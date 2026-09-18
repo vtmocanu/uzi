@@ -120,6 +120,19 @@ const REASON_PHRASES: Record<SelectReason, Phrase> = {
     hint: "Auto-selection picked a token whose stored value could not be decrypted, so the run floored onto another of your pooled tokens rather than failing — not your default. Re-paste the broken token on Settings → Anthropic tokens to fix it.",
     tone: "warning",
   },
+  // PRD #1247: the two per-run credential override reasons. Neutral tone — a per-run
+  // override is a deliberate choice the owner made for this run, not a fallback or a
+  // problem to act on. Their own words, not "pinned"/"default": those name a WORKER
+  // binding or an unset binding, and a user told "pinned" would go looking at Settings →
+  // Workers for a binding that this run's choice did not come from.
+  run_pinned: {
+    mode: "run-pinned",
+    hint: "You chose this token for this run specifically, so it spent that token whatever the claiming worker is bound to.",
+  },
+  run_default: {
+    mode: "run-default",
+    hint: "You chose your default Anthropic token for this run specifically, so it spent your default whatever the claiming worker is bound to.",
+  },
 };
 
 /** SELECT_REASONS is the vocabulary AT RUNTIME, derived from the exhaustive Record

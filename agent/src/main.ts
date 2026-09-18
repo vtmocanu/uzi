@@ -11,6 +11,8 @@ import { ChatExecutor, type ChatExecutorLike } from "./chat-executor.js";
 import { StubChatExecutor } from "./chat-executor-stub.js";
 import { RunRunner, type ExecutorFactory } from "./runner.js";
 import { ChatRunner } from "./chat-runner.js";
+import { Outbox, deriveTerminalReserveBytes } from "./outbox.js";
+import { ActiveRunRegistry } from "./active-run-registry.js";
 import { JudgeRunner } from "./judge-runner.js";
 import { ReviewRunner } from "./review-runner.js";
 import { stubJudgeQueryFn } from "./judge-runner-stub.js";
@@ -109,6 +111,40 @@ async function main(): Promise<void> {
     httpTimeoutMs: config.httpTimeoutMs,
   });
   const git = new GitCache(config.dataDir, log);
+
+  // PRD #1391 M2: the worker-owned message outbox and the shared re-arm registry,
+  // built + initialised BEFORE the runners/worker so a boot backlog is already
+  // loadable and every batcher can spill into the same store. `init()` mints/loads the
+  // worker-local HMAC key, scans the run tree and captures the spill-unclean flags;
+  // it fails closed (disables the store) rather than throwing, so a broken /data never
+  // blocks startup. The registry maps a live run's id to its batcher's rearm() so the
+  // drainer can return a still-running run to the network once its segments retire.
+  const outbox = new Outbox({
+    root: config.outboxDataDir,
+    log,
+    runMaxBytes: config.outboxRunMaxBytes,
+    maxBytes: config.outboxMaxBytes,
+    retentionMs: config.outboxRetentionMs,
+    // PRD #1391 M3 (Run B, D2): size the physical `.reserve` for the terminal journals, derived from
+    // ONE source — the per-record cap times how many hard-max journals must survive a full volume,
+    // plus a per-record overhead. init() grows a deployed Run A worker's 64 KiB reserve up to this.
+    reserveBytes: deriveTerminalReserveBytes(config.outboxReserveTerminals, config.outboxTerminalMaxBytes),
+  });
+  await outbox.init();
+  const rearm = new Map<string, () => void>();
+  // PRD #1390 M2a: the shared active-run registry the run lane + judge/review runners write
+  // as they start/transition/finish, and the worker reads to build the ActiveSnapshot that
+  // rides every heartbeat and run-lane claim. ONE instance so the snapshot epoch is a single
+  // process-monotonic counter across the heartbeat and claim loops.
+  // PRD #1391 Run B M4: thread the outbox pending-terminal lister + the register-returned server cap
+  // into the registry (function seams, so the registry stays decoupled from Outbox/WorkerClient).
+  // The cap getter reads the client field the register response populated, so it is correct on every
+  // build after register; before register it reads undefined (cap 0), which only matters if a build
+  // ran that early (it does not — snapshots build after register).
+  const activeRuns = new ActiveRunRegistry(
+    () => outbox.listPendingTerminals(),
+    () => client.workerOutboxMaxPending,
+  );
   // Pin the SDK's HOME (session transcripts under $HOME/.claude/projects) onto
   // the persistent data volume so `docker compose down && up` doesn't wipe
   // sessions and resume still works.
@@ -202,6 +238,16 @@ async function main(): Promise<void> {
     pollMs: config.pollIntervalMs,
     planApprovalTimeoutMs: config.planApprovalTimeoutMs,
     checkpointIntervalMs: config.checkpointIntervalMs,
+    // PRD #1391 M2: spill collaborators for every run's batcher.
+    outbox,
+    rearm,
+    transientTripMs: config.transientTripMs,
+    outboxSpillBufferBytes: config.outboxSpillBufferBytes,
+    // PRD #1391 Run B M3: the terminal-journal send-path knobs (canonicaliser cap + gap-fill bound).
+    outboxTerminalMaxBytes: config.outboxTerminalMaxBytes,
+    gapFillMax: config.gapFillMax,
+    // PRD #1390 M2a: the shared active-run registry the worker reads to build snapshots.
+    activeRuns,
   });
 
   // The chat lane (PRD #39). Per-session executor factory (PRD #42 Decision 4): each
@@ -239,13 +285,18 @@ async function main(): Promise<void> {
     // session) — the same discriminator the run lane gets for free from the stub's
     // absent per-run HOME above.
     //
-    // The conditional-spread idiom is the point (PRD #103 M3, oxlint
-    // unicorn/no-useless-spread): it OMITS the key rather than setting it to
-    // undefined, which is what lets the stub be told apart from a worker whose
-    // sdkHomeDir happens to be unset. Rewriting it to satisfy the rule would either
-    // reintroduce the undefined key or need a mutable builder for one field.
-    // eslint-disable-next-line unicorn/no-useless-spread
+    // The conditional-spread idiom is the point (PRD #103 M3): it OMITS the key
+    // rather than setting it to undefined, which is what lets the stub be told apart
+    // from a worker whose sdkHomeDir happens to be unset. (No oxlint
+    // unicorn/no-useless-spread disable is needed here: the PRD #1391 M2 fields below
+    // give the object sibling keys, so the rule no longer reads the spread as useless.)
     ...(config.executor === "stub" ? {} : { sdkHomeDir: sdkHomeRoot }),
+    // PRD #1391 M2: chat keeps the message outbox (Run A), spilling into the same store
+    // and re-arm registry as the run lane.
+    outbox,
+    rearm,
+    transientTripMs: config.transientTripMs,
+    outboxSpillBufferBytes: config.outboxSpillBufferBytes,
   });
 
   // The judge lane (PRD #46): a slim runner for `judge` claims. It reuses the SDK
@@ -256,6 +307,12 @@ async function main(): Promise<void> {
   // token and zero spend.
   const judgeRunner = new JudgeRunner(client, log, {
     homeRoot: sdkHomeRoot,
+    // PRD #1390 M2a: a judge attempt holds a run slot, so it is listed in the snapshot.
+    activeRuns,
+    // PRD #1391 Run B M3b (D6): journal the judge's terminal STATE write-ahead (never the verdict).
+    outbox,
+    outboxTerminalMaxBytes: config.outboxTerminalMaxBytes,
+    gapFillMax: config.gapFillMax,
     ...(config.executor === "stub" ? { queryFn: stubJudgeQueryFn } : {}),
   });
 
@@ -267,10 +324,19 @@ async function main(): Promise<void> {
   // review), mirroring the judge lane so the e2e can drive it with a dummy token.
   const reviewRunner = new ReviewRunner(client, git, log, {
     homeRoot: sdkHomeRoot,
+    // PRD #1390 M2a: a review attempt holds a run slot, so it is listed in the snapshot.
+    activeRuns,
+    // PRD #1391 Run B M3b (D6): journal the review's terminal STATE write-ahead (never the review POST).
+    outbox,
+    outboxTerminalMaxBytes: config.outboxTerminalMaxBytes,
+    gapFillMax: config.gapFillMax,
     ...(config.executor === "stub" ? { queryFn: stubJudgeQueryFn } : {}),
   });
 
-  const worker = new Worker(config, client, runner, chatRunner, judgeRunner, reviewRunner, log);
+  // PRD #1391 M2: the Worker owns the per-worker outbox drainer + the heartbeat outbox
+  // report, so it takes the same outbox + re-arm registry the runners spill into. The
+  // `undefined` preserves the default boot toolchain preflight (only tests inject one).
+  const worker = new Worker(config, client, runner, chatRunner, judgeRunner, reviewRunner, log, undefined, outbox, rearm, activeRuns);
 
   // Signal handlers FIRST, before anything that can take real time. Until these
   // are installed a SIGTERM hits Node's default disposition and terminates the

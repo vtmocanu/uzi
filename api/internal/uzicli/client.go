@@ -99,6 +99,14 @@ type Client interface {
 	// /api/runs/{id}/resume-now, RequireUser so a CLI token can reach it. A non-held run
 	// is a 409 → ExitConflict (5); a foreign/absent run is 404 → 4. No request body.
 	ResumeRunNow(ctx context.Context, id string) (apitypes.RunDTO, error)
+	// SetRunCredential is the `uzi run set-token` verb (PRD #1247 M4, D4/D12): POST
+	// /api/runs/{id}/credential {mode, secret_id?}, RequireUser so a uzc_ CLI Bearer reaches
+	// it. It re-points which Anthropic token a queued or parked run spends (promoting a
+	// parked run to queued at once) and returns the updated run plus an optional D6 warning
+	// string. A held/claimed/terminal run is 409 → ExitConflict (5); a foreign/unknown run
+	// or token is 404 → ExitNotFound (4); a codex-harness run is 422; a bad mode is 400 →
+	// ExitUsage (2) — all via the shared status→exit mapping.
+	SetRunCredential(ctx context.Context, id string, override SetRunCredentialOverride) (apitypes.RunDTO, string, error)
 	// SetRunMrRework sets the per-run MR review-rework override (PRD #841 M3): PUT
 	// /api/runs/{id}/mr-rework {enabled: bool|null}, RequireUser so a CLI `uzc_` token can
 	// reach it. enabled is tri-state — &true opts the run's MR into auto-rework, &false out,
@@ -240,7 +248,12 @@ type Client interface {
 	// before), and a non-nil seed always carries a plan (the server rejects a
 	// selection with no plan). The plan's size cap and empty-plan rejection are the
 	// SERVER's (422) — the client forwards the bytes so those rules live in one place.
-	CreateRun(ctx context.Context, repoID string, issueIID int64, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *CreateRunSeed) (apitypes.RunDTO, error)
+	//
+	// credOverride is PRD #1247 M2's create-time per-run credential choice (`--token`): nil
+	// OMITS the credential_override key (inherit the worker binding); a present override
+	// carries {mode, secret_id?}. The label→id resolution for a pinned choice happens
+	// CLIENT-SIDE before this call, so the server receives an id, not a label.
+	CreateRun(ctx context.Context, repoID string, issueIID int64, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *CreateRunSeed, credOverride *CreateRunCredentialOverride) (apitypes.RunDTO, error)
 	// CreateTaskRun queues an issue-less handoff/task run on a repo (PRD #400 M3):
 	// POST /api/repos/{id}/task-runs {context, base_branch?, open_mr}. The server
 	// names the branch (uzi/task/<run-id>) and the created-run response carries it in
@@ -268,10 +281,12 @@ type Client interface {
 	// non-task run, or an already-dispatched one is a 404 (exit 4).
 	DispatchTaskRun(ctx context.Context, runID string) (apitypes.RunDTO, error)
 	// SubmitRunInput submits a steering input: POST /api/runs/{id}/inputs
-	// {kind, body, selection}. kind ∈ {approve_plan, reject_plan, cancel, follow_up}.
-	// sel is legal only with approve_plan; the server validates it against the run's
-	// real roster (the client never composes the worker-bound body itself).
-	SubmitRunInput(ctx context.Context, runID, kind, body string, sel *apitypes.AgentSelection) (apitypes.RunInputResponse, error)
+	// {kind, body, selection, discard_pending_outcome}. kind ∈ {approve_plan, reject_plan,
+	// cancel, follow_up}. sel is legal only with approve_plan; the server validates it against
+	// the run's real roster (the client never composes the worker-bound body itself).
+	// discardPendingOutcome is the PRD #1391 Run B M3d (D13) confirmation, meaningful only with
+	// cancel: it discards a terminal outcome held on the worker (default false → unchanged).
+	SubmitRunInput(ctx context.Context, runID, kind, body string, sel *apitypes.AgentSelection, discardPendingOutcome bool) (apitypes.RunInputResponse, error)
 	// DeleteWorker removes one of the caller's workers: DELETE /api/workers/{id}
 	// (204 No Content on success). A worker with active runs is a 409 (exit 5); an
 	// unknown/foreign id is a 404 (exit 4). Minting a worker stays a webui action —
@@ -893,11 +908,26 @@ func transportMsg(err error) string {
 	return err.Error()
 }
 
+// ReasonOutcomePendingConfirmationRequired is the server's typed-409 reason code (PRD #1391 Run B
+// M3d, D13) for a cancel of a run whose executor journaled a terminal outcome held on its worker:
+// the cancel needs the explicit --discard-pending-outcome flag. Matched on the *ExitError.Reason
+// field so the CLI branches on the exact condition rather than the human message text.
+const ReasonOutcomePendingConfirmationRequired = "outcome_pending_confirmation_required"
+
 // statusError maps a non-2xx status to an *ExitError with the documented exit
 // code, folding in the server's {"error": "..."} message when present. retryAfter
-// is the response's Retry-After header (empty when absent), read only for a 429.
+// is the response's Retry-After header (empty when absent), read only for a 429. A
+// typed error body's machine-readable `reason` is carried on the *ExitError.Reason so a
+// caller can branch on the exact server condition (PRD #1391 Run B M3d's cancel gate).
 func statusError(status int, body []byte, retryAfter string) *ExitError {
 	msg := serverErrMsg(body)
+	reason := serverErrReason(body)
+	e := buildStatusError(status, msg, retryAfter)
+	e.Reason = reason
+	return e
+}
+
+func buildStatusError(status int, msg, retryAfter string) *ExitError {
 	switch {
 	case status == http.StatusTooManyRequests:
 		// A 429 is a rate-limit shed, not a bad request: the server (or the forge it
@@ -977,6 +1007,18 @@ func serverErrMsg(body []byte) string {
 	}
 	if json.Unmarshal(body, &e) == nil {
 		return strings.TrimSpace(e.Error)
+	}
+	return ""
+}
+
+// serverErrReason extracts the machine-readable `reason` from a typed error body
+// ({"error", "reason"}), or "" when the body carries none (the plain {"error"} shape).
+func serverErrReason(body []byte) string {
+	var e struct {
+		Reason string `json:"reason"`
+	}
+	if json.Unmarshal(body, &e) == nil {
+		return strings.TrimSpace(e.Reason)
 	}
 	return ""
 }

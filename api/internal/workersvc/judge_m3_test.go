@@ -149,7 +149,7 @@ func TestRegisterEnqueuesJudgeForOrphanFailedRuns(t *testing.T) {
 	svc := New(fs, newBox(t), testParams())
 	svc.SetSettings(fakeSettings{enabled: true, model: "haiku"})
 
-	if _, err := svc.Register(context.Background(), worker(), "v1", "", nil, nil, nil); err != nil {
+	if _, _, err := svc.Register(context.Background(), worker(), "v1", "", nil, nil, nil, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	if fs.createdJudgeRun == nil {
@@ -286,7 +286,7 @@ func TestJudgeClaimCarriesModelAndSignal(t *testing.T) {
 	svc := New(fs, box, testParams())
 	svc.SetSettings(fakeSettings{enabled: true, model: "haiku"})
 
-	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid})
+	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid}, nil)
 	if err != nil || payload == nil {
 		t.Fatalf("Claim: payload=%v err=%v", payload, err)
 	}

@@ -42,7 +42,30 @@ import (
 // The capability approval gate (PRD #84 M4 4c) is ENFORCED here — use
 // SubmitInputWithCapabilityOverride for the owner "run without the capability" override.
 func (s *Service) SubmitInput(ctx context.Context, userID, runID uuid.UUID, kind, body string, sel *AgentSelection) (SubmitInputResult, error) {
-	return s.submitInput(ctx, userID, runID, kind, body, sel, false)
+	return s.submitInput(ctx, userID, runID, kind, body, sel, SubmitInputOptions{})
+}
+
+// SubmitInputOptions carries the owner-authorized bypasses a steering input may request, kept as
+// a struct rather than a growing tail of booleans so an added bypass never re-widens SubmitInput's
+// fixed signature (matching the SubmitInputWithCapabilityOverride precedent, now folded in here).
+type SubmitInputOptions struct {
+	// OverrideCapabilities is the PRD #84 M4 4c "run without the capability" override, meaningful
+	// only with approve_plan (see SubmitInputWithCapabilityOverride).
+	OverrideCapabilities bool
+	// DiscardPendingOutcome is the PRD #1391 Run B M3d (D13) explicit confirmation on a `cancel`:
+	// when the target run has a terminal outcome journaled+leased on its worker, the server refuses
+	// the cancel (ErrOutcomePendingConfirmationRequired) UNLESS this is true, in which case the
+	// cancel takes the atomic no-live-poller branch that discards the pending outcome. Inert on any
+	// kind other than cancel and on a cancel of a run with no pending outcome (today's path).
+	DiscardPendingOutcome bool
+}
+
+// SubmitInputWithOptions is SubmitInput carrying the owner-authorized bypasses (PRD #84 M4 4c
+// capability override + PRD #1391 Run B M3d pending-outcome discard). The HTTP handler routes
+// through this so both bits can be set together; SubmitInput / SubmitInputWithCapabilityOverride
+// remain as the zero-option and capability-only shorthands their existing callers use.
+func (s *Service) SubmitInputWithOptions(ctx context.Context, userID, runID uuid.UUID, kind, body string, sel *AgentSelection, opts SubmitInputOptions) (SubmitInputResult, error) {
+	return s.submitInput(ctx, userID, runID, kind, body, sel, opts)
 }
 
 // SubmitInputWithCapabilityOverride is SubmitInput for the PRD #84 M4 4c owner override
@@ -55,10 +78,10 @@ func (s *Service) SubmitInput(ctx context.Context, userID, runID uuid.UUID, kind
 // requirement. The override is meaningful only for approve_plan; on any other kind the gate
 // never runs, so the flag is inert.
 func (s *Service) SubmitInputWithCapabilityOverride(ctx context.Context, userID, runID uuid.UUID, kind, body string, sel *AgentSelection) (SubmitInputResult, error) {
-	return s.submitInput(ctx, userID, runID, kind, body, sel, true)
+	return s.submitInput(ctx, userID, runID, kind, body, sel, SubmitInputOptions{OverrideCapabilities: true})
 }
 
-func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind, body string, sel *AgentSelection, overrideCapabilities bool) (SubmitInputResult, error) {
+func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind, body string, sel *AgentSelection, opts SubmitInputOptions) (SubmitInputResult, error) {
 	run, err := s.GetRun(ctx, userID, runID)
 	if err != nil {
 		return SubmitInputResult{}, err
@@ -91,7 +114,7 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 	// here, after the enqueue, rather than in the handler BEFORE this call, is the fix for
 	// the non-atomic drop.
 	if kind == "approve_plan" {
-		if !overrideCapabilities {
+		if !opts.OverrideCapabilities {
 			if err := s.capabilityGate(ctx, run); err != nil {
 				return SubmitInputResult{}, err
 			}
@@ -105,7 +128,7 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 		if err != nil {
 			return SubmitInputResult{}, err
 		}
-		if overrideCapabilities {
+		if opts.OverrideCapabilities {
 			// Only reached once the approve fully succeeded, so a failed approve above never
 			// clears the requirement. Owner- and awaiting_approval-scoped in SQL.
 			if err := s.OverrideRunRequiredCapabilities(ctx, userID, runID); err != nil {
@@ -290,6 +313,29 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 		if !live {
 			status := "cancelled"
 			if kind == "cancel" {
+				// PRD #1391 Run B M3d (D13): a run whose executor journaled a terminal (esp.
+				// blocked) outcome on its worker has no live poller for itself — hasLivePoller
+				// returned false above via RunHasPendingOutcomeLease — but the plain
+				// CancelRunServerSide would SILENTLY DISCARD that held completed/failed/blocked
+				// outcome. Gate it: refuse without the explicit discard bit, and only with it take
+				// the atomic, owner-scoped, row-locked cancel whose WHERE re-checks the same
+				// pending-outcome lease. A run with NO pending outcome keeps today's path unchanged.
+				// A pending outcome requires a worker_active_runs lease, which requires the run to
+				// hold a worker; chat never journals a terminal (D6/D10). So skip the query — and
+				// with it the confirmation gate — for a chat or worker-less run, which can never be
+				// pending, keeping today's cancel path byte-identical for them.
+				if run.Kind != runkind.Chat && run.WorkerID.Valid {
+					pending, perr := s.q.RunHasPendingOutcomeLease(ctx, runID)
+					if perr != nil {
+						return SubmitInputResult{}, perr
+					}
+					if pending {
+						if !opts.DiscardPendingOutcome {
+							return SubmitInputResult{}, ErrOutcomePendingConfirmationRequired
+						}
+						return s.cancelPendingOutcomeRun(ctx, userID, run, body)
+					}
+				}
 				// PRD #503 M3: persist the operator's OPTIONAL cancel reason; an empty
 				// body stores NULL (a cancel reason is helpful, not mandatory).
 				_, err = s.q.CancelRunServerSide(ctx, store.CancelRunServerSideParams{
@@ -436,6 +482,116 @@ func (s *Service) enqueueRunInput(ctx context.Context, runID uuid.UUID, kind, bo
 		return SubmitInputResult{}, err
 	}
 	return SubmitInputResult{ServerSide: false, ID: row.ID, CreatedAt: row.CreatedAt.Time}, nil
+}
+
+// cancelPendingOutcomeRun applies the owner's explicit discard of a run's pending terminal
+// outcome (PRD #1391 Run B M3d, D13). It is reached only after RunHasPendingOutcomeLease confirmed
+// the run has a journaled+leased outcome on its worker AND the owner set discard_pending_outcome,
+// so it is the atomic no-live-poller cancel the PRD's D13 resolution describes.
+//
+// It runs the single row-locking CancelRunServerSideWithPendingOutcome (whose WHERE re-checks the
+// pending-outcome predicate) INSIDE a transaction that first takes the run's FOR UPDATE lock —
+// mirroring SetState's fenced-transition wrapper — so a replayed terminal SetState and this cancel
+// resolve on the run's row lock rather than on a stale Go-side read: whichever takes the lock first
+// wins, and the loser observes the winner's committed row. Ownership is re-checked UNDER the lock
+// (a foreign run is hidden as ErrRunNotFound, matching the pre-lock GetRun — no admin bypass, so an
+// admin_ro token can never cancel), closing the same TOCTOU completion_decision closes. A tx-less
+// deployment (fake-store unit tests, txBeginner unwired) falls back to the same single UPDATE via
+// s.q, then owner-scoped re-reads the run after a 0-row result.
+//
+// A 0-row guarded cancel is ambiguous: a replayed terminal SetState may have won, or the pending
+// lease may merely have expired, rotated or cleared while the run stayed active. Success is correct
+// only for the terminal winner; an active run returns ErrOutcomePendingCancelRaced so the owner can
+// re-read and retry instead of being told a cancellation happened when it did not.
+func (s *Service) cancelPendingOutcomeRun(ctx context.Context, userID uuid.UUID, run store.Run, body string) (SubmitInputResult, error) {
+	runID := run.ID
+	params := store.CancelRunServerSideWithPendingOutcomeParams{ID: runID, UserID: userID, StopReason: stopReasonParam(body)}
+	var rows int64
+	if s.txBeginner != nil {
+		tx, err := s.txBeginner.Begin(ctx)
+		if err != nil {
+			return SubmitInputResult{}, err
+		}
+		committed := false
+		defer func() {
+			if !committed {
+				_ = tx.Rollback(ctx)
+			}
+		}()
+		qtx := store.New(tx)
+		locked, err := qtx.GetRunByIDForUpdate(ctx, runID)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return SubmitInputResult{}, ErrRunNotFound
+			}
+			return SubmitInputResult{}, err
+		}
+		if locked.UserID != userID {
+			return SubmitInputResult{}, ErrRunNotFound
+		}
+		rows, err = qtx.CancelRunServerSideWithPendingOutcome(ctx, params)
+		if err != nil {
+			return SubmitInputResult{}, err
+		}
+		if rows == 0 {
+			current, readErr := qtx.GetRunByIDForUpdate(ctx, runID)
+			if readErr != nil {
+				if errors.Is(readErr, pgx.ErrNoRows) {
+					return SubmitInputResult{}, ErrRunNotFound
+				}
+				return SubmitInputResult{}, readErr
+			}
+			if current.UserID != userID {
+				return SubmitInputResult{}, ErrRunNotFound
+			}
+			if !terminalStatuses[current.Status] {
+				return SubmitInputResult{}, ErrOutcomePendingCancelRaced
+			}
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return SubmitInputResult{}, err
+		}
+		committed = true
+	} else {
+		var err error
+		rows, err = s.q.CancelRunServerSideWithPendingOutcome(ctx, params)
+		if err != nil {
+			return SubmitInputResult{}, err
+		}
+		if rows == 0 {
+			current, readErr := s.GetRun(ctx, userID, runID)
+			if readErr != nil {
+				return SubmitInputResult{}, readErr
+			}
+			if !terminalStatuses[current.Status] {
+				return SubmitInputResult{}, ErrOutcomePendingCancelRaced
+			}
+		}
+	}
+	if rows == 0 {
+		return SubmitInputResult{ServerSide: true}, nil
+	}
+	if s.bcast != nil {
+		s.bcast.PublishState(runID, "cancelled")
+	}
+	s.notify(runID, "cancelled") // cancelled → origin restore
+	// A server-side CANCEL commits 'cancelled', which the judge-enqueue gate filters out — this
+	// mirrors the ordinary server-side cancel path (best-effort, gated inside).
+	s.maybeEnqueueJudgeByID(ctx, runID)
+	// PRD #634 follow-up: a server-side cancel on a scope-directed run commits terminal outside
+	// SetState, so settle the pending scope audit row here too (best-effort; must never fail the
+	// operator's cancel). Guarded on the run carrying a directive.
+	if run.ScopeCeiling.Valid {
+		if _, setErr := s.q.SettleScopeInputDisposition(ctx, store.SettleScopeInputDispositionParams{
+			RunID: runID, Disposition: pgconv.TextOrNull("declined"),
+		}); setErr != nil {
+			slog.Warn("settle scope input disposition (pending-outcome discard cancel)", "run", runID, "error", setErr)
+		}
+	}
+	// PRD #1030 M4: a server-side cancel commits the run terminal OUTSIDE SetState, so delete the
+	// now-stale checkpoint ref here too (best-effort, kind-gated in the helper).
+	s.deleteCheckpointBestEffort(runID, run.Kind, run.IssueIid)
+	return SubmitInputResult{ServerSide: true}, nil
 }
 
 // submitApproval enqueues an approve_plan carrying an agent selection (PRD #37):

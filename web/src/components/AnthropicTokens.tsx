@@ -49,7 +49,7 @@ function nameList(names: string[]): string {
 
 // deleteWarning is the confirmation copy, split out so the naming rules are
 // readable and testable in one place rather than nested three ternaries deep.
-export function deleteWarning(
+function deleteWarning(
   label: string,
   isDefault: boolean,
   boundWorkers: string[],

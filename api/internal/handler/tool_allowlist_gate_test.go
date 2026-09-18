@@ -112,6 +112,7 @@ func (r *toolAllowlistRows) Scan(dest ...any) error {
 func (r *toolAllowlistRows) Values() ([]any, error) { return nil, nil }
 func (r *toolAllowlistRows) RawValues() [][]byte    { return nil }
 func (r *toolAllowlistRows) Conn() *pgx.Conn        { return nil }
+func (r *toolAllowlistRows) TypeMap() *pgtype.Map   { return pgtype.NewMap() }
 
 // allowlistRow is a terse constructor for a fake allowlist row: a name and an
 // optional pinned version.

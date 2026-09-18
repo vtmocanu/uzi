@@ -127,7 +127,7 @@ func TestDrainGateLiveDB(t *testing.T) {
 	}
 
 	// claim while draining: the gate reports idle and the run stays queued.
-	payload, err := svc.Claim(ctx, beat)
+	payload, err := svc.Claim(ctx, beat, nil)
 	if err != nil {
 		t.Fatalf("Claim while draining: %v", err)
 	}
@@ -153,7 +153,7 @@ func TestDrainGateLiveDB(t *testing.T) {
 	// claim after the roll: the gate is reopened, so ClaimRun fires. The run leaves
 	// 'queued' (claimed, then failed on the absent Anthropic token) — either terminal is
 	// proof the gate no longer blocks.
-	if _, err := svc.Claim(ctx, rolled); err != nil {
+	if _, err := svc.Claim(ctx, rolled, nil); err != nil {
 		t.Fatalf("Claim after roll: %v", err)
 	}
 	if s := runStatus(); s == "queued" {

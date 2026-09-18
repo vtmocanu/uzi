@@ -18,6 +18,7 @@ import { skillsPluginDir } from "./skills-plugin.js";
 import { describeLimit, LimitReachedError } from "./limit.js";
 import type { Logger } from "./log.js";
 import type {
+  ActiveSnapshotPhase,
   AgentSelection,
   AgentSource,
   AgentTemplate,
@@ -32,6 +33,7 @@ import type {
   StateRequest,
 } from "./protocol.js";
 import { resolveAgentSelection } from "./protocol.js";
+import type { ActiveRunRegistry } from "./active-run-registry.js";
 import { deriveCloneKey, resolveRunKind, RUN_KIND_PROFILES } from "./run-kind.js";
 import { RecoveryCoordinator, isCodePublishingKind, type RecoveryRecord } from "./recovery.js";
 import {
@@ -41,10 +43,18 @@ import {
   type DetectedRepoAgents,
 } from "./repoagents.js";
 import { MessageBatcher } from "./batcher.js";
+import type { Outbox } from "./outbox.js";
+import {
+  journalAndResolveTerminal,
+  resolvePendingTerminal,
+  type SendTerminalState,
+  type TerminalOutboxDeps,
+} from "./terminal-resolve.js";
 import { rmTreeForce } from "./rmtree.js";
 import {
   SteeringChannel,
   PauseNowSignal,
+  CredentialSwitchSignal,
   type AnswerVerdict,
   type PlanVerdict,
 } from "./steering.js";
@@ -79,12 +89,33 @@ const MAX_FAILURE_REASON_LEN = 512;
  *  handleRecoveryExhausted loop and by phaseClone's foreign-capture probe (#1315). */
 const TERMINAL_RUN_STATUSES = new Set(["cancelled", "completed", "failed"]);
 
+/** PRD #1391 Run B M3 (D4): the phase stamped into a run-lane terminal journal (`phase_at_journal`,
+ *  what #1390's snapshot reports for a pending outcome after a restart). Every run-lane terminal
+ *  report is produced while the run is at the `running` (finalize) phase, so this is the honest
+ *  value; kept as one constant so every site agrees. */
+const TERMINAL_JOURNAL_PHASE = "running";
+
+/** PRD #1391 Run B M4: the FIXED log line the queued-duplicate claim router emits when it ends the
+ *  attempt WITHOUT executing (a terminal/held row, a different generation, a definitive not-owned, or
+ *  an exhausted transient-probe budget). One constant so every end-path logs the same greppable
+ *  message; the varying detail (run_id, reason, status) rides the structured fields. No terminal
+ *  report is ever sent on these paths — the run keeps its authoritative status. */
+const QUEUED_DUPLICATE_END_LOG = "queued duplicate claim ended without executing (ownership probe)";
+
 /** PRD #1226 M4 (D6): bounded in-call attempts to capture a VERIFIED completion-hold restore
  *  point before giving up. Mirrors handleRecoveryExhausted's retain-and-retry, but bounded (this
  *  runs synchronously inside the executor's completion loop, not the server-parked recovery loop).
  *  A never-verified capture DOES NOT park: enterCompletionHold clears its preserve flags and returns
  *  false, so the run's normal terminal cleanup runs (no park, no leak). */
 const COMPLETION_HOLD_CAPTURE_ATTEMPTS = 3;
+
+/** PRD #1247 M5b (D3): bounded in-call attempts to capture a VERIFIED restore point before a
+ *  held-state credential-switch RELEASE. Mirrors COMPLETION_HOLD_CAPTURE_ATTEMPTS — the same
+ *  retain-and-retry, bounded because it runs synchronously in executeClaim's catch arm. A capture
+ *  that never verifies GIVES UP: enterCredentialSwitch reports `credential_switch_failed`, KEEPS
+ *  the preserve flags (no work loss), and returns "gave_up" so the run is left non-terminal for
+ *  requeue on the still-standing override — the switch is realized at the reclaim boundary. */
+const CREDENTIAL_SWITCH_CAPTURE_ATTEMPTS = 3;
 
 /** PRD #1226 M4 (D5): the STATIC, content-free failure_reason a worker reports when the completion
  *  interlock cannot report completed AND cannot park the run for recovery (the restore point never
@@ -120,6 +151,50 @@ class TerminalReportError extends Error {
 }
 
 /**
+ * PRD #1416 M3/M4 SEAM — thrown at the FINALIZE bridge sites (the align `fetchAndPush`; the plain
+ * push handles the same outcome by a direct call+return) when the branch's history was rewritten
+ * at/below the published floor P AND the ancestry bridge B could not be built or validated, so the
+ * run cannot be landed with a fast-forward push. Defined and thrown from where
+ * `bridgeBareTrackingRefIfDivergent` returns `{kind:"failed"}`. M4 CATCHES it — the align chain is
+ * wrapped in a try/catch that routes it to `failHistoryRewritten` — so it is TYPED
+ * `history_rewritten` with a scan-gated preserved_patch and NEVER reaches the generic failure path
+ * (SC3). Carries P (the published floor) so the typed reason can name it. Local, like
+ * TerminalReportError / StaleClaimError. The MID-RUN and PARK/CAPTURE bridge sinks must NEVER throw
+ * it (best-effort — a park that loses a bridge is worse than one that fails, D4). */
+class HistoryRewrittenError extends Error {
+  constructor(readonly publishedTip: string) {
+    super(
+      `history rewritten at or below the published tip ${publishedTip}; a fast-forward bridge could not be built or validated`,
+    );
+    this.name = "HistoryRewrittenError";
+  }
+}
+
+/** PRD #1416 (MR-rework, finding 1) — a data-free unwind sentinel: the post-bridge secret scan
+ *  found a trusted secret in the now-pushable `P..B` range and has ALREADY terminally reported
+ *  push_secret_blocked (via reportPushSecretBlocked). Thrown from the ALIGN chain's fetchAndPush so
+ *  the enclosing align try/catch (which types HistoryRewrittenError) unwinds without pushing, and
+ *  caught in the outer finalize catch to STOP rather than re-report. Local, like HistoryRewrittenError. */
+class PushSecretBlockedSignal extends Error {
+  constructor() {
+    super("push_secret_blocked already reported by the post-bridge secret scan");
+    this.name = "PushSecretBlockedSignal";
+  }
+}
+
+/** PRD #1416 M3 — the outcome of {@link RunRunner.bridgeBareTrackingRefIfDivergent} at a
+ *  publication boundary. "clean": P (and C) already ancestors of the tracking tip, nothing to do.
+ *  "unknown": ancestry could not be read, so do NOT bridge and do NOT fail. "bridged": B was built
+ *  + validated, the tracking ref advanced to B, and C advanced to B. "failed": divergent, but B
+ *  could not be built or validated (the finalize sinks turn this into a HistoryRewrittenError; the
+ *  mid-run/park/capture sinks log it and continue — best-effort, D4). */
+type BridgeOutcome =
+  | { kind: "clean" }
+  | { kind: "unknown" }
+  | { kind: "bridged"; bridge: string }
+  | { kind: "failed" };
+
+/**
  * PRD #1392 M2 — `ensureClone` exhausted `withForgeRetry` with a TRANSIENT verdict: the forge
  * was unreachable at clone/fetch (a DNS blip, a connection reset, a 5xx), not a permanent
  * rejection (401/403/404). `phaseClone` wraps the `ensureClone` throw in this so `executeClaim`'s
@@ -131,6 +206,78 @@ export class ForgeUnreachableAtCloneError extends Error {
   constructor(message: string, cause?: unknown) {
     super(message, { cause });
     this.name = "ForgeUnreachableAtCloneError";
+  }
+}
+
+/**
+ * PRD #1247 M5b: a /state report came back with the top-level `stale_claim` disposition
+ * (`ack.staleClaim`) — a held-state credential switch RELEASED this claim, or a reclaim
+ * SUPERSEDED it. This flight no longer owns the run, so it MUST STOP without reporting a
+ * terminal state (another claim owns the run now) and without setting a preserve flag
+ * (normal teardown — the new claim has its own clone). Thrown from the flight.reportState
+ * closure the moment any report is answered stale, and caught in executeClaim's catch chain
+ * BEFORE the generic terminal path (mirroring the PauseNowSignal arm). Local, like
+ * TerminalReportError: it is thrown and caught entirely within this file.
+ */
+class StaleClaimError extends Error {
+  constructor() {
+    super("run claim superseded server-side (stale_claim)");
+    this.name = "StaleClaimError";
+  }
+}
+
+/**
+ * PRD #1390 M4 — the env-gated e2e DROP-EXECUTION seam signal. OFF unless the worker is
+ * started with `UZI_E2E_DROP_ON_SENTINEL=1` (inert in production); when on, a claim whose
+ * issue text carries {@link E2E_DROP_SENTINEL} is dropped right after its first `running`
+ * report, BEFORE the clone (no worktree, no recovery journal), to model a live worker that
+ * silently loses one execution: the flight ends with NO terminal report, so the run stays
+ * `running` for the api's heartbeat missing-run requeue (M2b) to reclaim after the fence, the
+ * snapshot entry is removed by the ordinary finally, and the claim loop is paused (via the
+ * shared registry) so the e2e can observe the requeued run before a reclaim. Local, thrown
+ * and caught entirely within this file, exactly like StaleClaimError. */
+class E2EDropExecutionError extends Error {
+  constructor() {
+    super("e2e drop-execution seam: ending flight with no terminal report");
+    this.name = "E2EDropExecutionError";
+  }
+}
+
+/** PRD #1390 M4: the issue-text sentinel the e2e drop-execution seam keys on (only when
+ *  UZI_E2E_DROP_ON_SENTINEL is set). Named like the stub sentinels; inert in production. */
+const E2E_DROP_SENTINEL = "UZI_STUB_DROP";
+
+/**
+ * PRD #1247 M5b (BLOCKING-2/3 rework): a held-state credential switch could not be CONFIRMED, so
+ * the flight must STOP without continuing in place — but, unlike StaleClaimError, it must RETAIN
+ * all work (enterCredentialSwitch left the preserve flags SET). Thrown by ctx.attemptCredentialSwitch
+ * when enterCredentialSwitch returns "retained_stop" — an unverified give-up whose stamp-clear the
+ * server never confirmed, or a release whose outcome is unknown. Continuing in place would risk
+ * working a claim the reclaim already owns (release) or stranding every buffered input behind a
+ * still-pending switch stamp (give-up); so executeClaim's catch chain ends the flight NON-TERMINAL
+ * (no failed report), keeping the clone + HOME so the sweeper's requeue lets a reclaim resume the
+ * retained work. Local, like TerminalReportError / StaleClaimError.
+ */
+class CredentialSwitchRetainedStop extends Error {
+  constructor() {
+    super("credential switch unconfirmed; retaining work and stopping the flight");
+    this.name = "CredentialSwitchRetainedStop";
+  }
+}
+
+/**
+ * PRD #1391 Run B M4: phaseClone's FIRST `running` report came back refused (applied:false) with a
+ * TERMINAL status — the run reached completed/failed/cancelled out from under this claim (a racing
+ * owner cancel, or an outcome that already landed). Continuing the phase clone would work a claim the
+ * run has already left, so STOP: close the batcher, report NO terminal state (a `failed` here would
+ * fight the authoritative terminal outcome), and set NO preserve flag (nothing was cloned yet). The
+ * distinct `staleClaim` disposition is handled separately by the reportState closure's StaleClaimError
+ * throw; this is the non-stale terminal case. Local, thrown and caught entirely within this file.
+ */
+class RunningAckTerminalError extends Error {
+  constructor(readonly runStatus: string) {
+    super(`first running report refused with a terminal status (${runStatus})`);
+    this.name = "RunningAckTerminalError";
   }
 }
 
@@ -204,10 +351,20 @@ export function composeWorkflowScopeReason(paths: string[]): string {
  * not by slicing the whole string at the end. Exported for a direct cap unit test; the caller
  * still applies `.slice(0, MAX_FAILURE_REASON_LEN)` as a belt-and-braces net.
  */
-export function composePushSecretBlockedReason(findings: SecretFinding[]): string {
-  const prefix =
-    "This run's branch could not be pushed: it carries a secret GitHub Push Protection blocks " +
-    "(GH013). Offending: ";
+export function composePushSecretBlockedReason(
+  findings: SecretFinding[],
+  forgeType?: string,
+): string {
+  // PRD #1416 (MR-rework, finding 1): the post-bridge scan runs on EVERY forge, so a non-GitHub
+  // block must NOT cite "GitHub Push Protection"/"GH013" (there is no such backstop on
+  // GitLab/Forgejo). GitHub (or an omitted forge — the top-of-finalize GH013 caller) keeps the
+  // original wording so its existing callers + unit tests stay stable.
+  const isGitHub = forgeType === undefined || forgeType === "github";
+  const prefix = isGitHub
+    ? "This run's branch could not be pushed: it carries a secret GitHub Push Protection blocks " +
+      "(GH013). Offending: "
+    : "This run's branch could not be pushed: the pre-push secret scan detected a secret (a " +
+      "rewritten branch was bridged so it could publish). Offending: ";
   const suffix =
     ". The change is otherwise valid; a human can scrub the secret from the commit(s) and " +
     "land it. The diff is withheld because it may carry the detected secret; if a " +
@@ -279,6 +436,128 @@ export function composeBaseAlignConflictReason(defaultBranch: string): string {
   const branch = db.length > budget ? db.slice(0, Math.max(0, budget - 1)) + "…" : db;
   // Belt-and-braces final net, mirroring composeWorkflowScopeReason's caller.
   return (prefix + branch + suffix).slice(0, MAX_FAILURE_REASON_LEN);
+}
+
+/**
+ * PRD #1416 M4 — the actionable `failure_reason` for a run whose branch was rewritten at or below
+ * its published tip P AND could not be bridged to a fast-forward (the bridge B could not be built
+ * or validated), so uzi cannot land it. It NAMES P, states that uzi lands work with a fast-forward
+ * push and NEVER force-pushes (so a branch rewritten at or below P cannot be landed as it stands),
+ * points at docs/github-bot-setup.md, and tells the human where the work is (the run branch / a
+ * durable-recovery archive).
+ *
+ * Unlike composeWorkflowScopeReason / composeBaseAlignConflictReason, it is worded to be ACCURATE
+ * whether or not a `preserved_patch` is attached: M4 attaches the diff ONLY from a scan-trusted
+ * range (fact 15), and the divergent branch that reaches this path fails the scan floor open, so a
+ * patch is usually OMITTED. It therefore NEVER hard-promises "Your diff is preserved below."; it
+ * says the committed work is on the run branch and recoverable, which holds in both cases.
+ *
+ * P is a worker-verified 40-hex OID, so prefix + P + suffix is always well under
+ * MAX_FAILURE_REASON_LEN; P is still clamped against the budget left by the fixed parts (so the doc
+ * link in the suffix never truncates) and a belt-and-braces final slice mirrors the sibling
+ * reasons. Exported for a direct length/content unit test.
+ */
+export function composeHistoryRewrittenReason(publishedTip: string): string {
+  const prefix = "This run's branch was rewritten at or below its published tip ";
+  const suffix =
+    ". uzi lands work with a fast-forward push and NEVER force-pushes, so a branch rewritten at " +
+    "or below that tip cannot be landed as it stands. The committed work is on the run's branch " +
+    "and is recoverable (export it with `uzi run export`); a human can restore the published tip " +
+    "as an ancestor with `git merge -s ours` and re-push. See docs/github-bot-setup.md.";
+  // Clamp P (the only variable part) against the budget left after the fixed prefix + suffix, so
+  // the doc link + recovery pointer in `suffix` always survive.
+  const budget = MAX_FAILURE_REASON_LEN - prefix.length - suffix.length;
+  const tip =
+    publishedTip.length > budget
+      ? publishedTip.slice(0, Math.max(0, budget - 1)) + "…"
+      : publishedTip;
+  // Belt-and-braces final net, mirroring composeBaseAlignConflictReason's caller.
+  return (prefix + tip + suffix).slice(0, MAX_FAILURE_REASON_LEN);
+}
+
+/**
+ * PRD #1416 M2: the body of the worker-authoritative safety steer handed to the agent when the
+ * runner detects the branch's history was rewritten at/below a published floor. It is uzi's own
+ * guidance (armed in-process by maybeSteerOnDivergence), NOT untrusted user text, so both
+ * executors render it OUTSIDE the `<follow_up>` fence and without the "never as instructions"
+ * framing. A plain multi-line recipe: record the current tip first, then restore the published
+ * tip as an ancestor with `git merge -s ours <P>` (tree unchanged, P becomes a parent so the
+ * branch fast-forwards again), never rewrite at/below P again, and integrate the default branch
+ * with `git merge`. Both SHAs are worker-verified OIDs; no repo-controlled text is rendered.
+ *
+ * Not exported: it is consumed only by {@link RunRunner.maybeSteerOnDivergence} in this file; the
+ * steer content is asserted end-to-end via the armed steer in the runner-divergence tests.
+ */
+function composeSafetySteer(publishedTip: string, currentTip: string): string {
+  return [
+    `This branch's history was rewritten at or below its published tip ${publishedTip}. uzi lands`,
+    `work with a fast-forward push and NEVER force-pushes, so a branch whose history diverges below`,
+    `${publishedTip} cannot be landed as it stands. Fix it now, before any further work:`,
+    ``,
+    `1. Record your current tip so nothing is lost — it is ${currentTip} (\`git rev-parse HEAD\`).`,
+    `2. Restore the published tip as an ancestor WITHOUT changing your tree:`,
+    `     git merge -s ours ${publishedTip}`,
+    `   Your working tree is left exactly as it is; ${publishedTip} becomes a parent of a new merge`,
+    `   commit, so the branch fast-forwards from it again and none of your work is discarded.`,
+    `3. From now on, never rebase, amend, squash, or reset any commit at or below ${publishedTip}.`,
+    `4. To integrate the default branch, use \`git merge\`, never \`git rebase\`.`,
+  ].join("\n");
+}
+
+/**
+ * PRD #1416 M5 (D5): does a submitted `plan_md` propose an operation that would rewrite history?
+ * A WARN-ONLY, case-insensitive regex scan over the plan prose (case-insensitive to catch prose
+ * casing). False POSITIVES are explicitly accepted — a plan that says "do NOT `git rebase`" still
+ * matches, and that is fine: a plan is prose, one spurious status line costs nothing, and a false
+ * NEGATIVE is caught downstream by the M2 mid-run steer and the M3 finalize bridge. Matches the
+ * D5 pattern set: `git rebase`, `--amend`, `filter-repo`/`filter-branch`, `reset --hard`, or a
+ * forced push (`push` followed on the same line by `--force`/`-f`/`--force-with-lease`).
+ *
+ * Not exported: consumed only by {@link RunRunner.gatePlan} in this file; its behaviour is
+ * asserted end-to-end via the emitted status nudge (and the armed steer) in the M5 plan-gate tests.
+ */
+function planProposesRewrite(planMd: string): boolean {
+  const patterns: RegExp[] = [
+    /\bgit\s+rebase\b/i,
+    /--amend\b/i,
+    /\bfilter-repo\b/i,
+    /\bfilter-branch\b/i,
+    /\breset\s+--hard\b/i,
+    // A forced push: `push` followed on the SAME LINE by a force flag (PRD: push
+    // (--force|-f|--force-with-lease)). `--force-with-lease`/`--force` are listed ahead of `-f`
+    // so the longest flag wins; `-f\b` will not match inside `--force` (the trailing `\b` fails
+    // before the `o`). Bounded to one line ([^\n]*?) so an unrelated later `--force` never pairs
+    // with a much earlier `push`.
+    /\bpush\b[^\n]*?(?:--force-with-lease|--force|-f)\b/i,
+  ];
+  return patterns.some((re) => re.test(planMd));
+}
+
+/**
+ * PRD #1416 M5: the body of the worker-authoritative safety steer armed at the PLAN GATE when the
+ * submitted plan proposes rewriting history (planProposesRewrite) on a branch with a published
+ * floor P, under AUTO-APPROVE. Distinct from {@link composeSafetySteer}, the M2 DETECTED-rewrite
+ * recipe: at plan time there is no rewritten tip H yet, so this is PREVENTIVE — it names P, states
+ * that uzi lands work with a fast-forward push and NEVER force-pushes (so the worker cannot land a
+ * rewritten branch without bridging), tells the agent not to rebase/amend/squash/reset any commit
+ * at or below P, and to integrate the default branch with `git merge`, not `git rebase`. Armed
+ * only on the auto-approved branch (a human on the gated branch sees the plan + the status nudge
+ * and can revise/reject). uzi's own guidance, NOT untrusted user text, so both executors render it
+ * outside the `<follow_up>` fence. P is a worker-verified OID; no repo-controlled text is rendered.
+ *
+ * Not exported: consumed only by {@link RunRunner.gatePlan} in this file; its content is asserted
+ * end-to-end via the armed steer in the M5 plan-gate tests.
+ */
+function composePlanGateNudge(publishedTip: string): string {
+  return [
+    `Your plan proposes rewriting history on a branch that is ALREADY PUBLISHED at ${publishedTip}.`,
+    `uzi lands work with a fast-forward push and NEVER force-pushes, so the worker cannot land a`,
+    `branch that was rewritten at or below ${publishedTip} without bridging. Before you start:`,
+    ``,
+    `1. Do NOT rebase, amend, squash, or reset any commit at or below ${publishedTip}.`,
+    `2. Add new commits on top instead.`,
+    `3. To integrate the default branch, use \`git merge\`, never \`git rebase\`.`,
+  ].join("\n");
 }
 
 /**
@@ -400,6 +679,13 @@ interface RunFlight {
   readonly batcher: MessageBatcher;
   readonly cancel: AbortController;
   readonly steering: SteeringChannel;
+  /** PRD #1247 M5b: the claim-lane generation THIS claim holds (from claim.claim_generation).
+   *  Threaded onto every mutating report (the reportState closure) and every message batch (the
+   *  batcher), so the server's per-query fence can engage. The client's send-gate (fix round E)
+   *  decides whether it actually rides the wire — a generation>0 capability/feature worker sends it,
+   *  0 (chat's legacy sentinel) is never sent, and a rolled-back api's strict-decode 400 strips it
+   *  and retries ONCE. Server-side NOT NULL DEFAULT 0. */
+  readonly claimGeneration: number;
   readonly reportState: (
     body: Parameters<WorkerClient["reportState"]>[1],
     signal?: AbortSignal,
@@ -410,6 +696,14 @@ interface RunFlight {
   branch: string | undefined;
   active: ActiveRun | undefined;
   parked: boolean;
+  /** PRD #1391 Run B M3 (N2/D5): true once ANY terminal outcome for this generation has been
+   *  sent/resolved through {@link RunRunner.journalAndSendTerminal} — a run-lane completed/failed
+   *  site, the permanent-failure hook, or reportGenericFailure itself. A journaled outcome is FINAL,
+   *  so once this latches, reportGenericFailure never reports a SECOND `failed` — even after a 200
+   *  RETIRED the journal (which makes `hasPendingTerminal` read false), the exact fall-through this
+   *  latch closes. Distinct from `hasPendingTerminal`: that reads the on-disk journal (kept), this
+   *  survives the journal's retirement. false until the first terminal resolve. */
+  terminalResolved: boolean;
   preserveSession: boolean;
   /** PRD #1392 M2: this run parked on a PRE-CLONE forge-unreachable transient error, so it
    *  captured no clone and no model session. Unlike a limit_wait/recovery park, it preserves its
@@ -443,6 +737,42 @@ interface RunFlight {
   runnerClone: RunnerClone | undefined;
   ciFixHumanApproved: boolean;
   result: ExecutorResult | undefined;
+  /** PRD #1416 M1: the branch's published forge tip P at claim (fact 2) — the floor at/below
+   *  which the branch must never be rewritten, since uzi lands work with a plain fast-forward
+   *  push and never force-pushes. Recorded ONCE at claim from `originBranchTip(bare, branch)`
+   *  (no fetch). Null/absent when the branch did not exist on the forge at clone (a fresh
+   *  issue run). Held here, on the flight, so it survives an executor/session restart —
+   *  deliberately NOT on `RunnerClone.baseCommit`, which can point at unpublished recovered
+   *  work. Named in every prompt of a run with a published floor; later milestones read it for
+   *  the ancestry check and the finalize bridge. */
+  publishedTip?: string;
+  /** PRD #1416 M1: floor C, initialised to P (`publishedTip`). Advanced to each confirmed
+   *  checkpoint tip by later milestones (M2/M3); M1 only seeds it. */
+  checkpointFloor?: string;
+  /** PRD #1416 M2: the set of fetched tips already steered on for a divergence, so the mid-run
+   *  detection emits AT MOST ONE status + steer per distinct tip. A repeated checkpoint tick that
+   *  re-fetches the SAME diverged tip emits nothing; a FURTHER rewrite (a new tip) is a new key
+   *  and steers again. Lazily initialised on first use. Held on the flight so it survives across
+   *  checkpoint ticks within a flight (a fresh flight after a restart re-detects, which is fine —
+   *  the finalize bridge in M3 is the correctness backstop). */
+  steeredTips?: Set<string>;
+}
+
+/** PRD #1390 M2a: the four run states a worker's ActiveSnapshot may report as a `phase`
+ *  (a strict subset of RunState — the ones the api re-adopts a run to). A `running` report
+ *  and each of the three held-state parks map through here into the active-run registry so
+ *  the next snapshot lists this run's real phase; every other status (terminal, limit_wait,
+ *  paused, recovery_wait, credential_switch, ...) is not a snapshot phase and leaves the
+ *  registry entry unchanged (the run is removed on terminal / requeue). */
+const SNAPSHOT_PHASES = new Set<ActiveSnapshotPhase>([
+  "running",
+  "awaiting_approval",
+  "awaiting_input",
+  "awaiting_followup",
+]);
+
+function snapshotPhaseOf(status: StateRequest["status"]): ActiveSnapshotPhase | undefined {
+  return SNAPSHOT_PHASES.has(status as ActiveSnapshotPhase) ? (status as ActiveSnapshotPhase) : undefined;
 }
 
 /** Tuning the runner needs beyond the collaborators (defaults keep M2/M3 tests terse). */
@@ -493,6 +823,41 @@ export interface RunnerOptions {
   /** PRD #1296 M3 — inject a pre-built recovery coordinator (a fake client/git) for tests;
    *  production builds one from the run lane's own client + git cache + join token. */
   recovery?: RecoveryCoordinator;
+  /** PRD #1391 M2 — the worker-owned message outbox the batcher SPILLS to after a
+   *  sustained transient outage (instead of tripping). main.ts builds + inits it once
+   *  and injects it here + into the Worker + ChatRunner. Undefined ⇒ the batcher keeps
+   *  today's trip behaviour (tests that do not exercise spill). */
+  outbox?: Outbox;
+  /** PRD #1391 M2 — the shared re-arm registry (runId → the live batcher's rearm()).
+   *  The runner registers this run's batcher at construction and drops it in the
+   *  terminal finally; the worker's drainer calls the hook once the run's segments
+   *  retire, returning a still-live batcher to the network. */
+  rearm?: Map<string, () => void>;
+  /** PRD #1391 M2 — the spill trip window (config.transientTripMs); default is the
+   *  batcher's own TRANSIENT_TRIP_MS. Threaded to every run's batcher. */
+  transientTripMs?: number;
+  /** PRD #1391 M2 — the in-memory spill-buffer cap (config.outboxSpillBufferBytes);
+   *  default is the batcher's own 2 MiB. Threaded to every run's batcher. */
+  outboxSpillBufferBytes?: number;
+  /** PRD #1391 Run B M3 — the per-record terminal canonicaliser cap (config.outboxTerminalMaxBytes).
+   *  The write-ahead terminal send path canonicalises each terminal body under this. Default 1.25 MiB. */
+  outboxTerminalMaxBytes?: number;
+  /** PRD #1391 Run B M3 — the total per-seq gap-fill tombstone budget (config.gapFillMax) before a
+   *  hole below the terminal fence is declared unrecoverable and the journal is marked blocked (D13).
+   *  Default 10,000. */
+  gapFillMax?: number;
+  /** PRD #1390 M2a — the shared active-run registry. Each run this runner executes is
+   *  registered at `running` (with its claim generation) as it starts, has its phase
+   *  updated as it transitions/parks (through the reportState choke point), and is removed
+   *  on terminal / requeue. The worker reads the registry to build the ActiveSnapshot.
+   *  Undefined ⇒ no tracking (tests that never negotiate the feature). */
+  activeRuns?: ActiveRunRegistry;
+  /** PRD #1391 Run B M4 — the wall-clock budget for the queued-duplicate ownership-probe retry: a
+   *  TRANSIENT probe failure retries with backoff up to this bound (the api's claim grace minus a
+   *  margin), a held/queued row is re-probed until it, then the attempt ends without executing.
+   *  Measured against the injectable `now`, so a test can shrink it. Default 20s — well under the
+   *  api's claimed-never-started grace so a probe never outlives the claim. */
+  queuedDuplicateProbeBudgetMs?: number;
 }
 
 /**
@@ -523,6 +888,23 @@ export class RunRunner {
   /** PRD #1296 M3 — durable-recovery capture/journal/upload coordinator (D1/D3/D5).
    *  Disabled when the worker has no join token (a token-less test harness). */
   private readonly recovery: RecoveryCoordinator;
+  /** PRD #1391 M2 — the worker message outbox the batcher spills to, the shared re-arm
+   *  registry, the spill trip window and the spill-buffer cap. All threaded into every
+   *  run's MessageBatcher; `outbox`/`rearm` undefined ⇒ today's trip behaviour. */
+  private readonly outbox: Outbox | undefined;
+  private readonly rearm: Map<string, () => void> | undefined;
+  private readonly transientTripMs: number | undefined;
+  private readonly outboxSpillBufferBytes: number | undefined;
+  /** PRD #1391 Run B M3 — terminal-journal send-path config, threaded into the terminal-resolve deps. */
+  private readonly outboxTerminalMaxBytes: number;
+  private readonly gapFillMax: number;
+  /** PRD #1391 Run B M4 — wall-clock budget for the queued-duplicate ownership-probe retry. */
+  private readonly queuedDuplicateProbeBudgetMs: number;
+  /** PRD #1390 M2a — the shared active-run registry (runId → phase + claim generation);
+   *  undefined ⇒ no snapshot tracking. The worker reads it to build the ActiveSnapshot.
+   *  Named distinctly from the `activeRuns` shutdown Map below — that tracks abortable
+   *  controllers, this tracks the snapshot phase. */
+  private readonly snapshotRegistry: ActiveRunRegistry | undefined;
   private readonly detect: (
     worktreePath: string,
   ) => Promise<DetectedRepoAgents>;
@@ -625,6 +1007,23 @@ export class RunRunner {
       });
     this.detect = opts.detectRepoAgents ?? detectRepoAgents;
     this.checkRunner = opts.checkRunner;
+    // PRD #1391 M2: spill collaborators, threaded into each run's batcher (buildFlight).
+    this.outbox = opts.outbox;
+    this.rearm = opts.rearm;
+    this.transientTripMs = opts.transientTripMs;
+    this.outboxSpillBufferBytes = opts.outboxSpillBufferBytes;
+    // PRD #1391 Run B M3: terminal send-path knobs. Defaults mirror config.ts (1.25 MiB / 10,000) so
+    // a test that injects an outbox but not these knobs still canonicalises + gap-fills sanely.
+    this.outboxTerminalMaxBytes = opts.outboxTerminalMaxBytes ?? Math.round(1.25 * 1024 * 1024);
+    this.gapFillMax = opts.gapFillMax ?? 10_000;
+    // PRD #1391 Run B M4: the queued-duplicate probe retry budget. Clamp a 0/negative override to
+    // the default (a non-positive budget would give up before the first probe).
+    this.queuedDuplicateProbeBudgetMs =
+      opts.queuedDuplicateProbeBudgetMs !== undefined && opts.queuedDuplicateProbeBudgetMs > 0
+        ? opts.queuedDuplicateProbeBudgetMs
+        : 20_000;
+    // PRD #1390 M2a: the shared active-run registry the worker reads to build snapshots.
+    this.snapshotRegistry = opts.activeRuns;
     this.checkpointIntervalMs = opts.checkpointIntervalMs ?? 20 * 60_000;
     this.shutdownPublishTimeoutMs = opts.shutdownPublishTimeoutMs ?? 15_000;
     this.recoveryRetryMs = Math.max(1, Math.min(opts.recoveryRetryMs ?? 1_000, 30_000));
@@ -672,12 +1071,152 @@ export class RunRunner {
     try {
       if (previous) {
         await previous;
+        // PRD #1391 Run B M4 — the generation-aware queued-duplicate router. A SECOND (or later) claim
+        // of this run serialised behind the first must NOT blindly re-execute: the first attempt may
+        // have journaled a terminal outcome, or a reclaim may have bumped the generation. Drain this
+        // run's pending terminal synchronously, then probe ownership and decide (proceed only on a
+        // claimed/running row AT this claim's generation). Ending here sends NO report — the run keeps
+        // its authoritative status for the api's own reclaim/sweep to resolve.
+        if (!(await this.gateQueuedDuplicate(claim))) return;
         claim = await this.refreshQueuedClaimCursor(claim);
       }
       await this.executeClaim(claim);
     } finally {
       if (this.executionTails.get(runId) === tail) this.executionTails.delete(runId);
       release();
+    }
+  }
+
+  /**
+   * PRD #1391 Run B M4 — the generation-aware queued-duplicate gate (fact 6). Called AFTER the
+   * previous same-run execution settled and BEFORE `executeClaim`, only on a serialised duplicate.
+   * Returns whether to PROCEED to execute:
+   *   1. Synchronously resolve this run's pending terminal journal (if any) — send/retire/stale-retire
+   *      per M3 — so a completion the previous attempt journaled lands (and its lease clears) first.
+   *   1b. SC4 guard: if the drain LEFT a pending terminal for this run at the claim's generation (a
+   *      `messages_pending` keep on an undrained run, a `blocked`/`gap_unrecoverable` journal, or a send
+   *      that could not land), END the attempt WITHOUT executing — the outcome is still pending, so a
+   *      second execution here would run over a pending outcome (an SC4 violation), even though the
+   *      server can still read running@same-generation and the probe below would otherwise PROCEED.
+   *   2. Probe `GET /worker/runs/{id}/ownership` (status + additive claim_generation) and decide:
+   *      - `claimed`/`running` AT this claim's generation → PROCEED (a `running` row is the case where
+   *        #1390 re-adopted this exact claim);
+   *      - a TERMINAL status, or a DIFFERENT generation → END (no report, no execute);
+   *      - a `queued`/held row at the SAME generation (e.g. SweepClaimedNeverStarted bumps nothing) →
+   *        re-probe up to the budget, then END without executing;
+   *      - a transient probe failure → retry with backoff up to the budget (the claim grace minus a
+   *        margin), then END without executing;
+   *      - a definitive 4xx (404 not-owned/reclaimed) → END without executing.
+   */
+  private async gateQueuedDuplicate(claim: ClaimResponse): Promise<boolean> {
+    const runId = claim.run_id;
+    // 1. Drain this run's pending terminal(s) first, so a journaled completion lands and clears its
+    //    lease before we read ownership. No-op when no usable outbox is wired.
+    await this.resolveRunPendingTerminals(runId);
+
+    const claimGen = claim.claim_generation ?? 0;
+    // 1b. SC4 guard (fact 6): the drain does NOT always clear the journal — a `blocked`/`gap_unrecoverable`
+    //     record is left for the owner (D13), a `messages_pending` keep waits on an undrained run, and a
+    //     send that could not land stays installed for a later resolve. In all of those the outcome is
+    //     STILL pending, yet the server can read running@same-generation, so the ownership probe below
+    //     would PROCEED and RE-EXECUTE the run OVER a pending outcome — the SC4 violation. End the attempt
+    //     here instead (no report, no executeClaim): the run keeps its authoritative status, leased/listed
+    //     for a later resolve or owner action. Only fall through to the probe once the drain actually
+    //     cleared the pending terminal.
+    if (claimGen !== undefined && this.outbox && this.outbox.hasPendingTerminal(runId, claimGen)) {
+      this.log.info(QUEUED_DUPLICATE_END_LOG, {
+        run_id: runId,
+        reason: "a pending terminal outcome remains after the drain",
+        claim_generation: claimGen,
+      });
+      return false;
+    }
+    const deadline = this.now() + this.queuedDuplicateProbeBudgetMs;
+    for (;;) {
+      if (this.shuttingDownGlobal) {
+        this.log.info(QUEUED_DUPLICATE_END_LOG, { run_id: runId, reason: "worker shutting down" });
+        return false;
+      }
+      let probe;
+      try {
+        probe = await this.client.getRunOwnership(runId);
+      } catch (err) {
+        // A definitive 4xx (404 not-owned / reclaimed, or any other non-transient 4xx) ends the
+        // attempt at once; a transient error (5xx / 429 / network) retries under the budget.
+        if (err instanceof RequestError && err.status >= 400 && err.status < 500 && err.status !== 429) {
+          this.log.info(QUEUED_DUPLICATE_END_LOG, {
+            run_id: runId,
+            reason: "ownership probe returned a definitive not-owned/4xx",
+            status: err.status,
+          });
+          return false;
+        }
+        if (this.now() >= deadline) {
+          this.log.warn(QUEUED_DUPLICATE_END_LOG, {
+            run_id: runId,
+            reason: "ownership probe kept failing up to the grace budget",
+            error: errMessage(err),
+          });
+          return false;
+        }
+        await sleep(this.recoveryRetryMs);
+        continue;
+      }
+      const status = probe.status;
+      // A DIFFERENT generation means a newer claim owns the run — end regardless of status. Only
+      // compare when BOTH sides carry a generation; an older api that omits it (undefined) cannot
+      // prove a mismatch, so we fall through to the status check.
+      if (probe.claim_generation !== undefined && claimGen !== undefined && probe.claim_generation !== claimGen) {
+        this.log.info(QUEUED_DUPLICATE_END_LOG, {
+          run_id: runId,
+          reason: "a different generation owns the run",
+          probe_generation: probe.claim_generation,
+          claim_generation: claimGen,
+          status,
+        });
+        return false;
+      }
+      if (TERMINAL_RUN_STATUSES.has(status)) {
+        this.log.info(QUEUED_DUPLICATE_END_LOG, { run_id: runId, reason: "run is terminal", status });
+        return false;
+      }
+      if (status === "claimed" || status === "running") {
+        return true; // proceed: this worker still holds the claim at this generation
+      }
+      // A `queued`/held row at the SAME generation: never proceed. Re-probe until the budget, then end
+      // (a bounded wait for it to settle, exactly as the PRD prescribes).
+      if (this.now() >= deadline) {
+        this.log.info(QUEUED_DUPLICATE_END_LOG, {
+          run_id: runId,
+          reason: "run is held/queued at the same generation",
+          status,
+        });
+        return false;
+      }
+      await sleep(this.recoveryRetryMs);
+    }
+  }
+
+  /**
+   * PRD #1391 Run B M4: synchronously resolve every pending terminal journal for ONE run (the
+   * queued-duplicate gate's step 1). Mirrors the worker's boot resolve: a state-only `client.reportState`
+   * send stamped with the journal's generation (so a superseded generation is refused stale_claim and
+   * local-retired, D11), letting a completion the previous attempt journaled land before the ownership
+   * probe reads the run's status. No-op when no usable outbox is wired.
+   */
+  private async resolveRunPendingTerminals(runId: string): Promise<void> {
+    const outbox = this.outbox;
+    if (!outbox || outbox.isDisabled()) return;
+    const deps = this.terminalDeps();
+    if (!deps) return;
+    for (const entry of outbox.listPendingTerminals()) {
+      if (entry.run_id !== runId) continue;
+      const gen = entry.claim_generation;
+      await resolvePendingTerminal(deps, {
+        runId,
+        claimGeneration: gen,
+        send: (body, sig) => this.client.reportState(runId, { ...body, claim_generation: gen }, sig),
+      });
     }
   }
 
@@ -752,6 +1291,12 @@ export class RunRunner {
       runScopedSecrets,
     );
     const { runLog, batcher, reportState, steering } = flight;
+    // PRD #1390 M2a: register this run in the active-run snapshot registry at `running`,
+    // at the generation it was claimed at, so the worker's next ActiveSnapshot lists it.
+    // The reportState choke point advances its phase as it parks/resumes; the terminal
+    // finally removes it (a park that RETURNS from executeClaim — limit_wait/recovery/
+    // pre-clone — is a requeue, so it stops being listed there too). Idempotent per run id.
+    this.snapshotRegistry?.add(runId, claim.claim_generation ?? 0);
     try {
       await this.phaseClone(claim, flight);
       const sessionId = await this.phaseResume(claim, flight);
@@ -846,6 +1391,11 @@ export class RunRunner {
                 // braces so nothing here can undo the park (D4).
                 await this.git.commitWipMarker(worktreePath).catch(() => false);
                 await this.fetchBackBestEffort(barePath, worktreePath, branch, runId, runLog);
+                // PRD #1416 M3 (C5): bridge a divergent tracking tip BEFORE the park publish so a
+                // reseed on resume adopts B (the rewritten work), not the published tip. Best-effort:
+                // a park that fails is worse than a park that loses work (D4), so it NEVER throws —
+                // "failed"/"unknown" only log and the park continues.
+                await this.bridgeParkSinkBestEffort(barePath, branch, flight, runLog, "limit-park");
                 // PRD #628 M2: publish a ONE-SHOT checkpoint to origin so a DIFFERENT worker
                 // re-claiming this limit_wait run recovers the committed tree from
                 // refs/uzi-checkpoints/<branch> instead of cold-starting from default. Runs
@@ -991,6 +1541,10 @@ export class RunRunner {
                 async (permit) => {
                   await this.git.commitWipMarker(worktreePath).catch(() => false);
                   await this.fetchBackBestEffort(barePath, worktreePath, branch, runId, runLog);
+                  // PRD #1416 M3 (C6): bridge a divergent tracking tip BEFORE the shutdown publish so
+                  // a resume adopts B, not the published tip. Best-effort — a shutdown checkpoint must
+                  // never throw (it is inside the k8s termination grace race, D4).
+                  await this.bridgeParkSinkBestEffort(barePath, branch, flight, runLog, "shutdown");
                   // PRD #1062 M2 (#1036): the path is reaped above, so the overlay's PAT
                   // default-fetch is permitted — a behind-on-workflows branch checkpoints durably.
                   const shutdownOverlay = await this.buildCheckpointOverlay(claim, flight, barePath);
@@ -1101,6 +1655,78 @@ export class RunRunner {
         if (outcome === "fail") {
           await this.reportGenericFailure(claim, flight, err);
         }
+      } else if (err instanceof StaleClaimError) {
+        // PRD #1247 M5b: a /state report came back with the stale_claim disposition — a held-state
+        // credential switch RELEASED this claim, or a reclaim SUPERSEDED it. Another claim owns the
+        // run now, so STOP this flight. Caught here BEFORE the generic terminal path (mirroring the
+        // PauseNowSignal arm above, but WITHOUT its park): log, close the batcher, and report NO
+        // terminal state — a `failed` here would fight the owning claim — and set NO preserve flag
+        // (normal teardown: the new claim has its own clone). The finally then runs ordinary cleanup.
+        runLog.info("run claim superseded server-side (stale_claim); stopping this flight");
+        await batcher.close().catch(() => undefined);
+      } else if (err instanceof RunningAckTerminalError) {
+        // PRD #1391 Run B M4: phaseClone's first `running` report was refused with a TERMINAL status
+        // (the run reached completed/failed/cancelled out from under this claim). STOP with NO
+        // terminal report (the authoritative outcome already landed) and NO preserve flag — nothing
+        // was cloned before the running report, so the finally runs ordinary teardown. Caught here
+        // BEFORE the generic terminal path so this never becomes a `failed` run.
+        runLog.info("run reached a terminal status before the phase clone started; stopping this flight", {
+          run_id: flight.runId,
+          status: err.runStatus,
+        });
+        await batcher.close().catch(() => undefined);
+      } else if (err instanceof CredentialSwitchRetainedStop) {
+        // PRD #1247 M5b (BLOCKING-2/3 rework): the in-place ctx.attemptCredentialSwitch could not
+        // CONFIRM the switch (an unverified give-up whose stamp-clear the server never confirmed, or
+        // a release whose outcome is unknown), so it retained all work and threw to stop rather than
+        // continue on a possibly-released claim. Unlike StaleClaimError, KEEP the preserve flags
+        // (enterCredentialSwitch left them SET) so the clone + HOME survive: report NO terminal state
+        // (a `failed` would fight a claim that may already have moved on) and leave the run
+        // NON-TERMINAL so the sweeper requeues it and a reclaim resumes the retained work.
+        runLog.info("credential switch unconfirmed; retaining work and leaving the run non-terminal for requeue", {
+          run_id: flight.runId,
+        });
+        await batcher.close().catch(() => undefined);
+      } else if (err instanceof CredentialSwitchSignal) {
+        // PRD #1247 M5b (data-integrity fix): a SAFETY NET. The switch is now handled IN PLACE by the
+        // executor via ctx.attemptCredentialSwitch — the implement loop's turn catch and each idle
+        // held-state waiter (plan gate / question / follow-up) call it and, on a give-up, CONTINUE the
+        // run on the old token rather than letting the CredentialSwitchSignal reach here. So this arm
+        // only fires when the signal escaped that in-place handling: a stub/test executor that does
+        // NOT wire attemptCredentialSwitch (it re-throws), or a switch tripping some await not wrapped
+        // at B/C. Caught here BEFORE the generic terminal path so a switch NEVER becomes a `failed`
+        // run. Enter the same two-phase release; enterCredentialSwitch already set the flight's flags
+        // and (on release) reported credential_switch, so NEITHER branch reports a terminal state.
+        const outcome = await this.enterCredentialSwitch(claim, flight, runLog);
+        if (outcome === "released") {
+          // The flight ends: the finally retires the clone and preserves the HOME; the server
+          // requeued the run; a reclaim resumes at resume_phase on the newly-chosen token. No
+          // terminal report — enterCredentialSwitch already reported credential_switch.
+          runLog.info("credential switch released this claim; leaving the run for a reclaim on the new token");
+        } else {
+          // GAVE UP and the signal reached HERE (not the in-place continue at B/C), so the executor
+          // has already unwound and cannot continue on the old token. Make it CONTINUE-SAFE the only
+          // way possible from here: NO terminal `failed` report (a switch must never fail a healthy
+          // run), and KEEP both preserve flags (enterCredentialSwitch left them set on give-up) so the
+          // run is left NON-TERMINAL with its clone + HOME retained for a requeue — the same posture as
+          // the worker-shutdown-interrupt arm. The standing override still points at the new token, so
+          // the requeued run's reclaim spends it. (After B/C this arm is a last resort — a running
+          // give-up continues in place and never reaches here.)
+          runLog.info(
+            "credential switch did not release the claim and reached the outer catch; leaving the run non-terminal for requeue on the standing override",
+          );
+        }
+        await batcher.close().catch(() => undefined); // idempotent (enterCredentialSwitch may have drained)
+      } else if (err instanceof E2EDropExecutionError) {
+        // PRD #1390 M4 (e2e drop seam): end the flight with NO terminal report, mirroring the
+        // StaleClaimError arm. The run is left `running` (non-terminal) so the api's heartbeat
+        // missing-run requeue (M2b) reclaims it after the fence; the finally drops the snapshot
+        // entry and (with no clone) retires nothing. pauseClaimForE2E was already latched at the
+        // throw site. Reachable only under UZI_E2E_DROP_ON_SENTINEL.
+        runLog.info(
+          "e2e drop-execution seam: ending flight with no terminal report (run left running for the missing-run requeue)",
+        );
+        await batcher.close().catch(() => undefined);
       } else {
         await this.reportGenericFailure(claim, flight, err);
       }
@@ -1122,6 +1748,16 @@ export class RunRunner {
       // must not stay abortable — shutdown() iterating a stale entry would abort a
       // controller nobody is watching, and the map would leak an entry per run.
       this.activeRuns.delete(runId);
+      // PRD #1390 M2a: drop the active-run snapshot entry. Reaching this finally means the
+      // run reached a terminal report OR parked-and-returned for a requeue — either way it is
+      // no longer executing on this worker, so it must stop being listed in the snapshot. A
+      // run parked at a gate (awaiting_approval/awaiting_input/awaiting_followup) never reaches
+      // here (its execute promise stays live), so it stays listed in its held phase.
+      this.snapshotRegistry?.remove(runId);
+      // PRD #1391 M2: drop this run's re-arm registration. The batcher is closed by the
+      // time we reach here, so a later drainer retire never needs to re-arm it; any
+      // still-pending segments are drained and simply not re-armed (a no-op).
+      this.rearm?.delete(runId);
       await steering.stop().catch(() => undefined);
       // PRD #41: drop this run's plan-approval deadline + gate-tracking (normally cleared
       // when the gate resolves terminally, but a run that ends by any other path must not
@@ -1291,6 +1927,110 @@ export class RunRunner {
     }
   }
 
+  /** PRD #1391 Run B M3b: the terminal-resolve deps for this runner, or undefined when no usable
+   *  outbox is wired (a test without spill, or a store that failed closed) — in which case the
+   *  write-ahead terminal send path falls back to today's un-journaled `reportState`. */
+  private terminalDeps(): TerminalOutboxDeps | undefined {
+    if (!this.outbox || this.outbox.isDisabled()) return undefined;
+    return {
+      outbox: this.outbox,
+      client: this.client,
+      gapFillMax: this.gapFillMax,
+      terminalMaxBytes: this.outboxTerminalMaxBytes,
+      log: this.log,
+    };
+  }
+
+  /**
+   * PRD #1391 Run B M3b: journal a run-lane terminal outcome WRITE-AHEAD (before the first network
+   * attempt), then resolve it over `send` (the phase-publish reportState choke point at a run site,
+   * or flight.reportState at reportGenericFailure / the permanent-failure hook). Falls back to a
+   * direct un-journaled send when no outbox is wired. The caller MUST have closed / final-flushed the
+   * batcher first, so `batcher.currentSeq()` is the run's DURABLE emitted tail — the fence source,
+   * never a server value.
+   */
+  private async journalAndSendTerminal(
+    flight: RunFlight,
+    phase: string,
+    body: Parameters<RunFlight["reportState"]>[0],
+    send: SendTerminalState,
+  ): Promise<void> {
+    const deps = this.terminalDeps();
+    if (!deps) {
+      // No usable outbox: send un-journaled exactly as today. A stale ack still THROWS
+      // StaleClaimError out of `send` and propagates to executeClaim's catch (there is no journal to
+      // stale-retire on this degradation path), so this branch is byte-for-byte unchanged.
+      await send(body);
+      flight.terminalResolved = true;
+      return;
+    }
+    await journalAndResolveTerminal(deps, {
+      runId: flight.runId,
+      claimGeneration: flight.claimGeneration,
+      phase,
+      messagesThroughSeq: flight.batcher.currentSeq(),
+      body,
+      // PRD #1391 Run B M3b (B1): the run-lane reportState choke point (flight.reportState, reached
+      // through every `send` closure a terminal site passes here) THROWS StaleClaimError on a stale
+      // ack instead of RETURNING it — the shape resolvePendingTerminal's catch would otherwise read
+      // as a transport failure and KEEP the journal forever, leaking the run's whole outbox tree and
+      // holding its terminal_pending lease (and, past the cap, pending_overflow) open (D11). Normalize
+      // the throw into the `{applied:false, staleClaim:true}` ack actOnAck stale-retires on, so a
+      // superseded generation local-retires the journal UNIFORMLY across lanes (the judge/review/boot
+      // lanes already return this shape via raw client.reportState). StaleClaimError is defined and
+      // caught entirely within this file — it never leaks into terminal-resolve.ts. A genuine
+      // transport error still propagates, and resolvePendingTerminal keeps the journal for a later
+      // resolve, exactly as designed.
+      send: async (b, sig) => {
+        try {
+          return await send(b, sig);
+        } catch (err) {
+          if (err instanceof StaleClaimError) return { applied: false, staleClaim: true };
+          throw err;
+        }
+      },
+    });
+    // PRD #1391 Run B M3 (N2/D5): latch that a terminal outcome for this generation has resolved, so
+    // a later reportGenericFailure never reports a SECOND `failed` — even after a 200 RETIRED the
+    // journal (hasPendingTerminal then reads false). Skipped on a throw above (reserve_exhausted's
+    // un-journaled send that failed), so that fallback still reports failed as today.
+    flight.terminalResolved = true;
+  }
+
+  /**
+   * PRD #1391 Run B M3 (D5): the permanent message-failure hook body, extracted from the batcher's
+   * onPermanentFailureReport closure so its ORDERING is unit-testable against the REAL shipping code
+   * (runner-terminal-journal.test.ts) rather than a synthetic hand-rolled handler. The `failed`
+   * journal is durably installed and resolved BEFORE `flight.cancel.abort()` is observable, so a
+   * completion racing the trip can never reverse the first durable winner (the no-replace install in
+   * journalTerminal arbitrates, D4). journalAndSendTerminal awaits the durable install; only then does
+   * the abort fire, unwinding execute() into reportGenericFailure — which awaits this settlement,
+   * finds the durable journal / the terminalResolved latch, and reports no second `failed` (fact 2).
+   * When no outbox is wired this degrades to today's direct `failed` report + abort. The abort is
+   * guarded so a concurrent abort (a racing steering-cancel/shutdown) is never doubled.
+   */
+  private async handlePermanentFailure(flight: RunFlight, reason: string): Promise<void> {
+    try {
+      await this.journalAndSendTerminal(
+        flight,
+        TERMINAL_JOURNAL_PHASE,
+        {
+          status: "failed",
+          failure_reason: reason.slice(0, MAX_FAILURE_REASON_LEN),
+        },
+        (b, sig) => flight.reportState(b, sig),
+      );
+    } catch (e) {
+      flight.runLog.error("could not journal/report the message-transport failure", {
+        error: errMessage(e),
+      });
+    }
+    // Abort the attempt ONLY AFTER the durable journal is installed (D5/D4), so execute() falls into
+    // its catch (→ reportGenericFailure, which awaits this handler's settlement, finds the durable
+    // journal / the terminalResolved latch, and does NOT report a second `failed`).
+    if (!flight.cancel.signal.aborted) flight.cancel.abort();
+  }
+
   /**
    * Today's generic terminal FAILED path (extracted verbatim so the pre-clone
    * forge-unreachable park's `fail` arm can reuse it). failure_reason goes straight to
@@ -1305,7 +2045,7 @@ export class RunRunner {
     flight: RunFlight,
     err: unknown,
   ): Promise<void> {
-    const { batcher, reportState, redactText, runLog } = flight;
+    const { batcher, redactText, runLog } = flight;
     const rawReason =
       err instanceof PlanRejectedError
         ? err.reason
@@ -1324,18 +2064,50 @@ export class RunRunner {
         ? err.failOrigin
         : failOriginForReason(rawReason);
     runLog.error("run failed", { error: reason });
+    // PRD #1391 Run B M3 (D5): if the permanent-failure hook tripped, AWAIT its settlement first — it
+    // journals `failed` durably and aborts the attempt (which routed us here), so the journal must be
+    // observed as installed before the hasPendingTerminal check below. Resolves immediately when the
+    // breaker never tripped (every ordinary failure), so this is a no-op on the common path.
+    await batcher.awaitPermanentFailureSettled();
+    // PRD #1391 Run B M3 (fact 2, D5, N2): a JOURNALED/RESOLVED outcome is FINAL. Do NOT fall through
+    // to a SECOND `failed` when EITHER a terminal outcome for this generation has already resolved
+    // (the `terminalResolved` latch — set even after a 200 RETIRED the journal, so hasPendingTerminal
+    // reads false) OR a write-ahead journal is still installed (the permanent-failure hook's durable
+    // `failed`, or a terminal site that journaled before throwing into this catch). The first durable
+    // winner stands (the no-replace install arbitrates, D4). Still close the batcher and settle
+    // recovery custody (clone cleanup is independent of the report).
+    if (
+      flight.terminalResolved ||
+      (this.outbox && this.outbox.hasPendingTerminal(flight.runId, flight.claimGeneration))
+    ) {
+      runLog.info("run outcome already journaled write-ahead; not reporting a second failed", {
+        run_id: flight.runId,
+        claim_generation: flight.claimGeneration,
+      });
+      await batcher.close().catch(() => undefined);
+      await this.reapThenSettleRecoveryGeneration(claim, flight, runLog, "terminal");
+      return;
+    }
     batcher.emit({
       kind: "error",
       agent: "worker",
       payload: { text: reason },
     });
     await batcher.close().catch(() => undefined);
-    // Cap what lands in the run row (matches the GitLab error-body cap).
-    await reportState({
-      status: "failed",
-      failure_reason: reason.slice(0, MAX_FAILURE_REASON_LEN),
-      fail_origin: failOrigin,
-    }).catch((e) =>
+    // Cap what lands in the run row (matches the GitLab error-body cap). Journal it WRITE-AHEAD then
+    // resolve it (D3): on reserve_exhausted it degrades to today's direct send, whose throw the
+    // .catch below still logs; on the journaled path journalAndSendTerminal never throws (a send that
+    // fails now leaves the durable journal for a later resolve).
+    await this.journalAndSendTerminal(
+      flight,
+      TERMINAL_JOURNAL_PHASE,
+      {
+        status: "failed",
+        failure_reason: reason.slice(0, MAX_FAILURE_REASON_LEN),
+        fail_origin: failOrigin,
+      },
+      (b, sig) => flight.reportState(b, sig),
+    ).catch((e) =>
       runLog.error("could not report failed state", {
         error: errMessage(e),
       }),
@@ -1365,8 +2137,9 @@ export class RunRunner {
    *      transaction — the worker calls no release endpoint).
    *   - `recovery_release_exact_echo` (but NOT recovery_park_cause) → the older-api fallback: an
    *      older api's park touches no custody (fact 13), so first prove an EXACT-generation release
-   *      (released && generation===gen && holds_released===1), then send the UNTYPED report,
-   *      keeping claim_generation IFF `claim_generation_fence` is advertised. Missing proof (or a
+   *      (released && generation===gen && holds_released===1), then send the UNTYPED report, which
+   *      still carries claim_generation — the reportState closure (M5b) threads it, and for a capability worker the E send-gate stamps it
+   *      regardless of the negotiated `claim_generation_fence` feature (strict-decode strip-and-retry if this older api also predates the /state field). Missing proof (or a
    *      release throw) → today's failed path, never a leaked hold.
    *   - neither token → negotiate nothing, take today's failed path.
    *
@@ -1432,13 +2205,9 @@ export class RunRunner {
         });
         return "fail";
       }
-      // With proof, send the UNTYPED report. Keep claim_generation IFF the api advertised the
-      // #1247 state fence (D7); the `6603f793` baseline has no generation field on the state
-      // report, so it carries neither field.
+      // With proof, send the UNTYPED recovery_wait report; the flight reportState closure it routes
+      // through (reportForgeParkAndDispatch) stamps claim_generation unconditionally (PRD #1247 M5b).
       const body: StateRequest = { status: "recovery_wait" };
-      if (features.includes("claim_generation_fence") && gen !== undefined) {
-        body.claim_generation = gen;
-      }
       return await this.reportForgeParkAndDispatch(body, claim, flight, reportState, runLog, runHome);
     }
 
@@ -1781,6 +2550,12 @@ export class RunRunner {
       return res;
     };
     const closeBatcher = () => batcher.close(boundarySignal);
+    // PRD #1391 Run B M3b: journal a run-lane TERMINAL report WRITE-AHEAD then resolve it over the
+    // `reportState` choke point (which stamps claim_generation and drives recovery). The caller must
+    // have closed the batcher first, so the fence is the durable emitted tail. Every terminal site in
+    // this phase routes through here instead of a raw `reportState(body)`.
+    const journalTerminalReport = (body: Parameters<RunFlight["reportState"]>[0]) =>
+      this.journalAndSendTerminal(flight, TERMINAL_JOURNAL_PHASE, body, reportState);
     const finishCommittedPublish = async (
       body: Parameters<RunFlight["reportState"]>[0],
       logMessage: string,
@@ -1789,14 +2564,19 @@ export class RunRunner {
       if (deferCommittedTerminal) {
         deferCommittedTerminal(async () => {
           await batcher.close();
-          await flight.reportState(body);
-          await driveRecoveryTerminal(body);
+          // Journal write-ahead here too (D3): the deferred Codex sink sends through
+          // flight.reportState + driveRecoveryTerminal, so wrap that pair as the resolve `send`.
+          await this.journalAndSendTerminal(flight, TERMINAL_JOURNAL_PHASE, body, async (b) => {
+            const res = await flight.reportState(b);
+            await driveRecoveryTerminal(b);
+            return res;
+          });
           runLog.info(logMessage, fields);
         });
         return;
       }
       await closeBatcher();
-      await reportState(body);
+      await journalTerminalReport(body);
       runLog.info(logMessage, fields);
     };
     const runId = claim.run_id;
@@ -1835,6 +2615,23 @@ export class RunRunner {
       });
       return;
     }
+    // PRD #1247 M5b (data-integrity fix): a held-state credential switch RELEASED the claim IN PLACE
+    // (ctx.attemptCredentialSwitch → "released"). enterCredentialSwitch already drained the batcher,
+    // reported credential_switch (queued ack), cleared preserveRecoveryClone + set parked, and the
+    // server requeued the run for a reclaim at resume_phase on the newly-chosen token. Like the pause
+    // park and the completion hold above, the run is non-terminal and already handled, so there is
+    // NOTHING to finalize (no push, no MR, no completion report). Reap + close the batcher
+    // (idempotent — the release already drained it) and return; the finally retires the clone
+    // (preserveRecoveryClone cleared) and preserves the HOME (parked) for the same-worker resume.
+    // Keyed on the executor's result so no non-release path can reach this branch.
+    if (result.switchReleased) {
+      executor.killAgentTree?.();
+      await closeBatcher().catch(() => undefined);
+      runLog.info("run released for a credential switch in place; skipping finalization", {
+        run_id: runId,
+      });
+      return;
+    }
     const runnerClone = flight.runnerClone!;
     const barePath = flight.barePath!;
     const lastPublishedTip = flight.lastPublishedTip;
@@ -1854,7 +2651,9 @@ export class RunRunner {
         },
       });
       await closeBatcher();
-      await reportState({ status: "completed", fix_verdict: "not_code" });
+      // PRD #1391 Run B M3 (N1): journal write-ahead so an outage keeps the exact not_code
+      // completion, not a generic agent_failure.
+      await journalTerminalReport({ status: "completed", fix_verdict: "not_code" });
       runLog.info("ci_fix run completed with not_code verdict", {
         run_id: runId,
       });
@@ -1897,7 +2696,9 @@ export class RunRunner {
           },
         });
         await closeBatcher();
-        await reportState({
+        // PRD #1391 Run B M3 (N1): journal write-ahead so the typed orphan-checkpoint failure
+        // survives an outage as this exact outcome, not a generic agent_failure.
+        await journalTerminalReport({
           status: "failed",
           failure_reason:
             "signal_done was called with report_only, but this run published committed work to a checkpoint ref (refs/uzi-checkpoints/" +
@@ -1917,7 +2718,9 @@ export class RunRunner {
         },
       });
       await closeBatcher();
-      await reportState({
+      // PRD #1391 Run B M3 (N1): journal write-ahead so the report_only completion (report_md) is
+      // the durable outcome after an outage, not a generic agent_failure.
+      await journalTerminalReport({
         status: "completed",
         report_only: true,
         report_md: result.summary,
@@ -2006,7 +2809,9 @@ export class RunRunner {
               },
             });
             await closeBatcher();
-            await reportState({
+            // PRD #1391 Run B M3 (N1): journal the scope-capped report_only completion write-ahead
+            // so its exact outcome survives an outage, not a generic agent_failure.
+            await journalTerminalReport({
               status: "completed",
               report_only: true,
               scope_capped: true,
@@ -2029,7 +2834,9 @@ export class RunRunner {
             },
           });
           await closeBatcher();
-          await reportState({
+          // PRD #1391 Run B M3 (N1): journal write-ahead so the undeclared empty-diff failure is the
+          // durable outcome after an outage, not a generic agent_failure.
+          await journalTerminalReport({
             status: "failed",
             failure_reason:
               "signal_done was called but no changes were committed, and report_only was not set. If this run's deliverable is a report or command output with no code change, call signal_done with report_only: true.",
@@ -2081,7 +2888,9 @@ export class RunRunner {
             },
           });
           await closeBatcher();
-          await reportState({
+          // PRD #1391 Run B M3 (N1): journal write-ahead so the prompt-kind orphan-checkpoint failure
+          // survives an outage as this exact outcome, not a generic agent_failure.
+          await journalTerminalReport({
             status: "failed",
             failure_reason:
               "signal_done was called with report_only, but this run published committed work to a checkpoint ref (refs/uzi-checkpoints/" +
@@ -2101,7 +2910,10 @@ export class RunRunner {
           },
         });
         await closeBatcher();
-        await reportState({
+        // PRD #1391 Run B M3 (N1): journal write-ahead so the prompt report_only completion (its
+        // report_md AND any structured proposal) is the durable outcome after an outage, not a
+        // generic agent_failure that loses the proposal.
+        await journalTerminalReport({
           status: "completed",
           report_only: true,
           report_md: result.summary,
@@ -2294,7 +3106,7 @@ export class RunRunner {
           { run_id: runId, paths: wfHits },
         );
         await closeBatcher();
-        await reportState({
+        await journalTerminalReport({
           status: "failed",
           failure_reason: reason.slice(0, MAX_FAILURE_REASON_LEN),
           fail_origin: "workflow_scope_missing",
@@ -2305,13 +3117,16 @@ export class RunRunner {
     }
 
     // PRD #974 M2 / #1077: the single terminal reporter for a push_secret_blocked failure.
-    // If reportState exhausts its bounded retries and throws, rethrow a typed sentinel so
-    // execute()'s generic catch preserves the push_secret_blocked origin instead of defaulting
-    // to agent_failure — and NEVER attach preserved_patch (the diff carries the detected secret).
+    // PRD #1391 Run B M3b: journal it WRITE-AHEAD (D3) then resolve it. On the journaled path a send
+    // that fails now leaves the durable journal (with the push_secret_blocked origin) for a later
+    // resolve, so it never throws — the outcome is captured. Only the reserve_exhausted (or no-outbox)
+    // degraded path sends directly and can throw on exhaustion; rethrow a typed sentinel THERE so
+    // execute()'s generic catch preserves the push_secret_blocked origin instead of defaulting to
+    // agent_failure. NEVER attach preserved_patch (the diff carries the detected secret).
     const reportPushSecretBlocked = async (reason: string): Promise<void> => {
       const capped = reason.slice(0, MAX_FAILURE_REASON_LEN);
       try {
-        await reportState({
+        await journalTerminalReport({
           status: "failed",
           failure_reason: capped,
           fail_origin: "push_secret_blocked",
@@ -2322,6 +3137,14 @@ export class RunRunner {
       }
     };
 
+    // PRD #1416 M4 (fact 15): whether the top-of-finalize secret scan below walked a TRUSTWORTHY
+    // range. A divergent H (the branch that reaches history_rewritten) fails the scan floor OPEN
+    // (secretScanRange returns trusted:false), so the pushable range is NOT secret-scanned. This
+    // flag gates whether failHistoryRewritten may attach a preserved_patch: only a scan-trusted
+    // range may be preserved, else an UNSCANNED secret could be written into a stored/displayed
+    // diff. Defaults false, so a non-github forge (no scan at all) also omits the patch — the
+    // conservative, safe default. Set only inside the github scan block below.
+    let scanRangeTrusted = false;
     // PRD #974 M2 (load-bearing security): a GitHub run's committed range is scanned for secrets
     // with the pinned gitleaks (default ruleset, all three silencers GitHub Push Protection
     // ignores DISABLED — see git.secretScanRange) BEFORE the doomed push, mirroring the #377
@@ -2338,6 +3161,7 @@ export class RunRunner {
         cloneUrl: claim.repo.clone_url,
         username: claim.secrets.forge_username,
       });
+      scanRangeTrusted = scan.trusted;
       if (scan.trusted && scan.findings.length > 0) {
         const reason = composePushSecretBlockedReason(scan.findings);
         // Do NOT preserve the diff on a secret block. redactText only scrubs the run's OWN
@@ -2400,6 +3224,58 @@ export class RunRunner {
         { log: runLog, signal: boundarySignal },
       );
 
+    // PRD #1416 (MR-rework, finding 1): a bridge NEWLY makes a rewritten branch pushable (a plain
+    // rewritten push is non-fast-forward-rejected on every forge). The top-of-finalize scan ran on
+    // the divergent H with an unresolvable floor and failed OPEN; now that the tracking ref is B and
+    // P is an ancestor of B, P..B is the real, trustworthy push delta. Re-scan it on EVERY forge
+    // before pushing B — GitLab/Forgejo have no GH013 backstop, so this worker-side scan is their
+    // only gate. On a TRUSTED finding: report push_secret_blocked (no preserved_patch), no push.
+    // On untrusted/clean: fail open (unchanged; GH013 still backstops GitHub at the push catch).
+    const scanBridgedRangeAndBlock = async (scanBare: string): Promise<"blocked" | "ok"> => {
+      const scan = await this.git.secretScanRange(scanBare, trackingRef, result.branch, {
+        pat: claim.secrets.forge_pat,
+        cloneUrl: claim.repo.clone_url,
+        username: claim.secrets.forge_username,
+      });
+      if (scan.trusted && scan.findings.length > 0) {
+        // #1416 (MR-rework, finding 8) — forge_type is optional (an omitted value means GitLab, R8),
+        // but composePushSecretBlockedReason defaults undefined → github (relied on by the
+        // GitHub-gated top-of-finalize caller). Normalize HERE so an omitted-forge_type GitLab run
+        // gets forge-neutral wording, not GH013/"GitHub Push Protection".
+        const forgeType =
+          claim.repo.forge_type === "forgejo"
+            ? "forgejo"
+            : claim.repo.forge_type === "github"
+              ? "github"
+              : "gitlab"; // R8: an omitted forge_type is GitLab, which has no GH013 backstop
+        const reason = composePushSecretBlockedReason(scan.findings, forgeType);
+        batcher.emit({
+          kind: "status",
+          agent: "worker",
+          payload: {
+            text: "the bridged branch carries a secret the pre-push scan detected; failing without pushing — the diff is withheld because it may carry the secret",
+          },
+        });
+        runLog.info(
+          "run failed: post-bridge secret scan found a secret in the P..B push delta; withholding diff",
+          {
+            run_id: runId,
+            findings: scan.findings.map((f) => ({ commit: f.commit, file: f.file, rule: f.ruleId })),
+          },
+        );
+        await closeBatcher();
+        await reportPushSecretBlocked(reason);
+        return "blocked";
+      }
+      if (!scan.trusted) {
+        runLog.warn(
+          "post-bridge secret scan: not trustworthy (broken/empty); pushing and relying on the GH013 remote backstop where it exists",
+          { run_id: runId },
+        );
+      }
+      return "ok";
+    };
+
     // PRD #974 M2 — the GH013 remote backstop. When a finalize push (the normal path OR an
     // align-path push) is rejected by GitHub Push Protection for a secret the pre-push gitleaks
     // scan missed (GitHub's pattern set is broader than gitleaks', and the two are not
@@ -2452,11 +3328,55 @@ export class RunRunner {
         { run_id: runId },
       );
       await closeBatcher();
-      await reportState({
+      await journalTerminalReport({
         status: "failed",
         failure_reason:
           "The MR branch was advanced by a concurrent writer, so this rework was superseded and not applied. The branch and the concurrent commits are intact.",
         branch_moved: true,
+      });
+    };
+
+    // PRD #1416 M4: the typed terminal for a run whose branch was rewritten at/below the published
+    // floor P AND could not be bridged to a fast-forward (bridgeBareTrackingRefIfDivergent returned
+    // {kind:"failed"}, which the finalize sinks throw as HistoryRewrittenError). Mirrors
+    // failBaseAlignConflict / failPushSecretBlocked / failBranchMoved: a worker status line, close
+    // the batcher, and report `failed` through the reportState WRAPPER (so driveRecoveryTerminal
+    // captures + uploads the verified bundle — the #1296 durable-recovery path, per the PRD).
+    // fail_origin=history_rewritten, NEVER the generic catch (agent_failure) and NEVER
+    // finalize_base_align_conflict. push_secret_blocked keeps precedence: a bridge FAILURE throws
+    // BEFORE any push, so a GH013 rejection (which happens only AFTER a successful bridge+push) can
+    // never collide with this path.
+    //
+    // preserved_patch is SECURITY-GATED (fact 15). The divergent H that reaches here failed the
+    // top-of-finalize secret scan floor OPEN (scanRangeTrusted=false), so the pushable range was NOT
+    // secret-scanned; attaching its diff could persist an UNSCANNED secret into runs.preserved_patch
+    // / RunView. So the (redacted) diff is included ONLY when a trustworthy scanned range was
+    // available, and OMITTED otherwise — which is the divergent case in practice. The committed work
+    // is durably recoverable via the #1296 capture regardless; the preserved_patch is a convenience.
+    const failHistoryRewritten = async (publishedTip: string) => {
+      let patch: string | undefined;
+      if (scanRangeTrusted) {
+        // Reuse the same diff helper failBaseAlignConflict uses, redacting the run's own secrets.
+        const rawPatch = await this.git.workflowScopeDiff(finalizeBarePath, trackingRef);
+        patch = rawPatch === null ? undefined : redactText(rawPatch);
+      }
+      batcher.emit({
+        kind: "status",
+        agent: "worker",
+        payload: {
+          text: "the branch's history was rewritten below its published tip and could not be bridged to a fast-forward; failing (uzi never force-pushes) — the committed work is on the run branch and recoverable",
+        },
+      });
+      runLog.info(
+        "run failed: history rewritten at or below the published tip; a fast-forward bridge could not be built or validated",
+        { run_id: runId, published_tip: publishedTip, preserved_patch: patch !== undefined },
+      );
+      await closeBatcher();
+      await journalTerminalReport({
+        status: "failed",
+        failure_reason: composeHistoryRewrittenReason(publishedTip).slice(0, MAX_FAILURE_REASON_LEN),
+        fail_origin: "history_rewritten",
+        preserved_patch: patch,
       });
     };
 
@@ -2471,298 +3391,345 @@ export class RunRunner {
     // rather than face-plant into GitHub's opaque rejection and discard the committed work.
     // GitHub-only: GitLab/Forgejo impose no workflow-scope rule.
     let alignPushed = false;
-    if (claim.repo.forge_type === "github") {
-      const alignBarePath = barePath;
-      const alignDefaultBranch =
-        claim.repo.default_branch?.trim() ||
-        (await this.git.defaultBranchName(alignBarePath)) ||
-        "main";
-      // Detection is best-effort (N2/D6 posture): a fetch/diff failure must NOT block a push
-      // that may well succeed (the branch may not actually be behind) — fall through to the
-      // normal push, never fail a run on an inability to compute the align target.
-      let defaultTip: string | undefined;
-      let differs = false;
-      try {
-        defaultTip = await this.git.fetchDefaultTip(
-          alignBarePath,
-          alignDefaultBranch,
-          claim.secrets.forge_pat,
-          claim.repo.clone_url,
-          claim.secrets.forge_username,
-        );
-        differs = await this.git.workflowTreeDiffers(
-          alignBarePath,
-          trackingRef,
-          defaultTip,
-        );
-      } catch (e) {
-        runLog.warn(
-          "finalize base-align: could not compute the align target; pushing without aligning",
-          { run_id: runId, error: errMessage(e) },
-        );
-      }
-      if (defaultTip && differs) {
-        // The pre-align committed agent tip — the base every align strategy starts from, so
-        // a rebase FALLBACK after a clean merge replays the ORIGINAL commits, not the merge.
-        const originalAgentTip = await this.git.branchTip(
-          runnerClone.path,
-          result.branch,
-        );
-        if (!originalAgentTip) {
-          runLog.warn(
-            "finalize base-align: could not resolve the branch tip; pushing without aligning",
-            { run_id: runId },
+    // PRD #1416 M4 (SC3): wrap the whole align chain so a HistoryRewrittenError thrown at its
+    // bridge site (git.ts bridgeToFloors → {kind:"failed"} → thrown inside fetchAndPush and
+    // rethrown by the arms' push catches, which classify only push-protection/workflow-scope/
+    // non-ff) is TYPED history_rewritten here rather than escaping to the generic catch. Declared
+    // OUTSIDE this try so the plain-push block below still sees `alignPushed`.
+    try {
+      if (claim.repo.forge_type === "github") {
+        const alignBarePath = barePath;
+        const alignDefaultBranch =
+          claim.repo.default_branch?.trim() ||
+          (await this.git.defaultBranchName(alignBarePath)) ||
+          "main";
+        // Detection is best-effort (N2/D6 posture): a fetch/diff failure must NOT block a push
+        // that may well succeed (the branch may not actually be behind) — fall through to the
+        // normal push, never fail a run on an inability to compute the align target.
+        let defaultTip: string | undefined;
+        let differs = false;
+        try {
+          defaultTip = await this.git.fetchDefaultTip(
+            alignBarePath,
+            alignDefaultBranch,
+            claim.secrets.forge_pat,
+            claim.repo.clone_url,
+            claim.secrets.forge_username,
           );
-        } else {
-          // The conflict-failure path (M2). The abort already ran inside
-          // alignBranchWithDefault; here we preserve the diff via #377's preserved_patch and
-          // fail typed. We diff the pre-align agent tip (`originalAgentTip`, declared at :1848,
-          // non-null under the :1852 guard) — NOT `trackingRef` — so the preserved patch is
-          // exactly the agent's human-landable work. Issue #631: when a strategy ALIGNED and
-          // then had its push rejected (the overlay's arm (c), or a merge/rebase whose push was
-          // rejected) `fetchAndPush` re-fetched the ALIGNED tip into `trackingRef`, so diffing
-          // `trackingRef` yielded a SUPERSET (agent work PLUS the aligning strategy's own
-          // workflow-subtree/merge changes) if a LATER strategy then conflicted and landed here.
-          // Diffing `originalAgentTip` eliminates that superset: its objects were fetched into
-          // the worker bare by the finalize `fetchAgentBranch` before any align, so
-          // workflowScopeDiff resolves it. In the non-push conflict paths originalAgentTip ==
-          // trackingRef, so those are unchanged; in the clobber-safety path (a branch that
-          // edited a workflow) originalAgentTip carries that edit, so it is still preserved.
-          const defTip = defaultTip;
-          const failBaseAlignConflict = async () => {
-            const rawPatch = await this.git.workflowScopeDiff(alignBarePath, originalAgentTip);
-            const patch = rawPatch === null ? undefined : redactText(rawPatch);
+          differs = await this.git.workflowTreeDiffers(
+            alignBarePath,
+            trackingRef,
+            defaultTip,
+          );
+        } catch (e) {
+          runLog.warn(
+            "finalize base-align: could not compute the align target; pushing without aligning",
+            { run_id: runId, error: errMessage(e) },
+          );
+        }
+        if (defaultTip && differs) {
+          // The pre-align committed agent tip — the base every align strategy starts from, so
+          // a rebase FALLBACK after a clean merge replays the ORIGINAL commits, not the merge.
+          const originalAgentTip = await this.git.branchTip(
+            runnerClone.path,
+            result.branch,
+          );
+          if (!originalAgentTip) {
+            runLog.warn(
+              "finalize base-align: could not resolve the branch tip; pushing without aligning",
+              { run_id: runId },
+            );
+          } else {
+            // The conflict-failure path (M2). The abort already ran inside
+            // alignBranchWithDefault; here we preserve the diff via #377's preserved_patch and
+            // fail typed. We diff the pre-align agent tip (`originalAgentTip`, declared at :1848,
+            // non-null under the :1852 guard) — NOT `trackingRef` — so the preserved patch is
+            // exactly the agent's human-landable work. Issue #631: when a strategy ALIGNED and
+            // then had its push rejected (the overlay's arm (c), or a merge/rebase whose push was
+            // rejected) `fetchAndPush` re-fetched the ALIGNED tip into `trackingRef`, so diffing
+            // `trackingRef` yielded a SUPERSET (agent work PLUS the aligning strategy's own
+            // workflow-subtree/merge changes) if a LATER strategy then conflicted and landed here.
+            // Diffing `originalAgentTip` eliminates that superset: its objects were fetched into
+            // the worker bare by the finalize `fetchAgentBranch` before any align, so
+            // workflowScopeDiff resolves it. In the non-push conflict paths originalAgentTip ==
+            // trackingRef, so those are unchanged; in the clobber-safety path (a branch that
+            // edited a workflow) originalAgentTip carries that edit, so it is still preserved.
+            const defTip = defaultTip;
+            const failBaseAlignConflict = async () => {
+              const rawPatch = await this.git.workflowScopeDiff(alignBarePath, originalAgentTip);
+              const patch = rawPatch === null ? undefined : redactText(rawPatch);
+              batcher.emit({
+                kind: "status",
+                agent: "worker",
+                payload: {
+                  text: "could not realign the branch with the updated default branch and safely push it (merge and rebase conflicted, or the aligned branch could not be fast-forwarded); failing and preserving the diff for a human to land",
+                },
+              });
+              runLog.info("run failed: finalize base-align conflict; preserving diff", {
+                run_id: runId,
+              });
+              await closeBatcher();
+              // PRD #1391 Run B M3 (N1): journal write-ahead so the typed base-align-conflict failure
+              // — its fail_origin AND its preserved_patch (the canonicaliser handles the diff size) —
+              // survives an outage as this exact outcome, not a generic agent_failure that loses the
+              // diff a human needs to land.
+              await journalTerminalReport({
+                status: "failed",
+                failure_reason: composeBaseAlignConflictReason(alignDefaultBranch),
+                fail_origin: "finalize_base_align_conflict",
+                preserved_patch: patch,
+              });
+            };
+
+            // Run one align STRATEGY, treating an UNEXPECTED throw (the S3 count-mismatch
+            // guard, or any git error) exactly like a `"conflict"` return. This is the whole
+            // point of the feature: the agent's work must be PRESERVED on failure, so an
+            // unexpected align error must route to failBaseAlignConflict (typed fail + diff),
+            // NOT escape to the generic catch below (raw message, no preserved_patch, defaulted
+            // fail_origin). Scoped to the align OPERATION only — the push keeps its own
+            // handling (workflow-scope → rebase fallback; any other push error rethrows).
+            const alignOp = async (strategy: "merge" | "rebase"): Promise<"aligned" | "conflict"> => {
+              try {
+                return await this.git.alignBranchWithDefault(
+                  runnerClone.path,
+                  result.branch,
+                  originalAgentTip,
+                  defTip,
+                  strategy,
+                );
+              } catch (e) {
+                runLog.warn(
+                  "finalize base-align: unexpected error during align; preserving diff and failing typed",
+                  { run_id: runId, strategy, error: errMessage(e) },
+                );
+                return "conflict";
+              }
+            };
+
+            // Re-fetch the aligned tip into the worker bare's tracking ref, then push once.
+            const fetchAndPush = async () => {
+              await this.git.fetchAgentBranch(
+                alignBarePath,
+                runnerClone.path,
+                result.branch,
+                runId,
+              );
+              // PRD #1416 M3 (C4): the align chain re-fetched the CLONE's aligned tip into the
+              // tracking ref — and a rebase-fallback align rewrites P (fact 14), so the aligned tip
+              // can itself be divergent below P. Bridge it here, AFTER the re-fetch and BEFORE the
+              // push, so pushToOrigin pushes B (P is an ancestor of B → fast-forward). One placement
+              // covers all three arms (overlay, merge, rebase). A "failed" bridge throws
+              // HistoryRewrittenError, which the arm's push catch rethrows (it catches only push-
+              // protection / workflow-scope / non-ff); PRD #1416 M4's try/catch wrapping the whole
+              // align chain then types it history_rewritten (never the generic catch, SC3).
+              const o = await this.bridgeBareTrackingRefIfDivergent(
+                alignBarePath,
+                result.branch,
+                flight,
+                runLog,
+              );
+              if (o.kind === "failed") throw new HistoryRewrittenError(flight.publishedTip!);
+              // PRD #1416 (MR-rework, finding 1): re-scan the now-trusted P..B delta before pushing
+              // the bridged, aligned tip. On a trusted finding scanBridgedRangeAndBlock has already
+              // terminally reported push_secret_blocked, so throw the data-free unwind sentinel — the
+              // enclosing align try/catch and the outer finalize catch propagate it without pushing or
+              // re-reporting (mirroring how HistoryRewrittenError unwinds this same nested closure).
+              if (o.kind === "bridged" && (await scanBridgedRangeAndBlock(alignBarePath)) === "blocked") {
+                throw new PushSecretBlockedSignal();
+              }
+              await pushToOrigin();
+              alignPushed = true;
+            };
+
+            // Push the aligned branch. Two rejections here are the base-align-conflict path,
+            // not a mislabel: a REPEAT workflow-scope rejection means the default's workflow
+            // files moved again DURING our align (double-TOCTOU); a NON-FAST-FORWARD rejection
+            // means the rebase fallback rewrote the history of an already-published branch (a
+            // resume, or the self_improve fixed branch) so this non-forced push cannot
+            // fast-forward, and force-push is denied by the guardrails by design. Both preserve
+            // the diff and fail typed rather than lose it to the generic catch. Any OTHER push
+            // error still rethrows unchanged (a genuine auth/transient/protected-branch failure
+            // must not be mislabelled as a base-align conflict). Returns true if it
+            // preserved-and-failed (the caller must then `return`), false on a successful push.
+            const pushAlignedOrPreserve = async (): Promise<boolean> => {
+              try {
+                await fetchAndPush();
+                return false;
+              } catch (e) {
+                // PRD #974 M2: an aligned push rejected by GitHub Push Protection (GH013) is a
+                // secret the pre-push gitleaks scan missed — route it to the typed
+                // push_secret_blocked fail (NO preserved diff: it may carry the detected secret)
+                // rather than the base-align-conflict path or the generic catch.
+                if (isPushProtectionRejection(e)) {
+                  runLog.info(
+                    "finalize base-align: aligned push rejected by GitHub Push Protection (GH013); failing typed, no preserved diff (it may carry the secret)",
+                    { run_id: runId },
+                  );
+                  await failPushSecretBlocked();
+                  return true;
+                }
+                const nonFf = isNonFastForwardRejection(e);
+                if (!isWorkflowScopeRejection(e) && !nonFf) throw e;
+                // Record WHICH cause fired so an operator reading logs can tell the two apart:
+                // a repeat workflow-scope rejection (the default's workflow files moved again
+                // DURING our align) versus a non-fast-forward (the rebase rewrote an
+                // already-published branch's history, a resume or the self_improve fixed
+                // branch, that the bot cannot force-push).
+                runLog.info(
+                  nonFf
+                    ? "finalize base-align: aligned push rejected non-fast-forward (rebase rewrote an already-published branch's history the bot cannot force-push); preserving diff and failing typed"
+                    : "finalize base-align: aligned push STILL workflow-scope-rejected (default moved again during align); preserving diff and failing typed",
+                  { run_id: runId },
+                );
+                await failBaseAlignConflict();
+                return true;
+              }
+            };
+
+            // Issue #627 — the overlay gate (correctness pin). FRESHLY recompute the branch's
+            // workflow-change signal here: the #377 guard earlier FAILS OPEN on a null diff, so
+            // a branch that modified a workflow file can still reach this block. Overlaying the
+            // default's workflow subtree would then CLOBBER that agent edit, so the overlay is
+            // allowed ONLY when the diff succeeded AND the branch provably modified NO workflow
+            // file. Any other case (null diff, or a real workflow edit) falls straight into the
+            // EXISTING merge → rebase → preserve chain, unchanged.
+            // Issue #631: reuse the #377 guard's changedFiles result (identical barePath+trackingRef);
+            // recompute only when #377 failed open (null diff), so a transient diff failure gets a retry.
+            const alignChanged =
+              changedForWf === null
+                ? await this.git.changedFiles(alignBarePath, trackingRef)
+                : changedForWf;
+            const alignWfHits =
+              alignChanged === null
+                ? null
+                : flagCIConfigPaths(alignChanged, [".github/workflows/**"]);
+            const canOverlay =
+              alignChanged !== null && alignWfHits !== null && alignWfHits.length === 0;
+
+            // Emit once here so the status fires on BOTH the overlay and the fallback paths.
             batcher.emit({
               kind: "status",
               agent: "worker",
               payload: {
-                text: "could not realign the branch with the updated default branch and safely push it (merge and rebase conflicted, or the aligned branch could not be fast-forwarded); failing and preserving the diff for a human to land",
+                text: "branch is behind the default branch on .github/workflows; aligning before pushing",
               },
             });
-            runLog.info("run failed: finalize base-align conflict; preserving diff", {
-              run_id: runId,
-            });
-            await closeBatcher();
-            await reportState({
-              status: "failed",
-              failure_reason: composeBaseAlignConflictReason(alignDefaultBranch),
-              fail_origin: "finalize_base_align_conflict",
-              preserved_patch: patch,
-            });
-          };
 
-          // Run one align STRATEGY, treating an UNEXPECTED throw (the S3 count-mismatch
-          // guard, or any git error) exactly like a `"conflict"` return. This is the whole
-          // point of the feature: the agent's work must be PRESERVED on failure, so an
-          // unexpected align error must route to failBaseAlignConflict (typed fail + diff),
-          // NOT escape to the generic catch below (raw message, no preserved_patch, defaulted
-          // fail_origin). Scoped to the align OPERATION only — the push keeps its own
-          // handling (workflow-scope → rebase fallback; any other push error rethrows).
-          const alignOp = async (strategy: "merge" | "rebase"): Promise<"aligned" | "conflict"> => {
-            try {
-              return await this.git.alignBranchWithDefault(
-                runnerClone.path,
-                result.branch,
-                originalAgentTip,
-                defTip,
-                strategy,
-              );
-            } catch (e) {
-              runLog.warn(
-                "finalize base-align: unexpected error during align; preserving diff and failing typed",
-                { run_id: runId, strategy, error: errMessage(e) },
-              );
-              return "conflict";
-            }
-          };
-
-          // Re-fetch the aligned tip into the worker bare's tracking ref, then push once.
-          const fetchAndPush = async () => {
-            await this.git.fetchAgentBranch(
-              alignBarePath,
-              runnerClone.path,
-              result.branch,
-              runId,
-            );
-            await pushToOrigin();
-            alignPushed = true;
-          };
-
-          // Push the aligned branch. Two rejections here are the base-align-conflict path,
-          // not a mislabel: a REPEAT workflow-scope rejection means the default's workflow
-          // files moved again DURING our align (double-TOCTOU); a NON-FAST-FORWARD rejection
-          // means the rebase fallback rewrote the history of an already-published branch (a
-          // resume, or the self_improve fixed branch) so this non-forced push cannot
-          // fast-forward, and force-push is denied by the guardrails by design. Both preserve
-          // the diff and fail typed rather than lose it to the generic catch. Any OTHER push
-          // error still rethrows unchanged (a genuine auth/transient/protected-branch failure
-          // must not be mislabelled as a base-align conflict). Returns true if it
-          // preserved-and-failed (the caller must then `return`), false on a successful push.
-          const pushAlignedOrPreserve = async (): Promise<boolean> => {
-            try {
-              await fetchAndPush();
-              return false;
-            } catch (e) {
-              // PRD #974 M2: an aligned push rejected by GitHub Push Protection (GH013) is a
-              // secret the pre-push gitleaks scan missed — route it to the typed
-              // push_secret_blocked fail (NO preserved diff: it may carry the detected secret)
-              // rather than the base-align-conflict path or the generic catch.
-              if (isPushProtectionRejection(e)) {
-                runLog.info(
-                  "finalize base-align: aligned push rejected by GitHub Push Protection (GH013); failing typed, no preserved diff (it may carry the secret)",
-                  { run_id: runId },
-                );
-                await failPushSecretBlocked();
-                return true;
-              }
-              const nonFf = isNonFastForwardRejection(e);
-              if (!isWorkflowScopeRejection(e) && !nonFf) throw e;
-              // Record WHICH cause fired so an operator reading logs can tell the two apart:
-              // a repeat workflow-scope rejection (the default's workflow files moved again
-              // DURING our align) versus a non-fast-forward (the rebase rewrote an
-              // already-published branch's history, a resume or the self_improve fixed
-              // branch, that the bot cannot force-push).
-              runLog.info(
-                nonFf
-                  ? "finalize base-align: aligned push rejected non-fast-forward (rebase rewrote an already-published branch's history the bot cannot force-push); preserving diff and failing typed"
-                  : "finalize base-align: aligned push STILL workflow-scope-rejected (default moved again during align); preserving diff and failing typed",
-                { run_id: runId },
-              );
-              await failBaseAlignConflict();
-              return true;
-            }
-          };
-
-          // Issue #627 — the overlay gate (correctness pin). FRESHLY recompute the branch's
-          // workflow-change signal here: the #377 guard earlier FAILS OPEN on a null diff, so
-          // a branch that modified a workflow file can still reach this block. Overlaying the
-          // default's workflow subtree would then CLOBBER that agent edit, so the overlay is
-          // allowed ONLY when the diff succeeded AND the branch provably modified NO workflow
-          // file. Any other case (null diff, or a real workflow edit) falls straight into the
-          // EXISTING merge → rebase → preserve chain, unchanged.
-          // Issue #631: reuse the #377 guard's changedFiles result (identical barePath+trackingRef);
-          // recompute only when #377 failed open (null diff), so a transient diff failure gets a retry.
-          const alignChanged =
-            changedForWf === null
-              ? await this.git.changedFiles(alignBarePath, trackingRef)
-              : changedForWf;
-          const alignWfHits =
-            alignChanged === null
-              ? null
-              : flagCIConfigPaths(alignChanged, [".github/workflows/**"]);
-          const canOverlay =
-            alignChanged !== null && alignWfHits !== null && alignWfHits.length === 0;
-
-          // Emit once here so the status fires on BOTH the overlay and the fallback paths.
-          batcher.emit({
-            kind: "status",
-            agent: "worker",
-            payload: {
-              text: "branch is behind the default branch on .github/workflows; aligning before pushing",
-            },
-          });
-
-          // PRIMARY (issue #627): overlay ONLY the default tip's .github/workflows/ subtree
-          // onto the agent tip. It cannot conflict and is a fast-forward (original agent SHAs
-          // preserved, nothing rebased), and it makes the tip's workflow tree equal main's —
-          // all GitHub's tip-vs-default check requires — WITHOUT dragging in main's unrelated
-          // changes the way a whole-tree merge/rebase does. Invoked OUTSIDE alignOp on
-          // purpose: alignOp maps any throw to "conflict" (→ preserve-and-fail), which is
-          // WRONG for the overlay — an overlay error must fall back to merge/rebase, not
-          // preserve-and-fail. So the overlay gets its own try/catch here.
-          let overlayHandled = false;
-          if (canOverlay) {
-            let overlayAligned = false;
-            try {
-              const res = await this.git.alignBranchWithDefault(
-                runnerClone.path,
-                result.branch,
-                originalAgentTip,
-                defTip,
-                "workflow-subtree",
-              );
-              overlayAligned = res === "aligned"; // the overlay never returns "conflict"
-            } catch (e) {
-              // (b) the overlay git op threw (a GENUINE unexpected git error) → fall back to
-              // merge/rebase, NOT preserve-and-fail. Distinct message from (c) below.
-              runLog.warn(
-                "finalize base-align: workflow-subtree overlay errored; falling back to merge/rebase",
-                { run_id: runId, error: errMessage(e) },
-              );
-            }
-            if (overlayAligned) {
+            // PRIMARY (issue #627): overlay ONLY the default tip's .github/workflows/ subtree
+            // onto the agent tip. It cannot conflict and is a fast-forward (original agent SHAs
+            // preserved, nothing rebased), and it makes the tip's workflow tree equal main's —
+            // all GitHub's tip-vs-default check requires — WITHOUT dragging in main's unrelated
+            // changes the way a whole-tree merge/rebase does. Invoked OUTSIDE alignOp on
+            // purpose: alignOp maps any throw to "conflict" (→ preserve-and-fail), which is
+            // WRONG for the overlay — an overlay error must fall back to merge/rebase, not
+            // preserve-and-fail. So the overlay gets its own try/catch here.
+            let overlayHandled = false;
+            if (canOverlay) {
+              let overlayAligned = false;
               try {
-                await fetchAndPush(); // sets alignPushed = true on success
-                overlayHandled = true;
+                const res = await this.git.alignBranchWithDefault(
+                  runnerClone.path,
+                  result.branch,
+                  originalAgentTip,
+                  defTip,
+                  "workflow-subtree",
+                );
+                overlayAligned = res === "aligned"; // the overlay never returns "conflict"
               } catch (e) {
-                // PRD #974 M2: an overlay push rejected by GitHub Push Protection (GH013) is a
-                // secret gitleaks missed — typed push_secret_blocked fail (NO preserved diff:
-                // it may carry the secret), not a fall-back to merge/rebase (which cannot clear
-                // a secret) nor the generic catch.
-                if (isPushProtectionRejection(e)) {
-                  runLog.info(
-                    "finalize base-align: workflow-subtree overlay push rejected by GitHub Push Protection (GH013); failing typed, no preserved diff (it may carry the secret)",
-                    { run_id: runId },
-                  );
-                  await failPushSecretBlocked();
-                  return;
-                }
-                if (!isWorkflowScopeRejection(e) && !isNonFastForwardRejection(e)) throw e;
-                // (c) the overlay pushed but was STILL rejected (workflow-scope: the default
-                // moved again during our align; or non-fast-forward: a resumed/rewritten
-                // branch) → fall back to merge/rebase. Distinct message from (b) above so an
-                // operator can tell the two failure modes apart.
-                runLog.info(
-                  "finalize base-align: workflow-subtree overlay push still rejected; falling back to merge/rebase",
-                  { run_id: runId },
+                // (b) the overlay git op threw (a GENUINE unexpected git error) → fall back to
+                // merge/rebase, NOT preserve-and-fail. Distinct message from (c) below.
+                runLog.warn(
+                  "finalize base-align: workflow-subtree overlay errored; falling back to merge/rebase",
+                  { run_id: runId, error: errMessage(e) },
                 );
               }
+              if (overlayAligned) {
+                try {
+                  await fetchAndPush(); // sets alignPushed = true on success
+                  overlayHandled = true;
+                } catch (e) {
+                  // PRD #974 M2: an overlay push rejected by GitHub Push Protection (GH013) is a
+                  // secret gitleaks missed — typed push_secret_blocked fail (NO preserved diff:
+                  // it may carry the secret), not a fall-back to merge/rebase (which cannot clear
+                  // a secret) nor the generic catch.
+                  if (isPushProtectionRejection(e)) {
+                    runLog.info(
+                      "finalize base-align: workflow-subtree overlay push rejected by GitHub Push Protection (GH013); failing typed, no preserved diff (it may carry the secret)",
+                      { run_id: runId },
+                    );
+                    await failPushSecretBlocked();
+                    return;
+                  }
+                  if (!isWorkflowScopeRejection(e) && !isNonFastForwardRejection(e)) throw e;
+                  // (c) the overlay pushed but was STILL rejected (workflow-scope: the default
+                  // moved again during our align; or non-fast-forward: a resumed/rewritten
+                  // branch) → fall back to merge/rebase. Distinct message from (b) above so an
+                  // operator can tell the two failure modes apart.
+                  runLog.info(
+                    "finalize base-align: workflow-subtree overlay push still rejected; falling back to merge/rebase",
+                    { run_id: runId },
+                  );
+                }
+              }
             }
-          }
 
-          if (!overlayHandled) {
-            const mergeRes = await alignOp("merge");
-            if (mergeRes === "aligned") {
-              try {
-                await fetchAndPush();
-              } catch (e) {
-                // PRD #974 M2: a merge push rejected by GitHub Push Protection (GH013) is a secret
-                // gitleaks missed — typed push_secret_blocked fail (NO preserved diff: it may
-                // carry the secret), not the rebase fallback (which cannot clear a secret) nor
-                // the generic catch.
-                if (isPushProtectionRejection(e)) {
+            if (!overlayHandled) {
+              const mergeRes = await alignOp("merge");
+              if (mergeRes === "aligned") {
+                try {
+                  await fetchAndPush();
+                } catch (e) {
+                  // PRD #974 M2: a merge push rejected by GitHub Push Protection (GH013) is a secret
+                  // gitleaks missed — typed push_secret_blocked fail (NO preserved diff: it may
+                  // carry the secret), not the rebase fallback (which cannot clear a secret) nor
+                  // the generic catch.
+                  if (isPushProtectionRejection(e)) {
+                    runLog.info(
+                      "finalize base-align: merge push rejected by GitHub Push Protection (GH013); failing typed, no preserved diff (it may carry the secret)",
+                      { run_id: runId },
+                    );
+                    await failPushSecretBlocked();
+                    return;
+                  }
+                  if (isNonFastForwardRejection(e)) {
+                    // Issue #631: a non-fast-forward rejection (an already-published branch — a resume, or
+                    // the self_improve fixed branch — whose merge push cannot fast-forward) can't be cleared
+                    // by the rebase fallback (it also can't force-push), so preserve the diff and fail typed
+                    // rather than escape to the generic catch (raw message, no preserved_patch). This
+                    // matches pushAlignedOrPreserve (:1945-1946), which likewise fails typed on non-ff.
+                    // (The overlay push catch at :2020 handles non-ff differently — it can still fall
+                    // back to merge/rebase — so this arm deliberately does NOT mirror it: once at the
+                    // merge, a rebase cannot clear a non-ff on an already-published branch.)
+                    runLog.info(
+                      "finalize base-align: merge push rejected non-fast-forward; preserving diff and failing typed",
+                      { run_id: runId },
+                    );
+                    await failBaseAlignConflict();
+                    return;
+                  }
+                  if (!isWorkflowScopeRejection(e)) throw e;
+                  // The merge did NOT clear GitHub's workflow-scope rejection → the proven
+                  // rebase fallback (#422). alignBranchWithDefault rewinds to originalAgentTip
+                  // first, so the rebase replays the ORIGINAL agent commits onto the fresh
+                  // default rather than the merge commit.
                   runLog.info(
-                    "finalize base-align: merge push rejected by GitHub Push Protection (GH013); failing typed, no preserved diff (it may carry the secret)",
+                    "finalize base-align: merge push still workflow-scope-rejected; trying rebase fallback",
                     { run_id: runId },
                   );
-                  await failPushSecretBlocked();
-                  return;
+                  const rebaseRes = await alignOp("rebase");
+                  if (rebaseRes === "aligned") {
+                    if (await pushAlignedOrPreserve()) return;
+                  } else {
+                    await failBaseAlignConflict();
+                    return;
+                  }
                 }
-                if (isNonFastForwardRejection(e)) {
-                  // Issue #631: a non-fast-forward rejection (an already-published branch — a resume, or
-                  // the self_improve fixed branch — whose merge push cannot fast-forward) can't be cleared
-                  // by the rebase fallback (it also can't force-push), so preserve the diff and fail typed
-                  // rather than escape to the generic catch (raw message, no preserved_patch). This
-                  // matches pushAlignedOrPreserve (:1945-1946), which likewise fails typed on non-ff.
-                  // (The overlay push catch at :2020 handles non-ff differently — it can still fall
-                  // back to merge/rebase — so this arm deliberately does NOT mirror it: once at the
-                  // merge, a rebase cannot clear a non-ff on an already-published branch.)
-                  runLog.info(
-                    "finalize base-align: merge push rejected non-fast-forward; preserving diff and failing typed",
-                    { run_id: runId },
-                  );
-                  await failBaseAlignConflict();
-                  return;
-                }
-                if (!isWorkflowScopeRejection(e)) throw e;
-                // The merge did NOT clear GitHub's workflow-scope rejection → the proven
-                // rebase fallback (#422). alignBranchWithDefault rewinds to originalAgentTip
-                // first, so the rebase replays the ORIGINAL agent commits onto the fresh
-                // default rather than the merge commit.
-                runLog.info(
-                  "finalize base-align: merge push still workflow-scope-rejected; trying rebase fallback",
-                  { run_id: runId },
-                );
+              } else {
+                // The merge conflicted (or errored) — a rebase may still replay cleanly where a
+                // single merge did not, so try it before giving up.
+                runLog.info("finalize base-align: merge conflicted; trying rebase", {
+                  run_id: runId,
+                });
                 const rebaseRes = await alignOp("rebase");
                 if (rebaseRes === "aligned") {
                   if (await pushAlignedOrPreserve()) return;
@@ -2771,23 +3738,26 @@ export class RunRunner {
                   return;
                 }
               }
-            } else {
-              // The merge conflicted (or errored) — a rebase may still replay cleanly where a
-              // single merge did not, so try it before giving up.
-              runLog.info("finalize base-align: merge conflicted; trying rebase", {
-                run_id: runId,
-              });
-              const rebaseRes = await alignOp("rebase");
-              if (rebaseRes === "aligned") {
-                if (await pushAlignedOrPreserve()) return;
-              } else {
-                await failBaseAlignConflict();
-                return;
-              }
             }
           }
         }
       }
+    } catch (e) {
+      // PRD #1416 M4 (SC3): a bridge that could not be built/validated at a finalize push site was
+      // thrown as HistoryRewrittenError; type it history_rewritten — never the generic catch
+      // (agent_failure), never finalize_base_align_conflict (the align arms call failBaseAlignConflict
+      // only for push-classified errors, never for this). Any other error rethrows unchanged.
+      if (e instanceof HistoryRewrittenError) {
+        await failHistoryRewritten(e.publishedTip);
+        return;
+      }
+      if (e instanceof PushSecretBlockedSignal) {
+        // PRD #1416 (MR-rework, finding 1): the align-path post-bridge scan already terminally
+        // reported push_secret_blocked inside fetchAndPush; unwind and stop (never re-report, never
+        // fall through to the plain-path push below).
+        return;
+      }
+      throw e;
     }
 
     // PRD #400 M2: a TASK run always pushes its branch back (the deliverable is the
@@ -2813,6 +3783,32 @@ export class RunRunner {
     // aligned branch — the run pushes through EXACTLY ONE code path (`pushToOrigin`), so a
     // successful align-push and the normal push converge here without ever double-pushing.
     if (!alignPushed) {
+      // PRD #1416 M3 (C3): non-destructively bridge a divergent tracking tip so the plain push
+      // fast-forwards. On "bridged" the tracking ref now points at B (P is an ancestor of B), so
+      // pushToOrigin pushes B. "clean"/"unknown" proceed unchanged. PRD #1416 M4: on "failed" the
+      // divergent tip cannot be bridged, so type it history_rewritten and STOP here (no push) —
+      // never the generic catch (SC3). A direct call+return is used because this site is at
+      // phasePublish top level, so `return` unwinds the whole finalize (unlike the align site,
+      // which throws to unwind its nested fetchAndPush and is caught by the wrap above). The
+      // top-of-finalize secret scan ran earlier on the divergent H (its floor was unresolvable, so
+      // it failed open); a secret on B is caught by the GH013 remote backstop in the push catch below.
+      const o = await this.bridgeBareTrackingRefIfDivergent(
+        finalizeBarePath,
+        result.branch,
+        flight,
+        runLog,
+      );
+      if (o.kind === "failed") {
+        await failHistoryRewritten(flight.publishedTip!);
+        return;
+      }
+      // PRD #1416 (MR-rework, finding 1): a bridge just made this rewritten branch pushable, so
+      // re-scan the now-trusted P..B delta on EVERY forge before pushing. A trusted finding reports
+      // push_secret_blocked and STOPS (a direct return unwinds the whole finalize, like the
+      // failHistoryRewritten site above).
+      if (o.kind === "bridged" && (await scanBridgedRangeAndBlock(finalizeBarePath)) === "blocked") {
+        return;
+      }
       try {
         await pushToOrigin();
       } catch (e) {
@@ -2866,6 +3862,35 @@ export class RunRunner {
         }
         throw e;
       }
+    }
+
+    // PRD #1416 M3 (Part D): the MR bridge-note, derived from the PUSHED HISTORY — not a
+    // flight-local flag. A bridge built before a park is invisible to a reclaimed run's finalize
+    // (which builds no new bridge), but it is right here in P..pushedTip, so a reclaim still
+    // reports it. Computed ONCE after whichever push landed (plain or align), so it is path-
+    // independent. Only meaningful when there is a published floor P. Best-effort: rangeContainsBridge
+    // never throws (a git error → false), so this can never fail a finalize whose push already landed.
+    let bridged = false;
+    if (flight.publishedTip) {
+      const pushedTip = await this.git.trackingTip(finalizeBarePath, result.branch);
+      if (pushedTip) {
+        bridged = await this.git.rangeContainsBridge(
+          finalizeBarePath,
+          flight.publishedTip,
+          pushedTip,
+        );
+      }
+    }
+    if (bridged) {
+      // Worded GENERICALLY: the branch may have been bridged by THIS worker OR by the agent (the M2
+      // steer's `git merge -s ours <P>`), so it never says "the worker bridged it".
+      batcher.emit({
+        kind: "status",
+        agent: "worker",
+        payload: {
+          text: "the branch contains a history bridge (a published commit was restored as an ancestor so the branch fast-forwards); `git log --first-parent` reads as the intended history",
+        },
+      });
     }
 
     // PRD #400 M2: a no-MR task completes HERE — the branch is pushed, there is
@@ -2935,7 +3960,9 @@ export class RunRunner {
         return;
       }
       await closeBatcher();
-      await reportState({ status: "failed", failure_reason: COMPLETION_INTERLOCK_UNHELD_REASON });
+      // PRD #1391 Run B M3 (N1): journal write-ahead so the completion-interlock failure survives an
+      // outage as this exact outcome, not a generic agent_failure.
+      await journalTerminalReport({ status: "failed", failure_reason: COMPLETION_INTERLOCK_UNHELD_REASON });
       runLog.info("run failed: completion interlock could not park the incomplete run", {
         run_id: runId,
         reason: holdReason,
@@ -2951,7 +3978,9 @@ export class RunRunner {
     const failInterlockedClosed = async (reason: string): Promise<void> => {
       executor.killAgentTree?.();
       await closeBatcher().catch(() => undefined);
-      await reportState({ status: "failed", failure_reason: COMPLETION_INTERLOCK_UNHELD_REASON });
+      // PRD #1391 Run B M3 (N1): journal write-ahead so the fail-closed completion-interlock outcome
+      // survives an outage as this exact outcome, not a generic agent_failure.
+      await journalTerminalReport({ status: "failed", failure_reason: COMPLETION_INTERLOCK_UNHELD_REASON });
       runLog.info("run failed closed: completion interlock could not guarantee a non-closing MR", {
         run_id: runId,
         reason,
@@ -2983,6 +4012,9 @@ export class RunRunner {
         contractRevision,
         branch: result.branch,
         head,
+        // PRD #1247 M5: stamp the claim-lane generation (the SAME value the reportState closure
+        // stamps) so the server refuses to issue a permit for a released/superseded stale flight.
+        claimGeneration: flight.claimGeneration,
       });
       // 3. NOT granted: do NOT create the MR, do NOT render Closes, do NOT report completed — hold.
       if (!permit.granted) {
@@ -3044,6 +4076,7 @@ export class RunRunner {
             result.scopeCapped,
             renderCloses,
             claim.config?.completion_scope,
+            bridged,
           ),
         }, boundarySignal),
       { log: runLog, signal: boundarySignal },
@@ -3088,6 +4121,7 @@ export class RunRunner {
           result.scopeCapped,
           withCloses,
           claim.config?.completion_scope,
+          bridged,
         );
         const desc = banner ? `${banner}\n\n${base}` : base;
         await withForgeRetry(
@@ -3262,6 +4296,10 @@ export class RunRunner {
     }
     const redact = makeRedactor(secrets);
     const redactText = makeTextRedactor(secrets);
+    // PRD #1247 M5b: the claim-lane generation this claim holds. Server-side NOT NULL DEFAULT 0;
+    // `?? 0` covers a pre-#1296 payload that omits the field. Held on the flight and stamped on
+    // every mutating report + message batch so the server's per-query fence can engage.
+    const claimGeneration = claim.claim_generation ?? 0;
     const batcher = new MessageBatcher(
       this.client,
       runId,
@@ -3270,7 +4308,24 @@ export class RunRunner {
       runLog,
       redact,
       redactText,
+      {
+        // PRD #1391 M2: spill to the outbox after a sustained transient outage instead
+        // of tripping. Segments carry the claim generation (default 0 when absent) so
+        // replay can ride it under #1247's fence (D11). transientTripMs/spillBufferBytes
+        // fall back to the batcher's own defaults when unset.
+        ...(this.outbox ? { outbox: this.outbox } : {}),
+        generation: claim.claim_generation ?? 0,
+        ...(this.transientTripMs !== undefined ? { transientTripMs: this.transientTripMs } : {}),
+        ...(this.outboxSpillBufferBytes !== undefined
+          ? { spillBufferBytes: this.outboxSpillBufferBytes }
+          : {}),
+      },
     );
+    // PRD #1391 M2: register this run's batcher in the shared re-arm registry so the
+    // per-worker drainer can return it to the network once its spilled segments retire
+    // — reachable while the run is still live and holds pending segments. Dropped in
+    // executeClaim's terminal finally.
+    this.rearm?.set(runId, () => batcher.rearm());
 
     // Cancel/shutdown spans the whole run; a `cancel` input aborts it via the
     // steering channel, which the executor's ctx.signal watches.
@@ -3287,6 +4342,9 @@ export class RunRunner {
       {
         notify: (text) =>
           batcher.emit({ kind: "status", agent: "worker", payload: { text } }),
+        // PRD #1247 M5b: the claim's generation, so the poll loop acts on a credential_switch
+        // signal ONLY when it targets THIS claim (a signal for a superseded claim is ignored).
+        claimGeneration,
       },
     );
     // issue #552 M3: a graceful `uzi run stop` (PRD #517 M4) consumed into the worker's
@@ -3322,15 +4380,42 @@ export class RunRunner {
       batcher,
       cancel,
       steering,
+      claimGeneration,
       observedSessionId: undefined,
-      reportState: (body, signal) =>
-        this.client.reportState(
-          runId,
-          flight.observedSessionId
-            ? { ...body, session_id: flight.observedSessionId }
-            : body,
-          signal,
-        ),
+      reportState: async (body, signal) => {
+        // PRD #1390 M2a: this same choke point is where the run announces every phase
+        // transition, so reflect the four snapshot phases (running / awaiting_approval /
+        // awaiting_input / awaiting_followup) into the active-run registry BEFORE the report
+        // is sent, so a concurrent snapshot build sees the run in its true phase. Every other
+        // status leaves the entry unchanged (removed by the terminal finally / requeue).
+        const phase = snapshotPhaseOf(body.status);
+        if (phase) this.snapshotRegistry?.setPhase(runId, phase);
+        // PRD #1247 M5b: stamp the claim-lane generation on EVERY mutating report. This is the
+        // single choke point every one of the ~71 report sites goes through (incl. the terminal
+        // `failed` report), so the server's per-query fence engages uniformly. Additive/optional:
+        // the observedSessionId injection is preserved, and claim_generation rides beside it.
+        const stamped: Parameters<WorkerClient["reportState"]>[1] = {
+          ...body,
+          claim_generation: flight.claimGeneration,
+          ...(flight.observedSessionId ? { session_id: flight.observedSessionId } : {}),
+        };
+        const ack = await this.client.reportState(runId, stamped, signal);
+        // PRD #1247 M5b (MINOR-7): the held-state switch signal rides the state ACK too — the
+        // advertised SECONDARY transport beside /inputs. Feed it into the SAME generation-checked,
+        // idempotent, defer-aware trigger the inputs poll uses (tripCredentialSwitch), so a failing
+        // /inputs poll can no longer disable the switch: a report is made far more often than an
+        // inputs poll, and the two transports compose (a switch trips at most once). Fed BEFORE the
+        // stale_claim check below; the two never co-occur (workerStateAck omits the switch signal
+        // from the stale_claim disposition), so ordering is immaterial to correctness.
+        if (ack.credentialSwitch) flight.steering.tripCredentialSwitch(ack.credentialSwitch.generation);
+        // PRD #1247 M5b: a stale_claim disposition means a held-state switch RELEASED this claim
+        // (or a reclaim SUPERSEDED it) — the flight no longer owns the run and MUST STOP. Throw so
+        // executeClaim's catch chain closes the batcher and ends the flight with NO terminal
+        // report (another claim owns the run now). A stale ack on the TERMINAL `failed` report is
+        // a no-op: that reportState is already `.catch(...)`-guarded, so the throw is swallowed.
+        if (ack.staleClaim) throw new StaleClaimError();
+        return ack;
+      },
       barePath: undefined,
       worktreePath: undefined,
       // PRD #267: time-based origin-checkpoint gate state (per run). `lastPublish` starts
@@ -3359,6 +4444,10 @@ export class RunRunner {
       // rather than in the catch so the finally can see it; false is the safe default,
       // so every path that never reaches the park logic cleans up exactly as before.
       parked: false,
+      // PRD #1391 Run B M3 (N2/D5): no terminal outcome resolved yet. Set by journalAndSendTerminal
+      // the moment any completed/failed for this generation is sent/resolved (write-ahead or not),
+      // so reportGenericFailure never falls through to a SECOND `failed` once one is final.
+      terminalResolved: false,
       // PRD #556 M1 / #1197: set by shutdown or a pending recovery capture/report.
       // Like `parked`, it gates EXACTLY the two filesystem removals in the
       // finally (the sibling skills plugin dir and the per-run HOME) and nothing else — so
@@ -3375,25 +4464,20 @@ export class RunRunner {
       result: undefined,
     };
 
-    // PRD #108 M3: the batcher's breaker reports OUT OF BAND, never through itself —
-    // `concat` is order-preserving, so an emitted explanation would queue behind the
-    // poison that tripped it and never land. reportState has bounded retries,
-    // 4xx-fatal semantics, and treats an already-terminal server response as
-    // success, so if the run has already reported terminal this is a safe no-op
-    // rather than a second, racing terminal report. Fire-and-forget: the batcher's
-    // trip path must never block on the network.
-    batcher.onPermanentFailureReport(({ reason }) => {
-      void flight
-        .reportState({
-          status: "failed",
-          failure_reason: reason.slice(0, MAX_FAILURE_REASON_LEN),
-        })
-        .catch((e) =>
-          runLog.error("could not report the message-transport failure", {
-            error: errMessage(e),
-          }),
-        );
-    });
+    // PRD #1391 Run B M3 (D5): a PERMANENT message failure now journals `failed` WRITE-AHEAD
+    // (durable), resolves it, then ABORTS the attempt so execute() unwinds — replacing today's
+    // fire-and-forget `failed` report that left the executor running (the split-brain in miniature,
+    // fact 1). The handler is ASYNC and trip() captures its promise into
+    // batcher.permanentFailureSettled, which reportGenericFailure AWAITS before it checks the journal
+    // — so the abort's terminal `failed` is observable ONLY AFTER the outcome is durable, and a
+    // completion that races the trip can never reverse the first durable winner (the no-replace
+    // install in journalTerminal arbitrates, D4). journalAndSendTerminal awaits the durable journal
+    // install, so by the time the abort fires the `failed` is on disk. Chat keeps today's non-journal
+    // behaviour (chat-runner.ts). When no outbox is wired this degrades to today's direct `failed`
+    // report + abort.
+    // The hook body lives in handlePermanentFailure (a named method) so its journal-BEFORE-abort
+    // ordering is unit-testable against the REAL code — a mutation to abort-first reddens that test.
+    batcher.onPermanentFailureReport(({ reason }) => this.handlePermanentFailure(flight, reason));
 
     return flight;
   }
@@ -3456,8 +4540,39 @@ export class RunRunner {
       repo: claim.repo.url,
       branch: claim.branch ?? null,
     });
-    await reportState({ status: "running" });
+    // PRD #1391 Run B M4: CAPTURE the first `running` ack (previously discarded). A stale_claim
+    // disposition already threw StaleClaimError inside the reportState closure; here we additionally
+    // STOP when the report is refused (applied:false) with a TERMINAL status — the run reached a
+    // terminal state out from under this claim (a racing cancel / an outcome that already landed), so
+    // continuing the phase clone would work a claim the run has already left. Throw the non-`failed`
+    // stop signal rather than clone-and-run on it.
+    const runningAck = await reportState({ status: "running" });
+    if (!runningAck.applied && runningAck.status !== undefined && TERMINAL_RUN_STATUSES.has(runningAck.status)) {
+      runLog.info("first running report refused with a terminal status; stopping the phase clone", {
+        run_id: runId,
+        status: runningAck.status,
+      });
+      throw new RunningAckTerminalError(runningAck.status);
+    }
     steering.start();
+
+    // PRD #1390 M4 — env-gated e2e DROP-EXECUTION seam. OFF unless UZI_E2E_DROP_ON_SENTINEL
+    // is set (so this whole block is inert in production). The run has just reported `running`
+    // (its status_since is now), and it is still listed at `running` in the active-run
+    // registry (executeClaim registered it before phaseClone). Ending the flight HERE — before
+    // ensureClone, so there is no worktree and no recovery journal to retire — models a live
+    // worker that silently loses one execution: no terminal report is sent (the run stays
+    // `running` for the api's heartbeat missing-run requeue to reclaim after the fence), the
+    // ordinary finally drops the snapshot entry, and the claim loop is paused so the e2e can
+    // observe the requeued run sitting `queued` before a reclaim. See E2EDropExecutionError.
+    if (
+      process.env.UZI_E2E_DROP_ON_SENTINEL === "1" &&
+      (claim.issue_description?.includes(E2E_DROP_SENTINEL) ||
+        claim.issue_title?.includes(E2E_DROP_SENTINEL))
+    ) {
+      this.snapshotRegistry?.pauseClaimForE2E();
+      throw new E2EDropExecutionError();
+    }
 
     // PRD #1392 M2: only `ensureClone` is wrapped in `withForgeRetry` (fact 4). When it exhausts
     // the schedule and rethrows the last raw git/forge error, a TRANSIENT verdict (a DNS blip, a
@@ -3522,6 +4637,17 @@ export class RunRunner {
       cancel.abort();
     }
     if (retained) throw new TransientRecoveryError("recovering retained work before reseeding");
+
+    // PRD #1416 M1: record the published floor P ONCE at claim — the branch's forge tip as of
+    // this clone (fact 2), read from the worker bare WITHOUT a fetch. Placed after the whole
+    // clone try/catch so it covers the primary AND the reclaim paths (both assign runnerClone);
+    // the retained-recovery path threw above and re-claims later, recording P on that pass.
+    // Null when the branch did not exist on the forge at clone (a fresh issue run). This is
+    // runner-level flight state that survives an executor restart — never RunnerClone.baseCommit,
+    // which can point at unpublished recovered work. checkpointFloor C initialises to P; later
+    // milestones advance it to each confirmed checkpoint tip.
+    flight.publishedTip = (await this.git.originBranchTip(barePath, flight.branch!)) ?? undefined;
+    flight.checkpointFloor = flight.publishedTip;
 
     // Journal ownership before any model can write. The worker-owned bare config
     // survives failed captures, process restarts, and runner-owned clone tampering.
@@ -3953,6 +5079,10 @@ export class RunRunner {
       // guessing the branch's parent (judge rec, run 51757591).
       baseCommit: runnerClone.baseCommit,
       defaultBranchCommit: runnerClone.defaultBranchCommit,
+      // PRD #1416 M1: the published floor P recorded at claim (flight, restart-surviving),
+      // threaded to prompt-build time so both builders name it on a run with a published
+      // floor. Absent (fresh branch) ⇒ no note.
+      publishedTip: flight.publishedTip,
       emit: (m) => batcher.emit(m),
       oauthToken: claim.secrets.anthropic_oauth_token,
       // PRD #362 M3c: the run-summary model resolved server-side (user-value-wins),
@@ -4029,6 +5159,62 @@ export class RunRunner {
       cancelRequested: () => steering.isCancelled(),
       pauseModeRequested: () => steering.getPauseMode(),
       onPauseNow: (cb) => steering.onPauseNow(cb),
+      // PRD #1247 M5b: re-arm the in-flight turn drop for a held-state credential switch (the
+      // analog of onPauseNow), and restore the gate phase after a switch resume (D13). Absent
+      // resume_phase ⇒ undefined (a fresh run, or an older server), which the executor treats as
+      // today's behaviour.
+      onCredentialSwitch: (cb) => steering.onCredentialSwitch(cb),
+      // PRD #1247 M5b (MAJOR-6): run `fn` with credential-switch trips DEFERRED (the signal held,
+      // not tripped) — the executor wraps a plan-REVISION planning turn in this so a switch never
+      // releases before gatePlan has persisted the revised plan. Balanced begin/finally-end.
+      deferCredentialSwitch: async (fn) => {
+        steering.beginCredentialSwitchDefer();
+        try {
+          return await fn();
+        } finally {
+          steering.endCredentialSwitchDefer();
+        }
+      },
+      // PRD #1247 M5b (data-integrity fix): attempt the held-state credential switch IN PLACE from
+      // wherever the executor was when it tripped (a live implement turn, or an idle gate/question/
+      // follow-up waiter), INSTEAD of letting the CredentialSwitchSignal reach the outer catch and
+      // end the flight while the run is still healthy (which no sweep requeues → a RUN_TIMEOUT
+      // orphan for a running give-up, a strand-until-restart for a held one). Delegates to the SAME
+      // two-phase enterCredentialSwitch the outer catch uses. On a GIVE-UP the run CONTINUES on the
+      // old token in place, so CLEAR the preserve flags enterCredentialSwitch set up front (its
+      // step 2) — a later NORMAL completion must clean up the clone + HOME as usual, not preserve
+      // them (D3/D14). On a RELEASE they are already correct (parked=true, preserveRecoveryClone=
+      // false) so the finally retires the clone and keeps the HOME for resume. The clear lives HERE,
+      // not inside enterCredentialSwitch, because the outer-catch safety net cannot continue in
+      // place and must KEEP the flags to leave the run non-terminal for a requeue.
+      attemptCredentialSwitch: async () => {
+        const outcome = await this.enterCredentialSwitch(claim, flight, runLog);
+        if (outcome === "retained_stop") {
+          // The switch could not be confirmed (BLOCKING-2/3 rework). enterCredentialSwitch RETAINED
+          // all work (the preserve flags stay set); STOP the flight NON-TERMINAL by throwing to
+          // executeClaim's catch chain, rather than continuing in place on a claim the reclaim may
+          // already own (release) or whose switch stamp may still be pending (give-up). Do NOT clear
+          // the preserve flags or undo the wip marker — the retained work must survive for the reclaim.
+          throw new CredentialSwitchRetainedStop();
+        }
+        if (outcome === "gave_up") {
+          flight.preserveRecoveryClone = false;
+          flight.preserveSession = false;
+          // A DIRTY-tree switch committed a `wip(park):` marker in captureRecoveryRestorePoint; a
+          // give-up CONTINUES in place with NO reseed, so the marker must be undone here or it rides
+          // into the eventual MR and the restarted turn builds on a throwaway commit — the SAME orphan
+          // handlePausePark fixes on the pause-continue path (undoWipMarker's docstring). headIsWipMarker
+          // self-guards the blind `reset --mixed HEAD^` so it fires ONLY when HEAD is a marker (a
+          // clean-tree switch committed none). Kept HERE, not in enterCredentialSwitch (shared with the
+          // outer-catch requeue arm, whose reseed reset-softs the marker) and NOT on the release path
+          // (the reclaim's reseed handles it) — the two paths that MUST leave the marker.
+          if (flight.worktreePath && (await this.git.headIsWipMarker(flight.worktreePath))) {
+            await this.git.undoWipMarker(flight.worktreePath).catch(() => undefined);
+          }
+        }
+        return outcome;
+      },
+      resumePhase: claim.resume_phase,
       // Persist the SDK session id the moment the executor learns it, so a
       // re-queued run can resume it. Best-effort.
       onSessionId: (sessionId) => {
@@ -4065,6 +5251,8 @@ export class RunRunner {
           // Use runnerClone.path (const, string), NOT the `worktreePath` local
           // (string | undefined — does not narrow in this closure).
           runnerClone.path,
+          // PRD #1416 M5: the published floor P for the warn-only plan-gate nudge.
+          flight.publishedTip,
           onAwaitingApproval,
         );
         // Human-in-the-loop iff the plan reached an approve verdict via the PARK path
@@ -4087,6 +5275,10 @@ export class RunRunner {
           claim.config ?? null,
         ),
       pullFollowUp: () => steering.pullFollowUp(),
+      // PRD #1416 M2: drain the worker-authoritative safety steer the divergence detection
+      // (maybeSteerOnDivergence) armed on this same steering channel, in-process. Consumed by
+      // both executors at their loop top ahead of the follow-up drain.
+      pullSafetySteer: () => steering.pullSafetySteer(),
       // PRD #517 M3: the interactive-task follow-up park. The executor calls this after a
       // clean signal_done on an interactive run (it has already checkpoint-pushed): report
       // awaiting_followup, verify the park took, then BLOCK on the steering channel until
@@ -4335,6 +5527,34 @@ export class RunRunner {
             });
           }
 
+          // PRD #1416 M2: on the tip that was just fetched into the bare, detect a history
+          // rewrite at/below the published floor P (and floor C) and steer the agent to restore
+          // it — never blocks a git command (D2). Read the tip FRESH from the bare tracking ref
+          // (refs/uzi-runner/<branch>) since fetchBackBestEffort returns nothing and the
+          // top-of-checkpoint trackTip predates this fetch; never the runner clone (that crosses
+          // the worker-uid/runner-uid ownership seam branchTip exists to avoid). MID-RUN
+          // checkpoint tick only — the finalize/park/capture fetch-backs are M3's territory.
+          const fetchedTip = await this.git.trackingTip(barePath, runnerClone.branch);
+          await this.maybeSteerOnDivergence(barePath, flight, fetchedTip, batcher, steering, runLog);
+
+          // PRD #1416 M3 (C1): AFTER the steer (which must see the agent's rewritten H) and BEFORE
+          // the publish, non-destructively bridge a divergent tracking tip so the checkpoint pack —
+          // and therefore a reseed on resume — carries B instead of the rewritten H. Best-effort:
+          // a checkpoint must never crash the run (D4), so "failed"/"unknown" only log and continue.
+          const bridgeOutcome = await this.bridgeBareTrackingRefIfDivergent(
+            barePath,
+            runnerClone.branch,
+            flight,
+            runLog,
+          );
+          if (bridgeOutcome.kind === "failed" || bridgeOutcome.kind === "unknown") {
+            runLog.info("PRD #1416 M3: mid-run checkpoint bridge did not advance the tracking ref", {
+              run_id: runId,
+              branch: runnerClone.branch,
+              outcome: bridgeOutcome.kind,
+            });
+          }
+
           // PRD #267: origin-publish gate. The publish is CREDENTIAL-FREE (a pack brokered to the
           // api via publishCheckpoint, no PAT — checkpointPack local objects → client join token)
           // EXCEPT the reap:true `overlay`'s default-tip fetch.
@@ -4361,6 +5581,15 @@ export class RunRunner {
             // retries the SAME tip at the next interval boundary (bounded loss).
             if (published) {
               flight.lastPublishedTip = cloneTip ?? flight.lastPublishedTip;
+              // PRD #1416 M3 (C2): advance the checkpoint floor C to the DURABLE published floor on
+              // EVERY confirmed publish (PRD line 62). When this tick BRIDGED, C is already B (the
+              // helper set it) and cloneTip is the un-bridged H — so DO NOT regress C back to H;
+              // otherwise C is the confirmed checkpoint tip cloneTip. lastPublishedTip stays cloneTip
+              // (H) above: it drives hasNewWork, a separate concern from the floor.
+              flight.checkpointFloor =
+                bridgeOutcome.kind === "bridged"
+                  ? bridgeOutcome.bridge
+                  : (cloneTip ?? flight.checkpointFloor);
               // PRD #267 M3: make the time-based publish observable, only for the time path so
               // we do not double-log the milestone case.
               if (!opts.reap) {
@@ -4471,6 +5700,9 @@ export class RunRunner {
           milestonesCompleted: declared,
           head,
           worktreeFingerprint,
+          // PRD #1247 M5: stamp the claim-lane generation (the SAME value the reportState closure
+          // stamps) so a released/superseded stale flight's attempt records nothing server-side.
+          claimGeneration: flight.claimGeneration,
         }),
       // PRD #1226 M4 (D3/D6): the recoverable completion-hold seam is now WIRED. On a repeated
       // no-progress completion attempt, a post-attempt budget/stall/wall/idle exhaustion, or the
@@ -4663,6 +5895,227 @@ export class RunRunner {
         error: errMessage(e),
       }),
     );
+  }
+
+  /**
+   * PRD #1416 M2: at the mid-run checkpoint fetch-back, detect whether the branch's history was
+   * rewritten at/below a published/checkpoint FLOOR and, if so, steer the agent to restore it —
+   * once per distinct fetched tip. It NEVER blocks a git command (D2): it only emits ONE `status`
+   * run message and arms ONE worker-authoritative steer that the next implement turn consumes.
+   * The finalize bridge (M3) is the correctness backstop; this mid-run steer is prevention and
+   * bounds detection at CHECKPOINT_INTERVAL (SC1).
+   *
+   * Dedup discipline (what makes the tests' "exactly one status and one steer" hold):
+   *  - null P (no published floor, fact 17) or a falsy tip → return (nothing to compare).
+   *  - test P, and C when it is set and differs from P, with {@link Git.ancestry}; the FIRST
+   *    "divergent" is enough — break so a single rewrite never emits twice. "unknown" (a git
+   *    error / missing ref) and "ancestor" are NOT divergent, so a transient read never steers.
+   *  - dedup by the FETCHED TIP (`flight.steeredTips`): a repeated tick re-fetching the SAME
+   *    diverged tip emits nothing; a FURTHER rewrite (a new tip) is a new key and steers again.
+   *
+   * Called from the mid-run checkpoint fetch-back ONLY (M2 scope); the finalize/park/capture
+   * fetch-backs are M3's territory, which adds the ancestry check and the bridge there together.
+   */
+  private async maybeSteerOnDivergence(
+    barePath: string,
+    flight: RunFlight,
+    tip: string | null,
+    batcher: MessageBatcher,
+    steering: SteeringChannel,
+    runLog: Logger,
+  ): Promise<void> {
+    const publishedTip = flight.publishedTip;
+    if (!publishedTip) return; // no published floor → nothing to have rewritten below (fact 17)
+    if (!tip) return; // no fetched tip to compare against
+    const floors = [publishedTip];
+    if (flight.checkpointFloor && flight.checkpointFloor !== publishedTip) {
+      floors.push(flight.checkpointFloor);
+    }
+    let divergent = false;
+    for (const floor of floors) {
+      if ((await this.git.ancestry(barePath, floor, tip)) === "divergent") {
+        divergent = true;
+        break; // one divergent floor is enough — do not emit twice
+      }
+    }
+    if (!divergent) return;
+    // Dedup by the fetched tip: at most one status + steer per distinct diverged tip.
+    const steered = (flight.steeredTips ??= new Set<string>());
+    if (steered.has(tip)) return; // repeated tick, same tip → nothing new
+    steered.add(tip);
+    batcher.emit({
+      kind: "status",
+      agent: "worker",
+      payload: {
+        text: `the branch's history was rewritten below its published tip ${publishedTip.slice(0, 12)}; uzi pushes fast-forward only; steering the agent to restore it`,
+      },
+    });
+    steering.pushSafetySteer(composeSafetySteer(publishedTip, tip));
+    runLog.info("PRD #1416 M2: divergence below published floor detected; armed safety steer", {
+      run_id: flight.runId,
+      published_tip: publishedTip,
+      tip,
+    });
+  }
+
+  /**
+   * PRD #1416 M3 — at a PUBLICATION BOUNDARY (finalize push, park, release, capture), non-
+   * destructively repair a divergent bare tracking tip H by wrapping it in a synthesised bridge
+   * commit B so a rewritten branch FAST-FORWARDS from its published floor P (and checkpoint floor
+   * C) WITHOUT a force-push (D4). Reads H from the WORKER BARE tracking ref (worker-uid, via
+   * {@link Git.trackingTip}) — NEVER the runner clone (that crosses the ownership seam branchTip
+   * avoids). Advances the tracking ref to B and C to B on success, so everything a caller then
+   * captures / releases / aligns / pushes off the tracking ref carries B.
+   *
+   * Outcomes (never thrown for control flow — a git failure inside maps to "failed"/"unknown"):
+   *  - "clean"   — no floor to bridge (P null, or P and C are already ancestors of H). Nothing done.
+   *  - "unknown" — ancestry could not be determined (a broken read); do NOT bridge, do NOT fail.
+   *  - "bridged" — B built AND validated (tree === H's tree, P and H both ancestors of B); the bare
+   *                tracking ref was advanced to B and C set to B.
+   *  - "failed"  — H is divergent but B could not be built or validated; the ref is left at H.
+   */
+  private async bridgeBareTrackingRefIfDivergent(
+    barePath: string,
+    branch: string,
+    flight: RunFlight,
+    runLog: Logger,
+  ): Promise<BridgeOutcome> {
+    const publishedTip = flight.publishedTip;
+    if (!publishedTip) return { kind: "clean" }; // no published floor (fact 17) — nothing to bridge
+    // Read H from the WORKER-owned bare tracking ref; null ⇒ nothing published yet on this seam.
+    const H = await this.git.trackingTip(barePath, branch);
+    if (!H) return { kind: "clean" };
+    // Ancestry of P and of C (when C is set and differs from P) against H, tri-state.
+    const floors = [publishedTip];
+    if (flight.checkpointFloor && flight.checkpointFloor !== publishedTip) {
+      floors.push(flight.checkpointFloor);
+    }
+    let anyDivergent = false;
+    let anyUnknown = false;
+    for (const floor of floors) {
+      const rel = await this.git.ancestry(barePath, floor, H);
+      if (rel === "divergent") anyDivergent = true;
+      else if (rel === "unknown") anyUnknown = true;
+    }
+    if (!anyDivergent) {
+      // All ancestor, OR a mix of ancestor+unknown (no divergent): a broken read must NEVER bridge.
+      return anyUnknown ? { kind: "unknown" } : { kind: "clean" };
+    }
+    // Build B over the floors (bridgeToFloors appends only the ones actually missing).
+    const bridgeResult = await this.git.bridgeToFloors(barePath, H, floors);
+    if (bridgeResult.kind === "noop") {
+      // #1416 (MR-rework, finding 4): nothing was actually missing — H already covers every floor (a
+      // fast-forward). The caller's divergence read raced ahead of bridgeToFloors' recheck. Treat as
+      // clean so a fast-forwardable run is NOT failed as history_rewritten.
+      return { kind: "clean" };
+    }
+    if (bridgeResult.kind === "failed") {
+      runLog.warn("PRD #1416 M3: divergence below published floor but the bridge could not be built", {
+        run_id: flight.runId,
+        published_tip: publishedTip,
+        tip: H,
+      });
+      return { kind: "failed" };
+    }
+    const bridge = bridgeResult.sha;
+    // VALIDATE B before adopting it: tree byte-equal to H's, and P and H both ancestors of B.
+    // #1416 M3 — distinguish a TRANSIENT/UNKNOWN read from a DEFINITIVE validation failure. A
+    // revParse that returns null (a broken/transient read) or an `ancestry` that returns "unknown"
+    // is NOT proof that B is malformed; at the finalize sinks a "failed" throws HistoryRewrittenError
+    // and fails the whole run, so a transient read must NOT hard-fail it. Only a DEFINITIVELY
+    // malformed B fails: its tree RESOLVES and differs from H's, OR `ancestry` DEFINITIVELY reports
+    // "divergent" (P or H provably NOT an ancestor of B). A transient/unknown read → "unknown"
+    // (best-effort: do not adopt B, do not throw at finalize).
+    const bridgeTree = await this.git.revParse(barePath, `${bridge}^{tree}`);
+    const hTree = await this.git.revParse(barePath, `${H}^{tree}`);
+    const pRel = await this.git.ancestry(barePath, publishedTip, bridge);
+    const hRel = await this.git.ancestry(barePath, H, bridge);
+    // A tree read that could not resolve is transient; a resolved-but-different tree is definitive.
+    const treeUnknown = bridgeTree === null || hTree === null;
+    const treeMismatch = !treeUnknown && bridgeTree !== hTree;
+    const definitiveFail = treeMismatch || pRel === "divergent" || hRel === "divergent";
+    const transientUnknown = treeUnknown || pRel === "unknown" || hRel === "unknown";
+    if (definitiveFail) {
+      runLog.warn("PRD #1416 M3: bridge is definitively malformed; NOT adopting it", {
+        run_id: flight.runId,
+        published_tip: publishedTip,
+        tip: H,
+        bridge,
+        tree_mismatch: treeMismatch,
+        p_ancestry: pRel,
+        h_ancestry: hRel,
+      });
+      return { kind: "failed" };
+    }
+    if (transientUnknown) {
+      // A broken/transient read during validation: do NOT adopt B, but do NOT fail the run either
+      // (the finalize sinks would throw). Best-effort — the caller leaves the tracking ref at H.
+      runLog.warn("PRD #1416 M3: bridge validation read was transient/unknown; NOT adopting it (best-effort)", {
+        run_id: flight.runId,
+        published_tip: publishedTip,
+        tip: H,
+        bridge,
+        tree_unknown: treeUnknown,
+        p_ancestry: pRel,
+        h_ancestry: hRel,
+      });
+      return { kind: "unknown" };
+    }
+    // Adopt B: advance the bare tracking ref (worker-uid) and the checkpoint floor C.
+    try {
+      await this.git.updateTrackingRef(barePath, branch, bridge);
+    } catch (e) {
+      runLog.warn("PRD #1416 M3: could not advance the tracking ref to the bridge", {
+        run_id: flight.runId,
+        bridge,
+        error: errMessage(e),
+      });
+      return { kind: "failed" };
+    }
+    flight.checkpointFloor = bridge;
+    runLog.info("PRD #1416 M3: history rewritten below the published floor; bridged and advanced the tracking ref", {
+      run_id: flight.runId,
+      published_tip: publishedTip,
+      tip: H,
+      bridge,
+    });
+    return { kind: "bridged", bridge };
+  }
+
+  /**
+   * PRD #1416 M3 — the BEST-EFFORT bridge wrapper for the park / shutdown / capture sinks (C5-C8).
+   * Unlike the finalize sinks (C3/C4), which throw {@link HistoryRewrittenError} on a "failed"
+   * bridge, these boundaries must NEVER throw: a park/shutdown/capture that fails is worse than one
+   * that loses a bridge (D4). It runs the bridge, logs a "failed"/"unknown" outcome, and returns —
+   * the caller then captures/publishes whatever the tracking ref points at (B on success, the
+   * un-bridged H otherwise). Swallows any thrown error too, so nothing here can undo a park.
+   */
+  private async bridgeParkSinkBestEffort(
+    barePath: string,
+    branch: string,
+    flight: RunFlight,
+    runLog: Logger,
+    sink: string,
+  ): Promise<void> {
+    try {
+      const o = await this.bridgeBareTrackingRefIfDivergent(barePath, branch, flight, runLog);
+      if (o.kind === "failed" || o.kind === "unknown") {
+        runLog.info("PRD #1416 M3: park/capture bridge did not advance the tracking ref", {
+          run_id: flight.runId,
+          branch,
+          sink,
+          outcome: o.kind,
+        });
+      }
+    } catch (e) {
+      // Never let a bridge failure undo a park/shutdown/capture (D4).
+      runLog.warn("PRD #1416 M3: park/capture bridge threw; continuing best-effort", {
+        run_id: flight.runId,
+        branch,
+        sink,
+        error: errMessage(e),
+      });
+    }
   }
 
   /**
@@ -5374,6 +6827,12 @@ export class RunRunner {
           runLog,
         );
       }
+      // PRD #1416 M3 (C7): bridge a divergent tracking tip BEFORE the pause-park publish so a resume
+      // adopts B (the rewritten work), not the published tip. handlePausePark is checkpoint-first and
+      // does NOT route through the doCheckpointPublish/reapForSink machinery C1/C5/C6 cover, so it is
+      // wired here directly; the PauseNowSignal catch and the parkForPause callback both reach it, so
+      // this one placement covers both. Best-effort — a park must never throw (D4).
+      await this.bridgeParkSinkBestEffort(barePath, branch, flight, runLog, "pause-park");
     }
 
     // Checkpoint FIRST (Decision 8). An already-durable tip (a prior mid-run publish
@@ -5536,6 +6995,12 @@ export class RunRunner {
       branch,
     );
     if (!verified) return { verified: false, published: false };
+    // PRD #1416 M3 (C8): bridge a divergent tracking tip AFTER the fetch-back + verify (so the verify
+    // still confirms the tracking ref covered the run's HEAD H) and BEFORE the capture publish, so
+    // the recovery restore point + its published checkpoint hold B — a reseed on resume adopts B
+    // (which descends from P) instead of the rewritten H being set aside. Best-effort — a recovery
+    // capture must never throw.
+    await this.bridgeParkSinkBestEffort(barePath, branch, flight, runLog, "recovery-capture");
     // Remote publish is SEPARATE and best-effort. The agent tree was already reaped by the
     // caller (handleRecoveryExhausted's killAgentTree, untouched), so the overlay's PAT
     // default-fetch is permitted. publishCheckpointBestEffort surfaces the HTTP/skip outcome
@@ -5657,7 +7122,12 @@ export class RunRunner {
     const head = captured.head;
     let status: string;
     try {
-      ({ status } = await this.client.requestCompletionHold(flight.runId, { head }));
+      ({ status } = await this.client.requestCompletionHold(flight.runId, {
+        head,
+        // PRD #1247 M5: stamp the claim-lane generation (the SAME value the reportState closure
+        // stamps) so the server refuses to park a released/superseded stale flight's reclaimed run.
+        claimGeneration: flight.claimGeneration,
+      }));
     } catch (holdError) {
       flight.preserveRecoveryClone = false;
       flight.preserveSession = false;
@@ -5687,6 +7157,152 @@ export class RunRunner {
       head,
     });
     return true;
+  }
+
+  /**
+   * PRD #1247 M5b (D3, D13, D14): enter the held-state CREDENTIAL SWITCH release. Modeled
+   * step-for-step on enterCompletionHold (runner.ts, the reap → set-preserve-flags-up-front →
+   * bounded VERIFIED capture → positive-ack state machine), but its terminal outcome is a REQUEUE,
+   * not a park:
+   *
+   *   1. Reap the agent tree BEFORE any credentialed capture git (REAP-BEFORE-GIT), like
+   *      enterCompletionHold step 1 — idempotent, run()'s finally reaps again.
+   *   2. Set preserveRecoveryClone + preserveSession up front (enterCompletionHold step 2) so a
+   *      failed capture cannot strand the run's only copy of work while the release is uncertain.
+   *   3-5. Capture a VERIFIED local restore point via captureRecoveryRestorePoint (dirty→WIP commit
+   *      required, clean→clean proof, unreadable status→NOT verified; origin publish best-effort),
+   *      bounded retry with waitRecoveryRetry between attempts — enterCompletionHold steps 3-5, but
+   *      using captureRecoveryRestorePoint (the PRD's named capture) rather than captureHoldContext.
+   *   6a. GIVE UP (never verified): report `credential_switch_failed` (best-effort; the server clears
+   *      the switch STAMP but leaves the standing override), KEEP both preserve flags (NO committed
+   *      work is lost), and return "gave_up". The caller leaves the run NON-TERMINAL for requeue,
+   *      exactly like the worker-shutdown-interrupt arm; the standing override still points at the
+   *      new token, so a same-worker reclaim resumes on it.
+   *   6b. VERIFIED capture: DRAIN the batcher FIRST (the server's fenced append only persists while
+   *      claim_released_at IS NULL, so pending messages MUST land before the release moves the run
+   *      to `queued`), THEN report `credential_switch` and REQUIRE ack.status === "queued" — the
+   *      positive-ack contract, exactly as enterCompletionHold requires "paused". A non-"queued" ack
+   *      or a throw (incl. a stale_claim from the reportState closure) is a GIVE-UP: keep the flags,
+   *      return "gave_up" — never assume released.
+   *   7. Only after the queued ack: preserveRecoveryClone=false (the finally RETIRES the clone — a
+   *      cross-worker reclaim re-clones and recovers from the durable tracking ref + best-effort
+   *      origin; work is safe) and parked=true (preserve HOME + plugin dir for a same-worker
+   *      resume); return "released".
+   *
+   * DELIBERATE INTERPRETATION vs the PRD's "continue on the old token in place": the SDK executor
+   * has no primitive to re-drive an aborted turn IN PLACE, so this realizes the switch at the
+   * RECLAIM boundary instead of mid-flight. The verified-capture gate plus the preserved clone/HOME
+   * keep committed work safe on both outcomes, and the standing override makes the reclaim spend the
+   * newly-chosen token — the codebase-idiomatic equivalent of "continue on the old token", with no
+   * committed work lost. Strict continue-in-place would require resuming an aborted SDK session the
+   * executor cannot resume in place.
+   */
+  private async enterCredentialSwitch(
+    claim: ClaimResponse,
+    flight: RunFlight,
+    runLog: Logger,
+  ): Promise<"released" | "gave_up" | "retained_stop"> {
+    // The generation this switch targets (equals flight.claimGeneration by construction — the
+    // steering channel trips only on a generation match). Logged for provenance; the release
+    // report's claim_generation is stamped by the reportState closure from flight.claimGeneration.
+    const generation = flight.steering.pendingCredentialSwitch();
+    // 1. Reap BEFORE any credentialed capture git (idempotent — run()'s finally reaps again).
+    flight.executor.killAgentTree?.();
+    // 2. Retain EVERYTHING up front so an uncertain capture cannot strand the only copy of work.
+    flight.preserveRecoveryClone = true;
+    flight.preserveSession = true;
+    // 3-5. Capture a VERIFIED local restore point, bounded retry (recovery's retain-and-retry).
+    let verified = false;
+    for (let attempt = 0; attempt < CREDENTIAL_SWITCH_CAPTURE_ATTEMPTS; attempt++) {
+      if (flight.active?.shuttingDown) break;
+      try {
+        const result = await this.captureRecoveryRestorePoint(claim, flight, runLog);
+        if (result.verified) {
+          verified = true;
+          break;
+        }
+      } catch (captureError) {
+        runLog.warn("credential switch capture failed; retaining live work for retry", {
+          error: errMessage(captureError),
+        });
+      }
+      if (attempt < CREDENTIAL_SWITCH_CAPTURE_ATTEMPTS - 1) await this.waitRecoveryRetry(flight);
+    }
+    if (!verified) {
+      // 6a. GIVE UP — but only CONTINUE in place on a POSITIVE clear confirmation (BLOCKING-3
+      // rework). Report credential_switch_failed and READ the ack: the server clears the stamp
+      // only on a 200 (applied). If the clear is NOT confirmed — a not-applied 409, a network
+      // error, or a stale_claim throw (the claim was superseded) — the switch stamp may still be
+      // pending, and continuing would let the server's consume-nothing rule strand every
+      // answer/follow-up for this claim forever. So RETAIN everything and STOP for requeue instead.
+      // KEEP both preserve flags either way (no work loss).
+      let cleared = false;
+      try {
+        const ack = await flight.reportState({ status: "credential_switch_failed" });
+        cleared = ack.applied === true;
+        if (!cleared) {
+          runLog.warn("credential switch give-up: server did not confirm the stamp cleared; retaining and stopping", {
+            run_id: flight.runId,
+            server_status: ack.status ?? "unknown",
+          });
+        }
+      } catch (e) {
+        runLog.warn("credential switch give-up: could not confirm credential_switch_failed cleared the stamp; retaining and stopping", {
+          run_id: flight.runId,
+          error: errMessage(e),
+        });
+      }
+      if (!cleared) {
+        return "retained_stop";
+      }
+      // Positive clear confirmed: RE-ARM the steering channel so a LATER same-generation switch
+      // request (the owner re-clicking "switch token" on the still-open claim) can trip again —
+      // the once-only guard would otherwise drop it — then continue in place on the old token.
+      flight.steering.rearmCredentialSwitch();
+      runLog.warn(
+        "credential switch: restore point never verified; the switch stamp is cleared, continuing on the old token (clone + HOME retained)",
+        { run_id: flight.runId, generation },
+      );
+      return "gave_up";
+    }
+    // 6b. Verified. DRAIN the batcher FIRST — the fenced append persists only while
+    // claim_released_at IS NULL, so every pending message MUST land BEFORE the release requeues the
+    // run. close() is safe here (not a "reversible drain"): BOTH release outcomes below END this
+    // flight — a confirmed release leaves the run for the reclaim, and an UNCONFIRMED release now
+    // RETAINS-and-STOPS (it no longer continues in place on a claim the reclaim may already own) —
+    // so a closed batcher is never continued past. Idempotent with the caller's own close().
+    await flight.batcher.close().catch(() => undefined);
+    // THEN report the RELEASE. Accept it off the server's RELEASED disposition — set on BOTH a
+    // fresh requeue (status 'queued') AND an idempotent release after a reclaim (applied, status
+    // 'running') — not off status === 'queued', which missed the idempotent-after-reclaim success
+    // and gave up on a server-confirmed release, leaving the old flight to continue on a claim the
+    // reclaim already owned. A throw or an unconfirmed release ⇒ retain-and-stop.
+    let released = false;
+    try {
+      const ack = await flight.reportState({ status: "credential_switch" });
+      released = ack.credentialSwitchReleased === true;
+      if (!released) {
+        runLog.warn("credential switch: server did not confirm the release; retaining and stopping", {
+          run_id: flight.runId,
+          server_status: ack.status ?? "unknown",
+        });
+      }
+    } catch (releaseError) {
+      runLog.warn("credential switch: release report failed; retaining and stopping", {
+        run_id: flight.runId,
+        error: errMessage(releaseError),
+      });
+    }
+    if (!released) return "retained_stop"; // flags stay SET; STOP — never continue on a possibly-released claim
+    // 7. Released. The work is durable on the worker tracking ref (+ best-effort origin), so RETIRE
+    // the clone (a cross-worker reclaim re-clones); KEEP the HOME (parked) for a same-worker resume.
+    flight.preserveRecoveryClone = false;
+    flight.parked = true;
+    runLog.info(
+      "run released for a credential switch; retiring the clone, preserving HOME for resume",
+      { run_id: flight.runId, generation },
+    );
+    return "released";
   }
 
   /**
@@ -5749,6 +7365,11 @@ export class RunRunner {
     // current HEAD (incl. any WIP marker), so a same-worker reseed recovers exactly this tip.
     const verified = await this.git.verifyRunnerTrackingCovers(barePath, worktreePath, branch);
     if (!verified) return NONE;
+    // PRD #1416 M3 (C8): bridge a divergent tracking tip AFTER the fetch-back + verify (so the verify
+    // still confirms the tracking ref covered H) and BEFORE the head is read + published, so a
+    // credential-switch release captures B, not the rewritten H — the completion-hold head and the
+    // published checkpoint both carry B, and a same-worker reclaim's reseed adopts it. Best-effort.
+    await this.bridgeParkSinkBestEffort(barePath, branch, flight, runLog, "hold-capture");
     // The captured head is the verified tracking tip. A verified ref whose tip is unresolvable is
     // treated as unverified (retain) — the hold contract requires a real head H for the permit.
     const head = await this.git.trackingTip(barePath, branch);
@@ -5928,6 +7549,11 @@ export class RunRunner {
     // PRD #212: the runner clone path (= runnerClone.path), so the gate can run a
     // runner-uid `git status --porcelain` there to surface plan-turn worktree writes.
     worktreePath: string,
+    // PRD #1416 M5: the branch's published floor P (flight.publishedTip), or undefined for a
+    // fresh, never-published branch. When set AND the submitted plan proposes rewriting history,
+    // the gate emits a warn-only status nudge (both modes) and, under auto-approve, arms the M2
+    // safety steer for the first implement turn. The verdict flow is untouched (never rejects).
+    publishedTip: string | undefined,
     // PRD #362 M3c: advisory hook fired AFTER the awaiting_approval report persists
     // plan_md, BEFORE the verdict wait (see the RunContext.gatePlan doc). Never invoked
     // on the autopilot branch: that branch DOES persist plan_md durably (RC1 #1197, via
@@ -5939,6 +7565,23 @@ export class RunRunner {
     // Get the plan message onto the stream regardless of mode — it is the audit
     // record of what the agent intended, autopilot or not.
     await batcher.flush().catch(() => undefined);
+
+    // PRD #1416 M5 (D5): a WARN-ONLY plan-gate nudge. When the branch has a published floor P and
+    // the submitted plan proposes rewriting history (a case-insensitive regex scan over plan_md),
+    // emit ONE visible `status` run message right after the plan — in BOTH modes, so a human sees
+    // it next to the plan and an auto-approved run still records it. The verdict flow is untouched:
+    // this never rejects and never blocks the plan (false positives are accepted, D5). The steer is
+    // armed under auto-approve only, below.
+    const proposesRewrite = !!publishedTip && planProposesRewrite(planMd);
+    if (proposesRewrite) {
+      batcher.emit({
+        kind: "status",
+        agent: "worker",
+        payload: {
+          text: `the plan proposes rewriting history on a branch published at ${publishedTip!.slice(0, 12)}; the worker lands fast-forward only and cannot land a rewritten branch — prefer \`git merge\``,
+        },
+      });
+    }
 
     if (autoApprove) {
       // Auto-approve is a VERDICT SOURCE at the existing gate, not a bypass around
@@ -6005,6 +7648,15 @@ export class RunRunner {
         run_id: runId,
         agent_source: selection.source,
       });
+      // PRD #1416 M5: on an AUTO-APPROVED run the human never sees the status nudge emitted above,
+      // so ALSO arm the M2 worker-authoritative safety steer with a plan-time PREVENTIVE body
+      // (composePlanGateNudge — distinct from composeSafetySteer, which references an already-
+      // rewritten tip H that does not exist yet at plan time). Both executors drain pullSafetySteer
+      // at their loop top, ahead of any follow-up and BEFORE the FIRST buildImplementPrompt, so the
+      // first implement turn is reminded not to rewrite at/below P. NOT armed on the human-gated
+      // branch below (a human sees the plan + the nudge and can revise/reject). The verdict is
+      // UNCHANGED — this arms guidance beside the approve, it does not alter it.
+      if (proposesRewrite) steering.pushSafetySteer(composePlanGateNudge(publishedTip!));
       return { kind: "approve", selection: { status: "ok", selection } };
     }
 
@@ -6559,8 +8211,22 @@ export function mrDescription(
   // reason), present in ANY branch — including on a closing accept-only PR. Absent/empty ⇒ no partial,
   // no accept, so the body is byte-identical to today.
   completionScope?: ClaimConfig["completion_scope"],
+  // PRD #1416 M3 (Part D): the pushed history contains an ancestry bridge (derived from history via
+  // rangeContainsBridge, NOT a flight-local flag). When true, ONE GENERIC sentence is appended to the
+  // body of EVERY kind's MR — never "the worker bridged it", because the agent's own `git merge -s
+  // ours <P>` bridge is equally possible. Defaults false so a non-bridged MR is byte-identical to today.
+  bridged = false,
 ): string {
   const footer = `Opened automatically by the uzi agent from branch \`${branch}\`. Please review and merge manually — the agent never merges.`;
+  // One generic sentence, rendered into whichever body arm runs below (a per-kind body or the issue
+  // body) so the note is path- AND kind-independent. Empty when not bridged (body unchanged). #1416
+  // FIX 6: the issue arm renders it WITHIN the body (before the `---` footer); the bridgeNote form
+  // (with its leading blank line) is kept for the per-kind arm, which appends it to a body that
+  // already carries its own footer.
+  const bridgeSentence = bridged
+    ? "This branch contains a history bridge: a published commit was restored as an ancestor so the branch fast-forwards without a force-push, and `git log --first-parent` still reads as the intended history."
+    : "";
+  const bridgeNote = bridgeSentence ? `\n\n${bridgeSentence}` : "";
   const repoMarker =
     agentSelection?.source === "repo"
       ? [
@@ -6585,7 +8251,7 @@ export function mrDescription(
     selfImproveSection,
     promptGuardSection,
   });
-  if (kindBody !== undefined) return kindBody;
+  if (kindBody !== undefined) return kindBody + bridgeNote;
   // PRD #1227 M2/M3: the owner completion decisions. `deferred` non-empty ⇒ owner PARTIAL
   // (scope_reduced): the issue is NOT fully delivered. `accepted` non-empty ⇒ owner-waived unmet
   // criteria to name in a warning block. Both absent/empty on a normal run.
@@ -6647,6 +8313,8 @@ export function mrDescription(
   }
   const gatesSection = gatesUnverifiedMrSection(gatesUnverified, gatesDiscoveryTruncated);
   if (gatesSection) body.push("", gatesSection);
+  // #1416 FIX 6: render the bridge sentence WITHIN the body, before the `---` footer.
+  if (bridgeSentence) body.push("", bridgeSentence);
   body.push("", "---", footer);
   return body.join("\n");
 }

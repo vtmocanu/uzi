@@ -15,8 +15,15 @@ import {
   type ScheduleInput,
   type ScheduleTarget,
   type ScheduleTiming,
+  type SecretMeta,
 } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
+import {
+  scheduleCredentialPatch,
+  selectionFromOverride,
+  type CredentialSelection,
+} from "../lib/credentialOverride";
+import { TokenPicker } from "./TokenPicker";
 import { useAuth } from "../auth/AuthContext";
 import {
   Alert,
@@ -237,6 +244,51 @@ export function ScheduleModal({
   // below (modelWarning) mirroring the server's ValidateModel reject.
   const [model, setModel] = useState<string>(editing?.model ?? "");
   const modelWarning = modelFieldWarning(model);
+  // PRD #1247 M6/M7: per-schedule Anthropic credential override. Seeded from the stored
+  // read-side override ({mode,label}); a pinned label is resolved to an id once the token
+  // list loads. `credentialTouched` gates the omit-vs-send decision: an UNTOUCHED picker
+  // sends NOTHING (the server's seed-and-keep preserves the stored value on an unrelated
+  // edit), while a change sends {mode, secret_id?} — or {mode:"inherit"} for an explicit
+  // clear. A ref mirrors it so the async token-load re-seed never clobbers a live edit.
+  const [tokens, setTokens] = useState<SecretMeta[]>([]);
+  const [credentialSel, setCredentialSel] = useState<CredentialSelection>(
+    selectionFromOverride(editing?.credential_override, []),
+  );
+  const [credentialTouched, setCredentialTouched] = useState(false);
+  const credentialTouchedRef = useRef(false);
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const { secrets } = await api.listSecrets();
+        if (cancelled) return;
+        const anthropic = secrets.filter((s) => s.kind === "anthropic_token");
+        setTokens(anthropic);
+        // Re-seed to resolve a pinned label→id now that the list is known — unless the
+        // user already changed the picker (then their choice stands).
+        if (!credentialTouchedRef.current) {
+          setCredentialSel(selectionFromOverride(editing?.credential_override, anthropic));
+        }
+      } catch {
+        // keep the pre-load seed; the picker still renders its four states
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // editing is a stable prop for the modal's lifetime; run once on mount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  const onCredentialChange = useCallback((sel: CredentialSelection) => {
+    credentialTouchedRef.current = true;
+    setCredentialTouched(true);
+    setCredentialSel(sel);
+  }, []);
+  // The schedule credential body: OMITTED (undefined) when untouched, {mode:"inherit"} on
+  // an explicit clear, else {mode, secret_id?}. Always undefined for a self_improve
+  // schedule — that lane 409s any explicit override, so the modal never sends one.
+  const credentialOverridePatch = () =>
+    target === "self_improve" ? undefined : scheduleCredentialPatch(credentialSel, credentialTouched);
   // PRD #929 M1: per-schedule output mode for prompt-target schedules. "" = inherit the
   // catalog/job default; "mr" opens a merge request from an idea file, "issues" files issues.
   const [outputMode, setOutputMode] = useState<string>(
@@ -460,6 +512,9 @@ export function ScheduleModal({
     // PRD #305: apply the run model to every subagent. Editable on a default too
     // (issue #691) — always sent with replace-semantics.
     override_subagent_model: overrideSubagentModel,
+    // PRD #1247 M6/M7: OMIT when untouched (seed-and-keep), {mode:"inherit"} on explicit
+    // clear, {mode,secret_id?} on a pick; always omitted for self_improve.
+    credential_override: credentialOverridePatch(),
     guidance:
       target === "prompt" || target === "sweep"
         ? guidance.trim() === ""
@@ -504,6 +559,10 @@ export function ScheduleModal({
       target === "prompt" ? (outputMode.trim() === "" ? null : outputMode) : undefined,
     // PRD #305: apply the run model to every subagent. Always sent (replace-semantics).
     override_subagent_model: overrideSubagentModel,
+    // PRD #1247 M6/M7: OMIT when untouched (seed-and-keep preserves the stored override on
+    // an unrelated edit), {mode:"inherit"} on explicit clear, {mode,secret_id?} on a pick;
+    // always omitted for self_improve (that lane 409s an explicit override).
+    credential_override: credentialOverridePatch(),
     // Sent only on create; on edit, enable/disable is pause/resume, so leave it absent
     // (undefined) here to avoid re-flipping enabled during a config edit.
     enabled: isEdit ? undefined : enabled,
@@ -1033,6 +1092,29 @@ export function ScheduleModal({
             </p>
           </Field>
           {modelWarning && <Alert message={modelWarning} tone="warning" />}
+
+          {/* PRD #1247 M6/M7: per-schedule Anthropic credential override, beside the model.
+              HIDDEN for self_improve (that lane 409s an explicit override) with a note in its
+              place, so the modal never sends one for it. Inherit follows the worker binding. */}
+          {target === "self_improve" ? (
+            <p className="text-[11px] text-faint">
+              Self-improvement runs always use your worker&rsquo;s token — no per-schedule override.
+            </p>
+          ) : (
+            <Field label="Anthropic token (optional)" htmlFor="sched-token">
+              <TokenPicker
+                id="sched-token"
+                label="Anthropic token for this schedule"
+                value={credentialSel}
+                onChange={onCredentialChange}
+                tokens={tokens}
+              />
+              <p className="mt-1 text-[11px] text-faint">
+                Runs fired by this schedule spend this token. Leave on Inherit to follow the
+                worker&rsquo;s binding.
+              </p>
+            </Field>
+          )}
 
           {/* PRD #305: apply the run model to every subagent. Always enabled — first-class
               on Inherit (the applied model is the same one the lead resolves). Editable on a

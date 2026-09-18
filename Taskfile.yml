@@ -291,6 +291,14 @@ tasks:
       # semantics AND guards the tally (>= 8 cases, c == p) so a gutted driver test cannot
       # read green. Before `scan:secrets`, which is deliberately last because it dominates.
       - task: test:e2e-driver
+      # Hermetic end-to-end tests for the repo-local uzi-watcher backup scripts. They use
+      # fake uzi/kubectl commands and temporary git repos: no cluster, forge or live backup
+      # directory is touched. This gates clone capture, bare-ref fallback, fail-closed
+      # publication/exit status, retention pruning and detached-loop terminal pruning.
+      - task: test:uzi-watcher-backups
+      # Hermetic regressions for the landing scripts: no network, forge or live PR.
+      # They pin review routing, fail-closed quota timing and stale-base push behavior.
+      - task: test:uzi-lander
       # cheapest-first: this whole-file duplicate check is sub-second, so it runs
       # before `scan:secrets`, which is deliberately last because it dominates.
       - task: check:spec-numbering
@@ -330,6 +338,14 @@ tasks:
       # present -- GitHub Push Protection honours no such directive and refuses the push.
       # Sub-second, offline, index-only tree fact, so it runs before `scan:secrets` too.
       - task: check:token-literals
+      # Offline fixture test of scripts/migration-renumber.sh (issue 1400). The ONE
+      # non-sub-second gate:repo member: it builds temp git repos with a local bare
+      # origin, so it does not fit gate:repo's offline sub-second band. It is kept here
+      # DELIBERATELY -- CI runs `task gate:repo` as a job and separately hardcodes only
+      # `test:release-scripts`, so wiring it into gate:repo is what makes it CI-gated
+      # WITHOUT editing .github/workflows/** (which this branch must not touch). Ordered
+      # before `scan:secrets`, which is deliberately last because it dominates.
+      - task: test:migration-renumber
       - task: scan:secrets
       # Whole-tree Go+TS SAST scan (semgrep), BYO fail-open like lint:yaml. Ordered
       # LAST because a whole-tree scan dominates, same as scan:secrets above (PRD #862 M2).
@@ -838,6 +854,21 @@ tasks:
       # the test emits more as sub-cases are added). See the script header.
       - ./scripts/check-e2e-driver.sh
 
+  test:uzi-watcher-backups:
+    desc: hermetic tests of uzi-watcher live-clone/bare-ref backups, retention and detached loop
+    cmds:
+      - ./.agents/skills/uzi-watcher/scripts/backup-runs.test.sh
+      - ./.agents/skills/uzi-watcher/scripts/backup-loop.test.sh
+
+  test:uzi-lander:
+    desc: hermetic tests of uzi-lander review routing, quota timing and stale-base push guards
+    cmds:
+      - ./.agents/skills/uzi-lander/scripts/lib/review-threads.test.sh
+      - ./.agents/skills/uzi-lander/scripts/cr-rate-limit.test.sh
+      - ./.agents/skills/uzi-lander/scripts/land-prep.test.sh
+      - ./.agents/skills/uzi-lander/scripts/watch-pr.test.sh
+      - ./.agents/skills/uzi-lander/scripts/pr-findings.test.sh
+
   test:release-scripts:
     desc: offline fixture test of the release-train scripts (builds a temp git repo; PRD 1265)
     cmds:
@@ -850,6 +881,16 @@ tasks:
       # exits nonzero on any failure. Watch it fail on the unmodified scripts. See the
       # script header.
       - ./scripts/release-scripts-test.sh
+
+  test:migration-renumber:
+    desc: offline fixture test of scripts/migration-renumber.sh (builds temp git repos; issue 1400)
+    cmds:
+      # A gate:repo member (see gate:repo), deliberately NOT in its sub-second band: it
+      # builds temp git repos with a local bare origin and drives the real
+      # migration-renumber.sh through its --rewrite-comments unit, its precondition/preflight
+      # refusals, and the happy-path renumber. Prints `N passed, N failed` and exits nonzero
+      # on any failure. See the script header.
+      - ./scripts/migration-renumber-test.sh
 
   check:spec-numbering:
     desc: specs/ai.md is frozen at section 637 (issue 1317), unique numbers, none above the head, count 637, with a canary proving both detectors fired
@@ -2484,6 +2525,19 @@ tasks:
     desc: regenerate the e2e/README.md phase-registry table from the e2e/phases headers
     cmds:
       - ./scripts/check-e2e-registry-doc.sh --write
+
+  # migration:renumber is a landing-time helper for the maintainer who rebased a branch
+  # onto main and finds a new migration's draft number now collides with a just-landed
+  # one. NOT a gate target and NOT under gate: it WRITES the tree (git mv's the branch's
+  # new migrations to consecutive numbers above the live main head, rewrites their own
+  # cross-reference comments, and REPORTS every other reference for a human to fix by
+  # hand). The gate is test:migration-renumber above (the docs:sync writer/drift-test
+  # relationship). Fail-closed before any mutation; leaves the tree
+  # dirty on success for the maintainer to review and commit.
+  migration:renumber:
+    desc: renumber the branch's new migrations above the live main head; rewrite their comments; report other refs
+    cmds:
+      - ./scripts/migration-renumber.sh
 
   # -------------------------------------------------------------------- nudge --
   # A NUDGE is not a gate. This target is DELIBERATELY absent from `gate` and from

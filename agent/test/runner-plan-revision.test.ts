@@ -155,12 +155,15 @@ describe("RunRunner — plan revision at the gate (PRD #41)", () => {
     // v1 epoch, so it must be stale at the v2 gate.
     const origGetInputs = client.getInputs.bind(client);
     let approveConsumed = false;
+    // PRD #1247 M5: getInputs now returns { inputs, credentialSwitch? }; the inputs array is `.inputs`.
     (
-      client as unknown as { getInputs: (r: string) => Promise<UserInput[]> }
+      client as unknown as {
+        getInputs: (r: string) => Promise<{ inputs: UserInput[]; credentialSwitch?: { generation: number } }>;
+      }
     ).getInputs = async (runId: string) => {
-      const inputs = await origGetInputs(runId);
-      if (inputs.some((i) => i.kind === "approve_plan")) approveConsumed = true;
-      return inputs;
+      const res = await origGetInputs(runId);
+      if (res.inputs.some((i) => i.kind === "approve_plan")) approveConsumed = true;
+      return res;
     };
 
     const reviseExec: Executor = {

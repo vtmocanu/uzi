@@ -241,6 +241,10 @@ type autopilotCall struct {
 	// #305), captured so a later milestone can assert the frozen flag was threaded onto
 	// the created run. false for the poller-shaped CreateAutopilotRun (no per-run opt-in).
 	overrideSubagentModel bool
+	// credOverride is the schedule's per-run credential override (PRD #1247 M6), captured so
+	// a test can prove the auto-approve scheduled path threads scheduleCredentialOverride(sched)
+	// onto the created run. nil for the poller-shaped CreateAutopilotRun (no per-run override).
+	credOverride *workersvc.CredentialOverride
 }
 
 type runCall struct {
@@ -266,6 +270,10 @@ type runCall struct {
 	// force is the CreateRun bypass flag (issue #856); automated scheduler seams must NEVER
 	// force, so this is asserted false.
 	force bool
+	// credOverride is the schedule's per-run credential override (PRD #1247 M6), captured to
+	// prove the non-auto scheduled path threads scheduleCredentialOverride(sched). nil for the
+	// interactive CreateRun (the handler's per-run field feeds that seam, not a schedule).
+	credOverride *workersvc.CredentialOverride
 }
 
 type promptCall struct {
@@ -281,6 +289,9 @@ type promptCall struct {
 	// overrideSubagentModel is the schedule's "apply model also to agents" opt-in (PRD
 	// #305), captured for a later assertion that the frozen flag reached the prompt run.
 	overrideSubagentModel bool
+	// credOverride is the schedule's per-run credential override (PRD #1247 M6), captured to
+	// prove the prompt path threads scheduleCredentialOverride(sched) onto the prompt run.
+	credOverride *workersvc.CredentialOverride
 }
 
 type fakeRuns struct {
@@ -308,17 +319,19 @@ func (f *fakeRuns) effErr(issueIID int64) error {
 	return f.err
 }
 
-func (f *fakeRuns) CreateRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, _ string, waitOnLimit *bool, mrReworkEnabled *bool, force bool, _ *workersvc.SeededPlan) (store.Run, error) {
+func (f *fakeRuns) CreateRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, _ string, waitOnLimit *bool, mrReworkEnabled *bool, force bool, _ *workersvc.SeededPlan, credOverride *workersvc.CredentialOverride) (store.Run, error) {
 	if f.err != nil {
 		return store.Run{}, f.err
 	}
 	// nil model: the interactive CreateRun seam carries no per-schedule model (PRD #300).
 	// false overrideSubagentModel: no per-run opt-in on the interactive seam (PRD #305).
 	// force is captured so a test can prove the scheduler never sets it (issue #856).
-	f.runs = append(f.runs, runCall{userID, repoID, issueIID, waitOnLimit, mrReworkEnabled, false, nil, false, force})
+	// credOverride captured (PRD #1247 M6): the scheduler never routes a fire through CreateRun,
+	// so this stays nil, but capturing it keeps the fake symmetric with the scheduled seams.
+	f.runs = append(f.runs, runCall{userID, repoID, issueIID, waitOnLimit, mrReworkEnabled, false, nil, false, force, credOverride})
 	return store.Run{ID: uuid.New()}, nil
 }
-func (f *fakeRuns) CreateScheduledRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, _ string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, _ *workersvc.SeededPlan) (store.Run, error) {
+func (f *fakeRuns) CreateScheduledRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, _ string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, _ *workersvc.SeededPlan, credOverride *workersvc.CredentialOverride) (store.Run, error) {
 	// The non-auto-approve scheduled path: recorded in the same `runs` bucket as
 	// CreateRun so the existing wait-on-limit / path-selection count assertions still
 	// observe it, but tagged scheduled=true so a test can prove the scheduler routed
@@ -327,7 +340,9 @@ func (f *fakeRuns) CreateScheduledRun(_ context.Context, userID, repoID uuid.UUI
 		return store.Run{}, err
 	}
 	// false force: the scheduled seam never forces a run creation (issue #856).
-	f.runs = append(f.runs, runCall{userID, repoID, issueIID, waitOnLimit, mrReworkEnabled, true, model, overrideSubagentModel, false})
+	// credOverride captured (PRD #1247 M6): proves the non-auto path threads the schedule's
+	// stored override onto the run.
+	f.runs = append(f.runs, runCall{userID, repoID, issueIID, waitOnLimit, mrReworkEnabled, true, model, overrideSubagentModel, false, credOverride})
 	return store.Run{ID: uuid.New()}, nil
 }
 func (f *fakeRuns) CreateAutopilotRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, description string) (store.Run, error) {
@@ -336,27 +351,27 @@ func (f *fakeRuns) CreateAutopilotRun(_ context.Context, userID, repoID uuid.UUI
 	}
 	// nil waitOnLimit: the poller seam has no per-run choice (owner default). nil model:
 	// the poller seam has no per-run model (PRD #300). Kept so the interface stays
-	// satisfied even though the scheduler no longer calls it.
-	f.autopilot = append(f.autopilot, autopilotCall{userID, repoID, issueIID, description, nil, nil, nil, false})
+	// satisfied even though the scheduler no longer calls it. nil credOverride (PRD #1247).
+	f.autopilot = append(f.autopilot, autopilotCall{userID, repoID, issueIID, description, nil, nil, nil, false, nil})
 	return store.Run{ID: uuid.New()}, nil
 }
-func (f *fakeRuns) CreateScheduledAutopilotRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool) (store.Run, error) {
+func (f *fakeRuns) CreateScheduledAutopilotRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, credOverride *workersvc.CredentialOverride) (store.Run, error) {
 	// The auto-approve scheduled path (PRD #274 Decision 1a): recorded in the same
 	// `autopilot` bucket as CreateAutopilotRun so the existing count assertions still
 	// observe it, but it CAPTURES waitOnLimit (which CreateAutopilotRun drops), the
-	// schedule's mr_rework override (PRD #841 M2) and the schedule's model (PRD #300) so a
-	// test can prove all are threaded through.
+	// schedule's mr_rework override (PRD #841 M2), the schedule's model (PRD #300) and the
+	// schedule's credential override (PRD #1247 M6) so a test can prove all are threaded through.
 	if err := f.effErr(issueIID); err != nil {
 		return store.Run{}, err
 	}
-	f.autopilot = append(f.autopilot, autopilotCall{userID, repoID, issueIID, description, waitOnLimit, mrReworkEnabled, model, overrideSubagentModel})
+	f.autopilot = append(f.autopilot, autopilotCall{userID, repoID, issueIID, description, waitOnLimit, mrReworkEnabled, model, overrideSubagentModel, credOverride})
 	return store.Run{ID: uuid.New()}, nil
 }
-func (f *fakeRuns) CreatePromptRun(_ context.Context, userID, repoID, scheduleID uuid.UUID, title, prompt string, autoApprove, waitOnLimit bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool) (store.Run, error) {
+func (f *fakeRuns) CreatePromptRun(_ context.Context, userID, repoID, scheduleID uuid.UUID, title, prompt string, autoApprove, waitOnLimit bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, credOverride *workersvc.CredentialOverride) (store.Run, error) {
 	if f.err != nil {
 		return store.Run{}, f.err
 	}
-	f.prompts = append(f.prompts, promptCall{userID, repoID, scheduleID, title, prompt, autoApprove, waitOnLimit, mrReworkEnabled, model, overrideSubagentModel})
+	f.prompts = append(f.prompts, promptCall{userID, repoID, scheduleID, title, prompt, autoApprove, waitOnLimit, mrReworkEnabled, model, overrideSubagentModel, credOverride})
 	return store.Run{ID: uuid.New()}, nil
 }
 
@@ -725,6 +740,133 @@ func TestTickThreadsScheduleMrReworkEnabled(t *testing.T) {
 		}
 		if got := h.runs.selfImprove[0].mrReworkEnabled; got != nil {
 			t.Fatalf("a self_improve schedule with a NULL mr_rework column must thread nil (inherit), got %v", *got)
+		}
+	})
+}
+
+// TestTickThreadsScheduleCredentialOverride pins PRD #1247 M6: a scheduled run must stamp the
+// schedule's stored per-run credential override onto the created run (scheduleCredentialOverride
+// reads it off the nullable RunSchedule columns). It mirrors TestTickThreadsScheduleMrReworkEnabled
+// across the three seams — CreatePromptRun, CreateScheduledAutopilotRun (auto issue AND sweep),
+// CreateScheduledRun (manual issue AND sweep) — covering the five logical producer paths, and
+// inverts the self_improve case: CreateSelfImproveRun takes NO override param (D10-excluded), so a
+// self_improve schedule never threads one however its columns read.
+func TestTickThreadsScheduleCredentialOverride(t *testing.T) {
+	pinned := uuid.New()
+	withPinned := func(s *store.RunSchedule) {
+		s.CredentialOverrideMode = pgtype.Text{String: "pinned", Valid: true}
+		s.CredentialOverrideSecretID = pgtype.UUID{Bytes: pinned, Valid: true}
+	}
+	assertPinned := func(t *testing.T, got *workersvc.CredentialOverride) {
+		t.Helper()
+		if got == nil || got.Mode != "pinned" || got.SecretID == nil || *got.SecretID != pinned {
+			t.Fatalf("threaded credential override = %+v, want a pinned override on secret %s", got, pinned)
+		}
+	}
+
+	t.Run("prompt", func(t *testing.T) {
+		h := newHarness()
+		s := h.issueSchedule()
+		s.Target = "prompt"
+		s.IssueIid = pgtype.Int8{}
+		s.Prompt = pgtype.Text{String: "weekly report", Valid: true}
+		s.AutoApprove = false
+		withPinned(&s)
+		h.st.due = []store.RunSchedule{s}
+		h.sched.Boot(context.Background())
+		if len(h.runs.prompts) != 1 {
+			t.Fatalf("CreatePromptRun calls = %d, want 1", len(h.runs.prompts))
+		}
+		assertPinned(t, h.runs.prompts[0].credOverride)
+	})
+	t.Run("issue auto-approve", func(t *testing.T) {
+		h := newHarness()
+		s := h.issueSchedule() // AutoApprove=true → CreateScheduledAutopilotRun
+		withPinned(&s)
+		h.st.due = []store.RunSchedule{s}
+		h.sched.Boot(context.Background())
+		if len(h.runs.autopilot) != 1 {
+			t.Fatalf("CreateScheduledAutopilotRun calls = %d, want 1", len(h.runs.autopilot))
+		}
+		assertPinned(t, h.runs.autopilot[0].credOverride)
+	})
+	t.Run("issue manual", func(t *testing.T) {
+		h := newHarness()
+		s := h.issueSchedule()
+		s.AutoApprove = false // → CreateScheduledRun
+		withPinned(&s)
+		h.st.due = []store.RunSchedule{s}
+		h.sched.Boot(context.Background())
+		if len(h.runs.runs) != 1 {
+			t.Fatalf("CreateScheduledRun calls = %d, want 1", len(h.runs.runs))
+		}
+		assertPinned(t, h.runs.runs[0].credOverride)
+	})
+	t.Run("sweep auto-approve", func(t *testing.T) {
+		h := newHarness()
+		s := h.sweepSchedule(pgtype.Int4{}) // AutoApprove=true, shares createIssueRun
+		withPinned(&s)
+		h.st.due = []store.RunSchedule{s}
+		h.st.sweepRows = []store.ListSweepCandidateIssuesRow{{ForgeIssueIid: 42}}
+		h.sched.Boot(context.Background())
+		if len(h.runs.autopilot) != 1 {
+			t.Fatalf("CreateScheduledAutopilotRun calls = %d, want 1", len(h.runs.autopilot))
+		}
+		assertPinned(t, h.runs.autopilot[0].credOverride)
+	})
+	t.Run("sweep manual", func(t *testing.T) {
+		h := newHarness()
+		s := h.sweepSchedule(pgtype.Int4{})
+		s.AutoApprove = false // → CreateScheduledRun
+		withPinned(&s)
+		h.st.due = []store.RunSchedule{s}
+		h.st.sweepRows = []store.ListSweepCandidateIssuesRow{{ForgeIssueIid: 43}}
+		h.sched.Boot(context.Background())
+		if len(h.runs.runs) != 1 {
+			t.Fatalf("CreateScheduledRun calls = %d, want 1", len(h.runs.runs))
+		}
+		assertPinned(t, h.runs.runs[0].credOverride)
+	})
+	t.Run("auto mode threads a bare auto override", func(t *testing.T) {
+		h := newHarness()
+		s := h.issueSchedule()
+		s.CredentialOverrideMode = pgtype.Text{String: "auto", Valid: true}
+		h.st.due = []store.RunSchedule{s}
+		h.sched.Boot(context.Background())
+		if len(h.runs.autopilot) != 1 {
+			t.Fatalf("CreateScheduledAutopilotRun calls = %d, want 1", len(h.runs.autopilot))
+		}
+		got := h.runs.autopilot[0].credOverride
+		if got == nil || got.Mode != "auto" || got.SecretID != nil {
+			t.Fatalf("threaded override = %+v, want mode auto with no secret", got)
+		}
+	})
+	t.Run("nil override inherits", func(t *testing.T) {
+		h := newHarness()
+		s := h.issueSchedule() // NULL credential columns
+		h.st.due = []store.RunSchedule{s}
+		h.sched.Boot(context.Background())
+		if len(h.runs.autopilot) != 1 {
+			t.Fatalf("CreateScheduledAutopilotRun calls = %d, want 1", len(h.runs.autopilot))
+		}
+		if got := h.runs.autopilot[0].credOverride; got != nil {
+			t.Fatalf("a schedule with NULL credential columns must thread nil (inherit), got %+v", got)
+		}
+	})
+	t.Run("self_improve never threads it", func(t *testing.T) {
+		// CreateSelfImproveRun takes NO credential override param (D10-excluded), so even a
+		// self_improve schedule whose columns somehow read set fires WITHOUT threading one —
+		// and only through the selfImprove seam.
+		h := newHarness()
+		s := h.selfImproveSchedule()
+		withPinned(&s)
+		h.st.due = []store.RunSchedule{s}
+		h.sched.Boot(context.Background())
+		if len(h.runs.selfImprove) != 1 {
+			t.Fatalf("CreateSelfImproveRun calls = %d, want 1", len(h.runs.selfImprove))
+		}
+		if n := len(h.runs.autopilot) + len(h.runs.runs) + len(h.runs.prompts); n != 0 {
+			t.Fatalf("self_improve must fire only through the selfImprove seam (which carries no override), used %d override-capable seams", n)
 		}
 	})
 }

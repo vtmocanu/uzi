@@ -32,8 +32,8 @@ type registerStore struct {
 func (r *registerStore) FailWorkerRunsOverCap(context.Context, store.FailWorkerRunsOverCapParams) ([]uuid.UUID, error) {
 	return nil, nil
 }
-func (r *registerStore) RequeueWorkerRuns(context.Context, store.RequeueWorkerRunsParams) (int64, error) {
-	return 0, nil
+func (r *registerStore) RequeueWorkerRuns(context.Context, store.RequeueWorkerRunsParams) ([]uuid.UUID, error) {
+	return nil, nil
 }
 
 // RegisterWorker returns the POST-register row. rotatedHash simulates a rotation

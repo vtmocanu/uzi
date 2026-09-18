@@ -145,6 +145,16 @@ type ClaimPayload struct {
 	// awaiting_approval in front of a human who already approved, and can fail with
 	// REASON_NO_PLAN when the resumed session declines to re-emit signal_plan.
 	PlanApproved bool `json:"plan_approved"`
+	// ResumePhase tells the worker which phase to RESTORE on a resume claim instead of re-entering
+	// the planning turn (PRD #1247 M5, D13). One of "awaiting_input", "awaiting_approval",
+	// "implementing", or "" (a fresh run with no prior phase — omitted). Derived server-side from the
+	// run row by resumePhaseFor; see its doc for the exact table and the awaiting_followup note.
+	ResumePhase string `json:"resume_phase,omitempty"`
+	// ResumePlanSeq is the run_messages seq of the submitted plan frame the gate is parked on,
+	// carried ONLY when ResumePhase == "awaiting_approval" (PRD #1247 M5, D13: "awaiting_approval with
+	// the submitted plan's seq"), so the worker correlates a buffered approve_plan with the right plan
+	// revision on the reclaim. 0 (omitted) for every other phase.
+	ResumePlanSeq int64 `json:"resume_plan_seq,omitempty"`
 	// PlanSource is where PlanMd came from (runs.plan_source, PRD #209): 'agent' for a
 	// worker-authored plan (or a pre-#209 run), 'seeded' for a plan supplied at create
 	// time over the API. The worker needs it to disambiguate the two plan_approved

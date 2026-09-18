@@ -1,9 +1,14 @@
-import { describe, it } from "node:test";
+import { afterEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import fsp from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import type { Options as SdkOptions, HookInput } from "@anthropic-ai/claude-agent-sdk";
 
 import { JudgeRunner, buildJudgePrompt, parseReview, fallbackReview, calibrateReview } from "../src/judge-runner.js";
+import { Outbox } from "../src/outbox.js";
+import type { StateAck } from "../src/protocol.js";
 import { stubJudgeQueryFn } from "../src/judge-runner-stub.js";
 import type { SdkQueryFn } from "../src/sdk-executor.js";
 import type { WorkerClient } from "../src/client.js";
@@ -25,7 +30,9 @@ function fakeClient(trace: JudgeTraceResponse) {
     review?: { id: string; review: ReviewRequest };
     state?: { id: string; body: StateRequest };
     states: { id: string; body: StateRequest }[];
-    messages: { id: string; messages: OutgoingMessage[] }[];
+    // `generation` records the arg the judge threads to postMessages (PRD #1247 M2): the m3
+    // send-gate reads it to decide whether to stamp claim_generation on the usage batch.
+    messages: { id: string; messages: OutgoingMessage[]; generation?: number }[];
   } = { states: [], messages: [] };
   const client = {
     getTrace: async () => trace,
@@ -36,8 +43,81 @@ function fakeClient(trace: JudgeTraceResponse) {
       calls.states.push({ id, body });
       calls.state = { id, body };
     },
-    postMessages: async (id: string, messages: OutgoingMessage[]) => {
-      calls.messages.push({ id, messages });
+    postMessages: async (id: string, messages: OutgoingMessage[], generation?: number) => {
+      calls.messages.push({ id, messages, generation });
+    },
+  } as unknown as WorkerClient;
+  return { client, calls };
+}
+
+// A generation-FENCING fake api (PRD #1247 M2): it models a credential_switch_v1 capability
+// worker whose mutating state reports the server fences on the claim generation. A
+// running/completed/failed report carrying no numeric claim_generation is REFUSED with the
+// server's 409 shape ({applied:false}); the real client swallows that 409 (it does not throw),
+// so acceptance is observed via `accepted`/`refused`, not a throw. With the threading in place
+// nothing is refused; reverting it reddens every assertion below.
+function fencedFakeClient(trace: JudgeTraceResponse) {
+  const MUTATING = new Set(["running", "completed", "failed"]);
+  const calls: {
+    review?: { id: string; review: ReviewRequest };
+    accepted: { id: string; body: StateRequest }[];
+    refused: { id: string; body: StateRequest }[];
+    messages: { id: string; messages: OutgoingMessage[]; generation?: number }[];
+  } = { accepted: [], refused: [], messages: [] };
+  const client = {
+    getTrace: async () => trace,
+    postReview: async (id: string, review: ReviewRequest) => {
+      calls.review = { id, review };
+    },
+    reportState: async (id: string, body: StateRequest) => {
+      if (MUTATING.has(body.status) && typeof body.claim_generation !== "number") {
+        // The fence: a capability worker's mutating report MUST carry the generation. The 409
+        // shape the real client reads as {applied:false, status} — the run is NOT applied.
+        calls.refused.push({ id, body });
+        return { applied: false, status: "running" } as never;
+      }
+      calls.accepted.push({ id, body });
+      return { applied: true, status: body.status } as never;
+    },
+    postMessages: async (id: string, messages: OutgoingMessage[], generation?: number) => {
+      calls.messages.push({ id, messages, generation });
+    },
+  } as unknown as WorkerClient;
+  return { client, calls };
+}
+
+// A fake api that returns staleClaim on the Nth `running` report — models a judge claim
+// SUPERSEDED by an ordinary stale-worker requeue + reclaim. PRD #1247 fix round (Greptile P1):
+// the runner must abandon cleanly on staleClaim, whether it fires on the INITIAL ack (index 1,
+// before any trace/model/advice) or on the PRE-POST probe (index 2, after the model but before the
+// advice write). `traceFetched` proves whether the model path ran.
+function staleRunningFakeClient(trace: JudgeTraceResponse, staleOnRunningIndex = 1) {
+  let runningCount = 0;
+  const calls: {
+    review?: { id: string; review: ReviewRequest };
+    states: { id: string; body: StateRequest }[];
+    messages: { id: string; messages: OutgoingMessage[]; generation?: number }[];
+    traceFetched: boolean;
+  } = { states: [], messages: [], traceFetched: false };
+  const client = {
+    getTrace: async () => {
+      calls.traceFetched = true;
+      return trace;
+    },
+    postReview: async (id: string, review: ReviewRequest) => {
+      calls.review = { id, review };
+    },
+    reportState: async (id: string, body: StateRequest) => {
+      calls.states.push({ id, body });
+      if (body.status === "running") {
+        runningCount++;
+        if (runningCount === staleOnRunningIndex) return { applied: false, staleClaim: true } as never;
+        return { applied: true, status: "running" } as never;
+      }
+      return { applied: true, status: body.status } as never;
+    },
+    postMessages: async (id: string, messages: OutgoingMessage[], generation?: number) => {
+      calls.messages.push({ id, messages, generation });
     },
   } as unknown as WorkerClient;
   return { client, calls };
@@ -133,11 +213,13 @@ describe("JudgeRunner", () => {
     await runner.execute(judgeClaim());
 
     // A `running` report precedes the terminal `completed` one — this is what stamps the
-    // judge run's started_at, giving the reviewed run's panel a duration to show.
+    // judge run's started_at, giving the reviewed run's panel a duration to show. PRD #1247 fix
+    // round adds a SECOND idempotent `running` probe immediately before the advice write, so the
+    // happy path is running (initial) → running (pre-post probe) → completed.
     assert.deepEqual(
       calls.states.map((s) => s.body.status),
-      ["running", "completed"],
-      "the judge must report running before completed",
+      ["running", "running", "completed"],
+      "the judge reports running, re-probes running before posting, then completed",
     );
     // Exactly one usage frame posted, on the judge run, carrying a result event and the
     // non-empty per-model usage the API folds into run_usage.
@@ -155,6 +237,135 @@ describe("JudgeRunner", () => {
     );
   });
 
+  // PRD #1247 M2 fix round: the judge reports state DIRECTLY (not through the RunRunner stamping
+  // closure), so it must thread the claim's run-lane generation onto the running + completed
+  // reports AND onto the usage postMessages (which rides the m3 send-gate).
+  it("stamps the claim generation on the running, completed, and usage reports (PRD #1247 M2)", async () => {
+    const { client, calls } = fakeClient(emptyTrace);
+    const modelJson = JSON.stringify({ verdict: "ok", summary: "s", recommendations: [] });
+    const runner = new JudgeRunner(client, nullLogger(), { queryFn: replyingQueryFnWithUsage(modelJson) });
+    await runner.execute(judgeClaim({ claim_generation: 9 }));
+
+    assert.deepEqual(
+      calls.states.map((s) => s.body.status),
+      ["running", "running", "completed"],
+    );
+    for (const s of calls.states) {
+      assert.equal(s.body.claim_generation, 9, `the ${s.body.status} report carries the claim generation`);
+    }
+    assert.equal(calls.messages.length, 1, "one usage frame is posted on the success path");
+    assert.equal(calls.messages[0]?.generation, 9, "the usage batch is sent with the claim generation for the send-gate");
+  });
+
+  // The failed report (here, the no-target early-exit through safeReportFailed) also carries the
+  // generation, so a capability worker's judge FAILURE is fenced, not 409'd.
+  it("stamps the claim generation on the failed report (PRD #1247 M2)", async () => {
+    const { client, calls } = fakeClient(emptyTrace);
+    const runner = new JudgeRunner(client, nullLogger(), { queryFn: replyingQueryFn("{}") });
+    await runner.execute(judgeClaim({ target_run_id: null, claim_generation: 4 }));
+    assert.equal(calls.state?.body.status, "failed");
+    assert.equal(calls.state?.body.claim_generation, 4, "the failed report carries the claim generation");
+  });
+
+  // Lane-acceptance: a capability worker's judge run is ACCEPTED by a generation-fencing api.
+  // Reverting the threading routes the mutating reports to `refused` (409) and reddens this.
+  it("a capability worker's judge run is ACCEPTED (not 409) by a generation-fencing api (PRD #1247 M2)", async () => {
+    const { client, calls } = fencedFakeClient(emptyTrace);
+    const modelJson = JSON.stringify({ verdict: "ok", summary: "s", recommendations: [] });
+    const runner = new JudgeRunner(client, nullLogger(), { queryFn: replyingQueryFnWithUsage(modelJson) });
+    await runner.execute(judgeClaim({ claim_generation: 7 }));
+
+    assert.deepEqual(calls.refused, [], "the fence refuses no mutating report — all carry the generation");
+    assert.deepEqual(
+      calls.accepted.map((s) => s.body.status),
+      ["running", "running", "completed"],
+      "all mutating reports (initial running, pre-post running probe, completed) are accepted by the fence",
+    );
+    for (const s of calls.accepted) {
+      assert.equal(s.body.claim_generation, 7, `the accepted ${s.body.status} report carries the claim generation`);
+    }
+    assert.equal(calls.messages[0]?.generation, 7, "the usage batch rides the send-gate with the generation");
+    assert.equal(calls.review?.review.verdict, "ok", "the review still posts on the accepted lane");
+  });
+
+  // PRD #1247 fix round (Greptile P1): a judge claim superseded before its first report gets
+  // staleClaim on `running`; the runner must ABANDON cleanly — no trace, no model, no advice
+  // POST, no completed/failed report — so a stale flight cannot overwrite the current verdict.
+  // Reverting the early return reddens this (the runner would fetch the trace and post a review).
+  it("abandons a stale-claimed judge run at the running report with zero downstream posts (PRD #1247 fix round)", async () => {
+    let modelCalled = false;
+    const { client, calls } = staleRunningFakeClient(emptyTrace);
+    const queryFn = async function* () {
+      modelCalled = true;
+      yield { type: "result", subtype: "success", is_error: false };
+    } as unknown as SdkQueryFn;
+    const runner = new JudgeRunner(client, nullLogger(), { queryFn });
+    await runner.execute(judgeClaim({ claim_generation: 5 }));
+
+    assert.deepEqual(
+      calls.states.map((s) => s.body.status),
+      ["running"],
+      "only the running report is sent; no completed/failed after staleClaim",
+    );
+    assert.equal(calls.traceFetched, false, "no trace is fetched after a stale running ack");
+    assert.equal(modelCalled, false, "no model call after a stale running ack");
+    assert.equal(calls.review, undefined, "no review is posted after a stale running ack");
+    assert.equal(calls.messages.length, 0, "no usage frame is posted after a stale running ack");
+  });
+
+  // PRD #1247 fix round (Greptile P1, pre-post probe): the most reachable window — the model runs
+  // (minutes) while a stale requeue + same-worker reclaim advances the run to G+1. The initial ack
+  // was fresh, so the model runs; the PRE-POST probe catches the supersession and abandons BEFORE
+  // the advice write, so the stale flight posts NO review and NO completed. Reverting the pre-post
+  // probe reddens this (the runner would postReview + completed on the superseded flight).
+  it("abandons a stale-claimed judge run at the pre-post probe with zero advice/completed posts (PRD #1247 fix round)", async () => {
+    const { client, calls } = staleRunningFakeClient(emptyTrace, 2);
+    const modelJson = JSON.stringify({ verdict: "ok", summary: "s", recommendations: [] });
+    const runner = new JudgeRunner(client, nullLogger(), { queryFn: replyingQueryFn(modelJson) });
+    await runner.execute(judgeClaim({ claim_generation: 5 }));
+
+    assert.deepEqual(
+      calls.states.map((s) => s.body.status),
+      ["running", "running"],
+      "the initial running is fresh; the pre-post probe is stale, so no completed/failed follows",
+    );
+    assert.equal(calls.traceFetched, true, "the model path DID run before the pre-post probe");
+    assert.equal(calls.review, undefined, "no review is posted when the pre-post probe is stale");
+  });
+
+  // PRD #1247 fix round (Greptile P1 disposition): the pre-post probe is a SUPERSESSION FENCE and is
+  // FAIL-CLOSED. A TRANSIENT failure (a throw, NOT a staleClaim ack) leaves ownership UNKNOWN, and
+  // postReview is generation-blind until #1423, so proceeding could overwrite a reclaiming flight's
+  // advice. The throw therefore propagates to the advice-phase catch (safeReportFailed) and posts
+  // NO advice. Removing the fence (or making it best-effort) reddens this (a review would be posted).
+  it("fails closed when the pre-post probe throws transiently: NO advice post, the run reports failed", async () => {
+    let running = 0;
+    const calls: { review?: unknown; states: string[] } = { states: [] };
+    const client = {
+      getTrace: async () => emptyTrace,
+      postReview: async (id: string, review: ReviewRequest) => {
+        calls.review = { id, review };
+      },
+      reportState: async (_id: string, body: StateRequest) => {
+        calls.states.push(body.status);
+        if (body.status === "running") {
+          running++;
+          if (running === 2) throw new Error("transient probe failure"); // the pre-post probe
+          return { applied: true, status: "running" } as never;
+        }
+        return { applied: true, status: body.status } as never;
+      },
+      postMessages: async () => {},
+    } as unknown as WorkerClient;
+    const modelJson = JSON.stringify({ verdict: "ok", summary: "s", recommendations: [] });
+    const runner = new JudgeRunner(client, nullLogger(), { queryFn: replyingQueryFn(modelJson) });
+    await runner.execute(judgeClaim({ claim_generation: 5 }));
+
+    assert.equal(calls.review, undefined, "a probe throw posts NO advice (fail-closed: ownership unknown)");
+    assert.ok(calls.states.includes("failed"), "the run reports failed via the advice-phase catch");
+    assert.ok(!calls.states.includes("completed"), "no completed report when the pre-post fence fails closed");
+  });
+
   it("posts NO usage frame on the model-error path (PRD #69 M6)", async () => {
     const { client, calls } = fakeClient(emptyTrace);
     const runner = new JudgeRunner(client, nullLogger(), { queryFn: replyingQueryFn("garbage", true) });
@@ -162,10 +373,11 @@ describe("JudgeRunner", () => {
 
     // The deterministic-fallback path records no real spend, so no usage frame is posted.
     assert.equal(calls.messages.length, 0, "an error result must not post a usage frame");
-    // The run still reports running then completes with the fallback review.
+    // The run still reports running, re-probes running before posting, then completes with the
+    // fallback review.
     assert.deepEqual(
       calls.states.map((s) => s.body.status),
-      ["running", "completed"],
+      ["running", "running", "completed"],
     );
   });
 
@@ -968,5 +1180,96 @@ describe("judge tool confinement (PRD #89 M-allow / auditor Medium)", () => {
 
     assert.ok(captured.options, "the judge must have called the model (so options were captured)");
     assert.ok(!("effort" in captured.options!), "no effort is set when the claim carries no default_effort");
+  });
+});
+
+// PRD #1391 Run B M3b (D6): the judge journals its terminal STATE write-ahead — never the verdict
+// POST. A fake api whose terminal report FAILS transport leaves the journal on disk so the test can
+// prove (a) the outcome is journalled before it is confirmed, (b) the journal body is the terminal
+// STATE (never the verdict), and (c) postReview is called exactly ONCE (the verdict is never replayed
+// by the resolve path).
+const journalTmp: string[] = [];
+afterEach(async () => {
+  for (const r of journalTmp.splice(0)) await fsp.rm(r, { recursive: true, force: true }).catch(() => undefined);
+});
+
+async function journalingClient(trace: JudgeTraceResponse, failTerminal: boolean) {
+  const calls: {
+    reviewPosts: number;
+    terminalAcks: number;
+    states: { id: string; body: StateRequest }[];
+  } = { reviewPosts: 0, terminalAcks: 0, states: [] };
+  const client = {
+    getTrace: async () => trace,
+    postReview: async () => {
+      calls.reviewPosts++;
+    },
+    reportState: async (id: string, body: StateRequest): Promise<StateAck> => {
+      calls.states.push({ id, body });
+      if (body.status === "completed" || body.status === "failed") {
+        calls.terminalAcks++;
+        if (failTerminal) throw new Error("api unreachable"); // the terminal send fails ⇒ journal stays
+        return { applied: true, status: body.status };
+      }
+      return { applied: true, status: "running" };
+    },
+    postMessages: async () => undefined,
+    hasFeature: (f: string) => f === "terminal_fence",
+    getMessageGaps: async () => ({ gaps: [] }),
+  } as unknown as WorkerClient;
+  return { client, calls };
+}
+
+async function mkJournalOutbox(): Promise<Outbox> {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "judge-journal-"));
+  journalTmp.push(dir);
+  const outbox = new Outbox({
+    root: path.join(dir, "outbox"),
+    log: nullLogger(),
+    runMaxBytes: 64 * 1024 * 1024,
+    maxBytes: 512 * 1024 * 1024,
+    retentionMs: 7 * 86_400_000,
+  });
+  await outbox.init();
+  return outbox;
+}
+
+describe("JudgeRunner terminal journaling (PRD #1391 Run B M3b, D6)", () => {
+  it("journals the terminal STATE (not the verdict) write-ahead; the verdict POST is never replayed", async () => {
+    const outbox = await mkJournalOutbox();
+    const { client, calls } = await journalingClient(emptyTrace, /*failTerminal*/ true);
+    const modelJson = JSON.stringify({ verdict: "ok", summary: "s", recommendations: [] });
+    const runner = new JudgeRunner(client, nullLogger(), {
+      queryFn: replyingQueryFn(modelJson),
+      outbox,
+      outboxTerminalMaxBytes: 1 << 20,
+      gapFillMax: 100,
+    });
+    await runner.execute(judgeClaim({ claim_generation: 5 }));
+
+    // The terminal `completed` send failed, so the write-ahead journal is still on disk — proving
+    // it was journalled BEFORE the send confirmed.
+    assert.equal(outbox.hasPendingTerminal("judge-1", 5), true, "the terminal state was journalled write-ahead");
+    const j = await outbox.readTerminalJournal("judge-1", 5);
+    assert.equal(j?.body.status, "completed", "the journal holds the terminal STATE");
+    assert.equal(j?.messagesThroughSeq, 0, "a judge trace gates no api sub-work ⇒ fence 0");
+    // The verdict POST happened exactly ONCE and is NOT in the journal (D6: never the verdict).
+    assert.equal(calls.reviewPosts, 1, "postReview is called exactly once, never replayed by the resolve path");
+    assert.ok(!("verdict" in (j?.body ?? {})), "the verdict is never journalled");
+  });
+
+  it("retires the journal on a 200 terminal ack (no residue on the happy path)", async () => {
+    const outbox = await mkJournalOutbox();
+    const { client } = await journalingClient(emptyTrace, /*failTerminal*/ false);
+    const modelJson = JSON.stringify({ verdict: "ok", summary: "s", recommendations: [] });
+    const runner = new JudgeRunner(client, nullLogger(), {
+      queryFn: replyingQueryFn(modelJson),
+      outbox,
+      outboxTerminalMaxBytes: 1 << 20,
+      gapFillMax: 100,
+    });
+    await runner.execute(judgeClaim({ claim_generation: 9 }));
+
+    assert.equal(outbox.hasPendingTerminal("judge-1", 9), false, "a 200 terminal ack retires the journal");
   });
 });

@@ -32,7 +32,3 @@ export function useSetFindingsOpen(): (open: number) => void {
 // — rendered outside an AppShell. A displayed 0 would be the claim "you have nothing to
 // triage", so a provider-less consumer must render nothing rather than substitute 0.
 export const FindingsOpenValueContext = createContext<number | null>(null);
-
-export function useFindingsOpen(): number | null {
-  return useContext(FindingsOpenValueContext);
-}

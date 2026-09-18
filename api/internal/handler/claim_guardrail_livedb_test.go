@@ -143,7 +143,7 @@ func TestClaimGuardBlocksCanPushLiveDB(t *testing.T) {
 	f := newClaimGuardFixture(ctx, t)
 	runID := f.seedEnabledRepoAndQueuedRun(ctx, t, 501, 7, protCanPush)
 
-	payload, err := f.svc.Claim(ctx, f.wkr)
+	payload, err := f.svc.Claim(ctx, f.wkr, nil)
 	if err != nil {
 		t.Fatalf("Claim must report idle (nil error) for a guardrail-blocked run, got %v", err)
 	}
@@ -166,7 +166,7 @@ func TestClaimGuardBlocksUnprotectedLiveDB(t *testing.T) {
 	f := newClaimGuardFixture(ctx, t)
 	runID := f.seedEnabledRepoAndQueuedRun(ctx, t, 502, 7, protUnprotected)
 
-	payload, err := f.svc.Claim(ctx, f.wkr)
+	payload, err := f.svc.Claim(ctx, f.wkr, nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -184,7 +184,7 @@ func TestClaimGuardFailsClosedOnForgeErrorLiveDB(t *testing.T) {
 	f := newClaimGuardFixture(ctx, t)
 	runID := f.seedEnabledRepoAndQueuedRun(ctx, t, 503, 7, protError)
 
-	payload, err := f.svc.Claim(ctx, f.wkr)
+	payload, err := f.svc.Claim(ctx, f.wkr, nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -203,7 +203,7 @@ func TestClaimGuardAllowsCleanLiveDB(t *testing.T) {
 	f := newClaimGuardFixture(ctx, t)
 	runID := f.seedEnabledRepoAndQueuedRun(ctx, t, 504, 7, protClean)
 
-	payload, err := f.svc.Claim(ctx, f.wkr)
+	payload, err := f.svc.Claim(ctx, f.wkr, nil)
 	if err != nil {
 		t.Fatalf("Claim (clean): %v", err)
 	}

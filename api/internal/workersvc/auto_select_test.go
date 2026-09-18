@@ -117,7 +117,7 @@ func newAutoFixture(t *testing.T) autoFixture {
 
 func (f autoFixture) claim(t *testing.T) *ClaimPayload {
 	t.Helper()
-	payload, err := f.svc.Claim(context.Background(), f.worker)
+	payload, err := f.svc.Claim(context.Background(), f.worker, nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -485,7 +485,7 @@ func TestAutoCandidateQueryErrorFailsTheClaim(t *testing.T) {
 	f := newAutoFixture(t)
 	f.fs.autoCandidatesErr = errors.New("connection reset")
 
-	_, err := f.svc.Claim(context.Background(), f.worker)
+	_, err := f.svc.Claim(context.Background(), f.worker, nil)
 	if err == nil {
 		t.Fatal("a failed candidate query produced no error; it must not look like an empty pool")
 	}
@@ -651,7 +651,7 @@ func TestAutoDoesNotRetryOnALockedVault(t *testing.T) {
 
 	payload, err := svc.Claim(context.Background(), store.Worker{
 		ID: uuid.New(), UserID: owner, AnthropicBindMode: BindModeAuto,
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -721,7 +721,12 @@ func TestPinnedOpenFailureStaysTerminal(t *testing.T) {
 // MUTATION THIS CATCHES: adding a constant to either Go half without touching 00089
 // (and the reverse). Measured both directions.
 func TestSelectReasonVocabularyMatchesCheck(t *testing.T) {
-	const path = "../store/migrations/00089_run_select_reason_check.sql"
+	// PRD #1247 M1 widened the vocabulary in 00233 (run_pinned, run_default) alongside
+	// the two override-MODE CHECKs, so the guard now parses 00233. 00233 carries several
+	// unrelated quoted vocabularies (the override-mode IN-list 'pinned'/'auto'/'default'
+	// on runs and run_schedules), so a whole-file regex would pull those in and disagree
+	// with AllReasons. Anchor strictly on the runs_anthropic_select_reason_check IN-list.
+	const path = "../store/migrations/00233_per_run_credential_override.sql"
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read %s: %v", path, err)
@@ -736,9 +741,19 @@ func TestSelectReasonVocabularyMatchesCheck(t *testing.T) {
 		stmt.WriteString(line)
 		stmt.WriteString("\n")
 	}
+	// Isolate the select-reason IN-list. 00233 both DROPs and re-ADDs the constraint;
+	// the DROP CONSTRAINT statement carries no IN-list, and only the FIRST re-ADD in the
+	// Up section (the NOT VALID one) is the widened vocabulary. Anchor on
+	// "anthropic_select_reason IN (" and collect the quoted values up to the closing ")".
+	body := stmt.String()
+	anchor := regexp.MustCompile(`anthropic_select_reason IN \(([^)]*)\)`)
+	inList := anchor.FindStringSubmatch(body)
+	if inList == nil {
+		t.Fatalf("could not find the anthropic_select_reason IN-list in %s; the guard is reading the wrong thing", path)
+	}
 	inCheck := regexp.MustCompile(`'([a-z_]+)'`)
 	var fromSQL []string
-	for _, m := range inCheck.FindAllStringSubmatch(stmt.String(), -1) {
+	for _, m := range inCheck.FindAllStringSubmatch(inList[1], -1) {
 		fromSQL = append(fromSQL, m[1])
 	}
 	if len(fromSQL) == 0 {

@@ -10,6 +10,7 @@ import {
   STUB_INTERLEAVE_SENTINEL,
   STUB_INTERLEAVE_STREAM,
   STUB_LOOP_SENTINEL,
+  STUB_OUTBOX_SENTINEL,
   STUB_STALL_SENTINEL,
   type EmittedMessage,
   type RunContext,
@@ -196,6 +197,51 @@ describe("StubExecutor — PRD #47 M6 run-health sentinels", () => {
       wt.cleanup();
     }
     assert.equal(tools(emitted, "tool_use").length, 0, "a normal run emits no stub tool calls");
+  });
+});
+
+describe("StubExecutor — PRD #1391 M5 outbox-outage sentinel", () => {
+  // outboxTickMs: 0 + a small outboxTicks make the steady stream run instantly so the
+  // unit test is fast; the real e2e leaves the STUB_OUTBOX_* defaults (a ~90s window).
+  const outboxTicks = (emitted: EmittedMessage[]) =>
+    emitted
+      .filter(
+        (m) =>
+          m.kind === "status" &&
+          typeof (m.payload as Record<string, unknown>).text === "string" &&
+          String((m.payload as Record<string, unknown>).text).startsWith("stub: outbox tick "),
+      )
+      .map((m) => String((m.payload as Record<string, unknown>).text));
+
+  it("UZI_STUB_OUTBOX emits a steady stream of numbered status ticks, tunable by count", async () => {
+    const wt = makeWorktree();
+    const { ctx, emitted } = makeCtx({
+      worktreePath: wt.path,
+      issueDescription: `x ${STUB_OUTBOX_SENTINEL}`,
+    });
+    try {
+      await new StubExecutor(nullLogger(), { outboxTickMs: 0, outboxTicks: 5 }).run(ctx);
+    } finally {
+      wt.cleanup();
+    }
+    // Exactly the requested count, numbered 1..N in emit order — the property the e2e
+    // relies on to assert every emitted frame replays exactly once in contiguous order.
+    assert.deepStrictEqual(
+      outboxTicks(emitted),
+      [1, 2, 3, 4, 5].map((i) => `stub: outbox tick ${i}`),
+      "the outbox sentinel must emit exactly outboxTicks numbered ticks, in order",
+    );
+  });
+
+  it("emits NO outbox ticks when the sentinel is absent (no leak into normal runs)", async () => {
+    const wt = makeWorktree();
+    const { ctx, emitted } = makeCtx({ worktreePath: wt.path });
+    try {
+      await new StubExecutor(nullLogger(), { outboxTickMs: 0, outboxTicks: 5 }).run(ctx);
+    } finally {
+      wt.cleanup();
+    }
+    assert.deepStrictEqual(outboxTicks(emitted), [], "a run without the sentinel must emit no outbox ticks");
   });
 });
 

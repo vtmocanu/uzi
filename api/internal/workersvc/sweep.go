@@ -4,12 +4,15 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/autoselect"
 	"github.com/vtmocanu/uzi/api/internal/autoselectrow"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -20,14 +23,35 @@ import (
 func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 	now := s.now()
 	staleCutoff := pgconv.Time(now.Add(-s.p.WorkerHeartbeatStale))
+	// PRD #1390 M1 (D9): the over-cap FAIL waits for TWO consecutive stale windows, so a run
+	// requeued once then hit by a partition just over one window is not terminated before a
+	// heartbeat can re-adopt it. The REQUEUE keeps the single window (staleCutoff).
+	failCutoff := pgconv.Time(now.Add(-2 * s.p.WorkerHeartbeatStale))
 	claimCutoff := pgconv.Time(now.Add(-s.p.ClaimGrace))
 	max := int32(s.p.RunMaxRequeues) //nolint:gosec // G115: RunMaxRequeues is a small bounded config int (env RUN_MAX_REQUEUES), never near int32 range
+
+	// PRD #1390 M1 (D1): the boot grace. While active, the three stale-worker passes
+	// (MarkStaleWorkersOffline, FailRunsOfStaleWorkersOverCap, RequeueRunsOfStaleWorkers) are
+	// skipped — an api that was unreachable must not declare every worker dead the instant it
+	// returns, before any worker could reconnect. Every other pass below runs as today. The
+	// grace is anchored on listener-ready (SetReadyAt), not process start; readyAt still zero
+	// (before bind) is treated as active. SWEEPER_BOOT_GRACE=0 makes this always false.
+	graceActive := bootGraceActive(s.p.SweeperBootGrace, s.readyAtTime(), now)
+	if graceActive {
+		slog.Info("sweeper: boot grace active, skipping stale-worker passes",
+			"boot_grace", s.p.SweeperBootGrace, "ready_at", s.readyAtTime())
+	} else if s.p.SweeperBootGrace > 0 && s.bootGraceFirstRunLogged.CompareAndSwap(false, true) {
+		slog.Info("sweeper: boot grace elapsed, running stale-worker passes",
+			"boot_grace", s.p.SweeperBootGrace, "ready_at", s.readyAtTime())
+	}
 
 	var res SweepResult
 	var err error
 
-	if res.WorkersOffline, err = s.q.MarkStaleWorkersOffline(ctx, staleCutoff); err != nil {
-		return res, fmt.Errorf("mark stale workers offline: %w", err)
+	if !graceActive {
+		if res.WorkersOffline, err = s.q.MarkStaleWorkersOffline(ctx, staleCutoff); err != nil {
+			return res, fmt.Errorf("mark stale workers offline: %w", err)
+		}
 	}
 
 	claimed, err := s.q.SweepClaimedNeverStarted(ctx, claimCutoff)
@@ -81,52 +105,57 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 	}
 
 	// Fail-over-cap before re-queue: the two are disjoint on requeue_count, but
-	// failing first keeps a run that just hit the cap from being re-queued.
-	failed, err := s.q.FailRunsOfStaleWorkersOverCap(ctx, store.FailRunsOfStaleWorkersOverCapParams{
-		FailureReason: pgconv.TextOrNull("worker lost; exceeded re-queue budget"),
-		MaxRequeues:   max,
-		Cutoff:        staleCutoff,
-	})
-	if err != nil {
-		return res, fmt.Errorf("fail stale-worker runs over cap: %w", err)
-	}
-	res.StaleFailed = int64(len(failed))
-	for _, r := range failed {
-		s.publishSwept(r.ID, r.Status)
-		// PRD #46 Decision 2: a swept-to-failed run (worker lost, over re-queue budget)
-		// is committed-terminal and worth judging. Best-effort, gated inside.
-		s.maybeEnqueueJudgeByID(ctx, r.ID)
-	}
+	// failing first keeps a run that just hit the cap from being re-queued. Both are
+	// stale-worker passes, so both are suppressed inside the boot grace (PRD #1390 M1).
+	if !graceActive {
+		failed, err := s.q.FailRunsOfStaleWorkersOverCap(ctx, store.FailRunsOfStaleWorkersOverCapParams{
+			FailureReason: pgconv.TextOrNull("worker lost; exceeded re-queue budget"),
+			MaxRequeues:   max,
+			// PRD #1390 M1 (D9): the two-window cutoff — the over-cap fail requires the worker
+			// to have been stale for 2*WORKER_HEARTBEAT_STALE, unlike the single-window requeue.
+			FailCutoff: failCutoff,
+		})
+		if err != nil {
+			return res, fmt.Errorf("fail stale-worker runs over cap: %w", err)
+		}
+		res.StaleFailed = int64(len(failed))
+		for _, r := range failed {
+			s.publishSwept(r.ID, r.Status)
+			// PRD #46 Decision 2: a swept-to-failed run (worker lost, over re-queue budget)
+			// is committed-terminal and worth judging. Best-effort, gated inside.
+			s.maybeEnqueueJudgeByID(ctx, r.ID)
+		}
 
-	requeued, err := s.q.RequeueRunsOfStaleWorkers(ctx, store.RequeueRunsOfStaleWorkersParams{
-		MaxRequeues: max,
-		Cutoff:      staleCutoff,
-	})
-	if err != nil {
-		return res, fmt.Errorf("re-queue stale-worker runs: %w", err)
-	}
-	res.StaleRequeued = int64(len(requeued))
-	for _, r := range requeued {
-		s.publishSwept(r.ID, r.Status)
-		// 🔴 A REQUEUE GRANTS A FRESH ATTEMPT, SO IT MUST CLEAR THE DEAD ATTEMPT'S
-		// EVIDENCE (PRD #108 M5). This query writes status='queued' but KEEPS
-		// worker_id for affinity, so without this the run returns to `running` under a
-		// new attempt still carrying the old one's 20-failure streak and is
-		// auto-stopped before the new worker persists a byte — uzi killing a run one
-		// tick after deciding it deserved another try and spending re-queue budget to
-		// say so. Likely rather than theoretical for the population M5 exists to
-		// protect: a pre-0.10.1 worker's retry batch GROWS, so a worker wedged at 2 Hz
-		// is a prime OOM candidate, and OOM is exactly what puts it here.
-		//
-		// The window is wide, and uzi's own configuration is the calibration:
-		// defaultClaimGrace budgets FIVE MINUTES for claimed→started, while the sweeper
-		// gives this 15 seconds. The whole of the new attempt's checkout sits inside it
-		// — ensureClone branches on isBareRepo, so a fresh container from a NEW image
-		// has an empty cache and takes the cold cloneBare path, and that clone runs
-		// between the worker's reportState({status:"running"}) and its first flush
-		// (runner.ts; batcher.emit only buffers and then waits for a tick). The claim
-		// is about that ORDERING, not a stopwatched duration.
-		s.persistFail.evict(r.ID)
+		requeued, err := s.q.RequeueRunsOfStaleWorkers(ctx, store.RequeueRunsOfStaleWorkersParams{
+			MaxRequeues: max,
+			Cutoff:      staleCutoff,
+		})
+		if err != nil {
+			return res, fmt.Errorf("re-queue stale-worker runs: %w", err)
+		}
+		res.StaleRequeued = int64(len(requeued))
+		for _, r := range requeued {
+			s.publishSwept(r.ID, r.Status)
+			// 🔴 A REQUEUE GRANTS A FRESH ATTEMPT, SO IT MUST CLEAR THE DEAD ATTEMPT'S
+			// EVIDENCE (PRD #108 M5). This query writes status='queued' but KEEPS
+			// worker_id for affinity, so without this the run returns to `running` under a
+			// new attempt still carrying the old one's 20-failure streak and is
+			// auto-stopped before the new worker persists a byte — uzi killing a run one
+			// tick after deciding it deserved another try and spending re-queue budget to
+			// say so. Likely rather than theoretical for the population M5 exists to
+			// protect: a pre-0.10.1 worker's retry batch GROWS, so a worker wedged at 2 Hz
+			// is a prime OOM candidate, and OOM is exactly what puts it here.
+			//
+			// The window is wide, and uzi's own configuration is the calibration:
+			// defaultClaimGrace budgets FIVE MINUTES for claimed→started, while the sweeper
+			// gives this 15 seconds. The whole of the new attempt's checkout sits inside it
+			// — ensureClone branches on isBareRepo, so a fresh container from a NEW image
+			// has an empty cache and takes the cold cloneBare path, and that clone runs
+			// between the worker's reportState({status:"running"}) and its first flush
+			// (runner.ts; batcher.emit only buffers and then waits for a tick). The claim
+			// is about that ORDERING, not a stopwatched duration.
+			s.persistFail.evict(r.ID)
+		}
 	}
 
 	// Chat idle backstop (PRD #39 Decision 3): a chat run whose last message is
@@ -166,6 +195,19 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 	// No persistFail.evict here, unlike the stale-worker requeue above. autoStopWedgedRuns
 	// already evicts on `run.Status != "running"`, which a parked run satisfied for the
 	// whole park, so the streak is long gone by the time this fires.
+	//
+	// Duration-time auto-failover re-evaluation (PRD #1247 M3, D8): BEFORE the promote
+	// pass, re-ask every still-parked `auto` run whether a pooled alternative became
+	// spendable after its park, and LOWER retry_not_before to now() for those that did —
+	// Decision 6e extended from park-time to park-duration. Placed immediately before
+	// PromoteLimitWaitRuns so the lowered stamp is presented to THIS tick's promote pass,
+	// which resumes it the same tick once the pass's clock has reached the stamp (the
+	// live-DB tests pin that) and otherwise the very next tick. It only lowers stamps; the
+	// resume mutation set stays PromoteLimitWaitRuns' alone.
+	if res.LimitReevaluated, err = s.reEvaluateParkedLimitWaitRuns(ctx, now); err != nil {
+		return res, fmt.Errorf("re-evaluate parked limit-wait runs: %w", err)
+	}
+
 	promoted, err := s.q.PromoteLimitWaitRuns(ctx, pgconv.Time(now))
 	if err != nil {
 		return res, fmt.Errorf("promote limit-wait runs: %w", err)
@@ -254,6 +296,12 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 	// detector so a flag is never raised off an entry this tick was going to expire.
 	s.persistFail.prune(now)
 
+	// Bound the in-process outbox-depth tracker (PRD #1391 M5), the same memory bound
+	// persistFail.prune above is: a worker that vanished (or went offline and stopped
+	// heartbeating) without a graceful delete has its stale depth age out here, which
+	// is also how the "queued on the worker" health reason clears for an offline worker.
+	s.outbox.prune(now)
+
 	// Run-health detector (PRD #47): flag/clear slow, stalled, looping, stuck-queued,
 	// and approval-idle runs from telemetry already in Postgres. Best-effort and
 	// non-terminal — it never kills a run and never fails the sweep (it logs and
@@ -311,26 +359,23 @@ func (s *Service) resumePoolWaitRuns(ctx context.Context) (int64, error) {
 			slog.Error("sweeper: pool-resume candidate read failed", "user", r.UserID, "error", err)
 			continue
 		}
-		// The pool is "non-empty / resumable" iff at least one candidate is AutoEligible.
-		// This is Select's PoolNonEmpty (membership counted with NO exclude), whereas the
-		// re-claim decides with autoselect.Floor(cands, claimExclude(run)) — Floor.ok, counted
-		// AFTER the run's dead-credential exclude. They can only diverge when a run's SOLE
-		// AutoEligible token is its own still-excluded dead credential, i.e. claimExclude
-		// returns non-Nil. But claimExclude excludes only while retry_not_before is in the
-		// FUTURE, and a pool_wait run can never carry a future stamp: SetRunPoolWait does not
-		// set retry_not_before, and the claim it came from was itself claimable, so the run's
-		// stamp was already NULL (never parked) or in the past (promoted out of limit_wait at
-		// retry_not_before <= now). So claimExclude relaxes to Nil at every real resume, making
-		// PoolNonEmpty here exactly Floor.ok at re-claim — this trigger never resumes a run that
-		// would immediately re-hold.
-		poolNonEmpty := false
+		cands := make([]autoselect.Candidate, 0, len(rows))
 		for _, row := range rows {
-			if autoselectrow.FromCandidateRow(row).AutoEligible {
-				poolNonEmpty = true
-				break
-			}
+			cands = append(cands, autoselectrow.FromCandidateRow(row))
 		}
-		if !poolNonEmpty {
+		// Resume iff there is a pooled token spendable NOW — autoselect.Floor(cands,
+		// claimExclude(run)).ok — the SAME question the re-claim asks, counting AFTER the
+		// run's dead-credential exclude (PRD #1247 M3, the pool-promoter fix). This
+		// REPLACES the old exclude-blind PoolNonEmpty loop, which relied on the invariant
+		// "a pool_wait run can never carry a future retry_not_before". Early promotion (the
+		// set-token verb and D8) breaks that invariant: an `auto` run switched early whose
+		// only pooled token is its own dead credential is held with a FUTURE stamp, so
+		// claimExclude keeps excluding that sole token and Floor.ok is false — the run must
+		// NOT resume (it would only re-hold, churning every tick while SetRunPoolWait never
+		// counts against RUN_LIMIT_MAX_WAITS). Behaviour is identical in the no-future-stamp
+		// case (claimExclude relaxes to Nil, so Floor.ok == the old PoolNonEmpty there); it
+		// differs only for a future-stamp pool_wait run, which it correctly holds.
+		if _, ok := autoselect.Floor(cands, s.claimExcludeFor(r.LimitDeadSecretID, r.RetryNotBefore), s.now()); !ok {
 			continue
 		}
 		promoted, err := s.q.PromotePoolWaitRun(ctx, store.PromotePoolWaitRunParams{ID: r.ID, UserID: r.UserID})
@@ -351,6 +396,129 @@ func (s *Service) resumePoolWaitRuns(ctx context.Context) (int64, error) {
 		s.publishSwept(r.ID, "queued")
 	}
 	return resumed, nil
+}
+
+// reEvaluateParkedLimitWaitRuns is the duration-time auto-failover pass (PRD #1247 M3,
+// D8): the second limit-wait promoter beside PromoteLimitWaitRuns. For each run STILL
+// parked in limit_wait whose next claim resolves through the `auto` selector, it re-asks
+// autoselect.NextAvailable over the owner's CURRENT pool and, when a pooled alternative
+// is now spendable at or before now, LOWERS retry_not_before to now() so the following
+// PromoteLimitWaitRuns pass resumes it (the same tick once that pass's clock has reached
+// the lowered stamp, else the next). This is Decision 6e extended from park-time to
+// park-duration, reusing the same NextAvailable policy and the same promoter. Returns the
+// number lowered.
+//
+// It does NOT transition status and does NOT fan out publishSwept — the lowered run is
+// promoted (and broadcast) by PromoteLimitWaitRuns, which runs immediately after this in
+// Sweep. Duplicating either would double-count the resume.
+//
+// 🔴 AT MOST ONE RUN PER OWNER PER TICK, OLDEST PARK FIRST. This pass bypasses the
+// park-time jitter that is the ONLY thing staggering a promoted wave (ADR-35 D4), so
+// lowering several of one owner's runs in a single tick would thundering-herd their pool
+// the instant PromoteLimitWaitRuns fires — every resumed run re-claims, all but one find
+// the alternative already spent and re-park. So `seen` records an owner the moment one of
+// its runs is LOWERED, and every later run of that owner is skipped THIS tick; the next
+// tick (~15s later) takes the next one once the first has actually claimed. seen is set
+// on the LOWERING, not on mere consideration, so a pinned/default/unknown run (skipped
+// below) never consumes an `auto` sibling's slot. ListLimitWaitReeval returns oldest park
+// first, matching resumePoolWaitRuns' stagger.
+//
+// Per-owner reads are deduped: ListAutoSelectCandidates and the judge-binding read fire at
+// most once per distinct owner per tick. A per-owner read fault is logged and skipped
+// (best-effort, like resumePoolWaitRuns); a ListLimitWaitReeval error fails the pass.
+func (s *Service) reEvaluateParkedLimitWaitRuns(ctx context.Context, now time.Time) (int64, error) {
+	rows, err := s.q.ListLimitWaitReeval(ctx, pgconv.Time(now))
+	if err != nil {
+		return 0, fmt.Errorf("list limit-wait reeval runs: %w", err)
+	}
+	seen := make(map[uuid.UUID]bool, len(rows))
+	candsByOwner := make(map[uuid.UUID][]autoselect.Candidate, len(rows))
+	judgeByOwner := make(map[uuid.UUID]string, len(rows))
+	var lowered int64
+	for _, r := range rows {
+		if seen[r.UserID] {
+			continue
+		}
+		// The minimal Run/Worker the two pure policies read — nothing else is projected.
+		run := store.Run{
+			Kind:                       r.Kind,
+			UserID:                     r.UserID,
+			WorkerID:                   r.WorkerID,
+			CredentialOverrideMode:     r.CredentialOverrideMode,
+			CredentialOverrideSecretID: r.CredentialOverrideSecretID,
+			LimitDeadSecretID:          r.LimitDeadSecretID,
+			RetryNotBefore:             r.RetryNotBefore,
+		}
+		var wkr store.Worker
+		if r.WorkerBindMode.Valid {
+			// The LEFT JOIN matched, so the recorded worker exists and this is its bind
+			// mode. A NULL worker_bind_mode (absent/deleted worker) leaves wkr zero-valued,
+			// which effectiveNextClaimMode maps to `unknown` — skipped below, the safe way.
+			wkr = store.Worker{ID: uuid.UUID(r.WorkerID.Bytes), AnthropicBindMode: r.WorkerBindMode.String}
+		}
+		// self_improve follows the owner's judge binding; every other kind ignores it. The
+		// read is deduped per owner. A read fault skips this run (best-effort) without
+		// consuming the owner's slot.
+		ownerJudgeMode := ""
+		if run.Kind == runkind.SelfImprove {
+			m, cached := judgeByOwner[r.UserID]
+			if !cached {
+				var jerr error
+				if m, jerr = s.ownerJudgeBindMode(ctx, r.UserID); jerr != nil {
+					slog.Error("sweeper: limit-wait reeval judge-binding read failed", "user", r.UserID, "error", jerr)
+					continue
+				}
+				judgeByOwner[r.UserID] = m
+			}
+			ownerJudgeMode = m
+		}
+		// Skip unless the NEXT claim is `auto`: a pinned/default/unknown resume would ignore
+		// a pooled alternative and re-park, so lowering it early only burns the wait budget.
+		// A per-run skip, NOT a per-owner one — it must not mark the owner seen.
+		if effectiveNextClaimMode(run, ownerJudgeMode, wkr) != BindModeAuto {
+			continue
+		}
+		// The dead credential to exclude from its own replacement (window still closed while
+		// parked). NextAvailable refuses a uuid.Nil exclude, so a relaxed one skips.
+		dead := s.claimExcludeFor(r.LimitDeadSecretID, r.RetryNotBefore)
+		if dead == uuid.Nil {
+			continue
+		}
+		cands, cached := candsByOwner[r.UserID]
+		if !cached {
+			candRows, cerr := s.q.ListAutoSelectCandidates(ctx, r.UserID)
+			if cerr != nil {
+				slog.Error("sweeper: limit-wait reeval candidate read failed", "user", r.UserID, "error", cerr)
+				continue
+			}
+			cands = make([]autoselect.Candidate, 0, len(candRows))
+			for _, cr := range candRows {
+				cands = append(cands, autoselectrow.FromCandidateRow(cr))
+			}
+			candsByOwner[r.UserID] = cands
+		}
+		// The same floor Decision 6e computes at park time — a lower bound on when this user
+		// can spend something OTHER than the dead credential. Lower only when it is spendable
+		// NOW (floor <= now); a future floor means nothing pooled is spendable yet.
+		if floor, ok := autoselect.NextAvailable(cands, dead, s.p.Autoselect, now); !ok || floor.After(now) {
+			continue
+		}
+		lrows, lerr := s.q.LowerLimitWaitRetryNow(ctx, store.LowerLimitWaitRetryNowParams{ID: r.ID, UserID: r.UserID})
+		if lerr != nil {
+			// Best-effort: a single lowering fault does not sink the sweep, mirroring the
+			// pool-resume promote.
+			slog.Error("sweeper: limit-wait reeval lower failed", "run", r.ID, "user", r.UserID, "error", lerr)
+			continue
+		}
+		if lrows == 0 {
+			// The run moved out of limit_wait between the list and the lower (a concurrent
+			// claim/cancel). Nothing lowered; do not consume the owner's one-per-tick slot.
+			continue
+		}
+		seen[r.UserID] = true
+		lowered++
+	}
+	return lowered, nil
 }
 
 // ReconcileCustodyReleases is the boot/periodic custody-release backstop (PRD #1296 M4,

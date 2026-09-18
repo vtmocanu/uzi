@@ -138,14 +138,14 @@ func (h *Handler) EnableCatalogSchedule(w http.ResponseWriter, r *http.Request) 
 				httpx.Error(w, http.StatusInternalServerError, "internal error")
 				return
 			}
-			httpx.JSON(w, http.StatusOK, h.scheduleDTO(existing, repo.PathWithNamespace))
+			httpx.JSON(w, http.StatusOK, h.scheduleDTOWithLabel(r.Context(), existing, repo.PathWithNamespace))
 			return
 		}
 		slog.Error("enable default schedule", "slug", slug, "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	httpx.JSON(w, http.StatusCreated, h.scheduleDTO(s, repo.PathWithNamespace))
+	httpx.JSON(w, http.StatusCreated, h.scheduleDTOWithLabel(r.Context(), s, repo.PathWithNamespace))
 }
 
 // ResetSchedule restores a default-origin schedule's editable fields to the builtin
@@ -199,7 +199,7 @@ func (h *Handler) ResetSchedule(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	httpx.JSON(w, http.StatusOK, h.scheduleDTO(s, h.repoPathFor(r.Context(), s)))
+	httpx.JSON(w, http.StatusOK, h.scheduleDTOWithLabel(r.Context(), s, h.repoPathFor(r.Context(), s)))
 }
 
 // patchDefaultScheduleConfig applies a config PATCH to a default-origin schedule (PRD #589
@@ -341,6 +341,22 @@ func (h *Handler) patchDefaultScheduleConfig(w http.ResponseWriter, r *http.Requ
 		return store.RunSchedule{}, false
 	}
 
+	// PRD #1247 M6: presence-aware credential override on a DEFAULT-origin config PATCH, the
+	// SAME validate/persist as the user path — OMITTED seeds-and-keeps the row's columns (an
+	// unrelated retime/model edit must not clear the override), PRESENT validates against the
+	// row's lane + effective harness and writes the resolved columns. It is an owner-editable
+	// run option (not catalog-owned), so it is absent from the catalog-owned reject block above.
+	credMode := cur.CredentialOverrideMode
+	credSecret := cur.CredentialOverrideSecretID
+	credCols, credOK := h.resolveScheduleCredentialOverride(w, r.Context(), user.ID, cur, cur.Target, req)
+	if !credOK {
+		return store.RunSchedule{}, false
+	}
+	if !credCols.keep {
+		credMode = credCols.mode
+		credSecret = credCols.secretID
+	}
+
 	// Guidance replace-semantics (issue #662, #675), scoped to a prompt or sweep default. The
 	// persisted column holds the owner OVERLAY (a prompt catalog job carries no guidance; a
 	// sweep default's baked guidance stays catalog-owned and is never stored here), so any
@@ -384,29 +400,36 @@ func (h *Handler) patchDefaultScheduleConfig(w http.ResponseWriter, r *http.Requ
 	// defaultEditableDiverges' inputs); its catalog baseline is always false, so any
 	// toggled-on value diverges (issue #691). Mirrors the guidance precedent above.
 	customized = customized || ov
+	// credential_override (PRD #1247 M6) is a run option, not a catalog field: its catalog
+	// baseline is inherit (NULL), so any stored override mode (pinned/auto/default) diverges =
+	// customized. A cleared/inherit override (mode NULL) does not, so an exact-restore
+	// un-customizes. Mirrors the override_subagent_model / guidance precedents above.
+	customized = customized || credMode.Valid
 
 	final, err := h.q.UpdateRunSchedule(r.Context(), store.UpdateRunScheduleParams{
-		Target:                cur.Target,
-		RepoID:                cur.RepoID,
-		IssueIid:              pgtype.Int8{},
-		Labels:                nil,
-		Prompt:                pgtype.Text{},
-		Timing:                "recurring",
-		CronExpr:              pgtype.Text{String: cron, Valid: true},
-		RunAt:                 pgtype.Timestamptz{},
-		Timezone:              tz,
-		NextFireAt:            pgtype.Timestamptz{Time: next, Valid: true},
-		AutoApprove:           autoApprove,
-		WaitOnLimit:           waitOnLimit,
-		MrReworkEnabled:       mrRework,
-		MaxIssues:             maxIssues,
-		Guidance:              guidance,
-		Model:                 model,
-		OutputMode:            outputMode,
-		OverrideSubagentModel: ov,
-		Customized:            customized,
-		ID:                    id,
-		UserID:                user.ID,
+		Target:                     cur.Target,
+		RepoID:                     cur.RepoID,
+		IssueIid:                   pgtype.Int8{},
+		Labels:                     nil,
+		Prompt:                     pgtype.Text{},
+		Timing:                     "recurring",
+		CronExpr:                   pgtype.Text{String: cron, Valid: true},
+		RunAt:                      pgtype.Timestamptz{},
+		Timezone:                   tz,
+		NextFireAt:                 pgtype.Timestamptz{Time: next, Valid: true},
+		AutoApprove:                autoApprove,
+		WaitOnLimit:                waitOnLimit,
+		MrReworkEnabled:            mrRework,
+		MaxIssues:                  maxIssues,
+		Guidance:                   guidance,
+		Model:                      model,
+		OutputMode:                 outputMode,
+		OverrideSubagentModel:      ov,
+		CredentialOverrideMode:     credMode,
+		CredentialOverrideSecretID: credSecret,
+		Customized:                 customized,
+		ID:                         id,
+		UserID:                     user.ID,
 	})
 	if err != nil {
 		slog.Error("update default run schedule", "error", err)

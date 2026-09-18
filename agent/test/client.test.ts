@@ -506,6 +506,63 @@ describe("reportState budget acknowledgement (PRD #1189 M1)", () => {
   });
 });
 
+// PRD #1247 M5 (INERT wire seam, M5b): the held-state credential-switch signal and the
+// stale-claim disposition ride the /state ack body TOP-LEVEL, beside `run`, on both the 200
+// ack and the ordinary not-applied 409. reportState folds them onto the StateAck via
+// readRunAck. This is the transport-level proof; nothing acts on the fields yet (a LATER
+// behavior unit does). Control flow is UNCHANGED — a stale-claim 409 is still `{applied:false}`.
+describe("reportState held-state credential-switch seam (PRD #1247 M5)", () => {
+  it("surfaces a top-level credential_switch on a 200 ack", async () => {
+    api.sendRawState("run-1", 200, JSON.stringify({ run: { status: "running" }, credential_switch: { generation: 7 } }));
+    const client = newClient();
+    const ack = await client.reportState("run-1", { status: "running" });
+    assert.deepStrictEqual(ack.credentialSwitch, { generation: 7 });
+    assert.strictEqual(ack.staleClaim, undefined);
+    assert.strictEqual(ack.status, "running");
+    assert.strictEqual(ack.applied, true);
+  });
+
+  it("surfaces a top-level credential_switch on an ordinary not-applied 409 ack", async () => {
+    api.sendRawState("run-1", 409, JSON.stringify({ run: { status: "running" }, credential_switch: { generation: 9 } }));
+    const client = newClient();
+    const ack = await client.reportState("run-1", { status: "running" });
+    assert.deepStrictEqual(ack.credentialSwitch, { generation: 9 });
+    assert.strictEqual(ack.applied, false, "a 409 stays not-applied — control flow is unchanged");
+    assert.strictEqual(ack.staleClaim, undefined);
+  });
+
+  it("sets staleClaim on a 409 carrying disposition:stale_claim", async () => {
+    api.sendRawState("run-1", 409, JSON.stringify({ run: { status: "cancelled" }, disposition: "stale_claim" }));
+    const client = newClient();
+    const ack = await client.reportState("run-1", { status: "running" });
+    assert.strictEqual(ack.staleClaim, true);
+    assert.strictEqual(ack.applied, false, "a stale-claim 409 is STILL returned as {applied:false,...}");
+    assert.strictEqual(ack.status, "cancelled");
+    assert.strictEqual(ack.credentialSwitch, undefined);
+  });
+
+  it("leaves both fields absent when the ack carries neither (back-compat)", async () => {
+    api.sendRawState("run-1", 200, JSON.stringify({ run: { status: "running" } }));
+    const client = newClient();
+    const ack = await client.reportState("run-1", { status: "running" });
+    assert.strictEqual(ack.credentialSwitch, undefined);
+    assert.strictEqual(ack.staleClaim, undefined);
+  });
+});
+
+// PRD #1247 M5 (INERT seam): getInputs now returns { inputs, credentialSwitch? }. The shared
+// FakeApi inputs route carries no credential_switch, so this pins the back-compat shape (the
+// signal-present case is covered against a purpose-built server in credential-switch.test.ts).
+describe("getInputs return shape (PRD #1247 M5)", () => {
+  it("returns the inputs array with credentialSwitch undefined when the poll omits it", async () => {
+    api.setInputs("run-inputs", [{ id: 1, kind: "follow_up", body: "hi" }]);
+    const client = newClient();
+    const res = await client.getInputs("run-inputs");
+    assert.deepStrictEqual(res.inputs, [{ id: 1, kind: "follow_up", body: "hi" }]);
+    assert.strictEqual(res.credentialSwitch, undefined);
+  });
+});
+
 describe("MessageBatcher seq numbering", () => {
   it("continues gapless numbering from last_seq across flushes", async () => {
     const client = newClient();

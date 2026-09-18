@@ -321,4 +321,32 @@ describe("MessageBatcher — the poison-pill wedge (PRD #108 M1b/M3)", () => {
     // The loss is permanent and silent to the user: nothing routes it anywhere a
     // consumer can see. M3 owns keeping this to ONE message via bisection.
   });
+
+  it("BLOCKING-4: a 409 stale_claim disposition is FATAL — the batcher stops without bisecting/tombstoning", async () => {
+    // A held-state switch RELEASED this claim (or a reclaim SUPERSEDED it): every message in the
+    // batch fences out server-side, and so would every tombstone marker. The batcher must treat
+    // that 409 like a fatal reject and STOP on the first post — not read it as an ordinary
+    // "permanent" 400 and spend its bisect budget tombstoning messages that can never land.
+    const { logger } = recordingLogger();
+    let posts = 0;
+    const client = {
+      async postMessages(runId: string): Promise<void> {
+        posts++;
+        throw new RequestError("POST", `/api/worker/runs/${runId}/messages`, 409, '{"disposition":"stale_claim"}');
+      },
+    } as unknown as WorkerClient;
+    const batcher = new MessageBatcher(client, "run-stale", 0, 5, logger);
+    let permanentReason: string | undefined;
+    batcher.onPermanentFailureReport(({ reason }) => {
+      permanentReason = reason;
+    });
+
+    batcher.emit({ kind: "text", agent: "lead", payload: { text: "one" } });
+    await batcher.close();
+
+    // FATAL stops on the FIRST post. A "permanent" 409 (the pre-fix classification) would post the
+    // message, tombstone it, then RE-POST the marker → ≥2 posts; fatal is exactly one.
+    assert.strictEqual(posts, 1, `stale_claim must be fatal (1 post, no tombstone re-post), saw ${posts}`);
+    assert.ok(permanentReason, "a fatal stale_claim trips the permanent-failure report so the flight stops");
+  });
 });

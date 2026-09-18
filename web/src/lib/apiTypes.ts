@@ -1398,6 +1398,11 @@ export interface Schedule {
   // fired (or a parked/transient fire left the prior summary — or none — in place, since
   // only the success/benign advance path persists).
   last_fire: LastFire | null;
+  /** PRD #1247 M1 (D5): the schedule's per-run credential override. null = inherit (the
+   *  fired run follows the worker binding), else the {mode, label} a fired run stamps onto
+   *  itself. Twin of Run.credential_override; null for every schedule until M6 wires it.
+   *  OPTIONAL for the same api/web rollout skew as Run.credential_override. */
+  credential_override?: CredentialOverride | null;
   auto_approve: boolean;
   wait_on_limit: boolean;
   /** PRD #841: per-schedule MR-review-rework override, tri-state. null = inherit (the
@@ -1571,6 +1576,12 @@ export interface ScheduleInput {
   // list omits it), mirroring RepoID's create-vs-PATCH asymmetry. `interface Schedule`
   // carries the read-side `sibling_group_id` (M3) separately; this is the write-side input.
   sibling_group_id?: string;
+  // PRD #1247 M6/M7: the schedule's per-run Anthropic credential override (D5). The
+  // write shape is {mode, secret_id?}, distinct from the read-side `Schedule.credential_override`
+  // ({mode,label}). Request-presence semantics: OMIT the field to leave the stored override
+  // unchanged (seed-and-keep on PATCH); send {mode:"inherit"} to clear it; a pinned mode
+  // carries secret_id. The server 409s any explicit override on a self_improve lane.
+  credential_override?: { mode: string; secret_id?: string } | null;
 }
 
 // SchedulePreviewInput asks for a live "next fires" preview from a timing spec
@@ -1585,6 +1596,16 @@ export interface SchedulePreviewInput {
 }
 
 // ── Agent runtime (PRD #4) ────────────────────────────────────────────────
+
+/** One entry of a worker's reported active-run snapshot (PRD #1390 M2c): a run the worker
+ *  says it is executing, with the phase it sees it in and the exact generation it was
+ *  claimed at. phase is a closed server enum (running | awaiting_approval | awaiting_input |
+ *  awaiting_followup). Nested in Worker.reported_runs. */
+export interface WorkerReportedRun {
+  run_id: string;
+  phase: string;
+  claim_generation: number;
+}
 
 export interface Worker {
   id: string;
@@ -1621,6 +1642,17 @@ export interface Worker {
   // "N/M runs" saturation badge (workerRunBadge in lib/workerRuns.ts).
   active_runs: number;
   max_concurrent_runs: number | null;
+  // reported_runs (PRD #1390 M2c): what this worker SAYS it is executing, from its latest
+  // active-run snapshot — one entry per run, each with the phase the worker sees it in and the
+  // generation it was claimed at. The api ALWAYS sends the key: the list/patch handlers overlay
+  // it from the DB and the DTO builders seed it to [], so a worker the snapshot table has no row
+  // for arrives as []. Distinct from active_runs (a bare count off run rows) — this is the
+  // worker's own report, so the two can differ (e.g. during an api outage it rode out). Optional
+  // in TS (`?`), exactly like the outbox_* overlay fields below and retaining_unpublished_work
+  // above: it is a handler-overlaid field a mock or older payload may omit, so `?` lets those
+  // literals compile while the wire contract stays a never-null array (pinned by the api-contract
+  // parity check against the recorded fixtures).
+  reported_runs?: WorkerReportedRun[];
   // retaining_unpublished_work (PRD #1296 M4): true when the worker holds an OPEN
   // durable-recovery custody hold (unpublished committed work not yet archived), so
   // teardown is deferred. Distinct from busy/active_runs — it consumes no run slot.
@@ -1727,6 +1759,29 @@ export interface Worker {
    *  default. The API applies that rule before answering, so "pinned" here always
    *  has an id beside it and no client needs to re-derive it. */
   anthropic_bind_mode: BindMode;
+  // Outbox depth this worker last reported on its heartbeat (PRD #1391 M5), summed
+  // across the runs it holds. All null until the worker reports a non-empty outbox
+  // (and re-nulled on the next empty report, when the backlog has drained) — the api
+  // overlays them from an in-process, restart-losing tracker, never from the DB, the
+  // same "null until reported, last-known otherwise" contract as the stats_ fields.
+  //
+  // outbox_pending_messages is the count of message frames buffered on the worker
+  // waiting to replay to the api (the visible symptom of an api outage the worker rode
+  // out). outbox_pending_terminal is the count of write-ahead terminal outcomes still
+  // to send (always 0 in Run A — terminal journaling is Run B). outbox_stale_retired
+  // counts frames a re-claim forced the worker to retire locally (D11). outbox_blocked
+  // is the oldest permanent-refusal reason across the worker's runs (never set in Run
+  // A; forward-compat for Run B), or null when nothing is blocked.
+  //
+  // Optional in TS (`?`), exactly like retaining_unpublished_work above and for the
+  // same reason: the api ALWAYS sends these keys (overlaid to null when the worker has
+  // no tracked depth), but they are overlay fields a mock or an older payload may omit,
+  // so `?` lets those literals compile while the wire contract stays `X | null`. The
+  // api-contract parity check pins the null/value shape against the recorded fixtures.
+  outbox_pending_messages?: number | null;
+  outbox_pending_terminal?: number | null;
+  outbox_stale_retired?: number | null;
+  outbox_blocked?: string | null;
 }
 
 /** The closed set of worker bind modes (PRD #111 M3), mirroring the server's CHECK. */
@@ -2401,6 +2456,51 @@ export interface Run {
    *  never <Markdown> or a URL sink. OPTIONAL here for the SAME api/web rollout skew as
    *  plan_source (a mid-deploy api pod predating the field omits the key). */
   current_activity?: RunActivity | null;
+  /** PRD #1247 M1: the per-run Anthropic credential override + attribution journal.
+   *  credential_override is null = inherit the worker binding (today's behaviour), else the
+   *  {mode, label} the owner chose. credential_switch is the pending held-state switch:
+   *  null | "requested" | "released". credential_epochs is the applied-switch history, one
+   *  entry per claim, oldest first — [] over null via the DTO builder (mapper-normalized, so
+   *  its null zero fixture is exempted in the contract test). All three read null/[] for a run
+   *  with no override and for a pre-feature run. OPTIONAL for the same api/web rollout
+   *  skew as current_activity/plan_changed_files: a mid-deploy api pod predating #1247
+   *  omits the keys. credential_epochs is normalized to [] by runToDTO (mapper never-null),
+   *  so its zero fixture null is exempted in the contract test like plan_changed_files. */
+  credential_override?: CredentialOverride | null;
+  credential_switch?: string | null;
+  credential_epochs?: CredentialEpoch[];
+  /** PRD #1391 M3 (D13): a finished outcome the run's OWNING worker is holding because the
+   *  api permanently refused the terminal report — so the owner can see it and resolve it
+   *  with a discarding cancel. null (today's contract) for every run with no held outcome.
+   *  reason is one of a CLOSED, server-filtered set (completion_permit_mismatch |
+   *  gap_unrecoverable | reserve_exhausted); the api drops any other value, so the web maps
+   *  the known set to friendly text and renders an unrecognised value honestly. OPTIONAL for
+   *  the same api/web rollout skew as credential_override: a mid-deploy api pod predating
+   *  #1391 M3 omits the key. Overlaid on the single-run detail read only (never the list). */
+  outcome_pending?: { reason: string } | null;
+}
+
+/** CredentialOverride is a run's or schedule's per-run credential choice (PRD #1247 M1):
+ *  mode is "pinned" | "auto" | "default", label is the pinned token's snapshotted name
+ *  (null for auto/default or a deleted token). Rendered null-when-absent on Run and
+ *  Schedule. */
+export interface CredentialOverride {
+  mode: string;
+  label: string | null;
+}
+
+/** CredentialEpoch is one claim's credential attribution (PRD #1247 M1, D7): the
+ *  generation, the token it spent (secret_id + label + select_reason, all null-tolerant for
+ *  a deleted token's history), and when it was applied. claim_generation is a plain JSON
+ *  number (int64 on the wire). secret_id is the STABLE switch key (a label can be renamed
+ *  and reused, so switch detection keys on the id, not the label); null when the token was
+ *  deleted. */
+export interface CredentialEpoch {
+  claim_generation: number;
+  secret_id: string | null;
+  label: string | null;
+  select_reason: string | null;
+  applied_at: string;
 }
 
 // RunActivity is the server-derived "now" line for a run (PRD #1064 D3): who is acting,
@@ -2583,7 +2683,9 @@ export type SelectReason =
   | "best_of_pool"
   | "pool_empty"
   | "pool_stale"
-  | "open_failed";
+  | "open_failed"
+  | "run_pinned"
+  | "run_default";
 
 export type AutoStatus =
   | "eligible"

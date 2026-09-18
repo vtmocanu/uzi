@@ -16,10 +16,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/url"
 	"regexp"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -198,6 +200,52 @@ var (
 	// handler's ordinary 409 {run} path (status recovery_wait, no reason) covers it.
 	ErrForgeParkStaleClaim       = errors.New("forge park: claim generation mismatch")
 	ErrForgeParkCustodyUnsettled = errors.New("forge park: custody could not be settled")
+	// ErrStaleClaim rejects a worker-driven MUTATING report whose claim_generation is stale
+	// (PRD #1247 M5, D3): a held-state credential switch RELEASED the claim (claim_released_at
+	// set) or a reclaim SUPERSEDED it (claim_generation advanced). The generation fence in
+	// SetState returns it atomically under a FOR UPDATE lock so no ClaimRun/release can
+	// interleave. The handler surfaces it as a `stale_claim` disposition on the state ack (a
+	// 409 carrying the run plus disposition:"stale_claim"), which the new worker reads to STOP
+	// the flight without further reports; an ordinary applied=false 409 keeps its meaning.
+	ErrStaleClaim = errors.New("run claim is stale (released or superseded)")
+	// ErrMissingClaimGeneration rejects a worker-driven MUTATING report from a CAPABILITY worker
+	// (one advertising capability.CredentialSwitchV1) that OMITS claim_generation (PRD #1247
+	// M5a-1 rework, auditor fail-open finding). The fence engages only when a report stamps a
+	// generation, so without this a capability worker could bypass it entirely by dropping the
+	// field. Making "legacy" a per-WORKER-capability property (not a per-request field-presence
+	// choice) closes that hole: a capability worker MUST stamp the generation, while a legacy
+	// worker (no capability) is still honoured unfenced when it omits it. The handler maps this to
+	// the SAME stale/refuse ack as ErrStaleClaim (a 409 with disposition:"stale_claim").
+	ErrMissingClaimGeneration = errors.New("capability worker omitted claim_generation on a mutating report")
+	// ErrMessagesPending rejects a TERMINAL transition whose messages_through_seq is not yet
+	// backed by a CONTIGUOUS [1..through] in run_messages (PRD #1391 Run B M3c, D3): the
+	// high-water last_seq has not reached `through`, or a hole exists below it (count < through).
+	// The fence returns it BEFORE the mutating SetRunCompleted/SetRunFailed/completeRunWithPermit
+	// call, so nothing is written; the worker fills the missing seqs and re-reports. The handler
+	// maps it to a typed 409 with a {run, reason:"messages_pending"} body — the SAME {run, reason}
+	// shape as the forge-park refusals, NOT the disposition shape. It is a RECOVERABLE refusal:
+	// the gap is small enough to fill (≤ WorkerGapFillMax), unlike ErrGapUnrecoverable.
+	ErrMessagesPending = errors.New("terminal transition refused: run messages are not yet contiguous through the reported seq")
+	// ErrGapUnrecoverable rejects a TERMINAL transition whose messages_through_seq leaves MORE than
+	// WorkerGapFillMax seqs missing from the stored [1..through] (PRD #1391 Run B M3c): the hole is
+	// too large to ever fill, so — unlike ErrMessagesPending — the worker must NOT keep re-parking
+	// on it. Checked in the SAME fence, BEFORE the mutation, and mapped by the handler to a typed
+	// 409 with a {reason:"gap_unrecoverable"} body (NOT a 400, and distinct from messages_pending).
+	ErrGapUnrecoverable = errors.New("terminal transition refused: too many messages are missing to recover")
+	// ErrOutcomePendingConfirmationRequired rejects a cancel of a run whose executor journaled a
+	// terminal (esp. blocked) outcome on its worker (PRD #1391 Run B M3d, D13) UNLESS the owner
+	// explicitly discards it. Such a run has no live poller for itself — its executor is gone —
+	// but an unconditional cancel would silently discard a completed/failed outcome held on the
+	// worker, so the server refuses without `discard_pending_outcome: true`. The handler maps it
+	// to a typed 409 with a {error, reason:"outcome_pending_confirmation_required"} body the
+	// web/CLI detect; with the discard bit set the cancel proceeds to the atomic no-live-poller
+	// branch (CancelRunServerSideWithPendingOutcome). Nothing is ever discarded on a timer.
+	ErrOutcomePendingConfirmationRequired = errors.New("cancel refused: this run has a pending outcome held on its worker; retry with discard_pending_outcome to discard it")
+	// ErrOutcomePendingCancelRaced rejects a confirmed discard whose guarded cancel matched
+	// zero rows while the run is still active. The pending lease expired, rotated or cleared
+	// after confirmation; reporting success would leave the run active while telling the owner
+	// it was cancelled. The handler maps this retryable state conflict to a typed 409.
+	ErrOutcomePendingCancelRaced = errors.New("pending outcome changed while cancelling; retry")
 	// ErrRunNotAwaitingInput rejects an `answer` for a run that is not parked on a
 	// clarification question (PRD #88 M1) → 409. Its sibling ErrStaleAnswer covers the
 	// run that IS parked but on a DIFFERENT question — the two are separated because
@@ -450,6 +498,12 @@ type Store interface {
 	ListActiveRunsAll(ctx context.Context, backgroundGraceCutoff pgtype.Timestamptz) ([]store.ListActiveRunsAllRow, error)
 	ListAllWorkers(ctx context.Context) ([]store.ListAllWorkersRow, error)
 	GetRunOwnedByWorker(ctx context.Context, arg store.GetRunOwnedByWorkerParams) (store.Run, error)
+	// CountRunMessagesThrough counts the stored message seqs in [1..through] for a run, the
+	// terminal fence's contiguity probe (PRD #1391 Run B M3c, D3).
+	CountRunMessagesThrough(ctx context.Context, arg store.CountRunMessagesThroughParams) (int32, error)
+	// RunMessageGaps returns the missing seq ranges in [1..through] as bounded {first,last} pairs,
+	// keyset-paginated by seq after a cursor (PRD #1391 Run B M3c).
+	RunMessageGaps(ctx context.Context, arg store.RunMessageGapsParams) ([]store.RunMessageGapsRow, error)
 	GetRunOrphanIdentity(ctx context.Context, arg store.GetRunOrphanIdentityParams) (store.GetRunOrphanIdentityRow, error)
 	// GetRunForgeConnForWorker returns the forge connection facts for a run the
 	// worker holds (PRD #158 M1): forge_project_id + the connection. Worker-scoped
@@ -571,6 +625,10 @@ type Store interface {
 	// /runs + board plan-revise flag (issue #750): the plan-ish message rows for a page of
 	// runs, folded into the is_revising set in Go by planRevisingSet — never in SQL.
 	ListPlanRevisionStateForRuns(ctx context.Context, runIds []uuid.UUID) ([]store.ListPlanRevisionStateForRunsRow, error)
+	// PRD #1247 M5 (D13): the seq of the run's latest submitted-plan frame, fetched only on the
+	// awaiting_approval resume so the worker correlates a buffered approve_plan to the right plan
+	// revision. Off the hot path for every other claim.
+	LatestPlanSeqForRun(ctx context.Context, runID uuid.UUID) (int64, error)
 	// /runs + board + run-view current_activity (PRD #1064 M2): the newest tool_use frame
 	// per run for a page, folded into the "now" line in Go by runactivity.FromFrame.
 	LatestToolUseForRuns(ctx context.Context, runIds []uuid.UUID) ([]store.LatestToolUseForRunsRow, error)
@@ -653,6 +711,20 @@ type Store interface {
 	// second park.
 	SetRunLimitWait(ctx context.Context, arg store.SetRunLimitWaitParams) (int64, error)
 	PromoteLimitWaitRuns(ctx context.Context, now pgtype.Timestamptz) ([]store.PromoteLimitWaitRunsRow, error)
+	// PromoteLimitWaitRunNow is the SINGLE-ROW early promote for `uzi run set-token` (PRD
+	// #1247 M4, D4): limit_wait -> queued for ONE owner+run WITHOUT the retry_not_before
+	// guard. Its mutation set is EXACTLY PromoteLimitWaitRuns' (a column-parity test pins
+	// them together) and it preserves the limit fields + retry_not_before so claimExclude
+	// keeps excluding the still-dead token. A 0-row result is a raced no-op (409).
+	PromoteLimitWaitRunNow(ctx context.Context, arg store.PromoteLimitWaitRunNowParams) (int64, error)
+	// The duration-time auto-failover re-evaluation pass (PRD #1247 M3, D8):
+	// ListLimitWaitReeval is the still-parked worklist (retry_not_before still in the
+	// future, a dead credential recorded) that reEvaluateParkedLimitWaitRuns walks, and
+	// LowerLimitWaitRetryNow lowers ONE due run's retry_not_before to now() so the same
+	// tick's PromoteLimitWaitRuns performs the actual resume. Placed BEFORE the promote
+	// call in Sweep so a lowered stamp is eligible for that tick's promotion pass.
+	ListLimitWaitReeval(ctx context.Context, now pgtype.Timestamptz) ([]store.ListLimitWaitReevalRow, error)
+	LowerLimitWaitRetryNow(ctx context.Context, arg store.LowerLimitWaitRetryNowParams) (int64, error)
 	// SetRunRecoveryWait parks a run in the transient-recovery hold (issue #1197);
 	// PromoteRecoveryWaitRuns is the sweeper pass that auto-promotes it once its capped
 	// backoff elapses. Like the limit-wait park its source guard is POSITIVE
@@ -660,6 +732,11 @@ type Store interface {
 	// it has NO per-run cap, so promotion always fires and the run recovers repeatedly.
 	SetRunRecoveryWait(ctx context.Context, arg store.SetRunRecoveryWaitParams) (int64, error)
 	PromoteRecoveryWaitRuns(ctx context.Context, now pgtype.Timestamptz) ([]store.PromoteRecoveryWaitRunsRow, error)
+	// PromoteRecoveryWaitRunNow is the SINGLE-ROW early promote for `uzi run set-token`
+	// (PRD #1247 M4, D4): recovery_wait -> queued for ONE owner+run WITHOUT the
+	// recovery_retry_not_before guard, mirroring PromoteRecoveryWaitRuns' mutation set. A
+	// 0-row result is a raced no-op (409).
+	PromoteRecoveryWaitRunNow(ctx context.Context, arg store.PromoteRecoveryWaitRunNowParams) (int64, error)
 	// PRD #1190 M1 pause/resume. SetRunPaused parks a running run on the owner's request
 	// (positive source guard, like SetRunLimitWait); ResumePausedRun promotes it back
 	// (paused → queued) with gate-park accounting; ClearPauseRequest clears a pending
@@ -674,6 +751,27 @@ type Store interface {
 	// rows (guard fail) is the non-paused ack the worker's park order must retain the run on.
 	SetRunCompletionHold(ctx context.Context, arg store.SetRunCompletionHoldParams) (store.Run, error)
 	ResumePausedRun(ctx context.Context, arg store.ResumePausedRunParams) (store.ResumePausedRunRow, error)
+	// ReleaseCredentialSwitch is the held-state credential-switch RELEASE transition (PRD
+	// #1247 M5, D3/D4/D14): a worker's {status:"credential_switch", claim_generation} report
+	// requeues the held run in ONE fenced statement — generation- and release-gated, banking
+	// the held gap like ResumePausedRun and keeping the switch stamp. releaseCredentialSwitch
+	// distinguishes a stale redelivery (0 rows) from an idempotent already-released/already-
+	// reclaimed one by a re-read.
+	ReleaseCredentialSwitch(ctx context.Context, arg store.ReleaseCredentialSwitchParams) (int64, error)
+	// StampHeldCredentialSwitch atomically writes the override columns AND the switch stamp
+	// (credential_switch_requested_at + _generation) for `uzi run set-token` on a run a worker
+	// holds (PRD #1247 M5, D4, BLOCKING-1 rework). One fenced UPDATE, owner-scoped and fenced on
+	// the exact live claim (worker_id + claim_generation + claim_released_at IS NULL + held
+	// status); it does NOT change status. Requires exactly one affected row — a 0-row result is a
+	// raced release/reclaim the caller maps to ErrCredentialSwitchRaced, with nothing written.
+	StampHeldCredentialSwitch(ctx context.Context, arg store.StampHeldCredentialSwitchParams) (int64, error)
+	// ClearCredentialSwitchByWorker clears a pending switch stamp WITHOUT changing status for the
+	// worker's `credential_switch_failed` report — the bounded capture-failure give-up (PRD #1247
+	// M5, D3/D14): the run keeps running on its current token. Fenced to the CURRENT claim
+	// (worker_id + exact generation + unreleased + a stamp actually pending), so a
+	// stale/superseded/foreign or already-cleared report affects 0 rows. failCredentialSwitch reads
+	// a 0-row result as a benign no-op (applied=false).
+	ClearCredentialSwitchByWorker(ctx context.Context, arg store.ClearCredentialSwitchByWorkerParams) (int64, error)
 	// ClearCompletionBudgetExhausted clears the served budget_exhausted steer
 	// (completion_budget_exhausted_at) on the owner's CONTINUE decision (PRD #1226 M5, D3): a
 	// new owner decision is the third of D3's clears (alongside the worker acting on it /
@@ -697,6 +795,16 @@ type Store interface {
 	// uq_runs_one_active_mr_rework partial unique index (migration 00167).
 	GetActiveMRReworkRunForMR(ctx context.Context, arg store.GetActiveMRReworkRunForMRParams) (store.Run, error)
 	CancelRunServerSide(ctx context.Context, arg store.CancelRunServerSideParams) (int64, error)
+	// RunHasPendingOutcomeLease reports whether a run's executor journaled a terminal outcome
+	// still leased on its owning worker (PRD #1391 Run B M3d, D13) — the POSITIVE form of the D11
+	// claim-exclusion predicate. Reused by hasLivePoller (such a run has no live poller for
+	// itself) and by the owner cancel's confirmation gate.
+	RunHasPendingOutcomeLease(ctx context.Context, id uuid.UUID) (bool, error)
+	// CancelRunServerSideWithPendingOutcome is the atomic owner-scoped cancel of a pending-outcome
+	// run (PRD #1391 Run B M3d, D13): one row-locking UPDATE whose WHERE re-checks the
+	// pending-outcome predicate, so a replayed SetState and this cancel resolve on the run's row
+	// lock rather than a stale Go-side read. Returns rows affected.
+	CancelRunServerSideWithPendingOutcome(ctx context.Context, arg store.CancelRunServerSideWithPendingOutcomeParams) (int64, error)
 	// CancelRunByWorker is the LIVE-worker cancel transition (PRD #503 M1). SetState's
 	// failed arm routes here (instead of SetRunFailed) when the loaded run carries
 	// stop_kind='cancelled', so an operator cancel ends 'cancelled'/NULL fail_origin —
@@ -745,7 +853,9 @@ type Store interface {
 	FailRunsOfStaleWorkersOverCap(ctx context.Context, arg store.FailRunsOfStaleWorkersOverCapParams) ([]store.FailRunsOfStaleWorkersOverCapRow, error)
 	RequeueRunsOfStaleWorkers(ctx context.Context, arg store.RequeueRunsOfStaleWorkersParams) ([]store.RequeueRunsOfStaleWorkersRow, error)
 	FailWorkerRunsOverCap(ctx context.Context, arg store.FailWorkerRunsOverCapParams) ([]uuid.UUID, error)
-	RequeueWorkerRuns(ctx context.Context, arg store.RequeueWorkerRunsParams) (int64, error)
+	// RequeueWorkerRuns returns the re-queued run ids (PRD #1390 M2a) so Register can publish
+	// each transition post-commit, mirroring the sweeper's RequeueRunsOfStaleWorkers twin.
+	RequeueWorkerRuns(ctx context.Context, arg store.RequeueWorkerRunsParams) ([]uuid.UUID, error)
 
 	// Run-health detector (PRD #47): the per-tick active-run scan, the per-running-run
 	// tool window (loop + in-flight), the single health writer, and the queued-run
@@ -797,7 +907,10 @@ type Store interface {
 	RunPriorityClassForRun(ctx context.Context, arg store.RunPriorityClassForRunParams) (string, error)
 
 	// Messages + inputs.
-	InsertRunMessage(ctx context.Context, arg store.InsertRunMessageParams) (int64, error)
+	// InsertRunMessage returns whether the row was inserted (vs a benign duplicate) AND whether
+	// the generation fence held (generation_live) — so a fenced-out stale-generation batch is
+	// distinguishable from a duplicate (BLOCKING-4 rework).
+	InsertRunMessage(ctx context.Context, arg store.InsertRunMessageParams) (store.InsertRunMessageRow, error)
 	ListRunMessagesAfter(ctx context.Context, arg store.ListRunMessagesAfterParams) ([]store.RunMessage, error)
 	ListRunMessagesAfterPage(ctx context.Context, arg store.ListRunMessagesAfterPageParams) ([]store.RunMessage, error)
 	ListRunMessagesBeforePage(ctx context.Context, arg store.ListRunMessagesBeforePageParams) ([]store.RunMessage, error)
@@ -909,7 +1022,23 @@ type Store interface {
 	// unscoped cross-tenant read, so there is deliberately no such query.
 	GetDefaultUserSecretMeta(ctx context.Context, arg store.GetDefaultUserSecretMetaParams) (store.GetDefaultUserSecretMetaRow, error)
 	GetUserSecretMetaByID(ctx context.Context, arg store.GetUserSecretMetaByIDParams) (store.GetUserSecretMetaByIDRow, error)
+	// GetUserSecretMetaByIDOfKind is the kind-SCOPED by-id meta lookup (PRD #1247 M1):
+	// the per-run credential override resolves a specific credential and must confirm it
+	// is an anthropic_token before opening it, without weakening the worker/judge lanes'
+	// non-kind-scoped GetUserSecretMetaByID (D9).
+	GetUserSecretMetaByIDOfKind(ctx context.Context, arg store.GetUserSecretMetaByIDOfKindParams) (store.GetUserSecretMetaByIDOfKindRow, error)
 	SetRunAnthropicSecret(ctx context.Context, arg store.SetRunAnthropicSecretParams) (int64, error)
+	// RecordRunCredentialEpoch appends the per-claim attribution-journal row (PRD #1247
+	// M1, D7/D14), keyed by the run's existing claim_generation; ListRunCredentialEpochs
+	// reads a run's applied-switch history (owner-scoped) for the GetRun DTO via the
+	// RunCredentialEpochs service method.
+	RecordRunCredentialEpoch(ctx context.Context, arg store.RecordRunCredentialEpochParams) error
+	ListRunCredentialEpochs(ctx context.Context, arg store.ListRunCredentialEpochsParams) ([]store.RunCredentialEpoch, error)
+	// SetRunCredentialOverride writes the per-run override columns for `uzi run set-token`
+	// (PRD #1247 M4, D4): the FIRST write in every writable-state branch of the verb,
+	// before the state-specific transition. Both params are nullable (inherit clears
+	// both). Owner-scoped; idempotent.
+	SetRunCredentialOverride(ctx context.Context, arg store.SetRunCredentialOverrideParams) (int64, error)
 	// Auto-selection (PRD #111 M4): every anthropic_token the user holds, with its
 	// gauge reading and in-flight run count. NOT pre-filtered on auto_eligible — the
 	// eligibility gate lives entirely in autoselect.Classify (D21), and the ranker
@@ -1010,6 +1139,12 @@ type Params struct {
 	CompletionHoldWindowSeconds int
 	RunMaxRequeues              int
 	WorkerHeartbeatStale        time.Duration
+	// WorkerHeartbeatInterval (WORKER_HEARTBEAT_INTERVAL) is the worker's heartbeat cadence.
+	// PRD #1390 M2b (D4): the missing-run fence is WorkerHeartbeatStale + WorkerHeartbeatInterval
+	// (the stale window plus one heartbeat interval), so a `running` run absent from a snapshot is
+	// requeued only once it has been silent past the whole window with margin. Mirrored from config;
+	// the zero value narrows the fence to just the stale window (degraded, never wrong).
+	WorkerHeartbeatInterval time.Duration
 	// DiskPressureThreshold (PRD #837 M4, UZI_DISK_PRESSURE_THRESHOLD) is the used/total
 	// fraction in (0,1] at/above which a self-reported disk volume counts as "over
 	// threshold" for one heartbeat. Heartbeat feeds it to diskOverThreshold, which drives
@@ -1034,6 +1169,36 @@ type Params struct {
 	// ClaimGrace is the claimed-but-never-started reclaim window. It is not a
 	// PRD env var (the PRD fixes it at 5m in prose); defaulted in New.
 	ClaimGrace time.Duration
+	// SweeperBootGrace (PRD #1390 M1, D1, SWEEPER_BOOT_GRACE) is the boot-grace window
+	// that suppresses the three stale-worker passes (MarkStaleWorkersOffline,
+	// FailRunsOfStaleWorkersOverCap, RequeueRunsOfStaleWorkers) until it has elapsed
+	// since the LISTENER became ready (Service.SetReadyAt), so an api that was unreachable
+	// does not declare every worker dead the instant it returns. Every other sweep pass runs
+	// as today. 0 (the zero value) means "immediate" — today's behaviour — so a Params literal
+	// that omits it is a safe no-op. Mirrored from config; the default lives in config.go.
+	SweeperBootGrace time.Duration
+	// TerminalPendingLease (PRD #1390 M2a, D11, TERMINAL_PENDING_LEASE) is the lifetime of a
+	// terminal-pending lease and of the pending_overflow closure, mirrored from config.
+	// ReplaceWorkerActiveRuns stamps `terminal_pending_until = now() + TerminalPendingLease` on
+	// every terminal_pending entry (and `pending_overflow_until` likewise). The zero value is a
+	// safe no-op (a lease of 0 is already expired, so nothing is protected — degraded, never
+	// wrong); the positive default lives in config.go.
+	TerminalPendingLease time.Duration
+	// ActiveSnapshotMaxEntries (PRD #1390 M2a, ACTIVE_SNAPSHOT_MAX_ENTRIES) is the absolute
+	// server ceiling on a snapshot's entry count, mirrored from config. A snapshot above it is
+	// rejected as invalid. The zero value would reject every non-empty snapshot; the positive
+	// default lives in config.go.
+	ActiveSnapshotMaxEntries int
+	// WorkerOutboxMaxPending (PRD #1390 M2a / #1391, WORKER_OUTBOX_MAX_PENDING) caps the
+	// terminal_pending=true entries in one snapshot, mirrored from config. A worker beyond it
+	// sets pending_overflow. The default lives in config.go.
+	WorkerOutboxMaxPending int
+	// WorkerGapFillMax (PRD #1391 Run B M3c, WORKER_GAP_FILL_MAX) is the terminal fence's
+	// gap-recovery ceiling, mirrored from config: a terminal report whose messages_through_seq
+	// leaves more than this many seqs missing from stored run_messages is refused
+	// ErrGapUnrecoverable rather than the recoverable ErrMessagesPending. The zero value means
+	// "any hole is unrecoverable"; the positive default lives in config.go.
+	WorkerGapFillMax int
 	// SkillMaxBytes / SkillsMaxPerRun are the skill caps (PRD #16), mirrored from
 	// config. SkillsMaxPerRun bounds the per-run union at claim assembly; both ride
 	// the claim so the worker enforces the same limits (no server/worker drift).
@@ -1342,6 +1507,13 @@ type Service struct {
 	// /messages and read by the sweeper, so it carries its own mutex — see
 	// persistfail.go.
 	persistFail *persistFailTracker
+	// outbox tracks each worker's last reported outbox depth (PRD #1391 M5), the
+	// signal the health detector turns into a truthful "queued on the worker" reason
+	// (instead of the misleading `stalled`) and the list/register/heartbeat DTOs
+	// overlay onto WorkerDTO. Always non-nil (New constructs it). Like persistFail it
+	// is IN-PROCESS, mutex-guarded, capped and TTL-pruned, and restart-losing by
+	// design — see outbox_tracker.go.
+	outbox *outboxTracker
 	// forgeBaseURLAllowed is the SSRF gate for the M8 checkpoint-publish path (PRD
 	// #122): it reports whether a run's forge base URL is on the configured
 	// allowlist before the api will fetch/push against it. Set via
@@ -1387,6 +1559,15 @@ type Service struct {
 	// non-atomically, so a deployment that never wired it can never complete an interlocked
 	// run without the permit transaction. A LEGACY completion never touches it.
 	txBeginner TxBeginner
+	// readyAt is the moment the worker-facing listener(s) became ready (PRD #1390 M1, D1),
+	// stored as Unix nanoseconds (0 = not yet ready). main.go writes it via SetReadyAt after
+	// binding every enabled listener; the sweeper goroutine reads it each tick to anchor the
+	// boot grace. An atomic.Int64 rather than a time.Time so the cross-goroutine read/write is
+	// data-race-free under -race.
+	readyAt atomic.Int64
+	// bootGraceFirstRunLogged flips true the first time a post-grace sweep runs the gated
+	// stale-worker passes, so that transition is logged exactly once (PRD #1390 M1).
+	bootGraceFirstRunLogged atomic.Bool
 }
 
 // SetSettings wires the instance settings reader (PRD #46). Call once at startup,
@@ -1484,6 +1665,42 @@ func (s *Service) SetDeleteCheckpointFn(fn func(ctx context.Context, o pushbroke
 // runner so the async checkpoint delete is observed deterministically.
 func (s *Service) SetBackground(fn func(func())) { s.background = fn }
 
+// SetReadyAt records the moment the worker-facing listener(s) became ready (PRD #1390 M1,
+// D1). main.go calls it exactly once, AFTER every enabled listener has bound, so the boot
+// grace is anchored on when workers could actually reconnect — not on process start, which
+// ages while the api is still unreachable. Race-safe: stores Unix nanoseconds atomically for
+// the sweeper goroutine to read. A zero t clears it back to "not ready".
+func (s *Service) SetReadyAt(t time.Time) {
+	if t.IsZero() {
+		s.readyAt.Store(0)
+		return
+	}
+	s.readyAt.Store(t.UnixNano())
+}
+
+// readyAtTime reads the listener-ready timestamp set by SetReadyAt, returning the zero
+// time.Time when the listener is not yet ready (the sweeper treats that as grace-active).
+func (s *Service) readyAtTime() time.Time {
+	ns := s.readyAt.Load()
+	if ns == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ns)
+}
+
+// bootGraceActive decides whether the three stale-worker passes are suppressed this tick
+// (PRD #1390 M1, D1). A pure function of the config knob, the listener-ready timestamp and
+// the current time, so it is table-testable without a DB:
+//   - bootGrace <= 0 ⇒ never active (SWEEPER_BOOT_GRACE=0 reproduces today's behaviour).
+//   - readyAt zero (the listener has not bound yet) ⇒ active (a worker cannot have reconnected).
+//   - now before readyAt+bootGrace ⇒ active; at or after ⇒ the grace has elapsed.
+func bootGraceActive(bootGrace time.Duration, readyAt, now time.Time) bool {
+	if bootGrace <= 0 {
+		return false
+	}
+	return readyAt.IsZero() || now.Before(readyAt.Add(bootGrace))
+}
+
 // notify fires the lifecycle hook if one is wired. It is a no-op otherwise, so
 // every call site stays unconditional.
 func (s *Service) notify(runID uuid.UUID, status string) {
@@ -1501,7 +1718,7 @@ func New(q Store, box *secretbox.Box, p Params) *Service {
 		p.ClaimGrace = defaultClaimGrace
 	}
 	return &Service{
-		q: q, box: box, p: p, now: time.Now, persistFail: newPersistFailTracker(),
+		q: q, box: box, p: p, now: time.Now, persistFail: newPersistFailTracker(), outbox: newOutboxTracker(),
 		publishFn:          pushbroker.Publish,
 		deleteCheckpointFn: pushbroker.Delete,
 		background:         func(fn func()) { go fn() },
@@ -1528,29 +1745,21 @@ func New(q Store, box *secretbox.Box, p Params) *Service {
 // awaiting_input forever, pointing at execution that no longer exists, with its
 // worker-held answer deadline gone and no user-visible signal — on the ordinary
 // restart path this comment already names.
-func (s *Service) Register(ctx context.Context, wkr store.Worker, version, template string, maxConcurrentRuns *int, capabilities []string, protocolCapabilities []string) (store.Worker, error) {
-	max := int32(s.p.RunMaxRequeues) //nolint:gosec // G115: RunMaxRequeues is a small bounded config int (env RUN_MAX_REQUEUES), never near int32 range
-	orphanFailed, err := s.q.FailWorkerRunsOverCap(ctx, store.FailWorkerRunsOverCapParams{
-		FailureReason: pgconv.TextOrNull("worker restarted; run orphaned and out of re-queue budget"),
-		WorkerID:      pgconv.UUID(wkr.ID),
-		MaxRequeues:   max,
-	})
+//
+// PRD #1390 M2a runs the whole of Register in ONE transaction (canonical worker-row lock
+// order): mint + persist a fresh register nonce and reset the snapshot epoch, persist any
+// register-carried snapshot (ownership-validated, preserving leased rows) BEFORE the orphan
+// pass so the D11 lease predicate reads a settled snapshot, then run the orphan fail/requeue
+// pass, commit, and only THEN publish each transition and judge the failures. It returns the
+// nonce so the handler can echo it in the register response. When no transaction beginner is
+// wired (unit tests with a fake store), it degrades to the tx-less path: no worker-row lock and
+// no snapshot persist — a fake store never carries a snapshot.
+func (s *Service) Register(ctx context.Context, wkr store.Worker, version, template string, maxConcurrentRuns *int, capabilities []string, protocolCapabilities []string, snapshot *ActiveSnapshot) (store.Worker, string, error) {
+	nonce, err := mintSnapshotNonce()
 	if err != nil {
-		return store.Worker{}, err
+		return store.Worker{}, "", err
 	}
-	// PRD #46 Decision 2: these orphaned-over-cap runs just committed to 'failed'
-	// (worker lost) — the same worker-lost runs the sweeper's identical
-	// FailRunsOfStaleWorkersOverCap funnels into the judge. Funnel them here too.
-	// Best-effort, gated inside; never fails the register.
-	for _, id := range orphanFailed {
-		s.maybeEnqueueJudgeByID(ctx, id)
-	}
-	if _, err := s.q.RequeueWorkerRuns(ctx, store.RequeueWorkerRunsParams{
-		WorkerID:    pgconv.UUID(wkr.ID),
-		MaxRequeues: max,
-	}); err != nil {
-		return store.Worker{}, err
-	}
+	max := int32(s.p.RunMaxRequeues) //nolint:gosec // G115: RunMaxRequeues is a small bounded config int (env RUN_MAX_REQUEUES), never near int32 range
 	// template is the worker's self-reported image template (PRD #18); empty →
 	// NULL (older image sends none). Soft signal only; never rejected here.
 	// maxConcurrentRuns is the worker's advertised concurrency cap (PRD #42); nil →
@@ -1574,20 +1783,105 @@ func (s *Service) Register(ctx context.Context, wkr store.Worker, version, templ
 	// fresh-start signal), so a downgraded image that stops reporting the protocol loses
 	// it here — which correctly makes it unable to claim an interlocked run.
 	protocolCaps := capability.FilterProtocol(protocolCapabilities)
-	row, err := s.q.RegisterWorker(ctx, store.RegisterWorkerParams{
-		Version:              pgconv.TextOrNull(version),
-		TemplateReported:     pgconv.TextOrNull(template),
-		Capabilities:         storedCaps,
-		ProtocolCapabilities: protocolCaps,
-		MaxConcurrentRuns:    pgconv.Int4Ptr(maxConcurrentRuns),
-		ID:                   wkr.ID,
-	})
-	if err != nil {
-		return store.Worker{}, err
+	regParams := store.RegisterWorkerParams{
+		Version:               pgconv.TextOrNull(version),
+		TemplateReported:      pgconv.TextOrNull(template),
+		Capabilities:          storedCaps,
+		ProtocolCapabilities:  protocolCaps,
+		MaxConcurrentRuns:     pgconv.Int4Ptr(maxConcurrentRuns),
+		SnapshotRegisterNonce: pgconv.TextOrNull(nonce),
+		ID:                    wkr.ID,
 	}
-	// Field-identical structs; the conversion keeps Register's signature — and so
-	// every handler and DTO builder above it — unchanged.
-	return store.Worker(row), nil
+	failParams := store.FailWorkerRunsOverCapParams{
+		FailureReason: pgconv.TextOrNull("worker restarted; run orphaned and out of re-queue budget"),
+		WorkerID:      pgconv.UUID(wkr.ID),
+		MaxRequeues:   max,
+	}
+	requeueParams := store.RequeueWorkerRunsParams{
+		WorkerID:    pgconv.UUID(wkr.ID),
+		MaxRequeues: max,
+	}
+
+	// Tx-less degraded path: no pool wired (fake-store unit tests). No worker-row lock and no
+	// snapshot persist; still rotates the nonce and resets the epoch via RegisterWorker.
+	if s.txBeginner == nil {
+		row, err := s.q.RegisterWorker(ctx, regParams)
+		if err != nil {
+			return store.Worker{}, "", err
+		}
+		orphanFailed, err := s.q.FailWorkerRunsOverCap(ctx, failParams)
+		if err != nil {
+			return store.Worker{}, "", err
+		}
+		requeued, err := s.q.RequeueWorkerRuns(ctx, requeueParams)
+		if err != nil {
+			return store.Worker{}, "", err
+		}
+		s.publishRegisterSweeps(ctx, orphanFailed, requeued)
+		return store.Worker(row), nonce, nil
+	}
+
+	tx, err := s.txBeginner.Begin(ctx)
+	if err != nil {
+		return store.Worker{}, "", err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+	qtx := store.New(tx)
+	// (a) Lock the worker row FOR UPDATE — the canonical order that serialises Register against
+	// a concurrent heartbeat and the stale-worker passes (both of which lock the worker row).
+	if _, err := qtx.GetWorkerForUpdate(ctx, wkr.ID); err != nil {
+		return store.Worker{}, "", err
+	}
+	// (b) Rotate the nonce + reset the epoch (folded into RegisterWorker's update).
+	row, err := qtx.RegisterWorker(ctx, regParams)
+	if err != nil {
+		return store.Worker{}, "", err
+	}
+	// (c) Persist a register-carried snapshot BEFORE the orphan pass, so its leased rows protect
+	// #1391's pending outcomes from the D11-predicated fail/requeue that follows. #1390's worker
+	// never sends one; the path exists for #1391. An invalid register snapshot is ignored, never
+	// fatal (register must not wedge on soft input).
+	if snapshot != nil {
+		if _, err := s.ReplaceWorkerActiveRuns(ctx, qtx, store.Worker(row), snapshot, snapshotModeRegister); err != nil {
+			return store.Worker{}, "", err
+		}
+	}
+	// (d) Orphan pass — fail-over-cap then requeue, both D11-lease/overflow-predicated (M1).
+	orphanFailed, err := qtx.FailWorkerRunsOverCap(ctx, failParams)
+	if err != nil {
+		return store.Worker{}, "", err
+	}
+	requeued, err := qtx.RequeueWorkerRuns(ctx, requeueParams)
+	if err != nil {
+		return store.Worker{}, "", err
+	}
+	// (e) Commit, then publish + judge post-commit (never inside the tx).
+	if err := tx.Commit(ctx); err != nil {
+		return store.Worker{}, "", err
+	}
+	committed = true
+	s.publishRegisterSweeps(ctx, orphanFailed, requeued)
+	return store.Worker(row), nonce, nil
+}
+
+// publishRegisterSweeps fans a register-time orphan pass out post-commit (PRD #1390 M2a):
+// publishSwept for both the failed and the requeued transitions (closing the gap where a
+// register-time requeue/fail reached no live channel — before, only the judge saw the fails)
+// and maybeEnqueueJudgeByID for the committed-terminal fails (PRD #46 Decision 2, the same
+// worker-lost runs the sweeper funnels). Both are best-effort and never fail the register.
+func (s *Service) publishRegisterSweeps(ctx context.Context, failed, requeued []uuid.UUID) {
+	for _, id := range failed {
+		s.publishSwept(id, "failed")
+		s.maybeEnqueueJudgeByID(ctx, id)
+	}
+	for _, id := range requeued {
+		s.publishSwept(id, "queued")
+	}
 }
 
 // WorkerStats is a validated, clamped container resource sample (PRD #49). The
@@ -1616,9 +1910,29 @@ type WorkerStats struct {
 }
 
 // Heartbeat refreshes liveness, overwrites the worker's latest resource sample (PRD
-// #49), and returns the updated worker. A nil stats writes NULLs for every stats_
-// column, so a worker that stops reporting self-clears its gauge.
-func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *WorkerStats) (store.Worker, error) {
+// #49), records the worker's per-run outbox depth (PRD #1391 M5), stores the worker's
+// active-run snapshot when one is carried (PRD #1390 M2a), and returns the updated worker.
+// A nil stats writes NULLs for every stats_ column, so a worker that stops reporting
+// self-clears its gauge; an empty/nil outbox CLEARS the worker's tracked depth (the "clears
+// on the next empty report" contract).
+//
+// When a snapshot is carried it runs inside ONE transaction in the canonical order (PRD #1390
+// M2b): HeartbeatWorker (locks the worker row), then LockOwnedRunsByIDs (pre-locks the runs the
+// snapshot lists so a sibling's concurrent FOR UPDATE SKIP LOCKED claim skips them), then
+// ReplaceWorkerActiveRuns in heartbeat mode. ONLY when the snapshot was applied does it then
+// reconcile: ReadoptRunsFromSnapshot (restore a queued run the worker still lists), then
+// FailRunsMissingFromSnapshot then RequeueRunsMissingFromSnapshot (fail before requeue) for a
+// running run this worker owns but no longer lists, past the missing fence. Each reconciled
+// transition is published post-commit (never inside the tx), mirroring publishRegisterSweeps.
+// An invalid/stale/wrong-nonce snapshot is IGNORED (applied=false) — a warning, no error, rows
+// and leases left as they were, and the reconciliation is skipped — so an invalid snapshot never
+// turns a heartbeat into a 400 and liveness is still refreshed. When no snapshot is carried (or
+// no tx beginner is wired), it takes the plain single-statement path, exactly as before.
+func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *WorkerStats, outbox []OutboxEntry, snapshot *ActiveSnapshot) (store.Worker, error) {
+	// Record the outbox depth BEFORE the liveness write: it is in-memory and cannot
+	// fail, and doing it unconditionally means an empty report clears the set even on
+	// a tick that carries no stats.
+	s.outbox.record(wkr.ID, outbox, s.now())
 	arg := store.HeartbeatWorkerParams{ID: wkr.ID}
 	if stats != nil {
 		arg.StatsCpuPct = pgconv.Float4Ptr(stats.CPUPct)
@@ -1635,7 +1949,113 @@ func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *Worker
 		// (the tick carried no evidence of pressure).
 		arg.DiskOverThreshold = diskOverThreshold(stats, s.p.DiskPressureThreshold)
 	}
-	return s.q.HeartbeatWorker(ctx, arg)
+	// No snapshot (an old worker, or the field absent), or no pool wired (tests): the plain
+	// single-statement liveness write, unchanged.
+	if snapshot == nil || s.txBeginner == nil {
+		return s.q.HeartbeatWorker(ctx, arg)
+	}
+	tx, err := s.txBeginner.Begin(ctx)
+	if err != nil {
+		return store.Worker{}, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+	qtx := store.New(tx)
+	updated, err := qtx.HeartbeatWorker(ctx, arg)
+	if err != nil {
+		return store.Worker{}, err
+	}
+	// (b) Pre-lock the runs the snapshot lists, in canonical id order, BEFORE the replace and the
+	// reconciliation writes — so a sibling's concurrent claim (FOR UPDATE SKIP LOCKED) skips them
+	// until this tx commits. Unparseable ids are skipped (they cannot name a real run); an id for a
+	// run this worker does not own is a no-op (the WHERE excludes it), never locked.
+	if ids := snapshotRunIDs(snapshot); len(ids) > 0 {
+		if _, err := qtx.LockOwnedRunsByIDs(ctx, store.LockOwnedRunsByIDsParams{
+			RunIds:   ids,
+			WorkerID: pgconv.UUID(updated.ID),
+		}); err != nil {
+			return store.Worker{}, err
+		}
+	}
+	// (c) heartbeat mode: an invalid snapshot returns (false, nil) — ignored, not fatal — so the
+	// heartbeat's liveness refresh still commits. Only a real DB error aborts the tx. CAPTURE
+	// applied: the reconciliation runs ONLY when the snapshot was actually applied (an invalid,
+	// stale-epoch or wrong-nonce snapshot must not drive readopt/requeue off rows it did not write).
+	applied, err := s.ReplaceWorkerActiveRuns(ctx, qtx, updated, snapshot, snapshotModeHeartbeat)
+	if err != nil {
+		return store.Worker{}, err
+	}
+	var (
+		readopted       []store.ReadoptRunsFromSnapshotRow
+		missingFailed   []store.FailRunsMissingFromSnapshotRow
+		missingRequeued []store.RequeueRunsMissingFromSnapshotRow
+	)
+	if applied {
+		// (d) Reconcile, fail before requeue (over-cap fail-first ordering). The missing fence is the
+		// stale window plus one heartbeat interval (D4). max_requeues is RUN_MAX_REQUEUES.
+		missingCutoff := pgconv.Time(s.now().Add(-(s.p.WorkerHeartbeatStale + s.p.WorkerHeartbeatInterval)))
+		maxRequeues := int32(s.p.RunMaxRequeues) //nolint:gosec // G115: RunMaxRequeues is a small bounded config int (env RUN_MAX_REQUEUES), never near int32 range
+		readopted, err = qtx.ReadoptRunsFromSnapshot(ctx, updated.ID)
+		if err != nil {
+			return store.Worker{}, err
+		}
+		missingFailed, err = qtx.FailRunsMissingFromSnapshot(ctx, store.FailRunsMissingFromSnapshotParams{
+			FailureReason: pgconv.TextOrNull("worker lost the execution; exceeded re-queue budget"),
+			WorkerID:      pgconv.UUID(updated.ID),
+			MissingCutoff: missingCutoff,
+			MaxRequeues:   maxRequeues,
+		})
+		if err != nil {
+			return store.Worker{}, err
+		}
+		missingRequeued, err = qtx.RequeueRunsMissingFromSnapshot(ctx, store.RequeueRunsMissingFromSnapshotParams{
+			WorkerID:      pgconv.UUID(updated.ID),
+			MissingCutoff: missingCutoff,
+			MaxRequeues:   maxRequeues,
+		})
+		if err != nil {
+			return store.Worker{}, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return store.Worker{}, err
+	}
+	committed = true
+	// (e) Publish + judge POST-COMMIT (never inside the tx), mirroring publishRegisterSweeps: a
+	// readopt and a missing-requeue publish their live status; a missing-fail publishes 'failed'
+	// AND funnels into the judge (PRD #46 Decision 2, the same worker-lost runs the sweeper funnels).
+	for _, r := range readopted {
+		s.publishSwept(r.ID, r.Status)
+	}
+	for _, r := range missingFailed {
+		s.publishSwept(r.ID, r.Status)
+		s.maybeEnqueueJudgeByID(ctx, r.ID)
+	}
+	for _, r := range missingRequeued {
+		s.publishSwept(r.ID, r.Status)
+	}
+	return updated, nil
+}
+
+// snapshotRunIDs parses the run ids an ActiveSnapshot lists into uuids for the canonical pre-lock
+// (PRD #1390 M2b). Unparseable ids are skipped (ReplaceWorkerActiveRuns rejects the whole snapshot
+// on a bad uuid anyway; the pre-lock only needs the parseable ones for its FOR UPDATE). Returns nil
+// for a nil/empty snapshot so the caller can skip the lock statement.
+func snapshotRunIDs(snap *ActiveSnapshot) []uuid.UUID {
+	if snap == nil || len(snap.Active) == 0 {
+		return nil
+	}
+	ids := make([]uuid.UUID, 0, len(snap.Active))
+	for _, e := range snap.Active {
+		if id, err := uuid.Parse(e.RunID); err == nil {
+			ids = append(ids, id)
+		}
+	}
+	return ids
 }
 
 // diskOverThreshold: any reported volume at/above threshold. >= pins the comparator
@@ -1648,6 +2068,62 @@ func diskOverThreshold(stats *WorkerStats, threshold float64) bool {
 		return float64(*used)/float64(*total) >= threshold
 	}
 	return over(stats.DiskNixBytes, stats.DiskNixTotalBytes) || over(stats.DiskDataBytes, stats.DiskDataTotalBytes)
+}
+
+// OutboxAggregate returns a worker's summed outbox depth (PRD #1391 M5) for the
+// WorkerDTO overlay: pending messages, pending terminals, stale-retired frames, and
+// the oldest blocked reason (nil when nothing is blocked). All zero and nil when the
+// worker has no tracked depth, so a worker with no outbox shows nulls.
+func (s *Service) OutboxAggregate(workerID uuid.UUID) (pendingMessages, pendingTerminal, staleRetired int, blocked *string) {
+	return s.outbox.workerAggregate(workerID)
+}
+
+// OutboxRunDepth returns the outbox entry reported for a run AND the id of the worker
+// that reported it, across whichever worker reported it last (PRD #1391 M5). The health
+// detector uses it to turn a non-zero pending depth into the truthful "queued on the
+// worker" reason instead of `stalled` — but ONLY when the reporting worker is the run's
+// current owner, so it passes the reporting worker id back for the caller to owner-gate.
+func (s *Service) OutboxRunDepth(runID uuid.UUID) (OutboxEntry, uuid.UUID, bool) {
+	return s.outbox.runDepth(runID)
+}
+
+// blockedOutcomeReasons is the CLOSED set of blocked-terminal reasons the api will
+// surface on a run (PRD #1391 M3, D13). The worker's heartbeat carries a free-text
+// blocked_reason, but the worker is untrusted (fact 8: a worker cannot forge health,
+// and the same posture applies to what it can put on the owner's run page), so only a
+// recognised member of this set is ever passed through — every other value is dropped.
+// The three members are the run-B permanent-refusal reasons: a completion-permit
+// mismatch, a message hole too large to fill (gap_unrecoverable), and an exhausted
+// terminal-journal reserve.
+var blockedOutcomeReasons = map[string]struct{}{
+	"completion_permit_mismatch": {},
+	"gap_unrecoverable":          {},
+	"reserve_exhausted":          {},
+}
+
+// RunBlockedOutcome reports the reason a run's OWNING worker is holding a finished
+// terminal outcome it could not land (PRD #1391 M3, D13), for the GetRun DTO overlay.
+// It reads the outbox tracker's per-run entry and returns its BlockedReason ONLY when
+// it is a recognised member of blockedOutcomeReasons — arbitrary worker text is
+// dropped (ok == false), so a hostile worker cannot inject a reason string onto the
+// owner's run page.
+//
+// It also returns the reporting worker id so the caller OWNER-GATES the overlay,
+// exactly as the health detector owner-gates OutboxRunDepth: runIndex is
+// "last reporter wins" with no ownership check (see outbox_tracker.go), so a
+// cross-tenant worker that knows a run's UUID could otherwise report a blocked reason
+// for it, and a reclaim-during-outage leaves runIndex pointing at the prior worker
+// until the TTL. The caller trusts the depth only when this id EQUALS the run's
+// current owning worker.
+func (s *Service) RunBlockedOutcome(runID uuid.UUID) (reason string, workerID uuid.UUID, ok bool) {
+	entry, reporter, found := s.outbox.runDepth(runID)
+	if !found {
+		return "", uuid.UUID{}, false
+	}
+	if _, recognised := blockedOutcomeReasons[entry.BlockedReason]; !recognised {
+		return "", uuid.UUID{}, false
+	}
+	return entry.BlockedReason, reporter, true
 }
 
 // Claim atomically claims the oldest claimable run for the worker's user and
@@ -1663,7 +2139,18 @@ func diskOverThreshold(stats *WorkerStats, threshold float64) bool {
 // it, so runs spread across a fleet instead of piling on whichever worker polls
 // first. The deferral is a no-op at the caller level — the run simply isn't
 // returned (nil payload / 204), so the worker just re-polls and a peer claims it.
-func (s *Service) Claim(ctx context.Context, wkr store.Worker) (*ClaimPayload, error) {
+//
+// snapshot is the worker's active-run snapshot riding the claim request (PRD #1390 M3, D3/D8),
+// nil for an old bodyless worker. When it is carried AND a tx beginner is wired, the claim runs in
+// ONE transaction in the canonical lock order — lock the worker row, pre-lock the request
+// snapshot's own runs, replace the snapshot, then (claimant guard) refuse the claim if the worker
+// is under an unexpired pending_overflow closure, else select and claim — so a run any fresh
+// snapshot lists (its own request's included) is never double-claimed and no sibling can steal a
+// pre-locked run until this tx commits. An invalid/stale/wrong-nonce claim snapshot fails the claim
+// CLOSED (ErrActiveSnapshotInvalid → the handler's 400). Without a snapshot (or without a tx
+// beginner: fake-store unit tests) it keeps the single auto-commit ClaimRun, which still applies
+// the persisted-snapshot exclusions and the overflow closure. Assembly always runs OUTSIDE the tx.
+func (s *Service) Claim(ctx context.Context, wkr store.Worker, snapshot *ActiveSnapshot) (*ClaimPayload, error) {
 	// Vault gate (PRD #32 M3): while the run owner's vault is locked (after a pod
 	// restart, or a manual lock), do not claim any of their runs — report idle so
 	// they stay queued as "waiting for vault unlock" instead of failing. This is a
@@ -1737,7 +2224,17 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker) (*ClaimPayload, e
 	// flag routes rather than silently degrading to a mid-run crash.
 	capabilityAware := s.capabilityAwareOn(ctx)
 
-	run, err := s.q.ClaimRun(ctx, store.ClaimRunParams{
+	// PRD #1390 M3: the request snapshot's index-aligned (run_id, generation) pairs, feeding
+	// ClaimRun's request-array exclusion so the claimant never re-claims a run its OWN request
+	// snapshot lists at the current generation, before the first heartbeat persists those rows
+	// (fact 7). Empty (nil-safe) when no snapshot rides the claim — an empty exclusion set.
+	reqIDs, reqGens := requestActivePairs(snapshot)
+
+	// ClaimRun params are built IDENTICALLY for both the no-snapshot auto-commit path and the
+	// transactional path (only the request arrays differ, and they are empty in the no-snapshot
+	// path). @snapshot_fresh_cutoff is the stale window plus one heartbeat interval (D3): a
+	// worker_active_runs row reported within it fences the run out of every claim.
+	params := store.ClaimRunParams{
 		WorkerID:            pgconv.UUID(wkr.ID),
 		UserID:              wkr.UserID,
 		AffinityCutoff:      pgconv.Time(s.now().Add(-s.p.WorkerAffinityCeiling)),
@@ -1774,19 +2271,134 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker) (*ClaimPayload, e
 		CustodyHoldLimit: custodyHoldLimit,
 		RecoveryCapable:  slices.Contains(wkr.ProtocolCapabilities, capability.RecoveryArchiveV1),
 		WorkerIdentity:   workerIdentity(wkr),
-	})
+		// PRD #1390 M3: the three snapshot-dedupe params. @snapshot_fresh_cutoff bounds the
+		// persisted-snapshot freshness test; the request arrays are the claimant's own listed runs
+		// (empty in the no-snapshot path). All three are always passed so an old worker still gets
+		// the persisted-snapshot exclusions + the overflow closure.
+		SnapshotFreshCutoff: pgconv.Time(s.now().Add(-(s.p.WorkerHeartbeatStale + s.p.WorkerHeartbeatInterval))),
+		RequestActiveIds:    reqIDs,
+		RequestActiveGens:   reqGens,
+	}
+
+	// No request snapshot (an old worker) or no tx beginner wired (fake-store unit tests): keep
+	// TODAY'S path — a single auto-commit ClaimRun, then assembleClaim. The predicate params above
+	// still apply, so an old worker gets the persisted-snapshot exclusions and the overflow closure;
+	// only the claimant guard (the flagged-worker-itself refusal) and the request pre-lock are
+	// snapshot-only, and an old worker is never flagged and lists nothing.
+	if snapshot == nil || s.txBeginner == nil {
+		run, err := s.q.ClaimRun(ctx, params)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil, nil // idle
+			}
+			return nil, err
+		}
+		payload, err := s.assembleClaim(ctx, wkr, run)
+		if err != nil {
+			return nil, s.recoverClaimAssembly(ctx, run, err)
+		}
+		return payload, nil
+	}
+
+	// Snapshot carried + tx beginner: ONE transaction in the canonical lock order (D8), so a
+	// sibling's concurrent FOR UPDATE SKIP LOCKED claim cannot see this claimant's pre-locked runs
+	// or replaced snapshot until it commits.
+	tx, err := s.txBeginner.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+	qtx := store.New(tx)
+	// (a) Lock the worker row FIRST — the canonical order shared with Register, Heartbeat and the
+	// stale-worker passes.
+	locked, err := qtx.GetWorkerForUpdate(ctx, wkr.ID)
+	if err != nil {
+		return nil, err
+	}
+	// (b) Pre-lock the request snapshot's own runs in deterministic id order (skip when empty), so a
+	// sibling's concurrent FOR UPDATE SKIP LOCKED claim skips them until this tx commits its
+	// replacement. An id for a run this worker does not own is a no-op (the WHERE excludes it).
+	if ids := snapshotRunIDs(snapshot); len(ids) > 0 {
+		if _, err := qtx.LockOwnedRunsByIDs(ctx, store.LockOwnedRunsByIDsParams{
+			RunIds:   ids,
+			WorkerID: pgconv.UUID(wkr.ID),
+		}); err != nil {
+			return nil, err
+		}
+	}
+	// (c) Replace the snapshot in CLAIM mode: an invalid/stale-epoch/wrong-nonce snapshot returns
+	// ErrActiveSnapshotInvalid — ROLLBACK (via the defer) and return it so the handler fails the
+	// claim CLOSED (400, no claim, no side effect). A real DB error propagates the same way.
+	if _, err := s.ReplaceWorkerActiveRuns(ctx, qtx, locked, snapshot, snapshotModeClaim); err != nil {
+		return nil, err
+	}
+	// (d) Claimant guard (snapshot-replace BEFORE overflow, blocker 2). The replace just set/cleared
+	// pending_overflow_until from the snapshot's pending_overflow flag; re-read the row to see the
+	// CURRENT value. If the worker is under an unexpired overflow closure it is refused every claim,
+	// unassigned runs included — but the replace is valid info that must persist, so COMMIT and
+	// report idle. An UNFLAGGED valid snapshot cleared the closure here, so the claim proceeds in
+	// this SAME tx below.
+	reread, err := qtx.GetWorkerByID(ctx, wkr.ID)
+	if err != nil {
+		return nil, err
+	}
+	if reread.PendingOverflowUntil.Valid && reread.PendingOverflowUntil.Time.After(s.now()) {
+		if err := tx.Commit(ctx); err != nil {
+			return nil, err
+		}
+		committed = true
+		return nil, nil // idle: the worker is overflowed, no claim
+	}
+	// (e) Claim inside the tx. On no candidate, COMMIT (the snapshot replace must persist) and report
+	// idle; on success, COMMIT and then assemble OUTSIDE the tx (assembly opens credentials + builds
+	// snapshots and must not hold the DB tx), exactly as the no-snapshot path does.
+	run, err := qtx.ClaimRun(ctx, params)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
+			if cerr := tx.Commit(ctx); cerr != nil {
+				return nil, cerr
+			}
+			committed = true
 			return nil, nil // idle
 		}
 		return nil, err
 	}
-
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	committed = true
 	payload, err := s.assembleClaim(ctx, wkr, run)
 	if err != nil {
 		return nil, s.recoverClaimAssembly(ctx, run, err)
 	}
 	return payload, nil
+}
+
+// requestActivePairs extracts the index-aligned (run_id, claim_generation) pairs a claim's request
+// snapshot lists (PRD #1390 M3), for ClaimRun's request-array exclusion. Only entries whose run_id
+// parses as a uuid are kept, and the two slices stay index-aligned (a dropped entry drops from
+// both). A nil/empty snapshot yields empty (non-nil) slices, which ClaimRun's WITH ORDINALITY zip
+// reads as an empty exclusion set.
+func requestActivePairs(snap *ActiveSnapshot) ([]uuid.UUID, []int64) {
+	ids := []uuid.UUID{}
+	gens := []int64{}
+	if snap == nil {
+		return ids, gens
+	}
+	for _, e := range snap.Active {
+		id, err := uuid.Parse(e.RunID)
+		if err != nil {
+			continue
+		}
+		ids = append(ids, id)
+		gens = append(gens, e.ClaimGeneration)
+	}
+	return ids, gens
 }
 
 // recoverClaimAssembly turns a failed claim assembly (run OR chat lane) into the
@@ -2051,6 +2663,13 @@ type IncomingMessage struct {
 	AgentInstance string          `json:"agent_instance,omitempty"`
 	AgentLabel    string          `json:"agent_label,omitempty"`
 	Payload       json.RawMessage `json:"payload"`
+	// ClaimGeneration is the runs.claim_generation the frame was produced under (PRD #1247 M9,
+	// D7) — the epoch the usage fold attributes this frame's leg to. It is SERVER-POPULATED, not a
+	// wire field (`json:"-"`): the batch generation rides its own top-level `claim_generation` on
+	// the request, and appendMessages stamps the per-call effectiveClaimGen onto every frame it
+	// folds; the refold reads each frame's PERSISTED run_messages.claim_generation. nil = legacy /
+	// unknown (a pre-feature frame, or a legacy worker's unfenced batch), folded as NULL provenance.
+	ClaimGeneration *int64 `json:"-"`
 }
 
 // resultUsagePayload is the subset of a terminal result frame's payload the fold
@@ -2127,10 +2746,38 @@ const maxCostUSD = 999999.999999
 // column and the M2 worker client); the Go field stays
 // `State` to avoid churn in the switch below.
 type StateRequest struct {
-	State  string  `json:"status"` // running|awaiting_approval|awaiting_input|completed|failed
-	PlanMd *string `json:"plan_md"`
-	Branch *string `json:"branch"`
-	MrIID  *int64  `json:"mr_iid"`
+	State string `json:"status"` // running|awaiting_approval|awaiting_input|awaiting_followup|limit_wait|recovery_wait|paused|pause_failed|credential_switch|completed|failed
+	// ClaimGeneration is the runs.claim_generation the worker believes it holds (PRD #1247
+	// M5, D3). A CAPABILITY worker (credential_switch_v1) stamps it on EVERY mutating report;
+	// SetState then fences the transition atomically on `claim_generation = @gen AND
+	// claim_released_at IS NULL`, so a report from a flight whose claim was RELEASED (a
+	// held-state switch requeued the run) or SUPERSEDED (a reclaim bumped the generation) is
+	// rejected with a typed stale_claim disposition instead of mutating the run. It is ALSO
+	// REQUIRED on a `credential_switch` release report (the release targets an exact
+	// generation). Nullable and OPTIONAL: a LEGACY worker (no capability) omits it, and the
+	// report is honoured UNFENCED exactly as before — back-compat by construction. The field
+	// MUST exist here because httpx.DecodeJSON sets DisallowUnknownFields — a capability
+	// worker that sends it would 400 otherwise. The SAME field is also the forge-park fence
+	// (PRD #1392 M1): the forge_unreachable park transaction requires it to equal the locked
+	// run's claim_generation and answers 409 stale_claim on a mismatch (#1247's precedence).
+	ClaimGeneration *int64 `json:"claim_generation"`
+	// MessagesThroughSeq is the terminal fence (PRD #1391 Run B M3c, D3): the highest message
+	// seq the worker asserts it has durably delivered to the api at the moment it reports a
+	// TERMINAL transition (completed/failed). When present, SetState refuses the terminal write
+	// until run_messages holds a CONTIGUOUS [1..through] — runs.last_seq must have reached
+	// `through` AND count(run_messages in [1..through]) must equal `through` (last_seq alone
+	// cannot see a hole below it) — answering ErrMessagesPending (409, reason messages_pending)
+	// otherwise so the worker fills the gap and re-reports. A missing count more than
+	// WorkerGapFillMax below `through` is instead ErrGapUnrecoverable (409, reason
+	// gap_unrecoverable): the hole is too large to ever fill, so the worker must stop re-parking.
+	// Nullable and OPTIONAL — a legacy worker omits it and the terminal transition is UNFENCED,
+	// byte-identical to before. The field MUST exist here because httpx.DecodeJSON sets
+	// DisallowUnknownFields — a fence-capable worker that sends it would 400 otherwise. A negative
+	// value is invalid (ErrInvalidState). Ignored on every non-terminal report.
+	MessagesThroughSeq *int64  `json:"messages_through_seq"`
+	PlanMd             *string `json:"plan_md"`
+	Branch             *string `json:"branch"`
+	MrIID              *int64  `json:"mr_iid"`
 	// Head is the EXACT source-branch tip H a `completed` report is being made against
 	// (PRD #1226 M2, D5). It is REQUIRED for an INTERLOCKED run's completion: SetState routes
 	// such a completion through completeRunWithPermit, which consumes the permit issued for
@@ -2346,13 +2993,6 @@ type StateRequest struct {
 	// worker's empty-turn park. httpx.DecodeJSON rejects unknown fields, so this field MUST
 	// exist here or a new worker's report 400s.
 	RecoveryCause *string `json:"recovery_cause"`
-	// ClaimGeneration is the claim generation the worker holds, carried on the forge-park report
-	// (PRD #1392 M1). UNTRUSTED, but it is a FENCE not a value: the forge-park transaction
-	// requires it to equal the locked run's claim_generation and answers 409 stale_claim on a
-	// mismatch, with nothing mutated (#1247's precedence, checked first). Required for a
-	// forge_unreachable park; ignored on every other report. httpx.DecodeJSON rejects unknown
-	// fields, so this field MUST exist here or a new worker's report 400s.
-	ClaimGeneration *int64 `json:"claim_generation"`
 }
 
 // ProposalPayload is the structured idea a scheduled issues-mode prompt run emits on
@@ -2362,6 +3002,57 @@ type StateRequest struct {
 type ProposalPayload struct {
 	Title string `json:"title"`
 	Body  string `json:"body"`
+}
+
+// terminalMessageFence is the terminal fence (PRD #1391 Run B M3c, D3). When a terminal
+// (completed/failed) report carries messages_through_seq, it refuses the transition — BEFORE any
+// mutating write — unless run_messages holds a CONTIGUOUS [1..through]:
+//
+//   - a NEGATIVE through is invalid (ErrInvalidState → 400);
+//   - MORE than WorkerGapFillMax seqs missing from [1..through] is ErrGapUnrecoverable — the hole
+//     is too large to ever fill, so the worker must stop re-parking on it (409 gap_unrecoverable);
+//   - any REMAINING shortfall — last_seq below through, or a hole below it (stored count < through)
+//     — is ErrMessagesPending, a recoverable refusal (409 messages_pending).
+//
+// A nil messages_through_seq leaves the transition UNFENCED (a legacy worker), byte-identical to
+// before. It runs the count on the SAME q the caller mutates through — the tx-bound qtx when the
+// generation FOR UPDATE fence is engaged, else the pool — so the contiguity read and the terminal
+// write share one snapshot. gap_unrecoverable is checked BEFORE messages_pending so a hole too
+// large to fill is never mislabelled as merely pending.
+func (s *Service) terminalMessageFence(ctx context.Context, q Store, runID uuid.UUID, owned store.Run, req StateRequest) error {
+	if req.MessagesThroughSeq == nil {
+		return nil
+	}
+	through := *req.MessagesThroughSeq
+	if through < 0 {
+		return fmt.Errorf("%w: messages_through_seq must be non-negative", ErrInvalidState)
+	}
+	// A message seq is an int32 column, so a run can never store `through` CONTIGUOUS messages once
+	// through exceeds int32 — the hole is unrecoverable by definition. Guarding here also makes the
+	// int32(through) cast at the count query provably in range (gosec G115).
+	if through > math.MaxInt32 {
+		return ErrGapUnrecoverable
+	}
+	// Cheap pre-check: last_seq is the high-water mark, so stored count <= last_seq. If the mark
+	// ALONE is more than a fill window short of `through`, the hole is unrecoverable no matter what
+	// is stored below it — answer without the count query.
+	if through-int64(owned.LastSeq) > int64(s.p.WorkerGapFillMax) {
+		return ErrGapUnrecoverable
+	}
+	// Contiguity count over the run_messages (run_id, seq) unique index. A hole BELOW last_seq is
+	// invisible to the high-water mark, so this — not runs.last_seq — is what proves [1..through]
+	// is gapless.
+	stored, cerr := q.CountRunMessagesThrough(ctx, store.CountRunMessagesThroughParams{RunID: runID, Through: int32(through)})
+	if cerr != nil {
+		return cerr
+	}
+	if through-int64(stored) > int64(s.p.WorkerGapFillMax) {
+		return ErrGapUnrecoverable
+	}
+	if int64(stored) < through {
+		return ErrMessagesPending
+	}
+	return nil
 }
 
 // SetState applies a worker's state transition and returns the run's resulting
@@ -2398,7 +3089,19 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	// transitions and pause_failed is not one; the in-app feed message carries the reason. A
 	// Slack DM would need a reason-carrying handler→slacksvc seam (deferred).
 	if req.State == "pause_failed" {
-		if _, cerr := s.q.ClearPauseRequest(ctx, store.ClearPauseRequestParams{ID: runID, WorkerID: pgconv.UUID(wkr.ID)}); cerr != nil {
+		// PRD #1247 M5: FAIL CLOSED for a CAPABILITY worker. pause_failed is handled BEFORE the
+		// generic fail-closed check below, so its own check lives here: a worker advertising
+		// credential_switch_v1 that OMITS claim_generation is refused (ErrMissingClaimGeneration →
+		// the same 409 the handler maps it to) rather than clearing the pause unfenced. A LEGACY
+		// worker (no capability, nil generation) skips the fence, byte-identical to before.
+		if req.ClaimGeneration == nil && slices.Contains(wkr.ProtocolCapabilities, capability.CredentialSwitchV1) {
+			return owned, false, ErrMissingClaimGeneration
+		}
+		// The nullable claim_generation fences the clear: a stale flight (its claim released by a
+		// held-state switch, or superseded by a reclaim) matches 0 rows, so it clears nothing and
+		// cannot withdraw the NEW flight's pending pause. The run stays running either way (the
+		// rowcount is intentionally not read — the fence is the protection, not a re-read).
+		if _, cerr := s.q.ClearPauseRequest(ctx, store.ClearPauseRequestParams{ID: runID, WorkerID: pgconv.UUID(wkr.ID), ClaimGeneration: pgconv.Int8Ptr(req.ClaimGeneration)}); cerr != nil {
 			return store.Run{}, false, cerr
 		}
 		run, err = s.runOwnedByWorker(ctx, runID, wkr)
@@ -2409,6 +3112,89 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			s.bcast.PublishState(runID, run.Status)
 		}
 		return run, true, nil
+	}
+	// PRD #1247 M5 (D3/D4/D14): the held-state credential-switch RELEASE report. It is NOT a
+	// generic mutation — a redelivered same-generation release after the release already
+	// applied (a lost ack) must converge to idempotent success, not a stale rejection — so it
+	// is handled by its own fenced+idempotent helper BEFORE the generation fence below (whose
+	// generic stale check would wrongly reject an already-released redelivery).
+	if req.State == "credential_switch" {
+		return s.releaseCredentialSwitch(ctx, owned, wkr, req)
+	}
+	// PRD #1247 M5 (D3 step 3 / D14): the bounded capture-failure GIVE-UP. After a bounded number
+	// of failed verified-restore-point captures the worker abandons the switch and reports
+	// {status:"credential_switch_failed", claim_generation}; the server CLEARS the pending switch
+	// stamp WITHOUT changing status — the run keeps running on its current token. Like pause_failed
+	// it withdraws a pending request (a SWITCH, not a PAUSE) rather than transitioning, so it is
+	// handled by its own fenced+idempotent helper BEFORE the generation fence below (whose generic
+	// stale check would wrongly reject an already-cleared redelivery).
+	if req.State == "credential_switch_failed" {
+		return s.failCredentialSwitch(ctx, owned, wkr, req)
+	}
+	// PRD #1247 M5a-1 rework (auditor fail-open finding): FAIL CLOSED for a CAPABILITY worker. The
+	// fence below engages only when the report STAMPS a generation, so a worker advertising
+	// credential_switch_v1 could otherwise bypass it entirely by OMITTING claim_generation on a
+	// mutating report. Make "legacy" a per-WORKER-capability property, not a per-request
+	// field-presence choice: a worker that advertises the capability MUST stamp the generation on
+	// every fenced mutating transition, so an omission is refused (ErrMissingClaimGeneration → the
+	// same 409/stale_claim ack as ErrStaleClaim). A LEGACY worker (no capability) is still honoured
+	// unfenced when it omits the field — back-compat by construction. INTERLOCKED completion is
+	// excluded here (stateUsesGenerationFence is false for it) and enforces the identical check
+	// inside completeRunWithPermit's permit transaction, where the rest of that arm's fence lives.
+	if req.ClaimGeneration == nil &&
+		stateUsesGenerationFence(req.State, owned) &&
+		slices.Contains(wkr.ProtocolCapabilities, capability.CredentialSwitchV1) {
+		return owned, false, ErrMissingClaimGeneration
+	}
+	// PRD #1247 M5 (D3): the released-generation fence. A CAPABILITY worker stamps
+	// req.ClaimGeneration on every mutating report; we then run the state transition under a
+	// FOR UPDATE lock on the run row and REJECT the report (ErrStaleClaim) when the run's
+	// generation has moved past the reported one (a reclaim) or its claim has been RELEASED (a
+	// held-state switch requeued it). Holding the row lock from the check THROUGH the mutation
+	// is what makes it atomic and serialized against ClaimRun / ReleaseCredentialSwitch — a
+	// Go-side check on a stale read then an unfenced UPDATE would be a TOCTOU (D3). A LEGACY
+	// report (nil generation, no capability) skips the tx entirely and runs UNFENCED exactly as
+	// before — back-compat by construction. The single-statement arms run their mutation
+	// through the tx-bound `q`; the multi-query park helpers (limit_wait/recovery_wait) and the
+	// interlocked-completion permit transaction do NOT nest under this lock — see
+	// stateUsesGenerationFence for why each is covered by its own guard.
+	q := Store(s.q)
+	var fenceTx pgx.Tx
+	defer func() {
+		if fenceTx != nil {
+			_ = fenceTx.Rollback(ctx)
+		}
+	}()
+	if req.ClaimGeneration != nil && stateUsesForUpdateFence(req.State, owned) {
+		if s.txBeginner == nil {
+			return store.Run{}, false, fmt.Errorf("state fence unavailable: no tx beginner wired for run %s", runID)
+		}
+		tx, berr := s.txBeginner.Begin(ctx)
+		if berr != nil {
+			return store.Run{}, false, berr
+		}
+		fenceTx = tx
+		qtx := store.New(tx)
+		locked, lerr := qtx.GetRunOwnedByWorkerForUpdate(ctx, store.GetRunOwnedByWorkerForUpdateParams{ID: runID, WorkerID: pgconv.UUID(wkr.ID)})
+		if lerr != nil {
+			if errors.Is(lerr, pgx.ErrNoRows) {
+				// The run left this worker (a reclaim by a DIFFERENT worker between the
+				// unlocked ownership read and this FOR UPDATE) → not this worker's to mutate.
+				return store.Run{}, false, ErrRunNotOwned
+			}
+			return store.Run{}, false, lerr
+		}
+		if locked.ClaimGeneration != *req.ClaimGeneration || locked.ClaimReleasedAt.Valid {
+			// Stale: a reclaim bumped the generation past the reported one, or a switch
+			// released this claim. Return the LOCKED row so the handler can render it beside
+			// the stale_claim disposition. The deferred Rollback releases the lock.
+			return locked, false, ErrStaleClaim
+		}
+		// Locked and current: the arms below mutate through the tx, and the lock is held
+		// until the post-mutation commit, so no ClaimRun/release can interleave. Use the
+		// freshly-locked snapshot for the arm's own reads of the run row.
+		owned = locked
+		q = qtx
 	}
 	var rows int64
 	// PRD #634 M4: the disposition to settle the pending scope audit row(s) with, decided in
@@ -2435,7 +3221,7 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 				return store.Run{}, false, fmt.Errorf("%w: running report carries a blank plan_md", ErrInvalidState)
 			}
 			var planRows int64
-			planRows, err = s.q.SetRunAutopilotPlan(ctx, store.SetRunAutopilotPlanParams{
+			planRows, err = q.SetRunAutopilotPlan(ctx, store.SetRunAutopilotPlanParams{
 				PlanMd:   planBody,
 				ID:       runID,
 				WorkerID: pgconv.UUID(wkr.ID),
@@ -2507,14 +3293,14 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// SQL is ownership+status guarded (id + worker_id, non-terminal), so a superseded worker
 		// cannot wipe the live owner's progress; a 0-row refusal is benign and not surfaced.
 		if req.SeededFromDefault != nil && *req.SeededFromDefault {
-			if _, cerr := s.q.ClearRunMilestonesCompleted(ctx, store.ClearRunMilestonesCompletedParams{
+			if _, cerr := q.ClearRunMilestonesCompleted(ctx, store.ClearRunMilestonesCompletedParams{
 				ID:       runID,
 				WorkerID: pgconv.UUID(wkr.ID),
 			}); cerr != nil {
 				return store.Run{}, false, cerr
 			}
 		}
-		rows, err = s.q.SetRunRunning(ctx, runningParams)
+		rows, err = q.SetRunRunning(ctx, runningParams)
 	case "awaiting_approval":
 		// PRD #122 M1: the CANDIDATE milestone list rides the pre-approval report.
 		// milestonesParam validates + kind-gates it (Decision 12/13) and returns NULL
@@ -2530,7 +3316,7 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// as an absent-safe pgtype.Text, so an off-vocabulary or absent value is an invalid
 		// (SQL NULL) param the query's COALESCE keeps out of the column.
 		inferredCaps, inferredTools, sizeClass := inferredRequirementParams(req)
-		rows, err = s.q.SetRunAwaitingApproval(ctx, store.SetRunAwaitingApprovalParams{
+		rows, err = q.SetRunAwaitingApproval(ctx, store.SetRunAwaitingApprovalParams{
 			PlanMd: stripNULParam(req.PlanMd), SessionID: sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
 			MilestonesCandidate:  milestonesParam(owned.Kind, req.Milestones),
 			InferredCapabilities: inferredCaps,
@@ -2563,7 +3349,7 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			now := time.Now().UTC()
 			completionQuestionAt = &now
 		}
-		rows, err = s.q.SetRunAwaitingInput(ctx, store.SetRunAwaitingInputParams{
+		rows, err = q.SetRunAwaitingInput(ctx, store.SetRunAwaitingInputParams{
 			OpenQuestionID:       pgconv.TextOrNull(qid),
 			CompletionQuestionAt: pgconv.TimePtr(completionQuestionAt),
 			SessionID:            sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
@@ -2587,7 +3373,7 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		if owned.Kind != runkind.Task || !owned.Interactive {
 			return store.Run{}, false, fmt.Errorf("%w: awaiting_followup requires an interactive task run", ErrInvalidState)
 		}
-		rows, err = s.q.SetRunAwaitingFollowup(ctx, store.SetRunAwaitingFollowupParams{
+		rows, err = q.SetRunAwaitingFollowup(ctx, store.SetRunAwaitingFollowupParams{
 			// int8Param maps nil → pgtype.Int8{} (Valid:false → SQL NULL), so an old
 			// worker that omits open_followup_id lands NULL and the query's COALESCE
 			// fallback recomputes the server-derived max-consumed watermark. A present
@@ -2596,6 +3382,16 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			SessionID:      sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
 		})
 	case "completed":
+		// PRD #1391 Run B M3c (D3): the terminal fence, BEFORE any mutating write (the
+		// SetRunCompleted / completeRunWithPermit calls below). When the report carries
+		// messages_through_seq it refuses a completion whose run_messages are not yet contiguous
+		// through that seq (ErrMessagesPending) or whose hole is too large to fill
+		// (ErrGapUnrecoverable). A legacy worker omits it and this is a no-op. Runs on q, which is
+		// the tx-bound qtx when the generation FOR UPDATE fence is engaged (a non-interlocked
+		// capability completion), else the pool.
+		if ferr := s.terminalMessageFence(ctx, q, runID, owned, req); ferr != nil {
+			return owned, false, ferr
+		}
 		// PRD #265 M1: reconcile the milestone tracker from the lead's signal_done
 		// declaration. progressParams subset-validates the declared ids against the run's
 		// FROZEN list (Decision 12/13) exactly as the `running` path does — a non-issue
@@ -2672,12 +3468,23 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		if owned.CompletionContractVersion.Valid {
 			var idempotent bool
 			rows, idempotent, err = s.completeRunWithPermit(ctx, wkr, owned, req, completedParams)
+			// PRD #1247 M5 (D3): the interlocked completion runs its OWN permit transaction, so
+			// it cannot nest under an outer FOR UPDATE fence (self-deadlock) — it is
+			// generation-fenced INSIDE that lock instead and returns ErrStaleClaim when a
+			// released/reclaimed old flight tries to consume a stale permit. It ALSO enforces the
+			// M5a-1 fail-closed check (a capability worker that omitted claim_generation →
+			// ErrMissingClaimGeneration), since interlocked-completed does not pass through the
+			// top-of-SetState check above. Surface either with the pre-tx run row so the handler
+			// renders the stale_claim disposition.
+			if errors.Is(err, ErrStaleClaim) || errors.Is(err, ErrMissingClaimGeneration) {
+				return owned, false, err
+			}
 			if err == nil && idempotent {
 				run, rerr := s.runOwnedByWorker(ctx, runID, wkr)
 				return run, true, rerr
 			}
 		} else {
-			rows, err = s.q.SetRunCompleted(ctx, completedParams)
+			rows, err = q.SetRunCompleted(ctx, completedParams)
 		}
 	case "limit_wait":
 		rows, err = s.setLimitWait(ctx, owned, wkr, req, sessionID)
@@ -2717,10 +3524,18 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// ack contract as limit_wait — the worker keys off the RETURNED status being literally
 		// "paused", never off applied — so a refused park (0 rows) surfaces as 409 and the worker
 		// cleans up. It clears the pending-pause columns (the request is now consumed).
-		rows, err = s.q.SetRunPaused(ctx, store.SetRunPausedParams{
+		rows, err = q.SetRunPaused(ctx, store.SetRunPausedParams{
 			SessionID: sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
 		})
 	case "failed":
+		// PRD #1391 Run B M3c (D3): the terminal fence, BEFORE any mutating write (the SetRunFailed /
+		// CancelRunByWorker / SupersedeRunByWorker calls below). Same contract as the completed arm:
+		// a `failed` report carrying messages_through_seq is refused until run_messages are contiguous
+		// through that seq (ErrMessagesPending), or told the hole is unrecoverable
+		// (ErrGapUnrecoverable). A legacy worker omits it and this is a no-op.
+		if ferr := s.terminalMessageFence(ctx, q, runID, owned, req); ferr != nil {
+			return owned, false, ferr
+		}
 		// PRD #634 follow-up: a scope-directed run that terminates abnormally (failed/cancelled/
 		// stopped/plan-rejected) never applied the scope cap, so settle its pending audit row
 		// 'declined' — otherwise `run inputs`/the web card render it "active" for a terminal run.
@@ -2742,7 +3557,7 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			// converging with the server-side CancelRunServerSide path. SetRunFailed is NOT
 			// called. rows drives the same applied/not-applied logic below (execrows, like
 			// SetRunFailed).
-			rows, err = s.q.CancelRunByWorker(ctx, store.CancelRunByWorkerParams{
+			rows, err = q.CancelRunByWorker(ctx, store.CancelRunByWorkerParams{
 				ID: runID, WorkerID: pgconv.UUID(wkr.ID),
 			})
 		case owned.StopKind.Valid && owned.StopKind.String == "stopped":
@@ -2755,18 +3570,24 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			// fail_origin='agent_failure' and must NOT be judged. Route to CancelRunByWorker
 			// exactly like the 'cancelled' arm: status 'cancelled', fail_origin NULL (CHECK-safe,
 			// no new vocabulary value), which Gate 0 of maybeEnqueueJudge excludes from judging.
-			rows, err = s.q.CancelRunByWorker(ctx, store.CancelRunByWorkerParams{
+			rows, err = q.CancelRunByWorker(ctx, store.CancelRunByWorkerParams{
 				ID: runID, WorkerID: pgconv.UUID(wkr.ID),
 			})
 		case owned.StopKind.Valid && owned.StopKind.String == "plan_rejected":
 			// A live plan-reject: stamp fail_origin='plan_rejected' (overriding the untrusted
 			// req.FailOrigin, which the worker cannot forge), matching the server-side
 			// RejectRunServerSide path rather than defaulting to agent_failure.
-			rows, err = s.q.SetRunFailed(ctx, store.SetRunFailedParams{
+			rows, err = q.SetRunFailed(ctx, store.SetRunFailedParams{
 				FailureReason:  limitAwareFailureReason(req),
 				FailOrigin:     pgconv.TextOrNull("plan_rejected"),
 				PreservedPatch: clampWirePreservedPatch(req.PreservedPatch),
 				SessionID:      sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
+				// PRD #1247 M5a-1 rework (m6): explicit nil. A fenced (non-chat, generation-bearing)
+				// capability report was already generation-checked under the outer FOR UPDATE fence
+				// upstream, so the per-query fence is redundant here; a legacy or chat report carries no
+				// generation (chat is deliberately fence-exempt), so nil is correct there too. Behavior
+				// preserved.
+				ClaimGeneration: pgtype.Int8{},
 			})
 		case req.BranchMoved != nil && *req.BranchMoved && owned.Kind == runkind.MRRework:
 			// Issue #1117: an mr_rework finalize push rejected non-fast-forward because a concurrent
@@ -2777,7 +3598,13 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			// like ScopeCapped's scope_ceiling guard) so an untrusted worker cannot mint the benign
 			// disposition on any other kind. Placed after the operator-stop arms so a concurrent operator
 			// cancel/stop (which pre-stamped owned.StopKind) still wins.
-			rows, err = s.q.SupersedeRunByWorker(ctx, store.SupersedeRunByWorkerParams{
+			//
+			// PRD #1247 fix round: use the TX-bound q (not s.q). This arm runs under the outer
+			// FOR UPDATE fence (q rebound to qtx), which holds a row lock on runID; issuing the
+			// supersede on the POOL (s.q) would wait on the transaction's own uncommitted lock until
+			// the context deadline, hanging every capability-worker mr_rework branch_moved report.
+			// Every sibling arm uses q for exactly this reason.
+			rows, err = q.SupersedeRunByWorker(ctx, store.SupersedeRunByWorkerParams{
 				ID: runID, WorkerID: pgconv.UUID(wkr.ID),
 			})
 		default:
@@ -2791,7 +3618,7 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			if o := CoerceFailOrigin(req.FailOrigin); o != nil {
 				failOrigin = *o
 			}
-			rows, err = s.q.SetRunFailed(ctx, store.SetRunFailedParams{
+			rows, err = q.SetRunFailed(ctx, store.SetRunFailedParams{
 				// PRD #35 §7.8: when a `failed` report carries the structured limit fields,
 				// the SERVER composes the sentence from its own allowlisted enum and replaces
 				// whatever text the worker sent. That is the opt-out path (a run with
@@ -2804,6 +3631,12 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 				FailOrigin:     pgconv.TextOrNull(failOrigin),
 				PreservedPatch: clampWirePreservedPatch(req.PreservedPatch),
 				SessionID:      sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
+				// PRD #1247 M5a-1 rework (m6): explicit nil. A fenced (non-chat, generation-bearing)
+				// capability report was already generation-checked under the outer FOR UPDATE fence
+				// upstream, so the per-query fence is redundant here; a legacy or chat report skips the
+				// lock and carries no generation (chat is deliberately fence-exempt), so nil is correct
+				// there too. Behavior preserved.
+				ClaimGeneration: pgtype.Int8{},
 			})
 		}
 	default:
@@ -2811,6 +3644,18 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	}
 	if err != nil {
 		return store.Run{}, false, err
+	}
+	// PRD #1247 M5 (D3): the fenced transition applied — COMMIT it, releasing the FOR UPDATE
+	// lock, BEFORE the post-transition automation below. That automation runs on s.q (a
+	// separate pool connection) and re-reads the run, so it must not run while this tx holds
+	// the row lock (the re-read would see the pre-commit row, and any run-row write would
+	// self-deadlock against the lock). A commit failure fails the report; the deferred Rollback
+	// is a no-op once fenceTx is cleared. A legacy report left fenceTx nil, so this is skipped.
+	if fenceTx != nil {
+		if cerr := fenceTx.Commit(ctx); cerr != nil {
+			return store.Run{}, false, cerr
+		}
+		fenceTx = nil
 	}
 	// issue #329: record the MR the worker opened INDEPENDENT of the terminal status
 	// the switch above wrote. If SetRunCompleted applied, ReconcileRunMR is a COALESCE
@@ -3168,17 +4013,51 @@ type InputDTO struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+// ConsumeInputsResult is what ConsumeInputs returns: the drained steering inputs and, when a
+// held-state switch is pending for the run's current claim, the worker-facing switch signal (PRD
+// #1247 M5, D3/D4). On the consume-nothing path (a pending switch) Inputs is empty and
+// CredentialSwitch is set; on the normal path CredentialSwitch is nil.
+type ConsumeInputsResult struct {
+	Inputs           []InputDTO
+	CredentialSwitch *CredentialSwitchSignal
+}
+
 // ConsumeInputs returns and marks-consumed every pending steering input for a
 // run the worker owns, FIFO. Delivery marks the input consumed (there is no
 // separate ack), so a worker crash right after the GET drops that input — an
 // accepted MVP trade-off for the steering channel (the user can re-send).
-func (s *Service) ConsumeInputs(ctx context.Context, wkr store.Worker, runID uuid.UUID) ([]InputDTO, error) {
-	if _, err := s.runOwnedByWorker(ctx, runID, wkr); err != nil {
-		return nil, err
+//
+// CONSUME-NOTHING RULE (PRD #1247 M5, step 2): the buffered inputs of a run whose claim is being
+// switched are earmarked for the RECLAIM, and this drains NOTHING until that reclaim happens. Two
+// windows are fenced, both server-side (never on worker discipline):
+//
+//   - a switch is PENDING for the current claim (PendingCredentialSwitchSignal != nil): return the
+//     signal and drain nothing, so a racing answer/follow-up stays unconsumed for the reclaim
+//     rather than being drained (and dropped) during the release the worker is about to perform.
+//   - the claim has been RELEASED and not yet reclaimed (claim_released_at set): the old worker
+//     still passes the worker_id-only ownership check in this window, and the signal has already
+//     cleared, so without this fence a stray poll from the departing worker would drain the very
+//     rows the reclaim must see. Drain nothing here too. The drain resumes only after ClaimRun
+//     reclaims the run (which clears claim_released_at and bumps the generation).
+func (s *Service) ConsumeInputs(ctx context.Context, wkr store.Worker, runID uuid.UUID) (ConsumeInputsResult, error) {
+	run, err := s.runOwnedByWorker(ctx, runID, wkr)
+	if err != nil {
+		return ConsumeInputsResult{}, err
+	}
+	if sig := PendingCredentialSwitchSignal(run); sig != nil {
+		// Pending switch: signal + no drain, so a racing answer/follow-up survives for the reclaim.
+		return ConsumeInputsResult{CredentialSwitch: sig}, nil
+	}
+	if run.ClaimReleasedAt.Valid {
+		// Released-but-not-reclaimed: claim_released_at is set ONLY by ReleaseCredentialSwitch and
+		// cleared ONLY by ClaimRun, so a valid value here means exactly "a credential switch
+		// released this claim and the reclaim has not happened yet." The buffered inputs belong to
+		// that reclaim; fence the drain (no signal — the switch for this claim is already released).
+		return ConsumeInputsResult{}, nil
 	}
 	rows, err := s.q.ConsumeRunInputs(ctx, runID)
 	if err != nil {
-		return nil, err
+		return ConsumeInputsResult{}, err
 	}
 	out := make([]InputDTO, 0, len(rows))
 	consumedFollowUp := false
@@ -3197,7 +4076,7 @@ func (s *Service) ConsumeInputs(ctx context.Context, wkr store.Worker, runID uui
 	if consumedFollowUp && s.bcast != nil {
 		s.bcast.PublishInput(runID)
 	}
-	return out, nil
+	return ConsumeInputsResult{Inputs: out}, nil
 }
 
 // SaveMemory persists one cross-run memory entry for the run's (user, repo), the
@@ -3356,17 +4235,21 @@ func (s *Service) ListMemoryForRun(ctx context.Context, wkr store.Worker, runID 
 // forge pre-clone park (PRD #1392 M1, D10) uses the retry stamp to reconcile an unknown park
 // outcome after a transport failure — so a reconciled park can still quote its retry time. The
 // stamp is nil for a run that is not recovery-parked.
-func (s *Service) RunOwnership(ctx context.Context, wkr store.Worker, runID uuid.UUID) (status string, recoveryRetryNotBefore *time.Time, err error) {
+func (s *Service) RunOwnership(ctx context.Context, wkr store.Worker, runID uuid.UUID) (status string, recoveryRetryNotBefore *time.Time, claimGeneration int64, err error) {
 	run, err := s.runOwnedByWorker(ctx, runID, wkr)
 	if err != nil {
-		return "", nil, err
+		return "", nil, 0, err
 	}
 	var retry *time.Time
 	if run.RecoveryRetryNotBefore.Valid {
 		t := run.RecoveryRetryNotBefore.Time
 		retry = &t
 	}
-	return run.Status, retry, nil
+	// PRD #1391 Run B M4: the run's current claim_generation rides the ownership probe
+	// (additive), so the run-lane claim router can proceed ONLY on a claimed/running row AT
+	// the claim's generation and end the attempt on a DIFFERENT generation. It already lives
+	// on the store.Run this read returns — no new query.
+	return run.Status, retry, run.ClaimGeneration, nil
 }
 
 func (s *Service) runOwnedByWorker(ctx context.Context, runID uuid.UUID, wkr store.Worker) (store.Run, error) {
@@ -3378,6 +4261,81 @@ func (s *Service) runOwnedByWorker(ctx context.Context, runID uuid.UUID, wkr sto
 		return store.Run{}, err
 	}
 	return run, nil
+}
+
+// clampInt32 saturates an int64 into the int32 range (0..math.MaxInt32) rather than wrapping — the
+// explicit bounds also make the narrowing provable to gosec G115 (PRD #1391 Run B M3c). Callers
+// already validate their inputs to a far smaller cap; this is defense-in-depth for a direct caller.
+func clampInt32(v int64) int32 {
+	if v > math.MaxInt32 {
+		return math.MaxInt32
+	}
+	if v < 0 {
+		return 0
+	}
+	return int32(v)
+}
+
+// MessageGap is one missing seq range [First..Last] (inclusive) in a run's message log (PRD #1391
+// Run B M3c). Both bounds are >= 1 and First <= Last.
+type MessageGap struct {
+	First int64 `json:"first"`
+	Last  int64 `json:"last"`
+}
+
+// MessageGapsPage is one keyset page of a run's message gaps (PRD #1391 Run B M3c): the gaps in
+// seq order plus, when more pages may follow, the cursor to resume after. NextCursor is nil at the
+// end of the scan.
+type MessageGapsPage struct {
+	Gaps       []MessageGap
+	NextCursor *int64
+}
+
+// RunMessageGaps returns the MISSING seq ranges in [1..through] for a run the worker holds AT THE
+// EXACT CURRENT, UNRELEASED `claimGeneration` (PRD #1391 Run B M3c) — keyset-paginated by seq after
+// `cursor`, at most `limit` ranges. Authorization and gap derivation are one SQL statement/snapshot,
+// so a same-worker reclaim cannot move the generation between a preliminary ownership read and the
+// gap read. Zero rows means a foreign, released or stale-generation claim (ErrRunNotOwned → 404);
+// an authorized run with no gaps returns one nullable sentinel row, filtered below. NextCursor is set
+// only when the page filled to `limit` and did not reach the trailing gap (whose Last == through).
+func (s *Service) RunMessageGaps(ctx context.Context, wkr store.Worker, runID uuid.UUID, claimGeneration, through, cursor, limit int64) (MessageGapsPage, error) {
+	// The handler validates through/cursor to <= a cap (1<<30) and limit to a small ceiling, all
+	// well within int32; clamp defensively so a direct caller cannot overflow the casts and the
+	// conversions are provably in range (gosec G115). A negative here is impossible (the caller
+	// rejects it) but is floored to 0 for the same provability.
+	rows, err := s.q.RunMessageGaps(ctx, store.RunMessageGapsParams{
+		RunID:           runID,
+		WorkerID:        pgconv.UUID(wkr.ID),
+		ClaimGeneration: claimGeneration,
+		Through:         clampInt32(through),
+		Cursor:          clampInt32(cursor),
+		Lim:             clampInt32(limit),
+	})
+	if err != nil {
+		return MessageGapsPage{}, err
+	}
+	if len(rows) == 0 {
+		return MessageGapsPage{}, ErrRunNotOwned
+	}
+	page := MessageGapsPage{Gaps: make([]MessageGap, 0, len(rows))}
+	for _, r := range rows {
+		if !r.GapFirst.Valid {
+			continue // authorized run with no gaps: the query's all-NULL sentinel row
+		}
+		page.Gaps = append(page.Gaps, MessageGap{First: int64(r.GapFirst.Int32), Last: int64(r.GapLast.Int32)})
+	}
+	// Keyset continuation: a full page MIGHT have more behind it, unless the last range is the
+	// trailing gap (Last == through), which is uniquely the final one — the query closes it with a
+	// sentinel and nothing can follow. A short page means the LIMIT was not hit, so the scan is
+	// exhausted. In both terminal cases NextCursor stays nil.
+	if int64(len(page.Gaps)) == limit && len(page.Gaps) > 0 {
+		last := rows[len(rows)-1]
+		if last.GapLast.Valid && int64(last.GapLast.Int32) < through {
+			next := int64(last.NextCursor.Int32)
+			page.NextCursor = &next
+		}
+	}
+	return page, nil
 }
 
 // RunOrphanIdentity is the authoritative owner-run identity a worker needs to derive an
@@ -4020,6 +4978,10 @@ func (s *Service) DeleteWorker(ctx context.Context, userID, workerID uuid.UUID) 
 	if n == 0 {
 		return ErrWorkerNotFound
 	}
+	// The worker is gone; drop its last-known outbox depth (PRD #1391 M5) so a
+	// removed worker's stale depth does not linger on the fleet view. In-memory and
+	// best-effort — the TTL prune is the backstop for any path that skips this.
+	s.outbox.evict(workerID)
 	return nil
 }
 
@@ -4029,7 +4991,7 @@ func (s *Service) DeleteWorker(ctx context.Context, userID, workerID uuid.UUID) 
 // run is self-contained even if the issue cache is later evicted. A PRD link is no
 // longer required. The one-non-terminal-run-per-issue index rejects a duplicate
 // active run.
-func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *SeededPlan) (store.Run, error) {
+func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *SeededPlan, credOverride *CredentialOverride) (store.Run, error) {
 	// waitOnLimit nil ⇒ inherit the owner's default. It is a *bool rather than a bool
 	// because "the caller said false" and "the caller said nothing" are different
 	// requests, and collapsing them would make every API client that omits the field
@@ -4047,16 +5009,20 @@ func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issue
 	// so it stays in the default lane where subagent pins win.
 	// force (issue #856): threaded straight through so the interactive/CLI caller can
 	// bypass the open-MR dedup with --force; it never affects the active-run gate.
-	return s.createRun(ctx, userID, repoID, issueIID, "manual", description, false, waitOnLimit, mrReworkEnabled, nil, false, force, seed)
+	// credOverride nil ⇒ inherit the worker binding (PRD #1247 M1); the create-time
+	// user choice is wired in M2. Threaded through the signature now so M2 does not
+	// reopen this seam (the freeze).
+	return s.createRun(ctx, userID, repoID, issueIID, "manual", description, false, waitOnLimit, mrReworkEnabled, nil, false, force, seed, credOverride)
 }
 
 // CreateScheduledRun queues a NON-auto-approve scheduled issue run (PRD #241: a timer
 // or label-sweep schedule firing an issue with the plan gate still requiring a human).
 // It is IDENTICAL to CreateRun — same single uzi_label eligibility gate (PRD #764 M1) —
 // and, like every create path, no longer requires a PRD link.
-func (s *Service) CreateScheduledRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, seed *SeededPlan) (store.Run, error) {
+func (s *Service) CreateScheduledRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, seed *SeededPlan, credOverride *CredentialOverride) (store.Run, error) {
 	// false force (issue #856): a scheduled run never bypasses the open-MR dedup.
-	return s.createRun(ctx, userID, repoID, issueIID, "schedule", description, false, waitOnLimit, mrReworkEnabled, model, overrideSubagentModel, false, seed)
+	// credOverride nil ⇒ inherit (PRD #1247 M1); M6 threads the schedule's stored override.
+	return s.createRun(ctx, userID, repoID, issueIID, "schedule", description, false, waitOnLimit, mrReworkEnabled, model, overrideSubagentModel, false, seed, credOverride)
 }
 
 // CreateAutopilotRun queues a run the poller's autopilot detection started on a
@@ -4080,7 +5046,9 @@ func (s *Service) CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UU
 	// express a per-run override, so the run's column stays NULL → inherit the owner
 	// default live, exactly today's behaviour.
 	// false force (issue #856): label-poller autopilot never bypasses the open-MR dedup.
-	return s.createRun(ctx, userID, repoID, issueIID, "autopilot", description, true, nil, nil, nil, false, false, nil)
+	// nil credOverride (PRD #1247 M1): label-poller autopilot has no per-run credential
+	// choice, so it inherits the worker binding exactly as before.
+	return s.createRun(ctx, userID, repoID, issueIID, "autopilot", description, true, nil, nil, nil, false, false, nil, nil)
 }
 
 // CreateScheduledAutopilotRun queues an auto-approve run for a schedule while honouring
@@ -4092,9 +5060,10 @@ func (s *Service) CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UU
 // seam (its interface, fake, and call site) stays byte-identical, so widening the
 // scheduler seam cannot change label-driven autopilot. seed=nil for the same reason as
 // CreateAutopilotRun: autopilot never seeds its plan.
-func (s *Service) CreateScheduledAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool) (store.Run, error) {
+func (s *Service) CreateScheduledAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, credOverride *CredentialOverride) (store.Run, error) {
 	// false force (issue #856): a scheduled autopilot run never bypasses the open-MR dedup.
-	return s.createRun(ctx, userID, repoID, issueIID, "autopilot", description, true /*autoApprove*/, waitOnLimit, mrReworkEnabled, model, overrideSubagentModel, false /*force*/, nil /*seed*/)
+	// credOverride nil ⇒ inherit (PRD #1247 M1); M6 threads the schedule's stored override.
+	return s.createRun(ctx, userID, repoID, issueIID, "autopilot", description, true /*autoApprove*/, waitOnLimit, mrReworkEnabled, model, overrideSubagentModel, false /*force*/, nil /*seed*/, credOverride)
 }
 
 // SeededPlan carries a create-time externally-authored plan and its optional agent
@@ -4123,7 +5092,7 @@ type SeededPlan struct {
 	RequireBase bool
 }
 
-func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, triggerSource string, description string, autoApprove bool, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, force bool, seed *SeededPlan) (store.Run, error) {
+func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, triggerSource string, description string, autoApprove bool, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, force bool, seed *SeededPlan, credOverride *CredentialOverride) (store.Run, error) {
 	// The description cap is enforced HERE, once, so the manual (handler → 422) and
 	// autopilot (poller → too-large comment) paths cannot drift (PRD #19 M5). Checked
 	// first: it is pure input validation, independent of the repo/issue gates below.
@@ -4376,6 +5345,13 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		// this stamps the run interlocked (version 1) before its first claim. Listed
 		// explicitly per runtime.sql's 🔴 silently-omittable-narg warning.
 		CompletionContractVersion: completionContractVersion,
+		// PRD #1247 M1 (D1): the per-run credential override, NULL/NULL for every M1
+		// caller (credOverride nil ⇒ inherit the worker binding, byte-identical to a
+		// pre-#1247 run). Listed explicitly per the same silently-omittable-narg warning:
+		// an omitted Go struct field would compile green and ship NULL, which is correct
+		// here only because NULL *is* the intended M1 value — M2 passes a real override.
+		CredentialOverrideMode:     pgOverrideMode(credOverride),
+		CredentialOverrideSecretID: pgOverrideSecretID(credOverride),
 	})
 	if err != nil {
 		if isUniqueViolation(err) {
@@ -4614,6 +5590,14 @@ func (s *Service) RunUsageTotal(ctx context.Context, runID uuid.UUID) (store.Get
 	return s.q.GetRunUsageTotal(ctx, runID)
 }
 
+// RunCredentialEpochs returns one run's applied-switch attribution journal, oldest
+// generation first (PRD #1247 M1, D7), owner-scoped through the query's run join. Empty
+// for a run that has never been claimed. Consumed by the handler's GetRun for the
+// credential_epochs DTO field.
+func (s *Service) RunCredentialEpochs(ctx context.Context, runID, userID uuid.UUID) ([]store.RunCredentialEpoch, error) {
+	return s.q.ListRunCredentialEpochs(ctx, store.ListRunCredentialEpochsParams{RunID: runID, UserID: userID})
+}
+
 // SelfUsage returns the user's own lifetime + last-7-days usage totals and their
 // usage-bearing run count (PRD #40 M3, GET /api/usage).
 func (s *Service) SelfUsage(ctx context.Context, userID uuid.UUID) (store.SelfUsageRow, error) {
@@ -4696,7 +5680,28 @@ func (s *Service) hasLivePoller(ctx context.Context, run store.Run) (bool, error
 	if !wkr.LastHeartbeatAt.Valid {
 		return false, nil
 	}
-	return s.now().Sub(wkr.LastHeartbeatAt.Time) < s.p.WorkerHeartbeatStale, nil
+	if s.now().Sub(wkr.LastHeartbeatAt.Time) >= s.p.WorkerHeartbeatStale {
+		// The worker's heartbeat has gone stale for ALL its runs — no live poller, unchanged.
+		return false, nil
+	}
+	// PRD #1391 Run B M3d (D13): the worker's heartbeat is fresh, but a run whose executor
+	// finished and journaled a terminal outcome sits with a terminal_pending lease on its owning
+	// worker (or that worker is under an unexpired pending_overflow) even while the worker keeps
+	// heartbeating for its OTHER runs. The poller for THIS run is gone — the executor no longer
+	// exists — so a cancel must go server-side (the atomic no-live-poller branch), NOT be enqueued
+	// for an executor that will never consume it. The predicate is the POSITIVE form of the D11
+	// claim-exclusion join; chat is exempt (D6/D10: it never journals a terminal), so it is skipped
+	// here rather than round-tripped for a query that always answers false.
+	if run.Kind != runkind.Chat {
+		pending, perr := s.q.RunHasPendingOutcomeLease(ctx, run.ID)
+		if perr != nil {
+			return false, perr
+		}
+		if pending {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // -------------------------------------------------------------------------
@@ -4729,6 +5734,16 @@ type SweepResult struct {
 	// ONE per distinct held-run owner per tick (the anti-stampede stagger), so on a
 	// busy resume it climbs one owner at a time across ticks. Normally 0.
 	PoolResumed int64
+	// LimitReevaluated is the number of still-parked limit_wait runs this pass LOWERED to
+	// retry_not_before = now() because their `auto` next claim now has a pooled
+	// alternative that is spendable sooner than their park (PRD #1247 M3, D8 — Decision
+	// 6e extended from park-time to park-duration). At most ONE per distinct owner per
+	// tick (the same anti-stampede stagger PoolResumed applies, since this pass bypasses
+	// the park-time jitter). A lowered run is transitioned to queued by the following
+	// PromoteLimitWaitRuns pass — the same tick once that pass's clock has reached the
+	// lowered stamp, else the next — so a non-zero LimitReevaluated is normally mirrored
+	// by LimitPromoted within a tick. Normally 0.
+	LimitReevaluated int64
 	// RecoveryPromoted is the number of runs this pass auto-promoted from recovery_wait to
 	// queued because their recovery_retry_not_before elapsed (issue #1197). Normally 0: the
 	// partial index this reads covers only parked runs, a set that is empty on a healthy

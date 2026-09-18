@@ -2,6 +2,8 @@ import type { Readable } from "node:stream";
 import type { Logger } from "./log.js";
 import {
   WORKER_API_PREFIX,
+  type ActiveSnapshot,
+  type ClaimRequest,
   type PublishResponse,
   type PublishResult,
   type ChatClaimResponse,
@@ -14,6 +16,7 @@ import {
   type ReportFindingRequest,
   type HeartbeatRequest,
   type MessagesRequest,
+  type OutboxHeartbeatEntry,
   type OutgoingMessage,
   type RegisterRequest,
   type RegisterResponse,
@@ -23,6 +26,7 @@ import {
   type InputsResponse,
   type RunOwnershipResponse,
   type RunOrphanClassificationResponse,
+  type MessageGapsResponse,
   type WorkerProposal,
   type WorkerRunDetail,
   type WorkerRunListItem,
@@ -248,11 +252,66 @@ export class WorkerClient {
   private readonly terminalRetrySchedule: number[];
   private readonly httpTimeoutMs: number;
   private readonly codexHTTPTimeoutMs: number;
-  /** PRD #1392 M2 (D7): the protocol features the api advertised at `register`, so the runner
-   *  can pick a capability-aware degradation for a pre-clone forge-unreachable park. Empty until
-   *  `register` runs, and stays `[]` when an OLDER api returns no `protocol_features` — so a
-   *  reader treats "no features" as the safe default (negotiate nothing). */
-  protocolFeatures: string[] = [];
+  /**
+   * The PROTOCOL FEATURES the server advertised on the last successful register. ONE
+   * shared negotiation wire (PRD #1392 D7 / #1391 D8): `register()` REPLACES the set from
+   * `RegisterResponse.protocol_features`, and a strict-decode rollback fallback CLEARS it
+   * (so nothing negotiated is sent again until process restart). Empty until the first
+   * register, so a client that has not registered sends today's byte-identical wire.
+   */
+  private serverFeatures = new Set<string>();
+
+  /**
+   * Whether this image advertised the `credential_switch_v1` protocol capability at
+   * register (PRD #1247 fix round). A capability worker's runs are fenced server-side,
+   * so it stamps `claim_generation` OPTIMISTICALLY — independent of the negotiated
+   * `claim_generation_fence` feature, which a one-shot register may have missed under
+   * rollout skew. Captured from `register()`'s `protocolCapabilities` argument; false
+   * until (and unless) a register advertises it, so a non-capability worker keeps the
+   * feature gate. Never cleared by the strict-decode fallback (a capability worker stays
+   * optimistic so the next request self-recovers once the api rolls forward).
+   */
+  private hasCredentialSwitchCapability = false;
+
+  /**
+   * The per-registration nonce the api minted on the last successful register (PRD #1390
+   * M2a), captured beside `serverFeatures`. The client stamps it onto every ActiveSnapshot
+   * it SENDS (heartbeat + claim), so the api can trust the snapshot's epoch across a worker
+   * OR api restart. Undefined until an api that advertises `active_run_snapshot` registers;
+   * an older api omits it. NOT cleared by the strict-decode fallback — clearing the feature
+   * set already stops the snapshot from being sent, and the nonce is re-minted on the next
+   * register (process restart) regardless.
+   */
+  private registerNonce: string | undefined;
+
+  /**
+   * PRD #1391 Run B M4: the api's server-side terminal-pending outbox cap
+   * (`WORKER_OUTBOX_MAX_PENDING`), captured from the register response so the active-run registry
+   * can size its `pending_overflow` decision + deterministic rotation to the server WITHOUT a
+   * worker-side cap mirror. Undefined until an api that returns the field registers; an older api
+   * omits it and the registry treats the cap as 0 (protect every pending outcome via overflow). NOT
+   * cleared by the strict-decode heartbeat fallback — it is a register-response value, not a wire
+   * extension, and is re-read on the next register (process restart) regardless.
+   */
+  private workerOutboxMaxPendingValue: number | undefined;
+
+  /** PRD #1391 Run B M4: the register-returned terminal-pending outbox cap, or undefined when the
+   *  api did not return it (older api ⇒ the registry treats it as cap 0). Read by the active-run
+   *  registry's `pending_overflow` + rotation. */
+  get workerOutboxMaxPending(): number | undefined {
+    return this.workerOutboxMaxPendingValue;
+  }
+
+  /** The advertised features as an array (PRD #1392 D7): the runner reads this to pick a
+   *  capability-aware degradation for a pre-clone forge-unreachable park. Backed by
+   *  `serverFeatures` so the two views never diverge and a rollback clear empties both. The
+   *  setter routes through the same set (a test that skips register can seed it directly). */
+  get protocolFeatures(): string[] {
+    return [...this.serverFeatures];
+  }
+  set protocolFeatures(v: string[]) {
+    this.serverFeatures = new Set(v);
+  }
 
   constructor(
     private readonly baseUrl: string,
@@ -273,6 +332,7 @@ export class WorkerClient {
     maxConcurrentRuns?: number,
     capabilities?: string[],
     protocolCapabilities?: string[],
+    initialSnapshot?: ActiveSnapshot,
   ): Promise<RegisterResponse> {
     const body: RegisterRequest = { name, version: this.version };
     // Only send the field when known: an image without ENV WORKER_TEMPLATE reports
@@ -296,29 +356,116 @@ export class WorkerClient {
     // byte-identical to today. The server stores it in workers.protocol_capabilities,
     // SEPARATE from `capabilities`, and the ClaimRun hard clause reads it there.
     if (protocolCapabilities?.length) body.protocol_capabilities = protocolCapabilities;
+    // PRD #1391 Run B M4: carry the boot active-run snapshot on register so a worker holding pending
+    // terminal outcomes leases them BEFORE the api's register-time orphan pass runs. Nonce-EXEMPT (no
+    // nonce exists yet), so it is sent verbatim WITHOUT stamping registerNonce — unlike the heartbeat
+    // and claim snapshots. Sent only when the boot-replay path built one (a pending terminal journal
+    // exists); an ordinary worker passes undefined and the register wire stays byte-identical.
+    if (initialSnapshot !== undefined) body.active_snapshot = initialSnapshot;
     const res = (await this.postJSON(`${WORKER_API_PREFIX}/register`, body)) as RegisterResponse;
-    // PRD #1392 M2 (D7): capture the api's advertised protocol features so the runner can pick a
-    // capability-aware degradation for a forge-unreachable park. An OLDER api omits the field
-    // entirely (returns only worker_id) — default to [] so "no features" is the safe negotiation.
-    this.protocolFeatures = Array.isArray(res.protocol_features)
-      ? res.protocol_features.filter((f): f is string => typeof f === "string")
-      : [];
+    // Capture the negotiated protocol features (PRD #1392 D7 / #1391 D8): REPLACE the set
+    // from this register's advertisement so a re-register after a rollout reflects the
+    // server's current features. Filter to strings (defensive), and treat an absent field
+    // as an empty set (older server) ⇒ no wire extension is ever sent.
+    this.serverFeatures = new Set(
+      Array.isArray(res.protocol_features)
+        ? res.protocol_features.filter((f): f is string => typeof f === "string")
+        : [],
+    );
+    // PRD #1247 fix round: remember whether THIS image advertised the credential_switch_v1
+    // capability, so the send-gate can stamp the claim generation optimistically (its runs
+    // are fenced server-side) even when a one-shot register missed the negotiated feature.
+    this.hasCredentialSwitchCapability = protocolCapabilities?.includes("credential_switch_v1") ?? false;
+    // PRD #1390 M2a: capture the per-registration nonce the api minted, stamped onto every
+    // ActiveSnapshot the worker sends. A string only (defensive); absent on an older api ⇒
+    // undefined, in which case no snapshot is sent either (the feature gate is off too).
+    this.registerNonce = typeof res.register_nonce === "string" ? res.register_nonce : undefined;
+    // PRD #1391 Run B M4: stash the server-side terminal-pending outbox cap so the active-run
+    // registry sizes its overflow/rotation to it. A finite non-negative number only (defensive);
+    // an absent/garbled field leaves it undefined ⇒ the registry treats the cap as 0.
+    this.workerOutboxMaxPendingValue =
+      typeof res.worker_outbox_max_pending === "number" &&
+      Number.isFinite(res.worker_outbox_max_pending) &&
+      res.worker_outbox_max_pending >= 0
+        ? Math.floor(res.worker_outbox_max_pending)
+        : undefined;
     return res;
   }
 
-  async heartbeat(stats?: WorkerStats): Promise<void> {
+  /** Whether the server advertised protocol feature `f` on the last register (PRD
+   *  #1391 D8). The gate on every optional wire extension. */
+  hasFeature(f: string): boolean {
+    return this.serverFeatures.has(f);
+  }
+
+  /** Drop the whole negotiated feature set (PRD #1391 M5): after a strict-decode
+   *  rollback fallback succeeds, nothing negotiated is sent again until the process
+   *  restarts (a re-register would re-populate it). */
+  clearFeatures(): void {
+    this.serverFeatures.clear();
+  }
+
+  async heartbeat(
+    stats?: WorkerStats,
+    outbox?: OutboxHeartbeatEntry[],
+    activeSnapshot?: ActiveSnapshot,
+  ): Promise<void> {
     const body: HeartbeatRequest = { version: this.version };
     // Only attach stats when the collector produced a sample (PRD #49): an absent
     // field is the same wire shape as today, so a pre-#49 server ignores the extra
     // bytes and a collector-less tick is indistinguishable from an old worker.
     if (stats) body.stats = stats;
-    await this.postJSON(`${WORKER_API_PREFIX}/heartbeat`, body);
+    // PRD #1391 M5: attach the outbox depth ONLY when the server negotiated
+    // `heartbeat_outbox` AND there is something to report, so an api that never
+    // advertised it sees a byte-identical heartbeat.
+    const includeOutbox = this.hasFeature("heartbeat_outbox") && outbox !== undefined && outbox.length > 0;
+    if (includeOutbox) body.outbox = outbox;
+    // PRD #1390 M2a: attach the active-run snapshot ONLY when the server negotiated
+    // `active_run_snapshot` AND the worker built one, stamped with the register nonce so the
+    // api can trust its epoch across a restart. Same "byte-identical wire on an old api" shape
+    // as `outbox`.
+    const includeSnapshot = this.hasFeature("active_run_snapshot") && activeSnapshot !== undefined;
+    if (includeSnapshot) body.active_snapshot = { ...activeSnapshot, register_nonce: this.registerNonce };
+    const includeExtension = includeOutbox || includeSnapshot;
+    try {
+      await this.postJSON(`${WORKER_API_PREFIX}/heartbeat`, body);
+    } catch (err) {
+      // Rollback fallback (PRD #1391 M5, extended by #1390 M2a): a rolled-back api that no
+      // longer knows a negotiated heartbeat extension strict-decodes it as an unknown field
+      // and answers a generic `invalid request body` 400. Retry the SAME heartbeat ONCE with
+      // EVERY negotiated extension stripped (both `outbox` AND `active_snapshot`); if the
+      // stripped retry SUCCEEDS, clear the WHOLE cached feature set so nothing negotiated is
+      // sent again until process restart. A heartbeat must NEVER be lost to a rolled-back api,
+      // so a stripped success is the outcome, not the original 400. Deliberately WHOLE-SET, not
+      // surgical: the sticky `credential_switch_v1` capability lives separately from
+      // `serverFeatures` and is NOT cleared, so `includeClaimGeneration` keeps stamping
+      // `claim_generation` for a capability worker after this clear.
+      if (!includeExtension || !isStrictDecodeError(err)) throw err;
+      const stripped: HeartbeatRequest = { version: this.version };
+      if (stats) stripped.stats = stats;
+      await this.postJSON(`${WORKER_API_PREFIX}/heartbeat`, stripped);
+      this.clearFeatures();
+      this.log.warn(
+        "heartbeat extension rejected by a rolled-back api; retried stripped and cleared the negotiated feature set",
+        {},
+      );
+    }
   }
 
   /** Claim the oldest queued run for this worker's user (the RUN lane — no lane
-   *  param, back-compat with older servers). Returns null on 204. */
-  async claimRun(): Promise<ClaimResponse | null> {
-    const res = await this.fetchRaw("POST", `${WORKER_API_PREFIX}/runs/claim`, {});
+   *  param, back-compat with older servers). Returns null on 204.
+   *
+   *  PRD #1390 M2a: carries the worker's {@link ActiveSnapshot} in the claim body when
+   *  `active_run_snapshot` is negotiated AND the worker built one (nonce-stamped), so the
+   *  api's pre-claim dedupe sees the runs this worker is already executing BEFORE the first
+   *  post-outage heartbeat lands. If not negotiated the claim posts an empty body `{}`, which
+   *  an old api ignores (harmless — the run-lane claim was bodyless before this). */
+  async claimRun(activeSnapshot?: ActiveSnapshot): Promise<ClaimResponse | null> {
+    const body: ClaimRequest = {};
+    if (this.hasFeature("active_run_snapshot") && activeSnapshot !== undefined) {
+      body.active_snapshot = { ...activeSnapshot, register_nonce: this.registerNonce };
+    }
+    const res = await this.fetchRaw("POST", `${WORKER_API_PREFIX}/runs/claim`, body);
     if (res.status === 204) return null;
     if (res.status >= 400) throw await this.toError("POST", `${WORKER_API_PREFIX}/runs/claim`, res);
     return (await res.json()) as ClaimResponse;
@@ -335,15 +482,74 @@ export class WorkerClient {
     return (await res.json()) as ChatClaimResponse;
   }
 
-  async postMessages(runId: string, messages: OutgoingMessage[], signal?: AbortSignal): Promise<void> {
-    if (messages.length === 0) return;
-    const body: MessagesRequest = { messages };
-    await this.postJSON(
-      `${WORKER_API_PREFIX}/runs/${runId}/messages`,
-      body,
-      this.httpTimeoutMs,
-      signal,
+  /**
+   * The send-gate for `claim_generation` (PRD #1247 fix round). `0` is chat's legacy
+   * sentinel and is NEVER sent (the batcher passes `this.generation`, default 0, and
+   * ChatRunner sets `generation: 0`; any CLAIMED work run is generation >= 1). A
+   * `credential_switch_v1` capability worker stamps OPTIMISTICALLY — its runs are fenced
+   * server-side, and a one-shot register may have missed the negotiated feature under
+   * rollout skew — while a non-capability (#1391-era) worker keeps the feature gate.
+   */
+  private includeClaimGeneration(generation?: number): boolean {
+    return (
+      generation !== undefined &&
+      generation > 0 &&
+      (this.hasCredentialSwitchCapability || this.hasFeature("claim_generation_fence"))
     );
+  }
+
+  /**
+   * Run `send(includeField)` with the shared skew-safe fallback (PRD #1247 fix round).
+   * REUSABLE: a later milestone drives the completion RPCs through it too. When `included`
+   * is true and the api answers the EXACT strict-decode 400 (a rolled-back api that
+   * strict-decodes `claim_generation` as an unknown field, `isStrictDecodeError`), retry
+   * ONCE with the field stripped and classify only that second response; a capability
+   * worker stays OPTIMISTIC (features NOT cleared) so the next request self-recovers once
+   * the api rolls forward, while a non-capability worker calls clearFeatures() (today's
+   * sticky behavior). A genuine (non-strict-decode) 400 — e.g. an unstorable/invalid
+   * message — propagates unchanged, so it is never mistaken for a rollback and the field
+   * is never stripped off a genuine-poison request.
+   */
+  private async withGenerationFallback<T>(
+    included: boolean,
+    send: (includeField: boolean) => Promise<T>,
+  ): Promise<T> {
+    try {
+      return await send(included);
+    } catch (err) {
+      if (!included || !isStrictDecodeError(err)) throw err;
+      if (!this.hasCredentialSwitchCapability) this.clearFeatures();
+      return await send(false);
+    }
+  }
+
+  async postMessages(
+    runId: string,
+    messages: OutgoingMessage[],
+    generation?: number,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    if (messages.length === 0) return;
+    const path = `${WORKER_API_PREFIX}/runs/${runId}/messages`;
+    // PRD #1247 fix round: stamp the claim generation through the shared send-gate. A
+    // credential_switch_v1 capability worker stamps OPTIMISTICALLY (its runs are fenced
+    // server-side, so a register that missed the negotiated `claim_generation_fence`
+    // feature under rollout skew must not silently drop the fence); a non-capability
+    // (#1391-era) worker keeps the feature gate. `0` is chat's legacy sentinel and is
+    // never sent. On the EXACT strict-decode 400 from a rolled-back api the field is
+    // stripped and the identical batch retried ONCE — the batcher classifies only that
+    // second response, so it sees exactly one outcome. A capability worker does NOT clear
+    // its features on the fallback (it stays optimistic, so the next batch self-recovers
+    // once the api rolls forward); a non-capability worker clears them (sticky, as today).
+    // A genuine unstorable/invalid-message 400 has a DIFFERENT body and propagates
+    // unchanged, so the batcher's bisection still runs and the generation is never
+    // stripped off a genuine-poison batch.
+    const included = this.includeClaimGeneration(generation);
+    await this.withGenerationFallback(included, (includeField) => {
+      const body: MessagesRequest = { messages };
+      if (includeField) body.claim_generation = generation;
+      return this.postJSON(path, body, this.httpTimeoutMs, signal);
+    });
   }
 
   /**
@@ -374,6 +580,27 @@ export class WorkerClient {
    */
   async reportState(runId: string, body: StateRequest, signal?: AbortSignal): Promise<StateAck> {
     const path = `${WORKER_API_PREFIX}/runs/${runId}/state`;
+    // PRD #1247 fix round (E): /state carries claim_generation on EVERY mutating report (M5b's
+    // reportState closure stamps it), but /state DisallowUnknownFields-decodes, so a rolled-back api
+    // that predates the field 400s the report and — force-roll off — a busy newer worker wedges every
+    // run. Route the report through the SAME send-gate + skew-safe fallback as postMessages and the
+    // completion RPCs: stamp the field ONLY for a generation>0 capability/feature worker, and on the
+    // EXACT strict-decode 400 strip it and retry the identical report ONCE (capability non-sticky so
+    // it self-recovers on roll-forward; non-capability sticky, as today). This also makes a <=v0.82
+    // claim (generation ?? 0) OMIT the key rather than send 0. The transient-retry loop, AbortSignal,
+    // 200/409 single-body ACK parse, already-terminal handling and logging are preserved per variant
+    // in reportStateOnce, so the fallback only toggles whether claim_generation is on the wire.
+    const included = this.includeClaimGeneration(body.claim_generation);
+    return this.withGenerationFallback(included, (includeField) =>
+      this.reportStateOnce(runId, path, includeField ? body : { ...body, claim_generation: undefined }, signal),
+    );
+  }
+
+  /** One /state POST WITH the given body, including the transient-retry loop, AbortSignal
+   *  handling, 200/409 single-body ACK parse, already-terminal handling and logging. Split out of
+   *  reportState (PRD #1247 fix round E) so the claim_generation send-gate + strict-decode
+   *  strip-and-retry can drive it through withGenerationFallback, exactly as postMessages. */
+  private async reportStateOnce(runId: string, path: string, body: StateRequest, signal?: AbortSignal): Promise<StateAck> {
     for (let attempt = 0; ; attempt++) {
       signal?.throwIfAborted();
       try {
@@ -421,6 +648,16 @@ export class WorkerClient {
           if (fields.reason !== undefined) ack.reason = fields.reason;
           if (fields.recoveryRetryNotBefore !== undefined)
             ack.recoveryRetryNotBefore = fields.recoveryRetryNotBefore;
+          // PRD #1247 M5b: fold the top-level held-state credential-switch signal and the
+          // stale-claim disposition off the SAME single-use body. A stale-claim 409 is still
+          // returned as {applied:false, staleClaim:true}; the runner's reportState closure throws
+          // StaleClaimError on that flag to stop the superseded flight.
+          if (fields.credentialSwitch !== undefined)
+            ack.credentialSwitch = fields.credentialSwitch;
+          if (fields.staleClaim !== undefined)
+            ack.staleClaim = fields.staleClaim;
+          if (fields.credentialSwitchReleased !== undefined)
+            ack.credentialSwitchReleased = fields.credentialSwitchReleased;
           if (!ack.applied) {
             this.log.info("state report not applied server-side", {
               run_id: runId,
@@ -599,9 +836,12 @@ export class WorkerClient {
     )) as RecoveryHoldsResponse;
   }
 
-  async getInputs(runId: string): Promise<UserInput[]> {
+  async getInputs(runId: string): Promise<{ inputs: UserInput[]; credentialSwitch?: { generation: number } }> {
     const res = (await this.getJSON(`${WORKER_API_PREFIX}/runs/${runId}/inputs`)) as InputsResponse;
-    return res.inputs ?? [];
+    // PRD #1247 M5b: the held-state credential-switch signal rides EVERY inputs response (including
+    // an empty-inputs poll), surfaced beside the inputs. The runner's poll trips the switch off it
+    // (steering.maybeTripCredentialSwitch); a legacy caller that reads only `.inputs` is unaffected.
+    return { inputs: res.inputs ?? [], credentialSwitch: res.credential_switch };
   }
 
   /** issue #559: lightweight read-only ownership/terminality probe for the interactive
@@ -610,6 +850,37 @@ export class WorkerClient {
    *  error via `err.status`. Reuses GetRunOwnedByWorker server-side; no new query. */
   async getRunOwnership(runId: string): Promise<RunOwnershipResponse> {
     return (await this.getJSON(`${WORKER_API_PREFIX}/runs/${runId}/ownership`)) as RunOwnershipResponse;
+  }
+
+  /** PRD #1391 Run B M3 (D3): read a page of a run's MISSING message-seq ranges in `[1..through]`
+   *  (GET /worker/runs/{id}/message-gaps?claim_generation=G&through=N&limit=&cursor=), index-backed
+   *  and keyset-paginated so the read never materialises N rows. The terminal-resolve path calls it
+   *  when the fence refused a terminal report `messages_pending`: it fills each missing seq with a
+   *  per-seq "unrecoverable gap" tombstone, then re-sends. `cursor` (the previous page's
+   *  `next_cursor`) resumes the walk; omit it (or 0) to start from the head. Throws a RequestError on
+   *  4xx/5xx (a 404 = run not owned at this exact generation). */
+  async getMessageGaps(
+    runId: string,
+    claimGeneration: number,
+    through: number,
+    limit?: number,
+    cursor?: number,
+  ): Promise<MessageGapsResponse> {
+    const params = new URLSearchParams({
+      claim_generation: String(claimGeneration),
+      through: String(through),
+    });
+    if (limit !== undefined) params.set("limit", String(limit));
+    if (cursor !== undefined && cursor > 0) params.set("cursor", String(cursor));
+    const res = (await this.getJSON(
+      `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/message-gaps?${params.toString()}`,
+    )) as MessageGapsResponse;
+    // Total-by-construction: an older/absent body yields an empty page (no gaps, no next cursor),
+    // which the resolve path reads as "nothing to fill" rather than throwing.
+    return {
+      gaps: Array.isArray(res?.gaps) ? res.gaps : [],
+      ...(typeof res?.next_cursor === "number" ? { next_cursor: res.next_cursor } : {}),
+    };
   }
 
   /** issue #1319 — the orphan-classification read: authoritative identity of a clone-orphan
@@ -710,17 +981,36 @@ export class WorkerClient {
    *  RequestError on non-2xx (409 stale claim, 400 not interlocked) — the caller decides. */
   async recordCompletionAttempt(
     runId: string,
-    args: { milestonesCompleted: string[]; head: string | null; worktreeFingerprint: string | null },
+    args: {
+      milestonesCompleted: string[];
+      head: string | null;
+      worktreeFingerprint: string | null;
+      claimGeneration?: number;
+    },
   ): Promise<{ unmet: string[]; attemptCount: number }> {
-    const body: CompletionAttemptRequest = {
-      milestones_completed: args.milestonesCompleted,
-      head: args.head,
-      worktree_fingerprint: args.worktreeFingerprint,
-    };
-    const res = (await this.postJSON(
-      `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/completion/attempt`,
-      body,
-    )) as CompletionAttemptResponse;
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/completion/attempt`;
+    // PRD #1247 fix round: stamp the claim-lane generation through the shared send-gate so a
+    // completion attempt racing a rollback recovers instead of hard-400ing. A
+    // credential_switch_v1 capability worker stamps OPTIMISTICALLY (its runs are fenced
+    // server-side, so a register that missed the negotiated `claim_generation_fence` feature
+    // under rollout skew must not silently drop the fence); a non-capability (#1391-era) worker
+    // keeps the feature gate; `0`/unset omits the field. On the EXACT strict-decode 400 from a
+    // rolled-back api the field is stripped and the identical attempt retried ONCE — the
+    // recompute+attempt is server-authoritative in ONE call, so the first (rejected) request
+    // records nothing and the stripped retry applies exactly once. A capability worker stays
+    // optimistic (features NOT cleared, self-recovers once the api rolls forward); a
+    // non-capability worker clears them (sticky, as today). A genuine business 400 (e.g. "not
+    // interlocked") is NOT a strict-decode 400 and propagates unchanged — no strip, no retry.
+    const included = this.includeClaimGeneration(args.claimGeneration);
+    const res = (await this.withGenerationFallback(included, (includeField) => {
+      const body: CompletionAttemptRequest = {
+        milestones_completed: args.milestonesCompleted,
+        head: args.head,
+        worktree_fingerprint: args.worktreeFingerprint,
+      };
+      if (includeField) body.claim_generation = args.claimGeneration;
+      return this.postJSON(path, body);
+    })) as CompletionAttemptResponse;
     return { unmet: res.unmet ?? [], attemptCount: res.attempt_count ?? 0 };
   }
 
@@ -733,17 +1023,31 @@ export class WorkerClient {
    *  transport/HTTP error (the denial is a 200 body, not a 4xx). */
   async requestCompletionPermit(
     runId: string,
-    args: { contractRevision: number; branch: string; head: string },
+    args: { contractRevision: number; branch: string; head: string; claimGeneration?: number },
   ): Promise<CompletionPermitResult> {
-    const body: CompletionPermitRequest = {
-      contract_revision: args.contractRevision,
-      branch: args.branch,
-      head: args.head,
-    };
-    const res = (await this.postJSON(
-      `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/completion/permit`,
-      body,
-    )) as CompletionPermitResponse;
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/completion/permit`;
+    // PRD #1247 fix round: stamp the claim-lane generation through the shared send-gate so a
+    // permit request racing a rollback recovers instead of hard-400ing. A credential_switch_v1
+    // capability worker stamps OPTIMISTICALLY (its runs are fenced server-side, so a register
+    // that missed the negotiated `claim_generation_fence` feature under rollout skew must not
+    // silently drop the fence); a non-capability (#1391-era) worker keeps the feature gate;
+    // `0`/unset omits the field. On the EXACT strict-decode 400 from a rolled-back api the field
+    // is stripped and the identical request retried ONCE — permit ISSUANCE is idempotent
+    // server-side, and the first (rejected) request issues nothing, so the stripped retry issues
+    // exactly once. A capability worker stays optimistic (features NOT cleared, self-recovers
+    // once the api rolls forward); a non-capability worker clears them (sticky, as today). A
+    // granted:false denial is a 200 body, not an error, so it never reaches the fallback; a
+    // genuine transport/HTTP 400 that is NOT a strict-decode 400 propagates unchanged.
+    const included = this.includeClaimGeneration(args.claimGeneration);
+    const res = (await this.withGenerationFallback(included, (includeField) => {
+      const body: CompletionPermitRequest = {
+        contract_revision: args.contractRevision,
+        branch: args.branch,
+        head: args.head,
+      };
+      if (includeField) body.claim_generation = args.claimGeneration;
+      return this.postJSON(path, body);
+    })) as CompletionPermitResponse;
     const result: CompletionPermitResult = { granted: res.granted ?? false };
     if (res.deny_reason !== undefined) result.denyReason = res.deny_reason;
     if (res.unmet !== undefined) result.unmet = res.unmet;
@@ -769,17 +1073,39 @@ export class WorkerClient {
    *  body (paused on a landed hold, the real status on a refusal); an unmodelled 2xx or an
    *  unreadable body yields "" (never "paused" ⇒ retain, the safe default). A genuine transport
    *  error or a non-200/409 4xx/5xx still throws RequestError. */
-  async requestCompletionHold(runId: string, args: { head: string }): Promise<{ status: string }> {
+  async requestCompletionHold(
+    runId: string,
+    args: { head: string; claimGeneration?: number },
+  ): Promise<{ status: string }> {
     const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/completion/hold`;
-    const res = await this.fetchRaw("POST", path, { head: args.head });
-    if (res.status === 200 || res.status === 409) {
-      const fields = await readRunAck(res);
-      return { status: fields.status ?? "" };
-    }
-    if (res.status >= 400) throw await this.toError("POST", path, res);
-    // A 2xx we do not model (e.g. 204 from an older server): no status came back, which is
-    // not "paused" and so retains the run.
-    return { status: "" };
+    // PRD #1247 fix round: stamp the claim-lane generation through the shared send-gate so a
+    // hold request racing a rollback recovers instead of hard-400ing. A credential_switch_v1
+    // capability worker stamps OPTIMISTICALLY (its runs are fenced server-side, so a register
+    // that missed the negotiated `claim_generation_fence` feature under rollout skew must not
+    // silently drop the fence); a non-capability (#1391-era) worker keeps the feature gate;
+    // `0`/unset omits the field. The whole fetchRaw + 200/409 readRunAck read runs INSIDE the
+    // closure, so a stripped retry re-runs the identical request and preserves the 200/409
+    // semantics (a 409 is a refusal that RETAINS the run, NOT an error — it returns the run's
+    // real status). Only a genuine non-200/409 throw reaches the fallback; a rolled-back api
+    // answers the completion fence field with a strict-decode 400 (NOT a 409), which the fallback
+    // catches and retries stripped ONCE — the first (rejected) request parks nothing, so the
+    // retry applies exactly once. A capability worker stays optimistic (features NOT cleared,
+    // self-recovers once the api rolls forward); a non-capability worker clears them (sticky, as
+    // today). A genuine non-200/409 4xx/5xx that is NOT a strict-decode 400 propagates unchanged.
+    const included = this.includeClaimGeneration(args.claimGeneration);
+    return this.withGenerationFallback(included, async (includeField) => {
+      const body: { head: string; claim_generation?: number } = { head: args.head };
+      if (includeField) body.claim_generation = args.claimGeneration;
+      const res = await this.fetchRaw("POST", path, body);
+      if (res.status === 200 || res.status === 409) {
+        const fields = await readRunAck(res);
+        return { status: fields.status ?? "" };
+      }
+      if (res.status >= 400) throw await this.toError("POST", path, res);
+      // A 2xx we do not model (e.g. 204 from an older server): no status came back, which is
+      // not "paused" and so retains the run.
+      return { status: "" };
+    });
   }
 
   // ── Inline run summaries (PRD #362 M3c) ────────────────────────────────────
@@ -1087,6 +1413,9 @@ export async function readRunAck(res: Response): Promise<{
   budgetExhausted?: boolean;
   reason?: string;
   recoveryRetryNotBefore?: string;
+  credentialSwitch?: { generation: number };
+  staleClaim?: boolean;
+  credentialSwitchReleased?: boolean;
 }> {
   try {
     const text = await res.text();
@@ -1106,6 +1435,10 @@ export async function readRunAck(res: Response): Promise<{
         // PRD #1392 M2 (D10): the retry-not-before stamp is a FIELD ON the RunDTO.
         recovery_retry_not_before?: unknown;
       };
+      // PRD #1247 M5b: the held-state signal + stale-claim disposition ride TOP-LEVEL,
+      // beside `run`, not inside it.
+      credential_switch?: unknown;
+      disposition?: unknown;
     };
     const run = parsed?.run;
     const out: {
@@ -1119,6 +1452,9 @@ export async function readRunAck(res: Response): Promise<{
       budgetExhausted?: boolean;
       reason?: string;
       recoveryRetryNotBefore?: string;
+      credentialSwitch?: { generation: number };
+      staleClaim?: boolean;
+      credentialSwitchReleased?: boolean;
     } = {};
     if (typeof run?.status === "string") out.status = run.status;
     if (typeof run?.budget_max_iterations === "number")
@@ -1159,10 +1495,38 @@ export async function readRunAck(res: Response): Promise<{
     if (typeof parsed?.reason === "string") out.reason = parsed.reason;
     if (typeof run?.recovery_retry_not_before === "string")
       out.recoveryRetryNotBefore = run.recovery_retry_not_before;
+    // PRD #1247 M5b: the held-state credential-switch signal and the stale-claim disposition ride
+    // the SAME single-use body, TOP-LEVEL beside `run` (present on the 200 ack, the ordinary 409,
+    // and — for stale_claim — the superseded/released 409). Both additive + optional and
+    // total-by-construction like the rest of this parse: a malformed/absent value leaves the field
+    // undefined. M5b acts on them — MINOR-7 trips the switch off credentialSwitch, and the
+    // reportState closure throws StaleClaimError off staleClaim.
+    const cs = parsed?.credential_switch;
+    if (typeof cs === "object" && cs !== null && typeof (cs as { generation?: unknown }).generation === "number")
+      out.credentialSwitch = { generation: (cs as { generation: number }).generation };
+    if (parsed?.disposition === "stale_claim") out.staleClaim = true;
+    // PRD #1247 M5b (BLOCKING-2 rework): the held-state credential-switch RELEASE applied. The
+    // server sets it on the 200 ack for BOTH a fresh requeue (status 'queued') and an idempotent
+    // release after a reclaim (status 'running'), so enterCredentialSwitch accepts the release off
+    // this flag rather than off status === 'queued' (which missed the idempotent case).
+    if (parsed?.disposition === "released") out.credentialSwitchReleased = true;
     return out;
   } catch {
     return {};
   }
+}
+
+/**
+ * The generic strict-decode signal (PRD #1391 D9): a 400 whose body is the api's
+ * generic `invalid request body` answer — what a rolled-back api returns when it
+ * strict-decodes an unknown field (a negotiated wire extension it no longer knows).
+ * Keyed ONLY on that body, so the dedicated unstorable-message 400 (a DIFFERENT
+ * body/reason from the messages route) and the invalid-message 400 never match — they
+ * must propagate so the batcher's bisection still runs. A typed code is preferred if
+ * the api gains one; until then the body string is the discriminator the PRD names.
+ */
+export function isStrictDecodeError(err: unknown): boolean {
+  return err instanceof RequestError && err.status === 400 && /invalid request body/i.test(err.body);
 }
 
 /** Retryable: transport failures, 5xx, and 408/429; permanent otherwise. */

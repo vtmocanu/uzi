@@ -476,7 +476,15 @@ owner's default token (recorded `pool_empty`) rather than holding in
 `pool_wait` as the run lane does, because a held retrospective carries no
 issue, no branch and nobody's attention, and would silently pile up. Because
 the token rides the claim rather than the worker, re-pointing a worker is
-complete server-side — no restart, no re-minted join token.
+complete server-side — no restart, no re-minted join token. Since PRD #1247
+`claimSecretID` also consults, ahead of the worker's own bind mode, a
+per-run (or per-schedule) credential override the owner can set or change at
+any time — queued, parked, at the plan gate, or mid-run — and a mid-run
+switch never rewrites a live claim in place: it reuses the same custody
+`runs.claim_generation` (below) plus a new `claim_released_at` fence to force
+the switch to cross an actual claim boundary, so the run always resumes with
+the new token rather than swapping it out from under a running turn; see
+[adr/1247-per-run-token-selection.md](adr/1247-per-run-token-selection.md).
 
 Since PRD #111 the bind mode is three-valued — `default`, `pinned` or `auto`
 — and `auto` ranks the owner's opted-in tokens by rate-limit headroom
@@ -986,9 +994,18 @@ chain in the diagram above, with no intervening `running`.
   5 minutes is re-queued; a running run older than `RUN_TIMEOUT` (default 2h)
   is failed; a worker whose heartbeat is stale past `WORKER_HEARTBEAT_STALE`
   (default 45s) is marked offline and its non-terminal runs re-queued,
-  incrementing `requeue_count` — past `RUN_MAX_REQUEUES` (default 1) a run is
-  failed instead of re-queued again. An orphan sweep also runs once at API
-  boot, so a run left dangling by a server restart is not stuck forever.
+  incrementing `requeue_count` — only after a *second* consecutive stale
+  window is the run failed instead of re-queued again, giving a worker that
+  briefly lost the api time to return (issue #1390). An orphan sweep also
+  runs once at API boot, but its three stale-worker passes (offline-marking,
+  over-cap fail, re-queue) are held off for `SWEEPER_BOOT_GRACE` (default 60s)
+  after the api's listeners are ready — every other boot pass runs as usual —
+  so a worker that only lost the api — not its own health — is not wrongly
+  declared dead; on its next
+  heartbeat, a worker's reported active-run snapshot re-adopts any run the
+  outage flipped to `queued` back to its exact phase, with no re-queue
+  budget spent and no new custody hold (issue #1390). `uzi worker list` and
+  `uzi admin workers` show each worker's reported runs and their phase.
 - **Cancel/reject with no live poller** (a `queued` run, or one whose worker
   has gone stale) is transitioned straight to `cancelled`/`failed`
   server-side rather than waiting on a `GET /api/worker/runs/:id/inputs` poll

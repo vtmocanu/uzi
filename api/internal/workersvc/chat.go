@@ -211,7 +211,10 @@ func (s *Service) assembleChatClaim(ctx context.Context, run store.Run) (*ChatCl
 	// reasons. Its second argument is unreachable here by construction (a nil override
 	// is `default` whatever it says), and it is spelled selectReasonDefault rather than
 	// a placeholder so a reader does not have to check.
-	if err := s.recordRunCredential(ctx, run, cred, staticChoice(nil, selectReasonDefault)); err != nil {
+	// emitSwitchMessage=false: chat is deliberately unbindable (D5), so it can never switch tokens
+	// and never emits a 'credential_switch' message. The returned last_seq is discarded (chat sets
+	// its ClaimPayload.LastSeq from run.LastSeq / the resume session directly).
+	if _, err := s.recordRunCredential(ctx, run, cred, staticChoice(nil, selectReasonDefault), false); err != nil {
 		return nil, err
 	}
 	anthropic := cred.Token

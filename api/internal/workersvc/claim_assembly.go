@@ -85,6 +85,46 @@ func workerIdentity(wkr store.Worker) string {
 	return wkr.ID.String()
 }
 
+// resumePhaseFor derives the phase a resumed claim should RESTORE, from the persisted run row
+// (PRD #1247 M5, D13). planApproved is the value assembleClaim already computes
+// (run.AutoApprove || rc.HumanPlanApproved || run.PlanSource == planSourceSeeded). Ordered, and
+// the order matters:
+//
+//  1. OpenQuestionID set  -> "awaiting_input". Checked FIRST and unconditionally: every other
+//     transition clears a resolved open_question_id (the "NO SETTER MAY LEAVE A RESOLVED
+//     open_question_id BEHIND" invariant, runtime.sql), so a non-null id can ONLY mean the run's
+//     held state was awaiting_input — even when planApproved is independently true (a mid-run
+//     clarification, PRD #88).
+//  2. has plan && planApproved -> "implementing". The approved-plan resume the worker already
+//     skips the planning turn for (preApproved). This bucket ALSO absorbs a released
+//     awaiting_followup run: awaiting_followup is NOT distinguishable from implementing once a
+//     run is released to queued (ReleaseCredentialSwitch records no source state and
+//     open_followup_id is a monotone ratchet), so it collapses here by design. That is safe:
+//     the worker's existing interactive-resume logic (Interactive + StopPending + follow-up
+//     inputs, all still delivered on the claim) drives the idle-for-follow-up behaviour exactly
+//     as it does today, with or without resume_phase.
+//  3. has plan && !planApproved && SessionID set -> "awaiting_approval". A plan was submitted
+//     (SetRunAwaitingApproval sets plan_md + plan_source='agent' + session_id and clears
+//     auto_approve + open_question_id) and not yet approved; the session exists to resume, so
+//     the worker restores the GATE with plan_md rather than re-planning. SessionID is required
+//     because a gate restore needs a resumable session; SetRunAwaitingApproval always sets it,
+//     so this is a safety guard, not a common exclusion.
+//  4. else -> "". A fresh queued run (plan_md null, session_id null) falls through here, and the
+//     worker plans normally.
+func resumePhaseFor(run store.Run, planApproved bool) string {
+	hasPlan := run.PlanMd.Valid && strings.TrimSpace(run.PlanMd.String) != ""
+	switch {
+	case run.OpenQuestionID.Valid && strings.TrimSpace(run.OpenQuestionID.String) != "":
+		return "awaiting_input"
+	case hasPlan && planApproved:
+		return "implementing"
+	case hasPlan && !planApproved && run.SessionID.Valid && strings.TrimSpace(run.SessionID.String) != "":
+		return "awaiting_approval"
+	default:
+		return ""
+	}
+}
+
 // assembleClaim builds the claim payload for an already-claimed run. It takes the
 // CLAIMING worker, not just the run, because since PRD #104 M3 the credential a
 // run spends can depend on which worker picked it up.
@@ -161,7 +201,16 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	// Record it before anything else can fail (PRD #111 M1): the credential HAS been
 	// opened at this point, so from the run's perspective it is already the account
 	// this claim commits to, whether or not the rest of assembly succeeds.
-	if err := s.recordRunCredential(ctx, run, cred, choice); err != nil {
+	//
+	// PRD #1247 M9 (task c): the RUN LANE passes emitSwitchMessage=true, so recordRunCredential
+	// emits a 'credential_switch' feed message on an APPLIED token switch (an epoch delta onto a
+	// different token) atomically with the credential write, and RETURNS the (possibly bumped)
+	// last_seq — the seq of the server-inserted message, or the run's current high-water mark when
+	// no message was emitted. ClaimPayload.LastSeq MUST be this returned value, not the stale
+	// run.LastSeq snapshot: the worker resumes seq numbering from it, so a stale snapshot would let
+	// it re-use the message's seq and collide.
+	recordedLastSeq, err := s.recordRunCredential(ctx, run, cred, choice, true)
+	if err != nil {
 		return nil, err
 	}
 	anthropic := cred.Token
@@ -322,6 +371,27 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		taskIdleTimeoutSeconds = int(s.p.WorkerTaskIdleTimeout.Seconds())
 	}
 
+	// plan_approved is computed once here so both the PlanApproved field and the
+	// resume_phase derivation (PRD #1247 M5, D13) read the SAME value — see the payload
+	// literal for the full provenance of the three disjuncts.
+	planApproved := run.AutoApprove || rc.HumanPlanApproved || run.PlanSource == planSourceSeeded
+	// PRD #1247 M5, D13: the server-derived phase a resumed claim RESTORES instead of
+	// re-entering the planning turn. Empty for a fresh run (omitted by omitempty).
+	resumePhase := resumePhaseFor(run, planApproved)
+	// The submitted plan's seq rides ONLY the awaiting_approval resume (D13: "awaiting_approval
+	// with the submitted plan's seq"), so the query stays off the hot path for every other
+	// claim. A query error degrades to seq 0 and NEVER fails the claim — the same degrade-and-log
+	// posture as the milestone/issue-comments decodes above; the run still resumes its gate, the
+	// worker just cannot correlate a buffered approve_plan to a specific plan revision.
+	var resumePlanSeq int64
+	if resumePhase == "awaiting_approval" {
+		if seq, err := s.q.LatestPlanSeqForRun(ctx, run.ID); err != nil {
+			slog.Warn("workersvc: latest plan seq for resume", "run_id", run.ID, "error", err)
+		} else {
+			resumePlanSeq = seq
+		}
+	}
+
 	payload := &ClaimPayload{
 		RunID:            run.ID.String(),
 		Kind:             run.Kind,
@@ -339,7 +409,11 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		Branch:         textPtr(branch),
 		SessionID:      textPtr(run.SessionID),
 		CheckpointTip:  textPtr(run.CheckpointTip),
-		LastSeq:        run.LastSeq,
+		// PRD #1247 M9 (task c): the last_seq recordRunCredential actually landed — bumped past any
+		// 'credential_switch' message it just inserted — NOT the stale run.LastSeq snapshot, so the
+		// worker never re-uses the server-inserted message's seq. Equals run.LastSeq when no switch
+		// message was emitted.
+		LastSeq:        recordedLastSeq,
 		IterationCount: run.IterationCount,
 		RequeueCount:   run.RequeueCount,
 		// PRD #1296 M1 (D2): the claim-lane counter the ClaimRun CTE just incremented, read
@@ -399,7 +473,15 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		// GATE by SetRunAwaitingApproval's symmetric auto_approve=false clear — parking a
 		// forceGate ci_fix run for human review clears auto_approve so a restart-requeued
 		// resume re-gates rather than shipping plan_approved=true past no human (runtime.sql).
-		PlanApproved: run.AutoApprove || rc.HumanPlanApproved || run.PlanSource == planSourceSeeded,
+		PlanApproved: planApproved,
+		// PRD #1247 M5 (D13): the server-derived phase to RESTORE on a resume claim, so a run
+		// re-claimed after a held-state credential switch (or any requeue) resumes its held
+		// state — crucially, an UNAPPROVED submitted plan resumes the GATE — instead of
+		// re-entering the planning turn. Derived from the run row by resumePhaseFor just above,
+		// off the SAME planApproved this literal ships. Empty for a fresh run (omitted). The
+		// submitted plan's seq rides ONLY the awaiting_approval phase (0/omitted otherwise).
+		ResumePhase:   resumePhase,
+		ResumePlanSeq: resumePlanSeq,
 		// PlanSource travels to the worker so it can tell D4 row 2 (seeded, no session ⇒
 		// implement) from row 3 (dropped session, not seeded ⇒ re-plan). Server writes
 		// it in M1; the worker consumes it in M2. Additive on the wire — an old worker

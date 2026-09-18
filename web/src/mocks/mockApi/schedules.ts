@@ -1,12 +1,13 @@
 import {
   type CatalogEntry,
+  type CredentialOverride,
   type Schedule,
   type ScheduleInput,
   type SchedulePauseDTO,
   type SchedulePreviewInput,
 } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
-import { mockRepos } from "../data";
+import { mockRepos, mockSecrets } from "../data";
 import { nextRunId } from "../store";
 import { delay, requireSession } from "./shared";
 import { repos } from "./forge";
@@ -27,6 +28,23 @@ function assertGuidanceWithinCap(guidance: string | null | undefined): void {
   if (guidance != null && new TextEncoder().encode(guidance).length > MAX_GUIDANCE_BYTES) {
     throw new ApiError(422, "guidance is too large");
   }
+}
+
+// PRD #1247 M6/M7: map a schedule's WRITE-side credential override ({mode, secret_id?})
+// to the READ-side {mode, label} the DTO carries. {mode:"inherit"} clears it to null; a
+// self_improve schedule 409s any explicit override (the UI never sends one for it, but the
+// mock enforces the same contract so a stray call still fails). Returns the value the row
+// should store; the caller only invokes it when the input carries the field.
+function scheduleOverrideToRead(
+  input: { mode: string; secret_id?: string },
+  target: string,
+): CredentialOverride | null {
+  if (target === "self_improve")
+    throw new ApiError(409, "a self_improve schedule cannot carry a credential override");
+  if (input.mode === "inherit") return null;
+  if (input.mode === "pinned")
+    return { mode: "pinned", label: mockSecrets.find((s) => s.id === input.secret_id)?.label ?? null };
+  return { mode: input.mode, label: null };
 }
 
 // mockScheduleFires computes the next N fire instants (UTC ISO) for a 5-field
@@ -89,7 +107,14 @@ function scheduleDTO(s: Schedule): Schedule {
       nextFireAt = s.run_at;
     }
   }
-  return { ...s, next_fire_at: nextFireAt, next_fires: nextFires };
+  // PRD #1247 M6/M7: the real ScheduleDTO always emits credential_override (null =
+  // inherit), so normalise an unset fixture to null rather than leaving it undefined.
+  return {
+    ...s,
+    credential_override: s.credential_override ?? null,
+    next_fire_at: nextFireAt,
+    next_fires: nextFires,
+  };
 }
 
 const daysFromNow = (d: number, h: number, m = 0): string => {
@@ -509,6 +534,12 @@ export const schedulesApi = {
       wait_on_limit: input.wait_on_limit ?? true,
       // PRD #841: a create stamps the explicit tri-state override, or leaves it null = inherit.
       mr_rework_enabled: input.mr_rework_enabled ?? null,
+      // PRD #1247 M6/M7: a present override translates to the read-side {mode,label};
+      // omitted/null/inherit all store null (inherit). self_improve 409s (in the helper).
+      credential_override:
+        input.credential_override != null
+          ? scheduleOverrideToRead(input.credential_override, target)
+          : null,
       // Sweep-only; new sweeps default to 10 (mirrors the server), unlimited otherwise.
       max_issues: target === "sweep" ? (input.max_issues ?? 10) : null,
       // Guidance on issue/sweep only; null (none) for prompt (re-nulled per target).
@@ -580,6 +611,12 @@ export const schedulesApi = {
     }
     assertGuidanceWithinCap(input.guidance);
     const m: Schedule = { ...cur };
+    // PRD #1247: production validates with allowSelfImprove = (cur.target === "self_improve")
+    // (schedules.go), so converting a non-self_improve schedule TO self_improve is rejected
+    // 400 by validateScheduleConfig BEFORE any credential-override handling — regardless of
+    // whether credential_override is provided, cleared, or omitted.
+    if (input.target === "self_improve" && cur.target !== "self_improve")
+      throw new ApiError(400, "target must be one of: issue, sweep, prompt");
     if (input.target !== undefined) m.target = input.target;
     if (input.timing !== undefined) m.timing = input.timing;
     if (input.issue_iid !== undefined) m.issue_iid = input.issue_iid;
@@ -592,6 +629,14 @@ export const schedulesApi = {
     if (input.wait_on_limit !== undefined) m.wait_on_limit = input.wait_on_limit;
     // PRD #841: replace-semantics — apply when present (explicit null clears to inherit).
     if (input.mr_rework_enabled !== undefined) m.mr_rework_enabled = input.mr_rework_enabled;
+    // PRD #1247 M6/M7: presence-aware seed-and-keep — an OMITTED field leaves the stored
+    // override untouched (unrelated edit), a present {mode:"inherit"} clears it to null,
+    // and any other present value writes the read-side {mode,label}. self_improve 409s.
+    if (input.credential_override !== undefined)
+      m.credential_override =
+        input.credential_override === null
+          ? null
+          : scheduleOverrideToRead(input.credential_override, m.target);
     // Replace-semantics: apply when the key is present (explicit null = unlimited).
     if (input.max_issues !== undefined) m.max_issues = input.max_issues;
     // Same replace-semantics for guidance (explicit null/"" clears to none).

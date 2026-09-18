@@ -1,11 +1,15 @@
-import { describe, it } from "node:test";
+import { afterEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
+import fsp from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 
 import { ReviewRunner, parseTaskReview, fallbackTaskReview, buildReviewPrompt } from "../src/review-runner.js";
+import { Outbox } from "../src/outbox.js";
 import type { SdkQueryFn } from "../src/sdk-executor.js";
 import type { GitCache } from "../src/git.js";
 import type { WorkerClient } from "../src/client.js";
-import type { ClaimResponse, StateRequest, TaskReviewRequest } from "../src/protocol.js";
+import type { ClaimResponse, StateAck, StateRequest, TaskReviewRequest } from "../src/protocol.js";
 import { nullLogger } from "./helpers.js";
 
 // A fake worker client recording the posted task-review + every state report.
@@ -17,6 +21,62 @@ function fakeClient() {
   const client = {
     reportState: async (id: string, body: StateRequest) => {
       calls.states.push({ id, body });
+    },
+    postTaskReview: async (id: string, review: TaskReviewRequest) => {
+      calls.review = { id, review };
+    },
+  } as unknown as WorkerClient;
+  return { client, calls };
+}
+
+// A generation-FENCING fake api (PRD #1247 M2), the review-lane twin of the judge test's. It
+// models a credential_switch_v1 capability worker whose mutating state reports the server fences
+// on the claim generation: a running/completed/failed report with no numeric claim_generation is
+// REFUSED with the 409 shape ({applied:false}). The real client swallows that 409 (never throws),
+// so acceptance is observed via `accepted`/`refused`. Threading in place ⇒ nothing refused;
+// reverting it reddens the lane test.
+function fencedFakeClient() {
+  const MUTATING = new Set(["running", "completed", "failed"]);
+  const calls: {
+    review?: { id: string; review: TaskReviewRequest };
+    accepted: { id: string; body: StateRequest }[];
+    refused: { id: string; body: StateRequest }[];
+  } = { accepted: [], refused: [] };
+  const client = {
+    reportState: async (id: string, body: StateRequest) => {
+      if (MUTATING.has(body.status) && typeof body.claim_generation !== "number") {
+        calls.refused.push({ id, body });
+        return { applied: false, status: "running" } as never;
+      }
+      calls.accepted.push({ id, body });
+      return { applied: true, status: body.status } as never;
+    },
+    postTaskReview: async (id: string, review: TaskReviewRequest) => {
+      calls.review = { id, review };
+    },
+  } as unknown as WorkerClient;
+  return { client, calls };
+}
+
+// A fake api that returns staleClaim on the INITIAL `running` report — models a review claim
+// SUPERSEDED by an ordinary stale-worker requeue + reclaim. PRD #1247 fix round (Greptile P1):
+// the runner must abandon cleanly BEFORE any clone/diff/model/advice/completed/failed work, so a
+// superseded flight cannot overwrite the current review.
+function staleRunningFakeClient(staleOnRunningIndex = 1) {
+  let runningCount = 0;
+  const calls: {
+    review?: { id: string; review: TaskReviewRequest };
+    states: { id: string; body: StateRequest }[];
+  } = { states: [] };
+  const client = {
+    reportState: async (id: string, body: StateRequest) => {
+      calls.states.push({ id, body });
+      if (body.status === "running") {
+        runningCount++;
+        if (runningCount === staleOnRunningIndex) return { applied: false, staleClaim: true } as never;
+        return { applied: true, status: "running" } as never;
+      }
+      return { applied: true, status: body.status } as never;
     },
     postTaskReview: async (id: string, review: TaskReviewRequest) => {
       calls.review = { id, review };
@@ -150,6 +210,129 @@ describe("ReviewRunner", () => {
     assert.equal(gitCalls.removeRunnerClone, 0, "a review makes no working-tree clone");
   });
 
+  // PRD #1247 M2 fix round: the review reports state DIRECTLY (not through the RunRunner stamping
+  // closure), so it threads the claim's run-lane generation onto both the running and completed
+  // reports.
+  it("stamps the claim generation on the running and completed reports (PRD #1247 M2)", async () => {
+    const { client, calls } = fakeClient();
+    const { git } = fakeGit("diff --git a/poller.ts b/poller.ts\n@@ -1 +1 @@\n-old\n+new\n");
+    const runner = new ReviewRunner(client, git, nullLogger(), { queryFn: replyingQueryFn(goodModelJson) });
+    await runner.execute(reviewClaim({ claim_generation: 9 }));
+
+    const mutating = calls.states.filter((s) => s.body.status === "running" || s.body.status === "completed");
+    // PRD #1247 fix round adds a SECOND idempotent `running` probe immediately before the advice
+    // write, so the happy path is running (initial) → running (pre-post probe) → completed.
+    assert.deepEqual(
+      mutating.map((s) => s.body.status),
+      ["running", "running", "completed"],
+    );
+    for (const s of mutating) {
+      assert.equal(s.body.claim_generation, 9, `the ${s.body.status} report carries the claim generation`);
+    }
+  });
+
+  // The failed report (here, the no-target early-exit through safeReportFailed) also carries the
+  // generation, so a capability worker's review FAILURE is fenced, not 409'd.
+  it("stamps the claim generation on the failed report (PRD #1247 M2)", async () => {
+    const { client, calls } = fakeClient();
+    const { git } = fakeGit("diff\n");
+    const runner = new ReviewRunner(client, git, nullLogger(), { queryFn: forbiddenQueryFn() });
+    await runner.execute(reviewClaim({ review_target_run_id: null, claim_generation: 4 }));
+    assert.equal(calls.states.at(-1)?.body.status, "failed");
+    assert.equal(calls.states.at(-1)?.body.claim_generation, 4, "the failed report carries the claim generation");
+  });
+
+  // Lane-acceptance: a capability worker's review run is ACCEPTED by a generation-fencing api.
+  // Reverting the threading routes the mutating reports to `refused` (409) and reddens this.
+  it("a capability worker's review run is ACCEPTED (not 409) by a generation-fencing api (PRD #1247 M2)", async () => {
+    const { client, calls } = fencedFakeClient();
+    const { git } = fakeGit("diff --git a/poller.ts b/poller.ts\n@@ -1 +1 @@\n-old\n+new\n");
+    const runner = new ReviewRunner(client, git, nullLogger(), { queryFn: replyingQueryFn(goodModelJson) });
+    await runner.execute(reviewClaim({ claim_generation: 7 }));
+
+    assert.deepEqual(calls.refused, [], "the fence refuses no mutating report — all carry the generation");
+    assert.deepEqual(
+      calls.accepted.map((s) => s.body.status),
+      ["running", "running", "completed"],
+      "all mutating reports (initial running, pre-post running probe, completed) are accepted by the fence",
+    );
+    for (const s of calls.accepted) {
+      assert.equal(s.body.claim_generation, 7, `the accepted ${s.body.status} report carries the claim generation`);
+    }
+    assert.equal(calls.review?.review.status, "complete", "the review still posts on the accepted lane");
+  });
+
+  // PRD #1247 fix round (Greptile P1): a review claim superseded before its first report gets
+  // staleClaim on `running`; the runner must ABANDON cleanly — no clone, no diff, no model, no
+  // advice POST, no completed/failed report — so a stale flight cannot overwrite the current review.
+  it("abandons a stale-claimed review run at the running report with zero clone/diff/advice work (PRD #1247 fix round)", async () => {
+    const { client, calls } = staleRunningFakeClient(1);
+    const { git, calls: gitCalls } = fakeGit("diff --git a/x b/x\n+one\n");
+    const runner = new ReviewRunner(client, git, nullLogger(), { queryFn: forbiddenQueryFn() });
+    await runner.execute(reviewClaim({ claim_generation: 5 }));
+
+    assert.deepEqual(
+      calls.states.map((s) => s.body.status),
+      ["running"],
+      "only the running report is sent; no completed/failed after staleClaim",
+    );
+    assert.equal(gitCalls.ensureClone, 0, "no clone after a stale running ack");
+    assert.deepEqual(gitCalls.reviewDiff, [], "no diff after a stale running ack");
+    assert.equal(calls.review, undefined, "no task review is posted after a stale running ack");
+  });
+
+  // PRD #1247 fix round (Greptile P1, pre-post probe): the most reachable window — the model runs
+  // (minutes) while a stale requeue + same-worker reclaim advances the run to G+1. The initial ack
+  // was fresh, so the clone/diff/model run; the PRE-POST probe catches the supersession and abandons
+  // BEFORE the advice write, so the stale flight posts NO review and NO completed. Reverting the
+  // pre-post probe reddens this (the runner would postTaskReview + completed on the superseded flight).
+  it("abandons a stale-claimed review run at the pre-post probe with zero advice/completed posts (PRD #1247 fix round)", async () => {
+    const { client, calls } = staleRunningFakeClient(2);
+    const { git, calls: gitCalls } = fakeGit("diff --git a/poller.ts b/poller.ts\n@@ -1 +1 @@\n-old\n+new\n");
+    const runner = new ReviewRunner(client, git, nullLogger(), { queryFn: replyingQueryFn(goodModelJson) });
+    await runner.execute(reviewClaim({ claim_generation: 5 }));
+
+    assert.deepEqual(
+      calls.states.map((s) => s.body.status),
+      ["running", "running"],
+      "the initial running is fresh; the pre-post probe is stale, so no completed/failed follows",
+    );
+    assert.equal(gitCalls.ensureClone, 1, "the clone/diff/model DID run before the pre-post probe");
+    assert.equal(gitCalls.reviewDiff.length, 1, "the diff was computed before the pre-post probe");
+    assert.equal(calls.review, undefined, "no task review is posted when the pre-post probe is stale");
+  });
+
+  // PRD #1247 fix round (Greptile P1 disposition): the pre-post probe is a SUPERSESSION FENCE and is
+  // FAIL-CLOSED. A TRANSIENT failure (a throw, NOT a staleClaim ack) leaves ownership UNKNOWN, and
+  // postTaskReview is generation-blind until #1423, so proceeding could overwrite a reclaiming
+  // flight's review. The throw propagates to the advice-phase catch (safeReportFailed) and posts NO
+  // review. Removing the fence (or making it best-effort) reddens this (a review would be posted).
+  it("fails closed when the pre-post probe throws transiently: NO review post, the run reports failed", async () => {
+    let running = 0;
+    const calls: { review?: unknown; states: string[] } = { states: [] };
+    const client = {
+      reportState: async (_id: string, body: StateRequest) => {
+        calls.states.push(body.status);
+        if (body.status === "running") {
+          running++;
+          if (running === 2) throw new Error("transient probe failure"); // the pre-post probe
+          return { applied: true, status: "running" } as never;
+        }
+        return { applied: true, status: body.status } as never;
+      },
+      postTaskReview: async (id: string, review: TaskReviewRequest) => {
+        calls.review = { id, review };
+      },
+    } as unknown as WorkerClient;
+    const { git } = fakeGit("diff --git a/poller.ts b/poller.ts\n@@ -1 +1 @@\n-old\n+new\n");
+    const runner = new ReviewRunner(client, git, nullLogger(), { queryFn: replyingQueryFn(goodModelJson) });
+    await runner.execute(reviewClaim({ claim_generation: 5 }));
+
+    assert.equal(calls.review, undefined, "a probe throw posts NO review (fail-closed: ownership unknown)");
+    assert.ok(calls.states.includes("failed"), "the run reports failed via the advice-phase catch");
+    assert.ok(!calls.states.includes("completed"), "no completed report when the pre-post fence fails closed");
+  });
+
   it("posts zero findings WITHOUT calling the model on an empty diff", async () => {
     const { client, calls } = fakeClient();
     const { git, calls: gitCalls } = fakeGit("   \n  "); // whitespace-only ⇒ nothing to review
@@ -261,5 +444,81 @@ describe("fallbackTaskReview / buildReviewPrompt", () => {
     assert.match(prompt, /<untrusted_diff_[0-9a-f]+>/);
     assert.match(prompt, /<\/untrusted_diff_[0-9a-f]+>/);
     assert.match(prompt, /Produce your JSON review now/);
+  });
+});
+
+// PRD #1391 Run B M3b (D6): the review journals its terminal STATE write-ahead — never the
+// postTaskReview. Mirror of the judge journaling test.
+const reviewJournalTmp: string[] = [];
+afterEach(async () => {
+  for (const r of reviewJournalTmp.splice(0)) await fsp.rm(r, { recursive: true, force: true }).catch(() => undefined);
+});
+
+function journalingClient(failTerminal: boolean) {
+  const calls = { reviewPosts: 0 };
+  const client = {
+    reportState: async (_id: string, body: StateRequest): Promise<StateAck> => {
+      if (body.status === "completed" || body.status === "failed") {
+        if (failTerminal) throw new Error("api unreachable");
+        return { applied: true, status: body.status };
+      }
+      return { applied: true, status: "running" };
+    },
+    postTaskReview: async () => {
+      calls.reviewPosts++;
+    },
+    postMessages: async () => undefined,
+    hasFeature: (f: string) => f === "terminal_fence",
+    getMessageGaps: async () => ({ gaps: [] }),
+  } as unknown as WorkerClient;
+  return { client, calls };
+}
+
+async function mkReviewOutbox(): Promise<Outbox> {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "review-journal-"));
+  reviewJournalTmp.push(dir);
+  const outbox = new Outbox({
+    root: path.join(dir, "outbox"),
+    log: nullLogger(),
+    runMaxBytes: 64 * 1024 * 1024,
+    maxBytes: 512 * 1024 * 1024,
+    retentionMs: 7 * 86_400_000,
+  });
+  await outbox.init();
+  return outbox;
+}
+
+describe("ReviewRunner terminal journaling (PRD #1391 Run B M3b, D6)", () => {
+  it("journals the terminal STATE (not the review) write-ahead; the review POST is never replayed", async () => {
+    const outbox = await mkReviewOutbox();
+    const { client, calls } = journalingClient(/*failTerminal*/ true);
+    const { git } = fakeGit("diff --git a/poller.ts b/poller.ts\n@@ -1 +1 @@\n-old\n+new\n");
+    const runner = new ReviewRunner(client, git, nullLogger(), {
+      queryFn: replyingQueryFn(goodModelJson),
+      outbox,
+      outboxTerminalMaxBytes: 1 << 20,
+      gapFillMax: 100,
+    });
+    await runner.execute(reviewClaim({ claim_generation: 6 }));
+
+    assert.equal(outbox.hasPendingTerminal("review-1", 6), true, "the terminal state was journalled write-ahead");
+    const j = await outbox.readTerminalJournal("review-1", 6);
+    assert.equal(j?.body.status, "completed", "the journal holds the terminal STATE, not the review");
+    assert.equal(calls.reviewPosts, 1, "postTaskReview is called exactly once, never replayed by the resolve path");
+  });
+
+  it("retires the journal on a 200 terminal ack (no residue on the happy path)", async () => {
+    const outbox = await mkReviewOutbox();
+    const { client } = journalingClient(/*failTerminal*/ false);
+    const { git } = fakeGit("diff --git a/poller.ts b/poller.ts\n@@ -1 +1 @@\n-old\n+new\n");
+    const runner = new ReviewRunner(client, git, nullLogger(), {
+      queryFn: replyingQueryFn(goodModelJson),
+      outbox,
+      outboxTerminalMaxBytes: 1 << 20,
+      gapFillMax: 100,
+    });
+    await runner.execute(reviewClaim({ claim_generation: 8 }));
+
+    assert.equal(outbox.hasPendingTerminal("review-1", 8), false, "a 200 terminal ack retires the journal");
   });
 });

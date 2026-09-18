@@ -48,6 +48,16 @@ export type RunState =
    *  `running`, and the worker CONTINUES the run. The human-readable reason rides the worker's
    *  own `pause_failed` feed message, not this report. */
   | "pause_failed"
+  /** PRD #1247 M5b: the worker's held-state credential-switch RELEASE report. A capability worker
+   *  acknowledges a requested switch by releasing its claim — reported as `{status:
+   *  "credential_switch", claim_generation}` — so the server's fence can hand the run to a fresh
+   *  flight. Reported by enterCredentialSwitch's release path (runner.ts). */
+  | "credential_switch"
+  /** PRD #1247 M5b: the worker's held-state credential-switch GIVE-UP report — `{status:
+   *  "credential_switch_failed", claim_generation}`, sent when the worker cannot complete the
+   *  release. Reported by enterCredentialSwitch's give-up path (runner.ts); the server clears the
+   *  pending switch stamp on it. */
+  | "credential_switch_failed"
   | "completed"
   | "failed";
 
@@ -329,6 +339,17 @@ export interface RegisterRequest {
    *  interlocked run. Sent only when non-empty (same "only send when known" shape as
    *  `capabilities`); the api Filter-s it against a server-owned protocol vocabulary. */
   protocol_capabilities?: string[];
+  /**
+   * PRD #1391 Run B M4: the worker's active-run snapshot, carried ON the register request so a
+   * worker holding pending terminal outcomes leases them BEFORE the api's register-time orphan
+   * pass can re-claim them (#1390 M2a persists it first). This is the ONE snapshot exempt from
+   * the register nonce (none exists yet at register time). #1390's own worker never sends it; the
+   * boot-replay path (M4) is its only producer, and only when a pending terminal journal exists —
+   * with an EMPTY pending subset + `pending_overflow:true`, so the protection is cap-independent
+   * (even cap 0, where a non-empty subset would be rejected whole when cap<count). An ordinary
+   * worker omits it and the register wire stays byte-identical to today.
+   */
+  active_snapshot?: ActiveSnapshot;
 }
 
 export interface RegisterResponse {
@@ -336,13 +357,35 @@ export interface RegisterResponse {
   // (heartbeat/claim carry no worker id in the path), so this is not strictly
   // needed; M1 returns it and we capture it for logging when present.
   worker_id?: string;
-  /** PRD #1392 M2 (D7): the protocol features THIS api advertises as implemented, so the
-   *  worker can pick a capability-aware degradation on a mixed fleet. A full #1392 api sends
-   *  `["recovery_park_cause","recovery_release_exact_echo"]`; a future api may also advertise
-   *  `claim_generation_fence`. OPTIONAL and OMITTED ENTIRELY by an OLDER api (which returns
-   *  only `worker_id`) — the worker then negotiates neither the typed park report nor the
-   *  exact-echo release fallback, so an absent field must decode as "no features". */
+  /** The PROTOCOL FEATURES this api advertises as implemented, so the worker can pick a
+   *  capability-aware degradation on a mixed fleet. ONE negotiation wire shared by several
+   *  PRDs (#1392 D7, #1391 D8, #1390 M2a): whichever lands first declares the field, the
+   *  others their values. A full #1392 api sends `["recovery_park_cause",
+   *  "recovery_release_exact_echo"]`; #1391's api adds `heartbeat_outbox`; a #1390 M2a api
+   *  adds `active_run_snapshot` (a LIVE value now — the worker attaches its ActiveSnapshot to
+   *  the heartbeat and the run-lane claim once it is advertised, and pairs it with the
+   *  `register_nonce` below); a future api may also advertise `claim_generation_fence` /
+   *  `terminal_fence`. OPTIONAL and OMITTED ENTIRELY by an OLDER api (which returns only
+   *  `worker_id`) — an absent field decodes as "no features", so the worker negotiates
+   *  nothing extra — EXCEPT that a `credential_switch_v1` CAPABILITY worker still stamps
+   *  `claim_generation` optimistically, regardless of the advertised features (see
+   *  `MessagesRequest.claim_generation`). */
   protocol_features?: string[];
+  /** PRD #1391 Run B M4: the api's server-side terminal-pending outbox cap
+   *  (`WORKER_OUTBOX_MAX_PENDING`, default 32) — the number of pending outcomes #1390 will lease
+   *  from one worker's snapshot. The worker reads it at register (stashed on the client) so the
+   *  active-run registry can size its `pending_overflow` decision and its deterministic rotation to
+   *  the server's cap, WITHOUT a worker-side cap mirror or a separate config channel. OMITTED by an
+   *  older api that predates M3c ⇒ the worker treats the cap as 0 (protect every pending outcome via
+   *  overflow — the cap-independent floor). */
+  worker_outbox_max_pending?: number;
+  /** PRD #1390 M2a: the per-registration nonce the api mints so it can trust the epoch of an
+   *  ActiveSnapshot across a worker OR api restart. The worker captures it at register and
+   *  echoes it verbatim on every snapshot it SENDS (heartbeat + claim); a snapshot whose
+   *  nonce is not the api's current one is discarded server-side. OPTIONAL and OMITTED by an
+   *  api that does not advertise `active_run_snapshot`; the register-carried snapshot (#1391)
+   *  is the one snapshot exempt from the nonce (none exists yet at that point). */
+  register_nonce?: string;
 }
 
 /**
@@ -383,6 +426,61 @@ export interface WorkerStats {
   disk_data_total_bytes?: number;
 }
 
+/**
+ * One run's outbox depth on the heartbeat (PRD #1391 M5). Its own isolated field
+ * (like `stats`, fact 8), so a malformed or oversized report drops without costing
+ * the heartbeat. `pending_terminal` is ALWAYS 0 in Run A (terminal journaling is Run
+ * B); `blocked_reason` is likewise never set here. `since` is epoch ms. Every field
+ * is model-independent worker telemetry — no secret, no repo content.
+ */
+export interface OutboxHeartbeatEntry {
+  run_id: string;
+  pending_messages: number;
+  pending_terminal: number;
+  stale_retired: number;
+  blocked_reason?: string;
+  since: number;
+}
+
+/** The phase a run-lane (or judge/review) attempt is in from the WORKER's point of
+ *  view (PRD #1390 M2a). A strict subset of {@link RunState}: the four the api restores
+ *  a re-adopted run to. A judge/review attempt is always `running`. */
+export type ActiveSnapshotPhase = "running" | "awaiting_approval" | "awaiting_input" | "awaiting_followup";
+
+/** One entry in an {@link ActiveSnapshot} (PRD #1390 M2a): a run-lane attempt (or a
+ *  judge/review attempt) this worker is currently executing, named by its run id, the
+ *  `claim_generation` it was claimed at, and its current `phase`. A #1390-only worker sets
+ *  `terminal_pending: false` on every entry; PRD #1391 Run B M4 sets it TRUE for a run whose
+ *  terminal outcome is journaled and pending replay (the api then keeps that run unclaimable and
+ *  its generation unbumped while the lease holds). */
+export interface ActiveSnapshotEntry {
+  run_id: string;
+  claim_generation: number;
+  phase: ActiveSnapshotPhase;
+  terminal_pending: boolean;
+}
+
+/**
+ * The worker's active-run snapshot (PRD #1390 M2a): the run-lane attempts it is
+ * currently executing PLUS any judge/review attempts, each with its current phase. It
+ * rides every heartbeat (`HeartbeatRequest.active_snapshot`) and every run-lane claim
+ * (`ClaimRequest.active_snapshot`) so the api can re-adopt a run after an outage and
+ * never double-claim one this worker is already running.
+ *
+ * `snapshot_epoch` is a worker-process-monotonic counter (starts at 1, ++ on every
+ * build) shared by the heartbeat and claim loops, so the api can order snapshots
+ * captured independently. `register_nonce` is the value the api issued at register,
+ * stamped by the client on send (OMITTED on a register-carried snapshot, #1391 — the one
+ * snapshot exempt from the nonce). For a #1390 worker `pending_overflow` is ALWAYS false
+ * (no terminal-outcome journaling yet — that is #1391).
+ */
+export interface ActiveSnapshot {
+  snapshot_epoch: number;
+  register_nonce?: string;
+  active: ActiveSnapshotEntry[];
+  pending_overflow: boolean;
+}
+
 export interface HeartbeatRequest {
   version: string;
   /** Optional container resource sample (PRD #49), same absent-optional convention
@@ -390,6 +488,32 @@ export interface HeartbeatRequest {
    *  nothing, and the server both tolerates its absence and (Decision 3) decodes it
    *  defensively so a malformed sample drops the stats without failing the heartbeat. */
   stats?: WorkerStats;
+  /**
+   * Per-run outbox depth (PRD #1391 M5). Sent ONLY when the server advertised
+   * `heartbeat_outbox` in `RegisterResponse.protocol_features` AND at least one run
+   * has pending outbox depth (client.ts gates both), so an older api never sees the
+   * field and the heartbeat wire stays byte-identical to today when it is unset.
+   */
+  outbox?: OutboxHeartbeatEntry[];
+  /**
+   * The worker's active-run snapshot (PRD #1390 M2a). Sent ONLY when the server
+   * advertised `active_run_snapshot` in `RegisterResponse.protocol_features` (client.ts
+   * gates it), so an older api never sees the field and the heartbeat wire stays
+   * byte-identical to today when it is unset. Stripped alongside `outbox` on the
+   * strict-decode rollback retry.
+   */
+  active_snapshot?: ActiveSnapshot;
+}
+
+/**
+ * Body of a run-lane claim POST (PRD #1390 M2a). The claim is a bodyless POST today;
+ * this adds the worker's {@link ActiveSnapshot} so the api's pre-claim dedupe can see
+ * the runs this worker is already executing BEFORE the first post-outage heartbeat
+ * lands. Sent ONLY when `active_run_snapshot` is negotiated; otherwise the claim posts
+ * an empty body, which an old api ignores (harmless).
+ */
+export interface ClaimRequest {
+  active_snapshot?: ActiveSnapshot;
 }
 
 /** Kebab-case agent name. Mirrors the API's template nameRe
@@ -1074,6 +1198,17 @@ export interface ClaimResponse {
    *  silently lose the behaviour the user chose. Absent on an older server ⇒ false,
    *  i.e. a limit death fails the run as it does today. */
   wait_on_limit?: boolean;
+  /** PRD #1247 M5 (D13): which phase a RESUME claim should RESTORE instead of re-entering the
+   *  planning turn — one of "awaiting_input", "awaiting_approval", "implementing", or absent/""
+   *  (a fresh run with no prior phase). Derived server-side from the run row
+   *  (workersvc.ClaimPayload.ResumePhase). Additive + optional; the runner reads it into
+   *  RunContext.resumePhase and the sdk-executor restores that phase on a resume claim. */
+  resume_phase?: string;
+  /** PRD #1247 M5 (D13): the run_messages seq of the submitted plan frame the gate is parked on,
+   *  carried ONLY when `resume_phase == "awaiting_approval"` so a reclaim can correlate a buffered
+   *  approve_plan with the right plan revision (workersvc.ClaimPayload.ResumePlanSeq). 0/absent for
+   *  every other phase. Additive + optional. */
+  resume_plan_seq?: number;
 }
 
 /** One deterministic missing-executable hit (PRD #46 Decision 4). */
@@ -1305,6 +1440,11 @@ export interface CompletionAttemptRequest {
   milestones_completed: string[];
   head: string | null;
   worktree_fingerprint: string | null;
+  /** PRD #1247 M5 (D3): the claim-lane generation the reporting worker holds. A CAPABILITY worker
+   *  stamps it so the server's RecordCompletionAttempt fence can engage — a released/superseded
+   *  stale flight's attempt then records nothing (the api decodes it as `ClaimGeneration *int64`).
+   *  Optional so a legacy worker omits it and the attempt is unfenced. */
+  claim_generation?: number;
 }
 
 /** Response body for POST /api/worker/runs/:id/completion/attempt (PRD #1226 M3): the
@@ -1324,6 +1464,11 @@ export interface CompletionPermitRequest {
   contract_revision: number;
   branch: string;
   head: string;
+  /** PRD #1247 M5 (D3): the claim-lane generation the reporting worker holds. A CAPABILITY worker
+   *  stamps it so the server refuses to issue a permit for a released/superseded stale flight (the
+   *  api decodes it as `ClaimGeneration *int64`). Optional so a legacy worker omits it and the
+   *  issue is unfenced. */
+  claim_generation?: number;
 }
 
 /** Response body for POST /api/worker/runs/:id/completion/permit (PRD #1226 M4, D5), the
@@ -1537,6 +1682,20 @@ export interface OutgoingMessage {
 
 export interface MessagesRequest {
   messages: OutgoingMessage[];
+  /**
+   * The claim generation these messages were produced under (PRD #1391 M2 / #1247
+   * fence, D11). Sent when the caller supplies a generation > 0 AND either this image
+   * advertised the `credential_switch_v1` capability OR the server advertised the
+   * `claim_generation_fence` feature (client.ts `includeClaimGeneration`): a
+   * `credential_switch_v1` capability worker stamps OPTIMISTICALLY — regardless of the
+   * negotiated feature, since its runs are fenced server-side and a one-shot register
+   * may have missed the feature under rollout skew — while a non-capability (#1391-era)
+   * worker keeps the feature gate. `0` is chat's legacy sentinel and is NEVER sent. On
+   * the EXACT strict-decode 400 from a rolled-back api the field is stripped and the
+   * batch retried ONCE — non-sticky for a capability worker (it stays optimistic, so the
+   * next batch self-recovers), sticky/clearFeatures for a non-capability worker.
+   */
+  claim_generation?: number;
 }
 
 /**
@@ -1726,6 +1885,16 @@ export type PublishResult =
 
 export interface StateRequest {
   status: RunState;
+  /** PRD #1392 M2 (#1247 generation fence): the exact claim generation THIS report is made
+   *  against, so the api's park transaction settles only the hold that generation opened. Sent on
+   *  the forge-unreachable park report; the #1247 reportState closure (M5b) THREADS it onto every
+   *  in-flight mutating report (including the older-api untyped forge-park fallback), and the fix
+   *  round (E) send-gates it in client.reportState: a `credential_switch_v1` capability worker
+   *  stamps OPTIMISTICALLY regardless of the negotiated `claim_generation_fence` feature, a
+   *  non-capability (#1391-era) worker feature-gates, 0 (chat's legacy sentinel) is omitted, and on
+   *  the exact strict-decode 400 from a rolled-back api the field is stripped and the report retried
+   *  ONCE. Additive + optional. */
+  claim_generation?: number;
   /** awaiting_approval carries the captured plan; an autopilot `running` report also
    *  carries it, persisted durably via SetRunAutopilotPlan (RC1 #1197). */
   plan_md?: string;
@@ -1933,11 +2102,16 @@ export interface StateRequest {
    *  which the worker's capability-aware fallback avoids by only sending it when the api
    *  advertised `recovery_park_cause` at register (D7). */
   recovery_cause?: string;
-  /** PRD #1392 M2 (#1247 generation fence): the exact claim generation THIS report is made
-   *  against, so the api's park transaction settles only the hold that generation opened. Sent
-   *  on the forge-unreachable park report; also kept on the older-api untyped fallback report
-   *  ONLY when the api advertised `claim_generation_fence` (D7). Additive + optional. */
-  claim_generation?: number;
+  /** PRD #1391 Run B M3 (D3): the worker's DURABLE message fence on a run-lane TERMINAL
+   *  (completed/failed) report — the run's last emitted seq after the final batcher flush. The api
+   *  refuses the transition with a typed 409 `messages_pending` while `runs.last_seq` is below it OR
+   *  the trace is not contiguous through it, so judge/task-review/notifications never fire ahead of
+   *  a complete trace. NEGOTIATED (D9): the worker sends it ONLY to an api that advertised
+   *  `terminal_fence` at register (the resolve/send path gates on client.hasFeature), never to an
+   *  older api that would strict-decode it as an unknown field. Validated `>= 0` server-side.
+   *  Additive + optional and OMITTED ENTIRELY on every non-terminal report and by a pre-#1391
+   *  worker, so the wire shape is unchanged. */
+  messages_through_seq?: number;
 }
 
 /**
@@ -2010,17 +2184,40 @@ export interface StateAck {
    *  boolean; the server owns the rule. Absent/non-boolean (older server, unparseable body) ⇒
    *  treated as false = "no budget-exhausted steer". */
   budgetExhausted?: boolean;
-  /** PRD #1392 M2 (D10): the TOP-LEVEL disposition reason the api returns on a 409 (and,
-   *  where present, a 200) for a `recovery_wait` park report — one of "stale_claim" (#1247: the
-   *  run moved on under this worker, so stop silently) or "custody_unsettled" (the exact-hold
-   *  cardinality/evidence step could not settle, so take today's failed path). Absent on an
-   *  ordinary ack. Read from the body's TOP LEVEL, NOT off `run`. */
+  /** The TOP-LEVEL disposition reason the api returns on a 409 (and, where present, a 200). Read
+   *  from the body's TOP LEVEL, NOT off `run`. Absent on an ordinary ack. Its vocabulary spans two
+   *  features:
+   *    - PRD #1392 M2 (D10) forge-park refusals: "stale_claim" (#1247: the run moved on under this
+   *      worker, so stop silently) or "custody_unsettled" (the exact-hold cardinality/evidence step
+   *      could not settle, so take today's failed path).
+   *    - PRD #1391 Run B M3 (D3) terminal fence refusals: "messages_pending" (the trace is not yet
+   *      contiguous through the reported `messages_through_seq`, so the resolve path fills the gaps
+   *      from the message-gaps read and re-sends) or "gap_unrecoverable" (the hole below the fence
+   *      exceeds `WORKER_GAP_FILL_MAX`, so the journal is marked blocked, D13). */
   reason?: string;
   /** PRD #1392 M2 (D10): the retry-not-before stamp the api returns on a `recovery_wait` ack —
    *  a field ON the RunDTO (`run.recovery_retry_not_before`), NOT top-level — so the pre-clone
    *  forge-park feed event can quote when the run resumes. An RFC3339 string as the api marshals
    *  it; absent (older server, no stamp, unparseable body) ⇒ the feed event says "after backoff". */
   recoveryRetryNotBefore?: string;
+  /** PRD #1247 M5b: the worker-facing held-state credential-switch signal, read TOP-LEVEL off the
+   *  /state ack body (beside `run`, on both the 200 ack and the ordinary not-applied 409). Present
+   *  when a switch is pending for the claim the worker still holds; the `generation` is the one the
+   *  worker must release at. Absent otherwise. M5b (MINOR-7) trips the switch off it — the
+   *  reportState closure calls steering.tripCredentialSwitch(generation). */
+  credentialSwitch?: { generation: number };
+  /** PRD #1247 M5b: true when the /state ack carried the top-level `disposition: "stale_claim"`
+   *  (a 409) — a held-state switch RELEASED this claim, or a reclaim SUPERSEDED it, so the old
+   *  flight must STOP without further reports. Absent otherwise. The reportState closure throws
+   *  StaleClaimError on it (BLOCKING-4), which the executeClaim catch chain turns into a clean
+   *  stop — no terminal report, no preserve flag. */
+  staleClaim?: boolean;
+  /** PRD #1247 M5b (BLOCKING-2 rework): true when the /state ack carried `disposition: "released"`
+   *  on a 200 — the held-state credential-switch RELEASE applied. The server sets it for BOTH a
+   *  fresh requeue (status 'queued') and an idempotent release after a reclaim (status 'running'),
+   *  so enterCredentialSwitch treats the release as done off this flag, not off status === 'queued'
+   *  (which missed the idempotent-after-reclaim success and gave up on a server-confirmed release). */
+  credentialSwitchReleased?: boolean;
 }
 
 export interface UserInput {
@@ -2037,6 +2234,12 @@ export interface UserInput {
 
 export interface InputsResponse {
   inputs: UserInput[];
+  /** PRD #1247 M5b: the held-state credential-switch signal, surfaced on EVERY inputs response —
+   *  including an empty-inputs poll (the idle gate/question/follow-up waiters poll this route
+   *  continuously) — so the worker holding the current claim learns a switch was requested. Present
+   *  only when a switch is pending for this claim; omitted otherwise. M5b trips the switch off it —
+   *  the runner's inputs poll calls steering.maybeTripCredentialSwitch(generation). */
+  credential_switch?: { generation: number };
 }
 
 /** Response of the interactive park-skip ownership probe (issue #559): the current
@@ -2044,12 +2247,36 @@ export interface InputsResponse {
  *  thrown RequestError, not by this shape. */
 export interface RunOwnershipResponse {
   status: string;
+  /** PRD #1391 Run B M4: the run's current `claim_generation` (additive on the probe). The run-lane
+   *  claim router proceeds to execute ONLY on a `claimed`/`running` row AT the claim's generation; a
+   *  DIFFERENT generation ends the attempt (a newer claim owns the run). ABSENT from an older api ⇒
+   *  undefined, which the router treats as "generation unknown, cannot prove a mismatch" and so does
+   *  not refuse on generation alone. */
+  claim_generation?: number;
   /** PRD #1392 M2 (D10): the run's `recovery_retry_not_before` stamp, added to the ownership
    *  probe so a forge park reconciled through the probe (a transport failure lost the report
    *  ack) can still quote when it resumes. An RFC3339 string when the run is parked with a
    *  stamp; absent otherwise (an older api, or a non-parked run) ⇒ the feed event falls back
    *  to "retry after backoff". */
   recovery_retry_not_before?: string;
+}
+
+/** PRD #1391 Run B M3 (D3): one missing seq range in a run's message trace, as the message-gaps
+ *  read returns it. Inclusive `[first, last]`; the resolve path fills every seq in the range with a
+ *  per-seq "unrecoverable gap" tombstone so the trace becomes contiguous and the terminal fence
+ *  can pass. */
+export interface MessageGap {
+  first: number;
+  last: number;
+}
+
+/** PRD #1391 Run B M3 (D3): a page of a run's missing message-seq ranges in `[1..through]`, from
+ *  GET /worker/runs/{id}/message-gaps?claim_generation=G&through=N&limit=&cursor=. The api
+ *  authorizes the worker's exact current, unreleased generation in the same SQL snapshot as the
+ *  gap read. `next_cursor` is present only when more pages remain and becomes the next cursor. */
+export interface MessageGapsResponse {
+  gaps: MessageGap[];
+  next_cursor?: number;
 }
 
 /** Response of the issue #1319 orphan-classification read (GET

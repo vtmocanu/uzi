@@ -84,7 +84,7 @@ func TestCreateRunGuardrailBlocksBeforeInsert(t *testing.T) {
 	svc := New(fs, newBox(t), testParams())
 	svc.SetRepoGuard(guard)
 
-	_, err := svc.CreateRun(context.Background(), user, repo, 4, "desc", nil, nil, false, nil)
+	_, err := svc.CreateRun(context.Background(), user, repo, 4, "desc", nil, nil, false, nil, nil)
 	assertGuardrailBlocked(t, err, wantMsgs)
 	if guard.called != 1 {
 		t.Fatalf("guard called %d times, want 1", guard.called)
@@ -142,7 +142,7 @@ func TestCreatePromptRunGuardrailBlocksBeforeInsert(t *testing.T) {
 	svc := New(fs, newBox(t), testParams())
 	svc.SetRepoGuard(guard)
 
-	_, err := svc.CreatePromptRun(context.Background(), user, repo, sched, "t", "p", false, false, nil, nil, false)
+	_, err := svc.CreatePromptRun(context.Background(), user, repo, sched, "t", "p", false, false, nil, nil, false, nil)
 	assertGuardrailBlocked(t, err, wantMsgs)
 	if guard.called != 1 {
 		t.Fatalf("guard called %d times, want 1", guard.called)
@@ -161,7 +161,7 @@ func TestCreatePromptRunNotBlockedGuardProceeds(t *testing.T) {
 	svc := New(fs, newBox(t), testParams())
 	svc.SetRepoGuard(guard)
 
-	if _, err := svc.CreatePromptRun(context.Background(), user, repo, sched, "t", "p", false, false, nil, nil, false); err != nil {
+	if _, err := svc.CreatePromptRun(context.Background(), user, repo, sched, "t", "p", false, false, nil, nil, false, nil); err != nil {
 		t.Fatalf("CreatePromptRun with a clearing guard: %v", err)
 	}
 	if guard.called != 1 {
@@ -185,7 +185,7 @@ func TestCreateRunNotBlockedGuardProceeds(t *testing.T) {
 	svc := New(fs, newBox(t), testParams())
 	svc.SetRepoGuard(guard)
 
-	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "desc", nil, nil, false, nil); err != nil {
+	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "desc", nil, nil, false, nil, nil); err != nil {
 		t.Fatalf("CreateRun with a clearing guard: %v", err)
 	}
 	if guard.called != 1 {
@@ -207,7 +207,7 @@ func TestClaimGuardrailBlocksAtClaim(t *testing.T) {
 	guard, _ := blockedGuard()
 	f.svc.SetRepoGuard(guard)
 
-	payload, err := f.svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: f.owner})
+	payload, err := f.svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: f.owner}, nil)
 	if err != nil {
 		t.Fatalf("Claim must report idle (nil error) for a guardrail-blocked run, got %v", err)
 	}
@@ -247,7 +247,7 @@ func TestClaimGuardrailNotBlockedProceeds(t *testing.T) {
 	guard := &fakeGuard{res: privcheck.GuardResult{Blocked: false}}
 	f.svc.SetRepoGuard(guard)
 
-	payload, err := f.svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: f.owner})
+	payload, err := f.svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: f.owner}, nil)
 	if err != nil {
 		t.Fatalf("Claim with a clearing guard: %v", err)
 	}
@@ -274,7 +274,7 @@ func TestClaimJudgeSkipsGuard(t *testing.T) {
 	guard := &fakeGuard{res: privcheck.GuardResult{Blocked: true}}
 	svc.SetRepoGuard(guard)
 
-	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid})
+	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid}, nil)
 	if err != nil {
 		t.Fatalf("Claim (judge): %v", err)
 	}
@@ -291,7 +291,7 @@ func TestClaimJudgeSkipsGuard(t *testing.T) {
 func TestClaimNilGuardBackstopSkips(t *testing.T) {
 	f := newClaimFixture(t) // SetRepoGuard deliberately not called
 
-	payload, err := f.svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: f.owner})
+	payload, err := f.svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: f.owner}, nil)
 	if err != nil {
 		t.Fatalf("Claim with a nil guard: %v", err)
 	}
@@ -330,7 +330,7 @@ func TestCreateRunThreadsOverriddenFromRow(t *testing.T) {
 			svc := New(fs, newBox(t), testParams())
 			svc.SetRepoGuard(guard)
 
-			if _, err := svc.CreateRun(context.Background(), user, repo, 4, "desc", nil, nil, false, nil); err != nil {
+			if _, err := svc.CreateRun(context.Background(), user, repo, 4, "desc", nil, nil, false, nil, nil); err != nil {
 				t.Fatalf("CreateRun: %v", err)
 			}
 			if guard.lastInput.Overridden != tc.wantOverr {
@@ -359,7 +359,7 @@ func TestClaimThreadsOverriddenFromContext(t *testing.T) {
 			guard := &fakeGuard{res: privcheck.GuardResult{Blocked: false}}
 			f.svc.SetRepoGuard(guard)
 
-			if _, err := f.svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: f.owner}); err != nil {
+			if _, err := f.svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: f.owner}, nil); err != nil {
 				t.Fatalf("Claim: %v", err)
 			}
 			if guard.lastInput.Overridden != tc.wantOverr {
@@ -381,7 +381,7 @@ func TestCreateRunNilGuardNotBlocked(t *testing.T) {
 	}
 	svc := New(fs, newBox(t), testParams()) // SetRepoGuard deliberately not called
 
-	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "desc", nil, nil, false, nil); err != nil {
+	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "desc", nil, nil, false, nil, nil); err != nil {
 		t.Fatalf("CreateRun with a nil guard must not be guardrail-blocked: %v", err)
 	}
 	if fs.createRunParams == nil {

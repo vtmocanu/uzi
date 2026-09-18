@@ -71,7 +71,8 @@ cd <the repo>                              # your normal checkout; work happens 
    git fetch origin main && git rebase origin/main
    ```
    Common conflicts: a new goose migration (rename to the next free number above the live
-   head in `api/internal/store/migrations/`, sequenced after any sibling PR's migration); a
+   head in `api/internal/store/migrations/`, sequenced after any sibling PR's migration;
+   `task migration:renumber` does the git-mv and comment rewrite and reports other refs); a
    hand-edited shared doc (keep both sides).
 5. **Restore the uncommitted state** the tracking ref never held — the whole point for a
    task run. Skip cleanly when the run had none, but do NOT mask a real apply failure (a
@@ -92,7 +93,7 @@ cd <the repo>                              # your normal checkout; work happens 
    ```sh
    git diff --name-only origin/main..HEAD -- .github/workflows/
    git log  --name-only origin/main..HEAD -- .github/workflows/
-   git diff --name-only origin/main..HEAD -- api/internal/store/migrations/   # renumber if non-empty
+   git diff --name-only origin/main..HEAD -- api/internal/store/migrations/   # renumber if non-empty (task migration:renumber)
    git rev-list --count origin/main..HEAD                                     # the range length: must be > 0, and must equal the scan's "N commits scanned" line below
    go run github.com/zricethezav/gitleaks/v8@v8.30.1 git --log-opts="origin/main..HEAD" --no-banner --ignore-gitleaks-allow   # EVERY commit in the range (push protection scans them all); pinned like scripts/scan-secrets.sh
    ```
@@ -117,9 +118,9 @@ cd <the repo>                              # your normal checkout; work happens 
    git push -u origin recover/STEM
    gh pr create --base main --title '…(recovered)' --body '…recovered from RUN…'   # --repo defaults to origin
    ```
-10. **Review, land, clean up** — wait for CodeRabbit, triage its findings (see *Reviewing
-    the diff* / *Triaging CodeRabbit findings*), fix the real ones, admin-merge, watch
-    post-merge CI (if a sibling PR must land first for migration ordering, merge it, then
+10. **Review, land, clean up** — from here the `uzi-lander` skill lands it: wait for the
+    review bots, triage the findings, fix the real ones, admin-merge, watch post-merge CI
+    (if a sibling PR must land first for migration ordering, merge it, then
     `gh pr update-branch` this one and re-wait). Then, **back in your normal checkout** —
     `cd` out of `DIR` first, since you cannot remove the worktree you are standing in nor
     delete its checked-out branch — `git worktree remove DIR`, `git branch -D recover/STEM`,

@@ -98,6 +98,14 @@ services:
       FRONTEND_ORIGIN: http://127.0.0.1:${E2E_WEB_PORT}
       # Give the restart-resilience step head-room to re-queue the orphaned run.
       RUN_MAX_REQUEUES: "3"
+      # PRD #1390 M4 (e2e ONLY): the D7 api-rollback simulation. Empty (the default) leaves
+      # the active-run-snapshot feature ENABLED for every phase — inert here. The
+      # api-outage-readoption phase (42) exports UZI_ACTIVE_SNAPSHOT_DISABLED=1 and recreates
+      # the api for its case (d): the api then omits active_run_snapshot from protocol_features
+      # and strict-decodes heartbeats, so a still-sending worker's heartbeat 400s once, the
+      # worker strips the field and retries, and liveness is never lost. Restored to empty
+      # after the phase.
+      UZI_ACTIVE_SNAPSHOT_DISABLED: ${UZI_ACTIVE_SNAPSHOT_DISABLED:-}
       # Heartbeat-stale window: no heartbeat past this ⇒ the worker goes offline and
       # its non-terminal runs re-queue (the sweeper's worker-loss recovery). run-e2e.sh
       # sets E2E_WORKER_HEARTBEAT_STALE=15s in the env-file from BOOT (was tightened
@@ -263,6 +271,20 @@ services:
       # exactly as before; that scenario sets UZI_E2E_MAX_CONCURRENT_RUNS=2 and
       # recreates the agent to prove two runs execute concurrently.
       WORKER_MAX_CONCURRENT_RUNS: ${UZI_E2E_MAX_CONCURRENT_RUNS:-1}
+      # PRD #1390 M4 (e2e ONLY): arms the runner's env-gated DROP-EXECUTION seam. Empty
+      # (the default) leaves it OFF for every phase — inert in production and in every other
+      # e2e run. The api-outage-readoption phase (42) exports UZI_E2E_DROP_ON_SENTINEL=1 and
+      # recreates the agent for its case (c), then recreates WITHOUT it to resume; when set,
+      # a run whose issue text carries UZI_STUB_DROP is dropped after its first `running`
+      # report (no terminal report) to model a live worker that silently loses one execution.
+      UZI_E2E_DROP_ON_SENTINEL: ${UZI_E2E_DROP_ON_SENTINEL:-}
+      # PRD #1391 Run B M6 (e2e ONLY): shrinks the stub UZI_STUB_OUTBOX stream (default 90
+      # one-second ticks) so a run reaches its TERMINAL inside a bounded outage — the
+      # write-ahead terminal + boot-gate-replay cases. Empty (the default) leaves the 90s Run A
+      # stream, so this is inert in every other phase and in production, exactly like
+      # UZI_E2E_DROP_ON_SENTINEL above; the api-outage-outbox phase (52) exports it for its Run B
+      # cases and unsets it at restore. Read by agent/src/executor.ts.
+      UZI_STUB_OUTBOX_TICKS: ${UZI_STUB_OUTBOX_TICKS:-}
       # Chat lane (PRD #39): fast turn pickup + a SHORT worker-driven idle window so the
       # e2e sees idle-completion in seconds instead of the 60m default. This agent-side
       # value is only the FALLBACK — the effective window is the api's claim-config

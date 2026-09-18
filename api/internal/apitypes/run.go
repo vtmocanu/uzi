@@ -493,9 +493,11 @@ type RunDTO struct {
 	// are different questions — and PRD #104's compatibility path creates a row
 	// labelled literally `default`, so the label is not even a reliable hint.
 	//
-	// One of eight server-generated values (autoselect.Reason, closed by migration
-	// 00089's CHECK): default, pinned, judge, auto, best_of_pool, pool_empty,
-	// pool_stale, open_failed. Null for a run claimed before M1.
+	// One of ten server-generated values (autoselect.Reason, closed by migration
+	// 00089's CHECK as widened by 00233): default, pinned, judge, auto, best_of_pool,
+	// pool_empty, pool_stale, open_failed, run_pinned, run_default.
+	// run_pinned/run_default are the per-run credential override reasons (PRD #1247).
+	// Null for a run claimed before M1.
 	//
 	// A CLOSED SERVER ENUM, not free text: it describes the OWNER'S OWN configuration
 	// and can carry no cross-tenant content, which is why it rides this DTO under the
@@ -661,6 +663,79 @@ type RunDTO struct {
 	// path and both list builders) from a batched per-page lookup, not in runToDTO
 	// itself, which stays a pure function of its row.
 	CurrentActivity *RunActivity `json:"current_activity"`
+	// Per-run Anthropic credential override + attribution journal (PRD #1247 M1). All
+	// three are back-compat by construction: a run with no override reads
+	// credential_override == null and credential_switch == null, and a run claimed before
+	// M1 (or never claimed) reads credential_epochs == [].
+	//
+	// CredentialOverride is the run's per-run token choice: null = inherit the worker
+	// binding (today's behaviour), else {mode, label}. Mode is one of pinned/auto/default;
+	// Label is the snapshotted token name for a pinned override (null for auto/default,
+	// or when the token was deleted). Populated from the run row + an owner-scoped label
+	// lookup in the DTO builder's enrichment path.
+	CredentialOverride *CredentialOverrideDTO `json:"credential_override"`
+	// CredentialSwitch is the state of a pending held-state switch (PRD #1247, D14):
+	// null (none pending) | "requested" (stamped, not yet released) | "released"
+	// (released, awaiting reclaim). Distinct from CredentialOverride, which is the choice;
+	// this is the in-flight transition. Always null in M1 (nothing stamps it until M4/M5).
+	CredentialSwitch *string `json:"credential_switch"`
+	// CredentialEpochs is the applied-switch history (D7): one entry per claim, oldest
+	// generation first, each naming the token that claim spent and why. Never omitempty —
+	// [] over null — so a client reads it unconditionally. Populated from
+	// run_credential_epochs in the DTO builder's enrichment path.
+	CredentialEpochs []CredentialEpochDTO `json:"credential_epochs"`
+	// OutcomePending is set (PRD #1391 M3, D13) when the run's OWNING worker holds a
+	// finished terminal outcome its api could not land — a terminal journal the api
+	// permanently refused — so the owner can see the held outcome and resolve it with a
+	// discarding cancel. null (today's contract) for every run with no held outcome, which
+	// is every run until a worker reports a blocked terminal journal. It is NON-PURE
+	// telemetry (the outbox tracker, not the run row), so it is overlaid in the GetRun
+	// enrichment path, never in the pure runToDTO builder, and only for the single-run
+	// detail read — the list/board never carries it. Reason is one of a CLOSED enum
+	// (completion_permit_mismatch | gap_unrecoverable | reserve_exhausted), filtered
+	// server-side so untrusted worker text can never reach the client.
+	OutcomePending *OutcomePendingDTO `json:"outcome_pending"`
+}
+
+// OutcomePendingDTO names a finished outcome held on the run's worker (PRD #1391 M3,
+// D13). Reason is one of the closed set the worker may report — completion_permit_mismatch
+// (the run's completion permit no longer matches), gap_unrecoverable (a message hole the
+// worker cannot fill bounds the terminal fence), reserve_exhausted (the terminal-journal
+// reserve is full) — mapped to friendly text by the web owner-resolution UI. The api drops
+// any other value (the worker is untrusted), so a client may render an unrecognised value
+// honestly but will never see one from this api.
+type OutcomePendingDTO struct {
+	Reason string `json:"reason"`
+}
+
+// CredentialOverrideDTO is a run's or schedule's per-run credential override (PRD #1247
+// M1): the mode the owner chose and, for a pinned override, the token label. It is the
+// null-when-absent shape on both RunDTO and ScheduleDTO.
+type CredentialOverrideDTO struct {
+	// Mode is one of "pinned" | "auto" | "default" (migration 00233's CHECK). A client
+	// must render an unrecognised value honestly — the API is deployed separately.
+	Mode string `json:"mode"`
+	// Label is the token name for a pinned override, snapshotted for readability after a
+	// rename/delete; null for auto/default or when no label is resolvable.
+	Label *string `json:"label"`
+}
+
+// CredentialEpochDTO is one claim's credential attribution (PRD #1247 M1, D7): the
+// generation, the token it spent (secret_id + label + select_reason, all null-tolerant so a
+// deleted token's history stays readable), and when it was applied. ClaimGeneration is int64
+// — every generation on the wire is int64, mirroring runs.claim_generation.
+//
+// SecretID is the STABLE switch key: a label can be renamed and reused after a delete, so a
+// consumer deciding whether the token actually changed keys on secret_id, not the label.
+// Nullable — the FK nulls it when the token is deleted, exactly as RunDTO.AnthropicSecretID
+// does, so a historical epoch legitimately carries a label with no id. Owner-or-admin scoped
+// like the rest of this DTO, so exposing the per-epoch id here is consistent with that field.
+type CredentialEpochDTO struct {
+	ClaimGeneration int64     `json:"claim_generation"`
+	SecretID        *string   `json:"secret_id"`
+	Label           *string   `json:"label"`
+	SelectReason    *string   `json:"select_reason"`
+	AppliedAt       time.Time `json:"applied_at"`
 }
 
 // RunListItemDTO is a run row for the Runs index and the admin Agents-status
@@ -740,6 +815,14 @@ type RunInputRequest struct {
 	// false-positive-inference correction. No runtime security boundary is bypassed: the
 	// §300 guardrail still denies docker USE on a daemon-less worker at run time.
 	OverrideCapabilities bool `json:"override_capabilities"`
+	// DiscardPendingOutcome is the PRD #1391 Run B M3d (D13) explicit confirmation on a `cancel`,
+	// default false and omitted so a newer client remains compatible with an older strict-decoding
+	// api. When the target run has a terminal outcome journaled and leased on its worker, the server
+	// refuses the cancel with a typed 409 (reason "outcome_pending_confirmation_required") UNLESS this
+	// is true; with it the cancel takes the atomic owner-scoped no-live-poller branch that discards the
+	// held outcome. Meaningful only for cancel — inert on every other kind and on a cancel of a run
+	// with no pending outcome. Nothing is ever discarded on a timer; only the owner, explicitly.
+	DiscardPendingOutcome bool `json:"discard_pending_outcome,omitempty"`
 }
 
 // RunInputResponse is the POST /api/runs/{id}/inputs reply: server_side reports

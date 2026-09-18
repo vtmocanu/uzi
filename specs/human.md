@@ -598,6 +598,7 @@ Tracked as GitLab issue vtmocanu/uzi#111; PRD at `prds/done/111-auto-select-anth
 - The candidate set is an opt-in pool, per token, default OFF — auto must never spend a token the user reserved for other work. [user 2026-07-22]
 - Ranking is least-consumed first; a within-threshold tie goes to the account that resets soonest. [user 2026-07-22]
 - The dev-cluster k8s validation (a PRD success criterion) is deferred to a follow-up issue, not dropped. [user 2026-07-27]
+- A run's owner can choose which of their Anthropic tokens a run spends — at run start, while parked, at the plan-approval gate, or mid-run — overriding the worker's binding for that run; an `auto` run parked on an exhausted account also fails over by itself to a pooled account with headroom, while a pinned or default choice is never moved automatically. [user, #1247]
 
 ## Feature #35 — Retry after an Anthropic usage limit
 
@@ -794,6 +795,22 @@ Tracked as GitHub issue vtmocanu/uzi#1265; PRD at `prds/1265-rc-release-train.md
 Tracked as GitHub issue vtmocanu/uzi#1349; PRD at `prds/1349-recovery-custody-hardening.md`.
 
 - An owner can see retained unpublished committed work, recover an available archive, and explicitly discard one exact held source only after a warning distinguishes recoverable work from a possible only copy. [AI-synced 2026-09-14, #1349]
+
+## Feature #1390 — Api outage does not disturb a run on a still-live worker
+
+Tracked as GitHub issue vtmocanu/uzi#1390; PRD at `prds/1390-outage-requeue-readoption.md`.
+
+- An api outage does not disturb a run executing on a still-live worker: within one worker heartbeat of the api's return each such run is restored to the exact status it held (running, or waiting at its plan/question gate), without spending its re-queue budget or opening a new custody hold. [user, #1390]
+- A worker that has genuinely died still has its runs re-queued after the stale window, and failed only after a second window. [user, #1390]
+- Each worker reports which runs it is executing and in which phase, visible in `uzi worker list` / `uzi admin workers`. [user, #1390]
+
+## Feature #1393 — A finished run's outcome survives an api outage
+
+Tracked as GitHub issue vtmocanu/uzi#1393; PRD at `prds/1391-worker-outbox-durable-reports.md`.
+
+- A run that finishes while the api is unreachable has its completed/failed outcome recorded durably on its worker before the first send, and that outcome — with its merge request — lands once the api returns and the run's own message backlog has replayed; it is never redone and never falsely marked failed by the outage. (AI-synced 2026-09-17)
+- While a worker still holds an unsent outcome for a run, no second execution of that run ever starts. (AI-synced 2026-09-17)
+- An outcome the api permanently refuses is shown on the run as held on the worker, and is resolved only by the owner explicitly discarding it, never on a timer. (AI-synced 2026-09-17)
 
 ## Startup admin seed
 

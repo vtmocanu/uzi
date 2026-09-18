@@ -35,11 +35,11 @@ func insertQuestionMessage(ctx context.Context, t *testing.T, q *store.Queries, 
 	if err != nil {
 		t.Fatalf("marshal question payload: %v", err)
 	}
-	rows, err := q.InsertRunMessage(ctx, store.InsertRunMessageParams{
+	res, err := q.InsertRunMessage(ctx, store.InsertRunMessageParams{
 		RunID: f.runID, Seq: seq, Kind: "question", Agent: pgT("lead"), Payload: payload,
 	})
-	if err != nil || rows != 1 {
-		t.Fatalf("insert question message seq=%d: rows=%d err=%v", seq, rows, err)
+	if err != nil || !res.Inserted {
+		t.Fatalf("insert question message seq=%d: inserted=%v err=%v", seq, res.Inserted, err)
 	}
 	return questionID
 }
@@ -64,10 +64,10 @@ func TestGetLatestRunQuestionLiveDB(t *testing.T) {
 
 	// A NON-question message must not satisfy the query: the kind filter is what makes
 	// this "the question", and a run's feed is mostly other kinds.
-	if rows, err := f.q.InsertRunMessage(ctx, store.InsertRunMessageParams{
+	if res, err := f.q.InsertRunMessage(ctx, store.InsertRunMessageParams{
 		RunID: f.runID, Seq: 1, Kind: "text", Agent: pgT("lead"), Payload: []byte(`{"text":"hello"}`),
-	}); err != nil || rows != 1 {
-		t.Fatalf("insert text message: rows=%d err=%v", rows, err)
+	}); err != nil || !res.Inserted {
+		t.Fatalf("insert text message: inserted=%v err=%v", res.Inserted, err)
 	}
 	if _, err := f.q.GetLatestRunQuestion(ctx, f.runID); !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("a non-question message must not satisfy the query, got err=%v", err)
@@ -76,10 +76,10 @@ func TestGetLatestRunQuestionLiveDB(t *testing.T) {
 	insertQuestionMessage(ctx, t, f.q, f, 2, "q-first", "which store?")
 	insertQuestionMessage(ctx, t, f.q, f, 3, "q-second", "which cache?")
 	// A later message of another kind must not displace the newest QUESTION.
-	if rows, err := f.q.InsertRunMessage(ctx, store.InsertRunMessageParams{
+	if res, err := f.q.InsertRunMessage(ctx, store.InsertRunMessageParams{
 		RunID: f.runID, Seq: 4, Kind: "status", Agent: pgT("lead"), Payload: []byte(`{"text":"parked"}`),
-	}); err != nil || rows != 1 {
-		t.Fatalf("insert status message: rows=%d err=%v", rows, err)
+	}); err != nil || !res.Inserted {
+		t.Fatalf("insert status message: inserted=%v err=%v", res.Inserted, err)
 	}
 
 	raw, err := f.q.GetLatestRunQuestion(ctx, f.runID)

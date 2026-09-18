@@ -2,8 +2,11 @@ package workersvc
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"strings"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -35,9 +38,9 @@ type claimCred struct {
 // a default fallback can name the same token, and PRD #104's compatibility path
 // creates a row labelled literally "default", so the label alone answers nothing).
 //
-// These are ALIASES, not a second definition. The whole eight-value vocabulary lives
+// These are ALIASES, not a second definition. The whole ten-value vocabulary lives
 // in autoselect (see Reason there for why it hosts even the non-auto three), and
-// migration 00089's CHECK is the same eight; these exist only so the claim path reads
+// the SQL CHECK is the same ten (00089's eight, widened by 00233); these exist only so the claim path reads
 // in its own idiom rather than saying string(autoselect.ReasonPinned) on every line.
 // Aliasing means a rename upstream is a compile error here, which a second set of
 // string literals would not be.
@@ -45,7 +48,18 @@ const (
 	selectReasonDefault = string(autoselect.ReasonDefault)
 	selectReasonPinned  = string(autoselect.ReasonPinned)
 	selectReasonJudge   = string(autoselect.ReasonJudge)
+	// PRD #1247 M1: the two per-run credential override reasons, same alias idiom as
+	// the three above (a rename upstream is a compile error here). run_pinned = a per-run
+	// override named a token; run_default = a per-run override of mode 'default'.
+	selectReasonRunPinned  = string(autoselect.ReasonRunPinned)
+	selectReasonRunDefault = string(autoselect.ReasonRunDefault)
 )
+
+// effectiveClaimModeUnknown is effectiveNextClaimMode's answer when the next claim's
+// mode cannot be predicted — no recorded worker, or a worker the caller could not load
+// (PRD #1247). It is deliberately NOT one of the three bind modes: 6e and the switch
+// verb must treat it as "do not promote early", the safe direction.
+const effectiveClaimModeUnknown = "unknown"
 
 // secretChoice is WHICH credential a claim should spend and WHY: the override
 // openAnthropic takes (nil ⇒ the owner's default), the reason to record, and the
@@ -253,7 +267,7 @@ func (s *Service) openAnthropic(ctx context.Context, userID uuid.UUID, secretID 
 // case that is NOT an error: it means the run vanished under us (its forge
 // connection cascade-deleted the repo → run), which every other claim-path reader
 // treats as errRunVanished and drops.
-func (s *Service) recordRunCredential(ctx context.Context, run store.Run, cred claimCred, choice secretChoice) error {
+func (s *Service) recordRunCredential(ctx context.Context, run store.Run, cred claimCred, choice secretChoice, emitSwitchMessage bool) (int32, error) {
 	// The headroom recorded is the RAW headroom of the pick — what the user's own
 	// meters show — never the in-flight-penalised rank, which is an internal ordering
 	// key that appears nowhere else in the product. NULL for every non-auto lane,
@@ -264,7 +278,41 @@ func (s *Service) recordRunCredential(ctx context.Context, run store.Run, cred c
 	if choice.headroom != nil {
 		headroom = pgtype.Int2{Int16: *choice.headroom, Valid: true}
 	}
-	n, err := s.q.SetRunAnthropicSecret(ctx, store.SetRunAnthropicSecretParams{
+	// The RUN-LANE claim path (emitSwitchMessage) emits a 'credential_switch' run message on an
+	// APPLIED token switch, ATOMICALLY with the credential write + epoch journal, so the message
+	// and the journal can never disagree about which token this claim spends (PRD #1247 M9, D7/D14).
+	// That needs a transaction; when none is wired — the chat/judge lanes (emitSwitchMessage=false),
+	// or a degraded/test deployment with no pool — fall back to the two-write, no-message path,
+	// byte-identical to the pre-M9 behaviour. The two-write path returns run.LastSeq unchanged
+	// (its callers discard it).
+	if !emitSwitchMessage || s.txBeginner == nil {
+		if err := writeCredentialAndEpoch(ctx, s.q, run, cred, choice, headroom); err != nil {
+			return 0, err
+		}
+		return run.LastSeq, nil
+	}
+	return s.recordRunCredentialTx(ctx, run, cred, choice, headroom)
+}
+
+// credentialWriter is the two-statement credential-record surface shared by the transactional
+// (qtx: *store.Queries) and the non-transactional (s.q: workersvc Store) recordRunCredential
+// paths, so the SetRunAnthropicSecret + RecordRunCredentialEpoch pair is written once and both
+// paths cannot drift (PRD #1247 M9). Both satisfy it.
+type credentialWriter interface {
+	SetRunAnthropicSecret(ctx context.Context, arg store.SetRunAnthropicSecretParams) (int64, error)
+	RecordRunCredentialEpoch(ctx context.Context, arg store.RecordRunCredentialEpochParams) error
+}
+
+// writeCredentialAndEpoch records WHICH credential a claim spent (SetRunAnthropicSecret) and
+// appends the attribution-journal epoch for THIS claim (RecordRunCredentialEpoch), keyed by the
+// run's existing claim_generation (00223, PRD #1349 — this PRD never increments it). The epoch is
+// written AFTER SetRunAnthropicSecret confirmed a live run (n>0), so the FK to runs cannot fail on
+// a vanished run and the epoch can never disagree with runs.anthropic_secret_id about which token
+// this claim spent. Idempotent on the composite PK, so a claim retried at the same generation
+// re-records rather than duplicating. A 0-row SetRunAnthropicSecret is errRunVanished (the run's
+// forge connection cascade-deleted the repo → run), the one non-error 0-row case.
+func writeCredentialAndEpoch(ctx context.Context, w credentialWriter, run store.Run, cred claimCred, choice secretChoice, headroom pgtype.Int2) error {
+	n, err := w.SetRunAnthropicSecret(ctx, store.SetRunAnthropicSecretParams{
 		AnthropicSecretID:     pgconv.UUID(cred.ID),
 		AnthropicSecretLabel:  pgconv.TextOrNull(cred.Label),
 		AnthropicSelectReason: pgconv.TextOrNull(choice.reason),
@@ -278,7 +326,243 @@ func (s *Service) recordRunCredential(ctx context.Context, run store.Run, cred c
 	if n == 0 {
 		return errRunVanished
 	}
+	if err := w.RecordRunCredentialEpoch(ctx, store.RecordRunCredentialEpochParams{
+		RunID:           run.ID,
+		ClaimGeneration: run.ClaimGeneration,
+		SecretID:        pgconv.UUID(cred.ID),
+		Label:           pgconv.TextOrNull(cred.Label),
+		SelectReason:    pgconv.TextOrNull(choice.reason),
+	}); err != nil {
+		return fmt.Errorf("record run credential epoch: %w", err)
+	}
 	return nil
+}
+
+// credentialSwitchMessageKind is the run_messages.kind for the per-applied-switch feed message
+// (PRD #1247 M9, task c). There is NO CHECK constraint on run_messages.kind (kinds like 'plan' /
+// 'question' were added without a migration), so minting a new kind needs no migration. The fold
+// filters kind IN ('status','error'), so this kind is invisible to usage folding by construction.
+const credentialSwitchMessageKind = "credential_switch" //nolint:gosec // G101: a run_messages.kind label, not a credential
+
+// maxSwitchSeqAttempts bounds the gapless seq-collision recovery loop (PRD #1247 M9, task c step
+// 7). A worker's InsertRunMessage is NOT serialized by the run-row FOR UPDATE lock the switch
+// transaction holds, so a worker frame can occupy the seq we try; one re-read + retry normally
+// lands it (at most one competing frame at a time). The bound is generous defense against a
+// pathological burst; on exhaustion the mandatory credential write still commits and only the
+// best-effort message is skipped (see insertCredentialSwitchMessage).
+//
+// A var, not a const, only so the seq-collision regression test can lower it to force the loop to
+// exhaust; production never reassigns it (default 32).
+var maxSwitchSeqAttempts = 32
+
+// credentialSwitchMessagePayload is the 'credential_switch' run message body (PRD #1247 M9, task
+// c): enough for a downstream renderer to say "Switched to token <label> (<reason>)" and for the
+// Slack resume DM to name the token. Label is a pointer so an unlabelled token serialises as JSON
+// null rather than "".
+type credentialSwitchMessagePayload struct {
+	Label        *string `json:"label"`
+	SelectReason string  `json:"select_reason"`
+	SecretID     string  `json:"secret_id"`
+}
+
+// pendingSwitchBroadcast carries the just-inserted switch message out of the transaction so the
+// caller can broadcast it AFTER commit (never before — a spare-slot reclaim must not see a message
+// the tx might roll back). nil ⇒ no message was inserted (no switch, or an idempotent skip).
+type pendingSwitchBroadcast struct {
+	seq     int32
+	payload json.RawMessage
+}
+
+// recordRunCredentialTx is recordRunCredential's transactional (run-lane claim) path (PRD #1247
+// M9, task c). In ONE transaction it: locks the run row (FOR UPDATE) and re-validates the claim
+// fence under the lock; writes the credential + epoch; detects an APPLIED token switch by the
+// epoch delta; and, on a switch, emits an idempotent 'credential_switch' run message at a gapless
+// seq and advances runs.last_seq to the seq it landed. It returns the (possibly bumped) last_seq —
+// the caller sets ClaimPayload.LastSeq to it (NOT the stale run.LastSeq snapshot) so the worker
+// resumes past the server-inserted message and never re-uses its seq. The switch message is
+// broadcast AFTER commit, best-effort; a nil broadcaster is covered by REST replay (?after=<seq>).
+func (s *Service) recordRunCredentialTx(ctx context.Context, run store.Run, cred claimCred, choice secretChoice, headroom pgtype.Int2) (int32, error) {
+	gen := run.ClaimGeneration
+
+	tx, err := s.txBeginner.Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("record run credential: begin tx: %w", err)
+	}
+	// A no-op after a successful Commit; on every early return it undoes the lock and any write.
+	defer func() { _ = tx.Rollback(ctx) }()
+	qtx := store.New(tx)
+
+	// Step 1: lock the run row and re-read the fence columns (generation, released, last_seq).
+	locked, err := qtx.GetRunByIDForUpdate(ctx, run.ID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, errRunVanished
+		}
+		return 0, fmt.Errorf("record run credential: lock run: %w", err)
+	}
+	// Step 2: fence re-validate UNDER THE LOCK. A raced release/reclaim — the claim was released
+	// (claim_released_at set) or a reclaim bumped the generation past this claim's — makes this
+	// assembly stale. Abort WITHOUT writing and treat it like the vanished-run path
+	// (recoverClaimAssembly drops errRunVanished to an idle no-op; the run is requeued and
+	// re-claimed fresh). Defense in depth: assembleClaim runs synchronously right after ClaimRun,
+	// so the fence normally holds.
+	if locked.ClaimGeneration != gen || locked.ClaimReleasedAt.Valid {
+		return 0, errRunVanished
+	}
+
+	// Steps 3+4: the credential write and the epoch journal, in the tx.
+	if err := writeCredentialAndEpoch(ctx, qtx, run, cred, choice, headroom); err != nil {
+		return 0, err
+	}
+
+	lastSeq := locked.LastSeq
+	var broadcast *pendingSwitchBroadcast
+
+	// Step 5: applied-switch detection (epoch delta). Belt-and-braces skip for self_improve (D10):
+	// that lane follows the judge binding, so its epoch delta will not fire anyway.
+	if run.Kind != runkind.SelfImprove {
+		switched, err := priorEpochIsDifferentToken(ctx, qtx, run.ID, gen, cred.ID)
+		if err != nil {
+			return 0, err
+		}
+		if switched {
+			// Steps 6+7+8: idempotent insert at a gapless seq + last_seq advance, all in the tx.
+			// newLast is the last_seq this tx adopts even when no message was inserted (an idempotent
+			// skip returns the locked high-water; exhaustion returns MAX(seq)).
+			newLast, bc, err := s.insertCredentialSwitchMessage(ctx, qtx, run.ID, gen, cred, choice, locked.LastSeq)
+			if err != nil {
+				return 0, err
+			}
+			lastSeq = newLast
+			if bc != nil {
+				broadcast = bc
+			}
+		}
+	}
+
+	// Step 9: commit.
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("record run credential: commit: %w", err)
+	}
+
+	// AFTER commit only (never before): broadcast the new message to the run's WS channel. A nil
+	// broadcaster (tests / a deployment without the WS hub) is covered by REST replay — last_seq
+	// was advanced in the tx, so a client polling ?after=<prev> picks the message up.
+	if broadcast != nil && s.bcast != nil {
+		s.bcast.PublishMessage(run.ID, broadcast.seq, credentialSwitchMessageKind, "", "", "", broadcast.payload, s.now())
+	}
+	return lastSeq, nil
+}
+
+// priorEpochIsDifferentToken reports whether the run's epoch IMMEDIATELY BEFORE gen named a
+// DIFFERENT, known token than the current claim spends — i.e. this claim is an APPLIED switch (PRD
+// #1247 M9, task c step 5). No prior epoch (pgx.ErrNoRows) is a FIRST claim → not a switch. A
+// prior epoch naming the SAME token is a same-token reclaim → not a switch. A prior epoch with no
+// recorded secret (never happens for a successful claim) is treated conservatively as NOT a switch,
+// so a message is never emitted on evidence that cannot name the prior token. Robust and decoupled
+// from the #1422-deferred switch-stamp clear.
+func priorEpochIsDifferentToken(ctx context.Context, q *store.Queries, runID uuid.UUID, gen int64, current uuid.UUID) (bool, error) {
+	prior, err := q.GetPriorRunCredentialEpoch(ctx, store.GetPriorRunCredentialEpochParams{RunID: runID, ClaimGeneration: gen})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		return false, fmt.Errorf("record run credential: prior epoch: %w", err)
+	}
+	if !prior.SecretID.Valid {
+		return false, nil
+	}
+	return uuid.UUID(prior.SecretID.Bytes) != current, nil
+}
+
+// insertCredentialSwitchMessage inserts the 'credential_switch' feed message for an applied switch
+// and advances runs.last_seq, all inside the caller's transaction (PRD #1247 M9, task c steps
+// 6/7/8). It returns the last_seq the transaction should adopt, plus the inserted message for the
+// caller to broadcast after commit (nil broadcast ⇒ nothing was inserted — an idempotent skip, or
+// the bounded seq-collision loop exhausted).
+//
+//   - Step 6 (idempotency): a 'credential_switch' message already recorded for this
+//     (run_id, claim_generation) means a same-generation retry — skip, return startLastSeq with a
+//     nil broadcast, no duplicate. startLastSeq is the locked high-water, which already reflects any
+//     earlier committed advance.
+//   - Step 7 (gapless seq): seq starts at last_seq+1; a worker frame may already occupy it (its
+//     InsertRunMessage is not serialized by our run-row lock), so on the ON CONFLICT (Inserted
+//     false) re-read MAX(seq) and retry at max+1, leaving no gap and losing no worker frame. Under
+//     the lock the generation fence always holds, so Inserted false is only a seq collision. On a
+//     successful insert, return that seq.
+//   - Step 8: advance runs.last_seq (GREATEST) to the seq that actually landed, in the same tx.
+//
+// On exhaustion the mandatory credential write + epoch already committed in this tx, so only the
+// best-effort message is skipped — but runs.last_seq is STILL advanced (GREATEST, gen-fenced) to
+// MAX(seq) floored at startLastSeq, and that value is returned, so ClaimPayload.LastSeq is never
+// below the true high-water even when the attribution message is skipped and the worker never
+// resumes at a seq already present in run_messages.
+func (s *Service) insertCredentialSwitchMessage(ctx context.Context, q *store.Queries, runID uuid.UUID, gen int64, cred claimCred, choice secretChoice, startLastSeq int32) (int32, *pendingSwitchBroadcast, error) {
+	n, err := q.CountCredentialSwitchMessages(ctx, store.CountCredentialSwitchMessagesParams{RunID: runID, ClaimGeneration: gen})
+	if err != nil {
+		return 0, nil, fmt.Errorf("record run credential: idempotency check: %w", err)
+	}
+	if n > 0 {
+		// Already emitted for this generation; no duplicate, no broadcast. Keep the locked
+		// high-water (it already reflects any earlier committed advance).
+		return startLastSeq, nil, nil
+	}
+
+	payload := credentialSwitchMessagePayload{SelectReason: choice.reason, SecretID: cred.ID.String()}
+	if strings.TrimSpace(cred.Label) != "" {
+		label := cred.Label
+		payload.Label = &label
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return 0, nil, fmt.Errorf("record run credential: marshal switch payload: %w", err)
+	}
+
+	seq := startLastSeq + 1
+	for attempt := 0; attempt < maxSwitchSeqAttempts; attempt++ {
+		res, err := q.InsertRunMessage(ctx, store.InsertRunMessageParams{
+			RunID:           runID,
+			Seq:             seq,
+			Kind:            credentialSwitchMessageKind,
+			Payload:         raw,
+			ClaimGeneration: pgconv.Int8Ptr(&gen),
+		})
+		if err != nil {
+			return 0, nil, fmt.Errorf("record run credential: insert switch message: %w", err)
+		}
+		if res.Inserted {
+			if _, err := q.UpdateRunLastSeq(ctx, store.UpdateRunLastSeqParams{ID: runID, Seq: seq, ClaimGeneration: pgconv.Int8Ptr(&gen)}); err != nil {
+				return 0, nil, fmt.Errorf("record run credential: advance last_seq: %w", err)
+			}
+			return seq, &pendingSwitchBroadcast{seq: seq, payload: raw}, nil
+		}
+		// ON CONFLICT (run_id, seq): a worker frame beat us to this seq. Re-read the high-water
+		// mark and retry at max+1 (no gap, no lost frame).
+		maxSeq, err := q.MaxRunMessageSeq(ctx, runID)
+		if err != nil {
+			return 0, nil, fmt.Errorf("record run credential: re-read max seq: %w", err)
+		}
+		seq = maxSeq + 1
+	}
+	// Exhausted the bounded retry — extraordinarily unlikely. Do NOT fail the claim over a
+	// best-effort attribution message: the mandatory credential write + epoch already committed in
+	// this tx. Skip only the message, but still advance runs.last_seq to the true high-water so the
+	// caller's ClaimPayload.LastSeq never sits below a seq already present in run_messages (a stale
+	// last_seq would resume the worker onto an occupied seq).
+	maxSeq, err := q.MaxRunMessageSeq(ctx, runID)
+	if err != nil {
+		return 0, nil, fmt.Errorf("record run credential: re-read max seq: %w", err)
+	}
+	newLast := maxSeq
+	if newLast < startLastSeq {
+		newLast = startLastSeq
+	}
+	if _, err := q.UpdateRunLastSeq(ctx, store.UpdateRunLastSeqParams{ID: runID, Seq: newLast, ClaimGeneration: pgconv.Int8Ptr(&gen)}); err != nil {
+		return 0, nil, fmt.Errorf("record run credential: advance last_seq: %w", err)
+	}
+	slog.Warn("workersvc: credential switch message seq collision retry exhausted",
+		"run_id", runID.String(), "generation", gen)
+	return newLast, nil, nil
 }
 
 // claimSecretID resolves WHICH credential a run-lane claim spends, and is the one
@@ -302,13 +586,164 @@ func (s *Service) claimSecretID(ctx context.Context, wkr store.Worker, run store
 		// Full judge resolution, including the `auto` pool ranker and D4's empty-pool
 		// fallback (PRD #1140 M2): self_improve is uzi reviewing itself and follows the
 		// judge's credential, not a worker's. The run-lane open-failed retry still wraps
-		// this because self_improve rides assembleClaim (via openWithAutoRetry).
+		// this because self_improve rides assembleClaim (via openWithAutoRetry). Checked
+		// FIRST, so the run override below can never apply to self_improve (D10: that lane
+		// is not switchable — the verb refuses it rather than writing an override its
+		// ladder would ignore).
 		return s.judgeChoice(ctx, run)
+	}
+	// PRD #1247 M1 (D2): a per-run credential override outranks the worker binding for
+	// THIS run — the user chose it for this run specifically. It sits BETWEEN the
+	// self_improve/judge branch above and the worker bind-mode branch below. NULL mode
+	// (every pre-feature run and every run created without a choice) and a `pinned` mode
+	// whose id was nulled by a token delete both fall through to the worker binding
+	// (inherit, D1), so behaviour is byte-identical to today when no override is set.
+	if choice, ok, err := s.runOverrideChoice(ctx, run); err != nil {
+		return secretChoice{}, err
+	} else if ok {
+		return choice, nil
 	}
 	if wkr.AnthropicBindMode == BindModeAuto {
 		return s.autoChoice(ctx, run)
 	}
 	return staticChoice(workerSecretID(wkr), selectReasonPinned), nil
+}
+
+// runOverrideChoice resolves the per-run credential override rung of the ladder (PRD
+// #1247 M1, D1/D2/D9). ok is false when there is NO override to apply and the caller
+// must fall through to the worker binding: a NULL/empty mode, a `pinned` mode whose id
+// was nulled by a token delete (D1, mirroring #104's worker-binding rule), or an
+// unrecognised mode (impossible through the validator + the 00233 CHECK, resolved as
+// inherit — the safe direction). ok is true when the override decides the credential:
+//
+//   - pinned + a live id → staticChoice(id, run_pinned), but ONLY after confirming the
+//     id is the caller's own anthropic_token via the kind-scoped lookup. A foreign or
+//     wrong-kind id resolves to errCredentialUnavailable (D9) rather than falling through
+//     to inherit — inheriting would silently spend the worker's binding and misattribute.
+//     openAnthropic then opens by id with its own owner-scoped read; the existing
+//     worker/judge lanes keep their non-kind-scoped lookup unchanged.
+//   - auto → the SAME autoChoice ranker the auto worker uses. errAutoPoolEmpty propagates
+//     exactly as it does for an auto worker (the caller holds the run in pool_wait).
+//   - default → an EXPLICITLY constructed choice with reason run_default. It cannot use
+//     staticChoice(nil, …), which always reports `default`: run_default is a deliberate
+//     per-run choice of the owner default, distinct from an unset binding, and D20 makes
+//     the run view name that difference.
+func (s *Service) runOverrideChoice(ctx context.Context, run store.Run) (secretChoice, bool, error) {
+	if !run.CredentialOverrideMode.Valid || run.CredentialOverrideMode.String == "" {
+		return secretChoice{}, false, nil
+	}
+	switch run.CredentialOverrideMode.String {
+	case BindModePinned:
+		if !run.CredentialOverrideSecretID.Valid {
+			// The FK nulled the id when the token was deleted; the mode stays. Resolve
+			// as inherit (D1), exactly the worker-pin rule for a deleted binding.
+			return secretChoice{}, false, nil
+		}
+		id := uuid.UUID(run.CredentialOverrideSecretID.Bytes)
+		// Kind-scoped resolution (D9): the override id must name the caller's OWN
+		// anthropic_token. A foreign id, a deleted-but-not-nulled id, or a wrong-kind
+		// id all return pgx.ErrNoRows here → errCredentialUnavailable, never another
+		// lane's credential and never a silent inherit.
+		if _, err := s.q.GetUserSecretMetaByIDOfKind(ctx, store.GetUserSecretMetaByIDOfKindParams{
+			ID:     id,
+			UserID: run.UserID,
+			Kind:   store.KindAnthropicToken,
+		}); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return secretChoice{}, true, fmt.Errorf("%w: run credential override is not an available Anthropic token", errCredentialUnavailable)
+			}
+			return secretChoice{}, true, fmt.Errorf("run credential override lookup: %w", err)
+		}
+		return staticChoice(&id, selectReasonRunPinned), true, nil
+	case BindModeAuto:
+		choice, err := s.autoChoice(ctx, run)
+		if err != nil {
+			return secretChoice{}, true, err
+		}
+		return choice, true, nil
+	case BindModeDefault:
+		// The owner default, chosen for THIS run. Built directly so the reason is
+		// run_default rather than staticChoice's `default`.
+		return secretChoice{reason: selectReasonRunDefault}, true, nil
+	default:
+		// Unrecognised mode (the CHECK and validator forbid it): inherit, the safe
+		// direction — spending the worker binding is what a run did before overrides.
+		return secretChoice{}, false, nil
+	}
+}
+
+// effectiveNextClaimMode is the shared PURE policy for "which mode will resolve the
+// run's NEXT claim" (PRD #1247, the one seam consulted by Decision 6e at park time, the
+// duration-time pass, and the verb's D6 warnings). It is derived from the run + owner +
+// worker rows, NEVER from anthropic_select_reason (which describes the PREVIOUS claim and
+// goes stale the moment a binding changes while parked).
+//
+//   - self_improve → the owner's judge bind mode, resolved by the caller and passed in
+//     (self_improve follows the judge binding, D10). The override never applies here.
+//   - else the run override: pinned/auto/default, EXCEPT a `pinned` whose id was nulled
+//     (inherit), which falls through to the worker.
+//   - else the recorded worker_id's bind mode.
+//   - a missing recorded worker, or a deleted worker (a zero-value worker row), → unknown.
+//
+// It has no production caller in M1 — M3 wires it into decideLimitPark — and is kept
+// alive by the workersvc unit tests that exercise every rung.
+func effectiveNextClaimMode(run store.Run, ownerJudgeMode string, worker store.Worker) string {
+	if run.Kind == runkind.SelfImprove {
+		return ownerJudgeMode
+	}
+	if run.CredentialOverrideMode.Valid && run.CredentialOverrideMode.String != "" {
+		switch run.CredentialOverrideMode.String {
+		case BindModePinned:
+			if run.CredentialOverrideSecretID.Valid {
+				return BindModePinned
+			}
+			// nulled pin → inherit; fall through to the worker binding below.
+		case BindModeAuto:
+			return BindModeAuto
+		case BindModeDefault:
+			return BindModeDefault
+		}
+	}
+	// Inherit the recorded worker's bind mode. No recorded worker, or a worker the
+	// caller could not load (zero-value row), is unknown — the next claim's mode cannot
+	// be predicted, so 6e and the verb must not promote it early.
+	if !run.WorkerID.Valid || worker.ID == uuid.Nil {
+		return effectiveClaimModeUnknown
+	}
+	return worker.AnthropicBindMode
+}
+
+// ownerJudgeBindMode reads the run owner's judge-lane bind mode for
+// effectiveNextClaimMode's self_improve rung (PRD #1247). It reuses judgeChoice's own
+// GetUserJudgeAnthropicBinding read — the SAME query that resolves the credential at
+// claim time — so the mode 6e and the D8 pass predict a self_improve resume against is
+// exactly the one its next claim will use. Only a self_improve run needs it; every
+// other kind passes "" without a read, since effectiveNextClaimMode ignores
+// ownerJudgeMode for them. A lookup error is propagated (never swallowed into a wrong
+// mode), matching judgeChoice.
+func (s *Service) ownerJudgeBindMode(ctx context.Context, userID uuid.UUID) (string, error) {
+	bound, err := s.q.GetUserJudgeAnthropicBinding(ctx, userID)
+	if err != nil {
+		return "", fmt.Errorf("owner judge binding lookup: %w", err)
+	}
+	return bound.JudgeAnthropicBindMode, nil
+}
+
+// claimExcludeFor is claimExclude's pure core (PRD #1247 M3): the credential a resume
+// must not re-pick, given only the run's dead-credential id and its retry cadence. It
+// exists so a caller holding just those two columns (the D8 re-eval pass, the widened
+// pool-wait resume) can ask the same question the full-row claimExclude asks, without
+// materialising a whole store.Run. uuid.Nil means "exclude nothing".
+func (s *Service) claimExcludeFor(limitDead pgtype.UUID, retryNotBefore pgtype.Timestamptz) uuid.UUID {
+	if !limitDead.Valid {
+		return uuid.Nil
+	}
+	// Window still closed → keep excluding. Relax (Nil) once retry_not_before has
+	// reopened, and also when there is no reset stamp to wait on.
+	if retryNotBefore.Valid && retryNotBefore.Time.After(s.now()) {
+		return uuid.UUID(limitDead.Bytes)
+	}
+	return uuid.Nil
 }
 
 // claimExclude is the credential this claim must NOT resolve onto: the run's
@@ -334,15 +769,7 @@ func (s *Service) claimSecretID(ctx context.Context, wkr store.Worker, run store
 // ever hand a not-yet-due run to the claim path, and the M2 exclusion tests inject a
 // future stamp to exercise it.
 func (s *Service) claimExclude(run store.Run) uuid.UUID {
-	if !run.LimitDeadSecretID.Valid {
-		return uuid.Nil
-	}
-	// Window still closed → keep excluding. Relax (Nil) once it has reopened, and also
-	// when there is no reset stamp to wait on (nothing says the window is closed).
-	if run.RetryNotBefore.Valid && run.RetryNotBefore.Time.After(s.now()) {
-		return uuid.UUID(run.LimitDeadSecretID.Bytes)
-	}
-	return uuid.Nil
+	return s.claimExcludeFor(run.LimitDeadSecretID, run.RetryNotBefore)
 }
 
 // autoChoice runs the selector for an `auto` worker (PRD #111 M4, #754 M2).

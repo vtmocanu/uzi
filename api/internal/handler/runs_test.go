@@ -80,9 +80,12 @@ type runsStore struct {
 	// pgx.ErrNoRows so a run shows no usage — existing GetRun tests are unaffected.
 	hasRunUsage   bool
 	runUsageTotal store.GetRunUsageTotalRow
-	selfUsage     store.SelfUsageRow
-	adminTotals   store.AdminUsageTotalsRow
-	adminPerUser  []store.AdminUsagePerUserRow
+	// PRD #1247 M1: the credential attribution journal ListRunCredentialEpochs returns
+	// (empty by default, so GetRun reads credential_epochs: []).
+	credentialEpochs []store.RunCredentialEpoch
+	selfUsage        store.SelfUsageRow
+	adminTotals      store.AdminUsageTotalsRow
+	adminPerUser     []store.AdminUsagePerUserRow
 	// PRD #95 steer queue: the follow_up rows ListFollowUpInputsForRun returns, and the
 	// row CreateRunInput echoes (so the richer follow-up write's id/created_at are
 	// assertable).
@@ -196,6 +199,19 @@ func (s *runsStore) GetRunUsageTotal(_ context.Context, _ uuid.UUID) (store.GetR
 		return store.GetRunUsageTotalRow{}, pgx.ErrNoRows
 	}
 	return s.runUsageTotal, nil
+}
+
+// ListRunCredentialEpochs backs GetRun's credential_epochs enrichment (PRD #1247 M1):
+// the staged journal, empty by default so existing GetRun tests read [].
+func (s *runsStore) ListRunCredentialEpochs(_ context.Context, _ store.ListRunCredentialEpochsParams) ([]store.RunCredentialEpoch, error) {
+	return s.credentialEpochs, nil
+}
+
+// HeartbeatWorker lets a test seed the in-memory outbox tracker through the public
+// Service.Heartbeat entry point (PRD #1391): Heartbeat records the outbox depth before
+// this liveness write, so returning the bare worker is enough for the record to land.
+func (s *runsStore) HeartbeatWorker(_ context.Context, arg store.HeartbeatWorkerParams) (store.Worker, error) {
+	return store.Worker{ID: arg.ID}, nil
 }
 func (s *runsStore) SelfUsage(_ context.Context, _ uuid.UUID) (store.SelfUsageRow, error) {
 	return s.selfUsage, nil
@@ -489,6 +505,201 @@ func TestGetRunPopulatesOwnAgents(t *testing.T) {
 			t.Fatalf("lead must be stripped from own_agents, got %+v", got)
 		}
 	}
+}
+
+// TestGetRunCredentialSwitchSuppression proves the PRD #1247 Step A enrichment override
+// (runs_lifecycle.go): the run-detail DTO suppresses a KNOWN-STALE credential_switch once an
+// APPLIED credential epoch exists at a generation STRICTLY GREATER THAN the switch stamp's
+// generation. credentialSwitchState derives credential_switch purely from the run row, but the
+// DB clear of the stamp on a successful application is deferred (D14 / #1422), so after a
+// release+reclaim the row still reads "requested"/"released" for a switch already applied. The
+// strict-> comparator is the crux: recordRunCredential already wrote an epoch AT the stamp
+// generation when the current claim opened, so an epoch == G is the pre-request epoch and must
+// NOT suppress — only an applied epoch at > G, written after the reclaim, does. Drives the real
+// GetRun HTTP enrichment path so it exercises the override, not a reimplementation.
+func TestGetRunCredentialSwitchSuppression(t *testing.T) {
+	str := func(s string) *string { return &s }
+	reqAt := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	applied := func(gen int64) store.RunCredentialEpoch {
+		return store.RunCredentialEpoch{ClaimGeneration: gen, AppliedAt: pgtype.Timestamptz{Time: reqAt.Add(time.Minute), Valid: true}}
+	}
+	unapplied := func(gen int64) store.RunCredentialEpoch {
+		// AppliedAt left zero (Valid=false): the epoch row exists but the switch is not
+		// yet applied at that generation.
+		return store.RunCredentialEpoch{ClaimGeneration: gen}
+	}
+
+	const stampGen = 5
+	requested := pgtype.Timestamptz{Time: reqAt, Valid: true}
+	released := pgtype.Timestamptz{Time: reqAt, Valid: true} // >= requested → "released"
+	stamp := pgtype.Int8{Int64: stampGen, Valid: true}
+
+	cases := []struct {
+		name    string
+		release pgtype.Timestamptz
+		epochs  []store.RunCredentialEpoch
+		want    *string // nil = suppressed (credential_switch: null)
+	}{
+		{
+			// Requested, not released, no later applied epoch → stays "requested".
+			name:    "pending stays requested",
+			release: pgtype.Timestamptz{}, // not released
+			epochs:  nil,
+			want:    str("requested"),
+		},
+		{
+			// Released, an applied epoch AT the stamp generation (== G, the current claim's
+			// pre-request epoch) → NOT suppressed. The key strict-> guard.
+			name:    "same-generation epoch keeps released visible",
+			release: released,
+			epochs:  []store.RunCredentialEpoch{applied(stampGen)},
+			want:    str("released"),
+		},
+		{
+			// Released, an applied epoch at G plus an UNAPPLIED later epoch (applied_at
+			// invalid): no APPLIED epoch at > G, so still "released".
+			name:    "later epoch not yet applied keeps released",
+			release: released,
+			epochs:  []store.RunCredentialEpoch{applied(stampGen), unapplied(stampGen + 1)},
+			want:    str("released"),
+		},
+		{
+			// Released, an applied epoch at G+1 (> stamp) → suppressed to null.
+			name:    "applied epoch past stamp suppresses",
+			release: released,
+			epochs:  []store.RunCredentialEpoch{applied(stampGen), applied(stampGen + 1)},
+			want:    nil,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			owner := store.User{ID: uuid.New()}
+			runID := uuid.New()
+			st := &runsStore{
+				ownerID: owner.ID,
+				run: store.Run{
+					ID:                          runID,
+					UserID:                      owner.ID,
+					Status:                      "running",
+					CredentialSwitchRequestedAt: requested,
+					ClaimReleasedAt:             tc.release,
+					CredentialSwitchGeneration:  stamp,
+				},
+				credentialEpochs: tc.epochs,
+			}
+			h := newRunsHandler(t, st)
+
+			rec := httptest.NewRecorder()
+			h.GetRun(rec, runReq(owner, runID))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("GetRun = %d, want 200", rec.Code)
+			}
+			var body struct {
+				Run struct {
+					CredentialSwitch *string `json:"credential_switch"`
+				} `json:"run"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Fatalf("decode body: %v", err)
+			}
+			got := body.Run.CredentialSwitch
+			switch {
+			case tc.want == nil && got != nil:
+				t.Fatalf("credential_switch = %q, want null (suppressed)", *got)
+			case tc.want != nil && got == nil:
+				t.Fatalf("credential_switch = null, want %q", *tc.want)
+			case tc.want != nil && *got != *tc.want:
+				t.Fatalf("credential_switch = %q, want %q", *got, *tc.want)
+			}
+		})
+	}
+}
+
+// TestGetRunOutcomePendingOverlay pins the PRD #1391 M3 (D13) enrichment overlay in
+// GetRun: run.outcome_pending surfaces when the run's OWNING worker reported a recognised
+// blocked-terminal reason on its heartbeat outbox, an UNRECOGNISED (untrusted) reason is
+// dropped, and the overlay is owner-gated so a NON-owning worker's report can never flip a
+// victim's run page. Drives the real GetRun HTTP path and seeds the in-memory outbox
+// through the public Service.Heartbeat, so it exercises the actual overlay, not a
+// reimplementation.
+func TestGetRunOutcomePendingOverlay(t *testing.T) {
+	owner := store.User{ID: uuid.New()}
+	runID := uuid.New()
+	ownerWorker := uuid.New()
+
+	newStore := func() *runsStore {
+		return &runsStore{
+			ownerID: owner.ID,
+			run: store.Run{
+				ID:       runID,
+				UserID:   owner.ID,
+				Status:   "running",
+				WorkerID: pgtype.UUID{Bytes: ownerWorker, Valid: true},
+			},
+		}
+	}
+	seed := func(t *testing.T, h *Handler, reporter uuid.UUID, reason string) {
+		t.Helper()
+		if _, err := h.wsvc.Heartbeat(context.Background(), store.Worker{ID: reporter}, nil,
+			[]workersvc.OutboxEntry{{RunID: runID, PendingTerminal: 1, BlockedReason: reason, Since: time.Now()}}, nil); err != nil {
+			t.Fatalf("seed heartbeat: %v", err)
+		}
+	}
+	getOutcome := func(t *testing.T, h *Handler) (reason string, present bool) {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		h.GetRun(rec, runReq(owner, runID))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GetRun = %d, want 200", rec.Code)
+		}
+		var body struct {
+			Run struct {
+				OutcomePending *struct {
+					Reason string `json:"reason"`
+				} `json:"outcome_pending"`
+			} `json:"run"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
+		if body.Run.OutcomePending == nil {
+			return "", false
+		}
+		return body.Run.OutcomePending.Reason, true
+	}
+
+	t.Run("owner-reported recognised reason surfaces", func(t *testing.T) {
+		h := newRunsHandler(t, newStore())
+		seed(t, h, ownerWorker, "gap_unrecoverable")
+		reason, present := getOutcome(t, h)
+		if !present {
+			t.Fatal("outcome_pending = null, want the held outcome surfaced")
+		}
+		if reason != "gap_unrecoverable" {
+			t.Fatalf("reason = %q, want %q", reason, "gap_unrecoverable")
+		}
+	})
+
+	t.Run("unrecognised reason is dropped", func(t *testing.T) {
+		h := newRunsHandler(t, newStore())
+		seed(t, h, ownerWorker, "arbitrary worker text")
+		if reason, present := getOutcome(t, h); present {
+			t.Fatalf("outcome_pending = %q, want null: untrusted worker text must not reach the client", reason)
+		}
+	})
+
+	t.Run("non-owning worker report is owner-gated out", func(t *testing.T) {
+		h := newRunsHandler(t, newStore())
+		foreign := uuid.New()
+		if foreign == ownerWorker {
+			t.Fatal("test fixture generated identical worker ids")
+		}
+		seed(t, h, foreign, "reserve_exhausted")
+		if reason, present := getOutcome(t, h); present {
+			t.Fatalf("outcome_pending = %q, want null: a non-owning worker must not flip a victim's run page", reason)
+		}
+	})
 }
 
 func TestListRunMessagesViewerAuthz(t *testing.T) {

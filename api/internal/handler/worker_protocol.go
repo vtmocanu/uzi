@@ -9,7 +9,9 @@ import (
 	"math"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/google/uuid"
@@ -230,6 +232,12 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 		// vocabulary or the web capability picker. An unknown/garbled name here is
 		// dropped, never stored, and the register never 400s over this field.
 		ProtocolCapabilities []string `json:"protocol_capabilities"`
+		// ActiveSnapshot is the worker's active-run snapshot (PRD #1390 M2a). #1390's worker
+		// NEVER sends it on register — the path exists for #1391's restart-replay of pending
+		// outcomes (it is the one snapshot exempt from the nonce check). Captured as an isolated
+		// json.RawMessage, parsed defensively below, so a malformed body can never 400 the
+		// register (a register that fails over soft input wedges the worker's retry loop).
+		ActiveSnapshot json.RawMessage `json:"active_snapshot"`
 	}
 	if err := httpx.DecodeJSON(r, &req); err != nil && !errors.Is(err, io.EOF) {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
@@ -264,7 +272,14 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("worker reported an out-of-range max_concurrent_runs; dropping", "worker_id", wkr.ID.String(), "value", *advertisedCap)
 		advertisedCap = nil
 	}
-	updated, err := h.wsvc.Register(r.Context(), wkr, version, reported, advertisedCap, req.Capabilities, req.ProtocolCapabilities)
+	// A register-carried snapshot is parsed only when the feature is enabled; #1390's worker
+	// never sends one, so this is nil in practice (the path is #1391's). An unparseable body
+	// yields nil (dropped, logged) — never a register failure.
+	var regSnapshot *workersvc.ActiveSnapshot
+	if !h.cfg.ActiveSnapshotDisabled {
+		regSnapshot = parseActiveSnapshot(req.ActiveSnapshot, wkr.ID)
+	}
+	updated, registerNonce, err := h.wsvc.Register(r.Context(), wkr, version, reported, advertisedCap, req.Capabilities, req.ProtocolCapabilities, regSnapshot)
 	if err != nil {
 		slog.Error("worker register", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -304,29 +319,81 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 	// worker_id is echoed for the worker's convenience; identity on every other
 	// call comes from the Bearer token, never a URL path (M2 wire contract).
 	//
-	// PRD #1392 M1: protocol_features advertises the OPTIONAL wire-protocol behaviours THIS api
-	// implements, so a worker can negotiate its report shape (the register-time capability
-	// advertisement PRDs #1390/#1391 also key on — this PRD ships the field first). It is
-	// server-derived and constant, not worker input.
+	// protocol_features is the shared negotiation wire (PRD #1392 M1 / #1391 D8 / #1390 M2a):
+	// the worker sends a gated wire extension only when its feature string appears here. A
+	// just-registered worker holds nothing, so overlayOutbox is a no-op, but the register
+	// response is one of the WorkerDTO surfaces and stays uniform with the list/heartbeat
+	// paths.
+	dto := workerDTOFromWorker(updated, 0, false, "", h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt)
+	h.overlayOutbox(&dto, updated.ID)
+	// register_nonce (PRD #1390 M2a): the per-registration nonce every subsequent heartbeat and
+	// claim snapshot must echo. Minted + persisted on the worker row inside Register's tx and
+	// returned here. protocol_features gates whether the worker even sends snapshots, but the
+	// nonce is issued unconditionally (harmless to an old worker, which ignores it).
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"worker_id":         updated.ID.String(),
-		"worker":            workerDTOFromWorker(updated, 0, false, "", h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt),
-		"protocol_features": protocolFeatures(),
+		"worker":            dto,
+		"protocol_features": protocolFeatures(!h.cfg.ActiveSnapshotDisabled),
+		"register_nonce":    registerNonce,
+		// worker_outbox_max_pending (PRD #1391 Run B M3c): the server's terminal_pending outbox cap,
+		// returned at register so the worker can size its own pending-outcome quota to match the
+		// server's WORKER_OUTBOX_MAX_PENDING without a separate config channel.
+		"worker_outbox_max_pending": h.cfg.WorkerOutboxMaxPending,
 	})
 }
 
-// protocolFeatures is the closed set of optional wire-protocol behaviours this api
-// implements, advertised on the register response (PRD #1392 M1). It is EXACTLY these two:
-//   - "recovery_park_cause": SetState accepts a typed recovery_cause and, for forge_unreachable,
-//     runs the atomic custody-settling park transaction.
-//   - "recovery_release_exact_echo": the v2 worker Release endpoint echoes the released
-//     generation back.
+// protocolFeatures is the set of optional wire-protocol behaviours this api implements,
+// advertised on the register response — the shared negotiation wire the worker reads to
+// decide which gated heartbeat/message extensions to send. Composed as a UNION of per-PRD
+// slices, deduped — NEVER a single literal a sibling PRD would overwrite.
 //
-// It deliberately does NOT advertise "claim_generation_fence" — that token is owned by #1390
-// and is advertised only once that PRD lands. Returns a fresh slice so a caller cannot mutate
-// the advertised set. TestRegisterAdvertisesProtocolFeatures pins the exact two.
-func protocolFeatures() []string {
-	return []string{"recovery_park_cause", "recovery_release_exact_echo"}
+// 🔴 THE RULE, VERBATIM: each PRD adds its own slice at its landing rebase (union, never
+// replace). PRD #1392 M1 adds `recovery_park_cause` and `recovery_release_exact_echo`;
+// PRD #1391 Run A adds `heartbeat_outbox`; PRD #1247 adds `claim_generation_fence`.
+//
+// `claim_generation_fence` is a SERVER-SUPPORT advertisement, not an issue-ownership token:
+// this api now implements the per-query claim-generation fence — a `credential_switch_v1`
+// worker fails closed (ErrMissingClaimGeneration) if a mutating batch omits the generation.
+// The advertisement is what lets a NON-capability (#1391-era) worker know it may stamp the
+// field; a `credential_switch_v1` CAPABILITY worker stamps OPTIMISTICALLY regardless of this
+// advertisement (its runs are fenced server-side, and a one-shot register may have missed the
+// feature under rollout skew), and rides the strict-decode strip-and-retry fallback (PRD #1247
+// fix round) on the message, /state and completion wires if it meets an api that predates the
+// field. #1390 lands after #1247 and its own slice must preserve/dedupe
+// this token, not activate it for the first time.
+//
+// `terminal_fence` (PRD #1391 Run B M3c) is Run B's own slice, added AFTER claim_generation_fence
+// and BEFORE the conditional active_run_snapshot append. This api now implements the terminal
+// fence — a terminal (completed/failed) report may stamp messages_through_seq and SetState refuses
+// the transition (ErrMessagesPending / ErrGapUnrecoverable) until run_messages are contiguous
+// through it — so advertising the token tells a fence-capable worker it may send the field. Returns
+// a fresh slice so a caller cannot mutate the advertised set.
+//
+// `active_run_snapshot` (PRD #1390 M2a) is appended in its own group, gated on
+// activeSnapshotEnabled (= !cfg.ActiveSnapshotDisabled). When the api is started with
+// UZI_ACTIVE_SNAPSHOT_DISABLED set (the D7 rollback simulation) the token is omitted and the
+// worker never sends the snapshot — the same shape an old worker sees.
+func protocolFeatures(activeSnapshotEnabled bool) []string {
+	groups := [][]string{
+		{"recovery_park_cause", "recovery_release_exact_echo"}, // PRD #1392 M1
+		{"heartbeat_outbox"},       // PRD #1391 M5, Run A
+		{"claim_generation_fence"}, // PRD #1247 M5 (D11): this api fences message/report inserts on claim_generation for a credential_switch_v1 worker
+		{"terminal_fence"},         // PRD #1391 Run B M3c: this api fences a terminal transition on messages_through_seq contiguity
+	}
+	if activeSnapshotEnabled {
+		groups = append(groups, []string{"active_run_snapshot"}) // PRD #1390 M2a
+	}
+	seen := make(map[string]bool)
+	out := make([]string, 0)
+	for _, g := range groups {
+		for _, f := range g {
+			if !seen[f] {
+				seen[f] = true
+				out = append(out, f)
+			}
+		}
+	}
+	return out
 }
 
 // maxWorkerCPUPct clamps a worker's self-reported CPU percentage (PRD #49 Decision
@@ -356,6 +423,21 @@ func (h *Handler) WorkerHeartbeat(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Version string          `json:"version"`
 		Stats   json.RawMessage `json:"stats"`
+		// Outbox is the per-run outbox depth (PRD #1391 M5), its OWN isolated
+		// json.RawMessage exactly like Stats and for the same reason: a malformed or
+		// oversized report must drop the depth WITHOUT failing the heartbeat's liveness.
+		// The worker sends it only when the register response advertised
+		// `heartbeat_outbox` AND a run has depth, so an older api never sees it and a
+		// current worker on a rolled-back api strips it on the generic-400 retry (D8).
+		Outbox json.RawMessage `json:"outbox"`
+		// ActiveSnapshot is the worker's active-run snapshot (PRD #1390 M2a), its OWN isolated
+		// json.RawMessage like Stats/Outbox and for the same reason: a malformed body must drop
+		// the snapshot WITHOUT failing the heartbeat's liveness. The worker sends it only when
+		// the register response advertised `active_run_snapshot`. When the api is started with
+		// UZI_ACTIVE_SNAPSHOT_DISABLED (D7's rollback simulation) it is not advertised, and a
+		// heartbeat that still carries it is 400'd below — exactly the generic 400 that triggers
+		// the worker's strip-and-retry fallback.
+		ActiveSnapshot json.RawMessage `json:"active_snapshot"`
 	}
 	if err := httpx.DecodeJSON(r, &req); err != nil && !errors.Is(err, io.EOF) {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
@@ -364,13 +446,204 @@ func (h *Handler) WorkerHeartbeat(w http.ResponseWriter, r *http.Request) {
 	// Second step: validate + clamp the isolated stats (Decision 5). A malformed or
 	// invalid sample drops to nil (columns written NULL) and the heartbeat still 200s.
 	stats := parseWorkerStats(req.Stats, wkr.ID)
-	updated, err := h.wsvc.Heartbeat(r.Context(), wkr, stats)
+	// Same defensive second step for the isolated outbox (PRD #1391 M5): validate
+	// drop-not-fail and hand the parsed entries to the service, which records them in
+	// its in-process tracker. An absent/empty/malformed body yields nil — which CLEARS
+	// the worker's tracked depth (the "clears on the next empty report" contract) — and
+	// the 200 stands.
+	outbox := parseWorkerOutbox(req.Outbox, wkr.ID)
+	// Active-run snapshot (PRD #1390 M2a, D7). When the feature is DISABLED, a heartbeat carrying
+	// the field is rejected with a generic 400 — the same rejection a pre-#1390 strict decoder
+	// would give an unknown field, which is what makes the worker strip the field and retry
+	// (never a lost heartbeat once it does). When enabled, parse defensively: a malformed body
+	// drops to nil (snapshot ignored) and the heartbeat still 200s.
+	var snapshot *workersvc.ActiveSnapshot
+	if h.cfg.ActiveSnapshotDisabled {
+		if req.ActiveSnapshot != nil {
+			httpx.Error(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
+	} else {
+		snapshot = parseActiveSnapshot(req.ActiveSnapshot, wkr.ID)
+	}
+	updated, err := h.wsvc.Heartbeat(r.Context(), wkr, stats, outbox, snapshot)
 	if err != nil {
 		slog.Error("worker heartbeat", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"worker": workerDTOFromWorker(updated, 0, false, "", h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt)})
+	dto := workerDTOFromWorker(updated, 0, false, "", h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt)
+	h.overlayOutbox(&dto, updated.ID)
+	httpx.JSON(w, http.StatusOK, map[string]any{"worker": dto})
+}
+
+// Outbox heartbeat validation bounds (PRD #1391 M5). The report is untrusted
+// worker self-report bound for an in-process map and the fleet UI.
+const (
+	// maxOutboxReportBytes is the WHOLE-REPORT byte cap: past it the entire report is
+	// dropped (like parseWorkerStats drops the whole stats object), so a hostile worker
+	// cannot make the api parse an unbounded array. A worker holds at most a handful of
+	// runs, each entry a few hundred bytes, so this is generous headroom.
+	maxOutboxReportBytes = 128 << 10 // 128 KiB
+	// maxOutboxEntries is the ENTRY-COUNT cap: past it the whole report is dropped. Far
+	// above any real worker's concurrent-run count (documented soft ceiling 8).
+	maxOutboxEntries = 256
+	// maxOutboxCount is the sane per-count ceiling. A count outside [0, maxOutboxCount]
+	// drops only THAT entry (the granular precedent is parseWorkerStats' per-disk-field
+	// drop). ~1e9 is orders of magnitude above any real backlog the quota permits.
+	maxOutboxCount = 1 << 30
+	// maxOutboxBlockedBytes bounds the blocked_reason string. It is sanitized (control
+	// + format chars stripped) and truncated, never rejected — same posture as
+	// sanitizeSelfReported.
+	maxOutboxBlockedBytes = 200
+)
+
+// parseWorkerOutbox is the heartbeat's defensive second-step parse of the untrusted,
+// isolated `outbox` field (PRD #1391 M5), mirroring parseWorkerStats. It NEVER fails
+// the heartbeat: an absent, empty, null, oversized, or malformed body returns nil (a
+// nil clears the worker's tracked depth) and the 200 stands. On a drop it logs
+// worker_id + a STATIC reason only — never the raw values, which are attacker-
+// controlled until validation passes (mirrors sanitizeSelfReported's no-echo posture).
+//
+// Drop granularity, chosen deliberately (see parseWorkerStats' two precedents — the
+// coarse whole-object drop and the granular per-disk-field drop):
+//   - WHOLE-REPORT drop: the byte cap, the entry-count cap, and a top-level non-array
+//     (the outer []json.RawMessage decode fails) — none of these can be trusted to
+//     bound anything.
+//   - PER-ENTRY drop: a wrong-typed entry (its own typed Unmarshal fails), a bad run_id,
+//     a negative/absurd count, or an invalid `since` drops only that one entry (the rest
+//     of a valid report still lands), because one bad entry proves nothing about the others.
+func parseWorkerOutbox(raw json.RawMessage, workerID uuid.UUID) []workersvc.OutboxEntry {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil // no outbox on this tick (older worker, feature off, or drained → clears)
+	}
+	drop := func(reason string) []workersvc.OutboxEntry {
+		slog.Warn("worker reported invalid outbox; dropping", "worker_id", workerID.String(), "reason", reason)
+		return nil
+	}
+	// Whole-report byte cap FIRST, before Unmarshal touches it.
+	if len(raw) > maxOutboxReportBytes {
+		return drop("oversize")
+	}
+	// Decode the TOP LEVEL into []json.RawMessage first, then each element into the typed
+	// per-entry struct below. Only a top-level shape error (not a JSON array) is a
+	// whole-report "malformed" drop; a WRONG-TYPED element (e.g. a numeric run_id or an
+	// object-valued blocked_reason) fails only its own per-entry Unmarshal and drops just
+	// that entry — a single typed field must never abort the whole array and discard every
+	// valid entry with it. Counts and `since` likewise decode as *json.Number so a float /
+	// overflow / non-integer value fails per-entry (converted below), the same reason
+	// parseWorkerStats decodes its disk fields as *json.Number.
+	var rawItems []json.RawMessage
+	if err := json.Unmarshal(raw, &rawItems); err != nil {
+		return drop("malformed")
+	}
+	if len(rawItems) > maxOutboxEntries {
+		return drop("too many entries")
+	}
+	out := make([]workersvc.OutboxEntry, 0, len(rawItems))
+	for _, rawItem := range rawItems {
+		var it struct {
+			RunID           string       `json:"run_id"`
+			PendingMessages *json.Number `json:"pending_messages"`
+			PendingTerminal *json.Number `json:"pending_terminal"`
+			StaleRetired    *json.Number `json:"stale_retired"`
+			BlockedReason   string       `json:"blocked_reason"`
+			Since           *json.Number `json:"since"`
+		}
+		if err := json.Unmarshal(rawItem, &it); err != nil {
+			continue // wrong-typed entry → drop only this entry
+		}
+		id, err := uuid.Parse(it.RunID)
+		if err != nil {
+			continue // bad run_id → drop only this entry
+		}
+		pm, ok := outboxCountOrDrop(it.PendingMessages)
+		if !ok {
+			continue
+		}
+		pt, ok := outboxCountOrDrop(it.PendingTerminal)
+		if !ok {
+			continue
+		}
+		sr, ok := outboxCountOrDrop(it.StaleRetired)
+		if !ok {
+			continue
+		}
+		since, ok := outboxSinceOrDrop(it.Since)
+		if !ok {
+			continue
+		}
+		out = append(out, workersvc.OutboxEntry{
+			RunID:           id,
+			PendingMessages: pm,
+			PendingTerminal: pt,
+			StaleRetired:    sr,
+			// Sanitize (strip control + format chars, bound) rather than reject: the
+			// reason reaches a CLI column and the web, and a register/heartbeat must never
+			// fail over cosmetic input. Same posture as sanitizeSelfReported.
+			BlockedReason: sanitizeSelfReported(it.BlockedReason, maxOutboxBlockedBytes),
+			Since:         since,
+		})
+	}
+	return out
+}
+
+// maxActiveSnapshotBytes bounds the heartbeat/claim/register active_snapshot body before
+// Unmarshal touches it (PRD #1390 M2a). Generous for ACTIVE_SNAPSHOT_MAX_ENTRIES entries (each
+// ~150 bytes) while bounding an abusive/garbled worker; the semantic entry caps are enforced
+// server-side in ReplaceWorkerActiveRuns.
+const maxActiveSnapshotBytes = 128 << 10 // 128 KiB
+
+// parseActiveSnapshot is the defensive JSON-shape parse of the untrusted active_snapshot body
+// (PRD #1390 M2a). It NEVER fails the request: an absent/empty/oversize/malformed body returns
+// nil (the snapshot is simply not applied) and, for a heartbeat, the 200 stands. It does only
+// the shape decode; the SEMANTIC validation (nonce, epoch ordering, phase set, caps, ownership)
+// lives in ReplaceWorkerActiveRuns, which needs the worker's stored nonce/epoch from the DB. A
+// lenient Unmarshal (not the strict whole-body decoder) is used on purpose, so a future worker
+// adding an inner field never 400s a heartbeat that carries the snapshot.
+func parseActiveSnapshot(raw json.RawMessage, workerID uuid.UUID) *workersvc.ActiveSnapshot {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil // no snapshot on this tick (older worker, feature off/absent)
+	}
+	if len(raw) > maxActiveSnapshotBytes {
+		slog.Warn("worker reported oversize active snapshot; dropping", "worker_id", workerID.String())
+		return nil
+	}
+	var snap workersvc.ActiveSnapshot
+	if err := json.Unmarshal(raw, &snap); err != nil {
+		slog.Warn("worker reported malformed active snapshot; dropping", "worker_id", workerID.String())
+		return nil
+	}
+	return &snap
+}
+
+// outboxCountOrDrop converts a raw count field to a non-negative int within the sane
+// ceiling, reporting ok=false (drop the entry) on absent / parse error / overflow /
+// negative / absurd. The counts are REQUIRED on the wire, so a nil is a malformed
+// entry, not a zero.
+func outboxCountOrDrop(n *json.Number) (int, bool) {
+	if n == nil {
+		return 0, false
+	}
+	v, err := n.Int64()
+	if err != nil || v < 0 || v > maxOutboxCount {
+		return 0, false
+	}
+	return int(v), true
+}
+
+// outboxSinceOrDrop converts the epoch-millisecond `since` (a NUMBER on the wire, not
+// an RFC3339 string) to a time, reporting ok=false (drop the entry) on absent / parse
+// error / overflow / negative. Only the ordering of blocked reasons depends on it.
+func outboxSinceOrDrop(n *json.Number) (time.Time, bool) {
+	if n == nil {
+		return time.Time{}, false
+	}
+	ms, err := n.Int64()
+	if err != nil || ms < 0 {
+		return time.Time{}, false
+	}
+	return time.UnixMilli(ms), true
 }
 
 // parseWorkerStats is Decision 3's second-step defensive parse plus Decision 5's
@@ -496,8 +769,38 @@ func (h *Handler) WorkerClaim(w http.ResponseWriter, r *http.Request) {
 		}
 		httpx.JSON(w, http.StatusOK, payload)
 	case "", "run":
-		payload, err := h.wsvc.Claim(r.Context(), wkr)
+		// PRD #1390 M3 (Task 1): the run-lane claim carries the worker's active-run snapshot, so a
+		// claim that beats the first post-outage heartbeat (fact 7) still dedupes and pre-locks its
+		// own runs. Strict-decode a body with just `active_snapshot`, treating EOF as "no snapshot"
+		// (the same !io.EOF guard the heartbeat/register handlers use) so an OLD bodyless worker
+		// never 400s. Chat stays bodyless (D10).
+		var req struct {
+			ActiveSnapshot json.RawMessage `json:"active_snapshot"`
+		}
+		if err := httpx.DecodeJSON(r, &req); err != nil && !errors.Is(err, io.EOF) {
+			httpx.Error(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
+		// Feature gate, mirroring WorkerHeartbeat's D7 rule EXACTLY: a disabled api 400s a claim that
+		// still carries the field (the same generic 400 that triggers the worker's strip-and-retry);
+		// when enabled, parse the snapshot defensively (a malformed body drops to nil).
+		var snapshot *workersvc.ActiveSnapshot
+		if h.cfg.ActiveSnapshotDisabled {
+			if req.ActiveSnapshot != nil {
+				httpx.Error(w, http.StatusBadRequest, "invalid request body")
+				return
+			}
+		} else {
+			snapshot = parseActiveSnapshot(req.ActiveSnapshot, wkr.ID)
+		}
+		payload, err := h.wsvc.Claim(r.Context(), wkr, snapshot)
 		if err != nil {
+			// An invalid/stale-epoch/wrong-nonce claim snapshot fails the claim CLOSED (D3): 400,
+			// no claim, no side effect. Same generic body the worker reads for its strip-and-retry.
+			if errors.Is(err, workersvc.ErrActiveSnapshotInvalid) {
+				httpx.Error(w, http.StatusBadRequest, "invalid request body")
+				return
+			}
 			slog.Error("worker claim", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return
@@ -526,6 +829,13 @@ func (h *Handler) WorkerRunMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	var req struct {
 		Messages []workersvc.IncomingMessage `json:"messages"`
+		// ClaimGeneration is the runs.claim_generation the reporting worker believes it holds
+		// (PRD #1247 M5, D3). A CAPABILITY worker stamps it on every batch; the fenced append
+		// then persists ONLY while the run is still at that generation with an unreleased claim,
+		// so a released/reclaimed old flight's batch lands nothing. Nullable + OPTIONAL: a legacy
+		// worker omits it and the append is unfenced. The field must exist here because
+		// DecodeJSONLimited rejects unknown fields.
+		ClaimGeneration *int64 `json:"claim_generation"`
 	}
 	// DecodeJSONLimited, not DecodeJSON: this is the one route whose client is a
 	// machine that must decide whether to retry (PRD #108 M2). DecodeJSON's
@@ -563,10 +873,25 @@ func (h *Handler) WorkerRunMessages(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if err := h.wsvc.AppendMessages(r.Context(), wkr, runID, req.Messages); err != nil {
+	if err := h.wsvc.AppendMessagesForClaim(r.Context(), wkr, runID, req.Messages, req.ClaimGeneration); err != nil {
 		switch {
 		case errors.Is(err, workersvc.ErrRunNotOwned):
 			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
+		case errors.Is(err, workersvc.ErrMissingClaimGeneration):
+			// PRD #1247 M5a-1 rework (auditor fail-open finding): a CAPABILITY worker
+			// (advertising credential_switch_v1) omitted claim_generation on a message batch, so
+			// the per-query fence could not engage. Refuse rather than persist unfenced. 409 is
+			// the refuse ack — a protocol violation the worker fixes by stamping the generation,
+			// distinct from the 404 (not owned) and 400 (bad/unstorable batch) causes.
+			httpx.Error(w, http.StatusConflict, "this worker must stamp claim_generation on every message batch")
+		case errors.Is(err, workersvc.ErrStaleClaim):
+			// PRD #1247 M5 (BLOCKING-4 rework): the message batch fenced out — a held-state switch
+			// RELEASED this claim or a reclaim SUPERSEDED it, so it persisted NOTHING and no usage
+			// was folded. Answer the same stale_claim 409 disposition WorkerRunState uses, which
+			// the worker reads to STOP the old flight rather than treat a 409 as a permanent
+			// per-message reject and bisect the batch. The old flight no longer owns the run, so no
+			// run DTO is carried — the disposition is the whole signal.
+			httpx.JSON(w, http.StatusConflict, map[string]any{"disposition": "stale_claim"})
 		case errors.Is(err, workersvc.ErrInvalidMessage):
 			httpx.Error(w, http.StatusBadRequest, "each message needs a positive seq, a kind, and a JSON payload")
 		case errors.Is(err, workersvc.ErrUnstorableMessage):
@@ -671,10 +996,40 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		switch {
+		case errors.Is(err, workersvc.ErrMessagesPending):
+			// PRD #1391 Run B M3c (D3): the terminal fence refused a completed/failed report whose
+			// run_messages are not yet contiguous through the reported messages_through_seq. 409 with
+			// the SAME {run, reason} shape as the forge-park refusals (top-level reason, NOT the
+			// disposition shape) so the worker fills the missing seqs and re-reports. SetState returns
+			// the run alongside the error.
+			httpx.JSON(w, http.StatusConflict, map[string]any{
+				"run":    runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock()),
+				"reason": "messages_pending",
+			})
+		case errors.Is(err, workersvc.ErrGapUnrecoverable):
+			// PRD #1391 Run B M3c: the hole below messages_through_seq is larger than
+			// WorkerGapFillMax, so it can never be filled — a typed 409 (NOT a 400) telling the worker
+			// to stop re-parking on it. Distinct reason token from messages_pending.
+			httpx.JSON(w, http.StatusConflict, map[string]any{
+				"reason": "gap_unrecoverable",
+			})
+		case errors.Is(err, workersvc.ErrStaleClaim), errors.Is(err, workersvc.ErrMissingClaimGeneration):
+			// PRD #1247 M5 (D3): the generation fence rejected this report — a held-state switch
+			// RELEASED this claim, or a reclaim SUPERSEDED it. M5a-1 rework: it ALSO covers a
+			// CAPABILITY worker that OMITTED claim_generation on a mutating report
+			// (ErrMissingClaimGeneration, fail-closed). Answer 409 with the run PLUS a
+			// disposition:"stale_claim" field the new worker reads to STOP the old flight without
+			// further reports. The 409 status is shared with an ordinary not-applied ack (an old
+			// worker that ignores the extra field still treats it as "changed nothing"); the
+			// disposition is what distinguishes a stale claim from a benign no-op.
+			httpx.JSON(w, http.StatusConflict, map[string]any{
+				"run":         runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock()),
+				"disposition": "stale_claim",
+			})
 		case errors.Is(err, workersvc.ErrRunNotOwned):
 			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
 		case errors.Is(err, workersvc.ErrInvalidState):
-			httpx.Error(w, http.StatusBadRequest, "state must be one of running, awaiting_approval, awaiting_input, awaiting_followup, limit_wait, recovery_wait, paused, pause_failed, completed, failed")
+			httpx.Error(w, http.StatusBadRequest, "state must be one of running, awaiting_approval, awaiting_input, awaiting_followup, limit_wait, recovery_wait, paused, pause_failed, credential_switch, credential_switch_failed, completed, failed")
 		default:
 			slog.Error("worker run state", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -700,10 +1055,33 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 		// run opted out) are server-side FAILURES delivered as 200s with
 		// status: "failed", where applied is TRUE. An applied-keyed branch leaks the
 		// disk on exactly those.
-		httpx.JSON(w, http.StatusConflict, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock())})
+		httpx.JSON(w, http.StatusConflict, h.workerStateAck(r, run))
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock())})
+	ack := h.workerStateAck(r, run)
+	if req.State == "credential_switch" {
+		// PRD #1247 M5b (BLOCKING-2 rework): the held-state credential-switch RELEASE applied — a
+		// FRESH requeue (status 'queued') OR an idempotent release after a reclaim (applied, status
+		// 'running'). Tell the worker EXPLICITLY the release took, so enterCredentialSwitch accepts
+		// it regardless of the run's status. It previously required status == 'queued' and so gave
+		// up on the idempotent-after-reclaim success (applied=true, status 'running'), leaving the
+		// old flight to continue on a claim the reclaim already owns.
+		ack["disposition"] = "released"
+	}
+	httpx.JSON(w, http.StatusOK, ack)
+}
+
+// workerStateAck builds the state-report ack body: the run DTO plus, when a held-state switch is
+// pending for the run's CURRENT claim, the worker-facing credential_switch signal (PRD #1247 M5,
+// D3/D4). It is shared by the 200 ack and the ORDINARY not-applied 409 ack — both hand back a run
+// the worker may still be holding, so both must carry the switch signal. It is deliberately NOT
+// used for the stale_claim 409 disposition, which already tells the worker to STOP the flight.
+func (h *Handler) workerStateAck(r *http.Request, run store.Run) map[string]any {
+	ack := map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock())}
+	if sig := workersvc.PendingCredentialSwitchSignal(run); sig != nil {
+		ack["credential_switch"] = sig
+	}
+	return ack
 }
 
 // WorkerRunInputs consumes and returns any pending steering inputs, FIFO.
@@ -717,7 +1095,7 @@ func (h *Handler) WorkerRunInputs(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	inputs, err := h.wsvc.ConsumeInputs(r.Context(), wkr, runID)
+	res, err := h.wsvc.ConsumeInputs(r.Context(), wkr, runID)
 	if err != nil {
 		if errors.Is(err, workersvc.ErrRunNotOwned) {
 			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
@@ -727,7 +1105,20 @@ func (h *Handler) WorkerRunInputs(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"inputs": inputs})
+	// inputs is ALWAYS an array (never nil) — the consume-nothing path returns an empty slice.
+	inputs := res.Inputs
+	if inputs == nil {
+		inputs = []workersvc.InputDTO{}
+	}
+	body := map[string]any{"inputs": inputs}
+	// PRD #1247 M5 (D3/D4, step 2): surface the held-state switch signal on EVERY inputs
+	// response — including an empty-inputs poll (the idle gate/question/follow-up waiters poll
+	// this route continuously) — so the worker holding the current claim learns a switch was
+	// requested and begins its local release. Omitted when no switch is pending for this claim.
+	if res.CredentialSwitch != nil {
+		body["credential_switch"] = res.CredentialSwitch
+	}
+	httpx.JSON(w, http.StatusOK, body)
 }
 
 // WorkerRunOwnership returns the current status of a run this worker owns —
@@ -745,7 +1136,7 @@ func (h *Handler) WorkerRunOwnership(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	status, recoveryRetryNotBefore, err := h.wsvc.RunOwnership(r.Context(), wkr, runID)
+	status, recoveryRetryNotBefore, claimGeneration, err := h.wsvc.RunOwnership(r.Context(), wkr, runID)
 	if err != nil {
 		if errors.Is(err, workersvc.ErrRunNotOwned) {
 			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
@@ -759,9 +1150,98 @@ func (h *Handler) WorkerRunOwnership(w http.ResponseWriter, r *http.Request) {
 	// reconciling an unknown forge-park outcome (a transport failure after the report was sent)
 	// can still quote the acknowledged retry time on its feed event. Omitted (nil) for a run
 	// that is not recovery-parked.
-	body := map[string]any{"status": status}
+	//
+	// PRD #1391 Run B M4: claim_generation rides the same probe (additive) so the run-lane claim
+	// router can proceed ONLY on a claimed/running row AT the claim's generation, and end the
+	// attempt (no report) on a terminal status or a DIFFERENT generation.
+	body := map[string]any{"status": status, "claim_generation": claimGeneration}
 	if recoveryRetryNotBefore != nil {
 		body["recovery_retry_not_before"] = recoveryRetryNotBefore
+	}
+	httpx.JSON(w, http.StatusOK, body)
+}
+
+// Message-gaps read bounds (PRD #1391 Run B M3c). maxMessageGapsThrough caps the `through` query
+// param well below math.MaxInt32 so the query's `through+1` sentinel and the int32 casts never
+// overflow; it is far above any real run's message count. defaultMessageGapsLimit /
+// maxMessageGapsLimit bound the page size — the default when `limit` is omitted, the hard ceiling
+// a larger value is clamped to.
+const (
+	maxMessageGapsThrough   = 1 << 30
+	defaultMessageGapsLimit = 256
+	maxMessageGapsLimit     = 1024
+)
+
+// WorkerRunMessageGaps returns the MISSING message-seq ranges in [1..through] for a run this worker
+// holds at its current, unreleased claim (PRD #1391 Run B M3c). Worker-authenticated, run-scoped,
+// generation-fenced and keyset-paginated: required `claim_generation` (>=0), `through` (>=0, <= a
+// cap), `limit` (default 256, hard-capped) and `cursor` (the previous page's next_cursor). A
+// foreign worker, or a stale/released flight, is 404 (ErrRunNotOwned) — it must not inspect or fill
+// a newer flight's gaps. Response: {"gaps":[{"first":F,"last":L},...], "next_cursor":<seq or omitted>}.
+func (h *Handler) WorkerRunMessageGaps(w http.ResponseWriter, r *http.Request) {
+	wkr, ok := mw.WorkerFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "worker authentication required")
+		return
+	}
+	runID, ok := httpx.PathUUID(w, r, "id", "run")
+	if !ok {
+		return
+	}
+	// claim_generation: required and non-negative. The journal generation is what prevents an old
+	// same-worker flight from inspecting a newer reclaim's gaps; this endpoint and terminal_fence
+	// ship together, so there is no legacy generation-less caller to admit.
+	claimGeneration, perr := strconv.ParseInt(r.URL.Query().Get("claim_generation"), 10, 64)
+	if perr != nil || claimGeneration < 0 {
+		httpx.Error(w, http.StatusBadRequest, "claim_generation must be a non-negative integer")
+		return
+	}
+	// through: required, >= 0, <= the cap (a bounded window the keyset walks).
+	through := int64(0)
+	if raw := r.URL.Query().Get("through"); raw != "" {
+		n, perr := strconv.ParseInt(raw, 10, 64)
+		if perr != nil || n < 0 || n > maxMessageGapsThrough {
+			httpx.Error(w, http.StatusBadRequest, "through must be an integer in [0, 2^30]")
+			return
+		}
+		through = n
+	}
+	// cursor: the seq keyset value to resume after; >= 0. 0 (the default) starts from the head.
+	cursor := int64(0)
+	if raw := r.URL.Query().Get("cursor"); raw != "" {
+		n, perr := strconv.ParseInt(raw, 10, 64)
+		if perr != nil || n < 0 || n > maxMessageGapsThrough {
+			httpx.Error(w, http.StatusBadRequest, "cursor must be an integer in [0, 2^30]")
+			return
+		}
+		cursor = n
+	}
+	// limit: default when omitted, clamped to the hard ceiling; a value <= 0 is invalid.
+	limit := int64(defaultMessageGapsLimit)
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		n, perr := strconv.ParseInt(raw, 10, 64)
+		if perr != nil || n <= 0 {
+			httpx.Error(w, http.StatusBadRequest, "limit must be a positive integer")
+			return
+		}
+		if n > maxMessageGapsLimit {
+			n = maxMessageGapsLimit
+		}
+		limit = n
+	}
+	page, err := h.wsvc.RunMessageGaps(r.Context(), wkr, runID, claimGeneration, through, cursor, limit)
+	if err != nil {
+		if errors.Is(err, workersvc.ErrRunNotOwned) {
+			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
+			return
+		}
+		slog.Error("worker run message gaps", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	body := map[string]any{"gaps": page.Gaps}
+	if page.NextCursor != nil {
+		body["next_cursor"] = *page.NextCursor
 	}
 	httpx.JSON(w, http.StatusOK, body)
 }
@@ -822,6 +1302,11 @@ func (h *Handler) WorkerRunCompletionPermit(w http.ResponseWriter, r *http.Reque
 		ContractRevision int    `json:"contract_revision"`
 		Branch           string `json:"branch"`
 		Head             string `json:"head"`
+		// PRD #1247 M5 (D3): the claim generation the worker holds. A CAPABILITY worker stamps it so
+		// RequestCompletionPermit's fence refuses to issue a permit for a released/superseded stale
+		// flight. Nullable + OPTIONAL (a legacy worker omits it, unfenced), but the field must exist
+		// here because httpx.DecodeJSON rejects unknown fields.
+		ClaimGeneration *int64 `json:"claim_generation"`
 	}
 	if err := httpx.DecodeJSON(r, &body); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
@@ -834,15 +1319,24 @@ func (h *Handler) WorkerRunCompletionPermit(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	res, err := h.wsvc.RequestCompletionPermit(r.Context(), wkr, runID, workersvc.CompletionPermitRequest{
-		ContractRevision: body.ContractRevision, Branch: branch, Head: head,
+		ContractRevision: body.ContractRevision, Branch: branch, Head: head, ClaimGeneration: body.ClaimGeneration,
 	})
 	if err != nil {
-		if errors.Is(err, workersvc.ErrRunNotOwned) {
+		switch {
+		case errors.Is(err, workersvc.ErrRunNotOwned):
 			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
-			return
+		case errors.Is(err, workersvc.ErrCompletionStaleClaim):
+			// PRD #1247 M5: the generation fence refused — a held-state switch RELEASED this claim or
+			// a reclaim SUPERSEDED it, so no permit is issued for the stale flight. 409, non-terminal.
+			httpx.Error(w, http.StatusConflict, "run is not in a live claimed state for this worker")
+		case errors.Is(err, workersvc.ErrMissingClaimGeneration):
+			// PRD #1247 M5: a CAPABILITY worker omitted claim_generation, so the fence could not
+			// engage. Refuse (409) rather than issue an unfenced permit, mirroring WorkerRunState.
+			httpx.Error(w, http.StatusConflict, "this worker must stamp claim_generation on the completion permit request")
+		default:
+			slog.Error("worker run completion permit", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
 		}
-		slog.Error("worker run completion permit", "error", err)
-		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 	httpx.JSON(w, http.StatusOK, res)
@@ -868,6 +1362,10 @@ func (h *Handler) WorkerRunCompletionAttempt(w http.ResponseWriter, r *http.Requ
 		MilestonesCompleted []string `json:"milestones_completed"`
 		Head                string   `json:"head"`
 		WorktreeFingerprint string   `json:"worktree_fingerprint"`
+		// PRD #1247 M5 (D3): the claim generation the worker holds. A CAPABILITY worker stamps it so
+		// the RecordCompletionAttempt fence refuses a released/superseded stale flight's attempt.
+		// Nullable + OPTIONAL, but the field must exist because httpx.DecodeJSON rejects unknown fields.
+		ClaimGeneration *int64 `json:"claim_generation"`
 	}
 	if err := httpx.DecodeJSON(r, &body); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
@@ -877,6 +1375,7 @@ func (h *Handler) WorkerRunCompletionAttempt(w http.ResponseWriter, r *http.Requ
 		MilestonesCompleted: body.MilestonesCompleted,
 		Head:                strings.TrimSpace(body.Head),
 		WorktreeFingerprint: strings.TrimSpace(body.WorktreeFingerprint),
+		ClaimGeneration:     body.ClaimGeneration,
 	})
 	if err != nil {
 		switch {
@@ -884,6 +1383,10 @@ func (h *Handler) WorkerRunCompletionAttempt(w http.ResponseWriter, r *http.Requ
 			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
 		case errors.Is(err, workersvc.ErrCompletionStaleClaim):
 			httpx.Error(w, http.StatusConflict, "run is not in a live claimed state for this worker")
+		case errors.Is(err, workersvc.ErrMissingClaimGeneration):
+			// PRD #1247 M5: a CAPABILITY worker omitted claim_generation, so the fence could not
+			// engage. Refuse (409) rather than record an unfenced attempt, mirroring WorkerRunState.
+			httpx.Error(w, http.StatusConflict, "this worker must stamp claim_generation on the completion attempt")
 		case errors.Is(err, workersvc.ErrCompletionNotInterlocked):
 			httpx.Error(w, http.StatusBadRequest, "run is not interlocked")
 		default:
@@ -923,15 +1426,25 @@ func (h *Handler) WorkerRunCompletionHold(w http.ResponseWriter, r *http.Request
 		// The exact head the worker captured at hold time. Empty is allowed (the column is
 		// nullable); the service NUL-strips + TrimSpaces it, matching the permit path.
 		Head string `json:"head"`
+		// PRD #1247 M5 (D3): the claim generation the worker holds. A CAPABILITY worker stamps it so
+		// the hold's fence refuses to park a released/superseded stale flight's reclaimed run.
+		// Nullable + OPTIONAL, but the field must exist because httpx.DecodeJSON rejects unknown fields.
+		ClaimGeneration *int64 `json:"claim_generation"`
 	}
 	if err := httpx.DecodeJSON(r, &body); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	run, applied, err := h.wsvc.SetRunCompletionHold(r.Context(), wkr, runID, body.Head)
+	run, applied, err := h.wsvc.SetRunCompletionHold(r.Context(), wkr, runID, body.Head, body.ClaimGeneration)
 	if err != nil {
 		if errors.Is(err, workersvc.ErrRunNotOwned) {
 			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
+			return
+		}
+		if errors.Is(err, workersvc.ErrMissingClaimGeneration) {
+			// PRD #1247 M5: a CAPABILITY worker omitted claim_generation, so the hold's fence could
+			// not engage. Refuse (409) rather than park unfenced, mirroring WorkerRunState.
+			httpx.Error(w, http.StatusConflict, "this worker must stamp claim_generation on the completion hold")
 			return
 		}
 		slog.Error("worker run completion hold", "error", err)

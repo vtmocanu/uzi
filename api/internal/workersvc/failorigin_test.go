@@ -3,8 +3,10 @@ package workersvc
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -67,41 +69,11 @@ func TestCoerceFailOrigin(t *testing.T) {
 // parses the migration rather than restating the list, because a second hand-typed copy
 // is exactly the drift it prevents.
 func TestFailOriginVocabularyMatchesCheck(t *testing.T) {
-	// The CURRENT fail_origin CHECK is declared by the LATEST migration that widened it, not
-	// 00186 (which added push_secret_blocked): PRD #1392 M1's 00232 re-declares it with the
-	// thirteenth value forge_unreachable, so this parses THAT migration's Up-section CHECK.
-	const path = "../store/migrations/00232_forge_unreachable_park.sql"
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read %s: %v", path, err)
-	}
-
-	// Strip comment lines first: the prose above the statement names several members
-	// (plan_rejected/auto_stopped), and a whole-file regex would collect them and agree
-	// with itself.
-	var stripped strings.Builder
-	for _, line := range strings.Split(string(raw), "\n") {
-		if strings.HasPrefix(strings.TrimSpace(line), "--") {
-			continue
-		}
-		stripped.WriteString(line)
-		stripped.WriteString("\n")
-	}
-	body := stripped.String()
-
-	// Scope to THIS CHECK's statement (from the FIRST fail_origin IN list — the Up's
-	// widened set — to its closing paren), so the Down section's narrower re-declared
-	// CHECK, which appears later in the file, contributes nothing.
-	start := strings.Index(body, "fail_origin IN (")
-	if start < 0 {
-		t.Fatalf("%s no longer declares a fail_origin IN (...) CHECK; the guard is reading "+
-			"the wrong thing, or the CHECK was dropped without dropping this test", path)
-	}
-	end := strings.Index(body[start:], ")")
-	if end < 0 {
-		t.Fatalf("the fail_origin CHECK in %s has no closing paren", path)
-	}
-	stmt := body[start : start+end]
+	// The CURRENT fail_origin CHECK is declared by the LATEST migration that widened it, so
+	// this DISCOVERS that migration at runtime instead of pinning a number that goes stale at
+	// every landing-time renumber. Discovery returns the exact Up-section CHECK expression it
+	// matched, so unrelated DML containing fail_origin IN (...) cannot become the parsed source.
+	path, stmt := latestFailOriginCheckMigration(t, "../store/migrations")
 
 	var fromSQL []string
 	for _, m := range regexp.MustCompile(`'([a-z_]+)'`).FindAllStringSubmatch(stmt, -1) {
@@ -120,6 +92,109 @@ func TestFailOriginVocabularyMatchesCheck(t *testing.T) {
 			"A value Go writes and 00126's CHECK rejects is a constraint violation at a "+
 			"failed run's write; add or remove a member on either side and the other must "+
 			"move in the same commit.", fromGo, fromSQL)
+	}
+}
+
+// latestFailOriginCheckMigration discovers the migration that declares the CURRENT
+// fail_origin CHECK: the highest-numbered migration under dir whose Up section contains an
+// actual CHECK expression over fail_origin. It returns that same expression for parsing, so
+// discovery and comparison cannot disagree about which SQL construct they selected.
+func latestFailOriginCheckMigration(t *testing.T, dir string) (string, string) {
+	t.Helper()
+	files, err := filepath.Glob(filepath.Join(dir, "*.sql"))
+	if err != nil {
+		t.Fatalf("glob %s: %v", dir, err)
+	}
+	best, bestStmt, bestNum := "", "", -1
+	for _, file := range files {
+		num, ok := migrationNumber(filepath.Base(file))
+		if !ok {
+			continue
+		}
+		raw, err := os.ReadFile(file) //nolint:gosec // G304: test reads migration files from the fixed repo-relative ../store/migrations dir, never user input
+		if err != nil {
+			t.Fatalf("read %s: %v", file, err)
+		}
+		stmt, ok := upSectionFailOriginCheck(string(raw))
+		if num > bestNum && ok {
+			best, bestStmt, bestNum = file, stmt, num
+		}
+	}
+	if best == "" {
+		t.Fatalf("no migration under %s declares a fail_origin IN (...) CHECK in its Up "+
+			"section; the scan is reading the wrong directory or the CHECK vanished. A broken "+
+			"scan that finds nothing must fail here, not pass vacuously", dir)
+	}
+	return best, bestStmt
+}
+
+// migrationNumber parses the leading run of digits of a goose migration basename (its
+// version). A basename that does not start with a digit is not a migration.
+func migrationNumber(base string) (int, bool) {
+	end := 0
+	for end < len(base) && base[end] >= '0' && base[end] <= '9' {
+		end++
+	}
+	if end == 0 {
+		return 0, false
+	}
+	n, err := strconv.Atoi(base[:end])
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+var failOriginCheckRE = regexp.MustCompile(
+	`(?s)\bCHECK[[:space:]]*\([[:space:]]*fail_origin[[:space:]]+IN[[:space:]]*\(([^)]*)\)[[:space:]]*\)`,
+)
+
+// upSectionFailOriginCheck returns the value-list body of the actual fail_origin CHECK in
+// the migration's Up section. Comment lines and the Down section are excluded first. Matching
+// CHECK (...) rather than a bare fail_origin IN (...) prevents unrelated DML from becoming
+// the vocabulary source.
+func upSectionFailOriginCheck(raw string) (string, bool) {
+	up := strings.Index(raw, "-- +goose Up")
+	if up < 0 {
+		return "", false
+	}
+	section := raw[up:]
+	if down := strings.Index(section, "-- +goose Down"); down >= 0 {
+		section = section[:down]
+	}
+	var stripped strings.Builder
+	for _, line := range strings.Split(section, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "--") {
+			continue
+		}
+		stripped.WriteString(line)
+		stripped.WriteString("\n")
+	}
+	match := failOriginCheckRE.FindStringSubmatch(stripped.String())
+	if len(match) != 2 {
+		return "", false
+	}
+	return match[1], true
+}
+
+func TestUpSectionFailOriginCheckIgnoresDMLAndDown(t *testing.T) {
+	raw := `-- +goose Up
+UPDATE runs SET failure_reason = 'x' WHERE fail_origin IN ('dml_only');
+ALTER TABLE runs ADD CONSTRAINT runs_fail_origin_check
+    CHECK (fail_origin IN ('agent_failure', 'worker_lost')) NOT VALID;
+-- +goose Down
+ALTER TABLE runs ADD CONSTRAINT runs_fail_origin_check
+    CHECK (fail_origin IN ('down_only'));
+`
+	stmt, ok := upSectionFailOriginCheck(raw)
+	if !ok {
+		t.Fatal("Up-section fail_origin CHECK was not found")
+	}
+	if strings.Contains(stmt, "dml_only") || strings.Contains(stmt, "down_only") {
+		t.Fatalf("matched unrelated fail_origin list: %q", stmt)
+	}
+	if !strings.Contains(stmt, "'agent_failure', 'worker_lost'") {
+		t.Fatalf("matched CHECK body = %q, want the Up-section constraint values", stmt)
 	}
 }
 

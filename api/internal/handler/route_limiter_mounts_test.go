@@ -67,7 +67,11 @@ var limiterNames = [...]string{
 // error rather than a failing row. Spelled `lim*` rather than matching the parameter
 // names exactly, so nothing here shadows a parameter inside Routes.
 //
-// 199 as of this commit (PRD #1349 M5 added GET /api/recovery/holds — the owner-wide custody
+// 200 as of this commit (PRD #1391 Run B M3c added GET /api/worker/runs/{id}/message-gaps — the
+// worker-authenticated, generation-fenced, keyset-paginated message-gaps read a fence-blocked
+// worker uses to find the seqs it must fill before re-reporting terminal. noLimiter, like the other
+// worker /runs/{id}/... reads it sits beside — a READ ONLY DB query, no forge call and no token spend.)
+// It was 199 until then (PRD #1349 M5 added GET /api/recovery/holds — the owner-wide custody
 // hold list + aggregate the board/Workers surface and `uzi run recovery` read — and DELETE
 // /api/runs/{id}/recovery-holds/{holdID} — the exact owner hold DISCARD. Both are owner-scoped
 // RequireUser routes with no forge call and no token spend → noLimiter, like the owner archive
@@ -416,6 +420,7 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/worker/runs/{id}/forge/pipelines/{pipeline_id}/jobs", noLimiter},
 	{"GET", "/api/worker/runs/{id}/inputs", noLimiter},
 	{"GET", "/api/worker/runs/{id}/memory", noLimiter},
+	{"GET", "/api/worker/runs/{id}/message-gaps", noLimiter},
 	{"GET", "/api/worker/runs/{id}/orphan-classification", noLimiter},
 	{"GET", "/api/worker/runs/{id}/ownership", noLimiter},
 	{"GET", "/api/worker/runs/{id}/recovery-holds", noLimiter},
@@ -597,6 +602,11 @@ var wantRouteMounts = []routeMount{
 	// UPDATE of runs (status → queued), no token spend, no forge write → noLimiter,
 	// mirroring the priority verb's posture.
 	{"POST", "/api/runs/{id}/resume-now", noLimiter},
+	// Per-run credential switch (PRD #1247 M4): one owner-scoped override write plus, for a
+	// parked run, an early-promote UPDATE of runs (→ queued) — no token spend, no forge
+	// write → noLimiter, mirroring resume-now's posture. (D6 warnings read the owner's own
+	// candidate gauge, still no forge call.)
+	{"POST", "/api/runs/{id}/credential", noLimiter},
 	// Owner completion decision (PRD #1226 M5, D7): one owner-scoped resume of a
 	// completion-blocked run (paused → queued via ResumePausedRun, or delivering the decision
 	// to the live worker) plus an audit/guidance input row — no token spend, no forge write →

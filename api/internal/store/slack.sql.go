@@ -156,6 +156,34 @@ func (q *Queries) GetConfirmedUserBySlackID(ctx context.Context, slackResolvedID
 	return i, err
 }
 
+const getLatestCredentialSwitchSince = `-- name: GetLatestCredentialSwitchSince :one
+SELECT payload FROM run_messages
+WHERE run_id = $1 AND kind = 'credential_switch' AND created_at > $2
+ORDER BY seq DESC LIMIT 1
+`
+
+type GetLatestCredentialSwitchSinceParams struct {
+	RunID uuid.UUID          `json:"run_id"`
+	Since pgtype.Timestamptz `json:"since"`
+}
+
+// The newest 'credential_switch' run_message minted AFTER @since (PRD #1247 M9/D14, task d): the
+// durable, immutable evidence that a token switch was APPLIED during this park cycle. Used by
+// handleLimitResume to name the new token in the ▶️ Resumed DM. @since is the park-cycle anchor
+// (slack_run_messages.limit_paused_at = the run's status_since copied at park), so created_at >
+// @since scopes the message to THIS park cycle — a switch applied in an EARLIER cycle, or a
+// same-generation epoch re-record that refreshed run_credential_epochs.applied_at during a LATER
+// park, cannot re-attribute (the message's created_at is immutable and anchors the cycle, unlike
+// applied_at which RecordRunCredentialEpoch refreshes on a retry). No row = no switch this cycle,
+// so the resume DM is unchanged. The raw payload is returned and parsed in Go (label, then
+// escaped/scrubbed before it reaches Slack), exactly like GetLatestRunQuestion.
+func (q *Queries) GetLatestCredentialSwitchSince(ctx context.Context, arg GetLatestCredentialSwitchSinceParams) ([]byte, error) {
+	row := q.db.QueryRow(ctx, getLatestCredentialSwitchSince, arg.RunID, arg.Since)
+	var payload []byte
+	err := row.Scan(&payload)
+	return payload, err
+}
+
 const getLatestRunQuestion = `-- name: GetLatestRunQuestion :one
 SELECT payload FROM run_messages
 WHERE run_id = $1 AND kind = 'question'

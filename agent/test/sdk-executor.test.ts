@@ -412,6 +412,45 @@ describe("SdkExecutor plan revision loop (PRD #41)", () => {
     assert.strictEqual(result.branch, "agent/issue-5");
   });
 
+  it("MAJOR-6: a mid-revision switch cannot approve the superseded plan — the revision turn runs DEFERRED and the re-gate persists the revised plan OUTSIDE the window", async () => {
+    const { queryFn } = fakeTurns([
+      [submitPlan("# Plan v1"), resultSuccess()], // planning turn
+      [submitPlan("# Plan v2"), resultSuccess()], // revision turn — MUST run inside the defer window
+      [assistantText("implementing"), signalDone(), resultSuccess()], // loop turn 1
+    ]);
+    // The revised v2 plan is persisted by the gate (probe.persisted / probe.gated). The fix wraps the
+    // revision planning turn in a credential-switch DEFER window so a mid-revision switch is held —
+    // not released mid-turn, which would leave the run row on the superseded v1 and re-present it on a
+    // reclaim. Record when the window opens/closes relative to how many gates have run: it must open
+    // AFTER the v1 gate and close BEFORE the v2 gate, so the switch trips only at the v2 gate wait,
+    // once v2 is persisted. Reverting the revision turn to runThroughSwitch (no defer) never calls the
+    // hook, so `order` stays empty and this reddens.
+    const order: string[] = [];
+    const probe = makeCtx(
+      {
+        agents: [lead, coder, reviewer],
+        deferCredentialSwitch: async (fn) => {
+          order.push(`begin@gated=${probe.gated.length}`);
+          try {
+            return await fn();
+          } finally {
+            order.push(`end@gated=${probe.gated.length}`);
+          }
+        },
+      },
+      [revise("add a rollback step"), approve],
+    );
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+
+    // Exactly one defer window, opened after the v1 gate (gated.length === 1) and closed before the
+    // v2 gate (still 1) — so a switch during the revision turn is deferred, never released mid-turn.
+    assert.deepStrictEqual(order, ["begin@gated=1", "end@gated=1"], "the revision turn is wrapped in one defer window, between the two gates");
+    // The re-gate ran AFTER the window and persisted the REVISED v2 (never the superseded v1), so a
+    // reclaim at resume_phase 'awaiting_approval' re-presents v2, not v1.
+    assert.deepStrictEqual(probe.gated, ["# Plan v1", "# Plan v2"], "the gate saw v1 then the revised v2");
+    assert.strictEqual(probe.persisted.planMd, "# Plan v2", "the persisted plan is the revised v2, so a reclaim resumes on it, never v1");
+  });
+
   it("a revision turn that submits no plan fails with REASON_NO_PLAN", async () => {
     const { queryFn } = fakeTurns([
       [submitPlan("# Plan v1"), resultSuccess()],
@@ -720,6 +759,38 @@ describe("SdkExecutor implement/review loop", () => {
     assert.match(turns[2]!.promptText ?? "", /please also add tests/);
     assert.match(turns[2]!.promptText ?? "", /UNTRUSTED INPUT/); // framed as data
     assert.doesNotMatch(turns[1]!.promptText ?? "", /please also add tests/);
+  });
+
+  it("drains the safety steer before building the implement prompt and renders it as worker guidance ahead of any follow-up (PRD #1416 M2)", async () => {
+    // Mutation: drop the `const safetySteer = ctx.pullSafetySteer?.()` drain (or its pass into
+    // buildImplementPrompt) → the steer body never reaches the prompt and the first assert reddens.
+    const followUps = ["please also add tests"];
+    let steerCall = 0;
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()], // planning
+      [assistantText("first pass"), resultSuccess()], // loop 1 (drains the follow-up at its END)
+      [assistantText("second pass"), signalDone(), resultSuccess()], // loop 2 (carries steer + follow-up)
+    ]);
+    const probe = makeCtx({
+      config: { max_iterations: 5 },
+      pullFollowUp: () => followUps.shift(),
+      // Armed for the NEXT turn (drained at iteration 2's loop top), so the steer and the
+      // follow-up land on the SAME prompt (turns[2]) and their ordering is observable.
+      pullSafetySteer: () => (++steerCall === 2 ? "WORKER-SAFETY-STEER-BODY-777" : undefined),
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+
+    const p = turns[2]!.promptText ?? "";
+    const steerIdx = p.indexOf("WORKER-SAFETY-STEER-BODY-777");
+    const openIdx = p.indexOf("<follow_up>");
+    const closeIdx = p.indexOf("</follow_up>");
+    assert.ok(steerIdx >= 0, "the drained safety steer reached the implement prompt");
+    assert.match(p, /The worker detected a problem and is steering you/); // worker-guidance framing
+    assert.ok(openIdx >= 0, "the follow-up is present on the same turn");
+    assert.ok(steerIdx < openIdx, "the safety steer is rendered BEFORE the <follow_up> block");
+    assert.ok(!(steerIdx > openIdx && steerIdx < closeIdx), "the steer is NOT wrapped in the <follow_up> fence");
+    // Drained fresh each turn (iteration 2 here), not first-turn-only.
+    assert.doesNotMatch(turns[1]!.promptText ?? "", /WORKER-SAFETY-STEER-BODY-777/);
   });
 });
 

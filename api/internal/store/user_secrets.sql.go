@@ -336,6 +336,38 @@ func (q *Queries) GetUserSecretMetaByID(ctx context.Context, arg GetUserSecretMe
 	return i, err
 }
 
+const getUserSecretMetaByIDOfKind = `-- name: GetUserSecretMetaByIDOfKind :one
+SELECT id, label, kind FROM user_secrets
+WHERE id = $1 AND user_id = $2 AND kind = $3
+`
+
+type GetUserSecretMetaByIDOfKindParams struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+	Kind   string    `json:"kind"`
+}
+
+type GetUserSecretMetaByIDOfKindRow struct {
+	ID    uuid.UUID `json:"id"`
+	Label string    `json:"label"`
+	Kind  string    `json:"kind"`
+}
+
+// The kind-SCOPED by-id meta lookup (PRD #1247 M1): the per-run credential override
+// resolves a specific credential and must confirm it is an anthropic_token before
+// opening it. GetUserSecretMetaByID above is owner-scoped but deliberately NOT
+// kind-scoped (its comment explains why the worker/judge bind lanes keep it that way),
+// so a separate query carries the kind predicate rather than weakening those lanes. Used
+// by the override open path in claimSecretID and by validateCredentialOverride as
+// defense in depth; a wrong-kind or foreign id returns pgx.ErrNoRows, which the caller
+// maps to the same "unavailable" credential failure a foreign id already produces (D9).
+func (q *Queries) GetUserSecretMetaByIDOfKind(ctx context.Context, arg GetUserSecretMetaByIDOfKindParams) (GetUserSecretMetaByIDOfKindRow, error) {
+	row := q.db.QueryRow(ctx, getUserSecretMetaByIDOfKind, arg.ID, arg.UserID, arg.Kind)
+	var i GetUserSecretMetaByIDOfKindRow
+	err := row.Scan(&i.ID, &i.Label, &i.Kind)
+	return i, err
+}
+
 const insertUserSecret = `-- name: InsertUserSecret :one
 INSERT INTO user_secrets (user_id, kind, label, is_default, auto_eligible, ciphertext, sealed_with)
 VALUES ($1, $2, $3,

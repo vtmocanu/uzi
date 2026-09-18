@@ -36,7 +36,7 @@ function okReading(
 // this is ONE READING PER TOKEN: the default matches mockup frame A (8% / 27%,
 // both green under the PRD #115 bands, "Live"), and the console key is busier so
 // the two meter pairs are visibly different rather than duplicates.
-export const mockMyRateLimits: MyRateLimits = okReading(8, 1 * H + 23 * MIN, 27, 2 * D + 4 * H);
+const mockMyRateLimits: MyRateLimits = okReading(8, 1 * H + 23 * MIN, 27, 2 * D + 4 * H);
 
 // 🔴 auto_eligible HERE MUST AGREE WITH mockSecrets, TOKEN FOR TOKEN. The settings
 // row draws its toggle from mockSecrets and its chip from this list, so a

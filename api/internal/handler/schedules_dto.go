@@ -3,9 +3,11 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/schedsvc"
@@ -24,6 +26,32 @@ func (h *Handler) repoPathFor(ctx context.Context, s store.RunSchedule) string {
 		return ""
 	}
 	return repo.PathWithNamespace
+}
+
+// scheduleDTOWithLabel is the CONTEXT-AWARE response builder every ScheduleDTO handler
+// returns through (PRD #1247 M6, Task 8): it builds the pure scheduleDTO (which sets the
+// override MODE from the row) and then, for a PINNED override, resolves the token LABEL
+// best-effort via an owner-scoped lookup — the pure mapper has no store to do this, exactly
+// like GetRun's credential-label enrichment (runs_lifecycle.go). Applied on GET, list,
+// create, patch, clone/add-repo, enable and reset so the resolved label rides EVERY response.
+// Best-effort: a missing/renamed/deleted token (or any lookup error) leaves the label nil
+// rather than failing the response, mirroring the run-DTO enrichment.
+func (h *Handler) scheduleDTOWithLabel(ctx context.Context, s store.RunSchedule, repoPath string) apitypes.ScheduleDTO {
+	dto := h.scheduleDTO(s, repoPath)
+	if dto.CredentialOverride != nil && s.CredentialOverrideSecretID.Valid {
+		if meta, err := h.q.GetUserSecretMetaByID(ctx, store.GetUserSecretMetaByIDParams{
+			ID:     uuid.UUID(s.CredentialOverrideSecretID.Bytes),
+			UserID: s.UserID,
+		}); err != nil {
+			if !errors.Is(err, pgx.ErrNoRows) {
+				slog.Error("resolve schedule credential override label", "schedule", s.ID.String(), "error", err)
+			}
+		} else {
+			label := meta.Label
+			dto.CredentialOverride.Label = &label
+		}
+	}
+	return dto
 }
 
 // scheduleDTO builds the response view, computing the next-fires preview (up to 3) for
@@ -52,6 +80,14 @@ func (h *Handler) scheduleDTO(s store.RunSchedule, repoPath string) apitypes.Sch
 	if s.CatalogSlug.Valid && s.CatalogSlug.String != "" {
 		v := s.CatalogSlug.String
 		dto.CatalogSlug = &v
+	}
+	// PRD #1247 M1 (D5): the schedule's per-run credential override. null = inherit
+	// (the fired run follows the worker binding); else {mode, label}. The mode is read
+	// straight from the row; the pinned-token label is resolved when M6 wires the picker
+	// (this pure mapper has no context to read the token row). Null for every schedule
+	// until M6, so behaviour is byte-identical to today.
+	if s.CredentialOverrideMode.Valid && s.CredentialOverrideMode.String != "" {
+		dto.CredentialOverride = &apitypes.CredentialOverrideDTO{Mode: s.CredentialOverrideMode.String}
 	}
 	// sibling_group_id (PRD #636): a display-only group tag, surfaced as a uuid string only
 	// when the row is grouped (nil for a standalone row).

@@ -1,5 +1,7 @@
 import {
   type AgentSelectionInput,
+  type CredentialEpoch,
+  type CredentialOverride,
   type RecoveryCustodyHold,
   type RecoveryCustodyHolds,
   type Run,
@@ -7,6 +9,7 @@ import {
   type RunInputKind,
 } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
+import { isCredentialSwitchRefusedLane } from "../../lib/credentialOverride";
 import { isTerminalRun } from "../../lib/runStatus";
 import {
   LIVE_RUN_ID,
@@ -15,6 +18,7 @@ import {
   mockMyTokenRateLimits,
   mockOtherRunOwners,
   mockRunInputs,
+  mockSecrets,
   runListItem,
 } from "../data";
 import { ensureLive, handleInput, startNewRun } from "../engine";
@@ -93,9 +97,116 @@ function custodyResponse(): RecoveryCustodyHolds {
   };
 }
 
+// ── Per-run credential override / switch demo (PRD #1247 M7) ──────────────────
+// Four ?mock= scenarios overlay the credential fields onto ONE seeded run each, so the
+// override / pending-switch / epoch-history surfaces AND the set-token warning are
+// browsable offline; any other scenario leaves every run clean (the override badges
+// self-hide on a null override). A run whose token was actually switched THIS session
+// (setRunCredential below) is recorded here so the live mutation wins over the seed —
+// which is what lets the "lingering-stamp" case prove no stale switch shows after apply.
+const credentialSwitched = new Set<string>();
+
+// One applied epoch, so the history list renders with a token label + reason + time.
+const appliedEpochs = (): CredentialEpoch[] => [
+  {
+    claim_generation: 1,
+    secret_id: "sec-default",
+    label: "default",
+    select_reason: "default",
+    applied_at: new Date(Date.now() - 90 * 60_000).toISOString(),
+  },
+  {
+    claim_generation: 2,
+    secret_id: "sec-console-key",
+    label: "console-key",
+    select_reason: "override_pinned",
+    applied_at: new Date(Date.now() - 20 * 60_000).toISOString(),
+  },
+];
+
+function credentialOverlay(run: Run): Run {
+  // A live set-token this session wins over the seeded scenario state (D-Step-A: the
+  // server suppresses a stale/applied switch, so the DTO reads null once applied).
+  if (credentialSwitched.has(run.id)) return run;
+  switch (mockScenario()) {
+    case "parked-with-alternative":
+      // A limit_wait run whose `auto` override could move it to a fresh pooled token.
+      if (run.id === "run-limit-wait")
+        return {
+          ...run,
+          credential_override: { mode: "auto", label: null },
+          credential_switch: null,
+          credential_epochs: appliedEpochs().slice(0, 1),
+        };
+      return run;
+    case "switch-on-running":
+      // A running run with a switch REQUESTED but not yet applied — the pending badge.
+      if (run.id === LIVE_RUN_ID)
+        return {
+          ...run,
+          credential_override: { mode: "pinned", label: "console-key" },
+          credential_switch: "requested",
+          credential_epochs: appliedEpochs().slice(0, 1),
+        };
+      return run;
+    case "released-awaiting-reclaim":
+      // The held worker released its claim; the run awaits reclaim on the new token.
+      if (run.id === LIVE_RUN_ID)
+        return {
+          ...run,
+          credential_override: { mode: "pinned", label: "console-key" },
+          credential_switch: "released",
+          credential_epochs: appliedEpochs().slice(0, 1),
+        };
+      return run;
+    case "warning":
+      // The set-token path returns a D6 warning (below); seed an override so the surface
+      // has something to show alongside it.
+      if (run.id === LIVE_RUN_ID)
+        return {
+          ...run,
+          credential_override: { mode: "auto", label: null },
+          credential_switch: null,
+          credential_epochs: appliedEpochs(),
+        };
+      return run;
+    case "lingering-stamp":
+      // The switch APPLIED: the override + epoch history stay, but credential_switch is
+      // null — proving the UI shows NO stale pending badge once the DTO reports null.
+      if (run.id === LIVE_RUN_ID)
+        return {
+          ...run,
+          credential_override: { mode: "pinned", label: "console-key" },
+          credential_switch: null,
+          credential_epochs: appliedEpochs(),
+        };
+      return run;
+    default:
+      return run;
+  }
+}
+
+// overrideToRead maps the set-token WRITE body ({mode, secret_id?}) to the READ-side
+// {mode, label} the run DTO carries; inherit clears it to null. A pinned token's label
+// is resolved from the seeded secrets (null when the id is unknown, mirroring a deleted
+// token's snapshot).
+function overrideToRead(body: { mode: string; secret_id?: string }): CredentialOverride | null {
+  if (body.mode === "inherit") return null;
+  if (body.mode === "pinned")
+    return { mode: "pinned", label: mockSecrets.find((s) => s.id === body.secret_id)?.label ?? null };
+  return { mode: body.mode, label: null };
+}
+
 export const runsApi = {
   // ── Runs ────────────────────────────────────────────────────────────────────
-  createRun: async (repoId: string, issueIid: number, force?: boolean) => {
+  createRun: async (
+    repoId: string,
+    issueIid: number,
+    force?: boolean,
+    // PRD #1247 M7: mirror the real client's optional override arg. The mock stamps the
+    // read-side {mode,label} onto the created run so a demo start-with-token is visible.
+    credentialOverride?: { mode: string; secret_id?: string },
+  ) => {
     const b = state.boards.get(repoId);
     const card = b?.cards.find((c) => c.iid === issueIid);
     if (!b || !card) throw new ApiError(404, "issue not found");
@@ -181,6 +292,10 @@ export const runsApi = {
       recovery_retry_not_before: null,
       forge_park_count: 0,
       forge_park_max: 0,
+      // PRD #1247 M7: stamp the read-side override the caller chose (null = inherit).
+      credential_override: credentialOverride ? overrideToRead(credentialOverride) : null,
+      credential_switch: null,
+      credential_epochs: [],
       claimed_at: null,
       started_at: null,
       finished_at: null,
@@ -327,7 +442,9 @@ export const runsApi = {
     const own_agents = templates
       .filter((t) => !LEAD_NAME_RE.test(t.name))
       .map((t) => ({ name: t.name, description: t.description }));
-    return delay({ run: { ...run, own_agents } }, 60);
+    // PRD #1247 M7: overlay the active credential-override demo scenario onto the run
+    // (a no-op for the default/unknown scenario, and for a run switched this session).
+    return delay({ run: { ...credentialOverlay(run), own_agents } }, 60);
   },
   // PRD #35: flip this run's usage-limit opt-in. Mirrors the server's guard — the
   // same NEGATIVE predicate the cancel path uses — so a terminal run is refused and
@@ -343,6 +460,37 @@ export const runsApi = {
     if (isTerminalRun(run.status)) throw new ApiError(409, "this run has already finished");
     patchRun(id, { wait_on_limit: enabled });
     return delay({ run: { ...getRun(id)! } }, 80);
+  },
+
+  // PRD #1247 M7: switch (or set) a run's Anthropic credential. Mirrors the server's
+  // contract closely enough to drive the demo and hold the UI to it: a missing run 404s;
+  // a terminal run 409s; a REFUSED lane (task_review / chat / judge / self_improve) 409s
+  // — the same lanes the UI hides the control for, so a stray call still fails. On success
+  // it writes the read-side override, marks the switch applied (credential_switch null,
+  // like Step A once applied), records the id so the seed no longer overlays it, and
+  // returns the updated run plus an OPTIONAL D6 warning for the `warning` scenario and for
+  // an `auto` choice with no eligible pooled token.
+  setRunCredential: async (id: string, body: { mode: string; secret_id?: string }) => {
+    const run = getRun(id);
+    if (!run) throw new ApiError(404, "run not found");
+    if (isTerminalRun(run.status)) throw new ApiError(409, "run has already finished");
+    if (isCredentialSwitchRefusedLane(run))
+      throw new ApiError(409, "this run's lane does not support switching its Anthropic token");
+    credentialSwitched.add(id);
+    patchRun(id, {
+      credential_override: overrideToRead(body),
+      credential_switch: null,
+      updated_at: new Date().toISOString(),
+    });
+    const updated = { ...getRun(id)! };
+    const pooledEligible = mockSecrets.some((s) => s.kind === "anthropic_token" && s.auto_eligible);
+    const warning =
+      mockScenario() === "warning"
+        ? "The chosen token was set, but a limit report suggests it may be throttled soon."
+        : body.mode === "auto" && !pooledEligible
+          ? "No token is currently eligible in your auto pool; the run will hold until one frees up."
+          : "";
+    return delay(warning ? { run: updated, warning } : { run: updated }, 120);
   },
 
   // PRD #841: set (or clear) a run's per-run MR-review-rework override. Mirrors the

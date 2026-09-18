@@ -85,6 +85,18 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 		// force" — and it never affects the active-run gate. The CLI `uzi run create --force`
 		// sets it (m2); the web board start button omits it.
 		Force bool `json:"force"`
+		// PRD #1247 M2: the create-time per-run Anthropic credential choice. A POINTER so
+		// its ABSENCE (the web board start button, the Slack/web chat start card, and any
+		// pre-#1247 client) stays distinct from a present choice: nil ⇒ send no override ⇒
+		// the run inherits the worker binding, byte-identical to today. When present, Mode
+		// is one of pinned/auto/default/inherit and SecretID (a *string, so it is optional
+		// and set only for a pinned choice) names the caller's own anthropic_token. The
+		// choice is validated + resolved below through the one validator (D5/D9/D10); the
+		// web start-dialog picker is M7 and schedule --token is M6.
+		CredentialOverride *struct {
+			Mode     string  `json:"mode"`
+			SecretID *string `json:"secret_id"`
+		} `json:"credential_override"`
 	}
 	if err := httpx.DecodeJSON(r, &req); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
@@ -132,15 +144,93 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// PRD #1247 M2: resolve the create-time credential override (D5/D9/D10) BEFORE the
+	// forge round-trip and the insert, so an invalid choice never creates a run. Absent ⇒
+	// nil ⇒ inherit the worker binding (the web board / chat start card path, unchanged).
+	var credOverride *workersvc.CredentialOverride
+	if req.CredentialOverride != nil {
+		var secretID *uuid.UUID
+		if req.CredentialOverride.SecretID != nil {
+			id, perr := uuid.Parse(strings.TrimSpace(*req.CredentialOverride.SecretID))
+			if perr != nil {
+				httpx.Error(w, http.StatusBadRequest, "credential_override.secret_id must be a valid uuid")
+				return
+			}
+			secretID = &id
+		}
+		// The effective harness of a NEW issue run is the user's default_harness (else
+		// claude): there is no runs.harness row yet (D9's "runs.harness, else
+		// users.default_harness"). Only a codex effective harness is refused (422), so any
+		// other value resolves to claude.
+		harness, herr := h.createRunEffectiveHarness(r.Context(), user.ID)
+		if herr != nil {
+			slog.Error("resolve create-time harness", "error", herr)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		resolved, verr := h.wsvc.ResolveCredentialOverride(r.Context(), user.ID, runkind.Issue, harness, req.CredentialOverride.Mode, secretID)
+		if verr != nil {
+			h.writeCredentialOverrideError(w, verr)
+			return
+		}
+		credOverride = resolved
+	}
+
 	// The forge GetIssue snapshot, the uzi-label eligibility gate and the description
 	// cap all live inside StartRunForUser (PRD #191 M1), shared with the Slack/web chat
 	// start-run card.
-	run, err := h.wsvc.StartRunForUser(r.Context(), user.ID, repo.ID, req.IssueIID, req.WaitOnLimit, req.MrReworkEnabled, req.Force, seed)
+	run, err := h.wsvc.StartRunForUser(r.Context(), user.ID, repo.ID, req.IssueIID, req.WaitOnLimit, req.MrReworkEnabled, req.Force, seed, credOverride)
 	if err != nil {
 		h.writeStartRunError(w, r, err)
 		return
 	}
 	httpx.JSON(w, http.StatusCreated, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock())})
+}
+
+// createRunEffectiveHarness resolves the effective harness of a NEW issue run for the
+// credential-override validator (PRD #1247 M2, D9). A run being created has no runs.harness
+// row yet, so the effective harness is the user's persisted default_harness, else claude —
+// the same "runs.harness, run_schedules.harness, else users.default_harness" fallback the
+// one validator's contract names, applied to the create case where the first two do not yet
+// exist. Only a codex effective harness is refused (422); every other value (including the
+// common NULL default) resolves to claude, so the fallback is the safe direction.
+func (h *Handler) createRunEffectiveHarness(ctx context.Context, userID uuid.UUID) (string, error) {
+	raw, err := h.q.GetUserDefaultHarness(ctx, userID)
+	if err != nil {
+		return "", err
+	}
+	if raw.Valid && raw.String == string(workersvc.HarnessCodex) {
+		return string(workersvc.HarnessCodex), nil
+	}
+	return string(workersvc.HarnessClaude), nil
+}
+
+// writeCredentialOverrideError maps the one validator's typed refusals to HTTP statuses
+// (PRD #1247, D6/D9/D10). Shared by the create path (M2) and reused by run set-token (M4)
+// and schedule create/edit (M6): the mapping lives in one place so the four override write
+// surfaces cannot drift in how they classify the same refusal.
+//
+//   - ErrCredentialOverrideSecretNotFound     → 404 (foreign / deleted / wrong-kind id)
+//   - ErrCredentialOverrideLaneNotSwitchable  → 409 (chat/judge/self_improve lane, D10)
+//   - ErrCredentialOverrideHarnessUnsupported → 422 (codex effective harness, D9)
+//   - ErrCredentialOverridePinnedNeedsSecret  → 400 (pinned with no id)
+//   - ErrCredentialOverrideInvalidMode        → 400 (mode outside the closed set)
+func (h *Handler) writeCredentialOverrideError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, workersvc.ErrCredentialOverrideSecretNotFound):
+		httpx.Error(w, http.StatusNotFound, "credential override token not found")
+	case errors.Is(err, workersvc.ErrCredentialOverrideLaneNotSwitchable):
+		httpx.Error(w, http.StatusConflict, "this run's lane does not support a credential override")
+	case errors.Is(err, workersvc.ErrCredentialOverrideHarnessUnsupported):
+		httpx.Error(w, http.StatusUnprocessableEntity, "a credential override is not supported on the codex harness")
+	case errors.Is(err, workersvc.ErrCredentialOverridePinnedNeedsSecret):
+		httpx.Error(w, http.StatusBadRequest, "a pinned credential override requires a token")
+	case errors.Is(err, workersvc.ErrCredentialOverrideInvalidMode):
+		httpx.Error(w, http.StatusBadRequest, "credential override mode must be one of pinned, auto, default or inherit")
+	default:
+		slog.Error("resolve credential override", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+	}
 }
 
 // CreateTaskRunRequest is the POST /repos/{id}/task-runs body (PRD #400): the inline
@@ -397,6 +487,65 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 			dto.MrReworkAutoCap = &capUsed
 		}
 	}
+	// PRD #1247 M1: attach the run's credential attribution journal (D7) and, for a pinned
+	// override, resolve the token label — both need the store, which runToDTO (pure) does
+	// not have. runToDTO already seeded credential_epochs to [] and set the override mode
+	// from the run row. Best-effort like the enrichments below: a lookup error leaves the
+	// journal empty / the label null rather than failing the read of an otherwise-fine run.
+	if epochs, err := h.wsvc.RunCredentialEpochs(r.Context(), run.ID, run.UserID); err != nil {
+		slog.Error("list run credential epochs", "run_id", run.ID, "error", err)
+	} else {
+		dto.CredentialEpochs = credentialEpochsToDTO(epochs)
+		// PRD #1247 Step A (D14, deferred clear #1422): credentialSwitchState derives
+		// credential_switch purely from the run row, but the DB clear of the switch stamp
+		// on a successful application is deferred to #1422 — so after a release+reclaim the
+		// row still carries credential_switch_requested_at/credential_switch_generation and
+		// the derived field reads a KNOWN-STALE "requested"/"released" for a switch that has
+		// already been applied. Suppress the stale DERIVED field here, where the epochs are
+		// in reach; the DB stays untouched and credentialSwitchState is unchanged.
+		//
+		// The stamp targets the CURRENT claim generation G, and recordRunCredential already
+		// wrote a run_credential_epochs row at that SAME generation G when the current claim
+		// opened — so an epoch AT G does NOT prove the switch was applied. Only an applied
+		// epoch at a LATER generation (STRICTLY > G), written after the release+reclaim,
+		// does. Use strict > (never >=): an epoch at == credential_switch_generation is the
+		// pre-request epoch of the current claim and must NOT suppress.
+		if dto.CredentialSwitch != nil && run.CredentialSwitchGeneration.Valid {
+			for _, e := range epochs {
+				if e.AppliedAt.Valid && e.ClaimGeneration > run.CredentialSwitchGeneration.Int64 {
+					dto.CredentialSwitch = nil
+					break
+				}
+			}
+		}
+	}
+	if dto.CredentialOverride != nil && run.CredentialOverrideSecretID.Valid {
+		if meta, err := h.q.GetUserSecretMetaByID(r.Context(), store.GetUserSecretMetaByIDParams{
+			ID:     uuid.UUID(run.CredentialOverrideSecretID.Bytes),
+			UserID: run.UserID,
+		}); err != nil {
+			if !errors.Is(err, pgx.ErrNoRows) {
+				slog.Error("resolve credential override label", "run_id", run.ID, "error", err)
+			}
+		} else {
+			label := meta.Label
+			dto.CredentialOverride.Label = &label
+		}
+	}
+	// PRD #1391 M3 (D13): surface a finished outcome the run's OWNING worker is holding
+	// because its api permanently refused the terminal report (a completion-permit
+	// mismatch, an unrecoverable message gap, or an exhausted terminal reserve), so the
+	// owner can see it and resolve it with a discarding cancel. Non-pure telemetry from
+	// the outbox tracker (not the run row), so it is overlaid here rather than in the pure
+	// runToDTO builder, and ONLY on this single-run detail path — the list/board never
+	// carries it. RunBlockedOutcome already dropped any unrecognised (untrusted) reason;
+	// OWNER-GATE on the reporting worker (the outbox runIndex is "last reporter wins" with
+	// no ownership check, so trust the depth only when the reporter IS the run's current
+	// owning worker, exactly as the health detector does).
+	if reason, reporter, ok := h.wsvc.RunBlockedOutcome(run.ID); ok &&
+		run.WorkerID.Valid && uuid.UUID(run.WorkerID.Bytes) == reporter {
+		dto.OutcomePending = &apitypes.OutcomePendingDTO{Reason: reason}
+	}
 	// PRD #37 M4-fix: resolve the owner's OWN-source roster here, on the detail read,
 	// so the plan-gate picker sources its "My agent templates" chips from exactly the
 	// roster the approve validator + worker use (allocation-resolved, lead stripped).
@@ -615,19 +764,32 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 	// validation and enqueue succeed, so a failed approve (e.g. an invalid selection) leaves
 	// the requirement INTACT and the retry stays gated. Owner- and awaiting_approval-scoped in
 	// SQL, and inert for any kind other than approve_plan (the gate only runs for approve_plan).
-	var res workersvc.SubmitInputResult
-	var err error
-	if req.OverrideCapabilities {
-		res, err = h.wsvc.SubmitInputWithCapabilityOverride(r.Context(), user.ID, id, req.Kind, req.Body, req.Selection)
-	} else {
-		res, err = h.wsvc.SubmitInput(r.Context(), user.ID, id, req.Kind, req.Body, req.Selection)
-	}
+	// PRD #1391 Run B M3d (D13): discard_pending_outcome rides alongside override_capabilities as
+	// an owner-authorized bypass, so route both through SubmitInputWithOptions. Both default false,
+	// so an approve without the capability override and a cancel of a run with no pending outcome
+	// behave exactly as before.
+	res, err := h.wsvc.SubmitInputWithOptions(r.Context(), user.ID, id, req.Kind, req.Body, req.Selection, workersvc.SubmitInputOptions{
+		OverrideCapabilities:  req.OverrideCapabilities,
+		DiscardPendingOutcome: req.DiscardPendingOutcome,
+	})
 	if err != nil {
 		switch {
 		case errors.Is(err, workersvc.ErrRunNotFound):
 			httpx.Error(w, http.StatusNotFound, "run not found")
 		case errors.Is(err, workersvc.ErrRunTerminal):
 			httpx.Error(w, http.StatusConflict, "run has already finished")
+		case errors.Is(err, workersvc.ErrOutcomePendingConfirmationRequired):
+			// PRD #1391 Run B M3d (D13): the cancel targets a run whose executor journaled a
+			// terminal (esp. blocked) outcome on its worker, and the request did not carry
+			// discard_pending_outcome. A typed 409 with a machine-readable `reason` beside the
+			// message so the web modal / CLI can detect exactly this case and retry with the bit,
+			// rather than string-matching the prose. Owner-only: a foreign/admin-ro caller resolves
+			// 0 rows upstream and 404s, never reaching here.
+			httpx.ErrorReason(w, http.StatusConflict, err.Error(), "outcome_pending_confirmation_required")
+		case errors.Is(err, workersvc.ErrOutcomePendingCancelRaced):
+			// The confirmed discard lost the pending-lease race while the run stayed active.
+			// Nothing was cancelled; surface a retryable state conflict rather than false success.
+			httpx.ErrorReason(w, http.StatusConflict, err.Error(), "outcome_pending_changed")
 		case errors.Is(err, workersvc.ErrStopNotInteractive):
 			// 409: a run-state conflict. Only an interactive task run's park honors a
 			// graceful stop; on any other run nothing would wind it down.

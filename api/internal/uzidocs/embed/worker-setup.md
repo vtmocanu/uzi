@@ -155,6 +155,29 @@ What the gauges mean:
 - **busy**: the worker holds one or more non-terminal runs — by default just one at a
   time; see [Concurrent runs](#concurrent-runs) to raise that.
 
+## Message outbox
+
+An api outage — of any length — no longer costs a run its message feed. The worker's message batcher keeps flushing to `api` as usual; once flushes have been failing transiently for `WORKER_TRANSIENT_TRIP_MS` (default 10m), it stops trying the network and starts spilling run messages to a durable, authenticated on-disk outbox under `<dataDir>/outbox` instead of tripping the run. A per-worker drainer replays the backlog, in order, once the api comes back — however long the outage lasted, as long as the retained data stays within the quotas below; past them, some message frames are dropped and replay as contiguous per-seq gap markers rather than the original messages. The outbox can't grow without bound: a per-run quota, a worker-total quota, an in-memory buffer cap while spilled, and a retention window on fully-drained runs (`WORKER_OUTBOX_RUN_MAX_BYTES`, `WORKER_OUTBOX_MAX_BYTES`, `WORKER_OUTBOX_SPILL_BUFFER_BYTES`, `WORKER_OUTBOX_RETENTION`) all keep how much disk it ever holds bounded — see [configuration.md](./configuration.md#worker-container-agent) for every knob and its default.
+
+**Same-uid caveat on the hosted runtime.** A [hosted worker](./hosted-workers.md) runs the `#58` single-uid posture (see [proc-hardening.md](proc-hardening.md)): the model process shares the worker's own uid, so it can read the outbox's signing key and forge, truncate, or delete any run's outbox files. There, the outbox protects against an api outage, not against a hostile model — integrity and durability against the model itself are a documented residual, closed by a later container-split follow-up (the model running in its own container behind an IPC boundary). On a self-run worker's [uid-split](proc-hardening.md#the-mechanism-as-built-mechanism-a1) start, the outbox tree is unwritable by the `runner` uid the model runs as.
+
+## Surviving an api restart mid-run
+
+The message outbox above keeps a run's message feed intact across an api
+outage; this is about the run's own status. On every heartbeat and claim, a
+worker reports which run-lane attempts it's actually executing and in which
+phase (running, or parked at a plan-approval or clarifying-question gate).
+Once the api is back (after a short boot grace where it holds off declaring
+workers stale, so a worker that only lost the api and not its own health
+isn't wrongly re-queued), it uses that report to restore a run the outage
+flipped to `queued` back to its exact phase within one heartbeat — no
+re-queue budget spent, no new custody hold. A run that was genuinely
+re-queued during the outage gets that charge refunded once it's back. See
+[configuration.md](./configuration.md#server-api) for `SWEEPER_BOOT_GRACE`
+and the related knobs.
+
+The same write-ahead journal covers a run-lane attempt's terminal outcome (an issue run, a judge, or a review; chat is excluded — it never carries a claim generation to fence on). Before the worker ever sends a `completed`/`failed` report, it journals the outcome to the same durable outbox tree the message outbox above uses, keyed by the run and its claim generation. Once the api is back, replay sends the run's own messages first and the outcome only after they've caught up, so a run that finished during the outage still gets its MR and its final state exactly once — a journaled outcome is never re-attempted, and a duplicate claim on the same run is refused rather than executed. If the worker container restarts mid-outage, it resolves every pending journal from disk before its claim loops start, so the outcome lands even though the executor that produced it is gone. An outcome the api permanently refuses (most often because the run's messages can't be reconciled, or a completion permit no longer matches) is never discarded on a timer: it's surfaced on the run as a held outcome and cleared only by the owner explicitly cancelling with the discard bit set (`uzi run cancel --discard-pending-outcome`, or the same confirmation from the run page). Same-uid caveat as above: the outcome journal lives in the same worker-owned tree as the message outbox, so on the hosted single-uid runtime it protects against the outage, not against a hostile model.
+
 ## Concurrent runs
 
 By default a worker executes one run at a time. Set `WORKER_MAX_CONCURRENT_RUNS`

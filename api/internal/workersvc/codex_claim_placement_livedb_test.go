@@ -245,7 +245,7 @@ func TestClaimCodexVocabularyRemovalCalibrationLiveDB(t *testing.T) {
 
 	// A bare worker row Register can UPDATE (RegisterWorker is an UPDATE-by-id).
 	workerID := e.seedWorker(t, nil)
-	if _, err := svc.Register(e.ctx, store.Worker{ID: workerID, UserID: e.userID}, "v-test", "base", nil, nil, []string{capability.CodexHarnessV1}); err != nil {
+	if _, _, err := svc.Register(e.ctx, store.Worker{ID: workerID, UserID: e.userID}, "v-test", "base", nil, nil, []string{capability.CodexHarnessV1}, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 

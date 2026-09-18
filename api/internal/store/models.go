@@ -587,6 +587,12 @@ type Run struct {
 	Harness                     string             `json:"harness"`
 	RecoveryWaitCause           pgtype.Text        `json:"recovery_wait_cause"`
 	ForgeParkCount              int32              `json:"forge_park_count"`
+	CredentialOverrideMode      pgtype.Text        `json:"credential_override_mode"`
+	CredentialOverrideSecretID  pgtype.UUID        `json:"credential_override_secret_id"`
+	ClaimReleasedAt             pgtype.Timestamptz `json:"claim_released_at"`
+	CredentialSwitchRequestedAt pgtype.Timestamptz `json:"credential_switch_requested_at"`
+	CredentialSwitchGeneration  pgtype.Int8        `json:"credential_switch_generation"`
+	StaleRequeueGeneration      pgtype.Int8        `json:"stale_requeue_generation"`
 }
 
 type RunCompletionAttempt struct {
@@ -612,16 +618,26 @@ type RunCompletionPermit struct {
 	ConsumedAt       pgtype.Timestamptz `json:"consumed_at"`
 }
 
+type RunCredentialEpoch struct {
+	RunID           uuid.UUID          `json:"run_id"`
+	ClaimGeneration int64              `json:"claim_generation"`
+	SecretID        pgtype.UUID        `json:"secret_id"`
+	Label           pgtype.Text        `json:"label"`
+	SelectReason    pgtype.Text        `json:"select_reason"`
+	AppliedAt       pgtype.Timestamptz `json:"applied_at"`
+}
+
 type RunMessage struct {
-	ID            int64              `json:"id"`
-	RunID         uuid.UUID          `json:"run_id"`
-	Seq           int32              `json:"seq"`
-	Kind          string             `json:"kind"`
-	Agent         pgtype.Text        `json:"agent"`
-	Payload       []byte             `json:"payload"`
-	CreatedAt     pgtype.Timestamptz `json:"created_at"`
-	AgentInstance pgtype.Text        `json:"agent_instance"`
-	AgentLabel    pgtype.Text        `json:"agent_label"`
+	ID              int64              `json:"id"`
+	RunID           uuid.UUID          `json:"run_id"`
+	Seq             int32              `json:"seq"`
+	Kind            string             `json:"kind"`
+	Agent           pgtype.Text        `json:"agent"`
+	Payload         []byte             `json:"payload"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	AgentInstance   pgtype.Text        `json:"agent_instance"`
+	AgentLabel      pgtype.Text        `json:"agent_label"`
+	ClaimGeneration pgtype.Int8        `json:"claim_generation"`
 }
 
 type RunReview struct {
@@ -638,37 +654,39 @@ type RunReview struct {
 }
 
 type RunSchedule struct {
-	ID                    uuid.UUID          `json:"id"`
-	UserID                uuid.UUID          `json:"user_id"`
-	RepoID                uuid.UUID          `json:"repo_id"`
-	Target                string             `json:"target"`
-	IssueIid              pgtype.Int8        `json:"issue_iid"`
-	Labels                []byte             `json:"labels"`
-	Prompt                pgtype.Text        `json:"prompt"`
-	Timing                string             `json:"timing"`
-	CronExpr              pgtype.Text        `json:"cron_expr"`
-	RunAt                 pgtype.Timestamptz `json:"run_at"`
-	Timezone              string             `json:"timezone"`
-	NextFireAt            pgtype.Timestamptz `json:"next_fire_at"`
-	LastFiredAt           pgtype.Timestamptz `json:"last_fired_at"`
-	AutoApprove           bool               `json:"auto_approve"`
-	WaitOnLimit           bool               `json:"wait_on_limit"`
-	Enabled               bool               `json:"enabled"`
-	Status                string             `json:"status"`
-	CreatedAt             pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt             pgtype.Timestamptz `json:"updated_at"`
-	MaxIssues             pgtype.Int4        `json:"max_issues"`
-	Guidance              pgtype.Text        `json:"guidance"`
-	Model                 pgtype.Text        `json:"model"`
-	OverrideSubagentModel bool               `json:"override_subagent_model"`
-	LastFire              []byte             `json:"last_fire"`
-	Origin                string             `json:"origin"`
-	CatalogSlug           pgtype.Text        `json:"catalog_slug"`
-	Customized            bool               `json:"customized"`
-	SiblingGroupID        pgtype.UUID        `json:"sibling_group_id"`
-	MrReworkEnabled       pgtype.Bool        `json:"mr_rework_enabled"`
-	OutputMode            pgtype.Text        `json:"output_mode"`
-	Harness               pgtype.Text        `json:"harness"`
+	ID                         uuid.UUID          `json:"id"`
+	UserID                     uuid.UUID          `json:"user_id"`
+	RepoID                     uuid.UUID          `json:"repo_id"`
+	Target                     string             `json:"target"`
+	IssueIid                   pgtype.Int8        `json:"issue_iid"`
+	Labels                     []byte             `json:"labels"`
+	Prompt                     pgtype.Text        `json:"prompt"`
+	Timing                     string             `json:"timing"`
+	CronExpr                   pgtype.Text        `json:"cron_expr"`
+	RunAt                      pgtype.Timestamptz `json:"run_at"`
+	Timezone                   string             `json:"timezone"`
+	NextFireAt                 pgtype.Timestamptz `json:"next_fire_at"`
+	LastFiredAt                pgtype.Timestamptz `json:"last_fired_at"`
+	AutoApprove                bool               `json:"auto_approve"`
+	WaitOnLimit                bool               `json:"wait_on_limit"`
+	Enabled                    bool               `json:"enabled"`
+	Status                     string             `json:"status"`
+	CreatedAt                  pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt                  pgtype.Timestamptz `json:"updated_at"`
+	MaxIssues                  pgtype.Int4        `json:"max_issues"`
+	Guidance                   pgtype.Text        `json:"guidance"`
+	Model                      pgtype.Text        `json:"model"`
+	OverrideSubagentModel      bool               `json:"override_subagent_model"`
+	LastFire                   []byte             `json:"last_fire"`
+	Origin                     string             `json:"origin"`
+	CatalogSlug                pgtype.Text        `json:"catalog_slug"`
+	Customized                 bool               `json:"customized"`
+	SiblingGroupID             pgtype.UUID        `json:"sibling_group_id"`
+	MrReworkEnabled            pgtype.Bool        `json:"mr_rework_enabled"`
+	OutputMode                 pgtype.Text        `json:"output_mode"`
+	Harness                    pgtype.Text        `json:"harness"`
+	CredentialOverrideMode     pgtype.Text        `json:"credential_override_mode"`
+	CredentialOverrideSecretID pgtype.UUID        `json:"credential_override_secret_id"`
 }
 
 type RunUsage struct {
@@ -684,6 +702,7 @@ type RunUsage struct {
 	LineageEpoch        int32              `json:"lineage_epoch"`
 	Harness             string             `json:"harness"`
 	CostStatus          string             `json:"cost_status"`
+	ClaimGeneration     pgtype.Int8        `json:"claim_generation"`
 }
 
 type RunUsageTotal struct {
@@ -865,6 +884,21 @@ type Worker struct {
 	StatsDiskDataTotalBytes pgtype.Int8        `json:"stats_disk_data_total_bytes"`
 	StatsDiskPressureStreak int32              `json:"stats_disk_pressure_streak"`
 	ProtocolCapabilities    []string           `json:"protocol_capabilities"`
+	SnapshotEpoch           int64              `json:"snapshot_epoch"`
+	SnapshotRegisterNonce   pgtype.Text        `json:"snapshot_register_nonce"`
+	PendingOverflow         bool               `json:"pending_overflow"`
+	PendingOverflowUntil    pgtype.Timestamptz `json:"pending_overflow_until"`
+}
+
+type WorkerActiveRun struct {
+	WorkerID             uuid.UUID          `json:"worker_id"`
+	RunID                uuid.UUID          `json:"run_id"`
+	ClaimGeneration      int64              `json:"claim_generation"`
+	Phase                string             `json:"phase"`
+	TerminalPending      bool               `json:"terminal_pending"`
+	TerminalPendingUntil pgtype.Timestamptz `json:"terminal_pending_until"`
+	SnapshotEpoch        int64              `json:"snapshot_epoch"`
+	ReportedAt           pgtype.Timestamptz `json:"reported_at"`
 }
 
 type WorkerUpgradeMute struct {

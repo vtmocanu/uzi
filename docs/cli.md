@@ -91,7 +91,7 @@ uzi run create --repo <id> --issue <iid> [--plan-file <path>]
 uzi run approve <id> [--agent-source own|repo] [--exclude-agents a,b]
 uzi run reject <id> [--message <text>]
 uzi run revise <id> [--message <text>]
-uzi run cancel <id>
+uzi run cancel <id> [--discard-pending-outcome]
 uzi run stop <id> [--message <text>]
 uzi run scope <id> --through <n>
 uzi run extend <id> --by <duration>
@@ -214,7 +214,10 @@ A few worth knowing:
   and (via the server's `completed` transition) `--review` fires iff it was
   requested, then the run lands `completed` with a distinct stop disposition.
   Unlike `run cancel`, which aborts mid-turn, `stop` never discards in-flight
-  work. On a **milestone-structured issue run** (PRD #634), `stop` instead
+  work. If a run finished on its worker but its outcome never reached uzi (an
+  api outage held it on the worker), `run cancel` refuses with a confirmation
+  error unless you pass `--discard-pending-outcome`, which cancels the run and
+  throws that finished result away. On a **milestone-structured issue run** (PRD #634), `stop` instead
   sets an operator scope ceiling at the already-completed milestone count:
   the run finalizes the committed slice (pushes the branch, opens the MR
   when requested) and starts no further milestone — the same graceful
@@ -818,6 +821,12 @@ A few things worth knowing before you rely on this:
   *live* task branch mid-run, they're rejected non-fast-forward rather than
   clobbering the worker's history — a mid-run user push is out of scope for
   v1; use `uzi run follow-up <id>` to send the worker more context instead.
+- **The seeded branch is already published, so ask for a merge, not a
+  rebase.** Your seed push publishes `uzi/task/<id>` before the worker ever
+  starts, so a task prompt should say "merge main into this branch," never
+  "rebase onto main" — uzi can't force-push a rewrite of a branch it already
+  published, so a rebase there gets bridged (or, if that's impossible, fails
+  the run) at finalize instead of landing as asked.
 - **A raw handoff has no forge record.** With no issue and no MR (no `--mr`),
   there's nothing durable on the forge — the run transcript and your inline
   context are still persisted in uzi (`uzi run get`/`uzi run logs`), but if

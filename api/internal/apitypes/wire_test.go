@@ -235,6 +235,13 @@ var runDTOKeys = []string{
 	// PRD #1064 M2: the server-derived "now" line (RunActivity object or null). On both
 	// list and detail via the RunListItemDTO embed.
 	"current_activity",
+	// PRD #1247 M1: the per-run credential override, the pending held-state switch state,
+	// and the applied-switch attribution journal. All three non-omitempty.
+	"credential_override", "credential_switch", "credential_epochs",
+	// PRD #1391 M3 (D13): a finished outcome the run's worker is holding because the api
+	// permanently refused the terminal report ({reason} object or null). Non-omitempty,
+	// overlaid on the single-run detail read only.
+	"outcome_pending",
 }
 
 func TestRunDTOTags(t *testing.T) {
@@ -271,8 +278,12 @@ func TestMessageDTOTags(t *testing.T) {
 
 func TestRunInputTags(t *testing.T) {
 	// PRD #84 M4 4c: override_capabilities is a plain bool (not omitempty), so it is always
-	// on the wire; meaningful only with approve_plan, default false.
-	assertTags(t, "RunInputRequest", RunInputRequest{}, "kind", "body", "selection", "override_capabilities")
+	// on the wire; meaningful only with approve_plan, default false. PRD #1391 Run B M3d (D13):
+	// discard_pending_outcome is omitted when false for newer-client/older-api compatibility,
+	// and present only for the owner's explicit confirmed discard.
+	assertTags(t, "RunInputRequest(false)", RunInputRequest{}, "kind", "body", "selection", "override_capabilities")
+	assertTags(t, "RunInputRequest(true)", RunInputRequest{DiscardPendingOutcome: true},
+		"kind", "body", "selection", "override_capabilities", "discard_pending_outcome")
 	// id + created_at are omitempty (nil on approve/cancel/reject): the zero value is
 	// still just server_side (PRD #95 S2).
 	assertTags(t, "RunInputResponse", RunInputResponse{}, "server_side")
@@ -740,6 +751,10 @@ var workerDTOKeys = []string{
 	// Read-only display for the workers UI.
 	"capabilities",
 	"max_concurrent_runs",
+	// PRD #1390 M2c: what this worker SAYS it is executing (its worker_active_runs snapshot),
+	// each entry a {run_id, phase, claim_generation}. ALWAYS a JSON array, never null — the
+	// list/patch overlay reads it from the DB and the builders seed it to []. Display-only.
+	"reported_runs",
 	// PRD #1296 M4 (D4): true when the worker holds an OPEN durable-recovery custody hold —
 	// it retained committed work a run could not publish. Distinct from busy (a held worker
 	// consumes no run/LLM slot) but still counts against the per-owner hosted quota.
@@ -770,6 +785,11 @@ var workerDTOKeys = []string{
 	// PRD #111 M3: HOW this worker chooses — default | pinned | auto. The server
 	// reports the EFFECTIVE mode, so "pinned" always has an id beside it.
 	"anthropic_bind_mode",
+	// PRD #1391 M5: the worker's last-reported outbox depth, summed across its runs.
+	// Null until it reports a non-empty outbox (re-nulled once drained). Overlaid from
+	// an in-process, restart-losing tracker, never stored — this tag set is the only
+	// wire contract these four fields have.
+	"outbox_pending_messages", "outbox_pending_terminal", "outbox_stale_retired", "outbox_blocked",
 }
 
 func TestWorkerDTOTags(t *testing.T) {

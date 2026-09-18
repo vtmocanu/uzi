@@ -23,7 +23,16 @@ describe("MessageBatcher durability-boundary cancellation", () => {
     const started = new Promise<void>((resolve) => { startedResolve = resolve; });
     let settled = false;
     const client = {
-      async postMessages(_runId: string, _messages: OutgoingMessage[], signal?: AbortSignal): Promise<void> {
+      // PRD #1391 M2: postMessages gained a `generation` param BEFORE `signal`
+      // (runId, messages, generation?, signal?), so the abort signal now rides the 4th
+      // positional arg — the fake must match the production interface or it would read
+      // the generation number as the signal and never see the abort.
+      async postMessages(
+        _runId: string,
+        _messages: OutgoingMessage[],
+        _generation?: number,
+        signal?: AbortSignal,
+      ): Promise<void> {
         startedResolve();
         await new Promise<void>((_, reject) => {
           const abort = (): void => {

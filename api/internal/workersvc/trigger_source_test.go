@@ -46,7 +46,7 @@ func TestTriggerSourceThreadedByCreateRunFamily(t *testing.T) {
 
 	t.Run("CreateRun stamps manual", func(t *testing.T) {
 		fs := newFS()
-		if _, err := New(fs, newBox(t), testParams()).CreateRun(ctx, user, repo, 1, "desc", nil, nil, false /*force*/, nil); err != nil {
+		if _, err := New(fs, newBox(t), testParams()).CreateRun(ctx, user, repo, 1, "desc", nil, nil, false /*force*/, nil, nil); err != nil {
 			t.Fatalf("CreateRun: %v", err)
 		}
 		assertStamp(t, fs, "manual")
@@ -54,7 +54,7 @@ func TestTriggerSourceThreadedByCreateRunFamily(t *testing.T) {
 
 	t.Run("CreateScheduledRun stamps schedule", func(t *testing.T) {
 		fs := newFS()
-		if _, err := New(fs, newBox(t), testParams()).CreateScheduledRun(ctx, user, repo, 1, "desc", nil, nil, nil, false, nil); err != nil {
+		if _, err := New(fs, newBox(t), testParams()).CreateScheduledRun(ctx, user, repo, 1, "desc", nil, nil, nil, false, nil, nil); err != nil {
 			t.Fatalf("CreateScheduledRun: %v", err)
 		}
 		assertStamp(t, fs, "schedule")
@@ -70,7 +70,7 @@ func TestTriggerSourceThreadedByCreateRunFamily(t *testing.T) {
 
 	t.Run("CreateScheduledAutopilotRun stamps autopilot", func(t *testing.T) {
 		fs := newFS()
-		if _, err := New(fs, newBox(t), testParams()).CreateScheduledAutopilotRun(ctx, user, repo, 1, "desc", nil, nil, nil, false); err != nil {
+		if _, err := New(fs, newBox(t), testParams()).CreateScheduledAutopilotRun(ctx, user, repo, 1, "desc", nil, nil, nil, false, nil); err != nil {
 			t.Fatalf("CreateScheduledAutopilotRun: %v", err)
 		}
 		assertStamp(t, fs, "autopilot")

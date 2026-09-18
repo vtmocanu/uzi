@@ -183,11 +183,16 @@ describe("RunRunner — pre-clone forge-unreachable park (PRD #1392 M2)", () => 
       const claim = gitlabClaim(702, { claim_generation: 9 });
       await makeRunner(client, factory).execute(claim);
 
-      // The TYPED report is sent first, carrying the cause + generation.
+      // The TYPED report is sent first, carrying the cause + generation. NOTE: ForgeParkClient
+      // OVERRIDES reportState and records the body the CLOSURE built, BEFORE client.reportState's
+      // send-gate (fix round E) runs — so this asserts the reportState closure STAMPS the generation
+      // into the report, not that it rides the wire. The actual wire behavior (capability-optimistic
+      // stamp, gen-0 omit, strict-decode strip-and-retry) is pinned in client-state-send-gate.test.ts
+      // and the runner integration in runner-stale-claim.test.ts.
       const park = parkReport(client);
       assert.ok(park, "the typed recovery_wait report must be sent");
       assert.strictEqual(park!.recovery_cause, "forge_unreachable");
-      assert.strictEqual(park!.claim_generation, 9);
+      assert.strictEqual(park!.claim_generation, 9, "the reportState closure stamps the claim generation into the report");
       // No terminal report, no release endpoint call (the api settles custody in the transaction).
       assert.ok(!reportedStatuses(client).includes("failed"), "a parked run reports no failure");
       assert.deepStrictEqual(client.releaseCalls, [], "recovery_park_cause api parks with NO release call");
@@ -637,7 +642,7 @@ describe("RunRunner — pre-clone forge-unreachable park (PRD #1392 M2)", () => 
     }
   });
 
-  it("D7 (recovery_release_exact_echo only): parks via an untyped report with NEITHER field after a proven exact release", async () => {
+  it("D7 (recovery_release_exact_echo only): parks via an untyped report whose reportState closure supplies claim_generation (PRD #1247 universal stamp, pre-client-gate) but NO cause after a proven exact release", async () => {
     const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-forgepark-d7-echo-"));
     try {
       const client = new ForgeParkClient(["recovery_release_exact_echo"], {
@@ -654,7 +659,22 @@ describe("RunRunner — pre-clone forge-unreachable park (PRD #1392 M2)", () => 
       assert.strictEqual(client.releaseCalls[0]!.generation, 20);
       const park = parkReport(client);
       assert.ok(park, "an untyped recovery_wait report must be sent");
-      assert.strictEqual(park!.claim_generation, undefined, "no generation field without the fence");
+      // PRD #1247 M5b: the reportState closure stamps claim_generation on the forge-park report (as on
+      // every mutating /state report), superseding #1392's forge-park conditional-omit. recovery_cause
+      // stays absent.
+      // PRD #1247 M5 rework: the recovery_release_exact_echo branch no longer stamps claim_generation
+      // LOCALLY (the `claim_generation_fence`-gated local set was dead — the reportState closure spreads
+      // `...body` then sets claim_generation). Here the fence is NOT advertised, so the retired local
+      // conditional could never have fired; claim_generation being present therefore proves the stamp
+      // comes SOLELY from the reportState closure, AT THE CLOSURE BOUNDARY — removing the local
+      // conditional changed nothing there. NOTE: this asserts the CLOSURE, not the wire. ForgeParkClient
+      // OVERRIDES reportState and records the body BEFORE the fix round E send-gate, so on the real wire
+      // this no-capability/no-feature config OMITS the field (pinned in client-state-send-gate.test.ts).
+      assert.strictEqual(
+        park!.claim_generation,
+        claim.claim_generation,
+        "the reportState closure stamps the claim's generation (20) on the untyped forge-park report",
+      );
       assert.strictEqual(park!.recovery_cause, undefined, "no cause on the baseline fallback");
       assert.strictEqual(statusTexts(claim.run_id).filter((t) => /parked/.test(t)).length, 1, "one park event");
     } finally {

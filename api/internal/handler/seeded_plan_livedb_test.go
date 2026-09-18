@@ -144,7 +144,7 @@ func TestSeededRunClaimCarriesApprovedPlanNoInputRowLiveDB(t *testing.T) {
 
 	const plan = "# Plan\n\nImplement the widget in widget.go. Done when the tests pass."
 	sel := workersvc.AgentSelection{Source: workersvc.AgentSourceRepo, Exclusions: []string{"reviewer"}}
-	run, err := f.svc.CreateRun(ctx, f.owner, f.repoID, f.iid, "issue body", nil, nil, false, &workersvc.SeededPlan{PlanMD: plan, Selection: &sel})
+	run, err := f.svc.CreateRun(ctx, f.owner, f.repoID, f.iid, "issue body", nil, nil, false, &workersvc.SeededPlan{PlanMD: plan, Selection: &sel}, nil)
 	if err != nil {
 		t.Fatalf("CreateRun (seeded): %v", err)
 	}
@@ -155,7 +155,7 @@ func TestSeededRunClaimCarriesApprovedPlanNoInputRowLiveDB(t *testing.T) {
 		t.Fatalf("created run status = %q, want queued", run.Status)
 	}
 
-	payload, err := f.svc.Claim(ctx, f.wkr)
+	payload, err := f.svc.Claim(ctx, f.wkr, nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -206,7 +206,7 @@ func TestSeededRunFallThroughToGateDisarmsLiveDB(t *testing.T) {
 	f := newSeededPlanFixture(ctx, t)
 
 	sel := workersvc.AgentSelection{Source: workersvc.AgentSourceRepo, Exclusions: []string{"reviewer"}}
-	run, err := f.svc.CreateRun(ctx, f.owner, f.repoID, f.iid, "issue body", nil, nil, false, &workersvc.SeededPlan{PlanMD: "# Seeded plan\nImplement it.", Selection: &sel})
+	run, err := f.svc.CreateRun(ctx, f.owner, f.repoID, f.iid, "issue body", nil, nil, false, &workersvc.SeededPlan{PlanMD: "# Seeded plan\nImplement it.", Selection: &sel}, nil)
 	if err != nil {
 		t.Fatalf("CreateRun (seeded): %v", err)
 	}
@@ -214,7 +214,7 @@ func TestSeededRunFallThroughToGateDisarmsLiveDB(t *testing.T) {
 	// Claim #1: at birth the run is armed (plan_approved true), which is correct — this
 	// is the state the D8 fall-through must NOT be able to resurrect after the worker
 	// overwrites plan_md.
-	first, err := f.svc.Claim(ctx, f.wkr)
+	first, err := f.svc.Claim(ctx, f.wkr, nil)
 	if err != nil {
 		t.Fatalf("first Claim: %v", err)
 	}
@@ -263,7 +263,7 @@ func TestSeededRunFallThroughToGateDisarmsLiveDB(t *testing.T) {
 	// Re-claim: the run is now an ordinary agent-planned run with no approval behind it,
 	// so it must come back DISARMED. Without the plan_source='agent' write above, this
 	// assertion reads true and the run would implement a plan no human ever saw.
-	second, err := f.svc.Claim(ctx, f.wkr)
+	second, err := f.svc.Claim(ctx, f.wkr, nil)
 	if err != nil {
 		t.Fatalf("re-claim: %v", err)
 	}
@@ -293,7 +293,7 @@ func TestSeededRunClaimCarriesPlannedBaseCommitLiveDB(t *testing.T) {
 		PlanMD:        "# Plan\nImplement the widget.",
 		PlannedCommit: plannedCommit,
 		RequireBase:   true,
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("CreateRun (seeded, --planned-commit --require-base): %v", err)
 	}
@@ -317,7 +317,7 @@ func TestSeededRunClaimCarriesPlannedBaseCommitLiveDB(t *testing.T) {
 	}
 
 	// The claim re-delivers both to the worker.
-	payload, err := f.svc.Claim(ctx, f.wkr)
+	payload, err := f.svc.Claim(ctx, f.wkr, nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -339,7 +339,7 @@ func TestSeededRunNoPlannedCommitClaimIsInertLiveDB(t *testing.T) {
 	ctx := context.Background()
 	f := newSeededPlanFixture(ctx, t)
 
-	run, err := f.svc.CreateRun(ctx, f.owner, f.repoID, f.iid, "issue body", nil, nil, false, &workersvc.SeededPlan{PlanMD: "# Plan\nImplement it."})
+	run, err := f.svc.CreateRun(ctx, f.owner, f.repoID, f.iid, "issue body", nil, nil, false, &workersvc.SeededPlan{PlanMD: "# Plan\nImplement it."}, nil)
 	if err != nil {
 		t.Fatalf("CreateRun (seeded, no planned commit): %v", err)
 	}
@@ -359,7 +359,7 @@ func TestSeededRunNoPlannedCommitClaimIsInertLiveDB(t *testing.T) {
 		t.Error("require_base_match = true, want false by default")
 	}
 
-	payload, err := f.svc.Claim(ctx, f.wkr)
+	payload, err := f.svc.Claim(ctx, f.wkr, nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}

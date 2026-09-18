@@ -20,6 +20,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/config"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -39,6 +40,9 @@ type protocolStore struct {
 	// Orphan-classification read (issue #1319): the owner-run row/error the orphan query returns.
 	orphanRow store.GetRunOrphanIdentityRow
 	orphanErr error
+	gapRows   []store.RunMessageGapsRow
+	gapErr    error
+	gapArg    store.RunMessageGapsParams
 }
 
 func (p *protocolStore) ClaimRun(context.Context, store.ClaimRunParams) (store.Run, error) {
@@ -50,6 +54,10 @@ func (p *protocolStore) GetRunOwnedByWorker(context.Context, store.GetRunOwnedBy
 func (p *protocolStore) GetRunOrphanIdentity(context.Context, store.GetRunOrphanIdentityParams) (store.GetRunOrphanIdentityRow, error) {
 	return p.orphanRow, p.orphanErr
 }
+func (p *protocolStore) RunMessageGaps(_ context.Context, arg store.RunMessageGapsParams) ([]store.RunMessageGapsRow, error) {
+	p.gapArg = arg
+	return p.gapRows, p.gapErr
+}
 func (p *protocolStore) SetRunCompleted(context.Context, store.SetRunCompletedParams) (int64, error) {
 	return p.completedRows, nil
 }
@@ -59,8 +67,8 @@ func (p *protocolStore) SetRunCompleted(context.Context, store.SetRunCompletedPa
 func (p *protocolStore) FailWorkerRunsOverCap(context.Context, store.FailWorkerRunsOverCapParams) ([]uuid.UUID, error) {
 	return nil, nil
 }
-func (p *protocolStore) RequeueWorkerRuns(context.Context, store.RequeueWorkerRunsParams) (int64, error) {
-	return 0, nil
+func (p *protocolStore) RequeueWorkerRuns(context.Context, store.RequeueWorkerRunsParams) ([]uuid.UUID, error) {
+	return nil, nil
 }
 func (p *protocolStore) RegisterWorker(_ context.Context, arg store.RegisterWorkerParams) (store.RegisterWorkerRow, error) {
 	return store.RegisterWorkerRow{ID: arg.ID, Status: "online", Version: arg.Version, TemplateReported: arg.TemplateReported, MaxConcurrentRuns: arg.MaxConcurrentRuns}, nil
@@ -116,6 +124,39 @@ func TestWorkerClaimIdleReturns204NoBody(t *testing.T) {
 	}
 	if rec.Body.Len() != 0 {
 		t.Fatalf("204 must have an empty body, got %q", rec.Body.String())
+	}
+}
+
+func TestWorkerClaimRunLaneAcceptsSnapshotBody(t *testing.T) {
+	// PRD #1390 M3 (Task 1): the run lane now decodes an active_snapshot body. The strict decoder
+	// must ACCEPT the field (never 400 a claim that carries it) when the feature is enabled; with
+	// the fake ClaimRun idle it answers 204, proving the field was accepted and the claim ran.
+	h := newProtocolHandler(t, &protocolStore{claimErr: pgx.ErrNoRows})
+	rec := httptest.NewRecorder()
+	body := `{"active_snapshot":{"snapshot_epoch":1,"register_nonce":"n","active":[]}}`
+	h.WorkerClaim(rec, workerReq(http.MethodPost, body, uuid.Nil))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204 (a run-lane claim carrying active_snapshot must not 400), body %q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestWorkerClaimDisabledApiRejectsSnapshotBody(t *testing.T) {
+	// PRD #1390 D7: an api started with UZI_ACTIVE_SNAPSHOT_DISABLED 400s a claim that still carries
+	// the field (the generic 400 that triggers the worker's strip-and-retry) — but an OLD bodyless
+	// claim on the same api still succeeds (never a lost claim).
+	h := newProtocolHandler(t, &protocolStore{claimErr: pgx.ErrNoRows})
+	h.cfg = config.Config{ActiveSnapshotDisabled: true}
+
+	withField := httptest.NewRecorder()
+	h.WorkerClaim(withField, workerReq(http.MethodPost, `{"active_snapshot":{"snapshot_epoch":1,"active":[]}}`, uuid.Nil))
+	if withField.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (a disabled api rejects a claim carrying active_snapshot)", withField.Code)
+	}
+
+	bodyless := httptest.NewRecorder()
+	h.WorkerClaim(bodyless, workerReq(http.MethodPost, "", uuid.Nil))
+	if bodyless.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204 (an old bodyless claim must not 400 on a disabled api)", bodyless.Code)
 	}
 }
 
@@ -855,20 +896,30 @@ func TestWorkerMessagesForeignRunReturns404(t *testing.T) {
 // the live status, which the worker reads as "keep going".
 func TestWorkerRunOwnershipOwnedRunning(t *testing.T) {
 	runID := uuid.New()
-	h := newProtocolHandler(t, &protocolStore{ownedRun: store.Run{ID: runID, Status: "running"}})
+	h := newProtocolHandler(t, &protocolStore{ownedRun: store.Run{ID: runID, Status: "running", ClaimGeneration: 7}})
 	rec := httptest.NewRecorder()
 	h.WorkerRunOwnership(rec, workerReq(http.MethodGet, "", runID))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (owned+running)", rec.Code)
 	}
+	// PRD #1391 Run B M4: claim_generation is additive on the ownership probe. Decode it
+	// as a pointer so an ABSENT field (an older api) is distinguishable from an explicit 0 —
+	// the router treats a different generation as "end the attempt".
 	var got struct {
-		Status string `json:"status"`
+		Status          string `json:"status"`
+		ClaimGeneration *int64 `json:"claim_generation"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
 		t.Fatalf("decode body: %v", err)
 	}
 	if got.Status != "running" {
 		t.Fatalf("status = %q, want %q", got.Status, "running")
+	}
+	if got.ClaimGeneration == nil {
+		t.Fatalf("ownership probe missing claim_generation (body %q)", rec.Body.String())
+	}
+	if *got.ClaimGeneration != 7 {
+		t.Fatalf("claim_generation = %d, want 7 (= run.ClaimGeneration)", *got.ClaimGeneration)
 	}
 }
 
@@ -904,6 +955,59 @@ func TestWorkerRunOwnershipTerminalReturnsStatus(t *testing.T) {
 	}
 	if got.Status != "completed" {
 		t.Fatalf("status = %q, want %q", got.Status, "completed")
+	}
+}
+
+func TestWorkerRunMessageGapsRequiresClaimGeneration(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		query string
+	}{
+		{name: "missing", query: "through=3"},
+		{name: "negative", query: "claim_generation=-1&through=3"},
+		{name: "not an integer", query: "claim_generation=nope&through=3"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := &protocolStore{}
+			h := newProtocolHandler(t, st)
+			req := workerReq(http.MethodGet, "", uuid.New())
+			req.URL.RawQuery = tc.query
+			rec := httptest.NewRecorder()
+
+			h.WorkerRunMessageGaps(rec, req)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 (body %q)", rec.Code, rec.Body.String())
+			}
+			if st.gapArg.RunID != uuid.Nil {
+				t.Fatal("invalid claim_generation reached the store")
+			}
+		})
+	}
+}
+
+func TestWorkerRunMessageGapsPassesClaimGenerationToAtomicQuery(t *testing.T) {
+	runID := uuid.New()
+	st := &protocolStore{gapRows: []store.RunMessageGapsRow{{}}} // authorized empty page sentinel
+	h := newProtocolHandler(t, st)
+	req := workerReq(http.MethodGet, "", runID)
+	req.URL.RawQuery = "claim_generation=9&through=42&cursor=3&limit=7"
+	wkr, _ := mw.WorkerFromContext(req.Context())
+	rec := httptest.NewRecorder()
+
+	h.WorkerRunMessageGaps(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %q)", rec.Code, rec.Body.String())
+	}
+	if st.gapArg.RunID != runID || !st.gapArg.WorkerID.Valid || st.gapArg.WorkerID.Bytes != wkr.ID {
+		t.Fatalf("query scope = {run:%s worker:%v}, want run %s worker %s", st.gapArg.RunID, st.gapArg.WorkerID, runID, wkr.ID)
+	}
+	if st.gapArg.ClaimGeneration != 9 {
+		t.Fatalf("claim_generation = %d, want 9", st.gapArg.ClaimGeneration)
+	}
+	if st.gapArg.Through != 42 || st.gapArg.Cursor != 3 || st.gapArg.Lim != 7 {
+		t.Fatalf("page args = {through:%d cursor:%d limit:%d}, want {42,3,7}", st.gapArg.Through, st.gapArg.Cursor, st.gapArg.Lim)
 	}
 }
 
@@ -1020,5 +1124,37 @@ func TestNormalizeMemoryBasis(t *testing.T) {
 				t.Errorf("normalizeMemoryBasis(%+v) = %q, want %q", tc.basis, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestWorkerRegisterCarriesOutboxMaxPending pins that the register response carries
+// worker_outbox_max_pending (PRD #1391 Run B M3c) = the server's WorkerOutboxMaxPending, so the
+// worker can size its own pending-outcome quota to match the server without a separate config
+// channel. A pointer decode target distinguishes an ABSENT field (dropping the key) from a legit 0.
+func TestWorkerRegisterCarriesOutboxMaxPending(t *testing.T) {
+	box, err := secretbox.New(make([]byte, secretbox.KeySize))
+	if err != nil {
+		t.Fatalf("new box: %v", err)
+	}
+	h := &Handler{
+		wsvc: workersvc.New(&protocolStore{}, box, workersvc.Params{}),
+		cfg:  config.Config{WorkerOutboxMaxPending: 32},
+	}
+	rec := httptest.NewRecorder()
+	h.WorkerRegister(rec, workerReq(http.MethodPost, `{"name":"laptop","version":"1.2.3"}`, uuid.Nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body %q", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		WorkerOutboxMaxPending *int `json:"worker_outbox_max_pending"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode register response: %v (body %q)", err, rec.Body.String())
+	}
+	if resp.WorkerOutboxMaxPending == nil {
+		t.Fatalf("register response missing worker_outbox_max_pending (body %q)", rec.Body.String())
+	}
+	if *resp.WorkerOutboxMaxPending != 32 {
+		t.Fatalf("worker_outbox_max_pending = %d, want 32 (= cfg.WorkerOutboxMaxPending)", *resp.WorkerOutboxMaxPending)
 	}
 }

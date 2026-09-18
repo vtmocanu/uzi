@@ -20,11 +20,37 @@ import (
 // the authority on "must be in the future" (422).
 var atLayouts = []string{time.RFC3339, "2006-01-02T15:04Z07:00"}
 
+// scheduleCredentialOverrideFlag resolves the optional --token flag into a request-presence
+// credential override (PRD #1247 M6). NOT passed → the zero OptionalCredentialOverride
+// (Present=false), which `omitzero` drops from the marshaled body so the server seeds-and-keeps
+// the stored override on a PATCH (an unrelated retime/model edit never restates it) and
+// defaults to inherit on create. Passed → auto|default|inherit|<label> resolved CLIENT-side via
+// the shared resolveTokenFlagValue (the same parsing as run create/approve, D8/D12); an
+// explicit --token inherit sends {"mode":"inherit"} and a <label> resolves to a pinned override
+// naming the anthropic_token id. Returns (override, present, error).
+func scheduleCredentialOverrideFlag(cmd *cobra.Command, c uzicli.Client) (apitypes.OptionalCredentialOverride, bool, error) {
+	if !cmd.Flags().Changed("token") {
+		return apitypes.OptionalCredentialOverride{}, false, nil
+	}
+	val, _ := cmd.Flags().GetString("token")
+	ov, err := resolveTokenFlagValue(cmd, c, val)
+	if err != nil {
+		return apitypes.OptionalCredentialOverride{}, false, err
+	}
+	co := apitypes.CredentialOverrideRequest{Mode: ov.Mode}
+	if ov.SecretID != "" {
+		sid := ov.SecretID
+		co.SecretID = &sid
+	}
+	return apitypes.OptionalCredentialOverride{Present: true, Value: &co}, true, nil
+}
+
 // buildScheduleRequest assembles the ScheduleRequest from the create flags, enforcing
 // the one-of TARGET and one-of TIMING constraints client-side so a bad invocation is a
 // clean exit-2 usage error before any request is sent (the server also enforces them).
 // It returns the request and the (one or more) repo ids to fan the create out across.
-func buildScheduleRequest(cmd *cobra.Command) (apitypes.ScheduleRequest, []string, error) {
+// The client is used only to resolve a --token label (auto|default|inherit need none).
+func buildScheduleRequest(cmd *cobra.Command, c uzicli.Client) (apitypes.ScheduleRequest, []string, error) {
 	repos, _ := cmd.Flags().GetStringArray("repo")
 	repos = nonBlankTrimmed(repos)
 	if len(repos) == 0 {
@@ -167,6 +193,18 @@ func buildScheduleRequest(cmd *cobra.Command) (apitypes.ScheduleRequest, []strin
 		enabled, _ := cmd.Flags().GetBool("enabled")
 		req.Enabled = &enabled
 	}
+
+	// --token (PRD #1247 M6): a per-run credential override for runs this schedule fires.
+	// Omitted → no credential_override key (create defaults to inherit); passed → validated
+	// server-side against the schedule's lane + effective harness. Valid on every create target
+	// (issue/sweep/prompt are all switchable), like --model.
+	co, present, terr := scheduleCredentialOverrideFlag(cmd, c)
+	if terr != nil {
+		return apitypes.ScheduleRequest{}, nil, terr
+	}
+	if present {
+		req.CredentialOverride = co
+	}
 	return req, repos, nil
 }
 
@@ -196,9 +234,9 @@ func parseAt(s string) (time.Time, error) {
 // — so those MUST be re-sent from the fetched row, or a --cron-only edit would silently
 // wipe them. Enabled is left nil so a config edit never touches the pause flag
 // (enable/disable is pause/resume's job).
-func buildScheduleEditRequest(cmd *cobra.Command, s apitypes.ScheduleDTO) (apitypes.ScheduleRequest, error) {
+func buildScheduleEditRequest(cmd *cobra.Command, c uzicli.Client, s apitypes.ScheduleDTO) (apitypes.ScheduleRequest, error) {
 	if s.Origin == schedOriginDefault {
-		return buildDefaultScheduleEditRequest(cmd, s)
+		return buildDefaultScheduleEditRequest(cmd, c, s)
 	}
 	req := apitypes.ScheduleRequest{
 		Target:    s.Target,
@@ -375,6 +413,18 @@ func buildScheduleEditRequest(cmd *cobra.Command, s apitypes.ScheduleDTO) (apity
 		req.RepoID = strings.TrimSpace(v)
 		changed = true
 	}
+	// --token (PRD #1247 M6): OMIT credential_override unless --token was explicitly passed —
+	// omission preserves the stored override via the server's presence-aware seed-and-keep, so
+	// (unlike model/mr_rework) it is NEVER restated from the fetched DTO. An explicit --token
+	// sends the resolved override and counts as a change (so a --token-only edit is valid).
+	co, present, terr := scheduleCredentialOverrideFlag(cmd, c)
+	if terr != nil {
+		return apitypes.ScheduleRequest{}, terr
+	}
+	if present {
+		req.CredentialOverride = co
+		changed = true
+	}
 	if !changed {
 		return apitypes.ScheduleRequest{}, uzicli.Exitf(uzicli.ExitUsage, "nothing to edit (pass at least one field to change)")
 	}
@@ -409,7 +459,7 @@ func buildScheduleEditRequest(cmd *cobra.Command, s apitypes.ScheduleDTO) (apity
 // issue/self_improve default guidance stays catalog-owned, so those flags are rejected
 // client-side. The remaining catalog-owned flags (--prompt/--label/--repo/--at) are likewise
 // rejected client-side with a usage error pointing at `schedule clone`.
-func buildDefaultScheduleEditRequest(cmd *cobra.Command, s apitypes.ScheduleDTO) (apitypes.ScheduleRequest, error) {
+func buildDefaultScheduleEditRequest(cmd *cobra.Command, c uzicli.Client, s apitypes.ScheduleDTO) (apitypes.ScheduleRequest, error) {
 	f := cmd.Flags()
 
 	// Catalog-owned fields cannot be edited on a default; fail fast client-side with a
@@ -572,9 +622,20 @@ func buildDefaultScheduleEditRequest(cmd *cobra.Command, s apitypes.ScheduleDTO)
 		req.OverrideSubagentModel = &v
 		changed = true
 	}
+	// --token (PRD #1247 M6) is an owner-editable run option on a default schedule too
+	// (patchDefaultScheduleConfig persists it): OMIT it unless --token was passed (seed-and-keep),
+	// never restated. An explicit --token counts as a change.
+	co, present, terr := scheduleCredentialOverrideFlag(cmd, c)
+	if terr != nil {
+		return apitypes.ScheduleRequest{}, terr
+	}
+	if present {
+		req.CredentialOverride = co
+		changed = true
+	}
 	if !changed {
 		return apitypes.ScheduleRequest{}, uzicli.Exitf(uzicli.ExitUsage,
-			"nothing to edit (pass at least one editable field: --cron, --tz, --auto-approve, --wait-on-limit, --mr-rework, --max-issues, --guidance, --model, --output, --apply-model-to-agents)")
+			"nothing to edit (pass at least one editable field: --cron, --tz, --auto-approve, --wait-on-limit, --mr-rework, --max-issues, --guidance, --model, --output, --apply-model-to-agents, --token)")
 	}
 	return req, nil
 }

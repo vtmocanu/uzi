@@ -161,6 +161,18 @@ const (
 	// pool_wait/recovery_wait park reasons (D4): this is an owner-admission block, not a
 	// credential-pool or transient-recovery hold, and its fix is archive retry/discard.
 	reasonCustodyLimit = "you have too much unpublished work awaiting recovery; resolve or discard some recovery archives to start new runs"
+	// reasonOutboxQueued (PRD #1391 M5) replaces the misleading `stalled` reason for a
+	// running run whose worker is holding its updates in the durable outbox during an
+	// api outage: the agent is working and sending, the frames are simply queued on the
+	// worker and will replay once it can reach the api. Without this, the health
+	// detector reads the outage silence as `stalled` — the exact wrong signal the
+	// outbox exists to prevent. It maps to the SAME healthStalled enum (no migration —
+	// runs.health_reason is free text, only runs.health is CHECK-constrained;
+	// migration 00057), and applies ONLY while the tracked pending-message depth is
+	// non-zero: on the next empty report (the backlog drained) or once the worker's set
+	// clears, normal stalled detection resumes. Same fixed-string contract as its
+	// siblings — no tool name, no repo content, no live duration.
+	reasonOutboxQueued = "the agent's updates are queued on its worker and will replay when it can reach the api"
 )
 
 // Persistence-failure FLAG thresholds (PRD #108 M4), code constants for the same
@@ -387,6 +399,25 @@ func (s *Service) runningTarget(ctx context.Context, now time.Time, r store.List
 	// pathological single call.
 	if th.stall > 0 && !stats.inFlight {
 		if base := stallBaseline(r); !base.IsZero() && now.Sub(base) >= th.stall {
+			// The silence may be an api outage, not a stall: if the run's OWNING worker
+			// reported a non-zero outbox depth for it (PRD #1391 M5), the agent IS working
+			// and sending — its updates are queued on the worker and will replay. Same
+			// healthStalled enum, truthful reason. Only while depth is non-zero; when the
+			// tracker reports nothing (backlog drained / cleared) normal stalled detection
+			// resumes.
+			//
+			// OWNER-GATE (trust boundary): the tracker's runIndex is "last reporter wins"
+			// with no ownership check, so the reporting worker id must EQUAL the run's
+			// current owning worker before we trust the depth. Two cases this closes: a
+			// cross-tenant worker that knows the run's UUID cannot flip a victim's stalled
+			// reason to the reassuring "queued", and after a reclaim-during-outage (run
+			// moved to worker B while runIndex still points at the offline worker A until
+			// the TTL) a genuinely-stalled B is not mislabeled "queued". An unclaimed run
+			// (worker_id NULL) never qualifies, so it falls through to the honest stall.
+			if d, reporter, ok := s.OutboxRunDepth(r.ID); ok && d.PendingMessages > 0 &&
+				r.WorkerID.Valid && uuid.UUID(r.WorkerID.Bytes) == reporter {
+				return healthStalled, reasonOutboxQueued
+			}
 			return healthStalled, reasonStalled
 		}
 	}

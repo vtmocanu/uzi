@@ -5,7 +5,7 @@ import { Input, Select } from "./ui";
 // shared source for the alias set (PRD #17 risk: alias drift), reused by the
 // agent-template editor and the per-user default-model setting. Anything not on
 // this list is entered through the "Other…" custom free-text ID.
-export const MODEL_ALIASES = ["opus", "sonnet", "haiku", "fable"] as const;
+const MODEL_ALIASES = ["opus", "sonnet", "haiku", "fable"] as const;
 
 type Mode = "inherit" | (typeof MODEL_ALIASES)[number] | "custom";
 

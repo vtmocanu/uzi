@@ -41,6 +41,9 @@ export class FakeApi {
   private readonly inputsByRun = new Map<string, UserInput[]>();
   private stateFailRemaining = 0;
   private stateFailStatus = 503;
+  // PRD #1247 fix round E: model an rc.5-shaped api that strict-decodes the unknown
+  // claim_generation field on /state with the EXACT "invalid request body" 400.
+  private strictDecodeStateRemaining = 0;
   private msgFailRemaining = 0;
   private msgFailStatus = 503;
   private readonly alreadyTerminal = new Set<string>();
@@ -50,6 +53,11 @@ export class FakeApi {
   // worker reads it off the same body (readRunAck). A resumed run whose pause columns survived a
   // requeue answers true here WITHOUT any pause input being delivered.
   private readonly pauseRequestedRuns = new Set<string>();
+  // PRD #1247 M5b (MINOR-7): runs whose /state ACK carries a TOP-LEVEL credential_switch signal
+  // (the SECONDARY transport beside /inputs). The real server (workerStateAck) sets it when a
+  // held-state switch is pending for the run's current claim; a test arms it to prove the state-ack
+  // transport triggers the switch through the reportState closure, independent of /inputs.
+  private readonly stateAckCredentialSwitch = new Map<string, number>();
   private readonly stateRawOverride = new Map<
     string,
     { status: number; body: string }
@@ -68,6 +76,10 @@ export class FakeApi {
       matchesState: (body: StateRequest) => boolean;
       httpStatus: number;
       runStatus?: string;
+      // PRD #1247 M5b: when set, a 409 refusal carries this TOP-LEVEL disposition (e.g.
+      // "stale_claim"), the shape the server produces when a held-state switch released this
+      // claim or a reclaim superseded it. readRunAck reads it into StateAck.staleClaim.
+      disposition?: string;
       fired: boolean;
     }
   >();
@@ -77,7 +89,7 @@ export class FakeApi {
   // 404 not-owned, or a transient 5xx.
   private readonly ownershipByRun = new Map<
     string,
-    { httpStatus: number; status?: string }
+    { httpStatus: number; status?: string; generation?: number }
   >();
   // issue #1319: the owner-scoped orphan-classification read. Keyed by OWNER run id (the
   // fake trusts the test for the claimant/authz; the runner's predicate logic is what's under
@@ -92,7 +104,17 @@ export class FakeApi {
   unauthorized = 0;
   stateAttempts = 0;
   readonly states: Array<{ runId: string; body: StateRequest }> = [];
+  // PRD #1247 M5b: a GLOBAL, ordered log of the mutating requests as they land, so a test can pin
+  // RELATIVE ORDER across the two endpoints the single `states`/`messageBatches` arrays cannot show
+  // (e.g. that a message batch DRAINED before the credential_switch state report). Each accepted
+  // /messages batch appends "messages"; each recorded /state report appends `state:<status>`.
+  readonly requestLog: string[] = [];
   private readonly stateHooks = new Map<string, (body: StateRequest) => void>();
+  // PRD #1247 M5b: the per-batch MessagesRequest wrapper as it landed (the runMatch handler
+  // otherwise keeps only the flattened `messages[]`, discarding the top-level claim_generation
+  // a capability worker stamps). Additive record; lets a runner test assert the batcher was
+  // wired from the claim.
+  readonly messageBatches: Array<{ runId: string; claim_generation?: number; count: number }> = [];
   private readonly messagesByRun = new Map<string, OutgoingMessage[]>();
   private readonly seenSeqByRun = new Map<string, Set<number>>();
 
@@ -190,6 +212,15 @@ export class FakeApi {
     this.stateFailStatus = status;
   }
 
+  /** PRD #1247 fix round E: make the next `times` /state calls answer the EXACT strict-decode 400
+   *  ("invalid request body") a rolled-back api produces for the unknown claim_generation field,
+   *  then succeed — so a runner test can prove reportState's strip-and-retry survives an rc.5-shaped
+   *  decoder. Distinct from failStateNext (whose {error:"injected failure"} body is NOT strict-decode
+   *  shaped, so isStrictDecodeError is false and the client would not strip). */
+  failStateStrictDecodeNext(times: number): void {
+    this.strictDecodeStateRemaining = times;
+  }
+
   /** Make the next `times` /messages calls fail with `status` before succeeding. */
   failMessagesNext(times: number, status = 503): void {
     this.msgFailRemaining = times;
@@ -227,6 +258,11 @@ export class FakeApi {
    *  markAlreadyTerminal only fires for terminal reports, so it cannot express a
    *  non-terminal report (limit_wait) racing a server-side cancel — which is
    *  precisely the case PRD #35's park has to survive. */
+  /** Refuse every NON-running /state report for this run with a 409 carrying `status:"cancelled"`
+   *  (the run moved on under the worker). The initial `running` report still SUCCEEDS, so the run
+   *  reaches its park path (recovery_wait / limit_wait) where the refusal is the point — and so the
+   *  PRD #1391 Run B M4 phaseClone guard (which stops on a running report refused with a TERMINAL
+   *  status) does not short-circuit before the park path under test. */
   refuseStateWith409(runId: string): void {
     this.refuseAllStates.add(runId);
   }
@@ -243,12 +279,13 @@ export class FakeApi {
   failStateWhen(
     runId: string,
     matchesState: (body: StateRequest) => boolean,
-    opts: { httpStatus?: number; runStatus?: string } = {},
+    opts: { httpStatus?: number; runStatus?: string; disposition?: string } = {},
   ): void {
     this.stateFailWhen.set(runId, {
       matchesState,
       httpStatus: opts.httpStatus ?? 409,
       runStatus: opts.runStatus,
+      disposition: opts.disposition,
       fired: false,
     });
   }
@@ -257,10 +294,19 @@ export class FakeApi {
     this.inputsByRun.set(runId, inputs);
   }
 
+  /** PRD #1247 M5b (MINOR-7): arm a TOP-LEVEL credential_switch signal on every /state ACK for a
+   *  run, WITHOUT delivering it through /inputs — so a test can prove the state-ack transport trips
+   *  the switch on its own. */
+  armStateAckCredentialSwitch(runId: string, generation: number): void {
+    this.stateAckCredentialSwitch.set(runId, generation);
+  }
+
   /** issue #559 M3: answer the ownership probe for this run with 200 {status}. Use a
-   *  terminal status (completed/failed/cancelled) to drive the skip-path terminal throw. */
-  setOwnershipStatus(runId: string, status: string): void {
-    this.ownershipByRun.set(runId, { httpStatus: 200, status });
+   *  terminal status (completed/failed/cancelled) to drive the skip-path terminal throw.
+   *  PRD #1391 Run B M4: an optional `generation` rides the 200 as `claim_generation`, so a test
+   *  can model the queued-duplicate router seeing a DIFFERENT generation own the run. */
+  setOwnershipStatus(runId: string, status: string, generation?: number): void {
+    this.ownershipByRun.set(runId, { httpStatus: 200, status, generation });
   }
 
   /** issue #559 M3: answer the ownership probe with 404 — the DEFINITIVE not-owned
@@ -508,7 +554,11 @@ export class FakeApi {
       if (!o) return send(res, 200, { status: "running" });
       if (o.httpStatus !== 200)
         return send(res, o.httpStatus, { error: "run not found for this worker" });
-      return send(res, 200, { status: o.status ?? "running" });
+      // PRD #1391 Run B M4: claim_generation is additive on the probe body; include it only when the
+      // test set one, so the default (issue #559) shape stays {status} for unrelated tests.
+      const body: Record<string, unknown> = { status: o.status ?? "running" };
+      if (o.generation !== undefined) body.claim_generation = o.generation;
+      return send(res, 200, body);
     }
 
     // issue #1319: the owner-scoped orphan-classification read. The `owner` query param is
@@ -564,6 +614,17 @@ export class FakeApi {
       return send(res, this.msgFailStatus, { error: "injected failure" });
     }
     const incoming = (json.messages ?? []) as OutgoingMessage[];
+    // PRD #1247 M5b: record the wrapper as it arrived, so a test can assert claim_generation was
+    // stamped (or omitted). Only when the batch has messages — an empty post is a client no-op.
+    if (incoming.length > 0) {
+      this.requestLog.push("messages");
+      this.messageBatches.push({
+        runId,
+        claim_generation:
+          typeof json.claim_generation === "number" ? json.claim_generation : undefined,
+        count: incoming.length,
+      });
+    }
     const list = this.messagesByRun.get(runId) ?? [];
     const seen = this.seenSeqByRun.get(runId) ?? new Set<number>();
     for (const m of incoming) {
@@ -582,6 +643,11 @@ export class FakeApi {
     json: Record<string, unknown>,
   ): void {
     this.stateAttempts++;
+    if (this.strictDecodeStateRemaining > 0) {
+      this.strictDecodeStateRemaining--;
+      // The exact 400 shape httpx.DecodeJSON (DisallowUnknownFields) produces for an unknown field.
+      return send(res, 400, { error: "invalid request body" });
+    }
     if (this.stateFailRemaining > 0) {
       this.stateFailRemaining--;
       return send(res, this.stateFailStatus, { error: "injected failure" });
@@ -593,7 +659,13 @@ export class FakeApi {
       return;
     }
     const body = json as unknown as StateRequest;
-    if (this.refuseAllStates.has(runId)) {
+    // The run moved on under the worker: refuse the PARK report (recovery_wait / limit_wait / a
+    // terminal report) with a 409 carrying the run's real (cancelled) status. The initial `running`
+    // report is left to SUCCEED — modelling the realistic sequence (the run was running, then got
+    // cancelled concurrently, and only the later park report is refused), which is also what keeps
+    // PRD #1391 Run B M4's phaseClone first-running-ack guard from stopping the flight before the
+    // park path this refusal is exercising.
+    if (this.refuseAllStates.has(runId) && body.status !== "running") {
       return send(res, 409, {
         error: "run already terminal",
         run: { id: runId, status: "cancelled" },
@@ -611,6 +683,8 @@ export class FakeApi {
         return send(res, 409, {
           error: "run already moved on",
           run: { id: runId, status: when.runStatus ?? "cancelled" },
+          // PRD #1247 M5b: a stale_claim (or other) disposition rides TOP-LEVEL when armed.
+          ...(when.disposition ? { disposition: when.disposition } : {}),
         });
       }
       return send(res, when.httpStatus, { error: "injected state failure" });
@@ -629,6 +703,7 @@ export class FakeApi {
       });
     }
     this.states.push({ runId, body });
+    this.requestLog.push(`state:${body.status}`);
     this.stateHooks.get(runId)?.(body);
     send(res, 200, {
       run: {
@@ -638,6 +713,17 @@ export class FakeApi {
         // present when a test armed it; otherwise absent (the worker reads it as "no pause").
         ...(this.pauseRequestedRuns.has(runId) ? { pause_requested: true } : {}),
       },
+      // PRD #1247 M5b (BLOCKING-2): mirror the real server — an APPLIED credential_switch RELEASE
+      // (a 200) carries disposition:"released", which the worker reads to accept the release
+      // regardless of the run's returned status (a fresh 'queued' OR an idempotent-after-reclaim
+      // 'running' set via overrideStateStatus). enterCredentialSwitch keys off this, not status.
+      ...(body.status === "credential_switch" ? { disposition: "released" } : {}),
+      // PRD #1247 M5b (MINOR-7): the TOP-LEVEL credential_switch signal the reportState closure feeds
+      // to the steering channel (armStateAckCredentialSwitch). Present on the ordinary report acks,
+      // not the credential_switch release report itself (which already carries disposition:released).
+      ...(this.stateAckCredentialSwitch.has(runId) && body.status !== "credential_switch"
+        ? { credential_switch: { generation: this.stateAckCredentialSwitch.get(runId)! } }
+        : {}),
     });
   }
 }

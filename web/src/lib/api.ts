@@ -252,6 +252,23 @@ export function openMRConflictMRIID(err: unknown): number | null {
   return typeof n === "number" ? n : null;
 }
 
+// isOutcomePendingConfirmation reports whether an error is the 409 the cancel path
+// returns when the run's worker is holding a finished-but-unlanded outcome (PRD #1391
+// Run B M3d, D13). The server refuses the cancel WITHOUT discard_pending_outcome so a
+// completed outcome is never silently discarded; the run page turns this into a
+// confirmation modal that names what is lost, then retries the cancel with the discard
+// bit. The typed body is {error, reason:"outcome_pending_confirmation_required"} (httpx
+// ErrorReason), so the reason is read from `reason`, NOT the `code` that isOpenMRConflict
+// reads — a distinct machine-readable field beside the human message.
+export function isOutcomePendingConfirmation(err: unknown): boolean {
+  return (
+    err instanceof ApiError &&
+    err.status === 409 &&
+    (err.body as { reason?: string } | null)?.reason ===
+      "outcome_pending_confirmation_required"
+  );
+}
+
 async function request<T>(
   method: string,
   path: string,
@@ -968,10 +985,20 @@ const realApi = {
       docker,
     }),
 
-  createRun: (repoId: string, issueIid: number, force?: boolean) =>
+  createRun: (
+    repoId: string,
+    issueIid: number,
+    force?: boolean,
+    // PRD #1247 M7: the per-run Anthropic credential override. Sent ONLY when the user
+    // picked a non-inherit value (the caller passes undefined for inherit), so an inherit
+    // run's body is byte-identical to a pre-#1247 create and the run follows the worker
+    // binding. The write shape mirrors the Go create handler ({mode, secret_id?}).
+    credentialOverride?: { mode: string; secret_id?: string },
+  ) =>
     request<{ run: Run }>("POST", `/repos/${repoId}/runs`, {
       issue_iid: issueIid,
       ...(force ? { force: true } : {}),
+      ...(credentialOverride ? { credential_override: credentialOverride } : {}),
     }),
   /** Queue a CI-fix run for a failed pipeline on a watched ref (PRD #6). */
   createCIFixRun: (repoId: string, ref: string) =>
@@ -1070,6 +1097,14 @@ const realApi = {
     // false-positive-inference correction. Sent only when truthy so an ordinary approve
     // body is unchanged (default false server-side).
     overrideCapabilities?: boolean,
+    // PRD #1391 Run B M3d (D13): the explicit "discard the held outcome" confirmation on a
+    // `cancel`. Meaningful ONLY with kind "cancel" (the server ignores it elsewhere). A
+    // cancel of a run whose worker holds a finished-but-unlanded outcome is refused with a
+    // typed 409 (reason "outcome_pending_confirmation_required", see
+    // isOutcomePendingConfirmation) UNLESS this is true; with it the server takes the atomic
+    // no-live-poller cancel branch and the held outcome is discarded. Sent only when truthy
+    // so an ordinary cancel body is unchanged (default false server-side).
+    discardPendingOutcome?: boolean,
   ) =>
     request<{ server_side: boolean; id?: number; created_at?: string }>(
       "POST",
@@ -1082,6 +1117,7 @@ const realApi = {
         // plain follow-up/cancel body is unchanged.
         ...(selection ? { selection } : {}),
         ...(overrideCapabilities ? { override_capabilities: true } : {}),
+        ...(discardPendingOutcome ? { discard_pending_outcome: true } : {}),
       },
     ),
 
@@ -1102,6 +1138,23 @@ const realApi = {
    */
   setRunWaitOnLimit: (id: string, enabled: boolean) =>
     request<{ run: Run }>("PUT", `/runs/${id}/wait-on-limit`, { enabled }),
+
+  /**
+   * PRD #1247 M7: SWITCH (or set) this run's Anthropic credential — POST
+   * /api/runs/{id}/credential with {mode, secret_id?}, mirroring the Go handler's
+   * request shape (secret_id rides a pinned mode only). Owner-scoped and RequireUser
+   * (cookie OR uzc_ Bearer), like setRunMrRework. For a queued/parked run it writes the
+   * override and transitions; for a held/running run it requests the held-state switch,
+   * losing at most the in-flight step.
+   *
+   * On success it returns the updated run DTO plus an OPTIONAL D6 `warning` string — a
+   * benign caveat (e.g. an auto choice whose pool has no currently-eligible token) that
+   * rides the 200, never a refusal. Refusals are non-2xx the caller surfaces inline; the
+   * refused lanes (task_review / chat / judge / self_improve) 409, so callers HIDE the
+   * control for them (isCredentialSwitchRefusedLane) rather than render a 409-ing button.
+   */
+  setRunCredential: (id: string, body: { mode: string; secret_id?: string }) =>
+    request<{ run: Run; warning?: string }>("POST", `/runs/${id}/credential`, body),
 
   /**
    * PRD #841: set (or clear) THIS run's per-run MR-review-rework override. `true`/`false`

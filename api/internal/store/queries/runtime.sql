@@ -222,6 +222,14 @@ WITH prev AS (
         -- before the poll re-derives disk_pressure. (Distinct from HeartbeatWorker's
         -- increment/reset CASE: this is reset-on-action, unconditional.)
         stats_disk_pressure_streak = 0,
+        -- PRD #1390 M2a: rotate the register nonce every snapshot must echo and RESET the
+        -- snapshot epoch to 0 under it (D3). A fresh worker process starts its epoch at 1, so
+        -- resetting to 0 here means its very first post-register snapshot (epoch 1) is accepted
+        -- while any delayed high-epoch snapshot from the PREVIOUS process is rejected by the
+        -- now-stale nonce — not by epoch. The nonce must live on the row (not in memory)
+        -- because it is checked exactly when an api restart has forgotten everything else.
+        snapshot_register_nonce = @snapshot_register_nonce,
+        snapshot_epoch      = 0,
         last_heartbeat_at   = now(),
         updated_at          = now()
     WHERE workers.id = @id
@@ -320,6 +328,14 @@ UPDATE workers SET
     updated_at            = now()
 WHERE id = @id
 RETURNING *;
+
+-- name: GetWorkerForUpdate :one
+-- PRD #1390 M2a: lock the worker row FOR UPDATE at the top of the Register transaction, in
+-- the canonical worker-row lock order shared with the stale-worker passes' `locked` CTE and
+-- with HeartbeatWorker's own UPDATE. Holding it across the nonce rotation + snapshot persist +
+-- orphan fail/requeue is what serialises Register against a concurrent heartbeat or stale
+-- sweep, so a run's D11 lease is read against a settled snapshot rather than a torn one.
+SELECT * FROM workers WHERE id = @id FOR UPDATE;
 
 -- name: DeleteWorkerForUser :execrows
 DELETE FROM workers WHERE id = @id AND user_id = @user_id;
@@ -431,8 +447,16 @@ WHERE status = 'online'
 -- production origin is Claude, and writing the literal (rather than relying on the column
 -- DEFAULT) means a future omitted column-list update fails loudly instead of the default
 -- silently masking it. M5A is dark, so no origin resolves Codex here; M5B adds that seam.
-INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve, wait_on_limit, mr_rework_enabled, plan_md, plan_source, agent_source, agent_exclusions, planned_base_commit, require_base_match, model, override_subagent_model, issue_comments, review_comments, required_capabilities, trigger_source, completion_contract_version, harness)
-VALUES (@user_id, @repo_id::uuid, @issue_iid, @issue_title, @issue_description, sqlc.narg('origin_column'), now(), @auto_approve, @wait_on_limit, sqlc.narg('mr_rework_enabled'), sqlc.narg('plan_md'), @plan_source, sqlc.narg('agent_source'), sqlc.narg('agent_exclusions')::jsonb, sqlc.narg('planned_base_commit'), @require_base_match, sqlc.narg('model'), @override_subagent_model, sqlc.narg('issue_comments')::jsonb, sqlc.narg('review_comments')::jsonb, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), @trigger_source, sqlc.narg('completion_contract_version'), 'claude')
+--
+-- 🔴 credential_override_mode / credential_override_secret_id (PRD #1247 M1) are the
+-- silently-omittable per-run credential override (D1), both sqlc.narg — NULL = inherit
+-- the worker binding, byte-identical to a pre-#1247 run. Every M1 caller passes NULL;
+-- a real user choice is wired in M2 (create) / M6 (schedule). Named explicitly per this
+-- query's own "name every column" convention so an unstamped path is visible in a diff
+-- of THIS file, and guarded by a per-path test rather than the compiler (the narg trap
+-- above applies identically).
+INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve, wait_on_limit, mr_rework_enabled, plan_md, plan_source, agent_source, agent_exclusions, planned_base_commit, require_base_match, model, override_subagent_model, issue_comments, review_comments, required_capabilities, trigger_source, completion_contract_version, harness, credential_override_mode, credential_override_secret_id)
+VALUES (@user_id, @repo_id::uuid, @issue_iid, @issue_title, @issue_description, sqlc.narg('origin_column'), now(), @auto_approve, @wait_on_limit, sqlc.narg('mr_rework_enabled'), sqlc.narg('plan_md'), @plan_source, sqlc.narg('agent_source'), sqlc.narg('agent_exclusions')::jsonb, sqlc.narg('planned_base_commit'), @require_base_match, sqlc.narg('model'), @override_subagent_model, sqlc.narg('issue_comments')::jsonb, sqlc.narg('review_comments')::jsonb, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), @trigger_source, sqlc.narg('completion_contract_version'), 'claude', sqlc.narg('credential_override_mode'), sqlc.narg('credential_override_secret_id'))
 RETURNING *;
 
 -- name: GetRunByIDForUser :one
@@ -552,6 +576,15 @@ FROM run_messages
 WHERE run_id = ANY(@run_ids::uuid[])
   AND kind IN ('plan', 'plan_revising')
 ORDER BY run_id, seq;
+
+-- name: LatestPlanSeqForRun :one
+-- The seq of the run's latest plan-gate frame ({plan, plan_revising}), for the awaiting_approval
+-- resume_phase (PRD #1247 M5, D13). 0 when the run has emitted no plan frame yet. Backed by
+-- run_messages UNIQUE (run_id, seq).
+SELECT COALESCE(MAX(seq), 0)::bigint AS seq
+FROM run_messages
+WHERE run_id = @run_id::uuid
+  AND kind IN ('plan', 'plan_revising');
 
 -- name: LatestToolUseForRuns :many
 -- The newest tool_use frame per run for a page of runs (PRD #1064 D3, current_activity):
@@ -826,6 +859,43 @@ WITH target AS (
                       * p.max_concurrent_runs
           )
       )
+      -- PRD #1390 M3 (D3, D8): global, pre-claim snapshot dedupe — three exclusions that run
+      -- INSIDE candidate selection, BEFORE the generation increment and before the `hold` CTE
+      -- opens custody, so a run a fresh snapshot lists is never returned to any claimant (including
+      -- a sibling past the affinity ceiling) and no side effect fires for it.
+      --
+      -- (1) Fresh-snapshot / terminal-pending exclusion: never claim a run a FRESH snapshot lists
+      -- as active at its CURRENT generation. Freshness is the snapshot's OWN reported_at (a worker
+      -- whose snapshots fail validation must not keep stale rows protected by its liveness), within
+      -- @snapshot_fresh_cutoff = now() - (WORKER_HEARTBEAT_STALE + WORKER_HEARTBEAT_INTERVAL). A
+      -- terminal-pending lease (a.terminal_pending AND still unexpired) excludes regardless of
+      -- freshness (#1391's journaled outcome outlives the heartbeat, D11). Worker-scoped
+      -- (a.worker_id = r.worker_id) for consistency with the sweep predicates, and sound because a
+      -- run's snapshot row is only ever its owner's.
+      AND NOT EXISTS (
+          SELECT 1 FROM worker_active_runs a
+          WHERE a.run_id = r.id AND a.worker_id = r.worker_id
+            AND a.claim_generation = r.claim_generation
+            AND (a.reported_at >= @snapshot_fresh_cutoff
+                 OR (a.terminal_pending AND a.terminal_pending_until > now())))
+      -- (2) Request-array exclusion (fact 7): the claimant's OWN request snapshot excludes its
+      -- listed runs at the CURRENT generation, so the exclusion holds BEFORE the first heartbeat
+      -- persists the rows exclusion (1) reads. @request_active_ids / @request_active_gens are
+      -- index-aligned pairs; the two-array unnest is spelled as a WITH ORDINALITY zip because
+      -- sqlc's analyzer cannot type a multi-argument unnest(a, b) (see judge_bulk_disposition.sql).
+      -- Empty arrays (no request snapshot, or the no-snapshot path) match nothing → no exclusion.
+      AND NOT EXISTS (
+          SELECT 1
+          FROM unnest(@request_active_ids::uuid[]) WITH ORDINALITY AS req_id(id, ord)
+          JOIN unnest(@request_active_gens::bigint[]) WITH ORDINALITY AS req_gen(gen, ord)
+               ON req_gen.ord = req_id.ord
+          WHERE req_id.id = r.id AND req_gen.gen = r.claim_generation)
+      -- (3) Overflow closure (D11): never claim a run whose OWNER is under an unexpired
+      -- pending_overflow closure — an outcome the worker could not list has no row of its own to
+      -- lease, so the worker-level closure stands in for the row-level lease. An unassigned run
+      -- (r.worker_id IS NULL) has no owner row, so it is never closed here; the claimant-side half
+      -- (a flagged worker refused every claim, unassigned included) is the service-level guard.
+      AND NOT EXISTS (SELECT 1 FROM workers w WHERE w.id = r.worker_id AND w.pending_overflow_until > now())
     -- Three-level sort (PRD #320 D3): (1) resume affinity — a re-queued run
     -- prefers its prior worker, exactly as before; (2) priority rank —
     -- fn_run_priority slots BETWEEN affinity and FIFO, so an interactive run
@@ -870,6 +940,19 @@ UPDATE runs SET
     -- PRD #1296 M1 (D2): the general claim-lane counter, incremented once per successful
     -- claim. Returned in the claim payload; the hold above binds the identical value.
     claim_generation = claim_generation + 1,
+    -- PRD #1247 M5 (D3): CLOSE the released-claim fence window. A held-state credential
+    -- switch requeues the run with claim_released_at set (ReleaseCredentialSwitch), which
+    -- makes the generation fence reject every report from the OLD flight. Reclaiming the
+    -- run opens a fresh generation, so the fence must be cleared in the SAME atomic UPDATE
+    -- that bumps claim_generation — otherwise a reclaim would immediately reject the NEW
+    -- flight's own first report. A run that was never released has claim_released_at NULL
+    -- already, so this is a harmless no-op on the ordinary claim path.
+    claim_released_at = NULL,
+    -- PRD #1390 M3 (D2 hygiene): clear the stale-requeue provenance on every fresh claim, alongside
+    -- the generation bump. The refund in ReadoptRunsFromSnapshot fires only when
+    -- stale_requeue_generation = claim_generation, so leaving a stale value here could refund a
+    -- requeue_count charged against a generation this claim has already replaced.
+    stale_requeue_generation = NULL,
     -- Exit contract (PRD #47 Decision 3): leaving 'queued' clears any health flag
     -- the detector raised (e.g. "no worker online"). health_notified_at is NOT reset.
     health = 'ok', health_reason = NULL, health_since = NULL
@@ -1002,6 +1085,72 @@ SET anthropic_secret_id     = @anthropic_secret_id,
     anthropic_select_reason = @anthropic_select_reason,
     anthropic_headroom_pct  = sqlc.narg('anthropic_headroom_pct'),
     limit_dead_secret_id    = NULL,
+    updated_at = now()
+WHERE id = @id AND user_id = @user_id;
+
+-- name: RecordRunCredentialEpoch :exec
+-- Append the attribution-journal row for one claim (PRD #1247 M1, D7/D14): one row per
+-- (run_id, claim_generation), written by recordRunCredential right after SetRunAnthropicSecret
+-- on a successful open. claim_generation is the run's EXISTING generation (00223, PRD #1349) —
+-- this PRD never increments it — so re-recording the same claim (a retry after a crash before
+-- the payload shipped) is idempotent: the composite PK conflicts and DO UPDATE refreshes the
+-- snapshot fields in place rather than duplicating the epoch. secret_id/label/select_reason are
+-- the credential the claim actually spent; applied_at defaults to now() and is refreshed on a
+-- re-record so it names the last apply of that generation.
+INSERT INTO run_credential_epochs (run_id, claim_generation, secret_id, label, select_reason, applied_at)
+VALUES (@run_id, @claim_generation, sqlc.narg('secret_id'), sqlc.narg('label'), sqlc.narg('select_reason'), now())
+ON CONFLICT (run_id, claim_generation) DO UPDATE
+SET secret_id     = EXCLUDED.secret_id,
+    label         = EXCLUDED.label,
+    select_reason = EXCLUDED.select_reason,
+    applied_at    = EXCLUDED.applied_at;
+
+-- name: ListRunCredentialEpochs :many
+-- The applied-switch history for one run (PRD #1247 M1, D7): every claim's credential
+-- epoch, oldest generation first, for the run-detail DTO's credential_epochs and for the
+-- M1 live-DB attribution test. Owner-scoped through the run join so a caller cannot read
+-- another user's journal.
+SELECT e.run_id, e.claim_generation, e.secret_id, e.label, e.select_reason, e.applied_at
+FROM run_credential_epochs e
+JOIN runs r ON r.id = e.run_id
+WHERE e.run_id = @run_id AND r.user_id = @user_id
+ORDER BY e.claim_generation ASC;
+
+-- name: GetPriorRunCredentialEpoch :one
+-- The epoch IMMEDIATELY BEFORE @claim_generation for a run (PRD #1247 M9, task c step 5): the
+-- highest-generation epoch strictly below the current claim's generation. recordRunCredential
+-- consults it to detect an APPLIED credential switch — if a prior epoch exists AND its secret_id
+-- differs from the token the current claim spent, this claim is a switch and earns a
+-- 'credential_switch' run message. pgx.ErrNoRows means there is NO prior epoch (a first claim), so
+-- no switch. NOT owner-scoped: the caller is inside the claim transaction with the run row locked,
+-- and this reads the run's OWN journal by run_id — the owner-scoped read is ListRunCredentialEpochs.
+SELECT run_id, claim_generation, secret_id, label, select_reason, applied_at
+FROM run_credential_epochs
+WHERE run_id = @run_id AND claim_generation < @claim_generation
+ORDER BY claim_generation DESC
+LIMIT 1;
+
+-- name: SetRunCredentialOverride :execrows
+-- Write the per-run credential override columns for `uzi run set-token` (PRD #1247 M4,
+-- D4). It is the FIRST write in every writable-state branch of the verb (queued /
+-- limit_wait / pool_wait / recovery_wait / paused), before the state-specific
+-- transition, and is idempotent: re-writing the same override is harmless, and a
+-- transition that then finds 0 rows leaves the override written but the status unchanged.
+--
+-- @mode and @secret_id are BOTH nullable (inherit clears both to NULL). A pinned override
+-- carries a mode + id; auto/default carry the mode with a NULL id; inherit carries NULL /
+-- NULL. The caller resolves them through the one validator (validateCredentialOverride)
+-- FIRST, so this statement never sees an unvalidated mode. It does NOT touch status /
+-- status_since — it only re-points which credential the next claim spends — so it is not
+-- one of the status_since-pairing writers.
+--
+-- Owner-scoped (user_id): a foreign run is a 0-row no-op, exactly like the other set-token
+-- writes, so the verb cannot re-point a run the caller does not own. The handler has
+-- already read the run owner-scoped (GetRunByIDForUser) before reaching here, so a 0-row
+-- result at this point means a concurrent delete/transfer, not a missing owner check.
+UPDATE runs SET
+    credential_override_mode = @mode,
+    credential_override_secret_id = @secret_id,
     updated_at = now()
 WHERE id = @id AND user_id = @user_id;
 
@@ -1688,7 +1837,16 @@ UPDATE runs SET
     updated_at           = now()
 WHERE id = @id AND worker_id = @worker_id
   AND status = 'running'
-  AND kind <> 'judge';
+  AND kind <> 'judge'
+  -- PRD #1247 M5a-1 rework (reviewer NB1): the per-query generation fence, the SAME nil-guarded
+  -- shape as InsertRunMessage. A CAPABILITY worker stamps claim_generation on the park report;
+  -- a stale report from an OLD flight — reclaimed to a NEW generation under same-worker affinity
+  -- (status 'running' and worker_id both still match, so the status guard alone does NOT exclude
+  -- it), or against a released claim — matches 0 rows here, so a fenced-out park cannot clobber
+  -- the reclaiming flight's run. A legacy worker (NULL generation) parks unconditionally,
+  -- unchanged. sqlc.narg, never @name (this file's multibyte comment blocks break the @name parser).
+  AND (sqlc.narg('claim_generation')::bigint IS NULL
+       OR (claim_generation = sqlc.narg('claim_generation')::bigint AND claim_released_at IS NULL));
 
 -- name: PromoteLimitWaitRuns :many
 -- The sweeper's promotion pass (PRD #35 M2): limit_wait → queued once the clock
@@ -1749,6 +1907,98 @@ UPDATE runs SET
     updated_at = now()
 WHERE status = 'limit_wait' AND retry_not_before <= @now
 RETURNING id, user_id, status;
+
+-- name: PromoteLimitWaitRunNow :execrows
+-- The SINGLE-ROW early promote of ONE owner's limit_wait run for `uzi run set-token`
+-- (PRD #1247 M4, D4). The owner chose a new credential for THIS run, so it is returned to
+-- `queued` at once WITHOUT waiting for retry_not_before — that stamp gates the sweeper's
+-- PromoteLimitWaitRuns pass, not this deliberate owner action, so this statement does NOT
+-- carry the `retry_not_before <= @now` guard.
+--
+-- 🔴 ITS MUTATION SET MUST STAY EXACTLY PromoteLimitWaitRuns' SET CLAUSE, column for
+-- column, and a column-parity test (store/promote_limit_wait_now_parity_test.go) pins the
+-- two queries together, naming every mutated column. The reasons each column moves are
+-- documented on PromoteLimitWaitRuns above and are not repeated here; the short of it:
+-- started_at = NULL gives the resumed run a FRESH wall (Decision 6d) so it cannot time out
+-- on its first report, budget_paused_seconds = 0 clears the pause banked against the old
+-- baseline, the codex cap is revoked + epoch bumped (PRD #1147 F7), and health is reset so
+-- the detector re-evaluates from the fresh status_since.
+--
+-- 🔴 AND IT MUST PRESERVE worker_id, session_id, last_seq, EVERY limit field,
+-- limit_dead_secret_id, retry_not_before and both retry counters — none of them appear in
+-- the SET clause, so they are left in place. That is load-bearing: claimExclude
+-- (secretchoice.go) keeps EXCLUDING the still-dead token while its window
+-- (retry_not_before) is closed, so the early-promoted run's next `auto` claim re-picks the
+-- newly-chosen credential rather than the one it just exhausted. limit_wait_count is left
+-- as history (this is not a new park), so RUN_LIMIT_MAX_WAITS still bounds thrash.
+--
+-- Owner- and status-scoped (user_id + status = 'limit_wait'): a run that moved out of
+-- limit_wait between the verb's read and this write is a 0-row no-op the service surfaces
+-- as a 409 (raced), and a foreign run can never be promoted.
+UPDATE runs SET
+    status     = 'queued',
+    status_since = now(),
+    started_at = NULL,
+    budget_paused_seconds = 0,
+    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE id = @id AND user_id = @user_id AND status = 'limit_wait';
+
+-- name: ListLimitWaitReeval :many
+-- The duration-time auto-failover worklist (PRD #1247 M3, D8): every run STILL parked
+-- in limit_wait whose window has NOT yet reopened (retry_not_before > @now) and that
+-- recorded a dead credential (limit_dead_secret_id IS NOT NULL), OLDEST park first
+-- (status_since ASC). It is the read half of the second limit-wait promoter that sits
+-- beside PromoteLimitWaitRuns: Decision 6e extended from park-time to park-duration, so
+-- a token that pools or a gauge that turns eligible AFTER the park is re-asked every
+-- tick instead of the run sleeping to retry_not_before regardless.
+--
+-- It projects exactly what the two pure policies in Go need and no more:
+-- effectiveNextClaimMode reads kind / credential_override_mode /
+-- credential_override_secret_id / worker_id plus the recorded worker's bind mode, and
+-- claimExclude reads limit_dead_secret_id / retry_not_before. The recorded worker's
+-- anthropic_bind_mode rides a LEFT JOIN (projected as worker_bind_mode) so the Go side
+-- needs no per-run worker fetch; a NULL/absent worker leaves it NULL, which
+-- effectiveNextClaimMode maps to `unknown` (and unknown is skipped, the safe direction).
+--
+-- No promotion happens here: a due run is LOWERED to now() by LowerLimitWaitRetryNow and
+-- the existing PromoteLimitWaitRuns performs the actual status transition. Backed by the
+-- same idx_runs_limit_wait_retry partial index PromoteLimitWaitRuns reads, so the set is
+-- empty on a healthy instance. @now is the sweep's own clock.
+SELECT
+    r.id,
+    r.user_id,
+    r.kind,
+    r.credential_override_mode,
+    r.credential_override_secret_id,
+    r.worker_id,
+    r.limit_dead_secret_id,
+    r.retry_not_before,
+    w.anthropic_bind_mode AS worker_bind_mode
+FROM runs r
+LEFT JOIN workers w ON w.id = r.worker_id
+WHERE r.status = 'limit_wait'
+  AND r.retry_not_before > @now
+  AND r.limit_dead_secret_id IS NOT NULL
+ORDER BY r.status_since ASC;
+
+-- name: LowerLimitWaitRetryNow :execrows
+-- The write half of the D8 duration-time re-evaluation pass (PRD #1247 M3): lower ONE
+-- still-parked limit_wait run's retry_not_before to now() so the immediately-following
+-- PromoteLimitWaitRuns pass (which the re-eval pass runs BEFORE in Sweep) brings it back
+-- to queued — the same tick once that pass's clock has reached the lowered stamp, else the
+-- next tick. It does NOT transition the status itself — the mutation set of the resume
+-- (fresh wall, health reset, codex-cap revoke) lives in PromoteLimitWaitRuns and must not
+-- be duplicated here.
+--
+-- Owner-scoped (user_id) and status-guarded (status = 'limit_wait') so a run that moved
+-- out of limit_wait between the list and this write is a 0-row no-op, and a lowering can
+-- never touch a foreign run. It writes ONLY retry_not_before + updated_at, leaving every
+-- limit field, limit_dead_secret_id and both retry counters in place, so claimExclude
+-- keeps its answer and the resumed claim re-picks correctly.
+UPDATE runs SET retry_not_before = now(), updated_at = now()
+WHERE id = @id AND user_id = @user_id AND status = 'limit_wait';
 
 -- name: SetRunRecoveryWait :execrows
 -- Park a run in the TRANSIENT-RECOVERY hold (issue #1197). running -> recovery_wait,
@@ -1811,7 +2061,15 @@ UPDATE runs SET
     updated_at                = now()
 WHERE id = @id AND worker_id = @worker_id
   AND status = 'running'
-  AND kind <> 'judge';
+  AND kind <> 'judge'
+  -- PRD #1247 M5a-1 rework (reviewer NB1): the per-query generation fence, identical to
+  -- SetRunLimitWait's and the SAME nil-guarded shape as InsertRunMessage. A stale report from an
+  -- OLD flight — reclaimed to a NEW generation under same-worker affinity, or against a released
+  -- claim — matches 0 rows, so a fenced-out park cannot clobber the reclaiming flight's run. A
+  -- legacy worker (NULL generation) parks unconditionally, unchanged. sqlc.narg, never @name (the
+  -- multibyte comment blocks break the @name parser).
+  AND (sqlc.narg('claim_generation')::bigint IS NULL
+       OR (claim_generation = sqlc.narg('claim_generation')::bigint AND claim_released_at IS NULL));
 
 -- name: ParkRunForgeUnreachable :one
 -- PRD #1392 M1 (D2/D3): the FORGE pre-clone park writer. It is the typed sibling of
@@ -1901,6 +2159,33 @@ UPDATE runs SET
     updated_at = now()
 WHERE status = 'recovery_wait' AND recovery_retry_not_before <= @now
 RETURNING id, user_id, status;
+
+-- name: PromoteRecoveryWaitRunNow :execrows
+-- The SINGLE-ROW early promote of ONE owner's recovery_wait run for `uzi run set-token`
+-- (PRD #1247 M4, D4). Mirrors PromoteRecoveryWaitRuns' mutation set field-for-field, but
+-- for one owner+run and WITHOUT the recovery_retry_not_before guard — the owner chose a
+-- new credential, so the run is returned to `queued` at once rather than sleeping to the
+-- capped recovery cadence.
+--
+-- started_at = NULL (fresh wall, so it cannot time out on its first report),
+-- budget_paused_seconds = 0, the codex cap revoked + epoch bumped, health reset — all
+-- exactly as PromoteRecoveryWaitRuns. session_id, worker_id, recovery_wait_count and
+-- recovery_retry_not_before are LEFT IN PLACE as affinity/history (recovery_wait carries no
+-- lifetime cap and this is not a new park). recovery_wait is not a usage limit, so there is
+-- no limit_dead_secret_id to preserve here.
+--
+-- Owner- and status-scoped (user_id + status = 'recovery_wait'): a run that moved out of
+-- recovery_wait between the verb's read and this write is a 0-row no-op the service
+-- surfaces as a 409 (raced), and a foreign run can never be promoted.
+UPDATE runs SET
+    status     = 'queued',
+    status_since = now(),
+    started_at = NULL,
+    budget_paused_seconds = 0,
+    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE id = @id AND user_id = @user_id AND status = 'recovery_wait';
 
 -- name: SetRunPaused :execrows
 -- Park a run on the owner's explicit request (PRD #1190 M1). running -> paused,
@@ -1998,6 +2283,15 @@ WHERE id = @id AND worker_id = @worker_id
   AND status IN ('running', 'awaiting_input')
   AND completion_contract_version IS NOT NULL
   AND completion_attempts > 0
+  -- PRD #1247 M5: the per-query generation fence, the SAME nil-guarded shape as InsertRunMessage.
+  -- A CAPABILITY worker stamps claim_generation on its park order; a STALE report from an OLD
+  -- flight (its claim RELEASED by a held-state switch, or SUPERSEDED by a reclaim — status
+  -- 'running'/'awaiting_input' and worker_id can both still match, so the guards above do not
+  -- exclude it) matches 0 rows here, which the service maps to the existing applied=false path
+  -- (the worker retains the reclaimed flight's run live). A legacy worker (NULL generation) holds
+  -- unconditionally, unchanged. sqlc.narg, never @name (this file's multibyte comments break @name).
+  AND (sqlc.narg('claim_generation')::bigint IS NULL
+       OR (claim_generation = sqlc.narg('claim_generation')::bigint AND claim_released_at IS NULL))
 RETURNING *;
 
 -- name: ResumePausedRun :one
@@ -2036,6 +2330,102 @@ WHERE id = @id AND user_id = @user_id
   AND status = 'paused'
 RETURNING id, user_id, status;
 
+-- name: ReleaseCredentialSwitch :execrows
+-- PRD #1247 M5 (D3/D4/D14): the held-state credential-switch RELEASE transition. After the
+-- worker's local two-phase release (quiesce -> verified capture -> teardown) it reports
+-- {status:"credential_switch", claim_generation}; in ONE fenced statement this requeues the
+-- held run so its next claim spends the already-written override.
+--
+-- THE WHERE IS THE FENCE. It requires the run still be at the reported generation
+-- (claim_generation = @generation), with an UNRELEASED claim (claim_released_at IS NULL), owned
+-- by the reporting worker (worker_id), and in one of the HELD states. A stale redelivery (the
+-- claim was released, or a reclaim bumped the generation) matches 0 rows; the caller
+-- distinguishes an already-applied/already-reclaimed redelivery (idempotent success) from an
+-- unexpected state by re-reading the run (releaseCredentialSwitch).
+--
+-- The claim_released_at IS NULL conjunct is DEFENSE IN DEPTH, not the pin of the idempotent
+-- redelivery test: both redelivery cases are already excluded INDEPENDENTLY — an already-released
+-- run is 'queued' (excluded by the status IN (...) clause below), and a reclaimed run is at a
+-- higher generation (excluded by claim_generation = @generation). What the conjunct alone catches
+-- is the ARTIFICIAL state a released claim still in a held status (which the normal flow never
+-- produces), pinned by TestReleaseCredentialSwitchReleasedConjunctLiveDB, which forces that state
+-- directly and asserts a same-generation release is refused.
+--
+-- THE BUDGET RULE IS THE GATE-PARK/PAUSE ONE (Open Question 3, D14): started_at is KEPT and the
+-- held gap is BANKED into budget_paused_seconds, exactly like ResumePausedRun — a mid-run switch
+-- is the owner's choice, not an external park, so a fresh wall would let repeated switches extend
+-- a run without bound. claim_released_at = now() ARMS the fence so every later report from the
+-- old flight is rejected until ClaimRun reclaims and clears it. The switch stamp
+-- (credential_switch_requested_at/_generation) is deliberately KEPT on this release transition — it
+-- is visible as "released, awaiting reclaim" (D14). It is cleared by any TERMINAL transition now
+-- (PRD #1247 D11 fix round, beside the pause-clears). The successful-APPLICATION clear at the next
+-- epoch write on reclaim (D14) is NOT yet implemented — deferred to issue #1422 (M9); until it
+-- lands the stamp lingers past a same-run reclaim (a stale DTO state only, no signal leak). codex
+-- cap/epoch are revoked/bumped like every other park->queued transition; health is reset because
+-- 'queued' is on the detector's allowlist. Status_since is NOT NULL (migration 00163), so the
+-- banked interval is never NULL.
+UPDATE runs SET
+    status                = 'queued',
+    status_since          = now(),
+    claim_released_at     = now(),
+    budget_paused_seconds = budget_paused_seconds
+        + GREATEST(0, EXTRACT(EPOCH FROM (now() - status_since))::int),
+    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at            = now()
+WHERE id = @id AND worker_id = @worker_id
+  AND claim_generation = @generation
+  AND claim_released_at IS NULL
+  AND status IN ('running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup');
+
+-- name: StampHeldCredentialSwitch :execrows
+-- PRD #1247 M5 (D4, BLOCKING-1 rework): the held-state credential switch for the owner's
+-- `uzi run set-token` verb on a run a worker currently holds (running/awaiting_*), written in ONE
+-- atomic, fenced UPDATE — the override columns AND the switch stamp together. This REPLACES the
+-- prior two-write path (SetRunCredentialOverride then a `id + user_id`-only stamp), which could
+-- interleave with a concurrent release/reclaim/cancel/second-switch and leave the override written
+-- but the stamp fenced out (or vice versa) while the verb still returned 200. The switch is
+-- REQUESTED (visible as "requested", D14); the holding worker's next inputs poll (M5a-2) reads the
+-- signal and drives the local release. It does NOT change status — the run stays in its held state
+-- until the worker releases.
+--
+-- THE WHERE IS THE FENCE. Owner-scoped (user_id, so a foreign run is a 0-row no-op) AND fenced on
+-- the EXACT live claim — worker_id, claim_generation = @generation, claim_released_at IS NULL, in
+-- one of the held states — mirroring ReleaseCredentialSwitch / ClearCredentialSwitchByWorker.
+-- @generation is the run's current claim_generation, so the switch stamp targets the CURRENT
+-- claim and ReleaseCredentialSwitch's fence matches it. EXACTLY ONE row is expected; a 0-row
+-- result means the run left the held state, the generation advanced, or the claim was released
+-- between the caller's read and this write (a raced release/reclaim) → the caller returns
+-- ErrCredentialSwitchRaced and NOTHING is written (this UPDATE matched no row).
+UPDATE runs SET
+    credential_override_mode       = @mode,
+    credential_override_secret_id  = @secret_id,
+    credential_switch_requested_at = now(),
+    credential_switch_generation   = @generation,
+    updated_at                     = now()
+WHERE id = @id
+  AND user_id = @user_id
+  AND worker_id = @worker_id
+  AND claim_generation = @generation
+  AND claim_released_at IS NULL
+  AND status IN ('running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup');
+
+-- name: ClearCredentialSwitchByWorker :execrows
+-- PRD #1247 M5 (D3/D14): a bounded capture-failure give-up (a credential_switch_failed worker
+-- report) clears the pending switch stamp WITHOUT changing status — the run keeps running on its
+-- current token. Fenced to the CURRENT claim: only the worker holding the exact generation, with
+-- the claim NOT released and a stamp actually pending, may clear it, so a stale/superseded/foreign
+-- report clears nothing. Idempotent: a second delivery affects 0 rows (already cleared).
+UPDATE runs
+SET credential_switch_requested_at = NULL,
+    credential_switch_generation = NULL,
+    updated_at = now()
+WHERE id = @id
+  AND worker_id = @worker_id
+  AND claim_generation = @generation
+  AND claim_released_at IS NULL
+  AND credential_switch_requested_at IS NOT NULL;
+
 -- name: ClearPauseRequest :execrows
 -- Clear a pending pause request WITHOUT parking (PRD #1190 M1), for the worker's
 -- `pause_failed` report: the worker could not publish the checkpoint, so the run STAYS running
@@ -2043,12 +2433,22 @@ RETURNING id, user_id, status;
 -- worker_id so only the worker holding the run can clear it; it does not touch status. One of
 -- the four sites that clear the pending-pause columns (with SetRunPaused, CancelPauseInput and
 -- the terminal transitions).
+--
+-- PRD #1247 M5: the per-query generation fence, the SAME nil-guarded shape as InsertRunMessage /
+-- SetRunLimitWait. A CAPABILITY worker stamps claim_generation on its `pause_failed` report; a
+-- STALE report from an OLD flight — its claim RELEASED by a held-state switch (claim_released_at
+-- set) or SUPERSEDED by a reclaim (claim_generation advanced) — matches 0 rows here, so it can
+-- NOT clear the NEW flight's pending pause request. A legacy worker (NULL generation) clears
+-- unconditionally, byte-identical to before. sqlc.narg, never @name (this file's multibyte
+-- comment blocks break the @name parser).
 UPDATE runs SET
     pause_requested_at = NULL,
     pause_mode         = NULL,
     pause_after_count  = NULL,
     updated_at         = now()
-WHERE id = @id AND worker_id = @worker_id;
+WHERE id = @id AND worker_id = @worker_id
+  AND (sqlc.narg('claim_generation')::bigint IS NULL
+       OR (claim_generation = sqlc.narg('claim_generation')::bigint AND claim_released_at IS NULL));
 
 -- name: SetRunAwaitingInput :execrows
 -- PRD #88 M1: the clarification park. Sibling of SetRunAwaitingApproval, and it
@@ -2272,6 +2672,7 @@ UPDATE runs SET
     -- CancelRunByWorker / FailRunAutoStop / RejectRunServerSide / SweepRunningTimeout
     -- and the stale-worker failers below) clear them for the same reason.
     pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
+    credential_switch_requested_at = NULL, credential_switch_generation = NULL, -- PRD #1247 D11 fix round: a terminal run settles a pending held switch (PRD #1190 pause-clear pattern) so the DTO never sticks at credential_switch:"requested" and PendingCredentialSwitchSignal (status-agnostic) can never signal a dead run
     -- Arm the M5 patch marker. Explicit rather than left to the column default,
     -- because SetRunCompleted can in principle run on a row that already carries a
     -- stamp from an earlier terminal transition.
@@ -2334,11 +2735,20 @@ UPDATE runs SET
     milestones_agents = NULL,
     -- PRD #1190 M1: a terminal run carries no pending pause (root-cause clear; see SetRunCompleted).
     pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
+    credential_switch_requested_at = NULL, credential_switch_generation = NULL, -- PRD #1247 D11 fix round: a terminal run settles a pending held switch (PRD #1190 pause-clear pattern) so the DTO never sticks at credential_switch:"requested" and PendingCredentialSwitchSignal (status-agnostic) can never signal a dead run
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
 WHERE id = @id AND worker_id = @worker_id
-  AND status NOT IN ('completed', 'failed', 'cancelled');
+  AND status NOT IN ('completed', 'failed', 'cancelled')
+  -- PRD #1247 M5a-1 rework (m6): the per-query generation fence, the SAME nil-guarded shape as
+  -- UpdateRunLastSeq/InsertRunMessage. limit_wait (non-park + forge-park DEGRADED) callers skip
+  -- the outer FOR UPDATE fence, so when a generation is supplied the fail applies ONLY to the
+  -- still-held run at that exact generation: a late gen-G report matches 0 rows against a run
+  -- released after G (claim_released_at set) or reclaimed to G+1 (generation moved on), so it
+  -- cannot clobber the reclaiming flight. nil = legacy/outer-lock-fenced callers, unchanged.
+  AND (sqlc.narg('claim_generation')::bigint IS NULL
+       OR (claim_generation = sqlc.narg('claim_generation')::bigint AND claim_released_at IS NULL));
 
 -- name: MarkRunFailedByID :execrows
 -- Service-internal fail (e.g. a claim whose secrets are missing/undecryptable):
@@ -2361,6 +2771,7 @@ UPDATE runs SET
     milestones_agents = NULL,
     -- PRD #1190 M1: a terminal run carries no pending pause (root-cause clear; see SetRunCompleted).
     pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
+    credential_switch_requested_at = NULL, credential_switch_generation = NULL, -- PRD #1247 D11 fix round: a terminal run settles a pending held switch (PRD #1190 pause-clear pattern) so the DTO never sticks at credential_switch:"requested" and PendingCredentialSwitchSignal (status-agnostic) can never signal a dead run
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
@@ -2382,11 +2793,68 @@ UPDATE runs SET status = 'cancelled', status_since = now(), stop_kind = 'cancell
     milestones_agents = NULL,
     -- PRD #1190 M1: a terminal run carries no pending pause (root-cause clear; see SetRunCompleted).
     pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
+    credential_switch_requested_at = NULL, credential_switch_generation = NULL, -- PRD #1247 D11 fix round: a terminal run settles a pending held switch (PRD #1190 pause-clear pattern) so the DTO never sticks at credential_switch:"requested" and PendingCredentialSwitchSignal (status-agnostic) can never signal a dead run
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE id = @id AND user_id = @user_id
   AND status NOT IN ('completed', 'failed', 'cancelled');
+
+-- name: RunHasPendingOutcomeLease :one
+-- PRD #1391 Run B M3d (D13): does this run currently have a terminal outcome journaled and
+-- leased on its owning worker? This is the POSITIVE form of the D11 claim-exclusion predicate
+-- (see SweepClaimedNeverStarted / FailRunAutoStop, whose negative `NOT EXISTS(...) AND NOT
+-- EXISTS(...)` PROTECT such a run). True when EITHER the run's owning worker holds an unexpired
+-- terminal_pending lease for it at the run's EXACT current claim_generation (the executor
+-- journaled a terminal outcome and is gone), OR the owning worker is under an unexpired
+-- pending_overflow (M4's rotation left this run unlisted, but the worker-level closure stands in
+-- for the missing row-level lease). Chat is excluded (D6/D10): chat has no claim generation and
+-- never journals a terminal outcome, so it is never pending. Reused by hasLivePoller (a run this
+-- returns true for has no live poller for ITSELF — its executor no longer exists) and by the
+-- owner cancel's confirmation gate + atomic no-live-poller branch.
+SELECT EXISTS (
+    SELECT 1 FROM runs
+    WHERE runs.id = @id
+      AND runs.kind <> 'chat'
+      AND (EXISTS (SELECT 1 FROM worker_active_runs a
+                   WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                     AND a.terminal_pending_until > now()
+                     AND a.claim_generation = runs.claim_generation)
+           OR EXISTS (SELECT 1 FROM workers w
+                      WHERE w.id = runs.worker_id AND w.pending_overflow_until > now()))
+);
+
+-- name: CancelRunServerSideWithPendingOutcome :execrows
+-- PRD #1391 Run B M3d (D13): the atomic owner-scoped cancel of a run whose executor journaled a
+-- terminal (esp. blocked) outcome on its worker, when the owner explicitly discards it. This is
+-- the resolution for a pending outcome the api permanently refuses — a silent unconditional
+-- CancelRunServerSide would trade a visible stall for a lost outcome, so this variant carries the
+-- SAME pending-outcome predicate the confirmation gate enforced (RunHasPendingOutcomeLease's
+-- positive form) INSIDE the UPDATE: a Go-side check followed by the plain CancelRunServerSide
+-- would race a lease clear or a re-claim and cancel a fresh generation on stale evidence. The
+-- UPDATE is one row-locking statement (it re-evaluates the predicate against the latest committed
+-- run row under READ COMMITTED / EvalPlanQual), so a replayed SetState and this cancel resolve on
+-- the run's row lock, not on stale reads: if the replayed SetState commits `completed`/`failed`
+-- first, this matches 0 rows (status NOT IN protects it); if this wins, the replay's no-op 409
+-- returns `cancelled`, the journal retires and completion side effects never fire. Field-for-field
+-- identical to CancelRunServerSide's terminal cleanup; only the WHERE differs.
+UPDATE runs SET status = 'cancelled', status_since = now(), stop_kind = 'cancelled', move_pending_since = now(), finished_at = now(),
+    stop_reason = @stop_reason,
+    milestones_in_progress = NULL,
+    milestones_agents = NULL,
+    pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
+    credential_switch_requested_at = NULL, credential_switch_generation = NULL,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE runs.id = @id AND runs.user_id = @user_id
+  AND runs.status NOT IN ('completed', 'failed', 'cancelled')
+  AND runs.kind <> 'chat'
+  AND (EXISTS (SELECT 1 FROM worker_active_runs a
+               WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                 AND a.terminal_pending_until > now()
+                 AND a.claim_generation = runs.claim_generation)
+       OR EXISTS (SELECT 1 FROM workers w
+                  WHERE w.id = runs.worker_id AND w.pending_overflow_until > now()));
 
 -- name: GetActiveMRReworkRunForMR :one
 -- Resolve the single non-terminal mr_rework run for a (repo, MR). Used by the
@@ -2436,6 +2904,7 @@ UPDATE runs SET
     milestones_agents = NULL,
     -- PRD #1190 M1: a terminal run carries no pending pause (root-cause clear; see SetRunCompleted).
     pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
+    credential_switch_requested_at = NULL, credential_switch_generation = NULL, -- PRD #1247 D11 fix round: a terminal run settles a pending held switch (PRD #1190 pause-clear pattern) so the DTO never sticks at credential_switch:"requested" and PendingCredentialSwitchSignal (status-agnostic) can never signal a dead run
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
@@ -2463,6 +2932,7 @@ UPDATE runs SET
     milestones_in_progress = NULL,
     milestones_agents = NULL,
     pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
+    credential_switch_requested_at = NULL, credential_switch_generation = NULL, -- PRD #1247 D11 fix round: a terminal run settles a pending held switch (PRD #1190 pause-clear pattern) so the DTO never sticks at credential_switch:"requested" and PendingCredentialSwitchSignal (status-agnostic) can never signal a dead run
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
 WHERE id = @id AND worker_id = @worker_id
@@ -2511,10 +2981,11 @@ UPDATE runs SET status = 'failed', status_since = now(),
     milestones_agents = NULL,
     -- PRD #1190 M1: a terminal run carries no pending pause (root-cause clear; see SetRunCompleted).
     pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
+    credential_switch_requested_at = NULL, credential_switch_generation = NULL, -- PRD #1247 D11 fix round: a terminal run settles a pending held switch (PRD #1190 pause-clear pattern) so the DTO never sticks at credential_switch:"requested" and PendingCredentialSwitchSignal (status-agnostic) can never signal a dead run
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
-WHERE id = @id
+WHERE runs.id = @id
   AND status NOT IN ('completed', 'failed', 'cancelled')
   -- limit_wait excluded EXPLICITLY (PRD #35) — the third statement in this file to
   -- need it, for the same reason as SetRunRunning and SetRunAwaitingApproval above:
@@ -2564,7 +3035,19 @@ WHERE id = @id
   -- slot), not looped, so auto-stopping one would be wrong on the merits. It is excluded today
   -- only by autostop.go's single `if run.Status != "running"` line, unmentioned in that line's
   -- comment, and exposed the day someone relaxes it — so this is its SQL backstop.
-  AND status <> 'paused';
+  AND status <> 'paused'
+  -- PRD #1390 D11: the persist-failure auto-stop honours the terminal-pending lease +
+  -- pending_overflow closure like every other terminal writer — a run whose outcome is
+  -- journaled on the worker (#1391) must not be auto-stopped out from under the pending
+  -- replay while its lease holds. Chat is exempt from the PROTECTION (D10):
+  -- `kind = 'chat' OR NOT EXISTS(...)`.
+  AND (runs.kind = 'chat'
+       OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                       WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                         AND a.terminal_pending_until > now()
+                         AND a.claim_generation = runs.claim_generation)
+           AND NOT EXISTS (SELECT 1 FROM workers w
+                           WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())));
 
 -- name: RejectRunServerSide :execrows
 -- Server-side plan rejection → failed → origin restore → stamp. stop_kind is
@@ -2580,6 +3063,7 @@ UPDATE runs SET status = 'failed', status_since = now(), stop_kind = 'plan_rejec
     milestones_agents = NULL,
     -- PRD #1190 M1: a terminal run carries no pending pause (root-cause clear; see SetRunCompleted).
     pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
+    credential_switch_requested_at = NULL, credential_switch_generation = NULL, -- PRD #1247 D11 fix round: a terminal run settles a pending held switch (PRD #1190 pause-clear pattern) so the DTO never sticks at credential_switch:"requested" and PendingCredentialSwitchSignal (status-agnostic) can never signal a dead run
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
@@ -2594,8 +3078,17 @@ WHERE id = @id AND user_id = @user_id
 -- activity-bump endpoint. A pure-duplicate re-delivery skips this call (maxSeq not
 -- advanced), so last_activity_at reflects real new activity, which is exactly what
 -- the stalled signal wants.
+--
+-- PRD #1247 M5 (D3): FENCED like InsertRunMessage. When the caller carries a claim generation
+-- (@claim_generation NOT NULL) the high-water bump lands ONLY while the run is at that
+-- generation with an unreleased claim, so a released/reclaimed old flight cannot advance
+-- last_seq (which would strand the reclaiming flight's re-emitted seqs behind a stale mark). A
+-- legacy caller (NULL) advances unconditionally, byte-identical to before.
 UPDATE runs SET last_seq = GREATEST(last_seq, @seq), last_activity_at = now()
-WHERE id = @id;
+WHERE id = @id
+  AND (sqlc.narg('claim_generation')::bigint IS NULL
+       OR (claim_generation = sqlc.narg('claim_generation')::bigint
+           AND claim_released_at IS NULL));
 
 -- Sweeper: run-level timeouts and worker-loss recovery -----------------------
 
@@ -2616,6 +3109,17 @@ UPDATE runs SET status = 'queued', status_since = now(),
     codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
     updated_at = now()
 WHERE status = 'claimed' AND claimed_at < @cutoff
+  -- PRD #1390 D11: a `claimed` run whose initial `running` report never landed while its worker
+  -- journaled a terminal outcome and leased it (or whose owner is pending_overflow) must not be
+  -- reset to `queued` — that would invite a re-claim that overtakes the pending replay. Chat is
+  -- exempt from the PROTECTION (D10): `kind = 'chat' OR NOT EXISTS(...)`.
+  AND (runs.kind = 'chat'
+       OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                       WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                         AND a.terminal_pending_until > now()
+                         AND a.claim_generation = runs.claim_generation)
+           AND NOT EXISTS (SELECT 1 FROM workers w
+                           WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
 RETURNING id, user_id, status;
 
 -- name: RequeueClaimedRunToQueued :execrows
@@ -2710,7 +3214,14 @@ WHERE id = @id AND worker_id = @worker_id
 -- oldest-first ORDER BY is index-ordered. The held set is expected to be tiny (a run
 -- holds only while an auto owner's whole pool is genuinely empty, a transient state M5
 -- resumes out of); the index mirrors limit_wait's idx_runs_limit_wait_retry.
-SELECT id, user_id, status_since FROM runs
+--
+-- limit_dead_secret_id and retry_not_before are projected so the reactive pass can ask
+-- the SAME question the re-claim asks — autoselect.Floor(cands, claimExclude(run)) —
+-- rather than the exclude-blind PoolNonEmpty it once used (PRD #1247 M3, the pool-
+-- promoter fix). Early promotion (the set-token verb and D8) can leave a pool_wait run
+-- carrying a FUTURE retry_not_before whose sole pooled token is its own dead credential;
+-- without these two columns the pass would resume it every tick only for it to re-hold.
+SELECT id, user_id, status_since, limit_dead_secret_id, retry_not_before FROM runs
 WHERE status = 'pool_wait'
 ORDER BY status_since ASC;
 
@@ -2803,6 +3314,7 @@ UPDATE runs SET status = 'failed', status_since = now(), failure_reason = @failu
     milestones_agents = NULL,
     -- PRD #1190 M1: a terminal run carries no pending pause (root-cause clear; see SetRunCompleted).
     pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
+    credential_switch_requested_at = NULL, credential_switch_generation = NULL, -- PRD #1247 D11 fix round: a terminal run settles a pending held switch (PRD #1190 pause-clear pattern) so the DTO never sticks at credential_switch:"requested" and PendingCredentialSwitchSignal (status-agnostic) can never signal a dead run
     -- Exit contract (PRD #47 Decision 3): a timed-out run must not keep a stale ⚠.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
@@ -2837,6 +3349,19 @@ WHERE status = 'running'
             AND w.last_heartbeat_at >= sqlc.arg('worker_stale_cutoff')::timestamptz
       )
   )
+  -- PRD #1390 D11: a run under an unexpired terminal-pending lease for its current generation
+  -- (an outcome journaled on the worker, #1391), or owned by a pending_overflow worker, is not
+  -- timed out — a journaled outcome must not be overwritten by a wall-clock fail while its lease
+  -- holds; the lease/overflow expiry is the backstop. Chat is exempt from the PROTECTION (D10),
+  -- so the guard is `kind = 'chat' OR NOT EXISTS(...)`; SweepRunningTimeout already excludes chat
+  -- by kind above, so the chat arm is inert here but kept identical for one predicate shape.
+  AND (runs.kind = 'chat'
+       OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                       WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                         AND a.terminal_pending_until > now()
+                         AND a.claim_generation = runs.claim_generation)
+           AND NOT EXISTS (SELECT 1 FROM workers w
+                           WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
 RETURNING id, user_id, status;
 
 -- name: StampCompletionBudgetExhausted :execrows
@@ -2896,6 +3421,28 @@ UPDATE runs SET completion_budget_exhausted_at = NULL, updated_at = now() WHERE 
 -- failed instead of re-queued. Stamps move_pending_since (reconcile restores the
 -- origin column; the sweep itself never touches the forge — worker-loss recovery
 -- must not wait on a down forge).
+--
+-- PRD #1390 M1 (D9): the FAIL path requires TWO consecutive stale windows —
+-- @fail_cutoff = now() - 2*WORKER_HEARTBEAT_STALE (the Go caller computes it) — so a run
+-- that was requeued once and then hits a partition just over one window is not terminated
+-- before a heartbeat can re-adopt it; terminal cannot be undone. The stale workers are
+-- locked FIRST in a `locked` CTE that takes each worker row FOR UPDATE ordered by id (the
+-- canonical lock order), so this statement serialises with HeartbeatWorker and re-checks
+-- staleness after a concurrent heartbeat commits — the race where a heartbeat lands between
+-- the staleness read and the terminal write is closed.
+--
+-- PRD #1390 M1 (D11): a run under an unexpired terminal-pending lease for its CURRENT
+-- generation is NOT failed (an outcome is journaled on the worker, #1391), and neither is
+-- any run owned by a worker flagged pending_overflow (the worker-level closure for outcomes
+-- it could not list). Chat is exempt from the lease/overflow PROTECTION (D10) — it is still
+-- failed as before — so the guard is `kind = 'chat' OR NOT EXISTS(...)`, never a top-level
+-- kind <> 'chat'. The lease/overflow expiries (one clock) are the dead-worker backstop.
+WITH locked AS (
+    SELECT workers.id FROM workers
+    WHERE workers.last_heartbeat_at IS NULL OR workers.last_heartbeat_at < @fail_cutoff
+    ORDER BY workers.id
+    FOR UPDATE
+)
 UPDATE runs SET status = 'failed', status_since = now(), failure_reason = @failure_reason,
     -- PRD #69 M7a: the trusted failure class for an orphaned run whose worker is gone.
     fail_origin = 'worker_lost',
@@ -2905,23 +3452,45 @@ UPDATE runs SET status = 'failed', status_since = now(), failure_reason = @failu
     milestones_agents = NULL,
     -- PRD #1190 M1: a terminal run carries no pending pause (root-cause clear; see SetRunCompleted).
     pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
+    credential_switch_requested_at = NULL, credential_switch_generation = NULL, -- PRD #1247 D11 fix round: a terminal run settles a pending held switch (PRD #1190 pause-clear pattern) so the DTO never sticks at credential_switch:"requested" and PendingCredentialSwitchSignal (status-agnostic) can never signal a dead run
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
   AND requeue_count >= @max_requeues
-  AND worker_id IN (
-      SELECT id FROM workers WHERE last_heartbeat_at IS NULL OR last_heartbeat_at < @cutoff
-  )
+  AND worker_id IN (SELECT id FROM locked)
+  -- PRD #1390 D11: terminal-pending lease + pending_overflow closure, chat-exempt (D10).
+  AND (runs.kind = 'chat'
+       OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                       WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                         AND a.terminal_pending_until > now()
+                         AND a.claim_generation = runs.claim_generation)
+           AND NOT EXISTS (SELECT 1 FROM workers w
+                           WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
 RETURNING id, user_id, status;
 
 -- name: RequeueRunsOfStaleWorkers :many
 -- A stale worker's non-terminal run within its re-queue budget → back to queued
 -- (worker_id kept for affinity, requeue_count incremented).
+--
+-- PRD #1390 M1 (D9): the stale workers are locked FIRST in a `locked` CTE that takes each
+-- worker row FOR UPDATE ordered by id (the canonical lock order shared with the over-cap
+-- fail above), so this statement serialises with HeartbeatWorker. The REQUEUE keeps the
+-- single stale window (@cutoff); only the over-cap FAIL waits for the second one (D9).
+WITH locked AS (
+    SELECT workers.id FROM workers
+    WHERE workers.last_heartbeat_at IS NULL OR workers.last_heartbeat_at < @cutoff
+    ORDER BY workers.id
+    FOR UPDATE
+)
 UPDATE runs SET status = 'queued', status_since = now(), requeue_count = requeue_count + 1,
     -- Exit contract (PRD #47 Decision 3): reset on the way back to 'queued'; the
     -- detector re-evaluates the queued signal from this transition's status_since.
     health = 'ok', health_reason = NULL, health_since = NULL,
+    -- PRD #1390 M2b (D2): record the generation this stale-worker requeue charged, so the
+    -- heartbeat re-adoption can refund the requeue only when the same generation is restored
+    -- (a legitimate earlier loss is never refunded). The restore and every ClaimRun clear it.
+    stale_requeue_generation = claim_generation,
     -- Issue #783: bank park time before a worker-death requeue -> queued, since started_at
     -- survives the requeue and the later claimed->running resume would not see the park.
     -- awaiting_followup is intentionally excluded: interactive runs are exempt from
@@ -2937,9 +3506,15 @@ UPDATE runs SET status = 'queued', status_since = now(), requeue_count = requeue
     updated_at = now()
 WHERE status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
   AND requeue_count < @max_requeues
-  AND worker_id IN (
-      SELECT id FROM workers WHERE last_heartbeat_at IS NULL OR last_heartbeat_at < @cutoff
-  )
+  AND worker_id IN (SELECT id FROM locked)
+  -- PRD #1390 D11: terminal-pending lease + pending_overflow closure, chat-exempt (D10).
+  AND (runs.kind = 'chat'
+       OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                       WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                         AND a.terminal_pending_until > now()
+                         AND a.claim_generation = runs.claim_generation)
+           AND NOT EXISTS (SELECT 1 FROM workers w
+                           WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
 RETURNING id, user_id, status;
 
 -- Register-time orphan recovery (worker-scoped) ------------------------------
@@ -2960,17 +3535,32 @@ UPDATE runs SET status = 'failed', status_since = now(), failure_reason = @failu
     milestones_agents = NULL,
     -- PRD #1190 M1: a terminal run carries no pending pause (root-cause clear; see SetRunCompleted).
     pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
+    credential_switch_requested_at = NULL, credential_switch_generation = NULL, -- PRD #1247 D11 fix round: a terminal run settles a pending held switch (PRD #1190 pause-clear pattern) so the DTO never sticks at credential_switch:"requested" and PendingCredentialSwitchSignal (status-agnostic) can never signal a dead run
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
-WHERE worker_id = @worker_id
+WHERE runs.worker_id = @worker_id
   AND status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
   AND requeue_count >= @max_requeues
+  -- PRD #1390 D11: register's orphan fail honours the terminal-pending lease + pending_overflow
+  -- closure exactly as the stale-worker passes do (chat-exempt, D10) — a fresh worker process
+  -- must not fail its own run whose outcome is journaled and about to be replayed (#1391).
+  AND (runs.kind = 'chat'
+       OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                       WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                         AND a.terminal_pending_until > now()
+                         AND a.claim_generation = runs.claim_generation)
+           AND NOT EXISTS (SELECT 1 FROM workers w
+                           WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
 RETURNING id;
 
--- name: RequeueWorkerRuns :execrows
+-- name: RequeueWorkerRuns :many
 -- Within budget → re-queued to this same worker (affinity), which then re-claims
 -- and resumes from the persisted session (handles docker compose down && up).
+--
+-- PRD #1390 M2a: RETURNING id so Register can publish each requeue transition post-commit
+-- (via publishSwept) exactly as the sweeper's RequeueRunsOfStaleWorkers twin already does —
+-- closing the gap where a register-time requeue reached no live channel.
 UPDATE runs SET status = 'queued', status_since = now(), requeue_count = requeue_count + 1,
     -- Exit contract (PRD #47 Decision 3): reset on the way back to 'queued'; the
     -- detector re-evaluates the queued signal from this transition's status_since.
@@ -2988,31 +3578,344 @@ UPDATE runs SET status = 'queued', status_since = now(), requeue_count = requeue
     -- epoch. A harmless no-op for a non-codex run, whose codex_cap_hash is already NULL.
     codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
     updated_at = now()
-WHERE worker_id = @worker_id
+WHERE runs.worker_id = @worker_id
   AND status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-  AND requeue_count < @max_requeues;
+  AND requeue_count < @max_requeues
+  -- PRD #1390 D11: register's orphan requeue honours the terminal-pending lease + pending_overflow
+  -- closure exactly as the stale-worker passes do (chat-exempt, D10) — a fresh worker process
+  -- must not requeue its own run whose outcome is journaled and about to be replayed (#1391).
+  AND (runs.kind = 'chat'
+       OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                       WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                         AND a.terminal_pending_until > now()
+                         AND a.claim_generation = runs.claim_generation)
+           AND NOT EXISTS (SELECT 1 FROM workers w
+                           WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
+RETURNING id;
+
+-- Worker active-run snapshot (PRD #1390 M2a) --------------------------------
+
+-- name: DeleteWorkerActiveRuns :execrows
+-- Full-replacement delete for the heartbeat/claim snapshot path (D3): drop every row of the
+-- worker before re-inserting the validated set, so an attempt that ended (dropped from the
+-- snapshot) leaves no row behind. Register uses DeleteOrdinaryWorkerActiveRunsNotIn instead,
+-- because it must PRESERVE leased rows across a restart.
+DELETE FROM worker_active_runs WHERE worker_id = @worker_id;
+
+-- name: DeleteOrdinaryWorkerActiveRunsNotIn :execrows
+-- Register-path delete (PRD #1390 M2a): remove only ORDINARY (terminal_pending = false) rows
+-- whose run is not in the register-carried snapshot, PRESERVING every row under a
+-- terminal-pending lease (its generation is what protects #1391's boot replay from the orphan
+-- pass that follows). @keep_run_ids is the snapshot's run-id set; an empty set deletes every
+-- ordinary row (a register with no listed live attempts). The kept rows are re-upserted right
+-- after, so this only removes ordinary rows the snapshot no longer names.
+DELETE FROM worker_active_runs
+WHERE worker_id = @worker_id
+  AND terminal_pending = false
+  AND run_id <> ALL(@keep_run_ids::uuid[]);
+
+-- name: UpsertWorkerActiveRun :execrows
+-- Insert (or replace) one validated snapshot entry, OWNERSHIP-ENFORCED in SQL (D3): the row is
+-- written only when the run is actually `worker_id = @worker_id`, so a buggy or hostile worker
+-- can never describe — and thereby suppress a sibling's claim on, or lease — a run it does not
+-- own. An entry that fails the EXISTS is silently dropped (0 rows affected); the Go caller logs
+-- it. terminal_pending_until is stamped now() + the lease for a pending entry and NULL for a
+-- live one; reported_at is this snapshot's capture time (now()), which ClaimRun's freshness
+-- test reads. ON CONFLICT keeps the (worker_id, run_id) primary key a full upsert so the
+-- register path's preserved-then-re-listed rows refresh cleanly.
+INSERT INTO worker_active_runs (
+    worker_id, run_id, claim_generation, phase,
+    terminal_pending, terminal_pending_until, snapshot_epoch, reported_at
+)
+SELECT @worker_id, @run_id, @claim_generation, @phase,
+       @terminal_pending,
+       CASE WHEN @terminal_pending::boolean
+            THEN now() + make_interval(secs => @lease_seconds::int)
+            ELSE NULL END,
+       @snapshot_epoch, now()
+WHERE EXISTS (SELECT 1 FROM runs r WHERE r.id = @run_id AND r.worker_id = @worker_id)
+ON CONFLICT (worker_id, run_id) DO UPDATE SET
+    claim_generation       = EXCLUDED.claim_generation,
+    phase                  = EXCLUDED.phase,
+    terminal_pending       = EXCLUDED.terminal_pending,
+    terminal_pending_until = EXCLUDED.terminal_pending_until,
+    snapshot_epoch         = EXCLUDED.snapshot_epoch,
+    reported_at            = EXCLUDED.reported_at;
+
+-- name: SetWorkerSnapshotState :execrows
+-- Apply the snapshot's worker-row effects (PRD #1390 M2a): advance snapshot_epoch to the
+-- accepted snapshot's epoch and set the pending_overflow closure. A flagged snapshot stamps
+-- pending_overflow_until = now() + the lease (the worker-level stand-in for the row-level
+-- leases it could not express, D11); an unflagged one clears both, which is what a valid
+-- unflagged snapshot uses to reopen claiming before expiry.
+UPDATE workers SET
+    snapshot_epoch         = @snapshot_epoch,
+    pending_overflow       = @pending_overflow,
+    pending_overflow_until = CASE WHEN @pending_overflow::boolean
+                                  THEN now() + make_interval(secs => @lease_seconds::int)
+                                  ELSE NULL END,
+    updated_at             = now()
+WHERE id = @id;
+
+-- name: ListActiveRunsForWorkers :many
+-- PRD #1390 M2c: the reported active runs (run_id, phase, generation) for a set of workers, for
+-- the worker-list DTO overlay. Batched over a worker-id set so the two list endpoints read every
+-- worker's rows in one round-trip (no N+1). Ordered by (worker_id, run_id) so the overlay can
+-- group by worker in one pass and each worker's entries render in a stable order.
+SELECT worker_id, run_id, phase, claim_generation
+FROM worker_active_runs
+WHERE worker_id = ANY(@worker_ids::uuid[])
+ORDER BY worker_id, run_id;
+
+-- Heartbeat reconciliation (PRD #1390 M2b) ----------------------------------
+
+-- name: LockOwnedRunsByIDs :many
+-- PRD #1390 M2b (blocker 1, canonical lock order step b): lock the runs the heartbeat's snapshot
+-- lists, owned by this worker, in deterministic id order, BEFORE the snapshot replace and the
+-- reconciliation writes. Rows returned are ignored; the statement exists for its FOR UPDATE.
+SELECT id FROM runs WHERE id = ANY(@run_ids::uuid[]) AND worker_id = @worker_id ORDER BY id FOR UPDATE;
+
+-- name: ReadoptRunsFromSnapshot :many
+-- PRD #1390 M2b (D5, D2): restore a `queued` run-lane run the worker still lists as a LIVE entry
+-- (terminal_pending = false) at the SAME generation to its listed phase. This is a DIRECT status
+-- write (not SetRunRunning), correct because the held-state content columns (open_question_id,
+-- plan candidates, completion/follow-up identity) survived the stale requeue untouched (fact 4),
+-- so the gate is restored by status alone. The queued interval is banked into budget_paused_seconds
+-- only for the two approval/input phases (as the stale requeue did for the park). The requeue
+-- refund (requeue_count - 1, floored at 0) fires ONLY when stale_requeue_generation = claim_generation
+-- (D2: the stale requeue charged THIS exact generation); a NULL/mismatched provenance never refunds.
+-- stale_requeue_generation is cleared after. claim_released_at IS NULL is #1247's fence (a run the
+-- credential switch released must not be revived). Held-state content columns are UNTOUCHED here.
+UPDATE runs r SET
+    status = a.phase,
+    status_since = now(),
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    budget_paused_seconds = r.budget_paused_seconds
+        + CASE WHEN a.phase IN ('awaiting_approval','awaiting_input')
+               THEN GREATEST(0, EXTRACT(EPOCH FROM (now() - r.status_since))::int)
+               ELSE 0 END,
+    requeue_count = CASE WHEN r.stale_requeue_generation = r.claim_generation
+                         THEN GREATEST(r.requeue_count - 1, 0) ELSE r.requeue_count END,
+    stale_requeue_generation = NULL,
+    updated_at = now()
+FROM worker_active_runs a
+WHERE a.worker_id = @worker_id AND a.run_id = r.id AND a.terminal_pending = false
+  AND r.worker_id = @worker_id
+  AND r.status = 'queued'
+  AND r.kind <> 'chat'
+  AND r.claim_generation = a.claim_generation
+  AND r.claim_released_at IS NULL
+RETURNING r.id, r.user_id, r.status;
+
+-- name: FailRunsMissingFromSnapshot :many
+-- PRD #1390 M2b (SC2, over cap): a run-lane `running` run this worker OWNS but no longer lists (its
+-- execution is lost) — past the fence, and out of re-queue budget — is FAILED (fail-first with the
+-- requeue twin below). Its SET list mirrors FailRunsOfStaleWorkersOverCap (fail_origin='worker_lost',
+-- the pause/switch/milestone clears, health reset, move_pending_since for the reconcile origin
+-- restore). Held states are never targeted (status = 'running' only). Chat is a target restriction
+-- (kind <> 'chat', D10) — these writers only ever touch run-lane runs. @missing_cutoff is the stale
+-- window plus one heartbeat interval (D4); @max_requeues is RUN_MAX_REQUEUES.
+UPDATE runs SET status = 'failed', status_since = now(), failure_reason = @failure_reason,
+    fail_origin = 'worker_lost',
+    move_pending_since = now(), finished_at = now(),
+    milestones_in_progress = NULL,
+    milestones_agents = NULL,
+    pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
+    credential_switch_requested_at = NULL, credential_switch_generation = NULL,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE runs.worker_id = @worker_id
+  AND runs.kind <> 'chat'                                   -- D10 (run-lane only; chat has its own sweeps)
+  AND runs.status = 'running'
+  AND runs.claim_released_at IS NULL                        -- #1247 fence
+  AND runs.status_since < @missing_cutoff                   -- fence: stale window + one heartbeat interval, D4
+  AND runs.requeue_count >= @max_requeues
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a        -- ABSENT (or a different generation) from the snapshot
+                  WHERE a.worker_id = @worker_id AND a.run_id = runs.id
+                    AND a.claim_generation = runs.claim_generation)
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a        -- D11 terminal-pending lease (worker-scoped, defense-in-depth)
+                  WHERE a.worker_id = runs.worker_id AND a.run_id = runs.id
+                    AND a.terminal_pending AND a.terminal_pending_until > now()
+                    AND a.claim_generation = runs.claim_generation)
+  AND NOT EXISTS (SELECT 1 FROM workers w                   -- D11 pending_overflow closure (worker-level, ESSENTIAL)
+                  WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())
+RETURNING id, user_id, status;
+
+-- name: RequeueRunsMissingFromSnapshot :many
+-- PRD #1390 M2b (SC2, under cap): the requeue twin of FailRunsMissingFromSnapshot — a `running`
+-- run-lane run this worker OWNS but no longer lists, past the fence and within budget, is REQUEUED
+-- through the existing requeue path. Its SET list mirrors RequeueRunsOfStaleWorkers (health reset,
+-- park-time bank for approval/input — a no-op here since only status='running' is targeted, codex
+-- cap revocation, requeue_count++). It does NOT set stale_requeue_generation: a genuine loss is
+-- never refunded (D2). Chat is a target restriction (kind <> 'chat', D10).
+UPDATE runs SET status = 'queued', status_since = now(), requeue_count = requeue_count + 1,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    budget_paused_seconds = budget_paused_seconds
+        + CASE WHEN status IN ('awaiting_approval', 'awaiting_input')
+               THEN GREATEST(0, EXTRACT(EPOCH FROM (now() - status_since))::int)
+               ELSE 0 END,
+    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
+    updated_at = now()
+WHERE runs.worker_id = @worker_id
+  AND runs.kind <> 'chat'                                   -- D10 (run-lane only; chat has its own sweeps)
+  AND runs.status = 'running'
+  AND runs.claim_released_at IS NULL                        -- #1247 fence
+  AND runs.status_since < @missing_cutoff                   -- fence: stale window + one heartbeat interval, D4
+  AND runs.requeue_count < @max_requeues
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a        -- ABSENT (or a different generation) from the snapshot
+                  WHERE a.worker_id = @worker_id AND a.run_id = runs.id
+                    AND a.claim_generation = runs.claim_generation)
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a        -- D11 terminal-pending lease (worker-scoped, defense-in-depth)
+                  WHERE a.worker_id = runs.worker_id AND a.run_id = runs.id
+                    AND a.terminal_pending AND a.terminal_pending_until > now()
+                    AND a.claim_generation = runs.claim_generation)
+  AND NOT EXISTS (SELECT 1 FROM workers w                   -- D11 pending_overflow closure (worker-level, ESSENTIAL)
+                  WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())
+RETURNING id, user_id, status;
 
 -- Messages -----------------------------------------------------------------
 
--- name: InsertRunMessage :execrows
+-- name: InsertRunMessage :one
 -- Idempotent seq-numbered append: a re-delivered batch (worker retry) is a
 -- no-op on the duplicate (run_id, seq).
-INSERT INTO run_messages (run_id, seq, kind, agent, agent_instance, agent_label, payload)
-VALUES (@run_id, @seq, @kind, @agent, @agent_instance, @agent_label, @payload)
-ON CONFLICT (run_id, seq) DO NOTHING;
+--
+-- PRD #1247 M5 (D3): when the caller carries a claim generation (@claim_generation NOT NULL —
+-- a capability worker stamps it on every message batch), the append is FENCED atomically. It
+-- lands ONLY while the run is still at that generation with an UNRELEASED claim, so a message
+-- batch from a released or reclaimed OLD flight persists nothing (the row-guard is checked in
+-- the same statement as the insert, no TOCTOU). A legacy caller (NULL generation) inserts
+-- unconditionally, byte-identical to before the fence. Preferring this per-query guard over a
+-- FOR UPDATE tx per message keeps the hot append path a single round-trip.
+--
+-- BLOCKING-4 rework: return BOTH `inserted` (did this call add a row) AND `generation_live` (did
+-- the fence predicate hold), computed in the SAME statement snapshot as the insert's WHERE, so
+-- the caller can tell a benign duplicate (generation_live, not inserted — the row is already
+-- persisted at the live generation) from a FENCE REJECTION (NOT generation_live — the batch is
+-- from a released/reclaimed OLD flight and persisted nothing). Both used to surface as :execrows
+-- == 0, so the caller advanced its high-water mark and folded usage over STALE frames. A legacy
+-- (NULL generation) caller always sees generation_live = TRUE, byte-identical to before.
+--
+-- PRD #1247 M9 (D7): claim_generation is now also PERSISTED in the row's own column, not only used
+-- in the fence WHERE. A capability worker's stamped generation lands on the frame, so both the
+-- incremental fold and a refold attribute each frame to the epoch that produced it (the join
+-- run_messages.claim_generation -> run_credential_epochs). A legacy caller (NULL narg) stores NULL,
+-- byte-identical to before, and the fence behaviour is unchanged (the WHERE still reads the narg).
+WITH ins AS (
+    INSERT INTO run_messages (run_id, seq, kind, agent, agent_instance, agent_label, payload, claim_generation)
+    SELECT @run_id, @seq, @kind, @agent, @agent_instance, @agent_label, @payload, sqlc.narg('claim_generation')::bigint
+    WHERE sqlc.narg('claim_generation')::bigint IS NULL
+       OR EXISTS (SELECT 1 FROM runs r
+                  WHERE r.id = @run_id
+                    AND r.claim_generation = sqlc.narg('claim_generation')::bigint
+                    AND r.claim_released_at IS NULL)
+    ON CONFLICT (run_id, seq) DO NOTHING
+    RETURNING 1 AS one
+)
+SELECT
+    EXISTS (SELECT 1 FROM ins) AS inserted,
+    (sqlc.narg('claim_generation')::bigint IS NULL
+     OR EXISTS (SELECT 1 FROM runs r
+                WHERE r.id = @run_id
+                  AND r.claim_generation = sqlc.narg('claim_generation')::bigint
+                  AND r.claim_released_at IS NULL)) AS generation_live;
+
+-- name: CountCredentialSwitchMessages :one
+-- Idempotency guard for the applied-switch run message (PRD #1247 M9, task c step 6): how many
+-- 'credential_switch' messages already exist for this run at this exact claim generation. Keyed on
+-- (run_id, claim_generation) so a same-generation retry after a crash (the epoch DO UPDATE
+-- re-records, and this claim re-assembles) finds the already-inserted message and does NOT emit a
+-- duplicate. > 0 ⇒ skip the insert. claim_generation is the message's persisted column (M9's
+-- InsertRunMessage stamp), so this matches only messages minted for THIS generation.
+SELECT count(*) FROM run_messages
+WHERE run_id = @run_id AND kind = 'credential_switch'
+  AND claim_generation = @claim_generation::bigint;
+
+-- name: MaxRunMessageSeq :one
+-- The run's current highest message seq, or 0 when it has none (PRD #1247 M9, task c step 7): the
+-- gapless collision-recovery re-read. A worker's InsertRunMessage is NOT serialized by the run-row
+-- FOR UPDATE lock the switch-message transaction holds, so a worker frame can land at last_seq+1
+-- between the caller's read and its own insert; on that ON CONFLICT the caller re-reads MAX(seq)
+-- here and retries at max+1, leaving no gap and losing no worker frame. COALESCE(...,0)::int keeps
+-- the return an int32 for a run with no messages yet.
+SELECT COALESCE(MAX(seq), 0)::int FROM run_messages WHERE run_id = @run_id;
+
+-- name: CountRunMessagesThrough :one
+-- The terminal fence's contiguity probe (PRD #1391 Run B M3c, D3): how many DISTINCT stored
+-- message seqs fall in [1..through] for this run. Backed by the run_messages UNIQUE (run_id, seq)
+-- index, so the count is an index-only range scan. A fully-contiguous run has count == through; a
+-- run with any hole in [1..through] has count < through, which is exactly what SetState refuses a
+-- terminal transition on (ErrMessagesPending) — the high-water last_seq alone cannot see a hole
+-- BELOW it, so the terminal fence needs this count, not just runs.last_seq. Modeled on
+-- MaxRunMessageSeq; ::int keeps the return an int32.
+SELECT count(seq)::int FROM run_messages WHERE run_id = @run_id AND seq BETWEEN 1 AND @through::int;
+
+-- name: RunMessageGaps :many
+-- The hardened message-gaps read (PRD #1391 Run B M3c): the MISSING seq ranges in [1..through]
+-- as bounded {first,last} pairs, after a keyset @cursor, ordered by seq, at most @lim of them.
+-- Authorization is part of THIS statement and snapshot: the run must belong to @worker_id at its
+-- current unreleased @claim_generation. A preliminary ownership query would leave a TOCTOU window
+-- where a same-worker reclaim increments the generation before this query reads the newer flight's
+-- gaps. `authorized` is empty for any stale/foreign/released claim, so the statement returns ZERO
+-- rows. For an authorized run with no gaps, the final LEFT JOIN returns one all-NULL sentinel row;
+-- the service uses that distinction to return an empty page rather than ErrRunNotOwned.
+--
+-- KEYSET pagination only — NO OFFSET, NO generate_series, NO materialisation of `through` rows:
+-- the gaps are derived from the PRESENT rows via LAG over the (run_id, seq) index, so the scan is
+-- bounded by what is stored (at most the run's message count), never by the size of `through`.
+--
+-- Each interior/leading gap is CLOSED by the present row immediately after it: for a present
+-- `seq` whose predecessor (LAG) is `prev`, the hole [prev+1, seq-1] exists iff seq - prev > 1.
+-- The TRAILING gap (max present seq .. through) has no closing present row, so a sentinel row at
+-- through+1 is UNION-ed in to close it exactly like every interior gap. The keyset is the CLOSER
+-- (the right-neighbor seq): a gap is emitted only when its closer > @cursor, and next_cursor is
+-- that closer, so the next page continues strictly after the last one with no overlap and no gap
+-- re-emitted. The present set is bounded below by @cursor (seq >= @cursor) so a large cursor scans
+-- only the index tail; @cursor doubles as the LAG seed so the first closer after the cursor gets
+-- the correct predecessor. @cursor = 0 (the first page) admits every gap, including the leading
+-- one [1, min_present-1]. The trailing gap is uniquely the one whose `last` == through.
+WITH authorized AS (
+    SELECT 1 AS ok FROM runs r
+    WHERE r.id = @run_id
+      AND r.worker_id = @worker_id
+      AND r.claim_released_at IS NULL
+      AND r.claim_generation = @claim_generation
+),
+present AS (
+    SELECT m.seq FROM run_messages m
+    CROSS JOIN authorized
+    WHERE m.run_id = @run_id AND m.seq BETWEEN 1 AND @through::int AND m.seq >= @cursor::int
+    UNION ALL
+    SELECT (@through::int) + 1 FROM authorized
+),
+edges AS (
+    SELECT seq AS closer,
+           COALESCE(LAG(seq) OVER (ORDER BY seq), @cursor::int) AS prev
+    FROM present
+),
+gaps AS (
+    SELECT (prev + 1)::int AS gap_first, (closer - 1)::int AS gap_last, closer::int AS next_cursor
+    FROM edges
+    WHERE closer - prev > 1 AND closer > @cursor::int
+    ORDER BY closer ASC
+    LIMIT @lim::int
+)
+SELECT gaps.gap_first, gaps.gap_last, gaps.next_cursor
+FROM authorized
+LEFT JOIN gaps ON true
+ORDER BY gaps.next_cursor ASC NULLS LAST;
 
 -- name: ListRunMessagesAfter :many
 -- Replay for a (re)connecting browser: everything after its last-seen seq, in
 -- order. The persisted log is authoritative; the WS layer (M5) is only a live
 -- cache on top of this.
 -- Column order matches the run_messages table order (the two PRD #99 columns were
--- appended by 00075), so sqlc keeps returning store.RunMessage rather than
--- minting a separate ...Row type.
+-- appended by 00075, claim_generation by PRD #1247's 00233), so sqlc keeps returning
+-- store.RunMessage rather than minting a separate ...Row type.
 -- TO DO IT RIGHT: new columns must be APPENDED to both this SELECT list and
 -- ListRunMessagesForWorkerPage's, in the same order the ALTER TABLE adds them.
 -- Diverge and sqlc mints per-query Row types for BOTH, breaking workersvc.Store's
 -- []store.RunMessage contract (a compile error at cmd/server/main.go).
-SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label
+SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label, claim_generation
 FROM run_messages
 WHERE run_id = @run_id AND seq > @after_seq
 ORDER BY seq ASC;
@@ -3024,7 +3927,7 @@ ORDER BY seq ASC;
 -- Column order is IDENTICAL to ListRunMessagesAfter so the row stays
 -- store.RunMessage. New columns must be APPENDED here AND in ListRunMessagesAfter,
 -- in the same order the ALTER TABLE adds them — see that query's note.
-SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label
+SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label, claim_generation
 FROM run_messages
 WHERE run_id = @run_id AND seq > @after_seq
 ORDER BY seq ASC
@@ -3039,7 +3942,7 @@ LIMIT @lim;
 -- the row stays store.RunMessage. New columns must be APPENDED to ALL THREE of these
 -- queries in the same order the ALTER TABLE adds them — see ListRunMessagesAfter's
 -- note. Diverge and sqlc mints a per-query Row type, breaking that []store.RunMessage.
-SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label
+SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label, claim_generation
 FROM run_messages
 WHERE run_id = @run_id AND seq < @before_seq
 ORDER BY seq DESC
@@ -3074,12 +3977,20 @@ LIMIT @lim;
 -- 'metered'), else 0 — so a redelivery can never combine an unreported/subscription status
 -- with a positive dollar amount, and the result always satisfies 00226's
 -- run_usage_nonmetered_zero_check (cost_status='metered' OR cost_usd=0).
+-- PRD #1247 M9 (D7): claim_generation is PROVENANCE ONLY — the epoch of the frames that produced
+-- this leg — never part of the leg key (00233's PK stays (run_id, session_id, model, lineage_epoch);
+-- it is NOT added to ON CONFLICT). On conflict it is COALESCE(existing, EXCLUDED): an established
+-- non-null provenance is NEVER clobbered by a later same-leg frame (a straggler re-delivery, or the
+-- rare case where a later frame of the same (session_id, model, lineage_epoch) leg carries a
+-- different generation), while a first frame whose existing value is NULL adopts the incoming one.
+-- Legacy NULL frames leave the column NULL. run_usage.claim_generation is DERIVED OUTPUT of the fold,
+-- never its evidence — the frame stamp on run_messages is the evidence.
 INSERT INTO run_usage (
     run_id, session_id, model, lineage_epoch,
-    input_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, cost_usd, harness, cost_status, updated_at
+    input_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, cost_usd, harness, cost_status, claim_generation, updated_at
 ) VALUES (
     @run_id, @session_id, @model, @lineage_epoch,
-    @input_tokens, @cache_read_tokens, @cache_creation_tokens, @output_tokens, @cost_usd, @harness, @cost_status, now()
+    @input_tokens, @cache_read_tokens, @cache_creation_tokens, @output_tokens, @cost_usd, @harness, @cost_status, sqlc.narg('claim_generation')::bigint, now()
 )
 ON CONFLICT (run_id, session_id, model, lineage_epoch) DO UPDATE SET
     input_tokens          = GREATEST(run_usage.input_tokens,          EXCLUDED.input_tokens),
@@ -3088,6 +3999,9 @@ ON CONFLICT (run_id, session_id, model, lineage_epoch) DO UPDATE SET
     output_tokens         = GREATEST(run_usage.output_tokens,         EXCLUDED.output_tokens),
     -- The run's harness is immutable, so existing == EXCLUDED on conflict; keep existing.
     harness               = run_usage.harness,
+    -- Provenance is set-once: keep an established non-null generation, never clobber it with a
+    -- later same-leg frame's EXCLUDED (M9, D7). A NULL existing value adopts EXCLUDED.
+    claim_generation      = COALESCE(run_usage.claim_generation, EXCLUDED.claim_generation),
     cost_status           = CASE
                                 WHEN run_usage.cost_status = EXCLUDED.cost_status THEN run_usage.cost_status
                                 ELSE 'unreported'
@@ -3239,7 +4153,7 @@ ORDER BY cost_usd DESC, output_tokens DESC, u.id;
 -- ListRunMessagesAfter so sqlc keeps returning store.RunMessage. status carries both
 -- the `init` markers CountRunInitFramesBefore counts and the success result frames;
 -- error carries a failed turn's result frame. This is a few dozen rows per run.
-SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label
+SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label, claim_generation
 FROM run_messages
 WHERE run_id = @run_id AND kind IN ('status', 'error')
 ORDER BY seq ASC;
@@ -3331,7 +4245,7 @@ WHERE r.id = @id AND r.user_id = @user_id AND r.kind <> 'judge';
 -- Column order matches the table (see ListRunMessagesAfter) so the row stays
 -- store.RunMessage. New columns must be APPENDED here AND in ListRunMessagesAfter,
 -- in the same order the ALTER TABLE adds them — see that query's note.
-SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label
+SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label, claim_generation
 FROM run_messages
 WHERE run_id = @run_id AND seq > @after_seq
 ORDER BY seq ASC
@@ -3913,12 +4827,17 @@ UPDATE runs SET checkpoint_tip = @checkpoint_tip, checkpoint_tip_at = now() WHER
 -- queued arm can surface a Codex-capability reason for a CODEX-INDICATING run (any of the three set)
 -- that no online worker advertises 'codex_harness_v1' — the non-bypassable Codex claim clause can
 -- never be satisfied. The resolver checks all three, mirroring the claim gate's fail-closed test.
+-- PRD #1391 M5 (owner-gated outbox reason): worker_id rides this read so the running-run stalled arm
+-- applies reasonOutboxQueued ONLY when the run's CURRENT owning worker is the same worker that
+-- reported the outbox depth. Without it a cross-tenant worker (or a stale runIndex entry left by a
+-- reclaim-during-outage) could flip a genuinely-stalled run to the reassuring "queued" reason.
+-- worker_id is NULL for an unclaimed run (ON DELETE SET NULL), so the arm requires it be non-null.
 SELECT id, user_id, status, auto_approve,
        started_at, last_activity_at, updated_at, status_since,
        health, health_reason, health_since, health_notified_at,
        budget_wall_seconds, budget_paused_seconds, budget_extension_seconds, interactive,
        repo_id, kind, required_capabilities, completion_contract_version,
-       harness, codex_material_revision, codex_secret_id
+       harness, codex_material_revision, codex_secret_id, worker_id
 FROM runs
 WHERE status IN ('queued', 'running', 'awaiting_approval')
   AND kind <> 'chat';
@@ -4491,6 +5410,13 @@ WITH ins AS (
     SELECT r.id, sqlc.narg('contract_revision'), @unmet::jsonb, sqlc.narg('head'), sqlc.narg('worktree_fingerprint')
     FROM runs r
     WHERE r.id = @run_id AND r.worker_id = @worker_id AND r.completion_contract_version IS NOT NULL
+      -- PRD #1247 M5: the per-query generation fence, the SAME nil-guarded shape as InsertRunMessage.
+      -- A CAPABILITY worker stamps claim_generation; a STALE attempt from an OLD flight (its claim
+      -- RELEASED by a held-state switch, or SUPERSEDED by a reclaim) inserts NOTHING here, so with the
+      -- UPDATE's EXISTS(ins) gate below it records no attempt (0 rows -> pgx.ErrNoRows -> the caller's
+      -- ErrCompletionStaleClaim). A legacy worker (NULL generation) records unconditionally, unchanged.
+      AND (sqlc.narg('claim_generation')::bigint IS NULL
+           OR (r.claim_generation = sqlc.narg('claim_generation')::bigint AND r.claim_released_at IS NULL))
     RETURNING run_completion_attempts.id
 ),
 pruned AS (
@@ -4522,6 +5448,12 @@ UPDATE runs SET
     updated_at = now()
 WHERE runs.id = @run_id AND runs.worker_id = @worker_id AND runs.completion_contract_version IS NOT NULL
   AND EXISTS (SELECT 1 FROM ins)
+  -- PRD #1247 M5: mirror the ins CTE's generation fence on the counter/summary UPDATE too, so a
+  -- fenced-out attempt updates NOTHING as well as inserting nothing (0 rows -> pgx.ErrNoRows ->
+  -- ErrCompletionStaleClaim). Belt-and-suspenders beside EXISTS(ins): the ins fence already stops
+  -- the insert, but pinning the same predicate here keeps the whole statement stale-safe.
+  AND (sqlc.narg('claim_generation')::bigint IS NULL
+       OR (runs.claim_generation = sqlc.narg('claim_generation')::bigint AND runs.claim_released_at IS NULL))
 RETURNING runs.completion_attempts;
 
 -- name: UpsertCompletionPermit :one

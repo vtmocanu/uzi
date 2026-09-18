@@ -890,6 +890,13 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// (foreign run → 404) and POOL_WAIT-ONLY (non-held → 409); it only flips the
 				// hold to queued, so no token spend and no forge write.
 				r.Post("/{id}/resume-now", h.ResumeRunNow)
+				// Per-run Anthropic credential switch (PRD #1247 M4, D4/D12): `uzi run
+				// set-token` re-points which token a queued or parked run spends, promoting a
+				// parked run to queued at once. RequireUser so the uzc_ CLI Bearer reaches it —
+				// NOT the cookie+CSRF RequireAuth group; a router-level auth test pins the
+				// mount. Owner-scoped in the service (foreign run → 404); a held/claimed/terminal
+				// run is a 409 (the held-state switch protocol is M5). D6 warnings ride the 200.
+				r.Post("/{id}/credential", h.SetRunCredential)
 				// Owner completion decision (PRD #1226 M5, D7 + #1227 M1): continue, partial
 				// (reduce scope) or accept (accept unmet criteria) a completion-blocked run,
 				// valid in BOTH the live awaiting_input completion-question window and the paused
@@ -1051,6 +1058,13 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// skipped awaiting_followup park report used to give. Reuses
 		// GetRunOwnedByWorker; no new query.
 		r.Get("/runs/{id}/ownership", h.WorkerRunOwnership)
+
+		// Message-gaps read (PRD #1391 Run B M3c): worker-authenticated, run-scoped, READ ONLY.
+		// Returns the MISSING message-seq ranges in [1..through] as keyset-paginated {first,last}
+		// pairs so a fence-blocked worker can fill the holes before re-reporting terminal. The gaps
+		// query atomically fences on the exact worker + unreleased claim generation — a stale worker
+		// or released/superseded generation gets 404, never a view of a newer flight's gaps.
+		r.Get("/runs/{id}/message-gaps", h.WorkerRunMessageGaps)
 
 		// Orphan-classification read (issue #1319): worker-authenticated, READ ONLY.
 		// {id} = the CLAIMANT run the worker holds (authz anchor + current repo);

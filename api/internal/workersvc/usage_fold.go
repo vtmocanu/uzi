@@ -9,11 +9,13 @@ import (
 	"log/slog"
 	"math"
 	"math/big"
+	"slices"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -33,8 +35,36 @@ import (
 // arm of the switch; the invariant they all serve is persistfail.go's ownership
 // tripwire.
 func (s *Service) AppendMessages(ctx context.Context, wkr store.Worker, runID uuid.UUID, msgs []IncomingMessage) error {
-	obs, err := s.appendMessages(ctx, wkr, runID, msgs)
+	return s.appendAndRecord(ctx, wkr, runID, msgs, nil)
+}
+
+// AppendMessagesForClaim is AppendMessages with the caller's claim generation threaded to the
+// FENCE (PRD #1247 M5, D3). A CAPABILITY worker stamps its claim_generation on every message
+// batch; the fenced InsertRunMessage / UpdateRunLastSeq then persist ONLY while the run is at
+// that generation with an unreleased claim, so a message batch from a RELEASED or RECLAIMED old
+// flight persists nothing and cannot advance last_seq. A nil generation is the LEGACY path
+// (identical to AppendMessages), unfenced — back-compat by construction. The handler
+// (WorkerRunMessages) passes the decoded batch generation here; every test caller keeps using
+// AppendMessages (nil), so the fence adds no test churn.
+func (s *Service) AppendMessagesForClaim(ctx context.Context, wkr store.Worker, runID uuid.UUID, msgs []IncomingMessage, claimGen *int64) error {
+	return s.appendAndRecord(ctx, wkr, runID, msgs, claimGen)
+}
+
+func (s *Service) appendAndRecord(ctx context.Context, wkr store.Worker, runID uuid.UUID, msgs []IncomingMessage, claimGen *int64) error {
+	obs, err := s.appendMessages(ctx, wkr, runID, msgs, claimGen)
 	switch {
+	case errors.Is(err, ErrMissingClaimGeneration):
+		// PRD #1247 M5a-1 rework (auditor fail-open finding): a CAPABILITY worker omitted its
+		// claim_generation on a message batch — a PROTOCOL violation refused before any insert,
+		// NOT a persistence failure. Do NOT record a streak against the run for the worker's
+		// missing field (recording here would build a spurious kill streak). Placed FIRST so it
+		// skips the recorder regardless of the run's status.
+	case errors.Is(err, ErrStaleClaim):
+		// PRD #1247 M5 (BLOCKING-4 rework): the batch fenced out — the run was released or
+		// reclaimed under this OLD flight, so it persisted nothing. Like the missing-generation
+		// case this is NOT a persistence failure of the run; recording a streak here would punish
+		// a run for a superseded flight's late delivery. Skip the recorder; the handler answers
+		// the worker a stale_claim 409 so the old flight STOPS.
 	case !obs.resolved:
 		// Ownership never resolved (ErrRunNotOwned, or the lookup itself failed), so
 		// this run is not this worker's to vouch for. Recording here is what would let
@@ -61,7 +91,7 @@ func (s *Service) AppendMessages(ctx context.Context, wkr store.Worker, runID uu
 		//     reach 20, so which side of the threshold an OOM lands on is close to a
 		//     coin flip; half that population landed here.
 		//   - Every OTHER path that resets status without a hook, including Register's
-		//     RequeueWorkerRuns, which returns no ids and so can never have one.
+		//     requeue path, which wires no eviction hook and so can never have one.
 		//
 		// Sweep's two requeue-site evictions and the evaluator's are now belt and
 		// braces rather than the mechanism, which is the safer arrangement: this arm
@@ -230,12 +260,33 @@ func (s *Service) NoteOversizeBatch(ctx context.Context, wkr store.Worker, runID
 // A broader wrap was considered and rejected: with the above holding it catches
 // nothing extra, while reintroducing exactly the misattribution this narrowness
 // exists to prevent.
-func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uuid.UUID, msgs []IncomingMessage) (appendObservation, error) {
+func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uuid.UUID, msgs []IncomingMessage, claimGen *int64) (appendObservation, error) {
 	run, err := s.runOwnedByWorker(ctx, runID, wkr)
 	if err != nil {
 		return appendObservation{}, err
 	}
 	obs := appendObservation{resolved: true, status: run.Status, lastSeq: run.LastSeq}
+	// PRD #1247 M5 rework (chat fence completeness): a CHAT run has no claim-generation contract,
+	// so NORMALIZE the generation to nil for chat and use effectiveClaimGen for EVERY fenced query
+	// below (the omission check, InsertRunMessage, the generation_live stale check, and
+	// UpdateRunLastSeq). This makes a chat batch legacy even if a worker SUPPLIES a (mismatched)
+	// generation: the server must never fence chat regardless of what any client version sends. The
+	// client also guards generation > 0 on chat, but the server holds the property independently (a
+	// guardrail layer is not weakened on the theory another layer covers it).
+	effectiveClaimGen := claimGen
+	if run.Kind == runkind.Chat {
+		effectiveClaimGen = nil
+	}
+	// PRD #1247 M5a-1 rework (auditor fail-open finding): FAIL CLOSED for a CAPABILITY worker. The
+	// per-query InsertRunMessage/UpdateRunLastSeq fence engages only when the batch STAMPS a
+	// generation, so a worker advertising credential_switch_v1 could bypass it by OMITTING it and
+	// persist unfenced. A capability worker MUST stamp its claim_generation, so an omission is
+	// refused; a LEGACY worker (no capability) keeps inserting unfenced (nil generation), unchanged.
+	// Checked AFTER ownership resolves so ErrRunNotOwned (a foreign worker) still takes precedence.
+	// A CHAT run is exempt via effectiveClaimGen (nil) plus the explicit run.Kind guard.
+	if effectiveClaimGen == nil && run.Kind != runkind.Chat && slices.Contains(wkr.ProtocolCapabilities, capability.CredentialSwitchV1) {
+		return obs, ErrMissingClaimGeneration
+	}
 	// Validate the whole batch before persisting any of it: a single invalid
 	// message rejects the batch with nothing written, so a [valid, valid, invalid]
 	// batch never leaves the first two half-persisted.
@@ -327,7 +378,7 @@ func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uu
 	var insertErr error
 	inserted := make([]IncomingMessage, 0, len(msgs))
 	for _, m := range msgs {
-		rows, err := s.q.InsertRunMessage(ctx, store.InsertRunMessageParams{
+		res, err := s.q.InsertRunMessage(ctx, store.InsertRunMessageParams{
 			RunID:         runID,
 			Seq:           m.Seq,
 			Kind:          m.Kind,
@@ -335,6 +386,10 @@ func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uu
 			AgentInstance: pgconv.TextOrNull(m.AgentInstance),
 			AgentLabel:    pgconv.TextOrNull(m.AgentLabel),
 			Payload:       []byte(m.Payload),
+			// PRD #1247 M5 (D3): the per-query generation fence. nil (legacy worker) inserts
+			// unconditionally; a present generation gates the insert on the run still being at
+			// that generation with an unreleased claim.
+			ClaimGeneration: pgconv.Int8Ptr(effectiveClaimGen),
 		})
 		if err != nil {
 			// The ONLY classified error on this path. See the tripwire on
@@ -356,12 +411,23 @@ func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uu
 			}
 			break
 		}
+		// BLOCKING-4 rework: distinguish a benign duplicate from a GENERATION-FENCE REJECTION. A
+		// capability worker's batch that fenced out (generation_live == false) persisted NOTHING —
+		// the run was released or reclaimed under this old flight — so return "stale" BEFORE
+		// advancing the high-water mark and BEFORE foldRunUsage, which would otherwise mutate
+		// run_usage with an OLD generation's frames after release/reclaim. Both the fence rejection
+		// and a benign duplicate used to look like rows == 0; only the former is stale. A legacy
+		// (nil generation) caller always sees generation_live == true, so this never fires for it.
+		if effectiveClaimGen != nil && !res.GenerationLive.Bool {
+			return obs, ErrStaleClaim
+		}
 		if m.Seq > maxStored {
 			maxStored = m.Seq
 		}
-		// rows == 0 means a duplicate (run_id, seq) — a worker re-delivery. Only
-		// broadcast genuinely new messages so a retry never double-emits over WS.
-		if rows > 0 {
+		// A live-generation insert that added no row is a duplicate (run_id, seq) — a worker
+		// re-delivery, already stored. Only broadcast genuinely new messages so a retry never
+		// double-emits over WS.
+		if res.Inserted {
 			inserted = append(inserted, m)
 		}
 	}
@@ -395,7 +461,10 @@ func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uu
 	// after it, which is why it is fixed here rather than left to the transaction
 	// Phase 2 will consider.
 	if maxStored > run.LastSeq {
-		if _, err := s.q.UpdateRunLastSeq(ctx, store.UpdateRunLastSeqParams{ID: runID, Seq: maxStored}); err != nil {
+		// Fenced on the same predicate (PRD #1247 M5, D3): a released/reclaimed old flight must
+		// not advance last_seq, which would strand the reclaiming flight's re-emitted seqs behind
+		// a stale high-water mark. nil generation advances unconditionally (legacy).
+		if _, err := s.q.UpdateRunLastSeq(ctx, store.UpdateRunLastSeqParams{ID: runID, Seq: maxStored, ClaimGeneration: pgconv.Int8Ptr(effectiveClaimGen)}); err != nil {
 			if insertErr != nil {
 				return obs, insertErr // the insert failure is the more informative of the two
 			}
@@ -404,6 +473,17 @@ func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uu
 	}
 	if insertErr != nil {
 		return obs, insertErr
+	}
+	// PRD #1247 M9 (D7): stamp the per-call fenced generation onto every frame before folding, so
+	// each leg is attributed to the epoch it was produced under (the join
+	// run_usage.claim_generation -> run_credential_epochs). All frames in ONE appendMessages call
+	// share the ONE fenced generation this batch stamped — uniform per-call assignment is correct
+	// (the fence already guaranteed they belong to this claim, or the batch would have been
+	// rejected above). effectiveClaimGen is nil for a legacy worker or a chat run, folding NULL
+	// provenance exactly as before. The stamp is on the fold input only; InsertRunMessage above
+	// persisted the SAME generation onto each row's own column independently.
+	for i := range msgs {
+		msgs[i].ClaimGeneration = effectiveClaimGen
 	}
 	// Fold every DELIVERED result frame's usage into run_usage (PRD #40 Decision 2)
 	// — over `msgs`, NOT `inserted`: a seq-deduped re-delivery (crash retry) must
@@ -547,6 +627,12 @@ func foldUsageFrames(ctx context.Context, q usageFoldQuerier, run store.Run, fra
 				CostUsd:             costUSD,
 				Harness:             run.Harness,
 				CostStatus:          costStatus,
+				// PRD #1247 M9 (D7): attribute this leg to the epoch the FRAME was produced under
+				// (the incremental path stamps effectiveClaimGen onto every frame; the refold reads
+				// each frame's persisted run_messages.claim_generation). COALESCE in UpsertRunUsage
+				// keeps an established non-null provenance, so a straggler re-delivery never
+				// re-attributes an already-attributed leg. nil ⇒ NULL provenance (legacy frame).
+				ClaimGeneration: pgconv.Int8Ptr(m.ClaimGeneration),
 			}); err != nil {
 				return fmt.Errorf("fold run usage (run %s, model %s): %w", run.ID, model, err)
 			}

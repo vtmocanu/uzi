@@ -223,7 +223,7 @@ func TestSetRunAutopilotPlanLiveDB(t *testing.T) {
 		// spread bypass + affinity clauses in ClaimRun make it claimable by this worker).
 		exec(`UPDATE runs SET status = 'queued', started_at = NULL, claimed_at = NULL WHERE id = $1`, id)
 
-		payload, err := svc.Claim(ctx, wkr)
+		payload, err := svc.Claim(ctx, wkr, nil)
 		if err != nil {
 			t.Fatalf("svc.Claim: %v", err)
 		}

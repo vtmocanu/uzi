@@ -1,8 +1,10 @@
 import os from "node:os";
 import fs from "node:fs";
+import path from "node:path";
 import type { LogLevel } from "./log.js";
 import type { DockerWiring } from "./docker-wiring.js";
 import type { CodexRuntimeProbeResult } from "./codex/codex-runtime-probe.js";
+import { TRANSIENT_TRIP_MS } from "./batcher.js";
 import { errMessage } from "./util.js";
 
 // Worker configuration, parsed from env (PRD #4 §Configuration).
@@ -134,6 +136,77 @@ export interface Config {
    */
   dockerReadyIntervalMs: number;
   dockerReadyTimeoutMs: number;
+  /**
+   * PRD #1391 M1: the worker-owned authenticated message outbox tree, rooted at
+   * `<dataDir>/outbox`. When the api is unreachable the batcher spills run
+   * messages here as fsync'd immutable segments and a per-worker drainer replays
+   * them in `seq` order once the api returns. Distinct from the run HOME (deleted
+   * at terminal cleanup) and from the recovery journal; a sibling of both under
+   * `/data`.
+   */
+  outboxDataDir: string;
+  /**
+   * Per-run byte quota for the outbox (WORKER_OUTBOX_RUN_MAX_BYTES, default
+   * 64 MiB). Before a segment is written, if adding it would exceed this the
+   * oldest segment of the run is replaced by one compact range record, so the
+   * run's on-disk footprint stays bounded (PRD #1391 D2).
+   */
+  outboxRunMaxBytes: number;
+  /**
+   * Worker-total byte quota across every run's outbox (WORKER_OUTBOX_MAX_BYTES,
+   * default 512 MiB). When it binds, the globally-oldest segment across all runs
+   * is evicted to a range record (PRD #1391 D2).
+   */
+  outboxMaxBytes: number;
+  /**
+   * How long a fully-retired (empty) run's outbox subtree is kept before the
+   * retention sweep age-deletes it (WORKER_OUTBOX_RETENTION, default 7d). Only
+   * runs whose records are all retired are eligible; a run with undrained
+   * segments is never removed by retention (PRD #1391 M1).
+   */
+  outboxRetentionMs: number;
+  /**
+   * PRD #1391 M2: how long an unbroken run of TRANSIENT message-flush failures may
+   * last before the batcher stops flushing to the network and starts spilling to the
+   * outbox (WORKER_TRANSIENT_TRIP_MS, default = batcher's TRANSIENT_TRIP_MS, 10 min).
+   * Overridable so the e2e outage phase can lower it and not wait ten real minutes.
+   */
+  transientTripMs: number;
+  /**
+   * PRD #1391 M2: the hard cap on the batcher's in-memory buffer while it is spilled
+   * to the outbox (WORKER_OUTBOX_SPILL_BUFFER_BYTES, default 2 MiB). A message that
+   * would exceed it is dropped and folded into a pending range record the next spill
+   * flush writes durably, so a spilled batcher can never grow memory without bound.
+   */
+  outboxSpillBufferBytes: number;
+  /**
+   * PRD #1391 M3 (Run B, D-A1 / D2): the hard serialised cap a terminal-report body is
+   * canonicalised to before it is FIRST sent and journalled alike (WORKER_OUTBOX_TERMINAL_MAX_BYTES,
+   * default 1.25 MiB — above the 1 MiB preserved patch a journal can carry, `service.go:4673-4679`).
+   * An optional forge-published field over this cap is dropped WHOLE (never byte-cut past the api's
+   * scrubber, which would leak a credential prefix); the preserved patch is rune-safe truncated with
+   * a visible marker; required fields (status, generation, fence, branch, head, MR coordinates,
+   * permit fields, failure class) are never touched. The canonical body is what both the send and
+   * the journal serialize, so the first send and any replay are byte-identical.
+   */
+  outboxTerminalMaxBytes: number;
+  /**
+   * PRD #1391 M3 (Run B, D2): how many hard-max terminal journals the physical `.reserve` is sized to
+   * admit on a full volume (WORKER_OUTBOX_RESERVE_TERMINALS, default 4). The reserve size is derived
+   * from ONE source — this count times {@link outboxTerminalMaxBytes} plus a per-record overhead
+   * (about 5.2 MiB at the defaults) — and resizes Run A's one-range-record `.reserve`. Past the
+   * reserve a terminal outcome is sent unjournaled as today, logged and counted, never silently
+   * dropped (the `reserve_exhausted` fallback).
+   */
+  outboxReserveTerminals: number;
+  /**
+   * PRD #1391 M3 (Run B): the upper bound on how many seqs a worker will page-fill with per-seq
+   * "unrecoverable gap" tombstones when the api refuses a terminal transition with `messages_pending`
+   * (WORKER_GAP_FILL_MAX, default 10,000). Past this the journal is marked `blocked` with reason
+   * `gap_unrecoverable` (D13) rather than spinning, since one absurd `messages_through_seq` could
+   * otherwise imply billions of holes (the schema has no positivity/contiguity CHECK, fact 4).
+   */
+  gapFillMax: number;
   logLevel: LogLevel;
 }
 
@@ -143,14 +216,17 @@ export interface Config {
  *  container. Advisory only, never enforced. */
 export const MAX_CONCURRENT_RUNS_SOFT_CEILING = 8;
 
-const DURATION_RE = /^(\d+)\s*(ms|s|m|h)?$/;
+const DURATION_RE = /^(\d+)\s*(ms|s|m|h|d)?$/;
 
-/** Parse "15s" / "500ms" / "2h" / "15000" into milliseconds. */
+/** Parse "15s" / "500ms" / "2h" / "7d" / "15000" into milliseconds. The `d`
+ *  (days) unit is carried for retention knobs that are naturally expressed in
+ *  days (WORKER_OUTBOX_RETENTION); the rest match the server-side duration set. */
 function parseDuration(value: string): number {
   const m = DURATION_RE.exec(value.trim());
   if (!m) throw new Error(`invalid duration: ${JSON.stringify(value)}`);
   const n = Number(m[1]);
   switch (m[2]) {
+    case "d": return n * 86_400_000;
     case "h": return n * 3_600_000;
     case "m": return n * 60_000;
     case "s": return n * 1_000;
@@ -249,10 +325,11 @@ function resolveWorkerToken(env: NodeJS.ProcessEnv): string {
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const apiUrl = required(env, "UZI_API_URL").replace(/\/+$/, "");
   const rawLevel = env.UZI_LOG_LEVEL?.trim().toLowerCase() ?? "info";
+  const dataDir = env.UZI_DATA_DIR?.trim() || "/data";
   return {
     apiUrl,
     workerToken: resolveWorkerToken(env),
-    dataDir: env.UZI_DATA_DIR?.trim() || "/data",
+    dataDir,
     workerName: env.UZI_WORKER_NAME?.trim() || os.hostname(),
     workerTemplate: env.UZI_WORKER_TEMPLATE?.trim() || "base",
     // Build-stamped by CI (`publish:agent` passes the release tag as the
@@ -311,6 +388,24 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     // Readiness wait for an EXPECTED docker sidecar (M2 follow-up). ~1s poll, ~30s budget.
     dockerReadyIntervalMs: duration(env, "UZI_DOCKER_READY_INTERVAL", "1s"),
     dockerReadyTimeoutMs: duration(env, "UZI_DOCKER_READY_TIMEOUT", "30s"),
+    // Worker outbox (PRD #1391 M1). The tree is a fixed sibling of the recovery
+    // journal under /data; the two byte quotas and the retention window are the
+    // operator-tunable bounds. positiveInt keeps the byte knobs plain positive
+    // integers; the retention window is a duration string (the `d` unit above).
+    outboxDataDir: path.join(dataDir, "outbox"),
+    outboxRunMaxBytes: positiveInt(env, "WORKER_OUTBOX_RUN_MAX_BYTES", 64 * 1024 * 1024),
+    outboxMaxBytes: positiveInt(env, "WORKER_OUTBOX_MAX_BYTES", 512 * 1024 * 1024),
+    outboxRetentionMs: duration(env, "WORKER_OUTBOX_RETENTION", "7d"),
+    // PRD #1391 M2. The trip window is a duration (bare number = ms), defaulting to
+    // the batcher's baked TRANSIENT_TRIP_MS so the two never drift; the spill buffer
+    // cap is a plain positive byte count.
+    transientTripMs: duration(env, "WORKER_TRANSIENT_TRIP_MS", String(TRANSIENT_TRIP_MS)),
+    outboxSpillBufferBytes: positiveInt(env, "WORKER_OUTBOX_SPILL_BUFFER_BYTES", 2 * 1024 * 1024),
+    // PRD #1391 M3 (Run B). The terminal cap is a plain positive byte count (1.25 MiB rounded to a
+    // whole byte); the reserve-terminal count and the gap-fill bound are plain positive integers.
+    outboxTerminalMaxBytes: positiveInt(env, "WORKER_OUTBOX_TERMINAL_MAX_BYTES", Math.round(1.25 * 1024 * 1024)),
+    outboxReserveTerminals: positiveInt(env, "WORKER_OUTBOX_RESERVE_TERMINALS", 4),
+    gapFillMax: positiveInt(env, "WORKER_GAP_FILL_MAX", 10000),
     logLevel: isLogLevel(rawLevel) ? rawLevel : "info",
   };
 }
