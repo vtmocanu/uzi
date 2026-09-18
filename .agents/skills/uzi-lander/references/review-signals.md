@@ -35,7 +35,7 @@ Greptile puts in the PR body. One credit per review. The check-run appears ~12 s
 |---|---|---|
 | Check-run `Greptile Review`, app `greptile-apps` | `repos/O/R/commits/<head>/check-runs` | **The per-head signal.** `in_progress` while reviewing; `completed` with `output.summary` = `Greptile has reviewed the Pull Request.\n\nN files reviewed, M comments added`. Conclusion is `success` even with a P1 finding: read M. Absent = not triggered on this head. Durations seen: 35 files 2.5 min, 107 files 6 min. |
 | Review object | `pulls/N/reviews` | Only when M > 0: a `greptile-apps[bot]` COMMENTED review, empty body, `commit_id` = reviewed head. **Zero findings posts no review at all**, so the reviews endpoint reads clean-as-absent. |
-| Inline comments | `pulls/N/comments` | Findings carry a `<img alt="P1">` / `P2` badge; live = `line != null`. |
+| Inline comments | `pulls/N/comments` | Findings carry a `<img alt="P1">` / `P2` badge. Scope them to the latest current-head review id; when the current-head check explicitly reports `0 comments added`, older still-anchored comments are not live. |
 | PR body | `pulls/N` `.body` | Greptile may rewrite the description between `<!-- greptile_comment -->` markers: `Confidence Score: N/5`, a summary, a mermaid diagram, and `<sub>Reviews (K) · Last reviewed commit: [...](…/commit/<full-sha>)</sub>`. Seen on 2 of 3 PRs, so a **secondary** confirmation only. The edit bumps the PR `updated_at`. |
 | Issue comments | | None from Greptile. |
 

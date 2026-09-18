@@ -866,6 +866,7 @@ tasks:
       - ./.agents/skills/uzi-lander/scripts/cr-rate-limit.test.sh
       - ./.agents/skills/uzi-lander/scripts/land-prep.test.sh
       - ./.agents/skills/uzi-lander/scripts/watch-pr.test.sh
+      - ./.agents/skills/uzi-lander/scripts/pr-findings.test.sh
 
   test:release-scripts:
     desc: offline fixture test of the release-train scripts (builds a temp git repo; PRD 1265)

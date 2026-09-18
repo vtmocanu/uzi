@@ -179,7 +179,7 @@ while [ "$i" -lt "$MAX" ]; do
   # does NOT accept jq's --arg (so the head SHA is passed to standalone jq), and `gh api
   # --paginate` emits one array PER PAGE (so pages are slurped with `-s`/`.[][]`).
   cr_reviewed=0; cr_unconfirmed=0
-  cr_a=""
+  cr_a=""; gr_review_id=""
   if rev_raw=$(gh api --paginate "repos/$REPO/pulls/$PR/reviews" 2>/dev/null) && pages_are_arrays "$rev_raw"; then
     # shellcheck disable=SC2016  # $h is a jq var (--arg), must stay single-quoted
     rev_on_head=$(printf '%s' "$rev_raw" | jq -rs --arg h "$head" \
@@ -195,6 +195,10 @@ while [ "$i" -lt "$MAX" ]; do
     # newest verdict. Empty when CodeRabbit has posted no review object yet.
     cr_a=$(printf '%s' "$rev_raw" | jq -rs \
       '[.[][]|select(.user.login=="coderabbitai[bot]")]|last|.commit_id // empty' 2>/dev/null) || unknown=1
+    # Greptile posts a review object only when it adds comments. Keep its current-head review
+    # id so old still-anchored comments from prior reviews cannot contaminate this pass.
+    gr_review_id=$(printf '%s' "$rev_raw" | jq -rs --arg h "$head" \
+      '[.[][]|select(.user.login=="greptile-apps[bot]" and .commit_id==$h)]|last|.id // empty' 2>/dev/null) || unknown=1
   else
     unknown=1
   fi
@@ -274,13 +278,16 @@ while [ "$i" -lt "$MAX" ]; do
   cr_live=0; gr_live=0
   if pull_c=$(gh api --paginate "repos/$REPO/pulls/$PR/comments" 2>/dev/null) && pages_are_arrays "$pull_c"; then
     cr_live=$(printf '%s' "$pull_c" | jq -rs '[.[][]|select(.user.login=="coderabbitai[bot]" and .line!=null and ((.body|contains("Addressed in commit"))|not))]|length' 2>/dev/null) || unknown=1
-    gr_live=$(printf '%s' "$pull_c" | jq -rs '[.[][]|select(.user.login=="greptile-apps[bot]" and .line!=null)]|length' 2>/dev/null) || unknown=1
+    if [ -n "$gr_review_id" ]; then
+      gr_live=$(printf '%s' "$pull_c" | jq -rs --argjson rid "$gr_review_id" \
+        '[.[][]|select(.user.login=="greptile-apps[bot]" and .pull_request_review_id==$rid and .line!=null)]|length' 2>/dev/null) || unknown=1
+    else
+      gr_live=$(printf '%s' "$pull_c" | jq -rs \
+        '[.[][]|select(.user.login=="greptile-apps[bot]" and .line!=null)]|length' 2>/dev/null) || unknown=1
+    fi
   else
     unknown=1
   fi
-  # An unconfirmed CodeRabbit review (grouped findings in its body) counts as live: it
-  # blocks a ready and surfaces as exit 3 for a human to read the body.
-  live=$((cr_live + gr_live + cr_unconfirmed))
 
   # Greptile: its `Greptile Review` check-run on the head (app slug greptile-apps). Absent =
   # not triggered on this head (Greptile is on-demand here: greptile.json autoReview []).
@@ -298,9 +305,24 @@ while [ "$i" -lt "$MAX" ]; do
   else
     unknown=1
   fi
-  gr_reviewed=0
-  if [ "$gr_state" = "completed" ] && [ "$gr_concl" = "success" ] && [ -n "$gr_summary" ]; then gr_reviewed=1; fi
+  gr_reviewed=0; gr_added=""
+  if [ "$gr_state" = "completed" ] && [ "$gr_concl" = "success" ] && [ -n "$gr_summary" ]; then
+    gr_reviewed=1
+    gr_added=$(printf '%s' "$gr_summary" | grep -oE '[0-9]+ comments added' | grep -oE '^[0-9]+' || true)
+    if [ "$gr_added" = "0" ]; then
+      # Greptile posts no review object for a clean pass; the explicit current-head zero is
+      # authoritative and every still-anchored Greptile comment belongs to an older pass.
+      gr_live=0
+    elif [ -z "$gr_review_id" ]; then
+      # A summary says comments were added but no current-head review id can scope them.
+      # Fail closed rather than mixing old and new comments into a false finding set.
+      unknown=1
+    fi
+  fi
   [ "$gr_state" = "completed" ] && [ "$gr_reviewed" -eq 0 ] && gr_state="completed(${gr_concl:-no-conclusion}, no summary)"
+  # An unconfirmed CodeRabbit review counts as live; Greptile is now scoped to its latest
+  # current-head review (or cleared by an explicit clean zero-comment summary).
+  live=$((cr_live + gr_live + cr_unconfirmed))
 
   # Signal (d): "equivalent head" — a logic-free merge commit CodeRabbit did not re-review
   # (issue #819). When the head is a merge that only brings in the PR base branch plus
@@ -373,7 +395,11 @@ while [ "$i" -lt "$MAX" ]; do
   if [ "$fail" -gt 0 ]; then echo "RESULT=red"; exit 1; fi
   if [ "$mrw_active" -gt 0 ]; then echo "RESULT=mr_rework_active"; exit 4; fi
   if [ "$pend" -eq 0 ] && [ "$cancel" -eq 0 ]; then
-    if [ "$reviewed_head" -eq 1 ]; then
+    # A selected or auto-started review can still append findings. Let every in-flight bot
+    # settle before declaring ready or surfacing a partial finding set for local edits.
+    if [ "$cr_pending" -eq 1 ] || [ "$gr_state" = "in_progress" ] || [ "$gr_state" = "queued" ]; then
+      : # a review is in flight; keep polling
+    elif [ "$reviewed_head" -eq 1 ]; then
       # Revalidate the head right before deciding (TOCTOU): a push during this iteration would
       # otherwise let an exit 0 describe an unreviewed head. Proceed to ready ONLY when the
       # re-read succeeds AND matches; an empty (failed) re-read is unknown, not a match — defer.
@@ -384,13 +410,9 @@ while [ "$i" -lt "$MAX" ]; do
       fi
       if [ "$live" -eq 0 ]; then echo "RESULT=ready"; exit 0; fi
       echo "RESULT=findings live=$live cr=$cr_live gr=$gr_live cr_unconfirmed=$cr_unconfirmed"; exit 3
-    fi
-    # CI settled, no review on this head. Is one coming, or must the caller act?
-    if [ "$cr_full_required" -eq 1 ] && [ "$REVIEWER" != "greptile" ] && [ "$REVIEWER" != "none" ]; then
+    elif [ "$cr_full_required" -eq 1 ] && [ "$REVIEWER" != "greptile" ] && [ "$REVIEWER" != "none" ]; then
       echo "RESULT=cr_full_review_required command='@coderabbitai full review'"
       exit 7
-    elif [ "$cr_pending" -eq 1 ] || [ "$gr_state" = "in_progress" ] || [ "$gr_state" = "queued" ]; then
-      : # a review is in flight; keep polling
     elif [ "$cr_limited" -eq 1 ] && [ "$REVIEWER" != "greptile" ] && [ "$gr_reviewed" -eq 0 ]; then
       echo "RESULT=cr_rate_limited${cr_reset_min:+ CR_RESET_MIN=$cr_reset_min}"
       [ -n "$cr_reset_min" ] && echo "CR_RESET_MIN=$cr_reset_min"
