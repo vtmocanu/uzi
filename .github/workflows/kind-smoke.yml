@@ -88,9 +88,9 @@ jobs:
           docker build -t uzi-api:kind ./api
           docker build -t uzi-web:kind -f web/Dockerfile .
 
-      # kind-action and node_image are one compatibility pair: action v1.15.0
-      # bundles kind v0.33.0 and kubectl v1.37.0 for Kubernetes v1.37. Both are
-      # exact, Renovate-tracked pins; this live install is the compatibility gate.
+      # kind-action and node_image are one compatibility pair. The action downloads its
+      # default kind/kubectl versions, and that kind must understand the node's kubeadm API.
+      # Exact, Renovate-tracked pins plus this live install keep compatibility gated.
       - name: Create KinD cluster
         uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2  # v1.15.0
         with:

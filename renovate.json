@@ -73,9 +73,10 @@
       "groupName": "shellcheck"
     },
     {
-      "description": "KinD toolchain: group helm/kind-action and kindest/node when both update because the action's bundled kind must understand the node image's kubeadm API. KinD smoke remains the gate for one-sided releases.",
+      "description": "KinD toolchain: group helm/kind-action and kindest/node because the action downloads a default kind that must understand the node image's kubeadm API. KinD smoke remains the gate for one-sided releases.",
       "matchPackageNames": ["helm/kind-action", "kindest/node"],
-      "groupName": "KinD toolchain"
+      "groupName": "KinD toolchain",
+      "separateMajorMinor": false
     }
   ]
 }
