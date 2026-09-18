@@ -863,6 +863,7 @@ tasks:
   test:uzi-lander:
     desc: hermetic tests of uzi-lander review routing, quota timing and stale-base push guards
     cmds:
+      - ./.agents/skills/uzi-lander/scripts/lib/review-threads.test.sh
       - ./.agents/skills/uzi-lander/scripts/cr-rate-limit.test.sh
       - ./.agents/skills/uzi-lander/scripts/land-prep.test.sh
       - ./.agents/skills/uzi-lander/scripts/watch-pr.test.sh

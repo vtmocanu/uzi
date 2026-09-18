@@ -267,8 +267,8 @@ a user reply that arrives first wins.
 - `scripts/land-prep.sh` rebase / renumber / gate / lease push; `scripts/merge.sh` the
   guarded admin merge; `scripts/watch-run-ci.sh` job-level CI for a run, a branch, or a
   merge SHA; `scripts/watch-prs-ci.sh` CI-only for a batch of PRs (shared
-  `scripts/lib/pr-checks-classify.sh`). The sibling `*.test.sh` scripts are the hermetic
-  regressions, wired through `task test:uzi-lander` and `gate:repo`.
+  `scripts/lib/pr-checks-classify.sh`). The sibling and `lib/*.test.sh` scripts are the
+  hermetic regressions, wired through `task test:uzi-lander` and `gate:repo`.
 - `references/review-signals.md` every pollable surface per bot; `references/coderabbit-triage.md`
   verifying and deciding findings; `references/mr-rework.md` coordinating with uzi's own
   rework; `references/merge-mechanics.md` ruleset, red `main`, post-merge CI.
