@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Regression test for backup-runs.sh's bundle decision.
+# Regression tests for backup-runs.sh's recovery-source and publication decisions.
 #
 # The bug (observed on run #1349, 2026-09-14): when a run has committed nothing
 # beyond public main (its work is still uncommitted), `git bundle create BR --not
@@ -12,6 +12,9 @@
 # PATH and a local fake runner clone (UZI_RUNNER_BASE), asserting:
 #   - uncommitted-only work  -> .tgz has NO .bundle member, log says PART
 #   - one committed commit   -> .tgz HAS a .bundle member,  log says OK
+#   - missing live clone     -> durable runner ref becomes a BARE bundle
+#   - missing clone + ref    -> nonzero, last recoverable `latest` is preserved
+#   - retention              -> only old timestamp-shaped directories are pruned
 # Run: bash backup-runs.test.sh   (exit 0 = pass)
 set -u
 
@@ -36,6 +39,11 @@ echo base > "$FORGE/f.txt"
 git_q "$FORGE" add f.txt
 git_q "$FORGE" commit -m base
 MAIN="$(git -C "$FORGE" rev-parse HEAD)"
+REPOS="$WORK/repos"
+BARE="$REPOS/testrepo.git"
+mkdir -p "$REPOS"
+git clone -q --bare "$FORGE" "$BARE"
+git --git-dir="$BARE" update-ref refs/remotes/origin/main "$MAIN"
 
 # --- stubs ----------------------------------------------------------------------
 # kubectl stub: answers the three calls backup-runs.sh makes. The capture exec is
@@ -60,8 +68,9 @@ case " \${args[*]} " in
 esac
 # exec ...: distinguish the REALMAIN git read from the capture sh -c.
 if [ "\${cmd[0]:-}" = git ]; then
-  # rev-parse origin/main from the bare repo -> the true public main
-  echo "$MAIN"; exit 0
+  # Execute the real bare-repo probes. This covers the public-main read and the
+  # missing-clone fallback's show-ref lookup against the local fake worker bare.
+  exec "\${cmd[@]}"
 fi
 if [ "\${cmd[0]:-}" = sh ]; then
   # cmd = (sh -c <CAPTURE> _ <STEM> <REALMAIN> <RUNNER_BASE>); the host already
@@ -83,6 +92,7 @@ set -u
 if [ "\${1:-}" = run ] && [ "\${2:-}" = get ]; then
   case "\${3:-}" in
     *mrr*) printf '%s' '{"status":"running","issue_iid":null,"kind":"mr_rework","branch":null,"pipeline_ref":"agent/issue-9999","worker_id":"${WID:-w0rker}","mr_iid":7777,"mr_web_url":null,"health_reason":"ok","anthropic_secret_label":"tok","anthropic_bind_mode":"default","milestones":[],"milestones_completed":[]}' ;;
+    *noworker*) printf '%s' '{"status":"queued","issue_iid":4242,"kind":"issue","branch":null,"pipeline_ref":null,"worker_id":null,"mr_web_url":null,"health_reason":"ok","anthropic_secret_label":"tok","anthropic_bind_mode":"default","milestones":[],"milestones_completed":[]}' ;;
     *)     printf '%s' '{"status":"running","issue_iid":4242,"kind":"issue","branch":null,"pipeline_ref":null,"worker_id":"${WID:-w0rker}","mr_web_url":null,"health_reason":"ok","anthropic_secret_label":"tok","anthropic_bind_mode":"default","milestones":[],"milestones_completed":[]}' ;;
   esac
   exit 0
@@ -100,6 +110,7 @@ run_backup() {
   local dest="$WORK/out.$1"; local rid="${2:-run-4242}"
   rm -rf "$dest"
   UZI_CTX=test-ctx UZI_WORKER_NS=ns UZI_REPO_SLUG=testrepo UZI_RUNNER_BASE="$WORK/runner" \
+    UZI_REPOS_BASE="$REPOS" \
     UZI_BACKUP_DIR="$dest" UZI_KUBECTL="$KSTUB" UZI_BIN="$WORK/uzi" \
     bash "$SCRIPT" "$rid" >/dev/null 2>&1
   echo "$dest/latest"
@@ -159,10 +170,66 @@ git_q "$RUNNER3" commit -am 'mr_rework commit'
 
 L3="$(run_backup 3 mrr-1)"
 [ -f "$L3/agent-issue-9999.tgz" ] \
-  || fail "case3: expected agent-issue-9999.tgz (slug from branch); dir has: $(ls "$L3" 2>/dev/null | tr '\n' ' ')"
+  || fail "case3: expected agent-issue-9999.tgz (slug from branch)"
 tar tzf "$L3/agent-issue-9999.tgz" 2>/dev/null | grep -q 'agent-issue-9999[.]bundle' \
   || fail "case3: mr_rework bundle missing (clone dir not resolved from branch)"
 grep -q "^.*OK .*mrr-1" "$L3/backup.log" || fail "case3: expected OK for mr_rework; got: $(cat "$L3/backup.log")"
 echo "PASS case3: mr_rework -> slug from branch (agent-issue-9999), bundle, OK"
+
+# --- case 4: clone gone -> search the worker bare ref, emit BARE ----------------
+# Publish the latest committed issue branch into the fake worker's durable runner ref,
+# then remove the clone. This is the exact limit_wait/worker-roll shape observed on #1429.
+git --git-dir="$BARE" fetch -q "$RUNNER" \
+  agent/issue-4242:refs/uzi-runner/agent/issue-4242
+rm -rf "$RUNNER"
+
+L4="$(run_backup 4)"
+[ -f "$L4/issue-4242.tgz" ] || fail "case4: no bare-fallback .tgz produced"
+tar tzf "$L4/issue-4242.tgz" 2>/dev/null | grep -q 'issue-4242[.]bundle' \
+  || fail "case4: bare fallback bundle missing"
+grep -q '^.*BARE .*run-4242' "$L4/backup.log" \
+  || fail "case4: expected BARE in log; got: $(cat "$L4/backup.log")"
+if tar tzf "$L4/issue-4242.tgz" 2>/dev/null | grep -q 'uncommitted[.]patch'; then
+  fail "case4: bare fallback falsely claims an uncommitted patch"
+fi
+echo "PASS case4: missing clone -> durable runner-ref bundle, BARE"
+
+# --- case 5: no clone/ref -> rc=1, latest preserved, safe retention ------------
+git --git-dir="$BARE" update-ref -d refs/uzi-runner/agent/issue-4242
+ROOT5="$WORK/out.5"
+mkdir -p "$ROOT5/20000101T000000Z" "$ROOT5/not-a-backup"
+touch -t 200001010000 "$ROOT5/20000101T000000Z" "$ROOT5/not-a-backup"
+ln -s "$L4" "$ROOT5/latest"
+set +e
+UZI_CTX=test-ctx UZI_WORKER_NS=ns UZI_REPO_SLUG=testrepo UZI_RUNNER_BASE="$WORK/runner" \
+  UZI_REPOS_BASE="$REPOS" UZI_BACKUP_DIR="$ROOT5" UZI_BACKUP_RETENTION_DAYS=14 \
+  UZI_KUBECTL="$KSTUB" UZI_BIN="$WORK/uzi" \
+  bash "$SCRIPT" run-4242 >/dev/null 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 1 ] || fail "case5: missing clone/ref rc=$rc, want 1"
+[ "$(readlink "$ROOT5/latest")" = "$L4" ] \
+  || fail "case5: failed attempt replaced the last recoverable latest"
+[ -L "$ROOT5/latest-attempt" ] || fail "case5: latest-attempt was not updated"
+[ ! -e "$ROOT5/20000101T000000Z" ] || fail "case5: old timestamp backup was not pruned"
+[ -d "$ROOT5/not-a-backup" ] || fail "case5: prune removed a non-backup directory"
+echo "PASS case5: active capture failure is nonzero, latest preserved, retention scoped"
+
+# --- case 6: no worker binding must not adopt a stale same-issue ref -------------
+git --git-dir="$BARE" fetch -q "$RUNNER3" \
+  agent/issue-9999:refs/uzi-runner/agent/issue-4242
+ROOT6="$WORK/out.6"
+set +e
+UZI_CTX=test-ctx UZI_WORKER_NS=ns UZI_REPO_SLUG=testrepo UZI_RUNNER_BASE="$WORK/runner" \
+  UZI_REPOS_BASE="$REPOS" UZI_BACKUP_DIR="$ROOT6" UZI_BACKUP_RETENTION_DAYS=0 \
+  UZI_KUBECTL="$KSTUB" UZI_BIN="$WORK/uzi" \
+  bash "$SCRIPT" noworker-1 >/dev/null 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 1 ] || fail "case6: no-worker run rc=$rc, want 1"
+if rg --files "$ROOT6" | grep -q '[.]tgz$'; then
+  fail "case6: no-worker run adopted a stale same-issue ref"
+fi
+echo "PASS case6: no worker binding refuses stale all-pod branch adoption"
 
 echo "ALL PASS"

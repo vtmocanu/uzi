@@ -13,14 +13,15 @@
 #
 # Env: UZI_BACKUP_INTERVAL (default 900s), UZI_BACKUP_MAX_HOURS (default 12),
 #      UZI_BACKUP_DIR (default /tmp/uzi-backups), UZI_BIN (uzi path).
-#      All backup-runs.sh env vars (UZI_CTX, UZI_WORKER_NS, UZI_REPO_SLUG, ...)
-#      are inherited and honored.
+#      UZI_BACKUP_RUNS_SCRIPT overrides the one-shot script (test/custom install).
+#      All backup-runs.sh env vars (UZI_CTX, UZI_WORKER_NS, UZI_REPO_SLUG,
+#      UZI_BACKUP_RETENTION_DAYS, ...) are inherited and honored.
 set -u
 export PATH="${PATH:-/usr/local/bin:/usr/bin:/bin}"
 UZI="${UZI_BIN:-uzi}"
 ROOT="${UZI_BACKUP_DIR:-/tmp/uzi-backups}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
-RUNS_SCRIPT="$HERE/backup-runs.sh"
+RUNS_SCRIPT="${UZI_BACKUP_RUNS_SCRIPT:-$HERE/backup-runs.sh}"
 INTERVAL="${UZI_BACKUP_INTERVAL:-900}"
 MAX_HOURS="${UZI_BACKUP_MAX_HOURS:-12}"
 
@@ -43,29 +44,55 @@ INTERVAL=$((10#$INTERVAL)); MAX_HOURS=$((10#$MAX_HOURS))
 
 mkdir -p "$ROOT"
 echo "$$" > "$ROOT/backup-loop.pid"
-END=$(( $(date +%s) + MAX_HOURS * 3600 ))
+START_EPOCH="$(date +%s)"
+END=$(( START_EPOCH + MAX_HOURS * 3600 ))
 
 llog(){ printf '%s [loop] %s\n' "$(date -u +%FT%TZ)" "$*"; }
-llog "started pid=$$ interval=${INTERVAL}s max=${MAX_HOURS}h runs=${RUNS[*]}"
+epoch_utc(){
+  date -u -r "$1" +%FT%TZ 2>/dev/null || date -u -d "@$1" +%FT%TZ 2>/dev/null
+}
+STARTED_AT="$(epoch_utc "$START_EPOCH")"
+ENDS_AT="$(epoch_utc "$END")"
+{
+  echo "pid=$$"
+  echo "status=running"
+  echo "context=${UZI_CTX:-<unset: current kube context>}"
+  echo "namespaces=${UZI_WORKER_NS:-uzi-workers uzi-workers-docker}"
+  echo "interval_seconds=$INTERVAL"
+  echo "max_hours=$MAX_HOURS"
+  echo "started_at=$STARTED_AT"
+  echo "ends_at=$ENDS_AT"
+  echo "retention_days=${UZI_BACKUP_RETENTION_DAYS:-14}"
+  echo "runs=${RUNS[*]}"
+} > "$ROOT/backup-loop.state"
+llog "started pid=$$ ctx=${UZI_CTX:-<unset>} ns=[${UZI_WORKER_NS:-uzi-workers uzi-workers-docker}] interval=${INTERVAL}s max=${MAX_HOURS}h ends=$ENDS_AT retention=${UZI_BACKUP_RETENTION_DAYS:-14}d runs=${RUNS[*]}"
 
 while :; do
   [ -e "$ROOT/STOP" ] && { llog "STOP file present; exiting"; break; }
   bash "$RUNS_SCRIPT" "${RUNS[@]}"
+  backup_rc=$?
+  [ "$backup_rc" -eq 0 ] || llog "backup cycle incomplete rc=$backup_rc; keeping active runs for retry"
 
-  # exit once every run is definitively terminal (empty status = keep going)
-  active=0
+  # Stop re-snapshotting a terminal run every cycle. Empty/unreadable status stays
+  # active and is retried rather than silently disappearing from protection.
+  next_runs=()
   for RID in "${RUNS[@]}"; do
     s="$("$UZI" run get "$RID" --field status 2>/dev/null)"
     case "$s" in
-      completed|failed|cancelled) ;;
-      *) active=1 ;;
+      completed|failed|cancelled) llog "retired terminal run $RID status=$s" ;;
+      *) next_runs+=("$RID") ;;
     esac
   done
-  [ "$active" -eq 0 ] && { llog "all runs terminal; exiting"; break; }
+  RUNS=("${next_runs[@]}")
+  [ "${#RUNS[@]}" -eq 0 ] && { llog "all runs terminal; exiting"; break; }
   [ "$(date +%s)" -ge "$END" ] && { llog "max runtime reached; exiting"; break; }
 
   llog "sleep ${INTERVAL}s"
   sleep "$INTERVAL"
 done
 rm -f "$ROOT/backup-loop.pid"
+{
+  echo "status=ended"
+  echo "ended_at=$(date -u +%FT%TZ)"
+} >> "$ROOT/backup-loop.state"
 llog "loop ended"
