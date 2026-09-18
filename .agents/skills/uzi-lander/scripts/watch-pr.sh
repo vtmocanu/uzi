@@ -275,10 +275,12 @@ while [ "$i" -lt "$MAX" ]; do
   # (measured 2026-08-29 on PR #807, where two such addressed findings were mis-counted as
   # live=2 and produced a false exit-3 after a clean rework). Greptile findings are counted
   # by the same line != null anchor (no addressed-marker convention has been observed).
-  cr_live=0; gr_live=0
+  cr_live=0; gr_live=0; gr_scoped_total=0
   if pull_c=$(gh api --paginate "repos/$REPO/pulls/$PR/comments" 2>/dev/null) && pages_are_arrays "$pull_c"; then
     cr_live=$(printf '%s' "$pull_c" | jq -rs '[.[][]|select(.user.login=="coderabbitai[bot]" and .line!=null and ((.body|contains("Addressed in commit"))|not))]|length' 2>/dev/null) || unknown=1
     if [ -n "$gr_review_id" ]; then
+      gr_scoped_total=$(printf '%s' "$pull_c" | jq -rs --argjson rid "$gr_review_id" \
+        '[.[][]|select(.user.login=="greptile-apps[bot]" and .pull_request_review_id==$rid)]|length' 2>/dev/null) || unknown=1
       gr_live=$(printf '%s' "$pull_c" | jq -rs --argjson rid "$gr_review_id" \
         '[.[][]|select(.user.login=="greptile-apps[bot]" and .pull_request_review_id==$rid and .line!=null)]|length' 2>/dev/null) || unknown=1
     else
@@ -316,6 +318,10 @@ while [ "$i" -lt "$MAX" ]; do
     elif [ -z "$gr_review_id" ]; then
       # A summary says comments were added but no current-head review id can scope them.
       # Fail closed rather than mixing old and new comments into a false finding set.
+      unknown=1
+    elif [ "$gr_scoped_total" -ne "$gr_added" ]; then
+      # GitHub can expose the completed check/review before all inline comments. Until the
+      # review-scoped count matches Greptile's own tally, the finding set is incomplete.
       unknown=1
     fi
   fi
@@ -385,9 +391,10 @@ while [ "$i" -lt "$MAX" ]; do
     none)       reviewed_head=1 ;;
   esac
 
-  eqnote=""
+  eqnote=""; grnote=""
   [ "$equiv" -eq 1 ] && eqnote=" equiv=1"
-  echo "try $i: head=${head:0:8} req_fail=$fail req_pend=$pend req_cancel=$cancel mrw_active=$mrw_active cr_reviewed=$cr_reviewed${eqnote} cr_status='${cr_desc:-absent}' cr_full_required=$cr_full_required greptile=$gr_state${gr_summary:+ ($gr_summary)} live=$live (cr=$cr_live gr=$gr_live cr_unconfirmed=$cr_unconfirmed)${unknown:+ unknown=$unknown}"
+  [ "$gr_reviewed" -eq 1 ] && grnote=" gr_scope=$gr_scoped_total/${gr_added:-?}"
+  echo "try $i: head=${head:0:8} req_fail=$fail req_pend=$pend req_cancel=$cancel mrw_active=$mrw_active cr_reviewed=$cr_reviewed${eqnote} cr_status='${cr_desc:-absent}' cr_full_required=$cr_full_required greptile=$gr_state${gr_summary:+ ($gr_summary)}${grnote} live=$live (cr=$cr_live gr=$gr_live cr_unconfirmed=$cr_unconfirmed)${unknown:+ unknown=$unknown}"
 
   # A failed lookup this iteration: defer, do not decide on masked values.
   if [ "$unknown" -ne 0 ]; then sleep "$INTERVAL"; continue; fi

@@ -176,6 +176,14 @@ for n in "$@"; do
     unconfirmed="${unconfirmed} #${n}"
     inline_raw='[]'
   fi
+  if [ "$gr_ok" -eq 1 ] && [ "$gr_added" != "0" ] && [ -n "$gr_review_id" ]; then
+    gr_scoped_total=$(printf '%s' "$inline_raw" | jq --argjson rid "$gr_review_id" \
+      '[.[]|select(.user.login=="greptile-apps[bot]" and .pull_request_review_id==$rid)]|length' 2>/dev/null || echo -1)
+    if [ "$gr_scoped_total" -ne "$gr_added" ]; then
+      echo "  🔴 Greptile finding set incomplete (${gr_scoped_total}/${gr_added} current-review comments readable) — NOT confirmed clean"
+      unconfirmed="${unconfirmed} #${n}"
+    fi
+  fi
   # $sev/$t/$p below are jq variables, not shell expansions — single quotes are correct.
   gr_clean=0; [ "$gr_ok" -eq 1 ] && [ "$gr_added" = "0" ] && gr_clean=1
   # shellcheck disable=SC2016
