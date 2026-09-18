@@ -217,7 +217,7 @@ describe("runBadge taxonomy", () => {
       tone: "warning",
       pulse: false,
     });
-    // NOT a usage-limit / pooled-token park: the title speaks of a transient empty result
+    // NOT a usage-limit / pooled-token park: the title speaks of a transient interruption
     // and an automatic resume, never a reset window or a pooled token.
     if (b.kind === "badge") {
       expect(b.title).toMatch(/resumes automatically/i);
@@ -1133,6 +1133,19 @@ describe("stop_kind='stopped' (PRD #517 M4, deliberate HUMAN_STOP_KINDS exclusio
     expect(runStatusTone("failed", kind)).toBe("danger");
     // A gracefully-stopped run lands status=completed, which is the success it is.
     expect(runStatusTone("completed", kind)).toBe("ok");
+  });
+});
+
+describe("stop_kind='branch_moved' (issue #1117, cancelled-status disposition)", () => {
+  it("type-checks as a StopKind and renders calm because it lands status='cancelled'", () => {
+    // 'branch_moved' is a valid StopKind (compile-time: this assignment fails to build if
+    // the union omits it).
+    const kind: StopKind = "branch_moved";
+    // The disposition lands status='cancelled'; isStoppedRun treats every cancelled run as a
+    // calm "stopped" regardless of stop_kind, so a concurrent-writer supersession never reads
+    // as breakage.
+    expect(isStoppedRun("cancelled", kind)).toBe(true);
+    expect(runStatusTone("cancelled", kind)).toBe("neutral");
   });
 });
 

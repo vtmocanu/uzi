@@ -62,6 +62,9 @@ spec:
         # api outage from here, not a policy mismatch.
         app.kubernetes.io/component: controller
     spec:
+      {{- if .Values.appPriorityClass.enabled }}
+      priorityClassName: {{ .Values.appPriorityClass.name | default (printf "%s-app" .Release.Name) }}
+      {{- end }}
       # TRUE — the one workload in uzi where it is. This SA's whole purpose is the
       # kube API (its Role is in the worker namespace, see worker-rbac.yaml); api and
       # web both set this false and must keep doing so.

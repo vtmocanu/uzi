@@ -13,6 +13,7 @@ import (
 )
 
 const bindCaptureManifest = `-- name: BindCaptureManifest :one
+
 UPDATE recovery_captures
 SET manifest_bound = true,
     byte_size = $1,
@@ -33,6 +34,11 @@ type BindCaptureManifestParams struct {
 	ID               uuid.UUID   `json:"id"`
 }
 
+// PRD #1296 M1 (D2/D4/D5): the durable-recovery store contract. These queries are the
+// COMPLETE store-query layer M2 (upload/owner API), M3 (worker capture/retry) and M5
+// (owner UX) consume, frozen here so those parallel milestones never edit this file.
+// Custody holds are opened atomically with the claim (runtime.sql ClaimRun); everything
+// below operates on the already-open hold and its captures.
 // D2/D4: compare-and-set the byte manifest ONCE. The first bind (manifest_bound=false)
 // always wins; a retry with the SAME byte_size+checksum is idempotent (the second
 // disjunct matches and re-stamps updated_at); a DIFFERENT manifest under the same
@@ -71,6 +77,40 @@ func (q *Queries) BindCaptureManifest(ctx context.Context, arg BindCaptureManife
 		&i.UpdatedAt,
 	)
 	return i, err
+}
+
+const claimCustodyEpisodeNotice = `-- name: ClaimCustodyEpisodeNotice :one
+INSERT INTO custody_episode_notices (user_id, notified_at)
+VALUES ($1, now())
+ON CONFLICT (user_id) DO NOTHING
+RETURNING user_id
+`
+
+// PRD #1349 M1 (D10): atomically claim the one-per-episode owner Slack DM slot, mirroring
+// ClaimVaultLockNotice. Backed by the additive custody_episode_notices table (migration 00226):
+// the FIRST caller to observe a blocked-custody episode for a user INSERTs the row and gets it
+// back; a concurrent second caller conflicts on the user_id PK, DO NOTHING returns no row
+// (pgx.ErrNoRows), so N api pods send EXACTLY ONE DM per episode (at-most-once dedup, the mark
+// is set before Notify runs). ClearCustodyEpisodeNotice re-arms it when the owner drops below
+// the limit, so a later crossing can notify afresh.
+func (q *Queries) ClaimCustodyEpisodeNotice(ctx context.Context, userID uuid.UUID) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, claimCustodyEpisodeNotice, userID)
+	var user_id uuid.UUID
+	err := row.Scan(&user_id)
+	return user_id, err
+}
+
+const clearCustodyEpisodeNotice = `-- name: ClearCustodyEpisodeNotice :exec
+DELETE FROM custody_episode_notices WHERE user_id = $1
+`
+
+// PRD #1349 M1 (D10): re-arm the owner custody-episode notice by dropping the mark, mirroring
+// ClearVaultLockNotice. Called when the owner falls back below the custody-admission limit
+// (the episode closes), so a later re-crossing sends a fresh DM. Idempotent: a delete of a
+// missing row is a no-op.
+func (q *Queries) ClearCustodyEpisodeNotice(ctx context.Context, userID uuid.UUID) error {
+	_, err := q.db.Exec(ctx, clearCustodyEpisodeNotice, userID)
+	return err
 }
 
 const countOpenCustodyHoldsForWorker = `-- name: CountOpenCustodyHoldsForWorker :one
@@ -127,6 +167,80 @@ type DiscardCaptureForOwnerParams struct {
 // owned, 0 for a foreign/absent id). The capture row is retained (audit), only its bytes go.
 func (q *Queries) DiscardCaptureForOwner(ctx context.Context, arg DiscardCaptureForOwnerParams) (int64, error) {
 	result, err := q.db.Exec(ctx, discardCaptureForOwner, arg.ID, arg.RunID, arg.UserID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const discardCustodyHoldForOwner = `-- name: DiscardCustodyHoldForOwner :execrows
+UPDATE recovery_custody_holds
+SET state = 'discarded', live_worker_id = NULL, live_run_id = NULL,
+    release_evidence = $1, updated_at = now()
+WHERE id = $2 AND run_id = $3 AND user_id = $4 AND state = 'open'
+`
+
+type DiscardCustodyHoldForOwnerParams struct {
+	ReleaseEvidence pgtype.Text `json:"release_evidence"`
+	HoldID          uuid.UUID   `json:"hold_id"`
+	RunID           uuid.UUID   `json:"run_id"`
+	UserID          uuid.UUID   `json:"user_id"`
+}
+
+// PRD #1349 M1 (D7): owner-initiated EXACT hold discard. Marks the ONE named open hold
+// 'discarded' and nulls its live worker/run FKs (dropping the ON DELETE RESTRICT so ordinary
+// teardown can proceed), leaving the immutable provenance columns intact for audit. OWNER
+// SCOPE IS VERIFIED IN THE SQL (user_id = @user_id) in ADDITION to the handler's owner-or-404
+// gate, and the run/hold identity (run_id + id) is matched, so a foreign owner or a wrong
+// run/hold id settles zero rows. state='open' makes discard terminal + idempotent: a second
+// call, or a hold already released/discarded, moves zero rows and can never revive it.
+// Captures are settled separately (DiscardNonReadyCapturesForHold); an available archive is
+// NEVER touched here (archive deletion is a distinct owner choice, D7). Sibling holds and
+// generations are left untouched.
+//
+// PRD #1392 M1 (D3): release_evidence is stamped 'owner_discard' — the class recording that
+// the owner explicitly discarded this hold's custody. The caller passes it as @release_evidence;
+// CHECK-constrained to the five classes (migration 00232).
+func (q *Queries) DiscardCustodyHoldForOwner(ctx context.Context, arg DiscardCustodyHoldForOwnerParams) (int64, error) {
+	result, err := q.db.Exec(ctx, discardCustodyHoldForOwner,
+		arg.ReleaseEvidence,
+		arg.HoldID,
+		arg.RunID,
+		arg.UserID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const discardNonReadyCapturesForHold = `-- name: DiscardNonReadyCapturesForHold :execrows
+WITH targets AS (
+    SELECT rc.id AS capture_id FROM recovery_captures rc
+    WHERE rc.hold_id = $1
+      AND rc.state IN ('preparing', 'uploading', 'needs_action')
+),
+del AS (
+    DELETE FROM recovery_capture_chunks
+    WHERE capture_id IN (SELECT targets.capture_id FROM targets)
+)
+UPDATE recovery_captures c
+SET state = 'discarded', updated_at = now()
+WHERE c.id IN (SELECT targets.capture_id FROM targets)
+`
+
+// PRD #1349 M1 (D7): the capture-settlement half of an owner hold discard. For ONE hold, marks
+// its preparing/uploading/needs_action captures 'discarded' and deletes their partial byte
+// chunks, NEVER touching an 'available' (ready) capture — a ready archive survives a hold
+// discard so the owner can still export it (D7/D9). Ordered exactly like DiscardCaptureForOwner
+// so the whole thing is ONE atomic statement: `targets` SELECTs the non-ready capture ids under
+// one snapshot, `del` deletes their chunks, and the final UPDATE flips exactly those ids to
+// 'discarded'. Because every CTE reads that same snapshot, a partially-settled capture can never
+// leave orphan chunks or a chunk-less non-terminal row, and :execrows reports the capture
+// UPDATE's row count (not the chunk deletes'). The caller runs this in the SAME transaction as
+// DiscardCustodyHoldForOwner, locking hold then captures in upload order (D7).
+func (q *Queries) DiscardNonReadyCapturesForHold(ctx context.Context, holdID uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, discardNonReadyCapturesForHold, holdID)
 	if err != nil {
 		return 0, err
 	}
@@ -239,6 +353,52 @@ func (q *Queries) GetCaptureForOwner(ctx context.Context, arg GetCaptureForOwner
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)
+	return i, err
+}
+
+const getCustodyAggregateForOwner = `-- name: GetCustodyAggregateForOwner :one
+SELECT
+    (SELECT count(*) FROM recovery_custody_holds h
+        WHERE h.user_id = $1::uuid AND h.state = 'open')::bigint AS open_holds,
+    (CASE
+        WHEN $2::int > 0
+             AND (SELECT count(*) FROM recovery_custody_holds h2
+                    WHERE h2.user_id = $1::uuid AND h2.state = 'open') >= $2::int
+        THEN (SELECT count(*) FROM runs r
+                WHERE r.user_id = $1::uuid
+                  AND r.status = 'queued'
+                  AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework'))
+        ELSE 0
+     END)::bigint AS blocked_runs
+`
+
+type GetCustodyAggregateForOwnerParams struct {
+	UserID           uuid.UUID `json:"user_id"`
+	CustodyHoldLimit int32     `json:"custody_hold_limit"`
+}
+
+type GetCustodyAggregateForOwnerRow struct {
+	OpenHolds   int64 `json:"open_holds"`
+	BlockedRuns int64 `json:"blocked_runs"`
+}
+
+// PRD #1349 M1 (D6/D10): the owner-level custody aggregate the board alert and one-per-episode
+// Slack DM read (M6). open_holds is the owner's UNRESOLVED (state='open') hold count — the SAME
+// admission signal ClaimRun blocks on. blocked_runs is the count of the owner's QUEUED
+// code-publishing runs currently blocked by the custody-admission predicate: it mirrors the
+// reasonCustodyLimit predicate in workersvc/health.go — a run stays queued for custody ONLY when
+// the owner is AT/OVER the limit — so it is 0 unless open_holds >= @custody_hold_limit (and a
+// non-positive @custody_hold_limit DISABLES the gate exactly like the claim path, yielding 0).
+// The code-publishing kinds match ClaimRun's custody-hold CTE (issue/ci_fix/self_improve/prompt/
+// task/mr_rework). Both columns are cast ::bigint so sqlc types them as int64, never interface{}.
+// Every column is table-qualified and @user_id carries an explicit ::uuid cast: this is a
+// top-level SELECT with no FROM, so sqlc's param-type inference cannot pick a single relation
+// for an untyped @user_id when both recovery_custody_holds and runs expose a user_id column
+// (it reports "column reference user_id is ambiguous"). The cast types the param directly.
+func (q *Queries) GetCustodyAggregateForOwner(ctx context.Context, arg GetCustodyAggregateForOwnerParams) (GetCustodyAggregateForOwnerRow, error) {
+	row := q.db.QueryRow(ctx, getCustodyAggregateForOwner, arg.UserID, arg.CustodyHoldLimit)
+	var i GetCustodyAggregateForOwnerRow
+	err := row.Scan(&i.OpenHolds, &i.BlockedRuns)
 	return i, err
 }
 
@@ -415,8 +575,261 @@ func (q *Queries) ListCapturesForRunOwner(ctx context.Context, arg ListCapturesF
 	return items, nil
 }
 
+const listCustodyHoldsForOwner = `-- name: ListCustodyHoldsForOwner :many
+SELECT
+    h.id,
+    h.run_id,
+    h.generation,
+    h.state,
+    h.created_at,
+    h.updated_at,
+    h.released_at,
+    h.original_worker_id,
+    COALESCE(w.name, '')::text AS worker_name,
+    (EXISTS (SELECT 1 FROM recovery_captures c
+        WHERE c.hold_id = h.id AND c.state = 'available'))::boolean AS has_available_capture,
+    COALESCE((SELECT c.state FROM recovery_captures c
+        WHERE c.hold_id = h.id
+        ORDER BY c.created_at DESC, c.id DESC
+        LIMIT 1), '')::text AS capture_state,
+    COALESCE(r.status, '')::text AS run_status
+FROM recovery_custody_holds h
+LEFT JOIN workers w ON w.id = h.original_worker_id AND w.user_id = h.user_id
+LEFT JOIN runs r ON r.id = h.run_id AND r.user_id = h.user_id
+WHERE h.user_id = $1
+  AND ($2::uuid IS NULL OR h.run_id = $2::uuid)
+  AND ($3::uuid IS NULL OR h.original_worker_id = $3::uuid)
+  AND ($4::text IS NULL OR h.state = $4::text)
+ORDER BY h.created_at ASC
+`
+
+type ListCustodyHoldsForOwnerParams struct {
+	UserID   uuid.UUID   `json:"user_id"`
+	RunID    pgtype.UUID `json:"run_id"`
+	WorkerID pgtype.UUID `json:"worker_id"`
+	State    pgtype.Text `json:"state"`
+}
+
+type ListCustodyHoldsForOwnerRow struct {
+	ID                  uuid.UUID          `json:"id"`
+	RunID               uuid.UUID          `json:"run_id"`
+	Generation          int64              `json:"generation"`
+	State               string             `json:"state"`
+	CreatedAt           pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt           pgtype.Timestamptz `json:"updated_at"`
+	ReleasedAt          pgtype.Timestamptz `json:"released_at"`
+	OriginalWorkerID    uuid.UUID          `json:"original_worker_id"`
+	WorkerName          string             `json:"worker_name"`
+	HasAvailableCapture bool               `json:"has_available_capture"`
+	CaptureState        string             `json:"capture_state"`
+	RunStatus           string             `json:"run_status"`
+}
+
+// PRD #1349 M1 (D7): the owner-scoped, bounded hold list the web Workers surface and the
+// `uzi run recovery` CLI render (M5/M6). OWNER-scoped by @user_id, with OPTIONAL run/worker/
+// state narg filters (a NULL narg disables that filter). It returns the exact hold identity
+// (id, run_id, generation), lifecycle state, timestamps, and the OPAQUE original_worker_id
+// UUID, plus a BOUNDED owner-safe worker display name LEFT-JOINed from workers.name (NULL ->
+// ” when the worker row is gone). It NEVER returns original_worker_identity (raw provenance,
+// D7). The per-hold capture summary (has_available_capture, latest capture_state) lets the
+// surface classify a hold (active protection / capture in progress / archive available /
+// needs attention) without a second query.
+//
+// run_status is the hold's run's live status (M5, D6/D8), LEFT-JOINed from runs (NULL -> ”
+// when the run row is gone). It is consumed ONLY by the Go attention derivation in
+// ListHoldsForOwner to tell `active` (an OPEN hold whose run is still running/claimed —
+// healthy protection, no owner decision) from `source_only` (an OPEN hold whose run is
+// terminal and carries no capture — a source needing an owner decision). It is NOT added to
+// the frozen RecoveryCustodyHoldDTO wire shape; it never reaches the SPA/CLI JSON. Ordered
+// oldest-first for a stable list.
+func (q *Queries) ListCustodyHoldsForOwner(ctx context.Context, arg ListCustodyHoldsForOwnerParams) ([]ListCustodyHoldsForOwnerRow, error) {
+	rows, err := q.db.Query(ctx, listCustodyHoldsForOwner,
+		arg.UserID,
+		arg.RunID,
+		arg.WorkerID,
+		arg.State,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListCustodyHoldsForOwnerRow{}
+	for rows.Next() {
+		var i ListCustodyHoldsForOwnerRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.RunID,
+			&i.Generation,
+			&i.State,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.ReleasedAt,
+			&i.OriginalWorkerID,
+			&i.WorkerName,
+			&i.HasAvailableCapture,
+			&i.CaptureState,
+			&i.RunStatus,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listCustodyHoldsForWorkerRun = `-- name: ListCustodyHoldsForWorkerRun :many
+SELECT
+    h.id,
+    h.generation,
+    (EXISTS (SELECT 1 FROM recovery_captures c
+        WHERE c.hold_id = h.id AND c.state = 'available'))::boolean AS has_available_capture,
+    COALESCE((SELECT c.state FROM recovery_captures c
+        WHERE c.hold_id = h.id
+        ORDER BY c.created_at DESC, c.id DESC
+        LIMIT 1), '')::text AS capture_state
+FROM recovery_custody_holds h
+WHERE h.run_id = $1
+  AND h.original_worker_id = $2::uuid
+  AND h.state = 'open'
+ORDER BY h.created_at ASC
+`
+
+type ListCustodyHoldsForWorkerRunParams struct {
+	RunID    uuid.UUID `json:"run_id"`
+	WorkerID uuid.UUID `json:"worker_id"`
+}
+
+type ListCustodyHoldsForWorkerRunRow struct {
+	ID                  uuid.UUID `json:"id"`
+	Generation          int64     `json:"generation"`
+	HasAvailableCapture bool      `json:"has_available_capture"`
+	CaptureState        string    `json:"capture_state"`
+}
+
+// PRD #1349 M1 (D3): the caller worker's OWN open holds on a run, for the worker-facing
+// post-clone generation-exact inventory (M2). Scoped to holds this worker ORIGINALLY took
+// (original_worker_id = @worker_id) so a cross-worker reclaim never sees the crashed worker's
+// holds. Returns the hold id + generation plus a per-hold capture summary: has_available_capture
+// (a ready archive already covers this hold's source) and capture_state (the latest capture's
+// lifecycle state, ” when the hold has no capture yet). The worker uses this to decide, per
+// generation, whether its source is already durable before it re-attempts capture/release.
+func (q *Queries) ListCustodyHoldsForWorkerRun(ctx context.Context, arg ListCustodyHoldsForWorkerRunParams) ([]ListCustodyHoldsForWorkerRunRow, error) {
+	rows, err := q.db.Query(ctx, listCustodyHoldsForWorkerRun, arg.RunID, arg.WorkerID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListCustodyHoldsForWorkerRunRow{}
+	for rows.Next() {
+		var i ListCustodyHoldsForWorkerRunRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Generation,
+			&i.HasAvailableCapture,
+			&i.CaptureState,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listOwnersOverCustodyLimit = `-- name: ListOwnersOverCustodyLimit :many
+
+SELECT h.user_id
+FROM recovery_custody_holds h
+WHERE h.state = 'open'
+GROUP BY h.user_id
+HAVING count(*) >= $1::int
+`
+
+// ════════════════════════════════════════════════════════════════════════════════════════
+// PRD #1349 M6: the owner custody-episode reconciler's find-owners reads. The one-per-episode
+// owner Slack DM (slacksvc.CustodyEpisodeReconciler, D10) coalesces the blocked-custody crossing
+// by owner, so it needs (a) the owners currently AT/OVER the admission limit to notify and
+// (b) the already-notified owners who have dropped BELOW it, to re-arm (clear) their episode
+// notice for a later crossing. Both key off the SAME open-hold admission signal ClaimRun and
+// GetCustodyAggregateForOwner gate on. Added strictly ADDITIVELY (M1/M4/M5 queries UNTOUCHED).
+// ════════════════════════════════════════════════════════════════════════════════════════
+// PRD #1349 M6 (D10): the owners whose OPEN (unresolved) custody-hold count is AT/OVER the
+// admission limit — the crossing set the episode reconciler considers for a one-per-episode DM.
+// Grouped over the partial idx_recovery_custody_holds_owner_open index; HAVING count(*) >=
+// @custody_hold_limit is the SAME predicate ClaimRun's custody-admission clause blocks on, so a
+// notified owner is exactly one whose runs are (or can be) blocked. The reconciler then claims
+// at-most-once and reads GetCustodyAggregateForOwner for the exact DM facts, so this returns only
+// the user_id. The caller guards a non-positive @custody_hold_limit (the admission gate is then
+// disabled), so this is never called with one — a non-positive limit here would match every owner.
+func (q *Queries) ListOwnersOverCustodyLimit(ctx context.Context, custodyHoldLimit int32) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, listOwnersOverCustodyLimit, custodyHoldLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var user_id uuid.UUID
+		if err := rows.Scan(&user_id); err != nil {
+			return nil, err
+		}
+		items = append(items, user_id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listOwnersWithClearedCustodyEpisode = `-- name: ListOwnersWithClearedCustodyEpisode :many
+SELECT n.user_id
+FROM custody_episode_notices n
+WHERE (SELECT count(*) FROM recovery_custody_holds h
+       WHERE h.user_id = n.user_id AND h.state = 'open') < $1::int
+`
+
+// PRD #1349 M6 (D10): the already-notified owners whose OPEN custody-hold count has dropped
+// BELOW the admission limit — the episode has closed, so the reconciler clears their notice
+// (ClearCustodyEpisodeNotice) to re-arm a later re-crossing. A row in custody_episode_notices
+// means "already DM'd for this episode"; the correlated open-hold count mirrors the same
+// admission signal, so this returns exactly the owners whose episode should re-arm. Returns only
+// the user_id; the reconciler clears each.
+func (q *Queries) ListOwnersWithClearedCustodyEpisode(ctx context.Context, custodyHoldLimit int32) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, listOwnersWithClearedCustodyEpisode, custodyHoldLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var user_id uuid.UUID
+		if err := rows.Scan(&user_id); err != nil {
+			return nil, err
+		}
+		items = append(items, user_id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listReleasableCustodyHolds = `-- name: ListReleasableCustodyHolds :many
-SELECT h.id, h.user_id, h.repo_id, h.run_id, h.generation, h.state, h.original_worker_id, h.original_worker_identity, h.live_worker_id, h.live_run_id, h.created_at, h.updated_at, h.released_at FROM recovery_custody_holds h
+SELECT h.id, h.user_id, h.repo_id, h.run_id, h.generation, h.state, h.original_worker_id, h.original_worker_identity, h.live_worker_id, h.live_run_id, h.created_at, h.updated_at, h.released_at, h.release_evidence,
+    CASE
+        WHEN EXISTS (SELECT 1 FROM runs r
+                       WHERE r.id = h.run_id
+                         AND r.status = 'completed'
+                         AND h.generation = r.claim_generation)
+            THEN 'publication'
+        ELSE 'archive'
+    END::text AS reason
+FROM recovery_custody_holds h
 WHERE h.state = 'open'
   AND (
       EXISTS (SELECT 1 FROM runs r
@@ -428,6 +841,24 @@ WHERE h.state = 'open'
   )
 ORDER BY h.created_at ASC
 `
+
+type ListReleasableCustodyHoldsRow struct {
+	ID                     uuid.UUID          `json:"id"`
+	UserID                 uuid.UUID          `json:"user_id"`
+	RepoID                 pgtype.UUID        `json:"repo_id"`
+	RunID                  uuid.UUID          `json:"run_id"`
+	Generation             int64              `json:"generation"`
+	State                  string             `json:"state"`
+	OriginalWorkerID       uuid.UUID          `json:"original_worker_id"`
+	OriginalWorkerIdentity string             `json:"original_worker_identity"`
+	LiveWorkerID           pgtype.UUID        `json:"live_worker_id"`
+	LiveRunID              pgtype.UUID        `json:"live_run_id"`
+	CreatedAt              pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt              pgtype.Timestamptz `json:"updated_at"`
+	ReleasedAt             pgtype.Timestamptz `json:"released_at"`
+	ReleaseEvidence        pgtype.Text        `json:"release_evidence"`
+	Reason                 string             `json:"reason"`
+}
 
 // PRD #1296 M4 (D3): the custody-release RECONCILER's candidate set — OPEN holds whose
 // release is now WARRANTED but was never applied (e.g. the best-effort terminal release in
@@ -457,15 +888,23 @@ ORDER BY h.created_at ASC
 // run retains custody for capture/discard). Returns oldest-first for stable reconcile order;
 // the reconciler releases the SPECIFIC selected hold by id (ReleaseCustodyHold), so selection
 // and release agree per-hold and a sibling hold is never collaterally released.
-func (q *Queries) ListReleasableCustodyHolds(ctx context.Context) ([]RecoveryCustodyHold, error) {
+//
+// PRD #1392 M1 (D3): `reason` is the per-hold RELEASE-EVIDENCE class the reconciler stamps
+// when it releases this hold, so the stored evidence matches the qualifier that selected it:
+// 'publication' when the completed-run backstop (a) qualifies it (the generation that
+// published its head), else 'archive' (its source is durably captured). The CASE mirrors the
+// WHERE's two disjuncts and prefers publication when both hold; a selected hold always
+// satisfies at least one disjunct, so `reason` is never a spurious 'archive' on a hold that
+// only the completed backstop qualified.
+func (q *Queries) ListReleasableCustodyHolds(ctx context.Context) ([]ListReleasableCustodyHoldsRow, error) {
 	rows, err := q.db.Query(ctx, listReleasableCustodyHolds)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []RecoveryCustodyHold{}
+	items := []ListReleasableCustodyHoldsRow{}
 	for rows.Next() {
-		var i RecoveryCustodyHold
+		var i ListReleasableCustodyHoldsRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.UserID,
@@ -480,6 +919,8 @@ func (q *Queries) ListReleasableCustodyHolds(ctx context.Context) ([]RecoveryCus
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.ReleasedAt,
+			&i.ReleaseEvidence,
+			&i.Reason,
 		); err != nil {
 			return nil, err
 		}
@@ -580,41 +1021,18 @@ func (q *Queries) MarkCaptureState(ctx context.Context, arg MarkCaptureStatePara
 	return i, err
 }
 
-const releaseCustodyForRunWorker = `-- name: ReleaseCustodyForRunWorker :execrows
-UPDATE recovery_custody_holds
-SET live_worker_id = NULL, live_run_id = NULL, state = 'released',
-    released_at = now(), updated_at = now()
-WHERE run_id = $1 AND live_worker_id = $2::uuid AND state = 'open'
-`
-
-type ReleaseCustodyForRunWorkerParams struct {
-	RunID    uuid.UUID `json:"run_id"`
-	WorkerID uuid.UUID `json:"worker_id"`
-}
-
-// D3: the terminal-completion RELEASE mechanism, scoped to ONE worker's hold on the run.
-// Nulls both live FKs, flips state to 'released' and stamps released_at, for the open hold on
-// @run_id held by @worker_id (the completing/reporting worker). Idempotent: a second call
-// moves zero rows. Scoping to the reporting worker's own (current-generation) hold is the
-// multi-hold guard on the completion path: a completed run reported by generation 2's worker
-// releases only generation 2's hold and PRESERVES a still-open generation-1 orphan hold, whose
-// uncaptured committed work is retained until capture/discard (surfaced as retaining-
-// unpublished-work), rather than being stranded by a release-by-run that nulls every open
-// hold's FKs. Captures survive; the immutable provenance columns are untouched.
-func (q *Queries) ReleaseCustodyForRunWorker(ctx context.Context, arg ReleaseCustodyForRunWorkerParams) (int64, error) {
-	result, err := q.db.Exec(ctx, releaseCustodyForRunWorker, arg.RunID, arg.WorkerID)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
-}
-
 const releaseCustodyHold = `-- name: ReleaseCustodyHold :execrows
 UPDATE recovery_custody_holds
 SET live_worker_id = NULL, live_run_id = NULL, state = 'released',
+    release_evidence = $1,
     released_at = now(), updated_at = now()
-WHERE id = $1 AND state = 'open'
+WHERE id = $2 AND state = 'open'
 `
+
+type ReleaseCustodyHoldParams struct {
+	ReleaseEvidence pgtype.Text `json:"release_evidence"`
+	ID              uuid.UUID   `json:"id"`
+}
 
 // D3: the PER-HOLD RELEASE mechanism. Nulls both live FKs (dropping the ON DELETE RESTRICT
 // that blocks worker/run teardown), flips state to 'released' and stamps released_at, for the
@@ -624,15 +1042,67 @@ WHERE id = $1 AND state = 'open'
 // it releases EXACTLY the hold ListReleasableCustodyHolds qualified, so a sibling
 // older-generation orphan hold on the same run is never collaterally released (the multi-hold
 // hazard documented on ListReleasableCustodyHolds).
-func (q *Queries) ReleaseCustodyHold(ctx context.Context, id uuid.UUID) (int64, error) {
-	result, err := q.db.Exec(ctx, releaseCustodyHold, id)
+//
+// PRD #1392 M1 (D3): release_evidence records WHY this release was warranted — the
+// reconciler passes the per-hold class ListReleasableCustodyHolds now computes ('publication'
+// for a completed-run backstop, 'archive' for a ready capture). CHECK-constrained to the five
+// classes (migration 00232).
+func (q *Queries) ReleaseCustodyHold(ctx context.Context, arg ReleaseCustodyHoldParams) (int64, error) {
+	result, err := q.db.Exec(ctx, releaseCustodyHold, arg.ReleaseEvidence, arg.ID)
 	if err != nil {
 		return 0, err
 	}
 	return result.RowsAffected(), nil
 }
 
-const reserveCapture = `-- name: ReserveCapture :one
+const releaseCustodyHoldExact = `-- name: ReleaseCustodyHoldExact :execrows
+UPDATE recovery_custody_holds
+SET live_worker_id = NULL, live_run_id = NULL, state = 'released',
+    release_evidence = $1,
+    released_at = now(), updated_at = now()
+WHERE run_id = $2
+  AND generation = $3
+  AND live_worker_id = $4::uuid
+  AND state = 'open'
+`
+
+type ReleaseCustodyHoldExactParams struct {
+	ReleaseEvidence pgtype.Text `json:"release_evidence"`
+	RunID           uuid.UUID   `json:"run_id"`
+	Generation      int64       `json:"generation"`
+	WorkerID        uuid.UUID   `json:"worker_id"`
+}
+
+// PRD #1349 M1 (D1/D2/D3): the GENERATION-EXACT worker release. Nulls both live FKs (dropping
+// the ON DELETE RESTRICT that blocks worker/run teardown), flips state to 'released' and
+// stamps released_at, for the ONE open hold on @run_id at @generation held live by
+// @worker_id. Unlike ReleaseCustodyForRunWorker (which matches EVERY open hold on the run for
+// the worker), this settles EXACTLY the named generation — so a newer same-worker generation
+// can never release an older generation whose source it did not inherit (the D2 hazard). The
+// caller must have already established this generation's durable evidence (published head,
+// available archive, or verified no-output). Idempotent: a second call moves zero rows.
+// Captures survive; the immutable provenance columns are untouched.
+//
+// PRD #1392 M1 (D3): release_evidence records WHY this release was warranted. The caller
+// supplies the class: the terminal-completion release passes 'publication'; the worker
+// Release endpoint passes an allowlisted request value ('publication' or 'forge_no_output');
+// the forge pre-clone park passes 'no_adopted_source' (a generation that never adopted a
+// source has nothing to prove against the forge). CHECK-constrained to the five classes
+// (migration 00232).
+func (q *Queries) ReleaseCustodyHoldExact(ctx context.Context, arg ReleaseCustodyHoldExactParams) (int64, error) {
+	result, err := q.db.Exec(ctx, releaseCustodyHoldExact,
+		arg.ReleaseEvidence,
+		arg.RunID,
+		arg.Generation,
+		arg.WorkerID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const reserveCaptureExact = `-- name: ReserveCaptureExact :one
 
 INSERT INTO recovery_captures
     (hold_id, run_id, user_id, original_worker_id, original_worker_identity,
@@ -643,6 +1113,7 @@ FROM recovery_custody_holds h
 WHERE h.run_id = $1
   AND h.user_id = $2
   AND h.original_worker_id = $3
+  AND h.generation = $8
   AND h.state = 'open'
 ORDER BY h.created_at DESC
 LIMIT 1
@@ -650,7 +1121,7 @@ ON CONFLICT (hold_id, idempotency_key) DO UPDATE SET updated_at = now()
 RETURNING id, hold_id, run_id, user_id, original_worker_id, original_worker_identity, source_sha, attempted_head_sha, idempotency_key, state, manifest_bound, byte_size, checksum, chunk_count, prerequisite_shas, reason, context, expires_at, created_at, updated_at
 `
 
-type ReserveCaptureParams struct {
+type ReserveCaptureExactParams struct {
 	RunID                  uuid.UUID   `json:"run_id"`
 	UserID                 uuid.UUID   `json:"user_id"`
 	OriginalWorkerID       pgtype.UUID `json:"original_worker_id"`
@@ -658,23 +1129,30 @@ type ReserveCaptureParams struct {
 	SourceSha              string      `json:"source_sha"`
 	AttemptedHeadSha       pgtype.Text `json:"attempted_head_sha"`
 	IdempotencyKey         string      `json:"idempotency_key"`
+	Generation             int64       `json:"generation"`
 }
 
-// PRD #1296 M1 (D2/D4/D5): the durable-recovery store contract. These queries are the
-// COMPLETE store-query layer M2 (upload/owner API), M3 (worker capture/retry) and M5
-// (owner UX) consume, frozen here so those parallel milestones never edit this file.
-// Custody holds are opened atomically with the claim (runtime.sql ClaimRun); everything
-// below operates on the already-open hold and its captures.
-// D2: reserve an immutable capture in state 'preparing', bound to the run's OPEN custody
-// hold taken by THIS worker. The hold is resolved in-SQL (fail-closed: no open hold owned
-// by @original_worker_id -> zero rows -> pgx.ErrNoRows -> not authorized), which enforces
-// the D2 invariant "a capture requires the original worker's open hold" at the store, not
-// only at the handler. Retrying the SAME capture identity (hold_id, idempotency_key) is
-// idempotent: ON CONFLICT bumps updated_at and returns the existing record, so a lost ACK
-// re-reserves the same capture_id. A changed source_sha under the same key does NOT
-// overwrite the frozen source (the conflict keeps the original row's columns).
-func (q *Queries) ReserveCapture(ctx context.Context, arg ReserveCaptureParams) (RecoveryCapture, error) {
-	row := q.db.QueryRow(ctx, reserveCapture,
+// ════════════════════════════════════════════════════════════════════════════════════════
+// PRD #1349 M1: the ADDITIVE exact-generation and owner-disposition store contract. These
+// queries are the COMPLETE store-query layer M2 (park capture/post-clone evidence), M4
+// (server generation-safe lifecycle), M5 (owner hold API/CLI disposition) and M6 (web
+// surface + owner Slack episode alert) consume. They were introduced strictly ADDITIVELY by
+// M1 (existing queries UNTOUCHED, so M1 compiled standalone). M4 has since flipped every
+// capture-reserve/custody-release call site onto these exact-generation names and DELETED the
+// superseded generation-blind ReserveCapture / ReleaseCustodyForRunWorker queries, so those no
+// longer exist above (ReleaseCustodyHold, the reconciler's per-hold release, remains).
+// ════════════════════════════════════════════════════════════════════════════════════════
+// PRD #1349 M1 (D1/D2): the GENERATION-EXACT reserve. Identical to ReserveCapture except the
+// hold-selection WHERE ALSO matches @generation, so a capture is bound to the ONE hold this
+// worker took at that exact claim generation (never a newer same-worker hold on the run). No
+// open hold owned by @original_worker_id AT @generation -> zero rows -> pgx.ErrNoRows -> not
+// authorized (fail closed), enforcing the D1 exact-identity invariant in-SQL. The ON CONFLICT
+// idempotency is unchanged: retrying the SAME (hold_id, idempotency_key) re-stamps updated_at
+// and returns the existing row, so a lost ACK re-reserves the same capture and a changed
+// source_sha under the same key never overwrites the frozen source. M2/M4 flip capture
+// reservation onto this in place of the generation-blind newest-hold ReserveCapture.
+func (q *Queries) ReserveCaptureExact(ctx context.Context, arg ReserveCaptureExactParams) (RecoveryCapture, error) {
+	row := q.db.QueryRow(ctx, reserveCaptureExact,
 		arg.RunID,
 		arg.UserID,
 		arg.OriginalWorkerID,
@@ -682,6 +1160,7 @@ func (q *Queries) ReserveCapture(ctx context.Context, arg ReserveCaptureParams) 
 		arg.SourceSha,
 		arg.AttemptedHeadSha,
 		arg.IdempotencyKey,
+		arg.Generation,
 	)
 	var i RecoveryCapture
 	err := row.Scan(

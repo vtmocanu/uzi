@@ -1127,7 +1127,9 @@ func (s *Service) assembleJudgeClaim(ctx context.Context, run store.Run) (*Claim
 	// resolved — `judge` for a pin, `default` for an unbound lane, or auto /
 	// best_of_pool / pool_stale / pool_empty / open_failed for the auto mode — so the
 	// run view names the MODE with no new vocabulary (D20).
-	if err := s.recordRunCredential(ctx, run, cred, choice); err != nil {
+	// emitSwitchMessage=false: the judge lane is not switchable (D10 — the verb refuses it), so it
+	// never emits a 'credential_switch' message. The returned last_seq is discarded.
+	if _, err := s.recordRunCredential(ctx, run, cred, choice, false); err != nil {
 		return nil, err
 	}
 	anthropic := cred.Token
@@ -1202,8 +1204,15 @@ func (s *Service) assembleJudgeClaim(ctx context.Context, run store.Run) (*Claim
 	}
 
 	return &ClaimPayload{
-		RunID:                  run.ID.String(),
-		Kind:                   run.Kind,
+		RunID: run.ID.String(),
+		Kind:  run.Kind,
+		// PRD #1247 M2 fix round: the judge lane forks here BEFORE assembleClaim's ordinary
+		// `ClaimGeneration: run.ClaimGeneration` (claim_assembly.go), so this literal must carry
+		// the field itself. ClaimRun has already incremented the judge run's row to >= 1, and the
+		// judge runner threads this onto its running/completed reports + usage batch — omitting it
+		// (a non-pointer int64, so 0) makes the server fence every capability worker's judge as
+		// stale (ErrMissingClaimGeneration / staleClaim), silently breaking the whole judge lane.
+		ClaimGeneration:        run.ClaimGeneration,
 		IssueTitle:             run.IssueTitle,
 		IssueDescription:       run.IssueDescription,
 		Status:                 run.Status,

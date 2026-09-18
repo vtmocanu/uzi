@@ -80,9 +80,12 @@ type runsStore struct {
 	// pgx.ErrNoRows so a run shows no usage — existing GetRun tests are unaffected.
 	hasRunUsage   bool
 	runUsageTotal store.GetRunUsageTotalRow
-	selfUsage     store.SelfUsageRow
-	adminTotals   store.AdminUsageTotalsRow
-	adminPerUser  []store.AdminUsagePerUserRow
+	// PRD #1247 M1: the credential attribution journal ListRunCredentialEpochs returns
+	// (empty by default, so GetRun reads credential_epochs: []).
+	credentialEpochs []store.RunCredentialEpoch
+	selfUsage        store.SelfUsageRow
+	adminTotals      store.AdminUsageTotalsRow
+	adminPerUser     []store.AdminUsagePerUserRow
 	// PRD #95 steer queue: the follow_up rows ListFollowUpInputsForRun returns, and the
 	// row CreateRunInput echoes (so the richer follow-up write's id/created_at are
 	// assertable).
@@ -197,6 +200,12 @@ func (s *runsStore) GetRunUsageTotal(_ context.Context, _ uuid.UUID) (store.GetR
 	}
 	return s.runUsageTotal, nil
 }
+
+// ListRunCredentialEpochs backs GetRun's credential_epochs enrichment (PRD #1247 M1):
+// the staged journal, empty by default so existing GetRun tests read [].
+func (s *runsStore) ListRunCredentialEpochs(_ context.Context, _ store.ListRunCredentialEpochsParams) ([]store.RunCredentialEpoch, error) {
+	return s.credentialEpochs, nil
+}
 func (s *runsStore) SelfUsage(_ context.Context, _ uuid.UUID) (store.SelfUsageRow, error) {
 	return s.selfUsage, nil
 }
@@ -253,7 +262,7 @@ func TestRunToDTOStopKind(t *testing.T) {
 	stamped := runToDTO(store.Run{
 		Status:   "failed",
 		StopKind: pgtype.Text{String: "plan_rejected", Valid: true},
-	}, "normal", 0, 0, dtoTestNow)
+	}, "normal", 0, 0, 0, dtoTestNow)
 	if stamped.StopKind == nil {
 		t.Fatal("a stamped stop_kind must reach the RunDTO, got nil")
 	}
@@ -262,7 +271,7 @@ func TestRunToDTOStopKind(t *testing.T) {
 	}
 
 	// NULL column ⇒ nil pointer (omitted from JSON), never "".
-	unstamped := runToDTO(store.Run{Status: "completed"}, "normal", 0, 0, dtoTestNow)
+	unstamped := runToDTO(store.Run{Status: "completed"}, "normal", 0, 0, 0, dtoTestNow)
 	if unstamped.StopKind != nil {
 		t.Errorf("an unstamped stop_kind must map to nil, got %q", *unstamped.StopKind)
 	}
@@ -275,7 +284,7 @@ func TestRunToDTOStopReason(t *testing.T) {
 	stamped := runToDTO(store.Run{
 		Status:     "cancelled",
 		StopReason: pgtype.Text{String: "wrong approach, restarting", Valid: true},
-	}, "normal", 0, 0, dtoTestNow)
+	}, "normal", 0, 0, 0, dtoTestNow)
 	if stamped.StopReason == nil {
 		t.Fatal("a stamped stop_reason must reach the RunDTO, got nil")
 	}
@@ -284,7 +293,7 @@ func TestRunToDTOStopReason(t *testing.T) {
 	}
 
 	// NULL column ⇒ nil pointer (omitted from JSON), never "".
-	unstamped := runToDTO(store.Run{Status: "completed"}, "normal", 0, 0, dtoTestNow)
+	unstamped := runToDTO(store.Run{Status: "completed"}, "normal", 0, 0, 0, dtoTestNow)
 	if unstamped.StopReason != nil {
 		t.Errorf("an unstamped stop_reason must map to nil, got %q", *unstamped.StopReason)
 	}
@@ -304,7 +313,7 @@ func TestRunToDTODeadlineAt(t *testing.T) {
 		Status:            "running",
 		StartedAt:         pgtype.Timestamptz{Time: start, Valid: true},
 		BudgetWallSeconds: pgtype.Int4{Int32: 8 * 60 * 60, Valid: true},
-	}, "normal", globalTimeout, 0, dtoTestNow)
+	}, "normal", globalTimeout, 0, 0, dtoTestNow)
 	if issue.DeadlineAt == nil {
 		t.Fatal("a running issue run must carry a deadline_at, got nil")
 	}
@@ -318,7 +327,7 @@ func TestRunToDTODeadlineAt(t *testing.T) {
 		Kind:      "chat",
 		Status:    "running",
 		StartedAt: pgtype.Timestamptz{Time: start, Valid: true},
-	}, "normal", globalTimeout, 0, dtoTestNow)
+	}, "normal", globalTimeout, 0, 0, dtoTestNow)
 	if chat.DeadlineAt != nil {
 		t.Errorf("a running chat run must carry deadline_at null, got %v", *chat.DeadlineAt)
 	}
@@ -335,7 +344,7 @@ func TestRunToDTORequirementSet(t *testing.T) {
 		RequiredCapabilities: []string{"docker"},
 		RequiredTools:        []string{"go", "node"},
 		SizeClass:            "m",
-	}, "normal", 0, 0, dtoTestNow)
+	}, "normal", 0, 0, 0, dtoTestNow)
 	if len(populated.RequiredCapabilities) != 1 || populated.RequiredCapabilities[0] != "docker" {
 		t.Errorf("required_capabilities = %v, want [docker]", populated.RequiredCapabilities)
 	}
@@ -347,7 +356,7 @@ func TestRunToDTORequirementSet(t *testing.T) {
 	}
 
 	// Empty columns ⇒ non-nil empty slices ([] over null) and "" for size_class.
-	empty := runToDTO(store.Run{Status: "queued"}, "normal", 0, 0, dtoTestNow)
+	empty := runToDTO(store.Run{Status: "queued"}, "normal", 0, 0, 0, dtoTestNow)
 	if empty.RequiredCapabilities == nil || len(empty.RequiredCapabilities) != 0 {
 		t.Errorf("required_capabilities = %v, want non-nil empty", empty.RequiredCapabilities)
 	}
@@ -356,6 +365,56 @@ func TestRunToDTORequirementSet(t *testing.T) {
 	}
 	if empty.SizeClass != "" {
 		t.Errorf("size_class = %q, want empty", empty.SizeClass)
+	}
+}
+
+// TestRunToDTOForgeParkFields pins that PRD #1392 M1's four forge-park fields reach the RunDTO
+// runToDTO builds (served on GET /api/runs/{id} and the worker 409 bodies). Nothing tested this
+// mapping — folding ForgeParkCount to 0 left the suite green — so this is the mutation-confirmed
+// gap. Both directions, with DISTINCT count vs. max so a swap is caught: a forge-parked run
+// carries the typed cause, the retry stamp, the lifetime count, and forge_park_max = the
+// configured cap (passed to runToDTO, NOT a run column); an unparked/legacy run maps to
+// null/null/0 while forge_park_max still reflects the cap (it is instance config on every run).
+func TestRunToDTOForgeParkFields(t *testing.T) {
+	retry := time.Date(2026, 9, 15, 8, 30, 0, 0, time.UTC)
+	const cap = 6
+
+	parked := runToDTO(store.Run{
+		Status:                 "recovery_wait",
+		RecoveryWaitCause:      pgtype.Text{String: "forge_unreachable", Valid: true},
+		RecoveryRetryNotBefore: pgtype.Timestamptz{Time: retry, Valid: true},
+		ForgeParkCount:         3,
+	}, "normal", 0, 0, cap, dtoTestNow)
+	if parked.RecoveryWaitCause == nil || *parked.RecoveryWaitCause != "forge_unreachable" {
+		t.Errorf("recovery_wait_cause = %v, want forge_unreachable", parked.RecoveryWaitCause)
+	}
+	if parked.RecoveryRetryNotBefore == nil || !parked.RecoveryRetryNotBefore.Equal(retry) {
+		t.Errorf("recovery_retry_not_before = %v, want %v", parked.RecoveryRetryNotBefore, retry)
+	}
+	if parked.ForgeParkCount != 3 {
+		t.Errorf("forge_park_count = %d, want 3", parked.ForgeParkCount)
+	}
+	// forge_park_max is the caller-supplied cap (6), NOT the run's count (3) — swapping the two
+	// (a plausible mapper bug) reddens because 6 != 3, and dropping the ForgeParkMax line reddens
+	// because the zero value 0 != 6.
+	if parked.ForgeParkMax != cap {
+		t.Errorf("forge_park_max = %d, want %d (the configured cap)", parked.ForgeParkMax, cap)
+	}
+
+	// An unparked/legacy run: NULL cause + NULL retry + zero count → null/null/0.
+	legacy := runToDTO(store.Run{Status: "completed"}, "normal", 0, 0, cap, dtoTestNow)
+	if legacy.RecoveryWaitCause != nil {
+		t.Errorf("legacy recovery_wait_cause = %q, want nil", *legacy.RecoveryWaitCause)
+	}
+	if legacy.RecoveryRetryNotBefore != nil {
+		t.Errorf("legacy recovery_retry_not_before = %v, want nil", *legacy.RecoveryRetryNotBefore)
+	}
+	if legacy.ForgeParkCount != 0 {
+		t.Errorf("legacy forge_park_count = %d, want 0", legacy.ForgeParkCount)
+	}
+	// forge_park_max is present on EVERY run (instance config), independent of park state.
+	if legacy.ForgeParkMax != cap {
+		t.Errorf("legacy forge_park_max = %d, want %d (the cap rides every run)", legacy.ForgeParkMax, cap)
 	}
 }
 
@@ -438,6 +497,115 @@ func TestGetRunPopulatesOwnAgents(t *testing.T) {
 		if a.Name == "lead" {
 			t.Fatalf("lead must be stripped from own_agents, got %+v", got)
 		}
+	}
+}
+
+// TestGetRunCredentialSwitchSuppression proves the PRD #1247 Step A enrichment override
+// (runs_lifecycle.go): the run-detail DTO suppresses a KNOWN-STALE credential_switch once an
+// APPLIED credential epoch exists at a generation STRICTLY GREATER THAN the switch stamp's
+// generation. credentialSwitchState derives credential_switch purely from the run row, but the
+// DB clear of the stamp on a successful application is deferred (D14 / #1422), so after a
+// release+reclaim the row still reads "requested"/"released" for a switch already applied. The
+// strict-> comparator is the crux: recordRunCredential already wrote an epoch AT the stamp
+// generation when the current claim opened, so an epoch == G is the pre-request epoch and must
+// NOT suppress — only an applied epoch at > G, written after the reclaim, does. Drives the real
+// GetRun HTTP enrichment path so it exercises the override, not a reimplementation.
+func TestGetRunCredentialSwitchSuppression(t *testing.T) {
+	str := func(s string) *string { return &s }
+	reqAt := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	applied := func(gen int64) store.RunCredentialEpoch {
+		return store.RunCredentialEpoch{ClaimGeneration: gen, AppliedAt: pgtype.Timestamptz{Time: reqAt.Add(time.Minute), Valid: true}}
+	}
+	unapplied := func(gen int64) store.RunCredentialEpoch {
+		// AppliedAt left zero (Valid=false): the epoch row exists but the switch is not
+		// yet applied at that generation.
+		return store.RunCredentialEpoch{ClaimGeneration: gen}
+	}
+
+	const stampGen = 5
+	requested := pgtype.Timestamptz{Time: reqAt, Valid: true}
+	released := pgtype.Timestamptz{Time: reqAt, Valid: true} // >= requested → "released"
+	stamp := pgtype.Int8{Int64: stampGen, Valid: true}
+
+	cases := []struct {
+		name    string
+		release pgtype.Timestamptz
+		epochs  []store.RunCredentialEpoch
+		want    *string // nil = suppressed (credential_switch: null)
+	}{
+		{
+			// Requested, not released, no later applied epoch → stays "requested".
+			name:    "pending stays requested",
+			release: pgtype.Timestamptz{}, // not released
+			epochs:  nil,
+			want:    str("requested"),
+		},
+		{
+			// Released, an applied epoch AT the stamp generation (== G, the current claim's
+			// pre-request epoch) → NOT suppressed. The key strict-> guard.
+			name:    "same-generation epoch keeps released visible",
+			release: released,
+			epochs:  []store.RunCredentialEpoch{applied(stampGen)},
+			want:    str("released"),
+		},
+		{
+			// Released, an applied epoch at G plus an UNAPPLIED later epoch (applied_at
+			// invalid): no APPLIED epoch at > G, so still "released".
+			name:    "later epoch not yet applied keeps released",
+			release: released,
+			epochs:  []store.RunCredentialEpoch{applied(stampGen), unapplied(stampGen + 1)},
+			want:    str("released"),
+		},
+		{
+			// Released, an applied epoch at G+1 (> stamp) → suppressed to null.
+			name:    "applied epoch past stamp suppresses",
+			release: released,
+			epochs:  []store.RunCredentialEpoch{applied(stampGen), applied(stampGen + 1)},
+			want:    nil,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			owner := store.User{ID: uuid.New()}
+			runID := uuid.New()
+			st := &runsStore{
+				ownerID: owner.ID,
+				run: store.Run{
+					ID:                          runID,
+					UserID:                      owner.ID,
+					Status:                      "running",
+					CredentialSwitchRequestedAt: requested,
+					ClaimReleasedAt:             tc.release,
+					CredentialSwitchGeneration:  stamp,
+				},
+				credentialEpochs: tc.epochs,
+			}
+			h := newRunsHandler(t, st)
+
+			rec := httptest.NewRecorder()
+			h.GetRun(rec, runReq(owner, runID))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("GetRun = %d, want 200", rec.Code)
+			}
+			var body struct {
+				Run struct {
+					CredentialSwitch *string `json:"credential_switch"`
+				} `json:"run"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Fatalf("decode body: %v", err)
+			}
+			got := body.Run.CredentialSwitch
+			switch {
+			case tc.want == nil && got != nil:
+				t.Fatalf("credential_switch = %q, want null (suppressed)", *got)
+			case tc.want != nil && got == nil:
+				t.Fatalf("credential_switch = null, want %q", *tc.want)
+			case tc.want != nil && *got != *tc.want:
+				t.Fatalf("credential_switch = %q, want %q", *got, *tc.want)
+			}
+		})
 	}
 }
 

@@ -153,6 +153,177 @@ describe("codex transport: notification decoding", () => {
     await transport.close();
   });
 
+  it("decodes a REAL-WIRE thread/tokenUsage/updated frame (breakdowns under params.tokenUsage) as a TYPED token_usage_updated notification (PRD #1332 C4a)", async () => {
+    // This feeds the EXACT pinned wire shape THROUGH the real transport decode path (writeFrame
+    // → decodeNotification), not a pre-decoded note: params = { threadId, turnId, tokenUsage: {
+    // total, last, modelContextWindow } } (commit 657a993…, ThreadTokenUsageUpdatedNotification).
+    // It fails on the pre-fix decoder, which only matched params.total/last or params.usage and
+    // so let the real frame fall through to `activity` — emitting NO modelUsage in production.
+    const { inbound, transport } = makePair();
+    const notes = transport.notifications();
+    writeFrame(inbound, {
+      method: "thread/tokenUsage/updated",
+      params: {
+        threadId: "th-9",
+        turnId: "tn-9",
+        tokenUsage: {
+          total: { inputTokens: 500, cachedInputTokens: 100, cacheWriteInputTokens: 20, outputTokens: 300, reasoningOutputTokens: 40, totalTokens: 800 },
+          last: { inputTokens: 120, cachedInputTokens: 30, cacheWriteInputTokens: 0, outputTokens: 80, reasoningOutputTokens: 10, totalTokens: 200 },
+          modelContextWindow: 272000,
+        },
+      },
+    });
+    const v = (await notes.next()).value as CodexNotification;
+    assert.equal(v.kind, "token_usage_updated");
+    if (v.kind === "token_usage_updated") {
+      assert.equal(v.threadId, "th-9");
+      assert.equal(v.turnId, "tn-9");
+      assert.deepEqual(v.usage.total, {
+        inputTokens: 500, cachedInputTokens: 100, cacheWriteInputTokens: 20, outputTokens: 300, reasoningOutputTokens: 40, totalTokens: 800,
+      });
+      assert.deepEqual(v.usage.last, {
+        inputTokens: 120, cachedInputTokens: 30, cacheWriteInputTokens: 0, outputTokens: 80, reasoningOutputTokens: 10, totalTokens: 200,
+      });
+      assert.equal(v.usage.modelContextWindow, 272000);
+      // m3 (CodeRabbit 4004800884): every priced bucket is a valid finite number ⇒ complete.
+      assert.equal(v.usage.pricingEvidenceComplete, true, "a fully well-formed frame is pricing-complete");
+    }
+    await transport.close();
+  });
+
+  it("RETAINS token totals for a present-but-malformed priced bucket but flags the frame pricing-incomplete (m3, CodeRabbit 4004800884)", async () => {
+    // Pre-m3 this test pinned pure coerce-and-accept. Post-m3 the token totals are STILL coerced and
+    // retained (token retention must never regress), but a PRESENT-but-malformed pricing-required
+    // bucket in `total` (inputTokens hostile string, cacheWriteInputTokens negative) marks the frame
+    // pricingEvidenceComplete=false so the accountant can fail cost closed. `last` here carries only
+    // totalTokens, so it is also incomplete because all four pricing-required buckets are absent.
+    const { inbound, transport } = makePair();
+    const notes = transport.notifications();
+    writeFrame(inbound, {
+      method: "thread/tokenUsage/updated",
+      params: {
+        threadId: "th-9",
+        turnId: "tn-9",
+        tokenUsage: {
+          // outputTokens ABSENT (lenient); inputTokens hostile (a string, malformed);
+          // cacheWriteInputTokens negative (malformed).
+          total: { inputTokens: "lots", cachedInputTokens: 50, cacheWriteInputTokens: -5, reasoningOutputTokens: 7, totalTokens: 90 },
+          last: { totalTokens: 10 },
+        },
+      },
+    });
+    const v = (await notes.next()).value as CodexNotification;
+    assert.equal(v.kind, "token_usage_updated");
+    if (v.kind === "token_usage_updated") {
+      // Token retention is UNCHANGED — the malformed/absent fields still coerce to 0.
+      assert.deepEqual(v.usage.total, {
+        inputTokens: 0, cachedInputTokens: 50, cacheWriteInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 7, totalTokens: 90,
+      });
+      assert.deepEqual(v.usage.last, {
+        inputTokens: 0, cachedInputTokens: 0, cacheWriteInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 10,
+      });
+      assert.equal(v.usage.modelContextWindow, undefined);
+      // The NEW fail-closed pricing signal: a present-but-malformed priced bucket ⇒ incomplete.
+      assert.equal(v.usage.pricingEvidenceComplete, false, "a present-but-malformed priced bucket flags the frame pricing-incomplete");
+    }
+    await transport.close();
+  });
+
+  it("flags pricing-incomplete when the malformation is in `last` while `total` is clean (m3)", async () => {
+    // The other half of the CodeRabbit-4004800884 bug: `total` is well-formed (the charged delta is
+    // fine) but `last` — the per-response pricing basis — carries a present-but-malformed priced
+    // bucket. The frame must decode and retain tokens, but be flagged pricing-incomplete.
+    const { inbound, transport } = makePair();
+    const notes = transport.notifications();
+    writeFrame(inbound, {
+      method: "thread/tokenUsage/updated",
+      params: {
+        threadId: "th-9",
+        turnId: "tn-9",
+        tokenUsage: {
+          total: { inputTokens: 500, cachedInputTokens: 100, cacheWriteInputTokens: 20, outputTokens: 300, reasoningOutputTokens: 40, totalTokens: 800 },
+          // outputTokens present-but-malformed (NaN over the wire arrives as a hostile value).
+          last: { inputTokens: 120, cachedInputTokens: 30, cacheWriteInputTokens: 0, outputTokens: "eighty", reasoningOutputTokens: 10, totalTokens: 200 },
+        },
+      },
+    });
+    const v = (await notes.next()).value as CodexNotification;
+    assert.equal(v.kind, "token_usage_updated");
+    if (v.kind === "token_usage_updated") {
+      // `total` is intact; `last.outputTokens` coerced to 0 but the frame is flagged incomplete.
+      assert.deepEqual(v.usage.total, {
+        inputTokens: 500, cachedInputTokens: 100, cacheWriteInputTokens: 20, outputTokens: 300, reasoningOutputTokens: 40, totalTokens: 800,
+      });
+      assert.equal(v.usage.last.outputTokens, 0, "the malformed last.outputTokens still coerces to 0 (tokens retained)");
+      assert.equal(v.usage.pricingEvidenceComplete, false, "a malformed priced bucket in `last` flags the frame pricing-incomplete");
+    }
+    await transport.close();
+  });
+
+  it("flags pricing-incomplete when any pricing-required bucket is absent (m3)", async () => {
+    // The pinned protocol requires all four priced buckets. Missing outputTokens and
+    // cacheWriteInputTokens retain zero-valued token placeholders, but cannot be treated as
+    // affirmative pricing evidence or an understated cost could be reported as metered.
+    const { inbound, transport } = makePair();
+    const notes = transport.notifications();
+    writeFrame(inbound, {
+      method: "thread/tokenUsage/updated",
+      params: {
+        threadId: "th-9",
+        turnId: "tn-9",
+        tokenUsage: {
+          total: { inputTokens: 400, cachedInputTokens: 100, totalTokens: 400 },
+          last: { inputTokens: 400, cachedInputTokens: 100, totalTokens: 400 },
+        },
+      },
+    });
+    const v = (await notes.next()).value as CodexNotification;
+    assert.equal(v.kind, "token_usage_updated");
+    if (v.kind === "token_usage_updated") {
+      assert.equal(v.usage.total.outputTokens, 0, "an absent priced bucket retains a zero token placeholder");
+      assert.equal(v.usage.pricingEvidenceComplete, false, "an absent required bucket fails pricing closed");
+    }
+    await transport.close();
+  });
+
+  it("a frame carrying total/last OUTSIDE params.tokenUsage (a shape the pinned protocol never emits) falls to activity", async () => {
+    // Guards the fix's direction: the pinned protocol nests the breakdowns ONLY under
+    // params.tokenUsage. The old decoder also matched params.total/last (top-level) and a
+    // params.usage object — shapes Codex never emits — so it could mis-decode a foreign frame
+    // as token usage. Both such shapes must now be liveness-only, never a token_usage_updated.
+    const { inbound, transport } = makePair();
+    const notes = transport.notifications();
+    writeFrame(inbound, {
+      method: "thread/tokenUsage/updated",
+      params: {
+        threadId: "th-9",
+        turnId: "tn-9",
+        // Breakdowns on params directly AND under a `usage` object — neither is `tokenUsage`.
+        total: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+        last: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+        usage: {
+          total: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+          last: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+        },
+      },
+    });
+    const v = (await notes.next()).value as CodexNotification;
+    assert.equal(v.kind, "activity");
+    assert.equal(v.kind === "activity" ? v.method : undefined, "thread/tokenUsage/updated");
+    await transport.close();
+  });
+
+  it("a token-usage frame missing turnId or a breakdown falls to activity (fail-safe liveness)", async () => {
+    const { inbound, transport } = makePair();
+    const notes = transport.notifications();
+    // No turnId, and no total/last at all — must never decode as a token_usage_updated.
+    writeFrame(inbound, { method: "thread/tokenUsage/updated", params: { threadId: "th-9" } });
+    const v = (await notes.next()).value as CodexNotification;
+    assert.equal(v.kind, "activity");
+    assert.equal(v.kind === "activity" ? v.method : undefined, "thread/tokenUsage/updated");
+    await transport.close();
+  });
+
   it("surfaces a server-initiated request (method + id) as activity carrying its requestId", async () => {
     const { inbound, transport } = makePair();
     const notes = transport.notifications();

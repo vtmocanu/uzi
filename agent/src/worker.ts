@@ -1,15 +1,19 @@
 import type { WorkerClient } from "./client.js";
 import { RequestError } from "./client.js";
+import { replaySegment } from "./batcher.js";
+import type { Outbox } from "./outbox.js";
 import type { RunRunner } from "./runner.js";
 import type { ChatRunner } from "./chat-runner.js";
 import type { JudgeRunner } from "./judge-runner.js";
 import type { ReviewRunner } from "./review-runner.js";
 import type { Logger } from "./log.js";
 import type { Config } from "./config.js";
-import type { WorkerStats } from "./protocol.js";
+import type { ActiveSnapshot, OutboxHeartbeatEntry, WorkerStats } from "./protocol.js";
+import type { ActiveRunRegistry } from "./active-run-registry.js";
 import { StatsCollector } from "./stats.js";
 import { errMessage, sleep } from "./util.js";
 import { toolchainPreflight, type PreflightResult } from "./toolchain-preflight.js";
+import { CODEX_HARNESS_CAPABILITY } from "./codex/codex-runtime-probe.js";
 
 /**
  * Outbound-only worker loop (a daemon model): register once, heartbeat on
@@ -37,7 +41,29 @@ export class Worker {
     // unit tests (which run on a non-image host with no `/opt/uzi-toolchain`) can pass a
     // stub; production uses the real check against the runner PATH.
     private readonly preflight: () => PreflightResult = () => toolchainPreflight(process.env),
+    // PRD #1391 M2: the worker-owned message outbox (main.ts builds + inits it before
+    // constructing the worker). The per-worker drainer replays every run's spilled
+    // segments over the messages route on each successful heartbeat and once on boot,
+    // and re-arms each run's live batcher (via `rearm`) once its segments retire.
+    // Undefined only in the concurrency/semaphore unit tests that never spill.
+    private readonly outbox?: Outbox,
+    // PRD #1391 M2: the shared re-arm registry — runId → the live batcher's `rearm()`.
+    // A RunRunner/ChatRunner registers its batcher here while it holds pending
+    // segments; the drainer calls the hook once the run's segments retire so the live
+    // batcher returns its flush target to the network.
+    private readonly rearm?: Map<string, () => void>,
+    // PRD #1390 M2a: the shared active-run registry the run lane + judge/review runners
+    // write as they start/transition/finish. The worker READS it to build the
+    // ActiveSnapshot that rides every heartbeat and run-lane claim. Undefined in the
+    // concurrency/semaphore unit tests that never negotiate the feature — buildActiveSnapshot
+    // then returns undefined and no snapshot is ever sent.
+    private readonly activeRuns?: ActiveRunRegistry,
   ) {}
+
+  /** PRD #1391 M2: single-flight guard — never two outbox drains at once (a heartbeat
+   *  tick must not start a drain while the boot drain, or a prior tick's drain, is
+   *  still running). */
+  private draining = false;
 
   async run(signal: AbortSignal): Promise<void> {
     // PRD #92 M3 — fail-loud boot toolchain preflight, BEFORE the register retry loop.
@@ -67,6 +93,24 @@ export class Worker {
     void this.runner.resumePendingRecoveries(signal).catch((err) => {
       this.log.warn("recovery: restart resume sweep failed", { error: errMessage(err) });
     });
+    // PRD #1391 M2: admit any spill tail a crash may have lost, then drain the outbox
+    // once in the background. On boot, for each run whose `spilled_unclean` flag was set
+    // at init, log ONCE that an unflushed tail MAY have been lost — naming NO span and
+    // NO count, because nothing durable can size it (the crash-before-range-flush
+    // admitted-loss log). Then a boot drain replays any pending segments without waiting
+    // for the first heartbeat. Fire-and-forget and fully swallowed — a drain must never
+    // block the claim loops.
+    if (this.outbox) {
+      for (const runId of this.outbox.uncleanRuns()) {
+        this.log.warn(
+          "outbox: a run was spilling when the worker last stopped; an unflushed tail may have been lost",
+          { run_id: runId },
+        );
+      }
+      void this.drainOutbox(signal).catch((err) => {
+        this.log.warn("outbox boot drain failed", { error: errMessage(err) });
+      });
+    }
     // Heartbeat, the run lane, and the chat lane run concurrently until abort.
     await Promise.all([this.heartbeatLoop(signal), this.claimLoop(signal), this.chatClaimLoop(signal)]);
   }
@@ -86,12 +130,42 @@ export class Worker {
         // unconditionally announces completion_interlock_v1. It also implements the PRD
         // #1296 durable-recovery archive protocol (D9), so it announces
         // recovery_archive_v1 — the flag M1's ClaimRun reads to open a custody hold for
-        // this worker on a code-publishing run. Kept SEPARATE from `capabilities` (the
-        // scheduler vocabulary) on the wire: the server stores it in
+        // this worker on a code-publishing run — AND the PRD #1349 generation-exact
+        // extension recovery_archive_v2, advertised ALONGSIDE v1 during rollout (v2 is a
+        // strict superset; the server's RecoveryCapable gate stays keyed on v1 until a
+        // later milestone flips it, so advertising both is safe). Kept SEPARATE from
+        // `capabilities` (the scheduler vocabulary) on the wire: the server stores it in
         // workers.protocol_capabilities and the ClaimRun hard clause reads it there,
         // OUTSIDE required_capabilities and the capability_aware kill-switch, so an old
         // image that omits it can never claim an interlocked run or open a custody hold.
-        const protocolCapabilities = ["completion_interlock_v1", "recovery_archive_v1"];
+        const protocolCapabilities = [
+          "completion_interlock_v1",
+          "recovery_archive_v1",
+          "recovery_archive_v2",
+          // PRD #1247 M5b (D3/protocol §9): this image implements the held-state credential-switch
+          // protocol — it stamps claim_generation on every mutating report (already landed in W2a),
+          // surfaces the credential_switch signal, and performs the two-phase release. Advertised
+          // UNCONDITIONALLY (like completion_interlock_v1): the server then REQUIRES claim_generation
+          // on every mutating report for this worker's fenced claims, which W2a already stamps, so it
+          // is safe to land now. An image WITHOUT this flag keeps working on legacy claims, and the
+          // held-state `set-token` verb 409s naming the worker.
+          "credential_switch_v1",
+        ];
+        // PRD #1332 D3 (M5A / C2): advertise the Codex harness PROTOCOL capability ONLY
+        // after a successful startup runtime probe of the pinned, image-baked Codex
+        // package. main.ts resolved that probe ONCE (like dockerWiring) and stored the
+        // boolean on config; a positive result APPENDS codex_harness_v1, a failed/absent
+        // one leaves the array unchanged so a stripped/corrupt/mismatched/old image keeps
+        // serving Claude. The `?.` degrades safe to "not capable" if the field is somehow
+        // unset — registration must never throw on a config quirk. The server now ADMITS
+        // codex_harness_v1 into its protocol vocabulary (FilterProtocol keeps it) and gates
+        // run placement/claim on it (the ClaimRun dedicated Codex clause admits a
+        // Codex-indicating run only for a worker that self-reported it). M5A stays dark
+        // regardless: no public DTO/CLI/web selector exposes Codex, so advertising this
+        // protocol fact is invisible to users until a later milestone lights it up.
+        if (this.config.codexProbe?.capable) {
+          protocolCapabilities.push(CODEX_HARNESS_CAPABILITY);
+        }
         const res = await this.client.register(
           this.config.workerName,
           this.config.workerTemplate,
@@ -137,12 +211,108 @@ export class Worker {
     // (PRD #837 M1); /nix stays the fixed default inside the collector.
     const stats = new StatsCollector({ dataDir: this.config.dataDir });
     while (!signal.aborted) {
+      let ok = false;
       try {
-        await this.client.heartbeat(this.collectStats(stats));
+        // PRD #1391 M5: report per-run outbox depth alongside the resource sample. The
+        // client sends the array only when the server negotiated `heartbeat_outbox`,
+        // so an older api sees a byte-identical heartbeat. Assembled BEFORE the send so
+        // the first recovered heartbeat carries the depth ahead of that tick's drain.
+        // PRD #1390 M2a: the active-run snapshot rides the same send (built here so its
+        // epoch is drawn from the ONE monotonic counter the claim loop also draws from).
+        await this.client.heartbeat(this.collectStats(stats), this.outboxEntries(), this.buildActiveSnapshot());
+        ok = true;
       } catch (err) {
         this.log.warn("heartbeat failed", { error: errMessage(err) });
       }
+      // PRD #1391 M2: the re-arm trigger — on EACH successful heartbeat, drain the
+      // outbox (single-flight). FIRE-AND-FORGET, like the boot drain: `drainOutbox`
+      // replays the ENTIRE per-run backlog with no time budget, so awaiting it here
+      // could push the next heartbeat past the api's 45s stale cutoff (message POSTs
+      // do not refresh liveness) → the sweeper marks the worker offline and re-queues
+      // its still-running runs (duplicate execution) during the very recovery this
+      // feature exists to handle. The heartbeat must keep ticking on its interval; the
+      // single-flight `draining` guard already makes a tick that fires mid-drain a
+      // no-op. The depth was already assembled and SENT above (before this tick's
+      // drain starts), so it is reported regardless. Guarded so a drain error never
+      // escapes the loop (mirrors the heartbeat try/catch above).
+      if (ok) {
+        void this.drainOutbox(signal).catch((err) => {
+          this.log.warn("outbox drain failed", { error: errMessage(err) });
+        });
+      }
       await sleep(this.config.heartbeatIntervalMs, signal);
+    }
+  }
+
+  /** PRD #1391 M5: assemble the per-run outbox depth for the heartbeat, mapping every
+   *  run with pending outbox depth to the wire {@link OutboxHeartbeatEntry} shape
+   *  (`pending_terminal` is always 0 in Run A). Undefined when there is no outbox or
+   *  nothing pending, so the heartbeat wire stays byte-identical. */
+  private outboxEntries(): OutboxHeartbeatEntry[] | undefined {
+    if (!this.outbox) return undefined;
+    const entries: OutboxHeartbeatEntry[] = [];
+    for (const runId of this.outbox.runsWithPending()) {
+      const d = this.outbox.depthFor(runId);
+      if (!d) continue;
+      entries.push({
+        run_id: d.runId,
+        pending_messages: d.pendingMessages,
+        pending_terminal: d.pendingTerminal,
+        stale_retired: d.staleRetired,
+        since: d.since,
+        ...(d.blockedReason ? { blocked_reason: d.blockedReason } : {}),
+      });
+    }
+    return entries.length > 0 ? entries : undefined;
+  }
+
+  /**
+   * PRD #1390 M2a: build the active-run snapshot the heartbeat and the run-lane claim
+   * both carry, from the shared {@link ActiveRunRegistry}. Returns undefined — so no
+   * snapshot is sent and no epoch is spent — unless the registry exists AND the server
+   * negotiated `active_run_snapshot`. Both loops call this, so their `snapshot_epoch`
+   * values come from the ONE monotonic counter the registry owns. The client stamps the
+   * register nonce on send.
+   */
+  private buildActiveSnapshot(): ActiveSnapshot | undefined {
+    if (!this.activeRuns) return undefined;
+    if (!this.client.hasFeature("active_run_snapshot")) return undefined;
+    return this.activeRuns.build();
+  }
+
+  /**
+   * PRD #1391 M2: the per-worker, single-flight outbox drainer. For each run with
+   * pending segments, replay them in seq order over the messages route (poison inside
+   * a segment is tombstoned and the rest lands — {@link replaySegment}); on a fully
+   * retired run, re-arm its live batcher (if any) so it returns to the network. One
+   * run at a time, awaiting each and yielding between them, so two drains never run
+   * concurrently. A non-2xx that {@link replaySegment} re-throws (transient/fatal)
+   * stops that ONE run and leaves the rest pending for the next heartbeat.
+   */
+  private async drainOutbox(signal?: AbortSignal): Promise<void> {
+    const outbox = this.outbox;
+    if (!outbox) return;
+    if (this.draining) return; // single-flight
+    this.draining = true;
+    try {
+      for (const runId of outbox.runsWithPending()) {
+        if (signal?.aborted) break;
+        try {
+          const res = await outbox.drainRun(runId, (msgs, gen) =>
+            replaySegment(this.client, runId, msgs, gen, this.log),
+          );
+          if (res.retired) this.rearm?.get(runId)?.();
+        } catch (err) {
+          this.log.warn("outbox drain failed for a run; will retry next heartbeat", {
+            run_id: runId,
+            error: errMessage(err),
+          });
+        }
+        // Yield between runs so a long backlog never starves the event loop.
+        await Promise.resolve();
+      }
+    } finally {
+      this.draining = false;
     }
   }
 
@@ -179,6 +349,14 @@ export class Worker {
     const active = new Set<Promise<void>>();
     let loggedAtCapacity = false;
     while (!signal.aborted) {
+      // PRD #1390 M4 (e2e ONLY): the env-gated drop-execution seam pauses claiming (via the
+      // shared registry latch) so a silently-dropped run can be observed sitting `queued`
+      // before any reclaim. isClaimPausedForE2E() is a constant `false` in production (nothing
+      // latches it), so this is a no-op there; the e2e clears it by recreating the agent.
+      if (this.activeRuns?.isClaimPausedForE2E()) {
+        await sleep(this.config.pollIntervalMs, signal);
+        continue;
+      }
       if (active.size >= cap) {
         // At capacity: defer the claim (never claim without a free slot) and wake
         // when a slot frees or after a poll. Log once per saturation episode so a
@@ -196,8 +374,27 @@ export class Worker {
       loggedAtCapacity = false;
       let claimed = false;
       try {
-        const claim = await this.client.claimRun();
-        if (claim) {
+        // PRD #1390 M2a: carry the active-run snapshot on the claim (built from the SAME
+        // monotonic epoch counter the heartbeat draws from) so the api's pre-claim dedupe
+        // sees this worker's live runs even before the first post-outage heartbeat lands.
+        const claim = await this.client.claimRun(this.buildActiveSnapshot());
+        if (claim && this.activeRuns?.has(claim.run_id)) {
+          // PRD #1390 M3 (blocker 7) — belt-and-braces duplicate-claim assertion. The
+          // server-side pre-claim dedupe (M3 api) is the real guard; this is the loud last
+          // line of defence. The claim loop tracks in-flight PROMISES, not run ids, so a
+          // server that ever hands back a run this worker is ALREADY executing (the exact
+          // #1390 root cause: a same-worker re-claim of its own live run) would have
+          // `runner.execute` serialise a second attempt behind the first through
+          // `executionTails`, parking a slot AND opening a gen+1 custody hold. Refuse it:
+          // log LOUD (error, greppable, with run_id) and do NOT execute — no slot taken, no
+          // hold, no double-execution. `claimed` stays false so the loop backs off one poll
+          // rather than tight-looping on a persistently-buggy server. This is ADDITIVE — the
+          // Set<Promise> semaphore and the shutdown drain below are untouched.
+          this.log.error(
+            "claim returned a run this worker is already executing; refusing to double-execute",
+            { run_id: claim.run_id },
+          );
+        } else if (claim) {
           claimed = true;
           // PRD #400 M4b: a DIFF-REVIEW claim is a `task`-kind claim carrying a non-null
           // review_target_run_id — routed to the slim ReviewRunner (clone + diff + reviewer

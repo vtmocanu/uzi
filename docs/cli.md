@@ -105,6 +105,8 @@ uzi run inputs <id> [--json]
 uzi run expedite <id> [--clear]
 uzi run rework <id> [-m|--message <text>]
 uzi run export <id> --output <path> [--capture <id>]
+uzi run recovery <id> [--json]
+uzi run discard <id> --hold <hold-id> [--yes]
 uzi schedule create --repo <id> [--repo <id> ...] (--issue <iid> | --sweep [--label <l> ...] [--create-missing-labels] | --prompt <text>)
                     (--at <rfc3339> | --cron <expr>) [--tz <iana>]
                     [--auto-approve[=false]] [--wait-on-limit[=false]]
@@ -727,6 +729,39 @@ captures (the archive count, per-state tally, and each available capture's id) s
 know what `--capture` can fetch. It is metadata only and never claims an archive is
 available when it is not.
 
+### Reviewing and resolving held work: `uzi run recovery` / `uzi run discard`
+
+A run's custody hold reserves owner capacity while its committed-but-unpublished work is
+recovered. Holds are per claim generation and capped per owner, so unresolved holds can
+eventually block new code runs. `uzi run recovery` lists a run's holds and captures so you
+can see exactly what is retained:
+
+```
+uzi run recovery <run-id> [--json]
+```
+
+- Shows each hold's exact id, claim generation, and its attention state — active
+  protection, a capture in flight, an archive ready (which releases automatically), or a
+  capture-less source that needs a decision — plus any retained captures. `--json` prints
+  the raw rows for scripting. Owner-only.
+
+When a capture-less hold is genuinely not worth keeping, discard that one exact held
+source:
+
+```
+uzi run discard <run-id> --hold <hold-id> --yes
+```
+
+- **Names one exact hold.** `--hold` is required; the discard settles only that hold and
+  its non-ready captures. It never touches an *available* archive (delete that separately
+  from the run view) and never a sibling hold or another generation.
+- **Confirmation required, and it may be the only copy.** Without `--yes` it prompts
+  interactively and refuses outright when stdin is not a TTY (so a script cannot discard
+  unprompted); a declined prompt makes no change. Discarding a capture-less hold can
+  destroy the last copy of that work — export anything you might need first.
+- **Terminal and owner-scoped.** A discarded hold cannot be revived, and you can discard
+  only your own runs' holds.
+
 ## uzi handoff: ephemeral branch-scoped task runs
 
 ```sh
@@ -783,6 +818,12 @@ A few things worth knowing before you rely on this:
   *live* task branch mid-run, they're rejected non-fast-forward rather than
   clobbering the worker's history — a mid-run user push is out of scope for
   v1; use `uzi run follow-up <id>` to send the worker more context instead.
+- **The seeded branch is already published, so ask for a merge, not a
+  rebase.** Your seed push publishes `uzi/task/<id>` before the worker ever
+  starts, so a task prompt should say "merge main into this branch," never
+  "rebase onto main" — uzi can't force-push a rewrite of a branch it already
+  published, so a rebase there gets bridged (or, if that's impossible, fails
+  the run) at finalize instead of landing as asked.
 - **A raw handoff has no forge record.** With no issue and no MR (no `--mr`),
   there's nothing durable on the forge — the run transcript and your inline
   context are still persisted in uzi (`uzi run get`/`uzi run logs`), but if
@@ -1591,9 +1632,9 @@ A run's `status` (on `run get` and `run list`) is one of exactly **thirteen** va
   genuinely empty, resumed once a token is pooled — see [Letting uzi pick the
   token](anthropic-token.md#letting-uzi-pick-the-token-auto-selection);
 - `recovery_wait` — parked to recover from a resumed turn that came back empty
-  (no model activity); the sweep auto-resumes it on a capped backoff until it
-  recovers or you cancel it — see [Recovering from an empty
-  turn](run-recovery-wait.md).
+  (no model activity) or hit a transient provider error; the sweep auto-resumes
+  it on a capped backoff until it recovers or you cancel it — see [Recovering
+  from a transient interruption](run-recovery-wait.md).
 - `paused`: an owner-requested hold (`uzi run pause`), resumed on demand from
   the run page or `uzi run resume <id>`. See [Pausing and resuming a
   run](run-pause.md). It does **not** auto-resume. A `paused` run can instead

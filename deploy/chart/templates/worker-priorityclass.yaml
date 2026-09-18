@@ -20,6 +20,14 @@ metadata:
   name: {{ .Values.workers.priorityClass.name | default (printf "%s-hosted-worker" .Release.Name) }}
   labels:
     {{- include "uzi.labels" . | nindent 4 }}
+  annotations:
+    # `value` and `preemptionPolicy` are IMMUTABLE on a live PriorityClass. Replace=true
+    # alone runs `kubectl replace`, which is still an update and REJECTS a changed value
+    # ("may not be changed in an update"), wedging the sync. Force=true adds `--force`, so
+    # ArgoCD deletes and recreates the object instead; running worker pods keep the priority
+    # recorded at admission. Force=true is only honored alongside Replace=true. Same
+    # annotation as the app and db classes.
+    argocd.argoproj.io/sync-options: Force=true,Replace=true
 value: {{ .Values.workers.priorityClass.value }}
 # HARD-CODED false, never configurable: globalDefault: true would repriority every
 # pod cluster-wide that declares no priorityClassName, far outside uzi's blast radius.

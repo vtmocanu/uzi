@@ -198,7 +198,7 @@ can skip the wait with `uzi run resume-now <run-id>` or the run view's
 nothing pooled to spend at all, not that a pooled token hit its rate limit.
 It is also different from [a transient-recovery
 park](run-recovery-wait.md): `pool_wait` means there was nothing pooled to
-spend, not that a resumed turn came back empty.
+spend, not that a resumed turn hit a transient interruption.
 
 ### Reading it back
 
@@ -240,6 +240,69 @@ default. It covers the [run judge](./judge.md) and uzi's own self-improvement
 runs — retrospective work, which you may well want billed separately from the
 runs being reviewed. Leave it on **your default token** to keep everything on
 one account.
+
+## Choosing the token for one run
+
+A worker's or the judge's binding is the default a run picks up, but you can
+also choose the token for **one run**, or one scheduled job, without touching
+either binding. The choice lives on the run itself, so a worker bound to
+`console-key` can still spend `subscription` on one run you ask for.
+
+Four modes:
+
+| Mode | Meaning |
+|---|---|
+| **Inherit** (default) | No override — the run follows whatever the worker is bound to, exactly as today. |
+| **Pin** to a named token | Spend that token, whatever the worker is bound to. |
+| **Auto** | Auto-select from your pool for this run, even on a worker that is itself pinned or set to default. |
+| **Default** | Spend your default token, even on a worker that is pinned or set to auto. |
+
+`default` is not the same as `inherit` on a worker that isn't itself on
+default — `inherit` follows whatever the worker is currently bound to (auto,
+pinned, or default), while `default` always means your default token
+regardless of the worker.
+
+### Where you can pick it
+
+- **Starting a run**: the token picker in the start dialog, or
+  `uzi run create --token <label>|auto|default|inherit`.
+- **A schedule**: the same picker in the schedule modal, or
+  `uzi schedule create/edit --token <label>|auto|default|inherit`; every run
+  the schedule fires inherits its choice.
+- **At the plan gate**: a token picker next to the agent-source picker,
+  defaulting to inherit and shown explicitly rather than left blank; the
+  implementation phase runs on whatever you leave it at when you approve.
+  `uzi run approve --token <label>|auto|default|inherit` switches and
+  approves in one step.
+- **On a run already underway**: the run page's **Switch token** action, or
+  `uzi run set-token <run-id> <label>|--auto|--default|--inherit`. A queued
+  run picks the choice up at its next claim; a run parked on
+  [a usage limit, a pooled-token wait, or a transient recovery
+  park](run-limit-wait.md) promotes straight back to `queued`; a running run
+  or one held at the plan gate switches when the worker next releases its
+  claim, losing at most the step in flight (the run page says so before you
+  confirm). Switching to a token that looks tight can warn instead of refuse
+  — see [Claude rate limits](rate-limits.md).
+
+### Which choice wins
+
+Only one thing ever outranks a per-run choice: the [run judge](./judge.md)
+and uzi's own self-improvement runs always follow the **judge's** binding (see
+[above](#pointing-the-judge-at-a-token)) — a run override never reaches them.
+For every other run, the ladder is:
+
+1. A per-run override, if one is set — pinned, auto, or default.
+2. Otherwise, the worker's own binding.
+
+So setting a per-run token never changes what the worker itself is bound to,
+and clearing it (`--inherit`) hands the run straight back to that binding.
+
+`uzi run get` shows the current choice in a **TOKEN** row (next to the
+**ANTHROPIC_TOKEN** row for what the run actually spent), any switch that's
+in flight, and — once a run has spent more than one credential — a
+**TOKEN_HISTORY** of the switches that were actually applied; `--json`
+carries the same as `credential_override`, `credential_switch` and
+`credential_epochs`.
 
 ## Rotating a value
 

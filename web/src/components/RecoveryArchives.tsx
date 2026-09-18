@@ -1,6 +1,7 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { api, runArchiveDownloadUrl, type RecoveryArchiveSummary, type Run } from "../lib/api";
+import { errorMessage } from "../lib/apiError";
 import { stripUnsafeChars } from "../lib/safeText";
 import { useNow } from "../lib/useNow";
 import { formatCountdown } from "../lib/limitWait";
@@ -12,7 +13,7 @@ import {
   sortedArchives,
 } from "../lib/recovery";
 import { Alert, Badge, Button, Card, SectionTitle } from "./ui";
-import { ShieldIcon } from "./icons";
+import { ShieldIcon, TrashIcon } from "./icons";
 
 // RecoveryArchivesPanel is the run page's owner-facing durable-recovery section (PRD
 // #1296 M5, D6/D7). It is a TOP-LEVEL section, driven by the aggregate summary rather
@@ -26,6 +27,18 @@ import { ShieldIcon } from "./icons";
 // archive to a viewer the server would refuse.
 export function RecoveryArchivesPanel({ run }: { run: Run }) {
   const [summary, setSummary] = useState<RecoveryArchiveSummary | null>(null);
+
+  // Re-fetch the owner-scoped summary. Used on mount/status-change AND after a Delete
+  // archive so the list reflects the deletion (the server drops the capture / flips it to
+  // discarded) without an optimistic guess that could disagree with the aggregate counts.
+  const reload = useCallback(() => {
+    return api
+      .getRunArchives(run.id)
+      .then((s) => setSummary(s))
+      .catch(() => {
+        /* keep the last-good summary; a transient failure must not blank the section */
+      });
+  }, [run.id]);
 
   useEffect(() => {
     let live = true;
@@ -49,7 +62,8 @@ export function RecoveryArchivesPanel({ run }: { run: Run }) {
   if (!kind) return null;
 
   return (
-    <Card className="space-y-3 p-4">
+    // id anchor so the Workers custody surface can deep-link straight to a run's archives.
+    <Card id="recovery-archives" className="scroll-mt-20 space-y-3 p-4">
       <div className="flex items-center gap-2">
         <ShieldIcon className="h-4 w-4 text-muted" aria-hidden="true" />
         <SectionTitle>Recovery archives</SectionTitle>
@@ -93,7 +107,7 @@ export function RecoveryArchivesPanel({ run }: { run: Run }) {
           />
           <ul className="space-y-3">
             {sortedArchives(summary).map((cap) => (
-              <CaptureRow key={cap.id} runId={run.id} capture={cap} />
+              <CaptureRow key={cap.id} runId={run.id} capture={cap} onDeleted={reload} />
             ))}
           </ul>
         </>
@@ -109,13 +123,55 @@ export function RecoveryArchivesPanel({ run }: { run: Run }) {
 function CaptureRow({
   runId,
   capture,
+  onDeleted,
 }: {
   runId: string;
   capture: RecoveryArchiveSummary["archives"][number];
+  onDeleted: () => void;
 }) {
   const now = useNow(60_000);
   const view = captureView(capture.state);
   const expiresIn = capture.expires_at ? formatCountdown(capture.expires_at, now) : null;
+  // "Delete archive" (D7/D9) is artifact cleanup, distinct from the "Discard held work"
+  // hold discard. It is offered only while the archive artifact meaningfully exists — an
+  // available (downloadable) capture, or a needs_action one that still retains recovery —
+  // never for an in-flight (preparing/uploading) capture the worker owns, nor an already
+  // gone (expired/discarded) one.
+  const deletable = capture.state === "available" || capture.state === "needs_action";
+  const [confirming, setConfirming] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const confirmRef = useRef<HTMLDivElement>(null);
+  const deleteBtnId = `delete-archive-btn-${capture.id}`;
+  const warningId = `delete-archive-warning-${capture.id}`;
+  const [restoreFocus, setRestoreFocus] = useState(false);
+
+  useEffect(() => {
+    if (confirming) confirmRef.current?.focus();
+  }, [confirming]);
+  useEffect(() => {
+    if (restoreFocus && !confirming) {
+      document.getElementById(deleteBtnId)?.focus();
+      setRestoreFocus(false);
+    }
+  }, [restoreFocus, confirming, deleteBtnId]);
+
+  const dismiss = () => {
+    setConfirming(false);
+    setError("");
+    setRestoreFocus(true);
+  };
+  const remove = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      await api.discardRunArchive(runId, capture.id);
+      onDeleted();
+    } catch (e) {
+      setError(errorMessage(e, "Could not delete the archive."));
+      setBusy(false);
+    }
+  };
 
   return (
     <li className="rounded-lg border border-edge bg-raised/40 p-3">
@@ -127,22 +183,68 @@ function CaptureRow({
           </span>
           <span className="text-xs text-faint">{formatArchiveSize(capture.byte_size)}</span>
         </div>
-        {view.downloadable ? (
-          // An authenticated same-origin attachment link (D6): the browser sends the
-          // session cookie, the server sets Content-Disposition/no-store, and no
-          // presigned/public URL is minted. `download` asks for a save rather than a
-          // navigation; the server-generated filename wins over this hint.
-          <a href={runArchiveDownloadUrl(runId, capture.id)} download>
-            <Button variant="primary" size="sm">
-              Download bundle
+        <div className="flex flex-wrap items-center gap-1.5">
+          {view.downloadable ? (
+            // An authenticated same-origin attachment link (D6) STYLED as a button — never
+            // an <a> wrapping a <Button>, which is two tab stops + a doubled screen-reader
+            // announcement and invalid HTML. The browser sends the session cookie, the
+            // server sets Content-Disposition/no-store, and no presigned/public URL is
+            // minted. `download` asks for a save rather than a navigation; the
+            // server-generated filename wins over this hint. The className mirrors the
+            // primary Button (size sm); the global a:focus-visible rule (index.css) gives
+            // it the same keyboard ring.
+            <a
+              href={runArchiveDownloadUrl(runId, capture.id)}
+              download
+              className="inline-flex h-7 shrink-0 select-none items-center justify-center gap-1 rounded-lg bg-brand px-2.5 text-xs font-medium text-on-brand transition-colors hover:bg-brand-hover"
+            >
+              Export archive
+            </a>
+          ) : (
+            <Button variant="secondary" size="sm" disabled>
+              Export archive
             </Button>
-          </a>
-        ) : (
-          <Button variant="secondary" size="sm" disabled>
-            Download bundle
-          </Button>
-        )}
+          )}
+          {deletable && !confirming && (
+            <Button id={deleteBtnId} variant="danger" size="sm" onClick={() => setConfirming(true)}>
+              <TrashIcon /> Delete archive
+            </Button>
+          )}
+        </div>
       </div>
+
+      {confirming && (
+        <div
+          ref={confirmRef}
+          tabIndex={-1}
+          role="group"
+          aria-label="Delete this recovery archive"
+          aria-describedby={warningId}
+          onKeyDown={(e) => {
+            if (e.key === "Escape") dismiss();
+          }}
+          className="mt-3 space-y-3 rounded-lg border border-danger/40 bg-danger/10 p-3 outline-hidden"
+        >
+          {/* D9 archive-deletion strength: warn that the server copy may be the only
+              remaining recovery artifact, and recommend exporting first. Weaker than the
+              possible-only-copy hold discard (no typed confirmation), stronger than a bare
+              are-you-sure. */}
+          <p id={warningId} className="text-sm text-danger">
+            {view.downloadable
+              ? "This permanently deletes the archived committed history from the server. It may be the only remaining copy of this work — export it first if you might need it. This cannot be undone."
+              : "This permanently deletes the retained recovery for this capture. It may be the only remaining copy of this work, and it cannot be undone."}
+          </p>
+          {error && <p className="text-xs text-danger">{error}</p>}
+          <div className="flex items-center gap-1.5">
+            <Button variant="dangerSolid" size="sm" disabled={busy} onClick={remove}>
+              {busy ? "Deleting…" : "Delete archive"}
+            </Button>
+            <Button variant="ghost" size="sm" onClick={dismiss} disabled={busy}>
+              Cancel
+            </Button>
+          </div>
+        </div>
+      )}
 
       <p className="mt-2 text-xs text-muted">{view.description}</p>
 

@@ -205,7 +205,7 @@ func (s *Service) evaluateAutoStop(ctx context.Context, now time.Time, c persist
 	//
 	// Sweep evicts at the requeue sites directly, which is immediate; this is the
 	// catch-all for every other path that resets status without a hook (Register's
-	// RequeueWorkerRuns returns no ids, so it has none), bounded by one sweep tick.
+	// requeue path wires no eviction hook, so it has none), bounded by one sweep tick.
 	//
 	// Chat coverage survives this: chat-runner.ts reports `running` before it does any
 	// work, so a wedged chat run is `running` exactly like an issue run.

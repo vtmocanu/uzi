@@ -27,6 +27,8 @@ import type { Readable } from "node:stream";
 import type { Logger } from "./log.js";
 import type {
   RecoveryCaptureStatusResponse,
+  RecoveryHold,
+  RecoveryHoldsResponse,
   RecoveryReleaseResponse,
   RecoveryReserveRequest,
   RecoveryReserveResponse,
@@ -83,8 +85,12 @@ export interface RecoveryRecord {
   kind: RunKind;
   /** The run's branch, used to name the bundle's source ref. */
   branch: string;
-  /** claim_generation when the server provides it. See the M3 report: the frozen
-   *  ClaimResponse does not carry claim_generation, so this is currently always absent. */
+  /** The exact claim generation this record's custody hold was taken at (PRD #1349 M1/M2,
+   *  D1). Populated from `claim.claim_generation` at every pin call site — the early
+   *  generation-evidence pin (after clone), the finalization pin, and the park / early-terminal
+   *  disposition — so a release or capture targets the ONE hold this generation owns and never
+   *  a sibling's. Optional only for a pre-#1296 payload from an older server that omits
+   *  `claim_generation`; a v1 record then settles by run+worker rather than by exact generation. */
   generation?: number;
   /** Epoch ms of the pin. */
   createdAt: number;
@@ -126,7 +132,18 @@ export interface RecoveryArchiveClient {
     bundle: Readable,
     signal?: AbortSignal,
   ): Promise<RecoveryCaptureStatusResponse>;
-  releaseRecoveryCustody(runId: string): Promise<RecoveryReleaseResponse>;
+  /** Release the run's custody. A v2 caller names the EXACT generation so the server settles
+   *  only the hold taken at that claim generation (PRD #1349 M1/M2, D1/D2); an omitted
+   *  generation is the v1 settle-by-run+worker fallback. `releaseEvidence` stamps the release's
+   *  evidence class (PRD #1392 M1/M2, fact 9), allowlisted server-side; omitted stores NULL. */
+  releaseRecoveryCustody(
+    runId: string,
+    generation?: number,
+    releaseEvidence?: string,
+  ): Promise<RecoveryReleaseResponse>;
+  /** The worker's own open custody holds on a run — the post-clone generation-exact inventory
+   *  (PRD #1349 M1/M2, D3). */
+  listRecoveryHolds(runId: string): Promise<RecoveryHoldsResponse>;
 }
 
 /** The bundle-producer subset {@link RecoveryCoordinator} needs — GitCache satisfies it. */
@@ -243,13 +260,39 @@ export class RecoveryCoordinator {
   async pin(input: PinInput): Promise<RecoveryRecord | undefined> {
     if (!this.enabled) return undefined;
     try {
-      const existing = await this.findRecord(input.runId, (r) => r.sourceSha === input.sourceSha);
+      // Idempotency key (PRD #1349 M2, D1): a v2 worker always carries claim_generation, so ONE
+      // record represents the ONE custody hold this run took at that exact generation. The EARLY
+      // generation-evidence pin (the restore point the run starts from) and the later
+      // finalization / park-terminal disposition pin then UPDATE the same record — its source
+      // advances from the start tip to the committed head as the run progresses, so no orphan
+      // base record is left behind for the restart sweep to flag needs_action. A v1 worker (no
+      // generation) falls back to (runId, sourceSha) matching, exactly as before.
+      const existing = await this.findRecord(
+        input.runId,
+        input.generation !== undefined
+          ? (r) => r.generation === input.generation
+          : (r) => r.sourceSha === input.sourceSha,
+      );
       if (existing) {
-        // Update the provenance H' if it is now known and was not recorded.
+        let changed = false;
+        // Advance the pinned source to the newest restore point for THIS generation (base →
+        // committed head), but NEVER re-point a record that already produced or uploaded a
+        // bundle: its source is bound to journaled bytes, so moving it would strand them.
+        if (existing.state === "pinned" && existing.sourceSha !== input.sourceSha) {
+          existing.sourceSha = input.sourceSha;
+          changed = true;
+        }
+        // Record the provenance H' once it is known and was not yet recorded.
         if (input.attemptedHeadSha && !existing.attemptedHeadSha) {
           existing.attemptedHeadSha = input.attemptedHeadSha;
-          await this.writeRecord(existing);
+          changed = true;
         }
+        // Fill the generation in if an earlier v1-shaped pin created the record without one.
+        if (existing.generation === undefined && input.generation !== undefined) {
+          existing.generation = input.generation;
+          changed = true;
+        }
+        if (changed) await this.writeRecord(existing);
         return existing;
       }
       const record: RecoveryRecord = {
@@ -300,9 +343,10 @@ export class RecoveryCoordinator {
       if (record.state !== "bundled") {
         const produced = await this.produceBundle(record, input);
         if (produced.kind === "already_published") {
-          // H is already on the fresh forge tip — verified no-unpublished-output (D3).
-          // Release custody and drop the local journal; nothing to archive.
-          await this.release(record.runId);
+          // H is already on the fresh forge tip — verified no-unpublished-output (D2/D3).
+          // Release THIS generation's exact hold and drop the local journal; nothing to archive.
+          // PRD #1392 M1/M2 (fact 9): a proven fresh-forge no-output release stamps forge_no_output.
+          await this.release(record.runId, record.generation, "forge_no_output");
           return { state: "uploaded", captureId: record.captureId, reason: "already_published" };
         }
         if (produced.kind !== "bundled") {
@@ -432,6 +476,9 @@ export class RecoveryCoordinator {
         idempotency_key: current.captureId,
         source_sha: current.sourceSha,
         ...(current.attemptedHeadSha ? { attempted_head_sha: current.attemptedHeadSha } : {}),
+        // Bind the reserve to the EXACT generation's hold (PRD #1349 M2, D1); a v1 record with
+        // no generation omits it and the server falls back to the newest-hold reserve.
+        ...(current.generation !== undefined ? { generation: current.generation } : {}),
       });
       current = { ...current, serverCaptureId: reserved.capture_id };
       await this.writeRecord(current);
@@ -468,26 +515,75 @@ export class RecoveryCoordinator {
   // ── D3: release custody on successful full publication ──────────────────────────
 
   /**
-   * Release the run's custody after a successful full publication (nothing to archive).
-   * Best-effort and idempotent: a failed release is NOT a precondition for reporting
-   * completion (a reconciler settles it later, D3), so this never throws to the caller. On a
-   * clean release, the run's local journal is removed.
+   * Release the run's custody after verified no-unpublished-output for the EXACT generation
+   * (a full publication, or a fresh-forge already-published proof). A v2 caller passes the
+   * generation so the server settles only the hold taken at that claim generation (PRD #1349
+   * M2, D1/D2); an omitted generation is the v1 settle-by-run+worker fallback.
+   *
+   * Best-effort and idempotent: a failed release is NOT a precondition for reporting completion
+   * (a reconciler settles it later, D3), so this never throws to the caller. The local journal
+   * is removed ONLY when the server actually released the hold — a server that RETAINED it
+   * (v1/ambiguous, `retained`) leaves the source protected, so the record stays for owner
+   * attention rather than deleting the only local pointer to it.
+   *
+   * PRD #1349 M2 (D1) — the local cleanup is GENERATION-SCOPED. M2 stores ONE record per
+   * generation (each with its own `<captureId>.json` + `<captureId>.bundle`), and on a same-worker
+   * affinity resume a retained sibling generation's record + bundle (possibly the last local copy of
+   * that generation's unpublished committed work) coexists with this generation's record in the
+   * SAME run dir. So a real release that names an exact generation removes ONLY that generation's
+   * record(s) + their bundle files, never the whole run dir — wiping the dir would take a sibling
+   * generation's work with it. Only the v1 fallback (generation omitted, at most one record) removes
+   * the whole run dir.
    */
-  async release(runId: string): Promise<void> {
+  async release(runId: string, generation?: number, releaseEvidence?: string): Promise<void> {
     if (!this.enabled) return;
     try {
-      const res = await this.client.releaseRecoveryCustody(runId);
-      this.log.info("recovery: released custody after successful publication", {
+      const res = await this.client.releaseRecoveryCustody(runId, generation, releaseEvidence);
+      this.log.info("recovery: released custody after verified no-unpublished-output", {
         run_id: runId,
+        generation,
+        release_evidence: releaseEvidence,
         released: res.released,
         holds_released: res.holds_released,
+        ...(res.retained ? { retained: res.retained, reason: res.reason } : {}),
       });
-      await this.removeRunDir(runId);
+      if (!res.retained) {
+        if (generation !== undefined) {
+          await this.removeGenerationRecords(runId, generation);
+        } else {
+          await this.removeRunDir(runId);
+        }
+      }
     } catch (err) {
       this.log.warn("recovery: custody release failed (a reconciler will retry; completion is unaffected)", {
         run_id: runId,
         error: errText(err),
       });
+    }
+  }
+
+  // ── D3: post-clone generation-exact prior-hold inventory ─────────────────────────
+
+  /**
+   * PRD #1349 M2 (D3): the post-clone, pre-model inventory of THIS run's own open custody
+   * holds — exact hold ids + generations, plus each hold's capture state. Purely
+   * observational: it NEVER computes `current - 1`, and NEVER releases or transfers a hold by
+   * itself. Ancestry settlement of any predecessor generation is deferred to disposition time
+   * against the final durable head; same-worker identity is never proof of source continuity.
+   * Best-effort: returns [] when recovery is disabled or on any transport failure, so it can
+   * never disturb the run's start.
+   */
+  async inventoryHolds(runId: string): Promise<RecoveryHold[]> {
+    if (!this.enabled) return [];
+    try {
+      const res = await this.client.listRecoveryHolds(runId);
+      return res.holds ?? [];
+    } catch (err) {
+      this.log.warn("recovery: prior-hold inventory failed (custody unchanged)", {
+        run_id: runId,
+        error: errText(err),
+      });
+      return [];
     }
   }
 
@@ -642,6 +738,31 @@ export class RecoveryCoordinator {
 
   private async removeRunDir(runId: string): Promise<void> {
     await fs.rm(this.runDir(runId), { recursive: true, force: true }).catch(() => undefined);
+  }
+
+  /**
+   * PRD #1349 M2 (D1) — remove ONLY the released generation's record(s) + their bundle files,
+   * leaving every sibling generation's record (and its possibly-last-local-copy bundle) intact.
+   * When this was the run's only generation the now-empty run dir is dropped, so a clean release of
+   * the sole hold still tidies the journal exactly as the v1 whole-dir removal did.
+   */
+  private async removeGenerationRecords(runId: string, generation: number): Promise<void> {
+    const records = await this.listRecords(runId);
+    let remaining = 0;
+    for (const record of records) {
+      if (record.generation === generation) {
+        await fs.rm(this.recordPath(record), { force: true }).catch(() => undefined);
+        // The bundle lives at the canonical <captureId>.bundle path; remove any distinct
+        // journaled bundlePath too, so a released generation never leaks its bytes.
+        await fs.rm(this.bundlePath(record), { force: true }).catch(() => undefined);
+        if (record.bundlePath && record.bundlePath !== this.bundlePath(record)) {
+          await fs.rm(record.bundlePath, { force: true }).catch(() => undefined);
+        }
+      } else {
+        remaining++;
+      }
+    }
+    if (remaining === 0) await this.removeRunDir(runId);
   }
 }
 

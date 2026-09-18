@@ -1,7 +1,10 @@
 import os from "node:os";
 import fs from "node:fs";
+import path from "node:path";
 import type { LogLevel } from "./log.js";
 import type { DockerWiring } from "./docker-wiring.js";
+import type { CodexRuntimeProbeResult } from "./codex/codex-runtime-probe.js";
+import { TRANSIENT_TRIP_MS } from "./batcher.js";
 import { errMessage } from "./util.js";
 
 // Worker configuration, parsed from env (PRD #4 §Configuration).
@@ -113,6 +116,17 @@ export interface Config {
    */
   dockerWiring: DockerWiring;
   /**
+   * The worker's resolved Codex runtime-probe outcome (PRD #1332 D3 / M5A C2). Like
+   * {@link dockerWiring}, `loadConfig` leaves it `{ capable: false }` — resolution reads
+   * the root-owned Codex receipt and recomputes member digests (async), so it cannot
+   * happen in the sync env parse; main.ts calls `probeCodexRuntime` ONCE at startup and
+   * populates this before the worker registers. `capable === true` ⇒ the pinned Codex
+   * package is present and intact, so the worker advertises the `codex_harness_v1`
+   * PROTOCOL capability; otherwise the capability is omitted and the worker keeps serving
+   * Claude. A stripped/hand-built/corrupt/mismatched/old image resolves to not-capable.
+   */
+  codexProbe: CodexRuntimeProbeResult;
+  /**
    * Readiness-wait knobs for the docker-wiring probe (PRD #83 M2 follow-up,
    * UZI_DOCKER_READY_INTERVAL / UZI_DOCKER_READY_TIMEOUT). When a sidecar is EXPECTED
    * (DOCKER_HOST or UZI_DIND_SOCKET set), the startup probe is retried every
@@ -122,6 +136,49 @@ export interface Config {
    */
   dockerReadyIntervalMs: number;
   dockerReadyTimeoutMs: number;
+  /**
+   * PRD #1391 M1: the worker-owned authenticated message outbox tree, rooted at
+   * `<dataDir>/outbox`. When the api is unreachable the batcher spills run
+   * messages here as fsync'd immutable segments and a per-worker drainer replays
+   * them in `seq` order once the api returns. Distinct from the run HOME (deleted
+   * at terminal cleanup) and from the recovery journal; a sibling of both under
+   * `/data`.
+   */
+  outboxDataDir: string;
+  /**
+   * Per-run byte quota for the outbox (WORKER_OUTBOX_RUN_MAX_BYTES, default
+   * 64 MiB). Before a segment is written, if adding it would exceed this the
+   * oldest segment of the run is replaced by one compact range record, so the
+   * run's on-disk footprint stays bounded (PRD #1391 D2).
+   */
+  outboxRunMaxBytes: number;
+  /**
+   * Worker-total byte quota across every run's outbox (WORKER_OUTBOX_MAX_BYTES,
+   * default 512 MiB). When it binds, the globally-oldest segment across all runs
+   * is evicted to a range record (PRD #1391 D2).
+   */
+  outboxMaxBytes: number;
+  /**
+   * How long a fully-retired (empty) run's outbox subtree is kept before the
+   * retention sweep age-deletes it (WORKER_OUTBOX_RETENTION, default 7d). Only
+   * runs whose records are all retired are eligible; a run with undrained
+   * segments is never removed by retention (PRD #1391 M1).
+   */
+  outboxRetentionMs: number;
+  /**
+   * PRD #1391 M2: how long an unbroken run of TRANSIENT message-flush failures may
+   * last before the batcher stops flushing to the network and starts spilling to the
+   * outbox (WORKER_TRANSIENT_TRIP_MS, default = batcher's TRANSIENT_TRIP_MS, 10 min).
+   * Overridable so the e2e outage phase can lower it and not wait ten real minutes.
+   */
+  transientTripMs: number;
+  /**
+   * PRD #1391 M2: the hard cap on the batcher's in-memory buffer while it is spilled
+   * to the outbox (WORKER_OUTBOX_SPILL_BUFFER_BYTES, default 2 MiB). A message that
+   * would exceed it is dropped and folded into a pending range record the next spill
+   * flush writes durably, so a spilled batcher can never grow memory without bound.
+   */
+  outboxSpillBufferBytes: number;
   logLevel: LogLevel;
 }
 
@@ -131,14 +188,17 @@ export interface Config {
  *  container. Advisory only, never enforced. */
 export const MAX_CONCURRENT_RUNS_SOFT_CEILING = 8;
 
-const DURATION_RE = /^(\d+)\s*(ms|s|m|h)?$/;
+const DURATION_RE = /^(\d+)\s*(ms|s|m|h|d)?$/;
 
-/** Parse "15s" / "500ms" / "2h" / "15000" into milliseconds. */
+/** Parse "15s" / "500ms" / "2h" / "7d" / "15000" into milliseconds. The `d`
+ *  (days) unit is carried for retention knobs that are naturally expressed in
+ *  days (WORKER_OUTBOX_RETENTION); the rest match the server-side duration set. */
 function parseDuration(value: string): number {
   const m = DURATION_RE.exec(value.trim());
   if (!m) throw new Error(`invalid duration: ${JSON.stringify(value)}`);
   const n = Number(m[1]);
   switch (m[2]) {
+    case "d": return n * 86_400_000;
     case "h": return n * 3_600_000;
     case "m": return n * 60_000;
     case "s": return n * 1_000;
@@ -237,10 +297,11 @@ function resolveWorkerToken(env: NodeJS.ProcessEnv): string {
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const apiUrl = required(env, "UZI_API_URL").replace(/\/+$/, "");
   const rawLevel = env.UZI_LOG_LEVEL?.trim().toLowerCase() ?? "info";
+  const dataDir = env.UZI_DATA_DIR?.trim() || "/data";
   return {
     apiUrl,
     workerToken: resolveWorkerToken(env),
-    dataDir: env.UZI_DATA_DIR?.trim() || "/data",
+    dataDir,
     workerName: env.UZI_WORKER_NAME?.trim() || os.hostname(),
     workerTemplate: env.UZI_WORKER_TEMPLATE?.trim() || "base",
     // Build-stamped by CI (`publish:agent` passes the release tag as the
@@ -292,9 +353,26 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     // Populated by main.ts after an async liveness probe (see the field doc); the sync
     // parse cannot probe, so the default is "no daemon wired".
     dockerWiring: {},
+    // Populated by main.ts after the async Codex runtime probe (see the field doc); the
+    // sync parse cannot read/hash the receipt, so the default is "not capable" — a worker
+    // never advertises codex_harness_v1 until the probe positively confirms the layout.
+    codexProbe: { capable: false },
     // Readiness wait for an EXPECTED docker sidecar (M2 follow-up). ~1s poll, ~30s budget.
     dockerReadyIntervalMs: duration(env, "UZI_DOCKER_READY_INTERVAL", "1s"),
     dockerReadyTimeoutMs: duration(env, "UZI_DOCKER_READY_TIMEOUT", "30s"),
+    // Worker outbox (PRD #1391 M1). The tree is a fixed sibling of the recovery
+    // journal under /data; the two byte quotas and the retention window are the
+    // operator-tunable bounds. positiveInt keeps the byte knobs plain positive
+    // integers; the retention window is a duration string (the `d` unit above).
+    outboxDataDir: path.join(dataDir, "outbox"),
+    outboxRunMaxBytes: positiveInt(env, "WORKER_OUTBOX_RUN_MAX_BYTES", 64 * 1024 * 1024),
+    outboxMaxBytes: positiveInt(env, "WORKER_OUTBOX_MAX_BYTES", 512 * 1024 * 1024),
+    outboxRetentionMs: duration(env, "WORKER_OUTBOX_RETENTION", "7d"),
+    // PRD #1391 M2. The trip window is a duration (bare number = ms), defaulting to
+    // the batcher's baked TRANSIENT_TRIP_MS so the two never drift; the spill buffer
+    // cap is a plain positive byte count.
+    transientTripMs: duration(env, "WORKER_TRANSIENT_TRIP_MS", String(TRANSIENT_TRIP_MS)),
+    outboxSpillBufferBytes: positiveInt(env, "WORKER_OUTBOX_SPILL_BUFFER_BYTES", 2 * 1024 * 1024),
     logLevel: isLogLevel(rawLevel) ? rawLevel : "info",
   };
 }

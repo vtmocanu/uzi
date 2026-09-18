@@ -14,6 +14,15 @@ agent committed, not a diff or a rebased copy — into a durable, encrypted,
 owner-only Git bundle stored in the database. This is your recovery path
 even after the worker and its disk are gone.
 
+uzi captures at other boundaries too, not only at final failure: when a run
+is parked (a usage limit or a recovery wait) or gracefully stopped while it
+holds committed work, uzi archives that exact work before its source can be
+torn down. If the same boundary can *prove* the work is already published,
+it releases the hold instead of archiving; if it can neither prove that nor
+archive, it keeps the source held for you to decide (see below). A hard
+crash with no shutdown window — a killed node, an out-of-memory kill — is
+outside this guarantee.
+
 This is a safety net for a run that already produced real commits, not a
 guarantee against every possible failure. It does **not** cover uncommitted
 files, the SDK transcript, the worker's HOME directory, or a worker that
@@ -52,7 +61,7 @@ archive alone does not undo that exposure.
 
 ## Downloading an archive
 
-From the run page, click **Download bundle** once a capture shows
+From the run page, click **Export archive** once a capture shows
 **Available**. From the CLI:
 
 ```sh
@@ -116,14 +125,61 @@ While a run's committed work is unpublished and not yet durably captured
 that holds it is kept around rather than torn down, even if it would
 otherwise be idle or recycled. Such a worker shows a **retaining work**
 badge in the worker list. Deleting that worker is refused until the work is
-recovered or explicitly discarded, and the refusal names the recovery
-command (`uzi run export`) and how many holds are blocking the delete.
-Discarding an archive is an owner action against the API
-(`DELETE /api/runs/{run}/archives/{capture}`), not a CLI subcommand or a web
-button; left untouched, an archive simply expires after its retention
-window instead (see Limits above). Removing a repo that still has a run
-retaining custody this way is refused the same way, naming how many runs
-are retaining unpublished work.
+recovered or explicitly discarded, and the refusal names how many holds are
+blocking the delete and the exact commands to clear them (`uzi run recovery`
+to list, then `uzi run export` or `uzi run discard`). `uzi worker rm` never
+force-discards held work for you. Removing a repo that still has a run
+retaining custody this way is refused the same way, naming how many runs are
+retaining unpublished work.
+
+Each retained claim keeps its own hold, keyed to the exact claim that
+produced the work, so a later run on the same worker never drops an older
+claim's only copy.
+
+## Reviewing and resolving held work
+
+At most **8 unresolved holds per owner** (the *Unresolved recovery holds*
+limit above) can accumulate before uzi pauses admitting **new** runs for you.
+When that happens, the dashboard shows a full-width alert beneath the page
+heading with your safety-slot use, how many held sources need a decision, how
+many runs are blocked, and a **Review held work** button; if you connected
+Slack, you also get one coalesced direct message per blocked episode (not one
+per run) carrying your open-hold and blocked-run counts, a link to the surface,
+and the exact discard command. The per-worker **retaining work** pills stay as
+row context.
+
+The **Workers** settings page is where you resolve them: every retained hold
+is grouped by worker with the run it came from, its claim generation, and a
+state that separates normal active protection from holds that actually need
+you. Each row offers the right action for its state:
+
+- **Export archive** — download a ready archive (same bundle as `uzi run
+  export`). An archive-ready hold releases itself automatically once you have
+  a copy; it offers Export only and does not count as needing a decision.
+- **Discard held work** — for a hold whose source may be the only copy (no
+  ready archive can restore it), permanently release custody so the worker
+  and its disk can be torn down. The confirmation names the run, worker, and
+  claim generation, and warns that this can destroy the work for good.
+
+On the run page, the **Recovery archives** section offers **Export archive**
+and, once you have a copy, **Delete archive** — archive-artifact cleanup that
+is deliberately distinct from discarding a held source. Deleting an archive
+while its hold is still open does not resolve custody; left untouched, an
+archive simply expires after its retention window instead (see Limits above).
+
+From the CLI, list a run's holds and captures with `uzi run recovery
+<run-id>`, then discard one exact held source:
+
+```sh
+uzi run recovery <run-id>
+uzi run discard <run-id> --hold <hold-id> --yes
+```
+
+`uzi run discard` targets one exact hold, prompts for confirmation
+interactively, and requires `--yes` when there is no terminal. It never
+touches a ready archive or any other hold. See
+[the CLI reference](cli.md#recovering-unpublished-work-uzi-run-export) for the
+`uzi run export` flag and exit-code contract.
 
 ## What this is not: the threat model
 
@@ -143,6 +199,6 @@ executed on an older worker, or against an older server, is honestly
 reported as **unsupported** rather than silently promised a recovery that
 was never captured. Upgrading your fleet only protects runs going forward.
 
-Related: [Recovering from an empty turn](run-recovery-wait.md) (a different,
+Related: [Recovering from a transient interruption](run-recovery-wait.md) (a different,
 earlier mechanism — a transient in-place retry, not a byte archive) ·
 [Hosted workers](hosted-workers.md) · [CLI](cli.md)

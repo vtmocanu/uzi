@@ -179,5 +179,60 @@ fi
 find "$DEST" -exec chmod u-s,g-s,o-t {} + || die "chmod (clear setid) ${DEST} failed"
 chmod -R a+rX "$DEST" || die "chmod -R a+rX ${DEST} failed"
 
-# --- 6. done -----------------------------------------------------------------------
+# --- 6. write the root-owned runtime receipt (PRD #1332 D3 / M5A C2) ----------------
+# Leave a content-addressed receipt BESIDE the version root, at
+# ${PREFIX}/${CODEX_VERSION}.receipt.json (never under /tmp, so the Dockerfiles'
+# `rm -rf /tmp/codex` cannot remove it; never inside ${DEST}, so it sits beside — not
+# within — the immutable version tree). It binds ONLY build-time facts — the lock digest
+# (this arch's pinned tarball SHA256), the arch, the exact codex-cli version, and for the
+# installed binary + every required package member its absolute installed path, SHA-256
+# and mode (computed AFTER the final chmod above, so the recorded mode is the shipped
+# one). It carries NO credential and NO mutable HOME state. The startup runtime probe
+# (agent/src/codex/codex-runtime-probe.ts) re-derives this SAME path and re-verifies every
+# member before the worker advertises codex_harness_v1; a stripped/corrupt/mismatched
+# image whose members no longer match this receipt fails that probe and keeps serving
+# Claude. Written by the ONE shared installer so both worker templates emit it identically.
+RECEIPT="${PREFIX}/${CODEX_VERSION}.receipt.json"
+TMP_RECEIPT="${WORK}/receipt.json"
+{
+  printf '{\n'
+  printf '  "schemaVersion": 1,\n'
+  printf '  "codexVersion": "%s",\n' "$CODEX_VERSION"
+  printf '  "targetArch": "%s",\n' "$TARGETARCH"
+  printf '  "muslTarget": "%s",\n' "$MUSL_TARGET"
+  printf '  "lockDigest": "%s",\n' "$EXPECTED_SHA"
+  printf '  "prefix": "%s",\n' "$PREFIX"
+  printf '  "versionRoot": "%s",\n' "$DEST"
+  printf '  "members": [\n'
+  last_idx=$(( ${#member_arr[@]} - 1 ))
+  for i in "${!member_arr[@]}"; do
+    m="${member_arr[$i]}"
+    abs="${DEST}/${m}"
+    [ -f "$abs" ] || die "installed member missing for receipt: ${abs}"
+    msha="$(sha256sum "$abs" | awk '{print $1}')"
+    [ -n "$msha" ] || die "could not compute SHA256 of installed member ${abs}"
+    mmode="$(stat -c '%a' "$abs")"
+    [ -n "$mmode" ] || die "could not stat mode of installed member ${abs}"
+    sep=","
+    [ "$i" -eq "$last_idx" ] && sep=""
+    printf '    {"member": "%s", "path": "%s", "sha256": "%s", "mode": "%s"}%s\n' \
+      "$m" "$abs" "$msha" "$mmode" "$sep"
+  done
+  printf '  ]\n'
+  printf '}\n'
+} > "$TMP_RECEIPT"
+
+# Move into place, then normalize ownership/mode: root-owned when we are root (the real
+# build path) and ALWAYS world-readable (0644) so the unprivileged worker uid can read it
+# at startup — matching the a+rX the members already got.
+mv -f "$TMP_RECEIPT" "$RECEIPT" || die "could not place receipt at ${RECEIPT}"
+if [ "$(id -u)" = "0" ]; then
+  chown 0:0 "$RECEIPT" || die "chown root:root ${RECEIPT} failed"
+else
+  log "not root — skipping receipt chown (rootless test install)"
+fi
+chmod 0644 "$RECEIPT" || die "chmod 0644 ${RECEIPT} failed"
+log "wrote runtime receipt ${RECEIPT} (${#member_arr[@]} members, lock ${EXPECTED_SHA})"
+
+# --- 7. done -----------------------------------------------------------------------
 log "installed Codex ${CODEX_VERSION} at ${DEST} (bin/codex + bin/codex-code-mode-host, not on PATH)"

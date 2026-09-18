@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"net/http"
 	"strings"
 	"testing"
@@ -349,6 +350,19 @@ func TestOnlyEnabled(t *testing.T) {
 	// short-circuit, or the repoint's repo_id would be silently dropped (Feature A, PRD #344).
 	if onlyEnabled(apitypes.ScheduleRequest{Enabled: &yes, RepoID: "some-id"}) {
 		t.Fatalf("enabled + repo_id is NOT onlyEnabled (else the repoint is dropped)")
+	}
+	// enabled + a PRESENT credential_override is a config PATCH, not enabled-only: it must
+	// NOT short-circuit, or the override would be silently dropped (PRD #1247 M6, the same
+	// bug class as model/override_subagent_model/repo_id above). A PRESENT wrapper — even one
+	// carrying an explicit inherit/null — trips the presence conjunct.
+	if onlyEnabled(apitypes.ScheduleRequest{Enabled: &yes, CredentialOverride: apitypes.OptionalCredentialOverride{Present: true, Value: &apitypes.CredentialOverrideRequest{Mode: "auto"}}}) {
+		t.Fatalf("enabled + credential_override is NOT onlyEnabled (else the override is dropped)")
+	}
+	// enabled + an OMITTED credential_override (Present:false, the zero-value wrapper) is
+	// STILL enabled-only: the presence conjunct must not over-trip on the zero value, or a
+	// bare pause/resume would be forced down the full config path (PRD #1247 M6).
+	if !onlyEnabled(apitypes.ScheduleRequest{Enabled: &yes, CredentialOverride: apitypes.OptionalCredentialOverride{Present: false}}) {
+		t.Fatalf("enabled + an omitted credential_override should still be onlyEnabled")
 	}
 	if onlyEnabled(apitypes.ScheduleRequest{}) {
 		t.Fatalf("a patch with no enabled is not onlyEnabled")
@@ -732,5 +746,33 @@ func TestValidateScheduleConfigOutputMode(t *testing.T) {
 		if _, status, _ := validateScheduleConfig(tc.req, fixedNow, tc.allowSelfImprove); status != http.StatusUnprocessableEntity {
 			t.Fatalf("output_mode on %s target: status=%d, want 422", tc.name, status)
 		}
+	}
+}
+
+// TestScheduleEffectiveHarnessExplicit: when run_schedules.harness is set, it resolves from
+// that column ALONE (codex→codex, anything else→claude) and never consults the user default —
+// so an explicitly-Claude schedule stays claude even when the owner's default is codex (the
+// bug: falling through returned codex and 422'd a valid Claude override). Both cases return
+// BEFORE touching h.q, so a zero-value *Handler suffices; the NULL branch (which DOES call
+// h.q) is covered by the live-DB tests in schedules_credential_livedb_test.go.
+func TestScheduleEffectiveHarnessExplicit(t *testing.T) {
+	cases := []struct {
+		name    string
+		harness pgtype.Text
+		want    string
+	}{
+		{"explicit claude", pgtype.Text{String: string(workersvc.HarnessClaude), Valid: true}, string(workersvc.HarnessClaude)},
+		{"explicit codex", pgtype.Text{String: string(workersvc.HarnessCodex), Valid: true}, string(workersvc.HarnessCodex)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := (&Handler{}).scheduleEffectiveHarness(context.Background(), store.RunSchedule{Harness: tc.harness})
+			if err != nil {
+				t.Fatalf("scheduleEffectiveHarness returned err=%v, want nil", err)
+			}
+			if got != tc.want {
+				t.Fatalf("scheduleEffectiveHarness = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }

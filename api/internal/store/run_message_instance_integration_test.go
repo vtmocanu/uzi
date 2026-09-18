@@ -56,7 +56,7 @@ func TestRunMessageInstanceLiveDB(t *testing.T) {
 	pgText := func(s string) pgtype.Text { return pgtype.Text{String: s, Valid: s != ""} }
 	insert := func(seq int32, agent, instance, label string) {
 		t.Helper()
-		rows, err := q.InsertRunMessage(ctx, store.InsertRunMessageParams{
+		res, err := q.InsertRunMessage(ctx, store.InsertRunMessageParams{
 			RunID: runID, Seq: seq, Kind: "text", Agent: pgText(agent),
 			AgentInstance: pgText(instance), AgentLabel: pgText(label),
 			Payload: []byte(`{"text":"x"}`),
@@ -64,8 +64,8 @@ func TestRunMessageInstanceLiveDB(t *testing.T) {
 		if err != nil {
 			t.Fatalf("InsertRunMessage(seq=%d): %v", seq, err)
 		}
-		if rows != 1 {
-			t.Fatalf("InsertRunMessage(seq=%d) inserted %d rows, want 1", seq, rows)
+		if !res.Inserted {
+			t.Fatalf("InsertRunMessage(seq=%d) did not insert (inserted=%v), want a new row", seq, res.Inserted)
 		}
 	}
 	// The lead: no instance, no label. Then two PARALLEL coder invocations — the

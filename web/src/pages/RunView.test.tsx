@@ -186,6 +186,10 @@ function run(over: Partial<Run>): Run {
     retry_not_before: null,
     limit_wait_count: 0,
     rate_limit_type: null,
+    recovery_wait_cause: null,
+    recovery_retry_not_before: null,
+    forge_park_count: 0,
+    forge_park_max: 0,
     claimed_at: null,
     started_at: null,
     finished_at: null,
@@ -4451,7 +4455,7 @@ describe("RecoveryWaitPanel (issue #1197)", () => {
     // The park is announced (role=status heading) and the copy explains the automatic
     // resume and the owner's cancel option — distinct from a pooled-token / usage-limit park.
     expect(container.querySelector('[role="status"]')).not.toBeNull();
-    expect(container.textContent).toContain("transient empty model result");
+    expect(container.textContent).toContain("transient interruption");
     expect(container.textContent).toContain("resumes on");
     expect(container.textContent).toContain("cancel");
     // COPY ONLY: no "Resume now" control (no resume-now verb for this park) and no countdown.
@@ -4472,6 +4476,51 @@ describe("RecoveryWaitPanel (issue #1197)", () => {
       const { container } = render(<RecoveryWaitPanel run={run({ status })} />);
       expect(container.textContent).toBe("");
     }
+  });
+
+  // PRD #1392 M5: a forge_unreachable park swaps in forge-specific copy — it is waiting
+  // for the forge, with the retry time and the park count against its cap.
+  it("renders forge-specific copy for a forge_unreachable park, with retry time and N of MAX", () => {
+    const { container } = render(
+      <RecoveryWaitPanel
+        run={run({
+          status: "recovery_wait",
+          recovery_wait_cause: "forge_unreachable",
+          recovery_retry_not_before: "2026-01-01T09:30:00Z",
+          forge_park_count: 2,
+          forge_park_max: 5,
+        })}
+      />,
+    );
+    expect(container.textContent).toContain("Waiting for the forge");
+    expect(container.textContent).toContain("2 of 5");
+    // The retry time renders as a wall-clock HH:MM (locale/tz-formatted, so match loosely).
+    expect(container.textContent).toMatch(/Retry at \d{1,2}:\d{2}/);
+    // It must NOT fall back to the generic transient-interruption wording.
+    expect(container.textContent).not.toContain("transient interruption");
+  });
+
+  it("renders 'unlimited' as the cap when forge_park_max is 0", () => {
+    const { container } = render(
+      <RecoveryWaitPanel
+        run={run({
+          status: "recovery_wait",
+          recovery_wait_cause: "forge_unreachable",
+          recovery_retry_not_before: "2026-01-01T09:30:00Z",
+          forge_park_count: 3,
+          forge_park_max: 0,
+        })}
+      />,
+    );
+    expect(container.textContent).toContain("3 of unlimited");
+  });
+
+  it("keeps the generic transient-interruption copy when the cause is null (issue #1088 generalization)", () => {
+    const { container } = render(
+      <RecoveryWaitPanel run={run({ status: "recovery_wait", recovery_wait_cause: null })} />,
+    );
+    expect(container.textContent).toContain("transient interruption");
+    expect(container.textContent).not.toContain("Waiting for the forge");
   });
 });
 
@@ -4669,7 +4718,7 @@ describe("RunView park announcement — recovery_wait (issue #1197, a11y)", () =
     });
     expect(region.getAttribute("aria-live")).toBe("polite");
     expect(region.textContent).toBe(
-      "This run paused to recover from a transient empty result and will resume automatically.",
+      "This run paused to recover from a transient interruption and will resume automatically.",
     );
     // Mutation guard: it is the recovery copy, NOT the pool_wait or awaiting_input copy.
     expect(region.textContent).not.toContain("pooled Anthropic token");

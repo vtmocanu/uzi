@@ -90,6 +90,15 @@ type fakeStore struct {
 	recordedCreds  []store.SetRunAnthropicSecretParams
 	recordCredErr  error
 	recordCredRows *int64
+	// PRD #1247 M1: recordedEpochs is every RecordRunCredentialEpoch write in order (the
+	// attribution journal), recordEpochErr fails it. metaOfKindLookups records every
+	// kind-scoped by-id meta lookup (the override open + validator path), proving it is
+	// owner-AND-kind-scoped.
+	recordedEpochs    []store.RecordRunCredentialEpochParams
+	recordEpochErr    error
+	metaOfKindLookups []store.GetUserSecretMetaByIDOfKindParams
+	// credentialEpochs is what ListRunCredentialEpochs (the read side) returns.
+	credentialEpochs []store.RunCredentialEpoch
 	// autoCandidates is what M4's ranking query returns (PRD #111 M4) and
 	// autoCandidatesErr fails it. autoCandidateLookups records the user ids asked
 	// for — which is what proves the selector never ranks another tenant's tokens,
@@ -246,13 +255,14 @@ type fakeStore struct {
 	settledScopeRows int64
 
 	// Register + heartbeat.
-	failOverCap      *store.FailWorkerRunsOverCapParams
-	orphanFailedRuns []uuid.UUID // ids FailWorkerRunsOverCap returns (PRD #46 register-time judge funnel)
-	requeueWorker    *store.RequeueWorkerRunsParams
-	registerParams   *store.RegisterWorkerParams
-	registerResult   store.Worker
-	heartbeat        store.Worker
-	callOrder        []string
+	failOverCap        *store.FailWorkerRunsOverCapParams
+	orphanFailedRuns   []uuid.UUID // ids FailWorkerRunsOverCap returns (PRD #46 register-time judge funnel)
+	requeuedWorkerRuns []uuid.UUID // ids RequeueWorkerRuns returns (PRD #1390 M2a register-time requeue publish)
+	requeueWorker      *store.RequeueWorkerRunsParams
+	registerParams     *store.RegisterWorkerParams
+	registerResult     store.Worker
+	heartbeat          store.Worker
+	callOrder          []string
 
 	// Sweep.
 	staleCutoff pgtype.Timestamptz
@@ -390,7 +400,11 @@ type fakeStore struct {
 	// applied, like the SetRunFailed fake).
 	cancelledByWorker     *store.CancelRunByWorkerParams
 	cancelledByWorkerRows int64
-	rejected              *store.RejectRunServerSideParams
+	// supersededByWorker captures the issue #1117 live-worker branch_moved supersession;
+	// SetState's failed arm calls it (instead of SetRunFailed) when an mr_rework run reports
+	// branch_moved. Mirrors cancelledByWorker.
+	supersededByWorker *store.SupersedeRunByWorkerParams
+	rejected           *store.RejectRunServerSideParams
 	// clearedCaps captures the PRD #84 M4 4c override clear (ClearRunRequiredCapabilities);
 	// clearCapsRows is the RowsAffected the fake returns. When cleared, the fake also empties
 	// runByID.RequiredCapabilities so a subsequent SubmitInput reload sees the override effect.
@@ -505,16 +519,21 @@ type fakeStore struct {
 	// tests are unaffected. countCustodyWorkerParams captures the last DeleteWorker guard
 	// call so a test can prove it was owner-scoped. releasableHolds seeds the reconciler
 	// candidate list; releaseCustodyRows is what the release queries report.
-	// releasedCustodyRuns records every (run, worker) ReleaseCustodyForRunWorker was called
-	// with (SetState terminal completion), and releasedCustodyHolds records every hold id
-	// ReleaseCustodyHold was called with (the reconciler).
-	openCustodyHolds         int64
-	countCustodyWorkerParams *store.CountOpenCustodyHoldsForWorkerParams
-	releasableHolds          []store.RecoveryCustodyHold
-	releaseCustodyRows       int64
-	releasedCustodyRuns      []uuid.UUID
-	releasedCustodyWorkers   []uuid.UUID
-	releasedCustodyHolds     []uuid.UUID
+	// releasedCustodyRuns / releasedCustodyWorkers / releasedCustodyGenerations record every
+	// (run, worker, generation) ReleaseCustodyHoldExact was called with (SetState terminal
+	// completion, PRD #1349 M4), and releasedCustodyHolds records every hold id ReleaseCustodyHold
+	// was called with (the reconciler).
+	openCustodyHolds           int64
+	countCustodyWorkerParams   *store.CountOpenCustodyHoldsForWorkerParams
+	releasableHolds            []store.ListReleasableCustodyHoldsRow
+	releaseCustodyRows         int64
+	releasedCustodyRuns        []uuid.UUID
+	releasedCustodyWorkers     []uuid.UUID
+	releasedCustodyGenerations []int64
+	releasedCustodyHolds       []uuid.UUID
+	// PRD #1392 M1 (D3): every release_evidence value ReleaseCustodyHold was called with (the
+	// reconciler), so a test can prove the per-hold class it stamps.
+	releasedCustodyEvidence []string
 	// PRD #1296 D3/D4 upload-retry-window sweep. stalledUploadsRows is what
 	// ExpireStalledUploads reports; expireStalledWindows records every retry_window it was
 	// called with, so a test can prove the sweep passes the configured window AND (by an empty
@@ -599,6 +618,22 @@ type fakeStore struct {
 	promotedPoolWait    []store.PromotePoolWaitRunParams
 	promotePoolWaitRows *int64
 	promotePoolWaitErr  error
+
+	// PRD #1247 M3 D8 duration-time re-evaluation. limitWaitReeval is what
+	// ListLimitWaitReeval returns (the still-parked worklist), limitWaitReevalErr fails
+	// that read, and limitWaitReevalAt records every `@now` the pass passed it.
+	// loweredLimitWait records every LowerLimitWaitRetryNow arg in order (so a test can
+	// assert WHICH run was lowered and that it was owner-scoped); lowerLimitWaitRows
+	// overrides the rows-affected (default 1; 0 models a run that moved out of limit_wait
+	// under the pass); lowerLimitWaitErr fails the lower. Like PromotePoolWaitRun, a
+	// successful lower DROPS the run from limitWaitReeval so a second Sweep on the same
+	// fake sees the remaining parked run — proving the one-per-owner-per-tick cap.
+	limitWaitReeval    []store.ListLimitWaitReevalRow
+	limitWaitReevalErr error
+	limitWaitReevalAt  []pgtype.Timestamptz
+	loweredLimitWait   []store.LowerLimitWaitRetryNowParams
+	lowerLimitWaitRows *int64
+	lowerLimitWaitErr  error
 
 	// PRD #217 M1: the park-time gauge write. markedFiveHour / markedSevenDay record
 	// every user_secret_id MarkFiveHourExhausted / MarkSevenDayExhausted was called
@@ -830,6 +865,44 @@ func (f *fakeStore) SetRunAnthropicSecret(_ context.Context, arg store.SetRunAnt
 	}
 	return 1, nil
 }
+
+// GetUserSecretMetaByIDOfKind mirrors the real kind-SCOPED by-id lookup (PRD #1247 M1):
+// owner-scoped AND kind-scoped, so a foreign id, a missing id, or a wrong-kind id all
+// yield pgx.ErrNoRows (never another tenant's or another kind's row). It reuses the
+// byIDSecrets fixtures a claim test already stages, keyed by id, so a run-override test
+// stages nothing new.
+func (f *fakeStore) GetUserSecretMetaByIDOfKind(_ context.Context, arg store.GetUserSecretMetaByIDOfKindParams) (store.GetUserSecretMetaByIDOfKindRow, error) {
+	f.metaOfKindLookups = append(f.metaOfKindLookups, arg)
+	row, ok := f.byIDSecrets[arg.ID]
+	if !ok {
+		return store.GetUserSecretMetaByIDOfKindRow{}, pgx.ErrNoRows
+	}
+	if row.UserID != uuid.Nil && row.UserID != arg.UserID {
+		return store.GetUserSecretMetaByIDOfKindRow{}, pgx.ErrNoRows
+	}
+	if row.Kind != "" && row.Kind != arg.Kind {
+		return store.GetUserSecretMetaByIDOfKindRow{}, pgx.ErrNoRows
+	}
+	label, ok := f.byIDLabels[arg.ID]
+	if !ok {
+		label = "token-" + arg.ID.String()[:8]
+	}
+	return store.GetUserSecretMetaByIDOfKindRow{ID: arg.ID, Label: label, Kind: arg.Kind}, nil
+}
+
+// RecordRunCredentialEpoch records the per-claim attribution-journal write (PRD #1247
+// M1), so a claim test can assert the epoch was appended (and, via recordEpochErr, that
+// a journal failure fails the claim).
+func (f *fakeStore) RecordRunCredentialEpoch(_ context.Context, arg store.RecordRunCredentialEpochParams) error {
+	f.recordedEpochs = append(f.recordedEpochs, arg)
+	return f.recordEpochErr
+}
+
+// ListRunCredentialEpochs is the read side backing RunCredentialEpochs; returns the
+// staged journal (empty by default).
+func (f *fakeStore) ListRunCredentialEpochs(_ context.Context, _ store.ListRunCredentialEpochsParams) ([]store.RunCredentialEpoch, error) {
+	return f.credentialEpochs, nil
+}
 func (f *fakeStore) SetRunCheckpointTip(_ context.Context, arg store.SetRunCheckpointTipParams) (int64, error) {
 	f.checkpointTips = append(f.checkpointTips, arg)
 	if f.checkpointTipErr != nil {
@@ -883,16 +956,18 @@ func (f *fakeStore) InsertAgentMemory(_ context.Context, arg store.InsertAgentMe
 func (f *fakeStore) EvictAgentMemoryOverCap(context.Context, store.EvictAgentMemoryOverCapParams) error {
 	return nil
 }
-func (f *fakeStore) InsertRunMessage(_ context.Context, arg store.InsertRunMessageParams) (int64, error) {
+func (f *fakeStore) InsertRunMessage(_ context.Context, arg store.InsertRunMessageParams) (store.InsertRunMessageRow, error) {
 	f.insertedMessages = append(f.insertedMessages, arg)
 	if f.insertedSeqs == nil {
 		f.insertedSeqs = map[int32]bool{}
 	}
+	live := store.InsertRunMessageRow{GenerationLive: pgtype.Bool{Bool: true, Valid: true}}
 	if f.insertedSeqs[arg.Seq] {
-		return 0, nil // ON CONFLICT DO NOTHING
+		return live, nil // ON CONFLICT DO NOTHING — a benign duplicate at the live generation
 	}
 	f.insertedSeqs[arg.Seq] = true
-	return 1, nil
+	live.Inserted = true
+	return live, nil
 }
 func (f *fakeStore) UpdateRunLastSeq(_ context.Context, arg store.UpdateRunLastSeqParams) (int64, error) {
 	v := arg.Seq
@@ -1012,6 +1087,41 @@ func (f *fakeStore) ListPoolWaitRuns(_ context.Context) ([]store.ListPoolWaitRun
 	return f.poolWaitRuns, f.poolWaitRunsErr
 }
 
+func (f *fakeStore) ListLimitWaitReeval(_ context.Context, now pgtype.Timestamptz) ([]store.ListLimitWaitReevalRow, error) {
+	f.limitWaitReevalAt = append(f.limitWaitReevalAt, now)
+	return f.limitWaitReeval, f.limitWaitReevalErr
+}
+
+// LowerLimitWaitRetryNow records the arg and, by default, reports 1 row (a still-parked
+// run lowered). lowerLimitWaitRows overrides the count so a test can model the 0-row
+// no-op (the run moved out of limit_wait under the pass); lowerLimitWaitErr fails it. It
+// also DROPS the lowered run from limitWaitReeval so a SECOND Sweep on the same fake sees
+// the remaining parked run — which is how the one-per-owner-per-tick cap is proven across
+// two calls (mirroring PromotePoolWaitRun).
+func (f *fakeStore) LowerLimitWaitRetryNow(_ context.Context, arg store.LowerLimitWaitRetryNowParams) (int64, error) {
+	f.loweredLimitWait = append(f.loweredLimitWait, arg)
+	if f.lowerLimitWaitErr != nil {
+		return 0, f.lowerLimitWaitErr
+	}
+	rows := int64(1)
+	if f.lowerLimitWaitRows != nil {
+		rows = *f.lowerLimitWaitRows
+	}
+	if rows > 0 {
+		// A FRESH slice, not f.limitWaitReeval[:0]: reEvaluateParkedLimitWaitRuns holds the
+		// slice ListLimitWaitReeval returned and iterates it while calling this, so reusing
+		// the backing array would corrupt that in-flight range.
+		remaining := make([]store.ListLimitWaitReevalRow, 0, len(f.limitWaitReeval))
+		for _, r := range f.limitWaitReeval {
+			if r.ID != arg.ID {
+				remaining = append(remaining, r)
+			}
+		}
+		f.limitWaitReeval = remaining
+	}
+	return rows, nil
+}
+
 // PromotePoolWaitRun records the arg and, by default, reports 1 row (a held run
 // resumed). promotePoolWaitRows overrides the count so a test can model the 0-row
 // no-op (the run moved out of pool_wait under the pass); promotePoolWaitErr fails it.
@@ -1046,10 +1156,10 @@ func (f *fakeStore) FailWorkerRunsOverCap(_ context.Context, arg store.FailWorke
 	f.callOrder = append(f.callOrder, "fail_over_cap")
 	return f.orphanFailedRuns, nil
 }
-func (f *fakeStore) RequeueWorkerRuns(_ context.Context, arg store.RequeueWorkerRunsParams) (int64, error) {
+func (f *fakeStore) RequeueWorkerRuns(_ context.Context, arg store.RequeueWorkerRunsParams) ([]uuid.UUID, error) {
 	f.requeueWorker = &arg
 	f.callOrder = append(f.callOrder, "requeue_worker")
-	return 0, nil
+	return f.requeuedWorkerRuns, nil
 }
 func (f *fakeStore) RegisterWorker(_ context.Context, arg store.RegisterWorkerParams) (store.RegisterWorkerRow, error) {
 	f.registerParams = &arg
@@ -1283,6 +1393,13 @@ func (f *fakeStore) CancelRunByWorker(_ context.Context, arg store.CancelRunByWo
 	}
 	return 1, nil
 }
+
+// SupersedeRunByWorker (issue #1117) records the live-worker branch_moved supersession of an
+// mr_rework run. Returns 1 (applied) like the CancelRunByWorker fake.
+func (f *fakeStore) SupersedeRunByWorker(_ context.Context, arg store.SupersedeRunByWorkerParams) (int64, error) {
+	f.supersededByWorker = &arg
+	return 1, nil
+}
 func (f *fakeStore) RejectRunServerSide(_ context.Context, arg store.RejectRunServerSideParams) (int64, error) {
 	f.rejected = &arg
 	return 1, nil
@@ -1397,16 +1514,18 @@ func (f *fakeStore) CountOpenCustodyHoldsForWorker(_ context.Context, arg store.
 func (f *fakeStore) CountUnresolvedCustodyHoldsForOwner(_ context.Context, _ uuid.UUID) (int64, error) {
 	return f.openCustodyHolds, nil
 }
-func (f *fakeStore) ListReleasableCustodyHolds(_ context.Context) ([]store.RecoveryCustodyHold, error) {
+func (f *fakeStore) ListReleasableCustodyHolds(_ context.Context) ([]store.ListReleasableCustodyHoldsRow, error) {
 	return f.releasableHolds, nil
 }
-func (f *fakeStore) ReleaseCustodyHold(_ context.Context, id uuid.UUID) (int64, error) {
-	f.releasedCustodyHolds = append(f.releasedCustodyHolds, id)
+func (f *fakeStore) ReleaseCustodyHold(_ context.Context, arg store.ReleaseCustodyHoldParams) (int64, error) {
+	f.releasedCustodyHolds = append(f.releasedCustodyHolds, arg.ID)
+	f.releasedCustodyEvidence = append(f.releasedCustodyEvidence, arg.ReleaseEvidence.String)
 	return f.releaseCustodyRows, nil
 }
-func (f *fakeStore) ReleaseCustodyForRunWorker(_ context.Context, arg store.ReleaseCustodyForRunWorkerParams) (int64, error) {
+func (f *fakeStore) ReleaseCustodyHoldExact(_ context.Context, arg store.ReleaseCustodyHoldExactParams) (int64, error) {
 	f.releasedCustodyRuns = append(f.releasedCustodyRuns, arg.RunID)
 	f.releasedCustodyWorkers = append(f.releasedCustodyWorkers, arg.WorkerID)
+	f.releasedCustodyGenerations = append(f.releasedCustodyGenerations, arg.Generation)
 	return f.releaseCustodyRows, nil
 }
 func (f *fakeStore) ExpireStalledUploads(_ context.Context, retryWindow pgtype.Interval) (int64, error) {
@@ -1436,21 +1555,34 @@ func testParams() Params {
 		QuestionTimeoutSeconds: 86400, // PRD #88 answer deadline (24h)
 		RunMaxRequeues:         1,
 		WorkerHeartbeatStale:   45 * time.Second,
-		WorkerAffinityGrace:    2 * time.Minute,
-		WorkerAffinityCeiling:  25 * time.Minute, // PRD #628 run-lane ceiling — deliberately != grace (2m) and != default (2h) so a test proves the run lane reads the ceiling
-		WorkerSpreadGrace:      9 * time.Second,
-		WorkerBackgroundGrace:  15 * time.Minute,
-		ClaimGrace:             5 * time.Minute,
-		SkillMaxBytes:          65536,
-		SkillsMaxPerRun:        32,
-		ChatIdleTimeout:        70 * time.Minute,
-		ChatMaxTurns:           50,
-		WorkerChatIdleTimeout:  60 * time.Minute,
-		WorkerChatTurnTimeout:  10 * time.Minute,
+		// PRD #1390 M2b (D4): the missing-run fence is WorkerHeartbeatStale + WorkerHeartbeatInterval
+		// (45s + 15s = 60s), so a Service from testParams() computes the same fence as production.
+		WorkerHeartbeatInterval: 15 * time.Second,
+		// PRD #1390 M2a snapshot knobs, at their config defaults so a Service built from
+		// testParams() validates/stamps snapshots exactly as production. Snapshot-cap tests
+		// override these on their own Params.
+		TerminalPendingLease:     time.Hour,
+		ActiveSnapshotMaxEntries: 256,
+		WorkerOutboxMaxPending:   32,
+		WorkerAffinityGrace:      2 * time.Minute,
+		WorkerAffinityCeiling:    25 * time.Minute, // PRD #628 run-lane ceiling — deliberately != grace (2m) and != default (2h) so a test proves the run lane reads the ceiling
+		WorkerSpreadGrace:        9 * time.Second,
+		WorkerBackgroundGrace:    15 * time.Minute,
+		ClaimGrace:               5 * time.Minute,
+		SkillMaxBytes:            65536,
+		SkillsMaxPerRun:          32,
+		ChatIdleTimeout:          70 * time.Minute,
+		ChatMaxTurns:             50,
+		WorkerChatIdleTimeout:    60 * time.Minute,
+		WorkerChatTurnTimeout:    10 * time.Minute,
 		// Issue #1197 transient-recovery park: the config defaults, so a svc built from
 		// testParams() computes a real recovery backoff (1m base doubling to a 30m cap).
 		RunRecoveryParkBase: time.Minute,
 		RunRecoveryMaxPark:  30 * time.Minute,
+		// PRD #1392 M1: the forge pre-clone park cap (default matches production). Forge-park
+		// tests that need a different cap (0 = unlimited, or a low value to exercise the
+		// cap-exceeded branch) build a Service with an overridden Params.
+		RunForgeUnreachableMaxParks: 6,
 	}
 }
 
@@ -1512,7 +1644,7 @@ func TestClaimAssemblesPayloadWithDecryptedSecrets(t *testing.T) {
 	defer slog.SetDefault(prev)
 
 	svc := New(fs, box, testParams())
-	payload, err := svc.Claim(context.Background(), worker())
+	payload, err := svc.Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -1598,7 +1730,7 @@ func TestClaimCarriesTaskOpenMrAndBaseBranch(t *testing.T) {
 	}
 
 	svc := New(fs, box, testParams())
-	payload, err := svc.Claim(context.Background(), worker())
+	payload, err := svc.Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -1646,7 +1778,7 @@ func TestClaimCarriesTaskIdleTimeoutForInteractiveRun(t *testing.T) {
 	}
 
 	svc := New(fs, box, testParams())
-	payload, err := svc.Claim(context.Background(), worker())
+	payload, err := svc.Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -1684,7 +1816,7 @@ func TestClaimOmitsTaskIdleTimeoutForNonInteractiveRun(t *testing.T) {
 	}
 
 	svc := New(fs, box, testParams())
-	payload, err := svc.Claim(context.Background(), worker())
+	payload, err := svc.Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -1751,7 +1883,7 @@ func TestClaimDerivesStopPending(t *testing.T) {
 			}
 
 			svc := New(fs, box, testParams())
-			payload, err := svc.Claim(context.Background(), worker())
+			payload, err := svc.Claim(context.Background(), worker(), nil)
 			if err != nil {
 				t.Fatalf("Claim: %v", err)
 			}
@@ -1782,7 +1914,7 @@ func TestClaimOmitsDefaultModelWhenOwnerHasNone(t *testing.T) {
 		// defaultModel left zero ⇒ NULL ⇒ the owner has no per-user default.
 	}
 
-	payload, err := New(fs, box, testParams()).Claim(context.Background(), worker())
+	payload, err := New(fs, box, testParams()).Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -1842,7 +1974,7 @@ func TestClaimScheduleModelOverridesUserDefault(t *testing.T) {
 		{Name: "reviewer", Description: "reviews", PromptBody: "you review", Model: pgconv.TextOrNull("claude-opus-4-8")},
 	}
 
-	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker())
+	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -1864,7 +1996,7 @@ func TestClaimDeliversOverrideSubagentModelWhenFrozenOn(t *testing.T) {
 	fs := scheduleModelStore(t, pgconv.TextOrNull("fable"), pgtype.Text{})
 	fs.claimRun.OverrideSubagentModel = true
 
-	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker())
+	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -1881,7 +2013,7 @@ func TestClaimOmitsOverrideSubagentModelWhenFrozenOff(t *testing.T) {
 	fs := scheduleModelStore(t, pgconv.TextOrNull("fable"), pgtype.Text{})
 	// claimRun.OverrideSubagentModel left zero ⇒ the run did not opt in.
 
-	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker())
+	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -1905,7 +2037,7 @@ func TestClaimDeliversAttributionEnabledWhenOwnerOn(t *testing.T) {
 	fs := scheduleModelStore(t, pgconv.TextOrNull("fable"), pgtype.Text{})
 	fs.attributionEnabled = true
 
-	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker())
+	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -1932,7 +2064,7 @@ func TestClaimDeliversAttributionDisabledWhenOwnerOff(t *testing.T) {
 	fs := scheduleModelStore(t, pgconv.TextOrNull("fable"), pgtype.Text{})
 	fs.attributionEnabled = false
 
-	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker())
+	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -1960,7 +2092,7 @@ func TestClaimReReadsAttributionLivePerClaim(t *testing.T) {
 
 	svc := New(fs, newBox(t), testParams())
 
-	first, err := svc.Claim(context.Background(), worker())
+	first, err := svc.Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("first Claim: %v", err)
 	}
@@ -1971,7 +2103,7 @@ func TestClaimReReadsAttributionLivePerClaim(t *testing.T) {
 	// Flip the owner's stored value (as SetUserAttributionEnabled would) and re-assemble.
 	fs.attributionEnabled = false
 
-	second, err := svc.Claim(context.Background(), worker())
+	second, err := svc.Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("second Claim: %v", err)
 	}
@@ -1985,7 +2117,7 @@ func TestClaimReReadsAttributionLivePerClaim(t *testing.T) {
 func TestClaimScheduleModelOverridesEvenWithNoUserDefault(t *testing.T) {
 	fs := scheduleModelStore(t, pgconv.TextOrNull("fable"), pgtype.Text{})
 
-	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker())
+	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -2000,7 +2132,7 @@ func TestClaimScheduleModelOverridesEvenWithNoUserDefault(t *testing.T) {
 func TestClaimNoScheduleModelUsesUserDefault(t *testing.T) {
 	fs := scheduleModelStore(t, pgtype.Text{}, pgconv.TextOrNull("sonnet"))
 
-	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker())
+	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -2027,7 +2159,7 @@ func TestClaimCarriesSummaryModelFromInstanceDefault(t *testing.T) {
 	svc := New(fs, newBox(t), testParams())
 	svc.SetSettings(fakeSettings{summaryModel: "haiku"})
 
-	payload, err := svc.Claim(context.Background(), worker())
+	payload, err := svc.Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -2044,7 +2176,7 @@ func TestClaimSummaryModelUserOverrideWins(t *testing.T) {
 	svc := New(fs, newBox(t), testParams())
 	svc.SetSettings(fakeSettings{summaryModel: "haiku"})
 
-	payload, err := svc.Claim(context.Background(), worker())
+	payload, err := svc.Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -2058,7 +2190,7 @@ func TestClaimSummaryModelUserOverrideWins(t *testing.T) {
 func TestClaimOmitsSummaryModelWhenNoSettings(t *testing.T) {
 	fs := scheduleModelStore(t, pgtype.Text{}, pgtype.Text{})
 	// New(...) leaves s.settings nil unless SetSettings is called.
-	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker())
+	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -2089,7 +2221,7 @@ func TestClaimFailsOnDefaultModelLookupError(t *testing.T) {
 		defaultModelErr: errors.New("db down"),
 	}
 
-	_, err := New(fs, box, testParams()).Claim(context.Background(), worker())
+	_, err := New(fs, box, testParams()).Claim(context.Background(), worker(), nil)
 	if err == nil {
 		t.Fatal("expected Claim to fail when the default-model lookup errors")
 	}
@@ -2123,7 +2255,7 @@ func TestClaimDefaultsEffortToXhighWhenOwnerHasNone(t *testing.T) {
 		// defaultEffort left zero ⇒ NULL ⇒ the owner has no per-user default.
 	}
 
-	payload, err := New(fs, box, testParams()).Claim(context.Background(), worker())
+	payload, err := New(fs, box, testParams()).Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -2158,7 +2290,7 @@ func TestClaimCarriesDefaultEffort(t *testing.T) {
 		defaultEffort: pgconv.TextOrNull("low"),
 	}
 
-	payload, err := New(fs, box, testParams()).Claim(context.Background(), worker())
+	payload, err := New(fs, box, testParams()).Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -2185,7 +2317,7 @@ func TestClaimFailsOnDefaultEffortLookupError(t *testing.T) {
 		defaultEffortErr: errors.New("db down"),
 	}
 
-	_, err := New(fs, box, testParams()).Claim(context.Background(), worker())
+	_, err := New(fs, box, testParams()).Claim(context.Background(), worker(), nil)
 	if err == nil {
 		t.Fatal("expected Claim to fail when the default-effort lookup errors")
 	}
@@ -2215,7 +2347,7 @@ func TestClaimFailsOnAttributionLookupError(t *testing.T) {
 		attributionEnabledErr: errors.New("db down"),
 	}
 
-	_, err := New(fs, box, testParams()).Claim(context.Background(), worker())
+	_, err := New(fs, box, testParams()).Claim(context.Background(), worker(), nil)
 	if err == nil {
 		t.Fatal("expected Claim to fail when the attribution lookup errors")
 	}
@@ -2230,7 +2362,7 @@ func TestClaimFailsOnAttributionLookupError(t *testing.T) {
 func TestClaimIdleReturnsNilPayload(t *testing.T) {
 	fs := &fakeStore{claimErr: pgx.ErrNoRows}
 	svc := New(fs, newBox(t), testParams())
-	payload, err := svc.Claim(context.Background(), worker())
+	payload, err := svc.Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -2248,7 +2380,7 @@ func TestClaimFailsRunWhenAnthropicTokenMissing(t *testing.T) {
 		anthropicErr: pgx.ErrNoRows,
 	}
 	svc := New(fs, box, testParams())
-	payload, err := svc.Claim(context.Background(), worker())
+	payload, err := svc.Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -2347,7 +2479,7 @@ func TestClaimFailsRunWhenToolPackagesRejected(t *testing.T) {
 		toolAllowlist: []store.ToolAllowlist{}, // shrank to nothing
 	}
 	svc := New(fs, box, testParams())
-	payload, err := svc.Claim(context.Background(), worker())
+	payload, err := svc.Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -2369,7 +2501,7 @@ func TestClaimFailsRunWhenPATUndecryptable(t *testing.T) {
 		claimCtx: store.GetRunClaimContextRow{TokenCiphertext: []byte("not-a-valid-ciphertext"), RepoWebUrl: "https://x/y"},
 	}
 	svc := New(fs, box, testParams())
-	payload, err := svc.Claim(context.Background(), worker())
+	payload, err := svc.Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -2391,7 +2523,7 @@ func TestClaimPassesAffinityCeiling(t *testing.T) {
 	fixed := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return fixed }
 
-	if _, err := svc.Claim(context.Background(), worker()); err != nil {
+	if _, err := svc.Claim(context.Background(), worker(), nil); err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
 	if fs.claimParams == nil {
@@ -2865,12 +2997,13 @@ func TestSetStateAppliedOnLiveRun(t *testing.T) {
 	}
 }
 
-// TestSetStateCompletedReleasesCustody proves the PRD #1296 M4 (D3) terminal SUCCESS
-// custody release: an APPLIED `completed` transition releases ONLY THE REPORTING WORKER'S
-// custody hold on the run (a completed code-publishing run published its head, so its
-// unpublished-work custody is moot). It is scoped to the reporting worker (wkr.ID) via
-// ReleaseCustodyForRunWorker, NOT the whole run: a sibling older-generation orphan hold held
-// by a different worker must survive. Uses checkpointDeleteSvc so the whole terminal-automation
+// TestSetStateCompletedReleasesCustody proves the PRD #1349 M4 (D1/D2/D3) terminal SUCCESS
+// custody release: an APPLIED `completed` transition releases EXACTLY the completing generation's
+// custody hold for the reporting worker (a completed code-publishing run published its head, so
+// its unpublished-work custody is moot). It is generation-exact via ReleaseCustodyHoldExact —
+// scoped to the reporting worker (wkr.ID) AND the server run row's claim_generation, NOT a
+// generation-blind run+worker bulk release: a sibling older-generation orphan hold (same worker
+// or different worker) must survive. Uses checkpointDeleteSvc so the whole terminal-automation
 // block runs.
 func TestSetStateCompletedReleasesCustody(t *testing.T) {
 	runID := uuid.New()
@@ -2879,6 +3012,7 @@ func TestSetStateCompletedReleasesCustody(t *testing.T) {
 		runOwned: store.Run{
 			ID: runID, Kind: runkind.Issue,
 			IssueIid: pgtype.Int8{Int64: 5, Valid: true}, Status: "completed",
+			ClaimGeneration: 2,
 		},
 		setCompletedRows:   1,
 		releaseCustodyRows: 1,
@@ -2892,12 +3026,17 @@ func TestSetStateCompletedReleasesCustody(t *testing.T) {
 		t.Fatal("applied = false, want true")
 	}
 	if len(fs.releasedCustodyRuns) != 1 || fs.releasedCustodyRuns[0] != runID {
-		t.Fatalf("ReleaseCustodyForRunWorker run calls = %v, want exactly [%s]", fs.releasedCustodyRuns, runID)
+		t.Fatalf("ReleaseCustodyHoldExact run calls = %v, want exactly [%s]", fs.releasedCustodyRuns, runID)
 	}
 	// The release is scoped to the REPORTING worker, not the whole run — the multi-hold guard
-	// that preserves a sibling older-generation orphan hold.
+	// that preserves a sibling orphan hold.
 	if len(fs.releasedCustodyWorkers) != 1 || fs.releasedCustodyWorkers[0] != wkr.ID {
-		t.Fatalf("ReleaseCustodyForRunWorker worker calls = %v, want exactly [%s] (release must be worker-scoped)", fs.releasedCustodyWorkers, wkr.ID)
+		t.Fatalf("ReleaseCustodyHoldExact worker calls = %v, want exactly [%s] (release must be worker-scoped)", fs.releasedCustodyWorkers, wkr.ID)
+	}
+	// The release names the SERVER run row's claim_generation exactly — so completing generation
+	// 2 can never release a still-open generation-1 sibling orphan (the D1/D2 core fix).
+	if len(fs.releasedCustodyGenerations) != 1 || fs.releasedCustodyGenerations[0] != 2 {
+		t.Fatalf("ReleaseCustodyHoldExact generation calls = %v, want exactly [2] (the completing generation)", fs.releasedCustodyGenerations)
 	}
 }
 
@@ -2922,7 +3061,7 @@ func TestSetStateFailedRetainsCustody(t *testing.T) {
 		t.Fatal("applied = false, want true")
 	}
 	if len(fs.releasedCustodyRuns) != 0 {
-		t.Fatalf("ReleaseCustodyForRunWorker was called on a failed run (%v); failed runs must RETAIN custody", fs.releasedCustodyRuns)
+		t.Fatalf("ReleaseCustodyHoldExact was called on a failed run (%v); failed runs must RETAIN custody", fs.releasedCustodyRuns)
 	}
 	if fs.setFailed == nil {
 		t.Fatal("SetRunFailed was not called; the failed transition must be recorded")
@@ -3526,10 +3665,15 @@ func TestRegisterRecoversOrphansThenComesOnline(t *testing.T) {
 	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
 	svc := New(fs, newBox(t), testParams())
 
-	if _, err := svc.Register(context.Background(), w, "1.2.3", "jvm", intp(2), nil, nil); err != nil {
+	if _, _, err := svc.Register(context.Background(), w, "1.2.3", "jvm", intp(2), nil, nil, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	want := []string{"fail_over_cap", "requeue_worker", "register"}
+	// PRD #1390 M2a flips the order: RegisterWorker (which rotates the nonce and resets the
+	// snapshot epoch) runs BEFORE the orphan pass, so a register-carried snapshot can be
+	// persisted between them and protect its leased runs from the D11-predicated orphan fail/
+	// requeue that follows. (This tx-less fake path never carries a snapshot, but keeps the
+	// same statement order as the production transaction.)
+	want := []string{"register", "fail_over_cap", "requeue_worker"}
 	if strings.Join(fs.callOrder, ",") != strings.Join(want, ",") {
 		t.Fatalf("call order = %v, want %v", fs.callOrder, want)
 	}
@@ -3565,7 +3709,7 @@ func TestRegisterUnionsAndFiltersCapabilities(t *testing.T) {
 	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
 	svc := New(fs, newBox(t), testParams())
 
-	if _, err := svc.Register(context.Background(), w, "1.2.3", "jvm", nil, []string{"docker", "gpu", "docker"}, nil); err != nil {
+	if _, _, err := svc.Register(context.Background(), w, "1.2.3", "jvm", nil, []string{"docker", "gpu", "docker"}, nil, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	got := fs.registerParams.Capabilities
@@ -3582,7 +3726,7 @@ func TestRegisterBaseTemplateDropsSelfReportedJVM(t *testing.T) {
 	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
 	svc := New(fs, newBox(t), testParams())
 
-	if _, err := svc.Register(context.Background(), w, "1.2.3", "base", nil, []string{"jvm", "docker"}, nil); err != nil {
+	if _, _, err := svc.Register(context.Background(), w, "1.2.3", "base", nil, []string{"jvm", "docker"}, nil, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	got := fs.registerParams.Capabilities
@@ -3598,7 +3742,7 @@ func TestRegisterBaseTemplateNoSelfReportEmptyCapabilities(t *testing.T) {
 	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
 	svc := New(fs, newBox(t), testParams())
 
-	if _, err := svc.Register(context.Background(), w, "1.2.3", "base", nil, nil, nil); err != nil {
+	if _, _, err := svc.Register(context.Background(), w, "1.2.3", "base", nil, nil, nil, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	if got := fs.registerParams.Capabilities; len(got) != 0 {
@@ -3616,8 +3760,8 @@ func TestRegisterFiltersProtocolCapabilitiesSeparately(t *testing.T) {
 	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
 	svc := New(fs, newBox(t), testParams())
 
-	if _, err := svc.Register(context.Background(), w, "1.2.3", "base", nil,
-		[]string{"docker"}, []string{"completion_interlock_v1", "docker", "gpu", "completion_interlock_v1"}); err != nil {
+	if _, _, err := svc.Register(context.Background(), w, "1.2.3", "base", nil,
+		[]string{"docker"}, []string{"completion_interlock_v1", "docker", "gpu", "completion_interlock_v1"}, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	// Scheduler capabilities: only the self-reported docker (base template implies nothing).
@@ -3639,7 +3783,7 @@ func TestRegisterNilProtocolCapsStoresEmpty(t *testing.T) {
 	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
 	svc := New(fs, newBox(t), testParams())
 
-	if _, err := svc.Register(context.Background(), w, "1.2.3", "base", nil, nil, nil); err != nil {
+	if _, _, err := svc.Register(context.Background(), w, "1.2.3", "base", nil, nil, nil, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	if got := fs.registerParams.ProtocolCapabilities; len(got) != 0 {
@@ -3654,7 +3798,7 @@ func TestRegisterNilCapStoresNull(t *testing.T) {
 	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
 	svc := New(fs, newBox(t), testParams())
 
-	if _, err := svc.Register(context.Background(), w, "1.2.3", "", nil, nil, nil); err != nil {
+	if _, _, err := svc.Register(context.Background(), w, "1.2.3", "", nil, nil, nil, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	if fs.registerParams == nil || fs.registerParams.MaxConcurrentRuns.Valid {
@@ -3669,7 +3813,7 @@ func TestRegisterEmptyTemplateStoresNull(t *testing.T) {
 	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
 	svc := New(fs, newBox(t), testParams())
 
-	if _, err := svc.Register(context.Background(), w, "1.2.3", "", nil, nil, nil); err != nil {
+	if _, _, err := svc.Register(context.Background(), w, "1.2.3", "", nil, nil, nil, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	if fs.registerParams == nil || fs.registerParams.TemplateReported.Valid {
@@ -4313,7 +4457,7 @@ func TestCreateRunSnapshotsTitleAndRunsWithoutPRDLink(t *testing.T) {
 		createRunResult: store.Run{ID: uuid.New()},
 	}
 	svc := New(fs, newBox(t), testParams())
-	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "the description", nil, nil, false, nil); err != nil {
+	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "the description", nil, nil, false, nil, nil); err != nil {
 		t.Fatalf("CreateRun: %v", err)
 	}
 	if fs.createRunParams == nil {
@@ -4345,7 +4489,7 @@ func TestCreateRunOpenMRGuard(t *testing.T) {
 			createRunResult:   store.Run{ID: uuid.New()},
 		}
 		svc := New(fs, newBox(t), testParams())
-		_, err := svc.CreateRun(context.Background(), user, repo, 4, "the description", nil, nil, false /*force*/, nil)
+		_, err := svc.CreateRun(context.Background(), user, repo, 4, "the description", nil, nil, false /*force*/, nil, nil)
 		if !errors.Is(err, ErrOpenMRExists) {
 			t.Fatalf("CreateRun err = %v, want ErrOpenMRExists", err)
 		}
@@ -4370,7 +4514,7 @@ func TestCreateRunOpenMRGuard(t *testing.T) {
 			createRunResult:   store.Run{ID: uuid.New()},
 		}
 		svc := New(fs, newBox(t), testParams())
-		_, err := svc.CreateRun(context.Background(), user, repo, 4, "the description", nil, nil, true /*force*/, nil)
+		_, err := svc.CreateRun(context.Background(), user, repo, 4, "the description", nil, nil, true /*force*/, nil, nil)
 		if errors.Is(err, ErrOpenMRExists) {
 			t.Fatalf("CreateRun with force=true err = %v, must NOT be ErrOpenMRExists (guard bypassed)", err)
 		}
@@ -4420,7 +4564,7 @@ func TestCreateAutopilotRunSetsAutoApproveAndSharesGates(t *testing.T) {
 		createRunResult: store.Run{ID: uuid.New()},
 	}
 	svc = New(fsManual, newBox(t), testParams())
-	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "d", nil, nil, false, nil); err != nil {
+	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "d", nil, nil, false, nil, nil); err != nil {
 		t.Fatalf("CreateRun: %v", err)
 	}
 	if fsManual.createRunParams.AutoApprove {
@@ -4447,7 +4591,7 @@ func TestClaimDeliversAutoApproveTopLevelFreshAndResume(t *testing.T) {
 
 	// Fresh autopilot run: no branch/session yet, auto_approve set on the row.
 	fresh := newFS(store.Run{ID: uuid.New(), IssueIid: pgtype.Int8{Int64: 4, Valid: true}, Status: "claimed", AutoApprove: true})
-	p, err := New(fresh, box, testParams()).Claim(context.Background(), worker())
+	p, err := New(fresh, box, testParams()).Claim(context.Background(), worker(), nil)
 	if err != nil || p == nil {
 		t.Fatalf("fresh Claim: payload=%v err=%v", p, err)
 	}
@@ -4462,7 +4606,7 @@ func TestClaimDeliversAutoApproveTopLevelFreshAndResume(t *testing.T) {
 		ID: uuid.New(), IssueIid: pgtype.Int8{Int64: 4, Valid: true}, Status: "claimed", AutoApprove: true,
 		Branch: pgconv.TextOrNull("agent/issue-4"), SessionID: pgconv.TextOrNull("sess-xyz"), RequeueCount: 1,
 	})
-	p, err = New(resume, box, testParams()).Claim(context.Background(), worker())
+	p, err = New(resume, box, testParams()).Claim(context.Background(), worker(), nil)
 	if err != nil || p == nil {
 		t.Fatalf("resume Claim: payload=%v err=%v", p, err)
 	}
@@ -4472,7 +4616,7 @@ func TestClaimDeliversAutoApproveTopLevelFreshAndResume(t *testing.T) {
 
 	// A manual run never carries it.
 	manual := newFS(store.Run{ID: uuid.New(), IssueIid: pgtype.Int8{Int64: 4, Valid: true}, Status: "claimed"})
-	p, err = New(manual, box, testParams()).Claim(context.Background(), worker())
+	p, err = New(manual, box, testParams()).Claim(context.Background(), worker(), nil)
 	if err != nil || p == nil {
 		t.Fatalf("manual Claim: payload=%v err=%v", p, err)
 	}
@@ -4487,7 +4631,7 @@ func TestCreateRunRejectsOversizeDescription(t *testing.T) {
 
 	// Manual and autopilot both reject at the one shared cap, before any run is made.
 	fs := &fakeStore{issueByID: store.Issue{Title: "T", Labels: uziLabels(), HasPrdLink: true}}
-	if _, err := New(fs, newBox(t), testParams()).CreateRun(context.Background(), user, repo, 4, big, nil, nil, false, nil); err != ErrDescriptionTooLarge {
+	if _, err := New(fs, newBox(t), testParams()).CreateRun(context.Background(), user, repo, 4, big, nil, nil, false, nil, nil); err != ErrDescriptionTooLarge {
 		t.Fatalf("CreateRun err = %v, want ErrDescriptionTooLarge", err)
 	}
 	if fs.createRunParams != nil {
@@ -4502,7 +4646,7 @@ func TestCreateRunRejectsOversizeDescription(t *testing.T) {
 	// Exactly at the cap is accepted (boundary).
 	ok := strings.Repeat("x", MaxIssueDescriptionBytes)
 	fsOK := &fakeStore{issueByID: store.Issue{Title: "T", Labels: uziLabels(), HasPrdLink: true}, createRunResult: store.Run{ID: uuid.New()}}
-	if _, err := New(fsOK, newBox(t), testParams()).CreateRun(context.Background(), user, repo, 4, ok, nil, nil, false, nil); err != nil {
+	if _, err := New(fsOK, newBox(t), testParams()).CreateRun(context.Background(), user, repo, 4, ok, nil, nil, false, nil, nil); err != nil {
 		t.Fatalf("a description exactly at the cap must be accepted, got %v", err)
 	}
 }
@@ -4514,7 +4658,7 @@ func TestCreateRunMapsDuplicateToActiveRunExists(t *testing.T) {
 		createRunErr: &pgconn.PgError{Code: "23505"},
 	}
 	svc := New(fs, newBox(t), testParams())
-	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "d", nil, nil, false, nil); err != ErrActiveRunExists {
+	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "d", nil, nil, false, nil, nil); err != ErrActiveRunExists {
 		t.Fatalf("err = %v, want ErrActiveRunExists", err)
 	}
 }
@@ -4533,7 +4677,7 @@ func TestCreateRunPreCheckBlocksDuplicateOnHeldIssue(t *testing.T) {
 		createRunResult:      store.Run{ID: uuid.New()},
 	}
 	svc := New(fs, newBox(t), testParams())
-	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "d", nil, nil, false, nil); err != ErrActiveRunExists {
+	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "d", nil, nil, false, nil, nil); err != ErrActiveRunExists {
 		t.Fatalf("err = %v, want ErrActiveRunExists — the pre-check must refuse a second run on a held issue", err)
 	}
 }
@@ -4549,7 +4693,7 @@ func TestCreateRunPreCheckErrorPropagates(t *testing.T) {
 		createRunResult:         store.Run{ID: uuid.New()},
 	}
 	svc := New(fs, newBox(t), testParams())
-	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "d", nil, nil, false, nil); !errors.Is(err, sentinel) {
+	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "d", nil, nil, false, nil, nil); !errors.Is(err, sentinel) {
 		t.Fatalf("err = %v, want the pre-check error to propagate", err)
 	}
 }
@@ -4557,7 +4701,7 @@ func TestCreateRunPreCheckErrorPropagates(t *testing.T) {
 func TestCreateRunRepoNotOwned(t *testing.T) {
 	fs := &fakeStore{repoErr: pgx.ErrNoRows}
 	svc := New(fs, newBox(t), testParams())
-	if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "d", nil, nil, false, nil); err != ErrRepoNotFound {
+	if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "d", nil, nil, false, nil, nil); err != ErrRepoNotFound {
 		t.Fatalf("err = %v, want ErrRepoNotFound", err)
 	}
 }
@@ -4883,7 +5027,7 @@ func TestCreateRunNotifiesQueuedWithOriginSnapshot(t *testing.T) {
 	lc := &fakeLifecycle{}
 	svc.SetLifecycle(lc)
 
-	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "desc", nil, nil, false, nil); err != nil {
+	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "desc", nil, nil, false, nil, nil); err != nil {
 		t.Fatalf("CreateRun: %v", err)
 	}
 	// origin_column snapshots the issue's current column ("Later"), always a valid
@@ -4910,7 +5054,7 @@ func TestCreateRunOriginNullWhenColumnsUnavailable(t *testing.T) {
 	}
 	svc := New(fs, newBox(t), testParams())
 
-	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "desc", nil, nil, false, nil); err != nil {
+	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "desc", nil, nil, false, nil, nil); err != nil {
 		t.Fatalf("CreateRun should not be blocked by a column-list error: %v", err)
 	}
 	if fs.createRunParams == nil {
@@ -4951,7 +5095,7 @@ func TestClaimCredentialFailureNotifiesFailed(t *testing.T) {
 	lc := &fakeLifecycle{}
 	svc.SetLifecycle(lc)
 
-	if _, err := svc.Claim(context.Background(), worker()); err != nil {
+	if _, err := svc.Claim(context.Background(), worker(), nil); err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
 	if len(lc.notes) != 1 || lc.notes[0].status != "failed" || lc.notes[0].runID != runID {
@@ -5013,7 +5157,7 @@ func TestClaimRebindChangesCredentialWithoutRestart(t *testing.T) {
 
 	claimToken := func(t *testing.T, w store.Worker) string {
 		t.Helper()
-		payload, err := svc.Claim(context.Background(), w)
+		payload, err := svc.Claim(context.Background(), w, nil)
 		if err != nil {
 			t.Fatalf("Claim: %v", err)
 		}
@@ -5113,7 +5257,7 @@ func TestClaimBoundToVanishedSecretFailsClosed(t *testing.T) {
 	wkr.AnthropicBindMode = BindModePinned
 	wkr.AnthropicSecretID = pgtype.UUID{Bytes: uuid.New(), Valid: true}
 
-	payload, err := svc.Claim(context.Background(), wkr)
+	payload, err := svc.Claim(context.Background(), wkr, nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -5155,7 +5299,7 @@ func TestJudgeClaimIgnoresWorkerBinding(t *testing.T) {
 		AnthropicBindMode: BindModePinned,
 		AnthropicSecretID: pgtype.UUID{Bytes: consoleID, Valid: true},
 	}
-	payload, err := svc.Claim(context.Background(), wkr)
+	payload, err := svc.Claim(context.Background(), wkr, nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -5234,7 +5378,7 @@ func TestJudgeClaimUsesJudgeBinding(t *testing.T) {
 		AnthropicBindMode: BindModePinned,
 		AnthropicSecretID: pgtype.UUID{Bytes: workerBoundID, Valid: true},
 	}
-	payload, err := svc.Claim(context.Background(), wkr)
+	payload, err := svc.Claim(context.Background(), wkr, nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -5276,7 +5420,7 @@ func TestJudgeClaimUnboundUsesDefault(t *testing.T) {
 	}
 	svc := New(fs, box, testParams())
 
-	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: owner})
+	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: owner}, nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -5317,7 +5461,7 @@ func TestJudgeBindingLookupErrorFailsClaim(t *testing.T) {
 	}
 	svc := New(fs, box, testParams())
 
-	_, err := svc.Claim(context.Background(), worker())
+	_, err := svc.Claim(context.Background(), worker(), nil)
 	if err == nil {
 		t.Fatal("a failed judge-binding lookup must fail the claim, never silently fall back to the default")
 	}
@@ -5344,7 +5488,7 @@ func TestJudgeBoundToVanishedSecretFailsClosed(t *testing.T) {
 	}
 	svc := New(fs, box, testParams())
 
-	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: owner})
+	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: owner}, nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -5396,7 +5540,7 @@ func TestSelfImproveClaimFollowsJudgeBinding(t *testing.T) {
 		AnthropicBindMode: BindModePinned,
 		AnthropicSecretID: pgtype.UUID{Bytes: workerID, Valid: true},
 	}
-	payload, err := svc.Claim(context.Background(), wkr)
+	payload, err := svc.Claim(context.Background(), wkr, nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}

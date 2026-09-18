@@ -44,7 +44,7 @@ func TestClaimDockerWorkerPassesAllowlistPredicate(t *testing.T) {
 	svc := New(fs, newBox(t), testParams())
 	svc.SetDockerAllowlist(fakeDockerAllowlist{list: []uuid.UUID{a, b}})
 
-	if _, err := svc.Claim(context.Background(), dockerWorker()); err != nil {
+	if _, err := svc.Claim(context.Background(), dockerWorker(), nil); err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
 	if fs.claimParams == nil {
@@ -67,7 +67,7 @@ func TestClaimNonDockerWorkerUnaffectedAndSkipsReader(t *testing.T) {
 	// If a non-docker worker wrongly consulted this reader, Claim would surface errBoom.
 	svc.SetDockerAllowlist(fakeDockerAllowlist{err: errors.New("boom: reader must not be consulted")})
 
-	if _, err := svc.Claim(context.Background(), worker()); err != nil {
+	if _, err := svc.Claim(context.Background(), worker(), nil); err != nil {
 		t.Fatalf("Claim (non-docker) = %v, want nil (reader must not be consulted)", err)
 	}
 	if fs.claimParams == nil {
@@ -85,7 +85,7 @@ func TestClaimDockerWorkerFailsClosedWithoutReader(t *testing.T) {
 	fs := &fakeStore{claimErr: pgx.ErrNoRows}
 	svc := New(fs, newBox(t), testParams()) // no SetDockerAllowlist
 
-	if _, err := svc.Claim(context.Background(), dockerWorker()); err != nil {
+	if _, err := svc.Claim(context.Background(), dockerWorker(), nil); err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
 	if fs.claimParams == nil {
@@ -110,7 +110,7 @@ func TestClaimDockerWorkerStrictOnAllowlistReadError(t *testing.T) {
 	boom := errors.New("settings cold-cache blip")
 	svc.SetDockerAllowlist(fakeDockerAllowlist{err: boom})
 
-	_, err := svc.Claim(context.Background(), dockerWorker())
+	_, err := svc.Claim(context.Background(), dockerWorker(), nil)
 	if !errors.Is(err, boom) {
 		t.Fatalf("Claim err = %v, want the settings read error surfaced", err)
 	}

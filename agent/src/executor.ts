@@ -118,6 +118,12 @@ export interface RunContext {
    *  alongside `baseCommit` because on a RESUME the two differ and name different diffs;
    *  the prompt is wrong on exactly the prior-work runs if it only ever sees one. */
   defaultBranchCommit?: string;
+  /** PRD #1416 M1: the branch's published forge tip P at claim (runner.ts `RunFlight.publishedTip`,
+   *  fact 2). Set only on a run whose branch already existed on the forge at clone (task,
+   *  mr_rework, self_improve, ci_fix on an existing branch, every resume of a pushed branch).
+   *  Threaded to the plan/implement builders so they name P with the fast-forward-only rule.
+   *  Optional; absent (a fresh issue branch) ⇒ no note. See prompt.ts `publishedTipNote`. */
+  publishedTip?: string;
   /** PRD #501 REC B: this run is auto-approved (autopilot, claim.auto_approve) — no
    *  human in the loop. Threaded to the plan builders so the lead is told up front to
    *  resolve open decisions on best judgment rather than calling `ask_user`. Optional;
@@ -227,6 +233,17 @@ export interface RunContext {
    *  3); a park BEFORE approval (only reachable if the planning turn itself died on a
    *  limit) likewise leaves this false and resumes into planning exactly as today. */
   planApproved?: boolean;
+  /** PRD #1247 M5b (D13): the phase a RESUME claim after a held-state credential switch should
+   *  RESTORE, one of "awaiting_approval" / "awaiting_input" / "implementing" (or absent/"" for a
+   *  fresh run). Set by the RUNNER from claim.resume_phase. The executor reads only
+   *  "awaiting_approval": it re-presents the ALREADY-CAPTURED plan (ctx.approvedPlan / the persisted
+   *  plan_md) at the gate WITHOUT running a planning turn — distinct from planApproved, which skips
+   *  the gate entirely for an APPROVED plan; here the plan is not yet approved, so a human still
+   *  approves it, then implementation proceeds on the newly-chosen token. The other phases need no
+   *  new executor code: "implementing" is the existing preApproved skip, "awaiting_input" is driven
+   *  by the existing open_question_id re-park, and "awaiting_followup" collapses to "implementing"
+   *  server-side. Absent/other ⇒ today's behaviour. */
+  resumePhase?: string;
   /** PRD #209 (D4 row 2): this run's plan was supplied EXTERNALLY by the user at create
    *  time (claim plan_source='seeded'), not produced by a Phase-1 planning turn. Set by
    *  the runner. Two effects: it relaxes the pre-approved skip so it fires with NO SDK
@@ -305,6 +322,12 @@ export interface RunContext {
   askUser?(questions: AskUserQuestion[]): Promise<AnswerVerdict>;
   /** M4: dequeue the next queued follow-up to inject into the next loop turn. */
   pullFollowUp?(): string | undefined;
+  /** PRD #1416 M2: drain the WORKER-AUTHORITATIVE safety steer armed in-process by the runner's
+   *  divergence detection, if any. Consumed with PRIORITY at each executor loop top — ahead of
+   *  pullFollowUp — and rendered as worker guidance, NOT as untrusted <follow_up> user input (D3).
+   *  Distinct from pullFollowUp: it carries no server input id and never touches the follow-up
+   *  wake-guard watermark. Optional; absent (a stub/older wiring) ⇒ no steer. */
+  pullSafetySteer?(): string | undefined;
   /**
    * M4: report a running/iteration heartbeat (server persists via GREATEST).
    *
@@ -394,6 +417,50 @@ export interface RunContext {
    * no re-arm (the first `now` still drops the turn via ctx.signal).
    */
   onPauseNow?(cb: () => void): void;
+  /**
+   * PRD #1247 M5b: register a RE-ARMABLE interrupt (steering.onCredentialSwitch) the steering
+   * channel invokes when a held-state CREDENTIAL SWITCH is pending for this claim, so a switch drops
+   * the in-flight turn even after the shared abort controller has already fired once — the exact
+   * analog of onPauseNow. The executor passes a callback that trips the current turn with
+   * REASON_CREDENTIAL_SWITCH, so driveTurn throws a CredentialSwitchSignal that propagates to the
+   * runner's release state machine. Absent on the stub/test executors ⇒ no re-arm (the first switch
+   * still drops the turn via ctx.signal's CredentialSwitchSignal abort reason).
+   */
+  onCredentialSwitch?(cb: () => void): void;
+  /**
+   * PRD #1247 M5b (data-integrity fix): attempt the held-state credential switch IN PLACE, driven
+   * from wherever the run was when the switch tripped — the implement loop's turn catch (a live
+   * turn), or one of the idle held-state waiters (the plan gate, an ask_user question, an
+   * interactive follow-up). Called INSTEAD of letting the CredentialSwitchSignal propagate to the
+   * runner's outer catch, so a GIVE-UP keeps the run running rather than ending the flight while it
+   * is still healthy (which no sweep requeues → RUN_TIMEOUT orphan / held-state strand).
+   *
+   * The runner wires it to `enterCredentialSwitch` (the same two-phase state machine the outer catch
+   * uses). Two outcomes:
+   *   - `"released"` — a VERIFIED capture + a `queued` release ack: the switch already drained the
+   *     batcher, reported `credential_switch`, and parked the HOME; the server requeued the run for a
+   *     reclaim at resume_phase on the newly-chosen token. The caller surfaces
+   *     {@link ExecutorResult.switchReleased} and ENDS (no more turns) so the runner skips finalize.
+   *   - `"gave_up"` — the capture never verified (or the release was not acked): the run CONTINUES on
+   *     the OLD token in place (a restarted turn, or a re-presented gate/question/follow-up wait). The
+   *     server already cleared the switch stamp, and the runner cleared the flight's preserve flags so
+   *     a later NORMAL completion cleans up as usual. This is the fall-through the PRD requires
+   *     (D3/D14), exactly like a declined `now` pause continues rather than parks.
+   *
+   * Absent on the stub/test executors ⇒ the loop/waiters re-throw the CredentialSwitchSignal to the
+   * runner's outer catch, byte-identical to the pre-fix behaviour.
+   */
+  attemptCredentialSwitch?(): Promise<"released" | "gave_up">;
+  /**
+   * PRD #1247 M5b (MAJOR-6): run `fn` with credential-switch trips DEFERRED — a matching switch
+   * signal is held (not tripped, the turn not aborted) for the duration, then honored at the next
+   * trip point after `fn` returns. The executor wraps a plan-REVISION planning turn (whose new plan
+   * is not yet persisted) in this, so a switch never releases mid-revision — which would leave the
+   * run row on the OLD plan_md and re-present the superseded plan on a reclaim. The switch instead
+   * trips at the following gate wait, after gatePlan has persisted the revised plan. Balanced
+   * (begin/finally end) by the runner. Absent on the stub/test executors ⇒ `fn` runs undeferred.
+   */
+  deferCredentialSwitch?<T>(fn: () => Promise<T>): Promise<T>;
   /**
    * PRD #517 M3: park an INTERACTIVE task run after a clean `signal_done`, waiting for the
    * next follow-up. The runner's implementation (a) reports `awaiting_followup` and verifies
@@ -554,6 +621,16 @@ export interface ExecutorResult {
    *  (the seam is unwired, so the executor falls back to the legacy throw). StubExecutor never
    *  sets it. */
   completionHeld?: { reason: string };
+  /** PRD #1247 M5b (data-integrity fix): set when a held-state credential switch RELEASED the claim
+   *  IN PLACE — `ctx.attemptCredentialSwitch` returned "released" from the implement loop, the plan
+   *  gate, an ask_user question, or an interactive follow-up wait. The switch already drained the
+   *  batcher, reported `credential_switch`, got the `queued` ack, and parked the HOME; the server
+   *  requeued the run for a reclaim at resume_phase on the newly-chosen token. The runner reads it in
+   *  phasePublish to SKIP finalization (no push, no MR, no completion report) exactly like
+   *  `pausedAt`/`completionHeld` — the run is already non-terminal and requeued, and the finally
+   *  retires the clone while preserving the HOME. Absent on every normal completion and on a give-up
+   *  (which CONTINUES the run). StubExecutor never sets it. */
+  switchReleased?: boolean;
 }
 
 /**
@@ -675,6 +752,33 @@ export const STUB_LOOP_SENTINEL = "UZI_STUB_LOOP";
 export const STUB_INFLIGHT_SENTINEL = "UZI_STUB_INFLIGHT";
 
 /**
+ * PRD #1391 M5 (Run A): drives the stub to emit a STEADY STREAM of status messages
+ * over a bounded window instead of a one-shot pause. The e2e outbox-outage phase
+ * stops the api mid-run so the batcher spills the frames produced DURING the outage
+ * to the durable outbox and replays them in order once the api returns; that needs a
+ * run that stays ALIVE and PRODUCING across the whole stop→wait→start window, which
+ * is exactly what this sentinel gives (the STALL sentinel goes quiet — the opposite).
+ * Off unless present; a normal run never streams.
+ */
+export const STUB_OUTBOX_SENTINEL = "UZI_STUB_OUTBOX";
+
+/**
+ * PRD #1390 M4: keeps a run parked in `running` (with `stalled` SUPPRESSED, via one held-open
+ * tool call) until the run is cancelled/shut down (`ctx.signal`) or a long ceiling elapses. The
+ * api-outage-readoption e2e needs a run that stays genuinely `running` across a stop-api /
+ * network-disconnect window and the reconciliation that follows (longer than STUB_INFLIGHT's
+ * one-shot 95s pause and, unlike it, abort-aware so a cancel frees the slot promptly). Off unless
+ * present; a normal run never holds. The ceiling is tunable via `healthPauseMs` so a unit test
+ * runs it instantly.
+ */
+const STUB_HOLD_SENTINEL = "UZI_STUB_HOLD";
+
+/** The STUB_HOLD ceiling: a generous upper bound (10 min) so the e2e's whole outage +
+ *  readoption window fits inside it; the hold normally ends earlier when `ctx.signal` aborts
+ *  (a cancel or a worker shutdown). Overridable via `healthPauseMs` for an instant unit test. */
+const STUB_HEALTH_HOLD_MS = 600_000;
+
+/**
  * Pause lengths for the health sentinels, in ms. STALL/INFLIGHT sit comfortably
  * above the 60s minimum health_stall_seconds the E2E sets, so the detector flags
  * (or, for in-flight, provably does NOT flag) the run before the stub moves on.
@@ -689,6 +793,16 @@ export const STUB_INFLIGHT_SENTINEL = "UZI_STUB_INFLIGHT";
 const STUB_HEALTH_STALL_MS = 95_000;
 const STUB_HEALTH_RESUME_MS = 20_000;
 const STUB_HEALTH_LOOP_HOLD_MS = 35_000;
+
+// PRD #1391 M5: the outbox-sentinel stream shape. The stub emits STUB_OUTBOX_TICKS
+// status frames spaced STUB_OUTBOX_TICK_MS apart, so the run stays alive and producing
+// for ~STUB_OUTBOX_TICKS × STUB_OUTBOX_TICK_MS (90s at the defaults) — long enough that
+// the e2e's whole stop-api → sleep → start-api → observe-depth window falls inside it
+// and a steady share of frames is produced (and spilled) mid-outage. The e2e leaves
+// these at their defaults; a unit test shrinks them via StubExecutorOptions so the
+// stream runs instantly (mirroring healthPauseMs for the health sentinels).
+const STUB_OUTBOX_TICK_MS = 1_000;
+const STUB_OUTBOX_TICKS = 90;
 
 // PRD #99 M2: the same six frames now also carry the per-instance attribution a
 // real parallel-subagent run would — `instance` = the SDK's `parent_tool_use_id`
@@ -796,6 +910,14 @@ export interface StubExecutorOptions {
    * server's stall threshold).
    */
   healthPauseMs?: number;
+  /**
+   * E2E/test-only (PRD #1391 M5): override the outbox-sentinel stream shape — the tick
+   * interval in ms (`outboxTickMs`) and the number of ticks (`outboxTicks`). A unit test
+   * sets tiny values so the stream runs instantly; the real e2e leaves them undefined to
+   * use the STUB_OUTBOX_* defaults (a ~90s window the outage falls inside).
+   */
+  outboxTickMs?: number;
+  outboxTicks?: number;
 }
 
 /**
@@ -1272,6 +1394,26 @@ export class StubExecutor implements Executor {
       return;
     }
 
+    if (has(STUB_OUTBOX_SENTINEL)) {
+      // PRD #1391 M5: emit a STEADY STREAM of status frames over a bounded window so the
+      // e2e can stop the api mid-run. The batcher spills the frames produced during the
+      // outage to the durable outbox and replays them in order once the api returns; the
+      // run stays alive and producing across the whole outage window (unlike the one-shot
+      // health pauses above). Tick interval + count are tunable so a unit test shrinks the
+      // stream to run instantly; the e2e leaves the STUB_OUTBOX_* defaults.
+      const outboxTickMs = this.opts.outboxTickMs ?? STUB_OUTBOX_TICK_MS;
+      const outboxTicks = this.opts.outboxTicks ?? STUB_OUTBOX_TICKS;
+      for (let i = 1; i <= outboxTicks; i++) {
+        ctx.emit({
+          kind: "status",
+          agent: "worker",
+          payload: { text: `stub: outbox tick ${i}` },
+        });
+        await sleep(outboxTickMs);
+      }
+      return;
+    }
+
     if (has(STUB_LOOP_SENTINEL)) {
       // Emit the SAME tool call four times, each with its result (so none is "in
       // flight"): the detector's window hash counts four identical calls → looping.
@@ -1294,6 +1436,40 @@ export class StubExecutor implements Executor {
         });
       }
       await sleep(loopHoldMs);
+      return;
+    }
+
+    if (has(STUB_HOLD_SENTINEL)) {
+      // PRD #1390 M4: hold the run OPEN in `running` for the whole outage/readoption window.
+      // One unmatched tool_use keeps the newest message an in-flight call, so `stalled` stays
+      // SUPPRESSED (working, not stuck) exactly like the INFLIGHT sentinel — but the wait is
+      // long AND abort-aware: it resolves the moment ctx.signal aborts (a cancel or worker
+      // shutdown), so a case's cleanup `cancel` frees the worker slot promptly instead of
+      // pinning it for the full ceiling. Close the tool out on exit so a non-aborted end (the
+      // ceiling elapsed) still lets the run complete cleanly.
+      const holdMs = override ?? STUB_HEALTH_HOLD_MS;
+      const id = "stub-hold-0";
+      ctx.emit({
+        kind: "tool_use",
+        agent: "worker",
+        payload: { id, name: "Bash", input: { command: "sleep infinity" } },
+      });
+      await new Promise<void>((resolve) => {
+        const sig = ctx.signal;
+        const timer = setTimeout(finish, holdMs);
+        function finish(): void {
+          clearTimeout(timer);
+          sig?.removeEventListener("abort", finish);
+          resolve();
+        }
+        if (sig?.aborted) return finish();
+        sig?.addEventListener("abort", finish, { once: true });
+      });
+      ctx.emit({
+        kind: "tool_result",
+        agent: "worker",
+        payload: { tool_use_id: id, content: "hold released", is_error: false },
+      });
       return;
     }
 

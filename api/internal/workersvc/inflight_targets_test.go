@@ -102,7 +102,7 @@ func TestSelfImproveClaimCarriesInflightTargets(t *testing.T) {
 		}},
 	}
 
-	payload, err := svc.Claim(context.Background(), wkr)
+	payload, err := svc.Claim(context.Background(), wkr, nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -143,7 +143,7 @@ func TestSelfImproveClaimOmitsEmptyInflightTargets(t *testing.T) {
 	fs, svc, wkr := selfImproveClaimFixture(t, selfRunID, repoID)
 	fs.activeRunsAll = nil
 
-	payload, err := svc.Claim(context.Background(), wkr)
+	payload, err := svc.Claim(context.Background(), wkr, nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}

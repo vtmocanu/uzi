@@ -183,6 +183,18 @@ func (s *Service) assembleChatClaim(ctx context.Context, run store.Run) (*ChatCl
 		return nil, fmt.Errorf("chat claim context: %w", err)
 	}
 
+	// PRD #1332 M5A (D3): belt-and-suspenders Codex refusal, mirroring assembleClaim's
+	// harness-authoritative fail-closed branch but UNCONDITIONAL — chat does NOT implement
+	// Codex until M5B, and there is no worker capability that authorizes it. ClaimChatRun's
+	// WHERE already excludes every Codex-indicating chat row, so a run reaching here should
+	// never be Codex; if one somehow does (a claim raced a binding write, or inconsistent
+	// legacy data), refuse rather than assemble a Claude chat claim for a Codex-indicating
+	// run. Checks all THREE binding facts so it stays closed on the deleted-alias / coherence
+	// edge the run lane guards. errCredentialUnavailable is TERMINAL, so the run fails cleanly.
+	if run.Harness == harnessCodex || run.CodexMaterialRevision.Valid || run.CodexSecretID.Valid {
+		return nil, fmt.Errorf("%w: chat run is Codex-indicating; Codex chat is not implemented until M5B", errCredentialUnavailable)
+	}
+
 	// nil, and it stays nil: chat is deliberately NOT bindable (PRD #104 D1), so a
 	// bound worker's chat runs still spend the owner's default token.
 	cred, err := s.openAnthropic(ctx, run.UserID, nil)
@@ -199,7 +211,10 @@ func (s *Service) assembleChatClaim(ctx context.Context, run store.Run) (*ChatCl
 	// reasons. Its second argument is unreachable here by construction (a nil override
 	// is `default` whatever it says), and it is spelled selectReasonDefault rather than
 	// a placeholder so a reader does not have to check.
-	if err := s.recordRunCredential(ctx, run, cred, staticChoice(nil, selectReasonDefault)); err != nil {
+	// emitSwitchMessage=false: chat is deliberately unbindable (D5), so it can never switch tokens
+	// and never emits a 'credential_switch' message. The returned last_seq is discarded (chat sets
+	// its ClaimPayload.LastSeq from run.LastSeq / the resume session directly).
+	if _, err := s.recordRunCredential(ctx, run, cred, staticChoice(nil, selectReasonDefault), false); err != nil {
 		return nil, err
 	}
 	anthropic := cred.Token

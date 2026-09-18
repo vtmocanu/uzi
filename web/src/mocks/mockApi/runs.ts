@@ -1,10 +1,15 @@
 import {
   type AgentSelectionInput,
+  type CredentialEpoch,
+  type CredentialOverride,
+  type RecoveryCustodyHold,
+  type RecoveryCustodyHolds,
   type Run,
   type RunPriority,
   type RunInputKind,
 } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
+import { isCredentialSwitchRefusedLane } from "../../lib/credentialOverride";
 import { isTerminalRun } from "../../lib/runStatus";
 import {
   LIVE_RUN_ID,
@@ -13,20 +18,195 @@ import {
   mockMyTokenRateLimits,
   mockOtherRunOwners,
   mockRunInputs,
+  mockSecrets,
   runListItem,
 } from "../data";
 import { ensureLive, handleInput, startNewRun } from "../engine";
 import { getRun, nextRunId, patchRun, state } from "../store";
-import { delay, requireSession } from "./shared";
+import { delay, mockScenario, requireSession } from "./shared";
 import { LEAD_NAME_RE, templates } from "./agents";
 
 function listRunsFor(): Run[] {
   return [...state.runs.values()].sort((a, b) => b.created_at.localeCompare(a.created_at));
 }
 
+// ── Custody recovery mock (PRD #1349 M6) ──────────────────────────────────────
+// The `?mock=custody` scenario seeds a full spread of owner custody holds — every
+// server-derived attention across several workers — so the board alert and the Workers
+// resolution surface can be seen and driven offline. Any other scenario reports zero open
+// holds, so the alert self-hides and the existing demos stay clean.
+//
+// Discards are persisted in module-level sets so a hold/archive stays gone across the 10s
+// polls (the surface re-fetches, and a mutation that reappeared would read as a no-op).
+const discardedHolds = new Set<string>();
+const discardedCaptures = new Set<string>();
+
+// Hostile worker name (a ZWSP, an RTL override and an HTML-injection payload, all as \u
+// ESCAPES — never raw bytes, so this source file carries no invisible characters) so the
+// surface's stripUnsafeChars + React escaping are visible offline. It renders as sanitized,
+// contiguous text with no <script> element.
+const HOSTILE_WORKER_NAME = "ci\u200brunner\u202e<script>alert(1)</script>";
+
+function seedCustodyHolds(): RecoveryCustodyHold[] {
+  const t = (minsAgo: number) => new Date(Date.now() - minsAgo * 60_000).toISOString();
+  const mk = (o: Partial<RecoveryCustodyHold> & Pick<RecoveryCustodyHold, "id" | "run_id" | "worker_id" | "attention">): RecoveryCustodyHold => ({
+    generation: 1,
+    state: o.attention === "released" || o.attention === "discarded" ? "released" : "open",
+    has_available_capture: false,
+    created_at: t(180),
+    updated_at: t(20),
+    ...o,
+  });
+  return [
+    // Worker A — base(M): the full lifecycle on one worker.
+    mk({ id: "hold-a4", run_id: "run-a4", worker_id: "wkr-base-m", worker_name: "base (M)", generation: 4, attention: "active" }),
+    mk({ id: "hold-a3", run_id: "run-a3", worker_id: "wkr-base-m", worker_name: "base (M)", generation: 3, attention: "capturing", capture_state: "uploading" }),
+    mk({ id: "hold-a2", run_id: "run-a2", worker_id: "wkr-base-m", worker_name: "base (M)", generation: 2, attention: "archive_ready", has_available_capture: true, capture_state: "available" }),
+    mk({ id: "hold-a1", run_id: "run-a1", worker_id: "wkr-base-m", worker_name: "base (M)", generation: 1, attention: "source_only" }),
+    // Worker B — jvm-worker: an actionable capture failure + a source-only hold.
+    mk({ id: "hold-b2", run_id: "run-b2", worker_id: "wkr-jvm", worker_name: "jvm-worker", generation: 2, attention: "needs_action", capture_state: "needs_action" }),
+    mk({ id: "hold-b1", run_id: "run-b1", worker_id: "wkr-jvm", worker_name: "jvm-worker", generation: 1, attention: "source_only" }),
+    // Worker C — hostile name: a source-only decision + healthy protection.
+    mk({ id: "hold-c2", run_id: "run-c2", worker_id: "wkr-ext", worker_name: HOSTILE_WORKER_NAME, generation: 2, attention: "active" }),
+    mk({ id: "hold-c1", run_id: "run-c1", worker_id: "wkr-ext", worker_name: HOSTILE_WORKER_NAME, generation: 1, attention: "source_only" }),
+    // A resolved hold whose archive survives — released, exportable on the run.
+    mk({ id: "hold-r1", run_id: "run-r1", worker_id: "wkr-base-m", worker_name: "base (M)", generation: 7, attention: "released", has_available_capture: true, capture_state: "available", released_at: t(5) }),
+  ];
+}
+
+function currentCustodyHolds(): RecoveryCustodyHold[] {
+  if (mockScenario() !== "custody") return [];
+  return seedCustodyHolds().filter((h) => !discardedHolds.has(h.id));
+}
+
+function custodyResponse(): RecoveryCustodyHolds {
+  const holds = currentCustodyHolds();
+  const open = holds.filter((h) => h.state === "open");
+  const decisionNeeded = open.filter(
+    (h) => h.attention === "source_only" || h.attention === "needs_action",
+  ).length;
+  return {
+    aggregate: {
+      open_holds: open.length,
+      custody_hold_limit: 8,
+      decision_needed: decisionNeeded,
+      // Two queued code runs are wedged behind the owner limit in this scenario.
+      blocked_runs: open.length >= 8 ? 2 : 0,
+    },
+    holds,
+  };
+}
+
+// ── Per-run credential override / switch demo (PRD #1247 M7) ──────────────────
+// Four ?mock= scenarios overlay the credential fields onto ONE seeded run each, so the
+// override / pending-switch / epoch-history surfaces AND the set-token warning are
+// browsable offline; any other scenario leaves every run clean (the override badges
+// self-hide on a null override). A run whose token was actually switched THIS session
+// (setRunCredential below) is recorded here so the live mutation wins over the seed —
+// which is what lets the "lingering-stamp" case prove no stale switch shows after apply.
+const credentialSwitched = new Set<string>();
+
+// One applied epoch, so the history list renders with a token label + reason + time.
+const appliedEpochs = (): CredentialEpoch[] => [
+  {
+    claim_generation: 1,
+    secret_id: "sec-default",
+    label: "default",
+    select_reason: "default",
+    applied_at: new Date(Date.now() - 90 * 60_000).toISOString(),
+  },
+  {
+    claim_generation: 2,
+    secret_id: "sec-console-key",
+    label: "console-key",
+    select_reason: "override_pinned",
+    applied_at: new Date(Date.now() - 20 * 60_000).toISOString(),
+  },
+];
+
+function credentialOverlay(run: Run): Run {
+  // A live set-token this session wins over the seeded scenario state (D-Step-A: the
+  // server suppresses a stale/applied switch, so the DTO reads null once applied).
+  if (credentialSwitched.has(run.id)) return run;
+  switch (mockScenario()) {
+    case "parked-with-alternative":
+      // A limit_wait run whose `auto` override could move it to a fresh pooled token.
+      if (run.id === "run-limit-wait")
+        return {
+          ...run,
+          credential_override: { mode: "auto", label: null },
+          credential_switch: null,
+          credential_epochs: appliedEpochs().slice(0, 1),
+        };
+      return run;
+    case "switch-on-running":
+      // A running run with a switch REQUESTED but not yet applied — the pending badge.
+      if (run.id === LIVE_RUN_ID)
+        return {
+          ...run,
+          credential_override: { mode: "pinned", label: "console-key" },
+          credential_switch: "requested",
+          credential_epochs: appliedEpochs().slice(0, 1),
+        };
+      return run;
+    case "released-awaiting-reclaim":
+      // The held worker released its claim; the run awaits reclaim on the new token.
+      if (run.id === LIVE_RUN_ID)
+        return {
+          ...run,
+          credential_override: { mode: "pinned", label: "console-key" },
+          credential_switch: "released",
+          credential_epochs: appliedEpochs().slice(0, 1),
+        };
+      return run;
+    case "warning":
+      // The set-token path returns a D6 warning (below); seed an override so the surface
+      // has something to show alongside it.
+      if (run.id === LIVE_RUN_ID)
+        return {
+          ...run,
+          credential_override: { mode: "auto", label: null },
+          credential_switch: null,
+          credential_epochs: appliedEpochs(),
+        };
+      return run;
+    case "lingering-stamp":
+      // The switch APPLIED: the override + epoch history stay, but credential_switch is
+      // null — proving the UI shows NO stale pending badge once the DTO reports null.
+      if (run.id === LIVE_RUN_ID)
+        return {
+          ...run,
+          credential_override: { mode: "pinned", label: "console-key" },
+          credential_switch: null,
+          credential_epochs: appliedEpochs(),
+        };
+      return run;
+    default:
+      return run;
+  }
+}
+
+// overrideToRead maps the set-token WRITE body ({mode, secret_id?}) to the READ-side
+// {mode, label} the run DTO carries; inherit clears it to null. A pinned token's label
+// is resolved from the seeded secrets (null when the id is unknown, mirroring a deleted
+// token's snapshot).
+function overrideToRead(body: { mode: string; secret_id?: string }): CredentialOverride | null {
+  if (body.mode === "inherit") return null;
+  if (body.mode === "pinned")
+    return { mode: "pinned", label: mockSecrets.find((s) => s.id === body.secret_id)?.label ?? null };
+  return { mode: body.mode, label: null };
+}
+
 export const runsApi = {
   // ── Runs ────────────────────────────────────────────────────────────────────
-  createRun: async (repoId: string, issueIid: number, force?: boolean) => {
+  createRun: async (
+    repoId: string,
+    issueIid: number,
+    force?: boolean,
+    // PRD #1247 M7: mirror the real client's optional override arg. The mock stamps the
+    // read-side {mode,label} onto the created run so a demo start-with-token is visible.
+    credentialOverride?: { mode: string; secret_id?: string },
+  ) => {
     const b = state.boards.get(repoId);
     const card = b?.cards.find((c) => c.iid === issueIid);
     if (!b || !card) throw new ApiError(404, "issue not found");
@@ -108,6 +288,14 @@ export const runsApi = {
       retry_not_before: null,
       limit_wait_count: 0,
       rate_limit_type: null,
+      recovery_wait_cause: null,
+      recovery_retry_not_before: null,
+      forge_park_count: 0,
+      forge_park_max: 0,
+      // PRD #1247 M7: stamp the read-side override the caller chose (null = inherit).
+      credential_override: credentialOverride ? overrideToRead(credentialOverride) : null,
+      credential_switch: null,
+      credential_epochs: [],
       claimed_at: null,
       started_at: null,
       finished_at: null,
@@ -178,6 +366,10 @@ export const runsApi = {
       retry_not_before: null,
       limit_wait_count: 0,
       rate_limit_type: null,
+      recovery_wait_cause: null,
+      recovery_retry_not_before: null,
+      forge_park_count: 0,
+      forge_park_max: 0,
       claimed_at: null,
       started_at: null,
       finished_at: null,
@@ -250,7 +442,9 @@ export const runsApi = {
     const own_agents = templates
       .filter((t) => !LEAD_NAME_RE.test(t.name))
       .map((t) => ({ name: t.name, description: t.description }));
-    return delay({ run: { ...run, own_agents } }, 60);
+    // PRD #1247 M7: overlay the active credential-override demo scenario onto the run
+    // (a no-op for the default/unknown scenario, and for a run switched this session).
+    return delay({ run: { ...credentialOverlay(run), own_agents } }, 60);
   },
   // PRD #35: flip this run's usage-limit opt-in. Mirrors the server's guard — the
   // same NEGATIVE predicate the cancel path uses — so a terminal run is refused and
@@ -266,6 +460,37 @@ export const runsApi = {
     if (isTerminalRun(run.status)) throw new ApiError(409, "this run has already finished");
     patchRun(id, { wait_on_limit: enabled });
     return delay({ run: { ...getRun(id)! } }, 80);
+  },
+
+  // PRD #1247 M7: switch (or set) a run's Anthropic credential. Mirrors the server's
+  // contract closely enough to drive the demo and hold the UI to it: a missing run 404s;
+  // a terminal run 409s; a REFUSED lane (task_review / chat / judge / self_improve) 409s
+  // — the same lanes the UI hides the control for, so a stray call still fails. On success
+  // it writes the read-side override, marks the switch applied (credential_switch null,
+  // like Step A once applied), records the id so the seed no longer overlays it, and
+  // returns the updated run plus an OPTIONAL D6 warning for the `warning` scenario and for
+  // an `auto` choice with no eligible pooled token.
+  setRunCredential: async (id: string, body: { mode: string; secret_id?: string }) => {
+    const run = getRun(id);
+    if (!run) throw new ApiError(404, "run not found");
+    if (isTerminalRun(run.status)) throw new ApiError(409, "run has already finished");
+    if (isCredentialSwitchRefusedLane(run))
+      throw new ApiError(409, "this run's lane does not support switching its Anthropic token");
+    credentialSwitched.add(id);
+    patchRun(id, {
+      credential_override: overrideToRead(body),
+      credential_switch: null,
+      updated_at: new Date().toISOString(),
+    });
+    const updated = { ...getRun(id)! };
+    const pooledEligible = mockSecrets.some((s) => s.kind === "anthropic_token" && s.auto_eligible);
+    const warning =
+      mockScenario() === "warning"
+        ? "The chosen token was set, but a limit report suggests it may be throttled soon."
+        : body.mode === "auto" && !pooledEligible
+          ? "No token is currently eligible in your auto pool; the run will hold until one frees up."
+          : "";
+    return delay(warning ? { run: updated, warning } : { run: updated }, 120);
   },
 
   // PRD #841: set (or clear) a run's per-run MR-review-rework override. Mirrors the
@@ -503,7 +728,8 @@ export const runsApi = {
   getRunArchives: async (id: string) => {
     const r = getRun(id);
     if (!r) throw new ApiError(404, "run not found");
-    if (r.status === "failed") {
+    const capId = `${id}-cap1`;
+    if (r.status === "failed" && !discardedCaptures.has(capId)) {
       return delay(
         {
           supported: true,
@@ -519,7 +745,7 @@ export const runsApi = {
           },
           archives: [
             {
-              id: `${id}-cap1`,
+              id: capId,
               run_id: id,
               state: "available",
               source_sha: "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
@@ -552,6 +778,27 @@ export const runsApi = {
       },
       60,
     );
+  },
+  // PRD #1349 M6 (D7/D8): the owner-wide custody hold listing + aggregate the board alert and
+  // the Workers resolution surface read. Rich under ?mock=custody; empty otherwise so the
+  // alert self-hides and the other demos stay clean.
+  getRecoveryHolds: async () => delay(custodyResponse(), 80),
+  // PRD #1296 / #1349 M6 (D7/D9): delete one recovery ARCHIVE artifact. Artifact cleanup
+  // only — it does NOT disposition the parent hold. Persisted so the capture stays gone on
+  // the run view's reload.
+  discardRunArchive: async (runId: string, captureId: string) => {
+    if (!getRun(runId)) throw new ApiError(404, "run not found");
+    discardedCaptures.add(captureId);
+    return delay({ discarded: true }, 80);
+  },
+  // PRD #1349 M5/M6 (D7/D9): discard one exact custody hold — the possible-only-copy source
+  // disposition. Removes it from the owner listing so the surface reflects the discard on the
+  // next poll. Mirrors the server: an unknown hold in the custody scenario 404s.
+  discardHold: async (runId: string, holdId: string) => {
+    const exists = currentCustodyHolds().some((h) => h.id === holdId && h.run_id === runId);
+    if (!exists) throw new ApiError(404, "hold not found");
+    discardedHolds.add(holdId);
+    return delay({ discarded: true }, 80);
   },
   submitRunInput: async (
     id: string,

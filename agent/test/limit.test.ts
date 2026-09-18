@@ -9,7 +9,7 @@ import {
   RateLimitObserver,
 } from "../src/limit.js";
 
-// Frames are hand-written to the shapes in the pinned SDK typings (0.3.219),
+// Frames are hand-written to the shapes in the pinned SDK typings (0.3.263),
 // because no observed production frame exists yet — which is exactly why the
 // classifier is pure and why these tests pin the SHAPES it reads. If a real
 // session ever proves a shape wrong, the fix lands here first.

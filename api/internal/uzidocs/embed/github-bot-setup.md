@@ -107,6 +107,28 @@ diff is preserved and rendered on the failed run's card for you to rebase and
 land by hand. See [ADR-456](../adr/0456-rebase-before-finalize-push.md) for
 the mechanism.
 
+**A third case: the branch's history was rewritten below its already-published
+tip.** Several kinds of run start from a branch that already exists on the
+forge — a `uzi handoff` task branch, an MR being reworked, a resumed run — and
+uzi always lands work there with a **plain fast-forward push, never a
+force-push**: force is denied by the worker's guardrails and by the bot's
+role, by design, so an agent that rebases, amends, or resets a commit at or
+below that published tip leaves uzi nothing it can simply force over. Instead,
+at the next checkpoint and again at finalize, uzi restores the published
+commit as an ancestor of the agent's rewritten tip with a synthesized bridge
+commit — its tree is exactly the agent's tip, byte-for-byte unchanged, with
+the published commit added as an extra parent — so the branch **fast-forwards**
+with both histories intact. A merge request opened on a bridged branch carries
+a one-line note saying so; `git log --first-parent` still reads as the
+agent's own work. Only when a bridge cannot be built or validated (the agent
+rewrote the branch again, or the bridge fails its own consistency check)
+does the run end `failed` with a typed reason (`fail_origin =
+history_rewritten`) naming the published tip. Unlike the two cases above, the
+diff is preserved on the failed run's card only when the push range could be
+secret-scanned first, which a rewritten branch usually prevents; either way
+your committed work stays on the run's branch and is recoverable with `uzi run
+export`.
+
 ## 4. Add the bot to your repo
 
 Repository → **Settings → Collaborators**, add the bot with role **Write** (not

@@ -1,0 +1,11 @@
+{
+  "instructions": "Only flag critical bugs, security issues, and architectural concerns; skip style nitpicks and minor improvements unless they materially affect correctness or maintainability. In *_test.go, web/**/*.test.{ts,tsx}, and agent/**/*.test.ts, review correctness and coverage only and flag vacuous assertions - a test that asserts a zero value or the mere absence of an error still passes when the behavior regresses. In api/internal/handler/**, flag any new API route the uzi CLI consumes that is mounted in the cookie-only RequireAuth group instead of RequireUser (which accepts a session cookie OR a uzc_ Bearer); verify forge PATs and per-user Anthropic tokens are never logged or returned unredacted, and that settings/config reads fail closed. In web/src/mocks/**, do not flag production-fidelity gaps - it is demo/dev scaffolding. In deploy/**, focus on correctness of Kubernetes manifests, Helm charts, and Kustomize config. In prds/**, docs/**, and ideas/**, review only for clarity, scope, and duplication; do not flag unbuilt mechanisms.",
+  "strictness": 1,
+  "commentTypes": ["logic", "syntax"],
+  "ignorePatterns": "**/package-lock.json\n**/dist/**\n**/node_modules/**\napi/internal/store/*.sql.go\napi/internal/store/models.go\napi/internal/store/querier.go\napi/internal/store/db.go\n**/*_generated.go\n**/zz_generated*.go",
+
+  "autoReview": [],
+  "excludeAuthors": ["renovate[bot]"],
+  "ignoreKeywords": "chore(deps)\nfix(deps)\nbuild(deps)",
+  "triggerOnDrafts": false
+}

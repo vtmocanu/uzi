@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -108,6 +109,37 @@ var (
 // leaves commit/recheck and response-delivery margin inside the 7.5s route budget, while the
 // worker HTTP client remains capped at 8s.
 const codexProviderRequestTimeout = 2500 * time.Millisecond
+
+// bindWorkerListeners binds the worker-facing listener(s) and, ONLY after every enabled bind
+// succeeds, calls setReady — so the boot-grace anchor (Service.SetReadyAt) fires after the api
+// can actually be reached, never before (PRD #1390 M1, D1). The plain listener binds first;
+// when tlsEnabled the TLS listener binds next, and a failure of EITHER bind returns the error
+// (crashing startup, as ListenAndServe did) with setReady NEVER called and any already-bound
+// listener closed. It is factored out with an injectable listen func so the bind ORDER — and
+// that setReady fires only after all enabled binds — is unit-testable without real sockets.
+func bindWorkerListeners(
+	addr, tlsAddr string,
+	tlsEnabled bool,
+	listen func(network, address string) (net.Listener, error),
+	setReady func(),
+) (lnPlain, lnTLS net.Listener, err error) {
+	lnPlain, err = listen("tcp", addr)
+	if err != nil {
+		return nil, nil, fmt.Errorf("bind api listener %s: %w", addr, err)
+	}
+	if tlsEnabled {
+		lnTLS, err = listen("tcp", tlsAddr)
+		if err != nil {
+			// Undo the plain bind so a partial failure leaves no dangling socket, and
+			// setReady stays uncalled — the grace never starts on a half-bound api.
+			_ = lnPlain.Close()
+			return nil, nil, fmt.Errorf("bind api tls listener %s: %w", tlsAddr, err)
+		}
+	}
+	// Every enabled listener is bound: workers can now reach the api, so anchor the grace.
+	setReady()
+	return lnPlain, lnTLS, nil
+}
 
 func main() {
 	// -health is a shell-free container healthcheck: the distroless runtime
@@ -274,6 +306,16 @@ func run() error {
 		CompletionHoldWindowSeconds: cfg.CompletionHoldWindowSeconds,
 		RunMaxRequeues:              cfg.RunMaxRequeues,
 		WorkerHeartbeatStale:        cfg.WorkerHeartbeatStale,
+		// PRD #1390 M2b (D4): the missing-run fence is WorkerHeartbeatStale + WorkerHeartbeatInterval.
+		WorkerHeartbeatInterval: cfg.WorkerHeartbeatInterval,
+		// PRD #1390 M1 (D1): the boot-grace window that suppresses the stale-worker passes
+		// until the worker-facing listener has been ready this long (SetReadyAt, below).
+		SweeperBootGrace: cfg.SweeperBootGrace,
+		// PRD #1390 M2a: the terminal-pending lease clock + the snapshot entry caps that
+		// ReplaceWorkerActiveRuns validates and stamps against.
+		TerminalPendingLease:        cfg.TerminalPendingLease,
+		ActiveSnapshotMaxEntries:    cfg.ActiveSnapshotMaxEntries,
+		WorkerOutboxMaxPending:      cfg.WorkerOutboxMaxPending,
 		DiskPressureThreshold:       cfg.DiskPressureThreshold,
 		WorkerAffinityGrace:         cfg.WorkerAffinityGrace,
 		WorkerAffinityCeiling:       cfg.WorkerAffinityCeiling,
@@ -301,6 +343,10 @@ func run() error {
 		// per-run cap — a park always becomes promotable again.
 		RunRecoveryParkBase: cfg.RunRecoveryParkBase,
 		RunRecoveryMaxPark:  cfg.RunRecoveryMaxPark,
+		// Forge-unreachable pre-clone park cap (PRD #1392 M1, D2): past this many forge parks
+		// the run fails with fail_origin='forge_unreachable' instead of parking again. 0 =
+		// unlimited. Counted separately from the recovery-park backoff (recovery_wait_count).
+		RunForgeUnreachableMaxParks: cfg.RunForgeUnreachableMaxParks,
 		// PRD #1296 D3/D4 durable-archive upload-retry window: the sweep flips a capture stuck
 		// in a non-terminal upload state past this to needs_action WITHOUT releasing its
 		// custody hold (source retained). Non-positive disables the pass.
@@ -844,6 +890,37 @@ func run() error {
 		slog.Info("vault-lock notice disabled (UZI_VAULT_LOCK_NOTICE_ENABLED=false)")
 	}
 
+	// Owner blocked-custody episode Slack DM (PRD #1349 M6, Decision D10): when an owner's
+	// unpublished-work custody holds cross the admission limit and block new runs, this
+	// STANDALONE reconciler DMs the owner ONCE per episode (coalesced by owner, never one DM per
+	// queued run — the per-run custody-limit health nudge is suppressed in workersvc/health.go so
+	// this owns the crossing). It is wired like the vault-lock reconciler above, on its OWN
+	// goroutine, but reuses the health-notification ENABLEMENT gate (read inside Reconcile) rather
+	// than a new enable flag (D10), so it has no dedicated kill-switch — HealthEnabled(false)
+	// suppresses it, exactly as it suppresses the per-run health nudge. It ticks on the sweep
+	// cadence (the SAME cadence the per-run health detector runs on), falling back to 15s when
+	// SWEEP_INTERVAL is unset (0), matching the sweeper's own default.
+	custodyEpisodeRec := slacksvc.NewCustodyEpisodeReconciler(q, notifier, settingsCache, workersvc.CustodyHoldLimit, slog.Default())
+	custodyEpisodeInterval := cfg.SweepInterval
+	if custodyEpisodeInterval <= 0 {
+		custodyEpisodeInterval = 15 * time.Second
+	}
+	bgWG.Add(1)
+	go func() {
+		defer bgWG.Done()
+		custodyEpisodeRec.Reconcile(ctx) // immediate boot pass so a live episode notifies promptly
+		tick := time.NewTicker(custodyEpisodeInterval)
+		defer tick.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+				custodyEpisodeRec.Reconcile(ctx)
+			}
+		}
+	}()
+
 	// History usage refold (PRD #1079 M3): the 00188 migration marked every pre-migration
 	// non-chat run usage_refolded=false, because those runs' run_usage rows were collapsed
 	// by the old MAX-per-model key. This boot one-shot re-folds each such TERMINAL run
@@ -1169,21 +1246,35 @@ func run() error {
 		}
 	}
 
+	// PRD #1390 M1 (D1): bind every enabled worker-facing listener BEFORE serving, and only
+	// once all binds succeed stamp the boot-grace anchor (wsvc.SetReadyAt). This replaces
+	// srv.ListenAndServe()/tlsSrv.ListenAndServeTLS("", ""), whose bind+serve are one call —
+	// there was no moment "the listener is ready" to anchor on. A bind failure still returns
+	// the error (crashing startup) exactly as before. bindWorkerListeners is factored out with
+	// an injectable listen func so the bind ORDER and the "ready only after all binds" rule are
+	// unit-tested without real sockets.
+	lnPlain, lnTLS, err := bindWorkerListeners(cfg.Addr, cfg.TLSAddr, tlsSrv != nil, net.Listen, func() {
+		wsvc.SetReadyAt(time.Now())
+	})
+	if err != nil {
+		return err
+	}
+
 	// Buffered for both listeners: an unbuffered channel would leak whichever
 	// goroutine lost the race to report its error.
 	errCh := make(chan error, 2)
 	go func() {
 		slog.Info("api listening", "addr", cfg.Addr)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := srv.Serve(lnPlain); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}
 	}()
 	if tlsSrv != nil {
 		go func() {
 			slog.Info("api listening (tls)", "addr", cfg.TLSAddr, "cert_file", cfg.TLSCertFile)
-			// The pair is already loaded and served by the reloader's GetCertificate;
-			// the empty arguments are how net/http says "use TLSConfig".
-			if err := tlsSrv.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			// Empty cert/key args ⇒ use the server's TLSConfig, identical to
+			// ListenAndServeTLS("", ""); the reloader's GetCertificate is preserved.
+			if err := tlsSrv.ServeTLS(lnTLS, "", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				errCh <- err
 			}
 		}()

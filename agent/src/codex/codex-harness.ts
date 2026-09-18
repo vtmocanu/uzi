@@ -54,6 +54,7 @@ import { renderCodexRun } from "./render.js";
 import { buildCodexDynamicTools } from "./dynamic-tools.js";
 import { CODEX_DELEGATE_TOOLS, CODEX_SIGNAL_TOOLS, canonicalizeCodexToolName } from "./broker.js";
 import { normalizeCodexStatus, normalizeCodexTerminalErrors, normalizeCodexUsage } from "./terminal-normalize.js";
+import { CodexUsageAccountant, deriveCodexRunCost } from "./token-accounting.js";
 
 import type { Logger } from "../log.js";
 import type {
@@ -66,6 +67,7 @@ import type {
   HarnessTerminal,
   HarnessThrownFailure,
   HarnessTurn,
+  HarnessUsage,
   ProcessReap,
   RunHarness,
   RunTurnRequest,
@@ -74,7 +76,7 @@ import type {
   TurnSignals,
 } from "../harness.js";
 import type { CallbackResult, CodexCallbackBroker } from "./broker.js";
-import type { CodexAppServerAuthSession } from "./appserver-auth.js";
+import type { CodexAppServerAuthMode, CodexAppServerAuthSession } from "./appserver-auth.js";
 import type { ExecutionRegistry, RegisteredRoot } from "./registry.js";
 import type { CodexNotification, CodexTransport } from "./transport.js";
 import type { RenderedCodexRun } from "./render.js";
@@ -173,6 +175,24 @@ export interface CodexHarnessOptions {
   readonly appServerAuth?: CodexAppServerAuthSession;
   /** Transitional pre-auth integration input. Mutually exclusive with appServerAuth. */
   readonly credentialValue?: string;
+  /** PRD #1332 C4b / D5: the RUN's immutable credential auth mode, from the binding. It selects
+   *  the terminal cost semantics — a subscription run's per-model usage is `subscription` (no
+   *  per-token charge), an api_key run's is `metered` (versioned Standard price table) or
+   *  `unreported`. When ABSENT (a transitional/test construction that supplies no mode) the
+   *  terminal prices NOTHING — every entry stays `unreported` and the run cost `unreported` — the
+   *  conservative choice that retains tokens and never invents a subscription or a dollar figure. */
+  readonly authMode?: CodexAppServerAuthMode;
+  /** PRD #1332 C4a / CodeRabbit 4004800880: the executor-claim-leg token accountant, INJECTED so it
+   *  survives provider-epoch recreation (plan approval, cooperative-checkpoint reaps). Each epoch
+   *  builds a FRESH {@link CodexHarness}, but the accountant keeps the claim leg's cumulative
+   *  per-thread reconciliation. A later worker claim constructs a new executor and accountant, and
+   *  its explicit init marker gives that resumed delta a new server lineage. When ABSENT (a
+   *  single-epoch or test construction) this defaults to a fresh accountant. */
+  readonly accountant?: CodexUsageAccountant;
+  /** Emit this executor claim leg's one explicit `initialized` event. The first provider epoch sets
+   *  this true; recreated internal epochs set it false, so each worker claim creates exactly one
+   *  persisted usage-lineage marker regardless of app-server `thread/started` behavior. */
+  readonly emitClaimInit?: boolean;
 }
 
 // --- small pure helpers -------------------------------------------------------
@@ -211,6 +231,20 @@ function extractText(item: Record<string, unknown>): string[] {
   return out;
 }
 
+/** PRD #1332 C4a: fold the reconciled per-model `modelUsage` into a terminal {@link
+ *  HarnessUsage}. When `modelUsage` is undefined (no usage reconciled) the base usage passes
+ *  through UNCHANGED, so a Codex terminal with no token-usage notes is byte-identical to before
+ *  C4a. When usage is reconciled but the turn carried no `turn.usage` (base is undefined), a
+ *  minimal `turn`-basis usage is created to carry `modelUsage` — its `wire.usage` stays
+ *  undefined so `payload.usage` remains absent exactly as before. */
+function attachModelUsage(base: HarnessUsage | undefined, modelUsage: unknown): HarnessUsage | undefined {
+  if (modelUsage === undefined) return base;
+  if (base === undefined) {
+    return { basis: "turn", tokens: {}, wire: { usage: undefined, modelUsage } };
+  }
+  return { ...base, wire: { usage: base.wire?.usage, modelUsage } };
+}
+
 /** A small best-effort deadline (ms) for tearing down a just-launched root that FAILED
  *  registry admission. The launch is already being failed; this only bounds the cleanup
  *  of the unadmitted root so it cannot hang the setup throw. */
@@ -246,6 +280,9 @@ export class CodexHarness implements RunHarness {
   private readonly appServerAuth?: CodexAppServerAuthSession;
   // Transitional private input; never combined with the pinned app-server auth path.
   private readonly credentialValue?: string;
+  // PRD #1332 C4b / D5: the run's immutable auth mode, used ONLY to project the terminal cost
+  // semantics from the accountant. Undefined leaves the terminal price-free (unreported).
+  private readonly authMode?: CodexAppServerAuthMode;
 
   // Run-level provider root state (launched once, reused across turns; a reused
   // notifications() iterator is single-consumer so it is obtained exactly once).
@@ -258,6 +295,14 @@ export class CodexHarness implements RunHarness {
   private threadId?: string;
   private currentModel?: string;
   private closed = false;
+
+  // PRD #1332 C4a: the executor-claim-leg token accountant. It holds the IMMUTABLE thread->model
+  // map and survives provider-epoch recreation inside this executor invocation. Each terminal emits
+  // the claim leg's cumulative-since-baseline modelUsage, which one server lineage row de-duplicates
+  // with GREATEST. A later worker claim gets a new accountant and a new explicit init lineage.
+  private readonly accountant: CodexUsageAccountant;
+  private readonly emitClaimInit: boolean;
+  private claimInitEmitted = false;
 
   // Child-thread demux (part C): a registered sink receives every frame carrying its
   // child thread id off the SAME transport, so a delegation's child turn can consume its
@@ -298,6 +343,9 @@ export class CodexHarness implements RunHarness {
     }
     this.appServerAuth = opts.appServerAuth;
     this.credentialValue = opts.credentialValue;
+    this.authMode = opts.authMode;
+    this.accountant = opts.accountant ?? new CodexUsageAccountant();
+    this.emitClaimInit = opts.emitClaimInit ?? true;
   }
 
   inspectSession(id: string): Promise<SessionPresence> {
@@ -331,6 +379,15 @@ export class CodexHarness implements RunHarness {
   /** Route frames carrying `threadId` into `sink` instead of the root loop. */
   registerChildSink(threadId: string, sink: CodexChildSink): void {
     this.childSinks.set(threadId, sink);
+  }
+
+  /** PRD #1332 C4a: capture the IMMUTABLE CHILD `threadId -> configured model` mapping. The
+   *  executor's child-turn seam calls this the moment a delegated child thread id is known,
+   *  with the model it selected (`spec.model ?? provider.model`), so the accountant can charge
+   *  the child's token-usage notes to its ACTUAL model rather than the root's. A child thread
+   *  is always fresh (ephemeral, never resumed), so it baselines at zero. */
+  recordChildThreadModel(threadId: string, model: string): void {
+    this.accountant.registerThread(threadId, model, false);
   }
 
   /** Stop routing frames for `threadId` to a child sink (the child turn is done). */
@@ -502,10 +559,14 @@ export class CodexHarness implements RunHarness {
       // 2. Start (or resume) the thread with the explicit untrusted / doc-max config —
       //    and NEVER a hook-trust bypass. Reused across turns once established.
       if (this.threadId === undefined) {
-        this.threadId =
-          request.resumeSessionId !== undefined
-            ? await this.resumeThread(transport, request, rendered)
-            : await this.startThread(transport, rendered, request.signal);
+        const resumed = request.resumeSessionId !== undefined;
+        this.threadId = resumed
+          ? await this.resumeThread(transport, request, rendered)
+          : await this.startThread(transport, rendered, request.signal);
+        // PRD #1332 C4a: capture the ROOT thread->model mapping the moment the thread id is
+        // known. The model is the immutable configured root model (currentModel); a resumed
+        // thread baselines at its pre-resume cumulative rather than zero.
+        this.accountant.registerThread(this.threadId, this.currentModel ?? this.provider.model, resumed);
       }
 
       // 3. Start the turn with the rendered prompt / model / effort.
@@ -515,6 +576,15 @@ export class CodexHarness implements RunHarness {
         // that activeTurnId exists, issue the best-effort interrupt and end cleanly.
         this.endTurnOnStop();
         return;
+      }
+
+      // Usage lineage is one row per executor claim leg, not per provider epoch. Emit the marker
+      // explicitly after thread start/resume + turn/start so a resumed claim gets one even though
+      // the pinned app-server emits no thread/started on thread/resume. Internal epoch recreations
+      // pass emitClaimInit=false, and this latch prevents another marker on later turns in epoch 0.
+      if (this.emitClaimInit && !this.claimInitEmitted) {
+        this.claimInitEmitted = true;
+        yield { kind: "initialized", model: this.currentModel, sessionId: this.threadId };
       }
 
       // 4. Consume the notification stream, mapping each raw frame to ONE neutral event.
@@ -544,6 +614,19 @@ export class CodexHarness implements RunHarness {
             category: "protocol",
             message: "codex app-server stream ended before turn completion",
           });
+        }
+        // The explicit claim init above replaces the root thread/started event without adding a
+        // second neutral activity. Child/foreign thread starts still flow through demux/mapNote.
+        if (step.value.kind === "thread_started" && step.value.threadId === this.threadId) {
+          continue;
+        }
+        // PRD #1332 C4a: reconcile every typed token-usage note into the per-model accountant
+        // BEFORE the demux, so BOTH root and demuxed-child usage is captured off this single
+        // consumer. An unknown/unregistered thread id is dropped inside record() (never
+        // attributed to root). The note still flows on to its normal handling below (a child's
+        // routes to its sink; a root's maps to `activity`), so decode behavior is unchanged.
+        if (step.value.kind === "token_usage_updated") {
+          this.accountant.record(step.value.threadId, step.value.usage);
         }
         // CHILD-THREAD DEMUX (part C). A frame carrying a REGISTERED child thread id is a
         // delegated child's frame: route its CONTENT to the child controller's sink and
@@ -750,17 +833,15 @@ export class CodexHarness implements RunHarness {
   ): Promise<HarnessEvent> {
     switch (note.kind) {
       case "thread_started":
-        // The model-bearing init: carries the model the harness configured, distinct
-        // from the bare turn-start below. Bind it to the ACTIVE ROOT thread: a child
-        // `thread/started` (a delegated subagent's) must never latch the root session id
-        // or emit a root `initialized`. The demux already routes a registered child's
-        // frames away, so this is defense-in-depth for the pre-registration window and any
-        // stray/foreign thread id — such a frame is liveness only.
-        if (note.threadId !== this.threadId) {
-          return { kind: "activity", sessionId: note.threadId };
-        }
-        return { kind: "initialized", model: this.currentModel, sessionId: note.threadId };
+        // The active root's notification is consumed in runTurn because its explicit claim init
+        // already carried the same session. Only a child/foreign start reaches here as liveness.
+        return { kind: "activity", sessionId: note.threadId };
       case "turn_started":
+        return { kind: "activity", sessionId: note.threadId };
+      case "token_usage_updated":
+        // PRD #1332 C4a: the token accounting already happened in the run loop before the
+        // demux; on the event stream this is pure liveness (no frame, no items). A child's
+        // token-usage note never reaches here (the demux routes it to the child sink first).
         return { kind: "activity", sessionId: note.threadId };
       case "turn_completed": {
         // The harness serves ONLY the ACTIVE root turn. A terminal for a stale turn id or
@@ -994,13 +1075,25 @@ export class CodexHarness implements RunHarness {
     // text-free, and usage is a bounded numeric-only subset.
     const { subtype, outcome } = normalizeCodexStatus(rawStatus);
     const errors = normalizeCodexTerminalErrors(subtype, outcome);
-    const usage = normalizeCodexUsage(turn?.usage, "turn");
+    // PRD #1332 C4a/C4b: attach the per-model token accounting as the result-frame `modelUsage`,
+    // now carrying each model's closed `costStatus` (and `costUSD` when metered) projected from
+    // the run's auth mode against the D5 price table (C4b). The reducer emits
+    // `terminal.usage.wire.modelUsage`, so the reconciled deltas + cost ride out there. When no
+    // usage was reconciled, aggregateByModel() is undefined and the terminal usage is left
+    // byte-identical to before C4a. `now` is the real clock at the terminal point; the price
+    // table keeps the injectable-clock seam (D5) so the Sol boundary is deterministic in tests.
+    const pricing = this.authMode === undefined ? undefined : { authMode: this.authMode, now: new Date() };
+    const modelUsage = this.accountant.aggregateByModel(pricing);
+    const usage = attachModelUsage(normalizeCodexUsage(turn?.usage, "turn"), modelUsage);
+    // The RUN-level cost status: subscription/metered/unreported, folded with D5's unreported
+    // dominance. Undefined auth mode leaves it `unreported` (price-free), matching `modelUsage`.
+    const cost = this.authMode === undefined ? { kind: "unreported" as const } : deriveCodexRunCost(modelUsage, this.authMode);
     return {
       outcome,
       subtype,
       errors,
       usage,
-      metrics: { cost: { kind: "unreported" } },
+      metrics: { cost },
       failure: {
         // Deferred, invoked only at the owner's classification point. Codex M3 carries no
         // limit facts, so this constructs the generic terminal exception; it never invents

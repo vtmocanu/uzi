@@ -171,6 +171,14 @@ export interface HarnessTerminal {
   // Exact uzi display subtype and String-mapped provider error array.
   subtype: string;
   errors: readonly string[];
+  // issue #1088: the raw provider-error signal threaded from decodeResult so the
+  // executor can classify a transient provider outage (429/500/502/503/529) and PARK
+  // via recovery_wait rather than terminal-fail. A 529 arrives as an api-error frame
+  // whose `errors` array is EMPTY (the text is in `resultText`), so these are the only
+  // signal available. All optional: absent on any non-provider-error terminal.
+  apiErrorStatus?: number | null;
+  resultText?: string;
+  terminalReason?: string;
   // Deferred compatibility construction, independent of display subtype.
   // Invoke only at the lane's existing terminal-classification point.
   failure?: HarnessTerminalFailure;
@@ -409,6 +417,15 @@ export interface ReducedTurnResult extends TurnSignals {
    *  undefined only when the turn streamed no model output at all. Paired with
    *  `numTurns === 0` it is the evidence a turn was positively empty. */
   sawModelActivity?: boolean;
+  /** PRD #1349 M3: THIS turn's FINAL latest-wins rate-limit observation, carried
+   *  through from the terminal's `HarnessLimitEvidence.latest` (built off the
+   *  latest-wins `RateLimitObserver`, so the newest `rate_limit_event` of the turn).
+   *  Undefined when the turn saw no rate-limit frame. Per-turn (cleared each
+   *  `beginTurn`), so a prior turn's verdict never leaks into a later empty turn's
+   *  routing. The empty-turn recovery arm reads `status === "rejected"` to route a
+   *  positively-empty, rate-limited turn to the usage-limit wait path (LimitReachedError)
+   *  rather than the generic recovery_wait park. */
+  rateLimit?: HarnessRateLimit;
 }
 
 export interface TurnReduction {

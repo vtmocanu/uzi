@@ -205,17 +205,19 @@ func newScheduleCreateCmd(env Env, gf *globalFlags) *cobra.Command {
 			"on N repos at once: a CLIENT-SIDE fan-out of one independent create per --repo.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			req, repos, err := buildScheduleRequest(cmd)
+			// The client is built first (PRD #1247 M6): buildScheduleRequest resolves an
+			// optional --token label through it (auto|default|inherit need no round-trip).
+			c, err := env.client(gf)
+			if err != nil {
+				return err
+			}
+			req, repos, err := buildScheduleRequest(cmd, c)
 			if err != nil {
 				return err
 			}
 			if req.Target == schedTargetIssue && len(repos) > 1 {
 				return uzicli.Exitf(uzicli.ExitUsage,
 					"an issue-target schedule cannot be created on multiple repos at once; issue numbers are repo-relative, so create it on one repo, then re-create it against each other repo")
-			}
-			c, err := env.client(gf)
-			if err != nil {
-				return err
 			}
 			// Sweep-label guardrail (PRD #589 M4): for a --sweep target, warn on (or, with
 			// --create-missing-labels, create) any explicitly-named --label missing on a
@@ -272,6 +274,7 @@ func newScheduleCreateCmd(env Env, gf *globalFlags) *cobra.Command {
 	create.Flags().Bool("auto-approve", true, "proceed past the plan gate unattended; pass --auto-approve=false to keep the gate")
 	create.Flags().Bool("wait-on-limit", true, "park a fired run until the Anthropic usage window reopens instead of failing it; pass --wait-on-limit=false to fail on limit")
 	create.Flags().Bool("mr-rework", false, "enable or disable auto-rework of fired runs' MR review comments; omit to inherit the account default, or pass --mr-rework=false to force off")
+	create.Flags().String("token", "", "Anthropic token for runs this schedule fires: a token label (from `uzi token list`), or auto|default|inherit; omit to inherit the worker binding")
 	create.Flags().Bool("enabled", true, "create the schedule enabled; pass --enabled=false to create it paused")
 	create.Flags().Bool("create-missing-labels", false, "for a --sweep target: create any --label missing on a target repo before creating the schedule (default: warn only)")
 	return create
@@ -372,7 +375,7 @@ func newScheduleEditCmd(env Env, gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			req, err := buildScheduleEditRequest(cmd, s)
+			req, err := buildScheduleEditRequest(cmd, c, s)
 			if err != nil {
 				return err
 			}
@@ -417,6 +420,7 @@ func newScheduleEditCmd(env Env, gf *globalFlags) *cobra.Command {
 	edit.Flags().Bool("auto-approve", true, "set whether a fired run proceeds past the plan gate unattended")
 	edit.Flags().Bool("wait-on-limit", true, "set whether a fired run parks on the usage limit instead of failing")
 	edit.Flags().Bool("mr-rework", false, "set whether fired runs' MR review comments are auto-reworked; pass --mr-rework=false to force off (an unset flag leaves the stored value unchanged)")
+	edit.Flags().String("token", "", "change the Anthropic token for runs this schedule fires: a token label (from `uzi token list`), or auto|default|inherit; an unset flag leaves the stored value unchanged")
 	edit.Flags().String("guidance", "", "change owner guidance injected into the run instruction (issue/sweep targets, or a prompt-target or sweep-target default)")
 	edit.Flags().Int("max-issues", 10, "change the per-fire sweep cap, oldest-first (sweep target only)")
 	edit.Flags().Bool("clear-guidance", false, "clear stored guidance back to none (issue/sweep targets, or a prompt-target or sweep-target default)")

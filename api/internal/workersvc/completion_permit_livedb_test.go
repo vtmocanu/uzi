@@ -365,6 +365,80 @@ func TestCompletionRevisionBumpUnderLockStaysNonTerminalLiveDB(t *testing.T) {
 	}
 }
 
+// TestCompletionGenerationFenceLiveDB drives completeRunWithPermit's generation fence (PRD #1247
+// M5, D3) end to end through a completed report carrying claim_generation, against an INTERLOCKED
+// run with a granted permit — coverage the interlocked completion arm lacked (tester BLOCKING gap):
+//   - (a) matching generation + not released -> completion proceeds (happy path);
+//   - (b1) generation mismatch (a superseding reclaim bumped it) -> ErrStaleClaim, not completed;
+//   - (b2) claim_released_at set at the matching generation -> ErrStaleClaim, not completed.
+//
+// The permit is issued in every case, so ONLY the generation fence distinguishes them. A mutation
+// flipping the fence boolean (== for !=) reddens (a); dropping the fence reddens (b1) and (b2).
+func TestCompletionGenerationFenceLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	svc := e.permitService(t)
+	wid := e.seedWorker(t, []string{"completion_interlock_v1"})
+	wkr := store.Worker{ID: wid}
+	const (
+		head   = "d0d0feed"
+		branch = "agent/issue-1"
+	)
+	g := int64(3)
+	permit := func(runID uuid.UUID) {
+		t.Helper()
+		if p, err := svc.RequestCompletionPermit(e.ctx, wkr, runID,
+			CompletionPermitRequest{ContractRevision: 1, Branch: branch, Head: head}); err != nil || !p.Granted {
+			t.Fatalf("permit must be granted: %+v err=%v", p, err)
+		}
+	}
+
+	// (a) HAPPY PATH: matching generation, not released -> the permitted completion terminates.
+	happy := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
+	e.exec(t, `UPDATE runs SET claim_generation = $2 WHERE id = $1`, happy, g)
+	permit(happy)
+	run, applied, err := svc.SetState(e.ctx, wkr, happy,
+		StateRequest{State: "completed", Head: strPtr(head), Branch: strPtr(branch), ClaimGeneration: &g})
+	if err != nil {
+		t.Fatalf("matching-generation completion: %v", err)
+	}
+	if !applied || run.Status != "completed" {
+		t.Fatalf("a matching-generation permitted completion must terminate the run; applied=%v status=%q", applied, run.Status)
+	}
+
+	// (b1) GENERATION MISMATCH: a reclaim bumped the run past the reported generation.
+	mismatch := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
+	e.exec(t, `UPDATE runs SET claim_generation = $2 WHERE id = $1`, mismatch, g)
+	permit(mismatch)
+	wrong := g + 1
+	_, applied, err = svc.SetState(e.ctx, wkr, mismatch,
+		StateRequest{State: "completed", Head: strPtr(head), Branch: strPtr(branch), ClaimGeneration: &wrong})
+	if !errors.Is(err, ErrStaleClaim) {
+		t.Fatalf("generation-mismatch completion: err = %v, want ErrStaleClaim", err)
+	}
+	if applied {
+		t.Fatal("a generation-mismatch completion must not apply")
+	}
+	if s := e.runStatus(t, mismatch); s != "running" {
+		t.Fatalf("run must stay non-terminal on a stale completion; status = %q", s)
+	}
+
+	// (b2) RELEASED CLAIM at the matching generation: a held-state switch released this claim.
+	released := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
+	e.exec(t, `UPDATE runs SET claim_generation = $2, claim_released_at = now() WHERE id = $1`, released, g)
+	permit(released)
+	_, applied, err = svc.SetState(e.ctx, wkr, released,
+		StateRequest{State: "completed", Head: strPtr(head), Branch: strPtr(branch), ClaimGeneration: &g})
+	if !errors.Is(err, ErrStaleClaim) {
+		t.Fatalf("released-claim completion: err = %v, want ErrStaleClaim", err)
+	}
+	if applied {
+		t.Fatal("a released-claim completion must not apply")
+	}
+	if s := e.runStatus(t, released); s != "running" {
+		t.Fatalf("run must stay non-terminal on a released-claim completion; status = %q", s)
+	}
+}
+
 // TestLegacyCompletionPassthroughLiveDB: a legacy run (completion_contract_version NULL)
 // completes through the unchanged path, needing no permit.
 func TestLegacyCompletionPassthroughLiveDB(t *testing.T) {
@@ -649,7 +723,7 @@ func TestSetRunCompletionHoldLiveDB(t *testing.T) {
 	// is recorded and a resolved open_question_id is cleared.
 	running := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
 	e.exec(t, `UPDATE runs SET completion_attempts = 1, open_question_id = 'q-should-clear' WHERE id = $1`, running)
-	run, applied, err := svc.SetRunCompletionHold(e.ctx, wkr, running, "capturedhead1")
+	run, applied, err := svc.SetRunCompletionHold(e.ctx, wkr, running, "capturedhead1", nil)
 	if err != nil {
 		t.Fatalf("SetRunCompletionHold (running): %v", err)
 	}
@@ -672,7 +746,7 @@ func TestSetRunCompletionHoldLiveDB(t *testing.T) {
 	// Case 2: owned interlocked AWAITING_INPUT run with an attempt also holds.
 	awaiting := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
 	e.exec(t, `UPDATE runs SET status = 'awaiting_input', completion_attempts = 2 WHERE id = $1`, awaiting)
-	run2, applied2, err := svc.SetRunCompletionHold(e.ctx, wkr, awaiting, "")
+	run2, applied2, err := svc.SetRunCompletionHold(e.ctx, wkr, awaiting, "", nil)
 	if err != nil {
 		t.Fatalf("SetRunCompletionHold (awaiting_input): %v", err)
 	}
@@ -687,7 +761,7 @@ func TestSetRunCompletionHoldLiveDB(t *testing.T) {
 	// Case 3: completion_attempts==0 is REFUSED (the guard fails); status is unchanged. THIS is
 	// the assertion the completion_attempts>0 mutation check reddens.
 	noAttempts := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false) // attempts defaults to 0
-	run3, applied3, err := svc.SetRunCompletionHold(e.ctx, wkr, noAttempts, "h")
+	run3, applied3, err := svc.SetRunCompletionHold(e.ctx, wkr, noAttempts, "h", nil)
 	if err != nil {
 		t.Fatalf("SetRunCompletionHold (attempts=0): %v", err)
 	}
@@ -704,7 +778,7 @@ func TestSetRunCompletionHoldLiveDB(t *testing.T) {
 	// Case 4: a non-running/awaiting_input status (queued) is REFUSED even with an attempt.
 	queued := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
 	e.exec(t, `UPDATE runs SET status = 'queued', completion_attempts = 3 WHERE id = $1`, queued)
-	run4, applied4, err := svc.SetRunCompletionHold(e.ctx, wkr, queued, "h")
+	run4, applied4, err := svc.SetRunCompletionHold(e.ctx, wkr, queued, "h", nil)
 	if err != nil {
 		t.Fatalf("SetRunCompletionHold (queued): %v", err)
 	}
@@ -736,7 +810,7 @@ func TestSetRunCompletionHoldLiveDB(t *testing.T) {
 	// drop `completion_contract_version IS NOT NULL` from SetRunCompletionHold and this reddens.
 	legacy := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
 	e.exec(t, `UPDATE runs SET completion_contract_version = NULL, completion_attempts = 4 WHERE id = $1`, legacy)
-	run6, applied6, err := svc.SetRunCompletionHold(e.ctx, wkr, legacy, "h")
+	run6, applied6, err := svc.SetRunCompletionHold(e.ctx, wkr, legacy, "h", nil)
 	if err != nil {
 		t.Fatalf("SetRunCompletionHold (legacy): %v", err)
 	}
@@ -761,7 +835,7 @@ func TestSetRunCompletionHoldLiveDB(t *testing.T) {
 	other := store.Worker{ID: otherWid}
 	foreign := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
 	e.exec(t, `UPDATE runs SET completion_attempts = 1 WHERE id = $1`, foreign)
-	run7, applied7, err := svc.SetRunCompletionHold(e.ctx, other, foreign, "foreignhead")
+	run7, applied7, err := svc.SetRunCompletionHold(e.ctx, other, foreign, "foreignhead", nil)
 	if !errors.Is(err, ErrRunNotOwned) {
 		t.Fatalf("a foreign worker must be refused ErrRunNotOwned; got run=%+v applied=%v err=%v", run7, applied7, err)
 	}

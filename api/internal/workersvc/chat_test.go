@@ -189,6 +189,87 @@ func TestClaimChatFailsWithoutAnthropicToken(t *testing.T) {
 	}
 }
 
+// TestAssembleChatClaimRefusesCodexIndicatingRun is the DB-free unit of the second-layer
+// Codex refusal in assembleChatClaim (PRD #1332 M5A / D3). The LiveDB test only exercises the
+// FIRST layer — ClaimChatRun's SQL WHERE, which excludes every Codex-indicating chat row before
+// it reaches assembleChatClaim — so the in-assembly guard itself was untested. Here we call
+// assembleChatClaim DIRECTLY with a Codex-indicating run to prove the belt-and-suspenders guard
+// fires: it must fail closed with errCredentialUnavailable and open NO credential (the guard sits
+// before openAnthropic), never assemble a Claude chat claim for a Codex-indicating run.
+func TestAssembleChatClaimRefusesCodexIndicatingRun(t *testing.T) {
+	// Each of the three binding facts, in isolation, must trip the refusal — the guard checks
+	// all three so it stays closed on the deleted-alias / coherence edge (harness stays 'codex'
+	// while codex_secret_id is nulled, and vice-versa).
+	cases := []struct {
+		name string
+		run  store.Run
+	}{
+		{"harness codex", store.Run{ID: uuid.New(), UserID: uuid.New(), Kind: runkind.Chat, Harness: harnessCodex}},
+		{"codex material revision valid", store.Run{ID: uuid.New(), UserID: uuid.New(), Kind: runkind.Chat, Harness: harnessClaude, CodexMaterialRevision: pgtype.Int8{Int64: 3, Valid: true}}},
+		{"codex secret id valid", store.Run{ID: uuid.New(), UserID: uuid.New(), Kind: runkind.Chat, Harness: harnessClaude, CodexSecretID: pgtype.UUID{Bytes: uuid.New(), Valid: true}}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			// A token IS wired, so if the guard did NOT fire the claim would ASSEMBLE (a false
+			// pass) rather than fail on a missing token — which is exactly what makes this prove
+			// the guard, not an incidental credential failure.
+			box := newBox(t)
+			sealedTok, _ := box.Seal([]byte("anthropic-codex-refusal-abcdef1234567890"))
+			fs := &fakeStore{anthropic: sealedTok}
+			svc := New(fs, box, testParams())
+
+			payload, err := svc.assembleChatClaim(context.Background(), c.run)
+			if !errors.Is(err, errCredentialUnavailable) {
+				t.Fatalf("err = %v, want errCredentialUnavailable (the Codex refusal)", err)
+			}
+			if !strings.Contains(err.Error(), "Codex chat is not implemented") {
+				t.Fatalf("err = %v, want the Codex-refusal message (proving the guard fired, not openAnthropic)", err)
+			}
+			if payload != nil {
+				t.Fatal("a refused Codex-indicating chat run must return no payload")
+			}
+			// The guard sits BEFORE openAnthropic/recordRunCredential, so no credential was
+			// resolved, opened, or recorded — even though a token was wired.
+			if len(fs.defaultMetaLookups) != 0 || len(fs.byIDLookups) != 0 {
+				t.Fatalf("refusal must open no credential: defaultMetaLookups=%d byIDLookups=%d", len(fs.defaultMetaLookups), len(fs.byIDLookups))
+			}
+			if len(fs.recordedCreds) != 0 {
+				t.Fatalf("refusal must record no credential, got %d", len(fs.recordedCreds))
+			}
+		})
+	}
+}
+
+// TestAssembleChatClaimAllowsClaudeRun is the positive control for the Codex refusal above: a
+// plain Claude chat run (no Codex-indicating fact) must NOT be refused by the guard — it proceeds
+// to open the Anthropic credential and assemble a claim. Wiring a token lets the whole path
+// succeed, which is a strong proof the guard did not fire for the harness reason.
+func TestAssembleChatClaimAllowsClaudeRun(t *testing.T) {
+	box := newBox(t)
+	sealedTok, _ := box.Seal([]byte("anthropic-claude-chat-allow-abcdef1234567890"))
+	fs := &fakeStore{anthropic: sealedTok}
+	svc := New(fs, box, testParams())
+
+	run := store.Run{ID: uuid.New(), UserID: uuid.New(), Kind: runkind.Chat, Harness: harnessClaude, Status: "claimed", Title: pgtype.Text{String: "hi", Valid: true}}
+	payload, err := svc.assembleChatClaim(context.Background(), run)
+	if err != nil {
+		t.Fatalf("assembleChatClaim(claude): %v", err)
+	}
+	if errors.Is(err, errCredentialUnavailable) {
+		t.Fatalf("a Claude chat run must not be refused by the Codex guard, got %v", err)
+	}
+	if payload == nil {
+		t.Fatal("a Claude chat run must assemble a payload")
+	}
+	if payload.Secrets.AnthropicOAuthToken != "anthropic-claude-chat-allow-abcdef1234567890" {
+		t.Fatalf("payload must carry the decrypted Anthropic token, got %q", payload.Secrets.AnthropicOAuthToken)
+	}
+	// The guard let the claim proceed, so the credential WAS opened (unlike the refusal cases).
+	if len(fs.defaultMetaLookups) == 0 {
+		t.Fatal("a proceeding Claude claim must resolve its default credential")
+	}
+}
+
 // TestSubmitChatMessageEnforcesTurnCap: at CHAT_MAX_TURNS persisted follow-ups the
 // server rejects a further message (Decision 3), and below the cap it enqueues a
 // follow_up on the steering wire.

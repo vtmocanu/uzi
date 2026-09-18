@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, describe, it, expect, vi } from "vitest";
-import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { RecoveryArchivesPanel } from "./RecoveryArchives";
 import { api, type RecoveryArchive, type RecoveryArchiveSummary, type Run } from "../lib/api";
 
@@ -11,7 +11,7 @@ vi.mock("../lib/api", async (importActual) => {
   const actual = await importActual<typeof import("../lib/api")>();
   return {
     ...actual,
-    api: { getRunArchives: vi.fn() },
+    api: { getRunArchives: vi.fn(), discardRunArchive: vi.fn() },
   };
 });
 const mockApi = vi.mocked(api);
@@ -77,7 +77,7 @@ describe("RecoveryArchivesPanel — zero-capture truthfulness", () => {
     expect(screen.getByText(/Durable recovery was not available for this run/)).toBeTruthy();
     // No capture list, so no download surface and no secret warning.
     expect(screen.queryByText(SECRET_WARNING)).toBeNull();
-    expect(screen.queryByRole("button", { name: "Download bundle" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Export archive" })).toBeNull();
   });
 
   it("shows the preparing note on a terminal run with an open hold and no capture", async () => {
@@ -109,32 +109,83 @@ describe("RecoveryArchivesPanel — download gating (D7)", () => {
       }),
     );
 
-    // Exactly ONE download link exists — the available capture's — proving the other state
-    // did not render a usable download. If the gate were removed both rows would link.
-    const links = screen.getAllByRole("link");
+    // Exactly ONE download control is a link — the available capture's — proving the other
+    // state did not render a usable download. If the gate were removed both rows would link.
+    const links = screen.getAllByRole("link", { name: "Export archive" });
     expect(links).toHaveLength(1);
     expect(links[0].getAttribute("href")).toBe("/api/runs/r1/archives/cap-ok/download");
+    // a11y: the enabled control is a SINGLE <a> styled as a button (its download attribute
+    // kept), never an <a> wrapping a <Button> — one tab stop, one screen-reader announcement.
+    expect(links[0].tagName).toBe("A");
+    expect(links[0].querySelector("button")).toBeNull();
+    expect(links[0].hasAttribute("download")).toBe(true);
     // The link's own row is the available one.
     expect(within(links[0].closest("li") as HTMLElement).getByText("Available")).toBeTruthy();
 
-    // Both rows still render a "Download bundle" control; the needs_action one is a disabled
-    // button not wrapped in a link.
-    const buttons = screen.getAllByRole("button", { name: "Download bundle" });
-    expect(buttons).toHaveLength(2);
-    const disabled = buttons.filter((b) => (b as HTMLButtonElement).disabled);
-    const enabled = buttons.filter((b) => !(b as HTMLButtonElement).disabled);
-    expect(disabled).toHaveLength(1);
-    expect(enabled).toHaveLength(1);
-    // The disabled control belongs to the needs_action row and is NOT inside a link.
-    expect(disabled[0].closest("a")).toBeNull();
-    expect(within(disabled[0].closest("li") as HTMLElement).getByText("Needs action")).toBeTruthy();
-    // The enabled control IS the one inside the sole link.
-    expect(enabled[0].closest("a")).toBe(links[0]);
+    // The non-downloadable row renders a DISABLED button (not a link), so there is exactly
+    // one "Export archive" button and it is disabled and not inside a link.
+    const buttons = screen.getAllByRole("button", { name: "Export archive" });
+    expect(buttons).toHaveLength(1);
+    expect((buttons[0] as HTMLButtonElement).disabled).toBe(true);
+    expect(buttons[0].closest("a")).toBeNull();
+    expect(within(buttons[0].closest("li") as HTMLElement).getByText("Needs action")).toBeTruthy();
   });
 
   it("shows the secret-review warning on the download surface whenever captures render", async () => {
     await renderPanel(aRun({ status: "failed" }), summary({ archives: [archive({ state: "available" })] }));
     expect(screen.getByText(SECRET_WARNING)).toBeTruthy();
+  });
+});
+
+describe("RecoveryArchivesPanel — Delete archive (D7/D9)", () => {
+  it("gates Delete archive behind a warn-only confirmation that recommends export first, then calls discardRunArchive and reloads", async () => {
+    // First fetch: one available capture. Second fetch (after delete): empty, so the row
+    // clears — proving the panel reloads from the server rather than optimistically mutating.
+    mockApi.getRunArchives
+      .mockResolvedValueOnce(summary({ archives: [archive({ id: "cap-ok", state: "available" })] }))
+      .mockResolvedValueOnce(summary({ archives: [] }));
+    mockApi.discardRunArchive.mockResolvedValue({ discarded: true });
+
+    render(<RecoveryArchivesPanel run={aRun({ status: "failed" })} />);
+    await waitFor(() => expect(mockApi.getRunArchives).toHaveBeenCalled());
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    // The confirmation is not shown until the owner asks for it.
+    expect(screen.queryByText(/permanently deletes the archived committed history/)).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: /Delete archive/ }));
+
+    // The warning recommends exporting first (D9), and nothing has been deleted yet.
+    expect(screen.getByText(/export it first if you might need it/)).toBeTruthy();
+    expect(mockApi.discardRunArchive).not.toHaveBeenCalled();
+
+    // Confirm — while confirming, the trigger unmounts, so the only "Delete archive" button
+    // left is the solid confirm inside the warning panel.
+    fireEvent.click(screen.getByRole("button", { name: /Delete archive/ }));
+    await waitFor(() => expect(mockApi.discardRunArchive).toHaveBeenCalledWith("r1", "cap-ok"));
+    // The reload replaces the list with the empty second fetch, so the capture is gone.
+    await waitFor(() => expect(screen.queryByText("Available")).toBeNull());
+  });
+
+  it("does not offer Delete archive for an in-flight (uploading) capture", async () => {
+    await renderPanel(
+      aRun({ status: "failed" }),
+      summary({ archives: [archive({ id: "cap-up", state: "uploading" })] }),
+    );
+    expect(screen.queryByRole("button", { name: /Delete archive/ })).toBeNull();
+  });
+
+  it("cancelling the confirmation performs no mutation", async () => {
+    await renderPanel(
+      aRun({ status: "failed" }),
+      summary({ archives: [archive({ id: "cap-ok", state: "available" })] }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /Delete archive/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByText(/permanently deletes the archived committed history/)).toBeNull();
+    expect(mockApi.discardRunArchive).not.toHaveBeenCalled();
   });
 });
 

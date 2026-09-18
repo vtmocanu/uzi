@@ -1,0 +1,50 @@
+{{- if .Values.appPriorityClass.enabled }}
+{{- /*
+  The app-tier PriorityClass for uzi's control plane (api, web, controller).
+
+  Cluster-scoped (scheduling.k8s.io/v1 PriorityClass has NO namespace), gated on
+  appPriorityClass.enabled. When present, api/web/controller carry its priorityClassName
+  (see the three *-deployment.yaml), so the control plane outranks lower-priority pods for
+  scheduling and kubelet node-pressure eviction instead of being the first thing evicted or
+  left unschedulable when the hosted worker fleet reserves most of the node memory.
+
+  value defaults to 1001 — above workers.priorityClass.value (1000), so a hosted worker can
+  never evict or preempt uzi's own control plane, and below dbPriorityClass (1002), the one
+  thing the api depends on. preemptionPolicy defaults to PreemptLowerPriority so an
+  unschedulable app pod preempts a lower-priority victim to get placed on a full cluster;
+  set it to Never for the polite shared-cluster option (eviction survival without
+  scheduling-time preemption).
+
+  sync-wave -1 so ArgoCD applies this object before the Deployments that reference it (an
+  otherwise-transient "no PriorityClass named ..." pod admission error on first sync).
+  Replace=true because `value` and `preemptionPolicy` are IMMUTABLE on a live PriorityClass:
+  a patch of a changed value is rejected and wedges the sync, so ArgoCD deletes and
+  recreates the object instead. Safe: running pods keep the priority recorded at admission,
+  and the wave ordering recreates the class before any Deployment rollout needs it.
+
+  Disabled (appPriorityClass.enabled: false) renders NOTHING here and the deployments carry
+  no priorityClassName — byte-identical to before this existed.
+*/ -}}
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: {{ .Values.appPriorityClass.name | default (printf "%s-app" .Release.Name) }}
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+    # `value` and `preemptionPolicy` are IMMUTABLE on a live PriorityClass. Replace=true
+    # alone runs `kubectl replace`, which is still an update and REJECTS a changed value
+    # ("may not be changed in an update"), wedging the sync. Force=true adds `--force`, so
+    # ArgoCD deletes and recreates the object; running pods keep the priority recorded at
+    # admission. Force=true is only honored alongside Replace=true.
+    argocd.argoproj.io/sync-options: Force=true,Replace=true
+value: {{ .Values.appPriorityClass.value }}
+# HARD-CODED false, never configurable: globalDefault: true would repriority every pod
+# cluster-wide that declares no priorityClassName, far outside uzi's blast radius.
+globalDefault: false
+{{- with .Values.appPriorityClass.preemptionPolicy }}
+preemptionPolicy: {{ . }}
+{{- end }}
+description: {{ .Values.appPriorityClass.description | default "Priority for the uzi control plane (api, web, controller) so it survives node memory pressure and is scheduled ahead of lower-priority pods." | quote }}
+{{- end }}

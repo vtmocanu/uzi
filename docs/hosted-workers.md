@@ -121,6 +121,37 @@ Both are cluster-driven, like cordoning; there's no button for either. An
 admin can turn the self-heal off entirely via chart config if it's ever not
 wanted.
 
+## Message outbox
+
+A hosted worker gets the same [message outbox](./worker-setup.md#message-outbox) as
+any worker: an api outage of any length no longer costs a run its message feed,
+since the worker spills to a durable on-disk outbox after a sustained outage and
+replays it in order once the api is back — as long as the retained data stays
+within the outbox's configured quotas (`WORKER_OUTBOX_RUN_MAX_BYTES`,
+`WORKER_OUTBOX_MAX_BYTES`, `WORKER_OUTBOX_SPILL_BUFFER_BYTES`); beyond them, some
+message frames are dropped and replayed as contiguous per-seq gap markers rather
+than the original messages. One caveat is worth restating here rather
+than at length: a hosted worker runs the `#58` single-uid posture, so the model
+process shares its uid and could read, forge, truncate, or delete its own outbox —
+the outbox protects against the outage, not against a hostile model, on this
+runtime. See [worker-setup.md](./worker-setup.md#message-outbox) for the full
+caveat and the tunable quotas.
+
+## Surviving an api restart mid-run
+
+The message outbox above is about the run's message feed surviving an
+outage; this is about the run's own status. A hosted worker reports, on
+every heartbeat, which run-lane attempts it's actually executing and in
+which phase — running, or waiting at a plan-approval or a clarifying-question
+gate. Once the api is back up (after a boot grace during which it holds off
+declaring workers stale, so a worker that only lost the api and not its own
+health isn't wrongly re-queued), it uses that report to restore a run the
+outage flipped to `queued` back to its exact phase within one heartbeat,
+without spending the run's re-queue budget or opening a new custody hold. A
+run genuinely re-queued during the outage has that charge refunded once it's
+back. See [configuration.md](./configuration.md#server-api) for
+`SWEEPER_BOOT_GRACE` and the related knobs.
+
 ## How this differs from running your own worker
 
 A worker you run yourself is a container on hardware you control: you copy a

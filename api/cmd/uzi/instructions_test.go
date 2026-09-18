@@ -403,10 +403,12 @@ var knownInstructions = []knownInstruction{
 		// executed against a FAKE client, so this proves the argv shape and the refusal, not
 		// that `uzi token list` succeeds against a booted API. TestTokenList covers the
 		// command itself, also against a fake.
-		note: "RUNTIME: `uzi token pool`'s unknown-label refusal (token.go) names the read " +
-			"that prints the caller's valid labels. EXECUTED through the real parse in " +
-			"TestTokenPoolUnknownLabelIsUsageError, which asserts exit 3 AND that no write " +
-			"was sent. Not executed against a booted API.",
+		note: "RUNTIME: `uzi token pool`'s unknown-label refusal (token.go) AND `uzi run create " +
+			"--token <label>`'s client-side unknown-label refusal (run_lifecycle.go, PRD #1247 M2) " +
+			"both name the read that prints the caller's valid labels. EXECUTED through the real " +
+			"parse in TestTokenPoolUnknownLabelIsUsageError (exit 3 AND no write sent) and " +
+			"TestRunCreateTokenUnknownLabelRefusedClientSide (exit 3 AND CreateRun never called). " +
+			"Not executed against a booted API.",
 	},
 	{
 		command:  "uzi skill install",
@@ -476,6 +478,50 @@ var knownInstructions = []knownInstruction{
 			"Exitf (STDERR, exit 5). EXECUTED by TestWorkerRmCustodyConflict, which asserts exit " +
 			"ExitConflict, one delete attempt, and that the stderr names the command. Not executed " +
 			"against a booted API.",
+	},
+	{
+		command:  "uzi run recovery",
+		evidence: evidenceGoTest,
+		where:    "TestWorkerRmCustodyConflict",
+		// ARRIVED WITH PRD #1349 M5. `uzi worker rm`'s custody refusal (worker.go) now names the
+		// LIST verb an operator runs to see which exact holds block the worker — `uzi run recovery
+		// <run-id>` — alongside the recover (`uzi run export`) and discard verbs. M5 wired the
+		// command into the cobra tree, so the backticked reference resolves under
+		// assertCommandPathResolves. It is ALSO named from run_recovery.go's `run discard`
+		// "--hold required" Exitf (see `uzi run recovery %s`), another RUNTIME emit.
+		//
+		// RUNTIME, derived: the spans sit inside Exitf/Sprintf arguments (worker.go's guidance,
+		// run_recovery.go's usage error), which classifyKind reads as emitters. EXECUTED by
+		// TestWorkerRmCustodyConflict, which asserts the worker-rm refusal names the exact
+		// `uzi run recovery <run-id>` on stderr. Its honest limit: executed against a FAKE client,
+		// so it proves the refusal names the verb, not that the verb succeeds against a booted API.
+		note: "RUNTIME: `uzi worker rm`'s custody refusal (worker.go) names `uzi run recovery` as " +
+			"the LIST verb for the exact holds blocking a worker, through Exitf (STDERR, exit 5). " +
+			"EXECUTED by TestWorkerRmCustodyConflict, which asserts the stderr names it. Not " +
+			"executed against a booted API.",
+	},
+	{
+		command:  "uzi run discard",
+		evidence: evidenceGoTest,
+		where:    "TestWorkerRmCustodyConflict",
+		// ARRIVED WITH PRD #1349 M5. `uzi worker rm`'s custody refusal (worker.go) now names the
+		// exact DISCARD verb — `uzi run discard <run-id> --hold <hold-id> --yes` — that an operator
+		// runs THEMSELVES to dispose a held source, rather than bundling a force-discard into
+		// `worker rm` (D9). M5 wired the command into the cobra tree, so the backticked reference
+		// resolves under assertCommandPathResolves. It is ALSO named from run_recovery.go's
+		// per-run decision hint (`uzi run discard %s --hold <hold-id> --yes`), another RUNTIME emit.
+		//
+		// RUNTIME, derived: the spans sit inside Exitf/Printf/Sprintf arguments (worker.go's
+		// guidance, run_recovery.go's decision hint), which classifyKind reads as emitters.
+		// EXECUTED by TestWorkerRmCustodyConflict, which asserts the worker-rm refusal names the
+		// exact `uzi run discard <run-id> --hold <hold-id> --yes` on stderr. Its honest limit:
+		// executed against a FAKE client, so it proves the refusal names the verb, not that the
+		// verb succeeds against a booted API (`uzi run discard`'s own paths — non-TTY refusal,
+		// cancellation, --yes → confirm=discard — are exercised by the run_recovery_test.go suite).
+		note: "RUNTIME: `uzi worker rm`'s custody refusal (worker.go) names `uzi run discard` as " +
+			"the exact held-source discard verb (never bundled into worker rm, D9), through Exitf " +
+			"(STDERR, exit 5). EXECUTED by TestWorkerRmCustodyConflict, which asserts the stderr " +
+			"names it. Not executed against a booted API.",
 	},
 	{
 		command:  "uzi schedule clone",

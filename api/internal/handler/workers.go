@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -124,17 +125,21 @@ func workerDTOFromWorker(w store.Worker, activeRuns int, busy bool, secretLabel,
 		Busy:                 busy,
 		ActiveRuns:           activeRuns,
 		MaxConcurrentRuns:    intPtrValue(w.MaxConcurrentRuns),
-		TemplateDeclared:     textPtrValue(w.TemplateDeclared.Valid, w.TemplateDeclared.String),
-		TemplateReported:     textPtrValue(w.TemplateReported.Valid, w.TemplateReported.String),
-		Version:              textPtrValue(w.Version.Valid, w.Version.String),
-		LastHeartbeatAt:      timePtr(w.LastHeartbeatAt.Valid, w.LastHeartbeatAt.Time),
-		OnlineSince:          timePtr(w.OnlineSince.Valid, w.OnlineSince.Time),
-		DrainingSince:        timePtr(w.DrainingSince.Valid, w.DrainingSince.Time),
-		CreatedAt:            w.CreatedAt.Time,
-		StatsCPUPct:          float4PtrValue(w.StatsCpuPct),
-		StatsMemBytes:        int8PtrValue(w.StatsMemBytes),
-		StatsMemLimitBytes:   int8PtrValue(w.StatsMemLimitBytes),
-		StatsSource:          textPtrValue(w.StatsSource.Valid, w.StatsSource.String),
+		// Seed reported_runs to a non-nil [] (PRD #1390 M2c): the DB overlay only runs on the
+		// list/patch surfaces, so this keeps every OTHER WorkerDTO producer (register, heartbeat,
+		// create, hosted-provision) marshaling an array rather than null.
+		ReportedRuns:       []apitypes.WorkerReportedRunDTO{},
+		TemplateDeclared:   textPtrValue(w.TemplateDeclared.Valid, w.TemplateDeclared.String),
+		TemplateReported:   textPtrValue(w.TemplateReported.Valid, w.TemplateReported.String),
+		Version:            textPtrValue(w.Version.Valid, w.Version.String),
+		LastHeartbeatAt:    timePtr(w.LastHeartbeatAt.Valid, w.LastHeartbeatAt.Time),
+		OnlineSince:        timePtr(w.OnlineSince.Valid, w.OnlineSince.Time),
+		DrainingSince:      timePtr(w.DrainingSince.Valid, w.DrainingSince.Time),
+		CreatedAt:          w.CreatedAt.Time,
+		StatsCPUPct:        float4PtrValue(w.StatsCpuPct),
+		StatsMemBytes:      int8PtrValue(w.StatsMemBytes),
+		StatsMemLimitBytes: int8PtrValue(w.StatsMemLimitBytes),
+		StatsSource:        textPtrValue(w.StatsSource.Valid, w.StatsSource.String),
 
 		StatsDiskNixBytes:       int8PtrValue(w.StatsDiskNixBytes),
 		StatsDiskNixTotalBytes:  int8PtrValue(w.StatsDiskNixTotalBytes),
@@ -178,6 +183,8 @@ func workerDTOFromRow(w store.ListWorkersByUserRow, cpVersion, pinnedWorkerVersi
 		Busy:                     w.Busy,
 		ActiveRuns:               int(w.ActiveRuns),
 		MaxConcurrentRuns:        intPtrValue(w.MaxConcurrentRuns),
+		// Seeded to [] (PRD #1390 M2c); ListWorkers overlays the real snapshot rows after.
+		ReportedRuns:             []apitypes.WorkerReportedRunDTO{},
 		RetainingUnpublishedWork: w.RetainingUnpublishedWork,
 		TemplateDeclared:         textPtrValue(w.TemplateDeclared.Valid, w.TemplateDeclared.String),
 		TemplateReported:         textPtrValue(w.TemplateReported.Valid, w.TemplateReported.String),
@@ -236,6 +243,72 @@ func rollSignalFromRow(w store.ListWorkersByUserRow) *workersvc.RollSignal {
 		sig.UpgradingSince = &t
 	}
 	return sig
+}
+
+// overlayOutbox folds a worker's in-process outbox depth (PRD #1391 M5) onto its
+// DTO. The depth lives in workersvc's restart-losing tracker, not in a store.Worker
+// row, so workerDTOFromWorker/workerDTOFromRow (which read only the row) cannot carry
+// it and this overlay runs at each response site that should show it. Left NIL (the
+// four fields marshal null) when the worker has no tracked depth, so a worker with no
+// outbox shows nulls; set together the moment any component is non-zero. A nil wsvc
+// (defensive; the handler always wires one) is a no-op.
+func (h *Handler) overlayOutbox(dto *apitypes.WorkerDTO, workerID uuid.UUID) {
+	if h.wsvc == nil {
+		return
+	}
+	pm, pt, sr, blocked := h.wsvc.OutboxAggregate(workerID)
+	if pm == 0 && pt == 0 && sr == 0 && blocked == nil {
+		return // no tracked depth → leave the four fields null
+	}
+	dto.OutboxPendingMessages = &pm
+	dto.OutboxPendingTerminal = &pt
+	dto.OutboxStaleRetired = &sr
+	dto.OutboxBlocked = blocked
+}
+
+// reportedRunsByWorker reads each listed worker's reported active runs (PRD #1390 M2c) from
+// the worker_active_runs snapshot table in ONE batched round-trip, grouped by worker id. The
+// batch is what keeps the two list endpoints off an N+1: ListWorkers and AdminListWorkers pass
+// every row's id at once, PatchWorker a one-element set. Every worker in workerIDs gets a
+// (possibly empty, never nil) slice, so overlayReportedRuns always attaches a JSON array — a
+// worker the table has no row for encodes reported_runs as [], not null. A query error is
+// logged and yields the all-empty map: reported_runs is a display overlay and must never fail
+// the response, mirroring overlayOutbox's nil-safe posture. A nil store (defensive; the handler
+// always wires one) also yields the all-empty map.
+func (h *Handler) reportedRunsByWorker(ctx context.Context, workerIDs []uuid.UUID) map[uuid.UUID][]apitypes.WorkerReportedRunDTO {
+	byWorker := make(map[uuid.UUID][]apitypes.WorkerReportedRunDTO, len(workerIDs))
+	for _, id := range workerIDs {
+		byWorker[id] = []apitypes.WorkerReportedRunDTO{}
+	}
+	if len(workerIDs) == 0 || h.q == nil {
+		return byWorker
+	}
+	rows, err := h.q.ListActiveRunsForWorkers(ctx, workerIDs)
+	if err != nil {
+		slog.Error("overlay reported runs", "error", err)
+		return byWorker
+	}
+	for _, row := range rows {
+		byWorker[row.WorkerID] = append(byWorker[row.WorkerID], apitypes.WorkerReportedRunDTO{
+			RunID:           row.RunID.String(),
+			Phase:           row.Phase,
+			ClaimGeneration: row.ClaimGeneration,
+		})
+	}
+	return byWorker
+}
+
+// overlayReportedRuns folds a worker's reported active runs (PRD #1390 M2c) onto its DTO,
+// mirroring overlayOutbox but reading the DB (via reportedRunsByWorker's batched result) rather
+// than an in-process tracker. It always sets a non-nil slice, so reported_runs marshals as a
+// JSON array even for a workerID byWorker has no entry for — belt-and-braces beside the batch,
+// which already pre-seeds a [] per id.
+func (h *Handler) overlayReportedRuns(dto *apitypes.WorkerDTO, byWorker map[uuid.UUID][]apitypes.WorkerReportedRunDTO, workerID uuid.UUID) {
+	runs := byWorker[workerID]
+	if runs == nil {
+		runs = []apitypes.WorkerReportedRunDTO{}
+	}
+	dto.ReportedRuns = runs
 }
 
 // -------------------------------------------------------------------------
@@ -322,8 +395,16 @@ func (h *Handler) ListWorkers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out := make([]apitypes.WorkerDTO, 0, len(rows))
+	ids := make([]uuid.UUID, 0, len(rows))
 	for _, row := range rows {
-		out = append(out, workerDTOFromRow(row, h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt))
+		ids = append(ids, row.ID)
+	}
+	reported := h.reportedRunsByWorker(r.Context(), ids)
+	for _, row := range rows {
+		dto := workerDTOFromRow(row, h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt)
+		h.overlayOutbox(&dto, row.ID)
+		h.overlayReportedRuns(&dto, reported, row.ID)
+		out = append(out, dto)
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"workers": out})
 }
@@ -338,9 +419,17 @@ func (h *Handler) AdminListWorkers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out := make([]apitypes.AdminWorkerDTO, 0, len(rows))
+	ids := make([]uuid.UUID, 0, len(rows))
 	for _, row := range rows {
+		ids = append(ids, row.Worker.ID)
+	}
+	reported := h.reportedRunsByWorker(r.Context(), ids)
+	for _, row := range rows {
+		dto := workerDTOFromWorker(row.Worker, int(row.ActiveRuns), row.Busy, "", h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt)
+		h.overlayOutbox(&dto, row.Worker.ID)
+		h.overlayReportedRuns(&dto, reported, row.Worker.ID)
 		out = append(out, apitypes.AdminWorkerDTO{
-			WorkerDTO:  workerDTOFromWorker(row.Worker, int(row.ActiveRuns), row.Busy, "", h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt),
+			WorkerDTO:  dto,
 			OwnerEmail: row.OwnerEmail,
 		})
 	}
@@ -507,5 +596,14 @@ func (h *Handler) PatchWorker(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"worker": workerDTOFromWorker(wkr, 0, false, token.label, h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt)})
+	// Overlay the in-process outbox depth (PRD #1391 M5) for consistency with the
+	// register/heartbeat/list surfaces: this worker may be active with a live backlog,
+	// and without the overlay its outbox_* fields would read null on this response.
+	dto := workerDTOFromWorker(wkr, 0, false, token.label, h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt)
+	h.overlayOutbox(&dto, wkr.ID)
+	// Reuse the batched query with a one-element id set (PRD #1390 M2c): this worker may hold a
+	// live snapshot, so without the overlay its reported_runs would read [] on this response.
+	reported := h.reportedRunsByWorker(r.Context(), []uuid.UUID{wkr.ID})
+	h.overlayReportedRuns(&dto, reported, wkr.ID)
+	httpx.JSON(w, http.StatusOK, map[string]any{"worker": dto})
 }

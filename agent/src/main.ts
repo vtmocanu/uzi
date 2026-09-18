@@ -11,6 +11,8 @@ import { ChatExecutor, type ChatExecutorLike } from "./chat-executor.js";
 import { StubChatExecutor } from "./chat-executor-stub.js";
 import { RunRunner, type ExecutorFactory } from "./runner.js";
 import { ChatRunner } from "./chat-runner.js";
+import { Outbox } from "./outbox.js";
+import { ActiveRunRegistry } from "./active-run-registry.js";
 import { JudgeRunner } from "./judge-runner.js";
 import { ReviewRunner } from "./review-runner.js";
 import { stubJudgeQueryFn } from "./judge-runner-stub.js";
@@ -19,6 +21,7 @@ import { reclaimStrandedRunHomes } from "./home-reclaim.js";
 import { errMessage } from "./util.js";
 import { uidSplitActive } from "./runner-uid.js";
 import { resolveDockerWiring, dockerSidecarExpected } from "./docker-wiring.js";
+import { probeCodexRuntime } from "./codex/codex-runtime-probe.js";
 
 // Set once the logger exists so the last-resort fatal handler can scrub through
 // the SecretRegistry instead of writing a raw (unredacted) line.
@@ -60,6 +63,28 @@ async function main(): Promise<void> {
     );
   }
 
+  // Codex runtime-probe keystone (PRD #1332 D3 / M5A C2): resolve ONCE at startup,
+  // mirroring the docker-wiring resolve-once above. It reads the root-owned Codex receipt
+  // and recomputes member digests WITHOUT executing Codex, searching PATH, starting
+  // app-server or using the network; the single boolean result feeds the register
+  // protocol-capability report (worker.ts appends codex_harness_v1 only when capable). A
+  // stripped/hand-built/corrupt/mismatched/old image resolves to not-capable and keeps
+  // serving Claude. The probe never throws, but a defensive catch degrades to not-capable
+  // so a probe fault can never break startup.
+  config.codexProbe = await probeCodexRuntime().catch((err) => {
+    log.warn("codex runtime probe threw unexpectedly; advertising no codex capability", {
+      error: errMessage(err),
+    });
+    return { capable: false as const };
+  });
+  if (config.codexProbe.capable) {
+    log.info("codex runtime probe OK — advertising codex_harness_v1");
+  } else {
+    log.info("codex runtime probe: codex_harness_v1 NOT advertised (serving Claude)", {
+      reason: config.codexProbe.reason ?? "not capable",
+    });
+  }
+
   log.info("uzi-agent starting", {
     version: config.version,
     api_url: config.apiUrl,
@@ -68,6 +93,7 @@ async function main(): Promise<void> {
     executor: config.executor,
     max_concurrent_runs: config.maxConcurrentRuns,
     docker_wired: config.dockerWiring.dockerHost !== undefined,
+    codex_capable: config.codexProbe.capable,
   });
   // Soft-ceiling warn (PRD #42 Decision 3): the cap is honored as configured, but a
   // value above the documented ceiling is almost certainly a fat-finger — each slot
@@ -85,6 +111,28 @@ async function main(): Promise<void> {
     httpTimeoutMs: config.httpTimeoutMs,
   });
   const git = new GitCache(config.dataDir, log);
+
+  // PRD #1391 M2: the worker-owned message outbox and the shared re-arm registry,
+  // built + initialised BEFORE the runners/worker so a boot backlog is already
+  // loadable and every batcher can spill into the same store. `init()` mints/loads the
+  // worker-local HMAC key, scans the run tree and captures the spill-unclean flags;
+  // it fails closed (disables the store) rather than throwing, so a broken /data never
+  // blocks startup. The registry maps a live run's id to its batcher's rearm() so the
+  // drainer can return a still-running run to the network once its segments retire.
+  const outbox = new Outbox({
+    root: config.outboxDataDir,
+    log,
+    runMaxBytes: config.outboxRunMaxBytes,
+    maxBytes: config.outboxMaxBytes,
+    retentionMs: config.outboxRetentionMs,
+  });
+  await outbox.init();
+  const rearm = new Map<string, () => void>();
+  // PRD #1390 M2a: the shared active-run registry the run lane + judge/review runners write
+  // as they start/transition/finish, and the worker reads to build the ActiveSnapshot that
+  // rides every heartbeat and run-lane claim. ONE instance so the snapshot epoch is a single
+  // process-monotonic counter across the heartbeat and claim loops.
+  const activeRuns = new ActiveRunRegistry();
   // Pin the SDK's HOME (session transcripts under $HOME/.claude/projects) onto
   // the persistent data volume so `docker compose down && up` doesn't wipe
   // sessions and resume still works.
@@ -178,6 +226,13 @@ async function main(): Promise<void> {
     pollMs: config.pollIntervalMs,
     planApprovalTimeoutMs: config.planApprovalTimeoutMs,
     checkpointIntervalMs: config.checkpointIntervalMs,
+    // PRD #1391 M2: spill collaborators for every run's batcher.
+    outbox,
+    rearm,
+    transientTripMs: config.transientTripMs,
+    outboxSpillBufferBytes: config.outboxSpillBufferBytes,
+    // PRD #1390 M2a: the shared active-run registry the worker reads to build snapshots.
+    activeRuns,
   });
 
   // The chat lane (PRD #39). Per-session executor factory (PRD #42 Decision 4): each
@@ -215,13 +270,18 @@ async function main(): Promise<void> {
     // session) — the same discriminator the run lane gets for free from the stub's
     // absent per-run HOME above.
     //
-    // The conditional-spread idiom is the point (PRD #103 M3, oxlint
-    // unicorn/no-useless-spread): it OMITS the key rather than setting it to
-    // undefined, which is what lets the stub be told apart from a worker whose
-    // sdkHomeDir happens to be unset. Rewriting it to satisfy the rule would either
-    // reintroduce the undefined key or need a mutable builder for one field.
-    // eslint-disable-next-line unicorn/no-useless-spread
+    // The conditional-spread idiom is the point (PRD #103 M3): it OMITS the key
+    // rather than setting it to undefined, which is what lets the stub be told apart
+    // from a worker whose sdkHomeDir happens to be unset. (No oxlint
+    // unicorn/no-useless-spread disable is needed here: the PRD #1391 M2 fields below
+    // give the object sibling keys, so the rule no longer reads the spread as useless.)
     ...(config.executor === "stub" ? {} : { sdkHomeDir: sdkHomeRoot }),
+    // PRD #1391 M2: chat keeps the message outbox (Run A), spilling into the same store
+    // and re-arm registry as the run lane.
+    outbox,
+    rearm,
+    transientTripMs: config.transientTripMs,
+    outboxSpillBufferBytes: config.outboxSpillBufferBytes,
   });
 
   // The judge lane (PRD #46): a slim runner for `judge` claims. It reuses the SDK
@@ -232,6 +292,8 @@ async function main(): Promise<void> {
   // token and zero spend.
   const judgeRunner = new JudgeRunner(client, log, {
     homeRoot: sdkHomeRoot,
+    // PRD #1390 M2a: a judge attempt holds a run slot, so it is listed in the snapshot.
+    activeRuns,
     ...(config.executor === "stub" ? { queryFn: stubJudgeQueryFn } : {}),
   });
 
@@ -243,10 +305,15 @@ async function main(): Promise<void> {
   // review), mirroring the judge lane so the e2e can drive it with a dummy token.
   const reviewRunner = new ReviewRunner(client, git, log, {
     homeRoot: sdkHomeRoot,
+    // PRD #1390 M2a: a review attempt holds a run slot, so it is listed in the snapshot.
+    activeRuns,
     ...(config.executor === "stub" ? { queryFn: stubJudgeQueryFn } : {}),
   });
 
-  const worker = new Worker(config, client, runner, chatRunner, judgeRunner, reviewRunner, log);
+  // PRD #1391 M2: the Worker owns the per-worker outbox drainer + the heartbeat outbox
+  // report, so it takes the same outbox + re-arm registry the runners spill into. The
+  // `undefined` preserves the default boot toolchain preflight (only tests inject one).
+  const worker = new Worker(config, client, runner, chatRunner, judgeRunner, reviewRunner, log, undefined, outbox, rearm, activeRuns);
 
   // Signal handlers FIRST, before anything that can take real time. Until these
   // are installed a SIGTERM hits Node's default disposition and terminates the

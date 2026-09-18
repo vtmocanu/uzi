@@ -105,12 +105,16 @@ type FakeClient struct {
 	// LastCreateSeed captures PRD #209's optional seeded plan (nil when the run was
 	// created without --plan-file), so a test can assert the plan body and the roster
 	// the CLI forwarded — the assertion M3's flag parsing is proven against.
-	LastCreateSeed     *CreateRunSeed
-	InputResp          apitypes.RunInputResponse
-	LastInputRunID     string
-	LastInputKind      string
-	LastInputBody      string
-	LastInputSelection *apitypes.AgentSelection
+	LastCreateSeed *CreateRunSeed
+	// LastCreateCredOverride captures PRD #1247 M2's create-time credential choice (nil when
+	// --token was omitted), so a test can assert the CLI resolved a label to {pinned,
+	// secret_id} client-side and sent auto/default/inherit as a bare mode.
+	LastCreateCredOverride *CreateRunCredentialOverride
+	InputResp              apitypes.RunInputResponse
+	LastInputRunID         string
+	LastInputKind          string
+	LastInputBody          string
+	LastInputSelection     *apitypes.AgentSelection
 
 	// CreateTaskRun / DispatchTaskRun capture (PRD #400 M3). CreatedTaskRun is the
 	// canned create reply (its Branch is what the handoff command pushes to);
@@ -179,6 +183,18 @@ type FakeClient struct {
 	LastResumeRunID string
 	ResumedRun      apitypes.RunDTO
 	ResumeRunNowErr error
+
+	// SetRunCredential capture (PRD #1247 M4). LastSetTokenRunID is the run id `uzi run
+	// set-token` targeted; LastSetTokenOverride is the resolved override it sent (a label
+	// resolved CLIENT-SIDE to {pinned, secret_id}; auto/default/inherit as a bare mode), so
+	// a test can assert the exact wire mapping. SetTokenRun / SetTokenWarning are the canned
+	// success reply and its D6 warning; SetRunCredentialErr wins over the blanket Err so a
+	// test can model a 409/404/422 on the write while the capture still proves it was reached.
+	LastSetTokenRunID    string
+	LastSetTokenOverride *SetRunCredentialOverride
+	SetTokenRun          apitypes.RunDTO
+	SetTokenWarning      string
+	SetRunCredentialErr  error
 
 	// SetRunMrRework capture (PRD #841 M3). LastMrReworkRunID is the run id `uzi run
 	// mr-rework` targeted; LastMrReworkEnabled keeps the POINTER so a test can tell the
@@ -534,6 +550,16 @@ type FakeClient struct {
 	RecoveryDownloadHook  func(runID, captureID string, w io.Writer) (int64, error)
 	RecoveryDownloadCalls []string
 	RecoveryDownloadErr   error
+
+	// Owner custody-hold list + discard (PRD #1349 M5). RecoveryHoldsResult backs
+	// RecoveryHolds; RecoveryHoldsErr wins over the blanket Err. DiscardHoldCalls records EACH
+	// (run, hold) discard IN ORDER, so a CLI test proves NO mutation was attempted on a
+	// cancelled/declined prompt or a non-TTY refusal (the list stays empty); DiscardHoldErr,
+	// when set, is returned by DiscardRecoveryHold (e.g. a 404 for a foreign/absent hold).
+	RecoveryHoldsResult apitypes.RecoveryCustodyHoldsDTO
+	RecoveryHoldsErr    error
+	DiscardHoldCalls    []DiscardHoldCall
+	DiscardHoldErr      error
 
 	// Err, when non-nil, is returned by every method (before any lookup).
 	Err error

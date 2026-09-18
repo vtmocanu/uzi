@@ -9,7 +9,7 @@
 // ── WHY THIS PINS TO STRUCTURED FIELDS AND NEVER TO TEXT ─────────────────────
 // The string "Claude AI usage limit reached|<epoch>" is a Claude Code PRODUCT
 // string and does not exist in @anthropic-ai/claude-agent-sdk (verified by grep of
-// the installed bundle's sdk.mjs and bridge.mjs at the pinned 0.3.219: zero hits in
+// the installed bundle's sdk.mjs and bridge.mjs at the pinned 0.3.263: zero hits in
 // both). Classifying provider limits by matching error text is fragile — a
 // provider rewording a message must not silently disable the feature — so we
 // deliberately pin to structured fields. Everything below reads a declared field.

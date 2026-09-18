@@ -26,7 +26,7 @@ func cand(n byte, headroom int, reset *time.Time) Candidate {
 		Label:        string(rune('a'+n-1)) + "-token",
 		AutoEligible: true,
 		HasReading:   true,
-		FiveHourPct:  i16(int16(100 - headroom)),
+		FiveHourPct:  i16(int16(100 - headroom)), //nolint:gosec // G115: test headroom is 0..100, so 100-headroom is 0..100 and the narrowing cannot overflow
 		SevenDayPct:  i16(0),
 		FiveResetsAt: reset,
 		SyncedAt:     at(-time.Minute),
@@ -130,7 +130,7 @@ func TestSelectOrderIndependent(t *testing.T) {
 	if !want.Picked {
 		t.Fatalf("baseline picked nothing (reason %q)", want.Reason)
 	}
-	rng := rand.New(rand.NewSource(1111))
+	rng := rand.New(rand.NewSource(1111)) //nolint:gosec // G404: a deterministic seed is the point — this asserts Select is order-independent, not a security context
 	for i := 0; i < 200; i++ {
 		shuffled := append([]Candidate(nil), cands...)
 		rng.Shuffle(len(shuffled), func(a, b int) { shuffled[a], shuffled[b] = shuffled[b], shuffled[a] })
@@ -457,11 +457,12 @@ func TestAllReasonsIsAFreshSlice(t *testing.T) {
 		t.Fatal("AllReasons hands out a shared backing array; one caller's append or write " +
 			"would then corrupt every other reader's view of a CLOSED set")
 	}
-	// Eight since M5 folded workersvc's three static reasons in here, so the whole
-	// vocabulary has ONE Go home. Migration 00089's CHECK is the same eight and three
-	// separate guards compare against it — workersvc's, the CLI's, and the web's — so a
-	// change to this number is a change to four artefacts and must be deliberate.
-	if len(AllReasons()) != 8 {
-		t.Fatalf("AllReasons has %d entries, want 8", len(AllReasons()))
+	// Ten: M5 folded workersvc's three static reasons in here (so the whole vocabulary
+	// has ONE Go home), and PRD #1247 added run_pinned/run_default. The SQL CHECK is the
+	// same ten (00089's eight, widened by 00233) and three separate guards compare against
+	// it — workersvc's, the CLI's, and the web's — so a change to this number is a change
+	// to four artefacts and must be deliberate.
+	if len(AllReasons()) != 10 {
+		t.Fatalf("AllReasons has %d entries, want 10", len(AllReasons()))
 	}
 }

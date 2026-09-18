@@ -50,13 +50,24 @@ func RefoldRunUsage(ctx context.Context, pool *pgxpool.Pool, q *store.Queries, r
 
 	frames := make([]IncomingMessage, len(rows))
 	for i, m := range rows {
+		// PRD #1247 M9 (D7): carry each frame's PERSISTED originating generation into the refold so
+		// a re-fold attributes every leg to the epoch that produced it — never to the run's latest
+		// token. ListRunUsageFrames already selects claim_generation; a legacy (NULL) frame stays
+		// nil ⇒ NULL provenance. This is why a full refold after an A→B switch keeps A's spend on A:
+		// the frames folded from A's epoch carry A's generation, B's carry B's.
+		var claimGen *int64
+		if m.ClaimGeneration.Valid {
+			g := m.ClaimGeneration.Int64
+			claimGen = &g
+		}
 		frames[i] = IncomingMessage{
-			Seq:           m.Seq,
-			Kind:          m.Kind,
-			Agent:         m.Agent.String,
-			AgentInstance: m.AgentInstance.String,
-			AgentLabel:    m.AgentLabel.String,
-			Payload:       m.Payload,
+			Seq:             m.Seq,
+			Kind:            m.Kind,
+			Agent:           m.Agent.String,
+			AgentInstance:   m.AgentInstance.String,
+			AgentLabel:      m.AgentLabel.String,
+			Payload:         m.Payload,
+			ClaimGeneration: claimGen,
 		}
 	}
 

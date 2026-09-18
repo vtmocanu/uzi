@@ -98,6 +98,14 @@ services:
       FRONTEND_ORIGIN: http://127.0.0.1:${E2E_WEB_PORT}
       # Give the restart-resilience step head-room to re-queue the orphaned run.
       RUN_MAX_REQUEUES: "3"
+      # PRD #1390 M4 (e2e ONLY): the D7 api-rollback simulation. Empty (the default) leaves
+      # the active-run-snapshot feature ENABLED for every phase — inert here. The
+      # api-outage-readoption phase (42) exports UZI_ACTIVE_SNAPSHOT_DISABLED=1 and recreates
+      # the api for its case (d): the api then omits active_run_snapshot from protocol_features
+      # and strict-decodes heartbeats, so a still-sending worker's heartbeat 400s once, the
+      # worker strips the field and retries, and liveness is never lost. Restored to empty
+      # after the phase.
+      UZI_ACTIVE_SNAPSHOT_DISABLED: ${UZI_ACTIVE_SNAPSHOT_DISABLED:-}
       # Heartbeat-stale window: no heartbeat past this ⇒ the worker goes offline and
       # its non-terminal runs re-queue (the sweeper's worker-loss recovery). run-e2e.sh
       # sets E2E_WORKER_HEARTBEAT_STALE=15s in the env-file from BOOT (was tightened
@@ -123,6 +131,15 @@ services:
       # (config.go RUN_RECOVERY_PARK_BASE / RUN_RECOVERY_MAX_PARK) are untouched.
       RUN_RECOVERY_PARK_BASE: 1s
       RUN_RECOVERY_MAX_PARK: 5s
+      # Forge pre-clone park lifetime cap (PRD #1392 M1): how many times a run may
+      # forge-park before SetState fails it with fail_origin=forge_unreachable (0 =
+      # unlimited). The shipped default is 6; interpolated so phase 73
+      # (forge-unreachable-park) can lower it to 2 for its cap-exhaustion case by
+      # writing E2E_FORGE_UNREACHABLE_MAX_PARKS into the env-file and recreating the
+      # api. Unset ⇒ the api's built-in 6 default, exercised by every other run.
+      # Mirrors the FORGE_POLL_INTERVAL interpolation pattern below. Overlay-only;
+      # production (config.go RUN_FORGE_UNREACHABLE_MAX_PARKS) is untouched.
+      RUN_FORGE_UNREACHABLE_MAX_PARKS: ${E2E_FORGE_UNREACHABLE_MAX_PARKS:-6}
       # MR review-watcher debounce (PRD #966 M6 / D6): the review-landed quiet period
       # the mr_rework detector waits after the newest review comment before queuing a
       # rework. Shrunk from the shipped 3m default so phase 71 can inject a note and
@@ -254,6 +271,13 @@ services:
       # exactly as before; that scenario sets UZI_E2E_MAX_CONCURRENT_RUNS=2 and
       # recreates the agent to prove two runs execute concurrently.
       WORKER_MAX_CONCURRENT_RUNS: ${UZI_E2E_MAX_CONCURRENT_RUNS:-1}
+      # PRD #1390 M4 (e2e ONLY): arms the runner's env-gated DROP-EXECUTION seam. Empty
+      # (the default) leaves it OFF for every phase — inert in production and in every other
+      # e2e run. The api-outage-readoption phase (42) exports UZI_E2E_DROP_ON_SENTINEL=1 and
+      # recreates the agent for its case (c), then recreates WITHOUT it to resume; when set,
+      # a run whose issue text carries UZI_STUB_DROP is dropped after its first `running`
+      # report (no terminal report) to model a live worker that silently loses one execution.
+      UZI_E2E_DROP_ON_SENTINEL: ${UZI_E2E_DROP_ON_SENTINEL:-}
       # Chat lane (PRD #39): fast turn pickup + a SHORT worker-driven idle window so the
       # e2e sees idle-completion in seconds instead of the 60m default. This agent-side
       # value is only the FALLBACK — the effective window is the api's claim-config

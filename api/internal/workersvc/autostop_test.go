@@ -1078,10 +1078,18 @@ func (f *autoStopSweepStore) PromotePoolWaitRun(context.Context, store.PromotePo
 	return 0, nil
 }
 
+// PRD #1247 M3's D8 duration-time re-evaluation pass. Empty for the same reason as
+// PromoteLimitWaitRuns above: this fixture's subject is the auto-stop streak, so no run is
+// re-evaluated and Sweep still runs end to end. LowerLimitWaitRetryNow is never reached
+// (the worklist is empty), so it stays on the embedded Store.
+func (f *autoStopSweepStore) ListLimitWaitReeval(context.Context, pgtype.Timestamptz) ([]store.ListLimitWaitReevalRow, error) {
+	return nil, nil
+}
+
 // PRD #1296 M4's custody-release reconciler pass. Empty for the same reason as the other
 // passes this fixture does not exercise: its subject is the auto-stop streak, so no hold is
 // releasable and Sweep still runs end to end.
-func (f *autoStopSweepStore) ListReleasableCustodyHolds(context.Context) ([]store.RecoveryCustodyHold, error) {
+func (f *autoStopSweepStore) ListReleasableCustodyHolds(context.Context) ([]store.ListReleasableCustodyHoldsRow, error) {
 	return nil, nil
 }
 func (f *autoStopSweepStore) ListActiveRunsForHealth(context.Context) ([]store.ListActiveRunsForHealthRow, error) {

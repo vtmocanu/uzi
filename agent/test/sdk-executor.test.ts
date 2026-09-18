@@ -4,14 +4,15 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { Options as SdkOptions, SDKMessage, HookInput } from "@anthropic-ai/claude-agent-sdk";
-import { SdkExecutor, resolveLeadModel, embedSeededPlan, TransientRecoveryError, type SdkQueryFn, type SdkExecutorOptions, type ContextUsageReading } from "../src/sdk-executor.js";
+import { SdkExecutor, resolveLeadModel, embedSeededPlan, TransientRecoveryError, ProviderTransientError, type SdkQueryFn, type SdkExecutorOptions, type ContextUsageReading } from "../src/sdk-executor.js";
+import { LimitReachedError } from "../src/limit.js";
 import { PlanRejectedError, type EmittedMessage, type RunContext } from "../src/executor.js";
 import type { PlanVerdict } from "../src/steering.js";
 import type { AgentTemplate, ClaimSkill, Milestone, MilestoneAgent, MilestoneProgress } from "../src/protocol.js";
 import type { JsDepsResult } from "../src/js-deps.js";
 import { skillsPluginDir } from "../src/skills-plugin.js";
 import { FINDINGS_SERVER_NAME, reportIncidentalIssueToolName } from "../src/findings-tools.js";
-import { FINDINGS_NUDGE_APPEND, WORKER_RUNTIME_APPEND } from "../src/prompt.js";
+import { FINDINGS_NUDGE_APPEND, SECRET_FIXTURE_HYGIENE_APPEND, WORKER_RUNTIME_APPEND } from "../src/prompt.js";
 import type { WorkerClient } from "../src/client.js";
 import type {
   SummaryRunner,
@@ -52,7 +53,8 @@ const FAKE_JOIN_TOKEN = "dummy-join-token-do-not-scan-2222";
 // PRD #457: toDefinition grants the findings tool to a non-empty allowlist and appends
 // the discovery nudge to every subagent prompt. Reference the helper, not a literal.
 const FINDINGS_TOOL = reportIncidentalIssueToolName();
-const withNudge = (body: string) => `${body}\n\n${FINDINGS_NUDGE_APPEND}\n\n${WORKER_RUNTIME_APPEND}`;
+const withNudge = (body: string) =>
+  `${body}\n\n${FINDINGS_NUDGE_APPEND}\n\n${WORKER_RUNTIME_APPEND}\n\n${SECRET_FIXTURE_HYGIENE_APPEND}`;
 
 const coder: AgentTemplate = { name: "coder", description: "writes code", prompt_body: "You implement.", tools: ["Read", "Edit", "Write", "Bash"] };
 const reviewer: AgentTemplate = { name: "reviewer", description: "reviews", prompt_body: "You review.", tools: ["Read", "Grep"] };
@@ -110,6 +112,21 @@ function resultEmpty(sessionId = "sess-1"): SDKMessage {
 function resultNoTurns(sessionId = "sess-1"): SDKMessage {
   return { type: "result", subtype: "success", is_error: false, session_id: sessionId } as unknown as SDKMessage;
 }
+// issue #1088: a TRANSIENT provider error surfaces as a `SDKResultSuccess` frame —
+// `subtype:"success"` with `is_error:true`, an `api_error_status` (e.g. 529), the human
+// text in `result`, and `terminal_reason:"api_error"`. Its `errors` array is EMPTY (the
+// text is in `result`). This is the shape a 529/500/…/401 arrives in.
+function resultApiError(status: number, result: string, sessionId = "s"): SDKMessage {
+  return {
+    type: "result",
+    subtype: "success",
+    is_error: true,
+    api_error_status: status,
+    result,
+    terminal_reason: "api_error",
+    session_id: sessionId,
+  } as unknown as SDKMessage;
+}
 // Issue #281: a subagent frame — `subagent_type` makes mapSdkMessage attribute it to
 // that agent (em.agent = "coder"), which the no-progress detector reads as activity.
 function subagentText(text: string, subagentType = "coder", sessionId = "sess-1"): SDKMessage {
@@ -119,6 +136,21 @@ function subagentText(text: string, subagentType = "coder", sessionId = "sess-1"
     subagent_type: subagentType,
     parent_tool_use_id: "p1",
     message: { content: [{ type: "text", text }] },
+  } as unknown as SDKMessage;
+}
+// PRD #1349 M3: an SDK `rate_limit_event` frame. The ClaudeHarness feeds the latest-wins
+// RateLimitObserver before decode and maps this frame to an `activity` event (NOT model
+// activity), so the newest such frame of a turn becomes the terminal's limitEvidence.latest
+// and flows to TurnResult.rateLimit without making an otherwise-empty turn non-empty.
+function rateLimitEvent(
+  status: string,
+  opts: { resetsAt?: number; rateLimitType?: string } = {},
+  sessionId = "sess-1",
+): SDKMessage {
+  return {
+    type: "rate_limit_event",
+    session_id: sessionId,
+    rate_limit_info: { status, resetsAt: opts.resetsAt, rateLimitType: opts.rateLimitType },
   } as unknown as SDKMessage;
 }
 
@@ -378,6 +410,45 @@ describe("SdkExecutor plan revision loop (PRD #41)", () => {
     assert.strictEqual(turns.length, 3);
     assert.deepStrictEqual(probe.iterations, [1]);
     assert.strictEqual(result.branch, "agent/issue-5");
+  });
+
+  it("MAJOR-6: a mid-revision switch cannot approve the superseded plan — the revision turn runs DEFERRED and the re-gate persists the revised plan OUTSIDE the window", async () => {
+    const { queryFn } = fakeTurns([
+      [submitPlan("# Plan v1"), resultSuccess()], // planning turn
+      [submitPlan("# Plan v2"), resultSuccess()], // revision turn — MUST run inside the defer window
+      [assistantText("implementing"), signalDone(), resultSuccess()], // loop turn 1
+    ]);
+    // The revised v2 plan is persisted by the gate (probe.persisted / probe.gated). The fix wraps the
+    // revision planning turn in a credential-switch DEFER window so a mid-revision switch is held —
+    // not released mid-turn, which would leave the run row on the superseded v1 and re-present it on a
+    // reclaim. Record when the window opens/closes relative to how many gates have run: it must open
+    // AFTER the v1 gate and close BEFORE the v2 gate, so the switch trips only at the v2 gate wait,
+    // once v2 is persisted. Reverting the revision turn to runThroughSwitch (no defer) never calls the
+    // hook, so `order` stays empty and this reddens.
+    const order: string[] = [];
+    const probe = makeCtx(
+      {
+        agents: [lead, coder, reviewer],
+        deferCredentialSwitch: async (fn) => {
+          order.push(`begin@gated=${probe.gated.length}`);
+          try {
+            return await fn();
+          } finally {
+            order.push(`end@gated=${probe.gated.length}`);
+          }
+        },
+      },
+      [revise("add a rollback step"), approve],
+    );
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+
+    // Exactly one defer window, opened after the v1 gate (gated.length === 1) and closed before the
+    // v2 gate (still 1) — so a switch during the revision turn is deferred, never released mid-turn.
+    assert.deepStrictEqual(order, ["begin@gated=1", "end@gated=1"], "the revision turn is wrapped in one defer window, between the two gates");
+    // The re-gate ran AFTER the window and persisted the REVISED v2 (never the superseded v1), so a
+    // reclaim at resume_phase 'awaiting_approval' re-presents v2, not v1.
+    assert.deepStrictEqual(probe.gated, ["# Plan v1", "# Plan v2"], "the gate saw v1 then the revised v2");
+    assert.strictEqual(probe.persisted.planMd, "# Plan v2", "the persisted plan is the revised v2, so a reclaim resumes on it, never v1");
   });
 
   it("a revision turn that submits no plan fails with REASON_NO_PLAN", async () => {
@@ -688,6 +759,38 @@ describe("SdkExecutor implement/review loop", () => {
     assert.match(turns[2]!.promptText ?? "", /please also add tests/);
     assert.match(turns[2]!.promptText ?? "", /UNTRUSTED INPUT/); // framed as data
     assert.doesNotMatch(turns[1]!.promptText ?? "", /please also add tests/);
+  });
+
+  it("drains the safety steer before building the implement prompt and renders it as worker guidance ahead of any follow-up (PRD #1416 M2)", async () => {
+    // Mutation: drop the `const safetySteer = ctx.pullSafetySteer?.()` drain (or its pass into
+    // buildImplementPrompt) → the steer body never reaches the prompt and the first assert reddens.
+    const followUps = ["please also add tests"];
+    let steerCall = 0;
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()], // planning
+      [assistantText("first pass"), resultSuccess()], // loop 1 (drains the follow-up at its END)
+      [assistantText("second pass"), signalDone(), resultSuccess()], // loop 2 (carries steer + follow-up)
+    ]);
+    const probe = makeCtx({
+      config: { max_iterations: 5 },
+      pullFollowUp: () => followUps.shift(),
+      // Armed for the NEXT turn (drained at iteration 2's loop top), so the steer and the
+      // follow-up land on the SAME prompt (turns[2]) and their ordering is observable.
+      pullSafetySteer: () => (++steerCall === 2 ? "WORKER-SAFETY-STEER-BODY-777" : undefined),
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+
+    const p = turns[2]!.promptText ?? "";
+    const steerIdx = p.indexOf("WORKER-SAFETY-STEER-BODY-777");
+    const openIdx = p.indexOf("<follow_up>");
+    const closeIdx = p.indexOf("</follow_up>");
+    assert.ok(steerIdx >= 0, "the drained safety steer reached the implement prompt");
+    assert.match(p, /The worker detected a problem and is steering you/); // worker-guidance framing
+    assert.ok(openIdx >= 0, "the follow-up is present on the same turn");
+    assert.ok(steerIdx < openIdx, "the safety steer is rendered BEFORE the <follow_up> block");
+    assert.ok(!(steerIdx > openIdx && steerIdx < closeIdx), "the steer is NOT wrapped in the <follow_up> fence");
+    // Drained fresh each turn (iteration 2 here), not first-turn-only.
+    assert.doesNotMatch(turns[1]!.promptText ?? "", /WORKER-SAFETY-STEER-BODY-777/);
   });
 });
 
@@ -4644,5 +4747,281 @@ describe("SdkExecutor empty-turn recovery (issue #1197 D-RC2b)", () => {
       probe.emits.some((m) => m.kind === "status" && RETRY_NOTICE.test(String(m.payload["text"]))),
       "the implement empty turn emitted a retry notice",
     );
+  });
+});
+
+// PRD #1349 M3: a POSITIVELY-empty turn caused by a HARD rate limit routes to the
+// usage-limit wait path (LimitReachedError → runner.ts handleLimitReached, which respects
+// wait_on_limit) instead of the endless-local recovery_wait park (TransientRecoveryError).
+// The routing keys ONLY on THIS attempt's FINAL latest-wins verdict being `rejected`, and —
+// unlike classifyLimitEvidence — does NOT require a future reset. Every other empty case
+// (no verdict, allowed/allowed_warning, utilization-only, rejected-then-allowed, or a
+// rejected verdict from a PRIOR attempt) stays the generic recovery_wait park.
+describe("SdkExecutor empty-turn limit routing (PRD #1349 M3)", () => {
+  const IN_5H = Date.now() + 5 * 60 * 60 * 1000;
+  const AN_HOUR_AGO = Date.now() - 60 * 60 * 1000;
+  const recovery = (queryFn: SdkQueryFn, maxRetries = 2): SdkExecutorOptions => ({
+    queryFn,
+    emptyTurnBackoffBaseMs: 0, // no real sleeps in tests
+    emptyTurnMaxRetries: maxRetries,
+  });
+
+  it("positively-empty + final verdict `rejected` → LimitReachedError (usage-limit path, not recovery_wait)", async () => {
+    const { queryFn } = fakeTurns([
+      [rateLimitEvent("rejected", { resetsAt: IN_5H, rateLimitType: "five_hour" }), resultEmpty()],
+    ]);
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, recovery(queryFn)).run(makeCtx().ctx),
+      (err: unknown) =>
+        err instanceof LimitReachedError &&
+        err.rateLimitType === "five_hour" &&
+        err.resetsAtMs === IN_5H,
+    );
+  });
+
+  for (const [label, resetsAt] of [
+    ["a PAST reset", AN_HOUR_AGO],
+    ["a MISSING reset", undefined],
+  ] as const) {
+    it(`positively-empty + rejected with ${label} → still LimitReachedError (the limit arm does NOT require a future reset)`, async () => {
+      const { queryFn } = fakeTurns([
+        [rateLimitEvent("rejected", { resetsAt, rateLimitType: "five_hour" }), resultEmpty()],
+      ]);
+      await assert.rejects(
+        new SdkExecutor(nullLogger(), homeDir, recovery(queryFn)).run(makeCtx().ctx),
+        // The verdict alone routes; the reset (past/missing) rides verbatim for the SERVER
+        // to validate. If this arm reused classifyLimitEvidence's future-reset gate, a
+        // past/missing reset would fall through to TransientRecoveryError here.
+        (err: unknown) => err instanceof LimitReachedError && err.resetsAtMs === resetsAt,
+      );
+    });
+  }
+
+  it("positively-empty + `rejected`-then-`allowed` (latest-wins → allowed) → TransientRecoveryError (recovery_wait)", async () => {
+    const { queryFn } = fakeTurns([
+      [
+        rateLimitEvent("rejected", { resetsAt: IN_5H, rateLimitType: "five_hour" }),
+        rateLimitEvent("allowed"),
+        resultEmpty(),
+      ],
+    ]);
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, recovery(queryFn)).run(makeCtx().ctx),
+      // The limit cleared mid-turn: the FINAL verdict is `allowed`, so this must NOT route
+      // to the limit path (keys on latest-wins, not "any rejected seen").
+      (err: unknown) => err instanceof TransientRecoveryError,
+    );
+  });
+
+  it("positively-empty + `allowed_warning` verdict → TransientRecoveryError (only `rejected` routes)", async () => {
+    const { queryFn } = fakeTurns([[rateLimitEvent("allowed_warning"), resultEmpty()]]);
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, recovery(queryFn)).run(makeCtx().ctx),
+      (err: unknown) => err instanceof TransientRecoveryError,
+    );
+  });
+
+  it("positively-empty + utilization-only frame (no usable status) → TransientRecoveryError", async () => {
+    // A rate_limit_event carrying only utilization data and NO status string: the observer
+    // ignores it, so there is no verdict and the empty turn stays recovery_wait — proving
+    // the routing does not fire on the mere presence of a rate-limit frame.
+    const utilizationOnly = {
+      type: "rate_limit_event",
+      session_id: "sess-1",
+      rate_limit_info: { utilization: 0.9 },
+    } as unknown as SDKMessage;
+    const { queryFn } = fakeTurns([[utilizationOnly, resultEmpty()]]);
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, recovery(queryFn)).run(makeCtx().ctx),
+      (err: unknown) => err instanceof TransientRecoveryError,
+    );
+  });
+
+  it("positively-empty + NO rate-limit frame at all → TransientRecoveryError (no verdict)", async () => {
+    const { queryFn } = fakeTurns([[resultEmpty()]]);
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, recovery(queryFn)).run(makeCtx().ctx),
+      (err: unknown) => err instanceof TransientRecoveryError,
+    );
+  });
+
+  it("a `rejected` verdict from a PRIOR attempt does NOT leak into a later empty attempt (cross-attempt isolation)", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [rateLimitEvent("rejected", { resetsAt: IN_5H, rateLimitType: "five_hour" }), resultEmpty()], // attempt 0: rejected + empty
+      [resultEmpty()], // retry 1: empty, NO verdict
+      [resultEmpty()], // retry 2 (FINAL): empty, NO verdict → decision must use THIS attempt's (absent) verdict
+    ]);
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, recovery(queryFn, 2)).run(makeCtx().ctx),
+      (err: unknown) => err instanceof TransientRecoveryError,
+    );
+    assert.strictEqual(turns.length, 3, "original drive + two retries, each a distinct attempt");
+  });
+
+  it("NONEMPTY success + `rejected` verdict → normal completion (the empty-check gates the limit routing)", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [rateLimitEvent("rejected", { resetsAt: IN_5H, rateLimitType: "five_hour" }), submitPlan("# Plan"), resultSuccess()],
+      [assistantText("impl"), signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx({ agents: [lead, coder, reviewer] });
+    const result = await new SdkExecutor(nullLogger(), homeDir, recovery(queryFn)).run(probe.ctx);
+    assert.strictEqual(result.branch, "agent/issue-5");
+    assert.deepStrictEqual(
+      probe.gated,
+      ["# Plan"],
+      "a rejected verdict on a NON-empty (planning) turn is normal work, never a limit park",
+    );
+    assert.strictEqual(turns.length, 2, "no retry, no escalation — the turn was not positively empty");
+  });
+});
+
+// issue #1088: a TRANSIENT provider error (429/500/502/503/529/overloaded) ends a turn as a
+// `subtype:"success"` api-error frame. It must (a) retry with the existing bounded in-process
+// backoff and, on a sustained outage, PARK via TransientRecoveryError (recovery_wait) instead
+// of terminal-failing, and (b) never report the self-contradictory "agent run failed: success".
+// A PERMANENT api error (401/403/400) is NOT retried/parked — it fails, labelled with its status.
+describe("SdkExecutor provider-transient error handling (issue #1088)", () => {
+  const OVERLOADED_529 = "API Error: 529 Overloaded. This is a server-side issue…";
+  const fast = (queryFn: SdkQueryFn, maxRetries: number): SdkExecutorOptions => ({
+    queryFn,
+    emptyTurnBackoffBaseMs: 1, // no real multi-second sleeps in tests
+    emptyTurnMaxRetries: maxRetries,
+  });
+  // Run to a rejection and hand back the thrown value for direct assertion.
+  const rejection = async (p: Promise<unknown>): Promise<unknown> =>
+    p.then(
+      () => {
+        throw new Error("expected the run to reject");
+      },
+      (e: unknown) => e,
+    );
+
+  it("parks (TransientRecoveryError), never fails, on a 529 with no in-process retries", async () => {
+    // Before the fix this rejected with /agent run failed: success/ (a terminal failure).
+    const { queryFn } = fakeTurns([[resultApiError(529, OVERLOADED_529)]]);
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, fast(queryFn, 0)).run(makeCtx().ctx),
+      (err: unknown) => err instanceof TransientRecoveryError,
+    );
+  });
+
+  it("retries a 529 provider error and recovers on the next successful turn (no throw)", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [resultApiError(529, OVERLOADED_529)], // planning turn 0: transient 529
+      [submitPlan("# The Plan"), resultSuccess()], // retry: a real plan
+      [assistantText("impl"), signalDone(), resultSuccess()], // implement done
+    ]);
+    const probe = makeCtx({ agents: [lead, coder, reviewer] });
+    const result = await new SdkExecutor(nullLogger(), homeDir, fast(queryFn, 1)).run(probe.ctx);
+    assert.strictEqual(result.branch, "agent/issue-5");
+    assert.deepStrictEqual(probe.gated, ["# The Plan"], "the retried plan reaches the gate");
+    assert.strictEqual(turns.length, 3, "529 turn + retried plan + implement");
+    assert.ok(
+      probe.emits.some(
+        (m) =>
+          m.kind === "status" &&
+          /provider returned a transient error \(529\)/.test(String(m.payload["text"])),
+      ),
+      "a provider-aware transient retry notice is emitted",
+    );
+  });
+
+  it("labels the 529 park message with the status and 'provider', never 'success'", async () => {
+    const { queryFn } = fakeTurns([[resultApiError(529, OVERLOADED_529)]]);
+    const err = await rejection(
+      new SdkExecutor(nullLogger(), homeDir, fast(queryFn, 0)).run(makeCtx().ctx),
+    );
+    assert.ok(err instanceof TransientRecoveryError, "the 529 outage parks");
+    assert.match(err.message, /529/, "the label pins the numeric status");
+    assert.match(err.message, /provider/i, "the label names the provider");
+    assert.doesNotMatch(err.message, /success/, "never the self-contradictory 'success'");
+  });
+
+  it("does NOT over-park a permanent 401 — it fails, labelled with 401 and never 'success'", async () => {
+    const { queryFn, turns } = fakeTurns([[resultApiError(401, "API Error: 401 Unauthorized")]]);
+    const err = await rejection(
+      new SdkExecutor(nullLogger(), homeDir, fast(queryFn, 2)).run(makeCtx().ctx),
+    );
+    assert.ok(err instanceof Error, "a 401 is a genuine failure");
+    assert.ok(!(err instanceof TransientRecoveryError), "a permanent 401 is NEVER parked");
+    assert.ok(!(err instanceof ProviderTransientError), "a permanent 401 is not classified transient");
+    assert.match(err.message, /401/, "the failure names the status");
+    assert.doesNotMatch(err.message, /success/, "never the self-contradictory 'success'");
+    assert.strictEqual(turns.length, 1, "a permanent api error fails immediately, no retries");
+  });
+
+  it("a usage-limit death on a FAILED terminal still throws LimitReachedError, not ProviderTransientError", async () => {
+    // classifyLimitEvidence wins over the provider-transient throw: a rejected rate-limit
+    // event with a FUTURE reset on a failed terminal materializes the TYPED LimitReachedError.
+    const IN_5H = Date.now() + 5 * 60 * 60 * 1000;
+    const { queryFn } = fakeTurns([
+      [
+        rateLimitEvent("rejected", { resetsAt: IN_5H, rateLimitType: "five_hour" }),
+        { type: "result", subtype: "error_during_execution", is_error: true, session_id: "s" } as unknown as SDKMessage,
+      ],
+    ]);
+    const err = await rejection(
+      new SdkExecutor(nullLogger(), homeDir, fast(queryFn, 2)).run(makeCtx().ctx),
+    );
+    assert.ok(err instanceof LimitReachedError, "a usage-limit death takes the limit path");
+    assert.ok(!(err instanceof ProviderTransientError), "the limit guard precedes the provider-transient throw");
+    assert.strictEqual(err.rateLimitType, "five_hour");
+    assert.strictEqual(err.resetsAtMs, IN_5H);
+  });
+
+  it("parks (TransientRecoveryError) on a transient 429, like a 529, with no in-process retries", async () => {
+    // The apiErrorStatus === 429 branch of isProviderTransient also routes to the park —
+    // not just 529 (the only status the sibling park tests exercise).
+    const { queryFn } = fakeTurns([[resultApiError(429, "API Error: 429 Too Many Requests")]]);
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, fast(queryFn, 0)).run(makeCtx().ctx),
+      (err: unknown) => err instanceof TransientRecoveryError,
+    );
+  });
+
+  it("parks (TransientRecoveryError) on a status-less (null) transport api_error", async () => {
+    // The apiErrorStatus == null branch: an api_error with no HTTP status is a
+    // transport/network failure, so it is retryable and parks, mirroring client.ts isTransient.
+    const { queryFn } = fakeTurns([
+      [
+        {
+          type: "result",
+          subtype: "success",
+          is_error: true,
+          api_error_status: null,
+          terminal_reason: "api_error",
+          session_id: "s",
+        } as unknown as SDKMessage,
+      ],
+    ]);
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, fast(queryFn, 0)).run(makeCtx().ctx),
+      (err: unknown) => err instanceof TransientRecoveryError,
+    );
+  });
+
+  it("pins limit-over-transient precedence: a limit-bearing transient 529 throws LimitReachedError, never a provider-transient park", async () => {
+    // The `!limitFacts &&` guard in driveTurn is load-bearing HERE: this terminal is
+    // SIMULTANEOUSLY a genuine provider-transient (terminal_reason:"api_error",
+    // api_error_status:529 → isProviderTransient true) AND limit-bearing (a rejected
+    // rate-limit event with a FUTURE reset → classifyLimitEvidence returns limitFacts).
+    // The limit path must WIN. Folding the guard down to `if (isProviderTransient(terminal))`
+    // would instead throw ProviderTransientError → retry → TransientRecoveryError park,
+    // mislabeling a usage-limit death as a transient outage.
+    const IN_5H = Date.now() + 5 * 60 * 60 * 1000;
+    const { queryFn } = fakeTurns([
+      [
+        rateLimitEvent("rejected", { resetsAt: IN_5H, rateLimitType: "five_hour" }),
+        resultApiError(529, OVERLOADED_529),
+      ],
+    ]);
+    const err = await rejection(
+      new SdkExecutor(nullLogger(), homeDir, fast(queryFn, 2)).run(makeCtx().ctx),
+    );
+    assert.ok(err instanceof LimitReachedError, "the limit death wins over the provider-transient throw");
+    assert.ok(!(err instanceof ProviderTransientError), "not classified as a provider-transient error");
+    assert.ok(!(err instanceof TransientRecoveryError), "not parked as a transient outage");
+    assert.strictEqual(err.rateLimitType, "five_hour");
+    assert.strictEqual(err.resetsAtMs, IN_5H);
   });
 });

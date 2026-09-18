@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
-import { act, cleanup, render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes, useNavigate } from "react-router-dom";
 import { IssueView } from "./IssueView";
 import { api, ApiError, type Card, type IssueDetail, type Run, type SecretMeta, type Worker } from "../lib/api";
@@ -691,5 +691,108 @@ describe("IssueView — a promote error clears on issue navigation (item 4a)", (
     fireEvent.click(screen.getByRole("button", { name: "go to B" }));
     await screen.findByText("Issue B");
     expect(screen.queryByText("forge said no")).toBeNull();
+  });
+});
+
+// PRD #1247 (CodeRabbit finding [5]). IssueView is REUSED across a route-param change
+// without remounting (the data effect keys on [repoId, iidNum] and refetches), so the
+// picked credential must reset to inherit when the route identity changes — otherwise a
+// token pinned for issue A silently carries to issue B's Start run.
+describe("IssueView — the picked credential resets on issue navigation (PRD #1247)", () => {
+  const aWorker = (): Worker => ({
+    id: "w1",
+    name: "laptop",
+    status: "online",
+    busy: false,
+    kind: "external",
+    hosted_size: null,
+    active_runs: 0,
+    max_concurrent_runs: null,
+    template_declared: null,
+    template_reported: null,
+    version: null,
+    upgrade_status: "unknown",
+    upgrade_detail: null,
+    upgrade_target: "",
+    upgrade_blocking_container: null,
+    upgrade_blocking_reason: null,
+    upgrade_last_exit_code: null,
+    last_heartbeat_at: null,
+    created_at: "2026-01-01T00:00:00Z",
+    stats_cpu_pct: null,
+    stats_mem_bytes: null,
+    stats_mem_limit_bytes: null,
+    stats_source: null,
+    stats_disk_nix_bytes: null,
+    stats_disk_nix_total_bytes: null,
+    stats_disk_data_bytes: null,
+    stats_disk_data_total_bytes: null,
+    anthropic_secret_id: null,
+    anthropic_secret_label: null,
+    anthropic_bind_mode: "default",
+    draining_since: null,
+  });
+  const aToken = (): SecretMeta => ({
+    id: "sec-1",
+    label: "console-key",
+    is_default: false,
+    auto_eligible: true,
+    kind: "anthropic_token",
+    created_at: "2026-01-01T00:00:00Z",
+    updated_at: "2026-01-01T00:00:00Z",
+  });
+
+  function NavToB() {
+    const navigate = useNavigate();
+    return (
+      <button type="button" onClick={() => navigate("/repos/repo-1/issues/8")}>
+        go to B
+      </button>
+    );
+  }
+
+  it("returns the token picker to inherit after navigating to another issue", async () => {
+    setAuth();
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
+    mockApi.listSecrets.mockResolvedValue({ secrets: [aToken()] });
+    // Both issues are runnable uzi issues, so the token picker renders for each.
+    mockApi.getIssue.mockImplementation(async (_repo: string, iid: number) => ({
+      issue:
+        iid === 7
+          ? anIssue({ iid: 7, title: "Issue A", labels: ["uzi"] })
+          : anIssue({ iid: 8, title: "Issue B", labels: ["uzi"] }),
+    }));
+
+    render(
+      <MemoryRouter initialEntries={["/repos/repo-1/issues/7"]}>
+        <Routes>
+          <Route
+            path="/repos/:repoId/issues/:iid"
+            element={
+              <>
+                <NavToB />
+                <IssueView />
+              </>
+            }
+          />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    await screen.findByText("Issue A");
+    // Pin the token for issue A (the user CHANGING the selection).
+    const pickerA = screen.getByLabelText("Anthropic token for this run") as HTMLSelectElement;
+    const opt = (await within(pickerA).findByRole("option", { name: /console-key/ })) as HTMLOptionElement;
+    fireEvent.change(pickerA, { target: { value: opt.value } });
+    expect(pickerA.value).toBe("sec-1");
+
+    // Navigate to issue B (same route element, no remount).
+    fireEvent.click(screen.getByRole("button", { name: "go to B" }));
+    await screen.findByText("Issue B");
+
+    // The pin must not carry over: issue B's picker seeds back to inherit. On the old code
+    // the `credential` state survives the route change and this reads "sec-1".
+    const pickerB = screen.getByLabelText("Anthropic token for this run") as HTMLSelectElement;
+    await waitFor(() => expect(pickerB.value).toBe("mode:inherit"));
   });
 });

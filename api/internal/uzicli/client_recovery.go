@@ -74,3 +74,24 @@ func (c *HTTPClient) DownloadRecoveryArchive(ctx context.Context, runID, capture
 	}
 	return n, nil
 }
+
+// RecoveryHolds fetches the caller's owner-wide custody holds + aggregate (PRD #1349 M5, D7).
+// Owner-scoped server-side; Holds is always a JSON array (never null). `uzi run recovery`
+// narrows to one run client-side.
+func (c *HTTPClient) RecoveryHolds(ctx context.Context) (apitypes.RecoveryCustodyHoldsDTO, error) {
+	var out apitypes.RecoveryCustodyHoldsDTO
+	if err := c.get(ctx, "/api/recovery/holds", &out); err != nil {
+		return apitypes.RecoveryCustodyHoldsDTO{}, err
+	}
+	return out, nil
+}
+
+// DiscardRecoveryHold discards ONE exact owner-owned open custody hold (PRD #1349 M5, D7/D9).
+// It ALWAYS sends ?confirm=discard — the server's only mutating form — so the human
+// confirmation (`uzi run discard`'s interactive prompt or --yes) is what precedes this call,
+// and the query field is the wire confirmation the server requires. A non-2xx maps to the
+// documented exit code (a 404 for a foreign/absent/already-settled hold → ExitNotFound).
+func (c *HTTPClient) DiscardRecoveryHold(ctx context.Context, runID, holdID string) error {
+	path := "/api/runs/" + url.PathEscape(runID) + "/recovery-holds/" + url.PathEscape(holdID) + "?confirm=discard"
+	return c.del(ctx, path)
+}

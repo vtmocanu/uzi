@@ -81,8 +81,8 @@ import {
   buildSignalMcpServer,
   SIGNAL_SERVER_NAME,
 } from "./signals.js";
-import { classifyLimitEvidence } from "./limit.js";
-import { PauseNowSignal } from "./steering.js";
+import { classifyLimitEvidence, LimitReachedError } from "./limit.js";
+import { PauseNowSignal, CredentialSwitchSignal } from "./steering.js";
 import { buildMemoryServer, MEMORY_SERVER_NAME } from "./memory-tools.js";
 import { buildForgeToolsServer, FORGE_SERVER_NAME } from "./forge-tools.js";
 import { buildFindingsToolsServer, FINDINGS_SERVER_NAME } from "./findings-tools.js";
@@ -91,10 +91,11 @@ import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-
 import { qualifiedSkillName, type SkillDrop } from "./skills-plugin.js";
 import { prepareSkillPlugin, resolveSkillCaps } from "./skills-run.js";
 import { killProcessGroup, spawnDetached } from "./sdk-spawn.js";
-import { defaultQueryFn } from "./sdk-messages.js";
+import { defaultQueryFn, providerErrorMessage } from "./sdk-messages.js";
 import { ClaudeHarness, type ClaudeTurnConfig } from "./claude-harness.js";
 import { RunTurnReducerImpl } from "./harness-reducer.js";
 import type {
+  HarnessRateLimit,
   HarnessTerminal,
   RunTurnReducer,
   RunTurnRequest,
@@ -133,6 +134,12 @@ const REASON_CANCELLED = "run cancelled";
 // implement loop's turn catch takes to the pause-park path, so it never reaches a `failed`
 // report as text. DISTINCT from REASON_CANCELLED so the two aborts do not collide.
 const REASON_PAUSE_NOW = "run paused (now)";
+// PRD #1247 M5b: the internal trip reason for a held-state CREDENTIAL SWITCH abort. Never a
+// failure_reason — tripError converts it to a thrown CredentialSwitchSignal at every driveTurn
+// throw site, which propagates through the implement loop's turn catch to the runner's release
+// state machine (enterCredentialSwitch), so it never reaches a `failed` report as text. DISTINCT
+// from REASON_CANCELLED and REASON_PAUSE_NOW so the three aborts never collide.
+const REASON_CREDENTIAL_SWITCH = "run released for a credential switch";
 // Exported so the runner's failed-report site can map it to a fail_origin
 // (PRD #69 M7a): a missing Anthropic token is a credential_unavailable failure.
 export const REASON_NO_TOKEN = "no Anthropic OAuth token was provided for this run";
@@ -209,6 +216,57 @@ export class TransientRecoveryError extends Error {
     super(message);
     this.name = "TransientRecoveryError";
   }
+}
+
+/**
+ * issue #1088: a single Anthropic SDK turn ended in a TRANSIENT provider error
+ * (429/500/502/503/529/overloaded, or a status-less transport api error). Thrown on
+ * driveTurn's failed-terminal throw-path (in place of materializing the generic
+ * `Error(provider error: …)`), caught by {@link SdkExecutor.driveTurnWithEmptyRecovery}
+ * which retries it with the existing bounded in-process backoff and, on a sustained
+ * outage, escalates to {@link TransientRecoveryError} → the `recovery_wait` park —
+ * NEVER a work-destroying terminal `failed`. `status` and `sessionId` ride so the park
+ * preserves the session lineage on the throw path (the clean path carries it via
+ * `turn.sessionId`). The default message is composed like the materialize provider
+ * message (readable, contains the status, never "success").
+ */
+export class ProviderTransientError extends Error {
+  public readonly status?: number | null;
+  public readonly sessionId?: string;
+  constructor(
+    message = providerErrorMessage(undefined, undefined),
+    status?: number | null,
+    sessionId?: string,
+  ) {
+    super(message);
+    this.name = "ProviderTransientError";
+    this.status = status;
+    this.sessionId = sessionId;
+  }
+}
+
+/**
+ * issue #1088: whether a FAILED terminal is a TRANSIENT provider error that should be
+ * retried and, on a sustained outage, PARKED (recovery_wait) rather than terminal-failed.
+ *
+ * A guarded AND, deliberately NOT an OR: it requires `terminal_reason === "api_error"`
+ * AND a retryable status. Permanent api errors (401/403/400) are `api_error` too, so an
+ * OR — or dropping the status guard — would park them forever in the uncapped recovery
+ * park. Mirrors client.ts's `isTransient` (transport/network, 408, 429, ≥500 incl. 529);
+ * a status-less api_error is a transport/network failure and is retryable.
+ *
+ * Module-private (used only by driveTurn); the 529/401 behavior is proven end-to-end
+ * through `run()` in the tests rather than by a direct predicate call.
+ */
+function isProviderTransient(t: HarnessTerminal): boolean {
+  return (
+    t.outcome === "failed" &&
+    t.terminalReason === "api_error" &&
+    (t.apiErrorStatus == null ||
+      t.apiErrorStatus === 408 ||
+      t.apiErrorStatus === 429 ||
+      t.apiErrorStatus >= 500)
+  );
 }
 
 // PRD #517 M3/M5: the FALLBACK idle bound for an INTERACTIVE task's follow-up park — how
@@ -370,6 +428,13 @@ interface TurnResult {
    *  so callers can distinguish a positively-empty turn (numTurns===0 && !sawModelActivity)
    *  from a genuine "ran but no plan" turn. */
   sawModelActivity?: boolean;
+  /** PRD #1349 M3: THIS turn's FINAL latest-wins rate-limit observation, mirrored from
+   *  ReducedTurnResult (the terminal's `HarnessLimitEvidence.latest`). Per-turn, so it is
+   *  the verdict of the attempt that produced this result, never a stale prior one. Read by
+   *  {@link SdkExecutor.driveTurnWithEmptyRecovery}: a positively-empty turn whose final
+   *  verdict is `rejected` routes to the usage-limit wait path (LimitReachedError) instead
+   *  of the generic recovery_wait park. */
+  rateLimit?: HarnessRateLimit;
 }
 
 /** PRD #88 feed notices for a question that could NOT be put to a human. Both are
@@ -1138,7 +1203,13 @@ export class SdkExecutor implements Executor {
         state,
         ctx.signal?.reason instanceof PauseNowSignal
           ? REASON_PAUSE_NOW
-          : REASON_CANCELLED,
+          : // PRD #1247 M5b: a held-state credential switch aborts the SAME controller as a cancel,
+            // but with a CredentialSwitchSignal reason. Trip with REASON_CREDENTIAL_SWITCH so
+            // driveTurn throws a CredentialSwitchSignal (via tripError) instead of the cancel error —
+            // the runner then RELEASES the claim rather than failing the run.
+            ctx.signal?.reason instanceof CredentialSwitchSignal
+            ? REASON_CREDENTIAL_SWITCH
+            : REASON_CANCELLED,
       );
       depsAbort.abort();
     };
@@ -1155,6 +1226,13 @@ export class SdkExecutor implements Executor {
     // cleared the prior trip still drops the (restarted) turn. `state` is the run-lifetime drive
     // object, so this one registration covers every turn.
     ctx.onPauseNow?.(() => this.trip(state, REASON_PAUSE_NOW));
+
+    // PRD #1247 M5b: register the RE-ARMABLE credential-switch interrupt, the exact analog of the
+    // pause-now interrupt above. The shared cancel controller fires 'abort' once, so a switch that
+    // lands after a declined `now` park (which already aborted it) cannot re-fire it; the steering
+    // channel invokes THIS on the matching switch, and trip() is first-wins-per-turn, so the switch
+    // drops the (restarted) turn as REASON_CREDENTIAL_SWITCH. One registration covers every turn.
+    ctx.onCredentialSwitch?.(() => this.trip(state, REASON_CREDENTIAL_SWITCH));
 
     // The SDK session id evolves across turns; resume each turn from the last.
     let resumeId = ctx.sessionId ?? undefined;
@@ -1252,6 +1330,17 @@ export class SdkExecutor implements Executor {
         (!!ctx.sessionId ||
           ctx.seeded === true ||
           ctx.reviewedPlanResume === true) &&
+        !!ctx.approvedPlan?.trim();
+
+      // PRD #1247 M5b (D13): a run RECLAIMED after a held-state credential switch at the plan gate.
+      // resume_phase == "awaiting_approval" carries the SUBMITTED-but-unapproved plan (persisted
+      // plan_md → ctx.approvedPlan). RE-PRESENT that exact plan at the gate WITHOUT running a
+      // planning turn, then await a fresh verdict. DISTINCT from preApproved (never both — the plan
+      // is not yet approved here); mutually exclusive by the `!preApproved` guard so an approved run
+      // still takes the gate-skip path.
+      const resumeAtGate =
+        !preApproved &&
+        ctx.resumePhase === "awaiting_approval" &&
         !!ctx.approvedPlan?.trim();
 
       // Hoisted above the skip so the post-gate code (the ci_fix not_code check, the
@@ -1417,6 +1506,9 @@ export class SdkExecutor implements Executor {
             // does not infer the parent from the clone's freshly-fetched default branch.
             baseCommit: ctx.baseCommit,
             defaultBranchCommit: ctx.defaultBranchCommit,
+            // PRD #1416 M1: name the published floor P — ci_fix branches are routinely
+            // published (PRD fact 17). Absent ⇒ no note.
+            publishedTip: ctx.publishedTip,
             // PRD #501 REC B: thread the autopilot flag so the plan note renders.
             autoApprove: ctx.autoApprove,
           });
@@ -1445,6 +1537,9 @@ export class SdkExecutor implements Executor {
             // cycle's tip, so its base is the least guessable of the three kinds.
             baseCommit: ctx.baseCommit,
             defaultBranchCommit: ctx.defaultBranchCommit,
+            // PRD #1416 M1: name the published floor P — the self_improve branch is
+            // routinely published (PRD fact 17). Absent ⇒ no note.
+            publishedTip: ctx.publishedTip,
             // PRD #501 REC B: thread the autopilot flag so the plan note renders.
             autoApprove: ctx.autoApprove,
           });
@@ -1471,31 +1566,57 @@ export class SdkExecutor implements Executor {
             // See above.
             baseCommit: ctx.baseCommit,
             defaultBranchCommit: ctx.defaultBranchCommit,
+            // PRD #1416 M1: name the published floor P on a run with one. Absent ⇒ no note.
+            publishedTip: ctx.publishedTip,
             // PRD #501 REC B: thread the autopilot flag so the plan note renders.
             autoApprove: ctx.autoApprove,
           });
         }
-        const planningLabel = isCIFix
-          ? "diagnosing CI failure"
-          : isSelfImprove
-            ? "planning self-improvement"
-            : "planning";
-        ctx.emit({
-          kind: "status",
-          agent: "worker",
-          payload: { text: `starting SDK agent (${planningLabel})` },
-        });
+        // PRD #1247 M5b (D13): both paths below set `approvedPlan` + the candidate milestone list,
+        // then share the gate + revision loop. A resume-at-gate run does NOT run a planning turn —
+        // it re-presents the ALREADY-CAPTURED plan (the persisted plan_md → ctx.approvedPlan) at the
+        // gate, so `planPrompt` built above is consumed only on the planning path.
+        let candidateMilestones: Milestone[] | undefined;
+        if (resumeAtGate) {
+          ctx.emit({
+            kind: "status",
+            agent: "worker",
+            payload: {
+              text: "resuming at the plan gate after a credential switch — re-presenting the submitted plan (no re-plan)",
+            },
+          });
+          approvedPlan = ctx.approvedPlan!;
+          // The frozen breakdown rides the claim so the re-presented gate shows the same
+          // milestones; absent ⇒ no milestones on the report, as for a plan turn producing none.
+          candidateMilestones = ctx.frozenMilestones ?? undefined;
+        } else {
+          const planningLabel = isCIFix
+            ? "diagnosing CI failure"
+            : isSelfImprove
+              ? "planning self-improvement"
+              : "planning";
+          ctx.emit({
+            kind: "status",
+            agent: "worker",
+            payload: { text: `starting SDK agent (${planningLabel})` },
+          });
 
-        const plan = await this.drivePlanningTurn(
-          ctx,
-          baseConfig,
-          resumeId,
-          planPrompt,
-          state,
-          idleMs,
-          budget,
-        );
-        resumeId = plan.sessionId ?? resumeId;
+          // PRD #1247 M5b (data-integrity fix): a credential switch can trip DURING the initial
+          // planning turn (a live turn, or its own ask_user park). Handle it IN PLACE via
+          // runThroughSwitch: "released" → reclaim re-plans on the new token (surface switchReleased
+          // and end), "gave_up" → restart the planning turn on the OLD token (re-run drivePlanningTurn,
+          // like the pause_failed turn restart).
+          const planStep = await this.runThroughSwitch(ctx, state, () =>
+            this.drivePlanningTurn(ctx, baseConfig, resumeId, planPrompt, state, idleMs, budget),
+          );
+          if ("released" in planStep) return { branch: ctx.branch, switchReleased: true };
+          const plan = planStep.value;
+          resumeId = plan.sessionId ?? resumeId;
+          approvedPlan = plan.plan;
+          // PRD #122 M1: the CANDIDATE milestone list rides every gate call so the human
+          // approves the breakdown. It is REPLACED on each revision round (Decision 2).
+          candidateMilestones = plan.milestones;
+        }
 
         // --- Plan gate (+ revision loop, PRD #41) -----------------------------
         // The gate can be re-entered N times under ONE approval budget: a `revise`
@@ -1506,11 +1627,6 @@ export class SdkExecutor implements Executor {
         // guarantee the only way past this block is an `approve` (see the explicit guard).
         if (!ctx.gatePlan)
           throw new Error("plan gate is not wired for this run");
-        approvedPlan = plan.plan;
-        // PRD #122 M1: the CANDIDATE milestone list rides every gate call so the human
-        // approves the breakdown. It is REPLACED on each revision round (Decision 2),
-        // tracked alongside approvedPlan.
-        let candidateMilestones = plan.milestones;
         // PRD #362 M3c PLAN hook (Decision 2): generate + post the plan summary as the
         // gate's onAwaitingApproval callback, so it fires AFTER the gate persists plan_md
         // (the summary's stale-write guard value) and BEFORE the verdict wait — blocking
@@ -1520,9 +1636,19 @@ export class SdkExecutor implements Executor {
         // its running report (SetRunAutopilotPlan, RC1 #1197) but never invokes the callback,
         // so an auto-approved run generates no plan summary. Advisory — the
         // helper swallows every failure.
-        let verdict = await ctx.gatePlan(approvedPlan, candidateMilestones, (planMd) =>
-          this.generateAndPostPlanSummary(ctx, planMd, prdInputP),
+        // PRD #1247 M5b (data-integrity fix): the plan gate is a HELD idle state — a credential
+        // switch trips by rejecting the parked gate waiter with a CredentialSwitchSignal. Handle it
+        // IN PLACE at EVERY gate wait via runThroughSwitch: "released" ends the flight (surface
+        // switchReleased; the reclaim resumes at resume_phase and re-presents this plan), "gave_up"
+        // re-presents the SAME gate on the OLD token (re-run ctx.gatePlan — keep waiting for a real
+        // verdict). The gate already loops for revisions; this only adds switch-survival to each wait.
+        const g0 = await this.runThroughSwitch(ctx, state, () =>
+          ctx.gatePlan!(approvedPlan, candidateMilestones, (planMd) =>
+            this.generateAndPostPlanSummary(ctx, planMd, prdInputP),
+          ),
         );
+        if ("released" in g0) return { branch: ctx.branch, switchReleased: true };
+        let verdict = g0.value;
         let revisions = 0;
         while (verdict.kind === "revise") {
           const feedback = verdict.feedback;
@@ -1550,7 +1676,11 @@ export class SdkExecutor implements Executor {
                 text: "revision budget exhausted — not revising the plan further",
               },
             });
-            verdict = await ctx.gatePlan(approvedPlan, candidateMilestones);
+            const gExhausted = await this.runThroughSwitch(ctx, state, () =>
+              ctx.gatePlan!(approvedPlan, candidateMilestones),
+            );
+            if ("released" in gExhausted) return { branch: ctx.branch, switchReleased: true };
+            verdict = gExhausted.value;
             continue;
           }
           revisions++;
@@ -1562,15 +1692,21 @@ export class SdkExecutor implements Executor {
           // A revision turn is a PLANNING turn (pre-approval), so it runs with the OWN
           // subagents (baseConfig), exactly like the first plan turn — the roster
           // selection only takes effect once a plan is APPROVED (PRD #37 Decision 5).
-          const turn = await this.drivePlanningTurn(
-            ctx,
-            baseConfig,
-            resumeId,
-            buildRevisePlanPrompt(feedback),
-            state,
-            idleMs,
-            budget,
-          );
+          // PRD #1247 M5b (MAJOR-6 rework): DEFER the credential switch across the revision planning
+          // turn instead of releasing mid-turn. The turn's new plan is not persisted until the gate
+          // report below, so a mid-turn release would leave the run row on the OLD plan_md and a
+          // reclaim would re-present the SUPERSEDED plan (resume_phase 'awaiting_approval' re-emits
+          // run.plan_md verbatim). Deferring holds the switch — which rides every inputs poll — until
+          // the NEXT trip point, the gate wait just below, AFTER gatePlan has persisted the revised
+          // plan; the reclaim then resumes at the gate on the CORRECT plan. The defer window covers
+          // the turn's own ask_user sub-park and closes before the gate wait. A stub/test executor
+          // that does not wire the hook runs the turn undeferred (the switch signal then reaches the
+          // outer catch, byte-identical to the pre-rework behaviour).
+          const runRevisionTurn = () =>
+            this.drivePlanningTurn(ctx, baseConfig, resumeId, buildRevisePlanPrompt(feedback), state, idleMs, budget);
+          const turn = ctx.deferCredentialSwitch
+            ? await ctx.deferCredentialSwitch(runRevisionTurn)
+            : await runRevisionTurn();
           resumeId = turn.sessionId ?? resumeId;
           approvedPlan = turn.plan;
           // Decision 2: the candidate is REPLACED across a revision round.
@@ -1578,9 +1714,13 @@ export class SdkExecutor implements Executor {
           // PRD #362 M3c: a re-plan REGENERATES the plan summary (Decision 2), fired from
           // the gate's onAwaitingApproval callback (after the re-report persists the NEW
           // plan_md) so its stale-write guard matches the new plan.
-          verdict = await ctx.gatePlan(approvedPlan, candidateMilestones, (planMd) =>
-            this.generateAndPostPlanSummary(ctx, planMd, prdInputP),
+          const gRev = await this.runThroughSwitch(ctx, state, () =>
+            ctx.gatePlan!(approvedPlan, candidateMilestones, (planMd) =>
+              this.generateAndPostPlanSummary(ctx, planMd, prdInputP),
+            ),
           );
+          if ("released" in gRev) return { branch: ctx.branch, switchReleased: true };
+          verdict = gRev.value;
         }
         if (verdict.kind === "reject")
           throw new PlanRejectedError(verdict.reason);
@@ -1843,6 +1983,13 @@ export class SdkExecutor implements Executor {
       // branch, or the `now` pause caught around driveTurn below). Hoisted like scopeCapped so it
       // survives the `break` into the ExecutorResult assembly. ANY kind (NOT gated on isIssueRun).
       let pausedAt: { completedCount: number; total?: number } | undefined;
+      // PRD #1247 M5b (data-integrity fix): latched TRUE when a held-state credential switch RELEASED
+      // the claim IN PLACE (ctx.attemptCredentialSwitch → "released") from a live implement turn, an
+      // ask_user question, or an interactive follow-up wait. Hoisted like pausedAt/scopeCapped so it
+      // survives the `break` into the ExecutorResult assembly; the runner reads it in phasePublish to
+      // SKIP finalization (the release already requeued the run for a reclaim on the new token). A
+      // give-up does NOT set it — the run continues on the old token instead.
+      let switchReleased = false;
       // PRD #1190 M2 (N1): honour a seeded/steered pause at the FIRST loop boundary as an
       // ACK-independent fallback. On a resume claim.pause_pending seeded steering.pauseMode; read it
       // here (ctx.pauseModeRequested) and treat a set mode as an initial pause request at the first
@@ -1973,6 +2120,12 @@ export class SdkExecutor implements Executor {
           agent: "worker",
           payload: { text: `implement/review iteration ${iteration}` },
         });
+        // PRD #1416 M2: drain the worker-authoritative safety steer BEFORE building the implement
+        // prompt, so an M2-armed steer reaches the next turn and an M5-armed steer reaches
+        // iteration 1. Every iteration (including the first), and AHEAD of the end-of-iteration
+        // follow-up drain at ~2672 — it survives the paths that `continue` before that drain, and
+        // is rendered as worker guidance OUTSIDE the <follow_up> fence (see buildImplementPrompt).
+        const safetySteer = ctx.pullSafetySteer?.();
         // PRD #1064 M1 (Decisions 1/2): a per-turn progress observer. It owns the diff base
         // (seeded from the loop-scope latestProgress, the previous turn's final snapshot, so
         // a transition already seen does not re-emit) and the frozen titles, emits the
@@ -2035,6 +2188,17 @@ export class SdkExecutor implements Executor {
             // lead hands a subagent a diff command, which is where the wrong one was seen.
             baseCommit: ctx.baseCommit,
             defaultBranchCommit: ctx.defaultBranchCommit,
+            // PRD #1416 M1: name the published floor P, first turn only (gated inside
+            // buildImplementPrompt). Absent ⇒ no note.
+            publishedTip: ctx.publishedTip,
+            // #1416 (MR-rework): under auto-approve the published-tip note's rewrite guidance
+            // must not tell the agent to call `ask_user` (no human answers it), matching the
+            // plan builders above.
+            autoApprove: ctx.autoApprove,
+            // PRD #1416 M2: the worker-authoritative safety steer drained above, EVERY turn it is
+            // present (drained fresh each turn, not first-turn-only). Rendered as worker guidance
+            // ahead of any <follow_up> block. Absent ⇒ no block.
+            safetySteer,
             // PRD #209 (D7): a requeued seeded run whose transcript was dropped re-enters
             // implement COLD — no plan turn carried the prior-work note. Threaded on the
             // pre-approved path ONLY, so an ordinary gated run's implement prompt is
@@ -2068,6 +2232,35 @@ export class SdkExecutor implements Executor {
         try {
           turn = await turnPromise;
         } catch (err) {
+          // PRD #1247 M5b (data-integrity fix): a held-state credential switch tripped this
+          // implement turn (the SDK abort / re-armable interrupt → driveTurn throws
+          // CredentialSwitchSignal). Handle it IN PLACE via ctx.attemptCredentialSwitch INSTEAD of
+          // re-throwing to the runner's outer catch — the pre-fix re-throw ended the flight while the
+          // run was still healthy (worker_id + live heartbeat), which no sweep requeues, so a give-up
+          // orphaned the work at RUN_TIMEOUT. Checked FIRST, so no later branch here (the WALL/IDLE
+          // completion-hold route, say) can swallow it. This MIRRORS the PauseNowSignal block below:
+          //   - "released"  → latch switchReleased and break (like a pause PARK breaks with pausedAt):
+          //     the release already requeued the run; the executor returns and the runner skips
+          //     finalize on the surfaced latch.
+          //   - "gave_up"   → clear the sticky trip and CONTINUE, EXACTLY as the pause_failed continue
+          //     just below (state.tripReason = undefined; continue): the aborted turn restarts on the
+          //     next iteration and the run keeps executing on the OLD token (the server already cleared
+          //     the switch stamp and the runner cleared the preserve flags), so a later NORMAL
+          //     completion cleans up. NEVER re-throw to the outer catch on a running give-up.
+          //   - no hook wired (stub/test executor) → re-throw, byte-identical to the pre-fix behaviour
+          //     (the runner's outer catch is then the safety net).
+          if (err instanceof CredentialSwitchSignal) {
+            const outcome = await ctx.attemptCredentialSwitch?.();
+            if (outcome === "released") {
+              switchReleased = true;
+              break;
+            }
+            if (outcome === "gave_up") {
+              state.tripReason = undefined;
+              continue;
+            }
+            throw err;
+          }
           if (err instanceof PauseNowSignal) {
             const at = {
               // The server's fresh completed count off THIS iteration's ACK, matching the
@@ -2205,7 +2398,20 @@ export class SdkExecutor implements Executor {
               ctx.config?.task_idle_timeout_seconds,
               TASK_FOLLOWUP_IDLE_MS / 1000,
             );
-            const outcome = await ctx.awaitFollowUp(followupIdleMs);
+            // PRD #1247 M5b (data-integrity fix): a held-state credential switch can trip while the
+            // run idles here waiting for a follow-up (steering rejects the follow-up waiter with a
+            // CredentialSwitchSignal). Handle it IN PLACE: on "released" surface switchReleased and
+            // end the run (the release requeued it); on "gave_up" runThroughSwitch re-parks the
+            // follow-up wait on the OLD token (keep waiting) — the audit flagged this waiter as
+            // previously untested. `ctx.awaitFollowUp` is guaranteed present by the guard above.
+            const followUpStep = await this.runThroughSwitch(ctx, state, () =>
+              ctx.awaitFollowUp!(followupIdleMs),
+            );
+            if ("released" in followUpStep) {
+              switchReleased = true;
+              break;
+            }
+            const outcome = followUpStep.value;
             if (outcome.kind === "followup") {
               // Fold the follow-up into the next turn EXACTLY as a mid-run follow-up is
               // (buildImplementPrompt renders `followUp` as UNTRUSTED user input); the
@@ -2443,11 +2649,20 @@ export class SdkExecutor implements Executor {
         // clarification turn free.
         const asked = turn.questions;
         if (asked?.length) {
-          const verdict = await this.askUserOrContinue(
-            ctx,
-            asked,
-            budget.asked,
+          // PRD #1247 M5b (data-integrity fix): the clarification park is a HELD idle state — a
+          // credential switch can trip while awaiting the answer (steering rejects the answer waiter
+          // with a CredentialSwitchSignal, raised out of ctx.askUser inside askUserOrContinue). Handle
+          // it IN PLACE: "released" surfaces switchReleased and ends the run (the release requeued it);
+          // "gave_up" re-presents the question on the OLD token (runThroughSwitch re-runs
+          // askUserOrContinue — keep waiting), never a terminal failure.
+          const askStep = await this.runThroughSwitch(ctx, state, () =>
+            this.askUserOrContinue(ctx, asked, budget.asked),
           );
+          if ("released" in askStep) {
+            switchReleased = true;
+            break;
+          }
+          const verdict = askStep.value;
           if (verdict.parked) {
             budget.asked++;
             if (verdict.cancelled)
@@ -2647,6 +2862,13 @@ export class SdkExecutor implements Executor {
       // it to SKIP finalization exactly like pausedAt. OMITTED (not undefined) on every normal
       // completion so the result shape is unchanged and existing deepStrictEqual assertions hold.
       if (completionHeld) result.completionHeld = completionHeld;
+      // PRD #1247 M5b (data-integrity fix): forward the released-in-place disposition. Set only when a
+      // held-state credential switch RELEASED the claim (ctx.attemptCredentialSwitch → "released")
+      // from the implement loop, an ask_user question, or an interactive follow-up wait — the loop
+      // broke with switchReleased latched. phasePublish reads it to SKIP finalization exactly like
+      // pausedAt/completionHeld (the release already requeued the run). OMITTED (not undefined) on
+      // every normal completion so the result shape is unchanged and existing assertions hold.
+      if (switchReleased) result.switchReleased = true;
       return result;
   }
 
@@ -2748,6 +2970,45 @@ export class SdkExecutor implements Executor {
   }
 
   /** Drive ONE SDK turn to its result frame, capturing signals + the session id. */
+  /**
+   * PRD #1247 M5b (data-integrity fix): run an idle held-state WAIT (the plan gate, an ask_user
+   * question, an interactive follow-up) or a PLANNING TURN that may reject with a
+   * CredentialSwitchSignal, and handle the switch IN PLACE instead of letting it reach the runner's
+   * outer catch (which would end the flight while the run is still healthy — no sweep requeues that).
+   *
+   * Returns `{ value }` on a normal resolution, or `{ released: true }` when the switch RELEASED the
+   * claim (a verified capture + queued release ack) — the caller then surfaces
+   * {@link ExecutorResult.switchReleased} and ENDS the run (the release already requeued it for a
+   * reclaim at resume_phase on the new token). On a GIVE-UP it clears the sticky trip (so the switch
+   * does not immediately re-throw the next SDK turn — the same re-arm the pause_failed continue does)
+   * and RE-RUNS `run`: a re-presented gate/question/follow-up wait, or a restarted planning turn, on
+   * the OLD token. The server already cleared the switch stamp and the runner cleared the flight's
+   * preserve flags, so a later NORMAL completion cleans up as usual.
+   *
+   * With no attemptCredentialSwitch hook wired (stub/test executor) it re-throws the signal, so it
+   * reaches the runner's outer catch byte-identically to the pre-fix behaviour.
+   */
+  private async runThroughSwitch<T>(
+    ctx: RunContext,
+    state: RunDrive,
+    run: () => Promise<T>,
+  ): Promise<{ value: T } | { released: true }> {
+    for (;;) {
+      try {
+        return { value: await run() };
+      } catch (err) {
+        if (!(err instanceof CredentialSwitchSignal)) throw err;
+        const outcome = await ctx.attemptCredentialSwitch?.();
+        if (outcome === "released") return { released: true };
+        if (outcome === "gave_up") {
+          state.tripReason = undefined;
+          continue;
+        }
+        throw err; // no hook wired: let the runner's outer catch handle it, as before this fix
+      }
+    }
+  }
+
   /**
    * PRD #88 M4: drive a PLANNING turn, letting the lead ask the human first.
    *
@@ -2983,6 +3244,11 @@ export class SdkExecutor implements Executor {
     reducer.beginTurn();
     let sawTerminal = false;
     let terminal: HarnessTerminal | undefined;
+    // issue #1088: the session id observed THIS turn (from the reducer's once-per-run
+    // first-session latch). On the clean path the reducer carries it via turn.sessionId;
+    // this is the throw-path analog, passed to a ProviderTransientError so the recovery
+    // park resumes the same session lineage.
+    let observedSessionId: string | undefined;
 
     this.armWall(state);
     // Budget already spent by earlier turns → fail now rather than run unbounded.
@@ -3015,6 +3281,8 @@ export class SdkExecutor implements Executor {
         // First-truthy session id once per run: the run callback, catch-and-warn
         // exactly as before (a handler throw must not fail the turn).
         if (reduction.firstSessionId !== undefined) {
+          // issue #1088: remember it for the ProviderTransientError throw-path resume.
+          observedSessionId = reduction.firstSessionId;
           try {
             ctx.onSessionId?.(reduction.firstSessionId);
           } catch (err) {
@@ -3055,13 +3323,29 @@ export class SdkExecutor implements Executor {
       if (sawTerminal && terminal && terminal.outcome === "failed") {
         // PRD #35: classify at the completion point with Date.now() (not earlier in
         // the stream). A usage-limit death materializes as the TYPED LimitReachedError
-        // carrying the normalized reset; everything else materializes as the generic
-        // `agent run failed: ${subtype}` collapse. The materializer retains the RAW
-        // subtype; malformed-value conversion throws HERE, at this call site.
+        // carrying the normalized reset; a genuine (non-transient) failure materializes
+        // via the closure into an accurate message (issue #1088: a readable
+        // `provider error: <status> <text>` for an api error, else
+        // `agent run failed: ${subtype}`, and NEVER `agent run failed: success`). The
+        // materializer retains the RAW subtype; malformed-value conversion throws HERE,
+        // at this call site.
         const limitFacts = classifyLimitEvidence(
           terminal.limitEvidence ?? { explicitExhaustion: false },
           Date.now(),
         );
+        // issue #1088: a usage-limit death (limitFacts) still wins and materializes the
+        // TYPED LimitReachedError. Otherwise, a TRANSIENT provider error (429/5xx/529 or
+        // a status-less transport api_error) is thrown as a ProviderTransientError so the
+        // recovery wrapper retries it and, on a sustained outage, PARKS via recovery_wait
+        // instead of terminal-failing. Permanent api errors (401/403/400) fail through
+        // materialize as before (isProviderTransient's status guard excludes them).
+        if (!limitFacts && isProviderTransient(terminal)) {
+          throw new ProviderTransientError(
+            providerErrorMessage(terminal.apiErrorStatus, terminal.resultText),
+            terminal.apiErrorStatus,
+            observedSessionId,
+          );
+        }
         const thrown = terminal.failure
           ? terminal.failure.materialize(limitFacts)
           : { original: new Error("agent run failed: unknown") };
@@ -3085,24 +3369,36 @@ export class SdkExecutor implements Executor {
   }
 
   /**
-   * issue #1197 (D-RC2b): drive one turn, then bounded/budget-safe/cancel-safe
-   * in-process retries when — and ONLY when — that turn returned POSITIVELY empty
-   * (0 turns, no model activity, no plan/questions/done). Every other return, including
-   * a turn that ran but did not submit a plan (which stays REASON_NO_PLAN in the caller)
-   * and a turn with MISSING metrics (numTurns undefined), returns unchanged.
+   * issue #1197 (D-RC2b) + issue #1088: drive one turn, then bounded/budget-safe/
+   * cancel-safe in-process retries when — and ONLY when — that turn either returned
+   * POSITIVELY empty (0 turns, no model activity, no plan/questions/done) OR threw a
+   * {@link ProviderTransientError} (a 429/5xx/529 or status-less transport api error).
+   * Every OTHER return or throw is unchanged: a turn that ran but did not submit a plan
+   * stays REASON_NO_PLAN in the caller, a turn with MISSING metrics returns unchanged,
+   * and a genuine (non-transient) failure re-throws to fail the run.
+   *
+   * BOTH driveTurn calls are inside the try/catch (issue #1088): the FIRST turn's
+   * transient throw must be caught here too — otherwise a first-turn ProviderTransientError
+   * would escape to runner.ts, which catches only TransientRecoveryError, and the run would
+   * FAIL instead of park.
    *
    * Invariants (the reason this is a wrapper, not inlined in driveTurn):
-   *  - A genuine cancel/idle/wall trip WINS: `state.tripReason` is thrown FIRST each
-   *    attempt and polled during the backoff, so a real trip keeps its existing
-   *    terminal/cancelled outcome and is NEVER reclassified as recovery.
+   *  - A genuine cancel/idle/wall trip WINS: `state.tripReason` is thrown FIRST — in the
+   *    catch of every drive AND before each backoff/re-drive — so a real trip keeps its
+   *    existing terminal/cancelled outcome and is NEVER reclassified as recovery.
+   *  - A LimitReachedError (usage-limit death) and any non-transient failure re-throw
+   *    unchanged — only a positively-empty turn or a ProviderTransientError is retried.
    *  - Budget exhaustion is NEVER a recovery trigger: the backoff is skipped once the
    *    wall is spent, and the next driveTurn's `armWall` trips REASON_WALL naturally —
    *    the genuine wall outcome, not a park. The between-turns wait is debited from the
    *    wall (disarmed between turns) so the next turn sees the true remaining budget.
-   *  - The re-drive resumes the last session observed, including a fresh empty
-   *    planning turn's session. The persisted first-session ID stays authoritative.
-   * Only after the bounded retries are exhausted on a still-positively-empty result
-   * does this throw {@link TransientRecoveryError} → the recovery_wait park (D-RC2c).
+   *  - The re-drive resumes the last session observed — a fresh empty planning turn's
+   *    `turn.sessionId`, or a transient throw's `err.sessionId`. The persisted
+   *    first-session ID stays authoritative.
+   * Only after the bounded retries are exhausted (still positively-empty, or still
+   * throwing transient) does this throw {@link TransientRecoveryError} → the
+   * recovery_wait park (D-RC2c), with a provider-aware message when the cause was a
+   * ProviderTransientError.
    */
   private async driveTurnWithEmptyRecovery(
     ctx: RunContext,
@@ -3114,20 +3410,45 @@ export class SdkExecutor implements Executor {
     idleMs: number,
     onProgress?: (progress: MilestoneProgress) => void,
   ): Promise<TurnResult> {
-    let turn = await this.driveTurn(
-      ctx,
-      turnConfig,
-      phase,
-      resumeId,
-      prompt,
-      state,
-      idleMs,
-      onProgress,
-    );
-    // The common path: a non-empty turn returns unchanged. Recovery is entered ONLY on
-    // a positively-empty return (isPositivelyEmpty excludes missing metrics, plan,
-    // questions, done and any model activity).
-    if (!isPositivelyEmpty(turn)) return turn;
+    // issue #1088: a driveTurn either RETURNS a result (possibly positively-empty) or
+    // THROWS. A ProviderTransientError throw is captured (retry it, like an empty turn);
+    // a trip / LimitReachedError / any other throw re-throws unchanged. `turn` is left
+    // undefined on a captured transient throw, `lastProviderErr` records the latest one.
+    let turn: TurnResult | undefined;
+    let lastProviderErr: ProviderTransientError | undefined;
+    const runOnce = async (): Promise<void> => {
+      try {
+        turn = await this.driveTurn(
+          ctx,
+          turnConfig,
+          phase,
+          resumeId,
+          prompt,
+          state,
+          idleMs,
+          onProgress,
+        );
+        lastProviderErr = undefined;
+      } catch (err) {
+        // A real cancel/idle/wall trip WINS and keeps its existing outcome.
+        if (state.tripReason) throw this.tripError(state);
+        // A usage-limit death routes to the usage-limit wait path, unchanged.
+        if (err instanceof LimitReachedError) throw err;
+        // Any genuine (non-transient) failure fails the run, exactly as before.
+        if (!(err instanceof ProviderTransientError)) throw err;
+        // A transient provider error: retry it like an empty turn, and preserve the
+        // session lineage on this throw path (the clean path uses turn.sessionId).
+        lastProviderErr = err;
+        turn = undefined;
+        resumeId = err.sessionId ?? resumeId;
+      }
+    };
+
+    await runOnce();
+    // The common path: a non-empty turn returns unchanged. Recovery is entered ONLY on a
+    // positively-empty return (isPositivelyEmpty excludes missing metrics, plan, questions,
+    // done and any model activity) or a captured ProviderTransientError (turn undefined).
+    if (turn && !isPositivelyEmpty(turn)) return turn;
 
     for (let attempt = 1; attempt <= this.emptyTurnMaxRetries; attempt++) {
       // A real cancel/idle/wall trip WINS and keeps its existing outcome — throw it
@@ -3140,32 +3461,50 @@ export class SdkExecutor implements Executor {
       if (state.wallRemainingMs > 0) {
         await this.emptyTurnBackoff(state, this.emptyTurnBackoffBaseMs * attempt);
       }
-      // A truthful feed notice each attempt, right before the re-drive.
+      // A truthful feed notice each attempt, right before the re-drive: provider-aware
+      // when the last drive threw transient, else the empty-turn notice.
       ctx.emit({
         kind: "status",
         agent: "worker",
         payload: {
-          text: "the model returned an empty result (0 turns, no activity); retrying…",
+          text: lastProviderErr
+            ? `the provider returned a transient error (${lastProviderErr.status ?? "API error"}); retrying…`
+            : "the model returned an empty result (0 turns, no activity); retrying…",
         },
       });
       // An empty fresh turn can still initialize a session. Resume it on retry:
       // the reducer already persisted that ID through its once-per-run callback.
-      // Starting a second session would leave recovery pointing at the first.
-      resumeId = turn.sessionId ?? resumeId;
-      turn = await this.driveTurn(
-        ctx,
-        turnConfig,
-        phase,
-        resumeId,
-        prompt,
-        state,
-        idleMs,
-        onProgress,
-      );
-      if (!isPositivelyEmpty(turn)) return turn;
+      // Starting a second session would leave recovery pointing at the first. (On the
+      // transient-throw path resumeId was already advanced inside runOnce.)
+      if (turn) resumeId = turn.sessionId ?? resumeId;
+      await runOnce();
+      if (turn && !isPositivelyEmpty(turn)) return turn;
     }
-    // Bounded retries exhausted, still positively empty → escalate to the recovery park.
-    throw new TransientRecoveryError();
+    // PRD #1349 M3: bounded retries exhausted, still positively empty. Branch on THIS
+    // (final) attempt's rate-limit verdict:
+    //   - status === "rejected" ⇒ the turn was empty BECAUSE the account is rate-limited.
+    //     Throw the TYPED LimitReachedError so runner.ts routes it to the usage-limit wait
+    //     path (handleLimitReached, which respects `wait_on_limit`), NOT to the endless
+    //     local recovery_wait retry. The reset/type ride verbatim; the SERVER owns
+    //     rate_limit_type validation, reset validation, fallback scheduling and wait_on_limit.
+    //   - anything else (no verdict, allowed/allowed_warning, utilization-only, or a
+    //     rejected-then-allowed latest-wins → allowed) stays the generic recovery park.
+    // This routing keys ONLY on `rejected` and DELIBERATELY does NOT reuse
+    // classifyLimitEvidence's future-reset corroboration (limit.ts): a missing or past
+    // reset must STILL take the limit path here — that gate governs a different decision.
+    if (turn?.rateLimit?.status === "rejected") {
+      throw new LimitReachedError({
+        resetsAtMs: turn.rateLimit.resetsAtMs,
+        rateLimitType: turn.rateLimit.window,
+      });
+    }
+    // issue #1088: a sustained provider outage carries its provider-aware message into the
+    // recovery_wait park; a positively-empty exhaustion uses the default message.
+    throw new TransientRecoveryError(
+      lastProviderErr
+        ? `provider transient error persisted after bounded in-process retries: ${lastProviderErr.message}`
+        : undefined,
+    );
   }
 
   /**
@@ -3297,9 +3636,13 @@ export class SdkExecutor implements Executor {
    *  path; every other trip reason throws its static Error(reason) exactly as before. Keeps the
    *  REASON_PAUSE_NOW sentinel from ever surfacing as a `failed` report's text. */
   private tripError(state: RunDrive): Error {
-    return state.tripReason === REASON_PAUSE_NOW
-      ? new PauseNowSignal()
-      : new Error(state.tripReason ?? REASON_CANCELLED);
+    if (state.tripReason === REASON_PAUSE_NOW) return new PauseNowSignal();
+    // PRD #1247 M5b: a credential-switch trip throws a CredentialSwitchSignal, which the implement
+    // loop's turn catch propagates (it is neither a PauseNowSignal nor a WALL/IDLE trip) to the
+    // runner's release state machine — keeping REASON_CREDENTIAL_SWITCH from ever surfacing as a
+    // `failed` report's text.
+    if (state.tripReason === REASON_CREDENTIAL_SWITCH) return new CredentialSwitchSignal();
+    return new Error(state.tripReason ?? REASON_CANCELLED);
   }
 
   /** Record a first-wins watchdog/cancel trip and stop the current turn. */

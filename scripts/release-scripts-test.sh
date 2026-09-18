@@ -215,6 +215,66 @@ EOF
   chart 0.3.0-rc.11
   commit "chore(release): v0.3.0-rc.11"
   git_c tag v0.3.0-rc.11
+
+  # RC-body DELTA scenario (PRD 1265): 0.4.0-rc.1 opens the [0.4.0] section with X;
+  # rc.2 appends Y (accumulation in the FILE); rc.3 re-spins the SAME commit as rc.2
+  # (no new bullets). Drives the changelog-section.sh body delta assertions below.
+  put api/feature_x.go <<<'package main // x'
+  commit "Feature X (#401)"
+  put CHANGELOG.md <<'EOF'
+# Changelog
+
+## [Unreleased]
+
+## [0.4.0] - 2026-09-20
+### Added
+- **Feature X** (#401)
+  Adds the X subsystem.
+- **Feature Z** (#403)
+  A stable helper.
+
+## [0.2.0] - 2026-09-05
+### Added
+- **Feature A** (#201)
+- **Feature B** (#202)
+
+## [0.1.0] - 2026-09-01
+### Added
+- **Initial** (#100)
+EOF
+  chart 0.4.0-rc.1
+  commit "chore(release): v0.4.0-rc.1"
+  git_c tag v0.4.0-rc.1
+
+  put api/feature_y.go <<<'package main // y'
+  commit "Feature Y (#402)"
+  put CHANGELOG.md <<'EOF'
+# Changelog
+
+## [Unreleased]
+
+## [0.4.0] - 2026-09-20
+### Added
+- **Feature X** (#401)
+  Adds the X subsystem, now with caching.
+- **Feature Z** (#403)
+  A stable helper.
+- **Feature Y** (#402)
+  Adds the Y subsystem.
+
+## [0.2.0] - 2026-09-05
+### Added
+- **Feature A** (#201)
+- **Feature B** (#202)
+
+## [0.1.0] - 2026-09-01
+### Added
+- **Initial** (#100)
+EOF
+  chart 0.4.0-rc.2
+  commit "chore(release): v0.4.0-rc.2"
+  git_c tag v0.4.0-rc.2
+  git_c tag v0.4.0-rc.3   # re-spin: same commit as rc.2, no new changelog bullets
 }
 
 # oracle_prev <ref> <version> — echo the PREV the oracle derives (VERSION passed,
@@ -257,6 +317,37 @@ title="$( cd "$REPO" && bash "$SECTION" title 0.2.0-rc.1 2>&1 )"
 assert_eq "section title is the full tag" "v0.2.0-rc.1" "$title"
 body="$( cd "$REPO" && bash "$SECTION" body 0.2.0-rc.1 2>&1 )"
 assert_contains "section body reads [0.2.0]" "Feature A" "$body"
+
+echo "=== M1: changelog-section.sh body RC delta (PRD 1265, stable-only accumulation) ==="
+# Two-physical-line bullets (title + indented description), matching the real
+# CHANGELOG shape. rc.1 = full section; rc.2 = only its delta since rc.1: the NEW
+# bullet (Y) and the AMENDED bullet (X, whose description gained a clause), while
+# the UNCHANGED bullet (Z) is dropped. stable = the full accumulated section; a
+# re-spin with no new bullets says so. Both directions, so an always-full-section
+# regression, a dropped continuation line, or a missed amend all fail.
+b_rc1="$( cd "$REPO" && bash "$SECTION" body 0.4.0-rc.1 2>&1 )"
+assert_contains "rc.1 body is the full section (X present)" "Feature X" "$b_rc1"
+assert_contains "rc.1 body is the full section (Z present)" "Feature Z" "$b_rc1"
+b_rc2="$( cd "$REPO" && bash "$SECTION" body 0.4.0-rc.2 2>&1 )"
+assert_contains "rc.2 body includes its new bullet (Y)" "Feature Y" "$b_rc2"
+assert_contains "rc.2 body surfaces an AMENDED bullet (X's new clause)" "now with caching" "$b_rc2"
+case "$b_rc2" in
+  *"Feature Z"*) fail "rc.2 body drops the unchanged bullet (Z)" ;;
+  *)             pass "rc.2 body drops the unchanged bullet (Z)" ;;
+esac
+# Structure fidelity: an emitted subsection keeps the blank line after its `### `
+# header (the authored loose list), matching the full-section body.
+if printf '%s\n' "$b_rc2" | awk 'prev == "### Added" && $0 == "" { ok = 1 } { prev = $0 } END { exit ok ? 0 : 1 }'; then
+  pass "rc.2 delta keeps the blank line after a subsection header"
+else
+  fail "rc.2 delta keeps the blank line after a subsection header"
+fi
+b_stable="$( cd "$REPO" && bash "$SECTION" body 0.4.0 2>&1 )"
+assert_contains "stable body accumulates rc.1 (X)" "Feature X" "$b_stable"
+assert_contains "stable body accumulates the unchanged bullet (Z)" "Feature Z" "$b_stable"
+assert_contains "stable body accumulates rc.2 (Y)" "Feature Y" "$b_stable"
+b_rc3="$( cd "$REPO" && bash "$SECTION" body 0.4.0-rc.3 2>&1 )"
+assert_contains "re-spin rc.3 with no new bullets says so" "No changelog changes since v0.4.0-rc.2" "$b_rc3"
 
 # =============================================================================
 # M2: release-cut.sh state machine (D1) + lockstep promote (D5)

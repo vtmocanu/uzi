@@ -598,6 +598,7 @@ Tracked as GitLab issue vtmocanu/uzi#111; PRD at `prds/done/111-auto-select-anth
 - The candidate set is an opt-in pool, per token, default OFF — auto must never spend a token the user reserved for other work. [user 2026-07-22]
 - Ranking is least-consumed first; a within-threshold tie goes to the account that resets soonest. [user 2026-07-22]
 - The dev-cluster k8s validation (a PRD success criterion) is deferred to a follow-up issue, not dropped. [user 2026-07-27]
+- A run's owner can choose which of their Anthropic tokens a run spends — at run start, while parked, at the plan-approval gate, or mid-run — overriding the worker's binding for that run; an `auto` run parked on an exhausted account also fails over by itself to a pooled account with headroom, while a pinned or default choice is never moved automatically. [user, #1247]
 
 ## Feature #35 — Retry after an Anthropic usage limit
 
@@ -636,6 +637,12 @@ Tracked as GitLab issue vtmocanu/uzi#218; PRD at `prds/done/218-park-resume-work
   [user 2026-08-04]
 - When prior work genuinely cannot be recovered, the run says so in the feed rather
   than silently re-treading it. [user 2026-08-04]
+
+## Feature #1392 — Park a run on a transient forge failure at clone or fetch
+
+Tracked as GitHub issue vtmocanu/uzi#1392; PRD at `prds/1392-forge-unreachable-preclone-park.md`.
+
+- A transient forge failure (DNS/connect/5xx) at clone or fetch parks the run and auto-resumes it, rather than failing it; it fails only after a bounded number of forge parks (`RUN_FORGE_UNREACHABLE_MAX_PARKS`). A permanent forge error (401/403/404) still fails at once. [user 2026-09-15, PRD #1392]
 
 ## Feature #88 — Ask-user clarification: the agent can ask the human a question
 
@@ -782,6 +789,20 @@ Tracked as GitHub issue vtmocanu/uzi#1226 (parent epic #1225); PRD at `prds/done
 Tracked as GitHub issue vtmocanu/uzi#1265; PRD at `prds/1265-rc-release-train.md`.
 
 - Releases are cut as release candidates by default; a stable release is promoted from the candidate's own commit; surfaces meant for stable users (the Homebrew formula, the GitHub Release marked latest, the in-app update check) never surface a candidate. [user, #1265]
+
+## Feature #1349 — Recovery custody hardening
+
+Tracked as GitHub issue vtmocanu/uzi#1349; PRD at `prds/1349-recovery-custody-hardening.md`.
+
+- An owner can see retained unpublished committed work, recover an available archive, and explicitly discard one exact held source only after a warning distinguishes recoverable work from a possible only copy. [AI-synced 2026-09-14, #1349]
+
+## Feature #1390 — Api outage does not disturb a run on a still-live worker
+
+Tracked as GitHub issue vtmocanu/uzi#1390; PRD at `prds/1390-outage-requeue-readoption.md`.
+
+- An api outage does not disturb a run executing on a still-live worker: within one worker heartbeat of the api's return each such run is restored to the exact status it held (running, or waiting at its plan/question gate), without spending its re-queue budget or opening a new custody hold. [user, #1390]
+- A worker that has genuinely died still has its runs re-queued after the stale window, and failed only after a second window. [user, #1390]
+- Each worker reports which runs it is executing and in which phase, visible in `uzi worker list` / `uzi admin workers`. [user, #1390]
 
 ## Startup admin seed
 

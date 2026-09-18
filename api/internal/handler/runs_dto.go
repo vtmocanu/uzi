@@ -134,6 +134,62 @@ func decodeLatestUnmet(raw []byte) []string {
 	return summary.Unmet
 }
 
+// credentialEpochsToDTO maps a run's credential-epoch journal rows to the DTO slice
+// (PRD #1247 M1, D7), oldest generation first (the query orders them). Always returns a
+// non-nil slice ([] over null) so the wire field is never null once enriched. secret_id,
+// label and select_reason are all null-tolerant so a deleted token's history stays readable;
+// secret_id is mapped INDEPENDENTLY of label (the FK nulls the id on a delete while the
+// snapshotted label stays), exactly as runToDTO maps the run-level id/label pair.
+func credentialEpochsToDTO(rows []store.RunCredentialEpoch) []apitypes.CredentialEpochDTO {
+	out := make([]apitypes.CredentialEpochDTO, 0, len(rows))
+	for _, e := range rows {
+		dto := apitypes.CredentialEpochDTO{
+			ClaimGeneration: e.ClaimGeneration,
+			AppliedAt:       e.AppliedAt.Time,
+		}
+		if e.SecretID.Valid {
+			s := uuid.UUID(e.SecretID.Bytes).String()
+			dto.SecretID = &s
+		}
+		if e.Label.Valid {
+			l := e.Label.String
+			dto.Label = &l
+		}
+		if e.SelectReason.Valid {
+			sr := e.SelectReason.String
+			dto.SelectReason = &sr
+		}
+		out = append(out, dto)
+	}
+	return out
+}
+
+// credentialSwitchState derives RunDTO.credential_switch from the run row (PRD #1247
+// M1, D14): null when no held-state switch is pending, "released" once the release
+// transition has stamped claim_released_at at-or-after the request, else "requested".
+//
+// M4/M5 make this LIVE: SetRunCredential stamps the columns on a held-state switch, and
+// (PRD #1247 D11 fix round) every terminal transition CLEARS them, so a completed/failed/
+// cancelled run never carries a stale switch state.
+//
+// NOT YET IMPLEMENTED (deferred, issue #1422): clearing the stamp on successful APPLICATION
+// at the next epoch write (D14). Until then, after a release+reclaim (the run's
+// claim_generation has advanced PAST credential_switch_generation) this reads the stale
+// pre-reclaim state ("requested"/"released") rather than null. It is NOT a worker-signal leak
+// — PendingCredentialSwitchSignal's generation guard already returns nil there — only this
+// DTO field, and no UI renders it yet (PRD m7/m8), so it is a JSON-contract wart, not a
+// user-visible one.
+func credentialSwitchState(r store.Run) *string {
+	if !r.CredentialSwitchRequestedAt.Valid {
+		return nil
+	}
+	state := "requested"
+	if r.ClaimReleasedAt.Valid && !r.ClaimReleasedAt.Time.Before(r.CredentialSwitchRequestedAt.Time) {
+		state = "released"
+	}
+	return &state
+}
+
 // runToDTO maps a bare run row to its wire DTO. priorityClass is the D8 display class
 // (from fn_run_priority_class via a list column or h.runPriorityClass), passed in
 // explicitly so this mapper stays a PURE function of its inputs — no now()/config
@@ -142,7 +198,11 @@ func decodeLatestUnmet(raw []byte) []string {
 // (PRD #1170). extensionCapSeconds is the effective admin extension cap (PRD #1189,
 // RunExtensionCapSeconds; 0 = extending disabled) and now is the wall-clock instant used
 // for budget_used_seconds — both passed in so this mapper stays pure.
-func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, extensionCapSeconds int, now time.Time) apitypes.RunDTO {
+// forgeParkMax is the effective forge-unreachable park cap (PRD #1392 M1,
+// RUN_FORGE_UNREACHABLE_MAX_PARKS; 0 = unlimited), passed in the same way as
+// extensionCapSeconds so this mapper stays pure — no config reaches into it. It surfaces on
+// the DTO as ForgeParkMax so the forge-park pill can render "N of MAX".
+func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, extensionCapSeconds int, forgeParkMax int, now time.Time) apitypes.RunDTO {
 	dto := apitypes.RunDTO{
 		ID:               r.ID.String(),
 		Kind:             r.Kind,
@@ -219,6 +279,15 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 		RetryNotBefore:  timePtr(r.RetryNotBefore.Valid, r.RetryNotBefore.Time),
 		LimitWaitCount:  r.LimitWaitCount,
 		RateLimitType:   textPtrValue(r.RateLimitType.Valid, r.RateLimitType.String),
+		// PRD #1392 M1: the forge pre-clone park surface. RecoveryWaitCause is the typed cause
+		// (null = untyped/legacy park); RecoveryRetryNotBefore is the recovery-park promotion
+		// stamp (the recovery-park analog of RetryNotBefore, a distinct column); ForgeParkCount
+		// is the forge-only lifetime counter; ForgeParkMax is the effective cap passed in
+		// (0 = unlimited). All four surface for every run (SC5), independent of each other.
+		RecoveryWaitCause:      textPtrValue(r.RecoveryWaitCause.Valid, r.RecoveryWaitCause.String),
+		RecoveryRetryNotBefore: timePtr(r.RecoveryRetryNotBefore.Valid, r.RecoveryRetryNotBefore.Time),
+		ForgeParkCount:         int(r.ForgeParkCount),
+		ForgeParkMax:           forgeParkMax,
 		// PRD #300: the per-schedule model a schedule froze onto this run at fire time.
 		// nil (NULL column) for every run that inherited the owner's per-user default.
 		Model: textPtrValue(r.Model.Valid, r.Model.String),
@@ -281,6 +350,18 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 		v := int(r.AnthropicHeadroomPct.Int16)
 		dto.AnthropicHeadroomPct = &v
 	}
+	// PRD #1247 M1: the per-run credential override + switch state, mapped from the run
+	// row. Mapped INDEPENDENTLY (like the anthropic fields above): a run can carry an
+	// override with no pending switch and vice versa. The override Label is resolved by
+	// the GetRun enrichment path (runToDTO is pure and cannot read the token row); here it
+	// is null. CredentialEpochs is initialized to [] and filled by the same enrichment —
+	// [] over null so a client reads it unconditionally, mirroring PlanChangedFiles. Every
+	// value stays null/[] in M1 because nothing writes the override columns yet.
+	if r.CredentialOverrideMode.Valid && r.CredentialOverrideMode.String != "" {
+		dto.CredentialOverride = &apitypes.CredentialOverrideDTO{Mode: r.CredentialOverrideMode.String}
+	}
+	dto.CredentialSwitch = credentialSwitchState(r)
+	dto.CredentialEpochs = []apitypes.CredentialEpochDTO{}
 	// PRD #37. A decode error should be impossible (the API validates every write
 	// and both columns carry a jsonb_typeof CHECK); it is logged and treated as
 	// "not reported" rather than failing the read of an otherwise-fine run.

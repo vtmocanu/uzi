@@ -45,6 +45,33 @@ The pause itself also updates that credential's rate-limit meter right away, so 
 
 A run can pause and resume more than once if the limit keeps recurring, backing off between attempts, up to a cap; a second cap bounds how far out any single pause may reach. Both are operator-configured — see [Configuration](configuration.md) to change them.
 
+## Switching to a different token while parked
+
+A park driven by one token can also end on a **different** one, instead of
+waiting out the reset — two ways:
+
+- **Automatically, for an auto-select worker.** A parked run is re-checked on
+  every sweep, not only at the moment it parked: the instant another one of
+  your pooled tokens gains enough headroom, the run promotes itself back to
+  `queued` — at most once per account per sweep tick — well before
+  `retry_not_before` arrives. This only happens for a worker set to
+  [auto-select from the pool](anthropic-token.md#letting-uzi-pick-the-token-auto-selection),
+  or a run carrying a per-run `auto`
+  [override](anthropic-token.md#choosing-the-token-for-one-run). A **pinned**
+  or **default**-bound run is never promoted early this way, at park time or
+  later — switching accounts on its behalf isn't something either mode
+  decides for you, and doing it anyway would only park it again.
+- **On demand, with `uzi run set-token`.** Pick a token yourself and the run
+  resumes right away, whatever its bind mode:
+  `uzi run set-token <run-id> <label>` (or `--auto` / `--default`) promotes
+  it straight to `queued`, and the next claim spends the token you named — no
+  waiting for the window, and nothing in flight to lose (a parked run has no
+  live claim). The dead token stays excluded from that next claim, so
+  pointing the run back at the very one that just hit its limit can park it
+  again — uzi warns about that up front rather than refusing, see
+  [Claude rate limits](rate-limits.md#choosing-a-token-near-its-limit). The
+  run page's token picker does the same switch.
+
 ## If a run isn't waiting out limits
 
 A run that isn't set up to wait still fails the moment it hits a limit, the same as before — but the failure now says why, instead of a bare error: *"Anthropic usage limit (5-hour) reached; resets at 2026-07-28T02:00:00Z"*. Re-run it once that time passes, or turn on waiting so next time it doesn't have to.
@@ -88,12 +115,13 @@ window resets. `pool_wait` means an `auto`-lane worker's token pool was
 genuinely empty — there was nothing to spend at all — and it clears when you
 opt a token into the pool, or on demand with `uzi run resume-now`. See
 [Letting uzi pick the token (auto-selection)](anthropic-token.md#letting-uzi-pick-the-token-auto-selection)
-for the pooled-token wait. `recovery_wait` means a resumed turn came back
-empty (no model activity), not a limit or an empty pool at all — see
-[Recovering from an empty turn](run-recovery-wait.md).
+for the pooled-token wait. `recovery_wait` means a resumed turn hit a
+transient interruption — a positively-empty turn or a transient provider
+error — not a limit or an empty pool at all — see
+[Recovering from a transient interruption](run-recovery-wait.md).
 
 ## Not the same as pausing
 
 A `limit_wait` park (this page) happens *to* the run — a token it was spending hit its rate limit — and it resumes on its own, with a fresh clock, once the window resets. [Pausing](run-pause.md) is something the run's owner asks for, on demand, and it only ever resumes when the owner says so, handing back exactly the budget that was left rather than a fresh clock. The two can overlap: a pause requested while a run is still `running` survives a `limit_wait` park that overtakes it, and takes effect at the first boundary once the run is working again — you don't have to ask twice.
 
-Related: [Claude rate limits](rate-limits.md) · [Anthropic tokens](anthropic-token.md) · [Run health](run-health.md) · [Pausing and resuming a run](run-pause.md) · [Configuration](configuration.md) · [Slack notifications](slack.md) · [Recovering from an empty turn](run-recovery-wait.md)
+Related: [Claude rate limits](rate-limits.md) · [Anthropic tokens](anthropic-token.md) · [Run health](run-health.md) · [Pausing and resuming a run](run-pause.md) · [Configuration](configuration.md) · [Slack notifications](slack.md) · [Recovering from a transient interruption](run-recovery-wait.md)

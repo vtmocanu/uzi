@@ -289,7 +289,9 @@ func TestRunPauseQueriesLiveDB(t *testing.T) {
 		pausedOver := insertRun(t, "paused", "issue", false, true, true, 9, "", 0)
 		controlOver := insertRun(t, "running", "issue", false, true, true, 9, "", 0)
 		if _, err := q.FailRunsOfStaleWorkersOverCap(ctx, store.FailRunsOfStaleWorkersOverCapParams{
-			FailureReason: pgconvText("worker lost"), MaxRequeues: 5, Cutoff: staleCut}); err != nil {
+			// PRD #1390 M1 (D9): renamed Cutoff → FailCutoff (the two-window cutoff); staleCut still
+			// selects this stale worker, so the paused-run carve-out assertion is unchanged.
+			FailureReason: pgconvText("worker lost"), MaxRequeues: 5, FailCutoff: staleCut}); err != nil {
 			t.Fatalf("FailRunsOfStaleWorkersOverCap: %v", err)
 		}
 		if status(t, pausedOver) != "paused" {
@@ -422,7 +424,7 @@ func TestRunPauseQueriesLiveDB(t *testing.T) {
 	// PRD #1224 M2 (Decision 7): this same table now ALSO pins the milestones_agents clear.
 	// armedRunning additionally sets milestones_in_progress + milestones_agents to non-empty
 	// values and asserts milestones_agents is SET, and assertCleared additionally asserts it
-	// is NULL after the transition — so all ten terminal writers are proven to clear the
+	// is NULL after the transition — so all eleven terminal writers are proven to clear the
 	// per-milestone agent attribution beside milestones_in_progress.
 	t.Run("every terminal transition clears a pending pause", func(t *testing.T) {
 		// milestonesAgents reads the run's milestones_agents column as its ::text form, so a
@@ -435,6 +437,17 @@ func TestRunPauseQueriesLiveDB(t *testing.T) {
 			}
 			return raw
 		}
+		// PRD #1247 D11 fix round: arm + assert the held-state credential-switch clear beside the
+		// pause + milestones_agents clears, so every terminal writer settles a pending switch.
+		switchStamp := func(t *testing.T, id uuid.UUID) (pgtype.Timestamptz, pgtype.Int8) {
+			t.Helper()
+			var at pgtype.Timestamptz
+			var gen pgtype.Int8
+			if err := pool.QueryRow(ctx, `SELECT credential_switch_requested_at, credential_switch_generation FROM runs WHERE id=$1`, id).Scan(&at, &gen); err != nil {
+				t.Fatalf("read switch cols %s: %v", id, err)
+			}
+			return at, gen
+		}
 		// armedRunning inserts a running issue run under this worker carrying a pending
 		// milestone pause (after-count 2), arms a non-empty milestones_in_progress +
 		// milestones_agents beside it (PRD #1224 M2), and asserts both the pause columns and
@@ -446,11 +459,16 @@ func TestRunPauseQueriesLiveDB(t *testing.T) {
 			mustExec(ctx, t, pool,
 				`UPDATE runs SET milestones_in_progress = '["m1"]'::jsonb,
 				 milestones_agents = '[{"id":"m1","agent":"coder"}]'::jsonb WHERE id = $1`, id)
+			mustExec(ctx, t, pool,
+				`UPDATE runs SET credential_switch_requested_at = now(), credential_switch_generation = 1 WHERE id = $1`, id)
 			if at, mode, after := pauseCols(t, id); !at.Valid || mode.String != "milestone" || after.Int32 != 2 {
 				t.Fatalf("precondition: pending pause not armed (at.Valid=%v mode=%q after=%d)", at.Valid, mode.String, after.Int32)
 			}
 			if ma := milestonesAgents(t, id); !ma.Valid {
 				t.Fatalf("precondition: milestones_agents not armed (Valid=%v)", ma.Valid)
+			}
+			if at, gen := switchStamp(t, id); !at.Valid || !gen.Valid {
+				t.Fatalf("precondition: credential switch not armed (at.Valid=%v gen.Valid=%v)", at.Valid, gen.Valid)
 			}
 			return id
 		}
@@ -464,6 +482,9 @@ func TestRunPauseQueriesLiveDB(t *testing.T) {
 			}
 			if ma := milestonesAgents(t, id); ma.Valid {
 				t.Fatalf("terminal transition must clear milestones_agents (got %q)", ma.String)
+			}
+			if at, gen := switchStamp(t, id); at.Valid || gen.Valid {
+				t.Fatalf("terminal transition must clear the credential-switch columns (at.Valid=%v gen.Valid=%v)", at.Valid, gen.Valid)
 			}
 		}
 
@@ -527,7 +548,9 @@ func TestRunPauseQueriesLiveDB(t *testing.T) {
 		t.Run("FailRunsOfStaleWorkersOverCap", func(t *testing.T) {
 			id := armedRunning(t, 9 /*over cap*/, false)
 			if _, err := q.FailRunsOfStaleWorkersOverCap(ctx, store.FailRunsOfStaleWorkersOverCapParams{
-				FailureReason: pgconvText("worker lost"), MaxRequeues: 5, Cutoff: pgtype.Timestamptz{Time: nowUTC(), Valid: true}}); err != nil {
+				// PRD #1390 M1 (D9): renamed Cutoff → FailCutoff (two-window cutoff); nowUTC() still
+				// selects this stale worker so the health-clear assertion is unchanged.
+				FailureReason: pgconvText("worker lost"), MaxRequeues: 5, FailCutoff: pgtype.Timestamptz{Time: nowUTC(), Valid: true}}); err != nil {
 				t.Fatalf("FailRunsOfStaleWorkersOverCap: %v", err)
 			}
 			assertCleared(t, id, "failed")
@@ -539,6 +562,13 @@ func TestRunPauseQueriesLiveDB(t *testing.T) {
 				t.Fatalf("FailWorkerRunsOverCap: %v", err)
 			}
 			assertCleared(t, id, "failed")
+		})
+		t.Run("SupersedeRunByWorker", func(t *testing.T) {
+			id := armedRunning(t, 0, false)
+			if rows, err := q.SupersedeRunByWorker(ctx, store.SupersedeRunByWorkerParams{ID: id, WorkerID: workerID}); err != nil || rows != 1 {
+				t.Fatalf("SupersedeRunByWorker = (%d,%v), want (1,nil)", rows, err)
+			}
+			assertCleared(t, id, "cancelled")
 		})
 	})
 }

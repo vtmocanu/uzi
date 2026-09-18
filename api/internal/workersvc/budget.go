@@ -53,3 +53,11 @@ const (
 	// Lead-design default 8; operator-configurable in a later milestone.
 	custodyHoldLimit = 8
 )
+
+// CustodyHoldLimit is the exported form of the owner-admission cap above (PRD #1349 M5).
+// The owner recovery-hold API (internal/recovery, wired via internal/handler) needs the SAME
+// ceiling this package's ClaimRun/health path uses — for the aggregate's custody_hold_limit
+// field and the blocked-runs CASE — but internal/recovery must not import workersvc's private
+// constant (its docstring forbids importing this milestone's package). Exposing the one value
+// keeps both halves reading a single source rather than hardcoding 8 in two places.
+const CustodyHoldLimit = custodyHoldLimit

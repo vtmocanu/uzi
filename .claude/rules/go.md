@@ -56,7 +56,7 @@ cd api && go run github.com/sqlc-dev/sqlc/cmd/sqlc@v1.31.1 generate
 
 - goose SQL files embedded via `go:embed` and run at API boot; there is no separate migration step.
 - Number prefixes must be unique (`gate:repo`'s `check:migration-numbering`). A duplicate panics goose (`goose: duplicate version <N> detected`) at boot and in every `*LiveDB` test.
-- Numbers are assigned at merge time: renumber above the live head. Intentional gaps are fine; order is not checked.
+- Numbers are assigned at merge time: renumber above the live head (`task migration:renumber` does the git-mv and comment rewrite and reports other refs to fix by hand). Intentional gaps are fine; order is not checked.
 - Never write the literal `+goose` in a migration comment: not quoted, not in prose, not while warning someone off an annotation. goose v3.27.3 (`internal/sqlparser/parser.go`) triggers on `HasPrefix(TrimSpace(line), "--") && Contains(line, "+goose")`, so the token anywhere on a comment line makes it an annotation (`not supported: invalid annotation`).
 - Blast radius: `store.Migrate` runs at API boot, so one bad parse leaves every later migration unapplied and the live-DB sweep reads `RUN=172 PASS=0 FAIL=172`.
 - Nothing local sees it: `go build`, `go vet`, `go test -count=1 ./...` and `sqlc generate` are all green. sqlc reads this directory (`sqlc.yaml`'s `schema:`) and fails on a SQL syntax error, but is blind to annotations. CI catches it in `test:api-store-it`, so the window is one push.

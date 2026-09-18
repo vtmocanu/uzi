@@ -451,6 +451,11 @@ func (h *Handler) recoveryLimits() recovery.Limits {
 		MaxConcurrentDownloads: h.cfg.RecoveryMaxConcurrentDownloads,
 		RequestDeadline:        h.cfg.RecoveryRequestDeadline,
 		UploadRetryWindow:      h.cfg.RecoveryUploadRetryWindow,
+		// PRD #1349 M5 (D6/D10): the owner custody-hold aggregate reports the SAME admission
+		// ceiling ClaimRun/health gate on, so the board alert and `uzi run recovery` never
+		// disagree with the claim path. Sourced from workersvc's exported constant rather than
+		// hardcoded here (a constant, so int32() is a compile-time conversion).
+		CustodyHoldLimit: int32(workersvc.CustodyHoldLimit),
 	}
 }
 
@@ -885,6 +890,13 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// (foreign run → 404) and POOL_WAIT-ONLY (non-held → 409); it only flips the
 				// hold to queued, so no token spend and no forge write.
 				r.Post("/{id}/resume-now", h.ResumeRunNow)
+				// Per-run Anthropic credential switch (PRD #1247 M4, D4/D12): `uzi run
+				// set-token` re-points which token a queued or parked run spends, promoting a
+				// parked run to queued at once. RequireUser so the uzc_ CLI Bearer reaches it —
+				// NOT the cookie+CSRF RequireAuth group; a router-level auth test pins the
+				// mount. Owner-scoped in the service (foreign run → 404); a held/claimed/terminal
+				// run is a 409 (the held-state switch protocol is M5). D6 warnings ride the 200.
+				r.Post("/{id}/credential", h.SetRunCredential)
 				// Owner completion decision (PRD #1226 M5, D7 + #1227 M1): continue, partial
 				// (reduce scope) or accept (accept unmet criteria) a completion-blocked run,
 				// valid in BOTH the live awaiting_input completion-question window and the paused
@@ -921,6 +933,13 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				r.Get("/{id}/archives", h.ListRecoveryArchives)
 				r.Get("/{id}/archives/{captureID}/download", h.DownloadRecoveryArchive)
 				r.Delete("/{id}/archives/{captureID}", h.DiscardRecoveryArchive)
+				// Exact owner custody-hold DISCARD (PRD #1349 M5, D7). Same RequireUser /runs
+				// group and same strict GetRun owner-or-404 gate as the archive DELETE above, so
+				// both the web dialog and the `uzi run discard` CLI (uzc_/uza_ Bearer) reach it;
+				// admin refused. The mutating ?confirm=discard gate is validated in the handler
+				// BEFORE any SQL. This disposes a HELD SOURCE (custody), distinct from the
+				// archive-artifact DELETE above.
+				r.Delete("/{id}/recovery-holds/{holdID}", h.DiscardRecoveryHold)
 			})
 			r.Group(func(r chi.Router) {
 				r.Use(mw.RequireAuth(h.q, h.cfg))
@@ -951,6 +970,16 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 		r.Group(func(r chi.Router) {
 			r.Use(mw.RequireUser(h.q, h.cfg))
 			r.Get("/ws", h.ServeWS)
+		})
+
+		// Owner recovery custody holds — owner-wide list + aggregate (PRD #1349 M5, D7).
+		// RequireUser (session cookie OR uzc_/uza_ Bearer) so the web board/Workers surface
+		// and the `uzi run recovery` CLI both reach it, mirroring how the owner archive routes
+		// gate ownership. Owner-scoped in SQL by the caller's user id — NO run scope (this is
+		// the owner-wide list; the exact-hold DISCARD is the DELETE under /runs above).
+		r.Group(func(r chi.Router) {
+			r.Use(mw.RequireUser(h.q, h.cfg))
+			r.Get("/recovery/holds", h.ListRecoveryHolds)
 		})
 
 		h.mountChatRoutes(r, chatLimiter, forgeLimiter)
@@ -1140,6 +1169,8 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		r.Post("/runs/{id}/archives/release", h.WorkerRecoveryRelease)
 		r.Post("/runs/{id}/archives/{captureID}/upload", h.WorkerRecoveryUpload)
 		r.Get("/runs/{id}/archives/{captureID}", h.WorkerRecoveryStatus)
+		// PRD #1349 M1: the post-clone generation-exact hold inventory for this worker's run.
+		r.Get("/runs/{id}/recovery-holds", h.WorkerListRecoveryHolds)
 	})
 }
 

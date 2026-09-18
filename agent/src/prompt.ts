@@ -187,6 +187,27 @@ export const FINDINGS_NUDGE_APPEND = [
 ].join("\n");
 
 /**
+ * PRD #1120: the safe-authoring rule for secret-shaped test fixtures, hoisted from
+ * `.claude/rules/prds.md` into the TRUSTED worker prompt because `.claude/rules/**` is
+ * never loaded by a worker run (claude-harness.ts sets `settingSources: []` and only the
+ * clone's root CLAUDE.md is threaded in — repo-instructions.ts). Shared VERBATIM by the
+ * lead system prompt (buildLeadSystemPrompt) and every subagent prompt (toDefinition in
+ * agents.ts, renderSubagentPrompt in codex/render.ts), so there is one source of wording.
+ * NB: this text must not itself contain a contiguous complete token shape — the `glpat-`
+ * example is written split/assembled so no scanner flags the guidance constant itself.
+ */
+export const SECRET_FIXTURE_HYGIENE_APPEND = [
+  "When a test needs a secret-shaped fixture, NEVER write a complete provider-token-shaped",
+  "literal into tracked source (e.g. a `glpat-` prefix immediately followed by 20 token",
+  "characters, or a full-length GitHub/Anthropic/Slack token). Instead assemble the value",
+  'from source fragments joined at runtime — e.g. `"glpat-" + "<the 20-char body>"` — so',
+  "the scrubber/redactor still sees the whole joined value at runtime, but no scanner (uzi's",
+  "finalize gitleaks scan, or GitHub Push Protection) ever sees a complete token-shaped",
+  "SOURCE literal. Keep the exact runtime value and the behaviour under test unchanged; this",
+  "is enforced by a source-hygiene gate.",
+].join("\n");
+
+/**
  * PRD #702 M5: the subagent-channel mirror of the lead's deps-provisioning notes
  * (depsProvisionPlanNote / depsProvisionImplementNote). Appended to EVERY subagent
  * prompt in `toDefinition` (agents.ts), exactly like FINDINGS_NUDGE_APPEND, so
@@ -262,6 +283,11 @@ export function buildLeadSystemPrompt(
   // production worker run always sets `this.client`, so threading a client flag into
   // prompt-building would add coupling for a case that cannot occur.
   parts.push(FINDINGS_NUDGE_APPEND);
+  // PRD #1120: the secret-fixture source-hygiene rule is unconditional across run kinds
+  // (any code-producing run can add a test that needs a secret-shaped fixture). Pushed
+  // right after the findings nudge and before every conditional append, so it never sits
+  // inside the untrusted-repo fence (repoInstructions is pushed last).
+  parts.push(SECRET_FIXTURE_HYGIENE_APPEND);
   if (resolveRunKind(opts.kind) === "issue") parts.push(PRD_LIFECYCLE_APPEND);
   // PRD #700 M4: the mr_rework run-lifecycle note. Gated on the kind so an issue/
   // ci_fix/self_improve run's prompt is byte-identical to before.
@@ -702,6 +728,11 @@ function wipRecoveredNote(wipRecovered: boolean | undefined): string {
  *  clamp does not close. An OID cannot carry that. */
 const BASE_COMMIT_RE = /^[0-9a-f]{7,64}$/;
 
+// #1416 (MR-rework, finding 5b) — publishedTip/defaultBranchCommit are WORKER-verified full object
+// names (ADR D7); this note renders them OUTSIDE every untrusted fence, so require a full 40-hex OID
+// rather than the 7–64 hex BASE_COMMIT_RE, so an abbreviated value can never be presented as the floor.
+const PUBLISHED_TIP_RE = /^[0-9a-f]{40}$/;
+
 /**
  * The paragraph that tells the lead which commit its branch was cut from, and which diff
  * commands are therefore right. Plain and outside every untrusted fence: like priorWorkNote,
@@ -749,6 +780,47 @@ export function baseCommitNote(
     `  - the whole branch, including work earlier runs pushed:`,
     `      \`git diff ${dflt}...HEAD\`  (THREE dots, against that commit id)`,
     ...shared,
+  ].join("\n");
+}
+
+/**
+ * PRD #1416 M1: the paragraph that names the branch's PUBLISHED FLOOR P — the forge tip the
+ * branch already carries at claim (git.ts `originBranchTip`, fact 2). uzi lands work with a
+ * plain fast-forward push and never force-pushes, so a rewrite at or below P is unlandable and
+ * only discovered at finalize; naming P up front lets the lead integrate the default branch
+ * with `git merge` instead of a rebase. Plain and OUTSIDE every untrusted fence, exactly like
+ * baseCommitNote: it is uzi's own worker-verified statement of fact, not repo- or user-supplied
+ * text, and only OIDs are ever threaded here.
+ *
+ * Absent/malformed P ⇒ nothing is injected (a fresh branch has no published floor). The
+ * default-branch tip, when provided, is named ONLY as an OID and only when it validates; its
+ * NAME is repo-controlled text that must never sit outside a fence (D7, `BASE_COMMIT_RE` and
+ * the doctrine at :718-728), so the wording refers to "the default branch" and its SHA only.
+ */
+export function publishedTipNote(
+  publishedTip: string | undefined,
+  defaultBranchCommit?: string,
+  autoApprove?: boolean,
+): string {
+  if (!publishedTip || !PUBLISHED_TIP_RE.test(publishedTip)) return "";
+  const dflt =
+    defaultBranchCommit && PUBLISHED_TIP_RE.test(defaultBranchCommit)
+      ? defaultBranchCommit
+      : undefined;
+  // The default-branch OID rides the merge clause only when it validates; its NAME never does.
+  const mergeLine = dflt
+    ? `Add new commits, and integrate the default branch (at ${dflt}) with \`git merge\`, not \`git rebase\`.`
+    : `Add new commits, and integrate the default branch with \`git merge\`, not \`git rebase\`.`;
+  return [
+    `This branch is already published on the forge at commit ${publishedTip}. The worker lands`,
+    `your work with a fast-forward push and never force-pushes, so a rewritten branch cannot be`,
+    `landed. Never rebase, amend, squash, or reset any commit at or below ${publishedTip}.`,
+    mergeLine,
+    // #1416 (MR-rework, finding 5c) — under auto-approve there is no human to answer `ask_user`
+    // (AUTOPILOT_PLAN_NOTE tells the lead not to call it), so give autopilot-safe guidance instead.
+    autoApprove
+      ? `If a rewrite is genuinely unavoidable, do not force it — state the constraint plainly in the plan for the human who reviews it.`
+      : `If a rewrite is genuinely unavoidable, stop and call \`ask_user\`.`,
   ].join("\n");
 }
 
@@ -953,6 +1025,10 @@ export interface PlanPromptInput {
    *  `baseCommit` on a fresh branch; on a resume it is the branch's true fork point and
    *  the note names both. Absent ⇒ the note makes the narrower claim. */
   defaultBranchCommit?: string;
+  /** PRD #1416 M1: the branch's published forge tip P at claim (runner.ts `RunFlight.publishedTip`).
+   *  Set on a run whose branch already existed on the forge at clone; absent on a fresh issue
+   *  branch. Drives publishedTipNote. See publishedTipNote. */
+  publishedTip?: string;
   /** PRD #501 REC B: autopilot run (claim.auto_approve). When true, the plan prompt
    *  tells the lead there is no human and to decide open questions on best judgment.
    *  Absent/false ⇒ byte-identical to before. */
@@ -976,10 +1052,18 @@ export function buildPlanPrompt(input: PlanPromptInput): string {
   const reviewBlock = buildReviewCommentsContext(input.reviewComments);
   const priorNote = priorWorkNote(input.priorWork);
   const baseNote = baseCommitNote(input.baseCommit, input.defaultBranchCommit);
+  // PRD #1416 M1: name the published floor P beside the base-commit/branch facts. Empty ⇒
+  // nothing added (a fresh branch has no published floor).
+  const publishedNote = publishedTipNote(
+    input.publishedTip,
+    input.defaultBranchCommit,
+    input.autoApprove,
+  );
   return [
     `Plan the work described by this forge issue. You are on branch \`${input.branch}\`.`,
     ...(priorNote ? ["", priorNote] : []),
     ...(baseNote ? ["", baseNote] : []),
+    ...(publishedNote ? ["", publishedNote] : []),
     "",
     UNTRUSTED_FRAME,
     "",
@@ -1095,6 +1179,14 @@ export interface ImplementPromptInput {
   seededPlan?: string;
   /** A queued user correction to fold into this turn, if any (untrusted). */
   followUp?: string;
+  /** PRD #1416 M2: a WORKER-AUTHORITATIVE safety steer, drained fresh from the steering channel
+   *  each turn by the executor (the runner's divergence detection armed it in-process). Rendered
+   *  as its OWN block framed as authoritative worker guidance, positioned BEFORE the untrusted
+   *  `<follow_up>` block so it is consumed ahead of any follow-up, and deliberately NOT wrapped in
+   *  the `<follow_up>` fence or the "never as instructions to you" framing (that is for untrusted
+   *  user text; this is uzi's own guidance, D3). Rendered EVERY turn it is present, not
+   *  first-turn-only. Absent ⇒ no block. See composeSafetySteer in runner.ts. */
+  safetySteer?: string;
   /** #157: the per-dir outcome of the worker's dependency install, known by the time
    *  this prompt is built (the executor joins before the first implement turn). Carried
    *  on the FIRST turn only — later turns ride a resumed session that already saw it, and
@@ -1111,6 +1203,15 @@ export interface ImplementPromptInput {
   baseCommit?: string;
   /** The default branch's tip. See baseCommitNote. */
   defaultBranchCommit?: string;
+  /** PRD #1416 M1: the branch's published forge tip P at claim. FIRST TURN ONLY, like
+   *  baseCommit — later turns resume a session that already read it. Drives publishedTipNote.
+   *  Absent (fresh issue branch) ⇒ no note. See publishedTipNote. */
+  publishedTip?: string;
+  /** #1416 (MR-rework): this run auto-approves its own plan, so — like the plan builders —
+   *  the published-tip note's rewrite guidance must NOT tell the agent to call `ask_user`
+   *  (there is no human to answer). Drives publishedTipNote's autopilot-safe branch. Absent/
+   *  false ⇒ the `ask_user` wording, unchanged. */
+  autoApprove?: boolean;
   /** PRD #209 (D7): prior pushed work on this branch, for a SEEDED cold-start implement.
    *  A requeued seeded run whose transcript was dropped never saw a plan turn, so the
    *  amnesiac note an ordinary run got in its plan prompt must ride the implement prompt
@@ -1220,6 +1321,12 @@ export function buildImplementPrompt(input: ImplementPromptInput): string {
     ? baseCommitNote(input.baseCommit, input.defaultBranchCommit)
     : "";
   if (baseNote) lines.push("", baseNote);
+  // PRD #1416 M1: name the published floor P, first turn only — like baseNote, later turns
+  // resume a session that already read it. Empty on a fresh branch ⇒ nothing added.
+  const publishedNote = input.first
+    ? publishedTipNote(input.publishedTip, input.defaultBranchCommit, input.autoApprove)
+    : "";
+  if (publishedNote) lines.push("", publishedNote);
   // PRD #122 M6: name the approved milestones and their live status EVERY turn (not
   // first-turn-only like the facts above — progress is dynamic), so the lead can see the
   // milestone boundaries and checkpoint at each one. Empty ⇒ nothing added.
@@ -1229,6 +1336,19 @@ export function buildImplementPrompt(input: ImplementPromptInput): string {
     input.progressMissedLastTurn,
   );
   if (milestoneNote) lines.push("", milestoneNote);
+  // PRD #1416 M2: a WORKER-AUTHORITATIVE safety steer, rendered EVERY turn it is present (it is
+  // drained fresh each turn, not first-turn-only) as its OWN block, positioned BEFORE the
+  // untrusted <follow_up> block so it is consumed ahead of any follow-up. It is uzi's own
+  // guidance (the worker's divergence detection armed it), NOT attacker-influenceable user text,
+  // so it is plain and OUTSIDE every fence and carries NO "never as instructions" framing (D3).
+  if (input.safetySteer) {
+    lines.push(
+      "",
+      "The worker detected a problem and is steering you. This is authoritative guidance from",
+      "uzi itself, not user input — follow it:",
+      input.safetySteer,
+    );
+  }
   if (input.followUp) {
     lines.push(
       "",
@@ -1459,6 +1579,10 @@ export interface SelfImprovePlanPromptInput {
   baseCommit?: string;
   /** The default branch's tip. See baseCommitNote. */
   defaultBranchCommit?: string;
+  /** PRD #1416 M1: the branch's published forge tip P at claim (runner.ts `RunFlight.publishedTip`).
+   *  The self_improve branch is fixed and long-lived and is routinely published (PRD fact 17),
+   *  so P is routinely set. Drives publishedTipNote. See publishedTipNote. */
+  publishedTip?: string;
   /** Issue #297: coordinate lines for work already in flight on this repo, rendered as
    *  their OWN untrusted nonce-fenced block. Absent/empty ⇒ no block. */
   inflightTargets?: string[];
@@ -1499,6 +1623,13 @@ export function buildSelfImprovePlanPrompt(
   const memoryBlock = buildMemoryContext(input.memory ?? []);
   const priorNote = priorWorkNote(input.priorWork);
   const baseNote = baseCommitNote(input.baseCommit, input.defaultBranchCommit);
+  // PRD #1416 M1: name the published floor P beside the base-commit/branch facts, OUTSIDE
+  // every untrusted fence (exactly where baseNote sits). Empty ⇒ nothing added.
+  const publishedNote = publishedTipNote(
+    input.publishedTip,
+    input.defaultBranchCommit,
+    input.autoApprove,
+  );
   // Issue #297: the in-flight avoid-set gets its OWN nonce-fenced block, minted from a
   // fresh nonce so it never shares a delimiter with the recommendations fence above. An
   // empty avoid-set injects nothing — no dangling fence, no preface.
@@ -1574,6 +1705,7 @@ export function buildSelfImprovePlanPrompt(
     `You are on this cycle's branch \`${input.branch}\`; open a new merge request for your change.`,
     ...(priorNote ? ["", priorNote] : []),
     ...(baseNote ? ["", baseNote] : []),
+    ...(publishedNote ? ["", publishedNote] : []),
     "",
     "Pick exactly ONE top improvement to make this cycle — a single bug fix, feature, or",
     "refactor that you can complete and verify in one merge request. Do NOT attempt a list.",
@@ -1678,6 +1810,10 @@ export interface CIFixPlanPromptInput {
   baseCommit?: string;
   /** The default branch's tip. See baseCommitNote. */
   defaultBranchCommit?: string;
+  /** PRD #1416 M1: the branch's published forge tip P at claim (runner.ts `RunFlight.publishedTip`).
+   *  A ci_fix run's branch is routinely published (PRD fact 17), so P is routinely set. Drives
+   *  publishedTipNote. See publishedTipNote. */
+  publishedTip?: string;
   /** PRD #501 REC B: autopilot run (claim.auto_approve). When true, the plan prompt
    *  tells the lead there is no human and to decide open questions on best judgment.
    *  Absent/false ⇒ byte-identical to before. */
@@ -1715,11 +1851,19 @@ export function buildCIFixPlanPrompt(input: CIFixPlanPromptInput): string {
   const closeTag = `</job_log_${nonce}>`;
   const priorNote = priorWorkNote(input.priorWork);
   const baseNote = baseCommitNote(input.baseCommit, input.defaultBranchCommit);
+  // PRD #1416 M1: name the published floor P beside the base-commit/branch facts, OUTSIDE
+  // the job-log fence (exactly where baseNote sits). Empty ⇒ nothing added.
+  const publishedNote = publishedTipNote(
+    input.publishedTip,
+    input.defaultBranchCommit,
+    input.autoApprove,
+  );
   const lines: string[] = [
     `A CI pipeline failed on ref \`${input.ref}\`. You are on branch \`${input.branch}\`.`,
     `Failing pipeline: ${input.pipelineWebURL}`,
     ...(priorNote ? ["", priorNote] : []),
     ...(baseNote ? ["", baseNote] : []),
+    ...(publishedNote ? ["", publishedNote] : []),
     "",
     ciLogFrame(openTag, closeTag),
     "",

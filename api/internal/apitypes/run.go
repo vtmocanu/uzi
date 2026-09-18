@@ -342,6 +342,11 @@ type RunDTO struct {
 	// `uzi run stop` of an interactive task run, null for every other run. It — not the
 	// failure_reason text — is what clients read.
 	//
+	// Later values widen this set: "scope_capped" (PRD #634) and "scope_reduced" (PRD #1227)
+	// are completed-status scope dispositions, and "branch_moved" (issue #1117) is a
+	// cancelled-status disposition for an mr_rework rework whose finalize push was superseded
+	// by a concurrent same-branch writer (a non-fast-forward push rejection).
+	//
 	// A "stopped" run's happy path lands `completed` (the worker finalizes — push + MR iff
 	// open_mr — and reports completed); on the edge where that finalize throws (or a
 	// cancel-then-stop let the cancel win) the worker reports `failed` and the server routes
@@ -488,9 +493,11 @@ type RunDTO struct {
 	// are different questions — and PRD #104's compatibility path creates a row
 	// labelled literally `default`, so the label is not even a reliable hint.
 	//
-	// One of eight server-generated values (autoselect.Reason, closed by migration
-	// 00089's CHECK): default, pinned, judge, auto, best_of_pool, pool_empty,
-	// pool_stale, open_failed. Null for a run claimed before M1.
+	// One of ten server-generated values (autoselect.Reason, closed by migration
+	// 00089's CHECK as widened by 00233): default, pinned, judge, auto, best_of_pool,
+	// pool_empty, pool_stale, open_failed, run_pinned, run_default.
+	// run_pinned/run_default are the per-run credential override reasons (PRD #1247).
+	// Null for a run claimed before M1.
 	//
 	// A CLOSED SERVER ENUM, not free text: it describes the OWNER'S OWN configuration
 	// and can carry no cross-tenant content, which is why it rides this DTO under the
@@ -587,6 +594,32 @@ type RunDTO struct {
 	// it: the vocabulary is the SDK's and a newer server can ship a member this
 	// client has not heard of. Same rule as AnthropicSelectReason above.
 	RateLimitType *string `json:"rate_limit_type"`
+	// RecoveryWaitCause is the TYPED cause of a 'recovery_wait' park (PRD #1392 M1). Null is
+	// the LEGACY/untyped park — the empty-turn park writes NULL (D9), so a client must render
+	// null as the generic "waiting to retry" wording, NOT as any particular cause. Today the
+	// only non-null value is "forge_unreachable" (the forge stayed unreachable at clone);
+	// "empty_turn"/"provider_outage" are reserved. Clients render an unrecognised value
+	// honestly (a newer server may ship a cause this client has not heard of), the same rule
+	// as RateLimitType.
+	RecoveryWaitCause *string `json:"recovery_wait_cause"`
+	// RecoveryRetryNotBefore is when the server will promote a 'recovery_wait' run back to
+	// queued — the retry stamp the forge-park surface counts down to ("retry at HH:MM"). It is
+	// the recovery-park analog of RetryNotBefore (the usage-limit park's stamp) and is a
+	// SEPARATE column: a run parks on at most one of the two at a time, but they never share a
+	// field. Null for a run that has never recovery-parked. Surfaced for EVERY recovery cause,
+	// not just the forge one (SC5).
+	RecoveryRetryNotBefore *time.Time `json:"recovery_retry_not_before"`
+	// ForgeParkCount is how many times this run has forge-parked in its lifetime (PRD #1392
+	// M1), the FORGE-ONLY counter the cap decides on — distinct from the backoff-shaping
+	// recovery_wait_count. 0 for a run that has never forge-parked (including every empty-turn
+	// park, which never touches it, SC5). Rendered as the "N" in "N of MAX".
+	ForgeParkCount int `json:"forge_park_count"`
+	// ForgeParkMax is the EFFECTIVE forge-park cap (RUN_FORGE_UNREACHABLE_MAX_PARKS),
+	// server-computed from config and surfaced so the pill can render "N of MAX". 0 means
+	// UNLIMITED (the cap is disabled) — render it as "unlimited", never as a real ceiling of
+	// zero. It is one server constant, but unlike LimitWaitCount's cap it IS on the row because
+	// the forge wording ("N of MAX") needs the denominator inline.
+	ForgeParkMax int `json:"forge_park_max"`
 	// Model is the model frozen onto the run at fire time by the schedule that created it
 	// (PRD #300): nil means the run inherited the owner's per-user Worker default. Surfaced
 	// read-only so a scheduled run's model is confirmable.
@@ -630,6 +663,57 @@ type RunDTO struct {
 	// path and both list builders) from a batched per-page lookup, not in runToDTO
 	// itself, which stays a pure function of its row.
 	CurrentActivity *RunActivity `json:"current_activity"`
+	// Per-run Anthropic credential override + attribution journal (PRD #1247 M1). All
+	// three are back-compat by construction: a run with no override reads
+	// credential_override == null and credential_switch == null, and a run claimed before
+	// M1 (or never claimed) reads credential_epochs == [].
+	//
+	// CredentialOverride is the run's per-run token choice: null = inherit the worker
+	// binding (today's behaviour), else {mode, label}. Mode is one of pinned/auto/default;
+	// Label is the snapshotted token name for a pinned override (null for auto/default,
+	// or when the token was deleted). Populated from the run row + an owner-scoped label
+	// lookup in the DTO builder's enrichment path.
+	CredentialOverride *CredentialOverrideDTO `json:"credential_override"`
+	// CredentialSwitch is the state of a pending held-state switch (PRD #1247, D14):
+	// null (none pending) | "requested" (stamped, not yet released) | "released"
+	// (released, awaiting reclaim). Distinct from CredentialOverride, which is the choice;
+	// this is the in-flight transition. Always null in M1 (nothing stamps it until M4/M5).
+	CredentialSwitch *string `json:"credential_switch"`
+	// CredentialEpochs is the applied-switch history (D7): one entry per claim, oldest
+	// generation first, each naming the token that claim spent and why. Never omitempty —
+	// [] over null — so a client reads it unconditionally. Populated from
+	// run_credential_epochs in the DTO builder's enrichment path.
+	CredentialEpochs []CredentialEpochDTO `json:"credential_epochs"`
+}
+
+// CredentialOverrideDTO is a run's or schedule's per-run credential override (PRD #1247
+// M1): the mode the owner chose and, for a pinned override, the token label. It is the
+// null-when-absent shape on both RunDTO and ScheduleDTO.
+type CredentialOverrideDTO struct {
+	// Mode is one of "pinned" | "auto" | "default" (migration 00233's CHECK). A client
+	// must render an unrecognised value honestly — the API is deployed separately.
+	Mode string `json:"mode"`
+	// Label is the token name for a pinned override, snapshotted for readability after a
+	// rename/delete; null for auto/default or when no label is resolvable.
+	Label *string `json:"label"`
+}
+
+// CredentialEpochDTO is one claim's credential attribution (PRD #1247 M1, D7): the
+// generation, the token it spent (secret_id + label + select_reason, all null-tolerant so a
+// deleted token's history stays readable), and when it was applied. ClaimGeneration is int64
+// — every generation on the wire is int64, mirroring runs.claim_generation.
+//
+// SecretID is the STABLE switch key: a label can be renamed and reused after a delete, so a
+// consumer deciding whether the token actually changed keys on secret_id, not the label.
+// Nullable — the FK nulls it when the token is deleted, exactly as RunDTO.AnthropicSecretID
+// does, so a historical epoch legitimately carries a label with no id. Owner-or-admin scoped
+// like the rest of this DTO, so exposing the per-epoch id here is consistent with that field.
+type CredentialEpochDTO struct {
+	ClaimGeneration int64     `json:"claim_generation"`
+	SecretID        *string   `json:"secret_id"`
+	Label           *string   `json:"label"`
+	SelectReason    *string   `json:"select_reason"`
+	AppliedAt       time.Time `json:"applied_at"`
 }
 
 // RunListItemDTO is a run row for the Runs index and the admin Agents-status

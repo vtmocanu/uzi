@@ -302,6 +302,7 @@ func (r *fakeCodexRows) Scan(dest ...any) error                       { return r
 func (r *fakeCodexRows) Values() ([]any, error)                       { return nil, nil }
 func (r *fakeCodexRows) RawValues() [][]byte                          { return nil }
 func (r *fakeCodexRows) Conn() *pgx.Conn                              { return nil }
+func (r *fakeCodexRows) TypeMap() *pgtype.Map                         { return pgtype.NewMap() }
 
 // newCodexHandler wires a Handler over a fake store and a real (nil-vault) box, so the
 // non-vault seal path is exercised exactly as the anthropic leak test does.

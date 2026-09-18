@@ -156,6 +156,10 @@
   "retry_not_before": "2020-01-02T03:04:05Z",
   "limit_wait_count": 1,
   "rate_limit_type": "x",
+  "recovery_wait_cause": "x",
+  "recovery_retry_not_before": "2020-01-02T03:04:05Z",
+  "forge_park_count": 1,
+  "forge_park_max": 1,
   "model": "x",
   "override_subagent_model": true,
   "priority": "x",
@@ -177,6 +181,20 @@
     "at": "2020-01-02T03:04:05Z",
     "seq": 1
   },
+  "credential_override": {
+    "mode": "x",
+    "label": "x"
+  },
+  "credential_switch": "x",
+  "credential_epochs": [
+    {
+      "claim_generation": 1,
+      "secret_id": "x",
+      "label": "x",
+      "select_reason": "x",
+      "applied_at": "2020-01-02T03:04:05Z"
+    }
+  ],
   "repo_path": "x",
   "worker_name": "x",
   "owner_email": "x",

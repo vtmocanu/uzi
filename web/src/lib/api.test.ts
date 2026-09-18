@@ -114,3 +114,53 @@ describe("listRuns passive-poll header (#331)", () => {
     expect(headers["X-Uzi-Passive"]).toBeUndefined();
   });
 });
+
+// PRD #1349 M5/M6 (D7/D9): the exact custody-hold discard REQUIRES the ?confirm=discard query
+// value — the server fail-fasts a missing or different value with a 400 BEFORE any SQL, so the
+// client must always carry it. This pins the REQUEST the client builds so a future edit that
+// drops the query (or renames the value) reddens a web test rather than silently 400ing.
+describe("discardHold carries ?confirm=discard (PRD #1349)", () => {
+  it("issues a DELETE to the run's recovery-hold path with confirm=discard", async () => {
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) =>
+      fakeResponse(200, { discarded: true }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    // request() reads the CSRF cookie for non-GET methods; this file runs in the node env
+    // (no jsdom document), so provide a minimal cookie source. cleaned up by afterEach's
+    // vi.unstubAllGlobals().
+    vi.stubGlobal("document", { cookie: "" });
+
+    await api.discardHold("run-1", "hold-1");
+
+    const url = fetchMock.mock.calls[0][0] as string;
+    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    expect(init.method).toBe("DELETE");
+    expect(url).toContain("/api/runs/run-1/recovery-holds/hold-1");
+    const qs = new URLSearchParams(url.split("?")[1] ?? "");
+    expect(qs.get("confirm")).toBe("discard");
+  });
+});
+
+// PRD #1371 (AC #4): getRecoveryHolds bounds the read to ?state=open so the listing carries
+// only still-open holds (released/discarded are excluded). The server validates state as
+// absent|open; the web always sends open. This pins the REQUEST the client builds so a future
+// edit that drops the query reddens a web test rather than silently widening the read.
+describe("getRecoveryHolds bounds the read to ?state=open (PRD #1371)", () => {
+  it("issues a GET to the recovery holds path with state=open", async () => {
+    const emptyHolds = {
+      aggregate: { open_holds: 0, custody_hold_limit: 8, decision_needed: 0, blocked_runs: 0 },
+      holds: [],
+    };
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) =>
+      fakeResponse(200, emptyHolds),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.getRecoveryHolds();
+
+    const url = fetchMock.mock.calls[0][0] as string;
+    expect(url).toContain("/api/recovery/holds");
+    const qs = new URLSearchParams(url.split("?")[1] ?? "");
+    expect(qs.get("state")).toBe("open");
+  });
+});

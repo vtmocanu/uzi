@@ -19,6 +19,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -148,8 +149,8 @@ func TestAppendMessagesDropsASubThresholdStreakWhenTheRunLeavesRunning(t *testin
 	// which side of the threshold a worker OOM lands on is close to a coin flip;
 	// half that population landed here.
 	//
-	// Register's RequeueWorkerRuns returns no ids, so it can never have a Sweep-style
-	// hook. Closing it at the RECORDER retires the class instead of adding a fourth
+	// Register's requeue path wires no eviction hook, so it can never have one.
+	// Closing it at the RECORDER retires the class instead of adding a fourth
 	// path-specific patch — and costs nothing, since appendMessages already read the
 	// run row.
 	w := worker()
@@ -498,19 +499,21 @@ func (f *persistFakeStore) GetRunForgeConnForWorker(context.Context, store.GetRu
 	return store.GetRunForgeConnForWorkerRow{}, nil
 }
 
-func (f *persistFakeStore) InsertRunMessage(_ context.Context, arg store.InsertRunMessageParams) (int64, error) {
+func (f *persistFakeStore) InsertRunMessage(_ context.Context, arg store.InsertRunMessageParams) (store.InsertRunMessageRow, error) {
 	if f.poisonSeq != 0 && arg.Seq >= f.poisonSeq {
-		return 0, f.insertErr
+		return store.InsertRunMessageRow{}, f.insertErr
 	}
 	f.inserts++
 	if f.stored == nil {
 		f.stored = map[int32]bool{}
 	}
+	live := store.InsertRunMessageRow{GenerationLive: pgtype.Bool{Bool: true, Valid: true}}
 	if f.stored[arg.Seq] {
-		return 0, nil // ON CONFLICT DO NOTHING — stored is stored
+		return live, nil // ON CONFLICT DO NOTHING — stored is stored (a live-generation duplicate)
 	}
 	f.stored[arg.Seq] = true
-	return 1, nil
+	live.Inserted = true
+	return live, nil
 }
 
 func (f *persistFakeStore) UpdateRunLastSeq(_ context.Context, arg store.UpdateRunLastSeqParams) (int64, error) {

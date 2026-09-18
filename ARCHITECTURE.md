@@ -476,7 +476,15 @@ owner's default token (recorded `pool_empty`) rather than holding in
 `pool_wait` as the run lane does, because a held retrospective carries no
 issue, no branch and nobody's attention, and would silently pile up. Because
 the token rides the claim rather than the worker, re-pointing a worker is
-complete server-side — no restart, no re-minted join token.
+complete server-side — no restart, no re-minted join token. Since PRD #1247
+`claimSecretID` also consults, ahead of the worker's own bind mode, a
+per-run (or per-schedule) credential override the owner can set or change at
+any time — queued, parked, at the plan gate, or mid-run — and a mid-run
+switch never rewrites a live claim in place: it reuses the same custody
+`runs.claim_generation` (below) plus a new `claim_released_at` fence to force
+the switch to cross an actual claim boundary, so the run always resumes with
+the new token rather than swapping it out from under a running turn; see
+[adr/1247-per-run-token-selection.md](adr/1247-per-run-token-selection.md).
 
 Since PRD #111 the bind mode is three-valued — `default`, `pinned` or `auto`
 — and `auto` ranks the owner's opted-in tokens by rate-limit headroom
@@ -675,9 +683,23 @@ chain in the diagram above, with no intervening `running`.
   transient-recovery park primitive: any
   transient cause can report `recovery_wait` and reuse the same
   preserve→park→promote→reclaim lifecycle, so issue #1088's provider-error
-  classifier can adopt it without a competing mechanism. See
-  [adr/1197-transient-recovery-park.md](adr/1197-transient-recovery-park.md)
-  and [docs/run-recovery-wait.md](docs/run-recovery-wait.md).
+  classifier can adopt it without a competing mechanism. PRD #1349 narrows the
+  routing at the boundary: a positively empty turn whose **final latest-wins
+  rate-limit verdict is `rejected`** (that same attempt hit a hard usage limit
+  and produced no model work) routes to `limit_wait` instead — respecting
+  `wait_on_limit`, so it fails fast rather than cycling here when limit-waiting
+  is off. An earlier `rejected` later followed by `allowed`, or any empty turn
+  from another cause, still parks here. `recovery_wait` also covers a
+  **pre-clone forge-unreachable park** (issue #1392): a transient forge
+  failure at clone or fetch parks here too, cause `forge_unreachable`, capped
+  by `RUN_FORGE_UNREACHABLE_MAX_PARKS` (unlike the empty-turn cause, which has
+  no lifetime cap). See
+  [adr/1197-transient-recovery-park.md](adr/1197-transient-recovery-park.md),
+  [adr/1296-durable-run-recovery.md](adr/1296-durable-run-recovery.md) (the
+  2026-09-14 PRD #1349 amendment),
+  [adr/1392-forge-unreachable-preclone-park.md](adr/1392-forge-unreachable-preclone-park.md)
+  and
+  [docs/run-recovery-wait.md](docs/run-recovery-wait.md).
 
 - **running ⇄ awaiting_followup** (PRD #517, `uzi handoff --interactive`) — a
   clean `signal_done` on an interactive task parks the run awaiting the
@@ -926,9 +948,25 @@ chain in the diagram above, with no intervening `running`.
   `recovery_wait` transient park above: that mechanism resumes a live,
   still-running turn from a local checkpoint, while this one preserves a
   run's original commits across a `failed` finalization and the worker's
-  eventual teardown. See [docs/run-recovery.md](docs/run-recovery.md),
-  [PRD #1296](prds/1296-durable-run-recovery.md) and
-  [adr/1296-durable-run-recovery.md](adr/1296-durable-run-recovery.md).
+  eventual teardown. A **claim-scoped custody hold** (`recovery_custody_holds`,
+  H-free, opened in the same `ClaimRun` transaction) reserves owner-scoped
+  admission capacity and blocks the worker's teardown while the work is
+  unpublished; the **archive capture** (`recovery_captures`) is the later,
+  immutable, encrypted artifact bound to that hold. PRD #1349 hardens the
+  lifecycle: reserve/release now key on the **exact `runs.claim_generation`**
+  (a v2 worker advertises `recovery_archive_v2`; an ambiguous/older case
+  retains rather than guessing), the agent dispositions custody by exact
+  generation on graceful-park and early-terminal paths (provably-empty →
+  release, committed → generation-bound capture, unverifiable → retain), and
+  owners can list retained holds and discard one exact held source
+  (`GET /api/recovery/holds` + aggregate; `uzi run recovery` /
+  `uzi run discard`; a Dashboard board alert and Workers resolution surface),
+  with the per-run custody Slack nudge coalesced into one owner-level
+  blocked-custody episode DM. See [docs/run-recovery.md](docs/run-recovery.md),
+  [PRD #1296](prds/1296-durable-run-recovery.md),
+  [PRD #1349](prds/1349-recovery-custody-hardening.md) and
+  [adr/1296-durable-run-recovery.md](adr/1296-durable-run-recovery.md) (with
+  its 2026-09-14 PRD #1349 amendment).
 - **Milestone tracker reconciliation** (PRD #122/#265/#390) — a milestone-structured
   `issue` run shows a *reported-complete* tracker (`runs.milestones_completed`,
   monotone union, never "verified"), fed by mid-run `report_progress` and the lead's
@@ -956,9 +994,18 @@ chain in the diagram above, with no intervening `running`.
   5 minutes is re-queued; a running run older than `RUN_TIMEOUT` (default 2h)
   is failed; a worker whose heartbeat is stale past `WORKER_HEARTBEAT_STALE`
   (default 45s) is marked offline and its non-terminal runs re-queued,
-  incrementing `requeue_count` — past `RUN_MAX_REQUEUES` (default 1) a run is
-  failed instead of re-queued again. An orphan sweep also runs once at API
-  boot, so a run left dangling by a server restart is not stuck forever.
+  incrementing `requeue_count` — only after a *second* consecutive stale
+  window is the run failed instead of re-queued again, giving a worker that
+  briefly lost the api time to return (issue #1390). An orphan sweep also
+  runs once at API boot, but its three stale-worker passes (offline-marking,
+  over-cap fail, re-queue) are held off for `SWEEPER_BOOT_GRACE` (default 60s)
+  after the api's listeners are ready — every other boot pass runs as usual —
+  so a worker that only lost the api — not its own health — is not wrongly
+  declared dead; on its next
+  heartbeat, a worker's reported active-run snapshot re-adopts any run the
+  outage flipped to `queued` back to its exact phase, with no re-queue
+  budget spent and no new custody hold (issue #1390). `uzi worker list` and
+  `uzi admin workers` show each worker's reported runs and their phase.
 - **Cancel/reject with no live poller** (a `queued` run, or one whose worker
   has gone stale) is transitioned straight to `cancelled`/`failed`
   server-side rather than waiting on a `GET /api/worker/runs/:id/inputs` poll
@@ -1138,7 +1185,7 @@ A worker is untrusted input on `/api/worker/runs/:id/messages` and `/state`, exa
 
 413 is never a poison verdict, and "no 413" is not proof of being under the cap (`MaxBytesReader` fires on the read, not the decoded value).
 
-**A second poison-pill class, closed the same way.** `run_usage`'s primary key `(run_id, session_id, model)` (`00062_run_usage.sql`) has both `session_id` and `model` worker-controlled. `foldRunUsage` caps both at 200 runes before the upsert, because an over-long value overflows a btree index entry (2704 bytes) and raises `54000`, outside the enumerated permanent set. Truncating (never rejecting) is safe because both are a grouping key, and a collision is absorbed by the idempotent `GREATEST` merge that makes at-least-once delivery converge.
+**A second poison-pill class, closed the same way.** `run_usage`'s primary key `(run_id, session_id, model, lineage_epoch)` (`00188_run_usage_leg_key.sql`) has both `session_id` and `model` worker-controlled. `foldRunUsage` caps both at 200 runes before the upsert, because an over-long value overflows a btree index entry (2704 bytes) and raises `54000`, outside the enumerated permanent set. Truncating (never rejecting) is safe because both are a grouping key: a collision within one executor leg is absorbed by its idempotent `GREATEST` merge, while `run_usage_totals` takes the per-model maximum within each lineage epoch and sums distinct epochs.
 
 **How a batch is bounded, split, and bisected.** `agent/src/batcher.ts` caps a flush at `MAX_BATCH_BYTES` (512 KiB, a soft grouping target) and tombstones any single message over `MAX_MESSAGE_BYTES` (900 KiB) at `emit()` time. A 413 splits the batch in half and **resets** the failure streak (a legitimate split is progress). A 400 with more than one message left triggers **bisection**, isolating the single poisoned message in `ceil(log2 n)` posts, backstopped at `MAX_BISECT_POSTS` (24). The isolated message is **tombstoned, not dropped**: it is re-posted under its original `seq` as a worker-minted `status` marker (`{"event":"message_dropped",...}`), because `web/src/lib/runStream.ts` requires seq contiguity and a real gap would freeze the live view. Only a *rejected* tombstone is a true drop; it is idempotent and carries the full attribution triple (`agent`/`agent_instance`/`agent_label`) so the loss renders in the subagent lane it happened in.
 

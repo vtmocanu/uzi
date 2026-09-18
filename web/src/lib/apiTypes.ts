@@ -1398,6 +1398,11 @@ export interface Schedule {
   // fired (or a parked/transient fire left the prior summary — or none — in place, since
   // only the success/benign advance path persists).
   last_fire: LastFire | null;
+  /** PRD #1247 M1 (D5): the schedule's per-run credential override. null = inherit (the
+   *  fired run follows the worker binding), else the {mode, label} a fired run stamps onto
+   *  itself. Twin of Run.credential_override; null for every schedule until M6 wires it.
+   *  OPTIONAL for the same api/web rollout skew as Run.credential_override. */
+  credential_override?: CredentialOverride | null;
   auto_approve: boolean;
   wait_on_limit: boolean;
   /** PRD #841: per-schedule MR-review-rework override, tri-state. null = inherit (the
@@ -1571,6 +1576,12 @@ export interface ScheduleInput {
   // list omits it), mirroring RepoID's create-vs-PATCH asymmetry. `interface Schedule`
   // carries the read-side `sibling_group_id` (M3) separately; this is the write-side input.
   sibling_group_id?: string;
+  // PRD #1247 M6/M7: the schedule's per-run Anthropic credential override (D5). The
+  // write shape is {mode, secret_id?}, distinct from the read-side `Schedule.credential_override`
+  // ({mode,label}). Request-presence semantics: OMIT the field to leave the stored override
+  // unchanged (seed-and-keep on PATCH); send {mode:"inherit"} to clear it; a pinned mode
+  // carries secret_id. The server 409s any explicit override on a self_improve lane.
+  credential_override?: { mode: string; secret_id?: string } | null;
 }
 
 // SchedulePreviewInput asks for a live "next fires" preview from a timing spec
@@ -1585,6 +1596,16 @@ export interface SchedulePreviewInput {
 }
 
 // ── Agent runtime (PRD #4) ────────────────────────────────────────────────
+
+/** One entry of a worker's reported active-run snapshot (PRD #1390 M2c): a run the worker
+ *  says it is executing, with the phase it sees it in and the exact generation it was
+ *  claimed at. phase is a closed server enum (running | awaiting_approval | awaiting_input |
+ *  awaiting_followup). Nested in Worker.reported_runs. */
+export interface WorkerReportedRun {
+  run_id: string;
+  phase: string;
+  claim_generation: number;
+}
 
 export interface Worker {
   id: string;
@@ -1621,6 +1642,17 @@ export interface Worker {
   // "N/M runs" saturation badge (workerRunBadge in lib/workerRuns.ts).
   active_runs: number;
   max_concurrent_runs: number | null;
+  // reported_runs (PRD #1390 M2c): what this worker SAYS it is executing, from its latest
+  // active-run snapshot — one entry per run, each with the phase the worker sees it in and the
+  // generation it was claimed at. The api ALWAYS sends the key: the list/patch handlers overlay
+  // it from the DB and the DTO builders seed it to [], so a worker the snapshot table has no row
+  // for arrives as []. Distinct from active_runs (a bare count off run rows) — this is the
+  // worker's own report, so the two can differ (e.g. during an api outage it rode out). Optional
+  // in TS (`?`), exactly like the outbox_* overlay fields below and retaining_unpublished_work
+  // above: it is a handler-overlaid field a mock or older payload may omit, so `?` lets those
+  // literals compile while the wire contract stays a never-null array (pinned by the api-contract
+  // parity check against the recorded fixtures).
+  reported_runs?: WorkerReportedRun[];
   // retaining_unpublished_work (PRD #1296 M4): true when the worker holds an OPEN
   // durable-recovery custody hold (unpublished committed work not yet archived), so
   // teardown is deferred. Distinct from busy/active_runs — it consumes no run slot.
@@ -1727,6 +1759,29 @@ export interface Worker {
    *  default. The API applies that rule before answering, so "pinned" here always
    *  has an id beside it and no client needs to re-derive it. */
   anthropic_bind_mode: BindMode;
+  // Outbox depth this worker last reported on its heartbeat (PRD #1391 M5), summed
+  // across the runs it holds. All null until the worker reports a non-empty outbox
+  // (and re-nulled on the next empty report, when the backlog has drained) — the api
+  // overlays them from an in-process, restart-losing tracker, never from the DB, the
+  // same "null until reported, last-known otherwise" contract as the stats_ fields.
+  //
+  // outbox_pending_messages is the count of message frames buffered on the worker
+  // waiting to replay to the api (the visible symptom of an api outage the worker rode
+  // out). outbox_pending_terminal is the count of write-ahead terminal outcomes still
+  // to send (always 0 in Run A — terminal journaling is Run B). outbox_stale_retired
+  // counts frames a re-claim forced the worker to retire locally (D11). outbox_blocked
+  // is the oldest permanent-refusal reason across the worker's runs (never set in Run
+  // A; forward-compat for Run B), or null when nothing is blocked.
+  //
+  // Optional in TS (`?`), exactly like retaining_unpublished_work above and for the
+  // same reason: the api ALWAYS sends these keys (overlaid to null when the worker has
+  // no tracked depth), but they are overlay fields a mock or an older payload may omit,
+  // so `?` lets those literals compile while the wire contract stays `X | null`. The
+  // api-contract parity check pins the null/value shape against the recorded fixtures.
+  outbox_pending_messages?: number | null;
+  outbox_pending_terminal?: number | null;
+  outbox_stale_retired?: number | null;
+  outbox_blocked?: string | null;
 }
 
 /** The closed set of worker bind modes (PRD #111 M3), mirroring the server's CHECK. */
@@ -1819,13 +1874,19 @@ export type RunStatus =
 // directive truncated. PRD #1227 M2: "scope_reduced" is stamped on a completed run whose
 // owner `partial` decision deferred part of its frozen scope. Both land
 // status="completed" (green success), so — like "stopped" — neither is a HUMAN_STOP_KIND.
+// Issue #1117: "branch_moved" is stamped on an mr_rework run whose finalize push was
+// rejected non-fast-forward because a concurrent same-branch writer advanced the MR branch
+// under it (a benign, expected race, not an agent failure). It lands status="cancelled", so
+// isStoppedRun already renders it calm regardless of stop_kind — it is NOT a HUMAN_STOP_KIND
+// (those govern the status="failed" case only).
 export type StopKind =
   | "cancelled"
   | "plan_rejected"
   | "auto_stopped"
   | "stopped"
   | "scope_capped"
-  | "scope_reduced";
+  | "scope_reduced"
+  | "branch_moved";
 
 // RunHealth is the server-side run-health flag (PRD #47): a non-terminal,
 // self-clearing signal that a run looks stuck, looping, or close to its timeout. "ok"
@@ -2235,6 +2296,31 @@ export interface Run {
    *  vocabulary is the SDK's and a newer server can ship a member this build has not
    *  heard of. Null for a run that has never parked. */
   rate_limit_type: string | null;
+  /** PRD #1392 M1: the TYPED cause of a `recovery_wait` park. Null is the LEGACY/untyped
+   *  park — the empty-turn park (#1197) writes null, so render null as the generic
+   *  "waiting to recover" wording, NOT as any particular cause. Today the only non-null
+   *  value is "forge_unreachable" (the forge stayed unreachable at clone);
+   *  "empty_turn"/"provider_outage" are reserved. Render an unrecognised value honestly (a
+   *  newer server may ship a cause this build has not heard of), the same rule as
+   *  rate_limit_type. */
+  recovery_wait_cause: string | null;
+  /** PRD #1392 M1: when the server will promote a `recovery_wait` run back to queued — the
+   *  retry stamp the forge-park surface counts down to ("retry at HH:MM"). The
+   *  recovery-park analog of retry_not_before (the usage-limit park's stamp) and a SEPARATE
+   *  field: a run parks on at most one of the two at a time. Null for a run that has never
+   *  recovery-parked. ISO-8601 string, like every other timestamp on this type. */
+  recovery_retry_not_before: string | null;
+  /** PRD #1392 M1: how many times this run has forge-parked in its lifetime — the
+   *  FORGE-ONLY counter the cap decides on. 0 for a run that has never forge-parked
+   *  (including every empty-turn park, which never touches it). Rendered as the "N" in
+   *  "N of MAX". */
+  forge_park_count: number;
+  /** PRD #1392 M1: the EFFECTIVE forge-park cap (RUN_FORGE_UNREACHABLE_MAX_PARKS),
+   *  server-computed and surfaced so the pill can render "N of MAX". 0 means UNLIMITED (the
+   *  cap is disabled) — render it as "unlimited", never as a real ceiling of zero. Unlike
+   *  limit_wait_count's cap it IS on the row because the forge wording ("N of MAX") needs
+   *  the denominator inline. */
+  forge_park_max: number;
   /** PRD #84 M4: the run's inferred/hinted scheduling requirements, surfaced RAW so the
    *  web derives the plan-gate readiness display from them plus the assigned worker's
    *  capabilities (there is no server-computed "capability_block" field — the 409 the
@@ -2370,6 +2456,42 @@ export interface Run {
    *  never <Markdown> or a URL sink. OPTIONAL here for the SAME api/web rollout skew as
    *  plan_source (a mid-deploy api pod predating the field omits the key). */
   current_activity?: RunActivity | null;
+  /** PRD #1247 M1: the per-run Anthropic credential override + attribution journal.
+   *  credential_override is null = inherit the worker binding (today's behaviour), else the
+   *  {mode, label} the owner chose. credential_switch is the pending held-state switch:
+   *  null | "requested" | "released". credential_epochs is the applied-switch history, one
+   *  entry per claim, oldest first — [] over null via the DTO builder (mapper-normalized, so
+   *  its null zero fixture is exempted in the contract test). All three read null/[] for a run
+   *  with no override and for a pre-feature run. OPTIONAL for the same api/web rollout
+   *  skew as current_activity/plan_changed_files: a mid-deploy api pod predating #1247
+   *  omits the keys. credential_epochs is normalized to [] by runToDTO (mapper never-null),
+   *  so its zero fixture null is exempted in the contract test like plan_changed_files. */
+  credential_override?: CredentialOverride | null;
+  credential_switch?: string | null;
+  credential_epochs?: CredentialEpoch[];
+}
+
+/** CredentialOverride is a run's or schedule's per-run credential choice (PRD #1247 M1):
+ *  mode is "pinned" | "auto" | "default", label is the pinned token's snapshotted name
+ *  (null for auto/default or a deleted token). Rendered null-when-absent on Run and
+ *  Schedule. */
+export interface CredentialOverride {
+  mode: string;
+  label: string | null;
+}
+
+/** CredentialEpoch is one claim's credential attribution (PRD #1247 M1, D7): the
+ *  generation, the token it spent (secret_id + label + select_reason, all null-tolerant for
+ *  a deleted token's history), and when it was applied. claim_generation is a plain JSON
+ *  number (int64 on the wire). secret_id is the STABLE switch key (a label can be renamed
+ *  and reused, so switch detection keys on the id, not the label); null when the token was
+ *  deleted. */
+export interface CredentialEpoch {
+  claim_generation: number;
+  secret_id: string | null;
+  label: string | null;
+  select_reason: string | null;
+  applied_at: string;
 }
 
 // RunActivity is the server-derived "now" line for a run (PRD #1064 D3): who is acting,
@@ -2552,7 +2674,9 @@ export type SelectReason =
   | "best_of_pool"
   | "pool_empty"
   | "pool_stale"
-  | "open_failed";
+  | "open_failed"
+  | "run_pinned"
+  | "run_default";
 
 export type AutoStatus =
   | "eligible"
@@ -3492,4 +3616,46 @@ export interface RecoveryArchiveSummary {
   has_open_hold: boolean;
   counts: RecoveryArchiveStateCounts;
   archives: RecoveryArchive[];
+}
+
+// ── Owner-facing custody holds (PRD #1349 M1) ─────────────────────────────────
+// The owner-visible custody-hold surface the Workers view and `uzi run recovery` render.
+// The Go source is api/internal/apitypes/recovery.go; the api-contract fixtures pin the two
+// in lockstep. Raw provenance (original_worker_identity) never appears here (D7) — only the
+// opaque worker_id and a bounded worker_name.
+
+// RecoveryCustodyHold is one owner-visible custody hold. attention is a SERVER-DERIVED
+// action/attention state DISTINCT from state (its vocabulary: active | capturing |
+// archive_ready | needs_action | source_only | released | discarded); M4/M5 compute it and
+// M1 leaves it "". worker_name/capture_state are absent when empty; released_at is absent
+// while the hold is open. has_available_capture is true when a ready archive covers the hold.
+export interface RecoveryCustodyHold {
+  id: string;
+  run_id: string;
+  generation: number;
+  state: string;
+  attention: string;
+  worker_id: string;
+  worker_name?: string;
+  has_available_capture: boolean;
+  capture_state?: string;
+  created_at: string;
+  updated_at: string;
+  released_at?: string;
+}
+
+// RecoveryCustodyAggregate is the owner-level custody summary the board alert and the
+// one-per-episode Slack DM read. All four counts are always present (0 is meaningful).
+export interface RecoveryCustodyAggregate {
+  open_holds: number;
+  custody_hold_limit: number;
+  decision_needed: number;
+  blocked_runs: number;
+}
+
+// RecoveryCustodyHolds is the owner GET /api/recovery/holds response (M5 populates the
+// endpoint; the shape is frozen in M1). holds is ALWAYS an array on the wire, never null.
+export interface RecoveryCustodyHolds {
+  aggregate: RecoveryCustodyAggregate;
+  holds: RecoveryCustodyHold[];
 }

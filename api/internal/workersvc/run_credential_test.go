@@ -84,7 +84,7 @@ func onlyRecord(t *testing.T, fs *fakeStore) store.SetRunAnthropicSecretParams {
 func TestClaimRecordsOwnerDefaultCredential(t *testing.T) {
 	f := newClaimFixture(t)
 
-	payload, err := f.svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: f.owner})
+	payload, err := f.svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: f.owner}, nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -136,7 +136,7 @@ func TestClaimRecordsWorkerBoundCredential(t *testing.T) {
 		AnthropicSecretID: pgtype.UUID{Bytes: f.consoleID, Valid: true},
 	}
 
-	if _, err := f.svc.Claim(context.Background(), wkr); err != nil {
+	if _, err := f.svc.Claim(context.Background(), wkr, nil); err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
 
@@ -173,7 +173,7 @@ func TestClaimRecordsNothingWhenOpenFails(t *testing.T) {
 		AnthropicSecretID: pgtype.UUID{Bytes: uuid.New(), Valid: true},
 	}
 
-	payload, err := f.svc.Claim(context.Background(), wkr)
+	payload, err := f.svc.Claim(context.Background(), wkr, nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -198,7 +198,7 @@ func TestTokenlessUserKeepsItsFailureText(t *testing.T) {
 	f := newClaimFixture(t)
 	f.fs.anthropicErr = pgx.ErrNoRows // no default row at all
 
-	payload, err := f.svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: f.owner})
+	payload, err := f.svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: f.owner}, nil)
 	if err != nil {
 		t.Fatalf("Claim returned an error instead of failing the run: %v", err)
 	}
@@ -230,7 +230,7 @@ func TestDefaultDeletedBetweenResolveAndOpen(t *testing.T) {
 	f := newClaimFixture(t)
 	f.fs.defaultCiphertextErr = pgx.ErrNoRows // resolve succeeded, the open finds nothing
 
-	payload, err := f.svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: f.owner})
+	payload, err := f.svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: f.owner}, nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -254,7 +254,7 @@ func TestRecordFailureFailsTheClaim(t *testing.T) {
 	f := newClaimFixture(t)
 	f.fs.recordCredErr = errors.New("boom")
 
-	_, err := f.svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: f.owner})
+	_, err := f.svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: f.owner}, nil)
 	if err == nil {
 		t.Fatal("a failed credential record must fail the claim, not deliver an unattributable payload")
 	}
@@ -272,7 +272,7 @@ func TestRecordVanishedRunDropsTheClaim(t *testing.T) {
 	var zero int64
 	f.fs.recordCredRows = &zero
 
-	payload, err := f.svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: f.owner})
+	payload, err := f.svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: f.owner}, nil)
 	if err != nil {
 		t.Fatalf("a vanished run must be dropped, not surfaced as an error: %v", err)
 	}
@@ -308,7 +308,7 @@ func TestJudgeClaimRecordsItsBinding(t *testing.T) {
 	}
 	svc := New(fs, box, testParams())
 
-	if _, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: owner}); err != nil {
+	if _, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: owner}, nil); err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
 	rec := onlyRecord(t, fs)

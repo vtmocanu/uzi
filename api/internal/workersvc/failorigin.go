@@ -53,9 +53,27 @@ var failOrigins = []string{
 	"finalize_base_align_conflict",
 	// issue #974: a GitHub run whose push carries a secret is rejected by GitHub Push
 	// Protection / GH013. The worker PREDICTS it with a pre-push gitleaks scan and also
-	// PARSES the remote reject, failing typed with the diff preserved instead of a raw
-	// `remote rejected` (worker-reportable — see workerReportableFailOrigins).
+	// PARSES the remote reject, failing typed WITHOUT a preserved diff (it may carry the
+	// detected secret; the committed work stays recoverable from the run branch/PVC) instead
+	// of a raw `remote rejected` (worker-reportable — see workerReportableFailOrigins).
 	"push_secret_blocked",
+	// PRD #1392 M1: a run whose forge stayed unreachable at CLONE past
+	// RUN_FORGE_UNREACHABLE_MAX_PARKS parks. SERVER-DERIVED, NOT worker-reportable (it is
+	// stamped directly inside SetState's forge-park transaction, so it is deliberately absent
+	// from workerReportableFailOrigins) — a worker reporting it is a forgery CoerceFailOrigin
+	// drops. Excluded from the judge (neverJudgeFailOrigins, judge_enqueue.go) REGARDLESS of
+	// iteration_count: a forge cap-fail is server-derived, never a real agent defect, and on a
+	// resumed run it carries iteration_count > 0, so the skip cannot be gated on == 0 (SC3).
+	"forge_unreachable",
+	// PRD #1416 M4: a run on a PUBLISHED branch whose history was rewritten below the
+	// published floor P, where the ancestry bridge B (tree == H, P and H both ancestors)
+	// could not be built or validated, so finalize cannot fast-forward and fails typed with
+	// preserved_patch on both push paths instead of finalize_base_align_conflict or the
+	// generic catch (SC3). WORKER-REPORTABLE (see workerReportableFailOrigins): the worker
+	// detects the un-bridgeable divergence at finalize. It is an AGENT DEFECT (the agent
+	// rewrote published history against the steer), so it is JUDGE-ELIGIBLE — deliberately
+	// absent from BOTH preStartInfraFailOrigins and neverJudgeFailOrigins (judge_enqueue.go).
+	"history_rewritten",
 }
 
 // failOriginSet is the lookup form. Built once; failOrigins stays the declaration so
@@ -92,8 +110,11 @@ func AllFailOrigins() []string {
 // (PRD #456: the finalize base-align merge AND rebase both conflict, so the worker
 // aborts and preserves the diff), and push_secret_blocked (issue #974: the finalize
 // pre-push gitleaks range scan finds a secret, or the push is rejected by GitHub Push
-// Protection / GH013, so the worker fails typed and preserves the diff); agent_failure
-// is included because it is the judgeable
+// Protection / GH013, so the worker fails typed WITHOUT a preserved diff — it may carry
+// the detected secret), and history_rewritten (PRD #1416 M4: the worker cannot build or
+// validate the ancestry bridge for a published branch whose history was rewritten below the
+// published floor, so finalize fails typed with the preserved diff instead of the generic
+// catch); agent_failure is included because it is the judgeable
 // default the `failed` arm applies anyway, so an explicit worker agent_failure is
 // harmless and semantically correct. The partition (worker-reportable + server-only ==
 // vocabulary) is pinned by TestCoerceFailOrigin.
@@ -105,6 +126,9 @@ var workerReportableFailOrigins = map[string]bool{
 	"workflow_scope_missing":       true,
 	"finalize_base_align_conflict": true,
 	"push_secret_blocked":          true,
+	// PRD #1416 M4: the worker detects an un-bridgeable published-history rewrite at
+	// finalize and reports it typed with preserved_patch (judge-eligible; see failOrigins).
+	"history_rewritten": true,
 }
 
 // CoerceFailOrigin maps a worker-reported fail_origin onto the WORKER-REPORTABLE subset.

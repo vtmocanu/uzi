@@ -6,10 +6,12 @@ import { existsSync } from "node:fs";
 
 import type { Options as SdkOptions } from "@anthropic-ai/claude-agent-sdk";
 
-import { runReadOnlyModelPass, type ReadOnlyModelPassOpts } from "../src/model-pass.js";
+import { runReadOnlyModelPass, safeReportFailed, type ReadOnlyModelPassOpts } from "../src/model-pass.js";
 import { classifyLimitFailure, LimitReachedError, type RateLimitObservation } from "../src/limit.js";
 import { mapSdkMessage } from "../src/sdk-messages.js";
 import type { SdkQueryFn } from "../src/sdk-executor.js";
+import type { WorkerClient } from "../src/client.js";
+import type { StateRequest } from "../src/protocol.js";
 import { nullLogger } from "./helpers.js";
 
 // A queryFn that records the `options` object the helper built, then yields a scripted
@@ -54,6 +56,58 @@ const rejectedRateLimit = (resetsAtMs: number) => ({
   rate_limit_info: { status: "rejected", resetsAt: resetsAtMs, rateLimitType: "five_hour" },
   uuid: "u",
   session_id: "s",
+});
+
+// PRD #1247 M2 fix round: safeReportFailed threads the run-lane claim generation onto the
+// failed advice report so a credential_switch_v1 capability worker's judge/review failure is
+// fenced (not 409'd) by the server's per-query generation fence. It must stamp BOTH failed
+// body shapes — the LimitReachedError shape and the default failure_reason shape — and leave
+// the field undefined (dropped on the wire) when no generation is supplied.
+describe("safeReportFailed — claim_generation stamping (PRD #1247 M2)", () => {
+  function recordingClient() {
+    const bodies: StateRequest[] = [];
+    const client = {
+      reportState: async (_id: string, body: StateRequest) => {
+        bodies.push(body);
+        return {} as never;
+      },
+    } as unknown as Pick<WorkerClient, "reportState">;
+    return { client, bodies };
+  }
+
+  it("stamps claim_generation on the default failure_reason body shape when supplied", async () => {
+    const { client, bodies } = recordingClient();
+    await safeReportFailed(client, nullLogger(), "review", "r1", "boom", undefined, 7);
+    assert.equal(bodies.length, 1);
+    assert.equal(bodies[0]?.status, "failed");
+    assert.equal(bodies[0]?.failure_reason, "boom");
+    assert.equal(bodies[0]?.claim_generation, 7, "the generation is stamped on the failure_reason shape");
+  });
+
+  it("stamps claim_generation on the LimitReachedError body shape when supplied", async () => {
+    const { client, bodies } = recordingClient();
+    const cause = new LimitReachedError({ rateLimitType: "five_hour", resetsAtMs: 123 });
+    await safeReportFailed(client, nullLogger(), "judge", "j1", "ignored on the limit path", cause, 5);
+    assert.equal(bodies.length, 1);
+    assert.equal(bodies[0]?.status, "failed");
+    assert.equal(bodies[0]?.rate_limit_type, "five_hour");
+    assert.equal(bodies[0]?.limit_resets_at, 123);
+    assert.equal(bodies[0]?.claim_generation, 5, "the generation is stamped on the limit shape");
+    // The limit shape composes the sentence server-side from the structured facts, so it must
+    // NOT smuggle a failure_reason — the generation stamp does not disturb that (PRD #35 D8).
+    assert.ok(!("failure_reason" in (bodies[0] as object)), "the limit shape omits failure_reason");
+  });
+
+  it("leaves claim_generation undefined (dropped on the wire) when none is supplied", async () => {
+    const { client, bodies } = recordingClient();
+    await safeReportFailed(client, nullLogger(), "review", "r2", "boom");
+    assert.equal(bodies.length, 1);
+    assert.equal(
+      bodies[0]?.claim_generation,
+      undefined,
+      "no generation supplied ⇒ the field is undefined and JSON.stringify drops it",
+    );
+  });
 });
 
 describe("runReadOnlyModelPass — isolation-shape characterization pin", () => {

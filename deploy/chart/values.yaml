@@ -110,6 +110,66 @@ releaseCheck:
   #   api.secretEnv:
   #     UZI_RELEASE_CHECK_TOKEN: UZI_RELEASE_CHECK_TOKEN
 
+# A cluster-scoped PriorityClass for the app tier (api, web, controller). When enabled,
+# the chart creates the PriorityClass AND stamps its name onto the api/web/controller
+# pods, so uzi's control plane outranks lower-priority pods for scheduling and kubelet
+# node-pressure eviction. This exists so the control plane is not the first thing evicted
+# or left unschedulable under node memory pressure (the hosted worker fleet reserves a
+# large share of node memory; see workers.priorityClass and worker memory presets).
+#
+# 🔴 CLUSTER-SCOPED: `name` must be unique cluster-wide across ALL PriorityClasses.
+# On a SHARED cluster, confirm/tune `value` with the cluster owner before deploying —
+# a higher value wins eviction/scheduling contests against other tenants' pods, and with
+# PreemptLowerPriority it evicts them to get scheduled. To gain eviction survival +
+# scheduling priority WITHOUT preempting other tenants' already-running pods, set
+# `preemptionPolicy: Never` (but then a full cluster leaves the app tier Pending).
+appPriorityClass:
+  enabled: true
+  # Cluster-scoped, so the name must be unique across ALL PriorityClasses in the cluster.
+  # Empty ⇒ the chart derives `<release>-app`, release-unique so two uzi releases in one
+  # cluster do not collide over this object.
+  name: ""
+  # 1001: ABOVE workers.priorityClass.value (1000) by design, so a hosted worker can
+  # never evict or preempt uzi's own control plane on a full node (a worker is
+  # disposable and its run requeues; an evicted api takes every run down with it), and
+  # BELOW dbPriorityClass (1002), the one thing the api itself depends on. Operator-
+  # tunable. 🔴 IMMUTABLE on a live PriorityClass: changing it means the object is
+  # deleted and recreated (the template carries Force=true,Replace=true so ArgoCD does that
+  # itself; running pods keep their recorded priority through the swap).
+  value: 1001
+  # PreemptLowerPriority (the k8s default, set explicitly): when an app-tier pod cannot be
+  # scheduled for lack of room, the scheduler evicts lower-priority pods to place it. That
+  # is what lets the control plane recover on a full cluster. Set `Never` for the polite
+  # shared-cluster option (eviction survival only, no scheduling-time preemption).
+  preemptionPolicy: PreemptLowerPriority
+
+# The database-tier PriorityClass for the chart-managed CNPG Cluster (postgres.*). Rendered
+# only when BOTH this and postgres.enabled are true. The CNPG subchart stamps
+# postgres.cluster.priorityClassName onto its instance pods; this block creates the class
+# that name points at. Why the DB needs one at all: ArgoCD gates the whole release's sync
+# on the CNPG Cluster reporting healthy, so a single Pending replica under node memory
+# pressure blocks every api/web/controller update until it schedules.
+#
+# 🔴 CLUSTER-SCOPED, and the name is PAIRED BY HAND with postgres.cluster.priorityClassName
+# (Helm cannot template a subchart's values). The db-priorityclass template FAILS the render
+# when the two differ. On a release not named `uzi`, set `name` here and the same literal
+# under postgres.cluster.priorityClassName. Shared-cluster caveats as for appPriorityClass.
+dbPriorityClass:
+  enabled: true
+  # Empty ⇒ the chart derives `<release>-db` (release-unique). Must equal
+  # postgres.cluster.priorityClassName; the default there assumes the release is `uzi`.
+  name: ""
+  # 1002: the HIGHEST uzi class, above appPriorityClass (1001) and workers.priorityClass
+  # (1000) by design: an evicted Postgres instance takes the api and every run down with
+  # it, so nothing of uzi's may preempt it, and a Pending replica may reclaim room from
+  # a worker or the app tier. 🔴 IMMUTABLE on a live PriorityClass: a change means
+  # delete-and-recreate (the template carries Force=true,Replace=true so ArgoCD does that
+  # itself; running pods keep their recorded priority through the swap).
+  value: 1002
+  # PreemptLowerPriority so an unschedulable replica reclaims room on a full cluster; set
+  # `Never` for eviction survival without scheduling-time preemption.
+  preemptionPolicy: PreemptLowerPriority
+
 # --- api: the Go backend (sole holder of secrets/keys, the DB client) -----------
 api:
   enabled: true
@@ -492,7 +552,7 @@ workers:
     # so the fleet rolls as its workers finish their runs. It must be concrete: the
     # controller-deployment template wraps it in `required`, so a blank tag fails the
     # render loudly rather than shipping an empty image reference.
-    tag: "0.83.0-rc.1"
+    tag: "0.83.0-rc.6"
   # The Harbor pull secret IN THE WORKER NAMESPACE. It cannot be the release
   # namespace's copy: a ServiceAccount's imagePullSecrets can only name a Secret in
   # its OWN namespace. Empty = no pull secret (the KinD smoke, where the agent image
@@ -1243,6 +1303,10 @@ postgres:
     # Cluster-specific (a private registry mirror) -> set in deploy/values/<cluster>.yaml.
     imageName: ""
     imagePullSecrets: []
+    # The PriorityClass the subchart stamps onto every instance pod. Must equal the name
+    # dbPriorityClass renders (`<release>-db`; this default assumes release `uzi`), or the
+    # render fails. Leave empty only with dbPriorityClass.enabled=false.
+    priorityClassName: uzi-db
     storage:
       size: 5Gi
       storageClass: ""        # per-cluster (e.g. standard)

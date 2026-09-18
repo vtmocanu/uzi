@@ -33,7 +33,7 @@ func TestJudgeClaimUserModelOverridesInstance(t *testing.T) {
 	svc := New(fs, box, testParams())
 	svc.SetSettings(fakeSettings{enabled: true, model: "haiku"})
 
-	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid})
+	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid}, nil)
 	if err != nil || payload == nil {
 		t.Fatalf("Claim: payload=%v err=%v", payload, err)
 	}
@@ -56,7 +56,7 @@ func TestJudgeClaimNullUserModelInheritsInstance(t *testing.T) {
 	svc := New(fs, box, testParams())
 	svc.SetSettings(fakeSettings{enabled: true, model: "haiku"})
 
-	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid})
+	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid}, nil)
 	if err != nil || payload == nil {
 		t.Fatalf("Claim: payload=%v err=%v", payload, err)
 	}
@@ -79,7 +79,7 @@ func TestJudgeClaimBlankUserModelInheritsInstance(t *testing.T) {
 	svc := New(fs, box, testParams())
 	svc.SetSettings(fakeSettings{enabled: true, model: "haiku"})
 
-	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid})
+	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid}, nil)
 	if err != nil || payload == nil {
 		t.Fatalf("Claim: payload=%v err=%v", payload, err)
 	}
@@ -103,7 +103,7 @@ func TestJudgeClaimUserModelReadErrorFallsBackToInstance(t *testing.T) {
 	svc := New(fs, box, testParams())
 	svc.SetSettings(fakeSettings{enabled: true, model: "haiku"})
 
-	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid})
+	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid}, nil)
 	if err != nil {
 		t.Fatalf("Claim must not fail on a user judge-model read error: %v", err)
 	}
@@ -134,7 +134,7 @@ func TestJudgeClaimNullDefaultEffortUsesUziDefault(t *testing.T) {
 	svc := New(fs, box, testParams())
 	svc.SetSettings(fakeSettings{enabled: true, model: "haiku"})
 
-	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid})
+	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid}, nil)
 	if err != nil || payload == nil {
 		t.Fatalf("Claim: payload=%v err=%v", payload, err)
 	}
@@ -164,7 +164,7 @@ func TestJudgeClaimExplicitDefaultEffortIsCarried(t *testing.T) {
 	svc := New(fs, box, testParams())
 	svc.SetSettings(fakeSettings{enabled: true, model: "haiku"})
 
-	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid})
+	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid}, nil)
 	if err != nil || payload == nil {
 		t.Fatalf("Claim: payload=%v err=%v", payload, err)
 	}
@@ -188,7 +188,7 @@ func TestJudgeClaimDefaultEffortReadErrorFallsBackToXhigh(t *testing.T) {
 	svc := New(fs, box, testParams())
 	svc.SetSettings(fakeSettings{enabled: true, model: "haiku"})
 
-	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid})
+	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid}, nil)
 	if err != nil {
 		t.Fatalf("Claim must not fail on a user default-effort read error: %v", err)
 	}

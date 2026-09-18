@@ -2,6 +2,7 @@ import type { WorkerClient } from "./client.js";
 import { RequestError, isTransient } from "./client.js";
 import type { Logger } from "./log.js";
 import type { EmittedMessage } from "./executor.js";
+import type { Outbox } from "./outbox.js";
 import type { OutgoingMessage } from "./protocol.js";
 import type { PayloadRedactor, TextRedactor } from "./redact.js";
 import { emptyCounts, countsTotal, sanitizePayload, sanitizeText } from "./sanitize.js";
@@ -44,6 +45,11 @@ export const MAX_BACKOFF_MS = 30_000;
 
 /** ±20%, so a fleet of workers that all broke at once does not retry in lockstep. */
 const BACKOFF_JITTER = 0.2;
+
+/** PRD #1391 M2: rearm materialises the in-memory dropped-range as network tombstones
+ *  one bounded chunk at a time (never the whole range at once — a long outage can make
+ *  it arbitrarily wide). Matches the outbox drainer's OUTBOX_DRAIN_CHUNK. */
+const REARM_TOMBSTONE_CHUNK = 500;
 
 /** `{"messages":[]}` plus a little slack for a future top-level field. */
 const FRAMING_BYTES = 32;
@@ -98,6 +104,13 @@ function classify(err: unknown): Verdict {
   if (err instanceof RequestError) {
     if (err.status === 413) return "oversize";
     if (err.status === 401 || err.status === 403 || err.status === 404) return "fatal";
+    // PRD #1247 M5 (BLOCKING-4): a 409 carrying the stale_claim disposition means a held-state
+    // switch RELEASED this claim or a reclaim SUPERSEDED it — EVERY message in the batch fences
+    // out server-side (and so would every tombstone), so bisecting only burns budget. Treat it
+    // like a fatal reject and stop delivering: the /state path already stops the superseded
+    // flight, and this old flight's own terminal report is itself generation-fenced, so the trip
+    // never actually fails the run (which the new flight now owns).
+    if (err.status === 409 && err.body.includes('"stale_claim"')) return "fatal";
     if (isTransient(err)) return "transient";
     return "permanent";
   }
@@ -195,6 +208,33 @@ export interface MessageBatcherOptions {
    * semantics and already-terminal-is-success.
    */
   onPermanentFailure?: (info: PermanentFailureInfo) => void;
+  /**
+   * PRD #1391 M2: the worker outbox to SPILL to after `transientTripMs` of unbroken
+   * TRANSIENT failures, instead of tripping. Undefined ⇒ no store (should not happen
+   * in prod) ⇒ fall back to today's `trip()`.
+   */
+  outbox?: Outbox;
+  /**
+   * The claim generation these messages were produced under (PRD #1391 D11). Stamped
+   * on every spilled segment/range so replay can ride it under #1247's fence, and
+   * passed to `postMessages` for the network flush/bisection paths (which send it on the
+   * wire when a credential_switch_v1 capability worker stamps optimistically, or a
+   * non-capability worker once the api advertises `claim_generation_fence`; see client.ts
+   * `includeClaimGeneration`). Default 0.
+   */
+  generation?: number;
+  /**
+   * Override for `TRANSIENT_TRIP_MS` (PRD #1391 M2, WORKER_TRANSIENT_TRIP_MS), so the
+   * e2e outage phase can lower the spill trip window. Default `TRANSIENT_TRIP_MS`.
+   */
+  transientTripMs?: number;
+  /**
+   * Hard cap on the in-memory buffer WHILE SPILLED (PRD #1391 M2,
+   * WORKER_OUTBOX_SPILL_BUFFER_BYTES). A message that would exceed it is dropped and
+   * folded into a pending range record. Default 2 MiB. Ignored when not spilled (the
+   * buffer is unbounded as today).
+   */
+  spillBufferBytes?: number;
 }
 
 /**
@@ -232,6 +272,20 @@ export class MessageBatcher {
   private tripReason: string | undefined;
   /** Cap on the NEXT prefix's message count, set when a 413 says to split. */
   private splitLimit: number | undefined;
+  /** PRD #1391 M2: SPILLED mode — the flush target is the outbox, not the network.
+   *  Entered after `transientTripMs` of unbroken transient failures (instead of
+   *  tripping); left only by {@link rearm} once the outbox has drained. */
+  private spilled = false;
+  /** PRD #1391 M2: the [first,last] seq range of messages the spill buffer cap has
+   *  dropped and not yet written as a range record. The next spill flush writes ONE
+   *  durable range record covering it; {@link rearm} materialises any remainder as
+   *  network tombstones so the re-armed stream stays contiguous. */
+  private pendingRangeFirst: number | undefined;
+  private pendingRangeLast: number | undefined;
+  private readonly outbox: Outbox | undefined;
+  private readonly generation: number;
+  private readonly transientTripMs: number;
+  private readonly spillBufferBytes: number;
   private permanentFailureHandler: ((info: PermanentFailureInfo) => void) | undefined;
   private seq: number;
   private timer: NodeJS.Timeout | undefined;
@@ -269,6 +323,10 @@ export class MessageBatcher {
     this.redact = redact ?? ((p) => p);
     this.redactText = redactText ?? ((s) => s);
     this.permanentFailureHandler = opts.onPermanentFailure;
+    this.outbox = opts.outbox;
+    this.generation = opts.generation ?? 0;
+    this.transientTripMs = opts.transientTripMs ?? TRANSIENT_TRIP_MS;
+    this.spillBufferBytes = opts.spillBufferBytes ?? 2 * 1024 * 1024;
   }
 
   emit(msg: EmittedMessage): void {
@@ -355,8 +413,42 @@ export class MessageBatcher {
     // serialized line a second time); UZI_LOG_LEVEL=debug turns it on, info stays
     // terse. The browser never shows raw JSON — this is the debug surface.
     this.log.debug("run event", { seq: out.seq, kind: out.kind, agent: out.agent, payload: out.payload });
+    // PRD #1391 M2: while SPILLED, cap the in-memory buffer. A message that would push
+    // it over the cap is DROPPED and folded into a pending range record the next spill
+    // flush writes durably (never a per-frame sync, never unbounded memory). The first
+    // message is always kept (an empty buffer), mirroring takePrefix's exemption, so a
+    // lone over-cap message is spilled rather than silently lost. When NOT spilled the
+    // buffer stays unbounded exactly as today.
+    if (this.spilled && this.buffer.length > 0 && this.bufferedBytes() + item.bytes > this.spillBufferBytes) {
+      this.foldIntoPendingRange(out.seq);
+      this.log.warn("spill buffer cap reached; dropped a message into a pending range record", {
+        run_id: this.runId,
+        seq: out.seq,
+        cap_bytes: this.spillBufferBytes,
+      });
+      this.scheduleFlush();
+      return;
+    }
     this.buffer.push(item);
     this.scheduleFlush();
+  }
+
+  /** Sum of the buffered messages' wire bytes (the spill-buffer-cap accounting). */
+  private bufferedBytes(): number {
+    let total = 0;
+    for (const b of this.buffer) total += b.bytes;
+    return total;
+  }
+
+  /** Extend the pending dropped-range to include `seq` (the spill-buffer-cap drop). */
+  private foldIntoPendingRange(seq: number): void {
+    if (this.pendingRangeFirst === undefined || this.pendingRangeLast === undefined) {
+      this.pendingRangeFirst = seq;
+      this.pendingRangeLast = seq;
+      return;
+    }
+    if (seq < this.pendingRangeFirst) this.pendingRangeFirst = seq;
+    if (seq > this.pendingRangeLast) this.pendingRangeLast = seq;
   }
 
   /** Highest seq assigned so far (for pinning / diagnostics). */
@@ -367,6 +459,78 @@ export class MessageBatcher {
   /** True once the breaker has tripped and nothing more will be delivered. */
   isTripped(): boolean {
     return this.tripped;
+  }
+
+  /** True while the batcher is SPILLING to the outbox rather than the network (PRD
+   *  #1391 M2). Observability for the drainer/tests; the flush target follows it. */
+  isSpilled(): boolean {
+    return this.spilled;
+  }
+
+  /** Buffered-item count. Observability for the drainer/tests (mirrors {@link isSpilled}). */
+  bufferedCount(): number {
+    return this.buffer.length;
+  }
+
+  /**
+   * PRD #1391 M2: return the flush target to the NETWORK after the per-worker drainer
+   * has retired this run's spilled segments, and resume normal flushing. The single
+   * re-arm trigger; the drainer calls it (via the shared re-arm registry) once
+   * {@link Outbox.drainRun} reports the run fully retired. Any in-memory dropped range
+   * not yet written to the outbox becomes network tombstones — but NOT all at once here:
+   * rearm only flips to the network and schedules a flush, and the network flush loop
+   * materialises the range one bounded chunk at a time ({@link refillPendingRangeChunk}),
+   * so an arbitrarily wide range (a long outage can make it huge) never allocates one
+   * giant array. The stream still ends up contiguous: the server is idempotent on
+   * (run_id, seq) and the web client gap-buffers out-of-order seqs, so a tombstone
+   * landing before a lower-or-later seq reassembles correctly. Idempotent and inert
+   * after close.
+   */
+  rearm(): void {
+    if (!this.spilled || this.closed) return;
+    this.spilled = false;
+    this.consecutiveFailures = 0;
+    this.failingSince = undefined;
+    this.log.info("message batcher re-armed to the network after the outbox drained", { run_id: this.runId });
+    if (this.buffer.length > 0 || this.pendingRangeFirst !== undefined) this.scheduleFlush();
+  }
+
+  /** Materialise up to one bounded chunk of the in-memory pending dropped-range as
+   *  per-seq network tombstones at the head of the buffer, advancing the range and
+   *  clearing it once exhausted. Called from the network flush loop after rearm so an
+   *  arbitrarily wide range never allocates one huge array. The seq stream stays
+   *  contiguous: the server is idempotent on (run_id, seq) and the web client
+   *  gap-buffers, so a tombstone landing before a later seq reassembles correctly. */
+  private refillPendingRangeChunk(): void {
+    if (this.pendingRangeFirst === undefined || this.pendingRangeLast === undefined) return;
+    const start = this.pendingRangeFirst;
+    const end = Math.min(start + REARM_TOMBSTONE_CHUNK - 1, this.pendingRangeLast);
+    const items: Buffered[] = [];
+    for (let seq = start; seq <= end; seq++) {
+      const msg: OutgoingMessage = {
+        seq,
+        kind: "status",
+        payload: {
+          text: this.redactText(`message dropped: spill buffer full (seq ${seq})`),
+          event: "message_dropped",
+          reason: "spill buffer full",
+        },
+      };
+      items.push({ msg, bytes: messageBytes(msg), tombstoned: true });
+    }
+    this.buffer = items.concat(this.buffer);
+    if (end >= this.pendingRangeLast) {
+      this.pendingRangeFirst = undefined;
+      this.pendingRangeLast = undefined;
+    } else {
+      this.pendingRangeFirst = end + 1;
+    }
+  }
+
+  /** Seq-count of the in-memory pending dropped-range (0 when none). */
+  private pendingRangeWidth(): number {
+    if (this.pendingRangeFirst === undefined || this.pendingRangeLast === undefined) return 0;
+    return this.pendingRangeLast - this.pendingRangeFirst + 1;
   }
 
   /**
@@ -434,14 +598,20 @@ export class MessageBatcher {
   }
 
   async flush(signal?: AbortSignal): Promise<void> {
-    if (this.flushing || this.buffer.length === 0 || this.tripped) return;
+    // A pending dropped-range is work in BOTH modes even with an empty buffer (PRD #1391
+    // M2): SPILLED → doSpillFlush writes it durably; network → doFlush drains it as
+    // bounded tombstone chunks.
+    const hasWork = this.buffer.length > 0 || this.pendingRangeFirst !== undefined;
+    if (this.flushing || !hasWork || this.tripped) return;
     this.flushing = true;
     const abort = new AbortController();
     const onAbort = (): void => abort.abort(signal?.reason);
     if (signal?.aborted) onAbort();
     else signal?.addEventListener("abort", onAbort, { once: true });
     this.inFlightAbort = abort;
-    this.inFlight = this.doFlush(abort.signal);
+    // PRD #1391 M2: SPILLED flushes go to the outbox (local, fast — the boundary signal
+    // is irrelevant); network flushes stay abort-aware as before.
+    this.inFlight = this.spilled ? this.doSpillFlush() : this.doFlush(abort.signal);
     try {
       await this.inFlight;
     } finally {
@@ -523,6 +693,7 @@ export class MessageBatcher {
         await this.client.postMessages(
           this.runId,
           half.map((b) => b.msg),
+          this.generation,
           signal,
         );
         lo = mid; // confirmed clean by a 2xx
@@ -577,7 +748,7 @@ export class MessageBatcher {
       bisect_posts: posts,
     });
     try {
-      await this.client.postMessages(this.runId, [marker.msg], signal);
+      await this.client.postMessages(this.runId, [marker.msg], this.generation, signal);
       progressed = true; // the poison was isolated and tombstoned
       return { remaining: batch.slice(lo + 1), progressed };
     } catch (err) {
@@ -605,13 +776,18 @@ export class MessageBatcher {
    */
   private async doFlush(signal?: AbortSignal): Promise<void> {
     try {
-      while (this.buffer.length > 0 && !this.tripped && !signal?.aborted) {
+      while ((this.buffer.length > 0 || this.pendingRangeFirst !== undefined) && !this.tripped && !signal?.aborted) {
+        // Materialise the next bounded tombstone chunk only once the buffer has drained,
+        // so each chunk is fully sent before the next is pulled (memory stays bounded to
+        // one chunk and chunks stay ascending).
+        if (this.buffer.length === 0 && this.pendingRangeFirst !== undefined) this.refillPendingRangeChunk();
         const batch = this.takePrefix();
         if (batch.length === 0) break;
         try {
           await this.client.postMessages(
             this.runId,
             batch.map((b) => b.msg),
+            this.generation,
             signal,
           );
           // Any success clears the backoff, the failure clock and the split limit.
@@ -628,7 +804,8 @@ export class MessageBatcher {
       }
     } finally {
       this.flushing = false;
-      if (this.buffer.length > 0 && !this.closed && !this.tripped) this.scheduleFlush();
+      if ((this.buffer.length > 0 || this.pendingRangeFirst !== undefined) && !this.closed && !this.tripped)
+        this.scheduleFlush();
     }
   }
 
@@ -710,7 +887,7 @@ export class MessageBatcher {
         // back off and keep the sustained-failure breaker clock running. Resetting the
         // accounting here — as the old code did — re-posted with no backoff and wiped
         // failingSince, reopening the PRD #108 retry storm through the bisect door.
-        this.noteTransientFailure(batch.length, lastSeq, err);
+        await this.noteTransientFailure(batch.length, lastSeq, err);
         return true;
       }
       // Real progress: a sub-batch was persisted, or the poison was isolated and
@@ -724,13 +901,15 @@ export class MessageBatcher {
     // whole buffer no longer rides on one request, so this re-buffer can no longer
     // grow a body across the server's cap — the next attempt re-splits.
     this.buffer = batch.concat(this.buffer);
-    this.noteTransientFailure(batch.length, lastSeq, err);
+    await this.noteTransientFailure(batch.length, lastSeq, err);
     return true;
   }
 
   /** Count one transient / no-progress failure toward the backed-off retry and the
-   *  sustained-failure breaker. The caller has already re-buffered the batch. */
-  private noteTransientFailure(count: number, lastSeq: number, err: unknown): void {
+   *  sustained-failure spill/trip. The caller has already re-buffered the batch. After
+   *  `transientTripMs` of unbroken transient failure the batcher SPILLS to the outbox
+   *  (PRD #1391 M2) instead of tripping; with no outbox it falls back to today's trip. */
+  private async noteTransientFailure(count: number, lastSeq: number, err: unknown): Promise<void> {
     this.consecutiveFailures += 1;
     const now = Date.now();
     this.failingSince ??= now;
@@ -741,11 +920,208 @@ export class MessageBatcher {
       failing_for_ms: now - this.failingSince,
       error: errMessage(err),
     });
-    if (now - this.failingSince >= TRANSIENT_TRIP_MS) {
-      this.trip(
-        `the api has been unreachable or failing for ${Math.round((now - this.failingSince) / 1000)}s`,
-        lastSeq,
-      );
+    if (this.failingSince !== undefined && now - this.failingSince >= this.transientTripMs) {
+      // Spill ONLY to a usable store. A DISABLED outbox (failed closed at init) is not
+      // a durable store: its writes are silent no-ops, so "spilling" to it would drop
+      // the whole buffer with no trip and no report. Treat a missing OR disabled outbox
+      // as "no durable store" and TRIP (surfacing the failure), exactly as today with
+      // no outbox at all.
+      if (this.outbox && !this.outbox.isDisabled()) {
+        await this.enterSpill(lastSeq);
+      } else {
+        this.trip(
+          `the api has been unreachable or failing for ${Math.round((now - this.failingSince) / 1000)}s`,
+          lastSeq,
+        );
+      }
+    }
+  }
+
+  /**
+   * PRD #1391 M2: switch the flush target from the network to the outbox after
+   * `transientTripMs` of unbroken transient failure, instead of tripping the breaker
+   * (so a transient outage of any length never produces a `failed` report). Marks the
+   * run `spilled_unclean` so a crash before the tail is durable is admitted at
+   * restart. If marking fails the store is unusable, so fall back to today's trip
+   * rather than silently losing the tail.
+   */
+  private async enterSpill(lastSeq: number): Promise<void> {
+    if (this.spilled || this.tripped) return;
+    // No durable store — absent, or failed closed at init (a disabled store's writes
+    // are silent no-ops). Trip rather than pretend to spill into the void.
+    if (!this.outbox || this.outbox.isDisabled()) {
+      this.trip("the api has been unreachable and no usable outbox is available", lastSeq);
+      return;
+    }
+    try {
+      await this.outbox.markSpillUnclean(this.runId);
+    } catch (err) {
+      this.log.error("outbox: could not mark spill unclean; tripping instead of spilling", {
+        run_id: this.runId,
+        error: errMessage(err),
+      });
+      this.trip("the api has been unreachable and the outbox is unavailable", lastSeq);
+      return;
+    }
+    this.spilled = true;
+    this.consecutiveFailures = 0;
+    this.failingSince = undefined;
+    this.log.warn("message batcher entered spill mode: flushing to the outbox instead of the network", {
+      run_id: this.runId,
+      trip_ms: this.transientTripMs,
+    });
+  }
+
+  /**
+   * PRD #1391 M2: the SPILLED flush path. Writes any pending dropped-range as ONE
+   * durable range record, then spills the buffer as byte-capped segments (each within
+   * MAX_BATCH_BYTES so replay never 413s). A clean flush that empties both the buffer
+   * and the pending range clears the failure clock and the `spilled_unclean` flag (the
+   * tail is durable at that instant). One `appendSegment` is the durability point — no
+   * per-frame sync.
+   */
+  private async doSpillFlush(): Promise<void> {
+    try {
+      const outbox = this.outbox;
+      if (!outbox) return; // defensive: only ever reached while spilled, which requires an outbox
+      // Re-mark unclean if any un-flushed data is present (a cheap no-op when already
+      // set), so a crash mid-flush is surfaced at restart even after a prior clean
+      // flush cleared the flag. A marker-write FAILURE must fail closed: proceeding to
+      // write range/segments while the unclean flag could not be (re)set risks a crash
+      // that restart reads as clean — a silent tail loss. Back off and retry instead.
+      if (this.buffer.length > 0 || this.pendingRangeFirst !== undefined) {
+        try {
+          await outbox.markSpillUnclean(this.runId);
+        } catch (err) {
+          if (this.spilled) {
+            this.consecutiveFailures += 1;
+            this.failingSince ??= Date.now();
+          }
+          this.log.warn("outbox spill mark-unclean failed; will retry", {
+            run_id: this.runId,
+            error: errMessage(err),
+          });
+          return; // preserve buffer + pending range; the finally reschedules
+        }
+      }
+      // The pending dropped-range first, as one durable record (D2); reset only on success.
+      if (this.pendingRangeFirst !== undefined && this.pendingRangeLast !== undefined) {
+        const first = this.pendingRangeFirst;
+        const last = this.pendingRangeLast;
+        try {
+          await outbox.appendRangeRecord(this.runId, this.generation, first, last);
+          this.pendingRangeFirst = undefined;
+          this.pendingRangeLast = undefined;
+        } catch (err) {
+          // Advance the failure clock so nextDelayMs() backs off on a persistent
+          // spill-write failure instead of retrying at the flat batchMs cadence.
+          // Guarded on `spilled` so a rearm() during the await above (which clears
+          // this state) is not re-dirtied.
+          if (this.spilled) {
+            this.consecutiveFailures += 1;
+            this.failingSince ??= Date.now();
+          }
+          this.log.warn("outbox spill range-record write failed; will retry", {
+            run_id: this.runId,
+            error: errMessage(err),
+          });
+          return; // keep the pending range; the finally reschedules
+        }
+      }
+      // `&& this.spilled` so a rearm() that flips the batcher back to the network
+      // mid-flush (during an await above) stops us appending further segments to the
+      // outbox — otherwise a late segment would be delivered out of order AFTER the
+      // network has re-armed. The remaining buffer flushes over the network; the
+      // finally below reschedules a (now network) flush for it.
+      while (this.buffer.length > 0 && !this.closed && this.spilled) {
+        const batch = this.takePrefix();
+        if (batch.length === 0) break;
+        try {
+          await outbox.appendSegment(
+            this.runId,
+            this.generation,
+            batch.map((b) => b.msg),
+          );
+        } catch (err) {
+          this.buffer = batch.concat(this.buffer);
+          // Advance the failure clock so nextDelayMs() backs off on a persistent
+          // spill-write failure instead of retrying at the flat batchMs cadence.
+          // Guarded on `spilled` so a rearm() during the await above (which clears
+          // this state) is not re-dirtied.
+          if (this.spilled) {
+            this.consecutiveFailures += 1;
+            this.failingSince ??= Date.now();
+          }
+          this.log.warn("outbox spill segment write failed; will retry", {
+            run_id: this.runId,
+            error: errMessage(err),
+          });
+          break;
+        }
+      }
+      if (this.buffer.length === 0 && this.pendingRangeFirst === undefined) {
+        this.consecutiveFailures = 0;
+        this.failingSince = undefined;
+        await outbox.clearSpillUnclean(this.runId).catch(() => undefined);
+      }
+    } finally {
+      this.flushing = false;
+      const more = this.buffer.length > 0 || this.pendingRangeFirst !== undefined;
+      if (more && !this.closed) this.scheduleFlush();
+    }
+  }
+
+  /** PRD #1391 M2: on close while SPILLED, spill the remaining buffer + pending range
+   *  to the outbox (durable, replayed later by the drainer) and clear the unclean flag
+   *  once the tail is on disk. A write failure leaves the flag set so restart admits
+   *  the possible loss. */
+  private async finalSpillOnClose(): Promise<void> {
+    const outbox = this.outbox;
+    if (!outbox) return;
+    try {
+      // Re-mark unclean BEFORE any close-time write, mirroring doSpillFlush's own
+      // defensive re-mark at its top. A prior clean periodic doSpillFlush may have
+      // already CLEARED the flag, so relying on it "still being set from enterSpill"
+      // is unsound: without this, a failed appendRangeRecord/appendSegment below is
+      // swallowed by the catch, the flag stays CLEAR, and restart's uncleanRuns()
+      // omits the run — a SILENT tail loss the PRD forbids ("admitted and logged,
+      // never inferred or fabricated"). Set the flag first; the clearSpillUnclean at
+      // the end runs only on a fully-successful close. A marker-write FAILURE must
+      // propagate to the outer catch BEFORE takePrefix() mutates the buffer, so the
+      // "may be lost" warning reports the full, accurate dropped count and
+      // clearSpillUnclean is skipped, so a flag already set stays set for restart;
+      // when the failing write is the marker itself (a prior clean flush having
+      // cleared the flag), an unwritable manifest can record nothing durably and the
+      // loss is admitted by the "may be lost" log alone.
+      if (this.buffer.length > 0 || this.pendingRangeFirst !== undefined) {
+        await outbox.markSpillUnclean(this.runId);
+      }
+      if (this.pendingRangeFirst !== undefined && this.pendingRangeLast !== undefined) {
+        await outbox.appendRangeRecord(this.runId, this.generation, this.pendingRangeFirst, this.pendingRangeLast);
+        this.pendingRangeFirst = undefined;
+        this.pendingRangeLast = undefined;
+      }
+      while (this.buffer.length > 0) {
+        const batch = this.takePrefix();
+        if (batch.length === 0) break;
+        try {
+          await outbox.appendSegment(
+            this.runId,
+            this.generation,
+            batch.map((b) => b.msg),
+          );
+        } catch (err) {
+          this.buffer = batch.concat(this.buffer);
+          throw err;
+        }
+      }
+      await outbox.clearSpillUnclean(this.runId);
+    } catch (err) {
+      this.log.warn("message batcher: spilling the tail to the outbox on close failed; it may be lost", {
+        run_id: this.runId,
+        dropped: this.buffer.length + this.pendingRangeWidth(),
+        error: errMessage(err),
+      });
     }
   }
 
@@ -774,6 +1150,14 @@ export class MessageBatcher {
       this.warnUndeliveredAtClose("durability boundary deadline expired");
       return;
     }
+    // PRD #1391 M2: a SPILLED batcher closes to the OUTBOX, not the network — spill the
+    // remaining buffer + pending range so the per-worker drainer replays it later, and
+    // clear the unclean flag once the tail is durable. Never a network drain here (the
+    // api is unreachable, which is why we spilled).
+    if (this.spilled) {
+      await this.finalSpillOnClose();
+      return;
+    }
     // A tripped breaker skips the drain entirely. The 3 attempts plus 600ms of
     // sleeps below exist to ride out a blip; a trip has already established that
     // this is not a blip, so buying three more futile round-trips only delays the
@@ -781,10 +1165,10 @@ export class MessageBatcher {
     // unconditionally — that guard is what stops close() observing an empty buffer
     // while a doomed flush is still airborne, and a trip does not make it less true.
     if (this.tripped) {
-      if (this.buffer.length > 0) {
+      if (this.buffer.length > 0 || this.pendingRangeFirst !== undefined) {
         this.log.warn("message batcher closed with undelivered messages", {
           run_id: this.runId,
-          dropped: this.buffer.length,
+          dropped: this.buffer.length + this.pendingRangeWidth(),
           trip_reason: this.tripReason,
           last_rejected_seq: this.buffer[0]?.msg.seq,
         });
@@ -797,27 +1181,88 @@ export class MessageBatcher {
     // were landing fine. Progress — the buffer shrank — is free and does not
     // consume an attempt; only an attempt that moved nothing does.
     let failed = 0;
-    while (failed < CLOSE_MAX_FAILED_ATTEMPTS && this.buffer.length > 0) {
+    while (failed < CLOSE_MAX_FAILED_ATTEMPTS && (this.buffer.length > 0 || this.pendingRangeFirst !== undefined)) {
       if (signal?.aborted) break;
-      const before = this.buffer.length;
+      const before = this.buffer.length + this.pendingRangeWidth();
       await this.flush(signal);
-      if (this.buffer.length === 0) break;
+      const remaining = this.buffer.length + this.pendingRangeWidth();
+      if (remaining === 0) break;
       if (signal?.aborted) break;
-      if (this.buffer.length < before) continue; // a sub-batch landed; keep going
+      if (remaining < before) continue; // progress (buffer and/or range shrank); keep going
       failed += 1;
       await sleepUnlessAborted(200 * failed, signal);
     }
-    if (this.buffer.length > 0)
+    if (this.buffer.length > 0 || this.pendingRangeFirst !== undefined)
       this.warnUndeliveredAtClose(signal?.aborted ? "durability boundary deadline expired" : undefined);
   }
 
   private warnUndeliveredAtClose(reason?: string): void {
-    if (this.buffer.length === 0) return;
+    const dropped = this.buffer.length + this.pendingRangeWidth();
+    if (dropped === 0) return;
     this.log.warn("message batcher closed with undelivered messages", {
       run_id: this.runId,
-      dropped: this.buffer.length,
+      dropped,
       ...(reason ? { reason } : {}),
     });
+  }
+}
+
+/** Build a tombstone OutgoingMessage from a bare message (the outbox-replay drop
+ *  path). Reuses {@link tombstone} — same idempotency + attribution copying — with an
+ *  identity redactor, since a replayed drop marker is worker-minted ASCII and the
+ *  per-run redactors are not in scope for the worker-level drainer. */
+function tombstoneMessage(msg: OutgoingMessage, event: TombstoneEvent, reason: string): OutgoingMessage {
+  return tombstone({ msg, bytes: messageBytes(msg) }, event, reason, (s) => s).msg;
+}
+
+/**
+ * Deliver one replayed outbox record over the messages route with the SAME failure
+ * taxonomy as the live batcher (PRD #1391 M2 drain / D2). A transient (5xx/408/429/
+ * network) or fatal (401/403/404) error THROWS, so the per-worker drainer stops this
+ * run and retries on the next heartbeat (the outbox leaves the record pending). A
+ * permanent (400) or oversize (413) rejection SPLITS to isolate the offending
+ * message: the poison is tombstoned and the rest still lands ("today's bisection
+ * semantics against a segment"), and this resolves so the outbox retires the record.
+ *
+ * `generation` rides `postMessages`, which sends it on the wire when a
+ * credential_switch_v1 capability worker stamps optimistically, or a non-capability
+ * worker once the api advertises `claim_generation_fence`. A crash
+ * mid-split leaves the record un-retired (the cursor is unchanged), so restart
+ * re-drains the whole record — already-delivered seqs dedupe on (run_id, seq).
+ */
+export async function replaySegment(
+  client: WorkerClient,
+  runId: string,
+  msgs: OutgoingMessage[],
+  generation: number | undefined,
+  log: Logger,
+): Promise<void> {
+  if (msgs.length === 0) return;
+  try {
+    await client.postMessages(runId, msgs, generation);
+    return;
+  } catch (err) {
+    const verdict = classify(err);
+    // Stop the drain on a transient/fatal error; the record stays pending for retry.
+    if (verdict === "transient" || verdict === "fatal") throw err;
+    if (msgs.length === 1) {
+      const only = msgs[0]!;
+      const event: TombstoneEvent = verdict === "oversize" ? "message_truncated" : "message_dropped";
+      const reason =
+        verdict === "oversize" ? "the api rejected the message as too large" : "payload rejected by the api";
+      log.warn("outbox replay: tombstoning a rejected message and delivering the marker", {
+        run_id: runId,
+        seq: only.seq,
+        kind: only.kind,
+      });
+      // Post the marker; if even the marker is refused it throws, stopping the drain
+      // (the one true drop, surfaced via the run's pending depth) rather than looping.
+      await client.postMessages(runId, [tombstoneMessage(only, event, reason)], generation);
+      return;
+    }
+    const mid = Math.floor(msgs.length / 2);
+    await replaySegment(client, runId, msgs.slice(0, mid), generation, log);
+    await replaySegment(client, runId, msgs.slice(mid), generation, log);
   }
 }
 

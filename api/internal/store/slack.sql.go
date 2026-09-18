@@ -100,7 +100,7 @@ func (q *Queries) CountRunPlanMessages(ctx context.Context, runID uuid.UUID) (in
 }
 
 const getConfirmedUserBySlackID = `-- name: GetConfirmedUserBySlackID :one
-SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface FROM users
+SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness FROM users
 WHERE slack_resolved_id = $1 AND slack_link_confirmed_at IS NOT NULL AND is_active = true
 `
 
@@ -151,8 +151,37 @@ func (q *Queries) GetConfirmedUserBySlackID(ctx context.Context, slackResolvedID
 		&i.LightTheme,
 		&i.DarkTheme,
 		&i.Typeface,
+		&i.DefaultHarness,
 	)
 	return i, err
+}
+
+const getLatestCredentialSwitchSince = `-- name: GetLatestCredentialSwitchSince :one
+SELECT payload FROM run_messages
+WHERE run_id = $1 AND kind = 'credential_switch' AND created_at > $2
+ORDER BY seq DESC LIMIT 1
+`
+
+type GetLatestCredentialSwitchSinceParams struct {
+	RunID uuid.UUID          `json:"run_id"`
+	Since pgtype.Timestamptz `json:"since"`
+}
+
+// The newest 'credential_switch' run_message minted AFTER @since (PRD #1247 M9/D14, task d): the
+// durable, immutable evidence that a token switch was APPLIED during this park cycle. Used by
+// handleLimitResume to name the new token in the ▶️ Resumed DM. @since is the park-cycle anchor
+// (slack_run_messages.limit_paused_at = the run's status_since copied at park), so created_at >
+// @since scopes the message to THIS park cycle — a switch applied in an EARLIER cycle, or a
+// same-generation epoch re-record that refreshed run_credential_epochs.applied_at during a LATER
+// park, cannot re-attribute (the message's created_at is immutable and anchors the cycle, unlike
+// applied_at which RecordRunCredentialEpoch refreshes on a retry). No row = no switch this cycle,
+// so the resume DM is unchanged. The raw payload is returned and parsed in Go (label, then
+// escaped/scrubbed before it reaches Slack), exactly like GetLatestRunQuestion.
+func (q *Queries) GetLatestCredentialSwitchSince(ctx context.Context, arg GetLatestCredentialSwitchSinceParams) ([]byte, error) {
+	row := q.db.QueryRow(ctx, getLatestCredentialSwitchSince, arg.RunID, arg.Since)
+	var payload []byte
+	err := row.Scan(&payload)
+	return payload, err
 }
 
 const getLatestRunQuestion = `-- name: GetLatestRunQuestion :one

@@ -66,7 +66,7 @@ func TestRunToDTOCompletionFieldsInterlocked(t *testing.T) {
 		CompletionAttempts:        3,
 		LatestCompletionAttempt:   []byte(`{"unmet":["m5","m6"],"head":"abc","worktree_fingerprint":"wf","at":"2026-09-11T00:00:00Z"}`),
 		HoldReason:                pgtype.Text{String: "completion_blocked", Valid: true},
-	}, "normal", 0, 0, dtoTestNow)
+	}, "normal", 0, 0, 0, dtoTestNow)
 
 	if !dto.CompletionInterlock {
 		t.Fatal("CompletionInterlock = false, want true (non-null completion_contract_version)")
@@ -92,7 +92,7 @@ func TestRunToDTOCompletionFieldsInterlocked(t *testing.T) {
 // completion_contract_version carries the inert defaults — no interlock, zero attempts, a
 // STABLE empty unmet array (never null), null hold reason/context, and an empty phase.
 func TestRunToDTOCompletionFieldsInert(t *testing.T) {
-	dto := runToDTO(store.Run{ID: uuid.New(), Status: "running"}, "normal", 0, 0, dtoTestNow)
+	dto := runToDTO(store.Run{ID: uuid.New(), Status: "running"}, "normal", 0, 0, 0, dtoTestNow)
 	if dto.CompletionInterlock {
 		t.Fatal("CompletionInterlock = true, want false for a non-interlocked run")
 	}
@@ -140,7 +140,7 @@ func TestRunToDTOCompletionScopeProjection(t *testing.T) {
 		CompletionContractVersion: pgtype.Int4{Int32: 1, Valid: true},
 		ContractRevision:          pgtype.Int4{Int32: 3, Valid: true},
 		CompletionContract:        contract,
-	}, "normal", 0, 0, dtoTestNow)
+	}, "normal", 0, 0, 0, dtoTestNow)
 
 	if dto.CompletionRevision == nil || *dto.CompletionRevision != 3 {
 		t.Fatalf("CompletionRevision = %v, want 3", dto.CompletionRevision)
@@ -174,12 +174,12 @@ func TestRunToDTOCompletionPhaseAwaitingInputMarker(t *testing.T) {
 
 	withMarker := base
 	withMarker.CompletionQuestionAt = pgtype.Timestamptz{Time: time.Unix(1_700_000_000, 0), Valid: true}
-	if got := runToDTO(withMarker, "normal", 0, 0, dtoTestNow).CompletionPhase; got != "blocked" {
+	if got := runToDTO(withMarker, "normal", 0, 0, 0, dtoTestNow).CompletionPhase; got != "blocked" {
 		t.Fatalf("marker-set awaiting_input CompletionPhase = %q, want blocked", got)
 	}
 
 	// Marker unset: an ordinary clarification on an interlocked post-attempt run no longer reads blocked.
-	if got := runToDTO(base, "normal", 0, 0, dtoTestNow).CompletionPhase; got != "" {
+	if got := runToDTO(base, "normal", 0, 0, 0, dtoTestNow).CompletionPhase; got != "" {
 		t.Fatalf("marker-unset awaiting_input CompletionPhase = %q, want empty (ordinary clarification)", got)
 	}
 }

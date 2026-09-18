@@ -12,6 +12,13 @@
   "busy": true,
   "active_runs": 1,
   "max_concurrent_runs": 1,
+  "reported_runs": [
+    {
+      "run_id": "x",
+      "phase": "x",
+      "claim_generation": 1
+    }
+  ],
   "retaining_unpublished_work": true,
   "template_declared": "x",
   "template_reported": "x",
@@ -36,5 +43,9 @@
   "stats_disk_data_total_bytes": 1,
   "anthropic_secret_id": "x",
   "anthropic_secret_label": "x",
-  "anthropic_bind_mode": "x"
+  "anthropic_bind_mode": "x",
+  "outbox_pending_messages": 1,
+  "outbox_pending_terminal": 1,
+  "outbox_stale_retired": 1,
+  "outbox_blocked": "x"
 }

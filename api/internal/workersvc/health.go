@@ -131,6 +131,17 @@ const (
 	// regardless of the flag, so the reason reflects the run's actual state (rollout-OFF, no run
 	// is interlocked, so this stays inert).
 	reasonNoCompletionCapableWorker = "no online worker implements the completion interlock (completion_interlock_v1); provision a capable worker"
+	// reasonNoCodexCapableWorker (PRD #1332 M5A, D3) is emitted for a CODEX-INDICATING queued run
+	// (harness='codex', or a surviving M1 binding sentinel) whose owner has NO online worker
+	// advertising the 'codex_harness_v1' protocol capability. Like reasonNoCompletionCapableWorker
+	// it names a NON-BYPASSABLE block: ClaimRun's dedicated Codex clause sits outside
+	// fn_worker_can_claim, required_capabilities, ClearRunRequiredCapabilities and the
+	// capability-aware kill-switch, so a Codex-indicating run in an all-incapable fleet is genuinely
+	// unclaimable until a worker that passed the Codex runtime probe comes online. The prose is the
+	// D3-fixed user-visible text. In M5A only internal test-only Codex rows exist, so this rung is
+	// reachable only for them (no public origin can create a Codex run yet). Maps to the SAME
+	// healthWaitingWorker enum (no migration — runs.health_reason is free text).
+	reasonNoCodexCapableWorker = "no Codex-capable worker is online"
 	// reasonRepoNotDockerAllowed (PRD #361) is the queued reason for a repo-bearing run
 	// that no online worker is eligible to claim because every online worker is a Docker
 	// worker and the repo is not on the Docker-worker allowlist (fn_worker_can_claim,
@@ -150,6 +161,18 @@ const (
 	// pool_wait/recovery_wait park reasons (D4): this is an owner-admission block, not a
 	// credential-pool or transient-recovery hold, and its fix is archive retry/discard.
 	reasonCustodyLimit = "you have too much unpublished work awaiting recovery; resolve or discard some recovery archives to start new runs"
+	// reasonOutboxQueued (PRD #1391 M5) replaces the misleading `stalled` reason for a
+	// running run whose worker is holding its updates in the durable outbox during an
+	// api outage: the agent is working and sending, the frames are simply queued on the
+	// worker and will replay once it can reach the api. Without this, the health
+	// detector reads the outage silence as `stalled` — the exact wrong signal the
+	// outbox exists to prevent. It maps to the SAME healthStalled enum (no migration —
+	// runs.health_reason is free text, only runs.health is CHECK-constrained;
+	// migration 00057), and applies ONLY while the tracked pending-message depth is
+	// non-zero: on the next empty report (the backlog drained) or once the worker's set
+	// clears, normal stalled detection resumes. Same fixed-string contract as its
+	// siblings — no tool name, no repo content, no live duration.
+	reasonOutboxQueued = "the agent's updates are queued on its worker and will replay when it can reach the api"
 )
 
 // Persistence-failure FLAG thresholds (PRD #108 M4), code constants for the same
@@ -234,6 +257,18 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		// it here — in the same SetRunHealth write — exactly when it emits a nudge.
 		nudge := target != healthOK && r.Health == healthOK &&
 			(cooldown == 0 || !r.HealthNotifiedAt.Valid || now.Sub(r.HealthNotifiedAt.Time) >= cooldown)
+		// PRD #1349 M6 (D10): SUPPRESS the per-run Slack nudge for the custody-limit reason. The
+		// owner-level custody-episode reconciler (slacksvc) coalesces this crossing into ONE owner
+		// DM; a per-run nudge here would ALSO DM the owner once per queued run (the exact spam the
+		// episode alert exists to prevent). Only the redundant per-run Slack NUDGE is turned off —
+		// the STATE (target + reason) is still written and broadcast below, so the web/CLI custody
+		// pill is unchanged. Keyed off the reason (not the enum): the healthWaitingWorker enum
+		// carries many reasons and only reasonCustodyLimit defers to the episode reconciler. Because
+		// no nudge is emitted, health_notified_at is not stamped for this reason (notifiedAt stays
+		// NULL below), so the per-run cooldown is never burned by a deferred custody crossing.
+		if reason == reasonCustodyLimit {
+			nudge = false
+		}
 		notifiedAt := pgtype.Timestamptz{}
 		if nudge {
 			notifiedAt = pgconv.Time(now)
@@ -364,6 +399,25 @@ func (s *Service) runningTarget(ctx context.Context, now time.Time, r store.List
 	// pathological single call.
 	if th.stall > 0 && !stats.inFlight {
 		if base := stallBaseline(r); !base.IsZero() && now.Sub(base) >= th.stall {
+			// The silence may be an api outage, not a stall: if the run's OWNING worker
+			// reported a non-zero outbox depth for it (PRD #1391 M5), the agent IS working
+			// and sending — its updates are queued on the worker and will replay. Same
+			// healthStalled enum, truthful reason. Only while depth is non-zero; when the
+			// tracker reports nothing (backlog drained / cleared) normal stalled detection
+			// resumes.
+			//
+			// OWNER-GATE (trust boundary): the tracker's runIndex is "last reporter wins"
+			// with no ownership check, so the reporting worker id must EQUAL the run's
+			// current owning worker before we trust the depth. Two cases this closes: a
+			// cross-tenant worker that knows the run's UUID cannot flip a victim's stalled
+			// reason to the reassuring "queued", and after a reclaim-during-outage (run
+			// moved to worker B while runIndex still points at the offline worker A until
+			// the TTL) a genuinely-stalled B is not mislabeled "queued". An unclaimed run
+			// (worker_id NULL) never qualifies, so it falls through to the honest stall.
+			if d, reporter, ok := s.OutboxRunDepth(r.ID); ok && d.PendingMessages > 0 &&
+				r.WorkerID.Valid && uuid.UUID(r.WorkerID.Bytes) == reporter {
+				return healthStalled, reasonOutboxQueued
+			}
 			return healthStalled, reasonStalled
 		}
 	}
@@ -605,6 +659,25 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 			slog.Error("health: count online workers satisfying completion protocol", "run_id", r.ID, "error", perr)
 		} else if p == 0 {
 			return reasonNoCompletionCapableWorker
+		}
+	}
+	// PRD #1332 M5A (D3): a CODEX-INDICATING run whose owner has NO online worker advertising the
+	// codex_harness_v1 protocol capability is genuinely UNPLACEABLE — the run's non-bypassable Codex
+	// claim clause (ClaimRun's 'codex_harness_v1' = ANY(worker_protocol_caps)) can never be
+	// satisfied. Placed right after the completion-capability rung and AHEAD of the priority-class
+	// re-label, for the same reason: an actionable "provision a capable worker" block must not be
+	// hidden behind a yield/restored message. The Codex-indicating test mirrors the claim gate's
+	// fail-closed all-three check (harness OR either M1 sentinel), so the pill and the claim can
+	// never disagree. In M5A only internal Codex rows exist, so this fires for them alone. The
+	// per-run Count sits behind the queued-threshold guard in healthTargetFor, so it runs for ~0
+	// runs/tick; a read error falls through to the generic reasons below rather than inventing a
+	// reason on a failed lookup (the conservative degrade the sibling per-run lookups use).
+	if r.Harness == harnessCodex || r.CodexMaterialRevision.Valid || r.CodexSecretID.Valid {
+		c, cerr := s.q.CountOnlineWorkersSatisfyingCodexHarness(ctx, r.UserID)
+		if cerr != nil {
+			slog.Error("health: count online workers satisfying codex harness", "run_id", r.ID, "error", cerr)
+		} else if c == 0 {
+			return reasonNoCodexCapableWorker
 		}
 	}
 	// A queued run the kind-derived priority DEMOTED (PRD #320 D9) is not stuck — it is

@@ -1,6 +1,7 @@
 package workersvc
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -8,11 +9,13 @@ import (
 	"log/slog"
 	"math"
 	"math/big"
+	"slices"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -32,8 +35,36 @@ import (
 // arm of the switch; the invariant they all serve is persistfail.go's ownership
 // tripwire.
 func (s *Service) AppendMessages(ctx context.Context, wkr store.Worker, runID uuid.UUID, msgs []IncomingMessage) error {
-	obs, err := s.appendMessages(ctx, wkr, runID, msgs)
+	return s.appendAndRecord(ctx, wkr, runID, msgs, nil)
+}
+
+// AppendMessagesForClaim is AppendMessages with the caller's claim generation threaded to the
+// FENCE (PRD #1247 M5, D3). A CAPABILITY worker stamps its claim_generation on every message
+// batch; the fenced InsertRunMessage / UpdateRunLastSeq then persist ONLY while the run is at
+// that generation with an unreleased claim, so a message batch from a RELEASED or RECLAIMED old
+// flight persists nothing and cannot advance last_seq. A nil generation is the LEGACY path
+// (identical to AppendMessages), unfenced — back-compat by construction. The handler
+// (WorkerRunMessages) passes the decoded batch generation here; every test caller keeps using
+// AppendMessages (nil), so the fence adds no test churn.
+func (s *Service) AppendMessagesForClaim(ctx context.Context, wkr store.Worker, runID uuid.UUID, msgs []IncomingMessage, claimGen *int64) error {
+	return s.appendAndRecord(ctx, wkr, runID, msgs, claimGen)
+}
+
+func (s *Service) appendAndRecord(ctx context.Context, wkr store.Worker, runID uuid.UUID, msgs []IncomingMessage, claimGen *int64) error {
+	obs, err := s.appendMessages(ctx, wkr, runID, msgs, claimGen)
 	switch {
+	case errors.Is(err, ErrMissingClaimGeneration):
+		// PRD #1247 M5a-1 rework (auditor fail-open finding): a CAPABILITY worker omitted its
+		// claim_generation on a message batch — a PROTOCOL violation refused before any insert,
+		// NOT a persistence failure. Do NOT record a streak against the run for the worker's
+		// missing field (recording here would build a spurious kill streak). Placed FIRST so it
+		// skips the recorder regardless of the run's status.
+	case errors.Is(err, ErrStaleClaim):
+		// PRD #1247 M5 (BLOCKING-4 rework): the batch fenced out — the run was released or
+		// reclaimed under this OLD flight, so it persisted nothing. Like the missing-generation
+		// case this is NOT a persistence failure of the run; recording a streak here would punish
+		// a run for a superseded flight's late delivery. Skip the recorder; the handler answers
+		// the worker a stale_claim 409 so the old flight STOPS.
 	case !obs.resolved:
 		// Ownership never resolved (ErrRunNotOwned, or the lookup itself failed), so
 		// this run is not this worker's to vouch for. Recording here is what would let
@@ -60,7 +91,7 @@ func (s *Service) AppendMessages(ctx context.Context, wkr store.Worker, runID uu
 		//     reach 20, so which side of the threshold an OOM lands on is close to a
 		//     coin flip; half that population landed here.
 		//   - Every OTHER path that resets status without a hook, including Register's
-		//     RequeueWorkerRuns, which returns no ids and so can never have one.
+		//     requeue path, which wires no eviction hook and so can never have one.
 		//
 		// Sweep's two requeue-site evictions and the evaluator's are now belt and
 		// braces rather than the mechanism, which is the safer arrangement: this arm
@@ -229,12 +260,33 @@ func (s *Service) NoteOversizeBatch(ctx context.Context, wkr store.Worker, runID
 // A broader wrap was considered and rejected: with the above holding it catches
 // nothing extra, while reintroducing exactly the misattribution this narrowness
 // exists to prevent.
-func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uuid.UUID, msgs []IncomingMessage) (appendObservation, error) {
+func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uuid.UUID, msgs []IncomingMessage, claimGen *int64) (appendObservation, error) {
 	run, err := s.runOwnedByWorker(ctx, runID, wkr)
 	if err != nil {
 		return appendObservation{}, err
 	}
 	obs := appendObservation{resolved: true, status: run.Status, lastSeq: run.LastSeq}
+	// PRD #1247 M5 rework (chat fence completeness): a CHAT run has no claim-generation contract,
+	// so NORMALIZE the generation to nil for chat and use effectiveClaimGen for EVERY fenced query
+	// below (the omission check, InsertRunMessage, the generation_live stale check, and
+	// UpdateRunLastSeq). This makes a chat batch legacy even if a worker SUPPLIES a (mismatched)
+	// generation: the server must never fence chat regardless of what any client version sends. The
+	// client also guards generation > 0 on chat, but the server holds the property independently (a
+	// guardrail layer is not weakened on the theory another layer covers it).
+	effectiveClaimGen := claimGen
+	if run.Kind == runkind.Chat {
+		effectiveClaimGen = nil
+	}
+	// PRD #1247 M5a-1 rework (auditor fail-open finding): FAIL CLOSED for a CAPABILITY worker. The
+	// per-query InsertRunMessage/UpdateRunLastSeq fence engages only when the batch STAMPS a
+	// generation, so a worker advertising credential_switch_v1 could bypass it by OMITTING it and
+	// persist unfenced. A capability worker MUST stamp its claim_generation, so an omission is
+	// refused; a LEGACY worker (no capability) keeps inserting unfenced (nil generation), unchanged.
+	// Checked AFTER ownership resolves so ErrRunNotOwned (a foreign worker) still takes precedence.
+	// A CHAT run is exempt via effectiveClaimGen (nil) plus the explicit run.Kind guard.
+	if effectiveClaimGen == nil && run.Kind != runkind.Chat && slices.Contains(wkr.ProtocolCapabilities, capability.CredentialSwitchV1) {
+		return obs, ErrMissingClaimGeneration
+	}
 	// Validate the whole batch before persisting any of it: a single invalid
 	// message rejects the batch with nothing written, so a [valid, valid, invalid]
 	// batch never leaves the first two half-persisted.
@@ -326,7 +378,7 @@ func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uu
 	var insertErr error
 	inserted := make([]IncomingMessage, 0, len(msgs))
 	for _, m := range msgs {
-		rows, err := s.q.InsertRunMessage(ctx, store.InsertRunMessageParams{
+		res, err := s.q.InsertRunMessage(ctx, store.InsertRunMessageParams{
 			RunID:         runID,
 			Seq:           m.Seq,
 			Kind:          m.Kind,
@@ -334,6 +386,10 @@ func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uu
 			AgentInstance: pgconv.TextOrNull(m.AgentInstance),
 			AgentLabel:    pgconv.TextOrNull(m.AgentLabel),
 			Payload:       []byte(m.Payload),
+			// PRD #1247 M5 (D3): the per-query generation fence. nil (legacy worker) inserts
+			// unconditionally; a present generation gates the insert on the run still being at
+			// that generation with an unreleased claim.
+			ClaimGeneration: pgconv.Int8Ptr(effectiveClaimGen),
 		})
 		if err != nil {
 			// The ONLY classified error on this path. See the tripwire on
@@ -355,12 +411,23 @@ func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uu
 			}
 			break
 		}
+		// BLOCKING-4 rework: distinguish a benign duplicate from a GENERATION-FENCE REJECTION. A
+		// capability worker's batch that fenced out (generation_live == false) persisted NOTHING —
+		// the run was released or reclaimed under this old flight — so return "stale" BEFORE
+		// advancing the high-water mark and BEFORE foldRunUsage, which would otherwise mutate
+		// run_usage with an OLD generation's frames after release/reclaim. Both the fence rejection
+		// and a benign duplicate used to look like rows == 0; only the former is stale. A legacy
+		// (nil generation) caller always sees generation_live == true, so this never fires for it.
+		if effectiveClaimGen != nil && !res.GenerationLive.Bool {
+			return obs, ErrStaleClaim
+		}
 		if m.Seq > maxStored {
 			maxStored = m.Seq
 		}
-		// rows == 0 means a duplicate (run_id, seq) — a worker re-delivery. Only
-		// broadcast genuinely new messages so a retry never double-emits over WS.
-		if rows > 0 {
+		// A live-generation insert that added no row is a duplicate (run_id, seq) — a worker
+		// re-delivery, already stored. Only broadcast genuinely new messages so a retry never
+		// double-emits over WS.
+		if res.Inserted {
 			inserted = append(inserted, m)
 		}
 	}
@@ -394,7 +461,10 @@ func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uu
 	// after it, which is why it is fixed here rather than left to the transaction
 	// Phase 2 will consider.
 	if maxStored > run.LastSeq {
-		if _, err := s.q.UpdateRunLastSeq(ctx, store.UpdateRunLastSeqParams{ID: runID, Seq: maxStored}); err != nil {
+		// Fenced on the same predicate (PRD #1247 M5, D3): a released/reclaimed old flight must
+		// not advance last_seq, which would strand the reclaiming flight's re-emitted seqs behind
+		// a stale high-water mark. nil generation advances unconditionally (legacy).
+		if _, err := s.q.UpdateRunLastSeq(ctx, store.UpdateRunLastSeqParams{ID: runID, Seq: maxStored, ClaimGeneration: pgconv.Int8Ptr(effectiveClaimGen)}); err != nil {
 			if insertErr != nil {
 				return obs, insertErr // the insert failure is the more informative of the two
 			}
@@ -403,6 +473,17 @@ func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uu
 	}
 	if insertErr != nil {
 		return obs, insertErr
+	}
+	// PRD #1247 M9 (D7): stamp the per-call fenced generation onto every frame before folding, so
+	// each leg is attributed to the epoch it was produced under (the join
+	// run_usage.claim_generation -> run_credential_epochs). All frames in ONE appendMessages call
+	// share the ONE fenced generation this batch stamped — uniform per-call assignment is correct
+	// (the fence already guaranteed they belong to this claim, or the batch would have been
+	// rejected above). effectiveClaimGen is nil for a legacy worker or a chat run, folding NULL
+	// provenance exactly as before. The stamp is on the fold input only; InsertRunMessage above
+	// persisted the SAME generation onto each row's own column independently.
+	for i := range msgs {
+		msgs[i].ClaimGeneration = effectiveClaimGen
 	}
 	// Fold every DELIVERED result frame's usage into run_usage (PRD #40 Decision 2)
 	// — over `msgs`, NOT `inserted`: a seq-deduped re-delivery (crash retry) must
@@ -519,6 +600,21 @@ func foldUsageFrames(ctx context.Context, q usageFoldQuerier, run store.Run, fra
 				continue
 			}
 			model = truncateRunes(model, maxUsageModelRunes)
+			// The row's harness is DERIVED from the persisted run harness (PRD #1332 M5A / D2),
+			// never from a worker-supplied field. The cost status is then resolved conservatively
+			// (D5): Claude stays metered under THIS model's provider costUSD (marker ignored), while
+			// Codex HONORS the agent's closed per-model costStatus marker — subscription/metered when
+			// the agent asserts it, unreported for any missing/unknown/inconsistent marker.
+			//
+			// The marker and amount are decoded INDEPENDENTLY of the frame's json.Unmarshal (m4):
+			// resolveCostStatusMarker / resolveCostUSD tolerate a non-string / non-numeric token on
+			// one sibling model, so a single malformed field no longer discards every other model's
+			// usage in the same frame. deriveUsageCost then applies m5's rule: a Codex 'metered'
+			// marker whose amount is absent or invalid (costPresent=false, NaN, ±Inf, <0) resolves
+			// to 'unreported' with cost 0 rather than a clamped, bogus metered dollar figure.
+			marker := resolveCostStatusMarker(mu.CostStatus)
+			emittedCostUSD, costPresent := resolveCostUSD(mu.CostUSD)
+			costStatus, costUSD := deriveUsageCost(run.Harness, marker, emittedCostUSD, costPresent)
 			if err := q.UpsertRunUsage(ctx, store.UpsertRunUsageParams{
 				RunID:               run.ID,
 				SessionID:           sessionID,
@@ -528,7 +624,15 @@ func foldUsageFrames(ctx context.Context, q usageFoldQuerier, run store.Run, fra
 				CacheReadTokens:     nonNegTokens(mu.CacheReadInputTokens),
 				CacheCreationTokens: nonNegTokens(mu.CacheCreationInputTokens),
 				OutputTokens:        nonNegTokens(mu.OutputTokens),
-				CostUsd:             numericUSD(mu.CostUSD),
+				CostUsd:             costUSD,
+				Harness:             run.Harness,
+				CostStatus:          costStatus,
+				// PRD #1247 M9 (D7): attribute this leg to the epoch the FRAME was produced under
+				// (the incremental path stamps effectiveClaimGen onto every frame; the refold reads
+				// each frame's persisted run_messages.claim_generation). COALESCE in UpsertRunUsage
+				// keeps an established non-null provenance, so a straggler re-delivery never
+				// re-attributes an already-attributed leg. nil ⇒ NULL provenance (legacy frame).
+				ClaimGeneration: pgconv.Int8Ptr(m.ClaimGeneration),
 			}); err != nil {
 				return fmt.Errorf("fold run usage (run %s, model %s): %w", run.ID, model, err)
 			}
@@ -550,6 +654,128 @@ func numericUSD(usd float64) pgtype.Numeric {
 		usd = maxCostUSD
 	}
 	return pgtype.Numeric{Int: big.NewInt(int64(math.Round(usd * 1e6))), Exp: -6, Valid: true}
+}
+
+// Harness and cost-status literals, matching the run_usage.harness / run_usage.cost_status
+// CHECK vocabularies (migration 00226) and runs.harness. Kept here (not a shared package)
+// because C1 is the only writer of these into run_usage; the pure D11 resolver (C3) and the
+// C4b cost projection add their own use of the same tokens.
+const (
+	harnessClaude = "claude"
+	harnessCodex  = "codex"
+
+	costStatusSubscription = "subscription"
+	costStatusMetered      = "metered"
+	costStatusUnreported   = "unreported"
+)
+
+// costMarkerInvalid is the sentinel resolveCostStatusMarker returns for a costStatus that is
+// PRESENT but not a JSON string (e.g. `false`, `{}`, an array, a number). A JSON `null` is NOT
+// invalid: it is treated as ABSENT (→ "", the same as an omitted key). It is deliberately NOT
+// one of the closed cost-status literals, so deriveUsageCost's switch routes it through the
+// default arm to 'unreported' for Codex — exactly as a missing or unknown marker is — while
+// staying DISTINCT from "" (absent) for a reader or test that wants to tell the two apart. It
+// never reaches the store: deriveUsageCost emits only its three fixed literals.
+const costMarkerInvalid = "invalid-cost-status-type"
+
+// resolveCostStatusMarker decodes the agent's per-model costStatus marker from its raw JSON
+// (PRD #1332 M5A / m4). Decoding it here, off a json.RawMessage, rather than as a typed struct
+// field is what stops a non-string token on ONE sibling model from failing the whole frame's
+// json.Unmarshal and discarding every other model's usage. The trichotomy:
+//   - ABSENT  — nil/empty RawMessage (the key was omitted: a pre-C4b or Claude frame), OR a JSON
+//     `null` literal (json.Unmarshal into a string is a no-op that leaves "") → "";
+//   - VALID   — a JSON string → that string verbatim (deriveUsageCost's closed switch validates it);
+//   - INVALID — present but not a JSON string (false, {}, an array, a number) → the costMarkerInvalid
+//     sentinel, which deriveUsageCost maps to 'unreported' for Codex.
+func resolveCostStatusMarker(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return costMarkerInvalid
+	}
+	return s
+}
+
+// resolveCostUSD decodes the agent's per-model costUSD from its raw JSON (PRD #1332 M5A / m4),
+// tolerating a non-numeric or non-finite value instead of rejecting the whole frame:
+//   - ABSENT  — nil/empty RawMessage, OR a JSON `null` literal → present=false (amount 0);
+//   - VALID   — a finite JSON number → (that value, true);
+//   - INVALID — a non-numeric token (string, bool, object) or a non-finite JSON number
+//     → present=false. A finite value above the storage domain remains present here so Claude keeps
+//     its historical clamp; deriveUsageCost rejects it for Codex.
+//
+// deriveUsageCost then treats an absent or invalid amount under a Codex 'metered' marker as
+// 'unreported' (m5), so a metered row never carries a bogus or clamped dollar figure. Claude
+// ignores present and folds numericUSD(amount) as before (an absent amount is 0, unchanged).
+func resolveCostUSD(raw json.RawMessage) (value float64, present bool) {
+	// A JSON `null` is the 4-byte literal `null` (len 4, non-nil), and it is ABSENT — not a
+	// metered $0. It MUST short-circuit BEFORE the Unmarshal: json.Unmarshal([]byte("null"),
+	// &float64) is a no-op that returns a nil error and leaves v at 0, so without this it would
+	// resolve to (0, present=true) and let deriveUsageCost fabricate a metered $0 Codex row
+	// (violating D5's "an absent costUSD is unreported, never metered zero"). Mirrors how
+	// resolveCostStatusMarker yields the absent result for a `null` costStatus.
+	if len(raw) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return 0, false
+	}
+	var v float64
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return 0, false
+	}
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return 0, false
+	}
+	return v, true
+}
+
+// deriveUsageCost maps a run's persisted harness and the agent's per-model cost marker to the
+// (cost_status, cost_usd) a folded run_usage row carries (PRD #1332 M5A / D2, D5). The HARNESS is
+// always DERIVED from runs.harness (never a worker-supplied field) — the security-critical binding
+// stays server-authoritative; only the cost STATUS consults the agent's closed marker, and only for
+// Codex. It is a pure function so the full marker matrix is unit-testable without a database.
+//
+//   - Claude (harness != codex): 'metered' under the existing provider-reported costUSD, marker
+//     IGNORED. This is D5's backward-compat rule — "a Claude row with the existing numeric costUSD
+//     and no marker resolves to metered" — so Claude accounting is unchanged. An unexpected harness
+//     (impossible under the runs CHECK) also lands here, preserving accounting rather than zeroing.
+//   - Codex (harness == codex): HONOR the closed marker the agent emits per model (D5).
+//     'subscription' → cost_status='subscription', cost_usd=0 (that credential mode has no
+//     per-token charge, so zero is neutral, not a metered $0). 'metered' → cost_status='metered',
+//     cost_usd = the agent's price-table amount (emittedCostUSD) — but ONLY when that amount is
+//     genuinely present and usable (costPresent, finite, >= 0, and within numeric(12,6)); an ABSENT
+//     or INVALID metered amount resolves to cost_status='unreported',
+//     cost_usd=0 (m5), because numericUSD would otherwise silently clamp the bogus value into a
+//     metered row that reads as a real dollar total. ANYTHING ELSE — missing, empty, unknown or
+//     inconsistent marker — → cost_status='unreported', cost_usd=0 ("a Codex row with a missing,
+//     unknown or inconsistent marker resolves to unreported").
+//
+// costPresent is resolveCostUSD's present flag (m4): false when the agent omitted costUSD or
+// emitted a non-numeric/non-finite token for it. It gates ONLY the Codex 'metered' arm; Claude
+// ignores it and folds numericUSD(emittedCostUSD) exactly as before (an absent amount is 0).
+//
+// The marker is worker-controlled, but it never reaches the store verbatim: this closed switch
+// emits only the three fixed literals. Forcing cost_usd to 0 for EVERY non-metered row is what
+// keeps the insert within 00226's run_usage_nonmetered_zero_check (cost_status='metered' OR
+// cost_usd=0) — only 'metered' ever carries a non-zero cost, whatever the harness.
+func deriveUsageCost(harness, marker string, emittedCostUSD float64, costPresent bool) (costStatus string, costUSD pgtype.Numeric) {
+	if harness != harnessCodex {
+		return costStatusMetered, numericUSD(emittedCostUSD)
+	}
+	switch marker {
+	case costStatusSubscription:
+		return costStatusSubscription, numericUSD(0)
+	case costStatusMetered:
+		// A metered marker is honored only with a present, finite, non-negative amount; an
+		// absent, invalid, or above-domain amount cannot be a real metered dollar figure, so
+		// fail safe to 'unreported' rather than let numericUSD clamp it into a metered row (m5).
+		if !costPresent || math.IsNaN(emittedCostUSD) || math.IsInf(emittedCostUSD, 0) || emittedCostUSD < 0 || emittedCostUSD > maxCostUSD {
+			return costStatusUnreported, numericUSD(0)
+		}
+		return costStatusMetered, numericUSD(emittedCostUSD)
+	default:
+		return costStatusUnreported, numericUSD(0)
+	}
 }
 
 // nonNegTokens clamps a token count to >= 0 at fold time. GREATEST only protects an

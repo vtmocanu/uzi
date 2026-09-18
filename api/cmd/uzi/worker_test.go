@@ -9,6 +9,152 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
+// TestWorkerListShowsOutboxColumn pins the OUTBOX column (PRD #1391 M5): "-" in the
+// steady state (no outbox), the pending-message count when the worker buffered
+// updates during an api outage, and a "(blocked)"/"blocked" annotation when an
+// outcome is held.
+func TestWorkerListShowsOutboxColumn(t *testing.T) {
+	four := 4
+	zero := 0
+	blocked := "reserve_exhausted"
+	fc := &uzicli.FakeClient{Workers: []apitypes.WorkerDTO{
+		{ID: "w1", Name: "idle", Status: "online"},
+		{ID: "w2", Name: "backlog", Status: "online", OutboxPendingMessages: &four},
+		{ID: "w3", Name: "held", Status: "online", OutboxPendingMessages: &zero, OutboxBlocked: &blocked},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "worker", "list")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(out, "OUTBOX") {
+		t.Fatalf("worker list is missing the OUTBOX column:\n%s", out)
+	}
+	header := strings.Fields(strings.Split(out, "\n")[0])
+	col := -1
+	for i, h := range header {
+		if h == "OUTBOX" {
+			col = i
+			break
+		}
+	}
+	// None of these rows has an empty cell before OUTBOX (it is the last column), so
+	// reading the last field is the OUTBOX cell; the header lookup asserts that too.
+	cellOf := func(name string) string {
+		t.Helper()
+		for _, line := range strings.Split(out, "\n") {
+			if strings.Contains(line, name) {
+				f := strings.Fields(line)
+				return f[len(f)-1]
+			}
+		}
+		t.Fatalf("no row for %s in %q", name, out)
+		return ""
+	}
+	if col != len(header)-1 {
+		t.Fatalf("OUTBOX is not the last column (header=%v)", header)
+	}
+	if got := cellOf("idle"); got != "-" {
+		t.Errorf("idle worker OUTBOX = %q, want - (no buffered updates)", got)
+	}
+	if got := cellOf("backlog"); got != "4" {
+		t.Errorf("backlog worker OUTBOX = %q, want 4 (buffered depth)", got)
+	}
+	if got := cellOf("held"); got != "blocked" {
+		t.Errorf("held worker OUTBOX = %q, want blocked (a held outcome with zero pending)", got)
+	}
+}
+
+// TestReportedRunsCell pins reportedRunsCell (PRD #1390 M2c): empty → "-", a single phase,
+// phase-grouped counts in a FIXED order regardless of input order, and an unrecognized phase a
+// newer api adds appended (sorted) rather than dropped.
+//
+// MUTATIONS THIS CATCHES: rendering the raw per-run count without grouping (the fixed-order case
+// would not read "2 running, 1 awaiting_approval"); iterating the count map directly (the
+// fixed-order case would be flaky); dropping unknown phases (the last case would lose the future
+// phase).
+func TestReportedRunsCell(t *testing.T) {
+	rr := func(phase string, gen int64) apitypes.WorkerReportedRunDTO {
+		return apitypes.WorkerReportedRunDTO{RunID: "r-" + phase, Phase: phase, ClaimGeneration: gen}
+	}
+	for _, tc := range []struct {
+		name string
+		runs []apitypes.WorkerReportedRunDTO
+		want string
+	}{
+		{"none renders dash", nil, "-"},
+		{"empty slice renders dash", []apitypes.WorkerReportedRunDTO{}, "-"},
+		{"single running", []apitypes.WorkerReportedRunDTO{rr("running", 1)}, "1 running"},
+		{
+			// running is rendered before awaiting_approval even though the input lists
+			// awaiting_approval first — the phase order is fixed, not input-order.
+			name: "phase-grouped in fixed order",
+			runs: []apitypes.WorkerReportedRunDTO{rr("awaiting_approval", 2), rr("running", 1), {RunID: "r3", Phase: "running", ClaimGeneration: 3}},
+			want: "2 running, 1 awaiting_approval",
+		},
+		{
+			// An unrecognized phase a newer api adds is appended (sorted), never dropped.
+			name: "unknown phase appended after known",
+			runs: []apitypes.WorkerReportedRunDTO{rr("running", 1), {RunID: "rx", Phase: "some_future_phase", ClaimGeneration: 4}},
+			want: "1 running, 1 some_future_phase",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := reportedRunsCell(apitypes.WorkerDTO{ReportedRuns: tc.runs}); got != tc.want {
+				t.Errorf("reportedRunsCell = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestWorkerListShowsReportedRuns pins the RUNS column end to end (PRD #1390 M2c): a worker that
+// reports active runs shows its phase-grouped tally, a worker that reports none shows no phase
+// words, and the raw reported_runs array rides --json for scripting. The fixture stages both so a
+// renderer that drops the cell or stamps every row is caught.
+func TestWorkerListShowsReportedRuns(t *testing.T) {
+	fc := &uzicli.FakeClient{Workers: []apitypes.WorkerDTO{
+		{ID: "w1", Name: "idle", Status: "online", AnthropicBindMode: "default"},
+		{ID: "w2", Name: "busy", Status: "online", AnthropicBindMode: "default", ReportedRuns: []apitypes.WorkerReportedRunDTO{
+			{RunID: "r1", Phase: "running", ClaimGeneration: 1},
+			{RunID: "r2", Phase: "awaiting_approval", ClaimGeneration: 2},
+		}},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "worker", "list")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(out, "RUNS") {
+		t.Fatalf("worker list is missing the RUNS column:\n%s", out)
+	}
+	rowOf := func(name string) string {
+		t.Helper()
+		for _, line := range strings.Split(out, "\n") {
+			if strings.Contains(line, name) {
+				return line
+			}
+		}
+		t.Fatalf("no row for %s in %q", name, out)
+		return ""
+	}
+	// The busy worker's row carries the phase-grouped tally.
+	busy := rowOf("busy")
+	if !strings.Contains(busy, "running") || !strings.Contains(busy, "awaiting_approval") {
+		t.Errorf("busy worker row = %q, want it to name its running + awaiting_approval runs", busy)
+	}
+	// The idle worker reports nothing, so its row must not carry any phase word.
+	idle := rowOf("idle")
+	if strings.Contains(idle, "running") || strings.Contains(idle, "awaiting_approval") {
+		t.Errorf("idle worker row = %q must carry no reported-run phase (it reports none)", idle)
+	}
+	// --json carries the raw reported_runs array for scripting, untouched by the cell.
+	jout, _, jcode := runCLI(t, fakeEnv(fc), "worker", "list", "--json")
+	if jcode != uzicli.ExitOK {
+		t.Fatalf("worker list --json exit = %d, want 0", jcode)
+	}
+	if !strings.Contains(jout, "reported_runs") {
+		t.Errorf("worker list --json = %q, want it to carry the reported_runs field", jout)
+	}
+}
+
 func TestWorkerRm(t *testing.T) {
 	fc := &uzicli.FakeClient{}
 	out, _, code := runCLI(t, fakeEnv(fc), "worker", "rm", "w1")
@@ -61,10 +207,16 @@ func TestWorkerRmCustodyConflict(t *testing.T) {
 	if fc.DeleteWorkerCalls != 1 || fc.LastDeletedWorkerID != "w1" {
 		t.Fatalf("DeleteWorker calls=%d id=%q, want exactly one attempt on w1", fc.DeleteWorkerCalls, fc.LastDeletedWorkerID)
 	}
-	// The guidance reaches stderr (Main prints the returned error there). It must name
-	// the recovery command, the discard alternative and the retry — the actionable trio,
-	// not a bare "conflict".
-	for _, want := range []string{"uzi run export", "discard", "retry"} {
+	// The guidance reaches stderr (Main prints the returned error there). It must name the
+	// exact recover/list/discard commands and the retry — the actionable set, not a bare
+	// "conflict" — and it must NAME the exact `uzi run discard <run-id> --hold <hold-id> --yes`
+	// rather than bundling a force-discard into `worker rm` (PRD #1349 M5, D9).
+	for _, want := range []string{
+		"uzi run recovery <run-id>",
+		"uzi run export",
+		"uzi run discard <run-id> --hold <hold-id> --yes",
+		"retry",
+	} {
 		if !strings.Contains(errb, want) {
 			t.Errorf("rm custody refusal missing %q on stderr; got stderr=%q stdout=%q", want, errb, out)
 		}
@@ -239,12 +391,27 @@ func TestWorkerListShowsBindMode(t *testing.T) {
 	if !strings.Contains(out, "TOKEN") {
 		t.Fatalf("worker list is missing the TOKEN column: %q", out)
 	}
+	// Read the TOKEN column by its HEADER index rather than the last field: PRD #1391
+	// M5 appended an OUTBOX column after TOKEN, so the last field is now OUTBOX. None of
+	// these fixture rows has an empty cell before TOKEN, so header-index and field-index
+	// line up.
+	header := strings.Fields(strings.Split(out, "\n")[0])
+	tokenCol := -1
+	for i, h := range header {
+		if h == "TOKEN" {
+			tokenCol = i
+			break
+		}
+	}
+	if tokenCol < 0 {
+		t.Fatalf("worker list is missing the TOKEN column: %q", out)
+	}
 	cellOf := func(name string) string {
 		t.Helper()
 		for _, line := range strings.Split(out, "\n") {
 			if strings.Contains(line, name) {
 				f := strings.Fields(line)
-				return f[len(f)-1]
+				return f[tokenCol]
 			}
 		}
 		t.Fatalf("no row for %s in %q", name, out)

@@ -58,7 +58,7 @@ func TestCommandTree(t *testing.T) {
 	}
 
 	subWant := map[string][]string{
-		"run": {"list", "get", "logs", "wait", "review", "create", "approve", "reject", "revise", "cancel", "stop", "scope", "extend", "follow-up", "answer", "inputs", "expedite", "resume-now", "mr-rework", "pause", "resume", "rework", "export"},
+		"run": {"list", "get", "logs", "wait", "review", "create", "approve", "reject", "revise", "cancel", "stop", "scope", "extend", "follow-up", "answer", "inputs", "expedite", "resume-now", "mr-rework", "pause", "resume", "rework", "export", "recovery", "discard"},
 		// backlog is the PRD #98 M7 read; `file` (PRD #365 M2) files a recommendation
 		// as a forge issue from the CLI, mirroring `findings file`.
 		"review": {"show", "backlog", "resolve", "dismiss", "undo", "stats", "file"},
@@ -1453,11 +1453,12 @@ func TestWorkerListSanitizesVersion(t *testing.T) {
 	// UpgradeStatus (worker.go), which BOTH fixture workers have, so the UPGRADE column
 	// satisfies it whatever VERSION renders. Measured — with the placeholder removed
 	// entirely, so an all-Cf version renders a blank cell, that assertion stayed green.
-	// Columns are ID NAME STATUS UPTIME VERSION UPGRADE (TOKEN is empty for both
-	// fixtures, so strings.Fields drops it), so a blank VERSION collapses the row to
-	// five fields and the length check is what catches it. Both workers are online with
-	// a nil OnlineSince, so their UPTIME cell renders "-" (PRD #251) and VERSION sits at
-	// index 4.
+	// Columns are ID NAME STATUS UPTIME VERSION UPGRADE TOKEN RUNS OUTBOX. TOKEN is empty for
+	// both fixtures so strings.Fields drops it, while RUNS and OUTBOX both render "-" (no
+	// reported runs, PRD #1390 M2c; no outbox, PRD #1391 M5) and SURVIVE — so a healthy row has
+	// EIGHT fields and a blank VERSION would collapse it to seven, which the length check
+	// catches. Both workers are online with a nil OnlineSince, so their UPTIME cell renders "-"
+	// (PRD #251) and VERSION sits at index 4.
 	var betaRow []string
 	for _, line := range strings.Split(out, "\n") {
 		if f := strings.Fields(line); len(f) > 1 && f[1] == "beta" {
@@ -1468,7 +1469,7 @@ func TestWorkerListSanitizesVersion(t *testing.T) {
 	if betaRow == nil {
 		t.Fatalf("no row for worker beta:\n%s", out)
 	}
-	if len(betaRow) != 6 || betaRow[4] != "-" {
+	if len(betaRow) != 8 || betaRow[4] != "-" {
 		t.Errorf("an all-format-character version must render \"-\" in the VERSION cell, got %q:\n%s", betaRow, out)
 	}
 }

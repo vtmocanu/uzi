@@ -35,6 +35,7 @@ class UziCli < Formula
   license "MIT"
 
   depends_on "go" => :build
+  conflicts_with "uzi-cli-rc", because: "both install a `uzi` binary; only one channel can be active at a time"
 
   def install
     # The Go module is rooted at api/, so build from there. `output: bin/"uzi"` names

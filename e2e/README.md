@@ -162,6 +162,7 @@ headers, not the rows.
 | 39 | review-row-cap | gitlab | no | PRD #98 M8b/B4': the server's row cap, and the truncation remedy executed against it |
 | 40 | chat-agent | gitlab | no | PRD #39: in-app chat agent (stub) — create -> read(red-team) -> propose -> confirm -> dismiss -> idle -> continue |
 | 41 | interleave-stream | gitlab | no | PRD #43 M5: interleaved multi-agent stream persists + replays (gapless seq, per-agent attribution) |
+| 42 | api-outage-readoption | gitlab | no | PRD #1390: api outage recovery — boot grace, heartbeat re-adoption, claim dedupe |
 | 43 | plan-revision-loop | gitlab | no | PRD #41: plan-revision loop (revise_plan -> re-plan -> re-park -> approve -> MR) |
 | 44 | ask-user-clarification | gitlab | no | PRD #88: ask-user clarification (park -> answer -> resume -> approve -> MR) |
 | 45 | bounded-concurrency | gitlab | no | PRD #42 bounded-concurrency scenario (stub-only) |
@@ -171,12 +172,15 @@ headers, not the rows.
 | 49 | docker-sidecar | gitlab | no | PRD #83 M2: rootless DinD sidecar + Decision-3 efficacy |
 | 50 | worker-token-binding | gitlab | no | PRD #104: a worker's Anthropic binding reaches the claim payload; a rebind lands on the next claim |
 | 51 | auto-stop-poison | gitlab | no | PRD #108 M5: auto-stop kills a run whose messages can't be saved (direct-to-API poison) |
+| 52 | api-outage-outbox | gitlab | no | PRD #1391: worker outbox survives an api outage (spill+drain, quota tombstones) |
 | 59 | restart-agent | gitlab | no | PRD #966: restart the agent worker before schedule phases 60-62 |
 | 60 | schedules-sweep | gitlab | no | PRD #966 M4: scheduled Planned-sweep (catalog enable, run-now tallies, uzi-gate skip, open-MR skip) |
 | 61 | schedules-prompt | gitlab | no | PRD #966 M4: scheduled prompt run (issue-less repo->MR run via run-now) |
 | 62 | self-improve | gitlab | no | PRD #966 M4: scheduled self_improve run (tracking issue, MR opened) |
 | 70 | handoff | gitlab | no | PRD #966 M5: task/handoff run kind via `uzi handoff` (+ host-gitconfig transport) |
 | 71 | mr-rework | gitlab | no | PRD #966 M6: mr_rework run kind (review-landed rework on a settled MR) |
+| 72 | custody-lifecycle | gitlab | no | PRD #1349 M7: recovery custody-limit wedge repro + owner-disposition unblock |
+| 73 | forge-unreachable-park | gitlab | no | PRD #1392: pre-clone forge park — recovery_wait(forge_unreachable), promote+complete, cap-fail no judge, cancel |
 
 <!-- registry:end -->
 

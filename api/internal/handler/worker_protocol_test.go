@@ -3,6 +3,8 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -18,6 +20,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/config"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -57,8 +60,8 @@ func (p *protocolStore) SetRunCompleted(context.Context, store.SetRunCompletedPa
 func (p *protocolStore) FailWorkerRunsOverCap(context.Context, store.FailWorkerRunsOverCapParams) ([]uuid.UUID, error) {
 	return nil, nil
 }
-func (p *protocolStore) RequeueWorkerRuns(context.Context, store.RequeueWorkerRunsParams) (int64, error) {
-	return 0, nil
+func (p *protocolStore) RequeueWorkerRuns(context.Context, store.RequeueWorkerRunsParams) ([]uuid.UUID, error) {
+	return nil, nil
 }
 func (p *protocolStore) RegisterWorker(_ context.Context, arg store.RegisterWorkerParams) (store.RegisterWorkerRow, error) {
 	return store.RegisterWorkerRow{ID: arg.ID, Status: "online", Version: arg.Version, TemplateReported: arg.TemplateReported, MaxConcurrentRuns: arg.MaxConcurrentRuns}, nil
@@ -114,6 +117,39 @@ func TestWorkerClaimIdleReturns204NoBody(t *testing.T) {
 	}
 	if rec.Body.Len() != 0 {
 		t.Fatalf("204 must have an empty body, got %q", rec.Body.String())
+	}
+}
+
+func TestWorkerClaimRunLaneAcceptsSnapshotBody(t *testing.T) {
+	// PRD #1390 M3 (Task 1): the run lane now decodes an active_snapshot body. The strict decoder
+	// must ACCEPT the field (never 400 a claim that carries it) when the feature is enabled; with
+	// the fake ClaimRun idle it answers 204, proving the field was accepted and the claim ran.
+	h := newProtocolHandler(t, &protocolStore{claimErr: pgx.ErrNoRows})
+	rec := httptest.NewRecorder()
+	body := `{"active_snapshot":{"snapshot_epoch":1,"register_nonce":"n","active":[]}}`
+	h.WorkerClaim(rec, workerReq(http.MethodPost, body, uuid.Nil))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204 (a run-lane claim carrying active_snapshot must not 400), body %q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestWorkerClaimDisabledApiRejectsSnapshotBody(t *testing.T) {
+	// PRD #1390 D7: an api started with UZI_ACTIVE_SNAPSHOT_DISABLED 400s a claim that still carries
+	// the field (the generic 400 that triggers the worker's strip-and-retry) — but an OLD bodyless
+	// claim on the same api still succeeds (never a lost claim).
+	h := newProtocolHandler(t, &protocolStore{claimErr: pgx.ErrNoRows})
+	h.cfg = config.Config{ActiveSnapshotDisabled: true}
+
+	withField := httptest.NewRecorder()
+	h.WorkerClaim(withField, workerReq(http.MethodPost, `{"active_snapshot":{"snapshot_epoch":1,"active":[]}}`, uuid.Nil))
+	if withField.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (a disabled api rejects a claim carrying active_snapshot)", withField.Code)
+	}
+
+	bodyless := httptest.NewRecorder()
+	h.WorkerClaim(bodyless, workerReq(http.MethodPost, "", uuid.Nil))
+	if bodyless.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204 (an old bodyless claim must not 400 on a disabled api)", bodyless.Code)
 	}
 }
 
@@ -801,6 +837,40 @@ func TestWorkerStateAlreadyTerminalReturns409(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "cancelled") {
 		t.Fatalf("409 body should echo the run's real status, got %q", rec.Body.String())
+	}
+}
+
+// TestForgeParkRefusalReason pins the pure error→reason mapping WorkerRunState's 409
+// {run, reason} body carries (PRD #1392 M1). It is the smallest testable seam for the two new
+// reason bodies — the errors themselves are only raised inside SetState's live-DB forge-park
+// transaction (a fake service is impossible: h.wsvc is a concrete *workersvc.Service) — and it
+// PROVES a stale_claim↔custody_unsettled mixup is caught: each sentinel demands its OWN exact
+// token. It also proves errors.Is-unwrapping (a wrapped sentinel still maps, the shape SetState
+// may return) and that every NON-forge-park error falls through (ok=false) so WorkerRunState
+// keeps routing it to ErrRunNotOwned/ErrInvalidState/the 500 arm instead of a 409 {reason}.
+func TestForgeParkRefusalReason(t *testing.T) {
+	if reason, ok := forgeParkRefusalReason(workersvc.ErrForgeParkStaleClaim); !ok || reason != "stale_claim" {
+		t.Errorf("stale-claim: got (%q,%v), want (stale_claim,true)", reason, ok)
+	}
+	if reason, ok := forgeParkRefusalReason(workersvc.ErrForgeParkCustodyUnsettled); !ok || reason != "custody_unsettled" {
+		t.Errorf("custody-unsettled: got (%q,%v), want (custody_unsettled,true)", reason, ok)
+	}
+	// errors.Is-unwrapping: a wrapped sentinel still maps to its token.
+	wrapped := fmt.Errorf("set state: %w", workersvc.ErrForgeParkCustodyUnsettled)
+	if reason, ok := forgeParkRefusalReason(wrapped); !ok || reason != "custody_unsettled" {
+		t.Errorf("wrapped custody-unsettled: got (%q,%v), want (custody_unsettled,true)", reason, ok)
+	}
+	// Every OTHER error falls through (ok=false, "") — never a 409 {reason} body. A nil error is
+	// never passed here in practice, but returns ("",false) too.
+	for _, err := range []error{
+		workersvc.ErrRunNotOwned,
+		workersvc.ErrInvalidState,
+		errors.New("boom"),
+		nil,
+	} {
+		if reason, ok := forgeParkRefusalReason(err); ok || reason != "" {
+			t.Errorf("forgeParkRefusalReason(%v) = (%q,%v), want (\"\",false)", err, reason, ok)
+		}
 	}
 }
 

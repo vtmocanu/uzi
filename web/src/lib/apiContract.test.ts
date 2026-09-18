@@ -37,6 +37,9 @@ import type {
   CIStep,
   RecoveryArchive,
   RecoveryArchiveSummary,
+  RecoveryCustodyHold,
+  RecoveryCustodyAggregate,
+  RecoveryCustodyHolds,
 } from "./apiTypes";
 
 import runZero from "../../../fixtures/api-contract/run.zero.json";
@@ -111,6 +114,12 @@ import recoveryArchiveZero from "../../../fixtures/api-contract/recovery_archive
 import recoveryArchiveFull from "../../../fixtures/api-contract/recovery_archive.full.json";
 import recoveryArchiveSummaryZero from "../../../fixtures/api-contract/recovery_archive_summary.zero.json";
 import recoveryArchiveSummaryFull from "../../../fixtures/api-contract/recovery_archive_summary.full.json";
+import recoveryCustodyHoldZero from "../../../fixtures/api-contract/recovery_custody_hold.zero.json";
+import recoveryCustodyHoldFull from "../../../fixtures/api-contract/recovery_custody_hold.full.json";
+import recoveryCustodyAggregateZero from "../../../fixtures/api-contract/recovery_custody_aggregate.zero.json";
+import recoveryCustodyAggregateFull from "../../../fixtures/api-contract/recovery_custody_aggregate.full.json";
+import recoveryCustodyHoldsZero from "../../../fixtures/api-contract/recovery_custody_holds.zero.json";
+import recoveryCustodyHoldsFull from "../../../fixtures/api-contract/recovery_custody_holds.full.json";
 
 // The api ⇄ SPA JSON wire-contract (PRD #982). This is the VITEST HALF; the Go
 // half is api/internal/apitypes/contract_test.go. Neither reads the other: each
@@ -189,6 +198,10 @@ type ZeroOf<T, NeverNull extends keyof T = never> = {
     | "completion_unmet"
     | "completion_deferred"
     | "completion_accepted"
+    // PRD #1247 M1: credential_epochs is normalized to [] by runToDTO
+    // (handler/runs_dto.go) but its zero fixture is a null nil-slice, so it is
+    // never-null on the wire and the null zero value is exempted here.
+    | "credential_epochs"
   > = runZero;
   // 3. value kinds, literal unions widened.
   const _runFull: Widen<Run> = runFull;
@@ -213,6 +226,7 @@ type ZeroOf<T, NeverNull extends keyof T = never> = {
     | "completion_unmet"
     | "completion_deferred"
     | "completion_accepted"
+    | "credential_epochs"
   > = runListItemZero;
   const _runListItemFull: Widen<RunListItem> = runListItemFull;
   void _runListItemMissing;
@@ -308,10 +322,18 @@ type ZeroOf<T, NeverNull extends keyof T = never> = {
 // handler/workers.go:201). DISCOVERED in M2 as a drift against the then-`docker?: boolean`
 // TS type; RECONCILED in M4 — TS is now `docker?: boolean | null`, so the null is accepted
 // and no directive or exemption is needed. Every other pointer field is typed X|null in TS.
+//
+// reported_runs (PRD #1390 M2c): a handler-overlaid field, so the TS type is OPTIONAL
+// (WorkerReportedRun[]?, matching the outbox_* / retaining_unpublished_work overlay siblings) —
+// the list/patch overlay and the DTO builders normalize the nil slice to [] on the real wire
+// (handler/workers.go reportedRunsByWorker/builders), never null. The exemption is still needed:
+// json.Marshal(WorkerDTO{}) emits null for the nil slice, so worker.zero.json carries an explicit
+// `null`, which an optional `X[] | undefined` field rejects — the exemption tolerates it exactly
+// like capabilities.
 {
   const _workerMissing: never = null as unknown as Exclude<keyof Worker, keyof typeof workerFull>;
   const _workerExtra: never = null as unknown as Exclude<keyof typeof workerFull, keyof Worker>;
-  const _workerZero: ZeroOf<Worker, "capabilities"> = workerZero;
+  const _workerZero: ZeroOf<Worker, "capabilities" | "reported_runs"> = workerZero;
   const _workerFull: Widen<Worker> = workerFull;
   void _workerMissing;
   void _workerExtra;
@@ -321,12 +343,13 @@ type ZeroOf<T, NeverNull extends keyof T = never> = {
 
 // ── AdminWorker (M2) ────────────────────────────────────────────────────────
 // AdminWorker extends Worker + owner_email; the embedded WorkerDTO fields marshal inline,
-// so full.json carries the Worker keys AND owner_email. Same capabilities exemption and the
-// same inherited worker.docker null, now reconciled in M4 (docker?: boolean | null) — no directive.
+// so full.json carries the Worker keys AND owner_email. Same capabilities exemption, the same
+// reported_runs exemption (PRD #1390 M2c, inherited from Worker), and the same inherited
+// worker.docker null, now reconciled in M4 (docker?: boolean | null) — no directive.
 {
   const _adminWorkerMissing: never = null as unknown as Exclude<keyof AdminWorker, keyof typeof adminWorkerFull>;
   const _adminWorkerExtra: never = null as unknown as Exclude<keyof typeof adminWorkerFull, keyof AdminWorker>;
-  const _adminWorkerZero: ZeroOf<AdminWorker, "capabilities"> = adminWorkerZero;
+  const _adminWorkerZero: ZeroOf<AdminWorker, "capabilities" | "reported_runs"> = adminWorkerZero;
   const _adminWorkerFull: Widen<AdminWorker> = adminWorkerFull;
   void _adminWorkerMissing;
   void _adminWorkerExtra;
@@ -773,6 +796,49 @@ type ZeroOf<T, NeverNull extends keyof T = never> = {
   void _recoverySummaryFull;
 }
 
+// ── RecoveryCustodyHold (PRD #1349 M1) ───────────────────────────────────────
+// Its only nullable field is released_at (omitempty, dropped on the zero value) and
+// worker_name/capture_state are omitempty strings, so the zero.json carries no null
+// (declared nullable:false below) — the finding shape.
+{
+  const _recoveryCustodyHoldMissing: never = null as unknown as Exclude<keyof RecoveryCustodyHold, keyof typeof recoveryCustodyHoldFull>;
+  const _recoveryCustodyHoldExtra: never = null as unknown as Exclude<keyof typeof recoveryCustodyHoldFull, keyof RecoveryCustodyHold>;
+  const _recoveryCustodyHoldZero: ZeroOf<RecoveryCustodyHold> = recoveryCustodyHoldZero;
+  const _recoveryCustodyHoldFull: Widen<RecoveryCustodyHold> = recoveryCustodyHoldFull;
+  void _recoveryCustodyHoldMissing;
+  void _recoveryCustodyHoldExtra;
+  void _recoveryCustodyHoldZero;
+  void _recoveryCustodyHoldFull;
+}
+
+// ── RecoveryCustodyAggregate (PRD #1349 M1) ──────────────────────────────────
+// All four fields are ints, so the zero.json carries no null (declared nullable:false).
+{
+  const _recoveryCustodyAggregateMissing: never = null as unknown as Exclude<keyof RecoveryCustodyAggregate, keyof typeof recoveryCustodyAggregateFull>;
+  const _recoveryCustodyAggregateExtra: never = null as unknown as Exclude<keyof typeof recoveryCustodyAggregateFull, keyof RecoveryCustodyAggregate>;
+  const _recoveryCustodyAggregateZero: ZeroOf<RecoveryCustodyAggregate> = recoveryCustodyAggregateZero;
+  const _recoveryCustodyAggregateFull: Widen<RecoveryCustodyAggregate> = recoveryCustodyAggregateFull;
+  void _recoveryCustodyAggregateMissing;
+  void _recoveryCustodyAggregateExtra;
+  void _recoveryCustodyAggregateZero;
+  void _recoveryCustodyAggregateFull;
+}
+
+// ── RecoveryCustodyHolds (PRD #1349 M1) ──────────────────────────────────────
+// ZeroOf exemption: holds — the endpoint (M5) returns [] for an owner with no holds, so the
+// TS type is a never-null array though the nil-slice zero marshal is null (the archives
+// shape). aggregate is a nested all-scalar object (no null).
+{
+  const _recoveryCustodyHoldsMissing: never = null as unknown as Exclude<keyof RecoveryCustodyHolds, keyof typeof recoveryCustodyHoldsFull>;
+  const _recoveryCustodyHoldsExtra: never = null as unknown as Exclude<keyof typeof recoveryCustodyHoldsFull, keyof RecoveryCustodyHolds>;
+  const _recoveryCustodyHoldsZero: ZeroOf<RecoveryCustodyHolds, "holds"> = recoveryCustodyHoldsZero;
+  const _recoveryCustodyHoldsFull: Widen<RecoveryCustodyHolds> = recoveryCustodyHoldsFull;
+  void _recoveryCustodyHoldsMissing;
+  void _recoveryCustodyHoldsExtra;
+  void _recoveryCustodyHoldsZero;
+  void _recoveryCustodyHoldsFull;
+}
+
 // ── Runtime self-checks ─────────────────────────────────────────────────────
 // A contract that passes on a missing fixture, or on a zero.json with no null in
 // it, is the false-green shape this repo documents repeatedly. These fatal
@@ -859,6 +925,14 @@ const dtos: { stem: string; nullable: boolean }[] = [
   // so its zero.json carries a null the M2 mapper normalizes to [].
   { stem: "recovery_archive", nullable: false },
   { stem: "recovery_archive_summary", nullable: true },
+  // PRD #1349 M1: the owner-facing custody-hold DTOs. recovery_custody_hold's only nullable
+  // field (released_at) plus worker_name/capture_state are all omitempty, so its zero.json
+  // carries no null (the finding shape); recovery_custody_aggregate is all ints (no null);
+  // recovery_custody_holds' holds slice is non-omitempty, so its zero.json carries a null the
+  // endpoint normalizes to [].
+  { stem: "recovery_custody_hold", nullable: false },
+  { stem: "recovery_custody_aggregate", nullable: false },
+  { stem: "recovery_custody_holds", nullable: true },
 ];
 
 describe("api-contract fixtures are present and discriminating", () => {

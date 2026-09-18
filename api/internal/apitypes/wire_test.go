@@ -200,6 +200,11 @@ var runDTOKeys = []string{
 	// clamped and pool-aware and is routinely EARLIER than the reported reset.
 	"wait_on_limit", "limit_resets_at", "retry_not_before", "limit_wait_count",
 	"rate_limit_type",
+	// PRD #1392 M1: the forge pre-clone park surface. recovery_wait_cause is the typed park
+	// cause (null = untyped/legacy park); recovery_retry_not_before is the recovery-park
+	// promotion stamp (a distinct column from retry_not_before, the limit park's); forge_park_count
+	// is the forge-only lifetime counter; forge_park_max is the effective cap (0 = unlimited).
+	"recovery_wait_cause", "recovery_retry_not_before", "forge_park_count", "forge_park_max",
 	// PRD #841 M1: the per-run MR-rework override, tri-state *bool (null = inherit the
 	// owner default, resolved live). NOT omitempty — always on the wire, so the web can
 	// tell "no per-run opinion" (null) from an explicit true/false and render the
@@ -230,6 +235,9 @@ var runDTOKeys = []string{
 	// PRD #1064 M2: the server-derived "now" line (RunActivity object or null). On both
 	// list and detail via the RunListItemDTO embed.
 	"current_activity",
+	// PRD #1247 M1: the per-run credential override, the pending held-state switch state,
+	// and the applied-switch attribution journal. All three non-omitempty.
+	"credential_override", "credential_switch", "credential_epochs",
 }
 
 func TestRunDTOTags(t *testing.T) {
@@ -735,6 +743,10 @@ var workerDTOKeys = []string{
 	// Read-only display for the workers UI.
 	"capabilities",
 	"max_concurrent_runs",
+	// PRD #1390 M2c: what this worker SAYS it is executing (its worker_active_runs snapshot),
+	// each entry a {run_id, phase, claim_generation}. ALWAYS a JSON array, never null — the
+	// list/patch overlay reads it from the DB and the builders seed it to []. Display-only.
+	"reported_runs",
 	// PRD #1296 M4 (D4): true when the worker holds an OPEN durable-recovery custody hold —
 	// it retained committed work a run could not publish. Distinct from busy (a held worker
 	// consumes no run/LLM slot) but still counts against the per-owner hosted quota.
@@ -765,6 +777,11 @@ var workerDTOKeys = []string{
 	// PRD #111 M3: HOW this worker chooses — default | pinned | auto. The server
 	// reports the EFFECTIVE mode, so "pinned" always has an id beside it.
 	"anthropic_bind_mode",
+	// PRD #1391 M5: the worker's last-reported outbox depth, summed across its runs.
+	// Null until it reports a non-empty outbox (re-nulled once drained). Overlaid from
+	// an in-process, restart-losing tracker, never stored — this tag set is the only
+	// wire contract these four fields have.
+	"outbox_pending_messages", "outbox_pending_terminal", "outbox_stale_retired", "outbox_blocked",
 }
 
 func TestWorkerDTOTags(t *testing.T) {
@@ -1000,10 +1017,13 @@ func TestRecoveryArchiveSummaryDTOTags(t *testing.T) {
 // These are Bearer-only worker/owner exchanges, never SPA DTOs, so they are pinned here
 // rather than in the api-contract fixtures.
 func TestRecoveryWorkerRPCTags(t *testing.T) {
+	gen := int64(2)
 	assertTags(t, "RecoveryReserveRequest", RecoveryReserveRequest{},
 		"run_id", "idempotency_key", "source_sha")
-	assertTags(t, "RecoveryReserveRequest(full)", RecoveryReserveRequest{AttemptedHeadSha: "h"},
-		"run_id", "idempotency_key", "source_sha", "attempted_head_sha")
+	// PRD #1349 M1: generation is *int64 omitempty (a v2 worker names its claim generation;
+	// a v1 worker omits it), so the full case surfaces it beside attempted_head_sha.
+	assertTags(t, "RecoveryReserveRequest(full)", RecoveryReserveRequest{AttemptedHeadSha: "h", Generation: &gen},
+		"run_id", "idempotency_key", "source_sha", "attempted_head_sha", "generation")
 	assertTags(t, "RecoveryReserveResponse", RecoveryReserveResponse{}, "capture_id", "state")
 	assertTags(t, "RecoveryUploadManifest", RecoveryUploadManifest{},
 		"byte_size", "checksum", "chunk_count")
@@ -1018,4 +1038,19 @@ func TestRecoveryWorkerRPCTags(t *testing.T) {
 		"capture_id", "state", "manifest_bound", "byte_size", "checksum", "reason", "expires_at")
 	assertTags(t, "RecoveryReleaseResponse", RecoveryReleaseResponse{},
 		"run_id", "released", "holds_released")
+	// PRD #1349 M1: retained + reason are omitempty, present only on the v1/ambiguous retain path.
+	assertTags(t, "RecoveryReleaseResponse(full)", RecoveryReleaseResponse{Retained: true, Reason: "r"},
+		"run_id", "released", "holds_released", "retained", "reason")
+	// PRD #1349 M1: the worker-facing exact-generation release request (generation is the sole
+	// field, *int64 omitempty — the zero value marshals {} and a v2 caller adds generation).
+	assertTags(t, "RecoveryReleaseRequest", RecoveryReleaseRequest{})
+	assertTags(t, "RecoveryReleaseRequest(full)", RecoveryReleaseRequest{Generation: &gen}, "generation")
+	// PRD #1349 M1: the post-clone hold inventory. capture_state is omitempty (absent when the
+	// hold has no capture yet); hold_id/generation/has_available_capture are always on the wire.
+	assertTags(t, "RecoveryHoldDTO", RecoveryHoldDTO{},
+		"hold_id", "generation", "has_available_capture")
+	assertTags(t, "RecoveryHoldDTO(full)", RecoveryHoldDTO{CaptureState: "preparing"},
+		"hold_id", "generation", "has_available_capture", "capture_state")
+	// holds is NOT omitempty (present-as-null on the zero value; the service normalizes to []).
+	assertTags(t, "RecoveryHoldsResponse", RecoveryHoldsResponse{}, "run_id", "holds")
 }
