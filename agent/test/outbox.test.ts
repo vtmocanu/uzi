@@ -1295,6 +1295,45 @@ describe("Outbox M3 terminal-journal store (PRD #1391 Run B)", () => {
     assert.equal(b.listPendingTerminals()[0]?.blocked, true);
   });
 
+  it("T6b. marking a terminal blocked releases the reserve on ENOSPC and persists across restart", async () => {
+    const root = await mkRoot();
+    const reservePath = path.join(root, ".reserve");
+    let terminalFileWrites = 0;
+    let retrySawReleasedReserve = false;
+    const rawWrite: RawWriteSeam = async (write, ctx) => {
+      if (ctx.kind === "terminal" && path.basename(ctx.path).startsWith("terminal-8.json.")) {
+        terminalFileWrites++;
+        if (terminalFileWrites === 2) {
+          assert.ok(existsSync(reservePath), "reserve is present when the blocked-state rewrite hits ENOSPC");
+          const err = new Error("no space left on device") as NodeJS.ErrnoException;
+          err.code = "ENOSPC";
+          throw err;
+        }
+        if (terminalFileWrites === 3) {
+          assert.ok(!existsSync(reservePath), "reserve is released before retrying the blocked-state rewrite");
+          retrySawReleasedReserve = true;
+        }
+      }
+      await write();
+    };
+    const o = makeOutbox(root, { rawWrite });
+    await o.init();
+    await o.journalTerminal("r1", 8, "reviewing", 9, canonicalizeTerminalBody({ status: "completed" }, 1 << 20));
+
+    const reason: TerminalBlockedReason = "completion_permit_mismatch";
+    await o.markTerminalBlocked("r1", 8, reason);
+
+    assert.equal(retrySawReleasedReserve, true, "the blocked-state rewrite retried after releasing the reserve");
+    assert.ok(existsSync(reservePath), "reserve replenishment was attempted after the retry");
+    assert.equal(statSync(reservePath).size, OUTBOX_RANGE_RESERVE_BYTES, "the reserve was replenished to its configured size");
+    assert.equal((await o.readTerminalJournal("r1", 8))?.blockedReason, reason, "the rewritten journal is blocked");
+
+    const b = makeOutbox(root);
+    await b.init();
+    assert.equal(b.depthFor("r1")?.blockedReason, reason, "the reserve-backed blocked state survives restart");
+    assert.equal(b.listPendingTerminals()[0]?.blocked, true);
+  });
+
   it("T7. a pending terminal journal survives restart and blocks retention of an otherwise-empty run", async () => {
     const root = await mkRoot();
     const clock = 5_000_000;

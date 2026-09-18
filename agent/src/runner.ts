@@ -1114,7 +1114,7 @@ export class RunRunner {
     //    lease before we read ownership. No-op when no usable outbox is wired.
     await this.resolveRunPendingTerminals(runId);
 
-    const claimGen = claim.claim_generation;
+    const claimGen = claim.claim_generation ?? 0;
     // 1b. SC4 guard (fact 6): the drain does NOT always clear the journal — a `blocked`/`gap_unrecoverable`
     //     record is left for the owner (D13), a `messages_pending` keep waits on an undrained run, and a
     //     send that could not land stays installed for a later resolve. In all of those the outcome is

@@ -190,6 +190,23 @@ describe("RunRunner queued-duplicate claim router (PRD #1391 Run B M4)", () => {
       "ending the attempt sends NO terminal report — the run keeps its authoritative status",
     );
   });
+
+  it("an omitted claim generation still guards a pending generation-zero outcome (SC4)", async () => {
+    const outbox = await mkOutbox();
+    const gen = 0;
+    const { runId, secondExecuted, probes } = await driveQueuedDuplicate({
+      outbox,
+      configureProbe: async (rid) => {
+        api.setOwnershipStatus(rid, "running", gen);
+        await outbox.journalTerminal(rid, gen, "running", 0, { status: "completed" });
+        await outbox.markTerminalBlocked(rid, gen, "gap_unrecoverable");
+      },
+    });
+
+    assert.equal(secondExecuted, false, "a legacy claim cannot execute over its pending generation-zero outcome");
+    assert.equal(probes, 0, "the pending-outcome guard ends the attempt before probing ownership");
+    assert.equal(outbox.hasPendingTerminal(runId, gen), true, "the blocked generation-zero journal stays pending");
+  });
 });
 
 describe("RunRunner phaseClone first-running-ack guard (PRD #1391 Run B M4)", () => {

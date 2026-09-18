@@ -1175,8 +1175,12 @@ export class Outbox {
       if (parsed) {
         const next = { ...parsed, blocked: true, blocked_reason: reason };
         // Re-seal + rewrite atomically (rename-based): the exclusive first-writer guarantee is only
-        // for the INITIAL install; updating blocked-state is the owner's own follow-up write.
-        await this.writeFileAtomic(dst, this.seal(MAC_DOMAIN_TERMINAL, next), "terminal");
+        // for the INITIAL install; updating blocked-state is the owner's own follow-up write. The
+        // rewrite needs temporary-file space too, so it must release the reserve on ENOSPC just like
+        // the initial terminal install; otherwise a full volume can strand an unblocked journal.
+        await this.withReserveOnEnospc(() =>
+          this.writeFileAtomic(dst, this.seal(MAC_DOMAIN_TERMINAL, next), "terminal"),
+        );
       } else {
         this.log.warn("outbox: terminal journal unreadable while marking blocked; updating in-memory only", {
           run_id: runId,
@@ -1645,13 +1649,13 @@ export class Outbox {
   }
 
   /** Run `fn`, and on `ENOSPC` release the reserve to free space, retry once, then
-   *  replenish the reserve. Used for range-record writes (D2). */
+   *  replenish the reserve. Used for reserve-backed range and terminal writes (D2). */
   private async withReserveOnEnospc<T>(fn: () => Promise<T>): Promise<T> {
     try {
       return await fn();
     } catch (err) {
       if (!isENOSPC(err)) throw err;
-      this.log.warn("outbox: ENOSPC on a range write; releasing reserve to admit it", {});
+      this.log.warn("outbox: ENOSPC on a reserve-backed write; releasing reserve to admit it", {});
       await this.releaseReserve();
       try {
         return await fn();

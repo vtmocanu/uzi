@@ -497,13 +497,12 @@ func (s *Service) enqueueRunInput(ctx context.Context, runID uuid.UUID, kind, bo
 // (a foreign run is hidden as ErrRunNotFound, matching the pre-lock GetRun — no admin bypass, so an
 // admin_ro token can never cancel), closing the same TOCTOU completion_decision closes. A tx-less
 // deployment (fake-store unit tests, txBeginner unwired) falls back to the same single UPDATE via
-// s.q: it self-locks the matched row and re-evaluates the predicate under READ COMMITTED, so the
-// atomicity guarantee holds without the explicit lock ordering.
+// s.q, then owner-scoped re-reads the run after a 0-row result.
 //
-// 0 rows means the lease cleared under the lock — a replayed terminal SetState won, or the lease
-// expired — so nothing was cancelled here and the run is already terminal; the winning transition
-// fired its own side effects, so this returns success WITHOUT the cancel-specific fan-out (which
-// would broadcast a spurious "cancelled" over a completed run).
+// A 0-row guarded cancel is ambiguous: a replayed terminal SetState may have won, or the pending
+// lease may merely have expired, rotated or cleared while the run stayed active. Success is correct
+// only for the terminal winner; an active run returns ErrOutcomePendingCancelRaced so the owner can
+// re-read and retry instead of being told a cancellation happened when it did not.
 func (s *Service) cancelPendingOutcomeRun(ctx context.Context, userID uuid.UUID, run store.Run, body string) (SubmitInputResult, error) {
 	runID := run.ID
 	params := store.CancelRunServerSideWithPendingOutcomeParams{ID: runID, UserID: userID, StopReason: stopReasonParam(body)}
@@ -534,6 +533,21 @@ func (s *Service) cancelPendingOutcomeRun(ctx context.Context, userID uuid.UUID,
 		if err != nil {
 			return SubmitInputResult{}, err
 		}
+		if rows == 0 {
+			current, readErr := qtx.GetRunByIDForUpdate(ctx, runID)
+			if readErr != nil {
+				if errors.Is(readErr, pgx.ErrNoRows) {
+					return SubmitInputResult{}, ErrRunNotFound
+				}
+				return SubmitInputResult{}, readErr
+			}
+			if current.UserID != userID {
+				return SubmitInputResult{}, ErrRunNotFound
+			}
+			if !terminalStatuses[current.Status] {
+				return SubmitInputResult{}, ErrOutcomePendingCancelRaced
+			}
+		}
 		if err := tx.Commit(ctx); err != nil {
 			return SubmitInputResult{}, err
 		}
@@ -543,6 +557,15 @@ func (s *Service) cancelPendingOutcomeRun(ctx context.Context, userID uuid.UUID,
 		rows, err = s.q.CancelRunServerSideWithPendingOutcome(ctx, params)
 		if err != nil {
 			return SubmitInputResult{}, err
+		}
+		if rows == 0 {
+			current, readErr := s.GetRun(ctx, userID, runID)
+			if readErr != nil {
+				return SubmitInputResult{}, readErr
+			}
+			if !terminalStatuses[current.Status] {
+				return SubmitInputResult{}, ErrOutcomePendingCancelRaced
+			}
 		}
 	}
 	if rows == 0 {

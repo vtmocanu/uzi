@@ -786,6 +786,10 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 			// rather than string-matching the prose. Owner-only: a foreign/admin-ro caller resolves
 			// 0 rows upstream and 404s, never reaching here.
 			httpx.ErrorReason(w, http.StatusConflict, err.Error(), "outcome_pending_confirmation_required")
+		case errors.Is(err, workersvc.ErrOutcomePendingCancelRaced):
+			// The confirmed discard lost the pending-lease race while the run stayed active.
+			// Nothing was cancelled; surface a retryable state conflict rather than false success.
+			httpx.ErrorReason(w, http.StatusConflict, err.Error(), "outcome_pending_changed")
 		case errors.Is(err, workersvc.ErrStopNotInteractive):
 			// 409: a run-state conflict. Only an interactive task run's park honors a
 			// graceful stop; on any other run nothing would wind it down.

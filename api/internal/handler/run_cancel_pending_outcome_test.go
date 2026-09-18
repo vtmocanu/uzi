@@ -46,6 +46,10 @@ func (s *pendingOutcomeStore) RunHasPendingOutcomeLease(_ context.Context, id uu
 	return id == s.run.ID, nil
 }
 
+func (s *pendingOutcomeStore) CancelRunServerSideWithPendingOutcome(_ context.Context, _ store.CancelRunServerSideWithPendingOutcomeParams) (int64, error) {
+	return 0, nil
+}
+
 func newPendingOutcomeHandler(st workersvc.Store) *Handler {
 	// A nonzero heartbeat-stale window so a fresh worker reads as live; the terminal_pending lease
 	// (RunHasPendingOutcomeLease) is then the only reason hasLivePoller reports no poller.
@@ -90,6 +94,39 @@ func TestCreateRunInputPendingOutcomeConfirmationRequired(t *testing.T) {
 	}
 	if strings.TrimSpace(got.Error) == "" {
 		t.Errorf("error message is empty; want the human-readable guidance beside the reason")
+	}
+}
+
+// TestCreateRunInputPendingOutcomeCancelRaceConflict pins the 0-row race response: a confirmed
+// discard whose pending lease changed while the run stayed active is a typed retryable 409, never
+// a false 200 saying the run was cancelled.
+func TestCreateRunInputPendingOutcomeCancelRaceConflict(t *testing.T) {
+	owner := store.User{ID: uuid.New()}
+	runID := uuid.New()
+	st := &pendingOutcomeStore{ownerID: owner.ID, worker: freshWorker(), run: store.Run{
+		ID: runID, UserID: owner.ID, Kind: runkind.Issue, Status: "running",
+		WorkerID: pgUUIDv(uuid.New()),
+	}}
+	h := newPendingOutcomeHandler(st)
+
+	w := httptest.NewRecorder()
+	h.CreateRunInput(w, inputReq(owner, runID, `{"kind":"cancel","discard_pending_outcome":true}`))
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (body: %s)", w.Code, w.Body.String())
+	}
+	var got struct {
+		Error  string `json:"error"`
+		Reason string `json:"reason"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode body: %v (%s)", err, w.Body.String())
+	}
+	if got.Reason != "outcome_pending_changed" {
+		t.Fatalf("reason = %q, want outcome_pending_changed (body: %s)", got.Reason, w.Body.String())
+	}
+	if strings.TrimSpace(got.Error) == "" {
+		t.Error("error message is empty; want retry guidance")
 	}
 }
 

@@ -241,6 +241,11 @@ var (
 	// web/CLI detect; with the discard bit set the cancel proceeds to the atomic no-live-poller
 	// branch (CancelRunServerSideWithPendingOutcome). Nothing is ever discarded on a timer.
 	ErrOutcomePendingConfirmationRequired = errors.New("cancel refused: this run has a pending outcome held on its worker; retry with discard_pending_outcome to discard it")
+	// ErrOutcomePendingCancelRaced rejects a confirmed discard whose guarded cancel matched
+	// zero rows while the run is still active. The pending lease expired, rotated or cleared
+	// after confirmation; reporting success would leave the run active while telling the owner
+	// it was cancelled. The handler maps this retryable state conflict to a typed 409.
+	ErrOutcomePendingCancelRaced = errors.New("pending outcome changed while cancelling; retry")
 	// ErrRunNotAwaitingInput rejects an `answer` for a run that is not parked on a
 	// clarification question (PRD #88 M1) → 409. Its sibling ErrStaleAnswer covers the
 	// run that IS parked but on a DIFFERENT question — the two are separated because
