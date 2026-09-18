@@ -296,6 +296,9 @@ tasks:
       # directory is touched. This gates clone capture, bare-ref fallback, fail-closed
       # publication/exit status, retention pruning and detached-loop terminal pruning.
       - task: test:uzi-watcher-backups
+      # Hermetic regressions for the landing scripts: no network, forge or live PR.
+      # They pin review routing, fail-closed quota timing and stale-base push behavior.
+      - task: test:uzi-lander
       # cheapest-first: this whole-file duplicate check is sub-second, so it runs
       # before `scan:secrets`, which is deliberately last because it dominates.
       - task: check:spec-numbering
@@ -856,6 +859,13 @@ tasks:
     cmds:
       - ./.agents/skills/uzi-watcher/scripts/backup-runs.test.sh
       - ./.agents/skills/uzi-watcher/scripts/backup-loop.test.sh
+
+  test:uzi-lander:
+    desc: hermetic tests of uzi-lander review routing, quota timing and stale-base push guards
+    cmds:
+      - ./.agents/skills/uzi-lander/scripts/cr-rate-limit.test.sh
+      - ./.agents/skills/uzi-lander/scripts/land-prep.test.sh
+      - ./.agents/skills/uzi-lander/scripts/watch-pr.test.sh
 
   test:release-scripts:
     desc: offline fixture test of the release-train scripts (builds a temp git repo; PRD 1265)

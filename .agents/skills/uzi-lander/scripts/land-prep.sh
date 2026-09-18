@@ -22,11 +22,10 @@
 #   --repo-root DIR  the checkout whose .git the worktree is added to (default: cwd's root).
 #
 # Guards, in order: no active mr_rework on the MR (a rework push would collide; the check
-# fails CLOSED when uzi cannot answer); the remote branch head is read when the landing
-# starts, persisted in the worktree's git dir, and the push is `--force-with-lease=<branch>:
-# <that head>` even on a --skip-rebase re-entry, so a push that landed in between (a rework,
-# a human) fails instead of being overwritten; the branch must be the PR's own head branch
-# in THIS repository (never main, never a renovate branch, never a fork's).
+# fails CLOSED when uzi cannot answer); the remote branch head and base SHA are persisted
+# when the landing starts; the push uses a branch lease and refuses if either coordinate
+# moved during gates or a --skip-rebase re-entry; the branch must be the PR's own head
+# branch in THIS repository (never main, never a renovate branch, never a fork's).
 #
 # Exit codes (callers branch on these; keep them stable):
 #   0  pushed (or, with --no-push, prepared) — prints NEW_HEAD=<sha>; a push re-triggers
@@ -39,8 +38,8 @@
 #   6  migration renumber needs hand work — the helper's report is printed and the tree is
 #      left dirty in the worktree: fix the other references, commit, re-run --skip-rebase
 #   7  a gate failed — log path printed; fix in the worktree, commit, re-run --skip-rebase
-#   8  the remote head moved since this landing started, or the worktree and the remote
-#      have diverged with no landing on record — start over with --fresh
+#   8  the remote head or base moved since this landing started, or the worktree and the
+#      remote diverged with no landing on record — start over with --fresh
 set -uo pipefail
 
 REPO=""; PR=""; WT=""; SKIP_REBASE=0; GATE="auto"; PUSH=1; ROOT=""; REWORK_CHECK=1; FRESH=0
@@ -116,6 +115,7 @@ mrw_check || exit 4
 
 # ---- worktree -----------------------------------------------------------------------------
 git -C "$ROOT" fetch origin "$BRANCH" "$BASE" --quiet || { echo "git fetch failed" >&2; exit 3; }
+base_now=$(git -C "$ROOT" rev-parse "origin/$BASE" 2>/dev/null) || { echo "cannot resolve origin/$BASE" >&2; exit 3; }
 # A branch can be checked out in only one worktree: if one already holds it (this session
 # or an earlier one made it), reuse that path instead of failing on `worktree add`.
 existing=$(git -C "$ROOT" worktree list --porcelain | awk -v b="refs/heads/$BRANCH" '$1=="worktree"{p=$2} $1=="branch" && $2==b {print p}' | head -1)
@@ -145,18 +145,26 @@ fi
 # otherwise a restart would accept an intervening remote commit into the lease and then
 # overwrite it with the stale local branch. A landing ends when the push succeeds (the file
 # is removed) or when you start over with --fresh, which resets the worktree to the remote.
-LEASE_FILE="$(git rev-parse --git-dir)/uzi-lander-lease-$PR"
+GIT_DIR=$(git rev-parse --git-dir)
+LEASE_FILE="$GIT_DIR/uzi-lander-lease-$PR"
+BASE_FILE="$GIT_DIR/uzi-lander-base-$PR"
 remote_now=$(git ls-remote origin "refs/heads/$BRANCH" | cut -f1)
 [ -n "$remote_now" ] || { echo "cannot read the remote head of $BRANCH" >&2; exit 3; }
 if [ "$FRESH" -eq 1 ]; then
   [ -z "$(git status --porcelain)" ] || { echo "worktree is dirty; --fresh would discard it" >&2; exit 3; }
-  git reset -q --hard "origin/$BRANCH"; rm -f "$LEASE_FILE"; log "--fresh: worktree reset to origin/$BRANCH (${remote_now:0:8})"
+  git reset -q --hard "origin/$BRANCH"; rm -f "$LEASE_FILE" "$BASE_FILE"; log "--fresh: worktree reset to origin/$BRANCH (${remote_now:0:8})"
 fi
 if [ -f "$LEASE_FILE" ]; then
   LEASE=$(cat "$LEASE_FILE")
+  [ -f "$BASE_FILE" ] || { log "landing has no recorded base; start over with --fresh"; echo "RESULT=base_unknown"; exit 8; }
+  BASE_SHA=$(cat "$BASE_FILE")
   if [ "$remote_now" != "$LEASE" ]; then
     log "remote $BRANCH moved ${LEASE:0:8} -> ${remote_now:0:8} since this landing started; start over with --fresh (resets the worktree)"
     echo "RESULT=remote_moved"; exit 8
+  fi
+  if [ "$base_now" != "$BASE_SHA" ]; then
+    log "remote $BASE moved ${BASE_SHA:0:8} -> ${base_now:0:8} since this landing started; start over with --fresh"
+    echo "RESULT=base_moved"; exit 8
   fi
 else
   [ "$SKIP_REBASE" -eq 0 ] || { echo "no lease recorded for #$PR in this worktree; run once without --skip-rebase" >&2; exit 8; }
@@ -173,7 +181,9 @@ else
     echo "RESULT=diverged"; exit 8
   fi
   LEASE="$remote_now"
+  BASE_SHA="$base_now"
   printf '%s' "$LEASE" > "$LEASE_FILE"
+  printf '%s' "$BASE_SHA" > "$BASE_FILE"
 fi
 
 # ---- rebase -----------------------------------------------------------------------------
@@ -267,8 +277,15 @@ if [ "$remote_now" != "$LEASE" ]; then
   echo "RESULT=remote_moved"
   exit 8
 fi
+base_remote_now=$(git ls-remote origin "refs/heads/$BASE" | cut -f1)
+[ -n "$base_remote_now" ] || { echo "cannot read the remote head of $BASE" >&2; exit 3; }
+if [ "$base_remote_now" != "$BASE_SHA" ]; then
+  log "remote $BASE moved ${BASE_SHA:0:8} -> ${base_remote_now:0:8} during preparation; refusing stale-base push"
+  echo "RESULT=base_moved"
+  exit 8
+fi
 if git push --force-with-lease="${BRANCH}:${LEASE}" origin "HEAD:refs/heads/${BRANCH}" --quiet; then
-  rm -f "$LEASE_FILE"
+  rm -f "$LEASE_FILE" "$BASE_FILE"
   log "pushed ${NEW_HEAD:0:8} (lease ${LEASE:0:8}); a re-review follows — run watch-pr.sh"
   echo "RESULT=pushed NEW_HEAD=$NEW_HEAD OLD_HEAD=$HEAD0 WORKTREE=$WT"
   exit 0

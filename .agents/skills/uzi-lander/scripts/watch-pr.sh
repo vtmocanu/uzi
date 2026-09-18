@@ -38,7 +38,9 @@
 #      (scripts/cr-rate-limit.sh --wait), then trigger `@coderabbitai review` ONCE.
 #   6  no reviewer will come on its own: CodeRabbit skipped this head (its status names
 #      the reason: base branch, >100 files, ignored title keyword) or is absent past the
-#      grace, and Greptile has not reviewed it. Trigger a bot or fall back to /code-review.
+#      grace, and Greptile has not reviewed it. Trigger a bot or use a local reviewer.
+#   7  CodeRabbit rejected `@coderabbitai review` because it considers the last commit
+#      already reviewed; post `@coderabbitai full review` once, then re-run this watcher.
 #
 # "CodeRabbit reviewed this head" is the union of three robust signals, because a
 # zero-actionable incremental review can post NO new review object AND re-anchor no
@@ -216,7 +218,7 @@ while [ "$i" -lt "$MAX" ]; do
   # summary); N is relative to that comment's updated_at, so it is converted to a
   # REMAINING figure here. Read from the newest such comment, independently of the
   # exactly-one walkthrough rule (it is informational, not a merge signal).
-  cr_reset_min=""
+  cr_reset_min=""; cr_full_required=0
   if issue_c=$(gh api --paginate "repos/$REPO/issues/$PR/comments" 2>/dev/null) && pages_are_arrays "$issue_c"; then
     wt_count=$(printf '%s' "$issue_c" | jq -rs '[.[][]|select(.user.login=="coderabbitai[bot]")|select(.body|contains("<!-- walkthrough_start -->"))]|length' 2>/dev/null) || unknown=1
     if [ "${wt_count:-0}" -eq 1 ]; then
@@ -240,6 +242,24 @@ while [ "$i" -lt "$MAX" ]; do
         fi
       fi
     fi
+    # A normal review command can receive a terminal "already reviewed" reply while the
+    # status remains the stale Review completed from an older head. Surface the prescribed
+    # full-review command immediately, but only once: a later user full-review command
+    # suppresses this state while CodeRabbit starts it.
+    cr_full_required=$(printf '%s' "$issue_c" | jq -rs '
+      ([.[][]|select(((.user.login|test("\\[bot\\]$"))|not)
+                      and (((.body // "")|gsub("^\\s+|\\s+$";""))=="@coderabbitai review"))]|last) as $ask
+      | if $ask==null then 0 else
+          ([.[][]|select(.user.login=="coderabbitai[bot]" and .created_at>$ask.created_at
+                         and ((.body // "")|contains("Already reviewed the last commit"))
+                         and ((.body // "")|contains("@coderabbitai full review")))]|last) as $reply
+          | if $reply==null then 0 else
+              ([.[][]|select(((.user.login|test("\\[bot\\]$"))|not)
+                             and .created_at>$reply.created_at
+                             and (((.body // "")|gsub("^\\s+|\\s+$";""))=="@coderabbitai full review"))]|length) as $full
+              | if $full==0 then 1 else 0 end
+            end
+        end' 2>/dev/null) || unknown=1
   else
     unknown=1
   fi
@@ -345,7 +365,7 @@ while [ "$i" -lt "$MAX" ]; do
 
   eqnote=""
   [ "$equiv" -eq 1 ] && eqnote=" equiv=1"
-  echo "try $i: head=${head:0:8} req_fail=$fail req_pend=$pend req_cancel=$cancel mrw_active=$mrw_active cr_reviewed=$cr_reviewed${eqnote} cr_status='${cr_desc:-absent}' greptile=$gr_state${gr_summary:+ ($gr_summary)} live=$live (cr=$cr_live gr=$gr_live cr_unconfirmed=$cr_unconfirmed)${unknown:+ unknown=$unknown}"
+  echo "try $i: head=${head:0:8} req_fail=$fail req_pend=$pend req_cancel=$cancel mrw_active=$mrw_active cr_reviewed=$cr_reviewed${eqnote} cr_status='${cr_desc:-absent}' cr_full_required=$cr_full_required greptile=$gr_state${gr_summary:+ ($gr_summary)} live=$live (cr=$cr_live gr=$gr_live cr_unconfirmed=$cr_unconfirmed)${unknown:+ unknown=$unknown}"
 
   # A failed lookup this iteration: defer, do not decide on masked values.
   if [ "$unknown" -ne 0 ]; then sleep "$INTERVAL"; continue; fi
@@ -366,7 +386,10 @@ while [ "$i" -lt "$MAX" ]; do
       echo "RESULT=findings live=$live cr=$cr_live gr=$gr_live cr_unconfirmed=$cr_unconfirmed"; exit 3
     fi
     # CI settled, no review on this head. Is one coming, or must the caller act?
-    if [ "$cr_pending" -eq 1 ] || [ "$gr_state" = "in_progress" ] || [ "$gr_state" = "queued" ]; then
+    if [ "$cr_full_required" -eq 1 ] && [ "$REVIEWER" != "greptile" ] && [ "$REVIEWER" != "none" ]; then
+      echo "RESULT=cr_full_review_required command='@coderabbitai full review'"
+      exit 7
+    elif [ "$cr_pending" -eq 1 ] || [ "$gr_state" = "in_progress" ] || [ "$gr_state" = "queued" ]; then
       : # a review is in flight; keep polling
     elif [ "$cr_limited" -eq 1 ] && [ "$REVIEWER" != "greptile" ] && [ "$gr_reviewed" -eq 0 ]; then
       echo "RESULT=cr_rate_limited${cr_reset_min:+ CR_RESET_MIN=$cr_reset_min}"
