@@ -71,6 +71,11 @@
       "description": "shellcheck is pinned in two managers (ci.yml tarball+sha via github-release-attachments; Taskfile lint:shell arg via github-releases). Group so a bump moves both in lockstep in one PR.",
       "matchDepNames": ["koalaman/shellcheck"],
       "groupName": "shellcheck"
+    },
+    {
+      "description": "KinD toolchain: group helm/kind-action and kindest/node when both update because the action's bundled kind must understand the node image's kubeadm API. KinD smoke remains the gate for one-sided releases.",
+      "matchPackageNames": ["helm/kind-action", "kindest/node"],
+      "groupName": "KinD toolchain"
     }
   ]
 }
