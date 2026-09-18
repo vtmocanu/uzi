@@ -1,6 +1,6 @@
 ---
 name: uzi-lander
-description: "Lands a uzi run's pull request on this GitHub-hosted repo, taking over at any point after dispatch: polls a running run blind to its terminal state, chooses a local reviewer for small/mechanical PRs or CodeRabbit/Greptile for large/high-risk PRs, handles review findings, uzi's own mr_rework, local fixes, rebase and migration renumbering, the admin merge and post-merge CI, reporting one status line per state change. Claims each PR in a shared per-repo board so several landing sessions (Claude or Codex) coordinate priority and quota. The deterministic steps are bundled scripts (takeover, claims, watch-pr, cr-rate-limit, review-quota, land-prep, merge, watch-run-ci, trail). Use when the user says take over run X, land PR N, babysit the PR, drive it home, watch the PR to merge, wait for CodeRabbit, or fix the review findings. Triggers include take over the run, land the PR, babysit, drive it home, uzi lander, CR rate limited, greptile review, merge it when green."
+description: "Lands a uzi run's pull request on this GitHub-hosted repo, taking over at any point after dispatch: polls a running run blind to its terminal state, decides whether Renovate-class PRs need independent review, chooses local or bot reviewers for other PRs by risk, handles findings, uzi's own mr_rework, local fixes, rebase and migration renumbering, the admin merge and post-merge CI, reporting one status line per state change. Claims each PR in a shared per-repo board so several landing sessions (Claude or Codex) coordinate priority and quota. The deterministic steps are bundled scripts (takeover, claims, watch-pr, cr-rate-limit, review-quota, land-prep, merge, watch-run-ci, trail). Use when the user says take over run X, land PR N, babysit the PR, drive it home, watch the PR to merge, wait for CodeRabbit, or fix the review findings. Triggers include take over the run, land the PR, babysit, drive it home, uzi lander, CR rate limited, greptile review, merge it when green."
 ---
 
 # uzi lander — take over a run and land its PR
@@ -40,12 +40,14 @@ Below, `RUN` is a run id, `PR` a PR number, `S` this skill's `scripts/` director
 - **Scripts do the deterministic parts.** Your judgment is: what a finding means, fix vs
   rework vs skip, whether to wait for a re-review, resolving a conflict, and the merge
   decision itself. When a step turns out to be mechanical, put it in a script.
-- **Scale the reviewer before waiting.** Small/mechanical PRs (dependencies, generated
-  lockfiles, docs, copy, config) get one local reviewer agent pinned to the head, then
-  `watch-pr.sh --reviewer none`. Reserve CodeRabbit/Greptile for large or high-risk work
-  (security, auth, credentials, data integrity, subtle state/concurrency). A `renovate/*`
-  PR or our replacement for a red Renovate PR stays Renovate-class; get user approval
-  before requesting a review bot for it.
+- **Scale the reviewer before waiting.** Small/mechanical non-Renovate PRs get one local
+  reviewer pinned to the head, then `watch-pr.sh --reviewer none`. For a `renovate/*` PR
+  or our replacement for a red Renovate PR, decide whether an independent review adds
+  value from the effective diff and risk. Exact version pins plus generated lockfile churn
+  may rely on green CI; code/config semantics, install scripts, native binaries, security or
+  toolchain risk, and unexplained lockfile changes need review. State the decision. Reserve
+  CodeRabbit/Greptile for large or high-risk work, and get user approval before requesting
+  a review bot for Renovate-class work.
 - **Absent user = time is cheap.** In a large/high-risk bot lane, when the choice is wait
   for CodeRabbit or switch reviewer, say it in one line with the default, start the patient
   path in the same turn, and let a reply override it.
@@ -74,7 +76,8 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
 | `claimed_by_other` | another live lander holds it: message the owner, take the patient path |
 | `mr_rework_active` | `S/wait-mrrework.sh` (references/mr-rework.md), then re-snapshot |
 | `ci_pending`, `review_pending` | step 2 |
-| `cr_rate_limited`, `no_review` | step 3 |
+| `cr_rate_limited` | step 2, choose the review requirement |
+| `no_review` | step 2, choose the review requirement |
 | `findings` | step 4 |
 | `ready` | step 6 |
 | `merged` | step 7 |
@@ -88,10 +91,13 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    is `uzi-watcher`'s job; `limit_wait` / `pool_wait` / `recovery_wait` / `paused` → one
    trail line, keep polling. `failed` / `cancelled` → `uzi-watcher`. `completed` → the PR
    is `uzi run get RUN --field mr_web_url`; trail `pr opened`; re-snapshot.
-2. **Choose the review lane, then wait for readiness.** For a small/mechanical PR,
-   dispatch one local reviewer agent on the immutable head and run the waiter with
-   `--reviewer none` in parallel; both must finish clean. For a large/high-risk PR, select
-   CodeRabbit or Greptile and let an auto-review already in progress finish.
+2. **Choose the review lane, then wait for readiness.** For a Renovate-class PR, inspect
+   the effective diff against the current base and decide whether review is needed. If not,
+   state why and use `--reviewer none`; green CI is the independent signal. If review adds
+   value, use one local reviewer by default or a user-approved bot. For other
+   small/mechanical PRs, dispatch one local reviewer on the immutable head and run the
+   waiter with `--reviewer none` in parallel; both must finish clean. For large/high-risk
+   PRs, select CodeRabbit or Greptile and let an auto-review already in progress finish.
 
    ```
    S/watch-pr.sh OWNER/REPO PR 60 60 [--reviewer any|coderabbit|greptile|none] [--reviewer-grace MIN]
@@ -99,7 +105,7 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
 
    | exit | meaning | next |
    |---|---|---|
-   | 0 | CI green, head reviewed, 0 live findings, no rework | step 6 |
+   | 0 | CI green, chosen review requirement satisfied, 0 live findings, no rework | step 6 |
    | 1 | required CI red | fix locally (step 4) or flake |
    | 2 | timeout | inspect; never merge on it |
    | 3 | live findings (CR + Greptile) | step 4 |
@@ -110,8 +116,9 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
 
    Let an auto-review that is already running finish; never re-trigger it.
 3. **The selected bot review is absent.** This step applies only when step 2 selected
-   CodeRabbit or Greptile; `--reviewer none` is an intentional local-review lane, not a
-   missing review. First run `S/review-quota.sh OWNER/REPO`, then batch fixes into one push.
+   CodeRabbit or Greptile; `--reviewer none` is an intentional local-review or
+   CI-sufficient Renovate lane, not a missing review. First run `S/review-quota.sh
+   OWNER/REPO`, then batch fixes into one push.
    - **Rate-limited (exit 5).** Tell the user in one line with the default wait and the
      local alternative. When quota timing matters, run
      `S/cr-rate-limit.sh OWNER/REPO PR --query --wait`: the exact two-word query is
@@ -184,10 +191,10 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    (drops claims whose PR merged or closed and orphans of dead sessions), and hand any
    still-open item on.
 
-## Always yours, whichever reviewer ran
+## Always yours, whichever review lane applies
 
-The selected reviewer is the independent pass after uzi's own wave; these checks are nobody
-else's, and they precede every merge (step 6):
+The chosen review requirement complements uzi's own wave; these checks are nobody else's,
+and they precede every merge (step 6):
 
 - **Workflow files.** `gh pr diff PR --name-only` filtered on `.github/workflows/`, then
   the two-dot merge-safety check `git fetch origin BRANCH && git diff --name-only
@@ -200,9 +207,10 @@ else's, and they precede every merge (step 6):
   no more, no less? A dropped milestone or an unplanned surface is a finding (step 4); a
   milestone reframed and documented is not.
 - **Pin every local review to the immutable head.** One focused local reviewer is the
-  default for small/mechanical diffs. Large/high-risk diffs use the stronger bot lane,
-  briefed with the plan's invariants; add a bespoke specialist only when the risk class
-  needs one.
+  default for small/mechanical non-Renovate diffs. For Renovate-class work, record the
+  explicit review-needed or CI-sufficient decision. Large/high-risk diffs use the stronger
+  bot lane, briefed with the plan's invariants; add a bespoke specialist only when the risk
+  class needs one.
 
 ## Several landers on one repo
 
@@ -215,8 +223,9 @@ session-peers registry, so a Codex thread with a shim is a peer like any Claude 
   `S/review-quota.sh`: every push to an eligible PR and every `@coderabbitai review` is one
   review from the shared quota.
 - **Order: reserve bot quota for big PRs.** Priority defaults to the PR's file count. A
-  large or trust-boundary PR can justify CodeRabbit/Greptile; a small PR uses a local
-  reviewer and consumes no bot quota. The sessions decide among themselves
+  large or trust-boundary PR can justify CodeRabbit/Greptile; a small non-Renovate PR uses
+  a local reviewer, while a Renovate-class PR may use CI alone after the agent's explicit
+  risk decision. Neither consumes bot quota. The sessions decide among themselves
   (SendMessage, one line: what you hold, what you are about to consume, what you propose);
   the user overrides with `--priority`.
 - **Dependencies.** `S/claims.sh claim '#B' --depends-on '#A'` when B must land after A;
