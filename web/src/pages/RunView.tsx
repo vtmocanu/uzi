@@ -87,7 +87,7 @@ export { JudgePanel, JUDGE_POLL_MAX_TRIES, TriageSummary } from "./runView/Judge
 
 // PRD #1227 M4: the owner completion-decision surface, an exported component re-exported here
 // (mirroring CompletionStatePanel's exported shape) so its tests can import it from ./RunView.
-export { CompletionDecisionPanel, milestoneCriterionId } from "./runView/CompletionDecisionPanel";
+export { CompletionDecisionPanel } from "./runView/CompletionDecisionPanel";
 
 // stageForMessages: latest-message → human stage label (a tool-slug → stage
 // map, adapted to uzi's message kinds).
@@ -105,7 +105,7 @@ const TOOL_STAGE: Record<string, string> = {
   Task: "Delegating to a subagent",
 };
 
-export function stageForMessages(messages: RunMessage[]): string {
+function stageForMessages(messages: RunMessage[]): string {
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
     if (m.kind === "tool_result") return "Working";
@@ -1321,10 +1321,9 @@ export function MrReworkPanel({
  * inline note on the panel, distinct from the page-level actionErr banner: a token
  * pooled — or the run resumed elsewhere — between render and click is not a failure.
  *
- * Exported like LimitWaitPanel so the copy and the resume/409 handling are reachable
- * without mounting the whole page.
+ * Kept as a named component so its pool-specific behavior stays isolated from RunView.
  */
-export function PoolWaitPanel({
+function PoolWaitPanel({
   run,
   canSteer = true,
   onResumed,

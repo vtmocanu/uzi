@@ -39,7 +39,7 @@ const ERROR_ID = "completion-decision-error";
 // excluded). Centralized in this one helper so if the convention ever changes there is a single
 // site to fix; the server is fail-closed (an unknown criterion id → 400), so the derivation is
 // safe to send.
-export function milestoneCriterionId(milestoneId: string): string {
+function milestoneCriterionId(milestoneId: string): string {
   return `${milestoneId}.c1`;
 }
 

@@ -35,7 +35,7 @@ import { RateLimitForecastMeter } from "./RateLimitForecast";
 // array. An empty array means the user holds no credential at all — the surfaces
 // render nothing rather than a "no token" meter, which is what they already did
 // for the old no_token status.
-export function useMyRateLimits(intervalMs: number): {
+function useMyRateLimits(intervalMs: number): {
   tokens: TokenRateLimits[] | null;
   loading: boolean;
 } {
