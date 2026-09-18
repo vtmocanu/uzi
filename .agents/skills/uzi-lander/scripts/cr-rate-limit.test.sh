@@ -34,6 +34,16 @@ if [ "${1:-}" = pr ] && [ "${2:-}" = comment ]; then
     {user:{login:"tester"},body:"@coderabbitai rate limit",created_at:$a,updated_at:$a},
     {user:{login:"coderabbitai[bot]"},body:("More reviews will be available in " + $n + " minutes"),created_at:$r,updated_at:$r}
   ]' > "$COMMENTS"
+  if [ "${LATER_WALKTHROUGH:-0}" = 1 ]; then
+    later=$(jq -nr 'now+4|todate')
+    jq --arg t "$later" '. + [{
+      user:{login:"coderabbitai[bot]"},
+      body:"<!-- auto-generated comment: rate limited by coderabbit.ai -->\nNext included review available in 60 minutes\n<!-- end of auto-generated comment: rate limited -->",
+      created_at:$t,
+      updated_at:$t
+    }]' "$COMMENTS" > "$COMMENTS.next"
+    mv "$COMMENTS.next" "$COMMENTS"
+  fi
   exit 0
 fi
 if [ "${1:-}" = api ]; then
@@ -61,8 +71,8 @@ export COMMENTS="$WORK/comments.json"
 export POSTED="$WORK/posted"
 export STATUS_COUNT="$WORK/status-count"
 
-# A stale success status must not suppress an explicitly requested exact quota query.
-MODE="query"; export MODE
+# A stale success status and later-edited walkthrough must not suppress or override the exact reply.
+MODE="query"; LATER_WALKTHROUGH=1; export MODE LATER_WALKTHROUGH
 printf '[]\n' > "$COMMENTS"
 set +e
 bash "$SCRIPT" test/repo 42 --query > "$WORK/query.out" 2>&1

@@ -101,6 +101,25 @@ reset_from_pr() {
   return 0
 }
 
+# Exact query mode ignores a later-edited walkthrough: only a qualifying bot reply after
+# this invocation's command can answer it. Prints "<epoch-of-reset>\treply" or nothing.
+reset_from_reply_after() {
+  local asked_at=$1 comments b n ts base
+  comments=$(gh api --paginate "repos/$REPO/issues/$PR/comments" 2>/dev/null | jq -s 'add // []') || return 1
+  printf '%s' "$comments" | jq -e 'type=="array"' >/dev/null 2>&1 || return 1
+  b=$(printf '%s' "$comments" | jq -r --arg a "$asked_at" \
+    '[.[]|select(.user.login=="coderabbitai[bot]" and .created_at>$a
+                 and ((.body // "")|test("More reviews will be available in [0-9]+ minutes")))]
+     |last|select(.!=null)|"\(.created_at)\t\(.body)"' 2>/dev/null)
+  [ -n "$b" ] || return 0
+  ts=$(printf '%s' "$b" | head -1 | cut -f1)
+  n=$(printf '%s' "$b" | grep -oE 'More reviews will be available in [0-9]+ minutes' | tail -1 | grep -oE '[0-9]+' || true)
+  if [ -n "$n" ] && [ -n "$ts" ] && base=$(iso2epoch "$ts") && [ -n "$base" ]; then
+    printf '%s\treply\n' "$(( base + n*60 ))"
+  fi
+  return 0
+}
+
 report() {  # $1 = reset epoch or "", $2 = source
   local now rem
   now=$(date +%s)
@@ -154,13 +173,11 @@ if { [ "$QUERY" -eq 1 ] || [ -z "$reset_ts" ]; } && [ "$ASK" -eq 1 ]; then
   fi
   for _ in $(seq 1 12); do
     sleep 15
-    row=$(reset_from_pr) || continue
-    src=$(printf '%s' "$row" | cut -f2)
-    # Only a reply posted after our ask counts (a stale earlier reply would mislead).
-    if [ "$src" = "reply" ]; then
-      newest=$(gh api --paginate "repos/$REPO/issues/$PR/comments" 2>/dev/null | jq -s 'add // []' \
-        | jq -r --arg a "$asked_at" '[.[]|select(.user.login=="coderabbitai[bot]" and (.body|test("More reviews will be available")) and .created_at > $a)]|length')
-      if [ "${newest:-0}" -ge 1 ]; then reset_ts=$(printf '%s' "$row" | cut -f1); break; fi
+    row=$(reset_from_reply_after "$asked_at") || continue
+    if [ -n "$row" ]; then
+      reset_ts=$(printf '%s' "$row" | cut -f1)
+      src=$(printf '%s' "$row" | cut -f2)
+      break
     fi
   done
 fi
