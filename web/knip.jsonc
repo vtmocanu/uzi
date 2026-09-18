@@ -27,17 +27,13 @@
 // ANYWHERE IN THIS TREE TODAY, so the residual is open for all seven; it is
 // recorded in the MR rather than closed here.
 {
-  // ---- SUPPRESSIONS. Three day-one findings, each verified against the tree. ----
+  // ---- EXPLICIT ENTRIES. -------------------------------------------------------
 
   // `public/theme-preinit.js` is loaded by `web/index.html` as
-  // `<script src="/theme-preinit.js">`. Vite copies `public/` verbatim and the
-  // reference is a URL rather than an import, so knip cannot resolve it and reports
-  // the file as unused. It is an EXTERNAL file specifically so nginx's CSP can stay
-  // `script-src 'self'` with no `'unsafe-inline'` (PRD #21, and `web/nginx.conf`'s
-  // own comment says so). Acting on the finding would break pre-paint theming in
-  // every nginx-served build AND the CSP rationale, in one edit.
-  "ignore": ["public/**"],
-
+  // `<script src="/theme-preinit.js">`. Knip 6.35+ resolves Vite public scripts,
+  // while the currently pinned 6.34 needs it declared explicitly. Keeping it as an
+  // entry is valid for both versions and keeps its imports in scope.
+  //
   // `scripts/gen-favicon-png.mjs` is a hand-run generator (its own header says
   // `node web/scripts/gen-favicon-png.mjs`), so it is an ENTRY POINT that happens to
   // be invoked by a human rather than by a build. Declared as `entry` and not
@@ -52,7 +48,7 @@
   // their own (`index.html` -> `src/main.tsx`, `vite.config.ts`, the test files), and
   // those are additive to this. Verified by measurement, not by assumption: with this
   // key present the report is unchanged except for the one file it removes.
-  "entry": ["scripts/gen-favicon-png.mjs"],
+  "entry": ["public/theme-preinit.js", "scripts/gen-favicon-png.mjs"],
 
   // ---- SEVERITY STAGING (PRD #103 Decision 4, Success Criterion 2). ------------
   //

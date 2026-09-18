@@ -146,7 +146,7 @@ export function codexShapeError(raw: string): string | null {
 // carries no such bindings). The default is reachable here only as the LAST
 // credential (D6 blocks deleting a default while others exist), so that branch is
 // the disconnect-my-account case.
-export function codexDeleteWarning(label: string, isDefault: boolean): string {
+function codexDeleteWarning(label: string, isDefault: boolean): string {
   if (isDefault) {
     return `Delete “${label}”? This is your last Codex credential — uzi will no longer be connected to your OpenAI account.`;
   }
