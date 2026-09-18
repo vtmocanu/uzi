@@ -53,18 +53,25 @@ epoch_utc(){
 }
 STARTED_AT="$(epoch_utc "$START_EPOCH")"
 ENDS_AT="$(epoch_utc "$END")"
-{
-  echo "pid=$$"
-  echo "status=running"
-  echo "context=${UZI_CTX:-<unset: current kube context>}"
-  echo "namespaces=${UZI_WORKER_NS:-uzi-workers uzi-workers-docker}"
-  echo "interval_seconds=$INTERVAL"
-  echo "max_hours=$MAX_HOURS"
-  echo "started_at=$STARTED_AT"
-  echo "ends_at=$ENDS_AT"
-  echo "retention_days=${UZI_BACKUP_RETENTION_DAYS:-14}"
-  echo "runs=${RUNS[*]}"
-} > "$ROOT/backup-loop.state"
+STATE="$ROOT/backup-loop.state"
+write_state(){
+  local status="$1" ended_at="${2:-}" tmp="$STATE.tmp.$$"
+  {
+    echo "pid=$$"
+    echo "status=$status"
+    echo "context=${UZI_CTX:-<unset: current kube context>}"
+    echo "namespaces=${UZI_WORKER_NS:-uzi-workers uzi-workers-docker}"
+    echo "interval_seconds=$INTERVAL"
+    echo "max_hours=$MAX_HOURS"
+    echo "started_at=$STARTED_AT"
+    echo "ends_at=$ENDS_AT"
+    echo "retention_days=${UZI_BACKUP_RETENTION_DAYS:-14}"
+    echo "runs=${RUNS[*]}"
+    [ -n "$ended_at" ] && echo "ended_at=$ended_at"
+  } > "$tmp"
+  mv -f "$tmp" "$STATE"
+}
+write_state running
 llog "started pid=$$ ctx=${UZI_CTX:-<unset>} ns=[${UZI_WORKER_NS:-uzi-workers uzi-workers-docker}] interval=${INTERVAL}s max=${MAX_HOURS}h ends=$ENDS_AT retention=${UZI_BACKUP_RETENTION_DAYS:-14}d runs=${RUNS[*]}"
 
 while :; do
@@ -79,11 +86,18 @@ while :; do
   for RID in "${RUNS[@]}"; do
     s="$("$UZI" run get "$RID" --field status 2>/dev/null)"
     case "$s" in
-      completed|failed|cancelled) llog "retired terminal run $RID status=$s" ;;
+      completed|failed|cancelled)
+        if [ "$backup_rc" -eq 0 ]; then
+          llog "retired terminal run $RID status=$s"
+        else
+          next_runs+=("$RID")
+          llog "keeping terminal run $RID after incomplete backup cycle"
+        fi ;;
       *) next_runs+=("$RID") ;;
     esac
   done
   RUNS=("${next_runs[@]}")
+  write_state running
   [ "${#RUNS[@]}" -eq 0 ] && { llog "all runs terminal; exiting"; break; }
   [ "$(date +%s)" -ge "$END" ] && { llog "max runtime reached; exiting"; break; }
 
@@ -91,8 +105,5 @@ while :; do
   sleep "$INTERVAL"
 done
 rm -f "$ROOT/backup-loop.pid"
-{
-  echo "status=ended"
-  echo "ended_at=$(date -u +%FT%TZ)"
-} >> "$ROOT/backup-loop.state"
+write_state ended "$(date -u +%FT%TZ)"
 llog "loop ended"

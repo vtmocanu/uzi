@@ -39,7 +39,7 @@
 #   UZI_BACKUP_DIR  output root (default: /tmp/uzi-backups)
 #   UZI_BACKUP_RETENTION_DAYS  prune timestamped snapshots older than this many
 #                   24-hour periods (default: 14; 0 disables pruning)
-#   UZI_KUBECTL / UZI_BIN / UZI_JQ   tool overrides (default: from PATH)
+#   UZI_KUBECTL / UZI_BIN / UZI_JQ / UZI_STAT  tool overrides (default: from PATH)
 # Exit: 0 when every active target produced a verified recovery artifact (terminal
 # targets may be status-only); 1 when any active target did not; 2 for bad usage.
 set -u
@@ -47,6 +47,7 @@ set -u
 KUBECTL="${UZI_KUBECTL:-kubectl}"
 UZI="${UZI_BIN:-uzi}"
 JQ="${UZI_JQ:-jq}"
+STAT="${UZI_STAT:-stat}"
 
 CTX="${UZI_CTX:-$("$KUBECTL" config current-context 2>/dev/null)}"
 NAMESPACES="${UZI_WORKER_NS:-uzi-workers uzi-workers-docker}"
@@ -79,13 +80,14 @@ if [ -z "$REPO_SLUG" ]; then
   exit 2
 fi
 
-RUNS=("$@")
-TS="$(date -u +%Y%m%dT%H%M%SZ)"
-DEST="$OUTROOT/$TS"
 # Backups hold unpushed repo work + run transcripts; keep them owner-only (0700
 # dirs / 0600 files) rather than inheriting a lax 022 umask on a shared host.
 umask 077
 mkdir -p "$OUTROOT"
+OUTROOT="$(cd "$OUTROOT" && pwd -P)" || exit 1
+RUNS=("$@")
+TS="$(date -u +%Y%m%dT%H%M%SZ)"
+DEST="$OUTROOT/$TS"
 if ! mkdir "$DEST" 2>/dev/null; then
   DEST="$(mktemp -d "$OUTROOT/${TS}.XXXXXX")" || exit 1
 fi
@@ -98,7 +100,25 @@ failures=0
 recoverable=0
 
 path_mtime(){
-  stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null
+  local value
+  value="$("$STAT" -f %m "$1" 2>/dev/null || true)"
+  # GNU stat accepts -f as "filesystem" mode and exits 0 while printing a
+  # non-numeric result for %m. Validate the value, not only the exit status,
+  # before falling back to GNU's -c spelling.
+  case "$value" in ''|*[!0-9]*) value="$("$STAT" -c %Y "$1" 2>/dev/null || true)" ;; esac
+  case "$value" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s\n' "$value"
+}
+
+canonical_link_dir(){
+  local link="$1" target
+  target="$(readlink "$link" 2>/dev/null)" || return 1
+  case "$target" in
+    /*) ;;
+    *) target="$(dirname "$link")/$target" ;;
+  esac
+  [ -d "$target" ] || return 1
+  (cd "$target" && pwd -P)
 }
 
 prune_old_backups(){
@@ -110,8 +130,8 @@ prune_old_backups(){
   case "$root" in ''|/|"${HOME:-/nonexistent}") log "WARN refusing unsafe backup prune root '$root'"; return 1 ;; esac
   now="$(date +%s)"
   cutoff=$((now - RETENTION_DAYS * 86400))
-  latest="$(readlink "$OUTROOT/latest" 2>/dev/null || true)"
-  latest_attempt="$(readlink "$OUTROOT/latest-attempt" 2>/dev/null || true)"
+  latest="$(canonical_link_dir "$OUTROOT/latest" || true)"
+  latest_attempt="$(canonical_link_dir "$OUTROOT/latest-attempt" || true)"
   for dir in "$root"/*; do
     [ -d "$dir" ] && [ ! -L "$dir" ] || continue
     [ "$(dirname "$dir")" = "$root" ] || continue
@@ -274,16 +294,27 @@ list_pods(){
 }
 
 pod_has_clone(){
-  local ns="$1" pod="$2" stem="$3"
+  local ns="$1" pod="$2" stem="$3" branch="$4" rid="$5" clone journal
+  [ -n "$branch" ] || return 1
+  clone="$RUNNER_BASE/$stem"
   # shellcheck disable=SC2016  # $1/$2 expand in the remote sh, not in this host shell.
   "$KUBECTL" --context "$CTX" -n "$ns" exec "$pod" -c worker -- \
-    sh -c '[ -d "$1/$2/.git" ]' _ "$RUNNER_BASE" "$stem" >/dev/null 2>&1
+    sh -c '[ -d "$1/.git" ]' _ "$clone" >/dev/null 2>&1 || return 1
+  journal="$("$KUBECTL" --context "$CTX" -n "$ns" exec "$pod" -c worker -- \
+    git --git-dir="$REPOS_BASE/$REPO_SLUG.git" config --get "uzi-recovery.$branch.clone" 2>/dev/null)" || return 1
+  # shellcheck disable=SC2016  # $rid/$clone are jq variables supplied with --arg.
+  printf '%s' "$journal" | "$JQ" -e --arg rid "$rid" --arg clone "$clone" \
+    '.runId == $rid and .clonePath == $clone' >/dev/null 2>&1
 }
 
 pod_has_ref(){
-  local ns="$1" pod="$2" ref="$3"
+  local ns="$1" pod="$2" ref="$3" branch="$4" rid="$5" owner
+  [ -n "$branch" ] || return 1
   "$KUBECTL" --context "$CTX" -n "$ns" exec "$pod" -c worker -- \
-    git --git-dir="$REPOS_BASE/$REPO_SLUG.git" show-ref --verify --quiet "$ref" >/dev/null 2>&1
+    git --git-dir="$REPOS_BASE/$REPO_SLUG.git" show-ref --verify --quiet "$ref" >/dev/null 2>&1 || return 1
+  owner="$("$KUBECTL" --context "$CTX" -n "$ns" exec "$pod" -c worker -- \
+    git --git-dir="$REPOS_BASE/$REPO_SLUG.git" config --get "uzi-trackowner.$branch.owner" 2>/dev/null)" || return 1
+  [ "$owner" = "$rid" ]
 }
 
 for RID in "${RUNS[@]}"; do
@@ -376,7 +407,7 @@ for RID in "${RUNS[@]}"; do
   ns=""; pod=""; capture_kind=""
   if [ -n "$preferred" ]; then
     ns="${preferred%% *}"; pod="${preferred#* }"
-    if pod_has_clone "$ns" "$pod" "$STEM"; then capture_kind="clone"; fi
+    if pod_has_clone "$ns" "$pod" "$STEM" "$RUN_BRANCH" "$RID"; then capture_kind="clone"; fi
   fi
 
   # A run may have resumed on a new worker, or its pod may have rolled while an older
@@ -385,7 +416,7 @@ for RID in "${RUNS[@]}"; do
     while read -r cns cpod; do
       [ -n "$cpod" ] || continue
       if [ -n "$preferred" ] && [ "$cns $cpod" = "$preferred" ]; then continue; fi
-      if pod_has_clone "$cns" "$cpod" "$STEM"; then
+      if pod_has_clone "$cns" "$cpod" "$STEM" "$RUN_BRANCH" "$RID"; then
         ns="$cns"; pod="$cpod"; capture_kind="clone"; break
       fi
     done < <(list_pods)
@@ -396,13 +427,13 @@ for RID in "${RUNS[@]}"; do
   if [ -z "$capture_kind" ] && [ -n "$TRACK_REF" ]; then
     if [ -n "$preferred" ]; then
       ns="${preferred%% *}"; pod="${preferred#* }"
-      if pod_has_ref "$ns" "$pod" "$TRACK_REF"; then capture_kind="bare"; fi
+      if pod_has_ref "$ns" "$pod" "$TRACK_REF" "$RUN_BRANCH" "$RID"; then capture_kind="bare"; fi
     fi
     if [ -z "$capture_kind" ]; then
       while read -r cns cpod; do
         [ -n "$cpod" ] || continue
         if [ -n "$preferred" ] && [ "$cns $cpod" = "$preferred" ]; then continue; fi
-        if pod_has_ref "$cns" "$cpod" "$TRACK_REF"; then
+        if pod_has_ref "$cns" "$cpod" "$TRACK_REF" "$RUN_BRANCH" "$RID"; then
           ns="$cns"; pod="$cpod"; capture_kind="bare"; break
         fi
       done < <(list_pods)

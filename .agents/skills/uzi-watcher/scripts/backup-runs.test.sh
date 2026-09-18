@@ -81,6 +81,23 @@ exit 0
 STUB
 chmod +x "$KSTUB"
 
+# stat stub: reproduce GNU stat's surprising contract on every host. `stat -f %m`
+# exits 0 but prints non-numeric filesystem information; `-c %Y` returns the real
+# epoch. This makes the Linux CI failure a deterministic local regression too.
+REAL_STAT="$(command -v stat)"
+cat > "$WORK/stat" <<STUB
+#!/usr/bin/env bash
+if [ "\${1:-}" = -f ]; then echo 'filesystem report, not an epoch'; exit 0; fi
+if [ "\${1:-}" = -c ]; then
+  value="\$("$REAL_STAT" -c %Y "\${3:?}" 2>/dev/null || true)"
+  if ! printf '%s' "\$value" | grep -Eq '^[0-9]+\$'; then value="\$("$REAL_STAT" -f %m "\${3:?}")"; fi
+  printf '%s\n' "\$value"
+  exit 0
+fi
+exec "$REAL_STAT" "\$@"
+STUB
+chmod +x "$WORK/stat"
+
 # make_uzi_stub: write a fake `uzi` that answers `run get --json`. A run id containing
 # "mrr" reports a mr_rework run EXACTLY as the real API does IN-FLIGHT: branch is null
 # and the live branch is in pipeline_ref (agent/issue-9999), so the slug must come from
@@ -126,6 +143,8 @@ git clone -q "$FORGE" "$RUNNER"
 git -C "$RUNNER" config user.email t@example.com
 git -C "$RUNNER" config user.name tester
 git_q "$RUNNER" checkout -b agent/issue-4242
+git --git-dir="$BARE" config 'uzi-recovery.agent/issue-4242.clone' \
+  "{\"runId\":\"run-4242\",\"clonePath\":\"$RUNNER\"}"
 echo dirty >> "$RUNNER/f.txt"   # uncommitted change only
 
 L1="$(run_backup 1)"
@@ -165,6 +184,8 @@ git clone -q "$FORGE" "$RUNNER3"
 git -C "$RUNNER3" config user.email t@example.com
 git -C "$RUNNER3" config user.name tester
 git_q "$RUNNER3" checkout -b agent/issue-9999
+git --git-dir="$BARE" config 'uzi-recovery.agent/issue-9999.clone' \
+  "{\"runId\":\"mrr-1\",\"clonePath\":\"$RUNNER3\"}"
 echo rework >> "$RUNNER3/f.txt"
 git_q "$RUNNER3" commit -am 'mr_rework commit'
 
@@ -181,6 +202,7 @@ echo "PASS case3: mr_rework -> slug from branch (agent-issue-9999), bundle, OK"
 # then remove the clone. This is the exact limit_wait/worker-roll shape observed on #1429.
 git --git-dir="$BARE" fetch -q "$RUNNER" \
   agent/issue-4242:refs/uzi-runner/agent/issue-4242
+git --git-dir="$BARE" config 'uzi-trackowner.agent/issue-4242.owner' run-4242
 rm -rf "$RUNNER"
 
 L4="$(run_backup 4)"
@@ -203,7 +225,7 @@ ln -s "$L4" "$ROOT5/latest"
 set +e
 UZI_CTX=test-ctx UZI_WORKER_NS=ns UZI_REPO_SLUG=testrepo UZI_RUNNER_BASE="$WORK/runner" \
   UZI_REPOS_BASE="$REPOS" UZI_BACKUP_DIR="$ROOT5" UZI_BACKUP_RETENTION_DAYS=14 \
-  UZI_KUBECTL="$KSTUB" UZI_BIN="$WORK/uzi" \
+  UZI_KUBECTL="$KSTUB" UZI_BIN="$WORK/uzi" UZI_STAT="$WORK/stat" \
   bash "$SCRIPT" run-4242 >/dev/null 2>&1
 rc=$?
 set -e
@@ -231,5 +253,54 @@ if rg --files "$ROOT6" | grep -q '[.]tgz$'; then
   fail "case6: no-worker run adopted a stale same-issue ref"
 fi
 echo "PASS case6: no worker binding refuses stale all-pod branch adoption"
+
+# --- case 7: relative latest target remains protected under a symlinked root ---
+git --git-dir="$BARE" update-ref -d refs/uzi-runner/agent/issue-4242
+ROOT7_REAL="$WORK/out.7.real"
+ROOT7_LINK="$WORK/out.7.link"
+mkdir -p "$ROOT7_REAL/20000101T000000Z"
+touch -t 200001010000 "$ROOT7_REAL/20000101T000000Z"
+ln -s 20000101T000000Z "$ROOT7_REAL/latest"
+ln -s "$ROOT7_REAL" "$ROOT7_LINK"
+set +e
+UZI_CTX=test-ctx UZI_WORKER_NS=ns UZI_REPO_SLUG=testrepo UZI_RUNNER_BASE="$WORK/runner" \
+  UZI_REPOS_BASE="$REPOS" UZI_BACKUP_DIR="$ROOT7_LINK" UZI_BACKUP_RETENTION_DAYS=14 \
+  UZI_KUBECTL="$KSTUB" UZI_BIN="$WORK/uzi" UZI_STAT="$WORK/stat" \
+  bash "$SCRIPT" run-4242 >/dev/null 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 1 ] || fail "case7: missing-source run rc=$rc, want 1"
+[ -d "$ROOT7_REAL/20000101T000000Z" ] \
+  || fail "case7: prune deleted the expired relative latest target"
+[ "$(readlink "$ROOT7_REAL/latest")" = 20000101T000000Z ] \
+  || fail "case7: relative latest link changed"
+echo "PASS case7: symlinked root canonicalized, relative latest target protected"
+
+# --- case 8: stale clone and ref owned by another run are rejected --------------
+RUNNER8="$WORK/runner/issue-4242"
+git clone -q "$FORGE" "$RUNNER8"
+git -C "$RUNNER8" config user.email t@example.com
+git -C "$RUNNER8" config user.name tester
+git_q "$RUNNER8" checkout -b agent/issue-4242
+echo foreign >> "$RUNNER8/f.txt"
+git_q "$RUNNER8" commit -am foreign
+git --git-dir="$BARE" fetch -q "$RUNNER8" \
+  agent/issue-4242:refs/uzi-runner/agent/issue-4242
+git --git-dir="$BARE" config 'uzi-recovery.agent/issue-4242.clone' \
+  "{\"runId\":\"foreign-run\",\"clonePath\":\"$RUNNER8\"}"
+git --git-dir="$BARE" config 'uzi-trackowner.agent/issue-4242.owner' foreign-run
+ROOT8="$WORK/out.8"
+set +e
+UZI_CTX=test-ctx UZI_WORKER_NS=ns UZI_REPO_SLUG=testrepo UZI_RUNNER_BASE="$WORK/runner" \
+  UZI_REPOS_BASE="$REPOS" UZI_BACKUP_DIR="$ROOT8" UZI_BACKUP_RETENTION_DAYS=0 \
+  UZI_KUBECTL="$KSTUB" UZI_BIN="$WORK/uzi" \
+  bash "$SCRIPT" run-4242 >/dev/null 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 1 ] || fail "case8: foreign-owned sources rc=$rc, want 1"
+if rg --files "$ROOT8" | grep -q '[.]tgz$'; then
+  fail "case8: foreign-owned clone/ref was captured as current-run work"
+fi
+echo "PASS case8: clone/ref ownership mismatch rejected"
 
 echo "ALL PASS"
