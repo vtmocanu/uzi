@@ -528,7 +528,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310  # v5
         with:
-          version: v4.2.4
+          version: v4.3.0
       - name: helm dependency build
         # Bundles the CNPG `cluster` subchart (oci://ghcr.io/cloudnative-pg/charts,
         # public) per Chart.lock, so the render below is self-contained.
