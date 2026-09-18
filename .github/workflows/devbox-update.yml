@@ -74,7 +74,7 @@ jobs:
       # the first run). Installing the tools ourselves skips it: `devbox update` only
       # re-locks, and the real toolchain install + validation happens in the base-image build.
       - name: Install nix (flakes)
-        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25  # v22
+        uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa  # v23
 
       # The pinned devbox release BINARY (not the self-updating launcher), sha256-verified,
       # matching agent/templates/base/Dockerfile's ARG DEVBOX_VERSION so the lock is
