@@ -67,10 +67,15 @@ func TestVaultBandEscalatesWhenOwnRunParked(t *testing.T) {
 	})
 	line := m.vaultIndicatorLine()
 	plain := stripANSI(line)
-	for _, want := range []string{"VAULT LOCKED", "1 run parked", "unlock to resume"} {
+	for _, want := range []string{"VAULT LOCKED", "1 run parked", "unlock in the web app to resume"} {
 		if !strings.Contains(plain, want) {
 			t.Errorf("escalated band missing %q; got stripped %q", want, plain)
 		}
+	}
+	// Regression pin: the band must NOT name a CLI vault-unlock command — there is none, unlock is
+	// a web/API-only surface, so the copy points at the web app instead.
+	if strings.Contains(plain, "uzi vault unlock") {
+		t.Errorf("band names the non-existent `uzi vault unlock` CLI command; got %q", plain)
 	}
 	// The band and the tier-1 hint are mutually exclusive on the one line: the faint lock glyph
 	// is gone once the band shows.
@@ -286,10 +291,14 @@ func TestVaultBandAsciiFallback(t *testing.T) {
 	m = next.(tuiModel)
 
 	line := m.vaultIndicatorLine()
-	for _, want := range []string{"VAULT LOCKED", "1 run parked", "unlock to resume"} {
+	for _, want := range []string{"VAULT LOCKED", "1 run parked", "unlock in the web app to resume"} {
 		if !strings.Contains(line, want) {
 			t.Errorf("ascii band missing the signal word %q; got %q", want, line)
 		}
+	}
+	// Regression pin: the ascii band must not name a CLI vault-unlock command either (there is none).
+	if strings.Contains(line, "uzi vault unlock") {
+		t.Errorf("ascii band names the non-existent `uzi vault unlock` CLI command; got %q", line)
 	}
 	// No SGR/colour under Ascii: the words alone carry it.
 	if strings.ContainsRune(line, '\x1b') {

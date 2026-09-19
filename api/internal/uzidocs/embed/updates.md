@@ -38,6 +38,13 @@ comparator that silently reports "up to date" for a version that is actually beh
 so it is done exactly once, server-side, and every surface only renders the boolean
 the server already computed.
 
+**`uzi tui` is the one exception**, and it's a different axis on purpose: a startup
+modal comparing this **CLI binary's own version** against the latest published
+release, not this server's currency. The server has no way to know which CLI build
+is asking, so that one comparison is recomputed client-side, from release facts the
+server already serves — see [Startup: an available
+update](cli.md#startup-an-available-update).
+
 ## Far behind and security releases
 
 The escalation banner is reserved for the case worth interrupting an admin for: it

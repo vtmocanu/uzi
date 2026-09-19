@@ -436,12 +436,13 @@ func (m tuiModel) vaultIndicatorLine() string {
 // non-dismissable, and it auto-clears when the lock clears (vaultIndicatorLine returns "" then).
 // It shows a COUNT, never the raw HealthReason, so no untrusted text reaches the frame (D7) — the
 // hostile-render test proves the count path cannot inject. The copy aligns with
-// vault_lock_notice.go and points the fix off-TUI (web / uzi vault unlock).
+// vault_lock_notice.go and points the fix off-TUI, in the web app (there is no CLI
+// vault-unlock command — unlock is a web/API surface only).
 //
 // It reuses the detail screen's attentionBanner fill+ink convention (paintSeg fg/bg, ▌ cap, full
 // width padded to m.width) so the board's one filled surface reads identically to the detail's.
 // Under colorprofile.Ascii the amber fill is stripped for a plain ascii-safe band whose WORDS
-// ("VAULT LOCKED", "N run(s) parked", "unlock to resume") carry the signal with no colour (D4).
+// ("VAULT LOCKED", "N run(s) parked", "unlock in the web app to resume") carry the signal with no colour (D4).
 func (m tuiModel) vaultBand(n int) string {
 	runsWord := "runs"
 	if n == 1 {
@@ -449,12 +450,12 @@ func (m tuiModel) vaultBand(n int) string {
 	}
 	count := itoa(n) + " " + runsWord + " parked"
 	if m.profile == colorprofile.Ascii {
-		return "[VAULT LOCKED] " + count + " - unlock to resume (web, uzi vault unlock)"
+		return "[VAULT LOCKED] " + count + " - unlock in the web app to resume"
 	}
 	amber, fg := m.pal.amber, m.pal.bandFg
 	seg := func(bold bool, s string) string { return paintSeg(fg, amber, bold, s) }
 	left := seg(true, "▌ VAULT LOCKED") +
-		seg(false, " · "+count+" — unlock to resume (web · uzi vault unlock)")
+		seg(false, " · "+count+" — unlock in the web app to resume")
 	return clampVisual(padSeg(left, m.width, amber), m.width)
 }
 
