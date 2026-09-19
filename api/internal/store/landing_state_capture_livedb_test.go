@@ -104,12 +104,39 @@ func TestLandingStateCaptureLiveDB(t *testing.T) {
 		t.Fatalf("RunHasAvailableCapture = %t after an available capture, want true", got)
 	}
 
-	// A non-'available' capture (or a foreign owner) does not count: the EXISTS is
-	// state- AND owner-scoped, so a different owner still reads false.
+	// Owner-scoped: a foreign owner reading the same run+capture still reads false.
 	if got, err := q.RunHasAvailableCapture(ctx, store.RunHasAvailableCaptureParams{RunID: runID, UserID: uuid.New()}); err != nil {
 		t.Fatalf("RunHasAvailableCapture(foreign owner): %v", err)
 	} else if got {
 		t.Fatalf("RunHasAvailableCapture(foreign owner) = %t, want false (owner-scoped)", got)
+	}
+
+	// State-scoped: a capture that exists but is NOT 'available' (here 'preparing') must not
+	// count — this guards the `AND c.state = 'available'` predicate in BOTH read paths
+	// (dropping it would make a still-uploading capture read needs_landing).
+	run2 := uuid.New()
+	exec(`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, status, fail_origin)
+	      VALUES ($1, $2, $3, 'issue', 2, 'seam2', 'ctx', 'failed', 'push_secret_blocked')`, run2, userID, repoID)
+	hold2, cap2 := uuid.New(), uuid.New()
+	exec(`INSERT INTO recovery_custody_holds
+	        (id, user_id, repo_id, run_id, generation, state,
+	         original_worker_id, original_worker_identity, live_worker_id, live_run_id)
+	      VALUES ($1, $2, $3, $4, 1, 'open', $5, $6, $5, $4)`,
+		hold2, userID, repoID, run2, workerID, workerName)
+	exec(`INSERT INTO recovery_captures (id, hold_id, run_id, user_id, original_worker_identity, source_sha, idempotency_key, state)
+	      VALUES ($1, $2, $3, $4, $5, 'H2', 'kprep', 'preparing')`, cap2, hold2, run2, userID, workerName)
+
+	rows, err = q.ListRunsForUser(ctx, store.ListRunsForUserParams{UserID: userID, BackgroundGraceCutoff: cutoff})
+	if err != nil {
+		t.Fatalf("ListRunsForUser(state): %v", err)
+	}
+	if got := findRunRow(t, rows, run2).HasAvailableCapture; got {
+		t.Fatalf("ListRunsForUser has_available_capture = %t for a 'preparing' capture, want false (state-scoped)", got)
+	}
+	if got, err := q.RunHasAvailableCapture(ctx, store.RunHasAvailableCaptureParams{RunID: run2, UserID: userID}); err != nil {
+		t.Fatalf("RunHasAvailableCapture(state): %v", err)
+	} else if got {
+		t.Fatalf("RunHasAvailableCapture = %t for a 'preparing' capture, want false (state-scoped)", got)
 	}
 }
 
