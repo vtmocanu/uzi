@@ -721,6 +721,23 @@ describe("the shared root-entry drop wrapper", () => {
     assert.ok(chmodAt < chownAt, "chmod 0400 must precede chown (runtime has no CAP_FOWNER)");
   });
 
+  it("reclaims the token to root before the chmod so a container RESTART does not abort the entrypoint", () => {
+    // A `docker compose restart` keeps the container AND its secret mount, so the second
+    // boot finds the file already chowned to `worker` by the first. With no CAP_FOWNER
+    // root can no longer chmod it: the call EPERMs and `set -eu` kills the entrypoint
+    // before the worker ever starts, so the api sweeps the worker stale and requeues its
+    // runs (e2e phase 52 case 4, the only place in the suite that restarts rather than
+    // recreates the agent). CAP_CHOWN needs no FOWNER, so the fix is to take the file
+    // back first — which also re-asserts the mode every boot, where an ownership-guarded
+    // chmod would silently leave a widened one in place.
+    const reclaimAt = entrypoint.search(/"\$CHOWN"\s+0:0\s+"\$TOKEN"/);
+    const chmodAt = entrypoint.search(/"\$CHMOD"\s+0400\s+"\$TOKEN"/);
+    const handOverAt = entrypoint.search(/"\$CHOWN"\s+"\$WORKER_OWNER"\s+"\$TOKEN"/);
+    assert.ok(reclaimAt >= 0, "must chown the token back to root before chmod-ing it");
+    assert.ok(reclaimAt < chmodAt, "the reclaim must precede the chmod (no CAP_FOWNER at runtime)");
+    assert.ok(chmodAt < handOverAt, "the chmod must precede the hand-over to worker");
+  });
+
   it("keeps the root startup window off the runner-writable volumes", () => {
     // PATH excludes /nix and /data so root never resolves a binary from a volume.
     assert.match(entrypoint, /PATH=\/usr\/local\/sbin:\/usr\/local\/bin:\/usr\/sbin:\/usr\/bin:\/sbin:\/bin/);
