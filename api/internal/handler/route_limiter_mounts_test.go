@@ -572,6 +572,11 @@ var wantRouteMounts = []routeMount{
 	// other forge-proxying repo routes.
 	{"POST", "/api/repos/{id}/labels/check", limForge},
 	{"POST", "/api/repos/{id}/labels/ensure", limForge},
+	// Request an admin guardrail-override (issue #1432): a web-only member action that
+	// re-runs the LIVE guard (GuardRepo) to snapshot the current findings and enforce
+	// waivability server-side, so it carries the per-user forge budget like the other
+	// forge-proxying repo routes.
+	{"POST", "/api/repos/{id}/override-request", limForge},
 	// Default-schedule catalog list (PRD #589 M2): reads the embedded catalog + the
 	// owner's enablement rows, no forge → noLimiter.
 	{"GET", "/api/schedule-catalog", noLimiter},

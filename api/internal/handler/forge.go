@@ -585,6 +585,18 @@ func (h *Handler) ListProjects(w http.ResponseWriter, r *http.Request) {
 	// A store error degrades gracefully (empty map → field stays nil), never failing
 	// the whole list, matching the docker-allowlist direction.
 	syncLinks := syncLinksForRepos(r.Context(), h.q, repoIDs, "list projects")
+	// PRD #1432: the member's latest override-request per repo, so a not-yet-enabled
+	// blocked repo can surface what they already asked for. Non-fatal on error — this
+	// is enrichment like GuardrailBlocked, so a store failure logs and leaves the map
+	// empty (the field stays nil) rather than failing the whole list.
+	reqMap := map[uuid.UUID]store.GuardrailOverrideRequest{}
+	if reqs, err := h.q.ListGuardrailOverrideRequestsForUser(r.Context(), user.ID); err != nil {
+		slog.Warn("list projects: override requests", "error", err)
+	} else {
+		for _, req := range reqs {
+			reqMap[req.RepoID] = req
+		}
+	}
 	for _, rp := range repos {
 		d := repoToDTO(rp)
 		d.Pipeline = pipelines[rp.ID]
@@ -593,6 +605,15 @@ func (h *Handler) ListProjects(w http.ResponseWriter, r *http.Request) {
 		d.DockerBlocked = blockedSet[rp.ID]
 		if link, ok := syncLinks[rp.ID]; ok {
 			d.GithubProjectSync = syncHealthForLink(link)
+		}
+		// Attach the override-request state to a NOT-yet-enabled repo only: an enabled
+		// repo carries none, so a successful enable does not leave a stale approved
+		// request lingering on the card.
+		if !rp.Enabled {
+			if req, ok := reqMap[rp.ID]; ok {
+				state := overrideRequestStateDTO(req)
+				d.OverrideRequest = &state
+			}
 		}
 		out = append(out, d)
 	}
@@ -737,6 +758,26 @@ func blockFindingMessages(findings []privcheck.Finding) []string {
 	return msgs
 }
 
+// blockFindingDTOs maps exactly the SeverityBlock findings to the wire DTO carried by
+// the enable-refusal 422's "findings" and snapshotted onto a member's override request
+// (PRD #1432). Same filter as blockFindingMessages — overridden and warn findings are
+// excluded — but it keeps the machine-readable Code and Severity alongside the message,
+// so the member UI can drive its "Request admin approval" affordance off the codes
+// rather than parsing prose. Never nil.
+func blockFindingDTOs(findings []privcheck.Finding) []apitypes.GuardrailFindingDTO {
+	out := make([]apitypes.GuardrailFindingDTO, 0, len(findings))
+	for _, f := range findings {
+		if f.Severity == privcheck.SeverityBlock {
+			out = append(out, apitypes.GuardrailFindingDTO{
+				Code:     string(f.Code),
+				Severity: string(f.Severity),
+				Message:  f.Message,
+			})
+		}
+	}
+	return out
+}
+
 // SetRepoEnabled toggles whether a repo is tracked (its board shown, its poller
 // active). Authorization is enforced in the UPDATE (user must own the
 // connection); a non-owned or unknown id returns 404.
@@ -799,6 +840,15 @@ func (h *Handler) SetRepoEnabled(w http.ResponseWriter, r *http.Request) {
 				// reason(s) are in "violations".
 				"error":      "this repo cannot be enabled: uzi will not run while the bot can reach the default branch, or while that cannot be verified (main is never touched). See the reasons below, fix branch protection on the forge, then retry.",
 				"violations": blockFindingMessages(res.Findings),
+				// PRD #1432: machine-readable coded findings + whether an admin override
+				// could actually clear this refusal, computed on res.Findings (the
+				// post-downgrade set, correct for both the non-overridden and
+				// already-overridden cases). These two drive the member's "Request admin
+				// approval" affordance — offered only when waivable is true; a
+				// protection_unreadable block is waivable:false, so the UI steers the
+				// member to fix protection instead.
+				"findings": blockFindingDTOs(res.Findings),
+				"waivable": privcheck.AllBlocksWaivable(res.Findings),
 			})
 			return
 		}
