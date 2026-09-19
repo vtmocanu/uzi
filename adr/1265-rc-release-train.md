@@ -7,7 +7,7 @@
 
 ## Decision (summary)
 
-Releases are cut as **release candidates by default**. `release-cut X.Y.Z` cuts `vX.Y.Z-rc.1`; the tag publishes the five images and the chart at `X.Y.Z-rc.1` exactly as a stable tag does, creates a GitHub Release flagged **pre-release** (never latest), and does **not** publish the Homebrew formula. A stable `vX.Y.Z` is a **promotion** of the in-flight candidate, built from the candidate's own commit on a throwaway release branch, cut in **lockstep** with the next candidate by a single `release-cut Y.Z.W --promote`. Stable-only surfaces — the Homebrew formula, the GitHub Release marked latest, and the in-app update check — never surface a candidate. A deployment opts into running candidates by tracking the Helm `targetRevision` range `0.*-0` instead of `0.*`.
+Releases are cut as **release candidates by default**. `release-cut X.Y.Z` cuts `vX.Y.Z-rc.1`; the tag publishes the five images and the chart at `X.Y.Z-rc.1` exactly as a stable tag does, creates a GitHub Release flagged **pre-release** (never latest), and does **not** publish the Homebrew formula. A stable `vX.Y.Z` is a **promotion** of the in-flight candidate, built from the candidate's own commit on a throwaway release branch, cut in **lockstep** with the next candidate by a single `release-cut Y.Z.W --promote` (or alone, by `release-cut X.Y.Z --promote-only`, when the next candidate is not wanted yet). Stable-only surfaces — the Homebrew formula, the GitHub Release marked latest, and the in-app update check — never surface a candidate. A deployment opts into running candidates by tracking the Helm `targetRevision` range `0.*-0` instead of `0.*`.
 
 ## Context
 
@@ -25,8 +25,11 @@ The publish pipeline was already largely prerelease-aware: `release.yml`'s `asse
 - default, RC in flight for **this** base (`release-cut B` while `vB-rc.N` exists) → the next candidate `vB-rc.(N+1)` (requires `[Unreleased]` empty, D3);
 - default, RC in flight for a **lower** base → refuse (exit 3) and print the facts, so the lead picks a verb;
 - `--promote` → promote the in-flight RC to stable (D5), then cut `vX.Y.Z-rc.1` on main;
+- `--promote-only` (given the in-flight base itself) → promote the in-flight RC to stable (D5) and stop: no next candidate, `main` untouched (amendment, below);
 - `--skip-promote` → abandon the RC, rename its open section to `X.Y.Z` and fold `[Unreleased]` in, cut `vX.Y.Z-rc.1`;
 - `--stable` → a plain `vX.Y.Z` from main's tip (the old one-step model), refused while an RC is in flight.
+
+**Promotion without a next candidate (amended 2026-09-19).** Lockstep assumes the next candidate is wanted the moment a stable is. It is not when `main` has merged work the owner wants held back from the candidate channel: the dogfooding deployment tracks `0.*-0` (D8), so a candidate deploys the moment it publishes. `--promote-only` decouples the halves. It runs D5's promote alone, keyed by the in-flight base so the argument names the stable being created; a next-version argument is refused, since it signals the lead expected a candidate. It keeps the published-RC refusal (D11) and refuses every main-half option (`--changelog-file`, `--no-commit`, `--prev-tag`). Afterwards no RC is in flight, so the next plain `release-cut <next>` is an ordinary `rc.1` whose coverage window starts at the new stable (D4), and the work held back ships there. `--promote` already took this branch implicitly when nothing shipping had landed since the RC and `[Unreleased]` was empty; the verb makes it available by intent instead of by the state of `main`. Cost: `main` is untouched, so its `Chart.yaml` stays at the RC version until the next cut, and its `## [B]` heading keeps the RC-cut date while the stable tag's copy carries the promotion date.
 
 **Tag discovery never sorts a mixed stable/prerelease list.** Git's `version:refname` orders `-rc.N` against its base by string length; the scripts filter stable tags first, and find the in-flight RC by grouping `v*-rc.*` per base and comparing `N` numerically. The script never prompts (D7): refusals exit 3 with the facts and the `uzi-release` skill owns the conversation.
 

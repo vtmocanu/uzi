@@ -640,6 +640,90 @@ if git -C "$S8P" rev-parse -q --verify refs/tags/v0.2.0 >/dev/null; then pass "p
 assert_eq "promote-only does NOT cut a next RC (main chart unchanged)" "$chart_before" "$(chart_ver "$S8P")"
 if has_heading "$S8P" 0.3.0; then fail "promote-only opens NO [0.3.0] section"; else pass "promote-only opens NO [0.3.0] section"; fi
 
+echo "=== M2b: --promote-only (stable from the RC commit, NO next candidate, main untouched) ==="
+# The 0.83.1 case: SHIPPING work landed on main after the RC, it must not ride into the
+# stable, and no next candidate is wanted yet. --promote would cut v0.3.0-rc.1 in lockstep
+# (and, with an empty [Unreleased], fail and roll the stable back); --promote-only tags
+# v0.2.0 from the RC commit and stops, whatever main carries. Same setup as S8.
+S8O="$(mktemp -d)"; seed_repo "$S8O"; add_origin "$S8O"; add_feature "$S8O" 201
+put_changelog "$S8O" <<'MD'
+# Changelog
+
+## [Unreleased]
+### Added
+- **Feature 201** (#201)
+
+## [0.1.0] - 2026-09-01
+### Added
+- **Initial** (#100)
+MD
+run_rc "$S8O" 0.2.0; git -C "$S8O" tag v0.2.0-rc.1; push_tag_to_origin "$S8O" v0.2.0-rc.1
+add_feature "$S8O" 301
+put_changelog "$S8O" <<'MD'
+# Changelog
+
+## [Unreleased]
+### Added
+- **Feature 301** (#301)
+
+## [0.2.0] - 2026-10-01
+### Added
+- **Feature 201** (#201)
+
+## [0.1.0] - 2026-09-01
+### Added
+- **Initial** (#100)
+MD
+head_before="$(git -C "$S8O" rev-parse HEAD)"; chart_before="$(chart_ver "$S8O")"
+run_rc "$S8O" 0.2.0 --promote-only
+assert_eq "--promote-only exits 0" "0" "$RC_RC"
+if git -C "$S8O" rev-parse -q --verify refs/tags/v0.2.0 >/dev/null; then pass "--promote-only creates stable tag v0.2.0"; else fail "--promote-only creates stable tag v0.2.0"; fi
+assert_eq "--promote-only tag chart is stable 0.2.0" "0.2.0" "$(git -C "$S8O" show v0.2.0:deploy/chart/Chart.yaml 2>/dev/null | awk '/^version:/{print $2;exit}')"
+assert_eq "--promote-only stable sits directly on the RC commit" "$(git -C "$S8O" rev-parse 'v0.2.0-rc.1^{commit}')" "$(git -C "$S8O" rev-parse -q --verify 'v0.2.0^{commit}^' 2>/dev/null)"
+if git -C "$S8O" cat-file -e v0.2.0:api/feature_301.go 2>/dev/null; then fail "--promote-only stable excludes main's later shipping work"; else pass "--promote-only stable excludes main's later shipping work"; fi
+assert_eq "--promote-only leaves main's HEAD untouched"   "$head_before"  "$(git -C "$S8O" rev-parse HEAD)"
+assert_eq "--promote-only leaves main's chart untouched"  "$chart_before" "$(chart_ver "$S8O")"
+if has_heading "$S8O" 0.3.0; then fail "--promote-only opens NO next section"; else pass "--promote-only opens NO next section"; fi
+if git -C "$S8O" rev-parse -q --verify refs/heads/release/0.2.0 >/dev/null; then fail "--promote-only leaves no release/0.2.0 branch"; else pass "--promote-only leaves no release/0.2.0 branch"; fi
+assert_contains "--promote-only names what the stable leaves out" "1 shipping commit" "$RC_OUT"
+# The follow-on: with the base promoted no RC is in flight, so the next plain cut is an
+# ordinary rc.1 whose coverage window starts at the new stable (the oracle runs inside it).
+run_rc "$S8O" 0.3.0
+assert_eq "after --promote-only, the next plain cut exits 0"      "0"          "$RC_RC"
+assert_eq "after --promote-only, the next plain cut is 0.3.0-rc.1" "0.3.0-rc.1" "$(chart_ver "$S8O")"
+
+echo "=== M2b: --promote-only refusals ==="
+# It must NAME the in-flight base (the stable being created), never a next version; it takes
+# no main-half options; it keeps --promote's published-RC guard; it needs an RC in flight.
+S8R="$(mktemp -d)"; seed_repo "$S8R"; add_origin "$S8R"; add_feature "$S8R" 201
+put_changelog "$S8R" <<'MD'
+# Changelog
+
+## [Unreleased]
+### Added
+- **Feature 201** (#201)
+
+## [0.1.0] - 2026-09-01
+### Added
+- **Initial** (#100)
+MD
+run_rc "$S8R" 0.2.0; git -C "$S8R" tag v0.2.0-rc.1
+run_rc "$S8R" 0.2.0 --promote-only
+assert_eq "--promote-only refused on a local-only RC exits 3" "3" "$RC_RC"
+assert_contains "--promote-only local-only refusal names the cause" "not on origin" "$RC_OUT"
+if git -C "$S8R" rev-parse -q --verify refs/tags/v0.2.0 >/dev/null; then fail "refused --promote-only (local-only RC) leaves NO v0.2.0 tag"; else pass "refused --promote-only (local-only RC) leaves NO v0.2.0 tag"; fi
+push_tag_to_origin "$S8R" v0.2.0-rc.1
+run_rc "$S8R" 0.3.0 --promote-only
+assert_eq "--promote-only with a version other than the in-flight base exits 3" "3" "$RC_RC"
+assert_contains "--promote-only wrong-version refusal names the base" "in-flight base 0.2.0" "$RC_OUT"
+run_rc "$S8R" 0.2.0 --promote-only --changelog-file /nonexistent/draft.md
+assert_eq "--promote-only with --changelog-file exits 3" "3" "$RC_RC"
+if git -C "$S8R" rev-parse -q --verify refs/tags/v0.2.0 >/dev/null; then fail "refused --promote-only leaves NO v0.2.0 tag"; else pass "refused --promote-only leaves NO v0.2.0 tag"; fi
+S8N="$(mktemp -d)"; seed_repo "$S8N"
+run_rc "$S8N" 0.2.0 --promote-only
+assert_eq "--promote-only with no RC in flight exits 3" "3" "$RC_RC"
+assert_contains "--promote-only with no RC in flight says so" "no RC is in flight" "$RC_OUT"
+
 echo "=== M2b: --promote REFUSED when the in-flight RC is local-only (not on origin) ==="
 # The 0.83.0-rc.7 guard: promotion re-tags the RC's PUBLISHED agent image, so an RC that
 # was never pushed (never built by release.yml) must not promote. Same setup as S8 but the

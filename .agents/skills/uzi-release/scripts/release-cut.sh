@@ -22,6 +22,11 @@
 #                     picks a verb.
 #     --promote       promote the in-flight RC to stable from its own commit (D5), then
 #                     cut vX.Y.Z-rc.1 on main. X.Y.Z must be > the in-flight base.
+#     --promote-only  promote the in-flight RC to stable from its own commit (D5) and STOP:
+#                     no next candidate, main untouched, whatever main has shipped since
+#                     the RC (that work waits for the next plain cut). X.Y.Z must EQUAL
+#                     the in-flight base: it names the stable being created. Takes none of
+#                     --changelog-file / --no-commit / --prev-tag (there is no main half).
 #     --skip-promote  abandon the in-flight RC: rename its open section to X.Y.Z, fold
 #                     [Unreleased] in, cut vX.Y.Z-rc.1. The RC tags/Releases stay history.
 #     --stable        cut a plain vX.Y.Z from main's tip (the old one-step model). An
@@ -44,23 +49,23 @@ set -uo pipefail
 
 VERSION=""; VERB=""; CL_FILE=""; DO_COMMIT=1; PREV_OVERRIDE=""
 set_verb() {
-  if [ -n "$VERB" ]; then echo "release-cut: only one of --promote/--skip-promote/--stable" >&2; exit 3; fi
+  if [ -n "$VERB" ]; then echo "release-cut: only one of --promote/--promote-only/--skip-promote/--stable" >&2; exit 3; fi
   VERB="$1"
 }
 while [ $# -gt 0 ]; do
   case "$1" in
-    --promote|--skip-promote|--stable) set_verb "$1"; shift;;
+    --promote|--promote-only|--skip-promote|--stable) set_verb "$1"; shift;;
     --changelog-file) CL_FILE="${2:?}"; shift 2;;
     --no-commit) DO_COMMIT=0; shift;;
     --prev-tag) PREV_OVERRIDE="${2:?}"; shift 2;;
-    -h|--help) sed -n '2,45p' "$0"; exit 3;;
+    -h|--help) awk 'NR > 1 { if (/^#/) print; else exit }' "$0"; exit 3;;
     -*) echo "release-cut: unknown flag $1" >&2; exit 3;;
     *) if [ -z "$VERSION" ]; then VERSION="$1"; shift
        else echo "release-cut: unexpected arg: $1" >&2; exit 3; fi ;;
   esac
 done
 if [ -z "$VERSION" ]; then
-  echo "usage: release-cut.sh <X.Y.Z> [--promote|--skip-promote|--stable] [--changelog-file FILE] [--no-commit] [--prev-tag TAG]" >&2
+  echo "usage: release-cut.sh <X.Y.Z> [--promote|--promote-only|--skip-promote|--stable] [--changelog-file FILE] [--no-commit] [--prev-tag TAG]" >&2
   exit 3
 fi
 VERSION="${VERSION#v}"
@@ -71,6 +76,11 @@ if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
 fi
 if [ "$DO_COMMIT" -eq 0 ] && [ "$VERB" = "--promote" ]; then
   echo "release-cut: --no-commit is rejected with --promote (the promote half tags unconditionally)" >&2; exit 3
+fi
+# --promote-only has no main half, so every main-half option is meaningless with it. Refuse
+# rather than ignore: a lead passing a changelog draft expects a next candidate to be cut.
+if [ "$VERB" = "--promote-only" ] && { [ -n "$CL_FILE" ] || [ "$DO_COMMIT" -eq 0 ] || [ -n "$PREV_OVERRIDE" ]; }; then
+  echo "release-cut: --promote-only takes no --changelog-file/--no-commit/--prev-tag (it cuts no next candidate and never touches main; use --promote to cut one in lockstep)" >&2; exit 3
 fi
 TODAY="$(date +%F)"
 
@@ -218,6 +228,7 @@ print_inflight_facts() {
     echo "  $cnt first-parent merge(s) on main since it; [Unreleased] is $([ -z "$unrel" ] && echo empty || echo non-empty)."
     echo "  Pick one:"
     echo "    promote it to stable and cut v$VERSION-rc.1:   release-cut $VERSION --promote"
+    echo "    promote it to stable, cut NO next candidate:    release-cut $IB --promote-only"
     echo "    keep testing this base with another candidate:  release-cut $IB"
     echo "    abandon it and cut v$VERSION-rc.1 instead:      release-cut $VERSION --skip-promote"
   } >&2
@@ -234,11 +245,14 @@ if [ -n "$INFLIGHT" ]; then
       elif [ "$cmp_ib" = 1 ]; then print_inflight_facts; exit 3
       else echo "release-cut: $VERSION is below the in-flight candidate $INFLIGHT; refusing." >&2; exit 3; fi ;;
     --promote)      [ "$cmp_ib" = 1 ] || { echo "release-cut: --promote needs a version ABOVE the in-flight base $IB (got $VERSION)." >&2; exit 3; }; OP=promote ;;
+    # --promote-only names the stable it CREATES, so the version must be the in-flight base
+    # itself: a next-version argument here means the lead expected a candidate to be cut.
+    --promote-only) [ "$cmp_ib" = 0 ] || { echo "release-cut: --promote-only names the stable being created, so it needs the in-flight base $IB (got $VERSION). To also cut v$VERSION-rc.1: release-cut $VERSION --promote." >&2; exit 3; }; OP=promoteonly ;;
     --skip-promote) [ "$cmp_ib" = 1 ] || { echo "release-cut: --skip-promote needs a version ABOVE the in-flight base $IB (got $VERSION)." >&2; exit 3; }; OP=skiprc ;;
   esac
 else
   case "$VERB" in
-    --promote|--skip-promote) echo "release-cut: no RC is in flight; nothing to ${VERB#--}." >&2; exit 3 ;;
+    --promote|--promote-only|--skip-promote) echo "release-cut: no RC is in flight; nothing to ${VERB#--}." >&2; exit 3 ;;
     --stable) OP=stable ;;
     "") OP=rc1 ;;
   esac
@@ -253,6 +267,7 @@ case "$OP" in
   rc1|skiprc|promote) TAG="v$VERSION-rc.1"; CHARTVER="$VERSION-rc.1"; BASE="$VERSION" ;;
   nextrc)             RCN=$((IN + 1)); TAG="v$IB-rc.$RCN"; CHARTVER="$IB-rc.$RCN"; BASE="$IB" ;;
   stable)             TAG="v$VERSION"; CHARTVER="$VERSION"; BASE="$VERSION" ;;
+  promoteonly)        TAG="v$IB"; CHARTVER="$IB"; BASE="$IB" ;;   # the stable itself; no main half runs
 esac
 
 # --- shared step helpers ------------------------------------------------------
@@ -416,10 +431,10 @@ promote_guard() {
   local rc=$?
   if [ "$rc" -ne 0 ] && [ -n "$PROMOTED_TAG" ] && [ "$PROMOTE_FINALIZED" -eq 0 ]; then
     git tag -d "$PROMOTED_TAG" >/dev/null 2>&1 \
-      && echo "release-cut: rolled back the local promote tag $PROMOTED_TAG (the RC cut did not complete); fix the cause and re-run." >&2
+      && echo "release-cut: rolled back the local promote tag $PROMOTED_TAG (the RC cut did not complete); fix the cause and re-run. To promote WITHOUT cutting a next candidate: release-cut $IB --promote-only." >&2
   fi
 }
-if [ "$OP" = promote ]; then
+if [ "$OP" = promote ] || [ "$OP" = promoteonly ]; then
   # REFUSE to promote an RC that is not confirmed PUBLISHED on origin. Promotion re-tags
   # the RC's published agent image and folds its notes; an unpushed RC was never built by
   # release.yml, so a promote of it ships a stable chart whose worker pin names an image
@@ -434,7 +449,7 @@ if [ "$OP" = promote ]; then
       echo "  Push the RC tag, let it publish, THEN promote:"
       echo "    ! git push origin $INFLIGHT"
       echo "    .../release-watch.sh ${INFLIGHT#v} && .../release-verify.sh ${INFLIGHT#v}"
-      echo "    release-cut $VERSION --promote"
+      echo "    release-cut $VERSION $VERB"
     } >&2
     exit 3
   elif [ "$rtr" -ne 0 ]; then
@@ -454,6 +469,21 @@ if [ "$OP" = promote ]; then
   unrel="$(changelog_unreleased_body | tr -d '[:space:]')"
   trap promote_guard EXIT
   promote_inflight
+  # --promote-only: the lead asked for the stable alone. Stop here whatever main carries:
+  # shipping work landed after the RC is deliberately NOT in this stable (it is tagged from
+  # the RC commit) and waits for the next plain cut, whose coverage window starts at this
+  # stable. main is untouched, so the same two warts as the implicit branch below apply.
+  if [ "$OP" = promoteonly ]; then
+    PROMOTE_FINALIZED=1
+    echo
+    echo "=== promoted $PROMOTED_TAG only (--promote-only: no next candidate cut, main untouched) ==="
+    if [ "$merges" -gt 0 ] || [ -n "$unrel" ]; then
+      echo "  NOT in $PROMOTED_TAG: $merges shipping commit(s) on main since $INFLIGHT; [Unreleased] is $([ -z "$unrel" ] && echo empty || echo non-empty). They ship with the next candidate (release-cut <next X.Y.Z>)."
+    fi
+    echo "  main is untouched: Chart.yaml stays at the RC version until the next cut, and its [$IB] section keeps the RC-cut date (the tag's copy carries today's)."
+    echo "Next:  git push origin $PROMOTED_TAG"
+    exit 0
+  fi
   if [ "$merges" -eq 0 ] && [ -z "$unrel" ]; then
     PROMOTE_FINALIZED=1
     echo
