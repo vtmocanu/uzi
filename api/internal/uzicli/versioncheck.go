@@ -206,6 +206,14 @@ type versionCheckEntry struct {
 	Version    string    `json:"version"`
 	CheckedAt  time.Time `json:"checked_at"`
 	CLIVersion string    `json:"cli_version,omitempty"`
+	// DismissedUpdateTag is the TUI startup update-prompt's per-version "don't remind
+	// me" dismissal (PRD #1251 M1): the latest-release tag the user asked not to be
+	// prompted about again on THIS server. omitempty so an older file lacking it decodes
+	// to "" (never dismissed) and so a record that only ever held a version-skew reading
+	// gains no key until a dismissal is actually made. It shares this per-server entry
+	// with the skew cache above deliberately — both are "what this CLI last learned about
+	// this server", keyed the same hashed base URL — rather than opening a second file.
+	DismissedUpdateTag string `json:"dismissed_update_tag,omitempty"`
 }
 
 func (s *Store) versionCheckPath() string { return filepath.Join(s.dir, versionCheckFile) }
@@ -313,16 +321,19 @@ func (s *Store) RecordServerVersion(url, version, cliVersion string, now time.Ti
 	}
 	st := s.loadVersionCheckState()
 	key := versionCheckKey(url)
+	prev := st.Servers[key] // zero value when absent
 	if version == "" {
 		// Failed probe: keep whatever version we last learned for this server.
-		if prev, ok := st.Servers[key]; ok {
-			version = prev.Version
-		}
+		version = prev.Version
 	}
 	st.Servers[key] = versionCheckEntry{
 		Version:    version,
 		CheckedAt:  now.UTC(),
 		CLIVersion: cliVersion,
+		// Preserve the TUI startup update-prompt dismissal (PRD #1251 M1): it shares this
+		// per-server record, so a version-skew write must not wipe it (and vice versa — see
+		// RecordDismissedUpdate, which preserves these version fields).
+		DismissedUpdateTag: prev.DismissedUpdateTag,
 	}
 	pruneVersionCheck(st.Servers)
 	b, err := json.Marshal(st)
@@ -336,6 +347,53 @@ func (s *Store) RecordServerVersion(url, version, cliVersion string, now time.Ti
 	// Written through writeFileAtomic rather than os.WriteFile — the rename REPLACES
 	// a symlink instead of following it, which a hand-rolled write would not.
 	return version, writeFileAtomic(s.versionCheckPath(), b, 0o644)
+}
+
+// DismissedUpdateTag returns the release tag the user asked not to be reminded about
+// for url via the TUI startup update prompt's "don't remind me for <tag>" choice (PRD
+// #1251 M1), or "" if none. It mirrors CachedServerVersion's nil-safety and per-server
+// keying: a nil store reads as "nothing dismissed", and an absent record reads the
+// zero-value entry's empty tag. Unlike the version cache there is no TTL — a dismissal
+// is intentional and holds until a NEWER latest tag appears (the caller compares the
+// stored tag against the current latest, so a later release is not dismissed).
+func (s *Store) DismissedUpdateTag(url string) string {
+	if s == nil {
+		return ""
+	}
+	return s.loadVersionCheckState().Servers[versionCheckKey(url)].DismissedUpdateTag
+}
+
+// RecordDismissedUpdate persists that the user dismissed the startup update prompt for
+// tag on url (PRD #1251 M1). It PRESERVES the entry's version-skew fields (Version /
+// CheckedAt / CLIVersion) rather than overwriting them, so a dismissal and the skew
+// cache coexist in one per-server record — the read-back in RecordServerVersion's map
+// key is the same hash, so neither clobbers the other.
+//
+// Best-effort like RecordServerVersion: the error is expected to be IGNORED by the CLI
+// (a read-only $HOME must not break `uzi tui`), and the value is bounded by
+// maxCachedVersionRunes before it lands on disk. Written 0644 through writeFileAtomic,
+// the same file, mode and replace-not-follow-symlink discipline as the version cache.
+func (s *Store) RecordDismissedUpdate(url, tag string) error {
+	if s == nil {
+		return errors.New("no config store")
+	}
+	if r := []rune(tag); len(r) > maxCachedVersionRunes {
+		tag = string(r[:maxCachedVersionRunes])
+	}
+	st := s.loadVersionCheckState()
+	key := versionCheckKey(url)
+	e := st.Servers[key] // zero value when absent; keeps Version/CheckedAt/CLIVersion when present
+	e.DismissedUpdateTag = tag
+	st.Servers[key] = e
+	pruneVersionCheck(st.Servers)
+	b, err := json.Marshal(st)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(s.dir, 0o700); err != nil {
+		return err
+	}
+	return writeFileAtomic(s.versionCheckPath(), b, 0o644)
 }
 
 // pruneVersionCheck drops the oldest entries until at most maxVersionCheckEntries

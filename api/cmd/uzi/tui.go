@@ -142,10 +142,23 @@ type settingsMsg struct {
 // buildInfoMsg carries the connected server's build version (from BuildInfo), which drives
 // the board footer's CLI-vs-server skew banner. Fetched at Init and on the skewTickMsg
 // ticker when the session is allowed to probe (see tuiModel.skewCheck).
+//
+// latest carries the newest upstream release the server knows about (PRD #1251 M1), copied
+// verbatim off the same GET /api/version response — the CLI does NO egress of its own for
+// the update prompt (D6). It is nil until a release check has run AND the feature is
+// enabled (nil = "never checked / disabled" ⇒ show no prompt). Its fields (Version, Name,
+// NotesURL) are server-authored and drawn ONLY through the D7 sanitizers.
 type buildInfoMsg struct {
 	version string
+	latest  *apitypes.LatestReleaseDTO
 	err     error
 }
+
+// brewInfoMsg carries the result of the deterministic brew-detection probe (PRD #1251 M1,
+// R1): isBrew is true when this uzi-cli is a Homebrew install, so the startup update prompt
+// offers the "Update now" action rather than the info-only variant. Produced by
+// detectBrewCmd from the Env.Brew seam; on any doubt or error it is false (info variant).
+type brewInfoMsg struct{ isBrew bool }
 
 // detailRunMsg carries the first GetRun for the drilled-in run (PRD #1137). The header,
 // crew-rail milestones/accounts and now-line render from it, before the transcript.
@@ -361,6 +374,27 @@ type tuiModel struct {
 	// ONCE at model init with the CLI's os.Getenv idiom — never per render. When set the blink
 	// tick is never armed and blinkOn stays false.
 	noBlink bool
+
+	// updatePrompt is the codex-style startup update-prompt modal (PRD #1251 M1): shown once
+	// per session, over the board, when the widened buildInfoMsg reports a newer STABLE
+	// release and the session is allowed to probe. Its full state and the show gate live in
+	// tui_update_prompt.go.
+	updatePrompt updatePromptState
+
+	// brew is the injected `brew` shell-out seam for the update prompt (Env.Brew), used for
+	// deterministic detection (detectBrewCmd) and the foreground `brew upgrade uzi-cli`
+	// hand-off on exit. Assigned from Env in newTUICmd's RunE on the real path; left nil on
+	// the --demo / direct-construction test paths, where the update prompt never runs. Read
+	// nil-safely — a nil brew reports non-brew and never upgrades.
+	brew func(foreground bool, args ...string) (string, error)
+
+	// store and serverURL back the update prompt's per-version "don't remind me" dismissal
+	// (PRD #1251 M1), threaded from newTUICmd's RunE like client/showVersion. store is the
+	// same local config store the CLI's skew cache uses; serverURL is the resolved base URL
+	// the client talks to, the key the dismissal is recorded under. Both may be zero on the
+	// test/demo paths, where dismissedForVersion reads "not dismissed".
+	store     *uzicli.Store
+	serverURL string
 }
 
 func newTUIModel(ctx context.Context, c uzicli.Client, startRun string) tuiModel {
@@ -611,7 +645,10 @@ func (m tuiModel) fetchBuildInfoCmd() tea.Cmd {
 	c, ctx := m.client, m.ctx
 	return func() tea.Msg {
 		info, err := c.BuildInfo(ctx)
-		return buildInfoMsg{version: info.Version, err: err}
+		// Carry info.Latest through verbatim (PRD #1251 M1): it is already on the decoded
+		// response, so the update prompt needs no extra call. nil (no check ran / disabled)
+		// stays nil, which the buildInfoMsg handler reads as "show nothing".
+		return buildInfoMsg{version: info.Version, latest: info.Latest, err: err}
 	}
 }
 
@@ -765,7 +802,10 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// work while the user is deciding to quit), mirroring the strip/skew ticks. Since the reply
 		// is now the only OTHER re-arm site, dropping the tick here would wedge automatic polling
 		// once the modal is dismissed.
-		if m.quitting {
+		// The startup update prompt (PRD #1251 M1) is a modal over the board, like the quit
+		// confirm: keep the tick chain alive but skip the poll while it is up, so background
+		// polling neither stacks nor dies while the user is deciding.
+		if m.quitting || m.updatePrompt.showing {
 			return m, tickAfter(boardTickInterval(m.board.errStreak), m.board.tickGen)
 		}
 		// The in-flight guard (PRD #1130 M1 D1): a periodic tick starts a new board poll ONLY
@@ -790,7 +830,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(cmds...)
 
 	case stripTickMsg:
-		if m.quitting {
+		if m.quitting || m.updatePrompt.showing {
 			return m, stripTickCmd()
 		}
 		return m, tea.Batch(m.fetchRateLimitsCmd(), m.fetchSettingsCmd(), stripTickCmd())
@@ -802,7 +842,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(tea.RequestBackgroundColor, themeTickCmd())
 
 	case skewTickMsg:
-		if m.quitting {
+		if m.quitting || m.updatePrompt.showing {
 			return m, skewTickCmd()
 		}
 		return m, tea.Batch(m.fetchBuildInfoCmd(), skewTickCmd())
@@ -1059,6 +1099,17 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err == nil && msg.version != "" {
 			m.serverVersion = msg.version
 		}
+		// The startup update prompt (PRD #1251 M1), evaluated ONCE per session on the first
+		// eligible reply (shownThisSession latches it). All the gating lives in maybeShowUpdatePrompt;
+		// when it opens the modal it kicks the brew-detection probe so the brew/non-brew variant
+		// resolves without blocking the board.
+		return m, (&m).maybeShowUpdatePrompt(msg.latest)
+
+	case brewInfoMsg:
+		// The deterministic brew-detection reply (PRD #1251 M1, R1): flips the modal to the
+		// "Update now" variant when this is a Homebrew install, leaving the info variant otherwise.
+		m.updatePrompt.isBrew = msg.isBrew
+		m.updatePrompt.brewKnown = true
 		return m, nil
 
 	case detailRunMsg:
@@ -1307,6 +1358,11 @@ func (m tuiModel) handleKey(k string) (tea.Model, tea.Cmd) {
 		m.showHelp = false
 		return m, nil
 	}
+	// The startup update prompt (PRD #1251 M1) is modal: it captures every key except the
+	// ctrl+c quit handled above, so it sits before the q/? shortcuts and the view dispatch.
+	if m.updatePrompt.showing {
+		return m.updatePromptKey(k)
+	}
 	if k == keyQuit && !m.filtering() {
 		return m, tea.Quit
 	}
@@ -1357,6 +1413,10 @@ func (m tuiModel) View() tea.View {
 		body = m.pal.box.Render("Quit uzi tui?  [y] quit   [any other key] stay")
 	case m.showHelp:
 		body = m.renderHelp()
+	case m.updatePrompt.showing:
+		// Placed AFTER quitting/showHelp so ctrl+c can still reach the quit modal (PRD #1251 M1);
+		// the modal captures every other key in handleKey.
+		body = m.renderUpdatePrompt()
 	case m.view == viewDetail:
 		body = m.renderDetail()
 	case m.view == viewPulls:
@@ -1431,10 +1491,27 @@ func newTUICmd(env Env, gf *globalFlags) *cobra.Command {
 			// The reduced-motion opt-out is read ONCE here, with the CLI's os.Getenv idiom
 			// (root.go), never per render (PRD #1064 D4).
 			m.noBlink = os.Getenv("UZI_TUI_NO_BLINK") == "1"
+			// The startup update prompt's seams (PRD #1251 M1), assigned like showVersion above:
+			// the brew shell-out, the config store for the per-version dismissal, and the resolved
+			// server URL the dismissal is keyed under. resolveSettings already succeeded inside
+			// env.client just above, so its error is swallowed here — a missing URL only means the
+			// dismissal degrades to session-only.
+			m.brew = env.Brew
+			m.store = env.Store
+			if s, serr := resolveSettings(env, gf); serr == nil {
+				m.serverURL = s.URL
+			}
 			p := tea.NewProgram(m, tea.WithContext(cmd.Context()),
 				tea.WithInput(env.Stdin), tea.WithOutput(env.Stdout))
-			if _, err := p.Run(); err != nil {
+			final, err := p.Run()
+			if err != nil {
 				return uzicli.Exitf(uzicli.ExitGeneric, "tui: %v", err)
+			}
+			// "Update now" (PRD #1251 M1 D1): the modal exits the TUI with a pending upgrade rather
+			// than running brew in the background, so the from-source compile output and any failure
+			// are visible and the running process is not left stale. Run it in the foreground now.
+			if fm, ok := final.(tuiModel); ok && fm.updatePrompt.pendingUpgrade {
+				return runPendingUpgrade(env, fm.updatePrompt.upgradeArgv)
 			}
 			return nil
 		},
