@@ -40,6 +40,7 @@ import type {
   RecoveryCustodyHold,
   RecoveryCustodyAggregate,
   RecoveryCustodyHolds,
+  GuardrailOverrideRequest,
 } from "./apiTypes";
 
 import runZero from "../../../fixtures/api-contract/run.zero.json";
@@ -120,6 +121,8 @@ import recoveryCustodyAggregateZero from "../../../fixtures/api-contract/recover
 import recoveryCustodyAggregateFull from "../../../fixtures/api-contract/recovery_custody_aggregate.full.json";
 import recoveryCustodyHoldsZero from "../../../fixtures/api-contract/recovery_custody_holds.zero.json";
 import recoveryCustodyHoldsFull from "../../../fixtures/api-contract/recovery_custody_holds.full.json";
+import guardrailOverrideRequestZero from "../../../fixtures/api-contract/guardrail_override_request.zero.json";
+import guardrailOverrideRequestFull from "../../../fixtures/api-contract/guardrail_override_request.full.json";
 
 // The api ⇄ SPA JSON wire-contract (PRD #982). This is the VITEST HALF; the Go
 // half is api/internal/apitypes/contract_test.go. Neither reads the other: each
@@ -249,6 +252,29 @@ type ZeroOf<T, NeverNull extends keyof T = never> = {
   void _repoExtra;
   void _repoZero;
   void _repoFull;
+}
+
+// ── GuardrailOverrideRequest (issue #1432) ────────────────────────────────────
+// One row of the admin cross-user override-request queue. ZeroOf exemption:
+// findings — the handler (guardrailOverrideRequestDTO) always emits [] (never nil),
+// so the TS type is a never-null GuardrailFinding[], but the zero marshal is a null
+// nil-slice. Same capsOrEmpty idiom as Repo.required_capabilities. created_at is a
+// non-pointer time.Time, so its zero fixture is the "0001-01-01T…" string, not null.
+{
+  const _gorMissing: never = null as unknown as Exclude<
+    keyof GuardrailOverrideRequest,
+    keyof typeof guardrailOverrideRequestFull
+  >;
+  const _gorExtra: never = null as unknown as Exclude<
+    keyof typeof guardrailOverrideRequestFull,
+    keyof GuardrailOverrideRequest
+  >;
+  const _gorZero: ZeroOf<GuardrailOverrideRequest, "findings"> = guardrailOverrideRequestZero;
+  const _gorFull: Widen<GuardrailOverrideRequest> = guardrailOverrideRequestFull;
+  void _gorMissing;
+  void _gorExtra;
+  void _gorZero;
+  void _gorFull;
 }
 
 // ── RunMessage (M2) ─────────────────────────────────────────────────────────
@@ -933,6 +959,10 @@ const dtos: { stem: string; nullable: boolean }[] = [
   { stem: "recovery_custody_hold", nullable: false },
   { stem: "recovery_custody_aggregate", nullable: false },
   { stem: "recovery_custody_holds", nullable: true },
+  // issue #1432: the admin override-request queue row. findings is a non-omitempty
+  // slice the handler normalizes to [], so its zero.json carries a null (the nil-slice
+  // marshal) that the "findings" ZeroOf exemption above accounts for.
+  { stem: "guardrail_override_request", nullable: true },
 ];
 
 describe("api-contract fixtures are present and discriminating", () => {

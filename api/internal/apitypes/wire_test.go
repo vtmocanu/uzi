@@ -996,7 +996,10 @@ func TestGuardrailImpactDTOTags(t *testing.T) {
 }
 
 func TestAdminBlockedReposDTOTags(t *testing.T) {
-	assertTags(t, "AdminBlockedReposDTO", AdminBlockedReposDTO{}, "repos", "checks_unknown")
+	assertTags(t, "AdminBlockedReposDTO", AdminBlockedReposDTO{}, "repos", "checks_unknown",
+		// PRD #1432: the pending cross-user override-request queue, non-omitempty
+		// (handler seeds [] so it serializes as [] not null).
+		"requests")
 	// guardrail_override is null when no override is active but the key is always on
 	// the wire (a blocked-not-overridden repo carries it as null); privilege_status /
 	// privilege_checked_at are pointers, present-as-null when the connection was never

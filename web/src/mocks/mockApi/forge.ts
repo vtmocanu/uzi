@@ -1,5 +1,7 @@
 import type {
   AdminBlockedRepos,
+  GuardrailOverrideRequest,
+  OverrideRequestState,
   PrivilegeReport,
   ProjectSyncOwnerKind,
   ProjectSyncStatus,
@@ -9,6 +11,7 @@ import type {
 import { ApiError } from "../../lib/apiError";
 import { CAPABILITY_VOCABULARY } from "../../lib/capabilityVocabulary";
 import {
+  minsAgo,
   mockAdmin,
   mockBlockedRepoMeta,
   mockConnection,
@@ -18,6 +21,24 @@ import {
   mockToolAllowlist,
 } from "../data";
 import { delay, requireSession } from "./shared";
+
+// Classify guardrail block messages into coded findings + waivability, mirroring
+// privcheck.AllBlocksWaivable: a "could not read"/"unreadable" message is
+// protection_unreadable (never waivable); anything else is a waivable push/merge block.
+// Shared by setRepoEnabled (the enable-422 body) and requestGuardrailOverride (which
+// rejects a non-waivable request before mutating state, exactly as the server does).
+function classifyGuardrailFindings(messages: string[]): {
+  findings: { code: string; severity: string; message: string }[];
+  waivable: boolean;
+} {
+  const unreadable = (m: string) => /could not read|unreadable/i.test(m);
+  const findings = messages.map((m) => ({
+    code: unreadable(m) ? "protection_unreadable" : "write_role_can_push",
+    severity: "block",
+    message: m,
+  }));
+  return { findings, waivable: messages.length > 0 && !messages.some(unreadable) };
+}
 
 let connections = [{ ...mockConnection }];
 export let repos = mockRepos.map((r) => ({ ...r }));
@@ -87,6 +108,37 @@ const repoToolProfiles = new Map<string, string[]>(
   Object.entries(mockRepoToolProfiles).map(([k, v]) => [k, [...v]]),
 );
 let toolEntryCounter = 0;
+
+// issue #1432: the pending member override-request queue, mutated by the member
+// requestGuardrailOverride and the admin approve/reject below, and surfaced by
+// adminListBlockedRepos. Seeded with one pending request (dana's) so the admin queue
+// renders under VITE_UZI_MOCK=1. It points at repo-billing — the disabled+blocked+
+// WAIVABLE row — and its single push finding matches that repo's real enable-422
+// findings, so the queued request is consistent with the block it describes (an admin
+// CAN clear it). repo-ledger stays the non-waivable "no doomed request" demo and
+// carries no seeded request.
+let overrideRequests: GuardrailOverrideRequest[] = [
+  {
+    id: "gor-billing",
+    repo_id: "repo-billing",
+    repo_path: "team-beta/billing-service",
+    owner_id: "u-dana",
+    owner_email: "dana@example.com",
+    forge_type: "gitlab",
+    reason:
+      "We tightened the Developer push rule on main; please allow this repo so I can enable its board.",
+    findings: [
+      {
+        code: "write_role_can_push",
+        severity: "block",
+        message: "the default branch is protected but the write role (Developer) may push to it",
+      },
+    ],
+    status: "pending",
+    created_at: minsAgo(12),
+  },
+];
+let overrideRequestCounter = 0;
 
 export const forgeApi = {
   // ── Forge ───────────────────────────────────────────────────────────────────
@@ -178,7 +230,16 @@ export const forgeApi = {
       const violations = mockBlockedRepoMeta[id]?.block_messages ?? [
         "this repository cannot be enabled until its guardrail violations are resolved",
       ];
-      throw new ApiError(422, "repository cannot be enabled — guardrail violations", { violations });
+      // issue #1432: the 422 now also carries coded findings and whether an admin could
+      // clear this refusal. classifyGuardrailFindings mirrors privcheck.AllBlocksWaivable —
+      // a "could not read protection" message is protection_unreadable (never waivable);
+      // anything else is a waivable push/merge block, so an admin CAN allow it.
+      const { findings, waivable } = classifyGuardrailFindings(violations);
+      throw new ApiError(422, "repository cannot be enabled — guardrail violations", {
+        violations,
+        findings,
+        waivable,
+      });
     }
     r.enabled = enabled;
     return delay({ repo: { ...r } });
@@ -437,5 +498,109 @@ export const forgeApi = {
             privilege_checked_at: meta?.privilege_checked_at ?? mockConnection.privilege_checked_at,
           };
         }),
+      // issue #1432: the PENDING override-request queue, deep-copied so a caller can't
+      // mutate the store. Always an array (never null), matching the server contract.
+      requests: overrideRequests
+        .filter((q) => q.status === "pending")
+        .map((q) => ({ ...q, findings: q.findings.map((f) => ({ ...f })) })),
     }),
+
+  // issue #1432: a member asks an admin to allow a guardrail-refused repo. Mirrors the
+  // server's cheap rejections (404 unknown repo, 400 empty reason, 409 not blocked);
+  // the demo trusts guardrail_blocked as the "is blocked" signal rather than re-running
+  // privcheck. On success it records a pending state on the repo AND enqueues the row
+  // the admin blocked-repos queue surfaces, so the request round-trips end to end.
+  requestGuardrailOverride: async (id: string, reason: string) => {
+    const r = repos.find((x) => x.id === id);
+    if (!r) throw new ApiError(404, "repo not found");
+    if (!reason.trim()) throw new ApiError(400, "a reason is required");
+    if (!r.guardrail_blocked) throw new ApiError(409, "this repo is not blocked");
+    const meta = mockBlockedRepoMeta[id];
+    const messages = meta?.block_messages ?? [];
+    // Mirror the server's 422: a non-waivable refusal (a protection_unreadable finding)
+    // cannot be cleared by an admin override, so refuse it BEFORE mutating the repo or the
+    // queue. repo-ledger's seed carries a "could not read" finding, so a request against it
+    // fails here while a waivable repo (repo-billing) proceeds.
+    const { findings, waivable } = classifyGuardrailFindings(messages);
+    if (!waivable) {
+      throw new ApiError(422, "this refusal cannot be waived by an admin override", {
+        violations: messages,
+        findings,
+        waivable: false,
+      });
+    }
+    const override_request: OverrideRequestState = {
+      status: "pending",
+      reason,
+      created_at: new Date().toISOString(),
+      decided_at: null,
+      decision_note: null,
+    };
+    r.override_request = override_request;
+    // Newest first; drop any prior pending row for the same repo (single active request).
+    overrideRequests = [
+      {
+        id: `gor-${++overrideRequestCounter}`,
+        repo_id: r.id,
+        repo_path: r.path_with_namespace,
+        owner_id: meta?.owner_id ?? mockAdmin.id,
+        owner_email: meta?.owner_email ?? mockAdmin.email,
+        forge_type: meta?.forge_type ?? mockConnection.forge_type,
+        reason,
+        // Real coded findings from the classifier (not a hardcoded push map), so the
+        // queued row's findings match the enable-422's findings for the same repo.
+        findings: findings.map((f) => ({ ...f })),
+        status: "pending",
+        created_at: override_request.created_at,
+      },
+      ...overrideRequests.filter((q) => q.repo_id !== r.id),
+    ];
+    return delay({ override_request });
+  },
+
+  // issue #1432: an admin approves a pending request. Records the override so the OWNER
+  // can retry Enable (and, in the demo, downgrades the block so the retry succeeds) —
+  // it does NOT enable the repo here. 404 unknown, 409 already-decided, mirroring the
+  // server's single-shot settle.
+  approveGuardrailOverrideRequest: async (id: string, decisionNote?: string) => {
+    const req = overrideRequests.find((q) => q.id === id);
+    if (!req) throw new ApiError(404, "request not found");
+    if (req.status !== "pending") throw new ApiError(409, "this request was already decided");
+    const now = new Date().toISOString();
+    const state: OverrideRequestState = {
+      status: "approved",
+      reason: req.reason,
+      created_at: req.created_at,
+      decided_at: now,
+      decision_note: decisionNote ?? null,
+    };
+    const r = repos.find((x) => x.id === req.repo_id);
+    if (r) {
+      r.override_request = state;
+      r.guardrail_override = { reason: req.reason, by: mockAdmin.email, at: now };
+      r.guardrail_blocked = false;
+    }
+    overrideRequests = overrideRequests.filter((q) => q.id !== id);
+    return delay({ request: state });
+  },
+
+  // issue #1432: an admin rejects a pending request with an OPTIONAL note. The member
+  // keeps their block. 404 unknown, 409 already-decided.
+  rejectGuardrailOverrideRequest: async (id: string, decisionNote?: string) => {
+    const req = overrideRequests.find((q) => q.id === id);
+    if (!req) throw new ApiError(404, "request not found");
+    if (req.status !== "pending") throw new ApiError(409, "this request was already decided");
+    const now = new Date().toISOString();
+    const state: OverrideRequestState = {
+      status: "rejected",
+      reason: req.reason,
+      created_at: req.created_at,
+      decided_at: now,
+      decision_note: decisionNote ?? null,
+    };
+    const r = repos.find((x) => x.id === req.repo_id);
+    if (r) r.override_request = state;
+    overrideRequests = overrideRequests.filter((q) => q.id !== id);
+    return delay({ request: state });
+  },
 };

@@ -26,6 +26,7 @@ vi.mock("../lib/api", async (importOriginal) => {
       setRepoRequiredCapabilities: vi.fn(),
       setRepoGuardrailOverride: vi.fn(),
       clearRepoGuardrailOverride: vi.fn(),
+      requestGuardrailOverride: vi.fn(),
       getProjectSyncStatus: vi.fn(),
       getProjectSyncOwnerType: vi.fn(),
       provisionProjectSync: vi.fn(),
@@ -610,6 +611,214 @@ describe("Repos — enable guardrail 422 violations (PRD #345)", () => {
     fireEvent.click(row().getByRole("button", { name: /^Enable$/ }));
     await waitFor(() => expect(screen.queryByText("reason one")).toBeNull());
     expect(screen.queryByText("reason two")).toBeNull();
+  });
+});
+
+describe("Repos — member override request (issue #1432)", () => {
+  // The enable-422 body shape after #1432: violations (human), findings (coded), and
+  // whether an admin could actually clear the refusal.
+  const refusalBody = (waivable: boolean) => ({
+    error: "this repo cannot be enabled",
+    violations: ["the write role may push to protected main"],
+    findings: [
+      { code: "write_role_can_push", severity: "block", message: "the write role may push to protected main" },
+    ],
+    waivable,
+  });
+
+  // A member-view disabled repo carrying a given override_request state.
+  const withRequest = (over: Partial<Repo>): Repo =>
+    repo({ id: "repo-www", path_with_namespace: "example/website", enabled: false, ...over });
+
+  it("a waivable enable 422 surfaces a Request-approval CTA; submitting posts the reason and reloads", async () => {
+    mockApi.setRepoEnabled.mockRejectedValue(new ApiError(422, "refused", refusalBody(true)));
+    mockApi.requestGuardrailOverride.mockResolvedValue({ override_request: {} as never });
+    renderPage();
+    await screen.findByText("example/website");
+    const row = () => within(rowFor("example/website"));
+    fireEvent.click(row().getByRole("button", { name: /^Enable$/ }));
+
+    // The CTA appears on the refused repo's row (driven off the transient 422, not
+    // guardrail_blocked, which is false for a disabled repo).
+    const cta = await row().findByRole("button", { name: /request admin approval/i });
+    fireEvent.click(cta);
+
+    // The modal requires a non-empty reason before it will POST.
+    const dialog = await screen.findByRole("dialog", { name: /request approval to enable example\/website/i });
+    const submit = within(dialog).getByRole("button", { name: /request approval/i });
+    expect((submit as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.change(within(dialog).getByRole("textbox"), { target: { value: "we fixed the push rule" } });
+    expect((submit as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(submit);
+
+    await waitFor(() =>
+      expect(mockApi.requestGuardrailOverride).toHaveBeenCalledWith("repo-www", "we fixed the push rule"),
+    );
+    // Reload after the write, like the admin override submit does.
+    await waitFor(() => expect(mockApi.listProjects).toHaveBeenCalledTimes(2));
+  });
+
+  it("renders two findings sharing a code in the request modal without a key collision", async () => {
+    // A single refusal can return two findings with the SAME code (e.g. two
+    // write_role_can_push). A code-only React key collides and may drop/duplicate a
+    // list item; the composite key (code+index) renders both (issue #1432).
+    mockApi.setRepoEnabled.mockRejectedValue(
+      new ApiError(422, "refused", {
+        error: "refused",
+        violations: ["push to main is allowed", "merge to main is allowed"],
+        findings: [
+          { code: "write_role_can_push", severity: "block", message: "push to main is allowed" },
+          { code: "write_role_can_push", severity: "block", message: "merge to main is allowed" },
+        ],
+        waivable: true,
+      }),
+    );
+    renderPage();
+    await screen.findByText("example/website");
+    const row = () => within(rowFor("example/website"));
+    fireEvent.click(row().getByRole("button", { name: /^Enable$/ }));
+    fireEvent.click(await row().findByRole("button", { name: /request admin approval/i }));
+
+    const dialog = await screen.findByRole("dialog", {
+      name: /request approval to enable example\/website/i,
+    });
+    // Both list items survive — the modal's findings list has exactly the two entries,
+    // in order, with neither dropped nor duplicated by a colliding key.
+    const items = within(dialog).getAllByRole("listitem");
+    expect(items.map((li) => li.textContent)).toEqual([
+      "push to main is allowed",
+      "merge to main is allowed",
+    ]);
+  });
+
+  it("a NON-waivable enable 422 offers no request CTA — only fix-protection guidance", async () => {
+    mockApi.setRepoEnabled.mockRejectedValue(new ApiError(422, "refused", refusalBody(false)));
+    renderPage();
+    await screen.findByText("example/website");
+    const row = () => within(rowFor("example/website"));
+    fireEvent.click(row().getByRole("button", { name: /^Enable$/ }));
+    // The violation still renders below the page Alert...
+    expect(await screen.findByText("the write role may push to protected main")).toBeTruthy();
+    // ...but a doomed request is never offered.
+    expect(row().queryByRole("button", { name: /request admin approval/i })).toBeNull();
+  });
+
+  it("renders a pending override_request as an awaiting-admin badge", async () => {
+    mockApi.listProjects.mockResolvedValue({
+      repos: [
+        withRequest({
+          override_request: {
+            status: "pending",
+            reason: "please allow",
+            created_at: "2026-08-10T00:00:00Z",
+            decided_at: null,
+            decision_note: null,
+          },
+        }),
+      ],
+    });
+    renderPage();
+    await screen.findByText("example/website");
+    expect(within(rowFor("example/website")).getByText(/awaiting an admin/i)).toBeTruthy();
+  });
+
+  it("renders an approved override_request plus the normal Enable action to retry", async () => {
+    mockApi.listProjects.mockResolvedValue({
+      repos: [
+        withRequest({
+          override_request: {
+            status: "approved",
+            reason: "please allow",
+            created_at: "2026-08-10T00:00:00Z",
+            decided_at: "2026-08-11T00:00:00Z",
+            decision_note: "ok, fixed",
+          },
+        }),
+      ],
+    });
+    renderPage();
+    await screen.findByText("example/website");
+    const row = within(rowFor("example/website"));
+    expect(row.getByText(/approved by an admin/i)).toBeTruthy();
+    // The admin's decision note renders as VISIBLE text (not only a tooltip), mirroring
+    // the rejected state, so a keyboard/touch user sees any conditions (issue #1432).
+    expect(row.getByText("ok, fixed")).toBeTruthy();
+    // The owner can retry Enable (the live guard re-runs on the server).
+    expect(row.getByRole("button", { name: /^Enable$/ })).toBeTruthy();
+  });
+
+  it("renders a rejected override_request with its note and a re-request affordance", async () => {
+    mockApi.listProjects.mockResolvedValue({
+      repos: [
+        withRequest({
+          override_request: {
+            status: "rejected",
+            reason: "please allow",
+            created_at: "2026-08-10T00:00:00Z",
+            decided_at: "2026-08-11T00:00:00Z",
+            decision_note: "fix protection first",
+          },
+        }),
+      ],
+    });
+    renderPage();
+    await screen.findByText("example/website");
+    const row = within(rowFor("example/website"));
+    expect(row.getByText(/request rejected/i)).toBeTruthy();
+    expect(row.getByText(/fix protection first/i)).toBeTruthy();
+    // Re-requesting reopens the reason modal.
+    fireEvent.click(row.getByRole("button", { name: /request again/i }));
+    expect(
+      await screen.findByRole("dialog", { name: /request approval to enable example\/website/i }),
+    ).toBeTruthy();
+  });
+});
+
+describe("Repos — administrator refusal uses Allow anyway (issue #1432, finding [3b])", () => {
+  // A waivable enable 422 for a disabled repo whose stored report is clean
+  // (guardrail_blocked===false), so the badge-state admin control never renders and the
+  // role-specific 422 affordance is the only path an admin (or member) gets.
+  const waivableRefusal = () =>
+    new ApiError(422, "refused", {
+      error: "this repo cannot be enabled",
+      violations: ["the write role may push to protected main"],
+      findings: [
+        { code: "write_role_can_push", severity: "block", message: "the write role may push to protected main" },
+      ],
+      waivable: true,
+    });
+
+  it("an admin gets 'Allow anyway' (not 'Request admin approval'), and it opens the admin modal", async () => {
+    asAdmin(true);
+    mockApi.setRepoEnabled.mockRejectedValue(waivableRefusal());
+    mockApi.setRepoGuardrailOverride.mockResolvedValue({ repo: {} as never });
+    renderPage();
+    // example/website is the disabled, guardrail_blocked===false repo in the fixture.
+    await screen.findByText("example/website");
+    const row = () => within(rowFor("example/website"));
+    fireEvent.click(row().getByRole("button", { name: /^Enable$/ }));
+
+    // The admin allows the repo directly; the member request path is never offered.
+    const allow = await row().findByRole("button", { name: /allow anyway/i });
+    expect(row().queryByRole("button", { name: /request admin approval/i })).toBeNull();
+
+    // Clicking it opens the admin Allow-anyway modal (openAllow), not the member request modal.
+    fireEvent.click(allow);
+    expect(
+      await screen.findByRole("dialog", { name: /allow runs on example\/website/i }),
+    ).toBeTruthy();
+  });
+
+  it("a member gets 'Request admin approval' (not 'Allow anyway') for the same refusal", async () => {
+    asAdmin(false);
+    mockApi.setRepoEnabled.mockRejectedValue(waivableRefusal());
+    renderPage();
+    await screen.findByText("example/website");
+    const row = () => within(rowFor("example/website"));
+    fireEvent.click(row().getByRole("button", { name: /^Enable$/ }));
+
+    expect(await row().findByRole("button", { name: /request admin approval/i })).toBeTruthy();
+    expect(row().queryByRole("button", { name: /allow anyway/i })).toBeNull();
   });
 });
 

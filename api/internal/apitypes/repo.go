@@ -51,6 +51,12 @@ type RepoDTO struct {
 	// enable/run gates still fail closed live (M4-M6); the admin blocked-repos list is
 	// where that unknown is surfaced explicitly (R1).
 	GuardrailBlocked bool `json:"guardrail_blocked"`
+	// OverrideRequest is the latest guardrail override-request state for a
+	// not-yet-enabled repo (PRD #1432): list-computed like GuardrailBlocked (never set
+	// by repoToDTO/PatchRepo), it carries what the owner asked for and how an admin
+	// settled it. nil/omitted when the repo has no override request — a repo that is
+	// enabled, never blocked, or never requested carries no state here.
+	OverrideRequest *OverrideRequestStateDTO `json:"override_request,omitempty"`
 	// DockerAllowlisted is the computed, caller-scoped "is THIS repo on the global
 	// Docker-worker repo allowlist" (PRD #361): membership-tested server-side against
 	// the docker_repo_allowlist admin setting in the owner-scoped list handlers. It is

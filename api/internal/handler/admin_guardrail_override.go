@@ -4,9 +4,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
-	"strings"
 	"time"
-	"unicode"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -54,26 +52,16 @@ func (h *Handler) SetRepoGuardrailOverride(w http.ResponseWriter, r *http.Reques
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	reason := strings.TrimSpace(req.Reason)
-	if reason == "" {
-		httpx.Error(w, http.StatusBadRequest, "a non-empty reason is required to override the guardrail")
+	// The reason validation is the SHARED validateGuardrailReason (PRD #1432): it
+	// trims, rejects an empty (400), over-long (422), or control-character (400)
+	// reason, and returns the clean value. Both this admin write and the member
+	// request (RequestGuardrailOverride) call the same helper so they cannot drift
+	// on what a legal audit note is (the M8 write-side backstop rationale lives on
+	// the helper's doc comment).
+	reason, status, msg := validateGuardrailReason(req.Reason)
+	if status != 0 {
+		httpx.Error(w, status, msg)
 		return
-	}
-	if len(reason) > maxGuardrailOverrideReasonBytes {
-		httpx.Error(w, http.StatusUnprocessableEntity, "reason is too long")
-		return
-	}
-	// Write-side backstop: the reason is an admin's audit note that M9 renders in a
-	// badge, the admin blocked-repos list, and potentially a plain-text CLI/log
-	// surface. Reject control characters here (newline, CR, tab, ANSI ESC, bidi
-	// overrides are the C1/Cc set unicode.IsControl covers) so a forged audit line
-	// cannot be smuggled into a non-escaping sink — one write-side check instead of
-	// trusting every future renderer to escape (PRD #66 M8 audit hardening).
-	for _, ru := range reason {
-		if unicode.IsControl(ru) {
-			httpx.Error(w, http.StatusBadRequest, "reason must not contain control characters")
-			return
-		}
 	}
 
 	repo, err := h.q.SetRepoGuardrailOverride(r.Context(), store.SetRepoGuardrailOverrideParams{

@@ -183,11 +183,43 @@ export const mockRepos: Repo[] = [
     // (reasons from mockBlockedRepoMeta below). We add this row rather than
     // flipping repo-payments, whose enabled:true state the Boards "runs blocked"
     // badge and admin Allow-anyway demo depend on.
+    //
+    // issue #1432: this row is the NON-waivable case — its block_messages carry a
+    // "could not read protection" finding (protection_unreadable), so its enable-422
+    // is waivable:false and the member gets NO Request-approval CTA. It is the
+    // "no doomed request against an unwaivable block" demo; repo-billing below is the
+    // waivable counterpart.
     id: "repo-ledger",
     connection_id: "conn-1",
     forge_project_id: 641,
     path_with_namespace: "team-beta/ledger-service",
     web_url: "https://gitlab.example.com/team-beta/ledger-service",
+    default_branch: "main",
+    enabled: false,
+    repo_skills_enabled: false,
+    repo_claudemd_enabled: false,
+    repo_devbox_opt_in: false,
+    repo_fold_improve_uzi_backlog: false,
+    pipeline: null,
+    guardrail_override: null,
+    guardrail_blocked: true,
+    // PRD #361 M1: not on the Docker-worker allowlist.
+    docker_allowlisted: false,
+    // PRD #361 M3: not actively blocked by the Docker-allowlist gap.
+    docker_blocked: false,
+  },
+  {
+    // issue #1432: the disabled+blocked+WAIVABLE row — the M4 happy path. Its
+    // block_messages are push/merge-only (no "could not read"), so clicking Enable
+    // trips a 422 with waivable:true and the member gets the "Request admin approval"
+    // CTA. It is also the repo the seeded admin-queue request (mockApi) points at, so
+    // the queued request's findings match this repo's real enable-422 findings — the
+    // internal consistency repo-ledger's non-waivable block could not give it.
+    id: "repo-billing",
+    connection_id: "conn-1",
+    forge_project_id: 733,
+    path_with_namespace: "team-beta/billing-service",
+    web_url: "https://gitlab.example.com/team-beta/billing-service",
     default_branch: "main",
     enabled: false,
     repo_skills_enabled: false,
@@ -240,7 +272,9 @@ export const mockBlockedRepoMeta: Record<string, MockBlockedRepoMeta> = {
   },
   // PRD #345 M2: the disabled+blocked row (repo-ledger) whose enable is refused.
   // These block_messages are the enable-guardrail (privcheck) reasons rendered as
-  // the 422 violations when a member clicks Enable on it under VITE_UZI_MOCK=1.
+  // the 422 violations when a member clicks Enable on it under VITE_UZI_MOCK=1. One
+  // is a "could not read" (protection_unreadable) finding, so the enable-422 is
+  // waivable:false — the non-waivable "no doomed request" demo (issue #1432).
   "repo-ledger": {
     owner_id: "u-dana",
     owner_email: "dana@example.com",
@@ -249,6 +283,18 @@ export const mockBlockedRepoMeta: Record<string, MockBlockedRepoMeta> = {
       "could not read default-branch protection on this repo",
       "the default branch is protected but the write role (Developer) may push to it",
     ],
+    privilege_status: "violations",
+    privilege_checked_at: minsAgo(18),
+  },
+  // issue #1432: the disabled+blocked+WAIVABLE row (repo-billing). A single push
+  // finding, no "could not read", so the enable-422 is waivable:true and an admin CAN
+  // clear it — the M4 Request-approval happy path. The seeded admin-queue request
+  // (mockApi) points here with a matching push finding, so the two are consistent.
+  "repo-billing": {
+    owner_id: "u-dana",
+    owner_email: "dana@example.com",
+    forge_type: "gitlab",
+    block_messages: ["the default branch is protected but the write role (Developer) may push to it"],
     privilege_status: "violations",
     privilege_checked_at: minsAgo(18),
   },

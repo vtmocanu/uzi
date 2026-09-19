@@ -3,7 +3,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { api, ApiError, isHttpsUrl, type ForgeConnection, type ProjectSyncOwnerKind, type ProjectSyncStatus, type Repo, type ToolAllowlistEntry } from "../lib/api";
+import { api, ApiError, isHttpsUrl, type ForgeConnection, type GuardrailFinding, type ProjectSyncOwnerKind, type ProjectSyncStatus, type Repo, type ToolAllowlistEntry } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
 import { repoFindings } from "../lib/privilege";
 import { useAuth } from "../auth/AuthContext";
@@ -32,9 +32,18 @@ export function Repos() {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
-  // A 422 enable-guardrail refusal carries a violation list we render below the
-  // page Alert, mirroring the identical 422 contract in ForgeSettings (PRD #345).
-  const [enableViolations, setEnableViolations] = useState<string[] | null>(null);
+  // A 422 enable-guardrail refusal, tied to the repo it refused (issue #1432) rather
+  // than a page-level banner, so the row can offer a "Request admin approval"
+  // affordance when the block is WAIVABLE. violations render below the page Alert as
+  // before (PRD #345); findings + waivable drive the per-repo request CTA. waivable is
+  // absent on the pre-#1432 422 shape, so it is read as false (never offer a doomed
+  // request against a protection that cannot be waived).
+  const [enableRefusal, setEnableRefusal] = useState<{
+    repoId: string;
+    violations: string[];
+    findings: GuardrailFinding[];
+    waivable: boolean;
+  } | null>(null);
   // The repo whose "Trusted repo" panel is currently expanded. The panel groups a
   // master control over two independently-revocable capabilities — Repo skills and
   // Repo instructions (PRD #246). It renders OUTSIDE the horizontally-scrolling
@@ -114,6 +123,14 @@ export function Repos() {
   // Alert would sit behind the backdrop, unseen). Distinct from the page `error`.
   const [allowError, setAllowError] = useState("");
   const [overrideBusyId, setOverrideBusyId] = useState<string | null>(null);
+  // The member "Request admin approval" modal (issue #1432): the repo whose modal is
+  // open, the member's reason, the in-flight POST, and the inline submit error. Cloned
+  // from the admin Allow-anyway modal state above — same required-reason pattern, but
+  // it POSTs the member override-request endpoint instead of the admin override.
+  const [requestRepoId, setRequestRepoId] = useState<string | null>(null);
+  const [requestReason, setRequestReason] = useState("");
+  const [requestBusy, setRequestBusy] = useState(false);
+  const [requestError, setRequestError] = useState("");
   // Focus management: remember the cell trigger so focus returns to it when the
   // panel closes, and move focus into the panel (its master switch) when it opens.
   const trustTriggerRef = useRef<HTMLButtonElement | null>(null);
@@ -431,17 +448,31 @@ export function Repos() {
 
   const toggle = async (repo: Repo) => {
     setError("");
-    setEnableViolations(null);
+    setEnableRefusal(null);
     setBusyId(repo.id);
     try {
       const { repo: updated } = await api.setRepoEnabled(repo.id, !repo.enabled);
       setRepos((prev) => prev.map((r) => (r.id === updated.id ? updated : r)));
-      setEnableViolations(null);
+      setEnableRefusal(null);
     } catch (err) {
       if (err instanceof ApiError && err.status === 422) {
-        const body = err.body as { violations?: string[] } | null;
-        setError(err.message);
-        setEnableViolations(body?.violations ?? []);
+        // PRD #345 body carried only violations[]; issue #1432 adds coded findings and
+        // waivable. Tie the refusal to THIS repo so the row (not just the page banner)
+        // can offer a Request-approval path when the block is waivable.
+        const body = err.body as
+          | { violations?: string[]; findings?: GuardrailFinding[]; waivable?: boolean }
+          | null;
+        // A guardrail refusal speaks ONLY through the rich, actionable refusal Card
+        // below (the violations, fix guidance, and — when waivable — a Request-approval
+        // CTA). Do NOT also raise the terse top-level Alert, which would duplicate the
+        // same failure in a weaker form (issue #1432). error stays cleared (the "" set
+        // at the top of toggle).
+        setEnableRefusal({
+          repoId: repo.id,
+          violations: body?.violations ?? [],
+          findings: body?.findings ?? [],
+          waivable: body?.waivable === true,
+        });
       } else {
         setError(errorMessage(err, "Update failed"));
       }
@@ -678,6 +709,46 @@ export function Repos() {
     }
   };
 
+  // Open the member "Request admin approval" modal (issue #1432): for a repo whose
+  // waivable enable was just refused, or to re-request after a rejection. Resets the reason.
+  const openRequest = (repo: Repo) => {
+    setError("");
+    setRequestReason("");
+    setRequestError("");
+    setRequestRepoId(repo.id);
+  };
+
+  // Close the request modal. A no-op while a POST is in flight so neither Escape nor a
+  // backdrop click can dismiss a submitting form (matching the disabled ×).
+  const closeRequest = () => {
+    if (requestBusy) return;
+    setRequestRepoId(null);
+    setRequestError("");
+  };
+
+  // POST the member override request with the typed reason, then reload the repos list
+  // (like submitAllow) so the row shows the new pending override_request. A 409 (not
+  // blocked), 422 (not waivable), or 400 (bad reason) surfaces inline in the modal.
+  const submitRequest = async (repoId: string) => {
+    const reason = requestReason.trim();
+    if (!reason) return;
+    setRequestError("");
+    setRequestBusy(true);
+    try {
+      await api.requestGuardrailOverride(repoId, reason);
+      setRequestRepoId(null);
+      setRequestReason("");
+      // The request supersedes the transient enable-refusal for this repo; drop it so
+      // the row falls through to the freshly-loaded pending override_request state.
+      setEnableRefusal((prev) => (prev?.repoId === repoId ? null : prev));
+      await loadProjects(connectionId);
+    } catch (err) {
+      setRequestError(errorMessage(err, "Failed to request approval"));
+    } finally {
+      setRequestBusy(false);
+    }
+  };
+
   // The selected connection's latest privilege report drives the per-repo
   // findings badges (null until a check has run).
   const privilegeReport = connections.find((c) => c.id === connectionId)?.privilege_report ?? null;
@@ -706,6 +777,11 @@ export function Repos() {
   // r.guardrail_blocked; the block rule is never re-implemented here).
   const allowRepo = repos.find((r) => r.id === allowRepoId) ?? null;
   const allowFindings = allowRepo ? repoFindings(privilegeReport, allowRepo.id)?.violations ?? [] : [];
+  // The repo whose Request-approval modal is open (issue #1432), and the coded findings
+  // to show inside it — read from the just-captured enable-422 for THIS repo (empty on a
+  // re-request after rejection, where there is no fresh refusal to draw from).
+  const requestRepo = repos.find((r) => r.id === requestRepoId) ?? null;
+  const requestFindings = enableRefusal?.repoId === requestRepoId ? enableRefusal.findings : [];
 
   return (
     <div className="space-y-6">
@@ -727,21 +803,38 @@ export function Repos() {
       />
 
       {error && <Alert message={error} />}
-      {enableViolations && (
+      {enableRefusal && (
         <Card className="border-danger/40 bg-danger/5">
           {/* role="alert" so the reasons are announced to assistive tech when they
               appear; Card does not forward a role, so it sits on the wrapper (PRD #345 M3). */}
           <div role="alert">
             <p className="text-sm font-medium text-danger">This repository was not enabled — the guardrail refused it:</p>
             <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-fg">
-              {enableViolations.map((v, i) => (
+              {enableRefusal.violations.map((v, i) => (
                 <li key={i}>{v}</li>
               ))}
             </ul>
-            <p className="mt-3 text-sm text-muted">
-              Fix the repository's default-branch protection on the forge so the bot cannot push or
-              merge to it directly, then click Enable again.
-            </p>
+            {enableRefusal.waivable ? (
+              // Waivable (issue #1432): fixing protection is still the clean fix, but the
+              // refusal can also be allowed through. The guidance is role-specific — an
+              // admin allows it themselves (Allow anyway); a member asks an admin.
+              isAdmin ? (
+                <p className="mt-3 text-sm text-muted">
+                  Fix the repository's default-branch protection on the forge, then click Enable again — or
+                  use Allow anyway on the repo below to allow it through the guardrail.
+                </p>
+              ) : (
+                <p className="mt-3 text-sm text-muted">
+                  Fix the repository's default-branch protection on the forge, then click Enable again — or
+                  use Request admin approval on the repo below to ask an admin to allow it.
+                </p>
+              )
+            ) : (
+              <p className="mt-3 text-sm text-muted">
+                Fix the repository's default-branch protection on the forge so the bot cannot push or
+                merge to it directly, then click Enable again.
+              </p>
+            )}
           </div>
         </Card>
       )}
@@ -862,14 +955,21 @@ export function Repos() {
                                       >
                                         Allow anyway
                                       </Button>
-                                    ) : (
+                                    ) : !r.override_request &&
+                                      !(enableRefusal?.repoId === r.id && enableRefusal.waivable) ? (
+                                      // Only the PASSIVE pointer, and only when the member has
+                                      // no actionable path: no waivable refusal just now (which
+                                      // would show the Request-approval CTA below) and no
+                                      // existing override_request state. Showing the passive
+                                      // "ask an admin" alongside an actionable request path
+                                      // contradicts itself (issue #1432).
                                       <span
                                         className="text-xs text-faint"
                                         title="Only an instance admin can allow a repo through this guardrail."
                                       >
                                         ask an admin to allow this repo
                                       </span>
-                                    )}
+                                    ) : null}
                                   </>
                                 );
                               }
@@ -918,6 +1018,84 @@ export function Repos() {
                                 Trusted/Tools cells' `!r.enabled` guards — a disabled
                                 repo has no capabilities to report. */}
                             {r.enabled && <RepoSetupChip repo={r} />}
+                            {/* Member guardrail override-request state (issue #1432).
+                                Driven off r.override_request — NOT guardrail_blocked,
+                                which is false for the disabled repos this serves — so a
+                                pending/approved/rejected request shows on the row. */}
+                            {r.override_request && (() => {
+                              const or = r.override_request;
+                              if (or.status === "pending") {
+                                return (
+                                  <Badge tone="info" dot title={`Your reason: ${or.reason}`}>
+                                    Approval requested — awaiting an admin
+                                  </Badge>
+                                );
+                              }
+                              if (or.status === "approved") {
+                                // The normal Enable action lives in the Actions cell; on
+                                // retry the live guard re-runs. The badge just says why, and
+                                // any admin note renders as VISIBLE text too (mirroring the
+                                // rejected state) so a keyboard/touch user sees the conditions
+                                // the admin left, not only a hover tooltip (issue #1432).
+                                return (
+                                  <>
+                                    <Badge
+                                      tone="ok"
+                                      dot
+                                      title={
+                                        or.decision_note
+                                          ? `Admin note: ${or.decision_note}`
+                                          : "An admin approved your request — click Enable to retry."
+                                      }
+                                    >
+                                      Approved by an admin
+                                    </Badge>
+                                    {or.decision_note && (
+                                      <span className="text-xs text-faint" title={or.decision_note}>
+                                        {or.decision_note}
+                                      </span>
+                                    )}
+                                  </>
+                                );
+                              }
+                              if (or.status === "rejected") {
+                                return (
+                                  <>
+                                    <Badge tone="neutral" dot>
+                                      Request rejected
+                                    </Badge>
+                                    {or.decision_note && (
+                                      <span className="text-xs text-faint" title={or.decision_note}>
+                                        {or.decision_note}
+                                      </span>
+                                    )}
+                                    <Button variant="secondary" size="sm" onClick={() => openRequest(r)}>
+                                      Request again
+                                    </Button>
+                                  </>
+                                );
+                              }
+                              return null;
+                            })()}
+                            {/* A just-refused WAIVABLE enable (issue #1432): offer the
+                                Request-approval path for THIS repo. Suppressed once a
+                                request exists (override_request drives that state). */}
+                            {enableRefusal?.repoId === r.id && enableRefusal.waivable && !r.override_request && (
+                              isAdmin ? (
+                                // An admin allows the repo directly (openAllow); openRequest is a member-only path
+                                // that would ask ANOTHER admin. Guarded on !guardrail_blocked so it does not double
+                                // the "Allow anyway" the badge-state block already renders when guardrail_blocked.
+                                !r.guardrail_blocked && (
+                                  <Button variant="secondary" size="sm" onClick={() => openAllow(r)}>
+                                    Allow anyway
+                                  </Button>
+                                )
+                              ) : (
+                                <Button variant="secondary" size="sm" onClick={() => openRequest(r)}>
+                                  Request admin approval
+                                </Button>
+                              )
+                            )}
                           </div>
                         </td>
                         <td className="px-4 py-3">
@@ -1759,8 +1937,10 @@ export function Repos() {
                 <div className="rounded-md border border-danger/40 bg-danger/5 p-3">
                   <h3 className="mb-1.5 text-sm font-semibold text-fg">You are accepting these findings</h3>
                   <ul className="list-disc space-y-1 pl-5 text-sm text-muted">
-                    {allowFindings.map((v) => (
-                      <li key={v.code}>{v.message}</li>
+                    {allowFindings.map((v, i) => (
+                      // Composite key: a single refusal can return two findings sharing a
+                      // code (e.g. two write_role_can_push), so code alone collides (#1432).
+                      <li key={`${v.code}-${i}`}>{v.message}</li>
                     ))}
                   </ul>
                 </div>
@@ -1792,6 +1972,80 @@ export function Repos() {
                 onClick={() => submitAllow(allowRepo.id)}
               >
                 {allowBusy ? "Allowing…" : "Allow anyway"}
+              </Button>
+            </div>
+          </div>
+        </Modal>
+      )}
+
+      {/* Request-admin-approval modal (issue #1432): a member whose WAIVABLE enable was
+          refused asks an admin to allow the repo. Cloned from the Allow-anyway modal —
+          same required-reason pattern — but the reason is the member's justification and
+          it POSTs the member override-request endpoint. */}
+      {requestRepo && (
+        <Modal
+          label={`Request approval to enable ${maskRepoPath(requestRepo.path_with_namespace, demo)}`}
+          onClose={closeRequest}
+          closeOnBackdrop={!requestBusy}
+        >
+          <div className="my-8 w-full max-w-lg overflow-hidden rounded-2xl border border-edge-strong bg-surface shadow-2xl">
+            <div className="flex items-start justify-between gap-3 border-b border-edge px-5 py-4">
+              <div>
+                <h2 className="text-base font-semibold">Request approval to enable this repo?</h2>
+                <p className="mt-0.5 text-xs text-muted">{maskRepoPath(requestRepo.path_with_namespace, demo)}</p>
+              </div>
+              <button
+                type="button"
+                onClick={closeRequest}
+                disabled={requestBusy}
+                aria-label="Close"
+                className="rounded-md p-1 text-muted hover:bg-raised hover:text-fg"
+              >
+                <XIcon />
+              </button>
+            </div>
+            <div className="space-y-4 px-5 py-5">
+              {requestError && <Alert message={requestError} />}
+              <p className="text-sm text-muted">
+                uzi will not enable this repo while the bot can reach the default branch. Ask an admin to
+                allow it — they read your reason, and if they approve you can enable the repo (the guardrail
+                re-runs live when you retry).
+              </p>
+              {requestFindings.length > 0 && (
+                <div className="rounded-md border border-danger/40 bg-danger/5 p-3">
+                  <h3 className="mb-1.5 text-sm font-semibold text-fg">What blocked the enable</h3>
+                  <ul className="list-disc space-y-1 pl-5 text-sm text-muted">
+                    {requestFindings.map((f, i) => (
+                      // Composite key: a single refusal can return two findings sharing a
+                      // code (e.g. two write_role_can_push), so code alone collides (#1432).
+                      <li key={`${f.code}-${i}`}>{f.message}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              <label className="block space-y-1.5">
+                <span className="text-sm font-medium text-fg">
+                  Reason <span className="text-danger">*</span>
+                </span>
+                <Textarea
+                  rows={3}
+                  value={requestReason}
+                  disabled={requestBusy}
+                  placeholder="Why this repo should be allowed through the guardrail (an admin reads this)"
+                  onChange={(e) => setRequestReason(e.target.value)}
+                />
+              </label>
+            </div>
+            <div className="flex items-center justify-end gap-2 border-t border-edge bg-ink/40 inset-panel px-5 py-3.5">
+              <Button variant="ghost" size="sm" disabled={requestBusy} onClick={closeRequest}>
+                Cancel
+              </Button>
+              <Button
+                size="sm"
+                disabled={requestBusy || requestReason.trim() === ""}
+                onClick={() => submitRequest(requestRepo.id)}
+              >
+                {requestBusy ? "Requesting…" : "Request approval"}
               </Button>
             </div>
           </div>
