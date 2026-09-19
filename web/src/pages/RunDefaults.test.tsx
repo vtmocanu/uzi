@@ -1037,4 +1037,21 @@ describe("Run defaults — default harness card (PRD #1429 M4a)", () => {
     expect(within(modelSelect).getByRole("option", { name: "gpt-6-astra" })).toBeTruthy();
     expect(within(modelSelect).queryByRole("option", { name: "opus" })).toBeNull();
   });
+
+  // PR #1449 review: a Codex-only user never sees the harness card (D2), so the pick
+  // stays "inherit" while every run resolves to Codex. Keyed on the raw pick, Worker
+  // model offered only Claude aliases, and a saved one was dropped at claim.
+  it("offers the Codex model vocabulary on Worker model to a Codex-only user with no harness card", async () => {
+    mockAuth(baseUser);
+    mockApi.listSecrets.mockResolvedValue({ secrets: [codexKey] });
+    render(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+    const modelSelect = (await screen.findByLabelText("Model")) as HTMLSelectElement;
+    await waitFor(() => expect(within(modelSelect).getByRole("option", { name: "gpt-6-astra" })).toBeTruthy());
+    expect(within(modelSelect).queryByRole("option", { name: "opus" })).toBeNull();
+    expect(screen.queryByText("Default harness")).toBeNull();
+  });
 });

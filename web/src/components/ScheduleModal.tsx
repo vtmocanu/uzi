@@ -1158,13 +1158,16 @@ export function ScheduleModal({
             </Field>
           )}
 
-          {/* Model override — shown for ALL targets (unlike guidance), in the common area. */}
+          {/* Model override — shown for ALL targets (unlike guidance), in the common area.
+              The vocabulary follows the EFFECTIVE harness, like the token picker below: an
+              "inherit" pin that will resolve to Codex must offer Codex models, or the pick
+              is accepted by the API and then dropped at claim (D6 fallback). */}
           <Field label="Model (optional)" htmlFor="sched-model">
             <ModelSelect
               id="sched-model"
               value={model}
               onChange={setModel}
-              harness={harnessSel === "inherit" ? undefined : harnessSel}
+              harness={scheduleStartsOnCodex ? "codex" : harnessSel === "inherit" ? undefined : harnessSel}
             />
             <p className="mt-1 text-[11px] text-faint">
               Runs fired by this schedule use this model on every target. Leave on Inherit to
