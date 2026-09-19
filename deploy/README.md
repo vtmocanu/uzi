@@ -96,7 +96,8 @@ whatever `main` has moved on to since — cut in lockstep with the next candidat
 full operational detail): no flag cuts the next candidate, or refuses with the facts if a lower
 base's candidate is still in flight; `--promote` promotes the in-flight candidate to stable,
 then cuts the next candidate; `--promote-only`, given the in-flight base, promotes it and stops
-(no next candidate, `main` untouched, one push: the stable tag); `--skip-promote` abandons the in-flight base and cuts a new
+(no next candidate, `main` untouched, one push: the stable tag); `--skip-promote` abandons the
+in-flight base and cuts a new
 `vX.Y.Z-rc.1` candidate (renaming the open section and folding `[Unreleased]` in), never a
 stable tag; `--stable` is the old one-step model, refused while a candidate is in
 flight. **Push order on a promote: the stable tag, then `main`, then the next candidate's
@@ -105,7 +106,8 @@ hotfix onto an already-promoted stable is a separate, manual procedure — see *
 Full design: [ADR-1265](../adr/1265-rc-release-train.md).
 
 Within a single cut — whether a candidate or a promotion — it is still **two steps** on
-dev-cluster (the third — the ArgoCD `targetRevision` bump — is gone now that this cluster
+dev-cluster (a `--promote-only` promotion is the exception: nothing lands on `main`, so it is step 2
+alone, the tag push) (the third — the ArgoCD `targetRevision` bump — is gone now that this cluster
 auto-tracks `0.*`, or `0.*-0` for a deployment that opts into candidates instead (ADR-1265
 D8); it survives below only as the rollback/other-cluster note). Only the tag push publishes
 anything. Step 1 (the chart-version
