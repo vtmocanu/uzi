@@ -824,8 +824,26 @@ if [ "$sd_ac" -ne 0 ]; then pass "autobump --check flags a local-only pin tag (e
 assert_eq "autobump edit on a local-only pin tag exits 0"        "0"     "$sd_ab"
 assert_eq "autobump repins a local-only pin tag to the version cut" "0.6.0" "$(pin_tag "$SD")"
 
-rm -rf "$S1" "$S3" "$S4" "$S6" "$S7" "$S8" "$S8B" "$S8C" "$S9" "$S10" "$SA" "$SB" "$SC" "$SD" \
-       "$S8.origin.git" "$S8B.origin.git" "$S9.origin.git" "$S10.origin.git" "$SD.origin.git"
+echo "=== M2c: worker-tag-autobump — a pin tag ON origin but missing locally is a broken instrument (exit 2) ==="
+# The inverse of local-only: present on origin, absent from this clone (a standalone run
+# with no tag fetch). It must NOT repin (wrong "not published" message + unneeded roll);
+# it exits 2 and tells the operator to fetch.
+SE="$(mktemp -d)"; seed_repo "$SE"; add_origin "$SE"
+git -C "$SE" tag v0.7.0-rc.1; push_tag_to_origin "$SE" v0.7.0-rc.1   # on origin AND local
+git -C "$SE" tag -d v0.7.0-rc.1 >/dev/null                            # delete locally; still on origin
+cat > "$SE/deploy/chart/values.yaml" <<'YAML'
+workers:
+  image:
+    repository: ghcr.io/x/worker
+    tag: "0.7.0-rc.1"
+YAML
+git -C "$SE" add deploy/chart/values.yaml; gcommit "$SE" "test: pin a tag on origin but not local"
+( cd "$SE" && bash scripts/worker-tag-autobump.sh 0.8.0 >/dev/null 2>&1 ); se_rc=$?
+assert_eq "autobump exits 2 when the pin tag is on origin but not local" "2"          "$se_rc"
+assert_eq "autobump does NOT repin on the broken-instrument path"        "0.7.0-rc.1" "$(pin_tag "$SE")"
+
+rm -rf "$S1" "$S3" "$S4" "$S6" "$S7" "$S8" "$S8B" "$S8C" "$S9" "$S10" "$SA" "$SB" "$SC" "$SD" "$SE" \
+       "$S8.origin.git" "$S8B.origin.git" "$S9.origin.git" "$S10.origin.git" "$SD.origin.git" "$SE.origin.git"
 
 echo "=== M3: release-mode lib (shared by watch + verify) ==="
 # shellcheck source=scripts/lib/release-mode.sh

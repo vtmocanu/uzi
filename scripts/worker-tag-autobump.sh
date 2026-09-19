@@ -125,7 +125,17 @@ PREV_TAG="v$OLD"
 tag_usable=0
 rc=0; git ls-remote --exit-code --tags origin "refs/tags/$PREV_TAG" >/dev/null 2>&1 || rc=$?
 case "$rc" in
-  0) git rev-parse -q --verify "refs/tags/$PREV_TAG" >/dev/null 2>&1 && tag_usable=1 ;;  # on origin (and local, after release-cut's fetch) -> diffable
+  0) # On origin -> published. It must be local too, to diff against; after release-cut's
+     # fetch it is. On origin but NOT in this clone is a broken instrument (a standalone
+     # run with no tag fetch), not an unpublished pin: say so and stop (exit 2) rather than
+     # repin with a wrong "not published" message and an unneeded fleet roll.
+     if git rev-parse -q --verify "refs/tags/$PREV_TAG" >/dev/null 2>&1; then
+       tag_usable=1
+     else
+       echo "worker-tag-autobump: $PREV_TAG is on origin but not in this clone, so the agent surface cannot be diffed. Run  git fetch --tags origin  and re-run." >&2
+       exit 2
+     fi
+     ;;
   2) tag_usable=0 ;;                                                                     # origin reachable, tag NOT there -> unpublished / local-only
   *) git rev-parse -q --verify "refs/tags/$PREV_TAG" >/dev/null 2>&1 && tag_usable=1 ;;  # origin unreachable -> fall back to the local check
 esac
