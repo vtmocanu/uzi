@@ -121,6 +121,7 @@ describe("YourUsageCard", () => {
       lifetime_unreported_run_count: 1,
       last7_subscription_run_count: 1,
       last7_unreported_run_count: 0,
+      outcomes: noOutcomes(),
     };
     const { container } = wrap(<YourUsageCard usage={usage} />);
     // Positive: the metered dollar figures are still shown...

@@ -1,8 +1,8 @@
 // Worker templates (PRD #18): the curated image variants a worker can be built
 // from. This is the web-side mirror of the server registry (api/internal/
 // workertmpl) and of the Dockerfiles under agent/templates/<name>/ — keep the
-// three in sync. Hardcoded here the same way ModelSelect hardcodes MODEL_ALIASES:
-// a tiny curated list needs no API round-trip.
+// three in sync. Hardcoded here the same way ModelSelect hardcodes its per-harness
+// alias lists: a tiny curated list needs no API round-trip.
 
 /** Curated template names, in display order (base first). */
 export const WORKER_TEMPLATES = ["base", "jvm"] as const;
