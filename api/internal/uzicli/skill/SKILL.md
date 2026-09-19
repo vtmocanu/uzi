@@ -609,7 +609,10 @@ uzi version
   and latest capture state. A `source_only` or `needs_action` disposition awaits your decision;
   `archive_ready` self-releases and `active` is healthy protection of a still-running run.
   Recover an available archive with `uzi run export`, or discard a held source with
-  `uzi run discard`. `--json` emits the run's raw hold DTOs.
+  `uzi run discard`. `--json` emits the run's raw hold DTOs. A `failed` run whose
+  `landing_state` is `needs_landing` carries human-landable work: recover it with
+  `uzi run export` when an archive is available, or from the preserved diff
+  (`uzi run get <run-id> --field preserved_patch`) when it isn't.
 - `uzi run discard <run-id> --hold <hold-id> [--yes]` — discard ONE exact custody hold (a held
   source of unpublished committed work), so a blocked worker/PVC can be torn down. **Destructive:**
   the worker-local source may be the only copy and no server archive can restore it after discard.

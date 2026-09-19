@@ -54,6 +54,28 @@ three whole-section conditions instead of a per-capture state:
 - **Unavailable source** — recovery was armed but nothing needed capturing,
   or the source could not be preserved.
 
+### Failed runs that need landing
+
+A run can finish every milestone and pass every gate, and still end up
+`failed` — because the worker could not publish its branch. That happens
+for a handful of reasons: a workflow-scoped file the bot can't push, a
+base-alignment conflict against a moving default branch, a push blocked by
+secret-scanning, or a rewritten published history. In every one of those
+cases the committed work itself is usually still intact, and uzi labels the
+run **needs landing** instead of a plain failure, so it's obvious a human
+can land it by hand. It still counts as a failure in your run stats — the
+factory didn't publish anything — the label just tells you the work is not
+lost.
+
+Where the work actually is depends on what got captured for that run: a
+preserved diff, shown inline on the run page (or via `uzi run get <run-id>
+--field preserved_patch`), or a recovery archive you can download — see
+[Downloading an archive](#downloading-an-archive) below, or `uzi run export
+<run-id> --output <path>`. When a run needs landing but neither a preserved
+diff nor an available archive exists yet, uzi reports it as
+**unrecoverable** instead: the same underlying cause, but nothing left to
+hand a human.
+
 Every download surface warns that the original may contain secrets: review
 it before publishing anywhere, and if it exposed a real credential, revoke
 and rotate it and remove it from the affected history — deleting the
