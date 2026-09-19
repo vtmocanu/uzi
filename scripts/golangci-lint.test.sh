@@ -536,11 +536,11 @@ CANCEL_CHILD_PID="$(cat "$CHILD_PID_FILE")"
 wrapper_tmp="$(awk 'END { print }' "$MKTEMP_LOG")"
 (
   sleep 5
-  kill -KILL -- "-$CANCEL_WRAPPER_PID" 2>/dev/null || true
+  kill -KILL "-$CANCEL_WRAPPER_PID" 2>/dev/null || true
   kill -KILL "$CANCEL_LAUNCHER_PID" 2>/dev/null || true
 ) &
 CANCEL_WATCHDOG_PID=$!
-kill -TERM -- "-$CANCEL_WRAPPER_PID"
+kill -TERM "-$CANCEL_WRAPPER_PID"
 group_rc=0
 wait "$CANCEL_LAUNCHER_PID" || group_rc=$?
 CANCEL_LAUNCHER_PID=""
