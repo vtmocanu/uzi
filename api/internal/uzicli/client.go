@@ -286,10 +286,12 @@ type Client interface {
 	// non-task run, or an already-dispatched one is a 404 (exit 4).
 	DispatchTaskRun(ctx context.Context, runID string) (apitypes.RunDTO, error)
 	// SubmitRunInput submits a steering input: POST /api/runs/{id}/inputs
-	// {kind, body, selection}. kind ∈ {approve_plan, reject_plan, cancel, follow_up}.
-	// sel is legal only with approve_plan; the server validates it against the run's
-	// real roster (the client never composes the worker-bound body itself).
-	SubmitRunInput(ctx context.Context, runID, kind, body string, sel *apitypes.AgentSelection) (apitypes.RunInputResponse, error)
+	// {kind, body, selection, discard_pending_outcome}. kind ∈ {approve_plan, reject_plan,
+	// cancel, follow_up}. sel is legal only with approve_plan; the server validates it against
+	// the run's real roster (the client never composes the worker-bound body itself).
+	// discardPendingOutcome is the PRD #1391 Run B M3d (D13) confirmation, meaningful only with
+	// cancel: it discards a terminal outcome held on the worker (default false → unchanged).
+	SubmitRunInput(ctx context.Context, runID, kind, body string, sel *apitypes.AgentSelection, discardPendingOutcome bool) (apitypes.RunInputResponse, error)
 	// DeleteWorker removes one of the caller's workers: DELETE /api/workers/{id}
 	// (204 No Content on success). A worker with active runs is a 409 (exit 5); an
 	// unknown/foreign id is a 404 (exit 4). Minting a worker stays a webui action —
@@ -911,11 +913,26 @@ func transportMsg(err error) string {
 	return err.Error()
 }
 
+// ReasonOutcomePendingConfirmationRequired is the server's typed-409 reason code (PRD #1391 Run B
+// M3d, D13) for a cancel of a run whose executor journaled a terminal outcome held on its worker:
+// the cancel needs the explicit --discard-pending-outcome flag. Matched on the *ExitError.Reason
+// field so the CLI branches on the exact condition rather than the human message text.
+const ReasonOutcomePendingConfirmationRequired = "outcome_pending_confirmation_required"
+
 // statusError maps a non-2xx status to an *ExitError with the documented exit
 // code, folding in the server's {"error": "..."} message when present. retryAfter
-// is the response's Retry-After header (empty when absent), read only for a 429.
+// is the response's Retry-After header (empty when absent), read only for a 429. A
+// typed error body's machine-readable `reason` is carried on the *ExitError.Reason so a
+// caller can branch on the exact server condition (PRD #1391 Run B M3d's cancel gate).
 func statusError(status int, body []byte, retryAfter string) *ExitError {
 	msg := serverErrMsg(body)
+	reason := serverErrReason(body)
+	e := buildStatusError(status, msg, retryAfter)
+	e.Reason = reason
+	return e
+}
+
+func buildStatusError(status int, msg, retryAfter string) *ExitError {
 	switch {
 	case status == http.StatusTooManyRequests:
 		// A 429 is a rate-limit shed, not a bad request: the server (or the forge it
@@ -995,6 +1012,18 @@ func serverErrMsg(body []byte) string {
 	}
 	if json.Unmarshal(body, &e) == nil {
 		return strings.TrimSpace(e.Error)
+	}
+	return ""
+}
+
+// serverErrReason extracts the machine-readable `reason` from a typed error body
+// ({"error", "reason"}), or "" when the body carries none (the plain {"error"} shape).
+func serverErrReason(body []byte) string {
+	var e struct {
+		Reason string `json:"reason"`
+	}
+	if json.Unmarshal(body, &e) == nil {
+		return strings.TrimSpace(e.Reason)
 	}
 	return ""
 }

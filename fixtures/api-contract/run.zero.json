@@ -111,5 +111,6 @@
   "current_activity": null,
   "credential_override": null,
   "credential_switch": null,
-  "credential_epochs": null
+  "credential_epochs": null,
+  "outcome_pending": null
 }

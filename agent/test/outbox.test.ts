@@ -5,7 +5,15 @@ import { existsSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { Outbox, StaleClaimError, OUTBOX_RANGE_RESERVE_BYTES, type RawWriteSeam } from "../src/outbox.js";
+import {
+  Outbox,
+  StaleClaimError,
+  OUTBOX_RANGE_RESERVE_BYTES,
+  canonicalizeTerminalBody,
+  deriveTerminalReserveBytes,
+  type RawWriteSeam,
+  type TerminalBlockedReason,
+} from "../src/outbox.js";
 import type { OutgoingMessage } from "../src/protocol.js";
 import { nullLogger, recordingLogger } from "./helpers.js";
 
@@ -33,6 +41,7 @@ type OutboxOverrides = Partial<{
   runMaxBytes: number;
   maxBytes: number;
   retentionMs: number;
+  reserveBytes: number;
   now: () => number;
   rawWrite: RawWriteSeam;
   log: ReturnType<typeof recordingLogger>["logger"];
@@ -45,6 +54,7 @@ function makeOutbox(root: string, over: OutboxOverrides = {}): Outbox {
     runMaxBytes: over.runMaxBytes ?? DEFAULTS.runMaxBytes,
     maxBytes: over.maxBytes ?? DEFAULTS.maxBytes,
     retentionMs: over.retentionMs ?? DEFAULTS.retentionMs,
+    ...(over.reserveBytes !== undefined ? { reserveBytes: over.reserveBytes } : {}),
     now: over.now,
     rawWrite: over.rawWrite,
   });
@@ -1137,5 +1147,459 @@ describe("Outbox M1 (PRD #1391 Run A)", () => {
     await o.sweepRetention(clock + 5000);
     assert.equal(o.depthFor("r1"), undefined, "an empty, aged run with no concurrent append is reclaimed");
     assert.ok(!existsSync(path.join(root, "r1")), "its directory was deleted");
+  });
+});
+
+// PRD #1391 M3 (Run B) — the terminal-journal STORE primitives, the canonicaliser, the
+// terminal-sized reserve upgrade, and the reserve_exhausted fallback. Store-level only:
+// there is no send-path consumer yet (that is M3b), so these tests are the module's only
+// consumer of the new surface, which is what keeps knip/deadcode green over its exports.
+
+async function terminalFileNames(runDir: string): Promise<string[]> {
+  const names = await fs.readdir(runDir).catch(() => [] as string[]);
+  return names.filter((n) => n.startsWith("terminal-") && n.endsWith(".json")).sort();
+}
+
+describe("Outbox M3 terminal-journal store (PRD #1391 Run B)", () => {
+  it("T1. journalTerminal installs terminal-<gen>.json crash-atomically and lists it as pending", async () => {
+    const root = await mkRoot();
+    const o = makeOutbox(root);
+    await o.init();
+
+    const body = canonicalizeTerminalBody({ status: "completed", branch: "agent/issue-9", report_md: "done" }, 1 << 20);
+    const res = await o.journalTerminal("r1", 3, "reviewing", 42, body);
+    assert.deepEqual(res, { journaled: true, adopted: false });
+
+    // The journal file exists, keyed by generation, NOT in the message manifest.
+    assert.deepEqual(await terminalFileNames(path.join(root, "r1")), ["terminal-3.json"]);
+    assert.ok(!existsSync(path.join(root, "r1", "manifest.json")), "a terminal-only run writes no message manifest");
+
+    // Depth + list surface the pending terminal, defaulting the message side to 0.
+    const depth = o.depthFor("r1");
+    assert.equal(depth?.pendingTerminal, 1);
+    assert.equal(depth?.pendingMessages, 0);
+    assert.equal(depth?.blockedReason, undefined, "an un-refused journal is not blocked");
+    const pending = o.listPendingTerminals();
+    assert.equal(pending.length, 1);
+    assert.deepEqual(
+      { run_id: pending[0]?.run_id, claim_generation: pending[0]?.claim_generation, phase: pending[0]?.phase, blocked: pending[0]?.blocked },
+      { run_id: "r1", claim_generation: 3, phase: "reviewing", blocked: false },
+    );
+  });
+
+  it("T2. no-replace install is first-writer-wins: a second outcome for one generation is adopted, not overwritten", async () => {
+    const root = await mkRoot();
+    const o = makeOutbox(root);
+    await o.init();
+
+    const first = canonicalizeTerminalBody({ status: "completed", branch: "b1", report_md: "FIRST" }, 1 << 20);
+    const r1 = await o.journalTerminal("r1", 5, "implementing", 10, first);
+    assert.deepEqual(r1, { journaled: true, adopted: false });
+
+    // A DIFFERENT outcome for the SAME generation (the permanent-failure hook racing a
+    // completion, fact 1) must adopt the first durable winner, never clobber it (D4).
+    const second = canonicalizeTerminalBody({ status: "failed", branch: "b2", report_md: "SECOND" }, 1 << 20);
+    const r2 = await o.journalTerminal("r1", 5, "reviewing", 12, second);
+    assert.deepEqual(r2, { journaled: true, adopted: true }, "the second install adopts the first winner");
+
+    // The on-disk journal still holds the FIRST body.
+    const raw = JSON.parse(await fs.readFile(path.join(root, "r1", "terminal-5.json"), "utf8")) as {
+      body: { status: string; report_md: string };
+      phase_at_journal: string;
+    };
+    assert.equal(raw.body.status, "completed", "the first outcome's status survives");
+    assert.equal(raw.body.report_md, "FIRST", "the second outcome never overwrote the first body");
+    assert.equal(raw.phase_at_journal, "implementing", "the first writer's metadata is preserved");
+    assert.equal(o.depthFor("r1")?.pendingTerminal, 1, "still exactly one pending terminal for the generation");
+  });
+
+  it("T3. a terminal on an exhausted reserve returns reserve_exhausted (unjournaled), never throws or drops silently", async () => {
+    const root = await mkRoot();
+    // Seam: EVERY terminal temp write hits ENOSPC, even after the reserve is released. So the
+    // store cannot admit the journal at all — it must SIGNAL the caller, not throw or drop.
+    const rawWrite: RawWriteSeam = async (write, ctx) => {
+      if (ctx.kind === "terminal") {
+        const err = new Error("no space left on device") as NodeJS.ErrnoException;
+        err.code = "ENOSPC";
+        throw err;
+      }
+      await write();
+    };
+    const { logger, lines } = recordingLogger();
+    const o = makeOutbox(root, { rawWrite, log: logger });
+    await o.init();
+
+    const body = canonicalizeTerminalBody({ status: "completed", branch: "b", report_md: "x" }, 1 << 20);
+    const res = await o.journalTerminal("r1", 1, "reviewing", 5, body);
+    assert.deepEqual(res, { journaled: false, reason: "reserve_exhausted" }, "the caller is told to send unjournaled");
+
+    // Nothing was left on disk, nothing is tracked pending, and the error was LOGGED (never silent).
+    assert.deepEqual(await terminalFileNames(path.join(root, "r1")), []);
+    assert.equal(o.depthFor("r1"), undefined);
+    assert.equal(o.listPendingTerminals().length, 0);
+    assert.ok(
+      (lines as Array<{ level: string; msg: string }>).some(
+        (l) => l.level === "error" && l.msg.includes("reserve exhausted"),
+      ),
+      "the unjournaled fallback is logged as an error",
+    );
+  });
+
+  it("T4. retireTerminal unlinks the journal and drops it from the pending set", async () => {
+    const root = await mkRoot();
+    const o = makeOutbox(root);
+    await o.init();
+    await o.journalTerminal("r1", 2, "reviewing", 7, canonicalizeTerminalBody({ status: "completed" }, 1 << 20));
+    assert.equal(o.depthFor("r1")?.pendingTerminal, 1);
+
+    await o.retireTerminal("r1", 2);
+    assert.deepEqual(await terminalFileNames(path.join(root, "r1")), [], "the journal file was unlinked");
+    assert.equal(o.depthFor("r1")?.pendingTerminal, 0);
+    assert.equal(o.listPendingTerminals().length, 0);
+  });
+
+  it("T5. staleRetireTerminal unlinks the journal and increments the run's stale_retired counter, no server write", async () => {
+    const root = await mkRoot();
+    const o = makeOutbox(root);
+    await o.init();
+    await o.journalTerminal("r1", 4, "implementing", 3, canonicalizeTerminalBody({ status: "failed" }, 1 << 20));
+
+    await o.staleRetireTerminal("r1", 4);
+    assert.deepEqual(await terminalFileNames(path.join(root, "r1")), []);
+    assert.equal(o.depthFor("r1")?.pendingTerminal, 0);
+    assert.equal(o.depthFor("r1")?.staleRetired, 1, "the D11 stale-retired counter advanced by one");
+
+    // The counter is durable (installManifest wrote a manifest for the terminal-only run).
+    const b = makeOutbox(root);
+    await b.init();
+    assert.equal(b.depthFor("r1")?.staleRetired, 1, "stale_retired survives restart via the manifest");
+  });
+
+  it("T6. markTerminalBlocked sets blocked + a closed-vocab reason, surfaced on depth and after restart", async () => {
+    const root = await mkRoot();
+    const o = makeOutbox(root);
+    await o.init();
+    await o.journalTerminal("r1", 8, "reviewing", 9, canonicalizeTerminalBody({ status: "completed" }, 1 << 20));
+
+    const reason: TerminalBlockedReason = "completion_permit_mismatch";
+    await o.markTerminalBlocked("r1", 8, reason);
+    assert.equal(o.depthFor("r1")?.blockedReason, reason, "the blocked reason surfaces on the depth");
+    const pending = o.listPendingTerminals();
+    assert.equal(pending[0]?.blocked, true);
+    assert.equal(pending[0]?.blocked_reason, reason);
+
+    // The blocked state is durable and re-adopted at init.
+    const b = makeOutbox(root);
+    await b.init();
+    assert.equal(b.depthFor("r1")?.blockedReason, reason, "blocked state survives restart");
+    assert.equal(b.listPendingTerminals()[0]?.blocked, true);
+  });
+
+  it("T6b. marking a terminal blocked releases the reserve on ENOSPC and persists across restart", async () => {
+    const root = await mkRoot();
+    const reservePath = path.join(root, ".reserve");
+    let terminalFileWrites = 0;
+    let retrySawReleasedReserve = false;
+    const rawWrite: RawWriteSeam = async (write, ctx) => {
+      if (ctx.kind === "terminal" && path.basename(ctx.path).startsWith("terminal-8.json.")) {
+        terminalFileWrites++;
+        if (terminalFileWrites === 2) {
+          assert.ok(existsSync(reservePath), "reserve is present when the blocked-state rewrite hits ENOSPC");
+          const err = new Error("no space left on device") as NodeJS.ErrnoException;
+          err.code = "ENOSPC";
+          throw err;
+        }
+        if (terminalFileWrites === 3) {
+          assert.ok(!existsSync(reservePath), "reserve is released before retrying the blocked-state rewrite");
+          retrySawReleasedReserve = true;
+        }
+      }
+      await write();
+    };
+    const o = makeOutbox(root, { rawWrite });
+    await o.init();
+    await o.journalTerminal("r1", 8, "reviewing", 9, canonicalizeTerminalBody({ status: "completed" }, 1 << 20));
+
+    const reason: TerminalBlockedReason = "completion_permit_mismatch";
+    await o.markTerminalBlocked("r1", 8, reason);
+
+    assert.equal(retrySawReleasedReserve, true, "the blocked-state rewrite retried after releasing the reserve");
+    assert.ok(existsSync(reservePath), "reserve replenishment was attempted after the retry");
+    assert.equal(statSync(reservePath).size, OUTBOX_RANGE_RESERVE_BYTES, "the reserve was replenished to its configured size");
+    assert.equal((await o.readTerminalJournal("r1", 8))?.blockedReason, reason, "the rewritten journal is blocked");
+
+    const b = makeOutbox(root);
+    await b.init();
+    assert.equal(b.depthFor("r1")?.blockedReason, reason, "the reserve-backed blocked state survives restart");
+    assert.equal(b.listPendingTerminals()[0]?.blocked, true);
+  });
+
+  it("T7. a pending terminal journal survives restart and blocks retention of an otherwise-empty run", async () => {
+    const root = await mkRoot();
+    const clock = 5_000_000;
+    const a = makeOutbox(root, { retentionMs: 1000, now: () => clock });
+    await a.init();
+    await a.journalTerminal("r1", 1, "reviewing", 2, canonicalizeTerminalBody({ status: "completed" }, 1 << 20));
+
+    // Restart: the journal is re-adopted from disk.
+    const o = makeOutbox(root, { retentionMs: 1000, now: () => clock });
+    await o.init();
+    assert.equal(o.depthFor("r1")?.pendingTerminal, 1, "the journal is re-adopted after restart");
+
+    // Retention must NOT age off a run with a pending terminal, however old.
+    await o.sweepRetention(clock + 10_000_000);
+    assert.equal(o.depthFor("r1")?.pendingTerminal, 1, "a pending terminal journal is never retention-removed");
+    assert.ok(existsSync(path.join(root, "r1", "terminal-1.json")), "its journal file survives the sweep");
+
+    // Once retired and aged, the empty run does age off.
+    await o.retireTerminal("r1", 1);
+    await o.sweepRetention(clock + 10_000_000);
+    assert.equal(o.depthFor("r1"), undefined, "after the terminal retires, the empty run ages off");
+  });
+
+  it("T8. in-place upgrade from a Run A disk tree: key + message records readable, metadata defaults safely, .reserve GREW", async () => {
+    const root = await mkRoot();
+    // (a) Build a genuine Run A tree: default (64 KiB) reserve, an authenticated message-only
+    // manifest, its .key, and a segment.
+    const a = makeOutbox(root); // no reserveBytes → OUTBOX_RANGE_RESERVE_BYTES
+    await a.init();
+    await a.appendSegment("r1", 1, [textMsg(1, "hello"), textMsg(2, "world")]);
+    assert.equal(statSync(path.join(root, ".reserve")).size, OUTBOX_RANGE_RESERVE_BYTES, "Run A reserve is 64 KiB");
+    const keyBefore = await fs.readFile(path.join(root, ".key"));
+
+    // (b) Re-open WITH terminal journaling enabled (a larger, terminal-derived reserve).
+    const terminalReserve = 256 * 1024; // > 64 KiB; a modest stand-in for the ~5.25 MiB default
+    const b = makeOutbox(root, { reserveBytes: terminalReserve });
+    await b.init();
+
+    // The worker-local key was not re-minted, and the message records stay readable.
+    assert.ok(keyBefore.equals(await fs.readFile(path.join(root, ".key"))), ".key was not re-minted on upgrade");
+    assert.equal(b.depthFor("r1")?.pendingMessages, 2, "the message records are still pending/readable");
+
+    // Terminal/blocked metadata defaults safely on the pre-existing run.
+    assert.equal(b.depthFor("r1")?.pendingTerminal, 0, "no terminal journal ⇒ pendingTerminal 0");
+    assert.equal(b.depthFor("r1")?.blockedReason, undefined, "no blocked reason on a Run A tree");
+    assert.equal(b.listPendingTerminals().length, 0);
+
+    // The .reserve GREW to the configured terminal size.
+    assert.equal(statSync(path.join(root, ".reserve")).size, terminalReserve, "the reserve grew to the terminal size");
+
+    // And the messages actually replay under the upgraded store.
+    const c = collector();
+    const res = await b.drainRun("r1", c.send);
+    assert.equal(res.retired, true);
+    assert.deepEqual(
+      c.flat().map((m) => (m.payload as { text: string }).text),
+      ["hello", "world"],
+      "the Run A messages replay intact after the in-place upgrade",
+    );
+  });
+
+  it("T9. deriveTerminalReserveBytes is reserveTerminals * (terminalMaxBytes + one range-record slack)", async () => {
+    // The reserve-size formula, from ONE source. At the defaults (4 × 1.25 MiB + 4 × 64 KiB) ≈ 5.25 MiB.
+    const terminalMax = Math.round(1.25 * 1024 * 1024);
+    assert.equal(
+      deriveTerminalReserveBytes(4, terminalMax),
+      4 * (terminalMax + OUTBOX_RANGE_RESERVE_BYTES),
+    );
+    assert.ok(
+      deriveTerminalReserveBytes(4, terminalMax) > 5 * 1024 * 1024 &&
+        deriveTerminalReserveBytes(4, terminalMax) < 5.5 * 1024 * 1024,
+      "about 5.2 MiB at the defaults",
+    );
+  });
+
+  it("T10. mkdir-ENOSPC fold-in: a terminal write-ahead on a full volume with an ABSENT run dir degrades to reserve_exhausted, NEVER throws", async () => {
+    // The M3a review gap: the run-dir mkdir used to sit BEFORE the ENOSPC→reserve_exhausted handling,
+    // so a full volume with no prior spill for the run THREW at the mkdir instead of degrading. The
+    // fix routes the mkdir through the same reserve/ENOSPC seam as the record write. Here the seam
+    // fails the mkdir (the run-dir path, never a .tmp) on EVERY attempt — even after the reserve is
+    // released — so the store cannot even create the dir and must SIGNAL the caller, not throw.
+    const root = await mkRoot();
+    const runDir = path.join(root, "r1");
+    const rawWrite: RawWriteSeam = async (write, ctx) => {
+      if (ctx.kind === "terminal" && ctx.path === runDir) {
+        const err = new Error("no space left on device") as NodeJS.ErrnoException;
+        err.code = "ENOSPC";
+        throw err; // the mkdir step, always full
+      }
+      await write();
+    };
+    const { logger, lines } = recordingLogger();
+    const o = makeOutbox(root, { rawWrite, log: logger });
+    await o.init();
+    assert.ok(!existsSync(runDir), "the run dir is absent before the write-ahead (no prior spill)");
+
+    const body = canonicalizeTerminalBody({ status: "failed", failure_reason: "boom" }, 1 << 20);
+    let threw = false;
+    let res: Awaited<ReturnType<typeof o.journalTerminal>> | undefined;
+    try {
+      res = await o.journalTerminal("r1", 1, "reviewing", 5, body);
+    } catch {
+      threw = true;
+    }
+    assert.equal(threw, false, "journalTerminal must NOT throw when the mkdir hits ENOSPC");
+    assert.deepEqual(res, { journaled: false, reason: "reserve_exhausted" }, "it degrades to reserve_exhausted");
+    assert.equal(o.depthFor("r1"), undefined, "nothing is tracked pending");
+    assert.ok(
+      (lines as Array<{ level: string; msg: string }>).some(
+        (l) => l.level === "error" && l.msg.includes("reserve exhausted"),
+      ),
+      "the unjournaled fallback is logged as an error (never a silent drop)",
+    );
+  });
+
+  it("T11. mkdir-ENOSPC fold-in: releasing the reserve ADMITS the run-dir mkdir, so the journal still installs", async () => {
+    // The complementary case: the mkdir hits ENOSPC ONCE (reserve present), the reserve release frees
+    // the space, and the retry succeeds — so a full volume with headroom in the reserve still journals
+    // the outcome durably rather than degrading.
+    const root = await mkRoot();
+    const runDir = path.join(root, "r1");
+    let mkdirCalls = 0;
+    const rawWrite: RawWriteSeam = async (write, ctx) => {
+      if (ctx.kind === "terminal" && ctx.path === runDir) {
+        mkdirCalls++;
+        if (mkdirCalls === 1) {
+          const err = new Error("no space left on device") as NodeJS.ErrnoException;
+          err.code = "ENOSPC";
+          throw err; // first mkdir attempt: full
+        }
+      }
+      await write(); // the retry (and the temp write) proceed
+    };
+    const o = makeOutbox(root, { rawWrite });
+    await o.init();
+
+    const body = canonicalizeTerminalBody({ status: "completed", branch: "b" }, 1 << 20);
+    const res = await o.journalTerminal("r1", 2, "reviewing", 9, body);
+    assert.deepEqual(res, { journaled: true, adopted: false }, "the reserve release admitted the mkdir; the journal installed");
+    assert.ok(mkdirCalls >= 2, "the mkdir was retried after the reserve release");
+    assert.deepEqual(await terminalFileNames(runDir), ["terminal-2.json"]);
+    assert.equal(o.depthFor("r1")?.pendingTerminal, 1);
+  });
+
+  it("T12. readTerminalJournal returns the durable canonical body + fence + phase, and undefined once retired / for an unknown gen", async () => {
+    const root = await mkRoot();
+    const o = makeOutbox(root);
+    await o.init();
+    const body = canonicalizeTerminalBody({ status: "completed", branch: "agent/issue-9", report_md: "done" }, 1 << 20);
+    await o.journalTerminal("r1", 3, "reviewing", 42, body);
+
+    const j = await o.readTerminalJournal("r1", 3);
+    assert.deepEqual(j?.body, body, "the canonical body is returned byte-for-byte for the send path");
+    assert.equal(j?.messagesThroughSeq, 42, "the fence is the journalled durable tail");
+    assert.equal(j?.phase, "reviewing");
+    assert.equal(j?.blocked, false);
+
+    assert.equal(await o.readTerminalJournal("r1", 999), undefined, "an unknown generation reads undefined");
+    await o.retireTerminal("r1", 3);
+    assert.equal(await o.readTerminalJournal("r1", 3), undefined, "a retired journal reads undefined");
+  });
+});
+
+describe("canonicalizeTerminalBody (PRD #1391 Run B / M3, D-A1)", () => {
+  it("C1. a max-shape terminal under the cap is byte-identical between two invocations (first-send vs journal)", async () => {
+    // Every required field present, plus optionals sized well under a generous cap. The canonicaliser
+    // is pure, so first-send and journal serialise byte-for-byte identically.
+    const body: Record<string, unknown> = {
+      status: "completed",
+      claim_generation: 7,
+      messages_through_seq: 128,
+      branch: "agent/issue-1393",
+      head: "0".repeat(40),
+      mr_iid: 4321,
+      mr_web_url: "https://forge.test/org/repo/-/merge_requests/4321",
+      fail_origin: "agent_failure",
+      report_md: "All three milestones landed.",
+      session_id: "sess-abc-123",
+      failure_reason: "n/a",
+      preserved_patch: "diff --git a/x b/x\n+line\n",
+      proposal: { title: "A follow-up", body: "Body text." },
+      milestones_completed: ["m1", "m2", "m3"],
+      milestones_in_progress: [],
+    };
+    const cap = 1 << 20; // 1 MiB — nothing is over cap here
+    const first = canonicalizeTerminalBody(body, cap);
+    const journal = canonicalizeTerminalBody(body, cap);
+    assert.strictEqual(JSON.stringify(first), JSON.stringify(journal), "two invocations serialise byte-identically");
+    assert.deepEqual(first, journal);
+
+    // Every required field is present and byte-identical to the input (never touched).
+    for (const k of ["status", "claim_generation", "messages_through_seq", "branch", "head", "mr_iid", "mr_web_url", "fail_origin"]) {
+      assert.deepEqual(first[k], body[k], `required field ${k} is preserved verbatim`);
+    }
+    // Under-cap optionals survive too.
+    assert.equal(first.report_md, body.report_md);
+    assert.deepEqual(first.proposal, body.proposal);
+    assert.deepEqual(first.milestones_completed, body.milestones_completed);
+  });
+
+  it("C2. the proposal is dropped WHOLE (not cut) when over cap; required fields are never dropped", async () => {
+    const cap = 256; // tiny, so the large proposal is over cap
+    const bigProposalBody = "P".repeat(4000);
+    const body: Record<string, unknown> = {
+      status: "completed",
+      claim_generation: 2,
+      branch: "agent/issue-1",
+      head: "a".repeat(40),
+      mr_iid: 1,
+      fail_origin: "agent_failure",
+      proposal: { title: "big", body: bigProposalBody },
+    };
+    const out = canonicalizeTerminalBody(body, cap);
+
+    // Proposal is gone ENTIRELY — not a truncated fragment.
+    assert.equal("proposal" in out, false, "the over-cap proposal is dropped whole");
+    assert.ok(!JSON.stringify(out).includes("PPPP"), "no fragment of the proposal body survived (never byte-cut)");
+
+    // Required fields survive at the tiny cap.
+    for (const k of ["status", "claim_generation", "branch", "head", "mr_iid", "fail_origin"]) {
+      assert.deepEqual(out[k], body[k], `required field ${k} is never dropped, even under a tiny cap`);
+    }
+  });
+
+  it("C3. a secret straddling the preserved_patch cap is wholly kept or wholly cut, never split into a prefix", async () => {
+    // Assemble a provider-token-shaped value from fragments joined at runtime, so no complete
+    // token-shaped literal appears in tracked source (source-hygiene gate).
+    const secret = ["glpat-", "AABBCCDDEEFFGG001122"].join("");
+    // Whole diff lines. The secret's line sits AFTER the byte budget, so line-aligned truncation
+    // must drop it entirely rather than keep a mid-secret prefix.
+    const keptLines = ("+" + "K".repeat(40) + " KEEPLINE\n").repeat(60); // ~3.1 KiB of whole lines
+    const secretLine = "+ token=" + secret + " trailing\n";
+    const tailLines = ("+" + "T".repeat(40) + " TAILLINE\n").repeat(60);
+    const patch = keptLines + secretLine + tailLines;
+
+    // A cap that lands inside the secret line: a NAIVE byte cut would split the secret.
+    const secretStart = keptLines.length + "+ token=".length;
+    const cap = secretStart + 8; // mid-secret
+    const naive = patch.slice(0, cap);
+    assert.ok(naive.includes("glpat-") && !naive.includes(secret), "a naive byte cut WOULD split the secret");
+
+    const out = canonicalizeTerminalBody({ status: "completed", preserved_patch: patch }, cap);
+    const canon = out.preserved_patch as string;
+
+    assert.ok(!canon.includes("glpat-"), "no fragment of the straddling secret survives the line-aligned truncation");
+    assert.ok(!canon.includes(secret), "and the full secret is not present either (its line was wholly cut)");
+    assert.ok(canon.includes("KEEPLINE"), "earlier whole lines are preserved");
+    assert.ok(canon.includes("truncated"), "a visible truncation marker is present");
+    assert.ok(Buffer.byteLength(JSON.stringify(canon), "utf8") <= cap, "the truncated field fits the cap");
+    // Byte-identical between invocations (pure).
+    assert.strictEqual(canon, canonicalizeTerminalBody({ status: "completed", preserved_patch: patch }, cap).preserved_patch);
+  });
+
+  it("C4. an over-cap optional string is dropped whole; an over-cap milestone entry is dropped per-entry", async () => {
+    const cap = 128;
+    const body: Record<string, unknown> = {
+      status: "failed",
+      claim_generation: 1,
+      failure_reason: "F".repeat(4000), // over cap → dropped whole (never cut a credential)
+      report_md: "short", // under cap → kept
+      milestones_completed: ["ok", "X".repeat(4000), "also-ok"], // the huge entry is dropped
+    };
+    const out = canonicalizeTerminalBody(body, cap);
+    assert.equal("failure_reason" in out, false, "the over-cap optional string is dropped whole");
+    assert.equal(out.report_md, "short", "an under-cap optional string survives");
+    assert.deepEqual(out.milestones_completed, ["ok", "also-ok"], "only the over-cap milestone entry is dropped");
+    assert.equal(out.status, "failed", "the required status is untouched");
   });
 });

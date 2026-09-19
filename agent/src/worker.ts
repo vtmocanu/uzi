@@ -8,8 +8,9 @@ import type { JudgeRunner } from "./judge-runner.js";
 import type { ReviewRunner } from "./review-runner.js";
 import type { Logger } from "./log.js";
 import type { Config } from "./config.js";
-import type { ActiveSnapshot, OutboxHeartbeatEntry, WorkerStats } from "./protocol.js";
+import type { ActiveSnapshot, OutboxHeartbeatEntry, StateRequest, WorkerStats } from "./protocol.js";
 import type { ActiveRunRegistry } from "./active-run-registry.js";
+import { makeTerminalOutboxDeps, resolvePendingTerminal } from "./terminal-resolve.js";
 import { StatsCollector } from "./stats.js";
 import { errMessage, sleep } from "./util.js";
 import { toolchainPreflight, type PreflightResult } from "./toolchain-preflight.js";
@@ -111,11 +112,72 @@ export class Worker {
         this.log.warn("outbox boot drain failed", { error: errMessage(err) });
       });
     }
-    // Heartbeat, the run lane, and the chat lane run concurrently until abort.
-    await Promise.all([this.heartbeatLoop(signal), this.claimLoop(signal), this.chatClaimLoop(signal)]);
+    // PRD #1391 Run B M4 (D7/SC3) — the boot claim gate. START THE HEARTBEAT LOOP FIRST, before the
+    // pending-terminal replay, so a pending run's terminal_pending lease keeps refreshing throughout
+    // (a lease that lapsed mid-replay would let a sibling reclaim it). Then RESOLVE every pending
+    // terminal journal (send, retire, or leave it listed) BEFORE the claim loops start — this is the
+    // correctness gate with NO time bound: no run-lane run may claim while an unleased pending outcome
+    // exists. The claim loops themselves additionally stay closed while the pending set exceeds the
+    // cap (`pending_overflow`, checked each iteration in claimLoop), and message drain stays in the
+    // background above. The heartbeat promise is created once and awaited alongside the claim loops.
+    const heartbeat = this.heartbeatLoop(signal);
+    await this.resolveBootTerminals(signal);
+    // The run lane and the chat lane join the already-running heartbeat until abort.
+    await Promise.all([heartbeat, this.claimLoop(signal), this.chatClaimLoop(signal)]);
+  }
+
+  /**
+   * PRD #1391 Run B M4 (D7): on boot, resolve every pending terminal journal BEFORE the claim loops
+   * start. For each journal, {@link resolvePendingTerminal} sends the canonical outcome over a
+   * state-only `client.reportState` send (so a stale_claim returns an ack, not a throw, mirroring the
+   * judge/review lanes) and retires / stale-retires / gap-fills / marks-blocked / leaves-listed per
+   * M3. The generation is stamped from the journal entry so the api's per-query fence engages (a
+   * run-lane journal body carries no generation of its own — the reportState closure stamps it during
+   * a live run; at boot there is no closure, so stamp it here). A journal that cannot resolve now
+   * (its run's messages are still draining, a transient blip) is LEFT LISTED — leased via the
+   * snapshot — and re-resolved at the next boot; that is an acceptable boot outcome (D7). No time
+   * bound; a resolve never throws on an expected failure, so the belt is defensive.
+   */
+  private async resolveBootTerminals(signal: AbortSignal): Promise<void> {
+    const outbox = this.outbox;
+    if (!outbox) return;
+    const deps = makeTerminalOutboxDeps(outbox, this.client, {
+      gapFillMax: this.config.gapFillMax,
+      terminalMaxBytes: this.config.outboxTerminalMaxBytes,
+      log: this.log,
+    });
+    if (!deps) return; // no usable outbox (failed closed) — nothing durable to resolve
+    for (const entry of outbox.listPendingTerminals()) {
+      if (signal.aborted) return;
+      const gen = entry.claim_generation;
+      try {
+        await resolvePendingTerminal(deps, {
+          runId: entry.run_id,
+          claimGeneration: gen,
+          // State-only send stamped with the journal's generation, so a superseded generation is
+          // refused as stale_claim (local-retired, D11) rather than mis-applied under the new one.
+          send: (body: StateRequest, sig?: AbortSignal) =>
+            this.client.reportState(entry.run_id, { ...body, claim_generation: gen }, sig),
+          signal,
+        });
+      } catch (err) {
+        this.log.warn("outbox: boot terminal resolve failed for a run; leaving it listed for a later resolve", {
+          run_id: entry.run_id,
+          error: errMessage(err),
+        });
+      }
+    }
   }
 
   private async registerWithRetry(signal: AbortSignal): Promise<void> {
+    // PRD #1391 Run B M4 (D7/SC3): if this worker holds any pending terminal journal, carry an
+    // initial snapshot with an EMPTY pending subset + `pending_overflow: true` ON the register
+    // request, so those outcomes are LEASED before the api's register-time orphan pass can re-claim
+    // them. Cap-independent: the empty subset + overflow protects every pending run regardless of the
+    // cap (even cap 0, where a non-empty subset would be rejected whole when cap < count). Built ONCE
+    // before the retry loop so a re-register re-sends the same snapshot. Undefined for an ordinary
+    // worker with no pending journals (or no registry) ⇒ the register wire stays byte-identical.
+    const initialSnapshot = this.buildRegisterSnapshot();
     let attempt = 0;
     while (!signal.aborted) {
       try {
@@ -172,6 +234,7 @@ export class Worker {
           this.config.maxConcurrentRuns,
           capabilities,
           protocolCapabilities,
+          initialSnapshot,
         );
         this.log.info("registered", {
           name: this.config.workerName,
@@ -281,6 +344,21 @@ export class Worker {
   }
 
   /**
+   * PRD #1391 Run B M4 (D7): build the BOOT register snapshot, or undefined for an ordinary worker.
+   * Returned only when the worker holds at least one pending terminal journal — then it is an EMPTY
+   * pending subset + `pending_overflow: true`, which leases every pending run BEFORE the api's
+   * register-time orphan pass, cap-independently. Unlike the heartbeat/claim snapshot this is NOT
+   * gated on the `active_run_snapshot` FEATURE (the feature is only known AFTER register, and #1390's
+   * register handler accepts the field unconditionally): the gate is purely "do we hold a pending
+   * outcome to protect". Undefined when there is no registry or nothing pending.
+   */
+  private buildRegisterSnapshot(): ActiveSnapshot | undefined {
+    if (!this.activeRuns) return undefined;
+    if (!this.outbox || this.outbox.listPendingTerminals().length === 0) return undefined;
+    return this.activeRuns.buildRegisterSnapshot();
+  }
+
+  /**
    * PRD #1391 M2: the per-worker, single-flight outbox drainer. For each run with
    * pending segments, replay them in seq order over the messages route (poison inside
    * a segment is tombstoned and the rest lands — {@link replaySegment}); on a fully
@@ -354,6 +432,19 @@ export class Worker {
       // before any reclaim. isClaimPausedForE2E() is a constant `false` in production (nothing
       // latches it), so this is a no-op there; the e2e clears it by recreating the agent.
       if (this.activeRuns?.isClaimPausedForE2E()) {
+        await sleep(this.config.pollIntervalMs, signal);
+        continue;
+      }
+      // PRD #1391 Run B M4 (D7/SC4) — the PRODUCTION boot gate. While the pending terminal set
+      // exceeds the server cap (`pending_overflow`), #1390's claim exclusion has already closed every
+      // run this worker owns to every claimant; keep the worker's OWN run-lane claim loop closed for
+      // the same duration too, so no unleased pending outcome ever coexists with a new claim. This is
+      // the same sleep-and-continue shape as the e2e latch above, but reads the REAL pending-vs-cap
+      // state via a DIFFERENT method — and, crucially (D9), keys on that state, NEVER on which wire
+      // features are currently negotiated, so a strict-decode rollback that clears the feature set can
+      // never reopen the loop while a terminal journal is still unresolved. A no-op when no outbox /
+      // registry is wired (the concurrency unit tests) or nothing is pending.
+      if (this.activeRuns?.claimsPausedByPendingOverflow()) {
         await sleep(this.config.pollIntervalMs, signal);
         continue;
       }

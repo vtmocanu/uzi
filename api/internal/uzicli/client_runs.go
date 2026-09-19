@@ -526,8 +526,8 @@ func (c *HTTPClient) DispatchTaskRun(ctx context.Context, runID string) (apitype
 	return env.Run, nil
 }
 
-func (c *HTTPClient) SubmitRunInput(ctx context.Context, runID, kind, body string, sel *apitypes.AgentSelection) (apitypes.RunInputResponse, error) {
-	reqBody := apitypes.RunInputRequest{Kind: kind, Body: body, Selection: sel}
+func (c *HTTPClient) SubmitRunInput(ctx context.Context, runID, kind, body string, sel *apitypes.AgentSelection, discardPendingOutcome bool) (apitypes.RunInputResponse, error) {
+	reqBody := apitypes.RunInputRequest{Kind: kind, Body: body, Selection: sel, DiscardPendingOutcome: discardPendingOutcome}
 	var out apitypes.RunInputResponse
 	if err := c.postJSON(ctx, "/api/runs/"+url.PathEscape(runID)+"/inputs", reqBody, &out); err != nil {
 		return apitypes.RunInputResponse{}, err

@@ -349,11 +349,12 @@ func (f *FakeClient) DispatchTaskRun(_ context.Context, runID string) (apitypes.
 	return f.DispatchedRun, nil
 }
 
-func (f *FakeClient) SubmitRunInput(_ context.Context, runID, kind, body string, sel *apitypes.AgentSelection) (apitypes.RunInputResponse, error) {
+func (f *FakeClient) SubmitRunInput(_ context.Context, runID, kind, body string, sel *apitypes.AgentSelection, discardPendingOutcome bool) (apitypes.RunInputResponse, error) {
 	f.LastInputRunID = runID
 	f.LastInputKind = kind
 	f.LastInputBody = body
 	f.LastInputSelection = sel
+	f.LastInputDiscardPendingOutcome = discardPendingOutcome
 	if f.Err != nil {
 		return apitypes.RunInputResponse{}, f.Err
 	}

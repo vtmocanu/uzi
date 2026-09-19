@@ -42,6 +42,12 @@ type ExitError struct {
 	// fixed cadence. Nothing depends on it for control flow, so a zero value simply
 	// falls back to the caller's own default interval.
 	RetryAfter time.Duration
+	// Reason is the server's machine-readable reason code from a typed error body
+	// ({"error", "reason"}), empty when the body carried no `reason` (today's plain
+	// {"error"} shape). It lets a command branch on the exact server condition instead of
+	// string-matching the human message — PRD #1391 Run B M3d's cancel reads it for
+	// "outcome_pending_confirmation_required". Advisory: the exit code is unaffected.
+	Reason string
 }
 
 func (e *ExitError) Error() string {

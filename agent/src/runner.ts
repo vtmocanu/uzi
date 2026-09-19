@@ -44,6 +44,12 @@ import {
 } from "./repoagents.js";
 import { MessageBatcher } from "./batcher.js";
 import type { Outbox } from "./outbox.js";
+import {
+  journalAndResolveTerminal,
+  resolvePendingTerminal,
+  type SendTerminalState,
+  type TerminalOutboxDeps,
+} from "./terminal-resolve.js";
 import { rmTreeForce } from "./rmtree.js";
 import {
   SteeringChannel,
@@ -82,6 +88,19 @@ const MAX_FAILURE_REASON_LEN = 512;
  *  write again, so its retained recovery clone is safe to reclaim. Used by the
  *  handleRecoveryExhausted loop and by phaseClone's foreign-capture probe (#1315). */
 const TERMINAL_RUN_STATUSES = new Set(["cancelled", "completed", "failed"]);
+
+/** PRD #1391 Run B M3 (D4): the phase stamped into a run-lane terminal journal (`phase_at_journal`,
+ *  what #1390's snapshot reports for a pending outcome after a restart). Every run-lane terminal
+ *  report is produced while the run is at the `running` (finalize) phase, so this is the honest
+ *  value; kept as one constant so every site agrees. */
+const TERMINAL_JOURNAL_PHASE = "running";
+
+/** PRD #1391 Run B M4: the FIXED log line the queued-duplicate claim router emits when it ends the
+ *  attempt WITHOUT executing (a terminal/held row, a different generation, a definitive not-owned, or
+ *  an exhausted transient-probe budget). One constant so every end-path logs the same greppable
+ *  message; the varying detail (run_id, reason, status) rides the structured fields. No terminal
+ *  report is ever sent on these paths — the run keeps its authoritative status. */
+const QUEUED_DUPLICATE_END_LOG = "queued duplicate claim ended without executing (ownership probe)";
 
 /** PRD #1226 M4 (D6): bounded in-call attempts to capture a VERIFIED completion-hold restore
  *  point before giving up. Mirrors handleRecoveryExhausted's retain-and-retry, but bounded (this
@@ -243,6 +262,22 @@ class CredentialSwitchRetainedStop extends Error {
   constructor() {
     super("credential switch unconfirmed; retaining work and stopping the flight");
     this.name = "CredentialSwitchRetainedStop";
+  }
+}
+
+/**
+ * PRD #1391 Run B M4: phaseClone's FIRST `running` report came back refused (applied:false) with a
+ * TERMINAL status — the run reached completed/failed/cancelled out from under this claim (a racing
+ * owner cancel, or an outcome that already landed). Continuing the phase clone would work a claim the
+ * run has already left, so STOP: close the batcher, report NO terminal state (a `failed` here would
+ * fight the authoritative terminal outcome), and set NO preserve flag (nothing was cloned yet). The
+ * distinct `staleClaim` disposition is handled separately by the reportState closure's StaleClaimError
+ * throw; this is the non-stale terminal case. Local, thrown and caught entirely within this file.
+ */
+class RunningAckTerminalError extends Error {
+  constructor(readonly runStatus: string) {
+    super(`first running report refused with a terminal status (${runStatus})`);
+    this.name = "RunningAckTerminalError";
   }
 }
 
@@ -661,6 +696,14 @@ interface RunFlight {
   branch: string | undefined;
   active: ActiveRun | undefined;
   parked: boolean;
+  /** PRD #1391 Run B M3 (N2/D5): true once ANY terminal outcome for this generation has been
+   *  sent/resolved through {@link RunRunner.journalAndSendTerminal} — a run-lane completed/failed
+   *  site, the permanent-failure hook, or reportGenericFailure itself. A journaled outcome is FINAL,
+   *  so once this latches, reportGenericFailure never reports a SECOND `failed` — even after a 200
+   *  RETIRED the journal (which makes `hasPendingTerminal` read false), the exact fall-through this
+   *  latch closes. Distinct from `hasPendingTerminal`: that reads the on-disk journal (kept), this
+   *  survives the journal's retirement. false until the first terminal resolve. */
+  terminalResolved: boolean;
   preserveSession: boolean;
   /** PRD #1392 M2: this run parked on a PRE-CLONE forge-unreachable transient error, so it
    *  captured no clone and no model session. Unlike a limit_wait/recovery park, it preserves its
@@ -796,12 +839,25 @@ export interface RunnerOptions {
   /** PRD #1391 M2 — the in-memory spill-buffer cap (config.outboxSpillBufferBytes);
    *  default is the batcher's own 2 MiB. Threaded to every run's batcher. */
   outboxSpillBufferBytes?: number;
+  /** PRD #1391 Run B M3 — the per-record terminal canonicaliser cap (config.outboxTerminalMaxBytes).
+   *  The write-ahead terminal send path canonicalises each terminal body under this. Default 1.25 MiB. */
+  outboxTerminalMaxBytes?: number;
+  /** PRD #1391 Run B M3 — the total per-seq gap-fill tombstone budget (config.gapFillMax) before a
+   *  hole below the terminal fence is declared unrecoverable and the journal is marked blocked (D13).
+   *  Default 10,000. */
+  gapFillMax?: number;
   /** PRD #1390 M2a — the shared active-run registry. Each run this runner executes is
    *  registered at `running` (with its claim generation) as it starts, has its phase
    *  updated as it transitions/parks (through the reportState choke point), and is removed
    *  on terminal / requeue. The worker reads the registry to build the ActiveSnapshot.
    *  Undefined ⇒ no tracking (tests that never negotiate the feature). */
   activeRuns?: ActiveRunRegistry;
+  /** PRD #1391 Run B M4 — the wall-clock budget for the queued-duplicate ownership-probe retry: a
+   *  TRANSIENT probe failure retries with backoff up to this bound (the api's claim grace minus a
+   *  margin), a held/queued row is re-probed until it, then the attempt ends without executing.
+   *  Measured against the injectable `now`, so a test can shrink it. Default 20s — well under the
+   *  api's claimed-never-started grace so a probe never outlives the claim. */
+  queuedDuplicateProbeBudgetMs?: number;
 }
 
 /**
@@ -839,6 +895,11 @@ export class RunRunner {
   private readonly rearm: Map<string, () => void> | undefined;
   private readonly transientTripMs: number | undefined;
   private readonly outboxSpillBufferBytes: number | undefined;
+  /** PRD #1391 Run B M3 — terminal-journal send-path config, threaded into the terminal-resolve deps. */
+  private readonly outboxTerminalMaxBytes: number;
+  private readonly gapFillMax: number;
+  /** PRD #1391 Run B M4 — wall-clock budget for the queued-duplicate ownership-probe retry. */
+  private readonly queuedDuplicateProbeBudgetMs: number;
   /** PRD #1390 M2a — the shared active-run registry (runId → phase + claim generation);
    *  undefined ⇒ no snapshot tracking. The worker reads it to build the ActiveSnapshot.
    *  Named distinctly from the `activeRuns` shutdown Map below — that tracks abortable
@@ -951,6 +1012,16 @@ export class RunRunner {
     this.rearm = opts.rearm;
     this.transientTripMs = opts.transientTripMs;
     this.outboxSpillBufferBytes = opts.outboxSpillBufferBytes;
+    // PRD #1391 Run B M3: terminal send-path knobs. Defaults mirror config.ts (1.25 MiB / 10,000) so
+    // a test that injects an outbox but not these knobs still canonicalises + gap-fills sanely.
+    this.outboxTerminalMaxBytes = opts.outboxTerminalMaxBytes ?? Math.round(1.25 * 1024 * 1024);
+    this.gapFillMax = opts.gapFillMax ?? 10_000;
+    // PRD #1391 Run B M4: the queued-duplicate probe retry budget. Clamp a 0/negative override to
+    // the default (a non-positive budget would give up before the first probe).
+    this.queuedDuplicateProbeBudgetMs =
+      opts.queuedDuplicateProbeBudgetMs !== undefined && opts.queuedDuplicateProbeBudgetMs > 0
+        ? opts.queuedDuplicateProbeBudgetMs
+        : 20_000;
     // PRD #1390 M2a: the shared active-run registry the worker reads to build snapshots.
     this.snapshotRegistry = opts.activeRuns;
     this.checkpointIntervalMs = opts.checkpointIntervalMs ?? 20 * 60_000;
@@ -1000,12 +1071,152 @@ export class RunRunner {
     try {
       if (previous) {
         await previous;
+        // PRD #1391 Run B M4 — the generation-aware queued-duplicate router. A SECOND (or later) claim
+        // of this run serialised behind the first must NOT blindly re-execute: the first attempt may
+        // have journaled a terminal outcome, or a reclaim may have bumped the generation. Drain this
+        // run's pending terminal synchronously, then probe ownership and decide (proceed only on a
+        // claimed/running row AT this claim's generation). Ending here sends NO report — the run keeps
+        // its authoritative status for the api's own reclaim/sweep to resolve.
+        if (!(await this.gateQueuedDuplicate(claim))) return;
         claim = await this.refreshQueuedClaimCursor(claim);
       }
       await this.executeClaim(claim);
     } finally {
       if (this.executionTails.get(runId) === tail) this.executionTails.delete(runId);
       release();
+    }
+  }
+
+  /**
+   * PRD #1391 Run B M4 — the generation-aware queued-duplicate gate (fact 6). Called AFTER the
+   * previous same-run execution settled and BEFORE `executeClaim`, only on a serialised duplicate.
+   * Returns whether to PROCEED to execute:
+   *   1. Synchronously resolve this run's pending terminal journal (if any) — send/retire/stale-retire
+   *      per M3 — so a completion the previous attempt journaled lands (and its lease clears) first.
+   *   1b. SC4 guard: if the drain LEFT a pending terminal for this run at the claim's generation (a
+   *      `messages_pending` keep on an undrained run, a `blocked`/`gap_unrecoverable` journal, or a send
+   *      that could not land), END the attempt WITHOUT executing — the outcome is still pending, so a
+   *      second execution here would run over a pending outcome (an SC4 violation), even though the
+   *      server can still read running@same-generation and the probe below would otherwise PROCEED.
+   *   2. Probe `GET /worker/runs/{id}/ownership` (status + additive claim_generation) and decide:
+   *      - `claimed`/`running` AT this claim's generation → PROCEED (a `running` row is the case where
+   *        #1390 re-adopted this exact claim);
+   *      - a TERMINAL status, or a DIFFERENT generation → END (no report, no execute);
+   *      - a `queued`/held row at the SAME generation (e.g. SweepClaimedNeverStarted bumps nothing) →
+   *        re-probe up to the budget, then END without executing;
+   *      - a transient probe failure → retry with backoff up to the budget (the claim grace minus a
+   *        margin), then END without executing;
+   *      - a definitive 4xx (404 not-owned/reclaimed) → END without executing.
+   */
+  private async gateQueuedDuplicate(claim: ClaimResponse): Promise<boolean> {
+    const runId = claim.run_id;
+    // 1. Drain this run's pending terminal(s) first, so a journaled completion lands and clears its
+    //    lease before we read ownership. No-op when no usable outbox is wired.
+    await this.resolveRunPendingTerminals(runId);
+
+    const claimGen = claim.claim_generation ?? 0;
+    // 1b. SC4 guard (fact 6): the drain does NOT always clear the journal — a `blocked`/`gap_unrecoverable`
+    //     record is left for the owner (D13), a `messages_pending` keep waits on an undrained run, and a
+    //     send that could not land stays installed for a later resolve. In all of those the outcome is
+    //     STILL pending, yet the server can read running@same-generation, so the ownership probe below
+    //     would PROCEED and RE-EXECUTE the run OVER a pending outcome — the SC4 violation. End the attempt
+    //     here instead (no report, no executeClaim): the run keeps its authoritative status, leased/listed
+    //     for a later resolve or owner action. Only fall through to the probe once the drain actually
+    //     cleared the pending terminal.
+    if (claimGen !== undefined && this.outbox && this.outbox.hasPendingTerminal(runId, claimGen)) {
+      this.log.info(QUEUED_DUPLICATE_END_LOG, {
+        run_id: runId,
+        reason: "a pending terminal outcome remains after the drain",
+        claim_generation: claimGen,
+      });
+      return false;
+    }
+    const deadline = this.now() + this.queuedDuplicateProbeBudgetMs;
+    for (;;) {
+      if (this.shuttingDownGlobal) {
+        this.log.info(QUEUED_DUPLICATE_END_LOG, { run_id: runId, reason: "worker shutting down" });
+        return false;
+      }
+      let probe;
+      try {
+        probe = await this.client.getRunOwnership(runId);
+      } catch (err) {
+        // A definitive 4xx (404 not-owned / reclaimed, or any other non-transient 4xx) ends the
+        // attempt at once; a transient error (5xx / 429 / network) retries under the budget.
+        if (err instanceof RequestError && err.status >= 400 && err.status < 500 && err.status !== 429) {
+          this.log.info(QUEUED_DUPLICATE_END_LOG, {
+            run_id: runId,
+            reason: "ownership probe returned a definitive not-owned/4xx",
+            status: err.status,
+          });
+          return false;
+        }
+        if (this.now() >= deadline) {
+          this.log.warn(QUEUED_DUPLICATE_END_LOG, {
+            run_id: runId,
+            reason: "ownership probe kept failing up to the grace budget",
+            error: errMessage(err),
+          });
+          return false;
+        }
+        await sleep(this.recoveryRetryMs);
+        continue;
+      }
+      const status = probe.status;
+      // A DIFFERENT generation means a newer claim owns the run — end regardless of status. Only
+      // compare when BOTH sides carry a generation; an older api that omits it (undefined) cannot
+      // prove a mismatch, so we fall through to the status check.
+      if (probe.claim_generation !== undefined && claimGen !== undefined && probe.claim_generation !== claimGen) {
+        this.log.info(QUEUED_DUPLICATE_END_LOG, {
+          run_id: runId,
+          reason: "a different generation owns the run",
+          probe_generation: probe.claim_generation,
+          claim_generation: claimGen,
+          status,
+        });
+        return false;
+      }
+      if (TERMINAL_RUN_STATUSES.has(status)) {
+        this.log.info(QUEUED_DUPLICATE_END_LOG, { run_id: runId, reason: "run is terminal", status });
+        return false;
+      }
+      if (status === "claimed" || status === "running") {
+        return true; // proceed: this worker still holds the claim at this generation
+      }
+      // A `queued`/held row at the SAME generation: never proceed. Re-probe until the budget, then end
+      // (a bounded wait for it to settle, exactly as the PRD prescribes).
+      if (this.now() >= deadline) {
+        this.log.info(QUEUED_DUPLICATE_END_LOG, {
+          run_id: runId,
+          reason: "run is held/queued at the same generation",
+          status,
+        });
+        return false;
+      }
+      await sleep(this.recoveryRetryMs);
+    }
+  }
+
+  /**
+   * PRD #1391 Run B M4: synchronously resolve every pending terminal journal for ONE run (the
+   * queued-duplicate gate's step 1). Mirrors the worker's boot resolve: a state-only `client.reportState`
+   * send stamped with the journal's generation (so a superseded generation is refused stale_claim and
+   * local-retired, D11), letting a completion the previous attempt journaled land before the ownership
+   * probe reads the run's status. No-op when no usable outbox is wired.
+   */
+  private async resolveRunPendingTerminals(runId: string): Promise<void> {
+    const outbox = this.outbox;
+    if (!outbox || outbox.isDisabled()) return;
+    const deps = this.terminalDeps();
+    if (!deps) return;
+    for (const entry of outbox.listPendingTerminals()) {
+      if (entry.run_id !== runId) continue;
+      const gen = entry.claim_generation;
+      await resolvePendingTerminal(deps, {
+        runId,
+        claimGeneration: gen,
+        send: (body, sig) => this.client.reportState(runId, { ...body, claim_generation: gen }, sig),
+      });
     }
   }
 
@@ -1453,6 +1664,17 @@ export class RunRunner {
         // (normal teardown: the new claim has its own clone). The finally then runs ordinary cleanup.
         runLog.info("run claim superseded server-side (stale_claim); stopping this flight");
         await batcher.close().catch(() => undefined);
+      } else if (err instanceof RunningAckTerminalError) {
+        // PRD #1391 Run B M4: phaseClone's first `running` report was refused with a TERMINAL status
+        // (the run reached completed/failed/cancelled out from under this claim). STOP with NO
+        // terminal report (the authoritative outcome already landed) and NO preserve flag — nothing
+        // was cloned before the running report, so the finally runs ordinary teardown. Caught here
+        // BEFORE the generic terminal path so this never becomes a `failed` run.
+        runLog.info("run reached a terminal status before the phase clone started; stopping this flight", {
+          run_id: flight.runId,
+          status: err.runStatus,
+        });
+        await batcher.close().catch(() => undefined);
       } else if (err instanceof CredentialSwitchRetainedStop) {
         // PRD #1247 M5b (BLOCKING-2/3 rework): the in-place ctx.attemptCredentialSwitch could not
         // CONFIRM the switch (an unverified give-up whose stamp-clear the server never confirmed, or
@@ -1705,6 +1927,110 @@ export class RunRunner {
     }
   }
 
+  /** PRD #1391 Run B M3b: the terminal-resolve deps for this runner, or undefined when no usable
+   *  outbox is wired (a test without spill, or a store that failed closed) — in which case the
+   *  write-ahead terminal send path falls back to today's un-journaled `reportState`. */
+  private terminalDeps(): TerminalOutboxDeps | undefined {
+    if (!this.outbox || this.outbox.isDisabled()) return undefined;
+    return {
+      outbox: this.outbox,
+      client: this.client,
+      gapFillMax: this.gapFillMax,
+      terminalMaxBytes: this.outboxTerminalMaxBytes,
+      log: this.log,
+    };
+  }
+
+  /**
+   * PRD #1391 Run B M3b: journal a run-lane terminal outcome WRITE-AHEAD (before the first network
+   * attempt), then resolve it over `send` (the phase-publish reportState choke point at a run site,
+   * or flight.reportState at reportGenericFailure / the permanent-failure hook). Falls back to a
+   * direct un-journaled send when no outbox is wired. The caller MUST have closed / final-flushed the
+   * batcher first, so `batcher.currentSeq()` is the run's DURABLE emitted tail — the fence source,
+   * never a server value.
+   */
+  private async journalAndSendTerminal(
+    flight: RunFlight,
+    phase: string,
+    body: Parameters<RunFlight["reportState"]>[0],
+    send: SendTerminalState,
+  ): Promise<void> {
+    const deps = this.terminalDeps();
+    if (!deps) {
+      // No usable outbox: send un-journaled exactly as today. A stale ack still THROWS
+      // StaleClaimError out of `send` and propagates to executeClaim's catch (there is no journal to
+      // stale-retire on this degradation path), so this branch is byte-for-byte unchanged.
+      await send(body);
+      flight.terminalResolved = true;
+      return;
+    }
+    await journalAndResolveTerminal(deps, {
+      runId: flight.runId,
+      claimGeneration: flight.claimGeneration,
+      phase,
+      messagesThroughSeq: flight.batcher.currentSeq(),
+      body,
+      // PRD #1391 Run B M3b (B1): the run-lane reportState choke point (flight.reportState, reached
+      // through every `send` closure a terminal site passes here) THROWS StaleClaimError on a stale
+      // ack instead of RETURNING it — the shape resolvePendingTerminal's catch would otherwise read
+      // as a transport failure and KEEP the journal forever, leaking the run's whole outbox tree and
+      // holding its terminal_pending lease (and, past the cap, pending_overflow) open (D11). Normalize
+      // the throw into the `{applied:false, staleClaim:true}` ack actOnAck stale-retires on, so a
+      // superseded generation local-retires the journal UNIFORMLY across lanes (the judge/review/boot
+      // lanes already return this shape via raw client.reportState). StaleClaimError is defined and
+      // caught entirely within this file — it never leaks into terminal-resolve.ts. A genuine
+      // transport error still propagates, and resolvePendingTerminal keeps the journal for a later
+      // resolve, exactly as designed.
+      send: async (b, sig) => {
+        try {
+          return await send(b, sig);
+        } catch (err) {
+          if (err instanceof StaleClaimError) return { applied: false, staleClaim: true };
+          throw err;
+        }
+      },
+    });
+    // PRD #1391 Run B M3 (N2/D5): latch that a terminal outcome for this generation has resolved, so
+    // a later reportGenericFailure never reports a SECOND `failed` — even after a 200 RETIRED the
+    // journal (hasPendingTerminal then reads false). Skipped on a throw above (reserve_exhausted's
+    // un-journaled send that failed), so that fallback still reports failed as today.
+    flight.terminalResolved = true;
+  }
+
+  /**
+   * PRD #1391 Run B M3 (D5): the permanent message-failure hook body, extracted from the batcher's
+   * onPermanentFailureReport closure so its ORDERING is unit-testable against the REAL shipping code
+   * (runner-terminal-journal.test.ts) rather than a synthetic hand-rolled handler. The `failed`
+   * journal is durably installed and resolved BEFORE `flight.cancel.abort()` is observable, so a
+   * completion racing the trip can never reverse the first durable winner (the no-replace install in
+   * journalTerminal arbitrates, D4). journalAndSendTerminal awaits the durable install; only then does
+   * the abort fire, unwinding execute() into reportGenericFailure — which awaits this settlement,
+   * finds the durable journal / the terminalResolved latch, and reports no second `failed` (fact 2).
+   * When no outbox is wired this degrades to today's direct `failed` report + abort. The abort is
+   * guarded so a concurrent abort (a racing steering-cancel/shutdown) is never doubled.
+   */
+  private async handlePermanentFailure(flight: RunFlight, reason: string): Promise<void> {
+    try {
+      await this.journalAndSendTerminal(
+        flight,
+        TERMINAL_JOURNAL_PHASE,
+        {
+          status: "failed",
+          failure_reason: reason.slice(0, MAX_FAILURE_REASON_LEN),
+        },
+        (b, sig) => flight.reportState(b, sig),
+      );
+    } catch (e) {
+      flight.runLog.error("could not journal/report the message-transport failure", {
+        error: errMessage(e),
+      });
+    }
+    // Abort the attempt ONLY AFTER the durable journal is installed (D5/D4), so execute() falls into
+    // its catch (→ reportGenericFailure, which awaits this handler's settlement, finds the durable
+    // journal / the terminalResolved latch, and does NOT report a second `failed`).
+    if (!flight.cancel.signal.aborted) flight.cancel.abort();
+  }
+
   /**
    * Today's generic terminal FAILED path (extracted verbatim so the pre-clone
    * forge-unreachable park's `fail` arm can reuse it). failure_reason goes straight to
@@ -1719,7 +2045,7 @@ export class RunRunner {
     flight: RunFlight,
     err: unknown,
   ): Promise<void> {
-    const { batcher, reportState, redactText, runLog } = flight;
+    const { batcher, redactText, runLog } = flight;
     const rawReason =
       err instanceof PlanRejectedError
         ? err.reason
@@ -1738,18 +2064,50 @@ export class RunRunner {
         ? err.failOrigin
         : failOriginForReason(rawReason);
     runLog.error("run failed", { error: reason });
+    // PRD #1391 Run B M3 (D5): if the permanent-failure hook tripped, AWAIT its settlement first — it
+    // journals `failed` durably and aborts the attempt (which routed us here), so the journal must be
+    // observed as installed before the hasPendingTerminal check below. Resolves immediately when the
+    // breaker never tripped (every ordinary failure), so this is a no-op on the common path.
+    await batcher.awaitPermanentFailureSettled();
+    // PRD #1391 Run B M3 (fact 2, D5, N2): a JOURNALED/RESOLVED outcome is FINAL. Do NOT fall through
+    // to a SECOND `failed` when EITHER a terminal outcome for this generation has already resolved
+    // (the `terminalResolved` latch — set even after a 200 RETIRED the journal, so hasPendingTerminal
+    // reads false) OR a write-ahead journal is still installed (the permanent-failure hook's durable
+    // `failed`, or a terminal site that journaled before throwing into this catch). The first durable
+    // winner stands (the no-replace install arbitrates, D4). Still close the batcher and settle
+    // recovery custody (clone cleanup is independent of the report).
+    if (
+      flight.terminalResolved ||
+      (this.outbox && this.outbox.hasPendingTerminal(flight.runId, flight.claimGeneration))
+    ) {
+      runLog.info("run outcome already journaled write-ahead; not reporting a second failed", {
+        run_id: flight.runId,
+        claim_generation: flight.claimGeneration,
+      });
+      await batcher.close().catch(() => undefined);
+      await this.reapThenSettleRecoveryGeneration(claim, flight, runLog, "terminal");
+      return;
+    }
     batcher.emit({
       kind: "error",
       agent: "worker",
       payload: { text: reason },
     });
     await batcher.close().catch(() => undefined);
-    // Cap what lands in the run row (matches the GitLab error-body cap).
-    await reportState({
-      status: "failed",
-      failure_reason: reason.slice(0, MAX_FAILURE_REASON_LEN),
-      fail_origin: failOrigin,
-    }).catch((e) =>
+    // Cap what lands in the run row (matches the GitLab error-body cap). Journal it WRITE-AHEAD then
+    // resolve it (D3): on reserve_exhausted it degrades to today's direct send, whose throw the
+    // .catch below still logs; on the journaled path journalAndSendTerminal never throws (a send that
+    // fails now leaves the durable journal for a later resolve).
+    await this.journalAndSendTerminal(
+      flight,
+      TERMINAL_JOURNAL_PHASE,
+      {
+        status: "failed",
+        failure_reason: reason.slice(0, MAX_FAILURE_REASON_LEN),
+        fail_origin: failOrigin,
+      },
+      (b, sig) => flight.reportState(b, sig),
+    ).catch((e) =>
       runLog.error("could not report failed state", {
         error: errMessage(e),
       }),
@@ -2192,6 +2550,12 @@ export class RunRunner {
       return res;
     };
     const closeBatcher = () => batcher.close(boundarySignal);
+    // PRD #1391 Run B M3b: journal a run-lane TERMINAL report WRITE-AHEAD then resolve it over the
+    // `reportState` choke point (which stamps claim_generation and drives recovery). The caller must
+    // have closed the batcher first, so the fence is the durable emitted tail. Every terminal site in
+    // this phase routes through here instead of a raw `reportState(body)`.
+    const journalTerminalReport = (body: Parameters<RunFlight["reportState"]>[0]) =>
+      this.journalAndSendTerminal(flight, TERMINAL_JOURNAL_PHASE, body, reportState);
     const finishCommittedPublish = async (
       body: Parameters<RunFlight["reportState"]>[0],
       logMessage: string,
@@ -2200,14 +2564,19 @@ export class RunRunner {
       if (deferCommittedTerminal) {
         deferCommittedTerminal(async () => {
           await batcher.close();
-          await flight.reportState(body);
-          await driveRecoveryTerminal(body);
+          // Journal write-ahead here too (D3): the deferred Codex sink sends through
+          // flight.reportState + driveRecoveryTerminal, so wrap that pair as the resolve `send`.
+          await this.journalAndSendTerminal(flight, TERMINAL_JOURNAL_PHASE, body, async (b) => {
+            const res = await flight.reportState(b);
+            await driveRecoveryTerminal(b);
+            return res;
+          });
           runLog.info(logMessage, fields);
         });
         return;
       }
       await closeBatcher();
-      await reportState(body);
+      await journalTerminalReport(body);
       runLog.info(logMessage, fields);
     };
     const runId = claim.run_id;
@@ -2282,7 +2651,9 @@ export class RunRunner {
         },
       });
       await closeBatcher();
-      await reportState({ status: "completed", fix_verdict: "not_code" });
+      // PRD #1391 Run B M3 (N1): journal write-ahead so an outage keeps the exact not_code
+      // completion, not a generic agent_failure.
+      await journalTerminalReport({ status: "completed", fix_verdict: "not_code" });
       runLog.info("ci_fix run completed with not_code verdict", {
         run_id: runId,
       });
@@ -2325,7 +2696,9 @@ export class RunRunner {
           },
         });
         await closeBatcher();
-        await reportState({
+        // PRD #1391 Run B M3 (N1): journal write-ahead so the typed orphan-checkpoint failure
+        // survives an outage as this exact outcome, not a generic agent_failure.
+        await journalTerminalReport({
           status: "failed",
           failure_reason:
             "signal_done was called with report_only, but this run published committed work to a checkpoint ref (refs/uzi-checkpoints/" +
@@ -2345,7 +2718,9 @@ export class RunRunner {
         },
       });
       await closeBatcher();
-      await reportState({
+      // PRD #1391 Run B M3 (N1): journal write-ahead so the report_only completion (report_md) is
+      // the durable outcome after an outage, not a generic agent_failure.
+      await journalTerminalReport({
         status: "completed",
         report_only: true,
         report_md: result.summary,
@@ -2434,7 +2809,9 @@ export class RunRunner {
               },
             });
             await closeBatcher();
-            await reportState({
+            // PRD #1391 Run B M3 (N1): journal the scope-capped report_only completion write-ahead
+            // so its exact outcome survives an outage, not a generic agent_failure.
+            await journalTerminalReport({
               status: "completed",
               report_only: true,
               scope_capped: true,
@@ -2457,7 +2834,9 @@ export class RunRunner {
             },
           });
           await closeBatcher();
-          await reportState({
+          // PRD #1391 Run B M3 (N1): journal write-ahead so the undeclared empty-diff failure is the
+          // durable outcome after an outage, not a generic agent_failure.
+          await journalTerminalReport({
             status: "failed",
             failure_reason:
               "signal_done was called but no changes were committed, and report_only was not set. If this run's deliverable is a report or command output with no code change, call signal_done with report_only: true.",
@@ -2509,7 +2888,9 @@ export class RunRunner {
             },
           });
           await closeBatcher();
-          await reportState({
+          // PRD #1391 Run B M3 (N1): journal write-ahead so the prompt-kind orphan-checkpoint failure
+          // survives an outage as this exact outcome, not a generic agent_failure.
+          await journalTerminalReport({
             status: "failed",
             failure_reason:
               "signal_done was called with report_only, but this run published committed work to a checkpoint ref (refs/uzi-checkpoints/" +
@@ -2529,7 +2910,10 @@ export class RunRunner {
           },
         });
         await closeBatcher();
-        await reportState({
+        // PRD #1391 Run B M3 (N1): journal write-ahead so the prompt report_only completion (its
+        // report_md AND any structured proposal) is the durable outcome after an outage, not a
+        // generic agent_failure that loses the proposal.
+        await journalTerminalReport({
           status: "completed",
           report_only: true,
           report_md: result.summary,
@@ -2722,7 +3106,7 @@ export class RunRunner {
           { run_id: runId, paths: wfHits },
         );
         await closeBatcher();
-        await reportState({
+        await journalTerminalReport({
           status: "failed",
           failure_reason: reason.slice(0, MAX_FAILURE_REASON_LEN),
           fail_origin: "workflow_scope_missing",
@@ -2733,13 +3117,16 @@ export class RunRunner {
     }
 
     // PRD #974 M2 / #1077: the single terminal reporter for a push_secret_blocked failure.
-    // If reportState exhausts its bounded retries and throws, rethrow a typed sentinel so
-    // execute()'s generic catch preserves the push_secret_blocked origin instead of defaulting
-    // to agent_failure — and NEVER attach preserved_patch (the diff carries the detected secret).
+    // PRD #1391 Run B M3b: journal it WRITE-AHEAD (D3) then resolve it. On the journaled path a send
+    // that fails now leaves the durable journal (with the push_secret_blocked origin) for a later
+    // resolve, so it never throws — the outcome is captured. Only the reserve_exhausted (or no-outbox)
+    // degraded path sends directly and can throw on exhaustion; rethrow a typed sentinel THERE so
+    // execute()'s generic catch preserves the push_secret_blocked origin instead of defaulting to
+    // agent_failure. NEVER attach preserved_patch (the diff carries the detected secret).
     const reportPushSecretBlocked = async (reason: string): Promise<void> => {
       const capped = reason.slice(0, MAX_FAILURE_REASON_LEN);
       try {
-        await reportState({
+        await journalTerminalReport({
           status: "failed",
           failure_reason: capped,
           fail_origin: "push_secret_blocked",
@@ -2941,7 +3328,7 @@ export class RunRunner {
         { run_id: runId },
       );
       await closeBatcher();
-      await reportState({
+      await journalTerminalReport({
         status: "failed",
         failure_reason:
           "The MR branch was advanced by a concurrent writer, so this rework was superseded and not applied. The branch and the concurrent commits are intact.",
@@ -2985,7 +3372,7 @@ export class RunRunner {
         { run_id: runId, published_tip: publishedTip, preserved_patch: patch !== undefined },
       );
       await closeBatcher();
-      await reportState({
+      await journalTerminalReport({
         status: "failed",
         failure_reason: composeHistoryRewrittenReason(publishedTip).slice(0, MAX_FAILURE_REASON_LEN),
         fail_origin: "history_rewritten",
@@ -3082,7 +3469,11 @@ export class RunRunner {
                 run_id: runId,
               });
               await closeBatcher();
-              await reportState({
+              // PRD #1391 Run B M3 (N1): journal write-ahead so the typed base-align-conflict failure
+              // — its fail_origin AND its preserved_patch (the canonicaliser handles the diff size) —
+              // survives an outage as this exact outcome, not a generic agent_failure that loses the
+              // diff a human needs to land.
+              await journalTerminalReport({
                 status: "failed",
                 failure_reason: composeBaseAlignConflictReason(alignDefaultBranch),
                 fail_origin: "finalize_base_align_conflict",
@@ -3569,7 +3960,9 @@ export class RunRunner {
         return;
       }
       await closeBatcher();
-      await reportState({ status: "failed", failure_reason: COMPLETION_INTERLOCK_UNHELD_REASON });
+      // PRD #1391 Run B M3 (N1): journal write-ahead so the completion-interlock failure survives an
+      // outage as this exact outcome, not a generic agent_failure.
+      await journalTerminalReport({ status: "failed", failure_reason: COMPLETION_INTERLOCK_UNHELD_REASON });
       runLog.info("run failed: completion interlock could not park the incomplete run", {
         run_id: runId,
         reason: holdReason,
@@ -3585,7 +3978,9 @@ export class RunRunner {
     const failInterlockedClosed = async (reason: string): Promise<void> => {
       executor.killAgentTree?.();
       await closeBatcher().catch(() => undefined);
-      await reportState({ status: "failed", failure_reason: COMPLETION_INTERLOCK_UNHELD_REASON });
+      // PRD #1391 Run B M3 (N1): journal write-ahead so the fail-closed completion-interlock outcome
+      // survives an outage as this exact outcome, not a generic agent_failure.
+      await journalTerminalReport({ status: "failed", failure_reason: COMPLETION_INTERLOCK_UNHELD_REASON });
       runLog.info("run failed closed: completion interlock could not guarantee a non-closing MR", {
         run_id: runId,
         reason,
@@ -4049,6 +4444,10 @@ export class RunRunner {
       // rather than in the catch so the finally can see it; false is the safe default,
       // so every path that never reaches the park logic cleans up exactly as before.
       parked: false,
+      // PRD #1391 Run B M3 (N2/D5): no terminal outcome resolved yet. Set by journalAndSendTerminal
+      // the moment any completed/failed for this generation is sent/resolved (write-ahead or not),
+      // so reportGenericFailure never falls through to a SECOND `failed` once one is final.
+      terminalResolved: false,
       // PRD #556 M1 / #1197: set by shutdown or a pending recovery capture/report.
       // Like `parked`, it gates EXACTLY the two filesystem removals in the
       // finally (the sibling skills plugin dir and the per-run HOME) and nothing else — so
@@ -4065,25 +4464,20 @@ export class RunRunner {
       result: undefined,
     };
 
-    // PRD #108 M3: the batcher's breaker reports OUT OF BAND, never through itself —
-    // `concat` is order-preserving, so an emitted explanation would queue behind the
-    // poison that tripped it and never land. reportState has bounded retries,
-    // 4xx-fatal semantics, and treats an already-terminal server response as
-    // success, so if the run has already reported terminal this is a safe no-op
-    // rather than a second, racing terminal report. Fire-and-forget: the batcher's
-    // trip path must never block on the network.
-    batcher.onPermanentFailureReport(({ reason }) => {
-      void flight
-        .reportState({
-          status: "failed",
-          failure_reason: reason.slice(0, MAX_FAILURE_REASON_LEN),
-        })
-        .catch((e) =>
-          runLog.error("could not report the message-transport failure", {
-            error: errMessage(e),
-          }),
-        );
-    });
+    // PRD #1391 Run B M3 (D5): a PERMANENT message failure now journals `failed` WRITE-AHEAD
+    // (durable), resolves it, then ABORTS the attempt so execute() unwinds — replacing today's
+    // fire-and-forget `failed` report that left the executor running (the split-brain in miniature,
+    // fact 1). The handler is ASYNC and trip() captures its promise into
+    // batcher.permanentFailureSettled, which reportGenericFailure AWAITS before it checks the journal
+    // — so the abort's terminal `failed` is observable ONLY AFTER the outcome is durable, and a
+    // completion that races the trip can never reverse the first durable winner (the no-replace
+    // install in journalTerminal arbitrates, D4). journalAndSendTerminal awaits the durable journal
+    // install, so by the time the abort fires the `failed` is on disk. Chat keeps today's non-journal
+    // behaviour (chat-runner.ts). When no outbox is wired this degrades to today's direct `failed`
+    // report + abort.
+    // The hook body lives in handlePermanentFailure (a named method) so its journal-BEFORE-abort
+    // ordering is unit-testable against the REAL code — a mutation to abort-first reddens that test.
+    batcher.onPermanentFailureReport(({ reason }) => this.handlePermanentFailure(flight, reason));
 
     return flight;
   }
@@ -4146,7 +4540,20 @@ export class RunRunner {
       repo: claim.repo.url,
       branch: claim.branch ?? null,
     });
-    await reportState({ status: "running" });
+    // PRD #1391 Run B M4: CAPTURE the first `running` ack (previously discarded). A stale_claim
+    // disposition already threw StaleClaimError inside the reportState closure; here we additionally
+    // STOP when the report is refused (applied:false) with a TERMINAL status — the run reached a
+    // terminal state out from under this claim (a racing cancel / an outcome that already landed), so
+    // continuing the phase clone would work a claim the run has already left. Throw the non-`failed`
+    // stop signal rather than clone-and-run on it.
+    const runningAck = await reportState({ status: "running" });
+    if (!runningAck.applied && runningAck.status !== undefined && TERMINAL_RUN_STATUSES.has(runningAck.status)) {
+      runLog.info("first running report refused with a terminal status; stopping the phase clone", {
+        run_id: runId,
+        status: runningAck.status,
+      });
+      throw new RunningAckTerminalError(runningAck.status);
+    }
     steering.start();
 
     // PRD #1390 M4 — env-gated e2e DROP-EXECUTION seam. OFF unless UZI_E2E_DROP_ON_SENTINEL

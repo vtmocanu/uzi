@@ -2,10 +2,13 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
+import fsp from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { nullLogger } from "./helpers.js";
 import { type Executor, type RunContext, type ExecutorResult } from "../src/executor.js";
-import { RunRunner, composeBaseAlignConflictReason } from "../src/runner.js";
+import { RunRunner, composeBaseAlignConflictReason, type RunnerOptions } from "../src/runner.js";
+import { Outbox } from "../src/outbox.js";
 import { isNonFastForwardRejection } from "../src/git.js";
 import { GitHubClient } from "../src/forge.js";
 import {
@@ -62,6 +65,16 @@ function githubRunner(github: GitHubClient, executor: Executor): RunRunner {
     undefined,
     { pollMs: 5, planApprovalTimeoutMs: 0, github },
   );
+}
+
+/** A github runner with extra RunnerOptions (e.g. a wired outbox), for the M3b write-ahead tests. */
+function githubRunnerWith(github: GitHubClient, executor: Executor, extra: Partial<RunnerOptions>): RunRunner {
+  return new RunRunner(client, git, () => ({ executor }), nullLogger(), 20, undefined, {
+    pollMs: 5,
+    planApprovalTimeoutMs: 0,
+    github,
+    ...extra,
+  });
 }
 
 const githubClaim = (iid: number, overrides = {}) =>
@@ -228,6 +241,54 @@ describe("RunRunner — finalize base-align (PRD #456)", () => {
     assert.match(failed.preserved_patch!, /conflict\.txt/, "the preserved patch carries the agent's work");
     assert.strictEqual(pushed, false, "the doomed push was skipped");
     assert.strictEqual(calls.length, 0, "no PR opened on the conflict fail");
+  });
+
+  // PRD #1391 Run B M3 (N1): the failBaseAlignConflict FAILED must be journalled WRITE-AHEAD, so an
+  // api outage at the finalize report does NOT degrade the typed outcome (fail_origin +
+  // preserved_patch, the diff a human needs to land) into a generic agent_failure. Drives the REAL
+  // conflict path (test (c)'s fixture) with an outbox wired and the failed report refused 409
+  // running (the outage/lost-ack shape), then proves the exact typed body is on disk as the journal.
+  it("(c') the base-align conflict FAILED is journalled write-ahead — fail_origin + preserved_patch survive an outage", async () => {
+    seedWorkflowsOnOrigin({ "conflict.txt": "base\n" });
+    git.changedFiles = (async () => null) as typeof git.changedFiles;
+    const { github, calls } = fakeGitHub();
+    let pushed = false;
+    git.pushBranch = (async () => {
+      pushed = true;
+    }) as typeof git.pushBranch;
+    const exec = committingExecutor(
+      { "conflict.txt": "branch side\n" },
+      { "conflict.txt": "main side\n", ".github/workflows/ci.yml": CI_V2 },
+    );
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "base-align-journal-"));
+    const outbox = new Outbox({
+      root: path.join(dir, "outbox"),
+      log: nullLogger(),
+      runMaxBytes: 64 * 1024 * 1024,
+      maxBytes: 512 * 1024 * 1024,
+      retentionMs: 7 * 86_400_000,
+    });
+    await outbox.init();
+    const claim = githubClaim(70, { claim_generation: 9 });
+    // Refuse the failed report with a benign 409 running (nothing applied), so the write-ahead
+    // journal STAYS on disk and we can prove the typed conflict body was journalled before the send.
+    api.failStateWhen(claim.run_id, (b) => b.status === "failed", { httpStatus: 409, runStatus: "running" });
+
+    await githubRunnerWith(github, exec, { outbox, outboxTerminalMaxBytes: 1 << 20, gapFillMax: 100 }).execute(claim);
+
+    assert.strictEqual(pushed, false, "the doomed push was skipped");
+    assert.strictEqual(calls.length, 0, "no PR opened on the conflict fail");
+    assert.equal(outbox.hasPendingTerminal(claim.run_id, 9), true, "the base-align-conflict failure is journalled write-ahead and kept on the 409");
+    const j = await outbox.readTerminalJournal(claim.run_id, 9);
+    assert.equal(j?.body.status, "failed", "the journal holds the failed outcome");
+    assert.equal(
+      j?.body.fail_origin,
+      "finalize_base_align_conflict",
+      "the TYPED fail_origin survived the outage, not a generic agent_failure",
+    );
+    const patch = j?.body.preserved_patch;
+    assert.ok(typeof patch === "string" && patch.includes("conflict.txt"), "the preserved diff a human needs to land was journalled");
+    await fsp.rm(dir, { recursive: true, force: true });
   });
 
   // (d) already aligned: the branch's workflow tree already matches the fresh default (main

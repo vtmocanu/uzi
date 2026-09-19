@@ -241,6 +241,10 @@ var runDTOKeys = []string{
 	// PRD #1247 M1: the per-run credential override, the pending held-state switch state,
 	// and the applied-switch attribution journal. All three non-omitempty.
 	"credential_override", "credential_switch", "credential_epochs",
+	// PRD #1391 M3 (D13): a finished outcome the run's worker is holding because the api
+	// permanently refused the terminal report ({reason} object or null). Non-omitempty,
+	// overlaid on the single-run detail read only.
+	"outcome_pending",
 }
 
 func TestRunDTOTags(t *testing.T) {
@@ -277,8 +281,12 @@ func TestMessageDTOTags(t *testing.T) {
 
 func TestRunInputTags(t *testing.T) {
 	// PRD #84 M4 4c: override_capabilities is a plain bool (not omitempty), so it is always
-	// on the wire; meaningful only with approve_plan, default false.
-	assertTags(t, "RunInputRequest", RunInputRequest{}, "kind", "body", "selection", "override_capabilities")
+	// on the wire; meaningful only with approve_plan, default false. PRD #1391 Run B M3d (D13):
+	// discard_pending_outcome is omitted when false for newer-client/older-api compatibility,
+	// and present only for the owner's explicit confirmed discard.
+	assertTags(t, "RunInputRequest(false)", RunInputRequest{}, "kind", "body", "selection", "override_capabilities")
+	assertTags(t, "RunInputRequest(true)", RunInputRequest{DiscardPendingOutcome: true},
+		"kind", "body", "selection", "override_capabilities", "discard_pending_outcome")
 	// id + created_at are omitempty (nil on approve/cancel/reject): the zero value is
 	// still just server_side (PRD #95 S2).
 	assertTags(t, "RunInputResponse", RunInputResponse{}, "server_side")
@@ -820,17 +828,33 @@ func TestSelfUsageDTOTags(t *testing.T) {
 		// PRD #1429 M1 (D7): the per-window subscription/unreported run counts, so a mixed
 		// aggregate discloses that a non-metered component makes the dollar total incomplete.
 		"lifetime_subscription_run_count", "lifetime_unreported_run_count",
-		"last7_subscription_run_count", "last7_unreported_run_count")
+		"last7_subscription_run_count", "last7_unreported_run_count",
+		// PRD #1293: gains "outcomes" (the failed-run rate windows wrapper).
+		"outcomes")
 }
 
 func TestAdminUserUsageDTOTags(t *testing.T) {
 	assertTags(t, "AdminUserUsageDTO", AdminUserUsageDTO{}, "user_id", "email", "usage", "run_count",
 		// PRD #1429 M1 (D7): the user's lifetime subscription/unreported run counts.
-		"subscription_run_count", "unreported_run_count")
+		"subscription_run_count", "unreported_run_count",
+		// PRD #1293: gains "outcomes" (this user's lifetime failed-run rate aggregate).
+		"outcomes")
 }
 
 func TestAdminUsageDTOTags(t *testing.T) {
 	assertTags(t, "AdminUsageDTO", AdminUsageDTO{}, "factory", "users", "earliest_run")
+}
+
+// TestRunOutcomesDTOTags pins the failed-run rate aggregate shape (PRD #1293): five
+// counts plus the fail_origins map, all always present.
+func TestRunOutcomesDTOTags(t *testing.T) {
+	assertTags(t, "RunOutcomesDTO", RunOutcomesDTO{},
+		"finished", "completed", "cancelled", "plan_rejected", "failed", "fail_origins")
+}
+
+// TestRunOutcomeWindowsDTOTags pins the two-window wrapper (PRD #1293).
+func TestRunOutcomeWindowsDTOTags(t *testing.T) {
+	assertTags(t, "RunOutcomeWindowsDTO", RunOutcomeWindowsDTO{}, "lifetime", "last_7_days")
 }
 
 func TestRateLimitWindowTags(t *testing.T) {

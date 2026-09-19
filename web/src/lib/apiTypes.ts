@@ -2506,6 +2506,15 @@ export interface Run {
   credential_override?: CredentialOverride | null;
   credential_switch?: string | null;
   credential_epochs?: CredentialEpoch[];
+  /** PRD #1391 M3 (D13): a finished outcome the run's OWNING worker is holding because the
+   *  api permanently refused the terminal report — so the owner can see it and resolve it
+   *  with a discarding cancel. null (today's contract) for every run with no held outcome.
+   *  reason is one of a CLOSED, server-filtered set (completion_permit_mismatch |
+   *  gap_unrecoverable | reserve_exhausted); the api drops any other value, so the web maps
+   *  the known set to friendly text and renders an unrecognised value honestly. OPTIONAL for
+   *  the same api/web rollout skew as credential_override: a mid-deploy api pod predating
+   *  #1391 M3 omits the key. Overlaid on the single-run detail read only (never the list). */
+  outcome_pending?: { reason: string } | null;
 }
 
 /** CredentialOverride is a run's or schedule's per-run credential choice (PRD #1247 M1):
@@ -2608,6 +2617,27 @@ export interface RunListItem extends Run {
   owner_email?: string;
 }
 
+// RunOutcomes is the failed-run rate aggregate for one scope+window (PRD #1293).
+// Counted over `runs` directly, NOT the usage rollup (D1): a run that fails before
+// spending a token has no usage row but must still count. All counts are always
+// present (zeros, never null). Invariants the API guarantees (asserted server-side):
+//   - finished === completed + cancelled + plan_rejected + failed
+//   - sum(fail_origins) === failed
+// plan_rejected is split out of failed (rejecting a plan is the owner's decision, not a
+// factory failure; D4). The rate the UI shows is client-computed (failed / finished),
+// never sent, so web and CLI cannot disagree on rounding (D6). fail_origins keys are the
+// failorigin.go vocabulary plus "unknown" (a NULL fail_origin, pre-migration 00126); an
+// unrecognised future key renders with its raw name (failOriginLabel falls back). The map
+// is always present — {} when empty, never null.
+export interface RunOutcomes {
+  finished: number;
+  completed: number;
+  cancelled: number;
+  plan_rejected: number;
+  failed: number;
+  fail_origins: Record<string, number>;
+}
+
 // SelfUsage is the caller's own consumption (GET /api/usage, PRD #40): lifetime and
 // last-7-days totals plus the count of their usage-bearing runs. run_count === 0
 // means "nothing yet" — the card renders that state, not fabricated zeros.
@@ -2622,6 +2652,11 @@ export interface SelfUsage {
   lifetime_unreported_run_count: number;
   last7_subscription_run_count: number;
   last7_unreported_run_count: number;
+  // outcomes is the failed-run rate aggregate for this scope, both windows (PRD #1293).
+  // Required (the API always sends it); the factory card reuses this type so it gets the
+  // block for free. Note the two populations differ from run_count on purpose (D2): a run
+  // that failed before spending has no usage row but is counted in outcomes.finished.
+  outcomes: { lifetime: RunOutcomes; last_7_days: RunOutcomes };
 }
 
 // AdminUsageUser is one user's lifetime row in the admin factory breakdown.
@@ -2634,6 +2669,10 @@ export interface AdminUsageUser {
    *  per-user breakdown discloses a non-metered component like the factory total. */
   subscription_run_count: number;
   unreported_run_count: number;
+  // outcomes is this user's LIFETIME failed-run rate aggregate (PRD #1293), matching the
+  // row's lifetime usage. Required; a user present in the outcomes aggregate but absent
+  // from usage (every run died before spending, D5) still gets a row, with zero usage.
+  outcomes: RunOutcomes;
 }
 
 // AdminUsage is the factory-wide view (GET /api/admin/usage, admin-only): the

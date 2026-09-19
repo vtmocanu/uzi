@@ -119,6 +119,10 @@ type FakeClient struct {
 	LastInputKind      string
 	LastInputBody      string
 	LastInputSelection *apitypes.AgentSelection
+	// LastInputDiscardPendingOutcome records the discard_pending_outcome bit the last
+	// SubmitRunInput carried (PRD #1391 Run B M3d), so a test can assert `uzi run cancel
+	// --discard-pending-outcome` threaded it onto the request.
+	LastInputDiscardPendingOutcome bool
 
 	// CreateTaskRun / DispatchTaskRun capture (PRD #400 M3). CreatedTaskRun is the
 	// canned create reply (its Branch is what the handoff command pushes to);

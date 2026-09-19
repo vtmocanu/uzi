@@ -1,8 +1,8 @@
 # ADR-628: Cross-worker resume durability for `limit_wait` parks
 
-**Status**: Accepted (PRD #628 M0 design gate — this ADR records the decisions that unblock M1–M4; no implementation has merged yet)
+**Status**: Accepted and implemented (PRD #628 M1–M4; amended by PRDs #1030, #1042 and #1059)
 **Date**: 2026-08-23
-**Deciders**: architect (M0 design gate); PRD #628 Decision Log (D1/D2/D4 already settled there); one open item flagged to the lead (see Open question)
+**Deciders**: architect (M0 design gate); PRD #628 Decision Log (D1/D2/D4 already settled there); the ceiling default later resolved at the shipped 2h (see Resolved question)
 **PRD**: [prds/done/628-cross-worker-resume-durability.md](../prds/done/628-cross-worker-resume-durability.md) (GitHub issue [vtmocanu/uzi#628](https://github.com/vtmocanu/uzi/issues/628)) — the PRD carries the milestones, the problem trace and the incident forensics; this ADR resolves the two open forks D3 opened (the drain-aware affinity predicate + its scope, and the M2/M3 ordering) plus the guardrail invariants the four implementation milestones must hold to.
 **Related**: refines [ADR-216](0216-fleet-aware-claim.md) (the affinity leg this ADR rewrites lives inside the same `ClaimRun` statement ADR-216 established; the liveness test reuses ADR-216 D6's heartbeat cutoff). Consumes [ADR-422](0422-decouple-worker-version.md)'s `workers.draining_since` (D5) as a claim-eligibility signal. Sits downstream of [ADR-35](0035-run-limit-retry.md) (the `limit_wait` park and its credential-pool early promotion are what make the 2-minute affinity window too short).
 
@@ -29,7 +29,7 @@ Entry point for D3a: the affinity leg of `ClaimRun` in `api/internal/store/queri
 
 | Requeue query | line | worker at requeue | today's 2-min affinity does | under the new predicate |
 |---|---|---|---|---|
-| `PromoteLimitWaitRuns` (park) | `1335` | live (park) OR gone (drain/roll) | pins 2 min then falls open | live → stays pinned via liveness; gone → falls open **immediately** |
+| `PromoteLimitWaitRuns` (park) | `1335` | live (park), draining (roll), or gone (teardown) | pins 2 min then falls open | live or draining → stays pinned; gone or stale and non-draining → falls open **immediately** |
 | `RequeueRunsOfStaleWorkers` | `1812` | **dead** (heartbeat stale by construction) | pins 2 min then falls open | liveness leg true → falls open **immediately** (better) |
 | `RequeueWorkerRuns` (register) | `1850` | **live** (just re-registered) | pins 2 min; worker re-claims | stays pinned via liveness; worker re-claims within a poll |
 | `SweepClaimedNeverStarted` | `1711` | **live** but wedged | pins 2 min then falls open | pinned to the **ceiling** (2m → 2h) — the one regression |
@@ -302,19 +302,19 @@ per the existing convention amendments do not each add their own link. Nothing t
 
 ## Consequences
 
-- **A `limit_wait` park whose original worker survives** now resumes **on that worker** — recovering both session and tree with zero new git machinery — for a park lasting far beyond 2 minutes, because the liveness leg keeps it pinned while the worker heartbeats and is non-draining. This is the common multi-hour-park case.
-- **A park whose original worker drains/rolls/dies** falls open **immediately** (liveness leg), not after a longer timer, and M2's checkpoint carries the committed tree to the re-claiming worker. No stuck run (PRD R1), no re-implement.
+- **A `limit_wait` park whose original worker survives** now resumes **on that worker** — recovering both session and tree with zero new git machinery — for a park lasting far beyond 2 minutes, because the affinity leg keeps it pinned while the worker is heartbeat-fresh or draining through a routine roll. This is the common multi-hour-park case.
+- **A routine roll preserves affinity**: the draining worker keeps its row and PVC, so the parked run stays pinned and the replacement pod reclaims it. A teardown (row deleted), or a stale non-draining worker, falls open immediately; M2's checkpoint then carries the committed tree to the re-claiming worker. No stuck run (PRD R1), no re-implement.
 - **`WORKER_AFFINITY_CEILING` (default 2h)** joins `WORKER_AFFINITY_GRACE`, `WORKER_SPREAD_GRACE` and `WORKER_HEARTBEAT_STALE` as a claim-timing knob. It governs the run lane only; chat keeps `WORKER_AFFINITY_GRACE`.
-- **One bounded behaviour change on the run lane:** a claimed-never-started run against a persistently-wedged-yet-heartbeating worker is now held up to 2 hours (was 2 minutes) before a peer takes it. Bounded by the ceiling and by the liveness leg (the moment the worker goes stale or drains, the run frees at once). Accepted (D3a).
+- **One bounded behaviour change on the run lane:** a claimed-never-started run against a persistently-wedged-yet-heartbeating worker is now held up to 2 hours (was 2 minutes) before a peer takes it. A stale non-draining worker or a deleted worker row frees the run immediately; a draining worker holds the pin across its routine pod swap, bounded by the same 2h ceiling. Accepted (D3a, amended by PRD #1030).
 - **The dead-worker requeue paths recover FASTER**, not slower: `RequeueRunsOfStaleWorkers` frees its run the instant the worker's heartbeat is stale, rather than waiting out a 2-minute affinity window. A net improvement that falls out of the same predicate.
 - **HOME GC is unchanged** and M1 does not touch it (D3a-R2). The startup-only, terminal-only reclaim and the 404-skip are pre-existing behaviours, not regressions from a longer pin.
 - **M4's clear is a new write path with a sharp key.** Anyone later tempted to reset `milestones_completed` on `resume_lineage_break` should re-read the M4 decision: the tree and session signals diverge once M2 lands, and the session signal is the wrong one.
 - **No schema change.** M1 adds no migration; the liveness columns and the checkpoint refs already exist.
 
-## Open question (for the lead → user)
+## Resolved question
 
-The ceiling default (originally proposed at 30 min; shipped at 2h — see the M5 amendment) is an architect's pick, generous enough that it never bites a healthy park and short enough to bound the wedged-live strand. If the maintainer wants the wedged-live regression narrower (closer to today's 2 minutes) at the cost of falling a genuine long-park open to a peer sooner when its worker briefly stops heartbeating, that is a knob-value call, not a design change — flagged so it is chosen, not defaulted silently.
+The ceiling default was originally proposed at 30 minutes and resolved at the shipped 2h (see the PRD #1030 amendment). It is generous enough that it does not bite a healthy park and still bounds the wedged-live strand. Changing that value remains an operator knob choice, not a design change.
 
-## Linked from ARCHITECTURE.md
+## Link status
 
-To be discharged on merge, per the repo convention: add the ADR link alongside the `limit_wait` / affinity references in ARCHITECTURE.md's Run lifecycle section in the same change that lands M1, rather than in this design-gate commit.
+Discharged on merge: ARCHITECTURE.md links this ADR from the run-lifecycle discussion of `limit_wait` affinity and routine worker rolls.

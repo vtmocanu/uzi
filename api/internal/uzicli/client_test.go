@@ -775,7 +775,7 @@ func TestHTTPClientOnlyReturnsExitError(t *testing.T) {
 			return e
 		}},
 		{"submit-run-input", func(c *HTTPClient) error {
-			_, e := c.SubmitRunInput(context.Background(), "r1", "cancel", "", nil)
+			_, e := c.SubmitRunInput(context.Background(), "r1", "cancel", "", nil, false)
 			return e
 		}},
 	}

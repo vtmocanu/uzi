@@ -195,6 +195,10 @@ export function useRunStream(runId: string) {
       // PRD #84 M4 4c: the "run without the capability" override, threaded through to
       // submitRunInput. Meaningful only with approve_plan; the server ignores it otherwise.
       overrideCapabilities?: boolean,
+      // PRD #1391 Run B M3d (D13): the "discard the held outcome" confirmation, threaded
+      // through to submitRunInput. Meaningful only with kind "cancel"; the server ignores
+      // it otherwise. RunView's central cancel path sets it on the confirmed retry.
+      discardPendingOutcome?: boolean,
     ) => {
       // A follow-up shows in the steer queue immediately as Queued (PRD #95 S2):
       // optimistically prepend a temp entry (the queue is newest-first), then adopt
@@ -231,7 +235,14 @@ export function useRunStream(runId: string) {
         void refreshRun();
         return;
       }
-      await api.submitRunInput(runId, kind, body, selection, overrideCapabilities);
+      await api.submitRunInput(
+        runId,
+        kind,
+        body,
+        selection,
+        overrideCapabilities,
+        discardPendingOutcome,
+      );
       void refreshRun();
     },
     [runId, refreshRun],

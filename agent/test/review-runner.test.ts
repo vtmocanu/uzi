@@ -1,11 +1,15 @@
-import { describe, it } from "node:test";
+import { afterEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
+import fsp from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 
 import { ReviewRunner, parseTaskReview, fallbackTaskReview, buildReviewPrompt } from "../src/review-runner.js";
+import { Outbox } from "../src/outbox.js";
 import type { SdkQueryFn } from "../src/sdk-executor.js";
 import type { GitCache } from "../src/git.js";
 import type { WorkerClient } from "../src/client.js";
-import type { ClaimResponse, StateRequest, TaskReviewRequest } from "../src/protocol.js";
+import type { ClaimResponse, StateAck, StateRequest, TaskReviewRequest } from "../src/protocol.js";
 import { nullLogger } from "./helpers.js";
 
 // A fake worker client recording the posted task-review + every state report.
@@ -489,5 +493,81 @@ describe("fallbackTaskReview / buildReviewPrompt", () => {
     assert.match(prompt, /<untrusted_diff_[0-9a-f]+>/);
     assert.match(prompt, /<\/untrusted_diff_[0-9a-f]+>/);
     assert.match(prompt, /Produce your JSON review now/);
+  });
+});
+
+// PRD #1391 Run B M3b (D6): the review journals its terminal STATE write-ahead — never the
+// postTaskReview. Mirror of the judge journaling test.
+const reviewJournalTmp: string[] = [];
+afterEach(async () => {
+  for (const r of reviewJournalTmp.splice(0)) await fsp.rm(r, { recursive: true, force: true }).catch(() => undefined);
+});
+
+function journalingClient(failTerminal: boolean) {
+  const calls = { reviewPosts: 0 };
+  const client = {
+    reportState: async (_id: string, body: StateRequest): Promise<StateAck> => {
+      if (body.status === "completed" || body.status === "failed") {
+        if (failTerminal) throw new Error("api unreachable");
+        return { applied: true, status: body.status };
+      }
+      return { applied: true, status: "running" };
+    },
+    postTaskReview: async () => {
+      calls.reviewPosts++;
+    },
+    postMessages: async () => undefined,
+    hasFeature: (f: string) => f === "terminal_fence",
+    getMessageGaps: async () => ({ gaps: [] }),
+  } as unknown as WorkerClient;
+  return { client, calls };
+}
+
+async function mkReviewOutbox(): Promise<Outbox> {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "review-journal-"));
+  reviewJournalTmp.push(dir);
+  const outbox = new Outbox({
+    root: path.join(dir, "outbox"),
+    log: nullLogger(),
+    runMaxBytes: 64 * 1024 * 1024,
+    maxBytes: 512 * 1024 * 1024,
+    retentionMs: 7 * 86_400_000,
+  });
+  await outbox.init();
+  return outbox;
+}
+
+describe("ReviewRunner terminal journaling (PRD #1391 Run B M3b, D6)", () => {
+  it("journals the terminal STATE (not the review) write-ahead; the review POST is never replayed", async () => {
+    const outbox = await mkReviewOutbox();
+    const { client, calls } = journalingClient(/*failTerminal*/ true);
+    const { git } = fakeGit("diff --git a/poller.ts b/poller.ts\n@@ -1 +1 @@\n-old\n+new\n");
+    const runner = new ReviewRunner(client, git, nullLogger(), {
+      queryFn: replyingQueryFn(goodModelJson),
+      outbox,
+      outboxTerminalMaxBytes: 1 << 20,
+      gapFillMax: 100,
+    });
+    await runner.execute(reviewClaim({ claim_generation: 6 }));
+
+    assert.equal(outbox.hasPendingTerminal("review-1", 6), true, "the terminal state was journalled write-ahead");
+    const j = await outbox.readTerminalJournal("review-1", 6);
+    assert.equal(j?.body.status, "completed", "the journal holds the terminal STATE, not the review");
+    assert.equal(calls.reviewPosts, 1, "postTaskReview is called exactly once, never replayed by the resolve path");
+  });
+
+  it("retires the journal on a 200 terminal ack (no residue on the happy path)", async () => {
+    const outbox = await mkReviewOutbox();
+    const { client } = journalingClient(/*failTerminal*/ false);
+    const { git } = fakeGit("diff --git a/poller.ts b/poller.ts\n@@ -1 +1 @@\n-old\n+new\n");
+    const runner = new ReviewRunner(client, git, nullLogger(), {
+      queryFn: replyingQueryFn(goodModelJson),
+      outbox,
+      outboxTerminalMaxBytes: 1 << 20,
+      gapFillMax: 100,
+    });
+    await runner.execute(reviewClaim({ claim_generation: 8 }));
+
+    assert.equal(outbox.hasPendingTerminal("review-1", 8), false, "a 200 terminal ack retires the journal");
   });
 });

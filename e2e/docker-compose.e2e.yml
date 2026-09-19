@@ -278,6 +278,13 @@ services:
       # a run whose issue text carries UZI_STUB_DROP is dropped after its first `running`
       # report (no terminal report) to model a live worker that silently loses one execution.
       UZI_E2E_DROP_ON_SENTINEL: ${UZI_E2E_DROP_ON_SENTINEL:-}
+      # PRD #1391 Run B M6 (e2e ONLY): shrinks the stub UZI_STUB_OUTBOX stream (default 90
+      # one-second ticks) so a run reaches its TERMINAL inside a bounded outage — the
+      # write-ahead terminal + boot-gate-replay cases. Empty (the default) leaves the 90s Run A
+      # stream, so this is inert in every other phase and in production, exactly like
+      # UZI_E2E_DROP_ON_SENTINEL above; the api-outage-outbox phase (52) exports it for its Run B
+      # cases and unsets it at restore. Read by agent/src/executor.ts.
+      UZI_STUB_OUTBOX_TICKS: ${UZI_STUB_OUTBOX_TICKS:-}
       # Chat lane (PRD #39): fast turn pickup + a SHORT worker-driven idle window so the
       # e2e sees idle-completion in seconds instead of the 60m default. This agent-side
       # value is only the FALLBACK — the effective window is the api's claim-config

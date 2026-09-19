@@ -38,13 +38,28 @@ import type { OutgoingMessage } from "./protocol.js";
 /** The worker-local HMAC secret is exactly this many random bytes. */
 const OUTBOX_KEY_BYTES = 32;
 
-/** The `.reserve` file is preallocated to this many bytes — sized for ONE range
- *  record (a few hundred bytes) with generous slack for the JSON + HMAC + the
- *  manifest rewrite it rides with. On `ENOSPC` during a range-record write the
- *  single-flight writer releases it to free the space, writes the range record,
- *  then replenishes it when space returns. Run A's reserve is sized for a range
- *  record only; the terminal-journal reserve is Run B (#1393), out of scope. */
+/** The `.reserve` file's FALLBACK size in bytes — sized for ONE range record (a
+ *  few hundred bytes) with generous slack for the JSON + HMAC + the manifest
+ *  rewrite it rides with. On `ENOSPC` during a range-record write the single-flight
+ *  writer releases it to free the space, writes the range record, then replenishes
+ *  it when space returns. This stays the DEFAULT used when no `reserveBytes` is
+ *  supplied (Run A behaviour, byte-for-byte); Run B (#1393 M3) threads a larger
+ *  terminal-sized reserve through {@link OutboxOptions.reserveBytes}, and it doubles
+ *  as the per-terminal overhead slack in {@link deriveTerminalReserveBytes}. */
 export const OUTBOX_RANGE_RESERVE_BYTES = 64 * 1024;
+
+/**
+ * PRD #1391 M3 (Run B, D2): derive the terminal-sized reserve from ONE source — the
+ * per-record cap times how many hard-max terminal journals must be writable on a full
+ * volume, plus a per-record overhead slack ({@link OUTBOX_RANGE_RESERVE_BYTES}, which
+ * also covers the single range record Run A's reserve was sized for). At the defaults
+ * (4 terminals × 1.25 MiB + 4 × 64 KiB) this is about 5.25 MiB. Exported so `main.ts`
+ * computes the reserve from the two config knobs with the derivation living beside the
+ * const it depends on.
+ */
+export function deriveTerminalReserveBytes(reserveTerminals: number, terminalMaxBytes: number): number {
+  return reserveTerminals * (terminalMaxBytes + OUTBOX_RANGE_RESERVE_BYTES);
+}
 
 // Domain-separation labels. Binding a distinct label into each kind's MAC keeps a
 // segment MAC unusable as a manifest MAC and vice-versa, so a record cannot be
@@ -52,10 +67,19 @@ export const OUTBOX_RANGE_RESERVE_BYTES = 64 * 1024;
 const MAC_DOMAIN_SEGMENT = "uzi.outbox.segment.v1";
 const MAC_DOMAIN_RANGE = "uzi.outbox.range.v1";
 const MAC_DOMAIN_MANIFEST = "uzi.outbox.manifest.v1";
+/** PRD #1391 M3 (Run B): the terminal-journal record's domain label, distinct from the
+ *  segment/range/manifest labels so a terminal journal's MAC can never be replayed as a
+ *  different record kind under the same worker-local key. */
+const MAC_DOMAIN_TERMINAL = "uzi.outbox.terminal.v1";
 
 const MANIFEST_FILE = "manifest.json";
 const KEY_FILE = ".key";
 const RESERVE_FILE = ".reserve";
+/** PRD #1391 M3 (Run B): the per-run terminal-journal filename, keyed by claim generation
+ *  (D4). It is NOT listed in the message manifest — the journal for a generation is its own
+ *  first-writer-wins file, `terminal-<claim_generation>.json`. */
+const TERMINAL_FILE_PREFIX = "terminal-";
+const TERMINAL_FILE_SUFFIX = ".json";
 
 /** The fixed reason a quota / ENOSPC drop records; replay expands the range into
  *  one status tombstone per seq carrying this reason (batcher.ts:152-180). */
@@ -109,17 +133,95 @@ interface ManifestData {
   updatedAt: number;
 }
 
+/** PRD #1391 M3 (Run B, D13): the CLOSED set of reasons a pending terminal journal can be
+ *  marked permanently blocked with. `completion_permit_mismatch` — the api refused the
+ *  transition against a released/superseded completion permit; `gap_unrecoverable` — the
+ *  message-gap fill hit `WORKER_GAP_FILL_MAX` and the api still refuses; `reserve_exhausted`
+ *  — the terminal-sized reserve could not admit the journal, so it was sent unjournaled. The
+ *  worker surfaces the reason on the heartbeat outbox entry, and the owner resolves it (never a
+ *  timer). Exported so M3b's send path names exactly these three. */
+export type TerminalBlockedReason = "completion_permit_mismatch" | "gap_unrecoverable" | "reserve_exhausted";
+
+/** PRD #1391 M3 (Run B): the outcome of {@link Outbox.journalTerminal}. A discriminated union so a
+ *  caller (M3b's send path) never confuses "installed durably" with "sent unjournaled": on success
+ *  the outcome is journalled (and `adopted` says whether THIS call installed it or adopted an
+ *  earlier first-writer for the same generation, D4); on `reserve_exhausted` the terminal-sized
+ *  reserve could not admit it, so the caller sends unjournaled + logs, never silently dropping. */
+export type TerminalJournalResult =
+  | { journaled: true; adopted: boolean }
+  | { journaled: false; reason: "reserve_exhausted" };
+
+/** PRD #1391 M3 (Run B): one pending terminal journal listed by {@link Outbox.listPendingTerminals}
+ *  and folded into the heartbeat outbox entry — the phase captured at journal time (`phase_at_journal`,
+ *  what #1390's snapshot reports after a restart), whether the api has permanently refused it
+ *  (`blocked` + `blocked_reason`, D13), and when it was installed. */
+export interface PendingTerminal {
+  run_id: string;
+  claim_generation: number;
+  phase: string;
+  blocked: boolean;
+  blocked_reason?: TerminalBlockedReason;
+  since: number;
+}
+
+/** PRD #1391 M3b: a pending terminal journal's durable payload, returned by
+ *  {@link Outbox.readTerminalJournal} for the send path — the already-canonical report `body`, its
+ *  `messagesThroughSeq` fence and the phase captured at journal time (`phase_at_journal`), plus its
+ *  blocked state (D13). The M3b `resolvePendingTerminal` send path sends `body` verbatim, adding the
+ *  fence only when the api advertises `terminal_fence` (D9). */
+export interface PendingTerminalJournal {
+  body: Record<string, unknown>;
+  messagesThroughSeq: number;
+  phase: string;
+  blocked: boolean;
+  blockedReason?: TerminalBlockedReason;
+}
+
+/** The on-disk terminal-journal record (D4). Installed crash-atomically and EXCLUSIVELY
+ *  (first durable writer for a generation wins), authenticated with {@link MAC_DOMAIN_TERMINAL}.
+ *  `body` is the ALREADY-canonical report body (M3b canonicalises before journalling AND before
+ *  the first send, so the two are byte-identical); `blocked`/`blocked_reason` are updated in place
+ *  by {@link Outbox.markTerminalBlocked} once the api permanently refuses (that is a legitimate
+ *  owner update, not a competing first-writer). */
+interface TerminalJournalData {
+  version: 1;
+  run_id: string;
+  claim_generation: number;
+  phase_at_journal: string;
+  messages_through_seq: number;
+  body: Record<string, unknown>;
+  since: number;
+  /** Lifecycle marker; only `installed` today (a retire unlinks the file rather than restamping). */
+  state: "installed";
+  blocked: boolean;
+  blocked_reason?: TerminalBlockedReason;
+}
+
+/** In-memory metadata for one pending terminal journal (the file's durable fields minus the body,
+ *  which the store never needs to re-read for depth/list/retire). */
+interface TerminalMeta {
+  claimGeneration: number;
+  phaseAtJournal: string;
+  since: number;
+  blocked: boolean;
+  blockedReason?: TerminalBlockedReason;
+}
+
 /** In-memory working state for one run: its authenticated manifest plus a byte
- *  map (file -> size) for quota accounting, so the quota check never re-stats. */
+ *  map (file -> size) for quota accounting, so the quota check never re-stats, and
+ *  the run's pending terminal journals keyed by claim generation (D4). */
 interface RunState {
   runId: string;
   manifest: ManifestData;
   recordBytes: Map<string, number>;
+  terminals: Map<number, TerminalMeta>;
 }
 
 /** The per-run outbox depth surfaced on the heartbeat (M5) and in `uzi admin
- *  workers`. `pendingTerminal` is ALWAYS 0 in Run A (terminal journaling is Run
- *  B); `blockedReason` is likewise never set here. */
+ *  workers`. `pendingTerminal` counts the run's pending (installed, un-retired)
+ *  terminal journals (Run B / M3); `blockedReason` is the run's oldest blocked
+ *  terminal reason, if any (D13). Both stay 0/unset for a run with no terminal
+ *  journal, so a Run A worker's depth is unchanged. */
 export interface OutboxDepth {
   runId: string;
   pendingMessages: number;
@@ -134,7 +236,7 @@ export interface OutboxDepth {
  *  seam that throws `ENOSPC` to exercise the reserve path. */
 export type RawWriteSeam = (
   write: () => Promise<void>,
-  ctx: { path: string; kind: RecordFileKind | "manifest" },
+  ctx: { path: string; kind: RecordFileKind | "manifest" | "terminal" },
 ) => Promise<void>;
 
 export interface OutboxOptions {
@@ -147,6 +249,14 @@ export interface OutboxOptions {
   maxBytes: number;
   /** Retention window for an empty (fully-retired) run. */
   retentionMs: number;
+  /**
+   * PRD #1391 M3 (Run B, D2): the physical `.reserve` size in bytes. When supplied the reserve is
+   * GROWN to at least this at init (so a deployed Run A worker with a 64 KiB reserve comes up with
+   * the larger terminal-sized reserve). Omitted ⇒ {@link OUTBOX_RANGE_RESERVE_BYTES}, preserving
+   * Run A's one-range-record reserve byte-for-byte. Derive it from the config knobs with
+   * {@link deriveTerminalReserveBytes}.
+   */
+  reserveBytes?: number;
   now?: () => number;
   /** Optional raw-write seam to simulate `ENOSPC` (tests). */
   rawWrite?: RawWriteSeam;
@@ -225,6 +335,9 @@ export class Outbox {
   private readonly runMaxBytes: number;
   private readonly maxBytes: number;
   private readonly retentionMs: number;
+  /** The configured `.reserve` byte size (Run B's terminal-sized reserve, or the
+   *  Run A default when no `reserveBytes` was supplied). */
+  private readonly reserveBytes: number;
   private readonly now: () => number;
   private readonly rawWrite: RawWriteSeam;
 
@@ -247,6 +360,11 @@ export class Outbox {
     this.runMaxBytes = opts.runMaxBytes;
     this.maxBytes = opts.maxBytes;
     this.retentionMs = opts.retentionMs;
+    // A non-positive override would defeat the reserve; fall back to the Run A default.
+    this.reserveBytes =
+      opts.reserveBytes !== undefined && Number.isInteger(opts.reserveBytes) && opts.reserveBytes > 0
+        ? opts.reserveBytes
+        : OUTBOX_RANGE_RESERVE_BYTES;
     this.now = opts.now ?? (() => Date.now());
     this.rawWrite = opts.rawWrite ?? ((write) => write());
   }
@@ -314,13 +432,17 @@ export class Outbox {
 
     if (!(await this.loadOrMintKey(hasRecords))) return; // disabled + logged inside
 
-    // Load every run's manifest (authenticated) and stat its files for accounting.
+    // Load every run's manifest (authenticated) and stat its files for accounting,
+    // then adopt any pending terminal journals (Run B / M3) — a run can carry a
+    // terminal journal with no message manifest, so this loads them independently.
     for (const runId of runDirs) {
       await this.loadRun(runId);
+      await this.loadTerminals(runId);
     }
 
-    // A best-effort preallocated reserve so a range record can still be written on
-    // a full volume (released on ENOSPC, then replenished).
+    // A best-effort preallocated reserve so a range record — and, with a terminal-sized
+    // reserve, the next few terminal journals — can still be written on a full volume
+    // (released on ENOSPC, then replenished). GROWS an undersized existing `.reserve`.
     await this.ensureReserve();
   }
 
@@ -382,8 +504,37 @@ export class Outbox {
         recordBytes.set(rec.file, 0); // referenced file missing/gone; accounts as 0
       }
     }
-    this.runs.set(runId, { runId, manifest, recordBytes });
+    this.runs.set(runId, { runId, manifest, recordBytes, terminals: new Map() });
     if (manifest.spilledUnclean) this.uncleanAtInit.push(runId);
+  }
+
+  /** Adopt a run's pending terminal journals (`terminal-<generation>.json`) at init (D4). A
+   *  journal is authenticated and bound to its directory (embedded `run_id` must match) and its
+   *  filename generation (the file names the generation, so a copied journal cannot masquerade
+   *  as another generation). A run may carry a terminal journal with NO message manifest, so this
+   *  creates the in-memory run entry when loadRun did not. */
+  private async loadTerminals(runId: string): Promise<void> {
+    if (!this.validRunId(runId)) return;
+    const dir = this.runDir(runId);
+    let names: string[];
+    try {
+      names = await fs.readdir(dir);
+    } catch {
+      return;
+    }
+    for (const name of names) {
+      const gen = parseTerminalFileName(name);
+      if (gen === undefined) continue;
+      const parsed = await this.readAuthed(path.join(dir, name), MAC_DOMAIN_TERMINAL);
+      if (!parsed) continue; // absent/symlink/unparseable/MAC-bad (readAuthed logged)
+      const meta = coerceTerminal(parsed, runId, gen);
+      if (!meta) {
+        this.log.warn("outbox: malformed or misfiled terminal journal; skipping", { run_id: runId, file: name });
+        continue;
+      }
+      const rs = this.ensureInMemoryRun(runId, meta.since);
+      rs.terminals.set(meta.claimGeneration, meta);
+    }
   }
 
   // ── writes ──────────────────────────────────────────────────────────────────
@@ -732,16 +883,23 @@ export class Outbox {
 
   // ── retention / removal ────────────────────────────────────────────────────────
 
-  /** Age-delete only runs whose records are all retired (empty) and whose last
-   *  write is older than `retentionMs`. A run with undrained records is never
-   *  removed here. */
+  /** Age-delete only runs whose records are all retired (empty), that hold NO pending
+   *  terminal journal (Run B / M3, PRD M1), and whose last write is older than
+   *  `retentionMs`. A run with undrained records or a pending outcome is never removed
+   *  here. */
   async sweepRetention(nowArg?: number): Promise<void> {
     if (this.disabled) return;
     const now = nowArg ?? this.now();
     // Collect first, then remove — never mutate the map mid-iteration.
     const toRemove: string[] = [];
     for (const [runId, rs] of this.runs) {
-      if (rs.manifest.records.length === 0 && now - rs.manifest.updatedAt > this.retentionMs) toRemove.push(runId);
+      if (
+        rs.manifest.records.length === 0 &&
+        rs.terminals.size === 0 &&
+        now - rs.manifest.updatedAt > this.retentionMs
+      ) {
+        toRemove.push(runId);
+      }
     }
     for (const runId of toRemove) {
       const removed = await this.withRunLock(runId, () => this.removeRunIfStillReclaimable(runId, now));
@@ -770,6 +928,7 @@ export class Outbox {
     const rs = this.runs.get(runId);
     if (!rs) return false; // no longer tracked (already removed / retired)
     if (rs.manifest.records.length !== 0) return false; // a record was appended after the decision
+    if (rs.terminals.size !== 0) return false; // a terminal journal was installed after the decision
     if (now - rs.manifest.updatedAt <= this.retentionMs) return false; // no longer past retention
     await this.removeRun(runId);
     return true;
@@ -795,6 +954,20 @@ export class Outbox {
     return out;
   }
 
+  /** PRD #1391 Run B M3b (N3): does this run still hold UNDRAINED message segments (locally-held
+   *  deliverable messages the per-worker drainer has not yet replayed)? The terminal send path's
+   *  gap-fill consults this before tombstoning a hole below the fence as "unrecoverable": a run
+   *  that spilled during the same outage may still have segments covering those seqs, and
+   *  tombstoning them would RACE the drainer and destroy recoverable messages. Gap-fill therefore
+   *  runs ONLY on a fully-drained run (this returns false); otherwise it keeps the journal for a
+   *  later resolve after the drain completes. A run with no message manifest (a terminal-only run)
+   *  returns false — the same "nothing undrained" answer as a fully-retired run. */
+  hasUndrainedMessages(runId: string): boolean {
+    const rs = this.runs.get(runId);
+    if (!rs) return false;
+    return rs.manifest.records.some((r) => r.lastSeq > rs.manifest.cursor);
+  }
+
   /** The outbox depth for one run, or undefined if the run is not tracked. */
   depthFor(runId: string): OutboxDepth | undefined {
     const rs = this.runs.get(runId);
@@ -802,11 +975,15 @@ export class Outbox {
     const m = rs.manifest;
     let pendingMessages = 0;
     for (const r of m.records) if (r.lastSeq > m.cursor) pendingMessages += seqCount(r);
+    const blockedReason = oldestBlockedReason(rs);
     return {
       runId,
       pendingMessages,
-      pendingTerminal: 0, // always 0 in Run A
+      // Run B: every installed, un-retired terminal journal for this run (blocked or not).
+      pendingTerminal: rs.terminals.size,
       staleRetired: m.staleRetired,
+      // The run's oldest blocked terminal reason, if any (D13) — omitted when none is blocked.
+      ...(blockedReason !== undefined ? { blockedReason } : {}),
       since: m.since,
     };
   }
@@ -825,6 +1002,292 @@ export class Outbox {
    *  trip and no report. */
   isDisabled(): boolean {
     return this.disabled;
+  }
+
+  // ── terminal journals (Run B / M3) ─────────────────────────────────────────────
+
+  /**
+   * Journal a run-lane terminal outcome WRITE-AHEAD, before its first network attempt (D3/D4).
+   * Installs `terminal-<claimGeneration>.json` crash-atomically and EXCLUSIVELY via the
+   * `mintKey`-style no-replace `link()` idiom (temp → fsync → `link()` → EEXIST adopts the
+   * first durable winner, never overwriting it → dir fsync), under the run's single-flight lock.
+   *
+   * `canonicalBody` MUST already be the canonical body (M3b runs {@link canonicalizeTerminalBody}
+   * before both this call and the first send, so the two are byte-identical). On a full volume the
+   * temp write uses the terminal-sized reserve (release → retry → replenish); if even that cannot
+   * admit it the result is `{journaled:false, reason:"reserve_exhausted"}` so the caller sends
+   * unjournaled + logs — never a silent drop (D2 / SC2).
+   */
+  async journalTerminal(
+    runId: string,
+    claimGeneration: number,
+    phaseAtJournal: string,
+    messagesThroughSeq: number,
+    canonicalBody: Record<string, unknown>,
+  ): Promise<TerminalJournalResult> {
+    if (!this.writable()) return { journaled: false, reason: "reserve_exhausted" };
+    return this.withRunLock(runId, async () => {
+      if (!this.validRunId(runId)) return { journaled: false, reason: "reserve_exhausted" };
+      const dir = this.runDir(runId);
+      if (await this.isSymlink(dir)) {
+        this.log.warn("outbox: run dir is a symlink; refusing terminal journal (skipped, not followed)", {
+          run_id: runId,
+        });
+        return { journaled: false, reason: "reserve_exhausted" };
+      }
+      const since = this.now();
+      const record: TerminalJournalData = {
+        version: 1,
+        run_id: runId,
+        claim_generation: claimGeneration,
+        phase_at_journal: phaseAtJournal,
+        messages_through_seq: messagesThroughSeq,
+        body: canonicalBody,
+        since,
+        state: "installed",
+        blocked: false,
+      };
+      const serialized = this.seal(MAC_DOMAIN_TERMINAL, record);
+      const dst = path.join(dir, terminalFileName(claimGeneration));
+      let adopted: boolean;
+      try {
+        // M3a review fold-in (SC2): the run-dir mkdir (and its dir fsync) can ENOSPC too, so a
+        // terminal write-ahead on a FULL volume with an ABSENT run dir would THROW if the mkdir
+        // sat before the ENOSPC handling. Wrap EVERY disk step that can hit ENOSPC — the mkdir
+        // INCLUDED — in withReserveOnEnospc so releasing the reserve frees the space the directory
+        // entry (and the record) needs; if even that cannot admit it the ENOSPC propagates to the
+        // catch below and degrades to reserve_exhausted rather than throwing. The mkdir is routed
+        // through the same rawWrite ENOSPC seam as the record write so a test can simulate a full
+        // volume at the directory-creation step.
+        adopted = await this.withReserveOnEnospc(async () => {
+          await this.rawWrite(
+            async () => {
+              await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+            },
+            { path: dir, kind: "terminal" },
+          );
+          await this.fsyncDir(this.root);
+          return this.installTerminalExclusive(dst, serialized);
+        });
+      } catch (err) {
+        if (isENOSPC(err)) {
+          // Even releasing the reserve could not admit the journal: signal the caller to
+          // send unjournaled (SC2), never a silent drop. Nothing is left on disk here.
+          this.log.error("outbox: terminal-journal reserve exhausted; caller must send unjournaled", {
+            run_id: runId,
+            claim_generation: claimGeneration,
+          });
+          return { journaled: false, reason: "reserve_exhausted" };
+        }
+        throw err;
+      }
+      // Track it in memory. On an adopt (a first-writer already installed this generation) keep
+      // the winner's metadata if we already loaded it; otherwise record ours (same generation).
+      const rs = this.ensureInMemoryRun(runId, since);
+      if (!rs.terminals.has(claimGeneration)) {
+        rs.terminals.set(claimGeneration, {
+          claimGeneration,
+          phaseAtJournal,
+          since,
+          blocked: false,
+        });
+      }
+      if (adopted) {
+        this.log.warn("outbox: a terminal journal for this generation already existed; adopted the first writer", {
+          run_id: runId,
+          claim_generation: claimGeneration,
+        });
+      }
+      return { journaled: true, adopted };
+    });
+  }
+
+  /** Every pending (installed, un-retired) terminal journal across all runs, for the heartbeat
+   *  outbox report and `uzi admin workers` (M5's `blocked_reason` folds in from here). */
+  listPendingTerminals(): PendingTerminal[] {
+    const out: PendingTerminal[] = [];
+    for (const rs of this.runs.values()) {
+      for (const t of rs.terminals.values()) {
+        out.push({
+          run_id: rs.runId,
+          claim_generation: t.claimGeneration,
+          phase: t.phaseAtJournal,
+          blocked: t.blocked,
+          ...(t.blockedReason !== undefined ? { blocked_reason: t.blockedReason } : {}),
+          since: t.since,
+        });
+      }
+    }
+    return out;
+  }
+
+  /** Retire a terminal journal (the api applied the transition on a 200, or answered a 409 whose
+   *  returned status is terminal): unlink the file and drop it from the pending set (D3). */
+  async retireTerminal(runId: string, claimGeneration: number): Promise<void> {
+    if (this.disabled) return;
+    await this.withRunLock(runId, async () => {
+      if (!this.validRunId(runId)) return;
+      await fs
+        .rm(path.join(this.runDir(runId), terminalFileName(claimGeneration)), { force: true })
+        .catch(() => undefined);
+      this.runs.get(runId)?.terminals.delete(claimGeneration);
+    });
+  }
+
+  /**
+   * D11-style LOCAL retire of a terminal journal under a stale claim: unlink the file, increment the
+   * run's `stale_retired` counter (the SAME manifest counter the message path uses), write NOTHING to
+   * the server, and NEVER rebind the outcome to a new generation. This is M3b's `stale_claim` handler,
+   * exposed now as the store primitive.
+   */
+  async staleRetireTerminal(runId: string, claimGeneration: number): Promise<void> {
+    if (this.disabled) return;
+    await this.withRunLock(runId, async () => {
+      if (!this.validRunId(runId)) return;
+      const rs = this.runs.get(runId);
+      if (!rs || !rs.terminals.has(claimGeneration)) return;
+      await fs
+        .rm(path.join(this.runDir(runId), terminalFileName(claimGeneration)), { force: true })
+        .catch(() => undefined);
+      rs.terminals.delete(claimGeneration);
+      // Reuse the message path's staleRetired mechanism (D11): a durable, monotone per-run count.
+      // A terminal outcome is one "frame" lost, so the counter advances by one; installManifest
+      // creates manifest.json for a terminal-only run that had none.
+      await this.installManifest(rs, rs.manifest.records, { staleRetired: rs.manifest.staleRetired + 1 });
+    });
+  }
+
+  /**
+   * Mark a pending terminal journal permanently `blocked` with a closed-vocab reason (D13), so the
+   * heartbeat outbox entry surfaces it and the owner can resolve it (never a timer). Updates the
+   * journal file in place (a legitimate owner update of an already-installed outcome, NOT a competing
+   * first-writer) and the in-memory metadata. A no-op when the run holds no such journal.
+   */
+  async markTerminalBlocked(runId: string, claimGeneration: number, reason: TerminalBlockedReason): Promise<void> {
+    if (this.disabled) return;
+    await this.withRunLock(runId, async () => {
+      if (!this.validRunId(runId)) return;
+      const rs = this.runs.get(runId);
+      const meta = rs?.terminals.get(claimGeneration);
+      if (!rs || !meta) return;
+      const dst = path.join(this.runDir(runId), terminalFileName(claimGeneration));
+      const parsed = await this.readAuthed(dst, MAC_DOMAIN_TERMINAL);
+      if (parsed) {
+        const next = { ...parsed, blocked: true, blocked_reason: reason };
+        // Re-seal + rewrite atomically (rename-based): the exclusive first-writer guarantee is only
+        // for the INITIAL install; updating blocked-state is the owner's own follow-up write. The
+        // rewrite needs temporary-file space too, so it must release the reserve on ENOSPC just like
+        // the initial terminal install; otherwise a full volume can strand an unblocked journal.
+        await this.withReserveOnEnospc(() =>
+          this.writeFileAtomic(dst, this.seal(MAC_DOMAIN_TERMINAL, next), "terminal"),
+        );
+      } else {
+        this.log.warn("outbox: terminal journal unreadable while marking blocked; updating in-memory only", {
+          run_id: runId,
+          claim_generation: claimGeneration,
+        });
+      }
+      meta.blocked = true;
+      meta.blockedReason = reason;
+    });
+  }
+
+  /**
+   * PRD #1391 M3b: read a pending terminal journal's DURABLE payload for the send path — the
+   * already-canonical report body, its `messages_through_seq` fence and the phase captured at
+   * journal time. The M3b `resolvePendingTerminal` send path reads this to send those exact
+   * canonical bytes (adding the fence only when the api advertises `terminal_fence`). Returns
+   * undefined when the run holds no such journal (already retired / never installed) or the file no
+   * longer authenticates (a tampered/absent record proves nothing — never sent).
+   */
+  async readTerminalJournal(
+    runId: string,
+    claimGeneration: number,
+  ): Promise<PendingTerminalJournal | undefined> {
+    if (this.disabled) return undefined;
+    return this.withRunLock(runId, async () => {
+      if (!this.validRunId(runId)) return undefined;
+      const parsed = await this.readAuthed(
+        path.join(this.runDir(runId), terminalFileName(claimGeneration)),
+        MAC_DOMAIN_TERMINAL,
+      );
+      if (!parsed) return undefined;
+      return coerceTerminalRecord(parsed, runId, claimGeneration) ?? undefined;
+    });
+  }
+
+  /** In-memory check: does this run hold an installed, un-retired terminal journal for the
+   *  generation? The executor catch reads it (via the send path) to treat a journaled outcome as
+   *  FINAL — no second fallback `failed` once the write-ahead journal exists (fact 2, D5). */
+  hasPendingTerminal(runId: string, claimGeneration: number): boolean {
+    return this.runs.get(runId)?.terminals.has(claimGeneration) ?? false;
+  }
+
+  /** Install a terminal journal crash-atomically and EXCLUSIVELY (D4): temp write → fsync →
+   *  no-replace `link()` (EEXIST means a first writer already won this generation) → dir fsync →
+   *  remove temp. Returns whether an existing winner was adopted rather than freshly installed.
+   *  The reserve/ENOSPC handling now lives in {@link journalTerminal}, wrapping this call AND the
+   *  run-dir mkdir together, so the whole sequence uses (and replenishes) the reserve exactly once
+   *  on a full volume — the temp write and the `link()` both ride that single release. */
+  private async installTerminalExclusive(dst: string, serialized: string): Promise<boolean> {
+    const tmp = `${dst}.${randomUUID()}.tmp`;
+    const doWrite = async () => {
+      const fh = await fs.open(
+        tmp,
+        fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
+        0o600,
+      );
+      try {
+        await fh.writeFile(serialized, "utf8");
+        await fh.sync();
+      } finally {
+        await fh.close();
+      }
+    };
+    try {
+      await this.rawWrite(doWrite, { path: tmp, kind: "terminal" });
+    } catch (err) {
+      await fs.rm(tmp, { force: true }).catch(() => undefined);
+      throw err;
+    }
+    let adopted = false;
+    try {
+      // fs.link is atomic and throws EEXIST if the journal already exists — a no-replace install,
+      // so a racing writer for the same generation cannot clobber the first durable winner (D4).
+      await fs.link(tmp, dst);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "EEXIST") {
+        adopted = true;
+      } else {
+        await fs.rm(tmp, { force: true }).catch(() => undefined);
+        throw err;
+      }
+    }
+    await this.fsyncDir(path.dirname(dst));
+    await fs.rm(tmp, { force: true }).catch(() => undefined);
+    return adopted;
+  }
+
+  /** Get an existing in-memory run entry, or create one WITHOUT writing a manifest to disk — a run
+   *  may carry a terminal journal with no message manifest, and forcing an empty manifest write here
+   *  would be a needless durable side effect. */
+  private ensureInMemoryRun(runId: string, since: number): RunState {
+    const existing = this.runs.get(runId);
+    if (existing) return existing;
+    const manifest: ManifestData = {
+      version: 1,
+      runId,
+      generation: 0,
+      records: [],
+      cursor: 0,
+      spilledUnclean: false,
+      staleRetired: 0,
+      since,
+      updatedAt: since,
+    };
+    const rs: RunState = { runId, manifest, recordBytes: new Map(), terminals: new Map() };
+    this.runs.set(runId, rs);
+    return rs;
   }
 
   // ── manifest / record IO ───────────────────────────────────────────────────────
@@ -931,7 +1394,7 @@ export class Outbox {
       since: t,
       updatedAt: t,
     };
-    const rs: RunState = { runId, manifest, recordBytes: new Map() };
+    const rs: RunState = { runId, manifest, recordBytes: new Map(), terminals: new Map() };
     this.runs.set(runId, rs);
     return rs;
   }
@@ -1105,16 +1568,59 @@ export class Outbox {
     return path.join(this.root, RESERVE_FILE);
   }
 
-  /** Preallocate the reserve file if absent (best-effort). */
+  /** Preallocate the reserve file, GROWING an undersized existing one to the configured size
+   *  (best-effort). A deployed Run A worker whose `.reserve` is the old 64 KiB must come up with
+   *  the larger terminal-sized reserve, so this STATS the file and replaces it atomically (temp →
+   *  fsync → rename → dir fsync, symlink-refusing — mirroring {@link replenishReserve}'s hardening)
+   *  whenever it is absent or smaller than {@link reserveBytes}. An already-large-enough reserve is
+   *  left untouched (never shrunk, so an operator who lowered the count keeps the headroom until it
+   *  is next consumed and replenished). */
   private async ensureReserve(): Promise<void> {
     try {
-      if (await pathExists(this.reservePath())) return;
-      await this.replenishReserve();
+      const p = this.reservePath();
+      if (await this.isSymlink(p)) {
+        this.log.warn("outbox: .reserve is a symlink; refusing to (re)allocate it (never followed)", { path: p });
+        return;
+      }
+      let size = -1;
+      try {
+        size = (await fs.stat(p)).size;
+      } catch {
+        size = -1; // absent
+      }
+      if (size >= this.reserveBytes) return; // already at/above the configured size
+      await this.growReserveAtomic();
     } catch (err) {
-      this.log.warn("outbox: could not preallocate reserve (range records may fail on a full volume)", {
+      this.log.warn("outbox: could not (pre)allocate reserve (range/terminal writes may fail on a full volume)", {
         error: errText(err),
       });
     }
+  }
+
+  /** Grow/replace the reserve atomically: temp file (0600, O_EXCL|O_NOFOLLOW) → fsync → rename →
+   *  parent-dir fsync, so a crash mid-grow never leaves a truncated `.reserve` (crash-atomicity, D2).
+   *  The `.reserve` is opaque padding and carries no MAC. */
+  private async growReserveAtomic(): Promise<void> {
+    const dst = this.reservePath();
+    const tmp = `${dst}.${randomUUID()}.tmp`;
+    try {
+      const fh = await fs.open(
+        tmp,
+        fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
+        0o600,
+      );
+      try {
+        await fh.writeFile(Buffer.alloc(this.reserveBytes));
+        await fh.sync();
+      } finally {
+        await fh.close();
+      }
+    } catch (err) {
+      await fs.rm(tmp, { force: true }).catch(() => undefined);
+      throw err;
+    }
+    await fs.rename(tmp, dst);
+    await this.fsyncDir(path.dirname(dst));
   }
 
   private async releaseReserve(): Promise<void> {
@@ -1133,7 +1639,7 @@ export class Outbox {
         0o600,
       );
       try {
-        await fh.writeFile(Buffer.alloc(OUTBOX_RANGE_RESERVE_BYTES));
+        await fh.writeFile(Buffer.alloc(this.reserveBytes));
       } finally {
         await fh.close();
       }
@@ -1143,13 +1649,13 @@ export class Outbox {
   }
 
   /** Run `fn`, and on `ENOSPC` release the reserve to free space, retry once, then
-   *  replenish the reserve. Used for range-record writes (D2). */
+   *  replenish the reserve. Used for reserve-backed range and terminal writes (D2). */
   private async withReserveOnEnospc<T>(fn: () => Promise<T>): Promise<T> {
     try {
       return await fn();
     } catch (err) {
       if (!isENOSPC(err)) throw err;
-      this.log.warn("outbox: ENOSPC on a range write; releasing reserve to admit it", {});
+      this.log.warn("outbox: ENOSPC on a reserve-backed write; releasing reserve to admit it", {});
       await this.releaseReserve();
       try {
         return await fn();
@@ -1167,7 +1673,7 @@ export class Outbox {
   private async writeFileAtomic(
     dstPath: string,
     data: string,
-    kind: RecordFileKind | "manifest",
+    kind: RecordFileKind | "manifest" | "terminal",
   ): Promise<void> {
     const dir = path.dirname(dstPath);
     const tmp = `${dstPath}.${randomUUID()}.tmp`;
@@ -1272,4 +1778,208 @@ function gapTombstone(seq: number, reason: string): OutgoingMessage {
     kind: "status",
     payload: { text: `message dropped: ${reason} (seq ${seq})`, event: "message_dropped", reason },
   };
+}
+
+// ── terminal-journal helpers (Run B / M3) ─────────────────────────────────────────
+
+/** The `terminal-<generation>.json` filename for a claim generation (D4). */
+function terminalFileName(claimGeneration: number): string {
+  return `${TERMINAL_FILE_PREFIX}${claimGeneration}${TERMINAL_FILE_SUFFIX}`;
+}
+
+/** The claim generation a terminal-journal filename names, or undefined when the name is not a
+ *  terminal journal or its generation is not a non-negative integer. The FILENAME is the source of
+ *  truth for the generation, so a journal copied under a different name cannot masquerade as another
+ *  generation (loadTerminals cross-checks the embedded field against this). */
+function parseTerminalFileName(name: string): number | undefined {
+  if (!name.startsWith(TERMINAL_FILE_PREFIX) || !name.endsWith(TERMINAL_FILE_SUFFIX)) return undefined;
+  const mid = name.slice(TERMINAL_FILE_PREFIX.length, name.length - TERMINAL_FILE_SUFFIX.length);
+  if (!/^\d+$/.test(mid)) return undefined; // no sign, no separators, no leading `+`
+  const gen = Number(mid);
+  return Number.isInteger(gen) && gen >= 0 ? gen : undefined;
+}
+
+/** The set of legal blocked reasons, mirroring {@link TerminalBlockedReason}. */
+const TERMINAL_BLOCKED_REASONS: ReadonlySet<string> = new Set<TerminalBlockedReason>([
+  "completion_permit_mismatch",
+  "gap_unrecoverable",
+  "reserve_exhausted",
+]);
+
+/** Validate an authenticated terminal-journal object into in-memory metadata (shape only; the MAC
+ *  already gated integrity in readAuthed). Binds the embedded `run_id` to the directory and the
+ *  embedded `claim_generation` to the filename, so a copied/misfiled journal is skipped. Returns
+ *  null on any mismatch. */
+function coerceTerminal(obj: Record<string, unknown>, runId: string, fileGen: number): TerminalMeta | null {
+  if (obj.version !== 1) return null;
+  if (obj.run_id !== runId) return null;
+  if (typeof obj.claim_generation !== "number" || obj.claim_generation !== fileGen) return null;
+  if (typeof obj.phase_at_journal !== "string") return null;
+  if (typeof obj.since !== "number") return null;
+  const blocked = obj.blocked === true;
+  let blockedReason: TerminalBlockedReason | undefined;
+  if (blocked && typeof obj.blocked_reason === "string" && TERMINAL_BLOCKED_REASONS.has(obj.blocked_reason)) {
+    blockedReason = obj.blocked_reason as TerminalBlockedReason;
+  }
+  return {
+    claimGeneration: obj.claim_generation,
+    phaseAtJournal: obj.phase_at_journal,
+    since: obj.since,
+    blocked,
+    ...(blockedReason !== undefined ? { blockedReason } : {}),
+  };
+}
+
+/** Validate an authenticated terminal-journal object into the FULL send-path payload (body + fence +
+ *  phase + blocked state; the MAC already gated integrity in readAuthed). Binds the embedded `run_id`
+ *  to the directory and the embedded `claim_generation` to the filename, so a copied/misfiled journal
+ *  is rejected. Returns null on any mismatch — a bad record proves nothing and is never sent. */
+function coerceTerminalRecord(
+  obj: Record<string, unknown>,
+  runId: string,
+  fileGen: number,
+): PendingTerminalJournal | null {
+  if (obj.version !== 1) return null;
+  if (obj.run_id !== runId) return null;
+  if (typeof obj.claim_generation !== "number" || obj.claim_generation !== fileGen) return null;
+  if (typeof obj.phase_at_journal !== "string") return null;
+  if (typeof obj.messages_through_seq !== "number") return null;
+  if (typeof obj.body !== "object" || obj.body === null || Array.isArray(obj.body)) return null;
+  const blocked = obj.blocked === true;
+  let blockedReason: TerminalBlockedReason | undefined;
+  if (blocked && typeof obj.blocked_reason === "string" && TERMINAL_BLOCKED_REASONS.has(obj.blocked_reason)) {
+    blockedReason = obj.blocked_reason as TerminalBlockedReason;
+  }
+  return {
+    body: obj.body as Record<string, unknown>,
+    messagesThroughSeq: obj.messages_through_seq,
+    phase: obj.phase_at_journal,
+    blocked,
+    ...(blockedReason !== undefined ? { blockedReason } : {}),
+  };
+}
+
+/** The run's oldest blocked terminal reason (lowest claim generation among blocked journals), or
+ *  undefined when none is blocked. */
+function oldestBlockedReason(rs: RunState): TerminalBlockedReason | undefined {
+  let best: TerminalMeta | undefined;
+  for (const t of rs.terminals.values()) {
+    if (!t.blocked || t.blockedReason === undefined) continue;
+    if (!best || t.claimGeneration < best.claimGeneration) best = t;
+  }
+  return best?.blockedReason;
+}
+
+// ── terminal canonicaliser (Run B / M3, D-A1 / D2) ────────────────────────────────
+
+/** Fields the canonicaliser must NEVER touch: the run's identity, the fence, the branch/head/MR
+ *  coordinates the forge needs verbatim, the completion-permit fields, and the failure class. An
+ *  over-cap value here is impossible in practice (they are short scalars) and dropping one would
+ *  corrupt the outcome, so they pass through unconditionally. */
+const TERMINAL_NEVER_TOUCH: ReadonlySet<string> = new Set([
+  "status",
+  "claim_generation",
+  "messages_through_seq",
+  "branch",
+  "head",
+  "mr_iid",
+  "mr_web_url",
+  "permit",
+  "completion_permit",
+  "fail_origin",
+]);
+
+/** The visible marker appended where {@link canonicalizeTerminalBody} truncates the preserved patch.
+ *  On its own line so it can never merge into a surviving diff line, and self-identifying so a human
+ *  landing the patch sees exactly why it is short. */
+const PATCH_TRUNCATION_MARKER = "\n…[uzi: preserved_patch truncated to fit the terminal-journal cap]…\n";
+
+/** The JSON-serialised byte size of a value (the cap is on the on-the-wire size, not the raw string
+ *  length, so quotes and escapes count). */
+function serializedBytes(value: unknown): number {
+  return Buffer.byteLength(JSON.stringify(value) ?? "null", "utf8");
+}
+
+/**
+ * Canonicalise a run-lane TERMINAL report body so the FIRST send and the write-ahead journal are
+ * byte-identical, and so the outbox size stays bounded without ever byte-cutting a credential prefix
+ * past the api's scrubber (D2 / D-A1). Pure and deterministic: same input ⇒ deep-equal output ⇒
+ * identical `JSON.stringify`. M3b calls it once and both sends AND journals the returned object.
+ *
+ * Per optional field, keyed on a per-field serialised cap of `maxBytes`:
+ *   - `preserved_patch` — the only field TRUNCATED (rune-safe, at a line boundary, with a visible
+ *     marker), because it is a human-landing diff, not forge-published. Line-boundary truncation is
+ *     what makes a secret straddling the cap WHOLLY kept or WHOLLY cut (a token never spans a
+ *     newline), never split into an unrecognisable prefix the scrubber no longer matches.
+ *   - `proposal` — the forge-published optional: DROPPED WHOLE when over cap (cutting it could leave
+ *     a partial credential in an issue the api files).
+ *   - `milestones_completed` / `milestones_in_progress` — per-ENTRY drop of any over-cap string.
+ *   - every other optional string — DROPPED WHOLE when over cap (the same "drop, not cut" rule).
+ *   - {@link TERMINAL_NEVER_TOUCH} fields and every non-string/structured field — passed through
+ *     untouched.
+ *
+ * Exported so M3b's send path runs the identical transform before journalling and before the send.
+ */
+export function canonicalizeTerminalBody(
+  body: Record<string, unknown>,
+  maxBytes: number,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(body)) {
+    if (v === undefined) continue; // an absent optional stays absent (stable serialization)
+    if (TERMINAL_NEVER_TOUCH.has(k)) {
+      out[k] = v;
+      continue;
+    }
+    if (k === "preserved_patch" && typeof v === "string") {
+      out[k] = serializedBytes(v) > maxBytes ? truncatePatchRuneSafe(v, maxBytes) : v;
+      continue;
+    }
+    if (k === "proposal") {
+      if (serializedBytes(v) <= maxBytes) out[k] = v; // else drop whole
+      continue;
+    }
+    if ((k === "milestones_completed" || k === "milestones_in_progress") && Array.isArray(v)) {
+      out[k] = v.filter((entry) => serializedBytes(entry) <= maxBytes);
+      continue;
+    }
+    if (typeof v === "string") {
+      if (serializedBytes(v) <= maxBytes) out[k] = v; // else drop whole (never cut a credential)
+      continue;
+    }
+    out[k] = v; // non-string scalar / structured field: untouched
+  }
+  return out;
+}
+
+/** Truncate a preserved patch so its JSON-serialised size fits within `maxBytes`, keeping only WHOLE
+ *  lines (a rune-safe byte cut, then backed up to the last newline) plus a visible marker. Keeping
+ *  whole lines is what guarantees a secret straddling the cut is wholly kept or wholly cut. */
+function truncatePatchRuneSafe(patch: string, maxBytes: number): string {
+  // Start with a budget below the cap for the marker + JSON quoting, then shrink until the
+  // serialised candidate fits. The loop is deterministic, so two invocations agree byte-for-byte.
+  let budget = maxBytes - Buffer.byteLength(PATCH_TRUNCATION_MARKER, "utf8") - 2;
+  for (let guard = 0; guard < 64; guard++) {
+    const prefix = budget > 0 ? lineAlignedRuneSafePrefix(patch, budget) : "";
+    const candidate = prefix + PATCH_TRUNCATION_MARKER;
+    if (budget <= 0 || serializedBytes(candidate) <= maxBytes) return candidate;
+    budget -= 256; // ASCII diffs fit on the first pass; this covers heavy JSON escaping
+  }
+  return PATCH_TRUNCATION_MARKER;
+}
+
+/** The longest prefix of `s` that (a) fits `budgetBytes` UTF-8 bytes without splitting a codepoint
+ *  and (b) ends on a newline (whole lines only). Returns "" when no newline falls within the budget,
+ *  so content that cannot be line-aligned is dropped rather than risk splitting a secret. */
+function lineAlignedRuneSafePrefix(s: string, budgetBytes: number): string {
+  const buf = Buffer.from(s, "utf8");
+  if (buf.length <= budgetBytes) return s;
+  let end = Math.min(budgetBytes, buf.length);
+  // Back up out of the middle of a multi-byte UTF-8 sequence (continuation bytes are 0b10xxxxxx).
+  while (end > 0 && (buf[end]! & 0xc0) === 0x80) end--;
+  // Back up to (and include) the last newline within [0, end).
+  let nl = end;
+  while (nl > 0 && buf[nl - 1] !== 0x0a) nl--;
+  if (nl > 0) return buf.subarray(0, nl).toString("utf8");
+  return "";
 }

@@ -804,6 +804,19 @@ Tracked as GitHub issue vtmocanu/uzi#1390; PRD at `prds/1390-outage-requeue-read
 - A worker that has genuinely died still has its runs re-queued after the stale window, and failed only after a second window. [user, #1390]
 - Each worker reports which runs it is executing and in which phase, visible in `uzi worker list` / `uzi admin workers`. [user, #1390]
 
+## Feature #1393 — A finished run's outcome survives an api outage
+
+Tracked as GitHub issue vtmocanu/uzi#1393; PRD at `prds/1391-worker-outbox-durable-reports.md`.
+
+- A run that finishes while the api is unreachable has its completed/failed outcome recorded durably on its worker before the first send, and that outcome — with its merge request — lands once the api returns and the run's own message backlog has replayed; it is never redone and never falsely marked failed by the outage. (AI-synced 2026-09-17)
+- While a worker still holds an unsent outcome for a run, no second execution of that run ever starts. (AI-synced 2026-09-17)
+- An outcome the api permanently refuses is shown on the run as held on the worker, and is resolved only by the owner explicitly discarding it, never on a timer. (AI-synced 2026-09-17)
+
+## Feature #1293 — Failed-run rate on the dashboard (global and per user)
+
+- The dashboard shows a failed-run percentage: global for admins, per user for everyone, and per user in the admin table. [user 2026-09-12]
+- In the admin per-user table the Failed and Fail rate columns come right after Runs, and Cost sits last before Share. [user 2026-09-12]
+
 ## Startup admin seed
 
 - Seed an admin user from env at startup (`UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME`) so the user survives DB wipes.

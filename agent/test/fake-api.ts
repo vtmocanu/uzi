@@ -89,7 +89,7 @@ export class FakeApi {
   // 404 not-owned, or a transient 5xx.
   private readonly ownershipByRun = new Map<
     string,
-    { httpStatus: number; status?: string }
+    { httpStatus: number; status?: string; generation?: number }
   >();
   // issue #1319: the owner-scoped orphan-classification read. Keyed by OWNER run id (the
   // fake trusts the test for the claimant/authz; the runner's predicate logic is what's under
@@ -258,6 +258,11 @@ export class FakeApi {
    *  markAlreadyTerminal only fires for terminal reports, so it cannot express a
    *  non-terminal report (limit_wait) racing a server-side cancel — which is
    *  precisely the case PRD #35's park has to survive. */
+  /** Refuse every NON-running /state report for this run with a 409 carrying `status:"cancelled"`
+   *  (the run moved on under the worker). The initial `running` report still SUCCEEDS, so the run
+   *  reaches its park path (recovery_wait / limit_wait) where the refusal is the point — and so the
+   *  PRD #1391 Run B M4 phaseClone guard (which stops on a running report refused with a TERMINAL
+   *  status) does not short-circuit before the park path under test. */
   refuseStateWith409(runId: string): void {
     this.refuseAllStates.add(runId);
   }
@@ -297,9 +302,11 @@ export class FakeApi {
   }
 
   /** issue #559 M3: answer the ownership probe for this run with 200 {status}. Use a
-   *  terminal status (completed/failed/cancelled) to drive the skip-path terminal throw. */
-  setOwnershipStatus(runId: string, status: string): void {
-    this.ownershipByRun.set(runId, { httpStatus: 200, status });
+   *  terminal status (completed/failed/cancelled) to drive the skip-path terminal throw.
+   *  PRD #1391 Run B M4: an optional `generation` rides the 200 as `claim_generation`, so a test
+   *  can model the queued-duplicate router seeing a DIFFERENT generation own the run. */
+  setOwnershipStatus(runId: string, status: string, generation?: number): void {
+    this.ownershipByRun.set(runId, { httpStatus: 200, status, generation });
   }
 
   /** issue #559 M3: answer the ownership probe with 404 — the DEFINITIVE not-owned
@@ -547,7 +554,11 @@ export class FakeApi {
       if (!o) return send(res, 200, { status: "running" });
       if (o.httpStatus !== 200)
         return send(res, o.httpStatus, { error: "run not found for this worker" });
-      return send(res, 200, { status: o.status ?? "running" });
+      // PRD #1391 Run B M4: claim_generation is additive on the probe body; include it only when the
+      // test set one, so the default (issue #559) shape stays {status} for unrelated tests.
+      const body: Record<string, unknown> = { status: o.status ?? "running" };
+      if (o.generation !== undefined) body.claim_generation = o.generation;
+      return send(res, 200, body);
     }
 
     // issue #1319: the owner-scoped orphan-classification read. The `owner` query param is
@@ -648,7 +659,13 @@ export class FakeApi {
       return;
     }
     const body = json as unknown as StateRequest;
-    if (this.refuseAllStates.has(runId)) {
+    // The run moved on under the worker: refuse the PARK report (recovery_wait / limit_wait / a
+    // terminal report) with a 409 carrying the run's real (cancelled) status. The initial `running`
+    // report is left to SUCCEED — modelling the realistic sequence (the run was running, then got
+    // cancelled concurrently, and only the later park report is refused), which is also what keeps
+    // PRD #1391 Run B M4's phaseClone first-running-ack guard from stopping the flight before the
+    // park path this refusal is exercising.
+    if (this.refuseAllStates.has(runId) && body.status !== "running") {
       return send(res, 409, {
         error: "run already terminal",
         run: { id: runId, status: "cancelled" },

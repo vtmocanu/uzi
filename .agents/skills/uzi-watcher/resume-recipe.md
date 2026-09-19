@@ -118,9 +118,9 @@ cd <the repo>                              # your normal checkout; work happens 
    git push -u origin recover/STEM
    gh pr create --base main --title '…(recovered)' --body '…recovered from RUN…'   # --repo defaults to origin
    ```
-10. **Review, land, clean up** — wait for CodeRabbit, triage its findings (see *Reviewing
-    the diff* / *Triaging CodeRabbit findings*), fix the real ones, admin-merge, watch
-    post-merge CI (if a sibling PR must land first for migration ordering, merge it, then
+10. **Review, land, clean up** — from here the `uzi-lander` skill lands it: wait for the
+    review bots, triage the findings, fix the real ones, admin-merge, watch post-merge CI
+    (if a sibling PR must land first for migration ordering, merge it, then
     `gh pr update-branch` this one and re-wait). Then, **back in your normal checkout** —
     `cd` out of `DIR` first, since you cannot remove the worktree you are standing in nor
     delete its checked-out branch — `git worktree remove DIR`, `git branch -D recover/STEM`,

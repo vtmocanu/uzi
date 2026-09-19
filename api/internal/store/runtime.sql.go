@@ -12,6 +12,198 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const adminRunOutcomeOrigins = `-- name: AdminRunOutcomeOrigins :many
+SELECT 'lifetime'::text AS window_tag,
+    COALESCE(fail_origin, 'unknown')::text AS origin,
+    count(*)::bigint AS cnt
+FROM runs
+WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected'
+  AND kind NOT IN ('chat', 'judge')
+GROUP BY COALESCE(fail_origin, 'unknown')
+UNION ALL
+SELECT 'last7'::text AS window_tag,
+    COALESCE(fail_origin, 'unknown')::text AS origin,
+    count(*)::bigint AS cnt
+FROM runs
+WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected'
+  AND kind NOT IN ('chat', 'judge')
+  AND created_at >= now() - interval '7 days'
+GROUP BY COALESCE(fail_origin, 'unknown')
+`
+
+type AdminRunOutcomeOriginsRow struct {
+	WindowTag string `json:"window_tag"`
+	Origin    string `json:"origin"`
+	Cnt       int64  `json:"cnt"`
+}
+
+// Factory-wide per-origin failure causes for BOTH windows (PRD #1293 M1).
+func (q *Queries) AdminRunOutcomeOrigins(ctx context.Context) ([]AdminRunOutcomeOriginsRow, error) {
+	rows, err := q.db.Query(ctx, adminRunOutcomeOrigins)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []AdminRunOutcomeOriginsRow{}
+	for rows.Next() {
+		var i AdminRunOutcomeOriginsRow
+		if err := rows.Scan(&i.WindowTag, &i.Origin, &i.Cnt); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const adminRunOutcomeOriginsPerUser = `-- name: AdminRunOutcomeOriginsPerUser :many
+SELECT r.user_id,
+    COALESCE(r.fail_origin, 'unknown')::text AS origin,
+    count(*)::bigint AS cnt
+FROM runs r
+WHERE r.status = 'failed' AND r.fail_origin IS DISTINCT FROM 'plan_rejected'
+  AND r.kind NOT IN ('chat', 'judge')
+GROUP BY r.user_id, COALESCE(r.fail_origin, 'unknown')
+`
+
+type AdminRunOutcomeOriginsPerUserRow struct {
+	UserID uuid.UUID `json:"user_id"`
+	Origin string    `json:"origin"`
+	Cnt    int64     `json:"cnt"`
+}
+
+// Per-user LIFETIME per-origin failure causes (PRD #1293 M1), grouped by user_id so the
+// handler can attach each user's causes by id. Lifetime-only, matching
+// AdminRunOutcomesPerUser.
+func (q *Queries) AdminRunOutcomeOriginsPerUser(ctx context.Context) ([]AdminRunOutcomeOriginsPerUserRow, error) {
+	rows, err := q.db.Query(ctx, adminRunOutcomeOriginsPerUser)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []AdminRunOutcomeOriginsPerUserRow{}
+	for rows.Next() {
+		var i AdminRunOutcomeOriginsPerUserRow
+		if err := rows.Scan(&i.UserID, &i.Origin, &i.Cnt); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const adminRunOutcomes = `-- name: AdminRunOutcomes :one
+SELECT
+    count(*)::bigint                                                                       AS lifetime_finished,
+    count(*) FILTER (WHERE status = 'completed')::bigint                                   AS lifetime_completed,
+    count(*) FILTER (WHERE status = 'cancelled')::bigint                                   AS lifetime_cancelled,
+    count(*) FILTER (WHERE status = 'failed' AND fail_origin = 'plan_rejected')::bigint    AS lifetime_plan_rejected,
+    count(*) FILTER (WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected')::bigint AS lifetime_failed,
+    count(*) FILTER (WHERE created_at >= now() - interval '7 days')::bigint                AS last7_finished,
+    count(*) FILTER (WHERE status = 'completed' AND created_at >= now() - interval '7 days')::bigint AS last7_completed,
+    count(*) FILTER (WHERE status = 'cancelled' AND created_at >= now() - interval '7 days')::bigint AS last7_cancelled,
+    count(*) FILTER (WHERE status = 'failed' AND fail_origin = 'plan_rejected' AND created_at >= now() - interval '7 days')::bigint AS last7_plan_rejected,
+    count(*) FILTER (WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected' AND created_at >= now() - interval '7 days')::bigint AS last7_failed
+FROM runs
+WHERE status IN ('completed', 'failed', 'cancelled')
+  AND kind NOT IN ('chat', 'judge')
+`
+
+type AdminRunOutcomesRow struct {
+	LifetimeFinished     int64 `json:"lifetime_finished"`
+	LifetimeCompleted    int64 `json:"lifetime_completed"`
+	LifetimeCancelled    int64 `json:"lifetime_cancelled"`
+	LifetimePlanRejected int64 `json:"lifetime_plan_rejected"`
+	LifetimeFailed       int64 `json:"lifetime_failed"`
+	Last7Finished        int64 `json:"last7_finished"`
+	Last7Completed       int64 `json:"last7_completed"`
+	Last7Cancelled       int64 `json:"last7_cancelled"`
+	Last7PlanRejected    int64 `json:"last7_plan_rejected"`
+	Last7Failed          int64 `json:"last7_failed"`
+}
+
+// Factory-wide run outcome counts for BOTH windows (PRD #1293 M1); same shape as
+// SelfRunOutcomes without the user filter.
+func (q *Queries) AdminRunOutcomes(ctx context.Context) (AdminRunOutcomesRow, error) {
+	row := q.db.QueryRow(ctx, adminRunOutcomes)
+	var i AdminRunOutcomesRow
+	err := row.Scan(
+		&i.LifetimeFinished,
+		&i.LifetimeCompleted,
+		&i.LifetimeCancelled,
+		&i.LifetimePlanRejected,
+		&i.LifetimeFailed,
+		&i.Last7Finished,
+		&i.Last7Completed,
+		&i.Last7Cancelled,
+		&i.Last7PlanRejected,
+		&i.Last7Failed,
+	)
+	return i, err
+}
+
+const adminRunOutcomesPerUser = `-- name: AdminRunOutcomesPerUser :many
+SELECT u.id AS user_id, u.email,
+    count(*)::bigint                                                                       AS finished,
+    count(*) FILTER (WHERE r.status = 'completed')::bigint                                 AS completed,
+    count(*) FILTER (WHERE r.status = 'cancelled')::bigint                                 AS cancelled,
+    count(*) FILTER (WHERE r.status = 'failed' AND r.fail_origin = 'plan_rejected')::bigint AS plan_rejected,
+    count(*) FILTER (WHERE r.status = 'failed' AND r.fail_origin IS DISTINCT FROM 'plan_rejected')::bigint AS failed
+FROM runs r
+JOIN users u ON u.id = r.user_id
+WHERE r.status IN ('completed', 'failed', 'cancelled')
+  AND r.kind NOT IN ('chat', 'judge')
+GROUP BY u.id, u.email
+ORDER BY u.id
+`
+
+type AdminRunOutcomesPerUserRow struct {
+	UserID       uuid.UUID `json:"user_id"`
+	Email        string    `json:"email"`
+	Finished     int64     `json:"finished"`
+	Completed    int64     `json:"completed"`
+	Cancelled    int64     `json:"cancelled"`
+	PlanRejected int64     `json:"plan_rejected"`
+	Failed       int64     `json:"failed"`
+}
+
+// Per-user LIFETIME outcome counts for the admin factory breakdown (PRD #1293 M1, D5).
+// Joins users so an outcome-only user (every run died before spending, so no usage row)
+// still has an email to render; the handler merges this by user id against the usage
+// rows. Lifetime-only, matching the admin per-user table's lifetime figures.
+func (q *Queries) AdminRunOutcomesPerUser(ctx context.Context) ([]AdminRunOutcomesPerUserRow, error) {
+	rows, err := q.db.Query(ctx, adminRunOutcomesPerUser)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []AdminRunOutcomesPerUserRow{}
+	for rows.Next() {
+		var i AdminRunOutcomesPerUserRow
+		if err := rows.Scan(
+			&i.UserID,
+			&i.Email,
+			&i.Finished,
+			&i.Completed,
+			&i.Cancelled,
+			&i.PlanRejected,
+			&i.Failed,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const adminUsagePerUser = `-- name: AdminUsagePerUser :many
 SELECT u.id AS user_id, u.email,
     COALESCE(SUM(t.input_tokens), 0)::bigint          AS input_tokens,
@@ -311,6 +503,53 @@ type CancelRunServerSideParams struct {
 // status='cancelled' branch already treats this run as a deliberate stop.
 func (q *Queries) CancelRunServerSide(ctx context.Context, arg CancelRunServerSideParams) (int64, error) {
 	result, err := q.db.Exec(ctx, cancelRunServerSide, arg.StopReason, arg.ID, arg.UserID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const cancelRunServerSideWithPendingOutcome = `-- name: CancelRunServerSideWithPendingOutcome :execrows
+UPDATE runs SET status = 'cancelled', status_since = now(), stop_kind = 'cancelled', move_pending_since = now(), finished_at = now(),
+    stop_reason = $1,
+    milestones_in_progress = NULL,
+    milestones_agents = NULL,
+    pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
+    credential_switch_requested_at = NULL, credential_switch_generation = NULL,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE runs.id = $2 AND runs.user_id = $3
+  AND runs.status NOT IN ('completed', 'failed', 'cancelled')
+  AND runs.kind <> 'chat'
+  AND (EXISTS (SELECT 1 FROM worker_active_runs a
+               WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                 AND a.terminal_pending_until > now()
+                 AND a.claim_generation = runs.claim_generation)
+       OR EXISTS (SELECT 1 FROM workers w
+                  WHERE w.id = runs.worker_id AND w.pending_overflow_until > now()))
+`
+
+type CancelRunServerSideWithPendingOutcomeParams struct {
+	StopReason pgtype.Text `json:"stop_reason"`
+	ID         uuid.UUID   `json:"id"`
+	UserID     uuid.UUID   `json:"user_id"`
+}
+
+// PRD #1391 Run B M3d (D13): the atomic owner-scoped cancel of a run whose executor journaled a
+// terminal (esp. blocked) outcome on its worker, when the owner explicitly discards it. This is
+// the resolution for a pending outcome the api permanently refuses — a silent unconditional
+// CancelRunServerSide would trade a visible stall for a lost outcome, so this variant carries the
+// SAME pending-outcome predicate the confirmation gate enforced (RunHasPendingOutcomeLease's
+// positive form) INSIDE the UPDATE: a Go-side check followed by the plain CancelRunServerSide
+// would race a lease clear or a re-claim and cancel a fresh generation on stale evidence. The
+// UPDATE is one row-locking statement (it re-evaluates the predicate against the latest committed
+// run row under READ COMMITTED / EvalPlanQual), so a replayed SetState and this cancel resolve on
+// the run's row lock, not on stale reads: if the replayed SetState commits `completed`/`failed`
+// first, this matches 0 rows (status NOT IN protects it); if this wins, the replay's no-op 409
+// returns `cancelled`, the journal retires and completion side effects never fire. Field-for-field
+// identical to CancelRunServerSide's terminal cleanup; only the WHERE differs.
+func (q *Queries) CancelRunServerSideWithPendingOutcome(ctx context.Context, arg CancelRunServerSideWithPendingOutcomeParams) (int64, error) {
+	result, err := q.db.Exec(ctx, cancelRunServerSideWithPendingOutcome, arg.StopReason, arg.ID, arg.UserID)
 	if err != nil {
 		return 0, err
 	}
@@ -1388,6 +1627,29 @@ func (q *Queries) CountRunInitFramesBefore(ctx context.Context, arg CountRunInit
 	var count int64
 	err := row.Scan(&count)
 	return count, err
+}
+
+const countRunMessagesThrough = `-- name: CountRunMessagesThrough :one
+SELECT count(seq)::int FROM run_messages WHERE run_id = $1 AND seq BETWEEN 1 AND $2::int
+`
+
+type CountRunMessagesThroughParams struct {
+	RunID   uuid.UUID `json:"run_id"`
+	Through int32     `json:"through"`
+}
+
+// The terminal fence's contiguity probe (PRD #1391 Run B M3c, D3): how many DISTINCT stored
+// message seqs fall in [1..through] for this run. Backed by the run_messages UNIQUE (run_id, seq)
+// index, so the count is an index-only range scan. A fully-contiguous run has count == through; a
+// run with any hole in [1..through] has count < through, which is exactly what SetState refuses a
+// terminal transition on (ErrMessagesPending) — the high-water last_seq alone cannot see a hole
+// BELOW it, so the terminal fence needs this count, not just runs.last_seq. Modeled on
+// MaxRunMessageSeq; ::int keeps the return an int32.
+func (q *Queries) CountRunMessagesThrough(ctx context.Context, arg CountRunMessagesThroughParams) (int32, error) {
+	row := q.db.QueryRow(ctx, countRunMessagesThrough, arg.RunID, arg.Through)
+	var column_1 int32
+	err := row.Scan(&column_1)
+	return column_1, err
 }
 
 const countRunReviseInputs = `-- name: CountRunReviseInputs :one
@@ -8703,6 +8965,38 @@ func (q *Queries) ResumePausedRun(ctx context.Context, arg ResumePausedRunParams
 	return i, err
 }
 
+const runHasPendingOutcomeLease = `-- name: RunHasPendingOutcomeLease :one
+SELECT EXISTS (
+    SELECT 1 FROM runs
+    WHERE runs.id = $1
+      AND runs.kind <> 'chat'
+      AND (EXISTS (SELECT 1 FROM worker_active_runs a
+                   WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                     AND a.terminal_pending_until > now()
+                     AND a.claim_generation = runs.claim_generation)
+           OR EXISTS (SELECT 1 FROM workers w
+                      WHERE w.id = runs.worker_id AND w.pending_overflow_until > now()))
+)
+`
+
+// PRD #1391 Run B M3d (D13): does this run currently have a terminal outcome journaled and
+// leased on its owning worker? This is the POSITIVE form of the D11 claim-exclusion predicate
+// (see SweepClaimedNeverStarted / FailRunAutoStop, whose negative `NOT EXISTS(...) AND NOT
+// EXISTS(...)` PROTECT such a run). True when EITHER the run's owning worker holds an unexpired
+// terminal_pending lease for it at the run's EXACT current claim_generation (the executor
+// journaled a terminal outcome and is gone), OR the owning worker is under an unexpired
+// pending_overflow (M4's rotation left this run unlisted, but the worker-level closure stands in
+// for the missing row-level lease). Chat is excluded (D6/D10): chat has no claim generation and
+// never journals a terminal outcome, so it is never pending. Reused by hasLivePoller (a run this
+// returns true for has no live poller for ITSELF — its executor no longer exists) and by the
+// owner cancel's confirmation gate + atomic no-live-poller branch.
+func (q *Queries) RunHasPendingOutcomeLease(ctx context.Context, id uuid.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, runHasPendingOutcomeLease, id)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
 const runHasVerdictSinceGateOpened = `-- name: RunHasVerdictSinceGateOpened :one
 SELECT (EXISTS (
     SELECT 1 FROM run_user_inputs
@@ -8808,6 +9102,104 @@ func (q *Queries) RunHasVerdictSinceGateOpened(ctx context.Context, arg RunHasVe
 	return has_verdict, err
 }
 
+const runMessageGaps = `-- name: RunMessageGaps :many
+WITH authorized AS (
+    SELECT 1 AS ok FROM runs r
+    WHERE r.id = $1
+      AND r.worker_id = $2
+      AND r.claim_released_at IS NULL
+      AND r.claim_generation = $3
+),
+present AS (
+    SELECT m.seq FROM run_messages m
+    CROSS JOIN authorized
+    WHERE m.run_id = $1 AND m.seq BETWEEN 1 AND $4::int AND m.seq >= $5::int
+    UNION ALL
+    SELECT ($4::int) + 1 FROM authorized
+),
+edges AS (
+    SELECT seq AS closer,
+           COALESCE(LAG(seq) OVER (ORDER BY seq), $5::int) AS prev
+    FROM present
+),
+gaps AS (
+    SELECT (prev + 1)::int AS gap_first, (closer - 1)::int AS gap_last, closer::int AS next_cursor
+    FROM edges
+    WHERE closer - prev > 1 AND closer > $5::int
+    ORDER BY closer ASC
+    LIMIT $6::int
+)
+SELECT gaps.gap_first, gaps.gap_last, gaps.next_cursor
+FROM authorized
+LEFT JOIN gaps ON true
+ORDER BY gaps.next_cursor ASC NULLS LAST
+`
+
+type RunMessageGapsParams struct {
+	RunID           uuid.UUID   `json:"run_id"`
+	WorkerID        pgtype.UUID `json:"worker_id"`
+	ClaimGeneration int64       `json:"claim_generation"`
+	Through         int32       `json:"through"`
+	Cursor          int32       `json:"cursor"`
+	Lim             int32       `json:"lim"`
+}
+
+type RunMessageGapsRow struct {
+	GapFirst   pgtype.Int4 `json:"gap_first"`
+	GapLast    pgtype.Int4 `json:"gap_last"`
+	NextCursor pgtype.Int4 `json:"next_cursor"`
+}
+
+// The hardened message-gaps read (PRD #1391 Run B M3c): the MISSING seq ranges in [1..through]
+// as bounded {first,last} pairs, after a keyset @cursor, ordered by seq, at most @lim of them.
+// Authorization is part of THIS statement and snapshot: the run must belong to @worker_id at its
+// current unreleased @claim_generation. A preliminary ownership query would leave a TOCTOU window
+// where a same-worker reclaim increments the generation before this query reads the newer flight's
+// gaps. `authorized` is empty for any stale/foreign/released claim, so the statement returns ZERO
+// rows. For an authorized run with no gaps, the final LEFT JOIN returns one all-NULL sentinel row;
+// the service uses that distinction to return an empty page rather than ErrRunNotOwned.
+//
+// KEYSET pagination only — NO OFFSET, NO generate_series, NO materialisation of `through` rows:
+// the gaps are derived from the PRESENT rows via LAG over the (run_id, seq) index, so the scan is
+// bounded by what is stored (at most the run's message count), never by the size of `through`.
+//
+// Each interior/leading gap is CLOSED by the present row immediately after it: for a present
+// `seq` whose predecessor (LAG) is `prev`, the hole [prev+1, seq-1] exists iff seq - prev > 1.
+// The TRAILING gap (max present seq .. through) has no closing present row, so a sentinel row at
+// through+1 is UNION-ed in to close it exactly like every interior gap. The keyset is the CLOSER
+// (the right-neighbor seq): a gap is emitted only when its closer > @cursor, and next_cursor is
+// that closer, so the next page continues strictly after the last one with no overlap and no gap
+// re-emitted. The present set is bounded below by @cursor (seq >= @cursor) so a large cursor scans
+// only the index tail; @cursor doubles as the LAG seed so the first closer after the cursor gets
+// the correct predecessor. @cursor = 0 (the first page) admits every gap, including the leading
+// one [1, min_present-1]. The trailing gap is uniquely the one whose `last` == through.
+func (q *Queries) RunMessageGaps(ctx context.Context, arg RunMessageGapsParams) ([]RunMessageGapsRow, error) {
+	rows, err := q.db.Query(ctx, runMessageGaps,
+		arg.RunID,
+		arg.WorkerID,
+		arg.ClaimGeneration,
+		arg.Through,
+		arg.Cursor,
+		arg.Lim,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []RunMessageGapsRow{}
+	for rows.Next() {
+		var i RunMessageGapsRow
+		if err := rows.Scan(&i.GapFirst, &i.GapLast, &i.NextCursor); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const runPriorityClass = `-- name: RunPriorityClass :one
 SELECT fn_run_priority_class($1::text, $2::smallint, $3::boolean)
 `
@@ -8853,6 +9245,129 @@ func (q *Queries) RunPriorityClassForRun(ctx context.Context, arg RunPriorityCla
 	var fn_run_priority_class string
 	err := row.Scan(&fn_run_priority_class)
 	return fn_run_priority_class, err
+}
+
+const selfRunOutcomeOrigins = `-- name: SelfRunOutcomeOrigins :many
+
+SELECT 'lifetime'::text AS window_tag,
+    COALESCE(r.fail_origin, 'unknown')::text AS origin,
+    count(*)::bigint AS cnt
+FROM runs r
+WHERE r.user_id = $1
+  AND r.status = 'failed' AND r.fail_origin IS DISTINCT FROM 'plan_rejected'
+  AND r.kind NOT IN ('chat', 'judge')
+GROUP BY COALESCE(r.fail_origin, 'unknown')
+UNION ALL
+SELECT 'last7'::text AS window_tag,
+    COALESCE(r.fail_origin, 'unknown')::text AS origin,
+    count(*)::bigint AS cnt
+FROM runs r
+WHERE r.user_id = $1
+  AND r.status = 'failed' AND r.fail_origin IS DISTINCT FROM 'plan_rejected'
+  AND r.kind NOT IN ('chat', 'judge')
+  AND r.created_at >= now() - interval '7 days'
+GROUP BY COALESCE(r.fail_origin, 'unknown')
+`
+
+type SelfRunOutcomeOriginsRow struct {
+	WindowTag string `json:"window_tag"`
+	Origin    string `json:"origin"`
+	Cnt       int64  `json:"cnt"`
+}
+
+// Per-origin failure causes (PRD #1293 M1). One :many per scope over the `failed` rows
+// only (status='failed' AND fail_origin IS DISTINCT FROM 'plan_rejected'), grouped by
+// COALESCE(fail_origin,'unknown') so a pre-00126 NULL-origin failure buckets as
+// 'unknown'. Folded into RunOutcomesDTO.fail_origins in Go — the default, because
+// runtime.sql has no precedent for returning a jsonb aggregate to Go (jsonb reaches Go
+// only as a plain []byte table column). window_tag distinguishes the two windows
+// ('lifetime' / 'last7') via a UNION ALL of two grouped selects; sum over a window's
+// rows equals that window's `failed` count.
+// The requesting user's per-origin failure causes for BOTH windows (PRD #1293 M1).
+// The `runs r` alias qualifies user_id so the @user_id param types unambiguously across
+// the UNION ALL branches (an unqualified user_id trips sqlc's cross-branch resolution).
+func (q *Queries) SelfRunOutcomeOrigins(ctx context.Context, userID uuid.UUID) ([]SelfRunOutcomeOriginsRow, error) {
+	rows, err := q.db.Query(ctx, selfRunOutcomeOrigins, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []SelfRunOutcomeOriginsRow{}
+	for rows.Next() {
+		var i SelfRunOutcomeOriginsRow
+		if err := rows.Scan(&i.WindowTag, &i.Origin, &i.Cnt); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const selfRunOutcomes = `-- name: SelfRunOutcomes :one
+
+SELECT
+    count(*)::bigint                                                                       AS lifetime_finished,
+    count(*) FILTER (WHERE status = 'completed')::bigint                                   AS lifetime_completed,
+    count(*) FILTER (WHERE status = 'cancelled')::bigint                                   AS lifetime_cancelled,
+    count(*) FILTER (WHERE status = 'failed' AND fail_origin = 'plan_rejected')::bigint    AS lifetime_plan_rejected,
+    count(*) FILTER (WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected')::bigint AS lifetime_failed,
+    count(*) FILTER (WHERE created_at >= now() - interval '7 days')::bigint                AS last7_finished,
+    count(*) FILTER (WHERE status = 'completed' AND created_at >= now() - interval '7 days')::bigint AS last7_completed,
+    count(*) FILTER (WHERE status = 'cancelled' AND created_at >= now() - interval '7 days')::bigint AS last7_cancelled,
+    count(*) FILTER (WHERE status = 'failed' AND fail_origin = 'plan_rejected' AND created_at >= now() - interval '7 days')::bigint AS last7_plan_rejected,
+    count(*) FILTER (WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected' AND created_at >= now() - interval '7 days')::bigint AS last7_failed
+FROM runs
+WHERE user_id = $1
+  AND status IN ('completed', 'failed', 'cancelled')
+  AND kind NOT IN ('chat', 'judge')
+`
+
+type SelfRunOutcomesRow struct {
+	LifetimeFinished     int64 `json:"lifetime_finished"`
+	LifetimeCompleted    int64 `json:"lifetime_completed"`
+	LifetimeCancelled    int64 `json:"lifetime_cancelled"`
+	LifetimePlanRejected int64 `json:"lifetime_plan_rejected"`
+	LifetimeFailed       int64 `json:"lifetime_failed"`
+	Last7Finished        int64 `json:"last7_finished"`
+	Last7Completed       int64 `json:"last7_completed"`
+	Last7Cancelled       int64 `json:"last7_cancelled"`
+	Last7PlanRejected    int64 `json:"last7_plan_rejected"`
+	Last7Failed          int64 `json:"last7_failed"`
+}
+
+// Failed-run rate outcome aggregates (PRD #1293 M1) -------------------------
+// These count over `runs` DIRECTLY, NOT run_usage_totals (D1): a run that fails at
+// provisioning / credential lookup / guardrail has no usage row, so a rate computed
+// over the usage join would systematically hide the infra failures this number exists
+// to surface. The predicate matches what the Runs page lists: terminal runs only
+// (status IN ('completed','failed','cancelled')) and kind NOT IN ('chat','judge') (D2 —
+// a chat/judge failure is not a factory failure). Windowed on created_at (D3), the same
+// axis as the usage 7-day figures, so the two 7-day numbers on one card describe the
+// same set of runs. plan_rejected is split out of failed (D4): rejecting a plan is the
+// owner's decision, kept in the denominator and its own bar segment but out of the
+// numerator. Every computed column carries an explicit ::bigint cast (the file's
+// convention). Invariants the handler/live-DB tests assert:
+// finished == completed + cancelled + plan_rejected + failed.
+// The requesting user's own run outcome counts for BOTH windows (PRD #1293 M1).
+func (q *Queries) SelfRunOutcomes(ctx context.Context, userID uuid.UUID) (SelfRunOutcomesRow, error) {
+	row := q.db.QueryRow(ctx, selfRunOutcomes, userID)
+	var i SelfRunOutcomesRow
+	err := row.Scan(
+		&i.LifetimeFinished,
+		&i.LifetimeCompleted,
+		&i.LifetimeCancelled,
+		&i.LifetimePlanRejected,
+		&i.LifetimeFailed,
+		&i.Last7Finished,
+		&i.Last7Completed,
+		&i.Last7Cancelled,
+		&i.Last7PlanRejected,
+		&i.Last7Failed,
+	)
+	return i, err
 }
 
 const selfUsage = `-- name: SelfUsage :one

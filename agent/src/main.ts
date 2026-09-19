@@ -12,7 +12,7 @@ import { ChatExecutor, type ChatExecutorLike } from "./chat-executor.js";
 import { StubChatExecutor } from "./chat-executor-stub.js";
 import { RunRunner, type ExecutorFactory, type RunExecution } from "./runner.js";
 import { ChatRunner } from "./chat-runner.js";
-import { Outbox } from "./outbox.js";
+import { Outbox, deriveTerminalReserveBytes } from "./outbox.js";
 import { ActiveRunRegistry } from "./active-run-registry.js";
 import { JudgeRunner } from "./judge-runner.js";
 import { ReviewRunner } from "./review-runner.js";
@@ -236,6 +236,10 @@ async function main(): Promise<void> {
     runMaxBytes: config.outboxRunMaxBytes,
     maxBytes: config.outboxMaxBytes,
     retentionMs: config.outboxRetentionMs,
+    // PRD #1391 M3 (Run B, D2): size the physical `.reserve` for the terminal journals, derived from
+    // ONE source — the per-record cap times how many hard-max journals must survive a full volume,
+    // plus a per-record overhead. init() grows a deployed Run A worker's 64 KiB reserve up to this.
+    reserveBytes: deriveTerminalReserveBytes(config.outboxReserveTerminals, config.outboxTerminalMaxBytes),
   });
   await outbox.init();
   const rearm = new Map<string, () => void>();
@@ -243,7 +247,15 @@ async function main(): Promise<void> {
   // as they start/transition/finish, and the worker reads to build the ActiveSnapshot that
   // rides every heartbeat and run-lane claim. ONE instance so the snapshot epoch is a single
   // process-monotonic counter across the heartbeat and claim loops.
-  const activeRuns = new ActiveRunRegistry();
+  // PRD #1391 Run B M4: thread the outbox pending-terminal lister + the register-returned server cap
+  // into the registry (function seams, so the registry stays decoupled from Outbox/WorkerClient).
+  // The cap getter reads the client field the register response populated, so it is correct on every
+  // build after register; before register it reads undefined (cap 0), which only matters if a build
+  // ran that early (it does not — snapshots build after register).
+  const activeRuns = new ActiveRunRegistry(
+    () => outbox.listPendingTerminals(),
+    () => client.workerOutboxMaxPending,
+  );
   // Pin the SDK's HOME (session transcripts under $HOME/.claude/projects) onto
   // the persistent data volume so `docker compose down && up` doesn't wipe
   // sessions and resume still works.
@@ -288,6 +300,9 @@ async function main(): Promise<void> {
     rearm,
     transientTripMs: config.transientTripMs,
     outboxSpillBufferBytes: config.outboxSpillBufferBytes,
+    // PRD #1391 Run B M3: the terminal-journal send-path knobs (canonicaliser cap + gap-fill bound).
+    outboxTerminalMaxBytes: config.outboxTerminalMaxBytes,
+    gapFillMax: config.gapFillMax,
     // PRD #1390 M2a: the shared active-run registry the worker reads to build snapshots.
     activeRuns,
   });
@@ -376,6 +391,10 @@ async function main(): Promise<void> {
     // PRD #1390 M2a: a judge attempt holds a run slot, so it is listed in the snapshot.
     activeRuns,
     codexAdviceHarnessFactory,
+    // PRD #1391 Run B M3b (D6): journal the judge's terminal STATE write-ahead (never the verdict).
+    outbox,
+    outboxTerminalMaxBytes: config.outboxTerminalMaxBytes,
+    gapFillMax: config.gapFillMax,
     ...(config.executor === "stub" ? { queryFn: stubJudgeQueryFn } : {}),
   });
 
@@ -390,6 +409,10 @@ async function main(): Promise<void> {
     // PRD #1390 M2a: a review attempt holds a run slot, so it is listed in the snapshot.
     activeRuns,
     codexAdviceHarnessFactory,
+    // PRD #1391 Run B M3b (D6): journal the review's terminal STATE write-ahead (never the review POST).
+    outbox,
+    outboxTerminalMaxBytes: config.outboxTerminalMaxBytes,
+    gapFillMax: config.gapFillMax,
     ...(config.executor === "stub" ? { queryFn: stubJudgeQueryFn } : {}),
   });
 

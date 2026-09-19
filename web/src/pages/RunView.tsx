@@ -6,12 +6,13 @@
 // states get a hero banner: the MR link is the run's entire output and must
 // not hide in chrome. The breadcrumb keeps PRD #12's in-app board / issue links.
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import {
   api,
   ApiError,
   isHttpsUrl,
+  isOutcomePendingConfirmation,
   preferForgeUrl,
   isTerminalRun,
   type Repo,
@@ -72,6 +73,7 @@ import { QuestionPanel, UnreadableQuestion } from "../components/QuestionPanel";
 import { deriveOpenQuestion } from "../lib/runQuestion";
 import { Markdown } from "../components/Markdown";
 import { Alert, Badge, Button, Card, PageHeader, Spinner, StatusPill, cx, type BadgeTone } from "../components/ui";
+import { Modal } from "../components/Modal";
 import { summaryCollapse } from "../lib/prefs";
 import { ExternalLinkIcon } from "../components/icons";
 import { PlanPanel, SeededPlanPanel } from "./runView/PlanPanel";
@@ -88,7 +90,7 @@ export { JudgePanel, JUDGE_POLL_MAX_TRIES, TriageSummary } from "./runView/Judge
 
 // PRD #1227 M4: the owner completion-decision surface, an exported component re-exported here
 // (mirroring CompletionStatePanel's exported shape) so its tests can import it from ./RunView.
-export { CompletionDecisionPanel, milestoneCriterionId } from "./runView/CompletionDecisionPanel";
+export { CompletionDecisionPanel } from "./runView/CompletionDecisionPanel";
 
 // stageForMessages: latest-message → human stage label (a tool-slug → stage
 // map, adapted to uzi's message kinds).
@@ -106,7 +108,7 @@ const TOOL_STAGE: Record<string, string> = {
   Task: "Delegating to a subagent",
 };
 
-export function stageForMessages(messages: RunMessage[]): string {
+function stageForMessages(messages: RunMessage[]): string {
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
     if (m.kind === "tool_result") return "Working";
@@ -1322,10 +1324,9 @@ export function MrReworkPanel({
  * inline note on the panel, distinct from the page-level actionErr banner: a token
  * pooled — or the run resumed elsewhere — between render and click is not a failure.
  *
- * Exported like LimitWaitPanel so the copy and the resume/409 handling are reachable
- * without mounting the whole page.
+ * Kept as a named component so its pool-specific behavior stays isolated from RunView.
  */
-export function PoolWaitPanel({
+function PoolWaitPanel({
   run,
   canSteer = true,
   onResumed,
@@ -1500,8 +1501,27 @@ export function RecoveryWaitPanel({ run }: { run: Run }) {
   );
 }
 
+// outcomePendingReasonLabel maps the CLOSED blocked-outcome reason set (PRD #1391 M3, D13)
+// to owner-facing text, in plain terms rather than the wire slug. The api already filters
+// to this set, but an unrecognised value is rendered honestly (as itself) since the api is
+// deployed separately from the web.
+function outcomePendingReasonLabel(reason: string): string {
+  switch (reason) {
+    case "completion_permit_mismatch":
+      return "the run's completion could not be confirmed";
+    case "gap_unrecoverable":
+      return "some of the run's updates can't be recovered";
+    case "reserve_exhausted":
+      return "the worker ran out of room to hold the outcome";
+    default:
+      return reason;
+  }
+}
+
 export function RunView() {
   const { id = "" } = useParams();
+  const currentRunIdRef = useRef(id);
+  currentRunIdRef.current = id;
   const { run, messages, connected, error, submit, refreshRun, inputs, canSteer } = useRunStream(id);
   const [repoWebUrl, setRepoWebUrl] = useState<string | null>(null);
   const [workers, setWorkers] = useState<Worker[]>([]);
@@ -1562,6 +1582,70 @@ export function RunView() {
       return true;
     } catch (e) {
       setActionErr(errorMessage(e, "Action failed"));
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // PRD #1391 Run B M3d (D13): the CENTRAL cancel path. ALL cancel entry points on this
+  // page route through here so the held-outcome confirmation can never be skipped per-
+  // button. The server refuses a cancel of a run whose worker holds a finished-but-
+  // unlanded outcome with a typed 409 (isOutcomePendingConfirmation) unless the discard
+  // bit is set; on that 409 we open the confirmation modal that NAMES what is lost instead
+  // of surfacing the raw error, and the modal's confirm retries with discardPendingOutcome
+  // true. Bind the confirmation to the run that earned it: React Router reuses this component
+  // when only `:id` changes, and a late response from the old run must never authorize a discard
+  // on the new one. Any other error surfaces on the page banner exactly as today.
+  const [discardConfirmationRunId, setDiscardConfirmationRunId] = useState<string | null>(null);
+  const confirmDiscardOutcome = discardConfirmationRunId === id;
+  // A MODAL-LOCAL error for the discard-confirmation modal. A failure of the confirmed
+  // discard retry must be shown INSIDE the modal: the page-level actionErr <Alert> renders
+  // behind the modal's `fixed inset-0 z-50` overlay, so surfacing it there on a high-stakes
+  // destructive flow leaves the owner looking at an open modal with no feedback. Cleared on a
+  // fresh confirm attempt (below), when the modal closes, and whenever the route changes runs.
+  const [discardOutcomeErr, setDiscardOutcomeErr] = useState("");
+  useEffect(() => {
+    setDiscardConfirmationRunId(null);
+    setDiscardOutcomeErr("");
+  }, [id]);
+  const closeDiscardModal = () => {
+    setDiscardConfirmationRunId(null);
+    setDiscardOutcomeErr("");
+  };
+  const cancelRun = async (discardPendingOutcome = false): Promise<boolean> => {
+    const requestRunId = id;
+    setActionErr("");
+    // A fresh attempt clears the modal-local error so a stale reason never lingers under a retry.
+    setDiscardOutcomeErr("");
+    setBusy(true);
+    try {
+      await submit("cancel", "", undefined, undefined, discardPendingOutcome);
+      if (currentRunIdRef.current === requestRunId) {
+        setDiscardConfirmationRunId(null);
+      }
+      return true;
+    } catch (e) {
+      if (isOutcomePendingConfirmation(e)) {
+        // A finished outcome is held on the worker — do not surface the raw 409; open the
+        // modal that names the loss and offers the discarding retry, but only while this is
+        // still the run whose cancel the server refused.
+        if (currentRunIdRef.current === requestRunId) {
+          setDiscardConfirmationRunId(requestRunId);
+        }
+        return false;
+      }
+      // A non-409 failure of the CONFIRMED discard retry (modal open) is shown inside the
+      // modal — the page-level <Alert> is hidden behind the overlay — and the modal stays open
+      // so the owner can retry or back out. Any other cancel entry point surfaces on the page.
+      // Ignore a late response from a route we no longer render.
+      if (currentRunIdRef.current === requestRunId) {
+        if (discardPendingOutcome) {
+          setDiscardOutcomeErr(errorMessage(e, "Action failed"));
+        } else {
+          setActionErr(errorMessage(e, "Action failed"));
+        }
+      }
       return false;
     } finally {
       setBusy(false);
@@ -2004,6 +2088,38 @@ export function RunView() {
       {error && <Alert message={error} />}
       {actionErr && <Alert message={actionErr} />}
 
+      {/* PRD #1391 Run B M3d (D13): a finished outcome is held on the run's worker because
+          the api could not land it. Surface it near the status so the owner knows why the
+          run has not closed and can resolve it — Stop/cancel takes the discard confirmation
+          path (cancelRun → the modal below). Self-hides when nothing is held. */}
+      {run.outcome_pending && (
+        <div
+          role="status"
+          className="rounded-lg border border-warn/40 bg-warn/10 px-3 py-2.5 text-sm"
+        >
+          <p className="font-medium text-fg">
+            Outcome held on the worker: {outcomePendingReasonLabel(run.outcome_pending.reason)}
+          </p>
+          <p className="mt-1 text-xs text-muted">
+            The run finished on its worker, but that outcome has not reached uzi yet.
+            {/* A terminal run's outcome is already resolved, so the stop-to-discard action no
+                longer applies — drop the now-meaningless sentence rather than dangle it with no
+                button (the resolve button below is gated out for a terminal run too). */}
+            {!isTerminalRun(run.status) &&
+              (canSteer
+                ? " Stopping the run discards the held outcome — you will be asked to confirm."
+                : " The run's owner can discard it by stopping the run.")}
+          </p>
+          {canSteer && !isTerminalRun(run.status) && (
+            <div className="mt-2">
+              <Button variant="ghost" size="sm" disabled={busy} onClick={() => cancelRun()}>
+                Discard held outcome…
+              </Button>
+            </div>
+          )}
+        </div>
+      )}
+
       {/* PRD #1247 M7: the applied-switch history — one row per claim, naming the token it
           spent, why, and when. Self-hides for a run with no epochs. */}
       <CredentialEpochList epochs={run.credential_epochs} />
@@ -2043,7 +2159,7 @@ export function RunView() {
             await refreshRun();
           })
         }
-        onStop={() => act(() => submit("cancel"))}
+        onStop={() => cancelRun()}
         onExtend={(seconds) => act(() => submit("extend", String(seconds)))}
       />
 
@@ -2055,7 +2171,7 @@ export function RunView() {
         busy={busy}
         canSteer={canSteer}
         onExtend={(seconds) => act(() => submit("extend", String(seconds)))}
-        onStop={() => act(() => submit("cancel"))}
+        onStop={() => cancelRun()}
       />
 
       {/* PRD #35: the usage-limit strip. High in the stack because on a parked run it
@@ -2074,7 +2190,7 @@ export function RunView() {
             run={run}
             busy={busy}
             canSteer={canSteer}
-            onStop={() => act(() => submit("cancel"))}
+            onStop={() => cancelRun()}
             onToggle={(enabled) =>
               act(async () => {
                 await api.setRunWaitOnLimit(run.id, enabled);
@@ -2112,7 +2228,7 @@ export function RunView() {
               run={run}
               busy={busy}
               canSteer={canSteer}
-              onStop={() => act(() => submit("cancel"))}
+              onStop={() => cancelRun()}
               onToggle={(enabled) =>
                 act(async () => {
                   await api.setRunWaitOnLimit(run.id, enabled);
@@ -2298,7 +2414,7 @@ export function RunView() {
           }
           onReject={(reason) => act(() => submit("reject_plan", reason))}
           onRequestChanges={(feedback) => act(() => submit("revise_plan", feedback))}
-          onCancel={() => act(() => submit("cancel"))}
+          onCancel={() => cancelRun()}
         />
       )}
 
@@ -2324,7 +2440,7 @@ export function RunView() {
             busy={busy}
             canSteer={canSteer}
             onAnswer={(body) => act(() => submit("answer", body))}
-            onCancel={canSteer ? () => act(() => submit("cancel")) : undefined}
+            onCancel={canSteer ? () => cancelRun() : undefined}
           />
         ) : (
           // Parked, but the question is unusable — no question_id, or nothing renderable.
@@ -2333,7 +2449,7 @@ export function RunView() {
           // affordance reads as "not loaded yet", so the reasonable response was to wait.
           <UnreadableQuestion
             busy={busy}
-            onCancel={canSteer ? () => act(() => submit("cancel")) : undefined}
+            onCancel={canSteer ? () => cancelRun() : undefined}
           />
         ))}
 
@@ -2401,7 +2517,7 @@ export function RunView() {
         status={run.status}
         canSteer={canSteer}
         busy={busy}
-        onStop={() => act(() => submit("cancel"))}
+        onStop={() => cancelRun()}
         onSend={(text) => act(() => submit("follow_up", text))}
         // PRD #1190: the "‖ Pause ▾" menu. The card decides whether to show it (running +
         // pausable kind + no pause pending); here we only wire the request → refetch.
@@ -2413,6 +2529,51 @@ export function RunView() {
           })
         }
       />
+
+      {/* PRD #1391 Run B M3d (D13): the discard-held-outcome confirmation. Opened when a
+          cancel is refused with the typed 409 (cancelRun), so it covers EVERY cancel entry
+          point at once. Confirm retries the cancel with discardPendingOutcome true; closing
+          leaves the run untouched. */}
+      {confirmDiscardOutcome && (
+        <Modal
+          label="Discard the held outcome?"
+          onClose={closeDiscardModal}
+          closeOnBackdrop={!busy}
+        >
+          <div className="my-8 w-full max-w-md overflow-hidden rounded-2xl border border-edge-strong bg-surface shadow-2xl">
+            <div className="border-b border-edge px-5 py-4">
+              <h2 className="text-base font-semibold">Discard the held outcome?</h2>
+            </div>
+            <div className="space-y-3 px-5 py-5 text-sm text-muted">
+              <p>
+                This run finished on its worker, but its result never reached uzi. Discarding it
+                cancels the run and throws that finished result away — this can&rsquo;t be undone.
+              </p>
+              {run.outcome_pending && (
+                <p className="text-xs">
+                  Held because {outcomePendingReasonLabel(run.outcome_pending.reason)}.
+                </p>
+              )}
+              {/* The confirmed retry's failure surfaces HERE, not on the page banner behind the
+                  overlay. The modal stays open so the owner sees why and can retry or back out. */}
+              {discardOutcomeErr && <p className="text-xs text-danger">{discardOutcomeErr}</p>}
+            </div>
+            <div className="flex items-center justify-end gap-2 border-t border-edge bg-ink/40 inset-panel px-5 py-3.5">
+              <Button variant="ghost" size="sm" disabled={busy} onClick={closeDiscardModal}>
+                Keep waiting
+              </Button>
+              <Button
+                variant="dangerSolid"
+                size="sm"
+                disabled={busy}
+                onClick={() => cancelRun(true)}
+              >
+                {busy ? "Discarding…" : "Discard and cancel"}
+              </Button>
+            </div>
+          </div>
+        </Modal>
+      )}
     </div>
   );
 }

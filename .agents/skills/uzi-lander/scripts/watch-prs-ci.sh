@@ -3,14 +3,14 @@
 # failed job the moment it appears on ANY of them, and exiting green only when they
 # are ALL terminal and none failed.
 #
-# This is the batch companion to watch-pr-ci.sh: the uzi-release skill's step 1/3
-# routinely has to watch a whole merge batch (e.g. several PRs re-running CI after a
-# repo-wide-red fix on main), and a single-PR watcher forces either N background
-# tasks or a hand-rolled loop — the latter is how a fragile poll loop gets written
-# under time pressure. This wraps the exact same awk classification watch-pr-ci.sh
-# uses (same field parsing, same fail/pending/terminal sets), extended across PRs.
-# It is a STARTING POINT: keep improving it as the CI surface changes (new jobs, new
-# terminal states, CodeRabbit behavior).
+# A single PR is a batch of one (the former watch-pr-ci.sh was this script's subset and
+# was folded in). The uzi-release skill's step 1/3 routinely has to watch a whole merge
+# batch (e.g. several PRs re-running CI after a repo-wide-red fix on main), and a
+# single-PR watcher forces either N background tasks or a hand-rolled loop — the latter
+# is how a fragile poll loop gets written under time pressure. CI only: for
+# merge-READINESS (CI + reviewer bots + mr_rework) use watch-pr.sh. It is a STARTING
+# POINT: keep improving it as the CI surface changes (new jobs, new terminal states,
+# CodeRabbit behavior).
 #
 # Usage:
 #   watch-prs-ci.sh <PR> [<PR>...] [--interval SECS] [--max-ticks N] [--wait-cr]
@@ -25,7 +25,7 @@
 # Run it in the BACKGROUND (the harness re-invokes you when it exits); do not block
 # a foreground turn on it.
 #
-# Exit codes (same contract as watch-pr-ci.sh, aggregated over the PR set):
+# Exit codes (aggregated over the PR set):
 #   0  every PR terminal and none failed (whole batch green)
 #   1  a failed/cancelled job was detected on some PR (that PR + its failing jobs are
 #      printed) — react now; a batch cannot merge on a red member
@@ -49,8 +49,8 @@
 #    exiting, because a freshly-started run can briefly report a stale non-success
 #    conclusion on a job that is actually still in_progress (skill step 4's
 #    stale-first-tick caveat).
-#  - The `classify` function is the shared lib/pr-checks-classify.sh (also sourced by
-#    watch-pr-ci.sh), so the two watchers cannot drift in what they count.
+#  - The `classify` function is the shared lib/pr-checks-classify.sh, kept separate so
+#    a state-policy edit has one home.
 #  - A genuine `gh` failure (bad PR number, auth, no network) is not swallowed: it
 #    surfaces as ERROR and exits 3 (the documented usage/gh-error code), rather than
 #    masquerading as an empty read that retries to the timeout code 2.

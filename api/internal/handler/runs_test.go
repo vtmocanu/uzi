@@ -86,6 +86,13 @@ type runsStore struct {
 	selfUsage        store.SelfUsageRow
 	adminTotals      store.AdminUsageTotalsRow
 	adminPerUser     []store.AdminUsagePerUserRow
+	// PRD #1293 failed-run rate outcome aggregates.
+	selfRunOutcomes               store.SelfRunOutcomesRow
+	selfRunOutcomeOrigins         []store.SelfRunOutcomeOriginsRow
+	adminRunOutcomes              store.AdminRunOutcomesRow
+	adminRunOutcomesPerUser       []store.AdminRunOutcomesPerUserRow
+	adminRunOutcomeOrigins        []store.AdminRunOutcomeOriginsRow
+	adminRunOutcomeOriginsPerUser []store.AdminRunOutcomeOriginsPerUserRow
 	// PRD #95 steer queue: the follow_up rows ListFollowUpInputsForRun returns, and the
 	// row CreateRunInput echoes (so the richer follow-up write's id/created_at are
 	// assertable).
@@ -206,6 +213,13 @@ func (s *runsStore) GetRunUsageTotal(_ context.Context, _ uuid.UUID) (store.GetR
 func (s *runsStore) ListRunCredentialEpochs(_ context.Context, _ store.ListRunCredentialEpochsParams) ([]store.RunCredentialEpoch, error) {
 	return s.credentialEpochs, nil
 }
+
+// HeartbeatWorker lets a test seed the in-memory outbox tracker through the public
+// Service.Heartbeat entry point (PRD #1391): Heartbeat records the outbox depth before
+// this liveness write, so returning the bare worker is enough for the record to land.
+func (s *runsStore) HeartbeatWorker(_ context.Context, arg store.HeartbeatWorkerParams) (store.Worker, error) {
+	return store.Worker{ID: arg.ID}, nil
+}
 func (s *runsStore) SelfUsage(_ context.Context, _ uuid.UUID) (store.SelfUsageRow, error) {
 	return s.selfUsage, nil
 }
@@ -214,6 +228,24 @@ func (s *runsStore) AdminUsageTotals(context.Context) (store.AdminUsageTotalsRow
 }
 func (s *runsStore) AdminUsagePerUser(context.Context) ([]store.AdminUsagePerUserRow, error) {
 	return s.adminPerUser, nil
+}
+func (s *runsStore) SelfRunOutcomes(context.Context, uuid.UUID) (store.SelfRunOutcomesRow, error) {
+	return s.selfRunOutcomes, nil
+}
+func (s *runsStore) SelfRunOutcomeOrigins(context.Context, uuid.UUID) ([]store.SelfRunOutcomeOriginsRow, error) {
+	return s.selfRunOutcomeOrigins, nil
+}
+func (s *runsStore) AdminRunOutcomes(context.Context) (store.AdminRunOutcomesRow, error) {
+	return s.adminRunOutcomes, nil
+}
+func (s *runsStore) AdminRunOutcomesPerUser(context.Context) ([]store.AdminRunOutcomesPerUserRow, error) {
+	return s.adminRunOutcomesPerUser, nil
+}
+func (s *runsStore) AdminRunOutcomeOrigins(context.Context) ([]store.AdminRunOutcomeOriginsRow, error) {
+	return s.adminRunOutcomeOrigins, nil
+}
+func (s *runsStore) AdminRunOutcomeOriginsPerUser(context.Context) ([]store.AdminRunOutcomeOriginsPerUserRow, error) {
+	return s.adminRunOutcomeOriginsPerUser, nil
 }
 
 func newRunsHandler(t *testing.T, st workersvc.Store) *Handler {
@@ -607,6 +639,92 @@ func TestGetRunCredentialSwitchSuppression(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestGetRunOutcomePendingOverlay pins the PRD #1391 M3 (D13) enrichment overlay in
+// GetRun: run.outcome_pending surfaces when the run's OWNING worker reported a recognised
+// blocked-terminal reason on its heartbeat outbox, an UNRECOGNISED (untrusted) reason is
+// dropped, and the overlay is owner-gated so a NON-owning worker's report can never flip a
+// victim's run page. Drives the real GetRun HTTP path and seeds the in-memory outbox
+// through the public Service.Heartbeat, so it exercises the actual overlay, not a
+// reimplementation.
+func TestGetRunOutcomePendingOverlay(t *testing.T) {
+	owner := store.User{ID: uuid.New()}
+	runID := uuid.New()
+	ownerWorker := uuid.New()
+
+	newStore := func() *runsStore {
+		return &runsStore{
+			ownerID: owner.ID,
+			run: store.Run{
+				ID:       runID,
+				UserID:   owner.ID,
+				Status:   "running",
+				WorkerID: pgtype.UUID{Bytes: ownerWorker, Valid: true},
+			},
+		}
+	}
+	seed := func(t *testing.T, h *Handler, reporter uuid.UUID, reason string) {
+		t.Helper()
+		if _, err := h.wsvc.Heartbeat(context.Background(), store.Worker{ID: reporter}, nil,
+			[]workersvc.OutboxEntry{{RunID: runID, PendingTerminal: 1, BlockedReason: reason, Since: time.Now()}}, nil); err != nil {
+			t.Fatalf("seed heartbeat: %v", err)
+		}
+	}
+	getOutcome := func(t *testing.T, h *Handler) (reason string, present bool) {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		h.GetRun(rec, runReq(owner, runID))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GetRun = %d, want 200", rec.Code)
+		}
+		var body struct {
+			Run struct {
+				OutcomePending *struct {
+					Reason string `json:"reason"`
+				} `json:"outcome_pending"`
+			} `json:"run"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
+		if body.Run.OutcomePending == nil {
+			return "", false
+		}
+		return body.Run.OutcomePending.Reason, true
+	}
+
+	t.Run("owner-reported recognised reason surfaces", func(t *testing.T) {
+		h := newRunsHandler(t, newStore())
+		seed(t, h, ownerWorker, "gap_unrecoverable")
+		reason, present := getOutcome(t, h)
+		if !present {
+			t.Fatal("outcome_pending = null, want the held outcome surfaced")
+		}
+		if reason != "gap_unrecoverable" {
+			t.Fatalf("reason = %q, want %q", reason, "gap_unrecoverable")
+		}
+	})
+
+	t.Run("unrecognised reason is dropped", func(t *testing.T) {
+		h := newRunsHandler(t, newStore())
+		seed(t, h, ownerWorker, "arbitrary worker text")
+		if reason, present := getOutcome(t, h); present {
+			t.Fatalf("outcome_pending = %q, want null: untrusted worker text must not reach the client", reason)
+		}
+	})
+
+	t.Run("non-owning worker report is owner-gated out", func(t *testing.T) {
+		h := newRunsHandler(t, newStore())
+		foreign := uuid.New()
+		if foreign == ownerWorker {
+			t.Fatal("test fixture generated identical worker ids")
+		}
+		seed(t, h, foreign, "reserve_exhausted")
+		if reason, present := getOutcome(t, h); present {
+			t.Fatalf("outcome_pending = %q, want null: a non-owning worker must not flip a victim's run page", reason)
+		}
+	})
 }
 
 func TestListRunMessagesViewerAuthz(t *testing.T) {

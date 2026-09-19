@@ -27,6 +27,37 @@ type UsageDTO struct {
 	CostStatus string `json:"cost_status"`
 }
 
+// RunOutcomesDTO is the failed-run rate aggregate for one scope+window (PRD #1293).
+// Counted over `runs` directly, NOT the usage rollup (D1): a run that fails before
+// spending a token has no usage row but must still count. All five counts are always
+// present (zeros, never null). Invariants, asserted in tests:
+//   - finished == completed + cancelled + plan_rejected + failed
+//   - sum(fail_origins) == failed
+//
+// plan_rejected is status=failed AND fail_origin='plan_rejected'; failed is every other
+// status=failed row (fail_origin IS DISTINCT FROM 'plan_rejected') (D4). The client
+// computes the rate (failed/finished), never the server (D6). FailOrigins keys are the
+// failorigin.go vocabulary plus 'unknown' (a NULL fail_origin, pre-migration 00126); it
+// is always a non-nil map so it marshals as {} rather than null, even when empty.
+type RunOutcomesDTO struct {
+	Finished     int64 `json:"finished"`
+	Completed    int64 `json:"completed"`
+	Cancelled    int64 `json:"cancelled"`
+	PlanRejected int64 `json:"plan_rejected"`
+	Failed       int64 `json:"failed"`
+	// FailOrigins counts the `failed` rows by fail_origin (NULL keyed "unknown"). Always
+	// non-nil so it marshals {} not null; sum over the map equals Failed.
+	FailOrigins map[string]int64 `json:"fail_origins"`
+}
+
+// RunOutcomeWindowsDTO carries the two windows the usage cards show side by side
+// (PRD #1293): lifetime and last-7-days, windowed on runs.created_at (D3) so the 7-day
+// failure figure describes the same run set as the 7-day usage figure on the same card.
+type RunOutcomeWindowsDTO struct {
+	Lifetime  RunOutcomesDTO `json:"lifetime"`
+	Last7Days RunOutcomesDTO `json:"last_7_days"`
+}
+
 // SelfUsageDTO is the current user's own consumption (GET /api/usage) or, reused,
 // the factory-wide totals on the admin summary. run_count is the number of the
 // scope's runs that carry usage; the client reads run_count == 0 as "nothing yet"
@@ -45,6 +76,9 @@ type SelfUsageDTO struct {
 	LifetimeUnreportedRunCount   int64 `json:"lifetime_unreported_run_count"`
 	Last7SubscriptionRunCount    int64 `json:"last7_subscription_run_count"`
 	Last7UnreportedRunCount      int64 `json:"last7_unreported_run_count"`
+	// Outcomes is the failed-run rate aggregate for this scope, both windows (PRD #1293).
+	// The factory card reuses this type, so it gets the block for free.
+	Outcomes RunOutcomeWindowsDTO `json:"outcomes"`
 }
 
 // AdminUserUsageDTO is one user's lifetime consumption row on the admin factory
@@ -60,6 +94,10 @@ type AdminUserUsageDTO struct {
 	// the factory SelfUsageDTO). Copied from AdminUsagePerUser, which computes them per user.
 	SubscriptionRunCount int64 `json:"subscription_run_count"`
 	UnreportedRunCount   int64 `json:"unreported_run_count"`
+	// Outcomes is this user's LIFETIME failed-run rate aggregate (PRD #1293), matching the
+	// row's lifetime usage. A user present in the outcomes aggregate but absent from usage
+	// (every run died before spending, D5) still gets a row, with zero usage.
+	Outcomes RunOutcomesDTO `json:"outcomes"`
 }
 
 // AdminUsageDTO is the admin factory view: the factory-wide totals plus the

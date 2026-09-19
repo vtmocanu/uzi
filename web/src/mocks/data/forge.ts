@@ -45,20 +45,6 @@ export const mockForgeConfigMultiForge = {
   forge_types: ["gitlab", "forgejo"],
 };
 
-// A three-forge config variant (PRD #238 D2/D11) advertising GitHub alongside GitLab
-// and Forgejo, for exercising the connect-form picker with GitHub's arm. Like the
-// two-forge variant, deliberately NOT wired into mockApi.forgeConfig — production
-// advertises only ["gitlab"] until the go-live flip (M10), so the picker stays hidden
-// in the demo (dark landing).
-export const mockForgeConfigAllForges = {
-  allowed_base_urls: [
-    "https://gitlab.example.com",
-    "https://forge.example.com",
-    "https://github.com",
-  ],
-  forge_types: ["gitlab", "forgejo", "github"],
-};
-
 // PRD #337 M2: a multi-forge config exercising the connect-form URL⇄type sync —
 // three recognized hosts (github/gitlab/forgejo) plus one unrecognized self-hosted
 // host that stays under manual control in both directions.
@@ -76,7 +62,7 @@ export const mockForgeConfigSyncForges = {
 // and the admin blocked-repos list so both read ONE literal. Typed as the wire
 // GuardrailOverrideMeta (the same shape RepoDTO.guardrail_override and
 // BlockedRepoDTO.guardrail_override carry).
-export const mockAtlasOverride: GuardrailOverrideMeta = {
+const mockAtlasOverride: GuardrailOverrideMeta = {
   reason: "forge fix scheduled for next sprint; accepting the risk until then",
   by: "vlad@example.com",
   at: daysAgo(3),

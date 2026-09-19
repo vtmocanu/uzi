@@ -52,9 +52,8 @@ export const mockMemories: (Memory & { user_id: string })[] = [
 // A seeded PENDING browser-login request so /cli-auth?request=<id> renders the
 // consent form in the demo. The code is fixed so the happy path is walkable
 // (a real flow prints it in the terminal; a pure-web demo has none). Approving
-// requires typing MOCK_CLI_AUTH_CODE below.
+// requires typing the canonical form of the user_code below.
 export const MOCK_CLI_AUTH_REQUEST_ID = "req-demo";
-export const MOCK_CLI_AUTH_CODE = "ABCD-2345"; // canonical "ABCD2345"
 
 export const mockCliAuthRequest: CliAuthRequestMeta & { user_code: string } = {
   client_desc: "uzi CLI on demo-laptop (darwin/arm64)",
