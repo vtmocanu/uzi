@@ -71,7 +71,16 @@ func TestScheduleListHarnessColumn(t *testing.T) {
 	if !strings.Contains(pinnedLine, "codex") {
 		t.Errorf("a codex-pinned schedule should show codex in its row, got: %q", pinnedLine)
 	}
-	if !strings.Contains(implicitLine, "-") {
-		t.Errorf("an unpinned schedule should show - in its row, got: %q", implicitLine)
+	// Assert on the specific HARNESS cell (the last tab-separated column, per newScheduleListCmd's
+	// header order ID/TARGET/REPO/WHEN/NEXT/ON/HARNESS), not a whole-line Contains: the fixture's
+	// own ID ("sch-implicit") already contains a hyphen, so a plain strings.Contains(implicitLine,
+	// "-") would pass even if the production "-" fallback broke and the column rendered something
+	// else entirely — it would still match the hyphen inside "sch-implicit".
+	implicitFields := strings.Fields(implicitLine)
+	if len(implicitFields) == 0 {
+		t.Fatalf("expected a rendered row for sch-implicit, got: %q", implicitLine)
+	}
+	if got := implicitFields[len(implicitFields)-1]; got != "-" {
+		t.Errorf("an unpinned schedule's HARNESS cell should be exactly \"-\", got %q in row: %q", got, implicitLine)
 	}
 }
