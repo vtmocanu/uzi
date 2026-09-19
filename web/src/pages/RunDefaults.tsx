@@ -20,6 +20,7 @@ import { SettingsShell } from "../components/SettingsShell";
 import { hasAnthropicToken, isCodexUsable } from "../lib/hasToken";
 import {
   bothHarnessesUsable,
+  effectiveHarnessIsCodex,
   INHERIT_HARNESS,
   selectionFromHarness,
   type HarnessSelection,
@@ -387,6 +388,12 @@ export function RunDefaults() {
   // Defaults, not just the start dialog).
   const showHarnessCard = bothHarnessesUsable(claudeUsable, codexUsable);
   const harnessDirty = defaultHarness !== savedHarness;
+  // The Worker model vocabulary follows the EFFECTIVE harness, not the raw pick: a
+  // Codex-only user never sees the card above, so `defaultHarness` stays "inherit" while
+  // every run resolves to Codex. Keyed on the raw pick they were offered Claude aliases
+  // only, and a saved one was dropped at claim (D6 fallback). `defaultHarness` IS the
+  // default here, so the helper takes no separate default argument.
+  const workerModelOnCodex = effectiveHarnessIsCodex(defaultHarness, claudeUsable, codexUsable);
 
   // saveHarness persists the pin (present-value sets it, null clears it back to
   // implicit D11) and — D6 — resets an incompatible STORED default model to inherit
@@ -832,7 +839,7 @@ export function RunDefaults() {
                 id="worker-model"
                 value={defaultModel}
                 onChange={setDefaultModel}
-                harness={defaultHarness === "inherit" ? undefined : defaultHarness}
+                harness={workerModelOnCodex ? "codex" : defaultHarness === "inherit" ? undefined : defaultHarness}
               />
             </Field>
             {modelWarning && <Alert message={modelWarning} tone="warning" />}

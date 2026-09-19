@@ -1493,4 +1493,21 @@ describe("the per-schedule harness picker (PRD #1429 M4a)", () => {
     expect(screen.queryByLabelText("Anthropic token for this schedule")).toBeNull();
     expect(screen.getByText(/fires on Codex/)).toBeTruthy();
   });
+
+  // PR #1449 review: the model vocabulary must follow the EFFECTIVE harness too. Keyed on
+  // the raw pin, an "inherit" schedule that resolves to Codex offered Claude aliases, and
+  // the API accepted a pick that claim assembly then dropped for the Codex default.
+  it("offers the Codex model vocabulary to a Codex-only owner, even with no explicit pin", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [codexKey()] });
+    render(
+      <MemoryRouter>
+        <ScheduleModal editing={schedFixture()} onClose={vi.fn()} onSaved={vi.fn()} />
+      </MemoryRouter>,
+    );
+    await screen.findByText(/fires on Codex/);
+    expect(screen.queryByLabelText("Harness for this schedule")).toBeNull();
+    const modelSelect = screen.getByLabelText("Model (optional)") as HTMLSelectElement;
+    expect(within(modelSelect).getByRole("option", { name: "gpt-6-astra" })).toBeTruthy();
+    expect(within(modelSelect).queryByRole("option", { name: "opus" })).toBeNull();
+  });
 });
