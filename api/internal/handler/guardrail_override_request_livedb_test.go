@@ -14,6 +14,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/notifysvc"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -262,5 +263,277 @@ func TestSetRepoEnable422CarriesWaivabilityLiveDB(t *testing.T) {
 	}
 	if !hasFindingCode(ub.Findings, "protection_unreadable") {
 		t.Errorf("findings = %+v, want a protection_unreadable code", ub.Findings)
+	}
+}
+
+// PRD #1432 M3: the admin approve/reject of a member override request. These reuse the
+// enable-gate live-DB harness (a real GitLab httptest server behind the real driver + a
+// real privcheck.Service), so the CROSS-USER regression exercises the real live guard:
+// approving a request sets the EXISTING #66 override, and the member's retry-Enable then
+// downgrades the waivable finding exactly as the M8 override path does. A real notifier
+// is wired over the live-DB store (notifysvc.New(f.h.q, …)) so the decided-kind inbox row
+// is actually inserted and asserted.
+
+// decideRequest POSTs approve (or reject) for reqID as actor, with an OPTIONAL decision
+// note (empty ⇒ no body ⇒ the tolerant "no note" path). Returns the recorder.
+func (f enableGuardFixture) decideRequest(t *testing.T, actor store.User, reqID uuid.UUID, approve bool, note string) *httptest.ResponseRecorder {
+	t.Helper()
+	path := "/admin/override-requests/x/reject"
+	if approve {
+		path = "/admin/override-requests/x/approve"
+	}
+	var r *http.Request
+	if note == "" {
+		r = httptest.NewRequest(http.MethodPost, path, nil)
+	} else {
+		body, _ := json.Marshal(map[string]string{"decision_note": note})
+		r = httptest.NewRequest(http.MethodPost, path, bytes.NewReader(body))
+	}
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", reqID.String())
+	r = r.WithContext(context.WithValue(mw.ContextWithUser(r.Context(), actor), chi.RouteCtxKey, rctx))
+	w := httptest.NewRecorder()
+	if approve {
+		f.h.ApproveGuardrailOverrideRequest(w, r)
+	} else {
+		f.h.RejectGuardrailOverrideRequest(w, r)
+	}
+	return w
+}
+
+// overrideBy reads guardrail_override_by as text (NULL → ""), for asserting the approving
+// admin is recorded as the live override actor.
+func (f enableGuardFixture) overrideBy(ctx context.Context, t *testing.T, repoID uuid.UUID) string {
+	t.Helper()
+	var by *string
+	if err := f.pool.QueryRow(ctx, `SELECT guardrail_override_by::text FROM repos WHERE id = $1`, repoID).Scan(&by); err != nil {
+		t.Fatalf("read override by: %v", err)
+	}
+	if by == nil {
+		return ""
+	}
+	return *by
+}
+
+// requestDecision reads the settled request's status + decided_by (as text, NULL → "").
+func (f enableGuardFixture) requestDecision(ctx context.Context, t *testing.T, reqID uuid.UUID) (status, decidedBy string) {
+	t.Helper()
+	var decidedByN *string
+	if err := f.pool.QueryRow(ctx,
+		`SELECT status, decided_by::text FROM guardrail_override_requests WHERE id = $1`, reqID,
+	).Scan(&status, &decidedByN); err != nil {
+		t.Fatalf("read request decision: %v", err)
+	}
+	if decidedByN != nil {
+		decidedBy = *decidedByN
+	}
+	return status, decidedBy
+}
+
+// notificationCount counts inbox rows of a kind for a user, so the decided-kind notify is
+// observable through the real notifysvc write.
+func (f enableGuardFixture) notificationCount(ctx context.Context, t *testing.T, userID uuid.UUID, kind string) int {
+	t.Helper()
+	var n int
+	if err := f.pool.QueryRow(ctx,
+		`SELECT count(*) FROM notifications WHERE user_id = $1 AND kind = $2`, userID, kind,
+	).Scan(&n); err != nil {
+		t.Fatalf("count notifications: %v", err)
+	}
+	return n
+}
+
+// Approve: → 200; (i) the repo carries the request reason + admin actor as the override;
+// (ii) the request is approved, decided_by the admin; (iii) the repo is STILL disabled
+// (approval must not enable); (iv) a decided-kind notification exists for the requester.
+func TestApproveGuardrailOverrideRequestLiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newEnableGuardFixture(ctx, t)
+	f.h.SetNotifier(notifysvc.New(f.h.q, nil, 0, nil))
+	admin := f.mkAdmin(ctx, t)
+
+	repoID := f.seedRepo(ctx, t, 301, false, protUnprotected)
+	const reason = "protection is enforced by our CI ruleset, not branch protection; please allow this repo"
+	reqID := f.seedPendingRequest(ctx, t, repoID, f.owner.ID, reason, []apitypes.GuardrailFindingDTO{
+		{Code: "default_branch_unprotected", Severity: "block", Message: "the default branch is not protected"},
+	})
+
+	w := f.decideRequest(t, admin, reqID, true, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("approve status = %d, want 200 (body %s)", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Request apitypes.OverrideRequestStateDTO `json:"request"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode 200 body: %v (body %s)", err, w.Body.String())
+	}
+	if resp.Request.Status != "approved" {
+		t.Errorf("response status = %q, want approved", resp.Request.Status)
+	}
+
+	// (i) the repo now carries the override with the request reason + admin actor.
+	gotReason, set := f.overrideReason(ctx, t, repoID)
+	if !set {
+		t.Fatalf("approve must set the repo override")
+	}
+	if gotReason != reason {
+		t.Errorf("override reason = %q, want the request reason %q", gotReason, reason)
+	}
+	if by := f.overrideBy(ctx, t, repoID); by != admin.ID.String() {
+		t.Errorf("override by = %q, want the admin id %q", by, admin.ID.String())
+	}
+	// (ii) the request row is approved, decided_by the admin.
+	status, decidedBy := f.requestDecision(ctx, t, reqID)
+	if status != "approved" {
+		t.Errorf("request status = %q, want approved", status)
+	}
+	if decidedBy != admin.ID.String() {
+		t.Errorf("request decided_by = %q, want the admin id %q", decidedBy, admin.ID.String())
+	}
+	// (iii) approval must NOT enable the repo.
+	if f.repoEnabled(ctx, t, repoID) {
+		t.Errorf("approval must not enable the repo — it stays disabled until the member retries Enable")
+	}
+	// (iv) a decided-kind notification exists for the requester.
+	if n := f.notificationCount(ctx, t, f.owner.ID, guardrailOverrideDecidedKind); n != 1 {
+		t.Errorf("requester notifications of kind %q = %d, want 1", guardrailOverrideDecidedKind, n)
+	}
+}
+
+// Reject: → 200; the repo has NO override set; the request is rejected, decided_by the
+// admin; a decided-kind notification exists. The decision note is optional and screened.
+func TestRejectGuardrailOverrideRequestLiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newEnableGuardFixture(ctx, t)
+	f.h.SetNotifier(notifysvc.New(f.h.q, nil, 0, nil))
+	admin := f.mkAdmin(ctx, t)
+
+	repoID := f.seedRepo(ctx, t, 302, false, protUnprotected)
+	reqID := f.seedPendingRequest(ctx, t, repoID, f.owner.ID, "please allow this repo", []apitypes.GuardrailFindingDTO{
+		{Code: "default_branch_unprotected", Severity: "block", Message: "the default branch is not protected"},
+	})
+
+	w := f.decideRequest(t, admin, reqID, false, "fix branch protection on the forge first, then retry Enable")
+	if w.Code != http.StatusOK {
+		t.Fatalf("reject status = %d, want 200 (body %s)", w.Code, w.Body.String())
+	}
+	// No override set by a rejection.
+	if _, set := f.overrideReason(ctx, t, repoID); set {
+		t.Errorf("reject must NOT set the repo override")
+	}
+	// The request is rejected, decided_by the admin.
+	status, decidedBy := f.requestDecision(ctx, t, reqID)
+	if status != "rejected" {
+		t.Errorf("request status = %q, want rejected", status)
+	}
+	if decidedBy != admin.ID.String() {
+		t.Errorf("request decided_by = %q, want the admin id %q", decidedBy, admin.ID.String())
+	}
+	// A notification exists for the requester.
+	if n := f.notificationCount(ctx, t, f.owner.ID, guardrailOverrideDecidedKind); n != 1 {
+		t.Errorf("requester notifications of kind %q = %d, want 1", guardrailOverrideDecidedKind, n)
+	}
+}
+
+// Already-decided → 409, and an unknown request id → 404. The single-shot guard (`AND
+// status = 'pending'`) is what makes the second decide a conflict, not a silent re-write.
+func TestDecideGuardrailOverrideRequestConflictAndNotFoundLiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newEnableGuardFixture(ctx, t)
+	f.h.SetNotifier(notifysvc.New(f.h.q, nil, 0, nil))
+	admin := f.mkAdmin(ctx, t)
+
+	repoID := f.seedRepo(ctx, t, 303, false, protUnprotected)
+	reqID := f.seedPendingRequest(ctx, t, repoID, f.owner.ID, "please allow this repo", []apitypes.GuardrailFindingDTO{
+		{Code: "default_branch_unprotected", Severity: "block", Message: "the default branch is not protected"},
+	})
+
+	if w := f.decideRequest(t, admin, reqID, true, ""); w.Code != http.StatusOK {
+		t.Fatalf("first approve status = %d, want 200 (body %s)", w.Code, w.Body.String())
+	}
+	// Second decide on the now-approved request → 409.
+	if w := f.decideRequest(t, admin, reqID, true, ""); w.Code != http.StatusConflict {
+		t.Fatalf("second approve status = %d, want 409 (already decided) (body %s)", w.Code, w.Body.String())
+	}
+	// An unknown request id → 404.
+	if w := f.decideRequest(t, admin, uuid.New(), true, ""); w.Code != http.StatusNotFound {
+		t.Fatalf("unknown-id status = %d, want 404 (body %s)", w.Code, w.Body.String())
+	}
+}
+
+// THE KEY AC — the full cross-user regression. A member owns a repo whose live guard
+// returns a WAIVABLE block; the member requests an override, the admin queue surfaces it,
+// the admin approves (override set, repo still disabled), and the member's retry-Enable
+// now succeeds because the live guard downgrades the waivable finding under the active
+// override. Every step's status is asserted, ending in enabled == true.
+func TestGuardrailOverrideRequestCrossUserFlowLiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newEnableGuardFixture(ctx, t)
+	f.h.SetNotifier(notifysvc.New(f.h.q, nil, 0, nil))
+	admin := f.mkAdmin(ctx, t)
+
+	// A waivable-block repo (unprotected default branch), owned by the member, disabled.
+	repoID := f.seedRepo(ctx, t, 304, false, protUnprotected)
+
+	// The enable is refused before any override exists.
+	if w := f.setEnabled(t, repoID, true); w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("pre-request enable status = %d, want 422 (body %s)", w.Code, w.Body.String())
+	}
+
+	// 1. Member requests an override → 200 pending.
+	const reason = "our platform team manages branch protection centrally; please allow this repo"
+	if w := f.requestOverride(t, f.owner, repoID, reason); w.Code != http.StatusOK {
+		t.Fatalf("request status = %d, want 200 pending (body %s)", w.Code, w.Body.String())
+	}
+
+	// 2. The admin cross-user queue surfaces the request; take its id from the queue.
+	rq := httptest.NewRequest(http.MethodGet, "/admin/blocked-repos", nil)
+	rq = rq.WithContext(mw.ContextWithUser(rq.Context(), admin))
+	wq := httptest.NewRecorder()
+	f.h.AdminListBlockedRepos(wq, rq)
+	if wq.Code != http.StatusOK {
+		t.Fatalf("admin queue status = %d, want 200 (body %s)", wq.Code, wq.Body.String())
+	}
+	var q apitypes.AdminBlockedReposDTO
+	if err := json.Unmarshal(wq.Body.Bytes(), &q); err != nil {
+		t.Fatalf("decode queue: %v (body %s)", err, wq.Body.String())
+	}
+	var reqID string
+	for _, req := range q.Requests {
+		if req.RepoID == repoID.String() {
+			reqID = req.ID
+			if req.Reason != reason {
+				t.Errorf("queue request reason = %q, want %q", req.Reason, reason)
+			}
+			break
+		}
+	}
+	if reqID == "" {
+		t.Fatalf("the pending request for repo %s must appear in the admin queue; got %+v", repoID, q.Requests)
+	}
+	reqUUID, err := uuid.Parse(reqID)
+	if err != nil {
+		t.Fatalf("queue request id %q is not a uuid: %v", reqID, err)
+	}
+
+	// 3. Admin approves → 200: the override is set, the repo is STILL disabled.
+	if w := f.decideRequest(t, admin, reqUUID, true, ""); w.Code != http.StatusOK {
+		t.Fatalf("approve status = %d, want 200 (body %s)", w.Code, w.Body.String())
+	}
+	if _, set := f.overrideReason(ctx, t, repoID); !set {
+		t.Fatalf("approve must set the repo override")
+	}
+	if f.repoEnabled(ctx, t, repoID) {
+		t.Errorf("approval must NOT enable the repo")
+	}
+
+	// 4. Member retries Enable → 200: the live guard downgrades the waivable finding
+	// under the active override, so the enable that was refused in step 0 now succeeds.
+	if w := f.setEnabled(t, repoID, true); w.Code != http.StatusOK {
+		t.Fatalf("enable-after-approve status = %d, want 200 (body %s)", w.Code, w.Body.String())
+	}
+	if !f.repoEnabled(ctx, t, repoID) {
+		t.Errorf("the repo must be enabled after the member retries Enable with an active override")
 	}
 }

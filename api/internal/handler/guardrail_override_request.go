@@ -1,17 +1,23 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/notifysvc"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/privcheck"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/termsafe"
@@ -41,15 +47,49 @@ func validateGuardrailReason(raw string) (clean string, status int, msg string) 
 	if clean == "" {
 		return "", http.StatusBadRequest, "a non-empty reason is required to override the guardrail"
 	}
+	if status, msg := screenGuardrailText(clean, "reason"); status != 0 {
+		return "", status, msg
+	}
+	return clean, 0, ""
+}
+
+// screenGuardrailText is the SHARED length + character screen for every guardrail
+// free-text field (the override reason and the admin decision note). It rejects an
+// over-long value (422 — maxGuardrailOverrideReasonBytes) and one carrying any unsafe
+// C0/C1 control or Unicode-format character (400, via termsafe.Unsafe). It does NOT
+// check emptiness: the reason requires a non-empty value while the decision note is
+// optional, so each caller owns that policy. label names the field in the message
+// ("reason" / "decision note") so one screen serves both without duplicating the
+// termsafe/length logic — the reason this exists rather than a copy in each validator.
+// Returns status==0 on success, else the HTTP status and message the caller emits.
+func screenGuardrailText(clean, label string) (status int, msg string) {
 	if len(clean) > maxGuardrailOverrideReasonBytes {
-		return "", http.StatusUnprocessableEntity, "reason is too long"
+		return http.StatusUnprocessableEntity, label + " is too long"
 	}
 	for _, ru := range clean {
 		if termsafe.Unsafe(ru) {
-			return "", http.StatusBadRequest, "reason must not contain control or formatting characters"
+			return http.StatusBadRequest, label + " must not contain control or formatting characters"
 		}
 	}
-	return clean, 0, ""
+	return 0, ""
+}
+
+// validateOptionalGuardrailNote screens the OPTIONAL admin decision note (PRD #1432
+// M3). It trims; an empty/absent note is legal and returns an invalid pgtype.Text (no
+// note persisted). A NON-empty note gets the SAME length + unsafe-character screen as
+// the override reason (screenGuardrailText) — the note is rendered back to the member
+// in an inbox notification, a cross-user surface, so it MUST get the same termsafe
+// treatment as any other free text that crosses that boundary. Returns status==0 on
+// success, else the HTTP status and message the caller emits.
+func validateOptionalGuardrailNote(raw string) (note pgtype.Text, status int, msg string) {
+	clean := strings.TrimSpace(raw)
+	if clean == "" {
+		return pgtype.Text{Valid: false}, 0, ""
+	}
+	if status, msg := screenGuardrailText(clean, "decision note"); status != 0 {
+		return pgtype.Text{}, status, msg
+	}
+	return pgtype.Text{String: clean, Valid: true}, 0, ""
 }
 
 // overrideRequestStateDTO maps a guardrail_override_requests row to the member-facing
@@ -180,4 +220,205 @@ func (h *Handler) RequestGuardrailOverride(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"override_request": overrideRequestStateDTO(reqRow)})
+}
+
+// guardrailOverrideDecidedKind is the notifications.kind for the inbox row a member
+// gets when an admin approves or rejects their guardrail-override request (PRD #1432
+// M3). The notifications table's kind + payload jsonb is generic (PRD #60), so a new
+// kind is free text needing no migration; the payload carries the rendered title/body,
+// the repo, and the decision. (issue #1432.)
+const guardrailOverrideDecidedKind = "guardrail_override_decided"
+
+// guardrailOverrideRequestDTO maps a ListPendingGuardrailOverrideRequestsRow to the
+// admin-queue wire DTO (PRD #1432 M3). The findings jsonb was stored by M2 as a
+// marshaled []apitypes.GuardrailFindingDTO, so it unmarshals into that type directly;
+// a malformed or null snapshot must NEVER nil the slice (the field is non-omitempty and
+// the TS type is a non-nullable array) or fail the row — the queue is the primary
+// payload — so it falls back to an empty (never nil) list.
+func guardrailOverrideRequestDTO(row store.ListPendingGuardrailOverrideRequestsRow) apitypes.GuardrailOverrideRequestDTO {
+	findings := []apitypes.GuardrailFindingDTO{}
+	if len(row.Findings) > 0 {
+		if err := json.Unmarshal(row.Findings, &findings); err != nil || findings == nil {
+			findings = []apitypes.GuardrailFindingDTO{}
+		}
+	}
+	return apitypes.GuardrailOverrideRequestDTO{
+		ID:         row.ID.String(),
+		RepoID:     row.RepoID.String(),
+		RepoPath:   row.PathWithNamespace,
+		OwnerID:    row.OwnerID.String(),
+		OwnerEmail: row.OwnerEmail,
+		ForgeType:  row.ForgeType,
+		Reason:     row.Reason,
+		Findings:   findings,
+		Status:     row.Status,
+		CreatedAt:  row.CreatedAt.Time,
+	}
+}
+
+// decideGuardrailOverrideRequestBody is the OPTIONAL POST body for approve/reject: an
+// admin's note rendered back to the requester. Absent/empty is allowed.
+type decideGuardrailOverrideRequestBody struct {
+	DecisionNote string `json:"decision_note"`
+}
+
+// decideGuardrailOverrideRequest is the shared body of ApproveGuardrailOverrideRequest
+// and RejectGuardrailOverrideRequest (PRD #1432 M3). status is "approved" or "rejected";
+// applyOverride is true only for approve. It settles the PENDING request single-shot,
+// and — on approve — sets the EXISTING #66 per-repo override with the member's own
+// reason, the deciding admin as actor, and now(). It NEVER enables the repo (the member
+// retries Enable so the live guard re-runs against the current forge state). The actor
+// is the SESSION user, never the body (audit).
+func (h *Handler) decideGuardrailOverrideRequest(w http.ResponseWriter, r *http.Request, status string, applyOverride bool) {
+	user, ok := mw.UserFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	id, ok := httpx.PathUUID(w, r, "id", "request")
+	if !ok {
+		return
+	}
+
+	// The body is OPTIONAL: an empty/absent body (io.EOF from the decoder) is not an
+	// error, it just means "no note". Any other decode error is a malformed body → 400.
+	var body decideGuardrailOverrideRequestBody
+	if err := httpx.DecodeJSON(r, &body); err != nil && !errors.Is(err, io.EOF) {
+		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	notePg, nstatus, nmsg := validateOptionalGuardrailNote(body.DecisionNote)
+	if nstatus != 0 {
+		httpx.Error(w, nstatus, nmsg)
+		return
+	}
+
+	ctx := r.Context()
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		slog.Error("decide guardrail override: begin tx", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op after a successful Commit
+	qtx := h.q.WithTx(tx)
+
+	req, err := qtx.DecideGuardrailOverrideRequest(ctx, store.DecideGuardrailOverrideRequestParams{
+		ID:           id,
+		Status:       status,
+		DecidedBy:    user.ID,
+		DecisionNote: notePg,
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// The `AND status = 'pending'` guard matched no row: the id is either unknown
+			// (404) or already decided (409). Disambiguate with a plain get so a
+			// double-decide reads as a conflict, not a not-found.
+			if _, gerr := h.q.GetGuardrailOverrideRequest(ctx, id); errors.Is(gerr, pgx.ErrNoRows) {
+				httpx.Error(w, http.StatusNotFound, "override request not found")
+			} else {
+				httpx.Error(w, http.StatusConflict, "this override request has already been decided")
+			}
+			return
+		}
+		slog.Error("decide guardrail override request", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+
+	if applyOverride {
+		// Reuse the EXISTING audited override write (SetRepoGuardrailOverride): it sets
+		// the per-repo override with the member's reason + admin actor + now(), but it
+		// NEVER enables the repo. The repo may have been deleted between the request and
+		// this approval → pgx.ErrNoRows → 409 (rollback via defer).
+		if _, err := qtx.SetRepoGuardrailOverride(ctx, store.SetRepoGuardrailOverrideParams{
+			ID:                      req.RepoID,
+			GuardrailOverrideReason: pgtype.Text{String: req.Reason, Valid: true},
+			GuardrailOverrideBy:     pgconv.UUID(user.ID),
+			GuardrailOverrideAt:     pgtype.Timestamptz{Time: time.Now().UTC(), Valid: true},
+		}); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				httpx.Error(w, http.StatusConflict, "the repository no longer exists")
+				return
+			}
+			slog.Error("decide guardrail override: set repo override", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		slog.Error("decide guardrail override: commit", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+
+	// Best-effort notify AFTER the durable commit; a notify error never fails the
+	// decision (the request is already settled).
+	h.notifyGuardrailOverrideDecision(ctx, req, status)
+
+	httpx.JSON(w, http.StatusOK, map[string]any{"request": overrideRequestStateDTO(req)})
+}
+
+// ApproveGuardrailOverrideRequest is the admin "approve this member override request"
+// write (PRD #1432 M3). Admin-only, mounted in the admin WRITE group (RequireAuth +
+// RequireAdmin), so it is cookie-only — a uza_ Bearer 401s before the handler. Approval
+// sets the EXISTING #66 per-repo override (SetRepoGuardrailOverride) with the member's
+// own reason, the admin as actor, and now(); it does NOT enable the repo. The member
+// then retries Enable, which re-runs the live guard so the override is weighed against
+// the current forge state rather than a stale snapshot.
+func (h *Handler) ApproveGuardrailOverrideRequest(w http.ResponseWriter, r *http.Request) {
+	h.decideGuardrailOverrideRequest(w, r, "approved", true)
+}
+
+// RejectGuardrailOverrideRequest is the admin "reject this member override request"
+// write (PRD #1432 M3). Admin-only, same admin WRITE-group posture as Approve (cookie-
+// only; a uza_ Bearer 401s before the handler). It settles the pending request as
+// rejected and notifies the requester; it sets no override and never touches the repo.
+func (h *Handler) RejectGuardrailOverrideRequest(w http.ResponseWriter, r *http.Request) {
+	h.decideGuardrailOverrideRequest(w, r, "rejected", false)
+}
+
+// notifyGuardrailOverrideDecision fires the best-effort inbox notification a member
+// gets when an admin settles their override request (PRD #1432 M3). Nil-safe: no
+// notifier wired ⇒ no-op (precedent notifyReviewReady). The repo path is a best-effort
+// lookup — a lookup miss degrades the body to "your repository" rather than dropping
+// the notification. A delivery error is logged, never returned: the decision is already
+// committed and must not fail on a notify error. Slack:nil ⇒ inbox-only (precedent the
+// run-failure notifier).
+func (h *Handler) notifyGuardrailOverrideDecision(ctx context.Context, req store.GuardrailOverrideRequest, status string) {
+	if h.notifier == nil {
+		return
+	}
+	repoPath := ""
+	if rp, err := h.q.GetRepoByID(ctx, req.RepoID); err == nil {
+		repoPath = rp.PathWithNamespace
+	}
+	repoLabel := repoPath
+	if repoLabel == "" {
+		repoLabel = "your repository"
+	}
+	var title, bodyText string
+	switch status {
+	case "approved":
+		title = "Guardrail override approved"
+		bodyText = "An instance admin approved your request to allow " + repoLabel + " through the guardrail. Retry Enable on your Repos page — the live guard runs again."
+	default: // "rejected"
+		title = "Guardrail override rejected"
+		bodyText = "An instance admin rejected your request to allow " + repoLabel + " through the guardrail."
+	}
+	if _, err := h.notifier.Notify(ctx, notifysvc.Notification{
+		UserID: req.RequestedBy,
+		Kind:   guardrailOverrideDecidedKind,
+		Payload: map[string]any{
+			"title":     title,
+			"body":      bodyText,
+			"repo_path": repoPath,
+			"repo_id":   req.RepoID.String(),
+			"decision":  status,
+		},
+		Slack: nil,
+	}); err != nil {
+		slog.Error("notify guardrail override decision", "error", err)
+	}
 }

@@ -67,7 +67,12 @@ var limiterNames = [...]string{
 // error rather than a failing row. Spelled `lim*` rather than matching the parameter
 // names exactly, so nothing here shadows a parameter inside Routes.
 //
-// 200 as of this commit (PRD #1391 Run B M3c added GET /api/worker/runs/{id}/message-gaps — the
+// 202 as of this commit (issue #1432 M3 added POST /api/admin/override-requests/{id}/approve and
+// POST /api/admin/override-requests/{id}/reject — the admin approve/reject of a member
+// guardrail-override request. Both are cookie-only admin writes in the admin WRITE group: a DB-only
+// decision write plus, on approve, the audited per-repo override set, no forge call → noLimiter,
+// like the guardrail-override set/revoke they sit beside.)
+// It was 200 until then (PRD #1391 Run B M3c added GET /api/worker/runs/{id}/message-gaps — the
 // worker-authenticated, generation-fenced, keyset-paginated message-gaps read a fence-blocked
 // worker uses to find the seqs it must fill before re-reporting terminal. noLimiter, like the other
 // worker /runs/{id}/... reads it sits beside — a READ ONLY DB query, no forge call and no token spend.)
@@ -453,6 +458,11 @@ var wantRouteMounts = []routeMount{
 	// PRD #66 M8 (D8): admin per-repo guardrail override set — an admin-only,
 	// unscoped-by-id DB write, no forge call → noLimiter.
 	{"POST", "/api/admin/repos/{id}/guardrail-override", noLimiter},
+	// issue #1432 M3: admin approve/reject of a member guardrail-override request. Both
+	// are admin writes — a DB-only decision write plus (on approve) the audited per-repo
+	// override set — with no forge call → noLimiter, like the other admin writes.
+	{"POST", "/api/admin/override-requests/{id}/approve", noLimiter},
+	{"POST", "/api/admin/override-requests/{id}/reject", noLimiter},
 	// PRD #602 M4: agent-source "Sync now" + approve-and-apply — cookie-only admin
 	// writes, no per-user forge/model spend → noLimiter.
 	{"POST", "/api/admin/agent-source/sync", noLimiter},
