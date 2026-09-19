@@ -431,3 +431,13 @@ func TestPokeReconcilesAndPollsUser(t *testing.T) {
 		t.Fatalf("poke2 want 1 upsert after recovery, got %d", len(st.upserts))
 	}
 }
+
+// TestPokeNonBlocking proves Engine.Poke drops the signal (never blocks or panics) once the
+// bounded poke buffer is full — the next tick covers the user regardless. Mirrors the Claude
+// usagepoller engine's TestPokeNonBlocking.
+func TestPokeNonBlocking(t *testing.T) {
+	e := newEngineFor(newFakeStore(), &fakeCollector{}, &fakeReconciler{})
+	for i := 0; i < pokeBuffer+10; i++ {
+		e.Poke(uuid.New()) // must not block or panic past the buffer
+	}
+}

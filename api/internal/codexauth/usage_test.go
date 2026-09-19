@@ -35,10 +35,11 @@ func newUsageClient(r *usageResponder) *Client {
 
 func TestReadUsageDecodeTable(t *testing.T) {
 	tests := []struct {
-		name    string
-		body    string
-		wantErr bool
-		check   func(t *testing.T, r UsageReading)
+		name      string
+		body      string
+		wantErr   bool
+		wantErrIs error // when set, the error must satisfy errors.Is(err, wantErrIs)
+		check     func(t *testing.T, r UsageReading)
 	}{
 		{
 			name: "full payload",
@@ -149,19 +150,23 @@ func TestReadUsageDecodeTable(t *testing.T) {
 			},
 		},
 		{
-			name:    "duplicate additional id rejected",
-			body:    `{"user_id":"u","account_id":"a","additional_rate_limits":[{"limit_name":"dup","rate_limit":{}},{"limit_name":"dup","rate_limit":{}}]}`,
-			wantErr: true,
+			name:      "duplicate additional id rejected",
+			body:      `{"user_id":"u","account_id":"a","additional_rate_limits":[{"limit_name":"dup","rate_limit":{}},{"limit_name":"dup","rate_limit":{}}]}`,
+			wantErr:   true,
+			wantErrIs: ErrUsageDuplicateBucket,
 		},
 		{
-			name:    "additional colliding with reserved codex id rejected",
-			body:    `{"user_id":"u","account_id":"a","rate_limit":{"allowed":true},"additional_rate_limits":[{"limit_name":"codex","rate_limit":{}}]}`,
-			wantErr: true,
+			name:      "additional colliding with reserved codex id rejected",
+			body:      `{"user_id":"u","account_id":"a","rate_limit":{"allowed":true},"additional_rate_limits":[{"limit_name":"codex","rate_limit":{}}]}`,
+			wantErr:   true,
+			wantErrIs: ErrUsageDuplicateBucket,
 		},
 		{
 			name: "control/bidi-laden label sanitized",
-			// limit_name carries a C0 escape, a bidi override (U+202E), a newline and a
-			// zero-width space around the real slug; all must be stripped, leaving "danger".
+			// limit_name (in the JSON body below) wraps the real slug in a C0 ESC introducer,
+			// a bidi override (U+202E), a newline and a zero-width space (U+200B).
+			// sanitizeBucketLabel strips the ESC byte and the other unsafe runes but KEEPS the
+			// printable bracket-2-J tail that trailed the ESC, so the slug reduces to "da[2Jnger".
 			body: "{\"user_id\":\"u\",\"account_id\":\"a\",\"additional_rate_limits\":[{\"limit_name\":\"da\\u001b[2Jn\\u202eg\\ne\\u200br\",\"rate_limit\":{}}]}",
 			check: func(t *testing.T, r UsageReading) {
 				if len(r.Buckets) != 1 {
@@ -187,6 +192,9 @@ func TestReadUsageDecodeTable(t *testing.T) {
 			if tc.wantErr {
 				if err == nil {
 					t.Fatalf("want error, got reading %+v", r)
+				}
+				if tc.wantErrIs != nil && !errors.Is(err, tc.wantErrIs) {
+					t.Fatalf("error = %v, want errors.Is(err, %v)", err, tc.wantErrIs)
 				}
 				return
 			}
