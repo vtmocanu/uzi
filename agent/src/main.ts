@@ -1,5 +1,6 @@
 import path from "node:path";
-import { loadConfig, MAX_CONCURRENT_RUNS_SOFT_CEILING } from "./config.js";
+import { fileURLToPath } from "node:url";
+import { loadConfig, MAX_CONCURRENT_RUNS_SOFT_CEILING, type ExecutorKind } from "./config.js";
 import { createLogger, type Logger } from "./log.js";
 import { WorkerClient, RequestError } from "./client.js";
 import { GitCache } from "./git.js";
@@ -9,7 +10,7 @@ import { selectCodexBinding, CodexSelectionError } from "./codex/select.js";
 import { CodexExecutor, FailClosedExecutor, CODEX_PRODUCTION_PROVIDER, makeProductionCodexAdviceHarnessFactory } from "./codex/codex-executor.js";
 import { ChatExecutor, type ChatExecutorLike } from "./chat-executor.js";
 import { StubChatExecutor } from "./chat-executor-stub.js";
-import { RunRunner, type ExecutorFactory } from "./runner.js";
+import { RunRunner, type ExecutorFactory, type RunExecution } from "./runner.js";
 import { ChatRunner } from "./chat-runner.js";
 import { Outbox } from "./outbox.js";
 import { ActiveRunRegistry } from "./active-run-registry.js";
@@ -20,12 +21,122 @@ import { Worker } from "./worker.js";
 import { reclaimStrandedRunHomes } from "./home-reclaim.js";
 import { errMessage } from "./util.js";
 import { uidSplitActive } from "./runner-uid.js";
-import { resolveDockerWiring, dockerSidecarExpected } from "./docker-wiring.js";
+import { resolveDockerWiring, dockerSidecarExpected, type DockerWiring } from "./docker-wiring.js";
 import { probeCodexRuntime } from "./codex/codex-runtime-probe.js";
+import type { ClaimCodexSecrets } from "./protocol.js";
 
 // Set once the logger exists so the last-resort fatal handler can scrub through
 // the SecretRegistry instead of writing a raw (unredacted) line.
 let fatalLog: Logger | undefined;
+
+/** Dependencies {@link buildRunExecutor} needs, factored out of `main()`'s closure so
+ *  the seam is callable in isolation (PRD #1429 M6 test). Production always supplies
+ *  the real `log`/`client` and the live-resolved `sdkHomeRoot`/`dockerWiring`; a test
+ *  supplies lightweight stand-ins (a `nullLogger()`, a throwaway `WorkerClient`, a
+ *  temp dir, a fabricated `DockerWiring`). */
+export interface BuildRunExecutorDeps {
+  log: Logger;
+  client: WorkerClient;
+  sdkHomeRoot: string;
+  executorKind: ExecutorKind;
+  stubPlanGate: boolean;
+  workerTokenFile?: string;
+  dockerWiring: DockerWiring;
+}
+
+/**
+ * Build a per-execution executor for a run id. Factored out of `main()`'s
+ * `makeExecutor` closure (PRD #1429 M6) ONLY so a test can call it directly without
+ * importing `main.ts`'s side-effecting `main()` entrypoint (guarded below); the
+ * construction logic and its ordering are otherwise untouched.
+ *
+ * PRD #1171 M3 — the claim-aware DARK selection seam. `selectCodexBinding` is a pure,
+ * fail-closed discriminator: ABSENCE of the block takes the LITERAL current Claude/stub
+ * path below (Claude byte-for-byte); a COMPLETE server-owned block selects Codex; a
+ * PRESENT-but-BROKEN block throws a bounded, secret-free CodexSelectionError. We wrap
+ * the select so that throw becomes a FailClosedExecutor whose run() re-throws the
+ * message (routing through the runner's failed-run catch), NEVER a Claude fallback and
+ * NEVER a crash of executeClaim itself.
+ */
+export function buildRunExecutor(runId: string, codex: ClaimCodexSecrets | undefined, deps: BuildRunExecutorDeps): RunExecution {
+  const { log, client, sdkHomeRoot, executorKind, stubPlanGate, workerTokenFile, dockerWiring } = deps;
+  let selection;
+  try {
+    selection = selectCodexBinding({ codex });
+  } catch (err) {
+    if (err instanceof CodexSelectionError) {
+      return { executor: new FailClosedExecutor(err.message) };
+    }
+    throw err;
+  }
+
+  // PRD #1429 M6: the harness-neutral e2e stub seam. This MUST run before the
+  // `selection.kind === "codex"` branch below, or a stub-configured worker would
+  // still build the production CodexExecutor for a Codex-bound claim and call/
+  // release the real credential — defeating the point of the stub. The stub
+  // simulates plan/implement and calls no provider; it never reads
+  // `selection.binding`, never claims/releases the Codex credential and
+  // constructs no Codex class, so it is safe to return for EITHER
+  // `selection.kind`. The stub has no SDK $HOME (no session transcript to
+  // isolate); its only homeDir use is the provisioning subprocess HOME, which
+  // stays SHARED (warm-start) like the SDK executor's. So the stub keeps the
+  // shared root and there is nothing per-run to clean (homeDir omitted from the
+  // RunExecution).
+  //
+  // Production is unchanged: `parseExecutor` (config.ts) only ever returns
+  // "stub" or "sdk" ("sdk" is the default for undefined/omitted), and only
+  // e2e/tests set UZI_EXECUTOR=stub — so `config.executor` is never "stub" in
+  // production and this branch is inert there. A real (non-stub) Codex claim
+  // still falls through to the `selection.kind === "codex"` branch below
+  // unchanged.
+  if (executorKind === "stub") {
+    return { executor: new StubExecutor(log, { planGate: stubPlanGate, homeDir: sdkHomeRoot }) };
+  }
+
+  if (selection.kind === "codex") {
+    // A validated Codex binding: the production CodexExecutor over the M3a launcher, the
+    // dark core and the M1 credential bridge. Per-run owned HOME (like SdkExecutor).
+    const runHome = path.join(sdkHomeRoot, runId);
+    const executor = new CodexExecutor(
+      log,
+      runHome,
+      {
+        binding: selection.binding,
+        client,
+        provider: CODEX_PRODUCTION_PROVIDER,
+      },
+      {
+        // PRD #1171 m4 (F1): the RUNNER owns the terminal registry teardown. Its post-run
+        // durability sinks (park/shutdown/finalize) reap the provider root through
+        // withBoundary AFTER run() returns, and executeClaim's finally calls safety.dispose
+        // once the last sink settles — so run()'s finally must leave the registry ALIVE.
+        deferRegistryTeardown: true,
+      },
+    );
+    return { executor, homeDir: runHome };
+  }
+
+  // selection.kind === "claude": the EXACT legacy path, unchanged.
+  const runHome = path.join(sdkHomeRoot, runId);
+  const executor = new SdkExecutor(log, runHome, {
+    // Deny a Bash `cat` of the join-token file (a read-only secret mount
+    // persists it); the built-in /run/secrets/ prefix already covers the
+    // shipping default, this adds a non-default UZI_WORKER_TOKEN_FILE path.
+    secretPaths: workerTokenFile ? [workerTokenFile] : [],
+    // The nix/devbox provisioning HOME + root stay SHARED worker-lifetime paths
+    // (Decision 5): only the SDK $HOME (runHome) is per-run, so warm-start state
+    // doesn't fragment per run. The per-run provision DIR still isolates the
+    // synthesized devbox.json.
+    provisionHomeDir: sdkHomeRoot,
+    // Docker wiring (PRD #83 M1): the same startup-resolved wiring for every run —
+    // gates the Bash guardrail's docker rule and supplies DOCKER_HOST to the SDK env.
+    dockerWiring,
+    // PRD #90: the worker→API client, so the lead's save_memory MCP tool can POST a
+    // cross-run learning (the server derives (user, repo) from the run claim).
+    client,
+  });
+  return { executor, homeDir: runHome };
+}
 
 async function main(): Promise<void> {
   // PRD #51 M4: under the uid split, run the worker with umask 002 so (a) the runner-owned
@@ -154,74 +265,20 @@ async function main(): Promise<void> {
   // what hid it: "stable across resume" reads as a guarantee it cannot make. The
   // runner now preflights the transcript and drops an unresolvable resume with an
   // honest run message (issue #105, sdk-session.ts).
-  const makeExecutor: ExecutorFactory = (runId, codex) => {
-    // PRD #1171 M3 — the claim-aware DARK selection seam. `selectCodexBinding` is a pure,
-    // fail-closed discriminator: ABSENCE of the block takes the LITERAL current Claude/stub
-    // path below (Claude byte-for-byte); a COMPLETE server-owned block selects Codex; a
-    // PRESENT-but-BROKEN block throws a bounded, secret-free CodexSelectionError. We wrap
-    // the select so that throw becomes a FailClosedExecutor whose run() re-throws the
-    // message (routing through the runner's failed-run catch), NEVER a Claude fallback and
-    // NEVER a crash of executeClaim itself.
-    let selection;
-    try {
-      selection = selectCodexBinding({ codex });
-    } catch (err) {
-      if (err instanceof CodexSelectionError) {
-        return { executor: new FailClosedExecutor(err.message) };
-      }
-      throw err;
-    }
-    if (selection.kind === "codex") {
-      // A validated Codex binding: the production CodexExecutor over the M3a launcher, the
-      // dark core and the M1 credential bridge. Per-run owned HOME (like SdkExecutor).
-      const runHome = path.join(sdkHomeRoot, runId);
-      const executor = new CodexExecutor(
-        log,
-        runHome,
-        {
-          binding: selection.binding,
-          client,
-          provider: CODEX_PRODUCTION_PROVIDER,
-        },
-        {
-          // PRD #1171 m4 (F1): the RUNNER owns the terminal registry teardown. Its post-run
-          // durability sinks (park/shutdown/finalize) reap the provider root through
-          // withBoundary AFTER run() returns, and executeClaim's finally calls safety.dispose
-          // once the last sink settles — so run()'s finally must leave the registry ALIVE.
-          deferRegistryTeardown: true,
-        },
-      );
-      return { executor, homeDir: runHome };
-    }
-
-    // selection.kind === "claude": the EXACT legacy path, unchanged.
-    // The stub has no SDK $HOME (no session transcript to isolate); its only homeDir
-    // use is the provisioning subprocess HOME, which stays SHARED (warm-start) like
-    // the SDK executor's. So the stub keeps the shared root and there is nothing
-    // per-run to clean (homeDir omitted from the RunExecution).
-    if (config.executor === "stub") {
-      return { executor: new StubExecutor(log, { planGate: config.stubPlanGate, homeDir: sdkHomeRoot }) };
-    }
-    const runHome = path.join(sdkHomeRoot, runId);
-    const executor = new SdkExecutor(log, runHome, {
-      // Deny a Bash `cat` of the join-token file (a read-only secret mount
-      // persists it); the built-in /run/secrets/ prefix already covers the
-      // shipping default, this adds a non-default UZI_WORKER_TOKEN_FILE path.
-      secretPaths: config.workerTokenFile ? [config.workerTokenFile] : [],
-      // The nix/devbox provisioning HOME + root stay SHARED worker-lifetime paths
-      // (Decision 5): only the SDK $HOME (runHome) is per-run, so warm-start state
-      // doesn't fragment per run. The per-run provision DIR still isolates the
-      // synthesized devbox.json.
-      provisionHomeDir: sdkHomeRoot,
-      // Docker wiring (PRD #83 M1): the same startup-resolved wiring for every run —
-      // gates the Bash guardrail's docker rule and supplies DOCKER_HOST to the SDK env.
-      dockerWiring: config.dockerWiring,
-      // PRD #90: the worker→API client, so the lead's save_memory MCP tool can POST a
-      // cross-run learning (the server derives (user, repo) from the run claim).
+  // The construction logic (dark Codex selection, the stub short-circuit, real
+  // Codex/SdkExecutor wiring) lives in the top-level `buildRunExecutor` above,
+  // factored out so a test can call it directly. This closure only binds it to
+  // this process's live config/log/client/sdkHomeRoot.
+  const makeExecutor: ExecutorFactory = (runId, codex) =>
+    buildRunExecutor(runId, codex, {
+      log,
       client,
+      sdkHomeRoot,
+      executorKind: config.executor,
+      stubPlanGate: config.stubPlanGate,
+      workerTokenFile: config.workerTokenFile,
+      dockerWiring: config.dockerWiring,
     });
-    return { executor, homeDir: runHome };
-  };
   const runner = new RunRunner(client, git, makeExecutor, log, config.messageBatchMs, config.workerToken, {
     pollMs: config.pollIntervalMs,
     planApprovalTimeoutMs: config.planApprovalTimeoutMs,
@@ -288,10 +345,24 @@ async function main(): Promise<void> {
   // runReadOnlyModelPass (model-pass.ts) so a Codex judge/review claim (secrets.codex
   // present) gets a REAL Codex advice pass instead of the missing-token fallback. Built
   // HERE — one of the two sites semgrep/codex-fixed-constructor.yml allows to construct a
-  // Codex class (the other is codex/codex-executor.ts itself) — and injected as an option,
-  // mirroring how makeExecutor above selects the real CodexExecutor unconditionally
-  // whenever the claim carries a valid codex block (never stub-gated; UZI_EXECUTOR=stub
-  // only ever affects the CLAUDE path).
+  // Codex class (the other is codex/codex-executor.ts itself) — and injected as an option.
+  //
+  // UNLIKE the run lane's `buildRunExecutor` (PRD #1429 M6, above this function): this
+  // factory is always built, and a codex-bound judge/review claim always constructs the
+  // REAL CodexAdviceHarness, regardless of `config.executor`. The judge/review e2e path
+  // proves itself through the packaged-only LOOPBACK app-server provider
+  // (`CODEX_M3B_LOOPBACK_PROVIDER_NAME`, wired via `appServerAuthOpenAIBaseUrlForTest`),
+  // not through a generic stub — so there is no judge-lane equivalent of the run lane's
+  // stub-before-codex short-circuit. `stubJudgeQueryFn` below only ever gates the CLAUDE
+  // judge's `queryFn`; the Codex judge/review path (`runCodexAdviceModelPass`) takes no
+  // `queryFn` at all and is unaffected by it.
+  //
+  // (This comment used to say makeExecutor "unconditionally" selected the real
+  // CodexExecutor the same way, with UZI_EXECUTOR=stub "only ever" affecting the Claude
+  // path. That was the M6 bug this PRD fixes, not an intended parallel: the run lane's
+  // stub now DOES short-circuit a codex-bound claim to StubExecutor before it ever
+  // reaches the codex branch. Only this judge/review advice lane keeps the old
+  // always-real-CodexAdviceHarness shape.)
   const codexAdviceHarnessFactory = makeProductionCodexAdviceHarnessFactory(client, log, sdkHomeRoot);
 
   // The judge lane (PRD #46): a slim runner for `judge` claims. It reuses the SDK
@@ -386,17 +457,34 @@ async function main(): Promise<void> {
   log.info("uzi-agent stopped");
 }
 
-main().catch((err) => {
-  // Last-resort handler: config errors and unexpected fatals land here.
-  const message = errMessage(err);
-  if (fatalLog) {
-    // Route through the logger so any registered secret is scrubbed.
-    fatalLog.error("fatal", { error: message });
-  } else {
-    // Logger not up yet — config load failed before any secret was registered
-    // (loadConfig errors carry only env key names / duration values, never the
-    // token), so a raw line is safe here.
-    process.stderr.write(JSON.stringify({ level: "error", msg: "fatal", error: message }) + "\n");
+// PRD #1429 M6: only auto-run `main()` when this module is the process ENTRYPOINT
+// (npm run start -> `tsx src/main.ts`, so process.argv[1] resolves to this exact
+// file), never when it is merely IMPORTED — e.g. by an agent/test/*.test.ts that
+// wants `buildRunExecutor` without paying for the full worker bootstrap
+// (loadConfig/resolveDockerWiring/probeCodexRuntime/worker.run(), none of which a
+// unit test can satisfy). Production is unaffected: `npm run start`/`tsx
+// src/main.ts` always sets argv[1] to this file, so the guard is true there.
+const isEntrypoint = (() => {
+  try {
+    return process.argv[1] !== undefined && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
+  } catch {
+    return false;
   }
-  process.exitCode = 1;
-});
+})();
+
+if (isEntrypoint) {
+  main().catch((err) => {
+    // Last-resort handler: config errors and unexpected fatals land here.
+    const message = errMessage(err);
+    if (fatalLog) {
+      // Route through the logger so any registered secret is scrubbed.
+      fatalLog.error("fatal", { error: message });
+    } else {
+      // Logger not up yet — config load failed before any secret was registered
+      // (loadConfig errors carry only env key names / duration values, never the
+      // token), so a raw line is safe here.
+      process.stderr.write(JSON.stringify({ level: "error", msg: "fatal", error: message }) + "\n");
+    }
+    process.exitCode = 1;
+  });
+}
