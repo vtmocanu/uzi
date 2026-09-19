@@ -7,7 +7,7 @@
 
 ## Decision (summary)
 
-Releases are cut as **release candidates by default**. `release-cut X.Y.Z` cuts `vX.Y.Z-rc.1`; the tag publishes the five images and the chart at `X.Y.Z-rc.1` exactly as a stable tag does, creates a GitHub Release flagged **pre-release** (never latest), and does **not** publish the Homebrew formula. A stable `vX.Y.Z` is a **promotion** of the in-flight candidate, built from the candidate's own commit on a throwaway release branch, cut in **lockstep** with the next candidate by a single `release-cut Y.Z.W --promote`. Stable-only surfaces — the Homebrew formula, the GitHub Release marked latest, and the in-app update check — never surface a candidate. A deployment opts into running candidates by tracking the Helm `targetRevision` range `0.*-0` instead of `0.*`.
+Releases are cut as **release candidates by default**. `release-cut X.Y.Z` cuts `vX.Y.Z-rc.1`; the tag publishes the five images and the chart at `X.Y.Z-rc.1` exactly as a stable tag does, creates a GitHub Release flagged **pre-release** (never latest), and does **not** publish the stable Homebrew formula (since PRD #1378 an RC publishes only the separate, opt-in `uzi-cli-rc` formula). A stable `vX.Y.Z` is a **promotion** of the in-flight candidate, built from the candidate's own commit on a throwaway release branch, cut in **lockstep** with the next candidate by a single `release-cut Y.Z.W --promote` (or alone, by `release-cut X.Y.Z --promote-only`, when the next candidate is not wanted yet). Stable-only surfaces — the Homebrew formula, the GitHub Release marked latest, and the in-app update check — never surface a candidate. A deployment opts into running candidates by tracking the Helm `targetRevision` range `0.*-0` instead of `0.*`.
 
 ## Context
 
@@ -19,14 +19,17 @@ The publish pipeline was already largely prerelease-aware: `release.yml`'s `asse
 
 ### D1 — RC by default; stable is a promotion, or an explicit escape
 
-`release-cut <X.Y.Z>` names the version a candidate is cut **for**; the tag shape is derived. `release-cut.sh` (`.agents/skills/uzi-release/scripts/`) is a tag-derived state machine. From the tags it derives the highest stable `S` and the **in-flight RC** — the highest-versioned `vX.Y.Z-rc.N` whose base has no stable tag. Verbs:
+`release-cut <X.Y.Z>` names the version a candidate is cut **for**; the tag shape is derived. `release-cut.sh` (`.agents/skills/uzi-release/scripts/`) is a tag-derived state machine. From the tags it derives the highest stable `S` and the **in-flight RC** — the highest-versioned `vX.Y.Z-rc.N` whose base has no stable tag and sits above `S` (a base at or below `S` with no stable of its own was abandoned by `--skip-promote`; lockstep always left a newer candidate to mask it, a promotion that cuts none does not, so discovery excludes it). Verbs:
 
 - default, no RC in flight → `vX.Y.Z-rc.1`;
 - default, RC in flight for **this** base (`release-cut B` while `vB-rc.N` exists) → the next candidate `vB-rc.(N+1)` (requires `[Unreleased]` empty, D3);
 - default, RC in flight for a **lower** base → refuse (exit 3) and print the facts, so the lead picks a verb;
 - `--promote` → promote the in-flight RC to stable (D5), then cut `vX.Y.Z-rc.1` on main;
+- `--promote-only` (given the in-flight base itself) → promote the in-flight RC to stable (D5) and stop: no next candidate, `main` untouched (amendment, below);
 - `--skip-promote` → abandon the RC, rename its open section to `X.Y.Z` and fold `[Unreleased]` in, cut `vX.Y.Z-rc.1`;
 - `--stable` → a plain `vX.Y.Z` from main's tip (the old one-step model), refused while an RC is in flight.
+
+**Promotion without a next candidate (amended 2026-09-19).** Lockstep assumes the next candidate is wanted the moment a stable is. It is not when `main` has merged work the owner wants held back from the candidate channel: the dogfooding deployment tracks `0.*-0` (D8), so a candidate deploys the moment it publishes. `--promote-only` decouples the halves. It runs D5's promote alone, keyed by the in-flight base so the argument names the stable being created; a next-version argument is refused, since it signals the lead expected a candidate. It keeps the published-RC refusal (D11) and refuses every main-half option (`--changelog-file`, `--no-commit`, `--prev-tag`). Afterwards no RC is in flight, so the next plain `release-cut <next>` is an ordinary `rc.1` whose coverage window starts at the new stable (D4), and the work held back ships there. `--promote` already took this branch implicitly when nothing shipping had landed since the RC and `[Unreleased]` was empty; the verb makes it available by intent instead of by the state of `main`. Cost: `main` is untouched, so until the next cut its `Chart.yaml` stays at the RC version and its `## [B]` heading keeps the RC-cut date while the stable tag's copy carries the promotion date. The next cut of a new base reconciles that heading from the `vB` tag's copy (D3: promotion dates the section), so the drift never outlives one cycle; the same applies to the implicit promote-only branch.
 
 **Tag discovery never sorts a mixed stable/prerelease list.** Git's `version:refname` orders `-rc.N` against its base by string length; the scripts filter stable tags first, and find the in-flight RC by grouping `v*-rc.*` per base and comparing `N` numerically. The script never prompts (D7): refusals exit 3 with the facts and the `uzi-release` skill owns the conversation.
 
@@ -60,10 +63,10 @@ A deployment that should run candidates tracks the Helm `targetRevision` range `
 
 ## Stable-only surfaces (D9), and how the train protects them
 
-- **Homebrew** — `brew.yml`'s tag trigger is `["v*", "!v*-*"]`, so an RC tag creates no run at all (the fix is "do not run", not "run and fail", so `release-watch.sh` has nothing to wait for). The strict Validate regex remains the second line of defense for `workflow_dispatch`.
+- **Homebrew** — the stable `uzi-cli` formula is published by stable tags only. Originally `brew.yml`'s tag trigger was `["v*", "!v*-*"]`, so an RC tag created no run at all; since PRD #1378 it triggers on every `v*` tag and its Detect-channel step routes an RC to the separate, opt-in `uzi-cli-rc` formula, so stable users still never see a candidate and `release-watch.sh` waits on `brew.yml` for both channels. The strict Validate regex remains the second line of defense for `workflow_dispatch`.
 - **The GitHub Release "Latest" badge** — `publish-release` marks any `-`-carrying tag pre-release.
 - **The in-app update check** — `releasecheck` reads `releases/latest` (server-side non-prerelease) and compares with `x/mod/semver`. No test pinned a prerelease running version; M5 added them (no behaviour change).
-- **`release-verify.sh`** is channel-aware: stable asserts the Release is latest; RC asserts it is flagged pre-release and `releases/latest` is unchanged. **`release-watch.sh`** watches `release.yml` only for an RC, both for a stable. Both read the channel from the shared `scripts/lib/release-mode.sh`, so they never disagree about whether a tag is an RC.
+- **`release-verify.sh`** is channel-aware: stable asserts the Release is latest; RC asserts it is flagged pre-release and `releases/latest` is unchanged. **`release-watch.sh`** watches `release.yml` and `brew.yml` for every tag (since PRD #1378 an RC publishes the opt-in `uzi-cli-rc` formula; originally it watched `release.yml` only for an RC). Both read the channel from the shared `scripts/lib/release-mode.sh`, so they never disagree about whether a tag is an RC.
 - **The web changelog drawer** — `web/src/lib/semver.ts` parses an `X.Y.Z-rc.N` running version to its stable base, so on the RC-dogfooding instance the `[X.Y.Z]` section still marks "You're running this" and no false "available" banner fires (precise `rc < stable` ordering would wrongly flag the in-progress section as an update).
 
 ## Scope beyond the PRD's stated list
