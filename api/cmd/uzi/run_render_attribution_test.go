@@ -230,3 +230,140 @@ func TestRenderRunDetailNonOwnerLiveAgentShowsGlobalNow(t *testing.T) {
 		t.Errorf("PRD #1353 M1: the global NOW row must carry the live reviewer/tool/age (the honesty fix):\n%s", out)
 	}
 }
+
+// PRD #1353 M5 — CLI `uzi run get` LIVE LANES.
+//
+// When the run HAS LANES (a non-terminal run with ≥1 in-progress milestone carrying lanes in
+// MilestonesLive), milestoneLaneRows is the AUTHORITATIVE live display and SUPERSEDES the M1
+// single-current_activity path: it emits a QUIET `OWNER <id>` row per declared owner plus one
+// `NOW <id>` row per LANE, and the M1 global/unattached now-line is NOT emitted. The lanes' At is
+// future-dated so relAge floors the age to "0s ago" deterministically.
+
+// TestMilestoneLaneRowsLivesSupersedeM1 pins the lanes branch: m2 has a declared owner AND two
+// reviewer lanes (repeated role, distinguished by label/detail) → one `OWNER m2` + two `NOW m2`
+// rows; m3 has a lane but NO declared owner → just a `NOW m3` row (no `OWNER m3`). current_activity
+// is set (a coder that would uniquely match m2 under M1), but in the lanes branch it is suppressed —
+// its distinctive detail must NOT appear, and no global `NOW` row is emitted.
+func TestMilestoneLaneRowsLivesSupersedeM1(t *testing.T) {
+	at := time.Now().Add(2 * time.Hour) // relAge floors a not-yet timestamp to "0s"
+	r := apitypes.RunDTO{
+		ID: "run-1353-cli-lanes", Kind: "issue", Status: "running", IssueTitle: "Add rate limiting",
+		Milestones: []apitypes.Milestone{
+			{ID: "m1", Title: "Alpha"}, {ID: "m2", Title: "Beta"}, {ID: "m3", Title: "Gamma"},
+		},
+		MilestonesCompleted:  []string{"m1"},
+		MilestonesInProgress: []string{"m2", "m3"},
+		// m2 has a declared owner; m3 does NOT — proving the OWNER row is per-owner while the NOW
+		// rows are per-lane.
+		MilestonesAgents: []apitypes.MilestoneAgent{
+			{ID: "m2", Agent: "coder", AgentLabel: "Wire the limiter"},
+		},
+		MilestonesLive: []apitypes.MilestoneLive{
+			{MilestoneID: "m2", Lanes: []apitypes.MilestoneLane{
+				{Agent: "reviewer", AgentInstance: "toolu_a", AgentLabel: "Review A", Tool: "Read", Detail: "a.go", At: at},
+				{Agent: "reviewer", AgentInstance: "toolu_b", AgentLabel: "Review B", Tool: "Read", Detail: "b.go", At: at},
+			}},
+			{MilestoneID: "m3", Lanes: []apitypes.MilestoneLane{
+				{Agent: "tester", AgentInstance: "toolu_c", AgentLabel: "Sweep", Tool: "Bash", Detail: "run tests", At: at},
+			}},
+		},
+		// A live current_activity that WOULD ride a global/M1 NOW row (its detail is the unique marker
+		// "window.go") — the lanes branch must suppress it entirely.
+		CurrentActivity: &apitypes.RunActivity{
+			Agent: "coder", AgentLabel: "coder busy", Tool: "Edit",
+			Detail: "api/internal/limits/window.go", At: at, Seq: 12,
+		},
+	}
+
+	got := milestoneLaneRows(r)
+	want := [][]string{
+		{"OWNER m2", "coder · Wire the limiter"},
+		{"NOW m2", "reviewer · Review A · Read a.go · 0s ago"},
+		{"NOW m2", "reviewer · Review B · Read b.go · 0s ago"},
+		{"NOW m3", "tester · Sweep · Bash run tests · 0s ago"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("PRD #1353 M5 milestoneLaneRows drifted.\n--- got ---\n%#v\n--- want ---\n%#v", got, want)
+	}
+
+	var buf bytes.Buffer
+	p := uzicli.NewPrinter(&buf, false, false, true, false) // non-tty, non-json, no colour
+	if err := renderRunDetail(p, r); err != nil {
+		t.Fatalf("renderRunDetail: %v", err)
+	}
+	out := buf.String()
+	// Three `NOW <id>` rows (two lanes on m2, one on m3), and NO global `NOW` row (its distinctive
+	// current_activity detail must be absent — lanes supersede it).
+	if n := countNowRows(out); n != 3 {
+		t.Errorf("PRD #1353 M5: a run with lanes must emit one NOW row per lane (3 here), got %d:\n%s", n, out)
+	}
+	for _, sub := range []string{
+		"OWNER m2",
+		"coder · Wire the limiter",
+		"NOW m2",
+		"reviewer · Review A · Read a.go · 0s ago",
+		"reviewer · Review B · Read b.go · 0s ago",
+		"NOW m3",
+		"tester · Sweep · Bash run tests · 0s ago",
+	} {
+		if !strings.Contains(out, sub) {
+			t.Errorf("PRD #1353 M5: lanes `run get` output missing %q:\n%s", sub, out)
+		}
+	}
+	// m3 has a lane but no declared owner — no `OWNER m3` row.
+	if strings.Contains(out, "OWNER m3") {
+		t.Errorf("PRD #1353 M5: a milestone with lanes but no declared owner must not emit an OWNER row:\n%s", out)
+	}
+	// The M1 current_activity display is superseded: its unique detail and its own label must not appear.
+	for _, gone := range []string{"api/internal/limits/window.go", "coder busy"} {
+		if strings.Contains(out, gone) {
+			t.Errorf("PRD #1353 M5: the lanes branch must suppress the M1 current_activity display, but %q appeared:\n%s", gone, out)
+		}
+	}
+}
+
+// TestMilestoneLaneRowsBackCompatNilLive is the D5 back-compat pin: with MilestonesLive nil,
+// milestoneLaneRows returns nil and renderRunDetail falls to the M1 path byte-for-byte. The SAME run
+// as the lanes test minus MilestonesLive: the coder current_activity uniquely matches m2's declared
+// owner, so M1 emits a single `NOW m2` live row carrying the current_activity detail, and countNowRows
+// is 1 (the unattributed/attributed M1 contract, unchanged).
+func TestMilestoneLaneRowsBackCompatNilLive(t *testing.T) {
+	at := time.Now().Add(2 * time.Hour)
+	r := apitypes.RunDTO{
+		ID: "run-1353-cli-nolive", Kind: "issue", Status: "running", IssueTitle: "Add rate limiting",
+		Milestones: []apitypes.Milestone{
+			{ID: "m1", Title: "Alpha"}, {ID: "m2", Title: "Beta"}, {ID: "m3", Title: "Gamma"},
+		},
+		MilestonesCompleted:  []string{"m1"},
+		MilestonesInProgress: []string{"m2", "m3"},
+		MilestonesAgents: []apitypes.MilestoneAgent{
+			{ID: "m2", Agent: "coder", AgentLabel: "Wire the limiter"},
+		},
+		MilestonesLive: nil, // the whole point: no lanes ⇒ the M1 path unchanged
+		CurrentActivity: &apitypes.RunActivity{
+			Agent: "coder", AgentLabel: "coder busy", Tool: "Edit",
+			Detail: "api/internal/limits/window.go", At: at, Seq: 12,
+		},
+	}
+	if got := milestoneLaneRows(r); got != nil {
+		t.Errorf("PRD #1353 M5 D5: milestoneLaneRows must return nil when MilestonesLive is nil, got %#v", got)
+	}
+
+	var buf bytes.Buffer
+	p := uzicli.NewPrinter(&buf, false, false, true, false)
+	if err := renderRunDetail(p, r); err != nil {
+		t.Fatalf("renderRunDetail: %v", err)
+	}
+	out := buf.String()
+	// M1 path: coder uniquely matches m2, so its live info rides `NOW m2` (the global is skipped),
+	// countNowRows == 1, and the current_activity detail IS shown (the M1 behaviour, not superseded).
+	if n := countNowRows(out); n != 1 {
+		t.Errorf("PRD #1353 M5 D5: back-compat (no lanes) must render the M1 output (countNowRows == 1), got %d:\n%s", n, out)
+	}
+	if !strings.Contains(out, "NOW m2") {
+		t.Errorf("PRD #1353 M5 D5: back-compat must keep the M1 `NOW m2` live row:\n%s", out)
+	}
+	if !strings.Contains(out, "coder · Wire the limiter · Edit api/internal/limits/window.go · 0s ago") {
+		t.Errorf("PRD #1353 M5 D5: back-compat must keep the M1 current_activity detail on the NOW row:\n%s", out)
+	}
+}

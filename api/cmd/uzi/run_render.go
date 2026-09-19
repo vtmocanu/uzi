@@ -162,24 +162,32 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 	// frozen milestone list and a global-default budget is byte-for-byte unchanged — the
 	// same back-compat contract the DTO's nil slices and null budgets carry.
 	rows = append(rows, milestoneRows(r)...)
-	// The NOW row(s) (PRD #1064 M5, D7; PRD #1224 M6; PRD #1353 M1 D6). With EFFECTIVE per-milestone
-	// attribution on a non-terminal run (D8), milestoneNowRows emits one row per attributed in-progress
-	// milestone: a `NOW <id>` row for the D3 unique-matching (live) lane carrying live tool/age, and a
-	// QUIET `OWNER <id>` tag row (role + label only, no age) for every idle declared owner.
+	// The NOW row(s). PRD #1353 M5 makes LIVE LANES the authoritative live display: when the run has
+	// at least one in-progress milestone with ≥1 lane in MilestonesLive, milestoneLaneRows emits the
+	// OWNER + per-lane `NOW <id>` rows and SUPERSEDES the M1 single-current_activity display — lanes
+	// are the real live frames, so the single `current_activity` line would only duplicate/undercount
+	// them. This is the D5 branch on lane PRESENCE (never a nil test): a non-terminal run with lanes
+	// takes the lanes path, everything else renders byte-for-byte as M1 did.
 	//
-	// PRD #1353 M1 then ALSO emits the single global nowRow whenever the live agent is NOT already shown
-	// on a `NOW <id>` row above — i.e. it matches no declared owner (a reviewer/tester) or is ambiguous
-	// (a repeated role, so uniqueMilestoneAgentMatch is ""). That keeps a live non-owner visible instead
-	// of vanishing (the pre-M1 `else if` dropped it). When the live agent DOES uniquely match a declared
-	// owner, its live info already rides that milestone's `NOW <id>` row, so the global is skipped (no
-	// duplication). The unattributed / [] / invalid-only / stale-only / terminal cases are byte-for-byte
-	// unchanged: milestoneNowRows returns nil AND uniqueMilestoneAgentMatch(empty, …) == "", so the
-	// single global nowRow is appended exactly as before (the M4 CLI baseline locks this).
-	rows = append(rows, milestoneNowRows(r)...)
-	if act := r.CurrentActivity; act != nil && !terminalRunStatuses[r.Status] {
-		if uniqueMilestoneAgentMatch(effectiveMilestoneAgents(r), act.Agent) == "" {
-			if row := nowRow(r); row != nil {
-				rows = append(rows, row)
+	// The M1 path (PRD #1064 M5, D7; PRD #1224 M6; PRD #1353 M1 D6): with EFFECTIVE per-milestone
+	// attribution on a non-terminal run (D8), milestoneNowRows emits one row per attributed in-progress
+	// milestone — a `NOW <id>` row for the D3 unique-matching (live) lane carrying live tool/age, and a
+	// QUIET `OWNER <id>` tag row (role + label only, no age) for every idle declared owner. It ALSO
+	// emits the single global nowRow whenever the live agent is NOT already shown on a `NOW <id>` row —
+	// it matches no declared owner (a reviewer/tester) or is ambiguous (a repeated role, so
+	// uniqueMilestoneAgentMatch is ""). That keeps a live non-owner visible instead of vanishing. When
+	// the live agent DOES uniquely match a declared owner, its live info already rides that milestone's
+	// `NOW <id>` row, so the global is skipped. The unattributed / [] / invalid-only / stale-only /
+	// terminal cases are byte-for-byte unchanged (the M4 CLI baseline locks this).
+	if laneRows := milestoneLaneRows(r); len(laneRows) > 0 {
+		rows = append(rows, laneRows...)
+	} else {
+		rows = append(rows, milestoneNowRows(r)...)
+		if act := r.CurrentActivity; act != nil && !terminalRunStatuses[r.Status] {
+			if uniqueMilestoneAgentMatch(effectiveMilestoneAgents(r), act.Agent) == "" {
+				if row := nowRow(r); row != nil {
+					rows = append(rows, row)
+				}
 			}
 		}
 	}
@@ -727,6 +735,128 @@ func milestoneNowRows(r apitypes.RunDTO) [][]string {
 		}
 	}
 	return rows
+}
+
+// milestoneLaneRows is the LIVE-LANES per-milestone block of `uzi run get` (PRD #1353 M5), and the
+// AUTHORITATIVE live display whenever the run HAS LANES — i.e. a non-terminal run with at least one
+// in-progress milestone carrying ≥1 lane in MilestonesLive (each lane is a subagent working that
+// milestone right now). It returns nil otherwise, which is the D5 back-compat branch: the caller
+// then falls to the M1 milestoneNowRows + global-now path unchanged. The branch is on lane PRESENCE
+// (a non-empty milestonesLiveIndex), never a nil test, so a pre-#1353 run — MilestonesLive JSON null
+// — renders exactly as before.
+//
+// Iterating r.Milestones (FROZEN order) keeps these rows aligned with milestoneRows above. For each
+// in-progress milestone the block emits, in order:
+//
+//   - a QUIET `OWNER <id>` tag row (declared role + label, NO age) when the milestone has a declared
+//     owner (effectiveMilestoneAgents) — the same honesty tag milestoneNowRows uses for an idle owner;
+//   - one `NOW <id>` row per LANE (matched by milestone id), `<agent> · <label> · <tool> <detail> ·
+//     <age> ago`, built exactly like nowRow / the M1 unique-match branch (empty segments drop, joined
+//     with " · "). Multiple lanes on one milestone yield multiple `NOW <id>` rows (reviewer×2 → two).
+//
+// In this branch the M1 unique-match promotion and the single global/unattached now-line are NOT
+// emitted (the caller skips them): the lanes ARE the live frames, so a single current_activity line
+// would only duplicate or undercount them.
+//
+// Agent, AgentLabel, Tool and Detail are UNTRUSTED, model-authored text (the server caps only
+// Detail/AgentLabel, leaving Agent/Tool unsanitized on the wire, D7), so every display segment goes
+// through cellText — the same terminal-safety backstop nowRow and the milestone-title rows rely on to
+// keep a hostile value from breaking the table rail.
+func milestoneLaneRows(r apitypes.RunDTO) [][]string {
+	if terminalRunStatuses[r.Status] {
+		return nil
+	}
+	laneIdx := milestonesLiveIndex(r)
+	if len(laneIdx) == 0 {
+		return nil
+	}
+	eff := effectiveMilestoneAgents(r)
+	var rows [][]string
+	for _, mi := range r.Milestones {
+		lanes := laneIdx[mi.ID]
+		e, hasOwner := eff[mi.ID]
+		if len(lanes) == 0 && !hasOwner {
+			continue
+		}
+		if hasOwner {
+			parts := make([]string, 0, 2)
+			if role := cellText(e.Agent); role != "" {
+				parts = append(parts, role)
+			}
+			if label := cellText(e.AgentLabel); label != "" {
+				parts = append(parts, label)
+			}
+			rows = append(rows, []string{"OWNER " + mi.ID, strings.Join(parts, " · ")})
+		}
+		for _, lane := range lanes {
+			parts := make([]string, 0, 4)
+			if role := cellText(lane.Agent); role != "" {
+				parts = append(parts, role)
+			}
+			if label := cellText(lane.AgentLabel); label != "" {
+				parts = append(parts, label)
+			}
+			// Tool + its most identifying argument as ONE segment: "Edit <path>", "Agent
+			// <description>", or a bare tool name when the rule left no detail — the exact shape nowRow
+			// builds. Empty segments drop, so no dangling separator.
+			tool := cellText(lane.Tool)
+			detail := cellText(lane.Detail)
+			switch {
+			case tool != "" && detail != "":
+				parts = append(parts, tool+" "+detail)
+			case tool != "":
+				parts = append(parts, tool)
+			case detail != "":
+				parts = append(parts, detail)
+			}
+			parts = append(parts, relAge(lane.At)+" ago")
+			rows = append(rows, []string{"NOW " + mi.ID, strings.Join(parts, " · ")})
+		}
+	}
+	return rows
+}
+
+// milestonesLiveIndex is the read-time re-filter of RunDTO.MilestonesLive keyed by milestone id
+// (PRD #1353 M5/M6), the lanes twin of effectiveMilestoneAgents. It restricts to entries whose id is
+// GENUINELY in progress — a frozen member of the live MilestonesInProgress set AND not already
+// completed — and carries ≥1 lane, so a stale snapshot never activates the lanes branch. Returns nil
+// when nothing survives, so a caller branches on "has lanes" via `len(...) > 0` (the D5 lane-presence
+// trigger, NOT a MilestonesLive-non-nil test). First-occurrence-wins on a duplicated milestone id
+// mirrors the server's first-valid-wins (and effectiveMilestoneAgents). Shared by the CLI `run get`
+// and the TUI crew rail so the two surfaces activate LIVE LANES off the identical rule.
+func milestonesLiveIndex(r apitypes.RunDTO) map[string][]apitypes.MilestoneLane {
+	if len(r.MilestonesLive) == 0 || len(r.MilestonesInProgress) == 0 || len(r.Milestones) == 0 {
+		return nil
+	}
+	inProg := make(map[string]bool, len(r.MilestonesInProgress))
+	for _, id := range r.MilestonesInProgress {
+		inProg[id] = true
+	}
+	completed := make(map[string]bool, len(r.MilestonesCompleted))
+	for _, id := range r.MilestonesCompleted {
+		completed[id] = true
+	}
+	frozen := make(map[string]bool, len(r.Milestones))
+	for _, mi := range r.Milestones {
+		frozen[mi.ID] = true
+	}
+	var out map[string][]apitypes.MilestoneLane
+	for _, ml := range r.MilestonesLive {
+		if !frozen[ml.MilestoneID] || !inProg[ml.MilestoneID] || completed[ml.MilestoneID] {
+			continue
+		}
+		if len(ml.Lanes) == 0 {
+			continue
+		}
+		if _, dup := out[ml.MilestoneID]; dup {
+			continue // first-occurrence wins (matches the server's first-valid-wins)
+		}
+		if out == nil {
+			out = make(map[string][]apitypes.MilestoneLane, len(r.MilestonesLive))
+		}
+		out[ml.MilestoneID] = ml.Lanes
+	}
+	return out
 }
 
 // summaryRows is the CLI surface of the plain-English run summaries (PRD #362 M5): the

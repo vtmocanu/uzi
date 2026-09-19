@@ -169,3 +169,71 @@ func TestTUIMilestoneAttributionNonOwnerLiveAgent(t *testing.T) {
 		t.Errorf("PRD #1353 M1: a live non-owner agent must appear as an unattached `↳ reviewer · <age>` now-line:\n%s", got)
 	}
 }
+
+// TestTUIMilestoneLanesRender is the PRD #1353 M6 crew-rail LIVE LANES golden: when the run has lanes
+// (MilestonesLive), the lanes are the authoritative live display. Under m2 (a declared owner) the rail
+// draws a QUIET owner line (no age) THEN the live lane line (↳ coder · 0s + the tool/detail + italic
+// label); under m3 (no declared owner) it draws one lane line per lane — two reviewer lanes here,
+// distinguished by tool arg + label. The eyebrow now-line is SUPPRESSED (the frame's "coder busy"
+// must not appear). The frame is future-dated so relAge floors the age to "0s".
+func TestTUIMilestoneLanesRender(t *testing.T) {
+	runID := "run-1353-tui-lanes"
+	at := time.Now().Add(2 * time.Hour) // relAge floors a not-yet timestamp to "0s"
+	run := apitypes.RunDTO{
+		ID: runID, Kind: "issue", Status: "running", Health: "ok", IssueTitle: "Add rate limiting",
+		Milestones: []apitypes.Milestone{
+			{ID: "m1", Title: "Alpha"}, {ID: "m2", Title: "Beta"}, {ID: "m3", Title: "Gamma"},
+		},
+		MilestonesCompleted:  []string{"m1"},
+		MilestonesInProgress: []string{"m2", "m3"},
+		// m2 has a declared owner (a QUIET owner line beside its lane); m3 has none (lanes only).
+		MilestonesAgents: []apitypes.MilestoneAgent{
+			{ID: "m2", Agent: "coder", AgentLabel: "Wire the limiter"},
+		},
+		MilestonesLive: []apitypes.MilestoneLive{
+			{MilestoneID: "m2", Lanes: []apitypes.MilestoneLane{
+				{Agent: "coder", AgentInstance: "toolu_1", AgentLabel: "Wire the limiter", Tool: "Edit", Detail: "window.go", At: at},
+			}},
+			{MilestoneID: "m3", Lanes: []apitypes.MilestoneLane{
+				{Agent: "reviewer", AgentInstance: "toolu_2", AgentLabel: "Review A", Tool: "Read", Detail: "a.go", At: at},
+				{Agent: "reviewer", AgentInstance: "toolu_3", AgentLabel: "Review B", Tool: "Read", Detail: "b.go", At: at},
+			}},
+		},
+	}
+	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
+	next, _ := m.Update(tea.ColorProfileMsg{Profile: colorprofile.Ascii})
+	m = next.(tuiModel)
+	// A driving frame supplies current_activity; the lanes branch SUPPRESSES the eyebrow now-line, so
+	// the frame's own label "coder busy" must NOT appear anywhere in the block.
+	frameAgent, frameLabel := "coder", "coder busy"
+	editPayload := json.RawMessage(`{"name":"Edit","input":{"file_path":"api/internal/limits/window.go"}}`)
+	m = applyDetail(m, run, []apitypes.MessageDTO{
+		{Seq: 1, Kind: "tool_use", Agent: &frameAgent, AgentLabel: &frameLabel, CreatedAt: at, Payload: editPayload},
+	})
+	got := milestoneBlockRegion(t, m.View().Content)
+
+	const want = "MILESTONES ▰▱▱ 1/3\n" +
+		"· m2, m3\n" +
+		" ✓ Alpha\n" +
+		" ◕ Beta\n" +
+		"   ↳ coder\n" +
+		"     Wire the limiter\n" +
+		"   ↳ coder · 0s\n" +
+		"     Edit window.go\n" +
+		"     Wire the limiter\n" +
+		" ◕ Gamma\n" +
+		"   ↳ reviewer · 0s\n" +
+		"     Read a.go\n" +
+		"     Review A\n" +
+		"   ↳ reviewer · 0s\n" +
+		"     Read b.go\n" +
+		"     Review B"
+
+	if got != want {
+		t.Errorf("PRD #1353 M6 TUI lanes render drifted.\n--- got ---\n%s\n--- want ---\n%s\n--- got (quoted) ---\n%q", got, want, got)
+	}
+	// The eyebrow now-line is suppressed in the lanes branch: the frame's own label never appears.
+	if strings.Contains(got, "coder busy") {
+		t.Errorf("PRD #1353 M6: the lanes branch must suppress the current_activity eyebrow now-line, but the frame label appeared:\n%s", got)
+	}
+}
