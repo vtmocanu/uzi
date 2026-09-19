@@ -812,6 +812,11 @@ Tracked as GitHub issue vtmocanu/uzi#1393; PRD at `prds/1391-worker-outbox-durab
 - While a worker still holds an unsent outcome for a run, no second execution of that run ever starts. (AI-synced 2026-09-17)
 - An outcome the api permanently refuses is shown on the run as held on the worker, and is resolved only by the owner explicitly discarding it, never on a timer. (AI-synced 2026-09-17)
 
+## Feature #1293 — Failed-run rate on the dashboard (global and per user)
+
+- The dashboard shows a failed-run percentage: global for admins, per user for everyone, and per user in the admin table. [user 2026-09-12]
+- In the admin per-user table the Failed and Fail rate columns come right after Runs, and Cost sits last before Share. [user 2026-09-12]
+
 ## Startup admin seed
 
 - Seed an admin user from env at startup (`UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME`) so the user survives DB wipes.
