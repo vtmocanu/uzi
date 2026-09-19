@@ -88,7 +88,8 @@ atomically, it does not ship a half-version.
 **Releases are cut RC-first** (ADR-1265, PRD #1265). `release-cut X.Y.Z`
 (`.agents/skills/uzi-release/`) cuts a release **candidate** `vX.Y.Z-rc.1` by default: it
 publishes the five images and the chart at that version, opens a GitHub Release flagged
-pre-release (never latest), and does not publish the Homebrew formula. A stable `vX.Y.Z` is a
+pre-release (never latest), and does not publish the stable Homebrew formula (since PRD #1378 an
+RC publishes only the separate, opt-in `uzi-cli-rc` formula). A stable `vX.Y.Z` is a
 **promotion** of the in-flight candidate — built from the candidate's own commit, never from
 whatever `main` has moved on to since — cut in lockstep with the next candidate by
 `release-cut Y.Z.W --promote`. The verbs, terse (`.agents/skills/uzi-release/SKILL.md` owns the
