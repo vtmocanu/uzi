@@ -658,6 +658,39 @@ describe("Repos — member override request (issue #1432)", () => {
     await waitFor(() => expect(mockApi.listProjects).toHaveBeenCalledTimes(2));
   });
 
+  it("renders two findings sharing a code in the request modal without a key collision", async () => {
+    // A single refusal can return two findings with the SAME code (e.g. two
+    // write_role_can_push). A code-only React key collides and may drop/duplicate a
+    // list item; the composite key (code+index) renders both (issue #1432).
+    mockApi.setRepoEnabled.mockRejectedValue(
+      new ApiError(422, "refused", {
+        error: "refused",
+        violations: ["push to main is allowed", "merge to main is allowed"],
+        findings: [
+          { code: "write_role_can_push", severity: "block", message: "push to main is allowed" },
+          { code: "write_role_can_push", severity: "block", message: "merge to main is allowed" },
+        ],
+        waivable: true,
+      }),
+    );
+    renderPage();
+    await screen.findByText("example/website");
+    const row = () => within(rowFor("example/website"));
+    fireEvent.click(row().getByRole("button", { name: /^Enable$/ }));
+    fireEvent.click(await row().findByRole("button", { name: /request admin approval/i }));
+
+    const dialog = await screen.findByRole("dialog", {
+      name: /request approval to enable example\/website/i,
+    });
+    // Both list items survive — the modal's findings list has exactly the two entries,
+    // in order, with neither dropped nor duplicated by a colliding key.
+    const items = within(dialog).getAllByRole("listitem");
+    expect(items.map((li) => li.textContent)).toEqual([
+      "push to main is allowed",
+      "merge to main is allowed",
+    ]);
+  });
+
   it("a NON-waivable enable 422 offers no request CTA — only fix-protection guidance", async () => {
     mockApi.setRepoEnabled.mockRejectedValue(new ApiError(422, "refused", refusalBody(false)));
     renderPage();
@@ -707,6 +740,9 @@ describe("Repos — member override request (issue #1432)", () => {
     await screen.findByText("example/website");
     const row = within(rowFor("example/website"));
     expect(row.getByText(/approved by an admin/i)).toBeTruthy();
+    // The admin's decision note renders as VISIBLE text (not only a tooltip), mirroring
+    // the rejected state, so a keyboard/touch user sees any conditions (issue #1432).
+    expect(row.getByText("ok, fixed")).toBeTruthy();
     // The owner can retry Enable (the live guard re-runs on the server).
     expect(row.getByRole("button", { name: /^Enable$/ })).toBeTruthy();
   });

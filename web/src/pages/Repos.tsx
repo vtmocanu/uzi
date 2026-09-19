@@ -462,7 +462,11 @@ export function Repos() {
         const body = err.body as
           | { violations?: string[]; findings?: GuardrailFinding[]; waivable?: boolean }
           | null;
-        setError(err.message);
+        // A guardrail refusal speaks ONLY through the rich, actionable refusal Card
+        // below (the violations, fix guidance, and — when waivable — a Request-approval
+        // CTA). Do NOT also raise the terse top-level Alert, which would duplicate the
+        // same failure in a weaker form (issue #1432). error stays cleared (the "" set
+        // at the top of toggle).
         setEnableRefusal({
           repoId: repo.id,
           violations: body?.violations ?? [],
@@ -943,14 +947,21 @@ export function Repos() {
                                       >
                                         Allow anyway
                                       </Button>
-                                    ) : (
+                                    ) : !r.override_request &&
+                                      !(enableRefusal?.repoId === r.id && enableRefusal.waivable) ? (
+                                      // Only the PASSIVE pointer, and only when the member has
+                                      // no actionable path: no waivable refusal just now (which
+                                      // would show the Request-approval CTA below) and no
+                                      // existing override_request state. Showing the passive
+                                      // "ask an admin" alongside an actionable request path
+                                      // contradicts itself (issue #1432).
                                       <span
                                         className="text-xs text-faint"
                                         title="Only an instance admin can allow a repo through this guardrail."
                                       >
                                         ask an admin to allow this repo
                                       </span>
-                                    )}
+                                    ) : null}
                                   </>
                                 );
                               }
@@ -1014,19 +1025,29 @@ export function Repos() {
                               }
                               if (or.status === "approved") {
                                 // The normal Enable action lives in the Actions cell; on
-                                // retry the live guard re-runs. The badge just says why.
+                                // retry the live guard re-runs. The badge just says why, and
+                                // any admin note renders as VISIBLE text too (mirroring the
+                                // rejected state) so a keyboard/touch user sees the conditions
+                                // the admin left, not only a hover tooltip (issue #1432).
                                 return (
-                                  <Badge
-                                    tone="ok"
-                                    dot
-                                    title={
-                                      or.decision_note
-                                        ? `Admin note: ${or.decision_note}`
-                                        : "An admin approved your request — click Enable to retry."
-                                    }
-                                  >
-                                    Approved by an admin
-                                  </Badge>
+                                  <>
+                                    <Badge
+                                      tone="ok"
+                                      dot
+                                      title={
+                                        or.decision_note
+                                          ? `Admin note: ${or.decision_note}`
+                                          : "An admin approved your request — click Enable to retry."
+                                      }
+                                    >
+                                      Approved by an admin
+                                    </Badge>
+                                    {or.decision_note && (
+                                      <span className="text-xs text-faint" title={or.decision_note}>
+                                        {or.decision_note}
+                                      </span>
+                                    )}
+                                  </>
                                 );
                               }
                               if (or.status === "rejected") {
@@ -1897,8 +1918,10 @@ export function Repos() {
                 <div className="rounded-md border border-danger/40 bg-danger/5 p-3">
                   <h3 className="mb-1.5 text-sm font-semibold text-fg">You are accepting these findings</h3>
                   <ul className="list-disc space-y-1 pl-5 text-sm text-muted">
-                    {allowFindings.map((v) => (
-                      <li key={v.code}>{v.message}</li>
+                    {allowFindings.map((v, i) => (
+                      // Composite key: a single refusal can return two findings sharing a
+                      // code (e.g. two write_role_can_push), so code alone collides (#1432).
+                      <li key={`${v.code}-${i}`}>{v.message}</li>
                     ))}
                   </ul>
                 </div>
@@ -1973,8 +1996,10 @@ export function Repos() {
                 <div className="rounded-md border border-danger/40 bg-danger/5 p-3">
                   <h3 className="mb-1.5 text-sm font-semibold text-fg">What blocked the enable</h3>
                   <ul className="list-disc space-y-1 pl-5 text-sm text-muted">
-                    {requestFindings.map((f) => (
-                      <li key={f.code}>{f.message}</li>
+                    {requestFindings.map((f, i) => (
+                      // Composite key: a single refusal can return two findings sharing a
+                      // code (e.g. two write_role_can_push), so code alone collides (#1432).
+                      <li key={`${f.code}-${i}`}>{f.message}</li>
                     ))}
                   </ul>
                 </div>

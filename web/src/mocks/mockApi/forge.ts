@@ -94,13 +94,16 @@ let toolEntryCounter = 0;
 // issue #1432: the pending member override-request queue, mutated by the member
 // requestGuardrailOverride and the admin approve/reject below, and surfaced by
 // adminListBlockedRepos. Seeded with one pending request (dana's) so the admin queue
-// renders under VITE_UZI_MOCK=1; the findings snapshot is a waivable push-to-main
-// block (an admin CAN clear it), matching the request-persistence rule.
+// renders under VITE_UZI_MOCK=1. It points at repo-billing — the disabled+blocked+
+// WAIVABLE row — and its single push finding matches that repo's real enable-422
+// findings, so the queued request is consistent with the block it describes (an admin
+// CAN clear it). repo-ledger stays the non-waivable "no doomed request" demo and
+// carries no seeded request.
 let overrideRequests: GuardrailOverrideRequest[] = [
   {
-    id: "gor-ledger",
-    repo_id: "repo-ledger",
-    repo_path: "team-beta/ledger-service",
+    id: "gor-billing",
+    repo_id: "repo-billing",
+    repo_path: "team-beta/billing-service",
     owner_id: "u-dana",
     owner_email: "dana@example.com",
     forge_type: "gitlab",
