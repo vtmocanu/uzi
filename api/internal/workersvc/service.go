@@ -834,6 +834,12 @@ type Store interface {
 
 	// Sweeper + register-time orphan recovery.
 	SweepClaimedNeverStarted(ctx context.Context, cutoff pgtype.Timestamptz) ([]store.SweepClaimedNeverStartedRow, error)
+	// SweepTaskNeverDispatched terminalizes a kind='task' (handoff) run left queued with
+	// dispatched_at NULL past the dispatch grace window (issue #1367): the CLI never landed
+	// its push/dispatch, so ClaimRun never offers it and no other sweep touches it. Server-
+	// derived fail_origin='task_undispatched'; status='queued' makes it the single winner
+	// against a racing DispatchTaskRun (now also guarded on status='queued').
+	SweepTaskNeverDispatched(ctx context.Context, arg store.SweepTaskNeverDispatchedParams) ([]store.SweepTaskNeverDispatchedRow, error)
 	// RequeueClaimedRunToQueued resets one just-claimed run to queued when its
 	// owner's vault locked between the claim gate and the token open (PRD #32 M3).
 	RequeueClaimedRunToQueued(ctx context.Context, id uuid.UUID) (int64, error)
@@ -1188,6 +1194,14 @@ type Params struct {
 	// ClaimGrace is the claimed-but-never-started reclaim window. It is not a
 	// PRD env var (the PRD fixes it at 5m in prose); defaulted in New.
 	ClaimGrace time.Duration
+	// DispatchGrace is the undispatched-task-run reaper window (issue #1367): how long a
+	// kind='task' (handoff) run may sit status='queued' with dispatched_at NULL before the
+	// undispatched-handoff sweep (SweepTaskNeverDispatched) terminalizes it. It is a
+	// SEPARATE, calibrated window distinct from the 5m worker ClaimGrace because a local
+	// push+dispatch has a different latency profile than a worker claim→start. Like
+	// ClaimGrace it is fixed in code (defaulted in New), not yet a PRD env var, and is
+	// promotable to one later.
+	DispatchGrace time.Duration
 	// SweeperBootGrace (PRD #1390 M1, D1, SWEEPER_BOOT_GRACE) is the boot-grace window
 	// that suppresses the three stale-worker passes (MarkStaleWorkersOffline,
 	// FailRunsOfStaleWorkersOverCap, RequeueRunsOfStaleWorkers) until it has elapsed
@@ -1738,10 +1752,19 @@ func (s *Service) notify(runID uuid.UUID, status string) {
 // defaultClaimGrace is the claimed-but-never-started reclaim window (PRD: 5m).
 const defaultClaimGrace = 5 * time.Minute
 
+// defaultDispatchGrace is the undispatched-task-run reaper window (issue #1367): a
+// kind='task' (handoff) run may sit queued+undispatched this long before the sweep
+// terminalizes it. Deliberately larger than defaultClaimGrace — a local push+dispatch
+// has a different latency profile than a worker claim→start.
+const defaultDispatchGrace = 15 * time.Minute
+
 // New constructs a Service. box may be nil only in tests that never call Claim.
 func New(q Store, box *secretbox.Box, p Params) *Service {
 	if p.ClaimGrace <= 0 {
 		p.ClaimGrace = defaultClaimGrace
+	}
+	if p.DispatchGrace <= 0 {
+		p.DispatchGrace = defaultDispatchGrace
 	}
 	return &Service{
 		q: q, box: box, p: p, now: time.Now, persistFail: newPersistFailTracker(), outbox: newOutboxTracker(),
@@ -5809,13 +5832,19 @@ func (s *Service) hasLivePoller(ctx context.Context, run store.Run) (bool, error
 
 // SweepResult reports the row counts touched by one Sweep pass (for logging).
 type SweepResult struct {
-	WorkersOffline     int64
-	ClaimedReset       int64
-	RunningTimeout     int64
-	StaleFailed        int64
-	StaleRequeued      int64
-	ChatIdleCompleted  int64
-	ProposalsRecovered int64
+	WorkersOffline int64
+	ClaimedReset   int64
+	// TaskUndispatchedFailed is the number of kind='task' (handoff) runs this pass
+	// terminalized because they sat queued with dispatched_at NULL past DispatchGrace —
+	// the CLI never landed their push/dispatch (issue #1367). Normally 0: a handoff is
+	// dispatched within seconds of creation, so a non-zero count means a client crashed or
+	// its push failed between create and DispatchTaskRun.
+	TaskUndispatchedFailed int64
+	RunningTimeout         int64
+	StaleFailed            int64
+	StaleRequeued          int64
+	ChatIdleCompleted      int64
+	ProposalsRecovered     int64
 	// HealthChanged is the number of runs whose health flag the detector wrote this
 	// pass (PRD #47) — raised, changed, or self-cleared. Observability only.
 	HealthChanged int64

@@ -12124,6 +12124,63 @@ func (q *Queries) SweepRunningTimeout(ctx context.Context, arg SweepRunningTimeo
 	return items, nil
 }
 
+const sweepTaskNeverDispatched = `-- name: SweepTaskNeverDispatched :many
+UPDATE runs SET status = 'failed', status_since = now(), failure_reason = $1,
+    fail_origin = 'task_undispatched',
+    finished_at = now(),
+    -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag or in-progress snapshot.
+    milestones_in_progress = NULL,
+    milestones_agents = NULL,
+    pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
+    credential_switch_requested_at = NULL, credential_switch_generation = NULL,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE kind = 'task' AND status = 'queued' AND dispatched_at IS NULL AND created_at < $2
+RETURNING id, user_id, status
+`
+
+type SweepTaskNeverDispatchedParams struct {
+	FailureReason pgtype.Text        `json:"failure_reason"`
+	Cutoff        pgtype.Timestamptz `json:"cutoff"`
+}
+
+type SweepTaskNeverDispatchedRow struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+	Status string    `json:"status"`
+}
+
+// PRD #400 Decision 6 orphan reaper (issue #1367): a kind='task' (handoff) run is created
+// status='queued' with dispatched_at NULL and is claimable only once the CLI seeds its
+// uzi/task/<id> branch and stamps dispatched_at (DispatchTaskRun). If the push or the dispatch
+// call never lands (push failure, dispatch UPDATE never commits, client crash/SIGKILL), the row
+// is queued+undispatched forever — ClaimRun never offers it (kind<>'task' OR dispatched_at IS
+// NOT NULL) and no other sweep touches it. Past the dispatch grace window, terminalize it.
+// No D11 terminal-pending-lease carve-out is needed: an undispatched task was never claimed
+// (worker_id NULL, no worker_active_runs row), so the lease/pending_overflow predicates are
+// vacuously false. status='queued' AND dispatched_at IS NULL makes this the single winner against
+// a racing DispatchTaskRun (which now also guards status='queued'): exactly one conditional
+// UPDATE matches the row.
+func (q *Queries) SweepTaskNeverDispatched(ctx context.Context, arg SweepTaskNeverDispatchedParams) ([]SweepTaskNeverDispatchedRow, error) {
+	rows, err := q.db.Query(ctx, sweepTaskNeverDispatched, arg.FailureReason, arg.Cutoff)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []SweepTaskNeverDispatchedRow{}
+	for rows.Next() {
+		var i SweepTaskNeverDispatchedRow
+		if err := rows.Scan(&i.ID, &i.UserID, &i.Status); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const updateRunLastSeq = `-- name: UpdateRunLastSeq :execrows
 UPDATE runs SET last_seq = GREATEST(last_seq, $1), last_activity_at = now()
 WHERE id = $2

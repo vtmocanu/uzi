@@ -1038,6 +1038,13 @@ func (f *autoStopSweepStore) MarkStaleWorkersOffline(context.Context, pgtype.Tim
 func (f *autoStopSweepStore) SweepClaimedNeverStarted(context.Context, pgtype.Timestamptz) ([]store.SweepClaimedNeverStartedRow, error) {
 	return f.claimed, nil
 }
+
+// issue #1367's undispatched-handoff reaper pass. Empty for the same reason as the other passes
+// this fixture does not exercise: it is here so Sweep runs end to end, and returning nothing keeps
+// this file's subject (the auto-stop streak) the only thing moving.
+func (f *autoStopSweepStore) SweepTaskNeverDispatched(context.Context, store.SweepTaskNeverDispatchedParams) ([]store.SweepTaskNeverDispatchedRow, error) {
+	return nil, nil
+}
 func (f *autoStopSweepStore) SweepRunningTimeout(context.Context, store.SweepRunningTimeoutParams) ([]store.SweepRunningTimeoutRow, error) {
 	return nil, nil
 }

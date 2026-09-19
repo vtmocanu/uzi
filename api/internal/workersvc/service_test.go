@@ -271,6 +271,8 @@ type fakeStore struct {
 	// Sweep.
 	staleCutoff pgtype.Timestamptz
 	claimCutoff pgtype.Timestamptz
+	// issue #1367: the undispatched-handoff reaper cutoff SweepTaskNeverDispatched received.
+	taskDispatchCutoff pgtype.Timestamptz
 	// PRD #122 M2 (Decision 5b): SweepRunningTimeout takes a per-run cutoff now — the
 	// server passes `now` and the global timeout, and the SQL subtracts the per-run
 	// effective wall clock. These capture what the sweep passed.
@@ -285,10 +287,11 @@ type fakeStore struct {
 	stampWorkerStaleCutoff pgtype.Timestamptz
 	stampRows              int64
 	// Rows the sweep queries return (PRD #25 M3): each drives a published transition.
-	sweptClaimed  []store.SweepClaimedNeverStartedRow
-	sweptTimeout  []store.SweepRunningTimeoutRow
-	sweptFailed   []store.FailRunsOfStaleWorkersOverCapRow
-	sweptRequeued []store.RequeueRunsOfStaleWorkersRow
+	sweptClaimed      []store.SweepClaimedNeverStartedRow
+	sweptUndispatched []store.SweepTaskNeverDispatchedRow // issue #1367
+	sweptTimeout      []store.SweepRunningTimeoutRow
+	sweptFailed       []store.FailRunsOfStaleWorkersOverCapRow
+	sweptRequeued     []store.RequeueRunsOfStaleWorkersRow
 
 	// PRD #46 judge: enqueue funnel + trace/review authz + review upsert.
 	runByIDPlain      store.Run // GetRunByID (non-user-scoped): swept-run reload + trace target
@@ -1188,6 +1191,11 @@ func (f *fakeStore) SweepClaimedNeverStarted(_ context.Context, cutoff pgtype.Ti
 	f.claimCutoff = cutoff
 	f.callOrder = append(f.callOrder, "claimed_never_started")
 	return f.sweptClaimed, nil
+}
+func (f *fakeStore) SweepTaskNeverDispatched(_ context.Context, arg store.SweepTaskNeverDispatchedParams) ([]store.SweepTaskNeverDispatchedRow, error) {
+	f.taskDispatchCutoff = arg.Cutoff
+	f.callOrder = append(f.callOrder, "task_never_dispatched")
+	return f.sweptUndispatched, nil
 }
 func (f *fakeStore) RequeueClaimedRunToQueued(_ context.Context, id uuid.UUID) (int64, error) {
 	f.requeuedRun = &id
@@ -3875,7 +3883,9 @@ func TestSweepComputesCutoffsAndOrder(t *testing.T) {
 	}
 	// PRD #1226 M4 (D3): the served-steer stamp runs RIGHT AFTER running_timeout (it stamps the
 	// rows that sweep's carve-out just spared), before the stale-worker recovery passes.
-	want := []string{"mark_stale", "claimed_never_started", "running_timeout", "stamp_budget_exhausted", "stale_fail_over_cap", "stale_requeue"}
+	// issue #1367: the undispatched-handoff reaper runs right after claimed_never_started (the
+	// analogous never-progressed reclaim it is modelled on), before the running-timeout pass.
+	want := []string{"mark_stale", "claimed_never_started", "task_never_dispatched", "running_timeout", "stamp_budget_exhausted", "stale_fail_over_cap", "stale_requeue"}
 	if strings.Join(fs.callOrder, ",") != strings.Join(want, ",") {
 		t.Fatalf("sweep order = %v, want %v", fs.callOrder, want)
 	}
@@ -3895,6 +3905,12 @@ func TestSweepComputesCutoffsAndOrder(t *testing.T) {
 	}
 	if !fs.claimCutoff.Time.Equal(fixed.Add(-5 * time.Minute)) {
 		t.Fatalf("claim cutoff = %v, want now-5m", fs.claimCutoff.Time)
+	}
+	// issue #1367: the undispatched-handoff reaper cutoff is now - DispatchGrace. testParams()
+	// leaves DispatchGrace unset, so New defaults it to defaultDispatchGrace (15m), distinct
+	// from the 5m ClaimGrace above — proving the two windows are separate.
+	if !fs.taskDispatchCutoff.Time.Equal(fixed.Add(-15 * time.Minute)) {
+		t.Fatalf("task-dispatch cutoff = %v, want now-15m (defaultDispatchGrace)", fs.taskDispatchCutoff.Time)
 	}
 	// PRD #122 M2 (Decision 5b): the sweep passes `now` and the GLOBAL timeout (2h in
 	// seconds); the per-run subtraction happens in SQL against each run's budget.
@@ -3935,6 +3951,57 @@ func TestSweepPublishesTransitions(t *testing.T) {
 	got := strings.Join(b.statuses, ",")
 	if got != "failed,failed,queued" {
 		t.Fatalf("published statuses = %q, want failed,failed,queued", got)
+	}
+}
+
+// TestSweepTaskNeverDispatchedPublishesAndSkipsJudge (issue #1367): the undispatched-handoff
+// reaper's terminal rows must (a) be published through the broadcaster fan-out, like every
+// other sweep transition, and (b) NEVER be handed to the judge — an undispatched task was
+// never claimed, so it has no agent attempt or trace to retrospect (the scope guardrail).
+//
+// The judge-not-enqueued assertion is NON-VACUOUS by construction: the fixture is fully
+// judge-eligible (eligibleFixture) and GetRunByID (the swept-run reload maybeEnqueueJudgeByID
+// uses) returns an eligible completed run, so IF the reaper loop called maybeEnqueueJudgeByID
+// for these rows a judge WOULD be created — proven live at the end by a direct call. Only the
+// undispatched slice is staged (the timeout/stale-fail slices, whose loops DO enqueue the
+// judge, are empty), so a non-nil createdJudgeRun after Sweep can only come from the reaper
+// loop, which is exactly the mutation this guards.
+func TestSweepTaskNeverDispatchedPublishesAndSkipsJudge(t *testing.T) {
+	fs, svc, eligible := eligibleFixture(t)
+	eligible.Status = "completed" // a clean terminal run: passes Gate 4b (no skip fail_origin)
+	fs.runByIDPlain = eligible
+	r1, r2 := uuid.New(), uuid.New()
+	owner := uuid.New()
+	fs.sweptUndispatched = []store.SweepTaskNeverDispatchedRow{
+		{ID: r1, UserID: owner, Status: "failed"},
+		{ID: r2, UserID: owner, Status: "failed"},
+	}
+	b := &fakeBroadcaster{}
+	svc.SetBroadcaster(b)
+
+	res, err := svc.Sweep(context.Background())
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if res.TaskUndispatchedFailed != 2 {
+		t.Fatalf("TaskUndispatchedFailed = %d, want 2", res.TaskUndispatchedFailed)
+	}
+	// Both terminal rows fan out through the broadcaster (no other slice is staged, so these
+	// are the only transitions this Sweep publishes).
+	if got := strings.Join(b.statuses, ","); got != "failed,failed" {
+		t.Fatalf("published statuses = %q, want failed,failed", got)
+	}
+	// The scope guardrail: no judge was enqueued for an undispatched row.
+	if fs.createdJudgeRun != nil {
+		t.Fatalf("a judge run was enqueued for an undispatched task row (must not be: no agent attempt): %+v", fs.createdJudgeRun)
+	}
+	// Non-vacuity proof: the very fixture above WOULD enqueue a judge if a swept row were run
+	// through the judge path, so the nil above is the reaper declining, not the fixture being
+	// judge-incapable.
+	svc.maybeEnqueueJudgeByID(context.Background(), r1)
+	if fs.createdJudgeRun == nil {
+		t.Fatal("fixture sanity: maybeEnqueueJudgeByID did NOT enqueue a judge for an eligible run; " +
+			"the createdJudgeRun==nil assertion above would be vacuous")
 	}
 }
 

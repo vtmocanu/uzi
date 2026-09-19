@@ -648,7 +648,7 @@ func (q *Queries) CreateThenFixRun(ctx context.Context, arg CreateThenFixRunPara
 const dispatchTaskRun = `-- name: DispatchTaskRun :one
 UPDATE runs
 SET dispatched_at = now(), updated_at = now()
-WHERE id = $1 AND user_id = $2 AND kind = 'task' AND dispatched_at IS NULL
+WHERE id = $1 AND user_id = $2 AND kind = 'task' AND status = 'queued' AND dispatched_at IS NULL
 RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash, pause_requested_at, pause_mode, pause_after_count, checkpoint_tip_at, recovery_wait_count, recovery_retry_not_before, completion_contract_version, contract_revision, completion_contract, completion_attempts, latest_completion_attempt, milestones_agents, hold_reason, hold_captured_head, completion_budget_exhausted_at, completion_question_at, budget_extension_seconds, claim_generation, harness, recovery_wait_cause, forge_park_count, credential_override_mode, credential_override_secret_id, claim_released_at, credential_switch_requested_at, credential_switch_generation, stale_requeue_generation
 `
 
@@ -665,6 +665,12 @@ type DispatchTaskRunParams struct {
 // gets. kind='task' is a guard against dispatching any other kind. dispatched_at IS NULL
 // makes the stamp idempotent: a second dispatch matches 0 rows and the caller reads it
 // as not-found rather than re-broadcasting a claimable signal.
+//
+// issue #1367: the added status='queued' guard closes the dispatch-vs-expiry race with the
+// undispatched-handoff reaper (SweepTaskNeverDispatched). If that sweep already failed the row
+// (status='failed', dispatched_at still NULL), a late dispatch matches 0 rows instead of
+// stamping dispatched_at onto a terminal run and re-broadcasting a claimable signal for a run
+// the server already expired.
 func (q *Queries) DispatchTaskRun(ctx context.Context, arg DispatchTaskRunParams) (Run, error) {
 	row := q.db.QueryRow(ctx, dispatchTaskRun, arg.RunID, arg.UserID)
 	var i Run
