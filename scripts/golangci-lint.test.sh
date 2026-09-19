@@ -512,7 +512,16 @@ assert_signal_forwarded() {
     fail "wrapper $cancel_signal left child $CANCEL_CHILD_PID alive"
   fi
   CANCEL_CHILD_PID=""
-  assert_contains "$SIGNAL_LOG" "$cancel_signal"
+  # The child records the forwarded signal from its own trap, a separate process
+  # whose append can lag the wrapper's exit (which returns 128+signum without
+  # waiting on the child). cancel_rc above already proved the signal propagated;
+  # poll the log for the child's record rather than reading it once and racing.
+  tries=0
+  while ! grep -Fq -- "$cancel_signal" "$SIGNAL_LOG" 2>/dev/null; do
+    tries=$((tries + 1))
+    [ "$tries" -le 150 ] || fail "$SIGNAL_LOG never recorded forwarded $cancel_signal"
+    sleep 0.02
+  done
 }
 assert_signal_forwarded INT 130
 assert_signal_forwarded TERM 143
@@ -554,7 +563,13 @@ if kill -0 "$CANCEL_CHILD_PID" 2>/dev/null; then
   fail "process-group TERM left child $CANCEL_CHILD_PID alive"
 fi
 CANCEL_CHILD_PID=""
-assert_contains "$SIGNAL_LOG" "TERM"
+# Same cross-process append lag as the single-signal case above: poll, don't race.
+tries=0
+while ! grep -Fq -- "TERM" "$SIGNAL_LOG" 2>/dev/null; do
+  tries=$((tries + 1))
+  [ "$tries" -le 150 ] || fail "$SIGNAL_LOG never recorded group-forwarded TERM"
+  sleep 0.02
+done
 tries=0
 while [ -e "$wrapper_tmp" ]; do
   tries=$((tries + 1))
