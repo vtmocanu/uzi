@@ -336,27 +336,107 @@ func (m tuiModel) tabStrip() string {
 	return out
 }
 
-// vaultIndicatorLine is the tier-1 vault-locked andon hint (PRD #1251 M2, D3/D4/D5): a quiet,
-// STEADY (never blinking), non-dismissable faint glyph+text line shown when the viewer's vault
-// is locked, and "" otherwise — so it auto-clears on its own the moment WhoamiVault reports the
-// vault unlocked (D3). It is a line of its OWN, adjacent to and never replacing the rate-limit
-// strip (D5): the two are distinct signals and can be visible together.
+// vaultLockedReasonSubstr is the lowercased marker matched on a run's HealthReason to count
+// runs parked because the viewer's vault is locked (PRD #1251 M3, tier-2 escalation input,
+// D10/R3). The full server string is reasonVaultLocked = "your vault is locked, so this run
+// can't start" (api/internal/workersvc/health.go), but that is UNEXPORTED in workersvc and
+// cmd/uzi (package main) must not import the server stack, so the count matches this lowercased
+// substring instead. A reword upstream would break the count silently — mitigated by pinning
+// the exact server string in a regression test (TestVaultBandMatchesServerReasonString); presence
+// never depends on it (it comes from WhoamiVault, D10), so a reword degrades only the tier-2
+// count, never whether the lock is shown.
+const vaultLockedReasonSubstr = "vault is locked"
+
+// ownParkedOnVaultCount counts the VIEWER'S OWN board runs parked because the vault is locked —
+// the best-effort tier-2 escalation input (PRD #1251 M3, R3/R6). A run counts when its
+// HealthReason contains vaultLockedReasonSubstr (case-insensitive); the reason is only a
+// best-effort input (it is run-health-gated and collapses into the generic waiting_worker
+// status, D10), so a run-health-off board simply counts 0 and the indicator stays at the M2
+// tier-1 hint.
+//
+// It is computed over m.board.runs — the FULL loaded set, not the scrolled window — matching
+// boardSummary's run-source convention, so the count is stable while the board scrolls.
+//
+// Scoping (D11): on the own board (admin == false) ListRuns is owner-scoped, so every run is the
+// viewer's own and all matching runs count. On the admin/factory board (admin == true)
+// AdminListRuns returns EVERY user's runs with their health reasons present (RunDTO.HealthReason
+// rides unconditionally, run.go), so the count is scoped to runs the viewer OWNS via OwnerEmail —
+// it never counts or blames another user's locked vault the admin cannot act on. If the viewer
+// identity is unknown (selfEmail == "", whoami failed) the band is suppressed on the admin view
+// (count 0) rather than risk attributing a stranger's lock to the admin.
+func (m tuiModel) ownParkedOnVaultCount() int {
+	admin := m.board.admin
+	if admin && m.selfEmail == "" {
+		return 0
+	}
+	n := 0
+	for _, r := range m.board.runs {
+		if r.HealthReason == nil || !strings.Contains(strings.ToLower(*r.HealthReason), vaultLockedReasonSubstr) {
+			continue
+		}
+		if admin && (r.OwnerEmail == nil || !strings.EqualFold(*r.OwnerEmail, m.selfEmail)) {
+			continue
+		}
+		n++
+	}
+	return n
+}
+
+// vaultIndicatorLine is the vault-locked andon line (PRD #1251 M2/M3, D3/D4/D5): a STEADY (never
+// blinking), non-dismissable line shown when the viewer's vault is locked, and "" otherwise — so
+// it auto-clears on its own the moment WhoamiVault reports the vault unlocked (D3). It is a line
+// of its OWN, adjacent to and never replacing the rate-limit strip (D5): the two are distinct
+// signals and can be visible together.
+//
+// Two mutually-exclusive forms share this ONE optional line, so boardCapacity's single-row
+// reservation (via vaultIndicatorLine() != "") stays correct without change:
+//   - M3 tier-2 amber needs-you band, when ≥1 of the viewer's OWN runs is parked on the vault
+//     (ownParkedOnVaultCount ≥ 1): the escalated, filled attention surface (vaultBand).
+//   - M2 tier-1 quiet faint hint, when locked but nothing is parked (run-health off, or count 0):
+//     the baseline informational hint (R6 — the lock still shows because WhoamiVault reports it).
 //
 // The signal is carried by the WORDS "vault locked", never colour alone (D4). Under
 // colorprofile.Ascii / NO_COLOR the faint SGR is stripped downstream, so the ascii form drops
 // the lock glyph for a plain "[locked]" marker that survives with no colour at all.
-//
-// M3 will ESCALATE this to the amber needs-you band when ≥1 of the viewer's OWN runs is parked
-// on the vault. The show-decision and the styling both live here on purpose: that is the seam
-// that lets M3 upgrade the hint to the band without restructuring renderBoard or boardCapacity.
 func (m tuiModel) vaultIndicatorLine() string {
 	if !m.vaultLocked {
 		return ""
+	}
+	if n := m.ownParkedOnVaultCount(); n >= 1 {
+		return m.vaultBand(n)
 	}
 	if m.profile == colorprofile.Ascii {
 		return " [locked] vault locked"
 	}
 	return " " + m.pal.faint.Render("🔒 vault locked")
+}
+
+// vaultBand is the M3 tier-2 amber needs-you band (PRD #1251 M3, D2/D8): the ONE filled surface,
+// a full-width amber fill with near-bg ink (pal.amber / pal.bandFg), shown when the vault is
+// locked AND n ≥ 1 of the viewer's own runs are parked on it. Steady (never blinking, D3),
+// non-dismissable, and it auto-clears when the lock clears (vaultIndicatorLine returns "" then).
+// It shows a COUNT, never the raw HealthReason, so no untrusted text reaches the frame (D7) — the
+// hostile-render test proves the count path cannot inject. The copy aligns with
+// vault_lock_notice.go and points the fix off-TUI (web / uzi vault unlock).
+//
+// It reuses the detail screen's attentionBanner fill+ink convention (paintSeg fg/bg, ▌ cap, full
+// width padded to m.width) so the board's one filled surface reads identically to the detail's.
+// Under colorprofile.Ascii the amber fill is stripped for a plain ascii-safe band whose WORDS
+// ("VAULT LOCKED", "N run(s) parked", "unlock to resume") carry the signal with no colour (D4).
+func (m tuiModel) vaultBand(n int) string {
+	runsWord := "runs"
+	if n == 1 {
+		runsWord = "run"
+	}
+	count := itoa(n) + " " + runsWord + " parked"
+	if m.profile == colorprofile.Ascii {
+		return "[VAULT LOCKED] " + count + " - unlock to resume (web, uzi vault unlock)"
+	}
+	amber, fg := m.pal.amber, m.pal.bandFg
+	seg := func(bold bool, s string) string { return paintSeg(fg, amber, bold, s) }
+	left := seg(true, "▌ VAULT LOCKED") +
+		seg(false, " · "+count+" — unlock to resume (web · uzi vault unlock)")
+	return clampVisual(padSeg(left, m.width, amber), m.width)
 }
 
 func (m tuiModel) renderBoard() string {

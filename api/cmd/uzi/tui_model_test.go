@@ -745,10 +745,16 @@ func TestTUIViewsStripControlBytesFromUntrustedText(t *testing.T) {
 	// model-authored, unsanitized on the wire, and drawn through renderer.Plain. Its milestone
 	// (hostile title) drives the `▸ <id> <title>` prefix too.
 	hostileActivity := apitypes.RunActivity{Agent: nasty, AgentLabel: nasty, Tool: "Edit", Detail: nasty}
+	// A hostile HealthReason that ALSO contains the "vault is locked" substring exercises the PRD
+	// #1251 M3 tier-2 escalation band (ownParkedOnVaultCount → vaultIndicatorLine → vaultBand). The
+	// band shows a COUNT, never the raw reason, so its control/bidi bytes must NOT reach the frame —
+	// assertNoRawControls below is the proof, and the "VAULT LOCKED" positive control proves the
+	// count path actually ran (a raw draw of the reason would be caught, not silently skipped).
+	hostileHealthReason := nasty + " your vault is locked, so this run can't start"
 	fake := &uzicli.FakeClient{Runs: []apitypes.RunListItemDTO{
 		{RunDTO: apitypes.RunDTO{ID: runID, Kind: "issue", Status: "running", IssueTitle: nasty, AnthropicSecretLabel: &hostileLabel,
 			Milestones: []apitypes.Milestone{{ID: "m1", Title: nasty}}, MilestonesInProgress: []string{"m1"},
-			CurrentActivity: &hostileActivity}},
+			HealthReason: &hostileHealthReason, CurrentActivity: &hostileActivity}},
 		{RunDTO: apitypes.RunDTO{ID: "77777777-2222", Kind: "issue", Status: "running", IssueTitle: nasty,
 			IssueIID: &hostileIID, IssueWebURL: &hostileURL}},
 	}}
@@ -771,8 +777,18 @@ func TestTUIViewsStripControlBytesFromUntrustedText(t *testing.T) {
 	// Two readable tokens ⇒ showLabel true ⇒ the hostile Label is actually drawn.
 	next, _ = board.Update(settingsMsg{settings: apitypes.UserSettingsDTO{SidebarTokenIds: []string{"sec-second"}}})
 	board = next.(tuiModel)
+	// PRD #1251 M3 D7: locking the vault with the own board's hostile HealthReason present drives
+	// the tier-2 escalation band. Its count path reads the reason but draws only a number.
+	next, _ = board.Update(vaultStatusMsg{user: apitypes.UserDTO{Email: "me@x.io"}, locked: true})
+	board = next.(tuiModel)
 	boardOut := board.View().Content
 	assertNoRawControls(t, "board", boardOut)
+	// Positive control: the band actually rendered, so the D7 band/count path was exercised. Paired
+	// with assertNoRawControls above, this proves the hostile HealthReason was counted (a "1 run
+	// parked" count) but none of its raw control/bidi bytes leaked into the frame.
+	if !strings.Contains(stripANSI(boardOut), "VAULT LOCKED") {
+		t.Fatalf("the M3 escalation band did not render, so this test is not exercising the D7 band/count path:\n%s", stripANSI(boardOut))
+	}
 	// Belt-and-braces beyond assertNoRawControls: the raw control bytes from the hostile
 	// IssueWebURL must not survive verbatim into the frame (the OSC-8 target is sanitized).
 	for _, ctrl := range []string{"\x1b[2J", "\x07", "\x01"} {
