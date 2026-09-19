@@ -22,8 +22,19 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+## [0.83.1] - 2026-09-19
+
+### Added
+
+- **Live per-milestone lanes on the run views ([#1353](https://github.com/vtmocanu/uzi/issues/1353), [#1457](https://github.com/vtmocanu/uzi/pull/1457)).**
+  The web run page and the TUI now show which agent is actually working each in-progress milestone, as live lanes that update as the run proceeds, extending the per-milestone attribution shipped in 0.83.0.
+- **A "needs landing" bucket for failed runs whose work is captured and human-landable ([#1418](https://github.com/vtmocanu/uzi/issues/1418), [#1459](https://github.com/vtmocanu/uzi/pull/1459)).**
+  A run that failed but left preserved, landable work is now derived into and rendered as a distinct "needs landing" state, so recoverable work is surfaced and actionable instead of buried among plain failures.
+
 ### Fixed
 
+- **Restart-safe hosted-worker container entrypoint ([#1456](https://github.com/vtmocanu/uzi/pull/1456)).**
+  The worker entrypoint no longer fails its startup file-ownership setup when a worker pod restarts, so a restarted worker comes back cleanly; also stabilizes two racy nightly end-to-end phases.
 - **The release train now enforces that the chart's hosted-worker pin names a published image ([#1462](https://github.com/vtmocanu/uzi/pull/1462)).**
   A release candidate cut at a commit and kept as a local-only tag was never built by CI, yet its version could still be pinned as the chart's `workers.image.tag` and shipped in a stable chart, leaving every new hosted worker in ImagePullBackOff. `release-cut.sh --promote` now refuses an in-flight candidate that is not on the remote, `release.yml` blocks the chart publish unless every worker image resolves on GHCR at the pinned tag, `release-verify.sh` re-checks the shipped pin, and `worker-tag-autobump.sh` repins a dead tag to the version being cut instead of failing open.
 
@@ -4038,7 +4049,8 @@ Re-ships the PRD #87 browser prebake + `web-ux` builtin (v0.11.0, rolled back to
 
 - Worker-side redaction now covers the `agent` and `kind` message fields, not just the payload and `agent_instance`/`agent_label`, closing a gap where a secret placed in either field reached the API, the WebSocket frame, the browser, and `uzi run logs` unscrubbed (PRD #108).
 
-[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.83.0...HEAD
+[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.83.1...HEAD
+[0.83.1]: https://github.com/vtmocanu/uzi/compare/v0.83.0...v0.83.1
 [0.83.0]: https://github.com/vtmocanu/uzi/compare/v0.82.0...v0.83.0
 [0.82.0]: https://github.com/vtmocanu/uzi/compare/v0.81.0...v0.82.0
 [0.81.0]: https://github.com/vtmocanu/uzi/compare/v0.80.0...v0.81.0
