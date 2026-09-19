@@ -87,8 +87,10 @@ function Subrow({ usage }: { usage: RunUsage }) {
 
 // FailedRunsBlock is the PRD #1293 failed-run block folded under the token figures of a
 // usage card (mock variant A): the rate, the counts sentence with the 7-day window, the
-// stacked outcome bar (completed → cancelled → plan rejected → failed) with a legend and
-// an aria-label, and the top fail_origin causes. `lifetime` drives everything except the
+// stacked outcome bar (completed → cancelled → plan rejected → failed → failed, needs
+// landing) with a legend and an aria-label, and the top fail_origin causes. The last two
+// segments split the single `failed` bucket (issue #1418) but sum to the same width.
+// `lifetime` drives everything except the
 // "in the last 7 days" clause, which reads `last7`. Hidden entirely when the scope has no
 // finished runs (mirrors the run_count === 0 precedent — never a fabricated 0%). The block
 // counts a different population from the card's run_count (D2), so they are never combined
@@ -101,11 +103,23 @@ function FailedRunsBlock({ lifetime, last7 }: { lifetime: RunOutcomes; last7: Ru
   const CANCEL = "rgb(var(--edge-strong))";
   const REJECT = "repeating-linear-gradient(135deg, rgb(var(--edge-strong)) 0 2px, rgb(var(--surface)) 2px 4px)";
   const FAIL = "rgb(var(--danger))";
+  // issue #1418: "failed, needs landing" is a SUB-CUT of failed — same danger colour, but a
+  // 45° hatch (the plan-rejected hatch idiom keyed on --danger) so it reads as "failed, but
+  // its committed work is landable/recoverable" while staying visually part of the failed bar.
+  const NEEDS_LANDING = "repeating-linear-gradient(135deg, rgb(var(--danger)) 0 2px, rgb(var(--surface)) 2px 4px)";
+  // Split the single `failed` bucket into two ADJACENT segments driven by the same
+  // `/ lifetime.finished` denominator, so their combined width equals the old `failed` width.
+  // Math.max(0, …) is defensive: the server guarantees needs_landing <= failed. The
+  // needs-landing segment is added (next to failed) only when there IS something to land, so a
+  // scope with no landable failures reads exactly as before — no "0" clutter in the bar/legend.
   const segments = [
     { label: "completed", count: lifetime.completed, background: OK },
     { label: "cancelled", count: lifetime.cancelled, background: CANCEL },
     { label: "plan rejected", count: lifetime.plan_rejected, background: REJECT },
-    { label: "failed", count: lifetime.failed, background: FAIL },
+    { label: "failed", count: Math.max(0, lifetime.failed - lifetime.needs_landing), background: FAIL },
+    ...(lifetime.needs_landing > 0
+      ? [{ label: "failed, needs landing", count: lifetime.needs_landing, background: NEEDS_LANDING }]
+      : []),
   ];
   const barLabel = "Finished runs: " + segments.map((s) => `${s.count} ${s.label}`).join(", ");
   // Top causes: up to 4 fail_origin buckets, descending by count. Array.sort is stable, so

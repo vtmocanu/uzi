@@ -475,8 +475,10 @@ func TestRunOutcomesRollupsLiveDB(t *testing.T) {
 	seedOutcomeRun(userB, repoB, "completed", "issue", nil, 0, nil)
 	seedOutcomeRun(userB, repoB, "failed", "issue", &agentFailure, 0, nil)
 
-	// --- SelfRunOutcomes(userA): the exclusions and the two windows.
-	selfA, err := q.SelfRunOutcomes(ctx, userA)
+	// --- SelfRunOutcomes(userA): the exclusions and the two windows. The needs_landing
+	// sub-cut (issue #1418) takes the Go-owned human-landable set as its bind array; this
+	// test seeds no landable+recoverable failures, so the value is 0 either way.
+	selfA, err := q.SelfRunOutcomes(ctx, store.SelfRunOutcomesParams{UserID: userA, LandableOrigins: workersvc.AllHumanLandableFailOrigins()})
 	if err != nil {
 		t.Fatalf("SelfRunOutcomes(A): %v", err)
 	}
@@ -535,7 +537,7 @@ func TestRunOutcomesRollupsLiveDB(t *testing.T) {
 	}
 
 	// --- SelfRunOutcomes(userB): isolation — userA's runs never leak in.
-	selfB, err := q.SelfRunOutcomes(ctx, userB)
+	selfB, err := q.SelfRunOutcomes(ctx, store.SelfRunOutcomesParams{UserID: userB, LandableOrigins: workersvc.AllHumanLandableFailOrigins()})
 	if err != nil {
 		t.Fatalf("SelfRunOutcomes(B): %v", err)
 	}
@@ -545,7 +547,7 @@ func TestRunOutcomesRollupsLiveDB(t *testing.T) {
 	}
 
 	// --- Per-user aggregate == self, and the per-user rows sum to the factory (agreement).
-	perUser, err := q.AdminRunOutcomesPerUser(ctx)
+	perUser, err := q.AdminRunOutcomesPerUser(ctx, workersvc.AllHumanLandableFailOrigins())
 	if err != nil {
 		t.Fatalf("AdminRunOutcomesPerUser: %v", err)
 	}
@@ -568,7 +570,7 @@ func TestRunOutcomesRollupsLiveDB(t *testing.T) {
 		t.Fatalf("per-user row for B = finished %d/failed %d, want 2/1", b.Finished, b.Failed)
 	}
 
-	factory, err := q.AdminRunOutcomes(ctx)
+	factory, err := q.AdminRunOutcomes(ctx, workersvc.AllHumanLandableFailOrigins())
 	if err != nil {
 		t.Fatalf("AdminRunOutcomes: %v", err)
 	}

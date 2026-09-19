@@ -30,10 +30,11 @@ func numericToFloat(n pgtype.Numeric) float64 {
 	return f.Float64
 }
 
-// runOutcomes assembles a RunOutcomesDTO from the five counts and a (possibly nil)
-// origins map (PRD #1293). It guarantees a non-nil fail_origins so the field marshals as
+// runOutcomes assembles a RunOutcomesDTO from the counts and a (possibly nil) origins map
+// (PRD #1293). needsLanding is the server-computed sub-cut of failed (issue #1418), always
+// needs_landing <= failed. It guarantees a non-nil fail_origins so the field marshals as
 // {} rather than null, per the API contract — a nil map JSON-encodes to null.
-func runOutcomes(finished, completed, cancelled, planRejected, failed int64, origins map[string]int64) apitypes.RunOutcomesDTO {
+func runOutcomes(finished, completed, cancelled, planRejected, failed, needsLanding int64, origins map[string]int64) apitypes.RunOutcomesDTO {
 	if origins == nil {
 		origins = map[string]int64{}
 	}
@@ -43,6 +44,7 @@ func runOutcomes(finished, completed, cancelled, planRejected, failed int64, ori
 		Cancelled:    cancelled,
 		PlanRejected: planRejected,
 		Failed:       failed,
+		NeedsLanding: needsLanding,
 		FailOrigins:  origins,
 	}
 }
@@ -103,9 +105,11 @@ func (h *Handler) SelfUsage(w http.ResponseWriter, r *http.Request) {
 		RunCount: row.RunCount,
 		Outcomes: apitypes.RunOutcomeWindowsDTO{
 			Lifetime: runOutcomes(outcomes.LifetimeFinished, outcomes.LifetimeCompleted,
-				outcomes.LifetimeCancelled, outcomes.LifetimePlanRejected, outcomes.LifetimeFailed, lifetimeOrigins),
+				outcomes.LifetimeCancelled, outcomes.LifetimePlanRejected, outcomes.LifetimeFailed,
+				outcomes.LifetimeNeedsLanding, lifetimeOrigins),
 			Last7Days: runOutcomes(outcomes.Last7Finished, outcomes.Last7Completed,
-				outcomes.Last7Cancelled, outcomes.Last7PlanRejected, outcomes.Last7Failed, last7Origins),
+				outcomes.Last7Cancelled, outcomes.Last7PlanRejected, outcomes.Last7Failed,
+				outcomes.Last7NeedsLanding, last7Origins),
 		},
 	})
 }
@@ -198,7 +202,7 @@ func (h *Handler) AdminUsage(w http.ResponseWriter, r *http.Request) {
 			},
 			RunCount: u.RunCount,
 			Outcomes: runOutcomes(oc.Finished, oc.Completed, oc.Cancelled, oc.PlanRejected, oc.Failed,
-				originsByUser[u.UserID]),
+				oc.NeedsLanding, originsByUser[u.UserID]),
 		})
 	}
 	// D5: a user present in the outcomes aggregate but ABSENT from usage (every run died
@@ -214,7 +218,7 @@ func (h *Handler) AdminUsage(w http.ResponseWriter, r *http.Request) {
 			Usage:    apitypes.UsageDTO{},
 			RunCount: 0,
 			Outcomes: runOutcomes(oc.Finished, oc.Completed, oc.Cancelled, oc.PlanRejected, oc.Failed,
-				originsByUser[oc.UserID]),
+				oc.NeedsLanding, originsByUser[oc.UserID]),
 		})
 	}
 	httpx.JSON(w, http.StatusOK, apitypes.AdminUsageDTO{
@@ -237,10 +241,10 @@ func (h *Handler) AdminUsage(w http.ResponseWriter, r *http.Request) {
 			Outcomes: apitypes.RunOutcomeWindowsDTO{
 				Lifetime: runOutcomes(factoryOutcomes.LifetimeFinished, factoryOutcomes.LifetimeCompleted,
 					factoryOutcomes.LifetimeCancelled, factoryOutcomes.LifetimePlanRejected,
-					factoryOutcomes.LifetimeFailed, factoryLifetimeOrigins),
+					factoryOutcomes.LifetimeFailed, factoryOutcomes.LifetimeNeedsLanding, factoryLifetimeOrigins),
 				Last7Days: runOutcomes(factoryOutcomes.Last7Finished, factoryOutcomes.Last7Completed,
 					factoryOutcomes.Last7Cancelled, factoryOutcomes.Last7PlanRejected,
-					factoryOutcomes.Last7Failed, factoryLast7Origins),
+					factoryOutcomes.Last7Failed, factoryOutcomes.Last7NeedsLanding, factoryLast7Origins),
 			},
 		},
 		Users:       users,

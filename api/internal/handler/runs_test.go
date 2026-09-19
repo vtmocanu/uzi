@@ -236,16 +236,16 @@ func (s *runsStore) AdminUsageTotals(context.Context) (store.AdminUsageTotalsRow
 func (s *runsStore) AdminUsagePerUser(context.Context) ([]store.AdminUsagePerUserRow, error) {
 	return s.adminPerUser, nil
 }
-func (s *runsStore) SelfRunOutcomes(context.Context, uuid.UUID) (store.SelfRunOutcomesRow, error) {
+func (s *runsStore) SelfRunOutcomes(context.Context, store.SelfRunOutcomesParams) (store.SelfRunOutcomesRow, error) {
 	return s.selfRunOutcomes, nil
 }
 func (s *runsStore) SelfRunOutcomeOrigins(context.Context, uuid.UUID) ([]store.SelfRunOutcomeOriginsRow, error) {
 	return s.selfRunOutcomeOrigins, nil
 }
-func (s *runsStore) AdminRunOutcomes(context.Context) (store.AdminRunOutcomesRow, error) {
+func (s *runsStore) AdminRunOutcomes(context.Context, []string) (store.AdminRunOutcomesRow, error) {
 	return s.adminRunOutcomes, nil
 }
-func (s *runsStore) AdminRunOutcomesPerUser(context.Context) ([]store.AdminRunOutcomesPerUserRow, error) {
+func (s *runsStore) AdminRunOutcomesPerUser(context.Context, []string) ([]store.AdminRunOutcomesPerUserRow, error) {
 	return s.adminRunOutcomesPerUser, nil
 }
 func (s *runsStore) AdminRunOutcomeOrigins(context.Context) ([]store.AdminRunOutcomeOriginsRow, error) {

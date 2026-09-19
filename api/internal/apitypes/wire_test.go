@@ -840,10 +840,11 @@ func TestAdminUsageDTOTags(t *testing.T) {
 }
 
 // TestRunOutcomesDTOTags pins the failed-run rate aggregate shape (PRD #1293): five
-// counts plus the fail_origins map, all always present.
+// counts plus the fail_origins map, all always present. needs_landing (issue #1418) is the
+// server-computed sub-cut of `failed` (needs_landing <= failed), also always present.
 func TestRunOutcomesDTOTags(t *testing.T) {
 	assertTags(t, "RunOutcomesDTO", RunOutcomesDTO{},
-		"finished", "completed", "cancelled", "plan_rejected", "failed", "fail_origins")
+		"finished", "completed", "cancelled", "plan_rejected", "failed", "needs_landing", "fail_origins")
 }
 
 // TestRunOutcomeWindowsDTOTags pins the two-window wrapper (PRD #1293).

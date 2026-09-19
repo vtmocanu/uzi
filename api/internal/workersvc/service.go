@@ -935,10 +935,13 @@ type Store interface {
 	SelfUsage(ctx context.Context, userID uuid.UUID) (store.SelfUsageRow, error)
 	AdminUsageTotals(ctx context.Context) (store.AdminUsageTotalsRow, error)
 	AdminUsagePerUser(ctx context.Context) ([]store.AdminUsagePerUserRow, error)
-	// Failed-run rate outcome aggregates (PRD #1293 M1), read straight from `runs`.
-	SelfRunOutcomes(ctx context.Context, userID uuid.UUID) (store.SelfRunOutcomesRow, error)
-	AdminRunOutcomes(ctx context.Context) (store.AdminRunOutcomesRow, error)
-	AdminRunOutcomesPerUser(ctx context.Context) ([]store.AdminRunOutcomesPerUserRow, error)
+	// Failed-run rate outcome aggregates (PRD #1293 M1), read straight from `runs`. The
+	// needs_landing sub-cut of `failed` (issue #1418) takes the human-landable fail_origin
+	// set as a bind array; the Service wrappers inject AllHumanLandableFailOrigins() so the
+	// set never leaves Go.
+	SelfRunOutcomes(ctx context.Context, arg store.SelfRunOutcomesParams) (store.SelfRunOutcomesRow, error)
+	AdminRunOutcomes(ctx context.Context, landableOrigins []string) (store.AdminRunOutcomesRow, error)
+	AdminRunOutcomesPerUser(ctx context.Context, landableOrigins []string) ([]store.AdminRunOutcomesPerUserRow, error)
 	SelfRunOutcomeOrigins(ctx context.Context, userID uuid.UUID) ([]store.SelfRunOutcomeOriginsRow, error)
 	AdminRunOutcomeOrigins(ctx context.Context) ([]store.AdminRunOutcomeOriginsRow, error)
 	AdminRunOutcomeOriginsPerUser(ctx context.Context) ([]store.AdminRunOutcomeOriginsPerUserRow, error)
@@ -5632,20 +5635,27 @@ func (s *Service) AdminUsagePerUser(ctx context.Context) ([]store.AdminUsagePerU
 }
 
 // SelfRunOutcomes returns the user's own run outcome counts for both windows
-// (PRD #1293 M1), the failed-run rate data for GET /api/usage.
+// (PRD #1293 M1), the failed-run rate data for GET /api/usage. The needs_landing sub-cut
+// (issue #1418) is keyed on AllHumanLandableFailOrigins(), injected here so the human-landable
+// set stays inside Go and the handler never has to know it.
 func (s *Service) SelfRunOutcomes(ctx context.Context, userID uuid.UUID) (store.SelfRunOutcomesRow, error) {
-	return s.q.SelfRunOutcomes(ctx, userID)
+	return s.q.SelfRunOutcomes(ctx, store.SelfRunOutcomesParams{
+		LandableOrigins: AllHumanLandableFailOrigins(),
+		UserID:          userID,
+	})
 }
 
-// AdminRunOutcomes returns factory-wide run outcome counts for both windows (PRD #1293 M1).
+// AdminRunOutcomes returns factory-wide run outcome counts for both windows (PRD #1293 M1);
+// needs_landing (issue #1418) keyed on the Go-owned human-landable set.
 func (s *Service) AdminRunOutcomes(ctx context.Context) (store.AdminRunOutcomesRow, error) {
-	return s.q.AdminRunOutcomes(ctx)
+	return s.q.AdminRunOutcomes(ctx, AllHumanLandableFailOrigins())
 }
 
 // AdminRunOutcomesPerUser returns the per-user lifetime outcome counts for the admin
 // factory breakdown (PRD #1293 M1, D5); joins users so an outcome-only user has an email.
+// needs_landing (issue #1418) keyed on the Go-owned human-landable set.
 func (s *Service) AdminRunOutcomesPerUser(ctx context.Context) ([]store.AdminRunOutcomesPerUserRow, error) {
-	return s.q.AdminRunOutcomesPerUser(ctx)
+	return s.q.AdminRunOutcomesPerUser(ctx, AllHumanLandableFailOrigins())
 }
 
 // SelfRunOutcomeOrigins returns the user's per-origin failure causes for both windows

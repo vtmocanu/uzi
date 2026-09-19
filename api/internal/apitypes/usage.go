@@ -28,12 +28,23 @@ type UsageDTO struct {
 // computes the rate (failed/finished), never the server (D6). FailOrigins keys are the
 // failorigin.go vocabulary plus 'unknown' (a NULL fail_origin, pre-migration 00126); it
 // is always a non-nil map so it marshals as {} rather than null, even when empty.
+//
+// NeedsLanding (issue #1418) is a server-computed SUB-CUT of the `failed` bucket, not a new
+// denominator member: the count of failed runs whose committed work is human-landable and
+// recoverable (fail_origin in the workersvc human-landable set AND an available recovery
+// capture or a preserved_patch — i.e. the runs whose per-run landing_state derives to
+// needs_landing). The invariant, asserted in tests, is needs_landing <= failed; finished and
+// failed are UNCHANGED by it (the dashboard splits the `failed` bar into "failed" and
+// "failed, needs landing" whose widths sum to the same `failed`).
 type RunOutcomesDTO struct {
 	Finished     int64 `json:"finished"`
 	Completed    int64 `json:"completed"`
 	Cancelled    int64 `json:"cancelled"`
 	PlanRejected int64 `json:"plan_rejected"`
 	Failed       int64 `json:"failed"`
+	// NeedsLanding is the sub-cut of Failed whose per-run landing_state is needs_landing
+	// (issue #1418). Always needs_landing <= failed; it does NOT enter the finished total.
+	NeedsLanding int64 `json:"needs_landing"`
 	// FailOrigins counts the `failed` rows by fail_origin (NULL keyed "unknown"). Always
 	// non-nil so it marshals {} not null; sum over the map equals Failed.
 	FailOrigins map[string]int64 `json:"fail_origins"`
