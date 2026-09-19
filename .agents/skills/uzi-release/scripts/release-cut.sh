@@ -137,6 +137,23 @@ prev_stable_below() {
 changelog_unreleased_body() {
   awk '/^## \[Unreleased\]/{f=1;next} f&&/^## \[/{exit} f{print}' CHANGELOG.md
 }
+# rc_tag_on_remote <tag> -> 0 present on origin, 2 absent from origin, 3 origin
+# unreachable (network/auth). A promote re-tags the in-flight RC's PUBLISHED agent image
+# and folds its notes, so promoting an RC that was never pushed (hence never built by
+# release.yml) would ship a stable chart whose workers.image.tag names an image nobody
+# built (the 0.83.0-rc.7 incident, 2026-09-19). A local-only tag is indistinguishable from
+# a published one via `git tag -l`, so ask the remote directly. `--exit-code` separates
+# "absent" (2) from a genuine remote error (anything else) so the two get distinct, honest
+# messages -- both still refuse (fail-closed). The fixture's origin is a local path;
+# ls-remote works on that too.
+rc_tag_on_remote() {
+  git ls-remote --exit-code --tags origin "refs/tags/$1" >/dev/null 2>&1
+  case $? in
+    0) return 0 ;;
+    2) return 2 ;;
+    *) return 3 ;;
+  esac
+}
 
 # --- preconditions ------------------------------------------------------------
 if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
@@ -378,6 +395,30 @@ promote_guard() {
   fi
 }
 if [ "$OP" = promote ]; then
+  # REFUSE to promote an RC that is not confirmed PUBLISHED on origin. Promotion re-tags
+  # the RC's published agent image and folds its notes; an unpushed RC was never built by
+  # release.yml, so a promote of it ships a stable chart whose worker pin names an image
+  # nobody built (the 0.83.0-rc.7 incident). Fail closed on both "absent" and "cannot
+  # reach origin", with distinct messages so a network/auth blip is not read as an unpushed
+  # tag. Push the RC, let it publish, THEN promote.
+  rc_tag_on_remote "$INFLIGHT"; rtr=$?
+  if [ "$rtr" -eq 2 ]; then
+    {
+      echo "release-cut: --promote REFUSED -- the in-flight RC $INFLIGHT is not on origin."
+      echo "  Promotion re-tags the RC's PUBLISHED agent image and folds its notes; an RC that was never pushed was never built by release.yml, so promoting it would ship a stable chart whose workers.image.tag names an image nobody built (the 0.83.0-rc.7 incident, 2026-09-19)."
+      echo "  Push the RC tag, let it publish, THEN promote:"
+      echo "    ! git push origin $INFLIGHT"
+      echo "    .../release-watch.sh ${INFLIGHT#v} && .../release-verify.sh ${INFLIGHT#v}"
+      echo "    release-cut $VERSION --promote"
+    } >&2
+    exit 3
+  elif [ "$rtr" -ne 0 ]; then
+    {
+      echo "release-cut: --promote REFUSED -- could not reach origin to confirm $INFLIGHT is published (git ls-remote failed)."
+      echo "  Promoting without confirming the RC is published risks shipping a stable chart pinned to an unbuilt worker image (the 0.83.0-rc.7 incident). Fix connectivity/auth and re-run."
+    } >&2
+    exit 3
+  fi
   # If main has not moved since the RC and [Unreleased] is empty, there is nothing to
   # cut: promote only (D1). main's Chart.yaml then stays at the RC version, harmless.
   merges="$(git log --first-parent --format=%H "$INFLIGHT..HEAD" 2>/dev/null | grep -c . || true)"

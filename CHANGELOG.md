@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Fixed
+
+- **The release train now enforces that the chart's hosted-worker pin names a published image ([#1462](https://github.com/vtmocanu/uzi/pull/1462)).**
+  A release candidate cut at a commit and kept as a local-only tag was never built by CI, yet its version could still be pinned as the chart's `workers.image.tag` and shipped in a stable chart, leaving every new hosted worker in ImagePullBackOff. `release-cut.sh --promote` now refuses an in-flight candidate that is not on the remote, `release.yml` blocks the chart publish unless every worker image resolves on GHCR at the pinned tag, `release-verify.sh` re-checks the shipped pin, and `worker-tag-autobump.sh` repins a dead tag to the version being cut instead of failing open.
+
 ## [0.83.0] - 2026-09-13
 
 ### Added
