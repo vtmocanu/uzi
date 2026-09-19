@@ -343,6 +343,47 @@ func TestMilestoneLaneRowsLivesSupersedeM1(t *testing.T) {
 	}
 }
 
+// TestMilestoneLaneRowsUnlanedLiveAgentShowsGlobalNow is the regression pin for the lanes-branch D6
+// defect: with a `coder` lane present, a live `reviewer` that is on NO lane (an untagged dispatch)
+// vanished from `uzi run get`, because any lane suppressed the global now-row outright. The lane row
+// and the global NOW row must both render. The converse (the live agent IS on a lane, so the global
+// row stays suppressed) is pinned by TestMilestoneLaneRowsLivesSupersedeM1 above.
+func TestMilestoneLaneRowsUnlanedLiveAgentShowsGlobalNow(t *testing.T) {
+	at := time.Now().Add(2 * time.Hour) // relAge floors a not-yet timestamp to "0s"
+	r := apitypes.RunDTO{
+		ID: "run-1353-cli-unlaned", Kind: "issue", Status: "running", IssueTitle: "Add rate limiting",
+		Milestones:           []apitypes.Milestone{{ID: "m1", Title: "Alpha"}, {ID: "m2", Title: "Beta"}},
+		MilestonesCompleted:  []string{"m1"},
+		MilestonesInProgress: []string{"m2"},
+		MilestonesLive: []apitypes.MilestoneLive{
+			{MilestoneID: "m2", Lanes: []apitypes.MilestoneLane{
+				{Agent: "coder", AgentInstance: "toolu_a", AgentLabel: "Wire the limiter", Tool: "Edit", Detail: "window.go", At: at},
+			}},
+		},
+		CurrentActivity: &apitypes.RunActivity{
+			Agent: "reviewer", AgentLabel: "Untagged review", Tool: "Read", Detail: "limits_test.go", At: at, Seq: 12,
+		},
+	}
+
+	var buf bytes.Buffer
+	p := uzicli.NewPrinter(&buf, false, false, true, false) // non-tty, non-json, no colour
+	if err := renderRunDetail(p, r); err != nil {
+		t.Fatalf("renderRunDetail: %v", err)
+	}
+	out := buf.String()
+	if n := countNowRows(out); n != 2 {
+		t.Errorf("want the `NOW m2` lane row plus the global NOW row (2), got %d:\n%s", n, out)
+	}
+	for _, sub := range []string{
+		"coder · Wire the limiter · Edit window.go · 0s ago",
+		"reviewer · Untagged review · Read limits_test.go · 0s ago",
+	} {
+		if !strings.Contains(out, sub) {
+			t.Errorf("`run get` output missing %q:\n%s", sub, out)
+		}
+	}
+}
+
 // TestMilestonesLiveIndex covers milestonesLiveIndex's exclusion/dedup branches directly (Finding 2):
 // the happy path only ever hits the inclusion branch, so a regression in an exclusion — most sharply
 // the empty-lanes skip, which would silently suppress a now-line if it dropped a real entry — would go

@@ -247,3 +247,36 @@ func TestTUIMilestoneLanesRender(t *testing.T) {
 		t.Errorf("PRD #1353 M6: the lanes branch must suppress the current_activity eyebrow now-line, but the frame label appeared:\n%s", got)
 	}
 }
+
+// TestTUIMilestoneLanesUnlanedLiveAgent is the crew-rail twin of the CLI regression pin for the
+// lanes-branch D6 defect: with a `coder` lane present, a live `reviewer` on NO lane (an untagged
+// dispatch) lost its unattached now-line, because any lane suppressed it outright. The unattached
+// now-line must render under the eyebrow while the coder lane stays under its milestone. The
+// converse (live agent IS on a lane, now-line suppressed) is pinned by TestTUIMilestoneLanesRender.
+func TestTUIMilestoneLanesUnlanedLiveAgent(t *testing.T) {
+	at := time.Now().Add(2 * time.Hour) // relAge floors a not-yet timestamp to "0s"
+	run := apitypes.RunDTO{
+		ID: "run-1353-tui-unlaned", Kind: "issue", Status: "running", Health: "ok", IssueTitle: "Add rate limiting",
+		Milestones:           []apitypes.Milestone{{ID: "m1", Title: "Alpha"}, {ID: "m2", Title: "Beta"}},
+		MilestonesCompleted:  []string{"m1"},
+		MilestonesInProgress: []string{"m2"},
+		MilestonesLive: []apitypes.MilestoneLive{
+			{MilestoneID: "m2", Lanes: []apitypes.MilestoneLane{
+				{Agent: "coder", AgentInstance: "toolu_1", AgentLabel: "Wire the limiter", Tool: "Edit", Detail: "window.go", At: at},
+			}},
+		},
+	}
+	got := tuiAttribModel(t, run, "reviewer", "Untagged review")
+
+	const want = "MILESTONES ▰▱ 1/2 · m2\n" +
+		" ↳ reviewer · 0s\n" +
+		"   Untagged review\n" +
+		" ✓ Alpha\n" +
+		" ◕ Beta\n" +
+		"   ↳ coder · 0s\n" +
+		"     Edit window.go\n" +
+		"     Wire the limiter"
+	if got != want {
+		t.Errorf("TUI unlaned live agent render drifted.\n--- got ---\n%s\n--- want ---\n%s\n--- got (quoted) ---\n%q", got, want, got)
+	}
+}

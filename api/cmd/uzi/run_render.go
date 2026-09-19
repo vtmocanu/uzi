@@ -164,10 +164,11 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 	rows = append(rows, milestoneRows(r)...)
 	// The NOW row(s). PRD #1353 M5 makes LIVE LANES the authoritative live display: when the run has
 	// at least one in-progress milestone with ≥1 lane in MilestonesLive, milestoneLaneRows emits the
-	// OWNER + per-lane `NOW <id>` rows and SUPERSEDES the M1 single-current_activity display — lanes
-	// are the real live frames, so the single `current_activity` line would only duplicate/undercount
-	// them. This is the D5 branch on lane PRESENCE (never a nil test): a non-terminal run with lanes
-	// takes the lanes path, everything else renders byte-for-byte as M1 did.
+	// OWNER + per-lane `NOW <id>` rows and SUPERSEDES the M1 single-current_activity display when a
+	// lane shows the live agent — lanes are the real live frames, so the single `current_activity`
+	// line would only duplicate them. A live agent shown on NO lane still gets the global nowRow
+	// (lanesShowAgent). This is the D5 branch on lane PRESENCE (never a nil test): a non-terminal
+	// run with lanes takes the lanes path, everything else renders byte-for-byte as M1 did.
 	//
 	// The M1 path (PRD #1064 M5, D7; PRD #1224 M6; PRD #1353 M1 D6): with EFFECTIVE per-milestone
 	// attribution on a non-terminal run (D8), milestoneNowRows emits one row per attributed in-progress
@@ -181,6 +182,15 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 	// terminal cases are byte-for-byte unchanged (the M4 CLI baseline locks this).
 	if laneRows := milestoneLaneRows(r); len(laneRows) > 0 {
 		rows = append(rows, laneRows...)
+		// D6 holds in the lanes branch too: the lanes supersede current_activity ONLY when one of
+		// them shows its agent. A live agent on no lane (an untagged dispatch, a subagent on a
+		// milestone not in progress, the lead itself) would otherwise vanish, so it keeps the
+		// single global nowRow. nowRow carries the nil/terminal guards.
+		if act := r.CurrentActivity; act != nil && !lanesShowAgent(milestonesLiveIndex(r), act.Agent) {
+			if row := nowRow(r); row != nil {
+				rows = append(rows, row)
+			}
+		}
 	} else {
 		rows = append(rows, milestoneNowRows(r)...)
 		if act := r.CurrentActivity; act != nil && !terminalRunStatuses[r.Status] {
@@ -754,9 +764,9 @@ func milestoneNowRows(r apitypes.RunDTO) [][]string {
 //     <age> ago`, built exactly like nowRow / the M1 unique-match branch (empty segments drop, joined
 //     with " · "). Multiple lanes on one milestone yield multiple `NOW <id>` rows (reviewer×2 → two).
 //
-// In this branch the M1 unique-match promotion and the single global/unattached now-line are NOT
-// emitted (the caller skips them): the lanes ARE the live frames, so a single current_activity line
-// would only duplicate or undercount them.
+// In this branch the M1 unique-match promotion is NOT emitted, and the caller emits the single
+// global/unattached now-line only when no lane shows the live agent (lanesShowAgent): the lanes ARE
+// the live frames, so a current_activity line for an agent already on a lane would only duplicate it.
 //
 // Agent, AgentLabel, Tool and Detail are UNTRUSTED, model-authored text (the server caps only
 // Detail/AgentLabel, leaving Agent/Tool unsanitized on the wire, D7), so every display segment goes
@@ -875,6 +885,22 @@ func milestonesLiveIndex(r apitypes.RunDTO) map[string][]apitypes.MilestoneLane 
 func laneHasAgent(lanes []apitypes.MilestoneLane, agent string) bool {
 	for _, lane := range lanes {
 		if lane.Agent == agent {
+			return true
+		}
+	}
+	return false
+}
+
+// lanesShowAgent reports whether ANY rendered live lane, on any in-progress milestone, is driven by
+// the given agent (the laneHasAgent byte-match, across the whole milestonesLiveIndex). It decides
+// whether the lanes already show the run's live activity: true means current_activity would only
+// duplicate a lane, false means the live agent is on no lane and keeps the single global now-line
+// (PRD #1353 D6). Name-matched rather than frame-matched on purpose: the TUI derives its activity
+// from its own frames, which run ahead of the polled DTO lanes, so a timestamp match would flicker
+// a duplicate now-line on every tool call. Shared by the CLI `run get` and the TUI crew rail.
+func lanesShowAgent(laneIdx map[string][]apitypes.MilestoneLane, agent string) bool {
+	for _, lanes := range laneIdx {
+		if laneHasAgent(lanes, agent) {
 			return true
 		}
 	}

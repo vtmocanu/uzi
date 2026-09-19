@@ -612,7 +612,8 @@ func (m tuiModel) renderMilestones() string {
 	}
 	// LIVE LANES (PRD #1353 M6). laneIdx is the D6-refiltered MilestonesLive keyed by milestone id;
 	// a NON-EMPTY laneIdx ("has lanes") is the authoritative live display — the lanes ARE the live
-	// frames, so they supersede the single current_activity now-line. Computed only for a non-terminal
+	// frames, so they supersede the single current_activity now-line whenever a lane shows its agent
+	// (lanesShowAgent; a live agent on no lane keeps the now-line). Computed only for a non-terminal
 	// run (a terminal run has no "now"). When laneIdx is empty the render is the M1 path unchanged (D5
 	// branch on lane PRESENCE, never a nil test).
 	var laneIdx map[string][]apitypes.MilestoneLane
@@ -652,12 +653,16 @@ func (m tuiModel) renderMilestones() string {
 		sb.WriteString(eyebrow + "\n")
 		sb.WriteString(m.pal.faint.Render("· "+suffix) + "\n")
 	}
-	// An unattached now line directly under the eyebrow, in two cases — SUPPRESSED entirely in the
-	// lanes branch (PRD #1353 M6): with live lanes present, the single current_activity now-line would
-	// only duplicate/undercount the per-lane lines rendered under each milestone below.
+	// An unattached now line directly under the eyebrow, in three cases. In the lanes branch (PRD
+	// #1353 M6) it is suppressed when a lane already shows the live agent, since it would only
+	// duplicate that per-lane line below.
 	switch {
 	case hasLanes:
-		// Lanes supersede the single current_activity line — no unattached eyebrow now-line.
+		// D6 holds here too: a live agent on NO lane (an untagged dispatch, a subagent on a milestone
+		// not in progress, the lead itself) keeps the unattached now-line instead of vanishing.
+		if act != nil && !lanesShowAgent(laneIdx, act.Agent) {
+			sb.WriteString(m.railNowLines(act, " ", "   "))
+		}
 	case len(effAgents) == 0 && ipID == "" && act != nil:
 		// Unattributed, nothing declared in progress but there IS activity (PRD #1064 mock; #390
 		// D7 — declared, not inferred, so the milestone stays unmarked).
