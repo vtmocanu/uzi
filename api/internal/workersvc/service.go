@@ -926,6 +926,13 @@ type Store interface {
 	SelfUsage(ctx context.Context, userID uuid.UUID) (store.SelfUsageRow, error)
 	AdminUsageTotals(ctx context.Context) (store.AdminUsageTotalsRow, error)
 	AdminUsagePerUser(ctx context.Context) ([]store.AdminUsagePerUserRow, error)
+	// Failed-run rate outcome aggregates (PRD #1293 M1), read straight from `runs`.
+	SelfRunOutcomes(ctx context.Context, userID uuid.UUID) (store.SelfRunOutcomesRow, error)
+	AdminRunOutcomes(ctx context.Context) (store.AdminRunOutcomesRow, error)
+	AdminRunOutcomesPerUser(ctx context.Context) ([]store.AdminRunOutcomesPerUserRow, error)
+	SelfRunOutcomeOrigins(ctx context.Context, userID uuid.UUID) ([]store.SelfRunOutcomeOriginsRow, error)
+	AdminRunOutcomeOrigins(ctx context.Context) ([]store.AdminRunOutcomeOriginsRow, error)
+	AdminRunOutcomeOriginsPerUser(ctx context.Context) ([]store.AdminRunOutcomeOriginsPerUserRow, error)
 	CreateRunInput(ctx context.Context, arg store.CreateRunInputParams) (store.RunUserInput, error)
 	// CountRunReviseInputs is the read-only reporting view of the PRD #41 plan-revision
 	// cap: all revise_plan rows for the run (no consumed_at filter), so a consumed
@@ -5613,6 +5620,41 @@ func (s *Service) AdminUsageTotals(ctx context.Context) (store.AdminUsageTotalsR
 // (PRD #40 M3); the rows sum to the factory total by construction.
 func (s *Service) AdminUsagePerUser(ctx context.Context) ([]store.AdminUsagePerUserRow, error) {
 	return s.q.AdminUsagePerUser(ctx)
+}
+
+// SelfRunOutcomes returns the user's own run outcome counts for both windows
+// (PRD #1293 M1), the failed-run rate data for GET /api/usage.
+func (s *Service) SelfRunOutcomes(ctx context.Context, userID uuid.UUID) (store.SelfRunOutcomesRow, error) {
+	return s.q.SelfRunOutcomes(ctx, userID)
+}
+
+// AdminRunOutcomes returns factory-wide run outcome counts for both windows (PRD #1293 M1).
+func (s *Service) AdminRunOutcomes(ctx context.Context) (store.AdminRunOutcomesRow, error) {
+	return s.q.AdminRunOutcomes(ctx)
+}
+
+// AdminRunOutcomesPerUser returns the per-user lifetime outcome counts for the admin
+// factory breakdown (PRD #1293 M1, D5); joins users so an outcome-only user has an email.
+func (s *Service) AdminRunOutcomesPerUser(ctx context.Context) ([]store.AdminRunOutcomesPerUserRow, error) {
+	return s.q.AdminRunOutcomesPerUser(ctx)
+}
+
+// SelfRunOutcomeOrigins returns the user's per-origin failure causes for both windows
+// (PRD #1293 M1), folded into RunOutcomesDTO.fail_origins by the handler.
+func (s *Service) SelfRunOutcomeOrigins(ctx context.Context, userID uuid.UUID) ([]store.SelfRunOutcomeOriginsRow, error) {
+	return s.q.SelfRunOutcomeOrigins(ctx, userID)
+}
+
+// AdminRunOutcomeOrigins returns the factory-wide per-origin failure causes for both
+// windows (PRD #1293 M1).
+func (s *Service) AdminRunOutcomeOrigins(ctx context.Context) ([]store.AdminRunOutcomeOriginsRow, error) {
+	return s.q.AdminRunOutcomeOrigins(ctx)
+}
+
+// AdminRunOutcomeOriginsPerUser returns the per-user lifetime per-origin failure causes
+// (PRD #1293 M1), keyed by user id so the handler attaches each user's causes.
+func (s *Service) AdminRunOutcomeOriginsPerUser(ctx context.Context) ([]store.AdminRunOutcomeOriginsPerUserRow, error) {
+	return s.q.AdminRunOutcomeOriginsPerUser(ctx)
 }
 
 // SubmitInputResult reports how a steering input was handled.

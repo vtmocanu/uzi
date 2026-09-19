@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"net/http"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
@@ -29,9 +30,27 @@ func numericToFloat(n pgtype.Numeric) float64 {
 	return f.Float64
 }
 
+// runOutcomes assembles a RunOutcomesDTO from the five counts and a (possibly nil)
+// origins map (PRD #1293). It guarantees a non-nil fail_origins so the field marshals as
+// {} rather than null, per the API contract — a nil map JSON-encodes to null.
+func runOutcomes(finished, completed, cancelled, planRejected, failed int64, origins map[string]int64) apitypes.RunOutcomesDTO {
+	if origins == nil {
+		origins = map[string]int64{}
+	}
+	return apitypes.RunOutcomesDTO{
+		Finished:     finished,
+		Completed:    completed,
+		Cancelled:    cancelled,
+		PlanRejected: planRejected,
+		Failed:       failed,
+		FailOrigins:  origins,
+	}
+}
+
 // SelfUsage returns the requesting user's own usage (PRD #40): lifetime totals,
 // last-7-days totals, and their usage-bearing run count. Session-authed; scoped to
-// the caller, so a user only ever sees their own consumption.
+// the caller, so a user only ever sees their own consumption. PRD #1293 adds the
+// failed-run rate outcome aggregate for both windows (a separate scan over `runs`, D1).
 func (h *Handler) SelfUsage(w http.ResponseWriter, r *http.Request) {
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {
@@ -43,6 +62,28 @@ func (h *Handler) SelfUsage(w http.ResponseWriter, r *http.Request) {
 		slog.Error("self usage", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
+	}
+	outcomes, err := h.wsvc.SelfRunOutcomes(r.Context(), user.ID)
+	if err != nil {
+		slog.Error("self run outcomes", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	originRows, err := h.wsvc.SelfRunOutcomeOrigins(r.Context(), user.ID)
+	if err != nil {
+		slog.Error("self run outcome origins", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	lifetimeOrigins := map[string]int64{}
+	last7Origins := map[string]int64{}
+	for _, o := range originRows {
+		switch o.WindowTag {
+		case "lifetime":
+			lifetimeOrigins[o.Origin] = o.Cnt
+		case "last7":
+			last7Origins[o.Origin] = o.Cnt
+		}
 	}
 	httpx.JSON(w, http.StatusOK, apitypes.SelfUsageDTO{
 		Lifetime: apitypes.UsageDTO{
@@ -60,6 +101,12 @@ func (h *Handler) SelfUsage(w http.ResponseWriter, r *http.Request) {
 			CostUSD:             numericToFloat(row.Last7CostUsd),
 		},
 		RunCount: row.RunCount,
+		Outcomes: apitypes.RunOutcomeWindowsDTO{
+			Lifetime: runOutcomes(outcomes.LifetimeFinished, outcomes.LifetimeCompleted,
+				outcomes.LifetimeCancelled, outcomes.LifetimePlanRejected, outcomes.LifetimeFailed, lifetimeOrigins),
+			Last7Days: runOutcomes(outcomes.Last7Finished, outcomes.Last7Completed,
+				outcomes.Last7Cancelled, outcomes.Last7PlanRejected, outcomes.Last7Failed, last7Origins),
+		},
 	})
 }
 
@@ -79,8 +126,66 @@ func (h *Handler) AdminUsage(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	users := make([]apitypes.AdminUserUsageDTO, 0, len(rows))
+	// PRD #1293: the failed-run rate outcome aggregates, a separate scan over `runs` (D1)
+	// merged into the usage rows by user id (D5).
+	factoryOutcomes, err := h.wsvc.AdminRunOutcomes(r.Context())
+	if err != nil {
+		slog.Error("admin run outcomes", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	factoryOriginRows, err := h.wsvc.AdminRunOutcomeOrigins(r.Context())
+	if err != nil {
+		slog.Error("admin run outcome origins", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	perUserOutcomes, err := h.wsvc.AdminRunOutcomesPerUser(r.Context())
+	if err != nil {
+		slog.Error("admin run outcomes per user", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	perUserOriginRows, err := h.wsvc.AdminRunOutcomeOriginsPerUser(r.Context())
+	if err != nil {
+		slog.Error("admin run outcome origins per user", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+
+	// Fold the factory per-origin rows into per-window maps.
+	factoryLifetimeOrigins := map[string]int64{}
+	factoryLast7Origins := map[string]int64{}
+	for _, o := range factoryOriginRows {
+		switch o.WindowTag {
+		case "lifetime":
+			factoryLifetimeOrigins[o.Origin] = o.Cnt
+		case "last7":
+			factoryLast7Origins[o.Origin] = o.Cnt
+		}
+	}
+	// Fold the per-user (lifetime-only) origin rows keyed by user id.
+	originsByUser := map[uuid.UUID]map[string]int64{}
+	for _, o := range perUserOriginRows {
+		m := originsByUser[o.UserID]
+		if m == nil {
+			m = map[string]int64{}
+			originsByUser[o.UserID] = m
+		}
+		m[o.Origin] = o.Cnt
+	}
+	// Index the per-user outcome counts by user id, so a usage row can attach its outcomes.
+	outcomesByUser := map[uuid.UUID]store.AdminRunOutcomesPerUserRow{}
+	for _, o := range perUserOutcomes {
+		outcomesByUser[o.UserID] = o
+	}
+
+	users := make([]apitypes.AdminUserUsageDTO, 0, len(rows)+len(perUserOutcomes))
+	seen := map[uuid.UUID]bool{}
 	for _, u := range rows {
+		seen[u.UserID] = true
+		// A user with no outcomes row gets a zero-value RunOutcomesDTO (all-zero counts).
+		oc := outcomesByUser[u.UserID]
 		users = append(users, apitypes.AdminUserUsageDTO{
 			UserID: u.UserID.String(),
 			Email:  u.Email,
@@ -92,6 +197,24 @@ func (h *Handler) AdminUsage(w http.ResponseWriter, r *http.Request) {
 				CostUSD:             numericToFloat(u.CostUsd),
 			},
 			RunCount: u.RunCount,
+			Outcomes: runOutcomes(oc.Finished, oc.Completed, oc.Cancelled, oc.PlanRejected, oc.Failed,
+				originsByUser[u.UserID]),
+		})
+	}
+	// D5: a user present in the outcomes aggregate but ABSENT from usage (every run died
+	// before spending, so no usage row) gets a zero-usage row APPENDED after the
+	// cost-sorted usage rows, so the heaviest-first order of the usage rows is untouched.
+	for _, oc := range perUserOutcomes {
+		if seen[oc.UserID] {
+			continue
+		}
+		users = append(users, apitypes.AdminUserUsageDTO{
+			UserID:   oc.UserID.String(),
+			Email:    oc.Email,
+			Usage:    apitypes.UsageDTO{},
+			RunCount: 0,
+			Outcomes: runOutcomes(oc.Finished, oc.Completed, oc.Cancelled, oc.PlanRejected, oc.Failed,
+				originsByUser[oc.UserID]),
 		})
 	}
 	httpx.JSON(w, http.StatusOK, apitypes.AdminUsageDTO{
@@ -111,6 +234,14 @@ func (h *Handler) AdminUsage(w http.ResponseWriter, r *http.Request) {
 				CostUSD:             numericToFloat(totals.Last7CostUsd),
 			},
 			RunCount: totals.RunCount,
+			Outcomes: apitypes.RunOutcomeWindowsDTO{
+				Lifetime: runOutcomes(factoryOutcomes.LifetimeFinished, factoryOutcomes.LifetimeCompleted,
+					factoryOutcomes.LifetimeCancelled, factoryOutcomes.LifetimePlanRejected,
+					factoryOutcomes.LifetimeFailed, factoryLifetimeOrigins),
+				Last7Days: runOutcomes(factoryOutcomes.Last7Finished, factoryOutcomes.Last7Completed,
+					factoryOutcomes.Last7Cancelled, factoryOutcomes.Last7PlanRejected,
+					factoryOutcomes.Last7Failed, factoryLast7Origins),
+			},
 		},
 		Users:       users,
 		EarliestRun: timePtr(totals.EarliestRun.Valid, totals.EarliestRun.Time),

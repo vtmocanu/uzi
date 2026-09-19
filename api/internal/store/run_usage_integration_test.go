@@ -388,6 +388,219 @@ func TestUsageRollupsLiveDB(t *testing.T) {
 	}
 }
 
+// TestRunOutcomesRollupsLiveDB proves the PRD #1293 M1 failed-run rate aggregates against
+// a REAL Postgres: the outcome counts are a straight scan over `runs` (NOT the usage join,
+// D1 — a run that fails before spending has no usage row and must still count), restricted
+// to terminal non-chat/judge runs and windowed on created_at (D3). It asserts the
+// exclusions (chat/judge never counted), both contract invariants (finished == sum of the
+// four outcomes; sum(fail_origins) == failed), that a NULL fail_origin buckets as
+// "unknown", the plan_rejected split (out of failed, in finished, D4), the 7-day window,
+// and that the per-user and factory aggregates agree (per-user rows sum to the factory).
+//
+// Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres.
+func TestRunOutcomesRollupsLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via the store integration runner for live-DB coverage")
+	}
+	ctx := context.Background()
+	if err := store.Migrate(ctx, dsn); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	pool, err := store.OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	defer pool.Close()
+	q := store.New(pool)
+
+	// Fresh users/repos so the SCOPED SelfRunOutcomes assertions are absolute; the shared
+	// store-IT DB means the FACTORY aggregates also see other tests' runs, so those are
+	// asserted only by invariant + per-user/factory agreement (mirrors TestUsageRollupsLiveDB).
+	seedUserRepo := func(tag string) (userID, repoID uuid.UUID) {
+		userID, connID, repoID := uuid.New(), uuid.New(), uuid.New()
+		mustExec(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
+			userID, fmt.Sprintf("outcomes-%s-%s@e2e", tag, userID))
+		mustExec(ctx, t, pool,
+			`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
+			 VALUES ($1, $2, 'gitlab', 'https://forge.e2e', 'bot', 1, $3)`, connID, userID, []byte{0x1})
+		mustExec(ctx, t, pool,
+			`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
+			 VALUES ($1, $2, 1, 'g/r-outcomes-'||$3, 'https://forge.e2e/g/r', 'main', true)`, repoID, connID, tag+"-"+userID.String())
+		return userID, repoID
+	}
+	userA, repoA := seedUserRepo("a")
+	userB, repoB := seedUserRepo("b")
+
+	oiid := int64(1_000_000) // high base so this test's issue_iids never collide with siblings'
+	// seedOutcomeRun inserts a terminal run with an explicit status/kind/fail_origin/created_at.
+	// An issue-shaped run carries repo_id + issue_iid (the kind-shape CHECK); a chat/judge run
+	// carries neither (nor a branch), and a judge run additionally needs a target_run_id.
+	seedOutcomeRun := func(userID, repoID uuid.UUID, status, kind string, failOrigin *string, daysAgo int, targetRunID *uuid.UUID) uuid.UUID {
+		oiid++
+		id := uuid.New()
+		if kind == "chat" || kind == "judge" {
+			var target any
+			if targetRunID != nil {
+				target = *targetRunID
+			}
+			mustExec(ctx, t, pool,
+				`INSERT INTO runs (id, user_id, kind, target_run_id, issue_title, issue_description, status, fail_origin, created_at)
+				 VALUES ($1, $2, $3, $4, 't', 'd', $5, $6, now() - make_interval(days => $7))`,
+				id, userID, kind, target, status, failOrigin, daysAgo)
+			return id
+		}
+		mustExec(ctx, t, pool,
+			`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, status, fail_origin, created_at)
+			 VALUES ($1, $2, $3, $4, $5, 't', 'd', $6, $7, now() - make_interval(days => $8))`,
+			id, userID, repoID, kind, oiid, status, failOrigin, daysAgo)
+		return id
+	}
+	planRejected := "plan_rejected"
+	agentFailure := "agent_failure"
+
+	// userA: one run per terminal status + a plan_rejected + a real-origin failure + a
+	// NULL-origin failure, plus one chat and one judge failure that MUST be excluded. The
+	// NULL-origin failure is backdated 10 days (outside the 7-day window) to prove windowing.
+	aCompleted := seedOutcomeRun(userA, repoA, "completed", "issue", nil, 0, nil)
+	seedOutcomeRun(userA, repoA, "cancelled", "issue", nil, 0, nil)
+	seedOutcomeRun(userA, repoA, "failed", "issue", &planRejected, 0, nil)
+	seedOutcomeRun(userA, repoA, "failed", "issue", &agentFailure, 0, nil)
+	seedOutcomeRun(userA, repoA, "failed", "issue", nil, 10, nil) // NULL origin -> "unknown", out of the 7-day window
+	seedOutcomeRun(userA, repoA, "failed", "chat", &agentFailure, 0, nil)
+	seedOutcomeRun(userA, repoA, "failed", "judge", &agentFailure, 0, &aCompleted)
+
+	// userB: a smaller set so per-user grouping is meaningful (its runs must not leak into
+	// userA's counts): one completed + one real-origin failure.
+	seedOutcomeRun(userB, repoB, "completed", "issue", nil, 0, nil)
+	seedOutcomeRun(userB, repoB, "failed", "issue", &agentFailure, 0, nil)
+
+	// --- SelfRunOutcomes(userA): the exclusions and the two windows.
+	selfA, err := q.SelfRunOutcomes(ctx, userA)
+	if err != nil {
+		t.Fatalf("SelfRunOutcomes(A): %v", err)
+	}
+	// finished == 5 (completed, cancelled, plan_rejected, failed-agent, failed-null); the
+	// chat and judge failures are EXCLUDED (a 7 here would mean the kind filter is broken).
+	if selfA.LifetimeFinished != 5 {
+		t.Fatalf("A lifetime finished = %d, want 5 (chat+judge excluded)", selfA.LifetimeFinished)
+	}
+	if selfA.LifetimeCompleted != 1 || selfA.LifetimeCancelled != 1 || selfA.LifetimePlanRejected != 1 {
+		t.Fatalf("A lifetime completed/cancelled/plan_rejected = %d/%d/%d, want 1/1/1",
+			selfA.LifetimeCompleted, selfA.LifetimeCancelled, selfA.LifetimePlanRejected)
+	}
+	// failed == 2 (agent_failure + NULL origin); the plan_rejected run is split OUT of failed.
+	if selfA.LifetimeFailed != 2 {
+		t.Fatalf("A lifetime failed = %d, want 2 (plan_rejected split out)", selfA.LifetimeFailed)
+	}
+	// Invariant 1: finished == completed + cancelled + plan_rejected + failed.
+	if got := selfA.LifetimeCompleted + selfA.LifetimeCancelled + selfA.LifetimePlanRejected + selfA.LifetimeFailed; got != selfA.LifetimeFinished {
+		t.Fatalf("A lifetime invariant: finished %d != sum %d", selfA.LifetimeFinished, got)
+	}
+	// Windowing: the NULL-origin failure is 10 days old, so last7 sees 4 finished / 1 failed.
+	if selfA.Last7Finished != 4 || selfA.Last7Failed != 1 {
+		t.Fatalf("A last7 finished/failed = %d/%d, want 4/1 (the 10-day-old NULL failure is out of window)",
+			selfA.Last7Finished, selfA.Last7Failed)
+	}
+	if got := selfA.Last7Completed + selfA.Last7Cancelled + selfA.Last7PlanRejected + selfA.Last7Failed; got != selfA.Last7Finished {
+		t.Fatalf("A last7 invariant: finished %d != sum %d", selfA.Last7Finished, got)
+	}
+
+	// --- SelfRunOutcomeOrigins(userA): NULL buckets as "unknown"; sum == failed per window.
+	lifeOrigins, last7Origins := map[string]int64{}, map[string]int64{}
+	originRows, err := q.SelfRunOutcomeOrigins(ctx, userA)
+	if err != nil {
+		t.Fatalf("SelfRunOutcomeOrigins(A): %v", err)
+	}
+	for _, o := range originRows {
+		switch o.WindowTag {
+		case "lifetime":
+			lifeOrigins[o.Origin] = o.Cnt
+		case "last7":
+			last7Origins[o.Origin] = o.Cnt
+		}
+	}
+	if lifeOrigins["agent_failure"] != 1 || lifeOrigins["unknown"] != 1 {
+		t.Fatalf("A lifetime origins = %v, want agent_failure:1 unknown:1", lifeOrigins)
+	}
+	// Invariant 2: sum(fail_origins) == failed, per window.
+	if s := lifeOrigins["agent_failure"] + lifeOrigins["unknown"]; s != selfA.LifetimeFailed {
+		t.Fatalf("A lifetime sum(origins)=%d != failed=%d", s, selfA.LifetimeFailed)
+	}
+	if last7Origins["agent_failure"] != 1 || last7Origins["unknown"] != 0 {
+		t.Fatalf("A last7 origins = %v, want agent_failure:1 (the NULL failure is out of window)", last7Origins)
+	}
+	if last7Origins["agent_failure"] != selfA.Last7Failed {
+		t.Fatalf("A last7 sum(origins)=%d != failed=%d", last7Origins["agent_failure"], selfA.Last7Failed)
+	}
+
+	// --- SelfRunOutcomes(userB): isolation — userA's runs never leak in.
+	selfB, err := q.SelfRunOutcomes(ctx, userB)
+	if err != nil {
+		t.Fatalf("SelfRunOutcomes(B): %v", err)
+	}
+	if selfB.LifetimeFinished != 2 || selfB.LifetimeFailed != 1 || selfB.LifetimeCompleted != 1 {
+		t.Fatalf("B lifetime finished/failed/completed = %d/%d/%d, want 2/1/1",
+			selfB.LifetimeFinished, selfB.LifetimeFailed, selfB.LifetimeCompleted)
+	}
+
+	// --- Per-user aggregate == self, and the per-user rows sum to the factory (agreement).
+	perUser, err := q.AdminRunOutcomesPerUser(ctx)
+	if err != nil {
+		t.Fatalf("AdminRunOutcomesPerUser: %v", err)
+	}
+	perUserByID := map[uuid.UUID]store.AdminRunOutcomesPerUserRow{}
+	var sumFinished, sumCompleted, sumCancelled, sumPlanRejected, sumFailed int64
+	for _, u := range perUser {
+		perUserByID[u.UserID] = u
+		sumFinished += u.Finished
+		sumCompleted += u.Completed
+		sumCancelled += u.Cancelled
+		sumPlanRejected += u.PlanRejected
+		sumFailed += u.Failed
+	}
+	if a := perUserByID[userA]; a.Finished != selfA.LifetimeFinished || a.Failed != selfA.LifetimeFailed ||
+		a.Completed != selfA.LifetimeCompleted || a.Cancelled != selfA.LifetimeCancelled || a.PlanRejected != selfA.LifetimePlanRejected {
+		t.Fatalf("per-user row for A (%+v) must equal SelfRunOutcomes lifetime (finished %d failed %d)",
+			a, selfA.LifetimeFinished, selfA.LifetimeFailed)
+	}
+	if b := perUserByID[userB]; b.Finished != 2 || b.Failed != 1 {
+		t.Fatalf("per-user row for B = finished %d/failed %d, want 2/1", b.Finished, b.Failed)
+	}
+
+	factory, err := q.AdminRunOutcomes(ctx)
+	if err != nil {
+		t.Fatalf("AdminRunOutcomes: %v", err)
+	}
+	if sumFinished != factory.LifetimeFinished || sumCompleted != factory.LifetimeCompleted ||
+		sumCancelled != factory.LifetimeCancelled || sumPlanRejected != factory.LifetimePlanRejected ||
+		sumFailed != factory.LifetimeFailed {
+		t.Fatalf("per-user rows must sum to the factory: sum(finished %d/completed %d/cancelled %d/plan_rejected %d/failed %d) "+
+			"vs factory(finished %d/completed %d/cancelled %d/plan_rejected %d/failed %d)",
+			sumFinished, sumCompleted, sumCancelled, sumPlanRejected, sumFailed,
+			factory.LifetimeFinished, factory.LifetimeCompleted, factory.LifetimeCancelled, factory.LifetimePlanRejected, factory.LifetimeFailed)
+	}
+	// The factory invariant holds over the whole shared DB too.
+	if got := factory.LifetimeCompleted + factory.LifetimeCancelled + factory.LifetimePlanRejected + factory.LifetimeFailed; got != factory.LifetimeFinished {
+		t.Fatalf("factory lifetime invariant: finished %d != sum %d", factory.LifetimeFinished, got)
+	}
+
+	// --- Per-user origins agree with the self origins for userA (NULL -> "unknown").
+	puOriginsA := map[string]int64{}
+	puOriginRows, err := q.AdminRunOutcomeOriginsPerUser(ctx)
+	if err != nil {
+		t.Fatalf("AdminRunOutcomeOriginsPerUser: %v", err)
+	}
+	for _, o := range puOriginRows {
+		if o.UserID == userA {
+			puOriginsA[o.Origin] = o.Cnt
+		}
+	}
+	if puOriginsA["agent_failure"] != 1 || puOriginsA["unknown"] != 1 {
+		t.Fatalf("per-user origins for A = %v, want agent_failure:1 unknown:1", puOriginsA)
+	}
+}
+
 // TestRunUsagePerLegFoldEndToEndLiveDB drives the PRODUCTION fold (workersvc.AppendMessages)
 // over the eight recorded frames of run 02854d5e — four init frames interleaved with four
 // result-frame legs — through a REAL Postgres, and proves the run total is the SUM of the
