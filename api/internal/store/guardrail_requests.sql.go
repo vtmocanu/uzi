@@ -59,6 +59,19 @@ func (q *Queries) DecideGuardrailOverrideRequest(ctx context.Context, arg Decide
 	return i, err
 }
 
+const deletePendingGuardrailOverrideRequestsForRepo = `-- name: DeletePendingGuardrailOverrideRequestsForRepo :exec
+DELETE FROM guardrail_override_requests WHERE repo_id = $1 AND status = 'pending'
+`
+
+// Settle any PENDING request for a repo when the owner successfully enables it (issue
+// #1432 rework): the request is moot, so it is removed rather than left to linger in the
+// admin queue (which is unfiltered by repos.enabled). A decided (approved/rejected) request
+// is untouched — only the open pending row for this repo is deleted.
+func (q *Queries) DeletePendingGuardrailOverrideRequestsForRepo(ctx context.Context, repoID uuid.UUID) error {
+	_, err := q.db.Exec(ctx, deletePendingGuardrailOverrideRequestsForRepo, repoID)
+	return err
+}
+
 const getGuardrailOverrideRequest = `-- name: GetGuardrailOverrideRequest :one
 SELECT id, repo_id, requested_by, reason, findings, status, created_at, decided_by, decided_at, decision_note FROM guardrail_override_requests WHERE id = $1
 `

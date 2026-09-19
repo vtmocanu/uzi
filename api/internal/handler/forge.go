@@ -864,6 +864,18 @@ func (h *Handler) SetRepoEnabled(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
+
+	// issue #1432 rework: a successful enable makes any pending override request for this
+	// repo moot. Settle it so it does not linger in the admin queue
+	// (ListPendingGuardrailOverrideRequests is not filtered by enabled state). Best-effort —
+	// the enable already succeeded, so a cleanup error is logged, never surfaced. Enable-only:
+	// SetRepoEnabledForUser is also the disable path, which must not touch requests.
+	if req.Enabled {
+		if err := h.q.DeletePendingGuardrailOverrideRequestsForRepo(r.Context(), id); err != nil {
+			slog.Warn("set repo enabled: settle pending override request", "error", err)
+		}
+	}
+
 	httpx.JSON(w, http.StatusOK, map[string]any{"repo": repoToDTO(repo)})
 }
 

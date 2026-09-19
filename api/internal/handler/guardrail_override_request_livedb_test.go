@@ -537,3 +537,106 @@ func TestGuardrailOverrideRequestCrossUserFlowLiveDB(t *testing.T) {
 		t.Errorf("the repo must be enabled after the member retries Enable with an active override")
 	}
 }
+
+// staleFindings is the realistic block-finding snapshot the member's request carried when
+// it was opened — the same shape RequestGuardrailOverride persists.
+func staleFindings() []apitypes.GuardrailFindingDTO {
+	return []apitypes.GuardrailFindingDTO{
+		{Code: "default_branch_unprotected", Severity: "block", Message: "the default branch is not protected"},
+	}
+}
+
+// issue #1432 rework: approve must REVALIDATE the live guard before it installs the
+// persistent #66 override. A request opened while the repo was blocked can go stale — the
+// member fixed protection, enabled the repo, or the block became non-waivable — and arming
+// the override then would silently waive a FUTURE regression. Each subtest seeds a pending
+// request, makes the live guard stale a different way, approves, and asserts 409 + the
+// request settled `rejected` + NO override installed.
+func TestApproveGuardrailOverrideRequestRevalidatesLiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newEnableGuardFixture(ctx, t)
+	f.h.SetNotifier(notifysvc.New(f.h.q, nil, 0, nil))
+	admin := f.mkAdmin(ctx, t)
+
+	const reason = "protection is enforced by our CI ruleset, not branch protection; please allow this repo"
+
+	t.Run("no longer blocked", func(t *testing.T) {
+		repoID := f.seedRepo(ctx, t, 320, false, protUnprotected)
+		reqID := f.seedPendingRequest(ctx, t, repoID, f.owner.ID, reason, staleFindings())
+
+		// The member fixed branch protection after opening the request.
+		f.forge.mu.Lock()
+		f.forge.prot[320] = protClean
+		f.forge.mu.Unlock()
+
+		w := f.decideRequest(t, admin, reqID, true, "")
+		if w.Code != http.StatusConflict {
+			t.Fatalf("approve status = %d, want 409 for a no-longer-blocked repo (body %s)", w.Code, w.Body.String())
+		}
+		if status, _ := f.requestDecision(ctx, t, reqID); status != "rejected" {
+			t.Errorf("request status = %q, want rejected (stale dismissal)", status)
+		}
+		if _, set := f.overrideReason(ctx, t, repoID); set {
+			t.Errorf("a stale approve must NOT install the override")
+		}
+	})
+
+	t.Run("already enabled", func(t *testing.T) {
+		repoID := f.seedRepo(ctx, t, 321, true, protUnprotected)
+		reqID := f.seedPendingRequest(ctx, t, repoID, f.owner.ID, reason, staleFindings())
+
+		w := f.decideRequest(t, admin, reqID, true, "")
+		if w.Code != http.StatusConflict {
+			t.Fatalf("approve status = %d, want 409 for an already-enabled repo (body %s)", w.Code, w.Body.String())
+		}
+		if status, _ := f.requestDecision(ctx, t, reqID); status != "rejected" {
+			t.Errorf("request status = %q, want rejected (stale dismissal)", status)
+		}
+		if _, set := f.overrideReason(ctx, t, repoID); set {
+			t.Errorf("a stale approve must NOT install the override")
+		}
+	})
+
+	t.Run("no longer waivable", func(t *testing.T) {
+		repoID := f.seedRepo(ctx, t, 322, false, protUnprotected)
+		reqID := f.seedPendingRequest(ctx, t, repoID, f.owner.ID, reason, staleFindings())
+
+		// Branch protection can no longer be verified → protection_unreadable, which an
+		// override can never clear.
+		f.forge.mu.Lock()
+		f.forge.prot[322] = protError
+		f.forge.mu.Unlock()
+
+		w := f.decideRequest(t, admin, reqID, true, "")
+		if w.Code != http.StatusConflict {
+			t.Fatalf("approve status = %d, want 409 for a no-longer-waivable refusal (body %s)", w.Code, w.Body.String())
+		}
+		if status, _ := f.requestDecision(ctx, t, reqID); status != "rejected" {
+			t.Errorf("request status = %q, want rejected (stale dismissal)", status)
+		}
+		if _, set := f.overrideReason(ctx, t, repoID); set {
+			t.Errorf("a stale approve must NOT install the override")
+		}
+	})
+}
+
+// issue #1432 rework: a successful enable settles any pending override request for the repo
+// so it does not linger in the admin queue. A clean repo enables (200), and the pending
+// request it carried is gone afterwards.
+func TestSetRepoEnabledSettlesPendingOverrideRequestLiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newEnableGuardFixture(ctx, t)
+	repoID := f.seedRepo(ctx, t, 330, false, protClean)
+	f.seedPendingRequest(ctx, t, repoID, f.owner.ID, "please allow this repo", staleFindings())
+
+	w := f.setEnabled(t, repoID, true)
+	if w.Code != http.StatusOK {
+		t.Fatalf("enable status = %d, want 200 (body %s)", w.Code, w.Body.String())
+	}
+	if !f.repoEnabled(ctx, t, repoID) {
+		t.Fatalf("a clean repo must be enabled after a 200")
+	}
+	if count, _, _, _ := f.overrideRequestRow(ctx, t, repoID); count != 0 {
+		t.Errorf("a successful enable must settle the pending request, got %d rows", count)
+	}
+}

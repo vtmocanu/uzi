@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
@@ -297,6 +298,47 @@ func (h *Handler) decideGuardrailOverrideRequest(w http.ResponseWriter, r *http.
 	}
 
 	ctx := r.Context()
+
+	// Approve must revalidate the live guard BEFORE it installs a persistent override
+	// (issue #1432 rework). A request opened while the repo was blocked can go stale: the
+	// member may have fixed branch protection, or enabled the repo, before the admin
+	// decides. Arming the #66 override on a repo that is no longer blocked would silently
+	// waive a FUTURE regression that reintroduces a waivable block. So we re-run the SAME
+	// live guard the enable gate and RequestGuardrailOverride run (GuardRepo with
+	// Overridden:false), and refuse to arm a stale override — settling the request as
+	// rejected with an explanatory note. Reject needs none of this: it installs no override,
+	// so a stale reject is harmless.
+	if applyOverride {
+		reqRow, err := h.q.GetGuardrailOverrideRequest(ctx, id)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				httpx.Error(w, http.StatusNotFound, "override request not found")
+				return
+			}
+			slog.Error("approve guardrail override: get request", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		if reqRow.Status != "pending" {
+			httpx.Error(w, http.StatusConflict, "this override request has already been decided")
+			return
+		}
+		repo, err := h.q.GetRepoByID(ctx, reqRow.RepoID)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				httpx.Error(w, http.StatusConflict, "the repository no longer exists")
+				return
+			}
+			slog.Error("approve guardrail override: get repo", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		if stale, note := h.staleOverrideRequest(ctx, repo); stale {
+			h.dismissStaleOverrideRequest(ctx, w, reqRow, user.ID, note)
+			return
+		}
+	}
+
 	tx, err := h.pool.Begin(ctx)
 	if err != nil {
 		slog.Error("decide guardrail override: begin tx", "error", err)
@@ -380,6 +422,64 @@ func (h *Handler) ApproveGuardrailOverrideRequest(w http.ResponseWriter, r *http
 // rejected and notifies the requester; it sets no override and never touches the repo.
 func (h *Handler) RejectGuardrailOverrideRequest(w http.ResponseWriter, r *http.Request) {
 	h.decideGuardrailOverrideRequest(w, r, "rejected", false)
+}
+
+// staleOverrideRequest re-runs the LIVE guardrail (issue #1432 rework) to decide whether
+// approving a pending request would arm a stale #66 override. It returns (true, note) when
+// the request can no longer be honoured — the repo is already enabled, the live guard no
+// longer blocks it (protection was fixed), or the block is no longer fully waivable
+// (protection_unreadable, which an override can never clear, D8/D3) — with a server-authored
+// note explaining why. It runs GuardRepo with Overridden:false, the SAME raw refusal set the
+// enable gate (SetRepoEnabled) and RequestGuardrailOverride evaluate, so approve-time and
+// request-time agree on what "blocked" and "waivable" mean.
+func (h *Handler) staleOverrideRequest(ctx context.Context, repo store.GetRepoByIDRow) (bool, string) {
+	if repo.Enabled {
+		return true, "the repository has already been enabled, so no override is needed."
+	}
+	res := h.pcheck.GuardRepo(ctx, privcheck.GuardInput{
+		ForgeType:       repo.ForgeType,
+		BaseURL:         repo.BaseUrl,
+		TokenCiphertext: repo.TokenCiphertext,
+		Repo: privcheck.Repo{
+			ID:             repo.ID.String(),
+			Path:           repo.PathWithNamespace,
+			ForgeProjectID: repo.ForgeProjectID,
+			DefaultBranch:  repo.DefaultBranch.String,
+		},
+		Overridden: false,
+	})
+	if !res.Blocked {
+		return true, "the repository is no longer blocked by the guardrail, so no override is needed. Retry Enable."
+	}
+	if !privcheck.AllBlocksWaivable(res.Findings) {
+		return true, "this refusal can no longer be waived by an override (branch protection could not be verified); fix protection on the forge, then retry Enable."
+	}
+	return false, ""
+}
+
+// dismissStaleOverrideRequest settles a stale pending request as rejected with the given
+// server-authored note and returns 409 (issue #1432 rework). It deliberately does NOT notify
+// the member: the generic decided-notification body says "An instance admin rejected your
+// request…", which would misdescribe a SYSTEM dismissal of an approve as an admin rejection;
+// the persisted decision_note explains the state change on the member's Repos page instead.
+// The `AND status = 'pending'` guard inside DecideGuardrailOverrideRequest makes a raced
+// double-decide a 409, not a silent re-write.
+func (h *Handler) dismissStaleOverrideRequest(ctx context.Context, w http.ResponseWriter, req store.GuardrailOverrideRequest, adminID uuid.UUID, note string) {
+	if _, err := h.q.DecideGuardrailOverrideRequest(ctx, store.DecideGuardrailOverrideRequestParams{
+		ID:           req.ID,
+		Status:       "rejected",
+		DecidedBy:    adminID,
+		DecisionNote: pgtype.Text{String: note, Valid: true},
+	}); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			httpx.Error(w, http.StatusConflict, "this override request has already been decided")
+			return
+		}
+		slog.Error("dismiss stale guardrail override request", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	httpx.Error(w, http.StatusConflict, "the repository's guardrail state changed since this request was made — "+note)
 }
 
 // notifyGuardrailOverrideDecision fires the best-effort inbox notification a member

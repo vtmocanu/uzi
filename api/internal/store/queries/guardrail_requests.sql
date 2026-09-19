@@ -65,3 +65,10 @@ JOIN forge_connections c ON c.id = r.connection_id
 JOIN users u ON u.id = c.user_id
 WHERE gor.status = 'pending'
 ORDER BY u.email ASC, r.path_with_namespace ASC;
+
+-- name: DeletePendingGuardrailOverrideRequestsForRepo :exec
+-- Settle any PENDING request for a repo when the owner successfully enables it (issue
+-- #1432 rework): the request is moot, so it is removed rather than left to linger in the
+-- admin queue (which is unfiltered by repos.enabled). A decided (approved/rejected) request
+-- is untouched — only the open pending row for this repo is deleted.
+DELETE FROM guardrail_override_requests WHERE repo_id = @repo_id AND status = 'pending';
