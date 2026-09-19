@@ -430,6 +430,17 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 			dto.CurrentActivity = activity[run.ID]
 		}
 	}
+	// PRD #1353: the server-derived per-in-progress-milestone LIVE LANES, additive to
+	// milestones_agents and populated ONLY on this run-detail read for a non-terminal run
+	// (D9 — the board/list stay a single now-line). Best-effort: a derivation error leaves
+	// milestones_live null rather than failing the read of an otherwise-fine run.
+	if !apitypes.IsTerminalRunStatus(run.Status) {
+		if lanes, err := h.wsvc.MilestonesLiveForRun(r.Context(), run.ID, dto.Milestones, dto.MilestonesInProgress, h.clock()); err != nil {
+			slog.Error("milestones live", "run_id", run.ID, "error", err)
+		} else {
+			dto.MilestonesLive = lanes
+		}
+	}
 	// PRD #65 D2: stamp the run's forge for the run-view MR/PR noun. Best-effort and
 	// only for a repo-ful run (chat runs have no repo, hence no MR affordance): a
 	// lookup error leaves forge_type "" (the web defaults to GitLab's noun), never

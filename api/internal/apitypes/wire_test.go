@@ -102,6 +102,9 @@ var runDTOKeys = []string{
 	// PRD #1224: the validated per-milestone agent attribution (nil ⇒ null), always on the
 	// wire; the subset of the lead's declaration whose ids survived in-progress validation.
 	"milestones_agents",
+	// PRD #1353: the server-derived per-in-progress-milestone live lanes (nil ⇒ null), on the
+	// run-detail read only; additive to milestones_agents, never client-re-derived.
+	"milestones_live",
 	"budget_max_iterations", "budget_wall_seconds",
 	// PRD #1189 M1: the owner-granted extension + effective cap (always present ints, 0 is
 	// meaningful) and the derived total/used seconds (nil for a kind that never times out /

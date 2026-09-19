@@ -610,6 +610,17 @@ func (m tuiModel) renderMilestones() string {
 			uniqueID = uniqueMilestoneAgentMatch(effAgents, act.Agent)
 		}
 	}
+	// LIVE LANES (PRD #1353 M6). laneIdx is the D6-refiltered MilestonesLive keyed by milestone id;
+	// a NON-EMPTY laneIdx ("has lanes") is the authoritative live display — the lanes ARE the live
+	// frames, so they supersede the single current_activity now-line whenever a lane shows its agent
+	// (lanesShowAgent; a live agent on no lane keeps the now-line). Computed only for a non-terminal
+	// run (a terminal run has no "now"). When laneIdx is empty the render is the M1 path unchanged (D5
+	// branch on lane PRESENCE, never a nil test).
+	var laneIdx map[string][]apitypes.MilestoneLane
+	if !terminal {
+		laneIdx = milestonesLiveIndex(m.detail.run)
+	}
+	hasLanes := len(laneIdx) > 0
 	var sb strings.Builder
 	// The eyebrow gets a milestone micro-bar (▰ done / ▱ remaining) beside the count, the rail
 	// twin of the board's micro-bar, with the in-progress cell blinking in the tungsten colour
@@ -642,11 +653,24 @@ func (m tuiModel) renderMilestones() string {
 		sb.WriteString(eyebrow + "\n")
 		sb.WriteString(m.pal.faint.Render("· "+suffix) + "\n")
 	}
-	// Nothing declared in progress but there IS activity: an unattached now line directly under
-	// the eyebrow (PRD #1064 mock; #390 D7 — declared, not inferred, so the milestone stays
-	// unmarked). Suppressed under effective attribution (PRD #1224 D8): the per-milestone declared
-	// lines below carry the crew, so no unattached line rides the eyebrow in that branch.
-	if len(effAgents) == 0 && ipID == "" && act != nil {
+	// An unattached now line directly under the eyebrow, in three cases. In the lanes branch (PRD
+	// #1353 M6) it is suppressed when a lane already shows the live agent, since it would only
+	// duplicate that per-lane line below.
+	switch {
+	case hasLanes:
+		// D6 holds here too: a live agent on NO lane (an untagged dispatch, a subagent on a milestone
+		// not in progress, the lead itself) keeps the unattached now-line instead of vanishing.
+		if act != nil && !lanesShowAgent(laneIdx, act.Agent) {
+			sb.WriteString(m.railNowLines(act, " ", "   "))
+		}
+	case len(effAgents) == 0 && ipID == "" && act != nil:
+		// Unattributed, nothing declared in progress but there IS activity (PRD #1064 mock; #390
+		// D7 — declared, not inferred, so the milestone stays unmarked).
+		sb.WriteString(m.railNowLines(act, " ", "   "))
+	case len(effAgents) > 0 && act != nil && uniqueID == "":
+		// M1 (PRD #1353 D6): attributed, but the live agent matches no declared owner (a
+		// reviewer/tester, or an ambiguous repeated role) — show it as an unattached now-line so a
+		// live non-owner is never suppressed. The per-milestone owner lines below stay quiet (no age).
 		sb.WriteString(m.railNowLines(act, " ", "   "))
 	}
 	for _, mi := range ms {
@@ -667,11 +691,32 @@ func (m tuiModel) renderMilestones() string {
 			style = lipgloss.NewStyle() // current — plain terminal fg, like the web's text-fg
 		}
 		sb.WriteString(" " + glyph + " " + style.Render(m.renderer.Plain(mi.Title, milestoneTitleCap)) + "\n")
-		// The now line rides beneath the in-progress milestone it belongs to. Under effective
-		// attribution (PRD #1224 D8) every attributed in-progress milestone gets a DECLARED role
-		// line (role + label), and only the D3 unique-matching lane also shows the live age; else
-		// the render is exactly today's single first-in-progress now-line under ipID.
+		// The now line rides beneath the in-progress milestone it belongs to. With LIVE LANES present
+		// (PRD #1353 M6) the lanes are authoritative: each in-progress milestone gets a QUIET declared
+		// owner line (role + label, NO age — the lead cannot prove the owner is live) plus one LANE
+		// line per lane (↳ role · age + the live tool/detail + the italic label). Else, under effective
+		// attribution (PRD #1224 D8) every attributed in-progress milestone gets a DECLARED role line
+		// (role + label), and only the D3 unique-matching lane also shows the live age; else the render
+		// is exactly today's single first-in-progress now-line under ipID.
 		switch {
+		case hasLanes:
+			// Quiet declared-owner line (age "") when this milestone has a declared owner, then one
+			// live LANE line per lane. Bound to locals so the untrusted fields reach the line helpers
+			// (which fold each through renderer.Plain) as plumbing, not a raw draw — the same shape the
+			// attribution branch below and the laneFrame converters use; the hostile-render test is the
+			// standing proof the fold holds (the D7 AST guard cannot see through the indirection, gap D).
+			// Draw the quiet declared-owner line ONLY when the owner is IDLE — its declared agent is
+			// not among this milestone's live lanes. When the owner IS live (the common case: it is
+			// one of the lanes) the lane line below already shows it, so the quiet line would only
+			// duplicate that lane; laneHasAgent (shared with the CLI) is the dedup predicate.
+			if e, ok := effAgents[mi.ID]; ok && !laneHasAgent(laneIdx[mi.ID], e.Agent) {
+				role, label := e.Agent, e.AgentLabel
+				sb.WriteString(m.railMilestoneAgentLines(role, label, "", "   ", "     "))
+			}
+			for _, lane := range laneIdx[mi.ID] {
+				agent, alabel, tool, detail := lane.Agent, lane.AgentLabel, lane.Tool, lane.Detail
+				sb.WriteString(m.railLaneLines(agent, alabel, tool, detail, relAge(lane.At), "   ", "     "))
+			}
 		case len(effAgents) > 0:
 			if e, ok := effAgents[mi.ID]; ok {
 				age := ""
@@ -728,6 +773,50 @@ func (m tuiModel) railMilestoneAgentLines(role, label, age, arrowIndent, labelIn
 		line += m.pal.faint.Render(" · " + age)
 	}
 	sb.WriteString(line + "\n")
+	if label != "" {
+		lst := lipgloss.NewStyle().Foreground(m.pal.faintC).Italic(true)
+		sb.WriteString(labelIndent + lst.Render(m.renderer.Plain(label, milestoneTitleCap)) + "\n")
+	}
+	return sb.String()
+}
+
+// railLaneLines renders the crew rail's LIVE LANE lines beneath an in-progress milestone (PRD #1353
+// M6): one lane = one subagent working the milestone right now. It mirrors railNowLines' `↳`-line +
+// italic-label shape but carries a lane's full live frame across up to three lines, each within the
+// fixed 26-col rail so joinColumns never clamps the load-bearing role/age off:
+//
+//	↳ <role> · <age>       — the acting lane's role and how long ago its live frame landed
+//	<tool> <detail>        — the live tool + its most identifying argument (faint), dropped when empty
+//	<label>                — the dispatch task label (italic), dropped when empty
+//
+// arrowIndent/labelIndent place the lines under their owning milestone (like railMilestoneAgentLines).
+// agent, label, tool and detail are all UNTRUSTED, model-authored MilestoneLane fields and EVERY one
+// rides renderer.Plain — the same D4/D7 terminal-safety fold railNowLines/railMilestoneAgentLines apply,
+// which is why Agent/AgentLabel/Tool/Detail are registered in d7UntrustedFields (the tui_d7 guard) and
+// the hostile-lane render test is the standing proof this fold holds.
+func (m tuiModel) railLaneLines(agent, label, tool, detail, age, arrowIndent, labelIndent string) string {
+	var sb strings.Builder
+	line := arrowIndent + m.pal.faint.Render("↳ ") + m.pal.state(crewWorking).Render(m.renderer.Plain(agent, 14))
+	if age != "" {
+		line += m.pal.faint.Render(" · " + age)
+	}
+	sb.WriteString(line + "\n")
+	// The live tool + its most identifying argument on its OWN line so the arrow line above keeps the
+	// role/age even at the 26-col rail width. Both folded through renderer.Plain; empty segments drop.
+	tool = m.renderer.Plain(tool, 14)
+	detail = m.renderer.Plain(detail, milestoneTitleCap)
+	td := ""
+	switch {
+	case tool != "" && detail != "":
+		td = tool + " " + detail
+	case tool != "":
+		td = tool
+	case detail != "":
+		td = detail
+	}
+	if td != "" {
+		sb.WriteString(labelIndent + m.pal.faint.Render(td) + "\n")
+	}
 	if label != "" {
 		lst := lipgloss.NewStyle().Foreground(m.pal.faintC).Italic(true)
 		sb.WriteString(labelIndent + lst.Render(m.renderer.Plain(label, milestoneTitleCap)) + "\n")

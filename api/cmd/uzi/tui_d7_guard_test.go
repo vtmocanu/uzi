@@ -8,6 +8,13 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
+
+	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/colorprofile"
+
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
 // d7Sanitizers are the calls that make an untrusted string safe to draw. Markdown and
@@ -100,11 +107,19 @@ var d7UntrustedFields = []string{
 	"AgentLabel",
 	"HealthReason",
 	"FailureReason",
-	// Detail is the model-authored tool detail on apitypes.RunActivity (a file path, an
-	// Agent/Bash description) surfaced on the crew rail's now line (railNowLines, via
-	// activityLabel's fallback) and the board's selected-row second line (boardSecondLine),
-	// both through renderer.Plain. Agent/AgentLabel (already listed) are the other two
-	// RunActivity display fields these draw; Tool is not surfaced in the TUI.
+	// Detail and Tool are model-authored fields on apitypes.RunActivity AND apitypes.MilestoneLane.
+	// Detail (a file path, an Agent/Bash description) is surfaced on the crew rail's now line
+	// (railNowLines, via activityLabel's fallback), the board's selected-row second line
+	// (boardSecondLine), and a live lane's line (railLaneLines, PRD #1353 M6). Tool (the tool name) is
+	// surfaced on a live lane's line (railLaneLines) — PRD #1353 M6 is the first TUI draw of it, so it
+	// is registered here alongside Detail; both were RunActivity-only before, with Tool undrawn.
+	// Agent/AgentLabel (already listed) are the other two RunActivity/MilestoneLane display fields;
+	// every one rides renderer.Plain (the D4/D7 fold). The AST guard sees the LANE draws only as
+	// plumbing (the fields are bound to locals in renderMilestones before railLaneLines folds them, gap
+	// D), so the hostile-lane render test is the standing proof the fold holds — these entries are the
+	// tripwire for any future DIRECT draw of the field.
+	"Detail",
+	"Tool",
 	// Milestone titles are repo/agent-authored free text drawn in the crew rail's
 	// milestone block (renderMilestones). apitypes.Milestone.Title is the wire field;
 	// the rail draws it through renderer.Plain.
@@ -264,6 +279,54 @@ func TestD7UntrustedFieldsNeverReachAWriterUnsanitized(t *testing.T) {
 			"    Every draw of model- or forge-authored text must pass through one of: sanitizeTTY, cellText, compactText, capCell, renderer.Markdown, renderer.Plain.\n"+
 			"    sanitizeTTY BEFORE Glamour, never after — reversing it strips Glamour's own escapes and prints literal SGR text.\n"+
 			"    If this mention genuinely renders nothing (a comparison), the guard already allows that shape; anything else needs a sanitizer.", v)
+	}
+}
+
+// TestTUILaneFieldsStripControlBytes is the PRD #1353 M6 hostile-value render proof for LIVE LANES:
+// a lane's UNTRUSTED, model-authored fields (Agent, AgentLabel, Tool, Detail) are drawn on the crew
+// rail (railLaneLines) and MUST be folded through renderer.Plain. It plants control + bidi bytes in
+// each and drives a real model through Update/View, then asserts (a) no raw control/format rune reaches
+// the frame, (b) each field's distinct sanitized marker survives (so the lane render path actually ran,
+// not a vacuous pass), and (c) AgentInstance — which the TUI never draws — does NOT leak. This is the
+// standing proof the D7 AST guard cannot give (it sees the lane draws only as plumbing, gap D). The
+// prefix is fully-stripping (bidi + control, no printable residue) so the markers survive the 26-col
+// rail clamp exactly.
+func TestTUILaneFieldsStripControlBytes(t *testing.T) {
+	const nasty = "\u202e\x07\x01" // RLO bidi override + BEL + SOH — all stripped, no printable residue
+	runID := "run-1353-hostile-lanes"
+	at := time.Now().Add(2 * time.Hour)
+	// Distinct sanitized tails so each marker's survival proves ITS field's render path ran.
+	laneAgent := nasty + "lanerole"
+	laneLabel := nasty + "lanelabel"
+	laneTool := nasty + "lanetool"
+	laneDetail := nasty + "lanedetail"
+	laneInstance := nasty + "laneinstance" // NOT drawn by the TUI — a non-leak tripwire
+	run := apitypes.RunDTO{
+		ID: runID, Kind: "issue", Status: "running", Health: "ok", IssueTitle: "safe",
+		Milestones:           []apitypes.Milestone{{ID: "m1", Title: "Alpha"}},
+		MilestonesInProgress: []string{"m1"},
+		MilestonesLive: []apitypes.MilestoneLive{
+			{MilestoneID: "m1", Lanes: []apitypes.MilestoneLane{
+				{Agent: laneAgent, AgentInstance: laneInstance, AgentLabel: laneLabel, Tool: laneTool, Detail: laneDetail, At: at},
+			}},
+		},
+	}
+	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
+	next, _ := m.Update(tea.ColorProfileMsg{Profile: colorprofile.Ascii})
+	m = next.(tuiModel)
+	m = applyDetail(m, run, nil)
+	out := m.View().Content
+	assertNoRawControls(t, "detail lanes", out)
+	stripped := stripANSI(out)
+	// Each drawn lane field's sanitized marker must survive — proving railLaneLines drew (and folded) it.
+	for _, marker := range []string{"lanerole", "lanelabel", "lanetool", "lanedetail"} {
+		if !strings.Contains(stripped, marker) {
+			t.Fatalf("PRD #1353 M6: lane field marker %q missing — railLaneLines is not drawing (or clamped away) a MilestoneLane field, so this test is not exercising the lane render path:\n%s", marker, stripped)
+		}
+	}
+	// AgentInstance is never drawn: its marker must NOT reach the frame (a tripwire for a future draw).
+	if strings.Contains(stripped, "laneinstance") {
+		t.Fatalf("PRD #1353 M6: the TUI drew MilestoneLane.AgentInstance — it is not surfaced; a future draw must go through a sanitizer AND register AgentInstance in d7UntrustedFields:\n%s", stripped)
 	}
 }
 

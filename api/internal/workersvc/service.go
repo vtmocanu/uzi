@@ -632,6 +632,15 @@ type Store interface {
 	// /runs + board + run-view current_activity (PRD #1064 M2): the newest tool_use frame
 	// per run for a page, folded into the "now" line in Go by runactivity.FromFrame.
 	LatestToolUseForRuns(ctx context.Context, runIds []uuid.UUID) ([]store.LatestToolUseForRunsRow, error)
+	// PRD #1353 run-view milestones_live: the three runtime reads milestonelanes.Derive folds
+	// into per-in-progress-milestone live lanes — the newest tool_use frame per live subagent
+	// instance (LiveLaneFramesForRun), the lead-lane Agent dispatch frames that carry each
+	// instance's [<id>] tag + label (LeadAgentDispatchFramesForRun), and the completed dispatch
+	// ids that expire finished lanes (LeadDispatchCompletionIDsForRun, id-only — never the
+	// tool_result output content, which Derive does not read).
+	LiveLaneFramesForRun(ctx context.Context, runID uuid.UUID) ([]store.LiveLaneFramesForRunRow, error)
+	LeadAgentDispatchFramesForRun(ctx context.Context, runID uuid.UUID) ([]store.LeadAgentDispatchFramesForRunRow, error)
+	LeadDispatchCompletionIDsForRun(ctx context.Context, runID uuid.UUID) ([]string, error)
 	ListOwnedRecommendationsForCoords(ctx context.Context, arg store.ListOwnedRecommendationsForCoordsParams) ([]store.ListOwnedRecommendationsForCoordsRow, error)
 	// The fan-out write itself: ONE multi-row upsert over the RESOLVED coordinates, so a
 	// bulk call is a single round-trip that cannot half-apply (PRD #98 M2, audit NB-A).

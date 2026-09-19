@@ -981,7 +981,13 @@ chain in the diagram above, with no intervening `running`.
   `milestones_in_progress` in `SetRunRunning` and cleared beside it on every
   terminal transition; web/TUI/CLI render the declared agent under each
   attributed in-progress milestone, with live tool/age enriching only the
-  uniquely-matching lane.
+  uniquely-matching lane. PRD #1353 adds `RunDTO.milestones_live` — the set of
+  every subagent currently working an in-progress milestone (several at once,
+  e.g. `reviewer ×2` plus `tester`), server-derived by back-joining a live
+  subagent frame to its dispatch's `[<id>]`-tagged `description` and
+  additive to the declared `milestones_agents` owner above. See
+  [ADR-1353](adr/1353-milestone-live-lanes.md) for the binding, the liveness
+  rule and why the DTO is never re-derived client-side.
 - **Operator scope steering** (PRD #634, [ADR-634](adr/0634-run-scope-steering.md)) —
   a mid-run `uzi run stop`/`uzi run scope --through N` on a milestone run writes one
   nullable `runs.scope_ceiling` (last-writer-wins, clamped to `[completed_count,

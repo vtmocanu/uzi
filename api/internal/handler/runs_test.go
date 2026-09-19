@@ -53,6 +53,13 @@ type runsStore struct {
 	latestToolUseArg  []uuid.UUID
 	latestToolUseErr  error
 
+	// PRD #1353 milestones_live: scripted frames for the run-detail live-lanes derivation.
+	// Empty by default so GetRun reads milestones_live: null and unrelated tests are unaffected.
+	liveLaneRows     []store.LiveLaneFramesForRunRow
+	leadDispatchRows []store.LeadAgentDispatchFramesForRunRow
+	completionIDRows []string
+	liveLaneErr      error
+
 	workersvc.Store
 	ownerID uuid.UUID
 	run     store.Run
@@ -1764,4 +1771,28 @@ func (s *runsStore) LatestToolUseForRuns(_ context.Context, runIds []uuid.UUID) 
 		}
 	}
 	return out, nil
+}
+
+// LiveLaneFramesForRun / LeadAgentDispatchFramesForRun / LeadDispatchCompletionIDsForRun back
+// MilestonesLiveForRun on the run-detail path (PRD #1353). They return the scripted rows (empty
+// by default), so a GetRun test that does not script frames reads milestones_live: null.
+func (s *runsStore) LiveLaneFramesForRun(_ context.Context, _ uuid.UUID) ([]store.LiveLaneFramesForRunRow, error) {
+	if s.liveLaneErr != nil {
+		return nil, s.liveLaneErr
+	}
+	return s.liveLaneRows, nil
+}
+
+func (s *runsStore) LeadAgentDispatchFramesForRun(_ context.Context, _ uuid.UUID) ([]store.LeadAgentDispatchFramesForRunRow, error) {
+	if s.liveLaneErr != nil {
+		return nil, s.liveLaneErr
+	}
+	return s.leadDispatchRows, nil
+}
+
+func (s *runsStore) LeadDispatchCompletionIDsForRun(_ context.Context, _ uuid.UUID) ([]string, error) {
+	if s.liveLaneErr != nil {
+		return nil, s.liveLaneErr
+	}
+	return s.completionIDRows, nil
 }

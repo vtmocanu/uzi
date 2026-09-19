@@ -1461,6 +1461,18 @@ function milestoneStatusNote(
     "milestones you ACTUALLY completed on `signal_done` (its `milestones_completed` field):",
     "list only what you truly finished, and leave any you deliberately left undone undeclared,",
     "so the tracker reflects what actually shipped rather than reading as 0 on a run that succeeded.",
+    // PRD #1353 M2: bind a dispatched subagent's LIVE activity to the milestone it works by
+    // tagging the dispatch description with the milestone id in square brackets. This is the
+    // description-side companion to milestones_agents above: report_progress records who is
+    // named on a milestone, while the `[<id>]` description prefix lets the run view attribute
+    // every agent currently working the milestone (reviewer, tester, auditor — several at once),
+    // not only the owner, so the lane shows the full crew on an in-progress milestone.
+    "",
+    "When you dispatch a subagent (Agent/Task) to work an in-progress milestone, also BEGIN",
+    "that dispatch's `description` with the milestone id in square brackets, e.g. `[<id>] Wire",
+    "the limiter`. That binds the subagent's live activity to that milestone so the run view",
+    "can show every agent currently working it (reviewer, tester, auditor — several at once),",
+    "not only the owner you named. Keep the rest of the description as your usual task label.",
   ];
   // PRD #390 M2/M3: the executor sets progressMissedLastTurn when the PREVIOUS work turn
   // marked no milestone in progress, escalating the standing requirement above into a direct

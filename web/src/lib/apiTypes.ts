@@ -1999,6 +1999,29 @@ export interface MilestoneAgent {
   agent_label: string;
 }
 
+// MilestoneLane is one LIVE lane on an in-progress milestone (PRD #1353): a single live
+// subagent working that milestone right now, folded from its newest tool_use frame and
+// back-joined to the lead's Agent dispatch by `agent_instance`. `agent`/`agent_instance`/
+// `agent_label`/`tool`/`detail` are model-authored UNTRUSTED display text a consumer sanitizes
+// before rendering, the same rule RunActivity and MilestoneAgent follow; `agent_instance` is the
+// dispatch tool_use id that identifies the lane and rides RAW on the wire (the write-side strips
+// only NUL); `at` is the frame's created_at (a wire string).
+export interface MilestoneLane {
+  agent: string;
+  agent_instance: string;
+  agent_label: string;
+  tool: string;
+  detail: string;
+  at: string;
+}
+
+// MilestoneLive is the set of LIVE lanes on one in-progress milestone (PRD #1353), server-
+// derived and web-consumed (never client-re-derived). A milestone with no live lane is omitted.
+export interface MilestoneLive {
+  milestone_id: string;
+  lanes: MilestoneLane[];
+}
+
 /** The create-entrypoint family that started a run (server column `trigger_source`,
  *  a closed 13-value enum). Mirrors the Go CHECK constraint / RunDTO. */
 export type RunTriggerSource =
@@ -2246,6 +2269,13 @@ export interface Run {
    *  effective attribution ⇒ render exactly as today. Each `agent_label` is UNTRUSTED display
    *  text a consumer sanitizes. */
   milestones_agents?: MilestoneAgent[] | null;
+  /** PRD #1353: the server-derived per-in-progress-milestone LIVE LANES — the subagents
+   *  working each milestone right now. Server-authoritative and web-consumed, NEVER
+   *  client-re-derived; populated ONLY on the run-detail read for a non-terminal run (null on
+   *  list/board and terminal runs). Optional and nullable for the same rollout-skew reason as
+   *  the other milestone fields; null ⇒ render exactly as today. Additive to
+   *  `milestones_agents`. Each lane's `agent_label`/`detail` is UNTRUSTED display text. */
+  milestones_live?: MilestoneLive[] | null;
   milestones_candidate?: Milestone[] | null;
   budget_max_iterations?: number | null;
   budget_wall_seconds?: number | null;
