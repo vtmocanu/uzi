@@ -6,8 +6,8 @@
 # spine: discover the tag state, apply the CHANGELOG section, bump the chart, auto-bump
 # the worker tag, refresh links, commit, and verify with the coverage oracle. It does
 # NOT push. It tags only the promoted STABLE (locally, on a throwaway release branch);
-# the RC tag on main is applied by the lead after ci.yml is green (the harness classifier
-# blocks the agent/lead from pushing a tag anyway).
+# the RC tag on main is applied by the lead after ci.yml is green. A tag push publishes
+# unattended, so it needs the user's go-ahead (without one the harness classifier blocks it).
 #
 #   release-cut.sh <X.Y.Z> [VERB] [--changelog-file FILE] [--no-commit] [--prev-tag TAG]
 #
@@ -214,6 +214,14 @@ fi
 # Best-effort tag refresh so discovery sees pushed tags; harmless (and skipped) with no
 # reachable origin, e.g. an offline fixture repo.
 git fetch --tags --quiet origin >/dev/null 2>&1 || true
+# The cut reads the LOCAL HEAD. A main that is BEHIND origin/main miscounts what shipped since
+# the RC (so --promote can take promote-only wrongly) and produces a release commit that can
+# never fast-forward onto origin. Refuse here rather than at the push. Ahead is normal (an
+# unpushed release commit); no origin/main ref (offline fixture, unreachable origin) skips it.
+BEHIND="$(git rev-list --count HEAD..refs/remotes/origin/main 2>/dev/null || echo 0)"
+if [ "${BEHIND:-0}" -gt 0 ]; then
+  echo "release-cut: local main is $BEHIND commit(s) behind origin/main. Fast-forward first: git merge --ff-only origin/main" >&2; exit 3
+fi
 
 # --- discovery ----------------------------------------------------------------
 S="$(highest_stable)"
@@ -589,12 +597,12 @@ if [ -n "$PROMOTED_TAG" ]; then
   echo "  git push origin $PROMOTED_TAG"
   echo "  git push origin main               # triggers ci.yml"
   echo "  .../watch-run-ci.sh --branch main --workflow ci.yml   # wait for green"
-  echo "  git tag -a $TAG -m $TAG HEAD  # then: ! git push origin $TAG  (classifier blocks the agent/lead)"
+  echo "  git tag -a $TAG -m $TAG HEAD  # then push it with the user's go-ahead; if the classifier blocks you, hand them: ! git push origin $TAG"
 else
   echo "  git show HEAD                 # review"
   echo "  git push origin main         # triggers ci.yml"
   echo "  .../watch-run-ci.sh --branch main --workflow ci.yml   # wait for green"
-  echo "  git tag -a $TAG -m $TAG HEAD  # then: ! git push origin $TAG  (classifier blocks the agent/lead)"
+  echo "  git tag -a $TAG -m $TAG HEAD  # then push it with the user's go-ahead; if the classifier blocks you, hand them: ! git push origin $TAG"
 fi
 echo "  .../release-watch.sh $CHARTVER && .../release-verify.sh $CHARTVER"
 exit 0
