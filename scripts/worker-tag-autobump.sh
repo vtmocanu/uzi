@@ -37,10 +37,15 @@
 # the decouple assert's PINNED_TAG in lockstep, so values.yaml stays the single pin and
 # `task render:worker-tag-check` keeps passing.
 #
+# A pin naming a tag that does NOT exist is never valid (it names an image no release
+# built -- the 0.83.0-rc.7 incident, 2026-09-19). We do NOT fail open on it: --check
+# reports it (exit 1) and edit mode repins to the version being cut (which this release
+# publishes), rather than leaving the dead pin to ship again on the next cut.
+#
 # EXIT CODES (the convention scan-secrets.sh / assert-worker-tag-decoupled.sh set):
 #     2 = the instrument is broken (not at repo root, tag unreadable, pin unparseable)
-#     1 = --check only: a bump is owed but was not applied
-#     0 = done (bumped, or nothing to bump, or --check clean)
+#     1 = --check only: a bump is owed but was not applied, or the pin names a missing tag
+#     0 = done (bumped, repinned off a missing tag, nothing to bump, or --check clean)
 set -euo pipefail
 
 usage() { echo "usage: $0 [--check] <release-version> [ref]" >&2; exit 2; }
@@ -74,9 +79,60 @@ read_pin() {
 OLD="$(read_pin)"
 [ -n "$OLD" ] || { echo "worker-tag-autobump: could not read workers.image.tag from $VALUES" >&2; exit 2; }
 
+# apply_bump <new-tag>: rewrite workers.image.tag -> new-tag in values.yaml, keeping
+# the decouple assert's PINNED_TAG in lockstep. Extracted so both the surface-changed
+# path and the missing-pin-tag repair below share one edit.
+apply_bump() {
+  local new="$1"
+  awk -v new="$new" '
+    /^workers:/ { inw=1 }
+    inw && /^[^[:space:]]/ && $0 !~ /^workers:/ { inw=0 }
+    inw && /^  image:/ { inimg=1 }
+    inw && inimg && /^  [^[:space:]]/ && $0 !~ /^  image:/ { inimg=0 }
+    inw && inimg && /^    tag:[[:space:]]/ && !done {
+      match($0, /^    tag:[[:space:]]*/)
+      printf "%s\"%s\"\n", substr($0, 1, RLENGTH), new
+      done = 1
+      next
+    }
+    { print }
+  ' "$VALUES" > "$VALUES.tmp" && mv "$VALUES.tmp" "$VALUES"
+
+  if [ -f "$ASSERT" ]; then
+    awk -v new="$new" '
+      /^PINNED_TAG=/ {
+        printf "PINNED_TAG=\"%s\"     # the concrete worker tag values.yaml must pin (kept in lockstep by scripts/worker-tag-autobump.sh)\n", new
+        next
+      }
+      { print }
+    ' "$ASSERT" > "$ASSERT.tmp" && mv "$ASSERT.tmp" "$ASSERT"
+    chmod +x "$ASSERT"   # mv from a fresh temp drops the exec bit; the assert is a gate script
+  fi
+}
+
 PREV_TAG="v$OLD"
 if ! git rev-parse -q --verify "refs/tags/$PREV_TAG" >/dev/null 2>&1; then
-  echo "worker-tag-autobump: tag $PREV_TAG not found; cannot diff the agent surface. Leaving workers.image.tag at $OLD (no roll) -- bump by hand if this release should roll the fleet." >&2
+  # A pin naming a nonexistent tag is NEVER valid: the chart would ship a
+  # workers.image.tag for an agent image no release ever built. That is the
+  # 0.83.0-rc.7 failure (2026-09-19) -- an RC cut at tip whose tag was kept
+  # local-only, so release.yml never built agent-*:0.83.0-rc.7, yet the stable
+  # chart shipped that pin and every new hosted worker sat in ImagePullBackOff.
+  # We cannot diff the agent surface against a missing tag, so DO NOT fail open
+  # (the old behaviour left the dead pin and re-shipped it on the next cut). The
+  # safe repair is unambiguous: point the pin at the image THIS cut publishes.
+  if [ "$OLD" = "$VERSION" ]; then
+    # The pin already names the version being cut, which this release publishes.
+    echo "worker-tag-autobump: tag $PREV_TAG is absent, but workers.image.tag already names the version being cut ($VERSION), which this release publishes -- nothing to do."
+    exit 0
+  fi
+  if [ "$MODE" = check ]; then
+    echo "worker-tag-autobump: FAIL -- workers.image.tag is $OLD but no tag $PREV_TAG exists, so the pin names an image no release published (new hosted workers would ImagePullBackOff)." >&2
+    echo "  A pin must name a published (or being-cut) image. Run  scripts/worker-tag-autobump.sh $VERSION  to repin it to the version being cut." >&2
+    exit 1
+  fi
+  apply_bump "$VERSION"
+  echo "worker-tag-autobump: tag $PREV_TAG is absent (workers.image.tag named an unpublished image); repinned $OLD -> $VERSION (the version being cut, which this release publishes)."
+  echo "  The hosted fleet WILL roll to $VERSION on deploy."
   exit 0
 fi
 
@@ -102,30 +158,7 @@ if [ "$MODE" = check ]; then
 fi
 
 # --- edit: bump workers.image.tag -> VERSION, keeping PINNED_TAG in lockstep -----------
-awk -v new="$VERSION" '
-  /^workers:/ { inw=1 }
-  inw && /^[^[:space:]]/ && $0 !~ /^workers:/ { inw=0 }
-  inw && /^  image:/ { inimg=1 }
-  inw && inimg && /^  [^[:space:]]/ && $0 !~ /^  image:/ { inimg=0 }
-  inw && inimg && /^    tag:[[:space:]]/ && !done {
-    match($0, /^    tag:[[:space:]]*/)
-    printf "%s\"%s\"\n", substr($0, 1, RLENGTH), new
-    done = 1
-    next
-  }
-  { print }
-' "$VALUES" > "$VALUES.tmp" && mv "$VALUES.tmp" "$VALUES"
-
-if [ -f "$ASSERT" ]; then
-  awk -v new="$VERSION" '
-    /^PINNED_TAG=/ {
-      printf "PINNED_TAG=\"%s\"     # the concrete worker tag values.yaml must pin (kept in lockstep by scripts/worker-tag-autobump.sh)\n", new
-      next
-    }
-    { print }
-  ' "$ASSERT" > "$ASSERT.tmp" && mv "$ASSERT.tmp" "$ASSERT"
-  chmod +x "$ASSERT"   # mv from a fresh temp drops the exec bit; the assert is a gate script
-fi
+apply_bump "$VERSION"
 
 echo "worker-tag-autobump: agent runtime surface changed since $PREV_TAG (${CHANGED}...); bumped workers.image.tag $OLD -> $VERSION (+ PINNED_TAG in the decouple assert)."
 echo "  The hosted fleet WILL roll to $VERSION on deploy, draining in-flight runs first (force-roll off, ${PREV_TAG} drain deadline bounds it)."

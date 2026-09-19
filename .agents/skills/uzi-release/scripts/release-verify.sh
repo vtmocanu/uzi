@@ -23,6 +23,10 @@
 #      pre-release and releases/latest is unchanged (a lower stable, never the RC). Uses
 #      the API, not `gh release view --json isLatest`, which errored on the installed gh
 #      cutting v0.59.0 (release.md).
+#   5. The released chart's worker pin (workers.image.tag, read from the tag's tree)
+#      resolves on GHCR for each worker template image. A stable chart may pin an RC
+#      worker (D11), but only a PUBLISHED one -- an unpublished pin ImagePullBackOffs
+#      every new hosted worker (the 0.83.0-rc.7 incident).
 #
 # Exit codes:
 #   0  every check passed
@@ -79,13 +83,16 @@ echo "=== verifying $TAG on $OWNER/$REPO ==="
 # walks every version page (the wanted tag is newest so usually page 1, but do not
 # rely on it). Membership is tested in pure bash — no `printf | grep -q`, which can
 # SIGPIPE-flake under pipefail (see assert-changelog-covers-release.sh).
+# img_has_tag <img> [wanted-tag] -> membership of <wanted-tag> (default $VERSION) among
+# <img>'s GHCR tags. The optional second arg lets check 5 reuse this for the worker pin,
+# which is NOT $VERSION (it may name an older published tag, or an RC inside a stable).
 img_has_tag() {
-  local img="$1" enc tags rc
+  local img="$1" want="${2:-$VERSION}" enc tags rc
   enc="${REPO}%2F${img}"
   tags="$(gh api --paginate "/${PKG_OWNER_PATH}/packages/container/${enc}/versions" \
         --jq '.[].metadata.container.tags[]' 2>/dev/null)"; rc=$?
   [ "$rc" -ne 0 ] && return 2
-  case $'\n'"$tags"$'\n' in (*$'\n'"$VERSION"$'\n'*) return 0 ;; (*) return 1 ;; esac
+  case $'\n'"$tags"$'\n' in (*$'\n'"$want"$'\n'*) return 0 ;; (*) return 1 ;; esac
 }
 for img in api web controller agent-base agent-jvm; do
   img_has_tag "$img"; r=$?
@@ -161,6 +168,34 @@ else
   else fail "Release $TAG prerelease flag is '${pre:-<none>}', expected true (an RC must never be latest)"; fi
   if [ "$latest" != "$TAG" ]; then pass "releases/latest is '${latest:-<none>}' — unchanged, not the RC"
   else fail "releases/latest is the RC $TAG; an RC must never be marked latest"; fi
+fi
+
+# --- 5. the released chart's worker pin names a PUBLISHED image ----------------
+# Read workers.image.tag from the RELEASED tree (the tag), not the working tree, so this
+# proves exactly what shipped. A stable chart may legitimately pin an RC worker (D11) --
+# but only a PUBLISHED one; an unpublished pin ImagePullBackOffs every new hosted worker
+# (the 0.83.0-rc.7 incident, 2026-09-19). The pin reader is the same shape as
+# scripts/worker-tag-autobump.sh's read_pin (workers.docker/controller image tags sit
+# deeper and must not match). Worker template images: keep equal to
+# api/internal/workertmpl.Names.
+PIN="$(git show "$TAG:deploy/chart/values.yaml" 2>/dev/null | awk '
+  /^workers:/ { inw=1; next }
+  inw && /^[^[:space:]]/ { inw=0 }
+  inw && /^  image:/ { inimg=1; next }
+  inw && inimg && /^  [^[:space:]]/ { inimg=0 }
+  inw && inimg && /^    tag:[[:space:]]/ { v=$2; gsub(/"/,"",v); print v; exit }
+')"
+if [ -z "$PIN" ]; then
+  fail "could not read workers.image.tag from ${TAG}:deploy/chart/values.yaml (is the tag present locally? run: git fetch --tags origin)"
+else
+  for img in agent-base agent-jvm; do
+    img_has_tag "$img" "$PIN"; r=$?
+    case $r in
+      0) pass "worker pin ${REPO}/${img}:${PIN} on GHCR" ;;
+      2) fail "worker image ${REPO}/${img}: could not query GHCR (gh/network error) -- re-run verify" ;;
+      *) fail "chart pins workers.image.tag=${PIN} but ${REPO}/${img}:${PIN} NOT on GHCR (unpublished worker image -- new hosted workers would ImagePullBackOff)" ;;
+    esac
+  done
 fi
 
 echo

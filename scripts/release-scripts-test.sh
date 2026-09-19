@@ -421,6 +421,16 @@ chart_ver()   { awk '/^version:/{print $2; exit}' "$1/deploy/chart/Chart.yaml"; 
 pin_tag()     { awk '/^workers:/{w=1} w&&/^    tag:/{gsub(/"/,"",$2);print $2;exit}' "$1/deploy/chart/values.yaml"; }
 head_msg()    { git -C "$1" log -1 --format=%s; }
 has_heading() { grep -qE "^## \[$2\]" "$1/CHANGELOG.md"; }
+# add_origin <dir>: give <dir> a LOCAL bare origin (a real remote for `git ls-remote`)
+# and push main, so release-cut's --promote remote-tag check can distinguish a pushed
+# RC from a local-only one. push_tag_to_origin <dir> <tag> publishes a tag to it.
+add_origin() {
+  local d="$1"; local bare="$d.origin.git"
+  git init -q --bare "$bare"
+  git -C "$d" remote add origin "$bare"
+  git -C "$d" push -q origin main
+}
+push_tag_to_origin() { git -C "$1" push -q origin "refs/tags/$2"; }
 
 echo "=== M2: release-cut first RC ==="
 S1="$(mktemp -d)"; seed_repo "$S1"; add_feature "$S1" 201
@@ -557,7 +567,7 @@ assert_eq "--stable exits 0"          "0"       "$RC_RC"
 assert_eq "--stable chart is 0.2.0 (no rc)" "0.2.0" "$(chart_ver "$S7")"
 
 echo "=== M2b: --promote (lockstep) ==="
-S8="$(mktemp -d)"; seed_repo "$S8"; add_feature "$S8" 201
+S8="$(mktemp -d)"; seed_repo "$S8"; add_origin "$S8"; add_feature "$S8" 201
 put_changelog "$S8" <<'MD'
 # Changelog
 
@@ -569,7 +579,7 @@ put_changelog "$S8" <<'MD'
 ### Added
 - **Initial** (#100)
 MD
-run_rc "$S8" 0.2.0; git -C "$S8" tag v0.2.0-rc.1
+run_rc "$S8" 0.2.0; git -C "$S8" tag v0.2.0-rc.1; push_tag_to_origin "$S8" v0.2.0-rc.1
 add_feature "$S8" 301
 put_changelog "$S8" <<'MD'
 # Changelog
@@ -596,8 +606,46 @@ if has_heading "$S8" 0.3.0; then pass "--promote opens [0.3.0] on main"; else fa
 if git -C "$S8" rev-parse -q --verify refs/heads/release/0.2.0 >/dev/null; then fail "--promote leaves no release/0.2.0 branch"; else pass "--promote leaves no release/0.2.0 branch"; fi
 assert_eq "--promote leaves the worker pin unchanged (D11)" "$pin_before" "$(pin_tag "$S8")"
 
+echo "=== M2b: --promote REFUSED when the in-flight RC is local-only (not on origin) ==="
+# The 0.83.0-rc.7 guard: promotion re-tags the RC's PUBLISHED agent image, so an RC that
+# was never pushed (never built by release.yml) must not promote. Same setup as S8 but the
+# RC tag is deliberately NOT pushed to origin.
+S8B="$(mktemp -d)"; seed_repo "$S8B"; add_origin "$S8B"; add_feature "$S8B" 201
+put_changelog "$S8B" <<'MD'
+# Changelog
+
+## [Unreleased]
+### Added
+- **Feature 201** (#201)
+
+## [0.1.0] - 2026-09-01
+### Added
+- **Initial** (#100)
+MD
+run_rc "$S8B" 0.2.0; git -C "$S8B" tag v0.2.0-rc.1   # LOCAL only — deliberately NOT pushed
+add_feature "$S8B" 301
+put_changelog "$S8B" <<'MD'
+# Changelog
+
+## [Unreleased]
+### Added
+- **Feature 301** (#301)
+
+## [0.2.0] - 2026-10-01
+### Added
+- **Feature 201** (#201)
+
+## [0.1.0] - 2026-09-01
+### Added
+- **Initial** (#100)
+MD
+run_rc "$S8B" 0.3.0 --promote
+assert_eq "--promote refused on a local-only RC exits 3" "3" "$RC_RC"
+assert_contains "refusal says the RC is not on origin" "not on origin" "$RC_OUT"
+if git -C "$S8B" rev-parse -q --verify refs/tags/v0.2.0 >/dev/null; then fail "refused promote leaves NO v0.2.0 tag"; else pass "refused promote leaves NO v0.2.0 tag"; fi
+
 echo "=== M2b: --promote allowlist abort ==="
-S9="$(mktemp -d)"; seed_repo "$S9"; add_feature "$S9" 201
+S9="$(mktemp -d)"; seed_repo "$S9"; add_origin "$S9"; add_feature "$S9" 201
 # Replace worker-tag-autobump.sh with a version-conditional stub and COMMIT it, so it
 # rides into the v0.2.0-rc.1 promote worktree (a stub written after the RC tag would not
 # exist there, and an uncommitted one would trip release-cut's clean-tree precondition
@@ -626,7 +674,7 @@ put_changelog "$S9" <<'MD'
 ### Added
 - **Initial** (#100)
 MD
-run_rc "$S9" 0.2.0; git -C "$S9" tag v0.2.0-rc.1
+run_rc "$S9" 0.2.0; git -C "$S9" tag v0.2.0-rc.1; push_tag_to_origin "$S9" v0.2.0-rc.1
 add_feature "$S9" 301
 put_changelog "$S9" <<'MD'
 # Changelog
@@ -650,7 +698,7 @@ if git -C "$S9" rev-parse -q --verify refs/tags/v0.2.0 >/dev/null; then fail "ab
 if git -C "$S9" rev-parse -q --verify refs/heads/release/0.2.0 >/dev/null; then fail "aborted promote leaves NO release/0.2.0 branch"; else pass "aborted promote leaves NO release/0.2.0 branch"; fi
 
 echo "=== M2b: --promote rolls back the local stable tag when the main half fails ==="
-S10="$(mktemp -d)"; seed_repo "$S10"; add_feature "$S10" 201
+S10="$(mktemp -d)"; seed_repo "$S10"; add_origin "$S10"; add_feature "$S10" 201
 put_changelog "$S10" <<'MD'
 # Changelog
 
@@ -662,7 +710,7 @@ put_changelog "$S10" <<'MD'
 ### Added
 - **Initial** (#100)
 MD
-run_rc "$S10" 0.2.0; git -C "$S10" tag v0.2.0-rc.1
+run_rc "$S10" 0.2.0; git -C "$S10" tag v0.2.0-rc.1; push_tag_to_origin "$S10" v0.2.0-rc.1
 add_feature "$S10" 301               # merges since the RC, so NOT the promote-only path
 # but leave [Unreleased] EMPTY and pass no --changelog-file, so the main-half fold fails
 # AFTER promote_inflight has already tagged v0.2.0. The trap must roll that tag back.
@@ -670,7 +718,56 @@ run_rc "$S10" 0.3.0 --promote
 if [ "$RC_RC" -ne 0 ]; then pass "promote main-half failure exits nonzero"; else fail "promote main-half failure exits nonzero"; fi
 if git -C "$S10" rev-parse -q --verify refs/tags/v0.2.0 >/dev/null; then fail "failed promote leaves NO local v0.2.0 tag (rolled back)"; else pass "failed promote leaves NO local v0.2.0 tag (rolled back)"; fi
 
-rm -rf "$S1" "$S3" "$S4" "$S6" "$S7" "$S8" "$S9" "$S10"
+echo "=== M2c: worker-tag-autobump — a pin naming a MISSING tag is repinned, never failed open ==="
+# The 0.83.0-rc.7 forward trap: after the local-only rc.7 tag was deleted, the pin named a
+# tag that no longer existed and the old autobump FAILED OPEN (left the dead pin, shipped
+# it again). seed_repo copies the REAL worker-tag-autobump.sh + assert into scripts/ and
+# tags v0.1.0; repin workers.image.tag to a tag that does NOT exist to hit that branch.
+SA="$(mktemp -d)"; seed_repo "$SA"
+cat > "$SA/deploy/chart/values.yaml" <<'YAML'
+workers:
+  image:
+    repository: ghcr.io/x/worker
+    tag: "0.9.9-rc.99"
+YAML
+git -C "$SA" add deploy/chart/values.yaml; gcommit "$SA" "test: pin a nonexistent worker tag"
+( cd "$SA" && bash scripts/worker-tag-autobump.sh --check 0.2.0 >/dev/null 2>&1 ); ac_rc=$?
+if [ "$ac_rc" -ne 0 ]; then pass "autobump --check flags a missing pin tag (exit $ac_rc)"; else fail "autobump --check flags a missing pin tag (got exit 0 — failed open)"; fi
+( cd "$SA" && bash scripts/worker-tag-autobump.sh 0.2.0 >/dev/null 2>&1 ); ab_rc=$?
+assert_eq "autobump edit on a missing pin tag exits 0"          "0"     "$ab_rc"
+assert_eq "autobump repins the dead pin to the version cut"     "0.2.0" "$(pin_tag "$SA")"
+assert_eq "autobump keeps PINNED_TAG in lockstep"               "0.2.0" "$(awk -F'"' '/^PINNED_TAG=/{print $2;exit}' "$SA/scripts/assert-worker-tag-decoupled.sh")"
+
+echo "=== M2c: worker-tag-autobump — a VALID pin tag + unchanged surface still leaves the pin ==="
+# The regression guard for guard 3: a present OLD tag must behave exactly as before.
+SB="$(mktemp -d)"; seed_repo "$SB"   # pin 0.1.0, tag v0.1.0 present, agent surface unchanged
+( cd "$SB" && bash scripts/worker-tag-autobump.sh 0.2.0 >/dev/null 2>&1 ); sb_rc=$?
+assert_eq "autobump with a valid tag + unchanged surface exits 0" "0"     "$sb_rc"
+assert_eq "autobump leaves the pin when the surface is unchanged"  "0.1.0" "$(pin_tag "$SB")"
+
+echo "=== M2c: worker-tag-autobump — reads/bumps workers.image.tag past a deeper decoy tag ==="
+# The pin reader/bumper (shared shape with release.yml's guard-1 job and release-verify's
+# guard-4 check) must target the two-space workers.image.tag, not a deeper decoy.
+SC="$(mktemp -d)"; seed_repo "$SC"
+cat > "$SC/deploy/chart/values.yaml" <<'YAML'
+workers:
+  controller:
+    image:
+      repository: ghcr.io/x/controller
+      tag: "9.9.9-decoy"
+  image:
+    repository: ghcr.io/x/worker
+    tag: "0.1.0"
+YAML
+mkdir -p "$SC/agent/src"; echo 'export const x = 1;' > "$SC/agent/src/index.ts"
+git -C "$SC" add -A; gcommit "$SC" "test: decoy nested tag + an agent-surface change"
+( cd "$SC" && bash scripts/worker-tag-autobump.sh 0.2.0 >/dev/null 2>&1 ); sc_rc=$?
+assert_eq "autobump (decoy) exits 0"                       "0"     "$sc_rc"
+assert_eq "autobump bumps workers.image.tag, not the decoy" "0.2.0" "$(pin_tag "$SC")"
+if grep -q '9.9.9-decoy' "$SC/deploy/chart/values.yaml"; then pass "autobump leaves the deeper controller decoy tag untouched"; else fail "autobump leaves the deeper controller decoy tag untouched"; fi
+
+rm -rf "$S1" "$S3" "$S4" "$S6" "$S7" "$S8" "$S8B" "$S9" "$S10" "$SA" "$SB" "$SC" \
+       "$S8.origin.git" "$S8B.origin.git" "$S9.origin.git" "$S10.origin.git"
 
 echo "=== M3: release-mode lib (shared by watch + verify) ==="
 # shellcheck source=scripts/lib/release-mode.sh

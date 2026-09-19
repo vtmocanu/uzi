@@ -137,6 +137,15 @@ prev_stable_below() {
 changelog_unreleased_body() {
   awk '/^## \[Unreleased\]/{f=1;next} f&&/^## \[/{exit} f{print}' CHANGELOG.md
 }
+# rc_tag_on_remote <tag> -> 0 if <tag> exists on origin, 1 otherwise. A promote re-tags
+# the in-flight RC's PUBLISHED agent image and folds its notes, so promoting an RC that
+# was never pushed (hence never built by release.yml) would ship a stable chart whose
+# workers.image.tag names an image nobody built (the 0.83.0-rc.7 incident, 2026-09-19).
+# A local-only tag is indistinguishable from a published one via `git tag -l`, so ask the
+# remote directly. The fixture's origin is a local path; ls-remote works on that too.
+rc_tag_on_remote() {
+  git ls-remote --tags origin "refs/tags/$1" 2>/dev/null | grep -q .
+}
 
 # --- preconditions ------------------------------------------------------------
 if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
@@ -378,6 +387,21 @@ promote_guard() {
   fi
 }
 if [ "$OP" = promote ]; then
+  # REFUSE to promote an RC that is not on origin. Promotion re-tags the RC's PUBLISHED
+  # agent image and folds its notes; an unpushed RC was never built by release.yml, so a
+  # promote of it ships a stable chart whose worker pin names an image nobody built (the
+  # 0.83.0-rc.7 incident). Push the RC, let it publish, THEN promote.
+  if ! rc_tag_on_remote "$INFLIGHT"; then
+    {
+      echo "release-cut: --promote REFUSED -- the in-flight RC $INFLIGHT is not on origin."
+      echo "  Promotion re-tags the RC's PUBLISHED agent image and folds its notes; an RC that was never pushed was never built by release.yml, so promoting it would ship a stable chart whose workers.image.tag names an image nobody built (the 0.83.0-rc.7 incident, 2026-09-19)."
+      echo "  Push the RC tag, let it publish, THEN promote:"
+      echo "    ! git push origin $INFLIGHT"
+      echo "    .../release-watch.sh ${INFLIGHT#v} && .../release-verify.sh ${INFLIGHT#v}"
+      echo "    release-cut $VERSION --promote"
+    } >&2
+    exit 3
+  fi
   # If main has not moved since the RC and [Unreleased] is empty, there is nothing to
   # cut: promote only (D1). main's Chart.yaml then stays at the RC version, harmless.
   merges="$(git log --first-parent --format=%H "$INFLIGHT..HEAD" 2>/dev/null | grep -c . || true)"
