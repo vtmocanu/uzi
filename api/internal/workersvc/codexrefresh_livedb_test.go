@@ -19,7 +19,7 @@ import (
 )
 
 // These tests exercise the coordinated Codex refresh state machine (PRD #1147 M2, B6,
-// ships DARK) end to end against a REAL Postgres with an IN-PROCESS call-counting fake
+// activated by PRD #1429) end to end against a REAL Postgres with an IN-PROCESS call-counting fake
 // oauth client — no HTTP. They are REPRESENTATIVE: one client at a time, driving each
 // arm of the state machine (advance, replay, reconcile, contended, quarantine, recovery).
 // codex_m4_livedb_test.go supplies the exhaustive two-client concurrency matrix.

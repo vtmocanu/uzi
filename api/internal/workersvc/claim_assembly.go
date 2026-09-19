@@ -609,7 +609,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		},
 	}
 
-	// PRD #1147 M2 (B7), ships DARK: a Codex run also carries its Codex credential. It mints
+	// PRD #1147 M2 (B7): a live Codex run also carries its Codex credential. It mints
 	// the per-claim capability (worker-scoped) and opens the usable credential (subscription
 	// access_token or static api_key) — never the refresh/login blob.
 	//

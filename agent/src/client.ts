@@ -1246,10 +1246,10 @@ export class WorkerClient {
     )) as ResolveMRThreadDTO;
   }
 
-  // ── Codex credential bridge (PRD #1171 M1), ships DARK ─────────────────────
+  // ── Codex credential bridge (PRD #1171 M1, activated by PRD #1429) ─────────
   // Bearer-only, run-scoped worker→API routes over the API's coordinated-refresh service.
   // The run id is the URL path — NEVER the body. Consumed by the Codex executor
-  // composition (a later milestone, m3); an api_key run only ever calls releaseCodex.
+  // composition; an api_key run only ever calls releaseCodex.
   // Both responses are Cache-Control: no-store and secret-bearing (an access token), so the
   // caller must treat the result like a claim secret — never log or persist it beyond use.
 

@@ -19,7 +19,7 @@ import (
 )
 
 // These tests exercise ReconcileCodexAuthIdentity end to end against a REAL Postgres
-// (PRD #1147 M1, ships DARK) with an IN-PROCESS fake identity client — no HTTP. They
+// (PRD #1147 M1, activated by PRD #1429) with an IN-PROCESS fake identity client — no HTTP. They
 // prove the reconciler's tuple convergence and its identity-first, no-pre-identity-
 // rotation contract on the actual schema (the composite FKs, the status CHECK, the
 // provider-account tuple key), which the pure-Go unit tests structurally cannot.

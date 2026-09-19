@@ -12,13 +12,10 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// harness_resolver.go is the PRD #1332 (M5A / D4) dark harness-routing contract: a
+// harness_resolver.go is the PRD #1332 (M5A / D4) harness-routing contract: a
 // pure D11 resolver plus the store-backed availability/credential-selection layer that
-// feeds it. It ships DARK. NOTHING in this file is reachable from a production
-// run-creation origin in M5A — no run-create, chat start_run, schedule fire or any
-// other run kind calls it. It is additive for M5B to consume, at which point M5B owns
-// the wiring and the error mapping (D4). Everything here is exercised only by unit and
-// live-store fixtures in this milestone.
+// feeds it. PRD #1429 routes production run creation through this resolver, including
+// manual, chat, schedule, autopilot, self-improve, CI-fix and derived-run origins.
 
 // Harness is a run's execution harness. The two values are the runs.harness /
 // run_usage.harness CHECK vocabulary; they are BUILT from the unexported string
@@ -174,11 +171,11 @@ func (s *Service) harnessStore() (harnessResolverStore, bool) {
 
 // resolveRunHarness gathers the D11 availability/preference facts from the C1-frozen read
 // queries, runs the pure resolveHarness, and — when the result is Codex — carries the
-// selected Codex credential (PRD #1332 D4). It ships DARK: no production run-creation path
-// calls it in M5A.
+// selected Codex credential (PRD #1332 D4). Production creation calls it through the
+// atomic create seam, so the resolved harness is the one persisted and frozen.
 //
-// explicit is the caller's outright harness choice (M5B's request field), nil for "let the
-// resolver decide". In M5A it is only ever set by tests.
+// explicit is the caller's outright or inherited harness choice, nil for "let the resolver
+// decide". Public request pins and derived-run inheritance both use the explicit path.
 //
 // Codex credential selection follows M1's named-default and auth-mode rules
 // (resolveUsableCodexCredential): the user's single default codex credential decides both

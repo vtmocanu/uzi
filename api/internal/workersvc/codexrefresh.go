@@ -18,7 +18,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
-// Codex COORDINATED-REFRESH state machine (PRD #1147 M2, B6), ships DARK. This is the
+// Codex COORDINATED-REFRESH state machine (PRD #1147 M2, B6), active for subscription-backed Codex runs. This is the
 // SERVICE half over the m2-A store primitives (codex_binding.sql.go): it drives the
 // lease/intent/generation dance that rotates ONE codex_provider_account's subscription
 // login without ever letting two workers rotate in parallel, without ever returning an

@@ -17,10 +17,10 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// PRD #1171 M1 (ships DARK): prove the coordinated refresher through the REAL production
+// PRD #1171 M1 (activated by PRD #1429): prove the coordinated refresher through the REAL production
 // codexauth.Client (built over a fake httpDoer) injected via the REAL SetCodexRefresh
 // setter — "prove the route through real server construction rather than direct service
-// tests alone". The dark M4 suite already proves the refresh state machine with an
+// tests alone". The M4 suite already proves the refresh state machine with an
 // in-process fake CodexRefreshClient; here the seam under test is the production client
 // wiring itself: request assembly, JSON and JWT-claim decode, the single-call advance, and
 // that an api_key run drives zero provider calls.

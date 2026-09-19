@@ -23,11 +23,11 @@ import (
 )
 
 // Codex per-run credential-operation authority + claim binding (PRD #1147 M2, B5/B7),
-// ships DARK. This is the SERVICE half over the m2-A store primitives: it mints the
+// active for Codex-bound runs through PRD #1429. This is the SERVICE half over the store primitives: it mints the
 // per-claim capability, decides whether a presented capability may perform a scoped
 // credential operation over the run's frozen binding, and freezes a run's binding at
 // creation. The coordinated-refresh state machine (lease/intent/generation) is a
-// SEPARATE later unit — the store primitives for it exist but are NOT driven here.
+// separate state machine; this authority layer does not drive refresh itself.
 
 // Codex auth modes (the runs.codex_auth_mode CHECK values, migration 00202). Named
 // here so this file never spells a bare literal that could drift from the schema.

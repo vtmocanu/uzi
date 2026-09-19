@@ -596,8 +596,8 @@ export interface ClaimRepo {
  *     `previousAccountId` is only an untrusted hint and never replaces this value.
  *   * "api_key" has NONE of those subscription fields and can never refresh.
  *
- * Present ONLY for an internally-bound Codex run (ships DARK — M5 still owns public
- * routing). Ordinary Claude claims OMIT it, so their wire is byte-identical: the
+ * Present ONLY for a Codex run selected by the public routing activated in PRD #1429.
+ * Ordinary Claude claims OMIT it, so their wire is byte-identical: the
  * field is optional/omitted, an existing Claude claim's JSON is unchanged, and
  * existing consumers are unaffected. Delivered ONLY in the claim response; never
  * persisted beyond the run, never logged (the access token/capability are secrets).
@@ -691,8 +691,8 @@ export interface ClaimSecrets {
   // Bot login for the git commit identity + MR authorship. Used in M4; M2
   // ignores it.
   forge_username?: string;
-  /** The Codex secret block (PRD #1171 M3/M4). Present ONLY for an internally-bound
-   *  Codex run (ships DARK); ordinary Claude claims omit it so their wire is
+  /** The Codex secret block (PRD #1171 M3/M4). Present ONLY for a Codex-bound
+   *  run; ordinary Claude claims omit it so their wire is
    *  byte-identical. See {@link ClaimCodexSecrets}. */
   codex?: ClaimCodexSecrets;
 }

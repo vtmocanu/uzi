@@ -15,7 +15,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// PRD #1147 M4 (ships DARK): the exhaustive PROOF of the M2 coordinated-refresh + authority
+// PRD #1147 M4 (activated by PRD #1429): the exhaustive PROOF of the M2 coordinated-refresh + authority
 // mechanism, driven with an in-process fake provider and, where the property demands it, TWO
 // concurrent clients against a REAL Postgres. These tests are TEST-ONLY: they add no
 // production code and only stress the M2 seams already committed. They fill the gaps the

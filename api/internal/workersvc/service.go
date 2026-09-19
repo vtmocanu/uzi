@@ -1481,11 +1481,11 @@ type Service struct {
 	// token under the master box — the pre-vault behavior.
 	vlt *vault.Vault
 	// codexRefresh is the injectable oauth-exchange seam the coordinated Codex
-	// refresher uses (PRD #1147 M2, B6, ships DARK). *codexauth.Client satisfies
+	// refresher uses (PRD #1147 M2, B6). *codexauth.Client satisfies
 	// CodexRefreshClient in production; tests supply a call-counting fake. Optional
 	// (nil): a nil client makes CoordinatedCodexRefresh refuse before touching the
-	// provider, so a deployment (or test) without it never rotates. No production path
-	// wires it yet — m2 ships dark.
+	// provider, so a deployment (or test) without it never rotates. Production wires it
+	// through SetCodexRefresh for the public Codex path activated by PRD #1429.
 	codexRefresh CodexRefreshClient
 	// Two narrow settings views over the same *settings.Cache: `settings` =
 	// judge/self-improve reads, `healthSettings` = run-health reads (interface
@@ -1629,7 +1629,7 @@ func (s *Service) SetLifecycle(l RunLifecycle) { s.lifecycle = l }
 func (s *Service) SetVault(v *vault.Vault) { s.vlt = v }
 
 // SetCodexRefresh wires the production Codex oauth-exchange client into the coordinated
-// refresher (PRD #1171 M1, ships DARK), mirroring SetVault. Call once at startup, before
+// refresher (PRD #1171 M1, activated by PRD #1429), mirroring SetVault. Call once at startup, before
 // serving. In production main.go injects a fixed-endpoint, deadline-bounded
 // *codexauth.Client; tests inject a call-counting fake (or a real Client over a fake
 // httpDoer). A nil client (the default, and every test that never wires it) leaves
