@@ -139,6 +139,17 @@ type settingsMsg struct {
 	err      error
 }
 
+// vaultStatusMsg carries the viewer's vault-lock state (from WhoamiVault, decoded off GET
+// /api/auth/me's sibling `vault.unlocked`, PRD #1251 M2). Fetched at Init, on the 60s strip
+// ticker (stripTickMsg), and on manual refresh (r) — the SAME cadence as the rate-limit
+// strip — so the tier-1 hint auto-clears within ~a minute of an unlock (D3). user carries the
+// viewer identity off the same reply, threaded now for M3's admin-board own-run scoping (D11).
+type vaultStatusMsg struct {
+	user   apitypes.UserDTO
+	locked bool
+	err    error
+}
+
 // buildInfoMsg carries the connected server's build version (from BuildInfo), which drives
 // the board footer's CLI-vs-server skew banner. Fetched at Init and on the skewTickMsg
 // ticker when the session is allowed to probe (see tuiModel.skewCheck).
@@ -338,6 +349,16 @@ type tuiModel struct {
 	rateLimits      []apitypes.TokenRateLimitDTO
 	sidebarTokenIds []string
 
+	// vaultLocked is the viewer's vault-lock state (PRD #1251 M2), decoded off GET
+	// /api/auth/me's sibling `vault.unlocked` via WhoamiVault. Fetched at Init, on the 60s
+	// strip ticker and on manual refresh (r) — the same cadence as the rate-limit strip — so
+	// the tier-1 vault-locked hint auto-clears within ~a minute of an unlock (D3). A fetch
+	// failure is swallowed (last-known state kept), so a transient error never flashes a
+	// spurious lock. selfEmail is the viewer identity from the SAME reply, threaded now for
+	// M3's admin-board own-run scoping (D11); M2 does not render it.
+	vaultLocked bool
+	selfEmail   string
+
 	// serverVersion holds the connected server's build version for the footer version readout
 	// (issue #687). Stored raw (unsanitized, last-known-good); sanitized at draw time via
 	// cellText before it reaches the readout (versionReadout / versionClientOnly). Empty until
@@ -453,7 +474,7 @@ func newTUIModel(ctx context.Context, c uzicli.Client, startRun string) tuiModel
 // so a light terminal actually gets the light theme instead of the dark default.
 func (m tuiModel) initCmds() []tea.Cmd {
 	cmds := []tea.Cmd{m.fetchRunsCmd(m.board.admin, m.board.waitID), m.fetchSecretsCmd(),
-		m.fetchRateLimitsCmd(), m.fetchSettingsCmd(), tickAfter(boardPollInterval, m.board.tickGen), stripTickCmd(),
+		m.fetchRateLimitsCmd(), m.fetchSettingsCmd(), m.fetchVaultCmd(), tickAfter(boardPollInterval, m.board.tickGen), stripTickCmd(),
 		themeTickCmd(),
 		// The forge views' repo scope (PRD #1255 D2) and the `pulls` list's own 10s tick chain.
 		// The tick is armed now but polls the forge only while the pulls screen is in focus
@@ -635,6 +656,18 @@ func (m tuiModel) fetchSettingsCmd() tea.Cmd {
 	return func() tea.Msg {
 		s, err := c.GetMySettings(ctx)
 		return settingsMsg{settings: s, err: err}
+	}
+}
+
+// fetchVaultCmd reads the viewer's vault-lock state (and identity) from GET /api/auth/me so
+// the board can draw the tier-1 vault-locked hint (PRD #1251 M2). A failure is swallowed like
+// the strip's fetch — the last-known state is left untouched, so a transient error never
+// flashes a spurious lock nor clears a real one, and never blocks the board.
+func (m tuiModel) fetchVaultCmd() tea.Cmd {
+	c, ctx := m.client, m.ctx
+	return func() tea.Msg {
+		user, locked, err := c.WhoamiVault(ctx)
+		return vaultStatusMsg{user: user, locked: locked, err: err}
 	}
 }
 
@@ -833,7 +866,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.quitting || m.updatePrompt.showing {
 			return m, stripTickCmd()
 		}
-		return m, tea.Batch(m.fetchRateLimitsCmd(), m.fetchSettingsCmd(), stripTickCmd())
+		return m, tea.Batch(m.fetchRateLimitsCmd(), m.fetchSettingsCmd(), m.fetchVaultCmd(), stripTickCmd())
 
 	case themeTickMsg:
 		// Re-query the terminal background so a LIVE theme switch reaches the model (issue #1348).
@@ -1090,6 +1123,17 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case settingsMsg:
 		if msg.err == nil {
 			m.sidebarTokenIds = msg.settings.SidebarTokenIds
+		}
+		return m, nil
+
+	case vaultStatusMsg:
+		// Swallow errors exactly like the rate-limit strip's fetch (rateLimitsMsg): on a
+		// failed probe leave the last-known state untouched, so a transient error neither
+		// flashes a spurious lock nor clears a real one. On success record the lock (drives
+		// the tier-1 hint) and the viewer identity (threaded now for M3's own-run scoping).
+		if msg.err == nil {
+			m.vaultLocked = msg.locked
+			m.selfEmail = msg.user.Email
 		}
 		return m, nil
 

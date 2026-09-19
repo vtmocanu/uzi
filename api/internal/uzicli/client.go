@@ -25,6 +25,14 @@ import (
 // chi into the binary — the go list -deps layering assertion).
 type Client interface {
 	Whoami(ctx context.Context) (apitypes.UserDTO, error)
+	// WhoamiVault reads GET /api/auth/me like Whoami, but decodes the sibling top-level
+	// `vault` object the same response carries and returns the viewer's vault-LOCK state
+	// (PRD #1251 M2). It returns the viewer identity AND `locked` (= !vault.unlocked), so
+	// the TUI can show the tier-1 vault-locked hint without a new endpoint or DTO (D9). An
+	// absent `vault` (a pre-vault server) decodes as unlocked, so an older server never
+	// shows a spurious lock — mirroring the web client's absent-⇒-unlocked convention. It
+	// is additive to Whoami, which stays `{user}`-only so `uzi whoami` is unchanged.
+	WhoamiVault(ctx context.Context) (apitypes.UserDTO, bool, error)
 	ListRuns(ctx context.Context) ([]apitypes.RunListItemDTO, error)
 	GetRun(ctx context.Context, id string) (apitypes.RunDTO, error)
 	// RunLogs returns a run's persisted messages after seq (0 = from the start);

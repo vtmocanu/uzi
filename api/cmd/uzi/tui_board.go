@@ -247,7 +247,7 @@ func (m tuiModel) boardKey(k string) (tea.Model, tea.Cmd) {
 		// becomes the new waitID, so the next periodic tick does not stack a second poll on top
 		// of this one and any periodic reply still in flight is superseded (its stale reqID is
 		// dropped); this reply's own reqID clears the guard.
-		return m, tea.Batch((&m).startBoardReq(), m.fetchRateLimitsCmd(), m.fetchSettingsCmd())
+		return m, tea.Batch((&m).startBoardReq(), m.fetchRateLimitsCmd(), m.fetchSettingsCmd(), m.fetchVaultCmd())
 	case keyAdmin:
 		m.board.admin = !m.board.admin
 		m.board.adminDenied = false
@@ -336,6 +336,29 @@ func (m tuiModel) tabStrip() string {
 	return out
 }
 
+// vaultIndicatorLine is the tier-1 vault-locked andon hint (PRD #1251 M2, D3/D4/D5): a quiet,
+// STEADY (never blinking), non-dismissable faint glyph+text line shown when the viewer's vault
+// is locked, and "" otherwise — so it auto-clears on its own the moment WhoamiVault reports the
+// vault unlocked (D3). It is a line of its OWN, adjacent to and never replacing the rate-limit
+// strip (D5): the two are distinct signals and can be visible together.
+//
+// The signal is carried by the WORDS "vault locked", never colour alone (D4). Under
+// colorprofile.Ascii / NO_COLOR the faint SGR is stripped downstream, so the ascii form drops
+// the lock glyph for a plain "[locked]" marker that survives with no colour at all.
+//
+// M3 will ESCALATE this to the amber needs-you band when ≥1 of the viewer's OWN runs is parked
+// on the vault. The show-decision and the styling both live here on purpose: that is the seam
+// that lets M3 upgrade the hint to the band without restructuring renderBoard or boardCapacity.
+func (m tuiModel) vaultIndicatorLine() string {
+	if !m.vaultLocked {
+		return ""
+	}
+	if m.profile == colorprofile.Ascii {
+		return " [locked] vault locked"
+	}
+	return " " + m.pal.faint.Render("🔒 vault locked")
+}
+
 func (m tuiModel) renderBoard() string {
 	var sb strings.Builder
 	rows := m.board.visible()
@@ -375,6 +398,13 @@ func (m tuiModel) renderBoard() string {
 	// only when at least one token is readable AND shown; otherwise nothing (no strip).
 	if strip := m.boardRateLimitStrip(time.Now()); strip != "" {
 		sb.WriteString(strip + "\n")
+	}
+	// The tier-1 vault-locked hint (PRD #1251 M2, D5): its OWN line directly under the strip,
+	// never replacing or hiding it — both are distinct signals and can show together. Its row
+	// is reserved in boardCapacity via the SAME vaultIndicatorLine() check, so the two spots
+	// cannot drift.
+	if vault := m.vaultIndicatorLine(); vault != "" {
+		sb.WriteString(vault + "\n")
 	}
 	sb.WriteString("\n")
 
@@ -659,6 +689,12 @@ func (m tuiModel) boardCapacity() int {
 	// The rate-limit strip, when present, adds one line between the wordmark and the blank
 	// below it. Recomputed here (cheap) so the row-window math matches renderBoard's layout.
 	if m.boardRateLimitStrip(time.Now()) != "" {
+		chrome++
+	}
+	// The tier-1 vault-locked hint (PRD #1251 M2) is its own line under the strip when shown;
+	// reserve one row for it the SAME way (calling vaultIndicatorLine, not re-deriving the
+	// show-condition) so the row window and renderBoard's layout cannot drift by a line.
+	if m.vaultIndicatorLine() != "" {
 		chrome++
 	}
 	// The selected row's variable-height second "now" line (D4) reserves one physical line, so
