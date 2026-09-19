@@ -9,17 +9,14 @@ import { Input, Select } from "./ui";
 // default-model setting) plus a free-text "Other…" custom escape hatch. Codex's
 // picker is EXACTLY `gpt-6-astra`/`gpt-5.6-sol` — no custom option, no catalog
 // discovery — matching D6's "the product-owned Codex picker remains exactly" rule.
-export const CLAUDE_MODEL_ALIASES = ["opus", "sonnet", "haiku", "fable"] as const;
-export const CODEX_MODEL_ALIASES = ["gpt-6-astra", "gpt-5.6-sol"] as const;
+const CLAUDE_MODEL_ALIASES = ["opus", "sonnet", "haiku", "fable"] as const;
+const CODEX_MODEL_ALIASES = ["gpt-6-astra", "gpt-5.6-sol"] as const;
 
-// Back-compat alias: every pre-M4a caller that never named a harness gets the
-// Claude vocabulary, byte-identical to before this milestone.
-export const MODEL_ALIASES = CLAUDE_MODEL_ALIASES;
-
-// aliasesForHarness is the single place a caller (this component, or a harness-aware
-// summary) resolves which curated list applies. Defaults to Claude for an omitted/
-// unrecognised harness — the safe, backward-compatible direction.
-export function aliasesForHarness(harness: Harness | undefined): readonly string[] {
+// aliasesForHarness is the single place this component resolves which curated list
+// applies. Defaults to Claude for an omitted/unrecognised harness — the safe,
+// backward-compatible direction: a caller that never names a harness gets the Claude
+// vocabulary, byte-identical to before PRD #1429 M4a.
+function aliasesForHarness(harness: Harness | undefined): readonly string[] {
   return harness === "codex" ? CODEX_MODEL_ALIASES : CLAUDE_MODEL_ALIASES;
 }
 
