@@ -368,11 +368,13 @@ gcommit() { # gcommit <dir> <msg>
 # changelog-links needs no remote.
 seed_repo() {
   local d="$1"
-  mkdir -p "$d/scripts" "$d/deploy/chart" "$d/api"
+  mkdir -p "$d/scripts/lib" "$d/deploy/chart" "$d/api"
   local s
   for s in worker-tag-autobump changelog-links assert-changelog-covers-release changelog-section assert-worker-tag-decoupled; do
     [ -f "$SCRIPTS_DIR/$s.sh" ] && { cp "$SCRIPTS_DIR/$s.sh" "$d/scripts/$s.sh"; chmod +x "$d/scripts/$s.sh"; }
   done
+  # The shared shipping-path lib the oracle and release-cut both source.
+  cp "$SCRIPTS_DIR/lib/shipping-paths.sh" "$d/scripts/lib/shipping-paths.sh"
   cat > "$d/deploy/chart/Chart.yaml" <<'YAML'
 apiVersion: v2
 name: uzi
@@ -609,6 +611,35 @@ if has_heading "$S8" 0.3.0; then pass "--promote opens [0.3.0] on main"; else fa
 if git -C "$S8" rev-parse -q --verify refs/heads/release/0.2.0 >/dev/null; then fail "--promote leaves no release/0.2.0 branch"; else pass "--promote leaves no release/0.2.0 branch"; fi
 assert_eq "--promote leaves the worker pin unchanged (D11)" "$pin_before" "$(pin_tag "$S8")"
 
+echo "=== M2b: --promote takes promote-only when only a NON-shipping commit follows the RC ==="
+# The cff43919 case: a docs/prd-only commit after the RC must NOT force an empty next RC.
+# promote-only keys on SHIPPING commits (is_shipping), so it fires: tags the stable, cuts no
+# next candidate, leaves main's Chart at the RC version. (On the raw-commit-count code this
+# dropped to the main half and, with an empty [Unreleased], failed and rolled the stable back.)
+S8P="$(mktemp -d)"; seed_repo "$S8P"; add_origin "$S8P"; add_feature "$S8P" 201
+put_changelog "$S8P" <<'MD'
+# Changelog
+
+## [Unreleased]
+### Added
+- **Feature 201** (#201)
+
+## [0.1.0] - 2026-09-01
+### Added
+- **Initial** (#100)
+MD
+run_rc "$S8P" 0.2.0; git -C "$S8P" tag v0.2.0-rc.1; push_tag_to_origin "$S8P" v0.2.0-rc.1
+mkdir -p "$S8P/prds"; echo 'anchor refresh' > "$S8P/prds/1359-x.md"   # NON-shipping, [Unreleased] stays empty
+git -C "$S8P" add prds/1359-x.md; gcommit "$S8P" "docs(prd-1359): refresh anchors [skip ci]"
+chart_before="$(chart_ver "$S8P")"
+run_rc "$S8P" 0.3.0 --promote
+assert_eq "--promote (docs-only follow) exits 0"                      "0"        "$RC_RC"
+assert_contains "--promote (docs-only follow) is promote-only"        "promoted" "$RC_OUT"
+assert_contains "--promote (docs-only follow) says nothing shipping"  "nothing shipping" "$RC_OUT"
+if git -C "$S8P" rev-parse -q --verify refs/tags/v0.2.0 >/dev/null; then pass "promote-only creates stable tag v0.2.0"; else fail "promote-only creates stable tag v0.2.0"; fi
+assert_eq "promote-only does NOT cut a next RC (main chart unchanged)" "$chart_before" "$(chart_ver "$S8P")"
+if has_heading "$S8P" 0.3.0; then fail "promote-only opens NO [0.3.0] section"; else pass "promote-only opens NO [0.3.0] section"; fi
+
 echo "=== M2b: --promote REFUSED when the in-flight RC is local-only (not on origin) ==="
 # The 0.83.0-rc.7 guard: promotion re-tags the RC's PUBLISHED agent image, so an RC that
 # was never pushed (never built by release.yml) must not promote. Same setup as S8 but the
@@ -842,8 +873,8 @@ git -C "$SE" add deploy/chart/values.yaml; gcommit "$SE" "test: pin a tag on ori
 assert_eq "autobump exits 2 when the pin tag is on origin but not local" "2"          "$se_rc"
 assert_eq "autobump does NOT repin on the broken-instrument path"        "0.7.0-rc.1" "$(pin_tag "$SE")"
 
-rm -rf "$S1" "$S3" "$S4" "$S6" "$S7" "$S8" "$S8B" "$S8C" "$S9" "$S10" "$SA" "$SB" "$SC" "$SD" "$SE" \
-       "$S8.origin.git" "$S8B.origin.git" "$S9.origin.git" "$S10.origin.git" "$SD.origin.git" "$SE.origin.git"
+rm -rf "$S1" "$S3" "$S4" "$S6" "$S7" "$S8" "$S8P" "$S8B" "$S8C" "$S9" "$S10" "$SA" "$SB" "$SC" "$SD" "$SE" \
+       "$S8.origin.git" "$S8P.origin.git" "$S8B.origin.git" "$S9.origin.git" "$S10.origin.git" "$SD.origin.git" "$SE.origin.git"
 
 echo "=== M3: release-mode lib (shared by watch + verify) ==="
 # shellcheck source=scripts/lib/release-mode.sh

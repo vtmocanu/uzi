@@ -76,6 +76,10 @@ TODAY="$(date +%F)"
 
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || { echo "not in a git repo" >&2; exit 3; }
 cd "$ROOT" || { echo "cannot cd to repo root $ROOT" >&2; exit 3; }
+# is_shipping: the shared release-train definition of "does this path ship" (same file the
+# coverage oracle uses), so promote-only and the oracle can never disagree about "shipping".
+# shellcheck source=scripts/lib/shipping-paths.sh
+. "$ROOT/scripts/lib/shipping-paths.sh"
 
 # --- version helpers ----------------------------------------------------------
 # ver_cmp <a> <b> -> -1|0|1 for a<b|a==b|a>b, comparing the X.Y.Z base only.
@@ -136,6 +140,27 @@ prev_stable_below() {
 # changelog_unreleased_body -> the body between `## [Unreleased]` and the next `## [`.
 changelog_unreleased_body() {
   awk '/^## \[Unreleased\]/{f=1;next} f&&/^## \[/{exit} f{print}' CHANGELOG.md
+}
+# shipping_commits_since <ref> -> count of first-parent commits in <ref>..HEAD that touched
+# a SHIPPING path (is_shipping, shared with the oracle). This is what promote-only keys on:
+# a docs/skill/prd/build-only commit after the RC must NOT force a next candidate that ships
+# nothing (it would leave an empty [X] section and, with an empty [Unreleased], fail the main
+# half and roll the stable tag back). Counting raw `git log` commits conflated the two.
+shipping_commits_since() {
+  local c=0 sha f files
+  while IFS= read -r sha; do
+    [ -n "$sha" ] || continue
+    files="$(git diff --name-only "$sha^1" "$sha" 2>/dev/null || git show --name-only --format= "$sha")"
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      if is_shipping "$f"; then c=$((c + 1)); break; fi
+    done <<EOF
+$files
+EOF
+  done <<EOF
+$(git log --first-parent --format=%H "$1..HEAD" 2>/dev/null)
+EOF
+  echo "$c"
 }
 # rc_tag_on_remote <tag> -> 0 present on origin, 2 absent from origin, 3 origin
 # unreachable (network/auth). A promote re-tags the in-flight RC's PUBLISHED agent image
@@ -419,16 +444,20 @@ if [ "$OP" = promote ]; then
     } >&2
     exit 3
   fi
-  # If main has not moved since the RC and [Unreleased] is empty, there is nothing to
-  # cut: promote only (D1). main's Chart.yaml then stays at the RC version, harmless.
-  merges="$(git log --first-parent --format=%H "$INFLIGHT..HEAD" 2>/dev/null | grep -c . || true)"
+  # If NOTHING SHIPPING has landed since the RC and [Unreleased] is empty, there is nothing
+  # to cut: promote only (D1). main's Chart.yaml then stays at the RC version, harmless. We
+  # count SHIPPING first-parent commits, not raw commits: a docs/skill/prd/build-only commit
+  # after the RC (e.g. a `docs(...) [skip ci]` anchor refresh) must still take promote-only,
+  # not drop through to the main half and fail on an empty [Unreleased] (which would roll the
+  # stable tag back). "Shipping" is is_shipping, the same predicate the coverage oracle uses.
+  merges="$(shipping_commits_since "$INFLIGHT")"
   unrel="$(changelog_unreleased_body | tr -d '[:space:]')"
   trap promote_guard EXIT
   promote_inflight
   if [ "$merges" -eq 0 ] && [ -z "$unrel" ]; then
     PROMOTE_FINALIZED=1
     echo
-    echo "=== promoted $PROMOTED_TAG only (nothing shipped since $INFLIGHT, [Unreleased] empty) ==="
+    echo "=== promoted $PROMOTED_TAG only (nothing shipping since $INFLIGHT, [Unreleased] empty) ==="
     echo "Next:  git push origin $PROMOTED_TAG"
     exit 0
   fi

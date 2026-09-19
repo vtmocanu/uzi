@@ -175,13 +175,11 @@ if [ -z "$(cat "$SECTION_FILE")" ]; then
   exit 1
 fi
 
-is_shipping() {
-  case "$1" in
-    *_test.go|*.test.ts|*.test.tsx|*/testdata/*|*/test/*|e2e/*|fixtures/*) return 1 ;;
-    api/*|agent/src/*|controller/*|web/src/*|deploy/chart/*|docs/*) return 0 ;;
-    *) return 1 ;;
-  esac
-}
+# is_shipping is shared with release-cut.sh's promote-only detection so "shipping" has one
+# definition (scripts/lib/shipping-paths.sh). Resolve the lib next to this script, CDPATH
+# cleared so `cd` cannot echo an unexpected dir.
+# shellcheck source=scripts/lib/shipping-paths.sh
+. "$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)/lib/shipping-paths.sh"
 
 missing=0
 while read -r sha; do
