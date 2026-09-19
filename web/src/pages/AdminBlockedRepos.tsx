@@ -6,7 +6,7 @@
 // caveat: if privilege checks were never run, an empty list is "unknown", not "none".
 
 import { useState } from "react";
-import { api, type BlockedRepo } from "../lib/api";
+import { api, type BlockedRepo, type GuardrailOverrideRequest } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
 import { useAsyncData } from "../lib/useAsyncData";
 import { Alert, Badge, Button, Card, EmptyState, ListSkeleton, Textarea } from "../components/ui";
@@ -30,13 +30,16 @@ export function AdminBlockedRepos() {
   const { data, loading, error: loadError, reload } = useAsyncData(
     async () => {
       const res = await api.adminListBlockedRepos();
-      return { repos: res.repos, checksUnknown: res.checks_unknown };
+      return { repos: res.repos, checksUnknown: res.checks_unknown, requests: res.requests };
     },
     [],
     { fallback: "Failed to load blocked repos" },
   );
   const repos = data?.repos ?? [];
   const checksUnknown = data?.checksUnknown ?? false;
+  // Pending cross-user override requests (issue #1432): members asking to enable a repo
+  // the guardrail refused. Always an array from the server (never null).
+  const requests = data?.requests ?? [];
   // Kept local: the Allow-anyway / Revoke handlers below still set the page error, so
   // it is merged with the hook's load error at the one page-level Alert.
   const [error, setError] = useState("");
@@ -48,6 +51,14 @@ export function AdminBlockedRepos() {
   // Alert would sit behind the backdrop, unseen). Distinct from the page `error`.
   const [allowError, setAllowError] = useState("");
   const [revokeBusyId, setRevokeBusyId] = useState<string | null>(null);
+  // Pending override-request decisions (issue #1432). decideBusyId disables the acting
+  // row's buttons; the reject-note modal carries the request, an OPTIONAL note, and its
+  // POST — approve is a direct call, reject prompts for a note first.
+  const [decideBusyId, setDecideBusyId] = useState<string | null>(null);
+  const [rejectRequest, setRejectRequest] = useState<GuardrailOverrideRequest | null>(null);
+  const [rejectNote, setRejectNote] = useState("");
+  const [rejectBusy, setRejectBusy] = useState(false);
+  const [rejectError, setRejectError] = useState("");
 
   const openAllow = (repo: BlockedRepo) => {
     setError("");
@@ -95,6 +106,56 @@ export function AdminBlockedRepos() {
     }
   };
 
+  // Approve a pending request (issue #1432): sets the override so the OWNER can retry
+  // Enable — it does not enable the repo. 409 (already decided) / 404 surface at the
+  // page Alert; reload settles the row out of the pending list.
+  const approve = async (req: GuardrailOverrideRequest) => {
+    setError("");
+    setDecideBusyId(req.id);
+    try {
+      await api.approveGuardrailOverrideRequest(req.id);
+      await reload();
+    } catch (err) {
+      setError(errorMessage(err, "Failed to approve the request"));
+    } finally {
+      setDecideBusyId(null);
+    }
+  };
+
+  const openReject = (req: GuardrailOverrideRequest) => {
+    setError("");
+    setRejectNote("");
+    setRejectError("");
+    setRejectRequest(req);
+  };
+
+  // Close the reject-note modal. A no-op while a POST is in flight so neither Escape nor
+  // a backdrop click can dismiss a submitting form (matching the disabled ×).
+  const closeReject = () => {
+    if (rejectBusy) return;
+    setRejectRequest(null);
+    setRejectError("");
+  };
+
+  // Reject a pending request with an OPTIONAL note (submit allowed when empty). An empty
+  // note is omitted so the endpoint sees no decision_note rather than "". reload after.
+  const submitReject = async () => {
+    if (!rejectRequest) return;
+    const note = rejectNote.trim();
+    setRejectError("");
+    setRejectBusy(true);
+    try {
+      await api.rejectGuardrailOverrideRequest(rejectRequest.id, note || undefined);
+      setRejectRequest(null);
+      setRejectNote("");
+      await reload();
+    } catch (err) {
+      setRejectError(errorMessage(err, "Failed to reject the request"));
+    } finally {
+      setRejectBusy(false);
+    }
+  };
+
   return (
     <AdminShell description="Every user's repos the push/merge guardrail refuses right now, plus any an admin has explicitly allowed. Fixing branch protection on the forge clears the block on the next sync; an override persists until revoked.">
 
@@ -106,6 +167,72 @@ export function AdminBlockedRepos() {
           tone="warning"
           message="At least one forge connection has never been privilege-checked (privilege checks may be disabled). This list may be incomplete — an empty or short list here means unknown, not none blocked."
         />
+      )}
+
+      {/* Pending override requests (issue #1432): members asking to enable a repo the
+          guardrail refused. Rendered above the blocked/overridden table, and outside its
+          repos-empty guard so a request shows even when nothing else is blocked. */}
+      {!loading && requests.length > 0 && (
+        <Card className="p-0">
+          <div className="border-b border-edge px-4 py-3">
+            <h2 className="text-sm font-semibold text-fg">Pending override requests</h2>
+            <p className="mt-0.5 text-xs text-muted">
+              Members asking to enable a repo the guardrail refused. Approving records the override so the
+              owner can retry Enable — it does not enable the repo for them.
+            </p>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-sm">
+              <thead className="border-b border-edge text-muted">
+                <tr>
+                  <th className="px-4 py-3 font-medium">Requested by</th>
+                  <th className="px-4 py-3 font-medium">Repo</th>
+                  <th className="px-4 py-3 font-medium">Reason</th>
+                  <th className="px-4 py-3 font-medium">What blocked it</th>
+                  <th className="px-4 py-3 text-right font-medium">Actions</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-edge">
+                {requests.map((req) => (
+                  <tr key={req.id} className="align-top transition-colors hover:bg-raised/30">
+                    <td className="px-4 py-3 text-muted">{maskEmail(req.owner_email, demo)}</td>
+                    <td className="px-4 py-3">
+                      <div className="font-medium text-fg">{maskRepoPath(req.repo_path, demo)}</div>
+                      <div className="font-mono text-xs text-faint">{req.forge_type}</div>
+                    </td>
+                    <td className="px-4 py-3 text-muted">{req.reason}</td>
+                    <td className="px-4 py-3">
+                      {req.findings.length > 0 ? (
+                        <ul className="list-disc space-y-0.5 pl-5 text-xs text-muted">
+                          {req.findings.map((f, i) => (
+                            <li key={`${f.code}-${i}`}>{f.message}</li>
+                          ))}
+                        </ul>
+                      ) : (
+                        <span className="text-xs text-faint">—</span>
+                      )}
+                    </td>
+                    <td className="px-4 py-3 text-right">
+                      <div className="flex justify-end gap-2">
+                        <Button size="sm" disabled={decideBusyId === req.id} onClick={() => approve(req)}>
+                          {decideBusyId === req.id ? "Approving…" : "Approve"}
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          disabled={decideBusyId === req.id}
+                          onClick={() => openReject(req)}
+                        >
+                          Reject
+                        </Button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </Card>
       )}
 
       {loading ? (
@@ -266,6 +393,61 @@ export function AdminBlockedRepos() {
               </Button>
               <Button size="sm" disabled={allowBusy || allowReason.trim() === ""} onClick={submitAllow}>
                 {allowBusy ? "Allowing…" : "Allow anyway"}
+              </Button>
+            </div>
+          </div>
+        </Modal>
+      )}
+
+      {/* Reject-note modal (issue #1432): the note is OPTIONAL, so the Reject button
+          stays enabled with an empty field. Rendered back to the requester when set. */}
+      {rejectRequest && (
+        <Modal
+          label={`Reject the request to enable ${maskRepoPath(rejectRequest.repo_path, demo)}`}
+          onClose={closeReject}
+          closeOnBackdrop={!rejectBusy}
+        >
+          <div className="my-8 w-full max-w-lg overflow-hidden rounded-2xl border border-edge-strong bg-surface shadow-2xl">
+            <div className="flex items-start justify-between gap-3 border-b border-edge px-5 py-4">
+              <div>
+                <h2 className="text-base font-semibold">Reject this request?</h2>
+                <p className="mt-0.5 text-xs text-muted">
+                  {maskRepoPath(rejectRequest.repo_path, demo)} · requested by {maskEmail(rejectRequest.owner_email, demo)}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={closeReject}
+                disabled={rejectBusy}
+                aria-label="Close"
+                className="rounded-md p-1 text-muted hover:bg-raised hover:text-fg"
+              >
+                <XIcon />
+              </button>
+            </div>
+            <div className="space-y-4 px-5 py-5">
+              {rejectError && <Alert message={rejectError} />}
+              <p className="text-sm text-muted">
+                The member keeps their block. Add a note if you want to tell them why — they see it on the
+                repo. It is optional.
+              </p>
+              <label className="block space-y-1.5">
+                <span className="text-sm font-medium text-fg">Note (optional)</span>
+                <Textarea
+                  rows={3}
+                  value={rejectNote}
+                  disabled={rejectBusy}
+                  placeholder="Why this request is rejected (shown to the requester)"
+                  onChange={(e) => setRejectNote(e.target.value)}
+                />
+              </label>
+            </div>
+            <div className="flex items-center justify-end gap-2 border-t border-edge bg-ink/40 inset-panel px-5 py-3.5">
+              <Button variant="ghost" size="sm" disabled={rejectBusy} onClick={closeReject}>
+                Cancel
+              </Button>
+              <Button variant="danger" size="sm" disabled={rejectBusy} onClick={submitReject}>
+                {rejectBusy ? "Rejecting…" : "Reject request"}
               </Button>
             </div>
           </div>

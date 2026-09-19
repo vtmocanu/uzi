@@ -537,12 +537,48 @@ export interface BlockedRepo {
   privilege_checked_at: string | null;
 }
 
+// GuardrailFinding is one coded blocking privcheck finding snapshotted onto a
+// guardrail override request (issue #1432): the reason an enable was refused,
+// carried for audit/display so an admin sees WHY without a fresh forge read.
+// severity is a plain string (the wire carries "block"/"warn", but the contract
+// fixture uses a generic populated value, so it is not narrowed to a union).
+// Mirrors apitypes.GuardrailFindingDTO.
+export interface GuardrailFinding {
+  code: string;
+  severity: string;
+  message: string;
+}
+
+// GuardrailOverrideRequest is one row of the admin cross-user override-request
+// queue (issue #1432): a member's pending request that an admin allow a guardrail-
+// blocked repo, joined to its repo path, owning user (id + email), and forge type
+// so the admin can triage the whole queue without a per-row fan-out. findings is
+// the audit/display snapshot of what blocked the enable. Mirrors
+// apitypes.GuardrailOverrideRequestDTO.
+export interface GuardrailOverrideRequest {
+  id: string;
+  repo_id: string;
+  repo_path: string;
+  owner_id: string;
+  owner_email: string;
+  forge_type: string;
+  reason: string;
+  findings: GuardrailFinding[];
+  status: string;
+  created_at: string;
+}
+
 // AdminBlockedRepos is the GET /api/admin/blocked-repos envelope (PRD #66 M9). When
 // checks_unknown is true at least one connection was never privilege-checked, so an
 // empty list is "unknown", NOT "none blocked" (R1) — the page says so.
 export interface AdminBlockedRepos {
   repos: BlockedRepo[];
   checks_unknown: boolean;
+  // The PENDING cross-user guardrail override requests (issue #1432): members who
+  // could not enable a blocked repo asking an admin to allow it. REQUIRED, never
+  // optional — the handler initializes it to an empty slice, so an admin with no
+  // pending requests sees [] rather than null.
+  requests: GuardrailOverrideRequest[];
 }
 
 export interface BoardColumn {
