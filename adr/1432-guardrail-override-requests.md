@@ -179,3 +179,28 @@ step — nothing else references the number.
   stored findings never feed a safety decision. A moot request is auto-dismissed
   (on approve, or when a successful Enable settles it); a request whose block can't
   currently be waived is refused and left pending rather than destroyed.
+
+### Accepted risk: the approve-time revalidation is best-effort, not race-free
+
+The approve-time live guard runs before the arming transaction, so a TOCTOU window
+remains: an owner could fix forge protection after `revalidateApprove` returns
+"proceed" but before `SetRepoGuardrailOverride` commits, arming a standing override
+on a repo that is momentarily clean. We accept this deliberately, because its
+consequence is bounded by two properties this issue preserves rather than by the
+narrowness of the window:
+
+1. The #66 override is by design a standing admin permission to waive every
+   *waivable* finding on the repo for its stale-after period (roughly 30 days), not
+   a token bound to one finding or one forge snapshot (invariant #4). So "a later
+   waivable regression is waived at Enable" is #66's intended behavior, present with
+   or without the race, not a defect this flow introduces.
+2. Enable stays the authoritative, live-evaluated gate (invariant #6): it re-runs
+   the guard, and `protection_unreadable` (which a transient forge outage fails
+   closed to) is never waived, override or not. A regression that makes protection
+   unverifiable is therefore still a hard block.
+
+Closing the window fully would require a forge-state-bound or one-shot override,
+which re-architects #66 and contradicts invariant #4; if that trade is ever wanted
+it belongs in a follow-up that revisits #66, not here. The approve-time
+revalidation stays as a best-effort hygiene step that dismisses definitively-moot
+requests, not as the safety boundary.
