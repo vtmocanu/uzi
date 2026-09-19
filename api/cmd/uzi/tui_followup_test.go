@@ -18,7 +18,7 @@ import (
 // the lowercased status), i.e. glyph "·" and word "awaiting_followup", so both assertions
 // fail. The word must NOT be "needs input" (awaiting_input's) either.
 func TestStateGlyphWordAwaitingFollowup(t *testing.T) {
-	glyph, word := stateGlyphWord("awaiting_followup", "", false, false)
+	glyph, word := stateGlyphWord("awaiting_followup", "", false, false, "")
 	if glyph != "➤" {
 		t.Errorf("awaiting_followup glyph = %q, want %q", glyph, "➤")
 	}
@@ -27,7 +27,7 @@ func TestStateGlyphWordAwaitingFollowup(t *testing.T) {
 	}
 	// A distinct glyph from the neighbouring parks, so the spine reads three different
 	// states under NO_COLOR where colour cannot tell them apart.
-	if inputGlyph, _ := stateGlyphWord("awaiting_input", "", false, false); glyph == inputGlyph {
+	if inputGlyph, _ := stateGlyphWord("awaiting_input", "", false, false, ""); glyph == inputGlyph {
 		t.Errorf("awaiting_followup and awaiting_input share glyph %q — they must be distinguishable without colour", glyph)
 	}
 }

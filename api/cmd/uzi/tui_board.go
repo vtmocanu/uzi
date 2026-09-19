@@ -132,7 +132,7 @@ func (b *boardState) visible() []apitypes.RunListItemDTO {
 			// #321 hides) plus the human word, so a user can filter by either "awaiting_approval"
 			// or "plan gate". The truly-raw r.Status is deliberately NOT included: it would let
 			// "running" match a planning run again, the exact thing #321 fixed.
-			_, word := stateGlyphWord(r.Status, r.Health, r.IsPlanning, r.IsRevising, strOr(r.RecoveryWaitCause, ""))
+			_, word := stateGlyphWord(r.Status, r.Health, r.IsPlanning, r.IsRevising, r.LandingState, strOr(r.RecoveryWaitCause, ""))
 			hay := strings.ToLower(strings.Join([]string{
 				r.ID, r.Kind, effectiveRunStatus(r.Status, r.IsPlanning, r.IsRevising),
 				word, r.Health, cellText(runTitle(r.RunDTO)),
@@ -589,7 +589,7 @@ func (m tuiModel) versionClientOnly() string {
 
 const (
 	boardIDWidth         = 8  // short run id (first 8 of the UUID)
-	boardStatusWordWidth = 12 // status word cell (fits the longest words, "rate-limited" / "near timeout")
+	boardStatusWordWidth = 14 // status word cell; fits the 13-rune longest words ("recovery wait" / "needs landing", issue #1418) with a column of breathing room
 	boardAgeWidth        = 4  // AGE cell (relAge, single-unit)
 	boardMileWidth       = 9  // milestone micro-bar cell (up to boardMileCap ▰/▱ cells, or done/total | –/N text above that)
 	boardMileCap         = 9  // above this many milestones the micro-bar falls back to N/M text

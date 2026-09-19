@@ -249,6 +249,25 @@ func renderRunRecoverySummary(ctx context.Context, env Env, gf *globalFlags, c u
 	}
 }
 
+// renderLandingHint appends the issue #1418 human-landing hint to `uzi run get`'s human output,
+// printed ONLY when the run's server-derived landing_state is "needs_landing" — a failed run
+// whose committed work is human-landable. It is a one-line pointer to `uzi run export`, mirroring
+// the recover-with-export idiom the custody-hold list uses (run_recovery.go): the capture id(s)
+// this points at are already surfaced by the recovery-summary block above, so this adds only the
+// gated hint, never new capture-fetch plumbing.
+//
+// Every other run — including a failed run whose landing_state is "unrecoverable" or "none", and
+// every non-failed run — prints nothing, so ordinary `run get` output is byte-for-byte unchanged.
+// run.ID is a server UUID (safe), sanitized defensively for consistency with the sibling hint.
+func renderLandingHint(env Env, gf *globalFlags, run apitypes.RunDTO) {
+	if run.LandingState != landingStateNeedsLanding {
+		return
+	}
+	p := env.printer(gf)
+	p.Printf("\nthis failed run's committed work is landable by hand: recover it with `uzi run export %s`\n",
+		sanitizeTTY(run.ID))
+}
+
 // recoverySummaryLines is the metadata-only recovery block for `uzi run get` (PRD #1296 D7):
 // a RECOVERY header with the capture count + per-state tally, then one line per available
 // capture (id, source SHA, size) so the owner knows what `uzi run export --capture` can

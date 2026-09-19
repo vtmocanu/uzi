@@ -113,6 +113,57 @@ func TestRenderAdminUsageZeroFinished(t *testing.T) {
 	}
 }
 
+// TestRenderAdminUsageNeedsLanding covers the issue #1418 CLI parity: the needs-landing sub-cut
+// of the `failed` bucket rides inline beside the failed figure — "failed=N (K need landing)" on
+// the factory line and the same parenthetical in the per-user FAILED cell — shown only when the
+// sub-cut is positive, and never as a new column (the header stays EMAIL RUNS FAILED FAIL% ...).
+func TestRenderAdminUsageNeedsLanding(t *testing.T) {
+	u := apitypes.AdminUsageDTO{
+		Factory: apitypes.SelfUsageDTO{
+			Lifetime: apitypes.UsageDTO{InputTokens: 1000, OutputTokens: 300, CostUSD: 12.34},
+			RunCount: 38,
+			Outcomes: apitypes.RunOutcomeWindowsDTO{
+				Lifetime: apitypes.RunOutcomesDTO{Finished: 1024, Failed: 106, NeedsLanding: 7},
+			},
+		},
+		Users: []apitypes.AdminUserUsageDTO{
+			{
+				Email:    "alice@example.com",
+				Usage:    apitypes.UsageDTO{InputTokens: 500, OutputTokens: 150, CostUSD: 6.00},
+				RunCount: 20,
+				Outcomes: apitypes.RunOutcomesDTO{Finished: 200, Failed: 40, NeedsLanding: 3},
+			},
+			{
+				// A user with failures but none human-landable: the FAILED cell is a bare count.
+				Email:    "bob@example.com",
+				Usage:    apitypes.UsageDTO{InputTokens: 10, OutputTokens: 5, CostUSD: 1.00},
+				RunCount: 5,
+				Outcomes: apitypes.RunOutcomesDTO{Finished: 5, Failed: 2, NeedsLanding: 0},
+			},
+		},
+	}
+
+	out := renderUsageToString(t, u)
+
+	// Factory line: the failed figure carries the inline sub-cut.
+	if !strings.Contains(out, "failed=106 (7 need landing)") {
+		t.Errorf("factory line missing inline needs-landing sub-cut \"failed=106 (7 need landing)\":\n%s", out)
+	}
+	// The header must NOT gain a column — the split rides the FAILED cell, not a new field.
+	header := firstHeaderLine(t, out)
+	wantOrder := []string{"EMAIL", "RUNS", "FAILED", "FAIL%", "INPUT", "OUTPUT", "COST"}
+	if got := strings.Fields(header); !equalStringSlices(got, wantOrder) {
+		t.Errorf("table header = %v, want %v (no new column)\nheader line: %q", got, wantOrder, header)
+	}
+	// alice's FAILED cell carries the sub-cut; bob's (zero landing) stays a bare count.
+	if alice := lineWith(t, out, "alice@example.com"); !strings.Contains(alice, "40 (3 need landing)") {
+		t.Errorf("alice FAILED cell missing \"40 (3 need landing)\": %q", alice)
+	}
+	if bob := lineWith(t, out, "bob@example.com"); strings.Contains(bob, "need landing") {
+		t.Errorf("bob has zero needs-landing and must show a bare FAILED count, got: %q", bob)
+	}
+}
+
 // firstHeaderLine returns the table header line (the first line beginning with EMAIL).
 func firstHeaderLine(t *testing.T, out string) string {
 	t.Helper()

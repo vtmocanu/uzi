@@ -65,7 +65,7 @@ func newAdminCmd(env Env, gf *globalFlags) *cobra.Command {
 			}
 			rows := make([][]string, 0, len(rs))
 			for _, r := range rs {
-				rows = append(rows, []string{r.ID, strOr(r.OwnerEmail, "-"), r.Kind, r.TriggerSource, effectiveRunStatus(r.Status, r.IsPlanning, r.IsRevising), runTitle(r.RunDTO)})
+				rows = append(rows, []string{r.ID, strOr(r.OwnerEmail, "-"), r.Kind, r.TriggerSource, displayRunStatus(r.Status, r.IsPlanning, r.IsRevising, r.LandingState), runTitle(r.RunDTO)})
 			}
 			return p.Table([]string{"ID", "OWNER", "KIND", "TRIGGER", "STATUS", "TITLE"}, rows)
 		},
@@ -602,6 +602,20 @@ func failRate(failed, finished int64) string {
 	return fmt.Sprintf("%.1f%%", float64(failed)/float64(finished)*100)
 }
 
+// failedFigure renders the failed count with the needs-landing sub-cut appended when any of
+// those failed runs is human-landable (issue #1418): "106" normally, "106 (3 need landing)"
+// when needs_landing > 0. This is the CLI twin of the dashboard splitting the `failed` bar into
+// "failed" and "failed, needs landing". needs_landing is a SUBSET of failed (needs_landing <=
+// failed), never a new denominator member, so it rides beside the figure rather than as a
+// separate column; the clause is emit-only-when-positive, keeping the common no-landing case
+// terse and every existing zero-landing row byte-for-byte unchanged.
+func failedFigure(failed, needsLanding int64) string {
+	if needsLanding > 0 {
+		return fmt.Sprintf("%d (%d need landing)", failed, needsLanding)
+	}
+	return fmt.Sprintf("%d", failed)
+}
+
 // renderAdminUsage prints the factory lifetime totals plus the per-user breakdown.
 // The factory line and the per-user table carry the PRD #1293 failed-run figures
 // (lifetime), mirroring the web column order (D8): Runs · Failed · Fail rate come
@@ -609,9 +623,12 @@ func failRate(failed, finished int64) string {
 func renderAdminUsage(p *uzicli.Printer, u apitypes.AdminUsageDTO) error {
 	lt := u.Factory.Lifetime
 	lo := u.Factory.Outcomes.Lifetime
-	p.Printf("factory (lifetime): input=%d cache_read=%d cache_creation=%d output=%d cost=$%.2f (runs=%d) finished=%d failed=%d fail_rate=%s\n",
+	// failed carries the needs-landing sub-cut inline (issue #1418): "failed=106" normally,
+	// "failed=106 (3 need landing)" when some failed runs are human-landable — the CLI half of
+	// the dashboard's failed-bar split, terse and appended only when needs_landing > 0.
+	p.Printf("factory (lifetime): input=%d cache_read=%d cache_creation=%d output=%d cost=$%.2f (runs=%d) finished=%d failed=%s fail_rate=%s\n",
 		lt.InputTokens, lt.CacheReadTokens, lt.CacheCreationTokens, lt.OutputTokens, lt.CostUSD, u.Factory.RunCount,
-		lo.Finished, lo.Failed, failRate(lo.Failed, lo.Finished))
+		lo.Finished, failedFigure(lo.Failed, lo.NeedsLanding), failRate(lo.Failed, lo.Finished))
 	if len(u.Users) == 0 {
 		return nil
 	}
@@ -621,7 +638,9 @@ func renderAdminUsage(p *uzicli.Printer, u apitypes.AdminUsageDTO) error {
 		rows = append(rows, []string{
 			row.Email,
 			fmt.Sprintf("%d", row.RunCount),
-			fmt.Sprintf("%d", row.Outcomes.Failed),
+			// FAILED carries the same inline needs-landing sub-cut as the factory line, so the
+			// per-user row and the total read the split the same way (no new column).
+			failedFigure(row.Outcomes.Failed, row.Outcomes.NeedsLanding),
 			failRate(row.Outcomes.Failed, row.Outcomes.Finished),
 			fmt.Sprintf("%d", row.Usage.InputTokens),
 			fmt.Sprintf("%d", row.Usage.OutputTokens),

@@ -74,7 +74,9 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 		{"TRIGGER", r.TriggerSource},
 		// RunDTO carries no is_revising (issue #750): the detail page keeps its own
 		// derivePlanRevision panel, so revising is never surfaced through this helper here.
-		{"STATUS", effectiveRunStatus(r.Status, r.IsPlanning, false)},
+		// displayRunStatus (issue #1418) additionally reads "needs landing" for a failed run
+		// whose landing_state is needs_landing; every other status is unchanged.
+		{"STATUS", displayRunStatus(r.Status, r.IsPlanning, false, r.LandingState)},
 		{"TITLE", runTitle(r)},
 		{"BRANCH", strOr(r.Branch, "-")},
 		{mrAbbrev(r.ForgeType), int64Or(r.MrIID, "-")},

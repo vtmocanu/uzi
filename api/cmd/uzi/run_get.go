@@ -34,7 +34,7 @@ func newRunListCmd(env Env, gf *globalFlags) *cobra.Command {
 			rows := make([][]string, 0, len(runs))
 			now := time.Now()
 			for _, r := range runs {
-				rows = append(rows, []string{r.ID, r.Kind, effectiveRunStatus(r.Status, r.IsPlanning, r.IsRevising), runAgeCell(r.RunDTO, now), runTitle(r.RunDTO)})
+				rows = append(rows, []string{r.ID, r.Kind, displayRunStatus(r.Status, r.IsPlanning, r.IsRevising, r.LandingState), runAgeCell(r.RunDTO, now), runTitle(r.RunDTO)})
 			}
 			return p.Table([]string{"ID", "KIND", "STATUS", "AGE", "TITLE"}, rows)
 		},
@@ -78,6 +78,11 @@ func newRunGetCmd(env Env, gf *globalFlags) *cobra.Command {
 			// appended after the detail block. It NEVER widens raw access and prints nothing
 			// when the run has no recovery content, so an ordinary run's output is unchanged.
 			renderRunRecoverySummary(cmd.Context(), env, gf, c, run)
+			// The human-landing hint (issue #1418): a one-line pointer to `uzi run export`,
+			// shown ONLY for a failed run whose landing_state is "needs_landing" — i.e. its
+			// committed work is human-landable and the recovery-summary block above already
+			// surfaced the capture id(s). Every other run prints nothing here.
+			renderLandingHint(env, gf, run)
 			return nil
 		},
 	}

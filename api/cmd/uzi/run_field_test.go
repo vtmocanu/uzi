@@ -135,6 +135,25 @@ func TestRunGetFieldOverrideSubagentModel(t *testing.T) {
 	}
 }
 
+// The server-derived landing bucket (issue #1418) is a top-level string scalar on RunDTO, so
+// `--field landing_state` prints it raw (unquoted, one line) with NO CLI change — printRunFields
+// marshals the live DTO and looks it up by JSON tag. This pins that read surface.
+func TestRunGetFieldLandingState(t *testing.T) {
+	fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{
+		"nl": {ID: "nl", Status: "failed", LandingState: "needs_landing"},
+	}}
+	stdout, stderr, code := runCLI(t, fakeEnv(fc), "run", "get", "nl", "--field", "landing_state")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, stderr)
+	}
+	if stdout != "needs_landing\n" {
+		t.Errorf("stdout = %q, want raw \"needs_landing\\n\" (unquoted, one line)", stdout)
+	}
+	if strings.Contains(stdout, `"`) {
+		t.Errorf("landing_state must be unquoted, got %q", stdout)
+	}
+}
+
 func TestRunGetFieldUnknownIsUsageError(t *testing.T) {
 	_, stderr, code := runCLI(t, fakeEnv(fieldFake()), "run", "get", "r1", "--field", "nope")
 	if code != uzicli.ExitUsage {
