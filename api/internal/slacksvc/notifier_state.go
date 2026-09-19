@@ -18,6 +18,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // The run-state DM seam (PRDs #25/#122/#268): handle turns a run-state transition
@@ -748,8 +749,17 @@ func renderThreadBlocks(rc store.GetSlackRunContextRow, base string) (blocks []s
 		if reason == "run cancelled" {
 			return cancelledThreadBlocks(linkElem), fmt.Sprintf("Cancelled · %s#%d", repo, iid(rc.IssueIid)), true
 		}
-		blocks = []slack.Block{threadSectionBlock("❌ *Failed*")}
-		fallback = fmt.Sprintf("Failed · %s#%d", repo, iid(rc.IssueIid))
+		// issue #1418: a failed run whose committed work is human-landable reads
+		// "❌ *Failed — needs landing*", mirroring the completed arm's scope-capped suffix.
+		// unrecoverable/none fail exactly as before (plain "Failed").
+		section := "❌ *Failed*"
+		fallbackHead := "Failed"
+		if slackLandingState(rc) == workersvc.LandingStateNeedsLanding {
+			section = "❌ *Failed — needs landing*"
+			fallbackHead = "Failed (needs landing)"
+		}
+		blocks = []slack.Block{threadSectionBlock(section)}
+		fallback = fmt.Sprintf("%s · %s#%d", fallbackHead, repo, iid(rc.IssueIid))
 		if reason != "" {
 			esc := EscapeMrkdwn(ScrubSecrets(boundReason(reason)))
 			blocks = append(blocks, threadSectionBlock(esc))
@@ -865,6 +875,21 @@ func limitWaitDetail(rc store.GetSlackRunContextRow) string {
 	return b.String()
 }
 
+// slackLandingState derives the run's landing_state bucket (issue #1418) from the Slack
+// context row, via the ONE server-side derivation (workersvc.DeriveLandingState) — slacksvc
+// never re-derives the human-landable set. Compose-time note: a no-preserved_patch run's
+// recovery capture may still be uploading when this fires, so such a run can read
+// "unrecoverable" here and settle to needs_landing later; the web/CLI re-derive live on each
+// view. slacksvc reflects compose-time truth — an accepted, documented behaviour, not a bug.
+func slackLandingState(rc store.GetSlackRunContextRow) string {
+	var fo *string
+	if rc.FailOrigin.Valid {
+		v := rc.FailOrigin.String
+		fo = &v
+	}
+	return workersvc.DeriveLandingState(fo, rc.HasPreservedPatch, rc.HasAvailableCapture)
+}
+
 // statusGlyph is the canonical (emoji, label) pair for a run's status on the root line
 // (PRD #268 M2). Every glyph is emoji-presentation so the DM reads consistently beside
 // the full-color ✅ ❌ 🚫. The MR ref is NOT inlined into the completed label — the MR
@@ -905,6 +930,12 @@ func statusGlyph(rc store.GetSlackRunContextRow) (emoji, label string) {
 	case "failed":
 		if strings.TrimSpace(rc.FailureReason.String) == "run cancelled" {
 			return "🚫", "Cancelled"
+		}
+		// issue #1418: name the "needs landing" bucket on the root/DM status line when the
+		// failed run's committed work is human-landable; keep the ❌ glyph. unrecoverable/none
+		// read as plain "Failed", exactly as before.
+		if slackLandingState(rc) == workersvc.LandingStateNeedsLanding {
+			return "❌", "Failed — needs landing"
 		}
 		return "❌", "Failed"
 	case "cancelled":
