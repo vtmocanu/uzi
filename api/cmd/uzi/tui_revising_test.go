@@ -21,7 +21,7 @@ import (
 // no effect. Reddening mutation: drop the "revising" case from stateGlyphWord → an
 // awaiting_approval+is_revising run renders ⚑ / "plan gate", so both assertions fail.
 func TestStateGlyphWordRevising(t *testing.T) {
-	glyph, word := stateGlyphWord("awaiting_approval", "", false, true)
+	glyph, word := stateGlyphWord("awaiting_approval", "", false, true, "")
 	if glyph != "↻" {
 		t.Errorf("revising glyph = %q, want %q", glyph, "↻")
 	}
@@ -29,11 +29,11 @@ func TestStateGlyphWordRevising(t *testing.T) {
 		t.Errorf("revising word = %q, want %q (must not be the awaiting_approval plan-gate label)", word, "revising")
 	}
 	// A distinct glyph from the plan gate, so the spine reads the two apart under NO_COLOR.
-	if gateGlyph, _ := stateGlyphWord("awaiting_approval", "", false, false); glyph == gateGlyph {
+	if gateGlyph, _ := stateGlyphWord("awaiting_approval", "", false, false, ""); glyph == gateGlyph {
 		t.Errorf("revising and the plan gate share glyph %q — they must be distinguishable without colour", glyph)
 	}
 	// is_revising is gated on awaiting_approval: it has no effect on any other status.
-	if _, w := stateGlyphWord("running", "", false, true); w != "running" {
+	if _, w := stateGlyphWord("running", "", false, true, ""); w != "running" {
 		t.Errorf("is_revising leaked onto a running run: word = %q, want %q", w, "running")
 	}
 }

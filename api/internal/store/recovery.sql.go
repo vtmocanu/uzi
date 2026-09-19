@@ -1187,3 +1187,25 @@ func (q *Queries) ReserveCaptureExact(ctx context.Context, arg ReserveCaptureExa
 	)
 	return i, err
 }
+
+const runHasAvailableCapture = `-- name: RunHasAvailableCapture :one
+SELECT EXISTS (
+    SELECT 1 FROM recovery_captures c
+    WHERE c.run_id = $1 AND c.user_id = $2 AND c.state = 'available'
+)::boolean
+`
+
+type RunHasAvailableCaptureParams struct {
+	RunID  uuid.UUID `json:"run_id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+// issue #1418: does this run (owner-scoped) have a recovery capture ready to export? The
+// needs_landing derivation's capture half; keyed on the run's OWNER, riding
+// idx_recovery_captures_run_owner (run_id, user_id).
+func (q *Queries) RunHasAvailableCapture(ctx context.Context, arg RunHasAvailableCaptureParams) (bool, error) {
+	row := q.db.QueryRow(ctx, runHasAvailableCapture, arg.RunID, arg.UserID)
+	var column_1 bool
+	err := row.Scan(&column_1)
+	return column_1, err
+}

@@ -543,7 +543,14 @@ SELECT sqlc.embed(r), rp.path_with_namespace AS repo_path, w.name AS worker_name
        ru.cache_read_tokens      AS usage_cache_read_tokens,
        ru.cache_creation_tokens  AS usage_cache_creation_tokens,
        ru.output_tokens          AS usage_output_tokens,
-       ru.cost_usd               AS usage_cost_usd
+       ru.cost_usd               AS usage_cost_usd,
+       -- issue #1418: does this run have an available recovery capture to export? The
+       -- capture half of the read-path landing_state derivation (workersvc.DeriveLandingState),
+       -- owner-scoped and riding idx_recovery_captures_run_owner (run_id, user_id). The
+       -- correlated EXISTS is cast to boolean so sqlc types it as a usable bool (an uncast
+       -- EXISTS types as interface{}); the inner alias c is the subquery's recovery_captures,
+       -- distinct from the outer forge_connections c.
+       (EXISTS (SELECT 1 FROM recovery_captures c WHERE c.run_id = r.id AND c.user_id = r.user_id AND c.state = 'available'))::boolean AS has_available_capture
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 JOIN forge_connections c ON c.id = rp.connection_id   -- forge_type for the per-run MR/PR noun (PRD #65 D2); every repo has a connection
@@ -4189,36 +4196,80 @@ ORDER BY cost_usd DESC, output_tokens DESC, u.id;
 
 -- name: SelfRunOutcomes :one
 -- The requesting user's own run outcome counts for BOTH windows (PRD #1293 M1).
+-- created_at/user_id are qualified runs.* because the needs_landing correlated subquery
+-- brings recovery_captures (which also has created_at/user_id) into the analyzer's scope
+-- (issue #1418); status/fail_origin/preserved_patch are unique to runs, so they stay bare.
 SELECT
     count(*)::bigint                                                                       AS lifetime_finished,
     count(*) FILTER (WHERE status = 'completed')::bigint                                   AS lifetime_completed,
     count(*) FILTER (WHERE status = 'cancelled')::bigint                                   AS lifetime_cancelled,
     count(*) FILTER (WHERE status = 'failed' AND fail_origin = 'plan_rejected')::bigint    AS lifetime_plan_rejected,
     count(*) FILTER (WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected')::bigint AS lifetime_failed,
-    count(*) FILTER (WHERE created_at >= now() - interval '7 days')::bigint                AS last7_finished,
-    count(*) FILTER (WHERE status = 'completed' AND created_at >= now() - interval '7 days')::bigint AS last7_completed,
-    count(*) FILTER (WHERE status = 'cancelled' AND created_at >= now() - interval '7 days')::bigint AS last7_cancelled,
-    count(*) FILTER (WHERE status = 'failed' AND fail_origin = 'plan_rejected' AND created_at >= now() - interval '7 days')::bigint AS last7_plan_rejected,
-    count(*) FILTER (WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected' AND created_at >= now() - interval '7 days')::bigint AS last7_failed
+    count(*) FILTER (WHERE runs.created_at >= now() - interval '7 days')::bigint           AS last7_finished,
+    count(*) FILTER (WHERE status = 'completed' AND runs.created_at >= now() - interval '7 days')::bigint AS last7_completed,
+    count(*) FILTER (WHERE status = 'cancelled' AND runs.created_at >= now() - interval '7 days')::bigint AS last7_cancelled,
+    count(*) FILTER (WHERE status = 'failed' AND fail_origin = 'plan_rejected' AND runs.created_at >= now() - interval '7 days')::bigint AS last7_plan_rejected,
+    count(*) FILTER (WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected' AND runs.created_at >= now() - interval '7 days')::bigint AS last7_failed,
+    -- needs_landing (issue #1418): the SUB-CUT of the `failed` count whose per-run
+    -- landing_state derives to needs_landing (workersvc.DeriveLandingState) — a human-landable
+    -- fail_origin (@landable_origins, the Go-owned set, never spelled here) whose committed work
+    -- is recoverable (an available recovery capture, owner-scoped on idx_recovery_captures_run_owner,
+    -- OR a preserved_patch). The correlated EXISTS resolves to the OUTER `runs` row; a JOIN would
+    -- fan out and corrupt the sibling counts, so it stays a subquery.
+    count(*) FILTER (
+        WHERE status = 'failed'
+          AND fail_origin = ANY(@landable_origins::text[])
+          AND (EXISTS (SELECT 1 FROM recovery_captures c
+                       WHERE c.run_id = runs.id AND c.user_id = runs.user_id AND c.state = 'available')
+               OR preserved_patch IS NOT NULL)
+    )::bigint AS lifetime_needs_landing,
+    count(*) FILTER (
+        WHERE status = 'failed'
+          AND fail_origin = ANY(@landable_origins::text[])
+          AND (EXISTS (SELECT 1 FROM recovery_captures c
+                       WHERE c.run_id = runs.id AND c.user_id = runs.user_id AND c.state = 'available')
+               OR preserved_patch IS NOT NULL)
+          AND runs.created_at >= now() - interval '7 days'
+    )::bigint AS last7_needs_landing
 FROM runs
-WHERE user_id = @user_id
+WHERE runs.user_id = @user_id
   AND status IN ('completed', 'failed', 'cancelled')
   AND kind NOT IN ('chat', 'judge');
 
 -- name: AdminRunOutcomes :one
 -- Factory-wide run outcome counts for BOTH windows (PRD #1293 M1); same shape as
--- SelfRunOutcomes without the user filter.
+-- SelfRunOutcomes without the user filter. created_at is qualified runs.* because the
+-- needs_landing correlated subquery brings recovery_captures (also has created_at) into
+-- the analyzer's scope (issue #1418); status/fail_origin/preserved_patch stay bare.
 SELECT
     count(*)::bigint                                                                       AS lifetime_finished,
     count(*) FILTER (WHERE status = 'completed')::bigint                                   AS lifetime_completed,
     count(*) FILTER (WHERE status = 'cancelled')::bigint                                   AS lifetime_cancelled,
     count(*) FILTER (WHERE status = 'failed' AND fail_origin = 'plan_rejected')::bigint    AS lifetime_plan_rejected,
     count(*) FILTER (WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected')::bigint AS lifetime_failed,
-    count(*) FILTER (WHERE created_at >= now() - interval '7 days')::bigint                AS last7_finished,
-    count(*) FILTER (WHERE status = 'completed' AND created_at >= now() - interval '7 days')::bigint AS last7_completed,
-    count(*) FILTER (WHERE status = 'cancelled' AND created_at >= now() - interval '7 days')::bigint AS last7_cancelled,
-    count(*) FILTER (WHERE status = 'failed' AND fail_origin = 'plan_rejected' AND created_at >= now() - interval '7 days')::bigint AS last7_plan_rejected,
-    count(*) FILTER (WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected' AND created_at >= now() - interval '7 days')::bigint AS last7_failed
+    count(*) FILTER (WHERE runs.created_at >= now() - interval '7 days')::bigint           AS last7_finished,
+    count(*) FILTER (WHERE status = 'completed' AND runs.created_at >= now() - interval '7 days')::bigint AS last7_completed,
+    count(*) FILTER (WHERE status = 'cancelled' AND runs.created_at >= now() - interval '7 days')::bigint AS last7_cancelled,
+    count(*) FILTER (WHERE status = 'failed' AND fail_origin = 'plan_rejected' AND runs.created_at >= now() - interval '7 days')::bigint AS last7_plan_rejected,
+    count(*) FILTER (WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected' AND runs.created_at >= now() - interval '7 days')::bigint AS last7_failed,
+    -- needs_landing (issue #1418): SUB-CUT of `failed`; see SelfRunOutcomes for the shape.
+    -- @landable_origins is the Go-owned human-landable set; the correlated EXISTS resolves to
+    -- the OUTER `runs` row (no JOIN, which would corrupt the sibling counts).
+    count(*) FILTER (
+        WHERE status = 'failed'
+          AND fail_origin = ANY(@landable_origins::text[])
+          AND (EXISTS (SELECT 1 FROM recovery_captures c
+                       WHERE c.run_id = runs.id AND c.user_id = runs.user_id AND c.state = 'available')
+               OR preserved_patch IS NOT NULL)
+    )::bigint AS lifetime_needs_landing,
+    count(*) FILTER (
+        WHERE status = 'failed'
+          AND fail_origin = ANY(@landable_origins::text[])
+          AND (EXISTS (SELECT 1 FROM recovery_captures c
+                       WHERE c.run_id = runs.id AND c.user_id = runs.user_id AND c.state = 'available')
+               OR preserved_patch IS NOT NULL)
+          AND runs.created_at >= now() - interval '7 days'
+    )::bigint AS last7_needs_landing
 FROM runs
 WHERE status IN ('completed', 'failed', 'cancelled')
   AND kind NOT IN ('chat', 'judge');
@@ -4233,7 +4284,18 @@ SELECT u.id AS user_id, u.email,
     count(*) FILTER (WHERE r.status = 'completed')::bigint                                 AS completed,
     count(*) FILTER (WHERE r.status = 'cancelled')::bigint                                 AS cancelled,
     count(*) FILTER (WHERE r.status = 'failed' AND r.fail_origin = 'plan_rejected')::bigint AS plan_rejected,
-    count(*) FILTER (WHERE r.status = 'failed' AND r.fail_origin IS DISTINCT FROM 'plan_rejected')::bigint AS failed
+    count(*) FILTER (WHERE r.status = 'failed' AND r.fail_origin IS DISTINCT FROM 'plan_rejected')::bigint AS failed,
+    -- needs_landing (issue #1418): SUB-CUT of `failed`; see SelfRunOutcomes for the shape.
+    -- Lifetime-only, matching this query's other lifetime-only counts. The alias here is `r`,
+    -- so the correlated EXISTS resolves to the OUTER `r` row (no JOIN — that would corrupt the
+    -- sibling per-user counts).
+    count(*) FILTER (
+        WHERE r.status = 'failed'
+          AND r.fail_origin = ANY(@landable_origins::text[])
+          AND (EXISTS (SELECT 1 FROM recovery_captures c
+                       WHERE c.run_id = r.id AND c.user_id = r.user_id AND c.state = 'available')
+               OR r.preserved_patch IS NOT NULL)
+    )::bigint AS needs_landing
 FROM runs r
 JOIN users u ON u.id = r.user_id
 WHERE r.status IN ('completed', 'failed', 'cancelled')

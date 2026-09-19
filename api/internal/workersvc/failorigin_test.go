@@ -212,6 +212,85 @@ func TestAllFailOriginsIsNotAliasable(t *testing.T) {
 	}
 }
 
+// TestHumanLandableFailOriginsExact pins humanLandableFailOrigins to its EXACT membership
+// (issue #1418): the finalize-time publish failures whose committed work a human can land.
+// An accidental add or drop (which would silently widen or narrow the needs_landing surface)
+// reddens here. assertFailOriginSetExact additionally proves every member is a real stored
+// fail_origin, so the set is a STRICT SUBSET of the vocabulary.
+func TestHumanLandableFailOriginsExact(t *testing.T) {
+	assertFailOriginSetExact(t, "humanLandableFailOrigins", humanLandableFailOrigins,
+		"finalize_base_align_conflict", "workflow_scope_missing", "push_secret_blocked", "history_rewritten")
+}
+
+// TestAllHumanLandableFailOrigins pins the SQL-bind-array accessor (issue #1418): it returns
+// exactly the human-landable set, in failOrigins source order, and — mirroring
+// TestAllFailOriginsIsNotAliasable — as a FRESH slice one caller's append cannot clobber.
+func TestAllHumanLandableFailOrigins(t *testing.T) {
+	got := AllHumanLandableFailOrigins()
+	// Membership matches the map exactly.
+	if len(got) != len(humanLandableFailOrigins) {
+		t.Fatalf("AllHumanLandableFailOrigins len = %d, want %d", len(got), len(humanLandableFailOrigins))
+	}
+	for _, o := range got {
+		if !humanLandableFailOrigins[o] {
+			t.Errorf("AllHumanLandableFailOrigins returned %q, not in the human-landable set", o)
+		}
+	}
+	// Source order: the returned order is the order those members appear in failOrigins.
+	var wantOrder []string
+	for _, o := range AllFailOrigins() {
+		if humanLandableFailOrigins[o] {
+			wantOrder = append(wantOrder, o)
+		}
+	}
+	if strings.Join(got, ",") != strings.Join(wantOrder, ",") {
+		t.Fatalf("AllHumanLandableFailOrigins order = %v, want failOrigins source order %v", got, wantOrder)
+	}
+	// Fresh slice: mutating the result must not affect a later call.
+	if len(got) > 0 {
+		got[0] = "clobbered"
+		if AllHumanLandableFailOrigins()[0] == "clobbered" {
+			t.Fatal("AllHumanLandableFailOrigins returns an aliasable view")
+		}
+	}
+}
+
+// TestDeriveLandingState is the exhaustive truth table for the ONE landing_state derivation
+// (issue #1418): EVERY origin in the vocabulary × hasPreservedPatch × hasAvailableCapture,
+// plus the nil-failOrigin case. Expected: none if the origin is not human-landable (or nil);
+// else needs_landing if (patch || capture) else unrecoverable.
+func TestDeriveLandingState(t *testing.T) {
+	// nil fail_origin is always none, regardless of the availability facts.
+	for _, patch := range []bool{false, true} {
+		for _, capture := range []bool{false, true} {
+			if got := DeriveLandingState(nil, patch, capture); got != LandingStateNone {
+				t.Errorf("DeriveLandingState(nil, patch=%t, capture=%t) = %q, want %q",
+					patch, capture, got, LandingStateNone)
+			}
+		}
+	}
+	for _, origin := range AllFailOrigins() {
+		landable := IsHumanLandableFailOrigin(origin)
+		for _, patch := range []bool{false, true} {
+			for _, capture := range []bool{false, true} {
+				want := LandingStateNone
+				if landable {
+					if patch || capture {
+						want = LandingStateNeedsLanding
+					} else {
+						want = LandingStateUnrecoverable
+					}
+				}
+				o := origin
+				if got := DeriveLandingState(&o, patch, capture); got != want {
+					t.Errorf("DeriveLandingState(%q, patch=%t, capture=%t) = %q, want %q",
+						origin, patch, capture, got, want)
+				}
+			}
+		}
+	}
+}
+
 // TestSetStateFailedStampsReportedOrigin: a worker-reported `failed` with an explicit,
 // in-set fail_origin stamps THAT class onto runs.fail_origin (PRD #69 M7a (5)).
 func TestSetStateFailedStampsReportedOrigin(t *testing.T) {

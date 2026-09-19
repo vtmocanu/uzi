@@ -96,6 +96,15 @@ SELECT
 FROM recovery_captures c
 WHERE c.run_id = @run_id AND c.user_id = @user_id;
 
+-- name: RunHasAvailableCapture :one
+-- issue #1418: does this run (owner-scoped) have a recovery capture ready to export? The
+-- needs_landing derivation's capture half; keyed on the run's OWNER, riding
+-- idx_recovery_captures_run_owner (run_id, user_id).
+SELECT EXISTS (
+    SELECT 1 FROM recovery_captures c
+    WHERE c.run_id = @run_id AND c.user_id = @user_id AND c.state = 'available'
+)::boolean;
+
 -- name: ReleaseCustodyHold :execrows
 -- D3: the PER-HOLD RELEASE mechanism. Nulls both live FKs (dropping the ON DELETE RESTRICT
 -- that blocks worker/run teardown), flips state to 'released' and stamps released_at, for the

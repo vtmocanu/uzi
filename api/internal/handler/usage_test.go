@@ -33,17 +33,20 @@ type usageBody struct {
 }
 
 // outcomesBody is the decoded shape of a RunOutcomesDTO (PRD #1293 failed-run rate).
+// needs_landing is the issue #1418 sub-cut of failed.
 type outcomesBody struct {
 	Finished     int64            `json:"finished"`
 	Completed    int64            `json:"completed"`
 	Cancelled    int64            `json:"cancelled"`
 	PlanRejected int64            `json:"plan_rejected"`
 	Failed       int64            `json:"failed"`
+	NeedsLanding int64            `json:"needs_landing"`
 	FailOrigins  map[string]int64 `json:"fail_origins"`
 }
 
-// assertOutcomeInvariants pins the two PRD #1293 contract invariants on a decoded window:
-// finished == completed+cancelled+plan_rejected+failed, and sum(fail_origins) == failed.
+// assertOutcomeInvariants pins the PRD #1293 / issue #1418 contract invariants on a decoded
+// window: finished == completed+cancelled+plan_rejected+failed, sum(fail_origins) == failed,
+// and needs_landing <= failed (it is a sub-cut of failed, not a new denominator member).
 func assertOutcomeInvariants(t *testing.T, name string, o outcomesBody) {
 	t.Helper()
 	if got := o.Completed + o.Cancelled + o.PlanRejected + o.Failed; got != o.Finished {
@@ -59,6 +62,9 @@ func assertOutcomeInvariants(t *testing.T, name string, o outcomesBody) {
 	if o.FailOrigins == nil {
 		t.Fatalf("%s: fail_origins must be a non-nil map (marshals {} not null)", name)
 	}
+	if o.NeedsLanding > o.Failed {
+		t.Fatalf("%s: needs_landing=%d must be <= failed=%d (a sub-cut of failed)", name, o.NeedsLanding, o.Failed)
+	}
 }
 
 func TestSelfUsageReturnsScopedTotals(t *testing.T) {
@@ -71,9 +77,12 @@ func TestSelfUsageReturnsScopedTotals(t *testing.T) {
 			RunCount: 3,
 		},
 		// PRD #1293 outcomes: lifetime 80+5+3+12=100 finished; last7 15+1+1+3=20 finished.
+		// issue #1418: needs_landing is a sub-cut of failed (4 of the 12 lifetime, 1 of 3 last7).
 		selfRunOutcomes: store.SelfRunOutcomesRow{
 			LifetimeFinished: 100, LifetimeCompleted: 80, LifetimeCancelled: 5, LifetimePlanRejected: 3, LifetimeFailed: 12,
-			Last7Finished: 20, Last7Completed: 15, Last7Cancelled: 1, Last7PlanRejected: 1, Last7Failed: 3,
+			LifetimeNeedsLanding: 4,
+			Last7Finished:        20, Last7Completed: 15, Last7Cancelled: 1, Last7PlanRejected: 1, Last7Failed: 3,
+			Last7NeedsLanding: 1,
 		},
 		// Per-origin causes: lifetime sums to 12 (=failed), last7 sums to 3 (=failed); a
 		// NULL origin arrives from the query already bucketed as "unknown".
@@ -122,6 +131,9 @@ func TestSelfUsageReturnsScopedTotals(t *testing.T) {
 	if lt.Finished != 100 || lt.Completed != 80 || lt.Cancelled != 5 || lt.PlanRejected != 3 || lt.Failed != 12 {
 		t.Fatalf("lifetime outcomes wrong: %+v", lt)
 	}
+	if lt.NeedsLanding != 4 {
+		t.Fatalf("lifetime needs_landing = %d, want 4 (sub-cut of failed)", lt.NeedsLanding)
+	}
 	if lt.FailOrigins["agent_failure"] != 8 || lt.FailOrigins["run_timeout"] != 3 || lt.FailOrigins["unknown"] != 1 {
 		t.Fatalf("lifetime fail_origins wrong: %+v", lt.FailOrigins)
 	}
@@ -129,6 +141,9 @@ func TestSelfUsageReturnsScopedTotals(t *testing.T) {
 	l7 := body.Outcomes.Last7Days
 	if l7.Finished != 20 || l7.Failed != 3 {
 		t.Fatalf("last7 outcomes wrong: %+v", l7)
+	}
+	if l7.NeedsLanding != 1 {
+		t.Fatalf("last7 needs_landing = %d, want 1 (sub-cut of failed)", l7.NeedsLanding)
 	}
 	if l7.FailOrigins["agent_failure"] != 2 || l7.FailOrigins["run_timeout"] != 1 {
 		t.Fatalf("last7 fail_origins wrong: %+v", l7.FailOrigins)
@@ -161,9 +176,12 @@ func TestAdminUsageShapesFactoryAndUsers(t *testing.T) {
 			{UserID: lightID, Email: "light@x", InputTokens: 300, OutputTokens: 100, CostUsd: numericFor(0.10), RunCount: 1},
 		},
 		// PRD #1293 factory outcomes: lifetime 150+10+5+35=200; last7 30+2+1+7=40.
+		// issue #1418: needs_landing is a sub-cut of failed (11 of 35 lifetime, 2 of 7 last7).
 		adminRunOutcomes: store.AdminRunOutcomesRow{
 			LifetimeFinished: 200, LifetimeCompleted: 150, LifetimeCancelled: 10, LifetimePlanRejected: 5, LifetimeFailed: 35,
-			Last7Finished: 40, Last7Completed: 30, Last7Cancelled: 2, Last7PlanRejected: 1, Last7Failed: 7,
+			LifetimeNeedsLanding: 11,
+			Last7Finished:        40, Last7Completed: 30, Last7Cancelled: 2, Last7PlanRejected: 1, Last7Failed: 7,
+			Last7NeedsLanding: 2,
 		},
 		adminRunOutcomeOrigins: []store.AdminRunOutcomeOriginsRow{
 			{WindowTag: "lifetime", Origin: "agent_failure", Cnt: 20},
@@ -177,8 +195,8 @@ func TestAdminUsageShapesFactoryAndUsers(t *testing.T) {
 		// broken is OUTCOME-ONLY (no usage row) so it must be APPENDED after the cost-sorted
 		// usage rows with zero usage (D5). Order in the slice is heavy, broken (light omitted).
 		adminRunOutcomesPerUser: []store.AdminRunOutcomesPerUserRow{
-			{UserID: heavyID, Email: "heavy@x", Finished: 120, Completed: 100, Cancelled: 5, PlanRejected: 3, Failed: 12},
-			{UserID: brokenID, Email: "broken@x", Finished: 30, Completed: 10, Cancelled: 2, PlanRejected: 1, Failed: 17},
+			{UserID: heavyID, Email: "heavy@x", Finished: 120, Completed: 100, Cancelled: 5, PlanRejected: 3, Failed: 12, NeedsLanding: 4},
+			{UserID: brokenID, Email: "broken@x", Finished: 30, Completed: 10, Cancelled: 2, PlanRejected: 1, Failed: 17, NeedsLanding: 7},
 		},
 		adminRunOutcomeOriginsPerUser: []store.AdminRunOutcomeOriginsPerUserRow{
 			{UserID: heavyID, Origin: "agent_failure", Cnt: 10},
@@ -220,6 +238,13 @@ func TestAdminUsageShapesFactoryAndUsers(t *testing.T) {
 	if fl.Finished != 200 || fl.Failed != 35 || fl.PlanRejected != 5 {
 		t.Fatalf("factory lifetime outcomes wrong: %+v", fl)
 	}
+	// issue #1418: needs_landing flows through both windows as a sub-cut of failed.
+	if fl.NeedsLanding != 11 {
+		t.Fatalf("factory lifetime needs_landing = %d, want 11", fl.NeedsLanding)
+	}
+	if body.Factory.Outcomes.Last7Days.NeedsLanding != 2 {
+		t.Fatalf("factory last7 needs_landing = %d, want 2", body.Factory.Outcomes.Last7Days.NeedsLanding)
+	}
 	if fl.FailOrigins["agent_failure"] != 20 || fl.FailOrigins["unknown"] != 5 {
 		t.Fatalf("factory lifetime fail_origins wrong: %+v", fl.FailOrigins)
 	}
@@ -253,6 +278,9 @@ func TestAdminUsageShapesFactoryAndUsers(t *testing.T) {
 	if heavy.Outcomes.Finished != 120 || heavy.Outcomes.Failed != 12 {
 		t.Fatalf("heavy outcomes wrong: %+v", heavy.Outcomes)
 	}
+	if heavy.Outcomes.NeedsLanding != 4 {
+		t.Fatalf("heavy needs_landing = %d, want 4 (sub-cut of failed)", heavy.Outcomes.NeedsLanding)
+	}
 	if heavy.Outcomes.FailOrigins["agent_failure"] != 10 || heavy.Outcomes.FailOrigins["run_timeout"] != 2 {
 		t.Fatalf("heavy fail_origins wrong: %+v", heavy.Outcomes.FailOrigins)
 	}
@@ -275,6 +303,9 @@ func TestAdminUsageShapesFactoryAndUsers(t *testing.T) {
 	}
 	if broken.Outcomes.Finished != 30 || broken.Outcomes.Failed != 17 {
 		t.Fatalf("broken outcomes wrong: %+v", broken.Outcomes)
+	}
+	if broken.Outcomes.NeedsLanding != 7 {
+		t.Fatalf("broken needs_landing = %d, want 7 (sub-cut of failed)", broken.Outcomes.NeedsLanding)
 	}
 	if broken.Outcomes.FailOrigins["unknown"] != 17 {
 		t.Fatalf("broken fail_origins should bucket NULL as unknown=17, got %+v", broken.Outcomes.FailOrigins)

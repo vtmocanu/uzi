@@ -205,7 +205,7 @@ beforeEach(() => {
 const zeros = () => ({ input_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0, output_tokens: 0, cost_usd: 0 });
 // PRD #1293: zero outcomes keep the failed-runs block hidden (finished===0), so these
 // usage fixtures leave the existing "nothing yet" / card assertions unchanged.
-const zeroOutcomes = () => ({ finished: 0, completed: 0, cancelled: 0, plan_rejected: 0, failed: 0, fail_origins: {} });
+const zeroOutcomes = () => ({ finished: 0, completed: 0, cancelled: 0, plan_rejected: 0, failed: 0, needs_landing: 0, fail_origins: {} });
 const zeroOutcomeWindows = () => ({ lifetime: zeroOutcomes(), last_7_days: zeroOutcomes() });
 function emptySelf() {
   return { lifetime: zeros(), last_7_days: zeros(), run_count: 0, outcomes: zeroOutcomeWindows() };

@@ -818,6 +818,13 @@ Tracked as GitHub issue vtmocanu/uzi#1393; PRD at `prds/1391-worker-outbox-durab
 - The dashboard shows a failed-run percentage: global for admins, per user for everyone, and per user in the admin table. [user 2026-09-12]
 - In the admin per-user table the Failed and Fail rate columns come right after Runs, and Cost sits last before Share. [user 2026-09-12]
 
+## Feature #1418 — "Needs landing" bucket for failed runs whose work is human-landable
+
+- A failed run whose committed work is still human-landable surfaces a secondary "needs landing" presentation bucket (`landing_state`), derived server-side from the run's `fail_origin` and whether its work is recoverable (a preserved diff or an available durable-recovery archive). The four human-landable origins are the publish-time failures `finalize_base_align_conflict`, `workflow_scope_missing`, `push_secret_blocked`, and `history_rewritten`. [AI-synced 2026-09-19, #1418]
+- The bucket renders everywhere a run is shown: the web run list and run page, the TUI, `uzi run list` / `uzi run get`, the failed-run-rate dashboard (the failed bar splits into "failed" and "failed, needs landing" at the same total), and the Slack run-finished copy. [AI-synced 2026-09-19, #1418]
+- These runs still count as failures — they extend, not amend, the #1293 failed-run rate (the factory did not publish its output). [AI-synced 2026-09-19, #1418]
+- The judge skips retrospecting the environment-caused subset (`finalize_base_align_conflict`, `workflow_scope_missing`, `push_secret_blocked`); `history_rewritten` stays judge-eligible as an agent defect. [AI-synced 2026-09-19, #1418]
+
 ## Startup admin seed
 
 - Seed an admin user from env at startup (`UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME`) so the user survives DB wipes.

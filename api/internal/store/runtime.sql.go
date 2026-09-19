@@ -104,11 +104,29 @@ SELECT
     count(*) FILTER (WHERE status = 'cancelled')::bigint                                   AS lifetime_cancelled,
     count(*) FILTER (WHERE status = 'failed' AND fail_origin = 'plan_rejected')::bigint    AS lifetime_plan_rejected,
     count(*) FILTER (WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected')::bigint AS lifetime_failed,
-    count(*) FILTER (WHERE created_at >= now() - interval '7 days')::bigint                AS last7_finished,
-    count(*) FILTER (WHERE status = 'completed' AND created_at >= now() - interval '7 days')::bigint AS last7_completed,
-    count(*) FILTER (WHERE status = 'cancelled' AND created_at >= now() - interval '7 days')::bigint AS last7_cancelled,
-    count(*) FILTER (WHERE status = 'failed' AND fail_origin = 'plan_rejected' AND created_at >= now() - interval '7 days')::bigint AS last7_plan_rejected,
-    count(*) FILTER (WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected' AND created_at >= now() - interval '7 days')::bigint AS last7_failed
+    count(*) FILTER (WHERE runs.created_at >= now() - interval '7 days')::bigint           AS last7_finished,
+    count(*) FILTER (WHERE status = 'completed' AND runs.created_at >= now() - interval '7 days')::bigint AS last7_completed,
+    count(*) FILTER (WHERE status = 'cancelled' AND runs.created_at >= now() - interval '7 days')::bigint AS last7_cancelled,
+    count(*) FILTER (WHERE status = 'failed' AND fail_origin = 'plan_rejected' AND runs.created_at >= now() - interval '7 days')::bigint AS last7_plan_rejected,
+    count(*) FILTER (WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected' AND runs.created_at >= now() - interval '7 days')::bigint AS last7_failed,
+    -- needs_landing (issue #1418): SUB-CUT of ` + "`" + `failed` + "`" + `; see SelfRunOutcomes for the shape.
+    -- @landable_origins is the Go-owned human-landable set; the correlated EXISTS resolves to
+    -- the OUTER ` + "`" + `runs` + "`" + ` row (no JOIN, which would corrupt the sibling counts).
+    count(*) FILTER (
+        WHERE status = 'failed'
+          AND fail_origin = ANY($1::text[])
+          AND (EXISTS (SELECT 1 FROM recovery_captures c
+                       WHERE c.run_id = runs.id AND c.user_id = runs.user_id AND c.state = 'available')
+               OR preserved_patch IS NOT NULL)
+    )::bigint AS lifetime_needs_landing,
+    count(*) FILTER (
+        WHERE status = 'failed'
+          AND fail_origin = ANY($1::text[])
+          AND (EXISTS (SELECT 1 FROM recovery_captures c
+                       WHERE c.run_id = runs.id AND c.user_id = runs.user_id AND c.state = 'available')
+               OR preserved_patch IS NOT NULL)
+          AND runs.created_at >= now() - interval '7 days'
+    )::bigint AS last7_needs_landing
 FROM runs
 WHERE status IN ('completed', 'failed', 'cancelled')
   AND kind NOT IN ('chat', 'judge')
@@ -125,12 +143,16 @@ type AdminRunOutcomesRow struct {
 	Last7Cancelled       int64 `json:"last7_cancelled"`
 	Last7PlanRejected    int64 `json:"last7_plan_rejected"`
 	Last7Failed          int64 `json:"last7_failed"`
+	LifetimeNeedsLanding int64 `json:"lifetime_needs_landing"`
+	Last7NeedsLanding    int64 `json:"last7_needs_landing"`
 }
 
 // Factory-wide run outcome counts for BOTH windows (PRD #1293 M1); same shape as
-// SelfRunOutcomes without the user filter.
-func (q *Queries) AdminRunOutcomes(ctx context.Context) (AdminRunOutcomesRow, error) {
-	row := q.db.QueryRow(ctx, adminRunOutcomes)
+// SelfRunOutcomes without the user filter. created_at is qualified runs.* because the
+// needs_landing correlated subquery brings recovery_captures (also has created_at) into
+// the analyzer's scope (issue #1418); status/fail_origin/preserved_patch stay bare.
+func (q *Queries) AdminRunOutcomes(ctx context.Context, landableOrigins []string) (AdminRunOutcomesRow, error) {
+	row := q.db.QueryRow(ctx, adminRunOutcomes, landableOrigins)
 	var i AdminRunOutcomesRow
 	err := row.Scan(
 		&i.LifetimeFinished,
@@ -143,6 +165,8 @@ func (q *Queries) AdminRunOutcomes(ctx context.Context) (AdminRunOutcomesRow, er
 		&i.Last7Cancelled,
 		&i.Last7PlanRejected,
 		&i.Last7Failed,
+		&i.LifetimeNeedsLanding,
+		&i.Last7NeedsLanding,
 	)
 	return i, err
 }
@@ -153,7 +177,18 @@ SELECT u.id AS user_id, u.email,
     count(*) FILTER (WHERE r.status = 'completed')::bigint                                 AS completed,
     count(*) FILTER (WHERE r.status = 'cancelled')::bigint                                 AS cancelled,
     count(*) FILTER (WHERE r.status = 'failed' AND r.fail_origin = 'plan_rejected')::bigint AS plan_rejected,
-    count(*) FILTER (WHERE r.status = 'failed' AND r.fail_origin IS DISTINCT FROM 'plan_rejected')::bigint AS failed
+    count(*) FILTER (WHERE r.status = 'failed' AND r.fail_origin IS DISTINCT FROM 'plan_rejected')::bigint AS failed,
+    -- needs_landing (issue #1418): SUB-CUT of ` + "`" + `failed` + "`" + `; see SelfRunOutcomes for the shape.
+    -- Lifetime-only, matching this query's other lifetime-only counts. The alias here is ` + "`" + `r` + "`" + `,
+    -- so the correlated EXISTS resolves to the OUTER ` + "`" + `r` + "`" + ` row (no JOIN — that would corrupt the
+    -- sibling per-user counts).
+    count(*) FILTER (
+        WHERE r.status = 'failed'
+          AND r.fail_origin = ANY($1::text[])
+          AND (EXISTS (SELECT 1 FROM recovery_captures c
+                       WHERE c.run_id = r.id AND c.user_id = r.user_id AND c.state = 'available')
+               OR r.preserved_patch IS NOT NULL)
+    )::bigint AS needs_landing
 FROM runs r
 JOIN users u ON u.id = r.user_id
 WHERE r.status IN ('completed', 'failed', 'cancelled')
@@ -170,14 +205,15 @@ type AdminRunOutcomesPerUserRow struct {
 	Cancelled    int64     `json:"cancelled"`
 	PlanRejected int64     `json:"plan_rejected"`
 	Failed       int64     `json:"failed"`
+	NeedsLanding int64     `json:"needs_landing"`
 }
 
 // Per-user LIFETIME outcome counts for the admin factory breakdown (PRD #1293 M1, D5).
 // Joins users so an outcome-only user (every run died before spending, so no usage row)
 // still has an email to render; the handler merges this by user id against the usage
 // rows. Lifetime-only, matching the admin per-user table's lifetime figures.
-func (q *Queries) AdminRunOutcomesPerUser(ctx context.Context) ([]AdminRunOutcomesPerUserRow, error) {
-	rows, err := q.db.Query(ctx, adminRunOutcomesPerUser)
+func (q *Queries) AdminRunOutcomesPerUser(ctx context.Context, landableOrigins []string) ([]AdminRunOutcomesPerUserRow, error) {
+	rows, err := q.db.Query(ctx, adminRunOutcomesPerUser, landableOrigins)
 	if err != nil {
 		return nil, err
 	}
@@ -193,6 +229,7 @@ func (q *Queries) AdminRunOutcomesPerUser(ctx context.Context) ([]AdminRunOutcom
 			&i.Cancelled,
 			&i.PlanRejected,
 			&i.Failed,
+			&i.NeedsLanding,
 		); err != nil {
 			return nil, err
 		}
@@ -6292,7 +6329,14 @@ SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_descripti
        ru.cache_read_tokens      AS usage_cache_read_tokens,
        ru.cache_creation_tokens  AS usage_cache_creation_tokens,
        ru.output_tokens          AS usage_output_tokens,
-       ru.cost_usd               AS usage_cost_usd
+       ru.cost_usd               AS usage_cost_usd,
+       -- issue #1418: does this run have an available recovery capture to export? The
+       -- capture half of the read-path landing_state derivation (workersvc.DeriveLandingState),
+       -- owner-scoped and riding idx_recovery_captures_run_owner (run_id, user_id). The
+       -- correlated EXISTS is cast to boolean so sqlc types it as a usable bool (an uncast
+       -- EXISTS types as interface{}); the inner alias c is the subquery's recovery_captures,
+       -- distinct from the outer forge_connections c.
+       (EXISTS (SELECT 1 FROM recovery_captures c WHERE c.run_id = r.id AND c.user_id = r.user_id AND c.state = 'available'))::boolean AS has_available_capture
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 JOIN forge_connections c ON c.id = rp.connection_id   -- forge_type for the per-run MR/PR noun (PRD #65 D2); every repo has a connection
@@ -6334,6 +6378,7 @@ type ListRunsForUserRow struct {
 	UsageCacheCreationTokens pgtype.Int8    `json:"usage_cache_creation_tokens"`
 	UsageOutputTokens        pgtype.Int8    `json:"usage_output_tokens"`
 	UsageCostUsd             pgtype.Numeric `json:"usage_cost_usd"`
+	HasAvailableCapture      bool           `json:"has_available_capture"`
 }
 
 // The user's runs, newest first (Runs index + Agents-status "your runs"), joined
@@ -6534,6 +6579,7 @@ func (q *Queries) ListRunsForUser(ctx context.Context, arg ListRunsForUserParams
 			&i.UsageCacheCreationTokens,
 			&i.UsageOutputTokens,
 			&i.UsageCostUsd,
+			&i.HasAvailableCapture,
 		); err != nil {
 			return nil, err
 		}
@@ -9425,16 +9471,42 @@ SELECT
     count(*) FILTER (WHERE status = 'cancelled')::bigint                                   AS lifetime_cancelled,
     count(*) FILTER (WHERE status = 'failed' AND fail_origin = 'plan_rejected')::bigint    AS lifetime_plan_rejected,
     count(*) FILTER (WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected')::bigint AS lifetime_failed,
-    count(*) FILTER (WHERE created_at >= now() - interval '7 days')::bigint                AS last7_finished,
-    count(*) FILTER (WHERE status = 'completed' AND created_at >= now() - interval '7 days')::bigint AS last7_completed,
-    count(*) FILTER (WHERE status = 'cancelled' AND created_at >= now() - interval '7 days')::bigint AS last7_cancelled,
-    count(*) FILTER (WHERE status = 'failed' AND fail_origin = 'plan_rejected' AND created_at >= now() - interval '7 days')::bigint AS last7_plan_rejected,
-    count(*) FILTER (WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected' AND created_at >= now() - interval '7 days')::bigint AS last7_failed
+    count(*) FILTER (WHERE runs.created_at >= now() - interval '7 days')::bigint           AS last7_finished,
+    count(*) FILTER (WHERE status = 'completed' AND runs.created_at >= now() - interval '7 days')::bigint AS last7_completed,
+    count(*) FILTER (WHERE status = 'cancelled' AND runs.created_at >= now() - interval '7 days')::bigint AS last7_cancelled,
+    count(*) FILTER (WHERE status = 'failed' AND fail_origin = 'plan_rejected' AND runs.created_at >= now() - interval '7 days')::bigint AS last7_plan_rejected,
+    count(*) FILTER (WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected' AND runs.created_at >= now() - interval '7 days')::bigint AS last7_failed,
+    -- needs_landing (issue #1418): the SUB-CUT of the ` + "`" + `failed` + "`" + ` count whose per-run
+    -- landing_state derives to needs_landing (workersvc.DeriveLandingState) — a human-landable
+    -- fail_origin (@landable_origins, the Go-owned set, never spelled here) whose committed work
+    -- is recoverable (an available recovery capture, owner-scoped on idx_recovery_captures_run_owner,
+    -- OR a preserved_patch). The correlated EXISTS resolves to the OUTER ` + "`" + `runs` + "`" + ` row; a JOIN would
+    -- fan out and corrupt the sibling counts, so it stays a subquery.
+    count(*) FILTER (
+        WHERE status = 'failed'
+          AND fail_origin = ANY($1::text[])
+          AND (EXISTS (SELECT 1 FROM recovery_captures c
+                       WHERE c.run_id = runs.id AND c.user_id = runs.user_id AND c.state = 'available')
+               OR preserved_patch IS NOT NULL)
+    )::bigint AS lifetime_needs_landing,
+    count(*) FILTER (
+        WHERE status = 'failed'
+          AND fail_origin = ANY($1::text[])
+          AND (EXISTS (SELECT 1 FROM recovery_captures c
+                       WHERE c.run_id = runs.id AND c.user_id = runs.user_id AND c.state = 'available')
+               OR preserved_patch IS NOT NULL)
+          AND runs.created_at >= now() - interval '7 days'
+    )::bigint AS last7_needs_landing
 FROM runs
-WHERE user_id = $1
+WHERE runs.user_id = $2
   AND status IN ('completed', 'failed', 'cancelled')
   AND kind NOT IN ('chat', 'judge')
 `
+
+type SelfRunOutcomesParams struct {
+	LandableOrigins []string  `json:"landable_origins"`
+	UserID          uuid.UUID `json:"user_id"`
+}
 
 type SelfRunOutcomesRow struct {
 	LifetimeFinished     int64 `json:"lifetime_finished"`
@@ -9447,6 +9519,8 @@ type SelfRunOutcomesRow struct {
 	Last7Cancelled       int64 `json:"last7_cancelled"`
 	Last7PlanRejected    int64 `json:"last7_plan_rejected"`
 	Last7Failed          int64 `json:"last7_failed"`
+	LifetimeNeedsLanding int64 `json:"lifetime_needs_landing"`
+	Last7NeedsLanding    int64 `json:"last7_needs_landing"`
 }
 
 // Failed-run rate outcome aggregates (PRD #1293 M1) -------------------------
@@ -9463,8 +9537,11 @@ type SelfRunOutcomesRow struct {
 // convention). Invariants the handler/live-DB tests assert:
 // finished == completed + cancelled + plan_rejected + failed.
 // The requesting user's own run outcome counts for BOTH windows (PRD #1293 M1).
-func (q *Queries) SelfRunOutcomes(ctx context.Context, userID uuid.UUID) (SelfRunOutcomesRow, error) {
-	row := q.db.QueryRow(ctx, selfRunOutcomes, userID)
+// created_at/user_id are qualified runs.* because the needs_landing correlated subquery
+// brings recovery_captures (which also has created_at/user_id) into the analyzer's scope
+// (issue #1418); status/fail_origin/preserved_patch are unique to runs, so they stay bare.
+func (q *Queries) SelfRunOutcomes(ctx context.Context, arg SelfRunOutcomesParams) (SelfRunOutcomesRow, error) {
+	row := q.db.QueryRow(ctx, selfRunOutcomes, arg.LandableOrigins, arg.UserID)
 	var i SelfRunOutcomesRow
 	err := row.Scan(
 		&i.LifetimeFinished,
@@ -9477,6 +9554,8 @@ func (q *Queries) SelfRunOutcomes(ctx context.Context, userID uuid.UUID) (SelfRu
 		&i.Last7Cancelled,
 		&i.Last7PlanRejected,
 		&i.Last7Failed,
+		&i.LifetimeNeedsLanding,
+		&i.Last7NeedsLanding,
 	)
 	return i, err
 }

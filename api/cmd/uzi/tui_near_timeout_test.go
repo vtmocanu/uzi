@@ -16,14 +16,14 @@ import (
 // through unchanged. This is the color-independent core; the render test below proves the
 // word survives on the actual board and detail surfaces.
 func TestStateGlyphWordSlowReadsNearTimeout(t *testing.T) {
-	if g, w := stateGlyphWord("running", "slow", false, false); g != "▲" || w != "near timeout" {
+	if g, w := stateGlyphWord("running", "slow", false, false, ""); g != "▲" || w != "near timeout" {
 		t.Fatalf("stateGlyphWord(running, slow) = (%q, %q), want (\"▲\", \"near timeout\")", g, w)
 	}
 	// The other WARN flags still read their own word (the map only remaps slow).
-	if _, w := stateGlyphWord("running", "stalled", false, false); w != "stalled" {
+	if _, w := stateGlyphWord("running", "stalled", false, false, ""); w != "stalled" {
 		t.Errorf("stateGlyphWord(running, stalled) word = %q, want \"stalled\"", w)
 	}
-	if _, w := stateGlyphWord("running", "looping", false, false); w != "looping" {
+	if _, w := stateGlyphWord("running", "looping", false, false, ""); w != "looping" {
 		t.Errorf("stateGlyphWord(running, looping) word = %q, want \"looping\"", w)
 	}
 	// displayHealth is the shared map, so the CLI HEALTH row and the token cannot drift.

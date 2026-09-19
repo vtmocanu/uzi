@@ -17,6 +17,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 type fakeNotifStore struct {
@@ -1504,6 +1505,78 @@ func TestRenderThreadBlocksScopeCappedCompletion(t *testing.T) {
 	}
 }
 
+// issue #1418: a failed run whose committed work is human-landable (a human-landable
+// fail_origin AND a preserved_patch OR an available recovery capture) threads
+// "❌ *Failed — needs landing*", mirroring the scope-capped completion suffix, and flags
+// the bucket in its fallback. An unrecoverable failure (landable origin, neither patch nor
+// capture) and a plain failure (non-landable origin) both keep the plain "❌ *Failed*"
+// shape. A run-cancelled failure still routes to the cancelled copy, untouched.
+//
+// Reddening mutation: drop the needs_landing suffix from renderThreadBlocks' failed arm →
+// the two needs_landing rows fail on both section and fallback.
+func TestRenderThreadBlocksNeedsLanding(t *testing.T) {
+	// Pin the premises: the origins these cases lean on must sit on the right side of the
+	// human-landable line, so a future change to that set fails here loudly, not silently.
+	if !workersvc.IsHumanLandableFailOrigin("workflow_scope_missing") ||
+		!workersvc.IsHumanLandableFailOrigin("push_secret_blocked") {
+		t.Fatal("test premise: workflow_scope_missing and push_secret_blocked must be human-landable")
+	}
+	if workersvc.IsHumanLandableFailOrigin("agent_failure") {
+		t.Fatal("test premise: agent_failure must NOT be human-landable")
+	}
+
+	// needs_landing via a preserved_patch: landable origin + HasPreservedPatch.
+	needsLandingPatch := baseRun("failed")
+	needsLandingPatch.FailOrigin = txt("workflow_scope_missing")
+	needsLandingPatch.HasPreservedPatch = true
+
+	// needs_landing via an available capture: landable origin + HasAvailableCapture, no patch.
+	needsLandingCapture := baseRun("failed")
+	needsLandingCapture.FailOrigin = txt("push_secret_blocked")
+	needsLandingCapture.HasAvailableCapture = true
+
+	// unrecoverable: landable origin, but neither patch nor capture → plain Failed.
+	unrecoverable := baseRun("failed")
+	unrecoverable.FailOrigin = txt("workflow_scope_missing")
+
+	// plain failure: a non-landable origin (even with a preserved_patch) → plain Failed.
+	plainFailed := baseRun("failed")
+	plainFailed.FailOrigin = txt("agent_failure")
+	plainFailed.HasPreservedPatch = true
+
+	// a cancelled failure still routes to the cancelled copy, needs_landing inputs or not.
+	cancelledLandable := baseRun("failed")
+	cancelledLandable.FailureReason = txt("run cancelled")
+	cancelledLandable.FailOrigin = txt("workflow_scope_missing")
+	cancelledLandable.HasPreservedPatch = true
+
+	for _, tc := range []struct {
+		name         string
+		rc           store.GetSlackRunContextRow
+		wantSection  string
+		wantFallback string
+	}{
+		{"needs-landing-patch", needsLandingPatch, "❌ *Failed — needs landing*", "Failed (needs landing) · grp/repo#42"},
+		{"needs-landing-capture", needsLandingCapture, "❌ *Failed — needs landing*", "Failed (needs landing) · grp/repo#42"},
+		{"unrecoverable", unrecoverable, "❌ *Failed*", "Failed · grp/repo#42"},
+		{"plain-failed-non-landable", plainFailed, "❌ *Failed*", "Failed · grp/repo#42"},
+		{"cancelled-still-cancelled", cancelledLandable, "🚫 *Cancelled*", "Cancelled · grp/repo#42"},
+	} {
+		blocks, fallback, ok := renderThreadBlocks(tc.rc, "https://uzi.example")
+		if !ok {
+			t.Errorf("%s: ok=false, want a threaded event", tc.name)
+			continue
+		}
+		_, section := blockSummary(blocks)
+		if section != tc.wantSection {
+			t.Errorf("%s: section = %q, want %q", tc.name, section, tc.wantSection)
+		}
+		if fallback != tc.wantFallback {
+			t.Errorf("%s: fallback = %q, want %q", tc.name, fallback, tc.wantFallback)
+		}
+	}
+}
+
 // PRD #1190: the owner-pause thread event reads "‖ *Paused by you*" and, when the run has
 // published a checkpoint, carries `checkpoint <short>` — the first 7 chars of checkpoint_tip
 // — alongside the `after milestone N` clause and the resume hint. A run that never published
@@ -1862,6 +1935,52 @@ func TestStatusGlyph(t *testing.T) {
 		{"failed", baseRun("failed"), "❌", "Failed"},
 		{"cancelled", baseRun("cancelled"), "🚫", "Cancelled"},
 		{"failed-run-cancelled", failedCancelled, "🚫", "Cancelled"},
+	} {
+		emoji, label := statusGlyph(tc.rc)
+		if emoji != tc.emoji || label != tc.label {
+			t.Errorf("statusGlyph(%s) = (%q, %q), want (%q, %q)", tc.name, emoji, label, tc.emoji, tc.label)
+		}
+	}
+}
+
+// issue #1418: the root/DM status line names the "needs landing" bucket for a failed run
+// whose committed work is human-landable, keeping the ❌ glyph. An unrecoverable failure
+// (landable origin, no patch/capture) and a plain failure (non-landable origin) both read
+// plain "Failed"; a run-cancelled failure still reads "Cancelled".
+//
+// Reddening mutation: drop the needs_landing arm from statusGlyph → the two needs_landing
+// rows fall through to plain "Failed" and fail.
+func TestStatusGlyphNeedsLanding(t *testing.T) {
+	needsLandingPatch := baseRun("failed")
+	needsLandingPatch.FailOrigin = txt("workflow_scope_missing")
+	needsLandingPatch.HasPreservedPatch = true
+
+	needsLandingCapture := baseRun("failed")
+	needsLandingCapture.FailOrigin = txt("push_secret_blocked")
+	needsLandingCapture.HasAvailableCapture = true
+
+	unrecoverable := baseRun("failed")
+	unrecoverable.FailOrigin = txt("workflow_scope_missing")
+
+	plainFailed := baseRun("failed")
+	plainFailed.FailOrigin = txt("agent_failure")
+	plainFailed.HasPreservedPatch = true
+
+	cancelledLandable := baseRun("failed")
+	cancelledLandable.FailureReason = txt("run cancelled")
+	cancelledLandable.FailOrigin = txt("workflow_scope_missing")
+	cancelledLandable.HasPreservedPatch = true
+
+	for _, tc := range []struct {
+		name         string
+		rc           store.GetSlackRunContextRow
+		emoji, label string
+	}{
+		{"needs-landing-patch", needsLandingPatch, "❌", "Failed — needs landing"},
+		{"needs-landing-capture", needsLandingCapture, "❌", "Failed — needs landing"},
+		{"unrecoverable", unrecoverable, "❌", "Failed"},
+		{"plain-failed-non-landable", plainFailed, "❌", "Failed"},
+		{"cancelled-still-cancelled", cancelledLandable, "🚫", "Cancelled"},
 	} {
 		emoji, label := statusGlyph(tc.rc)
 		if emoji != tc.emoji || label != tc.label {

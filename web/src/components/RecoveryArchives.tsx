@@ -107,7 +107,18 @@ export function RecoveryArchivesPanel({ run }: { run: Run }) {
           />
           <ul className="space-y-3">
             {sortedArchives(summary).map((cap) => (
-              <CaptureRow key={cap.id} runId={run.id} capture={cap} onDeleted={reload} />
+              <CaptureRow
+                key={cap.id}
+                runId={run.id}
+                capture={cap}
+                onDeleted={reload}
+                // issue #1418: the `uzi run export` CLI hint is recoverability-aware — it is
+                // gated here on the run's server-derived needs_landing bucket, so an ordinary
+                // recovery-archive render (e.g. a completed run whose captures were retained)
+                // is unchanged. CaptureRow further gates it on an AVAILABLE capture, so the
+                // hint only ever appears beside a capture the export can actually read.
+                showExportHint={run.landing_state === "needs_landing"}
+              />
             ))}
           </ul>
         </>
@@ -124,13 +135,33 @@ function CaptureRow({
   runId,
   capture,
   onDeleted,
+  showExportHint,
 }: {
   runId: string;
   capture: RecoveryArchiveSummary["archives"][number];
   onDeleted: () => void;
+  // issue #1418: render the capture-id + `uzi run export` CLI hint (see below). Gated by the
+  // panel on the run's needs_landing bucket; this row additionally shows it only for an
+  // AVAILABLE (downloadable) capture, so it never appears where export cannot read anything.
+  showExportHint: boolean;
 }) {
   const now = useNow(60_000);
   const view = captureView(capture.state);
+  // The copyable CLI equivalent of the "Export archive" download, for the needs_landing
+  // recovery path. run id and capture id are server UUIDs (safe — not worker-authored, and
+  // used as element ids / React keys elsewhere in this component), so they are rendered as
+  // plain auto-escaped React text; <path> is a literal placeholder the operator fills in.
+  const exportCommand = `uzi run export ${runId} --output <path> --capture ${capture.id}`;
+  const [copied, setCopied] = useState(false);
+  const copyExport = async () => {
+    try {
+      await navigator.clipboard.writeText(exportCommand);
+      setCopied(true);
+    } catch {
+      // Clipboard may be unavailable (insecure context); the command stays visible to copy
+      // by hand, so a failure is silent — mirrors CliTokens' copy handling.
+    }
+  };
   const expiresIn = capture.expires_at ? formatCountdown(capture.expires_at, now) : null;
   // "Delete archive" (D7/D9) is artifact cleanup, distinct from the "Discard held work"
   // hold discard. It is offered only while the archive artifact meaningfully exists — an
@@ -212,6 +243,34 @@ function CaptureRow({
           )}
         </div>
       </div>
+
+      {/* issue #1418: the CLI equivalent of "Export archive", for a needs_landing run. Shown
+          ONLY beside an AVAILABLE capture (view.downloadable) and only when the panel says the
+          run is in the needs_landing bucket — the same recoverability-aware rule the CLI/TUI
+          use (point at `uzi run export` where an available archive exists, at the preserved
+          diff otherwise; the run page renders that preserved_patch inline in the failed hero).
+          run/capture ids are server UUIDs rendered as plain escaped text; <path> is a literal
+          the operator substitutes. */}
+      {showExportHint && view.downloadable && (
+        <div className="mt-3 space-y-2 rounded-md border border-edge bg-surface/60 p-2">
+          <p className="text-xs text-muted">
+            Or export this capture from the command line. Replace{" "}
+            <span className="font-mono text-fg">&lt;path&gt;</span> with where to write the
+            archive:
+          </p>
+          <div className="flex items-center gap-2">
+            <code className="console flex-1 overflow-x-auto rounded-md border border-edge bg-ink px-2 py-1 font-mono text-xs text-fg">
+              {exportCommand}
+            </code>
+            <Button variant="secondary" size="sm" onClick={copyExport}>
+              {copied ? "Copied" : "Copy"}
+            </Button>
+          </div>
+          <p className="text-xs text-faint">
+            Capture id: <span className="font-mono text-muted">{capture.id}</span>
+          </p>
+        </div>
+      )}
 
       {confirming && (
         <div

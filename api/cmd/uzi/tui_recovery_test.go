@@ -20,7 +20,7 @@ import (
 // fail. It shares the wait-family "~" glyph with limit_wait/pool_wait but carries a
 // DISTINCT word so a user can tell the three holds apart at a glance.
 func TestStateGlyphWordRecoveryWait(t *testing.T) {
-	glyph, word := stateGlyphWord(statusRecoveryWait, "", false, false)
+	glyph, word := stateGlyphWord(statusRecoveryWait, "", false, false, "")
 	if glyph != "~" {
 		t.Errorf("recovery_wait glyph = %q, want %q (the shared wait-family glyph)", glyph, "~")
 	}
@@ -28,11 +28,11 @@ func TestStateGlyphWordRecoveryWait(t *testing.T) {
 		t.Errorf("recovery_wait word = %q, want %q (must not be the raw enum)", word, "recovery wait")
 	}
 	// Same wait-family glyph as its sibling holds — the word distinguishes them, not the glyph.
-	if limitGlyph, _ := stateGlyphWord(statusLimitWait, "", false, false); glyph != limitGlyph {
+	if limitGlyph, _ := stateGlyphWord(statusLimitWait, "", false, false, ""); glyph != limitGlyph {
 		t.Errorf("recovery_wait glyph %q differs from limit_wait's %q — the non-terminal holds share one wait glyph", glyph, limitGlyph)
 	}
 	// Distinct WORD from the neighbouring holds, so the spine reads three different states.
-	if _, poolWord := stateGlyphWord(statusPoolWait, "", false, false); word == poolWord {
+	if _, poolWord := stateGlyphWord(statusPoolWait, "", false, false, ""); word == poolWord {
 		t.Errorf("recovery_wait and pool_wait share word %q — they must be distinguishable", word)
 	}
 }
@@ -43,7 +43,7 @@ func TestStateGlyphWordRecoveryWait(t *testing.T) {
 // only the word distinguishes them. Reddening mutation: drop the cause branch in
 // stateGlyphWord → the forge park falls back to "recovery wait" and the first assertion fails.
 func TestStateGlyphWordForgePark(t *testing.T) {
-	glyph, word := stateGlyphWord(statusRecoveryWait, "", false, false, "forge_unreachable")
+	glyph, word := stateGlyphWord(statusRecoveryWait, "", false, false, "", "forge_unreachable")
 	if glyph != "~" {
 		t.Errorf("forge park glyph = %q, want %q (still a wait-family hold)", glyph, "~")
 	}
@@ -51,14 +51,14 @@ func TestStateGlyphWordForgePark(t *testing.T) {
 		t.Errorf("forge park word = %q, want %q", word, "forge wait")
 	}
 	// The empty-turn / null cause keeps the issue #1197 wording.
-	if _, w := stateGlyphWord(statusRecoveryWait, "", false, false, ""); w != "recovery wait" {
+	if _, w := stateGlyphWord(statusRecoveryWait, "", false, false, "", ""); w != "recovery wait" {
 		t.Errorf("empty-cause recovery park word = %q, want %q", w, "recovery wait")
 	}
-	if _, w := stateGlyphWord(statusRecoveryWait, "", false, false); w != "recovery wait" {
+	if _, w := stateGlyphWord(statusRecoveryWait, "", false, false, ""); w != "recovery wait" {
 		t.Errorf("cause-less recovery park word = %q, want %q (the pre-M5 call shape)", w, "recovery wait")
 	}
 	// An unrecognised cause is not the forge one, so it keeps the generic wording.
-	if _, w := stateGlyphWord(statusRecoveryWait, "", false, false, "provider_outage"); w != "recovery wait" {
+	if _, w := stateGlyphWord(statusRecoveryWait, "", false, false, "", "provider_outage"); w != "recovery wait" {
 		t.Errorf("other-cause recovery park word = %q, want %q", w, "recovery wait")
 	}
 	// The forge park still shares the wait ink with its sibling holds (colour unchanged).
@@ -91,7 +91,7 @@ func TestStateColorRecoveryWait(t *testing.T) {
 func TestRecoveryWaitIgnoresStaleHealth(t *testing.T) {
 	for _, health := range []string{"stalled", "looping", "slow"} {
 		t.Run(health, func(t *testing.T) {
-			glyph, word := stateGlyphWord(statusRecoveryWait, health, false, false)
+			glyph, word := stateGlyphWord(statusRecoveryWait, health, false, false, "")
 			if glyph != "~" || word != "recovery wait" {
 				t.Errorf("recovery park with stale %s = (%q, %q), want (~, recovery wait)", health, glyph, word)
 			}
@@ -105,7 +105,7 @@ func TestRecoveryWaitIgnoresStaleHealth(t *testing.T) {
 					t.Errorf("running %s agent, dark=%t lost its stall ink", health, dark)
 				}
 			}
-			if glyph, word := stateGlyphWord("running", health, false, false); glyph != "▲" || word != displayHealth(health) {
+			if glyph, word := stateGlyphWord("running", health, false, false, ""); glyph != "▲" || word != displayHealth(health) {
 				t.Errorf("running %s agent lost its health token: (%q, %q)", health, glyph, word)
 			}
 		})

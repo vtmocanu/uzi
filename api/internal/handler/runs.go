@@ -9,6 +9,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // runListItemDTO (apitypes.RunListItemDTO) and adminWorkerDTO
@@ -105,6 +106,10 @@ func (h *Handler) ListRuns(w http.ResponseWriter, r *http.Request) {
 		item.JudgeTodoCount = todo[row.Run.ID]
 		item.IsRevising = revising[row.Run.ID]      // nil map ⇒ false (issue #750)
 		item.CurrentActivity = activity[row.Run.ID] // nil map ⇒ null (PRD #1064)
+		// issue #1418: override runToDTO's capture-unaware landing_state with the
+		// capture-aware value from the query's has_available_capture column, so the list
+		// read distinguishes needs_landing (a capture exists) from unrecoverable.
+		item.LandingState = workersvc.DeriveLandingState(textPtrValue(row.Run.FailOrigin.Valid, row.Run.FailOrigin.String), row.Run.PreservedPatch.Valid, row.HasAvailableCapture)
 		out = append(out, item)
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"runs": out})

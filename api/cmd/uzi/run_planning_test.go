@@ -63,10 +63,10 @@ func TestPlanningStatusColour(t *testing.T) {
 // TestStatusGlyphPlanning pins the NO_COLOR-safe state glyph (D3): planning is a hollow circle
 // ("nothing committed yet"), distinct from running's filled dot.
 func TestStatusGlyphPlanning(t *testing.T) {
-	if got, _ := stateGlyphWord("running", "", true, false); got != "○" {
+	if got, _ := stateGlyphWord("running", "", true, false, ""); got != "○" {
 		t.Errorf("planning glyph = %q, want %q", got, "○")
 	}
-	if got, _ := stateGlyphWord("running", "", false, false); got != "●" {
+	if got, _ := stateGlyphWord("running", "", false, false, ""); got != "●" {
 		t.Errorf("running glyph = %q, want %q", got, "●")
 	}
 }

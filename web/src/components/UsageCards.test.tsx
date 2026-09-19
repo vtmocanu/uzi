@@ -18,6 +18,8 @@ const bundle = (inp: number, cr: number, out: number, cost: number) => ({
 // A RunOutcomes fixture (PRD #1293), mirroring bundle(): finished, then the four terminal
 // counts, then the fail_origins map. Callers keep the fixture internally consistent
 // (finished === completed + cancelled + planRejected + failed, sum(origins) === failed).
+// needsLanding (issue #1418) is the trailing optional sub-cut of failed (default 0, so the
+// pre-#1418 positional calls compile unchanged); keep needs_landing <= failed.
 const outcomes = (
   finished: number,
   completed: number,
@@ -25,12 +27,14 @@ const outcomes = (
   planRejected: number,
   failed: number,
   origins: Record<string, number> = {},
+  needsLanding = 0,
 ): RunOutcomes => ({
   finished,
   completed,
   cancelled,
   plan_rejected: planRejected,
   failed,
+  needs_landing: needsLanding,
   fail_origins: origins,
 });
 // The empty (nothing-finished) two-window shape, so a fixture that predates PRD #1293 keeps
@@ -209,6 +213,52 @@ describe("FailedRunsBlock (PRD #1293)", () => {
     const { container } = wrap(<YourUsageCard usage={usage} />);
     expect(container.textContent).not.toContain("Failed runs");
     expect(container.querySelector('[role="img"]')).toBeNull();
+  });
+
+  it("splits the failed bar into 'failed' and 'failed, needs landing' (issue #1418)", () => {
+    // failed=10 with needs_landing=4: the plain 'failed' segment reflects 6 (10 - 4) and the
+    // needs-landing sub-cut is its own adjacent segment of 4. finished = 85+3+2+10 = 100.
+    const usage: SelfUsage = {
+      lifetime: bundle(1_000_000, 0, 200_000, 1.23),
+      last_7_days: bundle(100_000, 0, 50_000, 0.5),
+      run_count: 40,
+      outcomes: {
+        lifetime: outcomes(100, 85, 3, 2, 10, { workflow_scope_missing: 4, agent_failure: 6 }, 4),
+        last_7_days: outcomes(38, 33, 1, 1, 3, { agent_failure: 3 }, 0),
+      },
+    };
+    const { container } = wrap(<YourUsageCard usage={usage} />);
+    // The counts sentence and rate keep reading the FULL failed count (10), not the split.
+    expect(container.textContent).toContain("10 of 100 finished runs");
+    expect(container.textContent).toContain("10.0%");
+    // Legend: the plain failed segment reflects 6, and the needs-landing sub-cut its own 4.
+    expect(container.textContent).toContain("failed 6");
+    expect(container.textContent).toContain("failed, needs landing 4");
+    // The aria-label names the new bucket, with the split counts summing back to failed=10.
+    const bar = container.querySelector('[role="img"]');
+    expect(bar?.getAttribute("aria-label")).toBe(
+      "Finished runs: 85 completed, 3 cancelled, 2 plan rejected, 6 failed, 4 failed, needs landing",
+    );
+  });
+
+  it("shows no needs-landing segment when needs_landing === 0 (no zero clutter)", () => {
+    const usage: SelfUsage = {
+      lifetime: bundle(1_000_000, 0, 200_000, 1.23),
+      last_7_days: bundle(100_000, 0, 50_000, 0.5),
+      run_count: 40,
+      outcomes: {
+        lifetime: outcomes(100, 85, 3, 2, 10, { agent_failure: 10 }, 0),
+        last_7_days: outcomes(38, 33, 1, 1, 3, { agent_failure: 3 }, 0),
+      },
+    };
+    const { container } = wrap(<YourUsageCard usage={usage} />);
+    expect(container.textContent).not.toContain("needs landing");
+    // The plain failed segment carries the full failed count when nothing needs landing.
+    expect(container.textContent).toContain("failed 10");
+    const bar = container.querySelector('[role="img"]');
+    expect(bar?.getAttribute("aria-label")).toBe(
+      "Finished runs: 85 completed, 3 cancelled, 2 plan rejected, 10 failed",
+    );
   });
 });
 

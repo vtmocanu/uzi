@@ -1215,3 +1215,50 @@ describe("RunRow Shadow surface attributes (PRD #1167 M4)", () => {
     expect(card.hasAttribute("data-attention")).toBe(false);
   });
 });
+
+// Issue #1418: a `failed` run whose committed work is human-landable reads "needs landing"
+// on the row's status pill instead of "failed" — the server-derived landing_state drives it,
+// and the pill keeps failed's danger tone (asserted in ui.test.tsx). Here we pin the RunsList
+// row's pillStatus DERIVATION: needs_landing → "needs landing", every other landing_state →
+// "failed".
+describe("RunRow — needs-landing status pill (issue #1418)", () => {
+  const renderRow = (over: Partial<RunListItem> = {}) =>
+    render(
+      <MemoryRouter>
+        <ul>
+          <RunRow run={aRun(over)} now={Date.parse("2026-07-05T12:04:00Z")} />
+        </ul>
+      </MemoryRouter>,
+    );
+
+  it("reads 'needs landing' for a failed run in the needs_landing bucket", () => {
+    renderRow({ status: "failed", failure_reason: null, landing_state: "needs_landing" });
+    expect(screen.getByText("needs landing")).toBeTruthy();
+  });
+
+  it("reads 'failed' (never 'needs landing') for a failed run that is unrecoverable", () => {
+    renderRow({ status: "failed", failure_reason: null, landing_state: "unrecoverable" });
+    expect(screen.queryByText("needs landing")).toBeNull();
+    expect(screen.getByText("failed")).toBeTruthy();
+  });
+
+  it("reads 'failed' for a failed run with landing_state 'none'", () => {
+    renderRow({ status: "failed", failure_reason: null, landing_state: "none" });
+    expect(screen.queryByText("needs landing")).toBeNull();
+    expect(screen.getByText("failed")).toBeTruthy();
+  });
+
+  it("does not fire for a stopped run (a HUMAN stop_kind rides 'stopped', never needs_landing)", () => {
+    // isStoppedRun precedence: a `failed` run carrying a human stop_kind is a deliberate stop,
+    // rendered as the calm "stopped" pill — it must never be re-read as needs_landing even if a
+    // landing_state somehow rode along.
+    renderRow({
+      status: "failed",
+      stop_kind: "plan_rejected",
+      failure_reason: null,
+      landing_state: "needs_landing",
+    });
+    expect(screen.queryByText("needs landing")).toBeNull();
+    expect(screen.getByText("stopped")).toBeTruthy();
+  });
+});

@@ -21,7 +21,7 @@ import (
 // apart). MUTATION PROOF: remove the statusPaused arm and the default arm draws "· paused" in
 // faintC, so both the glyph and the colour assertions redden.
 func TestPausedStateGlyphWord(t *testing.T) {
-	glyph, word := stateGlyphWord(statusPaused, "ok", false, false)
+	glyph, word := stateGlyphWord(statusPaused, "ok", false, false, "")
 	if glyph != "‖" || word != "paused" {
 		t.Errorf("stateGlyphWord(paused) = (%q, %q), want (%q, %q)", glyph, word, "‖", "paused")
 	}

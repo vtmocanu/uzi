@@ -257,6 +257,11 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 		// time), surfaced read-only so a diagnosis keys on it instead of failure_reason
 		// free text. Null when the run never set one.
 		FailOrigin: textPtrValue(r.FailOrigin.Valid, r.FailOrigin.String),
+		// issue #1418: the server-derived landing bucket. runToDTO is CAPTURE-UNAWARE
+		// (hasAvailableCapture=false), which is correct for every non-read caller and the
+		// default for the read callers before they overlay the capture-aware value. A
+		// preserved_patch alone is enough to reach needs_landing here.
+		LandingState: workersvc.DeriveLandingState(textPtrValue(r.FailOrigin.Valid, r.FailOrigin.String), r.PreservedPatch.Valid, false),
 		// PRD-link reconciliation (read-only): the path the run declared it archived a
 		// completed PRD to, and when that patch lifecycle settled (null = still pending).
 		PrdDonePath:       textPtrValue(r.PrdDonePath.Valid, r.PrdDonePath.String),
@@ -534,6 +539,21 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 		dto.PipelineWebURL = &url
 	}
 	return dto
+}
+
+// landingStateOverlay resolves the capture-aware landing_state for a single-run detail read
+// (issue #1418). On a capture-lookup error we do NOT know whether an available recovery
+// capture exists, so for a human-landable origin with no preserved_patch — whose
+// capture-unaware seed from runToDTO is "unrecoverable" — we must not emit that definitive
+// "work is lost" state on a transient DB blip. Bias to capture-present so the safe degraded
+// value is the actionable "needs_landing", which points the operator at `uzi run export`
+// (itself the source of truth for capture availability). The run-list path reads the capture
+// fact authoritatively from a joined column and never takes this error branch.
+func landingStateOverlay(failOrigin *string, hasPreservedPatch, hasAvailableCapture bool, lookupErr error) string {
+	if lookupErr != nil {
+		return workersvc.DeriveLandingState(failOrigin, hasPreservedPatch, true)
+	}
+	return workersvc.DeriveLandingState(failOrigin, hasPreservedPatch, hasAvailableCapture)
 }
 
 // runExtensionCapSeconds reads the per-run extension cap (PRD #1189) best-effort for the DTO:

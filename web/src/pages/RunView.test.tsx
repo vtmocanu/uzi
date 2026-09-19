@@ -2108,6 +2108,121 @@ describe("RunView preserved-patch surface (PRD #377)", () => {
   });
 });
 
+// Issue #1418: the run page surfaces a copyable `uzi run export` CLI hint (+ the capture id)
+// beside an AVAILABLE recovery capture, but ONLY for a run in the server-derived needs_landing
+// bucket. It mirrors M4's CLI fix — point at `uzi run export` where an available archive
+// exists, at the preserved diff otherwise (the run page renders preserved_patch inline in the
+// failed hero). So the hint is doubly recoverability-aware: needs_landing AND an available
+// capture. The header pill for such a run reads "needs landing" (issue #1418 part A).
+describe("RunView landing hint (issue #1418)", () => {
+  const EXPORT_CMD = "uzi run export r1 --output <path> --capture cap-ok";
+
+  function archiveSummary(over: Record<string, unknown> = {}) {
+    return {
+      supported: true,
+      legacy: false,
+      has_open_hold: false,
+      counts: {
+        preparing: 0,
+        uploading: 0,
+        available: 0,
+        needs_action: 0,
+        expired: 0,
+        discarded: 0,
+      },
+      archives: [],
+      ...over,
+    };
+  }
+  function availableCapture(over: Record<string, unknown> = {}) {
+    return {
+      id: "cap-ok",
+      run_id: "r1",
+      state: "available",
+      source_sha: "0123456789abcdef0123456789abcdef01234567",
+      created_at: "2026-09-13T00:00:00Z",
+      ...over,
+    };
+  }
+
+  function renderPage(over: Partial<Run>, summary: ReturnType<typeof archiveSummary>) {
+    mockUseRunStream.mockReturnValue({
+      run: run(over),
+      messages: [],
+      connected: true,
+      error: "",
+      submit: vi.fn(),
+      refreshRun: vi.fn(),
+      inputs: [],
+      canSteer: false,
+    } as unknown as ReturnType<typeof useRunStream>);
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
+    mockApi.getRunArchives.mockResolvedValue(
+      summary as unknown as Awaited<ReturnType<typeof api.getRunArchives>>,
+    );
+    return render(
+      <MemoryRouter initialEntries={["/runs/r1"]}>
+        <RunView />
+      </MemoryRouter>,
+    );
+  }
+
+  it("shows the capture id + `uzi run export` hint for a needs_landing run with an available capture", async () => {
+    renderPage(
+      {
+        status: "failed",
+        forge_type: "github",
+        landing_state: "needs_landing",
+        failure_reason: "The run failed; its committed work is preserved for you to land.",
+      },
+      archiveSummary({ archives: [availableCapture()] }),
+    );
+    // Part A: the header pill reads "needs landing", not "failed".
+    expect(await screen.findByText("needs landing")).toBeTruthy();
+    // Part B: the copyable CLI hint with the real run + capture ids, and the capture id as text.
+    expect(await screen.findByText(EXPORT_CMD)).toBeTruthy();
+    expect(screen.getByText(/Capture id:/)).toBeTruthy();
+    const section = document.getElementById("recovery-archives") as HTMLElement;
+    expect(within(section).getByRole("button", { name: "Copy" })).toBeTruthy();
+    // The existing download link is untouched — the hint sits ALONGSIDE it.
+    expect(within(section).getByRole("link", { name: "Export archive" })).toBeTruthy();
+  });
+
+  it("shows NO export hint for a needs_landing run with only a preserved_patch (no available capture)", async () => {
+    renderPage(
+      {
+        status: "failed",
+        forge_type: "github",
+        landing_state: "needs_landing",
+        failure_reason: "Land the preserved diff as a human PR.",
+        preserved_patch:
+          "diff --git a/.github/workflows/x.yml b/.github/workflows/x.yml\n+name: x\n",
+      },
+      // No captures at all — the preserved_patch is the recovery path here.
+      archiveSummary({ archives: [] }),
+    );
+    // The preserved-patch inline block still renders in the failed hero (the recovery path).
+    expect(
+      await screen.findByText("Here’s the diff to land as a human PR:", { exact: false }),
+    ).toBeTruthy();
+    // ...but there is no CLI export hint, because export can read nothing without a capture.
+    expect(screen.queryByText(/uzi run export/)).toBeNull();
+    expect(screen.queryByText(/Capture id:/)).toBeNull();
+  });
+
+  it("renders the recovery panel WITHOUT the export hint for a non-needs_landing run with retained captures", async () => {
+    renderPage(
+      { status: "completed", branch: "agent/issue-87", landing_state: "none" },
+      archiveSummary({ archives: [availableCapture()] }),
+    );
+    // Ordinary recovery-archive rendering is unchanged: the download link is present...
+    expect(await screen.findByRole("link", { name: "Export archive" })).toBeTruthy();
+    // ...but the needs_landing-only CLI hint is absent.
+    expect(screen.queryByText(/uzi run export/)).toBeNull();
+    expect(screen.queryByText(/Capture id:/)).toBeNull();
+  });
+});
+
 describe("RunHeading — the forge issue title carries no format characters (#124)", () => {
   it("strips bidi/zero-width characters, and keeps the iid beside them", () => {
     const { container } = render(

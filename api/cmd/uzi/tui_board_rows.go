@@ -202,7 +202,7 @@ func (m tuiModel) boardEmptyState() string {
 func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool, mc boardMarkerCols) string {
 	band := runBand(r.Status, r.IsRevising)
 	terminal := band == bandDone
-	tok := m.pal.stateToken(r.Status, r.Health, r.IsPlanning, r.IsRevising, strOr(r.RecoveryWaitCause, ""))
+	tok := m.pal.stateToken(r.Status, r.Health, r.IsPlanning, r.IsRevising, r.LandingState, strOr(r.RecoveryWaitCause, ""))
 	showCred := m.boardShowCred()
 
 	var bg color.Color

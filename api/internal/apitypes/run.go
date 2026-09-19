@@ -461,6 +461,12 @@ type RunDTO struct {
 	// diagnosis can key on a stable typed field instead of matching a forge's free-text
 	// rejection message. Null when the run never set one.
 	FailOrigin *string `json:"fail_origin"`
+	// LandingState is a server-derived, read-only secondary presentation bucket (issue #1418)
+	// for a failed run whose committed work is human-landable: "needs_landing" when fail_origin
+	// is in the human-landable set AND an available recovery capture or a preserved_patch exists,
+	// "unrecoverable" when the origin is in that set but neither exists, "none" (default) otherwise.
+	// Derived by workersvc.DeriveLandingState; a worker cannot report it.
+	LandingState string `json:"landing_state"`
 	// PrdDonePath is the repo-relative path the run declared it moved a PRD to when it
 	// archived a completed PRD (e.g. prds/done/72-x.md), null for a run that moved none.
 	// Read-only surfacing of the runs.prd_done_path column so the issue's PRD link can be

@@ -245,3 +245,59 @@ describe("RecoveryArchivesPanel — untrusted-text escaping (D6)", () => {
     }
   });
 });
+
+// Issue #1418: for a run whose server-derived landing_state is "needs_landing", each AVAILABLE
+// capture surfaces its id as text plus a copyable `uzi run export <run-id> --output <path>
+// --capture <id>` CLI hint alongside the download link. It is doubly recoverability-aware:
+// gated on needs_landing (the panel) AND on an available capture (the row), so it never
+// appears where export could read nothing, and it leaves the ordinary recovery render
+// (non-needs_landing runs whose captures were retained) untouched.
+describe("RecoveryArchivesPanel — needs_landing export hint (issue #1418)", () => {
+  const EXPORT_CMD = "uzi run export r1 --output <path> --capture cap1";
+
+  it("surfaces the capture id and a copyable export command beside an available capture", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+
+    await renderPanel(
+      aRun({ status: "failed", landing_state: "needs_landing" }),
+      summary({ archives: [archive({ state: "available" })] }),
+    );
+
+    // The capture id is surfaced as text, and the CLI hint carries the REAL run + capture ids
+    // (server UUIDs) with a literal <path> placeholder for the operator to fill in.
+    expect(screen.getByText(/Capture id:/)).toBeTruthy();
+    expect(screen.getByText(EXPORT_CMD)).toBeTruthy();
+
+    // Copyable: clicking Copy writes the exact command to the clipboard and reflects the state.
+    fireEvent.click(screen.getByRole("button", { name: "Copy" }));
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith(EXPORT_CMD));
+    expect(await screen.findByRole("button", { name: "Copied" })).toBeTruthy();
+
+    // The existing download link is intact — the hint sits ALONGSIDE it, not instead of it.
+    expect(screen.getByRole("link", { name: "Export archive" })).toBeTruthy();
+  });
+
+  it("does not show the hint for a non-available capture, even on a needs_landing run", async () => {
+    // The row gate is view.downloadable (only the `available` state), so a retained-but-not-
+    // downloadable capture on a needs_landing run still shows no export command.
+    await renderPanel(
+      aRun({ status: "failed", landing_state: "needs_landing" }),
+      summary({ archives: [archive({ id: "cap-na", state: "needs_action" })] }),
+    );
+    expect(screen.queryByText(/uzi run export/)).toBeNull();
+    expect(screen.queryByText(/Capture id:/)).toBeNull();
+  });
+
+  it("leaves the ordinary recovery render unchanged for a non-needs_landing run with an available capture", async () => {
+    // A completed run whose captures were retained (landing_state !== needs_landing): the panel
+    // gate is off, so no CLI hint — the download link and the rest of the row are unchanged.
+    await renderPanel(
+      aRun({ status: "completed", landing_state: "none" }),
+      summary({ archives: [archive({ state: "available" })] }),
+    );
+    expect(screen.getByRole("link", { name: "Export archive" })).toBeTruthy();
+    expect(screen.queryByText(/uzi run export/)).toBeNull();
+    expect(screen.queryByText(/Capture id:/)).toBeNull();
+  });
+});

@@ -232,7 +232,15 @@ func displayHealth(health string) string {
 // the wait word reads "forge wait" instead of "recovery wait" (glyph and colour unchanged —
 // it is still a wait-family hold). The retry/cap detail does not fit this fixed-width token;
 // it lives on the run-get notice and the web panel.
-func stateGlyphWord(status, health string, isPlanning, isRevising bool, cause ...string) (glyph, word string) {
+//
+// LANDING (issue #1418): landingState is the run's server-derived LandingState. A `failed` run
+// whose value is "needs_landing" reads the word "needs landing" instead of "failed" — its
+// committed work is human-landable — while the glyph (✗) and the alarm COLOUR (in stateColor)
+// stay the failed ones. It is a plain param (not folded into the cause variadic) so the two
+// status-specific qualifiers never share a slot; every other landing_state ("unrecoverable",
+// "none", "") reads as an ordinary failed run. landing_state is a closed server enum, so it is
+// branched on directly (no d7 guard needed — see tui_d7_guard_test.go).
+func stateGlyphWord(status, health string, isPlanning, isRevising bool, landingState string, cause ...string) (glyph, word string) {
 	// Recovery does no work while parked; stale health must not hide its wait state.
 	if status != statusRecoveryWait && stalledHealth[health] {
 		return "▲", displayHealth(health)
@@ -284,6 +292,13 @@ func stateGlyphWord(status, health string, isPlanning, isRevising bool, cause ..
 	case "completed":
 		return "✓", "done"
 	case "failed":
+		// issue #1418: a failed run whose committed work is human-landable reads "needs
+		// landing"; the ✗ glyph and the alarm colour (stateColor) stay the failed ones, so it
+		// still reads as a failure that now has a recovery path. Other landing_state buckets
+		// ("unrecoverable"/"none"/"") read as an ordinary failed run.
+		if landingState == landingStateNeedsLanding {
+			return "✗", "needs landing"
+		}
 		return "✗", "failed"
 	default: // queued, claimed, cancelled, unknown
 		// Status is a uzi-controlled closed enum (not a D7 hole), but keep the defensive posture
@@ -330,8 +345,8 @@ type runToken struct {
 // stateToken is the ONE shared helper the design mandates: (glyph, colour, word) from a
 // run's status/health/planning, used on the board row, the board strip and the detail
 // header so they cannot render one run three ways.
-func (p palette) stateToken(status, health string, isPlanning, isRevising bool, cause ...string) runToken {
-	g, w := stateGlyphWord(status, health, isPlanning, isRevising, cause...)
+func (p palette) stateToken(status, health string, isPlanning, isRevising bool, landingState string, cause ...string) runToken {
+	g, w := stateGlyphWord(status, health, isPlanning, isRevising, landingState, cause...)
 	return runToken{glyph: g, word: w, color: p.stateColor(status, health, isPlanning, isRevising)}
 }
 

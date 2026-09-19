@@ -2188,6 +2188,11 @@ export interface Run {
    *  write time), surfaced read-only so a diagnosis can key on a stable typed field instead
    *  of matching a forge's free-text rejection message. Null when the run never set one. */
   fail_origin?: string | null;
+  /** issue #1418: server-derived, read-only landing bucket for a failed run whose committed
+   *  work is human-landable — "needs_landing" (an available recovery capture or a preserved
+   *  patch exists), "unrecoverable" (neither), or "none" (default). Typed string, not a union,
+   *  to match the recorded contract fixtures' ""/"x" values. */
+  landing_state?: string;
   /** issue #150: the repo-relative path the run declared it moved a completed PRD to
    *  (e.g. `prds/done/72-x.md`), and the RFC3339 instant its PRD-completion patch settled.
    *  Both null on a run that moved no PRD. OPTIONAL for the SAME api/web rollout skew as
@@ -2668,12 +2673,17 @@ export interface RunListItem extends Run {
 // failorigin.go vocabulary plus "unknown" (a NULL fail_origin, pre-migration 00126); an
 // unrecognised future key renders with its raw name (failOriginLabel falls back). The map
 // is always present — {} when empty, never null.
+// needs_landing (issue #1418) is a server-computed SUB-CUT of failed: the failed runs whose
+// committed work is human-landable and recoverable (per-run landing_state === needs_landing).
+// It is always needs_landing <= failed and does NOT enter finished — the dashboard splits the
+// `failed` bar into "failed" and "failed, needs landing" whose widths sum to the same failed.
 export interface RunOutcomes {
   finished: number;
   completed: number;
   cancelled: number;
   plan_rejected: number;
   failed: number;
+  needs_landing: number;
   fail_origins: Record<string, number>;
 }
 

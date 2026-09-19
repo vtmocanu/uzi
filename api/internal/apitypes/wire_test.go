@@ -178,6 +178,11 @@ var runDTOKeys = []string{
 	// a stable field instead of failure_reason free text. Null unless the run set one, but
 	// the key is always on the wire.
 	"fail_origin",
+	// issue #1418: the server-derived, read-only landing bucket for a failed run whose
+	// committed work is human-landable. A plain (non-pointer, non-omitempty) string, so it
+	// is always on the wire — "" on a run with no landing state, else none/needs_landing/
+	// unrecoverable.
+	"landing_state",
 	// PRD-link reconciliation (read-only): the path the run declared it archived a PRD
 	// to, and when that patch lifecycle settled (null while pending). Both always on the
 	// wire — prd_done_path null for a run that moved no PRD, prd_patch_settled_at null
@@ -835,10 +840,11 @@ func TestAdminUsageDTOTags(t *testing.T) {
 }
 
 // TestRunOutcomesDTOTags pins the failed-run rate aggregate shape (PRD #1293): five
-// counts plus the fail_origins map, all always present.
+// counts plus the fail_origins map, all always present. needs_landing (issue #1418) is the
+// server-computed sub-cut of `failed` (needs_landing <= failed), also always present.
 func TestRunOutcomesDTOTags(t *testing.T) {
 	assertTags(t, "RunOutcomesDTO", RunOutcomesDTO{},
-		"finished", "completed", "cancelled", "plan_rejected", "failed", "fail_origins")
+		"finished", "completed", "cancelled", "plan_rejected", "failed", "needs_landing", "fail_origins")
 }
 
 // TestRunOutcomeWindowsDTOTags pins the two-window wrapper (PRD #1293).

@@ -552,7 +552,15 @@ describe("completion-interlock phase (PRD #1226 M5, D8)", () => {
 // build error and no failing test. The mirror was a comment.
 describe("RUN_STATUS_TONES ↔ runStatusTone agreement", () => {
   it("gives every status in the pill map the same tone on the board/list surface", () => {
+    // needs_landing (issue #1418) is a StatusPill-ONLY pseudo-status: RunsList/RunView derive
+    // it for the header/row pill from a `failed` run's landing_state, but the board card badge
+    // and the issue-view history rows (runStatusTone) are out of #1418 scope, so runStatusTone
+    // has no arm for it (it returns the neutral default). It therefore has no board/list
+    // counterpart to agree with — excluded here rather than forcing a runStatusTone arm the
+    // feature does not use. Its danger tone is pinned by the ui.test.tsx pill test instead.
+    const PILL_ONLY = new Set(["needs_landing"]);
     for (const [status, cfg] of Object.entries(RUN_STATUS_TONES)) {
+      if (PILL_ONLY.has(status)) continue;
       // stop_kind null: the "stopped" nuance is a runBadge-only overlay that
       // deliberately has no StatusPill counterpart (RunView passes the literal
       // "stopped", which is not a status at all), so it is out of scope here.

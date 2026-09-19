@@ -268,6 +268,9 @@ SELECT r.id, r.user_id, r.status, r.issue_iid, r.issue_title,
        r.checkpoint_tip,
        r.started_at, r.budget_wall_seconds, r.budget_paused_seconds, r.interactive,
        r.budget_extension_seconds, r.checkpoint_tip_at,
+       r.fail_origin,
+       (r.preserved_patch IS NOT NULL)::boolean AS has_preserved_patch,
+       (EXISTS (SELECT 1 FROM recovery_captures c WHERE c.run_id = r.id AND c.user_id = r.user_id AND c.state = 'available'))::boolean AS has_available_capture,
        rp.path_with_namespace, rp.web_url, c.forge_type,
        COALESCE(
            (SELECT array_agg(elem->>'name' ORDER BY ord)
@@ -309,6 +312,9 @@ type GetSlackRunContextRow struct {
 	Interactive            bool               `json:"interactive"`
 	BudgetExtensionSeconds int32              `json:"budget_extension_seconds"`
 	CheckpointTipAt        pgtype.Timestamptz `json:"checkpoint_tip_at"`
+	FailOrigin             pgtype.Text        `json:"fail_origin"`
+	HasPreservedPatch      bool               `json:"has_preserved_patch"`
+	HasAvailableCapture    bool               `json:"has_available_capture"`
 	PathWithNamespace      string             `json:"path_with_namespace"`
 	WebUrl                 string             `json:"web_url"`
 	ForgeType              string             `json:"forge_type"`
@@ -374,6 +380,18 @@ type GetSlackRunContextRow struct {
 // deadline and time-left; checkpoint_tip_at (PRD #1189/#1190) is the TIMESTAMP the tip was last
 // published so the DM can say how old the last checkpoint is (checkpoint_tip above is the SHA
 // text, which cannot answer "how long ago"). All ride the same one-row read.
+//
+// fail_origin / has_preserved_patch / has_available_capture (issue #1418) are the exact inputs
+// workersvc.DeriveLandingState needs so the run-FINISHED DM can name the "needs landing" bucket
+// for a failed run whose committed work is human-landable. All three are selected FROM THE RUNS
+// ROW (fail_origin and preserved_patch are columns on `runs`; the capture is a correlated EXISTS
+// against recovery_captures) for the same "explicit column list" reason stop_kind/checkpoint_tip
+// above are. Both booleans are cast ::boolean so sqlc types them as usable bools rather than
+// interface{} (an uncast `IS NOT NULL` predicate and an uncast EXISTS both type as interface{}).
+// has_available_capture mirrors runtime.sql's idiom: the correlated EXISTS correlates to the OUTER
+// run row and its owner (run_id, user_id), riding idx_recovery_captures_run_owner. The inner alias
+// c is the subquery's recovery_captures, distinct from the outer forge_connections c below (the
+// same shadowing runtime.sql relies on).
 func (q *Queries) GetSlackRunContext(ctx context.Context, id uuid.UUID) (GetSlackRunContextRow, error) {
 	row := q.db.QueryRow(ctx, getSlackRunContext, id)
 	var i GetSlackRunContextRow
@@ -405,6 +423,9 @@ func (q *Queries) GetSlackRunContext(ctx context.Context, id uuid.UUID) (GetSlac
 		&i.Interactive,
 		&i.BudgetExtensionSeconds,
 		&i.CheckpointTipAt,
+		&i.FailOrigin,
+		&i.HasPreservedPatch,
+		&i.HasAvailableCapture,
 		&i.PathWithNamespace,
 		&i.WebUrl,
 		&i.ForgeType,
