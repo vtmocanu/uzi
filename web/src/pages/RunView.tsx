@@ -512,6 +512,15 @@ export function MilestoneChecklist({ run, activity = null }: { run: Run; activit
   // agent byte-matches the live activity agent; zero or 2+ matches (a repeated role) suppress
   // live on ALL strips — every strip then shows declared role + label only.
   const uniqueMatchId = activity ? uniqueLiveMatchMilestoneId(effective, activity.agent) : null;
+  // PRD #1353 M4: the server-derived per-in-progress-milestone LIVE LANES (each lane a
+  // subagent working that milestone RIGHT NOW). When ANY milestone has a live lane, this is
+  // the AUTHORITATIVE live display and supersedes the single current_activity now-line: the
+  // declared owner renders QUIET (a non-pulsing "assigned to" line) and one green+pulsing
+  // strip renders per lane, keyed by agent_instance so distinct subagents (reviewer×2) show
+  // as distinct lines. We branch on PRESENCE of a lane (D5 back-compat), never on a nil test —
+  // null / [] / all-empty-lanes ALL fall through to the pre-#1353 render below, byte-for-byte.
+  const milestonesLiveById = new Map((run.milestones_live ?? []).map((e) => [e.milestone_id, e.lanes]));
+  const hasLanes = (run.milestones_live ?? []).some((e) => e.lanes.length > 0);
   return (
     <Card className="p-4">
       <div className="mb-3 flex items-center justify-between gap-2">
@@ -535,7 +544,7 @@ export function MilestoneChecklist({ run, activity = null }: { run: Run; activit
           ONLY in the D8-fallback (unattributed) path — in the attributed path every strip
           hangs off its own milestone row, so no unattached strip renders (and effective is
           non-empty only when some milestone is in progress, so firstInProgress is set). */}
-      {!attributed && !firstInProgress && activity && (
+      {!hasLanes && !attributed && !firstInProgress && activity && (
         <MilestoneNowStrip
           role={activity.agent}
           label={activity.agent_label}
@@ -563,38 +572,71 @@ export function MilestoneChecklist({ run, activity = null }: { run: Run; activit
                   {stripUnsafeChars(m.title)}
                 </span>
               </div>
-              {/* PRD #1224 M5 attributed path (D8/D3/D9): every in-progress milestone with an
-                  effective attribution shows its DECLARED role + label; live tool/age is added
-                  ONLY to the single unique-match milestone (D3). The ◐ mark above is untouched
-                  (D9 — attribution is strictly additive). */}
-              {attributed
-                ? attribution && (
-                    <MilestoneNowStrip
-                      role={attribution.agent}
-                      label={attribution.agent_label}
-                      live={
-                        m.id === uniqueMatchId && activity
-                          ? { tool: activity.tool, detail: activity.detail, at: activity.at }
-                          : null
-                      }
-                      status={run.status}
-                      now={now}
-                      variant="active"
-                    />
-                  )
-                : // D8-fallback (unattributed): the "now" line sits under the FIRST in-progress
-                  // row only (D4), sourced from the activity prop — structurally today's render.
-                  activity &&
-                  m.id === firstInProgress && (
-                    <MilestoneNowStrip
-                      role={activity.agent}
-                      label={activity.agent_label}
-                      live={{ tool: activity.tool, detail: activity.detail, at: activity.at }}
-                      status={run.status}
-                      now={now}
-                      variant="active"
-                    />
-                  )}
+              {hasLanes ? (
+                // PRD #1353 M4 LIVE-LANES path (the authoritative live display). For each
+                // in-progress milestone: the DECLARED owner (if any) renders QUIET (live=null →
+                // M1's non-pulsing "assigned to" line) and ONE live green+pulsing strip renders
+                // per lane, keyed by agent_instance. Neither the D8-fallback/unattached strip nor
+                // uniqueMatchId is consulted here — lanes supersede the current_activity now-line.
+                state === "in_progress" && (
+                  <>
+                    {attribution && (
+                      <MilestoneNowStrip
+                        role={attribution.agent}
+                        label={attribution.agent_label}
+                        live={null}
+                        status={run.status}
+                        now={now}
+                        variant="active"
+                      />
+                    )}
+                    {(milestonesLiveById.get(m.id) ?? []).map((lane) => (
+                      <MilestoneNowStrip
+                        key={lane.agent_instance}
+                        role={lane.agent}
+                        label={lane.agent_label}
+                        live={{ tool: lane.tool, detail: lane.detail, at: lane.at }}
+                        status={run.status}
+                        now={now}
+                        variant="active"
+                      />
+                    ))}
+                  </>
+                )
+              ) : attributed ? (
+                // PRD #1224 M5 attributed path (D8/D3/D9): every in-progress milestone with an
+                // effective attribution shows its DECLARED role + label; live tool/age is added
+                // ONLY to the single unique-match milestone (D3). The ◐ mark above is untouched
+                // (D9 — attribution is strictly additive).
+                attribution && (
+                  <MilestoneNowStrip
+                    role={attribution.agent}
+                    label={attribution.agent_label}
+                    live={
+                      m.id === uniqueMatchId && activity
+                        ? { tool: activity.tool, detail: activity.detail, at: activity.at }
+                        : null
+                    }
+                    status={run.status}
+                    now={now}
+                    variant="active"
+                  />
+                )
+              ) : (
+                // D8-fallback (unattributed): the "now" line sits under the FIRST in-progress
+                // row only (D4), sourced from the activity prop — structurally today's render.
+                activity &&
+                m.id === firstInProgress && (
+                  <MilestoneNowStrip
+                    role={activity.agent}
+                    label={activity.agent_label}
+                    live={{ tool: activity.tool, detail: activity.detail, at: activity.at }}
+                    status={run.status}
+                    now={now}
+                    variant="active"
+                  />
+                )
+              )}
             </li>
           );
         })}
