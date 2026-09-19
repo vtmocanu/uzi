@@ -107,7 +107,7 @@ func (e *Engine) runOnce(ctx context.Context) {
 	}
 	// Only log when the pass actually did something, to keep the log quiet on an
 	// idle system.
-	if res.WorkersOffline+res.ClaimedReset+res.RunningTimeout+res.StaleFailed+res.StaleRequeued+res.ChatIdleCompleted+res.ProposalsRecovered+res.HealthChanged+res.AutoStopped+res.LimitPromoted+res.PoolResumed+res.LimitReevaluated+res.RecoveryPromoted+res.CompletionBudgetExhausted+res.CustodyReleased+res.RecoveryStalled+res.RecoveryExpired > 0 {
+	if res.WorkersOffline+res.ClaimedReset+res.RunningTimeout+res.StaleFailed+res.StaleRequeued+res.ChatIdleCompleted+res.ProposalsRecovered+res.HealthChanged+res.AutoStopped+res.LimitPromoted+res.PoolResumed+res.LimitReevaluated+res.RecoveryPromoted+res.CompletionBudgetExhausted+res.CustodyReleased+res.RecoveryStalled+res.RecoveryExpired+res.TaskUndispatchedFailed > 0 {
 		slog.Info("sweeper pass",
 			"workers_offline", res.WorkersOffline,
 			"claimed_reset", res.ClaimedReset,
@@ -158,6 +158,11 @@ func (e *Engine) runOnce(ctx context.Context) {
 			// to expired and reclaiming its bytes) still raises this line rather than reclaiming
 			// storage invisibly.
 			"recovery_expired", res.RecoveryExpired,
+			// issue #1367: same reasoning — in the sum above as well as emitted here, so a
+			// tick that only reaps undispatched handoff runs (a kind='task' run left queued
+			// with dispatched_at NULL past DispatchGrace) still raises this line rather than
+			// failing an orphaned reservation invisibly.
+			"task_undispatched_failed", res.TaskUndispatchedFailed,
 		)
 	}
 }
