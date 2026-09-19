@@ -4,7 +4,7 @@
 # critical: no
 # lane:     gitlab
 # executor: stub
-# requires: REPO_ID UZI_BIN UZI_TOKEN_VAL UZI_WORKER_TOKEN ADMIN_ID ADMIN_SECRET_ID
+# requires: REPO_ID UZI_BIN UZI_TOKEN_VAL UZI_WORKER_TOKEN ADMIN_ID
 # provides: -
 # handoff:  -
 # mutates:  admin secrets (adds then deletes a codex openai_api_key default; temporarily deletes+recreates the default anthropic_token for the codex-only sub-scenario, which cascades its anthropic_rate_limits gauge row); creates a fire-once prompt schedule pinned harness=codex (deleted before this phase ends); creates several issues+runs on REPO_ID
@@ -25,6 +25,9 @@
 # exact starting shape at the end — the same "toggle on one account, then restore"
 # idiom 48-auto-selection.sh and 34-vault.sh already use for D11/vault-state coverage.
 say "PRD #1429 M6: joined Codex public activation, offline (stub harness-neutral seam)"
+if [ "$EXECUTOR" != stub ]; then
+  say "PRD #1429 M6 codex-activation scenario: SKIPPED (stub-only — every assertion below is a fixed stub token/cost figure and drives a Codex run through a dummy key; executor=$EXECUTOR)"
+else
 
 # --- runtime-assembled dummy openai_api_key -----------------------------------
 # NEVER a complete provider-token-shaped literal in this source (task scan:secrets +
@@ -236,7 +239,15 @@ wait_status "$CX_ONLY_RUN" awaiting_approval
 [ "$(apiget "/api/runs/$CX_ONLY_RUN" | jq -r '.run.harness')" = codex ] \
   || fail "a Codex-only user's PLAIN (no --harness) run did not implicitly resolve to codex (D11 rule 3)"
 pass "Codex-only user's plain run $CX_ONLY_RUN implicitly resolved to codex (D11 rule 3: the sole usable harness)"
+# A live-worker cancel at the gate is poller-consumed (SteeringChannel still polls at
+# awaiting_approval) and converges on 'cancelled' regardless of path (PRD #503 M1, the
+# same idiom 22-steer-queue-delivery.sh uses for its own live-worker cancel-at-gate:
+# fire the cancel, then wait_status ... cancelled). Waiting here (rather than firing and
+# moving straight to teardown) settles the run to a terminal state before the phase
+# ends, so it can never still be mid-cancel when driver.sh's end-of-phase leak-sweep
+# quarantine scan runs (a hard fail under E2E_STRICT_LEAKS=1).
 apipost "/api/runs/$CX_ONLY_RUN/inputs" '{"kind":"cancel","body":""}' >/dev/null 2>&1 || true
+wait_status "$CX_ONLY_RUN" cancelled
 
 # Explicit restore (not just the trap fail-safe): recreate the default anthropic_token
 # with the SAME seeded literal via the upsert-shaped PUT (34-vault.sh's own restore
@@ -296,3 +307,5 @@ if "${COMPOSE[@]}" exec -T agent sh -c "grep -rlF '$DUMMY_OPENAI' /data 2>/dev/n
   fail "the assembled dummy openai_api_key is present on the worker's /data disk"
 fi
 pass "no dummy openai_api_key on the worker's /data (bare clone cache, worktrees, sessions; corpus non-empty)"
+
+fi
