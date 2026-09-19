@@ -815,12 +815,20 @@ export function Repos() {
               ))}
             </ul>
             {enableRefusal.waivable ? (
-              // Waivable (issue #1432): fixing protection is still the clean fix, but an
-              // admin can also allow it — point to the per-repo Request approval button.
-              <p className="mt-3 text-sm text-muted">
-                Fix the repository's default-branch protection on the forge, then click Enable again — or
-                use Request admin approval on the repo below to ask an admin to allow it.
-              </p>
+              // Waivable (issue #1432): fixing protection is still the clean fix, but the
+              // refusal can also be allowed through. The guidance is role-specific — an
+              // admin allows it themselves (Allow anyway); a member asks an admin.
+              isAdmin ? (
+                <p className="mt-3 text-sm text-muted">
+                  Fix the repository's default-branch protection on the forge, then click Enable again — or
+                  use Allow anyway on the repo below to allow it through the guardrail.
+                </p>
+              ) : (
+                <p className="mt-3 text-sm text-muted">
+                  Fix the repository's default-branch protection on the forge, then click Enable again — or
+                  use Request admin approval on the repo below to ask an admin to allow it.
+                </p>
+              )
             ) : (
               <p className="mt-3 text-sm text-muted">
                 Fix the repository's default-branch protection on the forge so the bot cannot push or
@@ -1073,9 +1081,20 @@ export function Repos() {
                                 Request-approval path for THIS repo. Suppressed once a
                                 request exists (override_request drives that state). */}
                             {enableRefusal?.repoId === r.id && enableRefusal.waivable && !r.override_request && (
-                              <Button variant="secondary" size="sm" onClick={() => openRequest(r)}>
-                                Request admin approval
-                              </Button>
+                              isAdmin ? (
+                                // An admin allows the repo directly (openAllow); openRequest is a member-only path
+                                // that would ask ANOTHER admin. Guarded on !guardrail_blocked so it does not double
+                                // the "Allow anyway" the badge-state block already renders when guardrail_blocked.
+                                !r.guardrail_blocked && (
+                                  <Button variant="secondary" size="sm" onClick={() => openAllow(r)}>
+                                    Allow anyway
+                                  </Button>
+                                )
+                              ) : (
+                                <Button variant="secondary" size="sm" onClick={() => openRequest(r)}>
+                                  Request admin approval
+                                </Button>
+                              )
                             )}
                           </div>
                         </td>

@@ -51,10 +51,14 @@ export function AdminBlockedRepos() {
   // Alert would sit behind the backdrop, unseen). Distinct from the page `error`.
   const [allowError, setAllowError] = useState("");
   const [revokeBusyId, setRevokeBusyId] = useState<string | null>(null);
-  // Pending override-request decisions (issue #1432). decideBusyId disables the acting
-  // row's buttons; the reject-note modal carries the request, an OPTIONAL note, and its
-  // POST — approve is a direct call, reject prompts for a note first.
-  const [decideBusyId, setDecideBusyId] = useState<string | null>(null);
+  // Pending override-request decisions (issue #1432). Both decisions prompt a note-modal
+  // first — approve records the override with an OPTIONAL note, reject keeps the block with
+  // an OPTIONAL note — so each carries its request, note, in-flight POST, and inline error.
+  // A decision in flight (approveBusy || rejectBusy) locks the row's Approve/Reject buttons.
+  const [approveRequest, setApproveRequest] = useState<GuardrailOverrideRequest | null>(null);
+  const [approveNote, setApproveNote] = useState("");
+  const [approveBusy, setApproveBusy] = useState(false);
+  const [approveError, setApproveError] = useState("");
   const [rejectRequest, setRejectRequest] = useState<GuardrailOverrideRequest | null>(null);
   const [rejectNote, setRejectNote] = useState("");
   const [rejectBusy, setRejectBusy] = useState(false);
@@ -106,19 +110,41 @@ export function AdminBlockedRepos() {
     }
   };
 
-  // Approve a pending request (issue #1432): sets the override so the OWNER can retry
-  // Enable — it does not enable the repo. 409 (already decided) / 404 surface at the
-  // page Alert; reload settles the row out of the pending list.
-  const approve = async (req: GuardrailOverrideRequest) => {
+  // Open the approve-note modal (issue #1432): approval records the override so the OWNER
+  // can retry Enable — it does not enable the repo. Resets the optional note/error.
+  const openApprove = (req: GuardrailOverrideRequest) => {
     setError("");
-    setDecideBusyId(req.id);
+    setApproveNote("");
+    setApproveError("");
+    setApproveRequest(req);
+  };
+
+  // Close the approve-note modal. A no-op while a POST is in flight so neither Escape nor a
+  // backdrop click can dismiss a submitting form (matching the disabled ×).
+  const closeApprove = () => {
+    if (approveBusy) return;
+    setApproveRequest(null);
+    setApproveError("");
+  };
+
+  // Approve a pending request with an OPTIONAL note (submit allowed when empty). Sets the
+  // override so the OWNER can retry Enable — it does not enable the repo. An empty note is
+  // omitted so the endpoint sees no decision_note rather than "". reload after; 409 (already
+  // decided) / 404 surface inline in the modal.
+  const submitApprove = async () => {
+    if (!approveRequest) return;
+    const note = approveNote.trim();
+    setApproveError("");
+    setApproveBusy(true);
     try {
-      await api.approveGuardrailOverrideRequest(req.id);
+      await api.approveGuardrailOverrideRequest(approveRequest.id, note || undefined);
+      setApproveRequest(null);
+      setApproveNote("");
       await reload();
     } catch (err) {
-      setError(errorMessage(err, "Failed to approve the request"));
+      setApproveError(errorMessage(err, "Failed to approve the request"));
     } finally {
-      setDecideBusyId(null);
+      setApproveBusy(false);
     }
   };
 
@@ -214,13 +240,13 @@ export function AdminBlockedRepos() {
                     </td>
                     <td className="px-4 py-3 text-right">
                       <div className="flex justify-end gap-2">
-                        <Button size="sm" disabled={decideBusyId === req.id} onClick={() => approve(req)}>
-                          {decideBusyId === req.id ? "Approving…" : "Approve"}
+                        <Button size="sm" disabled={approveBusy || rejectBusy} onClick={() => openApprove(req)}>
+                          Approve
                         </Button>
                         <Button
                           variant="ghost"
                           size="sm"
-                          disabled={decideBusyId === req.id}
+                          disabled={approveBusy || rejectBusy}
                           onClick={() => openReject(req)}
                         >
                           Reject
@@ -393,6 +419,65 @@ export function AdminBlockedRepos() {
               </Button>
               <Button size="sm" disabled={allowBusy || allowReason.trim() === ""} onClick={submitAllow}>
                 {allowBusy ? "Allowing…" : "Allow anyway"}
+              </Button>
+            </div>
+          </div>
+        </Modal>
+      )}
+
+      {/* Approve-note modal (issue #1432): the note is OPTIONAL, so the Approve button
+          stays enabled with an empty field. Approval records the override so the owner can
+          retry Enable — it does not enable the repo, and the server re-checks the live guard
+          at retry time, dismissing the request if the repo is no longer blocked. */}
+      {approveRequest && (
+        <Modal
+          label={`Approve the request to enable ${maskRepoPath(approveRequest.repo_path, demo)}`}
+          onClose={closeApprove}
+          closeOnBackdrop={!approveBusy}
+        >
+          <div className="my-8 w-full max-w-lg overflow-hidden rounded-2xl border border-edge-strong bg-surface shadow-2xl">
+            <div className="flex items-start justify-between gap-3 border-b border-edge px-5 py-4">
+              <div>
+                <h2 className="text-base font-semibold">Approve this request?</h2>
+                <p className="mt-0.5 text-xs text-muted">
+                  {maskRepoPath(approveRequest.repo_path, demo)} · requested by {maskEmail(approveRequest.owner_email, demo)}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={closeApprove}
+                disabled={approveBusy}
+                aria-label="Close"
+                className="rounded-md p-1 text-muted hover:bg-raised hover:text-fg"
+              >
+                <XIcon />
+              </button>
+            </div>
+            <div className="space-y-4 px-5 py-5">
+              {approveError && <Alert message={approveError} />}
+              <p className="text-sm text-muted">
+                This records the override so the owner can retry Enable — it does{" "}
+                <span className="font-medium text-fg">not</span> enable the repo for them. On their
+                retry the server re-checks the live guardrail and dismisses this request if the repo
+                is no longer blocked.
+              </p>
+              <label className="block space-y-1.5">
+                <span className="text-sm font-medium text-fg">Note (optional)</span>
+                <Textarea
+                  rows={3}
+                  value={approveNote}
+                  disabled={approveBusy}
+                  placeholder="Add a note for the owner (shown to them on the repo)"
+                  onChange={(e) => setApproveNote(e.target.value)}
+                />
+              </label>
+            </div>
+            <div className="flex items-center justify-end gap-2 border-t border-edge bg-ink/40 inset-panel px-5 py-3.5">
+              <Button variant="ghost" size="sm" disabled={approveBusy} onClick={closeApprove}>
+                Cancel
+              </Button>
+              <Button size="sm" disabled={approveBusy} onClick={submitApprove}>
+                {approveBusy ? "Approving…" : "Approve"}
               </Button>
             </div>
           </div>

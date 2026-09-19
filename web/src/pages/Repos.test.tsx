@@ -774,6 +774,54 @@ describe("Repos — member override request (issue #1432)", () => {
   });
 });
 
+describe("Repos — administrator refusal uses Allow anyway (issue #1432, finding [3b])", () => {
+  // A waivable enable 422 for a disabled repo whose stored report is clean
+  // (guardrail_blocked===false), so the badge-state admin control never renders and the
+  // role-specific 422 affordance is the only path an admin (or member) gets.
+  const waivableRefusal = () =>
+    new ApiError(422, "refused", {
+      error: "this repo cannot be enabled",
+      violations: ["the write role may push to protected main"],
+      findings: [
+        { code: "write_role_can_push", severity: "block", message: "the write role may push to protected main" },
+      ],
+      waivable: true,
+    });
+
+  it("an admin gets 'Allow anyway' (not 'Request admin approval'), and it opens the admin modal", async () => {
+    asAdmin(true);
+    mockApi.setRepoEnabled.mockRejectedValue(waivableRefusal());
+    mockApi.setRepoGuardrailOverride.mockResolvedValue({ repo: {} as never });
+    renderPage();
+    // example/website is the disabled, guardrail_blocked===false repo in the fixture.
+    await screen.findByText("example/website");
+    const row = () => within(rowFor("example/website"));
+    fireEvent.click(row().getByRole("button", { name: /^Enable$/ }));
+
+    // The admin allows the repo directly; the member request path is never offered.
+    const allow = await row().findByRole("button", { name: /allow anyway/i });
+    expect(row().queryByRole("button", { name: /request admin approval/i })).toBeNull();
+
+    // Clicking it opens the admin Allow-anyway modal (openAllow), not the member request modal.
+    fireEvent.click(allow);
+    expect(
+      await screen.findByRole("dialog", { name: /allow runs on example\/website/i }),
+    ).toBeTruthy();
+  });
+
+  it("a member gets 'Request admin approval' (not 'Allow anyway') for the same refusal", async () => {
+    asAdmin(false);
+    mockApi.setRepoEnabled.mockRejectedValue(waivableRefusal());
+    renderPage();
+    await screen.findByText("example/website");
+    const row = () => within(rowFor("example/website"));
+    fireEvent.click(row().getByRole("button", { name: /^Enable$/ }));
+
+    expect(await row().findByRole("button", { name: /request admin approval/i })).toBeTruthy();
+    expect(row().queryByRole("button", { name: /allow anyway/i })).toBeNull();
+  });
+});
+
 describe("Repos — GitHub Projects sync (PRD #534 M3)", () => {
   const GH_CONN: ForgeConnection = {
     ...CONN,

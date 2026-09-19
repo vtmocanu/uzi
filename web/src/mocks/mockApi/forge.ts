@@ -22,6 +22,24 @@ import {
 } from "../data";
 import { delay, requireSession } from "./shared";
 
+// Classify guardrail block messages into coded findings + waivability, mirroring
+// privcheck.AllBlocksWaivable: a "could not read"/"unreadable" message is
+// protection_unreadable (never waivable); anything else is a waivable push/merge block.
+// Shared by setRepoEnabled (the enable-422 body) and requestGuardrailOverride (which
+// rejects a non-waivable request before mutating state, exactly as the server does).
+function classifyGuardrailFindings(messages: string[]): {
+  findings: { code: string; severity: string; message: string }[];
+  waivable: boolean;
+} {
+  const unreadable = (m: string) => /could not read|unreadable/i.test(m);
+  const findings = messages.map((m) => ({
+    code: unreadable(m) ? "protection_unreadable" : "write_role_can_push",
+    severity: "block",
+    message: m,
+  }));
+  return { findings, waivable: messages.length > 0 && !messages.some(unreadable) };
+}
+
 let connections = [{ ...mockConnection }];
 export let repos = mockRepos.map((r) => ({ ...r }));
 // PRD #534: a GitHub connection plus two GitHub repos so the Boards "Project
@@ -213,16 +231,10 @@ export const forgeApi = {
         "this repository cannot be enabled until its guardrail violations are resolved",
       ];
       // issue #1432: the 422 now also carries coded findings and whether an admin could
-      // clear this refusal. A "could not read protection" message is protection_unreadable
-      // (never waivable, mirroring privcheck.AllBlocksWaivable); anything else is a
-      // waivable push/merge block, so an admin CAN allow it.
-      const unreadable = (m: string) => /could not read|unreadable/i.test(m);
-      const findings = violations.map((m) => ({
-        code: unreadable(m) ? "protection_unreadable" : "write_role_can_push",
-        severity: "block",
-        message: m,
-      }));
-      const waivable = violations.length > 0 && !violations.some(unreadable);
+      // clear this refusal. classifyGuardrailFindings mirrors privcheck.AllBlocksWaivable —
+      // a "could not read protection" message is protection_unreadable (never waivable);
+      // anything else is a waivable push/merge block, so an admin CAN allow it.
+      const { findings, waivable } = classifyGuardrailFindings(violations);
       throw new ApiError(422, "repository cannot be enabled — guardrail violations", {
         violations,
         findings,
@@ -505,6 +517,18 @@ export const forgeApi = {
     if (!r.guardrail_blocked) throw new ApiError(409, "this repo is not blocked");
     const meta = mockBlockedRepoMeta[id];
     const messages = meta?.block_messages ?? [];
+    // Mirror the server's 422: a non-waivable refusal (a protection_unreadable finding)
+    // cannot be cleared by an admin override, so refuse it BEFORE mutating the repo or the
+    // queue. repo-ledger's seed carries a "could not read" finding, so a request against it
+    // fails here while a waivable repo (repo-billing) proceeds.
+    const { findings, waivable } = classifyGuardrailFindings(messages);
+    if (!waivable) {
+      throw new ApiError(422, "this refusal cannot be waived by an admin override", {
+        violations: messages,
+        findings,
+        waivable: false,
+      });
+    }
     const override_request: OverrideRequestState = {
       status: "pending",
       reason,
@@ -523,7 +547,9 @@ export const forgeApi = {
         owner_email: meta?.owner_email ?? mockAdmin.email,
         forge_type: meta?.forge_type ?? mockConnection.forge_type,
         reason,
-        findings: messages.map((m) => ({ code: "write_role_can_push", severity: "block", message: m })),
+        // Real coded findings from the classifier (not a hardcoded push map), so the
+        // queued row's findings match the enable-422's findings for the same repo.
+        findings: findings.map((f) => ({ ...f })),
         status: "pending",
         created_at: override_request.created_at,
       },

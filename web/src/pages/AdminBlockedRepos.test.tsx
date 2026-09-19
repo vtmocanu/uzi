@@ -196,7 +196,21 @@ describe("AdminBlockedRepos — pending override requests (issue #1432)", () => 
     expect(screen.getByText(/owner can retry Enable/i)).toBeTruthy();
   });
 
-  it("Approve calls approveGuardrailOverrideRequest and reloads", async () => {
+  it("Approve opens a note modal — the row click does not decide the request", async () => {
+    mockApi.adminListBlockedRepos.mockResolvedValue({
+      repos: [],
+      checks_unknown: false,
+      requests: [request({ id: "gor-42" })],
+    });
+    renderPage();
+    await screen.findByText(/pending override requests/i);
+    fireEvent.click(screen.getByRole("button", { name: /^Approve$/ }));
+
+    expect(await screen.findByRole("dialog", { name: /approve the request/i })).toBeTruthy();
+    expect(mockApi.approveGuardrailOverrideRequest).not.toHaveBeenCalled();
+  });
+
+  it("Approve WITH a note calls approveGuardrailOverrideRequest with (id, note) and reloads", async () => {
     mockApi.adminListBlockedRepos.mockResolvedValue({
       repos: [],
       checks_unknown: false,
@@ -206,8 +220,36 @@ describe("AdminBlockedRepos — pending override requests (issue #1432)", () => 
     renderPage();
     await screen.findByText(/pending override requests/i);
     fireEvent.click(screen.getByRole("button", { name: /^Approve$/ }));
-    await waitFor(() => expect(mockApi.approveGuardrailOverrideRequest).toHaveBeenCalledWith("gor-42"));
+
+    const dialog = await screen.findByRole("dialog", { name: /approve the request/i });
+    // The note is OPTIONAL: the Approve confirm is enabled even with an empty field.
+    const approveBtn = within(dialog).getByRole("button", { name: /^Approve$/ });
+    expect((approveBtn as HTMLButtonElement).disabled).toBe(false);
+
+    fireEvent.change(within(dialog).getByRole("textbox"), { target: { value: "fixed, allowing it" } });
+    fireEvent.click(approveBtn);
+    await waitFor(() =>
+      expect(mockApi.approveGuardrailOverrideRequest).toHaveBeenCalledWith("gor-42", "fixed, allowing it"),
+    );
     await waitFor(() => expect(mockApi.adminListBlockedRepos).toHaveBeenCalledTimes(2));
+  });
+
+  it("Approve with an EMPTY note omits decision_note (id, undefined)", async () => {
+    mockApi.adminListBlockedRepos.mockResolvedValue({
+      repos: [],
+      checks_unknown: false,
+      requests: [request({ id: "gor-45" })],
+    });
+    mockApi.approveGuardrailOverrideRequest.mockResolvedValue({ request: {} as never });
+    renderPage();
+    await screen.findByText(/pending override requests/i);
+    fireEvent.click(screen.getByRole("button", { name: /^Approve$/ }));
+
+    const dialog = await screen.findByRole("dialog", { name: /approve the request/i });
+    fireEvent.click(within(dialog).getByRole("button", { name: /^Approve$/ }));
+    await waitFor(() =>
+      expect(mockApi.approveGuardrailOverrideRequest).toHaveBeenCalledWith("gor-45", undefined),
+    );
   });
 
   it("Reject opens a note modal, sends the optional note, and reloads", async () => {
