@@ -82,7 +82,11 @@ func TestGetReviewForTargetVisibility(t *testing.T) {
 // dedupe. Each blocked path returns its typed error and never mints a judge run.
 func TestRerunJudgeGates(t *testing.T) {
 	owner, target := uuid.New(), uuid.New()
-	terminal := store.Run{ID: target, UserID: owner, Kind: runkind.Issue, Status: "completed"}
+	// PRD #1429 M3 (D4): RerunJudge now routes the enqueue through createRunResolved with
+	// the target's harness as an explicit selection; the non-live-DB fakeStore fallback
+	// only ever resolves Claude, so the fixture must stamp it explicitly (an unset "" would
+	// now be refused as an unusable explicit harness instead of reaching CreateJudgeRun).
+	terminal := store.Run{ID: target, UserID: owner, Kind: runkind.Issue, Status: "completed", Harness: string(HarnessClaude)}
 
 	cases := []struct {
 		name    string
@@ -313,7 +317,9 @@ func TestGetRunReviewPanel(t *testing.T) {
 func TestRerunJudgeHappyPath(t *testing.T) {
 	owner, target := uuid.New(), uuid.New()
 	fs := &fakeStore{
-		runByID:   store.Run{ID: target, UserID: owner, Kind: runkind.Issue, Status: "failed"},
+		// PRD #1429 M3 (D4): see TestRerunJudgeGates' identical note — the fakeStore
+		// fallback only ever resolves Claude, so the fixture must carry it explicitly.
+		runByID:   store.Run{ID: target, UserID: owner, Kind: runkind.Issue, Status: "failed", Harness: string(HarnessClaude)},
 		anthropic: []byte("sealed"),
 	}
 	svc := New(fs, newBox(t), testParams())

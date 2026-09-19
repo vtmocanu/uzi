@@ -222,7 +222,7 @@ func TestAssembleChatClaimRefusesCodexIndicatingRun(t *testing.T) {
 			if !errors.Is(err, errCredentialUnavailable) {
 				t.Fatalf("err = %v, want errCredentialUnavailable (the Codex refusal)", err)
 			}
-			if !strings.Contains(err.Error(), "Codex chat is not implemented") {
+			if !strings.Contains(err.Error(), "Codex chat is deferred to a later PRD") {
 				t.Fatalf("err = %v, want the Codex-refusal message (proving the guard fired, not openAnthropic)", err)
 			}
 			if payload != nil {

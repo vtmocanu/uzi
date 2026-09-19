@@ -112,24 +112,31 @@ func (s *Service) CreateTaskRun(ctx context.Context, userID, repoID uuid.UUID, i
 	// decoupled from the global RUN_TIMEOUT / RUN_MAX_ITERATIONS (see handoffBudget).
 	budgetWall, budgetIters := s.handoffBudget(interactive)
 
-	run, err := s.q.CreateTaskRun(ctx, store.CreateTaskRunParams{
-		RunID:               id,
-		UserID:              userID,
-		RepoID:              repoID,
-		Branch:              pgconv.TextOrNull(branch),
-		BaseBranch:          pgTextTrimNarg(baseBranch),
-		OpenMr:              openMR,
-		Interactive:         interactive,
-		ReviewRequested:     reviewRequested,
-		ThenFixRequested:    thenFixRequested,
-		IssueTitle:          deriveTaskTitle(inlineContext),
-		IssueDescription:    inlineContext,
-		BudgetWallSeconds:   budgetWall,
-		BudgetMaxIterations: budgetIters,
-		// PRD #35: the OWNER's default. A handoff has no per-request wait_on_limit
-		// override today, so nil resolves to the user's users.wait_on_limit — the same
-		// defaulting every other creation path applies (ci_fix/mr_rework/CreateRun).
-		WaitOnLimit: s.resolveWaitOnLimit(ctx, userID, nil),
+	// PRD #1429 M2: the initial task handoff has no source run, so it uses IMPLICIT D11 (nil
+	// explicit). This path previously BYPASSED createRun, so the M1 stopgap is replaced here by the
+	// atomic resolve/freeze — the pre-minted run id (RunID: id) is what the in-tx Codex freeze binds.
+	run, err := s.createRunResolved(ctx, userID, nil /*explicit: implicit D11*/, func(q Store, resolved resolvedHarness) (store.Run, error) {
+		return q.CreateTaskRun(ctx, store.CreateTaskRunParams{
+			RunID:               id,
+			UserID:              userID,
+			RepoID:              repoID,
+			Branch:              pgconv.TextOrNull(branch),
+			BaseBranch:          pgTextTrimNarg(baseBranch),
+			OpenMr:              openMR,
+			Interactive:         interactive,
+			ReviewRequested:     reviewRequested,
+			ThenFixRequested:    thenFixRequested,
+			IssueTitle:          deriveTaskTitle(inlineContext),
+			IssueDescription:    inlineContext,
+			BudgetWallSeconds:   budgetWall,
+			BudgetMaxIterations: budgetIters,
+			// PRD #1429 M2 (D1 auditor invariant): the D11-resolved harness frozen in-tx.
+			Harness: string(resolved.Harness),
+			// PRD #35: the OWNER's default. A handoff has no per-request wait_on_limit
+			// override today, so nil resolves to the user's users.wait_on_limit — the same
+			// defaulting every other creation path applies (ci_fix/mr_rework/CreateRun).
+			WaitOnLimit: s.resolveWaitOnLimit(ctx, userID, nil),
+		})
 	})
 	if err != nil {
 		return store.Run{}, err
@@ -203,16 +210,28 @@ var ErrTaskReviewAlreadyActive = errors.New("a review run is already active for 
 // partial unique index (23505 → ErrTaskReviewAlreadyActive). The id is minted here so the
 // server-named uzi/task/<id> title/provenance stays consistent with CreateTaskRun, but the
 // review's WORKING branch is the target's, not a fresh one.
-func (s *Service) CreateTaskReviewRun(ctx context.Context, userID, repoID, targetRunID uuid.UUID, branch, baseBranch string) (store.Run, error) {
+//
+// PRD #1429 M3 (D4): targetHarness is the reviewed target's harness, threaded in by the
+// caller (maybeEnqueueTaskReview, where the just-completed target run is already loaded).
+// It rides createRunResolved as an EXPLICIT selection (replacing the M1 HarnessClaude
+// stopgap) so D11 resolution + the INSERT + (for Codex) the binding freeze commit
+// atomically — the review is FROZEN onto the target's harness and never silently
+// alternates providers on one review chain. An inherited-but-unusable harness fails
+// closed with ErrNoCredentialForHarness rather than creating a stranded row.
+func (s *Service) CreateTaskReviewRun(ctx context.Context, userID, repoID, targetRunID uuid.UUID, branch, baseBranch string, targetHarness Harness) (store.Run, error) {
 	id := uuid.New()
-	run, err := s.q.CreateTaskReviewRun(ctx, store.CreateTaskReviewRunParams{
-		RunID:       id,
-		UserID:      userID,
-		RepoID:      repoID,
-		Branch:      pgconv.TextOrNull(branch),
-		BaseBranch:  pgTextTrimNarg(baseBranch),
-		TargetRunID: pgconv.UUID(targetRunID),
-		IssueTitle:  deriveTaskReviewTitle(branch),
+	run, err := s.createRunResolved(ctx, userID, &targetHarness, func(q Store, resolved resolvedHarness) (store.Run, error) {
+		return q.CreateTaskReviewRun(ctx, store.CreateTaskReviewRunParams{
+			RunID:       id,
+			UserID:      userID,
+			RepoID:      repoID,
+			Branch:      pgconv.TextOrNull(branch),
+			BaseBranch:  pgTextTrimNarg(baseBranch),
+			TargetRunID: pgconv.UUID(targetRunID),
+			IssueTitle:  deriveTaskReviewTitle(branch),
+			// PRD #1429 M3 (D4): the inherited target-run harness, frozen in-tx.
+			Harness: string(resolved.Harness),
+		})
 	})
 	if err != nil {
 		var pgErr *pgconn.PgError
@@ -242,7 +261,12 @@ var ErrThenFixAlreadyActive = errors.New("a fix run is already active for this t
 // or kind. A concurrent duplicate trips the partial unique index (23505 →
 // ErrThenFixAlreadyActive). The id is minted here for the same server-named-provenance
 // reason CreateTaskRun/CreateTaskReviewRun mint theirs.
-func (s *Service) CreateThenFixRun(ctx context.Context, userID, repoID, originalRunID uuid.UUID, branch, baseBranch, description string, budgetWall, budgetIters pgtype.Int4) (store.Run, error) {
+//
+// PRD #1429 M3 (D4): originalHarness is the ORIGINAL task's harness, threaded in by the
+// caller (maybeEnqueueThenFix, where the original is already loaded via GetRunByID). It
+// rides createRunResolved as an EXPLICIT selection (replacing the M1 HarnessClaude
+// stopgap), the same atomic-freeze/fail-closed treatment CreateTaskReviewRun gets.
+func (s *Service) CreateThenFixRun(ctx context.Context, userID, repoID, originalRunID uuid.UUID, branch, baseBranch, description string, budgetWall, budgetIters pgtype.Int4, originalHarness Harness) (store.Run, error) {
 	id := uuid.New()
 	// A then-fix INHERITS the original task's persisted budget verbatim (issue #785):
 	// budgetWall / budgetIters are the original run's stored budget_wall_seconds /
@@ -266,21 +290,25 @@ func (s *Service) CreateThenFixRun(ctx context.Context, userID, repoID, original
 		description = strings.ToValidUTF8(description[:keep], "") + marker
 	}
 
-	run, err := s.q.CreateThenFixRun(ctx, store.CreateThenFixRunParams{
-		RunID:               id,
-		UserID:              userID,
-		RepoID:              repoID,
-		Branch:              pgconv.TextOrNull(branch),
-		BaseBranch:          pgTextTrimNarg(baseBranch),
-		ThenFixOfRunID:      pgconv.UUID(originalRunID),
-		IssueTitle:          deriveThenFixTitle(branch),
-		IssueDescription:    description,
-		BudgetWallSeconds:   budgetWall,
-		BudgetMaxIterations: budgetIters,
-		// PRD #35: stamp the owner's usage-limit-parking default, same as CreateTaskRun —
-		// otherwise a fix run falls to the column DEFAULT false and stops on a limit even
-		// when the owner (and the original handoff) opted into parking.
-		WaitOnLimit: s.resolveWaitOnLimit(ctx, userID, nil),
+	run, err := s.createRunResolved(ctx, userID, &originalHarness, func(q Store, resolved resolvedHarness) (store.Run, error) {
+		return q.CreateThenFixRun(ctx, store.CreateThenFixRunParams{
+			RunID:            id,
+			UserID:           userID,
+			RepoID:           repoID,
+			Branch:           pgconv.TextOrNull(branch),
+			BaseBranch:       pgTextTrimNarg(baseBranch),
+			ThenFixOfRunID:   pgconv.UUID(originalRunID),
+			IssueTitle:       deriveThenFixTitle(branch),
+			IssueDescription: description,
+			// PRD #1429 M3 (D4): the inherited original-task harness, frozen in-tx.
+			Harness:             string(resolved.Harness),
+			BudgetWallSeconds:   budgetWall,
+			BudgetMaxIterations: budgetIters,
+			// PRD #35: stamp the owner's usage-limit-parking default, same as CreateTaskRun —
+			// otherwise a fix run falls to the column DEFAULT false and stops on a limit even
+			// when the owner (and the original handoff) opted into parking.
+			WaitOnLimit: s.resolveWaitOnLimit(ctx, userID, nil),
+		})
 	})
 	if err != nil {
 		var pgErr *pgconn.PgError

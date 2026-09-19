@@ -13,10 +13,12 @@
 -- as the target (never cross-user). issue_title/description are synthesized — a judge
 -- has no issue. The one-active-judge-per-target partial unique index (00057) makes a
 -- duplicate raise 23505, which the caller treats as "already being judged" (a no-op).
--- harness (PRD #1332 M5A / D2): SQL literal 'claude', not a param — a judge run is a Claude
--- production origin, and the literal defeats the DEFAULT-masks-omission trap.
+-- harness (PRD #1429 M1, was #1332 M5A / D2): now the @harness PARAMETER supplied by the M5B
+-- create seam (workersvc.createRunAtomic), not the SQL literal 'claude'. A judge inherits its
+-- target run's harness as an explicit selection (D4); M3 wires that real value. Every current
+-- caller passes string(HarnessClaude) as a mechanical stopgap.
 INSERT INTO runs (user_id, kind, target_run_id, issue_title, issue_description, status, trigger_source, harness)
-VALUES (@user_id, 'judge', @target_run_id, @issue_title, @issue_description, 'queued', @trigger_source, 'claude')
+VALUES (@user_id, 'judge', @target_run_id, @issue_title, @issue_description, 'queued', @trigger_source, @harness)
 RETURNING *;
 
 -- name: LastJudgeEnqueuedAt :one
@@ -175,6 +177,10 @@ SELECT * FROM run_reviews WHERE target_run_id = @target_run_id;
 -- pre-feature judge) yields NULLs, which the DTO renders as an absent strip — never a
 -- fabricated 0. Owner-or-admin visibility is enforced by the caller (GetRunForViewer on
 -- the target) BEFORE this read, exactly like GetRunReviewForTarget.
+--
+-- cost_status (PRD #1429 M3, D7) rides along like the token/cost columns above, so the
+-- panel's judge-run strip can tell a real metered dollar total from a subscription/
+-- unreported one that cost_usd alone cannot represent — never a fabricated complete $0.
 SELECT rr.judge_run_id,
        jr.claimed_at,
        jr.started_at,
@@ -183,7 +189,8 @@ SELECT rr.judge_run_id,
        ru.cache_read_tokens,
        ru.cache_creation_tokens,
        ru.output_tokens,
-       ru.cost_usd
+       ru.cost_usd,
+       ru.cost_status
 FROM run_reviews rr
 JOIN runs jr ON jr.id = rr.judge_run_id
 LEFT JOIN run_usage_totals ru ON ru.run_id = rr.judge_run_id

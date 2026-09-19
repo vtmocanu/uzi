@@ -115,16 +115,27 @@ func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 	if !enforceAll && !owner.JudgeEnabled {
 		return
 	}
-	// Gate 4: owner has an Anthropic token. Presence only, not decryptability — a
-	// locked vault just makes the judge run wait 'queued' like any run.
-	if _, err := s.q.GetUserSecretCiphertext(ctx, store.GetUserSecretCiphertextParams{
-		UserID: run.UserID,
-		Kind:   store.KindAnthropicToken,
-	}); err != nil {
-		if !errors.Is(err, pgx.ErrNoRows) {
-			slog.Warn("judge enqueue: token presence check", "run", run.ID, "error", err)
+	// Gate 4 (PRD #1429 M3, D4): usability of the TARGET run's INHERITED harness, not a
+	// hardcoded Anthropic-token presence check. The judge inherits run.Harness as an
+	// EXPLICIT selection (D4's derived-run inheritance rule), so a Codex-only target must
+	// enqueue a Codex judge and a Claude target must still require Anthropic usability.
+	// Mirrors the mr_rework on-demand door gate (task.go StartMRReworkForRun): a Claude
+	// target keeps the existing Anthropic-token presence check (byte-identical to before
+	// this repair); a Codex target's usability is the resolver's own per-harness usability
+	// (workersvc.resolveUsableCodexCredential), enforced authoritatively a few lines below
+	// by the atomic create (createRunResolved fails ErrNoCredentialForHarness for an
+	// inherited-but-unusable Codex harness) — presence-only here would be the same wrong
+	// shape this repair replaces, so Codex gets no separate presence pre-check.
+	if Harness(run.Harness) != HarnessCodex {
+		if _, err := s.q.GetUserSecretCiphertext(ctx, store.GetUserSecretCiphertextParams{
+			UserID: run.UserID,
+			Kind:   store.KindAnthropicToken,
+		}); err != nil {
+			if !errors.Is(err, pgx.ErrNoRows) {
+				slog.Warn("judge enqueue: token presence check", "run", run.ID, "error", err)
+			}
+			return // no token ⇒ nothing to spend ⇒ no judge run
 		}
-		return // no token ⇒ nothing to spend ⇒ no judge run
 	}
 	// Gate 4b (PRD #69 M7a Pass B, Decision 12; PRD #1392 M1): skip the judge for a failure
 	// with no agent behavior to retrospect. Two disjoint sets, differing ONLY in whether the
@@ -175,17 +186,37 @@ func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 	}
 	// Enqueue. The judge run is owned by the SAME user (never cross-user) and targets
 	// this run. A concurrent duplicate trips the one-active-judge-per-target index.
-	judge, err := s.q.CreateJudgeRun(ctx, store.CreateJudgeRunParams{
-		UserID:           run.UserID,
-		TargetRunID:      pgconv.UUID(run.ID),
-		IssueTitle:       judgeRunTitle(run),
-		IssueDescription: "",
-		TriggerSource:    "judge",
+	//
+	// PRD #1429 M3 (D4): routed through the M2 createRunResolved funnel with the TARGET's
+	// harness as an EXPLICIT selection (replacing the M1 HarnessClaude stopgap), so D11
+	// resolution + the INSERT + (for a Codex target) the binding freeze commit atomically —
+	// the judge is FROZEN onto the inherited harness rather than silently alternating onto
+	// the other provider, and an inherited-but-unusable harness fails closed
+	// (ErrNoCredentialForHarness) instead of inserting a stranded row.
+	judgeHarness := Harness(run.Harness)
+	judge, err := s.createRunResolved(ctx, run.UserID, &judgeHarness, func(q Store, resolved resolvedHarness) (store.Run, error) {
+		return q.CreateJudgeRun(ctx, store.CreateJudgeRunParams{
+			UserID:           run.UserID,
+			TargetRunID:      pgconv.UUID(run.ID),
+			IssueTitle:       judgeRunTitle(run),
+			IssueDescription: "",
+			TriggerSource:    "judge",
+			Harness:          string(resolved.Harness),
+		})
 	})
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
 			return // a judge run is already active for this target — expected, not an error
+		}
+		if errors.Is(err, ErrNoCredentialForHarness) {
+			// Legible harness-specific skip (PRD #1429 D4: "no derived run created" without a
+			// visible reason is not accepted): the inherited harness became unusable between
+			// Gate 4's pre-check and this atomic create (a credential deleted mid-race), or —
+			// for a Codex target, which has no separate pre-check — right here.
+			slog.Debug("judge enqueue: inherited harness has no usable credential, skipping judge",
+				"run", run.ID, "harness", run.Harness)
+			return
 		}
 		slog.Warn("judge enqueue: create judge run", "run", run.ID, "error", err)
 		return
@@ -228,9 +259,19 @@ func (s *Service) maybeEnqueueTaskReview(ctx context.Context, run store.Run) {
 		return // a task is repo-ful by shape; guard anyway before dereferencing.
 	}
 	repoID := uuid.UUID(run.RepoID.Bytes)
-	if _, err := s.CreateTaskReviewRun(ctx, run.UserID, repoID, run.ID, run.Branch.String, run.BaseBranch.String); err != nil {
+	// PRD #1429 M3 (D4): the review INHERITS the just-completed target's harness as an
+	// EXPLICIT selection (createRunResolved fails ErrNoCredentialForHarness rather than
+	// falling back if it is no longer usable — see CreateTaskReviewRun).
+	if _, err := s.CreateTaskReviewRun(ctx, run.UserID, repoID, run.ID, run.Branch.String, run.BaseBranch.String, Harness(run.Harness)); err != nil {
 		if errors.Is(err, ErrTaskReviewAlreadyActive) {
 			return // a review run is already active for this target — expected, not an error
+		}
+		if errors.Is(err, ErrNoCredentialForHarness) {
+			// Legible harness-specific skip (PRD #1429 D4): "no derived run created" without a
+			// visible reason is not accepted.
+			slog.Debug("task review enqueue: inherited harness has no usable credential, skipping review",
+				"run", run.ID, "harness", run.Harness)
+			return
 		}
 		slog.Warn("task review enqueue: create review run", "run", run.ID, "error", err)
 	}
@@ -295,11 +336,21 @@ func (s *Service) maybeEnqueueThenFix(ctx context.Context, reviewRun store.Run) 
 		return // a clean review needs no fix
 	}
 	desc := composeThenFixDescription(findings)
+	// PRD #1429 M3 (D4): the fix INHERITS the original task's harness as an EXPLICIT
+	// selection (createRunResolved fails ErrNoCredentialForHarness rather than falling
+	// back if it is no longer usable — see CreateThenFixRun).
 	if _, err := s.CreateThenFixRun(ctx, original.UserID, uuid.UUID(original.RepoID.Bytes),
 		original.ID, original.Branch.String, original.BaseBranch.String, desc,
-		original.BudgetWallSeconds, original.BudgetMaxIterations); err != nil {
+		original.BudgetWallSeconds, original.BudgetMaxIterations, Harness(original.Harness)); err != nil {
 		if errors.Is(err, ErrThenFixAlreadyActive) {
 			return // a fix run is already active for this original — expected, not an error
+		}
+		if errors.Is(err, ErrNoCredentialForHarness) {
+			// Legible harness-specific skip (PRD #1429 D4): "no derived run created" without a
+			// visible reason is not accepted.
+			slog.Debug("then-fix enqueue: inherited harness has no usable credential, skipping fix",
+				"review_run", reviewRun.ID, "target", original.ID, "harness", original.Harness)
+			return
 		}
 		slog.Warn("then-fix enqueue: create fix run", "review_run", reviewRun.ID, "target", original.ID, "error", err)
 	}

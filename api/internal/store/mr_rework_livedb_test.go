@@ -195,6 +195,7 @@ func TestMRReworkLiveDB(t *testing.T) {
 	      VALUES ($1, $2, $3, 'ci_fix', 't', 'd', 4242, 'agent/issue-7', 'running')`,
 		uuid.New(), inUser, repoID)
 	if _, err := q.CreateAutoMRReworkRun(ctx, store.CreateAutoMRReworkRunParams{
+		Harness:          "claude", // PRD #1429 M1: harness is now a required @harness param.
 		UserID:           inUser,
 		RepoID:           repoID,
 		IssueTitle:       "Rework MR review (occupied)",
@@ -213,6 +214,7 @@ func TestMRReworkLiveDB(t *testing.T) {
 	// mr_iid, target_run_id all present). Insert on a DIFFERENT ref so the cross-kind
 	// unique index does not collide with the ci_fix above.
 	run, err := q.CreateAutoMRReworkRun(ctx, store.CreateAutoMRReworkRunParams{
+		Harness:          "claude", // PRD #1429 M1: harness is now a required @harness param.
 		UserID:           inUser,
 		RepoID:           repoID,
 		IssueTitle:       "Rework MR review",

@@ -2,7 +2,7 @@ import type { AutoStatus, SecretMeta } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
 import { mockMyTokenRateLimits, mockSecrets } from "../data";
 import { state } from "../store";
-import { delay, users } from "./shared";
+import { delay, mockScenario, users } from "./shared";
 // secrets ↔ workers is the one accepted import cycle (PRD #991 D4): deleteAnthropicTokenById
 // unbinds workers pinned to the deleted token, and workers' setWorkerBindMode resolves a
 // token label against this roster. Both reads are inside function bodies and no module-level
@@ -80,6 +80,39 @@ const CODEX_KINDS = ["codex_auth", "openai_api_key"] as const;
 type CodexKind = (typeof CODEX_KINDS)[number];
 const isCodexKind = (kind: string): boolean =>
   (CODEX_KINDS as readonly string[]).includes(kind);
+
+// codexOnlySecrets (PRD #1429 M4a): the "codex-only" mock scenario removes every
+// anthropic_token row and guarantees a usable Codex default (D3: a linked codex_auth
+// or an openai_api_key), so the harness picker/badges and the start/schedule/Run
+// Defaults surfaces all see a Codex-only account — no Anthropic credential at all,
+// one usable Codex credential. A no-op for every other scenario, and read-side only
+// (mirrors credentialOverlay in runs.ts): the underlying `secrets` array — and every
+// other mock domain that reads it directly (workers, settings) — is untouched.
+function codexOnlySecrets(rows: SecretMeta[]): SecretMeta[] {
+  if (mockScenario() !== "codex-only") return rows;
+  const withoutAnthropic = rows.filter((s) => s.kind !== "anthropic_token");
+  const usableDefault = withoutAnthropic.find(
+    (s) => isCodexKind(s.kind) && s.is_default && (s.kind === "openai_api_key" || s.codex_status === "linked"),
+  );
+  if (usableDefault) return withoutAnthropic;
+  // No usable Codex default among the seed rows: demote any existing Codex default
+  // (a staging/failed one would otherwise still win the "is_default" lookup) and add
+  // one linked subscription so the scenario always has a usable Codex credential.
+  const now = new Date().toISOString();
+  return [
+    ...withoutAnthropic.map((s) => (isCodexKind(s.kind) ? { ...s, is_default: false } : s)),
+    {
+      id: "sec-codex-demo",
+      kind: "codex_auth",
+      label: "codex-demo",
+      is_default: true,
+      auto_eligible: false,
+      codex_status: "linked",
+      created_at: now,
+      updated_at: now,
+    },
+  ];
+}
 
 function createCodexCredential(kind: CodexKind, label: string, isDefault: boolean) {
   requireUnlockedVault();
@@ -161,7 +194,8 @@ export const secretsApi = {
   listSecrets: async () =>
     delay({
       // Default first, then by label — the order the server's query returns.
-      secrets: [...secrets]
+      // PRD #1429 M4a: codexOnlySecrets overlays the "codex-only" scenario read-side.
+      secrets: codexOnlySecrets([...secrets])
         .sort((a, b) =>
           a.is_default === b.is_default ? a.label.localeCompare(b.label) : a.is_default ? -1 : 1,
         )

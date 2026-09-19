@@ -291,7 +291,7 @@ func TestCreateThenFixRunCopiesOriginalBudget(t *testing.T) {
 	// ... but the original task was stored with 7200 / 7 (e.g. created under earlier config).
 	origWall := pgtype.Int4{Int32: 7200, Valid: true}
 	origIters := pgtype.Int4{Int32: 7, Valid: true}
-	if _, err := svc.CreateThenFixRun(context.Background(), owner, uuid.New(), uuid.New(), "uzi/task/abc", "main", "fix the findings", origWall, origIters); err != nil {
+	if _, err := svc.CreateThenFixRun(context.Background(), owner, uuid.New(), uuid.New(), "uzi/task/abc", "main", "fix the findings", origWall, origIters, HarnessClaude); err != nil {
 		t.Fatalf("CreateThenFixRun: %v", err)
 	}
 	got := fs.thenFixRunParams
@@ -365,7 +365,7 @@ func TestCreateThenFixRunCapsDescription(t *testing.T) {
 		// would split a rune; the cap logic must still yield valid UTF-8.
 		big := strings.Repeat("é", MaxIssueDescriptionBytes) + "\x00tail" // é is 2 bytes → well over the cap, plus a NUL
 		if _, err := svc.CreateThenFixRun(context.Background(), owner, uuid.New(), uuid.New(), "uzi/task/abc", "main", big,
-			pgtype.Int4{}, pgtype.Int4{}); err != nil {
+			pgtype.Int4{}, pgtype.Int4{}, HarnessClaude); err != nil {
 			t.Fatalf("CreateThenFixRun: %v", err)
 		}
 		got := fs.thenFixRunParams
@@ -392,7 +392,7 @@ func TestCreateThenFixRunCapsDescription(t *testing.T) {
 		svc := New(fs, newBox(t), testParams())
 		const withNUL = "abc\x00def" // well under MaxIssueDescriptionBytes; the NUL must be removed, not preserved
 		if _, err := svc.CreateThenFixRun(context.Background(), owner, uuid.New(), uuid.New(), "uzi/task/abc", "main", withNUL,
-			pgtype.Int4{}, pgtype.Int4{}); err != nil {
+			pgtype.Int4{}, pgtype.Int4{}, HarnessClaude); err != nil {
 			t.Fatalf("CreateThenFixRun: %v", err)
 		}
 		got := fs.thenFixRunParams
@@ -412,7 +412,7 @@ func TestCreateThenFixRunCapsDescription(t *testing.T) {
 		svc := New(fs, newBox(t), testParams())
 		const desc = "fix the two findings"
 		if _, err := svc.CreateThenFixRun(context.Background(), owner, uuid.New(), uuid.New(), "uzi/task/abc", "main", desc,
-			pgtype.Int4{}, pgtype.Int4{}); err != nil {
+			pgtype.Int4{}, pgtype.Int4{}, HarnessClaude); err != nil {
 			t.Fatalf("CreateThenFixRun: %v", err)
 		}
 		got := fs.thenFixRunParams

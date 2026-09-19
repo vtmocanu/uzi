@@ -52,6 +52,15 @@ const (
 	// merged or closed.
 	SkipOpenMRExists SkipReason = "open_mr_exists"
 
+	// SkipCodexOverrideConflict ← the fire-time codex+override fail-closed gate (PRD #1429 M2, D5):
+	// a null-harness schedule carrying a stored Anthropic credential override now resolves to Codex
+	// under D11. The Anthropic override cannot ride a Codex run and there is no cross-harness
+	// fallback, so the fire starts no run and leaves the stored override untouched. Benign for a
+	// recurring row: the schedule advances and re-fires next cadence (a credential change may make
+	// it resolvable again). Also mapped from workersvc.ErrCredentialOverrideHarnessUnsupported by
+	// skipReasonForErr, so a stored override that reaches the create seam classifies the same way.
+	SkipCodexOverrideConflict SkipReason = "codex_override_conflict"
+
 	// SkipSchedulesPaused ← the user-level "pause all schedules" kill switch (PRD #1093):
 	// the owner has paused every schedule they own (optionally until an auto-resume instant),
 	// so a fire that comes due while paused starts no run. Benign for a recurring row: the
@@ -59,6 +68,17 @@ const (
 	// #396 property). A once row is different — it is held un-advanced in process() so it
 	// fires on the first tick after the pause ends — and so never records this skip.
 	SkipSchedulesPaused SkipReason = "schedules_paused"
+
+	// SkipNoUsableCredential ← workersvc.ErrNoUsableCredential (PRD #1429 review fix): D11
+	// resolved NEITHER harness usable for the owner (no Anthropic token AND no usable Codex
+	// credential) and no explicit harness selection forces a hard refusal. Before M2 this fell
+	// through skipReasonForErr's default arm as a TRANSIENT error, so the fire never advanced
+	// and the schedule re-fired (and re-hit the forge) every tick — a tick-storm. Benign for a
+	// recurring row instead: the schedule advances normally and re-fires next cadence, once the
+	// owner configures a usable credential. This is deliberately narrower than
+	// ErrNoCredentialForHarness (an EXPLICIT/inherited harness that is unusable), which stays a
+	// hard, non-advancing refusal — only the implicit "neither harness usable" case is benign.
+	SkipNoUsableCredential SkipReason = "no_usable_credential" //nolint:gosec // G101: a schedule-skip-reason VOCABULARY value, not a credential — mirrors the same-shaped exclusion already granted the "credential"-named vocabulary constants elsewhere (e.g. store.KindAnthropicToken, capability.CredentialSwitchV1).
 )
 
 // AllSkipReasons lists every SkipReason in the closed set. The cross-language contract
@@ -71,7 +91,9 @@ var AllSkipReasons = []SkipReason{
 	SkipVaultLocked,
 	SkipSelfImproveMRCapReached,
 	SkipOpenMRExists,
+	SkipCodexOverrideConflict,
 	SkipSchedulesPaused,
+	SkipNoUsableCredential,
 }
 
 // skipReasonForErr maps the benign run-creation seam sentinels to their SkipReason.
@@ -90,6 +112,19 @@ func skipReasonForErr(err error) (SkipReason, bool) {
 		return SkipDescriptionTooLarge, true
 	case errors.Is(err, workersvc.ErrOpenMRExists):
 		return SkipOpenMRExists, true
+	case errors.Is(err, workersvc.ErrCredentialOverrideHarnessUnsupported):
+		// PRD #1429 M2 (D5): a stored Anthropic override that reached the create seam on a run
+		// resolving to Codex. The scheduler's fire-time gate normally catches this first, but the
+		// mapping keeps the classification stable if a fire ever surfaces it via the seam.
+		return SkipCodexOverrideConflict, true
+	case errors.Is(err, workersvc.ErrNoUsableCredential):
+		// Review fix (PRD #1429): D11 found neither harness usable for the owner. Checked with
+		// errors.Is (not ==) because ErrNoUsableCredential wraps errCredentialUnavailable. Benign,
+		// advancing — see the SkipNoUsableCredential doc for why this must NOT fall to the
+		// transient default arm (it would tick-storm: re-fire, re-hit the forge, never advance).
+		// ErrNoCredentialForHarness is intentionally NOT mapped here: an explicit/inherited
+		// harness with no usable credential stays a hard, non-advancing refusal.
+		return SkipNoUsableCredential, true
 	default:
 		return "", false
 	}

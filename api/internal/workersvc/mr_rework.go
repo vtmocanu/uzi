@@ -122,31 +122,44 @@ func (s *Service) createMRReworkRun(ctx context.Context, userID, repoID uuid.UUI
 	// per-run wait_on_limit request to honour.
 	waitOnLimit := s.resolveWaitOnLimit(ctx, userID, nil)
 
-	var (
-		run store.Run
-		err error
-	)
-	if highWater == nil {
-		// Automatic path: the poller advances the ledger separately in its proceed step.
-		// PRD #1202: trigger_source is 'mr_rework' from the poller detector. kind stays
-		// 'mr_rework' either way; only trigger_source discriminates them (D7).
-		run, err = s.q.CreateAutoMRReworkRun(ctx, store.CreateAutoMRReworkRunParams{
-			UserID:           userID,
-			RepoID:           repoID,
-			IssueTitle:       title,
-			IssueDescription: description,
-			PipelineRef:      pgtype.Text{String: ref, Valid: true},
-			MrIid:            pgtype.Int8{Int64: mrIID, Valid: true},
-			TargetRunID:      pgtype.UUID{Bytes: sourceRunID, Valid: true},
-			ReviewComments:   reviewJSON,
-			WaitOnLimit:      waitOnLimit,
-			TriggerSource:    triggerSource,
-		})
-	} else {
+	// PRD #1429 M2 (D4): a derived MR-rework INHERITS the source run's harness as an EXPLICIT
+	// selection — a review chain must not silently alternate providers. The source run is loaded
+	// here (both callers pass its id); an inherited-but-now-unusable harness makes createRunResolved
+	// fail with ErrNoCredentialForHarness (explicit classification, no fallback) — the manual handler
+	// returns the typed error and the auto poller records a nonsecret skip.
+	sourceRun, err := s.q.GetRunByID(ctx, sourceRunID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return store.Run{}, ErrRunNotFound
+		}
+		return store.Run{}, fmt.Errorf("load mr_rework source run: %w", err)
+	}
+	sourceHarness := Harness(sourceRun.Harness)
+
+	run, err := s.createRunResolved(ctx, userID, &sourceHarness, func(q Store, resolved resolvedHarness) (store.Run, error) {
+		if highWater == nil {
+			// Automatic path: the poller advances the ledger separately in its proceed step.
+			// PRD #1202: trigger_source is 'mr_rework' from the poller detector. kind stays
+			// 'mr_rework' either way; only trigger_source discriminates them (D7).
+			return q.CreateAutoMRReworkRun(ctx, store.CreateAutoMRReworkRunParams{
+				UserID:           userID,
+				RepoID:           repoID,
+				IssueTitle:       title,
+				IssueDescription: description,
+				PipelineRef:      pgtype.Text{String: ref, Valid: true},
+				MrIid:            pgtype.Int8{Int64: mrIID, Valid: true},
+				TargetRunID:      pgtype.UUID{Bytes: sourceRunID, Valid: true},
+				ReviewComments:   reviewJSON,
+				WaitOnLimit:      waitOnLimit,
+				TriggerSource:    triggerSource,
+				// PRD #1429 M2 (D4): the inherited source-run harness, frozen in-tx.
+				Harness: string(resolved.Harness),
+			})
+		}
 		// Manual (on-demand) path: the run INSERT and the non-counting high-water advance
 		// commit atomically as ONE statement — trigger_source='manual' is hard-coded in the
 		// query, so it is not a param here (PRD #1202 review-finding hardening).
-		run, err = s.q.CreateManualMRReworkRunAndAdvance(ctx, store.CreateManualMRReworkRunAndAdvanceParams{
+		return q.CreateManualMRReworkRunAndAdvance(ctx, store.CreateManualMRReworkRunAndAdvanceParams{
 			UserID:           userID,
 			RepoID:           repoID,
 			IssueTitle:       title,
@@ -157,8 +170,10 @@ func (s *Service) createMRReworkRun(ctx context.Context, userID, repoID uuid.UUI
 			ReviewComments:   reviewJSON,
 			WaitOnLimit:      waitOnLimit,
 			HighWater:        *highWater,
+			// PRD #1429 M2 (D4): the inherited source-run harness, frozen in-tx.
+			Harness: string(resolved.Harness),
 		})
-	}
+	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			// WHERE NOT EXISTS matched an active cross-kind ci_fix sibling on this pipeline_ref:
@@ -278,12 +293,18 @@ func (s *Service) StartMRReworkForRun(ctx context.Context, userID, runID uuid.UU
 
 	// The owner must be able to pay for the run this would mint (the candidate query's
 	// token gate, applied at the door instead of burning a worker on a doomed run).
-	hasToken, err := s.q.UserHasAnthropicToken(ctx, userID)
-	if err != nil {
-		return store.Run{}, fmt.Errorf("check anthropic token: %w", err)
-	}
-	if !hasToken {
-		return store.Run{}, ErrReworkNoToken
+	// PRD #1429 M2: the door gate is HARNESS-AWARE — a Codex source run inherits Codex, whose
+	// usability is Codex-credential-based, so an Anthropic token is NOT required for it. The
+	// authoritative codex-usability check is createRunResolved (it fails ErrNoCredentialForHarness
+	// if the inherited codex harness is unusable). Only a Claude source run keeps the Anthropic gate.
+	if Harness(run.Harness) != HarnessCodex {
+		hasToken, err := s.q.UserHasAnthropicToken(ctx, userID)
+		if err != nil {
+			return store.Run{}, fmt.Errorf("check anthropic token: %w", err)
+		}
+		if !hasToken {
+			return store.Run{}, ErrReworkNoToken
+		}
 	}
 
 	// The loop-guard ledger. No row = zero values (never reworked), exactly as the detector

@@ -141,10 +141,17 @@ describe("applyFrame", () => {
 });
 
 describe("startRunGate", () => {
+  // PRD #1429 M4a made the credential gate harness-aware: `hasToken` is replaced by
+  // `claudeUsable`/`codexUsable` + the harness this start will use. `ok` is the
+  // pre-M4a-equivalent Claude-only-usable, inherit-harness baseline, so every
+  // existing precondition assertion below is unchanged in spirit.
   const ok = {
     closed: false,
     hasWorker: true,
-    hasToken: true,
+    claudeUsable: true,
+    codexUsable: false,
+    hasCodexCredential: false,
+    harness: "inherit" as const,
     activeRunExists: false,
   };
 
@@ -170,11 +177,66 @@ describe("startRunGate", () => {
     expect(startRunGate({ ...ok, hasWorker: false }).reason).toMatch(/worker/i);
   });
 
-  it("requires an Anthropic token", () => {
-    expect(startRunGate({ ...ok, hasToken: false }).reason).toMatch(/token/i);
+  it("requires an Anthropic token on the inherit (single-Claude-harness) path", () => {
+    expect(startRunGate({ ...ok, claudeUsable: false }).reason).toMatch(/token/i);
   });
 
   it("blocks a second active run for the same issue", () => {
     expect(startRunGate({ ...ok, activeRunExists: true }).reason).toMatch(/already in progress/i);
+  });
+
+  // PRD #1429 M4a, D3: harness-aware gating and copy.
+  describe("harness-aware credential gate", () => {
+    it("enables inherit when EITHER harness is usable (codex-only)", () => {
+      expect(startRunGate({ ...ok, claudeUsable: false, codexUsable: true })).toEqual({
+        enabled: true,
+        reason: "",
+      });
+    });
+
+    it("never tells a Codex-only user to add an Anthropic token", () => {
+      const g = startRunGate({
+        ...ok,
+        claudeUsable: false,
+        codexUsable: false,
+        hasCodexCredential: true,
+      });
+      expect(g.enabled).toBe(false);
+      expect(g.reason).not.toMatch(/anthropic/i);
+    });
+
+    it("keeps the Anthropic wording for a Claude-only user with no Codex credential at all", () => {
+      const g = startRunGate({ ...ok, claudeUsable: false, codexUsable: false });
+      expect(g.enabled).toBe(false);
+      expect(g.reason).toMatch(/anthropic token/i);
+    });
+
+    it("an explicit codex choice checks codex usability only, not claude", () => {
+      const g = startRunGate({
+        ...ok,
+        harness: "codex",
+        claudeUsable: false,
+        codexUsable: false,
+      });
+      expect(g.enabled).toBe(false);
+      expect(g.reason).toMatch(/codex/i);
+    });
+
+    it("an explicit codex choice enables even when claude is unusable", () => {
+      expect(
+        startRunGate({ ...ok, harness: "codex", claudeUsable: false, codexUsable: true }),
+      ).toEqual({ enabled: true, reason: "" });
+    });
+
+    it("an explicit claude choice checks claude usability only, not codex", () => {
+      const g = startRunGate({
+        ...ok,
+        harness: "claude",
+        claudeUsable: false,
+        codexUsable: true,
+      });
+      expect(g.enabled).toBe(false);
+      expect(g.reason).toMatch(/anthropic token/i);
+    });
   });
 });

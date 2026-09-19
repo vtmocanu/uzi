@@ -23,6 +23,9 @@ import type { Outbox } from "./outbox.js";
 import type { EmittedMessage } from "./executor.js";
 import { classifyLimitFailure, LimitReachedError } from "./limit.js";
 import type { SdkQueryFn } from "./sdk-executor.js";
+import { selectCodexBinding } from "./codex/select.js"; // PRD #1429 M3: the pure, fail-closed claim-shape discriminator — NOT a Codex class construction
+import type { CodexBinding } from "./codex/select.js";
+import type { CodexAdviceHarnessFactory } from "./codex/codex-executor.js"; // type-only — the injected seam, never constructed here
 import { errMessage } from "./util.js";
 import type {
   ClaimResponse,
@@ -138,6 +141,13 @@ export interface JudgeRunnerOptions {
    *  it is listed in the worker's ActiveSnapshot at phase `running` for its whole life
    *  (a judge never parks). Undefined ⇒ no tracking. */
   activeRuns?: ActiveRunRegistry;
+  /** PRD #1429 M3: the injected Codex advice-harness factory. Built ONLY in main.ts /
+   *  codex/codex-executor.ts (the two sites semgrep/codex-fixed-constructor.yml allows to
+   *  construct a Codex class) and threaded in here so a Codex judge claim (secrets.codex
+   *  present) drives a REAL Codex advice pass instead of the missing-token fallback.
+   *  Undefined ⇒ a Codex judge claim fails closed rather than silently falling back to
+   *  Claude or to the deterministic fallback as if untokened. */
+  codexAdviceHarnessFactory?: CodexAdviceHarnessFactory;
   /** PRD #1391 Run B M3b (D6): the worker outbox + its terminal knobs, so the judge journals its
    *  terminal STATE (never the verdict POST) write-ahead — a lost judge terminal would otherwise sit
    *  `running` forever (the timeout sweep excludes judge runs, fact 12). Undefined ⇒ un-journaled. */
@@ -151,6 +161,7 @@ export class JudgeRunner {
   private readonly homeRoot: string;
   private readonly modelTimeoutMs: number;
   private readonly activeRuns: ActiveRunRegistry | undefined;
+  private readonly codexAdviceHarnessFactory: CodexAdviceHarnessFactory | undefined;
   /** PRD #1391 Run B M3b: the terminal-resolve deps, or undefined when no usable outbox is wired. */
   private readonly terminalDeps: TerminalOutboxDeps | undefined;
 
@@ -163,6 +174,7 @@ export class JudgeRunner {
     this.homeRoot = opts.homeRoot ?? os.tmpdir();
     this.modelTimeoutMs = opts.modelTimeoutMs ?? JUDGE_MODEL_TIMEOUT_MS;
     this.activeRuns = opts.activeRuns;
+    this.codexAdviceHarnessFactory = opts.codexAdviceHarnessFactory;
     this.terminalDeps = makeTerminalOutboxDeps(opts.outbox, this.client, {
       gapFillMax: opts.gapFillMax ?? 10_000,
       terminalMaxBytes: opts.outboxTerminalMaxBytes ?? Math.round(1.25 * 1024 * 1024),
@@ -233,14 +245,24 @@ export class JudgeRunner {
         return;
       }
       const trace = await this.fetchTrace(targetId);
-      const token = claim.secrets?.anthropic_oauth_token?.trim();
-      if (!token) {
-        this.log.warn("judge claim carried no Anthropic token; using deterministic fallback", { run_id: judgeRunId });
-        review = fallbackReview(claim.judge_signal);
+      // PRD #1429 M3 (D4): the claim SHAPE decides the advice lane, not a hardcoded
+      // Anthropic-token check. selectCodexBinding is the SAME pure, fail-closed
+      // discriminator the run lane uses (agent/src/main.ts's makeExecutor); a malformed
+      // codex block falls through to the outer catch's deterministic fallback exactly like
+      // any other trace/prep failure — the judge lane's "never spuriously fail" posture.
+      const selection = selectCodexBinding({ codex: claim.secrets.codex });
+      if (selection.kind === "codex") {
+        review = await this.judgeCodex(claim, trace, selection.binding);
       } else {
-        const judged = await this.judge(claim, trace, token);
-        review = judged.review;
-        usageMessage = judged.usageMessage;
+        const token = claim.secrets?.anthropic_oauth_token?.trim();
+        if (!token) {
+          this.log.warn("judge claim carried no Anthropic token; using deterministic fallback", { run_id: judgeRunId });
+          review = fallbackReview(claim.judge_signal);
+        } else {
+          const judged = await this.judge(claim, trace, token);
+          review = judged.review;
+          usageMessage = judged.usageMessage;
+        }
       }
     } catch (err) {
       this.log.warn("judge trace/prep failed; posting deterministic fallback", {
@@ -355,6 +377,8 @@ export class JudgeRunner {
         claim.judge_signal ?? null,
         claim.known_improve_uzi_targets ?? [],
         claim.failure_class ?? null,
+        claim.target_cost_status ?? null,
+        claim.target_cost_usd ?? null,
       );
       const { text, result } = await this.runModel(token, model, prompt, claim.config?.default_effort);
       return { review: calibrateReview(parseReview(text, model), claim.failure_class ?? null), usageMessage: result };
@@ -368,6 +392,56 @@ export class JudgeRunner {
       // No usageMessage on the fallback: the model call did not complete, so there is
       // no terminal result frame — and no spend — to fold.
       return { review: fb };
+    }
+  }
+
+  /** PRD #1429 M3: the CODEX judge model call — same prompt/parse/calibrate shape as
+   *  `judge` above, but routed through the injected Codex advice-harness factory via
+   *  `runReadOnlyModelPass`'s `codex` option instead of an Anthropic token. Falls back to
+   *  the deterministic review on ANY failure, exactly like `judge` (never a spurious judge
+   *  failure). A missing factory (a wiring gap) fails closed the same way: the deterministic
+   *  fallback still lands, never a silent Claude substitution.
+   *
+   *  No usageMessage: Codex M3 carries no rate-limit/usage-frame mapping equivalent to
+   *  mapSdkMessage's Claude SDK result yet, so this posts no run_usage row for the judge's
+   *  own spend (a Codex judge's cost accounting is a separate, later concern from routing). */
+  private async judgeCodex(claim: ClaimResponse, trace: JudgeTraceResponse, binding: CodexBinding): Promise<ReviewRequest> {
+    const model = (claim.judge_model ?? "").trim();
+    try {
+      if (!this.codexAdviceHarnessFactory) {
+        throw new Error("judge claim carries a Codex binding but no Codex advice-harness factory is wired");
+      }
+      const prompt = buildJudgePrompt(
+        trace,
+        claim.judge_signal ?? null,
+        claim.known_improve_uzi_targets ?? [],
+        claim.failure_class ?? null,
+        claim.target_cost_status ?? null,
+        claim.target_cost_usd ?? null,
+      );
+      const text = await runReadOnlyModelPass({
+        model,
+        effort: claim.config?.default_effort,
+        systemPrompt: JUDGE_SYSTEM_PROMPT,
+        prompt,
+        homeRoot: this.homeRoot,
+        homePrefix: "uzi-judge-",
+        label: "judge",
+        timeoutMs: this.modelTimeoutMs,
+        queryFn: this.queryFn,
+        denyReason: "the judge is read-only and runs no tools",
+        log: this.log,
+        codex: { runId: claim.run_id, binding, buildHarness: this.codexAdviceHarnessFactory },
+      });
+      return calibrateReview(parseReview(text, model), claim.failure_class ?? null);
+    } catch (err) {
+      this.log.warn("judge model call failed; using deterministic fallback", {
+        run_id: claim.run_id,
+        error: errMessage(err),
+      });
+      const fb = fallbackReview(claim.judge_signal);
+      fb.model = model;
+      return fb;
     }
   }
 
@@ -416,18 +490,48 @@ export class JudgeRunner {
 
 }
 
+/** PRD #1429 M3, D7: the ONE place the judge prompt names the reviewed run's TRUSTED
+ *  cost-observability status (server-computed from run_usage_totals, never trace-derived).
+ *  Rendered honestly: metered shows a dollar figure when known, subscription is labelled
+ *  and carries NO dollar figure, unreported says the total is incomplete — a
+ *  subscription/unreported run is never presented as a complete $0. A value outside the
+ *  closed three (a newer server) is still named plainly rather than silently dropped or
+ *  read as zero. "" (omitted from the prompt) only when there is no usage row at all. */
+export function renderTargetCostLine(status: string | null | undefined, costUsd: number | null | undefined): string {
+  switch (status) {
+    case "metered":
+      return typeof costUsd === "number" && Number.isFinite(costUsd)
+        ? `Reviewed run cost: $${costUsd.toFixed(2)} (metered).`
+        : "Reviewed run cost: metered (dollar amount unavailable).";
+    case "subscription":
+      return "Reviewed run cost: subscription usage — no per-token dollar figure applies.";
+    case "unreported":
+      return "Reviewed run cost: unreported — token totals only; the dollar cost is unavailable for this harness/plan.";
+    case null:
+    case undefined:
+    case "":
+      return "";
+    default:
+      return `Reviewed run cost status: ${status} (unrecognised status; never assume $0).`;
+  }
+}
+
 /** Build the judge's user prompt: target metadata + steering log + the
  *  command-not-found signal + the owner's known improve_uzi targets (issue #232) + a
  *  head/tail-sampled, char-budgeted message trace, all fenced as UNTRUSTED DATA.
  *
  *  `knownTargets` defaults to `[]` so a caller that never passes it (and the empty-menu
  *  case) yields a prompt BYTE-FOR-BYTE identical to before this field existed — the menu
- *  block is only appended when the list is non-empty. */
+ *  block is only appended when the list is non-empty. Likewise `targetCostStatus`/
+ *  `targetCostUsd` default to null so an omitting caller (or a target with no usage row)
+ *  keeps the prompt byte-for-byte identical to before PRD #1429 M3. */
 export function buildJudgePrompt(
   trace: JudgeTraceResponse,
   signal: JudgeSignal | null,
   knownTargets: string[] = [],
   failureClass: string | null = null,
+  targetCostStatus: string | null = null,
+  targetCostUsd: number | null = null,
 ): string {
   const t = trace.target;
   const header = [
@@ -440,6 +544,9 @@ export function buildJudgePrompt(
     // it is safe alongside status/iterations rather than inside the untrusted fence. The
     // ENUM VALUE ONLY (never failure_reason free text); omitted when null.
     failureClass ? `Failure class: ${failureClass}` : "",
+    // PRD #1429 M3, D7: the reviewed run's TRUSTED cost-observability status — see
+    // renderTargetCostLine's own comment for the honesty rule this line enforces.
+    renderTargetCostLine(targetCostStatus, targetCostUsd),
     // The TRUSTED terminal stop disposition (runs.stop_kind closed CHECK enum, PRD #634
     // M1) — server-computed like status/fail_origin, so it belongs in this pre-fence
     // header, not the untrusted fence. Null on a normal run, so both this line and the

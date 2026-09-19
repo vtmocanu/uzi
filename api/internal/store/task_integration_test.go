@@ -57,6 +57,7 @@ func TestCreateTaskRunLiveDB(t *testing.T) {
 	id := uuid.New()
 	branch := "uzi/task/" + id.String()
 	run, err := q.CreateTaskRun(ctx, store.CreateTaskRunParams{
+		Harness:          "claude", // PRD #1429 M1: harness is now a required @harness param.
 		RunID:            id,
 		UserID:           userID,
 		RepoID:           repoID,
@@ -97,6 +98,7 @@ func TestCreateTaskRunLiveDB(t *testing.T) {
 	// ── open_mr rides straight from the caller: true when passed. ──
 	id2 := uuid.New()
 	run2, err := q.CreateTaskRun(ctx, store.CreateTaskRunParams{
+		Harness:          "claude", // PRD #1429 M1: harness is now a required @harness param.
 		RunID:            id2,
 		UserID:           userID,
 		RepoID:           repoID,
@@ -181,6 +183,7 @@ func TestTaskRunDispatchGateLiveDB(t *testing.T) {
 	// branch yet), so it is NOT-yet-claimable.
 	id := uuid.New()
 	task, err := q.CreateTaskRun(ctx, store.CreateTaskRunParams{
+		Harness:          "claude", // PRD #1429 M1: harness is now a required @harness param.
 		RunID:            id,
 		UserID:           userID,
 		RepoID:           repoID,
@@ -236,7 +239,8 @@ func TestTaskRunDispatchGateLiveDB(t *testing.T) {
 	}
 	id2 := uuid.New()
 	task2, err := q.CreateTaskRun(ctx, store.CreateTaskRunParams{
-		RunID: id2, UserID: userID, RepoID: repoID,
+		Harness: "claude", // PRD #1429 M1: harness is now a required @harness param.
+		RunID:   id2, UserID: userID, RepoID: repoID,
 		Branch:     pgtype.Text{String: "uzi/task/" + id2.String(), Valid: true},
 		IssueTitle: "t2", IssueDescription: "d2",
 	})

@@ -6,6 +6,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { RunDefaults } from "./RunDefaults";
@@ -103,8 +104,8 @@ function mockAuth(user: User, over: Partial<ReturnType<typeof useAuth>> = {}) {
 
 beforeEach(() => {
   mockApi.listSecrets.mockResolvedValue({ secrets: [] });
-  mockApi.getMySettings.mockResolvedValue({ settings: { default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null } });
-  mockApi.putMySettings.mockResolvedValue({ settings: { default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: "mission" } });
+  mockApi.getMySettings.mockResolvedValue({ settings: { default_harness: null, default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null } });
+  mockApi.putMySettings.mockResolvedValue({ settings: { default_harness: null, default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: "mission" } });
   mockApi.getMySlack.mockResolvedValue({
     slack: { member_id: null, notify: true, resolved_id: null, confirmed: false, state: "unlinked", workspace: "connected" },
   });
@@ -264,10 +265,10 @@ describe("Run defaults — judge enforced banner + per-user model (PRD #69 M4)",
 
   it("saves the per-user judge model through PUT /me/settings", async () => {
     mockApi.getMySettings.mockResolvedValue({
-      settings: { default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
+      settings: { default_harness: null, default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
     });
     mockApi.putMySettings.mockResolvedValue({
-      settings: { default_model: null, default_effort: null, judge_model: "haiku", summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
+      settings: { default_harness: null, default_model: null, default_effort: null, judge_model: "haiku", summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
     });
     render(
       <MemoryRouter>
@@ -296,10 +297,10 @@ describe("Run defaults — per-user summary model (PRD #362 M2)", () => {
 
   it("saves the per-user summary model through PUT /me/settings", async () => {
     mockApi.getMySettings.mockResolvedValue({
-      settings: { default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
+      settings: { default_harness: null, default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
     });
     mockApi.putMySettings.mockResolvedValue({
-      settings: { default_model: null, default_effort: null, judge_model: null, summary_model: "haiku", appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
+      settings: { default_harness: null, default_model: null, default_effort: null, judge_model: null, summary_model: "haiku", appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
     });
     render(
       <MemoryRouter>
@@ -318,7 +319,7 @@ describe("Run defaults — per-user summary model (PRD #362 M2)", () => {
 describe("Run defaults — per-user reasoning effort (PRD #617 M5)", () => {
   it("loads and shows the saved effort", async () => {
     mockApi.getMySettings.mockResolvedValue({
-      settings: { default_model: null, default_effort: "low", judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
+      settings: { default_harness: null, default_model: null, default_effort: "low", judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
     });
     render(
       <MemoryRouter>
@@ -332,10 +333,10 @@ describe("Run defaults — per-user reasoning effort (PRD #617 M5)", () => {
 
   it("changing the dropdown enables Save and sends the chosen level", async () => {
     mockApi.getMySettings.mockResolvedValue({
-      settings: { default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
+      settings: { default_harness: null, default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
     });
     mockApi.putMySettings.mockResolvedValue({
-      settings: { default_model: null, default_effort: "low", judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
+      settings: { default_harness: null, default_model: null, default_effort: "low", judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
     });
     render(
       <MemoryRouter>
@@ -355,10 +356,10 @@ describe("Run defaults — per-user reasoning effort (PRD #617 M5)", () => {
 
   it("selecting Inherit sends default_effort: null", async () => {
     mockApi.getMySettings.mockResolvedValue({
-      settings: { default_model: null, default_effort: "max", judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
+      settings: { default_harness: null, default_model: null, default_effort: "max", judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
     });
     mockApi.putMySettings.mockResolvedValue({
-      settings: { default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
+      settings: { default_harness: null, default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
     });
     render(
       <MemoryRouter>
@@ -865,5 +866,192 @@ describe("Run defaults — CI autofix tri-state display (PRD #914 M3)", () => {
       </MemoryRouter>,
     );
     expect(ciAutofixToggle().checked).toBe(false);
+  });
+});
+
+// PRD #1429 M4a, D2/D3/D6: the Default harness card.
+describe("Run defaults — default harness card (PRD #1429 M4a)", () => {
+  const anthropicToken = {
+    id: "sec-anthropic",
+    kind: "anthropic_token",
+    label: "console-key",
+    is_default: true,
+    auto_eligible: false,
+    created_at: "2026-01-01T00:00:00Z",
+    updated_at: "2026-01-01T00:00:00Z",
+  };
+  const codexKey = {
+    id: "sec-codex",
+    kind: "openai_api_key",
+    label: "codex-key",
+    is_default: true,
+    auto_eligible: false,
+    created_at: "2026-01-01T00:00:00Z",
+    updated_at: "2026-01-01T00:00:00Z",
+  };
+
+  it("renders no harness card for a Claude-only user (today's flow, unchanged)", async () => {
+    mockAuth(baseUser);
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken] });
+    render(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+    await screen.findByText("Worker model");
+    expect(screen.queryByText("Default harness")).toBeNull();
+  });
+
+  it("shows the harness card once both harnesses are usable, defaulting to inherit", async () => {
+    mockAuth(baseUser);
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken, codexKey] });
+    render(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+    const picker = (await screen.findByLabelText("Default harness")) as HTMLSelectElement;
+    expect(picker.value).toBe("inherit");
+    // Save is disabled until the picker actually changes.
+    expect(screen.getByRole("button", { name: "Save harness" }) as HTMLButtonElement).toHaveProperty(
+      "disabled",
+      true,
+    );
+  });
+
+  it("saves the picked harness via PATCH /me/settings", async () => {
+    mockAuth(baseUser);
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken, codexKey] });
+    mockApi.getMySettings.mockResolvedValue({
+      settings: {
+        default_harness: null,
+        default_model: null,
+        default_effort: null,
+        judge_model: null,
+        summary_model: null,
+        appearance_mode: null,
+        light_theme: null,
+        dark_theme: null,
+        typeface: null,
+        theme: null,
+      },
+    });
+    mockApi.putMySettings.mockResolvedValue({
+      settings: {
+        default_harness: "codex",
+        default_model: null,
+        default_effort: null,
+        judge_model: null,
+        summary_model: null,
+        appearance_mode: null,
+        light_theme: null,
+        dark_theme: null,
+        typeface: null,
+        theme: null,
+      },
+    });
+    render(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+    const picker = (await screen.findByLabelText("Default harness")) as HTMLSelectElement;
+    fireEvent.change(picker, { target: { value: "codex" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save harness" }));
+    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({ default_harness: "codex" }));
+    await screen.findByText(/Default harness set to codex/);
+  });
+
+  // D6: switching the default harness to Codex resets an incompatible SAVED worker
+  // model (a Claude alias) to inherit in the SAME write, rather than persist a
+  // knowingly-invalid pair.
+  it("resets an incompatible saved worker model to inherit when switching to Codex", async () => {
+    mockAuth(baseUser);
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken, codexKey] });
+    mockApi.getMySettings.mockResolvedValue({
+      settings: {
+        default_harness: null,
+        default_model: "opus",
+        default_effort: null,
+        judge_model: null,
+        summary_model: null,
+        appearance_mode: null,
+        light_theme: null,
+        dark_theme: null,
+        typeface: null,
+        theme: null,
+      },
+    });
+    mockApi.putMySettings.mockResolvedValue({
+      settings: {
+        default_harness: "codex",
+        default_model: null,
+        default_effort: null,
+        judge_model: null,
+        summary_model: null,
+        appearance_mode: null,
+        light_theme: null,
+        dark_theme: null,
+        typeface: null,
+        theme: null,
+      },
+    });
+    render(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+    const picker = (await screen.findByLabelText("Default harness")) as HTMLSelectElement;
+    fireEvent.change(picker, { target: { value: "codex" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save harness" }));
+    await waitFor(() =>
+      expect(mockApi.putMySettings).toHaveBeenCalledWith({ default_harness: "codex", default_model: null }),
+    );
+    await screen.findByText(/worker model was reset to Inherit/);
+    // The Worker model picker itself now reflects the cleared value. ModelSelect
+    // derives its own <select> mode from a passive effect one render AFTER the
+    // `value` prop changes, so this settles on a LATER tick than the notice text
+    // above (which commits in the SAME render as the prop change) — wrapped in
+    // waitFor rather than a bare synchronous read, or this assertion can run before
+    // that effect has flushed and see the stale "custom" mode.
+    await waitFor(() => {
+      const modelSelect = screen.getByLabelText("Model") as HTMLSelectElement;
+      expect(modelSelect.value).toBe("inherit");
+    });
+  });
+
+  it("offers the Codex model vocabulary on Worker model once Codex is the selected harness", async () => {
+    mockAuth(baseUser);
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken, codexKey] });
+    render(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+    const picker = (await screen.findByLabelText("Default harness")) as HTMLSelectElement;
+    fireEvent.change(picker, { target: { value: "codex" } });
+    // Scoped to the Worker model <select> itself: the Judge/Summary model pickers
+    // stay Claude-only and also render an "opus" option, so an unscoped query is
+    // ambiguous across all three.
+    const modelSelect = screen.getByLabelText("Model") as HTMLSelectElement;
+    expect(within(modelSelect).getByRole("option", { name: "gpt-6-astra" })).toBeTruthy();
+    expect(within(modelSelect).queryByRole("option", { name: "opus" })).toBeNull();
+  });
+
+  // PR #1449 review: a Codex-only user never sees the harness card (D2), so the pick
+  // stays "inherit" while every run resolves to Codex. Keyed on the raw pick, Worker
+  // model offered only Claude aliases, and a saved one was dropped at claim.
+  it("offers the Codex model vocabulary on Worker model to a Codex-only user with no harness card", async () => {
+    mockAuth(baseUser);
+    mockApi.listSecrets.mockResolvedValue({ secrets: [codexKey] });
+    render(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+    const modelSelect = (await screen.findByLabelText("Model")) as HTMLSelectElement;
+    await waitFor(() => expect(within(modelSelect).getByRole("option", { name: "gpt-6-astra" })).toBeTruthy());
+    expect(within(modelSelect).queryByRole("option", { name: "opus" })).toBeNull();
+    expect(screen.queryByText("Default harness")).toBeNull();
   });
 });

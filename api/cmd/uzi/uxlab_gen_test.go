@@ -221,15 +221,16 @@ func boardRuns(now time.Time) []apitypes.RunListItemDTO {
 	runs[5].IssueIID, runs[5].IssueWebURL = ip(419), iurl(419)
 	runs[6].IssueIID, runs[6].IssueWebURL = ip(463), iurl(463)
 	runs[7].IssueIID, runs[7].IssueWebURL = ip(408), iurl(408)
-	// PRD #650: attach Usage to a spread of runs so the board's COST column and floor total are
-	// exercised with all four states plus the blank cell visible together — $N (a normal rounded
-	// cost), $1187 (a big cost), <$1 (a real sub-dollar cost), — (a subscription $0), and blank
+	// PRD #650 / #1429 M5: attach Usage to a spread of runs so the board's COST column and floor
+	// total are exercised with all four states plus the blank cell visible together — $N (a
+	// normal rounded metered cost), $1187 (a big metered cost), <$1 (a real sub-dollar metered
+	// cost), sub (a subscription-billed run, cost_status-driven — never a guessed $0), and blank
 	// (nil Usage, the common case worth checking for alignment). runs[0]'s cost is kept identical
 	// to the detail-running scene, which reuses this same run id.
-	runs[0].Usage = &apitypes.UsageDTO{CostUSD: 9.55, InputTokens: 2_400_000, CacheReadTokens: 14_200_000, CacheCreationTokens: 120_000, OutputTokens: 88_400}          // → $10
-	runs[2].Usage = &apitypes.UsageDTO{CostUSD: 1187.0, InputTokens: 40_000_000, CacheReadTokens: 900_000_000, CacheCreationTokens: 2_000_000, OutputTokens: 3_200_000} // → $1187
-	runs[5].Usage = &apitypes.UsageDTO{CostUSD: 0.32, InputTokens: 8_000, CacheReadTokens: 40_000, CacheCreationTokens: 500, OutputTokens: 900}                         // → <$1
-	runs[6].Usage = &apitypes.UsageDTO{CostUSD: 0, InputTokens: 120_000, CacheReadTokens: 300_000, CacheCreationTokens: 0, OutputTokens: 5_000}                         // → —
+	runs[0].Usage = &apitypes.UsageDTO{CostStatus: "metered", CostUSD: 9.55, InputTokens: 2_400_000, CacheReadTokens: 14_200_000, CacheCreationTokens: 120_000, OutputTokens: 88_400}          // → $10
+	runs[2].Usage = &apitypes.UsageDTO{CostStatus: "metered", CostUSD: 1187.0, InputTokens: 40_000_000, CacheReadTokens: 900_000_000, CacheCreationTokens: 2_000_000, OutputTokens: 3_200_000} // → $1187
+	runs[5].Usage = &apitypes.UsageDTO{CostStatus: "metered", CostUSD: 0.32, InputTokens: 8_000, CacheReadTokens: 40_000, CacheCreationTokens: 500, OutputTokens: 900}                         // → <$1
+	runs[6].Usage = &apitypes.UsageDTO{CostStatus: "subscription", CostUSD: 0, InputTokens: 120_000, CacheReadTokens: 300_000, CacheCreationTokens: 0, OutputTokens: 5_000}                    // → sub
 	return runs
 }
 
@@ -405,7 +406,7 @@ func detailRunning(dark bool, now time.Time) string {
 	run.AnthropicSecretID, run.AnthropicSecretLabel = sp("sec-meta"), sp("meta")
 	// PRD #650: usage so the header's cost tag and the crew-rail SPEND block render, coherent with
 	// the board's runs[0] for this same run id (identical cost value).
-	run.Usage = &apitypes.UsageDTO{CostUSD: 9.55, InputTokens: 2_400_000, CacheReadTokens: 14_200_000, CacheCreationTokens: 120_000, OutputTokens: 88_400}
+	run.Usage = &apitypes.UsageDTO{CostStatus: "metered", CostUSD: 9.55, InputTokens: 2_400_000, CacheReadTokens: 14_200_000, CacheCreationTokens: 120_000, OutputTokens: 88_400}
 	m := detailBase(dark, run, now, true)
 	m = withLiveStream(m)
 	return m.View().Content
@@ -432,7 +433,7 @@ func detailMilestonesAttributed(dark bool, now time.Time) string {
 			{ID: "m4", Agent: "coder", AgentLabel: "scheduler docs"},
 		}}
 	run.AnthropicSecretID, run.AnthropicSecretLabel = sp("sec-meta"), sp("meta")
-	run.Usage = &apitypes.UsageDTO{CostUSD: 9.55, InputTokens: 2_400_000, CacheReadTokens: 14_200_000, CacheCreationTokens: 120_000, OutputTokens: 88_400}
+	run.Usage = &apitypes.UsageDTO{CostStatus: "metered", CostUSD: 9.55, InputTokens: 2_400_000, CacheReadTokens: 14_200_000, CacheCreationTokens: 120_000, OutputTokens: 88_400}
 	m := detailBase(dark, run, now, true)
 	m = withLiveStream(m)
 	return m.View().Content
@@ -476,7 +477,7 @@ func detailCrewAutofold(dark bool, now time.Time) string {
 		Milestones:          milestoneList,
 		MilestonesCompleted: []string{"m1", "m2"}, MilestonesInProgress: []string{"m3", "m4"}}
 	run.AnthropicSecretID, run.AnthropicSecretLabel = sp("sec-meta"), sp("meta")
-	run.Usage = &apitypes.UsageDTO{CostUSD: 9.55, InputTokens: 2_400_000, CacheReadTokens: 14_200_000, CacheCreationTokens: 120_000, OutputTokens: 88_400}
+	run.Usage = &apitypes.UsageDTO{CostStatus: "metered", CostUSD: 9.55, InputTokens: 2_400_000, CacheReadTokens: 14_200_000, CacheCreationTokens: 120_000, OutputTokens: 88_400}
 	fake := &uzicli.FakeClient{}
 	m := uxModel(fake, detailRunID, dark)
 	m = applyDetail(m, run, crewAutofoldMsgs(now))

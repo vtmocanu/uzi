@@ -25,12 +25,36 @@ vi.mock("../lib/api", async (importOriginal) => {
       promoteIssue: vi.fn(),
       syncRepo: vi.fn(),
       configureColumns: vi.fn(),
+      // PRD #1429 M4a review Fix 1: the board's loadPreconditions fetches the viewer's
+      // default_harness alongside listWorkers/listSecrets/listRuns.
+      getMySettings: vi.fn(),
     },
   };
 });
 vi.mock("../auth/AuthContext", () => ({ useAuth: vi.fn() }));
 
 const mockApi = vi.mocked(api);
+
+// A sane default so every test that mounts the full Board (loadPreconditions calls
+// api.getMySettings() unconditionally) does not have to opt in explicitly — mirrors
+// the per-describe listWorkers/listSecrets defaults already scattered through this
+// file, but set ONCE here since every one of them needs it.
+beforeEach(() => {
+  mockApi.getMySettings.mockResolvedValue({
+    settings: {
+      default_harness: null,
+      default_model: null,
+      default_effort: null,
+      judge_model: null,
+      summary_model: null,
+      appearance_mode: null,
+      light_theme: null,
+      dark_theme: null,
+      typeface: null,
+      theme: null,
+    },
+  });
+});
 
 afterEach(() => {
   cleanup();
@@ -129,6 +153,172 @@ describe("IssueCard — the forge title carries no format characters (#124)", ()
     renderCard({ title: "Add a \u202Emetrics dashboard", iid: 7 });
     const link = screen.getByRole("link", { name: /metrics dashboard/ });
     expect(link.getAttribute("href")).toBe("/repos/repo-1/issues/7");
+  });
+});
+
+// PRD #1429 M4a: the per-card harness picker, direct-rendered (mirrors the credential
+// picker's own direct-render coverage above/below). It is opt-in via TWO props
+// (showHarnessPicker + onHarnessChange, mirroring onCredentialChange's opt-in), so a
+// card the board has not wired for it renders exactly as before this milestone.
+describe("IssueCard — per-card harness picker (PRD #1429 M4a)", () => {
+  it("renders no harness control when showHarnessPicker is false (default)", () => {
+    renderCard();
+    expect(screen.queryByLabelText(/Harness for #/)).toBeNull();
+  });
+
+  it("renders the picker only when BOTH showHarnessPicker and onHarnessChange are supplied", () => {
+    render(
+      <MemoryRouter>
+        <IssueCard
+          card={aCard()}
+          repoId="repo-1"
+          chips={[]}
+          laneLabel="Backlog"
+          canMoveUp={false}
+          canMoveDown={false}
+          onMoveUp={vi.fn()}
+          onMoveDown={vi.fn()}
+          insertionEdge={null}
+          gate={{ enabled: true, reason: "" }}
+          starting={false}
+          onStart={vi.fn()}
+          showHarnessPicker
+          harness="inherit"
+          onHarnessChange={vi.fn()}
+          fixCiBusy={false}
+          onFixCi={vi.fn()}
+          uziLabel="uzi"
+          isEligible
+          canPromote={false}
+          promoting={false}
+          onPromote={vi.fn()}
+          onDragStart={vi.fn()}
+          onDragEnd={vi.fn()}
+          dimmed={false}
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.getByLabelText("Harness for #7")).toBeTruthy();
+  });
+
+  it("hides the Anthropic token picker once this card's harness is explicitly codex", () => {
+    render(
+      <MemoryRouter>
+        <IssueCard
+          card={aCard()}
+          repoId="repo-1"
+          chips={[]}
+          laneLabel="Backlog"
+          canMoveUp={false}
+          canMoveDown={false}
+          onMoveUp={vi.fn()}
+          onMoveDown={vi.fn()}
+          insertionEdge={null}
+          gate={{ enabled: true, reason: "" }}
+          starting={false}
+          onStart={vi.fn()}
+          tokens={[]}
+          credential={{ mode: "inherit" }}
+          onCredentialChange={vi.fn()}
+          showHarnessPicker
+          harness="codex"
+          onHarnessChange={vi.fn()}
+          fixCiBusy={false}
+          onFixCi={vi.fn()}
+          uziLabel="uzi"
+          isEligible
+          canPromote={false}
+          promoting={false}
+          onPromote={vi.fn()}
+          onDragStart={vi.fn()}
+          onDragEnd={vi.fn()}
+          dimmed={false}
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.getByLabelText("Harness for #7")).toBeTruthy();
+    expect(screen.queryByLabelText("Anthropic token for #7")).toBeNull();
+  });
+
+  // Fix 2 (M4a review): a Codex-only card (showHarnessPicker false — D2, so `harness`
+  // stays the "inherit" default) still hides the Anthropic token picker, because
+  // codexUsable/claudeUsable name Codex as the effective harness even without an
+  // explicit pick.
+  it("hides the Anthropic token picker for a Codex-only card with no harness picker shown", () => {
+    render(
+      <MemoryRouter>
+        <IssueCard
+          card={aCard()}
+          repoId="repo-1"
+          chips={[]}
+          laneLabel="Backlog"
+          canMoveUp={false}
+          canMoveDown={false}
+          onMoveUp={vi.fn()}
+          onMoveDown={vi.fn()}
+          insertionEdge={null}
+          gate={{ enabled: true, reason: "" }}
+          starting={false}
+          onStart={vi.fn()}
+          tokens={[]}
+          credential={{ mode: "inherit" }}
+          onCredentialChange={vi.fn()}
+          claudeUsable={false}
+          codexUsable
+          fixCiBusy={false}
+          onFixCi={vi.fn()}
+          uziLabel="uzi"
+          isEligible
+          canPromote={false}
+          promoting={false}
+          onPromote={vi.fn()}
+          onDragStart={vi.fn()}
+          onDragEnd={vi.fn()}
+          dimmed={false}
+        />
+      </MemoryRouter>,
+    );
+    // Single-harness card: no harness picker (showHarnessPicker defaults false).
+    expect(screen.queryByLabelText(/Harness for #/)).toBeNull();
+    expect(screen.queryByLabelText("Anthropic token for #7")).toBeNull();
+  });
+
+  // Positive control for the case above: the pre-existing default props (claudeUsable
+  // defaults true, codexUsable defaults false) still show the Anthropic picker — the
+  // fix must not hide it universally.
+  it("still shows the Anthropic token picker on the pre-existing (Claude-usable) default props", () => {
+    render(
+      <MemoryRouter>
+        <IssueCard
+          card={aCard()}
+          repoId="repo-1"
+          chips={[]}
+          laneLabel="Backlog"
+          canMoveUp={false}
+          canMoveDown={false}
+          onMoveUp={vi.fn()}
+          onMoveDown={vi.fn()}
+          insertionEdge={null}
+          gate={{ enabled: true, reason: "" }}
+          starting={false}
+          onStart={vi.fn()}
+          tokens={[]}
+          credential={{ mode: "inherit" }}
+          onCredentialChange={vi.fn()}
+          fixCiBusy={false}
+          onFixCi={vi.fn()}
+          uziLabel="uzi"
+          isEligible
+          canPromote={false}
+          promoting={false}
+          onPromote={vi.fn()}
+          onDragStart={vi.fn()}
+          onDragEnd={vi.fn()}
+          dimmed={false}
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.getByLabelText("Anthropic token for #7")).toBeTruthy();
   });
 });
 
@@ -2960,5 +3150,122 @@ describe("Board — per-card credential resets on a repo change (PRD #1247)", ()
     // On the old code (no reset) cardCredential[1] survives and this reads "sec-1".
     const pickerB = screen.getByLabelText("Anthropic token for #1") as HTMLSelectElement;
     await waitFor(() => expect(pickerB.value).toBe("mode:inherit"));
+  });
+});
+
+// PRD #1429 M4a, D2: the harness picker's show/hide gate driven end to end through the
+// full Board (not just the direct-rendered IssueCard above) — a single-harness user
+// (Claude-only, the common case) never sees the picker; a both-usable user does, and
+// picking Codex both hides the Anthropic picker and rides the create call.
+describe("Board — per-card harness picker gate (PRD #1429 M4a)", () => {
+  function aBoard(): BoardData {
+    return {
+      repo_id: "repo-1",
+      path_with_namespace: "grp/one",
+      web_url: "https://gitlab.example.com/grp/one",
+      forge_type: "gitlab",
+      columns: [] as BoardData["columns"],
+      cards: [aCard({ iid: 1, title: "issue A", column: "", labels: ["uzi"], has_prd_link: false })],
+      pipeline: null,
+      bot_forge_user_id: 0,
+    };
+  }
+
+  const anthropicToken = () =>
+    ({
+      id: "sec-anthropic",
+      kind: "anthropic_token",
+      label: "console-key",
+      is_default: true,
+      auto_eligible: false,
+      created_at: "2026-01-01T00:00:00Z",
+      updated_at: "2026-01-01T00:00:00Z",
+    }) as unknown as import("../lib/api").SecretMeta;
+
+  const codexKey = () =>
+    ({
+      id: "sec-codex",
+      kind: "openai_api_key",
+      label: "codex-key",
+      is_default: true,
+      auto_eligible: false,
+      created_at: "2026-01-01T00:00:00Z",
+      updated_at: "2026-01-01T00:00:00Z",
+    }) as unknown as import("../lib/api").SecretMeta;
+
+  beforeEach(() => {
+    vi.mocked(useAuth).mockReturnValue({
+      user: null,
+      loading: false,
+      uziLabel: "uzi",
+      autopilotLabel: "autopilot",
+      appearance: {
+        mode: "dark",
+        light_theme: "hall",
+        dark_theme: "ember",
+        typeface: "system",
+        overrides: { mode: null, light_theme: null, dark_theme: null, typeface: null },
+        defaults: { mode: "dark", light_theme: "hall", dark_theme: "ember", typeface: "system" },
+      },
+      vaultUnlocked: true,
+      vaultExists: true,
+      hasPassword: true,
+      register: vi.fn(),
+      login: vi.fn(),
+      logout: vi.fn(),
+      refresh: vi.fn(),
+    } as unknown as ReturnType<typeof useAuth>);
+    mockApi.getBoard.mockResolvedValue({ board: aBoard() });
+    mockApi.getBoardPrefs.mockResolvedValue({ extra_labels: null, show_all: false });
+    mockApi.listWorkers.mockResolvedValue({ workers: [{ id: "w1" } as unknown as import("../lib/api").Worker] });
+    mockApi.listRuns.mockResolvedValue({ runs: [] });
+  });
+
+  const renderBoard = () =>
+    render(
+      <MemoryRouter initialEntries={["/repos/repo-1/board"]}>
+        <Routes>
+          <Route path="/repos/:id/board" element={<Board />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+  it("hides the harness picker for a Claude-only user (today's flow, unchanged)", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken()] });
+    renderBoard();
+    await screen.findByText("issue A");
+    expect(screen.queryByLabelText("Harness for #1")).toBeNull();
+    expect(screen.getByLabelText("Anthropic token for #1")).toBeTruthy();
+  });
+
+  it("shows the harness picker once both harnesses are usable, and picking codex hides the Anthropic picker + rides the create call", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken(), codexKey()] });
+    mockApi.createRun.mockResolvedValue({ run: { id: "run-codex-card" } as unknown as import("../lib/api").Run });
+    renderBoard();
+    await screen.findByText("issue A");
+
+    const picker = (await screen.findByLabelText("Harness for #1")) as HTMLSelectElement;
+    expect(picker.value).toBe("inherit");
+
+    fireEvent.change(picker, { target: { value: "codex" } });
+    expect(screen.queryByLabelText("Anthropic token for #1")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: /start run/i }));
+    await waitFor(() => expect(mockApi.createRun).toHaveBeenCalled());
+    expect(mockApi.createRun).toHaveBeenCalledWith("repo-1", 1, undefined, undefined, "codex");
+  });
+
+  // Fix 2 (M4a review): a Codex-only card never shows the harness picker (only one
+  // harness is usable — D2), so `harness` stays "inherit". Gating the Anthropic
+  // TokenPicker on the raw picker value alone left it visible even though the card's
+  // run WILL resolve to Codex — using it 422s.
+  it("hides the Anthropic token picker for a Codex-only user, even with no explicit harness pick", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [codexKey()] });
+    renderBoard();
+    await screen.findByText("issue A");
+
+    // Single-harness user: no redundant harness picker either (D2).
+    expect(screen.queryByLabelText("Harness for #1")).toBeNull();
+    expect(screen.queryByLabelText("Anthropic token for #1")).toBeNull();
   });
 });

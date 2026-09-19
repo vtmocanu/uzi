@@ -70,6 +70,7 @@ function demoIssueRun(over: Partial<Run> & Pick<Run, "id" | "status" | "health">
     issue_iid: 24,
     issue_title: over.issue_title ?? "Crew roster demo run",
     issue_description: "Demo run exercising the PRD #95 crew-state ladder.",
+    harness: "claude", // PRD #1429 M1: runs.harness is now on RunDTO (NOT NULL, default claude).
     kind: "issue",
     title: null,
     resume_of_run_id: null,
@@ -329,6 +330,7 @@ export const mockLaneRuns: Run[] = [
     issue_iid: 99,
     issue_title: "Two parallel coders (PRD #99 headline case)",
     issue_description: "Demo run: two same-role subagent invocations that must not merge into one lane.",
+    harness: "claude", // PRD #1429 M1: runs.harness is now on RunDTO (NOT NULL, default claude).
     branch: "agent/issue-99",
     status: "running",
     health: "ok",
@@ -338,6 +340,7 @@ export const mockLaneRuns: Run[] = [
     issue_iid: 99,
     issue_title: "Busy crew: role rollup, doubled tester, clamped label",
     issue_description: "Demo run: enough lanes and doubled roles to trigger the conditional role rollup.",
+    harness: "claude", // PRD #1429 M1: runs.harness is now on RunDTO (NOT NULL, default claude).
     branch: "agent/issue-99",
     status: "running",
     health: "ok",
@@ -373,6 +376,7 @@ export const mockLaneRuns: Run[] = [
     forge_park_max: 0,
     issue_title: "Busy crew, degraded: the stalled role sorts to the front",
     issue_description: "Demo run: same stream as run-busy with a looping health flag, so the active tester lane reads stalled and its role chip leads the rollup.",
+    harness: "claude", // PRD #1429 M1: runs.harness is now on RunDTO (NOT NULL, default claude).
     branch: "agent/issue-99",
     status: "running",
     health: "looping",
@@ -387,6 +391,7 @@ export const mockLaneRuns: Run[] = [
     issue_iid: 237,
     issue_title: "Live token counts before the first result frame (PRD #237)",
     issue_description: "Demo run: per-call usage frames with no result frame, so tokens are live-only.",
+    harness: "claude", // PRD #1429 M1: runs.harness is now on RunDTO (NOT NULL, default claude).
     branch: "agent/issue-237",
     status: "running",
     health: "ok",

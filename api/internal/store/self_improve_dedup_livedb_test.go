@@ -95,6 +95,7 @@ func seedSelfImproveRepo(ctx context.Context, t *testing.T, pool *pgxpool.Pool, 
 func createSelfImprove(ctx context.Context, t *testing.T, q *store.Queries, userID, repoID uuid.UUID, iid int64) (store.Run, error) {
 	t.Helper()
 	return q.CreateSelfImproveRun(ctx, store.CreateSelfImproveRunParams{
+		Harness:               "claude", // PRD #1429 M1: harness is now a required @harness param.
 		UserID:                userID,
 		RepoID:                repoID,
 		IssueIid:              pgtype.Int8{Int64: iid, Valid: true},

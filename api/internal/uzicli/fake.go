@@ -110,11 +110,15 @@ type FakeClient struct {
 	// --token was omitted), so a test can assert the CLI resolved a label to {pinned,
 	// secret_id} client-side and sent auto/default/inherit as a bare mode.
 	LastCreateCredOverride *CreateRunCredentialOverride
-	InputResp              apitypes.RunInputResponse
-	LastInputRunID         string
-	LastInputKind          string
-	LastInputBody          string
-	LastInputSelection     *apitypes.AgentSelection
+	// LastCreateHarness captures PRD #1429 M5's create-time explicit harness selection (""
+	// when --harness was omitted), so a test can assert the CLI forwarded the validated
+	// claude|codex value (or sent none at all).
+	LastCreateHarness  string
+	InputResp          apitypes.RunInputResponse
+	LastInputRunID     string
+	LastInputKind      string
+	LastInputBody      string
+	LastInputSelection *apitypes.AgentSelection
 	// LastInputDiscardPendingOutcome records the discard_pending_outcome bit the last
 	// SubmitRunInput carried (PRD #1391 Run B M3d), so a test can assert `uzi run cancel
 	// --discard-pending-outcome` threaded it onto the request.

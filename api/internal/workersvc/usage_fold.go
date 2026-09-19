@@ -656,6 +656,23 @@ func numericUSD(usd float64) pgtype.Numeric {
 	return pgtype.Numeric{Int: big.NewInt(int64(math.Round(usd * 1e6))), Exp: -6, Valid: true}
 }
 
+// numericToFloat64 renders a pgtype.Numeric (a summed cost_usd) as a float64 — the
+// inverse of numericUSD, and the workersvc-local twin of handler.numericToFloat
+// (workersvc cannot import the handler package: handler already imports workersvc, so
+// that would be a cycle). Folds to 0 on an invalid/unset numeric or a conversion
+// failure; costs are always finite and non-negative here. Used by the judge lane's D7
+// target-cost-context claim field (PRD #1429 M3).
+func numericToFloat64(n pgtype.Numeric) float64 {
+	if !n.Valid {
+		return 0
+	}
+	f, err := n.Float64Value()
+	if err != nil || !f.Valid {
+		return 0
+	}
+	return f.Float64
+}
+
 // Harness and cost-status literals, matching the run_usage.harness / run_usage.cost_status
 // CHECK vocabularies (migration 00226) and runs.harness. Kept here (not a shared package)
 // because C1 is the only writer of these into run_usage; the pure D11 resolver (C3) and the

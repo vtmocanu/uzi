@@ -16,7 +16,13 @@
 
 import { describe, expect, it } from "vitest";
 import type { SecretMeta } from "./api";
-import { anthropicTokenCount, hasAnthropicToken as hasToken } from "./hasToken";
+import {
+  anthropicTokenCount,
+  hasAnthropicToken as hasToken,
+  hasAnyCodexCredential,
+  hasUsableCredential,
+  isCodexUsable,
+} from "./hasToken";
 
 function secret(over: Partial<SecretMeta> = {}): SecretMeta {
   return {
@@ -93,5 +99,79 @@ describe("anthropicTokenCount (Runs-list credential-badge gate)", () => {
         secret({ id: "sec-oai", kind: "openai_token" }),
       ]),
     ).toBe(1);
+  });
+});
+
+// PRD #1429 M4a, D3: Codex usability mirrors the server's D11 rule EXACTLY — a
+// subscription default is usable only when linked, an api_key default is usable by
+// existence, and a failed/missing subscription default never falls through to a
+// non-default api key.
+describe("isCodexUsable (D3 Codex availability)", () => {
+  it("is false with no Codex secrets at all", () => {
+    expect(isCodexUsable([])).toBe(false);
+  });
+
+  it("is true for a LINKED subscription default", () => {
+    expect(
+      isCodexUsable([secret({ kind: "codex_auth", is_default: true, codex_status: "linked" })]),
+    ).toBe(true);
+  });
+
+  it("is false for a subscription default that is NOT linked (staging/failed)", () => {
+    expect(
+      isCodexUsable([secret({ kind: "codex_auth", is_default: true, codex_status: "staging" })]),
+    ).toBe(false);
+  });
+
+  // The load-bearing D3 case: an unusable subscription default must NOT fall through
+  // to a non-default api key sitting behind it.
+  it("does not fall through to a non-default api key behind an unusable subscription default", () => {
+    expect(
+      isCodexUsable([
+        secret({ kind: "codex_auth", is_default: true, codex_status: "failed" }),
+        secret({ id: "sec-key", kind: "openai_api_key", is_default: false }),
+      ]),
+    ).toBe(false);
+  });
+
+  it("is true for an api_key default (usable by existence)", () => {
+    expect(isCodexUsable([secret({ kind: "openai_api_key", is_default: true })])).toBe(true);
+  });
+
+  it("is false for a non-default api_key with no default of either kind", () => {
+    expect(isCodexUsable([secret({ kind: "openai_api_key", is_default: false })])).toBe(false);
+  });
+
+  it("ignores an anthropic token", () => {
+    expect(isCodexUsable([secret({ kind: "anthropic_token", is_default: true })])).toBe(false);
+  });
+});
+
+describe("hasAnyCodexCredential (harness-appropriate copy)", () => {
+  it("is false with no Codex secrets", () => {
+    expect(hasAnyCodexCredential([])).toBe(false);
+  });
+  it("is true for ANY Codex-kind secret, usable or not", () => {
+    expect(
+      hasAnyCodexCredential([secret({ kind: "codex_auth", is_default: false, codex_status: "staging" })]),
+    ).toBe(true);
+    expect(hasAnyCodexCredential([secret({ kind: "openai_api_key", is_default: false })])).toBe(true);
+  });
+  it("ignores an anthropic token", () => {
+    expect(hasAnyCodexCredential([secret({ kind: "anthropic_token" })])).toBe(false);
+  });
+});
+
+describe("hasUsableCredential (Dashboard onboarding step)", () => {
+  it("is false with no usable credential of either harness", () => {
+    expect(hasUsableCredential([])).toBe(false);
+  });
+  it("is true for a Claude-only user (today's behaviour, unchanged)", () => {
+    expect(hasUsableCredential([secret()])).toBe(true);
+  });
+  // The Codex-only case this milestone adds: a user with zero Anthropic tokens but a
+  // usable Codex credential has already completed the onboarding step.
+  it("is true for a Codex-only user", () => {
+    expect(hasUsableCredential([secret({ kind: "openai_api_key", is_default: true })])).toBe(true);
   });
 });

@@ -9,5 +9,6 @@
   "appearance_mode": null,
   "light_theme": null,
   "dark_theme": null,
-  "typeface": null
+  "typeface": null,
+  "default_harness": null
 }

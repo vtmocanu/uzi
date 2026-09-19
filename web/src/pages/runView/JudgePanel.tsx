@@ -18,7 +18,8 @@ import { isJudgeEligible } from "../../lib/runKind";
 import { stripUnsafeChars } from "../../lib/safeText";
 import { useAsyncData } from "../../lib/useAsyncData";
 import { formatDuration } from "../../components/RunEvent";
-import { formatTokens, formatCost } from "../../lib/formatTokens";
+import { formatTokens } from "../../lib/formatTokens";
+import { costDisplay, costHeadline } from "../../lib/costStatus";
 import { Markdown } from "../../components/Markdown";
 import { Alert, Badge, Button, Card, Spinner, cx } from "../../components/ui";
 import { TriageActions } from "../../components/triage/TriageActions";
@@ -66,13 +67,23 @@ function JudgeStat({ label, value, cost }: { label: string; value: string; cost?
 // Duration · Cost). Rendered ONLY when the judge posted a result frame (usage present);
 // a pre-feature judge has no run_usage row and renders NOTHING here, never a fabricated 0.
 // Duration = finished_at - started_at; absent when either stamp is missing.
-function JudgeUsageStrip({ judgeRun }: { judgeRun: NonNullable<RunReview["judge_run"]> }) {
+//
+// Exported for direct testing (PRD #1429 D7 completeness): `judgeRun.usage` is a
+// RunUsage and carries the server-truthed per-run `cost_status`, the exact same shape
+// RunUsagePanel switches on — so this Cost tile must go through the SAME shared
+// costDisplay/costHeadline helpers (lib/costStatus.ts) rather than re-deriving the
+// "cost_usd > 0" guess RunUsagePanel already retired. A $0 metered total is a REAL
+// reading (a tiny/cache-only judge call), never a "—" standing in for it; subscription
+// and unreported/hostile/legacy-empty status get their own words, never a bare dollar
+// and never a fabricated $0.
+export function JudgeUsageStrip({ judgeRun }: { judgeRun: NonNullable<RunReview["judge_run"]> }) {
   const usage = judgeRun.usage;
   if (!usage) return null;
   const durationMs =
     judgeRun.started_at !== null && judgeRun.finished_at !== null
       ? new Date(judgeRun.finished_at).getTime() - new Date(judgeRun.started_at).getTime()
       : null;
+  const cost = costDisplay(usage.cost_status, usage.cost_usd);
   return (
     <div
       role="group"
@@ -82,9 +93,7 @@ function JudgeUsageStrip({ judgeRun }: { judgeRun: NonNullable<RunReview["judge_
       <JudgeStat label="Tokens in" value={formatTokens(usage.input_tokens)} />
       <JudgeStat label="Tokens out" value={formatTokens(usage.output_tokens)} />
       <JudgeStat label="Duration" value={durationMs !== null ? formatDuration(durationMs) : "—"} />
-      {/* A $0 cost with real tokens is a subscription-auth run the SDK prices at $0
-          (formatTokens.ts money convention) — render "—", never a misleading "$0.00". */}
-      <JudgeStat label="Cost" value={usage.cost_usd > 0 ? formatCost(usage.cost_usd) : "—"} cost />
+      <JudgeStat label="Cost" value={costHeadline(cost)} cost={cost.kind === "metered"} />
     </div>
   );
 }

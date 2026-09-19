@@ -3,6 +3,7 @@ import {
   type AgentSelectionInput,
   type CredentialEpoch,
   type CredentialOverride,
+  type Harness,
   type RecoveryCustodyHold,
   type RecoveryCustodyHolds,
   type Run,
@@ -188,6 +189,15 @@ function credentialOverlay(run: Run): Run {
   }
 }
 
+// harnessOverlay (PRD #1429 M4a): the "codex-only" mock scenario flips every run's
+// harness to codex, so the harness badge (RunsList/RunView) and the run's usage/cost
+// context show Codex as this account's active harness end to end, offline. A no-op
+// for every other scenario — every run keeps its seeded "claude" harness.
+function harnessOverlay<T extends { harness: Harness }>(run: T): T {
+  if (mockScenario() !== "codex-only") return run;
+  return { ...run, harness: "codex" };
+}
+
 // overrideToRead maps the set-token WRITE body ({mode, secret_id?}) to the READ-side
 // {mode, label} the run DTO carries; inherit clears it to null. A pinned token's label
 // is resolved from the seeded secrets (null when the id is unknown, mirroring a deleted
@@ -208,6 +218,12 @@ export const runsApi = {
     // PRD #1247 M7: mirror the real client's optional override arg. The mock stamps the
     // read-side {mode,label} onto the created run so a demo start-with-token is visible.
     credentialOverride?: { mode: string; secret_id?: string },
+    // PRD #1429 M4a: mirror the real client's optional harness arg. An explicit pick is
+    // stamped verbatim (never overridden by the scenario — D2's "explicit never falls
+    // back" holds even in the mock); omitted falls through to the scenario's implicit
+    // resolution, mirroring D11 (the "codex-only" scenario has no usable Claude, so it
+    // implicitly resolves codex, same as the real server would).
+    harness?: Harness,
   ) => {
     const b = state.boards.get(repoId);
     const card = b?.cards.find((c) => c.iid === issueIid);
@@ -247,6 +263,7 @@ export const runsApi = {
       issue_iid: issueIid,
       issue_title: card.title,
       issue_description: "See the linked PRD.",
+      harness: harness ?? (mockScenario() === "codex-only" ? "codex" : "claude"),
       title: null,
       resume_of_run_id: null,
       status: "queued",
@@ -325,6 +342,7 @@ export const runsApi = {
       issue_iid: null,
       issue_title: `Fix CI: ${ref} pipeline`,
       issue_description: `Diagnose and fix the failed pipeline for \`${ref}\`.`,
+      harness: "claude", // PRD #1429 M1: runs.harness is now on RunDTO (NOT NULL, default claude).
       title: null,
       resume_of_run_id: null,
       status: "queued",
@@ -400,15 +418,21 @@ export const runsApi = {
         .filter((r) => !(r.id in mockOtherRunOwners))
         .filter((r) => (params?.repoId ? r.repo_id === params.repoId : true))
         .filter((r) => (params?.issueIid != null ? r.issue_iid === params.issueIid : true))
-        .map((r) => runListItem(r)),
+        .map((r) => runListItem(harnessOverlay(r))),
     }),
   // PRD #40: token/cost usage. Static demo figures — enough to populate the
   // dashboard's "Your usage" and (admin) factory cards + per-user table.
   getUsage: async () =>
     delay<SelfUsage>({
-      lifetime: { input_tokens: 1_610_000, cache_read_tokens: 16_100_000, cache_creation_tokens: 240_000, output_tokens: 710_000, cost_usd: 26.4 },
-      last_7_days: { input_tokens: 280_000, cache_read_tokens: 2_800_000, cache_creation_tokens: 40_000, output_tokens: 120_000, cost_usd: 4.55 },
+      // PRD #1429 M1 (D7): the per-window cost_status ("metered" on these demo bundles) and
+      // the subscription/unreported run counts (0 here — all demo runs are metered).
+      lifetime: { input_tokens: 1_610_000, cache_read_tokens: 16_100_000, cache_creation_tokens: 240_000, output_tokens: 710_000, cost_usd: 26.4, cost_status: "" as const },
+      last_7_days: { input_tokens: 280_000, cache_read_tokens: 2_800_000, cache_creation_tokens: 40_000, output_tokens: 120_000, cost_usd: 4.55, cost_status: "" as const },
       run_count: 23,
+      lifetime_subscription_run_count: 0,
+      lifetime_unreported_run_count: 0,
+      last7_subscription_run_count: 0,
+      last7_unreported_run_count: 0,
       // PRD #1293 failed-run outcomes. Internally consistent: finished === completed +
       // cancelled + plan_rejected + failed, and sum(fail_origins) === failed. finished is a
       // different population from run_count (D2) — infra failures spend no tokens, so it sits
@@ -427,9 +451,13 @@ export const runsApi = {
   getAdminUsage: async () =>
     delay<AdminUsage>({
       factory: {
-        lifetime: { input_tokens: 5_400_000, cache_read_tokens: 53_900_000, cache_creation_tokens: 900_000, output_tokens: 2_400_000, cost_usd: 88.15 },
-        last_7_days: { input_tokens: 900_000, cache_read_tokens: 9_100_000, cache_creation_tokens: 120_000, output_tokens: 410_000, cost_usd: 14.9 },
+        lifetime: { input_tokens: 5_400_000, cache_read_tokens: 53_900_000, cache_creation_tokens: 900_000, output_tokens: 2_400_000, cost_usd: 88.15, cost_status: "" as const },
+        last_7_days: { input_tokens: 900_000, cache_read_tokens: 9_100_000, cache_creation_tokens: 120_000, output_tokens: 410_000, cost_usd: 14.9, cost_status: "" as const },
         run_count: 79,
+        lifetime_subscription_run_count: 0,
+        lifetime_unreported_run_count: 0,
+        last7_subscription_run_count: 0,
+        last7_unreported_run_count: 0,
         // Factory lifetime outcomes are the sum of the four per-user rows below (finished 38 +
         // 30 + 21 + 8 = 97, failed 5 + 5 + 2 + 1 = 13); last_7_days is a smaller window.
         outcomes: {
@@ -444,10 +472,10 @@ export const runsApi = {
         },
       },
       users: [
-        { user_id: "u-maria", email: "maria@example.com", usage: { input_tokens: 2_490_000, cache_read_tokens: 22_400_000, cache_creation_tokens: 400_000, output_tokens: 1_020_000, cost_usd: 37.83 }, run_count: 31, outcomes: { finished: 38, completed: 30, cancelled: 2, plan_rejected: 1, failed: 5, fail_origins: { agent_failure: 2, run_timeout: 1, worker_lost: 1, unknown: 1 } } },
-        { user_id: "u-vlad", email: "vlad@example.com", usage: { input_tokens: 1_610_000, cache_read_tokens: 16_100_000, cache_creation_tokens: 240_000, output_tokens: 710_000, cost_usd: 26.4 }, run_count: 23, outcomes: { finished: 30, completed: 22, cancelled: 2, plan_rejected: 1, failed: 5, fail_origins: { agent_failure: 1, run_timeout: 1, worker_lost: 1, rate_limited: 1, unknown: 1 } } },
-        { user_id: "u-andrei", email: "andrei@example.com", usage: { input_tokens: 1_010_000, cache_read_tokens: 13_600_000, cache_creation_tokens: 210_000, output_tokens: 550_000, cost_usd: 19.71 }, run_count: 19, outcomes: { finished: 21, completed: 18, cancelled: 1, plan_rejected: 0, failed: 2, fail_origins: { agent_failure: 1, worker_lost: 1 } } },
-        { user_id: "u-dana", email: "dana@example.com", usage: { input_tokens: 290_000, cache_read_tokens: 3_500_000, cache_creation_tokens: 50_000, output_tokens: 120_000, cost_usd: 4.21 }, run_count: 6, outcomes: { finished: 8, completed: 7, cancelled: 0, plan_rejected: 0, failed: 1, fail_origins: { run_timeout: 1 } } },
+        { user_id: "u-maria", email: "maria@example.com", usage: { input_tokens: 2_490_000, cache_read_tokens: 22_400_000, cache_creation_tokens: 400_000, output_tokens: 1_020_000, cost_usd: 37.83, cost_status: "metered" as const }, run_count: 31, subscription_run_count: 0, unreported_run_count: 0, outcomes: { finished: 38, completed: 30, cancelled: 2, plan_rejected: 1, failed: 5, fail_origins: { agent_failure: 2, run_timeout: 1, worker_lost: 1, unknown: 1 } } },
+        { user_id: "u-vlad", email: "vlad@example.com", usage: { input_tokens: 1_610_000, cache_read_tokens: 16_100_000, cache_creation_tokens: 240_000, output_tokens: 710_000, cost_usd: 26.4, cost_status: "metered" as const }, run_count: 23, subscription_run_count: 0, unreported_run_count: 0, outcomes: { finished: 30, completed: 22, cancelled: 2, plan_rejected: 1, failed: 5, fail_origins: { agent_failure: 1, run_timeout: 1, worker_lost: 1, rate_limited: 1, unknown: 1 } } },
+        { user_id: "u-andrei", email: "andrei@example.com", usage: { input_tokens: 1_010_000, cache_read_tokens: 13_600_000, cache_creation_tokens: 210_000, output_tokens: 550_000, cost_usd: 19.71, cost_status: "metered" as const }, run_count: 19, subscription_run_count: 0, unreported_run_count: 0, outcomes: { finished: 21, completed: 18, cancelled: 1, plan_rejected: 0, failed: 2, fail_origins: { agent_failure: 1, worker_lost: 1 } } },
+        { user_id: "u-dana", email: "dana@example.com", usage: { input_tokens: 290_000, cache_read_tokens: 3_500_000, cache_creation_tokens: 50_000, output_tokens: 120_000, cost_usd: 4.21, cost_status: "metered" as const }, run_count: 6, subscription_run_count: 0, unreported_run_count: 0, outcomes: { finished: 8, completed: 7, cancelled: 0, plan_rejected: 0, failed: 1, fail_origins: { run_timeout: 1 } } },
       ],
       earliest_run: "2026-05-12T09:00:00Z",
     }),
@@ -472,7 +500,9 @@ export const runsApi = {
       .map((t) => ({ name: t.name, description: t.description }));
     // PRD #1247 M7: overlay the active credential-override demo scenario onto the run
     // (a no-op for the default/unknown scenario, and for a run switched this session).
-    return delay({ run: { ...credentialOverlay(run), own_agents } }, 60);
+    // PRD #1429 M4a: layered with the harness overlay, so a "codex-only" run also
+    // reads harness=codex on the detail page.
+    return delay({ run: { ...harnessOverlay(credentialOverlay(run)), own_agents } }, 60);
   },
   // PRD #35: flip this run's usage-limit opt-in. Mirrors the server's guard — the
   // same NEGATIVE predicate the cancel path uses — so a terminal run is refused and
@@ -504,6 +534,12 @@ export const runsApi = {
     if (isTerminalRun(run.status)) throw new ApiError(409, "run has already finished");
     if (isCredentialSwitchRefusedLane(run))
       throw new ApiError(409, "this run's lane does not support switching its Anthropic token");
+    // PRD #1429 D5/D9 (M4a review fix): a Codex run cannot carry an Anthropic-only override —
+    // mirrors the server's ErrCredentialOverrideHarnessUnsupported 422, so a demo/test can
+    // surface the harness-aware hiding (RunView/PlanPanel/SwitchTokenAction) rather than
+    // masking a stray call with a false success.
+    if (run.harness === "codex")
+      throw new ApiError(422, "credential override unsupported on codex harness");
     credentialSwitched.add(id);
     patchRun(id, {
       credential_override: overrideToRead(body),
@@ -556,6 +592,7 @@ export const runsApi = {
       issue_iid: null,
       issue_web_url: null,
       issue_description: g ? `On-demand MR rework.\n\nGuidance:\n${g}` : "On-demand MR rework.",
+      harness: "claude", // PRD #1429 M1: runs.harness is now on RunDTO (NOT NULL, default claude).
       requeue_count: 0,
       iteration_count: 0,
       // A fresh manual rework has no automatic-loop guard readings of its own.

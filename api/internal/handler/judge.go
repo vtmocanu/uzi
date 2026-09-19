@@ -316,6 +316,10 @@ func judgeRunToDTO(jr *store.GetJudgeRunUsageForTargetRow) *apitypes.JudgeRunDTO
 			CacheCreationTokens: jr.CacheCreationTokens.Int64,
 			OutputTokens:        jr.OutputTokens.Int64,
 			CostUSD:             numericToFloat(jr.CostUsd),
+			// PRD #1429 M3 (D7): the judge run's own folded cost_status, so the panel never
+			// reads a subscription/unreported judge spend as a complete $0 (mirrors
+			// usageFromListRow's identical field for a run-list row).
+			CostStatus: jr.CostStatus.String,
 		}
 	}
 	return dto
@@ -474,6 +478,14 @@ func (h *Handler) RerunJudge(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusConflict, "run judging is disabled")
 		case errors.Is(err, workersvc.ErrNoAnthropicToken):
 			httpx.Error(w, http.StatusUnprocessableEntity, "add an Anthropic token before running the judge")
+		case errors.Is(err, workersvc.ErrNoCredentialForHarness):
+			// PRD #1429 M3 (D4): the judge INHERITS the target run's harness explicitly; if
+			// that harness is no longer usable, creation refuses with no fallback. Same 422
+			// shape mrrework_run.go's identical case uses.
+			httpx.JSON(w, http.StatusUnprocessableEntity, map[string]any{
+				"error": "the target run's harness has no usable credential",
+				"code":  "no_credential_for_harness",
+			})
 		case errors.Is(err, workersvc.ErrJudgeAlreadyActive):
 			httpx.Error(w, http.StatusConflict, "a judge run is already in progress for this run")
 		default:

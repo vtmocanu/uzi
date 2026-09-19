@@ -1,4 +1,5 @@
 import type {
+  CostStatus,
   Disposition,
   PendingJudge,
   RecommendationCategory,
@@ -73,6 +74,9 @@ export interface MockReview {
       cache_creation_tokens: number;
       output_tokens: number;
       cost_usd: number;
+      // PRD #1429 M1 (D7): mirrors RunUsage.cost_status so the mock stays assignable to the
+      // real RunReview.judge_run.usage (RunUsage | null).
+      cost_status: CostStatus | "";
     } | null;
   };
 }
@@ -198,6 +202,7 @@ export const mockReviews: MockReview[] = [
         cache_creation_tokens: 3100,
         output_tokens: 1840,
         cost_usd: 0.42,
+        cost_status: "metered", // PRD #1429 M1 (D7): a metered judge run.
       },
     },
   },
@@ -298,6 +303,7 @@ export const mockReviews: MockReview[] = [
         cache_creation_tokens: 0,
         output_tokens: 1120,
         cost_usd: 0,
+        cost_status: "subscription", // PRD #1429 M1 (D7): $0 is subscription usage, not a real 0.
       },
     },
   },

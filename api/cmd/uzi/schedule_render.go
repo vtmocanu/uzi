@@ -85,6 +85,11 @@ func renderScheduleDetail(p *uzicli.Printer, s apitypes.ScheduleDTO) error {
 		[]string{"WAIT_ON_LIMIT", boolStr(s.WaitOnLimit)},
 		[]string{"MR_REWORK", triStateStr(s.MrReworkEnabled)},
 		[]string{"TOKEN", scheduleTokenCell(s)},
+		// HARNESS (PRD #1429 M5, D2): the schedule's per-run harness pin. A null pin is an
+		// EXPLICIT "implicit" (D11 resolves it fresh per fire), distinct from "-" (the row's
+		// other "not set at all" convention elsewhere in this block), since a nil pin here is
+		// a meaningful, deliberate configuration state rather than an absent optional field.
+		[]string{"HARNESS", strOr(s.Harness, "implicit")},
 		[]string{"ENABLED", boolStr(s.Enabled)},
 		[]string{"STATUS", s.Status},
 	)

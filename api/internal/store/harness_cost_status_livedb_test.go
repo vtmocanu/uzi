@@ -132,38 +132,44 @@ func TestRunCreationOriginsWriteClaudeHarnessLiveDB(t *testing.T) {
 	}{
 		{"CreateRun", func() (store.Run, error) {
 			return q.CreateRun(ctx, store.CreateRunParams{
-				UserID: e.userID, RepoID: e.repoID, IssueIid: hInt8(1), IssueTitle: "t", IssueDescription: "d",
+				Harness: "claude", // PRD #1429 M1: harness is now a required @harness param.
+				UserID:  e.userID, RepoID: e.repoID, IssueIid: hInt8(1), IssueTitle: "t", IssueDescription: "d",
 				AutoApprove: false, WaitOnLimit: false, PlanSource: "agent", RequireBaseMatch: false,
 				OverrideSubagentModel: false, TriggerSource: "manual",
 			})
 		}},
 		{"CreatePromptRun", func() (store.Run, error) {
 			return q.CreatePromptRun(ctx, store.CreatePromptRunParams{
-				UserID: e.userID, RepoID: e.repoID, IssueTitle: "t", IssueDescription: "d",
+				Harness: "claude", // PRD #1429 M1: harness is now a required @harness param.
+				UserID:  e.userID, RepoID: e.repoID, IssueTitle: "t", IssueDescription: "d",
 				ScheduleID: scheduleID, AutoApprove: true, WaitOnLimit: false, OverrideSubagentModel: false,
 			})
 		}},
 		{"CreateSelfImproveRun", func() (store.Run, error) {
 			return q.CreateSelfImproveRun(ctx, store.CreateSelfImproveRunParams{
-				UserID: e.userID, RepoID: e.repoID, IssueIid: hInt8(2), IssueTitle: "t", IssueDescription: "d",
+				Harness: "claude", // PRD #1429 M1: harness is now a required @harness param.
+				UserID:  e.userID, RepoID: e.repoID, IssueIid: hInt8(2), IssueTitle: "t", IssueDescription: "d",
 				WaitOnLimit: false, OverrideSubagentModel: false,
 			})
 		}},
 		{"CreateTaskRun", func() (store.Run, error) {
 			return q.CreateTaskRun(ctx, store.CreateTaskRunParams{
-				RunID: uuid.New(), UserID: e.userID, RepoID: e.repoID, Branch: hText("uzi/task/a"),
+				Harness: "claude", // PRD #1429 M1: harness is now a required @harness param.
+				RunID:   uuid.New(), UserID: e.userID, RepoID: e.repoID, Branch: hText("uzi/task/a"),
 				IssueTitle: "t", IssueDescription: "d", WaitOnLimit: false,
 			})
 		}},
 		{"CreateThenFixRun", func() (store.Run, error) {
 			return q.CreateThenFixRun(ctx, store.CreateThenFixRunParams{
-				RunID: uuid.New(), UserID: e.userID, RepoID: e.repoID, Branch: hText("uzi/task/b"),
+				Harness: "claude", // PRD #1429 M1: harness is now a required @harness param.
+				RunID:   uuid.New(), UserID: e.userID, RepoID: e.repoID, Branch: hText("uzi/task/b"),
 				ThenFixOfRunID: pgconv.UUID(anchorID), WaitOnLimit: false, IssueTitle: "t", IssueDescription: "d",
 			})
 		}},
 		{"CreateTaskReviewRun", func() (store.Run, error) {
 			return q.CreateTaskReviewRun(ctx, store.CreateTaskReviewRunParams{
-				RunID: uuid.New(), UserID: e.userID, RepoID: e.repoID, Branch: hText("uzi/task/c"),
+				Harness: "claude", // PRD #1429 M1: harness is now a required @harness param.
+				RunID:   uuid.New(), UserID: e.userID, RepoID: e.repoID, Branch: hText("uzi/task/c"),
 				TargetRunID: pgconv.UUID(anchorID), IssueTitle: "t",
 			})
 		}},
@@ -179,28 +185,32 @@ func TestRunCreationOriginsWriteClaudeHarnessLiveDB(t *testing.T) {
 		}},
 		{"CreateCIFixRun", func() (store.Run, error) {
 			return q.CreateCIFixRun(ctx, store.CreateCIFixRunParams{
-				UserID: e.userID, RepoID: e.repoID, IssueTitle: "t", IssueDescription: "d",
+				Harness: "claude", // PRD #1429 M1: harness is now a required @harness param.
+				UserID:  e.userID, RepoID: e.repoID, IssueTitle: "t", IssueDescription: "d",
 				PipelineID: hInt8(11), PipelineRef: hText("ci-ref-1"), FailureSnapshot: []byte(`{}`),
 				CiConfigPaths: []string{}, WaitOnLimit: false, AutoApprove: true,
 			})
 		}},
 		{"CreateAutoMRReworkRun", func() (store.Run, error) {
 			return q.CreateAutoMRReworkRun(ctx, store.CreateAutoMRReworkRunParams{
-				UserID: e.userID, RepoID: e.repoID, IssueTitle: "t", IssueDescription: "d",
+				Harness: "claude", // PRD #1429 M1: harness is now a required @harness param.
+				UserID:  e.userID, RepoID: e.repoID, IssueTitle: "t", IssueDescription: "d",
 				PipelineRef: hText("mr-ref-1"), MrIid: hInt8(21), TargetRunID: pgconv.UUID(anchorID),
 				WaitOnLimit: false, TriggerSource: "mr_rework",
 			})
 		}},
 		{"CreateManualMRReworkRunAndAdvance", func() (store.Run, error) {
 			return q.CreateManualMRReworkRunAndAdvance(ctx, store.CreateManualMRReworkRunAndAdvanceParams{
-				UserID: e.userID, RepoID: e.repoID, IssueTitle: "t", IssueDescription: "d",
+				Harness: "claude", // PRD #1429 M1: harness is now a required @harness param.
+				UserID:  e.userID, RepoID: e.repoID, IssueTitle: "t", IssueDescription: "d",
 				PipelineRef: hText("mr-ref-2"), MrIid: hInt8(22), TargetRunID: pgconv.UUID(anchorID),
 				WaitOnLimit: false, HighWater: 1,
 			})
 		}},
 		{"CreateJudgeRun", func() (store.Run, error) {
 			return q.CreateJudgeRun(ctx, store.CreateJudgeRunParams{
-				UserID: e.userID, TargetRunID: pgconv.UUID(anchorID), IssueTitle: "t", IssueDescription: "d",
+				Harness: "claude", // PRD #1429 M1: harness is now a required @harness param.
+				UserID:  e.userID, TargetRunID: pgconv.UUID(anchorID), IssueTitle: "t", IssueDescription: "d",
 				TriggerSource: "judge",
 			})
 		}},

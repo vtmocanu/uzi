@@ -78,6 +78,9 @@ func TestAgentSelectionTags(t *testing.T) {
 // the RunDTO pin and the RunListItemDTO embed pin.
 var runDTOKeys = []string{
 	"id", "repo_id", "forge_type", "kind", "issue_iid", "issue_title", "issue_description",
+	// PRD #1429 M1 (D2): the run's actual stored harness (closed enum claude|codex), NOT NULL
+	// DEFAULT 'claude' so always on the wire ("claude" for every current run).
+	"harness",
 	// PRD #764 M2: server-computed PRD presence for the runs view, always on the wire
 	// (bool, false for issue-less run kinds whose description carries no prds link).
 	"has_prd_link",
@@ -817,17 +820,28 @@ func TestAdminCLITokenDTOTags(t *testing.T) {
 
 func TestUsageDTOTags(t *testing.T) {
 	assertTags(t, "UsageDTO", UsageDTO{},
-		"input_tokens", "cache_read_tokens", "cache_creation_tokens", "output_tokens", "cost_usd")
+		"input_tokens", "cache_read_tokens", "cache_creation_tokens", "output_tokens", "cost_usd",
+		// PRD #1429 M1 (D7): the folded per-run cost-observability marker (metered|subscription|
+		// unreported). Always on the wire; "" on a per-window aggregate (the counts carry it there).
+		"cost_status")
 }
 
 func TestSelfUsageDTOTags(t *testing.T) {
-	// PRD #1293: gains "outcomes" (the failed-run rate windows wrapper).
-	assertTags(t, "SelfUsageDTO", SelfUsageDTO{}, "lifetime", "last_7_days", "run_count", "outcomes")
+	assertTags(t, "SelfUsageDTO", SelfUsageDTO{}, "lifetime", "last_7_days", "run_count",
+		// PRD #1429 M1 (D7): the per-window subscription/unreported run counts, so a mixed
+		// aggregate discloses that a non-metered component makes the dollar total incomplete.
+		"lifetime_subscription_run_count", "lifetime_unreported_run_count",
+		"last7_subscription_run_count", "last7_unreported_run_count",
+		// PRD #1293: gains "outcomes" (the failed-run rate windows wrapper).
+		"outcomes")
 }
 
 func TestAdminUserUsageDTOTags(t *testing.T) {
-	// PRD #1293: gains "outcomes" (this user's lifetime failed-run rate aggregate).
-	assertTags(t, "AdminUserUsageDTO", AdminUserUsageDTO{}, "user_id", "email", "usage", "run_count", "outcomes")
+	assertTags(t, "AdminUserUsageDTO", AdminUserUsageDTO{}, "user_id", "email", "usage", "run_count",
+		// PRD #1429 M1 (D7): the user's lifetime subscription/unreported run counts.
+		"subscription_run_count", "unreported_run_count",
+		// PRD #1293: gains "outcomes" (this user's lifetime failed-run rate aggregate).
+		"outcomes")
 }
 
 func TestAdminUsageDTOTags(t *testing.T) {
@@ -891,7 +905,9 @@ func TestUserSettingsDTOTags(t *testing.T) {
 		// PRD #700 M5: the per-user MR-review-watcher opt-in (default ON; null clears to default).
 		"mr_rework_enabled",
 		// PRD #1167: the four raw per-field appearance overrides (each null ⇒ inherit).
-		"appearance_mode", "light_theme", "dark_theme", "typeface")
+		"appearance_mode", "light_theme", "dark_theme", "typeface",
+		// PRD #1429 M1 (D3): the per-user default harness (null ⇒ no preference).
+		"default_harness")
 }
 
 // TestAgentMemoryWriteRequestTags pins the worker save body: {title, body} plus the

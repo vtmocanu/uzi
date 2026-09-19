@@ -11,6 +11,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // PRD #1247 M2: the create-time credential override on POST /api/runs. These tests exercise
@@ -187,12 +188,29 @@ func TestCreateRunCredentialOverrideRefusalsLiveDB(t *testing.T) {
 		assertNoRun(ctx, t, f, repoID)
 	})
 
-	// 422: the owner's default_harness is codex → ErrCredentialOverrideHarnessUnsupported,
-	// regardless of mode (the harness check precedes the per-mode secret lookup).
+	// 422: the owner's default_harness is codex AND that Codex default is actually USABLE (a
+	// linked/static credential), so D11 genuinely resolves Codex inside the create transaction
+	// → ErrCredentialOverrideHarnessUnsupported, regardless of mode (the harness check precedes
+	// the per-mode secret lookup). PRD #1429 M2 (D5): merely setting the raw default_harness
+	// column is no longer sufficient — the effective harness now comes from a real D11
+	// resolution, so an UNUSABLE Codex default falls through to Claude and ACCEPTS the
+	// override instead (covered by the Claude-fallback case below).
 	t.Run("codex default harness is 422", func(t *testing.T) {
 		f := newStartRunGuardFixture(ctx, t)
 		repoID := f.seedEnabledRepoWithIssue(ctx, t, 5212, 7, protClean)
 		mustExecT(ctx, t, f.pool, `UPDATE users SET default_harness = 'codex' WHERE id = $1`, f.owner.ID)
+		codexSecretID := uuid.New()
+		mustExecT(ctx, t, f.pool,
+			`INSERT INTO user_secrets (id, user_id, kind, label, is_default, ciphertext, sealed_with)
+			 VALUES ($1, $2, 'openai_api_key', $3, true, $4, 'master')`,
+			codexSecretID, f.owner.ID, "codex-key-"+uuid.NewString(), []byte("x"))
+		if _, err := f.h.q.InsertCodexCredentialState(ctx, store.InsertCodexCredentialStateParams{
+			UserSecretID: codexSecretID,
+			UserID:       f.owner.ID,
+			Status:       "static",
+		}); err != nil {
+			t.Fatalf("insert codex credential state: %v", err)
+		}
 		w := f.createRunWithOverride(t, repoID, map[string]any{
 			"issue_iid":           7,
 			"credential_override": map[string]any{"mode": "auto"},
@@ -201,6 +219,22 @@ func TestCreateRunCredentialOverrideRefusalsLiveDB(t *testing.T) {
 			t.Fatalf("status = %d, want 422 (body %s)", w.Code, w.Body.String())
 		}
 		assertNoRun(ctx, t, f, repoID)
+	})
+
+	// 201: the SAME raw default_harness=codex, but WITHOUT a usable Codex credential, falls
+	// through D11 to Claude — the Anthropic override is then accepted, not refused (D5's
+	// "unusable Codex default falls through to Claude and accepts a valid Anthropic override").
+	t.Run("unusable codex default falls through to claude and accepts override", func(t *testing.T) {
+		f := newStartRunGuardFixture(ctx, t)
+		repoID := f.seedEnabledRepoWithIssue(ctx, t, 5215, 7, protClean)
+		mustExecT(ctx, t, f.pool, `UPDATE users SET default_harness = 'codex' WHERE id = $1`, f.owner.ID)
+		w := f.createRunWithOverride(t, repoID, map[string]any{
+			"issue_iid":           7,
+			"credential_override": map[string]any{"mode": "auto"},
+		})
+		if w.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201 (body %s)", w.Code, w.Body.String())
+		}
 	})
 
 	// 400: a pinned mode with no secret_id → ErrCredentialOverridePinnedNeedsSecret.

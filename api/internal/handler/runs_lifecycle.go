@@ -97,6 +97,10 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 			Mode     string  `json:"mode"`
 			SecretID *string `json:"secret_id"`
 		} `json:"credential_override"`
+		// PRD #1429 M2 (D2): the optional public harness selection, values claude|codex; absent ⇒
+		// implicit D11 resolution. An invalid enum is a 400. The web start dialog picker is M4a and
+		// the `uzi run create --harness` flag is M5; this handler accepts the field now.
+		Harness string `json:"harness"`
 	}
 	if err := httpx.DecodeJSON(r, &req); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
@@ -144,10 +148,22 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// PRD #1247 M2: resolve the create-time credential override (D5/D9/D10) BEFORE the
-	// forge round-trip and the insert, so an invalid choice never creates a run. Absent ⇒
+	// PRD #1429 M2 (D2): the optional harness enum. Absent ⇒ nil ⇒ implicit D11; an invalid enum is
+	// a 400 before any forge round-trip or insert.
+	explicit, harnessOK := parseHarnessParam(req.Harness)
+	if !harnessOK {
+		httpx.Error(w, http.StatusBadRequest, "harness must be one of claude, codex")
+		return
+	}
+
+	// PRD #1429 M2 (D5): thread the RAW credential override (mode + optional secret id) down into
+	// the create path. It is validated through the one validator against the D11-RESOLVED harness
+	// INSIDE the create transaction (createRunAtomic) — not against a pre-transaction guess — so an
+	// explicit-Claude request with a Codex default keeps a valid Anthropic override, and an
+	// effective-Codex harness refuses it (422) with no run row and no forge write after the invalid
+	// fact is known. The old pre-transaction createRunEffectiveHarness guesser is gone. Absent ⇒
 	// nil ⇒ inherit the worker binding (the web board / chat start card path, unchanged).
-	var credOverride *workersvc.CredentialOverride
+	var rawOverride *workersvc.RawCredentialOverride
 	if req.CredentialOverride != nil {
 		var secretID *uuid.UUID
 		if req.CredentialOverride.SecretID != nil {
@@ -158,28 +174,13 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 			}
 			secretID = &id
 		}
-		// The effective harness of a NEW issue run is the user's default_harness (else
-		// claude): there is no runs.harness row yet (D9's "runs.harness, else
-		// users.default_harness"). Only a codex effective harness is refused (422), so any
-		// other value resolves to claude.
-		harness, herr := h.createRunEffectiveHarness(r.Context(), user.ID)
-		if herr != nil {
-			slog.Error("resolve create-time harness", "error", herr)
-			httpx.Error(w, http.StatusInternalServerError, "internal error")
-			return
-		}
-		resolved, verr := h.wsvc.ResolveCredentialOverride(r.Context(), user.ID, runkind.Issue, harness, req.CredentialOverride.Mode, secretID)
-		if verr != nil {
-			h.writeCredentialOverrideError(w, verr)
-			return
-		}
-		credOverride = resolved
+		rawOverride = &workersvc.RawCredentialOverride{Mode: req.CredentialOverride.Mode, SecretID: secretID}
 	}
 
 	// The forge GetIssue snapshot, the uzi-label eligibility gate and the description
 	// cap all live inside StartRunForUser (PRD #191 M1), shared with the Slack/web chat
 	// start-run card.
-	run, err := h.wsvc.StartRunForUser(r.Context(), user.ID, repo.ID, req.IssueIID, req.WaitOnLimit, req.MrReworkEnabled, req.Force, seed, credOverride)
+	run, err := h.wsvc.StartRunForUser(r.Context(), user.ID, repo.ID, req.IssueIID, req.WaitOnLimit, req.MrReworkEnabled, req.Force, seed, explicit, rawOverride)
 	if err != nil {
 		h.writeStartRunError(w, r, err)
 		return
@@ -187,22 +188,25 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusCreated, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock())})
 }
 
-// createRunEffectiveHarness resolves the effective harness of a NEW issue run for the
-// credential-override validator (PRD #1247 M2, D9). A run being created has no runs.harness
-// row yet, so the effective harness is the user's persisted default_harness, else claude —
-// the same "runs.harness, run_schedules.harness, else users.default_harness" fallback the
-// one validator's contract names, applied to the create case where the first two do not yet
-// exist. Only a codex effective harness is refused (422); every other value (including the
-// common NULL default) resolves to claude, so the fallback is the safe direction.
-func (h *Handler) createRunEffectiveHarness(ctx context.Context, userID uuid.UUID) (string, error) {
-	raw, err := h.q.GetUserDefaultHarness(ctx, userID)
-	if err != nil {
-		return "", err
+// parseHarnessParam parses the optional public harness enum (PRD #1429 M2, D2), shared by the
+// manual issue-create handler and the chat start_run card. An empty/whitespace value means "no
+// selection" ⇒ nil ⇒ implicit D11 resolution. A "claude"/"codex" value returns the typed harness.
+// Anything else returns ok=false so the caller maps it to a 400. It does NOT resolve availability
+// — an explicit-but-unusable harness is refused later (ErrNoCredentialForHarness → 422) so the
+// enum-shape 400 and the credential 422 stay distinct.
+func parseHarnessParam(raw string) (*workersvc.Harness, bool) {
+	switch strings.TrimSpace(raw) {
+	case "":
+		return nil, true
+	case string(workersvc.HarnessClaude):
+		h := workersvc.HarnessClaude
+		return &h, true
+	case string(workersvc.HarnessCodex):
+		h := workersvc.HarnessCodex
+		return &h, true
+	default:
+		return nil, false
 	}
-	if raw.Valid && raw.String == string(workersvc.HarnessCodex) {
-		return string(workersvc.HarnessCodex), nil
-	}
-	return string(workersvc.HarnessClaude), nil
 }
 
 // writeCredentialOverrideError maps the one validator's typed refusals to HTTP statuses
@@ -390,6 +394,26 @@ func (h *Handler) writeStartRunError(w http.ResponseWriter, r *http.Request, err
 		httpx.Error(w, http.StatusConflict, "a run is already in progress for this issue")
 	case errors.Is(err, workersvc.ErrBranchInUse):
 		httpx.Error(w, http.StatusConflict, "a CI-fix run is already working this issue's branch; cancel it before starting an issue run")
+	case errors.Is(err, workersvc.ErrNoCredentialForHarness):
+		// PRD #1429 M2 (D2): an EXPLICIT harness (request or pin) whose credential is unusable —
+		// 422 with the stable no_credential_for_harness classification. Never falls back.
+		httpx.JSON(w, http.StatusUnprocessableEntity, map[string]any{
+			"error": "the selected harness has no usable credential",
+			"code":  "no_credential_for_harness",
+		})
+	case errors.Is(err, workersvc.ErrNoUsableCredential):
+		// D11 rule 5: neither harness has a usable credential and no explicit selection forces one.
+		httpx.Error(w, http.StatusUnprocessableEntity, "no usable harness credential; add an Anthropic token or a Codex credential to run")
+	case errors.Is(err, workersvc.ErrCredentialOverrideSecretNotFound),
+		errors.Is(err, workersvc.ErrCredentialOverrideLaneNotSwitchable),
+		errors.Is(err, workersvc.ErrCredentialOverrideHarnessUnsupported),
+		errors.Is(err, workersvc.ErrCredentialOverridePinnedNeedsSecret),
+		errors.Is(err, workersvc.ErrCredentialOverrideInvalidMode):
+		// PRD #1429 M2 (D5): the #1247 credential override is now validated INSIDE the create
+		// transaction (StartRunForUser → createRunAtomic), so its typed refusals surface here.
+		// Reuse the one mapping so the four override write surfaces stay consistent (422 for a
+		// codex effective harness, 409/404/400 for the rest).
+		h.writeCredentialOverrideError(w, err)
 	default:
 		slog.Error("start run", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -577,6 +601,9 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 			CacheCreationTokens: u.CacheCreationTokens,
 			OutputTokens:        u.OutputTokens,
 			CostUSD:             numericToFloat(u.CostUsd),
+			// PRD #1429 M1 (D7): the run's folded cost_status, so the run-detail usage strip
+			// can distinguish a real metered dollar total from a subscription/unreported one.
+			CostStatus: u.CostStatus,
 		}
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		slog.Error("get run usage total", "run_id", run.ID, "error", err)

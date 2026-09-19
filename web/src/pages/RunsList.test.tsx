@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { RunRow, RunsHistory, RunsLayout, RunsList, sortPast } from "./RunsList";
-import { api, type RunListItem, type SecretMeta } from "../lib/api";
+import { api, type RunListItem, type SecretMeta, type CostStatus } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
 
 // Keep the real module (isTerminalRun etc.) and mock only the network + auth so the
@@ -83,6 +83,7 @@ function aRun(over: Partial<RunListItem> = {}): RunListItem {
     issue_iid: 7,
     issue_title: "A run",
     issue_description: "",
+    harness: "claude", // PRD #1429 M1: harness joined RunDTO.
     title: null,
     resume_of_run_id: null,
     status: "running",
@@ -395,6 +396,24 @@ describe("RunsList — autopilot badge", () => {
   });
 });
 
+describe("RunsList — harness badge (PRD #1429 M4a)", () => {
+  it("shows a Codex badge only for a codex-harness run, Claude stays unmarked", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        aRun({ id: "codex-run", issue_title: "Codex run", harness: "codex" }),
+        aRun({ id: "claude-run", issue_title: "Claude run", harness: "claude" }),
+      ],
+    });
+
+    renderRuns();
+
+    await waitFor(() => expect(screen.getByText("Codex run")).toBeTruthy());
+    expect(screen.getByText("Claude run")).toBeTruthy();
+    // Exactly one badge — the Claude run must not carry it.
+    expect(screen.getAllByText("Codex")).toHaveLength(1);
+  });
+});
+
 describe("RunsList — usage meta line (PRD #40)", () => {
   it("adds tokens + cost to a run with usage (running → 'so far'), nothing to a run without", async () => {
     mockApi.listRuns.mockResolvedValue({
@@ -403,7 +422,7 @@ describe("RunsList — usage meta line (PRD #40)", () => {
           id: "with",
           issue_title: "Has usage",
           status: "running",
-          usage: { input_tokens: 114_400, cache_read_tokens: 1_170_000, cache_creation_tokens: 0, output_tokens: 48_200, cost_usd: 1.87 },
+          usage: { input_tokens: 114_400, cache_read_tokens: 1_170_000, cache_creation_tokens: 0, output_tokens: 48_200, cost_usd: 1.87, cost_status: "metered" as const },
         }),
         aRun({ id: "without", issue_title: "No usage", status: "running" }),
       ],
@@ -418,7 +437,78 @@ describe("RunsList — usage meta line (PRD #40)", () => {
     // The no-usage run contributes no "tok" figure — exactly one run shows usage.
     expect(screen.queryAllByText(/tok/).length).toBe(1);
   });
-})
+});
+
+describe("RunsList — cost_status truthfulness (PRD #1429 M4b D7)", () => {
+  it("metered: shows the real dollar figure", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        aRun({
+          id: "metered",
+          issue_title: "Metered run",
+          usage: { input_tokens: 1000, cache_read_tokens: 0, cache_creation_tokens: 0, output_tokens: 200, cost_usd: 3.45, cost_status: "metered" as const },
+        }),
+      ],
+    });
+    renderRuns();
+    await waitFor(() => expect(screen.getByText("Metered run")).toBeTruthy());
+    expect(screen.getByText(/\$3\.45/)).toBeTruthy();
+  });
+
+  it("subscription: never a dollar figure, even with a nonzero cost_usd — an honest marker instead", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        aRun({
+          id: "sub",
+          issue_title: "Subscription run",
+          usage: { input_tokens: 1000, cache_read_tokens: 0, cache_creation_tokens: 0, output_tokens: 200, cost_usd: 0, cost_status: "subscription" as const },
+        }),
+      ],
+    });
+    renderRuns();
+    await waitFor(() => expect(screen.getByText("Subscription run")).toBeTruthy());
+    // Positive: the honest marker is shown, and tokens still render (not hidden).
+    expect(screen.getByText(/subscription/)).toBeTruthy();
+    expect(screen.getByText(/tok/)).toBeTruthy();
+    // Negative, paired with the above: never a dollar figure for this run.
+    expect(screen.queryByText(/\$/)).toBeNull();
+  });
+
+  it("unreported: tokens shown, cost marked unavailable rather than silently omitted", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        aRun({
+          id: "unrep",
+          issue_title: "Unreported run",
+          usage: { input_tokens: 1000, cache_read_tokens: 0, cache_creation_tokens: 0, output_tokens: 200, cost_usd: 0, cost_status: "unreported" as const },
+        }),
+      ],
+    });
+    renderRuns();
+    await waitFor(() => expect(screen.getByText("Unreported run")).toBeTruthy());
+    expect(screen.getByText(/cost n\/a/)).toBeTruthy();
+    expect(screen.getByText(/tok/)).toBeTruthy();
+    expect(screen.queryByText(/\$/)).toBeNull();
+  });
+
+  it("a hostile/unknown future cost_status renders as unavailable, never a complete $0", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        aRun({
+          id: "hostile",
+          issue_title: "Hostile status run",
+          // A newer server ships a status this build has never heard of, carrying a real
+          // nonzero cost_usd — it must never surface as a dollar figure.
+          usage: { input_tokens: 1000, cache_read_tokens: 0, cache_creation_tokens: 0, output_tokens: 200, cost_usd: 9.99, cost_status: "something_new" as CostStatus },
+        }),
+      ],
+    });
+    renderRuns();
+    await waitFor(() => expect(screen.getByText("Hostile status run")).toBeTruthy());
+    expect(screen.getByText(/cost n\/a/)).toBeTruthy();
+    expect(screen.queryByText(/\$/)).toBeNull();
+  });
+});
 
 // Issue #803: the MR/PR chip on a run row is a real deep-link to the forge request,
 // mirroring IssueView/Board — preferring the persisted mr_web_url and otherwise

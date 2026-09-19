@@ -89,6 +89,12 @@ func (h *Handler) scheduleDTO(s store.RunSchedule, repoPath string) apitypes.Sch
 	if s.CredentialOverrideMode.Valid && s.CredentialOverrideMode.String != "" {
 		dto.CredentialOverride = &apitypes.CredentialOverrideDTO{Mode: s.CredentialOverrideMode.String}
 	}
+	// harness (PRD #1429 M4a, D2): nil = implicit (D11 resolves at fire time), a value is the
+	// stored pin. Read straight from the row, mirroring credential_override's mode above.
+	if s.Harness.Valid && s.Harness.String != "" {
+		v := s.Harness.String
+		dto.Harness = &v
+	}
 	// sibling_group_id (PRD #636): a display-only group tag, surfaced as a uuid string only
 	// when the row is grouped (nil for a standalone row).
 	if s.SiblingGroupID.Valid {

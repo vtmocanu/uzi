@@ -7,15 +7,24 @@
 
 import { useState } from "react";
 import { useAuth } from "../auth/AuthContext";
-import { api } from "../lib/api";
+import { api, type UserSettingsPatch } from "../lib/api";
 import type { BindMode } from "../lib/apiTypes";
 import { errorMessage } from "../lib/apiError";
 import { useAsyncData } from "../lib/useAsyncData";
 import { Alert, Button, Card, Field, SectionTitle, Select, Skeleton } from "../components/ui";
-import { ModelSelect } from "../components/ModelSelect";
+import { ModelSelect, modelCompatibleWithHarness } from "../components/ModelSelect";
 import { EffortSelect } from "../components/EffortSelect";
+import { HarnessPicker } from "../components/HarnessPicker";
 import { modelFieldWarning } from "../lib/agentTemplates";
 import { SettingsShell } from "../components/SettingsShell";
+import { hasAnthropicToken, isCodexUsable } from "../lib/hasToken";
+import {
+  bothHarnessesUsable,
+  effectiveHarnessIsCodex,
+  INHERIT_HARNESS,
+  selectionFromHarness,
+  type HarnessSelection,
+} from "../lib/harnessSelection";
 
 // The judge picker's "Auto-select from the pool" sentinel — the SAME value
 // WorkersSettings.tsx uses for its worker picker, deliberately a string no
@@ -194,6 +203,18 @@ export function RunDefaults() {
   const [savedModel, setSavedModel] = useState("");
   const [modelBusy, setModelBusy] = useState(false);
 
+  // PRD #1429 M4a, D3/D6: the per-user default harness. "inherit" (no preference) is
+  // the default; a value pins new implicit run creation to that harness (D11's second
+  // rung). Its own saved/busy pair, independent of the model above.
+  const [defaultHarness, setDefaultHarness] = useState<HarnessSelection>(INHERIT_HARNESS);
+  const [savedHarness, setSavedHarness] = useState<HarnessSelection>(INHERIT_HARNESS);
+  const [harnessBusy, setHarnessBusy] = useState(false);
+  // D3: the harness card (and its D2 "no redundant picker" rule) appears only when the
+  // user has a usable credential for BOTH harnesses — a single-harness user's flow
+  // stays byte-identical to today, with no card at all.
+  const [claudeUsable, setClaudeUsable] = useState(false);
+  const [codexUsable, setCodexUsable] = useState(false);
+
   // Per-user judge model (PRD #69 M2): "" = inherit the instance judge_model. Its own
   // saved/busy pair, independent of the worker model above — they write the same
   // /me/settings endpoint but each sends only its own field.
@@ -240,6 +261,13 @@ export function RunDefaults() {
       setDefaultEffort(eff);
       setSavedEffort(eff);
       setMrReworkEnabled(settings.mr_rework_enabled ?? null);
+      // PRD #1429 M4a, D3: harness-aware credential facts, computed on ALL secrets
+      // (not the anthropic_token-only slice below, which the judge picker uses).
+      setClaudeUsable(hasAnthropicToken(rows));
+      setCodexUsable(isCodexUsable(rows));
+      const dh = selectionFromHarness(settings.default_harness);
+      setDefaultHarness(dh);
+      setSavedHarness(dh);
       return { secrets: rows.filter((s) => s.kind === "anthropic_token") };
     },
     [],
@@ -352,6 +380,55 @@ export function RunDefaults() {
       setError(errorMessage(err, "Failed to save reasoning effort"));
     } finally {
       setEffortBusy(false);
+    }
+  };
+
+  // PRD #1429 M4a, D2/D3: the harness card appears only when the user has a usable
+  // credential for BOTH harnesses (D2's "no redundant picker" rule extends to Run
+  // Defaults, not just the start dialog).
+  const showHarnessCard = bothHarnessesUsable(claudeUsable, codexUsable);
+  const harnessDirty = defaultHarness !== savedHarness;
+  // The Worker model vocabulary follows the EFFECTIVE harness, not the raw pick: a
+  // Codex-only user never sees the card above, so `defaultHarness` stays "inherit" while
+  // every run resolves to Codex. Keyed on the raw pick they were offered Claude aliases
+  // only, and a saved one was dropped at claim (D6 fallback). `defaultHarness` IS the
+  // default here, so the helper takes no separate default argument.
+  const workerModelOnCodex = effectiveHarnessIsCodex(defaultHarness, claudeUsable, codexUsable);
+
+  // saveHarness persists the pin (present-value sets it, null clears it back to
+  // implicit D11) and — D6 — resets an incompatible STORED default model to inherit
+  // in the SAME write, rather than persist a knowingly-invalid model/harness pair.
+  // Compatibility is checked against the persisted model (savedModel), not an
+  // unsaved draft in the model picker below, since only a SAVED model can ever reach
+  // a run.
+  const saveHarness = async () => {
+    setError("");
+    setNotice("");
+    setHarnessBusy(true);
+    try {
+      const nextHarness = defaultHarness === "inherit" ? null : defaultHarness;
+      const patch: UserSettingsPatch = { default_harness: nextHarness };
+      const resetModel = nextHarness != null && !modelCompatibleWithHarness(savedModel, nextHarness);
+      if (resetModel) patch.default_model = null;
+      const { settings } = await api.putMySettings(patch);
+      const dh = selectionFromHarness(settings.default_harness);
+      setDefaultHarness(dh);
+      setSavedHarness(dh);
+      if (resetModel) {
+        const model = settings.default_model ?? "";
+        setDefaultModel(model);
+        setSavedModel(model);
+      }
+      setNotice(
+        dh === "inherit"
+          ? "Default harness cleared. New runs resolve automatically."
+          : `Default harness set to ${dh}. It applies to a new run that doesn't choose one explicitly.` +
+              (resetModel ? " Your worker model was reset to Inherit — it isn't valid for that harness." : ""),
+      );
+    } catch (err) {
+      setError(errorMessage(err, "Failed to save default harness"));
+    } finally {
+      setHarnessBusy(false);
     }
   };
 
@@ -702,11 +779,50 @@ export function RunDefaults() {
         </label>
       </Card>
 
+      {/* PRD #1429 M4a, D2/D3: the per-user default harness. Shown ONLY when the user
+          has a usable credential for BOTH harnesses — a single-harness user's flow
+          stays byte-identical to today, with no card at all. Placed right before
+          Worker model: the two are coupled (D6) — switching harness here resets an
+          incompatible saved model rather than leaving a knowingly-invalid pair. */}
+      {showHarnessCard && (
+        <Card className="space-y-4">
+          <div>
+            <SectionTitle>Default harness</SectionTitle>
+            <p className="mt-2 text-sm text-muted">
+              Which agent harness a new run uses when it doesn't choose one explicitly.
+              Leave it on <em>Use my default</em> to let uzi resolve it automatically (the
+              only harness you can use, or Claude when both are available and you haven't
+              set one here).
+            </p>
+          </div>
+
+          {loading ? (
+            <Skeleton className="h-9 w-full max-w-sm" />
+          ) : (
+            <div className="space-y-3">
+              <Field label="Harness" htmlFor="default-harness">
+                <HarnessPicker
+                  id="default-harness"
+                  label="Default harness"
+                  className="w-full max-w-sm"
+                  value={defaultHarness}
+                  onChange={setDefaultHarness}
+                  disabled={harnessBusy}
+                />
+              </Field>
+              <Button type="button" disabled={harnessBusy || !harnessDirty} onClick={saveHarness}>
+                Save harness
+              </Button>
+            </div>
+          )}
+        </Card>
+      )}
+
       <Card className="space-y-5">
         <div>
           <SectionTitle>Worker model</SectionTitle>
           <p className="mt-2 text-sm text-muted">
-            The Claude model your runs use — the lead orchestrator and its subagents that
+            The model your runs use — the lead orchestrator and its subagents that
             inherit the model. Picking one here overrides the lead template's model for your
             own runs; other users are unaffected. Leave it on <em>Inherit</em> to use the lead
             template's model (opus by default). An unrecognized custom ID only fails on the
@@ -719,7 +835,12 @@ export function RunDefaults() {
         ) : (
           <div className="space-y-3">
             <Field label="Model" htmlFor="worker-model">
-              <ModelSelect id="worker-model" value={defaultModel} onChange={setDefaultModel} />
+              <ModelSelect
+                id="worker-model"
+                value={defaultModel}
+                onChange={setDefaultModel}
+                harness={workerModelOnCodex ? "codex" : defaultHarness === "inherit" ? undefined : defaultHarness}
+              />
             </Field>
             {modelWarning && <Alert message={modelWarning} tone="warning" />}
             <Button

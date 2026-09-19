@@ -141,7 +141,7 @@ func TestRegisterEnqueuesJudgeForOrphanFailedRuns(t *testing.T) {
 	orphan := uuid.New()
 	fs := &fakeStore{
 		orphanFailedRuns: []uuid.UUID{orphan},
-		runByIDPlain:     store.Run{ID: orphan, UserID: uuid.New(), Kind: runkind.Issue, Status: "failed"},
+		runByIDPlain:     store.Run{ID: orphan, UserID: uuid.New(), Kind: runkind.Issue, Status: "failed", Harness: string(HarnessClaude)},
 		userByID:         store.User{JudgeEnabled: true},
 		anthropic:        []byte("sealed"),
 		registerResult:   store.Worker{ID: uuid.New(), Status: "online"},
@@ -174,7 +174,13 @@ func eligibleFixture(t *testing.T) (*fakeStore, *Service, store.Run) {
 	}
 	svc := New(fs, newBox(t), testParams())
 	svc.SetSettings(fakeSettings{enabled: true, model: "haiku"})
-	run := store.Run{ID: uuid.New(), UserID: uuid.New(), Kind: runkind.Issue, Status: "completed", IssueTitle: "Do X"}
+	// PRD #1429 M3 (D4): the judge inherits the target's harness as an explicit selection,
+	// and createRunResolved's non-live-DB fallback only ever resolves Claude (the fake
+	// asserts no wrong harness) — so a fixture without an explicit Claude harness would now
+	// refuse at create (errNoCredentialForHarness) instead of enqueueing. Every plain-fake
+	// unit test here targets the pre-existing Claude behavior; the Codex-target enqueue path
+	// is proven live-DB (harness_origin_drift_livedb_test.go / judge_enqueue_harness_*).
+	run := store.Run{ID: uuid.New(), UserID: uuid.New(), Kind: runkind.Issue, Status: "completed", IssueTitle: "Do X", Harness: string(HarnessClaude)}
 	return fs, svc, run
 }
 
@@ -380,8 +386,8 @@ func TestPostReviewPersistsVerdictAndRecs(t *testing.T) {
 func TestSubmitInputRejectServerSideEnqueuesJudge(t *testing.T) {
 	user, runID := uuid.New(), uuid.New()
 	fs := &fakeStore{
-		runByID:      store.Run{ID: runID, UserID: user, Status: "awaiting_approval"},           // GetRun + no worker ⇒ no live poller
-		runByIDPlain: store.Run{ID: runID, UserID: user, Status: "failed", Kind: runkind.Issue}, // post-reject reload
+		runByID:      store.Run{ID: runID, UserID: user, Status: "awaiting_approval"},                                           // GetRun + no worker ⇒ no live poller
+		runByIDPlain: store.Run{ID: runID, UserID: user, Status: "failed", Kind: runkind.Issue, Harness: string(HarnessClaude)}, // post-reject reload
 		userByID:     store.User{JudgeEnabled: true},
 		anthropic:    []byte("sealed"),
 	}
@@ -423,8 +429,8 @@ func TestSubmitInputRejectServerSidePersistsReason(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			user, runID := uuid.New(), uuid.New()
 			fs := &fakeStore{
-				runByID:      store.Run{ID: runID, UserID: user, Status: "awaiting_approval"},           // GetRun + no worker ⇒ no live poller
-				runByIDPlain: store.Run{ID: runID, UserID: user, Status: "failed", Kind: runkind.Issue}, // post-reject reload
+				runByID:      store.Run{ID: runID, UserID: user, Status: "awaiting_approval"},                                           // GetRun + no worker ⇒ no live poller
+				runByIDPlain: store.Run{ID: runID, UserID: user, Status: "failed", Kind: runkind.Issue, Harness: string(HarnessClaude)}, // post-reject reload
 				userByID:     store.User{JudgeEnabled: true},
 				anthropic:    []byte("sealed"),
 			}
@@ -552,8 +558,8 @@ func TestSubmitInputCancelServerSideCapsStopReason(t *testing.T) {
 func TestSubmitInputRejectServerSideCapsReason(t *testing.T) {
 	user, runID := uuid.New(), uuid.New()
 	fs := &fakeStore{
-		runByID:      store.Run{ID: runID, UserID: user, Status: "awaiting_approval"},           // GetRun + no worker ⇒ no live poller
-		runByIDPlain: store.Run{ID: runID, UserID: user, Status: "failed", Kind: runkind.Issue}, // post-reject reload
+		runByID:      store.Run{ID: runID, UserID: user, Status: "awaiting_approval"},                                           // GetRun + no worker ⇒ no live poller
+		runByIDPlain: store.Run{ID: runID, UserID: user, Status: "failed", Kind: runkind.Issue, Harness: string(HarnessClaude)}, // post-reject reload
 		userByID:     store.User{JudgeEnabled: true},
 		anthropic:    []byte("sealed"),
 	}

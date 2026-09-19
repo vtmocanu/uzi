@@ -101,6 +101,13 @@ func (h *Handler) SelfUsage(w http.ResponseWriter, r *http.Request) {
 			CostUSD:             numericToFloat(row.Last7CostUsd),
 		},
 		RunCount: row.RunCount,
+		// PRD #1429 M1 (D7): the per-window subscription/unreported run counts the store
+		// already computes, so the summary can disclose that a non-metered component makes the
+		// numeric dollar total incomplete rather than presenting a partial sum as complete.
+		LifetimeSubscriptionRunCount: row.LifetimeSubscriptionRunCount,
+		LifetimeUnreportedRunCount:   row.LifetimeUnreportedRunCount,
+		Last7SubscriptionRunCount:    row.Last7SubscriptionRunCount,
+		Last7UnreportedRunCount:      row.Last7UnreportedRunCount,
 		Outcomes: apitypes.RunOutcomeWindowsDTO{
 			Lifetime: runOutcomes(outcomes.LifetimeFinished, outcomes.LifetimeCompleted,
 				outcomes.LifetimeCancelled, outcomes.LifetimePlanRejected, outcomes.LifetimeFailed, lifetimeOrigins),
@@ -197,6 +204,10 @@ func (h *Handler) AdminUsage(w http.ResponseWriter, r *http.Request) {
 				CostUSD:             numericToFloat(u.CostUsd),
 			},
 			RunCount: u.RunCount,
+			// PRD #1429 M1 (D7): the user's lifetime subscription/unreported run counts, so the
+			// admin per-user breakdown discloses a non-metered component like the factory total.
+			SubscriptionRunCount: u.SubscriptionRunCount,
+			UnreportedRunCount:   u.UnreportedRunCount,
 			Outcomes: runOutcomes(oc.Finished, oc.Completed, oc.Cancelled, oc.PlanRejected, oc.Failed,
 				originsByUser[u.UserID]),
 		})
@@ -234,6 +245,13 @@ func (h *Handler) AdminUsage(w http.ResponseWriter, r *http.Request) {
 				CostUSD:             numericToFloat(totals.Last7CostUsd),
 			},
 			RunCount: totals.RunCount,
+			// PRD #1429 M1 (D7): the factory-wide per-window subscription/unreported run
+			// counts, so a mixed aggregate never presents its numeric metered subset as the
+			// complete total.
+			LifetimeSubscriptionRunCount: totals.LifetimeSubscriptionRunCount,
+			LifetimeUnreportedRunCount:   totals.LifetimeUnreportedRunCount,
+			Last7SubscriptionRunCount:    totals.Last7SubscriptionRunCount,
+			Last7UnreportedRunCount:      totals.Last7UnreportedRunCount,
 			Outcomes: apitypes.RunOutcomeWindowsDTO{
 				Lifetime: runOutcomes(factoryOutcomes.LifetimeFinished, factoryOutcomes.LifetimeCompleted,
 					factoryOutcomes.LifetimeCancelled, factoryOutcomes.LifetimePlanRejected,
@@ -262,5 +280,10 @@ func usageFromListRow(row store.ListRunsForUserRow) *apitypes.UsageDTO {
 		CacheCreationTokens: row.UsageCacheCreationTokens.Int64,
 		OutputTokens:        row.UsageOutputTokens.Int64,
 		CostUSD:             numericToFloat(row.UsageCostUsd),
+		// PRD #1429 M1 (D7): the run's folded cost_status from run_usage_totals. Nullable in
+		// the LEFT join, but a usage-bearing row (guarded above by UsageInputTokens.Valid)
+		// always carries it; a NULL reads as "" (harmless — the row has usage, so the token
+		// columns gate the bundle, and cost_status is the display marker).
+		CostStatus: row.UsageCostStatus.String,
 	}
 }

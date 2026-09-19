@@ -55,6 +55,7 @@ func TestInteractiveTaskRunConstraintsLiveDB(t *testing.T) {
 	id := uuid.New()
 	branch := "uzi/task/" + id.String()
 	run, err := q.CreateTaskRun(ctx, store.CreateTaskRunParams{
+		Harness:          "claude", // PRD #1429 M1: harness is now a required @harness param.
 		RunID:            id,
 		UserID:           userID,
 		RepoID:           repoID,
@@ -84,6 +85,7 @@ func TestInteractiveTaskRunConstraintsLiveDB(t *testing.T) {
 	// of the column, and the "did we accidentally hard-code true" backstop.
 	plainID := uuid.New()
 	plain, err := q.CreateTaskRun(ctx, store.CreateTaskRunParams{
+		Harness:          "claude", // PRD #1429 M1: harness is now a required @harness param.
 		RunID:            plainID,
 		UserID:           userID,
 		RepoID:           repoID,

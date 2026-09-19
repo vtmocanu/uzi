@@ -16,6 +16,7 @@ import (
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/theme"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // userSettingsDTO is the current user's own (non-secret) settings: the default
@@ -48,6 +49,10 @@ type userSettingsDTO struct {
 	LightTheme     *string `json:"light_theme"`
 	DarkTheme      *string `json:"dark_theme"`
 	Typeface       *string `json:"typeface"`
+	// DefaultHarness is the user's per-user default harness (PRD #1429 M1 / D3), nullable:
+	// null = "no preference", so implicit run creation falls through D11 rather than pinning.
+	// A non-null value is one of the closed claude|codex set (validateHarness gates the write).
+	DefaultHarness *string `json:"default_harness"`
 }
 
 // userSettingsResponse reads the user's settings row (one GetUserSettings query,
@@ -77,6 +82,7 @@ func (h *Handler) userSettingsResponse(w http.ResponseWriter, r *http.Request, u
 			LightTheme:      textPtrValue(s.LightTheme.Valid, s.LightTheme.String),
 			DarkTheme:       textPtrValue(s.DarkTheme.Valid, s.DarkTheme.String),
 			Typeface:        textPtrValue(s.Typeface.Valid, s.Typeface.String),
+			DefaultHarness:  textPtrValue(s.DefaultHarness.Valid, s.DefaultHarness.String),
 		},
 	})
 }
@@ -130,6 +136,10 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 		LightTheme     json.RawMessage `json:"light_theme"`
 		DarkTheme      json.RawMessage `json:"dark_theme"`
 		Typeface       json.RawMessage `json:"typeface"`
+		// default_harness (PRD #1429 M1 / D3), same absent/null/value tri-state as the model
+		// fields: absent ⇒ column unchanged, null ⇒ clear to NULL ("no preference"), a
+		// claude|codex value ⇒ validated then set.
+		DefaultHarness json.RawMessage `json:"default_harness"`
 	}
 	if err := httpx.DecodeJSON(r, &req); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
@@ -248,6 +258,25 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		httpx.Error(w, http.StatusBadRequest, err.Error())
 		return
+	}
+
+	var harnessVal pgtype.Text
+	harnessPresent := req.DefaultHarness != nil
+	if harnessPresent {
+		var raw *string
+		if err := json.Unmarshal(req.DefaultHarness, &raw); err != nil {
+			httpx.Error(w, http.StatusBadRequest, "invalid default_harness")
+			return
+		}
+		// PRD #1429 M1 / D3: present-null clears to NULL ("no preference"); a claude|codex
+		// value sets the pin; anything else is a 400 (validateHarness). Validated in phase 1
+		// with the other fields so a bad harness leaves nothing half-written.
+		v, err := validateHarness(raw)
+		if err != nil {
+			httpx.Error(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		harnessVal = v
 	}
 
 	var mrVal pgtype.Bool
@@ -418,6 +447,17 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	if harnessPresent {
+		if _, err := h.q.SetUserDefaultHarness(r.Context(), store.SetUserDefaultHarnessParams{
+			ID:             user.ID,
+			DefaultHarness: harnessVal,
+		}); err != nil {
+			slog.Error("set user default harness", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+
 	if sidebarPresent {
 		if _, err := h.q.SetUserSidebarTokens(r.Context(), store.SetUserSidebarTokensParams{
 			ID:              user.ID,
@@ -513,6 +553,25 @@ func validateTheme(raw *string) (pgtype.Text, error) {
 		return pgtype.Text{}, err
 	}
 	return pgtype.Text{String: v, Valid: true}, nil
+}
+
+// validateHarness maps a nullable default_harness override to its storage type (PRD #1429
+// M1 / D3): a nil pointer clears to NULL ("no preference" — implicit run creation falls
+// through D11), a "claude"/"codex" value becomes a set pgtype.Text, and anything else is a
+// 400. The closed set mirrors the users_default_harness_check CHECK (migration 00226); the
+// enum tokens come from workersvc so the API and the resolver cannot drift. Unlike the model
+// validators it does NOT trim a blank string to NULL — only JSON null clears — so a bad value
+// is a clean reject rather than a silent inherit.
+func validateHarness(raw *string) (pgtype.Text, error) {
+	if raw == nil {
+		return pgtype.Text{}, nil
+	}
+	switch *raw {
+	case string(workersvc.HarnessClaude), string(workersvc.HarnessCodex):
+		return pgtype.Text{String: *raw, Valid: true}, nil
+	default:
+		return pgtype.Text{}, fmt.Errorf("default_harness: must be one of %s, %s", workersvc.HarnessClaude, workersvc.HarnessCodex)
+	}
 }
 
 // decodeAppearanceField decodes one tri-state appearance field (PRD #1167) into

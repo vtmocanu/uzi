@@ -48,6 +48,7 @@ import type {
   CreatedIssue,
   ForgeConfig,
   ForgeConnection,
+  Harness,
   HostedConfig,
   IncidentalFinding,
   IncidentalFindingBacklog,
@@ -1018,11 +1019,17 @@ const realApi = {
     // run's body is byte-identical to a pre-#1247 create and the run follows the worker
     // binding. The write shape mirrors the Go create handler ({mode, secret_id?}).
     credentialOverride?: { mode: string; secret_id?: string },
+    // PRD #1429 M4a: the explicit harness choice. Sent ONLY when the user picked one
+    // (lib/harnessSelection.ts's runHarnessBody returns undefined for "inherit"), so an
+    // inherit start is byte-identical to a pre-M4a create and the server's D11 resolver
+    // picks implicitly.
+    harness?: Harness,
   ) =>
     request<{ run: Run }>("POST", `/repos/${repoId}/runs`, {
       issue_iid: issueIid,
       ...(force ? { force: true } : {}),
       ...(credentialOverride ? { credential_override: credentialOverride } : {}),
+      ...(harness ? { harness } : {}),
     }),
   /** Queue a CI-fix run for a failed pipeline on a watched ref (PRD #6). */
   createCIFixRun: (repoId: string, ref: string) =>

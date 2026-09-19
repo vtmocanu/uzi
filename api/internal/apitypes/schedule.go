@@ -68,6 +68,52 @@ func (o OptionalCredentialOverride) MarshalJSON() ([]byte, error) {
 // zero value and dropped from the marshaled body.
 func (o OptionalCredentialOverride) IsZero() bool { return !o.Present }
 
+// OptionalHarness is a request-presence / tri-state wrapper for the schedule PATCH/create
+// harness field (PRD #1429 M4a, Part A), mirroring OptionalCredentialOverride exactly (see
+// its doc for the WHY a plain *string cannot distinguish omitted from an explicit null):
+//
+//   - key absent          → Present=false             (omitted: seed-and-keep the stored pin)
+//   - "harness": null     → Present=true, Value=nil    (explicit clear: back to implicit D11)
+//   - "harness": "codex"  → Present=true, Value=&"codex" (explicit pin, validated claude|codex)
+//
+// On ENCODE it carries `omitzero` (Go 1.24+) + IsZero so a Present=false value is OMITTED
+// from the marshaled body — the CLI (M5) leaves harness out of a PATCH unless --harness was
+// passed, so an unrelated edit never restates (and so never re-validates or clears) the pin.
+type OptionalHarness struct {
+	Present bool
+	Value   *string
+}
+
+// UnmarshalJSON records that the key was present (even for an explicit null) and, for a
+// non-null value, decodes the inner string. See the type doc for the tri-state contract.
+func (o *OptionalHarness) UnmarshalJSON(b []byte) error {
+	o.Present = true
+	if string(b) == "null" {
+		o.Value = nil
+		return nil
+	}
+	var v string
+	if err := json.Unmarshal(b, &v); err != nil {
+		return err
+	}
+	o.Value = &v
+	return nil
+}
+
+// MarshalJSON emits the inner value (or JSON null when Present with no value). A
+// Present=false wrapper is never reached because IsZero + the `omitzero` tag omit the
+// whole key; it still marshals to null defensively if a caller forces it.
+func (o OptionalHarness) MarshalJSON() ([]byte, error) {
+	if o.Value == nil {
+		return []byte("null"), nil
+	}
+	return json.Marshal(*o.Value)
+}
+
+// IsZero drives the `omitzero` tag: an omitted (Present=false) wrapper is treated as the
+// zero value and dropped from the marshaled body.
+func (o OptionalHarness) IsZero() bool { return !o.Present }
+
 // ScheduleRequest is the create/patch input for a run schedule (PRD #241 M4).
 //
 // On CREATE, omitted pointer fields take their documented defaults (auto_approve=true
@@ -147,6 +193,21 @@ type ScheduleRequest struct {
 	// one credential-override validator and written. `omitzero` drops it from the marshaled
 	// body when absent, so the CLI only sends it when --token was passed.
 	CredentialOverride OptionalCredentialOverride `json:"credential_override,omitzero"`
+	// Harness is the schedule's per-run harness pin (PRD #1429 M4a, D2): every fired run
+	// either resolves through this explicit pin (frozen onto the run, never falling back to
+	// the other harness) or, when null, through implicit D11 at fire time. It is
+	// request-presence / tri-state (see OptionalHarness) so an OMITTED field seeds-and-keeps
+	// the stored pin (an unrelated retime/model edit must neither re-validate nor clear it,
+	// same as CredentialOverride above), while an EXPLICIT value ({"harness":"codex"} or
+	// null) is validated against the closed claude|codex enum and written. `omitzero` drops
+	// it from the marshaled body when absent, so the CLI (M5) only sends it when --harness
+	// was passed. Unlike CredentialOverride, a harness pin is a SELECTION rather than a
+	// per-run credential override, so it is allowed on every lane including self_improve —
+	// self-improve creation resolves through the same D11 seam (M2), and the fire-time
+	// codexOverrideConflict gate (schedsvc) already documents that a pinned-Codex schedule
+	// can never ALSO store an Anthropic override; that invariant is enforced here at
+	// write time (see resolveScheduleHarness / resolveScheduleCredentialOverride ordering).
+	Harness OptionalHarness `json:"harness,omitzero"`
 }
 
 // ScheduleDTO is the response view of a run schedule (PRD #241 M4). All fields are
@@ -241,6 +302,12 @@ type ScheduleDTO struct {
 	// The twin of RunDTO.CredentialOverride — a fired run inherits this choice (M6). Null
 	// for every schedule until M6 wires the picker.
 	CredentialOverride *CredentialOverrideDTO `json:"credential_override"`
+	// Harness is the schedule's stored harness pin (PRD #1429 M4a, D2): nil means implicit —
+	// the fired run resolves through D11 at fire time (schedsvc already honors this, M2) — a
+	// value ("claude" or "codex") is an explicit pin frozen onto every fired run. The
+	// schedule-side twin of RunDTO.Harness, and what lets the edit form / `uzi schedule get`
+	// (M5) round-trip the pin.
+	Harness *string `json:"harness"`
 }
 
 // LastFireStarted is one run a persisted fire actually created (PRD #308 M3). Its json

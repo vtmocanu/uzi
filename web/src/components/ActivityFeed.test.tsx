@@ -61,6 +61,7 @@ function runFixture(over: Partial<Run> = {}): Run {
     issue_iid: 7,
     issue_title: "t",
     issue_description: "d",
+    harness: "claude", // PRD #1429 M1: harness joined RunDTO (NOT NULL, default claude).
     title: null,
     resume_of_run_id: null,
     status: "running",

@@ -17,8 +17,10 @@
 -- the manual Fix-CI button passes false (the run parks at the plan gate like any
 -- other), the poller's automatic ci_fix passes true (the worker resolves the plan
 -- gate with an approve verdict, mirroring autopilot's Decision 2).
--- harness (PRD #1332 M5A / D2) is the SQL literal 'claude', not a param: a ci_fix run is a
--- Claude production origin, and the literal defeats the DEFAULT-masks-omission trap.
+-- harness (PRD #1429 M1, was #1332 M5A / D2) is now the @harness PARAMETER supplied by the
+-- M5B create seam (workersvc.createRunAtomic), not the SQL literal 'claude'. CI-fix uses
+-- ordinary implicit D11 (no target-run relationship, D4); M2 wires the real resolved value.
+-- Every current caller passes string(HarnessClaude) as a mechanical stopgap.
 INSERT INTO runs (
     user_id, repo_id, kind, issue_title, issue_description,
     pipeline_id, pipeline_ref, failure_snapshot, ci_config_paths, wait_on_limit, auto_approve, required_capabilities, trigger_source, harness
@@ -30,7 +32,7 @@ INSERT INTO runs (
     -- required_capabilities (PRD #84 M2, issue #512 M1): inherit the repo's capability
     -- hint atomically via subquery, reusing the existing @repo_id param so no new Go
     -- struct field is generated. Same expression CreateRun uses.
-    COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), 'ci_fix', 'claude'
+    COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), 'ci_fix', @harness
 )
 RETURNING *;
 
