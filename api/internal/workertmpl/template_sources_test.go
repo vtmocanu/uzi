@@ -22,6 +22,13 @@ import (
 //   - Names (this package)                       — TestNamesMatchesTemplateDirs
 //   - .github/workflows/ci.yml     build matrix  — TestWorkflowMatricesMatchNames
 //   - .github/workflows/release.yml build matrix — TestWorkflowMatricesMatchNames
+//   - release.yml assert-worker-pin loop         — TestReleaseScriptWorkerListsMatchNames
+//   - release-verify.sh guard-4 loop             — TestReleaseScriptWorkerListsMatchNames
+//
+// The last two are the hand-written worker lists in the release-train's PUBLISHED-pin
+// guards (issue: an unpublished worker image, 2026-09-19). A template in Names but absent
+// from one of those loops is never checked for a published image, so the guard silently
+// misses it — the same drift class this file exists to catch.
 //
 // The controller's template→image map is covered transitively via PRD #58's
 // cross-module golden api/internal/hostedsvc/testdata/hosted_templates.json: its
@@ -106,7 +113,7 @@ var templateMatrixRe = regexp.MustCompile(`(?m)^\s*template:\s*\[([^\]]*)\]\s*$`
 // file, each sorted. Empty slice means none were found.
 func matrixTemplates(t *testing.T, path string) [][]string {
 	t.Helper()
-	raw, err := os.ReadFile(path)
+	raw, err := os.ReadFile(path) //nolint:gosec // G304: reads a fixed repo-relative workflow/script path in a test, not user input
 	if err != nil {
 		t.Fatalf("read %s: %v", path, err)
 	}
@@ -152,6 +159,73 @@ func TestWorkflowMatricesMatchNames(t *testing.T) {
 					"matrix (sorted): %v\nNames (sorted):  %v\n"+
 					"A template in Names but not the matrix is never built: its image is missing "+
 					"and the worker lands ImagePullBackOff. Update the matrix to match.", wf, got, want)
+			}
+		}
+	}
+}
+
+// workerListRe matches a shell `for <var> in <bare words>; do` loop carrying a trailing
+// `# ...workertmpl...` marker, e.g.
+//
+//	for t in base jvm; do  # worker templates; workertmpl.Names (pinned by ...)
+//	for img in agent-base agent-jvm; do  # worker images agent-<name>; workertmpl.Names ...
+//
+// The marker is the anchor: it singles these worker lists out from the OTHER bare-word
+// `for` loops in the same files (release-verify.sh's own `for img in api web controller
+// agent-base agent-jvm` images loop, release.yml's `for t in "${VERSION}" ...` re-tag
+// loop — the latter's tokens are not bare words anyway), so a template rename that forgets
+// one of these lists reddens here, the guarantee TestWorkflowMatricesMatchNames gives the
+// build matrix. Bare-word body only (`[A-Za-z0-9 _-]`), so a `${...}` list never matches.
+var workerListRe = regexp.MustCompile(`(?m)^[ \t]*for[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+in[ \t]+([A-Za-z0-9 _-]+?)[ \t]*;[ \t]*do\b[^\n]*#[^\n]*workertmpl`)
+
+// markedForLists returns every marked `for ... in ...; do` word list in the file, each
+// sorted. Empty slice means none were found.
+func markedForLists(t *testing.T, path string) [][]string {
+	t.Helper()
+	raw, err := os.ReadFile(path) //nolint:gosec // G304: reads a fixed repo-relative workflow/script path in a test, not user input
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	var out [][]string
+	for _, m := range workerListRe.FindAllStringSubmatch(string(raw), -1) {
+		fields := strings.Fields(m[1])
+		sort.Strings(fields)
+		out = append(out, fields)
+	}
+	return out
+}
+
+// TestReleaseScriptWorkerListsMatchNames pins the release-train's PUBLISHED-pin guard
+// lists to workertmpl.Names: release.yml's assert-worker-pin loop (template short names)
+// and release-verify.sh's guard-4 loop (agent-<name> image repos).
+func TestReleaseScriptWorkerListsMatchNames(t *testing.T) {
+	names := sortedNames()
+	agentNames := make([]string, len(names))
+	for i, n := range names {
+		agentNames[i] = "agent-" + n
+	}
+	sort.Strings(agentNames)
+
+	cases := []struct {
+		path string
+		want []string
+	}{
+		{filepath.Join(repoRoot, ".github", "workflows", "release.yml"), names},
+		{filepath.Join(repoRoot, ".agents", "skills", "uzi-release", "scripts", "release-verify.sh"), agentNames},
+	}
+	for _, c := range cases {
+		lists := markedForLists(t, c.path)
+		if len(lists) == 0 {
+			t.Fatalf("%s: found no marked `for ... in ...; do  # ...workertmpl...` worker list. "+
+				"Either the worker-pin guard was removed (drop this assertion) or its loop lost the "+
+				"marker comment this guard keys on — do not let it pass silently.", c.path)
+		}
+		for _, got := range lists {
+			if !slices.Equal(got, c.want) {
+				t.Fatalf("%s: worker list drifted from workertmpl.Names.\n"+
+					"list (sorted): %v\nwant (sorted): %v\n"+
+					"A template in Names but not this list is never checked for a published image: "+
+					"the unpublished-worker guard would miss it. Update the list to match.", c.path, got, c.want)
 			}
 		}
 	}

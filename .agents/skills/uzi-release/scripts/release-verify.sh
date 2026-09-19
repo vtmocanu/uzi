@@ -188,7 +188,7 @@ PIN="$(git show "$TAG:deploy/chart/values.yaml" 2>/dev/null | awk '
 if [ -z "$PIN" ]; then
   fail "could not read workers.image.tag from ${TAG}:deploy/chart/values.yaml (is the tag present locally? run: git fetch --tags origin)"
 else
-  for img in agent-base agent-jvm; do
+  for img in agent-base agent-jvm; do  # worker images agent-<name>; workertmpl.Names (pinned by template_sources_test.go)
     img_has_tag "$img" "$PIN"; r=$?
     case $r in
       0) pass "worker pin ${REPO}/${img}:${PIN} on GHCR" ;;

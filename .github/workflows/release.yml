@@ -545,14 +545,18 @@ jobs:
           fi
           echo "chart pins workers.image.tag=$PIN"
           # Worker template images. Keep equal to api/internal/workertmpl.Names, the same
-          # source of truth the publish-agent matrix mirrors.
+          # source of truth the publish-agent matrix mirrors (pinned by
+          # api/internal/workertmpl/template_sources_test.go via the trailing marker).
           fail=0
-          for t in base jvm; do
+          for t in base jvm; do  # worker templates; workertmpl.Names (pinned by template_sources_test.go)
             REPO="ghcr.io/vtmocanu/uzi/agent-${t}"
-            if docker buildx imagetools inspect "${REPO}:${PIN}" >/dev/null 2>&1; then
+            # stdout to /dev/null, but LET STDERR THROUGH: a transient auth/registry error
+            # must be readable and not misreported as a bad pin (release-watch re-runs
+            # transient publish flakes). Fail-closed either way.
+            if docker buildx imagetools inspect "${REPO}:${PIN}" >/dev/null; then
               echo "OK: ${REPO}:${PIN} exists on GHCR"
             else
-              echo "ERROR: chart pins workers.image.tag=${PIN} but ${REPO}:${PIN} is not on GHCR. A stable chart may pin an RC worker (D11), but only a PUBLISHED one -- push the RC tag and let release.yml build it before promoting (see .agents/skills/uzi-release)." >&2
+              echo "ERROR: chart pins workers.image.tag=${PIN} but ${REPO}:${PIN} could not be resolved on GHCR (unpublished, or a transient registry/auth error -- see the inspect stderr above). A stable chart may pin an RC worker (D11), but only a PUBLISHED one -- push the RC tag and let release.yml build it before promoting (see .agents/skills/uzi-release)." >&2
               fail=1
             fi
           done

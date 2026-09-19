@@ -428,7 +428,10 @@ add_origin() {
   local d="$1"; local bare="$d.origin.git"
   git init -q --bare "$bare"
   git -C "$d" remote add origin "$bare"
-  git -C "$d" push -q origin main
+  # main + the baseline tag (v0.1.0), so the pin's tag counts as PUBLISHED and the
+  # origin-aware autobump does not treat the seed baseline as local-only. A later RC tag
+  # is pushed explicitly (push_tag_to_origin) or deliberately withheld per test.
+  git -C "$d" push -q origin main --tags
 }
 push_tag_to_origin() { git -C "$1" push -q origin "refs/tags/$2"; }
 
@@ -644,6 +647,42 @@ assert_eq "--promote refused on a local-only RC exits 3" "3" "$RC_RC"
 assert_contains "refusal says the RC is not on origin" "not on origin" "$RC_OUT"
 if git -C "$S8B" rev-parse -q --verify refs/tags/v0.2.0 >/dev/null; then fail "refused promote leaves NO v0.2.0 tag"; else pass "refused promote leaves NO v0.2.0 tag"; fi
 
+echo "=== M2b: --promote REFUSED with a DISTINCT message when origin is unreachable ==="
+# Finding 2: a network/auth failure must not be reported as an unpushed tag. Point origin
+# at a path that does not exist so `git ls-remote` errors (not "absent").
+S8C="$(mktemp -d)"; seed_repo "$S8C"; git -C "$S8C" remote add origin "$S8C.noexist.git"; add_feature "$S8C" 201
+put_changelog "$S8C" <<'MD'
+# Changelog
+
+## [Unreleased]
+### Added
+- **Feature 201** (#201)
+
+## [0.1.0] - 2026-09-01
+### Added
+- **Initial** (#100)
+MD
+run_rc "$S8C" 0.2.0; git -C "$S8C" tag v0.2.0-rc.1
+add_feature "$S8C" 301
+put_changelog "$S8C" <<'MD'
+# Changelog
+
+## [Unreleased]
+### Added
+- **Feature 301** (#301)
+
+## [0.2.0] - 2026-10-01
+### Added
+- **Feature 201** (#201)
+
+## [0.1.0] - 2026-09-01
+### Added
+- **Initial** (#100)
+MD
+run_rc "$S8C" 0.3.0 --promote
+assert_eq "--promote refused when origin unreachable exits 3" "3" "$RC_RC"
+assert_contains "refusal distinguishes an unreachable origin" "could not reach origin" "$RC_OUT"
+
 echo "=== M2b: --promote allowlist abort ==="
 S9="$(mktemp -d)"; seed_repo "$S9"; add_origin "$S9"; add_feature "$S9" 201
 # Replace worker-tag-autobump.sh with a version-conditional stub and COMMIT it, so it
@@ -766,8 +805,27 @@ assert_eq "autobump (decoy) exits 0"                       "0"     "$sc_rc"
 assert_eq "autobump bumps workers.image.tag, not the decoy" "0.2.0" "$(pin_tag "$SC")"
 if grep -q '9.9.9-decoy' "$SC/deploy/chart/values.yaml"; then pass "autobump leaves the deeper controller decoy tag untouched"; else fail "autobump leaves the deeper controller decoy tag untouched"; fi
 
-rm -rf "$S1" "$S3" "$S4" "$S6" "$S7" "$S8" "$S8B" "$S9" "$S10" "$SA" "$SB" "$SC" \
-       "$S8.origin.git" "$S8B.origin.git" "$S9.origin.git" "$S10.origin.git"
+echo "=== M2c: worker-tag-autobump — a LOCAL-ONLY pin tag (origin reachable) is treated as unpublished ==="
+# Finding 1: git rev-parse passes for a local-only tag, so without the origin check a pin
+# naming an unpushed tag would diff clean and ship again. Origin here is reachable and has
+# the baseline, but the pinned tag was never pushed.
+SD="$(mktemp -d)"; seed_repo "$SD"; add_origin "$SD"
+git -C "$SD" tag v0.5.0-rc.1                          # a LOCAL-only tag, never pushed to origin
+cat > "$SD/deploy/chart/values.yaml" <<'YAML'
+workers:
+  image:
+    repository: ghcr.io/x/worker
+    tag: "0.5.0-rc.1"
+YAML
+git -C "$SD" add deploy/chart/values.yaml; gcommit "$SD" "test: pin a local-only tag"
+( cd "$SD" && bash scripts/worker-tag-autobump.sh --check 0.6.0 >/dev/null 2>&1 ); sd_ac=$?
+if [ "$sd_ac" -ne 0 ]; then pass "autobump --check flags a local-only pin tag (exit $sd_ac)"; else fail "autobump --check flags a local-only pin tag (got exit 0 — trusted the local tag)"; fi
+( cd "$SD" && bash scripts/worker-tag-autobump.sh 0.6.0 >/dev/null 2>&1 ); sd_ab=$?
+assert_eq "autobump edit on a local-only pin tag exits 0"        "0"     "$sd_ab"
+assert_eq "autobump repins a local-only pin tag to the version cut" "0.6.0" "$(pin_tag "$SD")"
+
+rm -rf "$S1" "$S3" "$S4" "$S6" "$S7" "$S8" "$S8B" "$S8C" "$S9" "$S10" "$SA" "$SB" "$SC" "$SD" \
+       "$S8.origin.git" "$S8B.origin.git" "$S9.origin.git" "$S10.origin.git" "$SD.origin.git"
 
 echo "=== M3: release-mode lib (shared by watch + verify) ==="
 # shellcheck source=scripts/lib/release-mode.sh

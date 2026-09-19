@@ -37,10 +37,13 @@
 # the decouple assert's PINNED_TAG in lockstep, so values.yaml stays the single pin and
 # `task render:worker-tag-check` keeps passing.
 #
-# A pin naming a tag that does NOT exist is never valid (it names an image no release
-# built -- the 0.83.0-rc.7 incident, 2026-09-19). We do NOT fail open on it: --check
-# reports it (exit 1) and edit mode repins to the version being cut (which this release
-# publishes), rather than leaving the dead pin to ship again on the next cut.
+# A pin naming a tag that is not PUBLISHED is never valid -- it names an image no release
+# built (the 0.83.0-rc.7 incident, 2026-09-19). "Not published" means absent, OR present
+# only as a LOCAL tag never pushed to origin (`git rev-parse` cannot tell those apart). We
+# do NOT fail open on it: when origin answers we require the tag on origin, --check reports
+# a bad pin (exit 1) and edit mode repins to the version being cut (which this release
+# publishes) rather than shipping the dead pin again. Only when origin is UNREACHABLE do we
+# fall back to the local check, never repinning blind offline.
 #
 # EXIT CODES (the convention scan-secrets.sh / assert-worker-tag-decoupled.sh set):
 #     2 = the instrument is broken (not at repo root, tag unreadable, pin unparseable)
@@ -111,27 +114,38 @@ apply_bump() {
 }
 
 PREV_TAG="v$OLD"
-if ! git rev-parse -q --verify "refs/tags/$PREV_TAG" >/dev/null 2>&1; then
-  # A pin naming a nonexistent tag is NEVER valid: the chart would ship a
-  # workers.image.tag for an agent image no release ever built. That is the
-  # 0.83.0-rc.7 failure (2026-09-19) -- an RC cut at tip whose tag was kept
-  # local-only, so release.yml never built agent-*:0.83.0-rc.7, yet the stable
-  # chart shipped that pin and every new hosted worker sat in ImagePullBackOff.
-  # We cannot diff the agent surface against a missing tag, so DO NOT fail open
-  # (the old behaviour left the dead pin and re-shipped it on the next cut). The
-  # safe repair is unambiguous: point the pin at the image THIS cut publishes.
+# Is the pinned tag safe to diff the agent surface against? It must name a PUBLISHED
+# image, and a LOCAL-only tag names none -- `git rev-parse` cannot tell a pushed tag from
+# a local-only one (release-cut.sh's rc_tag_on_remote makes the same point), which is the
+# second half of the 0.83.0-rc.7 failure (2026-09-19): an RC cut at tip whose tag was kept
+# local-only, so release.yml never built agent-*:0.83.0-rc.7, yet the pin named it and
+# every new hosted worker sat in ImagePullBackOff. So when origin ANSWERS, require the tag
+# THERE (a local-only or absent tag is unpublished); only when origin is UNREACHABLE fall
+# back to the local rev-parse, rather than repin blind offline.
+tag_usable=0
+rc=0; git ls-remote --exit-code --tags origin "refs/tags/$PREV_TAG" >/dev/null 2>&1 || rc=$?
+case "$rc" in
+  0) git rev-parse -q --verify "refs/tags/$PREV_TAG" >/dev/null 2>&1 && tag_usable=1 ;;  # on origin (and local, after release-cut's fetch) -> diffable
+  2) tag_usable=0 ;;                                                                     # origin reachable, tag NOT there -> unpublished / local-only
+  *) git rev-parse -q --verify "refs/tags/$PREV_TAG" >/dev/null 2>&1 && tag_usable=1 ;;  # origin unreachable -> fall back to the local check
+esac
+if [ "$tag_usable" -eq 0 ]; then
+  # The pin names no PUBLISHED image (absent everywhere, or present only locally). We
+  # cannot diff the agent surface against it, so DO NOT fail open (the old behaviour left
+  # the dead pin and re-shipped it on the next cut). The safe repair is unambiguous: point
+  # the pin at the image THIS cut publishes.
   if [ "$OLD" = "$VERSION" ]; then
     # The pin already names the version being cut, which this release publishes.
-    echo "worker-tag-autobump: tag $PREV_TAG is absent, but workers.image.tag already names the version being cut ($VERSION), which this release publishes -- nothing to do."
+    echo "worker-tag-autobump: $PREV_TAG is not published, but workers.image.tag already names the version being cut ($VERSION), which this release publishes -- nothing to do."
     exit 0
   fi
   if [ "$MODE" = check ]; then
-    echo "worker-tag-autobump: FAIL -- workers.image.tag is $OLD but no tag $PREV_TAG exists, so the pin names an image no release published (new hosted workers would ImagePullBackOff)." >&2
+    echo "worker-tag-autobump: FAIL -- workers.image.tag is $OLD but $PREV_TAG is not a published tag (absent, or present only locally), so the pin names an image no release published (new hosted workers would ImagePullBackOff)." >&2
     echo "  A pin must name a published (or being-cut) image. Run  scripts/worker-tag-autobump.sh $VERSION  to repin it to the version being cut." >&2
     exit 1
   fi
   apply_bump "$VERSION"
-  echo "worker-tag-autobump: tag $PREV_TAG is absent (workers.image.tag named an unpublished image); repinned $OLD -> $VERSION (the version being cut, which this release publishes)."
+  echo "worker-tag-autobump: $PREV_TAG is not published (workers.image.tag named an unpublished image); repinned $OLD -> $VERSION (the version being cut, which this release publishes)."
   echo "  The hosted fleet WILL roll to $VERSION on deploy."
   exit 0
 fi
