@@ -25,6 +25,10 @@ import "strings"
 // description text (the task label), and ok=true when a well-formed non-empty [id] leads
 // the string. Membership is NOT validated here — a non-member id is dropped by the caller
 // (D7). When there is no leading [id] tag, ok is false, id is "", and rest is the input.
+//
+// NOTE: the returned `rest` is UNVALIDATED, unsanitized, model-authored text — only `id` is
+// membership-validated (by MilestoneTagBinding). Its terminal-safety is applied downstream:
+// Derive sanitizes the lane label via runactivity.Sanitize before it lands on the wire.
 func ParseMilestoneTag(description string) (id, rest string, ok bool) {
 	trimmed := strings.TrimLeft(description, " \t")
 	if !strings.HasPrefix(trimmed, "[") {
@@ -49,6 +53,10 @@ func ParseMilestoneTag(description string) (id, rest string, ok bool) {
 // and bound=true only when the description carries a well-formed [id] tag whose id is a
 // member of inProgress. Otherwise it returns ("", "", false). A nil inProgress map is
 // treated as "no members", so every tag is dropped.
+//
+// NOTE: the returned `label` is UNVALIDATED, unsanitized, model-authored text — only `id` is
+// membership-validated. Its terminal-safety is applied downstream: Derive sanitizes the lane
+// label via runactivity.Sanitize before it lands on the wire.
 func MilestoneTagBinding(description string, inProgress map[string]bool) (id, label string, bound bool) {
 	parsedID, rest, ok := ParseMilestoneTag(description)
 	if !ok {

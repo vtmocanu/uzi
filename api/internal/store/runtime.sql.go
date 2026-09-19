@@ -5024,6 +5024,51 @@ func (q *Queries) LatestToolUseForRuns(ctx context.Context, runIds []uuid.UUID) 
 	return items, nil
 }
 
+const leadDispatchAndCompletionFramesForRun = `-- name: LeadDispatchAndCompletionFramesForRun :many
+SELECT seq, kind, payload, created_at
+FROM run_messages
+WHERE run_id = $1::uuid
+  AND agent_instance IS NULL
+  AND (kind = 'tool_result' OR (kind = 'tool_use' AND payload->>'name' = 'Agent'))
+ORDER BY seq
+`
+
+type LeadDispatchAndCompletionFramesForRunRow struct {
+	Seq       int32              `json:"seq"`
+	Kind      string             `json:"kind"`
+	Payload   []byte             `json:"payload"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+}
+
+// PRD #1353: the lead-lane frames Derive needs to bind and expire lanes — Agent dispatch
+// tool_use frames (payload {id, input:{subagent_type, description}}) carrying each instance's
+// milestone tag + label, and tool_result frames whose tool_use_id marks a dispatch complete.
+// Both live on the lead lane (agent_instance IS NULL). Bounded by the lead's own tool-call count.
+func (q *Queries) LeadDispatchAndCompletionFramesForRun(ctx context.Context, runID uuid.UUID) ([]LeadDispatchAndCompletionFramesForRunRow, error) {
+	rows, err := q.db.Query(ctx, leadDispatchAndCompletionFramesForRun, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []LeadDispatchAndCompletionFramesForRunRow{}
+	for rows.Next() {
+		var i LeadDispatchAndCompletionFramesForRunRow
+		if err := rows.Scan(
+			&i.Seq,
+			&i.Kind,
+			&i.Payload,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listActiveRunsAll = `-- name: ListActiveRunsAll :many
 SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, r.stop_kind, r.agent_source, r.agent_exclusions, r.repo_agents, r.title, r.resume_of_run_id, r.last_activity_at, r.health, r.health_reason, r.health_since, r.health_notified_at, r.target_run_id, r.mr_web_url, r.prd_done_path, r.prd_patch_settled_at, r.anthropic_secret_id, r.anthropic_secret_label, r.anthropic_select_reason, r.anthropic_headroom_pct, r.wait_on_limit, r.limit_resets_at, r.retry_not_before, r.limit_wait_count, r.rate_limit_type, r.open_question_id, r.revise_count, r.plan_source, r.planned_base_commit, r.require_base_match, r.milestones_candidate, r.milestones_frozen, r.milestones_completed, r.milestones_in_progress, r.budget_max_iterations, r.budget_wall_seconds, r.schedule_id, r.limit_dead_secret_id, r.report_only, r.report_md, r.ci_config_paths, r.model, r.override_subagent_model, r.fail_origin, r.priority, r.summary_intent, r.summary_plan, r.summary_deltas, r.issue_comments, r.base_branch, r.open_mr, r.dispatched_at, r.review_target_run_id, r.review_requested, r.then_fix_requested, r.then_fix_of_run_id, r.preserved_patch, r.required_capabilities, r.stop_reason, r.required_tools, r.size_class, r.interactive, r.open_followup_id, r.plan_changed_files, r.scope_ceiling, r.status_since, r.review_comments, r.budget_paused_seconds, r.mr_rework_enabled, r.trigger_source, r.checkpoint_tip, r.usage_refolded, r.codex_secret_id, r.codex_auth_mode, r.codex_secret_label, r.codex_account_key, r.codex_material_revision, r.codex_account_revision, r.codex_claim_epoch, r.codex_cap_hash, r.pause_requested_at, r.pause_mode, r.pause_after_count, r.checkpoint_tip_at, r.recovery_wait_count, r.recovery_retry_not_before, r.completion_contract_version, r.contract_revision, r.completion_contract, r.completion_attempts, r.latest_completion_attempt, r.milestones_agents, r.hold_reason, r.hold_captured_head, r.completion_budget_exhausted_at, r.completion_question_at, r.budget_extension_seconds, r.claim_generation, r.harness, r.recovery_wait_cause, r.forge_park_count, r.credential_override_mode, r.credential_override_secret_id, r.claim_released_at, r.credential_switch_requested_at, r.credential_switch_generation, r.stale_requeue_generation, rp.path_with_namespace AS repo_path, w.name AS worker_name, u.email AS owner_email,
        c.forge_type,
@@ -7162,6 +7207,56 @@ func (q *Queries) ListWorkersByUser(ctx context.Context, userID uuid.UUID) ([]Li
 			&i.RollObservedAt,
 			&i.RollUpgradingSince,
 			&i.RollWorkerImageTag,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const liveLaneFramesForRun = `-- name: LiveLaneFramesForRun :many
+SELECT DISTINCT ON (agent_instance) agent_instance, seq, kind, agent, agent_label, payload, created_at
+FROM run_messages
+WHERE run_id = $1::uuid
+  AND agent_instance IS NOT NULL
+  AND kind = 'tool_use'
+ORDER BY agent_instance, seq DESC
+`
+
+type LiveLaneFramesForRunRow struct {
+	AgentInstance pgtype.Text        `json:"agent_instance"`
+	Seq           int32              `json:"seq"`
+	Kind          string             `json:"kind"`
+	Agent         pgtype.Text        `json:"agent"`
+	AgentLabel    pgtype.Text        `json:"agent_label"`
+	Payload       []byte             `json:"payload"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+}
+
+// PRD #1353: newest tool_use frame per live subagent instance for a run (DISTINCT ON
+// agent_instance, greatest seq). milestonelanes.Derive folds each into a lane and back-joins
+// it to its Agent dispatch by agent_instance.
+func (q *Queries) LiveLaneFramesForRun(ctx context.Context, runID uuid.UUID) ([]LiveLaneFramesForRunRow, error) {
+	rows, err := q.db.Query(ctx, liveLaneFramesForRun, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []LiveLaneFramesForRunRow{}
+	for rows.Next() {
+		var i LiveLaneFramesForRunRow
+		if err := rows.Scan(
+			&i.AgentInstance,
+			&i.Seq,
+			&i.Kind,
+			&i.Agent,
+			&i.AgentLabel,
+			&i.Payload,
+			&i.CreatedAt,
 		); err != nil {
 			return nil, err
 		}

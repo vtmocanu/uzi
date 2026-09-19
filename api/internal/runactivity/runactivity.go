@@ -99,6 +99,13 @@ func sanitize(s string) string {
 	return string(out)
 }
 
+// Sanitize applies the same strip-and-cap rule FromFrame uses on model-authored display
+// fields (AgentLabel/Detail): it strips terminal-unsafe runes (control incl. \n/\t and the
+// Cf format runes) and caps at detailCapRunes runes. Exported for a caller that must fold a
+// display string NOT carried on a tool payload — the milestonelanes per-lane task label
+// (PRD #1353). TestUnsafeMatchesTermsafe pins the predicate to termsafe.Unsafe.
+func Sanitize(s string) string { return sanitize(s) }
+
 // deref returns the string a nullable frame column points at, or "" when nil.
 func deref(p *string) string {
 	if p == nil {

@@ -33,6 +33,35 @@ type MilestoneAgent struct {
 	AgentLabel string `json:"agent_label"`
 }
 
+// MilestoneLane is one LIVE lane on an in-progress milestone (PRD #1353): a single live
+// subagent currently working that milestone, folded from its newest tool_use frame and
+// back-joined to the lead's Agent dispatch by agent_instance. Agent is the acting lane's
+// role, AgentInstance the dispatch tool_use id that identifies the lane (= the subagent's
+// parent_tool_use_id), AgentLabel the dispatch's task label, Tool the tool name, Detail the
+// tool's most identifying argument (a repo-relative file_path, a Bash/Agent description, or
+// empty — NEVER a Bash command), and At the frame's created_at. Agent/AgentLabel/Tool/Detail
+// are UNTRUSTED, model-authored text; the server strips terminal-unsafe runes and caps
+// AgentLabel and Detail (200 runes) exactly as it does for RunActivity, and every renderer
+// still applies its own terminal-safety fold.
+type MilestoneLane struct {
+	Agent         string    `json:"agent"`
+	AgentInstance string    `json:"agent_instance"`
+	AgentLabel    string    `json:"agent_label"`
+	Tool          string    `json:"tool"`
+	Detail        string    `json:"detail"`
+	At            time.Time `json:"at"`
+}
+
+// MilestoneLive is the set of LIVE lanes on one in-progress milestone (PRD #1353): the
+// subagents working it right now. It is server-derived (api/internal/milestonelanes.Derive)
+// from the persisted run_messages, never stored, and additive to MilestonesAgents — a nil
+// RunDTO.MilestonesLive ⇒ JSON null ⇒ render exactly as today (Decision 5). Lanes are ordered
+// newest-frame-first (deterministic), and a milestone with no live lane is omitted from the set.
+type MilestoneLive struct {
+	MilestoneID string          `json:"milestone_id"`
+	Lanes       []MilestoneLane `json:"lanes"`
+}
+
 // RunSummaryDelta is one entry of a run's plan-summary deltas list (PRD #362): how
 // the proposed plan diverged from the original ask. Kind is a closed enum
 // {added, changed, dropped} (validated-and-rejected on persist, Decision 6); Text is
@@ -185,6 +214,14 @@ type RunDTO struct {
 	// as "render exactly as today" (Decision 8). Each entry's id is also a member of
 	// MilestonesInProgress; renderers re-filter against the live set as defense in depth.
 	MilestonesAgents []MilestoneAgent `json:"milestones_agents"`
+	// MilestonesLive is the server-derived per-in-progress-milestone LIVE LANES (PRD #1353):
+	// for each in-progress milestone, the subagents working it right now, folded from their
+	// newest tool_use frames and back-joined to the lead's Agent dispatch by agent_instance.
+	// Server-authoritative and web-consumed, NEVER client-re-derived (D2/D8); populated ONLY
+	// on the run DETAIL read (GetRun) for a non-terminal run, and null on list/board and every
+	// terminal run (D9 — the board/list stay a single now-line). Nil ⇒ JSON null ⇒ render
+	// exactly as today (D5). Additive to MilestonesAgents.
+	MilestonesLive []MilestoneLive `json:"milestones_live"`
 	// BudgetMaxIterations and BudgetWallSeconds are the run's EFFECTIVE budget (PRD #122
 	// M2, Decision 5/5b), derived server-side from the frozen milestone count at freeze
 	// and persisted. Each is null when the run is on the GLOBAL default (a 0/1-milestone

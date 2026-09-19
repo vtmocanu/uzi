@@ -40,6 +40,21 @@
       "agent_label": "x"
     }
   ],
+  "milestones_live": [
+    {
+      "milestone_id": "x",
+      "lanes": [
+        {
+          "agent": "x",
+          "agent_instance": "x",
+          "agent_label": "x",
+          "tool": "x",
+          "detail": "x",
+          "at": "2020-01-02T03:04:05Z"
+        }
+      ]
+    }
+  ],
   "budget_max_iterations": 1,
   "budget_wall_seconds": 1,
   "budget_extension_seconds": 1,

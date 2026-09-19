@@ -20,6 +20,7 @@
   "milestones_completed": null,
   "milestones_in_progress": null,
   "milestones_agents": null,
+  "milestones_live": null,
   "budget_max_iterations": null,
   "budget_wall_seconds": null,
   "budget_extension_seconds": 0,

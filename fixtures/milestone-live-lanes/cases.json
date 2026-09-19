@@ -1,0 +1,132 @@
+{
+  "_comment": "Golden cases for api/internal/milestonelanes.Derive (PRD #1353). Each case feeds a set of run-message frames, the frozen milestone list, the in-progress id set, and a `now` instant into Derive and asserts the derived per-milestone live lanes. now is 2026-09-19T12:00:00Z; laneFreshWindow is 10m, so the staleness backstop cuts at 2026-09-19T11:50:00Z. A dispatch frame is a lead-lane tool_use named 'Agent' whose payload.id is the subagent's agent_instance and whose input.description carries the leading [<id>] milestone tag; a lane frame is a subagent tool_use carrying that agent_instance; a completion is a lead-lane tool_result whose payload.tool_use_id == the agent_instance. Asserted from Go (milestonelanes/derive_test.go).",
+  "cases": [
+    {
+      "name": "multi-lane",
+      "now": "2026-09-19T12:00:00Z",
+      "milestones": [{"id": "m2", "title": "Rate limiter"}],
+      "in_progress": ["m2"],
+      "frames": [
+        {"kind": "tool_use", "agent": "lead", "agent_instance": "", "agent_label": "", "payload": {"id": "inst-coder", "name": "Agent", "input": {"subagent_type": "coder", "description": "[m2] Implement the limiter"}}, "created_at": "2026-09-19T11:55:00Z", "seq": 1},
+        {"kind": "tool_use", "agent": "lead", "agent_instance": "", "agent_label": "", "payload": {"id": "inst-reviewer", "name": "Agent", "input": {"subagent_type": "reviewer", "description": "[m2] Review the limiter"}}, "created_at": "2026-09-19T11:56:00Z", "seq": 2},
+        {"kind": "tool_use", "agent": "coder", "agent_instance": "inst-coder", "agent_label": "IGNORED-FRAME-LABEL", "payload": {"name": "Edit", "input": {"file_path": "api/limiter.go", "old_string": "x"}}, "created_at": "2026-09-19T11:58:00Z", "seq": 3},
+        {"kind": "tool_use", "agent": "reviewer", "agent_instance": "inst-reviewer", "agent_label": "", "payload": {"name": "Read", "input": {"file_path": "api/limiter.go"}}, "created_at": "2026-09-19T11:59:00Z", "seq": 4}
+      ],
+      "expected": [
+        {"milestone_id": "m2", "lanes": [
+          {"agent": "reviewer", "agent_instance": "inst-reviewer", "agent_label": "Review the limiter", "tool": "Read", "detail": "api/limiter.go", "at": "2026-09-19T11:59:00Z"},
+          {"agent": "coder", "agent_instance": "inst-coder", "agent_label": "Implement the limiter", "tool": "Edit", "detail": "api/limiter.go", "at": "2026-09-19T11:58:00Z"}
+        ]}
+      ]
+    },
+    {
+      "name": "repeated-role-by-instance",
+      "now": "2026-09-19T12:00:00Z",
+      "milestones": [{"id": "m2", "title": "Rate limiter"}],
+      "in_progress": ["m2"],
+      "frames": [
+        {"kind": "tool_use", "agent": "lead", "agent_instance": "", "agent_label": "", "payload": {"id": "inst-r1", "name": "Agent", "input": {"subagent_type": "reviewer", "description": "[m2] Review part A"}}, "created_at": "2026-09-19T11:55:00Z", "seq": 1},
+        {"kind": "tool_use", "agent": "lead", "agent_instance": "", "agent_label": "", "payload": {"id": "inst-r2", "name": "Agent", "input": {"subagent_type": "reviewer", "description": "[m2] Review part B"}}, "created_at": "2026-09-19T11:56:00Z", "seq": 2},
+        {"kind": "tool_use", "agent": "reviewer", "agent_instance": "inst-r1", "agent_label": "", "payload": {"name": "Read", "input": {"file_path": "api/a.go"}}, "created_at": "2026-09-19T11:57:00Z", "seq": 3},
+        {"kind": "tool_use", "agent": "reviewer", "agent_instance": "inst-r2", "agent_label": "", "payload": {"name": "Read", "input": {"file_path": "api/b.go"}}, "created_at": "2026-09-19T11:58:00Z", "seq": 4}
+      ],
+      "expected": [
+        {"milestone_id": "m2", "lanes": [
+          {"agent": "reviewer", "agent_instance": "inst-r2", "agent_label": "Review part B", "tool": "Read", "detail": "api/b.go", "at": "2026-09-19T11:58:00Z"},
+          {"agent": "reviewer", "agent_instance": "inst-r1", "agent_label": "Review part A", "tool": "Read", "detail": "api/a.go", "at": "2026-09-19T11:57:00Z"}
+        ]}
+      ]
+    },
+    {
+      "name": "idle-owner-completed",
+      "now": "2026-09-19T12:00:00Z",
+      "milestones": [{"id": "m2", "title": "Rate limiter"}],
+      "in_progress": ["m2"],
+      "frames": [
+        {"kind": "tool_use", "agent": "lead", "agent_instance": "", "agent_label": "", "payload": {"id": "inst-c", "name": "Agent", "input": {"subagent_type": "coder", "description": "[m2] Do work"}}, "created_at": "2026-09-19T11:55:00Z", "seq": 1},
+        {"kind": "tool_use", "agent": "coder", "agent_instance": "inst-c", "agent_label": "", "payload": {"name": "Edit", "input": {"file_path": "api/x.go"}}, "created_at": "2026-09-19T11:57:00Z", "seq": 2},
+        {"kind": "tool_result", "agent": "lead", "agent_instance": "", "agent_label": "", "payload": {"tool_use_id": "inst-c", "content": "done", "is_error": false}, "created_at": "2026-09-19T11:58:00Z", "seq": 3}
+      ],
+      "expected": null
+    },
+    {
+      "name": "out-of-window-dispatch",
+      "now": "2026-09-19T12:00:00Z",
+      "milestones": [{"id": "m2", "title": "Rate limiter"}],
+      "in_progress": ["m2"],
+      "frames": [
+        {"kind": "tool_use", "agent": "lead", "agent_instance": "", "agent_label": "", "payload": {"id": "inst-o", "name": "Agent", "input": {"subagent_type": "coder", "description": "[m2] Long task"}}, "created_at": "2026-09-19T11:30:00Z", "seq": 1},
+        {"kind": "tool_use", "agent": "coder", "agent_instance": "inst-o", "agent_label": "", "payload": {"name": "Bash", "input": {"command": "go test ./...", "description": "Run tests"}}, "created_at": "2026-09-19T11:59:00Z", "seq": 2}
+      ],
+      "expected": [
+        {"milestone_id": "m2", "lanes": [
+          {"agent": "coder", "agent_instance": "inst-o", "agent_label": "Long task", "tool": "Bash", "detail": "Run tests", "at": "2026-09-19T11:59:00Z"}
+        ]}
+      ]
+    },
+    {
+      "name": "stale-crashed",
+      "now": "2026-09-19T12:00:00Z",
+      "milestones": [{"id": "m2", "title": "Rate limiter"}],
+      "in_progress": ["m2"],
+      "frames": [
+        {"kind": "tool_use", "agent": "lead", "agent_instance": "", "agent_label": "", "payload": {"id": "inst-s", "name": "Agent", "input": {"subagent_type": "coder", "description": "[m2] Crashed task"}}, "created_at": "2026-09-19T11:40:00Z", "seq": 1},
+        {"kind": "tool_use", "agent": "coder", "agent_instance": "inst-s", "agent_label": "", "payload": {"name": "Edit", "input": {"file_path": "api/y.go"}}, "created_at": "2026-09-19T11:40:00Z", "seq": 2}
+      ],
+      "expected": null
+    },
+    {
+      "name": "non-member-tag",
+      "now": "2026-09-19T12:00:00Z",
+      "milestones": [{"id": "m2", "title": "Rate limiter"}],
+      "in_progress": ["m2"],
+      "frames": [
+        {"kind": "tool_use", "agent": "lead", "agent_instance": "", "agent_label": "", "payload": {"id": "inst-n", "name": "Agent", "input": {"subagent_type": "coder", "description": "[m9] Wrong milestone"}}, "created_at": "2026-09-19T11:55:00Z", "seq": 1},
+        {"kind": "tool_use", "agent": "coder", "agent_instance": "inst-n", "agent_label": "", "payload": {"name": "Edit", "input": {"file_path": "api/z.go"}}, "created_at": "2026-09-19T11:58:00Z", "seq": 2}
+      ],
+      "expected": null
+    },
+    {
+      "name": "untagged",
+      "now": "2026-09-19T12:00:00Z",
+      "milestones": [{"id": "m2", "title": "Rate limiter"}],
+      "in_progress": ["m2"],
+      "frames": [
+        {"kind": "tool_use", "agent": "lead", "agent_instance": "", "agent_label": "", "payload": {"id": "inst-u", "name": "Agent", "input": {"subagent_type": "coder", "description": "Just a task no tag"}}, "created_at": "2026-09-19T11:55:00Z", "seq": 1},
+        {"kind": "tool_use", "agent": "coder", "agent_instance": "inst-u", "agent_label": "", "payload": {"name": "Read", "input": {"file_path": "api/w.go"}}, "created_at": "2026-09-19T11:58:00Z", "seq": 2}
+      ],
+      "expected": null
+    },
+    {
+      "name": "frozen-milestone-order",
+      "now": "2026-09-19T12:00:00Z",
+      "milestones": [{"id": "m1", "title": "First"}, {"id": "m2", "title": "Second"}],
+      "in_progress": ["m1", "m2"],
+      "frames": [
+        {"kind": "tool_use", "agent": "lead", "agent_instance": "", "agent_label": "", "payload": {"id": "inst-1", "name": "Agent", "input": {"subagent_type": "coder", "description": "[m1] Task one"}}, "created_at": "2026-09-19T11:55:00Z", "seq": 1},
+        {"kind": "tool_use", "agent": "lead", "agent_instance": "", "agent_label": "", "payload": {"id": "inst-2", "name": "Agent", "input": {"subagent_type": "reviewer", "description": "[m2] Task two"}}, "created_at": "2026-09-19T11:56:00Z", "seq": 2},
+        {"kind": "tool_use", "agent": "coder", "agent_instance": "inst-1", "agent_label": "", "payload": {"name": "Edit", "input": {"file_path": "api/one.go"}}, "created_at": "2026-09-19T11:57:00Z", "seq": 3},
+        {"kind": "tool_use", "agent": "reviewer", "agent_instance": "inst-2", "agent_label": "", "payload": {"name": "Read", "input": {"file_path": "api/two.go"}}, "created_at": "2026-09-19T11:59:00Z", "seq": 4}
+      ],
+      "expected": [
+        {"milestone_id": "m1", "lanes": [
+          {"agent": "coder", "agent_instance": "inst-1", "agent_label": "Task one", "tool": "Edit", "detail": "api/one.go", "at": "2026-09-19T11:57:00Z"}
+        ]},
+        {"milestone_id": "m2", "lanes": [
+          {"agent": "reviewer", "agent_instance": "inst-2", "agent_label": "Task two", "tool": "Read", "detail": "api/two.go", "at": "2026-09-19T11:59:00Z"}
+        ]}
+      ]
+    },
+    {
+      "name": "no-milestones",
+      "now": "2026-09-19T12:00:00Z",
+      "milestones": [],
+      "in_progress": [],
+      "frames": [
+        {"kind": "tool_use", "agent": "lead", "agent_instance": "", "agent_label": "", "payload": {"id": "inst-z", "name": "Agent", "input": {"subagent_type": "coder", "description": "[m2] work"}}, "created_at": "2026-09-19T11:55:00Z", "seq": 1},
+        {"kind": "tool_use", "agent": "coder", "agent_instance": "inst-z", "agent_label": "", "payload": {"name": "Read", "input": {"file_path": "api/q.go"}}, "created_at": "2026-09-19T11:58:00Z", "seq": 2}
+      ],
+      "expected": null
+    }
+  ]
+}

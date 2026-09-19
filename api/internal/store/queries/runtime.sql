@@ -600,6 +600,29 @@ WHERE run_id = ANY(@run_ids::uuid[])
   AND kind = 'tool_use'
 ORDER BY run_id, seq DESC;
 
+-- name: LiveLaneFramesForRun :many
+-- PRD #1353: newest tool_use frame per live subagent instance for a run (DISTINCT ON
+-- agent_instance, greatest seq). milestonelanes.Derive folds each into a lane and back-joins
+-- it to its Agent dispatch by agent_instance.
+SELECT DISTINCT ON (agent_instance) agent_instance, seq, kind, agent, agent_label, payload, created_at
+FROM run_messages
+WHERE run_id = @run_id::uuid
+  AND agent_instance IS NOT NULL
+  AND kind = 'tool_use'
+ORDER BY agent_instance, seq DESC;
+
+-- name: LeadDispatchAndCompletionFramesForRun :many
+-- PRD #1353: the lead-lane frames Derive needs to bind and expire lanes — Agent dispatch
+-- tool_use frames (payload {id, input:{subagent_type, description}}) carrying each instance's
+-- milestone tag + label, and tool_result frames whose tool_use_id marks a dispatch complete.
+-- Both live on the lead lane (agent_instance IS NULL). Bounded by the lead's own tool-call count.
+SELECT seq, kind, payload, created_at
+FROM run_messages
+WHERE run_id = @run_id::uuid
+  AND agent_instance IS NULL
+  AND (kind = 'tool_result' OR (kind = 'tool_use' AND payload->>'name' = 'Agent'))
+ORDER BY seq;
+
 -- name: ListActiveRunsAll :many
 -- Admin Agents-status: every non-terminal run across all users, with repo path,
 -- worker name, and owner email for the admin overview.
