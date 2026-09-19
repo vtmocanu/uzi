@@ -29,20 +29,25 @@ if [ "${1:-}" = api ]; then
         head_two_runs) echo '[{"id":77,"user":{"login":"greptile-apps[bot]"},"commit_id":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","state":"COMMENTED","body":""}]' ;;
         *) echo '[]' ;;
       esac ;;
-    *'/issues/42/comments'*) echo '[]' ;;
+    *'/issues/42/comments'*)
+      case "$MODE" in
+        prior_requested) printf '[{"user":{"login":"lander","type":"User"},"created_at":"%s","body":"@greptileai review"}]\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" ;;
+        issue_unreadable) exit 1 ;;
+        *) echo '[]' ;;
+      esac ;;
     *'/pulls/42/commits'*)
       [ "$MODE" = prior_unreadable ] && exit 1
       echo '[{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},{"sha":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"}]' ;;
     *'/commits/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/check-runs'*)
       case "$MODE" in
-        prior_clean|head_unreadable|head_failed) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"90 files reviewed, 0 comments added"}}]}' ;;
+        prior_clean|head_unreadable|head_failed|prior_requested|issue_unreadable) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"90 files reviewed, 0 comments added"}}]}' ;;
         prior_pending) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"in_progress","conclusion":null,"output":{"summary":""}}]}' ;;
         *) echo '{"check_runs":[{"app":{"slug":"github-actions"},"name":"CI","status":"completed","conclusion":"success","output":{"summary":""}}]}' ;;
       esac ;;
     *'/commits/deadbeefdeadbeefdeadbeefdeadbeefdeadbeef/status'*) echo '' ;;
     *'/commits/deadbeefdeadbeefdeadbeefdeadbeefdeadbeef/check-runs'*)
       case "$MODE" in
-        prior_*) echo '{"check_runs":[]}' ;;
+        prior_*|issue_unreadable) echo '{"check_runs":[]}' ;;
         head_unreadable) exit 1 ;;
         head_failed) echo '{"check_runs":[{"id":10,"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"failure","output":{"summary":""}}]}' ;;
         # Newest first, as the API lists them: the re-trigger (id 2) found something the first run did not.
@@ -138,8 +143,30 @@ PATH="$WORK/bin:$PATH" bash "$SCRIPT" test/repo 42 > "$WORK/prior-pending.out" 2
 rc=$?
 set -e
 [ "$rc" -eq 3 ] || fail "in-flight newer Greptile review exited rc=$rc, want 3: $(cat "$WORK/prior-pending.out")"
-grep -q 'still running on a newer commit' "$WORK/prior-pending.out" || fail "in-flight newer Greptile review was not surfaced: $(cat "$WORK/prior-pending.out")"
+grep -q 'after its last verdict; findings deferred' "$WORK/prior-pending.out" || fail "in-flight newer Greptile review was not surfaced: $(cat "$WORK/prior-pending.out")"
 grep -q '^  GR  old.go:8' "$WORK/prior-pending.out" || fail "comment cleared while a newer review was running: $(cat "$WORK/prior-pending.out")"
+
+# A review REQUESTED after the last verdict outranks it: `@greptileai review` only becomes a
+# check-run ~12 s later, so until then the comment stays listed and the PR is deferred.
+MODE="prior_requested"; export MODE
+set +e
+PATH="$WORK/bin:$PATH" bash "$SCRIPT" test/repo 42 > "$WORK/prior-requested.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 3 ] || fail "just-requested Greptile review exited rc=$rc, want 3: $(cat "$WORK/prior-requested.out")"
+grep -q 'after its last verdict; findings deferred' "$WORK/prior-requested.out" || fail "just-requested Greptile review was not deferred: $(cat "$WORK/prior-requested.out")"
+grep -q '^  GR  old.go:8' "$WORK/prior-requested.out" || fail "comment cleared while a review was requested: $(cat "$WORK/prior-requested.out")"
+
+# An issue-comments listing that could not be READ is not "nobody asked for a review": the
+# trigger check fails closed, so the comment stays listed and the PR is unconfirmed.
+MODE="issue_unreadable"; export MODE
+set +e
+PATH="$WORK/bin:$PATH" bash "$SCRIPT" test/repo 42 > "$WORK/issue-unreadable.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 3 ] || fail "unreadable issue comments exited rc=$rc, want 3: $(cat "$WORK/issue-unreadable.out")"
+grep -q 'earlier verdict UNREADABLE' "$WORK/issue-unreadable.out" || fail "unreadable issue comments were not surfaced: $(cat "$WORK/issue-unreadable.out")"
+grep -q '^  GR  old.go:8' "$WORK/issue-unreadable.out" || fail "comment cleared on unreadable issue comments: $(cat "$WORK/issue-unreadable.out")"
 
 # A head check-runs request that FAILED is not "Greptile never ran": with CodeRabbit having
 # approved the head, treating it as `absent` let a clean earlier verdict drop a real anchored

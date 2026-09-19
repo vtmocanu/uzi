@@ -31,6 +31,8 @@ nothing; every push to any other open PR is one review, including uzi's `mr_rewo
 
 Trigger: a `@greptileai review` comment (also `@greptile review`), or the `Retrigger` link
 Greptile puts in the PR body. One credit per review. The check-run appears ~12 s later.
+Only the COMMENT is visible to the scripts: the `Retrigger` link posts none, so a review
+started that way is not seen until its check-run exists.
 
 | Surface | Endpoint | What it tells you |
 |---|---|---|

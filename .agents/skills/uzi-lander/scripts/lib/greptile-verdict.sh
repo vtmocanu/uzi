@@ -128,6 +128,9 @@ greptile_scope_live() {
   [ -n "$GRV_SHA" ] || return 0
   requested=$(printf '%s' "$issue_comments" | jq --arg since "$GRV_STARTED" --argjson grace "$grace" \
     'if type=="array" then
+       # Bot comments are skipped so a bot QUOTING the phrase cannot defer a lander. This assumes
+       # the trigger is posted by a user account; a lander posting through a GitHub App or
+       # GITHUB_TOKEN would be typed Bot and must be allowed here by login instead.
        [.[]|select((.user.type // "") != "Bot")
            |select((.body // "")|test("@greptile(ai)?\\s+review"; "i"))
            |(.created_at|fromdateiso8601) as $t

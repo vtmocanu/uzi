@@ -241,7 +241,7 @@ for n in "$@"; do
     gr_rc=0
     greptile_scope_live "$repo" "$n" "$head" "$gr_status" "$gr_review_id" "$gr_anchored" "$inline_raw" "$gr_issue" || gr_rc=$?
     if [ "$gr_rc" -eq 2 ]; then
-      echo "  ⏳ a Greptile review is still running on a newer commit than its last verdict; findings deferred"
+      echo "  ⏳ a Greptile review is running, or was just requested, after its last verdict; findings deferred"
       unconfirmed="${unconfirmed} #${n}"
     elif [ "$gr_rc" -ne 0 ]; then
       echo "  🔴 Greptile's earlier verdict UNREADABLE — older comments cannot be scoped; NOT confirmed clean"

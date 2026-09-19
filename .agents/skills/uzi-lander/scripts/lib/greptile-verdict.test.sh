@@ -30,6 +30,7 @@ nothing() { echo '{"check_runs":[{"id":5,"app":{"slug":"github-actions"},"name":
 [ "${1:-}" = api ] || { echo "unexpected gh call: $*" >&2; exit 1; }
 [ "$MODE" = no_api ] && { echo "the helper called the API when it must not: $*" >&2; exit 1; }
 case "$*" in
+  *'/pulls/44/commits'*) exit 1 ;;
   *'/pulls/43/commits'*)
     # A different PR that happens to share the head SHA and has no earlier commits.
     printf '[{"sha":"%s"}]\n' "$HEAD_SHA" ;;
@@ -200,6 +201,18 @@ want 0 "$PREV_SHA" 0 ""
 rc=0; greptile_prior_verdict test/repo 43 "$HEAD_SHA" || rc=$?
 { [ "$rc" -eq 0 ] && [ -z "$GRV_SHA" ]; } || fail "PR 43 was served PR 42's cached verdict (rc=$rc sha=$GRV_SHA)"
 
+
+# A cache HIT must restore the whole verdict, not just find it. A failed or pending call for
+# ANOTHER PR leaves the cache on the first PR but clears the globals, so the hit is the only
+# thing that puts them back; a stale GRV_STARTED would mis-date the trigger check below.
+MODE=prior_clean; export MODE
+want 0 "$PREV_SHA" 0 ""
+rc=0; greptile_prior_verdict test/repo 44 "$HEAD_SHA" || rc=$?
+{ [ "$rc" -eq 1 ] && [ -z "$GRV_SHA$GRV_STARTED" ]; } || fail "PR 44's failed lookup did not clear the globals (rc=$rc sha=$GRV_SHA started=$GRV_STARTED)"
+MODE=no_api; export MODE
+rc=0; greptile_prior_verdict test/repo 42 "$HEAD_SHA" || rc=$?
+{ [ "$rc" -eq 0 ] && [ "$GRV_SHA" = "$PREV_SHA" ] && [ "$GRV_ADDED" = "0" ] && [ "$GRV_STARTED" = "2001-01-01T00:00:00Z" ]; } \
+  || fail "cache hit did not restore the verdict (rc=$rc sha=$GRV_SHA added=$GRV_ADDED started=$GRV_STARTED)"
 # A review REQUESTED after the last verdict outranks it too: `@greptileai review` only
 # becomes a check-run ~12 s later, and until then the head reads `absent`. The stub's verdict
 # started 2001-01-01, so "now" is a trigger newer than it and inside the grace.
