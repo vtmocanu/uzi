@@ -304,10 +304,13 @@ func (h *Handler) decideGuardrailOverrideRequest(w http.ResponseWriter, r *http.
 	// member may have fixed branch protection, or enabled the repo, before the admin
 	// decides. Arming the #66 override on a repo that is no longer blocked would silently
 	// waive a FUTURE regression that reintroduces a waivable block. So we re-run the SAME
-	// live guard the enable gate and RequestGuardrailOverride run (GuardRepo with
-	// Overridden:false), and refuse to arm a stale override — settling the request as
-	// rejected with an explanatory note. Reject needs none of this: it installs no override,
-	// so a stale reject is harmless.
+	// raw refusal set RequestGuardrailOverride evaluates at request time (GuardRepo with
+	// Overridden:false), so approve-time and request-time agree on what "blocked" and
+	// "waivable" mean. revalidateApprove returns one of three verdicts: dismiss a
+	// definitively-moot request (settle it rejected), refuse an approval whose block cannot
+	// be waived RIGHT NOW without destroying the still-valid request (a transient forge
+	// outage fails closed here), or proceed to arm the override. Reject needs none of this:
+	// it installs no override, so a stale reject is harmless.
 	if applyOverride {
 		reqRow, err := h.q.GetGuardrailOverrideRequest(ctx, id)
 		if err != nil {
@@ -333,10 +336,17 @@ func (h *Handler) decideGuardrailOverrideRequest(w http.ResponseWriter, r *http.
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return
 		}
-		if stale, note := h.staleOverrideRequest(ctx, repo); stale {
+		switch verdict, note := h.revalidateApprove(ctx, repo); verdict {
+		case approveDismiss:
 			h.dismissStaleOverrideRequest(ctx, w, reqRow, user.ID, note)
 			return
+		case approveRefuse:
+			// Leave the pending request intact — a transient forge outage must not destroy a
+			// still-valid request. Refuse the approval so no stale/unwaivable override is armed.
+			httpx.Error(w, http.StatusConflict, "this override request cannot be approved right now — "+note)
+			return
 		}
+		// approveProceed falls through to the tx that settles the request and arms the override.
 	}
 
 	tx, err := h.pool.Begin(ctx)
@@ -424,17 +434,35 @@ func (h *Handler) RejectGuardrailOverrideRequest(w http.ResponseWriter, r *http.
 	h.decideGuardrailOverrideRequest(w, r, "rejected", false)
 }
 
-// staleOverrideRequest re-runs the LIVE guardrail (issue #1432 rework) to decide whether
-// approving a pending request would arm a stale #66 override. It returns (true, note) when
-// the request can no longer be honoured — the repo is already enabled, the live guard no
-// longer blocks it (protection was fixed), or the block is no longer fully waivable
-// (protection_unreadable, which an override can never clear, D8/D3) — with a server-authored
-// note explaining why. It runs GuardRepo with Overridden:false, the SAME raw refusal set the
-// enable gate (SetRepoEnabled) and RequestGuardrailOverride evaluate, so approve-time and
-// request-time agree on what "blocked" and "waivable" mean.
-func (h *Handler) staleOverrideRequest(ctx context.Context, repo store.GetRepoByIDRow) (bool, string) {
+// approveRevalidation is the verdict of re-running the live guard before an admin approval
+// arms the persistent #66 override (issue #1432 rework).
+type approveRevalidation int
+
+const (
+	// approveProceed: the repo is still blocked by a fully-waivable refusal — arm the override.
+	approveProceed approveRevalidation = iota
+	// approveDismiss: the request is DEFINITIVELY moot (the repo is already enabled, or a
+	// successful live guard shows it is no longer blocked). Settle it rejected with a note.
+	approveDismiss
+	// approveRefuse: the block cannot be waived RIGHT NOW (not fully waivable — e.g.
+	// protection_unreadable, which also covers a TRANSIENT forge outage that GuardRepo fails
+	// closed on). Refuse the approval but LEAVE the request pending, so a transient blip does
+	// not destroy a still-valid request; an admin can retry later or reject it deliberately.
+	approveRefuse
+)
+
+// revalidateApprove re-runs the live guardrail before an approval arms the persistent #66
+// override (issue #1432 rework). It runs GuardRepo with Overridden:false — the SAME raw
+// refusal set RequestGuardrailOverride evaluates at request time — so approve-time and
+// request-time agree on "blocked" and "waivable". It returns approveDismiss for a request
+// that is definitively moot (repo already enabled, or a successful guard shows the repo is no
+// longer blocked), approveRefuse when the current block cannot be waived (not fully waivable,
+// which also catches a transient forge outage GuardRepo fails closed on as
+// protection_unreadable — refuse without destroying the request), and approveProceed when the
+// override should be armed. The returned note is the member-facing explanation.
+func (h *Handler) revalidateApprove(ctx context.Context, repo store.GetRepoByIDRow) (approveRevalidation, string) {
 	if repo.Enabled {
-		return true, "the repository has already been enabled, so no override is needed."
+		return approveDismiss, "the repository has already been enabled, so no override is needed."
 	}
 	res := h.pcheck.GuardRepo(ctx, privcheck.GuardInput{
 		ForgeType:       repo.ForgeType,
@@ -449,12 +477,12 @@ func (h *Handler) staleOverrideRequest(ctx context.Context, repo store.GetRepoBy
 		Overridden: false,
 	})
 	if !res.Blocked {
-		return true, "the repository is no longer blocked by the guardrail, so no override is needed. Retry Enable."
+		return approveDismiss, "the repository is no longer blocked by the guardrail, so no override is needed. Retry Enable."
 	}
 	if !privcheck.AllBlocksWaivable(res.Findings) {
-		return true, "this refusal can no longer be waived by an override (branch protection could not be verified); fix protection on the forge, then retry Enable."
+		return approveRefuse, "this refusal cannot currently be waived by an override (branch protection could not be verified). If this is permanent, reject the request; if the forge was momentarily unreachable, try approving again once protection is readable."
 	}
-	return false, ""
+	return approveProceed, ""
 }
 
 // dismissStaleOverrideRequest settles a stale pending request as rejected with the given
@@ -479,7 +507,8 @@ func (h *Handler) dismissStaleOverrideRequest(ctx context.Context, w http.Respon
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	httpx.Error(w, http.StatusConflict, "the repository's guardrail state changed since this request was made — "+note)
+	// The note is a full, self-contained sentence, so it stands alone in the 409 body.
+	httpx.Error(w, http.StatusConflict, note)
 }
 
 // notifyGuardrailOverrideDecision fires the best-effort inbox notification a member

@@ -548,10 +548,13 @@ func staleFindings() []apitypes.GuardrailFindingDTO {
 
 // issue #1432 rework: approve must REVALIDATE the live guard before it installs the
 // persistent #66 override. A request opened while the repo was blocked can go stale — the
-// member fixed protection, enabled the repo, or the block became non-waivable — and arming
-// the override then would silently waive a FUTURE regression. Each subtest seeds a pending
-// request, makes the live guard stale a different way, approves, and asserts 409 + the
-// request settled `rejected` + NO override installed.
+// member fixed protection, enabled the repo, or the block can no longer be waived — and
+// arming the override then would silently waive a FUTURE regression. Each subtest seeds a
+// pending request, makes the live guard stale a different way, approves, and asserts 409 +
+// NO override installed + NO member notification. The DEFINITIVELY-moot cases (no longer
+// blocked, already enabled) settle the request `rejected`; the can't-waive-right-now case
+// (protection unreadable, which also covers a transient forge outage) LEAVES the request
+// `pending` so a blip does not destroy a still-valid request.
 func TestApproveGuardrailOverrideRequestRevalidatesLiveDB(t *testing.T) {
 	ctx := context.Background()
 	f := newEnableGuardFixture(ctx, t)
@@ -574,10 +577,13 @@ func TestApproveGuardrailOverrideRequestRevalidatesLiveDB(t *testing.T) {
 			t.Fatalf("approve status = %d, want 409 for a no-longer-blocked repo (body %s)", w.Code, w.Body.String())
 		}
 		if status, _ := f.requestDecision(ctx, t, reqID); status != "rejected" {
-			t.Errorf("request status = %q, want rejected (stale dismissal)", status)
+			t.Errorf("request status = %q, want rejected (definitively-moot dismissal)", status)
 		}
 		if _, set := f.overrideReason(ctx, t, repoID); set {
 			t.Errorf("a stale approve must NOT install the override")
+		}
+		if n := f.notificationCount(ctx, t, f.owner.ID, guardrailOverrideDecidedKind); n != 0 {
+			t.Errorf("a system dismissal must NOT notify the member, got %d notifications", n)
 		}
 	})
 
@@ -590,10 +596,13 @@ func TestApproveGuardrailOverrideRequestRevalidatesLiveDB(t *testing.T) {
 			t.Fatalf("approve status = %d, want 409 for an already-enabled repo (body %s)", w.Code, w.Body.String())
 		}
 		if status, _ := f.requestDecision(ctx, t, reqID); status != "rejected" {
-			t.Errorf("request status = %q, want rejected (stale dismissal)", status)
+			t.Errorf("request status = %q, want rejected (definitively-moot dismissal)", status)
 		}
 		if _, set := f.overrideReason(ctx, t, repoID); set {
 			t.Errorf("a stale approve must NOT install the override")
+		}
+		if n := f.notificationCount(ctx, t, f.owner.ID, guardrailOverrideDecidedKind); n != 0 {
+			t.Errorf("a system dismissal must NOT notify the member, got %d notifications", n)
 		}
 	})
 
@@ -602,7 +611,9 @@ func TestApproveGuardrailOverrideRequestRevalidatesLiveDB(t *testing.T) {
 		reqID := f.seedPendingRequest(ctx, t, repoID, f.owner.ID, reason, staleFindings())
 
 		// Branch protection can no longer be verified → protection_unreadable, which an
-		// override can never clear.
+		// override can never clear right now (this is also how a TRANSIENT forge outage
+		// surfaces). The approval is refused, but the request stays pending so a blip does
+		// not destroy a still-valid request.
 		f.forge.mu.Lock()
 		f.forge.prot[322] = protError
 		f.forge.mu.Unlock()
@@ -611,11 +622,14 @@ func TestApproveGuardrailOverrideRequestRevalidatesLiveDB(t *testing.T) {
 		if w.Code != http.StatusConflict {
 			t.Fatalf("approve status = %d, want 409 for a no-longer-waivable refusal (body %s)", w.Code, w.Body.String())
 		}
-		if status, _ := f.requestDecision(ctx, t, reqID); status != "rejected" {
-			t.Errorf("request status = %q, want rejected (stale dismissal)", status)
+		if status, _ := f.requestDecision(ctx, t, reqID); status != "pending" {
+			t.Errorf("request status = %q, want pending (refuse must NOT settle a can't-waive-now request)", status)
 		}
 		if _, set := f.overrideReason(ctx, t, repoID); set {
-			t.Errorf("a stale approve must NOT install the override")
+			t.Errorf("a refused approve must NOT install the override")
+		}
+		if n := f.notificationCount(ctx, t, f.owner.ID, guardrailOverrideDecidedKind); n != 0 {
+			t.Errorf("a refused approval must NOT notify the member, got %d notifications", n)
 		}
 	})
 }

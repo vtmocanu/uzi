@@ -13,12 +13,13 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// A non-admin member hitting either guardrail-override decision route gets 403 (issue
-// #1432): both are mounted under RequireAuth+RequireAdmin (routes_admin.go). The existing
-// decision tests call the handlers directly and so bypass that gate; this pins the
-// authorization the write group enforces. DB-free — RequireAdmin refuses before the handler
-// touches the store.
-func TestGuardrailOverrideDecisionRoutesRequireAdmin(t *testing.T) {
+// A non-admin member hitting either guardrail-override decision HANDLER gets 403 (issue
+// #1432): the admin write group wraps them in RequireAdmin. This wraps the middleware
+// directly to pin that authorization; it does NOT assert the route mounting (routes_admin.go
+// is the source of truth for the mount). The existing decision tests call the handlers
+// directly and so bypass RequireAdmin; this pins the gate the write group enforces. DB-free —
+// RequireAdmin refuses before the handler touches the store.
+func TestGuardrailOverrideDecisionHandlersRejectNonAdmin(t *testing.T) {
 	h := &Handler{}
 	member := store.User{ID: uuid.New(), Email: "member@e2e", IsAdmin: false}
 	cases := []struct {
