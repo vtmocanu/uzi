@@ -279,6 +279,20 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		if reason == reasonCustodyLimit {
 			nudge = false
 		}
+		// issue #1367: SUPPRESS the per-run Slack nudge for the undispatched-handoff reason too.
+		// reasonHandoffSetup maps onto the healthWaitingWorker enum, and slacksvc keys its nudge
+		// HEAD off that enum ("waiting for a worker to pick it up") — which is FALSE of an
+		// undispatched task run (ClaimRun never offers it), so a nudge would DM the owner a head
+		// that contradicts the honest reason block. slacksvc's own doc block forbids a third
+		// reason mirror and prescribes a full health enum (migration + web union + badge) for a
+		// third meaning on this enum — out of scope here — so suppress the per-run nudge instead.
+		// The STATE (waiting_worker + reasonHandoffSetup) is still written and broadcast below, so
+		// the web/CLI board reason is unchanged; the actionable signal is the sweeper's terminal
+		// failure after DispatchGrace, not a "waiting" nudge during a setup that may still be in
+		// flight. Keyed off the reason, exactly like reasonCustodyLimit above.
+		if reason == reasonHandoffSetup {
+			nudge = false
+		}
 		notifiedAt := pgtype.Timestamptz{}
 		if nudge {
 			notifiedAt = pgconv.Time(now)
