@@ -10,12 +10,13 @@ import (
 )
 
 // milestone_lanes_livedb_test.go is the PRD #1353 M3 live-DB gate for MilestonesLiveForRun:
-// it executes the two REAL runtime queries (LiveLaneFramesForRun and
-// LeadDispatchAndCompletionFramesForRun) against a throwaway Postgres, proving the DISTINCT ON
-// per-instance selection, the lead-lane dispatch/tool_result filter, and the end-to-end
-// back-join + completion drop that milestonelanes.Derive performs. Skipped unless
-// UZI_TEST_DATABASE_URL points at a throwaway Postgres (run via ./e2e/run-store-it.sh); sqlc
-// type inference is never trusted from a clean generate.
+// it executes the three REAL runtime queries (LiveLaneFramesForRun,
+// LeadAgentDispatchFramesForRun and LeadDispatchCompletionIDsForRun) against a throwaway
+// Postgres, proving the DISTINCT ON per-instance selection (newest seq wins), the lead-lane
+// Agent dispatch filter, the id-only completion projection, and the end-to-end back-join +
+// completion drop that milestonelanes.Derive performs. Skipped unless UZI_TEST_DATABASE_URL
+// points at a throwaway Postgres (run via ./e2e/run-store-it.sh); sqlc type inference is never
+// trusted from a clean generate.
 
 // seedLaneRun inserts a claimed issue run owned by workerID (the FK target for run_messages).
 func (e codexTestEnv) seedLaneRun(t *testing.T, userID, workerID, repoID uuid.UUID) uuid.UUID {
@@ -127,5 +128,41 @@ func TestMilestonesLiveForRunNoLanesLiveDB(t *testing.T) {
 	}
 	if live != nil {
 		t.Fatalf("live = %+v, want nil (only a completed instance)", live)
+	}
+}
+
+// One instance with TWO tool_use frames pins LiveLaneFramesForRun's DISTINCT ON (agent_instance)
+// ... ORDER BY agent_instance, seq DESC — the NEWEST (max-seq) frame must win. An older Read
+// (lower seq) then a newer Edit (higher seq) for one instance must derive the Edit's tool/detail;
+// flipping the ORDER BY to seq ASC (or dropping DESC) would surface the stale Read frame instead.
+func TestMilestonesLiveForRunNewestFrameWinsLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	userID, workerID, repoID := env.seedCodexInfra(t)
+	runID := env.seedLaneRun(t, userID, workerID, repoID)
+
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	older := now.Add(-4 * time.Minute)
+	newer := now.Add(-1 * time.Minute)
+
+	// Dispatch for the single live instance, then an OLDER lane frame (lower seq) and a NEWER
+	// one (higher seq). DISTINCT ON must keep the higher-seq Edit NEW.go, not the Read OLD.go.
+	env.insertLaneMessage(t, runID, 1, "tool_use", "lead", "",
+		`{"id":"inst-live","name":"Agent","input":{"subagent_type":"coder","description":"[m2] Do live work"}}`, older)
+	env.insertLaneMessage(t, runID, 2, "tool_use", "coder", "inst-live",
+		`{"name":"Read","input":{"file_path":"api/OLD.go"}}`, older)
+	env.insertLaneMessage(t, runID, 3, "tool_use", "coder", "inst-live",
+		`{"name":"Edit","input":{"file_path":"api/NEW.go"}}`, newer)
+
+	svc := New(env.q, env.box, testParams())
+	live, err := svc.MilestonesLiveForRun(env.ctx, runID, []apitypes.Milestone{{ID: "m2"}}, []string{"m2"}, now)
+	if err != nil {
+		t.Fatalf("MilestonesLiveForRun: %v", err)
+	}
+	if len(live) != 1 || len(live[0].Lanes) != 1 {
+		t.Fatalf("want one milestone with one lane, got %+v", live)
+	}
+	lane := live[0].Lanes[0]
+	if lane.Tool != "Edit" || lane.Detail != "api/NEW.go" || !lane.At.Equal(newer) {
+		t.Fatalf("lane = %+v, want the NEWEST frame {tool=Edit detail=api/NEW.go at=%v} (DISTINCT ON seq DESC)", lane, newer)
 	}
 }

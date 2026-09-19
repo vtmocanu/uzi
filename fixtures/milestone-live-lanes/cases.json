@@ -118,6 +118,23 @@
       ]
     },
     {
+      "name": "completed-milestone-not-live",
+      "now": "2026-09-19T12:00:00Z",
+      "milestones": [{"id": "m1", "title": "First (completed)"}, {"id": "m2", "title": "Second (in progress)"}],
+      "in_progress": ["m2"],
+      "frames": [
+        {"kind": "tool_use", "agent": "lead", "agent_instance": "", "agent_label": "", "payload": {"id": "inst-1", "name": "Agent", "input": {"subagent_type": "coder", "description": "[m1] Work on the completed milestone"}}, "created_at": "2026-09-19T11:55:00Z", "seq": 1},
+        {"kind": "tool_use", "agent": "lead", "agent_instance": "", "agent_label": "", "payload": {"id": "inst-2", "name": "Agent", "input": {"subagent_type": "reviewer", "description": "[m2] Work on the in-progress milestone"}}, "created_at": "2026-09-19T11:56:00Z", "seq": 2},
+        {"kind": "tool_use", "agent": "coder", "agent_instance": "inst-1", "agent_label": "", "payload": {"name": "Edit", "input": {"file_path": "api/m1.go"}}, "created_at": "2026-09-19T11:57:00Z", "seq": 3},
+        {"kind": "tool_use", "agent": "reviewer", "agent_instance": "inst-2", "agent_label": "", "payload": {"name": "Read", "input": {"file_path": "api/m2.go"}}, "created_at": "2026-09-19T11:58:00Z", "seq": 4}
+      ],
+      "expected": [
+        {"milestone_id": "m2", "lanes": [
+          {"agent": "reviewer", "agent_instance": "inst-2", "agent_label": "Work on the in-progress milestone", "tool": "Read", "detail": "api/m2.go", "at": "2026-09-19T11:58:00Z"}
+        ]}
+      ]
+    },
+    {
       "name": "no-milestones",
       "now": "2026-09-19T12:00:00Z",
       "milestones": [],

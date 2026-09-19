@@ -611,17 +611,28 @@ WHERE run_id = @run_id::uuid
   AND kind = 'tool_use'
 ORDER BY agent_instance, seq DESC;
 
--- name: LeadDispatchAndCompletionFramesForRun :many
--- PRD #1353: the lead-lane frames Derive needs to bind and expire lanes — Agent dispatch
--- tool_use frames (payload {id, input:{subagent_type, description}}) carrying each instance's
--- milestone tag + label, and tool_result frames whose tool_use_id marks a dispatch complete.
--- Both live on the lead lane (agent_instance IS NULL). Bounded by the lead's own tool-call count.
-SELECT seq, kind, payload, created_at
+-- name: LeadAgentDispatchFramesForRun :many
+-- PRD #1353: the lead-lane Agent dispatch tool_use frames (payload {id, input:{subagent_type,
+-- description}}) that carry each live instance's [<id>] milestone tag + label. Full payload is
+-- needed (id + input.description); bounded by the lead's dispatch count.
+SELECT seq, payload, created_at
 FROM run_messages
 WHERE run_id = @run_id::uuid
   AND agent_instance IS NULL
-  AND (kind = 'tool_result' OR (kind = 'tool_use' AND payload->>'name' = 'Agent'))
+  AND kind = 'tool_use'
+  AND payload->>'name' = 'Agent'
 ORDER BY seq;
+
+-- name: LeadDispatchCompletionIDsForRun :many
+-- PRD #1353: the tool_use_ids of lead-lane tool_result frames — a dispatch whose id appears here
+-- has COMPLETED (its subagent returned). Projects ONLY the id, never the (possibly large) tool
+-- output content, since Derive reads only the id.
+SELECT DISTINCT (payload->>'tool_use_id')::text AS tool_use_id
+FROM run_messages
+WHERE run_id = @run_id::uuid
+  AND agent_instance IS NULL
+  AND kind = 'tool_result'
+  AND payload->>'tool_use_id' IS NOT NULL;
 
 -- name: ListActiveRunsAll :many
 -- Admin Agents-status: every non-terminal run across all users, with repo path,

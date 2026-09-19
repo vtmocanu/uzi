@@ -5024,44 +5024,70 @@ func (q *Queries) LatestToolUseForRuns(ctx context.Context, runIds []uuid.UUID) 
 	return items, nil
 }
 
-const leadDispatchAndCompletionFramesForRun = `-- name: LeadDispatchAndCompletionFramesForRun :many
-SELECT seq, kind, payload, created_at
+const leadAgentDispatchFramesForRun = `-- name: LeadAgentDispatchFramesForRun :many
+SELECT seq, payload, created_at
 FROM run_messages
 WHERE run_id = $1::uuid
   AND agent_instance IS NULL
-  AND (kind = 'tool_result' OR (kind = 'tool_use' AND payload->>'name' = 'Agent'))
+  AND kind = 'tool_use'
+  AND payload->>'name' = 'Agent'
 ORDER BY seq
 `
 
-type LeadDispatchAndCompletionFramesForRunRow struct {
+type LeadAgentDispatchFramesForRunRow struct {
 	Seq       int32              `json:"seq"`
-	Kind      string             `json:"kind"`
 	Payload   []byte             `json:"payload"`
 	CreatedAt pgtype.Timestamptz `json:"created_at"`
 }
 
-// PRD #1353: the lead-lane frames Derive needs to bind and expire lanes — Agent dispatch
-// tool_use frames (payload {id, input:{subagent_type, description}}) carrying each instance's
-// milestone tag + label, and tool_result frames whose tool_use_id marks a dispatch complete.
-// Both live on the lead lane (agent_instance IS NULL). Bounded by the lead's own tool-call count.
-func (q *Queries) LeadDispatchAndCompletionFramesForRun(ctx context.Context, runID uuid.UUID) ([]LeadDispatchAndCompletionFramesForRunRow, error) {
-	rows, err := q.db.Query(ctx, leadDispatchAndCompletionFramesForRun, runID)
+// PRD #1353: the lead-lane Agent dispatch tool_use frames (payload {id, input:{subagent_type,
+// description}}) that carry each live instance's [<id>] milestone tag + label. Full payload is
+// needed (id + input.description); bounded by the lead's dispatch count.
+func (q *Queries) LeadAgentDispatchFramesForRun(ctx context.Context, runID uuid.UUID) ([]LeadAgentDispatchFramesForRunRow, error) {
+	rows, err := q.db.Query(ctx, leadAgentDispatchFramesForRun, runID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []LeadDispatchAndCompletionFramesForRunRow{}
+	items := []LeadAgentDispatchFramesForRunRow{}
 	for rows.Next() {
-		var i LeadDispatchAndCompletionFramesForRunRow
-		if err := rows.Scan(
-			&i.Seq,
-			&i.Kind,
-			&i.Payload,
-			&i.CreatedAt,
-		); err != nil {
+		var i LeadAgentDispatchFramesForRunRow
+		if err := rows.Scan(&i.Seq, &i.Payload, &i.CreatedAt); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const leadDispatchCompletionIDsForRun = `-- name: LeadDispatchCompletionIDsForRun :many
+SELECT DISTINCT (payload->>'tool_use_id')::text AS tool_use_id
+FROM run_messages
+WHERE run_id = $1::uuid
+  AND agent_instance IS NULL
+  AND kind = 'tool_result'
+  AND payload->>'tool_use_id' IS NOT NULL
+`
+
+// PRD #1353: the tool_use_ids of lead-lane tool_result frames — a dispatch whose id appears here
+// has COMPLETED (its subagent returned). Projects ONLY the id, never the (possibly large) tool
+// output content, since Derive reads only the id.
+func (q *Queries) LeadDispatchCompletionIDsForRun(ctx context.Context, runID uuid.UUID) ([]string, error) {
+	rows, err := q.db.Query(ctx, leadDispatchCompletionIDsForRun, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []string{}
+	for rows.Next() {
+		var tool_use_id string
+		if err := rows.Scan(&tool_use_id); err != nil {
+			return nil, err
+		}
+		items = append(items, tool_use_id)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err

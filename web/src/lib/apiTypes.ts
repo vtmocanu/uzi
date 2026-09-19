@@ -2001,10 +2001,11 @@ export interface MilestoneAgent {
 
 // MilestoneLane is one LIVE lane on an in-progress milestone (PRD #1353): a single live
 // subagent working that milestone right now, folded from its newest tool_use frame and
-// back-joined to the lead's Agent dispatch by `agent_instance`. `agent`/`agent_label`/`tool`/
-// `detail` are model-authored UNTRUSTED display text a consumer sanitizes before rendering,
-// the same rule RunActivity and MilestoneAgent follow; `agent_instance` is the dispatch
-// tool_use id that identifies the lane; `at` is the frame's created_at (a wire string).
+// back-joined to the lead's Agent dispatch by `agent_instance`. `agent`/`agent_instance`/
+// `agent_label`/`tool`/`detail` are model-authored UNTRUSTED display text a consumer sanitizes
+// before rendering, the same rule RunActivity and MilestoneAgent follow; `agent_instance` is the
+// dispatch tool_use id that identifies the lane and rides RAW on the wire (the write-side strips
+// only NUL); `at` is the frame's created_at (a wire string).
 export interface MilestoneLane {
   agent: string;
   agent_instance: string;

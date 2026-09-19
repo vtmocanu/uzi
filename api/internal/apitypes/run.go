@@ -39,10 +39,11 @@ type MilestoneAgent struct {
 // role, AgentInstance the dispatch tool_use id that identifies the lane (= the subagent's
 // parent_tool_use_id), AgentLabel the dispatch's task label, Tool the tool name, Detail the
 // tool's most identifying argument (a repo-relative file_path, a Bash/Agent description, or
-// empty — NEVER a Bash command), and At the frame's created_at. Agent/AgentLabel/Tool/Detail
-// are UNTRUSTED, model-authored text; the server strips terminal-unsafe runes and caps
-// AgentLabel and Detail (200 runes) exactly as it does for RunActivity, and every renderer
-// still applies its own terminal-safety fold.
+// empty — NEVER a Bash command), and At the frame's created_at. Agent/AgentInstance/AgentLabel/
+// Tool/Detail are UNTRUSTED, model-authored text; the server strips terminal-unsafe runes and
+// caps AgentLabel and Detail (200 runes) exactly as it does for RunActivity, while AgentInstance
+// rides RAW on the wire (the write-side strips only NUL), and every renderer still applies its
+// own terminal-safety fold.
 type MilestoneLane struct {
 	Agent         string    `json:"agent"`
 	AgentInstance string    `json:"agent_instance"`

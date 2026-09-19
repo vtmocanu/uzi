@@ -10,12 +10,14 @@
 // existing, uzi-authored field with no new frame field, no new column, and no SDK
 // schema risk.
 //
-// The `Derive` function that back-joins live frames to their dispatch frame and
-// reads this tag lands in a sibling file (M3). This file delivers only the pure tag
-// parser and the membership validator that Derive will call.
+// The `Derive` function that back-joins live frames to their dispatch frame and reads
+// this tag lives in a sibling file (derive.go); this file (tag.go) provides only the
+// dispatch-description tag parser and the membership validator that Derive calls.
 //
-// The package is deliberately STDLIB-ONLY (it imports only "strings"); it does not
-// import apitypes.
+// The package is SERVER-ONLY: it is not linked by the CLI leaf api/cmd/uzi (which
+// consumes the derived milestones_live DTO field, never this rule), so it is free to
+// import server packages — derive.go pulls in apitypes and runactivity (and, through
+// the stdlib, encoding/json, sort and time). It is NOT stdlib-only.
 package milestonelanes
 
 import "strings"

@@ -203,6 +203,14 @@ func TestDeriveGoldenFixture(t *testing.T) {
 // fragility). A JSON null expected decodes to a nil slice, which must match Derive's nil.
 func assertLive(t *testing.T, name string, got []apitypes.MilestoneLive, want []fixtureLive) {
 	t.Helper()
+	// The D5 back-compat contract: no live lanes derives a NIL slice (JSON null), never an
+	// empty []MilestoneLive{}. A case expecting null (want decodes to a nil slice, len 0) must
+	// get a nil got; a populated case must get a non-nil got. A regression returning [] over
+	// nil reddens here even though the len check below would still pass.
+	if (got == nil) != (len(want) == 0) {
+		t.Errorf("case %q: got == nil is %v, want %v (nil-vs-empty D5 contract; got %#v, want len %d)",
+			name, got == nil, len(want) == 0, got, len(want))
+	}
 	if len(got) != len(want) {
 		t.Fatalf("case %q: got %d milestones, want %d\n got  %+v\n want %+v", name, len(got), len(want), got, want)
 	}
