@@ -95,6 +95,11 @@ func (h *Handler) mountRepoRoutes(r chi.Router, forgeLimiter, boardOrderLimiter 
 		r.Group(func(r chi.Router) {
 			r.Use(mw.RequireAuth(h.q, h.cfg))
 			r.Put("/{id}", h.SetRepoEnabled)
+			// Member "request an override" (PRD #1432): a web-only member action
+			// mirroring SetRepoEnabled's cookie-only posture. forgeLimiter because it
+			// re-runs the LIVE guard; owner-scoped and waivable-only enforced
+			// server-side; it never sets an override or enables the repo.
+			r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/override-request", h.RequestGuardrailOverride)
 			// Repo-skills opt-in toggle (PRD #16): repo owner or admin.
 			r.Patch("/{id}", h.PatchRepo)
 			// GitHub Projects v2 sync, owner-or-admin (issue #534, PRD #364 follow-up):

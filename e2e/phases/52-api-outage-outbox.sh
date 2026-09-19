@@ -54,6 +54,12 @@
 #      — reached directly in the DB — loses its terminal to the outage; the journal replay lands
 #      `completed` (never the sweep's run_timeout `failed`), so it does not sit non-terminal forever.
 #
+# WHY the M5 outages are SPILL-GATED rather than fixed-length: the spill trip fires only
+# inside a failed flush, and a failed flush costs a connect timeout whose length is a
+# property of the HOST's networking, not of this phase (see wait_spilled). A fixed 20s
+# outage entered spill AFTER the api was already back on the CI runner. Both M5 cases
+# therefore cut the api, wait for the spill, and only then hold the outage open.
+#
 # WHY the api heartbeat-stale window is RAISED here: the e2e boots with
 # E2E_WORKER_HEARTBEAT_STALE=15s, but each outage cuts the api for >15s, so at recovery
 # the worker's last heartbeat is stale and the 2s sweeper would REQUEUE the running run
@@ -152,18 +158,74 @@ make_outbox_run() {
     || fail "outbox phase: the stub stream never reached 3 ticks (got ${n:-none}) — sentinel not streaming?"
   pass "stub run $OUTBOX_RUN streaming ($n outbox ticks landed) before the outage"
 }
-# outage RUN SECS — cut the api for SECS (> WORKER_TRANSIENT_TRIP_MS so the batcher
-# SPILLS), bring it back, re-login (the bounce drops the session), then assert the
-# barrier. No `docker compose start` (no phase uses it): stop, then `up -d --wait api`
-# + wait_http + login (the 15-happy-path-restart idiom).
-outage() {
-  local run="$1" secs="$2"
-  say "cutting the api for ${secs}s (> WORKER_TRANSIENT_TRIP_MS=3s) so the batcher spills run $run to the outbox"
-  "${COMPOSE[@]}" stop api >/dev/null 2>&1
-  sleep "$secs"
+# wait_spilled RUN [TIMEOUT] — block until the batcher has ENTERED SPILL MODE for RUN,
+# read from the agent's own log. The spill trip is evaluated ONLY inside a FAILED flush,
+# and `enterSpill` needs TWO of them: the first arms the failure clock, the second
+# compares it against WORKER_TRANSIENT_TRIP_MS. What a failed flush COSTS is host
+# dependent — a refused connect returns in ~1s against Docker Desktop, while the CI
+# runner's bridge black-holes the SYN and the fetch pays the full connect timeout,
+# measured at ~10s per attempt (2026-09-19 nightly artifacts, agent.log: flush failures
+# at 06:16:14.613 and 06:16:25.552 for a 20s outage). So the spill starts anywhere from
+# ~4s to ~21s in and a FIXED sleep cannot bound it: on that nightly the batcher entered
+# spill 0.37s AFTER the api was back and drained 1.65s later, leaving no window at all
+# for the first recovered heartbeat to report a depth. Gate the outage on the EVENT
+# instead, then hold it open for the caller's window so a real backlog builds.
+# Returns 0 once observed and 1 on timeout; it never calls `fail` itself, because it runs
+# with the api STOPPED and a `fail` there would leave the whole stack down for every later
+# phase. The caller restores the api first and judges after.
+wait_spilled() {
+  local run="$1" timeout="${2:-60}" f="$RUNROOT/.outbox-spill.log"
+  local start=$SECONDS deadline=$((SECONDS + timeout))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    "${COMPOSE[@]}" logs --no-color agent > "$f" 2>/dev/null || true
+    # awk, not `grep … | grep -q`: it reads to EOF, so there is no early-exiting reader to
+    # SIGPIPE its writer (CLAUDE.md), and it matches BOTH literals on the SAME line, so a
+    # spill logged for an earlier case's run can never satisfy this one.
+    if awk -v r="$run" 'index($0, "entered spill mode") && index($0, r) { hit = 1 } END { exit(hit ? 0 : 1) }' "$f"; then
+      pass "batcher entered spill mode for run $run $((SECONDS - start))s into the outage"
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+# api_back — bring the api up after an outage and make the HARNESS's own HTTP path usable
+# again. `web` is restarted alongside it, which is NOT belt-and-braces: nginx resolves the
+# `api` upstream ONCE at startup and caches the address for the worker's life
+# (`web/nginx.conf` uses a literal `proxy_pass http://api:8080` with no `resolver`), while
+# every wait_*/apiget in this harness goes through that proxy on $BASE. A stopped api frees
+# its container address, and CASE 4 restarts the agent while the api is down — the only
+# `compose restart` in the whole suite — so that address can be handed to the agent and the
+# api comes back on a different one, leaving nginx proxying to the wrong container.
+# Measured 2026-09-19 with the shipped web image on an isolated network: stop api, restart a
+# second container, start api, and the two addresses SWAP while the proxy goes from 404
+# (upstream reached) to 502. The product-side question — whether nginx should re-resolve —
+# is deliberately left to the maintainer; restarting web here only keeps the harness's own
+# plumbing honest and asserts nothing about the proxy.
+api_back() {
   "${COMPOSE[@]}" up -d --wait api >/dev/null
+  "${COMPOSE[@]}" restart web >/dev/null 2>&1
   wait_http
   login
+}
+# outage RUN SECS — cut the api, wait until the batcher has SPILLED run RUN, hold the
+# outage SECS longer so a real backlog accumulates, bring the api back, re-login (the
+# bounce drops the session), then assert the barrier. Spill-gated rather than
+# fixed-length: see wait_spilled for why a bare `sleep` cannot bound the spill. The
+# total stays well under the 90s heartbeat-stale window raised below (~21s worst-case
+# spill + 25s the longest hold). No `docker compose start` (no phase uses it): stop,
+# then api_back (the 15-happy-path-restart idiom plus this phase's proxy caveat).
+outage() {
+  local run="$1" secs="$2" spilled=0
+  say "cutting the api (> WORKER_TRANSIENT_TRIP_MS=3s) so the batcher spills run $run, then holding it down ${secs}s past the spill"
+  "${COMPOSE[@]}" stop api >/dev/null 2>&1
+  if wait_spilled "$run"; then spilled=1; fi
+  sleep "$secs"
+  api_back
+  # Judge the spill only AFTER the api is back: a `fail` with it still stopped would take
+  # every later phase down with this one.
+  [ "$spilled" = 1 ] \
+    || fail "outbox phase: the batcher never entered spill mode for run $run while the api was down — nothing was spilled, so there is no barrier to observe"
   observe_barrier "$run"
 }
 
@@ -238,7 +300,7 @@ pass "agent recreated with WORKER_OUTBOX_RUN_MAX_BYTES=1024 (forces quota evicti
 
 make_outbox_run
 RUN2="$OUTBOX_RUN"
-# A longer outage than case 1 so many small segments spill and the quota reliably binds.
+# A longer post-spill hold than case 1 so many small segments spill and the quota reliably binds.
 outage "$RUN2" 25
 wait_status "$RUN2" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
 wait_drained "$RUN2"
@@ -299,9 +361,7 @@ GEN_B1="$(rb_run_field "$RUN_B1" claim_generation)"
 say "cutting the api ~${RB_OUTAGE}s so run $RUN_B1 reaches its terminal (journaled write-ahead) while it is down"
 "${COMPOSE[@]}" stop api >/dev/null 2>&1
 sleep "$RB_OUTAGE"
-"${COMPOSE[@]}" up -d --wait api >/dev/null
-wait_http
-login
+api_back
 # On recovery the drainer replays the run's messages FIRST; the terminal SetState is then fenced
 # on runs.last_seq (409 messages_pending until the trace is contiguous through the journal's
 # messages_through_seq), so `completed` — and the judge/notification enqueue that rides the SAME
@@ -345,9 +405,7 @@ say "restarting the agent container mid-outage (its /data outbox tree persists a
 # Bring the api back. The restarted worker — parked in its register-retry while the api was down —
 # registers with its pending-terminal snapshot, then the boot gate resolves the journal BEFORE the
 # claim loops start.
-"${COMPOSE[@]}" up -d --wait api >/dev/null
-wait_http
-login
+api_back
 wait_worker_online
 wait_status "$RUN_B2" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
 wait_drained "$RUN_B2"
@@ -395,9 +453,7 @@ pass "case 5: past-wall interlocked run held at 'running' across the sweep (carv
 say "cutting the api so the interlocked run's terminal is journaled and its first send lost"
 "${COMPOSE[@]}" stop api >/dev/null 2>&1
 sleep "$RB_OUTAGE"
-"${COMPOSE[@]}" up -d --wait api >/dev/null
-wait_http
-login
+api_back
 # The journal replays: the run reaches `completed` (never the sweep's run_timeout `failed`), at its
 # original generation, with a gapless trace.
 wait_status "$RUN_B3" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"

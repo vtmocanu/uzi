@@ -69,6 +69,7 @@ import type {
   MyRateLimitsResponse,
   Notification,
   NotificationList,
+  OverrideRequestState,
   PendingJudge,
   PrivilegeReport,
   ProjectSyncOwnerKind,
@@ -796,6 +797,29 @@ const realApi = {
   // Revoke the override (PRD #66 D8): NULLs it, re-arming the guardrail immediately.
   clearRepoGuardrailOverride: (id: string) =>
     request<{ repo: Repo }>("DELETE", `/admin/repos/${id}/guardrail-override`),
+
+  // Member guardrail-override request (issue #1432): a member whose enable was refused
+  // for a WAIVABLE reason asks an admin to allow the repo. 200 { override_request };
+  // 409 (not blocked), 422 (not waivable), 400/422 (bad reason). MEMBER path (owner-
+  // scoped), distinct from the admin-only setRepoGuardrailOverride above.
+  requestGuardrailOverride: (id: string, reason: string) =>
+    request<{ override_request: OverrideRequestState }>("POST", `/repos/${id}/override-request`, { reason }),
+  // Admin decides a pending override request (issue #1432). The decision_note is
+  // optional (rendered back to the requester); an empty note is omitted. Approve sets
+  // the override so the owner can retry Enable — it does NOT enable the repo. 409 if the
+  // request was already decided, 404 if it does not exist.
+  approveGuardrailOverrideRequest: (id: string, decisionNote?: string) =>
+    request<{ request: OverrideRequestState }>(
+      "POST",
+      `/admin/override-requests/${id}/approve`,
+      decisionNote ? { decision_note: decisionNote } : {},
+    ),
+  rejectGuardrailOverrideRequest: (id: string, decisionNote?: string) =>
+    request<{ request: OverrideRequestState }>(
+      "POST",
+      `/admin/override-requests/${id}/reject`,
+      decisionNote ? { decision_note: decisionNote } : {},
+    ),
 
   // GitHub Projects v2 sync (PRD #534). Owner-or-admin; the server 404s a
   // non-linked or non-owner repo (existence-hiding). Read the current link

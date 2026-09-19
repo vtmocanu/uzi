@@ -116,5 +116,20 @@ func (h *Handler) AdminListBlockedRepos(w http.ResponseWriter, r *http.Request) 
 		out = append(out, dto)
 	}
 
-	httpx.JSON(w, http.StatusOK, apitypes.AdminBlockedReposDTO{Repos: out, ChecksUnknown: checksUnknown})
+	// Attach the pending cross-user override requests (PRD #1432): members asking an
+	// admin to allow a blocked repo through the guardrail. NON-fatal — the blocked list
+	// is the primary payload, so a query error logs and proceeds with an empty slice
+	// rather than 500ing the whole page. Initialized to an empty (never nil) slice so it
+	// serializes as [] not null, matching the non-omitempty Requests field.
+	requests := []apitypes.GuardrailOverrideRequestDTO{}
+	preqs, err := h.q.ListPendingGuardrailOverrideRequests(r.Context())
+	if err != nil {
+		slog.Warn("admin blocked repos: pending override requests", "error", err)
+	} else {
+		for _, row := range preqs {
+			requests = append(requests, guardrailOverrideRequestDTO(row))
+		}
+	}
+
+	httpx.JSON(w, http.StatusOK, apitypes.AdminBlockedReposDTO{Repos: out, ChecksUnknown: checksUnknown, Requests: requests})
 }

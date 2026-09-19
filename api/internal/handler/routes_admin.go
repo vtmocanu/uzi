@@ -145,6 +145,14 @@ func (h *Handler) mountAdminRoutes(r chi.Router, forgeLimiter, authLimiter *mw.L
 			// route-around D8 forbids. Actor + timestamp from the session, never the body.
 			r.Post("/repos/{id}/guardrail-override", h.SetRepoGuardrailOverride)
 			r.Delete("/repos/{id}/guardrail-override", h.ClearRepoGuardrailOverride)
+			// Admin approve/reject of a member guardrail-override request (#1432): approve
+			// sets the existing audited per-repo override (never enables the repo — the
+			// member retries Enable so the live guard re-runs), reject just settles the
+			// request; both notify the requester. No forge limiter (a DB-only decision write
+			// + audited override set, no forge call). Cookie-only in this write group, so a
+			// uza_ Bearer 401s before the handler.
+			r.Post("/override-requests/{id}/approve", h.ApproveGuardrailOverrideRequest)
+			r.Post("/override-requests/{id}/reject", h.RejectGuardrailOverrideRequest)
 			// Agent-source "Sync now" + approve-and-apply (PRD #602 M4). Cookie-only
 			// admin writes: sync runs the same reconcile the interval loop uses; apply
 			// is the ONLY path that writes agent_templates from a sync, so nothing

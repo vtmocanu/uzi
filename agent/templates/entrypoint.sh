@@ -24,8 +24,9 @@
 # anything resolves from a volume, regardless of volume contents.
 #
 # NOTE: the runtime cap set has NO CAP_FOWNER, so root can chmod a file only while it
-# still owns it (chmod-before-chown for the token) and can otherwise only chown (not
-# chmod) already-owned paths during the B4 migration.
+# still owns it — hence the token block reclaims ownership to root before its chmod and
+# hands it to `worker` after, and the B4 migration can otherwise only chown (not chmod)
+# already-owned paths.
 set -eu
 
 # Absolute, root-owned, image-baked binaries (no /nix, no /data). Defined BEFORE the
@@ -292,8 +293,26 @@ RUNNER_TMPDIR=/tmp/uzi-runner
 # same Docker-secret path (UZI_WORKER_TOKEN_FILE=/run/secrets/worker_token, sourced from
 # the minted UZI_WORKER_TOKEN), so this hardening covers it too — that is exactly what
 # makes the e2e's runner-uid read-denial assertion non-vacuous.
+#
+# RESTART-SAFE: RECLAIM ownership to root FIRST, then chmod, then hand it over. A
+# `docker compose restart` (as opposed to a recreate) keeps the container AND its secret
+# mount, so the second boot finds the file already owned by `worker` from the first —
+# and with no CAP_FOWNER root cannot chmod a file it does not own. Going straight to
+# chmod EPERMs there, `set -eu` aborts the ENTRYPOINT, and the worker never starts at
+# all: no heartbeat, so the api sweeps the worker stale and requeues every run it was
+# holding. CAP_CHOWN needs no FOWNER, so taking the file back is always permitted and
+# the chmod that follows is too. Measured in this image with the compose cap set, on a
+# worker-owned file: bare `chmod` prints "Operation not permitted" and exits 1, while
+# reclaim-chmod-hand-over exits 0 and leaves 0400 worker:worker.
+#
+# Reclaiming rather than skipping the chmod when root is not the owner is deliberate:
+# the mode is a security control and every boot must re-assert it. Measured on a token
+# left 0444 worker:worker by a previous boot, an ownership-guarded chmod leaves it 0444
+# while this sequence restores 0400. The transient root ownership never widens anything
+# (0400 carries no setuid/setgid bit for the final chown to strip).
 TOKEN=/run/secrets/worker_token
 if [ -e "$TOKEN" ]; then
+  "$CHOWN" 0:0 "$TOKEN"
   "$CHMOD" 0400 "$TOKEN"
   "$CHOWN" "$WORKER_OWNER" "$TOKEN"
 fi

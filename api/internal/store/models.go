@@ -256,6 +256,19 @@ type GithubProjectLink struct {
 	DoneOptionID     string             `json:"done_option_id"`
 }
 
+type GuardrailOverrideRequest struct {
+	ID           uuid.UUID          `json:"id"`
+	RepoID       uuid.UUID          `json:"repo_id"`
+	RequestedBy  uuid.UUID          `json:"requested_by"`
+	Reason       string             `json:"reason"`
+	Findings     []byte             `json:"findings"`
+	Status       string             `json:"status"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+	DecidedBy    pgtype.UUID        `json:"decided_by"`
+	DecidedAt    pgtype.Timestamptz `json:"decided_at"`
+	DecisionNote pgtype.Text        `json:"decision_note"`
+}
+
 type HostedWorkerToken struct {
 	WorkerID        uuid.UUID          `json:"worker_id"`
 	TokenCiphertext []byte             `json:"token_ciphertext"`

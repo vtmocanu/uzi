@@ -240,27 +240,42 @@ verifies" in the [GitLab](./gitlab-bot-setup.md#least-privilege-what-uzi-verifie
 for what triggers the block on each forge.
 
 This is not one of the instance-wide settings above: it is a **per-repo, per-decision**
-exception, not a knob. An **instance admin only** can grant it — a member cannot
-self-allow, not even for a repo they own; they see the block on their own Repos
-page with a pointer to ask an admin. Allowing a repo requires a written reason,
-and the write is recorded with the admin's identity and a timestamp — there's no
-anonymous or unattributed override.
+exception, not a knob. An **instance admin only** can grant it — a member still cannot
+self-allow, not even for a repo they own. What a member *can* do is ask: when their own
+Enable attempt is refused for a **waivable** reason, a **Request admin approval** action
+appears on their own Repos page. It takes a required reason of their own and records the
+request; only an instance admin can approve it. Allowing a repo, whether inline or via a
+request, requires a written reason, and the write is recorded with the admin's identity
+and a timestamp — there's no anonymous or unattributed override.
 
 Admins act on it in two places: **inline on the Repos page**, for any repo they
 can already see, with "Allow anyway" (blocked) or "Revoke" (already allowed); and
-from a cross-user **Admin → Blocked repos** page, which lists every user's
-blocked or overridden repos so an admin doesn't have to hunt through each user's
-own Repos page to find one. **Revoke** re-arms the block immediately. An
-override never auto-expires — silently re-blocking a repo with nobody present to
-fix it would be worse than the problem the guardrail exists to prevent — but the
-Blocked repos page flags an override as stale once it's roughly 30 days old, so
-an old accept-risk decision doesn't quietly outlive its reason.
+from a cross-user **Admin → Blocked repos** page. That page is built from the
+**last stored privilege sweep**, not a live re-check, so a connection that was
+never privilege-checked is invisible there — the page flags when the picture may
+be incomplete rather than rendering an empty list as clean. **Revoke** re-arms
+the block immediately. An override never auto-expires — silently re-blocking a
+repo with nobody present to fix it would be worse than the problem the guardrail
+exists to prevent — but the Blocked repos page flags an override as stale once
+it's roughly 30 days old, so an old accept-risk decision doesn't quietly outlive
+its reason.
+
+The same page also has a **Pending override requests** section: each request shows
+who asked, the repo, their reason, and the coded findings that refused their Enable
+attempt. An admin **Approve**s or **Reject**s it, either way with an optional note
+back to the requester. Approve sets the same per-repo override described above — the
+member's own reason, the admin's identity, and a timestamp — it does **not** enable
+the repo; the owner still has to retry Enable so the live guard runs again against
+the current forge state. The requester is notified of the decision either way.
 
 **The override can never waive the case where uzi couldn't read the repo's
 protection at all.** A forge read error, timeout, or an unverifiable answer (see
 the GitHub classic-branch-protection case in the setup doc above) still refuses
 the run even on a repo an admin has allowed — an admin can accept a risk uzi
-told them about, never one uzi couldn't see.
+told them about, never one uzi couldn't see. For the same reason, **Request admin
+approval** only ever appears for a waivable refusal: an unverifiable-protection
+refusal offers no request action at all, because no override, requested or
+admin-granted, could ever clear it.
 
 The `uzi admin guardrail-impact` and `uzi admin blocked-repos` CLI commands give
 the same picture from a terminal instead of the web UI — see

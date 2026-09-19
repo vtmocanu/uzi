@@ -26,6 +26,13 @@
     "at": "2020-01-02T03:04:05Z"
   },
   "guardrail_blocked": true,
+  "override_request": {
+    "status": "x",
+    "reason": "x",
+    "created_at": "2020-01-02T03:04:05Z",
+    "decided_at": "2020-01-02T03:04:05Z",
+    "decision_note": "x"
+  },
   "docker_allowlisted": true,
   "docker_blocked": true,
   "github_project_sync": {

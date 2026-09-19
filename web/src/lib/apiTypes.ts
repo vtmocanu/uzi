@@ -476,6 +476,11 @@ export interface Repo {
     last_error?: string;
     last_synced_at?: string;
   } | null;
+  // Latest guardrail override-request state for a not-yet-enabled repo (issue #1432),
+  // absent/null otherwise. List-computed like guardrail_blocked — never set on the
+  // single-repo PUT/PATCH responses. Drives the member's pending/approved/rejected
+  // affordance; the live enable guard stays authoritative regardless of this state.
+  override_request?: OverrideRequestState | null;
 }
 
 // GuardrailOverrideMeta is the audit metadata for an active admin per-repo guardrail
@@ -485,6 +490,17 @@ export interface GuardrailOverrideMeta {
   reason: string;
   by: string;
   at: string;
+}
+
+// OverrideRequestState is the member-facing state of a guardrail override request
+// (issue #1432): the current status, the reason the owner gave, when it was raised,
+// and — once an admin decides — when and any note. Mirrors apitypes.OverrideRequestStateDTO.
+export interface OverrideRequestState {
+  status: string;
+  reason: string;
+  created_at: string;
+  decided_at: string | null;
+  decision_note: string | null;
 }
 
 // GitHub Projects v2 sync status for one repo (PRD #534). Returned by the
@@ -528,12 +544,48 @@ export interface BlockedRepo {
   privilege_checked_at: string | null;
 }
 
+// GuardrailFinding is one coded blocking privcheck finding snapshotted onto a
+// guardrail override request (issue #1432): the reason an enable was refused,
+// carried for audit/display so an admin sees WHY without a fresh forge read.
+// severity is a plain string (the wire carries "block"/"warn", but the contract
+// fixture uses a generic populated value, so it is not narrowed to a union).
+// Mirrors apitypes.GuardrailFindingDTO.
+export interface GuardrailFinding {
+  code: string;
+  severity: string;
+  message: string;
+}
+
+// GuardrailOverrideRequest is one row of the admin cross-user override-request
+// queue (issue #1432): a member's pending request that an admin allow a guardrail-
+// blocked repo, joined to its repo path, owning user (id + email), and forge type
+// so the admin can triage the whole queue without a per-row fan-out. findings is
+// the audit/display snapshot of what blocked the enable. Mirrors
+// apitypes.GuardrailOverrideRequestDTO.
+export interface GuardrailOverrideRequest {
+  id: string;
+  repo_id: string;
+  repo_path: string;
+  owner_id: string;
+  owner_email: string;
+  forge_type: string;
+  reason: string;
+  findings: GuardrailFinding[];
+  status: string;
+  created_at: string;
+}
+
 // AdminBlockedRepos is the GET /api/admin/blocked-repos envelope (PRD #66 M9). When
 // checks_unknown is true at least one connection was never privilege-checked, so an
 // empty list is "unknown", NOT "none blocked" (R1) — the page says so.
 export interface AdminBlockedRepos {
   repos: BlockedRepo[];
   checks_unknown: boolean;
+  // The PENDING cross-user guardrail override requests (issue #1432): members who
+  // could not enable a blocked repo asking an admin to allow it. REQUIRED, never
+  // optional — the handler initializes it to an empty slice, so an admin with no
+  // pending requests sees [] rather than null.
+  requests: GuardrailOverrideRequest[];
 }
 
 export interface BoardColumn {

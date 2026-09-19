@@ -125,6 +125,11 @@ func contractCases() []contractCase {
 		newContractCase[RecoveryCustodyHoldDTO]("recovery_custody_hold"),
 		newContractCase[RecoveryCustodyAggregateDTO]("recovery_custody_aggregate"),
 		newContractCase[RecoveryCustodyHoldsDTO]("recovery_custody_holds"),
+		// PRD #1432 M1: the admin cross-user guardrail override-request row. Its
+		// Findings slice is non-omitempty (its zero.json carries a null the handler
+		// normalizes to []); every other field is a required scalar, so its zero.json
+		// carries no other null.
+		newContractCase[GuardrailOverrideRequestDTO]("guardrail_override_request"),
 	}
 }
 

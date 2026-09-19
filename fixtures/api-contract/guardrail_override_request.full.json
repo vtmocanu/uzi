@@ -1,0 +1,18 @@
+{
+  "id": "x",
+  "repo_id": "x",
+  "repo_path": "x",
+  "owner_id": "x",
+  "owner_email": "x",
+  "forge_type": "x",
+  "reason": "x",
+  "findings": [
+    {
+      "code": "x",
+      "severity": "x",
+      "message": "x"
+    }
+  ],
+  "status": "x",
+  "created_at": "2020-01-02T03:04:05Z"
+}

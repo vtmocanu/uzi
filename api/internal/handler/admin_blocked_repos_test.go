@@ -256,3 +256,85 @@ func TestAdminListBlockedReposLiveDB(t *testing.T) {
 		t.Errorf("member GET status = %d, want 403", wm.Code)
 	}
 }
+
+// seedPendingRequest inserts a PENDING guardrail-override request for repoID owned by
+// requestedBy, with reason + a marshaled findings snapshot, and returns its id. Direct
+// SQL: the admin queue reads the row regardless of which handler wrote it.
+func (f enableGuardFixture) seedPendingRequest(ctx context.Context, t *testing.T, repoID, requestedBy uuid.UUID, reason string, findings []apitypes.GuardrailFindingDTO) uuid.UUID {
+	t.Helper()
+	b, err := json.Marshal(findings)
+	if err != nil {
+		t.Fatalf("marshal findings: %v", err)
+	}
+	reqID := uuid.New()
+	mustExecT(ctx, t, f.pool,
+		`INSERT INTO guardrail_override_requests (id, repo_id, requested_by, reason, findings)
+		 VALUES ($1, $2, $3, $4, $5)`,
+		reqID, repoID, requestedBy, reason, b)
+	return reqID
+}
+
+// A pending override request appears in the admin queue (AdminBlockedReposDTO.Requests)
+// with its repo path, owner email, reason, and decoded findings — the cross-user triage
+// surface (PRD #1432 M3). The envelope's Requests is [] (never null) when there are none.
+func TestAdminListBlockedReposIncludesPendingRequestsLiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newEnableGuardFixture(ctx, t)
+	admin := f.mkAdmin(ctx, t)
+
+	// The fixture owner is a member; its connection resolves the queue's owner email.
+	repo := f.addRepoRow(ctx, t, f.connID, 9301, "g/needs-override", "", uuid.Nil)
+	const reason = "protection is enforced by our CI ruleset, not branch protection; please allow this repo"
+	findings := []apitypes.GuardrailFindingDTO{
+		{Code: "default_branch_unprotected", Severity: "block", Message: "the default branch is not protected"},
+	}
+	reqID := f.seedPendingRequest(ctx, t, repo, f.owner.ID, reason, findings)
+
+	r := httptest.NewRequest(http.MethodGet, "/admin/blocked-repos", nil)
+	r = r.WithContext(mw.ContextWithUser(r.Context(), admin))
+	w := httptest.NewRecorder()
+	f.h.AdminListBlockedRepos(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("admin GET status = %d, want 200 (body %s)", w.Code, w.Body.String())
+	}
+	var resp apitypes.AdminBlockedReposDTO
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v (body %s)", err, w.Body.String())
+	}
+	// Requests must be a non-nil slice ([], never null) — the non-omitempty contract.
+	if resp.Requests == nil {
+		t.Fatalf("requests must never be null; want [] or a populated list")
+	}
+
+	var got *apitypes.GuardrailOverrideRequestDTO
+	for i := range resp.Requests {
+		if resp.Requests[i].ID == reqID.String() {
+			got = &resp.Requests[i]
+			break
+		}
+	}
+	if got == nil {
+		t.Fatalf("the pending request %s must appear in the admin queue; got %+v", reqID, resp.Requests)
+	}
+	if got.RepoID != repo.String() {
+		t.Errorf("request repo_id = %q, want %q", got.RepoID, repo.String())
+	}
+	if got.RepoPath != "g/needs-override" {
+		t.Errorf("request repo_path = %q, want %q", got.RepoPath, "g/needs-override")
+	}
+	if got.OwnerEmail != f.owner.Email {
+		t.Errorf("request owner_email = %q, want %q", got.OwnerEmail, f.owner.Email)
+	}
+	if got.OwnerID != f.owner.ID.String() {
+		t.Errorf("request owner_id = %q, want %q", got.OwnerID, f.owner.ID.String())
+	}
+	if got.Reason != reason {
+		t.Errorf("request reason = %q, want %q", got.Reason, reason)
+	}
+	if got.Status != "pending" {
+		t.Errorf("request status = %q, want pending", got.Status)
+	}
+	if !hasFindingCode(got.Findings, "default_branch_unprotected") {
+		t.Errorf("request findings = %+v, want a default_branch_unprotected code", got.Findings)
+	}
+}
