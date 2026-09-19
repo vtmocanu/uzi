@@ -29,9 +29,18 @@ if [ "${1:-}" = api ]; then
         *) echo '[]' ;;
       esac ;;
     *'/issues/42/comments'*) echo '[]' ;;
+    *'/pulls/42/commits'*)
+      [ "$MODE" = prior_unreadable ] && exit 1
+      echo '[{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},{"sha":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"}]' ;;
+    *'/commits/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/check-runs'*)
+      case "$MODE" in
+        prior_clean) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"90 files reviewed, 0 comments added"}}]}' ;;
+        *) echo '{"check_runs":[{"app":{"slug":"github-actions"},"name":"CI","status":"completed","conclusion":"success","output":{"summary":""}}]}' ;;
+      esac ;;
     *'/commits/deadbeefdeadbeefdeadbeefdeadbeefdeadbeef/status'*) echo '' ;;
     *'/commits/deadbeefdeadbeefdeadbeefdeadbeefdeadbeef/check-runs'*)
       case "$MODE" in
+        prior_*) echo '{"check_runs":[]}' ;;
         race) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"Greptile has reviewed the Pull Request.\n\n90 files reviewed, 1 comments added"}}]}' ;;
         in_progress) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"in_progress","conclusion":null,"output":{"summary":""}}]}' ;;
         *) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"Greptile has reviewed the Pull Request.\n\n90 files reviewed, 0 comments added"}}]}' ;;
@@ -82,4 +91,36 @@ PATH="$WORK/bin:$PATH" bash "$SCRIPT" test/repo 42 > "$WORK/cr-resolved.out" 2>&
   || fail "resolved CR thread did not satisfy the gate: $(cat "$WORK/cr-resolved.out")"
 if grep -q '^  CR  ' "$WORK/cr-resolved.out"; then fail "resolved CR thread was printed live"; fi
 
-echo "PASS pr-findings: settled, resolved current-head scope"
+# A push Greptile never reviewed re-anchors its older comments onto the new head. A comment
+# a LATER clean Greptile pass superseded must not be listed as live again (PR #1449), and the
+# head must STILL read unreviewed: an earlier verdict scopes findings, never the gate.
+MODE="prior_clean"; export MODE
+set +e
+PATH="$WORK/bin:$PATH" bash "$SCRIPT" test/repo 42 > "$WORK/prior-clean.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 3 ] || fail "an earlier Greptile verdict cleared the exact-head gate, rc=$rc: $(cat "$WORK/prior-clean.out")"
+grep -q 'NOT REVIEWED on head by any bot' "$WORK/prior-clean.out" || fail "unreviewed head was not reported: $(cat "$WORK/prior-clean.out")"
+grep -q 'Greptile: last verdict on bbbbbbbb — 0 comments added' "$WORK/prior-clean.out" || fail "earlier clean verdict was not shown: $(cat "$WORK/prior-clean.out")"
+if grep -q '^  GR  ' "$WORK/prior-clean.out"; then fail "superseded Greptile comment was listed as live: $(cat "$WORK/prior-clean.out")"; fi
+
+# No earlier verdict: nothing superseded the comment, so it is still listed.
+MODE="prior_none"; export MODE
+set +e
+PATH="$WORK/bin:$PATH" bash "$SCRIPT" test/repo 42 > "$WORK/prior-none.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 3 ] || fail "unreviewed head exited rc=$rc, want 3: $(cat "$WORK/prior-none.out")"
+grep -q '^  GR  old.go:8' "$WORK/prior-none.out" || fail "an unsuperseded Greptile comment was dropped: $(cat "$WORK/prior-none.out")"
+
+# An unreadable history is never "clean": it is surfaced and the comment stays listed.
+MODE="prior_unreadable"; export MODE
+set +e
+PATH="$WORK/bin:$PATH" bash "$SCRIPT" test/repo 42 > "$WORK/prior-unreadable.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 3 ] || fail "unreadable Greptile history exited rc=$rc, want 3: $(cat "$WORK/prior-unreadable.out")"
+grep -q "earlier verdict UNREADABLE" "$WORK/prior-unreadable.out" || fail "unreadable Greptile history was not surfaced: $(cat "$WORK/prior-unreadable.out")"
+grep -q '^  GR  old.go:8' "$WORK/prior-unreadable.out" || fail "comment hidden on an unreadable history: $(cat "$WORK/prior-unreadable.out")"
+
+echo "PASS pr-findings: settled, resolved current-head scope, earlier-verdict Greptile scope"

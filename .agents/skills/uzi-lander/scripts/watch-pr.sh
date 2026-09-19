@@ -58,6 +58,8 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/review-threads.sh
 . "$HERE/lib/review-threads.sh"
+# shellcheck source=lib/greptile-verdict.sh
+. "$HERE/lib/greptile-verdict.sh"
 
 usage() { echo "usage: watch-pr.sh OWNER/REPO PR [interval_secs] [max_polls] [--reviewer any|coderabbit|greptile|none] [--reviewer-grace MIN]" >&2; exit 2; }
 
@@ -333,9 +335,30 @@ while [ "$i" -lt "$MAX" ]; do
       unknown=1
     fi
   fi
+  # No Greptile review on THIS head, yet Greptile comments are still anchored. A push
+  # re-anchors every older comment, so scope them to Greptile's newest EARLIER verdict
+  # rather than re-counting a finding a later pass already superseded. Liveness only:
+  # gr_reviewed stays the exact-head answer, so this never satisfies the reviewer gate.
+  gr_prior=""
+  if [ "$gr_reviewed" -eq 0 ] && [ -z "$gr_review_id" ] && [ "$gr_state" != "in_progress" ] && [ "$gr_state" != "queued" ] && [ "$gr_live" -gt 0 ]; then
+    if greptile_prior_verdict "$REPO" "$PR" "$head"; then
+      if [ -n "$GRV_SHA" ]; then
+        gr_prior="${GRV_SHA:0:8}/${GRV_ADDED}"
+        if [ "$GRV_ADDED" = "0" ]; then
+          gr_live=0
+        else
+          gr_live=$(printf '%s' "$pull_c" | jq -rs --argjson rid "$GRV_REVIEW_ID" \
+            '[.[][]|select(.user.login=="greptile-apps[bot]" and .pull_request_review_id==$rid and .line!=null)]|length' 2>/dev/null) || unknown=1
+        fi
+      fi
+    else
+      unknown=1
+    fi
+  fi
   [ "$gr_state" = "completed" ] && [ "$gr_reviewed" -eq 0 ] && gr_state="completed(${gr_concl:-no-conclusion}, no summary)"
-  # An unconfirmed CodeRabbit review counts as live; Greptile is now scoped to its latest
-  # current-head review (or cleared by an explicit clean zero-comment summary).
+  # An unconfirmed CodeRabbit review counts as live; Greptile is scoped to its current-head
+  # review, cleared by an explicit clean zero-comment summary, or, with no review on this
+  # head, scoped to its newest earlier verdict (gr_prior above).
   live=$((cr_live + gr_live + cr_unconfirmed))
 
   # Signal (d): "equivalent head" — a logic-free merge commit CodeRabbit did not re-review
@@ -402,6 +425,7 @@ while [ "$i" -lt "$MAX" ]; do
   eqnote=""; grnote=""
   [ "$equiv" -eq 1 ] && eqnote=" equiv=1"
   [ "$gr_reviewed" -eq 1 ] && grnote=" gr_scope=$gr_scoped_total/${gr_added:-?}"
+  [ -n "$gr_prior" ] && grnote=" gr_prior=$gr_prior"
   echo "try $i: head=${head:0:8} req_fail=$fail req_pend=$pend req_cancel=$cancel mrw_active=$mrw_active cr_reviewed=$cr_reviewed${eqnote} cr_status='${cr_desc:-absent}' cr_full_required=$cr_full_required greptile=$gr_state${gr_summary:+ ($gr_summary)}${grnote} live=$live (cr=$cr_live gr=$gr_live cr_unconfirmed=$cr_unconfirmed)${unknown:+ unknown=$unknown}"
 
   # A failed lookup this iteration: defer, do not decide on masked values.

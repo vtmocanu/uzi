@@ -54,6 +54,8 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/review-threads.sh
 . "$HERE/lib/review-threads.sh"
+# shellcheck source=lib/greptile-verdict.sh
+. "$HERE/lib/greptile-verdict.sh"
 
 cr_only=0
 if [ "${1:-}" = "--cr-only" ]; then cr_only=1; shift; fi
@@ -216,6 +218,24 @@ for n in "$@"; do
       | "  CR  \($c.path):\($c.line // $c.originalLine // "-")  [\($sev)] \($t|gsub("\\*";""))"' 2>/dev/null \
     || { echo "  🔴 could not render CodeRabbit review threads — NOT confirmed clean"; unconfirmed="${unconfirmed} #${n}"; }
   gr_clean=0; [ "$gr_ok" -eq 1 ] && [ "$gr_added" = "0" ] && gr_clean=1
+  # No Greptile review on THIS head, yet Greptile comments are still anchored. A push
+  # re-anchors every older comment, so scope them to Greptile's newest EARLIER verdict
+  # rather than re-listing a finding a later pass already superseded. Liveness only: the
+  # gate above already recorded this head as unreviewed, and that stands.
+  if [ "$gr_ok" -eq 0 ] && [ -z "$gr_review_id" ] && [ -n "$head" ]; then
+    gr_anchored=$(printf '%s' "$inline_raw" | jq '[.[]|select(.user.login=="greptile-apps[bot]" and .line!=null)]|length' 2>/dev/null || echo 0)
+    if [ "$gr_anchored" -gt 0 ]; then
+      if greptile_prior_verdict "$repo" "$n" "$head"; then
+        if [ -n "$GRV_SHA" ]; then
+          echo "  Greptile: last verdict on ${GRV_SHA:0:8} — ${GRV_ADDED} comments added; comments from older passes are superseded (this head is still unreviewed)"
+          if [ "$GRV_ADDED" = "0" ]; then gr_clean=1; else gr_review_id="$GRV_REVIEW_ID"; fi
+        fi
+      else
+        echo "  🔴 Greptile's earlier verdict UNREADABLE — older comments cannot be scoped; NOT confirmed clean"
+        unconfirmed="${unconfirmed} #${n}"
+      fi
+    fi
+  fi
   # shellcheck disable=SC2016
   printf '%s' "$inline_raw" | jq -r --argjson grclean "$gr_clean" --arg grid "$gr_review_id" '.[]
       | select(.user.login=="greptile-apps[bot]" and .line!=null)

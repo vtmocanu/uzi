@@ -30,6 +30,8 @@
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/greptile-verdict.sh
+. "$HERE/lib/greptile-verdict.sh"
 TARGET=""; REPO=""; CLAIM=1
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -172,6 +174,29 @@ pull_c=$(gh api --paginate "repos/$REPO/pulls/$PR/comments" 2>/dev/null | jq -s 
 arr_or_unknown "$pull_c"; printf '%s' "$pull_c" | jq -e 'type=="array"' >/dev/null 2>&1 || pull_c='[]'
 cr_live=$(printf '%s' "$pull_c" | jq '[.[]|select(.user.login=="coderabbitai[bot]" and .line!=null and ((.body|contains("Addressed in commit"))|not))]|length' 2>/dev/null || echo 0)
 gr_live=$(printf '%s' "$pull_c" | jq '[.[]|select(.user.login=="greptile-apps[bot]" and .line!=null)]|length' 2>/dev/null || echo 0)
+# Every push re-anchors Greptile's older comments onto the new head, so the raw anchored
+# count above over-reports. An explicit clean pass on THIS head clears them; with no review
+# on this head, scope them to Greptile's newest EARLIER verdict (lib/greptile-verdict.sh).
+# A current-head pass that added comments keeps the raw count: a superset, never an
+# under-report. Liveness only; GREPTILE_REVIEWED_HEAD above stays the exact-head answer.
+if [ "$gr_live" -gt 0 ]; then
+  if [ "$gr_reviewed" -eq 1 ]; then
+    case "$gr_sum" in *', 0 comments added') gr_live=0;; esac
+  elif [ "$gr_state" != "in_progress" ] && [ "$gr_state" != "queued" ]; then
+    if greptile_prior_verdict "$REPO" "$PR" "$head"; then
+      if [ -n "$GRV_SHA" ]; then
+        echo "GREPTILE_PRIOR_VERDICT=${GRV_SHA:0:8}/${GRV_ADDED}"
+        if [ "$GRV_ADDED" = "0" ]; then
+          gr_live=0
+        else
+          gr_live=$(printf '%s' "$pull_c" | jq --argjson rid "$GRV_REVIEW_ID" '[.[]|select(.user.login=="greptile-apps[bot]" and .pull_request_review_id==$rid and .line!=null)]|length' 2>/dev/null || echo "$gr_live")
+        fi
+      fi
+    else
+      UNKNOWN=1; echo "GREPTILE_PRIOR_VERDICT=unreadable"
+    fi
+  fi
+fi
 live=$((cr_live + gr_live + cr_unconfirmed))
 echo "LIVE_FINDINGS=$live (cr=$cr_live gr=$gr_live cr_unconfirmed=$cr_unconfirmed)"
 
