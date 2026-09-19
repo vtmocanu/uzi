@@ -188,6 +188,9 @@ if [ "${FAKE_CHILD_BLOCK:-0}" = "1" ]; then
   # otherwise the caller can signal after seeing the PID but before the traps exist.
   trap 'printf "TERM\n" >> "$FAKE_SIGNAL_LOG"; exit 143' TERM
   trap 'printf "INT\n" >> "$FAKE_SIGNAL_LOG"; exit 130' INT
+  if [ "${FAKE_CHILD_READY_DELAY:-0}" != "0" ]; then
+    sleep "$FAKE_CHILD_READY_DELAY"
+  fi
   printf '%s\n' "$$" > "$FAKE_CHILD_PID_FILE"
   while :; do sleep 1; done
 fi
@@ -236,6 +239,7 @@ MKTEMP_LOG="$TMP/mktemp.log"
 CHILD_PID_FILE="$TMP/child.pid"
 WRAPPER_PID_FILE="$TMP/wrapper.pid"
 SIGNAL_LOG="$TMP/signals.log"
+READINESS_MAX_TRIES=500 # 10s at the 20ms polling interval, bounded but tolerant of loaded CI.
 mkdir -p "$WRAPPER_TMP_ROOT"
 : > "$DOWNLOAD_LOG"
 : > "$EXEC_LOG"
@@ -361,6 +365,7 @@ start_blocking_wrapper() {
       FAKE_AMBIENT_GO=1.26.6 \
       FAKE_CHILD_STATUS=0 \
       FAKE_CHILD_BLOCK=1 \
+      FAKE_CHILD_READY_DELAY="${FAKE_CHILD_READY_DELAY:-0}" \
       FAKE_CHILD_PID_FILE="$CHILD_PID_FILE" \
       FAKE_SIGNAL_LOG="$SIGNAL_LOG" \
       FAKE_EXEC_LOG="$EXEC_LOG" \
@@ -493,12 +498,26 @@ assert_signal_forwarded() {
   : > "$CHILD_PID_FILE"
   : > "$WRAPPER_PID_FILE"
   : > "$SIGNAL_LOG"
+  FAKE_CHILD_READY_DELAY=0
+  if [ "$cancel_signal" = "INT" ]; then
+    # Prove the readiness wait survives the 2-second cap that failed on loaded CI.
+    FAKE_CHILD_READY_DELAY=4
+  fi
   start_blocking_wrapper "$cancel_output" "$CANCEL_CACHE"
   CANCEL_LAUNCHER_PID="$START_PID"
   tries=0
   while [ ! -s "$CHILD_PID_FILE" ] || [ ! -s "$WRAPPER_PID_FILE" ]; do
     tries=$((tries + 1))
-    [ "$tries" -le 100 ] || fail "blocking child did not start for $cancel_signal"
+    if [ "$tries" -gt "$READINESS_MAX_TRIES" ]; then
+      echo "startup timeout: wrapper_pid=$(cat "$WRAPPER_PID_FILE" 2>/dev/null || printf missing) child_pid=$(cat "$CHILD_PID_FILE" 2>/dev/null || printf missing) launcher_pid=${CANCEL_LAUNCHER_PID:-missing}" >&2
+      if [ -n "${CANCEL_LAUNCHER_PID:-}" ] && kill -0 "$CANCEL_LAUNCHER_PID" 2>/dev/null; then
+        echo "startup timeout: launcher=alive" >&2
+      else
+        echo "startup timeout: launcher=exited" >&2
+      fi
+      if [ -s "$cancel_output" ]; then cat "$cancel_output" >&2; else echo "startup timeout: output empty" >&2; fi
+      fail "blocking child did not start for $cancel_signal"
+    fi
     sleep 0.02
   done
   CANCEL_WRAPPER_PID="$(cat "$WRAPPER_PID_FILE")"
@@ -549,7 +568,16 @@ CANCEL_LAUNCHER_PID="$START_PID"
 tries=0
 while [ ! -s "$CHILD_PID_FILE" ] || [ ! -s "$WRAPPER_PID_FILE" ] || [ ! -s "$MKTEMP_LOG" ]; do
   tries=$((tries + 1))
-  [ "$tries" -le 100 ] || fail "process-group cancellation child did not start"
+  if [ "$tries" -gt "$READINESS_MAX_TRIES" ]; then
+    echo "startup timeout: wrapper_pid=$(cat "$WRAPPER_PID_FILE" 2>/dev/null || printf missing) child_pid=$(cat "$CHILD_PID_FILE" 2>/dev/null || printf missing) mktemp=$(awk 'END { print }' "$MKTEMP_LOG" 2>/dev/null || printf missing) launcher_pid=${CANCEL_LAUNCHER_PID:-missing}" >&2
+    if [ -n "${CANCEL_LAUNCHER_PID:-}" ] && kill -0 "$CANCEL_LAUNCHER_PID" 2>/dev/null; then
+      echo "startup timeout: launcher=alive" >&2
+    else
+      echo "startup timeout: launcher=exited" >&2
+    fi
+    if [ -s "$TMP/cancel-group.out" ]; then cat "$TMP/cancel-group.out" >&2; else echo "startup timeout: output empty" >&2; fi
+    fail "process-group cancellation child did not start"
+  fi
   sleep 0.02
 done
 CANCEL_WRAPPER_PID="$(cat "$WRAPPER_PID_FILE")"
