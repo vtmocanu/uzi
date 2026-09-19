@@ -278,9 +278,10 @@ describe("PRD #1224 M5: per-milestone agent attribution (web)", () => {
 });
 
 describe("PRD #1353 M4: per-milestone LIVE LANES (web)", () => {
-  // multi-lane: an in-progress milestone with a declared owner AND two live lanes (reviewer +
-  // tester). Both lanes render as distinct live lines with their tool + age token; the declared
-  // owner renders as a QUIET "assigned to" line (its role + label, no age token).
+  // IDLE owner + live lanes: an in-progress milestone whose declared owner (coder) is NOT among
+  // its lanes (reviewer + tester) — the "assigned to X, but Y/Z are working it" case. Both
+  // lanes render as distinct live lines with their tool + age token; the declared owner renders as
+  // a QUIET "assigned to" line (its role + label, no age token) because it is not itself a lane.
   it("renders a live line per lane plus a quiet declared owner", () => {
     render(
       <MilestoneChecklist
@@ -317,6 +318,55 @@ describe("PRD #1353 M4: per-milestone LIVE LANES (web)", () => {
     expect(within(betaRow).getByText("Bash go test")).toBeTruthy();
 
     // Exactly two live age tokens \u2014 one per lane; the quiet owner shows none.
+    expect(within(betaRow).getAllByText("40s ago")).toHaveLength(2);
+  });
+
+  // common-case dedup (tui-ux): the declared owner is ALSO one of the live lanes \u2014 the dispatched
+  // owner (coder) is the one actually working. Pre-fix the quiet "assigned to" owner strip
+  // DUPLICATED the owner's live lane strip (same role + label, once quiet + once live). The owner
+  // must now appear ONCE, as its live lane line; the quiet owner strip is suppressed.
+  it("shows the owner once (its live lane) when the owner is also a lane", () => {
+    render(
+      <MilestoneChecklist
+        run={run({
+          milestones,
+          milestones_completed: ["m1"],
+          milestones_in_progress: ["m2"],
+          milestones_agents: [agent("m2", "coder", "Owner label")],
+          milestones_live: [
+            {
+              milestone_id: "m2",
+              lanes: [
+                lane({ agent: "coder", agent_instance: "coder-1", agent_label: "Coding", tool: "Edit", detail: "x.ts" }),
+                lane({ agent: "reviewer", agent_instance: "rev-1", agent_label: "Reviewing", tool: "Read", detail: "a.ts" }),
+              ],
+            },
+          ],
+        })}
+        // activity is IGNORED in the live-lanes path.
+        activity={anActivity({ agent: "coder" })}
+      />,
+    );
+
+    const betaRow = screen.getByText("Beta").closest("li") as HTMLElement;
+
+    // The owner (coder) is drawn ONCE \u2014 only its live lane line, not a separate quiet owner strip.
+    expect(within(betaRow).getAllByText("coder")).toHaveLength(1);
+    // The declared owner's own label never renders (its quiet strip is suppressed); the coder lane
+    // carries its OWN lane label instead.
+    expect(within(betaRow).queryByText("Owner label")).toBeNull();
+    expect(within(betaRow).getByText("Coding")).toBeTruthy();
+    // Both lanes render as live lines with their own tool.
+    expect(within(betaRow).getByText("reviewer")).toBeTruthy();
+    expect(within(betaRow).getByText("Edit x.ts")).toBeTruthy();
+    expect(within(betaRow).getByText("Read a.ts")).toBeTruthy();
+
+    // Two strip dots (the two lanes), BOTH pulsing \u2014 no third quiet owner dot.
+    const dots = betaRow.querySelectorAll("span.rounded-full");
+    expect(dots).toHaveLength(2);
+    expect(dots[0].classList.contains("animate-pulse")).toBe(true);
+    expect(dots[1].classList.contains("animate-pulse")).toBe(true);
+    // Exactly two live age tokens (one per lane); the suppressed owner shows none.
     expect(within(betaRow).getAllByText("40s ago")).toHaveLength(2);
   });
 

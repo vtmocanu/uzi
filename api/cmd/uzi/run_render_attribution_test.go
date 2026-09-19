@@ -239,36 +239,48 @@ func TestRenderRunDetailNonOwnerLiveAgentShowsGlobalNow(t *testing.T) {
 // `NOW <id>` row per LANE, and the M1 global/unattached now-line is NOT emitted. The lanes' At is
 // future-dated so relAge floors the age to "0s ago" deterministically.
 
-// TestMilestoneLaneRowsLivesSupersedeM1 pins the lanes branch: m2 has a declared owner AND two
-// reviewer lanes (repeated role, distinguished by label/detail) → one `OWNER m2` + two `NOW m2`
-// rows; m3 has a lane but NO declared owner → just a `NOW m3` row (no `OWNER m3`). current_activity
-// is set (a coder that would uniquely match m2 under M1), but in the lanes branch it is suppressed —
-// its distinctive detail must NOT appear, and no global `NOW` row is emitted.
+// TestMilestoneLaneRowsLivesSupersedeM1 pins the lanes branch AND the owner-line dedup fix. Three
+// in-progress milestones exercise every owner shape:
+//
+//   - m2 has a declared owner "coder" that IS one of its live lanes (owner-is-live, the common case)
+//     plus a second reviewer lane. The quiet `OWNER m2` row is SUPPRESSED — the `NOW m2` coder lane
+//     row already carries the owner live, so an OWNER row would only duplicate it — leaving two
+//     `NOW m2` rows.
+//   - m3 has an IDLE declared owner "architect" (its agent is not among m3's lanes), so the quiet
+//     `OWNER m3` "assigned to" row is kept above the `NOW m3` lane row.
+//   - m4 has a lane but NO declared owner — just a `NOW m4` row (no `OWNER m4`).
+//
+// current_activity is set (a coder that would uniquely match m2 under M1), but in the lanes branch it
+// is suppressed — its distinctive detail must NOT appear, and no global `NOW` row is emitted.
 func TestMilestoneLaneRowsLivesSupersedeM1(t *testing.T) {
 	at := time.Now().Add(2 * time.Hour) // relAge floors a not-yet timestamp to "0s"
 	r := apitypes.RunDTO{
 		ID: "run-1353-cli-lanes", Kind: "issue", Status: "running", IssueTitle: "Add rate limiting",
 		Milestones: []apitypes.Milestone{
-			{ID: "m1", Title: "Alpha"}, {ID: "m2", Title: "Beta"}, {ID: "m3", Title: "Gamma"},
+			{ID: "m1", Title: "Alpha"}, {ID: "m2", Title: "Beta"}, {ID: "m3", Title: "Gamma"}, {ID: "m4", Title: "Delta"},
 		},
 		MilestonesCompleted:  []string{"m1"},
-		MilestonesInProgress: []string{"m2", "m3"},
-		// m2 has a declared owner; m3 does NOT — proving the OWNER row is per-owner while the NOW
-		// rows are per-lane.
+		MilestonesInProgress: []string{"m2", "m3", "m4"},
+		// m2's owner is live (coder is a lane); m3's owner is idle (architect is not a lane); m4 has no
+		// owner — the three shapes the OWNER row must distinguish.
 		MilestonesAgents: []apitypes.MilestoneAgent{
 			{ID: "m2", Agent: "coder", AgentLabel: "Wire the limiter"},
+			{ID: "m3", Agent: "architect", AgentLabel: "Design the API"},
 		},
 		MilestonesLive: []apitypes.MilestoneLive{
 			{MilestoneID: "m2", Lanes: []apitypes.MilestoneLane{
-				{Agent: "reviewer", AgentInstance: "toolu_a", AgentLabel: "Review A", Tool: "Read", Detail: "a.go", At: at},
-				{Agent: "reviewer", AgentInstance: "toolu_b", AgentLabel: "Review B", Tool: "Read", Detail: "b.go", At: at},
+				{Agent: "coder", AgentInstance: "toolu_a", AgentLabel: "Wire the limiter", Tool: "Edit", Detail: "window.go", At: at},
+				{Agent: "reviewer", AgentInstance: "toolu_b", AgentLabel: "Review A", Tool: "Read", Detail: "a.go", At: at},
 			}},
 			{MilestoneID: "m3", Lanes: []apitypes.MilestoneLane{
 				{Agent: "tester", AgentInstance: "toolu_c", AgentLabel: "Sweep", Tool: "Bash", Detail: "run tests", At: at},
 			}},
+			{MilestoneID: "m4", Lanes: []apitypes.MilestoneLane{
+				{Agent: "reviewer", AgentInstance: "toolu_d", AgentLabel: "Audit", Tool: "Read", Detail: "c.go", At: at},
+			}},
 		},
 		// A live current_activity that WOULD ride a global/M1 NOW row (its detail is the unique marker
-		// "window.go") — the lanes branch must suppress it entirely.
+		// "api/internal/limits/window.go") — the lanes branch must suppress it entirely.
 		CurrentActivity: &apitypes.RunActivity{
 			Agent: "coder", AgentLabel: "coder busy", Tool: "Edit",
 			Detail: "api/internal/limits/window.go", At: at, Seq: 12,
@@ -277,10 +289,14 @@ func TestMilestoneLaneRowsLivesSupersedeM1(t *testing.T) {
 
 	got := milestoneLaneRows(r)
 	want := [][]string{
-		{"OWNER m2", "coder · Wire the limiter"},
+		// m2: owner coder is live → NO OWNER m2 row, just the two lane rows.
+		{"NOW m2", "coder · Wire the limiter · Edit window.go · 0s ago"},
 		{"NOW m2", "reviewer · Review A · Read a.go · 0s ago"},
-		{"NOW m2", "reviewer · Review B · Read b.go · 0s ago"},
+		// m3: owner architect is idle → quiet OWNER m3 row kept above the lane row.
+		{"OWNER m3", "architect · Design the API"},
 		{"NOW m3", "tester · Sweep · Bash run tests · 0s ago"},
+		// m4: no declared owner → lane row only.
+		{"NOW m4", "reviewer · Audit · Read c.go · 0s ago"},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("PRD #1353 M5 milestoneLaneRows drifted.\n--- got ---\n%#v\n--- want ---\n%#v", got, want)
@@ -292,27 +308,32 @@ func TestMilestoneLaneRowsLivesSupersedeM1(t *testing.T) {
 		t.Fatalf("renderRunDetail: %v", err)
 	}
 	out := buf.String()
-	// Three `NOW <id>` rows (two lanes on m2, one on m3), and NO global `NOW` row (its distinctive
-	// current_activity detail must be absent — lanes supersede it).
-	if n := countNowRows(out); n != 3 {
-		t.Errorf("PRD #1353 M5: a run with lanes must emit one NOW row per lane (3 here), got %d:\n%s", n, out)
+	// Four `NOW <id>` rows (two lanes on m2, one each on m3/m4), and NO global `NOW` row (its
+	// distinctive current_activity detail must be absent — lanes supersede it).
+	if n := countNowRows(out); n != 4 {
+		t.Errorf("PRD #1353 M5: a run with lanes must emit one NOW row per lane (4 here), got %d:\n%s", n, out)
 	}
 	for _, sub := range []string{
-		"OWNER m2",
-		"coder · Wire the limiter",
 		"NOW m2",
+		"coder · Wire the limiter · Edit window.go · 0s ago",
 		"reviewer · Review A · Read a.go · 0s ago",
-		"reviewer · Review B · Read b.go · 0s ago",
+		"OWNER m3",
+		"architect · Design the API",
 		"NOW m3",
 		"tester · Sweep · Bash run tests · 0s ago",
+		"NOW m4",
+		"reviewer · Audit · Read c.go · 0s ago",
 	} {
 		if !strings.Contains(out, sub) {
 			t.Errorf("PRD #1353 M5: lanes `run get` output missing %q:\n%s", sub, out)
 		}
 	}
-	// m3 has a lane but no declared owner — no `OWNER m3` row.
-	if strings.Contains(out, "OWNER m3") {
-		t.Errorf("PRD #1353 M5: a milestone with lanes but no declared owner must not emit an OWNER row:\n%s", out)
+	// The owner-line dedup fix: m2's owner is live (a lane), so no quiet `OWNER m2` row duplicates it;
+	// m4 has no declared owner, so no `OWNER m4` row either.
+	for _, gone := range []string{"OWNER m2", "OWNER m4"} {
+		if strings.Contains(out, gone) {
+			t.Errorf("PRD #1353 owner-dedup: %q must not appear (owner is live, or no owner declared):\n%s", gone, out)
+		}
 	}
 	// The M1 current_activity display is superseded: its unique detail and its own label must not appear.
 	for _, gone := range []string{"api/internal/limits/window.go", "coder busy"} {
@@ -320,6 +341,105 @@ func TestMilestoneLaneRowsLivesSupersedeM1(t *testing.T) {
 			t.Errorf("PRD #1353 M5: the lanes branch must suppress the M1 current_activity display, but %q appeared:\n%s", gone, out)
 		}
 	}
+}
+
+// TestMilestonesLiveIndex covers milestonesLiveIndex's exclusion/dedup branches directly (Finding 2):
+// the happy path only ever hits the inclusion branch, so a regression in an exclusion — most sharply
+// the empty-lanes skip, which would silently suppress a now-line if it dropped a real entry — would go
+// unnoticed. Each case builds a RunDTO and asserts the returned map's keys and length.
+func TestMilestonesLiveIndex(t *testing.T) {
+	at := time.Now()
+	lane := func(detail string) apitypes.MilestoneLane {
+		return apitypes.MilestoneLane{Agent: "coder", Tool: "Edit", Detail: detail, At: at}
+	}
+	cases := []struct {
+		name     string
+		run      apitypes.RunDTO
+		wantKeys []string
+	}{
+		{
+			name: "genuine in-progress id with lanes is included",
+			run: apitypes.RunDTO{
+				Milestones:           []apitypes.Milestone{{ID: "m1", Title: "Alpha"}},
+				MilestonesInProgress: []string{"m1"},
+				MilestonesLive:       []apitypes.MilestoneLive{{MilestoneID: "m1", Lanes: []apitypes.MilestoneLane{lane("a.go")}}},
+			},
+			wantKeys: []string{"m1"},
+		},
+		{
+			name: "completed id with lanes is excluded",
+			run: apitypes.RunDTO{
+				Milestones:           []apitypes.Milestone{{ID: "m1", Title: "Alpha"}},
+				MilestonesInProgress: []string{"m1"},
+				MilestonesCompleted:  []string{"m1"},
+				MilestonesLive:       []apitypes.MilestoneLive{{MilestoneID: "m1", Lanes: []apitypes.MilestoneLane{lane("a.go")}}},
+			},
+			wantKeys: nil,
+		},
+		{
+			name: "non-frozen id is excluded",
+			run: apitypes.RunDTO{
+				Milestones:           []apitypes.Milestone{{ID: "m1", Title: "Alpha"}},
+				MilestonesInProgress: []string{"m1", "ghost"},
+				MilestonesLive:       []apitypes.MilestoneLive{{MilestoneID: "ghost", Lanes: []apitypes.MilestoneLane{lane("a.go")}}},
+			},
+			wantKeys: nil,
+		},
+		{
+			name: "non-in-progress id is excluded",
+			run: apitypes.RunDTO{
+				Milestones:           []apitypes.Milestone{{ID: "m1", Title: "Alpha"}, {ID: "m2", Title: "Beta"}},
+				MilestonesInProgress: []string{"m1"},
+				MilestonesLive:       []apitypes.MilestoneLive{{MilestoneID: "m2", Lanes: []apitypes.MilestoneLane{lane("a.go")}}},
+			},
+			wantKeys: nil,
+		},
+		{
+			name: "entry with empty lanes is skipped while a real sibling survives",
+			run: apitypes.RunDTO{
+				Milestones:           []apitypes.Milestone{{ID: "m1", Title: "Alpha"}, {ID: "m2", Title: "Beta"}},
+				MilestonesInProgress: []string{"m1", "m2"},
+				MilestonesLive: []apitypes.MilestoneLive{
+					{MilestoneID: "m1", Lanes: nil}, // the unique empty-lanes skip — must not suppress the sibling
+					{MilestoneID: "m2", Lanes: []apitypes.MilestoneLane{lane("b.go")}},
+				},
+			},
+			wantKeys: []string{"m2"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := milestonesLiveIndex(tc.run)
+			if len(got) != len(tc.wantKeys) {
+				t.Fatalf("milestonesLiveIndex len = %d, want %d\n%#v", len(got), len(tc.wantKeys), got)
+			}
+			for _, k := range tc.wantKeys {
+				if _, ok := got[k]; !ok {
+					t.Errorf("milestonesLiveIndex missing key %q\n%#v", k, got)
+				}
+			}
+		})
+	}
+
+	// First-occurrence-wins on a duplicated milestone id (mirrors the server's first-valid-wins): the
+	// SECOND {m1, …} entry is dropped, so out["m1"] carries the FIRST entry's lanes.
+	t.Run("first occurrence wins on duplicate id", func(t *testing.T) {
+		run := apitypes.RunDTO{
+			Milestones:           []apitypes.Milestone{{ID: "m1", Title: "Alpha"}},
+			MilestonesInProgress: []string{"m1"},
+			MilestonesLive: []apitypes.MilestoneLive{
+				{MilestoneID: "m1", Lanes: []apitypes.MilestoneLane{lane("first")}},
+				{MilestoneID: "m1", Lanes: []apitypes.MilestoneLane{lane("second")}},
+			},
+		}
+		got := milestonesLiveIndex(run)
+		if len(got) != 1 {
+			t.Fatalf("milestonesLiveIndex len = %d, want 1\n%#v", len(got), got)
+		}
+		if lanes := got["m1"]; len(lanes) != 1 || lanes[0].Detail != "first" {
+			t.Errorf("first-occurrence-wins violated: out[\"m1\"] = %#v, want the FIRST entry's lane (Detail \"first\")", lanes)
+		}
+	})
 }
 
 // TestMilestoneLaneRowsBackCompatNilLive is the D5 back-compat pin: with MilestonesLive nil,

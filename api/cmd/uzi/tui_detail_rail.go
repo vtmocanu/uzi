@@ -700,7 +700,11 @@ func (m tuiModel) renderMilestones() string {
 			// (which fold each through renderer.Plain) as plumbing, not a raw draw — the same shape the
 			// attribution branch below and the laneFrame converters use; the hostile-render test is the
 			// standing proof the fold holds (the D7 AST guard cannot see through the indirection, gap D).
-			if e, ok := effAgents[mi.ID]; ok {
+			// Draw the quiet declared-owner line ONLY when the owner is IDLE — its declared agent is
+			// not among this milestone's live lanes. When the owner IS live (the common case: it is
+			// one of the lanes) the lane line below already shows it, so the quiet line would only
+			// duplicate that lane; laneHasAgent (shared with the CLI) is the dedup predicate.
+			if e, ok := effAgents[mi.ID]; ok && !laneHasAgent(laneIdx[mi.ID], e.Agent) {
 				role, label := e.Agent, e.AgentLabel
 				sb.WriteString(m.railMilestoneAgentLines(role, label, "", "   ", "     "))
 			}

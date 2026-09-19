@@ -558,6 +558,14 @@ export function MilestoneChecklist({ run, activity = null }: { run: Run; activit
         {milestones.map((m) => {
           const state = completed.has(m.id) ? "done" : inProgress.has(m.id) ? "in_progress" : "left";
           const attribution = effectiveById.get(m.id);
+          // PRD #1353 M4 (tui-ux dedup): this milestone's live lanes, and whether the DECLARED
+          // owner is itself one of them (the common case — the dispatched owner is the one
+          // working). When it is, the quiet owner strip would DUPLICATE the owner's live lane
+          // strip (same role + label, once quiet + once live), so it is suppressed and the lane
+          // strip carries it. An IDLE owner (agent not among the lanes) still gets its quiet
+          // "assigned to" strip above the lanes.
+          const laneList = milestonesLiveById.get(m.id) ?? [];
+          const ownerIsLive = attribution ? laneList.some((l) => l.agent === attribution.agent) : false;
           return (
             <li key={m.id} className="text-sm">
               <div className="flex items-center gap-2">
@@ -574,13 +582,16 @@ export function MilestoneChecklist({ run, activity = null }: { run: Run; activit
               </div>
               {hasLanes ? (
                 // PRD #1353 M4 LIVE-LANES path (the authoritative live display). For each
-                // in-progress milestone: the DECLARED owner (if any) renders QUIET (live=null →
-                // M1's non-pulsing "assigned to" line) and ONE live green+pulsing strip renders
-                // per lane, keyed by agent_instance. Neither the D8-fallback/unattached strip nor
-                // uniqueMatchId is consulted here — lanes supersede the current_activity now-line.
+                // in-progress milestone: the DECLARED owner renders QUIET (live=null → M1's
+                // non-pulsing "assigned to" line) ONLY when its agent is NOT already one of the
+                // lanes — otherwise the owner is live and its lane strip carries it, so the quiet
+                // strip is suppressed to avoid drawing the same role + label twice (tui-ux dedup).
+                // ONE live green+pulsing strip renders per lane, keyed by agent_instance. Neither
+                // the D8-fallback/unattached strip nor uniqueMatchId is consulted here — lanes
+                // supersede the current_activity now-line.
                 state === "in_progress" && (
                   <>
-                    {attribution && (
+                    {attribution && !ownerIsLive && (
                       <MilestoneNowStrip
                         role={attribution.agent}
                         label={attribution.agent_label}
@@ -590,7 +601,7 @@ export function MilestoneChecklist({ run, activity = null }: { run: Run; activit
                         variant="active"
                       />
                     )}
-                    {(milestonesLiveById.get(m.id) ?? []).map((lane) => (
+                    {laneList.map((lane) => (
                       <MilestoneNowStrip
                         key={lane.agent_instance}
                         role={lane.agent}

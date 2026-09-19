@@ -778,7 +778,13 @@ func milestoneLaneRows(r apitypes.RunDTO) [][]string {
 		if len(lanes) == 0 && !hasOwner {
 			continue
 		}
-		if hasOwner {
+		// The quiet declared-owner row is emitted ONLY when the owner is IDLE — its declared agent
+		// is not among this milestone's live lanes. When the owner IS live (the common case: the
+		// declared owner is one of the lanes), the `NOW <id>` lane row already carries it live, so a
+		// quiet OWNER row would just duplicate that lane (same role + label). Suppressing it here is
+		// the tui-ux dedup fix; an idle owner (agent name not among the lanes) still gets the "assigned
+		// to" tag above the lanes.
+		if hasOwner && !laneHasAgent(lanes, e.Agent) {
 			parts := make([]string, 0, 2)
 			if role := cellText(e.Agent); role != "" {
 				parts = append(parts, role)
@@ -857,6 +863,22 @@ func milestonesLiveIndex(r apitypes.RunDTO) map[string][]apitypes.MilestoneLane 
 		out[ml.MilestoneID] = ml.Lanes
 	}
 	return out
+}
+
+// laneHasAgent reports whether any of a milestone's live lanes is driven by the given declared-owner
+// agent (a byte-match on MilestoneLane.Agent, the same equality uniqueMilestoneAgentMatch uses). It is
+// the owner-line dedup predicate shared by the CLI `run get` (milestoneLaneRows) and the TUI crew rail
+// (renderMilestones' lanes branch): when it is true the declared owner is already shown live on a
+// `NOW <id>` lane row, so the quiet OWNER/"assigned to" line would only duplicate that lane and is
+// suppressed; when it is false the owner is idle (its agent is not among the lanes) and the quiet line
+// is kept above the lanes.
+func laneHasAgent(lanes []apitypes.MilestoneLane, agent string) bool {
+	for _, lane := range lanes {
+		if lane.Agent == agent {
+			return true
+		}
+	}
+	return false
 }
 
 // summaryRows is the CLI surface of the plain-English run summaries (PRD #362 M5): the

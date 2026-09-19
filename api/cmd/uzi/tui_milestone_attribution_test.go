@@ -170,12 +170,18 @@ func TestTUIMilestoneAttributionNonOwnerLiveAgent(t *testing.T) {
 	}
 }
 
-// TestTUIMilestoneLanesRender is the PRD #1353 M6 crew-rail LIVE LANES golden: when the run has lanes
-// (MilestonesLive), the lanes are the authoritative live display. Under m2 (a declared owner) the rail
-// draws a QUIET owner line (no age) THEN the live lane line (↳ coder · 0s + the tool/detail + italic
-// label); under m3 (no declared owner) it draws one lane line per lane — two reviewer lanes here,
-// distinguished by tool arg + label. The eyebrow now-line is SUPPRESSED (the frame's "coder busy"
-// must not appear). The frame is future-dated so relAge floors the age to "0s".
+// TestTUIMilestoneLanesRender is the PRD #1353 M6 crew-rail LIVE LANES golden, also pinning the
+// owner-line dedup fix. When the run has lanes (MilestonesLive) the lanes are the authoritative live
+// display:
+//
+//   - m2's declared owner "coder" IS one of its lanes (owner-is-live). The quiet owner line is
+//     SUPPRESSED — it would only duplicate the coder lane — so m2 draws just the live lane line
+//     (↳ coder · 0s + the tool/detail + italic label).
+//   - m3's declared owner "architect" is IDLE (not among its two reviewer lanes), so the quiet
+//     `↳ architect` owner line (no age) is kept ABOVE the two lane lines.
+//
+// The eyebrow now-line is SUPPRESSED (the frame's "coder busy" must not appear). The frame is
+// future-dated so relAge floors the age to "0s".
 func TestTUIMilestoneLanesRender(t *testing.T) {
 	runID := "run-1353-tui-lanes"
 	at := time.Now().Add(2 * time.Hour) // relAge floors a not-yet timestamp to "0s"
@@ -186,9 +192,11 @@ func TestTUIMilestoneLanesRender(t *testing.T) {
 		},
 		MilestonesCompleted:  []string{"m1"},
 		MilestonesInProgress: []string{"m2", "m3"},
-		// m2 has a declared owner (a QUIET owner line beside its lane); m3 has none (lanes only).
+		// m2's owner is live (coder is a lane) → its quiet owner line is suppressed; m3's owner is idle
+		// (architect is not a lane) → its quiet owner line is kept.
 		MilestonesAgents: []apitypes.MilestoneAgent{
 			{ID: "m2", Agent: "coder", AgentLabel: "Wire the limiter"},
+			{ID: "m3", Agent: "architect", AgentLabel: "Design the API"},
 		},
 		MilestonesLive: []apitypes.MilestoneLive{
 			{MilestoneID: "m2", Lanes: []apitypes.MilestoneLane{
@@ -212,16 +220,18 @@ func TestTUIMilestoneLanesRender(t *testing.T) {
 	})
 	got := milestoneBlockRegion(t, m.View().Content)
 
+	// m2: owner coder is live → NO quiet `↳ coder` owner line, just the lane. m3: owner architect is
+	// idle → the quiet `↳ architect` owner line is kept above its two reviewer lanes.
 	const want = "MILESTONES ▰▱▱ 1/3\n" +
 		"· m2, m3\n" +
 		" ✓ Alpha\n" +
 		" ◕ Beta\n" +
-		"   ↳ coder\n" +
-		"     Wire the limiter\n" +
 		"   ↳ coder · 0s\n" +
 		"     Edit window.go\n" +
 		"     Wire the limiter\n" +
 		" ◕ Gamma\n" +
+		"   ↳ architect\n" +
+		"     Design the API\n" +
 		"   ↳ reviewer · 0s\n" +
 		"     Read a.go\n" +
 		"     Review A\n" +
