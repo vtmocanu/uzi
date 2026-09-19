@@ -142,6 +142,39 @@ describe("PRD #1224 M5: per-milestone agent attribution (web)", () => {
     expect(screen.getAllByText("40s ago")).toHaveLength(1);
   });
 
+  // PRD #1353 M1 (honesty fix): the pulsing green dot is reserved for a strip backed by a
+  // REAL live frame. Two in-progress milestones attributed to distinct agents (m2→coder,
+  // m3→tester) with activity.agent = "coder": m2 is the unique live match (live !== null),
+  // m3 is an IDLE declared owner (live === null). Only the live strip may read as "working
+  // now" — pre-fix BOTH strips pulsed (every attributed strip renders variant="active"),
+  // which is the dishonesty this pin catches.
+  it("pulses the dot only on the live strip, not the idle declared owner", () => {
+    const { container } = render(
+      <MilestoneChecklist
+        run={run({
+          milestones,
+          milestones_completed: ["m1"],
+          milestones_in_progress: ["m2", "m3"],
+          milestones_agents: [agent("m2", "coder", "Wire the limiter"), agent("m3", "tester", "Add coverage")],
+        })}
+        // activity matches EXACTLY m2's coder; m3's tester is an idle declared owner.
+        activity={anActivity({ agent: "coder" })}
+      />,
+    );
+
+    // Exactly ONE pulsing dot across the whole checklist — today (pre-fix) there are TWO.
+    expect(container.querySelectorAll(".animate-pulse")).toHaveLength(1);
+
+    const betaRow = screen.getByText("Beta").closest("li") as HTMLElement;
+    const gammaRow = screen.getByText("Gamma").closest("li") as HTMLElement;
+    const betaDot = betaRow.querySelector("span.rounded-full") as HTMLElement;
+    const gammaDot = gammaRow.querySelector("span.rounded-full") as HTMLElement;
+
+    // The live strip (coder, unique match) pulses; the idle declared owner (tester) does not.
+    expect(betaDot.classList.contains("animate-pulse")).toBe(true);
+    expect(gammaDot.classList.contains("animate-pulse")).toBe(false);
+  });
+
   // Pins D3's repeated-role rule: two effective attributions share a role that also equals
   // activity.agent → the match is ambiguous, so live tool/age is SUPPRESSED on BOTH; every
   // strip shows declared role + label only.

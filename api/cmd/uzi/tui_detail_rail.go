@@ -642,11 +642,16 @@ func (m tuiModel) renderMilestones() string {
 		sb.WriteString(eyebrow + "\n")
 		sb.WriteString(m.pal.faint.Render("· "+suffix) + "\n")
 	}
-	// Nothing declared in progress but there IS activity: an unattached now line directly under
-	// the eyebrow (PRD #1064 mock; #390 D7 — declared, not inferred, so the milestone stays
-	// unmarked). Suppressed under effective attribution (PRD #1224 D8): the per-milestone declared
-	// lines below carry the crew, so no unattached line rides the eyebrow in that branch.
-	if len(effAgents) == 0 && ipID == "" && act != nil {
+	// An unattached now line directly under the eyebrow, in two cases:
+	switch {
+	case len(effAgents) == 0 && ipID == "" && act != nil:
+		// Unattributed, nothing declared in progress but there IS activity (PRD #1064 mock; #390
+		// D7 — declared, not inferred, so the milestone stays unmarked).
+		sb.WriteString(m.railNowLines(act, " ", "   "))
+	case len(effAgents) > 0 && act != nil && uniqueID == "":
+		// M1 (PRD #1353 D6): attributed, but the live agent matches no declared owner (a
+		// reviewer/tester, or an ambiguous repeated role) — show it as an unattached now-line so a
+		// live non-owner is never suppressed. The per-milestone owner lines below stay quiet (no age).
 		sb.WriteString(m.railNowLines(act, " ", "   "))
 	}
 	for _, mi := range ms {

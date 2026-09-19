@@ -379,28 +379,34 @@ function MilestoneMark({ state }: { state: "done" | "in_progress" | "left" }) {
 // MilestoneNowStrip is the "now" line (PRD #1064 M3, D3/D5): a left-bordered strip that
 // names the lane acting RIGHT NOW under the in-progress milestone (or unattached under
 // the header when a milestone run has activity but nothing declared). Three variants:
-//   - active   — a milestone is in progress: ok-green border + pulsing dot, the role and
-//                its task, its last tool, and a client-side age (R7: a stalled lane reads
-//                its real age, not a lie).
+//   - active   — a milestone is in progress. The pulsing green (ok) border + dot are
+//                reserved for a strip backed by a REAL live frame (`live !== null`): it
+//                then shows the role, its task, its last tool, and a client-side age (R7:
+//                a stalled lane reads its real age, not a lie). A declared-owner-only
+//                strip (idle owner, `live === null`) renders QUIET instead — faint border,
+//                muted accent, a static faint dot with no pulse — so it never reads as
+//                "working now" (PRD #1353 M1 honesty fix).
 //   - waiting  — the run is parked on a self-resuming hold (limit_wait/pool_wait, or the
 //                transient-recovery park recovery_wait, issue #1197): a warn border +
 //                a waiting reason and age, so the strip does not pretend the lane
 //                is working while it is blocked.
 //   - unattached — activity exists but no milestone is declared in progress: a faint
-//                border, sitting directly under the header.
+//                border, sitting directly under the header. Always backed by a live frame.
 //
 // 🔴 ALL display fields are folded through stripUnsafeChars here (defense-in-depth): the
 // server caps/strips only detail and agent_label, so agent/role and tool arrive UNSANITIZED
 // on the wire — an auditor note. In the PRD #1224 per-milestone-attribution path (M5) the
 // role/label are the DECLARED agent/agent_label (equally untrusted), so the same fold covers
-// them. The pulsing dot uses animate-pulse, which index.css neutralizes under
-// prefers-reduced-motion.
+// them. The pulsing dot (present only for a live or waiting strip) uses animate-pulse, which
+// index.css neutralizes under prefers-reduced-motion.
 //
 // PRD #1224 M5 (D3): `live` carries the current tool/detail/age. It is non-null for TODAY's
 // activity-driven strip (the D8-fallback path) AND for the single unique-match milestone in
 // the attributed path; it is null for a declared-only strip (a sibling attribution, or every
 // strip when a repeated role makes the live join ambiguous), which then shows role + label
-// only — no tool line, no age. The waiting/border/dot logic stays keyed on status/variant.
+// only — no tool line, no age. PRD #1353 M1: the dot/border/accent now key on whether a real
+// live frame is present (`live !== null`), NOT on `variant` alone — an idle declared owner
+// renders quiet (faint, no pulse). The `waiting` styling stays keyed on status.
 function MilestoneNowStrip({
   role,
   label,
@@ -428,12 +434,26 @@ function MilestoneNowStrip({
   const tool = live ? stripUnsafeChars(live.tool) : "";
   const detail = live ? stripUnsafeChars(live.detail) : "";
   const toolText = tool ? (detail ? `${tool} ${detail}` : tool) : detail;
-  const border = waiting ? "border-warning" : variant === "unattached" ? "border-faint" : "border-ok/50";
-  const accent = waiting ? "text-warning" : "text-ok";
-  const dotBg = waiting ? "bg-warning" : "bg-ok";
+  // The pulse + green styling is reserved for a strip backed by a REAL live frame (M1
+  // honesty fix, PRD #1353): a declared-owner-only strip (idle owner, live === null) reads
+  // QUIET — faint border, muted accent, faint static dot — so it never pretends to be
+  // "working now". `waiting` is orthogonal and keeps its warn styling unchanged. The
+  // unattached variant is always live (its caller passes a live frame), so it keeps its
+  // faint border but a live green dot as before.
+  const isLive = live !== null;
+  const border = waiting
+    ? "border-warning"
+    : !isLive
+      ? "border-faint"
+      : variant === "unattached"
+        ? "border-faint"
+        : "border-ok/50";
+  const accent = waiting ? "text-warning" : isLive ? "text-ok" : "text-muted";
+  const dotBg = waiting ? "bg-warning" : isLive ? "bg-ok" : "bg-faint";
+  const dotPulse = waiting || isLive;
   return (
     <div className={cx("mt-1.5 flex items-center gap-2 border-l-2 py-1 pl-3 text-xs", border)}>
-      <span aria-hidden className={cx("h-1.5 w-1.5 shrink-0 rounded-full animate-pulse", dotBg)} />
+      <span aria-hidden className={cx("h-1.5 w-1.5 shrink-0 rounded-full", dotBg, dotPulse && "animate-pulse")} />
       <span className={cx("shrink-0 font-medium", accent)}>{safeRole}</span>
       {safeLabel && <span className="min-w-0 flex-1 truncate italic text-muted">{safeLabel}</span>}
       {toolText && <span className="min-w-0 shrink truncate font-mono text-faint">{toolText}</span>}

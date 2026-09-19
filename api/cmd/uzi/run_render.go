@@ -162,17 +162,26 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 	// frozen milestone list and a global-default budget is byte-for-byte unchanged — the
 	// same back-compat contract the DTO's nil slices and null budgets carry.
 	rows = append(rows, milestoneRows(r)...)
-	// The NOW row(s) (PRD #1064 M5, D7; PRD #1224 M6). With EFFECTIVE per-milestone attribution
-	// on a non-terminal run (D8), milestoneNowRows emits one `NOW <id>` row per attributed
-	// in-progress milestone (declared role + label; live tool/age only on the D3 unique-matching
-	// lane) IN PLACE OF the single global NOW row. Otherwise — unattributed, [], invalid-only,
-	// stale-only, or terminal — nowRow renders the single global current_activity row exactly as
-	// before, so a finished run and any pre-#1064 or unattributed run are byte-for-byte unchanged
-	// (the M4 CLI baseline locks this).
-	if mrows := milestoneNowRows(r); len(mrows) > 0 {
-		rows = append(rows, mrows...)
-	} else if row := nowRow(r); row != nil {
-		rows = append(rows, row)
+	// The NOW row(s) (PRD #1064 M5, D7; PRD #1224 M6; PRD #1353 M1 D6). With EFFECTIVE per-milestone
+	// attribution on a non-terminal run (D8), milestoneNowRows emits one row per attributed in-progress
+	// milestone: a `NOW <id>` row for the D3 unique-matching (live) lane carrying live tool/age, and a
+	// QUIET `OWNER <id>` tag row (role + label only, no age) for every idle declared owner.
+	//
+	// PRD #1353 M1 then ALSO emits the single global nowRow whenever the live agent is NOT already shown
+	// on a `NOW <id>` row above — i.e. it matches no declared owner (a reviewer/tester) or is ambiguous
+	// (a repeated role, so uniqueMilestoneAgentMatch is ""). That keeps a live non-owner visible instead
+	// of vanishing (the pre-M1 `else if` dropped it). When the live agent DOES uniquely match a declared
+	// owner, its live info already rides that milestone's `NOW <id>` row, so the global is skipped (no
+	// duplication). The unattributed / [] / invalid-only / stale-only / terminal cases are byte-for-byte
+	// unchanged: milestoneNowRows returns nil AND uniqueMilestoneAgentMatch(empty, …) == "", so the
+	// single global nowRow is appended exactly as before (the M4 CLI baseline locks this).
+	rows = append(rows, milestoneNowRows(r)...)
+	if act := r.CurrentActivity; act != nil && !terminalRunStatuses[r.Status] {
+		if uniqueMilestoneAgentMatch(effectiveMilestoneAgents(r), act.Agent) == "" {
+			if row := nowRow(r); row != nil {
+				rows = append(rows, row)
+			}
+		}
 	}
 	// The honest completion-interlock block (PRD #1226 M5, D8): the phase label, the unmet
 	// milestone ids, the attempt count and the same-worker-only HOLD_CONTEXT. Placed right after
@@ -643,19 +652,28 @@ func nowRow(r apitypes.RunDTO) []string {
 	return []string{"NOW", strings.Join(parts, " · ")}
 }
 
-// milestoneNowRows is the ATTRIBUTED-case replacement for the single global nowRow (PRD #1224
-// M6): one `NOW <id>` row per effective-attributed in-progress milestone, each carrying that
-// milestone's DECLARED role + optional label (MilestoneAgent.Agent/.AgentLabel). The D3
-// unique-matching lane — the single declared agent whose value byte-matches
-// current_activity.agent — ALSO carries the live tool detail + age (the exact segments nowRow
-// builds); every other attributed milestone (a non-match, or ALL of them when a repeated role
-// suppresses enrichment) shows role + label only, never a guessed age, because the lead lacks the
-// agent_instance that would tell duplicate roles apart.
+// milestoneNowRows is the ATTRIBUTED-case per-milestone tag/now block (PRD #1224 M6; PRD #1353 M1
+// D6): one row per effective-attributed in-progress milestone, in FROZEN order (iterating
+// r.Milestones) so they align with milestoneRows above. Each carries that milestone's DECLARED
+// role + optional label (MilestoneAgent.Agent/.AgentLabel), and the prefix distinguishes a LIVE
+// owner from an IDLE one:
 //
-// Returns nil (so the caller falls back to the single global nowRow, keeping the unattributed /
-// [] / invalid-only / stale-only cases byte-for-byte, D8) UNLESS the run is non-terminal AND at
-// least one attribution survives the D6 read-time re-filter (effectiveMilestoneAgents). Rows emit
-// in FROZEN order (iterating r.Milestones) so they align with milestoneRows above.
+//   - The D3 unique-matching lane — the single declared agent whose value byte-matches
+//     current_activity.agent — is the run's live agent, so it rides a `NOW <id>` row carrying the
+//     live tool detail + age (the exact segments nowRow builds).
+//   - Every OTHER attributed milestone is an IDLE declared owner (a non-match, or ALL of them when a
+//     repeated role makes the unique match ambiguous). PRD #1353 M1 demotes it to a QUIET `OWNER <id>`
+//     tag row — role + label only, NO `NOW` prefix and NO guessed age — because the lead lacks the
+//     agent_instance to prove that owner is live. Before M1 an idle owner also read as `NOW <id>`, so
+//     an idle declared owner falsely looked live; the `OWNER` tag is the honesty fix.
+//
+// Because an idle owner no longer occupies a `NOW <id>` row, the caller (renderRunDetail) STILL emits
+// the single global nowRow whenever the live agent is not on a `NOW <id>` row here — a reviewer/tester
+// matching no owner, or an ambiguous repeated role — so a live non-owner is never suppressed (D6).
+//
+// Returns nil (so the caller renders only the single global nowRow, keeping the unattributed / [] /
+// invalid-only / stale-only cases byte-for-byte, D8) UNLESS the run is non-terminal AND at least one
+// attribution survives the D6 read-time re-filter (effectiveMilestoneAgents).
 //
 // Agent, AgentLabel, Tool and Detail are UNTRUSTED, model-authored text (the server caps only
 // Detail/AgentLabel, leaving Agent/Tool unsanitized on the wire), so every display segment goes
@@ -687,9 +705,10 @@ func milestoneNowRows(r apitypes.RunDTO) [][]string {
 		if label := cellText(e.AgentLabel); label != "" {
 			parts = append(parts, label)
 		}
-		// The live tool + its most identifying argument + the age ride ONLY the D3 unique-matching
-		// lane; a non-match (or any lane under a repeated role) stops at role + label. Empty
-		// segments drop, joined with " · " exactly like nowRow, so no dangling separator.
+		// The D3 unique-matching lane is the LIVE agent: it rides a `NOW <id>` row carrying the live
+		// tool + its most identifying argument + the age. Every other attributed milestone is an idle
+		// declared owner and demotes to a QUIET `OWNER <id>` tag row (role + label only, no age).
+		// Empty segments drop, joined with " · " exactly like nowRow, so no dangling separator.
 		if act != nil && mi.ID == uniqueID {
 			tool := cellText(act.Tool)
 			detail := cellText(act.Detail)
@@ -702,8 +721,10 @@ func milestoneNowRows(r apitypes.RunDTO) [][]string {
 				parts = append(parts, detail)
 			}
 			parts = append(parts, relAge(act.At)+" ago")
+			rows = append(rows, []string{"NOW " + mi.ID, strings.Join(parts, " · ")})
+		} else {
+			rows = append(rows, []string{"OWNER " + mi.ID, strings.Join(parts, " · ")})
 		}
-		rows = append(rows, []string{"NOW " + mi.ID, strings.Join(parts, " · ")})
 	}
 	return rows
 }

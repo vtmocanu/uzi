@@ -77,13 +77,14 @@ func TestTUIMilestoneAttributionMultiUniqueMatch(t *testing.T) {
 	}
 }
 
-// TestTUIMilestoneAttributionRepeatedRoleSuppressesAge pins D3's repeated-role suppression: m2 and
-// m3 are both attributed to the SAME role ("coder"), which is also the live activity's agent. Two
-// effective entries share the role, so the unique-match is ambiguous and live age is suppressed on
-// BOTH now-lines (the lead lacks agent_instance to tell the lanes apart). Each still shows its
-// declared role + label.
+// TestTUIMilestoneAttributionRepeatedRoleSuppressesAge pins D3's repeated-role suppression AND the PRD
+// #1353 M1 honesty fix: m2 and m3 are both attributed to the SAME role ("coder"), which is also the live
+// activity's agent. Two effective entries share the role, so the unique-match is ambiguous and live age
+// is suppressed on BOTH per-milestone owner lines (the lead lacks agent_instance to tell the lanes
+// apart). PRD #1353 M1 then adds an unattached eyebrow now-line so the ambiguous LIVE agent stays
+// visible (with age) instead of vanishing, while the two owner lines remain quiet (no age).
 func TestTUIMilestoneAttributionRepeatedRoleSuppressesAge(t *testing.T) {
-	runID := "run-1224-tui-repeated"
+	runID := "run-1353-tui-repeated"
 	run := apitypes.RunDTO{
 		ID: runID, Kind: "issue", Status: "running", Health: "ok", IssueTitle: "Add rate limiting",
 		Milestones: []apitypes.Milestone{
@@ -98,8 +99,13 @@ func TestTUIMilestoneAttributionRepeatedRoleSuppressesAge(t *testing.T) {
 	}
 	got := tuiAttribModel(t, run, "coder", "coder busy")
 
+	// The ambiguous live "coder" now rides an unattached eyebrow now-line (↳ coder · 0s + its own
+	// frame label "coder busy"); BOTH per-milestone owner lines still show declared role + label
+	// with NO age.
 	const want = "MILESTONES ▰▱▱ 1/3\n" +
 		"· m2, m3\n" +
+		" ↳ coder · 0s\n" +
+		"   coder busy\n" +
 		" ✓ Alpha\n" +
 		" ◕ Beta\n" +
 		"   ↳ coder\n" +
@@ -109,11 +115,57 @@ func TestTUIMilestoneAttributionRepeatedRoleSuppressesAge(t *testing.T) {
 		"     Add the sweep"
 
 	if got != want {
-		t.Errorf("PRD #1224 M6 TUI repeated-role render drifted.\n--- got ---\n%s\n--- want ---\n%s", got, want)
+		t.Errorf("PRD #1353 M1 TUI repeated-role render drifted.\n--- got ---\n%s\n--- want ---\n%s", got, want)
 	}
-	// Belt-and-braces on the suppression itself: no age token ("0s") survives anywhere in the block
-	// when the matching role is ambiguous — a regression that mislabels one lane's age would trip this.
-	if strings.Contains(got, "0s") {
-		t.Errorf("PRD #1224 D3: repeated-role match must suppress live age on ALL now-lines, but an age token leaked:\n%s", got)
+	// The age appears EXACTLY once — on the eyebrow now-line for the live agent — proving the per-
+	// milestone owner lines still suppress the guessed age (a regression that stamped an age onto an
+	// owner line would push the count to two).
+	if n := strings.Count(got, "0s"); n != 1 {
+		t.Errorf("PRD #1353 M1: ambiguous live agent shows once (with age) at the eyebrow while owner lines suppress age; want exactly one \"0s\" token, got %d:\n%s", n, got)
+	}
+}
+
+// TestTUIMilestoneAttributionNonOwnerLiveAgent is the PRD #1353 M1 regression pin for the crew rail: a
+// live agent that matches NO declared owner (a reviewer) must stay visible. m2→coder and m3→tester are
+// both attributed and in progress, but the live activity is "reviewer", matching neither owner. So both
+// owners render as quiet declared lines (no age) and the live reviewer rides an unattached eyebrow
+// now-line (↳ reviewer · 0s + its frame label). Pre-M1 the eyebrow now-line was suppressed whenever
+// attribution was present, so the live reviewer vanished — this render is the fix.
+func TestTUIMilestoneAttributionNonOwnerLiveAgent(t *testing.T) {
+	runID := "run-1353-tui-nonowner"
+	run := apitypes.RunDTO{
+		ID: runID, Kind: "issue", Status: "running", Health: "ok", IssueTitle: "Add rate limiting",
+		Milestones: []apitypes.Milestone{
+			{ID: "m1", Title: "Alpha"}, {ID: "m2", Title: "Beta"}, {ID: "m3", Title: "Gamma"},
+		},
+		MilestonesCompleted:  []string{"m1"},
+		MilestonesInProgress: []string{"m2", "m3"},
+		MilestonesAgents: []apitypes.MilestoneAgent{
+			{ID: "m2", Agent: "coder", AgentLabel: "Wire the limiter"},
+			{ID: "m3", Agent: "tester", AgentLabel: "Add the sweep"},
+		},
+	}
+	// The live frame is a reviewer — matches neither declared owner, so it must show as the unattached
+	// eyebrow now-line rather than vanish.
+	got := tuiAttribModel(t, run, "reviewer", "reviewing the diff")
+
+	const want = "MILESTONES ▰▱▱ 1/3\n" +
+		"· m2, m3\n" +
+		" ↳ reviewer · 0s\n" +
+		"   reviewing the diff\n" +
+		" ✓ Alpha\n" +
+		" ◕ Beta\n" +
+		"   ↳ coder\n" +
+		"     Wire the limiter\n" +
+		" ◕ Gamma\n" +
+		"   ↳ tester\n" +
+		"     Add the sweep"
+
+	if got != want {
+		t.Errorf("PRD #1353 M1 TUI non-owner live agent render drifted.\n--- got ---\n%s\n--- want ---\n%s\n--- got (quoted) ---\n%q", got, want, got)
+	}
+	// The explicit honesty guarantee: the live reviewer is present as an unattached now-line with age.
+	if !strings.Contains(got, "↳ reviewer · 0s") {
+		t.Errorf("PRD #1353 M1: a live non-owner agent must appear as an unattached `↳ reviewer · <age>` now-line:\n%s", got)
 	}
 }
