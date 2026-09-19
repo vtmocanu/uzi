@@ -69,6 +69,16 @@ const (
 	reasonVaultLocked   = "your vault is locked, so this run can't start"
 	reasonNoWorker      = "no worker is online to pick up this run"
 	reasonWaitingWorker = "waiting for a worker to pick up this run"
+	// reasonHandoffSetup (PRD #400 Decision 6 / issue #1367) is the honest queued reason
+	// for an UNDISPATCHED task (handoff) run — one whose uzi/task/<id> branch push or
+	// dispatch has not yet landed, so dispatched_at is still NULL. ClaimRun never offers
+	// such a run (its claim clause is kind<>'task' OR dispatched_at IS NOT NULL), so NO
+	// worker gap is the cause and reasonWaitingWorker would be a lie. Same fixed-string
+	// contract as its siblings — server-controlled, no tool name, no repo content, no
+	// live duration — and maps to the SAME healthWaitingWorker enum (no migration —
+	// runs.health_reason is free text). The sweeper (SweepTaskNeverDispatched) expires
+	// the run to 'failed' with a terminal failure_reason after DispatchGrace.
+	reasonHandoffSetup = "handoff setup has not finished"
 	// reasonAllWorkersBusy (PRD #216) distinguishes a saturated fleet from an idle
 	// queue: every online worker is at its advertised run-lane cap, so this run is
 	// waiting for a SLOT to free — not for a worker to come online — and the
@@ -584,6 +594,15 @@ func stallBaseline(r store.ListActiveRunsForHealthRow) time.Time {
 // re-label, so a demoted-but-unplaceable run still reports the actionable capability block
 // rather than a yield message.
 func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListActiveRunsForHealthRow) string {
+	// PRD #400 Decision 6 / issue #1367: an undispatched task run (its uzi/task/<id> branch
+	// push or dispatch never landed) is NOT waiting for a worker — ClaimRun never offers it
+	// (kind<>'task' OR dispatched_at IS NOT NULL), so none of the fleet reasons below is the
+	// real cause. Report the honest saga-setup reason; the sweeper (SweepTaskNeverDispatched)
+	// expires it to 'failed' with a terminal failure_reason after DispatchGrace. A dispatched
+	// queued task (DispatchedAt.Valid) falls through to the normal rungs.
+	if r.Kind == "task" && !r.DispatchedAt.Valid {
+		return reasonHandoffSetup
+	}
 	if s.vlt != nil && !s.vlt.Unlocked(r.UserID) {
 		return reasonVaultLocked
 	}

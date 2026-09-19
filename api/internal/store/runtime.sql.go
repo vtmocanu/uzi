@@ -5342,7 +5342,7 @@ SELECT id, user_id, status, auto_approve,
        started_at, last_activity_at, updated_at, status_since,
        health, health_reason, health_since, health_notified_at,
        budget_wall_seconds, budget_paused_seconds, budget_extension_seconds, interactive,
-       repo_id, kind, required_capabilities, completion_contract_version,
+       repo_id, kind, dispatched_at, required_capabilities, completion_contract_version,
        harness, codex_material_revision, codex_secret_id, worker_id
 FROM runs
 WHERE status IN ('queued', 'running', 'awaiting_approval')
@@ -5368,6 +5368,7 @@ type ListActiveRunsForHealthRow struct {
 	Interactive               bool               `json:"interactive"`
 	RepoID                    pgtype.UUID        `json:"repo_id"`
 	Kind                      string             `json:"kind"`
+	DispatchedAt              pgtype.Timestamptz `json:"dispatched_at"`
 	RequiredCapabilities      []string           `json:"required_capabilities"`
 	CompletionContractVersion pgtype.Int4        `json:"completion_contract_version"`
 	Harness                   string             `json:"harness"`
@@ -5440,6 +5441,7 @@ func (q *Queries) ListActiveRunsForHealth(ctx context.Context) ([]ListActiveRuns
 			&i.Interactive,
 			&i.RepoID,
 			&i.Kind,
+			&i.DispatchedAt,
 			&i.RequiredCapabilities,
 			&i.CompletionContractVersion,
 			&i.Harness,
