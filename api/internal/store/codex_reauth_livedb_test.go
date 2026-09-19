@@ -110,7 +110,8 @@ func TestMarkCodexReauthRequiredLiveDB(t *testing.T) {
 // TestRefreshCodexAccountLoginReauthArmLiveDB pins the two-arm restore (PRD #1209 M1): the
 // reauth arm restores + clears reauth atomically when gen/cred match and recovery is null;
 // the quarantined arm still works unchanged; and the reauth arm refuses a stale
-// from_generation, a stale reauth_generation, or an in_progress account.
+// from_generation, a stale reauth_generation, a stale reauth_credential_revision, or an
+// in_progress account.
 func TestRefreshCodexAccountLoginReauthArmLiveDB(t *testing.T) {
 	ctx, pool, q, user := codexLiveDB(t)
 
@@ -182,6 +183,26 @@ func TestRefreshCodexAccountLoginReauthArmLiveDB(t *testing.T) {
 		staleReauth)
 	if n := refresh(staleReauth, 0); n != 0 {
 		t.Fatalf("refresh with a stale reauth_generation affected %d rows, want 0", n)
+	}
+
+	// --- reauth arm refuses when reauth_credential_revision no longer matches the live
+	// credential_revision (the OTHER half of the reauth fence; reauth_generation matches). ---
+	staleReauthCred := mkReauthAccount(ctx, t, q, user)
+	// Advance the account's live credential_revision to 1, then flag reauth against the OLD
+	// credential_revision (0) while reauth_generation MATCHES the live generation (0). The
+	// top-level from_generation and the reauth arm's reauth_generation=generation guard both
+	// still hold, so ONLY the reauth_credential_revision=credential_revision guard can reject
+	// this — dropping that conjunct would let the refresh restore (see the mutation check).
+	mustExec(ctx, t, pool,
+		`UPDATE codex_provider_account SET credential_revision=1, reauth_required=true, reauth_generation=0, reauth_credential_revision=0 WHERE id=$1`,
+		staleReauthCred)
+	if n := refresh(staleReauthCred, 0); n != 0 {
+		t.Fatalf("refresh with a stale reauth_credential_revision affected %d rows, want 0", n)
+	}
+	// No restore happened: the generation is untouched and the reauth flag still stands.
+	if got := getCodexAccount(ctx, t, q, user, staleReauthCred); got.Generation != 0 || got.CoordState != "idle" || !got.ReauthRequired {
+		t.Fatalf("stale-reauth_credential_revision refresh mutated the account: gen=%d coord=%q reauth_required=%v, want (0, idle, true)",
+			got.Generation, got.CoordState, got.ReauthRequired)
 	}
 
 	// --- reauth arm refuses an in_progress account (reauth flagged, not quarantined). ---

@@ -65,12 +65,22 @@ type userSettingsDTO struct {
 // userSettingsResponse reads the user's settings row (one GetUserSettings query,
 // summary_model folded in) and writes the settings body, shared by the GET and PUT
 // handlers so the two responses never drift.
-func (h *Handler) userSettingsResponse(w http.ResponseWriter, r *http.Request, userID uuid.UUID) {
+//
+// sidebarCodexOverride, when non-nil, replaces the stored sidebar_codex_account_ids in the
+// response with the caller-supplied set: the GET path passes the array
+// PruneUserSidebarCodexAccounts returned so the surfaced set reflects the just-pruned value
+// directly (PRD #1209 M1). A nil override uses the value read from GetUserSettings — the PUT
+// path, and the GET path's best-effort fallback when the prune UPDATE failed.
+func (h *Handler) userSettingsResponse(w http.ResponseWriter, r *http.Request, userID uuid.UUID, sidebarCodexOverride *[]uuid.UUID) {
 	s, err := h.q.GetUserSettings(r.Context(), userID)
 	if err != nil {
 		slog.Error("get user settings", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
+	}
+	sidebarCodexIDs := s.SidebarCodexAccountIds
+	if sidebarCodexOverride != nil {
+		sidebarCodexIDs = *sidebarCodexOverride
 	}
 	// summary_model rides the GetUserSettings one-row read (it is the same users row),
 	// so the settings surface reads it from `s` — no separate query. GetUserSummaryModel
@@ -85,7 +95,7 @@ func (h *Handler) userSettingsResponse(w http.ResponseWriter, r *http.Request, u
 			Theme:                  textPtrValue(s.Theme.Valid, s.Theme.String),
 			MrReworkEnabled:        boolPtrValue(s.MrReworkEnabled),
 			SidebarTokenIds:        uuidStrings(s.SidebarTokenIds),
-			SidebarCodexAccountIds: uuidStrings(s.SidebarCodexAccountIds),
+			SidebarCodexAccountIds: uuidStrings(sidebarCodexIDs),
 			AppearanceMode:         textPtrValue(s.AppearanceMode.Valid, s.AppearanceMode.String),
 			LightTheme:             textPtrValue(s.LightTheme.Valid, s.LightTheme.String),
 			DarkTheme:              textPtrValue(s.DarkTheme.Valid, s.DarkTheme.String),
@@ -102,20 +112,27 @@ func (h *Handler) userSettingsResponse(w http.ResponseWriter, r *http.Request, u
 // PruneUserSidebarCodexAccounts drops in ONE UPDATE any id that no longer names a linked
 // account (its account was deleted or its last codex_auth alias unlinked), so a since-
 // unlinked id never lingers in the surfaced set. It is a single atomic UPDATE — never a
-// read-merge-write — so it cannot lose a concurrent SetUserSidebarCodexAccounts. The
-// response then re-reads the pruned column via userSettingsResponse.
+// read-merge-write — so it cannot lose a concurrent SetUserSidebarCodexAccounts.
+//
+// The prune is BEST-EFFORT: a failed cosmetic sidebar prune must NOT break the core
+// settings read (the Claude/anthropic sidebar path has no such failure mode). On success
+// the response uses the pruned array Prune returns; on error we log a warning and fall
+// back to the currently-stored sidebar_codex_account_ids. The fallback set is still
+// correct — the meter/sidebar surfaces render only accounts that are actually linked, so a
+// lingering stale id is harmless and gets pruned on the next successful GET.
 func (h *Handler) GetMySettings(w http.ResponseWriter, r *http.Request) {
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	if _, err := h.q.PruneUserSidebarCodexAccounts(r.Context(), user.ID); err != nil {
-		slog.Error("prune user sidebar codex accounts", "error", err)
-		httpx.Error(w, http.StatusInternalServerError, "internal error")
+	pruned, err := h.q.PruneUserSidebarCodexAccounts(r.Context(), user.ID)
+	if err != nil {
+		slog.Warn("prune user sidebar codex accounts (best effort)", "error", err)
+		h.userSettingsResponse(w, r, user.ID, nil)
 		return
 	}
-	h.userSettingsResponse(w, r, user.ID)
+	h.userSettingsResponse(w, r, user.ID, &pruned)
 }
 
 // PutMySettings updates the current user's own settings with PATCH-like
@@ -531,7 +548,7 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	h.userSettingsResponse(w, r, user.ID)
+	h.userSettingsResponse(w, r, user.ID, nil)
 }
 
 // maxSidebarTokenIds bounds the request list before any per-id work; nobody
