@@ -818,15 +818,29 @@ func TestUsageDTOTags(t *testing.T) {
 }
 
 func TestSelfUsageDTOTags(t *testing.T) {
-	assertTags(t, "SelfUsageDTO", SelfUsageDTO{}, "lifetime", "last_7_days", "run_count")
+	// PRD #1293: gains "outcomes" (the failed-run rate windows wrapper).
+	assertTags(t, "SelfUsageDTO", SelfUsageDTO{}, "lifetime", "last_7_days", "run_count", "outcomes")
 }
 
 func TestAdminUserUsageDTOTags(t *testing.T) {
-	assertTags(t, "AdminUserUsageDTO", AdminUserUsageDTO{}, "user_id", "email", "usage", "run_count")
+	// PRD #1293: gains "outcomes" (this user's lifetime failed-run rate aggregate).
+	assertTags(t, "AdminUserUsageDTO", AdminUserUsageDTO{}, "user_id", "email", "usage", "run_count", "outcomes")
 }
 
 func TestAdminUsageDTOTags(t *testing.T) {
 	assertTags(t, "AdminUsageDTO", AdminUsageDTO{}, "factory", "users", "earliest_run")
+}
+
+// TestRunOutcomesDTOTags pins the failed-run rate aggregate shape (PRD #1293): five
+// counts plus the fail_origins map, all always present.
+func TestRunOutcomesDTOTags(t *testing.T) {
+	assertTags(t, "RunOutcomesDTO", RunOutcomesDTO{},
+		"finished", "completed", "cancelled", "plan_rejected", "failed", "fail_origins")
+}
+
+// TestRunOutcomeWindowsDTOTags pins the two-window wrapper (PRD #1293).
+func TestRunOutcomeWindowsDTOTags(t *testing.T) {
+	assertTags(t, "RunOutcomeWindowsDTO", RunOutcomeWindowsDTO{}, "lifetime", "last_7_days")
 }
 
 func TestRateLimitWindowTags(t *testing.T) {

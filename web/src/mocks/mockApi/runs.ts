@@ -1,4 +1,5 @@
 import {
+  type AdminUsage,
   type AgentSelectionInput,
   type CredentialEpoch,
   type CredentialOverride,
@@ -7,6 +8,7 @@ import {
   type Run,
   type RunPriority,
   type RunInputKind,
+  type SelfUsage,
 } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
 import { isCredentialSwitchRefusedLane } from "../../lib/credentialOverride";
@@ -403,23 +405,49 @@ export const runsApi = {
   // PRD #40: token/cost usage. Static demo figures — enough to populate the
   // dashboard's "Your usage" and (admin) factory cards + per-user table.
   getUsage: async () =>
-    delay({
+    delay<SelfUsage>({
       lifetime: { input_tokens: 1_610_000, cache_read_tokens: 16_100_000, cache_creation_tokens: 240_000, output_tokens: 710_000, cost_usd: 26.4 },
       last_7_days: { input_tokens: 280_000, cache_read_tokens: 2_800_000, cache_creation_tokens: 40_000, output_tokens: 120_000, cost_usd: 4.55 },
       run_count: 23,
+      // PRD #1293 failed-run outcomes. Internally consistent: finished === completed +
+      // cancelled + plan_rejected + failed, and sum(fail_origins) === failed. finished is a
+      // different population from run_count (D2) — infra failures spend no tokens, so it sits
+      // a little above the 23 usage-bearing runs. Mirrors the u-vlad row below ("you").
+      outcomes: {
+        lifetime: {
+          finished: 30, completed: 22, cancelled: 2, plan_rejected: 1, failed: 5,
+          fail_origins: { agent_failure: 1, run_timeout: 1, worker_lost: 1, rate_limited: 1, unknown: 1 },
+        },
+        last_7_days: {
+          finished: 8, completed: 6, cancelled: 1, plan_rejected: 0, failed: 1,
+          fail_origins: { agent_failure: 1 },
+        },
+      },
     }),
   getAdminUsage: async () =>
-    delay({
+    delay<AdminUsage>({
       factory: {
         lifetime: { input_tokens: 5_400_000, cache_read_tokens: 53_900_000, cache_creation_tokens: 900_000, output_tokens: 2_400_000, cost_usd: 88.15 },
         last_7_days: { input_tokens: 900_000, cache_read_tokens: 9_100_000, cache_creation_tokens: 120_000, output_tokens: 410_000, cost_usd: 14.9 },
         run_count: 79,
+        // Factory lifetime outcomes are the sum of the four per-user rows below (finished 38 +
+        // 30 + 21 + 8 = 97, failed 5 + 5 + 2 + 1 = 13); last_7_days is a smaller window.
+        outcomes: {
+          lifetime: {
+            finished: 97, completed: 77, cancelled: 5, plan_rejected: 2, failed: 13,
+            fail_origins: { agent_failure: 4, run_timeout: 3, worker_lost: 3, rate_limited: 1, unknown: 2 },
+          },
+          last_7_days: {
+            finished: 25, completed: 20, cancelled: 1, plan_rejected: 1, failed: 3,
+            fail_origins: { agent_failure: 2, run_timeout: 1 },
+          },
+        },
       },
       users: [
-        { user_id: "u-maria", email: "maria@example.com", usage: { input_tokens: 2_490_000, cache_read_tokens: 22_400_000, cache_creation_tokens: 400_000, output_tokens: 1_020_000, cost_usd: 37.83 }, run_count: 31 },
-        { user_id: "u-vlad", email: "vlad@example.com", usage: { input_tokens: 1_610_000, cache_read_tokens: 16_100_000, cache_creation_tokens: 240_000, output_tokens: 710_000, cost_usd: 26.4 }, run_count: 23 },
-        { user_id: "u-andrei", email: "andrei@example.com", usage: { input_tokens: 1_010_000, cache_read_tokens: 13_600_000, cache_creation_tokens: 210_000, output_tokens: 550_000, cost_usd: 19.71 }, run_count: 19 },
-        { user_id: "u-dana", email: "dana@example.com", usage: { input_tokens: 290_000, cache_read_tokens: 3_500_000, cache_creation_tokens: 50_000, output_tokens: 120_000, cost_usd: 4.21 }, run_count: 6 },
+        { user_id: "u-maria", email: "maria@example.com", usage: { input_tokens: 2_490_000, cache_read_tokens: 22_400_000, cache_creation_tokens: 400_000, output_tokens: 1_020_000, cost_usd: 37.83 }, run_count: 31, outcomes: { finished: 38, completed: 30, cancelled: 2, plan_rejected: 1, failed: 5, fail_origins: { agent_failure: 2, run_timeout: 1, worker_lost: 1, unknown: 1 } } },
+        { user_id: "u-vlad", email: "vlad@example.com", usage: { input_tokens: 1_610_000, cache_read_tokens: 16_100_000, cache_creation_tokens: 240_000, output_tokens: 710_000, cost_usd: 26.4 }, run_count: 23, outcomes: { finished: 30, completed: 22, cancelled: 2, plan_rejected: 1, failed: 5, fail_origins: { agent_failure: 1, run_timeout: 1, worker_lost: 1, rate_limited: 1, unknown: 1 } } },
+        { user_id: "u-andrei", email: "andrei@example.com", usage: { input_tokens: 1_010_000, cache_read_tokens: 13_600_000, cache_creation_tokens: 210_000, output_tokens: 550_000, cost_usd: 19.71 }, run_count: 19, outcomes: { finished: 21, completed: 18, cancelled: 1, plan_rejected: 0, failed: 2, fail_origins: { agent_failure: 1, worker_lost: 1 } } },
+        { user_id: "u-dana", email: "dana@example.com", usage: { input_tokens: 290_000, cache_read_tokens: 3_500_000, cache_creation_tokens: 50_000, output_tokens: 120_000, cost_usd: 4.21 }, run_count: 6, outcomes: { finished: 8, completed: 7, cancelled: 0, plan_rejected: 0, failed: 1, fail_origins: { run_timeout: 1 } } },
       ],
       earliest_run: "2026-05-12T09:00:00Z",
     }),

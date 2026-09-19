@@ -4139,6 +4139,137 @@ WHERE r.kind <> 'chat'
 GROUP BY u.id, u.email
 ORDER BY cost_usd DESC, output_tokens DESC, u.id;
 
+-- Failed-run rate outcome aggregates (PRD #1293 M1) -------------------------
+-- These count over `runs` DIRECTLY, NOT run_usage_totals (D1): a run that fails at
+-- provisioning / credential lookup / guardrail has no usage row, so a rate computed
+-- over the usage join would systematically hide the infra failures this number exists
+-- to surface. The predicate matches what the Runs page lists: terminal runs only
+-- (status IN ('completed','failed','cancelled')) and kind NOT IN ('chat','judge') (D2 —
+-- a chat/judge failure is not a factory failure). Windowed on created_at (D3), the same
+-- axis as the usage 7-day figures, so the two 7-day numbers on one card describe the
+-- same set of runs. plan_rejected is split out of failed (D4): rejecting a plan is the
+-- owner's decision, kept in the denominator and its own bar segment but out of the
+-- numerator. Every computed column carries an explicit ::bigint cast (the file's
+-- convention). Invariants the handler/live-DB tests assert:
+-- finished == completed + cancelled + plan_rejected + failed.
+
+-- name: SelfRunOutcomes :one
+-- The requesting user's own run outcome counts for BOTH windows (PRD #1293 M1).
+SELECT
+    count(*)::bigint                                                                       AS lifetime_finished,
+    count(*) FILTER (WHERE status = 'completed')::bigint                                   AS lifetime_completed,
+    count(*) FILTER (WHERE status = 'cancelled')::bigint                                   AS lifetime_cancelled,
+    count(*) FILTER (WHERE status = 'failed' AND fail_origin = 'plan_rejected')::bigint    AS lifetime_plan_rejected,
+    count(*) FILTER (WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected')::bigint AS lifetime_failed,
+    count(*) FILTER (WHERE created_at >= now() - interval '7 days')::bigint                AS last7_finished,
+    count(*) FILTER (WHERE status = 'completed' AND created_at >= now() - interval '7 days')::bigint AS last7_completed,
+    count(*) FILTER (WHERE status = 'cancelled' AND created_at >= now() - interval '7 days')::bigint AS last7_cancelled,
+    count(*) FILTER (WHERE status = 'failed' AND fail_origin = 'plan_rejected' AND created_at >= now() - interval '7 days')::bigint AS last7_plan_rejected,
+    count(*) FILTER (WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected' AND created_at >= now() - interval '7 days')::bigint AS last7_failed
+FROM runs
+WHERE user_id = @user_id
+  AND status IN ('completed', 'failed', 'cancelled')
+  AND kind NOT IN ('chat', 'judge');
+
+-- name: AdminRunOutcomes :one
+-- Factory-wide run outcome counts for BOTH windows (PRD #1293 M1); same shape as
+-- SelfRunOutcomes without the user filter.
+SELECT
+    count(*)::bigint                                                                       AS lifetime_finished,
+    count(*) FILTER (WHERE status = 'completed')::bigint                                   AS lifetime_completed,
+    count(*) FILTER (WHERE status = 'cancelled')::bigint                                   AS lifetime_cancelled,
+    count(*) FILTER (WHERE status = 'failed' AND fail_origin = 'plan_rejected')::bigint    AS lifetime_plan_rejected,
+    count(*) FILTER (WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected')::bigint AS lifetime_failed,
+    count(*) FILTER (WHERE created_at >= now() - interval '7 days')::bigint                AS last7_finished,
+    count(*) FILTER (WHERE status = 'completed' AND created_at >= now() - interval '7 days')::bigint AS last7_completed,
+    count(*) FILTER (WHERE status = 'cancelled' AND created_at >= now() - interval '7 days')::bigint AS last7_cancelled,
+    count(*) FILTER (WHERE status = 'failed' AND fail_origin = 'plan_rejected' AND created_at >= now() - interval '7 days')::bigint AS last7_plan_rejected,
+    count(*) FILTER (WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected' AND created_at >= now() - interval '7 days')::bigint AS last7_failed
+FROM runs
+WHERE status IN ('completed', 'failed', 'cancelled')
+  AND kind NOT IN ('chat', 'judge');
+
+-- name: AdminRunOutcomesPerUser :many
+-- Per-user LIFETIME outcome counts for the admin factory breakdown (PRD #1293 M1, D5).
+-- Joins users so an outcome-only user (every run died before spending, so no usage row)
+-- still has an email to render; the handler merges this by user id against the usage
+-- rows. Lifetime-only, matching the admin per-user table's lifetime figures.
+SELECT u.id AS user_id, u.email,
+    count(*)::bigint                                                                       AS finished,
+    count(*) FILTER (WHERE r.status = 'completed')::bigint                                 AS completed,
+    count(*) FILTER (WHERE r.status = 'cancelled')::bigint                                 AS cancelled,
+    count(*) FILTER (WHERE r.status = 'failed' AND r.fail_origin = 'plan_rejected')::bigint AS plan_rejected,
+    count(*) FILTER (WHERE r.status = 'failed' AND r.fail_origin IS DISTINCT FROM 'plan_rejected')::bigint AS failed
+FROM runs r
+JOIN users u ON u.id = r.user_id
+WHERE r.status IN ('completed', 'failed', 'cancelled')
+  AND r.kind NOT IN ('chat', 'judge')
+GROUP BY u.id, u.email
+ORDER BY u.id;
+
+-- Per-origin failure causes (PRD #1293 M1). One :many per scope over the `failed` rows
+-- only (status='failed' AND fail_origin IS DISTINCT FROM 'plan_rejected'), grouped by
+-- COALESCE(fail_origin,'unknown') so a pre-00126 NULL-origin failure buckets as
+-- 'unknown'. Folded into RunOutcomesDTO.fail_origins in Go — the default, because
+-- runtime.sql has no precedent for returning a jsonb aggregate to Go (jsonb reaches Go
+-- only as a plain []byte table column). window_tag distinguishes the two windows
+-- ('lifetime' / 'last7') via a UNION ALL of two grouped selects; sum over a window's
+-- rows equals that window's `failed` count.
+
+-- name: SelfRunOutcomeOrigins :many
+-- The requesting user's per-origin failure causes for BOTH windows (PRD #1293 M1).
+-- The `runs r` alias qualifies user_id so the @user_id param types unambiguously across
+-- the UNION ALL branches (an unqualified user_id trips sqlc's cross-branch resolution).
+SELECT 'lifetime'::text AS window_tag,
+    COALESCE(r.fail_origin, 'unknown')::text AS origin,
+    count(*)::bigint AS cnt
+FROM runs r
+WHERE r.user_id = @user_id
+  AND r.status = 'failed' AND r.fail_origin IS DISTINCT FROM 'plan_rejected'
+  AND r.kind NOT IN ('chat', 'judge')
+GROUP BY COALESCE(r.fail_origin, 'unknown')
+UNION ALL
+SELECT 'last7'::text AS window_tag,
+    COALESCE(r.fail_origin, 'unknown')::text AS origin,
+    count(*)::bigint AS cnt
+FROM runs r
+WHERE r.user_id = @user_id
+  AND r.status = 'failed' AND r.fail_origin IS DISTINCT FROM 'plan_rejected'
+  AND r.kind NOT IN ('chat', 'judge')
+  AND r.created_at >= now() - interval '7 days'
+GROUP BY COALESCE(r.fail_origin, 'unknown');
+
+-- name: AdminRunOutcomeOrigins :many
+-- Factory-wide per-origin failure causes for BOTH windows (PRD #1293 M1).
+SELECT 'lifetime'::text AS window_tag,
+    COALESCE(fail_origin, 'unknown')::text AS origin,
+    count(*)::bigint AS cnt
+FROM runs
+WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected'
+  AND kind NOT IN ('chat', 'judge')
+GROUP BY COALESCE(fail_origin, 'unknown')
+UNION ALL
+SELECT 'last7'::text AS window_tag,
+    COALESCE(fail_origin, 'unknown')::text AS origin,
+    count(*)::bigint AS cnt
+FROM runs
+WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected'
+  AND kind NOT IN ('chat', 'judge')
+  AND created_at >= now() - interval '7 days'
+GROUP BY COALESCE(fail_origin, 'unknown');
+
+-- name: AdminRunOutcomeOriginsPerUser :many
+-- Per-user LIFETIME per-origin failure causes (PRD #1293 M1), grouped by user_id so the
+-- handler can attach each user's causes by id. Lifetime-only, matching
+-- AdminRunOutcomesPerUser.
+SELECT r.user_id,
+    COALESCE(r.fail_origin, 'unknown')::text AS origin,
+    count(*)::bigint AS cnt
+FROM runs r
+WHERE r.status = 'failed' AND r.fail_origin IS DISTINCT FROM 'plan_rejected'
+  AND r.kind NOT IN ('chat', 'judge')
+GROUP BY r.user_id, COALESCE(r.fail_origin, 'unknown');
+
 -- History usage refold (PRD #1079 M3) ---------------------------------------
 -- A boot one-shot re-folds every PRE-MIGRATION terminal non-chat run through the
 -- SAME foldUsageFrames the incremental path uses, replacing the collapsed

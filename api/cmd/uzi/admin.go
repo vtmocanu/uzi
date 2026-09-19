@@ -591,11 +591,27 @@ func stagedCountCell(staged *apitypes.AgentSourceStagedDTO, pick func(apitypes.A
 	return fmt.Sprintf("%d", pick(staged.Counts))
 }
 
+// failRate renders the failed-run rate as a one-decimal percentage with a "%"
+// suffix, or "-" when there are no finished runs (PRD #1293 D6). The rate is
+// client-computed (failed/finished) so the CLI and web share one formatting rule
+// and cannot disagree with each other or the server.
+func failRate(failed, finished int64) string {
+	if finished == 0 {
+		return "-"
+	}
+	return fmt.Sprintf("%.1f%%", float64(failed)/float64(finished)*100)
+}
+
 // renderAdminUsage prints the factory lifetime totals plus the per-user breakdown.
+// The factory line and the per-user table carry the PRD #1293 failed-run figures
+// (lifetime), mirroring the web column order (D8): Runs · Failed · Fail rate come
+// before the token columns. SHARE stays web-only.
 func renderAdminUsage(p *uzicli.Printer, u apitypes.AdminUsageDTO) error {
 	lt := u.Factory.Lifetime
-	p.Printf("factory (lifetime): input=%d cache_read=%d cache_creation=%d output=%d cost=$%.2f (runs=%d)\n",
-		lt.InputTokens, lt.CacheReadTokens, lt.CacheCreationTokens, lt.OutputTokens, lt.CostUSD, u.Factory.RunCount)
+	lo := u.Factory.Outcomes.Lifetime
+	p.Printf("factory (lifetime): input=%d cache_read=%d cache_creation=%d output=%d cost=$%.2f (runs=%d) finished=%d failed=%d fail_rate=%s\n",
+		lt.InputTokens, lt.CacheReadTokens, lt.CacheCreationTokens, lt.OutputTokens, lt.CostUSD, u.Factory.RunCount,
+		lo.Finished, lo.Failed, failRate(lo.Failed, lo.Finished))
 	if len(u.Users) == 0 {
 		return nil
 	}
@@ -604,13 +620,15 @@ func renderAdminUsage(p *uzicli.Printer, u apitypes.AdminUsageDTO) error {
 	for _, row := range u.Users {
 		rows = append(rows, []string{
 			row.Email,
+			fmt.Sprintf("%d", row.RunCount),
+			fmt.Sprintf("%d", row.Outcomes.Failed),
+			failRate(row.Outcomes.Failed, row.Outcomes.Finished),
 			fmt.Sprintf("%d", row.Usage.InputTokens),
 			fmt.Sprintf("%d", row.Usage.OutputTokens),
 			fmt.Sprintf("$%.2f", row.Usage.CostUSD),
-			fmt.Sprintf("%d", row.RunCount),
 		})
 	}
-	return p.Table([]string{"EMAIL", "INPUT", "OUTPUT", "COST", "RUNS"}, rows)
+	return p.Table([]string{"EMAIL", "RUNS", "FAILED", "FAIL%", "INPUT", "OUTPUT", "COST"}, rows)
 }
 
 func vaultCell(locked bool) string {
