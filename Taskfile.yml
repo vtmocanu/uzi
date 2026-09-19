@@ -167,7 +167,7 @@ output: prefixed
 # command, so the resolved pin stays visible without accepting shell input.
 vars:
   # renovate: datasource=github-releases depName=golangci-lint-taskfile packageName=golangci/golangci-lint
-  GOLANGCI_LINT_VERSION: v2.12.2
+  GOLANGCI_LINT_VERSION: v2.13.2
 
 # THE TWO SANCTIONED INCLUDES (rule 3), and they are LOCAL, not remote. Both reuse
 # `./homebrew-tap.yml`, a VENDORED copy of vtmocanu/task's reusable brew mechanic (see its
