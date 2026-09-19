@@ -203,8 +203,12 @@ beforeEach(() => {
 });
 
 const zeros = () => ({ input_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0, output_tokens: 0, cost_usd: 0 });
+// PRD #1293: zero outcomes keep the failed-runs block hidden (finished===0), so these
+// usage fixtures leave the existing "nothing yet" / card assertions unchanged.
+const zeroOutcomes = () => ({ finished: 0, completed: 0, cancelled: 0, plan_rejected: 0, failed: 0, fail_origins: {} });
+const zeroOutcomeWindows = () => ({ lifetime: zeroOutcomes(), last_7_days: zeroOutcomes() });
 function emptySelf() {
-  return { lifetime: zeros(), last_7_days: zeros(), run_count: 0 };
+  return { lifetime: zeros(), last_7_days: zeros(), run_count: 0, outcomes: zeroOutcomeWindows() };
 }
 
 afterEach(() => {
@@ -413,12 +417,13 @@ describe("Dashboard usage cards (PRD #40)", () => {
     lifetime: bundle(1_610_000, 16_100_000, 710_000, 26.4),
     last_7_days: bundle(200_000, 2_800_000, 100_000, 4.55),
     run_count: 23,
+    outcomes: zeroOutcomeWindows(),
   };
   const adminUsage = {
-    factory: { lifetime: bundle(5_400_000, 53_900_000, 2_400_000, 88.15), last_7_days: zeros(), run_count: 79 },
+    factory: { lifetime: bundle(5_400_000, 53_900_000, 2_400_000, 88.15), last_7_days: zeros(), run_count: 79, outcomes: zeroOutcomeWindows() },
     users: [
-      { user_id: "a", email: "vlad@example.com", usage: bundle(1_610_000, 16_100_000, 710_000, 26.4), run_count: 23 },
-      { user_id: "b", email: "maria@example.com", usage: bundle(2_490_000, 21_400_000, 1_020_000, 37.83), run_count: 31 },
+      { user_id: "a", email: "vlad@example.com", usage: bundle(1_610_000, 16_100_000, 710_000, 26.4), run_count: 23, outcomes: zeroOutcomes() },
+      { user_id: "b", email: "maria@example.com", usage: bundle(2_490_000, 21_400_000, 1_020_000, 37.83), run_count: 31, outcomes: zeroOutcomes() },
     ],
     earliest_run: "2026-05-12T09:00:00Z",
   };
