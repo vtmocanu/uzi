@@ -337,6 +337,9 @@ func (h *Handler) decideGuardrailOverrideRequest(w http.ResponseWriter, r *http.
 			return
 		}
 		switch verdict, note := h.revalidateApprove(ctx, repo); verdict {
+		case approveProceed:
+			// Control continues past the switch to the tx, which settles the request and
+			// arms the override. Kept explicit so the switch is exhaustive and fails closed.
 		case approveDismiss:
 			h.dismissStaleOverrideRequest(ctx, w, reqRow, user.ID, note)
 			return
@@ -344,6 +347,12 @@ func (h *Handler) decideGuardrailOverrideRequest(w http.ResponseWriter, r *http.
 			// Leave the pending request intact — a transient forge outage must not destroy a
 			// still-valid request. Refuse the approval so no stale/unwaivable override is armed.
 			httpx.Error(w, http.StatusConflict, "this override request cannot be approved right now — "+note)
+			return
+		default:
+			// Fail closed: an unrecognized revalidation verdict must never reach the arming
+			// tx. Refuse rather than risk arming an override on an unclassified state.
+			slog.Error("approve guardrail override: unknown revalidation verdict", "verdict", int(verdict))
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return
 		}
 		// approveProceed falls through to the tx that settles the request and arms the override.
