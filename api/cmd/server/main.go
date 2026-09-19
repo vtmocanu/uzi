@@ -27,6 +27,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/anthropic"
 	"github.com/vtmocanu/uzi/api/internal/auth"
 	"github.com/vtmocanu/uzi/api/internal/codexauth"
+	"github.com/vtmocanu/uzi/api/internal/codexusagepoller"
 	"github.com/vtmocanu/uzi/api/internal/config"
 	"github.com/vtmocanu/uzi/api/internal/forgesvc"
 	"github.com/vtmocanu/uzi/api/internal/handler"
@@ -1070,6 +1071,34 @@ func run() error {
 		slog.Info("usage poller disabled (UZI_USAGE_POLL_INTERVAL=0)")
 	}
 
+	// Per-account Codex rate-limit poller (PRD #1209 M2): each pass reconciles staged codex
+	// aliases (the first production caller of the NONROTATING identity reconciler) and then
+	// polls every canonical linked account's rate-limit meter through workersvc — whose
+	// collector returns a token-free reading, so the raw access token never leaves workersvc.
+	// The usage GET is FREE (it reads the account's own meter, spending no token), so 0
+	// disables the WHOLE goroutine — Boot, ticker, poke AND the staged-reconcile egress. Held
+	// in an outer var so the credential-save handler can poke it.
+	//
+	// The M2 usage read REUSES the refresher's injected client (workersvc reaches ReadUsage
+	// through its own s.codexRefresh seam, set by SetCodexRefresh above), so no client is
+	// created for it. The reconciler's NONROTATING DiscoverIdentity gets its own client here,
+	// wired with the SAME per-request bound as the refresher — the same bounds, not a second
+	// differently-bounded client.
+	var codexUsageEngine *codexusagepoller.Engine
+	if cfg.CodexUsagePollInterval > 0 {
+		codexReconciler := workersvc.NewCodexReconciler(q, vlt, box,
+			codexauth.NewClient(codexauth.WithPerRequestTimeout(codexProviderRequestTimeout)), pool)
+		codexUsageEngine = codexusagepoller.New(q, wsvc, codexReconciler, cfg.CodexUsagePollInterval, slog.Default())
+		bgWG.Add(1)
+		go func() {
+			defer bgWG.Done()
+			codexUsageEngine.Boot(ctx)
+			codexUsageEngine.Run(ctx)
+		}()
+	} else {
+		slog.Info("codex usage poller disabled (UZI_CODEX_USAGE_POLL_INTERVAL=0)")
+	}
+
 	// Agent-source reconcile loop (PRD #602 M3): on each AgentSourceInterval tick, and
 	// only when agent_source_enabled is true, it clones the configured source at the
 	// pinned ref, parses the `.claude/agents/*.md` role files with the shared M3a
@@ -1170,6 +1199,12 @@ func run() error {
 	// *usagepoller.Engine must never be handed to the handler.
 	if usageEngine != nil {
 		h.SetUsagePoker(usageEngine)
+	}
+	// Wire the Codex account rate-limit poller so saving/replacing a codex credential pokes it
+	// for an immediate reconcile+poll (PRD #1209 M2). Only when the poller is enabled — a nil
+	// engine must never be handed to the handler.
+	if codexUsageEngine != nil {
+		h.SetCodexUsagePoker(codexUsageEngine)
 	}
 	// Wire the OIDC relying party when configured (PRD #45). Discovery is warmed once
 	// here so a misconfigured or unreachable IdP is surfaced loudly at boot; a failure

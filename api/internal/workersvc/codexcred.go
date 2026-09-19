@@ -276,18 +276,23 @@ func (r *CodexReconciler) reconcileTuple(ctx context.Context, q codexCredStore, 
 		// Existing account for this tuple. The imported blob's identity is freshly VERIFIED
 		// (that is how we resolved THIS account), so:
 		//   - if the account is QUARANTINED (a dead login the coordinated refresher could not
-		//     roll forward), RESTORE the canonical login from this verified blob BEFORE
-		//     linking (audit #5): RefreshCodexAccountLogin installs it, advances the
-		//     generation, and clears the quarantine, so the account is usable again;
-		//   - if the account is HEALTHY (idle/committed), keep the no-overwrite converge — it
-		//     is authoritative and another alias may already hold the canonical material.
-		// Order: verify identity → (if quarantined) restore login → CAS-link. The restore
+		//     roll forward) OR flagged REAUTH_REQUIRED (the poll path proved its access token
+		//     expired with no renewal material, PRD #1209 M2), RESTORE the canonical login from
+		//     this verified blob BEFORE linking: RefreshCodexAccountLogin's two-arm CAS installs
+		//     it, advances the generation, and clears the quarantine AND/OR the reauth flag, so
+		//     the account is usable — and pollable — again;
+		//   - if the account is HEALTHY (idle/committed, no reauth flag), keep the no-overwrite
+		//     converge — it is authoritative and another alias may already hold the canonical
+		//     material.
+		// Order: verify identity → (if quarantined/reauth) restore login → CAS-link. The restore
 		// and the link are in the same transaction, so a lost link CAS rolls the restore back
 		// (the account keeps its dead login + old generation), and an ordinary duplicate
-		// import that merely OBSERVED the quarantine cannot install a re-login it did not win:
-		// it is still gated by (i) the account-generation CAS here and (ii) the alias
-		// material-revision link CAS below.
-		if acct.CoordState == codexCoordQuarantined {
+		// import that merely OBSERVED the quarantine/reauth cannot install a re-login it did not
+		// win: it is still gated by (i) the account-generation CAS here (RefreshCodexAccountLogin
+		// fences on generation = from_generation, and the reauth arm additionally on
+		// reauth_generation/revision = the live values) and (ii) the alias material-revision link
+		// CAS below.
+		if acct.CoordState == codexCoordQuarantined || acct.ReauthRequired {
 			sealed, sealedWith, serr := r.sealLogin(userID, plain)
 			if serr != nil {
 				return fmt.Errorf("codex reconcile: seal re-login: %w", serr)
@@ -303,10 +308,11 @@ func (r *CodexReconciler) reconcileTuple(ctx context.Context, q codexCredStore, 
 				return fmt.Errorf("codex reconcile: restore re-login: %w", rerr)
 			}
 			if n == 0 {
-				// CAS lost: a concurrent PromoteCodexRecovery advanced the generation (or the
-				// account is no longer quarantined) under this restore. Reject BEFORE linking —
-				// linking against a moved quarantine would bind the run to stale material.
-				return fmt.Errorf("codex reconcile: quarantine moved under restore CAS")
+				// CAS lost: a concurrent PromoteCodexRecovery / refresh advanced the generation
+				// (or the account is no longer quarantined, or the reauth window closed) under
+				// this restore. Reject BEFORE linking — linking against moved authority would
+				// bind the run to stale material.
+				return fmt.Errorf("codex reconcile: quarantine/reauth moved under restore CAS")
 			}
 		}
 		return r.link(ctx, q, userID, userSecretID, acct.ID, observedMaterialRevision)
