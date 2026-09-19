@@ -786,6 +786,45 @@ run_rc "$S8A" 0.4.0
 assert_eq "next plain cut ignores the abandoned v0.2.0-rc.1 and exits 0" "0" "$RC_RC"
 assert_eq "next plain cut is 0.4.0-rc.1"                               "0.4.0-rc.1" "$(chart_ver "$S8A")"
 
+echo "=== M2: a local main BEHIND origin/main is refused before anything is cut ==="
+# release-cut reads the LOCAL HEAD: a stale main changes --promote's promote-only decision
+# (fewer shipping commits since the RC) and cuts from a base whose release commit can never
+# fast-forward onto origin. Refuse up front instead of failing at the push.
+SBH="$(mktemp -d)"; seed_repo "$SBH"; add_origin "$SBH"; add_feature "$SBH" 201
+put_changelog "$SBH" <<'MD'
+# Changelog
+
+## [Unreleased]
+### Added
+- **Feature 201** (#201)
+
+## [0.1.0] - 2026-09-01
+### Added
+- **Initial** (#100)
+MD
+add_feature "$SBH" 202
+git -C "$SBH" push -q origin main
+git -C "$SBH" reset -q --hard HEAD~1          # local main is now 1 behind origin/main
+run_rc "$SBH" 0.2.0
+assert_eq "a main behind origin/main exits 3" "3" "$RC_RC"
+assert_contains "the behind refusal names the cause" "behind origin/main" "$RC_OUT"
+assert_eq "a refused stale cut leaves the chart untouched" "0.1.0" "$(chart_ver "$SBH")"
+git -C "$SBH" merge -q --ff-only origin/main
+put_changelog "$SBH" <<'MD'
+# Changelog
+
+## [Unreleased]
+### Added
+- **Feature 201** (#201)
+- **Feature 202** (#202)
+
+## [0.1.0] - 2026-09-01
+### Added
+- **Initial** (#100)
+MD
+run_rc "$SBH" 0.2.0
+assert_eq "after the fast-forward the same cut exits 0" "0" "$RC_RC"
+
 echo "=== M2b: --promote REFUSED when the in-flight RC is local-only (not on origin) ==="
 # The 0.83.0-rc.7 guard: promotion re-tags the RC's PUBLISHED agent image, so an RC that
 # was never pushed (never built by release.yml) must not promote. Same setup as S8 but the
@@ -1021,7 +1060,7 @@ assert_eq "autobump does NOT repin on the broken-instrument path"        "0.7.0-
 
 rm -rf "$S1" "$S3" "$S4" "$S6" "$S7" "$S8" "$S8P" "$S8O" "$S8R" "$S8N" "$S8A" "$S8B" "$S8C" "$S9" "$S10" "$SA" "$SB" "$SC" "$SD" "$SE" \
        "$S8.origin.git" "$S8P.origin.git" "$S8O.origin.git" "$S8R.origin.git" "$S8A.origin.git" "$S8B.origin.git" "$S9.origin.git" "$S10.origin.git" "$SD.origin.git" "$SE.origin.git" \
-       "$S8R.draft.md"
+       "$S8R.draft.md" "$SBH" "$SBH.origin.git"
 
 echo "=== M3: release-mode lib (shared by watch + verify) ==="
 # shellcheck source=scripts/lib/release-mode.sh
