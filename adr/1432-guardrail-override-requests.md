@@ -83,19 +83,57 @@ The endpoint NEVER sets an override and NEVER enables the repo — only the admi
 write and Enable do. It mounts in the same authenticated repos group as the Enable
 action, owner-scoped (a non-owned or unknown id is a 404).
 
-### Approval sets the EXISTING #66 override inside the status transition; it never enables
+### Approval RE-RUNS the live guard before it arms the EXISTING #66 override; it never enables
 
-Approve settles the pending request and, in the **same transaction** as the status
-change, sets the existing #66 per-repo override on the `repos` row with the
-member's own reason, the deciding admin as actor, and `now()`. It deliberately
-does **not** enable the repo: the owner retries Enable so the live guard re-runs
-against current forge state and remains authoritative. Approving an exception and
-spending the enable are kept as separate acts, and a repo whose protection changed
-between request and approval is re-judged, not blindly enabled.
+Approve **first re-runs the live guard** (`GuardRepo` with `Overridden: false` —
+the same raw refusal set the request path evaluates, so approve-time and
+request-time agree on what "blocked" and "fully waivable" mean). Only when the repo
+is *still* blocked by a fully-waivable refusal does approve settle the pending
+request and, in the **same transaction** as the status change, set the existing #66
+per-repo override on the `repos` row with the member's own reason, the deciding
+admin as actor, and `now()`. It deliberately does **not** enable the repo: the
+owner retries Enable so the live guard re-runs against current forge state and
+remains authoritative. Approving an exception and spending the enable are kept as
+separate acts. A request opened while the repo was blocked can go stale — the owner
+may have fixed protection or enabled the repo before the admin decides — so
+approval no longer blindly arms a snapshot; it re-judges first. This closes the
+hole where arming an override on a no-longer-blocked repo would silently waive a
+future regression that reintroduces a waivable block.
+
+The revalidation yields one of three outcomes:
+
+- **ARM** (`approveProceed`) — the repo is still blocked by a fully-waivable
+  refusal. Fall through to the tx above: settle approved and set the override.
+- **DISMISS as moot** (`approveDismiss`) — the repo is already enabled, or a
+  successful live guard shows it is no longer blocked. Settle the request
+  **rejected** with an explanatory server-authored `decision_note` and return 409.
+  There is nothing to waive.
+- **REFUSE but LEAVE pending** (`approveRefuse`) — the current block cannot be
+  waived (not fully waivable). Because `GuardRepo` **fails closed**, this also
+  covers a TRANSIENT forge outage surfaced as `protection_unreadable`. Return 409
+  and leave the request pending. The point: a transient forge blip must not
+  permanently destroy a still-valid request — an admin can retry approving later
+  once protection is readable, or reject it deliberately.
+
+Neither auto-settle path notifies the requester. The generic decided-notification
+body ("an instance admin rejected your request") would misdescribe a SYSTEM
+dismissal of an approve as an admin rejection; the persisted `decision_note`
+explains the state change on the member's Repos page instead. (A deliberate admin
+reject still notifies as normal.)
+
+### A successful Enable settles any pending override request for that repo
+
+When Enable succeeds, it deletes any pending override request for that repo
+(`DeletePendingGuardrailOverrideRequestsForRepo`, from `SetRepoEnabled`), so a
+request the owner rendered moot by enabling does not linger in the admin queue —
+which is **not** filtered by enabled state. Enable-only: the shared toggle is also
+the disable path, which must not touch requests. Best-effort — the enable already
+succeeded, so a cleanup error is logged, never surfaced.
 
 The persisted `findings` jsonb is **display/audit only**. It is never re-evaluated
-and never consulted to decide safety at enable time — the block decision is always
-recomputed live. Reject settles the request with no override write.
+and never consulted to decide safety at approve or enable time — the block decision
+is always recomputed live. Reject settles the request with no override write (a
+stale reject is harmless, so reject needs no revalidation).
 
 ### Requester notification reuses the generic notifysvc seam — no schema change
 
@@ -134,6 +172,10 @@ step — nothing else references the number.
 - `repos.guardrail_override_by` (RESTRICT) stays the single authoritative live
   override actor; the request table's `decided_by` is audit history and may go null
   when an admin account is deleted.
-- Enable stays the one authoritative, live-evaluated gate. Approval arms the
-  override; it never substitutes for the live guard, and the stored findings never
-  feed a safety decision.
+- Enable stays the one authoritative, live-evaluated gate. Approval now ALSO
+  live-revalidates before it acts — it re-runs the guard and arms the override only
+  when the repo is still blocked by a fully-waivable refusal, so it never blindly
+  arms a stale snapshot — but it never substitutes for the live guard, and the
+  stored findings never feed a safety decision. A moot request is auto-dismissed
+  (on approve, or when a successful Enable settles it); a request whose block can't
+  currently be waived is refused and left pending rather than destroyed.
