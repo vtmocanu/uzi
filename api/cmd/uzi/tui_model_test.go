@@ -1425,6 +1425,14 @@ func TestTUIBoardCostCell(t *testing.T) {
 		t.Errorf("cost cell: an empty-status run must render n/a, got %q", s)
 	}
 
+	// A hostile/future cost_status this build has never heard of ("future-v2" stands in for a
+	// value a newer server can add to the wire enum) must fold to the SAME safe "n/a" bucket,
+	// never a dollar figure — mirroring web costStatus.ts's hostile-enum coverage (D7).
+	future := apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{Usage: &apitypes.UsageDTO{CostStatus: "future-v2", CostUSD: 0, InputTokens: 100}}}
+	if s := stripANSI(m.boardCostSeg(future, nil)); !strings.Contains(s, "n/a") || strings.Contains(s, "$") {
+		t.Errorf("cost cell: an unrecognised future cost_status must render n/a with no dollar figure, got %q", s)
+	}
+
 	// A sub-dollar metered cost renders "<$1" (so a real cost never shows as $0).
 	subdollar := apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{Usage: &apitypes.UsageDTO{CostStatus: "metered", CostUSD: 0.3, InputTokens: 100}}}
 	if s := stripANSI(m.boardCostSeg(subdollar, nil)); !strings.Contains(s, "<$1") {
@@ -2361,10 +2369,16 @@ func TestTUIDetailSpendUnreportedCost(t *testing.T) {
 func TestTUIBoardCostAsciiSurvives(t *testing.T) {
 	// Two tokens so the credential gate clears (secretsMsg{count:2}); at width 120 the mile
 	// threshold (111) is under the terminal so every column, COST included, renders.
+	//
+	// The second run's IssueTitle deliberately avoids "sub"/"subscription" (unlike an earlier
+	// version of this fixture, "a subscription run") — that title text would satisfy a plain
+	// whole-frame strings.Contains(out, "sub") on its own, so a boardCostSeg regression that
+	// rendered "$0" instead of "sub" for a subscription-status run would go undetected. The
+	// per-row assertion below additionally scopes the check to this run's OWN rendered line.
 	runs := []apitypes.RunListItemDTO{
 		{RunDTO: apitypes.RunDTO{ID: "aaaaaaaa-1", Kind: "issue", Status: "running", IssueTitle: "a real cost",
 			Usage: &apitypes.UsageDTO{CostStatus: "metered", CostUSD: 12.0, InputTokens: 100}}}, // → "$12"
-		{RunDTO: apitypes.RunDTO{ID: "bbbbbbbb-2", Kind: "issue", Status: "running", IssueTitle: "a subscription run",
+		{RunDTO: apitypes.RunDTO{ID: "bbbbbbbb-2", Kind: "issue", Status: "running", IssueTitle: "a plan-billed run",
 			Usage: &apitypes.UsageDTO{CostStatus: "subscription", CostUSD: 0, InputTokens: 100}}}, // → "sub"
 	}
 	m := tuiTestModel(t, &uzicli.FakeClient{Runs: runs}, "")
@@ -2379,12 +2393,27 @@ func TestTUIBoardCostAsciiSurvives(t *testing.T) {
 	m = next.(tuiModel)
 	out := stripANSI(m.View().Content)
 
-	// The per-row "$12" cell, the "sub" subscription cue, and the rounded floor total (round(12+0) =
-	// "$12") all survive with colour gone.
-	for _, want := range []string{"$12", "sub"} {
-		if !strings.Contains(out, want) {
-			t.Errorf("Ascii-profile board dropped the plain cost cue %q:\n%s", want, out)
+	// The metered run's "$12" cell survives anywhere in the frame.
+	if !strings.Contains(out, "$12") {
+		t.Errorf("Ascii-profile board dropped the plain cost cue %q:\n%s", "$12", out)
+	}
+
+	// The subscription run's "sub" cue must appear on ITS OWN row (found by its unique title,
+	// which carries no "sub"/"subscription" substring itself) — a $0/n/a regression in
+	// boardCostSeg would drop "sub" from this line even though other chrome elsewhere in the
+	// frame might coincidentally contain it.
+	var subRow string
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, "a plan-billed run") {
+			subRow = line
+			break
 		}
+	}
+	if subRow == "" {
+		t.Fatalf("no board row found for the subscription run:\n%s", out)
+	}
+	if !strings.Contains(subRow, "sub") {
+		t.Errorf("Ascii-profile board dropped the plain cost cue %q on the subscription run's row:\n%s", "sub", subRow)
 	}
 }
 
