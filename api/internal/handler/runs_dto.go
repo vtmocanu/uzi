@@ -541,6 +541,21 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 	return dto
 }
 
+// landingStateOverlay resolves the capture-aware landing_state for a single-run detail read
+// (issue #1418). On a capture-lookup error we do NOT know whether an available recovery
+// capture exists, so for a human-landable origin with no preserved_patch — whose
+// capture-unaware seed from runToDTO is "unrecoverable" — we must not emit that definitive
+// "work is lost" state on a transient DB blip. Bias to capture-present so the safe degraded
+// value is the actionable "needs_landing", which points the operator at `uzi run export`
+// (itself the source of truth for capture availability). The run-list path reads the capture
+// fact authoritatively from a joined column and never takes this error branch.
+func landingStateOverlay(failOrigin *string, hasPreservedPatch, hasAvailableCapture bool, lookupErr error) string {
+	if lookupErr != nil {
+		return workersvc.DeriveLandingState(failOrigin, hasPreservedPatch, true)
+	}
+	return workersvc.DeriveLandingState(failOrigin, hasPreservedPatch, hasAvailableCapture)
+}
+
 // runExtensionCapSeconds reads the per-run extension cap (PRD #1189) best-effort for the DTO:
 // a nil settings cache or a read error reads as 0 (extending disabled / unknown), so a
 // momentarily-unreadable setting never fails a run read — the client falls back to plain

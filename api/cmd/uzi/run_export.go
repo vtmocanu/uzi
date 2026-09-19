@@ -263,6 +263,20 @@ func hasAvailableArchive(summary apitypes.RecoveryArchiveSummaryDTO) bool {
 	return false
 }
 
+// availableCaptureIDs returns the (TTY-sanitized) ids of every downloadable 'available'
+// capture, in summary order. Used by the landing hint to name a concrete `--capture <id>`
+// when more than one is available — `uzi run export` auto-selects a SOLE available capture
+// but refuses to guess between several (ExitUsage), so a bare command would misdirect.
+func availableCaptureIDs(summary apitypes.RecoveryArchiveSummaryDTO) []string {
+	var ids []string
+	for _, a := range summary.Archives {
+		if a.State == recoveryStateAvailable {
+			ids = append(ids, sanitizeTTY(a.ID))
+		}
+	}
+	return ids
+}
+
 // renderLandingHint appends the issue #1418 human-landing hint to `uzi run get`'s human output,
 // printed ONLY when the run's server-derived landing_state is "needs_landing" — a failed run
 // whose committed work is human-landable. It names the recovery command that actually applies,
@@ -286,7 +300,14 @@ func renderLandingHint(env Env, gf *globalFlags, run apitypes.RunDTO, summary ap
 	id := sanitizeTTY(run.ID)
 	switch {
 	case hasAvailableArchive(summary):
-		p.Printf("\nthis failed run's committed work is landable by hand: export the recovery archive with `uzi run export %s`\n", id)
+		// `uzi run export <run-id>` auto-selects a SOLE available capture, but refuses to guess
+		// between several — name a concrete `--capture <id>` then so the hint is a runnable
+		// command, not one the CLI would reject (issue #1418).
+		if ids := availableCaptureIDs(summary); len(ids) > 1 {
+			p.Printf("\nthis failed run's committed work is landable by hand: it has %d recovery archives — export one with `uzi run export %s --capture <id>` (ids: %s)\n", len(ids), id, strings.Join(ids, ", "))
+		} else {
+			p.Printf("\nthis failed run's committed work is landable by hand: export the recovery archive with `uzi run export %s`\n", id)
+		}
 	case run.PreservedPatch != nil && strings.TrimSpace(*run.PreservedPatch) != "":
 		p.Printf("\nthis failed run's committed work is landable by hand: its diff is preserved — view it with `uzi run get %s --field preserved_patch`\n", id)
 	default:

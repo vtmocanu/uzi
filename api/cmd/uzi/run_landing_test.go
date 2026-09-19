@@ -133,6 +133,54 @@ func TestRunGetLandingHintByRecoverability(t *testing.T) {
 	}
 }
 
+// TestRunGetLandingHintMultipleArchives proves the hint stays a RUNNABLE command when more than
+// one recovery archive is available (issue #1418): `uzi run export <run-id>` alone refuses to
+// guess between several available captures (ExitUsage, TestRunExportMultipleAvailableRequiresCapture),
+// so the hint must name `--capture <id>`. With a SOLE available capture the bare command still
+// auto-selects, so the hint keeps its plain form.
+func TestRunGetLandingHintMultipleArchives(t *testing.T) {
+	a := []byte("bundle-a")
+	b := []byte("bundle-b")
+	fc := &uzicli.FakeClient{
+		RunByID: map[string]apitypes.RunDTO{
+			"multi": {ID: "multi", Kind: "issue", Status: "failed", LandingState: "needs_landing"},
+			"sole":  {ID: "sole", Kind: "issue", Status: "failed", LandingState: "needs_landing"},
+		},
+		RecoverySummaries: map[string]apitypes.RecoveryArchiveSummaryDTO{
+			"multi": {Supported: true, Archives: []apitypes.RecoveryArchiveDTO{availableCapture("cap-a", a), availableCapture("cap-b", b)}},
+			"sole":  {Supported: true, Archives: []apitypes.RecoveryArchiveDTO{availableCapture("cap-only", a)}},
+		},
+	}
+
+	multiOut, _, code := runCLI(t, fakeEnv(fc), "run", "get", "multi")
+	if code != uzicli.ExitOK {
+		t.Fatalf("run get multi exit = %d, want 0", code)
+	}
+	// With >1 available capture the hint must instruct --capture and name the concrete ids.
+	if !strings.Contains(multiOut, "--capture") {
+		t.Errorf("multi-archive hint must name `--capture` (a bare export refuses to guess):\n%s", multiOut)
+	}
+	if !strings.Contains(multiOut, "cap-a") || !strings.Contains(multiOut, "cap-b") {
+		t.Errorf("multi-archive hint must list the available capture ids:\n%s", multiOut)
+	}
+	// The bare, guess-required command must NOT be suggested as-is.
+	if strings.Contains(multiOut, "`uzi run export multi`\n") {
+		t.Errorf("multi-archive hint must not suggest the bare `uzi run export multi` the CLI would reject:\n%s", multiOut)
+	}
+
+	soleOut, _, code := runCLI(t, fakeEnv(fc), "run", "get", "sole")
+	if code != uzicli.ExitOK {
+		t.Fatalf("run get sole exit = %d, want 0", code)
+	}
+	// A sole available capture auto-selects, so the plain command stays and no --capture is forced.
+	if !strings.Contains(soleOut, "`uzi run export sole`") {
+		t.Errorf("sole-archive hint must keep the plain `uzi run export sole`:\n%s", soleOut)
+	}
+	if strings.Contains(soleOut, "--capture") {
+		t.Errorf("sole-archive hint must not force --capture:\n%s", soleOut)
+	}
+}
+
 // TestRunGetLandingHintNamesRun proves the needs_landing hint names the exact run and points at
 // `uzi run export`, mirroring the recover-with-export idiom of the custody-hold list.
 func TestRunGetLandingHintNamesRun(t *testing.T) {
