@@ -1,0 +1,38 @@
+{
+  "id": "x",
+  "email": "x",
+  "name": "x",
+  "vault_locked": true,
+  "accounts": [
+    {
+      "account_id": "x",
+      "aliases": [
+        "x"
+      ],
+      "is_default": true,
+      "status": "x",
+      "last_success_at": "x",
+      "stale": true,
+      "buckets": [
+        {
+          "id": "x",
+          "display_name": "x",
+          "allowed": true,
+          "limit_reached": true,
+          "primary": {
+            "used_percent": 1.5,
+            "limit_window_seconds": 1,
+            "reset_after_seconds": 1,
+            "reset_at": 1
+          },
+          "secondary": {
+            "used_percent": 1.5,
+            "limit_window_seconds": 1,
+            "reset_after_seconds": 1,
+            "reset_at": 1
+          }
+        }
+      ]
+    }
+  ]
+}

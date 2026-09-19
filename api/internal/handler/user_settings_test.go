@@ -25,26 +25,28 @@ import (
 // -> respond) without a real database. The
 // SetUserDefaultModel/SetUserDefaultEffort/SetUserJudgeModel/SetUserSummaryModel/SetUserTheme
 // UPDATEs QueryRow a single Text RETURNING column (discarded by the handler) and
-// SetUserSidebarTokens a uuid[] one; GetUserSettings QueryRows twelve (default_model,
+// SetUserSidebarTokens a uuid[] one; GetUserSettings QueryRows thirteen (default_model,
 // default_effort, judge_model, summary_model, theme, sidebar_token_ids,
 // mr_rework_enabled, appearance_mode, light_theme, dark_theme, typeface — the four
-// appearance columns joined the read in PRD #1167 M1 — and default_harness, which joined
-// in PRD #1429 M1) — summary_model rides that
+// appearance columns joined the read in PRD #1167 M1 — default_harness, which joined
+// in PRD #1429 M1, and sidebar_codex_account_ids, which joined in PRD #1209 M1) —
+// summary_model rides that
 // one-row read, so the settings handler makes no separate GetUserSummaryModel call.
 // The UPDATE paths record the written value so the round-trip is observable.
 type fakeSettingsDB struct {
-	model          pgtype.Text
-	effort         pgtype.Text
-	judge          pgtype.Text
-	summary        pgtype.Text
-	theme          pgtype.Text
-	mrRework       pgtype.Bool
-	sidebarIDs     []uuid.UUID
-	apprMode       pgtype.Text
-	lightTheme     pgtype.Text
-	darkTheme      pgtype.Text
-	typeface       pgtype.Text
-	defaultHarness pgtype.Text
+	model           pgtype.Text
+	effort          pgtype.Text
+	judge           pgtype.Text
+	summary         pgtype.Text
+	theme           pgtype.Text
+	mrRework        pgtype.Bool
+	sidebarIDs      []uuid.UUID
+	sidebarCodexIDs []uuid.UUID
+	apprMode        pgtype.Text
+	lightTheme      pgtype.Text
+	darkTheme       pgtype.Text
+	typeface        pgtype.Text
+	defaultHarness  pgtype.Text
 }
 
 func (f *fakeSettingsDB) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
@@ -85,6 +87,14 @@ func (f *fakeSettingsDB) QueryRow(_ context.Context, sql string, args ...any) pg
 		if ids, ok := args[0].([]uuid.UUID); ok {
 			f.sidebarIDs = ids // SetUserSidebarTokens: $1 = sidebar_token_ids
 		}
+	case strings.Contains(sql, "UPDATE users SET sidebar_codex_account_ids") && len(args) >= 1:
+		// SetUserSidebarCodexAccounts: $1 = sidebar_codex_account_ids (PRD #1209 M1). The
+		// Prune UPDATE (aliased "UPDATE users u SET ...") does not match this substring, so
+		// its RETURNING is discarded via the default fall-through — the fake has no linked-
+		// alias knowledge to prune with, and the handler discards Prune's result anyway.
+		if ids, ok := args[0].([]uuid.UUID); ok {
+			f.sidebarCodexIDs = ids
+		}
 	case strings.Contains(sql, "UPDATE users SET default_harness") && len(args) >= 1:
 		if h, ok := args[0].(pgtype.Text); ok {
 			f.defaultHarness = h // SetUserDefaultHarness: $1 = default_harness (PRD #1429 M1)
@@ -117,34 +127,36 @@ func (f *fakeSettingsDB) QueryRow(_ context.Context, sql string, args ...any) pg
 		}
 	}
 	return fakeSettingsRow{
-		model:          f.model,
-		effort:         f.effort,
-		judge:          f.judge,
-		summary:        f.summary,
-		theme:          f.theme,
-		mrRework:       f.mrRework,
-		sidebarIDs:     f.sidebarIDs,
-		apprMode:       f.apprMode,
-		lightTheme:     f.lightTheme,
-		darkTheme:      f.darkTheme,
-		typeface:       f.typeface,
-		defaultHarness: f.defaultHarness,
+		model:           f.model,
+		effort:          f.effort,
+		judge:           f.judge,
+		summary:         f.summary,
+		theme:           f.theme,
+		mrRework:        f.mrRework,
+		sidebarIDs:      f.sidebarIDs,
+		sidebarCodexIDs: f.sidebarCodexIDs,
+		apprMode:        f.apprMode,
+		lightTheme:      f.lightTheme,
+		darkTheme:       f.darkTheme,
+		typeface:        f.typeface,
+		defaultHarness:  f.defaultHarness,
 	}
 }
 
 type fakeSettingsRow struct {
-	model          pgtype.Text
-	effort         pgtype.Text
-	judge          pgtype.Text
-	summary        pgtype.Text
-	theme          pgtype.Text
-	mrRework       pgtype.Bool
-	sidebarIDs     []uuid.UUID
-	apprMode       pgtype.Text
-	lightTheme     pgtype.Text
-	darkTheme      pgtype.Text
-	typeface       pgtype.Text
-	defaultHarness pgtype.Text
+	model           pgtype.Text
+	effort          pgtype.Text
+	judge           pgtype.Text
+	summary         pgtype.Text
+	theme           pgtype.Text
+	mrRework        pgtype.Bool
+	sidebarIDs      []uuid.UUID
+	sidebarCodexIDs []uuid.UUID
+	apprMode        pgtype.Text
+	lightTheme      pgtype.Text
+	darkTheme       pgtype.Text
+	typeface        pgtype.Text
+	defaultHarness  pgtype.Text
 }
 
 func (r fakeSettingsRow) Scan(dest ...any) error {
@@ -174,12 +186,13 @@ func (r fakeSettingsRow) Scan(dest ...any) error {
 		if p, ok := dest[3].(*pgtype.Text); ok {
 			*p = r.typeface
 		}
-	case 12:
+	case 13:
 		// GetUserSettings: SELECT default_model, default_effort, judge_model,
 		// summary_model, theme, sidebar_token_ids, mr_rework_enabled,
-		// appearance_mode, light_theme, dark_theme, typeface, default_harness (the
-		// last four before default_harness are PRD #1167 M1's appearance columns; the
-		// trailing default_harness rides the same one-row read as of PRD #1429 M1).
+		// appearance_mode, light_theme, dark_theme, typeface, default_harness,
+		// sidebar_codex_account_ids (the four before default_harness are PRD #1167 M1's
+		// appearance columns; default_harness rides the read as of PRD #1429 M1; the
+		// trailing sidebar_codex_account_ids joined in PRD #1209 M1).
 		if p, ok := dest[0].(*pgtype.Text); ok {
 			*p = r.model
 		}
@@ -215,6 +228,9 @@ func (r fakeSettingsRow) Scan(dest ...any) error {
 		}
 		if p, ok := dest[11].(*pgtype.Text); ok {
 			*p = r.defaultHarness
+		}
+		if p, ok := dest[12].(*[]uuid.UUID); ok {
+			*p = r.sidebarCodexIDs
 		}
 	}
 	return nil

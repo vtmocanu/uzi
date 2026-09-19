@@ -20,6 +20,10 @@ type UserSettingsDTO struct {
 	// means unset = the default-ON state.
 	MrReworkEnabled *bool    `json:"mr_rework_enabled"`
 	SidebarTokenIds []string `json:"sidebar_token_ids"`
+	// SidebarCodexAccountIds is the CLI decode mirror of the linked Codex accounts the
+	// user surfaced on the sidebar rail (PRD #1209 M1), the codex sibling of
+	// SidebarTokenIds. Fidelity only — carried so a decode never drops it.
+	SidebarCodexAccountIds []string `json:"sidebar_codex_account_ids"`
 	// The four appearance override mirrors (PRD #1167): the user's RAW per-field
 	// overrides (each null ⇒ inherit the instance default). Fidelity only — carried
 	// so a decode never drops them; there is no CLI setter.

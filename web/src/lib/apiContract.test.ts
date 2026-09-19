@@ -41,6 +41,8 @@ import type {
   RecoveryCustodyAggregate,
   RecoveryCustodyHolds,
   GuardrailOverrideRequest,
+  CodexAccountRateLimit,
+  CodexAdminRateLimitRow,
 } from "./apiTypes";
 
 import runZero from "../../../fixtures/api-contract/run.zero.json";
@@ -123,6 +125,10 @@ import recoveryCustodyHoldsZero from "../../../fixtures/api-contract/recovery_cu
 import recoveryCustodyHoldsFull from "../../../fixtures/api-contract/recovery_custody_holds.full.json";
 import guardrailOverrideRequestZero from "../../../fixtures/api-contract/guardrail_override_request.zero.json";
 import guardrailOverrideRequestFull from "../../../fixtures/api-contract/guardrail_override_request.full.json";
+import codexAccountRateLimitZero from "../../../fixtures/api-contract/codex_account_rate_limit.zero.json";
+import codexAccountRateLimitFull from "../../../fixtures/api-contract/codex_account_rate_limit.full.json";
+import codexAdminRateLimitRowZero from "../../../fixtures/api-contract/codex_admin_rate_limit_row.zero.json";
+import codexAdminRateLimitRowFull from "../../../fixtures/api-contract/codex_admin_rate_limit_row.full.json";
 
 // The api ⇄ SPA JSON wire-contract (PRD #982). This is the VITEST HALF; the Go
 // half is api/internal/apitypes/contract_test.go. Neither reads the other: each
@@ -443,18 +449,57 @@ type ZeroOf<T, NeverNull extends keyof T = never> = {
 }
 
 // ── UserSettings (M2) ───────────────────────────────────────────────────────
-// ZeroOf exemption: sidebar_token_ids — the handler mapper runs uuidStrings, which returns
-// a non-nil [] (handler/user_settings.go:65), so the wire is [] though the nil-slice zero
-// marshals null. Every other field is typed X|null in TS.
+// ZeroOf exemption: sidebar_token_ids and sidebar_codex_account_ids — the handler mapper
+// runs uuidStrings on both, which returns a non-nil [] (handler/user_settings.go), so the
+// wire is [] though the nil-slice zero marshals null. Every other field is typed X|null in
+// TS.
 {
   const _userSettingsMissing: never = null as unknown as Exclude<keyof UserSettings, keyof typeof userSettingsFull>;
   const _userSettingsExtra: never = null as unknown as Exclude<keyof typeof userSettingsFull, keyof UserSettings>;
-  const _userSettingsZero: ZeroOf<UserSettings, "sidebar_token_ids"> = userSettingsZero;
+  const _userSettingsZero: ZeroOf<UserSettings, "sidebar_token_ids" | "sidebar_codex_account_ids"> = userSettingsZero;
   const _userSettingsFull: Widen<UserSettings> = userSettingsFull;
   void _userSettingsMissing;
   void _userSettingsExtra;
   void _userSettingsZero;
   void _userSettingsFull;
+}
+
+// ── Codex account rate limits (PRD #1209) ───────────────────────────────────
+// The per-account meter and its admin row. ZeroOf exemptions: aliases + buckets on the
+// account (non-omitempty Go slices whose nil-slice zero marshals null, normalized to [] by
+// the M3 mapper), and accounts on the admin row (same nil-slice shape). last_success_at /
+// stale are omitempty and simply absent from the zero fixture, so they need no exemption.
+// The nested window + bucket DTOs are exercised inside these two fixtures' full values.
+{
+  const _codexAcctMissing: never = null as unknown as Exclude<
+    keyof CodexAccountRateLimit,
+    keyof typeof codexAccountRateLimitFull
+  >;
+  const _codexAcctExtra: never = null as unknown as Exclude<
+    keyof typeof codexAccountRateLimitFull,
+    keyof CodexAccountRateLimit
+  >;
+  const _codexAcctZero: ZeroOf<CodexAccountRateLimit, "aliases" | "buckets"> = codexAccountRateLimitZero;
+  const _codexAcctFull: Widen<CodexAccountRateLimit> = codexAccountRateLimitFull;
+  void _codexAcctMissing;
+  void _codexAcctExtra;
+  void _codexAcctZero;
+  void _codexAcctFull;
+
+  const _codexAdminMissing: never = null as unknown as Exclude<
+    keyof CodexAdminRateLimitRow,
+    keyof typeof codexAdminRateLimitRowFull
+  >;
+  const _codexAdminExtra: never = null as unknown as Exclude<
+    keyof typeof codexAdminRateLimitRowFull,
+    keyof CodexAdminRateLimitRow
+  >;
+  const _codexAdminZero: ZeroOf<CodexAdminRateLimitRow, "accounts"> = codexAdminRateLimitRowZero;
+  const _codexAdminFull: Widen<CodexAdminRateLimitRow> = codexAdminRateLimitRowFull;
+  void _codexAdminMissing;
+  void _codexAdminExtra;
+  void _codexAdminZero;
+  void _codexAdminFull;
 }
 
 // ── CatalogEntry (M2 drift, RECONCILED M4) ──────────────────────────────────
@@ -963,6 +1008,11 @@ const dtos: { stem: string; nullable: boolean }[] = [
   // slice the handler normalizes to [], so its zero.json carries a null (the nil-slice
   // marshal) that the "findings" ZeroOf exemption above accounts for.
   { stem: "guardrail_override_request", nullable: true },
+  // PRD #1209 M1: the Codex per-account meter and its admin row. Both carry nil-slice
+  // nulls in their zero.json (aliases + buckets on the account; accounts on the admin
+  // row), normalized to [] by the M3 mapper — so nullable:true.
+  { stem: "codex_account_rate_limit", nullable: true },
+  { stem: "codex_admin_rate_limit_row", nullable: true },
 ];
 
 describe("api-contract fixtures are present and discriminating", () => {

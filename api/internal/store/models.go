@@ -151,6 +151,20 @@ type CliToken struct {
 	ExpiresAt   pgtype.Timestamptz `json:"expires_at"`
 }
 
+type CodexAccountRateLimit struct {
+	UserID                     uuid.UUID          `json:"user_id"`
+	ProviderAccountID          uuid.UUID          `json:"provider_account_id"`
+	Buckets                    []byte             `json:"buckets"`
+	ObservedGeneration         pgtype.Int8        `json:"observed_generation"`
+	ObservedCredentialRevision pgtype.Int8        `json:"observed_credential_revision"`
+	LastSuccessAt              pgtype.Timestamptz `json:"last_success_at"`
+	LastAttemptAt              pgtype.Timestamptz `json:"last_attempt_at"`
+	AttemptStatus              pgtype.Text        `json:"attempt_status"`
+	AttemptError               pgtype.Text        `json:"attempt_error"`
+	CreatedAt                  pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt                  pgtype.Timestamptz `json:"updated_at"`
+}
+
 type CodexCredentialState struct {
 	UserSecretID      uuid.UUID          `json:"user_secret_id"`
 	UserID            uuid.UUID          `json:"user_id"`
@@ -163,23 +177,26 @@ type CodexCredentialState struct {
 }
 
 type CodexProviderAccount struct {
-	ID                  uuid.UUID          `json:"id"`
-	UserID              uuid.UUID          `json:"user_id"`
-	ProviderUserID      string             `json:"provider_user_id"`
-	WorkspaceAccountID  string             `json:"workspace_account_id"`
-	SealedLogin         []byte             `json:"sealed_login"`
-	SealedWith          string             `json:"sealed_with"`
-	Generation          int64              `json:"generation"`
-	CredentialRevision  int64              `json:"credential_revision"`
-	RecoverySealed      []byte             `json:"recovery_sealed"`
-	RecoveryGeneration  pgtype.Int8        `json:"recovery_generation"`
-	RecoverySealedWith  pgtype.Text        `json:"recovery_sealed_with"`
-	CoordState          string             `json:"coord_state"`
-	CoordOperationID    pgtype.UUID        `json:"coord_operation_id"`
-	LeaseDeadline       pgtype.Timestamptz `json:"lease_deadline"`
-	CommittedGeneration pgtype.Int8        `json:"committed_generation"`
-	CreatedAt           pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt           pgtype.Timestamptz `json:"updated_at"`
+	ID                       uuid.UUID          `json:"id"`
+	UserID                   uuid.UUID          `json:"user_id"`
+	ProviderUserID           string             `json:"provider_user_id"`
+	WorkspaceAccountID       string             `json:"workspace_account_id"`
+	SealedLogin              []byte             `json:"sealed_login"`
+	SealedWith               string             `json:"sealed_with"`
+	Generation               int64              `json:"generation"`
+	CredentialRevision       int64              `json:"credential_revision"`
+	RecoverySealed           []byte             `json:"recovery_sealed"`
+	RecoveryGeneration       pgtype.Int8        `json:"recovery_generation"`
+	RecoverySealedWith       pgtype.Text        `json:"recovery_sealed_with"`
+	CoordState               string             `json:"coord_state"`
+	CoordOperationID         pgtype.UUID        `json:"coord_operation_id"`
+	LeaseDeadline            pgtype.Timestamptz `json:"lease_deadline"`
+	CommittedGeneration      pgtype.Int8        `json:"committed_generation"`
+	CreatedAt                pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt                pgtype.Timestamptz `json:"updated_at"`
+	ReauthRequired           bool               `json:"reauth_required"`
+	ReauthGeneration         pgtype.Int8        `json:"reauth_generation"`
+	ReauthCredentialRevision pgtype.Int8        `json:"reauth_credential_revision"`
 }
 
 type CodexRefreshIntent struct {
@@ -839,6 +856,7 @@ type User struct {
 	DarkTheme               pgtype.Text        `json:"dark_theme"`
 	Typeface                pgtype.Text        `json:"typeface"`
 	DefaultHarness          pgtype.Text        `json:"default_harness"`
+	SidebarCodexAccountIds  []uuid.UUID        `json:"sidebar_codex_account_ids"`
 }
 
 type UserSecret struct {

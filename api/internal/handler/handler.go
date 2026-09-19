@@ -148,6 +148,12 @@ type Handler struct {
 	// disabled, or a test handler) — the token still lands, just polled on the next
 	// tick.
 	usagePoker UsagePoker
+	// codexUsagePoker pokes the Codex account rate-limit poller when a user
+	// saves/replaces a codex credential (PRD #1209), so their account meters appear
+	// within seconds instead of up to a full poll interval — the codex sibling of
+	// usagePoker. Wired via SetCodexUsagePoker; nil-safe (the poller disabled, or a
+	// test handler) — the credential still lands, just polled on the next tick.
+	codexUsagePoker CodexUsagePoker
 	// version is the server build version, stamped into cmd/server via ldflags
 	// (Model B: == the release git tag) and served unauthenticated at GET
 	// /api/version. Two consumers read it: the SPA, for the footer badge and for PRD
@@ -317,6 +323,18 @@ type UsagePoker interface {
 // alongside the other background engines). Safe to leave unset — token saves then
 // simply wait for the poller's next tick.
 func (h *Handler) SetUsagePoker(p UsagePoker) { h.usagePoker = p }
+
+// CodexUsagePoker is the slice of the Codex account rate-limit poller the settings /
+// credential handlers need (PRD #1209): request an out-of-band poll for one user. The
+// codex sibling of UsagePoker; the M2 poller engine satisfies it.
+type CodexUsagePoker interface {
+	Poke(userID uuid.UUID)
+}
+
+// SetCodexUsagePoker wires the Codex rate-limit poller in after construction (built in
+// main alongside the other background engines). Safe to leave unset — credential saves
+// then simply wait for the poller's next tick.
+func (h *Handler) SetCodexUsagePoker(p CodexUsagePoker) { h.codexUsagePoker = p }
 
 // SetNotifier wires the notifications write seam in after construction (built in
 // main alongside the Slack notifier it delivers through). Safe to leave unset in

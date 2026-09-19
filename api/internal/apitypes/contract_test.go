@@ -130,6 +130,13 @@ func contractCases() []contractCase {
 		// normalizes to []); every other field is a required scalar, so its zero.json
 		// carries no other null.
 		newContractCase[GuardrailOverrideRequestDTO]("guardrail_override_request"),
+		// PRD #1209 M1: the Codex per-account meter and its admin row. The nested window
+		// and bucket DTOs ride inside these two fixtures (no standalone row — they are
+		// never returned alone). CodexAccountRateLimitDTO's aliases + buckets slices are
+		// non-omitempty, so its zero.json carries the nil-slice nulls the M3 mapper
+		// normalizes to []; last_success_at/stale are omitempty and drop on the zero value.
+		newContractCase[CodexAccountRateLimitDTO]("codex_account_rate_limit"),
+		newContractCase[CodexAdminRateLimitRowDTO]("codex_admin_rate_limit_row"),
 	}
 }
 

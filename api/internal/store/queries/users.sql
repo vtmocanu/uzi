@@ -228,7 +228,10 @@ RETURNING summary_model;
 -- "inherit the instance default", resolved by theme.ResolveAppearance at read time.
 -- default_harness (PRD #1429 M1 / D3) rides it too; NULL means "no preference" (implicit
 -- creation falls through D11), and the settings surface exposes it as nullable claude|codex.
-SELECT default_model, default_effort, judge_model, summary_model, theme, sidebar_token_ids, mr_rework_enabled, appearance_mode, light_theme, dark_theme, typeface, default_harness FROM users WHERE id = $1;
+-- sidebar_codex_account_ids (PRD #1209 M1) rides it as well — the linked Codex accounts the
+-- user surfaced on the sidebar rail, the codex sibling of sidebar_token_ids; NULL/'{}' read
+-- as "no explicit extras".
+SELECT default_model, default_effort, judge_model, summary_model, theme, sidebar_token_ids, mr_rework_enabled, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids FROM users WHERE id = $1;
 
 -- name: GetUserSchedulePause :one
 -- The current user's pause-all-schedules state (PRD #1093), returned RAW: the switch
@@ -277,6 +280,42 @@ RETURNING appearance_mode, light_theme, dark_theme, typeface;
 -- empty array is a valid "default-only" choice. Own-user only.
 UPDATE users SET sidebar_token_ids = @sidebar_token_ids::uuid[] WHERE id = @id
 RETURNING sidebar_token_ids;
+
+-- name: SetUserSidebarCodexAccounts :one
+-- Replaces the user's whole sidebar Codex-account set (PRD #1209 M1, 00238): the linked
+-- subscription accounts whose rate meters ride the sidebar rail. The codex sibling of
+-- SetUserSidebarTokens. The handler has already validated the ids to the caller's own
+-- linked accounts (rejecting a well-formed non-member) and excluded the implicit default
+-- account; an empty array is a valid "no explicit extras" choice. Own-user only.
+UPDATE users SET sidebar_codex_account_ids = @sidebar_codex_account_ids::uuid[] WHERE id = @id
+RETURNING sidebar_codex_account_ids;
+
+-- name: PruneUserSidebarCodexAccounts :one
+-- Drop stale ids from the user's sidebar Codex-account set in ONE atomic UPDATE (PRD #1209
+-- M1), never a read-merge-write. An id is stale once it no longer names an account the user
+-- has a linked alias for (the account was deleted, or its last codex_auth alias was
+-- unlinked). unnest ... WITH ORDINALITY re-filters the row's CURRENT array to the ids that
+-- still have a linked alias, PRESERVING the stored order (ORDER BY the ordinality), and
+-- writes the filtered array back in the same statement. Because it reads and rewrites the
+-- column inside one UPDATE — never fetching into Go and writing back — a concurrent
+-- SetUserSidebarCodexAccounts PUT cannot be lost: the two statements serialize, and this
+-- one only ever REMOVES stale ids from whatever the current array is. This is the
+-- SetUserAppearance rationale (that query was rewritten from read-merge-write BECAUSE it
+-- raced). COALESCE(..., '{}') handles the empty/NULL array. Own-user only; returns the
+-- pruned array so the settings GET can use it directly. The users table carries no
+-- updated_at column (SetUserSidebarTokens / SetUserAppearance touch none either), so this
+-- writes only the array.
+UPDATE users u
+SET sidebar_codex_account_ids = (
+        SELECT COALESCE(array_agg(t.x ORDER BY t.ord), '{}')::uuid[]
+        FROM unnest(u.sidebar_codex_account_ids) WITH ORDINALITY AS t(x, ord)
+        WHERE EXISTS (
+            SELECT 1 FROM codex_credential_state s
+            WHERE s.user_id = u.id AND s.provider_account_id = t.x AND s.status = 'linked'
+        )
+    )
+WHERE u.id = @id
+RETURNING sidebar_codex_account_ids;
 
 -- name: BumpTokenVersion :one
 UPDATE users SET token_version = token_version + 1 WHERE id = $1
