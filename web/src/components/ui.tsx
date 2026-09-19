@@ -434,6 +434,16 @@ export const RUN_STATUS_TONES: Record<
   completion_reworking: { tone: "info", pulse: true },
   completion_blocked: { tone: "warning" },
   completed: { tone: "ok" },
+  /** issue #1418: a StatusPill-ONLY pseudo-status for a `failed` run whose committed work
+   *  is human-landable (server-derived landing_state === "needs_landing"). RunsList/RunView
+   *  derive it for the pill (never re-derived from raw status); the board card badge
+   *  (runBadge/LatestRun) and the issue-view history rows (runStatusTone) are OUT of #1418
+   *  scope and LatestRun carries no landing_state, so this key has NO counterpart on those
+   *  surfaces — the ui.test.tsx label loop and runBadge.test.ts tone loop exempt it. DANGER
+   *  tone: it IS a failure, just a recoverable one, so it keeps failed's rose. The default
+   *  label `status.replace(/_/g," ")` already yields "needs landing" (like planning/
+   *  revising/recovery_wait), so no RUN_STATUS_LABELS override is needed. */
+  needs_landing: { tone: "danger" },
   failed: { tone: "danger" },
   cancelled: { tone: "neutral" },
 };

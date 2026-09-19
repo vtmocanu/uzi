@@ -1833,6 +1833,16 @@ export function RunView() {
   // the header pill and the terminal banner both go neutral so they agree with
   // the board/RunsList treatment (isStoppedRun).
   const stopped = isStoppedRun(run.status, run.stop_kind);
+  // issue #1418: a `failed` run whose committed work is human-landable (server-derived
+  // landing_state === "needs_landing") reads "needs landing" on the header pill instead of
+  // "failed" — still danger-toned, distinct label. Stopped precedence wins first (a stopped
+  // run rides completed/cancelled or a HUMAN stop_kind, never the failed+needs_landing shape),
+  // matching the RunsList row derivation so one run reads one word on both surfaces.
+  const pillStatus = stopped
+    ? "stopped"
+    : run.status === "failed" && run.landing_state === "needs_landing"
+      ? "needs_landing"
+      : effectiveRunStatus(run);
   // MR state (PRD #33): a per-run frozen hint. It appends "merged"/"closed" to the
   // MR affordance and (for closed) drops the ok tone; open is unchanged.
   const mrState = mrChipState(run.mr_state);
@@ -1899,7 +1909,7 @@ export function RunView() {
               {/* A stopped run (cancel or stop-shaped failure) reads as a neutral
                   "stopped" pill — StatusPill's default tone — so it stays calm and
                   agrees with the board/RunsList. */}
-              <StatusPill status={stopped ? "stopped" : effectiveRunStatus(run)} />
+              <StatusPill status={pillStatus} />
               {/* PRD #320 M6: the queue-priority pill + the owner's Expedite/undo action.
                   Both are QUEUED-ONLY (the pill self-hides on any other status; the action
                   is wrapped in the status guard) — the server is queued-only too (409). */}

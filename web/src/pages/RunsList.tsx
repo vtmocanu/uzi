@@ -251,7 +251,15 @@ export function RunRow({
   // A deliberate human stop (cancelled, or failed carrying a server-stamped
   // stop_kind — PRD #33) reads "stopped" / neutral, never "failed" / danger. Fold
   // that into the pill's status so the shared StatusPill palette renders it calm.
-  const pillStatus = isStoppedRun(run.status, run.stop_kind) ? "stopped" : effectiveRunStatus(run);
+  // A `failed` run whose committed work is human-landable (issue #1418, server-derived
+  // landing_state === "needs_landing") reads "needs landing" instead of "failed" — still
+  // danger-toned, but a distinct label. The stopped precedence wins first: a stopped run
+  // rides completed/cancelled or a HUMAN stop_kind, never the failed+needs_landing shape.
+  const pillStatus = isStoppedRun(run.status, run.stop_kind)
+    ? "stopped"
+    : run.status === "failed" && run.landing_state === "needs_landing"
+      ? "needs_landing"
+      : effectiveRunStatus(run);
   // PRD #1167 M4: Shadow's per-row surface signal, rendered as data-live/data-attention
   // on the row's card-chrome <div> (the carded surface, not the bare <li>), so a live
   // row is a solid dark --surface card. Inert on every other theme; computed once.
