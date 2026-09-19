@@ -257,6 +257,11 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 		// time), surfaced read-only so a diagnosis keys on it instead of failure_reason
 		// free text. Null when the run never set one.
 		FailOrigin: textPtrValue(r.FailOrigin.Valid, r.FailOrigin.String),
+		// issue #1418: the server-derived landing bucket. runToDTO is CAPTURE-UNAWARE
+		// (hasAvailableCapture=false), which is correct for every non-read caller and the
+		// default for the read callers before they overlay the capture-aware value. A
+		// preserved_patch alone is enough to reach needs_landing here.
+		LandingState: workersvc.DeriveLandingState(textPtrValue(r.FailOrigin.Valid, r.FailOrigin.String), r.PreservedPatch.Valid, false),
 		// PRD-link reconciliation (read-only): the path the run declared it archived a
 		// completed PRD to, and when that patch lifecycle settled (null = still pending).
 		PrdDonePath:       textPtrValue(r.PrdDonePath.Valid, r.PrdDonePath.String),

@@ -149,3 +149,50 @@ func CoerceFailOrigin(reported *string) *string {
 	}
 	return nil
 }
+
+// Landing-state values (issue #1418). Server-derived, read-only presentation bucket for a
+// failed run whose committed work is human-landable; a worker cannot report it.
+const (
+	LandingStateNone          = "none"
+	LandingStateNeedsLanding  = "needs_landing"
+	LandingStateUnrecoverable = "unrecoverable"
+)
+
+// humanLandableFailOrigins: the fail_origins whose committed work a human can land — the
+// finalize-time publish failures (PRD #377/#456/#974/#1416). A STRICT SUBSET of failOrigins
+// (pinned by TestHumanLandableFailOriginsExact).
+var humanLandableFailOrigins = map[string]bool{
+	"finalize_base_align_conflict": true,
+	"workflow_scope_missing":       true,
+	"push_secret_blocked":          true,
+	"history_rewritten":            true,
+}
+
+// IsHumanLandableFailOrigin reports whether a fail_origin belongs to the human-landable set.
+func IsHumanLandableFailOrigin(o string) bool { return humanLandableFailOrigins[o] }
+
+// AllHumanLandableFailOrigins returns the set as a fresh slice in failOrigins source order,
+// for use as a SQL bind array. Fresh copy for the same reason AllFailOrigins is.
+func AllHumanLandableFailOrigins() []string {
+	out := make([]string, 0, len(humanLandableFailOrigins))
+	for _, o := range failOrigins {
+		if humanLandableFailOrigins[o] {
+			out = append(out, o)
+		}
+	}
+	return out
+}
+
+// DeriveLandingState is the ONE landing_state derivation (issue #1418). Pure function of the
+// run's fail_origin plus two availability facts. needs_landing when the origin is human-landable
+// AND the work is recoverable (a preserved_patch, or an available recovery capture);
+// unrecoverable when landable but neither exists; none otherwise.
+func DeriveLandingState(failOrigin *string, hasPreservedPatch, hasAvailableCapture bool) string {
+	if failOrigin == nil || !humanLandableFailOrigins[*failOrigin] {
+		return LandingStateNone
+	}
+	if hasPreservedPatch || hasAvailableCapture {
+		return LandingStateNeedsLanding
+	}
+	return LandingStateUnrecoverable
+}

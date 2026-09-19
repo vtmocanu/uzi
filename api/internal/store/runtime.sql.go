@@ -6292,7 +6292,14 @@ SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_descripti
        ru.cache_read_tokens      AS usage_cache_read_tokens,
        ru.cache_creation_tokens  AS usage_cache_creation_tokens,
        ru.output_tokens          AS usage_output_tokens,
-       ru.cost_usd               AS usage_cost_usd
+       ru.cost_usd               AS usage_cost_usd,
+       -- issue #1418: does this run have an available recovery capture to export? The
+       -- capture half of the read-path landing_state derivation (workersvc.DeriveLandingState),
+       -- owner-scoped and riding idx_recovery_captures_run_owner (run_id, user_id). The
+       -- correlated EXISTS is cast to boolean so sqlc types it as a usable bool (an uncast
+       -- EXISTS types as interface{}); the inner alias c is the subquery's recovery_captures,
+       -- distinct from the outer forge_connections c.
+       (EXISTS (SELECT 1 FROM recovery_captures c WHERE c.run_id = r.id AND c.user_id = r.user_id AND c.state = 'available'))::boolean AS has_available_capture
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 JOIN forge_connections c ON c.id = rp.connection_id   -- forge_type for the per-run MR/PR noun (PRD #65 D2); every repo has a connection
@@ -6334,6 +6341,7 @@ type ListRunsForUserRow struct {
 	UsageCacheCreationTokens pgtype.Int8    `json:"usage_cache_creation_tokens"`
 	UsageOutputTokens        pgtype.Int8    `json:"usage_output_tokens"`
 	UsageCostUsd             pgtype.Numeric `json:"usage_cost_usd"`
+	HasAvailableCapture      bool           `json:"has_available_capture"`
 }
 
 // The user's runs, newest first (Runs index + Agents-status "your runs"), joined
@@ -6534,6 +6542,7 @@ func (q *Queries) ListRunsForUser(ctx context.Context, arg ListRunsForUserParams
 			&i.UsageCacheCreationTokens,
 			&i.UsageOutputTokens,
 			&i.UsageCostUsd,
+			&i.HasAvailableCapture,
 		); err != nil {
 			return nil, err
 		}

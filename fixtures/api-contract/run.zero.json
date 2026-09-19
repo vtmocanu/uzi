@@ -74,6 +74,7 @@
   "report_md": null,
   "preserved_patch": null,
   "fail_origin": null,
+  "landing_state": "",
   "prd_done_path": null,
   "prd_patch_settled_at": null,
   "claimed_at": null,

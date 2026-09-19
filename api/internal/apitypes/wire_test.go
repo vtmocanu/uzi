@@ -178,6 +178,11 @@ var runDTOKeys = []string{
 	// a stable field instead of failure_reason free text. Null unless the run set one, but
 	// the key is always on the wire.
 	"fail_origin",
+	// issue #1418: the server-derived, read-only landing bucket for a failed run whose
+	// committed work is human-landable. A plain (non-pointer, non-omitempty) string, so it
+	// is always on the wire — "" on a run with no landing state, else none/needs_landing/
+	// unrecoverable.
+	"landing_state",
 	// PRD-link reconciliation (read-only): the path the run declared it archived a PRD
 	// to, and when that patch lifecycle settled (null while pending). Both always on the
 	// wire — prd_done_path null for a run that moved no PRD, prd_patch_settled_at null

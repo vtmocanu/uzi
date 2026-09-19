@@ -452,6 +452,18 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 			dto.ForgeType = ft
 		}
 	}
+	// issue #1418: overlay the capture-aware landing_state on the single-run detail read.
+	// runToDTO seeded it capture-unaware (preserved_patch only); only a human-landable
+	// fail_origin can ever reach needs_landing/unrecoverable, so the extra capture query
+	// runs ONLY then. Best-effort: a lookup error leaves the capture-unaware value rather
+	// than failing the read of an otherwise-fine run.
+	if dto.FailOrigin != nil && workersvc.IsHumanLandableFailOrigin(*dto.FailOrigin) {
+		if hasCap, err := h.q.RunHasAvailableCapture(r.Context(), store.RunHasAvailableCaptureParams{RunID: run.ID, UserID: run.UserID}); err != nil {
+			slog.Error("resolve run available capture", "run_id", run.ID, "error", err)
+		} else {
+			dto.LandingState = workersvc.DeriveLandingState(dto.FailOrigin, run.PreservedPatch.Valid, hasCap)
+		}
+	}
 	// PRD #411: stamp the run's originating forge issue web URL for the run-view #<iid>
 	// link, resolved best-effort from the cached issues row — a join on GetRunByID* would
 	// flip its return type and ripple through ~15 callers (Design Decision 2). Guarded on
