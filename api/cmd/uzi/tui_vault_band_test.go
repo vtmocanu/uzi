@@ -144,6 +144,65 @@ func TestVaultBandAdminScopingToOwnRuns(t *testing.T) {
 	}
 }
 
+// TestVaultBandScopesOnRunSetProvenanceNotToggle — D11 transient cross-tenant safety. keyAdmin
+// flips admin→own IMMEDIATELY on keypress but does NOT clear the stale ALL-USERS run set, which
+// stays resident until the async own-runs ListRuns reply lands. The owner-filter must scope on the
+// PROVENANCE of the held run set (runsAdmin), not the live toggle, so during that window a
+// stranger's vault-locked run is never counted into the viewer's band. Reddens if the count is
+// scoped on m.board.admin.
+func TestVaultBandScopesOnRunSetProvenanceNotToggle(t *testing.T) {
+	const self, other = "me@x.io", "stranger@x.io"
+
+	// Admin board holding ONLY a stranger's parked-on-vault run; the viewer's own vault is locked
+	// but none of the viewer's own runs are parked → count 0, tier-1 hint (not the band).
+	m := vaultBoardModel(t, true, self, true, []apitypes.RunListItemDTO{
+		vaultParkedRun("r-other", serverVaultLockedReason, other),
+	})
+	if got := m.ownParkedOnVaultCount(); got != 0 {
+		t.Fatalf("precondition: a stranger's parked run must not count on the admin board; count = %d", got)
+	}
+	if plain := stripANSI(m.vaultIndicatorLine()); strings.Contains(plain, "VAULT LOCKED") {
+		t.Fatalf("precondition: the admin band must not show for a stranger's run; got %q", plain)
+	}
+
+	// Toggle a → own view WITHOUT delivering the own-runs reply: admin flips to false immediately,
+	// but the stale admin run set (the stranger's run) is still resident and runsAdmin is still true.
+	m = press(t, m, keyAdmin)
+	if m.board.admin {
+		t.Fatalf("the keyAdmin toggle did not flip off the admin board")
+	}
+	// The stranger's stale admin-set run must STILL not be counted during this window: the filter
+	// scopes on the run set's provenance, not the live toggle. This reddens if it keys on m.board.admin.
+	if got := m.ownParkedOnVaultCount(); got != 0 {
+		t.Errorf("a stranger's stale admin run was miscounted into the viewer's band during the admin→own toggle window; count = %d, want 0", got)
+	}
+	if plain := stripANSI(m.vaultIndicatorLine()); strings.Contains(plain, "VAULT LOCKED") {
+		t.Errorf("the vault band was wrongly shown during the admin→own toggle window; got %q", plain)
+	}
+	// The vault is still locked, so the tier-1 hint stays (the band suppressed, not the whole line).
+	if plain := stripANSI(m.vaultIndicatorLine()); !strings.Contains(plain, "🔒 vault locked") {
+		t.Errorf("the tier-1 hint should still show while the vault is locked and the band is suppressed; got %q", plain)
+	}
+}
+
+// TestVaultBandSuppressedWhenViewerIdentityUnknown — pins the selfEmail=="" identity-unknown
+// early-return guard INDEPENDENTLY of the per-run OwnerEmail mismatch. An admin-provenance run set
+// holds a run whose OwnerEmail is a pointer to the EMPTY string with the viewer identity unknown
+// (selfEmail == ""): without the guard, EqualFold("", "") would match and count the run, wrongly
+// showing the band. Reddens if the selfEmail=="" early return is removed.
+func TestVaultBandSuppressedWhenViewerIdentityUnknown(t *testing.T) {
+	r := vaultParkedRun("r-empty-owner", serverVaultLockedReason, "")
+	r.OwnerEmail = sptr("") // explicit empty-string owner (distinct from nil): EqualFold("", "") matches
+	m := vaultBoardModel(t, true, "", true, []apitypes.RunListItemDTO{r})
+
+	if got := m.ownParkedOnVaultCount(); got != 0 {
+		t.Errorf("with an unknown viewer identity the band must be suppressed even for an empty-owner run; count = %d, want 0", got)
+	}
+	if plain := stripANSI(m.vaultIndicatorLine()); strings.Contains(plain, "VAULT LOCKED") {
+		t.Errorf("the band must be suppressed when the viewer identity is unknown; got %q", plain)
+	}
+}
+
 // TestVaultBandCountsOnlyMatchingOwnRuns — the count reflects only runs whose HealthReason matches
 // the vault-locked substring (case-insensitive): a different reason and a nil reason do not count.
 func TestVaultBandCountsOnlyMatchingOwnRuns(t *testing.T) {

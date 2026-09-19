@@ -25,6 +25,16 @@ type boardState struct {
 	admin       bool
 	adminDenied bool
 
+	// runsAdmin is the PROVENANCE of the currently-resident run set: the admin-ness of the
+	// board whose accepted ListRuns reply is held in runs. It is set ONLY when a reply is
+	// accepted (in apply), so it lags the live admin toggle during the window after keyAdmin
+	// flips admin but before the matching reply lands — runs still holds the PREVIOUS board's
+	// set then. The vault band's cross-tenant owner-filter (ownParkedOnVaultCount, D11) scopes on
+	// THIS, never on the live toggle, so a stranger's parked run in a stale admin set is never
+	// miscounted into the viewer's band during that window. Defaults false, matching the
+	// non-admin Init fetch.
+	runsAdmin bool
+
 	// reqSeq / waitID / tickGen implement the request-generation guard (PRD #1130 M1 D2).
 	//
 	// reqSeq is the monotonic id minted for each board fetch (startBoardReq bumps it). waitID
@@ -93,6 +103,10 @@ func (b *boardState) apply(msg boardRunsMsg) {
 	b.err = nil
 	b.errStreak = 0
 	b.runs = msg.runs
+	// Record the accepted set's provenance. This is the single site runs are accepted (the
+	// error path above leaves runs — and so runsAdmin — untouched), and msg.admin == b.admin
+	// is guaranteed by the early return, so this is exactly the admin-ness of the held runs.
+	b.runsAdmin = msg.admin
 	b.clampCursor()
 }
 
@@ -357,15 +371,20 @@ const vaultLockedReasonSubstr = "vault is locked"
 // It is computed over m.board.runs — the FULL loaded set, not the scrolled window — matching
 // boardSummary's run-source convention, so the count is stable while the board scrolls.
 //
-// Scoping (D11): on the own board (admin == false) ListRuns is owner-scoped, so every run is the
-// viewer's own and all matching runs count. On the admin/factory board (admin == true)
-// AdminListRuns returns EVERY user's runs with their health reasons present (RunDTO.HealthReason
-// rides unconditionally, run.go), so the count is scoped to runs the viewer OWNS via OwnerEmail —
-// it never counts or blames another user's locked vault the admin cannot act on. If the viewer
-// identity is unknown (selfEmail == "", whoami failed) the band is suppressed on the admin view
+// Scoping (D11): the owner-filter decision keys on the PROVENANCE of the currently-resident run
+// set (m.board.runsAdmin — the admin-ness of the board whose accepted ListRuns reply is held),
+// NOT the live admin toggle. On an own-provenance set ListRuns was owner-scoped, so every run is
+// the viewer's own and all matching runs count. On an admin-provenance set AdminListRuns returned
+// EVERY user's runs with their health reasons present (RunDTO.HealthReason rides unconditionally,
+// run.go), so the count is scoped to runs the viewer OWNS via OwnerEmail — it never counts or
+// blames another user's locked vault the admin cannot act on. Keying on provenance (not the toggle)
+// closes the transient window after keyAdmin flips admin→own but before the own reply lands, when
+// the stale ALL-USERS set is still resident: the owner-filter stays applied until the own set
+// arrives, so a stranger's run is never counted into the viewer's band. If the viewer identity is
+// unknown (selfEmail == "", whoami failed) the band is suppressed on an admin-provenance set
 // (count 0) rather than risk attributing a stranger's lock to the admin.
 func (m tuiModel) ownParkedOnVaultCount() int {
-	admin := m.board.admin
+	admin := m.board.runsAdmin
 	if admin && m.selfEmail == "" {
 		return 0
 	}
