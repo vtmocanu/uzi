@@ -91,7 +91,19 @@ make_gate_run() {
 export UZI_E2E_MAX_CONCURRENT_RUNS=2
 "${COMPOSE[@]}" up -d --no-deps --force-recreate agent >/dev/null
 wait_worker_online
-CAP="$(apiget /api/workers | jq -r '[.workers[] | select(.status=="online")][0].max_concurrent_runs')"
+# Wait for the RECREATED worker's registration to actually LAND its advertised cap — not
+# merely for `online`, which `wait_worker_online` reads off `.workers[0].status`. The
+# recreated container reuses the join token and re-registers into the SAME row, so that
+# row still reads `online` at the OLD cap until the fresh register overwrites
+# max_concurrent_runs; a single read here is exactly the race phases 45 and 46 already
+# guard with this loop. Without it the whole phase failed 0.35s after compose printed
+# `Started`, before the new agent process had registered at all (2026-09-19 nightly).
+cap_deadline=$((SECONDS + 40)); CAP=""
+while [ $SECONDS -lt $cap_deadline ]; do
+  CAP="$(apiget /api/workers | jq -r '[.workers[] | select(.status=="online")][0].max_concurrent_runs')"
+  [ "$CAP" = 2 ] && break
+  sleep 0.3
+done
 [ "$CAP" = 2 ] || fail "readopt: worker did not advertise max_concurrent_runs=2 after recreate (got ${CAP:-none})"
 pass "agent recreated at max_concurrent_runs=2"
 
