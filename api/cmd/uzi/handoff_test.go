@@ -466,7 +466,7 @@ func TestHandoffPushFailureDoesNotDispatch(t *testing.T) {
 	}
 	env, _ := handoffEnv(fc, rec)
 
-	_, _, code := runCLI(t, env, "handoff", "--repo", "p1", "-m", "x")
+	_, stderr, code := runCLI(t, env, "handoff", "--repo", "p1", "-m", "x")
 	if code == uzicli.ExitOK {
 		t.Fatalf("push failure must be non-zero exit, got %d", code)
 	}
@@ -482,6 +482,52 @@ func TestHandoffPushFailureDoesNotDispatch(t *testing.T) {
 	// And the create DID happen (so the error message's cleanup hint is real).
 	if fc.LastCreateTaskRepoID != "p1" {
 		t.Errorf("create should have run before the push; repo = %q", fc.LastCreateTaskRepoID)
+	}
+	// The remediation hint must be ACTIONABLE: after a failed push the run is definitely
+	// created-but-undispatched, so 'uzi run cancel' (which accepts a queued run) is the
+	// right cleanup — NOT 'uzi handoff rm', which refuses a non-terminal run and so could
+	// never clean up a queued undispatched orphan.
+	if !strings.Contains(stderr, "uzi run cancel") {
+		t.Errorf("push-failure stderr should recommend 'uzi run cancel':\n%s", stderr)
+	}
+	if strings.Contains(stderr, "uzi handoff rm") {
+		t.Errorf("push-failure stderr must not recommend 'uzi handoff rm' (it refuses a non-terminal run):\n%s", stderr)
+	}
+}
+
+// A dispatch failure is AMBIGUOUS: the UPDATE may have committed while only the response
+// was lost (possibly after a worker already claimed the run), so a blind cancel is unsafe.
+// The push SUCCEEDS here and dispatch fails, and the remediation must point the user at
+// 'uzi run get' to check the true state first — never at 'uzi handoff rm', which refuses a
+// non-terminal run.
+func TestHandoffDispatchFailureHint(t *testing.T) {
+	fc := &uzicli.FakeClient{
+		CreatedTaskRun:     taskRun("r4d", "uzi/task/r4d"),
+		DispatchedRun:      taskRun("r4d", "uzi/task/r4d"),
+		DispatchTaskRunErr: errPushRejected,
+	}
+	// No gitErr for the push, so the push succeeds and dispatch is reached.
+	rec := &handoffRecorder{}
+	env, _ := handoffEnv(fc, rec)
+
+	_, stderr, code := runCLI(t, env, "handoff", "--repo", "p1", "-m", "x")
+	if code == uzicli.ExitOK {
+		t.Fatalf("dispatch failure must be non-zero exit, got %d", code)
+	}
+	// The push happened (so the ambiguity is real), and dispatch was reached and failed.
+	wantPush := []string{"push", "origin", "HEAD:refs/heads/uzi/task/r4d"}
+	if !hasGitCall(rec, wantPush) {
+		t.Errorf("push should have run before dispatch; git calls %v", rec.gitCalls)
+	}
+	if fc.LastDispatchRunID != "r4d" {
+		t.Errorf("dispatch should have been reached (run id %q), want r4d", fc.LastDispatchRunID)
+	}
+	// The hint must send the user to check the true state, not to a blind cleanup.
+	if !strings.Contains(stderr, "uzi run get") {
+		t.Errorf("dispatch-failure stderr should recommend 'uzi run get' to check the ambiguous state:\n%s", stderr)
+	}
+	if strings.Contains(stderr, "uzi handoff rm") {
+		t.Errorf("dispatch-failure stderr must not recommend 'uzi handoff rm' (it refuses a non-terminal run):\n%s", stderr)
 	}
 }
 

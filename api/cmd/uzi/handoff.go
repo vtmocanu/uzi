@@ -145,7 +145,7 @@ func runHandoffCreate(env Env, gf *globalFlags, cmd *cobra.Command) error {
 	}
 	if _, err := env.Git(".", "push", "origin", srcRef+":refs/heads/"+branch); err != nil {
 		return uzicli.Exitf(uzicli.ExitGeneric,
-			"pushing %s to %s failed: %v\nthe task run %s was created but NOT dispatched, so no worker will claim it; clean it up with 'uzi handoff rm %s'",
+			"pushing %s to %s failed: %v\nthe task run %s was created but NOT dispatched, so no worker will claim it; cancel it with 'uzi run cancel %s'",
 			srcRef, branch, err, run.ID, run.ID)
 	}
 
@@ -153,8 +153,8 @@ func runHandoffCreate(env Env, gf *globalFlags, cmd *cobra.Command) error {
 	dispatched, err := c.DispatchTaskRun(cmd.Context(), run.ID)
 	if err != nil {
 		return uzicli.Exitf(uzicli.ExitGeneric,
-			"dispatching task %s failed: %v\nlocal HEAD was pushed to %s but the run was not dispatched, so no worker will claim it; clean it up with 'uzi handoff rm %s'",
-			run.ID, err, branch, run.ID)
+			"dispatching task %s failed: %v\nlocal HEAD was pushed to %s, but the dispatch did not confirm — the run may or may not have become claimable. Check it with 'uzi run get %s': if it shows dispatched or running, the handoff succeeded; if it is still queued and undispatched, the server will expire it automatically within its setup deadline, or you can cancel it with 'uzi run cancel %s' once you have confirmed it is still undispatched.",
+			run.ID, err, branch, run.ID, run.ID)
 	}
 
 	return renderHandoff(env, gf, dispatched, branch, reviewRequested, thenFix)
