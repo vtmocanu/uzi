@@ -45,7 +45,7 @@
     },
     {
       "customType": "regex",
-      "description": "uzi CI tool pins that curl a GitHub release tarball and `sha256sum -c` it (go-task in .github/actions/setup-task, sqlc + actionlint in ci.yml). The github-release-attachments datasource makes Renovate bump the VERSION and the companion sha256 together in one PR -- it resolves the tarball's sha256 for the new tag from the release's checksums asset, or by hashing it. The *_VERSION literal MUST be the v-prefixed git tag: getDigest fetches releases/tags/<value> verbatim, and the shell strips the leading v (${VAR#v}) where the asset filename is versionless. Marked `# renovate-tarball:` so the version-only generic manager above does NOT also match these. Linter/codegen pins (sqlc drift, actionlint findings) still arrive red-with-work by design; only go-task arrives green.",
+      "description": "uzi CI tool pins that curl a GitHub release tarball and `sha256sum -c` it (go-task in .github/actions/setup-task, sqlc + actionlint in ci.yml, per-platform golangci-lint archives in scripts/golangci-lint.sh). The github-release-attachments datasource makes Renovate bump the VERSION and companion sha256 together in one PR: it resolves the new asset's sha256 from the release checksum asset or by hashing it. The *_VERSION literal MUST be the v-prefixed git tag because getDigest fetches releases/tags/<value> verbatim; shell code may strip the leading v for versionless asset names. An optional packageName lets distinct depName aliases prevent Renovate's same-file deduplication while resolving one upstream package. Marked `# renovate-tarball:` so the version-only generic manager above does NOT also match these. Linter/codegen pins (sqlc drift, actionlint findings) still arrive red-with-work by design; go-task and golangci-lint arrive with complete hashes.",
       "managerFilePatterns": [
         "/^\\.github/workflows/[^/]+\\.ya?ml$/",
         "/^\\.github/actions/[^/]+/action\\.ya?ml$/",
@@ -53,10 +53,11 @@
         "/(^|/)Taskfile\\.ya?ml$/"
       ],
       "matchStrings": [
-        "#\\s*renovate-tarball:\\s*depName=(?<depName>\\S+)(?:\\s+versioning=(?<versioning>\\S+))?[^\\n]*\\n[\\s\\S]*?_VERSION=\"(?<currentValue>v[0-9][^\"]*)\"[\\s\\S]*?_SHA256=\"(?<currentDigest>[0-9a-f]{64})\""
+        "#\\s*renovate-tarball:\\s*depName=(?<depName>\\S+)(?:\\s+packageName=(?<packageName>\\S+))?(?:\\s+versioning=(?<versioning>\\S+))?[^\\n]*\\n[\\s\\S]*?_VERSION=\"(?<currentValue>v[0-9][^\"]*)\"[\\s\\S]*?_SHA256=\"(?<currentDigest>[0-9a-f]{64})\""
       ],
       "datasourceTemplate": "github-release-attachments",
       "depNameTemplate": "{{{depName}}}",
+      "packageNameTemplate": "{{#if packageName}}{{{packageName}}}{{else}}{{{depName}}}{{/if}}",
       "versioningTemplate": "{{#if versioning}}{{{versioning}}}{{else}}semver{{/if}}"
     }
   ],
@@ -71,6 +72,29 @@
       "description": "shellcheck is pinned in two managers (ci.yml tarball+sha via github-release-attachments; Taskfile lint:shell arg via github-releases). Group so a bump moves both in lockstep in one PR.",
       "matchDepNames": ["koalaman/shellcheck"],
       "groupName": "shellcheck"
+    },
+    {
+      "description": "golangci-lint: group the Taskfile version and both platform archive hashes for every update. Distinct depName aliases avoid same-file deduplication; shared packageName joins them here.",
+      "matchPackageNames": ["golangci/golangci-lint"],
+      "groupName": "golangci-lint",
+      "separateMajorMinor": false
+    },
+    {
+      "description": "Go toolchain: keep major and minor go/golang updates eligible for one branch without grouping their patch or digest refreshes.",
+      "matchDepNames": ["go", "golang"],
+      "separateMajorMinor": false
+    },
+    {
+      "description": "Go toolchain: group major/minor go.mod/toolchain and setup-go updates with golang builder images. Patch and digest refreshes stay independent.",
+      "matchDepNames": ["go", "golang"],
+      "matchUpdateTypes": ["major", "minor"],
+      "groupName": "Go toolchain"
+    },
+    {
+      "description": "Go toolchain: a major/minor golangci-lint update must land with the Go surfaces so its build-Go supports the selected toolchain.",
+      "matchPackageNames": ["golangci/golangci-lint"],
+      "matchUpdateTypes": ["major", "minor"],
+      "groupName": "Go toolchain"
     },
     {
       "description": "KinD toolchain: group helm/kind-action and kindest/node because the action downloads a default kind that must understand the node image's kubeadm API. KinD smoke remains the gate for one-sided releases.",

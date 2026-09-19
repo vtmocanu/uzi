@@ -210,7 +210,7 @@ linters:
           # driver files themselves. Verified: 0 violations (drivers still excluded).
           #
           # 🔴 `pkg:` MATCHES BY PREFIX, NOT GLOB — do not "wildcard" these paths.
-          # depguard (v2, as bundled in golangci-lint 2.12.2) matches deny entries as
+          # depguard (v2, as bundled in the Taskfile-pinned golangci-lint) matches deny entries as
           # package-tree PREFIXES; a `**`/`*` in `pkg:` is taken LITERALLY and matches
           # nothing, so a glob'd rule reports a SILENT FALSE ZERO (measured 2026-08-30:
           # `github.com/google/go-github/**` flagged neither a probe import in

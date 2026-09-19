@@ -2,9 +2,9 @@ module github.com/vtmocanu/uzi/api
 
 go 1.26.4
 
-// Build with the patched 1.26.x that fixes the stdlib CVEs govulncheck gates on
-// (net/http, crypto/tls, net/url, encoding/asn1, ...). Go auto-downloads it; the
-// renovate operator keeps this current. `go 1.26.4` above stays the language floor.
+// Build with the patched toolchain selected below so stdlib fixes reach the
+// packages govulncheck gates (net/http, crypto/tls, net/url, encoding/asn1, ...).
+// Go auto-downloads it; Renovate keeps it current while `go` remains the floor.
 toolchain go1.26.6
 
 require (

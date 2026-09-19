@@ -26,7 +26,7 @@ reviews:
   review_details: false
 
   # Don't re-run linters uzi's own gate already owns (pinned + ratcheted in CI:
-  # golangci-lint v2.12.2 with .golangci.yml new-from-merge-base, plus gate:repo's
+  # Taskfile-pinned golangci-lint with .golangci.yml new-from-merge-base, plus gate:repo's
   # shellcheck/yamllint/scan:secrets). CodeRabbit's unpinned, un-ratcheted copies
   # would surface backlog/version-skew findings CI does not — pure noise.
   tools:
