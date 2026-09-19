@@ -49,13 +49,15 @@ if [ "${1:-}" = api ]; then
     *'/commits/deadbeefdeadbeefdeadbeefdeadbeefdeadbeef/status'*)
       case "$MODE" in
         pending_findings) echo '{"statuses":[{"context":"CodeRabbit","description":"Review in progress"}]}' ;;
-        greptile_clean|greptile_race) echo '{"statuses":[]}' ;;
+        greptile_clean|greptile_race|prior_*|head_*) echo '{"statuses":[]}' ;;
         *) echo '{"statuses":[{"context":"CodeRabbit","description":"Review completed"}]}' ;;
       esac ;;
     *'/pulls/42/reviews'*)
       case "$MODE" in
         pending_findings) echo '[{"id":1,"user":{"login":"coderabbitai[bot]"},"commit_id":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","state":"APPROVED","body":""}]' ;;
         greptile_race) echo '[{"id":7,"user":{"login":"greptile-apps[bot]"},"commit_id":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","state":"COMMENTED","body":""}]' ;;
+        prior_headreview|head_two_runs) echo '[{"id":77,"user":{"login":"greptile-apps[bot]"},"commit_id":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","state":"COMMENTED","body":""}]' ;;
+        prior_findings) echo '[{"id":44,"user":{"login":"greptile-apps[bot]"},"commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","state":"COMMENTED","body":""},{"id":55,"user":{"login":"greptile-apps[bot]"},"commit_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","state":"COMMENTED","body":""}]' ;;
         cr_resolved) echo '[{"id":9,"user":{"login":"coderabbitai[bot]"},"commit_id":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","state":"APPROVED","body":""}]' ;;
         *) echo '[]' ;;
       esac ;;
@@ -63,14 +65,31 @@ if [ "${1:-}" = api ]; then
     *'/pulls/42/comments'*)
       case "$MODE" in
         pending_findings) echo '[{"user":{"login":"coderabbitai[bot]"},"line":7,"body":"🟡 **partial finding**","pull_request_review_id":1}]' ;;
+        prior_headreview|head_two_runs) echo '[{"user":{"login":"greptile-apps[bot]"},"line":8,"body":"<img alt=\"P1\"> current head finding","pull_request_review_id":77}]' ;;
+        prior_clean|prior_none|prior_unreadable|prior_pending|prior_unparseable|head_unreadable) echo '[{"user":{"login":"greptile-apps[bot]"},"line":8,"body":"<img alt=\"P1\"> old addressed finding","pull_request_review_id":99}]' ;;
+        prior_findings) echo '[{"user":{"login":"greptile-apps[bot]"},"line":8,"body":"<img alt=\"P1\"> superseded finding","pull_request_review_id":44},{"user":{"login":"greptile-apps[bot]"},"line":9,"body":"<img alt=\"P1\"> still open finding","pull_request_review_id":55}]' ;;
         greptile_clean) echo '[{"user":{"login":"greptile-apps[bot]"},"line":8,"body":"<img alt=\"P1\"> old addressed finding","pull_request_review_id":99}]' ;;
         cr_resolved) echo '[{"user":{"login":"coderabbitai[bot]"},"line":8,"body":"🟡 **resolved finding**","pull_request_review_id":9}]' ;;
         *) echo '[]' ;;
+      esac ;;
+    *'/pulls/42/commits'*)
+      [ "$MODE" = prior_unreadable ] && exit 1
+      echo '[{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},{"sha":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"}]' ;;
+    *'/commits/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/check-runs'*)
+      case "$MODE" in
+        prior_clean|prior_headreview|prior_unparseable|head_unreadable) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"90 files reviewed, 0 comments added"}}]}' ;;
+        prior_pending) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"in_progress","conclusion":null,"output":{"summary":""}}]}' ;;
+        prior_findings) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"90 files reviewed, 1 comments added"}}]}' ;;
+        *) echo '{"check_runs":[{"app":{"slug":"github-actions"},"name":"CI","status":"completed","conclusion":"success","output":{"summary":""}}]}' ;;
       esac ;;
     *'/commits/deadbeefdeadbeefdeadbeefdeadbeefdeadbeef/check-runs'*)
       case "$MODE" in
         greptile_clean) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"Greptile has reviewed the Pull Request.\n\n90 files reviewed, 0 comments added"}}]}' ;;
         greptile_race) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"Greptile has reviewed the Pull Request.\n\n90 files reviewed, 1 comments added"}}]}' ;;
+        prior_unparseable) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"Reviewed 90 files and raised 3 issues"}}]}' ;;
+        head_unreadable) exit 1 ;;
+        # Newest first, as the API lists them: the re-trigger (id 2) found something the first run did not.
+        head_two_runs) echo '{"check_runs":[{"id":2,"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"90 files reviewed, 1 comments added"}},{"id":1,"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"90 files reviewed, 0 comments added"}}]}' ;;
         *) echo '{"check_runs":[]}' ;;
       esac ;;
     *) echo "unexpected gh api: $*" >&2; exit 1 ;;
@@ -144,4 +163,111 @@ set -e
 [ "$rc" -eq 0 ] || fail "resolved CR thread stayed live, rc=$rc: $(cat "$WORK/cr-resolved.out")"
 grep -q '^RESULT=ready$' "$WORK/cr-resolved.out" || fail "resolved CR thread did not reach ready"
 
-echo "PASS watch-pr: settled reviews and resolved-thread scope"
+# A push Greptile never reviewed re-anchors its older comments onto the new head. A finding
+# a LATER Greptile pass already cleared must not come back as live (PR #1449): with the local
+# review lane (--reviewer none) the head reaches ready on the earlier clean verdict.
+MODE="prior_clean"; export MODE
+set +e
+bash "$SCRIPT" test/repo 42 0 1 --reviewer none > "$WORK/prior-clean.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 0 ] || fail "superseded Greptile finding stayed live on an unreviewed head, rc=$rc: $(cat "$WORK/prior-clean.out")"
+grep -q 'gr_prior=bbbbbbbb/0.*live=0' "$WORK/prior-clean.out" || fail "earlier clean verdict was not shown: $(cat "$WORK/prior-clean.out")"
+
+# ...but it never satisfies the reviewer gate: the same head is still unreviewed by Greptile.
+set +e
+bash "$SCRIPT" test/repo 42 0 1 --reviewer greptile --reviewer-grace 0 > "$WORK/prior-gate.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 6 ] || fail "an earlier verdict satisfied the exact-head reviewer gate, rc=$rc: $(cat "$WORK/prior-gate.out")"
+
+# An earlier verdict that ADDED comments keeps exactly its own, and drops the older pass's.
+MODE="prior_findings"; export MODE
+set +e
+bash "$SCRIPT" test/repo 42 0 1 --reviewer none > "$WORK/prior-findings.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 3 ] || fail "earlier verdict's own finding was lost, rc=$rc: $(cat "$WORK/prior-findings.out")"
+grep -q '^RESULT=findings live=1 cr=0 gr=1 ' "$WORK/prior-findings.out" || fail "scoping kept the wrong Greptile findings: $(cat "$WORK/prior-findings.out")"
+
+# No earlier verdict: nothing superseded the comment, so it stays live.
+MODE="prior_none"; export MODE
+set +e
+bash "$SCRIPT" test/repo 42 0 1 --reviewer none > "$WORK/prior-none.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 3 ] || fail "an unsuperseded Greptile finding was dropped, rc=$rc: $(cat "$WORK/prior-none.out")"
+
+# An unreadable history is unknown, never clean.
+MODE="prior_unreadable"; export MODE
+set +e
+bash "$SCRIPT" test/repo 42 0 1 --reviewer none > "$WORK/prior-unreadable.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 2 ] || fail "unreadable Greptile history read as a verdict, rc=$rc: $(cat "$WORK/prior-unreadable.out")"
+grep -q 'unknown=1' "$WORK/prior-unreadable.out" || fail "unreadable Greptile history was not marked unknown"
+
+# A Greptile review still RUNNING on a newer commit outranks an older clean verdict: the
+# poll defers (unknown), it must not step over the running review and read ready.
+MODE="prior_pending"; export MODE
+set +e
+bash "$SCRIPT" test/repo 42 0 1 --reviewer none > "$WORK/prior-pending.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 2 ] || fail "an in-flight newer Greptile review was stepped over, rc=$rc: $(cat "$WORK/prior-pending.out")"
+grep -q 'gr_prior=pending.*unknown=1' "$WORK/prior-pending.out" || fail "pending newer review was not visible: $(cat "$WORK/prior-pending.out")"
+
+# A Greptile review object already ON the head, its check-run not exposed yet: what Greptile
+# said about this head stands, an older clean verdict does not speak over it.
+MODE="prior_headreview"; export MODE
+set +e
+bash "$SCRIPT" test/repo 42 0 1 --reviewer none > "$WORK/prior-headreview.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 3 ] || fail "an older verdict overrode a current-head Greptile review, rc=$rc: $(cat "$WORK/prior-headreview.out")"
+
+# A head Greptile DID review, with a summary this script cannot parse: keep the raw count
+# rather than let an older clean verdict clear it.
+MODE="prior_unparseable"; export MODE
+set +e
+bash "$SCRIPT" test/repo 42 0 1 --reviewer none > "$WORK/prior-unparseable.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 3 ] || fail "an older verdict overrode an unparseable current-head review, rc=$rc: $(cat "$WORK/prior-unparseable.out")"
+
+# A review REQUESTED after the last verdict outranks it as well: `@greptileai review` only
+# becomes a check-run ~12 s later, and until then the head reads `absent`. A lander that
+# triggers and immediately watches must not read ready off the verdict it just asked to redo.
+MODE="prior_clean"; export MODE
+jq -n --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '[{user:{login:"lander",type:"User"},body:"@greptileai review",created_at:$t}]' > "$COMMENTS"
+set +e
+bash "$SCRIPT" test/repo 42 0 1 --reviewer none > "$WORK/prior-requested.out" 2>&1
+rc=$?
+set -e
+printf '[]\n' > "$COMMENTS"
+[ "$rc" -eq 2 ] || fail "a just-requested Greptile review was ignored for the older verdict, rc=$rc: $(cat "$WORK/prior-requested.out")"
+grep -q 'gr_prior=pending.*unknown=1' "$WORK/prior-requested.out" || fail "requested review was not visible: $(cat "$WORK/prior-requested.out")"
+
+# A head check-runs request that FAILED is not "Greptile never ran": no earlier verdict is
+# consulted, whatever the separate unknown flag does.
+MODE="head_unreadable"; export MODE
+set +e
+bash "$SCRIPT" test/repo 42 0 1 --reviewer none > "$WORK/head-unreadable.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 2 ] || fail "unreadable head check-runs did not defer, rc=$rc: $(cat "$WORK/head-unreadable.out")"
+grep -q 'greptile=unreadable' "$WORK/head-unreadable.out" || fail "unreadable head was reported as something else: $(cat "$WORK/head-unreadable.out")"
+if grep -q 'gr_prior=' "$WORK/head-unreadable.out"; then fail "an earlier verdict was consulted on an unreadable head: $(cat "$WORK/head-unreadable.out")"; fi
+grep -q ' live=1 ' "$WORK/head-unreadable.out" || fail "the anchored finding was cleared on an unreadable head: $(cat "$WORK/head-unreadable.out")"
+
+# Two Greptile runs on the head (a re-trigger needs no push), listed newest first: the
+# NEWEST is the verdict. Reading the last entry took the stale clean run and read ready.
+MODE="head_two_runs"; export MODE
+set +e
+bash "$SCRIPT" test/repo 42 0 1 --reviewer greptile --reviewer-grace 0 > "$WORK/head-two-runs.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 3 ] || fail "the older clean head run hid the re-trigger's finding, rc=$rc: $(cat "$WORK/head-two-runs.out")"
+grep -q 'gr_scope=1/1' "$WORK/head-two-runs.out" || fail "the newest head Greptile run was not the one read: $(cat "$WORK/head-two-runs.out")"
+
+echo "PASS watch-pr: settled reviews, resolved-thread scope, earlier-verdict Greptile scope"

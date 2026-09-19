@@ -31,12 +31,14 @@ nothing; every push to any other open PR is one review, including uzi's `mr_rewo
 
 Trigger: a `@greptileai review` comment (also `@greptile review`), or the `Retrigger` link
 Greptile puts in the PR body. One credit per review. The check-run appears ~12 s later.
+Only the COMMENT is visible to the scripts: the `Retrigger` link posts none, so a review
+started that way is not seen until its check-run exists.
 
 | Surface | Endpoint | What it tells you |
 |---|---|---|
-| Check-run `Greptile Review`, app `greptile-apps` | `repos/O/R/commits/<head>/check-runs` | **The per-head signal.** `in_progress` while reviewing; `completed` with `output.summary` = `Greptile has reviewed the Pull Request.\n\nN files reviewed, M comments added`. Conclusion is `success` even with a P1 finding: read M. Absent = not triggered on this head. Durations seen: 35 files 2.5 min, 107 files 6 min. |
+| Check-run `Greptile Review`, app `greptile-apps` | `repos/O/R/commits/<head>/check-runs` | **The per-head signal.** `in_progress` while reviewing; `completed` with `output.summary` = `Greptile has reviewed the Pull Request.\n\nN files reviewed, M comments added`. Conclusion is `success` even with a P1 finding: read M. Absent = not triggered on this head. The listing is newest first and a re-trigger adds a second run on the same commit: take the max `id`, never the last. The live summary ends with a period. Durations seen: 35 files 2.5 min, 107 files 6 min. |
 | Review object | `pulls/N/reviews` | Only when M > 0: a `greptile-apps[bot]` COMMENTED review, empty body, `commit_id` = reviewed head. **Zero findings posts no review at all**, so the reviews endpoint reads clean-as-absent. |
-| Inline comments | `pulls/N/comments` | Findings carry a `<img alt="P1">` / `P2` badge. Scope them to the latest current-head review id; when the current-head check reports `M > 0`, wait until M scoped comments are readable. An explicit `0 comments added` makes older still-anchored comments non-live. |
+| Inline comments | `pulls/N/comments` | Findings carry a `<img alt="P1">` / `P2` badge. Scope them to the latest current-head review id; when the current-head check reports `M > 0`, wait until M scoped comments are readable. An explicit `0 comments added` makes older still-anchored comments non-live. A push re-anchors every older comment onto the new head. When the head carries NO Greptile evidence (no check-run in any state, no review object), scope them to the newest EARLIER verdict within the last 20 PR commits (`scripts/lib/greptile-verdict.sh`; clean → none live, else that review id only; none found → all anchored stay live). A Greptile run still queued or in progress on a newer commit than that verdict defers instead, and so does a `@greptileai review` comment newer than it (the check-run takes ~12 s to appear) for up to 10 min. A head listing that could not be READ is not "no evidence": it keeps every anchored comment live. Liveness only, never the head-reviewed gate. Premise: each pass reviews the whole PR diff, not the delta (both passes on one PR reported the PR's full changed-file count). |
 | PR body | `pulls/N` `.body` | Greptile may rewrite the description between `<!-- greptile_comment -->` markers: `Confidence Score: N/5`, a summary, a mermaid diagram, and `<sub>Reviews (K) · Last reviewed commit: [...](…/commit/<full-sha>)</sub>`. Seen on 2 of 3 PRs, so a **secondary** confirmation only. The edit bumps the PR `updated_at`. |
 | Issue comments | | None from Greptile. |
 
@@ -46,5 +48,5 @@ Greptile puts in the PR body. One credit per review. The check-run appears ~12 s
 2. CR: status description → pending / limited / skipped / absent; reviewed = (a) or (c) or (d); command reply can require the agent to decide on one full review.
 3. Greptile: check-run on head → absent / in_progress / completed(+M).
 4. If either bot is active, defer finding output; the set is incomplete even when the other bot already satisfies the gate.
-5. Live findings = CR live + current-head Greptile live, regardless of which bot the gate requires.
+5. Live findings = CR live + Greptile live, regardless of which bot the gate requires. Greptile live = current-head review, else its newest earlier verdict.
 6. Ready only when required CI is settled green, every active review settled, the required reviewer(s) reviewed this exact head, live = 0, no `mr_rework` active, and the head re-reads unchanged (TOCTOU).

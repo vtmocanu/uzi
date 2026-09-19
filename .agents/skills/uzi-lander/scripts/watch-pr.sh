@@ -58,6 +58,8 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/review-threads.sh
 . "$HERE/lib/review-threads.sh"
+# shellcheck source=lib/greptile-verdict.sh
+. "$HERE/lib/greptile-verdict.sh"
 
 usage() { echo "usage: watch-pr.sh OWNER/REPO PR [interval_secs] [max_polls] [--reviewer any|coderabbit|greptile|none] [--reviewer-grace MIN]" >&2; exit 2; }
 
@@ -306,13 +308,17 @@ while [ "$i" -lt "$MAX" ]; do
   # skipped is not a review. `gh api --paginate` emits one object per page, so slurp first.
   gr_state="absent"; gr_summary=""; gr_concl=""
   if cr_raw=$(gh api --paginate "repos/$REPO/commits/$head/check-runs" 2>/dev/null) && pages_are_checkruns "$cr_raw"; then
-    gr_json=$(printf '%s' "$cr_raw" | jq -s '[.[].check_runs[]?|select(.app.slug=="greptile-apps" and .name=="Greptile Review")]|last // empty' 2>/dev/null) || unknown=1
+    gr_json=$(printf '%s' "$cr_raw" | greptile_newest_run) || { unknown=1; gr_json=""; gr_state="unreadable"; }
+    [ "$gr_json" = "{}" ] && gr_json=""
     if [ -n "$gr_json" ]; then
       gr_state=$(printf '%s' "$gr_json" | jq -r '.status // "absent"' 2>/dev/null) || unknown=1
       gr_concl=$(printf '%s' "$gr_json" | jq -r '.conclusion // ""' 2>/dev/null) || unknown=1
       gr_summary=$(printf '%s' "$gr_json" | jq -r '.output.summary // ""' 2>/dev/null | grep -oE '[0-9]+ files reviewed, [0-9]+ comments added' || true)
     fi
   else
+    # Not `absent`: that means "read, and Greptile has no run here", which is what lets an
+    # earlier verdict scope the findings below. An unreadable listing must not.
+    gr_state="unreadable"
     unknown=1
   fi
   gr_reviewed=0; gr_added=""
@@ -333,9 +339,29 @@ while [ "$i" -lt "$MAX" ]; do
       unknown=1
     fi
   fi
+  # No Greptile review on THIS head, yet Greptile comments are still anchored. A push
+  # re-anchors every older comment, so lib/greptile-verdict.sh scopes them to Greptile's
+  # newest EARLIER verdict rather than re-counting a finding a later pass superseded. It
+  # applies only when the head carries no Greptile evidence at all, and it is liveness
+  # only: gr_reviewed stays the exact-head answer, so this never satisfies the reviewer
+  # gate. A newer Greptile review still running (rc 2) defers like an in-progress head.
+  gr_prior=""
+  if [ "$gr_reviewed" -eq 0 ] && [ "$gr_live" -gt 0 ]; then
+    gr_flat=$(printf '%s' "$pull_c" | jq -s 'add // []' 2>/dev/null) || gr_flat='x'
+    gr_rc=0
+    gr_issue_flat=$(printf '%s' "${issue_c:-}" | jq -s 'add // []' 2>/dev/null) || gr_issue_flat='x'
+    greptile_scope_live "$REPO" "$PR" "$head" "$gr_state" "$gr_review_id" "$gr_live" "$gr_flat" "$gr_issue_flat" || gr_rc=$?
+    if [ "$gr_rc" -eq 0 ]; then
+      gr_live="$GRL_LIVE"; gr_prior="$GRL_NOTE"
+    else
+      unknown=1
+      [ "$gr_rc" -eq 2 ] && gr_prior="pending"
+    fi
+  fi
   [ "$gr_state" = "completed" ] && [ "$gr_reviewed" -eq 0 ] && gr_state="completed(${gr_concl:-no-conclusion}, no summary)"
-  # An unconfirmed CodeRabbit review counts as live; Greptile is now scoped to its latest
-  # current-head review (or cleared by an explicit clean zero-comment summary).
+  # An unconfirmed CodeRabbit review counts as live; Greptile is scoped to its current-head
+  # review, cleared by an explicit clean zero-comment summary, or, with no review on this
+  # head, scoped to its newest earlier verdict (gr_prior above).
   live=$((cr_live + gr_live + cr_unconfirmed))
 
   # Signal (d): "equivalent head" — a logic-free merge commit CodeRabbit did not re-review
@@ -402,6 +428,7 @@ while [ "$i" -lt "$MAX" ]; do
   eqnote=""; grnote=""
   [ "$equiv" -eq 1 ] && eqnote=" equiv=1"
   [ "$gr_reviewed" -eq 1 ] && grnote=" gr_scope=$gr_scoped_total/${gr_added:-?}"
+  [ -n "$gr_prior" ] && grnote=" gr_prior=$gr_prior"
   echo "try $i: head=${head:0:8} req_fail=$fail req_pend=$pend req_cancel=$cancel mrw_active=$mrw_active cr_reviewed=$cr_reviewed${eqnote} cr_status='${cr_desc:-absent}' cr_full_required=$cr_full_required greptile=$gr_state${gr_summary:+ ($gr_summary)}${grnote} live=$live (cr=$cr_live gr=$gr_live cr_unconfirmed=$cr_unconfirmed)${unknown:+ unknown=$unknown}"
 
   # A failed lookup this iteration: defer, do not decide on masked values.

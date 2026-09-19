@@ -153,7 +153,8 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    execute; do not wait for answers. Several PRs with findings → assess all, report once,
    execute unattended.
    **After a push, the re-review is your call:** wait for it when the fix changed logic or
-   a trust boundary; merge on green CI alone when it did not (docs, comments, renames);
+   a trust boundary; merge on green CI alone when it did not (docs, comments, renames:
+   `watch-pr.sh --reviewer none`, which scopes Greptile's comments to its last verdict);
    ask when unsure and the user is present. Say which in the merge note. Greptile does not
    re-review on its own; re-comment if you want its second pass.
 5. **Base hygiene, when needed, unprompted.** `BEHIND` alone is fine under an admin merge.
