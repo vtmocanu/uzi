@@ -77,12 +77,13 @@ func newRunGetCmd(env Env, gf *globalFlags) *cobra.Command {
 			// Metadata-only durable-recovery summary (PRD #1296 D7): best-effort, human-only,
 			// appended after the detail block. It NEVER widens raw access and prints nothing
 			// when the run has no recovery content, so an ordinary run's output is unchanged.
-			renderRunRecoverySummary(cmd.Context(), env, gf, c, run)
-			// The human-landing hint (issue #1418): a one-line pointer to `uzi run export`,
-			// shown ONLY for a failed run whose landing_state is "needs_landing" — i.e. its
-			// committed work is human-landable and the recovery-summary block above already
-			// surfaced the capture id(s). Every other run prints nothing here.
-			renderLandingHint(env, gf, run)
+			summary := renderRunRecoverySummary(cmd.Context(), env, gf, c, run)
+			// The human-landing hint (issue #1418): shown ONLY for a failed run whose
+			// landing_state is "needs_landing" — its committed work is human-landable. It words
+			// the recovery pointer by what the summary fetched above actually carries (an
+			// available archive → `uzi run export`, else the preserved diff), so it never names a
+			// command that would error. Every other run prints nothing here.
+			renderLandingHint(env, gf, run, summary)
 			return nil
 		},
 	}

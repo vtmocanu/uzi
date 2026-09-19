@@ -228,44 +228,70 @@ func humanBytes(n int64) string {
 // an enrichment, not a gate. It NEVER widens raw access (metadata only) and NEVER claims an
 // archive is available when it is not; it prints nothing at all unless there is genuine
 // recovery content, and names each capture's honest state.
-func renderRunRecoverySummary(ctx context.Context, env Env, gf *globalFlags, c uzicli.Client, run apitypes.RunDTO) {
+func renderRunRecoverySummary(ctx context.Context, env Env, gf *globalFlags, c uzicli.Client, run apitypes.RunDTO) apitypes.RecoveryArchiveSummaryDTO {
 	// A recovery archive is captured at a finalization FAILURE, so only a terminal run can
 	// carry recoverable content. Skipping the fetch for a live run keeps every non-terminal
 	// `run get` a single round-trip and byte-for-byte unchanged.
 	if !terminalRunStatuses[run.Status] {
-		return
+		return apitypes.RecoveryArchiveSummaryDTO{}
 	}
 	summary, err := c.RecoveryArchives(ctx, run.ID)
 	if err != nil {
-		return
+		return apitypes.RecoveryArchiveSummaryDTO{}
 	}
+	// Return the summary so renderLandingHint can word its recovery pointer by what actually
+	// exists (an available archive vs a preserved diff) without a second round-trip.
 	lines := recoverySummaryLines(summary)
 	if len(lines) == 0 {
-		return
+		return summary
 	}
 	p := env.printer(gf)
 	for _, l := range lines {
 		p.Printf("%s\n", l)
 	}
+	return summary
+}
+
+// hasAvailableArchive reports whether the summary carries a capture in the downloadable
+// 'available' state — the only state `uzi run export` can actually fetch.
+func hasAvailableArchive(summary apitypes.RecoveryArchiveSummaryDTO) bool {
+	for _, a := range summary.Archives {
+		if a.State == recoveryStateAvailable {
+			return true
+		}
+	}
+	return false
 }
 
 // renderLandingHint appends the issue #1418 human-landing hint to `uzi run get`'s human output,
 // printed ONLY when the run's server-derived landing_state is "needs_landing" — a failed run
-// whose committed work is human-landable. It is a one-line pointer to `uzi run export`, mirroring
-// the recover-with-export idiom the custody-hold list uses (run_recovery.go): the capture id(s)
-// this points at are already surfaced by the recovery-summary block above, so this adds only the
-// gated hint, never new capture-fetch plumbing.
+// whose committed work is human-landable. It names the recovery command that actually applies,
+// so it never points the operator at a command that would error:
+//   - an available recovery archive exists  → `uzi run export` (its id is in the block above);
+//   - otherwise the branch diff is preserved → `uzi run get --field preserved_patch`;
+//   - neither is visible here (a still-preparing capture, or a transient archives-fetch miss,
+//     though the server derived needs_landing) → `uzi run recovery`, which always lists state.
 //
-// Every other run — including a failed run whose landing_state is "unrecoverable" or "none", and
-// every non-failed run — prints nothing, so ordinary `run get` output is byte-for-byte unchanged.
+// DeriveLandingState reaches needs_landing via an available capture OR a preserved_patch, so at
+// most one of the first two branches names the wrong tool; branching on what the fetched summary
+// and the run row actually carry keeps the guidance correct for every needs_landing sub-case.
+// Every other run — a failed run whose landing_state is "unrecoverable" or "none", and every
+// non-failed run — prints nothing, so ordinary `run get` output is byte-for-byte unchanged.
 // run.ID is a server UUID (safe), sanitized defensively for consistency with the sibling hint.
-func renderLandingHint(env Env, gf *globalFlags, run apitypes.RunDTO) {
+func renderLandingHint(env Env, gf *globalFlags, run apitypes.RunDTO, summary apitypes.RecoveryArchiveSummaryDTO) {
 	if run.LandingState != landingStateNeedsLanding {
 		return
 	}
 	p := env.printer(gf)
-	p.Printf("\nthis failed run's committed work is landable by hand: recover it with `uzi run export %s`\n",
-		sanitizeTTY(run.ID))
+	id := sanitizeTTY(run.ID)
+	switch {
+	case hasAvailableArchive(summary):
+		p.Printf("\nthis failed run's committed work is landable by hand: export the recovery archive with `uzi run export %s`\n", id)
+	case run.PreservedPatch != nil && strings.TrimSpace(*run.PreservedPatch) != "":
+		p.Printf("\nthis failed run's committed work is landable by hand: its diff is preserved — view it with `uzi run get %s --field preserved_patch`\n", id)
+	default:
+		p.Printf("\nthis failed run's committed work is landable by hand: see recovery options with `uzi run recovery %s`\n", id)
+	}
 }
 
 // recoverySummaryLines is the metadata-only recovery block for `uzi run get` (PRD #1296 D7):

@@ -92,6 +92,47 @@ func TestRunGetLandingStatusAndHint(t *testing.T) {
 	}
 }
 
+// TestRunGetLandingHintByRecoverability proves the hint names the recovery command that actually
+// applies, so it never misdirects the operator to a command that would error. A needs_landing run
+// recoverable only via a preserved_patch (no available archive) must point at
+// `uzi run get --field preserved_patch`, NOT `uzi run export` (which handles archives only); and a
+// needs_landing run with neither visible here falls back to `uzi run recovery`.
+func TestRunGetLandingHintByRecoverability(t *testing.T) {
+	patch := "diff --git a/x b/x\n"
+	fc := &uzicli.FakeClient{
+		RunByID: map[string]apitypes.RunDTO{
+			// Preserved-patch-only: needs_landing, a preserved diff, and NO available archive
+			// (absent from RecoverySummaries → the fake returns the empty summary).
+			"pp": {ID: "pp", Kind: "issue", Status: "failed", LandingState: "needs_landing", PreservedPatch: &patch},
+			// Neither an archive nor a preserved diff visible to this reader (a still-preparing
+			// capture / transient fetch miss) — the server still derived needs_landing.
+			"none": {ID: "none", Kind: "issue", Status: "failed", LandingState: "needs_landing"},
+		},
+	}
+
+	ppOut, _, code := runCLI(t, fakeEnv(fc), "run", "get", "pp")
+	if code != uzicli.ExitOK {
+		t.Fatalf("run get pp exit = %d, want 0", code)
+	}
+	if !strings.Contains(ppOut, "`uzi run get pp --field preserved_patch`") {
+		t.Errorf("preserved-patch-only run must point at --field preserved_patch:\n%s", ppOut)
+	}
+	if strings.Contains(ppOut, "uzi run export pp") {
+		t.Errorf("preserved-patch-only run must NOT name `uzi run export` (it exports archives only):\n%s", ppOut)
+	}
+
+	noneOut, _, code := runCLI(t, fakeEnv(fc), "run", "get", "none")
+	if code != uzicli.ExitOK {
+		t.Fatalf("run get none exit = %d, want 0", code)
+	}
+	if !strings.Contains(noneOut, "`uzi run recovery none`") {
+		t.Errorf("needs_landing run with neither archive nor patch must fall back to `uzi run recovery`:\n%s", noneOut)
+	}
+	if strings.Contains(noneOut, "uzi run export none") {
+		t.Errorf("fallback hint must NOT name `uzi run export`:\n%s", noneOut)
+	}
+}
+
 // TestRunGetLandingHintNamesRun proves the needs_landing hint names the exact run and points at
 // `uzi run export`, mirroring the recover-with-export idiom of the custody-hold list.
 func TestRunGetLandingHintNamesRun(t *testing.T) {
