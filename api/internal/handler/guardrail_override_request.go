@@ -77,10 +77,13 @@ func screenGuardrailText(clean, label string) (status int, msg string) {
 // validateOptionalGuardrailNote screens the OPTIONAL admin decision note (PRD #1432
 // M3). It trims; an empty/absent note is legal and returns an invalid pgtype.Text (no
 // note persisted). A NON-empty note gets the SAME length + unsafe-character screen as
-// the override reason (screenGuardrailText) — the note is rendered back to the member
-// in an inbox notification, a cross-user surface, so it MUST get the same termsafe
-// treatment as any other free text that crosses that boundary. Returns status==0 on
-// success, else the HTTP status and message the caller emits.
+// the override reason (screenGuardrailText) — the note is surfaced back to the member
+// on the Repos page (OverrideRequestStateDTO.DecisionNote, attached in ListProjects for
+// a not-yet-enabled repo), a cross-user surface where admin-authored text is shown to
+// the requester, so it MUST get the same termsafe treatment as any other free text that
+// crosses that boundary. (The decision notification itself carries only a fixed
+// title/body, not the note.) Returns status==0 on success, else the HTTP status and
+// message the caller emits.
 func validateOptionalGuardrailNote(raw string) (note pgtype.Text, status int, msg string) {
 	clean := strings.TrimSpace(raw)
 	if clean == "" {
