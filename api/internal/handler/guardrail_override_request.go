@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
-	"unicode"
 
 	"github.com/jackc/pgx/v5"
 
@@ -15,6 +14,7 @@ import (
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/privcheck"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/termsafe"
 )
 
 // validateGuardrailReason is the SHARED reason validator for every #66 guardrail
@@ -24,14 +24,18 @@ import (
 // drifting on what a legal reason is.
 //
 // It trims, then rejects an empty reason (400), an over-long one (422 —
-// maxGuardrailOverrideReasonBytes), or one carrying any control character (400). The
+// maxGuardrailOverrideReasonBytes), or one carrying any unsafe character (400). The
 // reason is an audit note M9 renders in a badge, the admin blocked-repos list, the
-// admin request queue, and potentially a plain-text CLI/log surface, so control
-// characters (newline, CR, tab, ANSI ESC, the C1/Cc set unicode.IsControl covers) are
-// rejected write-side: a forged audit line cannot be smuggled into a non-escaping sink,
-// one check here instead of trusting every future renderer to escape (PRD #66 M8 audit
-// hardening). On success it returns the trimmed reason with status==0; on rejection it
-// returns the HTTP status and the message the caller emits verbatim.
+// admin request queue (a CROSS-USER surface a member's text reaches), and potentially a
+// plain-text CLI/log surface, so both C0/C1 control characters (newline, CR, tab, ANSI
+// ESC — the Cc set unicode.IsControl covers) AND Unicode format characters (the Cf set:
+// bidi overrides U+202A-202E, isolates U+2066-2069, the zero-widths, the BOM) are
+// rejected write-side via termsafe.Unsafe. IsControl alone never sees U+202E, so on its
+// own it would let a member Trojan-Source-spoof the reason the approving admin reads and
+// weighs — the Cf half is the one that matters most here. One check write-side instead
+// of trusting every future renderer to escape (PRD #66 M8 audit hardening; issue #1432
+// extends it to the member-supplied path). On success it returns the trimmed reason with
+// status==0; on rejection it returns the HTTP status and the message the caller emits.
 func validateGuardrailReason(raw string) (clean string, status int, msg string) {
 	clean = strings.TrimSpace(raw)
 	if clean == "" {
@@ -41,8 +45,8 @@ func validateGuardrailReason(raw string) (clean string, status int, msg string) 
 		return "", http.StatusUnprocessableEntity, "reason is too long"
 	}
 	for _, ru := range clean {
-		if unicode.IsControl(ru) {
-			return "", http.StatusBadRequest, "reason must not contain control characters"
+		if termsafe.Unsafe(ru) {
+			return "", http.StatusBadRequest, "reason must not contain control or formatting characters"
 		}
 	}
 	return clean, 0, ""

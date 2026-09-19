@@ -49,6 +49,12 @@ func TestGuardrailOverrideReasonValidation(t *testing.T) {
 		{"newline (forged audit line)", "looks fine\nActor: someone-else approved", http.StatusBadRequest},
 		{"ansi escape", "reason\x1b[31mred", http.StatusBadRequest},
 		{"carriage return", "a\rb", http.StatusBadRequest},
+		// Trojan-Source display spoof: a right-to-left override (U+202E, Unicode
+		// category Cf) that unicode.IsControl does NOT catch — it must still be
+		// rejected write-side so a member's reason cannot visually reorder the text
+		// the approving admin reads (issue #1432, via termsafe.Unsafe).
+		{"bidi override (trojan source)", "allow" + string(rune(0x202e)) + "detsurt", http.StatusBadRequest},
+		{"zero-width space", "al" + string(rune(0x200b)) + "low", http.StatusBadRequest},
 		{"too long", strings.Repeat("x", maxGuardrailOverrideReasonBytes+1), http.StatusUnprocessableEntity},
 	}
 	for _, tc := range cases {
