@@ -53,6 +53,36 @@ var neverJudgeFailOrigins = map[string]bool{
 	"forge_unreachable": true,
 }
 
+// envPublishFailOrigins is the fail_origin set for ENVIRONMENT-CAUSED publish failures (issue
+// #1418): a run that did all its work and passed its gates, but whose branch the worker could
+// not publish because the environment refused it — the workflow-scoped push the bot PAT cannot
+// make (workflow_scope_missing, PRD #377), the base-align merge+rebase that both conflicted
+// (finalize_base_align_conflict, PRD #456), or the push GitHub Push Protection rejected
+// (push_secret_blocked, issue #974). There is no agent behaviour to retrospect — the failure is
+// the environment's, not the agent's — so the judge is skipped REGARDLESS of iteration_count
+// (like neverJudgeFailOrigins, and UNLIKE preStartInfraFailOrigins: these land at finalize,
+// after all work, so a resumed run carries iteration_count > 0 and an == 0 gate would wrongly
+// judge it). TestEnvPublishFailOriginsExact pins the exact set.
+//
+// DELIBERATELY WORKER-REPORTABLE, which is the one way this set differs from neverJudgeFailOrigins.
+// A worker forging one of these could at worst decline to spend judge tokens retrospecting its OWN
+// publish failure — a spend/accuracy footgun, NOT a security boundary (contrast guardrail_blocked,
+// which gates a security classification, and forge_unreachable, which is server-derived). These
+// three are already trusted worker-reported values that set preserved_patch / display today, so no
+// new trust is conferred. The deterministic failure NOTIFICATION is unaffected: each arrives as a
+// worker-reported `failed` SetState transition that fires PublishState(runID,"failed") BEFORE
+// maybeEnqueueJudge, and RunFailureNotifier notifies off that, exactly as for the infra origins.
+//
+// history_rewritten is DELIBERATELY NOT a member: uzi never force-pushes, so a branch rewritten
+// below the published tip is an AGENT DEFECT (the agent rewrote published history against the
+// steer) and stays JUDGE-ELIGIBLE — the one worker-reportable finalize-failure origin kept out of
+// this set on purpose (see failorigin.go and TestHistoryRewrittenStillJudged).
+var envPublishFailOrigins = map[string]bool{
+	"finalize_base_align_conflict": true,
+	"workflow_scope_missing":       true,
+	"push_secret_blocked":          true,
+}
+
 // maybeEnqueueJudgeByID reloads a run by id and runs the judge gate. Used by the
 // sweeper, whose swept rows do not carry the full run shape the gate needs.
 func (s *Service) maybeEnqueueJudgeByID(ctx context.Context, runID uuid.UUID) {
@@ -126,18 +156,25 @@ func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 		}
 		return // no token ⇒ nothing to spend ⇒ no judge run
 	}
-	// Gate 4b (PRD #69 M7a Pass B, Decision 12; PRD #1392 M1): skip the judge for a failure
-	// with no agent behavior to retrospect. Two disjoint sets, differing ONLY in whether the
-	// skip is gated on iteration_count:
+	// Gate 4b (PRD #69 M7a Pass B, Decision 12; PRD #1392 M1; issue #1418): skip the judge for a
+	// failure with no agent behavior to retrospect. Three disjoint sets, differing ONLY in whether
+	// the skip is gated on iteration_count:
 	//   - neverJudgeFailOrigins (forge_unreachable): server-derived, never a real agent defect,
 	//     so it skips REGARDLESS of iteration_count. A forge cap-fail on a RESUMED run carries
 	//     iteration_count > 0 (iteration_count is only ever advanced, never reset), so gating it
 	//     on == 0 would wrongly judge it — SC3 requires "no judge run" unconditionally.
+	//   - envPublishFailOrigins (finalize_base_align_conflict/workflow_scope_missing/
+	//     push_secret_blocked): environment-caused publish failures (issue #1418) — the run did all
+	//     its work, the environment refused the push. No agent behaviour to review, so skipped
+	//     REGARDLESS of iteration_count (these land at finalize, so a resumed run carries
+	//     iteration_count > 0). Worker-reportable, unlike neverJudgeFailOrigins — the accepted
+	//     spend/accuracy tradeoff, not a security boundary. history_rewritten is NOT here: it is an
+	//     agent defect (a rewrite below the published tip that uzi never force-pushes) and stays judged.
 	//   - preStartInfraFailOrigins (provisioning/credential/guardrail): a pre-start policy/config
 	//     block, skipped ONLY at iteration_count == 0. An agent that started and crashed at
-	//     iteration 0 carries 'agent_failure' (the worker-reported default), stays out of BOTH
+	//     iteration 0 carries 'agent_failure' (the worker-reported default), stays out of ALL three
 	//     sets, and is still judged (SC3); the iteration conjunct is the PRD's defensive guard.
-	// Neither is rate_limited/worker_lost/run_timeout (transient) nor agent_failure (judgeable).
+	// None is rate_limited/worker_lost/run_timeout (transient) nor agent_failure (judgeable).
 	// This is the ACCURACY+SPEND fix: such a failure has no agent behavior to review, and
 	// skipping avoids the most expensive per-run call (opus) on a run that did nothing.
 	//
@@ -156,8 +193,9 @@ func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 	// injecting it would create an import cycle.
 	if run.Status == "failed" && run.FailOrigin.Valid &&
 		(neverJudgeFailOrigins[run.FailOrigin.String] ||
+			envPublishFailOrigins[run.FailOrigin.String] ||
 			(run.IterationCount == 0 && preStartInfraFailOrigins[run.FailOrigin.String])) {
-		slog.Debug("judge enqueue: server-derived / pre-start infra failure, skipping judge (deterministic notification delivered by RunFailureNotifier on the same transition)",
+		slog.Debug("judge enqueue: server-derived / environment-caused publish / pre-start infra failure, skipping judge (deterministic notification delivered by RunFailureNotifier on the same transition)",
 			"run", run.ID, "fail_origin", run.FailOrigin.String)
 		return
 	}

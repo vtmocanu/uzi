@@ -168,6 +168,55 @@ func TestNeverJudgeFailOriginsExact(t *testing.T) {
 	assertFailOriginSetExact(t, "neverJudgeFailOrigins", neverJudgeFailOrigins, "forge_unreachable")
 }
 
+// TestEnvPublishFailOriginsExact pins envPublishFailOrigins (issue #1418) to its EXACT membership:
+// the three environment-caused publish failures. An accidental add (a genuinely judgeable origin —
+// notably history_rewritten — slipping into the regardless-of-iteration skip) or drop reddens here.
+func TestEnvPublishFailOriginsExact(t *testing.T) {
+	assertFailOriginSetExact(t, "envPublishFailOrigins", envPublishFailOrigins,
+		"finalize_base_align_conflict", "workflow_scope_missing", "push_secret_blocked")
+}
+
+// TestEnvPublishFailureSkipsJudgeRegardlessOfIteration (issue #1418): an environment-caused publish
+// failure (the run did all its work, the environment refused the push) must NEVER enqueue a judge,
+// whatever the iteration count — these land at finalize, so a RESUMED run carries iteration_count>0
+// and a == 0 gate would wrongly judge it. One regression per origin, both iteration regimes.
+func TestEnvPublishFailureSkipsJudgeRegardlessOfIteration(t *testing.T) {
+	for _, origin := range []string{"finalize_base_align_conflict", "workflow_scope_missing", "push_secret_blocked"} {
+		for _, iter := range []int32{0, 7} {
+			t.Run(origin+"/iteration_count="+strconv.Itoa(int(iter)), func(t *testing.T) {
+				fs, svc, run := eligibleFixture(t)
+				run.Status = "failed"
+				run.IterationCount = iter
+				run.FailOrigin = pgconv.TextOrNull(origin)
+				svc.maybeEnqueueJudge(context.Background(), run)
+				if fs.createdJudgeRun != nil {
+					t.Fatalf("%s at iteration_count=%d is an environment-caused publish failure and must NOT be judged, got %+v",
+						origin, iter, fs.createdJudgeRun)
+				}
+			})
+		}
+	}
+}
+
+// TestHistoryRewrittenStillJudged (issue #1418): history_rewritten is the one worker-reportable
+// finalize-failure origin deliberately kept OUT of envPublishFailOrigins — a rewrite below the
+// published tip (which uzi never force-pushes) is an agent defect, so it stays judge-eligible at
+// EVERY iteration count. Cheap insurance against it accidentally joining the env-publish skip set.
+func TestHistoryRewrittenStillJudged(t *testing.T) {
+	for _, iter := range []int32{0, 7} {
+		t.Run("iteration_count="+strconv.Itoa(int(iter)), func(t *testing.T) {
+			fs, svc, run := eligibleFixture(t)
+			run.Status = "failed"
+			run.IterationCount = iter
+			run.FailOrigin = pgconv.TextOrNull("history_rewritten")
+			svc.maybeEnqueueJudge(context.Background(), run)
+			if fs.createdJudgeRun == nil {
+				t.Fatalf("history_rewritten at iteration_count=%d is an agent defect and must still be judged (not in envPublishFailOrigins)", iter)
+			}
+		})
+	}
+}
+
 // assertFailOriginSetExact fails unless set contains EXACTLY want, and every member is a real
 // stored fail_origin (failOriginSet) so the set can never reference a phantom origin.
 func assertFailOriginSetExact(t *testing.T, name string, set map[string]bool, want ...string) {
