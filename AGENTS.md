@@ -64,7 +64,7 @@ go install github.com/go-task/task/v3/cmd/task@v3.53.1   # pinned, sumdb-verifie
 
 ### Lint ratchet
 
-- **The Go ratchet lives in `.golangci.yml`** (`issues: {new-from-merge-base: origin/main, whole-files: true}`), not on `lint:api`'s command line, so Task echoes only `../scripts/golangci-lint.sh v2.12.2 run ./...` (a pinned release binary). **Read `.golangci.yml`, not the gate's output.** The CLI form is not an option: it would need a variable spliced into a `cmds:` line, which `Taskfile.yml`'s header bans, or a CI-only flag, which would make local and CI disagree about what a finding is.
+- **The Go ratchet lives in `.golangci.yml`** (`issues: {new-from-merge-base: origin/main, whole-files: true}`), not on `lint:api`'s command line, so Task echoes only the resolved `../scripts/golangci-lint.sh <pinned-version> run ./...` command. **Read `.golangci.yml`, not the gate's output.** `GOLANGCI_LINT_VERSION` is a static, quoted Task variable so Renovate has one version field and the rendered echo still shows the pin. Dynamic or unquoted variables remain banned by `Taskfile.yml`'s header; a CI-only ratchet flag would make local and CI disagree about what a finding is.
 - Only findings your branch introduces block; `whole-files` also blocks pre-existing findings in a file you merely *touched*.
 - `task lint:api:all` / `lint:controller:all` print the unfiltered backlog and gate nothing.
 - If `origin/main` does not resolve, golangci-lint does not skip the ratchet: it reports the whole backlog behind one buried warning, reading as a huge regression. The targets pre-flight this and exit 2; run `git fetch origin main`.

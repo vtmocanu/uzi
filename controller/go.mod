@@ -20,8 +20,8 @@ module github.com/vtmocanu/uzi/controller
 
 go 1.26.4
 
-// Patched 1.26.x for the stdlib CVEs govulncheck gates on (auto-downloaded; renovate
-// keeps it current). `go 1.26.4` above stays the language floor.
+// The patched toolchain below carries stdlib fixes govulncheck gates on. Go
+// auto-downloads it; Renovate keeps it current while `go` remains the floor.
 toolchain go1.26.6
 
 require (

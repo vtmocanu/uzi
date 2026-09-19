@@ -170,8 +170,8 @@ print as your branch's findings.** And if a Go lint target prints
 `Error: parallel golangci-lint is running`, a sibling worktree holds the
 host-global lock: **re-run, do not report a red gate.** That one is invisible
 through `task` — golangci-lint exits 3, and since PRD #230 M5 the
-`scripts/golangci-lint.sh` wrapper execs the binary so that 3 now reaches the
-SCRIPT's exit (the old `go run` flattened it to 1); but `task` flattens every
+`scripts/golangci-lint.sh` wrapper preserves the binary's exit status, so 3
+reaches the SCRIPT's exit (the old `go run` flattened it to 1); but `task` flattens every
 nonzero to its usual 201, so `task lint:api` reports 201 for a lock exactly as for
 a finding — the message text is the only discriminator. *(PRD #103 M3, 2026-08-02: this paragraph
 said "this repo has no linter yet (PRD #103 M3 builds one)" and "Do not go

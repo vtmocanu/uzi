@@ -85,13 +85,14 @@ does that in its `before_script`.
 
 **One exception since PRD #103 M3, and it is why that sentence is now qualified:**
 `task lint:api` and `task lint:controller` acquire golangci-lint through
-`scripts/golangci-lint.sh v2.12.2` (PRD #230 M5) — a curl + sha256-verified
-release binary, cached under `$HOME/.cache`. It replaced a
-`go run …golangci-lint@v2.12.2` that **compiled** the tool from source on a cold
-cache (**51.6s**, the pipeline's cold long pole); the release binary is a ~1-2s
-download instead. It is version-pinned and writes nothing to either `go.mod`, so
-it changes no dependency of yours — the first run fetches once, which is expected,
-not a hang.
+`scripts/golangci-lint.sh` with the Taskfile's visible pinned-version argument
+(PRD #230 M5). The wrapper caches a curl-downloaded, sha256-verified release
+archive under `$HOME/.cache` and extracts a fresh binary from that verified
+archive for each invocation. It replaced a `go run …golangci-lint@v2.12.2` that
+**compiled** the tool from source on a cold cache (**51.6s**, the pipeline's cold
+long pole); the release archive is a ~1-2s download instead. It writes nothing to
+either `go.mod`, so it changes no dependency of yours. The first run fetches once,
+which is expected, not a hang.
 
 **🔴 BEFORE YOUR FIRST `task gate:web` OR `task gate:agent` AFTER PULLING M3 OR
 M4, YOU MUST INSTALL IN BOTH npm PACKAGES.** M3 added oxlint and M4 added knip,
