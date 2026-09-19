@@ -37,18 +37,26 @@ case "$*" in
       head_review_object) printf '[{"id":77,"user":{"login":"greptile-apps[bot]"},"commit_id":"%s","state":"COMMENTED","body":""}]\n' "$HEAD" ;;
       *) echo '[]' ;;
     esac ;;
-  *'/issues/42/comments'*) echo '[]' ;;
+  *'/issues/42/comments'*)
+    if [ "$MODE" = prior_requested ]; then printf '[{"user":{"login":"lander","type":"User"},"created_at":"%s","body":"@greptileai review"}]\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    else echo '[]'; fi ;;
   *"/commits/$HEAD/check-runs"*)
     case "$MODE" in
       head_clean) greptile completed '"success"' 'Greptile has reviewed the Pull Request.\n\n90 files reviewed, 0 comments added.' ;;
       head_findings) greptile completed '"success"' '90 files reviewed, 10 comments added' ;;
+      head_failed) greptile completed '"failure"' '' ;;
+      head_unreadable) echo '[]' ;;
+      # Newest first, as the API lists them: the re-trigger (id 2) found something the first run did not.
+      head_two_runs) echo '{"check_runs":[{"id":2,"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"90 files reviewed, 1 comments added"}},{"id":1,"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"90 files reviewed, 0 comments added"}}]}' ;;
       *) none ;;
     esac ;;
   *'/pulls/42/comments'*) echo '[{"user":{"login":"greptile-apps[bot]"},"line":8,"body":"<img alt=\"P1\"> finding","pull_request_review_id":99}]' ;;
-  *'/pulls/42/commits'*) printf '[{"sha":"%s"},{"sha":"%s"}]\n' "$PREV" "$HEAD" ;;
+  *'/pulls/42/commits'*)
+    [ "$MODE" = prior_unreadable ] && exit 1
+    printf '[{"sha":"%s"},{"sha":"%s"}]\n' "$PREV" "$HEAD" ;;
   *"/commits/$PREV/check-runs"*)
     case "$MODE" in
-      prior_clean|head_review_object) greptile completed '"success"' '90 files reviewed, 0 comments added' ;;
+      prior_clean|head_review_object|head_failed|head_unreadable|prior_requested) greptile completed '"success"' '90 files reviewed, 0 comments added' ;;
       prior_pending) greptile in_progress null '' ;;
       *) none ;;
     esac ;;
@@ -60,8 +68,11 @@ STUB
 chmod +x "$WORK/bin/gh" "$WORK/bin/uzi"
 export PATH="$WORK/bin:$PATH"
 
-# snap MODE — one snapshot; never claims (that writes shared state).
-snap() { MODE="$1"; export MODE; bash "$SCRIPT" 42 --repo test/repo --no-claim > "$WORK/$1.out" 2>&1 || true; }
+# snap MODE — one snapshot; never claims (that writes shared state). A snapshot always exits 0.
+snap() {
+  MODE="$1"; export MODE
+  bash "$SCRIPT" 42 --repo test/repo --no-claim > "$WORK/$1.out" 2>&1 || fail "$1: takeover.sh exited $?: $(cat "$WORK/$1.out")"
+}
 has() { grep -qF -- "$2" "$WORK/$1.out" || fail "$1: missing '$2': $(cat "$WORK/$1.out")"; }
 hasnt() { if grep -qF -- "$2" "$WORK/$1.out"; then fail "$1: unexpected '$2': $(cat "$WORK/$1.out")"; fi; }
 
@@ -97,5 +108,34 @@ snap prior_pending
 has prior_pending 'GREPTILE_PRIOR_VERDICT=pending'
 has prior_pending 'UNKNOWN=1'
 has prior_pending 'NEXT=unknown'
+
+# ...and so is a review REQUESTED after the last verdict whose check-run has not appeared yet.
+snap prior_requested
+has prior_requested 'GREPTILE_PRIOR_VERDICT=pending'
+has prior_requested 'NEXT=unknown'
+
+# An unreadable history is unknown, and says so.
+snap prior_unreadable
+has prior_unreadable 'GREPTILE_PRIOR_VERDICT=unreadable'
+has prior_unreadable 'LIVE_FINDINGS=1 (cr=0 gr=1 '
+has prior_unreadable 'NEXT=unknown'
+
+# A Greptile run that FAILED on the head is evidence about this head: the raw count stands.
+snap head_failed
+hasnt head_failed 'GREPTILE_PRIOR_VERDICT='
+has head_failed 'LIVE_FINDINGS=1 (cr=0 gr=1 '
+
+# An UNREADABLE head listing is not `absent`: no earlier verdict is consulted.
+snap head_unreadable
+has head_unreadable 'GREPTILE=unreadable'
+hasnt head_unreadable 'GREPTILE_PRIOR_VERDICT='
+has head_unreadable 'LIVE_FINDINGS=1 (cr=0 gr=1 '
+has head_unreadable 'NEXT=unknown'
+
+# Two Greptile runs on the head, listed newest first: the NEWEST is the verdict. Reading the
+# last entry took the stale clean run and cleared the finding the re-trigger raised.
+snap head_two_runs
+has head_two_runs "GREPTILE_SUMMARY='90 files reviewed, 1 comments added'"
+has head_two_runs 'LIVE_FINDINGS=1 (cr=0 gr=1 '
 
 echo "PASS takeover: Greptile liveness agrees with watch-pr and pr-findings"

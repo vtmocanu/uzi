@@ -89,7 +89,12 @@ for n in "$@"; do
   # `<sha>`"). Read it the fail-closed way: exactly one walkthrough comment, SHA parsed only
   # inside its block.
   wt_head=""
+  # gr_issue feeds the "was a Greptile review requested after its last verdict" check further
+  # down; a failed fetch becomes garbage there on purpose, so it fails closed rather than
+  # reading as "no trigger comment".
+  gr_issue="x"
   if wt_all=$(gh api --paginate "repos/${repo}/issues/${n}/comments" 2>/dev/null | jq -s 'add // []' 2>/dev/null) \
+     && gr_issue="$wt_all" \
      && [ "$(printf '%s' "$wt_all" | jq '[.[]|select(.user.login=="coderabbitai[bot]" and (.body|contains("<!-- walkthrough_start -->")))]|length' 2>/dev/null)" = "1" ]; then
     # shellcheck disable=SC2016  # literal backticks in CodeRabbit's marker
     wt_head=$(printf '%s' "$wt_all" | jq -r '.[]|select(.user.login=="coderabbitai[bot]" and (.body|contains("<!-- walkthrough_start -->")))|.body' \
@@ -135,9 +140,16 @@ for n in "$@"; do
   # ---- Greptile ----------------------------------------------------------------------
   gr_ok=0; gr_added=""; gr_status="absent"; gr_line="not triggered on this head (on-demand: gh pr comment ${n} --body '@greptileai review')"
   if [ -n "$head" ]; then
-    gr_json=$(gh api --paginate "repos/${repo}/commits/${head}/check-runs" 2>/dev/null \
-      | greptile_newest_run || true)
-    [ "$gr_json" = "{}" ] && gr_json=""
+    # An unreadable listing is NOT `absent`. `absent` means "read, and Greptile has no run
+    # here", which is what lets an earlier verdict scope the findings below; a request that
+    # failed must keep every anchored comment listed and the PR unconfirmed.
+    if gr_json=$(gh api --paginate "repos/${repo}/commits/${head}/check-runs" 2>/dev/null | greptile_newest_run); then
+      [ "$gr_json" = "{}" ] && gr_json=""
+    else
+      gr_json=""; gr_status="unreadable"
+      gr_line="check-runs on this head UNREADABLE (request failed or returned garbage) — NOT confirmed clean"
+      unconfirmed="${unconfirmed} #${n}"
+    fi
     if [ -n "$gr_json" ]; then
       gr_status=$(printf '%s' "$gr_json" | jq -r '.status // ""')
       gr_concl=$(printf '%s' "$gr_json" | jq -r '.conclusion // ""')
@@ -227,7 +239,7 @@ for n in "$@"; do
   if [ "$gr_ok" -eq 0 ] && [ -n "$head" ]; then
     gr_anchored=$(printf '%s' "$inline_raw" | jq '[.[]|select(.user.login=="greptile-apps[bot]" and .line!=null)]|length' 2>/dev/null || echo 0)
     gr_rc=0
-    greptile_scope_live "$repo" "$n" "$head" "$gr_status" "$gr_review_id" "$gr_anchored" "$inline_raw" || gr_rc=$?
+    greptile_scope_live "$repo" "$n" "$head" "$gr_status" "$gr_review_id" "$gr_anchored" "$inline_raw" "$gr_issue" || gr_rc=$?
     if [ "$gr_rc" -eq 2 ]; then
       echo "  ⏳ a Greptile review is still running on a newer commit than its last verdict; findings deferred"
       unconfirmed="${unconfirmed} #${n}"

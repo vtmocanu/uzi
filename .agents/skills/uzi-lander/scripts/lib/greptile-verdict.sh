@@ -37,6 +37,7 @@ greptile_newest_run() {
 #   "N files reviewed, M comments added" summary. Sets:
 #     GRV_SHA        that commit, or empty when no earlier verdict exists in the window
 #     GRV_ADDED      M
+#     GRV_STARTED    that run's started_at (empty when the API omits it)
 #     GRV_REVIEW_ID  the greptile review object on GRV_SHA (only when M > 0; a clean pass
 #                    posts no review object)
 #   rc 0  the answer is trustworthy, including "none found" (GRV_SHA empty).
@@ -50,10 +51,10 @@ greptile_prior_verdict() {
   local repo="$1" pr="$2" head="$3" max="${GREPTILE_PRIOR_MAX:-20}"
   local key="$1/$2/$3" pages shas sha run status concl sum
   if [ "${GRV_CACHE_KEY:-}" = "$key" ]; then
-    GRV_SHA="$GRV_CACHE_SHA"; GRV_ADDED="$GRV_CACHE_ADDED"; GRV_REVIEW_ID="$GRV_CACHE_REVIEW_ID"
+    GRV_SHA="$GRV_CACHE_SHA"; GRV_ADDED="$GRV_CACHE_ADDED"; GRV_REVIEW_ID="$GRV_CACHE_REVIEW_ID"; GRV_STARTED="$GRV_CACHE_STARTED"
     return 0
   fi
-  GRV_SHA=""; GRV_ADDED=""; GRV_REVIEW_ID=""
+  GRV_SHA=""; GRV_ADDED=""; GRV_REVIEW_ID=""; GRV_STARTED=""
 
   pages=$(gh api --paginate "repos/$repo/pulls/$pr/commits" 2>/dev/null) || return 1
   shas=$(printf '%s' "$pages" | jq -rs --arg h "$head" --argjson max "$max" \
@@ -75,6 +76,7 @@ greptile_prior_verdict() {
     if [ "$status" = "completed" ] && [ "$concl" = "success" ] && [ -n "$sum" ]; then
       GRV_SHA="$sha"
       GRV_ADDED=$(printf '%s' "$sum" | grep -oE '[0-9]+ comments added' | grep -oE '^[0-9]+' || true)
+      GRV_STARTED=$(printf '%s' "$run" | jq -r '.started_at // ""' 2>/dev/null) || return 1
       break
     fi
   done <<< "$shas"
@@ -91,31 +93,48 @@ greptile_prior_verdict() {
       [ -n "$GRV_REVIEW_ID" ] || return 1
     fi
   fi
-  GRV_CACHE_KEY="$key"; GRV_CACHE_SHA="$GRV_SHA"; GRV_CACHE_ADDED="$GRV_ADDED"; GRV_CACHE_REVIEW_ID="$GRV_REVIEW_ID"
+  GRV_CACHE_KEY="$key"; GRV_CACHE_SHA="$GRV_SHA"; GRV_CACHE_ADDED="$GRV_ADDED"; GRV_CACHE_REVIEW_ID="$GRV_REVIEW_ID"; GRV_CACHE_STARTED="$GRV_STARTED"
   return 0
 }
 
-# greptile_scope_live REPO PR HEAD HEAD_STATE HEAD_REVIEW_ID RAW_LIVE COMMENTS
+# greptile_scope_live REPO PR HEAD HEAD_STATE HEAD_REVIEW_ID RAW_LIVE COMMENTS ISSUE_COMMENTS
 #   The ONE liveness decision for a head Greptile has not reviewed, shared by watch-pr.sh,
-#   pr-findings.sh and takeover.sh so they cannot disagree about the same PR.
-#     HEAD_STATE      the head's Greptile check-run status, or `absent` when it has none
+#   pr-findings.sh and takeover.sh so they decide the same way about the same PR.
+#     HEAD_STATE      the head's Greptile check-run status; `absent` ONLY when the listing was
+#                     read and holds no Greptile run. A failed or unreadable listing is not
+#                     `absent`: pass any other word (the callers use `unreadable`).
 #     HEAD_REVIEW_ID  the greptile review object whose commit_id is the head, or empty
 #     RAW_LIVE        how many Greptile comments are still anchored (`line != null`)
 #     COMMENTS        `pulls/N/comments` as ONE flat JSON array
+#     ISSUE_COMMENTS  `issues/N/comments` as ONE flat JSON array
 #   Sets GRL_LIVE and GRL_NOTE (`<sha8>/<added>` when an earlier verdict scoped the count).
 #   The earlier verdict applies ONLY when the head carries no Greptile evidence at all: no
 #   check-run in any state and no review object. Anything Greptile said or is saying about
 #   THIS head outranks what it said about an older one, so every other case keeps RAW_LIVE.
-#   rc 0 decided; rc 1 unknown; rc 2 a newer Greptile review is still running (defer).
+#   A review REQUESTED after that verdict also outranks it: `@greptileai review` shows up as
+#   a check-run only ~12 s later, and until then the head reads `absent`. A trigger comment
+#   newer than the verdict defers for GREPTILE_TRIGGER_GRACE seconds (default 600); past
+#   that Greptile is evidently not coming (out of credits, app down) and the verdict stands.
+#   rc 0 decided; rc 1 unknown; rc 2 a newer Greptile review is running or was just requested.
 # shellcheck disable=SC2034  # GRL_LIVE / GRL_NOTE are this function's outputs: the scripts that source this file read them, which shellcheck cannot see when linting the lib alone.
 greptile_scope_live() {
-  local repo="$1" pr="$2" head="$3" state="$4" head_rid="$5" raw="$6" comments="$7" rc=0
+  local repo="$1" pr="$2" head="$3" state="$4" head_rid="$5" raw="$6" comments="$7" issue_comments="$8"
+  local rc=0 requested grace="${GREPTILE_TRIGGER_GRACE:-600}"
   GRL_LIVE="$raw"; GRL_NOTE=""
   [ "$raw" -gt 0 ] || return 0
   if [ "$state" != "absent" ] || [ -n "$head_rid" ]; then return 0; fi
   greptile_prior_verdict "$repo" "$pr" "$head" || rc=$?
   [ "$rc" -eq 0 ] || return "$rc"
   [ -n "$GRV_SHA" ] || return 0
+  requested=$(printf '%s' "$issue_comments" | jq --arg since "$GRV_STARTED" --argjson grace "$grace" \
+    'if type=="array" then
+       [.[]|select((.user.type // "") != "Bot")
+           |select((.body // "")|test("@greptile(ai)?\\s+review"; "i"))
+           |(.created_at|fromdateiso8601) as $t
+           |select($since == "" or $t > ($since|fromdateiso8601))
+           |select((now - $t) < $grace)]|length
+     else error("issue comments are not an array") end' 2>/dev/null) || return 1
+  [ "$requested" -eq 0 ] || return 2
   GRL_NOTE="${GRV_SHA:0:8}/${GRV_ADDED}"
   if [ "$GRV_ADDED" = "0" ]; then
     GRL_LIVE=0

@@ -23,13 +23,16 @@ HEAD_SHA=cccccccccccccccccccccccccccccccccccccccc
 PREV_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 OLD_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 echo "$*" >> "$CALLS"
-run() { printf '{"id":%s,"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"%s","conclusion":%s,"output":{"summary":"%s"}}' "$1" "$2" "$3" "$4"; }
+run() { printf '{"id":%s,"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"%s","conclusion":%s,"started_at":"%s","output":{"summary":"%s"}}' "$1" "$2" "$3" "${5:-2001-01-01T00:00:00Z}" "$4"; }
 page() { printf '{"check_runs":[%s]}\n' "$1"; }
 review() { page "$(run 10 completed '"success"' "Greptile has reviewed the Pull Request.\\n\\n90 files reviewed, $1 comments added.")"; }
 nothing() { echo '{"check_runs":[{"id":5,"app":{"slug":"github-actions"},"name":"CI","status":"completed","conclusion":"success","output":{"summary":""}}]}'; }
 [ "${1:-}" = api ] || { echo "unexpected gh call: $*" >&2; exit 1; }
 [ "$MODE" = no_api ] && { echo "the helper called the API when it must not: $*" >&2; exit 1; }
 case "$*" in
+  *'/pulls/43/commits'*)
+    # A different PR that happens to share the head SHA and has no earlier commits.
+    printf '[{"sha":"%s"}]\n' "$HEAD_SHA" ;;
   *'/pulls/42/commits'*)
     [ "$MODE" = commits_fail ] && exit 1
     # Oldest first, as the API returns them; the head is last.
@@ -41,6 +44,8 @@ case "$*" in
   *"/commits/$PREV_SHA/check-runs"*)
     case "$MODE" in
       prior_clean) review 0 ;;
+      # A clean verdict whose run STARTED an hour from now: any trigger posted "now" predates it.
+      prior_clean_later) page "$(run 10 completed '"success"' '90 files reviewed, 0 comments added' "$(jq -rn 'now+3600|todate')")" ;;
       prior_findings) review 1 ;;
       unscoped) review 2 ;;
       # A completed check that is not a review: conclusion failure, even carrying a summary.
@@ -147,12 +152,12 @@ COMMENTS='[{"user":{"login":"greptile-apps[bot]"},"line":8,"pull_request_review_
            {"user":{"login":"greptile-apps[bot]"},"line":9,"pull_request_review_id":55},
            {"user":{"login":"greptile-apps[bot]"},"line":null,"pull_request_review_id":55}]'
 
-# scope RC LIVE NOTE STATE HEAD_RID RAW — a cold call under $MODE.
+# scope RC LIVE NOTE STATE HEAD_RID RAW [ISSUE_COMMENTS] — a cold call under $MODE.
 scope() {
   local rc=0
   # shellcheck disable=SC2034  # read by the sourced lib: clearing it forces a cold (unmemoised) call.
   GRV_CACHE_KEY=""
-  greptile_scope_live test/repo 42 "$HEAD_SHA" "$4" "$5" "$6" "$COMMENTS" || rc=$?
+  greptile_scope_live test/repo 42 "$HEAD_SHA" "$4" "$5" "$6" "$COMMENTS" "${7:-[]}" || rc=$?
   [ "$rc" -eq "$1" ] || fail "scope $MODE/$4/rid=$5: rc=$rc, want $1"
   [ "$GRL_LIVE" = "$2" ] || fail "scope $MODE/$4/rid=$5: GRL_LIVE='$GRL_LIVE', want '$2'"
   [ "$GRL_NOTE" = "$3" ] || fail "scope $MODE/$4/rid=$5: GRL_NOTE='$GRL_NOTE', want '$3'"
@@ -182,5 +187,39 @@ MODE=pending_newer; export MODE
 scope 2 2 "" absent "" 2
 MODE=commits_fail; export MODE
 scope 1 2 "" absent "" 2
+
+# An UNREADABLE head listing is not `absent`: callers pass another word and the raw count
+# stands without the API being asked (a failed lookup must never read as "Greptile never ran").
+MODE=no_api; export MODE
+scope 0 2 "" unreadable "" 2
+
+# The cache key is the whole REPO/PR/HEAD: a different PR sharing the head SHA must not be
+# served the first PR's verdict (pr-findings.sh walks several PRs in one process).
+MODE=prior_clean; export MODE
+want 0 "$PREV_SHA" 0 ""
+rc=0; greptile_prior_verdict test/repo 43 "$HEAD_SHA" || rc=$?
+{ [ "$rc" -eq 0 ] && [ -z "$GRV_SHA" ]; } || fail "PR 43 was served PR 42's cached verdict (rc=$rc sha=$GRV_SHA)"
+
+# A review REQUESTED after the last verdict outranks it too: `@greptileai review` only
+# becomes a check-run ~12 s later, and until then the head reads `absent`. The stub's verdict
+# started 2001-01-01, so "now" is a trigger newer than it and inside the grace.
+now_iso=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+trigger() { printf '[{"user":{"login":"lander","type":"User"},"created_at":"%s","body":"%s"}]' "$1" "$2"; }
+MODE=prior_clean; export MODE
+scope 2 2 "" absent "" 2 "$(trigger "$now_iso" '@greptileai review')"
+scope 2 2 "" absent "" 2 "$(trigger "$now_iso" 'please @Greptile  Review this again')"
+# ...but not a trigger OLDER than the verdict: that is the request the verdict answered. The
+# first case isolates this guard (a recent trigger, so the grace alone would still count it).
+MODE=prior_clean_later; export MODE
+scope 0 0 "bbbbbbbb/0" absent "" 2 "$(trigger "$now_iso" '@greptileai review')"
+MODE=prior_clean; export MODE
+scope 0 0 "bbbbbbbb/0" absent "" 2 "$(trigger 2000-12-31T00:00:00Z '@greptileai review')"
+# ...nor one past the grace: Greptile is evidently not coming, so the verdict stands,
+scope 0 0 "bbbbbbbb/0" absent "" 2 "$(trigger 2001-01-02T00:00:00Z '@greptileai review')"
+# ...nor a bot quoting the phrase, nor a comment that merely mentions Greptile.
+scope 0 0 "bbbbbbbb/0" absent "" 2 '[{"user":{"login":"coderabbitai[bot]","type":"Bot"},"created_at":"'"$now_iso"'","body":"@greptileai review"}]'
+scope 0 0 "bbbbbbbb/0" absent "" 2 "$(trigger "$now_iso" 'greptile already looked at this')"
+# Unreadable issue comments fail closed and keep the raw count.
+scope 1 2 "" absent "" 2 'x'
 
 echo "PASS greptile-verdict: earlier verdict scoped, newer evidence outranks it, unreadable fails closed"

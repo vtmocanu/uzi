@@ -25,7 +25,8 @@ if [ "${1:-}" = api ]; then
       case "$MODE" in
         race) echo '[{"id":7,"user":{"login":"greptile-apps[bot]"},"commit_id":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","state":"COMMENTED","body":""}]' ;;
         in_progress) echo '[{"id":8,"user":{"login":"coderabbitai[bot]"},"commit_id":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","state":"APPROVED","body":""}]' ;;
-        cr_resolved) echo '[{"id":9,"user":{"login":"coderabbitai[bot]"},"commit_id":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","state":"APPROVED","body":""}]' ;;
+        cr_resolved|head_unreadable) echo '[{"id":9,"user":{"login":"coderabbitai[bot]"},"commit_id":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","state":"APPROVED","body":""}]' ;;
+        head_two_runs) echo '[{"id":77,"user":{"login":"greptile-apps[bot]"},"commit_id":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","state":"COMMENTED","body":""}]' ;;
         *) echo '[]' ;;
       esac ;;
     *'/issues/42/comments'*) echo '[]' ;;
@@ -34,7 +35,7 @@ if [ "${1:-}" = api ]; then
       echo '[{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},{"sha":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"}]' ;;
     *'/commits/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/check-runs'*)
       case "$MODE" in
-        prior_clean) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"90 files reviewed, 0 comments added"}}]}' ;;
+        prior_clean|head_unreadable|head_failed) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"90 files reviewed, 0 comments added"}}]}' ;;
         prior_pending) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"in_progress","conclusion":null,"output":{"summary":""}}]}' ;;
         *) echo '{"check_runs":[{"app":{"slug":"github-actions"},"name":"CI","status":"completed","conclusion":"success","output":{"summary":""}}]}' ;;
       esac ;;
@@ -42,6 +43,10 @@ if [ "${1:-}" = api ]; then
     *'/commits/deadbeefdeadbeefdeadbeefdeadbeefdeadbeef/check-runs'*)
       case "$MODE" in
         prior_*) echo '{"check_runs":[]}' ;;
+        head_unreadable) exit 1 ;;
+        head_failed) echo '{"check_runs":[{"id":10,"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"failure","output":{"summary":""}}]}' ;;
+        # Newest first, as the API lists them: the re-trigger (id 2) found something the first run did not.
+        head_two_runs) echo '{"check_runs":[{"id":2,"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"90 files reviewed, 1 comments added"}},{"id":1,"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"90 files reviewed, 0 comments added"}}]}' ;;
         race) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"Greptile has reviewed the Pull Request.\n\n90 files reviewed, 1 comments added"}}]}' ;;
         in_progress) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"in_progress","conclusion":null,"output":{"summary":""}}]}' ;;
         *) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"Greptile has reviewed the Pull Request.\n\n90 files reviewed, 0 comments added"}}]}' ;;
@@ -50,6 +55,7 @@ if [ "${1:-}" = api ]; then
       case "$MODE" in
         race) echo '[]' ;;
         in_progress) echo '[{"user":{"login":"greptile-apps[bot]"},"path":"partial.go","line":9,"body":"<img alt=\"P1\"> partial finding","pull_request_review_id":101}]' ;;
+        head_two_runs) echo '[{"user":{"login":"greptile-apps[bot]"},"path":"retrigger.go","line":8,"body":"<img alt=\"P1\"> found by the re-trigger","pull_request_review_id":77}]' ;;
         cr_resolved) echo '[{"user":{"login":"coderabbitai[bot]"},"path":"resolved.go","line":8,"body":"🟡 **resolved finding**","pull_request_review_id":9}]' ;;
         *) echo '[{"user":{"login":"greptile-apps[bot]"},"path":"old.go","line":8,"body":"<img alt=\"P1\"> old addressed finding","pull_request_review_id":99}]' ;;
       esac ;;
@@ -134,5 +140,37 @@ set -e
 [ "$rc" -eq 3 ] || fail "in-flight newer Greptile review exited rc=$rc, want 3: $(cat "$WORK/prior-pending.out")"
 grep -q 'still running on a newer commit' "$WORK/prior-pending.out" || fail "in-flight newer Greptile review was not surfaced: $(cat "$WORK/prior-pending.out")"
 grep -q '^  GR  old.go:8' "$WORK/prior-pending.out" || fail "comment cleared while a newer review was running: $(cat "$WORK/prior-pending.out")"
+
+# A head check-runs request that FAILED is not "Greptile never ran": with CodeRabbit having
+# approved the head, treating it as `absent` let a clean earlier verdict drop a real anchored
+# finding from the listing at exit 0.
+MODE="head_unreadable"; export MODE
+set +e
+PATH="$WORK/bin:$PATH" bash "$SCRIPT" test/repo 42 > "$WORK/head-unreadable.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 3 ] || fail "unreadable head check-runs exited rc=$rc, want 3: $(cat "$WORK/head-unreadable.out")"
+grep -q 'check-runs on this head UNREADABLE' "$WORK/head-unreadable.out" || fail "unreadable head check-runs were not surfaced: $(cat "$WORK/head-unreadable.out")"
+grep -q '^  GR  old.go:8' "$WORK/head-unreadable.out" || fail "finding dropped on an unreadable head: $(cat "$WORK/head-unreadable.out")"
+if grep -q 'last verdict on' "$WORK/head-unreadable.out"; then fail "an earlier verdict was consulted on an unreadable head: $(cat "$WORK/head-unreadable.out")"; fi
+
+# A Greptile run that FAILED on the head is Greptile evidence about this head: the raw count
+# stands, an older clean verdict does not clear it.
+MODE="head_failed"; export MODE
+set +e
+PATH="$WORK/bin:$PATH" bash "$SCRIPT" test/repo 42 > "$WORK/head-failed.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 3 ] || fail "failed head Greptile run exited rc=$rc, want 3: $(cat "$WORK/head-failed.out")"
+grep -q '^  GR  old.go:8' "$WORK/head-failed.out" || fail "an older verdict overrode a failed head Greptile run: $(cat "$WORK/head-failed.out")"
+if grep -q 'last verdict on' "$WORK/head-failed.out"; then fail "an earlier verdict was consulted past a failed head run: $(cat "$WORK/head-failed.out")"; fi
+
+# Two Greptile runs on the head (a re-trigger needs no push), listed newest first: the
+# NEWEST is the verdict. Reading the last entry took the stale clean run and hid the finding.
+MODE="head_two_runs"; export MODE
+PATH="$WORK/bin:$PATH" bash "$SCRIPT" test/repo 42 > "$WORK/head-two-runs.out" 2>&1 \
+  || fail "two head Greptile runs did not satisfy the gate: $(cat "$WORK/head-two-runs.out")"
+grep -q 'Greptile: completed on head.*1 comments added' "$WORK/head-two-runs.out" || fail "the newest head Greptile run was not the one read: $(cat "$WORK/head-two-runs.out")"
+grep -q '^  GR  retrigger.go:8' "$WORK/head-two-runs.out" || fail "the re-trigger's finding was hidden by the older clean run: $(cat "$WORK/head-two-runs.out")"
 
 echo "PASS pr-findings: settled, resolved current-head scope, earlier-verdict Greptile scope"

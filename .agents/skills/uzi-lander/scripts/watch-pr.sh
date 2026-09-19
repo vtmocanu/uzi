@@ -308,7 +308,7 @@ while [ "$i" -lt "$MAX" ]; do
   # skipped is not a review. `gh api --paginate` emits one object per page, so slurp first.
   gr_state="absent"; gr_summary=""; gr_concl=""
   if cr_raw=$(gh api --paginate "repos/$REPO/commits/$head/check-runs" 2>/dev/null) && pages_are_checkruns "$cr_raw"; then
-    gr_json=$(printf '%s' "$cr_raw" | greptile_newest_run) || unknown=1
+    gr_json=$(printf '%s' "$cr_raw" | greptile_newest_run) || { unknown=1; gr_json=""; gr_state="unreadable"; }
     [ "$gr_json" = "{}" ] && gr_json=""
     if [ -n "$gr_json" ]; then
       gr_state=$(printf '%s' "$gr_json" | jq -r '.status // "absent"' 2>/dev/null) || unknown=1
@@ -316,6 +316,9 @@ while [ "$i" -lt "$MAX" ]; do
       gr_summary=$(printf '%s' "$gr_json" | jq -r '.output.summary // ""' 2>/dev/null | grep -oE '[0-9]+ files reviewed, [0-9]+ comments added' || true)
     fi
   else
+    # Not `absent`: that means "read, and Greptile has no run here", which is what lets an
+    # earlier verdict scope the findings below. An unreadable listing must not.
+    gr_state="unreadable"
     unknown=1
   fi
   gr_reviewed=0; gr_added=""
@@ -346,7 +349,8 @@ while [ "$i" -lt "$MAX" ]; do
   if [ "$gr_reviewed" -eq 0 ] && [ "$gr_live" -gt 0 ]; then
     gr_flat=$(printf '%s' "$pull_c" | jq -s 'add // []' 2>/dev/null) || gr_flat='x'
     gr_rc=0
-    greptile_scope_live "$REPO" "$PR" "$head" "$gr_state" "$gr_review_id" "$gr_live" "$gr_flat" || gr_rc=$?
+    gr_issue_flat=$(printf '%s' "${issue_c:-}" | jq -s 'add // []' 2>/dev/null) || gr_issue_flat='x'
+    greptile_scope_live "$REPO" "$PR" "$head" "$gr_state" "$gr_review_id" "$gr_live" "$gr_flat" "$gr_issue_flat" || gr_rc=$?
     if [ "$gr_rc" -eq 0 ]; then
       gr_live="$GRL_LIVE"; gr_prior="$GRL_NOTE"
     else

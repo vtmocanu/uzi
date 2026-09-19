@@ -157,9 +157,14 @@ cr_tally=$(printf '%s' "$rev_raw" | jq -r '.[]|select(.user.login=="coderabbitai
 # Greptile check-run on the head.
 cr_pages=$(gh api --paginate "repos/$REPO/commits/$head/check-runs" 2>/dev/null || echo 'x')
 printf '%s' "$cr_pages" | jq -es 'length>0 and all(.[]; type=="object" and has("check_runs"))' >/dev/null 2>&1 || UNKNOWN=1
-gr_json=$(printf '%s' "$cr_pages" | greptile_newest_run || true)
-[ "$gr_json" = "{}" ] && gr_json=""
+# An unreadable listing is NOT `absent`: `absent` means "read, and Greptile has no run here",
+# which is what lets an earlier verdict scope the findings below.
 gr_state="absent"; gr_sum=""; gr_concl=""; gr_reviewed=0
+if gr_json=$(printf '%s' "$cr_pages" | greptile_newest_run); then
+  [ "$gr_json" = "{}" ] && gr_json=""
+else
+  gr_json=""; gr_state="unreadable"; UNKNOWN=1
+fi
 if [ -n "$gr_json" ]; then
   gr_state=$(printf '%s' "$gr_json" | jq -r '.status // "absent"')
   gr_concl=$(printf '%s' "$gr_json" | jq -r '.conclusion // ""')
@@ -178,7 +183,7 @@ gr_live=$(printf '%s' "$pull_c" | jq '[.[]|select(.user.login=="greptile-apps[bo
 # Every push re-anchors Greptile's older comments onto the new head, so the raw anchored
 # count above over-reports. An explicit clean pass on THIS head clears them; a head with no
 # Greptile evidence at all is scoped to Greptile's newest EARLIER verdict by the same
-# function watch-pr.sh and pr-findings.sh use (lib/greptile-verdict.sh), so the three agree.
+# function watch-pr.sh and pr-findings.sh use (lib/greptile-verdict.sh), so the three decide alike.
 # A current-head pass that added comments keeps the raw count: a superset, never an
 # under-report. Liveness only; GREPTILE_REVIEWED_HEAD above stays the exact-head answer.
 if [ "$gr_reviewed" -eq 1 ]; then
@@ -186,7 +191,7 @@ if [ "$gr_reviewed" -eq 1 ]; then
 else
   gr_head_rid=$(printf '%s' "$rev_raw" | jq -r --arg h "$head" '[.[]|select(.user.login=="greptile-apps[bot]" and .commit_id==$h)]|last|.id // empty' 2>/dev/null || echo unreadable)
   gr_rc=0
-  greptile_scope_live "$REPO" "$PR" "$head" "$gr_state" "$gr_head_rid" "$gr_live" "$pull_c" || gr_rc=$?
+  greptile_scope_live "$REPO" "$PR" "$head" "$gr_state" "$gr_head_rid" "$gr_live" "$pull_c" "$issue_c" || gr_rc=$?
   if [ "$gr_rc" -eq 0 ]; then
     gr_live="$GRL_LIVE"
     [ -n "$GRL_NOTE" ] && echo "GREPTILE_PRIOR_VERDICT=$GRL_NOTE"
