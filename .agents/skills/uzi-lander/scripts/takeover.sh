@@ -157,7 +157,8 @@ cr_tally=$(printf '%s' "$rev_raw" | jq -r '.[]|select(.user.login=="coderabbitai
 # Greptile check-run on the head.
 cr_pages=$(gh api --paginate "repos/$REPO/commits/$head/check-runs" 2>/dev/null || echo 'x')
 printf '%s' "$cr_pages" | jq -es 'length>0 and all(.[]; type=="object" and has("check_runs"))' >/dev/null 2>&1 || UNKNOWN=1
-gr_json=$(printf '%s' "$cr_pages" | jq -s '[.[].check_runs[]?|select(.app.slug=="greptile-apps" and .name=="Greptile Review")]|last // empty' 2>/dev/null || true)
+gr_json=$(printf '%s' "$cr_pages" | greptile_newest_run || true)
+[ "$gr_json" = "{}" ] && gr_json=""
 gr_state="absent"; gr_sum=""; gr_concl=""; gr_reviewed=0
 if [ -n "$gr_json" ]; then
   gr_state=$(printf '%s' "$gr_json" | jq -r '.status // "absent"')
@@ -175,26 +176,23 @@ arr_or_unknown "$pull_c"; printf '%s' "$pull_c" | jq -e 'type=="array"' >/dev/nu
 cr_live=$(printf '%s' "$pull_c" | jq '[.[]|select(.user.login=="coderabbitai[bot]" and .line!=null and ((.body|contains("Addressed in commit"))|not))]|length' 2>/dev/null || echo 0)
 gr_live=$(printf '%s' "$pull_c" | jq '[.[]|select(.user.login=="greptile-apps[bot]" and .line!=null)]|length' 2>/dev/null || echo 0)
 # Every push re-anchors Greptile's older comments onto the new head, so the raw anchored
-# count above over-reports. An explicit clean pass on THIS head clears them; with no review
-# on this head, scope them to Greptile's newest EARLIER verdict (lib/greptile-verdict.sh).
+# count above over-reports. An explicit clean pass on THIS head clears them; a head with no
+# Greptile evidence at all is scoped to Greptile's newest EARLIER verdict by the same
+# function watch-pr.sh and pr-findings.sh use (lib/greptile-verdict.sh), so the three agree.
 # A current-head pass that added comments keeps the raw count: a superset, never an
 # under-report. Liveness only; GREPTILE_REVIEWED_HEAD above stays the exact-head answer.
-if [ "$gr_live" -gt 0 ]; then
-  if [ "$gr_reviewed" -eq 1 ]; then
-    case "$gr_sum" in *', 0 comments added') gr_live=0;; esac
-  elif [ "$gr_state" != "in_progress" ] && [ "$gr_state" != "queued" ]; then
-    if greptile_prior_verdict "$REPO" "$PR" "$head"; then
-      if [ -n "$GRV_SHA" ]; then
-        echo "GREPTILE_PRIOR_VERDICT=${GRV_SHA:0:8}/${GRV_ADDED}"
-        if [ "$GRV_ADDED" = "0" ]; then
-          gr_live=0
-        else
-          gr_live=$(printf '%s' "$pull_c" | jq --argjson rid "$GRV_REVIEW_ID" '[.[]|select(.user.login=="greptile-apps[bot]" and .pull_request_review_id==$rid and .line!=null)]|length' 2>/dev/null || echo "$gr_live")
-        fi
-      fi
-    else
-      UNKNOWN=1; echo "GREPTILE_PRIOR_VERDICT=unreadable"
-    fi
+if [ "$gr_reviewed" -eq 1 ]; then
+  case "$gr_sum" in *', 0 comments added') gr_live=0;; esac
+else
+  gr_head_rid=$(printf '%s' "$rev_raw" | jq -r --arg h "$head" '[.[]|select(.user.login=="greptile-apps[bot]" and .commit_id==$h)]|last|.id // empty' 2>/dev/null || echo unreadable)
+  gr_rc=0
+  greptile_scope_live "$REPO" "$PR" "$head" "$gr_state" "$gr_head_rid" "$gr_live" "$pull_c" || gr_rc=$?
+  if [ "$gr_rc" -eq 0 ]; then
+    gr_live="$GRL_LIVE"
+    [ -n "$GRL_NOTE" ] && echo "GREPTILE_PRIOR_VERDICT=$GRL_NOTE"
+  else
+    UNKNOWN=1
+    if [ "$gr_rc" -eq 2 ]; then echo "GREPTILE_PRIOR_VERDICT=pending"; else echo "GREPTILE_PRIOR_VERDICT=unreadable"; fi
   fi
 fi
 live=$((cr_live + gr_live + cr_unconfirmed))

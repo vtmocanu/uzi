@@ -56,6 +56,7 @@ if [ "${1:-}" = api ]; then
       case "$MODE" in
         pending_findings) echo '[{"id":1,"user":{"login":"coderabbitai[bot]"},"commit_id":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","state":"APPROVED","body":""}]' ;;
         greptile_race) echo '[{"id":7,"user":{"login":"greptile-apps[bot]"},"commit_id":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","state":"COMMENTED","body":""}]' ;;
+        prior_headreview) echo '[{"id":77,"user":{"login":"greptile-apps[bot]"},"commit_id":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","state":"COMMENTED","body":""}]' ;;
         prior_findings) echo '[{"id":44,"user":{"login":"greptile-apps[bot]"},"commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","state":"COMMENTED","body":""},{"id":55,"user":{"login":"greptile-apps[bot]"},"commit_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","state":"COMMENTED","body":""}]' ;;
         cr_resolved) echo '[{"id":9,"user":{"login":"coderabbitai[bot]"},"commit_id":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","state":"APPROVED","body":""}]' ;;
         *) echo '[]' ;;
@@ -64,7 +65,8 @@ if [ "${1:-}" = api ]; then
     *'/pulls/42/comments'*)
       case "$MODE" in
         pending_findings) echo '[{"user":{"login":"coderabbitai[bot]"},"line":7,"body":"🟡 **partial finding**","pull_request_review_id":1}]' ;;
-        prior_clean|prior_none|prior_unreadable) echo '[{"user":{"login":"greptile-apps[bot]"},"line":8,"body":"<img alt=\"P1\"> old addressed finding","pull_request_review_id":99}]' ;;
+        prior_headreview) echo '[{"user":{"login":"greptile-apps[bot]"},"line":8,"body":"<img alt=\"P1\"> current head finding","pull_request_review_id":77}]' ;;
+        prior_clean|prior_none|prior_unreadable|prior_pending|prior_unparseable) echo '[{"user":{"login":"greptile-apps[bot]"},"line":8,"body":"<img alt=\"P1\"> old addressed finding","pull_request_review_id":99}]' ;;
         prior_findings) echo '[{"user":{"login":"greptile-apps[bot]"},"line":8,"body":"<img alt=\"P1\"> superseded finding","pull_request_review_id":44},{"user":{"login":"greptile-apps[bot]"},"line":9,"body":"<img alt=\"P1\"> still open finding","pull_request_review_id":55}]' ;;
         greptile_clean) echo '[{"user":{"login":"greptile-apps[bot]"},"line":8,"body":"<img alt=\"P1\"> old addressed finding","pull_request_review_id":99}]' ;;
         cr_resolved) echo '[{"user":{"login":"coderabbitai[bot]"},"line":8,"body":"🟡 **resolved finding**","pull_request_review_id":9}]' ;;
@@ -75,7 +77,8 @@ if [ "${1:-}" = api ]; then
       echo '[{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},{"sha":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"}]' ;;
     *'/commits/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/check-runs'*)
       case "$MODE" in
-        prior_clean) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"90 files reviewed, 0 comments added"}}]}' ;;
+        prior_clean|prior_headreview|prior_unparseable) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"90 files reviewed, 0 comments added"}}]}' ;;
+        prior_pending) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"in_progress","conclusion":null,"output":{"summary":""}}]}' ;;
         prior_findings) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"90 files reviewed, 1 comments added"}}]}' ;;
         *) echo '{"check_runs":[{"app":{"slug":"github-actions"},"name":"CI","status":"completed","conclusion":"success","output":{"summary":""}}]}' ;;
       esac ;;
@@ -83,6 +86,7 @@ if [ "${1:-}" = api ]; then
       case "$MODE" in
         greptile_clean) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"Greptile has reviewed the Pull Request.\n\n90 files reviewed, 0 comments added"}}]}' ;;
         greptile_race) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"Greptile has reviewed the Pull Request.\n\n90 files reviewed, 1 comments added"}}]}' ;;
+        prior_unparseable) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"Reviewed 90 files and raised 3 issues"}}]}' ;;
         *) echo '{"check_runs":[]}' ;;
       esac ;;
     *) echo "unexpected gh api: $*" >&2; exit 1 ;;
@@ -199,5 +203,33 @@ rc=$?
 set -e
 [ "$rc" -eq 2 ] || fail "unreadable Greptile history read as a verdict, rc=$rc: $(cat "$WORK/prior-unreadable.out")"
 grep -q 'unknown=1' "$WORK/prior-unreadable.out" || fail "unreadable Greptile history was not marked unknown"
+
+# A Greptile review still RUNNING on a newer commit outranks an older clean verdict: the
+# poll defers (unknown), it must not step over the running review and read ready.
+MODE="prior_pending"; export MODE
+set +e
+bash "$SCRIPT" test/repo 42 0 1 --reviewer none > "$WORK/prior-pending.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 2 ] || fail "an in-flight newer Greptile review was stepped over, rc=$rc: $(cat "$WORK/prior-pending.out")"
+grep -q 'gr_prior=pending.*unknown=1' "$WORK/prior-pending.out" || fail "pending newer review was not visible: $(cat "$WORK/prior-pending.out")"
+
+# A Greptile review object already ON the head, its check-run not exposed yet: what Greptile
+# said about this head stands, an older clean verdict does not speak over it.
+MODE="prior_headreview"; export MODE
+set +e
+bash "$SCRIPT" test/repo 42 0 1 --reviewer none > "$WORK/prior-headreview.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 3 ] || fail "an older verdict overrode a current-head Greptile review, rc=$rc: $(cat "$WORK/prior-headreview.out")"
+
+# A head Greptile DID review, with a summary this script cannot parse: keep the raw count
+# rather than let an older clean verdict clear it.
+MODE="prior_unparseable"; export MODE
+set +e
+bash "$SCRIPT" test/repo 42 0 1 --reviewer none > "$WORK/prior-unparseable.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 3 ] || fail "an older verdict overrode an unparseable current-head review, rc=$rc: $(cat "$WORK/prior-unparseable.out")"
 
 echo "PASS watch-pr: settled reviews, resolved-thread scope, earlier-verdict Greptile scope"

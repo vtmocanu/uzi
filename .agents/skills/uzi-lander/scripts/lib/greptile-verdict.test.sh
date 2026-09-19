@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Hermetic regression: Greptile's newest EARLIER verdict scopes finding liveness on a head
-# it never reviewed, and every unreadable or unscopable answer fails closed.
+# it never reviewed; anything Greptile said or is saying about a newer commit outranks it;
+# and every unreadable or unscopable answer fails closed.
 set -eu
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -21,15 +22,19 @@ set -eu
 HEAD_SHA=cccccccccccccccccccccccccccccccccccccccc
 PREV_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 OLD_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-review() { printf '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"Greptile has reviewed the Pull Request.\\n\\n90 files reviewed, %s comments added"}}]}\n' "$1"; }
-notreview() { echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"failure","output":{"summary":"90 files reviewed, 0 comments added"}}]}'; }
-nothing() { echo '{"check_runs":[{"app":{"slug":"github-actions"},"name":"CI","status":"completed","conclusion":"success","output":{"summary":""}}]}'; }
+echo "$*" >> "$CALLS"
+run() { printf '{"id":%s,"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"%s","conclusion":%s,"output":{"summary":"%s"}}' "$1" "$2" "$3" "$4"; }
+page() { printf '{"check_runs":[%s]}\n' "$1"; }
+review() { page "$(run 10 completed '"success"' "Greptile has reviewed the Pull Request.\\n\\n90 files reviewed, $1 comments added.")"; }
+nothing() { echo '{"check_runs":[{"id":5,"app":{"slug":"github-actions"},"name":"CI","status":"completed","conclusion":"success","output":{"summary":""}}]}'; }
 [ "${1:-}" = api ] || { echo "unexpected gh call: $*" >&2; exit 1; }
+[ "$MODE" = no_api ] && { echo "the helper called the API when it must not: $*" >&2; exit 1; }
 case "$*" in
   *'/pulls/42/commits'*)
     [ "$MODE" = commits_fail ] && exit 1
     # Oldest first, as the API returns them; the head is last.
-    printf '[{"sha":"%s"},{"sha":"%s"},{"sha":"%s"}]\n' "$OLD_SHA" "$PREV_SHA" "$HEAD_SHA" ;;
+    if [ "$MODE" = truncated ]; then printf '[{"sha":"%s"},{"sha":"%s"}]\n' "$OLD_SHA" "$PREV_SHA"
+    else printf '[{"sha":"%s"},{"sha":"%s"},{"sha":"%s"}]\n' "$OLD_SHA" "$PREV_SHA" "$HEAD_SHA"; fi ;;
   *"/commits/$HEAD_SHA/check-runs"*)
     # The helper answers for EARLIER commits only; the callers own the head.
     echo "helper queried the head's check-runs" >&2; exit 1 ;;
@@ -38,18 +43,24 @@ case "$*" in
       prior_clean) review 0 ;;
       prior_findings) review 1 ;;
       unscoped) review 2 ;;
-      skips_nonreview) notreview ;;
+      # A completed check that is not a review: conclusion failure, even carrying a summary.
+      skips_nonreview) page "$(run 10 completed '"failure"' '90 files reviewed, 0 comments added')" ;;
+      pending_newer) page "$(run 10 in_progress null '')" ;;
+      queued_newer) page "$(run 10 queued null '')" ;;
+      # Newest first, as the API lists them: the re-trigger (id 2) found something the
+      # first run (id 1) did not. `last` would pick the stale clean run.
+      two_runs) page "$(run 2 completed '"success"' '90 files reviewed, 1 comments added'),$(run 1 completed '"success"' '90 files reviewed, 0 comments added')" ;;
       garbage) echo '[]' ;;
       *) nothing ;;
     esac ;;
   *"/commits/$OLD_SHA/check-runs"*)
     case "$MODE" in
-      skips_nonreview|window) review 0 ;;
+      skips_nonreview|window|pending_newer|queued_newer) review 0 ;;
       *) nothing ;;
     esac ;;
   *'/pulls/42/reviews'*)
     case "$MODE" in
-      prior_findings) printf '[{"id":44,"user":{"login":"greptile-apps[bot]"},"commit_id":"%s"},{"id":55,"user":{"login":"greptile-apps[bot]"},"commit_id":"%s"}]\n' "$OLD_SHA" "$PREV_SHA" ;;
+      prior_findings|two_runs) printf '[{"id":44,"user":{"login":"greptile-apps[bot]"},"commit_id":"%s"},{"id":55,"user":{"login":"greptile-apps[bot]"},"commit_id":"%s"}]\n' "$OLD_SHA" "$PREV_SHA" ;;
       *) echo '[]' ;;
     esac ;;
   *) echo "unexpected gh api: $*" >&2; exit 1 ;;
@@ -57,10 +68,13 @@ esac
 STUB
 chmod +x "$WORK/bin/gh"
 export PATH="$WORK/bin:$PATH"
+export CALLS="$WORK/calls"; : > "$CALLS"
 
-# want RC SHA ADDED REVIEW_ID — runs the helper under $MODE and compares all four.
+# want RC SHA ADDED REVIEW_ID — a COLD helper call under $MODE, comparing all four.
 want() {
   local rc=0
+  # shellcheck disable=SC2034  # read by the sourced lib: clearing it forces a cold (unmemoised) call.
+  GRV_CACHE_KEY=""
   greptile_prior_verdict test/repo 42 "$HEAD_SHA" || rc=$?
   [ "$rc" -eq "$1" ] || fail "$MODE: rc=$rc, want $1"
   [ "$GRV_SHA" = "$2" ] || fail "$MODE: GRV_SHA='$GRV_SHA', want '$2'"
@@ -68,6 +82,7 @@ want() {
   [ "$GRV_REVIEW_ID" = "$4" ] || fail "$MODE: GRV_REVIEW_ID='$GRV_REVIEW_ID', want '$4'"
 }
 
+# ---- greptile_prior_verdict -----------------------------------------------------------
 # The PR #1449 shape: fixed finding, clean re-review on PREV, then a push Greptile never saw.
 MODE=prior_clean; export MODE
 want 0 "$PREV_SHA" 0 ""
@@ -76,10 +91,20 @@ want 0 "$PREV_SHA" 0 ""
 MODE=prior_findings; export MODE
 want 0 "$PREV_SHA" 1 55
 
-# A completed check that is not a review (conclusion failure, even carrying a summary) is
-# skipped, not trusted.
+# A completed check that is not a review is skipped, not trusted.
 MODE=skips_nonreview; export MODE
 want 0 "$OLD_SHA" 0 ""
+
+# A Greptile review still RUNNING on a newer commit must not be stepped over to reach an
+# older clean verdict: that turned a deferring poll into a false ready.
+MODE=pending_newer; export MODE
+want 2 "" "" ""
+MODE=queued_newer; export MODE
+want 2 "" "" ""
+
+# Two runs on one commit (a re-trigger needs no push): the NEWEST one is the verdict.
+MODE=two_runs; export MODE
+want 0 "$PREV_SHA" 1 55
 
 # No earlier verdict at all: a trustworthy "none", so callers keep their raw count.
 MODE=none; export MODE
@@ -90,13 +115,72 @@ MODE=window; export MODE
 GREPTILE_PRIOR_MAX=1 want 0 "" "" ""
 want 0 "$OLD_SHA" 0 ""
 
-# Fail closed: an unreadable commit list, an unreadable check-run page, and a verdict that
-# added comments with no review object to scope them by.
+# Fail closed: an unreadable commit list, one that does not end at the head (truncated past
+# the API's 250-commit cap, or the head moved), an unreadable check-run page, and a verdict
+# that added comments with no review object to scope them by.
 MODE=commits_fail; export MODE
+want 1 "" "" ""
+MODE=truncated; export MODE
 want 1 "" "" ""
 MODE=garbage; export MODE
 want 1 "" "" ""
 MODE=unscoped; export MODE
 want 1 "$PREV_SHA" 2 ""
 
-echo "PASS greptile-verdict: earlier verdict scoped, non-reviews skipped, unreadable fails closed"
+# A definitive answer is memoised per head (a poll loop must not re-walk every minute);
+# a pending or failed one never is.
+MODE=prior_clean; export MODE
+want 0 "$PREV_SHA" 0 ""
+: > "$CALLS"
+MODE=no_api; export MODE
+rc=0; greptile_prior_verdict test/repo 42 "$HEAD_SHA" || rc=$?
+{ [ "$rc" -eq 0 ] && [ "$GRV_SHA" = "$PREV_SHA" ]; } || fail "memoised verdict was not reused (rc=$rc sha=$GRV_SHA)"
+[ ! -s "$CALLS" ] || fail "memoised verdict still called the API: $(cat "$CALLS")"
+MODE=pending_newer; export MODE
+want 2 "" "" ""
+MODE=prior_clean; export MODE
+rc=0; greptile_prior_verdict test/repo 42 "$HEAD_SHA" || rc=$?
+{ [ "$rc" -eq 0 ] && [ "$GRV_SHA" = "$PREV_SHA" ]; } || fail "a pending answer was cached (rc=$rc sha=$GRV_SHA)"
+
+# ---- greptile_scope_live --------------------------------------------------------------
+COMMENTS='[{"user":{"login":"greptile-apps[bot]"},"line":8,"pull_request_review_id":44},
+           {"user":{"login":"greptile-apps[bot]"},"line":9,"pull_request_review_id":55},
+           {"user":{"login":"greptile-apps[bot]"},"line":null,"pull_request_review_id":55}]'
+
+# scope RC LIVE NOTE STATE HEAD_RID RAW — a cold call under $MODE.
+scope() {
+  local rc=0
+  # shellcheck disable=SC2034  # read by the sourced lib: clearing it forces a cold (unmemoised) call.
+  GRV_CACHE_KEY=""
+  greptile_scope_live test/repo 42 "$HEAD_SHA" "$4" "$5" "$6" "$COMMENTS" || rc=$?
+  [ "$rc" -eq "$1" ] || fail "scope $MODE/$4/rid=$5: rc=$rc, want $1"
+  [ "$GRL_LIVE" = "$2" ] || fail "scope $MODE/$4/rid=$5: GRL_LIVE='$GRL_LIVE', want '$2'"
+  [ "$GRL_NOTE" = "$3" ] || fail "scope $MODE/$4/rid=$5: GRL_NOTE='$GRL_NOTE', want '$3'"
+}
+
+# Nothing anchored: decided without touching the API.
+MODE=no_api; export MODE
+scope 0 0 "" absent "" 0
+# Anything Greptile said or is saying about THIS head outranks an older verdict, so the raw
+# count stands and the API is never asked: a run in flight, a completed run of any kind
+# (a failure, or a success whose summary this script cannot parse), or a head review object
+# whose check-run is not exposed yet.
+scope 0 2 "" in_progress "" 2
+scope 0 2 "" queued "" 2
+scope 0 2 "" completed "" 2
+scope 0 2 "" absent 77 2
+
+# A head with no Greptile evidence at all: the earlier verdict decides.
+MODE=prior_clean; export MODE
+scope 0 0 "bbbbbbbb/0" absent "" 2
+MODE=prior_findings; export MODE
+scope 0 1 "bbbbbbbb/1" absent "" 2
+MODE=none; export MODE
+scope 0 2 "" absent "" 2
+# ...and it fails closed, keeping the raw count, when it cannot.
+MODE=pending_newer; export MODE
+scope 2 2 "" absent "" 2
+MODE=commits_fail; export MODE
+scope 1 2 "" absent "" 2
+
+echo "PASS greptile-verdict: earlier verdict scoped, newer evidence outranks it, unreadable fails closed"

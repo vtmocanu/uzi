@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# Hermetic regression: takeover.sh's Greptile liveness. A push re-anchors Greptile's older
+# comments onto the new head, so the raw anchored count over-reports; the snapshot must
+# agree with watch-pr.sh and pr-findings.sh about which of them are live.
+set -eu
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT="$HERE/takeover.sh"
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+fail() { echo "FAIL: $*" >&2; exit 1; }
+
+mkdir -p "$WORK/bin"
+cat > "$WORK/bin/uzi" <<'STUB'
+#!/usr/bin/env bash
+# Not connected to uzi: the run/rework lookups are skipped, which is not under test here.
+if [ "${1:-}" = repo ] && [ "${2:-}" = list ]; then echo '[]'; exit 0; fi
+echo "unexpected uzi call: $*" >&2; exit 1
+STUB
+cat > "$WORK/bin/gh" <<'STUB'
+#!/usr/bin/env bash
+set -eu
+HEAD=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef
+PREV=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+greptile() { printf '{"check_runs":[{"id":10,"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"%s","conclusion":%s,"output":{"summary":"%s"}}]}\n' "$1" "$2" "$3"; }
+none() { echo '{"check_runs":[{"id":5,"app":{"slug":"github-actions"},"name":"CI","status":"completed","conclusion":"success","output":{"summary":""}}]}'; }
+if [ "${1:-}" = pr ] && [ "${2:-}" = view ]; then
+  printf '{"number":42,"state":"OPEN","isDraft":false,"headRefOid":"%s","headRefName":"agent/issue-1","baseRefName":"main","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","reviewDecision":"","title":"t"}\n' "$HEAD"
+  exit 0
+fi
+if [ "${1:-}" = pr ] && [ "${2:-}" = checks ]; then echo '[{"bucket":"pass"}]'; exit 0; fi
+[ "${1:-}" = api ] || { echo "unexpected gh call: $*" >&2; exit 1; }
+case "$*" in
+  *"/commits/$HEAD/status"*) echo '{"statuses":[]}' ;;
+  *'/pulls/42/reviews'*)
+    case "$MODE" in
+      head_review_object) printf '[{"id":77,"user":{"login":"greptile-apps[bot]"},"commit_id":"%s","state":"COMMENTED","body":""}]\n' "$HEAD" ;;
+      *) echo '[]' ;;
+    esac ;;
+  *'/issues/42/comments'*) echo '[]' ;;
+  *"/commits/$HEAD/check-runs"*)
+    case "$MODE" in
+      head_clean) greptile completed '"success"' 'Greptile has reviewed the Pull Request.\n\n90 files reviewed, 0 comments added.' ;;
+      head_findings) greptile completed '"success"' '90 files reviewed, 10 comments added' ;;
+      *) none ;;
+    esac ;;
+  *'/pulls/42/comments'*) echo '[{"user":{"login":"greptile-apps[bot]"},"line":8,"body":"<img alt=\"P1\"> finding","pull_request_review_id":99}]' ;;
+  *'/pulls/42/commits'*) printf '[{"sha":"%s"},{"sha":"%s"}]\n' "$PREV" "$HEAD" ;;
+  *"/commits/$PREV/check-runs"*)
+    case "$MODE" in
+      prior_clean|head_review_object) greptile completed '"success"' '90 files reviewed, 0 comments added' ;;
+      prior_pending) greptile in_progress null '' ;;
+      *) none ;;
+    esac ;;
+  *'/pulls/42/files'*) echo '[]' ;;
+  *'/contents/'*) echo '[]' ;;
+  *) echo "unexpected gh api: $*" >&2; exit 1 ;;
+esac
+STUB
+chmod +x "$WORK/bin/gh" "$WORK/bin/uzi"
+export PATH="$WORK/bin:$PATH"
+
+# snap MODE — one snapshot; never claims (that writes shared state).
+snap() { MODE="$1"; export MODE; bash "$SCRIPT" 42 --repo test/repo --no-claim > "$WORK/$1.out" 2>&1 || true; }
+has() { grep -qF -- "$2" "$WORK/$1.out" || fail "$1: missing '$2': $(cat "$WORK/$1.out")"; }
+hasnt() { if grep -qF -- "$2" "$WORK/$1.out"; then fail "$1: unexpected '$2': $(cat "$WORK/$1.out")"; fi; }
+
+# An explicit clean pass on THIS head clears the older anchored comment...
+snap head_clean
+has head_clean 'GREPTILE_REVIEWED_HEAD=1'
+has head_clean 'LIVE_FINDINGS=0 (cr=0 gr=0 '
+# ...while ", 10 comments added" must not match the ", 0 comments added" clean test.
+snap head_findings
+has head_findings 'LIVE_FINDINGS=1 (cr=0 gr=1 '
+
+# No Greptile evidence on the head: the newest earlier verdict scopes the count, and the
+# head still reads unreviewed (an earlier verdict never satisfies the gate).
+snap prior_clean
+has prior_clean 'GREPTILE_REVIEWED_HEAD=0'
+has prior_clean 'GREPTILE_PRIOR_VERDICT=bbbbbbbb/0'
+has prior_clean 'LIVE_FINDINGS=0 (cr=0 gr=0 '
+has prior_clean 'NEXT=no_review'
+
+# No earlier verdict: the comment stays live.
+snap prior_none
+hasnt prior_none 'GREPTILE_PRIOR_VERDICT='
+has prior_none 'LIVE_FINDINGS=1 (cr=0 gr=1 '
+
+# A Greptile review object already on the head outranks an older clean verdict, exactly as
+# in watch-pr.sh and pr-findings.sh.
+snap head_review_object
+hasnt head_review_object 'GREPTILE_PRIOR_VERDICT='
+has head_review_object 'LIVE_FINDINGS=1 (cr=0 gr=1 '
+
+# A review still running on a newer commit than the last verdict: unknown, never ready.
+snap prior_pending
+has prior_pending 'GREPTILE_PRIOR_VERDICT=pending'
+has prior_pending 'UNKNOWN=1'
+has prior_pending 'NEXT=unknown'
+
+echo "PASS takeover: Greptile liveness agrees with watch-pr and pr-findings"

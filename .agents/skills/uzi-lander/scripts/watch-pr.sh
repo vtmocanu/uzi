@@ -308,7 +308,8 @@ while [ "$i" -lt "$MAX" ]; do
   # skipped is not a review. `gh api --paginate` emits one object per page, so slurp first.
   gr_state="absent"; gr_summary=""; gr_concl=""
   if cr_raw=$(gh api --paginate "repos/$REPO/commits/$head/check-runs" 2>/dev/null) && pages_are_checkruns "$cr_raw"; then
-    gr_json=$(printf '%s' "$cr_raw" | jq -s '[.[].check_runs[]?|select(.app.slug=="greptile-apps" and .name=="Greptile Review")]|last // empty' 2>/dev/null) || unknown=1
+    gr_json=$(printf '%s' "$cr_raw" | greptile_newest_run) || unknown=1
+    [ "$gr_json" = "{}" ] && gr_json=""
     if [ -n "$gr_json" ]; then
       gr_state=$(printf '%s' "$gr_json" | jq -r '.status // "absent"' 2>/dev/null) || unknown=1
       gr_concl=$(printf '%s' "$gr_json" | jq -r '.conclusion // ""' 2>/dev/null) || unknown=1
@@ -336,23 +337,21 @@ while [ "$i" -lt "$MAX" ]; do
     fi
   fi
   # No Greptile review on THIS head, yet Greptile comments are still anchored. A push
-  # re-anchors every older comment, so scope them to Greptile's newest EARLIER verdict
-  # rather than re-counting a finding a later pass already superseded. Liveness only:
-  # gr_reviewed stays the exact-head answer, so this never satisfies the reviewer gate.
+  # re-anchors every older comment, so lib/greptile-verdict.sh scopes them to Greptile's
+  # newest EARLIER verdict rather than re-counting a finding a later pass superseded. It
+  # applies only when the head carries no Greptile evidence at all, and it is liveness
+  # only: gr_reviewed stays the exact-head answer, so this never satisfies the reviewer
+  # gate. A newer Greptile review still running (rc 2) defers like an in-progress head.
   gr_prior=""
-  if [ "$gr_reviewed" -eq 0 ] && [ -z "$gr_review_id" ] && [ "$gr_state" != "in_progress" ] && [ "$gr_state" != "queued" ] && [ "$gr_live" -gt 0 ]; then
-    if greptile_prior_verdict "$REPO" "$PR" "$head"; then
-      if [ -n "$GRV_SHA" ]; then
-        gr_prior="${GRV_SHA:0:8}/${GRV_ADDED}"
-        if [ "$GRV_ADDED" = "0" ]; then
-          gr_live=0
-        else
-          gr_live=$(printf '%s' "$pull_c" | jq -rs --argjson rid "$GRV_REVIEW_ID" \
-            '[.[][]|select(.user.login=="greptile-apps[bot]" and .pull_request_review_id==$rid and .line!=null)]|length' 2>/dev/null) || unknown=1
-        fi
-      fi
+  if [ "$gr_reviewed" -eq 0 ] && [ "$gr_live" -gt 0 ]; then
+    gr_flat=$(printf '%s' "$pull_c" | jq -s 'add // []' 2>/dev/null) || gr_flat='x'
+    gr_rc=0
+    greptile_scope_live "$REPO" "$PR" "$head" "$gr_state" "$gr_review_id" "$gr_live" "$gr_flat" || gr_rc=$?
+    if [ "$gr_rc" -eq 0 ]; then
+      gr_live="$GRL_LIVE"; gr_prior="$GRL_NOTE"
     else
       unknown=1
+      [ "$gr_rc" -eq 2 ] && gr_prior="pending"
     fi
   fi
   [ "$gr_state" = "completed" ] && [ "$gr_reviewed" -eq 0 ] && gr_state="completed(${gr_concl:-no-conclusion}, no summary)"

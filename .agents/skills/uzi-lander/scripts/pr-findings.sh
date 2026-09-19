@@ -136,7 +136,8 @@ for n in "$@"; do
   gr_ok=0; gr_added=""; gr_status="absent"; gr_line="not triggered on this head (on-demand: gh pr comment ${n} --body '@greptileai review')"
   if [ -n "$head" ]; then
     gr_json=$(gh api --paginate "repos/${repo}/commits/${head}/check-runs" 2>/dev/null \
-      | jq -s '[.[].check_runs[]?|select(.app.slug=="greptile-apps" and .name=="Greptile Review")]|last // empty' 2>/dev/null || true)
+      | greptile_newest_run || true)
+    [ "$gr_json" = "{}" ] && gr_json=""
     if [ -n "$gr_json" ]; then
       gr_status=$(printf '%s' "$gr_json" | jq -r '.status // ""')
       gr_concl=$(printf '%s' "$gr_json" | jq -r '.conclusion // ""')
@@ -219,21 +220,23 @@ for n in "$@"; do
     || { echo "  🔴 could not render CodeRabbit review threads — NOT confirmed clean"; unconfirmed="${unconfirmed} #${n}"; }
   gr_clean=0; [ "$gr_ok" -eq 1 ] && [ "$gr_added" = "0" ] && gr_clean=1
   # No Greptile review on THIS head, yet Greptile comments are still anchored. A push
-  # re-anchors every older comment, so scope them to Greptile's newest EARLIER verdict
-  # rather than re-listing a finding a later pass already superseded. Liveness only: the
-  # gate above already recorded this head as unreviewed, and that stands.
-  if [ "$gr_ok" -eq 0 ] && [ -z "$gr_review_id" ] && [ -n "$head" ]; then
+  # re-anchors every older comment, so lib/greptile-verdict.sh scopes them to Greptile's
+  # newest EARLIER verdict rather than re-listing a finding a later pass superseded. It
+  # applies only when the head carries no Greptile evidence at all, and it is liveness
+  # only: the gate above already recorded this head as unreviewed, and that stands.
+  if [ "$gr_ok" -eq 0 ] && [ -n "$head" ]; then
     gr_anchored=$(printf '%s' "$inline_raw" | jq '[.[]|select(.user.login=="greptile-apps[bot]" and .line!=null)]|length' 2>/dev/null || echo 0)
-    if [ "$gr_anchored" -gt 0 ]; then
-      if greptile_prior_verdict "$repo" "$n" "$head"; then
-        if [ -n "$GRV_SHA" ]; then
-          echo "  Greptile: last verdict on ${GRV_SHA:0:8} — ${GRV_ADDED} comments added; comments from older passes are superseded (this head is still unreviewed)"
-          if [ "$GRV_ADDED" = "0" ]; then gr_clean=1; else gr_review_id="$GRV_REVIEW_ID"; fi
-        fi
-      else
-        echo "  🔴 Greptile's earlier verdict UNREADABLE — older comments cannot be scoped; NOT confirmed clean"
-        unconfirmed="${unconfirmed} #${n}"
-      fi
+    gr_rc=0
+    greptile_scope_live "$repo" "$n" "$head" "$gr_status" "$gr_review_id" "$gr_anchored" "$inline_raw" || gr_rc=$?
+    if [ "$gr_rc" -eq 2 ]; then
+      echo "  ⏳ a Greptile review is still running on a newer commit than its last verdict; findings deferred"
+      unconfirmed="${unconfirmed} #${n}"
+    elif [ "$gr_rc" -ne 0 ]; then
+      echo "  🔴 Greptile's earlier verdict UNREADABLE — older comments cannot be scoped; NOT confirmed clean"
+      unconfirmed="${unconfirmed} #${n}"
+    elif [ -n "$GRL_NOTE" ]; then
+      echo "  Greptile: last verdict on ${GRV_SHA:0:8} — ${GRV_ADDED} comments added; comments from older passes are superseded (this head is still unreviewed)"
+      if [ "$GRV_ADDED" = "0" ]; then gr_clean=1; else gr_review_id="$GRV_REVIEW_ID"; fi
     fi
   fi
   # shellcheck disable=SC2016

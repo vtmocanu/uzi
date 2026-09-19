@@ -35,6 +35,7 @@ if [ "${1:-}" = api ]; then
     *'/commits/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/check-runs'*)
       case "$MODE" in
         prior_clean) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"90 files reviewed, 0 comments added"}}]}' ;;
+        prior_pending) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"in_progress","conclusion":null,"output":{"summary":""}}]}' ;;
         *) echo '{"check_runs":[{"app":{"slug":"github-actions"},"name":"CI","status":"completed","conclusion":"success","output":{"summary":""}}]}' ;;
       esac ;;
     *'/commits/deadbeefdeadbeefdeadbeefdeadbeefdeadbeef/status'*) echo '' ;;
@@ -122,5 +123,16 @@ set -e
 [ "$rc" -eq 3 ] || fail "unreadable Greptile history exited rc=$rc, want 3: $(cat "$WORK/prior-unreadable.out")"
 grep -q "earlier verdict UNREADABLE" "$WORK/prior-unreadable.out" || fail "unreadable Greptile history was not surfaced: $(cat "$WORK/prior-unreadable.out")"
 grep -q '^  GR  old.go:8' "$WORK/prior-unreadable.out" || fail "comment hidden on an unreadable history: $(cat "$WORK/prior-unreadable.out")"
+
+# A Greptile review still RUNNING on a newer commit outranks an older verdict: deferred, and
+# the comment stays listed rather than being cleared by the verdict behind it.
+MODE="prior_pending"; export MODE
+set +e
+PATH="$WORK/bin:$PATH" bash "$SCRIPT" test/repo 42 > "$WORK/prior-pending.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 3 ] || fail "in-flight newer Greptile review exited rc=$rc, want 3: $(cat "$WORK/prior-pending.out")"
+grep -q 'still running on a newer commit' "$WORK/prior-pending.out" || fail "in-flight newer Greptile review was not surfaced: $(cat "$WORK/prior-pending.out")"
+grep -q '^  GR  old.go:8' "$WORK/prior-pending.out" || fail "comment cleared while a newer review was running: $(cat "$WORK/prior-pending.out")"
 
 echo "PASS pr-findings: settled, resolved current-head scope, earlier-verdict Greptile scope"
