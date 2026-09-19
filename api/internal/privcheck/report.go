@@ -219,6 +219,28 @@ var waivableCodes = map[Code]bool{
 	CodeUnprotectedFilePatterns:  true,
 }
 
+// Waivable reports whether an admin per-repo override may downgrade a finding of
+// this code (PRD #66 D8). protection_unreadable is never waivable.
+func Waivable(code Code) bool { return waivableCodes[code] }
+
+// AllBlocksWaivable reports whether every SeverityBlock finding in the set is
+// waivable by an admin override — i.e. an override could actually clear the
+// refusal. False when there is no block finding at all, and false the moment any
+// block finding is non-waivable (e.g. CodeProtectionUnreadable), since the override
+// leaves that one blocking.
+func AllBlocksWaivable(findings []Finding) bool {
+	sawBlock := false
+	for _, f := range findings {
+		if f.Severity == SeverityBlock {
+			sawBlock = true
+			if !waivableCodes[f.Code] {
+				return false
+			}
+		}
+	}
+	return sawBlock
+}
+
 // DowngradeOverridden applies an admin per-repo guardrail override (PRD #66 D8)
 // as a POST-evaluation severity downgrade. This is the SINGLE downgrade function
 // both the live gate (Service.GuardRepo) and M8/M9's render path call, so the

@@ -72,4 +72,50 @@ type AdminBlockedReposDTO struct {
 	// UZI_PRIVILEGE_CHECK_INTERVAL=0). The UI must then say the list may be
 	// incomplete — empty is "unknown", not "none blocked".
 	ChecksUnknown bool `json:"checks_unknown"`
+	// Requests are the PENDING cross-user guardrail override requests (PRD #1432):
+	// members who could not enable a blocked repo asking an admin to allow it. NON-
+	// omitempty on purpose — the handler initializes it to an empty slice so an admin
+	// with no pending requests sees [] rather than null, the same shape contract as
+	// Repos.
+	Requests []GuardrailOverrideRequestDTO `json:"requests"`
+}
+
+// GuardrailFindingDTO is one blocking privcheck finding snapshotted onto a
+// guardrail override request (PRD #1432): the coded reason a member's enable was
+// refused, carried for audit/display so the admin sees WHY without a fresh forge
+// read. Mirrors privcheck.Finding's wire fields.
+type GuardrailFindingDTO struct {
+	Code     string `json:"code"`
+	Severity string `json:"severity"`
+	Message  string `json:"message"`
+}
+
+// OverrideRequestStateDTO is the latest override-request state attached to a
+// not-yet-enabled repo in the owner's own repo view (PRD #1432): what the member
+// asked for and, once an admin settles it, when and with what note. DecidedAt /
+// DecisionNote are null while the request is still pending.
+type OverrideRequestStateDTO struct {
+	Status       string     `json:"status"`
+	Reason       string     `json:"reason"`
+	CreatedAt    time.Time  `json:"created_at"`
+	DecidedAt    *time.Time `json:"decided_at"`
+	DecisionNote *string    `json:"decision_note"`
+}
+
+// GuardrailOverrideRequestDTO is one row of the admin cross-user override-request
+// queue (PRD #1432): a member's pending request that an admin allow a guardrail-
+// blocked repo, joined to its repo path, owning user (id + email), and forge type
+// so the admin can triage the whole queue without a per-row fan-out. Findings is
+// the audit/display snapshot of what blocked the enable.
+type GuardrailOverrideRequestDTO struct {
+	ID         string                `json:"id"`
+	RepoID     string                `json:"repo_id"`
+	RepoPath   string                `json:"repo_path"`
+	OwnerID    string                `json:"owner_id"`
+	OwnerEmail string                `json:"owner_email"`
+	ForgeType  string                `json:"forge_type"`
+	Reason     string                `json:"reason"`
+	Findings   []GuardrailFindingDTO `json:"findings"`
+	Status     string                `json:"status"`
+	CreatedAt  time.Time             `json:"created_at"`
 }

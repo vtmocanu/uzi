@@ -469,6 +469,11 @@ export interface Repo {
     last_error?: string;
     last_synced_at?: string;
   } | null;
+  // Latest guardrail override-request state for a not-yet-enabled repo (issue #1432),
+  // absent/null otherwise. List-computed like guardrail_blocked — never set on the
+  // single-repo PUT/PATCH responses. Drives the member's pending/approved/rejected
+  // affordance; the live enable guard stays authoritative regardless of this state.
+  override_request?: OverrideRequestState | null;
 }
 
 // GuardrailOverrideMeta is the audit metadata for an active admin per-repo guardrail
@@ -478,6 +483,17 @@ export interface GuardrailOverrideMeta {
   reason: string;
   by: string;
   at: string;
+}
+
+// OverrideRequestState is the member-facing state of a guardrail override request
+// (issue #1432): the current status, the reason the owner gave, when it was raised,
+// and — once an admin decides — when and any note. Mirrors apitypes.OverrideRequestStateDTO.
+export interface OverrideRequestState {
+  status: string;
+  reason: string;
+  created_at: string;
+  decided_at: string | null;
+  decision_note: string | null;
 }
 
 // GitHub Projects v2 sync status for one repo (PRD #534). Returned by the
