@@ -184,13 +184,25 @@ if [ "${1:-}" = "version" ]; then
 fi
 printf '%s\n' "$*" >> "$FAKE_EXEC_LOG"
 if [ "${FAKE_CHILD_BLOCK:-0}" = "1" ]; then
-  printf '%s\n' "$$" > "$FAKE_CHILD_PID_FILE"
+  # The PID file is the test's readiness handshake. Install handlers before publishing it,
+  # otherwise the caller can signal after seeing the PID but before the traps exist.
   trap 'printf "TERM\n" >> "$FAKE_SIGNAL_LOG"; exit 143' TERM
   trap 'printf "INT\n" >> "$FAKE_SIGNAL_LOG"; exit 130' INT
+  printf '%s\n' "$$" > "$FAKE_CHILD_PID_FILE"
   while :; do sleep 1; done
 fi
 exit "${FAKE_CHILD_STATUS:-0}"
 EOF
+
+# The blocking tests signal immediately after this PID appears, so the marker must mean
+# both handlers are installed. This static guard makes that readiness contract deterministic.
+awk '
+  /trap .* TERM$/ { term_ready = 1 }
+  /trap .* INT$/ { int_ready = 1 }
+  /FAKE_CHILD_PID_FILE/ { exit(term_ready && int_ready ? 0 : 1) }
+  END { if (!(term_ready && int_ready)) exit 1 }
+' "$FAKE_LINTER_TEMPLATE" \
+  || fail "fake linter publishes readiness before installing signal handlers"
 
 # Shell `cmd &` starts cmd with SIGINT ignored. Spawn through Node so the wrapper
 # enters with normal signal dispositions, matching foreground Task execution.
