@@ -213,7 +213,10 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 		// detector the board card uses. Only issue-backed runs can link a PRD, so an
 		// issue-less run (chat / self-improve) whose description happens to mention a
 		// prds/*.md path never shows a spurious PRD badge.
-		HasPRDLink:     r.IssueIid.Valid && forgesvc.HasPRDLink(r.IssueDescription),
+		HasPRDLink: r.IssueIid.Valid && forgesvc.HasPRDLink(r.IssueDescription),
+		// PRD #1429 M1 (D2): the run's actual stored harness, surfaced read-only. NOT NULL
+		// DEFAULT 'claude', so always a definite value ("claude" for every current run).
+		Harness:        r.Harness,
 		Title:          textPtrValue(r.Title.Valid, r.Title.String),
 		Status:         r.Status,
 		RequeueCount:   r.RequeueCount,

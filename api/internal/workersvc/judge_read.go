@@ -200,17 +200,20 @@ func (s *Service) judgeRunUsageForTarget(ctx context.Context, targetRunID uuid.U
 
 // RerunJudge enqueues a fresh judge run for a terminal run at the OWNER's explicit
 // request (PRD #46 Decision 8 — the "re-run judge" action). Spend is owner-scoped
-// (audit H3): the judge spends the run owner's Anthropic token, so only the owner may
-// trigger it. A non-owner non-admin can't even see the run (ErrRunNotFound); an admin
-// can see it but is refused with ErrNotRunOwner — an admin cannot redirect autonomous
-// spend onto another user.
+// (audit H3): the judge spends the run owner's Anthropic OR Codex credential, so only
+// the owner may trigger it. A non-owner non-admin can't even see the run
+// (ErrRunNotFound); an admin can see it but is refused with ErrNotRunOwner — an admin
+// cannot redirect autonomous spend onto another user.
 //
-// Gates mirror the automatic funnel except the per-user opt-in: the explicit click on
-// one's own run IS the consent (the opt-in flag gates the automatic path, not a
-// deliberate one-off). Still enforced: eligible terminal status + kind, the global
-// kill-switch, and an owner token to spend. The one-active-judge-per-target unique
-// index dedupes a double-click (23505 → ErrJudgeAlreadyActive); a prior review is
-// replaced by the new judge's PostReview UPSERT.
+// Gates mirror the automatic funnel (maybeEnqueueJudge) except the per-user opt-in: the
+// explicit click on one's own run IS the consent (the opt-in flag gates the automatic
+// path, not a deliberate one-off). Still enforced: eligible terminal status + kind, the
+// global kill-switch, and — PRD #1429 M3, D4 — usability of the TARGET's inherited
+// harness rather than a hardcoded Anthropic check: a Claude target keeps the existing
+// Anthropic-token presence check, a Codex target's usability is the atomic
+// createRunResolved call itself (ErrNoCredentialForHarness, no fallback). The
+// one-active-judge-per-target unique index dedupes a double-click (23505 →
+// ErrJudgeAlreadyActive); a prior review is replaced by the new judge's PostReview UPSERT.
 func (s *Service) RerunJudge(ctx context.Context, userID uuid.UUID, isAdmin bool, targetRunID uuid.UUID) (store.Run, error) {
 	target, err := s.GetRunForViewer(ctx, userID, isAdmin, targetRunID)
 	if err != nil {
@@ -235,21 +238,33 @@ func (s *Service) RerunJudge(ctx context.Context, userID uuid.UUID, isAdmin bool
 	if !enabled {
 		return store.Run{}, ErrJudgeDisabled
 	}
-	if _, err := s.q.GetUserSecretCiphertext(ctx, store.GetUserSecretCiphertextParams{
-		UserID: target.UserID,
-		Kind:   store.KindAnthropicToken,
-	}); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return store.Run{}, ErrNoAnthropicToken
+	// PRD #1429 M3 (D4): a Claude target keeps the existing Anthropic-token presence
+	// check (byte-identical to before this repair); a Codex target's usability is
+	// enforced by the atomic create below, not a hardcoded Anthropic check.
+	if Harness(target.Harness) != HarnessCodex {
+		if _, err := s.q.GetUserSecretCiphertext(ctx, store.GetUserSecretCiphertextParams{
+			UserID: target.UserID,
+			Kind:   store.KindAnthropicToken,
+		}); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return store.Run{}, ErrNoAnthropicToken
+			}
+			return store.Run{}, err
 		}
-		return store.Run{}, err
 	}
-	judge, err := s.q.CreateJudgeRun(ctx, store.CreateJudgeRunParams{
-		UserID:           target.UserID,
-		TargetRunID:      pgconv.UUID(target.ID),
-		IssueTitle:       judgeRunTitle(target),
-		IssueDescription: "",
-		TriggerSource:    "judge_rerun",
+	// PRD #1429 M3 (D4): routed through the M2 createRunResolved funnel with the TARGET's
+	// harness as an EXPLICIT selection (replacing the M1 HarnessClaude stopgap), so D11
+	// resolution + the INSERT + (for a Codex target) the binding freeze commit atomically.
+	targetHarness := Harness(target.Harness)
+	judge, err := s.createRunResolved(ctx, target.UserID, &targetHarness, func(q Store, resolved resolvedHarness) (store.Run, error) {
+		return q.CreateJudgeRun(ctx, store.CreateJudgeRunParams{
+			UserID:           target.UserID,
+			TargetRunID:      pgconv.UUID(target.ID),
+			IssueTitle:       judgeRunTitle(target),
+			IssueDescription: "",
+			TriggerSource:    "judge_rerun",
+			Harness:          string(resolved.Harness),
+		})
 	})
 	if err != nil {
 		var pgErr *pgconn.PgError

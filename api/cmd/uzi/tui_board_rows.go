@@ -333,18 +333,28 @@ func (m tuiModel) boardCredSeg(r apitypes.RunListItemDTO, bg color.Color) string
 	return paintSeg(m.pal.faintC, bg, false, padCell(label, boardCredWidth))
 }
 
-// boardCostSeg renders WHAT a run cost (PRD #650), right-aligned in a fixed cell, whole dollars
-// only (no decimals, to keep the column width stable). Three distinct states: a nil Usage (a
-// pre-#40 or unclaimed run) draws a BLANK cell, matching boardCredSeg's empty convention; a $0
-// cost is a subscription-auth run the SDK prices at $0 and draws "—" (never "$0"); a real cost
-// draws fmtCostWhole (which itself renders 0<usd<0.5 as "<$1" so a real cost never shows as $0).
+// boardCostSeg renders WHAT a run cost (PRD #650), right-aligned in a fixed cell, branching on
+// the run's cost_status (PRD #1429 M5, D7) rather than guessing "subscription" from cost_usd ==
+// 0 — the bug this retires: a subscription run and an unreported run both used to price at 0 and
+// render identically to a real metered $0. Four states: a nil Usage (a pre-#40 or unclaimed run)
+// draws a BLANK cell, matching boardCredSeg's empty convention; "metered" draws fmtCostBoard's
+// whole-dollar figure (0 < usd < 0.5 renders "<$1" so a real cost never shows as $0, and an exact
+// metered $0 IS a genuine reading — never special-cased); "subscription" draws the short "sub"
+// label (never a dollar figure); anything else — "unreported", the pre-M1 empty string, or a
+// status this build has not heard of — draws "n/a", the same safe-unavailable fold web's
+// costCellText uses.
 func (m tuiModel) boardCostSeg(r apitypes.RunListItemDTO, bg color.Color) string {
 	if r.Usage == nil {
 		return padSeg("", boardCostWidth, bg)
 	}
-	s := "—"
-	if r.Usage.CostUSD != 0 {
+	var s string
+	switch classifyCostStatus(r.Usage.CostStatus) {
+	case costStatusMetered:
 		s = fmtCostBoard(r.Usage.CostUSD) // width-capped so a pathological cost can't blow the cell
+	case costStatusSubscription:
+		s = "sub"
+	default:
+		s = "n/a"
 	}
 	if pad := boardCostWidth - visualWidth(s); pad > 0 {
 		s = strings.Repeat(" ", pad) + s // right-align within the cell

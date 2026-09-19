@@ -14,7 +14,7 @@ import (
 
 // These tests exercise the Codex per-run credential-operation authority check, the
 // binding freeze, and the claim-payload credential open end to end against a REAL
-// Postgres (PRD #1147 M2, ships DARK). They prove the authority check on the actual
+// Postgres (PRD #1147 M2, activated by PRD #1429). They prove the authority check on the actual
 // schema — the frozen-vs-current comparisons, the epoch/capability binding, the
 // worker-ownership + actively-claimed gating, and the per-alias / account-wide
 // revocation semantics — which the pure-Go unit tests structurally cannot.

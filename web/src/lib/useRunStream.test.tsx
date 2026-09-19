@@ -57,6 +57,7 @@ function fakeRun(): Run {
     issue_iid: 7,
     issue_title: "Wire the runtime",
     issue_description: "",
+    harness: "claude", // PRD #1429 M1: harness joined RunDTO (NOT NULL, default claude).
     title: null,
     resume_of_run_id: null,
     forge_type: "gitlab",

@@ -10,6 +10,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   api,
+  type Harness,
   type Repo,
   type Schedule,
   type ScheduleInput,
@@ -23,7 +24,16 @@ import {
   selectionFromOverride,
   type CredentialSelection,
 } from "../lib/credentialOverride";
+import {
+  bothHarnessesUsable,
+  effectiveHarnessIsCodex,
+  scheduleHarnessPatch,
+  selectionFromHarness,
+  type HarnessSelection,
+} from "../lib/harnessSelection";
+import { hasAnthropicToken, isCodexUsable } from "../lib/hasToken";
 import { TokenPicker } from "./TokenPicker";
+import { HarnessPicker } from "./HarnessPicker";
 import { useAuth } from "../auth/AuthContext";
 import {
   Alert,
@@ -251,6 +261,14 @@ export function ScheduleModal({
   // edit), while a change sends {mode, secret_id?} — or {mode:"inherit"} for an explicit
   // clear. A ref mirrors it so the async token-load re-seed never clobbers a live edit.
   const [tokens, setTokens] = useState<SecretMeta[]>([]);
+  // PRD #1429 M4a: the full secret list (all kinds), so the harness picker's D2
+  // show/hide gate can compute Codex usability alongside `tokens`' Anthropic-only slice.
+  const [allSecrets, setAllSecrets] = useState<SecretMeta[]>([]);
+  // PRD #1429 M4a review Fix 1: the owner's own default_harness — a schedule with no
+  // pin resolves at FIRE time from the then-current default (D11 rule 2), so this is
+  // only an edit-time hint for the effective-Codex gate below, mirroring IssueView's
+  // start dialog and Board's per-card gate.
+  const [ownerDefaultHarness, setOwnerDefaultHarness] = useState<Harness | null>(null);
   const [credentialSel, setCredentialSel] = useState<CredentialSelection>(
     selectionFromOverride(editing?.credential_override, []),
   );
@@ -260,8 +278,10 @@ export function ScheduleModal({
     let cancelled = false;
     void (async () => {
       try {
-        const { secrets } = await api.listSecrets();
+        const [{ secrets }, { settings }] = await Promise.all([api.listSecrets(), api.getMySettings()]);
         if (cancelled) return;
+        setAllSecrets(secrets);
+        setOwnerDefaultHarness(settings.default_harness);
         const anthropic = secrets.filter((s) => s.kind === "anthropic_token");
         setTokens(anthropic);
         // Re-seed to resolve a pinned label→id now that the list is known — unless the
@@ -289,6 +309,39 @@ export function ScheduleModal({
   // schedule — that lane 409s any explicit override, so the modal never sends one.
   const credentialOverridePatch = () =>
     target === "self_improve" ? undefined : scheduleCredentialPatch(credentialSel, credentialTouched);
+
+  // PRD #1429 M4a: the schedule's per-run harness pin. Seeded from the stored read-side
+  // pin (a bare string, unlike credential_override — no id resolution needed, so no async
+  // re-seed). `harnessTouched` gates the omit-vs-send decision exactly like the
+  // credential override: an UNTOUCHED picker sends NOTHING (seed-and-keep), while a
+  // change sends the bare harness string — or explicit null for a clear-to-implicit.
+  // Unlike credential_override this is allowed on EVERY lane including self_improve (a
+  // pin is a selection, not a per-run credential override — D2/D3).
+  const [harnessSel, setHarnessSel] = useState<HarnessSelection>(selectionFromHarness(editing?.harness));
+  const [harnessTouched, setHarnessTouched] = useState(false);
+  const onHarnessChange = useCallback((sel: HarnessSelection) => {
+    setHarnessTouched(true);
+    setHarnessSel(sel);
+  }, []);
+  const harnessPatch = () => scheduleHarnessPatch(harnessSel, harnessTouched);
+  // D2: the picker appears only when the caller has a usable credential for BOTH
+  // harnesses — a single-harness user never sees a redundant picker.
+  const claudeUsableForHarness = hasAnthropicToken(allSecrets);
+  const codexUsableForHarness = isCodexUsable(allSecrets);
+  const showHarnessPicker = bothHarnessesUsable(claudeUsableForHarness, codexUsableForHarness);
+  // Fix 2 (M4a review): gate the Anthropic TokenPicker on the EFFECTIVE harness, not the
+  // raw `harnessSel` — a Codex-only owner never sees the harness picker above
+  // (showHarnessPicker is false), so `harnessSel` stays "inherit" even though every run
+  // this schedule fires WILL resolve to Codex implicitly. Fix 1 (M4a review follow-up):
+  // also thread the owner's CURRENT default_harness (an edit-time hint only — the real
+  // resolution happens at fire time), so a both-usable owner with a usable Codex/Claude
+  // default (D11 rule 2) sees the same hide/show IssueView's start dialog would.
+  const scheduleStartsOnCodex = effectiveHarnessIsCodex(
+    harnessSel,
+    claudeUsableForHarness,
+    codexUsableForHarness,
+    ownerDefaultHarness,
+  );
   // PRD #929 M1: per-schedule output mode for prompt-target schedules. "" = inherit the
   // catalog/job default; "mr" opens a merge request from an idea file, "issues" files issues.
   const [outputMode, setOutputMode] = useState<string>(
@@ -515,6 +568,9 @@ export function ScheduleModal({
     // PRD #1247 M6/M7: OMIT when untouched (seed-and-keep), {mode:"inherit"} on explicit
     // clear, {mode,secret_id?} on a pick; always omitted for self_improve.
     credential_override: credentialOverridePatch(),
+    // PRD #1429 M4a: OMIT when untouched (seed-and-keep), null on explicit clear, the bare
+    // harness string on a pick. Allowed on every lane including self_improve.
+    harness: harnessPatch(),
     guidance:
       target === "prompt" || target === "sweep"
         ? guidance.trim() === ""
@@ -563,6 +619,9 @@ export function ScheduleModal({
     // an unrelated edit), {mode:"inherit"} on explicit clear, {mode,secret_id?} on a pick;
     // always omitted for self_improve (that lane 409s an explicit override).
     credential_override: credentialOverridePatch(),
+    // PRD #1429 M4a: OMIT when untouched (seed-and-keep), null on explicit clear, the bare
+    // harness string on a pick. Allowed on every lane including self_improve.
+    harness: harnessPatch(),
     // Sent only on create; on edit, enable/disable is pause/resume, so leave it absent
     // (undefined) here to avoid re-flipping enabled during a config edit.
     enabled: isEdit ? undefined : enabled,
@@ -1083,9 +1142,33 @@ export function ScheduleModal({
             </div>
           </details>
 
-          {/* Model override — shown for ALL targets (unlike guidance), in the common area. */}
+          {/* PRD #1429 M4a: per-schedule harness pin, shown ONLY when the caller has a
+              usable credential for BOTH harnesses (D2) — a single-harness user never
+              sees a redundant picker. Placed ahead of Model: the model vocabulary below
+              is scoped to whichever harness is picked here. Allowed on every target
+              including self_improve — a pin is a selection, not a per-run credential
+              override. */}
+          {showHarnessPicker && (
+            <Field label="Harness (optional)" htmlFor="sched-harness">
+              <HarnessPicker id="sched-harness" label="Harness for this schedule" value={harnessSel} onChange={onHarnessChange} />
+              <p className="mt-1 text-[11px] text-faint">
+                Runs fired by this schedule use this harness, frozen at fire time. Leave on
+                &ldquo;Use my default&rdquo; to resolve it automatically.
+              </p>
+            </Field>
+          )}
+
+          {/* Model override — shown for ALL targets (unlike guidance), in the common area.
+              The vocabulary follows the EFFECTIVE harness, like the token picker below: an
+              "inherit" pin that will resolve to Codex must offer Codex models, or the pick
+              is accepted by the API and then dropped at claim (D6 fallback). */}
           <Field label="Model (optional)" htmlFor="sched-model">
-            <ModelSelect id="sched-model" value={model} onChange={setModel} />
+            <ModelSelect
+              id="sched-model"
+              value={model}
+              onChange={setModel}
+              harness={scheduleStartsOnCodex ? "codex" : harnessSel === "inherit" ? undefined : harnessSel}
+            />
             <p className="mt-1 text-[11px] text-faint">
               Runs fired by this schedule use this model on every target. Leave on Inherit to
               use your per-user Worker default.
@@ -1094,11 +1177,20 @@ export function ScheduleModal({
           {modelWarning && <Alert message={modelWarning} tone="warning" />}
 
           {/* PRD #1247 M6/M7: per-schedule Anthropic credential override, beside the model.
-              HIDDEN for self_improve (that lane 409s an explicit override) with a note in its
-              place, so the modal never sends one for it. Inherit follows the worker binding. */}
+              HIDDEN for self_improve (that lane 409s an explicit override) and for a schedule
+              that will EFFECTIVELY fire on Codex — an explicit pin, OR (M4a review fix) a
+              Codex-only owner whose picker is hidden but who WILL resolve to Codex implicitly
+              (a Codex run spends a Codex credential, never an Anthropic one — PRD #1429
+              M4a) — each with a note in its place, so the modal never sends an override in
+              either case. Inherit follows the worker binding. */}
           {target === "self_improve" ? (
             <p className="text-[11px] text-faint">
               Self-improvement runs always use your worker&rsquo;s token — no per-schedule override.
+            </p>
+          ) : scheduleStartsOnCodex ? (
+            <p className="text-[11px] text-faint">
+              This schedule fires on Codex — it spends a Codex credential, not an Anthropic
+              token.
             </p>
           ) : (
             <Field label="Anthropic token (optional)" htmlFor="sched-token">

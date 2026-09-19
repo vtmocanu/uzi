@@ -100,10 +100,11 @@ func (s *Service) SetRunCredential(ctx context.Context, userID, runID uuid.UUID,
 	}
 
 	// The effective harness of THIS run: runs.harness is NOT NULL DEFAULT 'claude'
-	// (migration 00226), so a persisted run always carries its authoritative harness and no
-	// users.default_harness fallback is needed here (that fallback is the create case, where
-	// no run row exists yet — the handler's createRunEffectiveHarness). An empty value is
-	// defended as claude, the safe direction (only a codex harness is refused, D9).
+	// (migration 00226), so a persisted run always carries its authoritative harness — frozen
+	// by the D11 resolver inside the create transaction (createRunAtomic) — and needs no
+	// users.default_harness fallback here (the old pre-transaction createRunEffectiveHarness
+	// guesser is gone; see service.go and runs_lifecycle.go). An empty value is defended as
+	// claude, the safe direction (only a codex harness is refused, D9).
 	harness := run.Harness
 	if harness == "" {
 		harness = harnessClaude

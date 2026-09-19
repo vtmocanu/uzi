@@ -244,6 +244,20 @@ type ClaimPayload struct {
 	// carrying only the enum value.
 	FailureClass *string `json:"failure_class,omitempty"`
 
+	// TargetCostStatus is the reviewed run's folded cost-observability status (PRD #1429
+	// M3, D7): "metered" | "subscription" | "unreported", read from run_usage_totals at
+	// judge-claim assembly. Present only for kind=judge, and omitted when the target has
+	// no usage row yet (a target that never posted a result frame) — the SAME omitempty
+	// posture as FailureClass/JudgeSignal above. The judge prompt must render this
+	// honestly: a subscription/unreported target's total is never presented as a
+	// complete $0.
+	TargetCostStatus *string `json:"target_cost_status,omitempty"`
+	// TargetCostUSD is the reviewed run's metered dollar total, meaningful ONLY when
+	// TargetCostStatus == "metered" (a subscription/unreported target's total is not a
+	// real dollar figure and must not be rendered as one). nil alongside
+	// TargetCostStatus when the target has no usage row.
+	TargetCostUSD *float64 `json:"target_cost_usd,omitempty"`
+
 	// KnownImproveUziTargets is the run owner's existing improve_uzi target coordinates
 	// (issue #232): the judge reuses a matching one verbatim instead of inventing a new
 	// phrasing, so future recurrences land on the same exact key the cross-run dedup
@@ -363,7 +377,7 @@ type ClaimSecrets struct {
 	ForgePAT            string `json:"forge_pat"`
 	AnthropicOAuthToken string `json:"anthropic_oauth_token"`
 	// Codex is the Codex credential this claim spends, present ONLY for a Codex-bound
-	// run (runs.codex_secret_id non-null; PRD #1147 M2, ships DARK). omitempty is
+	// run whose frozen binding can be opened (PRD #1147 M2, activated by PRD #1429). omitempty is
 	// load-bearing: an ordinary Claude run leaves it nil so the emitted JSON is
 	// BYTE-IDENTICAL to today's wire (no `codex` key), and an old worker that never
 	// learns the key keeps working. Never logged — it carries a usable access token.
@@ -372,7 +386,7 @@ type ClaimSecrets struct {
 
 // ClaimCodexSecrets is the usable Codex credential for one claim of a Codex-bound run
 // (PRD #1147 M2, B7; PRD #1171 M1). It carries only what the worker needs to act as
-// the credential and call the dark per-run credential-operation endpoints:
+// the credential and call the scoped per-run credential-operation endpoints:
 //
 //   - AuthMode is the run's server-owned, frozen auth mode ("subscription" | "api_key").
 //     It is the discriminant of the TS wire union (agent/src/protocol.ts): the worker

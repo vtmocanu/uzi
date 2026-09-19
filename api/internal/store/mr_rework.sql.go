@@ -20,7 +20,7 @@ INSERT INTO runs (
 SELECT
     $1, $2::uuid, 'mr_rework', $3, $4,
     $5, $6, $7, $8::jsonb, true, $9,
-    COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = $2::uuid), '{}'), $10, 'claude'
+    COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = $2::uuid), '{}'), $10, $11
 WHERE NOT EXISTS (
     SELECT 1 FROM runs
     WHERE repo_id = $2::uuid
@@ -42,6 +42,7 @@ type CreateAutoMRReworkRunParams struct {
 	ReviewComments   []byte      `json:"review_comments"`
 	WaitOnLimit      bool        `json:"wait_on_limit"`
 	TriggerSource    string      `json:"trigger_source"`
+	Harness          string      `json:"harness"`
 }
 
 // Queue an mr_rework run (PRD #700 M3, sibling of CreateCIFixRun). The NAME is
@@ -78,9 +79,11 @@ type CreateAutoMRReworkRunParams struct {
 // mr_rework DUPLICATE (same pipeline_ref) now proceeds PAST this predicate — it is no
 // longer swallowed as a false branch conflict — and is rejected by the
 // uq_runs_one_active_mr_rework (repo_id, mr_iid) index → 23505 → ErrActiveMRReworkExists.
-// harness (PRD #1332 M5A / D2): SQL literal 'claude' in the SELECT list, not a param — an
-// mr_rework run is a Claude production origin, and the literal defeats the DEFAULT-masks-
-// omission trap. Keep in sync with CreateManualMRReworkRunAndAdvance's body below.
+// harness (PRD #1429 M1, was #1332 M5A / D2): now the @harness PARAMETER supplied by the M5B
+// create seam (workersvc.createRunAtomic) in the SELECT list, not the SQL literal 'claude'. A
+// derived mr_rework inherits its source run's harness as an explicit selection (D4); M2 wires
+// that real value — the caller passes the D11-resolved, source-run-inherited harness, not a
+// stopgap. Keep in sync with CreateManualMRReworkRunAndAdvance's body below.
 func (q *Queries) CreateAutoMRReworkRun(ctx context.Context, arg CreateAutoMRReworkRunParams) (Run, error) {
 	row := q.db.QueryRow(ctx, createAutoMRReworkRun,
 		arg.UserID,
@@ -93,6 +96,7 @@ func (q *Queries) CreateAutoMRReworkRun(ctx context.Context, arg CreateAutoMRRew
 		arg.ReviewComments,
 		arg.WaitOnLimit,
 		arg.TriggerSource,
+		arg.Harness,
 	)
 	var i Run
 	err := row.Scan(
@@ -241,7 +245,7 @@ func (q *Queries) CreateAutoMRReworkRun(ctx context.Context, arg CreateAutoMRRew
 const createManualMRReworkRunAndAdvance = `-- name: CreateManualMRReworkRunAndAdvance :one
 WITH led AS (
     INSERT INTO mr_rework_ledger (repo_id, ref, high_water)
-    SELECT $2::uuid, $5, $10
+    SELECT $2::uuid, $5, $11
     WHERE NOT EXISTS (
         SELECT 1 FROM runs
         WHERE repo_id = $2::uuid
@@ -261,8 +265,9 @@ INSERT INTO runs (
 SELECT
     $1, $2::uuid, 'mr_rework', $3, $4,
     $5, $6, $7, $8::jsonb, true, $9,
-    -- harness (PRD #1332 M5A / D2): SQL literal 'claude', mirroring CreateAutoMRReworkRun.
-    COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = $2::uuid), '{}'), 'manual', 'claude'
+    -- harness (PRD #1429 M1, was #1332 M5A / D2): the @harness PARAMETER, mirroring
+    -- CreateAutoMRReworkRun. The caller passes the D11-resolved, source-run-inherited harness.
+    COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = $2::uuid), '{}'), 'manual', $10
 WHERE NOT EXISTS (
     SELECT 1 FROM runs
     WHERE repo_id = $2::uuid
@@ -283,6 +288,7 @@ type CreateManualMRReworkRunAndAdvanceParams struct {
 	TargetRunID      pgtype.UUID `json:"target_run_id"`
 	ReviewComments   []byte      `json:"review_comments"`
 	WaitOnLimit      bool        `json:"wait_on_limit"`
+	Harness          string      `json:"harness"`
 	HighWater        int64       `json:"high_water"`
 }
 
@@ -315,6 +321,7 @@ func (q *Queries) CreateManualMRReworkRunAndAdvance(ctx context.Context, arg Cre
 		arg.TargetRunID,
 		arg.ReviewComments,
 		arg.WaitOnLimit,
+		arg.Harness,
 		arg.HighWater,
 	)
 	var i Run

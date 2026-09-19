@@ -75,4 +75,42 @@ describe("startRunWithCredential", () => {
     expect(h.onSettled).toHaveBeenCalledTimes(1);
     confirmSpy.mockRestore();
   });
+
+  // PRD #1429 M4a: the harness selection rides the SAME create call, with the same
+  // inherit-omits/explicit-sends shape as the credential override.
+  it("sends NO harness for an inherit choice (default, byte-identical to pre-M4a)", async () => {
+    mockCreateRun.mockResolvedValue({ run: { id: "run-4" } } as Awaited<ReturnType<typeof api.createRun>>);
+    const h = handlers();
+    await startRunWithCredential("repo-1", 11, { mode: "inherit" }, h);
+    expect(mockCreateRun).toHaveBeenCalledWith("repo-1", 11, undefined);
+  });
+
+  it("sends the explicit harness choice on the create body", async () => {
+    mockCreateRun.mockResolvedValue({ run: { id: "run-5" } } as Awaited<ReturnType<typeof api.createRun>>);
+    const h = handlers();
+    await startRunWithCredential("repo-1", 12, { mode: "inherit" }, h, "codex");
+    expect(mockCreateRun).toHaveBeenCalledWith("repo-1", 12, undefined, undefined, "codex");
+    expect(h.onCreated).toHaveBeenCalledWith("run-5");
+  });
+
+  it("sends both an explicit credential override and an explicit harness together", async () => {
+    mockCreateRun.mockResolvedValue({ run: { id: "run-6" } } as Awaited<ReturnType<typeof api.createRun>>);
+    const h = handlers();
+    await startRunWithCredential("repo-1", 13, { mode: "pinned", secret_id: "sec-9" }, h, "claude");
+    expect(mockCreateRun).toHaveBeenCalledWith("repo-1", 13, undefined, { mode: "pinned", secret_id: "sec-9" }, "claude");
+  });
+
+  it("RE-SENDS the same harness choice on the open-MR force retry", async () => {
+    mockCreateRun
+      .mockRejectedValueOnce(openMRConflict())
+      .mockResolvedValueOnce({ run: { id: "run-7" } } as Awaited<ReturnType<typeof api.createRun>>);
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+    const h = handlers();
+
+    await startRunWithCredential("repo-1", 14, { mode: "inherit" }, h, "codex");
+
+    expect(mockCreateRun.mock.calls[0]).toEqual(["repo-1", 14, undefined, undefined, "codex"]);
+    expect(mockCreateRun.mock.calls[1]).toEqual(["repo-1", 14, true, undefined, "codex"]);
+    confirmSpy.mockRestore();
+  });
 });

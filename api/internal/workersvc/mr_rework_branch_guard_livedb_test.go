@@ -68,6 +68,12 @@ func TestMRReworkBranchGuardForcedInterleaveLiveDB(t *testing.T) {
 	// The repo-ownership check (GetRepoForUser) needs users + forge_connections + repos.
 	userID, connID, repoID := uuid.New(), uuid.New(), uuid.New()
 	exec(`INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`, userID, fmt.Sprintf("bg-%s@e2e", userID))
+	// PRD #1429 M2 (D4): createMRReworkRun now inherits the SOURCE run's harness (defaults to
+	// 'claude') as an EXPLICIT createRunResolved selection, which requires the user to actually
+	// hold a usable Claude credential — orthogonal to the branch-guard behaviour under test.
+	exec(`INSERT INTO user_secrets (id, user_id, kind, label, is_default, ciphertext, sealed_with)
+	      VALUES ($1, $2, 'anthropic_token', 'anthropic-default', true, $3, 'master')`,
+		uuid.New(), userID, []byte("ct"))
 	exec(`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
 	      VALUES ($1, $2, 'gitlab', 'https://forge.e2e', 'bot', 1, $3)`, connID, userID, []byte{0x1})
 	exec(`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
@@ -192,6 +198,12 @@ func TestCreateAutoMRReworkRunSameMRDuplicateIsActiveExistsLiveDB(t *testing.T) 
 	// The repo-ownership check (GetRepoForUser) needs users + forge_connections + repos.
 	userID, connID, repoID := uuid.New(), uuid.New(), uuid.New()
 	exec(`INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`, userID, fmt.Sprintf("dup-%s@e2e", userID))
+	// PRD #1429 M2 (D4): createMRReworkRun now inherits the SOURCE run's harness (defaults to
+	// 'claude') as an EXPLICIT createRunResolved selection, which requires the user to actually
+	// hold a usable Claude credential — orthogonal to the same-MR duplicate behaviour under test.
+	exec(`INSERT INTO user_secrets (id, user_id, kind, label, is_default, ciphertext, sealed_with)
+	      VALUES ($1, $2, 'anthropic_token', 'anthropic-default', true, $3, 'master')`,
+		uuid.New(), userID, []byte("ct"))
 	exec(`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
 	      VALUES ($1, $2, 'gitlab', 'https://forge.e2e', 'bot', 1, $3)`, connID, userID, []byte{0x1})
 	exec(`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)

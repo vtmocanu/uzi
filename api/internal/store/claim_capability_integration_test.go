@@ -271,7 +271,8 @@ func TestCreateRunCopiesRepoCapabilityHintLiveDB(t *testing.T) {
 	mustExec(fx.ctx, fx.t, fx.pool, `UPDATE repos SET required_capabilities = $2 WHERE id = $1`,
 		fx.repoID, []string{"docker"})
 	run, err := fx.q.CreateRun(fx.ctx, store.CreateRunParams{
-		UserID: fx.userID, RepoID: fx.repoID,
+		Harness: "claude", // PRD #1429 M1: harness is now a required @harness param.
+		UserID:  fx.userID, RepoID: fx.repoID,
 		IssueIid: pgtype.Int8{Int64: fx.nextIID(), Valid: true}, IssueTitle: "hinted", IssueDescription: "d", PlanSource: "agent", TriggerSource: "manual",
 	})
 	if err != nil {
@@ -285,7 +286,8 @@ func TestCreateRunCopiesRepoCapabilityHintLiveDB(t *testing.T) {
 	plainRepo := uuid.New()
 	insertPlainRepo(fx, plainRepo)
 	run2, err := fx.q.CreateRun(fx.ctx, store.CreateRunParams{
-		UserID: fx.userID, RepoID: plainRepo,
+		Harness: "claude", // PRD #1429 M1: harness is now a required @harness param.
+		UserID:  fx.userID, RepoID: plainRepo,
 		IssueIid: pgtype.Int8{Int64: fx.nextIID(), Valid: true}, IssueTitle: "plain", IssueDescription: "d", PlanSource: "agent", TriggerSource: "manual",
 	})
 	if err != nil {

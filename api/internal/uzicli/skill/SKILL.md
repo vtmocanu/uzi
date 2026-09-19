@@ -149,7 +149,7 @@ uzi run get <run-id> [--field <name>]...
 uzi run logs <run-id> [--follow] [--after <seq>] [--tail <n>]
 uzi run wait <run-id> [--until <status,...>] [--interval <dur>] [--timeout <dur>] [--min-plan-seq <n>]
 uzi run review <run-id>
-uzi run create --repo <repo-id> --issue <issue-iid> [--wait-on-limit[=false]] [--mr-rework[=false]] [--plan-file <path>] [--agent-source own|repo] [--exclude-agents <a,b>] [--planned-commit <sha>] [--require-base] [--token <label>|auto|default|inherit]
+uzi run create --repo <repo-id> --issue <issue-iid> [--wait-on-limit[=false]] [--mr-rework[=false]] [--plan-file <path>] [--agent-source own|repo] [--exclude-agents <a,b>] [--planned-commit <sha>] [--require-base] [--token <label>|auto|default|inherit] [--harness claude|codex]
 uzi run approve <run-id> [--agent-source own|repo] [--exclude-agents <a,b>] [--token <label>|auto|default|inherit]
 uzi run reject <run-id> [--message <text>]
 uzi run revise <run-id> [--message <text>]
@@ -171,10 +171,10 @@ uzi run decide <run-id> --continue [--guidance <text>]
 uzi run export <run-id> --output <path> [--capture <id>]
 uzi run recovery <run-id> [--json]
 uzi run discard <run-id> --hold <hold-id> [--yes]
-uzi schedule create --repo <repo-id> [--repo <repo-id>]... (--issue <iid> | --sweep [--label <l>]... [--create-missing-labels] | --prompt <text>) (--at <rfc3339> | --cron <expr>) [--tz <iana>] [--enabled[=false]] [--auto-approve[=false]] [--wait-on-limit] [--mr-rework[=false]] [--output mr|issues] [--token <label>|auto|default|inherit]
+uzi schedule create --repo <repo-id> [--repo <repo-id>]... (--issue <iid> | --sweep [--label <l>]... [--create-missing-labels] | --prompt <text>) (--at <rfc3339> | --cron <expr>) [--tz <iana>] [--enabled[=false]] [--auto-approve[=false]] [--wait-on-limit] [--mr-rework[=false]] [--output mr|issues] [--token <label>|auto|default|inherit] [--harness claude|codex]
 uzi schedule list
 uzi schedule get <schedule-id>
-uzi schedule edit <schedule-id> [--repo <repo-id>] [--cron <expr> | --at <rfc3339>] [--tz <iana>] [--prompt <text>] [--label <l>]... [--create-missing-labels] [--guidance <text> | --clear-guidance] [--max-issues <n> | --clear-max-issues] [--output mr|issues|""] [--auto-approve[=false]] [--wait-on-limit[=false]] [--mr-rework[=false] | --clear-mr-rework] [--model <alias|id>] [--apply-model-to-agents[=false]] [--token <label>|auto|default|inherit]
+uzi schedule edit <schedule-id> [--repo <repo-id>] [--cron <expr> | --at <rfc3339>] [--tz <iana>] [--prompt <text>] [--label <l>]... [--create-missing-labels] [--guidance <text> | --clear-guidance] [--max-issues <n> | --clear-max-issues] [--output mr|issues|""] [--auto-approve[=false]] [--wait-on-limit[=false]] [--mr-rework[=false] | --clear-mr-rework] [--model <alias|id>] [--apply-model-to-agents[=false]] [--token <label>|auto|default|inherit] [--harness claude|codex|""]
 uzi schedule pause <schedule-id>
 uzi schedule resume <schedule-id>
 uzi schedule pause-all --until <when>
@@ -440,6 +440,10 @@ uzi version
   failure instead, so the run stops rather than implement against a base that has moved.
   Both require `--plan-file`, and `--require-base` requires `--planned-commit` — either
   combination is a usage error.
+
+  `--harness claude|codex` picks which harness this run uses, validated client-side
+  before any request; omit it to let the server resolve your effective default. A value
+  outside `claude`/`codex` is a usage error before any request is sent.
 - `uzi run approve <run-id>` — approve the plan gate. Omitting `--agent-source`
   sends no selection at all, and an absent selection resolves to **the agents the
   worker detected in the clone's `.claude/agents/`**, falling back to your own
@@ -687,8 +691,11 @@ nothing a manual start cannot.
     Anthropic credential override every run this schedule fires carries — the same
     label/mode vocabulary as `run set-token` above, resolved client-side. Omit it and a
     fired run has no override (inherits the claiming worker's binding).
+  - `--harness claude|codex` (valid on every target, including `self_improve` defaults)
+    pins the harness every run this schedule fires uses; omit it to resolve the
+    effective harness per fire instead of pinning one.
 - `uzi schedule list` — your schedules as a table (`ID`, `TARGET`, `REPO`, `WHEN`,
-  `NEXT`, `ON`); `--json` dumps the raw array. Each element's `target` is the
+  `NEXT`, `ON`, `HARNESS`); `--json` dumps the raw array. Each element's `target` is the
   string enum `issue` | `sweep` | `prompt` (a plain string, NOT a nested object),
   and a sweep's label selector is the top-level `labels` array. So the correct way
   to answer "is there a sweep schedule, and on which label(s)?" is
@@ -708,7 +715,9 @@ nothing a manual start cannot.
   never-fired schedule reads `Last fire: never fired`. `--json` carries the same detail
   under `.last_fire`. A `TOKEN` row shows the schedule's credential override (the pinned
   label, `auto`, `default`, or `inherit` when none is set); `--json` carries it as
-  `credential_override`.
+  `credential_override`. A `HARNESS` row shows the pinned harness, or `implicit` when
+  none is pinned (the server resolves the effective harness fresh at each fire); `--json`
+  carries it as `harness` (`null` when unpinned).
 - `uzi schedule edit <schedule-id>` — change a schedule's mutable config in place, keeping
   its id and run history (unlike delete-and-recreate). Any flag you omit keeps its stored
   value; editing config revives a terminal schedule (status returns to active — a recurring
@@ -722,12 +731,16 @@ nothing a manual start cannot.
   place; an empty string clears it back to the Worker-model default; valid on every
   target and origin), `--apply-model-to-agents` (toggle the subagent model override),
   `--token <label>|auto|default|inherit` (PRD #1247, change the credential override
-  fired runs carry; `--token inherit` clears it). At
+  fired runs carry; `--token inherit` clears it), `--harness claude|codex` (PRD #1429,
+  change the pinned harness fired runs use; pass `--harness ""` to clear the pin back to
+  implicit — there is no `inherit` keyword for this closed two-value enum, so the empty
+  string is the clear sentinel). At
   least one field is required. `edit` preserves the stored `--model`,
   `--apply-model-to-agents` and `--mr-rework` across any partial edit that does not pass
   those flags (previously a plain retime silently wiped the stored model); a `--token`-less
-  edit leaves the stored override untouched the same way, so a retime never silently
-  clears it. Changing a
+  edit leaves the stored override untouched the same way, and a `--harness`-less edit
+  likewise leaves the stored pin untouched — so a retime never silently clears either.
+  Changing a
   sweep schedule's `--label` selector runs the same advisory sweep-label guardrail as
   `create`/`catalog enable` (`WARNING` on a newly-set label missing on the repo, or
   `--create-missing-labels` to create it first); it never blocks the edit, and an edit that

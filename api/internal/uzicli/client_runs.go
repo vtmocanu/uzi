@@ -405,7 +405,7 @@ type CreateRunCredentialOverride struct {
 	SecretID string
 }
 
-func (c *HTTPClient) CreateRun(ctx context.Context, repoID string, issueIID int64, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *CreateRunSeed, credOverride *CreateRunCredentialOverride) (apitypes.RunDTO, error) {
+func (c *HTTPClient) CreateRun(ctx context.Context, repoID string, issueIID int64, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *CreateRunSeed, credOverride *CreateRunCredentialOverride, harness string) (apitypes.RunDTO, error) {
 	var env struct {
 		Run apitypes.RunDTO `json:"run"`
 	}
@@ -441,6 +441,11 @@ func (c *HTTPClient) CreateRun(ctx context.Context, repoID string, issueIID int6
 	// is itself `omitempty` on a `*string`, so it rides only for a pinned choice and the
 	// auto/default/inherit modes send `mode` alone. This mirrors the server's inline req
 	// struct `{mode, secret_id?}`.
+	// harness (PRD #1429 M5, D2) is a plain `omitempty` string, mirroring the server's own
+	// `Harness string` field: an empty value (the CLI's --harness omitted) sends no
+	// meaningful key, byte-identical to a pre-#1429 create, and the server resolves the
+	// effective harness itself; "claude"/"codex" (validated client-side before this call)
+	// rides as an explicit selection.
 	reqBody := struct {
 		IssueIID           int64                        `json:"issue_iid"`
 		WaitOnLimit        *bool                        `json:"wait_on_limit,omitempty"`
@@ -451,7 +456,8 @@ func (c *HTTPClient) CreateRun(ctx context.Context, repoID string, issueIID int6
 		PlannedCommit      *string                      `json:"planned_commit,omitempty"`
 		RequireBase        bool                         `json:"require_base,omitempty"`
 		CredentialOverride *createRunCredentialOverride `json:"credential_override,omitempty"`
-	}{IssueIID: issueIID, WaitOnLimit: waitOnLimit, MrReworkEnabled: mrReworkEnabled, Force: force}
+		Harness            string                       `json:"harness,omitempty"`
+	}{IssueIID: issueIID, WaitOnLimit: waitOnLimit, MrReworkEnabled: mrReworkEnabled, Force: force, Harness: harness}
 	if seed != nil {
 		reqBody.PlanMD = &seed.PlanMD
 		reqBody.Selection = seed.Selection

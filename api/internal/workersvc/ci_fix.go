@@ -174,21 +174,27 @@ func (s *Service) createCIFixRun(ctx context.Context, userID, repoID uuid.UUID, 
 	if err != nil {
 		return store.Run{}, fmt.Errorf("marshal failure snapshot: %w", err)
 	}
-	run, err := s.q.CreateCIFixRun(ctx, store.CreateCIFixRunParams{
-		UserID:           userID,
-		RepoID:           repoID,
-		IssueTitle:       title,
-		IssueDescription: description,
-		PipelineID:       pgtype.Int8{Int64: snapshot.PipelineID, Valid: true},
-		PipelineRef:      pgtype.Text{String: ref, Valid: true},
-		FailureSnapshot:  snapJSON,
-		CiConfigPaths:    ciConfigPaths,
-		// PRD #35: the OWNER's default. A ci_fix run is created by the poller with no
-		// user in the loop, so there is no per-run request to honour.
-		WaitOnLimit: s.resolveWaitOnLimit(ctx, userID, nil),
-		// PRD #71 M4: false on the manual path (parks at the plan gate), true on the
-		// automatic path (worker approves the plan gate itself).
-		AutoApprove: autoApprove,
+	// PRD #1429 M2: CI-fix has no reliable target run, so it uses IMPLICIT D11 (nil explicit) — the
+	// resolve + freeze commit atomically with the INSERT.
+	run, err := s.createRunResolved(ctx, userID, nil /*explicit: implicit D11*/, func(q Store, resolved resolvedHarness) (store.Run, error) {
+		return q.CreateCIFixRun(ctx, store.CreateCIFixRunParams{
+			UserID:           userID,
+			RepoID:           repoID,
+			IssueTitle:       title,
+			IssueDescription: description,
+			PipelineID:       pgtype.Int8{Int64: snapshot.PipelineID, Valid: true},
+			PipelineRef:      pgtype.Text{String: ref, Valid: true},
+			FailureSnapshot:  snapJSON,
+			CiConfigPaths:    ciConfigPaths,
+			// PRD #35: the OWNER's default. A ci_fix run is created by the poller with no
+			// user in the loop, so there is no per-run request to honour.
+			WaitOnLimit: s.resolveWaitOnLimit(ctx, userID, nil),
+			// PRD #71 M4: false on the manual path (parks at the plan gate), true on the
+			// automatic path (worker approves the plan gate itself).
+			AutoApprove: autoApprove,
+			// PRD #1429 M2 (D1 auditor invariant): the D11-resolved harness frozen in-tx.
+			Harness: string(resolved.Harness),
+		})
 	})
 	if err != nil {
 		if isUniqueViolation(err) {

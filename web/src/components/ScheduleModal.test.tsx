@@ -31,6 +31,8 @@ vi.mock("../lib/api", async (importOriginal) => {
       ensureRepoLabels: vi.fn(),
       // PRD #1247 M7: the modal's TokenPicker seed loads the user's tokens.
       listSecrets: vi.fn(),
+      // PRD #1429 M4a review Fix 1: the owner's default_harness edit-time hint.
+      getMySettings: vi.fn(),
     },
   };
 });
@@ -57,6 +59,21 @@ beforeEach(() => {
   mockApi.checkRepoLabels.mockResolvedValue({ missing: [] });
   mockApi.ensureRepoLabels.mockResolvedValue({ ensured: [] });
   mockApi.listSecrets.mockResolvedValue({ secrets: [] });
+  // PRD #1429 M4a review Fix 1: no owner default_harness preference by default.
+  mockApi.getMySettings.mockResolvedValue({
+    settings: {
+      default_harness: null,
+      default_model: null,
+      default_effort: null,
+      judge_model: null,
+      summary_model: null,
+      appearance_mode: null,
+      light_theme: null,
+      dark_theme: null,
+      typeface: null,
+      theme: null,
+    },
+  });
 });
 afterEach(() => {
   cleanup();
@@ -1327,5 +1344,170 @@ describe("the per-schedule credential picker (PRD #1247 M6/M7)", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
     await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenCalled());
     expect(mockApi.updateSchedule.mock.calls[0]?.[1]?.credential_override).toBeUndefined();
+  });
+});
+
+function codexKey(over: Partial<SecretMeta> = {}): SecretMeta {
+  return {
+    id: "sec-codex",
+    kind: "openai_api_key",
+    label: "codex-key",
+    is_default: true,
+    auto_eligible: false,
+    created_at: "2026-01-01T00:00:00Z",
+    updated_at: "2026-01-01T00:00:00Z",
+    ...over,
+  };
+}
+
+// PRD #1429 M4a: the per-schedule harness pin.
+describe("the per-schedule harness picker (PRD #1429 M4a)", () => {
+  it("hides the picker for a Claude-only user (today's flow, unchanged)", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken()] });
+    render(
+      <MemoryRouter>
+        <ScheduleModal editing={schedFixture()} onClose={vi.fn()} onSaved={vi.fn()} />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(mockApi.listSecrets).toHaveBeenCalled());
+    expect(screen.queryByLabelText("Harness for this schedule")).toBeNull();
+    // The Anthropic picker is unaffected.
+    expect(screen.getByLabelText("Anthropic token for this schedule")).toBeTruthy();
+  });
+
+  it("shows the picker once both harnesses are usable, seeded from the stored pin", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken(), codexKey()] });
+    render(
+      <MemoryRouter>
+        <ScheduleModal editing={schedFixture({ harness: "codex" })} onClose={vi.fn()} onSaved={vi.fn()} />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(mockApi.listSecrets).toHaveBeenCalled());
+    const picker = (await screen.findByLabelText("Harness for this schedule")) as HTMLSelectElement;
+    expect(picker.value).toBe("codex");
+  });
+
+  it("OMITS harness on an unrelated edit (seed-and-keep)", async () => {
+    mockApi.updateSchedule.mockResolvedValue(schedFixture());
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken(), codexKey()] });
+    render(
+      <MemoryRouter>
+        <ScheduleModal editing={schedFixture({ harness: "codex" })} onClose={vi.fn()} onSaved={vi.fn()} />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(mockApi.listSecrets).toHaveBeenCalled());
+
+    // Touch ONLY the model — the harness picker is left untouched.
+    fireEvent.change(screen.getByLabelText("Model (optional)"), { target: { value: "gpt-6-astra" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenCalled());
+
+    const input = mockApi.updateSchedule.mock.calls[0]?.[1];
+    expect(input?.model).toBe("gpt-6-astra");
+    expect(input?.harness).toBeUndefined();
+  });
+
+  it("sends null when the user explicitly clears a stored pin", async () => {
+    mockApi.updateSchedule.mockResolvedValue(schedFixture());
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken(), codexKey()] });
+    render(
+      <MemoryRouter>
+        <ScheduleModal editing={schedFixture({ harness: "codex" })} onClose={vi.fn()} onSaved={vi.fn()} />
+      </MemoryRouter>,
+    );
+    const picker = (await screen.findByLabelText("Harness for this schedule")) as HTMLSelectElement;
+    fireEvent.change(picker, { target: { value: "inherit" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenCalled());
+    expect(mockApi.updateSchedule.mock.calls[0]?.[1]?.harness).toBeNull();
+  });
+
+  it("sends the bare harness string when the user pins one", async () => {
+    mockApi.updateSchedule.mockResolvedValue(schedFixture());
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken(), codexKey()] });
+    render(
+      <MemoryRouter>
+        <ScheduleModal editing={schedFixture()} onClose={vi.fn()} onSaved={vi.fn()} />
+      </MemoryRouter>,
+    );
+    const picker = (await screen.findByLabelText("Harness for this schedule")) as HTMLSelectElement;
+    fireEvent.change(picker, { target: { value: "codex" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenCalled());
+    expect(mockApi.updateSchedule.mock.calls[0]?.[1]?.harness).toBe("codex");
+  });
+
+  it("is allowed (not hidden, not blocked) on a self_improve schedule, unlike credential_override", async () => {
+    mockApi.updateSchedule.mockResolvedValue(schedFixture({ target: "self_improve" }));
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken(), codexKey()] });
+    render(
+      <MemoryRouter>
+        <ScheduleModal
+          editing={schedFixture({ origin: "default", target: "self_improve", catalog_slug: "self-improve" })}
+          onClose={vi.fn()}
+          onSaved={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(mockApi.listSecrets).toHaveBeenCalled());
+    const picker = (await screen.findByLabelText("Harness for this schedule")) as HTMLSelectElement;
+    fireEvent.change(picker, { target: { value: "codex" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenCalled());
+    // Unlike credential_override (always undefined for self_improve), harness DOES ride.
+    expect(mockApi.updateSchedule.mock.calls[0]?.[1]?.harness).toBe("codex");
+    expect(mockApi.updateSchedule.mock.calls[0]?.[1]?.credential_override).toBeUndefined();
+  });
+
+  it("hides the Anthropic token picker and offers the Codex model vocabulary once harness=codex is picked", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken(), codexKey()] });
+    render(
+      <MemoryRouter>
+        <ScheduleModal editing={schedFixture()} onClose={vi.fn()} onSaved={vi.fn()} />
+      </MemoryRouter>,
+    );
+    const picker = (await screen.findByLabelText("Harness for this schedule")) as HTMLSelectElement;
+    fireEvent.change(picker, { target: { value: "codex" } });
+
+    expect(screen.queryByLabelText("Anthropic token for this schedule")).toBeNull();
+    expect(screen.getByText(/spends a Codex credential/)).toBeTruthy();
+    const modelSelect = screen.getByLabelText("Model (optional)") as HTMLSelectElement;
+    expect(within(modelSelect).getByRole("option", { name: "gpt-6-astra" })).toBeTruthy();
+    expect(within(modelSelect).queryByRole("option", { name: "opus" })).toBeNull();
+  });
+
+  // Fix 2 (M4a review): a Codex-only owner never sees the harness picker (only one
+  // harness is usable — D2), so the schedule's harness pin stays unset/"inherit" even
+  // though every run this schedule fires WILL resolve to Codex implicitly. Gating the
+  // Anthropic TokenPicker on the raw picker value alone left it visible for this owner.
+  it("hides the Anthropic token picker for a Codex-only owner, even with no explicit pin", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [codexKey()] });
+    render(
+      <MemoryRouter>
+        <ScheduleModal editing={schedFixture()} onClose={vi.fn()} onSaved={vi.fn()} />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(mockApi.listSecrets).toHaveBeenCalled());
+    // Single-harness owner: no redundant harness picker either (D2).
+    expect(screen.queryByLabelText("Harness for this schedule")).toBeNull();
+    expect(screen.queryByLabelText("Anthropic token for this schedule")).toBeNull();
+    expect(screen.getByText(/fires on Codex/)).toBeTruthy();
+  });
+
+  // PR #1449 review: the model vocabulary must follow the EFFECTIVE harness too. Keyed on
+  // the raw pin, an "inherit" schedule that resolves to Codex offered Claude aliases, and
+  // the API accepted a pick that claim assembly then dropped for the Codex default.
+  it("offers the Codex model vocabulary to a Codex-only owner, even with no explicit pin", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [codexKey()] });
+    render(
+      <MemoryRouter>
+        <ScheduleModal editing={schedFixture()} onClose={vi.fn()} onSaved={vi.fn()} />
+      </MemoryRouter>,
+    );
+    await screen.findByText(/fires on Codex/);
+    expect(screen.queryByLabelText("Harness for this schedule")).toBeNull();
+    const modelSelect = screen.getByLabelText("Model (optional)") as HTMLSelectElement;
+    expect(within(modelSelect).getByRole("option", { name: "gpt-6-astra" })).toBeTruthy();
+    expect(within(modelSelect).queryByRole("option", { name: "opus" })).toBeNull();
   });
 });

@@ -2,7 +2,8 @@
 import { afterEach, describe, it, expect } from "vitest";
 import { useState } from "react";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { ModelSelect } from "./ModelSelect";
+import type { Harness as HarnessKind } from "../lib/api";
+import { ModelSelect, modelCompatibleWithHarness } from "./ModelSelect";
 import { Field } from "./ui";
 
 afterEach(cleanup);
@@ -10,11 +11,11 @@ afterEach(cleanup);
 // Controlled harness: mirrors how the editor/Settings wire ModelSelect (the
 // emitted model string is the source of truth). The output node exposes the
 // current value for assertions.
-function Harness({ initial }: { initial: string }) {
+function Harness({ initial, pickerHarness }: { initial: string; pickerHarness?: HarnessKind }) {
   const [model, setModel] = useState(initial);
   return (
     <>
-      <ModelSelect value={model} onChange={setModel} />
+      <ModelSelect value={model} onChange={setModel} harness={pickerHarness} />
       <output data-testid="model">{model}</output>
     </>
   );
@@ -90,5 +91,90 @@ describe("ModelSelect label association", () => {
     expect(labeled.tagName).toBe("SELECT");
     expect((labeled as HTMLSelectElement).value).toBe("custom");
     expect(screen.getByLabelText("Custom model ID")).not.toBeNull();
+  });
+});
+
+// PRD #1429 D6: the two closed harness vocabularies. Claude keeps today's aliases
+// (defaulting harness omitted, so every pre-M4a call site is unaffected); Codex is
+// EXACTLY gpt-6-astra/gpt-5.6-sol with NO custom escape hatch.
+describe("ModelSelect — harness-scoped vocabulary (PRD #1429 D6)", () => {
+  it("offers today's Claude aliases plus Other… when harness is omitted (back-compat)", () => {
+    render(<Harness initial="" />);
+    expect(screen.getByRole("option", { name: "opus" })).toBeTruthy();
+    expect(screen.getByRole("option", { name: "sonnet" })).toBeTruthy();
+    expect(screen.getByRole("option", { name: /Other/ })).toBeTruthy();
+    expect(screen.queryByRole("option", { name: "gpt-6-astra" })).toBeNull();
+  });
+
+  it("offers the Claude vocabulary explicitly when harness='claude'", () => {
+    render(<Harness initial="" pickerHarness="claude" />);
+    expect(screen.getByRole("option", { name: "opus" })).toBeTruthy();
+    expect(screen.getByRole("option", { name: /Other/ })).toBeTruthy();
+  });
+
+  it("offers ONLY the two Codex models, with no custom escape hatch", () => {
+    render(<Harness initial="" pickerHarness="codex" />);
+    expect(screen.getByRole("option", { name: "gpt-6-astra" })).toBeTruthy();
+    expect(screen.getByRole("option", { name: "gpt-5.6-sol" })).toBeTruthy();
+    expect(screen.getByRole("option", { name: "Inherit (account default)" })).toBeTruthy();
+    expect(screen.queryByRole("option", { name: /Other/ })).toBeNull();
+    // No Claude alias leaks into the Codex vocabulary.
+    expect(screen.queryByRole("option", { name: "opus" })).toBeNull();
+  });
+
+  it("selects a curated Codex alias when the value is one", () => {
+    render(<Harness initial="gpt-6-astra" pickerHarness="codex" />);
+    expect(combo().value).toBe("gpt-6-astra");
+    expect(screen.queryByLabelText("Custom model ID")).toBeNull();
+  });
+
+  it("re-derives the picker when the harness prop itself changes (no value change)", () => {
+    function Switcher() {
+      const [h, setH] = useState<HarnessKind>("claude");
+      const [model, setModel] = useState("opus");
+      return (
+        <>
+          <button type="button" onClick={() => setH("codex")}>
+            switch to codex
+          </button>
+          <ModelSelect value={model} onChange={setModel} harness={h} />
+        </>
+      );
+    }
+    render(<Switcher />);
+    // "opus" is curated under Claude.
+    expect(combo().value).toBe("opus");
+    fireEvent.click(screen.getByRole("button", { name: "switch to codex" }));
+    // The SAME stored value ("opus") is not part of the Codex vocabulary, so the
+    // picker must re-derive it as custom rather than keep showing a Codex <option
+    // value="opus"> that no longer exists (a stale <select> value would silently
+    // fall back to the browser's first option instead).
+    expect(combo().value).toBe("custom");
+    expect((screen.getByLabelText("Custom model ID") as HTMLInputElement).value).toBe("opus");
+  });
+});
+
+// PRD #1429 D6: the Run Defaults reset-on-harness-switch rule.
+describe("modelCompatibleWithHarness (PRD #1429 D6)", () => {
+  it("inherit (blank) is always compatible", () => {
+    expect(modelCompatibleWithHarness("", "claude")).toBe(true);
+    expect(modelCompatibleWithHarness("", "codex")).toBe(true);
+  });
+
+  it("codex accepts only its two curated aliases", () => {
+    expect(modelCompatibleWithHarness("gpt-6-astra", "codex")).toBe(true);
+    expect(modelCompatibleWithHarness("gpt-5.6-sol", "codex")).toBe(true);
+    expect(modelCompatibleWithHarness("opus", "codex")).toBe(false);
+    expect(modelCompatibleWithHarness("some-custom-id", "codex")).toBe(false);
+  });
+
+  it("claude accepts a curated alias or any custom id", () => {
+    expect(modelCompatibleWithHarness("opus", "claude")).toBe(true);
+    expect(modelCompatibleWithHarness("claude-custom-9", "claude")).toBe(true);
+  });
+
+  it("claude rejects a known Codex-only alias", () => {
+    expect(modelCompatibleWithHarness("gpt-6-astra", "claude")).toBe(false);
+    expect(modelCompatibleWithHarness("gpt-5.6-sol", "claude")).toBe(false);
   });
 });

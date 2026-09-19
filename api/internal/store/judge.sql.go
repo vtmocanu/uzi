@@ -36,7 +36,7 @@ func (q *Queries) CountJudgesSince(ctx context.Context, arg CountJudgesSincePara
 const createJudgeRun = `-- name: CreateJudgeRun :one
 
 INSERT INTO runs (user_id, kind, target_run_id, issue_title, issue_description, status, trigger_source, harness)
-VALUES ($1, 'judge', $2, $3, $4, 'queued', $5, 'claude')
+VALUES ($1, 'judge', $2, $3, $4, 'queued', $5, $6)
 RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash, pause_requested_at, pause_mode, pause_after_count, checkpoint_tip_at, recovery_wait_count, recovery_retry_not_before, completion_contract_version, contract_revision, completion_contract, completion_attempts, latest_completion_attempt, milestones_agents, hold_reason, hold_captured_head, completion_budget_exhausted_at, completion_question_at, budget_extension_seconds, claim_generation, harness, recovery_wait_cause, forge_park_count, credential_override_mode, credential_override_secret_id, claim_released_at, credential_switch_requested_at, credential_switch_generation, stale_requeue_generation
 `
 
@@ -46,6 +46,7 @@ type CreateJudgeRunParams struct {
 	IssueTitle       string      `json:"issue_title"`
 	IssueDescription string      `json:"issue_description"`
 	TriggerSource    string      `json:"trigger_source"`
+	Harness          string      `json:"harness"`
 }
 
 // Run-judge queries (PRD #46 M3). The judge is a worker-executed retrospective of a
@@ -61,8 +62,10 @@ type CreateJudgeRunParams struct {
 // as the target (never cross-user). issue_title/description are synthesized — a judge
 // has no issue. The one-active-judge-per-target partial unique index (00057) makes a
 // duplicate raise 23505, which the caller treats as "already being judged" (a no-op).
-// harness (PRD #1332 M5A / D2): SQL literal 'claude', not a param — a judge run is a Claude
-// production origin, and the literal defeats the DEFAULT-masks-omission trap.
+// harness (PRD #1429 M1, was #1332 M5A / D2): now the @harness PARAMETER supplied by the M5B
+// create seam (workersvc.createRunAtomic), not the SQL literal 'claude'. A judge inherits its
+// target run's harness as an explicit selection (D4); M3 wires that real value. Every current
+// caller passes string(HarnessClaude) as a mechanical stopgap.
 func (q *Queries) CreateJudgeRun(ctx context.Context, arg CreateJudgeRunParams) (Run, error) {
 	row := q.db.QueryRow(ctx, createJudgeRun,
 		arg.UserID,
@@ -70,6 +73,7 @@ func (q *Queries) CreateJudgeRun(ctx context.Context, arg CreateJudgeRunParams) 
 		arg.IssueTitle,
 		arg.IssueDescription,
 		arg.TriggerSource,
+		arg.Harness,
 	)
 	var i Run
 	err := row.Scan(
@@ -438,7 +442,8 @@ SELECT rr.judge_run_id,
        ru.cache_read_tokens,
        ru.cache_creation_tokens,
        ru.output_tokens,
-       ru.cost_usd
+       ru.cost_usd,
+       ru.cost_status
 FROM run_reviews rr
 JOIN runs jr ON jr.id = rr.judge_run_id
 LEFT JOIN run_usage_totals ru ON ru.run_id = rr.judge_run_id
@@ -455,6 +460,7 @@ type GetJudgeRunUsageForTargetRow struct {
 	CacheCreationTokens pgtype.Int8        `json:"cache_creation_tokens"`
 	OutputTokens        pgtype.Int8        `json:"output_tokens"`
 	CostUsd             pgtype.Numeric     `json:"cost_usd"`
+	CostStatus          pgtype.Text        `json:"cost_status"`
 }
 
 // The judge run's timing + token/cost usage for a target run's review panel (PRD #69
@@ -469,6 +475,10 @@ type GetJudgeRunUsageForTargetRow struct {
 // pre-feature judge) yields NULLs, which the DTO renders as an absent strip — never a
 // fabricated 0. Owner-or-admin visibility is enforced by the caller (GetRunForViewer on
 // the target) BEFORE this read, exactly like GetRunReviewForTarget.
+//
+// cost_status (PRD #1429 M3, D7) rides along like the token/cost columns above, so the
+// panel's judge-run strip can tell a real metered dollar total from a subscription/
+// unreported one that cost_usd alone cannot represent — never a fabricated complete $0.
 func (q *Queries) GetJudgeRunUsageForTarget(ctx context.Context, targetRunID uuid.UUID) (GetJudgeRunUsageForTargetRow, error) {
 	row := q.db.QueryRow(ctx, getJudgeRunUsageForTarget, targetRunID)
 	var i GetJudgeRunUsageForTargetRow
@@ -482,6 +492,7 @@ func (q *Queries) GetJudgeRunUsageForTarget(ctx context.Context, targetRunID uui
 		&i.CacheCreationTokens,
 		&i.OutputTokens,
 		&i.CostUsd,
+		&i.CostStatus,
 	)
 	return i, err
 }

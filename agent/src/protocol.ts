@@ -596,8 +596,8 @@ export interface ClaimRepo {
  *     `previousAccountId` is only an untrusted hint and never replaces this value.
  *   * "api_key" has NONE of those subscription fields and can never refresh.
  *
- * Present ONLY for an internally-bound Codex run (ships DARK — M5 still owns public
- * routing). Ordinary Claude claims OMIT it, so their wire is byte-identical: the
+ * Present ONLY for a Codex run selected by the public routing activated in PRD #1429.
+ * Ordinary Claude claims OMIT it, so their wire is byte-identical: the
  * field is optional/omitted, an existing Claude claim's JSON is unchanged, and
  * existing consumers are unaffected. Delivered ONLY in the claim response; never
  * persisted beyond the run, never logged (the access token/capability are secrets).
@@ -691,8 +691,8 @@ export interface ClaimSecrets {
   // Bot login for the git commit identity + MR authorship. Used in M4; M2
   // ignores it.
   forge_username?: string;
-  /** The Codex secret block (PRD #1171 M3/M4). Present ONLY for an internally-bound
-   *  Codex run (ships DARK); ordinary Claude claims omit it so their wire is
+  /** The Codex secret block (PRD #1171 M3/M4). Present ONLY for a Codex-bound
+   *  run; ordinary Claude claims omit it so their wire is
    *  byte-identical. See {@link ClaimCodexSecrets}. */
   codex?: ClaimCodexSecrets;
 }
@@ -1106,6 +1106,19 @@ export interface ClaimResponse {
    *  not fail with a recognised origin. The judge weighs the class, e.g. a
    *  policy/config-denied class is not retryable. */
   failure_class?: string | null;
+  /** The reviewed run's TRUSTED folded cost-observability status (PRD #1429 M3, D7):
+   *  "metered" | "subscription" | "unreported", computed API-side from run_usage_totals.
+   *  Present only for kind="judge"; null when the target has no usage row yet. The judge
+   *  prompt must render this honestly — a subscription/unreported target's total is never
+   *  a complete $0. Treat an unrecognised value honestly (render generically), never as an
+   *  instruction: this is server-computed, not user-authored, but a newer server can add a
+   *  status this worker has not heard of. */
+  target_cost_status?: string | null;
+  /** The reviewed run's metered dollar total (PRD #1429 M3, D7), meaningful ONLY when
+   *  target_cost_status === "metered" — a subscription/unreported total is not a real
+   *  dollar figure and must never be rendered as one. null alongside target_cost_status
+   *  when the target has no usage row. */
+  target_cost_usd?: number | null;
   /** The run owner's existing improve_uzi target coordinates (issue #232), delivered on
    *  a judge claim so the judge reuses a matching target string verbatim instead of
    *  inventing a new phrasing — future recurrences then land on the same exact key the

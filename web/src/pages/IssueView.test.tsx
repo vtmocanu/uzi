@@ -17,6 +17,7 @@ vi.mock("../lib/api", async (importOriginal) => {
       listRuns: vi.fn(),
       listWorkers: vi.fn(),
       listSecrets: vi.fn(),
+      getMySettings: vi.fn(),
       promoteIssue: vi.fn(),
       createRun: vi.fn(),
     },
@@ -126,6 +127,21 @@ beforeEach(() => {
   mockApi.listRuns.mockResolvedValue({ runs: [] });
   mockApi.listWorkers.mockResolvedValue({ workers: [] });
   mockApi.listSecrets.mockResolvedValue({ secrets: [] });
+  // PRD #1429 M4a review Fix 1: the viewer's default_harness, no preference by default.
+  mockApi.getMySettings.mockResolvedValue({
+    settings: {
+      default_harness: null,
+      default_model: null,
+      default_effort: null,
+      judge_model: null,
+      summary_model: null,
+      appearance_mode: null,
+      light_theme: null,
+      dark_theme: null,
+      typeface: null,
+      theme: null,
+    },
+  });
 });
 
 afterEach(() => {
@@ -359,6 +375,151 @@ describe("IssueView Start gate (PRD #764)", () => {
     const startBtn = () => screen.getByRole("button", { name: /start run/i }) as HTMLButtonElement;
     await screen.findByText("A small typo fix");
     await waitFor(() => expect(startBtn().disabled).toBe(false));
+  });
+
+  // PRD #1429 M4a, D2: the harness picker appears ONLY when the user has a usable
+  // credential for BOTH harnesses — a single-harness (Claude-only) user's flow stays
+  // byte-identical to today, with no redundant picker.
+  it("hides the harness picker for a Claude-only user (today's flow, unchanged)", async () => {
+    setAuth();
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
+    mockApi.listSecrets.mockResolvedValue({ secrets: [aToken()] });
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["uzi"], has_prd_link: false }) });
+    renderIssueView();
+
+    await screen.findByText("A small typo fix");
+    await screen.findByRole("button", { name: /start run/i });
+    expect(screen.queryByLabelText("Harness for this run")).toBeNull();
+    // The Anthropic picker is still there — unaffected by the harness feature.
+    expect(screen.getByLabelText("Anthropic token for this run")).toBeTruthy();
+  });
+
+  it("shows the harness picker once BOTH harnesses are usable, defaulting to inherit", async () => {
+    setAuth();
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
+    mockApi.listSecrets.mockResolvedValue({
+      secrets: [aToken(), { ...aToken(), id: "sec-codex", kind: "openai_api_key" }],
+    });
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["uzi"], has_prd_link: false }) });
+    renderIssueView();
+
+    await screen.findByText("A small typo fix");
+    const picker = (await screen.findByLabelText("Harness for this run")) as HTMLSelectElement;
+    expect(picker.value).toBe("inherit");
+  });
+
+  it("sends the picked harness on Start and hides the Anthropic picker once Codex is chosen", async () => {
+    setAuth();
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
+    mockApi.listSecrets.mockResolvedValue({
+      secrets: [aToken(), { ...aToken(), id: "sec-codex", kind: "openai_api_key" }],
+    });
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["uzi"], has_prd_link: false }) });
+    mockApi.createRun.mockResolvedValue({ run: { id: "run-codex-1" } as unknown as Run });
+    renderIssueView();
+
+    await screen.findByText("A small typo fix");
+    const picker = (await screen.findByLabelText("Harness for this run")) as HTMLSelectElement;
+    fireEvent.change(picker, { target: { value: "codex" } });
+    // Once harness=codex is chosen, the Anthropic picker (irrelevant to a Codex run) hides.
+    expect(screen.queryByLabelText("Anthropic token for this run")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: /start run/i }));
+    await waitFor(() => expect(mockApi.createRun).toHaveBeenCalled());
+    expect(mockApi.createRun).toHaveBeenCalledWith("repo-1", 7, undefined, undefined, "codex");
+  });
+
+  // Fix 2 (M4a review): a Codex-only user never sees the harness picker (only one
+  // harness is usable — D2), so `harness` stays "inherit". Gating the Anthropic
+  // TokenPicker on the raw picker value alone left it visible for this user even though
+  // the run WILL resolve to Codex — using it 422s. Paired with the positive control
+  // below (a Claude-only / both-usable user DOES see it) so this is not a vacuous
+  // "never renders" assertion.
+  it("hides the Anthropic token picker for a Codex-only user, even with no explicit harness pick", async () => {
+    setAuth();
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
+    mockApi.listSecrets.mockResolvedValue({
+      secrets: [{ ...aToken(), id: "sec-codex", kind: "openai_api_key" }],
+    });
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["uzi"], has_prd_link: false }) });
+    renderIssueView();
+
+    await screen.findByText("A small typo fix");
+    await screen.findByRole("button", { name: /start run/i });
+    // Single-harness user: no redundant harness picker either (D2).
+    expect(screen.queryByLabelText("Harness for this run")).toBeNull();
+    expect(screen.queryByLabelText("Anthropic token for this run")).toBeNull();
+  });
+
+  // Positive control for the case above: a Claude-only user (the pre-existing,
+  // single-harness flow) still sees the Anthropic picker — the fix must not hide it
+  // universally.
+  it("still shows the Anthropic token picker for a Claude-only user", async () => {
+    setAuth();
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
+    mockApi.listSecrets.mockResolvedValue({ secrets: [aToken()] });
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["uzi"], has_prd_link: false }) });
+    renderIssueView();
+
+    await screen.findByText("A small typo fix");
+    expect(await screen.findByLabelText("Anthropic token for this run")).toBeTruthy();
+  });
+
+  // Positive control: a both-usable user with the harness picker left on inherit (the
+  // untouched default) also still sees the Anthropic picker — D11 rule 4 resolves
+  // inherit to Claude when both are usable and no default is set, so hiding it here
+  // would be wrong.
+  it("still shows the Anthropic token picker for a both-usable user on the untouched inherit default", async () => {
+    setAuth();
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
+    mockApi.listSecrets.mockResolvedValue({
+      secrets: [aToken(), { ...aToken(), id: "sec-codex", kind: "openai_api_key" }],
+    });
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["uzi"], has_prd_link: false }) });
+    renderIssueView();
+
+    await screen.findByText("A small typo fix");
+    const picker = (await screen.findByLabelText("Harness for this run")) as HTMLSelectElement;
+    expect(picker.value).toBe("inherit");
+    expect(screen.getByLabelText("Anthropic token for this run")).toBeTruthy();
+  });
+
+  // Fix 1 (M4a review follow-up, D11 rule 2): a both-usable user who set a Codex
+  // default_harness (Run Defaults) and leaves the picker on the untouched "inherit"
+  // default must ALSO have the Anthropic picker hidden — the run resolves to Codex via
+  // D11 rule 2 (a usable default wins), and touching the Anthropic picker would 422.
+  // Paired with the positive control directly above (both-usable, no default, still
+  // shows the picker) so this is not a vacuous "never renders" assertion.
+  it("hides the Anthropic token picker for a both-usable user whose default_harness is codex", async () => {
+    setAuth();
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
+    mockApi.listSecrets.mockResolvedValue({
+      secrets: [aToken(), { ...aToken(), id: "sec-codex", kind: "openai_api_key" }],
+    });
+    mockApi.getMySettings.mockResolvedValue({
+      settings: {
+        default_harness: "codex",
+        default_model: null,
+        default_effort: null,
+        judge_model: null,
+        summary_model: null,
+        appearance_mode: null,
+        light_theme: null,
+        dark_theme: null,
+        typeface: null,
+        theme: null,
+      },
+    });
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["uzi"], has_prd_link: false }) });
+    renderIssueView();
+
+    await screen.findByText("A small typo fix");
+    // The harness picker still shows (both are usable — D2) and stays on the untouched
+    // "inherit" default...
+    const picker = (await screen.findByLabelText("Harness for this run")) as HTMLSelectElement;
+    expect(picker.value).toBe("inherit");
+    // ...but the Anthropic picker is hidden: D11 rule 2 resolves this inherit pick to Codex.
+    expect(screen.queryByLabelText("Anthropic token for this run")).toBeNull();
   });
 
   // Issue #856 M3: a completed prior run that still owns an open MR makes the

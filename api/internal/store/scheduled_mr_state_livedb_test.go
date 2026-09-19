@@ -182,6 +182,7 @@ func TestScheduledBranchConcurrencyGuardsLiveDB(t *testing.T) {
 		 VALUES ($1, $2, $3, 'ci_fix', 't', 'd', 4242, $4, 'running')`,
 		uuid.New(), owner, repoID, occupiedBranch)
 	if _, err := q.CreateAutoMRReworkRun(ctx, store.CreateAutoMRReworkRunParams{
+		Harness:          "claude", // PRD #1429 M1: harness is now a required @harness param.
 		UserID:           owner,
 		RepoID:           repoID,
 		IssueTitle:       "Rework scheduled MR (occupied by ci_fix)",
@@ -208,6 +209,7 @@ func TestScheduledBranchConcurrencyGuardsLiveDB(t *testing.T) {
 		srcFree, owner, repoID, freeBranch, freeMR)
 
 	first, err := q.CreateAutoMRReworkRun(ctx, store.CreateAutoMRReworkRunParams{
+		Harness:          "claude", // PRD #1429 M1: harness is now a required @harness param.
 		UserID:           owner,
 		RepoID:           repoID,
 		IssueTitle:       "Rework scheduled MR",
@@ -227,6 +229,7 @@ func TestScheduledBranchConcurrencyGuardsLiveDB(t *testing.T) {
 	}
 
 	_, err = q.CreateAutoMRReworkRun(ctx, store.CreateAutoMRReworkRunParams{
+		Harness:          "claude", // PRD #1429 M1: harness is now a required @harness param.
 		UserID:           owner,
 		RepoID:           repoID,
 		IssueTitle:       "Rework scheduled MR (duplicate)",

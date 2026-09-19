@@ -22,7 +22,7 @@ VALUES (
     $1, $2, $3::uuid, 'task', $4, $5,
     $6, now(), true, false, false,
     $7, '',
-    COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = $3::uuid), '{}'), 'task_review', 'claude'
+    COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = $3::uuid), '{}'), 'task_review', $8
 )
 RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash, pause_requested_at, pause_mode, pause_after_count, checkpoint_tip_at, recovery_wait_count, recovery_retry_not_before, completion_contract_version, contract_revision, completion_contract, completion_attempts, latest_completion_attempt, milestones_agents, hold_reason, hold_captured_head, completion_budget_exhausted_at, completion_question_at, budget_extension_seconds, claim_generation, harness, recovery_wait_cause, forge_park_count, credential_override_mode, credential_override_secret_id, claim_released_at, credential_switch_requested_at, credential_switch_generation, stale_requeue_generation
 `
@@ -35,6 +35,7 @@ type CreateTaskReviewRunParams struct {
 	BaseBranch  pgtype.Text `json:"base_branch"`
 	TargetRunID pgtype.UUID `json:"target_run_id"`
 	IssueTitle  string      `json:"issue_title"`
+	Harness     string      `json:"harness"`
 }
 
 // The dedicated insert for a REVIEW run (PRD #400 M4a): a task run that IS a review of
@@ -48,7 +49,10 @@ type CreateTaskReviewRunParams struct {
 // review — no recursion). id is caller-supplied so Go derives the uzi/task/<id> namespace
 // invariant the same way CreateTaskRun does. The uq_one_active_task_review_per_target
 // partial unique index makes a duplicate active review raise 23505.
-// harness (PRD #1332 M5A / D2): SQL literal 'claude', not a param — a Claude production origin.
+// harness (PRD #1429 M1, was #1332 M5A / D2): now the @harness PARAMETER supplied by the M5B
+// create seam (workersvc.createRunAtomic). A task-review inherits its reviewed target's harness
+// as an explicit selection (D4); M3 wires that real value. Every current caller passes
+// string(HarnessClaude) as a mechanical stopgap.
 func (q *Queries) CreateTaskReviewRun(ctx context.Context, arg CreateTaskReviewRunParams) (Run, error) {
 	row := q.db.QueryRow(ctx, createTaskReviewRun,
 		arg.RunID,
@@ -58,6 +62,7 @@ func (q *Queries) CreateTaskReviewRun(ctx context.Context, arg CreateTaskReviewR
 		arg.BaseBranch,
 		arg.TargetRunID,
 		arg.IssueTitle,
+		arg.Harness,
 	)
 	var i Run
 	err := row.Scan(
@@ -206,7 +211,7 @@ func (q *Queries) CreateTaskReviewRun(ctx context.Context, arg CreateTaskReviewR
 const createTaskRun = `-- name: CreateTaskRun :one
 
 INSERT INTO runs (id, user_id, repo_id, kind, branch, base_branch, open_mr, interactive, review_requested, then_fix_requested, issue_title, issue_description, auto_approve, wait_on_limit, required_capabilities, budget_wall_seconds, budget_max_iterations, trigger_source, harness)
-VALUES ($1, $2, $3::uuid, 'task', $4, $5, $6, $7, $8, $9, $10, $11, true, $12, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = $3::uuid), '{}'), $13, $14, 'task', 'claude')
+VALUES ($1, $2, $3::uuid, 'task', $4, $5, $6, $7, $8, $9, $10, $11, true, $12, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = $3::uuid), '{}'), $13, $14, 'task', $15)
 RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash, pause_requested_at, pause_mode, pause_after_count, checkpoint_tip_at, recovery_wait_count, recovery_retry_not_before, completion_contract_version, contract_revision, completion_contract, completion_attempts, latest_completion_attempt, milestones_agents, hold_reason, hold_captured_head, completion_budget_exhausted_at, completion_question_at, budget_extension_seconds, claim_generation, harness, recovery_wait_cause, forge_park_count, credential_override_mode, credential_override_secret_id, claim_released_at, credential_switch_requested_at, credential_switch_generation, stale_requeue_generation
 `
 
@@ -225,6 +230,7 @@ type CreateTaskRunParams struct {
 	WaitOnLimit         bool        `json:"wait_on_limit"`
 	BudgetWallSeconds   pgtype.Int4 `json:"budget_wall_seconds"`
 	BudgetMaxIterations pgtype.Int4 `json:"budget_max_iterations"`
+	Harness             string      `json:"harness"`
 }
 
 // Task runs (PRD #400: uzi handoff) ------------------------------------------
@@ -254,8 +260,10 @@ type CreateTaskRunParams struct {
 // service layer (resolveWaitOnLimit): a handoff has no per-request override today, so
 // nil -> the owner's users.wait_on_limit is the whole behavior. Omitting it (as this
 // query originally did) silently opts every task run OUT via the column DEFAULT false.
-// harness (PRD #1332 M5A / D2) is the SQL literal 'claude', not a param: a task run is a
-// Claude production origin, and the literal defeats the DEFAULT-masks-omission trap.
+// harness (PRD #1429 M1, was #1332 M5A / D2) is now the @harness PARAMETER supplied by the M5B
+// create seam (workersvc.createRunAtomic), not the SQL literal 'claude'. A handoff task uses
+// D11; M2/M3 wire the real resolved value. Every current caller passes string(HarnessClaude)
+// as a mechanical stopgap.
 func (q *Queries) CreateTaskRun(ctx context.Context, arg CreateTaskRunParams) (Run, error) {
 	row := q.db.QueryRow(ctx, createTaskRun,
 		arg.RunID,
@@ -272,6 +280,7 @@ func (q *Queries) CreateTaskRun(ctx context.Context, arg CreateTaskRunParams) (R
 		arg.WaitOnLimit,
 		arg.BudgetWallSeconds,
 		arg.BudgetMaxIterations,
+		arg.Harness,
 	)
 	var i Run
 	err := row.Scan(
@@ -431,7 +440,7 @@ VALUES (
     true, false, false, false, $7,
     $8, $9,
     COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = $3::uuid), '{}'),
-    $10, $11, 'then_fix', 'claude'
+    $10, $11, 'then_fix', $12
 )
 RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash, pause_requested_at, pause_mode, pause_after_count, checkpoint_tip_at, recovery_wait_count, recovery_retry_not_before, completion_contract_version, contract_revision, completion_contract, completion_attempts, latest_completion_attempt, milestones_agents, hold_reason, hold_captured_head, completion_budget_exhausted_at, completion_question_at, budget_extension_seconds, claim_generation, harness, recovery_wait_cause, forge_park_count, credential_override_mode, credential_override_secret_id, claim_released_at, credential_switch_requested_at, credential_switch_generation, stale_requeue_generation
 `
@@ -448,6 +457,7 @@ type CreateThenFixRunParams struct {
 	IssueDescription    string      `json:"issue_description"`
 	BudgetWallSeconds   pgtype.Int4 `json:"budget_wall_seconds"`
 	BudgetMaxIterations pgtype.Int4 `json:"budget_max_iterations"`
+	Harness             string      `json:"harness"`
 }
 
 // The dedicated insert for a FIX run (PRD #400 M5): a NORMAL task run that pushes fixes,
@@ -472,7 +482,10 @@ type CreateThenFixRunParams struct {
 // path, so a then-fix parks/stops on an Anthropic usage limit the same way the original
 // handoff would — omitting it silently opts every fix run OUT via the column DEFAULT false,
 // so an owner who enabled parking could see the initial handoff park but its fix stop.
-// harness (PRD #1332 M5A / D2): SQL literal 'claude', not a param — a Claude production origin.
+// harness (PRD #1429 M1, was #1332 M5A / D2): now the @harness PARAMETER supplied by the M5B
+// create seam (workersvc.createRunAtomic). A then-fix inherits its original task's harness as
+// an explicit selection (D4); M3 wires that real value. Every current caller passes
+// string(HarnessClaude) as a mechanical stopgap.
 func (q *Queries) CreateThenFixRun(ctx context.Context, arg CreateThenFixRunParams) (Run, error) {
 	row := q.db.QueryRow(ctx, createThenFixRun,
 		arg.RunID,
@@ -486,6 +499,7 @@ func (q *Queries) CreateThenFixRun(ctx context.Context, arg CreateThenFixRunPara
 		arg.IssueDescription,
 		arg.BudgetWallSeconds,
 		arg.BudgetMaxIterations,
+		arg.Harness,
 	)
 	var i Run
 	err := row.Scan(

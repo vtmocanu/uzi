@@ -443,10 +443,11 @@ WHERE status = 'online'
 -- so stamping only at approval would make the D2 hard claim clause vacuous for the
 -- plan-phase worker. The contract CONTENT (completion_contract/contract_revision) is still
 -- absent here — it is frozen with milestones_frozen at approval / the first running report.
--- 🔴 harness (PRD #1332 M5A / D2) is the SQL literal 'claude', NOT a param: every current
--- production origin is Claude, and writing the literal (rather than relying on the column
--- DEFAULT) means a future omitted column-list update fails loudly instead of the default
--- silently masking it. M5A is dark, so no origin resolves Codex here; M5B adds that seam.
+-- 🔴 harness (PRD #1429 M1, was #1332 M5A / D2) is now the @harness PARAMETER supplied by
+-- the M5B create seam (workersvc.createRunAtomic), not the SQL literal 'claude': the atomic
+-- create transaction resolves D11 and passes the resolved harness here so a Codex row and
+-- its binding freeze commit together. M2/M3 wire the real per-origin value; every current
+-- caller passes string(HarnessClaude) as a mechanical stopgap, byte-identical to today.
 --
 -- 🔴 credential_override_mode / credential_override_secret_id (PRD #1247 M1) are the
 -- silently-omittable per-run credential override (D1), both sqlc.narg — NULL = inherit
@@ -456,7 +457,7 @@ WHERE status = 'online'
 -- of THIS file, and guarded by a per-path test rather than the compiler (the narg trap
 -- above applies identically).
 INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve, wait_on_limit, mr_rework_enabled, plan_md, plan_source, agent_source, agent_exclusions, planned_base_commit, require_base_match, model, override_subagent_model, issue_comments, review_comments, required_capabilities, trigger_source, completion_contract_version, harness, credential_override_mode, credential_override_secret_id)
-VALUES (@user_id, @repo_id::uuid, @issue_iid, @issue_title, @issue_description, sqlc.narg('origin_column'), now(), @auto_approve, @wait_on_limit, sqlc.narg('mr_rework_enabled'), sqlc.narg('plan_md'), @plan_source, sqlc.narg('agent_source'), sqlc.narg('agent_exclusions')::jsonb, sqlc.narg('planned_base_commit'), @require_base_match, sqlc.narg('model'), @override_subagent_model, sqlc.narg('issue_comments')::jsonb, sqlc.narg('review_comments')::jsonb, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), @trigger_source, sqlc.narg('completion_contract_version'), 'claude', sqlc.narg('credential_override_mode'), sqlc.narg('credential_override_secret_id'))
+VALUES (@user_id, @repo_id::uuid, @issue_iid, @issue_title, @issue_description, sqlc.narg('origin_column'), now(), @auto_approve, @wait_on_limit, sqlc.narg('mr_rework_enabled'), sqlc.narg('plan_md'), @plan_source, sqlc.narg('agent_source'), sqlc.narg('agent_exclusions')::jsonb, sqlc.narg('planned_base_commit'), @require_base_match, sqlc.narg('model'), @override_subagent_model, sqlc.narg('issue_comments')::jsonb, sqlc.narg('review_comments')::jsonb, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), @trigger_source, sqlc.narg('completion_contract_version'), @harness, sqlc.narg('credential_override_mode'), sqlc.narg('credential_override_secret_id'))
 RETURNING *;
 
 -- name: GetRunByIDForUser :one
@@ -544,6 +545,11 @@ SELECT sqlc.embed(r), rp.path_with_namespace AS repo_path, w.name AS worker_name
        ru.cache_creation_tokens  AS usage_cache_creation_tokens,
        ru.output_tokens          AS usage_output_tokens,
        ru.cost_usd               AS usage_cost_usd,
+       -- PRD #1429 M1 (D7): the run's folded per-run cost_status from run_usage_totals, so a
+       -- run-list row can surface metered/subscription/unreported and never present a
+       -- subscription/unreported placeholder 0 as a real dollar total. LEFT-joined like the
+       -- token columns, so a run with no usage yields NULL (rendered as absent).
+       ru.cost_status            AS usage_cost_status,
        -- issue #1418: does this run have an available recovery capture to export? The
        -- capture half of the read-path landing_state derivation (workersvc.DeriveLandingState),
        -- owner-scoped and riding idx_recovery_captures_run_owner (run_id, user_id). The

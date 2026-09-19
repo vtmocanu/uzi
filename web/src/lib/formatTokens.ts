@@ -41,10 +41,11 @@ export function formatTokens(n: number): string {
   return `${(n / 1_000_000_000_000).toFixed(2)}T`;
 }
 
-// formatCost renders a USD cost the way the mock does: "$1.87". A zero cost with
-// nonzero tokens is a subscription-auth run the SDK prices at $0 (Decision 8) —
-// callers render "—" for that rather than a misleading "$0.00", so this only ever
-// formats a genuinely present cost. Costs of $1000 or more drop the cents and
+// formatCost renders a USD cost the way the mock does: "$1.87". It formats the number
+// it is given and nothing else: whether a cost is a real metered figure is decided by
+// cost_status in costStatus.ts (PRD #1429 D7), never inferred from a zero here, so a
+// metered $0 renders "$0.00" and a subscription or unreported run never reaches this
+// through a per-run renderer. Costs of $1000 or more drop the cents and
 // render as a whole dollar amount ("$1119") — the cents are noise at that scale —
 // while anything below keeps the two-decimal form. No thousands separator either way.
 export function formatCost(usd: number): string {

@@ -144,6 +144,7 @@ function run(over: Partial<Run>): Run {
     issue_iid: 87,
     issue_title: "Add rate limiting",
     issue_description: "d",
+    harness: "claude", // PRD #1429 M1: harness joined RunDTO.
     title: null,
     resume_of_run_id: null,
     status: "awaiting_approval",
@@ -1164,6 +1165,18 @@ describe("RunView header — the frozen per-schedule model badge (PRD #300)", ()
     renderPage({ status: "failed", model: "fable", override_subagent_model: false });
     await screen.findByText("Add rate limiting");
     expect(screen.queryByTitle(OVERRIDE_BADGE_TITLE)).toBeNull();
+  });
+
+  // PRD #1429 M4a: the run's actual harness, in the same header cluster.
+  it("shows the Codex badge for a codex-harness run", async () => {
+    renderPage({ status: "completed", harness: "codex" });
+    expect(await screen.findByText("Codex")).toBeTruthy();
+  });
+
+  it("shows no harness badge for a claude-harness run (unmarked)", async () => {
+    renderPage({ status: "completed", harness: "claude" });
+    await screen.findByText("Add rate limiting");
+    expect(screen.queryByText("Codex")).toBeNull();
   });
 });
 
@@ -2303,6 +2316,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
             cache_creation_tokens: 3100,
             output_tokens: 1840,
             cost_usd: 0.42,
+            cost_status: "metered" as const, // PRD #1429 M1 (D7)
           },
         },
       }),

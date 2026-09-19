@@ -38,6 +38,27 @@ func (f scheduleFixture) seedOwnedAnthropicToken(ctx context.Context, t *testing
 	return id
 }
 
+// seedUsableCodexDefault gives userID a REAL, usable Codex credential (a static
+// openai_api_key default) so a raw default_harness='codex' column actually resolves Codex
+// under D11 (PRD #1429 M2, D5) — merely setting the column is no longer sufficient once
+// scheduleEffectiveHarness reads a genuine D11 resolution instead of the retired raw guesser.
+func (f scheduleFixture) seedUsableCodexDefault(ctx context.Context, t *testing.T, userID uuid.UUID) uuid.UUID {
+	t.Helper()
+	id := uuid.New()
+	mustExecT(ctx, t, f.pool,
+		`INSERT INTO user_secrets (id, user_id, kind, label, is_default, ciphertext, sealed_with)
+		 VALUES ($1, $2, 'openai_api_key', $3, true, $4, 'master')`,
+		id, userID, "codex-key-"+uuid.NewString(), []byte("x"))
+	if _, err := f.h.q.InsertCodexCredentialState(ctx, store.InsertCodexCredentialStateParams{
+		UserSecretID: id,
+		UserID:       userID,
+		Status:       "static",
+	}); err != nil {
+		t.Fatalf("insert codex credential state: %v", err)
+	}
+	return id
+}
+
 // patchScheduleRaw PATCHes /api/schedules/{id} with a raw body and returns the recorder.
 func (f scheduleFixture) patchScheduleRaw(t *testing.T, user, id uuid.UUID, body string) *httptest.ResponseRecorder {
 	t.Helper()
@@ -138,6 +159,10 @@ func TestCreateScheduleCredentialOverride422CodexLiveDB(t *testing.T) {
 	ctx := context.Background()
 	f := newScheduleFixture(ctx, t)
 	mustExecT(ctx, t, f.pool, `UPDATE users SET default_harness = 'codex' WHERE id = $1`, f.owner.ID)
+	// PRD #1429 M2 (D5): scheduleEffectiveHarness now resolves a REAL D11 harness rather than
+	// reading the raw default_harness column, so the pin must actually be usable to reach 422
+	// (an unusable Codex default falls through to Claude and accepts the override instead).
+	f.seedUsableCodexDefault(ctx, t, f.owner.ID)
 	_, code := f.createSchedule(t, f.owner.ID, f.repoID,
 		`{"target":"prompt","prompt":"x","timing":"recurring","cron_expr":"0 2 * * *","timezone":"UTC","credential_override":{"mode":"auto"}}`)
 	if code != http.StatusUnprocessableEntity {

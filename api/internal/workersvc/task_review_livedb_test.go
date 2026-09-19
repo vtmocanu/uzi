@@ -53,6 +53,13 @@ func TestTaskReviewLiveDB(t *testing.T) {
 	      VALUES ($1, $2, 'gitlab', 'https://forge.e2e', 'bot', 1, $3)`, connID, userID, []byte{0x1})
 	exec(`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
 	      VALUES ($1, $2, 1, 'g/m4a', 'https://forge.e2e/g/m4a', 'main', true)`, repoID, connID)
+	// PRD #1429 M3 (D4): a review INHERITS the target's harness as an EXPLICIT selection
+	// through createRunResolved, so — unlike before — Claude usability is now checked too
+	// (not merely stamped). This user needs a usable (default) Anthropic token or the
+	// inherited 'claude' harness is refused (ErrNoCredentialForHarness) and no review is
+	// created — exactly the D4 fail-closed behavior this PRD requires.
+	exec(`INSERT INTO user_secrets (id, user_id, kind, label, is_default, ciphertext, sealed_with)
+	      VALUES ($1, $2, 'anthropic_token', 'default', true, $3, 'master')`, uuid.New(), userID, []byte("ct"))
 
 	// A COMPLETED, review_requested task run — the exact shape the terminal transition hands
 	// maybeEnqueueTaskReview. Its branch is the server-named uzi/task/<id> the review clones.

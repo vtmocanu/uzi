@@ -16,7 +16,9 @@ export const SCHEDULE_SKIP_REASON_LABELS: Record<ScheduleSkipReason, string> = {
   vault_locked: "vault locked",
   self_improve_mr_cap_reached: "self-improve MR cap reached",
   open_mr_exists: "issue already has an open MR",
+  codex_override_conflict: "Codex harness cannot use an Anthropic credential override",
   schedules_paused: "all schedules paused",
+  no_usable_credential: "no usable credential for either harness",
 };
 
 export function scheduleSkipReasonLabel(reason: ScheduleSkipReason): string {

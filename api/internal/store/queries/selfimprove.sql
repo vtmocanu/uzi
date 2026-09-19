@@ -43,8 +43,10 @@
 -- mr_rework_enabled (PRD #908 M1): the schedule-driven fire path threads the schedule's
 -- per-schedule mr_rework override the same way (sqlc.narg('mr_rework_enabled'), nil =>
 -- inherit the owner default live at read time). The bespoke engine passes nil, freezing NULL.
--- harness (PRD #1332 M5A / D2) is the SQL literal 'claude', not a param: a self_improve run
--- is a Claude production origin, and the literal defeats the DEFAULT-masks-omission trap.
+-- harness (PRD #1429 M1, was #1332 M5A / D2) is now the @harness PARAMETER supplied by the M5B
+-- create seam (workersvc.createRunAtomic), not the SQL literal 'claude'. Self-improve uses
+-- implicit D11; M2 wires the real resolved value. Every current caller passes
+-- string(HarnessClaude) as a mechanical stopgap.
 INSERT INTO runs (
     user_id, repo_id, kind, issue_iid, issue_title, issue_description, auto_approve, wait_on_limit, model, override_subagent_model, mr_rework_enabled, required_capabilities, trigger_source, harness
 ) VALUES (
@@ -54,7 +56,7 @@ INSERT INTO runs (
     -- inherit the repo's capability hint like every other repo-bearing path — else with
     -- capability_aware ON a base worker claims it and fails mid-run. Inherit atomically via
     -- subquery reusing @repo_id, so no new Go struct field. Same expression CreateRun uses.
-    COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), 'self_improve', 'claude'
+    COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), 'self_improve', @harness
 )
 RETURNING *;
 

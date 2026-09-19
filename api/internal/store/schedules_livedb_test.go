@@ -362,6 +362,7 @@ func TestRunModelFrozenLiveDB(t *testing.T) {
 
 	// CreatePromptRun with a model → GetRunByID reads it back.
 	promptRun, err := q.CreatePromptRun(ctx, store.CreatePromptRunParams{
+		Harness:          "claude", // PRD #1429 M1: harness is now a required @harness param.
 		UserID:           userID,
 		RepoID:           repoID,
 		ScheduleID:       sched.ID,
@@ -397,6 +398,7 @@ func TestRunModelFrozenLiveDB(t *testing.T) {
 		t.Fatalf("create second schedule: %v", err)
 	}
 	nullRun, err := q.CreatePromptRun(ctx, store.CreatePromptRunParams{
+		Harness:          "claude", // PRD #1429 M1: harness is now a required @harness param.
 		UserID:           userID,
 		RepoID:           repoID,
 		ScheduleID:       sched2.ID,
@@ -417,6 +419,7 @@ func TestRunModelFrozenLiveDB(t *testing.T) {
 
 	// The shared engine insert (CreateRun) also freezes model → GetRunByID reads it back.
 	engineRun, err := q.CreateRun(ctx, store.CreateRunParams{
+		Harness:          "claude", // PRD #1429 M1: harness is now a required @harness param.
 		UserID:           userID,
 		RepoID:           repoID,
 		IssueIid:         pgtype.Int8{Int64: 4242, Valid: true},
@@ -541,6 +544,7 @@ func TestRunOverrideSubagentModelFrozenLiveDB(t *testing.T) {
 
 	// CreatePromptRun with the override on → GetRunByID reads it back.
 	promptRun, err := q.CreatePromptRun(ctx, store.CreatePromptRunParams{
+		Harness:               "claude", // PRD #1429 M1: harness is now a required @harness param.
 		UserID:                userID,
 		RepoID:                repoID,
 		ScheduleID:            sched.ID,
@@ -561,6 +565,7 @@ func TestRunOverrideSubagentModelFrozenLiveDB(t *testing.T) {
 
 	// The shared engine insert (CreateRun) also freezes the override → GetRunByID reads it back.
 	engineRun, err := q.CreateRun(ctx, store.CreateRunParams{
+		Harness:               "claude", // PRD #1429 M1: harness is now a required @harness param.
 		UserID:                userID,
 		RepoID:                repoID,
 		IssueIid:              pgtype.Int8{Int64: 4343, Valid: true},
@@ -600,6 +605,7 @@ func TestRunOverrideSubagentModelFrozenLiveDB(t *testing.T) {
 		t.Fatalf("create second schedule: %v", err)
 	}
 	defRun, err := q.CreatePromptRun(ctx, store.CreatePromptRunParams{
+		Harness:          "claude", // PRD #1429 M1: harness is now a required @harness param.
 		UserID:           userID,
 		RepoID:           repoID,
 		ScheduleID:       sched2.ID,

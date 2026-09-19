@@ -4,6 +4,7 @@
 // has no component test harness — see runStream.test.ts).
 
 import type { RunMessage, WsEvent } from "./api";
+import type { HarnessSelection } from "./harnessSelection";
 
 // StreamState is the client's view of a run's message log. `messages` are the
 // contiguously-rendered messages in ascending seq order; `lastSeq` is the highest
@@ -123,10 +124,21 @@ export function applyFrame(
 // prds/*.md file (the single `uzi` label is the eligibility gate, checked upstream by
 // whether the card is runnable at all). The worker/token/closed/active preconditions
 // stay.
+//
+// PRD #1429 M4a, D3 made the credential gate harness-aware: `hasToken` (Anthropic-only)
+// is replaced by `claudeUsable`/`codexUsable` (mirroring the server's D11 availability
+// rule — see lib/hasToken.ts's isCodexUsable) plus the `harness` this start will
+// actually use ("inherit" lets the server's D11 resolver pick, the common case for a
+// single-harness user whose picker is hidden). `hasCodexCredential` is used only to
+// pick harness-appropriate copy when NEITHER harness is usable.
 export interface StartRunPreconditions {
   closed: boolean;
   hasWorker: boolean;
-  hasToken: boolean;
+  claudeUsable: boolean;
+  codexUsable: boolean;
+  // Any Codex-kind secret exists at all (usable or not) — see hasAnyCodexCredential.
+  hasCodexCredential: boolean;
+  harness: HarnessSelection;
   activeRunExists: boolean;
 }
 
@@ -139,6 +151,14 @@ export interface StartRunGate {
 // single clearest reason. Order matters: the reason shown is the first unmet
 // precondition, cheapest-to-fix last so the user is nudged toward the real
 // blocker. Mirrors the server's own CreateRun rejections.
+//
+// The credential check is harness-aware (PRD #1429 D3): an EXPLICIT harness choice
+// checks only that harness's usability (a Codex-only user picking Codex is never told
+// to add an Anthropic token); "inherit" (the common single-harness path) checks that
+// AT LEAST ONE harness is usable, since the server's D11 resolver will pick whichever
+// is — and its copy stays the pre-M4a Anthropic wording unless the user has already
+// started down the Codex path (hasCodexCredential), keeping a Claude-only user's flow
+// byte-identical to today.
 export function startRunGate(p: StartRunPreconditions): StartRunGate {
   if (p.closed) {
     return { enabled: false, reason: "This issue is closed." };
@@ -146,8 +166,21 @@ export function startRunGate(p: StartRunPreconditions): StartRunGate {
   if (!p.hasWorker) {
     return { enabled: false, reason: "Connect a worker first (Settings → Workers)." };
   }
-  if (!p.hasToken) {
-    return { enabled: false, reason: "Add your Anthropic token first (Settings)." };
+  if (p.harness === "codex") {
+    if (!p.codexUsable) {
+      return { enabled: false, reason: "Add a usable Codex credential first (Settings)." };
+    }
+  } else if (p.harness === "claude") {
+    if (!p.claudeUsable) {
+      return { enabled: false, reason: "Add your Anthropic token first (Settings)." };
+    }
+  } else if (!p.claudeUsable && !p.codexUsable) {
+    return {
+      enabled: false,
+      reason: p.hasCodexCredential
+        ? "Finish setting up a usable credential first (Settings)."
+        : "Add your Anthropic token first (Settings).",
+    };
   }
   if (p.activeRunExists) {
     return { enabled: false, reason: "A run is already in progress for this issue." };

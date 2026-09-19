@@ -49,10 +49,11 @@ func toFixed(x float64, d int) string {
 }
 
 // Shared cost/token presentation layer for the TUI (PRD #650 M1). These are the
-// pure formatters — the callers (board and detail, in later milestones) own the
-// "—" (subscription $0) and blank (nil Usage) decisions, so the board and run
-// view can differ. Each formatter mirrors a web helper so the terminal and the
-// web UI read a figure the same way; the parity source is named on each.
+// pure formatters — the callers (board and detail) own the blank (nil Usage)
+// decision, so the board and run view can differ, and (as of PRD #1429 M5) the
+// cost_status branch via classifyCostStatus below — never a guessed "—"/subscription
+// derived from cost_usd == 0. Each formatter mirrors a web helper so the terminal and
+// the web UI read a figure the same way; the parity source is named on each.
 
 // fmtCostCents renders a USD cost the way web formatCost does
 // (web/src/lib/formatTokens.ts, formatCost): "$1.87". A cost of $1000 or more
@@ -196,5 +197,63 @@ func fmtCostBoard(usd float64) string {
 		return "$" + strconv.FormatInt(int64(usd/1e6), 10) + "M"
 	default:
 		return "$" + strconv.FormatInt(int64(usd/1e9), 10) + "G"
+	}
+}
+
+// ── cost_status-aware rendering (PRD #1429 M5, D7) ─────────────────────────────────
+//
+// Every reader above this point (fmtCostCents/fmtCostWhole/fmtCostBoard) takes a raw
+// USD float with NO branch on cost_status — the bug this section retires: a
+// subscription run (billed on a plan, no per-token metering) and an unreported run
+// (metering genuinely unknown) both priced their cost_usd at 0 and rendered
+// identically to a real metered $0. costStatusKind + classifyCostStatus give every
+// TUI/CLI caller ONE fold to switch on, mirroring web costStatus.ts's costDisplay
+// exactly, so the terminal and the browser read a run's cost the same honest way.
+
+// costStatusKind narrows a per-run cost_status to the three cases every cost renderer
+// must branch on: metered (a real dollar figure — even an exact $0 is a genuine
+// reading, e.g. a tiny or cache-only call), subscription (billed via a subscription,
+// never rendered as a dollar figure), and unavailable (unreported, the pre-M1 empty
+// string, or any value this build has not heard of). cost_status is a closed wire
+// enum a NEWER server can extend without this build knowing (RunDTO.Harness carries
+// the identical forward-compat contract), so anything other than the two known
+// non-unavailable values folds SAFELY to unavailable rather than guessing metered.
+type costStatusKind int
+
+const (
+	costStatusMetered costStatusKind = iota
+	costStatusSubscription
+	costStatusUnavailable
+)
+
+// classifyCostStatus folds a raw cost_status wire string into the three-way kind every
+// renderer below switches on.
+func classifyCostStatus(status string) costStatusKind {
+	switch status {
+	case "metered":
+		return costStatusMetered
+	case "subscription":
+		return costStatusSubscription
+	default:
+		return costStatusUnavailable
+	}
+}
+
+// costDetailCell renders the `uzi run get` COST row (PRD #1429 M5): the spacious,
+// single-row form — a real dollar figure for "metered" (via fmtCostCents, the same
+// cents-precision formatter the TUI SPEND block uses), the word "subscription" for
+// "subscription" (never a dollar figure, never $0), and "cost unavailable" with the
+// run's total token count for anything else ("unreported", the pre-M1 empty string,
+// or a future status this build has not heard of) — mirroring web costSubLabel's
+// "tokens only · cost unavailable" phrasing.
+func costDetailCell(u apitypes.UsageDTO) string {
+	switch classifyCostStatus(u.CostStatus) {
+	case costStatusMetered:
+		return fmtCostCents(u.CostUSD)
+	case costStatusSubscription:
+		return "subscription"
+	default:
+		total := u.InputTokens + u.CacheReadTokens + u.CacheCreationTokens + u.OutputTokens
+		return fmtTokens(total) + " tokens · cost unavailable"
 	}
 }

@@ -11,6 +11,7 @@
 import { api, ApiError, isOpenMRConflict, openMRConflictMRIID } from "./api";
 import { errorMessage } from "./apiError";
 import { type CredentialSelection, runCredentialBody } from "./credentialOverride";
+import { type HarnessSelection, runHarnessBody } from "./harnessSelection";
 
 export interface StartRunHandlers {
   // Navigate to the created run (each site encodeURIComponent-guards the id itself).
@@ -24,25 +25,34 @@ export interface StartRunHandlers {
 }
 
 // startRunWithCredential creates a run for (repoId, issueIid) carrying the chosen
-// credential override, and — on an open-MR conflict (issue #856) — confirms the
-// overwrite and retries with force AND the same override. inherit sends no override
-// (runCredentialBody returns undefined), so an inherit start is byte-identical to the
-// pre-#1247 body and the run follows the worker binding.
+// credential override AND harness selection (PRD #1429 M4a), and — on an open-MR
+// conflict (issue #856) — confirms the overwrite and retries with force AND the same
+// override/harness. inherit sends neither field (runCredentialBody/runHarnessBody both
+// return undefined for their inherit state), so an untouched start is byte-identical to
+// the pre-#1247/pre-M4a body and the run follows the worker binding / the server's D11
+// resolver. `harness` defaults to "inherit" so every existing caller (before the harness
+// picker existed) needs no change.
 export async function startRunWithCredential(
   repoId: string,
   issueIid: number,
   selection: CredentialSelection,
   handlers: StartRunHandlers,
+  harness: HarnessSelection = "inherit",
 ): Promise<void> {
   const override = runCredentialBody(selection);
+  const harnessChoice = runHarnessBody(harness);
   const createAndOpen = async (force?: boolean) => {
-    // `override` is captured here, so the force-retry below re-sends it unchanged. For an
-    // inherit choice (override undefined) call the 3-arg form, so an inherit start is
-    // byte-identical to the pre-#1247 call (and the wire body omits the field either way).
+    // `override`/`harnessChoice` are captured here, so the force-retry below re-sends
+    // them unchanged. Each inherit choice (undefined) drops its own trailing argument
+    // rather than passing an explicit `undefined`, so a start that touches neither
+    // control is byte-identical to the pre-#1247/pre-M4a call (both the wire body AND
+    // the call arity, which existing tests pin exactly).
     const { run } =
-      override === undefined
-        ? await api.createRun(repoId, issueIid, force)
-        : await api.createRun(repoId, issueIid, force, override);
+      harnessChoice === undefined
+        ? override === undefined
+          ? await api.createRun(repoId, issueIid, force)
+          : await api.createRun(repoId, issueIid, force, override)
+        : await api.createRun(repoId, issueIid, force, override, harnessChoice);
     handlers.onCreated(run.id);
   };
   try {

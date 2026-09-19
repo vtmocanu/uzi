@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -363,6 +364,20 @@ func TestOnlyEnabled(t *testing.T) {
 	// bare pause/resume would be forced down the full config path (PRD #1247 M6).
 	if !onlyEnabled(apitypes.ScheduleRequest{Enabled: &yes, CredentialOverride: apitypes.OptionalCredentialOverride{Present: false}}) {
 		t.Fatalf("enabled + an omitted credential_override should still be onlyEnabled")
+	}
+	// enabled + a PRESENT harness (PRD #1429 M4a) is a config PATCH, not enabled-only: it
+	// must NOT short-circuit, or the pin would be silently dropped, mirroring
+	// credential_override above. A PRESENT wrapper — even one carrying an explicit
+	// clear/null — trips the presence conjunct.
+	codex := "codex"
+	if onlyEnabled(apitypes.ScheduleRequest{Enabled: &yes, Harness: apitypes.OptionalHarness{Present: true, Value: &codex}}) {
+		t.Fatalf("enabled + harness is NOT onlyEnabled (else the pin is dropped)")
+	}
+	// enabled + an OMITTED harness (Present:false, the zero-value wrapper) is STILL
+	// enabled-only: the presence conjunct must not over-trip on the zero value, or a bare
+	// pause/resume would be forced down the full config path (PRD #1429 M4a).
+	if !onlyEnabled(apitypes.ScheduleRequest{Enabled: &yes, Harness: apitypes.OptionalHarness{Present: false}}) {
+		t.Fatalf("enabled + an omitted harness should still be onlyEnabled")
 	}
 	if onlyEnabled(apitypes.ScheduleRequest{}) {
 		t.Fatalf("a patch with no enabled is not onlyEnabled")
@@ -774,5 +789,81 @@ func TestScheduleEffectiveHarnessExplicit(t *testing.T) {
 				t.Fatalf("scheduleEffectiveHarness = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestResolveScheduleHarness pins the presence-aware harness pin (PRD #1429 M4a, Part A),
+// mirroring the #1247 resolveScheduleCredentialOverride presence tests: omitted keeps the
+// stored pin untouched, an explicit null clears it, a valid enum resolves the column, and an
+// invalid enum is a 400 that writes no column. resolveScheduleHarness never touches h.q, so a
+// zero-value *Handler suffices.
+func TestResolveScheduleHarness(t *testing.T) {
+	t.Run("omitted keeps", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		cols, ok := (&Handler{}).resolveScheduleHarness(rec, apitypes.ScheduleRequest{})
+		if !ok {
+			t.Fatalf("resolveScheduleHarness ok=false, want true")
+		}
+		if !cols.keep {
+			t.Fatalf("omitted harness: keep=false, want true (seed-and-keep)")
+		}
+		if rec.Code != 0 && rec.Code != http.StatusOK {
+			t.Fatalf("omitted harness must write no response, got status %d", rec.Code)
+		}
+	})
+	t.Run("explicit null clears", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		cols, ok := (&Handler{}).resolveScheduleHarness(rec, apitypes.ScheduleRequest{Harness: apitypes.OptionalHarness{Present: true, Value: nil}})
+		if !ok {
+			t.Fatalf("resolveScheduleHarness ok=false, want true")
+		}
+		if cols.keep {
+			t.Fatalf("explicit null: keep=true, want false (must write NULL)")
+		}
+		if cols.value.Valid {
+			t.Fatalf("explicit null: value=%+v, want invalid/NULL", cols.value)
+		}
+	})
+	for _, h := range []string{"claude", "codex"} {
+		t.Run("valid "+h, func(t *testing.T) {
+			v := h
+			rec := httptest.NewRecorder()
+			cols, ok := (&Handler{}).resolveScheduleHarness(rec, apitypes.ScheduleRequest{Harness: apitypes.OptionalHarness{Present: true, Value: &v}})
+			if !ok {
+				t.Fatalf("resolveScheduleHarness(%q) ok=false, want true", h)
+			}
+			if cols.keep || !cols.value.Valid || cols.value.String != h {
+				t.Fatalf("resolveScheduleHarness(%q) cols=%+v, want value=%q", h, cols, h)
+			}
+		})
+	}
+	t.Run("invalid enum is 400", func(t *testing.T) {
+		v := "gpt"
+		rec := httptest.NewRecorder()
+		_, ok := (&Handler{}).resolveScheduleHarness(rec, apitypes.ScheduleRequest{Harness: apitypes.OptionalHarness{Present: true, Value: &v}})
+		if ok {
+			t.Fatalf("resolveScheduleHarness(%q) ok=true, want false (400)", v)
+		}
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("resolveScheduleHarness(%q) status=%d, want 400", v, rec.Code)
+		}
+	})
+}
+
+// TestScheduleWithHarness pins the composition helper that lets a same-request
+// harness+credential_override edit see the POST-edit harness rather than the stale row
+// (PRD #1429 M4a): keep=true must return the row unchanged; a resolved value/NULL overwrites
+// Harness.
+func TestScheduleWithHarness(t *testing.T) {
+	base := store.RunSchedule{Harness: pgtype.Text{String: "claude", Valid: true}}
+	if got := scheduleWithHarness(base, scheduleHarnessColumns{keep: true}); got.Harness != base.Harness {
+		t.Fatalf("keep=true changed Harness: got %+v, want unchanged %+v", got.Harness, base.Harness)
+	}
+	codexCol := pgtype.Text{String: "codex", Valid: true}
+	if got := scheduleWithHarness(base, scheduleHarnessColumns{value: codexCol}); got.Harness != codexCol {
+		t.Fatalf("scheduleWithHarness value=codex: got %+v, want %+v", got.Harness, codexCol)
+	}
+	if got := scheduleWithHarness(base, scheduleHarnessColumns{value: pgtype.Text{}}); got.Harness.Valid {
+		t.Fatalf("scheduleWithHarness explicit clear: got %+v, want invalid/NULL", got.Harness)
 	}
 }

@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 import type { SelfUsage, AdminUsage, RunUsage, RunOutcomes } from "../lib/api";
 import { formatTokens, formatCost } from "../lib/formatTokens";
 import { failOriginLabel } from "../lib/failOriginLabel";
+import { aggregateDisclosure, type AggregateDisclosure } from "../lib/costStatus";
 import { useDemoMode } from "../lib/demoMode";
 import { maskEmail } from "../lib/demoMask";
 import { Card, SectionTitle } from "./ui";
@@ -46,9 +47,13 @@ function tokenShares(totals: number[], factoryTotal: number): number[] {
   return shares;
 }
 
-// Decision 8: a $0 cost (subscription auth) with nonzero tokens renders "—", never a
-// misleading "$0.00".
-const money = (usd: number): string => (usd > 0 ? formatCost(usd) : "—");
+// PRD #1429 M4b (D7) superseded PRD #40 Decision 8's "$0 renders '—'" heuristic: an
+// aggregate's cost_usd is the METERED SUBSET's real dollar sum (a subscription or
+// unreported run contributes $0 to that stored numeric by construction), so it is
+// shown here as a genuine figure via formatCost — never hidden behind "—" — and any
+// non-metered runs folded into the window are disclosed by count instead, via
+// `aggregateDisclosure` below. Showing the dollar figure ALONE, with no signal that
+// it excludes some runs, would be the aggregate shape of the same false-zero bug.
 
 // PRD #1293 D6: the failed-run rate as failed / finished, one decimal, "—" when the scope
 // has no finished runs (never a fabricated 0%). One helper for both cards' windows and the
@@ -73,14 +78,23 @@ function BigNum({ tokens }: { tokens: number }) {
   );
 }
 
-function Subrow({ usage }: { usage: RunUsage }) {
+// `disclosure` names the subscription/unreported runs folded into this window whose
+// dollar contribution is NOT in `usage.cost_usd` (PRD #1429 D7) — optional so a
+// per-user table row (which renders its own compact disclosure, see PerUserUsageTable)
+// can reuse `breakdown`'s cost figure without duplicating this line.
+function Subrow({ usage, disclosure }: { usage: RunUsage; disclosure?: AggregateDisclosure }) {
   const b = breakdown(usage);
   return (
-    <div className="mt-2 flex flex-wrap gap-x-3.5 gap-y-1.5 text-xs text-muted">
-      <span>in <span className="tabular-nums text-fg">{formatTokens(b.fresh)}</span></span>
-      <span>cached <span className="tabular-nums text-fg">{formatTokens(b.cached)}</span></span>
-      <span>out <span className="tabular-nums text-fg">{formatTokens(b.out)}</span></span>
-      <span>cost <span className="tabular-nums text-brand">{money(b.cost)}</span></span>
+    <div className="mt-2">
+      <div className="flex flex-wrap gap-x-3.5 gap-y-1.5 text-xs text-muted">
+        <span>in <span className="tabular-nums text-fg">{formatTokens(b.fresh)}</span></span>
+        <span>cached <span className="tabular-nums text-fg">{formatTokens(b.cached)}</span></span>
+        <span>out <span className="tabular-nums text-fg">{formatTokens(b.out)}</span></span>
+        <span>cost <span className="tabular-nums text-brand">{formatCost(b.cost)}</span></span>
+      </div>
+      {/* Byte-identical to nothing when the window is fully metered (disclosure.text
+          is "" then) — no disclosure noise on the common case. */}
+      {disclosure?.incomplete && <p className="mt-1 text-[11px] text-faint">{disclosure.text}</p>}
     </div>
   );
 }
@@ -177,6 +191,8 @@ function FailedRunsBlock({ lifetime, last7 }: { lifetime: RunOutcomes; last7: Ru
 export function YourUsageCard({ usage }: { usage: SelfUsage }) {
   const life = breakdown(usage.lifetime);
   const last7 = breakdown(usage.last_7_days);
+  const lifeDisclosure = aggregateDisclosure(usage.lifetime_subscription_run_count, usage.lifetime_unreported_run_count);
+  const last7Disclosure = aggregateDisclosure(usage.last7_subscription_run_count, usage.last7_unreported_run_count);
   return (
     <Card>
       <SectionTitle>Your usage</SectionTitle>
@@ -185,11 +201,12 @@ export function YourUsageCard({ usage }: { usage: SelfUsage }) {
       ) : (
         <>
           <BigNum tokens={life.total} />
-          <Subrow usage={usage.lifetime} />
+          <Subrow usage={usage.lifetime} disclosure={lifeDisclosure} />
           <p className="mt-2.5 text-[11px] text-faint">
             Across <span className="tabular-nums text-muted">{usage.run_count}</span> run{usage.run_count === 1 ? "" : "s"}, all
             time · <span className="tabular-nums text-muted">{formatTokens(last7.total)}</span> tok /{" "}
-            <span className="tabular-nums text-muted">{money(last7.cost)}</span> in the last 7 days ·{" "}
+            <span className="tabular-nums text-muted">{formatCost(last7.cost)}</span> in the last 7 days
+            {last7Disclosure.incomplete && <> ({last7Disclosure.text})</>} ·{" "}
             <Link to="/runs" className="text-info hover:underline whitespace-nowrap">
               see per-run detail{"\u00A0"}→
             </Link>
@@ -203,6 +220,10 @@ export function YourUsageCard({ usage }: { usage: SelfUsage }) {
 
 export function FactoryTotalCard({ admin }: { admin: AdminUsage }) {
   const f = breakdown(admin.factory.lifetime);
+  const disclosure = aggregateDisclosure(
+    admin.factory.lifetime_subscription_run_count,
+    admin.factory.lifetime_unreported_run_count,
+  );
   return (
     <Card>
       <SectionTitle>Factory total · all users · admin</SectionTitle>
@@ -211,7 +232,7 @@ export function FactoryTotalCard({ admin }: { admin: AdminUsage }) {
       ) : (
         <>
           <BigNum tokens={f.total} />
-          <Subrow usage={admin.factory.lifetime} />
+          <Subrow usage={admin.factory.lifetime} disclosure={disclosure} />
           <p className="mt-2.5 text-[11px] text-faint">
             <span className="tabular-nums text-muted">{admin.factory.run_count}</span> runs by{" "}
             <span className="tabular-nums text-muted">{admin.users.length}</span> user{admin.users.length === 1 ? "" : "s"}
@@ -266,6 +287,12 @@ export function PerUserUsageTable({ admin }: { admin: AdminUsage }) {
   const factory = breakdown(admin.factory.lifetime);
   const rows = admin.users.map((u) => ({ ...u, b: breakdown(u.usage) }));
   const shares = tokenShares(rows.map((r) => r.b.total), factory.total);
+  // The total row sums the per-user rows by construction, so its disclosure sums their
+  // counts too — reusing admin.factory's own counts rather than re-summing the rows.
+  const factoryDisclosure = aggregateDisclosure(
+    admin.factory.lifetime_subscription_run_count,
+    admin.factory.lifetime_unreported_run_count,
+  );
   return (
     <Card>
       <SectionTitle>Per-user breakdown · admin</SectionTitle>
@@ -291,6 +318,10 @@ export function PerUserUsageTable({ admin }: { admin: AdminUsage }) {
                 // Share is by total tokens (not cost) — matches the mock's percentages.
                 // Largest-remainder rounding (see tokenShares) so the column sums to 100%.
                 const pct = shares[i];
+                // PRD #1429 D7: this user's lifetime cost_usd is their metered subset —
+                // disclose their own subscription/unreported counts beside it rather than
+                // let the dollar figure read as their complete total.
+                const rowDisclosure = aggregateDisclosure(u.subscription_run_count, u.unreported_run_count);
                 return (
                   <tr key={u.user_id}>
                     <Td left>{maskEmail(u.email, demo)}</Td>
@@ -301,7 +332,12 @@ export function PerUserUsageTable({ admin }: { admin: AdminUsage }) {
                     </Td>
                     <Td>{formatTokens(u.b.total)}</Td>
                     <Td>{formatTokens(u.b.out)}</Td>
-                    <Td cost>{money(u.b.cost)}</Td>
+                    <Td cost>
+                      {formatCost(u.b.cost)}
+                      {rowDisclosure.incomplete && (
+                        <div className="whitespace-nowrap text-[9px] font-normal text-faint">{rowDisclosure.text}</div>
+                      )}
+                    </Td>
                     <Td>
                       <span className="inline-flex items-center justify-end gap-2 whitespace-nowrap">
                         {pct}%
@@ -329,7 +365,12 @@ export function PerUserUsageTable({ admin }: { admin: AdminUsage }) {
                 </Td>
                 <Td total>{formatTokens(factory.total)}</Td>
                 <Td total>{formatTokens(factory.out)}</Td>
-                <Td total cost>{money(factory.cost)}</Td>
+                <Td total cost>
+                  {formatCost(factory.cost)}
+                  {factoryDisclosure.incomplete && (
+                    <div className="whitespace-nowrap text-[9px] font-normal text-faint">{factoryDisclosure.text}</div>
+                  )}
+                </Td>
                 <Td total> </Td>
               </tr>
             </tbody>

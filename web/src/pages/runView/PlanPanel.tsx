@@ -200,12 +200,15 @@ export function PlanPanel({
   // sends nothing (a no-op that PRESERVES the create-time override). The credential call
   // stays HERE (not folded into onApprove's args) so the existing onApprove contract — and
   // its tests — are untouched.
+  // Fix 2 (M4a review): a Codex run (D5) has no Anthropic token to seed/set — gate the
+  // seed-and-fetch on the run's ACTUAL harness alongside canSteer, not canSteer alone.
+  const gateTokenPickerVisible = canSteer && run.harness !== "codex";
   const {
     selection: credential,
     onSelectionChange: onCredentialChange,
     tokens: credentialTokens,
     touched: credentialTouched,
-  } = useSeededCredential(run.credential_override, { enabled: canSteer });
+  } = useSeededCredential(run.credential_override, { enabled: gateTokenPickerVisible });
   const [credentialError, setCredentialError] = useState("");
   // A synchronous in-flight guard for the approve sequence. doApprove awaits
   // api.setRunCredential BEFORE onApprove, and RunView's `busy` only rises once
@@ -379,8 +382,9 @@ export function PlanPanel({
             Choose the Anthropic token the implementation phase runs on. Seeded from the
             run's stored override so it shows the CURRENT choice (a pinned label→id resolved
             once the list loads); a run with no override seeds to inherit. Owner-gated like
-            the AgentPicker. */}
-        {canSteer && (
+            the AgentPicker, and (Fix 2, M4a review) hidden for a Codex run — a Codex run has
+            no Anthropic token to choose; the control would be noise and using it would 422. */}
+        {gateTokenPickerVisible && (
           <Field label="Anthropic token" htmlFor="plan-gate-token">
             <TokenPicker
               id="plan-gate-token"

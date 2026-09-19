@@ -113,7 +113,7 @@ type codexLoginBlob struct {
 
 // CodexReconciler establishes a freshly imported Codex login's canonical identity
 // and binds its per-alias state row to the authoritative provider account (PRD
-// #1147 M1, ships DARK).
+// #1147 M1, activated for public Codex runs by PRD #1429).
 //
 // It is identity-first with NO pre-identity rotation: it opens the alias's stored
 // login, reads its identity with a single nonrotating call, and reconciles by the

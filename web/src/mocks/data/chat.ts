@@ -23,6 +23,7 @@ function chatRun(over: Partial<Run> & { id: string; title: string; status: Run["
     issue_iid: null,
     issue_title: title, // conversation title fallback (useRunStream reads the run)
     issue_description: "",
+    harness: "claude", // PRD #1429 M1: runs.harness is now on RunDTO (NOT NULL, default claude).
     title, // the runDTO's chat title
     resume_of_run_id: null,
     requeue_count: 0,

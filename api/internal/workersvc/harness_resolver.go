@@ -12,13 +12,10 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// harness_resolver.go is the PRD #1332 (M5A / D4) dark harness-routing contract: a
+// harness_resolver.go is the PRD #1332 (M5A / D4) harness-routing contract: a
 // pure D11 resolver plus the store-backed availability/credential-selection layer that
-// feeds it. It ships DARK. NOTHING in this file is reachable from a production
-// run-creation origin in M5A — no run-create, chat start_run, schedule fire or any
-// other run kind calls it. It is additive for M5B to consume, at which point M5B owns
-// the wiring and the error mapping (D4). Everything here is exercised only by unit and
-// live-store fixtures in this milestone.
+// feeds it. PRD #1429 routes production run creation through this resolver, including
+// manual, chat, schedule, autopilot, self-improve, CI-fix and derived-run origins.
 
 // Harness is a run's execution harness. The two values are the runs.harness /
 // run_usage.harness CHECK vocabulary; they are BUILT from the unexported string
@@ -174,11 +171,11 @@ func (s *Service) harnessStore() (harnessResolverStore, bool) {
 
 // resolveRunHarness gathers the D11 availability/preference facts from the C1-frozen read
 // queries, runs the pure resolveHarness, and — when the result is Codex — carries the
-// selected Codex credential (PRD #1332 D4). It ships DARK: no production run-creation path
-// calls it in M5A.
+// selected Codex credential (PRD #1332 D4). Production creation calls it through the
+// atomic create seam, so the resolved harness is the one persisted and frozen.
 //
-// explicit is the caller's outright harness choice (M5B's request field), nil for "let the
-// resolver decide". In M5A it is only ever set by tests.
+// explicit is the caller's outright or inherited harness choice, nil for "let the resolver
+// decide". Public request pins and derived-run inheritance both use the explicit path.
 //
 // Codex credential selection follows M1's named-default and auth-mode rules
 // (resolveUsableCodexCredential): the user's single default codex credential decides both
@@ -191,7 +188,17 @@ func (s *Service) resolveRunHarness(ctx context.Context, userID uuid.UUID, expli
 	if !ok {
 		return resolvedHarness{}, errHarnessStoreUnavailable
 	}
+	return s.resolveRunHarnessQ(ctx, userID, explicit, q)
+}
 
+// resolveRunHarnessQ is resolveRunHarness against an EXPLICIT query surface rather than the
+// ambient s.q (PRD #1429 M1, D1). The atomic create seam (createRunAtomic) passes a
+// transaction-bound *store.Queries (WithTx) so the credential/default facts D11 decides over
+// are re-read INSIDE the same transaction that commits the run and freezes a Codex binding —
+// closing the window where a credential deletion between a pre-tx read and the commit could
+// leave a Codex row bound to a vanished credential. *store.Queries satisfies harnessResolverStore,
+// so a qtx derived via WithTx is a valid q here. resolveRunHarness is the ambient-q wrapper.
+func (s *Service) resolveRunHarnessQ(ctx context.Context, userID uuid.UUID, explicit *Harness, q harnessResolverStore) (resolvedHarness, error) {
 	// Claude usability is exactly "does the user hold an Anthropic token", the same
 	// door-check GET /api/me/rate-limits derives no_token from.
 	claudeUsable, err := q.UserHasAnthropicToken(ctx, userID)
@@ -334,6 +341,98 @@ func (s *Service) resolveUsableCodexCredential(ctx context.Context, userID uuid.
 	// inconsistent state the force-default invariant forbids. Treat it as not usable
 	// (the safe direction: there is no default to select).
 	return codexCredentialChoice{}, false, nil
+}
+
+// errCodexCreateRequiresTx is the FAIL-CLOSED refusal when a run resolves to Codex but no
+// transaction beginner is wired (PRD #1429 M1, D1): a Codex run's binding freeze MUST commit
+// atomically with the run INSERT, so with no transaction there is no safe path — creation
+// refuses rather than inserting a Codex row non-atomically (which could leave an unbound Codex
+// row on a subsequent freeze failure). A Claude resolution never reaches this: it keeps the
+// existing cheap non-tx insert.
+var errCodexCreateRequiresTx = errors.New("codex run creation requires an atomic transaction (no tx beginner wired)")
+
+// createRunAtomic is the M5B atomic create seam (PRD #1429 M1, D1). It resolves the run's
+// harness via D11 and runs a caller-supplied, INSERT-shape-agnostic run INSERT, and — when the
+// resolved harness is Codex — freezes the run's Codex binding, ALL in ONE database transaction.
+// So runtime / judge / task / mr_rework / prompt / self-improve / ci-fix INSERT shapes all use
+// this one helper: each passes an insert closure that builds its own CreateXRunParams.
+//
+// The insert closure receives the transaction-bound *store.Queries AND the resolved harness, so
+// it stamps runs.harness with the D11 result and (M2/M3) can validate a #1247 credential
+// override against that EXACT harness inside the same tx via ResolveCredentialOverride(...,
+// string(resolved.Harness), ...) — D5's "resolved-once-inside-the-tx", not a pre-transaction
+// guess. (M1 builds and proves the seam; M2/M3 wire the production origins onto it.)
+//
+// Ordering (D1): begin tx → derive qtx via WithTx → resolve D11 through qtx (re-reading the
+// credential/default facts inside the tx that commits) → insert(qtx, resolved) → when codex,
+// freeze through the SAME qtx → commit. Any error rolls the whole transaction back, so a Codex
+// freeze failure leaves NO runs row.
+//
+// A nil txBeginner is FAIL CLOSED for Codex (errCodexCreateRequiresTx): the binding freeze must
+// commit atomically with the run, so with no transaction there is no safe insert — it never
+// falls back to a non-atomic Codex insert. A Claude resolution with a nil txBeginner keeps the
+// existing cheap non-tx path (no freeze is needed).
+func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explicit *Harness, insert func(q *store.Queries, resolved resolvedHarness) (store.Run, error)) (store.Run, resolvedHarness, error) {
+	if s.txBeginner == nil {
+		// No transaction available. Resolve via the ambient queries to learn the harness:
+		// Codex fails closed (it needs the atomic freeze); Claude keeps the cheap path.
+		res, err := s.resolveRunHarness(ctx, userID, explicit)
+		if err != nil {
+			return store.Run{}, resolvedHarness{}, err
+		}
+		if res.Harness == HarnessCodex {
+			return store.Run{}, resolvedHarness{}, errCodexCreateRequiresTx
+		}
+		q, ok := s.q.(*store.Queries)
+		if !ok {
+			return store.Run{}, resolvedHarness{}, errHarnessStoreUnavailable
+		}
+		run, err := insert(q, res)
+		if err != nil {
+			return store.Run{}, resolvedHarness{}, err
+		}
+		return run, res, nil
+	}
+
+	tx, err := s.txBeginner.Begin(ctx)
+	if err != nil {
+		return store.Run{}, resolvedHarness{}, err
+	}
+	// A no-op after a successful Commit; on any early return it rolls back the run INSERT and
+	// any Codex freeze, so a create that does not fully succeed commits nothing.
+	defer func() { _ = tx.Rollback(ctx) }()
+	qtx := store.New(tx)
+
+	// Re-read the credential/default facts and resolve D11 INSIDE the transaction that commits.
+	res, err := s.resolveRunHarnessQ(ctx, userID, explicit, qtx)
+	if err != nil {
+		return store.Run{}, resolvedHarness{}, err
+	}
+
+	run, err := insert(qtx, res)
+	if err != nil {
+		return store.Run{}, resolvedHarness{}, err
+	}
+
+	if res.Harness == HarnessCodex {
+		// resolveRunHarness returns Codex only with a populated choice; guard defensively so a
+		// disagreement never freezes a Codex run with no credential.
+		if res.Codex == nil {
+			return store.Run{}, resolvedHarness{}, errNoUsableCredential
+		}
+		freeze := s.freezeCodexBinding
+		if s.codexFreezeFn != nil {
+			freeze = s.codexFreezeFn
+		}
+		if ferr := freeze(ctx, qtx, userID, run.ID, res.Codex.SecretID, res.Codex.AuthMode); ferr != nil {
+			return store.Run{}, resolvedHarness{}, ferr
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return store.Run{}, resolvedHarness{}, err
+	}
+	return run, res, nil
 }
 
 // codexDefaultMeta resolves the user's default secret of one codex kind to its (id,

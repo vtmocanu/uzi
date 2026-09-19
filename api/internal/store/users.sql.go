@@ -441,7 +441,7 @@ func (q *Queries) GetUserSchedulePause(ctx context.Context, id uuid.UUID) (GetUs
 }
 
 const getUserSettings = `-- name: GetUserSettings :one
-SELECT default_model, default_effort, judge_model, summary_model, theme, sidebar_token_ids, mr_rework_enabled, appearance_mode, light_theme, dark_theme, typeface FROM users WHERE id = $1
+SELECT default_model, default_effort, judge_model, summary_model, theme, sidebar_token_ids, mr_rework_enabled, appearance_mode, light_theme, dark_theme, typeface, default_harness FROM users WHERE id = $1
 `
 
 type GetUserSettingsRow struct {
@@ -456,6 +456,7 @@ type GetUserSettingsRow struct {
 	LightTheme      pgtype.Text `json:"light_theme"`
 	DarkTheme       pgtype.Text `json:"dark_theme"`
 	Typeface        pgtype.Text `json:"typeface"`
+	DefaultHarness  pgtype.Text `json:"default_harness"`
 }
 
 // The current user's own (non-secret) settings surface: default worker model
@@ -469,6 +470,8 @@ type GetUserSettingsRow struct {
 // (PRD #700 M5) rides it too; NULL there means the default-ON per-user opt-in.
 // The four appearance columns (PRD #1167 M1) ride this read as well; each NULL means
 // "inherit the instance default", resolved by theme.ResolveAppearance at read time.
+// default_harness (PRD #1429 M1 / D3) rides it too; NULL means "no preference" (implicit
+// creation falls through D11), and the settings surface exposes it as nullable claude|codex.
 func (q *Queries) GetUserSettings(ctx context.Context, id uuid.UUID) (GetUserSettingsRow, error) {
 	row := q.db.QueryRow(ctx, getUserSettings, id)
 	var i GetUserSettingsRow
@@ -484,6 +487,7 @@ func (q *Queries) GetUserSettings(ctx context.Context, id uuid.UUID) (GetUserSet
 		&i.LightTheme,
 		&i.DarkTheme,
 		&i.Typeface,
+		&i.DefaultHarness,
 	)
 	return i, err
 }
@@ -1015,6 +1019,29 @@ func (q *Queries) SetUserDefaultEffort(ctx context.Context, arg SetUserDefaultEf
 	var default_effort pgtype.Text
 	err := row.Scan(&default_effort)
 	return default_effort, err
+}
+
+const setUserDefaultHarness = `-- name: SetUserDefaultHarness :one
+UPDATE users SET default_harness = $1 WHERE id = $2
+RETURNING default_harness
+`
+
+type SetUserDefaultHarnessParams struct {
+	DefaultHarness pgtype.Text `json:"default_harness"`
+	ID             uuid.UUID   `json:"id"`
+}
+
+// Sets (or clears, when @default_harness is NULL) the current user's per-user default
+// harness (PRD #1429 M1 / D3). NULL = no preference (implicit creation falls through D11).
+// Own-user only; the caller passes the session user's id. Mirrors SetUserDefaultModel; the
+// users_default_harness_check CHECK (00226) closes the value to claude|codex, so the handler
+// validates the enum before this write. It gains a static caller in PUT /api/me/settings,
+// which is what satisfies deadcode:api.
+func (q *Queries) SetUserDefaultHarness(ctx context.Context, arg SetUserDefaultHarnessParams) (pgtype.Text, error) {
+	row := q.db.QueryRow(ctx, setUserDefaultHarness, arg.DefaultHarness, arg.ID)
+	var default_harness pgtype.Text
+	err := row.Scan(&default_harness)
+	return default_harness, err
 }
 
 const setUserDefaultModel = `-- name: SetUserDefaultModel :one

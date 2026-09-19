@@ -125,6 +125,10 @@ export interface UserSettings {
    *  the user opted this account out, so the watcher stops auto-reworking their MRs.
    *  The admin global kill-switch is separate. */
   mr_rework_enabled?: boolean | null;
+  /** Per-user default harness (PRD #1429 M1 / D3); null = "no preference", so implicit run
+   *  creation falls through the D11 resolver. One of claude|codex when set; the web Run
+   *  Defaults page writes it. */
+  default_harness: Harness | null;
 }
 
 // UserSettingsPatch is the PATCH-like body of PUT /me/settings: a field present
@@ -152,6 +156,9 @@ export interface UserSettingsPatch {
   /** Per-user MR-review-watcher opt-in (PRD #700 M6); present-false opts out,
    *  present-true (or null clearing back to the default-ON) re-enables. */
   mr_rework_enabled?: boolean | null;
+  /** Per-user default harness (PRD #1429 M1 / D3); present-value sets the pin (claude|codex),
+   *  present-null clears back to "no preference", absent leaves it unchanged. */
+  default_harness?: Harness | null;
 }
 
 // AgentTemplateScope mirrors the skill scopes (PRD #18 M6): builtin (shipped),
@@ -1380,7 +1387,9 @@ export type ScheduleSkipReason =
   | "vault_locked"
   | "self_improve_mr_cap_reached"
   | "open_mr_exists"
-  | "schedules_paused";
+  | "codex_override_conflict"
+  | "schedules_paused"
+  | "no_usable_credential";
 
 // One run a persisted fire actually created; issue_iid is null for a prompt schedule.
 export interface LastFireStarted {
@@ -1455,6 +1464,11 @@ export interface Schedule {
    *  itself. Twin of Run.credential_override; null for every schedule until M6 wires it.
    *  OPTIONAL for the same api/web rollout skew as Run.credential_override. */
   credential_override?: CredentialOverride | null;
+  /** PRD #1429 M4a (D2): the schedule's stored harness pin. null = implicit — the fired
+   *  run resolves through D11 at fire time (the schedule fire path already honors this) —
+   *  a value ("claude"|"codex") is an explicit pin frozen onto every fired run, never
+   *  falling back to the other harness. The schedule-side twin of Run.harness. */
+  harness?: Harness | null;
   auto_approve: boolean;
   wait_on_limit: boolean;
   /** PRD #841: per-schedule MR-review-rework override, tri-state. null = inherit (the
@@ -1634,6 +1648,12 @@ export interface ScheduleInput {
   // unchanged (seed-and-keep on PATCH); send {mode:"inherit"} to clear it; a pinned mode
   // carries secret_id. The server 409s any explicit override on a self_improve lane.
   credential_override?: { mode: string; secret_id?: string } | null;
+  // PRD #1429 M4a (D2): the schedule's per-run harness pin. Presence semantics mirror
+  // credential_override above: OMIT to leave the stored pin unchanged (seed-and-keep on
+  // PATCH); send null to clear it back to implicit D11 resolution at fire time; a value
+  // ("claude"|"codex") pins it. Use lib/harnessSelection.ts's scheduleHarnessPatch to
+  // shape this from a HarnessSelection + a touched flag.
+  harness?: Harness | null;
 }
 
 // SchedulePreviewInput asks for a live "next fires" preview from a timing spec
@@ -2057,6 +2077,18 @@ export interface CompletionAccepted {
   revision: number;
 }
 
+// Harness is a run's execution harness (PRD #1429 M1 / D2), the closed runs.harness
+// vocabulary. A client should treat an unrecognised value honestly (the API is deployed
+// separately, so a newer server can ship a harness this build has not heard of); the union is
+// a compile-time hint, not a runtime guarantee.
+export type Harness = "claude" | "codex";
+
+// CostStatus is a run's folded cost-observability marker (PRD #1429 M1 / D7): metered rows
+// carry a real dollar cost, subscription/unreported rows do NOT, so a reader keys on this
+// rather than reading a placeholder cost_usd 0 as a real total. Same forward-compat rule as
+// Harness — render an unrecognised value honestly.
+export type CostStatus = "metered" | "subscription" | "unreported";
+
 export interface Run {
   id: string;
   /** Nullable since PRD #39: a chat run has no repo (issue/ci_fix runs always do). */
@@ -2073,6 +2105,11 @@ export interface Run {
   issue_iid: number | null;
   issue_title: string;
   issue_description: string;
+  /** The run's ACTUAL execution harness (PRD #1429 M1 / D2), the stored runs.harness.
+   *  Always present (NOT NULL DEFAULT 'claude' server-side, so every current run reads
+   *  "claude"). The web renders Claude visually unmarked and Codex explicit, and keys the
+   *  model/effort vocabulary on it (M4). */
+  harness: Harness;
   /** Chat conversation title (PRD #39), first-message derived; null for other kinds
    *  and until derived. resume_of_run_id points a continued chat at the ended one. */
   title: string | null;
@@ -2623,6 +2660,12 @@ export interface RunUsage {
   cache_creation_tokens: number;
   output_tokens: number;
   cost_usd: number;
+  /** The run's folded per-run cost_status (PRD #1429 M1 / D7): render dollars only for
+   *  "metered"; "subscription" is labelled subscription usage; "unreported" shows tokens
+   *  with cost unavailable. On a PER-RUN bundle (a run's usage) it is the real status; on a
+   *  per-WINDOW aggregate (SelfUsage.lifetime/last_7_days) a single status does not apply and
+   *  it is "" — the window's truth is the subscription/unreported counts on SelfUsage. */
+  cost_status: CostStatus | "";
 }
 
 // RunListItem is a run row for the index + admin overview: the run plus display
@@ -2699,6 +2742,13 @@ export interface SelfUsage {
   // block for free. Note the two populations differ from run_count on purpose (D2): a run
   // that failed before spending has no usage row but is counted in outcomes.finished.
   outcomes: { lifetime: RunOutcomes; last_7_days: RunOutcomes };
+  /** PRD #1429 M1 / D7: the per-window subscription/unreported run counts, so a mixed
+   *  aggregate can disclose that a non-metered component makes the numeric dollar total
+   *  incomplete rather than presenting a partial sum as complete. Lifetime AND last-seven. */
+  lifetime_subscription_run_count: number;
+  lifetime_unreported_run_count: number;
+  last7_subscription_run_count: number;
+  last7_unreported_run_count: number;
 }
 
 // AdminUsageUser is one user's lifetime row in the admin factory breakdown.
@@ -2711,6 +2761,10 @@ export interface AdminUsageUser {
   // row's lifetime usage. Required; a user present in the outcomes aggregate but absent
   // from usage (every run died before spending, D5) still gets a row, with zero usage.
   outcomes: RunOutcomes;
+  /** PRD #1429 M1 / D7: the user's LIFETIME subscription/unreported run counts, so the admin
+   *  per-user breakdown discloses a non-metered component like the factory total. */
+  subscription_run_count: number;
+  unreported_run_count: number;
 }
 
 // AdminUsage is the factory-wide view (GET /api/admin/usage, admin-only): the

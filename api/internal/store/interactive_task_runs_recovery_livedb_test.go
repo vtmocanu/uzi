@@ -78,6 +78,7 @@ func (f *followupFixture) seedInteractiveTaskRun(ctx context.Context, t *testing
 	t.Helper()
 	id := uuid.New()
 	if _, err := f.q.CreateTaskRun(ctx, store.CreateTaskRunParams{
+		Harness:          "claude", // PRD #1429 M1: harness is now a required @harness param.
 		RunID:            id,
 		UserID:           f.userID,
 		RepoID:           f.repoID,
@@ -99,6 +100,7 @@ func (f *followupFixture) seedNonInteractiveTaskRun(ctx context.Context, t *test
 	t.Helper()
 	id := uuid.New()
 	if _, err := f.q.CreateTaskRun(ctx, store.CreateTaskRunParams{
+		Harness:          "claude", // PRD #1429 M1: harness is now a required @harness param.
 		RunID:            id,
 		UserID:           f.userID,
 		RepoID:           f.repoID,

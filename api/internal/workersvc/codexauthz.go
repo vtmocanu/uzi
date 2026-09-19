@@ -23,11 +23,11 @@ import (
 )
 
 // Codex per-run credential-operation authority + claim binding (PRD #1147 M2, B5/B7),
-// ships DARK. This is the SERVICE half over the m2-A store primitives: it mints the
+// active for Codex-bound runs through PRD #1429. This is the SERVICE half over the store primitives: it mints the
 // per-claim capability, decides whether a presented capability may perform a scoped
 // credential operation over the run's frozen binding, and freezes a run's binding at
 // creation. The coordinated-refresh state machine (lease/intent/generation) is a
-// SEPARATE later unit — the store primitives for it exist but are NOT driven here.
+// separate state machine; this authority layer does not drive refresh itself.
 
 // Codex auth modes (the runs.codex_auth_mode CHECK values, migration 00202). Named
 // here so this file never spells a bare literal that could drift from the schema.
@@ -209,6 +209,34 @@ type codexAuthzStore interface {
 // codex queries, so the caller degrades safely rather than panicking.
 func (s *Service) codexStore() (codexAuthzStore, bool) {
 	q, ok := s.q.(codexAuthzStore)
+	return q, ok
+}
+
+// codexFreezeStore is the narrow query surface the binding-freeze path (freezeCodexBinding
+// + codexFreezeZeroRows) reads and writes through (PRD #1429 M1, D1). It is threaded as a
+// PARAMETER rather than reached via s.q so the freeze can run on the SAME transaction-bound
+// *store.Queries (WithTx) the atomic create seam (createRunAtomic) resolves D11 and INSERTs
+// the run on — making resolution, the run INSERT and the Codex freeze one transaction. It
+// unions the codex-authority writes/reads the freeze needs with the two owner-scoped reads it
+// also makes (GetUserSecretMetaByID for the alias label snapshot, GetRunByIDForUser for the
+// 0-row conflict classification), neither of which is on the narrower codexAuthzStore.
+// *store.Queries satisfies it (it has every query method); the existing non-tx callers pass
+// s.q via the FreezeCodexBinding wrapper below.
+type codexFreezeStore interface {
+	GetCodexCredentialState(ctx context.Context, arg store.GetCodexCredentialStateParams) (store.CodexCredentialState, error)
+	GetUserSecretMetaByID(ctx context.Context, arg store.GetUserSecretMetaByIDParams) (store.GetUserSecretMetaByIDRow, error)
+	FreezeRunCodexBinding(ctx context.Context, arg store.FreezeRunCodexBindingParams) (int64, error)
+	GetCodexProviderAccountByID(ctx context.Context, arg store.GetCodexProviderAccountByIDParams) (store.CodexProviderAccount, error)
+	SetRunCodexFrozenIdentity(ctx context.Context, arg store.SetRunCodexFrozenIdentityParams) (int64, error)
+	GetRunByIDForUser(ctx context.Context, arg store.GetRunByIDForUserParams) (store.Run, error)
+}
+
+// codexFreezeStoreFromService adapts the Service's ambient Store to the freeze surface for
+// the non-tx callers (the existing FreezeCodexBinding entrypoint and its tests). It succeeds
+// with the production *store.Queries and fails (false) with a store lacking the codex queries,
+// mirroring codexStore so the caller degrades safely rather than panicking.
+func (s *Service) codexFreezeStoreFromService() (codexFreezeStore, bool) {
+	q, ok := s.q.(codexFreezeStore)
 	return q, ok
 }
 
@@ -648,16 +676,27 @@ func (s *Service) AuthorizeCodexCredentialOp(ctx context.Context, wkr store.Work
 // when the identity is known) so the authority check can later compare run-frozen vs
 // current.
 //
-// This is an INTERNAL create path — no production path creates a Codex-bound run yet
-// (m2 ships DARK), so it is exercised only by tests/fixtures and is deliberately kept
-// out of the public CreateRun/schedule/chat paths.
+// This is an INTERNAL create path — no public route reaches it (D1). The exported
+// FreezeCodexBinding wrapper resolves the ambient s.q for the existing non-tx callers
+// (tests); the atomic create seam (createRunAtomic) calls freezeCodexBinding DIRECTLY with a
+// transaction-bound *store.Queries so resolution, the run INSERT and this freeze commit as one
+// transaction (D1). Either way the freeze reads/writes ONLY through the passed query surface.
 func (s *Service) FreezeCodexBinding(ctx context.Context, userID, runID, secretID uuid.UUID, authMode string) error {
-	if authMode != codexAuthModeSubscription && authMode != codexAuthModeAPIKey {
-		return fmt.Errorf("%w: %q", ErrCodexRunNotBound, authMode)
-	}
-	q, ok := s.codexStore()
+	q, ok := s.codexFreezeStoreFromService()
 	if !ok {
 		return errCodexStoreUnavailable
+	}
+	return s.freezeCodexBinding(ctx, q, userID, runID, secretID, authMode)
+}
+
+// freezeCodexBinding is FreezeCodexBinding's body against an EXPLICIT freeze query surface
+// (PRD #1429 M1, D1): every read and write — the alias state, the alias meta snapshot, the
+// write-once binding freeze, the identity freeze, and the 0-row conflict classification —
+// runs on the passed q. createRunAtomic passes the create transaction's tx-bound queries; the
+// exported wrapper passes the ambient s.q.
+func (s *Service) freezeCodexBinding(ctx context.Context, q codexFreezeStore, userID, runID, secretID uuid.UUID, authMode string) error {
+	if authMode != codexAuthModeSubscription && authMode != codexAuthModeAPIKey {
+		return fmt.Errorf("%w: %q", ErrCodexRunNotBound, authMode)
 	}
 
 	// Current alias material_revision (the value the run freezes at creation).
@@ -674,7 +713,7 @@ func (s *Service) FreezeCodexBinding(ctx context.Context, userID, runID, secretI
 
 	// Snapshot the alias label at bind time (the same reason 00086/00202 snapshot it:
 	// the FK nulls the id on delete and a rename rewrites the label in place).
-	meta, err := s.q.GetUserSecretMetaByID(ctx, store.GetUserSecretMetaByIDParams{
+	meta, err := q.GetUserSecretMetaByID(ctx, store.GetUserSecretMetaByIDParams{
 		ID:     secretID,
 		UserID: userID,
 	})
@@ -716,7 +755,7 @@ func (s *Service) FreezeCodexBinding(ctx context.Context, userID, runID, secretI
 		// vanished/foreign run: only the former is a binding conflict. An identical retry
 		// (same secret) would have matched the guard and affected ≥1 row, so it never
 		// reaches here.
-		return s.codexFreezeZeroRows(ctx, runID, userID)
+		return s.codexFreezeZeroRows(ctx, q, runID, userID)
 	}
 
 	// For a linked subscription alias, freeze the identity tuple + account revision now
@@ -748,7 +787,7 @@ func (s *Service) FreezeCodexBinding(ctx context.Context, userID, runID, secretI
 			// Same distinction as the binding freeze: 0 rows on the write-once identity
 			// guard is a conflict when the run exists and is owned (its identity is already
 			// frozen to a different tuple), else a vanished run.
-			return s.codexFreezeZeroRows(ctx, runID, userID)
+			return s.codexFreezeZeroRows(ctx, q, runID, userID)
 		}
 	}
 	return nil
@@ -758,9 +797,13 @@ func (s *Service) FreezeCodexBinding(ctx context.Context, userID, runID, secretI
 // conflict (ErrCodexBindingConflict) when the run still exists and is owned by the user
 // (so the 0 rows came from the immutability guard, not a missing run), else errRunVanished
 // (a genuinely gone/foreign run). Kept as one helper so the binding freeze and the
-// identity freeze classify a 0-row result identically.
-func (s *Service) codexFreezeZeroRows(ctx context.Context, runID, userID uuid.UUID) error {
-	_, err := s.q.GetRunByIDForUser(ctx, store.GetRunByIDForUserParams{ID: runID, UserID: userID})
+// identity freeze classify a 0-row result identically. It reads GetRunByIDForUser through the
+// SAME freeze query surface (PRD #1429 M1) so the classifying read runs on the create tx's
+// qtx — reading it off the ambient s.q instead would query outside the (uncommitted)
+// transaction and could see no row for a run the tx just inserted, misclassifying a real
+// conflict as errRunVanished.
+func (s *Service) codexFreezeZeroRows(ctx context.Context, q codexFreezeStore, runID, userID uuid.UUID) error {
+	_, err := q.GetRunByIDForUser(ctx, store.GetRunByIDForUserParams{ID: runID, UserID: userID})
 	switch {
 	case err == nil:
 		return ErrCodexBindingConflict

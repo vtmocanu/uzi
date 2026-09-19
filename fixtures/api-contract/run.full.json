@@ -6,6 +6,7 @@
   "issue_iid": 1,
   "issue_title": "x",
   "issue_description": "x",
+  "harness": "x",
   "has_prd_link": true,
   "title": "x",
   "resume_of_run_id": "x",
@@ -162,7 +163,8 @@
     "cache_read_tokens": 1,
     "cache_creation_tokens": 1,
     "output_tokens": 1,
-    "cost_usd": 1.5
+    "cost_usd": 1.5,
+    "cost_status": "x"
   },
   "wait_on_limit": true,
   "mr_rework_enabled": true,
