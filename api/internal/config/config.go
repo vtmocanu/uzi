@@ -215,6 +215,16 @@ type Config struct {
 	// value below 1m is clamped up to 1m with a boot warning — the header-probe
 	// fallback spends the user's own tokens, so a tight interval is a footgun (D2).
 	UsagePollInterval time.Duration
+	// CodexUsagePollInterval is the per-ACCOUNT Codex rate-limit poll cadence (PRD #1209
+	// M2), the Codex sibling of UsagePollInterval. Default 5m; 0 disables the engine
+	// entirely — no Boot pass, no ticker, no poke, and no staged-alias reconcile egress
+	// (the whole background goroutine is never started). A nonzero value below 1m is
+	// clamped up to 1m with a boot warning. The rationale differs from the Claude one:
+	// the Codex usage GET is FREE (it spends no token — it reads the account's own
+	// rate-limit meter), so the floor is not about token spend but about bounding
+	// provider EGRESS to the fixed usage host — a tight interval would hammer
+	// chatgpt.com with one request per linked account per tick for no added freshness.
+	CodexUsagePollInterval time.Duration
 	// Auto-selection policy (PRD #111 D6): the knobs that decide which of a user's
 	// opted-in Anthropic credentials an `auto` worker's claim spends. Server env
 	// rather than per-user settings deliberately — one operator-set policy keeps the
@@ -892,6 +902,19 @@ func Load() (Config, error) {
 			"configured", cfg.UsagePollInterval.String(),
 			"clamped_to", time.Minute.String())
 		cfg.UsagePollInterval = time.Minute
+	}
+	// Per-account Codex rate-limit poller (PRD #1209 M2). parseNonNegDuration: 0 is
+	// legitimate — it disables the engine (no Boot, no ticker, no poke, no staged
+	// reconcile). A nonzero value below the 1m floor is clamped up — NOT because the poll
+	// spends a token (the Codex usage GET is free), but to bound provider EGRESS to the
+	// fixed usage host: a tight interval fires one request per linked account per tick with
+	// no added freshness.
+	cfg.CodexUsagePollInterval = parseNonNegDuration("UZI_CODEX_USAGE_POLL_INTERVAL", 5*time.Minute)
+	if cfg.CodexUsagePollInterval > 0 && cfg.CodexUsagePollInterval < time.Minute {
+		slog.Warn("UZI_CODEX_USAGE_POLL_INTERVAL is below the 1m floor; clamping up (the Codex usage read is free, but a tight interval floods the fixed usage host with per-account egress for no added freshness)",
+			"configured", cfg.CodexUsagePollInterval.String(),
+			"clamped_to", time.Minute.String())
+		cfg.CodexUsagePollInterval = time.Minute
 	}
 	// Auto-selection policy (PRD #111 D6). parseNonNegInt, not parseInt: 0 is
 	// meaningful for all three — no floor, exact-tie-only, no in-flight bias — and

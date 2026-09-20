@@ -46,6 +46,13 @@ func (f *FakeClient) SelfRateLimits(context.Context) ([]apitypes.TokenRateLimitD
 	return f.SelfMeters, nil
 }
 
+func (f *FakeClient) SelfCodexRateLimits(context.Context) ([]apitypes.CodexAccountRateLimitDTO, error) {
+	if f.Err != nil {
+		return nil, f.Err
+	}
+	return f.SelfCodexMeters, nil
+}
+
 func (f *FakeClient) GetMySettings(context.Context) (apitypes.UserSettingsDTO, error) {
 	if f.Err != nil {
 		return apitypes.UserSettingsDTO{}, f.Err

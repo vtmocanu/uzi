@@ -106,6 +106,20 @@ func (c *HTTPClient) AdminRateLimits(ctx context.Context) ([]apitypes.AdminRateL
 	return env.Users, nil
 }
 
+// AdminCodexRateLimits reads the factory-wide per-user Codex rate-limit rows (PRD #1209
+// M3): GET /api/admin/codex-rate-limits, decoding the {users:[...]} envelope. Mirrors
+// AdminRateLimits' request+decode idiom; each row carries the user's identity, live
+// vault-lock state, and one Codex meter per linked account.
+func (c *HTTPClient) AdminCodexRateLimits(ctx context.Context) ([]apitypes.CodexAdminRateLimitRowDTO, error) {
+	var env struct {
+		Users []apitypes.CodexAdminRateLimitRowDTO `json:"users"`
+	}
+	if err := c.get(ctx, "/api/admin/codex-rate-limits", &env); err != nil {
+		return nil, err
+	}
+	return env.Users, nil
+}
+
 // AdminJudgeBacklog reads the admin "All users" aggregate backlog (PRD #1184 M5): GET
 // /api/admin/judge/recommendations. The handler serves an UNENVELOPED JudgeAdminBacklogDTO
 // (httpx.JSON of the DTO directly), so decode straight into it — no {"backlog": …} wrapper,

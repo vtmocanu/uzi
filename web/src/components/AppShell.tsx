@@ -17,6 +17,7 @@ import { maskEmail, maskName, maskRepoPath } from "../lib/demoMask";
 import { VaultBadge, VaultLockedBanner } from "./VaultControls";
 import { UpdateEscalationBanner } from "./UpdateEscalationBanner";
 import { RateLimitAnnouncer, SidebarRateLimits } from "./RateLimitMeters";
+import { SidebarCodexRateLimits } from "./CodexRateLimitMeters";
 import { onNotificationsChanged } from "../lib/notifications";
 import { useFavicon } from "../lib/useFavicon";
 import { brandTabTitle } from "../lib/brandTitle";
@@ -935,6 +936,9 @@ function SidebarContent({
               {/* Claude rate-limit micro-meters (PRD #53): two 5px bars under the
                   user block. Self-gates — renders nothing without a live reading. */}
               <SidebarRateLimits />
+              {/* Codex per-account micro-meters (PRD #1209 M3): a provider-labeled
+                  sibling beside the Claude bars. Self-gates the same way. */}
+              <SidebarCodexRateLimits />
             </div>
           ))}
 

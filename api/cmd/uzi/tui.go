@@ -132,8 +132,18 @@ type rateLimitsMsg struct {
 	err    error
 }
 
+// codexRateLimitsMsg carries the viewer's own per-account Codex rate-limit meters (from
+// SelfCodexRateLimits), which drive the factory-floor and detail-rail Codex meters beside
+// the Claude ones. Fetched at Init, on the 60s strip ticker (stripTickMsg), and on manual
+// refresh — the same cadence as rateLimitsMsg. A failure is swallowed: the meters just hide.
+type codexRateLimitsMsg struct {
+	accounts []apitypes.CodexAccountRateLimitDTO
+	err      error
+}
+
 // settingsMsg carries the viewer's own non-secret settings (from GetMySettings); only
-// SidebarTokenIds is used, to mirror the web sidebar's non-default-token selection.
+// SidebarTokenIds and SidebarCodexAccountIds are used, to mirror the web sidebar's
+// non-default token / Codex-account selection.
 type settingsMsg struct {
 	settings apitypes.UserSettingsDTO
 	err      error
@@ -349,6 +359,15 @@ type tuiModel struct {
 	rateLimits      []apitypes.TokenRateLimitDTO
 	sidebarTokenIds []string
 
+	// codexRateLimits and sidebarCodexAccountIds drive the Codex meters shown beside the
+	// Claude ones on the board strip and the detail rail (PRD #1209 M3). Same selection
+	// shape as the Claude side — the default account plus sidebar_codex_account_ids — but
+	// keyed on AccountID, with "readable" = a status carrying a reading (fresh or stale).
+	// Fetched and refreshed on the SAME cadence as rateLimits (Init / 60s strip tick /
+	// manual refresh); a fetch failure is swallowed so the meters just hide.
+	codexRateLimits        []apitypes.CodexAccountRateLimitDTO
+	sidebarCodexAccountIds []string
+
 	// vaultLocked is the viewer's vault-lock state (PRD #1251 M2), decoded off GET
 	// /api/auth/me's sibling `vault.unlocked` via WhoamiVault. Fetched at Init, on the 60s
 	// strip ticker and on manual refresh (r) — the same cadence as the rate-limit strip — so
@@ -474,7 +493,7 @@ func newTUIModel(ctx context.Context, c uzicli.Client, startRun string) tuiModel
 // so a light terminal actually gets the light theme instead of the dark default.
 func (m tuiModel) initCmds() []tea.Cmd {
 	cmds := []tea.Cmd{m.fetchRunsCmd(m.board.admin, m.board.waitID), m.fetchSecretsCmd(),
-		m.fetchRateLimitsCmd(), m.fetchSettingsCmd(), m.fetchVaultCmd(), tickAfter(boardPollInterval, m.board.tickGen), stripTickCmd(),
+		m.fetchRateLimitsCmd(), m.fetchCodexRateLimitsCmd(), m.fetchSettingsCmd(), m.fetchVaultCmd(), tickAfter(boardPollInterval, m.board.tickGen), stripTickCmd(),
 		themeTickCmd(),
 		// The forge views' repo scope (PRD #1255 D2) and the `pulls` list's own 10s tick chain.
 		// The tick is armed now but polls the forge only while the pulls screen is in focus
@@ -646,6 +665,18 @@ func (m tuiModel) fetchRateLimitsCmd() tea.Cmd {
 	return func() tea.Msg {
 		tokens, err := c.SelfRateLimits(ctx)
 		return rateLimitsMsg{tokens: tokens, err: err}
+	}
+}
+
+// fetchCodexRateLimitsCmd reads the viewer's own per-account Codex meters so the board
+// strip and detail rail can draw the Codex meters beside the Claude ones (PRD #1209 M3).
+// A failure is swallowed — the Codex meters just hide, and never block the board. Cached
+// reads work with no Codex run: the endpoint answers per linked account, not per run.
+func (m tuiModel) fetchCodexRateLimitsCmd() tea.Cmd {
+	c, ctx := m.client, m.ctx
+	return func() tea.Msg {
+		accounts, err := c.SelfCodexRateLimits(ctx)
+		return codexRateLimitsMsg{accounts: accounts, err: err}
 	}
 }
 
@@ -866,7 +897,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.quitting || m.updatePrompt.showing {
 			return m, stripTickCmd()
 		}
-		return m, tea.Batch(m.fetchRateLimitsCmd(), m.fetchSettingsCmd(), m.fetchVaultCmd(), stripTickCmd())
+		return m, tea.Batch(m.fetchRateLimitsCmd(), m.fetchCodexRateLimitsCmd(), m.fetchSettingsCmd(), m.fetchVaultCmd(), stripTickCmd())
 
 	case themeTickMsg:
 		// Re-query the terminal background so a LIVE theme switch reaches the model (issue #1348).
@@ -1120,9 +1151,19 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case codexRateLimitsMsg:
+		if msg.err == nil {
+			m.codexRateLimits = msg.accounts
+		}
+		return m, nil
+
 	case settingsMsg:
 		if msg.err == nil {
 			m.sidebarTokenIds = msg.settings.SidebarTokenIds
+			// A Settings checkmark change to the linked Codex accounts takes effect on the
+			// next settings refresh with no TUI restart (PRD #1209 M3), exactly as
+			// SidebarTokenIds does for the Claude meters.
+			m.sidebarCodexAccountIds = msg.settings.SidebarCodexAccountIds
 		}
 		return m, nil
 

@@ -102,6 +102,10 @@ var demoLiveLines = []string{
 // UserSettingsDTO.MrReworkEnabled, where nil = the default-ON state).
 func boolPtr(b bool) *bool { return &b }
 
+// fPtr returns a pointer to a float64, for the nullable Codex window fields (e.g.
+// CodexRateLimitWindowDTO.UsedPercent, where nil = no reading rather than 0%).
+func fPtr(f float64) *float64 { return &f }
+
 func newDemoClient() *uzicli.FakeClient {
 	now := time.Now()
 	runs := demoRuns(now)
@@ -136,13 +140,56 @@ func newDemoClient() *uzicli.FakeClient {
 				Status: "ok", FiveHour: &apitypes.RateLimitWindow{Pct: 12}, SevenDay: &apitypes.RateLimitWindow{Pct: 20}}},
 			{SecretID: "sec-throttled", Label: "throttled", Limits: apitypes.RateLimitDTO{Status: "unavailable"}},
 		},
-		// Only "meta" is promoted into the sidebar selection; "unlisted" stays hidden.
-		// MrReworkEnabled false is the explicit opt-out (PRD #700 M6); a nil pointer
-		// would be the default-ON state. Carried for decode fidelity — the TUI does
-		// not render it, matching the DTO's other fidelity-only fields.
+		// The viewer's own per-account Codex meters drive the Codex meters shown beside the
+		// Claude ones (PRD #1209 M3), mirroring the web sidebar's Codex selection. The default
+		// account always shows; "codex-team" shows because it is in SidebarCodexAccountIds
+		// below; "codex-unlisted" is readable but NOT shown; "codex-old" is stale (shown
+		// dimmed); a no_reading account never appears. Each carries a 5h bucket (primary +
+		// secondary) with percentages on the ok/warn/danger tone bands.
+		SelfCodexMeters: []apitypes.CodexAccountRateLimitDTO{
+			{
+				AccountID: "cx-primary", Aliases: []string{"primary"}, IsDefault: true, Status: "fresh",
+				Buckets: []apitypes.CodexRateLimitBucketDTO{{
+					ID: "5h", DisplayName: "5h",
+					Primary:   &apitypes.CodexRateLimitWindowDTO{UsedPercent: fPtr(41)},
+					Secondary: &apitypes.CodexRateLimitWindowDTO{UsedPercent: fPtr(63)},
+				}},
+			},
+			{
+				AccountID: "cx-team", Aliases: []string{"team"}, Status: "fresh",
+				Buckets: []apitypes.CodexRateLimitBucketDTO{{
+					ID: "5h", DisplayName: "5h",
+					Primary:   &apitypes.CodexRateLimitWindowDTO{UsedPercent: fPtr(88)},
+					Secondary: &apitypes.CodexRateLimitWindowDTO{UsedPercent: fPtr(52)},
+				}},
+			},
+			{
+				AccountID: "cx-unlisted", Aliases: []string{"unlisted"}, Status: "fresh",
+				Buckets: []apitypes.CodexRateLimitBucketDTO{{
+					ID: "5h", DisplayName: "5h",
+					Primary: &apitypes.CodexRateLimitWindowDTO{UsedPercent: fPtr(12)},
+				}},
+			},
+			{
+				AccountID: "cx-old", Aliases: []string{"archive"}, Status: "stale", Stale: boolPtr(true),
+				Buckets: []apitypes.CodexRateLimitBucketDTO{{
+					ID: "5h", DisplayName: "5h",
+					Primary: &apitypes.CodexRateLimitWindowDTO{UsedPercent: fPtr(70)},
+				}},
+			},
+			{AccountID: "cx-pending", Aliases: []string{"pending"}, Status: "no_reading"},
+		},
+		// "meta" (Claude), "cx-team" and "cx-old" (Codex) are promoted into the sidebar
+		// selection; the "cx-unlisted" row stays hidden. "cx-old" is listed so the STALE-DIMMED
+		// Codex meter (its "shown dimmed" comment above) actually renders in the demo — without
+		// it the selection would drop the account and the dimmed path this fixture showcases
+		// would never draw. MrReworkEnabled false is the explicit opt-out (PRD
+		// #700 M6); a nil pointer would be the default-ON state. Carried for decode fidelity —
+		// the TUI does not render it, matching the DTO's other fidelity-only fields.
 		Settings: apitypes.UserSettingsDTO{
-			SidebarTokenIds: []string{"sec-meta"},
-			MrReworkEnabled: boolPtr(false),
+			SidebarTokenIds:        []string{"sec-meta"},
+			SidebarCodexAccountIds: []string{"cx-team", "cx-old"},
+			MrReworkEnabled:        boolPtr(false),
 		},
 		// StreamEvents nil: NewRunStream emits nothing and stays OPEN (so the detail reads
 		// "live"); the ticker above supplies the live frames.

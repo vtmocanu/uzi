@@ -154,10 +154,12 @@ func NewCodexReconciler(q codexCredStore, vlt *vault.Vault, box *secretbox.Box, 
 // Steps:
 //  1. Read the alias's codex_credential_state (must exist, status staging/failed) and
 //     open its stored login blob via the shared vault-open path (by id, owner-scoped).
-//  2. DiscoverIdentity — NONROTATING. On any discovery failure (incomplete identity,
-//     an auth error, a transport error) mark the state 'failed' with last_error and
-//     return, having made ZERO oauth/refresh calls. Refresh is NEVER called here: if
-//     the access token is expired the import stays failed and the user re-logs in.
+//  2. DiscoverIdentity — NONROTATING. On a PROVEN unusable credential (an incomplete
+//     identity, or a 401/403 auth rejection) mark the state 'failed' with last_error; a
+//     TRANSIENT failure (a transport error, a 429, a 5xx, an undecodable body) is left
+//     'staging' for the next sweep to retry. Either way return having made ZERO
+//     oauth/refresh calls. Refresh is NEVER called here: if the access token is expired
+//     the import stays failed and the user re-logs in.
 //  3. Reconcile by the full tuple: an existing account for the tuple is linked to
 //     (its sealed_login untouched); otherwise the login blob is sealed under the DEK
 //     and a new account (generation 0) is inserted, then linked. Linking flips the
@@ -193,9 +195,16 @@ func (r *CodexReconciler) ReconcileCodexAuthIdentity(ctx context.Context, userID
 			// A locked vault is transient — never mark failed on it, the caller retries
 			// after the next unlock (the same contract secretopen gives every opener).
 			return err
-		default:
+		case errors.Is(err, secretopen.ErrUndecryptable):
 			// Undecryptable material is terminal for this import.
 			r.markFailed(ctx, userID, userSecretID, "stored codex login could not be decrypted", st.MaterialRevision)
+			return fmt.Errorf("codex reconcile: open login: %w", err)
+		default:
+			// A transient store/lookup error (OpenByIDOfKind wraps a non-ErrNoRows lookup
+			// failure as "secretopen: lookup by id") is NOT the credential's fault: leave the
+			// alias 'staging' so the next poller sweep retries it, exactly as the discovery
+			// path does. Marking it 'failed' on a DB blip would drop it from the staging list
+			// permanently (issue #1209 review).
 			return fmt.Errorf("codex reconcile: open login: %w", err)
 		}
 	}
@@ -210,12 +219,19 @@ func (r *CodexReconciler) ReconcileCodexAuthIdentity(ctx context.Context, userID
 		return fmt.Errorf("%w: missing access token", ErrCodexLoginBlob)
 	}
 
-	// NONROTATING identity read. On ANY failure: mark failed with the reason and
-	// return, having made zero oauth/refresh calls. Refresh is never invoked here.
-	// This is a NETWORK call and MUST stay OUTSIDE the transaction opened below.
+	// NONROTATING identity read, having made zero oauth/refresh calls; Refresh is never
+	// invoked here. This is a NETWORK call and MUST stay OUTSIDE the transaction opened below.
+	// On a PROVEN unusable credential (a 401/403 auth rejection, or a 2xx whose identity was
+	// incomplete) mark the alias 'failed'. A TRANSIENT provider fault — a transport timeout, a
+	// 429, a 5xx, or an undecodable body — leaves the alias 'staging' so the next poller sweep
+	// retries it under backoff; marking it 'failed' would drop it from the staging list
+	// (ListStagedCodexAliases selects status='staging' only), permanently stopping account
+	// linking and meter collection until the user re-adds the credential (issue #1209 review).
 	id, err := r.ident.DiscoverIdentity(ctx, blob.AccessToken)
 	if err != nil {
-		r.markFailed(ctx, userID, userSecretID, discoveryFailureReason(err), st.MaterialRevision)
+		if reason, terminal := classifyDiscoveryFailure(err); terminal {
+			r.markFailed(ctx, userID, userSecretID, reason, st.MaterialRevision)
+		}
 		return fmt.Errorf("codex reconcile: discover identity: %w", err)
 	}
 
@@ -276,18 +292,23 @@ func (r *CodexReconciler) reconcileTuple(ctx context.Context, q codexCredStore, 
 		// Existing account for this tuple. The imported blob's identity is freshly VERIFIED
 		// (that is how we resolved THIS account), so:
 		//   - if the account is QUARANTINED (a dead login the coordinated refresher could not
-		//     roll forward), RESTORE the canonical login from this verified blob BEFORE
-		//     linking (audit #5): RefreshCodexAccountLogin installs it, advances the
-		//     generation, and clears the quarantine, so the account is usable again;
-		//   - if the account is HEALTHY (idle/committed), keep the no-overwrite converge — it
-		//     is authoritative and another alias may already hold the canonical material.
-		// Order: verify identity → (if quarantined) restore login → CAS-link. The restore
+		//     roll forward) OR flagged REAUTH_REQUIRED (the poll path proved its access token
+		//     expired with no renewal material, PRD #1209 M2), RESTORE the canonical login from
+		//     this verified blob BEFORE linking: RefreshCodexAccountLogin's two-arm CAS installs
+		//     it, advances the generation, and clears the quarantine AND/OR the reauth flag, so
+		//     the account is usable — and pollable — again;
+		//   - if the account is HEALTHY (idle/committed, no reauth flag), keep the no-overwrite
+		//     converge — it is authoritative and another alias may already hold the canonical
+		//     material.
+		// Order: verify identity → (if quarantined/reauth) restore login → CAS-link. The restore
 		// and the link are in the same transaction, so a lost link CAS rolls the restore back
 		// (the account keeps its dead login + old generation), and an ordinary duplicate
-		// import that merely OBSERVED the quarantine cannot install a re-login it did not win:
-		// it is still gated by (i) the account-generation CAS here and (ii) the alias
-		// material-revision link CAS below.
-		if acct.CoordState == codexCoordQuarantined {
+		// import that merely OBSERVED the quarantine/reauth cannot install a re-login it did not
+		// win: it is still gated by (i) the account-generation CAS here (RefreshCodexAccountLogin
+		// fences on generation = from_generation, and the reauth arm additionally on
+		// reauth_generation/revision = the live values) and (ii) the alias material-revision link
+		// CAS below.
+		if acct.CoordState == codexCoordQuarantined || acct.ReauthRequired {
 			sealed, sealedWith, serr := r.sealLogin(userID, plain)
 			if serr != nil {
 				return fmt.Errorf("codex reconcile: seal re-login: %w", serr)
@@ -303,10 +324,11 @@ func (r *CodexReconciler) reconcileTuple(ctx context.Context, q codexCredStore, 
 				return fmt.Errorf("codex reconcile: restore re-login: %w", rerr)
 			}
 			if n == 0 {
-				// CAS lost: a concurrent PromoteCodexRecovery advanced the generation (or the
-				// account is no longer quarantined) under this restore. Reject BEFORE linking —
-				// linking against a moved quarantine would bind the run to stale material.
-				return fmt.Errorf("codex reconcile: quarantine moved under restore CAS")
+				// CAS lost: a concurrent PromoteCodexRecovery / refresh advanced the generation
+				// (or the account is no longer quarantined, or the reauth window closed) under
+				// this restore. Reject BEFORE linking — linking against moved authority would
+				// bind the run to stale material.
+				return fmt.Errorf("codex reconcile: quarantine/reauth moved under restore CAS")
 			}
 		}
 		return r.link(ctx, q, userID, userSecretID, acct.ID, observedMaterialRevision)
@@ -443,23 +465,24 @@ func (r *CodexReconciler) sealLogin(userID uuid.UUID, plaintext []byte) (sealed 
 	return sealed, store.SealedWithMaster, err
 }
 
-// discoveryFailureReason maps a DiscoverIdentity error to a short, secret-free
-// last_error string. It names WHY the identity could not be established so a user
-// reading the alias state knows whether to re-log-in (auth) or retry (transient),
-// without echoing any token or response body. "Identity incomplete" now means neither
-// the usage response nor the access-token JWT claim yielded an account id (or user_id
-// was absent) — the personal-seat token fallback in DiscoverIdentity was also exhausted.
-func discoveryFailureReason(err error) string {
-	switch {
-	case errors.Is(err, codexauth.ErrIdentityIncomplete):
-		return "provider did not return a complete identity (missing user or account id)"
+// classifyDiscoveryFailure maps a DiscoverIdentity error to (reason, terminal). terminal is
+// true only for a PROVEN unusable credential — a 401/403 auth rejection, or a 2xx reply whose
+// identity was incomplete — which marks the alias 'failed' (terminal, dropped from the staging
+// list, not re-probed). terminal is false for a TRANSIENT provider fault (a transport timeout,
+// a 429, a 5xx, or an undecodable 2xx body): those leave the alias 'staging' so a later poller
+// sweep retries it, because a failure that becomes permanent would silently stop account
+// linking on a temporary outage (issue #1209 review). reason is the short, secret-free
+// last_error text and is written only on the terminal path; it never echoes any token or
+// response body. "Identity incomplete" means neither the usage response nor the access-token
+// JWT claim yielded an account id (or user_id was absent).
+func classifyDiscoveryFailure(err error) (reason string, terminal bool) {
+	if errors.Is(err, codexauth.ErrIdentityIncomplete) {
+		return "provider did not return a complete identity (missing user or account id)", true
 	}
 	var authErr *codexauth.AuthError
-	if errors.As(err, &authErr) {
-		if authErr.Unauthorized() {
-			return "provider rejected the login token; re-login required"
-		}
-		return fmt.Sprintf("provider identity lookup failed with status %d", authErr.StatusCode)
+	if errors.As(err, &authErr) && authErr.Unauthorized() {
+		return "provider rejected the login token; re-login required", true
 	}
-	return "provider identity lookup failed"
+	// Transport error, 429, 5xx, other non-2xx, or an undecodable 2xx body: transient.
+	return "", false
 }

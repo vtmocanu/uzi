@@ -154,3 +154,70 @@ hasn't saved a token yet (shown as **no token**) — a capacity view for
 planning factory work, not just a personal gauge. A user holding several
 credentials gets one row per token, named and default-badged, grouped under
 their identity; the sort still keys on whoever is nearest a wall.
+
+## Codex account limits
+
+A [Codex subscription login](codex-credentials.md) — not an OpenAI API key —
+gets an account-scoped meter alongside your Claude token meters. The shape is
+different: Codex reports usage in **named buckets**, each with up to two
+windows of whatever duration the provider actually reports, not Claude's
+fixed 5-hour/7-day pair. A window's label reads "5-hour", "7-day", or
+whatever Codex says it is — uzi never assumes.
+
+**Collection needs no active worker or run.** A dedicated poller in the API
+process reads each linked Codex subscription account's usage on its own
+schedule (`UZI_CODEX_USAGE_POLL_INTERVAL`, default 5 minutes — see
+[Configuration](./configuration.md)), so a meter fills in even while nothing
+of yours is running, and it picks up usage the provider reports you incurred
+outside uzi entirely.
+
+**Duplicate logins of one account show one budget.** If you've imported the
+same Codex account under two saved aliases, they share a single meter —
+the quota is a property of the account, not of how many times you saved its
+login.
+
+**An OpenAI API key has no subscription windows and is not metered.** Only a
+linked Codex subscription login produces a meter; an API-key-only default
+shows nothing here, and Settings says so next to the credential itself.
+
+### Where to look
+
+| Surface | What you see |
+|---|---|
+| **Settings → Codex limits** | A card next to your Codex credentials, one block per linked subscription account: its aliases, a **default** badge, a **Show in sidebar and TUI** checkmark, every reported bucket with its own windows, percentages and reset countdown. |
+| **Sidebar** | Codex meters for your default subscription account, plus any additional account you've checked, provider-labeled next to your Claude meters. |
+| **Admin → Rate limits** | A separate Codex section, grouped by user then by account, sorted by utilization. |
+| **CLI / TUI** | `uzi rate-limits --provider codex` and `uzi admin rate-limits --provider codex` (see [uzi CLI](./cli.md)); the TUI board and rail carry provider-labeled Codex meters too. |
+
+**Choosing which accounts appear in the sidebar and TUI** works exactly like
+the Claude side: your subscription's **default** Codex account always shows,
+and the Settings checkmark on each additional linked account adds or removes
+it from both the sidebar and the TUI. Nothing here changes polling, which
+covers every linked account regardless of what's checked; it only changes
+what you see. The same anchored forecast ghost from [Reading the
+forecast](#reading-the-forecast) applies per bucket, using that bucket's own
+reported window length rather than a hardcoded 5h/7d.
+
+### Statuses
+
+Each linked account carries one of these, derived server-side — never
+re-derived by the client:
+
+| Status | Meaning |
+|---|---|
+| `pending` | Linked, but no poll has completed yet. |
+| `no_reading` | A poll was attempted and failed, with nothing successful yet. |
+| `fresh` | A successful reading no older than 3× the poll interval. |
+| `stale` | A reading exists but has aged past that window — shown greyed rather than dropped. |
+| `vault_locked` | Your vault is locked, so uzi can't open the login to poll it; the last known reading stays visible, marked stale. |
+| `credential_action_required` | The login needs re-authentication (re-import it) before polling can resume. |
+| `polling_disabled` | The operator has turned the Codex poller off entirely (`UZI_CODEX_USAGE_POLL_INTERVAL=0`); any retained reading shows as stale, since nothing will ever refresh it again. |
+
+**Staleness follows the same 3× rule as Claude's meters, with one addition**:
+a disabled poller marks every retained reading stale unconditionally, since
+there is no next poll to make it fresh again.
+
+A user with **no linked Codex subscription account** — including one whose
+only saved Codex credential is an API key — sees no accounts at all here: no
+row, no placeholder meter, on any surface. That's the empty-set shape, not a
+status of its own.

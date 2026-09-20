@@ -912,6 +912,55 @@ func TestAdminRateLimitRowDTOTags(t *testing.T) {
 		"id", "email", "name", "vault_locked", "tokens")
 }
 
+// TestCodexRateLimitWindowDTOTags pins the nested Codex window (PRD #1209). Every field
+// is a pointer with no omitempty, so a zero value keeps all four present as null.
+func TestCodexRateLimitWindowDTOTags(t *testing.T) {
+	assertTags(t, "CodexRateLimitWindowDTO", CodexRateLimitWindowDTO{},
+		"used_percent", "limit_window_seconds", "reset_after_seconds", "reset_at")
+}
+
+// TestCodexRateLimitBucketDTOTags pins the bucket: display_name is omitempty (dropped on a
+// zero value), every other field is present — the *bool/*window pointers as null.
+func TestCodexRateLimitBucketDTOTags(t *testing.T) {
+	assertTags(t, "CodexRateLimitBucketDTO(zero)", CodexRateLimitBucketDTO{},
+		"id", "allowed", "limit_reached", "primary", "secondary")
+	full := CodexRateLimitBucketDTO{
+		ID:           "b1",
+		DisplayName:  "5h",
+		Allowed:      new(bool),
+		LimitReached: new(bool),
+		Primary:      &CodexRateLimitWindowDTO{},
+		Secondary:    &CodexRateLimitWindowDTO{},
+	}
+	assertTags(t, "CodexRateLimitBucketDTO(full)", full,
+		"id", "display_name", "allowed", "limit_reached", "primary", "secondary")
+}
+
+// TestCodexAccountRateLimitDTOTags pins the per-account meter: last_success_at and stale
+// are omitempty (dropped on a zero value), the rest are always present.
+func TestCodexAccountRateLimitDTOTags(t *testing.T) {
+	assertTags(t, "CodexAccountRateLimitDTO(zero)", CodexAccountRateLimitDTO{},
+		"account_id", "aliases", "is_default", "status", "buckets")
+	stale := false
+	full := CodexAccountRateLimitDTO{
+		AccountID:     "a1",
+		Aliases:       []string{"x"},
+		IsDefault:     true,
+		Status:        "fresh",
+		LastSuccessAt: time.Now().UTC().Format(time.RFC3339),
+		Stale:         &stale,
+		Buckets:       []CodexRateLimitBucketDTO{},
+	}
+	assertTags(t, "CodexAccountRateLimitDTO(full)", full,
+		"account_id", "aliases", "is_default", "status", "last_success_at", "stale", "buckets")
+}
+
+// TestCodexAdminRateLimitRowDTOTags pins the admin row, mirroring AdminRateLimitRowDTO.
+func TestCodexAdminRateLimitRowDTOTags(t *testing.T) {
+	assertTags(t, "CodexAdminRateLimitRowDTO", CodexAdminRateLimitRowDTO{},
+		"id", "email", "name", "vault_locked", "accounts")
+}
+
 // TestUserSettingsDTOTags pins the CLI's decoding mirror of GET /api/me/settings
 // against the handler's own userSettingsDTO — a divergence in either type's tag
 // set fails here rather than silently dropping a field on decode.
@@ -923,7 +972,10 @@ func TestUserSettingsDTOTags(t *testing.T) {
 		// PRD #1167: the four raw per-field appearance overrides (each null ⇒ inherit).
 		"appearance_mode", "light_theme", "dark_theme", "typeface",
 		// PRD #1429 M1 (D3): the per-user default harness (null ⇒ no preference).
-		"default_harness")
+		"default_harness",
+		// PRD #1209 M1: the linked Codex accounts surfaced on the sidebar rail (codex sibling
+		// of sidebar_token_ids).
+		"sidebar_codex_account_ids")
 }
 
 // TestAgentMemoryWriteRequestTags pins the worker save body: {title, body} plus the

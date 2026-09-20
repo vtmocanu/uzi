@@ -72,6 +72,11 @@ func (h *Handler) mountAdminRoutes(r chi.Router, forgeLimiter, authLimiter *mw.L
 			// Every user's Claude rate-limit meters + staleness (PRD #53). Mirrors
 			// /usage: admin-only via this group, per-user rows incl. no_token.
 			r.Get("/rate-limits", h.AdminRateLimits)
+			// Every user's Codex account rate-limit meters + live vault-lock state (PRD
+			// #1209 M3), the Codex sibling of /rate-limits. Admin-only via this group
+			// (session OR admin-scoped CLI token), per-user rows grouped by account; a user
+			// with no linked codex account simply does not appear.
+			r.Get("/codex-rate-limits", h.AdminCodexRateLimits)
 			// Agent-source config + sync status + the staged snapshot for review
 			// (PRD #602 M4). Read-only: the "Sync now" trigger and approve-and-apply
 			// are cookie-only writes in the group below. The staged roles' body is

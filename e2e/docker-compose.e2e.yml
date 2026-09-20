@@ -206,6 +206,10 @@ services:
       # The harness seeds a gauge row directly (like the master-sealed row it stages
       # for user2) and asserts the read endpoints; disabled ⇒ readings serve stale.
       UZI_USAGE_POLL_INTERVAL: "0"
+      # PRD #1209: disable the Codex account rate-limit poller too — its usage host is a
+      # fixed const (no env knob, the same SSRF-guard decision), so an isolated stack must
+      # never call the provider; the harness seeds a snapshot row directly and asserts /me.
+      UZI_CODEX_USAGE_POLL_INTERVAL: "0"
       # PRD #111 M6: PIN the auto-selection freshness window instead of inheriting it.
       #
       # The shipped default is 3x UZI_USAGE_POLL_INTERVAL, and the line above disables

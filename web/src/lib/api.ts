@@ -23,6 +23,7 @@ export const MOCK_MODE = import.meta.env.VITE_UZI_MOCK === "1";
 // request helpers, ProjectSyncVisibility) references in its signatures.
 import type {
   AdminBlockedRepos,
+  AdminCodexRateLimits,
   AdminRateLimits,
   AdminUsage,
   AdminWorker,
@@ -66,6 +67,7 @@ import type {
   JudgeDispositionResult,
   JudgeDispositionScope,
   Memory,
+  MyCodexRateLimits,
   MyRateLimitsResponse,
   Notification,
   NotificationList,
@@ -1064,6 +1066,16 @@ const realApi = {
   /** Every user's rate-limit reading (PRD #53). Admin-only — a non-admin 403s. */
   getAdminRateLimits: () =>
     request<AdminRateLimits>("GET", "/admin/rate-limits"),
+  /** The caller's own Codex per-account rate-limit meters (PRD #1209 M3): one per
+   *  LINKED subscription account, or an empty array for a user with no subscription.
+   *  Percentages/labels only — no token, login blob or raw provider id ever leaves the
+   *  api. The Codex sibling of getMyRateLimits. */
+  getMyCodexRateLimits: () =>
+    request<MyCodexRateLimits>("GET", "/me/codex-rate-limits"),
+  /** Every user's Codex account meters (PRD #1209 M3). Admin-only — a non-admin 403s.
+   *  The Codex sibling of getAdminRateLimits. */
+  getAdminCodexRateLimits: () =>
+    request<AdminCodexRateLimits>("GET", "/admin/codex-rate-limits"),
   getRunMessages: (id: string, afterSeq = 0) =>
     request<{ messages: RunMessage[] }>(
       "GET",

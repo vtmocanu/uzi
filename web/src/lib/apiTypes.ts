@@ -120,6 +120,11 @@ export interface UserSettings {
    *  sidebar rail. The default token always shows and is never listed here.
    *  Absent (older server) reads as []: default-only, the pre-feature look. */
   sidebar_token_ids?: string[];
+  /** Ids of LINKED Codex subscription accounts the user surfaced on the sidebar rail
+   *  (PRD #1209 M1) — the codex sibling of sidebar_token_ids. The default account always
+   *  shows and is never listed here; the server prunes stale ids on read. Absent (older
+   *  server) reads as []: default-only. */
+  sidebar_codex_account_ids?: string[];
   /** Per-user opt-in for the MR review watcher (PRD #700 M5/M6); default ON.
    *  null/absent reads as enabled (the default-ON state); an explicit false means
    *  the user opted this account out, so the watcher stops auto-reworking their MRs.
@@ -153,6 +158,11 @@ export interface UserSettingsPatch {
   typeface?: string | null;
   /** Replaces the whole sidebar-token set (null clears it); absent leaves it. */
   sidebar_token_ids?: string[] | null;
+  /** Replaces the whole sidebar Codex-account set (null clears it); absent leaves it.
+   *  A well-formed id that is not one of the caller's linked accounts is a 400 (unlike
+   *  sidebar_token_ids, which silently drops); the default account is excluded, not
+   *  rejected (PRD #1209 M1). */
+  sidebar_codex_account_ids?: string[] | null;
   /** Per-user MR-review-watcher opt-in (PRD #700 M6); present-false opts out,
    *  present-true (or null clearing back to the default-ON) re-enables. */
   mr_rework_enabled?: boolean | null;
@@ -2912,6 +2922,88 @@ export interface AdminRateLimitUser {
 
 export interface AdminRateLimits {
   users: AdminRateLimitUser[];
+}
+
+// ── Codex per-ACCOUNT rate limits (PRD #1209) ────────────────────────────────
+// The Anthropic meter types above are flat (five_hour / seven_day); Codex reports a
+// NESTED bucket shape — a set of named buckets, each with up to two windows — so it has
+// its own mirror. These carry only labels, flags and the reading, never a token, login
+// blob, or raw provider principal (account_id is uzi's own internal id, a safe client key).
+
+// CodexRateLimitWindow is one utilization window of a Codex bucket. used_percent is
+// 0–100 (null when Codex reported none); the reset is reported as seconds-until and/or an
+// absolute epoch, either of which may be null. limit_window_seconds is the window length.
+export interface CodexRateLimitWindow {
+  used_percent: number | null;
+  limit_window_seconds: number | null;
+  reset_after_seconds: number | null;
+  reset_at: number | null;
+}
+
+// CodexRateLimitBucket is one named Codex rate-limit bucket. id is the stable key;
+// display_name is an optional human label (absent when Codex does not name it). allowed /
+// limit_reached are the bucket's boolean signals (null when unreported). primary /
+// secondary are the up-to-two windows (null when absent).
+export interface CodexRateLimitBucket {
+  id: string;
+  display_name?: string;
+  allowed: boolean | null;
+  limit_reached: boolean | null;
+  primary: CodexRateLimitWindow | null;
+  secondary: CodexRateLimitWindow | null;
+}
+
+/** CodexRateLimitStatus is the server's derived per-account status (PRD #1209). A CLOSED
+ *  set computed server-side — RENDER IT, never re-derive it from the reading. */
+export type CodexRateLimitStatus =
+  | "no_subscription"
+  | "pending"
+  | "no_reading"
+  | "fresh"
+  | "stale"
+  | "vault_locked"
+  | "credential_action_required"
+  | "polling_disabled";
+
+// CodexAccountRateLimit is one Codex subscription account's meter (PRD #1209): the
+// account's uzi id (a client key, never the raw provider principal), the linked-alias
+// labels naming WHICH account this is, whether it is the user's default codex credential,
+// the derived status, the last successful reading time (absent until a first success), a
+// stale flag (present only when a reading exists but has aged), and the nested buckets.
+export interface CodexAccountRateLimit {
+  account_id: string;
+  aliases: string[];
+  is_default: boolean;
+  status: CodexRateLimitStatus;
+  last_success_at?: string;
+  stale?: boolean;
+  buckets: CodexRateLimitBucket[];
+}
+
+// CodexAdminRateLimitRow is one user's row on the admin Codex view (PRD #1209): identity +
+// the live vault-lock state + one meter PER ACCOUNT. Mirrors AdminRateLimitUser.
+export interface CodexAdminRateLimitRow {
+  id: string;
+  email: string;
+  name: string;
+  vault_locked: boolean;
+  accounts: CodexAccountRateLimit[];
+}
+
+// MyCodexRateLimits is what GET /me/codex-rate-limits returns (PRD #1209 M3): ONE meter
+// per LINKED subscription account. An EMPTY array is the no_subscription shape — a user
+// with no linked Codex account (the server's EXISTS(linked) filter drops unlinked/API-key
+// credentials, so an API-key-only default supplies no implicit subscription meter). The
+// Codex sibling of MyRateLimitsResponse.
+export interface MyCodexRateLimits {
+  accounts: CodexAccountRateLimit[];
+}
+
+// AdminCodexRateLimits is the GET /admin/codex-rate-limits envelope (PRD #1209 M3): every
+// user with ≥1 linked Codex account, one row each, grouped by user then account. The Codex
+// sibling of AdminRateLimits.
+export interface AdminCodexRateLimits {
+  users: CodexAdminRateLimitRow[];
 }
 
 // ── Notifications inbox (PRD #46 M2) ─────────────────────────────────────────

@@ -186,6 +186,12 @@ func (h *Handler) mountMeRoutes(r chi.Router) {
 	r.Group(func(r chi.Router) {
 		r.Use(mw.RequireUser(h.q, h.cfg))
 		r.Get("/me/rate-limits", h.SelfRateLimits)
+		// Current-user Codex account rate-limit meters (PRD #1209 M3): the caller's own
+		// per-account 5h/weekly buckets, the Codex sibling of /me/rate-limits. RequireUser
+		// for the SAME reason (D23): it is a GET of the caller's own rows — one owner-scoped
+		// read, no outbound call, no poke, minting nothing and never reading IsAdmin — so it
+		// is reachable from a uzc_ CLI token. Admins use /admin/codex-rate-limits for everyone.
+		r.Get("/me/codex-rate-limits", h.SelfCodexRateLimits)
 	})
 
 	// Current-user settings (non-secret, own-user only): the per-user default

@@ -150,20 +150,27 @@ func newAdminCmd(env Env, gf *globalFlags) *cobra.Command {
 		},
 	}
 
+	var rlProvider string
 	rateLimits := &cobra.Command{
 		Use:   "rate-limits",
-		Short: "Show Claude rate-limit meters per user",
+		Short: "Show rate-limit meters per user (--provider claude|codex)",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := validateProvider(rlProvider); err != nil {
+				return err
+			}
 			c, err := env.client(gf)
 			if err != nil {
 				return err
+			}
+			p := env.printer(gf)
+			if rlProvider == providerCodex {
+				return runAdminCodexRateLimits(cmd, c, p)
 			}
 			rls, err := c.AdminRateLimits(cmd.Context())
 			if err != nil {
 				return err
 			}
-			p := env.printer(gf)
 			if p.Format == uzicli.FormatJSON {
 				return p.JSON(rls)
 			}
@@ -193,6 +200,10 @@ func newAdminCmd(env Env, gf *globalFlags) *cobra.Command {
 			return p.Table([]string{"EMAIL", "VAULT", "TOKEN", "STATUS", "5H%", "7D%"}, rows)
 		},
 	}
+	// --provider selects the credential family. Absent or "claude" keeps the historical
+	// Anthropic output above byte-for-byte; "codex" renders the per-account Codex view
+	// below (PRD #1209 M3).
+	rateLimits.Flags().StringVar(&rlProvider, "provider", providerClaude, "credential family: claude|codex")
 
 	cliTokens := &cobra.Command{
 		Use:   "cli-tokens",

@@ -78,6 +78,20 @@ func (c *HTTPClient) SelfRateLimits(ctx context.Context) ([]apitypes.TokenRateLi
 	return env.Tokens, nil
 }
 
+// SelfCodexRateLimits returns the caller's OWN per-account Codex rate-limit meters
+// (PRD #1209 M3): GET /api/me/codex-rate-limits, decoding the {accounts:[...]} envelope.
+// Mirrors SelfRateLimits' request+decode idiom; the Codex meters carry a NESTED bucket
+// shape (per apitypes.CodexAccountRateLimitDTO) rather than Anthropic's flat 5h/7d pair.
+func (c *HTTPClient) SelfCodexRateLimits(ctx context.Context) ([]apitypes.CodexAccountRateLimitDTO, error) {
+	var env struct {
+		Accounts []apitypes.CodexAccountRateLimitDTO `json:"accounts"`
+	}
+	if err := c.get(ctx, "/api/me/codex-rate-limits", &env); err != nil {
+		return nil, err
+	}
+	return env.Accounts, nil
+}
+
 func (c *HTTPClient) GetMySettings(ctx context.Context) (apitypes.UserSettingsDTO, error) {
 	var env struct {
 		Settings apitypes.UserSettingsDTO `json:"settings"`

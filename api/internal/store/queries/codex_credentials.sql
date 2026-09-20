@@ -141,3 +141,29 @@ RETURNING id, kind, label, is_default, auto_eligible, created_at, updated_at;
 -- row here and carry an empty status.
 SELECT user_secret_id, status FROM codex_credential_state
 WHERE user_id = @user_id;
+
+-- name: CountLinkedAliasesForCodexAccount :one
+-- How many LINKED aliases this user holds for one provider account (PRD #1209 M1). The
+-- membership check the settings handler uses to validate a sidebar-codex id: an id counts
+-- as a real subscription account the caller owns ONLY if it is a provider_account_id with
+-- at least one status='linked' alias owned by the caller. Owner-scoped, so an unknown id,
+-- an api_key (which is 'static', never 'linked'), or another user's account all return 0 —
+-- one indistinguishable answer, no existence oracle. Also the rate-limit fence's linked
+-- half asks the same question in EXISTS form (codex_rate_limits.sql).
+SELECT count(*) FROM codex_credential_state
+WHERE user_id = @user_id AND provider_account_id = @provider_account_id AND status = 'linked';
+
+-- name: ListStagedCodexAliases :many
+-- Every 'staging' codex alias across ALL users (PRD #1209 M1), factory-wide — the aliases
+-- a linker/refresher still has to resolve to an account. Returns the (owner, alias) pair
+-- so the caller opens each owner-scoped. Ordered for a deterministic, readable sweep.
+SELECT user_id, user_secret_id FROM codex_credential_state
+WHERE status = 'staging'
+ORDER BY user_id, user_secret_id;
+
+-- name: ListStagedCodexAliasesForUser :many
+-- One user's 'staging' codex aliases (PRD #1209 M1), the owner-scoped sibling of
+-- ListStagedCodexAliases. Same shape minus the cross-user fan-out.
+SELECT user_id, user_secret_id FROM codex_credential_state
+WHERE user_id = @user_id AND status = 'staging'
+ORDER BY user_secret_id;

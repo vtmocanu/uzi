@@ -49,7 +49,7 @@ func TestCommandTree(t *testing.T) {
 
 	topWant := []string{
 		"login", "logout", "auth", "whoami", "run", "review", "findings",
-		"worker", "token", "repo", "docs", "project-sync", "handoff", "admin", "skill", "version",
+		"worker", "token", "rate-limits", "repo", "docs", "project-sync", "handoff", "admin", "skill", "version",
 	}
 	for _, name := range topWant {
 		if findCmd(root, name) == nil {

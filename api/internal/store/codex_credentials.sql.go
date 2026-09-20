@@ -76,6 +76,30 @@ func (q *Queries) CountCodexSecrets(ctx context.Context, userID uuid.UUID) (int6
 	return count, err
 }
 
+const countLinkedAliasesForCodexAccount = `-- name: CountLinkedAliasesForCodexAccount :one
+SELECT count(*) FROM codex_credential_state
+WHERE user_id = $1 AND provider_account_id = $2 AND status = 'linked'
+`
+
+type CountLinkedAliasesForCodexAccountParams struct {
+	UserID            uuid.UUID   `json:"user_id"`
+	ProviderAccountID pgtype.UUID `json:"provider_account_id"`
+}
+
+// How many LINKED aliases this user holds for one provider account (PRD #1209 M1). The
+// membership check the settings handler uses to validate a sidebar-codex id: an id counts
+// as a real subscription account the caller owns ONLY if it is a provider_account_id with
+// at least one status='linked' alias owned by the caller. Owner-scoped, so an unknown id,
+// an api_key (which is 'static', never 'linked'), or another user's account all return 0 —
+// one indistinguishable answer, no existence oracle. Also the rate-limit fence's linked
+// half asks the same question in EXISTS form (codex_rate_limits.sql).
+func (q *Queries) CountLinkedAliasesForCodexAccount(ctx context.Context, arg CountLinkedAliasesForCodexAccountParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countLinkedAliasesForCodexAccount, arg.UserID, arg.ProviderAccountID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const getCodexCredentialState = `-- name: GetCodexCredentialState :one
 SELECT user_secret_id, user_id, status, provider_account_id, material_revision, last_error, created_at, updated_at FROM codex_credential_state
 WHERE user_secret_id = $1 AND user_id = $2
@@ -105,7 +129,7 @@ func (q *Queries) GetCodexCredentialState(ctx context.Context, arg GetCodexCrede
 }
 
 const getCodexProviderAccountByID = `-- name: GetCodexProviderAccountByID :one
-SELECT id, user_id, provider_user_id, workspace_account_id, sealed_login, sealed_with, generation, credential_revision, recovery_sealed, recovery_generation, recovery_sealed_with, coord_state, coord_operation_id, lease_deadline, committed_generation, created_at, updated_at FROM codex_provider_account
+SELECT id, user_id, provider_user_id, workspace_account_id, sealed_login, sealed_with, generation, credential_revision, recovery_sealed, recovery_generation, recovery_sealed_with, coord_state, coord_operation_id, lease_deadline, committed_generation, created_at, updated_at, reauth_required, reauth_generation, reauth_credential_revision FROM codex_provider_account
 WHERE user_id = $1 AND id = $2
 `
 
@@ -137,12 +161,15 @@ func (q *Queries) GetCodexProviderAccountByID(ctx context.Context, arg GetCodexP
 		&i.CommittedGeneration,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.ReauthRequired,
+		&i.ReauthGeneration,
+		&i.ReauthCredentialRevision,
 	)
 	return i, err
 }
 
 const getCodexProviderAccountByTuple = `-- name: GetCodexProviderAccountByTuple :one
-SELECT id, user_id, provider_user_id, workspace_account_id, sealed_login, sealed_with, generation, credential_revision, recovery_sealed, recovery_generation, recovery_sealed_with, coord_state, coord_operation_id, lease_deadline, committed_generation, created_at, updated_at FROM codex_provider_account
+SELECT id, user_id, provider_user_id, workspace_account_id, sealed_login, sealed_with, generation, credential_revision, recovery_sealed, recovery_generation, recovery_sealed_with, coord_state, coord_operation_id, lease_deadline, committed_generation, created_at, updated_at, reauth_required, reauth_generation, reauth_credential_revision FROM codex_provider_account
 WHERE user_id = $1
   AND provider_user_id = $2
   AND workspace_account_id = $3
@@ -178,6 +205,9 @@ func (q *Queries) GetCodexProviderAccountByTuple(ctx context.Context, arg GetCod
 		&i.CommittedGeneration,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.ReauthRequired,
+		&i.ReauthGeneration,
+		&i.ReauthCredentialRevision,
 	)
 	return i, err
 }
@@ -217,7 +247,7 @@ func (q *Queries) InsertCodexCredentialState(ctx context.Context, arg InsertCode
 const insertCodexProviderAccount = `-- name: InsertCodexProviderAccount :one
 INSERT INTO codex_provider_account (user_id, provider_user_id, workspace_account_id, sealed_login, sealed_with)
 VALUES ($1, $2, $3, $4, $5)
-RETURNING id, user_id, provider_user_id, workspace_account_id, sealed_login, sealed_with, generation, credential_revision, recovery_sealed, recovery_generation, recovery_sealed_with, coord_state, coord_operation_id, lease_deadline, committed_generation, created_at, updated_at
+RETURNING id, user_id, provider_user_id, workspace_account_id, sealed_login, sealed_with, generation, credential_revision, recovery_sealed, recovery_generation, recovery_sealed_with, coord_state, coord_operation_id, lease_deadline, committed_generation, created_at, updated_at, reauth_required, reauth_generation, reauth_credential_revision
 `
 
 type InsertCodexProviderAccountParams struct {
@@ -259,6 +289,9 @@ func (q *Queries) InsertCodexProviderAccount(ctx context.Context, arg InsertCode
 		&i.CommittedGeneration,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.ReauthRequired,
+		&i.ReauthGeneration,
+		&i.ReauthCredentialRevision,
 	)
 	return i, err
 }
@@ -383,6 +416,73 @@ func (q *Queries) ListCodexCredentialStatesForUser(ctx context.Context, userID u
 	for rows.Next() {
 		var i ListCodexCredentialStatesForUserRow
 		if err := rows.Scan(&i.UserSecretID, &i.Status); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listStagedCodexAliases = `-- name: ListStagedCodexAliases :many
+SELECT user_id, user_secret_id FROM codex_credential_state
+WHERE status = 'staging'
+ORDER BY user_id, user_secret_id
+`
+
+type ListStagedCodexAliasesRow struct {
+	UserID       uuid.UUID `json:"user_id"`
+	UserSecretID uuid.UUID `json:"user_secret_id"`
+}
+
+// Every 'staging' codex alias across ALL users (PRD #1209 M1), factory-wide — the aliases
+// a linker/refresher still has to resolve to an account. Returns the (owner, alias) pair
+// so the caller opens each owner-scoped. Ordered for a deterministic, readable sweep.
+func (q *Queries) ListStagedCodexAliases(ctx context.Context) ([]ListStagedCodexAliasesRow, error) {
+	rows, err := q.db.Query(ctx, listStagedCodexAliases)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListStagedCodexAliasesRow{}
+	for rows.Next() {
+		var i ListStagedCodexAliasesRow
+		if err := rows.Scan(&i.UserID, &i.UserSecretID); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listStagedCodexAliasesForUser = `-- name: ListStagedCodexAliasesForUser :many
+SELECT user_id, user_secret_id FROM codex_credential_state
+WHERE user_id = $1 AND status = 'staging'
+ORDER BY user_secret_id
+`
+
+type ListStagedCodexAliasesForUserRow struct {
+	UserID       uuid.UUID `json:"user_id"`
+	UserSecretID uuid.UUID `json:"user_secret_id"`
+}
+
+// One user's 'staging' codex aliases (PRD #1209 M1), the owner-scoped sibling of
+// ListStagedCodexAliases. Same shape minus the cross-user fan-out.
+func (q *Queries) ListStagedCodexAliasesForUser(ctx context.Context, userID uuid.UUID) ([]ListStagedCodexAliasesForUserRow, error) {
+	rows, err := q.db.Query(ctx, listStagedCodexAliasesForUser, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListStagedCodexAliasesForUserRow{}
+	for rows.Next() {
+		var i ListStagedCodexAliasesForUserRow
+		if err := rows.Scan(&i.UserID, &i.UserSecretID); err != nil {
 			return nil, err
 		}
 		items = append(items, i)

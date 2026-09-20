@@ -938,3 +938,46 @@ func TestLoadTLSListener(t *testing.T) {
 		}
 	})
 }
+
+// TestLoadCodexUsagePollInterval exercises the per-account Codex rate-limit poll cadence
+// (PRD #1209 M2) through Load(): the shipped 5m default when unset, "0" as the legitimate
+// DISABLE value (parseNonNegDuration, not parseDuration — 0 turns the engine off), and a
+// sub-minute value clamped UP to the 1m floor (a tight interval floods the fixed usage host
+// for no added freshness). The sibling UZI_USAGE_POLL_INTERVAL clamp is
+// TestLoadUsagePollInterval-adjacent coverage; this pins the Codex knob's own parse/clamp.
+func TestLoadCodexUsagePollInterval(t *testing.T) {
+	setBase := func(t *testing.T) {
+		t.Setenv("DATABASE_URL", "postgres://uzi:pw@db:5432/uzi?sslmode=disable")
+		t.Setenv("JWT_SECRET", "unit-test-jwt-signing-key-not-a-real-secret")
+		varied := make([]byte, secretbox.KeySize)
+		for i := range varied {
+			varied[i] = byte(i + 1)
+		}
+		t.Setenv("UZI_SECRET_KEY", base64.StdEncoding.EncodeToString(varied))
+	}
+
+	for _, tc := range []struct {
+		name string
+		set  bool
+		val  string
+		want time.Duration
+	}{
+		{"default when unset", false, "", 5 * time.Minute},
+		{"zero disables the engine", true, "0", 0},
+		{"sub-minute clamped up to the 1m floor", true, "30s", time.Minute},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setBase(t)
+			if tc.set {
+				t.Setenv("UZI_CODEX_USAGE_POLL_INTERVAL", tc.val)
+			}
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.CodexUsagePollInterval != tc.want {
+				t.Fatalf("CodexUsagePollInterval = %v, want %v", cfg.CodexUsagePollInterval, tc.want)
+			}
+		})
+	}
+}

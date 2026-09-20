@@ -38,7 +38,7 @@ func (q *Queries) CountUsers(ctx context.Context) (int64, error) {
 const createUser = `-- name: CreateUser :one
 INSERT INTO users (email, password_hash, display_name, is_admin)
 VALUES ($1, $2, $3, $4)
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids
 `
 
 type CreateUserParams struct {
@@ -95,6 +95,7 @@ func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (User, e
 		&i.DarkTheme,
 		&i.Typeface,
 		&i.DefaultHarness,
+		&i.SidebarCodexAccountIds,
 	)
 	return i, err
 }
@@ -102,7 +103,7 @@ func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (User, e
 const createUserOIDC = `-- name: CreateUserOIDC :one
 INSERT INTO users (email, password_hash, display_name, is_admin, oidc_issuer, oidc_subject)
 VALUES ($1, NULL, $2, $3, $4, $5)
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids
 `
 
 type CreateUserOIDCParams struct {
@@ -164,6 +165,7 @@ func (q *Queries) CreateUserOIDC(ctx context.Context, arg CreateUserOIDCParams) 
 		&i.DarkTheme,
 		&i.Typeface,
 		&i.DefaultHarness,
+		&i.SidebarCodexAccountIds,
 	)
 	return i, err
 }
@@ -183,7 +185,7 @@ func (q *Queries) GetUserAttributionEnabled(ctx context.Context, id uuid.UUID) (
 }
 
 const getUserByEmail = `-- name: GetUserByEmail :one
-SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness FROM users WHERE email = $1
+SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids FROM users WHERE email = $1
 `
 
 func (q *Queries) GetUserByEmail(ctx context.Context, email string) (User, error) {
@@ -228,12 +230,13 @@ func (q *Queries) GetUserByEmail(ctx context.Context, email string) (User, error
 		&i.DarkTheme,
 		&i.Typeface,
 		&i.DefaultHarness,
+		&i.SidebarCodexAccountIds,
 	)
 	return i, err
 }
 
 const getUserByID = `-- name: GetUserByID :one
-SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness FROM users WHERE id = $1
+SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids FROM users WHERE id = $1
 `
 
 func (q *Queries) GetUserByID(ctx context.Context, id uuid.UUID) (User, error) {
@@ -278,12 +281,13 @@ func (q *Queries) GetUserByID(ctx context.Context, id uuid.UUID) (User, error) {
 		&i.DarkTheme,
 		&i.Typeface,
 		&i.DefaultHarness,
+		&i.SidebarCodexAccountIds,
 	)
 	return i, err
 }
 
 const getUserByOIDCSubject = `-- name: GetUserByOIDCSubject :one
-SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness FROM users WHERE oidc_issuer = $1 AND oidc_subject = $2
+SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids FROM users WHERE oidc_issuer = $1 AND oidc_subject = $2
 `
 
 type GetUserByOIDCSubjectParams struct {
@@ -334,6 +338,7 @@ func (q *Queries) GetUserByOIDCSubject(ctx context.Context, arg GetUserByOIDCSub
 		&i.DarkTheme,
 		&i.Typeface,
 		&i.DefaultHarness,
+		&i.SidebarCodexAccountIds,
 	)
 	return i, err
 }
@@ -441,22 +446,23 @@ func (q *Queries) GetUserSchedulePause(ctx context.Context, id uuid.UUID) (GetUs
 }
 
 const getUserSettings = `-- name: GetUserSettings :one
-SELECT default_model, default_effort, judge_model, summary_model, theme, sidebar_token_ids, mr_rework_enabled, appearance_mode, light_theme, dark_theme, typeface, default_harness FROM users WHERE id = $1
+SELECT default_model, default_effort, judge_model, summary_model, theme, sidebar_token_ids, mr_rework_enabled, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids FROM users WHERE id = $1
 `
 
 type GetUserSettingsRow struct {
-	DefaultModel    pgtype.Text `json:"default_model"`
-	DefaultEffort   pgtype.Text `json:"default_effort"`
-	JudgeModel      pgtype.Text `json:"judge_model"`
-	SummaryModel    pgtype.Text `json:"summary_model"`
-	Theme           pgtype.Text `json:"theme"`
-	SidebarTokenIds []uuid.UUID `json:"sidebar_token_ids"`
-	MrReworkEnabled pgtype.Bool `json:"mr_rework_enabled"`
-	AppearanceMode  pgtype.Text `json:"appearance_mode"`
-	LightTheme      pgtype.Text `json:"light_theme"`
-	DarkTheme       pgtype.Text `json:"dark_theme"`
-	Typeface        pgtype.Text `json:"typeface"`
-	DefaultHarness  pgtype.Text `json:"default_harness"`
+	DefaultModel           pgtype.Text `json:"default_model"`
+	DefaultEffort          pgtype.Text `json:"default_effort"`
+	JudgeModel             pgtype.Text `json:"judge_model"`
+	SummaryModel           pgtype.Text `json:"summary_model"`
+	Theme                  pgtype.Text `json:"theme"`
+	SidebarTokenIds        []uuid.UUID `json:"sidebar_token_ids"`
+	MrReworkEnabled        pgtype.Bool `json:"mr_rework_enabled"`
+	AppearanceMode         pgtype.Text `json:"appearance_mode"`
+	LightTheme             pgtype.Text `json:"light_theme"`
+	DarkTheme              pgtype.Text `json:"dark_theme"`
+	Typeface               pgtype.Text `json:"typeface"`
+	DefaultHarness         pgtype.Text `json:"default_harness"`
+	SidebarCodexAccountIds []uuid.UUID `json:"sidebar_codex_account_ids"`
 }
 
 // The current user's own (non-secret) settings surface: default worker model
@@ -472,6 +478,9 @@ type GetUserSettingsRow struct {
 // "inherit the instance default", resolved by theme.ResolveAppearance at read time.
 // default_harness (PRD #1429 M1 / D3) rides it too; NULL means "no preference" (implicit
 // creation falls through D11), and the settings surface exposes it as nullable claude|codex.
+// sidebar_codex_account_ids (PRD #1209 M1) rides it as well — the linked Codex accounts the
+// user surfaced on the sidebar rail, the codex sibling of sidebar_token_ids; NULL/'{}' read
+// as "no explicit extras".
 func (q *Queries) GetUserSettings(ctx context.Context, id uuid.UUID) (GetUserSettingsRow, error) {
 	row := q.db.QueryRow(ctx, getUserSettings, id)
 	var i GetUserSettingsRow
@@ -488,6 +497,7 @@ func (q *Queries) GetUserSettings(ctx context.Context, id uuid.UUID) (GetUserSet
 		&i.DarkTheme,
 		&i.Typeface,
 		&i.DefaultHarness,
+		&i.SidebarCodexAccountIds,
 	)
 	return i, err
 }
@@ -511,7 +521,7 @@ func (q *Queries) GetUserSummaryModel(ctx context.Context, id uuid.UUID) (pgtype
 const linkUserOIDC = `-- name: LinkUserOIDC :one
 UPDATE users SET oidc_issuer = $2, oidc_subject = $3
 WHERE id = $1 AND oidc_subject IS NULL
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids
 `
 
 type LinkUserOIDCParams struct {
@@ -567,12 +577,13 @@ func (q *Queries) LinkUserOIDC(ctx context.Context, arg LinkUserOIDCParams) (Use
 		&i.DarkTheme,
 		&i.Typeface,
 		&i.DefaultHarness,
+		&i.SidebarCodexAccountIds,
 	)
 	return i, err
 }
 
 const listUsers = `-- name: ListUsers :many
-SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness FROM users ORDER BY created_at ASC
+SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids FROM users ORDER BY created_at ASC
 `
 
 func (q *Queries) ListUsers(ctx context.Context) ([]User, error) {
@@ -623,6 +634,7 @@ func (q *Queries) ListUsers(ctx context.Context) ([]User, error) {
 			&i.DarkTheme,
 			&i.Typeface,
 			&i.DefaultHarness,
+			&i.SidebarCodexAccountIds,
 		); err != nil {
 			return nil, err
 		}
@@ -632,6 +644,41 @@ func (q *Queries) ListUsers(ctx context.Context) ([]User, error) {
 		return nil, err
 	}
 	return items, nil
+}
+
+const pruneUserSidebarCodexAccounts = `-- name: PruneUserSidebarCodexAccounts :one
+UPDATE users u
+SET sidebar_codex_account_ids = (
+        SELECT COALESCE(array_agg(t.x ORDER BY t.ord), '{}')::uuid[]
+        FROM unnest(u.sidebar_codex_account_ids) WITH ORDINALITY AS t(x, ord)
+        WHERE EXISTS (
+            SELECT 1 FROM codex_credential_state s
+            WHERE s.user_id = u.id AND s.provider_account_id = t.x AND s.status = 'linked'
+        )
+    )
+WHERE u.id = $1
+RETURNING sidebar_codex_account_ids
+`
+
+// Drop stale ids from the user's sidebar Codex-account set in ONE atomic UPDATE (PRD #1209
+// M1), never a read-merge-write. An id is stale once it no longer names an account the user
+// has a linked alias for (the account was deleted, or its last codex_auth alias was
+// unlinked). unnest ... WITH ORDINALITY re-filters the row's CURRENT array to the ids that
+// still have a linked alias, PRESERVING the stored order (ORDER BY the ordinality), and
+// writes the filtered array back in the same statement. Because it reads and rewrites the
+// column inside one UPDATE — never fetching into Go and writing back — a concurrent
+// SetUserSidebarCodexAccounts PUT cannot be lost: the two statements serialize, and this
+// one only ever REMOVES stale ids from whatever the current array is. This is the
+// SetUserAppearance rationale (that query was rewritten from read-merge-write BECAUSE it
+// raced). COALESCE(..., '{}') handles the empty/NULL array. Own-user only; returns the
+// pruned array so the settings GET can use it directly. The users table carries no
+// updated_at column (SetUserSidebarTokens / SetUserAppearance touch none either), so this
+// writes only the array.
+func (q *Queries) PruneUserSidebarCodexAccounts(ctx context.Context, id uuid.UUID) ([]uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, pruneUserSidebarCodexAccounts, id)
+	var sidebar_codex_account_ids []uuid.UUID
+	err := row.Scan(&sidebar_codex_account_ids)
+	return sidebar_codex_account_ids, err
 }
 
 const setLastLogin = `-- name: SetLastLogin :exec
@@ -650,7 +697,7 @@ SET is_active = $1,
     -- reactivation leaves it untouched.
     token_version = CASE WHEN $1 THEN token_version ELSE token_version + 1 END
 WHERE id = $2
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids
 `
 
 type SetUserActiveParams struct {
@@ -700,13 +747,14 @@ func (q *Queries) SetUserActive(ctx context.Context, arg SetUserActiveParams) (U
 		&i.DarkTheme,
 		&i.Typeface,
 		&i.DefaultHarness,
+		&i.SidebarCodexAccountIds,
 	)
 	return i, err
 }
 
 const setUserAdmin = `-- name: SetUserAdmin :one
 UPDATE users SET is_admin = $1 WHERE id = $2
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids
 `
 
 type SetUserAdminParams struct {
@@ -761,6 +809,7 @@ func (q *Queries) SetUserAdmin(ctx context.Context, arg SetUserAdminParams) (Use
 		&i.DarkTheme,
 		&i.Typeface,
 		&i.DefaultHarness,
+		&i.SidebarCodexAccountIds,
 	)
 	return i, err
 }
@@ -827,7 +876,7 @@ func (q *Queries) SetUserAppearance(ctx context.Context, arg SetUserAppearancePa
 
 const setUserAttributionEnabled = `-- name: SetUserAttributionEnabled :one
 UPDATE users SET attribution_enabled = $2 WHERE id = $1
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids
 `
 
 type SetUserAttributionEnabledParams struct {
@@ -880,13 +929,14 @@ func (q *Queries) SetUserAttributionEnabled(ctx context.Context, arg SetUserAttr
 		&i.DarkTheme,
 		&i.Typeface,
 		&i.DefaultHarness,
+		&i.SidebarCodexAccountIds,
 	)
 	return i, err
 }
 
 const setUserAutopilotEnabled = `-- name: SetUserAutopilotEnabled :one
 UPDATE users SET autopilot_enabled = $2 WHERE id = $1
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids
 `
 
 type SetUserAutopilotEnabledParams struct {
@@ -938,13 +988,14 @@ func (q *Queries) SetUserAutopilotEnabled(ctx context.Context, arg SetUserAutopi
 		&i.DarkTheme,
 		&i.Typeface,
 		&i.DefaultHarness,
+		&i.SidebarCodexAccountIds,
 	)
 	return i, err
 }
 
 const setUserCIAutofixEnabled = `-- name: SetUserCIAutofixEnabled :one
 UPDATE users SET ci_autofix_enabled = $2 WHERE id = $1
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids
 `
 
 type SetUserCIAutofixEnabledParams struct {
@@ -998,6 +1049,7 @@ func (q *Queries) SetUserCIAutofixEnabled(ctx context.Context, arg SetUserCIAuto
 		&i.DarkTheme,
 		&i.Typeface,
 		&i.DefaultHarness,
+		&i.SidebarCodexAccountIds,
 	)
 	return i, err
 }
@@ -1065,7 +1117,7 @@ func (q *Queries) SetUserDefaultModel(ctx context.Context, arg SetUserDefaultMod
 
 const setUserEphemeralWorkersEnabled = `-- name: SetUserEphemeralWorkersEnabled :one
 UPDATE users SET ephemeral_workers_enabled = $2 WHERE id = $1
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids
 `
 
 type SetUserEphemeralWorkersEnabledParams struct {
@@ -1121,6 +1173,7 @@ func (q *Queries) SetUserEphemeralWorkersEnabled(ctx context.Context, arg SetUse
 		&i.DarkTheme,
 		&i.Typeface,
 		&i.DefaultHarness,
+		&i.SidebarCodexAccountIds,
 	)
 	return i, err
 }
@@ -1130,7 +1183,7 @@ UPDATE users
 SET judge_anthropic_bind_mode = $1,
     judge_anthropic_secret_id = $2
 WHERE id = $3
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids
 `
 
 type SetUserJudgeAnthropicBindingParams struct {
@@ -1193,13 +1246,14 @@ func (q *Queries) SetUserJudgeAnthropicBinding(ctx context.Context, arg SetUserJ
 		&i.DarkTheme,
 		&i.Typeface,
 		&i.DefaultHarness,
+		&i.SidebarCodexAccountIds,
 	)
 	return i, err
 }
 
 const setUserJudgeEnabled = `-- name: SetUserJudgeEnabled :one
 UPDATE users SET judge_enabled = $2 WHERE id = $1
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids
 `
 
 type SetUserJudgeEnabledParams struct {
@@ -1253,6 +1307,7 @@ func (q *Queries) SetUserJudgeEnabled(ctx context.Context, arg SetUserJudgeEnabl
 		&i.DarkTheme,
 		&i.Typeface,
 		&i.DefaultHarness,
+		&i.SidebarCodexAccountIds,
 	)
 	return i, err
 }
@@ -1301,7 +1356,7 @@ func (q *Queries) SetUserMrReworkEnabled(ctx context.Context, arg SetUserMrRewor
 
 const setUserNotifyEarlyReset = `-- name: SetUserNotifyEarlyReset :one
 UPDATE users SET notify_early_limit_reset = $2 WHERE id = $1
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids
 `
 
 type SetUserNotifyEarlyResetParams struct {
@@ -1355,6 +1410,7 @@ func (q *Queries) SetUserNotifyEarlyReset(ctx context.Context, arg SetUserNotify
 		&i.DarkTheme,
 		&i.Typeface,
 		&i.DefaultHarness,
+		&i.SidebarCodexAccountIds,
 	)
 	return i, err
 }
@@ -1384,6 +1440,28 @@ func (q *Queries) SetUserSchedulePause(ctx context.Context, arg SetUserScheduleP
 	var i SetUserSchedulePauseRow
 	err := row.Scan(&i.SchedulesPaused, &i.SchedulesPausedUntil)
 	return i, err
+}
+
+const setUserSidebarCodexAccounts = `-- name: SetUserSidebarCodexAccounts :one
+UPDATE users SET sidebar_codex_account_ids = $1::uuid[] WHERE id = $2
+RETURNING sidebar_codex_account_ids
+`
+
+type SetUserSidebarCodexAccountsParams struct {
+	SidebarCodexAccountIds []uuid.UUID `json:"sidebar_codex_account_ids"`
+	ID                     uuid.UUID   `json:"id"`
+}
+
+// Replaces the user's whole sidebar Codex-account set (PRD #1209 M1, 00239): the linked
+// subscription accounts whose rate meters ride the sidebar rail. The codex sibling of
+// SetUserSidebarTokens. The handler has already validated the ids to the caller's own
+// linked accounts (rejecting a well-formed non-member) and excluded the implicit default
+// account; an empty array is a valid "no explicit extras" choice. Own-user only.
+func (q *Queries) SetUserSidebarCodexAccounts(ctx context.Context, arg SetUserSidebarCodexAccountsParams) ([]uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, setUserSidebarCodexAccounts, arg.SidebarCodexAccountIds, arg.ID)
+	var sidebar_codex_account_ids []uuid.UUID
+	err := row.Scan(&sidebar_codex_account_ids)
+	return sidebar_codex_account_ids, err
 }
 
 const setUserSidebarTokens = `-- name: SetUserSidebarTokens :one
@@ -1448,7 +1526,7 @@ func (q *Queries) SetUserTheme(ctx context.Context, arg SetUserThemeParams) (pgt
 
 const setUserWaitOnLimit = `-- name: SetUserWaitOnLimit :one
 UPDATE users SET wait_on_limit = $2 WHERE id = $1
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids
 `
 
 type SetUserWaitOnLimitParams struct {
@@ -1507,6 +1585,7 @@ func (q *Queries) SetUserWaitOnLimit(ctx context.Context, arg SetUserWaitOnLimit
 		&i.DarkTheme,
 		&i.Typeface,
 		&i.DefaultHarness,
+		&i.SidebarCodexAccountIds,
 	)
 	return i, err
 }

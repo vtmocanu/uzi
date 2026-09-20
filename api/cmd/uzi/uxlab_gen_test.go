@@ -79,6 +79,7 @@ func TestGenerateUXLabFrames(t *testing.T) {
 	// scenes maps a base name to a builder that returns the rendered frame for a theme.
 	scenes := map[string]func(dark bool) string{
 		"board-populated":              func(d bool) string { return boardPopulated(d, now) },
+		"board-codex":                  func(d bool) string { return boardCodex(d, now) },
 		"board-empty":                  boardEmpty,
 		"board-admin":                  boardAdmin,
 		"board-filter":                 func(d bool) string { return boardFilter(d, now) },
@@ -86,6 +87,7 @@ func TestGenerateUXLabFrames(t *testing.T) {
 		"board-revising":               func(d bool) string { return boardRevising(d, now) },
 		"board-milestones":             func(d bool) string { return boardMilestones(d, now) },
 		"detail-running":               func(d bool) string { return detailRunning(d, now) },
+		"detail-codex":                 func(d bool) string { return detailCodex(d, now) },
 		"detail-milestones-attributed": func(d bool) string { return detailMilestonesAttributed(d, now) },
 		"detail-crew-autofold":         func(d bool) string { return detailCrewAutofold(d, now) },
 		"detail-planning":              func(d bool) string { return detailPlanning(d, now) },
@@ -259,6 +261,38 @@ func boardMeters() []apitypes.TokenRateLimitDTO {
 	}
 }
 
+// codexMeters is a representative set of the viewer's own per-account Codex rate-limit meters,
+// mirroring demo.go's SelfCodexMeters: the default "primary" account and the listed "team"
+// account both show (ok/warn/danger bands across their 5h bucket's primary+secondary windows),
+// "unlisted" is readable but hidden, "archive" is stale (shown DIMMED) and listed, a no_reading
+// account never appears. Shared by the ux-lab Codex frames so the Codex meters (PRD #1209 M3) are
+// exercised offline on both the board strip and the detail rail.
+func codexMeters() []apitypes.CodexAccountRateLimitDTO {
+	fp := func(f float64) *float64 { return &f }
+	bucket := func(primary, secondary *float64) []apitypes.CodexRateLimitBucketDTO {
+		b := apitypes.CodexRateLimitBucketDTO{ID: "5h", DisplayName: "5h"}
+		if primary != nil {
+			b.Primary = &apitypes.CodexRateLimitWindowDTO{UsedPercent: primary}
+		}
+		if secondary != nil {
+			b.Secondary = &apitypes.CodexRateLimitWindowDTO{UsedPercent: secondary}
+		}
+		return []apitypes.CodexRateLimitBucketDTO{b}
+	}
+	return []apitypes.CodexAccountRateLimitDTO{
+		{AccountID: "cx-primary", Aliases: []string{"primary"}, IsDefault: true, Status: "fresh", Buckets: bucket(fp(41), fp(63))},
+		{AccountID: "cx-team", Aliases: []string{"team"}, Status: "fresh", Buckets: bucket(fp(88), fp(52))},
+		{AccountID: "cx-unlisted", Aliases: []string{"unlisted"}, Status: "fresh", Buckets: bucket(fp(12), nil)},
+		{AccountID: "cx-old", Aliases: []string{"archive"}, Status: "stale", Buckets: bucket(fp(70), nil)},
+		{AccountID: "cx-pending", Aliases: []string{"pending"}, Status: "no_reading"},
+	}
+}
+
+// codexSidebar is the ux-lab Codex sidebar selection, matching demo.go: the listed "cx-team"
+// plus the stale "cx-old" (so the stale-dimmed path renders); the default "cx-primary" always
+// shows regardless.
+func codexSidebar() []string { return []string{"cx-team", "cx-old"} }
+
 func boardPopulated(dark bool, now time.Time) string {
 	fake := &uzicli.FakeClient{Runs: boardRuns(now)}
 	m := uxModel(fake, "", dark)
@@ -269,6 +303,24 @@ func boardPopulated(dark bool, now time.Time) string {
 	// under the wordmark (#519).
 	m = step(m, rateLimitsMsg{tokens: boardMeters()})
 	m = step(m, settingsMsg{settings: apitypes.UserSettingsDTO{SidebarTokenIds: []string{"sec-meta"}}})
+	return m.View().Content
+}
+
+// boardCodex is boardPopulated PLUS the viewer's own Codex meters and Codex sidebar selection, so
+// the board's SECOND provider strip line (boardCodexRateLimitStrip, PRD #1209 M3) renders under
+// the Claude strip and its percentages stay legible at the lab's 100 cols. The single settings
+// message carries BOTH sidebar selections (Claude + Codex) so the two strip lines show together.
+func boardCodex(dark bool, now time.Time) string {
+	fake := &uzicli.FakeClient{Runs: boardRuns(now)}
+	m := uxModel(fake, "", dark)
+	m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: fake.Runs})
+	m = step(m, secretsMsg{count: 2})
+	m = step(m, rateLimitsMsg{tokens: boardMeters()})
+	m = step(m, codexRateLimitsMsg{accounts: codexMeters()})
+	m = step(m, settingsMsg{settings: apitypes.UserSettingsDTO{
+		SidebarTokenIds:        []string{"sec-meta"},
+		SidebarCodexAccountIds: codexSidebar(),
+	}})
 	return m.View().Content
 }
 
@@ -408,6 +460,36 @@ func detailRunning(dark bool, now time.Time) string {
 	// the board's runs[0] for this same run id (identical cost value).
 	run.Usage = &apitypes.UsageDTO{CostStatus: "metered", CostUSD: 9.55, InputTokens: 2_400_000, CacheReadTokens: 14_200_000, CacheCreationTokens: 120_000, OutputTokens: 88_400}
 	m := detailBase(dark, run, now, true)
+	m = withLiveStream(m)
+	return m.View().Content
+}
+
+// detailCodex is detailRunning's run (a milestone-structured run with SPEND and the run's own
+// `meta` Claude account) PLUS the viewer's own Codex meters and Codex sidebar selection, so the
+// crew rail draws its CODEX block under the Claude ACCOUNTS block (PRD #1209 M3). It uses the
+// compact laneMsgs roster so the rail stays expanded at 100x34 and every block — MILESTONES,
+// SPEND, ACCOUNTS, CODEX — is on show; the stale "archive" account renders dimmed. A single
+// settings message carries BOTH sidebar selections so the Claude and Codex accounts show together.
+func detailCodex(dark bool, now time.Time) string {
+	run := apitypes.RunDTO{ID: detailRunID, Kind: "issue", Status: "running", Health: "ok",
+		IssueTitle:          "Add rate-limit headroom to the scheduler poll",
+		IssueIID:            ip(452),
+		IssueWebURL:         sp("https://github.com/vtmocanu/uzi/issues/452"),
+		StartedAt:           tp(now.Add(-4 * time.Minute)),
+		Milestones:          milestoneList,
+		MilestonesCompleted: []string{"m1", "m2"}, MilestonesInProgress: []string{"m3", "m4"}}
+	run.AnthropicSecretID, run.AnthropicSecretLabel = sp("sec-meta"), sp("meta")
+	run.Usage = &apitypes.UsageDTO{CostStatus: "metered", CostUSD: 9.55, InputTokens: 2_400_000, CacheReadTokens: 14_200_000, CacheCreationTokens: 120_000, OutputTokens: 88_400}
+	fake := &uzicli.FakeClient{}
+	m := uxModel(fake, detailRunID, dark)
+	m = applyDetail(m, run, laneMsgs(now))
+	m = step(m, rateLimitsMsg{tokens: boardMeters()})
+	m = step(m, codexRateLimitsMsg{accounts: codexMeters()})
+	m = step(m, settingsMsg{settings: apitypes.UserSettingsDTO{
+		SidebarTokenIds:        []string{"sec-meta"},
+		SidebarCodexAccountIds: codexSidebar(),
+	}})
+	m = step(m, runInputsMsg{runID: detailRunID, err: nil})
 	m = withLiveStream(m)
 	return m.View().Content
 }

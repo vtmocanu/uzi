@@ -74,6 +74,14 @@ SET generation           = generation + 1,
     -- so clearing the recovery blob MUST also clear its key discriminator or an account
     -- with a populated recovery slot would violate the CHECK (23514) on commit.
     recovery_sealed_with = NULL,
+    -- PRD #1209 M1: a commit advances the generation with a verified new login, which is
+    -- exactly the "the account is healthy again" signal a pending reauth flag waits for —
+    -- so clear it (and its observation counters) in the SAME statement. Clearing it
+    -- unconditionally keeps the 00239 coherence CHECK satisfied (reauth_required=false
+    -- needs no counters) and is a no-op when no reauth was pending.
+    reauth_required            = false,
+    reauth_generation          = NULL,
+    reauth_credential_revision = NULL,
     updated_at           = now()
 WHERE id = $4 AND user_id = $5 AND generation = $6::bigint
     AND coord_state = 'in_progress' AND coord_operation_id = $3::uuid
@@ -429,6 +437,53 @@ func (q *Queries) ListUnresolvedCodexRefreshIntents(ctx context.Context, arg Lis
 	return items, nil
 }
 
+const markCodexReauthRequired = `-- name: MarkCodexReauthRequired :execrows
+UPDATE codex_provider_account
+SET reauth_required            = true,
+    reauth_generation          = $1::bigint,
+    reauth_credential_revision = $2::bigint,
+    updated_at                 = now()
+WHERE id = $3 AND user_id = $4
+    AND coord_state IN ('idle', 'committed')
+    AND recovery_sealed IS NULL
+    AND generation = $1::bigint
+    AND credential_revision = $2::bigint
+`
+
+type MarkCodexReauthRequiredParams struct {
+	ObservedGeneration         int64     `json:"observed_generation"`
+	ObservedCredentialRevision int64     `json:"observed_credential_revision"`
+	ID                         uuid.UUID `json:"id"`
+	UserID                     uuid.UUID `json:"user_id"`
+}
+
+// Raise the "this account's login needs re-authentication" flag (PRD #1209 M1): the poll
+// path sets it when a rate-limit poll fails because the subscription must re-login. It
+// records the (generation, credential_revision) the flag was raised against so a later
+// verified install (CommitCodexRefresh / PromoteCodexRecovery / the reauth arm of
+// RefreshCodexAccountLogin) can clear it atomically with the generation advance.
+//
+// FENCED so the flag only lands on a SETTLED account that is STILL at the observed
+// counters: coord_state IN ('idle','committed') keeps it off an in-flight refresh
+// ('in_progress') and off a quarantined account (whose reconcile path owns the reauth
+// state); recovery_sealed IS NULL keeps it off an account carrying protected material; and
+// generation=@observed_generation AND credential_revision=@observed_credential_revision
+// make a stale poll (whose account moved between observation and this write) match 0 rows,
+// so the flag can never describe a superseded generation. :execrows — 0 rows means the
+// account moved or is not in a flaggable state, and the caller discards.
+func (q *Queries) MarkCodexReauthRequired(ctx context.Context, arg MarkCodexReauthRequiredParams) (int64, error) {
+	result, err := q.db.Exec(ctx, markCodexReauthRequired,
+		arg.ObservedGeneration,
+		arg.ObservedCredentialRevision,
+		arg.ID,
+		arg.UserID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const promoteCodexRecovery = `-- name: PromoteCodexRecovery :one
 UPDATE codex_provider_account
 SET sealed_login         = $1,
@@ -441,6 +496,13 @@ SET sealed_login         = $1,
     recovery_sealed      = NULL,
     recovery_generation  = NULL,
     recovery_sealed_with = NULL,
+    -- PRD #1209 M1: promoting recovery material installs a re-verified login and advances
+    -- the generation, so any pending reauth flag is satisfied — clear it (and its
+    -- observation counters) atomically, same as CommitCodexRefresh. Unconditional so the
+    -- 00239 coherence CHECK holds and it is a no-op when no reauth was pending.
+    reauth_required            = false,
+    reauth_generation          = NULL,
+    reauth_credential_revision = NULL,
     updated_at           = now()
 WHERE id = $3 AND user_id = $4
     AND coord_state = 'quarantined'
@@ -560,10 +622,25 @@ SET sealed_login         = $1,
     -- with a populated recovery slot (e.g. a quarantine re-login) would violate the
     -- CHECK (23514) on this install.
     recovery_sealed_with = NULL,
+    -- PRD #1209 M1: a verified re-login clears any pending reauth flag atomically with the
+    -- generation advance. Unconditional so the 00239 coherence CHECK holds; a no-op on the
+    -- quarantined arm when no reauth was pending.
+    reauth_required            = false,
+    reauth_generation          = NULL,
+    reauth_credential_revision = NULL,
     updated_at           = now()
 WHERE id = $3 AND user_id = $4
-    AND coord_state = 'quarantined'
     AND generation = $5::bigint
+    AND (
+        coord_state = 'quarantined'
+        OR (
+            reauth_required = true
+            AND coord_state IN ('idle', 'committed')
+            AND recovery_sealed IS NULL
+            AND reauth_generation = generation
+            AND reauth_credential_revision = credential_revision
+        )
+    )
 `
 
 type RefreshCodexAccountLoginParams struct {
@@ -582,13 +659,23 @@ type RefreshCodexAccountLoginParams struct {
 // recovery slots. Owner-scoped; 0 rows for a foreign account. Unlike PromoteCodexRecovery
 // this is a fresh install (new sealed_with may differ), so sealed_with IS written.
 //
-// Guarded on coord_state='quarantined' AND generation = @from_generation so ONLY a
-// quarantined account still at the caller's expected generation is restored: the restore
-// now LOSES to a concurrent PromoteCodexRecovery that already advanced the generation (and
-// returned the account to 'idle'). 0 rows means the quarantine moved under the caller (the
-// generation advanced or the account is no longer quarantined) → the caller must reject
-// before linking. This mirrors PromoteCodexRecovery's CAS: a stale writer loses rather than
-// clobbering a freshly-promoted login.
+// TWO ARMS (PRD #1209 M1), both requiring generation = @from_generation (the CAS the
+// quarantined arm always had — a stale writer loses rather than clobbering a
+// freshly-promoted login):
+//   - QUARANTINED arm (coord_state='quarantined') — unchanged behaviour from #1147: the
+//     out-of-band re-login recovery for a quarantined account. It ALSO clears the reauth
+//     columns now (see the SET list), which is a no-op when none were set.
+//   - REAUTH arm (reauth_required=true AND coord_state IN ('idle','committed') AND
+//     recovery_sealed IS NULL AND reauth_generation=generation AND
+//     reauth_credential_revision=credential_revision) — PRD #1209 M1: a re-login that
+//     clears a pending reauth flag on an account that is NOT quarantined. It is fenced on
+//     the account still being at the (generation, credential_revision) the reauth was
+//     raised against (reauth_generation/revision = the live values), so a re-login racing
+//     a concurrent generation advance matches 0 rows. recovery_sealed IS NULL keeps this
+//     arm off the recovery path (a populated slot is the quarantined arm's / promotion's
+//     concern). 0 rows means the account moved under the caller (generation advanced, no
+//     longer quarantined, or the reauth window closed) → the caller must reject before
+//     linking.
 func (q *Queries) RefreshCodexAccountLogin(ctx context.Context, arg RefreshCodexAccountLoginParams) (int64, error) {
 	result, err := q.db.Exec(ctx, refreshCodexAccountLogin,
 		arg.Sealed,

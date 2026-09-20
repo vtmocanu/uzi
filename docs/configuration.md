@@ -417,6 +417,24 @@ See [rate-limits.md](rate-limits.md) for what the meters show. The background po
 | `UZI_USAGE_PROBE` | `true` | `false` disables the ~1-token header-probe fallback entirely; affected users (whose credential the free usage endpoint refuses) then show `unavailable` instead of a reading. See [rate-limits.md](rate-limits.md#the-probe-and-turning-it-off) for the token-cost accounting. |
 | `UZI_ANTHROPIC_HTTP_TIMEOUT` | `15s` | Hard per-call timeout on every outbound request to Anthropic (usage endpoint and header probe), mirroring `FORGE_HTTP_TIMEOUT`'s and `UZI_OIDC_HTTP_TIMEOUT`'s posture. |
 
+## Codex account rate limits (PRD #1209)
+
+See [rate-limits.md](rate-limits.md#codex-account-limits) for what the meters
+show. A sibling background poller (`api/internal/codexusagepoller`) reads
+each linked Codex **subscription** account's usage with its own saved
+login — no worker, run, or model call involved; an OpenAI API key is never
+sent to it. Every outbound request from this poller targets the fixed Codex
+usage host only, refuses a redirect, and reads a bounded response body — see
+[ARCHITECTURE.md](../ARCHITECTURE.md) for the poller and credential design.
+
+| Var | Default | Notes |
+|---|---|---|
+| `UZI_CODEX_USAGE_POLL_INTERVAL` | `5m` | How often the Codex poller ticks. `0` disables the engine entirely (no boot pass, no ticker, no poke-on-save, no staged-login reconcile); existing rows are still served, always marked stale. A nonzero value below `1m` is clamped up to `1m` with a boot warning — not because the read spends a token (the Codex usage GET is free), but to bound provider egress to the fixed usage host: a too-tight interval fires one request per linked account per tick for no added freshness. |
+
+`UZI_USAGE_POLL_INTERVAL` and `UZI_USAGE_PROBE` above keep their existing,
+Claude-only meanings; the Codex poller has no header-probe fallback to
+toggle.
+
 ## Auto-selecting an Anthropic token (PRD #111)
 
 A worker can pick its Anthropic credential automatically from the pool its owner

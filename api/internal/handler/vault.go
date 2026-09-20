@@ -43,6 +43,11 @@ func (h *Handler) VaultUnlock(w http.ResponseWriter, r *http.Request) {
 	err := h.vault.UnlockExisting(r.Context(), user.ID, req.Password)
 	switch {
 	case err == nil:
+		// A successful unlock lets the Codex poller read this user's linked accounts;
+		// poke so their account meters refresh within seconds (PRD #1209). Best-effort.
+		if h.codexUsagePoker != nil {
+			h.codexUsagePoker.Poke(user.ID)
+		}
 		w.WriteHeader(http.StatusNoContent)
 	case errors.Is(err, vault.ErrWrongPassword), errors.Is(err, vault.ErrNoVault):
 		// One response for both: whether a vault row exists is not something the
@@ -126,6 +131,11 @@ func (h *Handler) VaultPassphrase(w http.ResponseWriter, r *http.Request) {
 		slog.Error("vault passphrase create", "user", user.ID, "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
+	}
+	// A successful create+unlock lets the Codex poller read this user's linked accounts;
+	// poke so their account meters refresh within seconds (PRD #1209). Best-effort.
+	if h.codexUsagePoker != nil {
+		h.codexUsagePoker.Poke(user.ID)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }

@@ -79,10 +79,50 @@ func (m tuiModel) selectedRateMeters() (shown []apitypes.TokenRateLimitDTO, show
 // NN% text. The NN% text is always present so an Ascii/NO_COLOR terminal (which strips the SGR
 // tone) keeps the legible signal — colour is never the only cue. Clamped to one physical line.
 // The Label is USER-AUTHORED and drawn through renderer.Plain (D7).
+//
+// The Codex meters ride their OWN second strip line (boardCodexRateLimitStrip), NOT this one:
+// a combined line (2 Claude + 2 Codex ≈ 173 cols) clipped the Codex percentages away entirely
+// at 100/80 cols, defeating the point of the feature (PRD #1209 M3). Splitting the providers
+// onto two lines keeps each legible at a standard width. This method's output stays byte-
+// identical to before whenever no Codex account is shown, so the Claude-only render is unmoved.
 func (m tuiModel) boardRateLimitStrip(now time.Time) string {
+	segs := m.boardClaudeMeterSegs(now)
+	if len(segs) == 0 {
+		return ""
+	}
+	// A faint leading space aligns the strip under the brand block (the brand line starts " ").
+	// Tokens are joined with three spaces; the per-group accent bar ▎ (prefixed above) is the
+	// group delimiter, so each token's two windows still read as a group; the intra-token 5h↔7d
+	// gap stays 3 spaces.
+	strip := " " + strings.Join(segs, "   ")
+	return clampVisual(strip, m.width)
+}
+
+// boardCodexRateLimitStrip is the Codex provider's OWN board strip line, drawn under the Claude
+// strip (or under the wordmark when no Claude token is shown) whenever ≥1 selected readable Codex
+// account exists — mirroring boardRateLimitStrip but for the Codex meters (PRD #1209 M3). Giving
+// Codex its own line is what keeps its bars/percentages reachable at a standard width (≤120 cols):
+// riding the Claude line, the combined strip overran and clampVisual chopped the Codex section off
+// entirely. The board's row math reserves this extra physical line via boardCapacity, exactly as
+// it reserves the Claude strip's row. "" when nothing is selected. Aliases/bucket names ride
+// renderer.Plain (D7), inside boardCodexMeterSeg.
+func (m tuiModel) boardCodexRateLimitStrip(now time.Time) string {
+	codex := m.boardCodexMeterSeg(now)
+	if codex == "" {
+		return ""
+	}
+	// The same leading space as the Claude strip aligns the Codex line under the brand block.
+	return clampVisual(" "+codex, m.width)
+}
+
+// boardClaudeMeterSegs builds the per-token Claude segments of the board strip (the
+// Anthropic 5h/7d meters), one string per shown token, empty when nothing is selected.
+// Split out of boardRateLimitStrip so the Codex section can ride the same line after it
+// without perturbing the Claude bytes.
+func (m tuiModel) boardClaudeMeterSegs(now time.Time) []string {
 	shown, showLabel := m.selectedRateMeters()
 	if len(shown) == 0 {
-		return ""
+		return nil
 	}
 	segs := make([]string, 0, len(shown))
 	for _, t := range shown {
@@ -103,12 +143,7 @@ func (m tuiModel) boardRateLimitStrip(now time.Time) string {
 		seg = paintSeg(accent, nil, false, "▎") + seg
 		segs = append(segs, seg)
 	}
-	// A faint leading space aligns the strip under the brand block (the brand line starts " ").
-	// Tokens are joined with three spaces; the per-group accent bar ▎ (prefixed above) is the
-	// group delimiter, so each token's two windows still read as a group; the intra-token 5h↔7d
-	// gap stays 3 spaces.
-	strip := " " + strings.Join(segs, "   ")
-	return clampVisual(strip, m.width)
+	return segs
 }
 
 // rateWindowCell renders one rate-limit window as `label <bar> NN%`: a faint label ("5h"/"7d"),

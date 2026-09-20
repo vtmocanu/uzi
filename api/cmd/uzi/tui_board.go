@@ -261,7 +261,7 @@ func (m tuiModel) boardKey(k string) (tea.Model, tea.Cmd) {
 		// becomes the new waitID, so the next periodic tick does not stack a second poll on top
 		// of this one and any periodic reply still in flight is superseded (its stale reqID is
 		// dropped); this reply's own reqID clears the guard.
-		return m, tea.Batch((&m).startBoardReq(), m.fetchRateLimitsCmd(), m.fetchSettingsCmd(), m.fetchVaultCmd())
+		return m, tea.Batch((&m).startBoardReq(), m.fetchRateLimitsCmd(), m.fetchCodexRateLimitsCmd(), m.fetchSettingsCmd(), m.fetchVaultCmd())
 	case keyAdmin:
 		m.board.admin = !m.board.admin
 		m.board.adminDenied = false
@@ -498,6 +498,13 @@ func (m tuiModel) renderBoard() string {
 	// only when at least one token is readable AND shown; otherwise nothing (no strip).
 	if strip := m.boardRateLimitStrip(time.Now()); strip != "" {
 		sb.WriteString(strip + "\n")
+	}
+	// The Codex meters get their OWN provider line under the Claude strip (PRD #1209 M3), so
+	// their percentages stay legible at a standard width instead of being clipped off the end
+	// of a combined line. Drawn only when ≥1 selected readable Codex account exists;
+	// boardCapacity reserves this physical line exactly as it reserves the Claude strip's.
+	if codex := m.boardCodexRateLimitStrip(time.Now()); codex != "" {
+		sb.WriteString(codex + "\n")
 	}
 	// The tier-1 vault-locked hint (PRD #1251 M2, D5): its OWN line directly under the strip,
 	// never replacing or hiding it — both are distinct signals and can show together. Its row
@@ -789,6 +796,11 @@ func (m tuiModel) boardCapacity() int {
 	// The rate-limit strip, when present, adds one line between the wordmark and the blank
 	// below it. Recomputed here (cheap) so the row-window math matches renderBoard's layout.
 	if m.boardRateLimitStrip(time.Now()) != "" {
+		chrome++
+	}
+	// The Codex meters ride their own second strip line (PRD #1209 M3), reserved exactly like
+	// the Claude strip's row so the extra line never overdraws the run list.
+	if m.boardCodexRateLimitStrip(time.Now()) != "" {
 		chrome++
 	}
 	// The tier-1 vault-locked hint (PRD #1251 M2) is its own line under the strip when shown;

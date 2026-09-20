@@ -42,6 +42,9 @@ vi.mock("../lib/api", () => ({
     // The sidebar-footer rate-limit micro-meters (PRD #53) self-gate: default to
     // no_token so they render nothing in these nav/collapse assertions.
     getMyRateLimits: vi.fn().mockResolvedValue({ status: "no_token" }),
+    // The Codex sidebar micro-meters (PRD #1209 M3) self-gate: default to no linked
+    // account so they render nothing in these nav/collapse assertions.
+    getMyCodexRateLimits: vi.fn().mockResolvedValue({ accounts: [] }),
     // SidebarRateLimits fetches the chosen sidebar-token set on mount.
     getMySettings: vi.fn().mockResolvedValue({ settings: { default_harness: null, default_model: null, default_effort: null, judge_model: null, summary_model: null, theme: null } }),
     // The sidebar-footer version badge fetches GET /api/version on mount; resolve it

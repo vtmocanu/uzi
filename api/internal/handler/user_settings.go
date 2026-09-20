@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/httpx"
@@ -41,6 +42,12 @@ type userSettingsDTO struct {
 	// NULL/absent user value is read as enabled); an explicit false is the opt-OUT.
 	MrReworkEnabled *bool    `json:"mr_rework_enabled"`
 	SidebarTokenIds []string `json:"sidebar_token_ids"`
+	// SidebarCodexAccountIds lists the LINKED Codex subscription accounts the user
+	// surfaced on the sidebar rail (PRD #1209 M1, 00239) — the codex sibling of
+	// SidebarTokenIds. The default account always shows and is never listed here; empty
+	// means default-only. Populated from the stored uuid[] via uuidStrings, so a NULL
+	// column reads as [] (never null), and pruned of stale ids on the GET path.
+	SidebarCodexAccountIds []string `json:"sidebar_codex_account_ids"`
 	// The four appearance override fields (PRD #1167): the user's RAW per-field
 	// overrides (each NULL ⇒ JSON null ⇒ inherit the instance default). These are
 	// the stored override values, NOT the resolved appearance — the resolved
@@ -58,12 +65,22 @@ type userSettingsDTO struct {
 // userSettingsResponse reads the user's settings row (one GetUserSettings query,
 // summary_model folded in) and writes the settings body, shared by the GET and PUT
 // handlers so the two responses never drift.
-func (h *Handler) userSettingsResponse(w http.ResponseWriter, r *http.Request, userID uuid.UUID) {
+//
+// sidebarCodexOverride, when non-nil, replaces the stored sidebar_codex_account_ids in the
+// response with the caller-supplied set: the GET path passes the array
+// PruneUserSidebarCodexAccounts returned so the surfaced set reflects the just-pruned value
+// directly (PRD #1209 M1). A nil override uses the value read from GetUserSettings — the PUT
+// path, and the GET path's best-effort fallback when the prune UPDATE failed.
+func (h *Handler) userSettingsResponse(w http.ResponseWriter, r *http.Request, userID uuid.UUID, sidebarCodexOverride *[]uuid.UUID) {
 	s, err := h.q.GetUserSettings(r.Context(), userID)
 	if err != nil {
 		slog.Error("get user settings", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
+	}
+	sidebarCodexIDs := s.SidebarCodexAccountIds
+	if sidebarCodexOverride != nil {
+		sidebarCodexIDs = *sidebarCodexOverride
 	}
 	// summary_model rides the GetUserSettings one-row read (it is the same users row),
 	// so the settings surface reads it from `s` — no separate query. GetUserSummaryModel
@@ -71,31 +88,51 @@ func (h *Handler) userSettingsResponse(w http.ResponseWriter, r *http.Request, u
 	// needed (PRD #362 M2).
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"settings": userSettingsDTO{
-			DefaultModel:    textPtrValue(s.DefaultModel.Valid, s.DefaultModel.String),
-			DefaultEffort:   textPtrValue(s.DefaultEffort.Valid, s.DefaultEffort.String),
-			JudgeModel:      textPtrValue(s.JudgeModel.Valid, s.JudgeModel.String),
-			SummaryModel:    textPtrValue(s.SummaryModel.Valid, s.SummaryModel.String),
-			Theme:           textPtrValue(s.Theme.Valid, s.Theme.String),
-			MrReworkEnabled: boolPtrValue(s.MrReworkEnabled),
-			SidebarTokenIds: uuidStrings(s.SidebarTokenIds),
-			AppearanceMode:  textPtrValue(s.AppearanceMode.Valid, s.AppearanceMode.String),
-			LightTheme:      textPtrValue(s.LightTheme.Valid, s.LightTheme.String),
-			DarkTheme:       textPtrValue(s.DarkTheme.Valid, s.DarkTheme.String),
-			Typeface:        textPtrValue(s.Typeface.Valid, s.Typeface.String),
-			DefaultHarness:  textPtrValue(s.DefaultHarness.Valid, s.DefaultHarness.String),
+			DefaultModel:           textPtrValue(s.DefaultModel.Valid, s.DefaultModel.String),
+			DefaultEffort:          textPtrValue(s.DefaultEffort.Valid, s.DefaultEffort.String),
+			JudgeModel:             textPtrValue(s.JudgeModel.Valid, s.JudgeModel.String),
+			SummaryModel:           textPtrValue(s.SummaryModel.Valid, s.SummaryModel.String),
+			Theme:                  textPtrValue(s.Theme.Valid, s.Theme.String),
+			MrReworkEnabled:        boolPtrValue(s.MrReworkEnabled),
+			SidebarTokenIds:        uuidStrings(s.SidebarTokenIds),
+			SidebarCodexAccountIds: uuidStrings(sidebarCodexIDs),
+			AppearanceMode:         textPtrValue(s.AppearanceMode.Valid, s.AppearanceMode.String),
+			LightTheme:             textPtrValue(s.LightTheme.Valid, s.LightTheme.String),
+			DarkTheme:              textPtrValue(s.DarkTheme.Valid, s.DarkTheme.String),
+			Typeface:               textPtrValue(s.Typeface.Valid, s.Typeface.String),
+			DefaultHarness:         textPtrValue(s.DefaultHarness.Valid, s.DefaultHarness.String),
 		},
 	})
 }
 
 // GetMySettings returns the current user's own settings. Session-authenticated
 // and own-user only (no admin path — a user's model and theme are theirs).
+//
+// The GET path ATOMICALLY prunes stale sidebar Codex-account ids first (PRD #1209 M1):
+// PruneUserSidebarCodexAccounts drops in ONE UPDATE any id that no longer names a linked
+// account (its account was deleted or its last codex_auth alias unlinked), so a since-
+// unlinked id never lingers in the surfaced set. It is a single atomic UPDATE — never a
+// read-merge-write — so it cannot lose a concurrent SetUserSidebarCodexAccounts.
+//
+// The prune is BEST-EFFORT: a failed cosmetic sidebar prune must NOT break the core
+// settings read (the Claude/anthropic sidebar path has no such failure mode). On success
+// the response uses the pruned array Prune returns; on error we log a warning and fall
+// back to the currently-stored sidebar_codex_account_ids. The fallback set is still
+// correct — the meter/sidebar surfaces render only accounts that are actually linked, so a
+// lingering stale id is harmless and gets pruned on the next successful GET.
 func (h *Handler) GetMySettings(w http.ResponseWriter, r *http.Request) {
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	h.userSettingsResponse(w, r, user.ID)
+	pruned, err := h.q.PruneUserSidebarCodexAccounts(r.Context(), user.ID)
+	if err != nil {
+		slog.Warn("prune user sidebar codex accounts (best effort)", "error", err)
+		h.userSettingsResponse(w, r, user.ID, nil)
+		return
+	}
+	h.userSettingsResponse(w, r, user.ID, &pruned)
 }
 
 // PutMySettings updates the current user's own settings with PATCH-like
@@ -129,6 +166,13 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 		Theme           json.RawMessage `json:"theme"`
 		MrReworkEnabled json.RawMessage `json:"mr_rework_enabled"`
 		SidebarTokenIds json.RawMessage `json:"sidebar_token_ids"`
+		// The linked Codex accounts on the sidebar rail (PRD #1209 M1): same
+		// absent/present tri-state as sidebar_token_ids — absent leaves the stored set,
+		// present (a JSON array, or null) replaces it. Unlike sidebar_token_ids, a
+		// well-formed id that is not one of the caller's linked accounts is a 400, not a
+		// silent drop (the implicit default account is the one exception — excluded, not
+		// rejected).
+		SidebarCodexAccountIds json.RawMessage `json:"sidebar_codex_account_ids"`
 		// The four appearance override fields (PRD #1167), same absent/null/value
 		// tri-state as theme: absent ⇒ column unchanged, null ⇒ clear to NULL
 		// (inherit), value ⇒ validated then set.
@@ -320,6 +364,30 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 		sidebarIDs = ids
 	}
 
+	var sidebarCodexIDs []uuid.UUID
+	sidebarCodexPresent := req.SidebarCodexAccountIds != nil
+	if sidebarCodexPresent {
+		var raw *[]string
+		if err := json.Unmarshal(req.SidebarCodexAccountIds, &raw); err != nil {
+			httpx.Error(w, http.StatusBadRequest, "invalid sidebar_codex_account_ids")
+			return
+		}
+		ids, err := h.validateSidebarCodexAccountIds(r.Context(), user.ID, raw)
+		if err != nil {
+			// Same split as sidebar_token_ids: a store fault is a 500, a genuine request
+			// defect (a non-UUID entry, an oversized list, or an id that is not one of the
+			// caller's linked accounts) is a 400 with an IDENTICAL message across the
+			// unknown / api-key / other-user cases (no existence oracle).
+			if errors.Is(err, errCodexSidebarStore) {
+				httpx.Error(w, http.StatusInternalServerError, "internal error")
+			} else {
+				httpx.Error(w, http.StatusBadRequest, err.Error())
+			}
+			return
+		}
+		sidebarCodexIDs = ids
+	}
+
 	// ---- Phase 2: writes. Every present field has validated, so nothing below
 	// leaves the row half-updated on a bad input. Each SetUser* is its own
 	// single-column statement (PATCH semantics); the four appearance columns go in
@@ -469,7 +537,18 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	h.userSettingsResponse(w, r, user.ID)
+	if sidebarCodexPresent {
+		if _, err := h.q.SetUserSidebarCodexAccounts(r.Context(), store.SetUserSidebarCodexAccountsParams{
+			ID:                     user.ID,
+			SidebarCodexAccountIds: sidebarCodexIDs,
+		}); err != nil {
+			slog.Error("set user sidebar codex accounts", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+
+	h.userSettingsResponse(w, r, user.ID, nil)
 }
 
 // maxSidebarTokenIds bounds the request list before any per-id work; nobody
@@ -524,6 +603,106 @@ func (h *Handler) validateSidebarTokenIds(ctx context.Context, userID uuid.UUID,
 		}
 	}
 	return ids, nil
+}
+
+// errCodexSidebarStore marks a store fault inside validateSidebarCodexAccountIds (the
+// codex sibling of errSidebarStore), so the caller answers 500 for it while every genuine
+// request defect stays a 400. The message is what a 500 body would say anyway; the
+// identity is what matters.
+var errCodexSidebarStore = errors.New("internal error")
+
+// errCodexSidebarNotLinked is the SINGLE 400 a well-formed id that is not one of the
+// caller's linked Codex accounts produces (PRD #1209 M1). It is one message across all
+// three miss cases — an unknown id, an api-key alias (which is 'static', never 'linked'),
+// and another user's account — precisely so it is not an existence oracle: the client can
+// never tell which of the three a rejected id was.
+var errCodexSidebarNotLinked = errors.New("sidebar_codex_account_ids: id is not one of your linked Codex accounts")
+
+// validateSidebarCodexAccountIds maps the request list to the stored set (PRD #1209 M1):
+// nil or empty clears back to default-only; each entry must parse as a UUID (a bad one is
+// a 400); duplicates collapse; the list is capped at maxSidebarTokenIds. UNLIKE
+// validateSidebarTokenIds it does NOT silently drop a non-member — a well-formed id that
+// is not one of the caller's LINKED subscription accounts is a 400 (errCodexSidebarNotLinked),
+// with an identical message across the unknown / api-key / other-user cases. The ONE
+// exception is the implicit default account (the account behind the default linked
+// codex_auth alias): it always shows on the rail, so a submitted default id is EXCLUDED
+// from the stored extras rather than rejected — the stored set never holds it. Membership
+// is checked with the owner-scoped CountLinkedAliasesForCodexAccount (0 for an unknown id,
+// an api-key, or a foreign account — the same indistinguishable answer).
+func (h *Handler) validateSidebarCodexAccountIds(ctx context.Context, userID uuid.UUID, raw *[]string) ([]uuid.UUID, error) {
+	if raw == nil || len(*raw) == 0 {
+		return []uuid.UUID{}, nil
+	}
+	if len(*raw) > maxSidebarTokenIds {
+		return nil, fmt.Errorf("sidebar_codex_account_ids: at most %d entries", maxSidebarTokenIds)
+	}
+	// Resolve the implicit default account once, so a submitted default id is excluded
+	// (not rejected) below. uuid.Nil means the user has no default linked codex account.
+	defaultAccountID, err := h.defaultCodexAccountID(ctx, userID)
+	if err != nil {
+		return nil, errCodexSidebarStore
+	}
+	ids := make([]uuid.UUID, 0, len(*raw))
+	seen := make(map[uuid.UUID]bool, len(*raw))
+	for _, v := range *raw {
+		id, err := uuid.Parse(v)
+		if err != nil {
+			return nil, fmt.Errorf("sidebar_codex_account_ids: %q is not a valid id", v)
+		}
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		// The default account is implicit — never stored among the explicit extras — so
+		// excluding a submitted default id is correct, and it must NOT 400.
+		if defaultAccountID != uuid.Nil && id == defaultAccountID {
+			continue
+		}
+		n, err := h.q.CountLinkedAliasesForCodexAccount(ctx, store.CountLinkedAliasesForCodexAccountParams{
+			UserID:            userID,
+			ProviderAccountID: pgtype.UUID{Bytes: id, Valid: true},
+		})
+		if err != nil {
+			slog.Error("count linked aliases for codex account", "error", err)
+			return nil, errCodexSidebarStore
+		}
+		if n == 0 {
+			return nil, errCodexSidebarNotLinked
+		}
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+
+// defaultCodexAccountID resolves the account behind the user's DEFAULT linked codex_auth
+// alias (PRD #1209 M1), or uuid.Nil when there is none (no default codex_auth, or it is
+// not currently linked to an account). Owner-scoped throughout. Returns a non-nil error
+// only on a real store fault; a missing default or an unlinked default is (uuid.Nil, nil).
+func (h *Handler) defaultCodexAccountID(ctx context.Context, userID uuid.UUID) (uuid.UUID, error) {
+	secretID, err := h.q.GetDefaultUserSecretID(ctx, store.GetDefaultUserSecretIDParams{
+		UserID: userID,
+		Kind:   store.KindCodexAuth,
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return uuid.Nil, nil
+		}
+		return uuid.Nil, err
+	}
+	st, err := h.q.GetCodexCredentialState(ctx, store.GetCodexCredentialStateParams{
+		UserSecretID: secretID,
+		UserID:       userID,
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return uuid.Nil, nil
+		}
+		return uuid.Nil, err
+	}
+	if st.Status != "linked" || !st.ProviderAccountID.Valid {
+		return uuid.Nil, nil
+	}
+	return uuid.UUID(st.ProviderAccountID.Bytes), nil
 }
 
 // uuidStrings renders a stored uuid[] for the DTO; a NULL column arrives as a

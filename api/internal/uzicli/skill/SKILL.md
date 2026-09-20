@@ -207,6 +207,7 @@ uzi worker set-token <worker-id> --default
 uzi worker set-token <worker-id> --auto
 uzi token list
 uzi token pool <label> --on|--off
+uzi rate-limits [--provider claude|codex]
 uzi memory list
 uzi memory rm <memory-id>
 uzi docs list [--audience user|operator|design|contributor|all]
@@ -228,7 +229,7 @@ uzi admin users
 uzi admin runs
 uzi admin workers
 uzi admin usage
-uzi admin rate-limits
+uzi admin rate-limits [--provider claude|codex]
 uzi admin cli-tokens
 uzi admin guardrail-impact
 uzi admin blocked-repos
@@ -1320,6 +1321,15 @@ into `file`/`dismiss`. `undo` keys on the `disposition_id` field (read it from
   meters read failed) — which is not the same as "not eligible", so branch on null
   before you branch on the value. An un-pooled token reports `not_pooled` there
   rather than the table's `-`.
+- `uzi rate-limits [--provider claude|codex]` — your own rate-limit meters, the
+  terminal twin of the web sidebar meters. `--provider claude` (the default) lists your
+  Anthropic tokens as `TOKEN`/`STATUS`/`5H%`/`7D%`; `--provider codex` lists your linked
+  Codex accounts, one row per `(account, bucket)`, as
+  `ACCOUNT`/`STATUS`/`BUCKET`/`PRIMARY`/`SECONDARY`/`RESET`. A window uzi has no reading
+  for renders `—` (not `0`), so partial or unknown state is never confused with a genuine
+  zero. `--json` returns the raw meters (`[]TokenRateLimitDTO` for claude, the nested
+  `[]CodexAccountRateLimitDTO` for codex). Read-only; the cross-user view is
+  `uzi admin rate-limits`.
 - `uzi memory list` — your agents' cross-run memory across every repo (each entry
   carries its repo, title, and the run that wrote it). `uzi memory rm <memory-id>`
   — purge one entry. Agents write memory in-run via the `save_memory` tool, not
@@ -1341,6 +1351,11 @@ into `file`/`dismiss`. `undo` keys on the `disposition_id` field (read it from
   reads the agent-source config (repo, ref, enabled, interval, and whether a
   credential is set — never its value) and sync status (last sync/apply, staged
   counts, pending); the "Sync now" and approve-and-apply writes stay web-only.
+  `rate-limits` takes `--provider claude|codex` (default `claude`): `claude` is the
+  per-user Anthropic view (`EMAIL`/`VAULT`/`TOKEN`/`STATUS`/`5H%`/`7D%`), `codex` the
+  per-user Codex view grouped by user, one row per `(account, bucket)`
+  (`EMAIL`/`VAULT`/`ACCOUNT`/`STATUS`/`BUCKET`/`PRIMARY`/`SECONDARY`/`RESET`), with a
+  no-reading window shown as `—`.
 - `uzi admin review backlog|stats` (PRD #1184) — the read-only admin **"All users"**
   judge aggregate: every user's recommendations deduped by `(category, target)` across
   the whole factory, with **attribution hidden**. `backlog` prints one line per group as

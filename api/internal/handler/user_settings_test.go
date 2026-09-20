@@ -25,26 +25,33 @@ import (
 // -> respond) without a real database. The
 // SetUserDefaultModel/SetUserDefaultEffort/SetUserJudgeModel/SetUserSummaryModel/SetUserTheme
 // UPDATEs QueryRow a single Text RETURNING column (discarded by the handler) and
-// SetUserSidebarTokens a uuid[] one; GetUserSettings QueryRows twelve (default_model,
+// SetUserSidebarTokens a uuid[] one; GetUserSettings QueryRows thirteen (default_model,
 // default_effort, judge_model, summary_model, theme, sidebar_token_ids,
 // mr_rework_enabled, appearance_mode, light_theme, dark_theme, typeface — the four
-// appearance columns joined the read in PRD #1167 M1 — and default_harness, which joined
-// in PRD #1429 M1) — summary_model rides that
+// appearance columns joined the read in PRD #1167 M1 — default_harness, which joined
+// in PRD #1429 M1, and sidebar_codex_account_ids, which joined in PRD #1209 M1) —
+// summary_model rides that
 // one-row read, so the settings handler makes no separate GetUserSummaryModel call.
 // The UPDATE paths record the written value so the round-trip is observable.
 type fakeSettingsDB struct {
-	model          pgtype.Text
-	effort         pgtype.Text
-	judge          pgtype.Text
-	summary        pgtype.Text
-	theme          pgtype.Text
-	mrRework       pgtype.Bool
-	sidebarIDs     []uuid.UUID
-	apprMode       pgtype.Text
-	lightTheme     pgtype.Text
-	darkTheme      pgtype.Text
-	typeface       pgtype.Text
-	defaultHarness pgtype.Text
+	model           pgtype.Text
+	effort          pgtype.Text
+	judge           pgtype.Text
+	summary         pgtype.Text
+	theme           pgtype.Text
+	mrRework        pgtype.Bool
+	sidebarIDs      []uuid.UUID
+	sidebarCodexIDs []uuid.UUID
+	apprMode        pgtype.Text
+	lightTheme      pgtype.Text
+	darkTheme       pgtype.Text
+	typeface        pgtype.Text
+	defaultHarness  pgtype.Text
+	// prunedCodexIDs is PruneUserSidebarCodexAccounts's RETURNING (the pruned set the GET
+	// path threads into the response); pruneCodexErr, when set, makes that prune UPDATE
+	// fail so a test can exercise GetMySettings's best-effort fallback (PRD #1209 M1).
+	prunedCodexIDs []uuid.UUID
+	pruneCodexErr  error
 }
 
 func (f *fakeSettingsDB) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
@@ -57,6 +64,17 @@ func (f *fakeSettingsDB) Query(context.Context, string, ...any) (pgx.Rows, error
 
 func (f *fakeSettingsDB) QueryRow(_ context.Context, sql string, args ...any) pgx.Row {
 	switch {
+	case strings.Contains(sql, "UPDATE users u"):
+		// PruneUserSidebarCodexAccounts is the ALIASED atomic prune (PRD #1209 M1) — it is
+		// the only "UPDATE users u" query, and does not match the un-aliased "UPDATE users
+		// SET sidebar_codex_account_ids" case below. A test arms pruneCodexErr to drive
+		// GetMySettings's best-effort fallback (log + stored column, still 200); otherwise
+		// it returns the pre-set pruned array so the success path's "use the pruned return"
+		// is observable.
+		if f.pruneCodexErr != nil {
+			return codexIDsRow{err: f.pruneCodexErr}
+		}
+		return codexIDsRow{ids: f.prunedCodexIDs}
 	case strings.Contains(sql, "UPDATE users SET default_model") && len(args) >= 1:
 		if m, ok := args[0].(pgtype.Text); ok {
 			f.model = m // SetUserDefaultModel: $1 = default_model
@@ -84,6 +102,14 @@ func (f *fakeSettingsDB) QueryRow(_ context.Context, sql string, args ...any) pg
 	case strings.Contains(sql, "UPDATE users SET sidebar_token_ids") && len(args) >= 1:
 		if ids, ok := args[0].([]uuid.UUID); ok {
 			f.sidebarIDs = ids // SetUserSidebarTokens: $1 = sidebar_token_ids
+		}
+	case strings.Contains(sql, "UPDATE users SET sidebar_codex_account_ids") && len(args) >= 1:
+		// SetUserSidebarCodexAccounts: $1 = sidebar_codex_account_ids (PRD #1209 M1). The
+		// Prune UPDATE (aliased "UPDATE users u SET ...") does not match this substring, so
+		// its RETURNING is discarded via the default fall-through — the fake has no linked-
+		// alias knowledge to prune with, and the handler discards Prune's result anyway.
+		if ids, ok := args[0].([]uuid.UUID); ok {
+			f.sidebarCodexIDs = ids
 		}
 	case strings.Contains(sql, "UPDATE users SET default_harness") && len(args) >= 1:
 		if h, ok := args[0].(pgtype.Text); ok {
@@ -117,34 +143,36 @@ func (f *fakeSettingsDB) QueryRow(_ context.Context, sql string, args ...any) pg
 		}
 	}
 	return fakeSettingsRow{
-		model:          f.model,
-		effort:         f.effort,
-		judge:          f.judge,
-		summary:        f.summary,
-		theme:          f.theme,
-		mrRework:       f.mrRework,
-		sidebarIDs:     f.sidebarIDs,
-		apprMode:       f.apprMode,
-		lightTheme:     f.lightTheme,
-		darkTheme:      f.darkTheme,
-		typeface:       f.typeface,
-		defaultHarness: f.defaultHarness,
+		model:           f.model,
+		effort:          f.effort,
+		judge:           f.judge,
+		summary:         f.summary,
+		theme:           f.theme,
+		mrRework:        f.mrRework,
+		sidebarIDs:      f.sidebarIDs,
+		sidebarCodexIDs: f.sidebarCodexIDs,
+		apprMode:        f.apprMode,
+		lightTheme:      f.lightTheme,
+		darkTheme:       f.darkTheme,
+		typeface:        f.typeface,
+		defaultHarness:  f.defaultHarness,
 	}
 }
 
 type fakeSettingsRow struct {
-	model          pgtype.Text
-	effort         pgtype.Text
-	judge          pgtype.Text
-	summary        pgtype.Text
-	theme          pgtype.Text
-	mrRework       pgtype.Bool
-	sidebarIDs     []uuid.UUID
-	apprMode       pgtype.Text
-	lightTheme     pgtype.Text
-	darkTheme      pgtype.Text
-	typeface       pgtype.Text
-	defaultHarness pgtype.Text
+	model           pgtype.Text
+	effort          pgtype.Text
+	judge           pgtype.Text
+	summary         pgtype.Text
+	theme           pgtype.Text
+	mrRework        pgtype.Bool
+	sidebarIDs      []uuid.UUID
+	sidebarCodexIDs []uuid.UUID
+	apprMode        pgtype.Text
+	lightTheme      pgtype.Text
+	darkTheme       pgtype.Text
+	typeface        pgtype.Text
+	defaultHarness  pgtype.Text
 }
 
 func (r fakeSettingsRow) Scan(dest ...any) error {
@@ -174,12 +202,13 @@ func (r fakeSettingsRow) Scan(dest ...any) error {
 		if p, ok := dest[3].(*pgtype.Text); ok {
 			*p = r.typeface
 		}
-	case 12:
+	case 13:
 		// GetUserSettings: SELECT default_model, default_effort, judge_model,
 		// summary_model, theme, sidebar_token_ids, mr_rework_enabled,
-		// appearance_mode, light_theme, dark_theme, typeface, default_harness (the
-		// last four before default_harness are PRD #1167 M1's appearance columns; the
-		// trailing default_harness rides the same one-row read as of PRD #1429 M1).
+		// appearance_mode, light_theme, dark_theme, typeface, default_harness,
+		// sidebar_codex_account_ids (the four before default_harness are PRD #1167 M1's
+		// appearance columns; default_harness rides the read as of PRD #1429 M1; the
+		// trailing sidebar_codex_account_ids joined in PRD #1209 M1).
 		if p, ok := dest[0].(*pgtype.Text); ok {
 			*p = r.model
 		}
@@ -215,6 +244,30 @@ func (r fakeSettingsRow) Scan(dest ...any) error {
 		}
 		if p, ok := dest[11].(*pgtype.Text); ok {
 			*p = r.defaultHarness
+		}
+		if p, ok := dest[12].(*[]uuid.UUID); ok {
+			*p = r.sidebarCodexIDs
+		}
+	}
+	return nil
+}
+
+// codexIDsRow is the single-column ([]uuid.UUID) RETURNING of
+// PruneUserSidebarCodexAccounts, or an injected store fault, for the GetMySettings prune
+// tests. A non-nil err makes Scan fail (the prune UPDATE errored); otherwise Scan yields
+// the pruned id set.
+type codexIDsRow struct {
+	ids []uuid.UUID
+	err error
+}
+
+func (r codexIDsRow) Scan(dest ...any) error {
+	if r.err != nil {
+		return r.err
+	}
+	if len(dest) == 1 {
+		if p, ok := dest[0].(*[]uuid.UUID); ok {
+			*p = r.ids
 		}
 	}
 	return nil
@@ -280,6 +333,64 @@ func TestGetMySettingsNullModelSerializesAsNull(t *testing.T) {
 	}
 	if got := decodeSettings(t, rec.Body.Bytes()); got != nil {
 		t.Fatalf("default_model = %q, want null (inherit)", *got)
+	}
+}
+
+// decodeSidebarCodex pulls the sidebar_codex_account_ids field out of a /me/settings
+// response.
+func decodeSidebarCodex(t *testing.T, body []byte) []string {
+	t.Helper()
+	var resp struct {
+		Settings struct {
+			SidebarCodexAccountIds []string `json:"sidebar_codex_account_ids"`
+		} `json:"settings"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("decode settings response %s: %v", body, err)
+	}
+	return resp.Settings.SidebarCodexAccountIds
+}
+
+// On a successful GET the response uses the array PruneUserSidebarCodexAccounts returned —
+// the pruned set — not the un-pruned stored column (PRD #1209 M1).
+func TestGetMySettingsUsesPrunedCodexAccounts(t *testing.T) {
+	kept := uuid.New()
+	h := &Handler{q: store.New(&fakeSettingsDB{
+		sidebarCodexIDs: []uuid.UUID{kept, uuid.New()}, // stored (un-pruned) set: two ids
+		prunedCodexIDs:  []uuid.UUID{kept},             // prune drops the stale second id
+	})}
+	rec := httptest.NewRecorder()
+	h.GetMySettings(rec, authed(httptest.NewRequest(http.MethodGet, "/api/me/settings", nil)))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	got := decodeSidebarCodex(t, rec.Body.Bytes())
+	if len(got) != 1 || got[0] != kept.String() {
+		t.Fatalf("sidebar_codex_account_ids = %v, want the pruned [%s]", got, kept)
+	}
+}
+
+// A failed sidebar-codex prune must NOT 500 the settings GET (PRD #1209 M1): the prune is
+// best-effort, so a store fault on PruneUserSidebarCodexAccounts is logged and the handler
+// falls back to the currently-stored sidebar_codex_account_ids, still answering 200.
+func TestGetMySettingsPruneFailureStillSucceeds(t *testing.T) {
+	stored := []uuid.UUID{uuid.New()}
+	db := &fakeSettingsDB{
+		sidebarCodexIDs: stored,
+		pruneCodexErr:   errors.New("prune boom"),
+	}
+	h := &Handler{q: store.New(db)}
+	rec := httptest.NewRecorder()
+	h.GetMySettings(rec, authed(httptest.NewRequest(http.MethodGet, "/api/me/settings", nil)))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 despite the prune failure; body=%s", rec.Code, rec.Body.String())
+	}
+	// The response falls back to the stored (un-pruned) column rather than erroring.
+	got := decodeSidebarCodex(t, rec.Body.Bytes())
+	if len(got) != 1 || got[0] != stored[0].String() {
+		t.Fatalf("sidebar_codex_account_ids = %v, want the stored fallback [%s]", got, stored[0])
 	}
 }
 

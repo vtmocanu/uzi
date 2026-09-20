@@ -52,6 +52,13 @@ func (f *FakeClient) AdminRateLimits(context.Context) ([]apitypes.AdminRateLimit
 	return f.RateLimits, nil
 }
 
+func (f *FakeClient) AdminCodexRateLimits(context.Context) ([]apitypes.CodexAdminRateLimitRowDTO, error) {
+	if f.Err != nil {
+		return nil, f.Err
+	}
+	return f.CodexRateLimits, nil
+}
+
 func (f *FakeClient) GuardrailImpact(context.Context) (apitypes.GuardrailImpactDTO, error) {
 	if f.Err != nil {
 		return apitypes.GuardrailImpactDTO{}, f.Err

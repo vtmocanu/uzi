@@ -59,6 +59,9 @@ const SEED_USER_SETTINGS: UserSettings = {
   dark_theme: null,
   typeface: null,
   sidebar_token_ids: [],
+  // PRD #1209 M3: LINKED Codex subscription accounts surfaced on the sidebar rail — the
+  // Codex sibling of sidebar_token_ids. Default-only (empty).
+  sidebar_codex_account_ids: [],
   // PRD #700 M6: MR review watcher per-user opt-in. null = the default-ON state;
   // an explicit false opts the account out.
   mr_rework_enabled: null,
@@ -169,7 +172,11 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
     // Optional so a pre-feature blob stays valid; absent reads as default-only.
     (u.sidebar_token_ids === undefined ||
       (Array.isArray(u.sidebar_token_ids) &&
-        u.sidebar_token_ids.every((id) => typeof id === "string")));
+        u.sidebar_token_ids.every((id) => typeof id === "string"))) &&
+    // PRD #1209 M3: optional so a pre-feature blob stays valid; absent reads as default-only.
+    (u.sidebar_codex_account_ids === undefined ||
+      (Array.isArray(u.sidebar_codex_account_ids) &&
+        u.sidebar_codex_account_ids.every((id) => typeof id === "string")));
   const okApp =
     typeof a.autopilot_label === "string" &&
     // PRD #764: accept legacy blobs that predate this field (undefined) — it is filled
@@ -1017,6 +1024,11 @@ export const settingsApi = {
       // value; null clears back to default-only. Ids are stored as given — a
       // stale id (deleted token) is harmless, it just matches nothing.
       next = { ...next, sidebar_token_ids: patch.sidebar_token_ids ?? [] };
+    }
+    if (patch.sidebar_codex_account_ids !== undefined) {
+      // Whole-set replace, mirroring the real handler; null clears back to default-only.
+      // The Codex sibling of sidebar_token_ids (PRD #1209 M3).
+      next = { ...next, sidebar_codex_account_ids: patch.sidebar_codex_account_ids ?? [] };
     }
     if (patch.mr_rework_enabled !== undefined) {
       // Tri-state (PRD #700 M6): present-false opts out, present-true re-enables,

@@ -743,7 +743,11 @@ func (h *Handler) CreateOpenAIAPIKey(w http.ResponseWriter, r *http.Request) {
 //   - A per-alias codex_credential_state row is created ('staging' for a codex_auth,
 //     'static' for an openai_api_key).
 //
-// It does NOT poke the usage poller: that is the Anthropic rate-limit surface only.
+// On a successful codex_auth LOGIN save it pokes the CODEX account rate-limit poller (PRD
+// #1209) so a subscription account's meter appears within seconds instead of up to a full
+// poll interval — the Codex sibling of CreateAnthropicToken's usagePoker.Poke. It does NOT
+// poke the ANTHROPIC usage poller (that surface is Anthropic-only), and does NOT poke for an
+// openai_api_key: a static API key carries no subscription rate-limit meter to poll.
 func (h *Handler) createCodexSecret(w http.ResponseWriter, r *http.Request, kind string) {
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {
@@ -824,6 +828,13 @@ func (h *Handler) createCodexSecret(w http.ResponseWriter, r *http.Request, kind
 		slog.Error("create codex secret", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
+	}
+	// Poke the Codex account rate-limit poller so a codex_auth LOGIN's account meter appears
+	// within seconds of saving, not up to a full poll interval later (PRD #1209). codex_auth
+	// only — an openai_api_key is a static key with no subscription meter to poll. Best-effort
+	// and non-blocking; nil when the poller is disabled or in tests.
+	if kind == store.KindCodexAuth && h.codexUsagePoker != nil {
+		h.codexUsagePoker.Poke(user.ID)
 	}
 	dto := secretMeta(row.ID, row.Kind, row.Label, row.IsDefault, row.AutoEligible, row.CreatedAt, row.UpdatedAt)
 	dto.CodexStatus = status
@@ -1004,6 +1015,12 @@ func (h *Handler) patchCodexSecret(w http.ResponseWriter, r *http.Request, kind 
 	if !found {
 		httpx.Error(w, http.StatusNotFound, "credential not found")
 		return
+	}
+	// Poke the Codex account rate-limit poller after a codex_auth LOGIN patch (rotate /
+	// rename / set-default) so the account meter reflects the change within seconds (PRD
+	// #1209). codex_auth only, and best-effort; nil when the poller is disabled or in tests.
+	if kind == store.KindCodexAuth && h.codexUsagePoker != nil {
+		h.codexUsagePoker.Poke(user.ID)
 	}
 	dto := secretMeta(out.ID, out.Kind, out.Label, out.IsDefault, out.AutoEligible, out.CreatedAt, out.UpdatedAt)
 	dto.CodexStatus = status

@@ -69,14 +69,20 @@ var ErrIdentityIncomplete = errors.New("codexauth: provider identity incomplete"
 // RefreshResult with an empty token.
 var ErrNoAccessToken = errors.New("codexauth: refresh response carried no access token")
 
-// AuthError is the typed error for a non-2xx provider reply on either surface. It
-// carries the operation ("discover_identity" / "refresh") and the HTTP status so a
-// caller can distinguish a 401 (the login's token is no longer valid) from a 5xx
-// (provider trouble) without parsing a string. Its message never includes the
-// response body, which may echo request material.
+// AuthError is the typed error for a non-2xx provider reply on any of the three
+// surfaces. It carries the operation ("discover_identity" / "refresh" / "read_usage")
+// and the HTTP status so a caller can distinguish a 401 (the login's token is no longer
+// valid) from a 429 (rate-limited) or a 5xx (provider trouble) without parsing a string.
+// Its message never includes the response body, which may echo request material.
+//
+// RetryAfter carries the provider's Retry-After hint on a 429 (ReadUsage only), so the
+// caller can back off for exactly as long as the provider asked. It is zero when the
+// provider sent no parseable Retry-After (or on any non-429 status); a caller reads it
+// only after checking StatusCode == 429.
 type AuthError struct {
 	Op         string
 	StatusCode int
+	RetryAfter time.Duration
 }
 
 func (e *AuthError) Error() string {
@@ -188,7 +194,17 @@ func WithPerRequestTimeout(d time.Duration) Option {
 // option then, with a caller — an unused exported option would redden the deadcode gate.
 func NewClient(opts ...Option) *Client {
 	c := &Client{
-		doer:      &http.Client{Timeout: 15 * time.Second},
+		// CheckRedirect refuses EVERY redirect (mirrors forge/github.go's second-hop log
+		// client): the default doer returns the 3xx response as-is rather than following it.
+		// ReadUsage sends a custom ChatGPT-Account-Id header, which Go forwards across a
+		// cross-host redirect — so a redirect MUST surface as a non-2xx and be refused, not
+		// followed. It is harmless (and desirable) on DiscoverIdentity/Refresh too, whose 2xx
+		// behaviour is unchanged. A test that injects its own doer via WithHTTPDoer replaces
+		// this client entirely and sets its own redirect policy where it needs one.
+		doer: &http.Client{
+			Timeout:       15 * time.Second,
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		},
 		usageBase: DefaultUsageBaseURL,
 		oauthBase: DefaultOAuthBaseURL,
 		clientID:  DefaultClientID,

@@ -51,9 +51,12 @@ type FakeClient struct {
 	AdminCLITokens []apitypes.AdminCLITokenDTO
 	AdminUsageV    apitypes.AdminUsageDTO
 	RateLimits     []apitypes.AdminRateLimitRowDTO
-	GuardrailV     apitypes.GuardrailImpactDTO
-	BlockedReposV  apitypes.AdminBlockedReposDTO
-	AgentSourceV   apitypes.AgentSourceDTO
+	// CodexRateLimits drives AdminCodexRateLimits (PRD #1209 M3): the factory-wide
+	// per-user Codex rows.
+	CodexRateLimits []apitypes.CodexAdminRateLimitRowDTO
+	GuardrailV      apitypes.GuardrailImpactDTO
+	BlockedReposV   apitypes.AdminBlockedReposDTO
+	AgentSourceV    apitypes.AgentSourceDTO
 
 	// ListRunsCalls / AdminListRunsCalls count real ListRuns / AdminListRuns
 	// invocations (PRD #1130 M1). Purely additive, no mutex like the rest of this
@@ -255,6 +258,10 @@ type FakeClient struct {
 	// SelfMeters drives SelfRateLimits (PRD #111 D23): the caller's own per-token
 	// meters, each carrying the server-computed auto-selection status.
 	SelfMeters []apitypes.TokenRateLimitDTO
+
+	// SelfCodexMeters drives SelfCodexRateLimits (PRD #1209 M3): the caller's own
+	// per-account Codex meters, each carrying the derived status + nested buckets.
+	SelfCodexMeters []apitypes.CodexAccountRateLimitDTO
 
 	// Settings drives GetMySettings: the caller's own non-secret settings.
 	Settings apitypes.UserSettingsDTO
