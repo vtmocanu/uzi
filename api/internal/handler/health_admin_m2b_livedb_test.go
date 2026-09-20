@@ -55,13 +55,14 @@ func TestAdminHealthSnoozeAuthLiveDB(t *testing.T) {
 
 	const path = "/api/admin/health/snooze"
 
-	// A uza_ / uzc_ CLI token is a Bearer request: the cookie-only write group's RequireAuth
-	// 401s it before the handler runs (no admin write verb reaches this route).
-	if rec := bearerReq(router, http.MethodPost, path, adminUza); rec.Code == http.StatusOK {
-		t.Errorf("uza_ POST %s = 200, want a 401/403 (cookie-only write group)\nbody: %s", path, rec.Body.String())
+	// A uza_ / uzc_ CLI token is a Bearer request with no session cookie: the cookie-only
+	// write group's RequireAuth rejects it with exactly 401 (the missing cookie fails before
+	// CSRF or the handler), the house convention for a Bearer on a cookie-only write route.
+	if rec := bearerReq(router, http.MethodPost, path, adminUza); rec.Code != http.StatusUnauthorized {
+		t.Errorf("uza_ POST %s = %d, want 401 (cookie-only write group)\nbody: %s", path, rec.Code, rec.Body.String())
 	}
-	if rec := bearerReq(router, http.MethodPost, path, adminUzc); rec.Code == http.StatusOK {
-		t.Errorf("uzc_ POST %s = 200, want a 401/403 (cookie-only write group)\nbody: %s", path, rec.Body.String())
+	if rec := bearerReq(router, http.MethodPost, path, adminUzc); rec.Code != http.StatusUnauthorized {
+		t.Errorf("uzc_ POST %s = %d, want 401 (cookie-only write group)\nbody: %s", path, rec.Code, rec.Body.String())
 	}
 	// A non-admin session cookie passes RequireAuth but RequireAdmin → 403.
 	if rec := cookieReq(t, router, http.MethodPost, path, cliMintJWT(t, pool, nonAdmin), ""); rec.Code != http.StatusForbidden {
