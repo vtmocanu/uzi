@@ -67,7 +67,7 @@ the worker lane (`coordinatedRefresh`, the unexported core), but it has no
 run and no worker claim to authorize against. Two things make that safe:
 
 - **The worker-facing wrappers are untouched.** `AuthorizeCodexCredentialOp`,
-  `CoordinatedCodexRefresh` and `ReleaseCodexAccessToken` keep their existing
+  `CoordinatedCodexRefresh` and `ReleaseCodexCredential` keep their existing
   run/current-worker/capability checks, pre/post-operation checks, and
   refusal of stale/revoked authority. `CollectCodexAccountUsage` never calls
   them — it calls the unexported `coordinatedRefresh` core directly, the same
