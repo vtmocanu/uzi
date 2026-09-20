@@ -970,7 +970,12 @@ func run() error {
 		CIWatchRunWindow:    cfg.CIWatchRunWindow,
 		Registry:            healthBeats,
 	})
-	healthEpisodeRec := healthsvc.NewEpisodeReconciler(healthSvc, q, slog.Default())
+	// M6 wires the notice fan-out into the SAME reconciler: the persist-first notifysvc
+	// seam, the store (ListAdmins fan-out set + the atomic ClaimHealthEpisodeNotice slot),
+	// and the health-notification enablement gate (settingsCache.HealthEnabled — the SAME
+	// gate the custody-episode reconciler reuses, no new enable flag, D10). notifier and
+	// settingsCache are the same collaborators wired into custodyEpisodeRec above.
+	healthEpisodeRec := healthsvc.NewEpisodeReconciler(healthSvc, q, notifier, settingsCache, slog.Default())
 	healthEpisodeInterval := time.Minute
 	bgWG.Add(1)
 	go func() {
