@@ -140,6 +140,7 @@ uzi findings stats [--repo <id>] [--json]
 uzi handoff -m <text> | -f <path> [--base <ref>] [--mr] [--review] [--then-fix] [--interactive] [--repo <id>]
 uzi handoff rm <run-id> | review <run-id>
 uzi token list
+uzi rate-limits [--provider claude|codex]
 uzi worker list | rm <id> | set-token <worker-id> <label> | set-token <worker-id> --default
 uzi repo list | remove <id> [--force]
 uzi project-sync status <repo> | resync <repo>
@@ -177,6 +178,18 @@ A few worth knowing:
 - **`token` is list-only, and `worker set-token` is the one write near it.**
   See [Anthropic tokens](#anthropic-tokens) below for why the split falls
   exactly there.
+- **`uzi rate-limits [--provider claude|codex]`** — your own rate-limit
+  meters, the terminal twin of the web sidebar meters. `--provider claude`
+  (the default) lists your Anthropic tokens as `TOKEN`/`STATUS`/`5H%`/`7D%`;
+  `--provider codex` lists your linked Codex accounts, one row per `(account,
+  bucket)`, as `ACCOUNT`/`STATUS`/`BUCKET`/`PRIMARY`/`SECONDARY`/`RESET`. A
+  window uzi has no reading for renders `—` (not `0`), so partial or unknown
+  state is never confused with a genuine zero. `--json` returns the raw
+  meters (`[]TokenRateLimitDTO` for claude, the nested
+  `[]CodexAccountRateLimitDTO` for codex). Read-only; the cross-user view is
+  `uzi admin rate-limits` below. See [Claude rate limits](rate-limits.md) and
+  [Codex account limits](rate-limits.md#codex-account-limits) for what the
+  numbers mean.
 - **`run create --plan-file <path>` seeds the run with a plan you already
   wrote**, skipping the planning turn and the approval gate entirely — the
   worker implements it directly. Pass `-` to read the plan from stdin. See
@@ -604,6 +617,14 @@ A few worth knowing:
   Settings → Access to use it. `uzi whoami` over a `uzc_` token reports
   `is_admin: false` even for an admin — that's the credential's own
   authority, not your résumé.
+- **`admin rate-limits` also takes `--provider claude|codex`** (default
+  `claude`, so an existing invocation is byte-for-byte unchanged):
+  `claude` is the existing per-user Anthropic view
+  (`EMAIL`/`VAULT`/`TOKEN`/`STATUS`/`5H%`/`7D%`); `codex` is the per-user
+  Codex view grouped by user, one row per `(account, bucket)`
+  (`EMAIL`/`VAULT`/`ACCOUNT`/`STATUS`/`BUCKET`/`PRIMARY`/`SECONDARY`/`RESET`),
+  with a no-reading window shown as `—`. `--json` returns the raw
+  `[]CodexAdminRateLimitRowDTO` for codex, unchanged for claude.
 - **`admin cli-tokens` is the factory-wide standing-credential inventory** —
   every CLI token, whoever owns it, with `OWNER`, `PREFIX`, `NAME`, `SCOPE`,
   `STATE`, `USED` (last-use, capped to once a minute) and `EXPIRES` (blank

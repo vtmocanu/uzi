@@ -116,3 +116,29 @@ Each stored Codex credential shows one of four statuses:
 | `linked` | The provider identity has been verified. |
 | `failed` | Verification failed. Replace the value, or re-add the login. |
 | `static` | An OpenAI API key, not a Codex login; provider-account linking doesn't apply to a key. |
+
+## Usage meters
+
+Once a login moves to `linked`, uzi starts polling its subscription usage in
+the background and surfaces it everywhere Claude's token meters already
+show up: the Settings → **Codex limits** card next to this one, the sidebar,
+**Admin → Rate limits**, and `uzi rate-limits --provider codex` (plus its
+admin CLI and TUI twins). This is visibility only — saving a Codex login
+still does not start a run; see [Codex account
+limits](rate-limits.md#codex-account-limits) for the full picture, including
+choosing which additional accounts show in the sidebar and TUI.
+
+**An OpenAI API key never gets a meter.** It has no subscription lifecycle
+behind it, so Codex limits shows a short "subscription windows do not
+apply" note next to it instead.
+
+A linked account's meter can land in a state that needs your attention:
+
+- **No reading yet** — just linked, or waiting on the first poll; a reading
+  appears within one poll interval.
+- **Credential action required** — the login has expired with nothing left
+  to renew it automatically. Re-add the login the same way you saved it the
+  first time (see above); the same `failed`-style replace flow applies.
+- **Vault locked** — uzi can't open the login to poll it until you unlock
+  your vault again. The last known reading stays on screen, greyed and
+  marked stale, rather than disappearing.

@@ -342,22 +342,27 @@ model); this section is the map. User-facing usage is
 
 ## Secrets: per-user credentials at rest
 
-`user_secrets` is a generic, kind-keyed table (`kind` currently only
-`anthropic_token`, `CHECK`-constrained so a new kind is one migration, not a
-new table) holding AES-256-GCM-sealed per-user secrets. A user may hold
-**several** secrets of one kind, each under a label they chose, exactly one of
-which is flagged `is_default` — the one every unbound consumer resolves
-(PRD #104). The
+`user_secrets` is a generic, kind-keyed table — three kinds today
+(`anthropic_token`; and `openai_api_key`/`codex_auth`, which share ONE
+`is_default` slot per user, separate from the Anthropic token's own default —
+`CHECK`-constrained so a new kind is one migration, not a new table) — holding
+sealed per-user secrets. A user may hold **several** secrets of one kind, each
+under a label they chose, exactly one of which is flagged `is_default` — the
+one every unbound consumer resolves (PRD #104). The
 `secretbox` package (`api/internal/secretbox/`) wraps `Seal`/`Open` around a
 single 32-byte key that `config.Load` validates from `UZI_SECRET_KEY` at boot
 (refusing to start if it is missing, malformed, or a low-entropy placeholder)
 and then builds, already validated, into one `*secretbox.Box` shared by every
-handler (see [docs/configuration.md](docs/configuration.md)). This is the
-platform's one shared secret-at-rest mechanism: any feature that needs to
-store a per-user credential (starting with the Anthropic token this PRD adds)
-seals it with the same key before it reaches Postgres, so a DB dump alone
-never yields a plaintext secret, and rotating the key invalidates every
-stored secret across every feature at once, not just one.
+handler (see [docs/configuration.md](docs/configuration.md)). **Since the
+per-user vault (PRD #32), this master box is no longer the normal sealing
+path**: a secret is sealed under the owner's own 256-bit DEK once their vault
+has been unlocked once, and the master box is reserved for a row that has
+never been rewrapped plus one narrow Codex exception — a refresh's *recovery*
+copy is sealed under the master box only while the owner's vault happens to
+be locked at that exact moment, then re-sealed under the DEK on the next
+reconcile pass. See [docs/vault-threat-model.md](docs/vault-threat-model.md)
+for the full model. Either way, rotating `UZI_SECRET_KEY` invalidates every
+row still master-sealed, across every feature at once, not just one.
 
 The API around it is deliberately minimal, and **every read is metadata only**:
 `GET /api/me/secrets` returns `id`, `kind`, `label`, `is_default` and
@@ -402,6 +407,30 @@ Settings card, a sidebar micro-meter, and an Admin → Rate limits table. See
 Decisions) for the full rationale, including the vault-locked staleness
 rule and the failure/backoff semantics; user-facing behavior is in
 [docs/rate-limits.md](docs/rate-limits.md).
+
+## Codex account rate-limit visibility (PRD #1209)
+
+A sibling background engine (`api/internal/codexusagepoller`) does the same
+job for a linked Codex **subscription** account, entirely idle (no worker,
+run, or model call): it opens the account's committed login through the same
+vault-then-master path above, reads its rate-limit buckets from the fixed
+Codex usage host (redirects refused, response body size-bounded), and
+upserts one JSONB snapshot per **canonical account**
+(`codex_account_rate_limits`, keyed `(user_id, provider_account_id)` against
+`codex_provider_account`'s owner-scoped composite FK — PRD #1147/#1171 — so
+duplicate saved aliases of one account share a single budget). It reaches
+#1171's run-authorized refresh core through a dedicated, owner-scoped
+internal principal (`api/internal/workersvc/codexusage.go`,
+`CollectCodexAccountUsage`) rather than the worker-facing wrapper, so worker
+authorization is untouched and the raw access token never leaves that
+package. Two owner/admin reads (`GET /api/me/codex-rate-limits`, `GET
+/api/admin/codex-rate-limits`) serve the frozen `CodexAccountRateLimitDTO`,
+and the SPA, `uzi rate-limits`/`uzi admin rate-limits --provider codex` and
+the TUI render it everywhere the Claude meters already appear. See
+[adr/1209-codex-account-meters.md](adr/1209-codex-account-meters.md) for the
+durable design decisions and
+[docs/rate-limits.md](docs/rate-limits.md#codex-account-limits) for
+user-facing behavior.
 
 ## Agent runtime: workers, runs, live view
 

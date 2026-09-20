@@ -20,12 +20,26 @@ this page is the as-built residual-risk list and the operator hardening steps.
 
 ## What the vault protects — and what it does not
 
-- **Protected**: each user's `user_secrets` rows (today the Anthropic token). They
-  are sealed with a per-user 256-bit DEK. The DEK is stored only wrapped:
-  `secretbox(KEK, DEK)` where `KEK = Argon2id(login password, per-user salt)`. The
-  KEK is derived at unlock, used once, and discarded; the plaintext DEK lives only
-  in the API process's memory while the vault is unlocked, and is gone on lock or
-  restart. Neither the KEK nor the plaintext DEK is ever written anywhere.
+- **Protected**: each user's `user_secrets` rows — three kinds today
+  (`anthropic_token`, `openai_api_key`, `codex_auth`; the latter two share one
+  default slot per user, separate from the Anthropic token's own default) —
+  plus the per-account Codex login material in `codex_provider_account`. They
+  are sealed with a per-user 256-bit DEK under normal operation. The DEK is
+  stored only wrapped: `secretbox(KEK, DEK)` where `KEK = Argon2id(login
+  password, per-user salt)`. The KEK is derived at unlock, used once, and
+  discarded; the plaintext DEK lives only in the API process's memory while
+  the vault is unlocked, and is gone on lock or restart. Neither the KEK nor
+  the plaintext DEK is ever written anywhere. **One narrow exception**: a
+  Codex account's *recovery* slot (a previously-good login retained so a
+  failed refresh can roll back) is sealed under the legacy `UZI_SECRET_KEY`
+  master box instead, but only when the owner's vault is locked at the exact
+  moment a refresh needs to protect newly-rotated material — never the live,
+  in-use login. A later reconcile pass re-seals that recovery copy under the
+  user's DEK once the vault unlocks. This same protected login is what the
+  Codex account-meter poller (PRD #1209 — see
+  [rate-limits.md](rate-limits.md#codex-account-limits)) opens to read usage;
+  it hands back only a sanitized reading and never the token itself, so it
+  adds no new decrypted-secret surface beyond the one already covered here.
 - **Not protected (by design)**: the forge **bot PAT**
   (`forge_connections.token_ciphertext`). The poller syncs issues 24/7 with no
   user present, so its credential cannot be password-wrapped. It stays sealed
