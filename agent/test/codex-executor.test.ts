@@ -1051,6 +1051,55 @@ describe("CodexExecutor: wall park (PRD #1497 M2)", () => {
     assert.equal(spies.clearWallModeCalls, 1, "the refused park cleared the sticky wall mode");
     assert.equal(spies.mode, null, "the sticky wall mode is cleared for the re-drive");
   });
+
+  // PRD #1497 M2 (cross-harness parity) — a genuine owner `cancel` that RACES a REFUSED wall park
+  // must CANCEL the run, not be silently dropped. Mechanism: a `wall` PauseNowSignal aborts the
+  // SHARED, once-only ctx.signal PERMANENTLY; if the owner ALSO cancels during parkForWall's
+  // round-trip, route('cancel') finds the signal already aborted so its abort() is a no-op and only
+  // the sticky `cancelled` flag is set (steering.isCancelled → ctx.cancelRequested). Before the fix,
+  // parkForWall answering "refused" cleared the sticky wall mode and RE-DROVE the turn; the re-drive's
+  // handledWallPause suppression continued it and NEVER re-checked the sticky cancel, so the run
+  // completed normally instead of cancelling. The SDK executor handles the analogous "cancel after a
+  // declined park" with a loop-top ctx.cancelRequested re-check (sdk-executor.ts); Codex now mirrors
+  // it with a pre-redrive re-check in tryCodexWallPark's refused branch. Cancel WINS over the extend.
+  // Verified this REDDENS without the fix: removing the `if (ctx.cancelRequested?.()) throw` re-check
+  // makes the run re-drive turn 2 to a normal `signal_done` completion (branch agent/issue-42) and
+  // this assertion.rejects(/run cancelled/) fails.
+  it("(implement) an owner cancel racing a REFUSED `wall` park CANCELS the run — the sticky cancel is not dropped (cross-harness parity)", async () => {
+    const controller = new AbortController();
+    const rig = makeRig({ responder: refusedRestartResponder() });
+    let cancelled = false;
+    const spies = { parkForWallCalls: 0, clearWallModeCalls: 0, mode: "wall" as "wall" | null };
+    const { ctx } = makeCtx({
+      signal: controller.signal,
+      pauseModeRequested: () => spies.mode,
+      // The steering channel's sticky cancel flag (runner wires this to steering.isCancelled).
+      cancelRequested: () => cancelled,
+      clearWallMode: () => {
+        spies.clearWallModeCalls++;
+        spies.mode = null;
+      },
+      parkForWall: async () => {
+        spies.parkForWallCalls++;
+        // The owner cancels DURING the park round-trip. The `wall` pause already aborted the shared
+        // once-only ctx.signal, so route('cancel') finds it aborted — abort() is a no-op and only the
+        // sticky `cancelled` flag is set. The park then answers "refused" (e.g. the owner extended, or
+        // the reclaim declined) — the case that, before the fix, re-drove the turn and dropped the cancel.
+        cancelled = true;
+        return "refused";
+      },
+    });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    await waitFor(() => rig.transport.turnStartCount >= 1, "implement turn 1 started");
+    controller.abort(new PauseNowSignal());
+    // Cancel WINS over the extend: the run cancels rather than continuing. A continue would have
+    // re-driven turn 2 to a normal `signal_done` completion (branch agent/issue-42), so a rejection
+    // with /run cancelled/ is what proves the sticky cancel was honored before the re-drive.
+    await assert.rejects(withTimeout(running, 3000, "codex cancel racing refused park"), /run cancelled/);
+    assert.equal(spies.parkForWallCalls, 1, "the `wall` pause reached the wall park once");
+    assert.equal(rig.transport.turnStartCount, 1, "the turn did NOT re-drive — the cancel was honored before the re-drive");
+    assert.equal(spies.clearWallModeCalls, 0, "cancel-wins throws before the refused branch clears the wall mode / re-drives");
+  });
 });
 
 // ================================================================================

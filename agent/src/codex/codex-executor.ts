@@ -2126,6 +2126,18 @@ export class CodexExecutor implements Executor {
     if (outcome === "parked" || outcome === "undeliverable") return "parked";
     if (outcome === "cancelled") throw new Error(REASON_CANCEL);
     if (outcome === "refused") {
+      // PRD #1497 M2 (cross-harness parity): honor a sticky owner cancel that RACED the refused wall
+      // park BEFORE re-driving the turn. A `wall` PauseNowSignal aborted the SHARED, once-only
+      // ctx.signal permanently; a `cancel` that arrives during parkForWall's round-trip therefore
+      // finds the signal already aborted, so route('cancel')'s abort() is a no-op and it only sets the
+      // sticky `cancelled` flag (steering). Without this re-check the refused re-drive's handledWallPause
+      // suppression (driveCodexTurn) would CONTINUE the turn and the sticky cancel would be silently
+      // dropped — the run completing instead of cancelling. Mirror the SDK executor's loop-top
+      // ctx.cancelRequested re-check (sdk-executor.ts, the "cancel after a declined park" case): a
+      // pending cancel wins over the extend and throws the terminal Codex cancel reason. An extend-only
+      // refusal (no cancel pending ⇒ ctx.cancelRequested?.() is falsy/undefined) still continues,
+      // preserving the c4c4c1f6 refused-restart fix and never over-cancelling.
+      if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
       ctx.clearWallMode?.();
       return "refused";
     }
