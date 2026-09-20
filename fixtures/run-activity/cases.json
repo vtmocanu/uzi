@@ -518,6 +518,34 @@
       "name": "empty_frames_yield_null",
       "frames": [],
       "expected": null
+    },
+    {
+      "name": "subagent_tool_use_carries_agent_instance",
+      "frames": [
+        {
+          "kind": "tool_use",
+          "agent": "coder",
+          "agent_label": "wire it",
+          "agent_instance": "toolu_lane1",
+          "payload": {
+            "name": "Edit",
+            "input": {
+              "file_path": "api/internal/runactivity/runactivity.go"
+            }
+          },
+          "created_at": "2026-09-03T12:00:01Z",
+          "seq": 1
+        }
+      ],
+      "expected": {
+        "agent": "coder",
+        "agent_instance": "toolu_lane1",
+        "agent_label": "wire it",
+        "tool": "Edit",
+        "detail": "api/internal/runactivity/runactivity.go",
+        "at": "2026-09-03T12:00:01Z",
+        "seq": 1
+      }
     }
   ]
 }

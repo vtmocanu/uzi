@@ -114,8 +114,9 @@ runs_for_sha() {
     2>/dev/null
 }
 
-# Classify one run's jobs (jq TSV on stdin: status<TAB>conclusion<TAB>name<TAB>url).
-# Prints FAIL / PENDING / GREEN, then the failing rows (name<TAB>url) when FAIL.
+# Classify one run's jobs (jq TSV on stdin:
+# status<TAB>conclusion<TAB>name<TAB>url<TAB>databaseId).
+# Prints FAIL / PENDING / GREEN, then the failing rows (name<TAB>url<TAB>id) when FAIL.
 # $1 == "1" excludes `cancelled` from the failure set: in --branch/--sha mode a cancelled
 # run means it was superseded by a newer push (ci.yml concurrency), NOT a failure, and the
 # run-level guard handles it before jobs are read. In explicit run-id mode a cancelled job
@@ -128,9 +129,9 @@ classify() {
       return 0
     }
     {
-      status=$1; concl=$2; name=$3; url=$4
+      status=$1; concl=$2; name=$3; url=$4; id=$5
       if (status!="completed") { pend++; next }        # non-terminal job
-      if (isfail(concl)) { fails[nf++]=name "\t" url }  # completed AND failed
+      if (isfail(concl)) { fails[nf++]=name "\t" url "\t" id }  # completed AND failed
     }
     END {
       if (nf>0){ print "FAIL"; for(i=0;i<nf;i++) print fails[i] }
@@ -146,12 +147,30 @@ classify() {
 # would discard the rc this function exists to return.
 dump() {
   DUMP_OUT="$(gh run view "${GHR[@]}" "$1" --json jobs \
-    --jq '.jobs[] | [.status, (.conclusion // ""), .name, .url] | @tsv' 2>&1)"
+    --jq '.jobs[] | [.status, (.conclusion // ""), .name, .url, .databaseId] | @tsv' 2>&1)"
 }
 
-print_fails() {  # $1 = run id, $2 = verdict text
-  echo "=== run $1: FAILED JOB(S) — react now (read the log: gh run view --job <id> --log-failed) ==="
-  printf '%s\n' "$2" | tail -n +2 | awk -F'\t' '{printf "  FAIL  %-28s %s\n",$1,$2}'
+print_fails() {  # $1 = run id, $2 = workflow name (optional), $3 = verdict text
+  run_id="$1"
+  workflow="$2"
+  label="run $run_id"
+  [ -n "$workflow" ] && label="$label ($(printf '%q' "$workflow"))"
+  printf '=== %s: FAILED JOB(S) — react now; each completed job has a live log command below ===\n' "$label"
+  printf '%s\n' "$3" | tail -n +2 | while IFS=$'\t' read -r name url job_id; do
+    repo_path="$REPO"
+    if [ -z "$repo_path" ]; then
+      repo_path="$(printf '%s\n' "$url" | awk -F/ 'NF >= 5 { print $4 "/" $5; exit }')"
+    fi
+    [ -n "$repo_path" ] || repo_path="OWNER/REPO"
+    safe_name="$(printf '%q' "$name")"
+    safe_endpoint="$(printf '%q' "repos/$repo_path/actions/jobs/$job_id/logs")"
+    safe_repo="$(printf '%q' "$repo_path")"
+    safe_run="$(printf '%q' "$run_id")"
+    safe_job="$(printf '%q' "$job_id")"
+    printf '  FAIL  %s  %s\n' "$safe_name" "$url"
+    printf '    live log: gh api --allow-escape-sequences %s\n' "$safe_endpoint"
+    printf '    after run terminal: gh run view %s --repo %s --job %s --log-failed\n' "$safe_run" "$safe_repo" "$safe_job"
+  done
 }
 
 tick=0; gh_errs=0; seen_any=0
@@ -190,7 +209,7 @@ while [ "$tick" -lt "$MAX_TICKS" ]; do
           if dump "$rid"; then
             verdict2="$(printf '%s\n' "$DUMP_OUT" | classify 1)"
             if [ "$(printf '%s\n' "$verdict2" | head -1)" = "FAIL" ]; then
-              print_fails "$rid ($wname)" "$verdict2"; failed=1; break
+              print_fails "$rid" "$wname" "$verdict2"; failed=1; break
             fi
             echo "[tick $tick] $wname: a fail cleared on re-query (stale read); continuing"; pending=1
           else
@@ -257,7 +276,7 @@ while [ "$tick" -lt "$MAX_TICKS" ]; do
       if dump "$cur"; then
         verdict2="$(printf '%s\n' "$DUMP_OUT" | classify "$bmode")"
         if [ "$(printf '%s\n' "$verdict2" | head -1)" = "FAIL" ]; then
-          print_fails "$cur" "$verdict2"; exit 1
+          print_fails "$cur" "" "$verdict2"; exit 1
         fi
         echo "[tick $tick] a fail cleared on re-query (stale read); continuing"
       fi

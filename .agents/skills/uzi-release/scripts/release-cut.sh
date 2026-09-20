@@ -6,8 +6,8 @@
 # spine: discover the tag state, apply the CHANGELOG section, bump the chart, auto-bump
 # the worker tag, refresh links, commit, and verify with the coverage oracle. It does
 # NOT push. It tags only the promoted STABLE (locally, on a throwaway release branch);
-# the RC tag on main is applied by the lead after ci.yml is green (the harness classifier
-# blocks the agent/lead from pushing a tag anyway).
+# the RC tag on main is applied by the lead after ci.yml is green. A tag push publishes
+# unattended, so it needs the user's go-ahead (without one the harness classifier blocks it).
 #
 #   release-cut.sh <X.Y.Z> [VERB] [--changelog-file FILE] [--no-commit] [--prev-tag TAG]
 #
@@ -22,6 +22,11 @@
 #                     picks a verb.
 #     --promote       promote the in-flight RC to stable from its own commit (D5), then
 #                     cut vX.Y.Z-rc.1 on main. X.Y.Z must be > the in-flight base.
+#     --promote-only  promote the in-flight RC to stable from its own commit (D5) and STOP:
+#                     no next candidate, main untouched, whatever main has shipped since
+#                     the RC (that work waits for the next plain cut). X.Y.Z must EQUAL
+#                     the in-flight base: it names the stable being created. Takes none of
+#                     --changelog-file / --no-commit / --prev-tag (there is no main half).
 #     --skip-promote  abandon the in-flight RC: rename its open section to X.Y.Z, fold
 #                     [Unreleased] in, cut vX.Y.Z-rc.1. The RC tags/Releases stay history.
 #     --stable        cut a plain vX.Y.Z from main's tip (the old one-step model). An
@@ -44,23 +49,23 @@ set -uo pipefail
 
 VERSION=""; VERB=""; CL_FILE=""; DO_COMMIT=1; PREV_OVERRIDE=""
 set_verb() {
-  if [ -n "$VERB" ]; then echo "release-cut: only one of --promote/--skip-promote/--stable" >&2; exit 3; fi
+  if [ -n "$VERB" ]; then echo "release-cut: only one of --promote/--promote-only/--skip-promote/--stable" >&2; exit 3; fi
   VERB="$1"
 }
 while [ $# -gt 0 ]; do
   case "$1" in
-    --promote|--skip-promote|--stable) set_verb "$1"; shift;;
+    --promote|--promote-only|--skip-promote|--stable) set_verb "$1"; shift;;
     --changelog-file) CL_FILE="${2:?}"; shift 2;;
     --no-commit) DO_COMMIT=0; shift;;
     --prev-tag) PREV_OVERRIDE="${2:?}"; shift 2;;
-    -h|--help) sed -n '2,45p' "$0"; exit 3;;
+    -h|--help) awk 'NR > 1 { if (/^#/) print; else exit }' "$0"; exit 3;;
     -*) echo "release-cut: unknown flag $1" >&2; exit 3;;
     *) if [ -z "$VERSION" ]; then VERSION="$1"; shift
        else echo "release-cut: unexpected arg: $1" >&2; exit 3; fi ;;
   esac
 done
 if [ -z "$VERSION" ]; then
-  echo "usage: release-cut.sh <X.Y.Z> [--promote|--skip-promote|--stable] [--changelog-file FILE] [--no-commit] [--prev-tag TAG]" >&2
+  echo "usage: release-cut.sh <X.Y.Z> [--promote|--promote-only|--skip-promote|--stable] [--changelog-file FILE] [--no-commit] [--prev-tag TAG]" >&2
   exit 3
 fi
 VERSION="${VERSION#v}"
@@ -71,6 +76,11 @@ if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
 fi
 if [ "$DO_COMMIT" -eq 0 ] && [ "$VERB" = "--promote" ]; then
   echo "release-cut: --no-commit is rejected with --promote (the promote half tags unconditionally)" >&2; exit 3
+fi
+# --promote-only has no main half, so every main-half option is meaningless with it. Refuse
+# rather than ignore: a lead passing a changelog draft expects a next candidate to be cut.
+if [ "$VERB" = "--promote-only" ] && { [ -n "$CL_FILE" ] || [ "$DO_COMMIT" -eq 0 ] || [ -n "$PREV_OVERRIDE" ]; }; then
+  echo "release-cut: --promote-only takes no --changelog-file/--no-commit/--prev-tag (it cuts no next candidate and never touches main; use --promote to cut one in lockstep)" >&2; exit 3
 fi
 TODAY="$(date +%F)"
 
@@ -102,9 +112,14 @@ highest_stable() {
     END { if (best != "") print "v" best }'
 }
 # inflight_rc -> the in-flight RC tag: the highest-versioned vX.Y.Z-rc.N whose base has
-# no stable tag. Bases with a stable tag are promoted and ignored (abandoned lower RCs of
-# an abandoned base are ignored too, never an error). Grouped per base, N compared
-# numerically, so git's prerelease-vs-base sort order never enters (D1).
+# no stable tag AND sits above the highest stable. Bases with a stable tag are promoted and
+# ignored. A base at or below the highest stable with no stable of its own was ABANDONED
+# (--skip-promote) and is ignored too: no verb can cut it any more (every new base must be
+# above the highest stable), and under lockstep a newer candidate always masked it, but a
+# promote that cuts no next candidate (--promote-only, or the implicit branch) leaves none,
+# and the abandoned base would come back as "in flight" and wedge the next plain cut.
+# Grouped per base, N compared numerically, so git's prerelease-vs-base sort order never
+# enters (D1).
 inflight_rc() {
   local stables
   stables="$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sed 's/^v//' | tr '\n' ' ')"
@@ -115,11 +130,12 @@ inflight_rc() {
       if (ax[2]+0 != ay[2]+0) return ax[2]+0 > ay[2]+0
       return ax[3]+0 > ay[3]+0
     }
-    BEGIN { n = split(stables, arr, " "); for (i = 1; i <= n; i++) hasstable[arr[i]] = 1 }
+    BEGIN { n = split(stables, arr, " "); for (i = 1; i <= n; i++) { hasstable[arr[i]] = 1; if (hs == "" || gt(arr[i], hs)) hs = arr[i] } }
     {
       tag = $0; b = tag; sub(/^v/, "", b); sub(/-rc\..*$/, "", b)
       rc = tag; sub(/^.*-rc\./, "", rc)
       if (b in hasstable) next
+      if (hs != "" && !gt(b, hs)) next   # abandoned: at or below the highest stable
       if (bestb == "" || gt(b, bestb) || (b == bestb && rc+0 > bestn+0)) { bestb = b; bestn = rc+0; besttag = tag }
     }
     END { if (besttag != "") print besttag }'
@@ -198,6 +214,14 @@ fi
 # Best-effort tag refresh so discovery sees pushed tags; harmless (and skipped) with no
 # reachable origin, e.g. an offline fixture repo.
 git fetch --tags --quiet origin >/dev/null 2>&1 || true
+# The cut reads the LOCAL HEAD. A main that is BEHIND origin/main miscounts what shipped since
+# the RC (so --promote can take promote-only wrongly) and produces a release commit that can
+# never fast-forward onto origin. Refuse here rather than at the push. Ahead is normal (an
+# unpushed release commit); no origin/main ref (offline fixture, unreachable origin) skips it.
+BEHIND="$(git rev-list --count HEAD..refs/remotes/origin/main 2>/dev/null || echo 0)"
+if [ "${BEHIND:-0}" -gt 0 ]; then
+  echo "release-cut: local main is $BEHIND commit(s) behind origin/main. Fast-forward first: git merge --ff-only origin/main" >&2; exit 3
+fi
 
 # --- discovery ----------------------------------------------------------------
 S="$(highest_stable)"
@@ -218,6 +242,7 @@ print_inflight_facts() {
     echo "  $cnt first-parent merge(s) on main since it; [Unreleased] is $([ -z "$unrel" ] && echo empty || echo non-empty)."
     echo "  Pick one:"
     echo "    promote it to stable and cut v$VERSION-rc.1:   release-cut $VERSION --promote"
+    echo "    promote it to stable, cut NO next candidate:    release-cut $IB --promote-only"
     echo "    keep testing this base with another candidate:  release-cut $IB"
     echo "    abandon it and cut v$VERSION-rc.1 instead:      release-cut $VERSION --skip-promote"
   } >&2
@@ -234,11 +259,14 @@ if [ -n "$INFLIGHT" ]; then
       elif [ "$cmp_ib" = 1 ]; then print_inflight_facts; exit 3
       else echo "release-cut: $VERSION is below the in-flight candidate $INFLIGHT; refusing." >&2; exit 3; fi ;;
     --promote)      [ "$cmp_ib" = 1 ] || { echo "release-cut: --promote needs a version ABOVE the in-flight base $IB (got $VERSION)." >&2; exit 3; }; OP=promote ;;
+    # --promote-only names the stable it CREATES, so the version must be the in-flight base
+    # itself: a next-version argument here means the lead expected a candidate to be cut.
+    --promote-only) [ "$cmp_ib" = 0 ] || { echo "release-cut: --promote-only names the stable being created, so it needs the in-flight base $IB (got $VERSION). To also cut v$VERSION-rc.1: release-cut $VERSION --promote." >&2; exit 3; }; OP=promoteonly ;;
     --skip-promote) [ "$cmp_ib" = 1 ] || { echo "release-cut: --skip-promote needs a version ABOVE the in-flight base $IB (got $VERSION)." >&2; exit 3; }; OP=skiprc ;;
   esac
 else
   case "$VERB" in
-    --promote|--skip-promote) echo "release-cut: no RC is in flight; nothing to ${VERB#--}." >&2; exit 3 ;;
+    --promote|--promote-only|--skip-promote) echo "release-cut: no RC is in flight; nothing to ${VERB#--}." >&2; exit 3 ;;
     --stable) OP=stable ;;
     "") OP=rc1 ;;
   esac
@@ -253,6 +281,7 @@ case "$OP" in
   rc1|skiprc|promote) TAG="v$VERSION-rc.1"; CHARTVER="$VERSION-rc.1"; BASE="$VERSION" ;;
   nextrc)             RCN=$((IN + 1)); TAG="v$IB-rc.$RCN"; CHARTVER="$IB-rc.$RCN"; BASE="$IB" ;;
   stable)             TAG="v$VERSION"; CHARTVER="$VERSION"; BASE="$VERSION" ;;
+  promoteonly)        TAG="v$IB"; CHARTVER="$IB"; BASE="$IB" ;;   # the stable itself; no main half runs
 esac
 
 # --- shared step helpers ------------------------------------------------------
@@ -308,6 +337,26 @@ rename_and_fold() { # skiprc: rename `## [IB]`->`## [NEW]` (date today), move [U
     { print }
   ' CHANGELOG.md > "$tmp" || { rm -f "$tmp" "$bodyf"; echo "release-cut: skip-promote rename/fold failed" >&2; exit 1; }
   mv "$tmp" CHANGELOG.md; rm -f "$bodyf"
+}
+
+# sync_stable_heading <stable-tag>: make main's `## [S] - <date>` heading match the copy in
+# the stable tag. Promotion dates the section on the release branch (D3/D5); a promote that
+# never touches main (--promote-only, or the implicit promote-only branch) leaves main at the
+# RC-cut date, so the next cut of a new base reconciles it here. No-op when the two agree or
+# either side lacks the heading. index(), not a regex: the version's dots stay literal.
+sync_stable_heading() {
+  local tag="$1" sec="${1#v}" want have tmp
+  [ -n "$tag" ] || return 0
+  want="$(git show "$tag:CHANGELOG.md" 2>/dev/null | awk -v h="## [$sec]" 'index($0, h) == 1 { print; exit }')"
+  have="$(awk -v h="## [$sec]" 'index($0, h) == 1 { print; exit }' CHANGELOG.md)"
+  if [ -z "$want" ] || [ -z "$have" ] || [ "$want" = "$have" ]; then return 0; fi
+  tmp="$(mktemp)"
+  if awk -v h="## [$sec]" -v w="$want" 'index($0, h) == 1 && !done { print w; done = 1; next } { print }' CHANGELOG.md > "$tmp"; then
+    mv "$tmp" CHANGELOG.md
+    echo "  CHANGELOG: [$sec] heading synced to the $tag tag's copy (was '$have')"
+  else
+    rm -f "$tmp"; echo "release-cut: could not sync the [$sec] heading from $tag" >&2; exit 1
+  fi
 }
 
 refresh_section_date() { # set `## [SEC] - <today>` for the first [SEC] heading
@@ -416,10 +465,10 @@ promote_guard() {
   local rc=$?
   if [ "$rc" -ne 0 ] && [ -n "$PROMOTED_TAG" ] && [ "$PROMOTE_FINALIZED" -eq 0 ]; then
     git tag -d "$PROMOTED_TAG" >/dev/null 2>&1 \
-      && echo "release-cut: rolled back the local promote tag $PROMOTED_TAG (the RC cut did not complete); fix the cause and re-run." >&2
+      && echo "release-cut: rolled back the local promote tag $PROMOTED_TAG (the RC cut did not complete); fix the cause and re-run. To promote WITHOUT cutting a next candidate: release-cut $IB --promote-only." >&2
   fi
 }
-if [ "$OP" = promote ]; then
+if [ "$OP" = promote ] || [ "$OP" = promoteonly ]; then
   # REFUSE to promote an RC that is not confirmed PUBLISHED on origin. Promotion re-tags
   # the RC's published agent image and folds its notes; an unpushed RC was never built by
   # release.yml, so a promote of it ships a stable chart whose worker pin names an image
@@ -429,17 +478,17 @@ if [ "$OP" = promote ]; then
   rc_tag_on_remote "$INFLIGHT"; rtr=$?
   if [ "$rtr" -eq 2 ]; then
     {
-      echo "release-cut: --promote REFUSED -- the in-flight RC $INFLIGHT is not on origin."
+      echo "release-cut: $VERB REFUSED -- the in-flight RC $INFLIGHT is not on origin."
       echo "  Promotion re-tags the RC's PUBLISHED agent image and folds its notes; an RC that was never pushed was never built by release.yml, so promoting it would ship a stable chart whose workers.image.tag names an image nobody built (the 0.83.0-rc.7 incident, 2026-09-19)."
       echo "  Push the RC tag, let it publish, THEN promote:"
       echo "    ! git push origin $INFLIGHT"
       echo "    .../release-watch.sh ${INFLIGHT#v} && .../release-verify.sh ${INFLIGHT#v}"
-      echo "    release-cut $VERSION --promote"
+      echo "    release-cut $VERSION $VERB"
     } >&2
     exit 3
   elif [ "$rtr" -ne 0 ]; then
     {
-      echo "release-cut: --promote REFUSED -- could not reach origin to confirm $INFLIGHT is published (git ls-remote failed)."
+      echo "release-cut: $VERB REFUSED -- could not reach origin to confirm $INFLIGHT is published (git ls-remote failed)."
       echo "  Promoting without confirming the RC is published risks shipping a stable chart pinned to an unbuilt worker image (the 0.83.0-rc.7 incident). Fix connectivity/auth and re-run."
     } >&2
     exit 3
@@ -454,6 +503,21 @@ if [ "$OP" = promote ]; then
   unrel="$(changelog_unreleased_body | tr -d '[:space:]')"
   trap promote_guard EXIT
   promote_inflight
+  # --promote-only: the lead asked for the stable alone. Stop here whatever main carries:
+  # shipping work landed after the RC is deliberately NOT in this stable (it is tagged from
+  # the RC commit) and waits for the next plain cut, whose coverage window starts at this
+  # stable. main is untouched, so the same two warts as the implicit branch below apply.
+  if [ "$OP" = promoteonly ]; then
+    PROMOTE_FINALIZED=1
+    echo
+    echo "=== promoted $PROMOTED_TAG only (--promote-only: no next candidate cut, main untouched) ==="
+    if [ "$merges" -gt 0 ] || [ -n "$unrel" ]; then
+      echo "  NOT in $PROMOTED_TAG: $merges shipping commit(s) on main since $INFLIGHT; [Unreleased] is $([ -z "$unrel" ] && echo empty || echo non-empty). They ship with the next candidate (release-cut <next X.Y.Z>)."
+    fi
+    echo "  main is untouched: until the next cut its Chart.yaml stays at the RC version and its [$IB] section keeps the RC-cut date (the next cut syncs it from $PROMOTED_TAG)."
+    echo "Next:  git push origin $PROMOTED_TAG"
+    exit 0
+  fi
   if [ "$merges" -eq 0 ] && [ -z "$unrel" ]; then
     PROMOTE_FINALIZED=1
     echo
@@ -484,6 +548,9 @@ case "$OP" in
     fold_or_insert "$BASE" ;;
 esac
 echo "  CHANGELOG: [$BASE] section applied ($OP)"
+# A cut of a NEW base also reconciles the previous stable's heading date (a no-op unless that
+# stable was promoted without touching main). nextrc stays CHANGELOG-free by contract (D3).
+[ "$OP" = nextrc ] || sync_stable_heading "$(prev_stable_below "$BASE")"
 
 # --- Chart.yaml + autobump + links --------------------------------------------
 bump_chart "$CHARTVER"
@@ -530,12 +597,12 @@ if [ -n "$PROMOTED_TAG" ]; then
   echo "  git push origin $PROMOTED_TAG"
   echo "  git push origin main               # triggers ci.yml"
   echo "  .../watch-run-ci.sh --branch main --workflow ci.yml   # wait for green"
-  echo "  git tag -a $TAG -m $TAG HEAD  # then: ! git push origin $TAG  (classifier blocks the agent/lead)"
+  echo "  git tag -a $TAG -m $TAG HEAD  # then push it with the user's go-ahead; if the classifier blocks you, hand them: ! git push origin $TAG"
 else
   echo "  git show HEAD                 # review"
   echo "  git push origin main         # triggers ci.yml"
   echo "  .../watch-run-ci.sh --branch main --workflow ci.yml   # wait for green"
-  echo "  git tag -a $TAG -m $TAG HEAD  # then: ! git push origin $TAG  (classifier blocks the agent/lead)"
+  echo "  git tag -a $TAG -m $TAG HEAD  # then push it with the user's go-ahead; if the classifier blocks you, hand them: ! git push origin $TAG"
 fi
 echo "  .../release-watch.sh $CHARTVER && .../release-verify.sh $CHARTVER"
 exit 0

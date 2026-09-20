@@ -640,6 +640,191 @@ if git -C "$S8P" rev-parse -q --verify refs/tags/v0.2.0 >/dev/null; then pass "p
 assert_eq "promote-only does NOT cut a next RC (main chart unchanged)" "$chart_before" "$(chart_ver "$S8P")"
 if has_heading "$S8P" 0.3.0; then fail "promote-only opens NO [0.3.0] section"; else pass "promote-only opens NO [0.3.0] section"; fi
 
+echo "=== M2b: --promote-only (stable from the RC commit, NO next candidate, main untouched) ==="
+# The 0.83.1 case: SHIPPING work landed on main after the RC, it must not ride into the
+# stable, and no next candidate is wanted yet. --promote would cut v0.3.0-rc.1 in lockstep
+# (and, with an empty [Unreleased], fail and roll the stable back); --promote-only tags
+# v0.2.0 from the RC commit and stops, whatever main carries. Same setup as S8.
+S8O="$(mktemp -d)"; seed_repo "$S8O"; add_origin "$S8O"; add_feature "$S8O" 201
+put_changelog "$S8O" <<'MD'
+# Changelog
+
+## [Unreleased]
+### Added
+- **Feature 201** (#201)
+
+## [0.1.0] - 2026-09-01
+### Added
+- **Initial** (#100)
+MD
+run_rc "$S8O" 0.2.0; git -C "$S8O" tag v0.2.0-rc.1; push_tag_to_origin "$S8O" v0.2.0-rc.1
+add_feature "$S8O" 301
+put_changelog "$S8O" <<'MD'
+# Changelog
+
+## [Unreleased]
+### Added
+- **Feature 301** (#301)
+
+## [0.2.0] - 2020-01-01
+### Added
+- **Feature 201** (#201)
+
+## [0.1.0] - 2026-09-01
+### Added
+- **Initial** (#100)
+MD
+head_before="$(git -C "$S8O" rev-parse HEAD)"; chart_before="$(chart_ver "$S8O")"
+run_rc "$S8O" 0.2.0 --promote-only
+assert_eq "--promote-only exits 0" "0" "$RC_RC"
+if git -C "$S8O" rev-parse -q --verify refs/tags/v0.2.0 >/dev/null; then pass "--promote-only creates stable tag v0.2.0"; else fail "--promote-only creates stable tag v0.2.0"; fi
+assert_eq "--promote-only tag chart is stable 0.2.0" "0.2.0" "$(git -C "$S8O" show v0.2.0:deploy/chart/Chart.yaml 2>/dev/null | awk '/^version:/{print $2;exit}')"
+assert_eq "--promote-only stable sits directly on the RC commit" "$(git -C "$S8O" rev-parse 'v0.2.0-rc.1^{commit}')" "$(git -C "$S8O" rev-parse -q --verify 'v0.2.0^{commit}^' 2>/dev/null)"
+if git -C "$S8O" cat-file -e v0.2.0:api/feature_301.go 2>/dev/null; then fail "--promote-only stable excludes main's later shipping work"; else pass "--promote-only stable excludes main's later shipping work"; fi
+assert_eq "--promote-only leaves main's HEAD untouched"   "$head_before"  "$(git -C "$S8O" rev-parse HEAD)"
+assert_eq "--promote-only leaves main's chart untouched"  "$chart_before" "$(chart_ver "$S8O")"
+if has_heading "$S8O" 0.3.0; then fail "--promote-only opens NO next section"; else pass "--promote-only opens NO next section"; fi
+if git -C "$S8O" rev-parse -q --verify refs/heads/release/0.2.0 >/dev/null; then fail "--promote-only leaves no release/0.2.0 branch"; else pass "--promote-only leaves no release/0.2.0 branch"; fi
+assert_contains "--promote-only names what the stable leaves out" "1 shipping commit" "$RC_OUT"
+# The follow-on: with the base promoted no RC is in flight, so the next plain cut is an
+# ordinary rc.1 whose coverage window starts at the new stable (the oracle runs inside it).
+run_rc "$S8O" 0.3.0
+assert_eq "after --promote-only, the next plain cut exits 0"      "0"          "$RC_RC"
+assert_eq "after --promote-only, the next plain cut is 0.3.0-rc.1" "0.3.0-rc.1" "$(chart_ver "$S8O")"
+# ...and that cut reconciles main's [0.2.0] heading with the stable tag's copy: the promotion
+# dated the section on the release branch only, main still carried the RC-cut date (D3).
+heading_of() { awk -v h="## [$1]" 'index($0, h) == 1 { print; exit }'; }   # stdin -> the `## [X]` heading line
+tag_heading="$(git -C "$S8O" show v0.2.0:CHANGELOG.md | heading_of 0.2.0)"
+if [ "$tag_heading" != "## [0.2.0] - 2020-01-01" ] && [ -n "$tag_heading" ]; then pass "promotion dated the stable tag's [0.2.0] heading"; else fail "promotion dated the stable tag's [0.2.0] heading (got '$tag_heading')"; fi
+assert_eq "next cut syncs main's [0.2.0] heading to the stable tag's copy" "$tag_heading" "$(heading_of 0.2.0 < "$S8O/CHANGELOG.md")"
+
+echo "=== M2b: --promote-only refusals ==="
+# It must NAME the in-flight base (the stable being created), never a next version; it takes
+# no main-half options; it keeps --promote's published-RC guard; it needs an RC in flight.
+S8R="$(mktemp -d)"; seed_repo "$S8R"; add_origin "$S8R"; add_feature "$S8R" 201
+put_changelog "$S8R" <<'MD'
+# Changelog
+
+## [Unreleased]
+### Added
+- **Feature 201** (#201)
+
+## [0.1.0] - 2026-09-01
+### Added
+- **Initial** (#100)
+MD
+run_rc "$S8R" 0.2.0; git -C "$S8R" tag v0.2.0-rc.1
+run_rc "$S8R" 0.2.0 --promote-only
+assert_eq "--promote-only refused on a local-only RC exits 3" "3" "$RC_RC"
+assert_contains "--promote-only local-only refusal names the cause" "not on origin" "$RC_OUT"
+if git -C "$S8R" rev-parse -q --verify refs/tags/v0.2.0 >/dev/null; then fail "refused --promote-only (local-only RC) leaves NO v0.2.0 tag"; else pass "refused --promote-only (local-only RC) leaves NO v0.2.0 tag"; fi
+push_tag_to_origin "$S8R" v0.2.0-rc.1
+run_rc "$S8R" 0.3.0 --promote-only
+assert_eq "--promote-only with a version other than the in-flight base exits 3" "3" "$RC_RC"
+assert_contains "--promote-only wrong-version refusal names the base" "in-flight base 0.2.0" "$RC_OUT"
+# A VALID draft and an EXISTING --prev-tag, so the generic "file not found" / "tag does not
+# exist" preconditions cannot satisfy these; the specific refusal text must.
+printf '## [0.2.0] - 2026-10-02\n### Added\n- **Feature 201** (#201)\n' > "$S8R.draft.md"
+run_rc "$S8R" 0.2.0 --promote-only --changelog-file "$S8R.draft.md"
+assert_eq "--promote-only with --changelog-file exits 3" "3" "$RC_RC"
+assert_contains "--promote-only --changelog-file refusal is the specific one" "--promote-only takes no" "$RC_OUT"
+run_rc "$S8R" 0.2.0 --promote-only --no-commit
+assert_eq "--promote-only with --no-commit exits 3" "3" "$RC_RC"
+assert_contains "--promote-only --no-commit refusal is the specific one" "--promote-only takes no" "$RC_OUT"
+run_rc "$S8R" 0.2.0 --promote-only --prev-tag v0.1.0
+assert_eq "--promote-only with --prev-tag exits 3" "3" "$RC_RC"
+assert_contains "--promote-only --prev-tag refusal is the specific one" "--promote-only takes no" "$RC_OUT"
+if git -C "$S8R" rev-parse -q --verify refs/tags/v0.2.0 >/dev/null; then fail "refused --promote-only leaves NO v0.2.0 tag"; else pass "refused --promote-only leaves NO v0.2.0 tag"; fi
+S8N="$(mktemp -d)"; seed_repo "$S8N"
+run_rc "$S8N" 0.2.0 --promote-only
+assert_eq "--promote-only with no RC in flight exits 3" "3" "$RC_RC"
+assert_contains "--promote-only with no RC in flight says so" "no RC is in flight" "$RC_OUT"
+
+echo "=== M2b: an ABANDONED lower RC is not resurrected once a promote cuts no next candidate ==="
+# v0.2.0-rc.1 is abandoned (--skip-promote), v0.3.0-rc.1 is promoted alone. No candidate is
+# left to mask the abandoned base, so it used to come back as "in flight" and the next plain
+# cut refused (exit 3) instead of cutting v0.4.0-rc.1. A base at or below the highest stable
+# is never in flight.
+S8A="$(mktemp -d)"; seed_repo "$S8A"; add_origin "$S8A"; add_feature "$S8A" 201
+put_changelog "$S8A" <<'MD'
+# Changelog
+
+## [Unreleased]
+### Added
+- **Feature 201** (#201)
+
+## [0.1.0] - 2026-09-01
+### Added
+- **Initial** (#100)
+MD
+run_rc "$S8A" 0.2.0; git -C "$S8A" tag v0.2.0-rc.1; push_tag_to_origin "$S8A" v0.2.0-rc.1
+add_feature "$S8A" 301
+put_changelog "$S8A" <<'MD'
+# Changelog
+
+## [Unreleased]
+### Added
+- **Feature 301** (#301)
+
+## [0.2.0] - 2026-10-01
+### Added
+- **Feature 201** (#201)
+
+## [0.1.0] - 2026-09-01
+### Added
+- **Initial** (#100)
+MD
+run_rc "$S8A" 0.3.0 --skip-promote
+assert_eq "abandon v0.2.0-rc.1 (--skip-promote) exits 0" "0" "$RC_RC"
+git -C "$S8A" tag v0.3.0-rc.1; push_tag_to_origin "$S8A" v0.3.0-rc.1
+run_rc "$S8A" 0.3.0 --promote-only
+assert_eq "--promote-only of v0.3.0-rc.1 (abandoned v0.2.0-rc.1 below it) exits 0" "0" "$RC_RC"
+add_feature "$S8A" 401
+awk '/^## \[Unreleased\]/ { print; print "### Added"; print "- **Feature 401** (#401)"; print ""; next } { print }' "$S8A/CHANGELOG.md" > "$S8A/CHANGELOG.new" \
+  && mv "$S8A/CHANGELOG.new" "$S8A/CHANGELOG.md" && git -C "$S8A" add CHANGELOG.md && gcommit "$S8A" "docs: changelog"
+run_rc "$S8A" 0.4.0
+assert_eq "next plain cut ignores the abandoned v0.2.0-rc.1 and exits 0" "0" "$RC_RC"
+assert_eq "next plain cut is 0.4.0-rc.1"                               "0.4.0-rc.1" "$(chart_ver "$S8A")"
+
+echo "=== M2: a local main BEHIND origin/main is refused before anything is cut ==="
+# release-cut reads the LOCAL HEAD: a stale main changes --promote's promote-only decision
+# (fewer shipping commits since the RC) and cuts from a base whose release commit can never
+# fast-forward onto origin. Refuse up front instead of failing at the push.
+SBH="$(mktemp -d)"; seed_repo "$SBH"; add_origin "$SBH"; add_feature "$SBH" 201
+put_changelog "$SBH" <<'MD'
+# Changelog
+
+## [Unreleased]
+### Added
+- **Feature 201** (#201)
+
+## [0.1.0] - 2026-09-01
+### Added
+- **Initial** (#100)
+MD
+add_feature "$SBH" 202
+git -C "$SBH" push -q origin main
+git -C "$SBH" reset -q --hard HEAD~1          # local main is now 1 behind origin/main
+run_rc "$SBH" 0.2.0
+assert_eq "a main behind origin/main exits 3" "3" "$RC_RC"
+assert_contains "the behind refusal names the cause" "behind origin/main" "$RC_OUT"
+assert_eq "a refused stale cut leaves the chart untouched" "0.1.0" "$(chart_ver "$SBH")"
+git -C "$SBH" merge -q --ff-only origin/main
+put_changelog "$SBH" <<'MD'
+# Changelog
+
+## [Unreleased]
+### Added
+- **Feature 201** (#201)
+- **Feature 202** (#202)
+
+## [0.1.0] - 2026-09-01
+### Added
+- **Initial** (#100)
+MD
+run_rc "$SBH" 0.2.0
+assert_eq "after the fast-forward the same cut exits 0" "0" "$RC_RC"
+
 echo "=== M2b: --promote REFUSED when the in-flight RC is local-only (not on origin) ==="
 # The 0.83.0-rc.7 guard: promotion re-tags the RC's PUBLISHED agent image, so an RC that
 # was never pushed (never built by release.yml) must not promote. Same setup as S8 but the
@@ -873,8 +1058,9 @@ git -C "$SE" add deploy/chart/values.yaml; gcommit "$SE" "test: pin a tag on ori
 assert_eq "autobump exits 2 when the pin tag is on origin but not local" "2"          "$se_rc"
 assert_eq "autobump does NOT repin on the broken-instrument path"        "0.7.0-rc.1" "$(pin_tag "$SE")"
 
-rm -rf "$S1" "$S3" "$S4" "$S6" "$S7" "$S8" "$S8P" "$S8B" "$S8C" "$S9" "$S10" "$SA" "$SB" "$SC" "$SD" "$SE" \
-       "$S8.origin.git" "$S8P.origin.git" "$S8B.origin.git" "$S9.origin.git" "$S10.origin.git" "$SD.origin.git" "$SE.origin.git"
+rm -rf "$S1" "$S3" "$S4" "$S6" "$S7" "$S8" "$S8P" "$S8O" "$S8R" "$S8N" "$S8A" "$S8B" "$S8C" "$S9" "$S10" "$SA" "$SB" "$SC" "$SD" "$SE" \
+       "$S8.origin.git" "$S8P.origin.git" "$S8O.origin.git" "$S8R.origin.git" "$S8A.origin.git" "$S8B.origin.git" "$S9.origin.git" "$S10.origin.git" "$SD.origin.git" "$SE.origin.git" \
+       "$S8R.draft.md" "$SBH" "$SBH.origin.git"
 
 echo "=== M3: release-mode lib (shared by watch + verify) ==="
 # shellcheck source=scripts/lib/release-mode.sh

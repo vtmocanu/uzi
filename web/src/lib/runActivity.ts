@@ -72,6 +72,9 @@ export function latestActivity(messages: RunMessage[]): RunActivity | null {
 // Bash's command), and "" otherwise. agent_label and detail are stripped-and-capped;
 // agent and tool are NOT sanitized here (the server does not cap them either) — the
 // render layer folds all four through stripUnsafeChars for defense-in-depth.
+// agent_instance is passed through UNCHANGED from the frame (not derived from the
+// payload, not sanitized — it is COMPARED to match a live lane, never rendered) and is
+// present on the object ONLY when non-empty, mirroring Go's `omitempty`.
 function fromMessage(m: RunMessage): RunActivity {
   const payload = asRecord(m.payload);
   const name = str(payload.name);
@@ -103,7 +106,7 @@ function fromMessage(m: RunMessage): RunActivity {
       detail = "";
   }
 
-  return {
+  const activity: RunActivity = {
     agent,
     agent_label: sanitize(agentLabel),
     tool: name,
@@ -111,6 +114,9 @@ function fromMessage(m: RunMessage): RunActivity {
     at: m.created_at,
     seq: m.seq,
   };
+  const instance = m.agent_instance ?? "";
+  if (instance !== "") activity.agent_instance = instance;
+  return activity;
 }
 
 // activityAge renders a RunActivity's client-side age from its `at` instant — the R7

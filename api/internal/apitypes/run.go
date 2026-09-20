@@ -88,13 +88,20 @@ type RunSummaryDelta struct {
 // server strips terminal-unsafe runes and caps them (200 runes) before they land
 // here, and every renderer still applies its own terminal-safety fold. At is the
 // frame's created_at and Seq its per-run seq (the deterministic tiebreak).
+//
+// AgentInstance is the acting subagent's dispatch/parent tool_use id (empty for the
+// lead or a bare orchestrator frame); it is used to match a live lane and is COMPARED,
+// never rendered, so it carries no display sanitization obligation (it rides raw like
+// MilestoneLane.AgentInstance). omitempty because an empty instance is the "keep the
+// global now-line" signal.
 type RunActivity struct {
-	Agent      string    `json:"agent"`
-	AgentLabel string    `json:"agent_label"`
-	Tool       string    `json:"tool"`
-	Detail     string    `json:"detail"`
-	At         time.Time `json:"at"`
-	Seq        int32     `json:"seq"`
+	Agent         string    `json:"agent"`
+	AgentInstance string    `json:"agent_instance,omitempty"`
+	AgentLabel    string    `json:"agent_label"`
+	Tool          string    `json:"tool"`
+	Detail        string    `json:"detail"`
+	At            time.Time `json:"at"`
+	Seq           int32     `json:"seq"`
 }
 
 // IsTerminalRunStatus reports whether a run status is one a run never leaves — the

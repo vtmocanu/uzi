@@ -37,6 +37,31 @@ func realGit(dir string, args ...string) (string, error) {
 	return strings.TrimSpace(stdout.String()), nil
 }
 
+// realBrew is the production Env.Brew: it runs `brew <args>` (PRD #1251 M1's startup
+// update prompt). It has two modes, matching how the TUI uses the seam:
+//
+//   - foreground == false: a QUIET detection probe (`brew list uzi-cli`, `brew --prefix`).
+//     stdout+stderr are captured and returned combined so the caller can inspect them,
+//     and no output reaches the terminal — a `brew: command not found` here just means
+//     "not a brew user", not an error the user should see.
+//   - foreground == true: the actual `brew upgrade uzi-cli`, run AFTER the TUI has exited
+//     (D1). The subprocess stdout/stderr are wired to the real os.Stdout/os.Stderr so the
+//     from-source compile progress and any failure are visible; nothing is captured.
+//
+// Same injection-seam contract as Git/NewClient above: DefaultEnv wires this, tests
+// inject a fake that records (foreground, args) and returns canned output without forking
+// brew.
+func realBrew(foreground bool, args ...string) (string, error) {
+	cmd := exec.Command("brew", args...) //nolint:gosec // G204: the CLI's own brew shell-out seam — `brew <args>` where args are internal command literals (`list uzi-cli`, `--prefix`, `upgrade uzi-cli`), never remote/untrusted input.
+	if foreground {
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		return "", cmd.Run()
+	}
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
 // version is stamped at build time via -ldflags "-X main.version=vX.Y.Z"
 // (the brew formula does this). It equals the uzi v* tag the binary was built
 // from, making `uzi version` == the API version it was compiled against.
@@ -69,6 +94,16 @@ type Env struct {
 	// fake that records calls and returns canned output/errors, so no command test
 	// forks git. Same injection-seam contract as NewClient above.
 	Git func(dir string, args ...string) (string, error)
+
+	// Brew runs `brew <args>` for the TUI startup update prompt (PRD #1251 M1): brew
+	// detection (`brew list uzi-cli`, `brew --prefix`) and the `brew upgrade uzi-cli`
+	// hand-off on foreground exit. foreground==false captures output quietly for a
+	// detection probe; foreground==true wires the subprocess to os.Stdout/os.Stderr so
+	// the from-source compile is visible (D1). DefaultEnv wires realBrew; tests inject a
+	// fake that records the (foreground, args) call and returns canned output, so no test
+	// forks brew. Same injection-seam contract as Git above; may be nil (a test that never
+	// exercises the prompt), read through the brew() accessor which then reports non-brew.
+	Brew func(foreground bool, args ...string) (string, error)
 
 	// Store reads config/credentials. May be nil (e.g. no home dir), in which
 	// case only env/flags supply settings.
@@ -118,6 +153,7 @@ func DefaultEnv() Env {
 		StdinTTY:           uzicli.IsTerminal(os.Stdin),
 		NewClient:          func(s uzicli.Settings) uzicli.Client { return uzicli.NewHTTPClient(s) },
 		Git:                realGit,
+		Brew:               realBrew,
 		Store:              store,
 		Getenv:             os.Getenv,
 		AutoUpgradeSkill:   true,

@@ -59,7 +59,7 @@ GitHub tests each PR as branch **merged with base**, so a broken `main` fails `v
 on every PR at once. A `[skip ci]` doc/PRD commit is the classic cause — it never ran CI,
 so a `check-docs` break (e.g. a backticked `adr/…` or `prds/…` path that does not exist
 yet) sits on `main` unseen. Diagnose from a PR's failing job log (`gh run view --log-failed`,
-or `gh api …/jobs/JOB_ID/logs`), confirm the fault is on `main` (not the PR's own diff),
+or `gh api --allow-escape-sequences …/jobs/JOB_ID/logs`), confirm the fault is on `main` (not the PR's own diff),
 then fix it. A **docs-only** fix direct to `main` is the norm here (releases land that way);
 the `check-docs` opt-out for a forward-referenced artifact is a `check-docs:ignore-path`
 HTML-comment marker on the line. **Never push non-doc code to `main`.**
@@ -99,9 +99,12 @@ On red, read each failed job and classify: **code / conflict / missing-file** �
 branch, PR, merge, re-watch (never push code to `main`); **flaky** (passes on isolated
 re-run; `gh run rerun <run-id> --failed`) → file an issue, do not chase; **infra / can't-fix**
 → report and stop. Green = done. This is the local session fixing CI, NOT uzi's `ci_autofix`
-(which only touches pre-merge `agent/*` branches). `--log-failed` returns 0 bytes while the
-run is still in progress; read the failing step from
-`gh api repos/O/R/actions/jobs/<job-id> --jq '.steps[]|select(.conclusion=="failure")|.name'`.
+(which only touches pre-merge `agent/*` branches). The watcher prints two commands per
+failed job. Its `gh api --allow-escape-sequences repos/O/R/actions/jobs/JOB/logs` command
+returns the completed job's full log immediately, even while sibling jobs keep the workflow
+run in progress; `gh run view RUN --job JOB --log-failed` may refuse until that whole run is
+terminal. When only the failed step name is needed, use
+`gh api repos/O/R/actions/jobs/JOB --jq '.steps[]|select(.conclusion=="failure")|.name'`.
 
 **`conclusion == cancelled` is almost never a failure — it is concurrency
 supersession.** The CI workflows run with `concurrency: cancel-in-progress` on the `main`

@@ -294,8 +294,8 @@ type fakeStore struct {
 	candidates    []store.ListMRWatchCandidatesRow
 	candidatesErr error
 
-	scheduledCandidates    []store.ListScheduledMRStateWatchCandidatesRow
-	scheduledCandidatesErr error
+	boardFreeCandidates    []store.ListBoardFreeMRStateWatchCandidatesRow
+	boardFreeCandidatesErr error
 	issue                  store.Issue
 	issueErr               error
 	columns                []store.BoardColumn
@@ -376,8 +376,8 @@ func (s *fakeStore) DeleteIssuesNotIn(_ context.Context, arg store.DeleteIssuesN
 func (s *fakeStore) ListMRWatchCandidates(context.Context, uuid.UUID) ([]store.ListMRWatchCandidatesRow, error) {
 	return s.candidates, s.candidatesErr
 }
-func (s *fakeStore) ListScheduledMRStateWatchCandidates(context.Context, uuid.UUID) ([]store.ListScheduledMRStateWatchCandidatesRow, error) {
-	return s.scheduledCandidates, s.scheduledCandidatesErr
+func (s *fakeStore) ListBoardFreeMRStateWatchCandidates(context.Context, uuid.UUID) ([]store.ListBoardFreeMRStateWatchCandidatesRow, error) {
+	return s.boardFreeCandidates, s.boardFreeCandidatesErr
 }
 func (s *fakeStore) GetIssueByIID(context.Context, store.GetIssueByIIDParams) (store.Issue, error) {
 	return s.issue, s.issueErr
@@ -474,7 +474,7 @@ func (s *fakeStore) SettlePRDLinkPatch(_ context.Context, id uuid.UUID) (int64, 
 }
 
 // fakeReworkCanceller is a ReworkCanceller (forgesvc/service.go) stand-in for the
-// scheduled MR-state recorder tests (PRD #908): it records the mrIIDs it was asked to
+// board-free MR-state recorder tests (PRD #908): it records the mrIIDs it was asked to
 // cancel, in order, and can be forced to fail (err) to exercise the leave-unadvanced
 // retry contract on the opened->closed / ->merged cancel path.
 type fakeReworkCanceller struct {
@@ -487,11 +487,11 @@ func (c *fakeReworkCanceller) CancelReworkForMR(_ context.Context, _ uuid.UUID, 
 	return c.err
 }
 
-// scheduledCand builds a ListScheduledMRStateWatchCandidates row for the board-free
+// boardFreeCand builds a ListBoardFreeMRStateWatchCandidates row for the board-free
 // recorder tests (PRD #908). stored==nil models a NULL mr_state (Valid=false, the
 // bootstrap case); a non-nil pointer models a stored value.
-func scheduledCand(runID uuid.UUID, mrIID int64, stored *string) store.ListScheduledMRStateWatchCandidatesRow {
-	row := store.ListScheduledMRStateWatchCandidatesRow{
+func boardFreeCand(runID uuid.UUID, mrIID int64, stored *string) store.ListBoardFreeMRStateWatchCandidatesRow {
+	row := store.ListBoardFreeMRStateWatchCandidatesRow{
 		ID:    runID,
 		MrIid: pgtype.Int8{Int64: mrIID, Valid: true},
 	}

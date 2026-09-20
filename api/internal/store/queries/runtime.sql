@@ -607,7 +607,7 @@ WHERE run_id = @run_id::uuid
 -- partial index idx_run_messages_tool_use_seq (run_id, seq DESC) WHERE kind = 'tool_use'
 -- (migration 00186), so the per-run first row is one index seek rather than a walk back
 -- over the trailing non-tool_use frames the UNIQUE (run_id, seq) index would force.
-SELECT DISTINCT ON (run_id) run_id, seq, kind, agent, agent_label, payload, created_at
+SELECT DISTINCT ON (run_id) run_id, seq, kind, agent, agent_instance, agent_label, payload, created_at
 FROM run_messages
 WHERE run_id = ANY(@run_ids::uuid[])
   AND kind = 'tool_use'
@@ -5005,11 +5005,11 @@ WHERE repo_id = @repo_id::uuid AND issue_iid = @issue_iid AND move_pending_since
 -- Record the merge-request state the watcher just observed for this run. This is
 -- the ONLY SQL statement that writes runs.mr_state (the watcher-owned invariant,
 -- review finding 11): no run-status path writes it. It now has TWO Go callers over
--- near-disjoint run sets — SyncMRStates (issue runs, board-coupled) and
--- SyncScheduledMRStates (prompt/self_improve runs, board-free) — PRD #908; each
--- records the state for its own lane through this one statement (they can overlap only
--- on the newest self_improve run when its shared tracking issue is cached, which is
--- idempotent and board-move-free — see recordMRState). The run itself
+-- DISJOINT run sets — SyncMRStates (issue-lane runs, board-coupled) and
+-- SyncBoardFreeMRStates (issue-less MR-bearing runs, board-free) — PRD #908; each
+-- records the state for its own lane through this one statement. The two lanes never
+-- overlap: an issue-less run never matches the board lane's issues JOIN, and
+-- prompt/self_improve are excluded by its CTE (see recordMRState). The run itself
 -- stays terminal — closing an MR is review feedback, not a run-status event — so
 -- this touches mr_state (and updated_at) only.
 UPDATE runs SET mr_state = @mr_state, updated_at = now()

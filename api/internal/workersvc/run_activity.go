@@ -30,7 +30,7 @@ func (s *Service) CurrentActivityForRuns(ctx context.Context, runIDs []uuid.UUID
 	}
 	out := make(map[uuid.UUID]*apitypes.RunActivity, len(rows))
 	for _, r := range rows {
-		var agent, label *string
+		var agent, label, instance *string
 		if r.Agent.Valid {
 			v := r.Agent.String
 			agent = &v
@@ -39,7 +39,11 @@ func (s *Service) CurrentActivityForRuns(ctx context.Context, runIDs []uuid.UUID
 			v := r.AgentLabel.String
 			label = &v
 		}
-		out[r.RunID] = runactivity.FromFrame(r.Kind, agent, label,
+		if r.AgentInstance.Valid {
+			v := r.AgentInstance.String
+			instance = &v
+		}
+		out[r.RunID] = runactivity.FromFrame(r.Kind, agent, label, instance,
 			json.RawMessage(r.Payload), r.CreatedAt.Time, r.Seq)
 	}
 	return out, nil

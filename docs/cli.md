@@ -172,6 +172,10 @@ A few worth knowing:
   and the server's nests under `server`, leaving existing parsers untouched;
   fields the server did not stamp are omitted rather than sent empty, so an
   absent `server.commit` means "unknown", never "empty".
+- **`uzi tui` also surfaces an available update, unprompted.** Where `version`
+  only tells you on request, the TUI checks at every startup and shows a modal
+  when this binary is behind the latest published release — see [Startup: an
+  available update](#startup-an-available-update) below.
 - **No `worker create` and no `admin` writes.** Minting a worker join token
   returns a credential that reads decrypted secrets, and every admin write
   stays cookie-only — both are web UI actions by design.
@@ -961,6 +965,46 @@ keyboard; `--follow` (with `--json` for NDJSON, `--after <seq>` to resume,
 and stop-on-terminal-status) stays the scriptable, single-run surface and is
 also the TUI's own fallback when the live channel is unreachable (below).
 
+### Startup: an available update
+
+Before the board draws, `uzi tui` checks whether a newer **stable** uzi
+release exists and, if so, shows a modal on top of it:
+
+```
+▲ Update available
+uzi 0.83.0  →  0.85.0
+
+A newer release is available.
+
+▸ Update now  (brew upgrade uzi-cli)
+  Not now
+  Don't remind me for 0.85.0
+```
+
+- **A Homebrew install** gets the "Update now" action: choosing it exits the
+  TUI and runs `brew upgrade uzi-cli` in the foreground — so the from-source
+  compile output (and any failure) stays visible — then tells you to rerun
+  `uzi tui`. It never upgrades silently in the background while the TUI keeps
+  running. A **go-install or source build** gets an info variant instead: the
+  release-notes link, with no action button, since there's no single upgrade
+  command to hand it.
+- **A security release** renders as the filled amber andon band and is
+  worded as a security update; a routine release stays quiet.
+- **Gating mirrors** [the CLI-vs-server skew warning](#when-your-cli-is-older-than-the-server):
+  shown only for a stamped release build (a `go build`/`dev` binary never
+  prompts), and it honours the same off-switches — `UZI_VERSION_CHECK=0` and
+  `--quiet`. It never offers a prerelease (`-rc.N`) tag.
+- **"Don't remind me for `<version>`"** is remembered per release version (a
+  later release re-prompts anyway); **"Not now"** (or `esc`) just closes the
+  modal for this session, with nothing persisted, and it shows at most once
+  per `uzi tui` invocation either way.
+- **This is a third axis**, distinct from `version`'s own `update … available`
+  row and from the CLI-vs-server skew banner above: it compares this CLI
+  binary against the latest *published* release, not the CLI against the
+  *server's* running version. The CLI makes no network call of its own for
+  it — it reads the release facts already riding the same `/api/version`
+  response the TUI fetches for the footer skew readout.
+
 ### Three views
 
 - **Board** (the default). Your own runs, refreshed on a poll — a live list
@@ -1006,7 +1050,18 @@ also the TUI's own fallback when the live channel is unreachable (below).
   from the visible per-row cells (so the two won't always visibly agree —
   the total is the accurate figure), and it's dropped when zero. The whole
   board refreshes on the poll, so status, health, milestones, age, cost and
-  the judge verdict stay live.
+  the judge verdict stay live. **A locked vault gets its own line** beside
+  the per-token rate-limit strip under the wordmark — the strip is never
+  hidden — matching the web SPA's "waiting for vault unlock": a quiet, faint
+  `🔒 vault locked` hint (`[locked] vault locked` under NO_COLOR or a
+  non-color terminal). When one or more of **your own** runs are actually
+  parked on the lock, the hint escalates to a steady amber needs-you band
+  instead: `▌ VAULT LOCKED · N runs parked — unlock in the web app to
+  resume`. On the admin/factory board the count is scoped to your own
+  runs only — it never counts or names another user's locked vault. Either
+  form is steady, never blinking, and clears on its own within about a
+  minute of the vault unlocking; there's no dismiss. Unlocking itself is done
+  off-TUI, in the web app.
 - **Run detail** (`[enter]` from the board, or `uzi tui <run-id>` directly).
   A left rail of agent lanes — the lead plus each live subagent, one lane per
   invocation, each with a status dot — beside the selected lane's transcript,

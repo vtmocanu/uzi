@@ -5012,7 +5012,7 @@ func (q *Queries) LatestPlanSeqForRun(ctx context.Context, runID uuid.UUID) (int
 }
 
 const latestToolUseForRuns = `-- name: LatestToolUseForRuns :many
-SELECT DISTINCT ON (run_id) run_id, seq, kind, agent, agent_label, payload, created_at
+SELECT DISTINCT ON (run_id) run_id, seq, kind, agent, agent_instance, agent_label, payload, created_at
 FROM run_messages
 WHERE run_id = ANY($1::uuid[])
   AND kind = 'tool_use'
@@ -5020,13 +5020,14 @@ ORDER BY run_id, seq DESC
 `
 
 type LatestToolUseForRunsRow struct {
-	RunID      uuid.UUID          `json:"run_id"`
-	Seq        int32              `json:"seq"`
-	Kind       string             `json:"kind"`
-	Agent      pgtype.Text        `json:"agent"`
-	AgentLabel pgtype.Text        `json:"agent_label"`
-	Payload    []byte             `json:"payload"`
-	CreatedAt  pgtype.Timestamptz `json:"created_at"`
+	RunID         uuid.UUID          `json:"run_id"`
+	Seq           int32              `json:"seq"`
+	Kind          string             `json:"kind"`
+	Agent         pgtype.Text        `json:"agent"`
+	AgentInstance pgtype.Text        `json:"agent_instance"`
+	AgentLabel    pgtype.Text        `json:"agent_label"`
+	Payload       []byte             `json:"payload"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
 }
 
 // The newest tool_use frame per run for a page of runs (PRD #1064 D3, current_activity):
@@ -5050,6 +5051,7 @@ func (q *Queries) LatestToolUseForRuns(ctx context.Context, runIds []uuid.UUID) 
 			&i.Seq,
 			&i.Kind,
 			&i.Agent,
+			&i.AgentInstance,
 			&i.AgentLabel,
 			&i.Payload,
 			&i.CreatedAt,
@@ -10836,11 +10838,11 @@ type SetRunMRStateParams struct {
 // Record the merge-request state the watcher just observed for this run. This is
 // the ONLY SQL statement that writes runs.mr_state (the watcher-owned invariant,
 // review finding 11): no run-status path writes it. It now has TWO Go callers over
-// near-disjoint run sets — SyncMRStates (issue runs, board-coupled) and
-// SyncScheduledMRStates (prompt/self_improve runs, board-free) — PRD #908; each
-// records the state for its own lane through this one statement (they can overlap only
-// on the newest self_improve run when its shared tracking issue is cached, which is
-// idempotent and board-move-free — see recordMRState). The run itself
+// DISJOINT run sets — SyncMRStates (issue-lane runs, board-coupled) and
+// SyncBoardFreeMRStates (issue-less MR-bearing runs, board-free) — PRD #908; each
+// records the state for its own lane through this one statement. The two lanes never
+// overlap: an issue-less run never matches the board lane's issues JOIN, and
+// prompt/self_improve are excluded by its CTE (see recordMRState). The run itself
 // stays terminal — closing an MR is review feedback, not a run-status event — so
 // this touches mr_state (and updated_at) only.
 func (q *Queries) SetRunMRState(ctx context.Context, arg SetRunMRStateParams) (int64, error) {

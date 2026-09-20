@@ -577,7 +577,7 @@ func railActivity(frames []laneFrame) *apitypes.RunActivity {
 	ra := make([]runactivity.Frame, 0, len(frames))
 	for i := range frames {
 		f := &frames[i]
-		var agent, label *string
+		var agent, label, instance *string
 		if f.Agent != "" {
 			a := f.Agent
 			agent = &a
@@ -586,8 +586,15 @@ func railActivity(frames []laneFrame) *apitypes.RunActivity {
 			l := f.AgentLabel
 			label = &l
 		}
+		// Thread agent_instance the same "" → nil way, so the folded RunActivity carries the acting
+		// subagent's instance and the lanes now-line suppression matches BY INSTANCE (lanesShowInstance,
+		// PRD #1353 D4) rather than by role name.
+		if f.AgentInstance != "" {
+			in := f.AgentInstance
+			instance = &in
+		}
 		ra = append(ra, runactivity.Frame{
-			Kind: f.Kind, Agent: agent, AgentLabel: label,
+			Kind: f.Kind, Agent: agent, AgentLabel: label, AgentInstance: instance,
 			Payload: f.Payload, CreatedAt: f.CreatedAt, Seq: f.Seq,
 		})
 	}
@@ -675,10 +682,11 @@ func (m tuiModel) renderMilestones() string {
 	}
 	// LIVE LANES (PRD #1353 M6). laneIdx is the D6-refiltered MilestonesLive keyed by milestone id;
 	// a NON-EMPTY laneIdx ("has lanes") is the authoritative live display — the lanes ARE the live
-	// frames, so they supersede the single current_activity now-line whenever a lane shows its agent
-	// (lanesShowAgent; a live agent on no lane keeps the now-line). Computed only for a non-terminal
-	// run (a terminal run has no "now"). When laneIdx is empty the render is the M1 path unchanged (D5
-	// branch on lane PRESENCE, never a nil test).
+	// frames, so they supersede the single current_activity now-line whenever a lane shares the live
+	// activity's agent_instance (lanesShowInstance; a live activity on no lane, or one with no
+	// instance, keeps the now-line). Computed only for a non-terminal run (a terminal run has no
+	// "now"). When laneIdx is empty the render is the M1 path unchanged (D5 branch on lane PRESENCE,
+	// never a nil test).
 	var laneIdx map[string][]apitypes.MilestoneLane
 	if !terminal {
 		laneIdx = milestonesLiveIndex(m.detail.run)
@@ -717,13 +725,14 @@ func (m tuiModel) renderMilestones() string {
 		sb.WriteString(m.pal.faint.Render("· "+suffix) + "\n")
 	}
 	// An unattached now line directly under the eyebrow, in three cases. In the lanes branch (PRD
-	// #1353 M6) it is suppressed when a lane already shows the live agent, since it would only
-	// duplicate that per-lane line below.
+	// #1353 M6) it is suppressed when a lane already shares the live activity's agent_instance, since
+	// it would only duplicate that per-lane line below.
 	switch {
 	case hasLanes:
-		// D6 holds here too: a live agent on NO lane (an untagged dispatch, a subagent on a milestone
-		// not in progress, the lead itself) keeps the unattached now-line instead of vanishing.
-		if act != nil && !lanesShowAgent(laneIdx, act.Agent) {
+		// D6 holds here too, now via the D4 instance match: a live activity on NO lane (an untagged
+		// dispatch, a subagent on a milestone not in progress, or the lead / an orchestrator frame
+		// that carries no instance) keeps the unattached now-line instead of vanishing.
+		if act != nil && !lanesShowInstance(laneIdx, act.AgentInstance) {
 			sb.WriteString(m.railNowLines(act, " ", "   "))
 		}
 	case len(effAgents) == 0 && ipID == "" && act != nil:

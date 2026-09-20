@@ -214,9 +214,13 @@ func TestTUIMilestoneLanesRender(t *testing.T) {
 	// A driving frame supplies current_activity; the lanes branch SUPPRESSES the eyebrow now-line, so
 	// the frame's own label "coder busy" must NOT appear anywhere in the block.
 	frameAgent, frameLabel := "coder", "coder busy"
+	// The frame's AgentInstance is "toolu_1", the m2 coder lane's instance, so lanesShowInstance
+	// matches and the eyebrow now-line stays suppressed (a bare role name would no longer suffice
+	// after the D4 change).
+	toolu1 := "toolu_1"
 	editPayload := json.RawMessage(`{"name":"Edit","input":{"file_path":"api/internal/limits/window.go"}}`)
 	m = applyDetail(m, run, []apitypes.MessageDTO{
-		{Seq: 1, Kind: "tool_use", Agent: &frameAgent, AgentLabel: &frameLabel, CreatedAt: at, Payload: editPayload},
+		{Seq: 1, Kind: "tool_use", Agent: &frameAgent, AgentInstance: &toolu1, AgentLabel: &frameLabel, CreatedAt: at, Payload: editPayload},
 	})
 	got := milestoneBlockRegion(t, m.View().Content)
 
@@ -278,5 +282,51 @@ func TestTUIMilestoneLanesUnlanedLiveAgent(t *testing.T) {
 		"     Wire the limiter"
 	if got != want {
 		t.Errorf("TUI unlaned live agent render drifted.\n--- got ---\n%s\n--- want ---\n%s\n--- got (quoted) ---\n%q", got, want, got)
+	}
+}
+
+// TestTUIMilestoneLanesSameRoleUnlanedInstance is the crew-rail twin of the CLI M2 regression pin for
+// the D4 SAME-ROLE instance defect (issue #1460). m2 has one live `reviewer` lane (AgentInstance
+// "toolu_laned") and the driving frame is a SECOND live `reviewer` with a DIFFERENT instance
+// ("toolu_unlaned") and a distinctive label. On the OLD role-NAME match the laned reviewer suppressed
+// the eyebrow now-line, so the unlaned reviewer vanished (PRD #1353 D4 violation); the instance match
+// keeps it because the two instances differ. Built INLINE (NOT via tuiAttribModel, which sets no
+// instance and is shared by other tests), with the Ascii profile and a future-dated frame so the
+// render is deterministic. Fails on the name match, passes on the instance match.
+func TestTUIMilestoneLanesSameRoleUnlanedInstance(t *testing.T) {
+	runID := "run-1460-tui-samerole"
+	at := time.Now().Add(2 * time.Hour) // relAge floors a not-yet timestamp to "0s"
+	run := apitypes.RunDTO{
+		ID: runID, Kind: "issue", Status: "running", Health: "ok", IssueTitle: "Add rate limiting",
+		Milestones:           []apitypes.Milestone{{ID: "m1", Title: "Alpha"}, {ID: "m2", Title: "Beta"}},
+		MilestonesCompleted:  []string{"m1"},
+		MilestonesInProgress: []string{"m2"},
+		MilestonesLive: []apitypes.MilestoneLive{
+			{MilestoneID: "m2", Lanes: []apitypes.MilestoneLane{
+				{Agent: "reviewer", AgentInstance: "toolu_laned", AgentLabel: "Review A", Tool: "Read", Detail: "a.go", At: at},
+			}},
+		},
+	}
+	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
+	next, _ := m.Update(tea.ColorProfileMsg{Profile: colorprofile.Ascii})
+	m = next.(tuiModel)
+	// A SECOND live reviewer on NO lane: same role as the lane, DIFFERENT instance ("toolu_unlaned")
+	// and a distinctive label. Its label must appear (the eyebrow now-line renders) — the old name
+	// match would have hidden it because the laned reviewer's role matched.
+	frameAgent, frameLabel := "reviewer", "Untagged review"
+	toolu := "toolu_unlaned"
+	readPayload := json.RawMessage(`{"name":"Read","input":{"file_path":"api/internal/limits/unlaned_marker.go"}}`)
+	m = applyDetail(m, run, []apitypes.MessageDTO{
+		{Seq: 1, Kind: "tool_use", Agent: &frameAgent, AgentInstance: &toolu, AgentLabel: &frameLabel, CreatedAt: at, Payload: readPayload},
+	})
+	got := milestoneBlockRegion(t, m.View().Content)
+
+	// The eyebrow now-line RENDERS: the driving frame's distinctive label appears in the block.
+	if !strings.Contains(got, "Untagged review") {
+		t.Errorf("PRD #1353 D4: a same-role unlaned reviewer (distinct instance) must render the eyebrow now-line, but its label is missing:\n%s", got)
+	}
+	// The m2 reviewer lane's OWN line still renders beneath its milestone (its distinctive label).
+	if !strings.Contains(got, "Review A") {
+		t.Errorf("PRD #1353 M6: the m2 reviewer lane line must still render:\n%s", got)
 	}
 }

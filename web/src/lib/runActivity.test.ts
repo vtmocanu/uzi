@@ -12,13 +12,15 @@ import type { RunActivity, RunMessage } from "./apiTypes";
 //
 // The fixture is the SPEC, not a recording: it is hand-authored and owned by neither
 // module. Its frame shape is the language-neutral Frame {kind, agent, agent_label,
-// payload, created_at, seq}; RunMessage additionally carries agent_instance, so the
-// bridge below adds `agent_instance: null` (latestActivity does not read it — the
-// dispatch identity it folds comes from the payload, not the frame column).
+// agent_instance, payload, created_at, seq}; the shared fixture now carries
+// agent_instance, which the TS fold passes through unchanged (fromMessage copies it onto
+// the RunActivity when non-empty — it is COMPARED to match a live lane, never rendered),
+// so the bridge below reads it from the fixture frame rather than hard-coding null.
 
 interface FixtureFrame {
   kind: string;
   agent: string | null;
+  agent_instance?: string | null;
   agent_label: string | null;
   payload: unknown;
   created_at: string;
@@ -48,7 +50,7 @@ function bridgeFrame(f: FixtureFrame): RunMessage {
     seq: f.seq,
     kind: f.kind,
     agent: f.agent,
-    agent_instance: null,
+    agent_instance: f.agent_instance ?? null,
     agent_label: f.agent_label,
     payload: f.payload,
     created_at: f.created_at,

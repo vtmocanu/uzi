@@ -287,6 +287,16 @@ func TestMessageDTOTags(t *testing.T) {
 		"seq", "kind", "agent", "agent_instance", "agent_label", "payload", "created_at")
 }
 
+func TestRunActivityTags(t *testing.T) {
+	// agent_instance is omitempty (present only when set), unlike MessageDTO's non-omitempty agent_instance.
+	assertTags(t, "RunActivity(empty)", RunActivity{},
+		"agent", "agent_label", "tool", "detail", "at", "seq")
+	// present when set.
+	if got := tagSet(t, RunActivity{AgentInstance: "x"}); !contains(got, "agent_instance") {
+		t.Fatalf("RunActivity with AgentInstance set must include agent_instance key, got %v", got)
+	}
+}
+
 func TestRunInputTags(t *testing.T) {
 	// PRD #84 M4 4c: override_capabilities is a plain bool (not omitempty), so it is always
 	// on the wire; meaningful only with approve_plan, default false. PRD #1391 Run B M3d (D13):

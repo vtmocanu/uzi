@@ -16,6 +16,13 @@ func (f *FakeClient) Whoami(context.Context) (apitypes.UserDTO, error) {
 	return f.User, nil
 }
 
+func (f *FakeClient) WhoamiVault(context.Context) (apitypes.UserDTO, bool, error) {
+	if f.Err != nil {
+		return apitypes.UserDTO{}, false, f.Err
+	}
+	return f.User, f.VaultLocked, nil
+}
+
 func (f *FakeClient) ListSecrets(context.Context) ([]apitypes.SecretDTO, error) {
 	if f.Err != nil {
 		return nil, f.Err

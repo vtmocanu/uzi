@@ -1,0 +1,605 @@
+<title>uzi Admin Health</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<style>
+  /* uzi's own tokens: the "dawn" light theme as the base, "ember" for dark. */
+  :root {
+    color-scheme: light;
+    --bg: 242 244 247; --surface: 255 255 255; --raised: 235 238 243;
+    --edge: 214 219 228; --edge-strong: 174 182 196;
+    --fg: 21 26 34; --muted: 74 85 103; --faint: 95 106 130;
+    --brand: 185 60 11; --on-brand: 255 255 255;
+    --ok: 3 112 90; --warn: 154 74 5; --danger: 190 18 60; --info: 3 105 161;
+    /* the console scope stays dark in every theme, as in the app */
+    --con-bg: 8 10 15; --con-fg: 228 232 240; --con-muted: 148 158 176; --con-edge: 39 45 60;
+    --con-ok: 52 211 153; --con-warn: 251 191 36; --con-danger: 251 113 133; --con-brand: 251 146 60;
+    --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --bg: 8 10 15; --surface: 15 18 26; --raised: 23 27 38; --edge: 39 45 60; --edge-strong: 58 66 86;
+      --fg: 228 232 240; --muted: 148 158 176; --faint: 122 133 154;
+      --brand: 251 146 60; --on-brand: 26 16 8;
+      --ok: 52 211 153; --warn: 251 191 36; --danger: 251 113 133; --info: 56 189 248;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: 8 10 15; --surface: 15 18 26; --raised: 23 27 38; --edge: 39 45 60; --edge-strong: 58 66 86;
+    --fg: 228 232 240; --muted: 148 158 176; --faint: 122 133 154;
+    --brand: 251 146 60; --on-brand: 26 16 8;
+    --ok: 52 211 153; --warn: 251 191 36; --danger: 251 113 133; --info: 56 189 248;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: rgb(var(--bg)); color: rgb(var(--fg));
+    font-family: var(--font-sans); font-size: 14px; line-height: 1.45;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: rgb(var(--info)); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  button { font: inherit; }
+  :focus-visible { outline: 2px solid rgb(var(--brand)); outline-offset: 2px; border-radius: 4px; }
+  .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+  .num { font-variant-numeric: tabular-nums; }
+  .muted { color: rgb(var(--muted)); }
+  .faint { color: rgb(var(--faint)); }
+
+  /* ---- the mock's own chrome, kept visually apart from the app ---- */
+  .mockbar {
+    position: sticky; top: env(safe-area-inset-top, 0px); z-index: 10;
+    display: flex; flex-wrap: wrap; align-items: center; gap: 8px 18px;
+    padding: 9px 16px; background: rgb(var(--fg)); color: rgb(var(--bg)); font-size: 12.5px;
+  }
+  .mockbar .tag {
+    font-family: var(--font-mono); font-size: 11px; letter-spacing: .08em; text-transform: uppercase;
+    padding: 2px 7px; border-radius: 4px; background: rgb(var(--brand)); color: rgb(var(--on-brand));
+  }
+  .ctl { display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .ctl > span { opacity: .7; }
+  .seg { display: inline-flex; flex-wrap: wrap; border: 1px solid rgb(var(--bg) / .35); border-radius: 8px; overflow: hidden; }
+  .seg button {
+    appearance: none; border: 0; margin: 0; cursor: pointer; padding: 5px 11px; font-size: 12.5px;
+    background: transparent; color: rgb(var(--bg) / .82);
+  }
+  .seg button + button { border-left: 1px solid rgb(var(--bg) / .35); }
+  .seg button[aria-pressed="true"] { background: rgb(var(--bg)); color: rgb(var(--fg)); font-weight: 600; }
+  .seg button:focus-visible { outline-offset: -2px; }
+  .seg button:disabled { opacity: .4; cursor: default; }
+
+  .note {
+    border: 1px dashed rgb(var(--edge-strong)); border-radius: 8px; padding: 10px 12px;
+    font-size: 12.5px; color: rgb(var(--muted)); background: transparent; max-width: 78ch;
+  }
+  .note b { font-family: var(--font-mono); font-size: 10.5px; letter-spacing: .08em; text-transform: uppercase; color: rgb(var(--brand)); margin-right: 6px; font-weight: 600; }
+
+  /* ---- app frame ---- */
+  .frame { display: grid; grid-template-columns: 208px minmax(0, 1fr); min-height: 80vh; }
+  .side { border-right: 1px solid rgb(var(--edge)); background: rgb(var(--surface)); padding: 18px 10px; }
+  .wordmark { padding: 0 10px 14px; font-weight: 600; letter-spacing: -.01em; font-size: 15px; }
+  .wordmark small { display: block; font-weight: 400; font-size: 11px; color: rgb(var(--faint)); letter-spacing: 0; }
+  .nav { display: grid; gap: 2px; }
+  .nav button {
+    appearance: none; border: 0; background: transparent; color: rgb(var(--muted)); text-align: left;
+    padding: 7px 10px; border-radius: 7px; font-size: 13.5px; display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  }
+  .nav button.live { cursor: pointer; }
+  .nav button.live:hover { background: rgb(var(--raised)); color: rgb(var(--fg)); }
+  .nav button[aria-current="page"] { background: rgb(var(--raised)); color: rgb(var(--fg)); font-weight: 500; }
+  .pip { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+  .pip.warn { background: rgb(var(--warn)); }
+  .pip.danger { background: rgb(var(--danger)); }
+  .main { padding-block: 26px 48px; padding-inline: 28px; display: grid; gap: 22px; align-content: start; min-width: 0; }
+  .main > section { display: grid; gap: 20px; min-width: 0; }
+  @media (max-width: 860px) {
+    .frame { grid-template-columns: minmax(0, 1fr); }
+    .side { display: none; }
+    .main { padding-inline: 16px; }
+  }
+
+  h1 { margin: 0; font-size: 22px; font-weight: 600; letter-spacing: -.01em; text-wrap: balance; }
+  .sub { margin: 4px 0 0; color: rgb(var(--muted)); }
+  h2.section { margin: 0; font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .08em; color: rgb(var(--faint)); }
+
+  .tabs { display: flex; gap: 4px; overflow-x: auto; border-bottom: 1px solid rgb(var(--edge)); }
+  .tabs span, .tabs button {
+    appearance: none; background: transparent; border: 0; border-bottom: 2px solid transparent; margin-bottom: -1px;
+    padding: 8px 12px; font-size: 14px; font-weight: 500; color: rgb(var(--muted)); white-space: nowrap; flex: none;
+    display: inline-flex; align-items: center; gap: 7px;
+  }
+  .tabs .on { border-bottom-color: rgb(var(--brand)); color: rgb(var(--fg)); }
+  .newtag { font-family: var(--font-mono); font-size: 9.5px; letter-spacing: .08em; text-transform: uppercase; color: rgb(var(--brand)); border: 1px solid rgb(var(--brand) / .45); border-radius: 4px; padding: 0 4px; }
+
+  .card { border: 1px solid rgb(var(--edge)); background: rgb(var(--surface)); border-radius: 12px; }
+  .pad { padding: 18px 20px; }
+
+  /* severity language: form + colour */
+  .sev { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; letter-spacing: .02em; padding: 2px 8px 2px 6px; border-radius: 999px; border: 1px solid; white-space: nowrap; width: max-content; }
+  .sev i { font-style: normal; font-size: 10px; width: 10px; text-align: center; }
+  .sev.ok { color: rgb(var(--ok)); border-color: rgb(var(--ok) / .3); background: rgb(var(--ok) / .08); }
+  .sev.warn { color: rgb(var(--warn)); border-color: rgb(var(--warn) / .4); background: rgb(var(--warn) / .1); }
+  .sev.danger { color: rgb(var(--danger)); border-color: rgb(var(--danger) / .45); background: rgb(var(--danger) / .1); }
+  .sev.unknown { color: rgb(var(--muted)); border-color: rgb(var(--edge-strong)); border-style: dashed; background: rgb(var(--raised)); }
+  .sev.na { color: rgb(var(--faint)); border-color: rgb(var(--edge)); background: transparent; font-weight: 500; }
+
+  /* verdict */
+  .verdict { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 14px 24px; align-items: start; }
+  .verdict .big { display: flex; gap: 12px; align-items: flex-start; }
+  .verdict .glyph { font-size: 22px; line-height: 1.25; flex: none; }
+  .verdict .glyph.ok { color: rgb(var(--ok)); } .verdict .glyph.warn { color: rgb(var(--warn)); }
+  .verdict .glyph.danger { color: rgb(var(--danger)); }
+  .verdict h2 { margin: 0; font-size: 20px; font-weight: 600; letter-spacing: -.01em; text-wrap: balance; }
+  .verdict p { margin: 3px 0 0; color: rgb(var(--muted)); max-width: 70ch; }
+  .tally { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; }
+  .meta { display: flex; flex-wrap: wrap; gap: 6px 16px; align-items: center; font-size: 12.5px; color: rgb(var(--faint)); margin-top: 14px; padding-top: 12px; border-top: 1px solid rgb(var(--edge)); }
+  .btn { appearance: none; cursor: pointer; border: 1px solid rgb(var(--edge-strong)); background: rgb(var(--surface)); color: rgb(var(--fg)); border-radius: 7px; padding: 4px 10px; font-size: 12.5px; }
+  .btn:hover { background: rgb(var(--raised)); }
+  .attn { margin: 14px 0 0; padding: 0; list-style: none; display: grid; gap: 6px; }
+  .attn li { display: grid; grid-template-columns: 84px minmax(0, 1fr) auto; gap: 4px 12px; align-items: baseline; }
+  .attn a { color: rgb(var(--fg)); font-weight: 500; }
+  .attn .s { color: rgb(var(--muted)); font-weight: 400; }
+  @media (max-width: 720px) { .verdict { grid-template-columns: minmax(0, 1fr); } .tally { justify-content: flex-start; } }
+
+  /* check rows */
+  .group { overflow: hidden; }
+  .group > header { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; padding: 12px 20px; border-bottom: 1px solid rgb(var(--edge)); }
+  .check { border-top: 1px solid rgb(var(--edge)); }
+  .group > header + .check { border-top: 0; }
+  .check > summary {
+    list-style: none; cursor: pointer; padding: 11px 20px;
+    display: grid; grid-template-columns: 84px minmax(130px, 190px) minmax(0, 1fr) auto 14px;
+    grid-template-areas: "sev title sum since chev"; gap: 4px 14px; align-items: baseline;
+  }
+  .check > summary::-webkit-details-marker { display: none; }
+  .check > summary:hover { background: rgb(var(--raised) / .6); }
+  .check .sev { grid-area: sev; }
+  .check .ctitle { grid-area: title; font-weight: 500; }
+  .check .csum { grid-area: sum; color: rgb(var(--muted)); min-width: 0; }
+  .check .since { grid-area: since; font-size: 12.5px; color: rgb(var(--faint)); white-space: nowrap; }
+  .check .chev { grid-area: chev; color: rgb(var(--faint)); font-size: 11px; transition: transform .15s; }
+  .check[open] .chev { transform: rotate(90deg); }
+  @media (prefers-reduced-motion: reduce) { .check .chev { transition: none; } }
+  .check.s-ok .ctitle, .check.s-na .ctitle { font-weight: 400; }
+  .check.s-warn { background: rgb(var(--warn) / .05); }
+  .check.s-danger { background: rgb(var(--danger) / .06); }
+  .check.s-warn .csum, .check.s-danger .csum, .check.s-unknown .csum { color: rgb(var(--fg)); }
+  @media (max-width: 720px) {
+    .check > summary { grid-template-columns: 84px minmax(0, 1fr) auto 14px; grid-template-areas: "sev title since chev" "sum sum sum sum"; padding-inline: 16px; }
+    .group > header { padding-inline: 16px; }
+  }
+  .cbody { padding: 2px 20px 16px 118px; display: grid; gap: 12px; }
+  @media (max-width: 720px) { .cbody { padding-left: 16px; padding-right: 16px; } }
+  .kv { margin: 0; display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 3px 16px; font-size: 13px; }
+  .kv dt { color: rgb(var(--faint)); }
+  .kv dd { margin: 0; font-family: var(--font-mono); font-size: 12.5px; overflow-wrap: anywhere; }
+  .action { font-size: 13.5px; max-width: 72ch; }
+  .action b { font-weight: 600; }
+  .cmd { display: flex; gap: 8px; align-items: stretch; }
+  .cmd pre { margin: 0; flex: 1; min-width: 0; overflow-x: auto; background: rgb(var(--con-bg)); color: rgb(var(--con-fg)); border: 1px solid rgb(var(--con-edge)); border-radius: 7px; padding: 7px 10px; font-family: var(--font-mono); font-size: 12px; }
+  .src { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; font-size: 12px; color: rgb(var(--faint)); }
+  .plumb { font-family: var(--font-mono); font-size: 10px; letter-spacing: .06em; text-transform: uppercase; border-radius: 4px; padding: 1px 5px; border: 1px solid rgb(var(--edge-strong)); color: rgb(var(--muted)); }
+  .plumb.new { border-color: rgb(var(--brand) / .5); color: rgb(var(--brand)); }
+
+  /* fleet table */
+  .scroll { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th { text-align: left; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .07em; color: rgb(var(--faint)); padding: 9px 12px; border-bottom: 1px solid rgb(var(--edge)); white-space: nowrap; }
+  td { padding: 9px 12px; border-bottom: 1px solid rgb(var(--edge)); white-space: nowrap; vertical-align: baseline; }
+  tr:last-child td { border-bottom: 0; }
+  th:first-child, td:first-child { padding-left: 20px; } th:last-child, td:last-child { padding-right: 20px; }
+  .dot { display: inline-flex; align-items: center; gap: 6px; }
+  .dot::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+  .t-ok { color: rgb(var(--ok)); } .t-warn { color: rgb(var(--warn)); } .t-danger { color: rgb(var(--danger)); } .t-muted { color: rgb(var(--muted)); }
+
+  /* banner (AppShell level) */
+  .banner { border: 1px solid rgb(var(--danger) / .4); background: rgb(var(--danger) / .1); border-radius: 10px; padding: 12px 16px; display: flex; flex-wrap: wrap; gap: 10px 20px; align-items: center; justify-content: space-between; }
+  .banner p { margin: 0; }
+  .banner .t { font-weight: 600; }
+  .banner .b { color: rgb(var(--muted)); margin-top: 2px; max-width: 80ch; }
+  .banner .acts { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .linkbtn { appearance: none; border: 0; background: transparent; padding: 0; color: rgb(var(--info)); cursor: pointer; font-size: 14px; }
+  .linkbtn:hover { text-decoration: underline; }
+
+  /* overview */
+  .tiles { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+  @media (min-width: 900px) { .tiles { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
+  .tile { padding: 16px; }
+  .label { margin: 0; font-size: 12px; font-weight: 500; text-transform: uppercase; letter-spacing: .08em; color: rgb(var(--faint)); }
+  .tile .value { margin: 6px 0 0; font-size: 24px; font-weight: 600; }
+  .tile .hint { margin: 2px 0 0; font-size: 12px; color: rgb(var(--faint)); }
+  .hcard header { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px 16px; }
+  .hcard .line { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+  .hcard .line strong { font-weight: 600; }
+  .quiet { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; justify-content: space-between; padding: 11px 16px; }
+  .runs { margin: 8px 0 0; padding: 0; list-style: none; }
+  .runs li { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 6px 12px; padding: 10px 0; border-top: 1px solid rgb(var(--edge)); }
+  .runs li:first-child { border-top: 0; }
+  .badge { font-size: 12px; padding: 1px 8px; border-radius: 999px; border: 1px solid rgb(var(--edge)); background: rgb(var(--raised)); color: rgb(var(--muted)); white-space: nowrap; }
+  .badge.warn { color: rgb(var(--warn)); border-color: rgb(var(--warn) / .4); background: rgb(var(--warn) / .1); }
+  .badge.ok { color: rgb(var(--ok)); border-color: rgb(var(--ok) / .3); background: rgb(var(--ok) / .08); }
+  .badge.info { color: rgb(var(--info)); border-color: rgb(var(--info) / .35); background: rgb(var(--info) / .08); }
+  .userline { border: 1px solid rgb(var(--edge-strong)); background: rgb(var(--raised)); border-radius: 10px; padding: 11px 16px; color: rgb(var(--fg)); }
+
+  /* console + slack */
+  .console { background: rgb(var(--con-bg)); color: rgb(var(--con-fg)); border: 1px solid rgb(var(--con-edge)); border-radius: 10px; padding: 14px 16px; overflow-x: auto; font-family: var(--font-mono); font-size: 12.5px; line-height: 1.6; margin: 0; white-space: pre; }
+  .console .p { color: rgb(var(--con-brand)); } .console .m { color: rgb(var(--con-muted)); }
+  .console .ok { color: rgb(var(--con-ok)); } .console .warn { color: rgb(var(--con-warn)); } .console .danger { color: rgb(var(--con-danger)); }
+  .slack { display: grid; grid-template-columns: 36px minmax(0, 1fr); gap: 12px; padding: 16px 18px; max-width: 640px; }
+  .slack .av { width: 36px; height: 36px; border-radius: 8px; background: rgb(var(--brand)); color: rgb(var(--on-brand)); display: grid; place-items: center; font-weight: 600; font-size: 13px; }
+  .slack .who { font-weight: 600; } .slack .who span { font-weight: 400; color: rgb(var(--faint)); font-size: 12px; margin-left: 6px; }
+  .slack ul { margin: 6px 0 8px; padding-left: 18px; } .slack p { margin: 4px 0 0; }
+  .two { display: grid; gap: 20px; grid-template-columns: minmax(0, 1fr); }
+</style>
+
+<div class="mockbar">
+  <span class="tag">mock</span>
+  <div class="ctl"><span>Scenario</span>
+    <div class="seg" id="seg-scn" role="group" aria-label="Scenario">
+      <button id="scn-healthy" data-scn="healthy">Healthy</button>
+      <button id="scn-degraded" data-scn="degraded">Degraded</button>
+      <button id="scn-incident" data-scn="incident">Incident</button>
+      <button id="scn-silent" data-scn="silent">Controller silent</button>
+      <button id="scn-compose" data-scn="compose">Compose</button>
+    </div>
+  </div>
+  <div class="ctl"><span>Surface</span>
+    <div class="seg" id="seg-view" role="group" aria-label="Surface">
+      <button id="view-btn-health" data-view="health">Admin health tab</button>
+      <button id="view-btn-overview" data-view="overview">Overview</button>
+      <button id="view-btn-push" data-view="push">CLI and Slack</button>
+    </div>
+  </div>
+  <div class="ctl"><span>Viewing as</span>
+    <div class="seg" id="seg-role" role="group" aria-label="Role">
+      <button id="role-admin" data-role="admin">Admin</button>
+      <button id="role-user" data-role="user">User</button>
+    </div>
+  </div>
+</div>
+
+<div class="frame">
+  <aside class="side" aria-label="App navigation (mock)">
+    <div class="wordmark">uzi<small>Uzinele Întunecate</small></div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <div id="banner"></div>
+    <section id="v-health"></section>
+    <section id="v-overview" hidden></section>
+    <section id="v-push" hidden></section>
+  </main>
+</div>
+
+<script>
+(function () {
+  "use strict";
+  var GLYPH = { ok: "●", warn: "▲", danger: "◆", unknown: "?", na: "○" };
+  var LABEL = { ok: "OK", warn: "Warn", danger: "Danger", unknown: "Unknown", na: "N/A" };
+  var RANK = { danger: 0, unknown: 1, warn: 2, ok: 3, na: 4 };
+  var GROUPS = [
+    ["workers", "Workers and capacity"], ["queue", "Queue"], ["control", "Control plane"],
+    ["integrations", "Integrations"], ["housekeeping", "Housekeeping"]
+  ];
+
+  // plumb: "have" = the api already holds this data, "new" = needs new plumbing, "check" = not yet verified in code
+  var BASE = [
+    { id: "fleet.roll", group: "workers", title: "Worker image roll", summary: "4 of 4 hosted workers on 0.84.0",
+      plumb: "have", source: "Controller status report. Stored today, but only the owner's worker list reads it; the admin list must join it too.",
+      evidence: [["Target tag", "0.84.0"], ["Settled", "4"], ["Rolling", "0"], ["Stuck", "0"]] },
+    { id: "fleet.capacity", group: "workers", title: "Run capacity", summary: "4 workers online across 3 users, 3 idle, none cordoned",
+      plumb: "have", source: "Worker heartbeats",
+      evidence: [["Online", "4 of 4"], ["Busy", "1"], ["Cordoned", "0"], ["Users with waiting runs and no usable worker", "0"]] },
+    { id: "fleet.disk", group: "workers", title: "Worker disk", summary: "Fullest volume is 41% used",
+      plumb: "have", source: "Worker heartbeat stats",
+      evidence: [["Fullest", "base.l-7c2e data, 41%"], ["Disk-pressure flags", "0"]] },
+    { id: "queue.waiting", group: "queue", title: "Queued runs", summary: "No run is waiting for a worker",
+      plumb: "have", source: "runs.health, written by the sweeper",
+      evidence: [["Waiting for a worker", "0"], ["Oldest", "n/a"]] },
+    { id: "queue.undispatched", group: "queue", title: "Undispatched runs", summary: "No task run is stuck before dispatch",
+      plumb: "new", source: "New query: task runs created but never dispatched (dispatched_at is null)",
+      evidence: [["Threshold", "10 min"], ["Matches", "0"]] },
+    { id: "controller.report", group: "control", title: "Worker controller", summary: "Last report 6 s ago, expected every 10 s",
+      plumb: "new", source: "Arrival time of the controller's status report. Today it is stored only per worker, so an empty fleet leaves no trace: needs one stored row.",
+      evidence: [["Last report", "6 s ago"], ["Interval", "10 s"], ["Stale after", "30 s"], ["Danger after", "5 min"]] },
+    { id: "db.ping", group: "control", title: "Database", summary: "Ping 2 ms, pool 3 of 20 in use, migrations at head",
+      plumb: "have", source: "pgx pool stats and the goose version table",
+      evidence: [["Ping", "2 ms"], ["Pool in use", "3 of 20"], ["Migration head", "applied"]] },
+    { id: "loops.tick", group: "control", title: "Background loops", summary: "Sweeper, forge poller and lifecycle reconciler all ticked in the last minute",
+      plumb: "new", source: "In-process last-tick timestamps",
+      evidence: [["Sweeper", "12 s ago"], ["Forge poller", "31 s ago"], ["Lifecycle reconciler", "9 s ago"]] },
+    { id: "version.skew", group: "control", title: "Version skew", summary: "web, api and controller all on 0.84.0",
+      deferred: true, plumb: "later", source: "Stamping the web and controller builds needs a CI workflow edit, which a uzi worker cannot push. A maintainer follow-up.",
+      evidence: [["api", "0.84.0"], ["web", "0.84.0"], ["controller", "0.84.0"]] },
+    { id: "forge.sync", group: "integrations", title: "Forge sync", summary: "3 connections synced in the last 2 min",
+      deferred: true, plumb: "later", source: "No per-connection sync bookkeeping exists yet. A follow-up once that is stored.",
+      evidence: [["Connections", "3"], ["Oldest sync", "1 min 48 s ago"], ["Failing", "0"]] },
+    { id: "forge.ciwatch", group: "integrations", title: "CI watch", summary: "12 of 20 branch slots used",
+      plumb: "new", source: "A count in place of today's once-a-minute log line (issue #1483)",
+      evidence: [["Busiest repo", "acme/factory"], ["Slots used", "12 of 20"]] },
+    { id: "slack.socket", group: "integrations", title: "Slack", summary: "Socket connected for 9 h",
+      plumb: "have", source: "The existing admin Slack status endpoint",
+      evidence: [["State", "connected"], ["Since", "9 h ago"]] },
+    { id: "schedules.paused", group: "housekeeping", title: "Schedules", summary: "No pause-all in force",
+      plumb: "have", source: "Schedule pause state and last-fire skip reasons",
+      evidence: [["Users paused", "0"], ["Jobs skipped last fire", "0"]] },
+    { id: "board.drift", group: "housekeeping", title: "Board drift", summary: "No column move given up in 24 h",
+      plumb: "have", source: "The column-move marker, once issue #1482 stops repo-less runs tripping it",
+      evidence: [["Given up, 24 h", "0"]] },
+    { id: "custody.holds", group: "housekeeping", title: "Recovery custody", summary: "0 of 4 custody slots held",
+      plumb: "have", source: "The existing recovery holds endpoint",
+      evidence: [["Held", "0 of 4"]] },
+    { id: "release.check", group: "housekeeping", title: "Release", summary: "Running the latest release",
+      plumb: "have", source: "The existing release check",
+      evidence: [["Running", "0.84.0"], ["Latest", "0.84.0"]] }
+  ];
+
+  var W_OK = [
+    { owner: "user A", name: "base.l-7c2e", kind: "hosted", status: "online", st: "ok", version: "0.84.0", upgrade: "up to date", ut: "ok", blocking: "", since: "11 h" },
+    { owner: "user A", name: "base.l-19fd", kind: "hosted", status: "online", st: "ok", version: "0.84.0", upgrade: "up to date", ut: "ok", blocking: "", since: "11 h" },
+    { owner: "user B", name: "base.m-40ab", kind: "hosted", status: "busy", st: "ok", version: "0.84.0", upgrade: "up to date", ut: "ok", blocking: "", since: "11 h" },
+    { owner: "user C", name: "base.l-e215", kind: "hosted", status: "online", st: "ok", version: "0.84.0", upgrade: "up to date", ut: "ok", blocking: "", since: "11 h" }
+  ];
+  function fleet(patch) { return W_OK.map(function (w, i) { return Object.assign({}, w, typeof patch === "function" ? patch(w, i) : patch); }); }
+
+  var CIWATCH_WARN = { sev: "warn", summary: "At the cap: 20 of 20 slots used, 7 older run branches are not watched", since: "3 d",
+    evidence: [["Repo", "acme/factory"], ["Slots used", "20 of 20"], ["Unwatched branches", "7"]],
+    action: "Delete merged agent/issue-* branches, or raise CI_WATCH_MAX_REFS. Runs on an unwatched branch get no CI auto-fix." };
+
+  var SCN = {
+    healthy: { verdict: "All systems normal", sub: "Every check uzi can make about itself is passing.", overrides: {}, fleet: fleet({}),
+      tiles: ["2", "2 / 2"], runs: [["Board: drag to the Closed column", "running", "info", ""], ["Rework MR review: agent/issue-412", "completed", "ok", ""], ["Judge stats: per-category totals", "completed", "ok", ""]] },
+
+    degraded: { verdict: "2 warnings, nothing is blocked", sub: "Work is flowing. These are the quiet no-ops that otherwise only show up as a log line.",
+      overrides: {
+        "fleet.roll": { summary: "3 of 4 on 0.84.0, 1 rolling for 2 min", evidence: [["Target tag", "0.84.0"], ["Settled", "3"], ["Rolling", "1"], ["Stuck", "0"]] },
+        "forge.ciwatch": CIWATCH_WARN,
+        "schedules.paused": { sev: "warn", summary: "1 user has pause-all in force, 5 enabled jobs skipped their last fire", since: "6 d",
+          evidence: [["Users paused", "1 (user A)"], ["Jobs skipped last fire", "5"], ["Skip reason", "schedules_paused"]],
+          action: "If the pause is intentional, snooze this check. Otherwise that user resumes with the command below; labelled issues look queued but never run while it holds.",
+          cmd: "uzi schedule resume-all" }
+      },
+      fleet: fleet(function (w, i) { return i === 3 ? { status: "offline", st: "muted", version: "0.83.1", upgrade: "upgrading", ut: "warn", since: "2 min" } : {}; }),
+      tiles: ["2", "2 / 2"], runs: [["Board: drag to the Closed column", "running", "info", ""], ["Rework MR review: agent/issue-412", "completed", "ok", ""], ["Judge stats: per-category totals", "completed", "ok", ""]] },
+
+    incident: { verdict: "uzi cannot run work", sub: "No hosted worker can take a run. Three checks share one cause: the fleet is pinned to a worker image that was never published.",
+      overrides: {
+        "fleet.roll": { sev: "danger", summary: "4 of 4 workers stuck rolling to 0.84.0-rc.2: ImagePullBackOff", since: "38 min",
+          evidence: [["Target tag", "0.84.0-rc.2"], ["Stuck", "4 of 4"], ["Blocking container", "worker"], ["Reason", "ImagePullBackOff"], ["Likely cause", "the pinned tag is not in the registry"]],
+          action: "Publish the image, or release a chart whose workers.image.tag names a published tag. Do not patch the Deployment by hand: GitOps reverts it within minutes.",
+          cmd: "kubectl -n <worker-namespace> describe pod -l uzi.dev/hosted-worker-id=<id>" },
+        "fleet.capacity": { sev: "danger", summary: "2 users have runs waiting and no worker that can take them", since: "36 min",
+          evidence: [["Online", "0 of 4"], ["Stuck", "4"], ["Users with waiting runs and no usable worker", "2 (user A, user C)"]],
+          action: "Follows from the image roll above. Capacity returns on its own once the workers pull a real image." },
+        "queue.waiting": { sev: "danger", summary: "3 runs waiting for a worker, the oldest for 34 min", since: "34 min",
+          evidence: [["Waiting for a worker", "3"], ["Owners", "user A (2), user C (1)"], ["Oldest", "34 min"]],
+          action: "Nothing to do per run. They dispatch when capacity returns." },
+        "forge.ciwatch": CIWATCH_WARN
+      },
+      fleet: fleet({ status: "offline", st: "danger", version: "0.83.1", upgrade: "FAILED", ut: "danger", blocking: "worker: ImagePullBackOff", since: "38 min" }),
+      banner: { t: "uzi cannot run work: 0 of 4 hosted workers are available", b: "All 4 are stuck pulling worker image 0.84.0-rc.2 (ImagePullBackOff). 3 runs are queued behind them." },
+      slack: { head: "Health turned DANGER at 02:14", items: ["Worker image roll: 4 of 4 workers stuck rolling to 0.84.0-rc.2 (ImagePullBackOff)", "Run capacity: 0 workers can take a run", "Queued runs: 3 waiting, oldest 2 min"], foot: "One notice per admin per Danger episode, sent once Danger has held for 2 min, as a Slack DM and in the web inbox. It re-arms when health leaves Danger." },
+      tiles: ["0", "0 / 2"], runs: [["Schedules: owner overlay on sweep defaults", "queued", "", "waiting for a worker"], ["TUI: vault-locked indicator", "queued", "", "waiting for a worker"], ["Docs hygiene, weekly", "queued", "", "waiting for a worker"]] },
+
+    silent: { verdict: "The worker controller has gone silent", sub: "Workers still heartbeat, so runs continue. But no one is reconciling the fleet, and roll health below is last-known, not live.",
+      overrides: {
+        "controller.report": { sev: "danger", summary: "No report for 14 min, expected every 10 s", since: "14 min",
+          evidence: [["Last report", "14 min ago"], ["Interval", "10 s"], ["Danger after", "5 min"]],
+          action: "Check the controller pod. While it is down, new hosted workers are not provisioned, image rolls do not progress and ephemeral workers are not torn down.",
+          cmd: "kubectl -n <release-namespace> get pods -l app.kubernetes.io/component=controller" },
+        "fleet.roll": { sev: "unknown", summary: "Last known: 4 of 4 on 0.84.0. That signal is 14 min stale", since: "14 min",
+          evidence: [["Last known", "4 settled, 0 stuck"], ["Signal age", "14 min"], ["Trusted for", "60 s"]],
+          action: "Stale never reads as green. This clears when the controller reports again." }
+      },
+      fleet: fleet({ upgrade: "unknown (stale)", ut: "muted" }),
+      banner: { t: "The worker controller stopped reporting 14 min ago", b: "Running work is unaffected. New hosted workers, image rolls and ephemeral teardown are all paused until it returns." },
+      slack: { head: "Health turned DANGER at 09:41", items: ["Worker controller: no report for 5 min, expected every 10 s"], foot: "One notice per admin per Danger episode, sent once Danger has held for 2 min, as a Slack DM and in the web inbox. It re-arms when health leaves Danger." },
+      tiles: ["2", "2 / 2"], runs: [["Board: drag to the Closed column", "running", "info", ""], ["Rework MR review: agent/issue-412", "completed", "ok", ""], ["Judge stats: per-category totals", "completed", "ok", ""]] },
+
+    compose: { verdict: "All systems normal", sub: "A laptop compose stack. Kubernetes-only checks are marked not applicable instead of disappearing or turning green.",
+      overrides: {
+        "fleet.roll": { sev: "na", summary: "Hosted workers are not enabled on this deployment", evidence: [["workers.enabled", "false"]] },
+        "controller.report": { sev: "na", summary: "No controller on this deployment", evidence: [["workers.enabled", "false"]] },
+        "fleet.capacity": { summary: "1 worker online, idle", evidence: [["Online", "1 of 1"], ["Busy", "0"], ["Free run slots", "2"]] },
+        "forge.ciwatch": { summary: "3 of 20 branch slots used", evidence: [["Slots used", "3 of 20"]] },
+        "slack.socket": { sev: "na", summary: "Slack is not configured", evidence: [["Configured", "no"]] }
+      },
+      fleet: [{ owner: "user A", name: "laptop", kind: "external", status: "online", st: "ok", version: "0.84.0", upgrade: "up to date", ut: "ok", blocking: "", since: "2 h" }],
+      tiles: ["0", "1 / 1"], runs: [["Rework MR review: agent/issue-412", "completed", "ok", ""], ["Judge stats: per-category totals", "completed", "ok", ""]] }
+  };
+
+  var state = { scn: "incident", view: "health", role: "admin", snoozed: false };
+  try {
+    var saved = JSON.parse(localStorage.getItem("uzi-health-mock") || "null");
+    if (saved && SCN[saved.scn]) { state.scn = saved.scn; state.view = saved.view || state.view; state.role = saved.role || state.role; }
+  } catch (e) { /* storage unavailable: defaults are fine */ }
+
+  function esc(s) { return String(s).replace(/[&<>"]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]; }); }
+  function sevPill(s) { return '<span class="sev ' + s + '"><i aria-hidden="true">' + GLYPH[s] + "</i>" + LABEL[s] + "</span>"; }
+  function checks() {
+    var ov = SCN[state.scn].overrides;
+    return BASE.filter(function (c) { return !c.deferred; }).map(function (c) { return Object.assign({ sev: "ok", since: "" }, c, ov[c.id] || {}); });
+  }
+  function tally(list) {
+    var t = { ok: 0, warn: 0, danger: 0, unknown: 0, na: 0 };
+    list.forEach(function (c) { t[c.sev]++; });
+    return t;
+  }
+  function worst(list) {
+    var t = tally(list);
+    return t.danger ? "danger" : (t.unknown || t.warn) ? "warn" : "ok";
+  }
+  function attention(list) {
+    return list.filter(function (c) { return c.sev !== "ok" && c.sev !== "na"; })
+      .sort(function (a, b) { return RANK[a.sev] - RANK[b.sev]; });
+  }
+
+  /* ---------- admin health tab ---------- */
+  function renderHealth() {
+    var el = document.getElementById("v-health");
+    if (state.role === "user") {
+      el.innerHTML = '<div><h1>Overview</h1></div><div class="note"><b>mock note</b>Non-admins never see this tab. Every /admin route already redirects them to Overview, and the health endpoint sits behind the read-only admin guard. Switch to the Overview surface to see what a user gets.</div>';
+      return;
+    }
+    var list = checks(), t = tally(list), w = worst(list), att = attention(list), s = SCN[state.scn];
+    var tabs = ["Users", "Rate limits", "Tool allowlist", "Blocked repos", "Instance", "Branding"];
+    var pip = att.length ? '<span class="pip ' + (t.danger ? "danger" : "warn") + '" aria-hidden="true"></span><span class="num">' + att.length + "</span>" : "";
+    var h = '<div><h1>Admin</h1><p class="sub">Configuration and controls for this uzi instance.</p></div>';
+    h += '<div class="tabs" id="admin-tabs">' + tabs.map(function (x) { return "<span>" + x + "</span>"; }).join("") +
+      '<button class="on" type="button">Health ' + pip + ' <span class="newtag">new</span></button></div>';
+    h += '<p class="muted" style="margin:0">What uzi can tell about its own health. Read-only: nothing here restarts, retries or rolls anything back.</p>';
+
+    h += '<div class="card pad"><div class="verdict"><div class="big"><span class="glyph ' + w + '" aria-hidden="true">' + GLYPH[t.danger ? "danger" : w === "warn" ? "warn" : "ok"] + '</span><div><h2>' + esc(s.verdict) + "</h2><p>" + esc(s.sub) + '</p></div></div><div class="tally">' +
+      ["danger", "unknown", "warn", "ok", "na"].filter(function (k) { return t[k]; }).map(function (k) { return '<span class="sev ' + k + '"><i aria-hidden="true">' + GLYPH[k] + '</i><span class="num">' + t[k] + "</span> " + LABEL[k] + "</span>"; }).join("") + "</div></div>";
+    if (att.length) {
+      h += '<ul class="attn">' + att.map(function (c) {
+        return "<li>" + sevPill(c.sev) + '<span><a href="#c-' + c.id + '" data-jump="' + c.id + '">' + esc(c.title) + '</a> <span class="s">' + esc(c.summary) + '</span></span><span class="faint num">' + (c.since ? "for " + esc(c.since) : "") + "</span></li>";
+      }).join("") + "</ul>";
+    }
+    h += '<div class="meta"><span>Checked 8 s ago, refreshes every 10 s</span><span>' + list.length + ' checks</span><button class="btn" type="button" id="copy-diag">Copy diagnostics</button></div></div>';
+
+    if (state.scn === "silent") h += '<div class="note"><b>mock note</b>The point of this scenario: a stale signal reads Unknown, never green. Run capacity stays OK because it comes from worker heartbeats, which do not depend on the controller.</div>';
+    if (state.scn === "degraded") h += '<div class="note"><b>mock note</b>One worker is mid-roll and the roll check stays OK. A roll in progress must not alert; it only turns Danger when a pod is blocked, or Warn when it outlasts its window.</div>';
+
+    GROUPS.forEach(function (g) {
+      var rows = list.filter(function (c) { return c.group === g[0]; });
+      var gt = tally(rows), bad = gt.danger + gt.warn + gt.unknown;
+      h += '<div class="card group"><header><h2 class="section">' + g[1] + '</h2><span class="faint num" style="font-size:12.5px">' + (bad ? bad + " need attention" : "all passing") + "</span></header>";
+      rows.forEach(function (c) {
+        var open = c.sev === "danger" || c.sev === "unknown";
+        h += '<details class="check s-' + c.sev + '" id="c-' + c.id + '"' + (open ? " open" : "") + "><summary>" + sevPill(c.sev) +
+          '<span class="ctitle">' + esc(c.title) + '</span><span class="csum">' + esc(c.summary) + '</span><span class="since num">' + (c.since ? "for " + esc(c.since) : "") + '</span><span class="chev" aria-hidden="true">▶</span></summary><div class="cbody">';
+        if (c.action) h += '<p class="action" style="margin:0"><b>What to do.</b> ' + esc(c.action) + "</p>";
+        h += '<dl class="kv">' + c.evidence.map(function (kv) { return "<dt>" + esc(kv[0]) + "</dt><dd>" + esc(kv[1]) + "</dd>"; }).join("") + "</dl>";
+        if (c.cmd) h += '<div class="cmd"><pre>' + esc(c.cmd) + '</pre><button class="btn" type="button" data-copy="' + esc(c.cmd) + '">Copy</button></div>';
+        h += '<div class="src"><span class="mono">' + c.id + '</span><span class="plumb ' + (c.plumb === "have" ? "" : "new") + '">' + (c.plumb === "have" ? "data exists" : c.plumb === "new" ? "new plumbing" : "to verify") + "</span><span>" + esc(c.source) + "</span></div></div></details>";
+      });
+      if (g[0] === "workers") h += fleetTable(s.fleet);
+      h += "</div>";
+    });
+    h += '<div class="card group"><header><h2 class="section">Not in v1</h2><span class="faint" style="font-size:12.5px">deferred, with the reason</span></header>' +
+      BASE.filter(function (c) { return c.deferred; }).map(function (c) { return '<div class="check" style="padding:11px 20px;display:grid;gap:3px"><span><span class="ctitle" style="font-weight:500">' + esc(c.title) + '</span> <span class="plumb">deferred</span></span><span class="muted" style="font-size:13px">' + esc(c.source) + "</span></div>"; }).join("") + "</div>";
+    el.innerHTML = h;
+    // Health is the last tab: on a narrow screen the strip scrolls, so keep the active tab in view.
+    var strip = document.getElementById("admin-tabs");
+    if (strip) strip.scrollLeft = strip.scrollWidth;
+  }
+
+  function fleetTable(rows) {
+    var h = '<div style="border-top:1px solid rgb(var(--edge))"><header style="display:flex;justify-content:space-between;gap:12px;align-items:baseline;padding:12px 20px 4px;flex-wrap:wrap"><h2 class="section">Fleet, all users</h2><span class="faint" style="font-size:12.5px">The Upgrade and Blocking columns are what the admin list lacks today</span></header><div class="scroll"><table><thead><tr><th>Owner</th><th>Worker</th><th>Kind</th><th>Status</th><th>Version</th><th>Upgrade</th><th>Blocking</th><th>Since</th></tr></thead><tbody>';
+    rows.forEach(function (w) {
+      h += "<tr><td>" + esc(w.owner) + '</td><td class="mono">' + esc(w.name) + "</td><td>" + esc(w.kind) + '</td><td><span class="dot t-' + w.st + '">' + esc(w.status) + '</span></td><td class="mono">' + esc(w.version) + '</td><td><span class="t-' + w.ut + '" style="font-weight:' + (w.ut === "danger" ? 600 : 400) + '">' + esc(w.upgrade) + '</span></td><td class="mono">' + (w.blocking ? esc(w.blocking) : '<span class="faint">none</span>') + '</td><td class="num faint">' + esc(w.since) + "</td></tr>";
+    });
+    return h + "</tbody></table></div></div>";
+  }
+
+  /* ---------- overview ---------- */
+  function renderOverview() {
+    var el = document.getElementById("v-overview"), s = SCN[state.scn], list = checks(), t = tally(list), att = attention(list), admin = state.role === "admin";
+    var h = '<div><h1>Welcome, ' + (admin ? "admin" : "user C") + '</h1><p class="sub">The factory floor at a glance.</p></div>';
+
+    if (admin) {
+      if (!att.length) {
+        h += '<div class="card quiet"><span style="display:inline-flex;gap:10px;align-items:center;flex-wrap:wrap">' + sevPill("ok") + "<span>System health: all " + (t.ok) + " checks passing" + (t.na ? ", " + t.na + " not applicable" : "") + '</span></span><button class="linkbtn" type="button" data-goto="health">Open health</button></div>';
+      } else {
+        var top = att.slice(0, 3);
+        h += '<div class="card pad hcard"><header><div class="line">' + sevPill(t.danger ? "danger" : "warn") + "<strong>System health: " + esc(s.verdict) + '</strong></div><button class="linkbtn" type="button" data-goto="health">Open health</button></header><ul class="attn">' +
+          top.map(function (c) { return "<li>" + sevPill(c.sev) + "<span><strong style=\"font-weight:500\">" + esc(c.title) + '</strong> <span class="s">' + esc(c.summary) + '</span></span><span class="faint num">' + (c.since ? "for " + esc(c.since) : "") + "</span></li>"; }).join("") + "</ul>" +
+          (att.length > 3 ? '<p class="faint" style="margin:10px 0 0;font-size:12.5px">and ' + (att.length - 3) + " more</p>" : "") + "</div>";
+      }
+      h += '<div class="note"><b>mock note</b>Admin-only card, self-hiding for everyone else. Healthy collapses to one quiet line so it costs no attention on a normal day. It sits where the custody alert sits today and polls on the same 10 s cadence.</div>';
+    } else if (state.scn === "incident") {
+      h += '<div class="userline" role="status">Your hosted workers cannot start right now: the worker image cannot be pulled. This is a platform problem, not your run. Queued runs start on their own once it is fixed.</div>';
+      h += '<div class="note"><b>decided</b>Non-admins get this line. It is built only from the viewer\'s own workers and runs, data they can already see on the Workers page, and shows only when they have a queued run and every one of their hosted workers is blocked. It names no other user.</div>';
+    } else {
+      h += '<div class="note"><b>mock note</b>Nothing new for a user in this scenario: none of their runs is blocked by a platform problem, so Overview is unchanged.</div>';
+    }
+
+    h += '<div class="tiles"><div class="card tile"><p class="label">Active runs</p><p class="value num">' + s.tiles[0] + '</p><p class="hint">running or awaiting approval</p></div><div class="card tile"><p class="label">Workers online</p><p class="value num">' + s.tiles[1] + '</p><p class="hint">' + (admin ? "yours" : "yours") + '</p></div><div class="card tile"><p class="label">Boards</p><p class="value num">3</p><p class="hint">connected repos</p></div><div class="card tile"><p class="label">Agent templates</p><p class="value num">12</p><p class="hint">builtin roles</p></div></div>';
+
+    h += '<div class="card pad"><h2 class="section">Recent runs</h2><ul class="runs">' + s.runs.map(function (r) {
+      return "<li><span>" + esc(r[0]) + '</span><span style="display:inline-flex;gap:6px;flex-wrap:wrap"><span class="badge ' + r[2] + '">' + esc(r[1]) + "</span>" + (r[3] ? '<span class="badge warn">▲ ' + esc(r[3]) + "</span>" : "") + "</span></li>";
+    }).join("") + '</ul><p class="faint" style="margin:10px 0 0;font-size:12px">Existing cards (worker load, usage, onboarding) are unchanged and left out of this mock.</p></div>';
+    el.innerHTML = h;
+  }
+
+  /* ---------- CLI and Slack ---------- */
+  function pad(s, n) { s = String(s); return s.length >= n ? s + " " : s + new Array(n - s.length + 1).join(" "); }
+  function renderPush() {
+    var el = document.getElementById("v-push"), s = SCN[state.scn], list = checks(), t = tally(list), att = attention(list);
+    var h = '<div><h1>Outside the browser</h1><p class="sub">The same checks from the CLI, and the push that makes a pull-only tab safe to rely on.</p></div>';
+
+    var out = '<span class="p">$</span> uzi admin health\n';
+    if (att.length) {
+      out += '<span class="m">' + pad("SEVERITY", 9) + pad("CHECK", 20) + pad("SINCE", 8) + "SUMMARY</span>\n";
+      att.forEach(function (c) { out += '<span class="' + (c.sev === "unknown" ? "m" : c.sev) + '">' + pad(LABEL[c.sev].toUpperCase(), 9) + "</span>" + pad(c.id, 20) + pad(c.since || "", 8) + esc(c.summary) + "\n"; });
+      out += "\n";
+    }
+    out += '<span class="' + (t.danger ? "danger" : att.length ? "warn" : "ok") + '">' + esc(s.verdict) + "</span>\n";
+    out += '<span class="m">' + t.ok + " ok · " + t.warn + " warn · " + t.danger + " danger · " + t.unknown + " unknown · " + t.na + " n/a    (--all lists every check, --json for machines)</span>\n";
+    out += '<span class="p">$</span> echo $?\n' + (t.danger ? "8" : "0");
+    h += '<div class="two"><div style="display:grid;gap:10px"><h2 class="section">uzi admin health</h2><pre class="console">' + out + '</pre><div class="note"><b>mock note</b>Exit status 8 (a new code in the CLI contract) only on Danger, so the command works as a cron or uptime probe with an admin token. Warnings and Unknown exit 0 unless --strict is passed.</div></div>';
+
+    var ws = '<span class="p">$</span> uzi admin workers\n<span class="m">' + pad("OWNER", 8) + pad("NAME", 13) + pad("STATUS", 9) + pad("VERSION", 9) + pad("UPGRADE", 17) + "BLOCKING</span>\n";
+    s.fleet.forEach(function (w) { ws += pad(w.owner, 8) + pad(w.name, 13) + pad(w.status, 9) + pad(w.version, 9) + '<span class="' + (w.ut === "muted" ? "m" : w.ut) + '">' + pad(w.upgrade, 17) + "</span>" + esc(w.blocking || "") + "\n"; });
+    h += '<div style="display:grid;gap:10px"><h2 class="section">uzi admin workers, with the missing columns</h2><pre class="console">' + ws.replace(/\n$/, "") + "</pre></div>";
+
+    h += '<div style="display:grid;gap:10px"><h2 class="section">Slack DM to admins</h2>';
+    if (s.slack) {
+      h += '<div class="card slack"><div class="av" aria-hidden="true">uz</div><div><div class="who">uzi<span>APP</span></div><p><strong>◆ ' + esc(s.slack.head) + "</strong></p><ul>" + s.slack.items.map(function (i) { return "<li>" + esc(i) + "</li>"; }).join("") + '</ul><p><a href="#" data-goto="health">Open health</a></p></div></div><div class="note"><b>mock note</b>' + esc(s.slack.foot) + " Warnings never notify.</div>";
+    } else {
+      h += '<div class="note"><b>mock note</b>No message in this scenario: nothing crossed into Danger. Warnings and not-applicable checks never DM.</div>';
+    }
+    h += "</div></div>";
+    el.innerHTML = h;
+  }
+
+  /* ---------- shell ---------- */
+  function renderBanner() {
+    var el = document.getElementById("banner"), b = SCN[state.scn].banner;
+    if (!b || state.role !== "admin" || state.view === "push" || state.snoozed) { el.innerHTML = ""; return; }
+    el.innerHTML = '<div class="banner" role="alert"><div><p class="t"><span aria-hidden="true" class="t-danger">◆</span> ' + esc(b.t) + '</p><p class="b">' + esc(b.b) + '</p></div><div class="acts">' +
+      (state.view === "health" ? "" : '<button class="linkbtn" type="button" data-goto="health">Open health</button>') + '<button class="btn" type="button" id="snooze">Snooze 1 h</button></div></div>';
+  }
+  function renderNav() {
+    var list = checks(), t = tally(list), att = attention(list), admin = state.role === "admin";
+    var items = [["Overview", "overview"], ["Board", ""], ["Runs", ""], ["Workers", ""], ["Schedules", ""], ["Judge", ""], ["Docs", ""], ["Settings", ""]];
+    if (admin) items.push(["Admin", "health"]);
+    document.getElementById("nav").innerHTML = items.map(function (i) {
+      var cur = i[1] && i[1] === state.view ? ' aria-current="page"' : "";
+      var pip = i[0] === "Admin" && att.length ? '<span class="pip ' + (t.danger ? "danger" : "warn") + '" title="' + att.length + ' health checks need attention"></span>' : "";
+      return "<button type=\"button\"" + (i[1] ? ' class="live" data-goto="' + i[1] + '"' : " tabindex=\"-1\"") + cur + "><span>" + i[0] + "</span>" + pip + "</button>";
+    }).join("");
+  }
+  function press(groupId, attr, val) {
+    Array.prototype.forEach.call(document.querySelectorAll("#" + groupId + " button"), function (b) { b.setAttribute("aria-pressed", String(b.getAttribute(attr) === val)); });
+  }
+  function render() {
+    press("seg-scn", "data-scn", state.scn); press("seg-view", "data-view", state.view); press("seg-role", "data-role", state.role);
+    ["health", "overview", "push"].forEach(function (v) { document.getElementById("v-" + v).hidden = v !== state.view; });
+    renderNav(); renderBanner(); renderHealth(); renderOverview(); renderPush();
+    try { localStorage.setItem("uzi-health-mock", JSON.stringify({ scn: state.scn, view: state.view, role: state.role })); } catch (e) { /* ignore */ }
+  }
+
+  document.addEventListener("click", function (ev) {
+    var b = ev.target.closest("button, a"); if (!b) return;
+    if (b.dataset.scn) { state.scn = b.dataset.scn; state.snoozed = false; render(); }
+    else if (b.dataset.view) { state.view = b.dataset.view; render(); }
+    else if (b.dataset.role) { state.role = b.dataset.role; render(); }
+    else if (b.dataset.goto) { ev.preventDefault(); state.view = b.dataset.goto; render(); window.scrollTo(0, 0); }
+    else if (b.dataset.jump) {
+      ev.preventDefault(); var d = document.getElementById("c-" + b.dataset.jump);
+      if (d) { d.open = true; d.scrollIntoView({ block: "center", behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" }); }
+    }
+    else if (b.id === "snooze") { state.snoozed = true; renderBanner(); }
+    else if (b.dataset.copy || b.id === "copy-diag") {
+      var text = b.dataset.copy || checks().map(function (c) { return LABEL[c.sev].toUpperCase() + "\t" + c.id + "\t" + c.summary; }).join("\n");
+      var label = b.textContent;
+      try { navigator.clipboard.writeText(text).then(function () { b.textContent = "Copied"; setTimeout(function () { b.textContent = label; }, 1400); }, function () {}); } catch (e) { /* clipboard blocked */ }
+    }
+  });
+  render();
+})();
+</script>

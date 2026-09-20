@@ -2,7 +2,7 @@
 
 **Issue**: [#1253](https://github.com/vtmocanu/uzi/issues/1253)
 **Priority**: Medium
-**Status**: Draft
+**Status**: Complete (2026-09-20)
 
 ## Problem
 
@@ -82,7 +82,7 @@ Implementation note: this is an **additive restructure of the inline branch**, n
 
 Phase 1 (parallel, disjoint files): M1 and M2 touch non-overlapping trees (api SQL + `forgesvc` + poller vs. `web/`), so they can be implemented as independent agents. Phase 2 (M3) depends on both.
 
-- [ ] **M1 — Board-free lane covers issue-less MR-bearing runs, with a live-DB regression test.**
+- [x] **M1 — Board-free lane covers issue-less MR-bearing runs, with a live-DB regression test.** *(Done, commit `914860b5`: D1 widen + D2 full `BoardFree*` rename + sqlc regen; the false "lanes can overlap" comment in `recordMRState` was also corrected. New tests `TestSyncBoardFreeMRStatesRecordsMrReworkLiveDB`, `TestBoardFreeMRStateWatchCandidatesLiveDB` (count 3→4), `TestBoardFreeAndBoardCoupledLanesDisjointLiveDB` all pass on a live Postgres and FAIL on the un-widened predicate (mutation-verified both directions). `task gate:api` green.)*
   - Widen `ListScheduledMRStateWatchCandidates` per D1; `sqlc generate` and confirm the generated const in `api/internal/store/*.sql.go` moved (per `.claude/rules/go.md` mutation-testing note: the generated const is what executes).
   - Apply the D2 rename (or, if descoped in review, fix the doc comments in place).
   - Regression test pinned to this bug's seam: a completed `mr_rework` run with `issue_iid = NULL`, `mr_iid = X`, `mr_state = NULL`, forge reports `merged`, is returned by the widened candidate query and, after `SyncBoardFreeMRStates`, has `mr_state = 'merged'`. It must **fail on the unfixed query** (kind not in the old list, issue-less, so not a candidate; `mr_state` stays null) and pass after. Model it on the existing prompt-run test at `api/internal/forgesvc/scheduled_mr_watch_livedb_test.go` (which uses a `fakeForge`, so this is offline); rename the file with the symbols if D2 is taken. Watch both directions.
@@ -92,13 +92,13 @@ Phase 1 (parallel, disjoint files): M1 and M2 touch non-overlapping trees (api S
   - **M1 closes on the tests + gates**, not on the four PR #1244 helper runs flipping to `merged`: that backfill (D4) needs a live poller tick against the real forge and is a post-deploy dev-cluster check, not a worker-blocking criterion.
   - Offline-worker note: this milestone runs `go run github.com/sqlc-dev/sqlc/cmd/sqlc@v1.31.1 generate`; the worker needs `sqlc@v1.31.1` already in its module cache (a cold cache would force a network fetch the restricted egress blocks).
 
-- [ ] **M2 — Option A merged chip (web), still a link, with tests.**
-  - Implement D6 in `web/src/components/MrChip.tsx` (inline merged -> check + tinted bordered chip). `RunsList.tsx` and `IssueView.tsx` call sites need no change (they already pass `variant="inline"`); confirm the `IssueView` `openTone="brand"` path still renders merged as ok-toned (merged is ok everywhere by contract).
+- [x] **M2 — Option A merged chip (web), still a link, with tests.** *(Done, commits `c8d59623` + `eff2094e`. `task gate:web` green, 4340 web tests pass.)*
+  - Implement D6 in `web/src/components/MrChip.tsx` (inline merged -> check + tinted bordered chip). `IssueView.tsx` needed no change (it already emits the `· ` separator as a sibling text node); confirm the `IssueView` `openTone="brand"` path still renders merged as ok-toned (merged is ok everywhere by contract). **Correction (found in review):** `RunsList.tsx` *did* need a change — it baked the `· ` meta separator into `MrChip`'s `label`, so once inline merged became a bordered box the dot rendered *inside* the border. Fixed in `eff2094e` by moving the separator to a sibling text node (mirroring `IssueView`), keeping only the `MR `/`PR ` abbrev in `label` (D8).
   - Add a **positive** assertion in `web/src/components/MrChip.test.tsx` for the new merged treatment (the bordered chip / check present for inline merged). No negative-assertion repointing is needed: no string is retired, and the existing inline-merged test (`MrChip.test.tsx:54-60`) stays green because `CheckIcon` is `aria-hidden` and does not change `textContent` (`"!7 merged"`). Also assert inline `open` stays non-`rounded` and inline `closed` unchanged.
   - Verify the chip is unchanged for `open` and `closed`, and that a null `href` still degrades to plain text (never absent).
   - `task gate:web` green.
 
-- [ ] **M3 — Docs, specs, and full gate.**
+- [x] **M3 — Docs, specs, and full gate.** *(Done: `specs/ai.md` left untouched (frozen §637); no `specs/human.md` change needed; the design is recorded in this Decision Log. Rename verification pass confirmed no stale scheduled-only claim remains in `forge.sql`/`board_free_mr_watch.go`/`poller.go`/`mr_watch.go` (the surviving `forge.sql` "Scheduled-lane" mentions correctly describe the board-COUPLED lane's own kind exclusion). `gate:api`, `gate:web`, `gate:repo`, and `check-docs:web` green.)*
   - `specs/ai.md`: note the board-free lane now covers all issue-less MR-bearing runs (D1) and the merged-chip inline treatment (D6). No `specs/human.md` change is required (bug fix + presentation polish, no new user-stated requirement); if a terse sync line is warranted, tag it `(AI-synced YYYY-MM-DD)`. *(Superseded 2026-09-13, issue #1317: `specs/ai.md` is frozen; record the design in this PRD's Decision Log or an ADR instead.)*
   - Confirm no doc comment left stale by the rename remains (`forge.sql`, `scheduled_mr_watch.go`, `poller.go`); M1 owns those under D2's floor, so this is a verification pass, not a second edit of the same comments.
   - `check:migration-numbering` and `check-docs` unaffected (no migration, no `docs/*.md` change expected); run `task gate` (all components) green.
@@ -120,6 +120,7 @@ Phase 1 (parallel, disjoint files): M1 and M2 touch non-overlapping trees (api S
 - Chose a structural predicate (`issue_iid IS NULL OR kind IN (...)`) over appending kinds to a list, so a newly-added MR-bearing kind cannot silently reopen the gap (D1).
 - Bundled the web chip and the backend fix into one PRD because the louder chip amplifies the exact inconsistency the fix removes; they touch disjoint files and ship as parallel milestones.
 - Kept PRD #908's self-bounding, no-reopen board-free design intact (D3); this PRD widens *which runs* the lane sees, not *how long* it watches them.
+- **D8 (found in review):** making the inline merged chip a bordered box surfaced a latent coupling — `RunsList.tsx` passed its `· ` meta separator *through* `MrChip`'s `label`, so the dot ended up inside the new border. Resolved by moving the separator to a sibling text node (the pattern `IssueView.tsx` already used) and keeping only the `MR `/`PR ` abbreviation in `label`. Side effect (intended): the `RunsList` separator dot for open/closed now inherits the meta line's `text-faint` instead of the chip's state tone, matching `IssueView` and the line's other separators. `Dashboard.tsx` (no dot) and the `variant="pill"` board card were unaffected.
 
 ## Not doing
 
