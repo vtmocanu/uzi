@@ -635,6 +635,19 @@ export function CodexCredentials({
         </div>
       )}
 
+      {/* An API key has no ChatGPT/Codex SUBSCRIPTION, so it has no per-account
+          rate-limit windows and never appears under Settings → Codex limits or the
+          sidebar meters (PRD #1209 M3). Shown only when an API key is present, so a
+          login-only user is not told about a case they do not have. The read itself
+          never receives an API key. */}
+      {!loading && !first && secrets.some((s) => s.kind === "openai_api_key") && (
+        <p className="text-xs text-muted">
+          OpenAI API keys have no subscription windows, so they are not metered under{" "}
+          <strong className="text-fg">Codex limits</strong>. Only linked Codex
+          subscription logins show rate-limit meters.
+        </p>
+      )}
+
       {/* A visible, keyboard/touch/screen-reader-reachable legend for the four
           status badges (issue #1174 item 3). The per-badge title + sr-only text
           answers "what does THIS badge mean" in place; this answers "what can a

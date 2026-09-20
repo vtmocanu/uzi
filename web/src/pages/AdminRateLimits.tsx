@@ -3,7 +3,16 @@
 // the capacity view leads with who is near a wall. Same table conventions as
 // Admin → Users; the meters reuse the shared MeterTrack + toneFor thresholds.
 
-import { api, type AdminRateLimitUser, type MyRateLimits, type TokenRateLimits } from "../lib/api";
+import {
+  api,
+  type AdminRateLimitUser,
+  type CodexAccountRateLimit,
+  type CodexAdminRateLimitRow,
+  type CodexRateLimitBucket,
+  type CodexRateLimitWindow,
+  type MyRateLimits,
+  type TokenRateLimits,
+} from "../lib/api";
 import { useAsyncData } from "../lib/useAsyncData";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import {
@@ -17,11 +26,21 @@ import {
   WINDOW_DURATION,
   type PaceForecast,
 } from "../lib/rateLimits";
-import { Alert, Badge, Card, cx, EmptyState, ListSkeleton } from "../components/ui";
+import {
+  codexAccountLabel,
+  codexResetEpoch,
+  codexStatusBadge,
+  codexWindowForecast,
+  formatCodexWindowLabel,
+  hasCodexReading,
+  sortCodexAdminRows,
+} from "../lib/codexRateLimits";
+import { Alert, Badge, Card, cx, EmptyState, ListSkeleton, SectionTitle } from "../components/ui";
 import { AdminShell } from "../components/AdminShell";
 import { DocLink } from "../components/DocLink";
 import { DOC_RATE_LIMITS } from "../lib/doclinks";
 import { RateLimitForecastMeter } from "../components/RateLimitForecast";
+import { MeterTrack } from "../components/Meter";
 import { useDemoMode } from "../lib/demoMode";
 import { maskEmail, maskName } from "../lib/demoMask";
 
@@ -126,6 +145,193 @@ function UserCell({
       </div>
       <div className="text-xs text-faint">{maskEmail(user.email, demo)}</div>
     </td>
+  );
+}
+
+// ── Codex accounts section (PRD #1209 M3) ────────────────────────────────────
+// A provider-labeled sibling of the Claude table above, grouped BY USER then BY
+// ACCOUNT, sorted by valid utilization (sortCodexAdminRows). Alias capacity is never
+// double-counted (one account = one budget); only the safe DTO fields are read.
+
+function bucketDisplayName(bucket: CodexRateLimitBucket): string {
+  return bucket.display_name?.trim() || bucket.id;
+}
+
+function bucketWindows(bucket: CodexRateLimitBucket): CodexRateLimitWindow[] {
+  return [bucket.primary, bucket.secondary].filter(
+    (w): w is CodexRateLimitWindow => w != null,
+  );
+}
+
+function CodexWindowRow({
+  bucketName,
+  win,
+  dim,
+  now,
+}: {
+  bucketName: string;
+  win: CodexRateLimitWindow;
+  dim: boolean;
+  now: number;
+}) {
+  const chip = formatCodexWindowLabel(win.limit_window_seconds);
+  const label = `${bucketName} ${chip} window`;
+  if (win.used_percent == null) {
+    // A partial window: no percentage for this slot. A grey 0-width bar keeps the
+    // column aligned; the "—" reset says there is nothing to project.
+    return (
+      <div className="grid grid-cols-[1.5rem_minmax(4rem,1fr)_2.5rem_4.25rem] items-center gap-2.5">
+        <span className="font-mono text-xs text-muted">{chip}</span>
+        <MeterTrack className="h-1.5" label={label} fillPct={0} valueText="no reading" dim />
+        <span className="text-right font-mono tabular-nums text-faint">—</span>
+        <span className="whitespace-nowrap text-right text-xs tabular-nums text-faint">no reading</span>
+      </div>
+    );
+  }
+  const reset = dim ? "stale" : (formatCountdown(codexResetEpoch(win, now), now) ?? "—");
+  const forecast = codexWindowForecast(dim, win, now);
+  return (
+    <div className="grid grid-cols-[1.5rem_minmax(4rem,1fr)_2.5rem_4.25rem] items-center gap-2.5">
+      <span className="font-mono text-xs text-muted">{chip}</span>
+      <RateLimitForecastMeter
+        className="h-1.5"
+        label={label}
+        pct={win.used_percent}
+        valueText={`${win.used_percent}%`}
+        forecast={forecast}
+        dim={dim}
+      />
+      <span className={cx("text-right font-mono tabular-nums", dim ? "text-faint" : "text-muted")}>
+        {win.used_percent}%
+      </span>
+      <span
+        className={cx(
+          "whitespace-nowrap text-right text-xs tabular-nums",
+          dim ? "text-faint" : "text-muted",
+        )}
+      >
+        {reset}
+      </span>
+    </div>
+  );
+}
+
+// CodexUtilizationCell stacks an account's buckets/windows as thin rows in ONE column,
+// mirroring the Claude UtilizationCell. An account with no reading (pending, no_reading,
+// vault_locked, credential_action_required, polling_disabled) collapses to a single
+// em-dash — never a bogus bar.
+function CodexUtilizationCell({ account, now }: { account: CodexAccountRateLimit; now: number }) {
+  if (!hasCodexReading(account.status)) return <span className="text-faint">—</span>;
+  const dim = account.status !== "fresh";
+  const rows = account.buckets.flatMap((b) =>
+    bucketWindows(b).map((w, i) => (
+      <CodexWindowRow key={`${b.id}:${i}`} bucketName={bucketDisplayName(b)} win={w} dim={dim} now={now} />
+    )),
+  );
+  if (rows.length === 0) return <span className="text-faint">—</span>;
+  return <div className="flex max-w-[22rem] flex-col gap-2">{rows}</div>;
+}
+
+function CodexUserCell({
+  user,
+  rowSpan,
+}: {
+  user: CodexAdminRateLimitRow;
+  rowSpan: number;
+}) {
+  const demo = useDemoMode();
+  return (
+    <td className="px-4 py-3 align-top" rowSpan={rowSpan}>
+      <div className="font-medium text-fg">
+        {maskName(user.name, demo) || <span className="italic text-faint">no name</span>}
+      </div>
+      <div className="text-xs text-faint">{maskEmail(user.email, demo)}</div>
+    </td>
+  );
+}
+
+function CodexAdminSection() {
+  const { data, loading, error, reload } = useAsyncData(
+    async () => (await api.getAdminCodexRateLimits()).users,
+    [],
+    { fallback: "Failed to load Codex rate limits" },
+  );
+  const now = useNow();
+  usePollWhileVisible(reload, 60_000);
+
+  const users = data ?? [];
+  // Self-hide until there is a Codex user to show: an instance with no linked Codex
+  // subscription accounts gets no dead chrome under the Claude table. An error is
+  // surfaced so an admin is never told "none" when the read actually failed.
+  if (error) {
+    return (
+      <section aria-label="Codex accounts" className="mt-10">
+        <SectionTitle>Codex accounts</SectionTitle>
+        <div className="mt-3">
+          <Alert message={error} />
+        </div>
+      </section>
+    );
+  }
+  if (loading || users.length === 0) return null;
+  const rows = sortCodexAdminRows(users);
+
+  return (
+    <section aria-label="Codex accounts" className="mt-10">
+      <div className="mb-3">
+        <SectionTitle>Codex accounts</SectionTitle>
+        <p className="mt-2 text-sm text-muted">
+          Each linked Codex subscription account&rsquo;s per-bucket utilization, read server-side
+          with the owner&rsquo;s own login. Each bucket is metered on its own window, so its reset and
+          forecast use the length Codex reports. Users nearest a limit sort first.
+        </p>
+      </div>
+      <Card className="p-0">
+        <div className="overflow-x-auto">
+          <table className="w-full text-left text-sm">
+            <thead className="border-b border-edge text-muted">
+              <tr>
+                <th className="px-4 py-3 font-medium">User</th>
+                <th className="px-4 py-3 font-medium">Account</th>
+                <th className="px-4 py-3 font-medium">Utilization &amp; Forecast</th>
+                <th className="px-4 py-3 font-medium">Status</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-edge">
+              {rows.flatMap((u) =>
+                u.accounts.map((a, i) => {
+                  const badge = codexStatusBadge(a.status);
+                  return (
+                    <tr key={`${u.id}:${a.account_id}`} className="transition-colors hover:bg-raised/30">
+                      {i === 0 ? <CodexUserCell user={u} rowSpan={u.accounts.length} /> : null}
+                      <td className="px-4 py-3 align-top">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="text-xs font-medium text-fg">{codexAccountLabel(a)}</span>
+                          {a.is_default && <Badge tone="neutral">default</Badge>}
+                        </div>
+                      </td>
+                      <td className="px-4 py-3 align-top">
+                        <CodexUtilizationCell account={a} now={now} />
+                      </td>
+                      <td className="px-4 py-3 align-top">
+                        <Badge tone={badge.tone} title={badge.hint}>
+                          {badge.label}
+                        </Badge>
+                        {a.last_success_at && (
+                          <div className="mt-1.5 text-xs tabular-nums text-muted">
+                            updated {formatAgo(a.last_success_at, now)}
+                          </div>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                }),
+              )}
+            </tbody>
+          </table>
+        </div>
+      </Card>
+    </section>
   );
 }
 
@@ -262,6 +468,9 @@ export function AdminRateLimits() {
           </div>
         </Card>
       )}
+      {/* Codex accounts (PRD #1209 M3): a separate, provider-labeled section below the
+          Claude table. Self-hides until an instance has a linked Codex account. */}
+      <CodexAdminSection />
     </AdminShell>
   );
 }

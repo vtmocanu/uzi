@@ -2985,6 +2985,22 @@ export interface CodexAdminRateLimitRow {
   accounts: CodexAccountRateLimit[];
 }
 
+// MyCodexRateLimits is what GET /me/codex-rate-limits returns (PRD #1209 M3): ONE meter
+// per LINKED subscription account. An EMPTY array is the no_subscription shape — a user
+// with no linked Codex account (the server's EXISTS(linked) filter drops unlinked/API-key
+// credentials, so an API-key-only default supplies no implicit subscription meter). The
+// Codex sibling of MyRateLimitsResponse.
+export interface MyCodexRateLimits {
+  accounts: CodexAccountRateLimit[];
+}
+
+// AdminCodexRateLimits is the GET /admin/codex-rate-limits envelope (PRD #1209 M3): every
+// user with ≥1 linked Codex account, one row each, grouped by user then account. The Codex
+// sibling of AdminRateLimits.
+export interface AdminCodexRateLimits {
+  users: CodexAdminRateLimitRow[];
+}
+
 // ── Notifications inbox (PRD #46 M2) ─────────────────────────────────────────
 // A generic in-app notification. kind + payload let any feature enqueue one; the
 // judge is tenant #1. payload is the render blob — by convention a `title` and

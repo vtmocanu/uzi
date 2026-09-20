@@ -18,6 +18,7 @@ import { AnthropicTokens } from "../components/AnthropicTokens";
 import { CodexCredentials } from "../components/CodexCredentials";
 import { SettingsShell } from "../components/SettingsShell";
 import { RateLimitCard } from "../components/RateLimitMeters";
+import { CodexRateLimitCard } from "../components/CodexRateLimitMeters";
 import { VaultBadge, useVaultLock } from "../components/VaultControls";
 import { SlackNotifications } from "../components/SlackNotifications";
 import { prefs } from "../lib/prefs";
@@ -53,6 +54,10 @@ export function Settings() {
   // does). Owned here beside `secrets` so the checkbox column and the token list
   // load and reload together.
   const [sidebarTokenIds, setSidebarTokenIds] = useState<string[]>([]);
+  // The Codex sibling (PRD #1209 M3): which non-default LINKED Codex accounts also
+  // ride the sidebar/TUI. Owned here so the "Codex limits" card's checkboxes and the
+  // one getMySettings read stay in lockstep.
+  const [sidebarCodexAccountIds, setSidebarCodexAccountIds] = useState<string[]>([]);
 
   const { data, loading, error: loadError, reload } = useAsyncData(
     async () => {
@@ -61,6 +66,7 @@ export function Settings() {
         api.getMySettings(),
       ]);
       setSidebarTokenIds(settings.sidebar_token_ids ?? []);
+      setSidebarCodexAccountIds(settings.sidebar_codex_account_ids ?? []);
       // ONE listSecrets() call feeds both cards: the Anthropic slice is unchanged,
       // and the Codex slice is the union of the two Codex kinds (they share one
       // card and one default across both).
@@ -90,6 +96,23 @@ export function Settings() {
       emitSidebarTokensChanged();
     } catch (err) {
       setError(errorMessage(err, "Failed to update the sidebar meters"));
+    }
+  };
+
+  // The Codex sibling of toggleSidebarToken: a whole-set replace over PUT /me/settings
+  // keyed on account_id, then the shared changed-event so the sidebar rail (a separate
+  // mount) refetches now rather than on its next poll.
+  const toggleSidebarCodexAccount = async (id: string, shown: boolean) => {
+    setError("");
+    const next = shown
+      ? [...new Set([...sidebarCodexAccountIds, id])]
+      : sidebarCodexAccountIds.filter((x) => x !== id);
+    try {
+      const { settings } = await api.putMySettings({ sidebar_codex_account_ids: next });
+      setSidebarCodexAccountIds(settings.sidebar_codex_account_ids ?? next);
+      emitSidebarTokensChanged();
+    } catch (err) {
+      setError(errorMessage(err, "Failed to update the Codex sidebar meters"));
     }
   };
 
@@ -124,6 +147,15 @@ export function Settings() {
         reload={reload}
         onError={setError}
         onNotice={setNotice}
+      />
+
+      {/* Codex per-account rate-limit meters (PRD #1209 M3). Self-gates: hidden when
+          no subscription account is linked (an API-key-only default supplies none). The
+          "Show in sidebar and TUI" checkboxes write sidebar_codex_account_ids. */}
+      <CodexRateLimitCard
+        sidebarAccountIds={sidebarCodexAccountIds}
+        onToggleSidebarAccount={toggleSidebarCodexAccount}
+        busy={busy}
       />
 
       {/* The rotate-your-legacy-token reminder (PRD #32): password protection

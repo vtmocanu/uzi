@@ -1,16 +1,32 @@
 // @vitest-environment jsdom
-import { afterEach, describe, it, expect, vi } from "vitest";
+import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { cleanup, render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { AdminRateLimits } from "./AdminRateLimits";
-import { api, type AdminRateLimitUser, type MyRateLimits } from "../lib/api";
+import {
+  api,
+  type AdminRateLimitUser,
+  type CodexAccountRateLimit,
+  type CodexAdminRateLimitRow,
+  type CodexRateLimitBucket,
+  type CodexRateLimitStatus,
+  type CodexRateLimitWindow,
+  type MyRateLimits,
+} from "../lib/api";
 
 vi.mock("../lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/api")>();
-  return { ...actual, api: { getAdminRateLimits: vi.fn() } };
+  return { ...actual, api: { getAdminRateLimits: vi.fn(), getAdminCodexRateLimits: vi.fn() } };
 });
 
 const mockApi = vi.mocked(api);
+
+beforeEach(() => {
+  // The page now also renders the Codex section, which reads /admin/codex-rate-limits.
+  // Default to no linked Codex accounts so the section self-hides and these Claude-table
+  // assertions are unaffected; the Codex-specific tests override this.
+  mockApi.getAdminCodexRateLimits.mockResolvedValue({ users: [] });
+});
 
 afterEach(() => {
   cleanup();
@@ -277,5 +293,99 @@ describe("AdminRateLimits reset label (PRD #310 M3)", () => {
   );
     const vlad = (await screen.findByText("vlad")).closest("tr")!;
     expect(vlad.textContent).not.toMatch(RESET_LABEL);
+  });
+});
+
+// ── Codex accounts section (PRD #1209 M3) ────────────────────────────────────
+const cnowSecs = Math.floor(Date.now() / 1000);
+function cwin(usedPct: number | null, windowSecs: number | null, resetIn: number | null): CodexRateLimitWindow {
+  return {
+    used_percent: usedPct,
+    limit_window_seconds: windowSecs,
+    reset_after_seconds: resetIn,
+    reset_at: resetIn == null ? null : cnowSecs + resetIn,
+  };
+}
+function cbucket(id: string, name: string, primary: CodexRateLimitWindow | null, secondary: CodexRateLimitWindow | null = null): CodexRateLimitBucket {
+  return { id, display_name: name, allowed: true, limit_reached: false, primary, secondary };
+}
+function cacct(account_id: string, aliases: string[], is_default: boolean, status: CodexRateLimitStatus, buckets: CodexRateLimitBucket[], over: Partial<CodexAccountRateLimit> = {}): CodexAccountRateLimit {
+  return { account_id, aliases, is_default, status, buckets, ...over };
+}
+function crow(name: string, accounts: CodexAccountRateLimit[], vault_locked = false): CodexAdminRateLimitRow {
+  return { id: name, name, email: `${name}@example.com`, vault_locked, accounts };
+}
+
+describe("AdminRateLimits — Codex section", () => {
+  // Keep the Claude side empty so its table does not interfere; the Codex section is
+  // scoped by its own aria-label region in every assertion.
+  beforeEach(() => {
+    mockApi.getAdminRateLimits.mockResolvedValue({ users: [] });
+  });
+
+  const codexUsers: CodexAdminRateLimitRow[] = [
+    // A warn-tone user (60%) — should sort BELOW the danger user.
+    crow("warmian", [cacct("cdx-w", ["warm-codex"], true, "fresh", [cbucket("requests", "Requests", cwin(60, 18000, 5000))])]),
+    // A danger-tone user (96%) with a NONSTANDARD 3-hour bucket — should lead.
+    crow("hotpat", [cacct("cdx-h", ["hot-codex"], true, "fresh", [cbucket("code", "Code", cwin(96, 10800, 2000))])]),
+    // A non-reading user — sinks to the bottom, utilization em-dash.
+    crow("pendra", [cacct("cdx-p", ["pend-codex"], true, "pending", [])]),
+  ];
+
+  const section = () => screen.getByLabelText("Codex accounts");
+
+  it("renders a separate Codex section with its own four-column table", async () => {
+    mockApi.getAdminCodexRateLimits.mockResolvedValue({ users: codexUsers });
+    render(
+      <MemoryRouter>
+        <AdminRateLimits />
+      </MemoryRouter>,
+    );
+    await screen.findByText("hot-codex");
+    const headers = within(section()).getAllByRole("columnheader").map((h) => h.textContent);
+    expect(headers).toEqual(["User", "Account", "Utilization & Forecast", "Status"]);
+  });
+
+  it("sorts danger-first and sinks the non-reading user, with the reported 3h chip", async () => {
+    mockApi.getAdminCodexRateLimits.mockResolvedValue({ users: codexUsers });
+    render(
+      <MemoryRouter>
+        <AdminRateLimits />
+      </MemoryRouter>,
+    );
+    await screen.findByText("hot-codex");
+    const names = within(section())
+      .getAllByRole("row")
+      .slice(1)
+      .map((r) => within(r).getAllByRole("cell")[0].querySelector("div")!.textContent);
+    expect(names).toEqual(["hotpat", "warmian", "pendra"]);
+    // The 3-hour bucket's chip is derived from the reported length, not hardcoded 5h/7d.
+    expect(within(section()).getByRole("progressbar", { name: "Code 3h window" })).toBeTruthy();
+    expect(within(section()).getByText("96%")).toBeTruthy();
+  });
+
+  it("collapses a non-reading account to an em-dash and badges its status", async () => {
+    mockApi.getAdminCodexRateLimits.mockResolvedValue({ users: [crow("pendra", [cacct("cdx-p", ["pend-codex"], true, "pending", [])])] });
+    render(
+      <MemoryRouter>
+        <AdminRateLimits />
+      </MemoryRouter>,
+    );
+    await screen.findByText("pend-codex");
+    const pendra = within(section()).getByText("pend-codex").closest("tr")!;
+    expect(within(pendra).getByText("—")).toBeTruthy();
+    expect(within(pendra).getByText("Pending")).toBeTruthy();
+  });
+
+  it("self-hides when no user has a linked Codex account", async () => {
+    mockApi.getAdminCodexRateLimits.mockResolvedValue({ users: [] });
+    render(
+      <MemoryRouter>
+        <AdminRateLimits />
+      </MemoryRouter>,
+    );
+    // The Claude side settles to its empty state; the Codex section never appears.
+    await screen.findByText("No users yet");
+    expect(screen.queryByLabelText("Codex accounts")).toBeNull();
   });
 });

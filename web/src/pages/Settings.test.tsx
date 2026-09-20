@@ -33,6 +33,10 @@ vi.mock("../lib/api", async (importActual) => {
       // how the API reports a token-less user since M5, so the card renders nothing
       // and stays out of these token/vault/theme assertions.
       getMyRateLimits: vi.fn().mockResolvedValue({ tokens: [] }),
+      // The Codex limits card (PRD #1209 M3) self-gates: an EMPTY accounts list is how
+      // the API reports a user with no linked subscription account, so the card renders
+      // nothing and stays out of these token/vault/theme assertions.
+      getMyCodexRateLimits: vi.fn().mockResolvedValue({ accounts: [] }),
       // The Notifications section (a child of Settings) loads its own state.
       getMySlack: vi.fn(),
       setMySlackNotify: vi.fn(),

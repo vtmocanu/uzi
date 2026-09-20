@@ -16,7 +16,10 @@ import { isCredentialSwitchRefusedLane } from "../../lib/credentialOverride";
 import { isTerminalRun } from "../../lib/runStatus";
 import {
   LIVE_RUN_ID,
+  mockAdminCodexRateLimits,
   mockAdminRateLimits,
+  mockMyCodexRateLimits,
+  mockMyCodexRateLimitsByUser,
   mockMyRateLimitsByUser,
   mockMyTokenRateLimits,
   mockOtherRunOwners,
@@ -491,6 +494,17 @@ export const runsApi = {
     return delay({ tokens: mockMyRateLimitsByUser[me.id] ?? mockMyTokenRateLimits }, 60);
   },
   getAdminRateLimits: async () => delay({ users: mockAdminRateLimits.map((u) => ({ ...u })) }, 60),
+  // ── Codex per-account rate limits (PRD #1209 M3) ────────────────────────────
+  // The caller's own Codex meters follow the persona (a demo login as a seeded
+  // non-admin reaches pending / vault-locked / polling-off / no-subscription); the
+  // admin table covers every renderable status. Labels/percentages only — no token,
+  // login blob or provider id ever appears here.
+  getMyCodexRateLimits: async () => {
+    const me = requireSession();
+    return delay({ accounts: mockMyCodexRateLimitsByUser[me.id] ?? mockMyCodexRateLimits }, 60);
+  },
+  getAdminCodexRateLimits: async () =>
+    delay({ users: mockAdminCodexRateLimits.map((u) => ({ ...u })) }, 60),
   getRun: async (id: string) => {
     const run = getRun(id);
     if (!run) throw new ApiError(404, "run not found");
