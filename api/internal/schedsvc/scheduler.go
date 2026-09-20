@@ -198,6 +198,12 @@ type Scheduler struct {
 	// origin='default'.
 	catalog func(slug string) (schedtmpl.DefaultJob, bool)
 	logger  *slog.Logger
+	// beat is the admin-health loop-beat callback (PRD #1484 M2): main.go injects a
+	// func(){ registry.Beat("scheduler") } ONLY when the scheduler is started
+	// (SchedulerCheckInterval > 0), so a not-started scheduler is left out of the loops
+	// evidence entirely (D15). Optional and nil-safe. A plain func — this package must NOT
+	// import healthsvc.
+	beat func()
 }
 
 // New builds a Scheduler. interval is the wake cadence (how often the due-gate is
@@ -212,6 +218,16 @@ func New(st Store, runs RunCreator, fb ForgeBuilder, set SettingsReader, notifie
 		interval: interval, now: time.Now, catalog: schedtmpl.BySlug, logger: logger,
 	}
 }
+
+// SetBeat wires the admin-health loop-beat callback (PRD #1484 M2). Call once at startup,
+// before Run. A nil beat (the default) disables it, so tests and the run-now-only Handler
+// scheduler that never wire one behave exactly as before. The callback fires once per Run
+// tick (not on Boot).
+func (e *Scheduler) SetBeat(beat func()) { e.beat = beat }
+
+// Interval reports the wake cadence the loop ticks at, so main.go registers the loop-beat
+// with the effective interval (PRD #1484 M2).
+func (e *Scheduler) Interval() time.Duration { return e.interval }
 
 // Boot runs one immediate tick at API start so schedules that came due while the API
 // was down fire promptly instead of one wake-cadence later. Failures are logged per
@@ -229,6 +245,9 @@ func (e *Scheduler) Run(ctx context.Context) {
 			e.logger.Info("scheduler stopped")
 			return
 		case <-ticker.C:
+			if e.beat != nil {
+				e.beat() // admin-health loop-beat: this loop ticked (PRD #1484 M2)
+			}
 			e.tick(ctx)
 		}
 	}

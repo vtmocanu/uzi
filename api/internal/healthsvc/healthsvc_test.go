@@ -41,6 +41,10 @@ type fakeStore struct {
 	gaveUpErr     error
 	custodyOwners []uuid.UUID
 	custodyErr    error
+	controller    pgtype.Timestamptz
+	controllerErr error
+	ciwatch       []store.CountEligibleCIWatchRefsPerRepoRow
+	ciwatchErr    error
 }
 
 func (f *fakeStore) ListAllWorkers(context.Context) ([]store.ListAllWorkersRow, error) {
@@ -63,6 +67,12 @@ func (f *fakeStore) ListGaveUpColumnMoves(context.Context, store.ListGaveUpColum
 }
 func (f *fakeStore) ListOwnersOverCustodyLimit(context.Context, int32) ([]uuid.UUID, error) {
 	return f.custodyOwners, f.custodyErr
+}
+func (f *fakeStore) GetControllerReport(context.Context) (pgtype.Timestamptz, error) {
+	return f.controller, f.controllerErr
+}
+func (f *fakeStore) CountEligibleCIWatchRefsPerRepo(context.Context, pgtype.Timestamptz) ([]store.CountEligibleCIWatchRefsPerRepoRow, error) {
+	return f.ciwatch, f.ciwatchErr
 }
 
 type fakeSettings struct {
@@ -143,6 +153,7 @@ func TestFleetRoll(t *testing.T) {
 		name       string
 		hostedVer  string
 		workers    []store.ListAllWorkersRow
+		crOK       bool // controller.report ok-ness fed to the M2 unknown conjunct
 		wantSev    string
 		wantSubstr string
 	}{
@@ -154,11 +165,23 @@ func TestFleetRoll(t *testing.T) {
 			wantSubstr: "No hosted workers are configured",
 		},
 		{
-			name:       "unknown when configured but all signals stale",
+			// M2 conjunct: a stale signal is unknown ONLY when controller.report is not ok.
+			name:       "unknown when stale AND controller not ok",
 			hostedVer:  "0.84.0",
 			workers:    []store.ListAllWorkersRow{hostedRow("w1", workersvc.PhaseStuck, stale, "ImagePullBackOff", "agent", "0.84.0")},
+			crOK:       false,
 			wantSev:    sevUnknown,
 			wantSubstr: "roll health cannot be determined",
+		},
+		{
+			// The other half of the conjunct: stale but controller reporting cleanly ⇒ NOT
+			// unknown; falls through to the ordinary classification (ok, no fresh stuck signal).
+			name:       "ok when stale but controller ok",
+			hostedVer:  "0.84.0",
+			workers:    []store.ListAllWorkersRow{hostedRow("w1", workersvc.PhaseStuck, stale, "ImagePullBackOff", "agent", "0.84.0")},
+			crOK:       true,
+			wantSev:    sevOK,
+			wantSubstr: "rolling cleanly",
 		},
 		{
 			name:      "ok when fresh and none stuck",
@@ -167,6 +190,7 @@ func TestFleetRoll(t *testing.T) {
 				hostedRow("w1", workersvc.PhaseSettled, fresh, "", "", "0.84.0"),
 				hostedRow("w2", workersvc.PhaseRolling, fresh, "", "", "0.84.0"),
 			},
+			crOK:       true,
 			wantSev:    sevOK,
 			wantSubstr: "rolling cleanly",
 		},
@@ -177,6 +201,7 @@ func TestFleetRoll(t *testing.T) {
 				hostedRow("w1", workersvc.PhaseStuck, fresh, "ImagePullBackOff", "agent", "0.84.0"),
 				hostedRow("w2", workersvc.PhaseSettled, fresh, "", "", "0.84.0"),
 			},
+			crOK:       true,
 			wantSev:    sevWarn,
 			wantSubstr: "1 of 2 hosted workers stuck rolling",
 		},
@@ -187,6 +212,7 @@ func TestFleetRoll(t *testing.T) {
 				hostedRow("w1", workersvc.PhaseStuck, fresh, "ImagePullBackOff", "agent", "0.84.0"),
 				hostedRow("w2", workersvc.PhaseStuck, fresh, "ImagePullBackOff", "agent", "0.84.0"),
 			},
+			crOK:       true,
 			wantSev:    sevDanger,
 			wantSubstr: "2 of 2 hosted workers stuck rolling",
 		},
@@ -199,7 +225,7 @@ func TestFleetRoll(t *testing.T) {
 				Now:                 func() time.Time { return fixedNow },
 				HostedWorkerVersion: tc.hostedVer,
 			})
-			c := svc.checkFleetRoll(fixedNow, tc.workers)
+			c := svc.checkFleetRoll(fixedNow, tc.workers, tc.crOK)
 			if c.Severity != tc.wantSev {
 				t.Fatalf("severity = %q, want %q (summary %q)", c.Severity, tc.wantSev, c.Summary)
 			}
@@ -552,10 +578,13 @@ func TestEvaluateRollupAndRegistry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Evaluate: %v", err)
 	}
-	// The full M1 registry, in a stable order, always present.
+	// The full registry, in a stable order (PRD "Checks in v1" table order), always
+	// present. M2-B added controller.report + loops (control) and forge.ciwatch
+	// (integrations), so it is 14, not 11.
 	wantIDs := []string{
 		"fleet.roll", "fleet.capacity", "fleet.disk", "queue.waiting", "queue.undispatched",
-		"db", "slack.socket", "schedules.paused", "board.drift", "custody.holds", "release.check",
+		"controller.report", "db", "loops", "forge.ciwatch", "slack.socket",
+		"schedules.paused", "board.drift", "custody.holds", "release.check",
 	}
 	if len(doc.Checks) != len(wantIDs) {
 		t.Fatalf("doc has %d checks, want %d", len(doc.Checks), len(wantIDs))

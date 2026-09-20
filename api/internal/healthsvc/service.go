@@ -84,6 +84,12 @@ type Store interface {
 	ListGaveUpColumnMoves(ctx context.Context, arg store.ListGaveUpColumnMovesParams) ([]store.ListGaveUpColumnMovesRow, error)
 	// custody.holds: owners at/over the custody admission limit.
 	ListOwnersOverCustodyLimit(ctx context.Context, custodyHoldLimit int32) ([]uuid.UUID, error)
+	// controller.report: the fleet-independent controller-report singleton's observed_at
+	// (pgx.ErrNoRows when the controller has never reported).
+	GetControllerReport(ctx context.Context) (pgtype.Timestamptz, error)
+	// forge.ciwatch: eligible run-branch counts per repo (one row per repo with >= 1
+	// eligible branch), compared to CIWatchMaxRefs. finishedAfter = now - CIWatchRunWindow.
+	CountEligibleCIWatchRefsPerRepo(ctx context.Context, finishedAfter pgtype.Timestamptz) ([]store.CountEligibleCIWatchRefsPerRepoRow, error)
 }
 
 // Settings is the slice of the settings cache healthsvc reads: the run-health kill switch
@@ -131,6 +137,25 @@ type Config struct {
 	// CustodyHoldLimit is workersvc.CustodyHoldLimit, the admission ceiling custody.holds
 	// keys on.
 	CustodyHoldLimit int32
+	// BootTime is the api process start (the handler's startedAt). controller.report uses
+	// it for the first-5-minutes-after-boot grace: with no report yet it degrades to
+	// `unknown` rather than `danger` for that window. Zero (a struct-literal test handler
+	// with no report ever) makes the grace not apply, which is the safe direction — the
+	// check only reads danger when hosted workers ARE configured, and tests that configure
+	// them write a report first.
+	BootTime time.Time
+	// CIWatchMaxRefs is cfg.CIWatchMaxRefs: the per-repo cap on watched run branches.
+	// forge.ciwatch is `na` when it is 0 (the CI watch is disabled), and warns when any
+	// repo's eligible-branch count exceeds it.
+	CIWatchMaxRefs int
+	// CIWatchRunWindow is cfg.CIWatchRunWindow: how long a finished run's branch stays
+	// eligible. forge.ciwatch passes now-CIWatchRunWindow as the eligibility floor, exactly
+	// as the pipeline watcher does.
+	CIWatchRunWindow time.Duration
+	// Registry is the shared loop-beat registry (main.go builds ONE and injects the SAME
+	// one here and into each loop's Beat callback). The loops check reads its Snapshot. nil
+	// (a struct-literal test handler that never wired loops) makes loops degrade to `na`.
+	Registry *BeatRegistry
 }
 
 // Service holds the injected deps plus the process-memory slack "first-saw-non-connected"
@@ -199,13 +224,28 @@ func (s *Service) Evaluate(ctx context.Context) (Doc, error) {
 		}
 	}
 
+	// "Hosted workers are configured" (HOSTED_WORKER_VERSION set OR any kind='hosted'
+	// worker) is the shared `na` predicate for the two hosted checks; compute it once so
+	// fleet.roll and controller.report can never disagree about it.
+	hostedConfigured := s.hostedConfigured(workers)
+
+	// controller.report is evaluated FIRST because fleet.roll's `unknown` conjunct reads
+	// its ok-ness: fleet.roll only degrades to `unknown` on a stale roll signal when the
+	// controller is ALSO not reporting cleanly (M2 conjunct). Its position in the emitted
+	// registry is unchanged (control group, below).
+	controllerReport := s.checkControllerReport(ctx, now, hostedConfigured)
+	controllerReportOK := controllerReport.Severity == sevOK
+
 	checks := []apitypes.HealthCheckDTO{
-		s.checkFleetRoll(now, workers),
+		s.checkFleetRoll(now, workers, controllerReportOK),
 		s.checkFleetCapacity(ctx, now, healthState),
 		s.checkFleetDisk(now, workers),
 		s.checkQueueWaiting(ctx, now, healthState),
 		s.checkQueueUndispatched(ctx, now),
+		controllerReport,
 		s.checkDB(ctx),
+		s.checkLoops(now),
+		s.checkForgeCIWatch(ctx, now),
 		s.checkSlackSocket(now),
 		s.checkSchedulesPaused(ctx, now),
 		s.checkBoardDrift(ctx, now),

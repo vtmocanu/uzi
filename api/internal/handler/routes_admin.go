@@ -182,6 +182,11 @@ func (h *Handler) mountAdminRoutes(r chi.Router, forgeLimiter, authLimiter *mw.L
 			// Cookie-only admin, no egress — upserts the snooze tag = latest_tag so a
 			// newer release auto-clears it. Off the read-only GET and the uza_ CLI token.
 			r.Post("/release-check/snooze", h.PostReleaseCheckSnooze)
+			// PRD #1484 D2: snooze the admin Danger health banner for the current episode,
+			// per admin. Cookie-only admin write (no CLI verb, matching "no admin write
+			// verbs" — a uza_/uzc_ Bearer 401s/403s before the handler). 409 when no episode
+			// is open. No forge limiter — a local per-(episode, caller) upsert, no egress.
+			r.Post("/health/snooze", h.PostAdminHealthSnooze)
 		})
 	})
 }

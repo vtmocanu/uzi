@@ -2,9 +2,12 @@ package healthsvc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
@@ -35,7 +38,10 @@ var checkMeta = map[string]struct {
 	"fleet.disk":         {groupWorkers, "Worker disk", "hosted-workers"},
 	"queue.waiting":      {groupQueue, "Runs waiting for a worker", ""},
 	"queue.undispatched": {groupQueue, "Undispatched task runs", ""},
+	"controller.report":  {groupControl, "Controller reporting", "hosted-workers"},
 	"db":                 {groupControl, "Database", ""},
+	"loops":              {groupControl, "Background loops", ""},
+	"forge.ciwatch":      {groupIntegrations, "CI watch capacity", ""},
 	"slack.socket":       {groupIntegrations, "Slack socket", ""},
 	"schedules.paused":   {groupHousekeeping, "Paused schedules", ""},
 	"board.drift":        {groupHousekeeping, "Board drift", ""},
@@ -97,16 +103,36 @@ func humanDur(d time.Duration) string {
 // workers group
 // -------------------------------------------------------------------------
 
+// hostedConfigured is the shared "hosted workers are configured" predicate for the two
+// hosted checks (fleet.roll, controller.report): HostedWorkerVersion non-empty OR any
+// kind='hosted' worker row exists (confirmed against config.go). Computing it in one place
+// keeps the two checks' `na` gate identical.
+func (s *Service) hostedConfigured(workers []store.ListAllWorkersRow) bool {
+	if s.cfg.HostedWorkerVersion != "" {
+		return true
+	}
+	for _, w := range workers {
+		if w.Worker.Kind == "hosted" {
+			return true
+		}
+	}
+	return false
+}
+
 // checkFleetRoll classifies the hosted fleet's roll health. A worker is upgrade_failed
 // exactly when it has a FRESH controller signal whose phase is `stuck` (R1 of the upgrade
 // classifier, the only path to upgrade_failed — deliberately not version-dependent, so it
 // needs no CPVersion). warn when some hosted workers are stuck, danger when every one is.
 // `na` when hosted workers are not configured — HostedWorkerVersion=="" AND no kind='hosted'
-// worker exists (the predicate confirmed against config.go:641). `unknown` when hosted
-// workers exist but the NEWEST roll signal is stale (older than rollSignalTTL): a silent
-// controller must not read green (D6). (M2 adds the "controller.report is not ok"
-// conjunct; controller.report does not exist yet.)
-func (s *Service) checkFleetRoll(now time.Time, workers []store.ListAllWorkersRow) apitypes.HealthCheckDTO {
+// worker exists (the predicate confirmed against config.go:641).
+//
+// `unknown` is the M2 conjunct: the NEWEST roll signal is stale (older than rollSignalTTL)
+// AND controller.report is NOT ok. A silent controller must not read green (D6) — but when
+// the controller IS reporting cleanly (controllerReportOK), a stale per-worker roll signal
+// is not blindness (that worker simply left the report), so fleet.roll does NOT double-alarm
+// on it and falls through to the ordinary classification (ok, since no fresh signal means no
+// stuck worker).
+func (s *Service) checkFleetRoll(now time.Time, workers []store.ListAllWorkersRow, controllerReportOK bool) apitypes.HealthCheckDTO {
 	c := s.base("fleet.roll")
 
 	hosted := make([]store.ListAllWorkersRow, 0, len(workers))
@@ -167,10 +193,16 @@ func (s *Service) checkFleetRoll(now time.Time, workers []store.ListAllWorkersRo
 	}
 
 	if !anyFreshSignal {
-		c.Severity = sevUnknown
-		c.Summary = "No fresh controller signal for the hosted fleet; roll health cannot be determined."
-		c.Action = strPtr("Check that the worker controller is running and reporting.")
-		return c
+		// M2 conjunct: only degrade to `unknown` when the controller is ALSO not reporting
+		// cleanly. If controller.report is ok, the controller is alive and simply carries no
+		// active roll signal — fall through to the ordinary classification (ok below) rather
+		// than double-alarm on staleness controller.report already covers.
+		if !controllerReportOK {
+			c.Severity = sevUnknown
+			c.Summary = "No fresh controller signal for the hosted fleet; roll health cannot be determined."
+			c.Action = strPtr("Check that the worker controller is running and reporting.")
+			return c
+		}
 	}
 
 	if failed == 0 {
@@ -413,9 +445,211 @@ func (s *Service) livePoolProbe(ctx context.Context) dbStat {
 	return st
 }
 
+// checkControllerReport classifies the fleet-INDEPENDENT "is the controller still
+// reporting" signal — the singleton row ControllerStatus advances on EVERY report,
+// including a zero-worker one (so it is the only liveness trace when there are no hosted
+// worker rows to stamp). There is no warn band. `na` when hosted workers are not configured
+// (the same predicate as fleet.roll). `danger` when there has been no report for
+// controllerReportDanger (5 min). `unknown` from 3 missed intervals up to 5 min, and for the
+// boot grace: the first controllerReportDanger after api boot with no report received SINCE
+// boot — whether the singleton row is absent (first-ever boot) or a stale pre-boot row
+// persists across a restart. `ok` otherwise. Once a report arrives after boot the age-based
+// bands apply exactly, and a stale-report restart past the boot grace correctly becomes danger.
+func (s *Service) checkControllerReport(ctx context.Context, now time.Time, hostedConfigured bool) apitypes.HealthCheckDTO {
+	c := s.base("controller.report")
+	if !hostedConfigured {
+		c.Severity = sevNA
+		c.Summary = "No hosted workers are configured, so the controller does not report."
+		return c
+	}
+
+	observed, err := s.cfg.Store.GetControllerReport(ctx)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows) || (err == nil && !observed.Valid):
+		// The controller has never reported. Inside the boot grace it is unknown (the api
+		// just started and the first report has not arrived yet); past the grace it is a
+		// danger (the controller has been silent since boot).
+		sinceBoot := now.Sub(s.cfg.BootTime)
+		if sinceBoot < controllerReportDanger {
+			c.Severity = sevUnknown
+			c.Summary = "The controller has not reported yet (within the startup grace)."
+			return c
+		}
+		c.Severity = sevDanger
+		c.Summary = "The controller has never reported since api start."
+		c.Action = strPtr("Check that the worker controller is running and can reach the api.")
+		c.Command = strPtr("kubectl -n <worker-namespace> get pods -l app.kubernetes.io/component=controller")
+		c.Since = sincePtr(s.cfg.BootTime)
+		return c
+	case err != nil:
+		return degradeUnknown(c, "controller.report", err)
+	}
+
+	// Boot grace on RESTART: the singleton persists across api restarts, so immediately
+	// after a restart whose downtime exceeded the danger window we read a stale-but-valid
+	// row with no report received SINCE this process booted (the boot-pass evaluation runs
+	// before the api is even listening for reports). That is the same first-report latency
+	// the no-row grace above covers, not a silent controller — within the boot grace degrade
+	// to unknown rather than opening a spurious danger episode. Once a report arrives after
+	// boot (observed.Time is not before BootTime) the age bands below apply unchanged, and a
+	// stale-report restart PAST the grace still becomes danger.
+	if observed.Time.Before(s.cfg.BootTime) && now.Sub(s.cfg.BootTime) < controllerReportDanger {
+		c.Severity = sevUnknown
+		c.Summary = "The controller has not reported since api start (within the startup grace)."
+		return c
+	}
+
+	age := now.Sub(observed.Time)
+	switch {
+	case age >= controllerReportDanger:
+		c.Severity = sevDanger
+		c.Summary = fmt.Sprintf("The controller has not reported for %s.", humanDur(age))
+		c.Since = sincePtr(observed.Time)
+		c.Action = strPtr("Check that the worker controller is running and can reach the api.")
+		c.Command = strPtr("kubectl -n <worker-namespace> get pods -l app.kubernetes.io/component=controller")
+		return c
+	case age >= loopBeatWarnIntervals*controllerReportInterval:
+		// From 3 missed intervals up to the danger window: the controller may just be slow
+		// this tick, so this is unknown, never a warn or a green.
+		c.Severity = sevUnknown
+		c.Summary = fmt.Sprintf("The controller's last report is %s old (a few intervals late).", humanDur(age))
+		c.Since = sincePtr(observed.Time)
+		return c
+	default:
+		c.Severity = sevOK
+		c.Summary = "The controller is reporting."
+		return c
+	}
+}
+
+// checkLoops classifies each REGISTERED background loop against its own tick interval
+// (D8). Per loop: danger past loopBeatDangerIntervals of its intervals, warn past
+// loopBeatWarnIntervals; unknown for a loop that has not beaten since registration and is
+// still within loopBeatWarnIntervals intervals (it has not had a chance yet). A loop that
+// was never registered (the conditional scheduler when not started, D15) is absent from
+// the snapshot and left out entirely. The loops severity is the worst across registered
+// loops. An empty/nil registry (a struct-literal test handler that wired no loops) has no
+// loops to report, so the check is `na` — it cannot apply on this deployment — rather than
+// inventing a warn.
+func (s *Service) checkLoops(now time.Time) apitypes.HealthCheckDTO {
+	c := s.base("loops")
+	var snapshot []LoopBeat
+	if s.cfg.Registry != nil {
+		snapshot = s.cfg.Registry.Snapshot()
+	}
+	if len(snapshot) == 0 {
+		c.Severity = sevNA
+		c.Summary = "No background loops are registered on this deployment."
+		return c
+	}
+
+	worst := sevOK
+	var worstName string
+	var worstAge time.Duration
+	var worstSince time.Time
+	haveWorstSince := false
+	rank := map[string]int{sevOK: 0, sevUnknown: 1, sevWarn: 2, sevDanger: 3}
+	stalled := 0
+	for _, lb := range snapshot {
+		beaten := !lb.LastBeat.IsZero()
+		ref := lb.RegisteredAt
+		if beaten {
+			ref = lb.LastBeat
+		}
+		age := now.Sub(ref)
+		var sev string
+		switch {
+		case age >= time.Duration(loopBeatDangerIntervals)*lb.Interval:
+			sev = sevDanger
+		case age >= time.Duration(loopBeatWarnIntervals)*lb.Interval:
+			sev = sevWarn
+		case !beaten:
+			sev = sevUnknown
+		default:
+			sev = sevOK
+		}
+		if sev != sevOK {
+			stalled++
+		}
+		if rank[sev] > rank[worst] {
+			worst = sev
+			worstName = lb.Name
+			worstAge = age
+			worstSince = ref
+			haveWorstSince = beaten
+		}
+	}
+
+	if worst == sevOK {
+		c.Severity = sevOK
+		c.Summary = fmt.Sprintf("All %d background loops are ticking.", len(snapshot))
+		return c
+	}
+	c.Severity = worst
+	switch worst {
+	case sevUnknown:
+		c.Summary = fmt.Sprintf("The %s loop has not ticked yet since api start.", safe(worstName))
+	default:
+		c.Summary = fmt.Sprintf("The %s loop last ticked %s ago.", safe(worstName), humanDur(worstAge))
+	}
+	c.Evidence = []apitypes.HealthEvidenceDTO{{Label: "Loops needing attention", Value: fmt.Sprintf("%d of %d", stalled, len(snapshot))}}
+	if worst == sevWarn || worst == sevDanger {
+		c.Action = strPtr("A background loop has stopped ticking; check the api logs and restart it if needed.")
+	}
+	if haveWorstSince {
+		c.Since = sincePtr(worstSince)
+	}
+	return c
+}
+
 // -------------------------------------------------------------------------
 // integrations group
 // -------------------------------------------------------------------------
+
+// checkForgeCIWatch warns when ANY repo has more ELIGIBLE run branches than
+// CIWatchMaxRefs, so some run branches go unwatched (the watcher LIMITs to the cap). The
+// comparison is PER REPO — each returned row is one repo with >= 1 eligible branch — never
+// a fleet-wide sum. `na` when CIWatchMaxRefs is 0 (the CI watch is disabled). No danger
+// band.
+func (s *Service) checkForgeCIWatch(ctx context.Context, now time.Time) apitypes.HealthCheckDTO {
+	c := s.base("forge.ciwatch")
+	if s.cfg.CIWatchMaxRefs == 0 {
+		c.Severity = sevNA
+		c.Summary = "The CI watch is disabled (CI_WATCH_MAX_REFS is 0)."
+		return c
+	}
+	rows, err := s.cfg.Store.CountEligibleCIWatchRefsPerRepo(ctx, pgconv.Time(now.Add(-s.cfg.CIWatchRunWindow)))
+	if err != nil {
+		return degradeUnknown(c, "forge.ciwatch", err)
+	}
+	cap64 := int64(s.cfg.CIWatchMaxRefs)
+	var over int
+	var worstRow store.CountEligibleCIWatchRefsPerRepoRow
+	haveWorst := false
+	for _, r := range rows {
+		if r.EligibleRefs > cap64 {
+			over++
+			if !haveWorst || r.EligibleRefs > worstRow.EligibleRefs {
+				worstRow = r
+				haveWorst = true
+			}
+		}
+	}
+	if over == 0 {
+		c.Severity = sevOK
+		c.Summary = "Every repo's run branches fit within the CI watch cap."
+		return c
+	}
+	c.Severity = sevWarn
+	c.Summary = fmt.Sprintf("%d repo(s) have more run branches than the CI watch cap of %d, so some go unwatched.", over, s.cfg.CIWatchMaxRefs)
+	c.Evidence = []apitypes.HealthEvidenceDTO{
+		{Label: "Repos over the cap", Value: fmt.Sprintf("%d", over)},
+		{Label: "Busiest repo", Value: orDash(safe(worstRow.RepoPath))},
+		{Label: "Eligible branches", Value: fmt.Sprintf("%d of %d watched", worstRow.EligibleRefs, s.cfg.CIWatchMaxRefs)},
+	}
+	c.Action = strPtr("Raise CI_WATCH_MAX_REFS, or close finished run branches, so every run branch is watched.")
+	return c
+}
 
 // checkSlackSocket is `na` when Slack is not configured (StateDisabled), ok when connected,
 // and warn when configured but disconnected for at least slackDisconnectedWarn. The manager
