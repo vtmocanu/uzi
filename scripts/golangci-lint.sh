@@ -33,11 +33,11 @@ shift
 # in a newer release. Distinct depName aliases prevent Renovate from deduplicating
 # the two matches in this one file; packageName keeps both on the real upstream.
 # renovate-tarball: depName=golangci-lint-darwin-arm64 packageName=golangci/golangci-lint
-GOLANGCI_LINT_DARWIN_ARM64_VERSION="v2.12.2"
-GOLANGCI_LINT_DARWIN_ARM64_SHA256="a9c54498731b3128f79e090be6110f3e5fffccc617b08142ed244d4126c73f29"
+GOLANGCI_LINT_DARWIN_ARM64_VERSION="v2.13.2"
+GOLANGCI_LINT_DARWIN_ARM64_SHA256="f4bf83f0b64f055c42b28fc9a38861839f69c096e61c788e72dfaae412011789"
 # renovate-tarball: depName=golangci-lint-linux-amd64 packageName=golangci/golangci-lint
-GOLANGCI_LINT_LINUX_AMD64_VERSION="v2.12.2"
-GOLANGCI_LINT_LINUX_AMD64_SHA256="8df580d2670fed8fa984aac0507099af8df275e665215f5c7a2ae3943893a553"
+GOLANGCI_LINT_LINUX_AMD64_VERSION="v2.13.2"
+GOLANGCI_LINT_LINUX_AMD64_SHA256="2277d43b98ec0054280f2ac26b53268bae97682444678a59a657dd565da021d6"
 
 # One sha across two arches is a guaranteed mismatch whose tempting "fix" is to
 # delete the check. Only darwin/arm64 (the dev host) and linux/amd64 (both shared
