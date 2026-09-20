@@ -71,3 +71,17 @@ const PLATFORM: Record<string, string> = {
 export function forgePlatform(forgeType: string | null | undefined): string {
   return PLATFORM[forgeType ?? ""] ?? PLATFORM.gitlab;
 }
+
+// mrPathSegment is the forge's URL path segment for a merge/pull request by number:
+// GitLab "/-/merge_requests/", GitHub "/pull/", Forgejo/Gitea "/pulls/". Both PR-forges
+// are named explicitly (the D2 trap): an unlisted github/forgejo arm would silently build
+// a GitLab /-/merge_requests/ path (a 404 on GitHub/Forgejo), so only unknown/absent falls
+// to GitLab's segment — preserving the exact pre-Forgejo reconstruction for existing rows.
+const MR_PATH: Record<string, string> = {
+  gitlab: "/-/merge_requests/",
+  [GITHUB]: "/pull/",
+  [FORGEJO]: "/pulls/",
+};
+export function mrPathSegment(forgeType: string | null | undefined): string {
+  return MR_PATH[forgeType ?? ""] ?? MR_PATH.gitlab;
+}

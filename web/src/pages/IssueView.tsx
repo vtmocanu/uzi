@@ -462,11 +462,15 @@ function RunHistoryRow({ run, projectWebUrl }: { run: RunListItem; projectWebUrl
   const stopped = isStoppedRun(run.status, run.stop_kind);
   const duration = runDuration(run);
   // PRD §3 asks for an MR/PR *link* in the history. Prefer the forge-supplied URL
-  // the worker persisted (PRD #65 D8) — the only correct link on Forgejo — guarded
-  // through isHttpsUrl by preferForgeUrl. A null (rows created before it landed, all
-  // GitLab) falls back to the legacy GitLab reconstruction; when neither yields an
-  // https URL the chip renders as plain text so it is never absent.
-  const mrHref = preferForgeUrl(run.mr_web_url, run.mr_iid != null ? mergeRequestUrl(projectWebUrl, run.mr_iid) : null);
+  // the worker persisted (PRD #65 D8) — the forge's own canonical URL — guarded
+  // through isHttpsUrl by preferForgeUrl. A null (rows created before it landed) falls
+  // back to a forge-aware reconstruction: mergeRequestUrl picks the path segment per
+  // forge (GitLab /-/merge_requests/, GitHub /pull/, Forgejo /pulls/); when neither
+  // yields an https URL the chip renders as plain text so it is never absent.
+  const mrHref = preferForgeUrl(
+    run.mr_web_url,
+    run.mr_iid != null ? mergeRequestUrl(projectWebUrl, run.mr_iid, run.forge_type) : null,
+  );
   // MR state (PRD #33): a per-run frozen hint; open renders exactly as before,
   // merged/closed get a label and closed is muted + struck ("as of last sync").
   const mrState = mrChipState(run.mr_state);

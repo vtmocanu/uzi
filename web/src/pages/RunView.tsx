@@ -11,7 +11,6 @@ import { Link, useParams } from "react-router-dom";
 import {
   api,
   ApiError,
-  isHttpsUrl,
   isOutcomePendingConfirmation,
   preferForgeUrl,
   isTerminalRun,
@@ -21,6 +20,7 @@ import {
   type RunMessage,
   type Worker,
 } from "../lib/api";
+import { mergeRequestUrl } from "../lib/forgeUrls";
 import { errorMessage } from "../lib/apiError";
 import { canToggleWaitOnLimit, formatCountdown, runWindowLabel } from "../lib/limitWait";
 import {
@@ -1848,12 +1848,14 @@ export function RunView() {
   // MR affordance and (for closed) drops the ok tone; open is unchanged.
   const mrState = mrChipState(run.mr_state);
   // The MR/PR link (PRD #65 D8): prefer the forge-supplied URL the worker persisted
-  // (the only correct link on Forgejo), guarded through isHttpsUrl by preferForgeUrl
-  // before it becomes an anchor. A null (rows created before it landed — all GitLab)
-  // falls back to the legacy GitLab reconstruction from the repo web url.
+  // (the forge's own canonical URL), guarded through isHttpsUrl by preferForgeUrl
+  // before it becomes an anchor. A null (rows created before it landed) falls back to
+  // a forge-aware reconstruction from the repo web url — the path segment is chosen per
+  // forge (GitLab /-/merge_requests/, GitHub /pull/, Forgejo /pulls/) by mergeRequestUrl,
+  // which keeps the isHttpsUrl guard.
   const mrUrl = preferForgeUrl(
     run.mr_web_url,
-    run.mr_iid != null && isHttpsUrl(repoWebUrl) ? `${repoWebUrl}/-/merge_requests/${run.mr_iid}` : null,
+    run.mr_iid != null ? mergeRequestUrl(repoWebUrl, run.mr_iid, run.forge_type) : null,
   );
   const duration =
     run.started_at && run.finished_at

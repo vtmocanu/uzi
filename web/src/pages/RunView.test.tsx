@@ -5738,3 +5738,57 @@ describe("RunView — held-outcome banner + discard confirmation (PRD #1391 M3d)
     await waitFor(() => expect(screen.queryByText(MODAL_BODY)).toBeNull());
   });
 });
+
+// issue #1486: when mr_web_url is null (rows created before it was persisted), the MR/PR
+// link is RECONSTRUCTED from the repo web URL, and that reconstruction must be forge-aware.
+// A GitHub run must build a `/pull/<n>` link, not GitLab's `/-/merge_requests/<n>` (the bug:
+// the old code hard-coded the GitLab path, producing a 404 link on GitHub). The repo web
+// URL is fetched via api.listRepos, so this renders the whole page with that mock supplying
+// an https GitHub repo base.
+describe("RunView — forge-aware MR/PR link fallback when mr_web_url is null (#1486)", () => {
+  function renderPage(over: Partial<Run>, repoWebUrl: string) {
+    mockUseRunStream.mockReturnValue({
+      run: run(over),
+      messages: [],
+      connected: true,
+      error: "",
+      submit: vi.fn(),
+      refreshRun: vi.fn(),
+      inputs: [],
+      canSteer: false,
+    } as unknown as ReturnType<typeof useRunStream>);
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
+    // The default listRepos mock returns []; give it a repo matching the run's repo_id so
+    // the page resolves repoWebUrl and the fallback reconstruction can run.
+    mockApi.listRepos.mockResolvedValue({
+      repos: [{ id: "repo1", web_url: repoWebUrl } as unknown as Repo],
+    });
+    return render(
+      <MemoryRouter initialEntries={["/runs/r1"]}>
+        <RunView />
+      </MemoryRouter>,
+    );
+  }
+
+  it("builds a /pull/<n> anchor for a github run (never GitLab's /-/merge_requests/)", async () => {
+    renderPage(
+      {
+        status: "completed",
+        forge_type: "github",
+        mr_web_url: null,
+        mr_iid: 42,
+        branch: "agent/issue-1486",
+      },
+      "https://github.com/ns/repo",
+    );
+    // The listRepos fetch resolves in an effect, so the anchor appears after settle.
+    const link = (await screen.findByRole("link", {
+      name: /Open pull request/i,
+    })) as HTMLAnchorElement;
+    const href = link.getAttribute("href") ?? "";
+    expect(href).toBe("https://github.com/ns/repo/pull/42");
+    // Non-vacuous: the old hard-coded GitLab path would end /-/merge_requests/42 and fail here.
+    expect(href.endsWith("/pull/42")).toBe(true);
+    expect(href).not.toContain("/-/merge_requests/");
+  });
+});

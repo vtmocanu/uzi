@@ -159,8 +159,8 @@ export function isHttpsUrl(url: string | null | undefined): boolean {
 }
 
 // preferForgeUrl chooses the forge-supplied persisted MR/PR URL when it is a usable
-// https URL (PRD #65 D8 — the only correct link on Forgejo, whose PR URL grammar the
-// legacy GitLab reconstruction never knew), else the caller's legacy reconstruction.
+// https URL (PRD #65 D8 — the forge's own canonical URL), else the caller's
+// reconstructed fallback (forgeUrls.mergeRequestUrl builds the per-forge path).
 // The persisted value is WORKER-supplied and stored without scheme validation, so
 // routing it through isHttpsUrl here is the load-bearing guard: a hostile http: or
 // javascript: mr_web_url is rejected and never becomes an anchor href. Shared by

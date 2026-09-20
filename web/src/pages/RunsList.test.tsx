@@ -569,6 +569,38 @@ describe("RunsList — MR/PR chip deep-links (issue #803)", () => {
     expect(chip).not.toBeNull();
     expect(chip?.getAttribute("href")).toBe("https://gitlab.example.com/g/p/-/merge_requests/799");
   });
+
+  // issue #1486: the fallback reconstruction must be forge-aware. A github run with a
+  // github-shaped issue URL and no persisted mr_web_url must produce a REAL /pull/<n>
+  // link, not GitLab's hard-coded /-/merge_requests/<n> (a 404 on GitHub) and not an
+  // inert text span.
+  it("the runs list MR chip reconstructs a GitHub /pull/<n> link from a github issue URL (#1486)", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        aRun({
+          id: "run-1",
+          issue_title: "GitHub-derived run",
+          status: "running",
+          forge_type: "github",
+          mr_iid: 799,
+          mr_state: "opened",
+          mr_web_url: null,
+          issue_web_url: "https://github.com/ns/repo/issues/42",
+        }),
+      ],
+    });
+
+    const { container } = renderRuns();
+
+    await waitFor(() => expect(screen.getByText("GitHub-derived run")).toBeTruthy());
+    // A real anchor (not an inert span), carrying the GitHub /pull/ path.
+    const chip = container.querySelector('a[href*="/pull/"]') as HTMLAnchorElement | null;
+    expect(chip).not.toBeNull();
+    expect(chip?.getAttribute("href")).toBe("https://github.com/ns/repo/pull/799");
+    expect(chip?.getAttribute("target")).toBe("_blank");
+    // Non-vacuous: the old hard-coded path would have produced /-/merge_requests/799.
+    expect(container.querySelector('a[href*="merge_requests"]')).toBeNull();
+  });
 });
 
 describe("RunsList — global judge-triage strip removed (PRD #98 Decision 7)", () => {
