@@ -513,6 +513,23 @@ workers:
   #   false in normal operation and flip it true only for the duration of the emergency.
   forceRoll: false
 
+  # --- the Codex uid-split profile (PRD #1493 M4) ---------------------------------
+  #
+  # Two knobs the controller threads onto the worker pod spec, so they live beside the
+  # drain/roll knobs above rather than under api/*. Both are conditionally omitted from
+  # the controller env at their default, so a default install's Deployment is unchanged.
+  uidSplit:
+    # When on, the kube-native worker namespace drops from PodSecurity `restricted` to
+    # `baseline` and the worker + seed-nix containers start as root with a fixed
+    # capability set so the Codex uid split can be established. Default off keeps today's
+    # restricted posture; a flip rolls the whole fleet.
+    enabled: false
+  codex:
+    # `required` fails a Codex command closed if the kernel lacks Landlock. `best-effort`
+    # runs the command without Landlock filesystem confinement on such kernels (relying on
+    # the uid split), never relaxing the uid split.
+    commandSandbox: required
+
   # PRD #837 M4 disk-pressure recycle (self-healing worker disk). When a hosted worker
   # reports disk pressure (a volume at used/total >= the api's diskPressureThreshold
   # across >=2 fresh heartbeats), the controller drains it and recycles its PVCs.

@@ -45,14 +45,18 @@ metadata:
   labels:
     {{- include "uzi.labels" . | nindent 4 }}
     app.kubernetes.io/component: worker
-    # PodSecurity `restricted`, ENFORCED. This is what makes the worker pod's posture
-    # a property of the namespace rather than of the controller remembering to render
-    # it: no root entry, no capability beyond NET_BIND_SERVICE, no privilege
-    # escalation. It is also why PRD #51's A1 compose mechanism (root entry +
-    # setpriv drop, ambient CAP_SETUID/SETGID) cannot run here, and why v1 is
-    # single-container at runAsUser 10001 — the image's entrypoint detects the
-    # non-root start and skips the drop.
-    pod-security.kubernetes.io/enforce: restricted
+    # PodSecurity, ENFORCED at the namespace so the worker pod's posture is a property of
+    # the namespace rather than of the controller remembering to render it. The enforced
+    # tier follows workers.uidSplit.enabled: `restricted` by default (no root entry, no
+    # capability beyond NET_BIND_SERVICE, no privilege escalation), dropping to `baseline`
+    # while the uid split is on. PRD #51's A1 uid-split mechanism (root entry + setpriv
+    # drop, a fixed SETUID/SETGID/SETPCAP/CHOWN/DAC_OVERRIDE capability set) NOW runs on
+    # k8s behind workers.uidSplit.enabled (PRD #1493): under `restricted` v1 is
+    # single-container at runAsUser 10001 and the image's entrypoint detects the non-root
+    # start and skips the drop; under `baseline` the worker + seed-nix containers start as
+    # root and establish the split. audit and warn STAY `restricted` in both cases, so the
+    # delta from the enforced posture stays visible in audit logs and warnings.
+    pod-security.kubernetes.io/enforce: {{ if .Values.workers.uidSplit.enabled }}baseline{{ else }}restricted{{ end }}
     pod-security.kubernetes.io/enforce-version: latest
     pod-security.kubernetes.io/audit: restricted
     pod-security.kubernetes.io/audit-version: latest
