@@ -10,6 +10,11 @@ import {
   CODEX_PROBE_EXPECTATION,
   type ProbeCodexRuntimeOptions,
 } from "../src/codex/codex-runtime-probe.js";
+import {
+  probeLandlockAvailability,
+  resolveCodexHarnessAvailability,
+  type LandlockProbeOutcome,
+} from "../src/codex/codex-capability.js";
 
 // PRD #1332 D3 (M5A / C2) — the startup runtime probe that gates the codex_harness_v1
 // PROTOCOL capability. These tests run against small RECEIPT FIXTURES (a handful of tiny
@@ -333,5 +338,78 @@ describe("probeCodexRuntime — no exec / no network by construction", () => {
     assert.doesNotMatch(src, /\brequire\s*\(/, "probe module must not use require()");
     assert.doesNotMatch(src, /\bimport\s*\(/, "probe module must not use dynamic import()");
     assert.doesNotMatch(src, /\bfetch\s*\(/, "probe module must not call fetch()");
+  });
+});
+
+// PRD #1493 M3 — the Landlock probe (exit-code mapping) and the honest-advertisement
+// CONJUNCTION: advertise codex_harness_v1 ONLY when receipt intact AND uid split active
+// AND (Landlock available OR best-effort on a Landlock-unavailable kernel). Each failing
+// precondition yields a distinct reason. The wrapper lives in its OWN module (it spawns a
+// subprocess), so probeCodexRuntime keeps the no-exec contract asserted above.
+describe("probeLandlockAvailability — --probe exit-code mapping", () => {
+  const fakeSpawn = (status: number | null, error?: Error) => () => ({ status, error });
+  it("maps exit 0 → available, 10 → unavailable, 11 → error", () => {
+    assert.equal(probeLandlockAvailability("/bin/x", fakeSpawn(0)), "available");
+    assert.equal(probeLandlockAvailability("/bin/x", fakeSpawn(10)), "unavailable");
+    assert.equal(probeLandlockAvailability("/bin/x", fakeSpawn(11)), "error");
+  });
+  it("maps a spawn error, a null status, or an unknown code → probe-failed", () => {
+    assert.equal(probeLandlockAvailability("/bin/x", fakeSpawn(0, new Error("ENOENT"))), "probe-failed");
+    assert.equal(probeLandlockAvailability("/bin/x", fakeSpawn(null)), "probe-failed");
+    assert.equal(probeLandlockAvailability("/bin/x", fakeSpawn(42)), "probe-failed");
+  });
+  it("never throws when the spawn seam itself throws", () => {
+    const throwing = () => { throw new Error("spawn blew up"); };
+    assert.equal(probeLandlockAvailability("/bin/x", throwing), "probe-failed");
+  });
+});
+
+describe("resolveCodexHarnessAvailability — honest advertisement conjunction", () => {
+  const base = { receiptCapable: true, uidSplit: true, mode: "required" as const, landlock: "available" as LandlockProbeOutcome };
+
+  it("advertises (not degraded) when receipt intact AND uid split AND Landlock available", () => {
+    const r = resolveCodexHarnessAvailability({ ...base });
+    assert.equal(r.advertise, true);
+    assert.equal(r.degraded, false);
+    assert.equal(r.reason, undefined);
+  });
+
+  it("does NOT advertise when the receipt is not intact (distinct reason)", () => {
+    const r = resolveCodexHarnessAvailability({ ...base, receiptCapable: false, receiptReason: "receipt not readable" });
+    assert.equal(r.advertise, false);
+    assert.match(r.reason ?? "", /receipt not intact/);
+  });
+
+  it("does NOT advertise when the uid split is inactive (distinct reason)", () => {
+    const r = resolveCodexHarnessAvailability({ ...base, uidSplit: false });
+    assert.equal(r.advertise, false);
+    assert.match(r.reason ?? "", /uid split not active/);
+  });
+
+  it("advertises DEGRADED in best-effort on a Landlock-UNAVAILABLE kernel", () => {
+    const r = resolveCodexHarnessAvailability({ ...base, mode: "best-effort", landlock: "unavailable" });
+    assert.equal(r.advertise, true);
+    assert.equal(r.degraded, true);
+  });
+
+  it("does NOT advertise in required mode on a Landlock-unavailable kernel (distinct reason)", () => {
+    const r = resolveCodexHarnessAvailability({ ...base, mode: "required", landlock: "unavailable" });
+    assert.equal(r.advertise, false);
+    assert.match(r.reason ?? "", /required/);
+  });
+
+  it("does NOT advertise on a Landlock ERROR even in best-effort (D8: error stays fatal)", () => {
+    for (const landlock of ["error", "probe-failed"] as const) {
+      const r = resolveCodexHarnessAvailability({ ...base, mode: "best-effort", landlock });
+      assert.equal(r.advertise, false, `best-effort must not advertise on landlock ${landlock}`);
+      assert.equal(r.degraded, false);
+      assert.match(r.reason ?? "", /fatal even in best-effort/);
+    }
+  });
+
+  it("the receipt precondition is checked FIRST (a split-less, Landlock-less, no-receipt worker names the receipt)", () => {
+    const r = resolveCodexHarnessAvailability({ receiptCapable: false, receiptReason: "no receipt", uidSplit: false, mode: "required", landlock: "error" });
+    assert.equal(r.advertise, false);
+    assert.match(r.reason ?? "", /receipt not intact/);
   });
 });

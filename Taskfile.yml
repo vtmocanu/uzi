@@ -364,6 +364,14 @@ tasks:
       # WITHOUT editing .github/workflows/** (which this branch must not touch). Ordered
       # before `scan:secrets`, which is deliberately last because it dominates.
       - task: test:migration-renumber
+      # PRD #1493 M3: the Codex command sandbox is a SEPARATE Go module
+      # (agent/codex/supervisor, go 1.26.0, vendored/offline) whose tests NO CI job runs
+      # today. Wiring test:codex-supervisor here makes the lint-repo job (which runs
+      # `task gate:repo` on Linux with Go) reach them WITHOUT a .github/workflows edit --
+      # the same "reachable from gate:repo" seam test:migration-renumber uses. The target
+      # is `platforms: [linux]`, so a macOS `task gate:repo` skips it rather than failing.
+      # Also non-sub-second (it runs `go test`), so it sits before `scan:secrets`.
+      - task: test:codex-supervisor
       - task: scan:secrets
       # Whole-tree Go+TS SAST scan (semgrep), BYO fail-open like lint:yaml. Ordered
       # LAST because a whole-tree scan dominates, same as scan:secrets above (PRD #862 M2).
@@ -2257,10 +2265,12 @@ tasks:
   test:codex-supervisor:
     desc: Opt-in Linux-only gofmt vet and unit tests for the static Codex process supervisor module
     platforms: [linux]
-    # A SEPARATE Go module (uzi.local/codex-supervisor), deliberately NOT part of gate:api
-    # and NOT under gate. GOTOOLCHAIN=local pins the host toolchain (the module go.mod floors
-    # go 1.25); -mod=vendor builds offline from the committed vendor tree; -buildvcs=false
-    # skips VCS stamping, which otherwise fails inside a linked worktree.
+    # A SEPARATE Go module (uzi.local/codex-supervisor), deliberately NOT part of gate:api.
+    # It IS reached by `task gate` transitively: gate -> gate:repo lists it (PRD #1493 M3),
+    # so the lint-repo CI job (Linux + Go) runs it; a macOS `task gate:repo` skips it via
+    # `platforms: [linux]`. GOTOOLCHAIN=local pins the host toolchain (the module go.mod
+    # floors go 1.26.0); -mod=vendor builds offline from the committed vendor tree;
+    # -buildvcs=false skips VCS stamping, which otherwise fails inside a linked worktree.
     dir: agent/codex/supervisor
     env:
       GOTOOLCHAIN: local

@@ -783,13 +783,16 @@ describe("Worker — diff-review dispatch (PRD #400 M4b)", () => {
   });
 });
 
-// PRD #1332 D3 (M5A / C2) — the worker advertises the `codex_harness_v1` PROTOCOL
-// capability IFF the startup runtime probe (resolved once, carried on config.codexProbe)
-// succeeded. A failed or absent probe leaves the two always-present protocol capabilities
-// unchanged, so a stripped/corrupt/mismatched/old image keeps serving Claude. The server
-// silently filters the string until the later vocabulary-admission unit lands — this test
-// pins the WORKER side: what it puts on the wire, and only that.
-describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3)", () => {
+// PRD #1332 D3 (M5A / C2), refined by PRD #1493 M3 — the worker advertises the
+// `codex_harness_v1` PROTOCOL capability IFF the HONEST combined availability result
+// (resolved once, carried on config.codexHarness) says to. That result combines the
+// receipt probe, the uid split and the Landlock probe with the sandbox mode; a false or
+// absent result leaves the always-present protocol capabilities unchanged, so a
+// stripped/split-less/Landlock-less worker keeps serving Claude. The server silently
+// filters the string until the vocabulary-admission unit lands — this test pins the
+// WORKER side: what it puts on the wire, and only that. The combining logic itself is
+// unit-tested in codex-capability.test.ts.
+describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / #1493 M3)", () => {
   // A client whose register() captures the protocol-capabilities argument (5th param) so a
   // test can assert exactly what the worker advertised, then idles both claim lanes.
   function capturingClient(): { client: WorkerClient; captured: () => string[] | undefined } {
@@ -832,41 +835,55 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3)",
     return captured();
   }
 
-  it("appends codex_harness_v1 when the startup probe succeeded", async () => {
-    const caps = await advertisedCapabilities(fakeConfig({ codexProbe: { capable: true } }));
+  it("appends codex_harness_v1 when the combined availability result advertises", async () => {
+    const caps = await advertisedCapabilities(
+      fakeConfig({ codexHarness: { advertise: true, degraded: false, landlock: "available" } }),
+    );
     assert.deepStrictEqual(
       caps,
       ["completion_interlock_v1", "recovery_archive_v1", "recovery_archive_v2", "credential_switch_v1", CODEX_HARNESS_CAPABILITY],
-      "a capable probe appends codex_harness_v1 after the always-present protocol caps (v2 by PRD #1349 M1, credential_switch_v1 by PRD #1247 M5b)",
+      "an advertising result appends codex_harness_v1 after the always-present protocol caps (v2 by PRD #1349 M1, credential_switch_v1 by PRD #1247 M5b)",
     );
   });
 
-  it("omits codex_harness_v1 when the probe failed, keeping the other two", async () => {
+  it("still appends codex_harness_v1 when advertising DEGRADED (best-effort, no Landlock)", async () => {
     const caps = await advertisedCapabilities(
-      fakeConfig({ codexProbe: { capable: false, reason: "receipt not readable" } }),
+      fakeConfig({ codexHarness: { advertise: true, degraded: true, landlock: "unavailable" } }),
+    );
+    assert.ok(
+      caps?.includes(CODEX_HARNESS_CAPABILITY),
+      "a degraded best-effort worker still advertises codex_harness_v1 (it can run Codex, unconfined)",
+    );
+  });
+
+  it("omits codex_harness_v1 when the combined result does not advertise, keeping the others", async () => {
+    const caps = await advertisedCapabilities(
+      fakeConfig({ codexHarness: { advertise: false, degraded: false, landlock: "unavailable", reason: "landlock unavailable and command sandbox mode is required" } }),
     );
     assert.deepStrictEqual(
       caps,
       ["completion_interlock_v1", "recovery_archive_v1", "recovery_archive_v2", "credential_switch_v1"],
-      "a failed probe leaves the always-present protocol caps unchanged (Claude service intact)",
+      "a non-advertising result leaves the always-present protocol caps unchanged (Claude service intact)",
     );
-    assert.ok(!caps?.includes(CODEX_HARNESS_CAPABILITY), "codex_harness_v1 is absent on a failed probe");
+    assert.ok(!caps?.includes(CODEX_HARNESS_CAPABILITY), "codex_harness_v1 is absent when not advertising");
   });
 
-  it("omits codex_harness_v1 when the probe result is absent (defensive optional chaining)", async () => {
-    // fakeConfig() sets no codexProbe, so config.codexProbe is undefined — the `?.` guard
-    // must degrade to "not capable" rather than throw inside the registration loop.
+  it("omits codex_harness_v1 when the result is absent (defensive optional chaining)", async () => {
+    // fakeConfig() sets no codexHarness, so config.codexHarness is undefined — the `?.` guard
+    // must degrade to "not advertising" rather than throw inside the registration loop.
     const caps = await advertisedCapabilities(fakeConfig());
     assert.deepStrictEqual(
       caps,
       ["completion_interlock_v1", "recovery_archive_v1", "recovery_archive_v2", "credential_switch_v1"],
-      "an absent probe result advertises only the always-present protocol caps",
+      "an absent availability result advertises only the always-present protocol caps",
     );
   });
 
-  it("always advertises completion_interlock_v1, recovery_archive_v1, recovery_archive_v2 and credential_switch_v1 regardless of the probe", async () => {
-    for (const codexProbe of [{ capable: true }, { capable: false }]) {
-      const caps = await advertisedCapabilities(fakeConfig({ codexProbe }));
+  it("always advertises completion_interlock_v1, recovery_archive_v1, recovery_archive_v2 and credential_switch_v1 regardless of Codex availability", async () => {
+    for (const advertise of [true, false]) {
+      const caps = await advertisedCapabilities(
+        fakeConfig({ codexHarness: { advertise, degraded: false, landlock: advertise ? "available" : "unavailable" } }),
+      );
       assert.ok(caps?.includes("completion_interlock_v1"), "completion_interlock_v1 always present");
       assert.ok(caps?.includes("recovery_archive_v1"), "recovery_archive_v1 always present");
       assert.ok(caps?.includes("recovery_archive_v2"), "recovery_archive_v2 always present (PRD #1349 M1)");

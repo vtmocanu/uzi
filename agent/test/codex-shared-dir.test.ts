@@ -50,12 +50,12 @@ async function freshTmp(): Promise<string> {
   return fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "codex-shared-dir-")));
 }
 
-/** Make `dir` a setgid dir group-owned by `gid` (mode 2770): the hosted-k8s setgid-parent
+/** Make `dir` a sticky setgid dir group-owned by `gid` (mode 3770): the hosted-k8s setgid-parent
  *  shape a fresh child inherits its group from. Requires the process to be a member of `gid`. */
 async function makeSetgidParent(dir: string, uid: number, gid: number): Promise<void> {
-  await fs.mkdir(dir, { mode: 0o2770 });
+  await fs.mkdir(dir, { mode: 0o3770 });
   await fs.chown(dir, uid, gid);
-  await fs.chmod(dir, 0o2770);
+  await fs.chmod(dir, 0o3770);
 }
 
 // ─── Group A: portable, any uid ─────────────────────────────────────────────────
@@ -82,7 +82,7 @@ describe("Issue #1492: ensureCodexSharedDirectory create-only group repair (port
       const st = await statOf(child);
       assert.equal(st.uid, uid, "owner is preserved");
       assert.equal(st.gid, gB, "the freshly-created dir was chgrp'd to the expected gid");
-      assert.equal(st.mode, 0o2770, "mode is 2770 (setgid + rwxrwx---)");
+      assert.equal(st.mode, 0o3770, "mode is 3770 (sticky + setgid + rwxrwx---)");
     } finally {
       await fs.rm(base, { recursive: true, force: true });
     }
@@ -98,7 +98,7 @@ describe("Issue #1492: ensureCodexSharedDirectory create-only group repair (port
       const st = await statOf(child);
       assert.equal(st.uid, uid);
       assert.equal(st.gid, gB, "the correct-gid dir is left as-is");
-      assert.equal(st.mode, 0o2770);
+      assert.equal(st.mode, 0o3770);
     } finally {
       await fs.rm(base, { recursive: true, force: true });
     }
@@ -112,7 +112,7 @@ describe("Issue #1492: ensureCodexSharedDirectory create-only group repair (port
       const child = path.join(parent, "run-1");
       // Create the child OUTSIDE the helper so this call does not "create" it: it inherits
       // gid A from the setgid parent and must be REJECTED, not repaired.
-      await fs.mkdir(child, { mode: 0o2770 });
+      await fs.mkdir(child, { mode: 0o3770 });
       await assert.rejects(
         ensureCodexSharedDirectory(child, { uid, gid: gB }),
         /unexpected owner or group/,
@@ -129,7 +129,7 @@ describe("Issue #1492: ensureCodexSharedDirectory create-only group repair (port
       const parent = path.join(base, "agent-home");
       await makeSetgidParent(parent, uid, gB);
       const real = path.join(parent, "real");
-      await fs.mkdir(real, { mode: 0o2770 });
+      await fs.mkdir(real, { mode: 0o3770 });
       const link = path.join(parent, "link");
       await fs.symlink(real, link);
       await assert.rejects(
@@ -151,7 +151,7 @@ describe("Issue #1492: ensureCodexSharedDirectory create-only group repair (port
       const child = path.join(parent, "codex-advice-data");
       // Create the child OUTSIDE the helper so this call does NOT "create" it: it inherits gid A
       // (the "wrong" disposable gid) and owner = test uid, i.e. the pre-rc.2 worker:worker parent.
-      await fs.mkdir(child, { mode: 0o2770 });
+      await fs.mkdir(child, { mode: 0o3770 });
       const originalInode = await inodeOf(child);
 
       await ensureCodexSharedDirectory(child, { uid, gid: gB }, { recreateDisposableWorkerGroupDir: true, recoverGid: gA });
@@ -159,7 +159,7 @@ describe("Issue #1492: ensureCodexSharedDirectory create-only group repair (port
       const st = await statOf(child);
       assert.equal(st.uid, uid, "owner is the worker");
       assert.equal(st.gid, gB, "the recreated dir is grouped the expected gid (repaired after fresh create)");
-      assert.equal(st.mode, 0o2770, "mode is 2770 (setgid + rwxrwx---)");
+      assert.equal(st.mode, 0o3770, "mode is 3770 (sticky + setgid + rwxrwx---)");
       const newInode = await inodeOf(child);
       assert.notEqual(
         `${newInode.dev}:${newInode.ino}`,
@@ -177,7 +177,7 @@ describe("Issue #1492: ensureCodexSharedDirectory create-only group repair (port
       const parent = path.join(base, "agent-home");
       await makeSetgidParent(parent, uid, gA);
       const child = path.join(parent, "codex-advice-cwd");
-      await fs.mkdir(child, { mode: 0o2770 });
+      await fs.mkdir(child, { mode: 0o3770 });
       const marker = path.join(child, "leftover.txt");
       await fs.writeFile(marker, "pre-existing content that must NOT be adopted");
 
@@ -203,7 +203,7 @@ describe("Issue #1492: ensureCodexSharedDirectory create-only group repair (port
       const parent = path.join(base, "agent-home"); // the runner-group-writable parent under uid-split
       await makeSetgidParent(parent, uid, gA);
       const child = path.join(parent, "codex-advice-data");
-      await fs.mkdir(child, { mode: 0o2770 });
+      await fs.mkdir(child, { mode: 0o3770 });
 
       await ensureCodexSharedDirectory(child, { uid, gid: gB }, { recreateDisposableWorkerGroupDir: true, recoverGid: gA });
 
@@ -234,7 +234,7 @@ describe("Issue #1492: ensureCodexSharedDirectory create-only group repair (port
       const parent = path.join(base, "agent-home");
       await makeSetgidParent(parent, uid, gA);
       const child = path.join(parent, "codex-advice-data");
-      await fs.mkdir(child, { mode: 0o2770 });
+      await fs.mkdir(child, { mode: 0o3770 });
       const originalInode = await inodeOf(child);
       // Make <dataDir> (the quarantine root = grandparent of the live path) non-writable so the
       // 0700 quarantine cannot be created: cleanup must fail SAFELY — recover the live path but
@@ -274,7 +274,7 @@ describe("Issue #1492: ensureCodexSharedDirectory create-only group repair (port
       const parent = path.join(base, "agent-home");
       await makeSetgidParent(parent, uid, gA); // child inherits gid A
       const child = path.join(parent, "codex-advice-data");
-      await fs.mkdir(child, { mode: 0o2770 });
+      await fs.mkdir(child, { mode: 0o3770 });
       // recoverGid gB, but the pre-existing dir is gid A ⇒ gA !== recoverGid ⇒ recovery is NOT
       // triggered, and the strict gid check rejects the EEXISTing mismatch as before.
       await assert.rejects(
@@ -293,7 +293,7 @@ describe("Issue #1492: ensureCodexSharedDirectory create-only group repair (port
       const parent = path.join(base, "agent-home");
       await makeSetgidParent(parent, uid, gA); // child inherits gid A, owner = this test uid
       const child = path.join(parent, "codex-advice-data");
-      await fs.mkdir(child, { mode: 0o2770 });
+      await fs.mkdir(child, { mode: 0o3770 });
       const originalInode = await inodeOf(child);
       // expect.uid is a DIFFERENT uid than the dir's actual owner (this process). The recovery
       // guard requires `before.uid === expect.uid`, so it must NOT fire on a foreign-owned dir —
@@ -323,7 +323,7 @@ describe("Issue #1492: ensureCodexSharedDirectory create-only group repair (port
       const parent = path.join(base, "agent-home");
       await makeSetgidParent(parent, uid, gA);
       const real = path.join(parent, "real");
-      await fs.mkdir(real, { mode: 0o2770 });
+      await fs.mkdir(real, { mode: 0o3770 });
       const link = path.join(parent, "codex-advice-data");
       await fs.symlink(real, link);
       await assert.rejects(
@@ -341,7 +341,7 @@ describe("Issue #1492: ensureCodexSharedDirectory create-only group repair (port
       const parent = path.join(base, "agent-home");
       await makeSetgidParent(parent, uid, gA);
       const child = path.join(parent, "codex-advice-data");
-      await fs.mkdir(child, { mode: 0o2770 }); // pre-existing worker:gA, the "wrong" gid
+      await fs.mkdir(child, { mode: 0o3770 }); // pre-existing worker:gA, the "wrong" gid
 
       // Two overlapping opt-in calls on the SAME path. A NON-serialized impl risks the second
       // caller re-renaming the first's freshly-recreated (healthy worker:gB) dir out of the live
@@ -355,7 +355,7 @@ describe("Issue #1492: ensureCodexSharedDirectory create-only group repair (port
       const st = await statOf(child);
       assert.equal(st.uid, uid, "owner is the worker");
       assert.equal(st.gid, gB, "final dir is grouped the expected gid");
-      assert.equal(st.mode, 0o2770, "final dir mode is 2770");
+      assert.equal(st.mode, 0o3770, "final dir mode is 3770");
 
       const entries = await fs.readdir(parent);
       const liveChildren = entries.filter((e) => e === "codex-advice-data");
@@ -390,12 +390,12 @@ describe("Issue #1492: production paths repair worker-inherited dirs to RUNNER_U
       const home = await statOf(runHome);
       assert.equal(home.uid, WORKER_UID);
       assert.equal(home.gid, RUNNER_UID, "the per-run home was repaired from gid worker to gid runner");
-      assert.equal(home.mode, 0o2770);
+      assert.equal(home.mode, 0o3770);
 
       const codexData = await statOf(path.join(runHome, "codex-data"));
       assert.equal(codexData.uid, WORKER_UID);
       assert.equal(codexData.gid, RUNNER_UID, "codex-data is runner-group-owned");
-      assert.equal(codexData.mode, 0o2770);
+      assert.equal(codexData.mode, 0o3770);
     } finally {
       await fs.rm(base, { recursive: true, force: true });
     }
@@ -411,13 +411,13 @@ describe("Issue #1492: production paths repair worker-inherited dirs to RUNNER_U
 
       // Initialize once (run()'s pre-provisioning INITIALIZATION), then REVALIDATE (each provider
       // epoch's startProviderEpoch re-runs prepareCodexRunHome). The second call hits created=false
-      // and VALIDATES the already-correct worker:runner 2770 — a no-op, never a re-adopt.
+      // and VALIDATES the already-correct worker:runner 3770 — a no-op, never a re-adopt.
       await prepareCodexRunHome(runHome);
       await prepareCodexRunHome(runHome);
       const home = await statOf(runHome);
       assert.equal(home.uid, WORKER_UID);
       assert.equal(home.gid, RUNNER_UID, "revalidation leaves the per-run home worker:runner");
-      assert.equal(home.mode, 0o2770);
+      assert.equal(home.mode, 0o3770);
       const codexData = await statOf(path.join(runHome, "codex-data"));
       assert.equal(codexData.gid, RUNNER_UID, "revalidation leaves codex-data runner-group-owned");
 
@@ -476,7 +476,7 @@ describe("Issue #1492: production paths repair worker-inherited dirs to RUNNER_U
         const st = await statOf(path.join(homeRoot, name));
         assert.equal(st.uid, WORKER_UID, `${name} owner is worker`);
         assert.equal(st.gid, RUNNER_UID, `${name} was repaired from gid worker to gid runner`);
-        assert.equal(st.mode, 0o2770, `${name} mode is 2770`);
+        assert.equal(st.mode, 0o3770, `${name} mode is 3770`);
       }
     } finally {
       await fs.rm(base, { recursive: true, force: true });
@@ -495,8 +495,8 @@ describe("Issue #1492: production paths repair worker-inherited dirs to RUNNER_U
       // worker roll on the RWO PVC. The seam must RECOVER them, not throw.
       const dataParent = path.join(homeRoot, "codex-advice-data");
       const cwdParent = path.join(homeRoot, "codex-advice-cwd");
-      await fs.mkdir(dataParent, { mode: 0o2770 });
-      await fs.mkdir(cwdParent, { mode: 0o2770 });
+      await fs.mkdir(dataParent, { mode: 0o3770 });
+      await fs.mkdir(cwdParent, { mode: 0o3770 });
       const originalInodes = {
         "codex-advice-data": await inodeOf(dataParent),
         "codex-advice-cwd": await inodeOf(cwdParent),
@@ -538,7 +538,7 @@ describe("Issue #1492: production paths repair worker-inherited dirs to RUNNER_U
         const st = await statOf(p);
         assert.equal(st.uid, WORKER_UID, `${name} owner is worker`);
         assert.equal(st.gid, RUNNER_UID, `${name} was recovered from gid worker to gid runner`);
-        assert.equal(st.mode, 0o2770, `${name} mode is 2770`);
+        assert.equal(st.mode, 0o3770, `${name} mode is 3770`);
         const newInode = await inodeOf(p);
         assert.notEqual(
           `${newInode.dev}:${newInode.ino}`,
@@ -561,7 +561,7 @@ describe("Issue #1492: production paths repair worker-inherited dirs to RUNNER_U
       // Pre-create the run HOME as worker:worker (gid inherited), as if left by a prior worker.
       // Unlike the two disposable advice parents, prepareCodexRunHome does NOT opt into recovery
       // (the run HOME holds codex-session-store resume state), so it MUST reject, never recreate.
-      await fs.mkdir(runHome, { mode: 0o2770 });
+      await fs.mkdir(runHome, { mode: 0o3770 });
       await assert.rejects(
         prepareCodexRunHome(runHome),
         /unexpected owner or group/,

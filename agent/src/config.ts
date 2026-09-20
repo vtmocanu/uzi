@@ -4,6 +4,7 @@ import path from "node:path";
 import type { LogLevel } from "./log.js";
 import type { DockerWiring } from "./docker-wiring.js";
 import type { CodexRuntimeProbeResult } from "./codex/codex-runtime-probe.js";
+import type { CodexHarnessAvailability } from "./codex/codex-capability.js";
 import { TRANSIENT_TRIP_MS } from "./batcher.js";
 import { errMessage } from "./util.js";
 
@@ -15,6 +16,17 @@ import { errMessage } from "./util.js";
 
 /** Which executor drives a claimed run. */
 export type ExecutorKind = "sdk" | "stub";
+
+/**
+ * PRD #1493 M3: the Codex command-sandbox enforcement mode. `required` (the
+ * default) keeps today's fail-closed behaviour — the command sandbox refuses to
+ * run without Landlock. `best-effort` applies Landlock wherever the kernel offers
+ * it (still failing closed if applying it fails) and otherwise runs the command
+ * without filesystem confinement, relying on the uid split. It never relaxes the
+ * uid split. The value comes ONLY from the worker's own env, never from run, repo
+ * or model input.
+ */
+export type CommandSandboxMode = "required" | "best-effort";
 
 export interface Config {
   apiUrl: string;
@@ -126,6 +138,27 @@ export interface Config {
    * Claude. A stripped/hand-built/corrupt/mismatched/old image resolves to not-capable.
    */
   codexProbe: CodexRuntimeProbeResult;
+  /**
+   * PRD #1493 M3: the Codex command-sandbox enforcement mode
+   * (UZI_CODEX_COMMAND_SANDBOX). Parsed strictly at `loadConfig` (unknown value
+   * throws and refuses to start, mirroring {@link parseExecutor}); defaults to
+   * `required`. It is threaded into `commandSandboxArgv` as the `--mode` token the
+   * trusted worker passes to `uzi-codex-command-sandbox`, and into the startup
+   * capability wrapper that gates `codex_harness_v1`. The command env is fully
+   * replaced (`buildCommandEnv`), so this worker-owned value can never be
+   * influenced by the model.
+   */
+  codexCommandSandbox: CommandSandboxMode;
+  /**
+   * PRD #1493 M3: the resolved honest-advertisement decision for `codex_harness_v1`.
+   * Like {@link codexProbe}/{@link dockerWiring}, `loadConfig` leaves it a
+   * not-advertising default; main.ts resolves it ONCE at startup by combining the
+   * receipt probe, `uidSplitActive()` and the `uzi-codex-command-sandbox --probe`
+   * Landlock probe with {@link codexCommandSandbox}. worker.ts gates the advertised
+   * protocol capability on `advertise`; the executor writes one degraded-mode feed
+   * line per Codex run when `degraded`.
+   */
+  codexHarness: CodexHarnessAvailability;
   /**
    * Readiness-wait knobs for the docker-wiring probe (PRD #83 M2 follow-up,
    * UZI_DOCKER_READY_INTERVAL / UZI_DOCKER_READY_TIMEOUT). When a sidecar is EXPECTED
@@ -269,6 +302,19 @@ function parseExecutor(v: string | undefined): ExecutorKind {
   throw new Error(`invalid UZI_EXECUTOR ${JSON.stringify(v)} (expected "sdk" or "stub")`);
 }
 
+/**
+ * Strict allow-list parse of UZI_CODEX_COMMAND_SANDBOX, mirroring
+ * {@link parseExecutor}'s shape exactly: `best-effort` and `required` are the only
+ * accepted values; absent/empty defaults to `required`; anything else THROWS so a
+ * fat-fingered mode refuses to start rather than silently degrading enforcement.
+ */
+function parseCommandSandbox(v: string | undefined): CommandSandboxMode {
+  const mode = v?.trim().toLowerCase();
+  if (mode === "best-effort") return "best-effort";
+  if (mode === "required" || mode === undefined || mode === "") return "required";
+  throw new Error(`invalid UZI_CODEX_COMMAND_SANDBOX ${JSON.stringify(v)} (expected "required" or "best-effort")`);
+}
+
 function parseBool(v: string | undefined): boolean {
   const s = v?.trim().toLowerCase();
   return s === "1" || s === "true" || s === "yes";
@@ -385,6 +431,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     // sync parse cannot read/hash the receipt, so the default is "not capable" — a worker
     // never advertises codex_harness_v1 until the probe positively confirms the layout.
     codexProbe: { capable: false },
+    // PRD #1493 M3: the command-sandbox mode, strict-parsed (unknown value throws
+    // and refuses to start). Default `required` keeps today's fail-closed sandbox.
+    codexCommandSandbox: parseCommandSandbox(env.UZI_CODEX_COMMAND_SANDBOX),
+    // Populated by main.ts after the async receipt + Landlock probes; the sync parse
+    // cannot probe, so the default is "do not advertise" until startup resolves it.
+    codexHarness: { advertise: false, degraded: false, landlock: "probe-failed" },
     // Readiness wait for an EXPECTED docker sidecar (M2 follow-up). ~1s poll, ~30s budget.
     dockerReadyIntervalMs: duration(env, "UZI_DOCKER_READY_INTERVAL", "1s"),
     dockerReadyTimeoutMs: duration(env, "UZI_DOCKER_READY_TIMEOUT", "30s"),

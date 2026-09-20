@@ -390,6 +390,32 @@ describe("launchCodexRoot: app-server auth (production config, no env credential
 });
 
 describe("launchCodexEffectRoot: supervised command identity", () => {
+  // PRD #1493 M3: the missing negative twin of launchCodexRoot's supported-profile gate.
+  // Both launcher guards stay EXACTLY as they are; this only pins the effect-root refusal.
+  it("REFUSES to launch (CodexUnsupportedProfileError) when the uid split is not active", async () => {
+    const fake = newFake({ uid: COMMAND_UID });
+    await assert.rejects(
+      launchCodexEffectRoot(
+        {
+          identity: "command",
+          command: "/bin/sh",
+          args: ["-c", "true"],
+          cwd: "/work/repo",
+          env: { PATH: "/usr/bin:/bin", HOME: "/tmp", TMPDIR: "/tmp" },
+          supervisorBin: SUPERVISOR_BIN,
+        },
+        // An env WITHOUT UZI_UID_SPLIT models a single-uid / shared-uid profile.
+        baseDeps(fake, { env: { PATH: "/usr/bin" }, resolveCommandUid: () => COMMAND_UID }),
+      ),
+      (err: unknown) => {
+        assert.ok(err instanceof CodexUnsupportedProfileError);
+        assert.match((err as Error).message, /effect roots require the A1 uid split/);
+        return true;
+      },
+    );
+    assert.equal(spawnCalls.length, 0, "no supervisor spawn under an unsupported profile");
+  });
+
   it("launches uid 10003 with a replaced env and reports the primary child status", async () => {
     const fake = newFake({ uid: COMMAND_UID });
     const env = { PATH: "/usr/bin:/bin", HOME: "/tmp", TMPDIR: "/tmp" };

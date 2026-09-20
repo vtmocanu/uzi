@@ -664,7 +664,7 @@ describe("PRD #1493 M2: legacy run HOME survives migration and still validates (
       assert.equal(r.status, 0, `real migration run must succeed (stderr: ${r.stderr})`);
 
       // (a) the run HOME + codex-data are now worker:runner and PASS the production validator
-      // (it force-asserts 2770 and rejects any owner/group mismatch).
+      // (it force-asserts 3770 — sticky + setgid, PRD #1493 M3 — and rejects any owner/group mismatch).
       await ensureCodexSharedDirectory(runHome);
       await ensureCodexSharedDirectory(path.join(runHome, "codex-data"));
       const home = await fsp.lstat(runHome);

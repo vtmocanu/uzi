@@ -23,7 +23,9 @@ import { errMessage } from "./util.js";
 import { uidSplitActive } from "./runner-uid.js";
 import { resolveDockerWiring, dockerSidecarExpected, type DockerWiring } from "./docker-wiring.js";
 import { probeCodexRuntime } from "./codex/codex-runtime-probe.js";
+import { probeLandlockAvailability, resolveCodexHarnessAvailability } from "./codex/codex-capability.js";
 import type { ClaimCodexSecrets } from "./protocol.js";
+import type { CommandSandboxMode } from "./config.js";
 
 // Set once the logger exists so the last-resort fatal handler can scrub through
 // the SecretRegistry instead of writing a raw (unredacted) line.
@@ -42,6 +44,12 @@ export interface BuildRunExecutorDeps {
   stubPlanGate: boolean;
   workerTokenFile?: string;
   dockerWiring: DockerWiring;
+  /** PRD #1493 M3: the worker-configured command-sandbox mode, threaded into the
+   *  CodexExecutor so its command/fileop argv carries the `--mode` token. */
+  codexCommandSandbox: CommandSandboxMode;
+  /** PRD #1493 M3: true when the sandbox is running degraded (best-effort on a
+   *  Landlock-less kernel); the CodexExecutor writes one feed line per run. */
+  codexSandboxDegraded: boolean;
 }
 
 /**
@@ -59,7 +67,7 @@ export interface BuildRunExecutorDeps {
  * NEVER a crash of executeClaim itself.
  */
 export function buildRunExecutor(runId: string, codex: ClaimCodexSecrets | undefined, deps: BuildRunExecutorDeps): RunExecution {
-  const { log, client, sdkHomeRoot, executorKind, stubPlanGate, workerTokenFile, dockerWiring } = deps;
+  const { log, client, sdkHomeRoot, executorKind, stubPlanGate, workerTokenFile, dockerWiring, codexCommandSandbox, codexSandboxDegraded } = deps;
   let selection;
   try {
     selection = selectCodexBinding({ codex });
@@ -110,6 +118,11 @@ export function buildRunExecutor(runId: string, codex: ClaimCodexSecrets | undef
         // materializes the per-run HOME with the wrong gid. provisionRoot takes its
         // computed default (path.dirname(provisionHomeDir)/provision).
         provisionHomeDir: sdkHomeRoot,
+        // PRD #1493 M3: the worker-configured command-sandbox mode (never run/repo/model
+        // input). Threaded into commandSandboxArgv's `--mode` token; degraded drives the
+        // per-run feed line.
+        commandSandbox: codexCommandSandbox,
+        commandSandboxDegraded: codexSandboxDegraded,
       },
       {
         // PRD #1171 m4 (F1): the RUNNER owns the terminal registry teardown. Its post-run
@@ -194,11 +207,41 @@ async function main(): Promise<void> {
     });
     return { capable: false as const };
   });
-  if (config.codexProbe.capable) {
-    log.info("codex runtime probe OK — advertising codex_harness_v1");
+  // PRD #1493 M3: honest advertisement. The receipt probe alone no longer decides
+  // codex_harness_v1 — combine it with the uid-split state AND a Landlock availability
+  // probe (with the configured sandbox mode). A split-less worker, and a split worker on
+  // a Landlock-less kernel in `required` mode, stop advertising a Codex run they were
+  // going to fail; those runs queue with the api's existing reason instead. The Landlock
+  // probe invokes `uzi-codex-command-sandbox --probe` (never Codex, never the network), so
+  // probeCodexRuntime keeps its no-exec contract. Each failing precondition logs a
+  // distinct reason.
+  const uidSplit = uidSplitActive();
+  const landlock = probeLandlockAvailability();
+  config.codexHarness = resolveCodexHarnessAvailability({
+    receiptCapable: config.codexProbe.capable,
+    receiptReason: config.codexProbe.reason,
+    uidSplit,
+    mode: config.codexCommandSandbox,
+    landlock,
+  });
+  if (config.codexHarness.advertise && config.codexHarness.degraded) {
+    // Log the DEGRADED mode ONCE here at startup (no per-command model-visible warning;
+    // the executor writes one line into each Codex run's feed).
+    log.warn("codex_harness_v1 advertised DEGRADED: best-effort mode on a kernel without Landlock — commands run WITHOUT filesystem confinement (uid split still enforced)", {
+      sandbox_mode: config.codexCommandSandbox,
+      landlock,
+    });
+  } else if (config.codexHarness.advertise) {
+    log.info("codex runtime probe OK — advertising codex_harness_v1", {
+      sandbox_mode: config.codexCommandSandbox,
+      landlock,
+    });
   } else {
-    log.info("codex runtime probe: codex_harness_v1 NOT advertised (serving Claude)", {
-      reason: config.codexProbe.reason ?? "not capable",
+    log.info("codex_harness_v1 NOT advertised (serving Claude)", {
+      reason: config.codexHarness.reason ?? "not capable",
+      landlock,
+      uid_split: uidSplit,
+      sandbox_mode: config.codexCommandSandbox,
     });
   }
 
@@ -211,6 +254,9 @@ async function main(): Promise<void> {
     max_concurrent_runs: config.maxConcurrentRuns,
     docker_wired: config.dockerWiring.dockerHost !== undefined,
     codex_capable: config.codexProbe.capable,
+    codex_advertise: config.codexHarness.advertise,
+    codex_sandbox_mode: config.codexCommandSandbox,
+    codex_sandbox_degraded: config.codexHarness.degraded,
   });
   // Soft-ceiling warn (PRD #42 Decision 3): the cap is honored as configured, but a
   // value above the documented ceiling is almost certainly a fat-finger — each slot
@@ -296,6 +342,8 @@ async function main(): Promise<void> {
       stubPlanGate: config.stubPlanGate,
       workerTokenFile: config.workerTokenFile,
       dockerWiring: config.dockerWiring,
+      codexCommandSandbox: config.codexCommandSandbox,
+      codexSandboxDegraded: config.codexHarness.degraded,
     });
   const runner = new RunRunner(client, git, makeExecutor, log, config.messageBatchMs, config.workerToken, {
     pollMs: config.pollIntervalMs,
