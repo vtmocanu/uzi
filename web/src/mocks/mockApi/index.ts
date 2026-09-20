@@ -17,6 +17,7 @@ import { chatApi } from "./chat";
 import { secretsApi } from "./secrets";
 import { workersApi } from "./workers";
 import { settingsApi } from "./settings";
+import { healthApi } from "./health";
 import { boardsApi } from "./boards";
 import { usersApi } from "./users";
 import { schedulesApi } from "./schedules";
@@ -32,6 +33,9 @@ export const mockApi = {
   ...usersApi,
 
   ...settingsApi,
+
+  // ── Admin health (PRD #1484) ─────────────────────────────────────────────────
+  ...healthApi,
 
   // ── Agent source (PRD #602 M5) ───────────────────────────────────────────────
   ...agentSourceApi,
