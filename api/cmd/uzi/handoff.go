@@ -144,17 +144,25 @@ func runHandoffCreate(env Env, gf *globalFlags, cmd *cobra.Command) error {
 		srcRef = b // validated non-leading-dash above, before the run was created
 	}
 	if _, err := env.Git(".", "push", "origin", srcRef+":refs/heads/"+branch); err != nil {
-		return uzicli.Exitf(uzicli.ExitGeneric,
-			"pushing %s to %s failed: %v\nthe task run %s was created but NOT dispatched, so no worker will claim it; cancel it with 'uzi run cancel %s'",
-			srcRef, branch, err, run.ID, run.ID)
+		// The remediation is multi-clause and would exceed the 200-rune cap root.go's
+		// one-line "uzi: <err>" report applies (render.go compactText), which silently
+		// truncates the actionable tail. Print the guidance in full here and return a
+		// short summary error — the pattern used at run_steer.go.
+		_, _ = fmt.Fprintf(env.Stderr,
+			"the task run %s was created but NOT dispatched, so no worker will claim it; cancel it with 'uzi run cancel %s'\n",
+			run.ID, run.ID)
+		return uzicli.Exitf(uzicli.ExitGeneric, "pushing %s to %s failed: %v", srcRef, branch, err)
 	}
 
 	// (3) Dispatch — only now may the worker claim it.
 	dispatched, err := c.DispatchTaskRun(cmd.Context(), run.ID)
 	if err != nil {
-		return uzicli.Exitf(uzicli.ExitGeneric,
-			"dispatching task %s failed: %v\nlocal HEAD was pushed to %s, but the dispatch did not confirm — the run may or may not have become claimable. Check it with 'uzi run get %s': if it shows dispatched or running, the handoff succeeded; if it is still queued and undispatched, the server will expire it automatically within its setup deadline, or you can cancel it with 'uzi run cancel %s' once you have confirmed it is still undispatched.",
-			run.ID, err, branch, run.ID, run.ID)
+		// Full remediation via a direct Fprintln so it survives root.go's 200-rune
+		// one-line error cap (render.go compactText); the returned error stays short.
+		_, _ = fmt.Fprintf(env.Stderr,
+			"local HEAD was pushed to %s, but the dispatch did not confirm — the run may or may not have become claimable. Check it with 'uzi run get %s': if it shows dispatched or running, the handoff succeeded; if it is still queued and undispatched, the server will expire it automatically within its setup deadline, or you can cancel it with 'uzi run cancel %s' once you have confirmed it is still undispatched.\n",
+			branch, run.ID, run.ID)
+		return uzicli.Exitf(uzicli.ExitGeneric, "dispatching task %s failed: %v", run.ID, err)
 	}
 
 	return renderHandoff(env, gf, dispatched, branch, reviewRequested, thenFix)

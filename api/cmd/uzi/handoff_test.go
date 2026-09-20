@@ -526,6 +526,12 @@ func TestHandoffDispatchFailureHint(t *testing.T) {
 	if !strings.Contains(stderr, "uzi run get") {
 		t.Errorf("dispatch-failure stderr should recommend 'uzi run get' to check the ambiguous state:\n%s", stderr)
 	}
+	// Pin the exact remediation: the hint names the run id and requires confirming the
+	// run is still undispatched before cancelling — not an unconditional 'uzi run cancel'.
+	if !strings.Contains(stderr, "uzi run get r4d") ||
+		!strings.Contains(stderr, "once you have confirmed it is still undispatched") {
+		t.Errorf("dispatch-failure stderr must name the run and require state confirmation before cancellation:\n%s", stderr)
+	}
 	if strings.Contains(stderr, "uzi handoff rm") {
 		t.Errorf("dispatch-failure stderr must not recommend 'uzi handoff rm' (it refuses a non-terminal run):\n%s", stderr)
 	}
