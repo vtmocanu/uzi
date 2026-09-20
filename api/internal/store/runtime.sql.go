@@ -5540,11 +5540,13 @@ SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.v
        u.email AS owner_email,
        rh.phase              AS roll_phase,
        rh.phase_since        AS roll_phase_since,
+       rh.pod_phase          AS roll_pod_phase,
        rh.blocking_container AS roll_blocking_container,
        rh.blocking_reason    AS roll_blocking_reason,
        rh.restart_count      AS roll_restart_count,
        rh.last_exit_code     AS roll_last_exit_code,
        rh.observed_at        AS roll_observed_at,
+       rh.upgrading_since    AS roll_upgrading_since,
        rh.worker_image_tag   AS roll_worker_image_tag
 FROM workers w
 JOIN users u ON u.id = w.user_id
@@ -5559,11 +5561,13 @@ type ListAllWorkersRow struct {
 	OwnerEmail            string             `json:"owner_email"`
 	RollPhase             pgtype.Text        `json:"roll_phase"`
 	RollPhaseSince        pgtype.Timestamptz `json:"roll_phase_since"`
+	RollPodPhase          pgtype.Text        `json:"roll_pod_phase"`
 	RollBlockingContainer pgtype.Text        `json:"roll_blocking_container"`
 	RollBlockingReason    pgtype.Text        `json:"roll_blocking_reason"`
 	RollRestartCount      pgtype.Int4        `json:"roll_restart_count"`
 	RollLastExitCode      pgtype.Int4        `json:"roll_last_exit_code"`
 	RollObservedAt        pgtype.Timestamptz `json:"roll_observed_at"`
+	RollUpgradingSince    pgtype.Timestamptz `json:"roll_upgrading_since"`
 	RollWorkerImageTag    pgtype.Text        `json:"roll_worker_image_tag"`
 }
 
@@ -5574,14 +5578,18 @@ type ListAllWorkersRow struct {
 // embedded worker carries max_concurrent_runs (the advertised cap, NULL when
 // unadvertised).
 //
-// Roll health (PRD #1484 M1), LEFT JOINed exactly as ListWorkersByUser does so the
+// Roll health (PRD #1484 M1/M2), LEFT JOINed exactly as ListWorkersByUser does so the
 // admin fleet view and the cross-user health checks (fleet.roll, fleet.disk) can read
 // the controller's per-worker roll signal instead of the always-null placeholder the
 // old admin list carried. A worker with no report — every external worker, any hosted
 // worker the controller has not reached, and the whole fleet under docker-compose where
 // no controller runs — still lists (LEFT JOIN). observed_at is the API's own receipt
 // time and the only freshness input; controller_reported_at is deliberately NOT
-// selected (it is display-only and must not reach a freshness classifier).
+// selected (it is display-only and must not reach a freshness classifier). The full set
+// of roll columns ListWorkersByUser selects — INCLUDING pod_phase and upgrading_since —
+// is carried (M2) so AdminListWorkers' row-to-DTO mapper builds the SAME RollSignal and
+// classifies upgrade_status/blocking fields byte-identically to GET /api/workers, rather
+// than diverging on the INV-5 ceiling (upgrading_since) or the rolling-detail (pod_phase).
 func (q *Queries) ListAllWorkers(ctx context.Context) ([]ListAllWorkersRow, error) {
 	rows, err := q.db.Query(ctx, listAllWorkers)
 	if err != nil {
@@ -5634,11 +5642,13 @@ func (q *Queries) ListAllWorkers(ctx context.Context) ([]ListAllWorkersRow, erro
 			&i.OwnerEmail,
 			&i.RollPhase,
 			&i.RollPhaseSince,
+			&i.RollPodPhase,
 			&i.RollBlockingContainer,
 			&i.RollBlockingReason,
 			&i.RollRestartCount,
 			&i.RollLastExitCode,
 			&i.RollObservedAt,
+			&i.RollUpgradingSince,
 			&i.RollWorkerImageTag,
 		); err != nil {
 			return nil, err
