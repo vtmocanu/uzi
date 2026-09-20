@@ -202,6 +202,101 @@ func TestHealthEpisodeConcurrentOpenLiveDB(t *testing.T) {
 	mustExec(ctx, t, pool, `UPDATE health_episodes SET closed_at = now() WHERE closed_at IS NULL`)
 }
 
+// TestClaimHealthEpisodeNoticeAtomicLiveDB is the M6 exactly-once proof: N goroutines race
+// ClaimHealthEpisodeNotice for the SAME (episode, admin) slot, and EXACTLY ONE insert takes
+// (rows-affected 1) while every loser is an ON CONFLICT DO NOTHING no-op (rows-affected 0) —
+// none an error. That is what makes the danger notice fire exactly once per admin per episode
+// across api replicas and repeated still-danger ticks. It then proves the claim is PER-EPISODE:
+// the same admin claims freshly against a SECOND episode (a distinct PK) — the re-arm — while a
+// repeat within an episode stays a no-op. Modeled on TestHealthEpisodeConcurrentOpenLiveDB; run
+// under -race.
+func TestClaimHealthEpisodeNoticeAtomicLiveDB(t *testing.T) {
+	ctx, pool, q := openHealthLiveDB(t)
+	mustExec(ctx, t, pool, `UPDATE health_episodes SET closed_at = now() WHERE closed_at IS NULL`)
+
+	userID := uuid.New()
+	mustExec(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
+		userID, fmt.Sprintf("claim-%s@e2e", userID))
+	ep1, err := q.OpenHealthEpisode(ctx, ts(time.Now()))
+	if err != nil {
+		t.Fatalf("open episode 1: %v", err)
+	}
+
+	const n = 8
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	type res struct {
+		rows int64
+		err  error
+	}
+	results := make([]res, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			rows, err := q.ClaimHealthEpisodeNotice(ctx, store.ClaimHealthEpisodeNoticeParams{EpisodeID: ep1, UserID: userID})
+			results[i] = res{rows: rows, err: err}
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	var took, noop, errs int
+	for _, r := range results {
+		switch {
+		case r.err != nil:
+			errs++
+		case r.rows == 1:
+			took++
+		case r.rows == 0:
+			noop++
+		}
+	}
+	if errs != 0 {
+		t.Fatalf("got %d errored claims; ON CONFLICT DO NOTHING must never error a loser", errs)
+	}
+	if took != 1 {
+		t.Fatalf("claims that inserted = %d, want exactly 1 (the atomic per-admin-per-episode claim)", took)
+	}
+	if noop != n-1 {
+		t.Fatalf("no-op claims = %d, want %d (every loser is a DO NOTHING no-op)", noop, n-1)
+	}
+	var count int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM health_episode_notices WHERE episode_id = $1 AND user_id = $2`, ep1, userID).Scan(&count); err != nil {
+		t.Fatalf("count notices: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("health_episode_notices rows for (ep1,user) = %d, want 1 (exactly one claim landed)", count)
+	}
+
+	// PER-EPISODE: the SAME admin claims FRESH against a second episode (the re-arm). Close ep1
+	// first so the partial unique index admits a second open.
+	if err := q.CloseHealthEpisode(ctx, store.CloseHealthEpisodeParams{ID: ep1, ClosedAt: ts(time.Now())}); err != nil {
+		t.Fatalf("close episode 1: %v", err)
+	}
+	ep2, err := q.OpenHealthEpisode(ctx, ts(time.Now()))
+	if err != nil {
+		t.Fatalf("open episode 2: %v", err)
+	}
+	rows, err := q.ClaimHealthEpisodeNotice(ctx, store.ClaimHealthEpisodeNoticeParams{EpisodeID: ep2, UserID: userID})
+	if err != nil {
+		t.Fatalf("claim for episode 2: %v", err)
+	}
+	if rows != 1 {
+		t.Fatalf("claim for a DIFFERENT episode returned rows = %d, want 1 (claims are per-episode — the re-arm)", rows)
+	}
+	// A repeat of the ep2 claim is a no-op (idempotent within the episode).
+	rows, err = q.ClaimHealthEpisodeNotice(ctx, store.ClaimHealthEpisodeNoticeParams{EpisodeID: ep2, UserID: userID})
+	if err != nil {
+		t.Fatalf("repeat claim for episode 2: %v", err)
+	}
+	if rows != 0 {
+		t.Fatalf("repeat claim within an episode returned rows = %d, want 0 (idempotent)", rows)
+	}
+	mustExec(ctx, t, pool, `UPDATE health_episodes SET closed_at = now() WHERE closed_at IS NULL`)
+}
+
 // TestHealthBannerSnoozeLiveDB proves the snooze read reports "not snoozed" (pgx.ErrNoRows)
 // before any snooze, and that a re-snooze OVERWRITES the expiry (ON CONFLICT DO UPDATE) — the
 // per-admin, per-episode key the Danger banner reads.

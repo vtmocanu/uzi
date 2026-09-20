@@ -36,6 +36,19 @@ UPDATE health_episodes SET closed_at = @closed_at WHERE id = @id AND closed_at I
 -- exist (the partial unique index).
 SELECT id, opened_at FROM health_episodes WHERE closed_at IS NULL;
 
+-- name: ClaimHealthEpisodeNotice :execrows
+-- Atomically claim the per-admin, per-episode notice slot (PRD #1484 M6). The INSERT itself
+-- is the claim: ON CONFLICT (episode_id, user_id) DO NOTHING makes a re-claim a silent no-op,
+-- so the M6 evaluator's danger fan-out sends a notice ONLY when the insert took. :execrows
+-- returns rows-affected — 1 when this caller claimed (send), 0 when a prior tick or a sibling
+-- replica already claimed (skip, not an error). This is the exactly-one-notice-per-admin-per-
+-- episode dedup, the health analogue of ClaimCustodyEpisodeNotice (which uses RETURNING +
+-- pgx.ErrNoRows for the same effect); the (episode_id, user_id) PK is what two api replicas
+-- cannot both win. notified_at defaults to now() at the table.
+INSERT INTO health_episode_notices (episode_id, user_id)
+VALUES (@episode_id, @user_id)
+ON CONFLICT (episode_id, user_id) DO NOTHING;
+
 -- name: UpsertHealthBannerSnooze :exec
 -- Snooze the caller's Danger banner for the named episode until snoozed_until. Re-snoozing
 -- overwrites the expiry (ON CONFLICT DO UPDATE).

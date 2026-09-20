@@ -12,6 +12,33 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const claimHealthEpisodeNotice = `-- name: ClaimHealthEpisodeNotice :execrows
+INSERT INTO health_episode_notices (episode_id, user_id)
+VALUES ($1, $2)
+ON CONFLICT (episode_id, user_id) DO NOTHING
+`
+
+type ClaimHealthEpisodeNoticeParams struct {
+	EpisodeID uuid.UUID `json:"episode_id"`
+	UserID    uuid.UUID `json:"user_id"`
+}
+
+// Atomically claim the per-admin, per-episode notice slot (PRD #1484 M6). The INSERT itself
+// is the claim: ON CONFLICT (episode_id, user_id) DO NOTHING makes a re-claim a silent no-op,
+// so the M6 evaluator's danger fan-out sends a notice ONLY when the insert took. :execrows
+// returns rows-affected — 1 when this caller claimed (send), 0 when a prior tick or a sibling
+// replica already claimed (skip, not an error). This is the exactly-one-notice-per-admin-per-
+// episode dedup, the health analogue of ClaimCustodyEpisodeNotice (which uses RETURNING +
+// pgx.ErrNoRows for the same effect); the (episode_id, user_id) PK is what two api replicas
+// cannot both win. notified_at defaults to now() at the table.
+func (q *Queries) ClaimHealthEpisodeNotice(ctx context.Context, arg ClaimHealthEpisodeNoticeParams) (int64, error) {
+	result, err := q.db.Exec(ctx, claimHealthEpisodeNotice, arg.EpisodeID, arg.UserID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const closeHealthEpisode = `-- name: CloseHealthEpisode :exec
 UPDATE health_episodes SET closed_at = $1 WHERE id = $2 AND closed_at IS NULL
 `
