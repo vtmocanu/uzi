@@ -3901,12 +3901,16 @@ func TestSweepComputesCutoffsAndOrder(t *testing.T) {
 	if _, err := svc.Sweep(context.Background()); err != nil {
 		t.Fatalf("Sweep: %v", err)
 	}
-	// PRD #1497 M1: the wall-clock sweep is now RequestWallParks then ParkRunsAtWall (park, not
-	// fail). The served-steer stamp still runs RIGHT AFTER them (it stamps the post-attempt live
-	// rows the carve-out spared), before the stale-worker recovery passes; ParkRunsAtWall runs
-	// before the stale requeue (D5). issue #1367: the undispatched-handoff reaper runs right after
-	// claimed_never_started, before the wall-park passes.
-	want := []string{"mark_stale", "claimed_never_started", "task_never_dispatched", "wall_park_request", "wall_park", "stamp_budget_exhausted", "stale_fail_over_cap", "stale_requeue"}
+	// PRD #1497 M1: the wall-clock sweep is RequestWallParks (ungated) then, once boot grace has
+	// elapsed, ParkRunsAtWall — which the review Fix 2 moved INTO the boot-grace-gated stale-worker
+	// block (it must not server-park a transiently-stale returning worker's run during grace).
+	// RequestWallParks stays ungated (it only touches live capable workers). The served-steer stamp
+	// (stamp_budget_exhausted) stays ungated too and runs right after the request pass, so with grace
+	// inactive ParkRunsAtWall now runs AFTER it. Within the gated block ParkRunsAtWall runs FIRST,
+	// BEFORE both stale_fail_over_cap and stale_requeue (D5), so a dead worker's out-of-time run parks
+	// (preserving its work) instead of being failed over cap or requeued. issue #1367: the
+	// undispatched-handoff reaper runs right after claimed_never_started, before the wall-park passes.
+	want := []string{"mark_stale", "claimed_never_started", "task_never_dispatched", "wall_park_request", "stamp_budget_exhausted", "wall_park", "stale_fail_over_cap", "stale_requeue"}
 	if strings.Join(fs.callOrder, ",") != strings.Join(want, ",") {
 		t.Fatalf("sweep order = %v, want %v", fs.callOrder, want)
 	}

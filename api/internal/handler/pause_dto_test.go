@@ -24,6 +24,7 @@ func TestPauseRequestedRule(t *testing.T) {
 		want                           bool
 	}{
 		{"now parks immediately", "now", 6, 3, 3, true},
+		{"wall parks immediately (PRD #1497)", "wall", 6, 3, 3, true},
 		{"milestone not yet at boundary (completed == after)", "milestone", 6, 3, 3, false},
 		{"milestone past boundary (completed > after)", "milestone", 6, 4, 3, true},
 		{"milestone with no frozen list parks at next turn", "milestone", 0, 0, 0, true},

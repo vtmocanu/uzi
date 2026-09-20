@@ -11016,6 +11016,17 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
 WHERE id = $11 AND worker_id = $12
+  -- PRD #1497 M1 (DEVIATION-3): a legacy (nil-generation, non-interlocked) ` + "`" + `completed` + "`" + ` from an
+  -- old flight must never complete a run the wall-park sweep just server-parked. ParkRunsAtWall
+  -- leaves the row status='paused' with claim_released_at set and KEEPS worker_id (informational),
+  -- so a stale worker_id-only completion would otherwise satisfy the guard below and walk the park
+  -- back to 'completed'. SetState's Go wrapper fences a generation-STAMPING report, but a
+  -- generation-less legacy report is honoured by that nil-guarded fence and the best-effort Go
+  -- status check in SetState is a TOCTOU — so the guard lives in SQL, mirroring SetRunRunning's
+  -- own ` + "`" + `status <> 'paused'` + "`" + ` exclusion. A live legacy ` + "`" + `completed` + "`" + ` always runs on a running,
+  -- non-released row (the interlocked path is completeRunWithPermit, fenced on its own locked row),
+  -- so this never blocks a legitimate completion.
+  AND status <> 'paused' AND claim_released_at IS NULL
   -- issue #329: a genuine worker completion (it opened the MR) supersedes a
   -- wall-clock RUN_TIMEOUT failure. Scoped to fail_origin='run_timeout' ONLY: a
   -- human 'cancelled' still wins, and a worker's own 'failed'/'worker_lost' is never
@@ -12938,18 +12949,14 @@ func (q *Queries) StampHeldCredentialSwitch(ctx context.Context, arg StampHeldCr
 }
 
 const stopWallPark = `-- name: StopWallPark :one
-WITH superseded AS (
-    UPDATE run_user_inputs SET disposition = 'superseded'
-    WHERE run_user_inputs.run_id = $1 AND run_user_inputs.kind = 'scope' AND run_user_inputs.disposition IS NULL
-),
-stopped AS (
+WITH stopped AS (
     -- Outer refs qualified ` + "`" + `runs.` + "`" + ` for the shared-scope reason above (sibling run_user_inputs CTEs).
     UPDATE runs SET
-        scope_ceiling = $2::int,
+        scope_ceiling = $1::int,
         budget_finalize_seconds = 1800,
         budget_paused_seconds = runs.budget_paused_seconds
             + GREATEST(0, (GREATEST(0, EXTRACT(EPOCH FROM (runs.status_since - runs.started_at))::int) - runs.budget_paused_seconds)
-                          - (COALESCE(runs.budget_wall_seconds, $3::int)
+                          - (COALESCE(runs.budget_wall_seconds, $2::int)
                              + runs.budget_extension_seconds + runs.budget_finalize_seconds))
             + GREATEST(0, EXTRACT(EPOCH FROM (now() - runs.status_since))::int),
         status = 'queued',
@@ -12960,7 +12967,7 @@ stopped AS (
         codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
         health = 'ok', health_reason = NULL, health_since = NULL,
         updated_at = now()
-    WHERE runs.id = $1 AND runs.user_id = $4
+    WHERE runs.id = $3 AND runs.user_id = $4
       AND runs.status = 'paused'
       AND runs.hold_reason = 'budget_exhausted'
       AND runs.kind = 'issue'
@@ -12969,28 +12976,38 @@ stopped AS (
       AND COALESCE(jsonb_array_length(runs.milestones_completed), 0) >= 1
     RETURNING id
 ),
+superseded AS (
+    -- Gated on EXISTS(stopped) (matching the sibling consumed_wall/scope_audit/resume_audit CTEs):
+    -- a TOCTOU where the run left the eligible state (0 stopped rows) must NOT supersede a prior
+    -- pending ` + "`" + `scope` + "`" + ` audit row, or a later finalize's disposition-settle would find nothing to
+    -- settle. Computed AFTER ` + "`" + `stopped` + "`" + ` so it can reference it. Postgres runs every CTE against the
+    -- one pre-statement snapshot, so this never sees (and never supersedes) scope_audit's new row.
+    UPDATE run_user_inputs SET disposition = 'superseded'
+    WHERE run_user_inputs.run_id = $3 AND run_user_inputs.kind = 'scope' AND run_user_inputs.disposition IS NULL
+      AND EXISTS (SELECT 1 FROM stopped)
+),
 consumed_wall AS (
     UPDATE run_user_inputs u SET consumed_at = now()
-    WHERE u.run_id = $1 AND u.kind = 'pause' AND u.body = 'wall' AND u.consumed_at IS NULL
+    WHERE u.run_id = $3 AND u.kind = 'pause' AND u.body = 'wall' AND u.consumed_at IS NULL
       AND EXISTS (SELECT 1 FROM stopped)
 ),
 scope_audit AS (
     -- sqlc.arg('id') for run_id, ` + "`" + `FROM stopped` + "`" + ` only for the row count — no bare ` + "`" + `id` + "`" + `/` + "`" + `run_id` + "`" + `
     -- collides with run_user_inputs' own columns in the INSERT scope.
     INSERT INTO run_user_inputs (run_id, kind, body)
-    SELECT $1, 'scope', $5 FROM stopped
+    SELECT $3, 'scope', $5 FROM stopped
 ),
 resume_audit AS (
     INSERT INTO run_user_inputs (run_id, kind, body)
-    SELECT $1, 'resume', NULL::text FROM stopped
+    SELECT $3, 'resume', NULL::text FROM stopped
 )
 SELECT stopped.id FROM stopped
 `
 
 type StopWallParkParams struct {
-	ID                   uuid.UUID   `json:"id"`
 	ScopeCeiling         int32       `json:"scope_ceiling"`
 	GlobalTimeoutSeconds int32       `json:"global_timeout_seconds"`
+	ID                   uuid.UUID   `json:"id"`
 	UserID               uuid.UUID   `json:"user_id"`
 	Body                 pgtype.Text `json:"body"`
 }
@@ -13016,9 +13033,9 @@ type StopWallParkParams struct {
 // response.
 func (q *Queries) StopWallPark(ctx context.Context, arg StopWallParkParams) (uuid.UUID, error) {
 	row := q.db.QueryRow(ctx, stopWallPark,
-		arg.ID,
 		arg.ScopeCeiling,
 		arg.GlobalTimeoutSeconds,
+		arg.ID,
 		arg.UserID,
 		arg.Body,
 	)

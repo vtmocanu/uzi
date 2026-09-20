@@ -102,8 +102,11 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 	// alive and speaks wall_park_v1 (the worker drops its turn and captures); ParkRunsAtWall parks the
 	// row server-side when the worker is dead, incapable, or unresponsive past the grace. Neither
 	// fails the run, so a parked row is NOT enqueued to the judge (it is not finished). ParkRunsAtWall
-	// runs BEFORE the stale-worker requeue below (D5), so a dead worker's out-of-time run parks once
-	// instead of being requeued and re-cloned only to park.
+	// is a stale-worker classification pass, so it lives in the boot-grace-gated block below (PRD #1390
+	// M1) — it must not server-park a returning worker's run on a transiently-stale heartbeat — and it
+	// runs FIRST there, BEFORE both the stale-worker fail-over-cap and requeue (D5), so a dead worker's
+	// out-of-time run parks (preserving its work) instead of being failed over cap or requeued and
+	// re-cloned only to park.
 	//
 	// worker_stale_cutoff is the SAME staleCutoff the stale-worker passes use, so "live" means exactly
 	// "not yet swept as a stale worker" — both for the #1226 carve-out (a live post-attempt run is
@@ -123,23 +126,11 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 		s.publishSwept(r.ID, r.Status)
 	}
 
-	parked, err := s.q.ParkRunsAtWall(ctx, store.ParkRunsAtWallParams{
-		Now:                  pgconv.Time(now),
-		GlobalTimeoutSeconds: int32(s.p.RunTimeout.Seconds()),
-		WorkerStaleCutoff:    staleCutoff,
-		// D11: the grace a live capable worker gets to finish its own capture before the server
-		// parks the row from under it. A fixed 10-minute constant, deliberately not a setting.
-		GraceSeconds: int32(wallParkGraceSeconds),
-	})
-	if err != nil {
-		return res, fmt.Errorf("park runs at wall: %w", err)
-	}
-	res.WallParked = int64(len(parked))
-	for _, r := range parked {
-		// The run transitioned to paused; fan the transition out. NOT enqueued to the judge —
-		// unlike the old fail-at-the-wall, a parked run is not finished.
-		s.publishSwept(r.ID, r.Status)
-	}
+	// PRD #1497 review (Fix 2): ParkRunsAtWall is the SERVER-side park — it fires precisely on a
+	// worker classified stale/incapable/unresponsive, so it belongs with the other stale-worker
+	// passes below, INSIDE the boot grace (PRD #1390 M1). RequestWallParks stays here, ungated: it
+	// only touches LIVE, capable workers (a transiently-stale returning worker cannot match it), so
+	// it is safe during grace and lets a live worker self-park.
 
 	// PRD #1226 M4 (D3): the served `budget_exhausted` steer, run RIGHT AFTER the sweep with the
 	// SAME now/global_timeout_seconds/worker_stale_cutoff, so it stamps EXACTLY the post-attempt
@@ -159,6 +150,33 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 	// failing first keeps a run that just hit the cap from being re-queued. Both are
 	// stale-worker passes, so both are suppressed inside the boot grace (PRD #1390 M1).
 	if !graceActive {
+		// PRD #1497 M1 (D5), gated by boot grace (Fix 2): server-park each past-deadline run whose
+		// worker is stale/incapable/unresponsive-past-grace. It runs FIRST in this block — BEFORE both
+		// FailRunsOfStaleWorkersOverCap and RequeueRunsOfStaleWorkers — so a dead worker's out-of-time
+		// run PARKS (preserving its work, the PRD #1497 invariant) instead of being failed over cap or
+		// requeued and re-cloned only to park. It is inside `if !graceActive` for the same reason
+		// MarkStaleWorkersOffline is: while the api is in its post-outage boot grace (PRD #1390 M1) a
+		// returning worker's last_heartbeat_at is transiently stale, and server-parking its run then
+		// would drop same-worker affinity before the worker can self-park — the exact misclassification
+		// the boot grace exists to prevent.
+		parked, err := s.q.ParkRunsAtWall(ctx, store.ParkRunsAtWallParams{
+			Now:                  pgconv.Time(now),
+			GlobalTimeoutSeconds: int32(s.p.RunTimeout.Seconds()),
+			WorkerStaleCutoff:    staleCutoff,
+			// D11: the grace a live capable worker gets to finish its own capture before the server
+			// parks the row from under it. A fixed 10-minute constant, deliberately not a setting.
+			GraceSeconds: int32(wallParkGraceSeconds),
+		})
+		if err != nil {
+			return res, fmt.Errorf("park runs at wall: %w", err)
+		}
+		res.WallParked = int64(len(parked))
+		for _, r := range parked {
+			// The run transitioned to paused; fan the transition out. NOT enqueued to the judge —
+			// unlike the old fail-at-the-wall, a parked run is not finished.
+			s.publishSwept(r.ID, r.Status)
+		}
+
 		failed, err := s.q.FailRunsOfStaleWorkersOverCap(ctx, store.FailRunsOfStaleWorkersOverCapParams{
 			FailureReason: pgconv.TextOrNull("worker lost; exceeded re-queue budget"),
 			MaxRequeues:   max,

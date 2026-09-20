@@ -62,6 +62,17 @@ func TestMapLatestRun(t *testing.T) {
 		}
 	})
 
+	t.Run("hold_reason flows to the DTO (PRD #1497 board badge)", func(t *testing.T) {
+		// The committed cases thread a null hold_reason; this pins that a non-null one (a wall park)
+		// flows through so the board badge can render "Time limit reached".
+		dto := mapLatestRun(runID, viewer, "paused", "issue", 4, false, pgtype.Int8{}, nullTxt(), nullTxt(), nullTxt(), nullTxt(), nullTxt(),
+			"ok", nullTxt(), pgtype.Timestamptz{}, txt("budget_exhausted"), pgtype.Timestamptz{}, pgtype.Int4{}, 0, 0, 0, false,
+			txt("Vlad"), nullTxt(), 1, tstamp(created), tstamp(updated), viewer, 0)
+		if dto.HoldReason == nil || *dto.HoldReason != "budget_exhausted" {
+			t.Fatalf("hold_reason should flow to the board DTO, got %v", dto.HoldReason)
+		}
+	})
+
 	t.Run("another owner's run is not mine: no email, failure_reason gated, stop_kind exposed", func(t *testing.T) {
 		otherOwner := uuid.New()
 		// A non-owner viewer of a shared board: owner_name is empty when the display

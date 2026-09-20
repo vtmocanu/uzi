@@ -465,7 +465,10 @@ func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uu
 	if maxStored > run.LastSeq {
 		// Fenced on the same predicate (PRD #1247 M5, D3): a released/reclaimed old flight must
 		// not advance last_seq, which would strand the reclaiming flight's re-emitted seqs behind
-		// a stale high-water mark. nil generation advances unconditionally (legacy).
+		// a stale high-water mark. Since PRD #1497 D16 UpdateRunLastSeq carries a STANDALONE
+		// `claim_released_at IS NULL` conjunct, so a nil generation advances only on a LIVE
+		// (unreleased) claim — a released claim is now rejected even for a generation-less (legacy)
+		// report; a live claim still honours a NULL generation.
 		if _, err := s.q.UpdateRunLastSeq(ctx, store.UpdateRunLastSeqParams{ID: runID, Seq: maxStored, ClaimGeneration: pgconv.Int8Ptr(effectiveClaimGen)}); err != nil {
 			if insertErr != nil {
 				return obs, insertErr // the insert failure is the more informative of the two

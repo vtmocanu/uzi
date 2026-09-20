@@ -4136,10 +4136,12 @@ func (s *Service) ConsumeInputs(ctx context.Context, wkr store.Worker, runID uui
 		return ConsumeInputsResult{CredentialSwitch: sig}, nil
 	}
 	if run.ClaimReleasedAt.Valid {
-		// Released-but-not-reclaimed: claim_released_at is set ONLY by ReleaseCredentialSwitch and
-		// cleared ONLY by ClaimRun, so a valid value here means exactly "a credential switch
-		// released this claim and the reclaim has not happened yet." The buffered inputs belong to
-		// that reclaim; fence the drain (no signal — the switch for this claim is already released).
+		// Released-but-not-reclaimed: claim_released_at is set by ReleaseCredentialSwitch (a credential
+		// switch released this claim) OR by ParkRunsAtWall (PRD #1497: the server parked the run at its
+		// wall limit and fenced the old flight), and cleared ONLY by ClaimRun, so a valid value here
+		// means exactly "the current flight's claim was released and the reclaim has not happened yet."
+		// Either way the buffered inputs belong to that reclaim; fence the drain (no signal — the switch
+		// for this claim, if any, is already released).
 		return ConsumeInputsResult{}, nil
 	}
 	rows, err := s.q.ConsumeRunInputs(ctx, runID)

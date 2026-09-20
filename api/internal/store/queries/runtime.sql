@@ -2936,6 +2936,17 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
 WHERE id = @id AND worker_id = @worker_id
+  -- PRD #1497 M1 (DEVIATION-3): a legacy (nil-generation, non-interlocked) `completed` from an
+  -- old flight must never complete a run the wall-park sweep just server-parked. ParkRunsAtWall
+  -- leaves the row status='paused' with claim_released_at set and KEEPS worker_id (informational),
+  -- so a stale worker_id-only completion would otherwise satisfy the guard below and walk the park
+  -- back to 'completed'. SetState's Go wrapper fences a generation-STAMPING report, but a
+  -- generation-less legacy report is honoured by that nil-guarded fence and the best-effort Go
+  -- status check in SetState is a TOCTOU — so the guard lives in SQL, mirroring SetRunRunning's
+  -- own `status <> 'paused'` exclusion. A live legacy `completed` always runs on a running,
+  -- non-released row (the interlocked path is completeRunWithPermit, fenced on its own locked row),
+  -- so this never blocks a legitimate completion.
+  AND status <> 'paused' AND claim_released_at IS NULL
   -- issue #329: a genuine worker completion (it opened the MR) supersedes a
   -- wall-clock RUN_TIMEOUT failure. Scoped to fail_origin='run_timeout' ONLY: a
   -- human 'cancelled' still wins, and a worker's own 'failed'/'worker_lost' is never
@@ -5296,11 +5307,7 @@ SELECT COALESCE((SELECT budget_extension_seconds FROM extended), 0)::int AS budg
 -- Refuses (0 rows) a non-issue kind, an interactive run, zero completed milestones, a non-budget_
 -- exhausted hold, or an allowance already granted. Returns the run id; the handler re-reads for the
 -- response.
-WITH superseded AS (
-    UPDATE run_user_inputs SET disposition = 'superseded'
-    WHERE run_user_inputs.run_id = sqlc.arg('id') AND run_user_inputs.kind = 'scope' AND run_user_inputs.disposition IS NULL
-),
-stopped AS (
+WITH stopped AS (
     -- Outer refs qualified `runs.` for the shared-scope reason above (sibling run_user_inputs CTEs).
     UPDATE runs SET
         scope_ceiling = sqlc.arg('scope_ceiling')::int,
@@ -5326,6 +5333,16 @@ stopped AS (
       AND runs.budget_finalize_seconds = 0
       AND COALESCE(jsonb_array_length(runs.milestones_completed), 0) >= 1
     RETURNING id
+),
+superseded AS (
+    -- Gated on EXISTS(stopped) (matching the sibling consumed_wall/scope_audit/resume_audit CTEs):
+    -- a TOCTOU where the run left the eligible state (0 stopped rows) must NOT supersede a prior
+    -- pending `scope` audit row, or a later finalize's disposition-settle would find nothing to
+    -- settle. Computed AFTER `stopped` so it can reference it. Postgres runs every CTE against the
+    -- one pre-statement snapshot, so this never sees (and never supersedes) scope_audit's new row.
+    UPDATE run_user_inputs SET disposition = 'superseded'
+    WHERE run_user_inputs.run_id = sqlc.arg('id') AND run_user_inputs.kind = 'scope' AND run_user_inputs.disposition IS NULL
+      AND EXISTS (SELECT 1 FROM stopped)
 ),
 consumed_wall AS (
     UPDATE run_user_inputs u SET consumed_at = now()
