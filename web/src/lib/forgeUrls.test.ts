@@ -87,7 +87,7 @@ describe("mergeRequestUrl", () => {
 describe("preferForgeUrl (D8 persisted-URL guard)", () => {
   const legacy = "https://gitlab.example.com/g/p/-/merge_requests/12";
 
-  it("uses the persisted URL when it is https (the only correct link on Forgejo)", () => {
+  it("uses the persisted URL when it is https (the forge's own canonical URL)", () => {
     expect(preferForgeUrl("https://forge.example.com/g/p/pulls/12", legacy)).toBe(
       "https://forge.example.com/g/p/pulls/12",
     );

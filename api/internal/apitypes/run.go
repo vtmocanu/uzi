@@ -366,8 +366,8 @@ type RunDTO struct {
 	MrIID        *int64     `json:"mr_iid"`
 	// MrWebURL is the forge-supplied MR/PR web URL persisted by the worker at MR
 	// creation (PRD #65 D8), null on runs created before it landed. The web renders
-	// it directly through isHttpsUrl and only falls back to the legacy GitLab URL
-	// reconstruction for those null rows — it is the only correct link on Forgejo.
+	// it directly through isHttpsUrl and falls back to a forge-aware URL
+	// reconstruction for those null rows; it is preferred as the forge's own canonical URL.
 	MrWebURL *string `json:"mr_web_url"`
 	// BranchHasActiveRun and BranchHasOpenMr are server-computed `uzi handoff rm` preconditions
 	// (issue #403 F1/F6), stamped ONLY on the owner/admin GetRun detail read for a kind='task'
