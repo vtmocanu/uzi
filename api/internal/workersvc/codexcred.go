@@ -154,10 +154,12 @@ func NewCodexReconciler(q codexCredStore, vlt *vault.Vault, box *secretbox.Box, 
 // Steps:
 //  1. Read the alias's codex_credential_state (must exist, status staging/failed) and
 //     open its stored login blob via the shared vault-open path (by id, owner-scoped).
-//  2. DiscoverIdentity — NONROTATING. On any discovery failure (incomplete identity,
-//     an auth error, a transport error) mark the state 'failed' with last_error and
-//     return, having made ZERO oauth/refresh calls. Refresh is NEVER called here: if
-//     the access token is expired the import stays failed and the user re-logs in.
+//  2. DiscoverIdentity — NONROTATING. On a PROVEN unusable credential (an incomplete
+//     identity, or a 401/403 auth rejection) mark the state 'failed' with last_error; a
+//     TRANSIENT failure (a transport error, a 429, a 5xx, an undecodable body) is left
+//     'staging' for the next sweep to retry. Either way return having made ZERO
+//     oauth/refresh calls. Refresh is NEVER called here: if the access token is expired
+//     the import stays failed and the user re-logs in.
 //  3. Reconcile by the full tuple: an existing account for the tuple is linked to
 //     (its sealed_login untouched); otherwise the login blob is sealed under the DEK
 //     and a new account (generation 0) is inserted, then linked. Linking flips the
@@ -193,9 +195,16 @@ func (r *CodexReconciler) ReconcileCodexAuthIdentity(ctx context.Context, userID
 			// A locked vault is transient — never mark failed on it, the caller retries
 			// after the next unlock (the same contract secretopen gives every opener).
 			return err
-		default:
+		case errors.Is(err, secretopen.ErrUndecryptable):
 			// Undecryptable material is terminal for this import.
 			r.markFailed(ctx, userID, userSecretID, "stored codex login could not be decrypted", st.MaterialRevision)
+			return fmt.Errorf("codex reconcile: open login: %w", err)
+		default:
+			// A transient store/lookup error (OpenByIDOfKind wraps a non-ErrNoRows lookup
+			// failure as "secretopen: lookup by id") is NOT the credential's fault: leave the
+			// alias 'staging' so the next poller sweep retries it, exactly as the discovery
+			// path does. Marking it 'failed' on a DB blip would drop it from the staging list
+			// permanently (issue #1209 review).
 			return fmt.Errorf("codex reconcile: open login: %w", err)
 		}
 	}

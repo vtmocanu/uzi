@@ -699,3 +699,53 @@ func TestReconcileCodexTransientDiscoveryStaysStagingLiveDB(t *testing.T) {
 		t.Fatalf("provider accounts = %d, want 0 for unlinked imports", n)
 	}
 }
+
+// transientOpenStore wraps the live store and forces a TRANSIENT (non-ErrNoRows) failure from
+// the by-id ciphertext lookup that OpenByIDOfKind performs, without disturbing any other query
+// (GetCodexCredentialState still hits the real DB). It proves the open path treats a store blip
+// as transient rather than terminal.
+type transientOpenStore struct {
+	codexCredStore
+	err error
+}
+
+func (s transientOpenStore) GetUserSecretCiphertextByID(context.Context, store.GetUserSecretCiphertextByIDParams) (store.GetUserSecretCiphertextByIDRow, error) {
+	return store.GetUserSecretCiphertextByIDRow{}, s.err
+}
+
+// TestReconcileCodexTransientOpenStaysStagingLiveDB (issue #1209 review): a TRANSIENT failure
+// opening the stored login — a non-ErrNoRows store/lookup error from OpenByIDOfKind, e.g. a DB
+// connection reset — must leave the alias 'staging', not 'failed'. This is the SAME
+// permanent-failure seam as the discovery path: a 'failed' alias is dropped from
+// ListStagedCodexAliases forever, so a transient blip would permanently stop account linking.
+//
+// FAILS OLD: the pre-fix open-error switch marked failed on any non-ErrNoSecret/non-ErrVaultLocked
+// error, so a transient store error flipped the alias to 'failed'.
+func TestReconcileCodexTransientOpenStaysStagingLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	userID := env.seedUser(t)
+	alias := env.seedStagingAlias(t, userID, "codex-transient-open",
+		codexLoginBlob{AccessToken: codexToken("a"), RefreshToken: codexToken("r")})
+
+	fake := newFakeCodexIdentity() // never reached: the open fails before discovery
+	q := transientOpenStore{codexCredStore: env.q, err: errors.New("read tcp: connection reset by peer")}
+	r := NewCodexReconciler(q, nil, env.box, fake, env.pool)
+
+	err := r.ReconcileCodexAuthIdentity(env.ctx, userID, alias)
+	if err == nil {
+		t.Fatal("want a transient open error, got nil")
+	}
+	st, gerr := env.q.GetCodexCredentialState(env.ctx, store.GetCodexCredentialStateParams{UserSecretID: alias, UserID: userID})
+	if gerr != nil {
+		t.Fatalf("read state: %v", gerr)
+	}
+	if st.Status != "staging" {
+		t.Fatalf("status = %q, want staging (a transient open failure must stay staging so it is re-probed)", st.Status)
+	}
+	if st.ProviderAccountID.Valid {
+		t.Fatal("a failed open must bind no provider account")
+	}
+	if fake.refreshCalls != 0 {
+		t.Fatalf("refresh counter = %d, want 0 (discovery never reached)", fake.refreshCalls)
+	}
+}

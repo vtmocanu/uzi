@@ -377,8 +377,9 @@ func TestDiscardOnAuthorityMoved(t *testing.T) {
 }
 
 // TestStagedReconcileErrorBacksOff proves a reconcile error arms the reconcile backoff so a
-// still-'staging' alias is not re-probed every tick (only a proven rejection is terminal, and
-// a terminal alias drops out of the staging listing anyway).
+// still-'staging' alias is not re-probed every tick (a proven unusable credential — a 401/403
+// or an incomplete identity — is terminal, and a terminal alias drops out of the staging
+// listing anyway).
 func TestStagedReconcileErrorBacksOff(t *testing.T) {
 	userID, alias := uuid.New(), uuid.New()
 	st := newFakeStore()

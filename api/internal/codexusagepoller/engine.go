@@ -7,9 +7,11 @@
 //  1. RECONCILE staged aliases FIRST. A freshly imported codex_auth login sits 'staging'
 //     until its identity is established; this engine is its first production caller of
 //     ReconcileCodexAuthIdentity (a NONROTATING DiscoverIdentity — it never spends a
-//     refresh). A proven auth rejection marks the alias 'failed' (terminal, no longer
-//     enumerated as staging, so not re-probed every tick); a transient failure stays
-//     'staging' and is retried under an in-memory backoff, exactly like the Claude engine.
+//     refresh). A PROVEN unusable credential — a 401/403 auth rejection, or a 2xx whose
+//     identity was incomplete — marks the alias 'failed' (terminal, no longer enumerated
+//     as staging, so not re-probed every tick); a transient failure (transport timeout,
+//     429, 5xx, undecodable body) stays 'staging' and is retried under an in-memory
+//     backoff, exactly like the Claude engine.
 //  2. POLL linked accounts. For each canonical linked account it calls the workersvc
 //     collector, whose return type carries NO token — only a normalized bucket set. A
 //     reading is written with the revision-fenced UpsertCodexAccountRateLimits; a typed
@@ -355,9 +357,9 @@ func (e *Engine) recordFailure(ctx context.Context, t pollTarget, err error) {
 }
 
 // reconcileAlias reconciles ONE staged alias under its own in-memory backoff. The reconciler
-// marks a proven auth rejection terminal ('failed'), so it drops out of the staging list and
-// is not re-probed; a transient failure stays 'staging', and the backoff keeps it from being
-// re-probed every tick (only a proven rejection is terminal).
+// marks a proven unusable credential terminal ('failed') — a 401/403 auth rejection or an
+// incomplete identity — so it drops out of the staging list and is not re-probed; a transient
+// failure stays 'staging', and the backoff keeps it from being re-probed every tick.
 func (e *Engine) reconcileAlias(ctx context.Context, userID, aliasID uuid.UUID, ignoreBackoff bool) {
 	if ignoreBackoff {
 		e.clearReconcileBackoff(aliasID)
@@ -366,8 +368,9 @@ func (e *Engine) reconcileAlias(ctx context.Context, userID, aliasID uuid.UUID, 
 	}
 	if err := e.reconciler.ReconcileCodexAuthIdentity(ctx, userID, aliasID); err != nil {
 		// Best-effort: the reconciler already recorded a terminal 'failed' status with a reason
-		// where the discovery proved the token bad; a transient failure it left 'staging'. Either
-		// way, back off so a still-staging alias is not re-probed every tick.
+		// where the credential proved unusable (a 401/403, or an incomplete identity); a transient
+		// failure it left 'staging'. Either way, back off so a still-staging alias is not re-probed
+		// every tick.
 		e.logger.Info("codex usage poller: reconcile staged alias", "user", userID.String(), "alias", aliasID.String(), "error", err.Error())
 		e.setReconcileBackoff(aliasID, defaultBackoff)
 		return
