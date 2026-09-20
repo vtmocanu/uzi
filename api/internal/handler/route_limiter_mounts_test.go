@@ -67,7 +67,13 @@ var limiterNames = [...]string{
 // error rather than a failing row. Spelled `lim*` rather than matching the parameter
 // names exactly, so nothing here shadows a parameter inside Routes.
 //
-// 202 as of this commit (issue #1432 M3 added POST /api/admin/override-requests/{id}/approve and
+// 204 as of this commit (PRD #1484 M2-B added POST /api/admin/health/snooze — the per-admin,
+// per-episode Danger-banner snooze in the admin WRITE group, cookie+CSRF, a single local
+// per-(episode, caller) upsert → noLimiter, like the release-check snooze it sits beside).
+// It was 203 until then (PRD #1484 M1 added GET /api/admin/health — the admin-health document
+// read in the admin READ group, a cache-backed read with no forge call → noLimiter, like the
+// release-check GET beside it).
+// It was 202 until then (issue #1432 M3 added POST /api/admin/override-requests/{id}/approve and
 // POST /api/admin/override-requests/{id}/reject — the admin approve/reject of a member
 // guardrail-override request. Both are cookie-only admin writes in the admin WRITE group: a DB-only
 // decision write plus, on approve, the audited per-repo override set, no forge call → noLimiter,
@@ -483,6 +489,10 @@ var wantRouteMounts = []routeMount{
 	// app_settings upsert (no egress, no forge/model spend) → noLimiter, like the
 	// release-check "Check now" above.
 	{"POST", "/api/admin/release-check/snooze", noLimiter},
+	// PRD #1484 D2: snooze the admin Danger health banner for the current episode, per
+	// admin — cookie-only admin, a single local per-(episode, caller) upsert (no egress, no
+	// forge/model spend) → noLimiter, like the release-check snooze above.
+	{"POST", "/api/admin/health/snooze", noLimiter},
 	// PRD #1184 M3: the admin "All users" FILE issue write — files a coordinate's newest open
 	// occurrence through the owner filer's forge path (claim-first → CreateIssue → settle). A
 	// forge WRITE, so it carries forgeLimiter.PerUserMiddleware like the owner

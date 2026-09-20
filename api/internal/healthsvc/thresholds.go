@@ -56,4 +56,25 @@ const (
 	// reuses workersvc's own TTL so the health check and the per-worker upgrade classifier
 	// can never disagree on freshness.
 	rollSignalTTL = workersvc.DefaultControllerSignalTTL
+
+	// controllerReportInterval is how often the controller posts its status report — the
+	// controller's CONTROLLER_POLL_INTERVAL default (controller/internal/config: 10s). The
+	// controller.report unknown band is 3 of these intervals; there is no config for it on
+	// the api side, so it is named once here rather than pulled from the wire's
+	// poll_interval_seconds (which the report may or may not carry).
+	controllerReportInterval = 10 * time.Second
+
+	// controllerReportDanger: no controller report for this long is a danger (the fleet's
+	// only fleet-independent liveness signal has gone silent). It doubles as the boot-grace
+	// window: for the first controllerReportDanger after api start with no report yet, the
+	// check is unknown rather than danger.
+	controllerReportDanger = 5 * time.Minute
+
+	// Loop-beat bands for the loops check, expressed as multiples of each loop's own tick
+	// interval (D8): a loop whose last beat is older than loopBeatDangerIntervals of its
+	// intervals is danger, older than loopBeatWarnIntervals is warn. A loop that has not
+	// beaten since registration and is younger than loopBeatWarnIntervals intervals is
+	// unknown (it has not yet had a chance to tick), not warn.
+	loopBeatWarnIntervals   = 3
+	loopBeatDangerIntervals = 10
 )

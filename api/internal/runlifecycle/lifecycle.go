@@ -105,6 +105,12 @@ type Lifecycle struct {
 	giveup   time.Duration
 	batch    int32
 
+	// beat is the admin-health loop-beat callback (PRD #1484 M2): main.go injects a
+	// func(){ registry.Beat("lifecycle") } so the `loops` health check can see this loop is
+	// still ticking. Optional and nil-safe. A plain func — this package must NOT import
+	// healthsvc.
+	beat func()
+
 	// wg tracks in-flight async Notify goroutines so shutdown can drain them
 	// before the pool closes.
 	wg sync.WaitGroup
@@ -131,6 +137,15 @@ func New(q Store, mover Mover, frontendOrigin string) *Lifecycle {
 // the repo's optional-collaborator pattern. Safe to leave unset — the lifecycle
 // then performs no Status projection.
 func (l *Lifecycle) SetProjector(p Projector) { l.projector = p }
+
+// SetBeat wires the admin-health loop-beat callback (PRD #1484 M2). Call once at startup,
+// before RunReconciler. A nil beat (the default) disables it, so tests that never wire one
+// behave exactly as before. The callback fires once per reconcile tick.
+func (l *Lifecycle) SetBeat(beat func()) { l.beat = beat }
+
+// Interval reports the reconcile cadence the loop ticks at, so main.go registers the
+// loop-beat with the effective interval (PRD #1484 M2).
+func (l *Lifecycle) Interval() time.Duration { return l.interval }
 
 // moveContext is the run + connection facts one move needs, sourced identically
 // by the notifier (GetRunMoveContext) and the reconciler (re-read per run).
@@ -522,6 +537,9 @@ func (l *Lifecycle) RunReconciler(ctx context.Context) {
 			slog.Info("run-lifecycle reconciler stopped")
 			return
 		case <-ticker.C:
+			if l.beat != nil {
+				l.beat() // admin-health loop-beat: this loop ticked (PRD #1484 M2)
+			}
 			passCtx, cancel := context.WithTimeout(ctx, l.interval)
 			l.Reconcile(passCtx)
 			cancel()
