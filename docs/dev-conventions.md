@@ -630,6 +630,13 @@ scenarios are mutually exclusive by construction. Known values:
   run title. Requires a signed-in admin user for the switch to render; the
   owner-scoped `Mine` view is unchanged (it never reads the synthetic owners).
   (PRD #1184.)
+- `health-degraded`, `health-incident`, `health-silent` — the PRD #1484
+  Admin → Health tab (`/admin/health?mock=<name>`).
+  `health-degraded` serves a warn-level document (two warnings, nothing
+  blocked); `health-incident` serves a danger document AND makes the workers
+  mock return a stuck hosted fleet, so the cross-user fleet table shows the
+  blocking container and reason across owners; `health-silent` (the default too)
+  serves an all-passing document. Requires a signed-in admin. (PRD #1484.)
 
 ### What keeps the mock build current
 

@@ -10,6 +10,7 @@ import { AdminUsers } from "./pages/AdminUsers";
 import { AdminRateLimits } from "./pages/AdminRateLimits";
 import { AdminSettings } from "./pages/AdminSettings";
 import { AdminBranding } from "./pages/AdminBranding";
+import { AdminHealth } from "./pages/AdminHealth";
 import { Settings } from "./pages/Settings";
 import { AppearanceSettings } from "./pages/AppearanceSettings";
 import { RunDefaults } from "./pages/RunDefaults";
@@ -134,6 +135,8 @@ export const APP_ROUTES: AppRoute[] = [
   { path: "/admin/branding", element: <AdminBranding />, guard: "admin" },
   { path: "/admin/tool-allowlist", element: <ToolAllowlist />, guard: "admin" },
   { path: "/admin/blocked-repos", element: <AdminBlockedRepos />, guard: "admin" },
+  // PRD #1484 M4: the Admin → Health tab. LAST row (D1), guarded admin like its siblings.
+  { path: "/admin/health", element: <AdminHealth />, guard: "admin" },
 ];
 
 // withGuard wraps a page element in its guard. "public" (and the two redirects,

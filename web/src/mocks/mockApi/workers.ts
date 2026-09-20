@@ -1,7 +1,7 @@
 import type { BindMode } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
-import { mockAdminWorkers, mockWorkers } from "../data";
-import { delay } from "./shared";
+import { incidentFleetWorkers, mockAdminWorkers, mockWorkers } from "../data";
+import { delay, mockScenario } from "./shared";
 // secrets ↔ workers is the one accepted import cycle (PRD #991 D4): setWorkerBindMode
 // resolves a token label against the secrets roster, and secrets' deleteAnthropicTokenById
 // unbinds workers pinned to a deleted token. Both reads are inside function bodies and no
@@ -178,5 +178,12 @@ export const workersApi = {
     return delay({ worker: { ...w } });
   },
 
-  adminListWorkers: async () => delay({ workers: mockAdminWorkers.map((w) => ({ ...w })) }),
+  // The cross-user admin fleet the Health tab's table reads (PRD #1484 M4). Under the
+  // health-incident scenario it returns the stuck hosted fleet so the Blocking/Upgrade
+  // columns — the ones the admin list lacked before this PRD — are populated across two
+  // owners, matching the danger health document that scenario also serves.
+  adminListWorkers: async () => {
+    const rows = mockScenario() === "health-incident" ? incidentFleetWorkers() : mockAdminWorkers;
+    return delay({ workers: rows.map((w) => ({ ...w })) });
+  },
 };
