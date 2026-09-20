@@ -37,7 +37,9 @@ type CodexRateLimitBucketDTO struct {
 // account's uzi id (a client key, never the raw provider principal), the linked-alias
 // labels that name WHICH account this is, whether it is the user's default codex
 // credential, the derived status, the last successful reading time (omitempty), a stale
-// flag (omitempty — set only when a reading exists but has aged), and the nested buckets.
+// flag (omitempty — set true when a retained reading has aged past 3x the poll interval,
+// and also when polling is disabled so any retained reading counts as stale), and the
+// nested buckets.
 //
 // status is a CLOSED set derived server-side (M3), never re-derived by a client:
 //
