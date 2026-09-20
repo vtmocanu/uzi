@@ -2146,7 +2146,8 @@ export interface Run {
   mr_iid: number | null;
   /** Forge-supplied MR/PR web URL persisted by the worker at creation (PRD #65 D8),
    *  null on runs created before it landed. Rendered directly through isHttpsUrl; a
-   *  null falls back to the legacy GitLab reconstruction (forgeUrls.ts). */
+   *  null falls back to a forge-aware reconstruction (forgeUrls.ts) that picks the
+   *  path segment per forge_type. */
   mr_web_url: string | null;
   /** Forge-supplied issue web URL (PRD #411), null for issue-less runs or when the
    *  issue is no longer cached. Rendered through isHttpsUrl into the #<iid> link. */
