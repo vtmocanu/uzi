@@ -43,7 +43,7 @@ type userSettingsDTO struct {
 	MrReworkEnabled *bool    `json:"mr_rework_enabled"`
 	SidebarTokenIds []string `json:"sidebar_token_ids"`
 	// SidebarCodexAccountIds lists the LINKED Codex subscription accounts the user
-	// surfaced on the sidebar rail (PRD #1209 M1, 00238) — the codex sibling of
+	// surfaced on the sidebar rail (PRD #1209 M1, 00239) — the codex sibling of
 	// SidebarTokenIds. The default account always shows and is never listed here; empty
 	// means default-only. Populated from the stored uuid[] via uuidStrings, so a NULL
 	// column reads as [] (never null), and pruned of stale ids on the GET path.

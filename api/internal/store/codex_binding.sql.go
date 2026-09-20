@@ -77,7 +77,7 @@ SET generation           = generation + 1,
     -- PRD #1209 M1: a commit advances the generation with a verified new login, which is
     -- exactly the "the account is healthy again" signal a pending reauth flag waits for —
     -- so clear it (and its observation counters) in the SAME statement. Clearing it
-    -- unconditionally keeps the 00238 coherence CHECK satisfied (reauth_required=false
+    -- unconditionally keeps the 00239 coherence CHECK satisfied (reauth_required=false
     -- needs no counters) and is a no-op when no reauth was pending.
     reauth_required            = false,
     reauth_generation          = NULL,
@@ -499,7 +499,7 @@ SET sealed_login         = $1,
     -- PRD #1209 M1: promoting recovery material installs a re-verified login and advances
     -- the generation, so any pending reauth flag is satisfied — clear it (and its
     -- observation counters) atomically, same as CommitCodexRefresh. Unconditional so the
-    -- 00238 coherence CHECK holds and it is a no-op when no reauth was pending.
+    -- 00239 coherence CHECK holds and it is a no-op when no reauth was pending.
     reauth_required            = false,
     reauth_generation          = NULL,
     reauth_credential_revision = NULL,
@@ -623,7 +623,7 @@ SET sealed_login         = $1,
     -- CHECK (23514) on this install.
     recovery_sealed_with = NULL,
     -- PRD #1209 M1: a verified re-login clears any pending reauth flag atomically with the
-    -- generation advance. Unconditional so the 00238 coherence CHECK holds; a no-op on the
+    -- generation advance. Unconditional so the 00239 coherence CHECK holds; a no-op on the
     -- quarantined arm when no reauth was pending.
     reauth_required            = false,
     reauth_generation          = NULL,

@@ -52,7 +52,7 @@ func addLinkedAlias(ctx context.Context, t *testing.T, pool *pgxpool.Pool, q *st
 	return secret
 }
 
-// TestCodexAccountRateLimitsFKLiveDB pins 00238's table shape: the composite FK rejects a
+// TestCodexAccountRateLimitsFKLiveDB pins 00239's table shape: the composite FK rejects a
 // cross-owner snapshot insert, and ON DELETE CASCADE removes the snapshot when the account
 // is deleted.
 func TestCodexAccountRateLimitsFKLiveDB(t *testing.T) {

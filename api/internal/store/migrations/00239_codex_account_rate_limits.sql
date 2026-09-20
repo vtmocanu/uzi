@@ -6,10 +6,10 @@
 -- statement is ADDITIVE and safe for an N-1 worker during a rolling release: a worker
 -- that never touches the new table or columns keeps working.
 --
--- NOTE (goose numbering): drafted as 00238 — the next free number above the live head
+-- NOTE (goose numbering): drafted as 00239 — the next free number above the live head
 -- (00237) at drafting time — and renumbered above the live head at landing via
 -- `task migration:renumber` if another migration lands first, per the CLAUDE.md
--- convention. Its sibling 00239 (VALIDATE) must stay immediately after it.
+-- convention. Its sibling 00240 (VALIDATE) must stay immediately after it.
 
 -- The per-account rate-limit snapshot, keyed on the CANONICAL account, not the alias:
 -- the meters Codex reports are properties of the subscription ACCOUNT (like
@@ -84,7 +84,7 @@ ALTER TABLE codex_provider_account ADD COLUMN reauth_credential_revision BIGINT;
 -- Coherence: when reauth is required the two observation counters MUST both be present, so
 -- a reader (and the atomic-clear WHERE in RefreshCodexAccountLogin) can trust them. Added
 -- NOT VALID (enforced for new/updated rows immediately; the backlog scan deferred to
--- 00239's VALIDATE CONSTRAINT), the lock-cheap two-step 00226/00227 established for a
+-- 00240's VALIDATE CONSTRAINT), the lock-cheap two-step 00226/00227 established for a
 -- CHECK on a live table — an inline validated CHECK would scan every row under the ACCESS
 -- EXCLUSIVE lock the ALTER already holds. Every existing row is reauth_required=false, so
 -- the backlog satisfies it vacuously.

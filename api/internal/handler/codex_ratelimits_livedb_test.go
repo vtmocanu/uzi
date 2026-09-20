@@ -163,7 +163,7 @@ func TestCodexRateLimitsReadSurfaceLiveDB(t *testing.T) {
 	acctReauth := seedAccount(t, userA, []string{"reauth-sub"}, false)
 	seedRL(t, userA, acctReauth, buckets(10), now, now) // a fresh reading reauth must OVERRIDE
 	// reauth_required=true requires the observed (generation, credential_revision) set too
-	// (codex_provider_account_reauth_coherence, 00238).
+	// (codex_provider_account_reauth_coherence, 00239).
 	mustExecT(ctx, t, pool, `UPDATE codex_provider_account
 		SET reauth_required = true, reauth_generation = 0, reauth_credential_revision = 0 WHERE id = $1`, acctReauth)
 

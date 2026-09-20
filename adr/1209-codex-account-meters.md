@@ -100,7 +100,7 @@ existing reconciler only repaired a **quarantined** account, not this case.
 A fresh same-account re-login could then silently link back to the same dead
 canonical blob.
 
-Migration `00238` adds three columns to `codex_provider_account`:
+Migration `00239` adds three columns to `codex_provider_account`:
 `reauth_required BOOLEAN NOT NULL DEFAULT false`, `reauth_generation
 BIGINT`, and `reauth_credential_revision BIGINT`, under a `NOT VALID` CHECK
 that the two counters are populated whenever the flag is set. The poll path
@@ -148,7 +148,7 @@ the poller, not merely rejected at the write.
 
 ### One JSONB snapshot per canonical account, keyed by an owner-scoped composite FK
 
-`codex_account_rate_limits` (migration `00238`) is keyed `PRIMARY KEY
+`codex_account_rate_limits` (migration `00239`) is keyed `PRIMARY KEY
 (user_id, provider_account_id)`, with an owner-scoped composite FK to
 `codex_provider_account (user_id, id)` — the same `UNIQUE (user_id, id)`
 target `00199` cut for exactly this purpose, so a snapshot can never
@@ -163,7 +163,7 @@ login is never mistaken for extra capacity.
 ### A shared sidebar/TUI selection preference: `sidebar_codex_account_ids`
 
 Mirroring `sidebar_token_ids` (00123) on the Claude side, `users` gained a
-`sidebar_codex_account_ids uuid[]` column (migration `00238`). The account
+`sidebar_codex_account_ids uuid[]` column (migration `00239`). The account
 holding the user's current default `codex_auth` alias is always shown and
 needs no entry in the set; the column holds only the **additional** accounts
 the user opted into. Both the web sidebar and the TUI read the same

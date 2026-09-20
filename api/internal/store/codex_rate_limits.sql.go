@@ -425,7 +425,7 @@ type UpsertCodexAccountRateLimitsParams struct {
 
 // Codex per-ACCOUNT rate-limit snapshot primitives (PRD #1209 M1), STORE/SCHEMA only —
 // ships DARK. The poller (M2) writes the two revision-fenced upserts; the read surface
-// (M3) drives the owner/admin reads. Companion schema: 00238 (codex_account_rate_limits +
+// (M3) drives the owner/admin reads. Companion schema: 00239 (codex_account_rate_limits +
 // codex_provider_account.reauth_*), 00199/00200 (codex_provider_account /
 // codex_credential_state).
 // The revision-fenced SUCCESS write (PRD #1209 M1): install a fresh reading on an account,

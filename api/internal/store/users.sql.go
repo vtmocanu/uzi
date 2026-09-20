@@ -1452,7 +1452,7 @@ type SetUserSidebarCodexAccountsParams struct {
 	ID                     uuid.UUID   `json:"id"`
 }
 
-// Replaces the user's whole sidebar Codex-account set (PRD #1209 M1, 00238): the linked
+// Replaces the user's whole sidebar Codex-account set (PRD #1209 M1, 00239): the linked
 // subscription accounts whose rate meters ride the sidebar rail. The codex sibling of
 // SetUserSidebarTokens. The handler has already validated the ids to the caller's own
 // linked accounts (rejecting a well-formed non-member) and excluded the implicit default

@@ -16,7 +16,7 @@
 # base URL is a hardcoded const (an SSRF-guard decision, no env knob), so there is nothing to
 # point at a fake. Everything the handler/CLI/TUI layers can prove is already proven in
 # api/internal/handler/codex_ratelimits_livedb_test.go over the real handlers. What no lower
-# layer shows is that a snapshot row written to the REAL schema (00199/00200/00238) reaches
+# layer shows is that a snapshot row written to the REAL schema (00199/00200/00239) reaches
 # the REAL /api/me/codex-rate-limits endpoint, so one seeded snapshot -> /me remains.
 #
 # STATUS IS polling_disabled, NOT fresh: with the poller off (interval<=0) the handler's
