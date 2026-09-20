@@ -842,8 +842,8 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     );
     assert.deepStrictEqual(
       caps,
-      ["completion_interlock_v1", "recovery_archive_v1", "recovery_archive_v2", "credential_switch_v1", CODEX_HARNESS_CAPABILITY],
-      "an advertising result appends codex_harness_v1 after the always-present protocol caps (v2 by PRD #1349 M1, credential_switch_v1 by PRD #1247 M5b)",
+      ["completion_interlock_v1", "recovery_archive_v1", "recovery_archive_v2", "credential_switch_v1", "wall_park_v1", CODEX_HARNESS_CAPABILITY],
+      "an advertising result appends codex_harness_v1 after the always-present protocol caps (v2 by PRD #1349 M1, credential_switch_v1 by PRD #1247 M5b, wall_park_v1 by PRD #1497 M2)",
     );
   });
 
@@ -863,7 +863,7 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     );
     assert.deepStrictEqual(
       caps,
-      ["completion_interlock_v1", "recovery_archive_v1", "recovery_archive_v2", "credential_switch_v1"],
+      ["completion_interlock_v1", "recovery_archive_v1", "recovery_archive_v2", "credential_switch_v1", "wall_park_v1"],
       "a non-advertising result leaves the always-present protocol caps unchanged (Claude service intact)",
     );
     assert.ok(!caps?.includes(CODEX_HARNESS_CAPABILITY), "codex_harness_v1 is absent when not advertising");
@@ -875,7 +875,7 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     const caps = await advertisedCapabilities(fakeConfig());
     assert.deepStrictEqual(
       caps,
-      ["completion_interlock_v1", "recovery_archive_v1", "recovery_archive_v2", "credential_switch_v1"],
+      ["completion_interlock_v1", "recovery_archive_v1", "recovery_archive_v2", "credential_switch_v1", "wall_park_v1"],
       "an absent availability result advertises only the always-present protocol caps",
     );
   });
@@ -889,6 +889,7 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
       assert.ok(caps?.includes("recovery_archive_v1"), "recovery_archive_v1 always present");
       assert.ok(caps?.includes("recovery_archive_v2"), "recovery_archive_v2 always present (PRD #1349 M1)");
       assert.ok(caps?.includes("credential_switch_v1"), "credential_switch_v1 always present (PRD #1247 M5b)");
+      assert.ok(caps?.includes("wall_park_v1"), "wall_park_v1 always present (PRD #1497 M2)");
     }
   });
 });

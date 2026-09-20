@@ -1505,6 +1505,28 @@ export interface CompletionPermitResponse {
   };
 }
 
+/** Request body for POST /api/worker/runs/:id/wall-park (PRD #1497 M2, D4/D15): the worker
+ *  reports it dropped its turn at the run's wall-clock deadline and captured the tree, and the
+ *  server parks the run (running → paused, hold_reason='budget_exhausted') via the fenced
+ *  SetRunWallPark whose SOLE authority is the three-term deadline. The park is CAPTURE-FIRST
+ *  (D4): a verified LOCAL capture makes the park, the publish is best-effort, and even an
+ *  unverifiable capture parks DEGRADED (head reported empty). This is a SEPARATE endpoint from
+ *  /state, not a status transition — it mirrors the completion/hold report shape. */
+export interface WallParkRequest {
+  /** The exact head the worker captured at park time (the verified tracking tip). Empty on a
+   *  DEGRADED park where the capture could not be verified after the bounded retry — the server
+   *  column is nullable and NUL-strips + TrimSpaces it, so "" reads as "no captured head". */
+  head: string;
+  /** Whether the checkpoint was published to origin. Informational for the degraded-park feed
+   *  message only — the park transition never depends on it (a verified LOCAL capture makes the
+   *  park, D4). */
+  published: boolean;
+  /** PRD #1497 M1 (D16): the claim generation the worker holds. A wall_park_v1 worker stamps it so
+   *  the fence refuses a released/superseded stale flight's reclaimed run. Optional so a legacy
+   *  worker omits it (it never advertises wall_park_v1, so the sweep parks its run server-side). */
+  claim_generation?: number;
+}
+
 /** Request body for POST /api/worker/runs/:id/findings (PRD #333 M2). The server
  *  derives (user_id, repo_id) from the run claim — the worker NEVER sends them (D2/D3).
  *  `location` is a symbol-anchored, repo-root-relative coordinate with NO line number
@@ -2159,6 +2181,15 @@ export interface StateAck {
    *  server, an unparseable body, or a 4xx recognised as already-terminal by its
    *  text. Undefined must always be treated as "not parked". */
   status?: string;
+  /** PRD #1497 M2: the run's `hold_reason` after the report, read off the SAME `{run: RunDTO}`
+   *  body as `status` (the DTO's `hold_reason` field). It is the ONLY signal that distinguishes a
+   *  SERVER-side wall park (status `paused` + hold_reason `budget_exhausted`) from every other
+   *  fenced/superseded stale-claim ACK: the reportState closure throws a distinct
+   *  ServerWallParkedError on that pair, AHEAD of StaleClaimError, so a fenced-out flight whose
+   *  run the sweep already parked at the wall ends non-terminal (clone + HOME retained) instead of
+   *  a plain stop. null/absent (older server, an unparseable body, a run with no hold) leaves it
+   *  undefined, treated as "no hold" — the safe default. */
+  holdReason?: string | null;
   /** The server-computed effective per-run budget (PRD #122 M2, Decisions 5/5b), read
    *  off the SAME `{run: RunDTO}` body as `status`. `budgetMaxIterations` is the scaled
    *  total implement/review turn ceiling; `budgetWallSeconds` is the effective wall clock

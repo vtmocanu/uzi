@@ -39,7 +39,8 @@ import type {
 import { CodexAdviceHarness } from "../src/codex/codex-advice-harness.js";
 import { makeRedactor, makeTextRedactor } from "../src/redact.js";
 import type { CodexNotification, CodexTransport } from "../src/codex/transport.js";
-import type { RunContext, EmittedMessage, Executor } from "../src/executor.js";
+import type { RunContext, EmittedMessage, Executor, WallParkOutcome } from "../src/executor.js";
+import { PauseNowSignal } from "../src/steering.js";
 import type { Logger } from "../src/log.js";
 import type { AgentTemplate } from "../src/protocol.js";
 import type { BoundaryRequest } from "../src/harness.js";
@@ -865,6 +866,115 @@ describe("CodexExecutor: run() control flow (run-lane precedence)", () => {
     controller.abort();
     await assert.rejects(withTimeout(running, 3000, "cancel shell trip"), /run cancelled/);
     assert.equal(shellObservedAbort, true);
+  });
+});
+
+// ================================================================================
+// PRD #1497 M2 — the Codex harness parks at the wall (D2). onCancel reads ctx.signal.reason: a
+// PauseNowSignal trips REASON_PAUSE (not REASON_CANCEL). A `wall` PauseNowSignal (getPauseMode()
+// === 'wall') and the own wall timer's REASON_WALL both route to the capture-first wall park
+// (ctx.parkForWall). An ordinary owner now/milestone pause on a Codex run keeps today's behaviour
+// (the run cancels — Codex owner-pause is out of scope, PRD #1190). Codex does NOT enter the
+// completion-attempt interlock, so its wall trip ALWAYS parks (no D14 race). Tests cover BOTH trips
+// in BOTH the plan turn and the implement turn.
+describe("CodexExecutor: wall park (PRD #1497 M2)", () => {
+  // Wire the wall-park seams onto a ctx: a mutable pause mode (read by pauseModeRequested), a
+  // parkForWall spy returning a configurable outcome, and a clearWallMode spy.
+  function wallCtx(
+    overrides: Partial<RunContext> = {},
+  ): {
+    ctx: RunContext;
+    spies: { parkForWallCalls: number; outcome: WallParkOutcome; mode: "now" | "wall" | null; clearWallModeCalls: number };
+    emitted: EmittedMessage[];
+  } {
+    const spies = { parkForWallCalls: 0, outcome: "parked" as WallParkOutcome, mode: null as "now" | "wall" | null, clearWallModeCalls: 0 };
+    const { ctx, emitted } = makeCtx({
+      pauseModeRequested: () => spies.mode,
+      clearWallMode: () => {
+        spies.clearWallModeCalls++;
+        spies.mode = null;
+      },
+      parkForWall: async () => {
+        spies.parkForWallCalls++;
+        return spies.outcome;
+      },
+      ...overrides,
+    });
+    return { ctx, spies, emitted };
+  }
+
+  it("(implement) a `wall` PauseNowSignal trips REASON_PAUSE not REASON_CANCEL and reaches the wall park", async () => {
+    const controller = new AbortController();
+    const rig = makeRig();
+    rig.transport.push(threadStarted()); // the turn is in progress; no terminal, so we abort it
+    const { ctx, spies } = wallCtx({ signal: controller.signal });
+    spies.mode = "wall";
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    await tick();
+    controller.abort(new PauseNowSignal());
+    const result = await withTimeout(running, 3000, "codex implement wall pause");
+    // The run PARKED (walled) rather than cancelling — proving REASON_PAUSE (not REASON_CANCEL) was
+    // tripped AND the wall seam was reached. A REASON_CANCEL trip would have rejected /run cancelled/.
+    assert.deepStrictEqual(result.walled, { reason: "codex run wall-clock timeout" }, "the Codex run parked at the wall");
+    assert.equal(spies.parkForWallCalls, 1, "the `wall` pause reached the wall park");
+  });
+
+  it("(implement) an ordinary `now` pause does NOT route to the wall seam (Codex owner-pause is out of scope — the run cancels)", async () => {
+    const controller = new AbortController();
+    const rig = makeRig();
+    rig.transport.push(threadStarted());
+    const { ctx, spies } = wallCtx({ signal: controller.signal });
+    spies.mode = "now"; // an ordinary owner pause, NOT a wall park
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    await tick();
+    controller.abort(new PauseNowSignal());
+    await assert.rejects(withTimeout(running, 3000, "codex now pause"), /run cancelled/);
+    assert.equal(spies.parkForWallCalls, 0, "an ordinary now pause NEVER reaches the wall seam on a Codex run");
+  });
+
+  it("(implement) a local REASON_WALL (the own wall timer) reaches the wall park", async () => {
+    const rig = makeRig();
+    rig.deps = { ...rig.deps, idleMs: 1000, wallMs: 20 };
+    rig.transport.push(threadStarted()); // go quiet; the 20ms wall timer trips before any terminal
+    const { ctx, spies } = wallCtx();
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "codex implement wall timer");
+    assert.deepStrictEqual(result.walled, { reason: "codex run wall-clock timeout" }, "the own wall timer parked the run");
+    assert.equal(spies.parkForWallCalls, 1, "the local REASON_WALL reached the wall park");
+  });
+
+  it("(plan) a `wall` PauseNowSignal during the plan turn reaches the wall park", async () => {
+    const controller = new AbortController();
+    const rig = makeRig();
+    rig.transport.push(threadStarted());
+    // A NON-pre-approved run runs the plan turn on epoch 0 (before any recreation), so the trip
+    // lands in the plan turn. gatePlan is never reached (the turn aborts first).
+    const { ctx, spies } = wallCtx({
+      signal: controller.signal,
+      planApproved: false,
+      approvedPlan: undefined,
+      gatePlan: async () => ({ kind: "approve", selection: { status: "absent" } }),
+    });
+    spies.mode = "wall";
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    await tick();
+    controller.abort(new PauseNowSignal());
+    const result = await withTimeout(running, 3000, "codex plan wall pause");
+    assert.deepStrictEqual(result.walled, { reason: "codex run wall-clock timeout" }, "the plan-turn wall pause parked the run");
+    assert.equal(spies.parkForWallCalls, 1, "the plan-turn `wall` pause reached the wall park");
+  });
+
+  it("(plan) a local REASON_WALL during the plan turn reaches the wall park", async () => {
+    const rig = makeRig();
+    rig.deps = { ...rig.deps, idleMs: 1000, wallMs: 20 };
+    rig.transport.push(threadStarted());
+    const { ctx, spies } = wallCtx({
+      planApproved: false,
+      approvedPlan: undefined,
+      gatePlan: async () => ({ kind: "approve", selection: { status: "absent" } }),
+    });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "codex plan wall timer");
+    assert.deepStrictEqual(result.walled, { reason: "codex run wall-clock timeout" }, "the plan-turn wall timer parked the run");
+    assert.equal(spies.parkForWallCalls, 1, "the plan-turn local REASON_WALL reached the wall park");
   });
 });
 

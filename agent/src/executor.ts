@@ -75,6 +75,15 @@ export interface EmittedMessage {
 }
 
 /**
+/**
+ * PRD #1497 M2: the outcome of a capture-first wall park ({@link RunContext.parkForWall}). See that
+ * seam's doc for the full contract. "parked"/"undeliverable" both END the flight keeping clone +
+ * HOME (never a terminal report); "refused" continues the run (the owner extended); "cancelled"
+ * ends it as a cancel.
+ */
+export type WallParkOutcome = "parked" | "undeliverable" | "refused" | "cancelled";
+
+/**
  * Everything an executor needs to work one run.
  *
  * The fields below `emit` are consumed only by the SDK executor (M3); the M2
@@ -408,7 +417,39 @@ export interface RunContext {
    * ACK's pauseRequested regressed — an ACK-independent fallback. Absent on the stub/test executors
    * ⇒ no fallback (the ACK's pauseRequested is then the sole park trigger, as before).
    */
-  pauseModeRequested?(): "milestone" | "now" | null;
+  pauseModeRequested?(): "milestone" | "now" | "wall" | null;
+  /**
+   * PRD #1497 M2: park the run at its WALL-CLOCK limit — the CAPTURE-FIRST wall park (D4), NOT
+   * handlePausePark's publish-or-stay contract. The runner's implementation reaps the agent tree,
+   * sets the preserve flags FIRST, captures a verified restore point via the SHARED captureHoldContext
+   * (WIP-commit dirty → fetch-back → positive verify → publish best-effort), then reports the wall_park
+   * transition with the captured head. A verified LOCAL capture makes the park; even an UNVERIFIABLE
+   * capture parks DEGRADED (flags stay set, clone + HOME retained, head reported empty). It NEVER
+   * reports pause_failed and NEVER continues the run on its own. Called by the implement loop when a
+   * `wall` pause aborted the turn (PauseNowSignal with getPauseMode()==='wall') or a PRE-attempt
+   * REASON_WALL fired, and at the loop-top boundary when a `wall` pause is pending. Outcomes:
+   *   - "parked"       — the server answered `paused`: the run is durably parked (the caller latches
+   *     {@link ExecutorResult.walled} and breaks; the finally preserves clone + HOME for resume).
+   *   - "undeliverable"— the wall_park report could not be delivered (server unreachable / a reclaim
+   *     404): the flight RETAINS clone + HOME, reports NOTHING terminal, and ends NON-TERMINAL like
+   *     the retained held-state park (D17). The caller latches `walled` and breaks the SAME as
+   *     "parked" — both skip finalize and keep the work; reportGenericFailure is never reached.
+   *   - "refused"      — the server answered a non-`paused`, non-cancelled status (the owner extended
+   *     in the request-then-park window): the caller clears the sticky wall mode (clearWallMode) and
+   *     RESTARTS the turn (the declined-`now` path); the wall lifts from the next reportIteration's
+   *     served total.
+   *   - "cancelled"    — the refused run's status is `cancelled`: the caller ends the run as a cancel.
+   * Absent on the stub/test executors ⇒ a wall trip has no seam and the executor falls back to the
+   * legacy behaviour (the caller treats the absent seam as "no park").
+   */
+  parkForWall?(at: { completedCount: number; total?: number }): Promise<WallParkOutcome>;
+  /**
+   * PRD #1497 M2: clear a STICKY `wall` pause mode (steering.clearWallMode). Called by the executor
+   * after a REFUSED wall_park so the sticky wall mode does not re-fire the wall seam on the next loop
+   * boundary — the owner extended, so the run continues on the (lifted) wall. Absent on the stub/test
+   * executors ⇒ inert.
+   */
+  clearWallMode?(): void;
   /**
    * PRD #1190 rework (N2): register a RE-ARMABLE interrupt (steering.onPauseNow) the steering
    * channel invokes on EVERY `now` pause, so a second `now` after a declined park still drops the
@@ -621,6 +662,14 @@ export interface ExecutorResult {
    *  (the seam is unwired, so the executor falls back to the legacy throw). StubExecutor never
    *  sets it. */
   completionHeld?: { reason: string };
+  /** PRD #1497 M2: set when the run PARKED at its WALL-CLOCK limit (ctx.parkForWall returned
+   *  "parked" or "undeliverable"). The runner reads it in phasePublish to SKIP finalization (no
+   *  push, no PR, no terminal report), exactly like `pausedAt`/`completionHeld`: the wall seam
+   *  already handled the run (a `paused` report on "parked", or NOTHING on "undeliverable", D17) and
+   *  the finally preserves clone + HOME. `reason` is the static, content-free failure-reason constant
+   *  the trip used (REASON_WALL). NOT gated on run kind (all six timed kinds park at the wall) or on
+   *  harness (both Claude and Codex). Absent on every normal completion. StubExecutor never sets it. */
+  walled?: { reason: string };
   /** PRD #1247 M5b (data-integrity fix): set when a held-state credential switch RELEASED the claim
    *  IN PLACE — `ctx.attemptCredentialSwitch` returned "released" from the implement loop, the plan
    *  gate, an ask_user question, or an interactive follow-up wait. The switch already drained the

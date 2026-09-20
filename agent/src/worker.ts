@@ -258,6 +258,13 @@ export class Worker {
           // is safe to land now. An image WITHOUT this flag keeps working on legacy claims, and the
           // held-state `set-token` verb 409s naming the worker.
           "credential_switch_v1",
+          // PRD #1497 M2 (D13): this image parks a run at its wall-clock limit instead of failing it
+          // — BOTH harnesses (Claude and Codex) drop the turn in flight, capture the tree, and report
+          // the wall_park transition. Advertised UNCONDITIONALLY: the sweep's RequestWallParks join
+          // reads 'wall_park_v1' = ANY(workers.protocol_capabilities) to decide a run's out-of-time
+          // row can be asked to park itself; an image WITHOUT it has its out-of-time run parked
+          // server-side at once (never failed), so advertising it is negotiation, not a toggle.
+          "wall_park_v1",
         ];
         // PRD #1332 D3 (M5A / C2), refined by PRD #1493 M3: advertise the Codex harness
         // PROTOCOL capability ONLY on an HONEST availability result. The old gate was the
