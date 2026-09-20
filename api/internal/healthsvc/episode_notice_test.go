@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/slacksvc"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -253,13 +254,94 @@ func TestEpisodeNotice_ServerAuthoredBody(t *testing.T) {
 	if n.Slack == nil {
 		t.Fatal("Slack render is nil; a linked admin gets no DM")
 	}
-	if len(n.Slack.Facts) != 2 {
-		t.Errorf("Slack facts = %d, want 2 (one per danger check)", len(n.Slack.Facts))
+	// The check titles/summaries ride in the Slack BODY (the notifier mrkdwn-escapes it), NOT in
+	// the Facts. The Slack body must contain the two DANGER checks' server-authored text...
+	for _, want := range []string{"Worker image roll", "4 of 4 workers stuck rolling", "Controller reporting", "not reported for 6m"} {
+		if !strings.Contains(n.Slack.Body, want) {
+			t.Errorf("Slack body missing danger-check text %q; got %q", want, n.Slack.Body)
+		}
+	}
+	// ...and NOT the WARN check's text (only danger checks are listed).
+	for _, absent := range []string{"Runs waiting for a worker", "oldest waiting 12m"} {
+		if strings.Contains(n.Slack.Body, absent) {
+			t.Errorf("Slack body contains warn-check text %q; only danger checks may appear", absent)
+		}
+	}
+	// Facts carry ONLY the CLOSED server count now (never the untrusted-carrying check text) —
+	// one fact reading the number of danger checks (2 here), matching custody_episode.
+	if len(n.Slack.Facts) != 1 {
+		t.Fatalf("Slack facts = %d, want 1 (a single CLOSED danger-check count)", len(n.Slack.Facts))
+	}
+	if !strings.Contains(n.Slack.Facts[0], "2") {
+		t.Errorf("Slack count fact = %q, want it to report the 2 danger checks", n.Slack.Facts[0])
+	}
+	for _, leaked := range []string{"Worker image roll", "Controller reporting"} {
+		if strings.Contains(n.Slack.Facts[0], leaked) {
+			t.Errorf("Slack fact %q leaks check text %q; Facts must be CLOSED server values only", n.Slack.Facts[0], leaked)
+		}
 	}
 	if n.Slack.Link != "https://uzi.example.com/admin/health" {
 		t.Errorf("Slack link = %q, want the server-built /admin/health deep link", n.Slack.Link)
 	}
 	if n.UserID != a1 {
 		t.Errorf("notice UserID = %s, want the admin %s", n.UserID, a1)
+	}
+}
+
+// (g) SECURITY (M6 audit): an owner-supplied worker name carrying Slack markup that reaches a
+// danger-check summary must render INERT in the Slack DM — no live <url|text> phishing link, no
+// bold. Worker names are owner-supplied and termsafe.Validate permits these printable ASCII markup
+// chars; safe() strips control/bidi but NOT Slack markup. The fix routes the check text through
+// the notice BODY (which the notifier renders via SlackMrkdwn — the injection-safe &<>-escaper)
+// and keeps the Facts slot (scrubbed but NOT mrkdwn-escaped) to CLOSED server values only. This
+// asserts the untrusted text left the Facts slot AND that the real SlackMrkdwn render of the body
+// neutralizes the phishing link. It FAILS against the pre-fix code, which put the raw summary in a
+// Fact and left the Slack body free of it.
+func TestEpisodeNotice_SlackMarkupInSummaryIsInert(t *testing.T) {
+	a1 := uuid.New()
+	ep := uuid.New()
+	st := &fakeEpisodeStore{open: store.GetOpenHealthEpisodeRow{ID: ep}, admins: []uuid.UUID{a1}}
+	nf := &fakeEpisodeNotifier{}
+	// A worker an owner named with Slack markup flows into the check summary (PRD D7): a live-link
+	// attempt, bold, and a backtick code chip.
+	const evil = "worker <https://evil.example|click> *urgent* `code`"
+	ev := &mutEvaluator{doc: Doc{Status: sevDanger, Checks: []apitypes.HealthCheckDTO{
+		dangerCheckDTO("fleet.roll", "Worker image roll", evil+" stuck"),
+	}}}
+	r := newNoticeReconciler(ev, st, nf, &fakeEpisodeSettings{enabled: true})
+
+	r.Reconcile(context.Background()) // episode already open ⇒ fan out
+	if len(nf.sent) != 1 {
+		t.Fatalf("notices = %d, want 1", len(nf.sent))
+	}
+	slackR := nf.sent[0].Slack
+	if slackR == nil {
+		t.Fatal("Slack render is nil; a linked admin gets no DM")
+	}
+
+	// The untrusted-carrying check text must NOT sit in a Fact: the notifier scrubs but does NOT
+	// mrkdwn-escape Facts, so a raw <url|text> there would render as a live link. (Pre-fix, the
+	// fact was "*Worker image roll*: worker <https://evil.example|click> …" — this catches a revert.)
+	for _, f := range slackR.Facts {
+		if strings.Contains(f, "evil.example") {
+			t.Fatalf("Slack Fact carries the untrusted summary %q; check text must ride in Body, not the un-escaped Facts", f)
+		}
+	}
+
+	// The check text rides in the Slack Body, so it reaches the notifier's SlackMrkdwn render — the
+	// exact escaper the notifier applies to the body. Render it here and assert it is INERT.
+	if !strings.Contains(slackR.Body, "evil.example") {
+		t.Fatalf("Slack Body does not carry the danger-check summary at all; got %q", slackR.Body)
+	}
+	rendered := slacksvc.SlackMrkdwn(slackR.Body)
+	// The hostname survives as inert text (not silently dropped)...
+	if !strings.Contains(rendered, "evil.example") {
+		t.Fatalf("SlackMrkdwn render dropped the summary entirely; got %q", rendered)
+	}
+	// ...but the live <url|text> link markup is neutralized: the raw <https://evil.example… must be
+	// gone (SlackMrkdwn escapes the angle brackets / degrades the autolink to inert text), so no
+	// clickable phishing link reaches the admin's DM.
+	if strings.Contains(rendered, "<https://evil.example") {
+		t.Errorf("SlackMrkdwn render kept a RAW <url|text> link (live phishing markup); want it neutralized. got %q", rendered)
 	}
 }

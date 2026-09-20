@@ -201,14 +201,17 @@ func (r *EpisodeReconciler) notifyAdmins(ctx context.Context, episodeID uuid.UUI
 
 // KindHealthEpisode is the notifications.kind for the per-admin Danger health-episode notice
 // (PRD #1484 M6). kind is a free-text column with no CHECK, so this needs no migration (like
-// notifysvc's other kinds and slacksvc.KindCustodyEpisode). The web inbox renderer keys off
-// this kind and reads the payload.
+// notifysvc's other kinds and slacksvc.KindCustodyEpisode). The web inbox renderer renders
+// generically from the payload's { title, body } convention and does NOT switch on this kind;
+// kind only drives its humanized-title fallback and deep-link mapping.
 const KindHealthEpisode = "health_episode"
 
 // healthEpisode copy is FIXED, server-authored text (D7). The title/body are cause-neutral
-// fixed strings; the per-check facts are built from the danger checks' ALREADY-SANITIZED
+// fixed strings; the per-check BODY lines are built from the danger checks' ALREADY-SANITIZED
 // titles/summaries (composed by Evaluate from fixed templates + closed enums + sanitized
-// identifiers) — never raw free text from kube/forge/run/worker.
+// identifiers) — never raw free text from kube/forge/run/worker. Those sanitized identifiers
+// are still not Slack-mrkdwn-escaped, so they ride in the notice BODY (which the notifier
+// escapes via SlackMrkdwn), never in the Slack Facts (which it does not).
 const (
 	healthEpisodeTitle = "Instance health needs attention"
 	healthEpisodeBody  = "One or more health checks are at danger, so uzi may not be able to run work. Open Admin > Health for the full picture and what to do."
@@ -236,34 +239,47 @@ func dangerChecks(doc Doc) []dangerCheck {
 }
 
 // buildHealthEpisodeNotification assembles the per-admin Danger notice (PRD #1484 M6, D7/D10).
-// It is PURE (no I/O) so its shape is unit-testable. The title/body are fixed cause-neutral
-// text; the body enumerates the danger checks' server-authored titles/summaries; the Slack
-// Facts carry the same, all TRUSTED (server-composed, already sanitized). The deep link is
-// server-built from the operator base URL (the /admin/health surface); an empty base yields
-// no link, matching the custody notice. User-scoped (no run/review anchor) — the episode is
-// instance-level, not per-run.
+// It is PURE (no I/O) so its shape is unit-testable. The title is fixed cause-neutral text; the
+// body is that fixed copy followed by the danger checks' server-authored titles/summaries. Those
+// summaries interpolate owner-supplied identifiers (worker names, forge repo paths — D7) that
+// safe() sanitizes (control/bidi stripped, bounded) but does NOT Slack-mrkdwn-escape, so the
+// check text rides in the notice BODY — which the notifier renders injection-safely through
+// SlackMrkdwn (&<>-escaping, so a hostile <url|text> cannot become a live link) — and NEVER in
+// the Slack Facts slot, which the notifier scrubs but does NOT mrkdwn-escape and which the
+// notifysvc contract reserves for CLOSED server values. The Slack Facts therefore carry only a
+// server-computed count, matching the custody-episode notice. The web-inbox payload body is the
+// same text (React escapes it on render). The deep link is server-built from the operator base
+// URL (the /admin/health surface); an empty base yields no link, matching the custody notice.
+// User-scoped (no run/review anchor) — the episode is instance-level, not per-run.
 func buildHealthEpisodeNotification(baseURL string, userID, episodeID uuid.UUID, danger []dangerCheck) notifysvc.Notification {
+	// Composed ONCE and shared by the web-inbox payload and the Slack DM. The untrusted-carrying
+	// check text lives here, in the BODY, so the notifier's SlackMrkdwn render neutralizes any
+	// Slack markup an owner-supplied identifier smuggled in — the Facts slot would not.
+	body := healthEpisodeBody + "\n\n" + healthEpisodeCheckLines(danger)
 	return notifysvc.Notification{
 		UserID: userID,
 		Kind:   KindHealthEpisode,
 		Payload: map[string]any{
 			"title":      healthEpisodeTitle,
-			"body":       healthEpisodeBody + "\n\n" + healthEpisodeCheckLines(danger),
+			"body":       body,
 			"episode_id": episodeID.String(),
 			"checks":     danger,
 		},
 		Slack: &notifysvc.SlackRender{
 			Emoji: "🛑",
 			Title: healthEpisodeTitle,
-			Body:  healthEpisodeBody,
+			Body:  body,
 			Link:  healthEpisodeDeepLink(baseURL),
 			Facts: healthEpisodeFacts(danger),
 		},
 	}
 }
 
-// healthEpisodeCheckLines renders the danger checks as one plain-text line each ("Title:
-// summary") for the web-inbox body. All text is server-authored and already sanitized.
+// healthEpisodeCheckLines renders the danger checks as one line each ("Title: summary") for the
+// notice body — the SINGLE slot the check text reaches on both channels: the web-inbox payload
+// (React escapes it) and the Slack DM body (the notifier's SlackMrkdwn render &<>-escapes it, so
+// the interpolated identifiers cannot smuggle a live <url|text> link). All text is server-authored
+// and already safe()-sanitized.
 func healthEpisodeCheckLines(danger []dangerCheck) string {
 	lines := make([]string, 0, len(danger))
 	for _, c := range danger {
@@ -272,17 +288,21 @@ func healthEpisodeCheckLines(danger []dangerCheck) string {
 	return strings.Join(lines, "\n")
 }
 
-// healthEpisodeFacts renders the danger checks as TRUSTED mrkdwn Facts (one per check, the
-// title bolded). All are server-built from the sanitized check titles/summaries, so the
-// `*bold*` markup is intended (Facts are ScrubSecrets'd but NOT mrkdwn-escaped by the
-// notifier). Empty is impossible in practice — the reconciler reaches here only when the
-// overall status is danger, which requires at least one danger check.
+// healthEpisodeFacts renders a single TRUSTED, CLOSED-VALUE Slack Fact: the count of danger
+// checks. It deliberately carries NO check title/summary — those interpolate owner-supplied
+// identifiers (worker names, forge repo paths — D7) and safe() does not escape Slack markup, so
+// putting them here (Facts are ScrubSecrets'd but NOT mrkdwn-escaped by the notifier) would let a
+// hostile <url|text> render as a live phishing link in an admin's DM. That text rides in the
+// notice BODY instead, where the notifier's SlackMrkdwn render neutralizes it. The count is a
+// server-computed int, so its `*bold*` chip is intended and injection-free — Facts must be CLOSED
+// per notifysvc's contract, matching custody_episode's counts-only Facts. len(danger) >= 1 in
+// practice: the reconciler reaches here only when the overall status is danger.
 func healthEpisodeFacts(danger []dangerCheck) []string {
-	facts := make([]string, 0, len(danger))
-	for _, c := range danger {
-		facts = append(facts, fmt.Sprintf("*%s*: %s", c.Title, c.Summary))
+	noun := "checks"
+	if len(danger) == 1 {
+		noun = "check"
 	}
-	return facts
+	return []string{fmt.Sprintf("*%d* danger %s", len(danger), noun)}
 }
 
 // healthEpisodeDeepLink builds the Slack DM deep link to the Admin > Health surface from the
