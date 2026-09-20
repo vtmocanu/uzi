@@ -59,6 +59,19 @@ describe("MrChip inline (meta-line surfaces)", () => {
     expect(link.textContent).toBe("!7 merged"); // state inside the link
   });
 
+  it("merged renders a louder tinted bordered chip with a check icon (Option A, PRD #1253)", () => {
+    render(<MrChip forgeType="gitlab" variant="inline" openTone="brand" mrIid={7} mrState="merged" href={HREF} />);
+    const link = screen.getByRole("link");
+    // Louder than the old colour-only treatment: bordered, rounded, ok-tinted.
+    expect(link.className).toContain("rounded");
+    expect(link.className).toContain("border-ok/40");
+    // A check icon leads the chip and is decorative (adds no text node).
+    const svg = link.querySelector("svg");
+    expect(svg).toBeTruthy();
+    expect(svg?.getAttribute("aria-hidden")).toBeTruthy();
+    expect(link.textContent).toBe("!7 merged"); // textContent unchanged by the icon
+  });
+
   it("closed is muted + struck with the state inside the accessible name", () => {
     render(<MrChip forgeType="gitlab" variant="inline" openTone="brand" mrIid={7} mrState="closed" href={HREF} />);
     const link = screen.getByRole("link");

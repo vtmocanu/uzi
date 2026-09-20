@@ -53,7 +53,7 @@ export function MrChip({
   // element so the state is part of the link/chip's accessible name.
   const body = (
     <>
-      {variant === "pill" && merged && <CheckIcon className="h-3 w-3" aria-hidden />}
+      {merged && <CheckIcon className="h-3 w-3" aria-hidden />}
       {label}
       <span className={closed ? "line-through" : undefined}>
         {mrRefSymbol(forgeType)}
@@ -81,18 +81,24 @@ export function MrChip({
     );
   }
 
-  // inline: colour only (no border). merged → ok, closed → muted, open → openTone.
-  const color = closed ? "text-muted" : merged ? "text-ok" : openTone === "brand" ? "text-brand" : "text-ok";
+  // inline: merged reads as a louder tinted BORDERED chip (Option A, PRD #1253) — same
+  // ok-token family as the pill so the two surfaces stay consistent — while open and
+  // closed stay colour-only (no border). open → openTone, closed → muted (struck).
+  const color = closed ? "text-muted" : openTone === "brand" ? "text-brand" : "text-ok";
   const hover = href
     ? closed
       ? "hover:text-fg"
-      : merged
-        ? "hover:text-ok"
-        : openTone === "brand"
-          ? "hover:text-brand-hover"
-          : "hover:text-ok"
+      : openTone === "brand"
+        ? "hover:text-brand-hover"
+        : "hover:text-ok"
     : undefined;
-  const cls = cx(color, hover, className);
+  const cls = merged
+    ? cx(
+        "inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 text-[11px] font-medium border-ok/40 bg-ok/10 text-ok",
+        href && "transition-colors hover:bg-ok/20",
+        className,
+      )
+    : cx(color, hover, className);
   return href ? (
     <a href={href} target="_blank" rel="noreferrer" title={title} className={cls}>
       {body}
