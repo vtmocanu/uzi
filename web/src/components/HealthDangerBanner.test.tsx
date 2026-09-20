@@ -11,7 +11,7 @@
 // RETURNS after the 1 h snooze lapses on a still-danger, still-open episode (D2 — the snooze
 // honours 1 h, not the whole episode), driven by the injectable `now` clock.
 import { afterEach, describe, it, expect, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 
 import { HealthDangerBanner } from "./HealthDangerBanner";
@@ -147,5 +147,41 @@ describe("HealthDangerBanner", () => {
     repoll();
     await waitFor(() => expect(banner()).not.toBeNull());
     expect(screen.getByRole("button", { name: "Snooze 1 h" })).toBeTruthy();
+  });
+
+  // The hide is time-based, so it must lapse on a TIMER, not only on the next poll. If polling
+  // stalls across the deadline (useHealthPoll keeps the last-good doc and calls no setState), an
+  // expiry timer is the only thing that can bring the banner back at the hour. Regression for a
+  // banner that stayed hidden past its snooze during a polling outage. Fails without the timer:
+  // every poll here resolves the SAME object reference, so setDoc bails and drives no re-render.
+  it("re-renders and returns when the snooze deadline passes even if no further poll updates the doc", async () => {
+    vi.useFakeTimers();
+    try {
+      const base = Date.parse("2026-09-20T00:00:00Z");
+      vi.setSystemTime(base);
+      const now = () => Date.now(); // fake-timer clock: setTimeout and now() advance together
+      const snoozedUntil = new Date(base + 3600_000).toISOString(); // server snooze, base + 1 h (D2)
+      mockApi.getAdminHealth.mockResolvedValue({ ...incidentDoc(), snoozed_until: snoozedUntil });
+
+      render(
+        <MemoryRouter>
+          <HealthDangerBanner now={now} />
+        </MemoryRouter>,
+      );
+      // Flush the initial fallback fetch; the active server snooze hides the banner.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1);
+      });
+      expect(banner()).toBeNull();
+
+      // Advance past the 1 h deadline WITHOUT delivering a new doc (the mock keeps resolving the
+      // same reference, so the 10 s poll re-renders nothing). Only the expiry timer can return it.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(3600_000 + 1000);
+      });
+      expect(banner()).not.toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

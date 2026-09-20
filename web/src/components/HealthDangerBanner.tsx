@@ -18,7 +18,7 @@
 //
 // `now` is injectable so the 1 h lapse is testable without waiting; it defaults to Date.now.
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 
 import { api } from "../lib/api";
@@ -36,6 +36,24 @@ export function HealthDangerBanner({ now = Date.now }: { now?: () => number } = 
   // snooze round-trip, and the next poll's snoozed_until confirms it.
   const [optimistic, setOptimistic] = useState<{ episode: string; until: number } | null>(null);
   const [snoozing, setSnoozing] = useState(false);
+
+  // React only re-renders on a state/prop change, but the hide below is TIME-based: without an
+  // explicit timer the banner would stay hidden past effectiveSnoozedUntil until the next thing
+  // that happens to re-render it. useHealthPoll keeps the last-good doc on a failed fetch (no
+  // setState), so across a polling outage that "next thing" can land well past the 1 h deadline
+  // and the snooze silently outlives its hour. Schedule a re-render exactly at the deadline,
+  // re-armed whenever the doc or the optimistic snooze changes, so the snooze always lapses on
+  // time (D2). forceRender's value is unused — bumping it to force the re-render is the point.
+  const [, forceRender] = useState(0);
+  useEffect(() => {
+    if (!doc || doc.status !== "danger") return;
+    const server = doc.snoozed_until != null ? Date.parse(doc.snoozed_until) : 0;
+    const local = optimistic != null && optimistic.episode === doc.episode_id ? optimistic.until : 0;
+    const delay = Math.max(server, local) - now();
+    if (delay <= 0) return;
+    const timer = setTimeout(() => forceRender((n) => n + 1), delay);
+    return () => clearTimeout(timer);
+  }, [doc, optimistic, now]);
 
   // null doc = a non-admin (no fetch) or before the first load. Follow `status` so the banner
   // appears the moment the instance crosses into danger.
