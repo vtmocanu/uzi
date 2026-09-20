@@ -22,6 +22,31 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+## [0.84.0] - 2026-09-20
+
+### Added
+
+- **Codex is now a selectable agent runtime across every run origin ([#1449](https://github.com/vtmocanu/uzi/pull/1449)).**
+  The Codex harness, previously dark, is publicly activated in one atomic step: the API, web, CLI/TUI, schedules, and chat can all point a run at Codex instead of the default runtime, and per-run cost status is presented conservatively. Completes M5B of the Codex worker phase-1 work ([#1106](https://github.com/vtmocanu/uzi/issues/1106)).
+- **Codex account rate-limit meters alongside the Claude ones ([#1480](https://github.com/vtmocanu/uzi/pull/1480)).**
+  A user's Codex account rate-limit status is now surfaced next to the existing Claude usage meters, on the web Settings and Admin rate-limits pages, in the CLI (`uzi rate-limits`), and in the TUI, backed by a poller that reads and stores each account's limits.
+- **The TUI shows a startup update prompt and a vault-locked indicator ([#1476](https://github.com/vtmocanu/uzi/pull/1476)).**
+  `uzi tui` now prompts at startup when a newer stable release is available (update now, postpone, or stop reminding), offers a direct "Update now" path on Homebrew installs, gives security releases extra emphasis, and shows an at-a-glance indicator when the per-user vault is locked.
+- **Merged-run signalling now covers helper runs, with a clearer merged chip ([#1478](https://github.com/vtmocanu/uzi/pull/1478)).**
+  MR-state tracking was broadened beyond issue runs to prompt, self-improve, CI-fix, chat, and task runs; a terminal merged or closed MR now cancels its associated rework and stops being watched; and the run's merged chip reads more clearly.
+
+### Fixed
+
+- **Undispatched task and handoff runs no longer sit queued forever ([#1477](https://github.com/vtmocanu/uzi/pull/1477)).**
+  A handoff run that was never dispatched now expires after its setup deadline and drops out of claimable work, instead of showing "waiting for a worker" indefinitely even with a healthy idle worker present.
+- **Live milestone lanes match the "now" line by agent instance, not role name ([#1479](https://github.com/vtmocanu/uzi/pull/1479)).**
+  Two similarly named agents can no longer hide each other's live activity, and the global "now" indicator stays visible for unassigned or distinct same-role agents.
+
+### Changed
+
+- **Go toolchain and dependency bumps ([#1485](https://github.com/vtmocanu/uzi/pull/1485), [#1467](https://github.com/vtmocanu/uzi/pull/1467), [#1435](https://github.com/vtmocanu/uzi/pull/1435)).**
+  Go toolchain 1.27 with golangci-lint v2.13.2 and govulncheck v1.8.0, the go-toolchain and golangci-lint Renovate bumps now grouped with a hardened lint wrapper, and the golang base-image digest refreshed.
+
 ## [0.83.1] - 2026-09-19
 
 ### Added
@@ -4049,7 +4074,8 @@ Re-ships the PRD #87 browser prebake + `web-ux` builtin (v0.11.0, rolled back to
 
 - Worker-side redaction now covers the `agent` and `kind` message fields, not just the payload and `agent_instance`/`agent_label`, closing a gap where a secret placed in either field reached the API, the WebSocket frame, the browser, and `uzi run logs` unscrubbed (PRD #108).
 
-[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.83.1...HEAD
+[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.84.0...HEAD
+[0.84.0]: https://github.com/vtmocanu/uzi/compare/v0.83.1...v0.84.0
 [0.83.1]: https://github.com/vtmocanu/uzi/compare/v0.83.0...v0.83.1
 [0.83.0]: https://github.com/vtmocanu/uzi/compare/v0.82.0...v0.83.0
 [0.82.0]: https://github.com/vtmocanu/uzi/compare/v0.81.0...v0.82.0
