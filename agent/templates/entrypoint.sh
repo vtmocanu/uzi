@@ -143,7 +143,7 @@ NIX_OWNER=runner:runner
 # token logic below reference nothing else), so the shell tests can point them at a sandbox.
 DATA_DIR=/data
 NIX_DIR=/nix
-# busybox is the canonical absolute binary in the pinned node:22-alpine (the same base whose
+# busybox is the canonical absolute binary in the pinned node:24-alpine (the same base whose
 # /bin/{chown,chmod,mkdir} the constants above resolve). Its `stat`/`cat` applets back the
 # read-only-token posture + read checks; invoked via `busybox <applet>` so the exact applet
 # symlink location does not matter.
@@ -313,12 +313,24 @@ if [ ! -f "$LEGACY_SENTINEL" ]; then
       "$CHOWN" "$RUNNER_TREE_OWNER" "$DATA_DIR/$d"
     fi
   done
+  # SYMLINK GIVE-AWAY DEFENSE (PRD #1493 M2 audit, HIGH): a legacy single-uid /data was writable
+  # by the untrusted agent uid, so a descendant of these carve-out trees may be an attacker-planted
+  # symlink (e.g. agent-home/evil -> ../repos, or -> /). A `chown -R` whose argument OR whose
+  # mid-path prefix resolves through such a link would re-own an unrelated tree — notably the
+  # worker-only bare-repo cache repos/ (the B2 code-exec surface) — to `runner`, letting the
+  # untrusted identity plant a git hook the PAT-holding worker later executes: it defeats the uid
+  # split. The kernel ALWAYS resolves mid-path components regardless of busybox chown's
+  # no-dereference default, so every descendant loop below skips a symlink entry outright (`[ -L ]`)
+  # and only ever descends REAL directories. A legitimate carve-out child / per-run HOME / epoch is
+  # always a real path; a symlink there is never something the migration needs to re-own.
+  #
   # "$DATA_DIR"/runner + /provision: re-own retained content to `runner`, preserving it. Only the
   # PARENT's CHILDREN are re-owned (the parents stay worker:runner, set just above).
   for tree in runner provision; do
     if [ -d "$DATA_DIR/$tree" ]; then
       for c in "$DATA_DIR/$tree"/* "$DATA_DIR/$tree"/.[!.]* "$DATA_DIR/$tree"/..?*; do
         [ -e "$c" ] || continue
+        [ -L "$c" ] && continue                          # never dereference an attacker-planted symlink into a chown -R
         "$CHOWN" -R runner:runner "$c"
       done
     fi
@@ -327,16 +339,19 @@ if [ ! -f "$LEGACY_SENTINEL" ]; then
   if [ -d "$DATA_DIR/agent-home" ]; then
     for home in "$DATA_DIR"/agent-home/* "$DATA_DIR"/agent-home/.[!.]* "$DATA_DIR"/agent-home/..?*; do
       [ -d "$home" ] || continue
+      [ -L "$home" ] && continue                        # a legit per-run HOME is always a REAL dir; skip a planted symlink so it can never become a mid-path prefix
       "$CHOWN" worker:runner "$home"                    # run HOME / advice-parent root STAYS worker-owned, gid runner
-      if [ -d "$home/codex-data" ]; then
+      if [ -d "$home/codex-data" ] && [ ! -L "$home/codex-data" ]; then   # only descend a REAL codex-data, never a planted symlink
         "$CHOWN" worker:runner "$home/codex-data"       # codex-data root STAYS worker:runner
         for epoch in "$home"/codex-data/* "$home"/codex-data/.[!.]* "$home"/codex-data/..?*; do
           [ -e "$epoch" ] || continue
+          [ -L "$epoch" ] && continue                   # skip a planted epoch symlink before the recursive chown
           "$CHOWN" -R runner:runner "$epoch"            # provider-owned per-epoch trees -> runner
         done
       fi
       for entry in "$home"/* "$home"/.[!.]* "$home"/..?*; do
         [ -e "$entry" ] || continue
+        [ -L "$entry" ] && continue                     # skip a planted symlink so the recursive chown never dereferences it
         case "${entry##*/}" in
           codex-data|codex-session-store) continue ;;   # codex-data handled above; store is worker-private
         esac
