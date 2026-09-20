@@ -79,6 +79,7 @@ it.
 | 5 | conflict (e.g. the run already finished) | re-read state with `uzi run get`; the action no longer applies |
 | 6 | server unreachable / 5xx, or 429 rate-limited | transient; back off and retry (a 429 carries a `Retry-After` hint in the message) |
 | 7 | a wait deadline elapsed (`run wait --timeout`) before any target state | the run is still working; re-`wait` or raise `--timeout` |
+| 8 | `uzi admin health` overall status is `danger` (or `warn`/`unknown` under `--strict`) | the instance is unhealthy — read the report; a success-path exit (HTTP 200), so a transport/auth failure keeps its own code (3/6): 8 means "unhealthy", not "could not ask" |
 
 ### Configuration and credentials
 
@@ -228,6 +229,7 @@ uzi handoff review <run-id>
 uzi admin users
 uzi admin runs
 uzi admin workers
+uzi admin health [--all] [--strict]
 uzi admin usage
 uzi admin rate-limits [--provider claude|codex]
 uzi admin cli-tokens
@@ -1340,7 +1342,7 @@ into `file`/`dismiss`. `undo` keys on the `disposition_id` field (read it from
   repo's board and run history, so it prompts `[y/N]` unless you pass
   `--force`/`-f`. A repo the bot can still see reappears (disabled) on the next
   projects refresh; to keep it out, remove the bot's forge access first.
-- `uzi admin users|runs|workers|usage|rate-limits|cli-tokens|guardrail-impact` and
+- `uzi admin users|runs|workers|health|usage|rate-limits|cli-tokens|guardrail-impact` and
   `uzi admin agent-source get|status` —
   **read-only** factory-wide views. These require an admin-scoped (`uza_`) token; a
   default token gets exit 3. There are no admin write verbs — those stay cookie-only
@@ -1356,6 +1358,18 @@ into `file`/`dismiss`. `undo` keys on the `disposition_id` field (read it from
   per-user Codex view grouped by user, one row per `(account, bucket)`
   (`EMAIL`/`VAULT`/`ACCOUNT`/`STATUS`/`BUCKET`/`PRIMARY`/`SECONDARY`/`RESET`), with a
   no-reading window shown as `—`.
+- `uzi admin health` (PRD #1484) — the instance health document: a closed registry of
+  checks over what uzi knows about itself (worker rolls, queue and capacity, the
+  controller report, background loops, the database, integrations, housekeeping), a
+  verdict and a per-severity tally. By default it prints only the checks needing
+  attention (not `ok`, not `na`); `--all` lists every check; `--json` emits the endpoint's
+  document unchanged. **Exit code, for a cron probe:** 0 unless the overall status is
+  `danger`, then **8**; `--strict` also exits 8 on `warn` or `unknown`. Exit 8 is a
+  **success-path** exit (HTTP 200 carrying an unhealthy verdict), so the full report prints
+  first and a transport/auth failure keeps its own code — 8 means "unhealthy", 3/6 means
+  "could not ask". `uzi admin workers` now carries the same roll health per worker
+  (`VERSION`, `UPGRADE`, `BLOCKING`), cross-user, so an admin can see which owner's fleet is
+  stuck rolling and why.
 - `uzi admin review backlog|stats` (PRD #1184) — the read-only admin **"All users"**
   judge aggregate: every user's recommendations deduped by `(category, target)` across
   the whole factory, with **attribution hidden**. `backlog` prints one line per group as

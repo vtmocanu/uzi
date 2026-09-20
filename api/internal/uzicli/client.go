@@ -203,6 +203,12 @@ type Client interface {
 	AdminListUsers(ctx context.Context) ([]apitypes.UserDTO, error)
 	AdminListRuns(ctx context.Context) ([]apitypes.RunListItemDTO, error)
 	AdminListWorkers(ctx context.Context) ([]apitypes.AdminWorkerDTO, error)
+	// AdminHealth reads the admin health document (PRD #1484 M3): GET
+	// /api/admin/health, in the admin READ group (RequireUser + RequireAdminRO), so a
+	// uza_ token reads it and a masked uzc_/non-admin session is a 403 (exit 3). The
+	// full closed check registry plus an overall verdict; `uzi admin health` exits 8
+	// when that verdict is danger (or warn/unknown under --strict), a success-path exit.
+	AdminHealth(ctx context.Context) (apitypes.HealthDocDTO, error)
 	AdminListCLITokens(ctx context.Context) ([]apitypes.AdminCLITokenDTO, error)
 	AdminUsage(ctx context.Context) (apitypes.AdminUsageDTO, error)
 	AdminRateLimits(ctx context.Context) ([]apitypes.AdminRateLimitRowDTO, error)
