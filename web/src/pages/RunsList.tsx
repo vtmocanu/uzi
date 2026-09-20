@@ -391,20 +391,27 @@ export function RunRow({
             <span>· {new Date(run.updated_at).toLocaleString()}</span>
             {duration && <span className="font-mono tabular-nums">· {duration}</span>}
             {run.mr_iid != null && (
-              <MrChip
-                variant="inline"
-                label={`· ${mrAbbrev(run.forge_type)} `}
-                forgeType={run.forge_type}
-                mrIid={run.mr_iid}
-                mrState={mrState}
-                href={mrHref}
-                // Issue #485 review FIX 1: raised above the card's stretched-link overlay
-                // (relative z-10) so its native `title` fires on hover AND so the chip is
-                // independently clickable — clicking it opens the PR/MR on the forge in a
-                // new tab (`target="_blank"`), while clicking elsewhere on the card follows
-                // the stretched link to the run detail view (issue #803).
-                className="relative z-10 font-medium"
-              />
+              // The "· " separator lives OUTSIDE MrChip (issue #1253): the inline merged
+              // chip is now a bordered box, so a dot passed through `label` would render
+              // inside the border. Mirror IssueView — keep only the "MR "/"PR " abbrev in
+              // `label`, and emit the separator as a sibling text node.
+              <span>
+                ·{" "}
+                <MrChip
+                  variant="inline"
+                  label={`${mrAbbrev(run.forge_type)} `}
+                  forgeType={run.forge_type}
+                  mrIid={run.mr_iid}
+                  mrState={mrState}
+                  href={mrHref}
+                  // Issue #485 review FIX 1: raised above the card's stretched-link overlay
+                  // (relative z-10) so its native `title` fires on hover AND so the chip is
+                  // independently clickable — clicking it opens the PR/MR on the forge in a
+                  // new tab (`target="_blank"`), while clicking elsewhere on the card follows
+                  // the stretched link to the run detail view (issue #803).
+                  className="relative z-10 font-medium"
+                />
+              </span>
             )}
             {/* PRD #40: tokens + cost join the meta line; hidden for a run with no
                 usage rows (a pre-feature run) — never a fabricated 0. A running run
