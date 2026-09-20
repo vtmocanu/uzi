@@ -2,8 +2,10 @@
 # agent/src/codex/** outside the one sanctioned supervisor launcher.
 #
 # WHAT THIS ENFORCES. Inside the Codex provider tree, raw subprocess creation is
-# confined to launcher.ts (the supervisor spawn plus the id/provision spawnSync
-# probes). Every other file in agent/src/codex/** must reach a subprocess
+# confined to two deliberately excluded seams: launcher.ts (the supervisor spawn
+# plus the id/provision spawnSync probes) and codex-capability.ts (a single
+# fixed-arg one-shot Landlock probe at worker boot -- see the exclude list below).
+# Every other file in agent/src/codex/** must reach a subprocess
 # through that seam, never by importing child_process and spawning its own -- a raw
 # spawn elsewhere escapes the supervisor/registry lifecycle and the seam boundary.
 # Shell, fileop and boundary-action processes reserve and register through it.
@@ -13,8 +15,8 @@
 # namespace-member forms (cp.spawn(...) etc.) for the names that do not collide with
 # common member methods; and (3) an aliased or namespaced child_process IMPORT itself
 # (import * as cp / import { spawn as start }), whose local name is arbitrary and so
-# escapes (1) and (2). The sanctioned launcher is `paths.exclude`d. On the
-# clean tree it is the only child_process user in agent/src/codex/**, so this rule
+# escapes (1) and (2). The two sanctioned seams are `paths.exclude`d. On the
+# clean tree they are the only child_process users in agent/src/codex/**, so this rule
 # reports ZERO findings; the same call/import in
 # e.g. broker.ts fires. `exec(...)` matches only a bare `exec` callee, and no $NS.exec
 # member pattern is used, so `regexp.exec(...)` / `str.exec(...)` never fire. Codex tests
@@ -33,7 +35,8 @@
 # an aliased `import { spawn as start } from "node:child_process"; start("x");` fires;
 # reverting returns to zero.
 # NEGATIVE CONTROL: the committed tree reports zero findings -- the only child_process
-# user is the excluded launcher, and `regexp.exec(...)` does not match.
+# users are the two excluded seams (launcher.ts and codex-capability.ts), and
+# `regexp.exec(...)` does not match.
 rules:
   - id: codex-no-direct-spawn
     languages: [typescript]
@@ -50,10 +53,15 @@ rules:
       # The gate scans `.` from the repo root, so this resolves to agent/src/codex/.
       include:
         - /agent/src/codex
-      # The only file that legitimately imports node:child_process today: the
-      # supervisor spawn plus its fixed provisioning probes.
+      # The two files that legitimately create a subprocess in agent/src/codex/**.
       exclude:
+        # The supervisor spawn plus its fixed id/provisioning spawnSync probes.
         - /agent/src/codex/launcher.ts
+        # One-shot startup Landlock probe: spawns `uzi-codex-command-sandbox --probe`
+        # with fixed args at worker boot (no untrusted input, not a registry-managed
+        # run-time command). Deliberately its own module so the spawn stays out of the
+        # no-exec codex-runtime-probe.ts (PRD #1493 M3).
+        - /agent/src/codex/codex-capability.ts
     pattern-either:
       # (1) BARE-CALLEE call forms (a destructured `import { spawn } from ...`).
       - pattern: spawn(...)
