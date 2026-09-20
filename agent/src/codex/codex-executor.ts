@@ -969,20 +969,15 @@ async function ensureCodexSharedDirectoryInner(
       // The inode we validated under O_NOFOLLOW on the held handle.
       const beforeDev = before.dev;
       const beforeIno = before.ino;
-      const tombstone = `${dir}.uzi-tomb-${randomUUID()}`; // a worker-owned sibling out of the live path
-      await fs.rename(dir, tombstone); // atomic; the held handle still refers to the moved inode
-      // Verify the moved inode matches the one we validated: a path swap between our validation
-      // and the rename must NEVER be adopted — throw and leave the tombstone quarantined.
-      const verifyHandle = await fs.open(tombstone, FS.O_RDONLY | FS.O_DIRECTORY | FS.O_NOFOLLOW);
-      try {
-        const moved = await verifyHandle.stat();
-        if (moved.dev !== beforeDev || moved.ino !== beforeIno) {
-          throw new Error("Codex shared data directory has an unexpected owner or group");
-        }
-      } finally {
-        await verifyHandle.close();
-      }
-      // Recreate the live path fresh through the strict create path.
+      // Atomically move the pre-existing dir OUT of the live path. This sibling lives in the advice
+      // parent's own directory (sdkHomeRoot/agent-home), which under supported uid-split is
+      // worker:runner 2775 — runner-group-writable — so it is only a TRANSIENT holding spot, NEVER
+      // where we recursively remove (issue #1495 CodeRabbit CWE-367: a concurrent runner could
+      // rename that path between a check and fs.rm's recursive walk).
+      const tombstone = `${dir}.uzi-tomb-${randomUUID()}`;
+      await fs.rename(dir, tombstone); // atomic same-filesystem move
+      // Recreate the live path fresh through the strict create path. The live path is now correct
+      // regardless of the tombstone's fate; the disposal below is best-effort and never throws.
       await handle.close();
       await fs.mkdir(dir, { mode: 0o2770 });
       created = true;
@@ -991,8 +986,12 @@ async function ensureCodexSharedDirectoryInner(
       if (!before.isDirectory()) {
         throw new Error("Codex shared data directory has an unexpected owner or group");
       }
-      // Best-effort removal of the quarantined tombstone (see the GUARANTEE above).
-      await fs.rm(tombstone, { recursive: true, force: true }).catch(() => undefined);
+      // Dispose of the transient tombstone SAFELY: relocate it under a worker-only-parented, 0700
+      // quarantine beneath <dataDir> and recursively remove only that private subtree; on EXDEV, a
+      // path swap, or any validation failure it is left QUARANTINED, never removed in the
+      // runner-writable parent. GUARANTEE: pre-existing content is never adopted or unsafely
+      // removed; the live path is always fresh worker:runner 2770.
+      await disposeCodexRecoveryTombstone(tombstone, dir, expect.uid, beforeDev, beforeIno);
     }
 
     // Create-only group repair (PRD #58 non-root / hosted k8s start): under a setgid
@@ -1017,6 +1016,67 @@ async function ensureCodexSharedDirectoryInner(
     }
   } finally {
     await handle.close();
+  }
+}
+
+/** Safely dispose of a recovery tombstone (issue #1495 CodeRabbit TOCTOU/CWE-367). The tombstone
+ *  sits beside the live advice parent, whose directory is runner-group-writable under supported
+ *  uid-split (worker:runner 2775), so it must NOT be recursively removed in place — a concurrent
+ *  runner could swap that path between a check and the recursive walk, and entry removal/rename
+ *  depends on the PARENT's permissions, so a 0700 dir *under* agent-home would still be swappable.
+ *  Instead relocate the tombstone into a freshly-created, validated 0700 quarantine rooted at
+ *  <dataDir> (the parent of sdkHomeRoot: root:worker, so a non-worker cannot create/rename/remove
+ *  its entries), re-verify it is the exact inode we validated, then remove ONLY that private
+ *  subtree. Best-effort and never throws (the live path is already correct); on EXDEV, an inode
+ *  mismatch (a swapped path), or a failed quarantine validation, the content is left quarantined
+ *  and never recursively removed. `workerUid` is the worker identity (expect.uid; a test seam
+ *  mirrors it so a portable test drives this under any uid). */
+async function disposeCodexRecoveryTombstone(
+  tombstone: string,
+  liveDir: string,
+  workerUid: number,
+  expectDev: number,
+  expectIno: number,
+): Promise<void> {
+  try {
+    // The recovery opt-in is used only for the two fixed advice parents, <dataDir>/agent-home/<name>,
+    // so the grandparent of the live path is <dataDir>, the worker-only root.
+    const dataRoot = path.dirname(path.dirname(liveDir));
+    const quarantine = path.join(dataRoot, `.uzi-quarantine-${randomUUID()}`);
+    await fs.mkdir(quarantine, { mode: 0o700 });
+    await fs.chmod(quarantine, 0o700); // force 0700 regardless of umask before validating
+    const qHandle = await fs.open(quarantine, FS.O_RDONLY | FS.O_DIRECTORY | FS.O_NOFOLLOW);
+    try {
+      const qs = await qHandle.stat();
+      if (!qs.isDirectory() || qs.uid !== workerUid || (qs.mode & 0o777) !== 0o700) {
+        return; // not a safe quarantine → leave the tombstone quarantined where it is.
+      }
+    } finally {
+      await qHandle.close();
+    }
+    const child = path.join(quarantine, "tomb");
+    try {
+      await fs.rename(tombstone, child); // same-filesystem atomic move; EXDEV → catch
+    } catch {
+      // Never copy across filesystems, never recursively remove in the runner-writable parent.
+      await fs.rmdir(quarantine).catch(() => undefined); // remove the (empty) quarantine only
+      return;
+    }
+    // Re-verify the moved inode is the exact one we validated: a swap of the transient tombstone
+    // path must never be recursively removed. On mismatch, leave it under the private 0700 dir.
+    const vh = await fs.open(child, FS.O_RDONLY | FS.O_DIRECTORY | FS.O_NOFOLLOW);
+    let verified = false;
+    try {
+      const moved = await vh.stat();
+      verified = moved.dev === expectDev && moved.ino === expectIno;
+    } finally {
+      await vh.close();
+    }
+    if (!verified) return; // swapped content → leave quarantined under the worker-only 0700 dir.
+    // Verified disposable content, in a subtree whose parent (<dataDir>) is not runner-writable.
+    await fs.rm(quarantine, { recursive: true, force: true });
+  } catch {
+    // Best-effort: any unexpected failure leaves the content quarantined; the live path is correct.
   }
 }
 

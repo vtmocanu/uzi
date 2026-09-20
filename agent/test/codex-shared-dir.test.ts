@@ -197,6 +197,37 @@ describe("Issue #1492: ensureCodexSharedDirectory create-only group repair (port
     }
   });
 
+  it("opt-in cleanup roots the quarantine under <dataDir>, leaving no tomb/quarantine in the runner-writable parent (issue #1495 TOCTOU)", async () => {
+    const base = await freshTmp();
+    try {
+      const parent = path.join(base, "agent-home"); // the runner-group-writable parent under uid-split
+      await makeSetgidParent(parent, uid, gA);
+      const child = path.join(parent, "codex-advice-data");
+      await fs.mkdir(child, { mode: 0o2770 });
+
+      await ensureCodexSharedDirectory(child, { uid, gid: gB }, { recreateDisposableWorkerGroupDir: true, recoverGid: gA });
+
+      // The transient tombstone must NOT be recursively removed in the runner-writable parent: it
+      // is relocated into a 0700 quarantine rooted at <dataDir> (here `base`) and removed there.
+      const parentEntries = await fs.readdir(parent);
+      assert.deepEqual(
+        parentEntries.filter((e) => e.includes(".uzi-tomb-")),
+        [],
+        "no tombstone left in the runner-writable parent (agent-home)",
+      );
+      // On the happy path the private quarantine subtree is fully removed from <dataDir>.
+      const dataRootEntries = await fs.readdir(base);
+      assert.deepEqual(
+        dataRootEntries.filter((e) => e.includes(".uzi-quarantine-")),
+        [],
+        "the private quarantine under <dataDir> is removed on the happy path",
+      );
+      assert.equal((await statOf(child)).gid, gB, "the recreated live path is grouped the expected gid");
+    } finally {
+      await fs.rm(base, { recursive: true, force: true });
+    }
+  });
+
   it("opt-in still REJECTS a dir whose gid is NOT the recoverGid (recovery does not fire)", async () => {
     const base = await freshTmp();
     try {
