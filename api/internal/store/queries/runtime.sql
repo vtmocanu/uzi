@@ -678,14 +678,18 @@ LIMIT 500;
 -- embedded worker carries max_concurrent_runs (the advertised cap, NULL when
 -- unadvertised).
 --
--- Roll health (PRD #1484 M1), LEFT JOINed exactly as ListWorkersByUser does so the
+-- Roll health (PRD #1484 M1/M2), LEFT JOINed exactly as ListWorkersByUser does so the
 -- admin fleet view and the cross-user health checks (fleet.roll, fleet.disk) can read
 -- the controller's per-worker roll signal instead of the always-null placeholder the
 -- old admin list carried. A worker with no report — every external worker, any hosted
 -- worker the controller has not reached, and the whole fleet under docker-compose where
 -- no controller runs — still lists (LEFT JOIN). observed_at is the API's own receipt
 -- time and the only freshness input; controller_reported_at is deliberately NOT
--- selected (it is display-only and must not reach a freshness classifier).
+-- selected (it is display-only and must not reach a freshness classifier). The full set
+-- of roll columns ListWorkersByUser selects — INCLUDING pod_phase and upgrading_since —
+-- is carried (M2) so AdminListWorkers' row-to-DTO mapper builds the SAME RollSignal and
+-- classifies upgrade_status/blocking fields byte-identically to GET /api/workers, rather
+-- than diverging on the INV-5 ceiling (upgrading_since) or the rolling-detail (pod_phase).
 SELECT sqlc.embed(w),
        EXISTS (
            SELECT 1 FROM runs r
@@ -701,11 +705,13 @@ SELECT sqlc.embed(w),
        u.email AS owner_email,
        rh.phase              AS roll_phase,
        rh.phase_since        AS roll_phase_since,
+       rh.pod_phase          AS roll_pod_phase,
        rh.blocking_container AS roll_blocking_container,
        rh.blocking_reason    AS roll_blocking_reason,
        rh.restart_count      AS roll_restart_count,
        rh.last_exit_code     AS roll_last_exit_code,
        rh.observed_at        AS roll_observed_at,
+       rh.upgrading_since    AS roll_upgrading_since,
        rh.worker_image_tag   AS roll_worker_image_tag
 FROM workers w
 JOIN users u ON u.id = w.user_id

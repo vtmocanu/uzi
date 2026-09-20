@@ -209,6 +209,11 @@ type CodexRefreshIntent struct {
 	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
 }
 
+type ControllerReportStatus struct {
+	ID         int16              `json:"id"`
+	ObservedAt pgtype.Timestamptz `json:"observed_at"`
+}
+
 type CustodyEpisodeNotice struct {
 	UserID     uuid.UUID          `json:"user_id"`
 	NotifiedAt pgtype.Timestamptz `json:"notified_at"`
@@ -284,6 +289,24 @@ type GuardrailOverrideRequest struct {
 	DecidedBy    pgtype.UUID        `json:"decided_by"`
 	DecidedAt    pgtype.Timestamptz `json:"decided_at"`
 	DecisionNote pgtype.Text        `json:"decision_note"`
+}
+
+type HealthBannerSnooze struct {
+	EpisodeID    uuid.UUID          `json:"episode_id"`
+	UserID       uuid.UUID          `json:"user_id"`
+	SnoozedUntil pgtype.Timestamptz `json:"snoozed_until"`
+}
+
+type HealthEpisode struct {
+	ID       uuid.UUID          `json:"id"`
+	OpenedAt pgtype.Timestamptz `json:"opened_at"`
+	ClosedAt pgtype.Timestamptz `json:"closed_at"`
+}
+
+type HealthEpisodeNotice struct {
+	EpisodeID  uuid.UUID          `json:"episode_id"`
+	UserID     uuid.UUID          `json:"user_id"`
+	NotifiedAt pgtype.Timestamptz `json:"notified_at"`
 }
 
 type HostedWorkerToken struct {
