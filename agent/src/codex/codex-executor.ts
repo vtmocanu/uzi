@@ -650,7 +650,7 @@ function buildAdviceAuthConfig(
  * here as a stable parent so a fresh per-call child directory inherits the correct
  * ownership/group without a dedicated per-advice-call preparation step.
  */
-function makeProductionLaunchAdviceRoot(homeRoot: string, authMode: CodexAppServerAuthMode): LaunchAdviceRootSeam {
+export function makeProductionLaunchAdviceRoot(homeRoot: string, authMode: CodexAppServerAuthMode): LaunchAdviceRootSeam {
   return async (spec) => {
     const id = randomUUID();
     const dataParent = path.join(homeRoot, "codex-advice-data");
@@ -860,17 +860,39 @@ type ToolTextResultLike = ReturnType<typeof asText>;
 
 /** Create one worker-owned, runner-group-accessible directory without following a
  * final symlink. The private runner-owned epoch roots live below these shared
- * directories; the credential-free store remains worker-owned beside them. */
-async function ensureCodexSharedDirectory(dir: string): Promise<void> {
+ * directories; the credential-free store remains worker-owned beside them.
+ *
+ * `expect` is a test-injection seam (production callers pass nothing, keeping the
+ * real WORKER_UID/RUNNER_UID ownership): it lets a test drive the create-only repair
+ * below under any CI uid using the test process's own uid and two of its own groups. */
+export async function ensureCodexSharedDirectory(
+  dir: string,
+  expect: { readonly uid: number; readonly gid: number } = { uid: WORKER_UID, gid: RUNNER_UID },
+): Promise<void> {
+  let created = false;
   try {
     await fs.mkdir(dir, { mode: 0o2770 });
+    created = true;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
   }
   const handle = await fs.open(dir, FS.O_RDONLY | FS.O_DIRECTORY | FS.O_NOFOLLOW);
   try {
     const before = await handle.stat();
-    if (!before.isDirectory() || before.uid !== WORKER_UID || before.gid !== RUNNER_UID) {
+    if (!before.isDirectory()) {
+      throw new Error("Codex shared data directory has an unexpected owner or group");
+    }
+    // Create-only group repair (PRD #58 non-root / hosted k8s start): under a setgid
+    // agent-home group-owned by `worker` (fsGroup:10001 on the PVC), a freshly-created dir
+    // inherits gid `worker`. The worker OWNS it and is a supplementary member of `runner`,
+    // so it may chgrp the group to RUNNER_UID while preserving the owner. Repair ONLY a dir
+    // this call just created AND verified worker-owned; NEVER an EEXISTing one (retain the
+    // deliberate check-don't-repair security stance — an existing mismatch still throws).
+    if (created && before.uid === expect.uid && before.gid !== expect.gid) {
+      await handle.chown(expect.uid, expect.gid);
+    }
+    const owned = await handle.stat();
+    if (owned.uid !== expect.uid || owned.gid !== expect.gid) {
       throw new Error("Codex shared data directory has an unexpected owner or group");
     }
     await handle.chmod(0o2770);
@@ -883,7 +905,7 @@ async function ensureCodexSharedDirectory(dir: string): Promise<void> {
   }
 }
 
-async function prepareCodexRunHome(homeRoot: string): Promise<void> {
+export async function prepareCodexRunHome(homeRoot: string): Promise<void> {
   if (!path.isAbsolute(homeRoot) || path.resolve(homeRoot) !== homeRoot || homeRoot === path.parse(homeRoot).root) {
     throw new Error("Codex run HOME must be a canonical absolute non-root path");
   }
