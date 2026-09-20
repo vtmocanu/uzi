@@ -193,6 +193,7 @@
   ],
   "current_activity": {
     "agent": "x",
+    "agent_instance": "x",
     "agent_label": "x",
     "tool": "x",
     "detail": "x",

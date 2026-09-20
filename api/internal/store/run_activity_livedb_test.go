@@ -66,7 +66,7 @@ func TestLatestToolUseForRunsLiveDB(t *testing.T) {
 	mkRun(runB, 2)
 	mkRun(runC, 3)
 
-	msg := func(runID uuid.UUID, seq int32, kind, agent, label string, payload any) {
+	msg := func(runID uuid.UUID, seq int32, kind, agent, instance, label string, payload any) {
 		t.Helper()
 		var raw []byte
 		if payload != nil {
@@ -78,15 +78,18 @@ func TestLatestToolUseForRunsLiveDB(t *testing.T) {
 		} else {
 			raw = []byte(`{}`)
 		}
-		var agentArg, labelArg any
+		var agentArg, instanceArg, labelArg any
 		if agent != "" {
 			agentArg = agent
+		}
+		if instance != "" {
+			instanceArg = instance
 		}
 		if label != "" {
 			labelArg = label
 		}
-		exec(`INSERT INTO run_messages (run_id, seq, kind, agent, agent_label, payload)
-		      VALUES ($1, $2, $3, $4, $5, $6)`, runID, seq, kind, agentArg, labelArg, raw)
+		exec(`INSERT INTO run_messages (run_id, seq, kind, agent, agent_instance, agent_label, payload)
+		      VALUES ($1, $2, $3, $4, $5, $6, $7)`, runID, seq, kind, agentArg, instanceArg, labelArg, raw)
 	}
 	toolUse := func(name string, input map[string]any) map[string]any {
 		return map[string]any{"name": name, "input": input}
@@ -94,17 +97,17 @@ func TestLatestToolUseForRunsLiveDB(t *testing.T) {
 
 	// run A: Read (seq 1) → Edit (seq 2, the newest tool_use) → a NEWER tool_result (seq 3).
 	// The tool_result must NOT win: the query filters kind='tool_use'.
-	msg(runA, 1, "tool_use", "coder", "task", toolUse("Read", map[string]any{"file_path": "api/a.go"}))
-	msg(runA, 2, "tool_use", "coder", "task", toolUse("Edit", map[string]any{"file_path": "api/b.go"}))
-	msg(runA, 3, "tool_result", "coder", "task", map[string]any{"tool_use_id": "t1", "content": "ok"})
+	msg(runA, 1, "tool_use", "coder", "", "task", toolUse("Read", map[string]any{"file_path": "api/a.go"}))
+	msg(runA, 2, "tool_use", "coder", "toolu_livedb", "task", toolUse("Edit", map[string]any{"file_path": "api/b.go"}))
+	msg(runA, 3, "tool_result", "coder", "", "task", map[string]any{"tool_use_id": "t1", "content": "ok"})
 
 	// run B: a status (seq 1) then a single tool_use (seq 2, the newest).
-	msg(runB, 1, "status", "worker", "", map[string]any{"phase": "implement iteration 1"})
-	msg(runB, 2, "tool_use", "lead", "", toolUse("Bash", map[string]any{"command": "go build ./...", "description": "build"}))
+	msg(runB, 1, "status", "worker", "", "", map[string]any{"phase": "implement iteration 1"})
+	msg(runB, 2, "tool_use", "lead", "", "", toolUse("Bash", map[string]any{"command": "go build ./...", "description": "build"}))
 
 	// run C: no tool_use at all → must return no row.
-	msg(runC, 1, "status", "worker", "", map[string]any{"phase": "implement iteration 1"})
-	msg(runC, 2, "text", "lead", "", map[string]any{"text": "thinking"})
+	msg(runC, 1, "status", "worker", "", "", map[string]any{"phase": "implement iteration 1"})
+	msg(runC, 2, "text", "lead", "", "", map[string]any{"text": "thinking"})
 
 	rows, err := q.LatestToolUseForRuns(ctx, []uuid.UUID{runA, runB, runC})
 	if err != nil {
@@ -128,6 +131,10 @@ func TestLatestToolUseForRunsLiveDB(t *testing.T) {
 	}
 	if name := payloadName(t, a.Payload); name != "Edit" {
 		t.Fatalf("run A: payload tool = %q, want Edit", name)
+	}
+	// run A's newest tool_use frame carries agent_instance: the query must return it.
+	if !a.AgentInstance.Valid || a.AgentInstance.String != "toolu_livedb" {
+		t.Fatalf("run A: agent_instance = {valid=%t, %q}, want {true, toolu_livedb}", a.AgentInstance.Valid, a.AgentInstance.String)
 	}
 
 	// run B: newest tool_use is the Bash at seq 2 (the status at seq 1 is skipped).
@@ -159,12 +166,12 @@ func TestLatestToolUseForRunsLiveDB(t *testing.T) {
 				kind = "tool_use"
 				payload = toolUse("Read", map[string]any{"file_path": "api/n.go"})
 			}
-			msg(noise, s, kind, "coder", "task", payload)
+			msg(noise, s, kind, "coder", "", "task", payload)
 		}
 	}
 	exec(`ANALYZE run_messages`)
 
-	const explainSQL = `EXPLAIN SELECT DISTINCT ON (run_id) run_id, seq, kind, agent, agent_label, payload, created_at
+	const explainSQL = `EXPLAIN SELECT DISTINCT ON (run_id) run_id, seq, kind, agent, agent_instance, agent_label, payload, created_at
 FROM run_messages
 WHERE run_id = ANY($1::uuid[])
   AND kind = 'tool_use'

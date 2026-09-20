@@ -323,8 +323,8 @@ func TestTrimPayloadNowLineParity(t *testing.T) {
 	agent := "lead"
 	label := "orig-label"
 	at := time.Unix(1700000000, 0).UTC()
-	fromFull := runactivity.FromFrame("tool_use", &agent, &label, full, at, 1)
-	fromTrimmed := runactivity.FromFrame("tool_use", &agent, &label, trimmed, at, 1)
+	fromFull := runactivity.FromFrame("tool_use", &agent, &label, nil, full, at, 1)
+	fromTrimmed := runactivity.FromFrame("tool_use", &agent, &label, nil, trimmed, at, 1)
 
 	if fromFull.Agent != fromTrimmed.Agent {
 		t.Fatalf("Agent differs: full=%q trimmed=%q", fromFull.Agent, fromTrimmed.Agent)

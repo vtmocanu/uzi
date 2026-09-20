@@ -40,15 +40,17 @@ func TestUnsafeMatchesTermsafe(t *testing.T) {
 func TestFromFrameToolFamilies(t *testing.T) {
 	at := time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
 	cases := []struct {
-		name       string
-		agent      *string
-		agentLabel *string
-		payloadIn  map[string]any
-		toolName   string
-		wantAgent  string
-		wantLabel  string
-		wantTool   string
-		wantDetail string
+		name          string
+		agent         *string
+		agentLabel    *string
+		agentInstance *string
+		payloadIn     map[string]any
+		toolName      string
+		wantAgent     string
+		wantLabel     string
+		wantTool      string
+		wantDetail    string
+		wantInstance  string
 	}{
 		{
 			name:  "read_file_path",
@@ -104,10 +106,18 @@ func TestFromFrameToolFamilies(t *testing.T) {
 			toolName: "Grep", payloadIn: map[string]any{"pattern": "TODO", "path": "api"},
 			wantAgent: "coder", wantLabel: "s", wantTool: "Grep", wantDetail: "",
 		},
+		{
+			name:  "agent_instance_passthrough",
+			agent: strptr("coder"), agentLabel: strptr("do it"),
+			agentInstance: strptr("toolu_lane1"),
+			toolName:      "Edit", payloadIn: map[string]any{"file_path": "api/a.go"},
+			wantAgent: "coder", wantLabel: "do it", wantTool: "Edit", wantDetail: "api/a.go",
+			wantInstance: "toolu_lane1",
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := FromFrame("tool_use", c.agent, c.agentLabel,
+			got := FromFrame("tool_use", c.agent, c.agentLabel, c.agentInstance,
 				mustPayload(t, c.toolName, c.payloadIn), at, 7)
 			if got == nil {
 				t.Fatal("FromFrame returned nil")
@@ -117,6 +127,9 @@ func TestFromFrameToolFamilies(t *testing.T) {
 				t.Fatalf("got {agent=%q label=%q tool=%q detail=%q}, want {agent=%q label=%q tool=%q detail=%q}",
 					got.Agent, got.AgentLabel, got.Tool, got.Detail,
 					c.wantAgent, c.wantLabel, c.wantTool, c.wantDetail)
+			}
+			if got.AgentInstance != c.wantInstance {
+				t.Errorf("got agent_instance=%q, want %q", got.AgentInstance, c.wantInstance)
 			}
 			if !got.At.Equal(at) || got.Seq != 7 {
 				t.Fatalf("got at=%v seq=%d, want at=%v seq=7", got.At, got.Seq, at)
@@ -162,7 +175,7 @@ func utf8ValidRunes(s string) bool {
 }
 
 func TestFromFrameNeverSurfacesBashCommand(t *testing.T) {
-	got := FromFrame("tool_use", strptr("coder"), strptr("run"),
+	got := FromFrame("tool_use", strptr("coder"), strptr("run"), nil,
 		mustPayload(t, "Bash", map[string]any{"command": "SECRET_TOKEN=abc rm -rf /", "description": "clean"}), time.Now(), 1)
 	if strings.Contains(got.Detail, "SECRET_TOKEN") || strings.Contains(got.Detail, "rm -rf") {
 		t.Fatalf("Bash command leaked into detail: %q", got.Detail)
@@ -206,21 +219,23 @@ func TestLatestNilWhenNoToolUse(t *testing.T) {
 // --- Golden fixture: fixtures/run-activity/cases.json ---------------------------
 
 type fixtureFrame struct {
-	Kind       string          `json:"kind"`
-	Agent      *string         `json:"agent"`
-	AgentLabel *string         `json:"agent_label"`
-	Payload    json.RawMessage `json:"payload"`
-	CreatedAt  time.Time       `json:"created_at"`
-	Seq        int32           `json:"seq"`
+	Kind          string          `json:"kind"`
+	Agent         *string         `json:"agent"`
+	AgentLabel    *string         `json:"agent_label"`
+	AgentInstance *string         `json:"agent_instance"`
+	Payload       json.RawMessage `json:"payload"`
+	CreatedAt     time.Time       `json:"created_at"`
+	Seq           int32           `json:"seq"`
 }
 
 type fixtureExpected struct {
-	Agent      string    `json:"agent"`
-	AgentLabel string    `json:"agent_label"`
-	Tool       string    `json:"tool"`
-	Detail     string    `json:"detail"`
-	At         time.Time `json:"at"`
-	Seq        int32     `json:"seq"`
+	Agent         string    `json:"agent"`
+	AgentInstance string    `json:"agent_instance"`
+	AgentLabel    string    `json:"agent_label"`
+	Tool          string    `json:"tool"`
+	Detail        string    `json:"detail"`
+	At            time.Time `json:"at"`
+	Seq           int32     `json:"seq"`
 }
 
 type fixtureCase struct {
@@ -285,11 +300,13 @@ func TestRunActivityGoldenFixture(t *testing.T) {
 				t.Fatalf("expected %+v, got null", *c.Expected)
 			}
 			want := apitypes.RunActivity{
-				Agent: c.Expected.Agent, AgentLabel: c.Expected.AgentLabel,
-				Tool: c.Expected.Tool, Detail: c.Expected.Detail,
+				Agent: c.Expected.Agent, AgentInstance: c.Expected.AgentInstance,
+				AgentLabel: c.Expected.AgentLabel,
+				Tool:       c.Expected.Tool, Detail: c.Expected.Detail,
 				At: c.Expected.At, Seq: c.Expected.Seq,
 			}
-			if got.Agent != want.Agent || got.AgentLabel != want.AgentLabel ||
+			if got.Agent != want.Agent || got.AgentInstance != want.AgentInstance ||
+				got.AgentLabel != want.AgentLabel ||
 				got.Tool != want.Tool || got.Detail != want.Detail ||
 				!got.At.Equal(want.At) || got.Seq != want.Seq {
 				t.Fatalf("case %q:\n got  %+v\n want %+v", c.Name, *got, want)

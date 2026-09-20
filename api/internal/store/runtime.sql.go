@@ -5012,7 +5012,7 @@ func (q *Queries) LatestPlanSeqForRun(ctx context.Context, runID uuid.UUID) (int
 }
 
 const latestToolUseForRuns = `-- name: LatestToolUseForRuns :many
-SELECT DISTINCT ON (run_id) run_id, seq, kind, agent, agent_label, payload, created_at
+SELECT DISTINCT ON (run_id) run_id, seq, kind, agent, agent_instance, agent_label, payload, created_at
 FROM run_messages
 WHERE run_id = ANY($1::uuid[])
   AND kind = 'tool_use'
@@ -5020,13 +5020,14 @@ ORDER BY run_id, seq DESC
 `
 
 type LatestToolUseForRunsRow struct {
-	RunID      uuid.UUID          `json:"run_id"`
-	Seq        int32              `json:"seq"`
-	Kind       string             `json:"kind"`
-	Agent      pgtype.Text        `json:"agent"`
-	AgentLabel pgtype.Text        `json:"agent_label"`
-	Payload    []byte             `json:"payload"`
-	CreatedAt  pgtype.Timestamptz `json:"created_at"`
+	RunID         uuid.UUID          `json:"run_id"`
+	Seq           int32              `json:"seq"`
+	Kind          string             `json:"kind"`
+	Agent         pgtype.Text        `json:"agent"`
+	AgentInstance pgtype.Text        `json:"agent_instance"`
+	AgentLabel    pgtype.Text        `json:"agent_label"`
+	Payload       []byte             `json:"payload"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
 }
 
 // The newest tool_use frame per run for a page of runs (PRD #1064 D3, current_activity):
@@ -5050,6 +5051,7 @@ func (q *Queries) LatestToolUseForRuns(ctx context.Context, runIds []uuid.UUID) 
 			&i.Seq,
 			&i.Kind,
 			&i.Agent,
+			&i.AgentInstance,
 			&i.AgentLabel,
 			&i.Payload,
 			&i.CreatedAt,
