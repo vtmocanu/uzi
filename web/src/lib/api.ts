@@ -456,6 +456,14 @@ const realApi = {
   // RequireAdminRO (a uza_ CLI token or an admin session); unlike release-check it returns
   // the document unwrapped. The endpoint caches one evaluation for 5s server-side.
   getAdminHealth: () => request<HealthDoc>("GET", "/admin/health"),
+  // Snooze the caller's admin Danger banner for the current health episode (PRD #1484 M5,
+  // D2). A POST through the request wrapper so the CSRF header rides along — RequireAdmin
+  // (cookie + CSRF), no CLI verb, matching "no admin write verbs" in the CLI. Returns the
+  // open episode id and the new snoozed_until; 409 when no episode is open. Called by the
+  // HealthDangerBanner's "Snooze 1 h" action; a new episode re-shows the banner because the
+  // snooze is keyed to episode_id.
+  snoozeAdminHealth: () =>
+    request<{ episode_id: string; snoozed_until: string }>("POST", "/admin/health/snooze"),
   checkReleaseNow: () =>
     request<{ release_check: ReleaseCheckStatus }>("POST", "/admin/release-check"),
   // Snooze the admin escalation banner (PRD #836 M6) for the current release: upserts

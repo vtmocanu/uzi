@@ -23,7 +23,18 @@ export const workersApi = {
   },
 
   // ── Workers ─────────────────────────────────────────────────────────────────
-  listWorkers: async () => delay({ workers: workers.map((w) => ({ ...w })) }),
+  // The owner-scoped list (GET /api/workers), NOT the admin route. Under the health-incident
+  // scenario it serves the stuck hosted fleet as the VIEWER'S OWN workers, so a non-admin
+  // demo viewer (log in as a seeded non-admin persona) sees the Overview platform line: every
+  // hosted worker they own is upgrade_failed and the demo runs include a queued one (PRD #1484
+  // M5). AdminWorker extends Worker, so the shape is compatible. Every other scenario returns
+  // the ordinary seeded fleet.
+  listWorkers: async () => {
+    if (mockScenario() === "health-incident") {
+      return delay({ workers: incidentFleetWorkers().map((w) => ({ ...w })) });
+    }
+    return delay({ workers: workers.map((w) => ({ ...w })) });
+  },
   createWorker: async (name: string, template?: string) => {
     const w = {
       id: `w-new-${++workerCounter}`,
