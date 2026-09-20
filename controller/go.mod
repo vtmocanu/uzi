@@ -22,7 +22,7 @@ go 1.26.4
 
 // The patched toolchain below carries stdlib fixes govulncheck gates on. Go
 // auto-downloads it; Renovate keeps it current while `go` remains the floor.
-toolchain go1.26.6
+toolchain go1.27.1
 
 require (
 	k8s.io/api v0.37.0

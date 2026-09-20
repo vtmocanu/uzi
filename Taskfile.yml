@@ -167,7 +167,7 @@ output: prefixed
 # command, so the resolved pin stays visible without accepting shell input.
 vars:
   # renovate: datasource=github-releases depName=golangci-lint-taskfile packageName=golangci/golangci-lint
-  GOLANGCI_LINT_VERSION: v2.12.2
+  GOLANGCI_LINT_VERSION: v2.13.2
 
 # THE TWO SANCTIONED INCLUDES (rule 3), and they are LOCAL, not remote. Both reuse
 # `./homebrew-tap.yml`, a VENDORED copy of vtmocanu/task's reusable brew mechanic (see its
@@ -1585,7 +1585,16 @@ tasks:
       #
       # THE PIN IS AN ARGUMENT so this file's echo shows it, exactly as
       # `deadcode:api` and `scan:secrets` pass theirs.
-      - ./scripts/govulncheck-gate.sh api golang.org/x/vuln/cmd/govulncheck@v1.1.4
+      #
+      # RENOVATE-TRACKED so this pin does not drift again: leaving it untracked is
+      # what let it sit at v1.1.4 while go moved to 1.27, where v1.1.4's x/tools
+      # SSA panics. depName is an alias (govulncheck-api / -controller) with a
+      # shared packageName because two identical depNames in one file dedupe --
+      # the same reason the golangci-lint tarball pins in scripts/golangci-lint.sh
+      # carry per-arch aliases. The generic version-only customManager in
+      # renovate.json matches the annotation; go datasource, semver.
+      # renovate: datasource=go depName=govulncheck-api packageName=golang.org/x/vuln
+      - ./scripts/govulncheck-gate.sh api golang.org/x/vuln/cmd/govulncheck@v1.8.0
 
   test:api:
     desc: api unit tests (-race -count=1; live-DB tests self-skip)
@@ -1785,7 +1794,9 @@ tasks:
     cmds:
       # Same script, same pin, same reasons, and the same deliberate absence from
       # `gate:controller` - read vulncheck:api's comment before editing either.
-      - ./scripts/govulncheck-gate.sh controller golang.org/x/vuln/cmd/govulncheck@v1.1.4
+      # Renovate-tracked too (alias -controller, shared packageName); see vulncheck:api.
+      # renovate: datasource=go depName=govulncheck-controller packageName=golang.org/x/vuln
+      - ./scripts/govulncheck-gate.sh controller golang.org/x/vuln/cmd/govulncheck@v1.8.0
 
   test:controller:
     desc: controller unit tests (-race -count=1)

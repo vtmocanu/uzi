@@ -7,7 +7,10 @@
 #     2 = the instrument is broken     1 = there are findings     0 = clean
 #
 # (`fmt-check:api`, `lint:api`'s pre-flight, `scripts/deadcode-gate.sh`).
-# govulncheck v1.1.4 uses, read out of its own source and then measured:
+# govulncheck uses this same contract (read out of v1.1.4's source and measured;
+# the pin is now v1.8.0, bumped for go1.27 -- v1.1.4's bundled x/tools/go/ssa
+# panics `unexpected expr: *ast.KeyValueExpr` building SSA for go1.27 syntax --
+# and the 0/3/2/1 mapping is unchanged, re-confirmed clean=0 under go1.27.1):
 #
 #     0  clean
 #     3  FINDINGS                 internal/scan/text.go, errVulnerabilitiesFound
@@ -74,7 +77,7 @@ TOOL="${2:-}"
 
 if [ -z "$MODULE_DIR" ] || [ -z "$TOOL" ]; then
   echo "usage: scripts/govulncheck-gate.sh <module-dir> <pkg@version>" >&2
-  echo "  e.g. scripts/govulncheck-gate.sh api golang.org/x/vuln/cmd/govulncheck@v1.1.4" >&2
+  echo "  e.g. scripts/govulncheck-gate.sh api golang.org/x/vuln/cmd/govulncheck@v1.8.0" >&2
   exit 2
 fi
 
