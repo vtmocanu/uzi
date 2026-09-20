@@ -41,6 +41,14 @@ func TestControllerReport(t *testing.T) {
 		{"unknown from 3 missed intervals up to 5m", true, time.Hour, ts(40 * time.Second), nil, sevUnknown, "intervals late"},
 		{"danger with no report for 5m", true, time.Hour, ts(6 * time.Minute), nil, sevDanger, "not reported for 6m"},
 		{"ok when fresh", true, time.Hour, ts(5 * time.Second), nil, sevOK, "controller is reporting"},
+		// Restart boot-grace: the singleton persists across a restart, so a stale-but-valid
+		// row whose report predates this boot must honour the same grace as the no-row path
+		// rather than falling straight to the age-based danger band.
+		{"unknown on restart within grace with a stale pre-boot report", true, 2 * time.Minute, ts(10 * time.Minute), nil, sevUnknown, "since api start"},
+		{"danger on restart past grace with a stale pre-boot report", true, 6 * time.Minute, ts(20 * time.Minute), nil, sevDanger, "not reported for 20m"},
+		// Steady state within the grace window: once a report has arrived AFTER boot the
+		// normal age bands apply, so a fresh post-boot report is ok, never spuriously unknown.
+		{"ok on restart within grace once a report arrives after boot", true, 2 * time.Minute, ts(5 * time.Second), nil, sevOK, "controller is reporting"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -98,27 +106,56 @@ func TestLoops(t *testing.T) {
 		}
 	})
 
-	t.Run("warn past 3 intervals", func(t *testing.T) {
+	t.Run("warn just past 3 intervals, ok just under", func(t *testing.T) {
+		// The warn band is inclusive at 3× the interval (age >= loopBeatWarnIntervals*interval).
+		// Hug the boundary: a beat one second PAST 3× warns, one second UNDER stays ok — so an
+		// off-by-one in loopBeatWarnIntervals (3→4 or 3→2) cannot slip through as it would at 4×.
 		clk := &mutClock{t: fixedNow}
 		reg := NewBeatRegistry(clk.now)
 		reg.Register("sweeper", interval)
-		reg.Beat("sweeper")
+		reg.Beat("sweeper") // beaten at fixedNow
 		svc := New(Config{Store: &fakeStore{}, Registry: reg})
-		c := svc.checkLoops(fixedNow.Add(4 * interval))
-		if c.Severity != sevWarn || !strings.Contains(c.Summary, "sweeper loop last ticked") {
-			t.Fatalf("got %q / %q, want warn", c.Severity, c.Summary)
+		if c := svc.checkLoops(fixedNow.Add(3*interval - time.Second)); c.Severity != sevOK || !strings.Contains(c.Summary, "All 1 background loops are ticking") {
+			t.Fatalf("just under 3×: got %q / %q, want ok", c.Severity, c.Summary)
+		}
+		if c := svc.checkLoops(fixedNow.Add(3*interval + time.Second)); c.Severity != sevWarn || !strings.Contains(c.Summary, "sweeper loop last ticked") {
+			t.Fatalf("just past 3×: got %q / %q, want warn", c.Severity, c.Summary)
 		}
 	})
 
-	t.Run("danger past 10 intervals", func(t *testing.T) {
+	t.Run("danger just past 10 intervals, warn just under", func(t *testing.T) {
+		// The danger band is inclusive at 10× the interval. Hug it: one second PAST 10× is
+		// danger, one second UNDER is still warn (past 3× but under 10×) — pinning
+		// loopBeatDangerIntervals against a 10→11 or 10→9 off-by-one.
 		clk := &mutClock{t: fixedNow}
 		reg := NewBeatRegistry(clk.now)
 		reg.Register("lifecycle", interval)
-		reg.Beat("lifecycle")
+		reg.Beat("lifecycle") // beaten at fixedNow
 		svc := New(Config{Store: &fakeStore{}, Registry: reg})
-		c := svc.checkLoops(fixedNow.Add(11 * interval))
-		if c.Severity != sevDanger || !strings.Contains(c.Summary, "lifecycle loop last ticked") {
-			t.Fatalf("got %q / %q, want danger", c.Severity, c.Summary)
+		if c := svc.checkLoops(fixedNow.Add(10*interval - time.Second)); c.Severity != sevWarn || !strings.Contains(c.Summary, "lifecycle loop last ticked") {
+			t.Fatalf("just under 10×: got %q / %q, want warn", c.Severity, c.Summary)
+		}
+		if c := svc.checkLoops(fixedNow.Add(10*interval + time.Second)); c.Severity != sevDanger || !strings.Contains(c.Summary, "lifecycle loop last ticked") {
+			t.Fatalf("just past 10×: got %q / %q, want danger", c.Severity, c.Summary)
+		}
+	})
+
+	t.Run("never-beaten loop escalates past its thresholds", func(t *testing.T) {
+		// A REGISTERED loop that has never beaten (LastBeat zero) is unknown only while young;
+		// once its RegisteredAt ages past 3× / 10× its interval it must escalate to warn /
+		// danger, NOT stay stuck at unknown. Register at a fixed instant, never Beat, then
+		// evaluate at chosen ages (age = now - RegisteredAt drives the bands).
+		regAt := fixedNow
+		mk := func() *Service {
+			reg := NewBeatRegistry(func() time.Time { return regAt })
+			reg.Register("poller", interval) // registered, never beaten
+			return New(Config{Store: &fakeStore{}, Registry: reg})
+		}
+		if c := mk().checkLoops(regAt.Add(3*interval + time.Second)); c.Severity != sevWarn || !strings.Contains(c.Summary, "poller loop last ticked") {
+			t.Fatalf("never-beaten past 3×: got %q / %q, want warn", c.Severity, c.Summary)
+		}
+		if c := mk().checkLoops(regAt.Add(10*interval + time.Second)); c.Severity != sevDanger || !strings.Contains(c.Summary, "poller loop last ticked") {
+			t.Fatalf("never-beaten past 10×: got %q / %q, want danger", c.Severity, c.Summary)
 		}
 	})
 

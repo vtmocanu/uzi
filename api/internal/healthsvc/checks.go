@@ -450,8 +450,11 @@ func (s *Service) livePoolProbe(ctx context.Context) dbStat {
 // including a zero-worker one (so it is the only liveness trace when there are no hosted
 // worker rows to stamp). There is no warn band. `na` when hosted workers are not configured
 // (the same predicate as fleet.roll). `danger` when there has been no report for
-// controllerReportDanger (5 min). `unknown` from 3 missed intervals up to 5 min, AND for the
-// first 5 min after api boot with no report yet (BootTime grace). `ok` otherwise.
+// controllerReportDanger (5 min). `unknown` from 3 missed intervals up to 5 min, and for the
+// boot grace: the first controllerReportDanger after api boot with no report received SINCE
+// boot — whether the singleton row is absent (first-ever boot) or a stale pre-boot row
+// persists across a restart. `ok` otherwise. Once a report arrives after boot the age-based
+// bands apply exactly, and a stale-report restart past the boot grace correctly becomes danger.
 func (s *Service) checkControllerReport(ctx context.Context, now time.Time, hostedConfigured bool) apitypes.HealthCheckDTO {
 	c := s.base("controller.report")
 	if !hostedConfigured {
@@ -480,6 +483,20 @@ func (s *Service) checkControllerReport(ctx context.Context, now time.Time, host
 		return c
 	case err != nil:
 		return degradeUnknown(c, "controller.report", err)
+	}
+
+	// Boot grace on RESTART: the singleton persists across api restarts, so immediately
+	// after a restart whose downtime exceeded the danger window we read a stale-but-valid
+	// row with no report received SINCE this process booted (the boot-pass evaluation runs
+	// before the api is even listening for reports). That is the same first-report latency
+	// the no-row grace above covers, not a silent controller — within the boot grace degrade
+	// to unknown rather than opening a spurious danger episode. Once a report arrives after
+	// boot (observed.Time is not before BootTime) the age bands below apply unchanged, and a
+	// stale-report restart PAST the grace still becomes danger.
+	if observed.Time.Before(s.cfg.BootTime) && now.Sub(s.cfg.BootTime) < controllerReportDanger {
+		c.Severity = sevUnknown
+		c.Summary = "The controller has not reported since api start (within the startup grace)."
+		return c
 	}
 
 	age := now.Sub(observed.Time)
