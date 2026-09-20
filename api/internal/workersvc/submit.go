@@ -162,6 +162,43 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 	completed, _ := DecodeMilestoneIDs(run.MilestonesCompleted)
 	milestoneIssueRun := run.Kind == runkind.Issue && len(frozen) > 0
 
+	// PRD #1497 M1 (D7/D9): a wall-parked run (paused, hold_reason='budget_exhausted') routes its
+	// owner actions to the dedicated ONE-STATEMENT transitions, checked BEFORE the generic paths
+	// below (the generic `extend` already admits a paused row; the milestone `stop` branch is
+	// unconditional on status, so it would otherwise mis-handle a parked run). `extend` adds time and
+	// resumes in one action (ExtendAndResumeWallPark); `stop` caps the scope, grants the finalize
+	// allowance, and resumes (StopWallPark); `cancel` falls through to CancelRunServerSide unchanged.
+	if run.Status == "paused" && run.HoldReason.Valid && run.HoldReason.String == "budget_exhausted" {
+		switch kind {
+		case "extend":
+			secs, err := strconv.Atoi(strings.TrimSpace(body))
+			if err != nil || secs < 60 || secs > math.MaxInt32 {
+				return SubmitInputResult{}, ErrInvalidExtension
+			}
+			capSeconds, err := s.runExtensionCap(ctx)
+			if err != nil {
+				return SubmitInputResult{}, err
+			}
+			if capSeconds == 0 {
+				return SubmitInputResult{}, ErrExtendDisabled
+			}
+			// secs > capSeconds can never apply and would overflow the CTE's int4 addition — reported
+			// as a cap violation here, keeping secs in [60, capSeconds] for the int32 casts below.
+			if secs > capSeconds {
+				return SubmitInputResult{}, extendRefusalReason(run, secs, capSeconds)
+			}
+			return s.extendAndResumeWallPark(ctx, userID, run, secs, capSeconds)
+		case "stop":
+			// D9: Stop finalizes the completed milestones. Only a milestone ISSUE run with >= 1
+			// completed milestone and its finalize allowance unused can Stop; otherwise 409 naming
+			// the remaining choices (extend, cancel).
+			if !milestoneIssueRun || len(completed) < 1 || run.BudgetFinalizeSeconds != 0 {
+				return SubmitInputResult{}, ErrWallParkStopUnavailable
+			}
+			return s.stopWallPark(ctx, userID, run, len(completed))
+		}
+	}
+
 	// A `scope` directive (PRD #634 M2) bounds how many of the run's frozen milestones it may
 	// complete. It writes runs.scope_ceiling (the control the worker honors on its ACK) plus a
 	// kind='scope' audit row in one statement, and NEVER a stop_kind — the scope-capped
@@ -946,9 +983,87 @@ func (s *Service) submitExtend(ctx context.Context, run store.Run, secs, capSeco
 	}
 	// Deadline is computed from the COMMITTED total (newTotal), not run.BudgetExtensionSeconds+secs,
 	// so two concurrent extends can never return a DeadlineAt that disagrees with ExtensionSeconds.
-	deadline := RunDeadline(run.StartedAt, run.BudgetWallSeconds, run.BudgetPausedSeconds, run.Kind, run.Interactive, run.Status, s.p.RunTimeout, newTotal)
+	deadline := RunDeadline(run.StartedAt, run.BudgetWallSeconds, run.BudgetPausedSeconds, run.Kind, run.Interactive, run.Status, s.p.RunTimeout, newTotal, run.BudgetFinalizeSeconds)
 	nt := int(newTotal)
 	return SubmitInputResult{ServerSide: false, ExtensionSeconds: &nt, DeadlineAt: deadline}, nil
+}
+
+// extendAndResumeWallPark applies the owner's Extend on a budget_exhausted wall park (PRD #1497 M1,
+// D7): add @secs of wall-clock time AND resume, in ONE statement (ExtendAndResumeWallPark). It banks
+// the overrun so the extension buys exactly @secs of active run-time, clears the hold, drops the
+// released worker (D19), and writes the extend + resume audit rows. Refusals mirror submitExtend's
+// (a 0-row CTE — over the cap — is mapped by extendRefusalReason). The projected deadline is
+// computed from the committed new total; Resumed is true so the CLI says the run resumed. Callers
+// have already validated secs ∈ [60, capSeconds].
+func (s *Service) extendAndResumeWallPark(ctx context.Context, userID uuid.UUID, run store.Run, secs, capSeconds int) (SubmitInputResult, error) {
+	secs32, cap32 := int32(0), int32(0)
+	if secs >= 0 && secs <= math.MaxInt32 {
+		secs32 = int32(secs)
+	}
+	if capSeconds >= 0 && capSeconds <= math.MaxInt32 {
+		cap32 = int32(capSeconds)
+	}
+	auditBody := fmt.Sprintf("extend and resume +%s (cap %s)", extendDurationLabel(secs), extendDurationLabel(capSeconds))
+	newTotal, err := s.q.ExtendAndResumeWallPark(ctx, store.ExtendAndResumeWallParkParams{
+		ID:                   run.ID,
+		UserID:               userID,
+		Secs:                 secs32,
+		Cap:                  cap32,
+		GlobalTimeoutSeconds: int32(s.p.RunTimeout.Seconds()),
+		Body:                 pgconv.TextOrNull(auditBody),
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// The only refusal reachable here (the caller pre-validated the cap and the status is a
+			// budget_exhausted paused hold) is a raced cap violation; extendRefusalReason words it.
+			return SubmitInputResult{}, extendRefusalReason(run, secs, capSeconds)
+		}
+		return SubmitInputResult{}, err
+	}
+	// The run is back to queued; publish the transition through the same fan-out the other
+	// park->queued transitions use, so the web/Slack observers see the resume.
+	if s.bcast != nil {
+		s.bcast.PublishState(run.ID, "queued")
+	}
+	s.notify(run.ID, "queued")
+	// Deadline reflects the new total extension; the finalize term is unchanged by an extend.
+	deadline := RunDeadline(run.StartedAt, run.BudgetWallSeconds, run.BudgetPausedSeconds, run.Kind, run.Interactive, "running", s.p.RunTimeout, newTotal, run.BudgetFinalizeSeconds)
+	nt := int(newTotal)
+	return SubmitInputResult{ServerSide: false, ExtensionSeconds: &nt, DeadlineAt: deadline, Resumed: true}, nil
+}
+
+// stopWallPark applies the owner's Stop on a budget_exhausted wall park of a milestone issue run
+// (PRD #1497 M1, D9): cap the scope at the completed count, grant the one-time 1800s finalize
+// allowance, bank the overrun, and resume — in ONE statement (StopWallPark) — so the re-claimed
+// worker finalizes the completed milestones into a merge request. A 0-row CTE means the allowance
+// was already granted (or the run left the eligible state in a race) -> the 409 naming the remaining
+// choices. Returns the resolved scope ceiling and Resumed=true. Callers have already confirmed the
+// run is a milestone issue run with >= 1 completed milestone and the allowance unused.
+func (s *Service) stopWallPark(ctx context.Context, userID uuid.UUID, run store.Run, completedCount int) (SubmitInputResult, error) {
+	ceiling32 := int32(0)
+	if completedCount >= 0 && completedCount <= math.MaxInt32 {
+		ceiling32 = int32(completedCount)
+	}
+	auditBody := fmt.Sprintf("stop at the wall → finalize %d completed milestone(s), start no further (finalize allowance %s)",
+		completedCount, extendDurationLabel(1800))
+	if _, err := s.q.StopWallPark(ctx, store.StopWallParkParams{
+		ID:                   run.ID,
+		UserID:               userID,
+		ScopeCeiling:         ceiling32,
+		GlobalTimeoutSeconds: int32(s.p.RunTimeout.Seconds()),
+		Body:                 pgconv.TextOrNull(auditBody),
+	}); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return SubmitInputResult{}, ErrWallParkStopUnavailable
+		}
+		return SubmitInputResult{}, err
+	}
+	if s.bcast != nil {
+		s.bcast.PublishState(run.ID, "queued")
+	}
+	s.notify(run.ID, "queued")
+	c := completedCount
+	return SubmitInputResult{ServerSide: false, ScopeCeiling: &c, Resumed: true}, nil
 }
 
 // pauseRefusalReason turns a 0-row CreatePauseInput into the specific 409 the owner sees

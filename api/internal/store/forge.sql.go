@@ -354,6 +354,9 @@ SELECT r.id, r.user_id, r.status, r.mr_iid, r.mr_web_url, r.mr_state, r.failure_
        -- deadline_at reflects a granted extension.
        r.started_at, r.budget_wall_seconds, r.budget_paused_seconds, r.interactive,
        r.budget_extension_seconds,
+       -- PRD #1497 M1: budget_finalize_seconds is the third RunDeadline term; hold_reason lets the
+       -- board badge render a wall park ('budget_exhausted') as needing the owner.
+       r.budget_finalize_seconds, r.hold_reason,
        r.created_at, r.updated_at,
        ru.display_name AS owner_name, rw.name AS worker_name,
        COUNT(*) OVER () AS run_count
@@ -391,6 +394,8 @@ type GetLatestRunForIssueRow struct {
 	BudgetPausedSeconds    int32              `json:"budget_paused_seconds"`
 	Interactive            bool               `json:"interactive"`
 	BudgetExtensionSeconds int32              `json:"budget_extension_seconds"`
+	BudgetFinalizeSeconds  int32              `json:"budget_finalize_seconds"`
+	HoldReason             pgtype.Text        `json:"hold_reason"`
 	CreatedAt              pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt              pgtype.Timestamptz `json:"updated_at"`
 	OwnerName              pgtype.Text        `json:"owner_name"`
@@ -429,6 +434,8 @@ func (q *Queries) GetLatestRunForIssue(ctx context.Context, arg GetLatestRunForI
 		&i.BudgetPausedSeconds,
 		&i.Interactive,
 		&i.BudgetExtensionSeconds,
+		&i.BudgetFinalizeSeconds,
+		&i.HoldReason,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.OwnerName,
@@ -966,6 +973,9 @@ SELECT DISTINCT ON (r.issue_iid)
        -- deadline_at reflects a granted extension.
        r.started_at, r.budget_wall_seconds, r.budget_paused_seconds, r.interactive,
        r.budget_extension_seconds,
+       -- PRD #1497 M1: budget_finalize_seconds is the third RunDeadline term; hold_reason lets the
+       -- board badge render a wall park ('budget_exhausted') as needing the owner.
+       r.budget_finalize_seconds, r.hold_reason,
        r.created_at, r.updated_at,
        ru.display_name AS owner_name, rw.name AS worker_name,
        COUNT(*) OVER (PARTITION BY r.issue_iid) AS run_count
@@ -998,6 +1008,8 @@ type ListLatestRunsForRepoRow struct {
 	BudgetPausedSeconds    int32              `json:"budget_paused_seconds"`
 	Interactive            bool               `json:"interactive"`
 	BudgetExtensionSeconds int32              `json:"budget_extension_seconds"`
+	BudgetFinalizeSeconds  int32              `json:"budget_finalize_seconds"`
+	HoldReason             pgtype.Text        `json:"hold_reason"`
 	CreatedAt              pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt              pgtype.Timestamptz `json:"updated_at"`
 	OwnerName              pgtype.Text        `json:"owner_name"`
@@ -1053,6 +1065,8 @@ func (q *Queries) ListLatestRunsForRepo(ctx context.Context, repoID uuid.UUID) (
 			&i.BudgetPausedSeconds,
 			&i.Interactive,
 			&i.BudgetExtensionSeconds,
+			&i.BudgetFinalizeSeconds,
+			&i.HoldReason,
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.OwnerName,

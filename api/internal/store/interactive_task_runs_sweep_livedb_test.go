@@ -23,9 +23,10 @@ import (
 //
 // The test is DISCRIMINATING by contrast, not by a single positive: it seeds two runs
 // with the SAME stale started_at, differing only in `interactive`. The interactive run
-// must survive; the non-interactive run must be swept. Removing `AND interactive = false`
-// from SweepRunningTimeout would fail the interactive assertion (the run would be swept),
-// which is what makes this non-vacuous.
+// must survive; the non-interactive run must be PARKED at the wall (PRD #1497 — the wall no
+// longer fails; here the shared worker is stale, so ParkRunsAtWall parks the non-interactive
+// run server-side). Removing `AND interactive = false` from the wall passes would park the
+// interactive run too, which is what makes this non-vacuous.
 //
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres; mirrors the other
 // *_livedb / *_integration_test.go in this package.
@@ -55,30 +56,42 @@ func TestInteractiveRunWallClockExemptionLiveDB(t *testing.T) {
 		`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
 		 VALUES ($1, $2, 1, 'g/r', 'https://forge.e2e/g/r', 'main', true)`, repoID, connID)
 
+	// A shared STALE worker (heartbeat well before the cutoff) so ParkRunsAtWall parks the
+	// non-interactive run server-side (the interactive one is exempt regardless).
+	staleWorker := uuid.New()
+	mustExec(ctx, t, pool,
+		`INSERT INTO workers (id, user_id, name, token_hash, status, last_heartbeat_at)
+		 VALUES ($1, $2, 'stale', $3, 'offline', now() - interval '10 years')`, staleWorker, userID, staleWorker[:])
+
 	// Two running task runs with the SAME ancient started_at (well past the 60s wall
 	// budget below); the ONLY difference is `interactive`. kind='task' requires issue_iid
 	// NULL + branch set (runs_kind_shape), which is the interactive-task shape.
 	interactiveID, plainID := uuid.New(), uuid.New()
 	mustExec(ctx, t, pool,
-		`INSERT INTO runs (id, user_id, repo_id, kind, interactive, branch, issue_title, issue_description, status, started_at)
-		 VALUES ($1, $2, $3, 'task', true, $4, 't', 'd', 'running', now() - interval '10 years')`,
-		interactiveID, userID, repoID, "uzi/task/"+interactiveID.String())
+		`INSERT INTO runs (id, user_id, repo_id, kind, interactive, branch, issue_title, issue_description, status, worker_id, started_at)
+		 VALUES ($1, $2, $3, 'task', true, $4, 't', 'd', 'running', $5, now() - interval '10 years')`,
+		interactiveID, userID, repoID, "uzi/task/"+interactiveID.String(), staleWorker)
 	mustExec(ctx, t, pool,
-		`INSERT INTO runs (id, user_id, repo_id, kind, interactive, branch, issue_title, issue_description, status, started_at)
-		 VALUES ($1, $2, $3, 'task', false, $4, 't', 'd', 'running', now() - interval '10 years')`,
-		plainID, userID, repoID, "uzi/task/"+plainID.String())
+		`INSERT INTO runs (id, user_id, repo_id, kind, interactive, branch, issue_title, issue_description, status, worker_id, started_at)
+		 VALUES ($1, $2, $3, 'task', false, $4, 't', 'd', 'running', $5, now() - interval '10 years')`,
+		plainID, userID, repoID, "uzi/task/"+plainID.String(), staleWorker)
 
-	swept, err := q.SweepRunningTimeout(ctx, store.SweepRunningTimeoutParams{
-		FailureReason:        pgtype.Text{String: "run exceeded RUN_TIMEOUT", Valid: true},
-		Now:                  pgtype.Timestamptz{Time: time.Now().UTC(), Valid: true},
-		GlobalTimeoutSeconds: 60,
+	now := pgtype.Timestamptz{Time: time.Now().UTC(), Valid: true}
+	staleCutoff := pgtype.Timestamptz{Time: time.Now().UTC().Add(-5 * time.Minute), Valid: true}
+	if _, err := q.RequestWallParks(ctx, store.RequestWallParksParams{
+		Now: now, GlobalTimeoutSeconds: 60, WorkerStaleCutoff: staleCutoff,
+	}); err != nil {
+		t.Fatalf("RequestWallParks: %v", err)
+	}
+	parked, err := q.ParkRunsAtWall(ctx, store.ParkRunsAtWallParams{
+		Now: now, GlobalTimeoutSeconds: 60, WorkerStaleCutoff: staleCutoff, GraceSeconds: 600,
 	})
 	if err != nil {
-		t.Fatalf("SweepRunningTimeout: %v", err)
+		t.Fatalf("ParkRunsAtWall: %v", err)
 	}
-	sweptIDs := map[uuid.UUID]bool{}
-	for _, s := range swept {
-		sweptIDs[s.ID] = true
+	parkedIDs := map[uuid.UUID]bool{}
+	for _, s := range parked {
+		parkedIDs[s.ID] = true
 	}
 
 	readStatus := func(id uuid.UUID) string {
@@ -90,26 +103,26 @@ func TestInteractiveRunWallClockExemptionLiveDB(t *testing.T) {
 		return status
 	}
 
-	// The interactive run must NOT be swept: not in the returned set, and still running.
+	// The interactive run must NOT be parked: not in the returned set, and still running.
 	// This is the assertion that breaks if `AND interactive = false` is removed.
-	if sweptIDs[interactiveID] {
-		t.Fatalf("the interactive task run was swept by SweepRunningTimeout; PRD #517 Decision 6 exempts it "+
+	if parkedIDs[interactiveID] {
+		t.Fatalf("the interactive task run was parked by the wall sweep; PRD #517 Decision 6 exempts it "+
 			"(user-paced, bounded by the M5 idle timeout). Its resumed started_at is past the wall budget, "+
-			"which is exactly the legitimately-resumed long-lived run the exemption protects: %+v", swept)
+			"which is exactly the legitimately-resumed long-lived run the exemption protects: %+v", parked)
 	}
 	if got := readStatus(interactiveID); got != "running" {
-		t.Fatalf("interactive run status = %q after sweep, want running (untouched)", got)
+		t.Fatalf("interactive run status = %q after the wall passes, want running (untouched)", got)
 	}
 
-	// The non-interactive control MUST be swept — same stale started_at, so this proves
-	// the interactive run survived because of `interactive`, not because the sweep did
-	// nothing at all.
-	if !sweptIDs[plainID] {
-		t.Fatalf("the NON-interactive task run was NOT swept; with a started_at 10 years past a 60s wall it "+
-			"must be failed as run_timeout — the contrast is what makes the interactive exemption "+
-			"non-vacuous: %+v", swept)
+	// The non-interactive control MUST be parked — same stale started_at, so this proves
+	// the interactive run survived because of `interactive`, not because the passes did
+	// nothing at all. PRD #1497 D2: parked (paused), never failed.
+	if !parkedIDs[plainID] {
+		t.Fatalf("the NON-interactive task run was NOT parked; with a started_at 10 years past a 60s wall and a "+
+			"stale worker it must be parked at the wall — the contrast is what makes the interactive exemption "+
+			"non-vacuous: %+v", parked)
 	}
-	if got := readStatus(plainID); got != "failed" {
-		t.Fatalf("non-interactive run status = %q after sweep, want failed", got)
+	if got := readStatus(plainID); got != "paused" {
+		t.Fatalf("non-interactive run status = %q after the wall passes, want paused (never failed)", got)
 	}
 }

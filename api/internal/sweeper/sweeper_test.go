@@ -171,6 +171,15 @@ func TestSweeperPassLogsResumeOnlyTicks(t *testing.T) {
 		// sum AND emit list both include TaskUndispatchedFailed, else an undispatched-orphan reap
 		// logs nothing and the terminalized reservation is invisible in the operator log.
 		{name: "task undispatched failed alone", res: workersvc.SweepResult{TaskUndispatchedFailed: 1}, attr: "task_undispatched_failed"},
+		// PRD #1497 M1: a tick that ONLY files a wall-park request (a past-deadline run whose live
+		// worker speaks wall_park_v1) must raise the line too — the guard sum AND emit list both
+		// include WallParkRequested, else a request-only tick logs nothing and the pending park is
+		// invisible in the operator log.
+		{name: "wall park requested alone", res: workersvc.SweepResult{WallParkRequested: 1}, attr: "wall_park_requested"},
+		// PRD #1497 M1: a tick that ONLY parks a run server-side (a dead/incapable/unresponsive
+		// worker's out-of-time run) must raise the line too — the guard sum AND emit list both
+		// include WallParked, else a park-only tick logs nothing and the server-side park is invisible.
+		{name: "wall parked alone", res: workersvc.SweepResult{WallParked: 1}, attr: "wall_parked"},
 		{name: "idle tick logs nothing", res: workersvc.SweepResult{}, attr: ""},
 	}
 	for _, tc := range cases {

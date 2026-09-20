@@ -1461,6 +1461,61 @@ func (h *Handler) WorkerRunCompletionHold(w http.ResponseWriter, r *http.Request
 	httpx.JSON(w, http.StatusOK, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock())})
 }
 
+// WorkerRunWallPark is the wall-clock PARK endpoint (PRD #1497 M1, D4/D15): the worker reports it
+// dropped its turn at the run's deadline and captured the tree, and the service parks the run
+// (running -> paused, hold_reason='budget_exhausted') via the fenced SetRunWallPark whose SOLE
+// authority is the three-term deadline. It mirrors WorkerRunCompletionHold's applied/409 shape,
+// which is load-bearing for the park-order ack contract: 200 with the paused run on success; a
+// 409 with the run's ACTUAL status when the park is REFUSED — usually `running` (the owner extended
+// in the request-then-park window, so the worker clears its sticky wall mode, lifts its wall from
+// the served total, and restarts the turn). An idempotent report after the SERVER already parked the
+// row (ParkRunsAtWall beat the worker) is answered 200/`paused` (D16), and a captured head it
+// carries is kept via RecordWallParkCapturedHead. A reclaim surfaces as ErrRunNotOwned -> 404.
+func (h *Handler) WorkerRunWallPark(w http.ResponseWriter, r *http.Request) {
+	wkr, ok := mw.WorkerFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "worker authentication required")
+		return
+	}
+	runID, ok := httpx.PathUUID(w, r, "id", "run")
+	if !ok {
+		return
+	}
+	var body struct {
+		// The exact head the worker captured at park time. Empty is allowed (the column is
+		// nullable; a degraded park reports it null); the service NUL-strips + TrimSpaces it.
+		Head string `json:"head"`
+		// Published reports whether the checkpoint was published to the forge (informational for the
+		// degraded-park feed message, M2). The park transition itself does not depend on it — a
+		// verified LOCAL capture makes the park (D4). Present so DecodeJSON does not reject it.
+		Published bool `json:"published"`
+		// PRD #1497 M1 (D16): the claim generation the worker holds. A wall_park_v1 worker stamps it
+		// so the fence refuses a released/superseded stale flight's reclaimed run. Nullable + OPTIONAL.
+		ClaimGeneration *int64 `json:"claim_generation"`
+	}
+	if err := httpx.DecodeJSON(r, &body); err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	run, applied, err := h.wsvc.ReportWallPark(r.Context(), wkr, runID, body.Head, body.Published, body.ClaimGeneration)
+	if err != nil {
+		if errors.Is(err, workersvc.ErrRunNotOwned) {
+			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
+			return
+		}
+		slog.Error("worker run wall park", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if !applied {
+		// The park was refused (the owner extended in the window, or the run moved on): 409 with the
+		// run's REAL status, which the worker reads off the body to clear the wall mode and restart.
+		httpx.JSON(w, http.StatusConflict, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock())})
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock())})
+}
+
 // workerMemoryToDTO maps a stored entry to the worker-facing DTO. It carries run_id
 // (provenance) but OMITS repo_id/repo_name — the worker already knows the run's repo
 // and the write derives it server-side, so echoing it would be redundant surface.

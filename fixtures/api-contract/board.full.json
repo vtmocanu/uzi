@@ -40,6 +40,7 @@
         "health": "x",
         "health_reason": "x",
         "health_since": "2020-01-02T03:04:05Z",
+        "hold_reason": "x",
         "deadline_at": "2020-01-02T03:04:05Z",
         "is_planning": true,
         "is_revising": true,

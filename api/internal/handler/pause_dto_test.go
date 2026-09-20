@@ -101,7 +101,7 @@ func TestBoardCardCarriesNoPauseIntent(t *testing.T) {
 	// A non-owner viewer (viewerID != ownerID) of a paused run's card.
 	card := mapLatestRun(uuid.New(), uuid.New(), "paused", "issue", 3, true,
 		pgtype.Int8{}, pgtype.Text{}, pgtype.Text{}, pgtype.Text{}, pgtype.Text{}, pgtype.Text{},
-		"ok", pgtype.Text{}, pgtype.Timestamptz{}, pgtype.Timestamptz{}, pgtype.Int4{}, 0, 0, false,
+		"ok", pgtype.Text{}, pgtype.Timestamptz{}, pgtype.Text{}, pgtype.Timestamptz{}, pgtype.Int4{}, 0, 0, 0, false,
 		pgtype.Text{}, pgtype.Text{}, 1,
 		pgtype.Timestamptz{Valid: true}, pgtype.Timestamptz{Valid: true}, uuid.New(), 0)
 	if card.IsMine {

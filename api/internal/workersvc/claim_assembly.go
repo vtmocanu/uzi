@@ -563,7 +563,10 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			// this the worker trips REASON_WALL at the frozen budget before the server's
 			// extended deadline, and the extend is a silent no-op. budget_extension_seconds is
 			// NOT NULL DEFAULT 0, so this is byte-identical for a run that was never extended.
-			RunTimeoutSeconds:      coalesceInt(run.BudgetWallSeconds, int(s.p.RunTimeout.Seconds())) + int(run.BudgetExtensionSeconds),
+			// PRD #1497 M1: add budget_finalize_seconds as the THIRD term, so a run that resumed on
+			// its Stop finalize allowance arms the larger wall too. NOT NULL DEFAULT 0, byte-identical
+			// for a run that never used the allowance.
+			RunTimeoutSeconds:      coalesceInt(run.BudgetWallSeconds, int(s.p.RunTimeout.Seconds())) + int(run.BudgetExtensionSeconds) + int(run.BudgetFinalizeSeconds),
 			IdleTimeoutSeconds:     int(s.p.RunIdleTimeout.Seconds()),
 			TaskIdleTimeoutSeconds: taskIdleTimeoutSeconds,
 			MaxIterations:          coalesceInt(run.BudgetMaxIterations, s.p.RunMaxIterations),

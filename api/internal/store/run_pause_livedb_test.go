@@ -324,18 +324,37 @@ func TestRunPauseQueriesLiveDB(t *testing.T) {
 			t.Fatal("FailRunAutoStop must not fail a paused run")
 		}
 
-		// SweepRunningTimeout: an old-started control running run IS failed; the paused one not.
+		// The wall sweep (PRD #1497): an old-started control RUNNING run is PARKED server-side (its
+		// worker wkr is stale and incapable), the already-paused one is left untouched — the wall
+		// passes only ever act on 'running' rows. ParkRunsAtWall's returned set is the discriminator
+		// (both would read 'paused' afterwards, but only the control transitioned).
 		pausedSweep := insertRun(t, "paused", "issue", false, true, true, 0, "", 0)
 		controlSweep := insertRun(t, "running", "issue", false, true, true, 0, "", 0)
-		if _, err := q.SweepRunningTimeout(ctx, store.SweepRunningTimeoutParams{
-			FailureReason: pgconvText("timeout"), Now: pgtype.Timestamptz{Time: nowUTC(), Valid: true}, GlobalTimeoutSeconds: 1}); err != nil {
-			t.Fatalf("SweepRunningTimeout: %v", err)
+		staleCutoff := pgtype.Timestamptz{Time: nowUTC().Add(-45 * time.Second), Valid: true}
+		if _, err := q.RequestWallParks(ctx, store.RequestWallParksParams{
+			Now: pgtype.Timestamptz{Time: nowUTC(), Valid: true}, GlobalTimeoutSeconds: 1, WorkerStaleCutoff: staleCutoff}); err != nil {
+			t.Fatalf("RequestWallParks: %v", err)
+		}
+		parked, err := q.ParkRunsAtWall(ctx, store.ParkRunsAtWallParams{
+			Now: pgtype.Timestamptz{Time: nowUTC(), Valid: true}, GlobalTimeoutSeconds: 1, WorkerStaleCutoff: staleCutoff, GraceSeconds: 600})
+		if err != nil {
+			t.Fatalf("ParkRunsAtWall: %v", err)
+		}
+		parkedIDs := map[uuid.UUID]bool{}
+		for _, r := range parked {
+			parkedIDs[r.ID] = true
+		}
+		if parkedIDs[pausedSweep] {
+			t.Fatal("the wall sweep must not touch an already-paused run")
 		}
 		if status(t, pausedSweep) != "paused" {
-			t.Fatal("SweepRunningTimeout must not sweep a paused run")
+			t.Fatal("the already-paused run must stay paused")
 		}
-		if status(t, controlSweep) != "failed" {
-			t.Fatal("control old-started run should have been swept (test is otherwise vacuous)")
+		if !parkedIDs[controlSweep] {
+			t.Fatal("control old-started running run should have been parked (test is otherwise vacuous)")
+		}
+		if status(t, controlSweep) != "paused" {
+			t.Fatal("control old-started run should have been parked to paused (never failed)")
 		}
 
 		// ListActiveRunsForHealth: a running run is listed; the paused one is not.
@@ -537,13 +556,24 @@ func TestRunPauseQueriesLiveDB(t *testing.T) {
 			}
 			assertCleared(t, id, "failed")
 		})
-		t.Run("SweepRunningTimeout", func(t *testing.T) {
+		t.Run("ParkRunsAtWall", func(t *testing.T) {
+			// PRD #1497: the wall no longer FAILS — it PARKS. A park is NOT terminal, so unlike the
+			// sibling terminal writers it does NOT clear milestones_agents or the credential-switch
+			// stamp (those survive the park for the resume). It DOES clear the pending-pause columns
+			// (it consumes the request), which is the part of this group's contract a park keeps —
+			// asserted directly here rather than through assertCleared (which expects the terminal clears).
 			id := armedRunning(t, 0, true /*startedOld*/)
-			if _, err := q.SweepRunningTimeout(ctx, store.SweepRunningTimeoutParams{
-				FailureReason: pgconvText("timeout"), Now: pgtype.Timestamptz{Time: nowUTC(), Valid: true}, GlobalTimeoutSeconds: 1}); err != nil {
-				t.Fatalf("SweepRunningTimeout: %v", err)
+			staleCutoff := pgtype.Timestamptz{Time: nowUTC().Add(-45 * time.Second), Valid: true}
+			if _, err := q.ParkRunsAtWall(ctx, store.ParkRunsAtWallParams{
+				Now: pgtype.Timestamptz{Time: nowUTC(), Valid: true}, GlobalTimeoutSeconds: 1, WorkerStaleCutoff: staleCutoff, GraceSeconds: 600}); err != nil {
+				t.Fatalf("ParkRunsAtWall: %v", err)
 			}
-			assertCleared(t, id, "failed")
+			if got := status(t, id); got != "paused" {
+				t.Fatalf("status = %q, want paused (a wall park never fails)", got)
+			}
+			if at, mode, after := pauseCols(t, id); at.Valid || mode.Valid || after.Valid {
+				t.Fatalf("the wall park must clear the pending-pause columns (at.Valid=%v mode.Valid=%v after.Valid=%v)", at.Valid, mode.Valid, after.Valid)
+			}
 		})
 		t.Run("FailRunsOfStaleWorkersOverCap", func(t *testing.T) {
 			id := armedRunning(t, 9 /*over cap*/, false)

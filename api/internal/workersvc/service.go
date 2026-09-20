@@ -183,6 +183,10 @@ var (
 	ErrExtendDisabled       = errors.New("extending runs is turned off")
 	ErrExtensionCapExceeded = errors.New("extension cap exceeded")
 	ErrExtendNotTimed       = errors.New("this run has no wall-clock timeout to extend")
+	// ErrWallParkStopUnavailable (PRD #1497 M1, D9) rejects a `stop` on a budget_exhausted wall park
+	// that has nothing to finalize (zero completed milestones), is not a milestone issue run, or has
+	// already used its one-time finalize allowance. It names the choices that remain: extend or cancel.
+	ErrWallParkStopUnavailable = errors.New("this parked run has nothing to finalize; extend it to keep working, or cancel it")
 	// ErrReviseCapReached rejects a revise_plan once the run has hit
 	// PLAN_MAX_REVISIONS persisted revisions (PRD #41). Counted over ALL
 	// revise_plan rows for the run (a consumed revise still counts), so the cap is
@@ -859,11 +863,34 @@ type Store interface {
 	// OPEN merge request for the issue (issue #856), or pgx.ErrNoRows when none does. It
 	// backs createRun's create-time open-MR refusal (the open-MR dedup that --force bypasses).
 	GetOpenMRRunForIssue(ctx context.Context, arg store.GetOpenMRRunForIssueParams) (pgtype.Int8, error)
-	SweepRunningTimeout(ctx context.Context, arg store.SweepRunningTimeoutParams) ([]store.SweepRunningTimeoutRow, error)
+	// PRD #1497 M1: the wall-clock sweep PARKS instead of failing. RequestWallParks files a system
+	// 'wall' pause request on a past-deadline run whose worker is alive and speaks wall_park_v1 (the
+	// worker drops the turn and captures); ParkRunsAtWall parks the row server-side when the worker is
+	// dead, incapable, or unresponsive. Both return (id, user_id, status) rows for publishSwept; the
+	// row counts feed SweepResult.WallParkRequested / .WallParked. They REPLACE SweepRunningTimeout.
+	RequestWallParks(ctx context.Context, arg store.RequestWallParksParams) ([]store.RequestWallParksRow, error)
+	ParkRunsAtWall(ctx context.Context, arg store.ParkRunsAtWallParams) ([]store.ParkRunsAtWallRow, error)
+	// SetRunWallPark (PRD #1497 M1) is the worker-authored, fenced wall-park transition for the
+	// `wall_park` report: running -> paused with hold_reason='budget_exhausted', gated on the
+	// three-term deadline (the sole authority) and completion_attempts = 0. RecordWallParkCapturedHead
+	// records a late head after the server already parked the row.
+	SetRunWallPark(ctx context.Context, arg store.SetRunWallParkParams) (store.Run, error)
+	RecordWallParkCapturedHead(ctx context.Context, arg store.RecordWallParkCapturedHeadParams) (int64, error)
+	// CountOnlineWorkersClaimableForRun (PRD #1497 M1, D19) counts the owner's workers that could
+	// actually claim THIS run now (ClaimRun's full per-worker conjunction, incl. the released
+	// incarnation exclusion), for the new queued-health rung.
+	CountOnlineWorkersClaimableForRun(ctx context.Context, arg store.CountOnlineWorkersClaimableForRunParams) (int64, error)
+	// ExtendAndResumeWallPark / StopWallPark (PRD #1497 M1, D7/D9) are the owner's Extend and Stop on
+	// a budget_exhausted wall park, each in one statement: bank the overrun, resume, and (Stop) cap
+	// the scope + grant the 1800s finalize allowance. ExtendAndResumeWallPark returns the new total
+	// extension; StopWallPark returns the run id (0 rows / ErrNoRows on refusal).
+	ExtendAndResumeWallPark(ctx context.Context, arg store.ExtendAndResumeWallParkParams) (int32, error)
+	StopWallPark(ctx context.Context, arg store.StopWallParkParams) (uuid.UUID, error)
 	// StampCompletionBudgetExhausted (PRD #1226 M4, D3) arms the server-side served
 	// `budget_exhausted` steer on EXACTLY the post-attempt live-worker interlocked rows
-	// SweepRunningTimeout's carve-out spared. Same now/global_timeout_seconds/worker_stale_cutoff
-	// args the sweep receives; returns the execrows count of rows freshly stamped this tick.
+	// the wall-park sweep's carve-out spared. PRD #1497 M1: its deadline now mirrors the
+	// sweep's three-term total. Same now/global_timeout_seconds/worker_stale_cutoff args;
+	// returns the execrows count of rows freshly stamped this tick.
 	StampCompletionBudgetExhausted(ctx context.Context, arg store.StampCompletionBudgetExhaustedParams) (int64, error)
 	FailRunsOfStaleWorkersOverCap(ctx context.Context, arg store.FailRunsOfStaleWorkersOverCapParams) ([]store.FailRunsOfStaleWorkersOverCapRow, error)
 	RequeueRunsOfStaleWorkers(ctx context.Context, arg store.RequeueRunsOfStaleWorkersParams) ([]store.RequeueRunsOfStaleWorkersRow, error)
@@ -3214,6 +3241,16 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			_ = fenceTx.Rollback(ctx)
 		}
 	}()
+	// PRD #1497 M1 (D16): close the released window for a generation-less (legacy) report too. A
+	// nil-generation report on a fenced state whose claim is RELEASED (a held-state switch, or a
+	// server-side wall park set claim_released_at) is rejected as stale — the released window closes
+	// for it. This is a best-effort check on the UNLOCKED `owned` snapshot: a legacy worker (no
+	// generation) never reclaims, so the released flag is stable, and this path deliberately does NOT
+	// take the FOR UPDATE tx (a generation-stamping worker takes the fence below, which re-checks
+	// claim_released_at under the lock). A LIVE nil-generation report stays honoured, unchanged.
+	if req.ClaimGeneration == nil && stateUsesForUpdateFence(req.State, owned) && owned.ClaimReleasedAt.Valid {
+		return owned, false, ErrStaleClaim
+	}
 	if req.ClaimGeneration != nil && stateUsesForUpdateFence(req.State, owned) {
 		if s.txBeginner == nil {
 			return store.Run{}, false, fmt.Errorf("state fence unavailable: no tx beginner wired for run %s", runID)
@@ -3234,9 +3271,9 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			return store.Run{}, false, lerr
 		}
 		if locked.ClaimGeneration != *req.ClaimGeneration || locked.ClaimReleasedAt.Valid {
-			// Stale: a reclaim bumped the generation past the reported one, or a switch
-			// released this claim. Return the LOCKED row so the handler can render it beside
-			// the stale_claim disposition. The deferred Rollback releases the lock.
+			// Stale: a reclaim bumped the generation past the reported one, or a switch/wall-park
+			// released this claim. Return the LOCKED row so the handler can render it beside the
+			// stale_claim disposition. The deferred Rollback releases the lock.
 			return locked, false, ErrStaleClaim
 		}
 		// Locked and current: the arms below mutate through the tx, and the lock is held
@@ -3699,7 +3736,8 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	// separate pool connection) and re-reads the run, so it must not run while this tx holds
 	// the row lock (the re-read would see the pre-commit row, and any run-row write would
 	// self-deadlock against the lock). A commit failure fails the report; the deferred Rollback
-	// is a no-op once fenceTx is cleared. A legacy report left fenceTx nil, so this is skipped.
+	// is a no-op once fenceTx is cleared. A legacy (nil-generation) report left fenceTx nil, so this
+	// is skipped.
 	if fenceTx != nil {
 		if cerr := fenceTx.Commit(ctx); cerr != nil {
 			return store.Run{}, false, cerr
@@ -5764,6 +5802,11 @@ type SubmitInputResult struct {
 	// print the outcome without a read-back. Nil on every non-extend path.
 	ExtensionSeconds *int
 	DeadlineAt       *time.Time
+	// Resumed is true when an owner action on a wall park both applied AND resumed the run in one
+	// step (PRD #1497 M1): ExtendAndResumeWallPark and StopWallPark. It lets the CLI/handler say the
+	// run resumed, not merely that time was added. False on every other path (including a plain
+	// extend of a running run, which does not resume).
+	Resumed bool
 }
 
 // hasLivePoller reports whether a worker is currently polling this run's inputs:
@@ -5840,11 +5883,20 @@ type SweepResult struct {
 	// dispatched within seconds of creation, so a non-zero count means a client crashed or
 	// its push failed between create and DispatchTaskRun.
 	TaskUndispatchedFailed int64
-	RunningTimeout         int64
-	StaleFailed            int64
-	StaleRequeued          int64
-	ChatIdleCompleted      int64
-	ProposalsRecovered     int64
+	// WallParkRequested is the number of past-deadline runs this pass filed a system 'wall' pause
+	// request on because their worker is alive and speaks wall_park_v1 (PRD #1497 M1): the worker
+	// drops its turn and takes the capture-first park. Set from the RequestWallParks row count.
+	// REPLACES the old RunningTimeout (the wall no longer fails a run).
+	WallParkRequested int64
+	// WallParked is the number of runs this pass parked server-side because their worker is dead,
+	// incapable, or unresponsive past the grace (PRD #1497 M1, D5). Set from the ParkRunsAtWall row
+	// count. These transition to paused (hold_reason='budget_exhausted') and are fanned out via
+	// publishSwept; they are NOT enqueued to the judge (the run is not finished).
+	WallParked         int64
+	StaleFailed        int64
+	StaleRequeued      int64
+	ChatIdleCompleted  int64
+	ProposalsRecovered int64
 	// HealthChanged is the number of runs whose health flag the detector wrote this
 	// pass (PRD #47) — raised, changed, or self-cleared. Observability only.
 	HealthChanged int64

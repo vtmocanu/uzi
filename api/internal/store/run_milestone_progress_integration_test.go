@@ -547,7 +547,7 @@ func TestRunMilestoneProgressLiveDB(t *testing.T) {
 		}
 	})
 
-	// ── SweepRunningTimeout honours the PER-RUN wall clock (Decision 5b). ──
+	// ── The wall PARK honours the PER-RUN wall clock (Decision 5b), PRD #1497. ──
 	t.Run("sweep honours the per-run wall clock", func(t *testing.T) {
 		base := time.Now().UTC()
 		// budget_wall=28800s (8h), started 3h ago → NOT swept.
@@ -563,31 +563,42 @@ func TestRunMilestoneProgressLiveDB(t *testing.T) {
 		mustExec(ctx, t, pool, `UPDATE runs SET started_at = $2 WHERE id = $1`,
 			globalOver, base.Add(-3*time.Hour))
 
-		swept, err := q.SweepRunningTimeout(ctx, store.SweepRunningTimeoutParams{
-			FailureReason:        pgtype.Text{String: "run exceeded RUN_TIMEOUT", Valid: true},
+		// PRD #1497 M1: the wall no longer FAILS — it PARKS. The shared worker advertises no
+		// wall_park_v1, so ParkRunsAtWall parks each past-deadline run server-side; the same per-run
+		// three-term deadline decides membership, which is what these subtests pin.
+		if _, err := q.RequestWallParks(ctx, store.RequestWallParksParams{
 			Now:                  pgtype.Timestamptz{Time: base, Valid: true},
 			GlobalTimeoutSeconds: runTimeout,
+			WorkerStaleCutoff:    pgtype.Timestamptz{Time: base.Add(-5 * time.Minute), Valid: true},
+		}); err != nil {
+			t.Fatalf("RequestWallParks: %v", err)
+		}
+		parked, err := q.ParkRunsAtWall(ctx, store.ParkRunsAtWallParams{
+			Now:                  pgtype.Timestamptz{Time: base, Valid: true},
+			GlobalTimeoutSeconds: runTimeout,
+			WorkerStaleCutoff:    pgtype.Timestamptz{Time: base.Add(-5 * time.Minute), Valid: true},
+			GraceSeconds:         600,
 		})
 		if err != nil {
-			t.Fatalf("SweepRunningTimeout: %v", err)
+			t.Fatalf("ParkRunsAtWall: %v", err)
 		}
 		got := map[uuid.UUID]bool{}
-		for _, r := range swept {
+		for _, r := range parked {
 			got[r.ID] = true
 		}
 		if got[survives] {
-			t.Fatalf("a scaled run 3h into an 8h budget must NOT be swept")
+			t.Fatalf("a scaled run 3h into an 8h budget must NOT be parked")
 		}
 		if !got[scaledOver] {
-			t.Fatalf("a scaled run 9h into an 8h budget MUST be swept")
+			t.Fatalf("a scaled run 9h into an 8h budget MUST be parked")
 		}
 		if !got[globalOver] {
-			t.Fatalf("a NULL-budget run 3h in MUST be swept at the global 2h")
+			t.Fatalf("a NULL-budget run 3h in MUST be parked at the global 2h")
 		}
 	})
 
-	// ── Issue #783: SweepRunningTimeout EXCLUDES budget_paused_seconds (time parked at a
-	//    human gate) from the deadline, so gate-wait does not consume the wall budget. ──
+	// ── Issue #783: the wall PARK EXCLUDES budget_paused_seconds (time parked at a human
+	//    gate) from the deadline, so gate-wait does not consume the wall budget (PRD #1497). ──
 	t.Run("sweep excludes banked parked time from the wall deadline", func(t *testing.T) {
 		base := time.Now().UTC()
 		// 8h budget + 2h banked park = 10h deadline; started 9h ago → 9h < 10h → NOT swept.
@@ -601,23 +612,34 @@ func TestRunMilestoneProgressLiveDB(t *testing.T) {
 			`UPDATE runs SET started_at = $2, budget_wall_seconds = 28800, budget_paused_seconds = 7200 WHERE id = $1`,
 			overParked, base.Add(-11*time.Hour))
 
-		swept, err := q.SweepRunningTimeout(ctx, store.SweepRunningTimeoutParams{
-			FailureReason:        pgtype.Text{String: "run exceeded RUN_TIMEOUT", Valid: true},
+		// PRD #1497 M1: the wall no longer FAILS — it PARKS. The shared worker advertises no
+		// wall_park_v1, so ParkRunsAtWall parks each past-deadline run server-side; the same per-run
+		// three-term deadline decides membership, which is what these subtests pin.
+		if _, err := q.RequestWallParks(ctx, store.RequestWallParksParams{
 			Now:                  pgtype.Timestamptz{Time: base, Valid: true},
 			GlobalTimeoutSeconds: runTimeout,
+			WorkerStaleCutoff:    pgtype.Timestamptz{Time: base.Add(-5 * time.Minute), Valid: true},
+		}); err != nil {
+			t.Fatalf("RequestWallParks: %v", err)
+		}
+		parked, err := q.ParkRunsAtWall(ctx, store.ParkRunsAtWallParams{
+			Now:                  pgtype.Timestamptz{Time: base, Valid: true},
+			GlobalTimeoutSeconds: runTimeout,
+			WorkerStaleCutoff:    pgtype.Timestamptz{Time: base.Add(-5 * time.Minute), Valid: true},
+			GraceSeconds:         600,
 		})
 		if err != nil {
-			t.Fatalf("SweepRunningTimeout: %v", err)
+			t.Fatalf("ParkRunsAtWall: %v", err)
 		}
 		got := map[uuid.UUID]bool{}
-		for _, r := range swept {
+		for _, r := range parked {
 			got[r.ID] = true
 		}
 		if got[underParked] {
-			t.Fatalf("a run 9h into an 8h budget + 2h banked park (10h deadline) must NOT be swept")
+			t.Fatalf("a run 9h into an 8h budget + 2h banked park (10h deadline) must NOT be parked")
 		}
 		if !got[overParked] {
-			t.Fatalf("a run 11h into an 8h budget + 2h banked park (10h deadline) MUST be swept")
+			t.Fatalf("a run 11h into an 8h budget + 2h banked park (10h deadline) MUST be parked")
 		}
 	})
 
@@ -641,23 +663,34 @@ func TestRunMilestoneProgressLiveDB(t *testing.T) {
 			`UPDATE runs SET started_at = $2, budget_wall_seconds = NULL, budget_paused_seconds = 3600 WHERE id = $1`,
 			overGlobal, base.Add(-4*time.Hour))
 
-		swept, err := q.SweepRunningTimeout(ctx, store.SweepRunningTimeoutParams{
-			FailureReason:        pgtype.Text{String: "run exceeded RUN_TIMEOUT", Valid: true},
+		// PRD #1497 M1: the wall no longer FAILS — it PARKS. The shared worker advertises no
+		// wall_park_v1, so ParkRunsAtWall parks each past-deadline run server-side; the same per-run
+		// three-term deadline decides membership, which is what these subtests pin.
+		if _, err := q.RequestWallParks(ctx, store.RequestWallParksParams{
 			Now:                  pgtype.Timestamptz{Time: base, Valid: true},
 			GlobalTimeoutSeconds: runTimeout,
+			WorkerStaleCutoff:    pgtype.Timestamptz{Time: base.Add(-5 * time.Minute), Valid: true},
+		}); err != nil {
+			t.Fatalf("RequestWallParks: %v", err)
+		}
+		parked, err := q.ParkRunsAtWall(ctx, store.ParkRunsAtWallParams{
+			Now:                  pgtype.Timestamptz{Time: base, Valid: true},
+			GlobalTimeoutSeconds: runTimeout,
+			WorkerStaleCutoff:    pgtype.Timestamptz{Time: base.Add(-5 * time.Minute), Valid: true},
+			GraceSeconds:         600,
 		})
 		if err != nil {
-			t.Fatalf("SweepRunningTimeout: %v", err)
+			t.Fatalf("ParkRunsAtWall: %v", err)
 		}
 		got := map[uuid.UUID]bool{}
-		for _, r := range swept {
+		for _, r := range parked {
 			got[r.ID] = true
 		}
 		if got[underGlobal] {
-			t.Fatalf("a NULL-budget run 2h30m into a 2h global + 1h banked park (3h deadline) must NOT be swept")
+			t.Fatalf("a NULL-budget run 2h30m into a 2h global + 1h banked park (3h deadline) must NOT be parked")
 		}
 		if !got[overGlobal] {
-			t.Fatalf("a NULL-budget run 4h into a 2h global + 1h banked park (3h deadline) MUST be swept")
+			t.Fatalf("a NULL-budget run 4h into a 2h global + 1h banked park (3h deadline) MUST be parked")
 		}
 	})
 

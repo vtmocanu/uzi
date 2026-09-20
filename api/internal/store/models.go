@@ -646,6 +646,9 @@ type Run struct {
 	CredentialSwitchRequestedAt pgtype.Timestamptz `json:"credential_switch_requested_at"`
 	CredentialSwitchGeneration  pgtype.Int8        `json:"credential_switch_generation"`
 	StaleRequeueGeneration      pgtype.Int8        `json:"stale_requeue_generation"`
+	BudgetFinalizeSeconds       int32              `json:"budget_finalize_seconds"`
+	ReleasedWorkerID            pgtype.UUID        `json:"released_worker_id"`
+	ReleasedWorkerNonce         pgtype.Text        `json:"released_worker_nonce"`
 }
 
 type RunCompletionAttempt struct {

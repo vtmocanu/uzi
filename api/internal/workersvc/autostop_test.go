@@ -1045,11 +1045,29 @@ func (f *autoStopSweepStore) SweepClaimedNeverStarted(context.Context, pgtype.Ti
 func (f *autoStopSweepStore) SweepTaskNeverDispatched(context.Context, store.SweepTaskNeverDispatchedParams) ([]store.SweepTaskNeverDispatchedRow, error) {
 	return nil, nil
 }
-func (f *autoStopSweepStore) SweepRunningTimeout(context.Context, store.SweepRunningTimeoutParams) ([]store.SweepRunningTimeoutRow, error) {
+func (f *autoStopSweepStore) RequestWallParks(context.Context, store.RequestWallParksParams) ([]store.RequestWallParksRow, error) {
 	return nil, nil
 }
+func (f *autoStopSweepStore) ParkRunsAtWall(context.Context, store.ParkRunsAtWallParams) ([]store.ParkRunsAtWallRow, error) {
+	return nil, nil
+}
+func (f *autoStopSweepStore) SetRunWallPark(context.Context, store.SetRunWallParkParams) (store.Run, error) {
+	return store.Run{}, pgx.ErrNoRows
+}
+func (f *autoStopSweepStore) RecordWallParkCapturedHead(context.Context, store.RecordWallParkCapturedHeadParams) (int64, error) {
+	return 0, nil
+}
+func (f *autoStopSweepStore) CountOnlineWorkersClaimableForRun(context.Context, store.CountOnlineWorkersClaimableForRunParams) (int64, error) {
+	return 0, nil
+}
+func (f *autoStopSweepStore) ExtendAndResumeWallPark(context.Context, store.ExtendAndResumeWallParkParams) (int32, error) {
+	return 0, pgx.ErrNoRows
+}
+func (f *autoStopSweepStore) StopWallPark(context.Context, store.StopWallParkParams) (uuid.UUID, error) {
+	return uuid.Nil, pgx.ErrNoRows
+}
 
-// PRD #1226 M4 (D3)'s served-steer stamp, called right after SweepRunningTimeout. Empty (0 rows)
+// PRD #1226 M4 (D3)'s served-steer stamp, called right after the wall-park passes. Empty (0 rows)
 // for the same reason as the other passes this fixture does not exercise: it is here so Sweep runs
 // end to end, and stamping nothing keeps this file's subject (the auto-stop streak) the only thing
 // moving.

@@ -287,11 +287,12 @@ type fakeStore struct {
 	stampWorkerStaleCutoff pgtype.Timestamptz
 	stampRows              int64
 	// Rows the sweep queries return (PRD #25 M3): each drives a published transition.
-	sweptClaimed      []store.SweepClaimedNeverStartedRow
-	sweptUndispatched []store.SweepTaskNeverDispatchedRow // issue #1367
-	sweptTimeout      []store.SweepRunningTimeoutRow
-	sweptFailed       []store.FailRunsOfStaleWorkersOverCapRow
-	sweptRequeued     []store.RequeueRunsOfStaleWorkersRow
+	sweptClaimed       []store.SweepClaimedNeverStartedRow
+	sweptUndispatched  []store.SweepTaskNeverDispatchedRow // issue #1367
+	sweptWallRequested []store.RequestWallParksRow         // PRD #1497 M1: RequestWallParks rows
+	sweptWallParked    []store.ParkRunsAtWallRow           // PRD #1497 M1: ParkRunsAtWall rows
+	sweptFailed        []store.FailRunsOfStaleWorkersOverCapRow
+	sweptRequeued      []store.RequeueRunsOfStaleWorkersRow
 
 	// PRD #46 judge: enqueue funnel + trace/review authz + review upsert.
 	runByIDPlain      store.Run // GetRunByID (non-user-scoped): swept-run reload + trace target
@@ -974,7 +975,7 @@ func (f *fakeStore) InsertRunMessage(_ context.Context, arg store.InsertRunMessa
 	if f.insertedSeqs == nil {
 		f.insertedSeqs = map[int32]bool{}
 	}
-	live := store.InsertRunMessageRow{GenerationLive: pgtype.Bool{Bool: true, Valid: true}}
+	live := store.InsertRunMessageRow{GenerationLive: true}
 	if f.insertedSeqs[arg.Seq] {
 		return live, nil // ON CONFLICT DO NOTHING — a benign duplicate at the live generation
 	}
@@ -1216,11 +1217,30 @@ func (f *fakeStore) GetOpenMRRunForIssue(_ context.Context, _ store.GetOpenMRRun
 	}
 	return f.openMRRunForIssue, f.openMRRunForIssueErr
 }
-func (f *fakeStore) SweepRunningTimeout(_ context.Context, arg store.SweepRunningTimeoutParams) ([]store.SweepRunningTimeoutRow, error) {
+func (f *fakeStore) RequestWallParks(_ context.Context, arg store.RequestWallParksParams) ([]store.RequestWallParksRow, error) {
 	f.runNow = arg.Now
 	f.runGlobalTimeoutSeconds = arg.GlobalTimeoutSeconds
-	f.callOrder = append(f.callOrder, "running_timeout")
-	return f.sweptTimeout, nil
+	f.callOrder = append(f.callOrder, "wall_park_request")
+	return f.sweptWallRequested, nil
+}
+func (f *fakeStore) ParkRunsAtWall(_ context.Context, arg store.ParkRunsAtWallParams) ([]store.ParkRunsAtWallRow, error) {
+	f.callOrder = append(f.callOrder, "wall_park")
+	return f.sweptWallParked, nil
+}
+func (f *fakeStore) SetRunWallPark(context.Context, store.SetRunWallParkParams) (store.Run, error) {
+	return store.Run{}, pgx.ErrNoRows
+}
+func (f *fakeStore) RecordWallParkCapturedHead(context.Context, store.RecordWallParkCapturedHeadParams) (int64, error) {
+	return 0, nil
+}
+func (f *fakeStore) CountOnlineWorkersClaimableForRun(context.Context, store.CountOnlineWorkersClaimableForRunParams) (int64, error) {
+	return 0, nil
+}
+func (f *fakeStore) ExtendAndResumeWallPark(context.Context, store.ExtendAndResumeWallParkParams) (int32, error) {
+	return 0, pgx.ErrNoRows
+}
+func (f *fakeStore) StopWallPark(context.Context, store.StopWallParkParams) (uuid.UUID, error) {
+	return uuid.Nil, pgx.ErrNoRows
 }
 func (f *fakeStore) StampCompletionBudgetExhausted(_ context.Context, arg store.StampCompletionBudgetExhaustedParams) (int64, error) {
 	f.stampNow = arg.Now
@@ -3881,16 +3901,17 @@ func TestSweepComputesCutoffsAndOrder(t *testing.T) {
 	if _, err := svc.Sweep(context.Background()); err != nil {
 		t.Fatalf("Sweep: %v", err)
 	}
-	// PRD #1226 M4 (D3): the served-steer stamp runs RIGHT AFTER running_timeout (it stamps the
-	// rows that sweep's carve-out just spared), before the stale-worker recovery passes.
-	// issue #1367: the undispatched-handoff reaper runs right after claimed_never_started (the
-	// analogous never-progressed reclaim it is modelled on), before the running-timeout pass.
-	want := []string{"mark_stale", "claimed_never_started", "task_never_dispatched", "running_timeout", "stamp_budget_exhausted", "stale_fail_over_cap", "stale_requeue"}
+	// PRD #1497 M1: the wall-clock sweep is now RequestWallParks then ParkRunsAtWall (park, not
+	// fail). The served-steer stamp still runs RIGHT AFTER them (it stamps the post-attempt live
+	// rows the carve-out spared), before the stale-worker recovery passes; ParkRunsAtWall runs
+	// before the stale requeue (D5). issue #1367: the undispatched-handoff reaper runs right after
+	// claimed_never_started, before the wall-park passes.
+	want := []string{"mark_stale", "claimed_never_started", "task_never_dispatched", "wall_park_request", "wall_park", "stamp_budget_exhausted", "stale_fail_over_cap", "stale_requeue"}
 	if strings.Join(fs.callOrder, ",") != strings.Join(want, ",") {
 		t.Fatalf("sweep order = %v, want %v", fs.callOrder, want)
 	}
-	// The stamp must receive the SAME now / global-timeout / worker-stale-cutoff SweepRunningTimeout
-	// does, so it targets exactly the set the carve-out spared.
+	// The stamp must receive the SAME now / global-timeout / worker-stale-cutoff the wall-park
+	// request does, so it targets exactly the set the carve-out spared.
 	if !fs.stampNow.Time.Equal(fs.runNow.Time) {
 		t.Fatalf("stamp now = %v, want the same as SweepRunningTimeout's %v", fs.stampNow.Time, fs.runNow.Time)
 	}
@@ -3932,9 +3953,12 @@ func TestSweepPublishesTransitions(t *testing.T) {
 	r1, r2, r3 := uuid.New(), uuid.New(), uuid.New()
 	owner := uuid.New()
 	fs := &fakeStore{
-		sweptTimeout:  []store.SweepRunningTimeoutRow{{ID: r1, UserID: owner, Status: "failed"}},
-		sweptFailed:   []store.FailRunsOfStaleWorkersOverCapRow{{ID: r2, UserID: owner, Status: "failed"}},
-		sweptRequeued: []store.RequeueRunsOfStaleWorkersRow{{ID: r3, UserID: owner, Status: "queued"}},
+		// PRD #1497 M1: a server-side wall park (ParkRunsAtWall) publishes 'paused' — the wall no
+		// longer fails a run. RequestWallParks would publish 'running' (unchanged status); none is
+		// staged here, so the parked row is the only wall-park transition published.
+		sweptWallParked: []store.ParkRunsAtWallRow{{ID: r1, UserID: owner, Status: "paused"}},
+		sweptFailed:     []store.FailRunsOfStaleWorkersOverCapRow{{ID: r2, UserID: owner, Status: "failed"}},
+		sweptRequeued:   []store.RequeueRunsOfStaleWorkersRow{{ID: r3, UserID: owner, Status: "queued"}},
 	}
 	svc := New(fs, newBox(t), testParams())
 	b := &fakeBroadcaster{}
@@ -3944,13 +3968,13 @@ func TestSweepPublishesTransitions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Sweep: %v", err)
 	}
-	if res.RunningTimeout != 1 || res.StaleFailed != 1 || res.StaleRequeued != 1 {
-		t.Fatalf("counts = %d/%d/%d, want 1/1/1", res.RunningTimeout, res.StaleFailed, res.StaleRequeued)
+	if res.WallParked != 1 || res.StaleFailed != 1 || res.StaleRequeued != 1 {
+		t.Fatalf("counts = %d/%d/%d, want 1/1/1", res.WallParked, res.StaleFailed, res.StaleRequeued)
 	}
 	// Each swept row published its new status through the broadcaster.
 	got := strings.Join(b.statuses, ",")
-	if got != "failed,failed,queued" {
-		t.Fatalf("published statuses = %q, want failed,failed,queued", got)
+	if got != "paused,failed,queued" {
+		t.Fatalf("published statuses = %q, want paused,failed,queued", got)
 	}
 }
 

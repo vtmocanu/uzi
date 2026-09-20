@@ -253,6 +253,11 @@ type RunDTO struct {
 	// present (a non-pointer int): 0 is a meaningful value, not "unknown".
 	BudgetExtensionSeconds    int `json:"budget_extension_seconds"`
 	BudgetExtensionCapSeconds int `json:"budget_extension_cap_seconds"`
+	// BudgetFinalizeSeconds is the one-time finalize allowance the Stop action grants a wall-parked
+	// milestone issue run (PRD #1497 M1, D9): 1800 once granted, else 0. It lives OUTSIDE
+	// budget_extension_seconds (so the owner extension cap never sees it) and is the third term of
+	// budget_total_seconds. Always present (a plain int; 0 is meaningful, like the extension fields).
+	BudgetFinalizeSeconds int `json:"budget_finalize_seconds"`
 	// BudgetTotalSeconds is the run's total wall-clock budget: COALESCE(budget_wall_seconds,
 	// RUN_TIMEOUT) + budget_extension_seconds, computed server-side so a client never has to
 	// know RUN_TIMEOUT. Null for a kind/state that never times out (not running, chat/judge,
@@ -322,6 +327,16 @@ type RunDTO struct {
 	// HONESTLY — the hold is same-worker-only and MUST NOT be rendered as cross-worker durable.
 	// Server-computed, not stored.
 	HoldContext *string `json:"hold_context"`
+	// WorkerName is the display name of the run's worker (PRD #1497 M1), null when the run has no
+	// worker (unclaimed, or a server-side wall park that nulled worker_id on resume). Run detail
+	// previously exposed only worker_id; the wall-park panel names the worker, so the DTO carries it
+	// alongside. Non-sensitive display field, always on the wire (null when absent).
+	WorkerName *string `json:"worker_name"`
+	// CanStopAtWall is the SERVER-DERIVED gate for the Stop action on a wall park (PRD #1497 M1):
+	// true iff the run is in a 'budget_exhausted' hold on a milestone ISSUE run with at least one
+	// completed milestone AND the finalize allowance is unused (budget_finalize_seconds == 0). The
+	// client shows Stop only when this is true; false for every other run. Always on the wire.
+	CanStopAtWall bool `json:"can_stop_at_wall"`
 	// CompletionPhase is the SERVER-COMPUTED derived completion label (one of "checking" |
 	// "reworking" | "blocked" | ""): the SINGLE field the web and CLI both render D8's three
 	// states from ("Checking completion" / "Reworking unmet milestones" / "Completion blocked"),
@@ -802,7 +817,11 @@ type CredentialEpochDTO struct {
 // admin view, the owning user's email.
 type RunListItemDTO struct {
 	RunDTO
-	RepoPath   string  `json:"repo_path"`
+	RepoPath string `json:"repo_path"`
+	// WorkerName SHADOWS the embedded RunDTO.WorkerName (PRD #1497 M1 added that): the list query
+	// populates this depth-0 field, which json marshals in preference to the (null-in-the-list-path)
+	// embedded one, so the Runs index keeps its worker-name column. json collapses the duplicate tag
+	// to a single worker_name key on the wire.
 	WorkerName *string `json:"worker_name"`
 	OwnerEmail *string `json:"owner_email,omitempty"`
 	// Judge badge (PRD #98 M4, Decision 7). JudgeVerdict is the run's review verdict
@@ -899,6 +918,10 @@ type RunInputResponse struct {
 	// without a follow-up read. Both omitempty — set only on the extend path.
 	ExtensionSeconds *int       `json:"extension_seconds,omitempty"`
 	DeadlineAt       *time.Time `json:"deadline_at,omitempty"`
+	// PRD #1497 M1: true when an owner action on a wall park both applied AND resumed the run in one
+	// step (extend-and-resume, or stop). omitempty — absent (false) on every other path, including a
+	// plain extend of a running run — so the CLI can say the run resumed, not merely that time was added.
+	Resumed bool `json:"resumed,omitempty"`
 }
 
 // SteerInputDTO is one steer-queue entry (PRD #95, #634), served by

@@ -1151,35 +1151,41 @@ func TestRunDeadline(t *testing.T) {
 		budget      pgtype.Int4
 		paused      int32
 		ext         int32 // PRD #1189 M1: budget_extension_seconds, added to the sum
+		fin         int32 // PRD #1497 M1: budget_finalize_seconds, the third additive term
 		kind        string
 		interactive bool
 		status      string
 		wantNil     bool
 		want        time.Time
 	}{
-		{"8h budget + 32m pause", started, budget8h, int32(32 * 60), 0, "issue", false, "running", false, t0.Add(8*time.Hour + 32*time.Minute)},
-		{"null budget uses globalTimeout", started, nullBudget, 0, 0, "issue", false, "running", false, t0.Add(globalTimeout)},
+		{"8h budget + 32m pause", started, budget8h, int32(32 * 60), 0, 0, "issue", false, "running", false, t0.Add(8*time.Hour + 32*time.Minute)},
+		{"null budget uses globalTimeout", started, nullBudget, 0, 0, 0, "issue", false, "running", false, t0.Add(globalTimeout)},
 		// PRD #1189 M1: the extension is added on top of the frozen budget AND the pause.
 		// 8h wall + 30m pause + 2h extension = 10h30m. Mutation check: dropping the
 		// `effTimeout += budget_extension_seconds` fold in runWallClock reddens this case.
-		{"8h budget + 30m pause + 2h extension", started, budget8h, int32(30 * 60), int32(2 * 60 * 60), "issue", false, "running", false, t0.Add(10*time.Hour + 30*time.Minute)},
-		{"extension alone, no pause", started, budget8h, 0, int32(2 * 60 * 60), "issue", false, "running", false, t0.Add(10 * time.Hour)},
+		{"8h budget + 30m pause + 2h extension", started, budget8h, int32(30 * 60), int32(2 * 60 * 60), 0, "issue", false, "running", false, t0.Add(10*time.Hour + 30*time.Minute)},
+		{"extension alone, no pause", started, budget8h, 0, int32(2 * 60 * 60), 0, "issue", false, "running", false, t0.Add(10 * time.Hour)},
+		// PRD #1497 M1: budget_finalize_seconds is the third additive term. 8h wall + 30m finalize =
+		// 8h30m. Mutation check: dropping the `effTimeout += budget_finalize_seconds` fold reddens this.
+		{"8h budget + 30m finalize", started, budget8h, 0, 0, int32(30 * 60), "issue", false, "running", false, t0.Add(8*time.Hour + 30*time.Minute)},
+		// All three terms: 8h wall + 15m pause + 1h extension + 30m finalize = 9h45m.
+		{"8h + pause + extension + finalize", started, budget8h, int32(15 * 60), int32(60 * 60), int32(30 * 60), "issue", false, "running", false, t0.Add(9*time.Hour + 45*time.Minute)},
 		// A run with no wall deadline (chat) stays nil even when an extension is present:
 		// the extension only moves an EXISTING deadline, it never creates one.
-		{"chat with extension stays nil", started, budget8h, 0, int32(2 * 60 * 60), "chat", false, "running", true, time.Time{}},
-		{"null started_at", pgtype.Timestamptz{}, budget8h, 0, 0, "issue", false, "running", true, time.Time{}},
-		{"chat", started, budget8h, 0, 0, "chat", false, "running", true, time.Time{}},
-		{"judge", started, budget8h, 0, 0, "judge", false, "running", true, time.Time{}},
-		{"interactive", started, budget8h, 0, 0, "task", true, "running", true, time.Time{}},
-		{"queued", started, budget8h, 0, 0, "issue", false, "queued", true, time.Time{}},
-		{"awaiting_approval", started, budget8h, 0, 0, "issue", false, "awaiting_approval", true, time.Time{}},
-		{"completed", started, budget8h, 0, 0, "issue", false, "completed", true, time.Time{}},
-		{"failed", started, budget8h, 0, 0, "issue", false, "failed", true, time.Time{}},
-		{"cancelled", started, budget8h, 0, 0, "issue", false, "cancelled", true, time.Time{}},
+		{"chat with extension stays nil", started, budget8h, 0, int32(2 * 60 * 60), 0, "chat", false, "running", true, time.Time{}},
+		{"null started_at", pgtype.Timestamptz{}, budget8h, 0, 0, 0, "issue", false, "running", true, time.Time{}},
+		{"chat", started, budget8h, 0, 0, 0, "chat", false, "running", true, time.Time{}},
+		{"judge", started, budget8h, 0, 0, 0, "judge", false, "running", true, time.Time{}},
+		{"interactive", started, budget8h, 0, 0, 0, "task", true, "running", true, time.Time{}},
+		{"queued", started, budget8h, 0, 0, 0, "issue", false, "queued", true, time.Time{}},
+		{"awaiting_approval", started, budget8h, 0, 0, 0, "issue", false, "awaiting_approval", true, time.Time{}},
+		{"completed", started, budget8h, 0, 0, 0, "issue", false, "completed", true, time.Time{}},
+		{"failed", started, budget8h, 0, 0, 0, "issue", false, "failed", true, time.Time{}},
+		{"cancelled", started, budget8h, 0, 0, 0, "issue", false, "cancelled", true, time.Time{}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := RunDeadline(tc.started, tc.budget, tc.paused, tc.kind, tc.interactive, tc.status, globalTimeout, tc.ext)
+			got := RunDeadline(tc.started, tc.budget, tc.paused, tc.kind, tc.interactive, tc.status, globalTimeout, tc.ext, tc.fin)
 			if tc.wantNil {
 				if got != nil {
 					t.Fatalf("RunDeadline = %v, want nil", *got)

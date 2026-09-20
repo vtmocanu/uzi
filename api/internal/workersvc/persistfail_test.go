@@ -19,7 +19,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -507,7 +506,7 @@ func (f *persistFakeStore) InsertRunMessage(_ context.Context, arg store.InsertR
 	if f.stored == nil {
 		f.stored = map[int32]bool{}
 	}
-	live := store.InsertRunMessageRow{GenerationLive: pgtype.Bool{Bool: true, Valid: true}}
+	live := store.InsertRunMessageRow{GenerationLive: true}
 	if f.stored[arg.Seq] {
 		return live, nil // ON CONFLICT DO NOTHING — stored is stored (a live-generation duplicate)
 	}

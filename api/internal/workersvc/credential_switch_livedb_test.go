@@ -117,17 +117,34 @@ func TestSetStateGenerationFenceLiveDB(t *testing.T) {
 		}
 	})
 
-	t.Run("legacy report honoured unfenced", func(t *testing.T) {
-		// A run whose claim is RELEASED at G, but the report carries NO generation (a legacy,
-		// non-capability worker). The fence never engages, so the report is applied exactly as
-		// before the feature — proving nil generation is unfenced back-compat.
-		id := seedHeldRun(t, env, o, 5004, "running", g, false, true)
+	t.Run("legacy report on a LIVE claim honoured unfenced", func(t *testing.T) {
+		// A run at G with an UNRELEASED claim, reported with NO generation (a legacy, non-capability
+		// worker). The compatibility contract still honours a nil-generation report on a live claim.
+		id := seedHeldRun(t, env, o, 5004, "running", g, false, false)
 		run, applied, err := svc.SetState(env.ctx, wkr, id, runningReport(nil))
 		if err != nil {
-			t.Fatalf("legacy report: err = %v, want nil (unfenced)", err)
+			t.Fatalf("legacy report on live claim: err = %v, want nil (unfenced)", err)
 		}
 		if !applied || run.Status != "running" {
-			t.Fatalf("legacy report applied=%v status=%q, want applied running", applied, run.Status)
+			t.Fatalf("legacy report on live claim applied=%v status=%q, want applied running", applied, run.Status)
+		}
+	})
+
+	t.Run("legacy report on a RELEASED claim rejected", func(t *testing.T) {
+		// PRD #1497 M1 (D16): the released window closes for a generation-less report too. A run whose
+		// claim is RELEASED at G (queued after the release, the realistic post-release state), reported
+		// with NO generation, is now REJECTED — a legacy worker's report can no longer clobber a
+		// released claim, matching the generation-stamping fence.
+		id := seedHeldRun(t, env, o, 5005, "queued", g, false, true /* released */)
+		_, applied, err := svc.SetState(env.ctx, wkr, id, runningReport(nil))
+		if !errors.Is(err, ErrStaleClaim) {
+			t.Fatalf("legacy report on released claim: err = %v, want ErrStaleClaim (D16)", err)
+		}
+		if applied {
+			t.Fatal("a legacy nil-generation report on a RELEASED claim must NOT be applied (D16)")
+		}
+		if got := statusOf(t, env, id); got != "queued" {
+			t.Fatalf("released run status = %q, want it to STAY queued (the legacy report must not flip it to running)", got)
 		}
 	})
 }
@@ -414,9 +431,10 @@ func TestSetRunCredentialHeldStateStampRacedReleaseLiveDB(t *testing.T) {
 	}
 }
 
-// TestInsertRunMessageFenceLiveDB proves the message-append fence (PRD #1247 M5, D3): a batch
-// carrying the current generation lands; the SAME batch after the claim is released lands NOTHING;
-// a legacy batch (no generation) lands unconditionally.
+// TestInsertRunMessageFenceLiveDB proves the message-append fence (PRD #1247 M5, D3; tightened by
+// PRD #1497 M1 D16): a batch carrying the current generation lands; the SAME batch after the claim is
+// released lands NOTHING; and a legacy batch (no generation) ALSO lands nothing on a released claim
+// (D16 closes the released window for a generation-less append too) while still landing on a live one.
 func TestInsertRunMessageFenceLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	svc := New(env.q, env.box, testParams())
@@ -456,12 +474,25 @@ func TestInsertRunMessageFenceLiveDB(t *testing.T) {
 		t.Fatalf("message count = %d, want 1 (a released-claim append is fenced out)", countMsgs())
 	}
 
-	// (3) A legacy batch (nil generation) lands unconditionally, even on the released run.
+	// (3) PRD #1497 M1 (D16): a legacy batch (nil generation) on the RELEASED run now lands NOTHING
+	// too — the InsertRunMessage fence requires an unreleased claim even without a stamped generation.
+	// AppendMessages (the nil-generation path) does not surface ErrStaleClaim (that is the
+	// capability-batch contract), so it returns nil while persisting nothing.
 	if err := svc.AppendMessages(env.ctx, wkr, id, []IncomingMessage{msg(3)}); err != nil {
-		t.Fatalf("legacy append: %v", err)
+		t.Fatalf("legacy append on released claim: %v", err)
+	}
+	if countMsgs() != 1 {
+		t.Fatalf("message count = %d, want 1 (D16: a legacy append on a released claim is fenced out too)", countMsgs())
+	}
+
+	// (4) A legacy batch on a LIVE claim still lands (the compatibility contract): clear the release
+	// and re-append.
+	env.exec(`UPDATE runs SET claim_released_at = NULL WHERE id = $1`, id)
+	if err := svc.AppendMessages(env.ctx, wkr, id, []IncomingMessage{msg(3)}); err != nil {
+		t.Fatalf("legacy append on live claim: %v", err)
 	}
 	if countMsgs() != 2 {
-		t.Fatalf("message count = %d, want 2 (a legacy append is unfenced)", countMsgs())
+		t.Fatalf("message count = %d, want 2 (a legacy append on a LIVE claim is unfenced)", countMsgs())
 	}
 }
 

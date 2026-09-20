@@ -76,7 +76,7 @@ func (n *Notifier) handleHealth(ctx context.Context, ev healthEvent) {
 	// admin setting (nil reader / read error → 0 → the command is omitted, the safe
 	// default). Both inputs are ignored for every flag other than `slow`.
 	deadline := workersvc.RunDeadline(rc.StartedAt, rc.BudgetWallSeconds, rc.BudgetPausedSeconds,
-		rc.Kind, rc.Interactive, rc.Status, n.runTimeout, rc.BudgetExtensionSeconds)
+		rc.Kind, rc.Interactive, rc.Status, n.runTimeout, rc.BudgetExtensionSeconds, rc.BudgetFinalizeSeconds)
 	extensionCap := 0
 	if n.extensionCap != nil {
 		extensionCap, _ = n.extensionCap(ctx)

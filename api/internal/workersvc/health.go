@@ -14,6 +14,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -452,7 +453,7 @@ func (s *Service) runningTarget(ctx context.Context, now time.Time, r store.List
 	// RunDeadline so the arm and the served deadline_at can never disagree (D9). Static
 	// reason; the live number rides deadline_at on the DTO (D4).
 	if th.nearTimeoutPct > 0 {
-		if effTimeout, ok := runWallClock(r.BudgetWallSeconds, r.Kind, r.Interactive, r.Status, r.StartedAt.Valid, s.p.RunTimeout, r.BudgetExtensionSeconds); ok {
+		if effTimeout, ok := runWallClock(r.BudgetWallSeconds, r.Kind, r.Interactive, r.Status, r.StartedAt.Valid, s.p.RunTimeout, r.BudgetExtensionSeconds, r.BudgetFinalizeSeconds); ok {
 			active := now.Sub(r.StartedAt.Time) - time.Duration(r.BudgetPausedSeconds)*time.Second
 			if active >= effTimeout/100*time.Duration(th.nearTimeoutPct) { // divide first: no overflow, sub-100ns loss
 				return healthSlow, reasonNearTimeout
@@ -760,6 +761,38 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 			}
 		}
 	}
+	// PRD #1497 M1 (D19): a run whose ONLY worker that could claim it is the incarnation a
+	// server-side wall park RELEASED is unplaceable until that worker restarts (a restart rotates its
+	// snapshot_register_nonce → a fresh, claimable incarnation) or another worker comes online. When
+	// NO online worker can actually claim THIS run (CountOnlineWorkersClaimableForRun mirrors
+	// ClaimRun's full per-worker conjunction, incl. the released-pair exclusion) AND released_worker_id
+	// still names an online worker, name it so the owner knows the actionable fix. Placed after the
+	// capability/repo rungs so their more-specific reasons keep precedence; a read error falls through
+	// to the generic reasons below. The per-run counts sit behind the queued-threshold guard in
+	// healthTargetFor, so they run for ~0 runs/tick.
+	if r.ReleasedWorkerID.Valid {
+		var allowlist []uuid.UUID
+		if s.dockerAllowlist != nil {
+			if al, aerr := s.dockerAllowlist.DockerRepoAllowlist(ctx); aerr != nil {
+				slog.Error("health: docker allowlist for released-worker reason", "error", aerr)
+			} else {
+				allowlist = al
+			}
+		}
+		if claimable, cerr := s.q.CountOnlineWorkersClaimableForRun(ctx, store.CountOnlineWorkersClaimableForRunParams{
+			RunID:               r.ID,
+			HeartbeatCutoff:     pgconv.Time(now.Add(-s.p.WorkerHeartbeatStale)),
+			DockerRepoAllowlist: allowlist,
+			CapabilityAware:     capAware,
+		}); cerr != nil {
+			slog.Error("health: count workers claimable for run", "run_id", r.ID, "error", cerr)
+		} else if claimable == 0 {
+			if wkr, werr := s.q.GetWorkerByID(ctx, uuid.UUID(r.ReleasedWorkerID.Bytes)); werr == nil &&
+				wkr.LastHeartbeatAt.Valid && !wkr.LastHeartbeatAt.Time.Before(now.Add(-s.p.WorkerHeartbeatStale)) {
+				return fmt.Sprintf("waiting for another worker, or restart worker %s (its previous process was released at the time limit)", wkr.Name)
+			}
+		}
+	}
 	free, err := s.q.CountOnlineWorkersWithFreeSlotForUser(ctx, r.UserID)
 	if err != nil {
 		slog.Error("health: count online workers with free slot", "error", err)
@@ -901,7 +934,7 @@ func healthPct(pct int, _ error) int {
 // PRD #1189: budgetExtensionSeconds is folded into effTimeout, so an owner-granted
 // extension moves the near-timeout line AND the served deadline together — exactly the
 // term SweepRunningTimeout adds to its own interval.
-func runWallClock(budgetWallSeconds pgtype.Int4, kind string, interactive bool, status string, startedValid bool, globalTimeout time.Duration, budgetExtensionSeconds int32) (effTimeout time.Duration, ok bool) {
+func runWallClock(budgetWallSeconds pgtype.Int4, kind string, interactive bool, status string, startedValid bool, globalTimeout time.Duration, budgetExtensionSeconds, budgetFinalizeSeconds int32) (effTimeout time.Duration, ok bool) {
 	if !startedValid || interactive || status != "running" || kind == "chat" || kind == "judge" {
 		return 0, false
 	}
@@ -909,7 +942,10 @@ func runWallClock(budgetWallSeconds pgtype.Int4, kind string, interactive bool, 
 	if budgetWallSeconds.Valid && budgetWallSeconds.Int32 > 0 {
 		effTimeout = time.Duration(budgetWallSeconds.Int32) * time.Second
 	}
+	// PRD #1189 extension term + PRD #1497 finalize term — the same two additive terms the sweep's
+	// three-term deadline carries, so the near-timeout line and the park fire together.
 	effTimeout += time.Duration(budgetExtensionSeconds) * time.Second
+	effTimeout += time.Duration(budgetFinalizeSeconds) * time.Second
 	if effTimeout <= 0 {
 		return 0, false
 	}
@@ -918,11 +954,12 @@ func runWallClock(budgetWallSeconds pgtype.Int4, kind string, interactive bool, 
 
 // RunDeadline is the one server-computed wall-clock deadline every surface shares
 // (D9): started_at + COALESCE(budget_wall_seconds, globalTimeout) + budget_paused_seconds
-// + budget_extension_seconds, or nil when the run has no wall deadline (not running,
-// chat/judge, interactive, or no started_at). Pure. The extend/pause follow-up adds
-// budget_extension_seconds here.
-func RunDeadline(startedAt pgtype.Timestamptz, budgetWallSeconds pgtype.Int4, budgetPausedSeconds int32, kind string, interactive bool, status string, globalTimeout time.Duration, budgetExtensionSeconds int32) *time.Time {
-	effTimeout, ok := runWallClock(budgetWallSeconds, kind, interactive, status, startedAt.Valid, globalTimeout, budgetExtensionSeconds)
+// + budget_extension_seconds + budget_finalize_seconds (PRD #1497 M1's three-term total),
+// or nil when the run has no wall deadline (not running, chat/judge, interactive, or no
+// started_at). Pure. It stays nil while PARKED (status != 'running'), by design — a parked
+// run has no live deadline; its budget_total_seconds/budget_used_seconds are surfaced instead.
+func RunDeadline(startedAt pgtype.Timestamptz, budgetWallSeconds pgtype.Int4, budgetPausedSeconds int32, kind string, interactive bool, status string, globalTimeout time.Duration, budgetExtensionSeconds, budgetFinalizeSeconds int32) *time.Time {
+	effTimeout, ok := runWallClock(budgetWallSeconds, kind, interactive, status, startedAt.Valid, globalTimeout, budgetExtensionSeconds, budgetFinalizeSeconds)
 	if !ok {
 		return nil
 	}

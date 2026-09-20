@@ -1090,6 +1090,12 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// interlocked run it cannot complete (running/awaiting_input -> paused); the returned
 		// status is the park-order ack (paused = clean up, anything else = retain live).
 		r.Post("/runs/{id}/completion/hold", h.WorkerRunCompletionHold)
+		// PRD #1497 M1 (D4/D15): the wall-clock PARK transition. The worker reports it dropped its
+		// turn at the deadline and captured the tree; the service parks the run (running -> paused,
+		// hold_reason='budget_exhausted') via the fenced SetRunWallPark, whose sole authority is the
+		// three-term deadline. paused = parked (clean up), anything else = the owner extended in the
+		// window, restart the turn. Mirrors the completion/hold ack contract.
+		r.Post("/runs/{id}/wall-park", h.WorkerRunWallPark)
 
 		// Ownership/terminality probe (#559): worker-authenticated, run-scoped,
 		// READ ONLY. The interactive park-SKIP path polls it to detect a mid-turn

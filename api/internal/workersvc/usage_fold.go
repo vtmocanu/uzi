@@ -417,8 +417,10 @@ func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uu
 		// advancing the high-water mark and BEFORE foldRunUsage, which would otherwise mutate
 		// run_usage with an OLD generation's frames after release/reclaim. Both the fence rejection
 		// and a benign duplicate used to look like rows == 0; only the former is stale. A legacy
-		// (nil generation) caller always sees generation_live == true, so this never fires for it.
-		if effectiveClaimGen != nil && !res.GenerationLive.Bool {
+		// (nil generation) caller is not fenced HERE (the effectiveClaimGen != nil short-circuit), so
+		// this never fires for it; PRD #1497 M1 (D16) tightened InsertRunMessage so a nil-generation
+		// append on a RELEASED claim persists nothing (generation_live == false) at the SQL layer.
+		if effectiveClaimGen != nil && !res.GenerationLive {
 			return obs, ErrStaleClaim
 		}
 		if m.Seq > maxStored {

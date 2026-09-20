@@ -86,6 +86,17 @@ const CodexHarnessV1 = "codex_harness_v1"
 // vocabulary entry is what makes FilterProtocol ADMIT it, so a worker that sends it is recorded.
 const CredentialSwitchV1 = "credential_switch_v1" //nolint:gosec // G101: a capability VOCABULARY name, not a credential — the string is a protocol token stored in workers.protocol_capabilities, never a secret.
 
+// WallParkV1 is the PROTOCOL capability a worker self-reports (PRD #1497 M1, D13) to declare it
+// implements the wall-clock PARK protocol — it drops its turn on a system 'wall' pause input,
+// captures the tree, and reports the wall_park transition rather than failing at the deadline. Like
+// CompletionInterlockV1 / CodexHarnessV1 it is a worker/server protocol fact, NOT a scheduler
+// capability or a user-chosen repo requirement, so it lives in the protocol vocabulary below, NEVER
+// in `vocabulary`, `required_capabilities` or the web capability picker. It is compatibility
+// NEGOTIATION, not a rollout toggle: the timeout sweep files a wall request only for a worker that
+// advertises it (RequestWallParks joins on it); an incapable worker's out-of-time run is parked
+// server-side at once (ParkRunsAtWall), never failed, so a mixed fleet is handled by construction.
+const WallParkV1 = "wall_park_v1"
+
 // protocolVocabulary is the closed set of legal PROTOCOL capability names — kept
 // entirely separate from `vocabulary` so a protocol string is never offered to users
 // through Vocabulary()/the web mirror. FilterProtocol drops anything not in here.
@@ -95,11 +106,12 @@ var protocolVocabulary = map[string]struct{}{
 	RecoveryArchiveV2:     {},
 	CodexHarnessV1:        {},
 	CredentialSwitchV1:    {},
+	WallParkV1:            {},
 }
 
 // protocolOrder fixes FilterProtocol's stable output order (protocolVocabulary is a map,
 // so its own iteration order is not stable). Keep in lockstep with protocolVocabulary.
-var protocolOrder = []string{CompletionInterlockV1, RecoveryArchiveV1, RecoveryArchiveV2, CodexHarnessV1, CredentialSwitchV1}
+var protocolOrder = []string{CompletionInterlockV1, RecoveryArchiveV1, RecoveryArchiveV2, CodexHarnessV1, CredentialSwitchV1, WallParkV1}
 
 // FilterProtocol returns the members of in that are in the PROTOCOL vocabulary, DROPPING
 // unknowns silently (never an error), deduped, in stable order. It mirrors Filter but
