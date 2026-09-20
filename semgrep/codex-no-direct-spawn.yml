@@ -43,8 +43,8 @@ rules:
     languages: [typescript]
     severity: ERROR
     message: >-
-      Raw child_process spawn is confined to the sanctioned Codex supervisor launcher.
-      A spawn/exec/fork in any
+      Raw child_process spawn is confined to the sanctioned Codex seams (the
+      supervisor launcher, plus the boot-time Landlock probe). A spawn/exec/fork in any
       other agent/src/codex file escapes the supervisor/registry lifecycle and the
       seam boundary. Route the subprocess through the launcher / command / fileop
       seam.
