@@ -3,7 +3,16 @@ import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { act, cleanup, render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes, useNavigate } from "react-router-dom";
 import { IssueView } from "./IssueView";
-import { api, ApiError, type Card, type IssueDetail, type Run, type SecretMeta, type Worker } from "../lib/api";
+import {
+  api,
+  ApiError,
+  type Card,
+  type IssueDetail,
+  type Run,
+  type RunListItem,
+  type SecretMeta,
+  type Worker,
+} from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
 
 // IssueView loads four endpoints and, for Promote (PRD #764), calls promoteIssue.
@@ -85,6 +94,70 @@ function aCard(labels: string[]): Card {
     latest_run: null,
     pipeline: null,
   };
+}
+
+function aRunItem(over: Partial<RunListItem> = {}): RunListItem {
+  return {
+    id: "run-1",
+    repo_id: "repo-1",
+    forge_type: "gitlab",
+    mr_web_url: null,
+    issue_web_url: null,
+    kind: "issue",
+    issue_iid: 7,
+    issue_title: "A run",
+    issue_description: "",
+    harness: "claude",
+    title: null,
+    resume_of_run_id: null,
+    status: "completed",
+    requeue_count: 0,
+    iteration_count: 0,
+    auto_approve: false,
+    worker_id: "w1",
+    branch: null,
+    model: null,
+    override_subagent_model: false,
+    mr_iid: null,
+    mr_state: null,
+    failure_reason: null,
+    stop_kind: null,
+    stop_reason: null,
+    health: "ok",
+    health_reason: null,
+    health_since: null,
+    pipeline_ref: null,
+    pipeline_web_url: null,
+    fix_verdict: null,
+    plan_md: null,
+    repo_agents: null,
+    agent_source: null,
+    agent_exclusions: null,
+    own_agents: null,
+    anthropic_secret_id: null,
+    anthropic_secret_label: null,
+    anthropic_select_reason: null,
+    anthropic_headroom_pct: null,
+    wait_on_limit: false,
+    limit_resets_at: null,
+    retry_not_before: null,
+    limit_wait_count: 0,
+    rate_limit_type: null,
+    recovery_wait_cause: null,
+    recovery_retry_not_before: null,
+    forge_park_count: 0,
+    forge_park_max: 0,
+    claimed_at: null,
+    started_at: "2026-07-05T12:00:00Z",
+    finished_at: "2026-07-05T12:05:00Z",
+    created_at: "2026-07-05T12:00:00Z",
+    updated_at: "2026-07-05T12:05:00Z",
+    repo_path: "ns/repo",
+    worker_name: "w1",
+    judge_verdict: null,
+    judge_todo_count: 0,
+    ...over,
+  } as RunListItem;
 }
 
 function setAuth() {
@@ -174,6 +247,47 @@ describe("IssueView — the forge title and description carry no format characte
     expect(await screen.findByText("Fix the parser bug")).toBeTruthy();
     expect(container.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
     expect(container.textContent).toContain("The approved fix is in");
+  });
+});
+
+// issue #1486: a run-history row's MR/PR link is reconstructed from the issue's project
+// URL when the run has no persisted mr_web_url, and that reconstruction must be
+// forge-aware. A github issue + github run must produce a /pull/<n> link, not GitLab's
+// hard-coded /-/merge_requests/<n> (a 404 on GitHub) and not an inert chip.
+describe("IssueView run history — forge-aware MR/PR link when mr_web_url is null (#1486)", () => {
+  it("builds a /pull/<n> RunHistoryRow link for a github issue+run", async () => {
+    setAuth();
+    mockApi.getIssue.mockResolvedValue({
+      issue: anIssue({
+        forge_type: "github",
+        web_url: "https://github.com/ns/repo/issues/7",
+      }),
+    });
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        aRunItem({
+          id: "run-1",
+          status: "completed",
+          forge_type: "github",
+          mr_iid: 799,
+          mr_state: "opened",
+          mr_web_url: null,
+        }),
+      ],
+    });
+
+    const { container } = renderIssueView();
+
+    await screen.findByText("A small typo fix");
+    // A real anchor (not an inert span) carrying the GitHub /pull/ path.
+    const chip = await waitFor(() => {
+      const a = container.querySelector('a[href*="/pull/"]') as HTMLAnchorElement | null;
+      expect(a).not.toBeNull();
+      return a!;
+    });
+    expect(chip.getAttribute("href")).toBe("https://github.com/ns/repo/pull/799");
+    // Non-vacuous: the old hard-coded path would have produced /-/merge_requests/799.
+    expect(container.querySelector('a[href*="merge_requests"]')).toBeNull();
   });
 });
 

@@ -20,6 +20,7 @@ import { Badge, Button, cx } from "../../components/ui";
 import { FixCiButton, PipelineBadge } from "../../components/PipelineBadge";
 import { MrChip } from "../../components/MrChip";
 import { forgePlatform } from "../../lib/forgeNoun";
+import { mergeRequestUrl } from "../../lib/forgeUrls";
 import { ExternalLinkIcon } from "../../components/icons";
 import { stripUnsafeChars } from "../../lib/safeText";
 import { useDemoMode } from "../../lib/demoMode";
@@ -221,13 +222,15 @@ export function IssueCard({
   const loud = needsHumanAttention(effectiveRunStatus(run ?? { status: "" }));
   // The MR/PR link (PRD #65 D8): prefer the forge-supplied URL the worker persisted
   // (the only correct link on Forgejo), guarded through isHttpsUrl by preferForgeUrl
-  // before it becomes an anchor. A null (rows created before it landed — all GitLab)
-  // falls back to the legacy GitLab reconstruction from the project base.
+  // before it becomes an anchor. A null (rows created before it landed) falls back to a
+  // forge-aware reconstruction from the project base — the path segment is chosen per
+  // forge (GitLab /-/merge_requests/, GitHub /pull/, Forgejo /pulls/) by mergeRequestUrl,
+  // which keeps the isHttpsUrl guard.
   const mrHref =
     badge?.kind === "mr"
       ? preferForgeUrl(
           run?.mr_web_url,
-          isHttpsUrl(projectWebUrl) ? `${projectWebUrl}/-/merge_requests/${badge.mrIid}` : null,
+          mergeRequestUrl(projectWebUrl, badge.mrIid, card.forge_type),
         )
       : null;
   return (

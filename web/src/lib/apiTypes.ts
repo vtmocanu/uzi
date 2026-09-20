@@ -620,8 +620,9 @@ export interface LatestRun {
   mr_iid: number | null;
   // Forge-supplied MR/PR web URL persisted by the worker at creation (PRD #65 D8),
   // null on runs created before it landed. Rendered directly through isHttpsUrl; a
-  // null falls back to the legacy GitLab URL reconstruction (forgeUrls.ts). It is
-  // the only correct link on Forgejo, whose PR URL grammar differs from GitLab's.
+  // null falls back to a forge-aware URL reconstruction (forgeUrls.ts) that picks the
+  // path segment per forge_type. It is the only correct link on Forgejo, whose PR URL
+  // grammar differs from GitLab's.
   mr_web_url: string | null;
   // Last merge-request state the PRD #24 watcher observed for mr_iid
   // (opened|closed|merged|locked), null when never observed. Display-only hint

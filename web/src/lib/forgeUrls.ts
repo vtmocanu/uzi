@@ -1,22 +1,33 @@
-// Pure GitLab web-URL helpers (GitLab-only product). Kept in one module so the
-// `/-/issues/` and `/-/merge_requests/` path coupling lives in a single tested
+// Forge-aware web-URL helpers (GitLab, GitHub, Forgejo). Kept in one module so the
+// per-forge `/issues/` and merge/pull-request path coupling lives in a single tested
 // place instead of being reconstructed inline in each page (see forgeUrls.test.ts).
 
 import { isHttpsUrl } from "./api";
+import { mrPathSegment } from "./forgeNoun";
 
 // projectWebUrlFromIssue recovers a project's base web URL from one of its issue
-// URLs. GitLab issue URLs are `${projectWebUrl}/-/issues/${iid}` (the project path
-// may contain subgroups, e.g. .../group/sub/proj/-/issues/5), so stripping at the
-// `/-/issues/` marker yields the base. Returns "" when the shape does not match,
-// which mergeRequestUrl then declines to turn into a link.
+// URLs, tolerating both forge grammars. GitLab issue URLs are
+// `${projectWebUrl}/-/issues/${iid}` (the project path may contain subgroups, e.g.
+// .../group/sub/proj/-/issues/5); GitHub/Forgejo use `${projectWebUrl}/issues/${n}`.
+// The GitLab `/-/issues/` marker is checked FIRST because a GitLab URL also contains
+// the plain `/issues/` substring. Returns "" when neither shape matches, which
+// mergeRequestUrl then declines to turn into a link.
 export function projectWebUrlFromIssue(issueWebUrl: string): string {
-  const i = issueWebUrl.indexOf("/-/issues/");
-  return i >= 0 ? issueWebUrl.slice(0, i) : "";
+  const g = issueWebUrl.indexOf("/-/issues/");
+  if (g >= 0) return issueWebUrl.slice(0, g);
+  const h = issueWebUrl.indexOf("/issues/");
+  return h >= 0 ? issueWebUrl.slice(0, h) : "";
 }
 
-// mergeRequestUrl builds the web URL for a project's merge request by iid, or null
-// when the project base is not a usable https URL — so callers render a plain "!N"
-// chip instead of a dead or hostile link.
-export function mergeRequestUrl(projectWebUrl: string, mrIid: number): string | null {
-  return isHttpsUrl(projectWebUrl) ? `${projectWebUrl}/-/merge_requests/${mrIid}` : null;
+// mergeRequestUrl builds the web URL for a project's merge/pull request by iid, with
+// the path segment chosen per forge (mrPathSegment): GitLab `/-/merge_requests/`,
+// GitHub `/pull/`, Forgejo/Gitea `/pulls/`. Returns null when the project base is not
+// a usable https URL — so callers render a plain "!N"/"#N" chip instead of a dead or
+// hostile link.
+export function mergeRequestUrl(
+  projectWebUrl: string | null | undefined,
+  mrIid: number,
+  forgeType: string | null | undefined,
+): string | null {
+  return isHttpsUrl(projectWebUrl) ? `${projectWebUrl}${mrPathSegment(forgeType)}${mrIid}` : null;
 }

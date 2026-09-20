@@ -522,6 +522,72 @@ describe("IssueCard duration token (issue #256 M4)", () => {
   });
 });
 
+// issue #1486: the board card's MR/PR chip falls back to a RECONSTRUCTED link when the
+// run has no persisted mr_web_url, and that reconstruction must be forge-aware. A GitHub
+// card must build /pull/<n>, not GitLab's hard-coded /-/merge_requests/<n> (a 404 link on
+// GitHub). projectWebUrl is the board's https web_url prop, from which the chip is rebuilt.
+describe("IssueCard — forge-aware MR/PR chip link when mr_web_url is null (#1486)", () => {
+  const completedGithubRun = (): LatestRun =>
+    ({
+      id: "run-1",
+      status: "completed",
+      mr_iid: 42,
+      mr_web_url: null,
+      mr_state: null,
+      failure_reason: null,
+      stop_kind: null,
+      health: "ok",
+      health_reason: null,
+      health_since: null,
+      owner_name: "someone",
+      worker_name: "laptop",
+      is_mine: true,
+      run_count: 1,
+      created_at: "2026-07-04T12:00:00Z",
+      updated_at: "2026-07-04T12:00:00Z",
+    }) as LatestRun;
+
+  it("builds a /pull/<n> chip href for a github card (never GitLab's /-/merge_requests/)", () => {
+    render(
+      <MemoryRouter>
+        <IssueCard
+          card={aCard({ forge_type: "github", latest_run: completedGithubRun() })}
+          repoId="repo-1"
+          projectWebUrl="https://github.com/ns/repo"
+          chips={[]}
+          laneLabel="Backlog"
+          canMoveUp={false}
+          canMoveDown={false}
+          onMoveUp={vi.fn()}
+          onMoveDown={vi.fn()}
+          insertionEdge={null}
+          gate={{ enabled: true, reason: "" }}
+          starting={false}
+          onStart={vi.fn()}
+          fixCiBusy={false}
+          onFixCi={vi.fn()}
+          uziLabel="uzi"
+          isEligible
+          canPromote={false}
+          promoting={false}
+          onPromote={vi.fn()}
+          onDragStart={vi.fn()}
+          onDragEnd={vi.fn()}
+          dimmed={false}
+        />
+      </MemoryRouter>,
+    );
+    // The completed-run MR chip is an anchor whose accessible name is the "#42" ref (github
+    // sigil), distinct from the card's title link and its "#7" iid span.
+    const link = screen.getByRole("link", { name: "#42" }) as HTMLAnchorElement;
+    const href = link.getAttribute("href") ?? "";
+    expect(href).toBe("https://github.com/ns/repo/pull/42");
+    // Non-vacuous: the old hard-coded GitLab path would end /-/merge_requests/42 and fail here.
+    expect(href.endsWith("/pull/42")).toBe(true);
+    expect(href).not.toContain("/-/merge_requests/");
+  });
+});
+
 // PRD #1167 M4: shadowSignal drives data-live / data-attention on the card ROOT, which
 // only the Shadow theme styles (live → ember-dark card, attention → rust rail). The
 // attributes render present-or-absent, so these assert their presence off the root's

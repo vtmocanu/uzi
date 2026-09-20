@@ -270,14 +270,16 @@ export function RunRow({
   // label and closed is muted + struck. This is a per-run frozen hint.
   const mrState = mrChipState(run.mr_state);
   // Issue #803: make the MR/PR chip a real deep-link. Prefer the persisted forge URL
-  // (mr_web_url); fall back to reconstructing it from the run's own issue URL, which
-  // only works for GitLab's /-/issues/ shape (projectWebUrlFromIssue), exactly as
+  // (mr_web_url); fall back to reconstructing it from the run's own issue URL. Both
+  // forge grammars are handled (projectWebUrlFromIssue tolerates GitLab's /-/issues/
+  // and GitHub/Forgejo's /issues/), and mergeRequestUrl picks the path segment per
+  // forge (GitLab /-/merge_requests/, GitHub /pull/, Forgejo /pulls/), exactly as
   // IssueView does. preferForgeUrl/mergeRequestUrl guard non-https/empty inputs and
   // return null, so a malformed value degrades to the inert <span> chip.
   const mrHref = preferForgeUrl(
     run.mr_web_url,
     run.mr_iid != null && run.issue_web_url
-      ? mergeRequestUrl(projectWebUrlFromIssue(run.issue_web_url), run.mr_iid)
+      ? mergeRequestUrl(projectWebUrlFromIssue(run.issue_web_url), run.mr_iid, run.forge_type)
       : null,
   );
   // PRD #122: compact milestone progress for the row; null on a non-milestone run,

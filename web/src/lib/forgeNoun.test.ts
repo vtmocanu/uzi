@@ -1,5 +1,13 @@
 import { describe, it, expect } from "vitest";
-import { forgeNoun, forgeNounLower, forgeNounSentence, forgePlatform, mrAbbrev, mrRefSymbol } from "./forgeNoun";
+import {
+  forgeNoun,
+  forgeNounLower,
+  forgeNounSentence,
+  forgePlatform,
+  mrAbbrev,
+  mrPathSegment,
+  mrRefSymbol,
+} from "./forgeNoun";
 
 describe("forgeNoun", () => {
   it("returns the per-forge Title-Case noun", () => {
@@ -46,5 +54,22 @@ describe("forgeNoun", () => {
     expect(forgePlatform("")).toBe("GitLab");
     expect(forgePlatform(null)).toBe("GitLab");
     expect(forgePlatform(undefined)).toBe("GitLab");
+  });
+});
+
+describe("mrPathSegment (issue #1486)", () => {
+  it("gives the per-forge merge/pull-request path segment", () => {
+    expect(mrPathSegment("gitlab")).toBe("/-/merge_requests/");
+    // GitHub's PR path is /pull/<n>; Forgejo/Gitea's is /pulls/<n>. Both PR-forges are
+    // named explicitly so a missing arm never builds GitLab's /-/merge_requests/ (a 404).
+    expect(mrPathSegment("github")).toBe("/pull/");
+    expect(mrPathSegment("forgejo")).toBe("/pulls/");
+  });
+
+  it("defaults unknown/absent forge_type to GitLab's segment (preserves pre-Forgejo rows)", () => {
+    expect(mrPathSegment("")).toBe("/-/merge_requests/");
+    expect(mrPathSegment(null)).toBe("/-/merge_requests/");
+    expect(mrPathSegment(undefined)).toBe("/-/merge_requests/");
+    expect(mrPathSegment("something_else")).toBe("/-/merge_requests/");
   });
 });
