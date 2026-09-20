@@ -36,7 +36,12 @@ export function AdminShell({ description, children }: { description: ReactNode; 
 
   // On a narrow tab strip the row scrolls (overflow-x-auto); keep the ACTIVE tab in view so
   // Health — the last, rightmost tab — is reachable without a horizontal scroll the user
-  // has to discover. Re-run when the route changes so switching tabs re-centres.
+  // has to discover. Re-run when the route changes so switching tabs re-centres, AND when the
+  // health pip appears or changes severity: the pip is fed by a best-effort fetch that resolves
+  // 100-300 ms after mount, widening the (rightmost) Health tab; without it in the deps the
+  // scroll runs once on the pre-pip width and leaves the just-rendered pip's count clipped at
+  // the strip's right edge on a narrow viewport (PRD #1484 M4 review). `attention`/`pipDanger`
+  // are the two inputs to the pip's rendered width.
   const stripRef = useRef<HTMLDivElement>(null);
   const { pathname } = useLocation();
   useEffect(() => {
@@ -44,7 +49,7 @@ export function AdminShell({ description, children }: { description: ReactNode; 
     if (active && typeof (active as HTMLElement).scrollIntoView === "function") {
       (active as HTMLElement).scrollIntoView({ block: "nearest", inline: "nearest" });
     }
-  }, [pathname]);
+  }, [pathname, attention, pipDanger]);
 
   return (
     <div className="space-y-6">

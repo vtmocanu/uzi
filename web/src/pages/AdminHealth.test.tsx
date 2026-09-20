@@ -74,7 +74,10 @@ describe("AdminHealth — the five states", () => {
 
   it("warn (degraded): verdict, Warn pills, a needs-attention list, and a warning tab pip with the count", async () => {
     await renderHealth(degradedDoc());
-    expect(screen.getByRole("heading", { name: "Some checks need attention" })).toBeTruthy();
+    // Count-aware warn headline, derived from counts (2 warn, 0 unknown → "2 warnings").
+    // Asserting the real count text: a regression to a constant headline, or a wrong count,
+    // fails here.
+    expect(screen.getByRole("heading", { name: "2 warnings, nothing is blocked" })).toBeTruthy();
     // Severity asserted by TEXT (the pill word), not a colour class.
     expect(screen.getAllByText("Warn").length).toBeGreaterThan(0);
     // Needs-attention list: the two warn checks link to their check by title.
@@ -88,7 +91,9 @@ describe("AdminHealth — the five states", () => {
 
   it("danger (incident): verdict, Danger pills, a danger tab pip, and the fleet table populated with blocking cause", async () => {
     const { container } = await renderHealth(incidentDoc(), incidentFleetWorkers());
-    expect(screen.getByRole("heading", { name: "uzi has a blocking problem" })).toBeTruthy();
+    // Count-aware danger headline, derived from counts.danger (3 danger checks; the 1 warn is
+    // not blocking and is excluded). A wrong count or a warn-inclusive count fails here.
+    expect(screen.getByRole("heading", { name: "uzi cannot run work: 3 blocking checks" })).toBeTruthy();
     expect(screen.getAllByText("Danger").length).toBeGreaterThan(0);
     // Tab pip worded as danger, count 4 (3 danger + 1 warn). Awaited for the same reason.
     const pip = await screen.findByLabelText(/checks need attention \(danger\)/);
@@ -107,8 +112,9 @@ describe("AdminHealth — the five states", () => {
     // controller.report is unknown → expanded; a green check stays collapsed.
     expect(checkDetails(container, "controller.report").open).toBe(true);
     expect(checkDetails(container, "db").open).toBe(false);
-    // Overall ranks unknown as warn: the verdict is the warn one, not danger.
-    expect(screen.getByRole("heading", { name: "Some checks need attention" })).toBeTruthy();
+    // Overall ranks unknown as warn: the verdict is the warn one, not danger. Unknowns fold
+    // into the warn count (4 unknown, 0 warn → "4 warnings"), matching the pip's aria wording.
+    expect(screen.getByRole("heading", { name: "4 warnings, nothing is blocked" })).toBeTruthy();
   });
 
   it("na (no hosted workers): the hosted checks read N/A and the overall verdict is still ok", async () => {

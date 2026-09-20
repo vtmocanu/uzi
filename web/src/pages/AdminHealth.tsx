@@ -57,16 +57,25 @@ function isAttention(c: HealthCheck): boolean {
   return c.severity !== "ok" && c.severity !== "na";
 }
 
-function verdictText(status: string): { title: string; sub: string } {
+// The headline is derived from `counts` ONLY — HealthDoc carries no verdict field and no
+// cause, so the copy stays true for any danger/warn cause rather than describing one
+// scenario. Punctuation follows the mock (comma for the warn line, colon for the danger one).
+function verdictText(status: string, counts: HealthDoc["counts"]): { title: string; sub: string } {
   if (status === "danger") {
+    // danger implies counts.danger > 0. Warns present alongside are not blocking, so the
+    // headline counts only the blocking (danger) checks.
+    const d = counts.danger;
     return {
-      title: "uzi has a blocking problem",
-      sub: "One or more checks are failing. Start with the flagged checks below.",
+      title: `uzi cannot run work: ${d} blocking ${d === 1 ? "check" : "checks"}`,
+      sub: "Work is blocked until these clear. Start with the flagged checks below.",
     };
   }
   if (status === "warn" || status === "unknown") {
+    // warn implies at least one warn or unknown check. The aggregate signal is worded
+    // "warning" everywhere (the tab pip's aria-label too), so unknowns fold in here.
+    const n = counts.warn + counts.unknown;
     return {
-      title: "Some checks need attention",
+      title: `${n} ${n === 1 ? "warning" : "warnings"}, nothing is blocked`,
       sub: "Work is still flowing. These are the quiet no-ops that otherwise only surface as a log line.",
     };
   }
@@ -138,7 +147,7 @@ function jumpToCheck(id: string) {
 }
 
 function VerdictCard({ doc, attention, nowMs }: { doc: HealthDoc; attention: HealthCheck[]; nowMs: number }) {
-  const v = verdictText(doc.status);
+  const v = verdictText(doc.status, doc.counts);
   const glyphSev = sevOf(doc.status === "danger" ? "danger" : doc.status === "ok" ? "ok" : "warn");
   const glyphColor = { ok: "text-ok", warn: "text-warn", danger: "text-danger", unknown: "text-muted", na: "text-faint" }[glyphSev];
 
@@ -378,14 +387,14 @@ function FleetTable() {
         <table className="w-full text-left text-sm">
           <thead>
             <tr className="border-b border-edge text-xs uppercase tracking-wide text-faint">
-              <th className="px-3 py-2 pl-5 font-semibold">Owner</th>
-              <th className="px-3 py-2 font-semibold">Worker</th>
-              <th className="px-3 py-2 font-semibold">Kind</th>
-              <th className="px-3 py-2 font-semibold">Status</th>
-              <th className="px-3 py-2 font-semibold">Version</th>
-              <th className="px-3 py-2 font-semibold">Upgrade</th>
-              <th className="px-3 py-2 font-semibold">Blocking</th>
-              <th className="px-3 py-2 pr-5 font-semibold">Since</th>
+              <th scope="col" className="px-3 py-2 pl-5 font-semibold">Owner</th>
+              <th scope="col" className="px-3 py-2 font-semibold">Worker</th>
+              <th scope="col" className="px-3 py-2 font-semibold">Kind</th>
+              <th scope="col" className="px-3 py-2 font-semibold">Status</th>
+              <th scope="col" className="px-3 py-2 font-semibold">Version</th>
+              <th scope="col" className="px-3 py-2 font-semibold">Upgrade</th>
+              <th scope="col" className="px-3 py-2 font-semibold">Blocking</th>
+              <th scope="col" className="px-3 py-2 pr-5 font-semibold">Since</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-edge">

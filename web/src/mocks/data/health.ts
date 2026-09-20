@@ -279,3 +279,59 @@ export function incidentFleetWorkers(): AdminWorker[] {
     stuckHosted({ id: "w-inc-4", name: "base.l-e215", owner_email: "user.c@uzi.local" }),
   ];
 }
+
+// ── Fleet, all users (healthy) ──────────────────────────────────────────────────
+
+// The healthy hosted fleet the silent (all-ok) and degraded (warn) scenarios show: every
+// worker online and up to date across three owners, so the cross-user table AGREES with the
+// "all normal" / "warnings only, nothing is blocked" verdict rather than showing a stuck
+// upgrade the verdict says nothing about. In production both endpoints read one DB and so
+// always agree; this only keeps the DEMO scenarios coherent. No upgrade_failed row here.
+function healthyHosted(over: Partial<AdminWorker>): AdminWorker {
+  return {
+    id: "w-ok",
+    name: "base.l-7c2e",
+    status: "online",
+    kind: "hosted",
+    hosted_size: "l",
+    docker: false,
+    busy: false,
+    active_runs: 0,
+    max_concurrent_runs: 2,
+    template_declared: "base",
+    template_reported: "base",
+    version: "0.84.0",
+    upgrade_status: "up_to_date",
+    upgrade_detail: null,
+    upgrade_target: "0.84.0",
+    upgrade_blocking_container: null,
+    upgrade_blocking_reason: null,
+    upgrade_last_exit_code: null,
+    last_heartbeat_at: minsAgo(1),
+    online_since: minsAgo(60 * 11),
+    created_at: minsAgo(60 * 11),
+    stats_cpu_pct: null,
+    stats_mem_bytes: null,
+    stats_mem_limit_bytes: null,
+    stats_source: null,
+    stats_disk_nix_bytes: null,
+    stats_disk_nix_total_bytes: null,
+    stats_disk_data_bytes: null,
+    stats_disk_data_total_bytes: null,
+    anthropic_secret_id: null,
+    anthropic_secret_label: null,
+    anthropic_bind_mode: "default",
+    draining_since: null,
+    owner_email: "user.a@uzi.local",
+    ...over,
+  };
+}
+
+export function healthyFleetWorkers(): AdminWorker[] {
+  return [
+    healthyHosted({ id: "w-ok-1", name: "base.l-7c2e", owner_email: "user.a@uzi.local" }),
+    healthyHosted({ id: "w-ok-2", name: "base.l-19fd", owner_email: "user.a@uzi.local" }),
+    healthyHosted({ id: "w-ok-3", name: "base.m-40ab", busy: true, active_runs: 1, owner_email: "user.b@uzi.local" }),
+    healthyHosted({ id: "w-ok-4", name: "base.l-e215", owner_email: "user.c@uzi.local" }),
+  ];
+}

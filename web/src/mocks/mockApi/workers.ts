@@ -1,6 +1,6 @@
 import type { BindMode } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
-import { incidentFleetWorkers, mockAdminWorkers, mockWorkers } from "../data";
+import { healthyFleetWorkers, incidentFleetWorkers, mockAdminWorkers, mockWorkers } from "../data";
 import { delay, mockScenario } from "./shared";
 // secrets ↔ workers is the one accepted import cycle (PRD #991 D4): setWorkerBindMode
 // resolves a token label against the secrets roster, and secrets' deleteAnthropicTokenById
@@ -178,12 +178,24 @@ export const workersApi = {
     return delay({ worker: { ...w } });
   },
 
-  // The cross-user admin fleet the Health tab's table reads (PRD #1484 M4). Under the
-  // health-incident scenario it returns the stuck hosted fleet so the Blocking/Upgrade
-  // columns — the ones the admin list lacked before this PRD — are populated across two
-  // owners, matching the danger health document that scenario also serves.
+  // The cross-user admin fleet the Health tab's table reads (PRD #1484 M4). It tracks the
+  // health scenario so the table never contradicts the verdict (in production both endpoints
+  // read one DB and always agree; this keeps the DEMO coherent):
+  //   health-incident            → the stuck hosted fleet, so the Blocking/Upgrade columns
+  //                                 (the ones the admin list lacked before this PRD) are
+  //                                 populated across two owners, matching the danger doc;
+  //   health-silent / -degraded  → a HEALTHY fleet, so "all normal" / "warnings only, nothing
+  //                                 is blocked" is not undercut by a stuck upgrade in the table;
+  //   otherwise                  → the default mixed fleet (unchanged), which the Workers page
+  //                                 demo relies on to show the full range of worker states.
   adminListWorkers: async () => {
-    const rows = mockScenario() === "health-incident" ? incidentFleetWorkers() : mockAdminWorkers;
+    const scn = mockScenario();
+    const rows =
+      scn === "health-incident"
+        ? incidentFleetWorkers()
+        : scn === "health-silent" || scn === "health-degraded"
+          ? healthyFleetWorkers()
+          : mockAdminWorkers;
     return delay({ workers: rows.map((w) => ({ ...w })) });
   },
 };
