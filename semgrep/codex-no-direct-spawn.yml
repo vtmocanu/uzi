@@ -1,5 +1,6 @@
 # DARK CODEX GUARD (issue #1171 M5) -- no raw child_process spawn in
-# agent/src/codex/** outside the one sanctioned supervisor launcher.
+# agent/src/codex/** outside the two sanctioned seams (the supervisor launcher
+# and the boot-time Landlock probe -- see the exclude list).
 #
 # WHAT THIS ENFORCES. Inside the Codex provider tree, raw subprocess creation is
 # confined to two deliberately excluded seams: launcher.ts (the supervisor spawn
