@@ -1669,6 +1669,21 @@ still-Terminating PVC, the default-ON decision over reviewer dissent, and the
 thrash-cooldown-as-capacity-signal — is in
 [adr/0837-worker-disk-lifecycle.md](adr/0837-worker-disk-lifecycle.md).
 
+### Admin in-app health (PRD #1484)
+
+An admin-only, read-only Health tab, Overview card, app-wide Danger banner (with a
+per-admin 1h snooze), `uzi admin health`, and a per-admin danger-episode notice roll
+up a closed registry of checks over worker rolls/capacity, the queue, the
+controller's own liveness, background loops, the database, integrations, and
+housekeeping. It **never reads the Kubernetes API** — `api` stays credential-free,
+exactly as the worker controller section above requires — so every
+Kubernetes-derived fact (a worker pod stuck rolling) still arrives only over the
+existing controller report; pod-level health of the `api`/`web`/database/controller
+pods themselves stays out of scope, owned by cluster monitoring. See
+[PRD #1484](prds/1484-admin-health-tab.md) and
+[ADR-1484](adr/1484-in-app-health-boundary.md) for the checks, the boundary
+rationale, and the deferred items (version skew, forge sync freshness).
+
 ## Not yet in scope
 
 WS wakeup for idle workers (a 3s poll is the MVP), **wiring PRD #84's

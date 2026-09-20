@@ -825,6 +825,16 @@ Tracked as GitHub issue vtmocanu/uzi#1393; PRD at `prds/1391-worker-outbox-durab
 - These runs still count as failures — they extend, not amend, the #1293 failed-run rate (the factory did not publish its output). [AI-synced 2026-09-19, #1418]
 - The judge skips retrospecting the environment-caused subset (`finalize_base_align_conflict`, `workflow_scope_missing`, `push_secret_blocked`); `history_rewritten` stays judge-eligible as an agent defect. [AI-synced 2026-09-19, #1418]
 
+## Feature #1484 — Admin in-app health
+
+Tracked as GitHub issue vtmocanu/uzi#1484; PRD at `prds/1484-admin-health-tab.md`.
+
+- An admin gets a read-only, closed registry of checks over what uzi knows about itself (worker rolls, queue and capacity, controller liveness, background loops, the database, integrations, housekeeping), surfaced as an Admin → Health tab, an Overview card, an app-wide Danger banner, `uzi admin health`, and one notice per admin per danger episode. [AI-synced 2026-09-20, #1484]
+- Health is the **last** admin tab, after Branding, not the first; the sidebar pip and the Overview card are the entry points. [AI-synced 2026-09-20, #1484]
+- The Danger banner carries a "Snooze 1 h", per admin, per open episode; a new episode shows the banner again. [AI-synced 2026-09-20, #1484]
+- A non-admin gets a platform line on Overview instead of the admin card, derived only from their own runs and workers, so they can tell a platform problem from a problem with their own run. [AI-synced 2026-09-20, #1484]
+- In-app health never reads the Kubernetes API; the api holds no kube credential, and no action (restart, retry, rollback, cordon) is offered — diagnosis only. [AI-synced 2026-09-20, #1484]
+
 ## Startup admin seed
 
 - Seed an admin user from env at startup (`UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME`) so the user survives DB wipes.
