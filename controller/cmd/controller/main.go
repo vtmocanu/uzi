@@ -97,7 +97,13 @@ func main() {
 		StorageClass:        cfg.WorkerStorageClass,
 		PriorityClassName:   cfg.WorkerPriorityClassName,
 		MaxConcurrentRuns:   cfg.WorkerMaxConcurrentRuns,
-		APICAPEM:            cfg.APICAPEM,
+		// The Codex uid-split worker profile (PRD #1493 M1): when on, the worker + seed-nix
+		// containers start as root with a short capability set so the image entrypoint can
+		// establish the split. CommandSandbox rides the worker env only when it is not the
+		// default "required".
+		UIDSplit:       cfg.WorkerUIDSplit,
+		CommandSandbox: cfg.WorkerCommandSandbox,
+		APICAPEM:       cfg.APICAPEM,
 	}
 	// The apiclient doubles as the cordon-write channel (PRD #422 M4): its RequestDrain
 	// satisfies kube.Cordoner, so a busy drifted worker is cordoned and drained rather

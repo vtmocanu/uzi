@@ -23,6 +23,15 @@ import (
 // nonsense cap straight into the pod.
 const workerMaxConcurrentRunsCeiling = 256
 
+// The Codex command sandbox modes (PRD #1493). "required" is today's behaviour (Landlock
+// mandatory); "best-effort" runs a command unconfined behind the uid split when the kernel
+// lacks Landlock. The set is a strict allow-list — any other UZI_CODEX_COMMAND_SANDBOX
+// value is a boot error rather than a silent default.
+const (
+	commandSandboxRequired   = "required"
+	commandSandboxBestEffort = "best-effort"
+)
+
 // Config holds the controller's runtime settings.
 type Config struct {
 	// APIBaseURL is the uzi api's base URL (scheme://host[:port], no path). https
@@ -130,6 +139,25 @@ type Config struct {
 	// (PRD #58 Decision 7). Real concurrency is enforced solely by the worker-side
 	// semaphore, so this pod env is the only thing pinning a hosted worker to 1.
 	WorkerMaxConcurrentRuns int
+
+	// --- Codex uid-split profile (PRD #1493 M1) -------------------------------
+	// WorkerUIDSplit opts the fleet into the Codex uid-split worker profile
+	// (UZI_WORKER_UID_SPLIT, default false). When on, the controller renders the
+	// worker + seed-nix containers to start as root with a short fixed capability set
+	// so the image's root entrypoint branch can establish Codex's three-identity
+	// (worker/runner/runner-cmd) split. A set-but-unparseable value is a BOOT error
+	// rather than a silent false, mirroring UZI_WORKER_FORCE_ROLL: an operator opting
+	// the fleet into (or out of) the split must not have the choice silently flipped by
+	// a typo. Off, the rendered pod is byte-identical to before this field existed.
+	WorkerUIDSplit bool
+	// WorkerCommandSandbox is the Codex command sandbox mode (UZI_CODEX_COMMAND_SANDBOX):
+	// "required" (the default and today's behaviour — Landlock is mandatory) or
+	// "best-effort" (Landlock applied where the kernel offers it, otherwise the command
+	// runs unconfined behind the uid split). Strict allow-list: an unknown value is a BOOT
+	// error, never a silent default, and empty/unset takes the "required" default. Rendered
+	// onto the worker container as UZI_CODEX_COMMAND_SANDBOX only when it is NOT "required",
+	// so a default install's pod stays byte-identical.
+	WorkerCommandSandbox string
 
 	// --- drain policy (PRD #422 M5) -------------------------------------------
 	// DrainDeadline bounds how long a cordoned BUSY hosted worker delays a deliberate
@@ -380,6 +408,35 @@ func loadWorkerSettings(cfg *Config) error {
 	// configured would be silently ignored on most of them.
 	if err := parseQuantityEnv("UZI_WORKER_MAX_PVC_STORAGE", &cfg.WorkerMaxPVCStorage); err != nil {
 		return err
+	}
+
+	// The Codex uid-split profile (PRD #1493 M1). Default false; a set-but-unparseable
+	// value is a BOOT error rather than a silent false, mirroring UZI_WORKER_FORCE_ROLL —
+	// an operator opting the fleet into (or out of) the split must not have it silently
+	// flipped by a typo. It applies to every worker (plain and docker), so it is read here
+	// rather than behind the docker tier's early return.
+	if raw := strings.TrimSpace(os.Getenv("UZI_WORKER_UID_SPLIT")); raw != "" {
+		uidSplit, err := strconv.ParseBool(raw)
+		if err != nil {
+			return fmt.Errorf("UZI_WORKER_UID_SPLIT=%q is not a boolean (want true or false): %w", raw, err)
+		}
+		cfg.WorkerUIDSplit = uidSplit
+	}
+
+	// The Codex command sandbox mode (PRD #1493). Default "required" (today's behaviour);
+	// "best-effort" runs a command unconfined behind the uid split on a kernel without
+	// Landlock. Strict allow-list: an unknown value is a BOOT error rather than a silent
+	// default — the same "fail at boot, not at the far end" rule the other knobs follow. An
+	// empty/unset value takes the default.
+	cfg.WorkerCommandSandbox = commandSandboxRequired
+	if raw := strings.TrimSpace(os.Getenv("UZI_CODEX_COMMAND_SANDBOX")); raw != "" {
+		switch raw {
+		case commandSandboxRequired, commandSandboxBestEffort:
+			cfg.WorkerCommandSandbox = raw
+		default:
+			return fmt.Errorf("UZI_CODEX_COMMAND_SANDBOX=%q is not a recognized mode (want %q or %q)",
+				raw, commandSandboxRequired, commandSandboxBestEffort)
+		}
 	}
 
 	// The docker tier (PRD #83 M3): namespace + sidecar image, both or neither. No
