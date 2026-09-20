@@ -308,6 +308,14 @@ func (h *Handler) SetAgentSourceReconciler(r AgentSourceReconciler) { h.agentSou
 // a clean 500 rather than panic (struct-literal test handlers that don't exercise it).
 func (h *Handler) SetReleaseCheckReconciler(r ReleaseCheckReconciler) { h.releaseCheck = r }
 
+// SetHealthService injects the SHARED admin-health evaluator (PRD #1484 M2) built in main
+// — the one holding the loop-beat registry the four background loops beat into, so
+// GetAdminHealth and the once-a-minute episode evaluator see the SAME beats. It is set
+// before the first request, so the lazy healthService() fallback (used only by
+// struct-literal test handlers that never call this) never overwrites it. Leaving it unset
+// keeps the M1 lazy-construction behaviour, whose registry is empty (loops degrades to na).
+func (h *Handler) SetHealthService(s *healthsvc.Service) { h.healthSvc = s }
+
 // clock reads the classification clock seam, nil-safe.
 //
 // Nil-safe because many tests build a Handler as a struct literal rather than through

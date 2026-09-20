@@ -102,6 +102,13 @@ type Engine struct {
 	// the same optional-collaborator pattern as autopilot/pipeline/ciAutoFix above
 	// (issue #139).
 	forgeTimeout time.Duration
+
+	// beat is the admin-health loop-beat callback (PRD #1484 M2): main.go injects a
+	// func(){ registry.Beat("poller") } so the `loops` health check can see this loop is
+	// still ticking. Optional and nil-safe (nil = no beat), so existing tests that
+	// construct the Engine with no beat keep working. It is a plain func — this package
+	// must NOT import healthsvc (the registry is a leaf; the loop only receives a callback).
+	beat func()
 }
 
 // repoState is one repo's in-memory sync state. marks holds a SEPARATE
@@ -178,6 +185,16 @@ func (e *Engine) SetPipelineWatch(window time.Duration, maxRefs int) {
 // interval keeps its fast cadence, but a single tick is always granted enough time
 // for the forge round-trips it makes, so a healthy forge is never cancelled mid-call.
 func (e *Engine) SetForgeTimeout(d time.Duration) { e.forgeTimeout = d }
+
+// SetBeat wires the admin-health loop-beat callback (PRD #1484 M2). Call once at startup,
+// before Run. A nil beat (the default) disables it, so tests that never wire one behave
+// exactly as before. The callback fires once per tick.
+func (e *Engine) SetBeat(beat func()) { e.beat = beat }
+
+// Interval reports the poll cadence the loop actually ticks at (after New's clamp), so
+// main.go registers the loop-beat with the effective interval rather than duplicating the
+// clamp (PRD #1484 M2).
+func (e *Engine) Interval() time.Duration { return e.interval }
 
 // ForceReconcile requests that the next tick full-syncs every enabled repo,
 // dropping the incremental fast-path so a changed uzi_label immediately re-filters
@@ -259,6 +276,9 @@ func (e *Engine) Run(ctx context.Context) {
 			slog.Info("poller: force reconcile requested")
 			e.resetReconcileState()
 		case <-ticker.C:
+			if e.beat != nil {
+				e.beat() // admin-health loop-beat: this loop ticked (PRD #1484 M2)
+			}
 			e.tick(ctx)
 		}
 	}
