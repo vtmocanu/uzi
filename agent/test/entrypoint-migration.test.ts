@@ -108,6 +108,12 @@ function makeHarness(): Harness {
     '#!/bin/sh\nprintf "mkdir %s\\n" "$*" >> "$OPLOG"\n' +
       '[ -n "${STUB_NOOP:-}" ] && exit 0\n/bin/mkdir "$@" 2>/dev/null || true\nexit 0\n',
   );
+  writeStub(
+    stubDir,
+    "rm",
+    '#!/bin/sh\nprintf "rm %s\\n" "$*" >> "$OPLOG"\n' +
+      '[ -n "${STUB_NOOP:-}" ] && exit 0\n/bin/rm "$@" 2>/dev/null || true\nexit 0\n',
+  );
   // busybox -> stat returns $STUB_TOKEN_POSTURE (default a valid kube posture); cat is real.
   writeStub(
     stubDir,
@@ -126,6 +132,7 @@ function makeHarness(): Harness {
     .replace("CHOWN=/bin/chown", `CHOWN=${path.join(stubDir, "chown")}`)
     .replace("CHMOD=/bin/chmod", `CHMOD=${path.join(stubDir, "chmod")}`)
     .replace("MKDIR=/bin/mkdir", `MKDIR=${path.join(stubDir, "mkdir")}`)
+    .replace("RM=/bin/rm", `RM=${path.join(stubDir, "rm")}`)
     .replace("BUSYBOX=/bin/busybox", `BUSYBOX=${path.join(stubDir, "busybox")}`)
     .replace("DATA_DIR=/data", `DATA_DIR=${data}`)
     .replace("NIX_DIR=/nix", `NIX_DIR=${nix}`)
@@ -214,6 +221,41 @@ describe("PRD #1493 M2: root-branch migration ownership map (portable, record-on
       const handover = r.ops.findIndex((o) => o.startsWith("chown worker:worker ") && o.includes(h.token));
       assert.ok(reclaim >= 0 && chmod0400 >= 0 && handover >= 0, "compose token needs reclaim + chmod 0400 + hand-over");
       assert.ok(reclaim < chmod0400 && chmod0400 < handover, "order must be reclaim -> chmod 0400 -> hand-over");
+    } finally {
+      fs.rmSync(h.root, { recursive: true, force: true });
+    }
+  });
+
+  it("tmpdir: RESETS each per-uid dir (rm) then reclaims -> chmod 0700 -> hand-over (CWE-732)", () => {
+    const h = makeHarness();
+    try {
+      fs.mkdirSync(h.data);
+      fs.mkdirSync(h.nix);
+      fs.writeFileSync(h.token, "t");
+      // Compose path (no ambient TMPDIR) => /tmp/uzi-worker + /tmp/uzi-runner. STUB_NOOP so the
+      // recorded rm/mkdir/chown/chmod are never really applied to the live worker's /tmp.
+      const r = run(h, { STUB_NOOP: "1" });
+      assert.equal(r.status, 0, `compose tmpdir run must succeed (stderr: ${r.stderr})`);
+      for (const [dir, owner] of [
+        ["/tmp/uzi-worker", "worker:worker"],
+        ["/tmp/uzi-runner", "runner:runner"],
+      ] as const) {
+        const rm = r.ops.findIndex((o) => o.startsWith("rm ") && o.includes(dir));
+        const mkdir = r.ops.findIndex((o) => o.startsWith("mkdir ") && o.includes(dir));
+        const reclaim = r.ops.findIndex((o) => o.startsWith("chown 0:0 ") && o.includes(dir));
+        const chmod0700 = r.ops.findIndex((o) => o.startsWith("chmod 0700 ") && o.includes(dir));
+        const handover = r.ops.findIndex((o) => o.startsWith(`chown ${owner} `) && o.includes(dir));
+        assert.ok(
+          rm >= 0 && mkdir >= 0 && reclaim >= 0 && chmod0700 >= 0 && handover >= 0,
+          `${dir} needs rm + mkdir + reclaim + chmod 0700 + hand-over (${owner})`,
+        );
+        // rm BEFORE mkdir (reset a planted dir/symlink before adoption), then reclaim -> chmod ->
+        // hand-over so the UNCONDITIONAL 0700 cannot EPERM on a worker/runner-owned dir.
+        assert.ok(rm < mkdir, `${dir}: rm must precede mkdir`);
+        assert.ok(mkdir < reclaim, `${dir}: mkdir must precede the root reclaim`);
+        assert.ok(reclaim < chmod0700, `${dir}: chown 0:0 must precede chmod 0700`);
+        assert.ok(chmod0700 < handover, `${dir}: chmod 0700 must precede the owner hand-over`);
+      }
     } finally {
       fs.rmSync(h.root, { recursive: true, force: true });
     }

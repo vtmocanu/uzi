@@ -39,6 +39,7 @@ SETPRIV=/bin/setpriv
 CHOWN=/bin/chown
 CHMOD=/bin/chmod
 MKDIR=/bin/mkdir
+RM=/bin/rm
 
 # --- PRD #58: tolerate a NON-ROOT start ---------------------------------------
 # Started non-root (k8s runAsUser: 10001, PRD #58 single-uid v1)? Then there is no
@@ -397,10 +398,12 @@ fi
 # runner each a private 0700 tmp. The worker's is exported as TMPDIR below; the runner's
 # is exported as UZI_RUNNER_TMPDIR (the runner env builders put it on the agent/checks/
 # provision children — runner-uid.ts). Its 0700/runner mode is owner-only, so the worker
-# (a `runner`-GROUP member) still cannot read it. The chmod is guarded on root-ownership
-# for the same restart-safety reason as the carve-out above: /tmp is the container's
-# writable layer (NOT a named volume), so a `docker restart` reuses it — an unconditional
-# chmod on the now-worker/runner-owned dir would EPERM (no CAP_FOWNER) -> set -eu crash.
+# (a `runner`-GROUP member) still cannot read it. The mode is re-asserted every boot by
+# reclaiming ownership to root FIRST and only then chmod'ing: /tmp is the container's
+# writable layer (NOT a named volume), so a `docker restart` reuses it and a prior boot
+# may have left the dir worker/runner-owned. Rather than guard the chmod on root-ownership,
+# we `chown 0:0` each dir back to root (CAP_CHOWN, which the root startup window has; no
+# CAP_FOWNER needed) and then chmod — so an unconditional chmod can never EPERM here.
 #
 # DOCKER-LANE TMPDIR (PRD #1493 M2 change 2 / coupling #2): the k8s docker lane pre-sets an
 # ambient TMPDIR to the DinD-shared run workdir (render_dind.go: /data/runner) so a
@@ -416,27 +419,26 @@ else
   WORKER_TMPDIR=/tmp/uzi-worker
   RUNNER_TMPDIR=/tmp/uzi-runner
 fi
+# HARDEN ADOPTION (PRD #1493 rework / CWE-732 CodeRabbit): TMPDIR is an ambient, possibly
+# PERSISTENT shared volume on the docker lane (render_dind.go pre-sets it to /data/runner),
+# so an untrusted principal can pre-create uzi-worker/uzi-runner. `mkdir -p` NO-OPS on an
+# existing dir (it keeps that dir's mode AND contents), and a planted SYMLINK at that name
+# would make the chmod/chown below DEREFERENCE onto its target. So RESET each path first:
+# `rm -rf` on a trailing symlink unlinks the LINK itself (never its target) and clears any
+# planted dir + contents. These hold only disposable per-uid scratch (git/npm/node temp);
+# no resumed-run state lives here (that is under /data/agent-home + the clone), so a
+# boot-time wipe is safe on the /tmp writable layer and on the docker-lane PVC alike.
+"$RM" -rf "$WORKER_TMPDIR" "$RUNNER_TMPDIR"
 "$MKDIR" -p "$WORKER_TMPDIR" "$RUNNER_TMPDIR"
-# SC3067: `-O` is undefined in POSIX sh and implemented by busybox ash 1.37.0, the
-# /bin/sh this file actually runs under in the pinned node:22-alpine (measured
-# 2026-08-03, with an unsupported-operator control). Per-instance rather than an rc
-# entry because the hazard is LOCAL: change the interpreter and `[ -O ... ]` goes
-# false, the `&&` short-circuits, this chmod never runs, and `set -eu` cannot see it
-# (POSIX exempts the left of an AND-list from errexit). A 0700 that silently became
-# 0755 is the whole point of the line. See the (a2) block above for the full argument.
-# shellcheck disable=SC3067
-[ -O "$WORKER_TMPDIR" ] && "$CHMOD" 0700 "$WORKER_TMPDIR"; "$CHOWN" "$WORKER_OWNER" "$WORKER_TMPDIR"
-# runner:runner 0700 — owner-only, so even the worker (a `runner`-GROUP member) cannot
-# reach it (0700 grants the group nothing); true per-uid isolation.
-# SC3067: same operator, same shell, same reason as the line above -- busybox ash
-# 1.37.0 in the pinned node:22-alpine implements `-O` (measured 2026-08-03 with an
-# unsupported-operator control), POSIX does not. Per-instance because a changed
-# interpreter turns this into a SKIPPED chmod with no error: `[ -O ... ]` is false,
-# `&&` short-circuits, and errexit does not apply to the left of an AND-list. Here
-# that would leave the runner's private tmp readable by the worker uid, which is the
-# isolation this line exists to create.
-# shellcheck disable=SC3067
-[ -O "$RUNNER_TMPDIR" ] && "$CHMOD" 0700 "$RUNNER_TMPDIR"; "$CHOWN" runner:runner "$RUNNER_TMPDIR"
+# Then RECLAIM to root and re-assert 0700 UNCONDITIONALLY (no `[ -O ]` guard): root reclaims
+# via CAP_CHOWN (the root startup window has CHOWN, no FOWNER), so the chmod always succeeds
+# even when a prior boot left the dir worker/runner-owned -- the SAME restart-safe reclaim the
+# token block and the legacy-migration roots use. No `if`-wrapper (unlike the token's EROFS
+# read-only Secret mount): these tmpdirs are ALWAYS a writable mount, never read-only.
+"$CHOWN" 0:0 "$WORKER_TMPDIR"; "$CHMOD" 0700 "$WORKER_TMPDIR"; "$CHOWN" "$WORKER_OWNER" "$WORKER_TMPDIR"
+# runner:runner 0700 -- owner-only, so even the worker (a `runner`-GROUP member) cannot reach
+# it (0700 grants the group nothing); true per-uid isolation.
+"$CHOWN" 0:0 "$RUNNER_TMPDIR"; "$CHMOD" 0700 "$RUNNER_TMPDIR"; "$CHOWN" runner:runner "$RUNNER_TMPDIR"
 
 # --- (b) token: force 0400 worker on the join-token secret ---------------------
 # Compose delivers the env-sourced `worker_token` secret 0444 root:root (world-readable
