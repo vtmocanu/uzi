@@ -1,7 +1,7 @@
 import type { BindMode } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
-import { mockAdminWorkers, mockWorkers } from "../data";
-import { delay } from "./shared";
+import { healthyFleetWorkers, incidentFleetWorkers, mockAdminWorkers, mockWorkers } from "../data";
+import { delay, mockScenario } from "./shared";
 // secrets ↔ workers is the one accepted import cycle (PRD #991 D4): setWorkerBindMode
 // resolves a token label against the secrets roster, and secrets' deleteAnthropicTokenById
 // unbinds workers pinned to a deleted token. Both reads are inside function bodies and no
@@ -23,7 +23,18 @@ export const workersApi = {
   },
 
   // ── Workers ─────────────────────────────────────────────────────────────────
-  listWorkers: async () => delay({ workers: workers.map((w) => ({ ...w })) }),
+  // The owner-scoped list (GET /api/workers), NOT the admin route. Under the health-incident
+  // scenario it serves the stuck hosted fleet as the VIEWER'S OWN workers, so a non-admin
+  // demo viewer (log in as a seeded non-admin persona) sees the Overview platform line: every
+  // hosted worker they own is upgrade_failed and the demo runs include a queued one (PRD #1484
+  // M5). AdminWorker extends Worker, so the shape is compatible. Every other scenario returns
+  // the ordinary seeded fleet.
+  listWorkers: async () => {
+    if (mockScenario() === "health-incident") {
+      return delay({ workers: incidentFleetWorkers().map((w) => ({ ...w })) });
+    }
+    return delay({ workers: workers.map((w) => ({ ...w })) });
+  },
   createWorker: async (name: string, template?: string) => {
     const w = {
       id: `w-new-${++workerCounter}`,
@@ -178,5 +189,24 @@ export const workersApi = {
     return delay({ worker: { ...w } });
   },
 
-  adminListWorkers: async () => delay({ workers: mockAdminWorkers.map((w) => ({ ...w })) }),
+  // The cross-user admin fleet the Health tab's table reads (PRD #1484 M4). It tracks the
+  // health scenario so the table never contradicts the verdict (in production both endpoints
+  // read one DB and always agree; this keeps the DEMO coherent):
+  //   health-incident            → the stuck hosted fleet, so the Blocking/Upgrade columns
+  //                                 (the ones the admin list lacked before this PRD) are
+  //                                 populated across two owners, matching the danger doc;
+  //   health-silent / -degraded  → a HEALTHY fleet, so "all normal" / "warnings only, nothing
+  //                                 is blocked" is not undercut by a stuck upgrade in the table;
+  //   otherwise                  → the default mixed fleet (unchanged), which the Workers page
+  //                                 demo relies on to show the full range of worker states.
+  adminListWorkers: async () => {
+    const scn = mockScenario();
+    const rows =
+      scn === "health-incident"
+        ? incidentFleetWorkers()
+        : scn === "health-silent" || scn === "health-degraded"
+          ? healthyFleetWorkers()
+          : mockAdminWorkers;
+    return delay({ workers: rows.map((w) => ({ ...w })) });
+  },
 };

@@ -48,6 +48,11 @@ type Engine struct {
 	svc      Sweeper
 	interval time.Duration
 	passes   []Pass
+	// beat is the admin-health loop-beat callback (PRD #1484 M2): main.go injects a
+	// func(){ registry.Beat("sweeper") } so the `loops` health check can see this loop is
+	// still ticking. Optional and nil-safe. A plain func — this package must NOT import
+	// healthsvc.
+	beat func()
 }
 
 // New constructs an Engine. A non-positive interval falls back to the default.
@@ -58,6 +63,15 @@ func New(svc Sweeper, interval time.Duration, passes ...Pass) *Engine {
 	}
 	return &Engine{svc: svc, interval: interval, passes: passes}
 }
+
+// SetBeat wires the admin-health loop-beat callback (PRD #1484 M2). Call once at startup,
+// before Run. A nil beat (the default) disables it, so tests that never wire one behave
+// exactly as before. The callback fires once per Run tick (not on the Boot pass).
+func (e *Engine) SetBeat(beat func()) { e.beat = beat }
+
+// Interval reports the sweep cadence the loop actually ticks at (after New's clamp), so
+// main.go registers the loop-beat with the effective interval (PRD #1484 M2).
+func (e *Engine) Interval() time.Duration { return e.interval }
 
 // Boot runs one immediate sweep — the orphan sweep on API boot (bottega). It
 // recovers runs left non-terminal by workers that died while the API was down
@@ -78,6 +92,9 @@ func (e *Engine) Run(ctx context.Context) {
 			slog.Info("sweeper stopped")
 			return
 		case <-ticker.C:
+			if e.beat != nil {
+				e.beat() // admin-health loop-beat: this loop ticked (PRD #1484 M2)
+			}
 			e.runOnce(ctx)
 		}
 	}

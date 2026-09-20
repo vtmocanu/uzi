@@ -1,0 +1,855 @@
+package healthsvc
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
+	"github.com/vtmocanu/uzi/api/internal/releasecheck"
+	"github.com/vtmocanu/uzi/api/internal/slacksvc"
+	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/termsafe"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
+)
+
+// maxEvidenceBytes bounds any identifier/enum interpolated into a summary or evidence
+// value — worker names, blocking reasons, tags. It is the last line of the text-discipline
+// defense: even an already-sanitized enum is re-bounded and re-stripped here so a hostile
+// value that slipped a prior gate cannot render control bytes or an unbounded string into
+// an admin surface.
+const maxEvidenceBytes = 96
+
+// checkMeta is the fixed per-id metadata: the group, the human title, and the docs slug
+// (empty ⇒ no doc link in M1). The registry order in Evaluate is the stable order; this
+// map only supplies the constant fields so each check builder sets just severity + text.
+var checkMeta = map[string]struct {
+	group string
+	title string
+	doc   string
+}{
+	"fleet.roll":         {groupWorkers, "Worker image roll", "worker-upgrades"},
+	"fleet.capacity":     {groupWorkers, "Worker capacity", "hosted-workers"},
+	"fleet.disk":         {groupWorkers, "Worker disk", "hosted-workers"},
+	"queue.waiting":      {groupQueue, "Runs waiting for a worker", ""},
+	"queue.undispatched": {groupQueue, "Undispatched task runs", ""},
+	"controller.report":  {groupControl, "Controller reporting", "hosted-workers"},
+	"db":                 {groupControl, "Database", ""},
+	"loops":              {groupControl, "Background loops", ""},
+	"forge.ciwatch":      {groupIntegrations, "CI watch capacity", ""},
+	"slack.socket":       {groupIntegrations, "Slack socket", ""},
+	"schedules.paused":   {groupHousekeeping, "Paused schedules", ""},
+	"board.drift":        {groupHousekeeping, "Board drift", ""},
+	"custody.holds":      {groupHousekeeping, "Recovery custody holds", ""},
+	"release.check":      {groupHousekeeping, "Upstream release", ""},
+}
+
+// base returns a check DTO pre-filled with the id's fixed metadata and a non-nil (empty)
+// evidence slice, so every check marshals evidence as [] rather than null.
+func (s *Service) base(id string) apitypes.HealthCheckDTO {
+	m := checkMeta[id]
+	c := apitypes.HealthCheckDTO{
+		ID:       id,
+		Group:    m.group,
+		Title:    m.title,
+		Evidence: []apitypes.HealthEvidenceDTO{},
+	}
+	if m.doc != "" {
+		c.Doc = strPtr(m.doc)
+	}
+	return c
+}
+
+// strPtr returns a pointer to s (a required-non-nil string field).
+func strPtr(s string) *string { return &s }
+
+// sincePtr formats a source timestamp as an RFC3339 UTC string pointer for a check's
+// `since`, nil when the source has none.
+func sincePtr(t time.Time) *string {
+	s := t.UTC().Format(time.RFC3339)
+	return &s
+}
+
+// safe strips control bytes (incl. tabs/newlines) and bounds an untrusted identifier or
+// enum before it renders into an admin surface. CellText folds \t/\n to spaces and strips
+// terminal escapes / bidi overrides; SanitizeBounded then caps the length. The result
+// carries no control characters and is at most maxEvidenceBytes long.
+func safe(v string) string {
+	return termsafe.SanitizeBounded(termsafe.CellText(v), maxEvidenceBytes)
+}
+
+// humanDur renders a duration for a summary: whole minutes under an hour, else Hh Mm.
+func humanDur(d time.Duration) string {
+	if d < time.Minute {
+		return "under a minute"
+	}
+	if d < time.Hour {
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	}
+	h := int(d.Hours())
+	m := int(d.Minutes()) - h*60
+	if m == 0 {
+		return fmt.Sprintf("%dh", h)
+	}
+	return fmt.Sprintf("%dh%dm", h, m)
+}
+
+// -------------------------------------------------------------------------
+// workers group
+// -------------------------------------------------------------------------
+
+// hostedConfigured is the shared "hosted workers are configured" predicate for the two
+// hosted checks (fleet.roll, controller.report): HostedWorkerVersion non-empty OR any
+// kind='hosted' worker row exists (confirmed against config.go). Computing it in one place
+// keeps the two checks' `na` gate identical.
+func (s *Service) hostedConfigured(workers []store.ListAllWorkersRow) bool {
+	if s.cfg.HostedWorkerVersion != "" {
+		return true
+	}
+	for _, w := range workers {
+		if w.Worker.Kind == "hosted" {
+			return true
+		}
+	}
+	return false
+}
+
+// checkFleetRoll classifies the hosted fleet's roll health. A worker is upgrade_failed
+// exactly when it has a FRESH controller signal whose phase is `stuck` (R1 of the upgrade
+// classifier, the only path to upgrade_failed — deliberately not version-dependent, so it
+// needs no CPVersion). warn when some hosted workers are stuck, danger when every one is.
+// `na` when hosted workers are not configured — HostedWorkerVersion=="" AND no kind='hosted'
+// worker exists (the predicate confirmed against config.go:641).
+//
+// `unknown` is the M2 conjunct: the NEWEST roll signal is stale (older than rollSignalTTL)
+// AND controller.report is NOT ok. A silent controller must not read green (D6) — but when
+// the controller IS reporting cleanly (controllerReportOK), a stale per-worker roll signal
+// is not blindness (that worker simply left the report), so fleet.roll does NOT double-alarm
+// on it and falls through to the ordinary classification (ok, since no fresh signal means no
+// stuck worker).
+func (s *Service) checkFleetRoll(now time.Time, workers []store.ListAllWorkersRow, controllerReportOK bool) apitypes.HealthCheckDTO {
+	c := s.base("fleet.roll")
+
+	hosted := make([]store.ListAllWorkersRow, 0, len(workers))
+	for _, w := range workers {
+		if w.Worker.Kind == "hosted" {
+			hosted = append(hosted, w)
+		}
+	}
+
+	// "Hosted workers are configured" — HostedWorkerVersion non-empty OR any hosted worker.
+	configured := s.cfg.HostedWorkerVersion != "" || len(hosted) > 0
+	if !configured {
+		c.Severity = sevNA
+		c.Summary = "No hosted workers are configured on this deployment."
+		return c
+	}
+	if len(hosted) == 0 {
+		// Configured (a pinned tag) but no hosted worker rows: nothing is rolling, nothing
+		// is stuck, and we are not blind about any worker.
+		c.Severity = sevOK
+		c.Summary = "No hosted workers are present."
+		return c
+	}
+
+	var (
+		failed          int
+		anyFreshSignal  bool
+		stuckSince      time.Time
+		haveStuckSince  bool
+		blockingReason  string
+		blockingCont    string
+		targetTag       string
+		firstStuckName  string
+		haveStuckWorker bool
+	)
+	for _, w := range hosted {
+		signalFresh := w.RollPhase.Valid && w.RollPhase.String != "" &&
+			w.RollObservedAt.Valid && now.Sub(w.RollObservedAt.Time) <= rollSignalTTL
+		if signalFresh {
+			anyFreshSignal = true
+		}
+		if signalFresh && w.RollPhase.String == workersvc.PhaseStuck {
+			failed++
+			if !haveStuckWorker {
+				haveStuckWorker = true
+				firstStuckName = w.Worker.Name
+				blockingReason = w.RollBlockingReason.String
+				blockingCont = w.RollBlockingContainer.String
+				targetTag = w.RollWorkerImageTag.String
+			}
+			// Oldest phase_since across the stuck workers is the best "since" the source
+			// carries (for a stuck pod it is the pod creation time, not the transition).
+			if w.RollPhaseSince.Valid && (!haveStuckSince || w.RollPhaseSince.Time.Before(stuckSince)) {
+				stuckSince = w.RollPhaseSince.Time
+				haveStuckSince = true
+			}
+		}
+	}
+
+	if !anyFreshSignal {
+		// M2 conjunct: only degrade to `unknown` when the controller is ALSO not reporting
+		// cleanly. If controller.report is ok, the controller is alive and simply carries no
+		// active roll signal — fall through to the ordinary classification (ok below) rather
+		// than double-alarm on staleness controller.report already covers.
+		if !controllerReportOK {
+			c.Severity = sevUnknown
+			c.Summary = "No fresh controller signal for the hosted fleet; roll health cannot be determined."
+			c.Action = strPtr("Check that the worker controller is running and reporting.")
+			return c
+		}
+	}
+
+	if failed == 0 {
+		c.Severity = sevOK
+		c.Summary = fmt.Sprintf("All %d hosted workers are rolling cleanly.", len(hosted))
+		return c
+	}
+
+	tagLabel := "the pinned tag"
+	if t := safe(targetTag); t != "" {
+		tagLabel = t
+	}
+	reasonLabel := safe(blockingReason)
+	if reasonLabel == "" {
+		reasonLabel = "unknown reason"
+	}
+	c.Summary = fmt.Sprintf("%d of %d hosted workers stuck rolling to %s: %s", failed, len(hosted), tagLabel, reasonLabel)
+	c.Evidence = []apitypes.HealthEvidenceDTO{
+		{Label: "Target tag", Value: tagLabel},
+		{Label: "Blocking container", Value: orDash(safe(blockingCont))},
+		{Label: "Blocking reason", Value: reasonLabel},
+		{Label: "Worker", Value: orDash(safe(firstStuckName))},
+		{Label: "Stuck workers", Value: fmt.Sprintf("%d of %d", failed, len(hosted))},
+	}
+	c.Action = strPtr("Publish the image, or release a chart whose workers.image.tag names a published tag.")
+	c.Command = strPtr("kubectl -n <worker-namespace> describe pod -l uzi.dev/hosted-worker-id=<id>")
+	if haveStuckSince {
+		c.Since = sincePtr(stuckSince)
+	}
+	if failed == len(hosted) {
+		c.Severity = sevDanger
+	} else {
+		c.Severity = sevWarn
+	}
+	return c
+}
+
+// checkFleetCapacity is danger when, for at least fleetCapacityDanger, an owner has a
+// waiting_worker run and zero usable (online, non-draining, fresh-heartbeat) workers.
+// `unknown` when health_enabled is off — the sole writer of waiting_worker is gated by it,
+// so the signal is absent, not green (D6) — AND `unknown` when the kill-switch read itself
+// failed (we cannot tell whether the writer is running, so the run tables must not be
+// queried for a green verdict). Below the threshold it is ok (a transient claim delay), and
+// there is no warn band.
+func (s *Service) checkFleetCapacity(ctx context.Context, now time.Time, health healthDetectorState) apitypes.HealthCheckDTO {
+	c := s.base("fleet.capacity")
+	switch health {
+	case healthDetectorDisabled:
+		return unknownHealthDisabled(c)
+	case healthDetectorUnknown:
+		return unknownHealthReadFailed(c)
+	}
+	rows, err := s.cfg.Store.ListOwnersWaitingNoCapacity(ctx, pgconv.Time(now.Add(-s.heartbeatStale())))
+	if err != nil {
+		return degradeUnknown(c, "fleet.capacity", err)
+	}
+	if len(rows) == 0 {
+		c.Severity = sevOK
+		c.Summary = "Every owner with queued work has a usable worker."
+		return c
+	}
+	var oldest time.Time
+	haveOldest := false
+	for _, r := range rows {
+		if r.OldestHealthSince.Valid && (!haveOldest || r.OldestHealthSince.Time.Before(oldest)) {
+			oldest = r.OldestHealthSince.Time
+			haveOldest = true
+		}
+	}
+	if haveOldest && now.Sub(oldest) >= fleetCapacityDanger {
+		c.Severity = sevDanger
+		c.Summary = fmt.Sprintf("%d owner(s) have queued runs and no usable worker (oldest waiting %s).", len(rows), humanDur(now.Sub(oldest)))
+		c.Since = sincePtr(oldest)
+		c.Evidence = []apitypes.HealthEvidenceDTO{{Label: "Owners affected", Value: fmt.Sprintf("%d", len(rows))}}
+		c.Action = strPtr("Recover or provision a worker for the affected owners, or check fleet.roll for stuck pods.")
+		c.Command = strPtr("kubectl -n <worker-namespace> get pods")
+		return c
+	}
+	c.Severity = sevOK
+	c.Summary = "Owners waiting for a worker are within the transient window."
+	return c
+}
+
+// checkFleetDisk warns when any worker (of any kind) with a fresh heartbeat has a debounced
+// disk-pressure streak of at least diskPressureStreakWarn consecutive polls. There is no
+// danger, unknown or na band for it (it reads live workers, no controller signal).
+func (s *Service) checkFleetDisk(now time.Time, workers []store.ListAllWorkersRow) apitypes.HealthCheckDTO {
+	c := s.base("fleet.disk")
+	var affected int
+	for _, w := range workers {
+		fresh := w.Worker.LastHeartbeatAt.Valid && now.Sub(w.Worker.LastHeartbeatAt.Time) <= s.heartbeatStale()
+		if fresh && w.Worker.StatsDiskPressureStreak >= diskPressureStreakWarn {
+			affected++
+		}
+	}
+	if affected == 0 {
+		c.Severity = sevOK
+		c.Summary = "No worker is under sustained disk pressure."
+		return c
+	}
+	c.Severity = sevWarn
+	c.Summary = fmt.Sprintf("%d worker(s) are under sustained disk pressure.", affected)
+	c.Evidence = []apitypes.HealthEvidenceDTO{{Label: "Workers", Value: fmt.Sprintf("%d", affected)}}
+	c.Action = strPtr("Free disk on the affected worker(s) or increase the worker volume size.")
+	return c
+}
+
+// -------------------------------------------------------------------------
+// queue group
+// -------------------------------------------------------------------------
+
+// checkQueueWaiting bands the oldest waiting_worker run by age: warn at queueWaitingWarn,
+// danger at queueWaitingDanger. `unknown` when health_enabled is off (the writer is gated
+// by it, D6), and `unknown` when the kill-switch read itself failed (the signal cannot be
+// trusted to read green, so the run tables are not queried).
+func (s *Service) checkQueueWaiting(ctx context.Context, now time.Time, health healthDetectorState) apitypes.HealthCheckDTO {
+	c := s.base("queue.waiting")
+	switch health {
+	case healthDetectorDisabled:
+		return unknownHealthDisabled(c)
+	case healthDetectorUnknown:
+		return unknownHealthReadFailed(c)
+	}
+	ts, err := s.cfg.Store.OldestWaitingWorkerRun(ctx)
+	if err != nil {
+		return degradeUnknown(c, "queue.waiting", err)
+	}
+	if !ts.Valid {
+		c.Severity = sevOK
+		c.Summary = "No run is waiting for a worker."
+		return c
+	}
+	age := now.Sub(ts.Time)
+	switch {
+	case age >= queueWaitingDanger:
+		c.Severity = sevDanger
+		c.Summary = fmt.Sprintf("A run has been waiting for a worker for %s.", humanDur(age))
+		c.Since = sincePtr(ts.Time)
+		c.Action = strPtr("Check fleet.capacity and fleet.roll — a stuck roll or zero capacity is the usual cause.")
+	case age >= queueWaitingWarn:
+		c.Severity = sevWarn
+		c.Summary = fmt.Sprintf("A run has been waiting for a worker for %s.", humanDur(age))
+		c.Since = sincePtr(ts.Time)
+		c.Action = strPtr("Check fleet.capacity and fleet.roll — a stuck roll or zero capacity is the usual cause.")
+	default:
+		c.Severity = sevOK
+		c.Summary = "No run has been waiting for a worker longer than 10 minutes."
+	}
+	return c
+}
+
+// checkQueueUndispatched is danger when a task run has been queued with no dispatch for
+// longer than queueUndispatchedDanger (the #1367 failure class). No warn / unknown / na.
+func (s *Service) checkQueueUndispatched(ctx context.Context, now time.Time) apitypes.HealthCheckDTO {
+	c := s.base("queue.undispatched")
+	ts, err := s.cfg.Store.OldestUndispatchedTaskRun(ctx)
+	if err != nil {
+		return degradeUnknown(c, "queue.undispatched", err)
+	}
+	if !ts.Valid || now.Sub(ts.Time) < queueUndispatchedDanger {
+		c.Severity = sevOK
+		c.Summary = "No task run is stuck undispatched."
+		return c
+	}
+	c.Severity = sevDanger
+	c.Summary = fmt.Sprintf("A task run has been queued undispatched for %s.", humanDur(now.Sub(ts.Time)))
+	c.Since = sincePtr(ts.Time)
+	c.Action = strPtr("A queued task run was never dispatched (issue #1367); re-dispatch it or check the CLI push.")
+	return c
+}
+
+// -------------------------------------------------------------------------
+// control group
+// -------------------------------------------------------------------------
+
+// checkDB warns on a slow ping or a saturated pool and is danger on a failed ping or a
+// migration-version mismatch. It reads the injected probe (the live pool in production, a
+// fake in unit tests). A nil probe (no pool wired) is `unknown`.
+func (s *Service) checkDB(ctx context.Context) apitypes.HealthCheckDTO {
+	c := s.base("db")
+	if s.probeDB == nil {
+		c.Severity = sevUnknown
+		c.Summary = "The database probe is not configured."
+		return c
+	}
+	st := s.probeDB(ctx)
+	switch {
+	case st.pingErr != nil:
+		c.Severity = sevDanger
+		c.Summary = "Database ping failed."
+		c.Action = strPtr("The database is unreachable; check the Postgres pod and connection.")
+		return c
+	case st.schemaErr != nil:
+		c.Severity = sevDanger
+		c.Summary = "Could not read the applied migration version."
+		c.Action = strPtr("Check that migrations have been applied to this database.")
+		return c
+	case !st.schemaAtHead:
+		c.Severity = sevDanger
+		c.Summary = fmt.Sprintf("Applied migration version %d differs from the embedded head %d.", st.schemaApplied, st.schemaHead)
+		c.Evidence = []apitypes.HealthEvidenceDTO{
+			{Label: "Applied", Value: fmt.Sprintf("%d", st.schemaApplied)},
+			{Label: "Head", Value: fmt.Sprintf("%d", st.schemaHead)},
+		}
+		c.Action = strPtr("Run the pending migrations, or roll back to the release whose embedded head matches.")
+		return c
+	}
+	poolRatio := 0.0
+	if st.maxConns > 0 {
+		poolRatio = float64(st.acquiredConns) / float64(st.maxConns)
+	}
+	if st.pingDur > dbPingWarn {
+		c.Severity = sevWarn
+		c.Summary = fmt.Sprintf("Database ping is slow (%dms).", st.pingDur.Milliseconds())
+		c.Action = strPtr("The database is slow to respond; check its load and the network path.")
+		return c
+	}
+	if poolRatio >= dbPoolWarnRatio {
+		c.Severity = sevWarn
+		c.Summary = fmt.Sprintf("Connection pool is near capacity (%d of %d in use).", st.acquiredConns, st.maxConns)
+		c.Action = strPtr("Connection demand is high; consider raising the pool size or reducing load.")
+		return c
+	}
+	c.Severity = sevOK
+	c.Summary = fmt.Sprintf("Database reachable (%dms); schema at head.", st.pingDur.Milliseconds())
+	return c
+}
+
+// livePoolProbe is the production db probe: a real ping (timed with wall-clock time, not
+// the injected clock), the pool stat, and the goose applied-vs-embedded-head comparison.
+func (s *Service) livePoolProbe(ctx context.Context) dbStat {
+	var st dbStat
+	start := time.Now()
+	st.pingErr = s.cfg.Pool.Ping(ctx)
+	st.pingDur = time.Since(start)
+	stat := s.cfg.Pool.Stat()
+	st.acquiredConns = stat.AcquiredConns()
+	st.maxConns = stat.MaxConns()
+	st.schemaApplied, st.schemaHead, st.schemaAtHead, st.schemaErr = store.SchemaVersionStatus(ctx, s.cfg.Pool)
+	return st
+}
+
+// checkControllerReport classifies the fleet-INDEPENDENT "is the controller still
+// reporting" signal — the singleton row ControllerStatus advances on EVERY report,
+// including a zero-worker one (so it is the only liveness trace when there are no hosted
+// worker rows to stamp). There is no warn band. `na` when hosted workers are not configured
+// (the same predicate as fleet.roll). `danger` when there has been no report for
+// controllerReportDanger (5 min). `unknown` from 3 missed intervals up to 5 min, and for the
+// boot grace: the first controllerReportDanger after api boot with no report received SINCE
+// boot — whether the singleton row is absent (first-ever boot) or a stale pre-boot row
+// persists across a restart. `ok` otherwise. Once a report arrives after boot the age-based
+// bands apply exactly, and a stale-report restart past the boot grace correctly becomes danger.
+func (s *Service) checkControllerReport(ctx context.Context, now time.Time, hostedConfigured bool) apitypes.HealthCheckDTO {
+	c := s.base("controller.report")
+	if !hostedConfigured {
+		c.Severity = sevNA
+		c.Summary = "No hosted workers are configured, so the controller does not report."
+		return c
+	}
+
+	observed, err := s.cfg.Store.GetControllerReport(ctx)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows) || (err == nil && !observed.Valid):
+		// The controller has never reported. Inside the boot grace it is unknown (the api
+		// just started and the first report has not arrived yet); past the grace it is a
+		// danger (the controller has been silent since boot).
+		sinceBoot := now.Sub(s.cfg.BootTime)
+		if sinceBoot < controllerReportDanger {
+			c.Severity = sevUnknown
+			c.Summary = "The controller has not reported yet (within the startup grace)."
+			return c
+		}
+		c.Severity = sevDanger
+		c.Summary = "The controller has never reported since api start."
+		c.Action = strPtr("Check that the worker controller is running and can reach the api.")
+		c.Command = strPtr("kubectl -n <worker-namespace> get pods -l app.kubernetes.io/component=controller")
+		c.Since = sincePtr(s.cfg.BootTime)
+		return c
+	case err != nil:
+		return degradeUnknown(c, "controller.report", err)
+	}
+
+	// Boot grace on RESTART: the singleton persists across api restarts, so immediately
+	// after a restart whose downtime exceeded the danger window we read a stale-but-valid
+	// row with no report received SINCE this process booted (the boot-pass evaluation runs
+	// before the api is even listening for reports). That is the same first-report latency
+	// the no-row grace above covers, not a silent controller — within the boot grace degrade
+	// to unknown rather than opening a spurious danger episode. Once a report arrives after
+	// boot (observed.Time is not before BootTime) the age bands below apply unchanged, and a
+	// stale-report restart PAST the grace still becomes danger.
+	if observed.Time.Before(s.cfg.BootTime) && now.Sub(s.cfg.BootTime) < controllerReportDanger {
+		c.Severity = sevUnknown
+		c.Summary = "The controller has not reported since api start (within the startup grace)."
+		return c
+	}
+
+	age := now.Sub(observed.Time)
+	switch {
+	case age >= controllerReportDanger:
+		c.Severity = sevDanger
+		c.Summary = fmt.Sprintf("The controller has not reported for %s.", humanDur(age))
+		c.Since = sincePtr(observed.Time)
+		c.Action = strPtr("Check that the worker controller is running and can reach the api.")
+		c.Command = strPtr("kubectl -n <worker-namespace> get pods -l app.kubernetes.io/component=controller")
+		return c
+	case age >= loopBeatWarnIntervals*controllerReportInterval:
+		// From 3 missed intervals up to the danger window: the controller may just be slow
+		// this tick, so this is unknown, never a warn or a green.
+		c.Severity = sevUnknown
+		c.Summary = fmt.Sprintf("The controller's last report is %s old (a few intervals late).", humanDur(age))
+		c.Since = sincePtr(observed.Time)
+		return c
+	default:
+		c.Severity = sevOK
+		c.Summary = "The controller is reporting."
+		return c
+	}
+}
+
+// checkLoops classifies each REGISTERED background loop against its own tick interval
+// (D8). Per loop: danger past loopBeatDangerIntervals of its intervals, warn past
+// loopBeatWarnIntervals; unknown for a loop that has not beaten since registration and is
+// still within loopBeatWarnIntervals intervals (it has not had a chance yet). A loop that
+// was never registered (the conditional scheduler when not started, D15) is absent from
+// the snapshot and left out entirely. The loops severity is the worst across registered
+// loops. An empty/nil registry (a struct-literal test handler that wired no loops) has no
+// loops to report, so the check is `na` — it cannot apply on this deployment — rather than
+// inventing a warn.
+func (s *Service) checkLoops(now time.Time) apitypes.HealthCheckDTO {
+	c := s.base("loops")
+	var snapshot []LoopBeat
+	if s.cfg.Registry != nil {
+		snapshot = s.cfg.Registry.Snapshot()
+	}
+	if len(snapshot) == 0 {
+		c.Severity = sevNA
+		c.Summary = "No background loops are registered on this deployment."
+		return c
+	}
+
+	worst := sevOK
+	var worstName string
+	var worstAge time.Duration
+	var worstSince time.Time
+	haveWorstSince := false
+	rank := map[string]int{sevOK: 0, sevUnknown: 1, sevWarn: 2, sevDanger: 3}
+	stalled := 0
+	for _, lb := range snapshot {
+		beaten := !lb.LastBeat.IsZero()
+		ref := lb.RegisteredAt
+		if beaten {
+			ref = lb.LastBeat
+		}
+		age := now.Sub(ref)
+		var sev string
+		switch {
+		case age >= time.Duration(loopBeatDangerIntervals)*lb.Interval:
+			sev = sevDanger
+		case age >= time.Duration(loopBeatWarnIntervals)*lb.Interval:
+			sev = sevWarn
+		case !beaten:
+			sev = sevUnknown
+		default:
+			sev = sevOK
+		}
+		if sev != sevOK {
+			stalled++
+		}
+		if rank[sev] > rank[worst] {
+			worst = sev
+			worstName = lb.Name
+			worstAge = age
+			worstSince = ref
+			haveWorstSince = beaten
+		}
+	}
+
+	if worst == sevOK {
+		c.Severity = sevOK
+		c.Summary = fmt.Sprintf("All %d background loops are ticking.", len(snapshot))
+		return c
+	}
+	c.Severity = worst
+	switch worst {
+	case sevUnknown:
+		c.Summary = fmt.Sprintf("The %s loop has not ticked yet since api start.", safe(worstName))
+	default:
+		c.Summary = fmt.Sprintf("The %s loop last ticked %s ago.", safe(worstName), humanDur(worstAge))
+	}
+	c.Evidence = []apitypes.HealthEvidenceDTO{{Label: "Loops needing attention", Value: fmt.Sprintf("%d of %d", stalled, len(snapshot))}}
+	if worst == sevWarn || worst == sevDanger {
+		c.Action = strPtr("A background loop has stopped ticking; check the api logs and restart it if needed.")
+	}
+	if haveWorstSince {
+		c.Since = sincePtr(worstSince)
+	}
+	return c
+}
+
+// -------------------------------------------------------------------------
+// integrations group
+// -------------------------------------------------------------------------
+
+// checkForgeCIWatch warns when ANY repo has more ELIGIBLE run branches than
+// CIWatchMaxRefs, so some run branches go unwatched (the watcher LIMITs to the cap). The
+// comparison is PER REPO — each returned row is one repo with >= 1 eligible branch — never
+// a fleet-wide sum. `na` when CIWatchMaxRefs is 0 (the CI watch is disabled). No danger
+// band.
+func (s *Service) checkForgeCIWatch(ctx context.Context, now time.Time) apitypes.HealthCheckDTO {
+	c := s.base("forge.ciwatch")
+	if s.cfg.CIWatchMaxRefs == 0 {
+		c.Severity = sevNA
+		c.Summary = "The CI watch is disabled (CI_WATCH_MAX_REFS is 0)."
+		return c
+	}
+	rows, err := s.cfg.Store.CountEligibleCIWatchRefsPerRepo(ctx, pgconv.Time(now.Add(-s.cfg.CIWatchRunWindow)))
+	if err != nil {
+		return degradeUnknown(c, "forge.ciwatch", err)
+	}
+	cap64 := int64(s.cfg.CIWatchMaxRefs)
+	var over int
+	var worstRow store.CountEligibleCIWatchRefsPerRepoRow
+	haveWorst := false
+	for _, r := range rows {
+		if r.EligibleRefs > cap64 {
+			over++
+			if !haveWorst || r.EligibleRefs > worstRow.EligibleRefs {
+				worstRow = r
+				haveWorst = true
+			}
+		}
+	}
+	if over == 0 {
+		c.Severity = sevOK
+		c.Summary = "Every repo's run branches fit within the CI watch cap."
+		return c
+	}
+	c.Severity = sevWarn
+	c.Summary = fmt.Sprintf("%d repo(s) have more run branches than the CI watch cap of %d, so some go unwatched.", over, s.cfg.CIWatchMaxRefs)
+	c.Evidence = []apitypes.HealthEvidenceDTO{
+		{Label: "Repos over the cap", Value: fmt.Sprintf("%d", over)},
+		{Label: "Busiest repo", Value: orDash(safe(worstRow.RepoPath))},
+		{Label: "Eligible branches", Value: fmt.Sprintf("%d of %d watched", worstRow.EligibleRefs, s.cfg.CIWatchMaxRefs)},
+	}
+	c.Action = strPtr("Raise CI_WATCH_MAX_REFS, or close finished run branches, so every run branch is watched.")
+	return c
+}
+
+// checkSlackSocket is `na` when Slack is not configured (StateDisabled), ok when connected,
+// and warn when configured but disconnected for at least slackDisconnectedWarn. The manager
+// exposes only the current state, so the "first saw non-connected" timestamp is tracked in
+// process memory here (mutex-guarded), set on the first non-connected evaluation and reset
+// on connect. Below the threshold it is ok (a reconnect blip is not worth alarming).
+func (s *Service) checkSlackSocket(now time.Time) apitypes.HealthCheckDTO {
+	c := s.base("slack.socket")
+	state := slacksvc.StateDisabled
+	if s.cfg.SlackState != nil {
+		state = s.cfg.SlackState()
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	switch state {
+	case slacksvc.StateDisabled:
+		s.slackNonConnectedSince = nil
+		c.Severity = sevNA
+		c.Summary = "Slack is not configured."
+		return c
+	case slacksvc.StateConnected:
+		s.slackNonConnectedSince = nil
+		c.Severity = sevOK
+		c.Summary = "Slack socket is connected."
+		return c
+	}
+
+	if s.slackNonConnectedSince == nil {
+		t := now
+		s.slackNonConnectedSince = &t
+	}
+	disconnectedFor := now.Sub(*s.slackNonConnectedSince)
+	if disconnectedFor >= slackDisconnectedWarn {
+		c.Severity = sevWarn
+		c.Summary = fmt.Sprintf("Slack socket has been disconnected for %s (state: %s).", humanDur(disconnectedFor), state)
+		c.Since = sincePtr(*s.slackNonConnectedSince)
+		c.Action = strPtr("Check the Slack app tokens and the socket connection.")
+		return c
+	}
+	c.Severity = sevOK
+	c.Summary = fmt.Sprintf("Slack socket is reconnecting (state: %s).", state)
+	return c
+}
+
+// -------------------------------------------------------------------------
+// housekeeping group
+// -------------------------------------------------------------------------
+
+// checkSchedulesPaused warns when at least one user has a pause-all in force AND owns at
+// least one enabled schedule — the set whose labelled issues look queued forever.
+func (s *Service) checkSchedulesPaused(ctx context.Context, now time.Time) apitypes.HealthCheckDTO {
+	c := s.base("schedules.paused")
+	n, err := s.cfg.Store.CountUsersPausedWithEnabledSchedules(ctx, pgconv.Time(now))
+	if err != nil {
+		return degradeUnknown(c, "schedules.paused", err)
+	}
+	if n == 0 {
+		c.Severity = sevOK
+		c.Summary = "No user has paused schedules while owning enabled ones."
+		return c
+	}
+	c.Severity = sevWarn
+	c.Summary = fmt.Sprintf("%d user(s) have paused all schedules while owning enabled schedules.", n)
+	c.Evidence = []apitypes.HealthEvidenceDTO{{Label: "Users", Value: fmt.Sprintf("%d", n)}}
+	c.Action = strPtr("Their labelled issues look queued but will not run until they unpause.")
+	return c
+}
+
+// checkBoardDrift warns when at least one column move was given up (pending past the give-up
+// boundary) within the last boardDriftWindow, on a run that HAS an issue (D12: issue_iid IS
+// NOT NULL, filtered in Go so the issue-less false positives of #1482 never count).
+func (s *Service) checkBoardDrift(ctx context.Context, now time.Time) apitypes.HealthCheckDTO {
+	c := s.base("board.drift")
+	rows, err := s.cfg.Store.ListGaveUpColumnMoves(ctx, store.ListGaveUpColumnMovesParams{
+		GiveupCutoff: pgconv.Time(now.Add(-boardGiveUp)),
+		PriorCutoff:  pgconv.Time(now.Add(-boardDriftWindow)),
+	})
+	if err != nil {
+		return degradeUnknown(c, "board.drift", err)
+	}
+	var count int
+	for _, r := range rows {
+		if r.IssueIid.Valid {
+			count++
+		}
+	}
+	if count == 0 {
+		c.Severity = sevOK
+		c.Summary = "No column move has been given up in the last 24 hours."
+		return c
+	}
+	c.Severity = sevWarn
+	c.Summary = fmt.Sprintf("%d issue column move(s) were given up in the last 24 hours.", count)
+	c.Evidence = []apitypes.HealthEvidenceDTO{{Label: "Given-up moves", Value: fmt.Sprintf("%d", count)}}
+	c.Action = strPtr("An automation could not move an issue's card; move it by hand or investigate the board sync.")
+	return c
+}
+
+// checkCustodyHolds warns when at least one owner is at the custody-hold admission limit.
+// `na` when the limit is non-positive (custody admission disabled) — a defensive guard the
+// caller's positive constant never trips in production.
+func (s *Service) checkCustodyHolds(ctx context.Context) apitypes.HealthCheckDTO {
+	c := s.base("custody.holds")
+	if s.cfg.CustodyHoldLimit <= 0 {
+		c.Severity = sevNA
+		c.Summary = "Custody-hold admission is not configured."
+		return c
+	}
+	owners, err := s.cfg.Store.ListOwnersOverCustodyLimit(ctx, s.cfg.CustodyHoldLimit)
+	if err != nil {
+		return degradeUnknown(c, "custody.holds", err)
+	}
+	if len(owners) == 0 {
+		c.Severity = sevOK
+		c.Summary = "No owner is at the custody-hold admission limit."
+		return c
+	}
+	c.Severity = sevWarn
+	c.Summary = fmt.Sprintf("%d owner(s) are at the custody-hold admission limit.", len(owners))
+	c.Evidence = []apitypes.HealthEvidenceDTO{{Label: "Owners", Value: fmt.Sprintf("%d", len(owners))}}
+	c.Action = strPtr("Their new runs are blocked until they discard or resolve held work (uzi run recovery).")
+	return c
+}
+
+// checkReleaseCheck warns when the upstream release check reports far_behind. `na` when the
+// release check is disabled; `unknown` on a settings read error (a missing signal must not
+// read green, D6). Zero store involvement.
+func (s *Service) checkReleaseCheck(ctx context.Context, now time.Time) apitypes.HealthCheckDTO {
+	c := s.base("release.check")
+	if s.cfg.Settings == nil {
+		c.Severity = sevUnknown
+		c.Summary = "Release-check settings are unavailable."
+		return c
+	}
+	enabled, err := s.cfg.Settings.ReleaseCheckEnabled(ctx)
+	if err != nil {
+		return degradeUnknown(c, "release.check", err)
+	}
+	if !enabled {
+		c.Severity = sevNA
+		c.Summary = "The upstream release check is disabled."
+		return c
+	}
+	st, err := s.cfg.Settings.ReleaseStatus(ctx)
+	if err != nil {
+		return degradeUnknown(c, "release.check", err)
+	}
+	if releasecheck.FarBehind(s.cfg.RunningVersion, st.LatestTag, st.PublishedAt, now) {
+		c.Severity = sevWarn
+		c.Summary = fmt.Sprintf("This instance is far behind the latest release (%s).", safe(st.LatestTag))
+		c.Evidence = []apitypes.HealthEvidenceDTO{
+			{Label: "Latest", Value: orDash(safe(st.LatestTag))},
+			{Label: "Running", Value: orDash(safe(s.cfg.RunningVersion))},
+		}
+		c.Action = strPtr("Plan an upgrade to the latest release.")
+		return c
+	}
+	c.Severity = sevOK
+	c.Summary = "This instance is on a recent release."
+	return c
+}
+
+// -------------------------------------------------------------------------
+// shared helpers
+// -------------------------------------------------------------------------
+
+// unknownHealthDisabled is the shared `unknown` verdict for the two checks whose signal is
+// written only when the run-health detector is enabled.
+func unknownHealthDisabled(c apitypes.HealthCheckDTO) apitypes.HealthCheckDTO {
+	c.Severity = sevUnknown
+	c.Summary = "The run-health detector is disabled, so this signal is unavailable."
+	return c
+}
+
+// unknownHealthReadFailed is the shared `unknown` verdict for those same two checks when the
+// run-health kill switch could not be read: with the detector's state indeterminate we
+// cannot tell whether the waiting_worker signal is being written, so the check must not
+// query the run tables for a green verdict (D6). Its summary is deliberately distinct from
+// the known-disabled one.
+func unknownHealthReadFailed(c apitypes.HealthCheckDTO) apitypes.HealthCheckDTO {
+	c.Severity = sevUnknown
+	c.Summary = "Run-health detection state could not be determined."
+	return c
+}
+
+// degradeUnknown turns a per-check query failure into `unknown` (never ok, per D6) and logs
+// it, so one broken query cannot blank the whole page or read green.
+func degradeUnknown(c apitypes.HealthCheckDTO, id string, err error) apitypes.HealthCheckDTO {
+	slog.Warn("healthsvc: check query failed", "check", id, "error", err)
+	c.Severity = sevUnknown
+	c.Summary = "This signal is temporarily unavailable."
+	return c
+}
+
+// orDash renders an empty value as an em-dash placeholder in evidence.
+func orDash(v string) string {
+	if v == "" {
+		return "—"
+	}
+	return v
+}

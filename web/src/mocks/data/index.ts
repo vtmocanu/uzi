@@ -11,6 +11,7 @@ export * from "./secrets";
 export * from "./forge";
 export * from "./boards";
 export * from "./workers";
+export * from "./health";
 export * from "./agents";
 export * from "./plans";
 export * from "./runs";

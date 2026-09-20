@@ -87,6 +87,11 @@ func (h *Handler) mountAdminRoutes(r chi.Router, forgeLimiter, authLimiter *mw.L
 			// is a cookie-only write in the group below. Admin-only route, so the DTO
 			// carries the raw release body the card previews.
 			r.Get("/release-check", h.GetReleaseCheck)
+			// Admin-health document (PRD #1484 M1): the closed registry of checks with the
+			// overall verdict, tally and evidence. A cache-backed read, no forge call →
+			// noLimiter, like the release-check GET beside it. Admin-only by this group, so
+			// the owner/worker names it carries never reach a uzc_ token or a non-admin.
+			r.Get("/health", h.GetAdminHealth)
 			// Factory-wide standing-credential inventory: every CLI token with its
 			// owner. Closes the gap that `workers` has not had since PRD #42 — a CLI
 			// token was visible to its owner and to NOBODY else, and a user-scope token
@@ -182,6 +187,11 @@ func (h *Handler) mountAdminRoutes(r chi.Router, forgeLimiter, authLimiter *mw.L
 			// Cookie-only admin, no egress — upserts the snooze tag = latest_tag so a
 			// newer release auto-clears it. Off the read-only GET and the uza_ CLI token.
 			r.Post("/release-check/snooze", h.PostReleaseCheckSnooze)
+			// PRD #1484 D2: snooze the admin Danger health banner for the current episode,
+			// per admin. Cookie-only admin write (no CLI verb, matching "no admin write
+			// verbs" — a uza_/uzc_ Bearer 401s/403s before the handler). 409 when no episode
+			// is open. No forge limiter — a local per-(episode, caller) upsert, no egress.
+			r.Post("/health/snooze", h.PostAdminHealthSnooze)
 		})
 	})
 }

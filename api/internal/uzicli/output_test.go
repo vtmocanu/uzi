@@ -24,6 +24,12 @@ func TestExitCodeFor(t *testing.T) {
 		{"cobra-unknown-command", errors.New(`unknown command "bogus" for "uzi"`), ExitUsage},
 		{"cobra-accepts", errors.New("accepts 1 arg(s), received 0"), ExitUsage},
 		{"cobra-required-flag", errors.New(`required flag(s) "id" not set`), ExitUsage},
+		// The health-danger sentinel is a success-path signal (`uzi admin health` on a
+		// 200-carried danger verdict), so it maps to its own code, not the generic default —
+		// both bare and wrapped, since the command wraps it with a status-specific message
+		// under --strict. This is what lets a probe tell "unhealthy" (8) from a real failure.
+		{"health-danger-sentinel", ErrHealthDanger, ExitHealthDanger},
+		{"wrapped-health-danger", errWrap(ErrHealthDanger), ExitHealthDanger},
 	}
 	for _, tc := range cases {
 		if got := ExitCodeFor(tc.err); got != tc.want {

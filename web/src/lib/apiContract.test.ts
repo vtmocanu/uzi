@@ -43,6 +43,7 @@ import type {
   GuardrailOverrideRequest,
   CodexAccountRateLimit,
   CodexAdminRateLimitRow,
+  HealthDoc,
 } from "./apiTypes";
 
 import runZero from "../../../fixtures/api-contract/run.zero.json";
@@ -129,6 +130,8 @@ import codexAccountRateLimitZero from "../../../fixtures/api-contract/codex_acco
 import codexAccountRateLimitFull from "../../../fixtures/api-contract/codex_account_rate_limit.full.json";
 import codexAdminRateLimitRowZero from "../../../fixtures/api-contract/codex_admin_rate_limit_row.zero.json";
 import codexAdminRateLimitRowFull from "../../../fixtures/api-contract/codex_admin_rate_limit_row.full.json";
+import healthDocZero from "../../../fixtures/api-contract/health_doc.zero.json";
+import healthDocFull from "../../../fixtures/api-contract/health_doc.full.json";
 
 // The api ⇄ SPA JSON wire-contract (PRD #982). This is the VITEST HALF; the Go
 // half is api/internal/apitypes/contract_test.go. Neither reads the other: each
@@ -281,6 +284,24 @@ type ZeroOf<T, NeverNull extends keyof T = never> = {
   void _gorExtra;
   void _gorZero;
   void _gorFull;
+}
+
+// ── HealthDoc (PRD #1484 M1) ──────────────────────────────────────────────────
+// The admin-health document. ZeroOf exemption: checks — the registry always emits a
+// non-nil slice, but json.Marshal(HealthDocDTO{}) is a null nil-slice (same idiom as
+// GuardrailOverrideRequest.findings). snoozed_until/episode_id are string|null (present
+// as null on the zero value, so they need no exemption — Widen<string|null> accepts
+// null). counts is a nested all-number object. The nested HealthCheck/HealthEvidence
+// types ride inside checks[0] of the full fixture.
+{
+  const _healthDocMissing: never = null as unknown as Exclude<keyof HealthDoc, keyof typeof healthDocFull>;
+  const _healthDocExtra: never = null as unknown as Exclude<keyof typeof healthDocFull, keyof HealthDoc>;
+  const _healthDocZero: ZeroOf<HealthDoc, "checks"> = healthDocZero;
+  const _healthDocFull: Widen<HealthDoc> = healthDocFull;
+  void _healthDocMissing;
+  void _healthDocExtra;
+  void _healthDocZero;
+  void _healthDocFull;
 }
 
 // ── RunMessage (M2) ─────────────────────────────────────────────────────────
@@ -1013,6 +1034,10 @@ const dtos: { stem: string; nullable: boolean }[] = [
   // row), normalized to [] by the M3 mapper — so nullable:true.
   { stem: "codex_account_rate_limit", nullable: true },
   { stem: "codex_admin_rate_limit_row", nullable: true },
+  // PRD #1484 M1: the admin-health document. snoozed_until/episode_id are present-as-null
+  // pointers and checks is a non-omitempty slice (a null nil-slice marshal the registry
+  // normalizes to []), so its zero.json carries nulls.
+  { stem: "health_doc", nullable: true },
 ];
 
 describe("api-contract fixtures are present and discriminating", () => {

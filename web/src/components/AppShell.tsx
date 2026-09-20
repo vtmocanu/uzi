@@ -16,6 +16,9 @@ import { useDemoMode } from "../lib/demoMode";
 import { maskEmail, maskName, maskRepoPath } from "../lib/demoMask";
 import { VaultBadge, VaultLockedBanner } from "./VaultControls";
 import { UpdateEscalationBanner } from "./UpdateEscalationBanner";
+import { HealthDangerBanner } from "./HealthDangerBanner";
+import { HealthPip } from "./healthSeverity";
+import { HealthStatusProvider, useHealthStatus } from "../lib/useAdminHealth";
 import { RateLimitAnnouncer, SidebarRateLimits } from "./RateLimitMeters";
 import { SidebarCodexRateLimits } from "./CodexRateLimitMeters";
 import { onNotificationsChanged } from "../lib/notifications";
@@ -426,6 +429,7 @@ function NavItem({
   badge = 0,
   badgeTone = "count",
   badgeLabel,
+  healthPip,
 }: {
   to: string;
   icon?: ReactNode;
@@ -457,11 +461,19 @@ function NavItem({
   // above already states the label must say what the number MEANS; this makes that
   // reachable per-item instead of one hardcoded string for the whole tone.
   badgeLabel?: string;
+  // The Admin entry's health severity pip (PRD #1484 M5): a severity entry point per D1.
+  // count 0 / null renders nothing. Reuses the shared HealthPip when expanded; on the
+  // collapsed rail it becomes a severity dot on the icon with an sr-only worded count, so
+  // the severity is never colour-only. Distinct from `badge` so the Admin item's pip and any
+  // future count badge would not fight over the one trailing slot.
+  healthPip?: { count: number; danger: boolean } | null;
 }) {
   const { pathname } = useLocation();
   const active = exactOnly ? pathname === to : isNavActive(pathname, to);
   const hasBadge = badge > 0;
   const alert = badgeTone === "alert";
+  const pip = healthPip && healthPip.count > 0 ? healthPip : null;
+  const pipWord = pip?.danger ? "danger" : "warning";
   // The accessible noun: explicit override, else the per-tone default.
   const badgeNoun = badgeLabel ?? (alert ? "needing attention" : "unread");
   return (
@@ -499,9 +511,32 @@ function NavItem({
               )}
             />
           )}
+          {/* Collapsed rail: a severity dot on the Admin icon (the count moves to the
+              sr-only span below, since a rail has no room for a number). */}
+          {collapsed && pip && (
+            <span
+              aria-hidden="true"
+              className={cx(
+                "absolute -right-1 -top-1 h-2 w-2 rounded-full ring-2 ring-surface",
+                pip.danger ? "bg-danger" : "bg-warn",
+              )}
+            />
+          )}
         </span>
       )}
       {!collapsed && <span className="truncate">{label}</span>}
+      {/* The health pip's count survives collapse as sr-only text, mirroring the badge: a
+          collapsed rail is not a reason to withhold an incident count from assistive tech. */}
+      {collapsed && pip && (
+        <span className="sr-only">{`${pip.count} health ${pip.count === 1 ? "check" : "checks"} need attention (${pipWord})`}</span>
+      )}
+      {/* Expanded: the shared HealthPip (dot + count + worded aria-label), reused from the
+          Admin > Health tab so the two entry points read identically (PRD #1484 M5). */}
+      {!collapsed && pip && (
+        <span className="ml-auto">
+          <HealthPip count={pip.count} danger={pip.danger} />
+        </span>
+      )}
       {/* The count SURVIVES COLLAPSE. The pill below is gated on !collapsed and the rail's
           dot is aria-hidden, so without this an assistive-tech user got no count and no
           tone at all in the collapsed rail — measured: no aria-label, empty innerText, only
@@ -613,6 +648,12 @@ function SidebarContent({
   const navigate = useNavigate();
   const location = useLocation();
   const demoMode = useDemoMode();
+  // The Admin entry's health pip (PRD #1484 M5): a severity entry point in the sidebar (D1),
+  // fed by the ONE shared HealthStatusProvider — no second poll here, and a non-admin never
+  // fetches (the provider's isAdmin gate leaves doc null, so attentionCount is 0). Danger
+  // dominates the pip colour, else warning (which covers unknown).
+  const { doc: health, attentionCount: healthAttention } = useHealthStatus();
+  const healthPipDanger = (health?.counts.danger ?? 0) > 0;
   // Single masked identity label (PRD #886 M3). Preserve the raw display_name ?? email
   // fallback precedence, masking whichever branch is chosen, and derive the initial from
   // the masked label so it matches the shown name (decision 7: Vlad → V, not the raw one).
@@ -839,8 +880,16 @@ function SidebarContent({
           />
           {user?.is_admin && (
             /* /admin redirects to the first tab; the prefix match keeps this entry
-               lit on every /admin/* tab. */
-            <NavItem to="/admin" icon={<ShieldIcon />} label="Admin" onNavigate={onNavigate} collapsed={collapsed} />
+               lit on every /admin/* tab. The health pip is a severity entry point (PRD
+               #1484 M5, D1): a count + worded severity when checks need attention. */
+            <NavItem
+              to="/admin"
+              icon={<ShieldIcon />}
+              label="Admin"
+              onNavigate={onNavigate}
+              collapsed={collapsed}
+              healthPip={{ count: healthAttention, danger: healthPipDanger }}
+            />
           )}
           <NavItem to="/docs" icon={<BookIcon />} label="Docs" onNavigate={onNavigate} collapsed={collapsed} />
         </NavGroup>
@@ -1251,9 +1300,14 @@ export function AppShell({ children }: { children: ReactNode }) {
   const fullBleed = /^\/repos\/[^/]+\/board/.test(location.pathname);
 
   return (
-    // Width/padding are literal class strings in the ternary so Tailwind's JIT
-    // emits both — an interpolated `lg:pl-${n}` would never be scanned.
-    <div className={cx("min-h-screen", collapsed ? "lg:pl-14" : "lg:pl-60")}>
+    // The ONE admin-health poll for the whole app (PRD #1484 M5). Mounted here, above both
+    // the sidebar (the Admin pip) and the main pane (the danger banner + Overview card + the
+    // Health page), so every consumer reads one provider and the isAdmin gate lives in one
+    // place. A non-admin session never fetches the admin endpoint.
+    <HealthStatusProvider>
+      {/* Width/padding are literal class strings in the ternary so Tailwind's JIT
+          emits both — an interpolated `lg:pl-${n}` would never be scanned. */}
+      <div className={cx("min-h-screen", collapsed ? "lg:pl-14" : "lg:pl-60")}>
       {/* App-wide screen-reader alert for rate-limit tone crossings (PRD #54,
           Decision 4): a visually-hidden aria-live region mounted once so a
           window crossing into warn/danger announces on any route, not only
@@ -1338,6 +1392,10 @@ export function AppShell({ children }: { children: ReactNode }) {
               renders nothing unless the server says the instance is far behind and the
               banner is enabled and not snoozed for the current release. */}
           <UpdateEscalationBanner />
+          {/* App-wide instance-health danger banner (PRD #1484 M5): admin-only, danger-only,
+              self-gating, with a 1 h per-episode snooze. Reads the shared HealthStatusProvider,
+              so a non-admin never fetches the admin endpoint. */}
+          <HealthDangerBanner />
           {/* Both halves of the one canonical to-triage number (PRD #98). The setter is
               how the Judge page keeps it fresh after a dispose; the value is how the judge
               notification in the inbox reads the SAME number the nav badge above is
@@ -1366,6 +1424,7 @@ export function AppShell({ children }: { children: ReactNode }) {
           onClose={() => setChangelogOpen(false)}
         />
       )}
-    </div>
+      </div>
+    </HealthStatusProvider>
   );
 }

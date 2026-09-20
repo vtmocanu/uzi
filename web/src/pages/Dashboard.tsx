@@ -26,6 +26,8 @@ import { RunHealthBadge } from "../components/RunHealthBadge";
 import { WorkerStatLine, hasStats } from "../components/WorkerStats";
 import { WorkerCordonBadge } from "../components/WorkerCordonBadge";
 import { CustodyBoardAlert } from "../components/CustodyBoardAlert";
+import { HealthOverviewCard } from "../components/HealthOverviewCard";
+import { HealthPlatformLine } from "../components/HealthPlatformLine";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import { Badge, Button, Card, cx, PageHeader, SectionTitle, Skeleton, StatTile, StatusPill } from "../components/ui";
 import { CheckIcon, ChevronRightIcon } from "../components/icons";
@@ -255,6 +257,17 @@ export function Dashboard() {
           and refreshes its own aggregate, so it can render before the rest of the dashboard
           settles. */}
       <CustodyBoardAlert recoveryWaitCount={recoveryWaitCount} />
+
+      {/* Instance health on Overview (PRD #1484 M5). Admins get the self-hiding health card
+          (fed by the shared HealthStatusProvider — no fetch for a non-admin). A non-admin
+          whose own hosted fleet is stuck gets the platform line instead, derived only from
+          their own runs + workers already fetched above. The two are mutually exclusive. */}
+      <HealthOverviewCard />
+      <HealthPlatformLine
+        isAdmin={user.is_admin === true}
+        runs={data?.runs ?? []}
+        workers={data?.workers ?? []}
+      />
 
       {!data ? (
         <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">

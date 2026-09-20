@@ -1734,6 +1734,30 @@ func (q *Queries) CountUnresolvedCustodyHoldsForOwner(ctx context.Context, userI
 	return count, err
 }
 
+const countUsersPausedWithEnabledSchedules = `-- name: CountUsersPausedWithEnabledSchedules :one
+SELECT count(*) FROM (
+    SELECT u.id
+    FROM users u
+    JOIN run_schedules rs ON rs.user_id = u.id
+    WHERE u.schedules_paused = true
+       OR (u.schedules_paused_until IS NOT NULL AND u.schedules_paused_until > $1)
+    GROUP BY u.id
+    HAVING count(*) FILTER (WHERE rs.enabled) >= 1
+) paused_users
+`
+
+// health schedules.paused: how many users have a pause-all in force AND own at least one
+// ENABLED schedule — the set whose labelled issues look queued forever. A pause is in
+// force when schedules_paused is true OR schedules_paused_until is still ahead of @now.
+// The HAVING filter counts only enabled schedules, so a user who paused but has only
+// disabled schedules does not count. healthsvc warns when the count is >= 1.
+func (q *Queries) CountUsersPausedWithEnabledSchedules(ctx context.Context, now pgtype.Timestamptz) (int64, error) {
+	row := q.db.QueryRow(ctx, countUsersPausedWithEnabledSchedules, now)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const countWorkerNonTerminalRuns = `-- name: CountWorkerNonTerminalRuns :one
 SELECT count(*) FROM runs
 WHERE worker_id = $1
@@ -5515,17 +5539,38 @@ SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.v
              AND r.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
              AND r.kind <> 'chat'
        ) AS active_runs,
-       u.email AS owner_email
+       u.email AS owner_email,
+       rh.phase              AS roll_phase,
+       rh.phase_since        AS roll_phase_since,
+       rh.pod_phase          AS roll_pod_phase,
+       rh.blocking_container AS roll_blocking_container,
+       rh.blocking_reason    AS roll_blocking_reason,
+       rh.restart_count      AS roll_restart_count,
+       rh.last_exit_code     AS roll_last_exit_code,
+       rh.observed_at        AS roll_observed_at,
+       rh.upgrading_since    AS roll_upgrading_since,
+       rh.worker_image_tag   AS roll_worker_image_tag
 FROM workers w
 JOIN users u ON u.id = w.user_id
+LEFT JOIN worker_upgrade_reports rh ON rh.worker_id = w.id
 ORDER BY w.created_at DESC
 `
 
 type ListAllWorkersRow struct {
-	Worker     Worker `json:"worker"`
-	Busy       bool   `json:"busy"`
-	ActiveRuns int64  `json:"active_runs"`
-	OwnerEmail string `json:"owner_email"`
+	Worker                Worker             `json:"worker"`
+	Busy                  bool               `json:"busy"`
+	ActiveRuns            int64              `json:"active_runs"`
+	OwnerEmail            string             `json:"owner_email"`
+	RollPhase             pgtype.Text        `json:"roll_phase"`
+	RollPhaseSince        pgtype.Timestamptz `json:"roll_phase_since"`
+	RollPodPhase          pgtype.Text        `json:"roll_pod_phase"`
+	RollBlockingContainer pgtype.Text        `json:"roll_blocking_container"`
+	RollBlockingReason    pgtype.Text        `json:"roll_blocking_reason"`
+	RollRestartCount      pgtype.Int4        `json:"roll_restart_count"`
+	RollLastExitCode      pgtype.Int4        `json:"roll_last_exit_code"`
+	RollObservedAt        pgtype.Timestamptz `json:"roll_observed_at"`
+	RollUpgradingSince    pgtype.Timestamptz `json:"roll_upgrading_since"`
+	RollWorkerImageTag    pgtype.Text        `json:"roll_worker_image_tag"`
 }
 
 // Admin Agents-status: every worker with owner email plus the same two derived
@@ -5534,6 +5579,19 @@ type ListAllWorkersRow struct {
 // excluded so a live chat never inflates "N/M runs" past the run-lane cap). The
 // embedded worker carries max_concurrent_runs (the advertised cap, NULL when
 // unadvertised).
+//
+// Roll health (PRD #1484 M1/M2), LEFT JOINed exactly as ListWorkersByUser does so the
+// admin fleet view and the cross-user health checks (fleet.roll, fleet.disk) can read
+// the controller's per-worker roll signal instead of the always-null placeholder the
+// old admin list carried. A worker with no report — every external worker, any hosted
+// worker the controller has not reached, and the whole fleet under docker-compose where
+// no controller runs — still lists (LEFT JOIN). observed_at is the API's own receipt
+// time and the only freshness input; controller_reported_at is deliberately NOT
+// selected (it is display-only and must not reach a freshness classifier). The full set
+// of roll columns ListWorkersByUser selects — INCLUDING pod_phase and upgrading_since —
+// is carried (M2) so AdminListWorkers' row-to-DTO mapper builds the SAME RollSignal and
+// classifies upgrade_status/blocking fields byte-identically to GET /api/workers, rather
+// than diverging on the INV-5 ceiling (upgrading_since) or the rolling-detail (pod_phase).
 func (q *Queries) ListAllWorkers(ctx context.Context) ([]ListAllWorkersRow, error) {
 	rows, err := q.db.Query(ctx, listAllWorkers)
 	if err != nil {
@@ -5584,6 +5642,16 @@ func (q *Queries) ListAllWorkers(ctx context.Context) ([]ListAllWorkersRow, erro
 			&i.Busy,
 			&i.ActiveRuns,
 			&i.OwnerEmail,
+			&i.RollPhase,
+			&i.RollPhaseSince,
+			&i.RollPodPhase,
+			&i.RollBlockingContainer,
+			&i.RollBlockingReason,
+			&i.RollRestartCount,
+			&i.RollLastExitCode,
+			&i.RollObservedAt,
+			&i.RollUpgradingSince,
+			&i.RollWorkerImageTag,
 		); err != nil {
 			return nil, err
 		}
@@ -5827,6 +5895,64 @@ func (q *Queries) ListLimitWaitReeval(ctx context.Context, now pgtype.Timestampt
 			&i.RetryNotBefore,
 			&i.WorkerBindMode,
 		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listOwnersWaitingNoCapacity = `-- name: ListOwnersWaitingNoCapacity :many
+
+SELECT r.user_id,
+       min(r.health_since)::timestamptz AS oldest_health_since
+FROM runs r
+WHERE r.health = 'waiting_worker'
+  AND r.health_since IS NOT NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM workers w
+      WHERE w.user_id = r.user_id
+        AND w.draining_since IS NULL
+        AND w.last_heartbeat_at IS NOT NULL
+        AND w.last_heartbeat_at >= $1
+  )
+GROUP BY r.user_id
+`
+
+type ListOwnersWaitingNoCapacityRow struct {
+	UserID            uuid.UUID          `json:"user_id"`
+	OldestHealthSince pgtype.Timestamptz `json:"oldest_health_since"`
+}
+
+// ════════════════════════════════════════════════════════════════════════════════════════
+// Admin health checks (PRD #1484 M1). Each is an indexed count/min over a table the api
+// already holds; healthsvc composes the server-authored summary and applies the named
+// thresholds. board.drift reuses ListGaveUpColumnMoves and custody.holds reuses
+// ListOwnersOverCustodyLimit, so only these four are new.
+// ════════════════════════════════════════════════════════════════════════════════════════
+// health fleet.capacity: the owners who have at least one run parked in
+// health='waiting_worker' AND own ZERO usable workers — online (fresh heartbeat), not
+// draining. Per owner the OLDEST health_since (the wait's start); healthsvc applies the
+// 5-minute danger threshold. The heartbeat-freshness definition (last_heartbeat_at >=
+// @heartbeat_cutoff, cutoff = now - WORKER_HEARTBEAT_STALE) mirrors the "online worker"
+// window the recovery/claim queries use, so this stays truthful even when the controller
+// is silent (a heartbeat-based signal, not status-based). The conjunction with "zero
+// usable workers" is what makes waiting_worker a CAPACITY failure rather than one of its
+// other causes (vault locked, custody limit, all workers busy) — those surface through
+// queue.waiting by age instead.
+func (q *Queries) ListOwnersWaitingNoCapacity(ctx context.Context, heartbeatCutoff pgtype.Timestamptz) ([]ListOwnersWaitingNoCapacityRow, error) {
+	rows, err := q.db.Query(ctx, listOwnersWaitingNoCapacity, heartbeatCutoff)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListOwnersWaitingNoCapacityRow{}
+	for rows.Next() {
+		var i ListOwnersWaitingNoCapacityRow
+		if err := rows.Scan(&i.UserID, &i.OldestHealthSince); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -7722,6 +7848,41 @@ func (q *Queries) NewestRunForMR(ctx context.Context, arg NewestRunForMRParams) 
 		&i.StaleRequeueGeneration,
 	)
 	return i, err
+}
+
+const oldestUndispatchedTaskRun = `-- name: OldestUndispatchedTaskRun :one
+SELECT min(created_at)::timestamptz AS oldest_created_at
+FROM runs
+WHERE kind = 'task' AND status = 'queued' AND dispatched_at IS NULL
+`
+
+// health queue.undispatched: the oldest created_at across every task run stuck queued
+// with no dispatch (the #1367 failure class), or NULL when none exists. healthsvc applies
+// danger when older than 10 min. The kind='task' scope is load-bearing: dispatched_at is
+// only ever set on a task run, so unscoped the predicate would match every queued run.
+func (q *Queries) OldestUndispatchedTaskRun(ctx context.Context) (pgtype.Timestamptz, error) {
+	row := q.db.QueryRow(ctx, oldestUndispatchedTaskRun)
+	var oldest_created_at pgtype.Timestamptz
+	err := row.Scan(&oldest_created_at)
+	return oldest_created_at, err
+}
+
+const oldestWaitingWorkerRun = `-- name: OldestWaitingWorkerRun :one
+SELECT min(health_since)::timestamptz AS oldest_health_since
+FROM runs
+WHERE health = 'waiting_worker'
+`
+
+// health queue.waiting: the oldest health_since across every run in
+// health='waiting_worker', or NULL when none is waiting. healthsvc applies warn >= 10 min
+// and danger >= 30 min. This is the sole reader of the age; the writer (detectRunHealth)
+// is gated by health_enabled, so when that setting is off the check reports unknown, not
+// ok, rather than reading this NULL as "nothing waiting".
+func (q *Queries) OldestWaitingWorkerRun(ctx context.Context) (pgtype.Timestamptz, error) {
+	row := q.db.QueryRow(ctx, oldestWaitingWorkerRun)
+	var oldest_health_since pgtype.Timestamptz
+	err := row.Scan(&oldest_health_since)
+	return oldest_health_since, err
 }
 
 const parkRunForgeUnreachable = `-- name: ParkRunForgeUnreachable :one

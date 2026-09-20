@@ -31,6 +31,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/config"
 	"github.com/vtmocanu/uzi/api/internal/forgesvc"
 	"github.com/vtmocanu/uzi/api/internal/handler"
+	"github.com/vtmocanu/uzi/api/internal/healthsvc"
 	"github.com/vtmocanu/uzi/api/internal/hostedsvc"
 	"github.com/vtmocanu/uzi/api/internal/hub"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
@@ -623,6 +624,14 @@ func run() error {
 	failNotifier := notifysvc.NewRunFailureNotifier(q, notifier, slog.Default())
 	wsvc.SetBroadcaster(workersvc.MultiBroadcaster{liveHub, slackNotifier, failNotifier})
 
+	// Admin-health loop-beat registry (PRD #1484 M2, D8): ONE registry, built here before
+	// the four background loops so each can be Registered with its effective interval and
+	// handed a plain func(){ healthBeats.Beat("<name>") }. It is a leaf held by the SHARED
+	// healthsvc.Service (built below and injected into both the handler and the once-a-minute
+	// episode evaluator), so the endpoint and the evaluator see the SAME beats. No loop
+	// package imports healthsvc — each only receives a callback.
+	healthBeats := healthsvc.NewBeatRegistry(time.Now)
+
 	// Board column automation (PRD #12): reacts to run status changes with
 	// forge-first label moves, plus a reconcile loop that retries moves a down
 	// forge dropped. Wired into workersvc as the status-change hook and run as its
@@ -633,6 +642,9 @@ func run() error {
 	// v2 Status (PRD #364 M5), best-effort. The same service backs the drag handler.
 	lifecycle.SetProjector(projectSync)
 	wsvc.SetLifecycle(lifecycle)
+	// Admin-health loop-beat: the run-lifecycle reconciler is one of the four loops (M2).
+	lifecycle.SetBeat(func() { healthBeats.Beat("lifecycle") })
+	healthBeats.Register("lifecycle", lifecycle.Interval())
 
 	// Background sync engine: pulls forge changes into the issue cache for every
 	// enabled repo. Its lifetime is tracked so shutdown waits for it before the
@@ -678,6 +690,9 @@ func run() error {
 	// changes. Wired unconditionally — the instance kill-switch is simply NOT wiring
 	// it; the per-repo link row + the settings kill-switch gate activation.
 	engine.SetProjectReverseSync(projectSync)
+	// Admin-health loop-beat: the forge poller is one of the four loops (PRD #1484 M2).
+	engine.SetBeat(func() { healthBeats.Beat("poller") })
+	healthBeats.Register("poller", engine.Interval())
 
 	// Run-liveness sweeper (sibling of the poller). Boot runs one orphan sweep
 	// immediately, then the goroutine sweeps on its own interval. Both lifetimes
@@ -772,6 +787,10 @@ func run() error {
 			Run:  ephemeralProv.ReapPass,
 		},
 	)
+	// Admin-health loop-beat: the run-liveness sweeper is one of the four loops (PRD #1484
+	// M2). Registered before Boot so the loops check has its baseline from api start.
+	sweep.SetBeat(func() { healthBeats.Beat("sweeper") })
+	healthBeats.Register("sweeper", sweep.Interval())
 	sweep.Boot(ctx)
 
 	// PAT least-privilege service + sweep (PRD #5). The service is shared by the
@@ -842,6 +861,12 @@ func run() error {
 	// schedule that came due while the api was down fire promptly after a restart.
 	if cfg.SchedulerCheckInterval > 0 {
 		scheduler := schedsvc.New(q, wsvc, svc, settingsCache, notifier, vlt, cfg.SchedulerCheckInterval, slog.Default())
+		// Admin-health loop-beat: the scheduler is one of the four loops (PRD #1484 M2, D15).
+		// Registered ONLY inside this started-block, so a not-started scheduler
+		// (SCHEDULER_CHECK_INTERVAL=0) is left OUT of the loops evidence entirely rather than
+		// counted as a silent loop.
+		scheduler.SetBeat(func() { healthBeats.Beat("scheduler") })
+		healthBeats.Register("scheduler", scheduler.Interval())
 		bgWG.Add(1)
 		go func() {
 			defer bgWG.Done()
@@ -920,6 +945,51 @@ func run() error {
 				return
 			case <-tick.C:
 				custodyEpisodeRec.Reconcile(ctx)
+			}
+		}
+	}()
+
+	// Admin-health evaluator (PRD #1484 M2, D14). ONE shared healthsvc.Service holds the
+	// loop-beat registry wired above plus every check dep the handler passes to Evaluate, so
+	// the GET /api/admin/health endpoint and this once-a-minute episode evaluator can never
+	// disagree about the instance's health. It is injected into the handler below via
+	// SetHealthService, and driven here to open/close DANGER episodes (M2 has NO notice — the
+	// debounced claimed fan-out is M6). Wired beside the custody-episode reconciler above: a
+	// standalone reconciler with a boot pass then a one-minute ticker.
+	healthSvc := healthsvc.New(healthsvc.Config{
+		Store:               q,
+		Pool:                pool,
+		Settings:            settingsCache,
+		SlackState:          slackManager.State,
+		Now:                 time.Now,
+		HostedWorkerVersion: cfg.HostedWorkerVersion,
+		RunningVersion:      version,
+		HeartbeatStale:      cfg.WorkerHeartbeatStale,
+		CustodyHoldLimit:    int32(workersvc.CustodyHoldLimit),
+		BootTime:            time.Now(),
+		CIWatchMaxRefs:      cfg.CIWatchMaxRefs,
+		CIWatchRunWindow:    cfg.CIWatchRunWindow,
+		Registry:            healthBeats,
+	})
+	// M6 wires the notice fan-out into the SAME reconciler: the persist-first notifysvc
+	// seam, the store (ListAdmins fan-out set + the atomic ClaimHealthEpisodeNotice slot),
+	// and the health-notification enablement gate (settingsCache.HealthEnabled — the SAME
+	// gate the custody-episode reconciler reuses, no new enable flag, D10). notifier and
+	// settingsCache are the same collaborators wired into custodyEpisodeRec above.
+	healthEpisodeRec := healthsvc.NewEpisodeReconciler(healthSvc, q, notifier, settingsCache, slog.Default())
+	healthEpisodeInterval := time.Minute
+	bgWG.Add(1)
+	go func() {
+		defer bgWG.Done()
+		healthEpisodeRec.Reconcile(ctx) // immediate boot pass so a live danger opens promptly
+		tick := time.NewTicker(healthEpisodeInterval)
+		defer tick.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+				healthEpisodeRec.Reconcile(ctx)
 			}
 		}
 	}()
@@ -1173,6 +1243,11 @@ func run() error {
 	// The admin release-check "Check now" endpoint (PRD #836 M3) drives the SAME
 	// reconciler the interval Runner uses (releaseRec, built above): CheckForUpdate.
 	h.SetReleaseCheckReconciler(releaseRec)
+	// Inject the SHARED admin-health evaluator (PRD #1484 M2): the SAME Service the episode
+	// evaluator uses, holding the loop-beat registry the four background loops beat into, so
+	// GET /api/admin/health and the evaluator agree on the beats. Without this the handler
+	// would lazily build its own registry-less Service (loops → na); production always sets it.
+	h.SetHealthService(healthSvc)
 	// Share the vault with the HTTP handlers: unlock at login, DEK-seal on secret
 	// save, the /api/vault endpoints, and vault status on /api/me (PRD #32). M3 adds
 	// the same instance to workersvc for claim-time gating + open.

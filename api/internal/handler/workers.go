@@ -245,6 +245,83 @@ func rollSignalFromRow(w store.ListWorkersByUserRow) *workersvc.RollSignal {
 	return sig
 }
 
+// rollSignalFromAdminRow is rollSignalFromRow for the admin fleet row (PRD #1484 M2). The
+// two row types carry the SAME LEFT-JOINed roll columns (ListAllWorkers selects them
+// "exactly as ListWorkersByUser does"), so this is a field-for-field copy differing only in
+// the parameter type — which is why the admin list classifies upgrade_status and the
+// upgrade_blocking_* fields identically to GET /api/workers for the same underlying report.
+// The nil-on-absent contract is the same load-bearing half rollSignalFromRow documents:
+// absent lets a report DECAY to a version compare rather than pinning the last phase.
+func rollSignalFromAdminRow(w store.ListAllWorkersRow) *workersvc.RollSignal {
+	if !w.RollPhase.Valid || !w.RollObservedAt.Valid {
+		return nil
+	}
+	sig := &workersvc.RollSignal{
+		Phase:             w.RollPhase.String,
+		ObservedAt:        w.RollObservedAt.Time,
+		PodPhase:          w.RollPodPhase.String,
+		BlockingContainer: w.RollBlockingContainer.String,
+		BlockingReason:    w.RollBlockingReason.String,
+		RolledTag:         w.RollWorkerImageTag.String,
+	}
+	if w.RollRestartCount.Valid {
+		sig.RestartCount = w.RollRestartCount.Int32
+	}
+	if w.RollLastExitCode.Valid {
+		code := w.RollLastExitCode.Int32
+		sig.LastExitCode = &code
+	}
+	if w.RollPhaseSince.Valid {
+		t := w.RollPhaseSince.Time
+		sig.PhaseSince = &t
+	}
+	if w.RollUpgradingSince.Valid {
+		t := w.RollUpgradingSince.Time
+		sig.UpgradingSince = &t
+	}
+	return sig
+}
+
+// workerDTOFromAdminRow builds the admin fleet DTO from a ListAllWorkers row, folding the
+// LEFT-JOINed roll signal so the cross-user list classifies upgrade_status and populates the
+// upgrade_blocking_* fields EXACTLY as GET /api/workers does for the same report (PRD #1484
+// M2). Before this, AdminListWorkers went through workerDTOFromWorker with a hardcoded
+// Signal: nil, so a stuck hosted worker read a bare version compare and the blocking fields
+// were always null on the admin list.
+//
+// It DECORATES workerDTOFromWorker rather than re-listing WorkerDTO's fields: the base call
+// sets every column (and the row's real busy/active-runs, so the admin path keeps a
+// non-constant caller of those params), then the roll signal — the one input a bare
+// store.Worker cannot carry — is folded by re-classifying and overwriting only the six
+// upgrade fields, matching workerDTOFromRow's gating. A worker with no controller report
+// (rollSignalFromAdminRow nil) keeps the base version-compare classification, exactly as the
+// per-user path does when its signal is nil.
+func workerDTOFromAdminRow(row store.ListAllWorkersRow, cpVersion, pinnedWorkerVersion string, now, apiStartedAt time.Time) apitypes.WorkerDTO {
+	dto := workerDTOFromWorker(row.Worker, int(row.ActiveRuns), row.Busy, "", cpVersion, pinnedWorkerVersion, now, apiStartedAt)
+	sig := rollSignalFromAdminRow(row)
+	if sig == nil {
+		return dto
+	}
+	status, detail, target := workersvc.ClassifyUpgradeWithTarget(workersvc.UpgradeInput{
+		Reported:            row.Worker.Version.String,
+		Kind:                row.Worker.Kind,
+		CPVersion:           cpVersion,
+		PinnedWorkerVersion: pinnedWorkerVersion,
+		Signal:              sig,
+		Now:                 now,
+		APIStartedAt:        apiStartedAt,
+	}, workersvc.UpgradeParams{})
+	dto.UpgradeStatus = status
+	dto.UpgradeDetail = textPtrValue(detail != "", detail)
+	dto.UpgradeTarget = target
+	// The three blocking fields are meaningful only for a failed upgrade, gated identically to
+	// workerDTOFromRow so the admin list matches GET /api/workers for the same roll data.
+	dto.UpgradeBlockingContainer = textPtrValue(status == workersvc.UpgradeStatusUpgradeFailed && row.RollBlockingContainer.Valid, row.RollBlockingContainer.String)
+	dto.UpgradeBlockingReason = textPtrValue(status == workersvc.UpgradeStatusUpgradeFailed && row.RollBlockingReason.Valid, row.RollBlockingReason.String)
+	dto.UpgradeLastExitCode = int32PtrValue(status == workersvc.UpgradeStatusUpgradeFailed && row.RollLastExitCode.Valid, row.RollLastExitCode.Int32)
+	return dto
+}
+
 // overlayOutbox folds a worker's in-process outbox depth (PRD #1391 M5) onto its
 // DTO. The depth lives in workersvc's restart-losing tracker, not in a store.Worker
 // row, so workerDTOFromWorker/workerDTOFromRow (which read only the row) cannot carry
@@ -425,7 +502,7 @@ func (h *Handler) AdminListWorkers(w http.ResponseWriter, r *http.Request) {
 	}
 	reported := h.reportedRunsByWorker(r.Context(), ids)
 	for _, row := range rows {
-		dto := workerDTOFromWorker(row.Worker, int(row.ActiveRuns), row.Busy, "", h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt)
+		dto := workerDTOFromAdminRow(row, h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt)
 		h.overlayOutbox(&dto, row.Worker.ID)
 		h.overlayReportedRuns(&dto, reported, row.Worker.ID)
 		out = append(out, apitypes.AdminWorkerDTO{

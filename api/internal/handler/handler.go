@@ -23,6 +23,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/forgememo"
 	"github.com/vtmocanu/uzi/api/internal/forgesvc"
+	"github.com/vtmocanu/uzi/api/internal/healthsvc"
 	"github.com/vtmocanu/uzi/api/internal/hostedsvc"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	"github.com/vtmocanu/uzi/api/internal/hub"
@@ -213,6 +214,18 @@ type Handler struct {
 	// calls. Wired via SetReleaseCheckReconciler in main; nil-guarded in the handler so
 	// a struct-literal test handler returns a clean error, not a panic.
 	releaseCheck ReleaseCheckReconciler
+	// healthSvc evaluates the admin-health registry for GET /api/admin/health (PRD #1484
+	// M1). Lazily constructed under healthSvcOnce from the collaborators the handler
+	// already holds (q/pool/cfg/settings/slackState/clock), so a struct-literal test
+	// handler is race-safe without every construction site wiring it — mirroring memo()
+	// and recovery(). The endpoint caches one evaluation for healthCacheTTL under
+	// healthCacheMu so a fleet of open admin tabs polling every 10 s cost one evaluation
+	// per window rather than one per request.
+	healthSvc      *healthsvc.Service
+	healthSvcOnce  sync.Once
+	healthCacheMu  sync.Mutex
+	healthCachedAt time.Time
+	healthCached   *apitypes.HealthDocDTO
 }
 
 // ReleaseCheckReconciler is the slice of *releasecheck.Reconciler the admin
@@ -294,6 +307,14 @@ func (h *Handler) SetAgentSourceReconciler(r AgentSourceReconciler) { h.agentSou
 // after construction. Safe to leave unset — the admin "Check now" endpoint then returns
 // a clean 500 rather than panic (struct-literal test handlers that don't exercise it).
 func (h *Handler) SetReleaseCheckReconciler(r ReleaseCheckReconciler) { h.releaseCheck = r }
+
+// SetHealthService injects the SHARED admin-health evaluator (PRD #1484 M2) built in main
+// — the one holding the loop-beat registry the four background loops beat into, so
+// GetAdminHealth and the once-a-minute episode evaluator see the SAME beats. It is set
+// before the first request, so the lazy healthService() fallback (used only by
+// struct-literal test handlers that never call this) never overwrites it. Leaving it unset
+// keeps the M1 lazy-construction behaviour, whose registry is empty (loops degrades to na).
+func (h *Handler) SetHealthService(s *healthsvc.Service) { h.healthSvc = s }
 
 // clock reads the classification clock seam, nil-safe.
 //

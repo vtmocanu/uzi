@@ -524,7 +524,6 @@ export const settingsApi = {
     releaseBannerSnoozeTag = releaseCheckFacts.latest_tag;
     return delay({ release_check: releaseCheckStatus() });
   },
-
   updateSettings: async (updates: UpdateSettingsPayload) => {
     // Secret tokens are write-only: validated + recorded as configured, never
     // merged into the readable settings (mirrors the real structural exclusion).

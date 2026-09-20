@@ -1282,6 +1282,61 @@ export interface ReleaseCheckStatus {
   message?: string;
 }
 
+// HealthDoc is the admin-health document (PRD #1484 M1): the response of
+// `GET /api/admin/health` (RequireAdminRO). It mirrors `apitypes.HealthDocDTO`
+// byte-for-byte (snake_case JSON keys). Admin-only by route — it carries owner and
+// worker names — so it must never migrate onto an unauthenticated response.
+export interface HealthDoc {
+  // Overall verdict: the worst check, "danger" then "warn", with unknown ranking as
+  // warn. "ok" | "warn" | "danger" | "unknown".
+  status: string;
+  // Evaluation time (RFC3339 UTC); the card renders "Checked N s ago" from it.
+  checked_at: string;
+  // Per-severity tally over checks.
+  counts: HealthCounts;
+  // The caller's own banner snooze against the open episode, or null. Always null in
+  // M1 (the episode/snooze machinery lands in M2).
+  snoozed_until: string | null;
+  // The open danger episode's id, or null. Always null in M1 (episodes are M2).
+  episode_id: string | null;
+  // The full registry in a stable order (never a subset).
+  checks: HealthCheck[];
+}
+
+// HealthCounts is the per-severity tally. Mirrors `apitypes.HealthCountsDTO`.
+export interface HealthCounts {
+  ok: number;
+  warn: number;
+  danger: number;
+  unknown: number;
+  na: number;
+}
+
+// HealthCheck is one check's verdict plus its server-authored evidence and what-to-do
+// line. Mirrors `apitypes.HealthCheckDTO`. id/group/severity are closed-enum strings.
+export interface HealthCheck {
+  id: string;
+  group: string;
+  title: string;
+  severity: string;
+  summary: string;
+  // When the check first went non-ok, where the source has one, else null.
+  since: string | null;
+  // Labelled facts (always present, possibly empty).
+  evidence: HealthEvidence[];
+  // What-to-do line, a fixed-template diagnostic command, and a docs slug — each null
+  // when the check has none.
+  action: string | null;
+  command: string | null;
+  doc: string | null;
+}
+
+// HealthEvidence is one labelled fact under a check. Mirrors `apitypes.HealthEvidenceDTO`.
+export interface HealthEvidence {
+  label: string;
+  value: string;
+}
+
 // ── CLI tokens (PRD #64) ──────────────────────────────────────────────────
 // A Bearer credential the `uzi` CLI presents (sha256 at rest). scope is a
 // ceiling: 'user' is the owner's own authority, 'admin_ro' reads the whole

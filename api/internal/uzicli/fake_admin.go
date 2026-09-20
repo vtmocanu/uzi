@@ -24,6 +24,13 @@ func (f *FakeClient) AdminListRuns(context.Context) ([]apitypes.RunListItemDTO, 
 	return f.AdminRuns, nil
 }
 
+func (f *FakeClient) AdminHealth(context.Context) (apitypes.HealthDocDTO, error) {
+	if f.Err != nil {
+		return apitypes.HealthDocDTO{}, f.Err
+	}
+	return f.AdminHealthDoc, nil
+}
+
 func (f *FakeClient) AdminListWorkers(context.Context) ([]apitypes.AdminWorkerDTO, error) {
 	if f.Err != nil {
 		return nil, f.Err

@@ -4,9 +4,15 @@ import (
 	"context"
 	"database/sql"
 	"embed"
+	"errors"
 	"fmt"
+	"io/fs"
+	"strconv"
+	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/jackc/pgx/v5/stdlib" // registers the "pgx" database/sql driver
 	"github.com/pressly/goose/v3"
 )
@@ -178,6 +184,77 @@ func openForMigrate(ctx context.Context, dsn string) (*sql.DB, error) {
 		return nil, fmt.Errorf("set goose dialect: %w", err)
 	}
 	return db, nil
+}
+
+// SchemaVersionStatus reports the applied goose migration version against the
+// embedded migration head, for the admin-health `db` check (PRD #1484 M1).
+//
+//   - applied is max(version_id) over the rows goose marks is_applied in
+//     goose_db_version. A freshly-migrated database returns the head; a database that
+//     an older api migrated (so a newer binary's embedded head is ahead) returns the
+//     lower number.
+//   - head is the largest numeric filename prefix under the embedded migrations/ FS —
+//     the version this binary WOULD migrate to. It is computed from the same embed.FS
+//     goose runs, so the two can never be read from different sources.
+//   - atHead is applied == head.
+//
+// It reads through the caller's *pgxpool.Pool rather than opening its own sql.DB, so
+// the health check reuses the live pool instead of paying a connect per evaluation. A
+// missing goose_db_version table (a database that has never been migrated) is a real
+// error, not a silent zero: the check must not read "no migrations applied" as healthy.
+func SchemaVersionStatus(ctx context.Context, pool *pgxpool.Pool) (applied int64, head int64, atHead bool, err error) {
+	head, err = embeddedMigrationHead()
+	if err != nil {
+		return 0, 0, false, err
+	}
+	// max(version_id) is NULL only on an empty goose_db_version, which goose never
+	// leaves (it seeds version 0); scan into a nullable to fail loud rather than panic
+	// if it ever is.
+	var appliedRow sql.NullInt64
+	if err := pool.QueryRow(ctx,
+		`SELECT max(version_id) FROM goose_db_version WHERE is_applied`).Scan(&appliedRow); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, head, false, errors.New("goose_db_version has no applied rows")
+		}
+		return 0, head, false, fmt.Errorf("read applied migration version: %w", err)
+	}
+	if !appliedRow.Valid {
+		return 0, head, false, errors.New("goose_db_version has no applied rows")
+	}
+	applied = appliedRow.Int64
+	return applied, head, applied == head, nil
+}
+
+// embeddedMigrationHead is the largest numeric filename prefix under migrations/, e.g.
+// 00192_worker_disk_pressure_streak.sql -> 192. It globs the same embed.FS goose runs
+// so "the head this binary knows" is derived, never hardcoded.
+func embeddedMigrationHead() (int64, error) {
+	entries, err := fs.ReadDir(migrationFS, "migrations")
+	if err != nil {
+		return 0, fmt.Errorf("read embedded migrations: %w", err)
+	}
+	var head int64
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".sql") {
+			continue
+		}
+		prefix, _, found := strings.Cut(name, "_")
+		if !found {
+			continue
+		}
+		n, perr := strconv.ParseInt(prefix, 10, 64)
+		if perr != nil {
+			continue
+		}
+		if n > head {
+			head = n
+		}
+	}
+	if head == 0 {
+		return 0, errors.New("no numbered migrations embedded")
+	}
+	return head, nil
 }
 
 func waitForDB(ctx context.Context, db *sql.DB) error {

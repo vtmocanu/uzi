@@ -11,6 +11,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/hostedsvc"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
@@ -83,6 +84,25 @@ func (h *Handler) ControllerStatus(w http.ResponseWriter, r *http.Request) {
 	// report shares a freshness basis. This — never req.ReportedAt — is what freshness
 	// is computed from.
 	observedAt := h.clock()
+
+	// Advance the fleet-INDEPENDENT controller-report singleton (PRD #1484 M2) on the
+	// unconditional path, so EVERY report — including a zero-worker one that upserts no
+	// worker_upgrade_reports row — leaves a trace of "the controller is still reporting".
+	// It is the only signal the controller.report health check can read when there are no
+	// hosted worker rows to stamp; gating it on len(req.Workers) would blind that check
+	// for a fleet at zero capacity, which is exactly when it matters most.
+	//
+	// BEST-EFFORT, not fatal: a failed singleton write is logged and the report still
+	// answers 204. The write is display-only, and failing the whole controller report over
+	// it would be strictly worse than a briefly-stale singleton (the check degrades to
+	// unknown/danger on staleness on its own). Guarded on h.q because the struct-literal
+	// test handlers wire no *store.Queries; production always sets it (mirrors
+	// reportedRunsByWorker's nil-store posture).
+	if h.q != nil {
+		if err := h.q.UpsertControllerReport(r.Context(), pgconv.Time(observedAt)); err != nil {
+			slog.Error("controller status: advancing controller-report singleton", "error", err)
+		}
+	}
 
 	var accepted, dropped int
 	for _, ws := range req.Workers {
