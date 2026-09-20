@@ -645,24 +645,37 @@ function buildAdviceAuthConfig(
  * {@link CodexAdviceLaunchSpec} itself carries no auth-mode field (the pinned app-server auth
  * owner authenticates over the login RPC, not a launcher config choice).
  *
- * `homeRoot` is the WORKER's shared SDK home root (`sdkHomeRoot` in main.ts) — the same
- * setgid, runner-group-accessible tree {@link prepareCodexRunHome} prepares per run, reused
- * here as a stable parent so a fresh per-call child directory inherits the correct
- * ownership/group without a dedicated per-advice-call preparation step.
+ * `homeRoot` is the WORKER's shared SDK home root (`sdkHomeRoot` in main.ts): a stable, setgid,
+ * runner-group-accessible parent under which a fresh per-call child directory inherits the correct
+ * ownership/group without a dedicated per-advice-call preparation step. (`sdkHomeRoot` itself is
+ * created by run()'s early recursive mkdir; {@link prepareCodexRunHome} prepares the PER-RUN home
+ * `sdkHomeRoot/<runId>`, not this shared root.) The two disposable
+ * advice PARENTS (`codex-advice-data` / `codex-advice-cwd`) survive worker rolls on the RWO
+ * PVC, so they opt into {@link ensureCodexSharedDirectory}'s destructive recovery: a
+ * pre-existing worker:worker parent left by pre-rc.2 code is renamed OUT and recreated fresh
+ * as worker:runner (never adopted), so a rolled worker starts clean instead of throwing.
  */
 export function makeProductionLaunchAdviceRoot(homeRoot: string, authMode: CodexAppServerAuthMode): LaunchAdviceRootSeam {
   return async (spec) => {
     const id = randomUUID();
     const dataParent = path.join(homeRoot, "codex-advice-data");
     const cwdParent = path.join(homeRoot, "codex-advice-cwd");
-    await ensureCodexSharedDirectory(dataParent);
-    await ensureCodexSharedDirectory(cwdParent);
+    // These two long-lived advice PARENTS are disposable (only per-call UUID leaves live under
+    // them) and survive worker rolls on the RWO PVC. A parent left by pre-rc.2 code as
+    // worker:worker (gid WORKER_UID) would EEXIST and be REJECTED by the strict gid check, so
+    // they opt in to the narrowly-scoped destructive recovery: a pre-existing worker-group
+    // parent is atomically renamed OUT of the live path and recreated FRESH (worker:runner
+    // 2770) — NEVER chgrp'd/adopted. The per-call UUID leaves below stay plain strict calls.
+    await ensureCodexSharedDirectory(dataParent, undefined, { recreateDisposableWorkerGroupDir: true });
+    await ensureCodexSharedDirectory(cwdParent, undefined, { recreateDisposableWorkerGroupDir: true });
     const ownedDataRoot = path.join(dataParent, id);
     const cwd = path.join(cwdParent, id);
     // The launcher's own deriveOwnedTrees creates ownedDataRoot itself (runner-owned, fresh
     // per call); cwd is only the isolated, EXPLICITLY-untrusted project dir the advice thread
     // pins (codex-advice-harness.ts's adviceThreadConfig), so it is prepared here the same
-    // shared-directory way as the run lane's HOME (worker-owned, group runner, setgid).
+    // shared-directory way as the run lane's HOME (worker-owned, group runner, setgid). It is
+    // a fresh per-call UUID leaf (never pre-existing), so it stays a plain strict call — no
+    // opt-in recovery.
     await ensureCodexSharedDirectory(cwd);
 
     const handle = await launchCodexRoot({
@@ -858,16 +871,71 @@ export function buildCodexToolHandlers(deps: CodexToolHandlerDeps): ReadonlyMap<
  *  tool-evidence.ts's ToolTextResult without re-importing the type. */
 type ToolTextResultLike = ReturnType<typeof asText>;
 
+// Module-level per-path serialization for the opt-in destructive recovery. Keyed by the
+// RESOLVED path so two overlapping advice calls on the same parent run the full
+// open→check→recover→validate sequence one at a time and each RE-READS state under the lock:
+// a second caller finds the already-recreated worker:runner dir and no-ops through to strict
+// validation instead of re-renaming a healthy dir. This serializes the TRUSTED in-process callers
+// (this single Node worker) against each other only; it does NOT serialize an untrusted
+// cross-process actor (a runner under uid-split) — the O_NOFOLLOW checks, the inode re-verification
+// and the worker-only quarantine in the cleanup path are what guard against that. Bounded to the
+// two advice paths, so leaving stale settled map entries is fine (never cleaned up).
+const codexRecoveryChains = new Map<string, Promise<unknown>>();
+
 /** Create one worker-owned, runner-group-accessible directory without following a
  * final symlink. The private runner-owned epoch roots live below these shared
  * directories; the credential-free store remains worker-owned beside them.
  *
  * `expect` is a test-injection seam (production callers pass nothing, keeping the
  * real WORKER_UID/RUNNER_UID ownership): it lets a test drive the create-only repair
- * below under any CI uid using the test process's own uid and two of its own groups. */
+ * below under any CI uid using the test process's own uid and two of its own groups.
+ *
+ * By DEFAULT (no `opts`, the behaviour for EVERY caller but the two advice parents) this is
+ * rejection-only for a pre-existing directory: an EEXISTing dir is VALIDATED, never repaired
+ * or adopted — the deliberate check-don't-repair stance, so any mismatch throws. The
+ * `opts.recreateDisposableWorkerGroupDir` opt-in enables a narrowly-scoped, crash/TOCTOU-safe
+ * DESTRUCTIVE recovery for the two FIXED, disposable advice PARENTS ONLY
+ * (`codex-advice-data` / `codex-advice-cwd`): a pre-existing dir owned `expect.uid` and grouped
+ * the "wrong" disposable gid (`opts.recoverGid`, default WORKER_UID) is atomically renamed OUT
+ * of the live path and the live path recreated FRESH — NEVER chgrp'd/adopted. Every other
+ * caller and every other mismatch stays rejection-only. The opt-in path is serialized
+ * per-resolved-path (see `codexRecoveryChains`). */
 export async function ensureCodexSharedDirectory(
   dir: string,
   expect: { readonly uid: number; readonly gid: number } = { uid: WORKER_UID, gid: RUNNER_UID },
+  opts?: {
+    // Opt-in destructive recovery of a PRE-EXISTING *disposable, worker-group* directory at a
+    // FIXED internal path (the two advice parents ONLY). When set and the EEXISTing dir is a real
+    // directory owned expect.uid and grouped `recoverGid`, it is renamed out and recreated fresh
+    // (never chgrp'd/adopted). Default (absent) ⇒ rejection-only, unchanged for every other caller.
+    readonly recreateDisposableWorkerGroupDir?: boolean;
+    // The "wrong disposable gid" that triggers recovery; defaults to WORKER_UID (the worker's own
+    // group, the fsGroup-inherited case). Test-injection seam (mirrors `expect`) so a portable
+    // test drives recovery under any uid/groups.
+    readonly recoverGid?: number;
+  },
+): Promise<void> {
+  if (opts?.recreateDisposableWorkerGroupDir === true) {
+    const key = path.resolve(dir);
+    const prev = codexRecoveryChains.get(key) ?? Promise.resolve();
+    const run = prev.then(
+      () => ensureCodexSharedDirectoryInner(dir, expect, opts),
+      () => ensureCodexSharedDirectoryInner(dir, expect, opts),
+    );
+    // The NEXT caller on this path chains after our chain has settled (never rejects the tail).
+    codexRecoveryChains.set(key, run.then(() => undefined, () => undefined));
+    return run;
+  }
+  return ensureCodexSharedDirectoryInner(dir, expect, opts);
+}
+
+async function ensureCodexSharedDirectoryInner(
+  dir: string,
+  expect: { readonly uid: number; readonly gid: number },
+  opts?: {
+    readonly recreateDisposableWorkerGroupDir?: boolean;
+    readonly recoverGid?: number;
+  },
 ): Promise<void> {
   let created = false;
   try {
@@ -876,18 +944,69 @@ export async function ensureCodexSharedDirectory(
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
   }
-  const handle = await fs.open(dir, FS.O_RDONLY | FS.O_DIRECTORY | FS.O_NOFOLLOW);
+  let handle = await fs.open(dir, FS.O_RDONLY | FS.O_DIRECTORY | FS.O_NOFOLLOW);
   try {
-    const before = await handle.stat();
+    let before = await handle.stat();
     if (!before.isDirectory()) {
       throw new Error("Codex shared data directory has an unexpected owner or group");
     }
+
+    // Opt-in destructive recovery of a PRE-EXISTING disposable worker-group parent (PRD #58
+    // non-root / hosted k8s, issue #1495): a parent left by pre-rc.2 code as worker:worker on
+    // the RWO PVC survives worker rolls, so `fs.mkdir` above returned EEXIST (created=false),
+    // the create-only repair below is skipped, and the strict gid check would throw. For the two
+    // FIXED disposable advice parents ONLY (recreateDisposableWorkerGroupDir), recover by
+    // renaming the pre-existing dir OUT of the live path and recreating the live path FRESH.
+    // GUARANTEE: the pre-existing content is NEVER adopted — it is atomically renamed OUT and
+    // the live path is always recreated fresh; on cleanup success the tombstone is removed, and
+    // on cleanup FAILURE the tombstone remains QUARANTINED as a worker-owned sibling OUTSIDE the
+    // live path (never an adopted dir in the live path). Removal is best-effort, NOT guaranteed.
+    const recoverGid = opts?.recoverGid ?? WORKER_UID;
+    if (
+      !created &&
+      opts?.recreateDisposableWorkerGroupDir === true &&
+      before.uid === expect.uid &&
+      before.gid === recoverGid &&
+      recoverGid !== expect.gid // nothing to recover if the "wrong" gid already equals the expected one
+    ) {
+      // The inode we validated under O_NOFOLLOW on the held handle.
+      const beforeDev = before.dev;
+      const beforeIno = before.ino;
+      // Atomically move the pre-existing dir OUT of the live path. This sibling lives in the advice
+      // parent's own directory (sdkHomeRoot/agent-home), which under supported uid-split is
+      // worker:runner 2775 — runner-group-writable — so it is only a TRANSIENT holding spot, NEVER
+      // where we recursively remove (issue #1495 CodeRabbit CWE-367: a concurrent runner could
+      // rename that path between a check and fs.rm's recursive walk).
+      const tombstone = `${dir}.uzi-tomb-${randomUUID()}`;
+      await fs.rename(dir, tombstone); // atomic same-filesystem move
+      // Recreate the live path fresh through the strict create path. The live path is now correct
+      // regardless of the tombstone's fate; the disposal below is best-effort and never throws.
+      await handle.close();
+      await fs.mkdir(dir, { mode: 0o2770 });
+      created = true;
+      handle = await fs.open(dir, FS.O_RDONLY | FS.O_DIRECTORY | FS.O_NOFOLLOW);
+      before = await handle.stat();
+      if (!before.isDirectory()) {
+        throw new Error("Codex shared data directory has an unexpected owner or group");
+      }
+      // Dispose of the transient tombstone SAFELY: relocate it under a worker-only-parented, 0700
+      // quarantine beneath <dataDir> and recursively remove only that private subtree. If the
+      // quarantine cannot be made/validated or the move hits EXDEV, the tombstone is RETAINED beside
+      // the live path (out of the live path, in the runner-writable parent) and never recursively
+      // removed; on a post-move inode mismatch the moved content stays in the private quarantine and
+      // is not removed. GUARANTEE: pre-existing content is never adopted or unsafely removed, and
+      // the live path is always fresh worker:runner 2770.
+      await disposeCodexRecoveryTombstone(tombstone, dir, expect.uid, beforeDev, beforeIno);
+    }
+
     // Create-only group repair (PRD #58 non-root / hosted k8s start): under a setgid
     // agent-home group-owned by `worker` (fsGroup:10001 on the PVC), a freshly-created dir
     // inherits gid `worker`. The worker OWNS it and is a supplementary member of `runner`,
     // so it may chgrp the group to RUNNER_UID while preserving the owner. Repair ONLY a dir
     // this call just created AND verified worker-owned; NEVER an EEXISTing one (retain the
     // deliberate check-don't-repair security stance — an existing mismatch still throws).
+    // After a recovery above `created` is true for the freshly-recreated dir, so this chgrps
+    // it to worker:runner.
     if (created && before.uid === expect.uid && before.gid !== expect.gid) {
       await handle.chown(expect.uid, expect.gid);
     }
@@ -902,6 +1021,70 @@ export async function ensureCodexSharedDirectory(
     }
   } finally {
     await handle.close();
+  }
+}
+
+/** Safely dispose of a recovery tombstone (issue #1495 CodeRabbit TOCTOU/CWE-367). The tombstone
+ *  sits beside the live advice parent, whose directory is runner-group-writable under supported
+ *  uid-split (worker:runner 2775), so it must NOT be recursively removed in place — a concurrent
+ *  runner could swap that path between a check and the recursive walk, and entry removal/rename
+ *  depends on the PARENT's permissions, so a 0700 dir *under* agent-home would still be swappable.
+ *  Instead relocate the tombstone into a freshly-created, validated 0700 quarantine rooted at
+ *  <dataDir> (the parent of sdkHomeRoot). The invariant that matters is that <dataDir> is NOT
+ *  writable by a non-worker (runner), so it cannot swap the quarantine's entries; we do not rely on
+ *  a specific owner/mode there. Re-verify the moved inode is the exact one validated, then remove
+ *  ONLY that private subtree. Best-effort and never throws (the live path is already correct). On a
+ *  pre-move failure (the quarantine cannot be created/validated, or the move hits EXDEV) the
+ *  tombstone is RETAINED beside the live path, outside it, and never recursively removed in the
+ *  runner-writable parent; on a post-move inode mismatch (a swapped path) the moved content is left
+ *  in the private quarantine and not removed. `workerUid` is the worker identity (expect.uid; a test
+ *  seam mirrors it so a portable test drives this under any uid). */
+async function disposeCodexRecoveryTombstone(
+  tombstone: string,
+  liveDir: string,
+  workerUid: number,
+  expectDev: number,
+  expectIno: number,
+): Promise<void> {
+  try {
+    // The recovery opt-in is used only for the two fixed advice parents, <dataDir>/agent-home/<name>,
+    // so the grandparent of the live path is <dataDir>, the worker-only root.
+    const dataRoot = path.dirname(path.dirname(liveDir));
+    const quarantine = path.join(dataRoot, `.uzi-quarantine-${randomUUID()}`);
+    await fs.mkdir(quarantine, { mode: 0o700 });
+    await fs.chmod(quarantine, 0o700); // force 0700 regardless of umask before validating
+    const qHandle = await fs.open(quarantine, FS.O_RDONLY | FS.O_DIRECTORY | FS.O_NOFOLLOW);
+    try {
+      const qs = await qHandle.stat();
+      if (!qs.isDirectory() || qs.uid !== workerUid || (qs.mode & 0o777) !== 0o700) {
+        return; // not a safe quarantine → leave the tombstone quarantined where it is.
+      }
+    } finally {
+      await qHandle.close();
+    }
+    const child = path.join(quarantine, "tomb");
+    try {
+      await fs.rename(tombstone, child); // same-filesystem atomic move; EXDEV → catch
+    } catch {
+      // Never copy across filesystems, never recursively remove in the runner-writable parent.
+      await fs.rmdir(quarantine).catch(() => undefined); // remove the (empty) quarantine only
+      return;
+    }
+    // Re-verify the moved inode is the exact one we validated: a swap of the transient tombstone
+    // path must never be recursively removed. On mismatch, leave it under the private 0700 dir.
+    const vh = await fs.open(child, FS.O_RDONLY | FS.O_DIRECTORY | FS.O_NOFOLLOW);
+    let verified = false;
+    try {
+      const moved = await vh.stat();
+      verified = moved.dev === expectDev && moved.ino === expectIno;
+    } finally {
+      await vh.close();
+    }
+    if (!verified) return; // swapped content → leave quarantined under the worker-only 0700 dir.
+    // Verified disposable content, in a subtree whose parent (<dataDir>) is not runner-writable.
+    await fs.rm(quarantine, { recursive: true, force: true });
+  } catch {
+    // Best-effort: any unexpected failure leaves the content quarantined; the live path is correct.
   }
 }
 
@@ -984,6 +1167,18 @@ export interface CodexExecutorOptions {
   readonly binding: CodexBinding;
   readonly client: WorkerClient;
   readonly provider: CodexProviderConfig;
+  /** The SHARED worker-lifetime provisioning HOME (PRD #42 Decision 5), deliberately
+   *  distinct from the per-run `homeRoot`: the nix/devbox provisioning subprocess sets
+   *  HOME to this, so keeping it worker-lifetime (not per-run) stops the nix profile /
+   *  devbox warm-start state from fragmenting per run. Defaults to the per-run `homeRoot`
+   *  when omitted, reproducing today's exact paths for callers/tests that don't split them
+   *  (parity with SdkExecutor). */
+  readonly provisionHomeDir?: string;
+  /** The SHARED worker-lifetime provisioning ROOT (PRD #42 Decision 5) under which the
+   *  per-run provisioning dir (`provisionRoot/<runId>`) lives, again distinct from the
+   *  per-run `homeRoot`. Defaults to `path.dirname(provisionHomeDir)/provision` when
+   *  omitted (parity with SdkExecutor). */
+  readonly provisionRoot?: string;
 }
 
 // ─── The per-epoch provider bundle + shared executor-claim context (m4) ─────────
@@ -1058,6 +1253,8 @@ export class CodexExecutor implements Executor {
 
   private readonly log: Logger;
   private readonly homeRoot: string;
+  private readonly provisionHomeDir: string;
+  private readonly provisionRoot: string;
   private readonly opts: CodexExecutorOptions;
   private readonly deps: CodexExecutorDeps;
   private readonly sessionStore: Pick<typeof CodexSessionStore, "adopt" | "inspect" | "remove" | "persist">;
@@ -1065,6 +1262,12 @@ export class CodexExecutor implements Executor {
   constructor(log: Logger, homeRoot: string, opts: CodexExecutorOptions, deps: CodexExecutorDeps = {}) {
     this.log = log;
     this.homeRoot = homeRoot;
+    // Provisioning HOME + root are SHARED worker-lifetime paths (PRD #42 Decision 5),
+    // mirroring SdkExecutor (sdk-executor.ts:627-630). The `?? this.homeRoot` default
+    // reproduces today's EXACT paths for callers/tests that don't split them, so nothing
+    // changes for a caller that omits both.
+    this.provisionHomeDir = opts.provisionHomeDir ?? this.homeRoot;
+    this.provisionRoot = opts.provisionRoot ?? path.join(path.dirname(this.provisionHomeDir), "provision");
     this.opts = opts;
     this.deps = deps;
     this.sessionStore = deps.sessionStore ?? CodexSessionStore;
@@ -1123,15 +1326,34 @@ export class CodexExecutor implements Executor {
     let epochIndex = 0;
     let provisionDir: string | undefined;
     try {
+      // INITIALIZATION (trust boundary): materialize the SHARED provisioning root and a FRESH
+      // per-run HOME BEFORE anything (a devbox/nix subprocess with HOME=provisionHomeDir) can
+      // touch them. The recursive mkdir ensures the SHARED root exists: a non-root entrypoint
+      // skips the `mkdir -p /data/agent-home` block (entrypoint.sh:109 vs :207-208) and
+      // `ensureCodexSharedDirectory` (and thus `prepareCodexRunHome`) uses a NON-recursive mkdir, so a
+      // fresh-PVC/zero-package run would otherwise ENOENT (mirrors sdk-executor.ts:820-826). It
+      // creates only the PARENT (`provisionHomeDir` === dirname(homeRoot) in production), never
+      // the per-run home itself, so the create-only gid repair still fires. `prepareCodexRunHome`
+      // then creates the fresh per-run home (created=true → repair → worker:runner 2770) BEFORE
+      // devbox materializes it with the wrong (inherited) gid. Gated on the same
+      // `launchProviderRoot === undefined` production gate the per-epoch prepare uses, so injected
+      // launcher tests keep owning their synthetic filesystem.
+      if (this.deps.launchProviderRoot === undefined) {
+        await fs.mkdir(this.provisionHomeDir, { recursive: true });
+        await prepareCodexRunHome(this.homeRoot);
+      }
       // Provision the run's tool packages ONCE (PRD #18; SHARED across every epoch — the forge/
       // memory budget counters a per-epoch rebuild would reset). A tier-1 failure throws
       // REASON_PROVISION_FAILED, which this try's finally then cleans up after. Injected via
-      // `deps.provisionRunTools` so a unit test stubs it. The provisioning HOME + root are SHARED
-      // worker-lifetime paths (not the per-run codex home), matching sdk-executor.
+      // `deps.provisionRunTools` so a unit test stubs it. The provisioning HOME (`provisionHomeDir`)
+      // + root (`provisionRoot`) are the SHARED worker-lifetime paths (PRD #42 Decision 5), NOT the
+      // per-run `homeRoot` — a devbox/nix subprocess sets HOME to `provisionHomeDir`, so pointing it
+      // at the shared root keeps warm-start state from fragmenting per run AND stops it from
+      // materializing the per-run HOME with the wrong gid (matching sdk-executor).
       const provisionRunToolsFn = this.deps.provisionRunTools ?? provisionRunTools;
       const provisioned = await provisionRunToolsFn(ctx, {
-        provisionRoot: path.join(path.dirname(this.homeRoot), "provision"),
-        homeDir: this.homeRoot,
+        provisionRoot: this.provisionRoot,
+        homeDir: this.provisionHomeDir,
         log: this.log,
       });
       provisionDir = provisioned.provisionDir; // removed in the terminal finally (best-effort)
@@ -1402,10 +1624,13 @@ export class CodexExecutor implements Executor {
       spawnBoundaryRoot, boundaryProcessSpawner, reconcile, evictTokens, accountant,
     } = shared;
 
-    // The real launcher needs a worker-owned shared run HOME and codex-data parent: the
-    // credential-free session store is worker-owned, while each child epoch is runner-owned
-    // 0700 and removed as runner after its supervisor proves drained disposal. Injected
-    // launchProviderRoot tests own their synthetic filesystem and skip this production step.
+    // Per-epoch trust-boundary REVALIDATION: re-verify the run HOME + codex-data parent's
+    // owner/group/mode/directory-type immediately before each credentialed provider root. The
+    // shared parents are runner-group-writable, so a checkpoint-driven epoch recreation must
+    // re-verify rather than assume nothing mutated between checkpoints. The call is cheap and
+    // idempotent: on the already-initialized home (run() initialized it before provisioning) it
+    // hits created=false and validates the correct worker:runner 2770, or throws if tampered.
+    // Injected launchProviderRoot tests own their synthetic filesystem and skip this production step.
     if (this.deps.launchProviderRoot === undefined) {
       await prepareCodexRunHome(homeRoot);
     }
