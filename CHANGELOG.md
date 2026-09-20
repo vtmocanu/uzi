@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Added
+
+- **An admin-only Health tab shows whether uzi can actually run work right now, with an app-wide Danger banner and a per-episode notice ([#1484](https://github.com/vtmocanu/uzi/issues/1484)).**
+  A closed registry of 14 checks (worker rolls, queue and capacity, controller liveness, background loops, the database, integrations, housekeeping) rolls up into a verdict on a new Admin → Health tab, a self-hiding Overview card, and a Danger-only app-wide banner with a per-admin 1h snooze; `uzi admin health` (exit 8 on danger, for cron probes) and roll-health columns on `uzi admin workers` give the same view from the CLI, and each admin gets one web-inbox/Slack notice per Danger episode. It never reads the Kubernetes API — every Kubernetes-derived fact still arrives over the existing controller report — and a stale or disabled signal always reads `unknown`, never green.
+
 ## [0.83.1] - 2026-09-19
 
 ### Added
