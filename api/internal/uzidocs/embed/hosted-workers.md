@@ -144,11 +144,15 @@ within the outbox's configured quotas (`WORKER_OUTBOX_RUN_MAX_BYTES`,
 `WORKER_OUTBOX_MAX_BYTES`, `WORKER_OUTBOX_SPILL_BUFFER_BYTES`); beyond them, some
 message frames are dropped and replayed as contiguous per-seq gap markers rather
 than the original messages. One caveat is worth restating here rather
-than at length: a hosted worker runs the `#58` single-uid posture, so the model
-process shares its uid and could read, forge, truncate, or delete its own outbox —
-the outbox protects against the outage, not against a hostile model, on this
-runtime. See [worker-setup.md](./worker-setup.md#message-outbox) for the full
-caveat and the tunable quotas.
+than at length, and which profile the worker runs decides it. On the default
+single-uid profile a hosted worker runs the `#58` posture, so the model process
+shares the worker's uid and could read, forge, truncate, or delete its own outbox —
+there the outbox protects against the outage, not against a hostile model. On the
+opt-in uid-split Codex profile the model runs under a distinct uid while the outbox
+tree stays worker-owned and `0700`-private, so a hostile model can no longer read or
+tamper with it (see ["no Codex-capable worker is online"](#my-codex-run-says-no-codex-capable-worker-is-online)
+for that profile). See [worker-setup.md](./worker-setup.md#message-outbox) for the
+full caveat and the tunable quotas.
 
 ## Surviving an api restart mid-run
 
