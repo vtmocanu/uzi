@@ -1252,8 +1252,9 @@ func TestWallParkThreeTermAgreementLiveDB(t *testing.T) {
 
 // --- Scenario 16: kind coverage -------------------------------------------------------------------
 
-// TestWallParkKindCoverageLiveDB pins that each of prompt/self_improve/mr_rework/ci_fix parks at the
-// wall (in addition to issue/task), while chat/judge/interactive tasks are untouched.
+// TestWallParkKindCoverageLiveDB pins that each of the six timed kinds — non-interactive task,
+// prompt, self_improve, mr_rework, ci_fix (issue is exercised by the other tests in this file) —
+// parks at the wall, while chat and an interactive task are untouched.
 func TestWallParkKindCoverageLiveDB(t *testing.T) {
 	fx := newWPFixture(t)
 	stale := fx.worker("stale", wpWorker{heartbeatAgo: time.Hour, nonce: "n"})
@@ -1267,7 +1268,11 @@ func TestWallParkKindCoverageLiveDB(t *testing.T) {
 		mustExec(fx.ctx, t, fx.pool, sql, id, fx.userID, fx.repoID, kind, stale)
 		return id
 	}
-	// The four kinds not already covered by issue/task in run_pause_livedb_test.go.
+	// The five timed kinds this function proves (issue is covered by the other tests in this file).
+	// A NON-interactive task run (interactive defaults to false, so the sweep predicate admits it) —
+	// the sixth timed kind, distinct from the interactive task in the untouched set below. A task row
+	// needs branch NOT NULL (runs_kind_shape); it stays non-interactive (interactive defaults false).
+	task := insert("task", ", branch", ", 'uzi/task/nonint'")
 	prompt := insert("prompt", "", "")
 	selfImprove := insert("self_improve", ", issue_iid", fmt.Sprintf(", %d", 90000+fx.iid))
 	mrRework := func() uuid.UUID {
@@ -1311,7 +1316,7 @@ func TestWallParkKindCoverageLiveDB(t *testing.T) {
 	for _, r := range parked {
 		set[r.ID] = true
 	}
-	for _, id := range []uuid.UUID{prompt, selfImprove, mrRework, ciFix} {
+	for _, id := range []uuid.UUID{task, prompt, selfImprove, mrRework, ciFix} {
 		if !set[id] {
 			t.Fatalf("kind of run %s must park at the wall", id)
 		}
