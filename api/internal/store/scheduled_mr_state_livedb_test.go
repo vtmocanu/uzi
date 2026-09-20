@@ -15,21 +15,22 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// TestScheduledMRStateWatchCandidatesLiveDB pins ListScheduledMRStateWatchCandidates (PRD
-// #908) against a REAL Postgres. The board-free MR-state watch enumerates the scheduled
-// lanes (kind IN ('prompt','self_improve')) whose MR is still transient so the recorder can
-// keep runs.mr_state fresh; a run self-evicts from the set once its mr_state is terminal
-// (merged/closed). The query is:
+// TestBoardFreeMRStateWatchCandidatesLiveDB pins ListBoardFreeMRStateWatchCandidates (PRD
+// #908, widened in issue #1253) against a REAL Postgres. The board-free MR-state watch
+// enumerates every issue-less MR-bearing run PLUS the prompt/self_improve scheduled lanes
+// whose MR is still transient so the recorder can keep runs.mr_state fresh; a run self-evicts
+// from the set once its mr_state is terminal (merged/closed). The query is:
 //
 //	SELECT id, branch, mr_iid, mr_state FROM runs
-//	WHERE repo_id=$1 AND kind IN ('prompt','self_improve') AND status='completed'
-//	  AND mr_iid IS NOT NULL AND (mr_state IS NULL OR mr_state IN ('opened','locked'))
+//	WHERE repo_id=$1 AND (issue_iid IS NULL OR kind IN ('prompt','self_improve'))
+//	  AND status='completed' AND mr_iid IS NOT NULL
+//	  AND (mr_state IS NULL OR mr_state IN ('opened','locked'))
 //	ORDER BY created_at DESC LIMIT 100
 //
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres; the store-it sweep
 // (e2e/run-store-it.sh, task gate:api in CI) provides one. `go test ./...` without it SKIPs.
 // A package that prints `ok` with PASS=0 is INVALID, not green.
-func TestScheduledMRStateWatchCandidatesLiveDB(t *testing.T) {
+func TestBoardFreeMRStateWatchCandidatesLiveDB(t *testing.T) {
 	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
@@ -69,7 +70,7 @@ func TestScheduledMRStateWatchCandidatesLiveDB(t *testing.T) {
 	sp := func(s string) *string { return &s }
 	ip := func(n int64) *int64 { return &n }
 
-	// INCLUDED — the transient-MR scheduled runs the recorder must keep polling:
+	// INCLUDED — the transient-MR board-free runs the recorder must keep polling:
 	//   prompt, mr_iid set, mr_state NULL → the bootstrap candidate (first observation
 	//   records without acting).
 	promptBootstrap := seedRun("prompt", "uzi/prompt-"+uuid.New().String(), nil, ip(9101), nil, "completed")
@@ -77,35 +78,46 @@ func TestScheduledMRStateWatchCandidatesLiveDB(t *testing.T) {
 	selfImpOpened := seedRun("self_improve", "uzi/self-improve/"+uuid.New().String(), ip(9102), ip(9102), sp("opened"), "completed")
 	//   prompt, mr_state='locked' → still transient (mid-merge), included.
 	promptLocked := seedRun("prompt", "uzi/prompt-"+uuid.New().String(), nil, ip(9103), sp("locked"), "completed")
+	//   mr_rework, issue_iid NULL, mr_iid set, mr_state NULL → an issue-less helper run the
+	//   board-coupled lane (its issues JOIN) structurally cannot own; the widened predicate
+	//   includes it via the `issue_iid IS NULL` disjunct (issue #1253). The 00167
+	//   runs_kind_shape CHECK requires pipeline_ref + mr_iid + target_run_id for kind='mr_rework';
+	//   target_run_id points at promptBootstrap only to satisfy the FK.
+	mrReworkID := uuid.New()
+	mustExec(ctx, t, pool,
+		`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, branch, pipeline_ref, target_run_id, mr_iid, status)
+		 VALUES ($1, $2, $3, 'mr_rework', NULL, 't', 'd', $4, $4, $5, $6, 'completed')`,
+		mrReworkID, owner, repoID, "agent/issue-"+uuid.New().String(), promptBootstrap, int64(9109))
 
 	// EXCLUDED — one per gate:
 	//   mr_state='merged' → terminal, self-eviction.
 	seedRun("prompt", "uzi/prompt-"+uuid.New().String(), nil, ip(9104), sp("merged"), "completed")
 	//   mr_state='closed' → terminal.
 	seedRun("self_improve", "uzi/self-improve/"+uuid.New().String(), ip(9105), ip(9105), sp("closed"), "completed")
-	//   kind='issue' with mr_iid + mr_state NULL → the kind filter drops it (issue runs are
-	//   watched by the board-coupled Lane A, not this board-free lane).
+	//   kind='issue' with a non-null issue_iid + mr_iid + mr_state NULL → fails BOTH disjuncts
+	//   of the widened predicate (issue_iid IS NOT NULL and kind not in prompt/self_improve),
+	//   so the board-coupled Lane A owns it, not this board-free lane (issue #1253).
 	seedRun("issue", "agent/issue-9106", ip(9106), ip(9106), nil, "completed")
 	//   mr_iid NULL → nothing to watch.
 	seedRun("prompt", "uzi/prompt-"+uuid.New().String(), nil, nil, sp("opened"), "completed")
 	//   status='running' → the run has not completed, no MR yet.
 	seedRun("prompt", "uzi/prompt-"+uuid.New().String(), nil, ip(9108), sp("opened"), "running")
 
-	cands, err := q.ListScheduledMRStateWatchCandidates(ctx, repoID)
+	cands, err := q.ListBoardFreeMRStateWatchCandidates(ctx, repoID)
 	if err != nil {
-		t.Fatalf("ListScheduledMRStateWatchCandidates: %v", err)
+		t.Fatalf("ListBoardFreeMRStateWatchCandidates: %v", err)
 	}
-	byID := map[uuid.UUID]store.ListScheduledMRStateWatchCandidatesRow{}
+	byID := map[uuid.UUID]store.ListBoardFreeMRStateWatchCandidatesRow{}
 	for _, c := range cands {
 		byID[c.ID] = c
 	}
-	wantIDs := []uuid.UUID{promptBootstrap, selfImpOpened, promptLocked}
+	wantIDs := []uuid.UUID{promptBootstrap, selfImpOpened, promptLocked, mrReworkID}
 	if len(cands) != len(wantIDs) {
-		t.Fatalf("want exactly %d scheduled watch candidates (NULL/opened/locked), got %d: %+v", len(wantIDs), len(cands), cands)
+		t.Fatalf("want exactly %d board-free watch candidates (NULL/opened/locked + issue-less mr_rework), got %d: %+v", len(wantIDs), len(cands), cands)
 	}
 	for _, id := range wantIDs {
 		if _, ok := byID[id]; !ok {
-			t.Errorf("run %s must be a scheduled MR-state watch candidate, got set %+v", id, cands)
+			t.Errorf("run %s must be a board-free MR-state watch candidate, got set %+v", id, cands)
 		}
 	}
 	// The projection carries branch/mr_iid/mr_state through untouched (the recorder needs

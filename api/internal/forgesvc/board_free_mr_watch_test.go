@@ -12,10 +12,10 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// The board-FREE scheduled MR-state recorder (SyncScheduledMRStates, PRD #908) is a
+// The board-FREE MR-state recorder (SyncBoardFreeMRStates, PRD #908) is a
 // second implementation of syncOneMRState's observe->persist->cancel contract WITHOUT
 // the board move. These tests pin the differential/mirror contract: every fixture in
-// TestSyncScheduledMRStatesDifferential asserts recorded state, cancel-call count, AND
+// TestSyncBoardFreeMRStatesDifferential asserts recorded state, cancel-call count, AND
 // zero board moves (assertNoMove), so the recorder can never regress into moving a card.
 //
 // Which fixture proves which behavior (each is exercised — no vacuous case):
@@ -42,7 +42,7 @@ import (
 
 func strptr(s string) *string { return &s }
 
-func TestSyncScheduledMRStatesDifferential(t *testing.T) {
+func TestSyncBoardFreeMRStatesDifferential(t *testing.T) {
 	const mrIID = int64(13)
 
 	cases := []struct {
@@ -138,8 +138,8 @@ func TestSyncScheduledMRStatesDifferential(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			runID, repoID := uuid.New(), uuid.New()
 			st := &fakeStore{
-				scheduledCandidates: []store.ListScheduledMRStateWatchCandidatesRow{
-					scheduledCand(runID, mrIID, tc.stored),
+				boardFreeCandidates: []store.ListBoardFreeMRStateWatchCandidatesRow{
+					boardFreeCand(runID, mrIID, tc.stored),
 				},
 			}
 			f := &fakeForge{mr: forgeMR(mrIID, tc.observed)}
@@ -150,8 +150,8 @@ func TestSyncScheduledMRStatesDifferential(t *testing.T) {
 			svc := newTestService(st)
 			svc.SetReworkCanceller(canceller)
 
-			if err := svc.SyncScheduledMRStates(context.Background(), repoID, testProjectID, f); err != nil {
-				t.Fatalf("SyncScheduledMRStates: %v", err)
+			if err := svc.SyncBoardFreeMRStates(context.Background(), repoID, testProjectID, f); err != nil {
+				t.Fatalf("SyncBoardFreeMRStates: %v", err)
 			}
 
 			// The recorder NEVER moves a board card.

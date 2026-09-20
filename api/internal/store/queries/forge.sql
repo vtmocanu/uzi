@@ -582,8 +582,10 @@ LIMIT 1;
 -- so it only backfills historical merged PRs and decays as each run settles to a
 -- terminal state. The Go ResolveColumn check remains authoritative for board moves.
 --
--- Scheduled-lane runs (prompt/self_improve) are watched separately, board-free, by
--- ListScheduledMRStateWatchCandidates (PRD #908) — they have no board card.
+-- Issue-less MR-bearing runs are watched separately, board-free, by
+-- ListBoardFreeMRStateWatchCandidates (PRD #908, widened in issue #1253): the
+-- prompt/self_improve lanes plus issue-less helper runs (mr_rework, ci_fix, and
+-- issue-less chat/task) that carry an MR — none of which have a board card.
 WITH latest AS (
     SELECT DISTINCT ON (r.issue_iid)
            r.id, r.issue_iid, r.status, r.mr_iid, r.mr_state, r.created_at
@@ -629,13 +631,19 @@ WHERE l.status = 'completed'
 ORDER BY (i.state = 'opened') DESC, l.created_at DESC
 LIMIT 100;
 
--- name: ListScheduledMRStateWatchCandidates :many
--- Board-FREE MR-state watch for the scheduled lanes (prompt, self_improve) — PRD #908.
--- Sibling of ListMRWatchCandidates but with NO issues JOIN and NO DISTINCT ON (issue_iid):
--- prompt runs are issue-less and self_improve runs share one tracking issue, so neither the
+-- name: ListBoardFreeMRStateWatchCandidates :many
+-- Board-FREE MR-state watch for every issue-less MR-bearing run — PRD #908, widened in
+-- issue #1253. The board-coupled ListMRWatchCandidates only covers issue-lane runs (its
+-- issues JOIN drops issue_iid IS NULL rows, and its latest CTE excludes prompt/self_improve),
+-- so this sibling owns everything that lane structurally cannot: the prompt/self_improve
+-- lanes plus issue-less helper runs (mr_rework, ci_fix, and issue-less chat/task) that carry
+-- an MR. The predicate `issue_iid IS NULL OR kind IN ('prompt','self_improve')` is disjoint
+-- from the board lane by construction — an issue_iid IS NULL run never matches that lane's
+-- JOIN, and prompt/self_improve are excluded by its CTE. NO issues JOIN and NO DISTINCT ON
+-- (issue_iid): these runs are issue-less or share one tracking issue, so neither the
 -- board-move machinery nor the per-issue collapse applies. Keyed on the run/branch. Populates
--- runs.mr_state via forgesvc.SyncScheduledMRStates so ListMRReworkCandidates' mr_state='opened'
--- gate, the mr_rework ledger eviction, and stop-on-close cancellation all work for these lanes.
+-- runs.mr_state via forgesvc.SyncBoardFreeMRStates so ListMRReworkCandidates' mr_state='opened'
+-- gate, the mr_rework ledger eviction, and stop-on-close cancellation all work for these runs.
 -- Self-bounding like Lane B: poll a run only until its mr_state reaches a terminal value
 -- (merged/closed), then it drops out of this set. LIMIT 100 is a hardcoded burst bound (mirrors
 -- ListMRWatchCandidates), not a sqlc param, so zero Go signature change. Keep this rationale
@@ -643,7 +651,7 @@ LIMIT 100;
 SELECT id, branch, mr_iid, mr_state
 FROM runs
 WHERE repo_id = @repo_id::uuid
-  AND kind IN ('prompt', 'self_improve')
+  AND (issue_iid IS NULL OR kind IN ('prompt', 'self_improve'))
   AND status = 'completed'
   AND mr_iid IS NOT NULL
   AND (mr_state IS NULL OR mr_state IN ('opened', 'locked'))

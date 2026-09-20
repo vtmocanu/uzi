@@ -137,7 +137,7 @@ func (s *Service) syncOneMRState(ctx context.Context, repoID uuid.UUID, forgePro
 		// this arm on the `locked`->`closed` tick — the `opened`->`closed` close arm
 		// above never sees it, so without cancelling here the run self-evicts at the
 		// terminal `closed` state with the rework still spending (issue #1072, the
-		// issue-lane analogue of the scheduled-lane fix in recordScheduledMRState). The
+		// issue-lane analogue of the board-free-lane fix in recordBoardFreeMRState). The
 		// cancel is keyed on the MR, not the card; no board move happens here because
 		// `locked` was mid-merge. A `locked`->`opened` settle is a non-terminal
 		// transition and must NOT cancel — the rework gate stays open.
@@ -234,13 +234,13 @@ func (s *Service) guardedMRMove(ctx context.Context, repoID uuid.UUID, forgeProj
 }
 
 // recordMRState persists the observed MR state (runs.mr_state is written only by
-// forgesvc MR-state sync — SyncMRStates and SyncScheduledMRStates, PRD #908 — both
-// through the single SetRunMRState statement). The two syncs cover near-disjoint run
-// sets (issue vs prompt/self_improve); they can overlap on the newest self_improve run
-// when its shared tracking issue is cached (that run satisfies both candidate queries),
-// but both read live forge state and drive the same idempotent record/cancel path, and
-// the board move is a guarded no-op for the un-promoted tracking issue, so a same-tick
-// double observation is harmless. Best-effort: a write failure only means the same edge is
+// forgesvc MR-state sync — SyncMRStates and SyncBoardFreeMRStates, PRD #908 — both
+// through the single SetRunMRState statement). The two syncs cover DISJOINT run sets,
+// so no run is ever recorded by both on one tick: ListMRWatchCandidates requires a
+// non-null issue_iid (via its issues JOIN) AND kind NOT IN ('prompt','self_improve'),
+// while ListBoardFreeMRStateWatchCandidates owns exactly the complement
+// (issue_iid IS NULL OR kind IN ('prompt','self_improve')) — a run cannot satisfy both
+// predicates at once. Best-effort: a write failure only means the same edge is
 // re-observed next tick, and the guards make the retry a no-op if the card has
 // already moved.
 func (s *Service) recordMRState(ctx context.Context, runID uuid.UUID, state string) {

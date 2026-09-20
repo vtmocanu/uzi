@@ -646,6 +646,66 @@ func (q *Queries) ListBoardColumns(ctx context.Context, repoID uuid.UUID) ([]Boa
 	return items, nil
 }
 
+const listBoardFreeMRStateWatchCandidates = `-- name: ListBoardFreeMRStateWatchCandidates :many
+SELECT id, branch, mr_iid, mr_state
+FROM runs
+WHERE repo_id = $1::uuid
+  AND (issue_iid IS NULL OR kind IN ('prompt', 'self_improve'))
+  AND status = 'completed'
+  AND mr_iid IS NOT NULL
+  AND (mr_state IS NULL OR mr_state IN ('opened', 'locked'))
+ORDER BY created_at DESC
+LIMIT 100
+`
+
+type ListBoardFreeMRStateWatchCandidatesRow struct {
+	ID      uuid.UUID   `json:"id"`
+	Branch  pgtype.Text `json:"branch"`
+	MrIid   pgtype.Int8 `json:"mr_iid"`
+	MrState pgtype.Text `json:"mr_state"`
+}
+
+// Board-FREE MR-state watch for every issue-less MR-bearing run — PRD #908, widened in
+// issue #1253. The board-coupled ListMRWatchCandidates only covers issue-lane runs (its
+// issues JOIN drops issue_iid IS NULL rows, and its latest CTE excludes prompt/self_improve),
+// so this sibling owns everything that lane structurally cannot: the prompt/self_improve
+// lanes plus issue-less helper runs (mr_rework, ci_fix, and issue-less chat/task) that carry
+// an MR. The predicate `issue_iid IS NULL OR kind IN ('prompt','self_improve')` is disjoint
+// from the board lane by construction — an issue_iid IS NULL run never matches that lane's
+// JOIN, and prompt/self_improve are excluded by its CTE. NO issues JOIN and NO DISTINCT ON
+// (issue_iid): these runs are issue-less or share one tracking issue, so neither the
+// board-move machinery nor the per-issue collapse applies. Keyed on the run/branch. Populates
+// runs.mr_state via forgesvc.SyncBoardFreeMRStates so ListMRReworkCandidates' mr_state='opened'
+// gate, the mr_rework ledger eviction, and stop-on-close cancellation all work for these runs.
+// Self-bounding like Lane B: poll a run only until its mr_state reaches a terminal value
+// (merged/closed), then it drops out of this set. LIMIT 100 is a hardcoded burst bound (mirrors
+// ListMRWatchCandidates), not a sqlc param, so zero Go signature change. Keep this rationale
+// ABOVE the statement — a comment trailing after the `;` is grabbed by sqlc as the NEXT query's doc.
+func (q *Queries) ListBoardFreeMRStateWatchCandidates(ctx context.Context, repoID uuid.UUID) ([]ListBoardFreeMRStateWatchCandidatesRow, error) {
+	rows, err := q.db.Query(ctx, listBoardFreeMRStateWatchCandidates, repoID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListBoardFreeMRStateWatchCandidatesRow{}
+	for rows.Next() {
+		var i ListBoardFreeMRStateWatchCandidatesRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Branch,
+			&i.MrIid,
+			&i.MrState,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listEnabledReposByConnection = `-- name: ListEnabledReposByConnection :many
 SELECT id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog FROM repos WHERE connection_id = $1 AND enabled = true
 ORDER BY path_with_namespace ASC
@@ -1085,8 +1145,10 @@ type ListMRWatchCandidatesRow struct {
 // so it only backfills historical merged PRs and decays as each run settles to a
 // terminal state. The Go ResolveColumn check remains authoritative for board moves.
 //
-// Scheduled-lane runs (prompt/self_improve) are watched separately, board-free, by
-// ListScheduledMRStateWatchCandidates (PRD #908) — they have no board card.
+// Issue-less MR-bearing runs are watched separately, board-free, by
+// ListBoardFreeMRStateWatchCandidates (PRD #908, widened in issue #1253): the
+// prompt/self_improve lanes plus issue-less helper runs (mr_rework, ci_fix, and
+// issue-less chat/task) that carry an MR — none of which have a board card.
 // Open-issue (Lane A) candidates first so the board-move watch is never deferred
 // behind a closed-issue backfill burst; then newest runs first so recent merges
 // record before old ones. Qualify l.created_at (not bare) — `issues` has none.
@@ -1289,60 +1351,6 @@ func (q *Queries) ListReposByConnectionForUser(ctx context.Context, arg ListRepo
 			&i.GuardrailOverrideAt,
 			&i.RequiredCapabilities,
 			&i.FoldImproveUziBacklog,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
-const listScheduledMRStateWatchCandidates = `-- name: ListScheduledMRStateWatchCandidates :many
-SELECT id, branch, mr_iid, mr_state
-FROM runs
-WHERE repo_id = $1::uuid
-  AND kind IN ('prompt', 'self_improve')
-  AND status = 'completed'
-  AND mr_iid IS NOT NULL
-  AND (mr_state IS NULL OR mr_state IN ('opened', 'locked'))
-ORDER BY created_at DESC
-LIMIT 100
-`
-
-type ListScheduledMRStateWatchCandidatesRow struct {
-	ID      uuid.UUID   `json:"id"`
-	Branch  pgtype.Text `json:"branch"`
-	MrIid   pgtype.Int8 `json:"mr_iid"`
-	MrState pgtype.Text `json:"mr_state"`
-}
-
-// Board-FREE MR-state watch for the scheduled lanes (prompt, self_improve) — PRD #908.
-// Sibling of ListMRWatchCandidates but with NO issues JOIN and NO DISTINCT ON (issue_iid):
-// prompt runs are issue-less and self_improve runs share one tracking issue, so neither the
-// board-move machinery nor the per-issue collapse applies. Keyed on the run/branch. Populates
-// runs.mr_state via forgesvc.SyncScheduledMRStates so ListMRReworkCandidates' mr_state='opened'
-// gate, the mr_rework ledger eviction, and stop-on-close cancellation all work for these lanes.
-// Self-bounding like Lane B: poll a run only until its mr_state reaches a terminal value
-// (merged/closed), then it drops out of this set. LIMIT 100 is a hardcoded burst bound (mirrors
-// ListMRWatchCandidates), not a sqlc param, so zero Go signature change. Keep this rationale
-// ABOVE the statement — a comment trailing after the `;` is grabbed by sqlc as the NEXT query's doc.
-func (q *Queries) ListScheduledMRStateWatchCandidates(ctx context.Context, repoID uuid.UUID) ([]ListScheduledMRStateWatchCandidatesRow, error) {
-	rows, err := q.db.Query(ctx, listScheduledMRStateWatchCandidates, repoID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []ListScheduledMRStateWatchCandidatesRow{}
-	for rows.Next() {
-		var i ListScheduledMRStateWatchCandidatesRow
-		if err := rows.Scan(
-			&i.ID,
-			&i.Branch,
-			&i.MrIid,
-			&i.MrState,
 		); err != nil {
 			return nil, err
 		}

@@ -168,7 +168,7 @@ func TestListMRWatchCandidatesLiveDB(t *testing.T) {
 	// the board: without the `kind NOT IN ('prompt','self_improve')` filter in the CTE it
 	// satisfies Lane A (opened + Human Review) and the board-coupled syncOneMRState would
 	// move the SHARED tracking-issue card on the MR close/reopen edge — the R1 violation.
-	// The kind filter drops it here; ListScheduledMRStateWatchCandidates owns it board-free
+	// The kind filter drops it here; ListBoardFreeMRStateWatchCandidates owns it board-free
 	// instead. Designed to FAIL on the pre-fix query (112 would appear as a 6th candidate);
 	// its exclusion plus the exact count of 5 below is the non-vacuous proof.
 	issue(112, "opened", hr)
@@ -226,6 +226,114 @@ func TestListMRWatchCandidatesLiveDB(t *testing.T) {
 	}
 	if c := got[109]; c.MrIid.Int64 != 209 || c.MrState.String != "locked" {
 		t.Errorf("candidate 109 = {mr_iid:%d mr_state:%q}, want {209 \"locked\"}", c.MrIid.Int64, c.MrState.String)
+	}
+}
+
+// TestBoardFreeAndBoardCoupledLanesDisjointLiveDB is the D1 invariant / R3 guard (issue
+// #1253): the board-free lane (ListBoardFreeMRStateWatchCandidates) and the board-coupled
+// lane (ListMRWatchCandidates) PARTITION the MR-bearing run set — no run is ever a candidate
+// for both, so runs.mr_state has exactly one writer. It seeds one run of each shape against a
+// REAL Postgres and asserts BOTH directions on the SAME store.Queries:
+//
+//   - an issue-LESS mr_rework run (issue_iid NULL) is a board-free candidate and NOT a
+//     board-coupled one — the board-coupled query's issues JOIN drops issue_iid IS NULL rows;
+//   - an issue-lane latest kind='issue' run whose issue is open + Human Review (a Lane-A
+//     candidate) is a board-coupled candidate and NOT a board-free one — the board-free
+//     predicate `issue_iid IS NULL OR kind IN ('prompt','self_improve')` excludes a non-null
+//     issue_iid on a non-scheduled kind.
+//
+// Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres; the store-it sweep
+// (e2e/run-store-it.sh, task gate:api in CI) provides one. `go test ./...` without it SKIPs.
+func TestBoardFreeAndBoardCoupledLanesDisjointLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
+	}
+	ctx := context.Background()
+	if err := store.Migrate(ctx, dsn); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	pool, err := store.OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	defer pool.Close()
+	q := store.New(pool)
+
+	userID, connID, repoID := uuid.New(), uuid.New(), uuid.New()
+	mustExec(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
+		userID, fmt.Sprintf("lane-disjoint-%s@e2e", userID))
+	mustExec(ctx, t, pool,
+		`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
+		 VALUES ($1, $2, 'gitlab', 'https://forge.e2e', 'bot', 1, $3)`, connID, userID, []byte{0x1})
+	mustExec(ctx, t, pool,
+		`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
+		 VALUES ($1, $2, 1, 'g/disjoint', 'https://forge.e2e/g/disjoint', 'main', true)`, repoID, connID)
+
+	// Board-COUPLED (Lane A) fixture: an open issue parked in Human Review whose LATEST run is
+	// a completed kind='issue' run carrying an MR. issue_iid is non-null, so the board-free
+	// predicate excludes it.
+	const issueIID int64 = 5001
+	const issueMR int64 = 6001
+	mustExec(ctx, t, pool,
+		`INSERT INTO issues (repo_id, forge_issue_iid, title, state, labels, web_url, has_prd_link, forge_updated_at, synced_at)
+		 VALUES ($1, $2, 't', 'opened', $3::jsonb, 'https://x', true, now(), now())`,
+		repoID, issueIID, `["PRD","Human Review"]`)
+	issueRunID := uuid.New()
+	mustExec(ctx, t, pool,
+		`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, branch, mr_iid, status)
+		 VALUES ($1, $2, $3, 'issue', $4, 't', 'd', $5, $6, 'completed')`,
+		issueRunID, userID, repoID, issueIID, "agent/issue-"+uuid.New().String(), issueMR)
+
+	// Board-FREE fixture: an issue-LESS mr_rework run (issue_iid NULL, mr_state NULL). A source
+	// run satisfies the target_run_id FK (00058 REFERENCES runs); it carries no MR, so it is not
+	// itself a candidate.
+	srcRunID := uuid.New()
+	mustExec(ctx, t, pool,
+		`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, branch, status)
+		 VALUES ($1, $2, $3, 'prompt', NULL, 't', 'd', $4, 'completed')`,
+		srcRunID, userID, repoID, "uzi/prompt-"+uuid.New().String())
+	const reworkMR int64 = 6002
+	reworkRunID := uuid.New()
+	mustExec(ctx, t, pool,
+		`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, branch, pipeline_ref, target_run_id, mr_iid, status)
+		 VALUES ($1, $2, $3, 'mr_rework', NULL, 't', 'd', $4, $4, $5, $6, 'completed')`,
+		reworkRunID, userID, repoID, "agent/issue-"+uuid.New().String(), srcRunID, reworkMR)
+
+	// Direction 1 — board-free lane: the issue-less mr_rework run IS a candidate; the
+	// issue-lane run is NOT.
+	boardFree, err := q.ListBoardFreeMRStateWatchCandidates(ctx, repoID)
+	if err != nil {
+		t.Fatalf("ListBoardFreeMRStateWatchCandidates: %v", err)
+	}
+	bf := map[uuid.UUID]bool{}
+	for _, c := range boardFree {
+		bf[c.ID] = true
+	}
+	if !bf[reworkRunID] {
+		t.Errorf("issue-less mr_rework run %s must be a board-free candidate; got %+v", reworkRunID, boardFree)
+	}
+	if bf[issueRunID] {
+		t.Errorf("issue-lane run %s (non-null issue_iid, kind='issue') must NOT be a board-free candidate", issueRunID)
+	}
+
+	// Direction 2 — board-coupled lane: the issue-lane run IS a candidate (by issue_iid); the
+	// issue-less mr_rework run is NOT.
+	coupled, err := q.ListMRWatchCandidates(ctx, repoID)
+	if err != nil {
+		t.Fatalf("ListMRWatchCandidates: %v", err)
+	}
+	coupledByRun := map[uuid.UUID]bool{}
+	coupledByIssue := map[int64]bool{}
+	for _, c := range coupled {
+		coupledByRun[c.ID] = true
+		coupledByIssue[c.IssueIid.Int64] = true
+	}
+	if !coupledByIssue[issueIID] {
+		t.Errorf("issue-lane run (issue %d) must be a board-coupled candidate; got %+v", issueIID, coupled)
+	}
+	if coupledByRun[reworkRunID] {
+		t.Errorf("issue-less mr_rework run %s must NOT be a board-coupled candidate (issues JOIN drops issue_iid NULL)", reworkRunID)
 	}
 }
 
