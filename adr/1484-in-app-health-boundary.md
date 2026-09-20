@@ -35,8 +35,9 @@ today: `automountServiceAccountToken: false` on the api Deployment
 **separate Go module** specifically so `k8s.io/client-go` never enters `api/go.mod`
 — enforced by a standing test, `api/internal/hostedsvc/no_kube_dependency_test.go`,
 that walks the whole `api` build graph. The controller's own RBAC (`Role`s in
-`deploy/chart/templates/worker-rbac.yaml`) is scoped to two worker namespaces with
-`pods: ["list"]` and nothing else; there is no `ClusterRole` in the chart and no
+`deploy/chart/templates/worker-rbac.yaml`) is scoped to the two worker namespaces,
+where its access to pods is `pods: ["list"]` and nothing more — no `get`, no
+`watch`, no pod logs; there is no `ClusterRole` in the chart and no
 Role at all on the release namespace where `api`, `web`, the database, and the
 controller itself run. Building this feature by widening any of that would trade a
 credential-free `api` — the security boundary the hosted-worker feature's own RBAC
