@@ -42,7 +42,8 @@ if [ "${1:-}" = run ] && [ "${2:-}" = list ]; then
       esac
       ;;
     failure)
-      printf '104\tin_progress\t\tCI\033[2J\n'
+      escape=$'\x1b'
+      printf '104\tcompleted\tfailure\tCI%s[2J\n' "$escape"
       ;;
     *) echo "unknown MODE=$MODE" >&2; exit 1 ;;
   esac
@@ -50,7 +51,8 @@ if [ "${1:-}" = run ] && [ "${2:-}" = list ]; then
 fi
 if [ "${1:-}" = run ] && [ "${2:-}" = view ]; then
   if [ "$MODE" = failure ]; then
-    printf 'completed\tfailure\tlint\033[31m-repo\thttps://github.com/test/repo/actions/runs/104/job/999\t999\n'
+    escape=$'\x1b'
+    printf 'completed\tfailure\tlint%s[31m-repo\thttps://github.com/test/repo/actions/runs/104/job/999\t999\n' "$escape"
   elif [ "$MODE" = transient ]; then
     n=0; [ -f "$VIEW_COUNT" ] && n=$(cat "$VIEW_COUNT")
     n=$((n+1)); printf '%s' "$n" > "$VIEW_COUNT"
@@ -101,7 +103,7 @@ grep -q 'workflow listing temporarily empty after runs were seen' "$WORK/transie
 : > "$CALLS"
 MODE=failure; export MODE
 set +e
-bash "$SCRIPT" --sha "$FULL_SHA" --repo test/repo --interval 0 --max-ticks 2 > "$WORK/failure.out" 2>&1
+bash -O xpg_echo "$SCRIPT" --sha "$FULL_SHA" --repo test/repo --interval 0 --max-ticks 2 > "$WORK/failure.out" 2>&1
 rc=$?
 set -e
 [ "$rc" -eq 1 ] || fail "confirmed failed job did not exit 1, rc=$rc: $(cat "$WORK/failure.out")"

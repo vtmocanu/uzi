@@ -155,7 +155,7 @@ print_fails() {  # $1 = run id, $2 = workflow name (optional), $3 = verdict text
   workflow="$2"
   label="run $run_id"
   [ -n "$workflow" ] && label="$label ($(printf '%q' "$workflow"))"
-  echo "=== $label: FAILED JOB(S) — react now; each completed job has a live log command below ==="
+  printf '=== %s: FAILED JOB(S) — react now; each completed job has a live log command below ===\n' "$label"
   printf '%s\n' "$3" | tail -n +2 | while IFS=$'\t' read -r name url job_id; do
     repo_path="$REPO"
     if [ -z "$repo_path" ]; then
@@ -167,9 +167,9 @@ print_fails() {  # $1 = run id, $2 = workflow name (optional), $3 = verdict text
     safe_repo="$(printf '%q' "$repo_path")"
     safe_run="$(printf '%q' "$run_id")"
     safe_job="$(printf '%q' "$job_id")"
-    echo "  FAIL  $safe_name  $url"
-    echo "    live log: gh api --allow-escape-sequences $safe_endpoint"
-    echo "    after run terminal: gh run view $safe_run --repo $safe_repo --job $safe_job --log-failed"
+    printf '  FAIL  %s  %s\n' "$safe_name" "$url"
+    printf '    live log: gh api --allow-escape-sequences %s\n' "$safe_endpoint"
+    printf '    after run terminal: gh run view %s --repo %s --job %s --log-failed\n' "$safe_run" "$safe_repo" "$safe_job"
   done
 }
 
