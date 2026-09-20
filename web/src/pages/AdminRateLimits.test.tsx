@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
-import { cleanup, render, screen, within } from "@testing-library/react";
+import { act, cleanup, render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { AdminRateLimits } from "./AdminRateLimits";
 import {
@@ -30,6 +30,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  vi.useRealTimers();
   vi.clearAllMocks();
 });
 
@@ -387,5 +388,39 @@ describe("AdminRateLimits — Codex section", () => {
     // The Claude side settles to its empty state; the Codex section never appears.
     await screen.findByText("No users yet");
     expect(screen.queryByLabelText("Codex accounts")).toBeNull();
+  });
+
+  it("keeps the last-good Codex table when a poll fails, showing the alert above it", async () => {
+    // A single transient poll failure must NOT blank the whole capacity table for a
+    // poll interval: useAsyncData keeps last-good data on a failed reload, so the rows
+    // stay and the alert renders above them (mirroring the Claude table).
+    vi.useFakeTimers();
+    mockApi.getAdminCodexRateLimits.mockResolvedValue({ users: codexUsers });
+    render(
+      <MemoryRouter>
+        <AdminRateLimits />
+      </MemoryRouter>,
+    );
+    // Flush the successful first load: the table renders with a known account + percentage.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(within(section()).getByText("hot-codex")).toBeTruthy();
+    expect(within(section()).getByText("96%")).toBeTruthy();
+
+    // The next 60s poll rejects; the section must swallow it, keep the last-good rows,
+    // and surface the error above the table rather than collapsing to an alert-only view.
+    mockApi.getAdminCodexRateLimits.mockRejectedValueOnce(new Error("poll blip"));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000);
+    });
+    expect(mockApi.getAdminCodexRateLimits).toHaveBeenCalledTimes(2); // first load + one poll
+
+    // Last-good rows persist (assert the actual account row + percentage + its meter)...
+    expect(within(section()).getByText("hot-codex")).toBeTruthy();
+    expect(within(section()).getByText("96%")).toBeTruthy();
+    expect(within(section()).getByRole("progressbar", { name: "Code 3h window" })).toBeTruthy();
+    // ...and the transient error is shown (the fallback message, since it is not an ApiError).
+    expect(within(section()).getByText("Failed to load Codex rate limits")).toBeTruthy();
   });
 });

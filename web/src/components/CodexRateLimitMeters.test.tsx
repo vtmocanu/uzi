@@ -103,10 +103,32 @@ describe("CodexRateLimitCard (Settings)", () => {
     expect(screen.getByText("46%")).toBeTruthy();
     expect(screen.getByText("90%")).toBeTruthy();
     // The window chips are derived from the reported length: a 3-hour bucket reads "3h",
-    // never a hardcoded 5h/7d. Both standard and nonstandard chips are present.
-    expect(screen.getByRole("progressbar", { name: "5h window" })).toBeTruthy();
-    expect(screen.getByRole("progressbar", { name: "7d window" })).toBeTruthy();
-    expect(screen.getByRole("progressbar", { name: "3h window" })).toBeTruthy();
+    // never a hardcoded 5h/7d. The accessible name also carries the bucket name so two
+    // same-duration windows stay distinguishable to a screen reader.
+    expect(screen.getByRole("progressbar", { name: "Requests 5h window" })).toBeTruthy();
+    expect(screen.getByRole("progressbar", { name: "Requests 7d window" })).toBeTruthy();
+    expect(screen.getByRole("progressbar", { name: "Code (3-hour) 3h window" })).toBeTruthy();
+  });
+
+  it("disambiguates two same-duration windows of a 2-bucket account by bucket name", async () => {
+    // A team account with a Requests 7d window and a Tokens 7d window: same duration, so
+    // the chip alone ("7d window") would give both the SAME accessible name. The bucket
+    // name must qualify the meter's aria-label so a screen-reader user can tell them apart.
+    mockApi.getMyCodexRateLimits.mockResolvedValue({
+      accounts: [
+        acct("cdx-team", ["team-codex"], true, "fresh", [
+          bucket("requests", "Requests", win(40, 604800, 200_000)),
+          bucket("tokens", "Tokens", win(72, 604800, 200_000)),
+        ]),
+      ],
+    });
+    render(<CodexRateLimitCard sidebarAccountIds={[]} onToggleSidebarAccount={noop} />);
+    await screen.findByText("Codex limits");
+    // Both 7d windows resolve to distinct, bucket-qualified accessible names.
+    expect(screen.getByRole("progressbar", { name: "Requests 7d window" })).toBeTruthy();
+    expect(screen.getByRole("progressbar", { name: "Tokens 7d window" })).toBeTruthy();
+    // The visible chip stays the short "7d window" (rendered once per bucket).
+    expect(screen.getAllByText("7d window")).toHaveLength(2);
   });
 
   it("draws the forecast on the 3-hour bucket from its OWN reported duration", async () => {
@@ -115,9 +137,9 @@ describe("CodexRateLimitCard (Settings)", () => {
     await screen.findByText("Codex limits");
     // The 3h window at 90% with a near reset heads past the cap → a projected value on the
     // bar's aria-valuetext. The 5h window at 28% has headroom → no projection.
-    const bar3h = screen.getByRole("progressbar", { name: "3h window" });
+    const bar3h = screen.getByRole("progressbar", { name: "Code (3-hour) 3h window" });
     expect(bar3h.getAttribute("aria-valuetext")).toMatch(/projected \d+% by reset/);
-    const bar5h = screen.getByRole("progressbar", { name: "5h window" });
+    const bar5h = screen.getByRole("progressbar", { name: "Requests 5h window" });
     expect(bar5h.getAttribute("aria-valuetext")).not.toMatch(/projected/);
   });
 
@@ -138,7 +160,7 @@ describe("CodexRateLimitCard (Settings)", () => {
     expect(screen.getByText("Stale")).toBeTruthy();
     // The stale account still shows its aged number, dimmed.
     expect(screen.getByText("52%")).toBeTruthy();
-    const bar = screen.getByRole("progressbar", { name: "5h window" }).lastChild as HTMLElement;
+    const bar = screen.getByRole("progressbar", { name: "Requests 5h window" }).lastChild as HTMLElement;
     expect(bar.className).toMatch(/opacity-40/);
   });
 

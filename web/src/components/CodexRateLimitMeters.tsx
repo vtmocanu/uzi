@@ -88,15 +88,21 @@ function accountResetLabel(account: CodexAccountRateLimit, nowMs: number): strin
 // ── Settings card ────────────────────────────────────────────────────────────
 
 function CodexSettingsWindowRow({
+  bucketName,
   win,
   dim,
   now,
 }: {
+  bucketName: string;
   win: CodexRateLimitWindow;
   dim: boolean;
   now: number;
 }) {
   const chip = formatCodexWindowLabel(win.limit_window_seconds);
+  // The accessible name carries the bucket name too (like the sidebar and admin surfaces),
+  // so two same-duration windows of a 2-bucket account ("Requests 7d" vs "Tokens 7d") read
+  // distinctly to a screen reader. The visible chip stays the short "5h window".
+  const label = `${bucketName} ${chip} window`;
   // A partial window (no percentage reported for this slot) reads "no reading yet" rather
   // than a bogus 0% bar.
   if (win.used_percent == null) {
@@ -106,7 +112,7 @@ function CodexSettingsWindowRow({
           <span className="font-medium text-muted">{chip} window</span>
           <span className="text-faint">no reading yet</span>
         </div>
-        <MeterTrack className="mt-1.5 h-2" label={`${chip} window`} fillPct={0} valueText="no reading yet" dim />
+        <MeterTrack className="mt-1.5 h-2" label={label} fillPct={0} valueText="no reading yet" dim />
       </div>
     );
   }
@@ -127,7 +133,7 @@ function CodexSettingsWindowRow({
       </div>
       <RateLimitForecastMeter
         className="mt-1.5 h-2"
-        label={`${chip} window`}
+        label={label}
         pct={win.used_percent}
         valueText={`${win.used_percent}%${countdown ? `, resets in ${countdown}` : ""}`}
         forecast={forecast}
@@ -181,7 +187,7 @@ function CodexAccountBlock({
                 {b.limit_reached === true && <Badge tone="danger">limit reached</Badge>}
               </div>
               {bucketWindows(b).map((w, i) => (
-                <CodexSettingsWindowRow key={`${b.id}:${i}`} win={w} dim={dim} now={now} />
+                <CodexSettingsWindowRow key={`${b.id}:${i}`} bucketName={bucketDisplayName(b)} win={w} dim={dim} now={now} />
               ))}
             </div>
           ))}
