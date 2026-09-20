@@ -1,0 +1,445 @@
+// PRD #1493 M2 — BEHAVIOURAL coverage of the ROOT (uid-split) branch of the worker
+// entrypoint's k8s-safe migration. The four couplings (read-only token, docker-lane TMPDIR,
+// legacy /data migration, sticky carve-out) plus the PVC-root fsGroup alignment are exercised
+// by RUNNING the real `agent/templates/entrypoint.sh` with:
+//   * `id` stubbed to `echo 0`, so the ROOT branch is taken regardless of who runs the suite;
+//   * the mutating binaries (chown/chmod/mkdir) and busybox (stat/cat) and setpriv/tini
+//     stubbed, so the branch runs to completion under uid 10001 without needing real root;
+//   * the volume roots + token path pointed at a sandbox via the entrypoint's own
+//     DATA_DIR/NIX_DIR/TOKEN constants (the same string-replace seam the issue-#120 test uses
+//     for ID/TINI).
+//
+// Group 1 runs under ANY uid: the stubs RECORD every chown/chmod/mkdir to an op-log and apply
+// nothing (STUB_NOOP), so the ownership MAP and the split env are asserted from the log +
+// captured env, and content survival is proven by the absence of any destructive op.
+//
+// Group 2 (gated on running AS WORKER_UID with WORKER+RUNNER membership, like
+// codex-shared-dir.test.ts Group B) lets the stubs apply the ops best-effort (real chgrp
+// succeeds; a give-away chown to another uid EPERMs and is recorded only), then makes REAL
+// filesystem assertions: the migrated run HOME + codex-data validate through the production
+// `ensureCodexSharedDirectory`, the worker-private codex-session-store is byte-identical and
+// still worker:worker 0700/0600, and resume state survives.
+
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import fs from "node:fs";
+import fsp from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+import { ensureCodexSharedDirectory } from "../src/codex/codex-executor.js";
+import { WORKER_UID, RUNNER_UID } from "../src/runner-uid.js";
+
+const entrypointPath = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "../templates/entrypoint.sh",
+);
+const entrypointText = fs.readFileSync(entrypointPath, "utf8");
+
+const MODE_MASK = 0o7777;
+
+interface RunResult {
+  status: number | null;
+  stdout: string;
+  stderr: string;
+  ops: string[];
+  env: Map<string, string>;
+}
+
+/** Write an executable stub. */
+function writeStub(dir: string, name: string, body: string): string {
+  const p = path.join(dir, name);
+  fs.writeFileSync(p, body, { mode: 0o755 });
+  return p;
+}
+
+/** A harness dir holding the sandbox volume roots, the stubs, and the op-log. */
+interface Harness {
+  root: string;
+  data: string;
+  nix: string;
+  token: string;
+  stubDir: string;
+  opLog: string;
+  script: string;
+}
+
+function makeHarness(): Harness {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-entrypoint-m2-"));
+  const data = path.join(root, "data");
+  const nix = path.join(root, "nix");
+  const token = path.join(root, "token");
+  const stubDir = path.join(root, "stubs");
+  const opLog = path.join(root, "ops.log");
+  fs.mkdirSync(stubDir);
+  fs.writeFileSync(opLog, "");
+
+  // id -> echo 0 (force the ROOT branch under any uid).
+  writeStub(stubDir, "id", "#!/bin/sh\necho 0\n");
+  // tini -> dump env (the drop's exported env is what we inspect).
+  writeStub(stubDir, "tini", "#!/bin/sh\nenv\n");
+  // setpriv -> skip its own flags to `--`, then exec the target (so the token read-test runs
+  // `busybox cat` and the final drop runs the tini stub).
+  writeStub(
+    stubDir,
+    "setpriv",
+    '#!/bin/sh\nwhile [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done\n[ "$1" = "--" ] && shift\nexec "$@"\n',
+  );
+  // chown/chmod/mkdir -> record to $OPLOG; apply best-effort unless $STUB_NOOP; $STUB_ROFS_TOKEN
+  // makes `chown 0:0 <that path>` fail like an EROFS read-only Secret mount.
+  writeStub(
+    stubDir,
+    "chown",
+    '#!/bin/sh\nprintf "chown %s\\n" "$*" >> "$OPLOG"\n' +
+      'if [ -n "${STUB_ROFS_TOKEN:-}" ] && [ "$1" = "0:0" ] && [ "$2" = "$STUB_ROFS_TOKEN" ]; then exit 1; fi\n' +
+      '[ -n "${STUB_NOOP:-}" ] && exit 0\n/bin/chown "$@" 2>/dev/null || true\nexit 0\n',
+  );
+  writeStub(
+    stubDir,
+    "chmod",
+    '#!/bin/sh\nprintf "chmod %s\\n" "$*" >> "$OPLOG"\n' +
+      '[ -n "${STUB_NOOP:-}" ] && exit 0\n/bin/chmod "$@" 2>/dev/null || true\nexit 0\n',
+  );
+  writeStub(
+    stubDir,
+    "mkdir",
+    '#!/bin/sh\nprintf "mkdir %s\\n" "$*" >> "$OPLOG"\n' +
+      '[ -n "${STUB_NOOP:-}" ] && exit 0\n/bin/mkdir "$@" 2>/dev/null || true\nexit 0\n',
+  );
+  // busybox -> stat returns $STUB_TOKEN_POSTURE (default a valid kube posture); cat is real.
+  writeStub(
+    stubDir,
+    "busybox",
+    '#!/bin/sh\nsub=$1; shift\ncase "$sub" in\n' +
+      '  stat) printf "%s\\n" "${STUB_TOKEN_POSTURE:-0 10001 440}" ;;\n' +
+      '  cat) /bin/cat "$@" 2>/dev/null || exit 1 ;;\n' +
+      "  *) exit 1 ;;\nesac\n",
+  );
+
+  const script = path.join(root, "entrypoint.sh");
+  const patched = entrypointText
+    .replace("ID=/usr/bin/id", `ID=${path.join(stubDir, "id")}`)
+    .replace("TINI=/sbin/tini", `TINI=${path.join(stubDir, "tini")}`)
+    .replace("SETPRIV=/bin/setpriv", `SETPRIV=${path.join(stubDir, "setpriv")}`)
+    .replace("CHOWN=/bin/chown", `CHOWN=${path.join(stubDir, "chown")}`)
+    .replace("CHMOD=/bin/chmod", `CHMOD=${path.join(stubDir, "chmod")}`)
+    .replace("MKDIR=/bin/mkdir", `MKDIR=${path.join(stubDir, "mkdir")}`)
+    .replace("BUSYBOX=/bin/busybox", `BUSYBOX=${path.join(stubDir, "busybox")}`)
+    .replace("DATA_DIR=/data", `DATA_DIR=${data}`)
+    .replace("NIX_DIR=/nix", `NIX_DIR=${nix}`)
+    .replace("TOKEN=/run/secrets/worker_token", `TOKEN=${token}`);
+  // Every constant we depend on must actually have been rewritten.
+  for (const marker of [stubDir, data, nix, token]) {
+    assert.ok(patched.includes(marker), `entrypoint patch did not apply for ${marker}`);
+  }
+  fs.writeFileSync(script, patched, { mode: 0o755 });
+  return { root, data, nix, token, stubDir, opLog, script };
+}
+
+function run(h: Harness, extraEnv: Record<string, string> = {}): RunResult {
+  const r = spawnSync("/bin/sh", [h.script, "npm", "run", "start"], {
+    encoding: "utf8",
+    env: {
+      // A minimal env: the entrypoint sets its own PATH in the root branch, so the outer PATH
+      // only matters until then; keep the real one so `/bin/sh` and the stubs resolve.
+      PATH: process.env.PATH ?? "/usr/bin:/bin",
+      HOME: h.root,
+      OPLOG: h.opLog,
+      ...extraEnv,
+    },
+  });
+  const env = new Map<string, string>(
+    (r.stdout ?? "")
+      .split("\n")
+      .filter((l) => l.includes("="))
+      .map((l) => [l.slice(0, l.indexOf("=")), l.slice(l.indexOf("=") + 1)] as [string, string]),
+  );
+  const ops = fs.existsSync(h.opLog)
+    ? fs.readFileSync(h.opLog, "utf8").split("\n").filter((l) => l.trim() !== "")
+    : [];
+  return { status: r.status, stdout: r.stdout ?? "", stderr: r.stderr ?? "", ops, env };
+}
+
+/** True if some recorded op line contains ALL of the given fragments. */
+function opMatches(ops: string[], ...fragments: string[]): boolean {
+  return ops.some((op) => fragments.every((f) => op.includes(f)));
+}
+
+// ─── Group 1: portable (any uid) — the ownership MAP + env, from the op-log ──────────────
+
+describe("PRD #1493 M2: root-branch migration ownership map (portable, record-only)", () => {
+  it("token: a READ-ONLY kube mount is verified, NOT aborted (uid=0 gid=10001 mode=0440, worker-readable)", () => {
+    const h = makeHarness();
+    try {
+      fs.mkdirSync(h.data);
+      fs.mkdirSync(h.nix);
+      fs.writeFileSync(h.token, "join-token-body");
+      const r = run(h, { STUB_NOOP: "1", STUB_ROFS_TOKEN: h.token, STUB_TOKEN_POSTURE: "0 10001 440" });
+      assert.equal(r.status, 0, `read-only token must NOT abort the entrypoint (stderr: ${r.stderr})`);
+      assert.match(r.stderr, /read-only kube Secret .*worker-readable/, "must log the accepted read-only posture");
+      // The split still activates (we reached the drop's env dump).
+      assert.equal(r.env.get("UZI_UID_SPLIT"), "1", "the split must still activate after the read-only token path");
+    } finally {
+      fs.rmSync(h.root, { recursive: true, force: true });
+    }
+  });
+
+  it("token: FAILS CLOSED on a read-only mount whose posture is wrong (e.g. gid != 10001)", () => {
+    const h = makeHarness();
+    try {
+      fs.mkdirSync(h.data);
+      fs.mkdirSync(h.nix);
+      fs.writeFileSync(h.token, "join-token-body");
+      const r = run(h, { STUB_NOOP: "1", STUB_ROFS_TOKEN: h.token, STUB_TOKEN_POSTURE: "0 0 440" });
+      assert.notEqual(r.status, 0, "a wrong read-only posture must fail closed (non-zero exit)");
+      assert.match(r.stderr, /refusing to start \(posture:/, "must log the fail-closed refusal");
+    } finally {
+      fs.rmSync(h.root, { recursive: true, force: true });
+    }
+  });
+
+  it("token: the COMPOSE (writable) path keeps reclaim -> chmod 0400 -> hand-over unchanged", () => {
+    const h = makeHarness();
+    try {
+      fs.mkdirSync(h.data);
+      fs.mkdirSync(h.nix);
+      fs.writeFileSync(h.token, "join-token-body");
+      // STUB_ROFS_TOKEN unset -> `chown 0:0 token` succeeds -> the compose branch runs.
+      const r = run(h, { STUB_NOOP: "1" });
+      assert.equal(r.status, 0, `compose token path must succeed (stderr: ${r.stderr})`);
+      const reclaim = r.ops.findIndex((o) => o.startsWith("chown 0:0 ") && o.includes(h.token));
+      const chmod0400 = r.ops.findIndex((o) => o.startsWith("chmod 0400 ") && o.includes(h.token));
+      const handover = r.ops.findIndex((o) => o.startsWith("chown worker:worker ") && o.includes(h.token));
+      assert.ok(reclaim >= 0 && chmod0400 >= 0 && handover >= 0, "compose token needs reclaim + chmod 0400 + hand-over");
+      assert.ok(reclaim < chmod0400 && chmod0400 < handover, "order must be reclaim -> chmod 0400 -> hand-over");
+    } finally {
+      fs.rmSync(h.root, { recursive: true, force: true });
+    }
+  });
+
+  it("tmpdir: an ambient (pod) TMPDIR derives BOTH private tmpdirs beneath it and exports them", () => {
+    const h = makeHarness();
+    try {
+      fs.mkdirSync(h.data);
+      fs.mkdirSync(h.nix);
+      fs.writeFileSync(h.token, "t");
+      const workdir = path.join(h.data, "runner"); // the DinD-shared workdir the pod pre-sets
+      const r = run(h, { STUB_NOOP: "1", TMPDIR: workdir });
+      assert.equal(r.status, 0, `ambient-TMPDIR run must succeed (stderr: ${r.stderr})`);
+      // Both private tmpdirs are created BENEATH the ambient TMPDIR (bind sources resolve in
+      // the DinD-shared workdir), and the worker's is exported as TMPDIR across the drop.
+      assert.ok(opMatches(r.ops, "mkdir", `${workdir}/uzi-worker`, `${workdir}/uzi-runner`), "tmpdirs must derive beneath the ambient TMPDIR");
+      assert.equal(r.env.get("TMPDIR"), `${workdir}/uzi-worker`, "TMPDIR must be the derived worker tmp");
+      assert.equal(r.env.get("UZI_RUNNER_TMPDIR"), `${workdir}/uzi-runner`, "UZI_RUNNER_TMPDIR must be the derived runner tmp");
+    } finally {
+      fs.rmSync(h.root, { recursive: true, force: true });
+    }
+  });
+
+  it("tmpdir: with NO ambient TMPDIR (compose) the tmpdirs stay /tmp/uzi-worker + /tmp/uzi-runner", () => {
+    const h = makeHarness();
+    try {
+      fs.mkdirSync(h.data);
+      fs.mkdirSync(h.nix);
+      fs.writeFileSync(h.token, "t");
+      // STUB_NOOP so the /tmp targets are only RECORDED, never really created (never touch a
+      // live worker's /tmp/uzi-*). No TMPDIR in the env => the compose fallback.
+      const r = run(h, { STUB_NOOP: "1" });
+      assert.equal(r.status, 0, `compose tmpdir run must succeed (stderr: ${r.stderr})`);
+      assert.ok(opMatches(r.ops, "mkdir", "/tmp/uzi-worker", "/tmp/uzi-runner"), "compose tmpdirs must stay under /tmp");
+      assert.equal(r.env.get("TMPDIR"), "/tmp/uzi-worker", "compose TMPDIR is /tmp/uzi-worker");
+      assert.equal(r.env.get("UZI_RUNNER_TMPDIR"), "/tmp/uzi-runner", "compose runner tmp is /tmp/uzi-runner");
+    } finally {
+      fs.rmSync(h.root, { recursive: true, force: true });
+    }
+  });
+
+  it("sticky carve-out: the three parents get 3775 (setgid+group-write+STICKY), never 2775", () => {
+    const h = makeHarness();
+    try {
+      fs.mkdirSync(h.nix);
+      // Pre-create the parents so the every-boot carve-out's `[ -O ]` guard (owned by the
+      // effective uid) is satisfied AND the legacy-migration `[ -d ]` guard fires; STUB_NOOP
+      // means mkdir would not create them itself.
+      for (const d of ["runner", "agent-home", "provision"]) fs.mkdirSync(path.join(h.data, d), { recursive: true });
+      fs.writeFileSync(h.token, "t");
+      const r = run(h, { STUB_NOOP: "1" });
+      assert.equal(r.status, 0, `carve-out run must succeed (stderr: ${r.stderr})`);
+      for (const d of ["runner", "agent-home", "provision"]) {
+        assert.ok(opMatches(r.ops, "chmod 3775", `${h.data}/${d}`), `${d} parent must be chmod 3775 (sticky)`);
+      }
+      assert.ok(!r.ops.some((o) => o.startsWith("chmod 2775") && o.includes(`${h.data}/`)), "no carve-out parent may be plain 2775");
+    } finally {
+      fs.rmSync(h.root, { recursive: true, force: true });
+    }
+  });
+
+  it("PVC-root alignment RUNS on the k8s fsGroup fingerprint (setgid /nix), NO-OP on compose", () => {
+    // k8s: /nix carries the kubelet fsGroup setgid bit -> alignment reclaims + chmod 2775 +
+    // restores group 10001 on BOTH mount roots without touching content ownership.
+    const k = makeHarness();
+    try {
+      fs.mkdirSync(k.data);
+      fs.mkdirSync(k.nix);
+      fs.chmodSync(k.nix, 0o2755); // setgid: the fsGroup fingerprint
+      fs.writeFileSync(k.token, "t");
+      const r = run(k, { STUB_NOOP: "1" });
+      assert.equal(r.status, 0, `k8s alignment run must succeed (stderr: ${r.stderr})`);
+      for (const root of [k.nix, k.data]) {
+        const reclaim = r.ops.findIndex((o) => o === `chown 0:0 ${root}`);
+        const chmod = r.ops.findIndex((o) => o === `chmod 2775 ${root}`);
+        assert.ok(reclaim >= 0 && chmod >= 0 && reclaim < chmod, `${root} must be reclaimed then chmod 2775 (setgid+group-rwx)`);
+      }
+      assert.ok(opMatches(r.ops, "chown runner:10001", k.nix), "/nix root group restored to the fsGroup (10001), owner preserved");
+      assert.ok(opMatches(r.ops, "chown worker:10001", k.data), "/data root group restored to the fsGroup (10001)");
+    } finally {
+      fs.rmSync(k.root, { recursive: true, force: true });
+    }
+
+    const c = makeHarness();
+    try {
+      fs.mkdirSync(c.data);
+      fs.mkdirSync(c.nix);
+      // CLEAR any setgid the sandbox inherited from a setgid os.tmpdir() (the gate's TMPDIR is
+      // /data/runner at 2777): a compose /nix mount root carries NO setgid (the image bakes it
+      // with `chmod -R a+rX`), so the fingerprint must be false and the alignment a no-op.
+      fs.chmodSync(c.nix, 0o755);
+      fs.writeFileSync(c.token, "t");
+      const r = run(c, { STUB_NOOP: "1" });
+      assert.equal(r.status, 0, `compose run must succeed (stderr: ${r.stderr})`);
+      assert.ok(!r.ops.some((o) => o === `chmod 2775 ${c.nix}` || o === `chmod 2775 ${c.data}`), "compose must NOT run the PVC-root alignment (byte-for-byte compose behaviour)");
+    } finally {
+      fs.rmSync(c.root, { recursive: true, force: true });
+    }
+  });
+
+  it("legacy /data map: run HOME + codex-data stay worker:runner, descendants -> runner, session-store UNTOUCHED", () => {
+    const h = makeHarness();
+    try {
+      // A populated legacy single-uid volume: everything worker-created, one run HOME with a
+      // Codex resume store + Claude SDK state, plus a plain-lane clone and provision state.
+      fs.mkdirSync(h.nix);
+      const runHome = path.join(h.data, "agent-home", "run-legacy");
+      fs.mkdirSync(path.join(runHome, "codex-data", "epoch-1"), { recursive: true });
+      fs.mkdirSync(path.join(runHome, "codex-session-store"), { recursive: true });
+      fs.writeFileSync(path.join(runHome, "codex-session-store", "session.json"), "resume");
+      fs.mkdirSync(path.join(runHome, ".claude", "projects"), { recursive: true });
+      fs.writeFileSync(path.join(runHome, ".claude.json"), "sdk-config");
+      fs.mkdirSync(path.join(h.data, "runner", "clone-1"), { recursive: true });
+      fs.writeFileSync(path.join(h.data, "runner", "clone-1", "work.txt"), "unpublished");
+      fs.mkdirSync(path.join(h.data, "provision"), { recursive: true });
+      fs.writeFileSync(path.join(h.data, "provision", "cache"), "pkgs");
+      fs.writeFileSync(h.token, "t");
+
+      const r = run(h, { STUB_NOOP: "1" });
+      assert.equal(r.status, 0, `legacy migration run must succeed (stderr: ${r.stderr})`);
+
+      // Run HOME root + codex-data root STAY worker-owned, gid runner (a non-recursive chgrp,
+      // NOT a give-away `chown -R runner:runner`, so ensureCodexSharedDirectory still validates).
+      assert.ok(r.ops.some((o) => o === `chown worker:runner ${runHome}`), "run HOME root -> worker:runner (non-recursive)");
+      assert.ok(r.ops.some((o) => o === `chown worker:runner ${runHome}/codex-data`), "codex-data root -> worker:runner (non-recursive)");
+      assert.ok(!r.ops.includes(`chown -R runner:runner ${runHome}`), "the run HOME root is never a give-away chown -R target");
+      // Provider epoch trees + ordinary SDK descendants -> runner-owned.
+      assert.ok(opMatches(r.ops, "chown -R runner:runner", `${runHome}/codex-data/epoch-1`), "epoch tree -> runner");
+      assert.ok(opMatches(r.ops, "chown -R runner:runner", `${runHome}/.claude`), "the Claude SDK .claude tree -> runner");
+      assert.ok(opMatches(r.ops, "chown -R runner:runner", `${runHome}/.claude.json`), "the Claude SDK config -> runner");
+      // Plain-lane clone + provision content -> runner (preserved, not purged).
+      assert.ok(opMatches(r.ops, "chown -R runner:runner", `${h.data}/runner/clone-1`), "the retained clone -> runner");
+      assert.ok(opMatches(r.ops, "chown -R runner:runner", `${h.data}/provision/cache`), "provision content -> runner");
+      // codex-session-store is NEVER a chown/chmod target.
+      assert.ok(!r.ops.some((o) => o.includes("codex-session-store")), "codex-session-store must never be touched by the migration");
+      // Nothing was purged (no rm is issued; content survives — proven byte-for-byte below).
+      assert.equal(fs.readFileSync(path.join(runHome, "codex-session-store", "session.json"), "utf8"), "resume", "session store content survives");
+      assert.equal(fs.readFileSync(path.join(h.data, "runner", "clone-1", "work.txt"), "utf8"), "unpublished", "clone content survives byte-for-byte");
+      assert.equal(fs.readFileSync(path.join(runHome, ".claude.json"), "utf8"), "sdk-config", "SDK config survives");
+
+      // The one-time sentinel is written.
+      assert.ok(opMatches(r.ops, "chown worker:worker", `${h.data}/.uzi-legacy-split-migrated`) || fs.existsSync(path.join(h.data, ".uzi-legacy-split-migrated")), "the legacy migration writes its sentinel");
+    } finally {
+      fs.rmSync(h.root, { recursive: true, force: true });
+    }
+  });
+
+  it("legacy migration is SENTINEL-GATED: a second boot does not re-run the ownership walk", () => {
+    const h = makeHarness();
+    try {
+      fs.mkdirSync(h.nix);
+      fs.mkdirSync(path.join(h.data, "agent-home", "run-x"), { recursive: true });
+      fs.writeFileSync(h.token, "t");
+      // Pre-place the sentinel: the walk must be skipped entirely.
+      fs.writeFileSync(path.join(h.data, ".uzi-legacy-split-migrated"), "");
+      const r = run(h, { STUB_NOOP: "1" });
+      assert.equal(r.status, 0, `sentinel-gated run must succeed (stderr: ${r.stderr})`);
+      assert.ok(!opMatches(r.ops, "chown worker:runner", `${h.data}/agent-home/run-x`), "the run HOME walk must be skipped when the sentinel exists");
+      assert.doesNotMatch(r.stderr, /one-time ownership-aware migration/, "the migration banner must not print on a sentinel-gated boot");
+    } finally {
+      fs.rmSync(h.root, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── Group 2: REAL ownership (gated: run AS WORKER_UID with WORKER+RUNNER membership) ─────
+
+const uidNow = typeof process.getuid === "function" ? process.getuid() : undefined;
+const memberGroups = typeof process.getgroups === "function" ? [...new Set(process.getgroups())] : [];
+const GROUP2_SKIP =
+  uidNow === WORKER_UID && memberGroups.includes(WORKER_UID) && memberGroups.includes(RUNNER_UID)
+    ? false
+    : "requires running as WORKER_UID with WORKER_UID + RUNNER_UID group membership";
+
+describe("PRD #1493 M2: legacy run HOME survives migration and still validates (real ownership)", { skip: GROUP2_SKIP }, () => {
+  it("migrated run HOME + codex-data validate via ensureCodexSharedDirectory; session store stays worker-private", async () => {
+    const h = makeHarness();
+    try {
+      fs.mkdirSync(h.nix);
+      // A populated legacy run HOME, all worker:worker (== the test uid's own uid+primary gid
+      // under the gate), mirroring a single-uid volume after migrate_tree.
+      const runHome = path.join(h.data, "agent-home", "run-legacy");
+      fs.mkdirSync(path.join(runHome, "codex-data"), { recursive: true });
+      fs.mkdirSync(path.join(runHome, "codex-session-store"), { recursive: true });
+      fs.chmodSync(path.join(runHome, "codex-session-store"), 0o700);
+      fs.writeFileSync(path.join(runHome, "codex-session-store", "session.json"), "resume-state");
+      fs.chmodSync(path.join(runHome, "codex-session-store", "session.json"), 0o600);
+      fs.mkdirSync(path.join(runHome, ".claude", "projects"), { recursive: true });
+      fs.writeFileSync(path.join(runHome, ".claude", "projects", "p.json"), "history");
+      fs.writeFileSync(h.token, "t");
+
+      // Real (best-effort) ops: `chown worker:runner` is a chgrp to a member group (succeeds);
+      // a give-away `chown -R runner:runner` EPERMs under uid 10001 and is recorded only.
+      const r = run(h, {});
+      assert.equal(r.status, 0, `real migration run must succeed (stderr: ${r.stderr})`);
+
+      // (a) the run HOME + codex-data are now worker:runner and PASS the production validator
+      // (it force-asserts 2770 and rejects any owner/group mismatch).
+      await ensureCodexSharedDirectory(runHome);
+      await ensureCodexSharedDirectory(path.join(runHome, "codex-data"));
+      const home = await fsp.lstat(runHome);
+      assert.equal(home.uid, WORKER_UID, "run HOME owner stays worker");
+      assert.equal(home.gid, RUNNER_UID, "run HOME group is runner");
+
+      // (b) resume state is byte-identical.
+      assert.equal(fs.readFileSync(path.join(runHome, "codex-session-store", "session.json"), "utf8"), "resume-state", "session store bytes intact");
+      assert.equal(fs.readFileSync(path.join(runHome, ".claude", "projects", "p.json"), "utf8"), "history", "SDK resume state intact");
+
+      // (c) codex-session-store is UNTOUCHED: still worker:worker, dir 0700, file 0600 — so a
+      // non-owner non-group process (uid 10003, in neither the owner nor group `worker`) is
+      // DAC-denied read/modify. Expressed as a mode/ownership check (the gate has no uid 10003).
+      const store = await fsp.lstat(path.join(runHome, "codex-session-store"));
+      assert.equal(store.uid, WORKER_UID, "session store owner stays worker");
+      assert.equal(store.gid, WORKER_UID, "session store group stays worker (NOT runner)");
+      assert.equal(store.mode & MODE_MASK, 0o700, "session store dir stays 0700 (worker-private)");
+      const storeFile = await fsp.lstat(path.join(runHome, "codex-session-store", "session.json"));
+      assert.equal(storeFile.mode & MODE_MASK, 0o600, "session store file stays 0600");
+
+      // (d) the migration RE-OWNS the ordinary SDK HOME state to the runner (uid 10002) that
+      // runs the SDK under the split, so the runner can read AND update it. Under the gate uid
+      // 10001 cannot GIVE AWAY ownership, so the effected transition is asserted from the
+      // recorded intent (a mode/ownership statement about what the root-window migration does).
+      assert.ok(opMatches(r.ops, "chown -R runner:runner", `${runHome}/.claude`), "SDK HOME state is re-owned to the runner");
+    } finally {
+      fs.rmSync(h.root, { recursive: true, force: true });
+    }
+  });
+});
