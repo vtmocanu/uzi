@@ -702,7 +702,12 @@ describe("PRD #1493 M2: legacy run HOME survives migration and still validates (
 
       // Real (best-effort) ops: `chown worker:runner` is a chgrp to a member group (succeeds);
       // a give-away `chown -R runner:runner` EPERMs under uid 10001 and is recorded only.
-      const r = run(h, {});
+      // Point the ambient TMPDIR at this test's own mkdtemp root so the (a3) tmpdir block's
+      // REAL `rm -rf`/`mkdir` land under h.root/ambient-tmp — NEVER a real `rm -rf /tmp/uzi-*`
+      // against a live worker's scratch tmp when the gate runs as WORKER_UID (this test has no
+      // STUB_NOOP). It exercises the identical rm/reclaim/chmod lines; only the path differs, and
+      // nothing here asserts on the tmpdir, so the run-HOME assertions below are unaffected.
+      const r = run(h, { TMPDIR: path.join(h.root, "ambient-tmp") });
       assert.equal(r.status, 0, `real migration run must succeed (stderr: ${r.stderr})`);
 
       // (a) the run HOME + codex-data are now worker:runner and PASS the production validator
