@@ -220,21 +220,24 @@ func TestFleetCapacity(t *testing.T) {
 		}
 	}
 	tests := []struct {
-		name          string
-		healthEnabled bool
-		rows          []store.ListOwnersWaitingNoCapacityRow
-		wantSev       string
-		wantSubstr    string
+		name       string
+		health     healthDetectorState
+		rows       []store.ListOwnersWaitingNoCapacityRow
+		wantSev    string
+		wantSubstr string
 	}{
-		{"unknown when health disabled", false, nil, sevUnknown, "run-health detector is disabled"},
-		{"ok when nobody waiting", true, nil, sevOK, "has a usable worker"},
-		{"ok under the danger window", true, []store.ListOwnersWaitingNoCapacityRow{waitRow(2 * time.Minute)}, sevOK, "transient window"},
-		{"danger past the window", true, []store.ListOwnersWaitingNoCapacityRow{waitRow(7 * time.Minute)}, sevDanger, "no usable worker"},
+		{"unknown when health disabled", healthDetectorDisabled, nil, sevUnknown, "run-health detector is disabled"},
+		// Read-failed: rows that WOULD be danger if queried; asserting unknown proves the
+		// check does not query the run tables when the kill-switch state is indeterminate.
+		{"unknown when health read failed", healthDetectorUnknown, []store.ListOwnersWaitingNoCapacityRow{waitRow(7 * time.Minute)}, sevUnknown, "could not be determined"},
+		{"ok when nobody waiting", healthDetectorEnabled, nil, sevOK, "has a usable worker"},
+		{"ok under the danger window", healthDetectorEnabled, []store.ListOwnersWaitingNoCapacityRow{waitRow(2 * time.Minute)}, sevOK, "transient window"},
+		{"danger past the window", healthDetectorEnabled, []store.ListOwnersWaitingNoCapacityRow{waitRow(7 * time.Minute)}, sevDanger, "no usable worker"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			svc := newSvc(&fakeStore{capacityRows: tc.rows}, &fakeSettings{})
-			c := svc.checkFleetCapacity(context.Background(), fixedNow, tc.healthEnabled)
+			c := svc.checkFleetCapacity(context.Background(), fixedNow, tc.health)
 			if c.Severity != tc.wantSev {
 				t.Fatalf("severity = %q, want %q (summary %q)", c.Severity, tc.wantSev, c.Summary)
 			}
@@ -286,22 +289,25 @@ func TestQueueWaiting(t *testing.T) {
 		return pgtype.Timestamptz{Time: fixedNow.Add(-ago), Valid: true}
 	}
 	tests := []struct {
-		name          string
-		healthEnabled bool
-		oldest        pgtype.Timestamptz
-		wantSev       string
-		wantSubstr    string
+		name       string
+		health     healthDetectorState
+		oldest     pgtype.Timestamptz
+		wantSev    string
+		wantSubstr string
 	}{
-		{"unknown when health disabled", false, pgtype.Timestamptz{}, sevUnknown, "run-health detector is disabled"},
-		{"ok when nothing waiting", true, pgtype.Timestamptz{}, sevOK, "No run is waiting"},
-		{"ok under the warn band", true, at(3 * time.Minute), sevOK, "longer than 10 minutes"},
-		{"warn at 10m", true, at(12 * time.Minute), sevWarn, "waiting for a worker for 12m"},
-		{"danger at 30m", true, at(45 * time.Minute), sevDanger, "waiting for a worker for 45m"},
+		{"unknown when health disabled", healthDetectorDisabled, pgtype.Timestamptz{}, sevUnknown, "run-health detector is disabled"},
+		// Read-failed: a run old enough to be danger if queried; asserting unknown proves the
+		// check does not query the run tables when the kill-switch state is indeterminate.
+		{"unknown when health read failed", healthDetectorUnknown, at(45 * time.Minute), sevUnknown, "could not be determined"},
+		{"ok when nothing waiting", healthDetectorEnabled, pgtype.Timestamptz{}, sevOK, "No run is waiting"},
+		{"ok under the warn band", healthDetectorEnabled, at(3 * time.Minute), sevOK, "longer than 10 minutes"},
+		{"warn at 10m", healthDetectorEnabled, at(12 * time.Minute), sevWarn, "waiting for a worker for 12m"},
+		{"danger at 30m", healthDetectorEnabled, at(45 * time.Minute), sevDanger, "waiting for a worker for 45m"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			svc := newSvc(&fakeStore{waiting: tc.oldest}, &fakeSettings{})
-			c := svc.checkQueueWaiting(context.Background(), fixedNow, tc.healthEnabled)
+			c := svc.checkQueueWaiting(context.Background(), fixedNow, tc.health)
 			if c.Severity != tc.wantSev {
 				t.Fatalf("severity = %q, want %q (summary %q)", c.Severity, tc.wantSev, c.Summary)
 			}
@@ -610,6 +616,100 @@ func TestEvaluateHealthDisabled(t *testing.T) {
 	// unknown ranks as warn for the overall rollup.
 	if doc.Status != sevWarn {
 		t.Fatalf("overall status = %q, want warn (unknown ranks as warn)", doc.Status)
+	}
+}
+
+// TestEvaluateHealthReadError covers Fix 1: when the run-health kill switch read ERRORS,
+// the two run-health-derived checks must degrade to `unknown` with the distinct read-error
+// summary — never default to enabled and query the run tables for a green verdict (D6). If
+// the degrade were removed (read error swallowed as enabled=true), both checks would query
+// the empty fake store and read `ok`, so these assertions fail exactly when the fix is gone.
+func TestEvaluateHealthReadError(t *testing.T) {
+	svc := New(Config{
+		Store:               &fakeStore{},
+		Settings:            &fakeSettings{healthErr: errors.New("settings read failed"), releaseEnabled: true, release: settings.ReleaseStatus{LatestTag: "v0.84.0"}},
+		SlackState:          func() string { return slacksvc.StateDisabled },
+		Now:                 func() time.Time { return fixedNow },
+		HostedWorkerVersion: "",
+		RunningVersion:      "0.84.0",
+		CustodyHoldLimit:    3,
+	})
+	svc.probeDB = func(context.Context) dbStat {
+		return dbStat{pingDur: time.Millisecond, acquiredConns: 1, maxConns: 20, schemaAtHead: true}
+	}
+	doc, err := svc.Evaluate(context.Background())
+	if err != nil {
+		t.Fatalf("Evaluate: %v", err)
+	}
+	const wantSummary = "Run-health detection state could not be determined."
+	for _, id := range []string{"fleet.capacity", "queue.waiting"} {
+		sev, summary := check(t, doc, id)
+		if sev != sevUnknown {
+			t.Fatalf("%s = %q (%q), want unknown when the HealthEnabled read errors", id, sev, summary)
+		}
+		if summary != wantSummary {
+			t.Fatalf("%s summary = %q, want the distinct read-error summary %q", id, summary, wantSummary)
+		}
+	}
+	// unknown ranks as warn for the overall rollup.
+	if doc.Status != sevWarn {
+		t.Fatalf("overall status = %q, want warn (unknown ranks as warn)", doc.Status)
+	}
+}
+
+// TestDegradeUnknownOnQueryError covers Fix 2: a per-check query/read failure must degrade
+// that check to `unknown` with the degradeUnknown summary, never let a nil result read
+// green. Each subtest injects a non-nil error into the fake and asserts the check emits
+// `unknown` + the shared summary; if the degrade path were removed, each would fall through
+// to its ok verdict (queue.undispatched/release.check status especially would read green).
+func TestDegradeUnknownOnQueryError(t *testing.T) {
+	const degradeSummary = "This signal is temporarily unavailable."
+	boom := errors.New("query failed")
+
+	t.Run("fleet.capacity", func(t *testing.T) {
+		svc := newSvc(&fakeStore{capacityErr: boom}, &fakeSettings{})
+		assertUnknown(t, svc.checkFleetCapacity(context.Background(), fixedNow, healthDetectorEnabled), degradeSummary)
+	})
+	t.Run("queue.waiting", func(t *testing.T) {
+		svc := newSvc(&fakeStore{waitingErr: boom}, &fakeSettings{})
+		assertUnknown(t, svc.checkQueueWaiting(context.Background(), fixedNow, healthDetectorEnabled), degradeSummary)
+	})
+	t.Run("queue.undispatched", func(t *testing.T) {
+		svc := newSvc(&fakeStore{undispatchErr: boom}, &fakeSettings{})
+		assertUnknown(t, svc.checkQueueUndispatched(context.Background(), fixedNow), degradeSummary)
+	})
+	t.Run("schedules.paused", func(t *testing.T) {
+		svc := newSvc(&fakeStore{pausedErr: boom}, &fakeSettings{})
+		assertUnknown(t, svc.checkSchedulesPaused(context.Background(), fixedNow), degradeSummary)
+	})
+	t.Run("board.drift", func(t *testing.T) {
+		svc := newSvc(&fakeStore{gaveUpErr: boom}, &fakeSettings{})
+		assertUnknown(t, svc.checkBoardDrift(context.Background(), fixedNow), degradeSummary)
+	})
+	t.Run("custody.holds", func(t *testing.T) {
+		// CustodyHoldLimit is 3 (via newSvc), so the na guard does not fire first.
+		svc := newSvc(&fakeStore{custodyErr: boom}, &fakeSettings{})
+		assertUnknown(t, svc.checkCustodyHolds(context.Background()), degradeSummary)
+	})
+	t.Run("release.check enabled read", func(t *testing.T) {
+		svc := newSvc(&fakeStore{}, &fakeSettings{relEnabledErr: boom})
+		assertUnknown(t, svc.checkReleaseCheck(context.Background(), fixedNow), degradeSummary)
+	})
+	t.Run("release.check status read", func(t *testing.T) {
+		svc := newSvc(&fakeStore{}, &fakeSettings{releaseEnabled: true, relStatusErr: boom})
+		assertUnknown(t, svc.checkReleaseCheck(context.Background(), fixedNow), degradeSummary)
+	})
+}
+
+// assertUnknown fails unless the check emits severity `unknown` with the exact summary
+// (text, not a bare count).
+func assertUnknown(t *testing.T, c apitypes.HealthCheckDTO, wantSummary string) {
+	t.Helper()
+	if c.Severity != sevUnknown {
+		t.Fatalf("severity = %q, want unknown (summary %q)", c.Severity, c.Summary)
+	}
+	if c.Summary != wantSummary {
+		t.Fatalf("summary = %q, want %q", c.Summary, wantSummary)
 	}
 }
 
