@@ -38,6 +38,13 @@ async function statOf(p: string): Promise<{ uid: number; gid: number; mode: numb
   return { uid: st.uid, gid: st.gid, mode: st.mode & MODE_MASK };
 }
 
+/** The (dev, ino) identity of `p` without following a final symlink, used to prove the
+ *  destructive recovery RECREATED the live path (inode changed) rather than adopting it. */
+async function inodeOf(p: string): Promise<{ dev: number; ino: number }> {
+  const st = await fs.lstat(p);
+  return { dev: st.dev, ino: st.ino };
+}
+
 /** A fresh, canonical (realpath'd) temp directory the caller owns; cleaned up by the caller. */
 async function freshTmp(): Promise<string> {
   return fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "codex-shared-dir-")));
@@ -129,6 +136,131 @@ describe("Issue #1492: ensureCodexSharedDirectory create-only group repair (port
         ensureCodexSharedDirectory(link, { uid, gid: gB }),
         "a final-component symlink is refused by the O_NOFOLLOW open",
       );
+    } finally {
+      await fs.rm(base, { recursive: true, force: true });
+    }
+  });
+
+  // ─── issue #1495 m2: opt-in destructive recovery of a pre-existing worker-group parent ───
+
+  it("opt-in RECREATES a pre-existing worker-owned wrong-gid dir (removal+recreation, not chgrp)", async () => {
+    const base = await freshTmp();
+    try {
+      const parent = path.join(base, "agent-home");
+      await makeSetgidParent(parent, uid, gA); // setgid, group A: a fresh child inherits gid A
+      const child = path.join(parent, "codex-advice-data");
+      // Create the child OUTSIDE the helper so this call does NOT "create" it: it inherits gid A
+      // (the "wrong" disposable gid) and owner = test uid, i.e. the pre-rc.2 worker:worker parent.
+      await fs.mkdir(child, { mode: 0o2770 });
+      const originalInode = await inodeOf(child);
+
+      await ensureCodexSharedDirectory(child, { uid, gid: gB }, { recreateDisposableWorkerGroupDir: true, recoverGid: gA });
+
+      const st = await statOf(child);
+      assert.equal(st.uid, uid, "owner is the worker");
+      assert.equal(st.gid, gB, "the recreated dir is grouped the expected gid (repaired after fresh create)");
+      assert.equal(st.mode, 0o2770, "mode is 2770 (setgid + rwxrwx---)");
+      const newInode = await inodeOf(child);
+      assert.notEqual(
+        `${newInode.dev}:${newInode.ino}`,
+        `${originalInode.dev}:${originalInode.ino}`,
+        "the LIVE-path inode CHANGED — the original was renamed out and a fresh dir created, never chgrp'd/adopted",
+      );
+    } finally {
+      await fs.rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it("opt-in NEVER adopts pre-existing content (a marker file does not survive into the live path)", async () => {
+    const base = await freshTmp();
+    try {
+      const parent = path.join(base, "agent-home");
+      await makeSetgidParent(parent, uid, gA);
+      const child = path.join(parent, "codex-advice-cwd");
+      await fs.mkdir(child, { mode: 0o2770 });
+      const marker = path.join(child, "leftover.txt");
+      await fs.writeFile(marker, "pre-existing content that must NOT be adopted");
+
+      await ensureCodexSharedDirectory(child, { uid, gid: gB }, { recreateDisposableWorkerGroupDir: true, recoverGid: gA });
+
+      // The content was renamed OUT with the old inode and discarded; the LIVE path is fresh.
+      // (Removal of the tombstone is best-effort, so we assert only that the marker is absent
+      // from the LIVE path, not that the tombstone is gone.)
+      await assert.rejects(
+        fs.access(marker),
+        "the pre-existing marker is absent from the recreated live path (content never adopted)",
+      );
+      const entries = await fs.readdir(child);
+      assert.equal(entries.length, 0, "the recreated live path is empty (fresh dir, no adopted content)");
+    } finally {
+      await fs.rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it("opt-in still REJECTS a dir whose gid is NOT the recoverGid (recovery does not fire)", async () => {
+    const base = await freshTmp();
+    try {
+      const parent = path.join(base, "agent-home");
+      await makeSetgidParent(parent, uid, gA); // child inherits gid A
+      const child = path.join(parent, "codex-advice-data");
+      await fs.mkdir(child, { mode: 0o2770 });
+      // recoverGid gB, but the pre-existing dir is gid A ⇒ gA !== recoverGid ⇒ recovery is NOT
+      // triggered, and the strict gid check rejects the EEXISTing mismatch as before.
+      await assert.rejects(
+        ensureCodexSharedDirectory(child, { uid, gid: gB }, { recreateDisposableWorkerGroupDir: true, recoverGid: gB }),
+        /unexpected owner or group/,
+        "an EEXISTing dir whose gid is not the recoverGid is rejected, not recovered",
+      );
+    } finally {
+      await fs.rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it("opt-in still REJECTS a final-component symlink (O_NOFOLLOW)", async () => {
+    const base = await freshTmp();
+    try {
+      const parent = path.join(base, "agent-home");
+      await makeSetgidParent(parent, uid, gA);
+      const real = path.join(parent, "real");
+      await fs.mkdir(real, { mode: 0o2770 });
+      const link = path.join(parent, "codex-advice-data");
+      await fs.symlink(real, link);
+      await assert.rejects(
+        ensureCodexSharedDirectory(link, { uid, gid: gB }, { recreateDisposableWorkerGroupDir: true, recoverGid: gA }),
+        "a final-component symlink is refused by the O_NOFOLLOW open even under the opt-in",
+      );
+    } finally {
+      await fs.rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it("concurrent opt-in recovery is serialized and safe (two callers, one live child, no tombstone leak)", async () => {
+    const base = await freshTmp();
+    try {
+      const parent = path.join(base, "agent-home");
+      await makeSetgidParent(parent, uid, gA);
+      const child = path.join(parent, "codex-advice-data");
+      await fs.mkdir(child, { mode: 0o2770 }); // pre-existing worker:gA, the "wrong" gid
+
+      // Two overlapping opt-in calls on the SAME path. A NON-serialized impl risks the second
+      // caller re-renaming the first's freshly-recreated (healthy worker:gB) dir out of the live
+      // path; per-path serialization makes the second RE-READ state and no-op through to strict
+      // validation instead.
+      await Promise.all([
+        ensureCodexSharedDirectory(child, { uid, gid: gB }, { recreateDisposableWorkerGroupDir: true, recoverGid: gA }),
+        ensureCodexSharedDirectory(child, { uid, gid: gB }, { recreateDisposableWorkerGroupDir: true, recoverGid: gA }),
+      ]);
+
+      const st = await statOf(child);
+      assert.equal(st.uid, uid, "owner is the worker");
+      assert.equal(st.gid, gB, "final dir is grouped the expected gid");
+      assert.equal(st.mode, 0o2770, "final dir mode is 2770");
+
+      const entries = await fs.readdir(parent);
+      const liveChildren = entries.filter((e) => e === "codex-advice-data");
+      assert.equal(liveChildren.length, 1, "exactly one live child directory named as expected");
+      const tombstones = entries.filter((e) => e.includes(".uzi-tomb-"));
+      assert.equal(tombstones.length, 0, "no leftover tombstone sibling on the happy path");
     } finally {
       await fs.rm(base, { recursive: true, force: true });
     }
@@ -245,6 +377,97 @@ describe("Issue #1492: production paths repair worker-inherited dirs to RUNNER_U
         assert.equal(st.gid, RUNNER_UID, `${name} was repaired from gid worker to gid runner`);
         assert.equal(st.mode, 0o2770, `${name} mode is 2770`);
       }
+    } finally {
+      await fs.rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it("advice roots: PRE-EXISTING worker:worker parents are RECOVERED (renamed out + recreated worker:runner) — issue #1495 m2", async () => {
+    const base = await freshTmp();
+    try {
+      // homeRoot is the worker's shared SDK home (sdkHomeRoot), setgid group-owned worker (10001).
+      const homeRoot = path.join(base, "agent-home");
+      await makeSetgidParent(homeRoot, WORKER_UID, WORKER_UID);
+
+      // Pre-create the two advice PARENTS BEFORE the seam runs, so they EEXIST as worker:worker
+      // (gid inherited from the setgid worker homeRoot) — the pre-rc.2 parents that survive a
+      // worker roll on the RWO PVC. The seam must RECOVER them, not throw.
+      const dataParent = path.join(homeRoot, "codex-advice-data");
+      const cwdParent = path.join(homeRoot, "codex-advice-cwd");
+      await fs.mkdir(dataParent, { mode: 0o2770 });
+      await fs.mkdir(cwdParent, { mode: 0o2770 });
+      const originalInodes = {
+        "codex-advice-data": await inodeOf(dataParent),
+        "codex-advice-cwd": await inodeOf(cwdParent),
+      } as const;
+      // Confirm the pre-condition: both are worker:worker (the "wrong" disposable gid).
+      for (const name of ["codex-advice-data", "codex-advice-cwd"]) {
+        const st = await statOf(path.join(homeRoot, name));
+        assert.equal(st.gid, WORKER_UID, `${name} starts group-owned worker (pre-rc.2 shape)`);
+      }
+
+      const seam = makeProductionLaunchAdviceRoot(homeRoot, "subscription");
+      // Same invalid-envKey spec as the advice repair test: the seam creates/recovers the advice
+      // parents BEFORE launchCodexRoot, and the invalid envKey forces an early launch failure in
+      // BOTH modes (single-uid CodexUnsupportedProfileError, split fails the envKey allowlist).
+      const spec: CodexAdviceLaunchSpec = {
+        kind: "advice",
+        label: "judge",
+        provider: { name: "openai", baseUrl: "https://api.openai.com/v1", envKey: "invalid-env-key", model: "gpt-x" },
+        model: "gpt-x",
+      };
+
+      let outcome: "resolved" | Error;
+      try {
+        const handle = await seam(spec);
+        await handle.dispose().catch(() => undefined); // guard: never leave a real root live
+        outcome = "resolved";
+      } catch (e) {
+        outcome = e instanceof Error ? e : new Error(String(e));
+      }
+      assert.notEqual(outcome, "resolved", "the advice seam must NOT resolve to a real provider launch");
+      const err = outcome as Error;
+      assert.ok(
+        err instanceof CodexUnsupportedProfileError || /provider envKey is invalid or reserved/.test(err.message),
+        `unexpected advice-launch failure class: ${err.message}`,
+      );
+
+      for (const name of ["codex-advice-data", "codex-advice-cwd"] as const) {
+        const p = path.join(homeRoot, name);
+        const st = await statOf(p);
+        assert.equal(st.uid, WORKER_UID, `${name} owner is worker`);
+        assert.equal(st.gid, RUNNER_UID, `${name} was recovered from gid worker to gid runner`);
+        assert.equal(st.mode, 0o2770, `${name} mode is 2770`);
+        const newInode = await inodeOf(p);
+        assert.notEqual(
+          `${newInode.dev}:${newInode.ino}`,
+          `${originalInodes[name].dev}:${originalInodes[name].ino}`,
+          `${name} LIVE-path inode CHANGED — the pre-existing parent was renamed out and recreated fresh`,
+        );
+      }
+    } finally {
+      await fs.rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it("run-home: a PRE-EXISTING worker:worker run HOME stays REJECTED (no opt-in; protects resume state) — issue #1495 m2", async () => {
+    const base = await freshTmp();
+    try {
+      // Simulate the fsGroup:10001 agent-home: setgid, group-owned worker (10001).
+      const agentHome = path.join(base, "agent-home");
+      await makeSetgidParent(agentHome, WORKER_UID, WORKER_UID);
+      const runHome = path.join(agentHome, "run-preexisting"); // == sdkHomeRoot/<runId>
+      // Pre-create the run HOME as worker:worker (gid inherited), as if left by a prior worker.
+      // Unlike the two disposable advice parents, prepareCodexRunHome does NOT opt into recovery
+      // (the run HOME holds codex-session-store resume state), so it MUST reject, never recreate.
+      await fs.mkdir(runHome, { mode: 0o2770 });
+      await assert.rejects(
+        prepareCodexRunHome(runHome),
+        /unexpected owner or group/,
+        "a pre-existing wrong-gid run HOME is REJECTED, never destructively recovered",
+      );
+      // The tamper variant (revalidation after a chgrp) is additionally covered by the m1
+      // revalidation test above.
     } finally {
       await fs.rm(base, { recursive: true, force: true });
     }

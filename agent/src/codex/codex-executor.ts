@@ -648,21 +648,33 @@ function buildAdviceAuthConfig(
  * `homeRoot` is the WORKER's shared SDK home root (`sdkHomeRoot` in main.ts) — the same
  * setgid, runner-group-accessible tree {@link prepareCodexRunHome} prepares per run, reused
  * here as a stable parent so a fresh per-call child directory inherits the correct
- * ownership/group without a dedicated per-advice-call preparation step.
+ * ownership/group without a dedicated per-advice-call preparation step. The two disposable
+ * advice PARENTS (`codex-advice-data` / `codex-advice-cwd`) survive worker rolls on the RWO
+ * PVC, so they opt into {@link ensureCodexSharedDirectory}'s destructive recovery: a
+ * pre-existing worker:worker parent left by pre-rc.2 code is renamed OUT and recreated fresh
+ * as worker:runner (never adopted), so a rolled worker starts clean instead of throwing.
  */
 export function makeProductionLaunchAdviceRoot(homeRoot: string, authMode: CodexAppServerAuthMode): LaunchAdviceRootSeam {
   return async (spec) => {
     const id = randomUUID();
     const dataParent = path.join(homeRoot, "codex-advice-data");
     const cwdParent = path.join(homeRoot, "codex-advice-cwd");
-    await ensureCodexSharedDirectory(dataParent);
-    await ensureCodexSharedDirectory(cwdParent);
+    // These two long-lived advice PARENTS are disposable (only per-call UUID leaves live under
+    // them) and survive worker rolls on the RWO PVC. A parent left by pre-rc.2 code as
+    // worker:worker (gid WORKER_UID) would EEXIST and be REJECTED by the strict gid check, so
+    // they opt in to the narrowly-scoped destructive recovery: a pre-existing worker-group
+    // parent is atomically renamed OUT of the live path and recreated FRESH (worker:runner
+    // 2770) — NEVER chgrp'd/adopted. The per-call UUID leaves below stay plain strict calls.
+    await ensureCodexSharedDirectory(dataParent, undefined, { recreateDisposableWorkerGroupDir: true });
+    await ensureCodexSharedDirectory(cwdParent, undefined, { recreateDisposableWorkerGroupDir: true });
     const ownedDataRoot = path.join(dataParent, id);
     const cwd = path.join(cwdParent, id);
     // The launcher's own deriveOwnedTrees creates ownedDataRoot itself (runner-owned, fresh
     // per call); cwd is only the isolated, EXPLICITLY-untrusted project dir the advice thread
     // pins (codex-advice-harness.ts's adviceThreadConfig), so it is prepared here the same
-    // shared-directory way as the run lane's HOME (worker-owned, group runner, setgid).
+    // shared-directory way as the run lane's HOME (worker-owned, group runner, setgid). It is
+    // a fresh per-call UUID leaf (never pre-existing), so it stays a plain strict call — no
+    // opt-in recovery.
     await ensureCodexSharedDirectory(cwd);
 
     const handle = await launchCodexRoot({
@@ -858,16 +870,69 @@ export function buildCodexToolHandlers(deps: CodexToolHandlerDeps): ReadonlyMap<
  *  tool-evidence.ts's ToolTextResult without re-importing the type. */
 type ToolTextResultLike = ReturnType<typeof asText>;
 
+// Module-level per-path serialization for the opt-in destructive recovery. Keyed by the
+// RESOLVED path so two overlapping advice calls on the same parent run the full
+// open→check→recover→validate sequence one at a time and each RE-READS state under the lock:
+// a second caller finds the already-recreated worker:runner dir and no-ops through to strict
+// validation instead of re-renaming a healthy dir. The worker is a single Node process on an
+// RWO PVC, so an in-process chain covers all concurrency. Bounded to the two advice paths, so
+// leaving stale settled map entries is fine (never cleaned up).
+const codexRecoveryChains = new Map<string, Promise<unknown>>();
+
 /** Create one worker-owned, runner-group-accessible directory without following a
  * final symlink. The private runner-owned epoch roots live below these shared
  * directories; the credential-free store remains worker-owned beside them.
  *
  * `expect` is a test-injection seam (production callers pass nothing, keeping the
  * real WORKER_UID/RUNNER_UID ownership): it lets a test drive the create-only repair
- * below under any CI uid using the test process's own uid and two of its own groups. */
+ * below under any CI uid using the test process's own uid and two of its own groups.
+ *
+ * By DEFAULT (no `opts`, the behaviour for EVERY caller but the two advice parents) this is
+ * rejection-only for a pre-existing directory: an EEXISTing dir is VALIDATED, never repaired
+ * or adopted — the deliberate check-don't-repair stance, so any mismatch throws. The
+ * `opts.recreateDisposableWorkerGroupDir` opt-in enables a narrowly-scoped, crash/TOCTOU-safe
+ * DESTRUCTIVE recovery for the two FIXED, disposable advice PARENTS ONLY
+ * (`codex-advice-data` / `codex-advice-cwd`): a pre-existing dir owned `expect.uid` and grouped
+ * the "wrong" disposable gid (`opts.recoverGid`, default WORKER_UID) is atomically renamed OUT
+ * of the live path and the live path recreated FRESH — NEVER chgrp'd/adopted. Every other
+ * caller and every other mismatch stays rejection-only. The opt-in path is serialized
+ * per-resolved-path (see `codexRecoveryChains`). */
 export async function ensureCodexSharedDirectory(
   dir: string,
   expect: { readonly uid: number; readonly gid: number } = { uid: WORKER_UID, gid: RUNNER_UID },
+  opts?: {
+    // Opt-in destructive recovery of a PRE-EXISTING *disposable, worker-group* directory at a
+    // FIXED internal path (the two advice parents ONLY). When set and the EEXISTing dir is a real
+    // directory owned expect.uid and grouped `recoverGid`, it is renamed out and recreated fresh
+    // (never chgrp'd/adopted). Default (absent) ⇒ rejection-only, unchanged for every other caller.
+    readonly recreateDisposableWorkerGroupDir?: boolean;
+    // The "wrong disposable gid" that triggers recovery; defaults to WORKER_UID (the worker's own
+    // group, the fsGroup-inherited case). Test-injection seam (mirrors `expect`) so a portable
+    // test drives recovery under any uid/groups.
+    readonly recoverGid?: number;
+  },
+): Promise<void> {
+  if (opts?.recreateDisposableWorkerGroupDir === true) {
+    const key = path.resolve(dir);
+    const prev = codexRecoveryChains.get(key) ?? Promise.resolve();
+    const run = prev.then(
+      () => ensureCodexSharedDirectoryInner(dir, expect, opts),
+      () => ensureCodexSharedDirectoryInner(dir, expect, opts),
+    );
+    // The NEXT caller on this path chains after our chain has settled (never rejects the tail).
+    codexRecoveryChains.set(key, run.then(() => undefined, () => undefined));
+    return run;
+  }
+  return ensureCodexSharedDirectoryInner(dir, expect, opts);
+}
+
+async function ensureCodexSharedDirectoryInner(
+  dir: string,
+  expect: { readonly uid: number; readonly gid: number },
+  opts?: {
+    readonly recreateDisposableWorkerGroupDir?: boolean;
+    readonly recoverGid?: number;
+  },
 ): Promise<void> {
   let created = false;
   try {
@@ -876,18 +941,68 @@ export async function ensureCodexSharedDirectory(
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
   }
-  const handle = await fs.open(dir, FS.O_RDONLY | FS.O_DIRECTORY | FS.O_NOFOLLOW);
+  let handle = await fs.open(dir, FS.O_RDONLY | FS.O_DIRECTORY | FS.O_NOFOLLOW);
   try {
-    const before = await handle.stat();
+    let before = await handle.stat();
     if (!before.isDirectory()) {
       throw new Error("Codex shared data directory has an unexpected owner or group");
     }
+
+    // Opt-in destructive recovery of a PRE-EXISTING disposable worker-group parent (PRD #58
+    // non-root / hosted k8s, issue #1495): a parent left by pre-rc.2 code as worker:worker on
+    // the RWO PVC survives worker rolls, so `fs.mkdir` above returned EEXIST (created=false),
+    // the create-only repair below is skipped, and the strict gid check would throw. For the two
+    // FIXED disposable advice parents ONLY (recreateDisposableWorkerGroupDir), recover by
+    // renaming the pre-existing dir OUT of the live path and recreating the live path FRESH.
+    // GUARANTEE: the pre-existing content is NEVER adopted — it is atomically renamed OUT and
+    // the live path is always recreated fresh; on cleanup success the tombstone is removed, and
+    // on cleanup FAILURE the tombstone remains QUARANTINED as a worker-owned sibling OUTSIDE the
+    // live path (never an adopted dir in the live path). Removal is best-effort, NOT guaranteed.
+    const recoverGid = opts?.recoverGid ?? WORKER_UID;
+    if (
+      !created &&
+      opts?.recreateDisposableWorkerGroupDir === true &&
+      before.uid === expect.uid &&
+      before.gid === recoverGid &&
+      recoverGid !== expect.gid // nothing to recover if the "wrong" gid already equals the expected one
+    ) {
+      // The inode we validated under O_NOFOLLOW on the held handle.
+      const beforeDev = before.dev;
+      const beforeIno = before.ino;
+      const tombstone = `${dir}.uzi-tomb-${randomUUID()}`; // a worker-owned sibling out of the live path
+      await fs.rename(dir, tombstone); // atomic; the held handle still refers to the moved inode
+      // Verify the moved inode matches the one we validated: a path swap between our validation
+      // and the rename must NEVER be adopted — throw and leave the tombstone quarantined.
+      const verifyHandle = await fs.open(tombstone, FS.O_RDONLY | FS.O_DIRECTORY | FS.O_NOFOLLOW);
+      try {
+        const moved = await verifyHandle.stat();
+        if (moved.dev !== beforeDev || moved.ino !== beforeIno) {
+          throw new Error("Codex shared data directory has an unexpected owner or group");
+        }
+      } finally {
+        await verifyHandle.close();
+      }
+      // Recreate the live path fresh through the strict create path.
+      await handle.close();
+      await fs.mkdir(dir, { mode: 0o2770 });
+      created = true;
+      handle = await fs.open(dir, FS.O_RDONLY | FS.O_DIRECTORY | FS.O_NOFOLLOW);
+      before = await handle.stat();
+      if (!before.isDirectory()) {
+        throw new Error("Codex shared data directory has an unexpected owner or group");
+      }
+      // Best-effort removal of the quarantined tombstone (see the GUARANTEE above).
+      await fs.rm(tombstone, { recursive: true, force: true }).catch(() => undefined);
+    }
+
     // Create-only group repair (PRD #58 non-root / hosted k8s start): under a setgid
     // agent-home group-owned by `worker` (fsGroup:10001 on the PVC), a freshly-created dir
     // inherits gid `worker`. The worker OWNS it and is a supplementary member of `runner`,
     // so it may chgrp the group to RUNNER_UID while preserving the owner. Repair ONLY a dir
     // this call just created AND verified worker-owned; NEVER an EEXISTing one (retain the
     // deliberate check-don't-repair security stance — an existing mismatch still throws).
+    // After a recovery above `created` is true for the freshly-recreated dir, so this chgrps
+    // it to worker:runner.
     if (created && before.uid === expect.uid && before.gid !== expect.gid) {
       await handle.chown(expect.uid, expect.gid);
     }
