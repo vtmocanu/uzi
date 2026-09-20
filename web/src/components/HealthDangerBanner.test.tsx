@@ -7,7 +7,9 @@
 // UpdateEscalationBanner own their own roles.
 //
 // Covered: renders only on danger; hides the Snooze button while episode_id is null; snoozes
-// through the endpoint (click → POST called → banner hides); returns on a new episode_id.
+// through the endpoint (click → POST called → banner hides); returns on a new episode_id; and
+// RETURNS after the 1 h snooze lapses on a still-danger, still-open episode (D2 — the snooze
+// honours 1 h, not the whole episode), driven by the injectable `now` clock.
 import { afterEach, describe, it, expect, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
@@ -27,10 +29,10 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-function renderBanner() {
+function renderBanner(now?: () => number) {
   return render(
     <MemoryRouter>
-      <HealthDangerBanner />
+      <HealthDangerBanner now={now} />
     </MemoryRouter>,
   );
 }
@@ -105,6 +107,45 @@ describe("HealthDangerBanner", () => {
     repoll();
     await waitFor(() => expect(banner()).not.toBeNull());
     // And its Snooze button is back for the new episode.
+    expect(screen.getByRole("button", { name: "Snooze 1 h" })).toBeTruthy();
+  });
+
+  it("returns after the 1 h snooze lapses on a still-danger, still-open episode", async () => {
+    // A clock the test controls, so the 1 h lapse needs no real waiting. The component reads
+    // it for both the server-snooze comparison and the optimistic snoozed-until (now + 1 h).
+    let clock = Date.parse("2026-09-20T00:00:00Z");
+    const now = () => clock;
+    const snoozedUntil = new Date(clock + 3600_000).toISOString(); // base + 1 h — the server's D2 value
+
+    // Episode open (b1f0c2ep), no server snooze yet. The endpoint confirms snoozed_until =
+    // now + 1 h, exactly what the server stores (D2).
+    mockApi.getAdminHealth.mockResolvedValue(incidentDoc());
+    mockApi.snoozeAdminHealth.mockResolvedValue({ episode_id: "b1f0c2ep", snoozed_until: snoozedUntil });
+    renderBanner(now);
+    await waitFor(() => expect(banner()).not.toBeNull());
+
+    // Snooze → optimistic hide for 1 h.
+    fireEvent.click(screen.getByRole("button", { name: "Snooze 1 h" }));
+    await waitFor(() => expect(banner()).toBeNull());
+
+    // The next poll carries the server-confirmed snooze (snoozed_until = base + 1 h). The
+    // episode is unchanged and still danger, so the banner stays hidden within the hour. A
+    // FRESH doc object each poll, so React re-renders and re-reads the clock (an identical
+    // object reference would bail the render).
+    const snoozedDoc: HealthDoc = { ...incidentDoc(), snoozed_until: snoozedUntil };
+    mockApi.getAdminHealth.mockResolvedValue(snoozedDoc);
+    repoll();
+    await waitFor(() => expect(mockApi.getAdminHealth).toHaveBeenCalledTimes(2));
+    expect(banner()).toBeNull();
+
+    // Advance the clock past the 1 h snooze. Same open episode, still danger, same server
+    // snoozed_until (now in the past) — both snoozes have lapsed, so the banner RETURNS.
+    // (Against the old episode-keyed boolean hide this assertion fails: that hid the whole
+    // episode regardless of elapsed time.)
+    clock += 3600_000 + 1000;
+    mockApi.getAdminHealth.mockResolvedValue({ ...incidentDoc(), snoozed_until: snoozedUntil });
+    repoll();
+    await waitFor(() => expect(banner()).not.toBeNull());
     expect(screen.getByRole("button", { name: "Snooze 1 h" })).toBeTruthy();
   });
 });
