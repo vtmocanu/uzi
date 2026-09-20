@@ -2635,6 +2635,11 @@ export interface RunActivity {
   /** The acting lane's role: a subagent's role, "lead" for the orchestrator, or an Agent
    *  dispatch's subagent_type. */
   agent: string;
+  /** The acting subagent's dispatch/parent tool_use id (absent for the lead or a bare
+   *  orchestrator frame), mirroring the Go `json:"agent_instance,omitempty"`. It is
+   *  COMPARED to match a live lane, never rendered, so it carries no display-sanitization
+   *  obligation. */
+  agent_instance?: string;
   /** The lane's task description (the dispatch's description); "" for a bare lead frame.
    *  UNTRUSTED model-authored text — render escaped, never <Markdown>. */
   agent_label: string;
