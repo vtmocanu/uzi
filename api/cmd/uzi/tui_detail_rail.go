@@ -46,6 +46,9 @@ func (m tuiModel) renderLaneRail() string {
 		if rb := m.railRateMeters(now, strings.Count(sb.String(), "\n")+1); rb != "" {
 			appendRailBlock(&sb, rb)
 		}
+		if cb := m.railCodexRateMeters(now, strings.Count(sb.String(), "\n")+1); cb != "" {
+			appendRailBlock(&sb, cb)
+		}
 		if cl := m.railCredentialLine(strings.Count(sb.String(), "\n") + 1); cl != "" {
 			appendRailBlock(&sb, cl)
 		}
@@ -72,6 +75,9 @@ func (m tuiModel) renderLaneRail() string {
 	}
 	if rb := m.railRateMeters(now, strings.Count(sb.String(), "\n")+1); rb != "" {
 		appendRailBlock(&sb, rb)
+	}
+	if cb := m.railCodexRateMeters(now, strings.Count(sb.String(), "\n")+1); cb != "" {
+		appendRailBlock(&sb, cb)
 	}
 	if cl := m.railCredentialLine(strings.Count(sb.String(), "\n") + 1); cl != "" {
 		appendRailBlock(&sb, cl)

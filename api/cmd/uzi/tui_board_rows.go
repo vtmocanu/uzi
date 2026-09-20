@@ -80,9 +80,32 @@ func (m tuiModel) selectedRateMeters() (shown []apitypes.TokenRateLimitDTO, show
 // tone) keeps the legible signal — colour is never the only cue. Clamped to one physical line.
 // The Label is USER-AUTHORED and drawn through renderer.Plain (D7).
 func (m tuiModel) boardRateLimitStrip(now time.Time) string {
+	segs := m.boardClaudeMeterSegs(now)
+	// The Codex meters ride the SAME single line, appended after the Claude ones with their
+	// own "Codex" provider label so the two providers never look merged (PRD #1209 M3). When
+	// no Claude token is shown but a Codex account is, the strip still renders (Codex-only).
+	if codex := m.boardCodexMeterSeg(now); codex != "" {
+		segs = append(segs, codex)
+	}
+	if len(segs) == 0 {
+		return ""
+	}
+	// A faint leading space aligns the strip under the brand block (the brand line starts " ").
+	// Tokens are joined with three spaces; the per-group accent bar ▎ (prefixed above) is the
+	// group delimiter, so each token's two windows still read as a group; the intra-token 5h↔7d
+	// gap stays 3 spaces.
+	strip := " " + strings.Join(segs, "   ")
+	return clampVisual(strip, m.width)
+}
+
+// boardClaudeMeterSegs builds the per-token Claude segments of the board strip (the
+// Anthropic 5h/7d meters), one string per shown token, empty when nothing is selected.
+// Split out of boardRateLimitStrip so the Codex section can ride the same line after it
+// without perturbing the Claude bytes.
+func (m tuiModel) boardClaudeMeterSegs(now time.Time) []string {
 	shown, showLabel := m.selectedRateMeters()
 	if len(shown) == 0 {
-		return ""
+		return nil
 	}
 	segs := make([]string, 0, len(shown))
 	for _, t := range shown {
@@ -103,12 +126,7 @@ func (m tuiModel) boardRateLimitStrip(now time.Time) string {
 		seg = paintSeg(accent, nil, false, "▎") + seg
 		segs = append(segs, seg)
 	}
-	// A faint leading space aligns the strip under the brand block (the brand line starts " ").
-	// Tokens are joined with three spaces; the per-group accent bar ▎ (prefixed above) is the
-	// group delimiter, so each token's two windows still read as a group; the intra-token 5h↔7d
-	// gap stays 3 spaces.
-	strip := " " + strings.Join(segs, "   ")
-	return clampVisual(strip, m.width)
+	return segs
 }
 
 // rateWindowCell renders one rate-limit window as `label <bar> NN%`: a faint label ("5h"/"7d"),

@@ -247,7 +247,7 @@ func (m tuiModel) boardKey(k string) (tea.Model, tea.Cmd) {
 		// becomes the new waitID, so the next periodic tick does not stack a second poll on top
 		// of this one and any periodic reply still in flight is superseded (its stale reqID is
 		// dropped); this reply's own reqID clears the guard.
-		return m, tea.Batch((&m).startBoardReq(), m.fetchRateLimitsCmd(), m.fetchSettingsCmd())
+		return m, tea.Batch((&m).startBoardReq(), m.fetchRateLimitsCmd(), m.fetchCodexRateLimitsCmd(), m.fetchSettingsCmd())
 	case keyAdmin:
 		m.board.admin = !m.board.admin
 		m.board.adminDenied = false

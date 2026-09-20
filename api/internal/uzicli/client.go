@@ -159,6 +159,12 @@ type Client interface {
 	// half. The status string is computed server-side by autoselect.Classify and is
 	// RENDERED here, never re-derived (D21).
 	SelfRateLimits(ctx context.Context) ([]apitypes.TokenRateLimitDTO, error)
+	// SelfCodexRateLimits returns the caller's OWN per-account Codex rate-limit
+	// meters (PRD #1209 M3): GET /api/me/codex-rate-limits. RequireUser, so a uzc_
+	// CLI token reaches it. Each account carries a NESTED bucket shape (labels,
+	// flags and the reading — never a token or raw provider principal), unlike the
+	// flat 5h/7d Anthropic pair SelfRateLimits returns.
+	SelfCodexRateLimits(ctx context.Context) ([]apitypes.CodexAccountRateLimitDTO, error)
 	// GetMySettings returns the caller's own non-secret settings, including
 	// sidebar_token_ids: GET /api/me/settings. RequireUser (the GET was split out
 	// from the cookie-only /me/settings group so a uzc_ can read it).
@@ -192,6 +198,11 @@ type Client interface {
 	AdminListCLITokens(ctx context.Context) ([]apitypes.AdminCLITokenDTO, error)
 	AdminUsage(ctx context.Context) (apitypes.AdminUsageDTO, error)
 	AdminRateLimits(ctx context.Context) ([]apitypes.AdminRateLimitRowDTO, error)
+	// AdminCodexRateLimits reads the factory-wide per-user Codex rate-limit rows
+	// (PRD #1209 M3): GET /api/admin/codex-rate-limits. Requires a uza_ (admin_ro)
+	// token; each row carries identity, live vault-lock state, and one Codex meter
+	// per linked account — the Codex cousin of AdminRateLimits.
+	AdminCodexRateLimits(ctx context.Context) ([]apitypes.CodexAdminRateLimitRowDTO, error)
 	// GuardrailImpact reads the live, non-persisting guardrail pre-flight impact
 	// count (PRD #66 M3): GET /api/admin/guardrail-impact.
 	GuardrailImpact(ctx context.Context) (apitypes.GuardrailImpactDTO, error)
