@@ -17,6 +17,7 @@ SELECT
     a.id                         AS provider_account_id,
     COALESCE(al.labels, '{}')::text[] AS aliases,
     COALESCE(al.is_default, false)    AS is_default,
+    a.reauth_required,
     rl.buckets,
     rl.observed_generation,
     rl.observed_credential_revision,
@@ -46,6 +47,7 @@ type GetCodexAccountRateLimitsForUserRow struct {
 	ProviderAccountID          uuid.UUID          `json:"provider_account_id"`
 	Aliases                    []string           `json:"aliases"`
 	IsDefault                  bool               `json:"is_default"`
+	ReauthRequired             bool               `json:"reauth_required"`
 	Buckets                    []byte             `json:"buckets"`
 	ObservedGeneration         pgtype.Int8        `json:"observed_generation"`
 	ObservedCredentialRevision pgtype.Int8        `json:"observed_credential_revision"`
@@ -76,6 +78,7 @@ func (q *Queries) GetCodexAccountRateLimitsForUser(ctx context.Context, userID u
 			&i.ProviderAccountID,
 			&i.Aliases,
 			&i.IsDefault,
+			&i.ReauthRequired,
 			&i.Buckets,
 			&i.ObservedGeneration,
 			&i.ObservedCredentialRevision,
@@ -102,6 +105,7 @@ SELECT
     a.id                         AS provider_account_id,
     COALESCE(al.labels, '{}')::text[] AS aliases,
     COALESCE(al.is_default, false)    AS is_default,
+    a.reauth_required,
     rl.buckets,
     rl.observed_generation,
     rl.observed_credential_revision,
@@ -134,6 +138,7 @@ type ListCodexAccountRateLimitsRow struct {
 	ProviderAccountID          uuid.UUID          `json:"provider_account_id"`
 	Aliases                    []string           `json:"aliases"`
 	IsDefault                  bool               `json:"is_default"`
+	ReauthRequired             bool               `json:"reauth_required"`
 	Buckets                    []byte             `json:"buckets"`
 	ObservedGeneration         pgtype.Int8        `json:"observed_generation"`
 	ObservedCredentialRevision pgtype.Int8        `json:"observed_credential_revision"`
@@ -166,6 +171,7 @@ func (q *Queries) ListCodexAccountRateLimits(ctx context.Context) ([]ListCodexAc
 			&i.ProviderAccountID,
 			&i.Aliases,
 			&i.IsDefault,
+			&i.ReauthRequired,
 			&i.Buckets,
 			&i.ObservedGeneration,
 			&i.ObservedCredentialRevision,

@@ -171,6 +171,10 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 	if h.vault != nil {
 		if err := h.vault.Unlock(r.Context(), user.ID, req.Password); err != nil {
 			slog.Error("vault unlock at register", "user", user.ID, "error", err)
+		} else if h.codexUsagePoker != nil {
+			// A successful unlock lets the Codex poller read this user's linked accounts;
+			// poke so their account meters refresh within seconds (PRD #1209). Best-effort.
+			h.codexUsagePoker.Poke(user.ID)
 		}
 	}
 
@@ -302,6 +306,10 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 	if h.vault != nil {
 		if err := h.vault.Unlock(r.Context(), user.ID, req.Password); err != nil {
 			slog.Error("vault unlock at login", "user", user.ID, "error", err)
+		} else if h.codexUsagePoker != nil {
+			// A successful unlock lets the Codex poller read this user's linked accounts;
+			// poke so their account meters refresh within seconds (PRD #1209). Best-effort.
+			h.codexUsagePoker.Poke(user.ID)
 		}
 	}
 

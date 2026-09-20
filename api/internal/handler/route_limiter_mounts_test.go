@@ -288,6 +288,9 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/admin/judge/recommendations/issue-draft", noLimiter},
 	{"GET", "/api/admin/judge/stats", noLimiter},
 	{"GET", "/api/admin/rate-limits", noLimiter},
+	// PRD #1209 M3: the admin per-account Codex rate-limit read — a store read (no forge
+	// call, no token spend) in the admin read group → noLimiter, like /rate-limits beside it.
+	{"GET", "/api/admin/codex-rate-limits", noLimiter},
 	{"GET", "/api/admin/runs", noLimiter},
 	{"GET", "/api/admin/agent-source", noLimiter},
 	// PRD #836 M3: the admin Updates-card data source — a cache-backed read, no forge
@@ -359,6 +362,9 @@ var wantRouteMounts = []routeMount{
 	{"DELETE", "/api/schedules/pause", noLimiter},
 	{"GET", "/api/me/memory/", noLimiter},
 	{"GET", "/api/me/rate-limits", noLimiter},
+	// PRD #1209 M3: the caller's own per-account Codex rate-limit read — an owner-scoped
+	// store read, RequireUser, no limiter, like /me/rate-limits beside it.
+	{"GET", "/api/me/codex-rate-limits", noLimiter},
 	{"GET", "/api/me/secrets/", noLimiter},
 	{"GET", "/api/me/settings/", noLimiter},
 	{"GET", "/api/me/slack/", noLimiter},
