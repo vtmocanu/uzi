@@ -645,10 +645,11 @@ function buildAdviceAuthConfig(
  * {@link CodexAdviceLaunchSpec} itself carries no auth-mode field (the pinned app-server auth
  * owner authenticates over the login RPC, not a launcher config choice).
  *
- * `homeRoot` is the WORKER's shared SDK home root (`sdkHomeRoot` in main.ts) — the same
- * setgid, runner-group-accessible tree {@link prepareCodexRunHome} prepares per run, reused
- * here as a stable parent so a fresh per-call child directory inherits the correct
- * ownership/group without a dedicated per-advice-call preparation step. The two disposable
+ * `homeRoot` is the WORKER's shared SDK home root (`sdkHomeRoot` in main.ts): a stable, setgid,
+ * runner-group-accessible parent under which a fresh per-call child directory inherits the correct
+ * ownership/group without a dedicated per-advice-call preparation step. (`sdkHomeRoot` itself is
+ * created by run()'s early recursive mkdir; {@link prepareCodexRunHome} prepares the PER-RUN home
+ * `sdkHomeRoot/<runId>`, not this shared root.) The two disposable
  * advice PARENTS (`codex-advice-data` / `codex-advice-cwd`) survive worker rolls on the RWO
  * PVC, so they opt into {@link ensureCodexSharedDirectory}'s destructive recovery: a
  * pre-existing worker:worker parent left by pre-rc.2 code is renamed OUT and recreated fresh
@@ -874,9 +875,11 @@ type ToolTextResultLike = ReturnType<typeof asText>;
 // RESOLVED path so two overlapping advice calls on the same parent run the full
 // open→check→recover→validate sequence one at a time and each RE-READS state under the lock:
 // a second caller finds the already-recreated worker:runner dir and no-ops through to strict
-// validation instead of re-renaming a healthy dir. The worker is a single Node process on an
-// RWO PVC, so an in-process chain covers all concurrency. Bounded to the two advice paths, so
-// leaving stale settled map entries is fine (never cleaned up).
+// validation instead of re-renaming a healthy dir. This serializes the TRUSTED in-process callers
+// (this single Node worker) against each other only; it does NOT serialize an untrusted
+// cross-process actor (a runner under uid-split) — the O_NOFOLLOW checks, the inode re-verification
+// and the worker-only quarantine in the cleanup path are what guard against that. Bounded to the
+// two advice paths, so leaving stale settled map entries is fine (never cleaned up).
 const codexRecoveryChains = new Map<string, Promise<unknown>>();
 
 /** Create one worker-owned, runner-group-accessible directory without following a
@@ -987,10 +990,12 @@ async function ensureCodexSharedDirectoryInner(
         throw new Error("Codex shared data directory has an unexpected owner or group");
       }
       // Dispose of the transient tombstone SAFELY: relocate it under a worker-only-parented, 0700
-      // quarantine beneath <dataDir> and recursively remove only that private subtree; on EXDEV, a
-      // path swap, or any validation failure it is left QUARANTINED, never removed in the
-      // runner-writable parent. GUARANTEE: pre-existing content is never adopted or unsafely
-      // removed; the live path is always fresh worker:runner 2770.
+      // quarantine beneath <dataDir> and recursively remove only that private subtree. If the
+      // quarantine cannot be made/validated or the move hits EXDEV, the tombstone is RETAINED beside
+      // the live path (out of the live path, in the runner-writable parent) and never recursively
+      // removed; on a post-move inode mismatch the moved content stays in the private quarantine and
+      // is not removed. GUARANTEE: pre-existing content is never adopted or unsafely removed, and
+      // the live path is always fresh worker:runner 2770.
       await disposeCodexRecoveryTombstone(tombstone, dir, expect.uid, beforeDev, beforeIno);
     }
 
@@ -1025,12 +1030,15 @@ async function ensureCodexSharedDirectoryInner(
  *  runner could swap that path between a check and the recursive walk, and entry removal/rename
  *  depends on the PARENT's permissions, so a 0700 dir *under* agent-home would still be swappable.
  *  Instead relocate the tombstone into a freshly-created, validated 0700 quarantine rooted at
- *  <dataDir> (the parent of sdkHomeRoot: root:worker, so a non-worker cannot create/rename/remove
- *  its entries), re-verify it is the exact inode we validated, then remove ONLY that private
- *  subtree. Best-effort and never throws (the live path is already correct); on EXDEV, an inode
- *  mismatch (a swapped path), or a failed quarantine validation, the content is left quarantined
- *  and never recursively removed. `workerUid` is the worker identity (expect.uid; a test seam
- *  mirrors it so a portable test drives this under any uid). */
+ *  <dataDir> (the parent of sdkHomeRoot). The invariant that matters is that <dataDir> is NOT
+ *  writable by a non-worker (runner), so it cannot swap the quarantine's entries; we do not rely on
+ *  a specific owner/mode there. Re-verify the moved inode is the exact one validated, then remove
+ *  ONLY that private subtree. Best-effort and never throws (the live path is already correct). On a
+ *  pre-move failure (the quarantine cannot be created/validated, or the move hits EXDEV) the
+ *  tombstone is RETAINED beside the live path, outside it, and never recursively removed in the
+ *  runner-writable parent; on a post-move inode mismatch (a swapped path) the moved content is left
+ *  in the private quarantine and not removed. `workerUid` is the worker identity (expect.uid; a test
+ *  seam mirrors it so a portable test drives this under any uid). */
 async function disposeCodexRecoveryTombstone(
   tombstone: string,
   liveDir: string,

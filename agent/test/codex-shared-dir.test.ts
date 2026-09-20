@@ -228,6 +228,46 @@ describe("Issue #1492: ensureCodexSharedDirectory create-only group repair (port
     }
   });
 
+  it("opt-in leaves the tombstone beside the fresh live path (never removed) when the quarantine root is not writable (issue #1495 failure path)", { skip: uidA === 0 ? "root bypasses the chmod-based write denial this test relies on" : false }, async () => {
+    const base = await freshTmp();
+    try {
+      const parent = path.join(base, "agent-home");
+      await makeSetgidParent(parent, uid, gA);
+      const child = path.join(parent, "codex-advice-data");
+      await fs.mkdir(child, { mode: 0o2770 });
+      const originalInode = await inodeOf(child);
+      // Make <dataDir> (the quarantine root = grandparent of the live path) non-writable so the
+      // 0700 quarantine cannot be created: cleanup must fail SAFELY — recover the live path but
+      // leave the tombstone beside it, never recursively removing it in the runner-writable parent.
+      await fs.chmod(base, 0o500);
+
+      await ensureCodexSharedDirectory(child, { uid, gid: gB }, { recreateDisposableWorkerGroupDir: true, recoverGid: gA });
+
+      // The live path is recovered fresh regardless of whether cleanup could run.
+      assert.equal((await statOf(child)).gid, gB, "the live path is recovered even when cleanup cannot run");
+      const newInode = await inodeOf(child);
+      assert.notEqual(
+        `${newInode.dev}:${newInode.ino}`,
+        `${originalInode.dev}:${originalInode.ino}`,
+        "the live path was recreated fresh",
+      );
+      // Restore write to inspect: the tombstone is RETAINED beside the live path, holding the
+      // ORIGINAL (disposable) inode, and was never recursively removed.
+      await fs.chmod(base, 0o700);
+      const tomb = (await fs.readdir(parent)).find((e) => e.includes(".uzi-tomb-"));
+      assert.ok(tomb, "the tombstone is retained beside the live path when cleanup cannot run");
+      const tombInode = await inodeOf(path.join(parent, tomb!));
+      assert.equal(
+        `${tombInode.dev}:${tombInode.ino}`,
+        `${originalInode.dev}:${originalInode.ino}`,
+        "the retained tombstone still holds the original inode, untouched",
+      );
+    } finally {
+      await fs.chmod(base, 0o700).catch(() => undefined);
+      await fs.rm(base, { recursive: true, force: true });
+    }
+  });
+
   it("opt-in still REJECTS a dir whose gid is NOT the recoverGid (recovery does not fire)", async () => {
     const base = await freshTmp();
     try {
