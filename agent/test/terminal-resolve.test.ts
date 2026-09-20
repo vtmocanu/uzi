@@ -14,7 +14,7 @@ import {
 } from "../src/terminal-resolve.js";
 import { RequestError } from "../src/client.js";
 import type { MessageGapsResponse, OutgoingMessage, StateAck, StateRequest } from "../src/protocol.js";
-import { nullLogger } from "./helpers.js";
+import { nullLogger, recordingLogger } from "./helpers.js";
 
 // PRD #1391 Run B M3b — the write-ahead terminal-report SEND path. Every test drives the real
 // Outbox store (a fresh mkdtemp root) plus a fake client + a scripted `send`, so the classification,
@@ -130,6 +130,47 @@ describe("resolvePendingTerminal / journalAndResolveTerminal (PRD #1391 Run B M3
     assert.equal(outbox.depthFor("r1")?.pendingTerminal, 0, "a 200 retires the journal");
     assert.equal(outbox.hasPendingTerminal("r1", GEN), false, "no pending terminal remains after a 200");
     assert.equal(existsSync(path.join(root, "r1", `terminal-${GEN}.json`)), false, "the journal file was unlinked");
+  });
+
+  it("emits the 'terminal journaled write-ahead' line BEFORE the first send (the e2e outbox phase gates its outage on it)", async () => {
+    // The e2e phase 52 M6 cases (3/4/5) wait for this exact log line to know the run has REACHED and
+    // JOURNALED its terminal while the api is down, instead of a fixed sleep the slow CI lane blew.
+    // Renaming or dropping it, or moving it after the send, silently re-breaks that nightly gate — so
+    // pin the string, the fields, and that it lands durable-before-first-send here.
+    const { outbox, root } = await mkOutbox();
+    const client = new FakeClient();
+    const { logger, lines } = recordingLogger();
+    const deps = makeTerminalOutboxDeps(outbox, client, { gapFillMax: 10_000, terminalMaxBytes: 1 << 20, log: logger });
+    assert.ok(deps, "deps built (outbox enabled)");
+
+    const journaledLine = () =>
+      lines.find(
+        (l): l is { msg: string; run_id: unknown; claim_generation: unknown; messages_through_seq: unknown } =>
+          typeof l === "object" && l !== null && (l as { msg?: unknown }).msg === "outbox: terminal journaled write-ahead",
+      );
+
+    let lineExistedAtSend = false;
+    const send = async (_body: StateRequest): Promise<StateAck> => {
+      lineExistedAtSend = journaledLine() !== undefined;
+      return { applied: true, status: "completed" };
+    };
+
+    await journalAndResolveTerminal(deps, {
+      runId: "r1",
+      claimGeneration: GEN,
+      phase: "running",
+      messagesThroughSeq: FENCE,
+      body: { status: "completed" },
+      send,
+    });
+
+    assert.equal(lineExistedAtSend, true, "the journaled-write-ahead line was emitted before the first send");
+    const line = journaledLine();
+    assert.ok(line, "the journaled-write-ahead line was emitted");
+    assert.equal(line?.run_id, "r1", "the line carries the run id (the harness greps it per-run)");
+    assert.equal(line?.claim_generation, GEN, "the line carries the claim generation");
+    assert.equal(line?.messages_through_seq, FENCE, "the line carries the durable emitted tail (fence)");
+    assert.equal(existsSync(path.join(root, "r1", `terminal-${GEN}.json`)), false, "a 200 still retired the journal");
   });
 
   it("does NOT send messages_through_seq to an api that never advertised terminal_fence (D9)", async () => {
