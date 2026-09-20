@@ -41,11 +41,15 @@ through `[0.52.0]`.)
   A handoff run that was never dispatched now expires after its setup deadline and drops out of claimable work, instead of showing "waiting for a worker" indefinitely even with a healthy idle worker present.
 - **Live milestone lanes match the "now" line by agent instance, not role name ([#1479](https://github.com/vtmocanu/uzi/pull/1479)).**
   Two similarly named agents can no longer hide each other's live activity, and the global "now" indicator stays visible for unassigned or distinct same-role agents.
+- **Codex runs start cleanly on non-root hosted (k8s) workers ([#1494](https://github.com/vtmocanu/uzi/pull/1494)).**
+  Per-run home, data, advice, and working directory setup now repairs the group of directories it creates instead of rejecting the `worker:worker` group a non-root hosted start inherits, while still refusing pre-existing directories with the wrong ownership and guarding against unsafe directory symlinks.
 
 ### Changed
 
 - **Go toolchain and dependency bumps ([#1485](https://github.com/vtmocanu/uzi/pull/1485), [#1467](https://github.com/vtmocanu/uzi/pull/1467), [#1435](https://github.com/vtmocanu/uzi/pull/1435)).**
   Go toolchain 1.27 with golangci-lint v2.13.2 and govulncheck v1.8.0, the go-toolchain and golangci-lint Renovate bumps now grouped with a hardened lint wrapper, and the golang base-image digest refreshed.
+- **Merge and pull-request links work on GitHub and Forgejo, not just GitLab ([#1488](https://github.com/vtmocanu/uzi/pull/1488)).**
+  Reconstructed MR/PR web links now pick the forge's own path segment (GitHub `/pull/`, Forgejo `/pulls/`, GitLab `/-/merge_requests/`) instead of always building a GitLab path, so a run's PR chip links correctly on every forge.
 
 ## [0.83.1] - 2026-09-19
 
