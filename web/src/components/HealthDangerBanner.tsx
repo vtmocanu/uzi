@@ -84,8 +84,11 @@ export function HealthDangerBanner({ now = Date.now }: { now?: () => number } = 
     try {
       await api.snoozeAdminHealth();
     } catch {
-      // The local hide already took effect; a failed snooze just means the banner may return
-      // on the next poll — acceptable for a nudge that also lives on the Health tab.
+      // The write failed, so the server holds no snooze: drop the optimistic hide too. Otherwise
+      // localUntil (now + 1 h) stays the later deadline and hides the banner for the full hour
+      // with nothing persisted, and no poll can restore it (effectiveSnoozedUntil never drops).
+      // Clearing it returns the still-danger banner at once, so a failed snooze is visible.
+      setOptimistic(null);
     } finally {
       setSnoozing(false);
     }

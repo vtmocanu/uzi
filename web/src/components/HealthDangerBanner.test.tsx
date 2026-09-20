@@ -149,6 +149,24 @@ describe("HealthDangerBanner", () => {
     expect(screen.getByRole("button", { name: "Snooze 1 h" })).toBeTruthy();
   });
 
+  // A FAILED snooze POST must not leave the banner hidden. The optimistic hide is rolled back
+  // in the rejection path, so a still-danger banner returns at once rather than staying hidden
+  // for the full hour with nothing persisted server-side. Fails without the rollback: the
+  // optimistic now+1h deadline hides it and no poll can restore it (effectiveSnoozedUntil never
+  // drops), so the banner never comes back.
+  it("rolls back the optimistic snooze and keeps the banner when the POST fails", async () => {
+    mockApi.getAdminHealth.mockResolvedValue(incidentDoc());
+    mockApi.snoozeAdminHealth.mockRejectedValue(new Error("network"));
+    renderBanner();
+    await waitFor(() => expect(banner()).not.toBeNull());
+
+    fireEvent.click(screen.getByRole("button", { name: "Snooze 1 h" }));
+    await waitFor(() => expect(mockApi.snoozeAdminHealth).toHaveBeenCalled());
+    // The POST rejected, so the optimistic hide is cleared and the still-danger banner stays.
+    await waitFor(() => expect(banner()).not.toBeNull());
+    expect(screen.getByRole("button", { name: "Snooze 1 h" })).toBeTruthy();
+  });
+
   // The hide is time-based, so it must lapse on a TIMER, not only on the next poll. If polling
   // stalls across the deadline (useHealthPoll keeps the last-good doc and calls no setState), an
   // expiry timer is the only thing that can bring the banner back at the hour. Regression for a
