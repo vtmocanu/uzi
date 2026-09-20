@@ -146,6 +146,7 @@ uzi project-sync status <repo> | resync <repo>
 uzi pr list [--repo <id>] | checks <iid> [--repo <id>] [--watch]
 uzi ci list [--repo <id>] [--limit <n>] | jobs <run-id> [--repo <id>] | fix <ref> [--repo <id>]
 uzi admin users | runs | workers | usage | rate-limits | cli-tokens | guardrail-impact | blocked-repos
+uzi admin health [--all] [--strict]
 uzi admin agent-source get | status
 uzi admin review backlog [--bucket todo|filed|done|dismissed|all] [--category label,label] | stats [--json]
 uzi skill status | install [--force] | install-hook | uninstall-hook
@@ -638,6 +639,22 @@ A few worth knowing:
   warns and the JSON `checks_unknown` is true, so an empty list means "unknown",
   not "none blocked". The table has `OWNER`, `PATH`, `BLOCKED`, `ALLOWED BY`
   (the admin who allowed it, or `—`). Allowing/revoking is done from the web UI.
+- **`admin health` is the instance health document** (PRD #1484) — a closed registry
+  of checks over what uzi knows about itself (worker rolls, queue and capacity, the
+  controller report, background loops, the database, integrations, housekeeping), with an
+  overall verdict and a per-severity tally. By default it prints only the checks needing
+  attention (everything that is not `ok` and not `na`) as
+  `SEVERITY CHECK SINCE SUMMARY`, then the verdict and the tally. `--all` lists every
+  check. `--json` emits the endpoint's document unchanged. **Its exit code is a probe
+  contract:** 0 unless the overall status is `danger`, then **8**; `--strict` also exits
+  8 on `warn` or `unknown`. Exit 8 is a **success-path** exit — the HTTP call returned
+  200 carrying an unhealthy verdict — so the full report prints first, and a transport or
+  auth failure keeps its own code (3 for a 401, 6 for a 5xx or unreachable server). That
+  lets a cron probe (`uzi admin health --strict` with a `uza_` token) tell "unhealthy"
+  (8) from "could not ask" (3/6). `admin workers` gained the matching roll health per
+  worker (`VERSION`, `UPGRADE`, `BLOCKING`), cross-user, so an admin sees which owner's
+  fleet is stuck rolling and why. Read-only, `uza_`-token, same ceiling as every other
+  `admin` verb — the banner snooze stays cookie-only in the web UI.
 - **`admin agent-source get | status`** (PRD #602, update fields PRD #702
   M4) reads the [agent source](agent-source.md) config and sync status:
   `get` shows the repo URL, ref, folder (the repo-relative subfolder role
@@ -1556,6 +1573,7 @@ silent contract change — so an agent always passes `--json` explicitly.
 | 5 | conflict (e.g. the run already finished) |
 | 6 | server unreachable / 5xx |
 | 7 | a `run wait --timeout` elapsed before any target state |
+| 8 | `uzi admin health` overall status is `danger` (or `warn`/`unknown` under `--strict`) — a success-path exit (HTTP 200), so a transport/auth failure keeps its own 3/6 |
 
 Branch on the exit code, not on stderr text — the wording is for humans and
 can change. There's also no `--token` flag: a credential must never land on

@@ -20,15 +20,25 @@ import (
 // these; cobra's own flag/usage parse errors are the only plain errors that
 // reach ExitCodeFor, and they map to ExitUsage.
 const (
-	ExitOK          = 0 // success
-	ExitGeneric     = 1 // generic error
-	ExitUsage       = 2 // usage error
-	ExitAuth        = 3 // auth required / invalid / wrong scope
-	ExitNotFound    = 4 // not found
-	ExitConflict    = 5 // conflict (e.g. run finished)
-	ExitUnreachable = 6 // server unreachable / 5xx
-	ExitTimeout     = 7 // a wait deadline elapsed before the target state (`run wait --timeout`)
+	ExitOK           = 0 // success
+	ExitGeneric      = 1 // generic error
+	ExitUsage        = 2 // usage error
+	ExitAuth         = 3 // auth required / invalid / wrong scope
+	ExitNotFound     = 4 // not found
+	ExitConflict     = 5 // conflict (e.g. run finished)
+	ExitUnreachable  = 6 // server unreachable / 5xx
+	ExitTimeout      = 7 // a wait deadline elapsed before the target state (`run wait --timeout`)
+	ExitHealthDanger = 8 // a health check reports danger (`uzi admin health`; a 200-carried verdict, not a transport failure)
 )
+
+// ErrHealthDanger is the sentinel `uzi admin health` returns on the success-path
+// exit-8: the HTTP GET returned 200, but the health document's overall status
+// warrants a nonzero exit (danger, or warn/unknown under --strict). ExitCodeFor maps
+// it — and anything wrapping it — to ExitHealthDanger, so the command PRINTS ITS FULL
+// REPORT FIRST and then returns this to drive the process exit code. A transport or
+// auth failure keeps its own code (ExitAuth/ExitUnreachable), so a probe can tell
+// "unhealthy" (8) from "could not ask" (3/6): only a 200 response can yield 8.
+var ErrHealthDanger = errors.New("health check reports danger")
 
 // ExitError carries the process exit code a command should produce. main() maps
 // it via ExitCodeFor.
@@ -84,6 +94,13 @@ func ExitCodeFor(err error) int {
 	var ee *ExitError
 	if errors.As(err, &ee) {
 		return ee.Code
+	}
+	// The health-danger sentinel is a success-path signal, not a transport failure, so it
+	// gets its own code rather than falling through to the generic default. errors.Is, not
+	// a type assertion, so a command may wrap it with a status-specific message and still
+	// map to 8.
+	if errors.Is(err, ErrHealthDanger) {
+		return ExitHealthDanger
 	}
 	if isCobraUsageError(err) {
 		return ExitUsage

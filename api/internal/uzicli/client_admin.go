@@ -30,6 +30,20 @@ func (c *HTTPClient) AdminListRuns(ctx context.Context) ([]apitypes.RunListItemD
 	return env.Runs, nil
 }
 
+// AdminHealth reads the admin health document (PRD #1484 M3): GET /api/admin/health,
+// in the RequireUser + RequireAdminRO group — so a uza_ (admin_ro) token reads it and a
+// masked uzc_/non-admin session is a 403 (exit 3). The reply is the HealthDocDTO directly
+// (httpx.JSON of the doc, no envelope), so decode straight into it. Every string in the
+// document is server-authored from a fixed template; the CLI treats it as untrusted at the
+// render boundary all the same (cellText on every cell).
+func (c *HTTPClient) AdminHealth(ctx context.Context) (apitypes.HealthDocDTO, error) {
+	var out apitypes.HealthDocDTO
+	if err := c.get(ctx, "/api/admin/health", &out); err != nil {
+		return apitypes.HealthDocDTO{}, err
+	}
+	return out, nil
+}
+
 func (c *HTTPClient) AdminListWorkers(ctx context.Context) ([]apitypes.AdminWorkerDTO, error) {
 	var env struct {
 		Workers []apitypes.AdminWorkerDTO `json:"workers"`

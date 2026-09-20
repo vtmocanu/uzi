@@ -118,16 +118,62 @@ func newAdminCmd(env Env, gf *globalFlags) *cobra.Command {
 				// validator at all (handler/workers.go checks length only, and workers.name
 				// carries no CHECK), so ESC remains STORABLE in one. That is a behaviour
 				// change to a shipped endpoint and belongs in its own MR.
-				rows = append(rows, []string{w.ID, w.OwnerEmail, cellText(w.Name), w.Status, reportedRunsCell(w.WorkerDTO), outboxCell(w.WorkerDTO)})
+				// VERSION is the worker's self-reported version — untrusted, so cellText, with
+				// the same sanitize-then-"-" fold `uzi worker list` uses (a version that is all
+				// format characters must still read "-", not blank). UPGRADE reuses upgradeCell
+				// (worker.go), the SAME five-state renderer `uzi worker list` uses, so the two
+				// consumers never describe a worker differently — this is the roll-health column
+				// the admin list was missing (PRD #1484). BLOCKING is the compact
+				// container/reason behind an upgrade_failed, through cellText.
+				version := cellText(strOr(w.Version, ""))
+				if version == "" {
+					version = "-"
+				}
+				rows = append(rows, []string{
+					w.ID, w.OwnerEmail, cellText(w.Name), w.Status,
+					version, upgradeCell(w.WorkerDTO), blockingCell(w.WorkerDTO),
+					reportedRunsCell(w.WorkerDTO), outboxCell(w.WorkerDTO),
+				})
 			}
-			// RUNS (PRD #1390 M2c): what each worker SAYS it is executing (its reported active-run
-			// snapshot), summarized per phase. OUTBOX (PRD #1391 M5): the depth of a worker's
-			// locally-buffered updates waiting to replay to the api — "-" in the steady state, a
-			// count while the api was unreachable. Both share their renderer with `uzi worker
-			// list` (worker.go), read off the embedded WorkerDTO.
-			return p.Table([]string{"ID", "OWNER", "NAME", "STATUS", "RUNS", "OUTBOX"}, rows)
+			// VERSION / UPGRADE / BLOCKING (PRD #1484 M3): the roll health the admin list finally
+			// carries, now that ListAllWorkers joins worker_upgrade_reports (M2) — cross-user,
+			// so an admin can see which owner's fleet is stuck rolling and why. RUNS (PRD #1390
+			// M2c): what each worker SAYS it is executing, summarized per phase. OUTBOX (PRD
+			// #1391 M5): the depth of a worker's locally-buffered updates waiting to replay —
+			// "-" in the steady state, a count while the api was unreachable. RUNS/UPGRADE/OUTBOX
+			// share their renderers with `uzi worker list` (worker.go), read off the embedded
+			// WorkerDTO.
+			return p.Table([]string{"ID", "OWNER", "NAME", "STATUS", "VERSION", "UPGRADE", "BLOCKING", "RUNS", "OUTBOX"}, rows)
 		},
 	}
+
+	var healthAll, healthStrict bool
+	health := &cobra.Command{
+		Use:   "health",
+		Short: "Instance health: the checks needing attention, a verdict and a tally",
+		Long: "Read the admin health document (PRD #1484): a closed registry of checks over " +
+			"what uzi knows about itself — worker rolls, queue and capacity, the controller " +
+			"report, background loops, the database, integrations and housekeeping.\n\n" +
+			"By default it prints only the checks needing attention (everything that is not " +
+			"ok and not na), then the overall verdict and a per-severity tally. --all lists " +
+			"every check. --json emits the endpoint's document unchanged.\n\n" +
+			"EXIT CODE, for a probe: 0 unless the overall status is danger, then 8. --strict " +
+			"also exits 8 on warn or unknown. Exit 8 is a SUCCESS-path exit — the HTTP call " +
+			"returned 200 carrying an unhealthy verdict — so the full report prints first. A " +
+			"transport or auth failure keeps its own code (3 for a 401, 6 for a 5xx or an " +
+			"unreachable server), so a cron probe can tell \"unhealthy\" (8) from \"could not " +
+			"ask\" (3/6). Needs a uza_ (admin_ro) token.",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := env.client(gf)
+			if err != nil {
+				return err
+			}
+			return runAdminHealth(env, gf, c, cmd, healthAll, healthStrict)
+		},
+	}
+	health.Flags().BoolVar(&healthAll, "all", false, "list every check, not just the ones needing attention")
+	health.Flags().BoolVar(&healthStrict, "strict", false, "also exit 8 when the overall status is warn or unknown")
 
 	usage := &cobra.Command{
 		Use:   "usage",
@@ -315,8 +361,88 @@ func newAdminCmd(env Env, gf *globalFlags) *cobra.Command {
 		},
 	}
 
-	cmd.AddCommand(users, runs, workers, usage, rateLimits, cliTokens, guardrailImpact, blockedRepos, newAdminAgentSourceCmd(env, gf), newAdminReviewCmd(env, gf))
+	cmd.AddCommand(users, runs, workers, health, usage, rateLimits, cliTokens, guardrailImpact, blockedRepos, newAdminAgentSourceCmd(env, gf), newAdminReviewCmd(env, gf))
 	return cmd
+}
+
+// runAdminHealth fetches and renders the admin health document, then returns the exit-8
+// sentinel when the overall verdict warrants it. The flow is deliberate: PRINT THE FULL
+// REPORT FIRST, then return uzicli.ErrHealthDanger (which ExitCodeFor maps to
+// ExitHealthDanger = 8). Exit 8 is a SUCCESS-path exit — the HTTP GET returned 200 carrying
+// an unhealthy verdict — so a transport/auth failure (c.AdminHealth error) is returned
+// straight through and keeps its own code (3/6), never 8.
+//
+// EVERY server string that lands in a table cell goes through the bounded package-local
+// cellText, never the unbounded uzicli.CellText: the document is server-authored from fixed
+// templates, but it interpolates already-sanitized identifiers an owner controls (worker
+// names, repo paths), and this is an ADMIN's terminal. cellText's 200-rune cap is what bounds
+// a hostile megabyte-long summary that CellText alone would print in full.
+func runAdminHealth(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, all, strict bool) error {
+	doc, err := c.AdminHealth(cmd.Context())
+	if err != nil {
+		return err
+	}
+	p := env.printer(gf)
+	if p.Format == uzicli.FormatJSON {
+		// --json emits the endpoint's document unchanged (a re-marshal of the decoded DTO).
+		// The verdict still drives the exit code so a probe piping --json to a log still
+		// distinguishes danger (8) from healthy (0).
+		if err := p.JSON(doc); err != nil {
+			return err
+		}
+		return healthVerdictError(doc.Status, strict)
+	}
+	rows := make([][]string, 0, len(doc.Checks))
+	for _, ck := range doc.Checks {
+		if !all && (ck.Severity == "ok" || ck.Severity == "na") {
+			continue
+		}
+		rows = append(rows, []string{
+			cellText(strings.ToUpper(ck.Severity)),
+			cellText(ck.ID),
+			cellText(healthSince(ck.Since)),
+			cellText(ck.Summary),
+		})
+	}
+	if len(rows) > 0 {
+		if err := p.Table([]string{"SEVERITY", "CHECK", "SINCE", "SUMMARY"}, rows); err != nil {
+			return err
+		}
+	} else if !all {
+		// Nothing needs attention and --all was not asked for: say so rather than print an
+		// empty table with only a header.
+		p.Println("all checks passing")
+	}
+	p.Printf("status: %s\n", strings.ToUpper(doc.Status))
+	p.Printf("checks: %d ok, %d warn, %d danger, %d unknown, %d na\n",
+		doc.Counts.OK, doc.Counts.Warn, doc.Counts.Danger, doc.Counts.Unknown, doc.Counts.NA)
+	return healthVerdictError(doc.Status, strict)
+}
+
+// healthVerdictError maps the overall status to the exit-8 sentinel when the CLI should
+// exit nonzero: always on danger, and additionally on warn/unknown under --strict. It
+// returns nil (exit 0) otherwise. The bare sentinel reads cleanly on the danger path; the
+// strict path wraps it with the actual status so the stderr line is honest that a warn or
+// unknown, not a danger, drove the exit-8 code.
+func healthVerdictError(status string, strict bool) error {
+	switch status {
+	case "danger":
+		return uzicli.ErrHealthDanger
+	case "warn", "unknown":
+		if strict {
+			return fmt.Errorf("overall health status is %s (--strict): %w", status, uzicli.ErrHealthDanger)
+		}
+	}
+	return nil
+}
+
+// healthSince renders a check's nullable RFC3339 `since` for the SINCE column: "-" when the
+// check carries none (an ok/na check, or a source with no timestamp).
+func healthSince(since *string) string {
+	if since == nil || *since == "" {
+		return "-"
+	}
+	return *since
 }
 
 // newAdminReviewCmd — `uzi admin review`. A container group (no RunE) of two READ-ONLY

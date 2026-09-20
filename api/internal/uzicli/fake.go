@@ -48,6 +48,7 @@ type FakeClient struct {
 	AdminUsers     []apitypes.UserDTO
 	AdminRuns      []apitypes.RunListItemDTO
 	AdminWorkers   []apitypes.AdminWorkerDTO
+	AdminHealthDoc apitypes.HealthDocDTO
 	AdminCLITokens []apitypes.AdminCLITokenDTO
 	AdminUsageV    apitypes.AdminUsageDTO
 	RateLimits     []apitypes.AdminRateLimitRowDTO
