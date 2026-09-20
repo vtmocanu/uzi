@@ -11,7 +11,7 @@
 --   1. issue runs plus the scheduled lanes open an MR review loop: kind IN
 --      ('issue','prompt','self_improve') (PRD #908 widened this from issue-only —
 --      chat/judge still out of scope). For the scheduled lanes runs.mr_state is made
---      reliable by forgesvc.SyncScheduledMRStates (PRD #908 M3); prompt runs are
+--      reliable by forgesvc.SyncBoardFreeMRStates (PRD #908 M3); prompt runs are
 --      issue-less (so the board-coupled ListMRWatchCandidates, which JOINs issues,
 --      never watched them) and self_improve shares one tracking issue (so that watcher
 --      recorded mr_state only for the newest cycle via DISTINCT ON (issue_iid) — and
