@@ -41,18 +41,25 @@ if [ "${1:-}" = run ] && [ "${2:-}" = list ]; then
         *) printf '103\tcompleted\tsuccess\tCI\n' ;;
       esac
       ;;
+    failure)
+      escape=$'\x1b'
+      printf '104\tcompleted\tfailure\tCI%s[2J\n' "$escape"
+      ;;
     *) echo "unknown MODE=$MODE" >&2; exit 1 ;;
   esac
   exit 0
 fi
 if [ "${1:-}" = run ] && [ "${2:-}" = view ]; then
-  if [ "$MODE" = transient ]; then
+  if [ "$MODE" = failure ]; then
+    escape=$'\x1b'
+    printf 'completed\tfailure\tlint%s[31m-repo\thttps://github.com/test/repo/actions/runs/104/job/999\t999\n' "$escape"
+  elif [ "$MODE" = transient ]; then
     n=0; [ -f "$VIEW_COUNT" ] && n=$(cat "$VIEW_COUNT")
     n=$((n+1)); printf '%s' "$n" > "$VIEW_COUNT"
-    if [ "$n" -eq 1 ]; then printf 'in_progress\t\tCI\thttps://example.invalid/job/103\n'
-    else printf 'completed\tsuccess\tCI\thttps://example.invalid/job/103\n'; fi
+    if [ "$n" -eq 1 ]; then printf 'in_progress\t\tCI\thttps://example.invalid/job/103\t103\n'
+    else printf 'completed\tsuccess\tCI\thttps://example.invalid/job/103\t103\n'; fi
   else
-    printf 'completed\tsuccess\tCI\thttps://example.invalid/job/%s\n' "${3:-run}"
+    printf 'completed\tsuccess\tCI\thttps://example.invalid/job/%s\t%s\n' "${3:-run}" "${3:-0}"
   fi
   exit 0
 fi
@@ -93,4 +100,30 @@ set -e
 grep -q 'workflow listing temporarily empty after runs were seen' "$WORK/transient.out" \
   || fail "transient empty listing used misleading never-seen wording: $(cat "$WORK/transient.out")"
 
-echo "PASS watch-run-ci: exact SHA discovery, short fallback, transient empty recovery"
+: > "$CALLS"
+MODE=failure; export MODE
+set +e
+bash -O xpg_echo "$SCRIPT" --sha "$FULL_SHA" --repo test/repo --interval 0 --max-ticks 2 > "$WORK/failure.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 1 ] || fail "confirmed failed job did not exit 1, rc=$rc: $(cat "$WORK/failure.out")"
+grep -Fq 'live log: gh api --allow-escape-sequences repos/test/repo/actions/jobs/999/logs' "$WORK/failure.out" \
+  || fail "failed job omitted live-log command: $(cat "$WORK/failure.out")"
+grep -Fq 'after run terminal: gh run view 104 --repo test/repo --job 999 --log-failed' "$WORK/failure.out" \
+  || fail "failed job omitted terminal log command: $(cat "$WORK/failure.out")"
+if LC_ALL=C grep -Fq $'\033' "$WORK/failure.out"; then
+  fail "untrusted workflow/job name emitted a raw escape byte: $(cat "$WORK/failure.out")"
+fi
+
+: > "$CALLS"
+set +e
+bash "$SCRIPT" --sha "$FULL_SHA" --interval 0 --max-ticks 2 > "$WORK/failure-derived.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 1 ] || fail "URL-derived failure case did not exit 1, rc=$rc: $(cat "$WORK/failure-derived.out")"
+grep -Fq 'live log: gh api --allow-escape-sequences repos/test/repo/actions/jobs/999/logs' "$WORK/failure-derived.out" \
+  || fail "URL-derived repo missing from live-log command: $(cat "$WORK/failure-derived.out")"
+grep -Fq 'after run terminal: gh run view 104 --repo test/repo --job 999 --log-failed' "$WORK/failure-derived.out" \
+  || fail "URL-derived repo missing from terminal command: $(cat "$WORK/failure-derived.out")"
+
+echo "PASS watch-run-ci: exact SHA discovery, short fallback, transient empty recovery, live failed-job logs"

@@ -184,9 +184,10 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    line and releases the claim. A classifier block prints the exact command for the
    user's `!` line.
 7. **Post-merge CI.** `S/watch-run-ci.sh --sha MERGE_SHA --interval 60` in the background.
-   Exit 0 green (a partial dispatch counts; confirm a gate fix another way), 1 red (fix on a
-   branch, never code to `main`; flake → rerun + file), 3 no run appeared, 4 superseded →
-   re-watch the current `main` head (references/merge-mechanics.md). Trail `main ci green`.
+   Exit 0 green (a partial dispatch counts; confirm a gate fix another way), 1 red (use the
+   per-job live-log commands it prints, then fix on a branch, never `main`; flake → rerun +
+   file), 3 no run appeared, 4 superseded → re-watch the current `main` head
+   (references/merge-mechanics.md). Trail `main ci green`.
 8. **Finish.** Remove the worktrees and branches you created (`git worktree remove`,
    `git branch -D`), print the final trail line, `S/claims.sh reap --repo OWNER/REPO`
    (drops claims whose PR merged or closed and orphans of dead sessions), and hand any
