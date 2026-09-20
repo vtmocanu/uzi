@@ -607,7 +607,7 @@ WHERE run_id = @run_id::uuid
 -- partial index idx_run_messages_tool_use_seq (run_id, seq DESC) WHERE kind = 'tool_use'
 -- (migration 00186), so the per-run first row is one index seek rather than a walk back
 -- over the trailing non-tool_use frames the UNIQUE (run_id, seq) index would force.
-SELECT DISTINCT ON (run_id) run_id, seq, kind, agent, agent_label, payload, created_at
+SELECT DISTINCT ON (run_id) run_id, seq, kind, agent, agent_instance, agent_label, payload, created_at
 FROM run_messages
 WHERE run_id = ANY(@run_ids::uuid[])
   AND kind = 'tool_use'

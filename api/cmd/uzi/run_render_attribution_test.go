@@ -280,9 +280,11 @@ func TestMilestoneLaneRowsLivesSupersedeM1(t *testing.T) {
 			}},
 		},
 		// A live current_activity that WOULD ride a global/M1 NOW row (its detail is the unique marker
-		// "api/internal/limits/window.go") — the lanes branch must suppress it entirely.
+		// "api/internal/limits/window.go") — the lanes branch must suppress it entirely. Its
+		// AgentInstance is "toolu_a", the m2 coder lane's instance, so lanesShowInstance matches and the
+		// global now-line is dropped (a bare role name would no longer be enough after the D4 change).
 		CurrentActivity: &apitypes.RunActivity{
-			Agent: "coder", AgentLabel: "coder busy", Tool: "Edit",
+			Agent: "coder", AgentInstance: "toolu_a", AgentLabel: "coder busy", Tool: "Edit",
 			Detail: "api/internal/limits/window.go", At: at, Seq: 12,
 		},
 	}
@@ -377,6 +379,55 @@ func TestMilestoneLaneRowsUnlanedLiveAgentShowsGlobalNow(t *testing.T) {
 	for _, sub := range []string{
 		"coder · Wire the limiter · Edit window.go · 0s ago",
 		"reviewer · Untagged review · Read limits_test.go · 0s ago",
+	} {
+		if !strings.Contains(out, sub) {
+			t.Errorf("`run get` output missing %q:\n%s", sub, out)
+		}
+	}
+}
+
+// TestMilestoneLaneRowsSameRoleUnlanedInstanceShowsGlobalNow is the M2 regression pin for the D4
+// SAME-ROLE instance defect (issue #1460). m2 has one live `reviewer` lane (AgentInstance
+// "toolu_laned"), and the run's current_activity is a SECOND live `reviewer` on NO lane, carrying a
+// DIFFERENT instance ("toolu_unlaned") and a distinctive detail ("unlaned_marker.go"). On the OLD
+// role-NAME match the laned reviewer's role matched the second reviewer, so the global now-line was
+// suppressed (countNowRows == 1) and the unlaned reviewer VANISHED (PRD #1353 D4 violation). The
+// instance match keeps the global now-line because the two instances differ, so BOTH reviewers stay
+// visible. Fails on the name match, passes on the instance match — the mutation-testing discipline.
+func TestMilestoneLaneRowsSameRoleUnlanedInstanceShowsGlobalNow(t *testing.T) {
+	at := time.Now().Add(2 * time.Hour) // relAge floors a not-yet timestamp to "0s"
+	r := apitypes.RunDTO{
+		ID: "run-1460-cli-samerole", Kind: "issue", Status: "running", IssueTitle: "Add rate limiting",
+		Milestones:           []apitypes.Milestone{{ID: "m1", Title: "Alpha"}, {ID: "m2", Title: "Beta"}},
+		MilestonesCompleted:  []string{"m1"},
+		MilestonesInProgress: []string{"m2"},
+		MilestonesLive: []apitypes.MilestoneLive{
+			{MilestoneID: "m2", Lanes: []apitypes.MilestoneLane{
+				{Agent: "reviewer", AgentInstance: "toolu_laned", AgentLabel: "Review A", Tool: "Read", Detail: "a.go", At: at},
+			}},
+		},
+		// A SECOND live reviewer on no lane: SAME role as the lane, DIFFERENT instance, distinctive detail.
+		CurrentActivity: &apitypes.RunActivity{
+			Agent: "reviewer", AgentInstance: "toolu_unlaned", AgentLabel: "Untagged review", Tool: "Read",
+			Detail: "unlaned_marker.go", At: at, Seq: 12,
+		},
+	}
+
+	var buf bytes.Buffer
+	p := uzicli.NewPrinter(&buf, false, false, true, false) // non-tty, non-json, no colour
+	if err := renderRunDetail(p, r); err != nil {
+		t.Fatalf("renderRunDetail: %v", err)
+	}
+	out := buf.String()
+	// The `NOW m2` lane row PLUS the global NOW row (2). The old role-name match suppressed the global
+	// row (countNowRows == 1) and the second reviewer disappeared.
+	if n := countNowRows(out); n != 2 {
+		t.Errorf("PRD #1353 D4: a same-role unlaned reviewer (distinct instance) must keep the global NOW row (2), got %d:\n%s", n, out)
+	}
+	// The unlaned reviewer's distinctive detail/label must be present (it was lost under the name match).
+	for _, sub := range []string{
+		"reviewer · Review A · Read a.go · 0s ago",
+		"reviewer · Untagged review · Read unlaned_marker.go · 0s ago",
 	} {
 		if !strings.Contains(out, sub) {
 			t.Errorf("`run get` output missing %q:\n%s", sub, out)

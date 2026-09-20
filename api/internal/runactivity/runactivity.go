@@ -33,12 +33,13 @@ const detailCapRunes = 200
 // per-kind payload, the created_at instant and the per-run seq. The handler builds
 // these from the batched query; the TUI builds them from its own frames.
 type Frame struct {
-	Kind       string
-	Agent      *string
-	AgentLabel *string
-	Payload    json.RawMessage
-	CreatedAt  time.Time
-	Seq        int32
+	Kind          string
+	Agent         *string
+	AgentLabel    *string
+	AgentInstance *string
+	Payload       json.RawMessage
+	CreatedAt     time.Time
+	Seq           int32
 }
 
 // Latest folds the newest tool_use frame in frames via FromFrame, skipping every
@@ -60,7 +61,7 @@ func Latest(frames []Frame) *apitypes.RunActivity {
 	if best == nil {
 		return nil
 	}
-	return FromFrame(best.Kind, best.Agent, best.AgentLabel, best.Payload, best.CreatedAt, best.Seq)
+	return FromFrame(best.Kind, best.Agent, best.AgentLabel, best.AgentInstance, best.Payload, best.CreatedAt, best.Seq)
 }
 
 // unsafeRune reports whether r must not reach a terminal. It is inlined from
@@ -141,7 +142,9 @@ type toolInput struct {
 // verbatim. Detail is the repo-relative file_path for Read/Edit/Write/MultiEdit, the
 // description for Agent and Bash (NEVER Bash's command), and empty otherwise.
 // AgentLabel and Detail are stripped-and-capped; At and Seq come from the frame.
-func FromFrame(kind string, agent, agentLabel *string, payload json.RawMessage, createdAt time.Time, seq int32) *apitypes.RunActivity {
+// agentInstance is passed through UNCHANGED onto RunActivity.AgentInstance (it is
+// COMPARED, never rendered) — it is NOT derived from the payload.
+func FromFrame(kind string, agent, agentLabel, agentInstance *string, payload json.RawMessage, createdAt time.Time, seq int32) *apitypes.RunActivity {
 	var p toolPayload
 	// A malformed payload yields a zero toolPayload rather than an error: the now line
 	// is advisory, and a frame the worker persisted is trusted to be a tool_use block,
@@ -153,11 +156,12 @@ func FromFrame(kind string, agent, agentLabel *string, payload json.RawMessage, 
 	}
 
 	act := &apitypes.RunActivity{
-		Agent:      deref(agent),
-		AgentLabel: deref(agentLabel),
-		Tool:       p.Name,
-		At:         createdAt,
-		Seq:        seq,
+		Agent:         deref(agent),
+		AgentInstance: deref(agentInstance),
+		AgentLabel:    deref(agentLabel),
+		Tool:          p.Name,
+		At:            createdAt,
+		Seq:           seq,
 	}
 
 	switch p.Name {

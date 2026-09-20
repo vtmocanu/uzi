@@ -128,7 +128,7 @@ func Derive(frames []Frame, milestones []apitypes.Milestone, inProgress []string
 		// the dispatch label sanitized via the exported Sanitize (the label is NOT carried on
 		// the lane's tool payload). FromFrame already strips+caps Detail and leaves Agent/Tool
 		// raw, matching the RunActivity wire contract — renderers fold those.
-		ra := runactivity.FromFrame(lf.Kind, sp(lf.Agent), sp(lf.AgentLabel), lf.Payload, lf.CreatedAt, lf.Seq)
+		ra := runactivity.FromFrame(lf.Kind, sp(lf.Agent), sp(lf.AgentLabel), sp(lf.AgentInstance), lf.Payload, lf.CreatedAt, lf.Seq)
 		lanesByMilestone[mid] = append(lanesByMilestone[mid], apitypes.MilestoneLane{
 			Agent:         ra.Agent,
 			AgentInstance: instance,
