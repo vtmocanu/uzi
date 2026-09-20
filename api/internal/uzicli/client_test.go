@@ -215,6 +215,47 @@ func TestHTTPClientWhoami(t *testing.T) {
 	}
 }
 
+// TestHTTPClientWhoamiVault pins the PRD #1251 M2 decode: WhoamiVault reads the SAME GET
+// /api/auth/me response and derives `locked` from the sibling top-level `vault.unlocked`.
+//   - vault.unlocked=false ⇒ locked true (the lock is shown);
+//   - vault.unlocked=true  ⇒ locked false (no hint);
+//   - `vault` absent (a pre-vault server) ⇒ locked false, NOT a spurious lock — the *bool
+//     decodes nil, which the absent-⇒-unlocked convention treats as unlocked.
+//
+// The viewer identity rides back off the same reply in every case.
+func TestHTTPClientWhoamiVault(t *testing.T) {
+	cases := []struct {
+		name       string
+		body       string
+		wantLocked bool
+	}{
+		{"unlocked=false is locked", `{"user":{"id":"u1","email":"a@b.c"},"vault":{"unlocked":false}}`, true},
+		{"unlocked=true is unlocked", `{"user":{"id":"u1","email":"a@b.c"},"vault":{"unlocked":true}}`, false},
+		{"absent vault is unlocked", `{"user":{"id":"u1","email":"a@b.c"}}`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/api/auth/me" {
+					t.Errorf("path = %q, want /api/auth/me", r.URL.Path)
+				}
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer srv.Close()
+			u, locked, err := newTestClient(srv).WhoamiVault(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if locked != tc.wantLocked {
+				t.Errorf("locked = %v, want %v (body %s)", locked, tc.wantLocked, tc.body)
+			}
+			if u.ID != "u1" || u.Email != "a@b.c" {
+				t.Errorf("user = %+v, want the same identity the reply carries", u)
+			}
+		})
+	}
+}
+
 func TestHTTPClientGetMySettings(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || r.URL.Path != "/api/me/settings" {
@@ -248,6 +289,26 @@ func TestHTTPClientGetMySettings(t *testing.T) {
 	}
 	if s.DarkTheme != nil || s.Typeface != nil {
 		t.Errorf("null appearance overrides should decode to nil, got dark=%v typeface=%v", s.DarkTheme, s.Typeface)
+	}
+}
+
+// TestFakeWhoamiVault pins the fake's PRD #1251 M2 knob: VaultLocked drives the `locked`
+// return so a TUI test can flip the vault-locked hint on/off, and the canned User rides back.
+func TestFakeWhoamiVault(t *testing.T) {
+	f := &FakeClient{User: apitypes.UserDTO{ID: "u1", Email: "a@b.c"}, VaultLocked: true}
+	u, locked, err := f.WhoamiVault(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !locked {
+		t.Errorf("locked = false, want true when VaultLocked is set")
+	}
+	if u.Email != "a@b.c" {
+		t.Errorf("user = %+v, want the canned identity", u)
+	}
+	f.VaultLocked = false
+	if _, locked, _ := f.WhoamiVault(context.Background()); locked {
+		t.Errorf("locked = true, want false when VaultLocked is clear")
 	}
 }
 

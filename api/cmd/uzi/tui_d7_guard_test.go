@@ -138,6 +138,14 @@ var d7UntrustedFields = []string{
 	// GET /api/version, drawn in the board footer skew banner (boardFooterLine) only inside
 	// cellText(...) before SkewWarning embeds it.
 	"serverVersion",
+	// The startup update prompt's server-authored release facts (PRD #1251 M1), copied off
+	// buildInfoMsg.latest into the model's updatePrompt sub-struct and drawn in the modal
+	// (renderUpdatePrompt / updateChoiceLabel) only through cellText / renderer.Plain. Like
+	// serverVersion they are the model field names, not the wire names (Version/Name/NotesURL),
+	// so this guard supplements the hostile-value render test rather than replacing it.
+	"latestVersion",
+	"latestName",
+	"latestNotesURL",
 	// Forge PullDTO / RepoDTO text drawn on the `pulls` screen (PRD #1255 M4a, D7): the PR
 	// source/target branch and the scoped repo's path are forge-authored free text, drawn
 	// through renderer.Plain (pullRow / pullSecondLine / tabStrip). PullDTO.Title is already

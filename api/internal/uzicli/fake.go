@@ -32,7 +32,11 @@ import (
 // render those identically. A test that wants a pending judge over a run with NO
 // review still needs the nil Reviews entry — otherwise it is asking about a 404.
 type FakeClient struct {
-	User           apitypes.UserDTO
+	User apitypes.UserDTO
+	// VaultLocked drives WhoamiVault's `locked` return (PRD #1251 M2), so a test can drive
+	// the TUI's tier-1 vault-locked hint on/off. Whoami ignores it (it stays {user}-only).
+	VaultLocked bool
+
 	Runs           []apitypes.RunListItemDTO
 	RunByID        map[string]apitypes.RunDTO
 	LogsByID       map[string][]apitypes.MessageDTO

@@ -25,6 +25,16 @@ type boardState struct {
 	admin       bool
 	adminDenied bool
 
+	// runsAdmin is the PROVENANCE of the currently-resident run set: the admin-ness of the
+	// board whose accepted ListRuns reply is held in runs. It is set ONLY when a reply is
+	// accepted (in apply), so it lags the live admin toggle during the window after keyAdmin
+	// flips admin but before the matching reply lands — runs still holds the PREVIOUS board's
+	// set then. The vault band's cross-tenant owner-filter (ownParkedOnVaultCount, D11) scopes on
+	// THIS, never on the live toggle, so a stranger's parked run in a stale admin set is never
+	// miscounted into the viewer's band during that window. Defaults false, matching the
+	// non-admin Init fetch.
+	runsAdmin bool
+
 	// reqSeq / waitID / tickGen implement the request-generation guard (PRD #1130 M1 D2).
 	//
 	// reqSeq is the monotonic id minted for each board fetch (startBoardReq bumps it). waitID
@@ -93,6 +103,10 @@ func (b *boardState) apply(msg boardRunsMsg) {
 	b.err = nil
 	b.errStreak = 0
 	b.runs = msg.runs
+	// Record the accepted set's provenance. This is the single site runs are accepted (the
+	// error path above leaves runs — and so runsAdmin — untouched), and msg.admin == b.admin
+	// is guaranteed by the early return, so this is exactly the admin-ness of the held runs.
+	b.runsAdmin = msg.admin
 	b.clampCursor()
 }
 
@@ -247,7 +261,7 @@ func (m tuiModel) boardKey(k string) (tea.Model, tea.Cmd) {
 		// becomes the new waitID, so the next periodic tick does not stack a second poll on top
 		// of this one and any periodic reply still in flight is superseded (its stale reqID is
 		// dropped); this reply's own reqID clears the guard.
-		return m, tea.Batch((&m).startBoardReq(), m.fetchRateLimitsCmd(), m.fetchSettingsCmd())
+		return m, tea.Batch((&m).startBoardReq(), m.fetchRateLimitsCmd(), m.fetchSettingsCmd(), m.fetchVaultCmd())
 	case keyAdmin:
 		m.board.admin = !m.board.admin
 		m.board.adminDenied = false
@@ -336,6 +350,115 @@ func (m tuiModel) tabStrip() string {
 	return out
 }
 
+// vaultLockedReasonSubstr is the lowercased marker matched on a run's HealthReason to count
+// runs parked because the viewer's vault is locked (PRD #1251 M3, tier-2 escalation input,
+// D10/R3). The full server string is reasonVaultLocked = "your vault is locked, so this run
+// can't start" (api/internal/workersvc/health.go), but that is UNEXPORTED in workersvc and
+// cmd/uzi (package main) must not import the server stack, so the count matches this lowercased
+// substring instead. A reword upstream would break the count silently — mitigated by pinning
+// the exact server string in a regression test (TestVaultBandMatchesServerReasonString); presence
+// never depends on it (it comes from WhoamiVault, D10), so a reword degrades only the tier-2
+// count, never whether the lock is shown.
+const vaultLockedReasonSubstr = "vault is locked"
+
+// ownParkedOnVaultCount counts the VIEWER'S OWN board runs parked because the vault is locked —
+// the best-effort tier-2 escalation input (PRD #1251 M3, R3/R6). A run counts when its
+// HealthReason contains vaultLockedReasonSubstr (case-insensitive); the reason is only a
+// best-effort input (it is run-health-gated and collapses into the generic waiting_worker
+// status, D10), so a run-health-off board simply counts 0 and the indicator stays at the M2
+// tier-1 hint.
+//
+// It is computed over m.board.runs — the FULL loaded set, not the scrolled window — matching
+// boardSummary's run-source convention, so the count is stable while the board scrolls.
+//
+// Scoping (D11): the owner-filter decision keys on the PROVENANCE of the currently-resident run
+// set (m.board.runsAdmin — the admin-ness of the board whose accepted ListRuns reply is held),
+// NOT the live admin toggle. On an own-provenance set ListRuns was owner-scoped, so every run is
+// the viewer's own and all matching runs count. On an admin-provenance set AdminListRuns returned
+// EVERY user's runs with their health reasons present (RunDTO.HealthReason rides unconditionally,
+// run.go), so the count is scoped to runs the viewer OWNS via OwnerEmail — it never counts or
+// blames another user's locked vault the admin cannot act on. Keying on provenance (not the toggle)
+// closes the transient window after keyAdmin flips admin→own but before the own reply lands, when
+// the stale ALL-USERS set is still resident: the owner-filter stays applied until the own set
+// arrives, so a stranger's run is never counted into the viewer's band. If the viewer identity is
+// unknown (selfEmail == "", whoami failed) the band is suppressed on an admin-provenance set
+// (count 0) rather than risk attributing a stranger's lock to the admin.
+func (m tuiModel) ownParkedOnVaultCount() int {
+	admin := m.board.runsAdmin
+	if admin && m.selfEmail == "" {
+		return 0
+	}
+	n := 0
+	for _, r := range m.board.runs {
+		if r.HealthReason == nil || !strings.Contains(strings.ToLower(*r.HealthReason), vaultLockedReasonSubstr) {
+			continue
+		}
+		if admin && (r.OwnerEmail == nil || !strings.EqualFold(*r.OwnerEmail, m.selfEmail)) {
+			continue
+		}
+		n++
+	}
+	return n
+}
+
+// vaultIndicatorLine is the vault-locked andon line (PRD #1251 M2/M3, D3/D4/D5): a STEADY (never
+// blinking), non-dismissable line shown when the viewer's vault is locked, and "" otherwise — so
+// it auto-clears on its own the moment WhoamiVault reports the vault unlocked (D3). It is a line
+// of its OWN, adjacent to and never replacing the rate-limit strip (D5): the two are distinct
+// signals and can be visible together.
+//
+// Two mutually-exclusive forms share this ONE optional line, so boardCapacity's single-row
+// reservation (via vaultIndicatorLine() != "") stays correct without change:
+//   - M3 tier-2 amber needs-you band, when ≥1 of the viewer's OWN runs is parked on the vault
+//     (ownParkedOnVaultCount ≥ 1): the escalated, filled attention surface (vaultBand).
+//   - M2 tier-1 quiet faint hint, when locked but nothing is parked (run-health off, or count 0):
+//     the baseline informational hint (R6 — the lock still shows because WhoamiVault reports it).
+//
+// The signal is carried by the WORDS "vault locked", never colour alone (D4). Under
+// colorprofile.Ascii / NO_COLOR the faint SGR is stripped downstream, so the ascii form drops
+// the lock glyph for a plain "[locked]" marker that survives with no colour at all.
+func (m tuiModel) vaultIndicatorLine() string {
+	if !m.vaultLocked {
+		return ""
+	}
+	if n := m.ownParkedOnVaultCount(); n >= 1 {
+		return m.vaultBand(n)
+	}
+	if m.profile == colorprofile.Ascii {
+		return " [locked] vault locked"
+	}
+	return " " + m.pal.faint.Render("🔒 vault locked")
+}
+
+// vaultBand is the M3 tier-2 amber needs-you band (PRD #1251 M3, D2/D8): the ONE filled surface,
+// a full-width amber fill with near-bg ink (pal.amber / pal.bandFg), shown when the vault is
+// locked AND n ≥ 1 of the viewer's own runs are parked on it. Steady (never blinking, D3),
+// non-dismissable, and it auto-clears when the lock clears (vaultIndicatorLine returns "" then).
+// It shows a COUNT, never the raw HealthReason, so no untrusted text reaches the frame (D7) — the
+// hostile-render test proves the count path cannot inject. The copy aligns with
+// vault_lock_notice.go and points the fix off-TUI, in the web app (there is no CLI
+// vault-unlock command — unlock is a web/API surface only).
+//
+// It reuses the detail screen's attentionBanner fill+ink convention (paintSeg fg/bg, ▌ cap, full
+// width padded to m.width) so the board's one filled surface reads identically to the detail's.
+// Under colorprofile.Ascii the amber fill is stripped for a plain ascii-safe band whose WORDS
+// ("VAULT LOCKED", "N run(s) parked", "unlock in the web app to resume") carry the signal with no colour (D4).
+func (m tuiModel) vaultBand(n int) string {
+	runsWord := "runs"
+	if n == 1 {
+		runsWord = "run"
+	}
+	count := itoa(n) + " " + runsWord + " parked"
+	if m.profile == colorprofile.Ascii {
+		return "[VAULT LOCKED] " + count + " - unlock in the web app to resume"
+	}
+	amber, fg := m.pal.amber, m.pal.bandFg
+	seg := func(bold bool, s string) string { return paintSeg(fg, amber, bold, s) }
+	left := seg(true, "▌ VAULT LOCKED") +
+		seg(false, " · "+count+" — unlock in the web app to resume")
+	return clampVisual(padSeg(left, m.width, amber), m.width)
+}
+
 func (m tuiModel) renderBoard() string {
 	var sb strings.Builder
 	rows := m.board.visible()
@@ -375,6 +498,13 @@ func (m tuiModel) renderBoard() string {
 	// only when at least one token is readable AND shown; otherwise nothing (no strip).
 	if strip := m.boardRateLimitStrip(time.Now()); strip != "" {
 		sb.WriteString(strip + "\n")
+	}
+	// The tier-1 vault-locked hint (PRD #1251 M2, D5): its OWN line directly under the strip,
+	// never replacing or hiding it — both are distinct signals and can show together. Its row
+	// is reserved in boardCapacity via the SAME vaultIndicatorLine() check, so the two spots
+	// cannot drift.
+	if vault := m.vaultIndicatorLine(); vault != "" {
+		sb.WriteString(vault + "\n")
 	}
 	sb.WriteString("\n")
 
@@ -659,6 +789,12 @@ func (m tuiModel) boardCapacity() int {
 	// The rate-limit strip, when present, adds one line between the wordmark and the blank
 	// below it. Recomputed here (cheap) so the row-window math matches renderBoard's layout.
 	if m.boardRateLimitStrip(time.Now()) != "" {
+		chrome++
+	}
+	// The tier-1 vault-locked hint (PRD #1251 M2) is its own line under the strip when shown;
+	// reserve one row for it the SAME way (calling vaultIndicatorLine, not re-deriving the
+	// show-condition) so the row window and renderBoard's layout cannot drift by a line.
+	if m.vaultIndicatorLine() != "" {
 		chrome++
 	}
 	// The selected row's variable-height second "now" line (D4) reserves one physical line, so
