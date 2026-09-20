@@ -188,6 +188,6 @@ unhealthy verdict, so the full report prints before the process exits nonzero.
 A transport or auth failure keeps its own code (`3`/`6`) rather than also
 returning `8`, so a probe can always tell "the instance is unhealthy" apart
 from "I could not even ask" — see the full exit-code table in
-[uzi CLI](cli.md#agents-json-and-exit-codes). `uzi admin workers` is the
+[uzi CLI](cli.md#agents---json-and-exit-codes). `uzi admin workers` is the
 companion read for the cross-user roll-health detail behind a `warn`/`danger`
 on `fleet.roll`.
