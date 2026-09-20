@@ -4,7 +4,7 @@
 -- fleet-independent controller-report trace, and the DANGER-episode + per-admin snooze
 -- storage. Four ADDITIVE tables, one partial unique index: an N-1 api reading the
 -- pre-existing surface during a rolling release is unaffected (nothing here alters a
--- worker-facing table). DRAFT number 00238 above the live head 00237; the lead renumbers
+-- worker-facing table). DRAFT number 00241 above the live head 00237; the lead renumbers
 -- above the live head at landing.
 
 -- controller_report_status: the fleet-INDEPENDENT trace of "when did the controller last
