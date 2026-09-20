@@ -1578,6 +1578,26 @@ docker tier's own privileged-namespace ruling (Q-B) and Decision 3's
 separate-mount-namespace invariant are recorded in
 `prds/done/83-docker-capable-worker.md`.
 
+**Codex on a hosted worker needs a third identity, and that is opt-in.** The
+restricted-tier namespace above starts every worker single-uid, which is one
+identity short of what the Codex harness's fail-closed launcher requires (a
+trusted `worker`, a credentialed `runner`, and a command-executing
+`runner-cmd`). An opt-in chart knob (`workers.uidSplit.enabled`) reuses the
+uid-split mechanism the image already ships for compose, starting the
+`worker` and `seed-nix` containers root with a fixed capability set so the
+existing entrypoint establishes the split before dropping to `worker`; the
+kube-native worker namespace's PodSecurity `enforce` tier moves from
+`restricted` to `baseline` only while it is on. A second knob
+(`workers.codex.commandSandbox`) makes the command sandbox's Landlock
+requirement `required` (fail closed on a kernel without it, the default) or
+`best-effort` (run unconfined on such a kernel, relying on the uid split
+alone). A worker advertises the Codex capability only when the split is
+active and Landlock is usable under the configured mode; otherwise it never
+claims a Codex-indicating run, which stays queued instead. See
+[PRD #1493](prds/1493-codex-k8s-uid-split-profile.md) for the full design and
+Decision Log, and [docs/configuration.md](docs/configuration.md#controller)
+for the operator-facing knobs.
+
 ### Worker version and upgrade health
 
 A worker's `version` is written **only at register** (`workersvc.Register`), so a worker

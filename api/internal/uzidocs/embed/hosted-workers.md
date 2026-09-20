@@ -100,6 +100,17 @@ That's expected while it's cordoned — it isn't a bug, and it isn't stuck. It
 resumes claiming runs on its own once the roll finishes. There's no manual
 way to cordon a worker yourself; it's driven entirely by the cluster.
 
+## My Codex run says "no Codex-capable worker is online"
+
+A hosted worker only claims a Codex run once it can actually run one. Two
+things can leave it unable to, and both mean the run stays queued rather than
+being claimed and then failing partway through: the fleet may not have the
+opt-in uid-split profile Codex needs turned on, or a node's kernel may lack
+Landlock while the fleet requires it. This applies to a full Codex run and
+to Codex judge/review advice alike — ask your admin to check the
+[operator knobs](./configuration.md#controller) (`UZI_WORKER_UID_SPLIT`,
+`UZI_CODEX_COMMAND_SANDBOX`) that control this.
+
 ## Disk self-heal
 
 A hosted worker also reports its disk usage now — the same CPU/memory gauges
