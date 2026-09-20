@@ -73,11 +73,13 @@ re-provision it.
 ## Status
 
 A hosted worker's online/offline/busy status works exactly like any other
-worker's — a heartbeat, nothing pod-level. If one never comes online, there's
-no in-app diagnostic yet; ask an admin to check the pod directly. (A worker that came online
-once and then failed an upgrade DOES have one now — see
+worker's — a heartbeat, nothing pod-level. If one never comes online, that's
+one of the checks an admin can now see cross-user in **Admin → Health**
+(`fleet.roll`, see [Admin health](admin-health.md)) — it names the blocking
+container and reason for a stuck roll, across every owner's fleet, without
+anyone needing to check the pod by hand. (A worker that came online once and
+then failed an upgrade also shows in your own **Settings → Workers** — see
 [Worker versions and upgrades](worker-upgrades.md).)
-(`kubectl -n <worker namespace> get pods`).
 
 ## Draining and cordoned
 

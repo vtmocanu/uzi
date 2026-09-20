@@ -94,7 +94,9 @@ tag can be pinned independently and a hosted worker is compared against the tag 
 reports rolling to, so a pinned worker reads *up to date* at its pinned tag. `uzi worker list`
 carries the same states in an `UPGRADE` column rendered for that surface (`FAILED`, and `-` for
 no badge), documented in [uzi CLI](cli.md#upgrade-status) — a second definition rather than a
-deferral, so a state added or renamed must be edited in both.
+deferral, so a state added or renamed must be edited in both. This page is your own fleet;
+an admin sees the same roll health **across every owner** from Admin → Health
+(`fleet.roll`) — see [Admin health](admin-health.md).
 
 **A reused agent image reads *up to date*, not *outdated*.** Recall the version is baked at
 build time and reported at registration. When a release leaves the worker agent unchanged, the
