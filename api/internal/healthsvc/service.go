@@ -13,6 +13,7 @@ package healthsvc
 
 import (
 	"context"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -46,6 +47,23 @@ const (
 	groupControl      = "control"
 	groupIntegrations = "integrations"
 	groupHousekeeping = "housekeeping"
+)
+
+// healthDetectorState is the tri-state read of the run-health kill switch that gates the
+// sole writer of the waiting_worker signal. It is deliberately three-valued: a read that
+// ERRORS is distinct from a known-off detector, because in neither case can fleet.capacity
+// or queue.waiting be trusted to read green — a missing signal is `unknown`, never `ok`
+// (D6). This mirrors how release.check degrades a settings-read error to `unknown`.
+type healthDetectorState int
+
+const (
+	// healthDetectorEnabled: the detector is on, so the run tables carry a live signal.
+	healthDetectorEnabled healthDetectorState = iota
+	// healthDetectorDisabled: the detector is off, so the signal is absent (known-off).
+	healthDetectorDisabled
+	// healthDetectorUnknown: the kill-switch read failed, so we cannot tell whether the
+	// signal is being written; the two derived checks must degrade to `unknown`.
+	healthDetectorUnknown
 )
 
 // Store is the exact slice of read methods the M1 checks need. *store.Queries satisfies
@@ -164,18 +182,28 @@ func (s *Service) Evaluate(ctx context.Context) (Doc, error) {
 		return Doc{}, err
 	}
 
-	healthEnabled := true
+	// Resolve the run-health kill switch as a tri-state. A read ERROR is NOT treated as
+	// enabled: fleet.capacity and queue.waiting then degrade to `unknown` rather than query
+	// the run tables for a possibly-green verdict, exactly as when the detector is known-off
+	// (D6, "a health page must never read green while blind"). A nil Settings collaborator
+	// keeps the known-enabled default, as before.
+	healthState := healthDetectorEnabled
 	if s.cfg.Settings != nil {
-		if v, herr := s.cfg.Settings.HealthEnabled(ctx); herr == nil {
-			healthEnabled = v
+		v, herr := s.cfg.Settings.HealthEnabled(ctx)
+		switch {
+		case herr != nil:
+			slog.Warn("healthsvc: run-health kill switch read failed", "error", herr)
+			healthState = healthDetectorUnknown
+		case !v:
+			healthState = healthDetectorDisabled
 		}
 	}
 
 	checks := []apitypes.HealthCheckDTO{
 		s.checkFleetRoll(now, workers),
-		s.checkFleetCapacity(ctx, now, healthEnabled),
+		s.checkFleetCapacity(ctx, now, healthState),
 		s.checkFleetDisk(now, workers),
-		s.checkQueueWaiting(ctx, now, healthEnabled),
+		s.checkQueueWaiting(ctx, now, healthState),
 		s.checkQueueUndispatched(ctx, now),
 		s.checkDB(ctx),
 		s.checkSlackSocket(now),

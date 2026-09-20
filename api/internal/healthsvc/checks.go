@@ -211,12 +211,17 @@ func (s *Service) checkFleetRoll(now time.Time, workers []store.ListAllWorkersRo
 // checkFleetCapacity is danger when, for at least fleetCapacityDanger, an owner has a
 // waiting_worker run and zero usable (online, non-draining, fresh-heartbeat) workers.
 // `unknown` when health_enabled is off — the sole writer of waiting_worker is gated by it,
-// so the signal is absent, not green (D6). Below the threshold it is ok (a transient claim
-// delay), and there is no warn band.
-func (s *Service) checkFleetCapacity(ctx context.Context, now time.Time, healthEnabled bool) apitypes.HealthCheckDTO {
+// so the signal is absent, not green (D6) — AND `unknown` when the kill-switch read itself
+// failed (we cannot tell whether the writer is running, so the run tables must not be
+// queried for a green verdict). Below the threshold it is ok (a transient claim delay), and
+// there is no warn band.
+func (s *Service) checkFleetCapacity(ctx context.Context, now time.Time, health healthDetectorState) apitypes.HealthCheckDTO {
 	c := s.base("fleet.capacity")
-	if !healthEnabled {
+	switch health {
+	case healthDetectorDisabled:
 		return unknownHealthDisabled(c)
+	case healthDetectorUnknown:
+		return unknownHealthReadFailed(c)
 	}
 	rows, err := s.cfg.Store.ListOwnersWaitingNoCapacity(ctx, pgconv.Time(now.Add(-s.heartbeatStale())))
 	if err != nil {
@@ -279,11 +284,15 @@ func (s *Service) checkFleetDisk(now time.Time, workers []store.ListAllWorkersRo
 
 // checkQueueWaiting bands the oldest waiting_worker run by age: warn at queueWaitingWarn,
 // danger at queueWaitingDanger. `unknown` when health_enabled is off (the writer is gated
-// by it, D6).
-func (s *Service) checkQueueWaiting(ctx context.Context, now time.Time, healthEnabled bool) apitypes.HealthCheckDTO {
+// by it, D6), and `unknown` when the kill-switch read itself failed (the signal cannot be
+// trusted to read green, so the run tables are not queried).
+func (s *Service) checkQueueWaiting(ctx context.Context, now time.Time, health healthDetectorState) apitypes.HealthCheckDTO {
 	c := s.base("queue.waiting")
-	if !healthEnabled {
+	switch health {
+	case healthDetectorDisabled:
 		return unknownHealthDisabled(c)
+	case healthDetectorUnknown:
+		return unknownHealthReadFailed(c)
 	}
 	ts, err := s.cfg.Store.OldestWaitingWorkerRun(ctx)
 	if err != nil {
@@ -580,6 +589,17 @@ func (s *Service) checkReleaseCheck(ctx context.Context, now time.Time) apitypes
 func unknownHealthDisabled(c apitypes.HealthCheckDTO) apitypes.HealthCheckDTO {
 	c.Severity = sevUnknown
 	c.Summary = "The run-health detector is disabled, so this signal is unavailable."
+	return c
+}
+
+// unknownHealthReadFailed is the shared `unknown` verdict for those same two checks when the
+// run-health kill switch could not be read: with the detector's state indeterminate we
+// cannot tell whether the waiting_worker signal is being written, so the check must not
+// query the run tables for a green verdict (D6). Its summary is deliberately distinct from
+// the known-disabled one.
+func unknownHealthReadFailed(c apitypes.HealthCheckDTO) apitypes.HealthCheckDTO {
+	c.Severity = sevUnknown
+	c.Summary = "Run-health detection state could not be determined."
 	return c
 }
 
