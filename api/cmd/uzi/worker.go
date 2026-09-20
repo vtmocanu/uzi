@@ -354,6 +354,32 @@ func upgradeCell(w apitypes.WorkerDTO) string {
 	}
 }
 
+// blockingCell renders the compact container/reason behind an upgrade_failed roll for
+// `uzi admin workers`'s BLOCKING column (PRD #1484 M3) — the cross-user answer to "why is
+// this owner's worker stuck rolling".
+//
+// "-" when neither field is set (every status other than upgrade_failed). Otherwise
+// "<container>: <reason>" when both are present, or whichever single field is. Both are the
+// short k8s enums the controller reports and the api already sanitizes at write time
+// (control/format chars stripped, 64-byte cap) — `state.waiting.message` is deliberately
+// never relayed — but this renders into an ADMIN's terminal across tenants, so it goes
+// through cellText all the same, the same render-boundary discipline every other cell here
+// uses.
+func blockingCell(w apitypes.WorkerDTO) string {
+	container := strOr(w.UpgradeBlockingContainer, "")
+	reason := strOr(w.UpgradeBlockingReason, "")
+	switch {
+	case container != "" && reason != "":
+		return cellText(container + ": " + reason)
+	case reason != "":
+		return cellText(reason)
+	case container != "":
+		return cellText(container)
+	default:
+		return "-"
+	}
+}
+
 // outboxCell renders a worker's outbox depth for `uzi worker list`'s and
 // `uzi admin workers`'s OUTBOX column (PRD #1391 M5) — "how many of this worker's
 // updates are buffered locally waiting to replay to the api".
