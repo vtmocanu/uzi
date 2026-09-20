@@ -259,7 +259,21 @@ func TestHealthChecksLiveDB(t *testing.T) {
 	}
 	if after != before+1 {
 		t.Errorf("enabling the paused user's only schedule changed the count by %d, want +1 "+
-			"(proves the HAVING enabled filter and the pause predicate)", after-before)
+			"(proves the HAVING enabled filter)", after-before)
+	}
+	// Targeted proof of the PAUSE predicate itself: pausing a user who ALREADY owns an enabled
+	// schedule (the seeded `unpaused` negative) must raise the count by exactly one. Without
+	// this the WHERE pause clause could be dropped entirely and every assertion above would
+	// still pass — `unpaused` already contributes to the baseline `>= 2`, and the enable-flip
+	// delta exercises only the HAVING filter.
+	mustExec(ctx, t, pool, `UPDATE users SET schedules_paused = true WHERE id = $1`, unpaused)
+	withUnpaused, err := q.CountUsersPausedWithEnabledSchedules(ctx, ts(now))
+	if err != nil {
+		t.Fatalf("re-count after pausing the unpaused user: %v", err)
+	}
+	if withUnpaused != after+1 {
+		t.Errorf("pausing a user with an enabled schedule changed the count by %d, want +1 "+
+			"(proves the pause predicate)", withUnpaused-after)
 	}
 
 	// -------------------------------------------------------------------------

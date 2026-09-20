@@ -431,8 +431,11 @@ func runAdminHealth(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Comman
 }
 
 // healthVerdictError maps the overall status to the exit-8 sentinel when the CLI should
-// exit nonzero: always on danger, and additionally on warn/unknown under --strict. It
-// returns nil (exit 0) otherwise. The bare sentinel reads cleanly on the danger path; the
+// exit nonzero: always on danger, and additionally on warn/unknown under --strict. A plain
+// ok returns nil (exit 0). Any value OUTSIDE the closed overall enum (ok | warn | danger |
+// unknown — "na" is never an overall status) is a malformed document and returns an error:
+// an empty Status from a `{}` body must NOT read as healthy to a cron probe, or exit 0 would
+// silently mask a broken endpoint. The bare sentinel reads cleanly on the danger path; the
 // strict path wraps it with the actual status so the stderr line is honest that a warn or
 // unknown, not a danger, drove the exit-8 code.
 func healthVerdictError(status string, strict bool) error {
@@ -443,8 +446,12 @@ func healthVerdictError(status string, strict bool) error {
 		if strict {
 			return fmt.Errorf("overall health status is %s (--strict): %w", status, uzicli.ErrHealthDanger)
 		}
+		return nil
+	case "ok":
+		return nil
+	default:
+		return fmt.Errorf("invalid overall health status %q", status)
 	}
-	return nil
 }
 
 // healthSince renders a check's nullable RFC3339 `since` for the SINCE column: "-" when the

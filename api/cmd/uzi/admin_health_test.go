@@ -163,6 +163,29 @@ func TestAdminHealthUnknownWithoutStrictIsZero(t *testing.T) {
 	}
 }
 
+// A document whose overall Status is empty or outside the closed enum (ok | warn | danger |
+// unknown — "na" is never an overall status) is MALFORMED, not healthy. The CLI must exit
+// nonzero-but-not-8 so a cron probe reads "could not trust the answer" rather than a false
+// green. The concrete regression this pins: a `{}` body leaves Status empty, which reached the
+// old `return nil` and exited 0 — a broken endpoint reporting success.
+func TestAdminHealthMalformedStatusIsRejected(t *testing.T) {
+	for _, status := range []string{"", "bogus", "na"} {
+		t.Run("status="+status, func(t *testing.T) {
+			fc := &uzicli.FakeClient{AdminHealthDoc: healthDoc(status, dbOKCheck())}
+			_, _, code := runCLI(t, fakeEnv(fc), "admin", "health")
+			if code == uzicli.ExitOK {
+				t.Fatalf("malformed status %q exited 0: a broken document must not read as healthy to a probe", status)
+			}
+			if code == uzicli.ExitHealthDanger {
+				t.Fatalf("malformed status %q exited 8 (danger): it is 'could not trust the answer', not danger", status)
+			}
+			if code != uzicli.ExitGeneric {
+				t.Fatalf("malformed status %q exit = %d, want %d (generic)", status, code, uzicli.ExitGeneric)
+			}
+		})
+	}
+}
+
 // A transport/auth failure keeps its EXISTING code and never becomes 8: only a 200 response
 // can yield 8, so a probe can tell "unhealthy" (8) from "could not ask" (3/6). A 401 → exit 3,
 // a 5xx/unreachable → exit 6, under --strict too.
