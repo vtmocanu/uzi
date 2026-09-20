@@ -74,6 +74,15 @@ var failOrigins = []string{
 	// rewrote published history against the steer), so it is JUDGE-ELIGIBLE — deliberately
 	// absent from BOTH preStartInfraFailOrigins and neverJudgeFailOrigins (judge_enqueue.go).
 	"history_rewritten",
+	// issue #1367: a kind='task' (handoff) run created status='queued' with dispatched_at NULL
+	// that the CLI never dispatched (push/dispatch never landed) is terminalized by the
+	// undispatched-handoff sweep (SweepTaskNeverDispatched) past its dispatch grace window.
+	// SERVER-DERIVED, NOT worker-reportable (stamped inside the sweep's conditional UPDATE, so
+	// it is deliberately absent from workerReportableFailOrigins — a worker reporting it is a
+	// forgery CoerceFailOrigin drops). Excluded from the judge (neverJudgeFailOrigins,
+	// judge_enqueue.go): an undispatched run was never claimed, so there is no agent attempt or
+	// trace to retrospect.
+	"task_undispatched",
 }
 
 // failOriginSet is the lookup form. Built once; failOrigins stays the declaration so

@@ -3309,6 +3309,31 @@ UPDATE runs SET
 WHERE id = @id AND user_id = @user_id
   AND status = 'pool_wait';
 
+-- name: SweepTaskNeverDispatched :many
+-- PRD #400 Decision 6 orphan reaper (issue #1367): a kind='task' (handoff) run is created
+-- status='queued' with dispatched_at NULL and is claimable only once the CLI seeds its
+-- uzi/task/<id> branch and stamps dispatched_at (DispatchTaskRun). If the push or the dispatch
+-- call never lands (push failure, dispatch UPDATE never commits, client crash/SIGKILL), the row
+-- is queued+undispatched forever — ClaimRun never offers it (kind<>'task' OR dispatched_at IS
+-- NOT NULL) and no other sweep touches it. Past the dispatch grace window, terminalize it.
+-- No D11 terminal-pending-lease carve-out is needed: an undispatched task was never claimed
+-- (worker_id NULL, no worker_active_runs row), so the lease/pending_overflow predicates are
+-- vacuously false. status='queued' AND dispatched_at IS NULL makes this the single winner against
+-- a racing DispatchTaskRun (which now also guards status='queued'): exactly one conditional
+-- UPDATE matches the row.
+UPDATE runs SET status = 'failed', status_since = now(), failure_reason = @failure_reason,
+    fail_origin = 'task_undispatched',
+    finished_at = now(),
+    -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag or in-progress snapshot.
+    milestones_in_progress = NULL,
+    milestones_agents = NULL,
+    pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
+    credential_switch_requested_at = NULL, credential_switch_generation = NULL,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE kind = 'task' AND status = 'queued' AND dispatched_at IS NULL AND created_at < @cutoff
+RETURNING id, user_id, status;
+
 -- name: SweepRunningTimeout :many
 -- running past RUN_TIMEOUT → failed (a hung agent is failed without a human).
 -- Stamps move_pending_since so the (forge-free) sweep leaves the isolated
@@ -5069,7 +5094,7 @@ SELECT id, user_id, status, auto_approve,
        started_at, last_activity_at, updated_at, status_since,
        health, health_reason, health_since, health_notified_at,
        budget_wall_seconds, budget_paused_seconds, budget_extension_seconds, interactive,
-       repo_id, kind, required_capabilities, completion_contract_version,
+       repo_id, kind, dispatched_at, required_capabilities, completion_contract_version,
        harness, codex_material_revision, codex_secret_id, worker_id
 FROM runs
 WHERE status IN ('queued', 'running', 'awaiting_approval')
