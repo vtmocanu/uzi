@@ -216,6 +216,36 @@ describe("Issue #1492: ensureCodexSharedDirectory create-only group repair (port
     }
   });
 
+  it("opt-in still REJECTS a dir whose OWNER is not expect.uid (recovery does not fire, dir left in place)", async () => {
+    const base = await freshTmp();
+    try {
+      const parent = path.join(base, "agent-home");
+      await makeSetgidParent(parent, uid, gA); // child inherits gid A, owner = this test uid
+      const child = path.join(parent, "codex-advice-data");
+      await fs.mkdir(child, { mode: 0o2770 });
+      const originalInode = await inodeOf(child);
+      // expect.uid is a DIFFERENT uid than the dir's actual owner (this process). The recovery
+      // guard requires `before.uid === expect.uid`, so it must NOT fire on a foreign-owned dir —
+      // the deliberate "never adopt a dir we don't own" stance — and the strict owner check rejects.
+      const foreignUid = uid + 1;
+      await assert.rejects(
+        ensureCodexSharedDirectory(child, { uid: foreignUid, gid: gB }, { recreateDisposableWorkerGroupDir: true, recoverGid: gA }),
+        /unexpected owner or group/,
+        "an EEXISTing dir owned by a uid other than expect.uid is rejected, not recovered",
+      );
+      // Discriminating assertion: recovery must NOT have renamed/recreated it — the ORIGINAL inode
+      // is still at the live path (a buggy recovery-fires-on-wrong-owner would change it).
+      const afterInode = await inodeOf(child);
+      assert.equal(
+        `${afterInode.dev}:${afterInode.ino}`,
+        `${originalInode.dev}:${originalInode.ino}`,
+        "the foreign-owned dir was left in place (never renamed out), proving recovery did not fire",
+      );
+    } finally {
+      await fs.rm(base, { recursive: true, force: true });
+    }
+  });
+
   it("opt-in still REJECTS a final-component symlink (O_NOFOLLOW)", async () => {
     const base = await freshTmp();
     try {

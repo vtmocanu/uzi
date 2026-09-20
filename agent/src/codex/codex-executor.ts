@@ -1262,7 +1262,7 @@ export class CodexExecutor implements Executor {
       // per-run HOME BEFORE anything (a devbox/nix subprocess with HOME=provisionHomeDir) can
       // touch them. The recursive mkdir ensures the SHARED root exists: a non-root entrypoint
       // skips the `mkdir -p /data/agent-home` block (entrypoint.sh:109 vs :207-208) and
-      // `ensureCodexSharedDirectory` uses a NON-recursive mkdir (codex-executor.ts:874), so a
+      // `ensureCodexSharedDirectory` (and thus `prepareCodexRunHome`) uses a NON-recursive mkdir, so a
       // fresh-PVC/zero-package run would otherwise ENOENT (mirrors sdk-executor.ts:820-826). It
       // creates only the PARENT (`provisionHomeDir` === dirname(homeRoot) in production), never
       // the per-run home itself, so the create-only gid repair still fires. `prepareCodexRunHome`
