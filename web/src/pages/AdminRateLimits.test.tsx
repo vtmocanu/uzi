@@ -390,6 +390,31 @@ describe("AdminRateLimits — Codex section", () => {
     expect(screen.queryByLabelText("Codex accounts")).toBeNull();
   });
 
+  it("stays self-hidden on a transient poll error after a confirmed-empty load (no dead chrome on a non-Codex instance)", async () => {
+    // data === [] (a confirmed-empty first load) must self-hide even when a later poll
+    // fails: a non-Codex instance must never flash a "Codex accounts / Failed to load"
+    // banner on a routine poll blip. Only data === null (never-loaded) shows the alert.
+    vi.useFakeTimers();
+    mockApi.getAdminCodexRateLimits.mockResolvedValue({ users: [] });
+    render(
+      <MemoryRouter>
+        <AdminRateLimits />
+      </MemoryRouter>,
+    );
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(screen.queryByLabelText("Codex accounts")).toBeNull();
+
+    mockApi.getAdminCodexRateLimits.mockRejectedValueOnce(new Error("poll blip"));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000);
+    });
+    expect(mockApi.getAdminCodexRateLimits).toHaveBeenCalledTimes(2); // confirmed-empty load + one failed poll
+    // Still hidden — the transient error over a confirmed-empty list draws nothing.
+    expect(screen.queryByLabelText("Codex accounts")).toBeNull();
+  });
+
   it("keeps the last-good Codex table when a poll fails, showing the alert above it", async () => {
     // A single transient poll failure must NOT blank the whole capacity table for a
     // poll interval: useAsyncData keeps last-good data on a failed reload, so the rows

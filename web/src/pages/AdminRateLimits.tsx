@@ -262,12 +262,15 @@ function CodexAdminSection() {
   const users = data ?? [];
   // Self-hide until there is a Codex user to show: an instance with no linked Codex
   // subscription accounts gets no dead chrome under the Claude table. Only take the
-  // alert-only branch when there is NO last-good data (the initial-load-failed case),
-  // so an admin is never told "none" when the read failed with no prior data. Once
-  // there ARE last-good rows, a transient poll error keeps the table rendered with the
-  // alert shown above it — mirroring the Claude table above — rather than blanking the
-  // whole capacity view for up to a poll interval on a single failed poll.
-  if (error && users.length === 0) {
+  // alert-only branch when there is NO data at all yet (data === null: the initial load
+  // has never succeeded), so an admin is never told "none" when the read failed with no
+  // prior data. A CONFIRMED-empty load (data === [], a non-Codex instance) self-hides
+  // even on a later transient poll error — it falls through to the null-return below —
+  // so a poll blip never flashes a Codex error banner where there are no Codex accounts.
+  // Once there ARE last-good rows, a transient poll error keeps the table rendered with
+  // the alert shown above it (mirroring the Claude table), rather than blanking the whole
+  // capacity view for up to a poll interval on a single failed poll.
+  if (error && data === null) {
     return (
       <section aria-label="Codex accounts" className="mt-10">
         <SectionTitle>Codex accounts</SectionTitle>
