@@ -1,6 +1,9 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { PassThrough } from "node:stream";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 
 import {
   CodexExecutor,
@@ -20,6 +23,7 @@ import {
   type CodexExecutorDeps,
   type CodexCommittedGenerationCell,
 } from "../src/codex/codex-executor.js";
+import { WORKER_UID, RUNNER_UID } from "../src/runner-uid.js";
 import { forgeToolNames } from "../src/forge-tools.js";
 import { memoryToolNames } from "../src/memory-tools.js";
 import { reportIncidentalIssueToolName } from "../src/findings-tools.js";
@@ -2581,6 +2585,117 @@ describe("CodexExecutor: credential-free command env (item 6)", () => {
     assert.equal(env.LOCALE_ARCHIVE, "/nix/locale-archive");
     assert.equal(env.UZI_CODEX_COMMANDENV_CANARY, undefined, "process.env is not inherited into the credential-free command identity");
   });
+});
+
+// ================================================================================
+// Issue #1495 m1 — Codex provisioning targets the SHARED worker-lifetime HOME (PRD #42
+// Decision 5), never the per-run codex home, and run() initializes a FRESH per-run HOME
+// before anything (a devbox/nix subprocess) can materialize it with the wrong gid.
+describe("CodexExecutor: provisioning + init target the SHARED provisioning HOME (issue #1495 m1)", () => {
+  it("run() provisions against the SHARED provisioning HOME, never <sdkHomeRoot>/<runId>", async () => {
+    const rig = makeRig();
+    let recorded: { homeDir?: string; provisionRoot?: string } = {};
+    rig.deps = {
+      ...rig.deps,
+      provisionRunTools: async (_ctx, opts) => {
+        recorded = { homeDir: opts.homeDir, provisionRoot: opts.provisionRoot };
+        return { toolEnv: {} };
+      },
+    };
+    rig.transport
+      .push(threadStarted())
+      .push(toolCall(1, "Bash", { command: "echo hi" }, "th-1", "tn-1", "c1"))
+      .push(signalDone())
+      .push(turnCompleted("completed"))
+      .end();
+    const { ctx } = makeCtx();
+    // Build the executor DIRECTLY to split the per-run homeRoot from the SHARED provisionHomeDir
+    // (makeExecutor collapses them). launchProviderRoot stays injected via rig.deps, so run()'s
+    // real prepare/initialization is skipped and this assertion is portable across CI uids.
+    const executor = new CodexExecutor(
+      noopLog,
+      "/data/agent-home/run-1",
+      { binding: bindingOf(SUBSCRIPTION), client: rig.client as never, provider, provisionHomeDir: "/data/agent-home" },
+      rig.deps,
+    );
+    await withTimeout(executor.run(ctx), 3000, "provisioning-home run");
+
+    assert.equal(recorded.homeDir, "/data/agent-home", "provisioning HOME is the SHARED root (SdkExecutor Decision 5)");
+    assert.notEqual(recorded.homeDir, "/data/agent-home/run-1", "provisioning HOME is NEVER the per-run codex home");
+    assert.equal(
+      recorded.provisionRoot,
+      "/data/provision",
+      "provisionRoot defaults to path.dirname(provisionHomeDir)/provision (SdkExecutor parity)",
+    );
+  });
+
+  // Group-B gated (real WORKER_UID/RUNNER_UID + membership), modeled on codex-shared-dir.test.ts:
+  // Group B drives the production paths with the REAL constants under the uzi worker gate.
+  const uid1495 = typeof process.getuid === "function" ? process.getuid() : undefined;
+  const groups1495 = typeof process.getgroups === "function" ? [...new Set(process.getgroups())] : [];
+  const INIT_SKIP =
+    uid1495 === WORKER_UID && groups1495.includes(WORKER_UID) && groups1495.includes(RUNNER_UID)
+      ? false
+      : "requires running as WORKER_UID with WORKER_UID + RUNNER_UID group membership";
+
+  it(
+    "run() initializes the FRESH per-run HOME to worker:runner 2770 BEFORE provisioning materializes it",
+    { skip: INIT_SKIP },
+    async () => {
+      // Single-uid (#58) non-root k8s: no UZI_UID_SPLIT, so run()'s worktree-posture assert is inert.
+      const savedSplit = process.env.UZI_UID_SPLIT;
+      delete process.env.UZI_UID_SPLIT;
+      const base = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "codex-init-1495-")));
+      try {
+        // fsGroup:10001 shape: a setgid agent-home group-owned worker (10001). The SHARED root
+        // exists here (setgid parent), also exercising the recursive-mkdir no-op path; do NOT
+        // pre-create the per-run home.
+        const provisionHomeDir = path.join(base, "agent-home");
+        await fs.mkdir(provisionHomeDir, { mode: 0o2770 });
+        await fs.chown(provisionHomeDir, WORKER_UID, WORKER_UID);
+        await fs.chmod(provisionHomeDir, 0o2770);
+        const homeRoot = path.join(provisionHomeDir, "run-1495"); // == sdkHomeRoot/<runId>
+
+        const sentinel = new Error("SENTINEL: provisioning short-circuit after devbox materialized its HOME");
+        let provisionHomeSeen: string | undefined;
+        const deps: CodexExecutorDeps = {
+          // Do NOT inject launchProviderRoot: the REAL initialization ordering (fs.mkdir +
+          // prepareCodexRunHome) must run. The stub simulates devbox materializing its SUPPLIED
+          // HOME (the SHARED root post-fix), then short-circuits before the real supervisor is needed.
+          provisionRunTools: async (_ctx, opts) => {
+            provisionHomeSeen = opts.homeDir;
+            await fs.mkdir(opts.homeDir, { recursive: true });
+            throw sentinel;
+          },
+        };
+        const executor = new CodexExecutor(
+          noopLog,
+          homeRoot,
+          { binding: bindingOf(SUBSCRIPTION), client: fakeClient() as never, provider, provisionHomeDir },
+          deps,
+        );
+        const { ctx } = makeCtx();
+        await assert.rejects(executor.run(ctx), /SENTINEL/, "the run short-circuits at the provisioning stub");
+
+        // run()'s initialization created the per-run home FRESH (created=true → create-only repair)
+        // BEFORE provisioning could touch it: worker:runner 2770. PRE-FIX (no init block,
+        // provisioning HOME = the per-run home) this dir would EXIST with the inherited gid worker,
+        // unrepaired — so gid === RUNNER_UID is the load-bearing regression assertion.
+        const st = await fs.lstat(homeRoot);
+        assert.equal(st.uid, WORKER_UID, "per-run home owner is worker");
+        assert.equal(st.gid, RUNNER_UID, "per-run home was repaired FRESH to gid runner (init ordering)");
+        assert.equal(st.mode & 0o7777, 0o2770, "per-run home mode is 2770");
+        const codexData = await fs.lstat(path.join(homeRoot, "codex-data"));
+        assert.equal(codexData.gid, RUNNER_UID, "codex-data is runner-group-owned (init ordering)");
+        assert.equal(provisionHomeSeen, provisionHomeDir, "provisioning HOME is the SHARED root, never the per-run home");
+        assert.notEqual(provisionHomeSeen, homeRoot);
+      } finally {
+        if (savedSplit === undefined) delete process.env.UZI_UID_SPLIT;
+        else process.env.UZI_UID_SPLIT = savedSplit;
+        await fs.rm(base, { recursive: true, force: true });
+      }
+    },
+  );
 });
 
 // ================================================================================

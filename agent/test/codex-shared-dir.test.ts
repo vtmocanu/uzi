@@ -168,6 +168,40 @@ describe("Issue #1492: production paths repair worker-inherited dirs to RUNNER_U
     }
   });
 
+  it("run-home: a per-epoch REVALIDATION is a validating no-op, but REJECTS a tampered gid (issue #1495 m1)", async () => {
+    const base = await freshTmp();
+    try {
+      // Simulate the fsGroup:10001 agent-home: setgid, group-owned worker (10001).
+      const agentHome = path.join(base, "agent-home");
+      await makeSetgidParent(agentHome, WORKER_UID, WORKER_UID);
+      const runHome = path.join(agentHome, "run-reval"); // == sdkHomeRoot/<runId>
+
+      // Initialize once (run()'s pre-provisioning INITIALIZATION), then REVALIDATE (each provider
+      // epoch's startProviderEpoch re-runs prepareCodexRunHome). The second call hits created=false
+      // and VALIDATES the already-correct worker:runner 2770 — a no-op, never a re-adopt.
+      await prepareCodexRunHome(runHome);
+      await prepareCodexRunHome(runHome);
+      const home = await statOf(runHome);
+      assert.equal(home.uid, WORKER_UID);
+      assert.equal(home.gid, RUNNER_UID, "revalidation leaves the per-run home worker:runner");
+      assert.equal(home.mode, 0o2770);
+      const codexData = await statOf(path.join(runHome, "codex-data"));
+      assert.equal(codexData.gid, RUNNER_UID, "revalidation leaves codex-data runner-group-owned");
+
+      // Tamper: chgrp the per-run home to the WRONG gid (worker). The next REVALIDATION must NOT
+      // adopt it — the create-only repair fires ONLY on a dir this call just created (created=false
+      // here), so the deliberate check-don't-repair stance rejects a tampered, EEXISTing dir.
+      await fs.chown(runHome, WORKER_UID, WORKER_UID);
+      await assert.rejects(
+        prepareCodexRunHome(runHome),
+        /unexpected owner or group/,
+        "a tampered (wrong-gid) per-run home is REJECTED by revalidation, never silently adopted",
+      );
+    } finally {
+      await fs.rm(base, { recursive: true, force: true });
+    }
+  });
+
   it("advice roots: makeProductionLaunchAdviceRoot repairs codex-advice-data/-cwd to gid RUNNER_UID", async () => {
     const base = await freshTmp();
     try {

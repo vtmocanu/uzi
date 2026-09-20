@@ -984,6 +984,18 @@ export interface CodexExecutorOptions {
   readonly binding: CodexBinding;
   readonly client: WorkerClient;
   readonly provider: CodexProviderConfig;
+  /** The SHARED worker-lifetime provisioning HOME (PRD #42 Decision 5), deliberately
+   *  distinct from the per-run `homeRoot`: the nix/devbox provisioning subprocess sets
+   *  HOME to this, so keeping it worker-lifetime (not per-run) stops the nix profile /
+   *  devbox warm-start state from fragmenting per run. Defaults to the per-run `homeRoot`
+   *  when omitted, reproducing today's exact paths for callers/tests that don't split them
+   *  (parity with SdkExecutor). */
+  readonly provisionHomeDir?: string;
+  /** The SHARED worker-lifetime provisioning ROOT (PRD #42 Decision 5) under which the
+   *  per-run provisioning dir (`provisionRoot/<runId>`) lives, again distinct from the
+   *  per-run `homeRoot`. Defaults to `path.dirname(provisionHomeDir)/provision` when
+   *  omitted (parity with SdkExecutor). */
+  readonly provisionRoot?: string;
 }
 
 // ─── The per-epoch provider bundle + shared executor-claim context (m4) ─────────
@@ -1058,6 +1070,8 @@ export class CodexExecutor implements Executor {
 
   private readonly log: Logger;
   private readonly homeRoot: string;
+  private readonly provisionHomeDir: string;
+  private readonly provisionRoot: string;
   private readonly opts: CodexExecutorOptions;
   private readonly deps: CodexExecutorDeps;
   private readonly sessionStore: Pick<typeof CodexSessionStore, "adopt" | "inspect" | "remove" | "persist">;
@@ -1065,6 +1079,12 @@ export class CodexExecutor implements Executor {
   constructor(log: Logger, homeRoot: string, opts: CodexExecutorOptions, deps: CodexExecutorDeps = {}) {
     this.log = log;
     this.homeRoot = homeRoot;
+    // Provisioning HOME + root are SHARED worker-lifetime paths (PRD #42 Decision 5),
+    // mirroring SdkExecutor (sdk-executor.ts:627-630). The `?? this.homeRoot` default
+    // reproduces today's EXACT paths for callers/tests that don't split them, so nothing
+    // changes for a caller that omits both.
+    this.provisionHomeDir = opts.provisionHomeDir ?? this.homeRoot;
+    this.provisionRoot = opts.provisionRoot ?? path.join(path.dirname(this.provisionHomeDir), "provision");
     this.opts = opts;
     this.deps = deps;
     this.sessionStore = deps.sessionStore ?? CodexSessionStore;
@@ -1123,15 +1143,34 @@ export class CodexExecutor implements Executor {
     let epochIndex = 0;
     let provisionDir: string | undefined;
     try {
+      // INITIALIZATION (trust boundary): materialize the SHARED provisioning root and a FRESH
+      // per-run HOME BEFORE anything (a devbox/nix subprocess with HOME=provisionHomeDir) can
+      // touch them. The recursive mkdir ensures the SHARED root exists: a non-root entrypoint
+      // skips the `mkdir -p /data/agent-home` block (entrypoint.sh:109 vs :207-208) and
+      // `ensureCodexSharedDirectory` uses a NON-recursive mkdir (codex-executor.ts:874), so a
+      // fresh-PVC/zero-package run would otherwise ENOENT (mirrors sdk-executor.ts:820-826). It
+      // creates only the PARENT (`provisionHomeDir` === dirname(homeRoot) in production), never
+      // the per-run home itself, so the create-only gid repair still fires. `prepareCodexRunHome`
+      // then creates the fresh per-run home (created=true → repair → worker:runner 2770) BEFORE
+      // devbox materializes it with the wrong (inherited) gid. Gated on the same
+      // `launchProviderRoot === undefined` production gate the per-epoch prepare uses, so injected
+      // launcher tests keep owning their synthetic filesystem.
+      if (this.deps.launchProviderRoot === undefined) {
+        await fs.mkdir(this.provisionHomeDir, { recursive: true });
+        await prepareCodexRunHome(this.homeRoot);
+      }
       // Provision the run's tool packages ONCE (PRD #18; SHARED across every epoch — the forge/
       // memory budget counters a per-epoch rebuild would reset). A tier-1 failure throws
       // REASON_PROVISION_FAILED, which this try's finally then cleans up after. Injected via
-      // `deps.provisionRunTools` so a unit test stubs it. The provisioning HOME + root are SHARED
-      // worker-lifetime paths (not the per-run codex home), matching sdk-executor.
+      // `deps.provisionRunTools` so a unit test stubs it. The provisioning HOME (`provisionHomeDir`)
+      // + root (`provisionRoot`) are the SHARED worker-lifetime paths (PRD #42 Decision 5), NOT the
+      // per-run `homeRoot` — a devbox/nix subprocess sets HOME to `provisionHomeDir`, so pointing it
+      // at the shared root keeps warm-start state from fragmenting per run AND stops it from
+      // materializing the per-run HOME with the wrong gid (matching sdk-executor).
       const provisionRunToolsFn = this.deps.provisionRunTools ?? provisionRunTools;
       const provisioned = await provisionRunToolsFn(ctx, {
-        provisionRoot: path.join(path.dirname(this.homeRoot), "provision"),
-        homeDir: this.homeRoot,
+        provisionRoot: this.provisionRoot,
+        homeDir: this.provisionHomeDir,
         log: this.log,
       });
       provisionDir = provisioned.provisionDir; // removed in the terminal finally (best-effort)
@@ -1402,10 +1441,13 @@ export class CodexExecutor implements Executor {
       spawnBoundaryRoot, boundaryProcessSpawner, reconcile, evictTokens, accountant,
     } = shared;
 
-    // The real launcher needs a worker-owned shared run HOME and codex-data parent: the
-    // credential-free session store is worker-owned, while each child epoch is runner-owned
-    // 0700 and removed as runner after its supervisor proves drained disposal. Injected
-    // launchProviderRoot tests own their synthetic filesystem and skip this production step.
+    // Per-epoch trust-boundary REVALIDATION: re-verify the run HOME + codex-data parent's
+    // owner/group/mode/directory-type immediately before each credentialed provider root. The
+    // shared parents are runner-group-writable, so a checkpoint-driven epoch recreation must
+    // re-verify rather than assume nothing mutated between checkpoints. The call is cheap and
+    // idempotent: on the already-initialized home (run() initialized it before provisioning) it
+    // hits created=false and validates the correct worker:runner 2770, or throws if tampered.
+    // Injected launchProviderRoot tests own their synthetic filesystem and skip this production step.
     if (this.deps.launchProviderRoot === undefined) {
       await prepareCodexRunHome(homeRoot);
     }

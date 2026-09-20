@@ -104,6 +104,12 @@ export function buildRunExecutor(runId: string, codex: ClaimCodexSecrets | undef
         binding: selection.binding,
         client,
         provider: CODEX_PRODUCTION_PROVIDER,
+        // The nix/devbox provisioning HOME + root stay SHARED worker-lifetime paths
+        // (Decision 5): only the per-run Codex $HOME (runHome) is per-run, so warm-start
+        // state doesn't fragment per run — and the provisioning subprocess never
+        // materializes the per-run HOME with the wrong gid. provisionRoot takes its
+        // computed default (path.dirname(provisionHomeDir)/provision).
+        provisionHomeDir: sdkHomeRoot,
       },
       {
         // PRD #1171 m4 (F1): the RUNNER owns the terminal registry teardown. Its post-run
