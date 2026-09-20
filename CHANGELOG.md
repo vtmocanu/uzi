@@ -41,8 +41,8 @@ through `[0.52.0]`.)
   A handoff run that was never dispatched now expires after its setup deadline and drops out of claimable work, instead of showing "waiting for a worker" indefinitely even with a healthy idle worker present.
 - **Live milestone lanes match the "now" line by agent instance, not role name ([#1479](https://github.com/vtmocanu/uzi/pull/1479)).**
   Two similarly named agents can no longer hide each other's live activity, and the global "now" indicator stays visible for unassigned or distinct same-role agents.
-- **Codex runs start cleanly on non-root hosted (k8s) workers ([#1494](https://github.com/vtmocanu/uzi/pull/1494)).**
-  Per-run home, data, advice, and working directory setup now repairs the group of directories it creates instead of rejecting the `worker:worker` group a non-root hosted start inherits, while still refusing pre-existing directories with the wrong ownership and guarding against unsafe directory symlinks.
+- **Codex runs start cleanly on non-root hosted (k8s) workers ([#1494](https://github.com/vtmocanu/uzi/pull/1494), [#1496](https://github.com/vtmocanu/uzi/pull/1496)).**
+  Per-run home, data, advice, and working directory setup now prepares and revalidates those directories before provisioning, repairing the group a non-root hosted start inherits (including directories the provisioner pre-creates) and using shared worker-lifetime paths, while still refusing tampered or wrongly-owned directories and serializing concurrent recovery.
 
 ### Changed
 
