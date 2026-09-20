@@ -376,6 +376,13 @@ func (m tuiModel) renderBoard() string {
 	if strip := m.boardRateLimitStrip(time.Now()); strip != "" {
 		sb.WriteString(strip + "\n")
 	}
+	// The Codex meters get their OWN provider line under the Claude strip (PRD #1209 M3), so
+	// their percentages stay legible at a standard width instead of being clipped off the end
+	// of a combined line. Drawn only when ≥1 selected readable Codex account exists;
+	// boardCapacity reserves this physical line exactly as it reserves the Claude strip's.
+	if codex := m.boardCodexRateLimitStrip(time.Now()); codex != "" {
+		sb.WriteString(codex + "\n")
+	}
 	sb.WriteString("\n")
 
 	if m.board.adminDenied {
@@ -659,6 +666,11 @@ func (m tuiModel) boardCapacity() int {
 	// The rate-limit strip, when present, adds one line between the wordmark and the blank
 	// below it. Recomputed here (cheap) so the row-window math matches renderBoard's layout.
 	if m.boardRateLimitStrip(time.Now()) != "" {
+		chrome++
+	}
+	// The Codex meters ride their own second strip line (PRD #1209 M3), reserved exactly like
+	// the Claude strip's row so the extra line never overdraws the run list.
+	if m.boardCodexRateLimitStrip(time.Now()) != "" {
 		chrome++
 	}
 	// The selected row's variable-height second "now" line (D4) reserves one physical line, so

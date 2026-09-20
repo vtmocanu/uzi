@@ -106,24 +106,34 @@ func TestBoardCodexStripSelection(t *testing.T) {
 	}
 }
 
-// TestBoardCodexStripDedupOneMeterPerAccount — an account both IsDefault AND listed in the
-// sidebar appears exactly once (the selection dedups on AccountID).
+// TestBoardCodexStripDedupOneMeterPerAccount — TWO m.codexRateLimits rows carrying the SAME
+// AccountID (one default, one sidebar-listed) collapse to ONE meter: the `seen` map in
+// selectedCodexRateMeters keeps the first and drops the duplicate. Feeding two same-id rows is
+// what actually exercises the dedup — a single-row fixture never reaches the `seen` guard, so it
+// could pass with the dedup deleted.
 func TestBoardCodexStripDedupOneMeterPerAccount(t *testing.T) {
 	accts := []apitypes.CodexAccountRateLimitDTO{
-		codexAcct("cx-primary", "onlyacct", true, "fresh", cwin(33), cwin(61)),
+		codexAcct("cx-dup", "dupacct", true, "fresh", cwin(33), cwin(61)),  // default → clears the shown filter
+		codexAcct("cx-dup", "dupacct", false, "fresh", cwin(77), cwin(88)), // SAME id, sidebar-listed → also clears it
 	}
-	m := codexStripModel(t, accts, []string{"cx-primary"}) // default AND listed
+	m := codexStripModel(t, accts, []string{"cx-dup"}) // the non-default duplicate is sidebar-listed
 	shown, _ := m.selectedCodexRateMeters()
 	if len(shown) != 1 {
-		t.Fatalf("an account both default and listed must appear once, got %d: %+v", len(shown), shown)
+		t.Fatalf("two rows with the same AccountID must dedup to one meter, got %d: %+v", len(shown), shown)
 	}
-	// A single readable account → showLabel false, so no alias eyebrow, but the windows render.
-	strip := stripANSI(m.boardCodexMeterSeg(time.Now()))
-	if strings.Contains(strip, "onlyacct") {
-		t.Errorf("alias rendered for a single readable account (showLabel must be false):\n%s", strip)
+	// Exactly one per-account meter renders: the accent bar ▎ prefixes each account segment, so
+	// there must be exactly one in the strip.
+	seg := stripANSI(m.boardCodexMeterSeg(time.Now()))
+	if n := strings.Count(seg, "▎"); n != 1 {
+		t.Errorf("expected exactly one Codex account meter (one ▎ accent bar), got %d:\n%s", n, seg)
 	}
-	if !strings.Contains(strip, "33%") || !strings.Contains(strip, "61%") {
-		t.Errorf("the single account's windows are missing:\n%s", strip)
+	// The kept meter is the FIRST row (its 33%/61% windows); the dropped duplicate's 77%/88% must
+	// not appear.
+	if !strings.Contains(seg, "33%") || !strings.Contains(seg, "61%") {
+		t.Errorf("the first (kept) account's windows are missing:\n%s", seg)
+	}
+	if strings.Contains(seg, "77%") || strings.Contains(seg, "88%") {
+		t.Errorf("the dropped duplicate row's windows leaked into the strip:\n%s", seg)
 	}
 }
 
@@ -210,36 +220,133 @@ func TestBoardCodexStripEmptyCases(t *testing.T) {
 	}
 }
 
-// TestBoardCodexStripRidesSameLineAsClaude — the Codex meters ride the SAME single strip line
-// after the Claude ones, and a Codex-only viewer (no readable Claude token) still gets the
-// strip. Also pins the strip to exactly one physical line.
-func TestBoardCodexStripRidesSameLineAsClaude(t *testing.T) {
-	// Codex-only: no Claude meters seeded, so the strip is the Codex section alone.
+// TestBoardCodexStripOwnLine — the Codex meters ride their OWN board strip line
+// (boardCodexRateLimitStrip), separate from the Claude strip (boardRateLimitStrip), so at a
+// standard width the Codex percentages stay legible instead of being clipped off the end of a
+// combined line (PRD #1209 M3). The Claude strip carries NO Codex bytes, each strip is one
+// physical line, and a Codex-only viewer (no readable Claude token) still gets its Codex line.
+func TestBoardCodexStripOwnLine(t *testing.T) {
+	// Codex-only: no Claude meters seeded. The Claude strip is empty; the Codex strip carries it.
 	m := codexStripModel(t, []apitypes.CodexAccountRateLimitDTO{
 		codexAcct("cx-primary", "primary", true, "fresh", cwin(33), cwin(61)),
 	}, nil)
-	strip := m.boardRateLimitStrip(time.Now())
-	if strip == "" {
-		t.Fatalf("a Codex-only viewer must still get a rate-limit strip")
+	if claude := m.boardRateLimitStrip(time.Now()); claude != "" {
+		t.Errorf("no readable Claude token: the Claude strip must be empty, got %q", claude)
 	}
-	if strings.Contains(strip, "\n") {
-		t.Errorf("the strip must be one physical line:\n%q", strip)
+	codex := m.boardCodexRateLimitStrip(time.Now())
+	if codex == "" {
+		t.Fatalf("a Codex-only viewer must still get a Codex strip line")
 	}
-	plain := stripANSI(strip)
-	if !strings.Contains(plain, "Codex") || !strings.Contains(plain, "33%") {
-		t.Errorf("the Codex section is missing from the combined strip:\n%s", plain)
+	if strings.Contains(codex, "\n") {
+		t.Errorf("the Codex strip must be one physical line:\n%q", codex)
+	}
+	if plain := stripANSI(codex); !strings.Contains(plain, "Codex") || !strings.Contains(plain, "33%") {
+		t.Errorf("the Codex line is missing its label or reading:\n%s", plain)
 	}
 
-	// Claude + Codex: both providers render, with the Claude 5h/7d ahead of the Codex section.
+	// Claude + Codex: the two providers render on SEPARATE lines. The Claude strip carries the
+	// Claude reading and NO "Codex" label; the Codex strip carries the Codex reading.
 	next, _ := m.Update(rateLimitsMsg{tokens: []apitypes.TokenRateLimitDTO{
 		okMeter("sec-personal", "claudeacct", true, 44, 55),
 	}})
 	both := next.(tuiModel)
-	bs := stripANSI(both.boardRateLimitStrip(time.Now()))
-	claudeIdx := strings.Index(bs, "44%")
-	codexIdx := strings.Index(bs, "Codex")
+	claudeLine := stripANSI(both.boardRateLimitStrip(time.Now()))
+	codexLine := stripANSI(both.boardCodexRateLimitStrip(time.Now()))
+	if !strings.Contains(claudeLine, "44%") {
+		t.Errorf("the Claude strip must carry the Claude reading:\n%s", claudeLine)
+	}
+	if strings.Contains(claudeLine, "Codex") {
+		t.Errorf("the Claude strip must NOT carry the Codex section (it rides its own line):\n%s", claudeLine)
+	}
+	if !strings.Contains(codexLine, "Codex") || !strings.Contains(codexLine, "33%") {
+		t.Errorf("the Codex strip must carry the Codex section:\n%s", codexLine)
+	}
+
+	// In the composed board, the Claude line is drawn BEFORE the Codex line (Claude above Codex).
+	both.width, both.height = 100, 40
+	board := stripANSI(both.renderBoard())
+	claudeIdx := strings.Index(board, "44%")
+	codexIdx := strings.Index(board, "Codex")
 	if claudeIdx < 0 || codexIdx < 0 || claudeIdx >= codexIdx {
-		t.Errorf("Claude meters must precede the Codex section (claude=%d codex=%d):\n%s", claudeIdx, codexIdx, bs)
+		t.Errorf("the Claude strip must be drawn above the Codex line (claude=%d codex=%d):\n%s", claudeIdx, codexIdx, board)
+	}
+}
+
+// TestBoardCodexReachableAtStandardWidth is the PRD #1209 M3 acceptance test for FIX 1: at width
+// 100 with TWO readable Claude tokens AND TWO selected readable Codex accounts, a Codex account's
+// percentage digits are present in the composed board render — i.e. the Codex data is reachable,
+// not clipped to just the "Codex" label the way a single combined strip line was at ≤120 cols. The
+// Codex percentages here (71/29, 66/13) are chosen to NOT collide with the Claude readings, so a
+// hit proves the Codex bytes themselves survived, not an accidental substring match.
+func TestBoardCodexReachableAtStandardWidth(t *testing.T) {
+	m := tuiTestModel(t, &uzicli.FakeClient{}, "")
+	m.width, m.height = 100, 40
+	next, _ := m.Update(rateLimitsMsg{tokens: []apitypes.TokenRateLimitDTO{
+		okMeter("sec-personal", "personal", true, 35, 62),
+		okMeter("sec-meta", "meta", false, 88, 44),
+	}})
+	m = next.(tuiModel)
+	next, _ = m.Update(codexRateLimitsMsg{accounts: []apitypes.CodexAccountRateLimitDTO{
+		codexAcct("cx-primary", "primary", true, "fresh", cwin(71), cwin(29)),
+		codexAcct("cx-team", "team", false, "fresh", cwin(66), cwin(13)),
+	}})
+	m = next.(tuiModel)
+	next, _ = m.Update(settingsMsg{settings: apitypes.UserSettingsDTO{
+		SidebarTokenIds:        []string{"sec-meta"},
+		SidebarCodexAccountIds: []string{"cx-team"},
+	}})
+	m = next.(tuiModel)
+
+	board := stripANSI(m.renderBoard())
+	if !strings.Contains(board, "Codex") {
+		t.Fatalf("the Codex provider label is missing from the width-100 board:\n%s", board)
+	}
+	// The load-bearing assertion: a Codex account's utilization percentage is actually present,
+	// not clipped away. Both the default account's window (71%) and the listed account's (66%).
+	for _, want := range []string{"71%", "66%"} {
+		if !strings.Contains(board, want) {
+			t.Errorf("Codex reading %q was clipped from the width-100 board (unreachable):\n%s", want, board)
+		}
+	}
+}
+
+// TestBoardCodexStripReservesOwnRow is the FIX 1 row-accounting acceptance test: showing a Codex
+// strip must drop boardCapacity by EXACTLY one (reserve one extra physical line), the same way the
+// Claude strip's row is reserved, so the second provider line never overdraws the run list.
+func TestBoardCodexStripReservesOwnRow(t *testing.T) {
+	m := tuiTestModel(t, &uzicli.FakeClient{}, "")
+	m.width, m.height = 100, 40
+	// Two readable Claude tokens shown, so the Claude strip already reserves its own row.
+	next, _ := m.Update(rateLimitsMsg{tokens: []apitypes.TokenRateLimitDTO{
+		okMeter("sec-personal", "personal", true, 35, 62),
+		okMeter("sec-meta", "meta", false, 88, 44),
+	}})
+	m = next.(tuiModel)
+	next, _ = m.Update(settingsMsg{settings: apitypes.UserSettingsDTO{SidebarTokenIds: []string{"sec-meta"}}})
+	m = next.(tuiModel)
+	if m.boardCodexRateLimitStrip(time.Now()) != "" {
+		t.Fatalf("precondition: no Codex accounts, so the Codex strip must be empty")
+	}
+	withoutCodex := m.boardCapacity()
+
+	// Add two selected readable Codex accounts → the Codex strip renders on its own line.
+	next, _ = m.Update(codexRateLimitsMsg{accounts: []apitypes.CodexAccountRateLimitDTO{
+		codexAcct("cx-primary", "primary", true, "fresh", cwin(71), cwin(29)),
+		codexAcct("cx-team", "team", false, "fresh", cwin(66), cwin(13)),
+	}})
+	m = next.(tuiModel)
+	next, _ = m.Update(settingsMsg{settings: apitypes.UserSettingsDTO{
+		SidebarTokenIds:        []string{"sec-meta"},
+		SidebarCodexAccountIds: []string{"cx-team"},
+	}})
+	m = next.(tuiModel)
+	if m.boardCodexRateLimitStrip(time.Now()) == "" {
+		t.Fatalf("precondition: two selected readable Codex accounts, so the Codex strip must render")
+	}
+	withCodex := m.boardCapacity()
+
+	if withoutCodex-withCodex != 1 {
+		t.Errorf("showing a Codex strip must reserve exactly one more row: capacity %d → %d (want a drop of 1)", withoutCodex, withCodex)
 	}
 }
 
@@ -348,6 +455,77 @@ func TestRailCodexRateMetersNilWindow(t *testing.T) {
 	}
 }
 
+// codexFoldRun builds the FIX-2 fixture: a running, metered run with a milestone list, the run's
+// own Claude account, a five-lane crew, and (optionally) two selected readable Codex accounts. At
+// 100x34 the roster + MILESTONES + SPEND + ACCOUNTS fit the height-clamped rail when expanded, so
+// without a Codex block the rail stays expanded — which isolates the Codex block as the sole reason
+// the WITH-Codex run must auto-fold.
+func codexFoldRun(t *testing.T, withCodex bool) tuiModel {
+	t.Helper()
+	now := time.Now()
+	run := apitypes.RunDTO{ID: "cx-fold", Kind: "issue", Status: "running", Health: "ok",
+		IssueTitle: "many lanes with codex",
+		Milestones: []apitypes.Milestone{{ID: "m1", Title: "Alpha"}, {ID: "m2", Title: "Beta"},
+			{ID: "m3", Title: "Gamma"}, {ID: "m4", Title: "Delta"}},
+		MilestonesCompleted: []string{"m1", "m2"}, MilestonesInProgress: []string{"m3"}}
+	sid, lbl := "sec-meta", "meta"
+	run.AnthropicSecretID, run.AnthropicSecretLabel = &sid, &lbl
+	run.Usage = spendUsage()
+	roles := []string{"lead", "coder", "tester", "reviewer", "auditor"}
+	msgs := make([]apitypes.MessageDTO, 0, len(roles))
+	for i, role := range roles {
+		msgs = append(msgs, msgDTO(int32(i+1), "text", role, "toolu_"+itoa(i), "lbl"+itoa(i), "x", now))
+	}
+	m := tuiTestModel(t, &uzicli.FakeClient{}, run.ID)
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 34})
+	m = next.(tuiModel)
+	next, _ = m.Update(rateLimitsMsg{tokens: []apitypes.TokenRateLimitDTO{okMeter(sid, lbl, true, 33, 61)}})
+	m = next.(tuiModel)
+	settings := apitypes.UserSettingsDTO{SidebarTokenIds: []string{sid}}
+	if withCodex {
+		next, _ = m.Update(codexRateLimitsMsg{accounts: []apitypes.CodexAccountRateLimitDTO{
+			codexAcct("cx-primary", "primary", true, "fresh", cwin(41), cwin(63)),
+			codexAcct("cx-team", "team", false, "fresh", cwin(88), cwin(52)),
+		}})
+		m = next.(tuiModel)
+		settings.SidebarCodexAccountIds = []string{"cx-team"}
+	}
+	next, _ = m.Update(settingsMsg{settings: settings})
+	m = next.(tuiModel)
+	return applyDetail(m, run, msgs)
+}
+
+// TestRailCodexBlockAutoFoldsIntoView is the FIX-2 acceptance test (PRD #1209 M3): at a normal
+// 100x34 running+metered run with a selected readable Codex account, the crew rail must auto-fold
+// so the CODEX block renders (header + an account line), instead of staying expanded and letting
+// the block silently overflow to nothing. The control run (no Codex) stays expanded at the same
+// geometry, proving the Codex block's floor is what tips the auto-fold — the exact railAutoFolded
+// gap this fix closes (the CODEX block was appended last and never counted there).
+func TestRailCodexBlockAutoFoldsIntoView(t *testing.T) {
+	// Control: without a Codex block, roster + MILESTONES + SPEND + ACCOUNTS fit at 100x34, so the
+	// rail stays EXPANDED (open caret ▾).
+	if got := railTitleLine(codexFoldRun(t, false)); !strings.Contains(got, "▾") {
+		t.Fatalf("without a Codex block the rail should stay expanded at 100x34 (▾), got %q", got)
+	}
+
+	// With a selected readable Codex account, the crew auto-folds to make room (closed count caret).
+	m := codexFoldRun(t, true)
+	if got := railTitleLine(m); !strings.Contains(got, "▸") {
+		t.Errorf("with a Codex block the rail must auto-fold at 100x34 (N ▸), got %q", got)
+	}
+	// The CODEX header and the first shown account's line are in the composed view (not overflowed).
+	view := stripANSI(m.View().Content)
+	if !strings.Contains(view, "CODEX") {
+		t.Errorf("the CODEX header must be present after the crew auto-folds:\n%s", view)
+	}
+	if !strings.Contains(view, "primary") {
+		t.Errorf("a selected Codex account line (its alias) must be present:\n%s", view)
+	}
+	if !strings.Contains(view, "41%") {
+		t.Errorf("the shown Codex account's reading must be present:\n%s", view)
+	}
+}
+
 // TestCodexMetersSanitizeUntrustedText — a hostile alias AND a hostile bucket display name,
 // each carrying control + bidi bytes, are scrubbed by renderer.Plain (D7) before they reach
 // EITHER the board strip or the detail rail. The account is default+sidebar-listed and a
@@ -372,10 +550,16 @@ func TestCodexMetersSanitizeUntrustedText(t *testing.T) {
 				t.Errorf("%s: hostile byte %q survived; Plain (D7) did not scrub it:\n%q", surface.name, bad, surface.out)
 			}
 		}
-		// The sanitized residue must still be present, proving the untrusted field was drawn
-		// (and folded), not silently dropped.
-		if !strings.Contains(stripANSI(surface.out), "hostile") {
-			t.Errorf("%s: the sanitized alias residue is missing — the alias was not drawn:\n%s", surface.name, stripANSI(surface.out))
+		// The sanitized residue of BOTH untrusted fields must still be present, proving each was
+		// drawn (and folded), not silently dropped: "hostile" from the alias, and "evil" from the
+		// bucket DisplayName. Pinning both keeps the two Plain-folds (codexAccountLabel and
+		// codexBucketLabel) honest, not just the alias one.
+		plain := stripANSI(surface.out)
+		if !strings.Contains(plain, "hostile") {
+			t.Errorf("%s: the sanitized alias residue is missing — the alias was not drawn:\n%s", surface.name, plain)
+		}
+		if !strings.Contains(plain, "evil") {
+			t.Errorf("%s: the sanitized bucket display-name residue is missing — DisplayName was not drawn:\n%s", surface.name, plain)
 		}
 	}
 }

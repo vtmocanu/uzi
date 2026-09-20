@@ -151,10 +151,12 @@ func (m tuiModel) effectiveRailFolded(now time.Time) bool {
 // railAutoFolded reports whether the EXPANDED rail's roster plus every PRESENT protected block
 // would overrun transcriptViewport(), so the rail must fold by itself (PRD #1257 D1/D2). The
 // protected set is: the whole MILESTONES list (no budget of its own — clamped by joinColumns), the
-// 3-line SPEND block, and — the PRD #623 floor — the run's OWN ACCOUNTS entry (3 rows under a
-// 1-row header). Sibling accounts stay best-effort and drop bottom-up as today, so they are NOT
-// counted (D2). A run with no lanes has nothing to fold; a run with an empty required set (no
-// milestone list, no usage, no own account) never folds either — its roster just clips at the
+// 3-line SPEND block, the PRD #623 floor of the run's OWN ACCOUNTS entry (3 rows under a 1-row
+// header), and — PRD #1209 M3 — the CODEX block's floor (its 1-row header + the first shown Codex
+// account, the analog of the Claude own-account floor; railCodexFloorRows). Sibling Claude/Codex
+// accounts stay best-effort and drop bottom-up as today, so only the first of each is counted (D2).
+// A run with no lanes has nothing to fold; a run with an empty required set (no milestone list, no
+// usage, no own account, no shown Codex account) never folds either — its roster just clips at the
 // bottom exactly as today (D2/D5).
 //
 // The decision REPLAYS renderLaneRail's expanded builder (expandedRoster + the same appendRailBlock
@@ -164,7 +166,10 @@ func (m tuiModel) effectiveRailFolded(now time.Time) bool {
 // rail stays expanded every present block is guaranteed to render whole — the silent-vanish bug this
 // PRD fixes. R2's exception is ACCOUNTS: the decision counts only the run's own entry while the
 // render draws every fitted entry, which is safe because railRateMeters forces the run's entry first
-// (PRD #623), so it is the one guaranteed on screen whenever the rail is expanded.
+// (PRD #623), so it is the one guaranteed on screen whenever the rail is expanded. The CODEX floor
+// (PRD #1209 M3) counts only its first shown account the same way, but is measured BELOW the actual
+// railRateMeters output (replayed here), since the whole ACCOUNTS block — siblings included — sits
+// above CODEX in the render and would otherwise hide it.
 func (m tuiModel) railAutoFolded(now time.Time) bool {
 	d := &m.detail
 	if len(d.lanes) == 0 {
@@ -173,7 +178,8 @@ func (m tuiModel) railAutoFolded(now time.Time) bool {
 	block := m.renderMilestones()
 	spend := d.run.Usage != nil
 	ownAccount := d.run.AnthropicSecretID != nil
-	if block == "" && !spend && !ownAccount {
+	codexRows, hasCodex := m.railCodexFloorRows()
+	if block == "" && !spend && !ownAccount && !hasCodex {
 		return false // empty required set: nothing below the roster to protect (D2/D5)
 	}
 	vp := m.transcriptViewport()
@@ -197,11 +203,62 @@ func (m tuiModel) railAutoFolded(now time.Time) bool {
 			return true
 		}
 	}
+	if hasCodex {
+		// The CODEX block (PRD #1209 M3) is drawn AFTER the Claude ACCOUNTS block, so it must be
+		// measured at its REAL position — below whatever ACCOUNTS actually renders (the run's own
+		// entry plus any sibling accounts that fit). Advance past the actual railRateMeters output
+		// (its own-account floor is already protected above; siblings are best-effort and greedily
+		// fill the budget), then apply the CODEX floor check. Without this advance the CODEX floor
+		// would look like it fits when the ACCOUNTS siblings above it have already pushed it off —
+		// the same silent-vanish this method exists to prevent, and the exact FIX-2 bug: the CODEX
+		// block was appended last and NOT counted here, so a normal running+metered run stayed
+		// expanded and the CODEX block overflowed to nothing.
+		if claude := m.railRateMeters(now, strings.Count(sb.String(), "\n")+1); claude != "" {
+			appendRailBlock(&sb, claude)
+		}
+		// railCodexRateMeters draws its whole entries in order and drops the rest bottom-up, so the
+		// FIRST shown account (the default/selected one) is the one guaranteed on screen whenever the
+		// block renders — the CODEX analog of the Claude own-account floor (R2). codexRows is that
+		// header + first-account row count; fold if it does not fit under the separator.
+		usedRows := strings.Count(sb.String(), "\n") + 1
+		if codexRows > vp-usedRows-1 {
+			return true
+		}
+	}
 	// The roster (+ any present MILESTONES) alone overflowing the height-clamped rail folds too
 	// (D5): joinColumns drops the bottom rows, so folding maximizes what shows. strings.Count(sb,
 	// "\n") is the content-rows-beneath-the-title count (the title's own "\n" cancels the trailing
 	// row the final block lacks). This is the binding case for a MILESTONES-only run.
 	return strings.Count(sb.String(), "\n") > vp
+}
+
+// railCodexFloorRows reports the CODEX block's protected floor — the 1-row CODEX header plus the
+// FIRST shown Codex account's entry (its optional label eyebrow and each bucket's name/P/S lines)
+// — and whether any Codex account is shown at all. It is the PRD #1209 M3 analog of the Claude
+// own-account floor railAutoFolded protects: railCodexRateMeters appends whole entries in order
+// and drops the rest bottom-up, so the first renderable account is the one guaranteed on screen
+// whenever the block renders. Counting it makes the crew auto-fold to keep at least that account
+// visible instead of letting the whole CODEX block silently overflow. The row math here mirrors
+// railCodexRateMeters' entry-building exactly, so the decision and the render cannot disagree.
+func (m tuiModel) railCodexFloorRows() (rows int, shownAny bool) {
+	shown, showLabel := m.selectedCodexRateMeters()
+	for _, a := range shown {
+		entry := 0
+		if showLabel {
+			entry++ // the account label eyebrow
+		}
+		for _, b := range a.Buckets {
+			entry += 2 // the bucket name eyebrow + the primary (P) window line
+			if b.Secondary != nil {
+				entry++ // the secondary (S) window line
+			}
+		}
+		if entry == 0 {
+			continue // railCodexRateMeters skips a zero-line entry too (no label, no buckets)
+		}
+		return 1 + entry, true // the 1-row CODEX header + the first renderable account's rows
+	}
+	return 0, false
 }
 
 // laneIdentities maps each real lane's key to the identity string the crew rail shows for it,

@@ -79,14 +79,14 @@ func (m tuiModel) selectedRateMeters() (shown []apitypes.TokenRateLimitDTO, show
 // NN% text. The NN% text is always present so an Ascii/NO_COLOR terminal (which strips the SGR
 // tone) keeps the legible signal — colour is never the only cue. Clamped to one physical line.
 // The Label is USER-AUTHORED and drawn through renderer.Plain (D7).
+//
+// The Codex meters ride their OWN second strip line (boardCodexRateLimitStrip), NOT this one:
+// a combined line (2 Claude + 2 Codex ≈ 173 cols) clipped the Codex percentages away entirely
+// at 100/80 cols, defeating the point of the feature (PRD #1209 M3). Splitting the providers
+// onto two lines keeps each legible at a standard width. This method's output stays byte-
+// identical to before whenever no Codex account is shown, so the Claude-only render is unmoved.
 func (m tuiModel) boardRateLimitStrip(now time.Time) string {
 	segs := m.boardClaudeMeterSegs(now)
-	// The Codex meters ride the SAME single line, appended after the Claude ones with their
-	// own "Codex" provider label so the two providers never look merged (PRD #1209 M3). When
-	// no Claude token is shown but a Codex account is, the strip still renders (Codex-only).
-	if codex := m.boardCodexMeterSeg(now); codex != "" {
-		segs = append(segs, codex)
-	}
 	if len(segs) == 0 {
 		return ""
 	}
@@ -96,6 +96,23 @@ func (m tuiModel) boardRateLimitStrip(now time.Time) string {
 	// gap stays 3 spaces.
 	strip := " " + strings.Join(segs, "   ")
 	return clampVisual(strip, m.width)
+}
+
+// boardCodexRateLimitStrip is the Codex provider's OWN board strip line, drawn under the Claude
+// strip (or under the wordmark when no Claude token is shown) whenever ≥1 selected readable Codex
+// account exists — mirroring boardRateLimitStrip but for the Codex meters (PRD #1209 M3). Giving
+// Codex its own line is what keeps its bars/percentages reachable at a standard width (≤120 cols):
+// riding the Claude line, the combined strip overran and clampVisual chopped the Codex section off
+// entirely. The board's row math reserves this extra physical line via boardCapacity, exactly as
+// it reserves the Claude strip's row. "" when nothing is selected. Aliases/bucket names ride
+// renderer.Plain (D7), inside boardCodexMeterSeg.
+func (m tuiModel) boardCodexRateLimitStrip(now time.Time) string {
+	codex := m.boardCodexMeterSeg(now)
+	if codex == "" {
+		return ""
+	}
+	// The same leading space as the Claude strip aligns the Codex line under the brand block.
+	return clampVisual(" "+codex, m.width)
 }
 
 // boardClaudeMeterSegs builds the per-token Claude segments of the board strip (the

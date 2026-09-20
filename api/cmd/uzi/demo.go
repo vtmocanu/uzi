@@ -179,13 +179,16 @@ func newDemoClient() *uzicli.FakeClient {
 			},
 			{AccountID: "cx-pending", Aliases: []string{"pending"}, Status: "no_reading"},
 		},
-		// Only "meta" (Claude) and "cx-team" (Codex) are promoted into the sidebar selection;
-		// the unlisted rows stay hidden. MrReworkEnabled false is the explicit opt-out (PRD
+		// "meta" (Claude), "cx-team" and "cx-old" (Codex) are promoted into the sidebar
+		// selection; the "cx-unlisted" row stays hidden. "cx-old" is listed so the STALE-DIMMED
+		// Codex meter (its "shown dimmed" comment above) actually renders in the demo — without
+		// it the selection would drop the account and the dimmed path this fixture showcases
+		// would never draw. MrReworkEnabled false is the explicit opt-out (PRD
 		// #700 M6); a nil pointer would be the default-ON state. Carried for decode fidelity —
 		// the TUI does not render it, matching the DTO's other fidelity-only fields.
 		Settings: apitypes.UserSettingsDTO{
 			SidebarTokenIds:        []string{"sec-meta"},
-			SidebarCodexAccountIds: []string{"cx-team"},
+			SidebarCodexAccountIds: []string{"cx-team", "cx-old"},
 			MrReworkEnabled:        boolPtr(false),
 		},
 		// StreamEvents nil: NewRunStream emits nothing and stays OPEN (so the detail reads
