@@ -381,16 +381,19 @@ describe("PRD #1493 M2: root-branch migration ownership map (portable, record-on
 });
 
 // ─── Group 1b: symlink give-away DEFENSE (portable, record-only) ──────────────────────────
-// A legacy single-uid /data let the untrusted agent uid write /data/agent-home, so it could
-// plant a sibling symlink whose name is NOT a real per-run HOME (e.g. agent-home/evil -> ../repos),
-// or make a run HOME's codex-data a symlink escape. Without the `[ -L ]` guards the migration's
-// globs walk THROUGH such a link and its `chown -R runner:runner` re-owns the worker-only bare-repo
-// cache /data/repos (the B2 code-exec surface) to `runner`, defeating the uid split. These cases run
-// the REAL entrypoint with the links planted and assert the op-log records NO recursive chown whose
-// argument RESOLVES under repos/ (proving both the direct-argument and the mid-path-prefix escapes
-// are closed). Reddens on the pre-fix entrypoint (the guardless globs record a chown -R reaching
-// repos); passes with the guards. Portable/record-only because the gate runs as uid 10001 and cannot
-// observe a give-away to uid 10002 on the real fs — the op-log is the cross-uid signal.
+// A legacy single-uid /data let the untrusted agent uid write /data, so it could plant a symlink
+// either as a DESCENDANT of a carve-out tree (e.g. agent-home/evil -> ../repos, or a run HOME's
+// codex-data -> ../../repos) OR AT a carve-out ROOT itself (e.g. agent-home -> repos, runner ->
+// ../repos). Without the `[ -L ]` guards a chmod/chown on the root DEREFERENCES onto the link's
+// target (chmod follows symlinks) and the migration's globs walk THROUGH such a link, so a
+// `chown -R runner:runner` (or the root chmod) re-owns/re-modes the worker-only bare-repo cache
+// /data/repos (the B2 code-exec surface) to `runner`, defeating the uid split. These cases run the
+// REAL entrypoint with the links planted and assert the op-log records NO chown/chmod whose argument
+// RESOLVES onto/under repos/ (proving the direct-argument, the mid-path-prefix, AND the
+// symlinked-root escapes are all closed). Reddens on the pre-fix entrypoint (the guardless ops record
+// a chown -R / chmod reaching repos); passes with the guards. Portable/record-only because the gate
+// runs as uid 10001 and cannot observe a give-away to uid 10002 on the real fs — the op-log is the
+// cross-uid signal.
 
 describe("PRD #1493 M2: legacy migration resists a symlink give-away (portable, record-only)", () => {
   const CHOWN_R_PREFIX = "chown -R runner:runner ";
@@ -411,6 +414,32 @@ describe("PRD #1493 M2: legacy migration resists a symlink give-away (portable, 
         continue; // no longer resolvable => cannot reach repos
       }
       if (resolved === reposReal || resolved.startsWith(reposReal + path.sep)) hits.push(`${arg} -> ${resolved}`);
+    }
+    return hits;
+  }
+
+  /** The last whitespace-delimited token of an op line (its path argument; test paths have no spaces). */
+  function opPathArg(op: string): string {
+    const parts = op.trim().split(/\s+/);
+    return parts[parts.length - 1] ?? "";
+  }
+
+  /**
+   * Every op line for `verb` (chown OR chmod, recursive or not) whose path argument's REAL
+   * (symlink-resolved) path is repos/ itself or under it — catching a root symlink dereferenced
+   * ONTO repos/ (the chmod-dereference hole) as well as a mid-path prefix descending through it.
+   */
+  function opsReachingRepos(ops: string[], reposReal: string, verb: "chown" | "chmod"): string[] {
+    const hits: string[] = [];
+    for (const op of ops) {
+      if (!op.startsWith(verb + " ")) continue;
+      let resolved: string;
+      try {
+        resolved = fs.realpathSync(opPathArg(op));
+      } catch {
+        continue; // no longer resolvable => cannot reach repos
+      }
+      if (resolved === reposReal || resolved.startsWith(reposReal + path.sep)) hits.push(`${op} -> ${resolved}`);
     }
     return hits;
   }
@@ -497,6 +526,105 @@ describe("PRD #1493 M2: legacy migration resists a symlink give-away (portable, 
 
       const after = fs.statSync(witness);
       assert.equal(after.uid, before.uid, "repos witness owner unchanged");
+      assert.equal(after.ctimeMs, before.ctimeMs, "repos witness ctime unchanged (never re-owned)");
+    } finally {
+      fs.rmSync(h.root, { recursive: true, force: true });
+    }
+  });
+
+  it("a TOP-LEVEL agent-home -> repos symlink ROOT is rejected: no chmod/chown reaches repos/, real siblings still migrate", () => {
+    const h = makeHarness();
+    try {
+      fs.mkdirSync(h.nix);
+      fs.mkdirSync(h.data);
+      // The worker-only bare-repo cache the give-away targets, with a known witness file.
+      const bare = path.join(h.data, "repos", "mybare");
+      fs.mkdirSync(bare, { recursive: true });
+      const witness = path.join(bare, "config");
+      const witnessBody = "hooksPath=/usr/share/uzi-git-nohooks\n";
+      fs.writeFileSync(witness, witnessBody);
+      const reposReal = fs.realpathSync(path.join(h.data, "repos"));
+      const before = fs.statSync(witness);
+
+      // The WHOLE carve-out ROOT is a symlink to repos: a chmod/chown keyed on it dereferences onto
+      // the bare cache, and any glob keyed on it descends through it into repos/.
+      fs.symlinkSync("repos", path.join(h.data, "agent-home"));
+      // A real sibling carve-out with content: the positive control that real work still happens.
+      fs.mkdirSync(path.join(h.data, "provision"), { recursive: true });
+      fs.writeFileSync(path.join(h.data, "provision", "cache"), "pkgs");
+      fs.writeFileSync(h.token, "t");
+
+      const r = run(h, { STUB_NOOP: "1" });
+      assert.equal(r.status, 0, `migration run must succeed (stderr: ${r.stderr})`);
+
+      // (a) NO chown -R runner:runner resolves under repos/ (the auditor's demonstrated give-away
+      //     `chown -R runner:runner .../repos/mybare/config`).
+      assert.deepEqual(chownRReaching(r.ops, reposReal), [], "no chown -R may resolve under repos/ via the agent-home root symlink");
+      // (b) NO chmod op resolves onto/under repos/ (the chmod-dereference hole on the root itself).
+      assert.deepEqual(opsReachingRepos(r.ops, reposReal, "chmod"), [], "no chmod may dereference onto repos/ via the agent-home root symlink");
+      // (c) NO chown of ANY kind (recursive or not) resolves onto/under repos/.
+      assert.deepEqual(opsReachingRepos(r.ops, reposReal, "chown"), [], "no chown may dereference onto repos/ via the agent-home root symlink");
+      // The symlinked root is never a chown/chmod target (mkdir -p records it; nothing else may).
+      assert.ok(
+        !r.ops.some((o) => (o.startsWith("chown") || o.startsWith("chmod")) && o.includes(`${h.data}/agent-home`)),
+        "the symlinked agent-home root must never be a chown/chmod target",
+      );
+      // Positive control: a real sibling carve-out's content is still migrated.
+      assert.ok(opMatches(r.ops, CHOWN_R_PREFIX, `${h.data}/provision/cache`), "a real carve-out's content is still migrated");
+
+      // (d) the witness under repos/ is byte-identical with unchanged ownership/ctime.
+      const after = fs.statSync(witness);
+      assert.equal(fs.readFileSync(witness, "utf8"), witnessBody, "repos witness bytes intact");
+      assert.equal(after.uid, before.uid, "repos witness owner unchanged");
+      assert.equal(after.gid, before.gid, "repos witness group unchanged");
+      assert.equal(after.ctimeMs, before.ctimeMs, "repos witness ctime unchanged (never re-owned)");
+    } finally {
+      fs.rmSync(h.root, { recursive: true, force: true });
+    }
+  });
+
+  it("a TOP-LEVEL runner -> ../repos symlink ROOT (escaping the data volume) is rejected: no chmod/chown reaches repos/", () => {
+    const h = makeHarness();
+    try {
+      fs.mkdirSync(h.nix);
+      fs.mkdirSync(h.data);
+      // A repos cache OUTSIDE the data volume that `runner -> ../repos` escapes to — a symlinked
+      // root can point anywhere the attacker chooses, not only at a sibling of the carve-outs.
+      const reposDir = path.join(h.root, "repos");
+      const bare = path.join(reposDir, "mybare");
+      fs.mkdirSync(bare, { recursive: true });
+      const witness = path.join(bare, "config");
+      const witnessBody = "bare-config\n";
+      fs.writeFileSync(witness, witnessBody);
+      const reposReal = fs.realpathSync(reposDir);
+      const before = fs.statSync(witness);
+
+      // The runner carve-out ROOT is a symlink escaping the data volume (../repos from /data).
+      fs.symlinkSync("../repos", path.join(h.data, "runner"));
+      // A real sibling per-run HOME: the positive control that real migration still happens.
+      const legit = path.join(h.data, "agent-home", "run-legit");
+      fs.mkdirSync(path.join(legit, ".claude"), { recursive: true });
+      fs.writeFileSync(path.join(legit, ".claude", "p.json"), "history");
+      fs.writeFileSync(h.token, "t");
+
+      const r = run(h, { STUB_NOOP: "1" });
+      assert.equal(r.status, 0, `migration run must succeed (stderr: ${r.stderr})`);
+
+      // The auditor's demonstrated give-away `chown -R runner:runner .../repos/mybare`.
+      assert.deepEqual(chownRReaching(r.ops, reposReal), [], "no chown -R may resolve under repos/ via the runner root symlink");
+      assert.deepEqual(opsReachingRepos(r.ops, reposReal, "chmod"), [], "no chmod may dereference onto repos/ via the runner root symlink");
+      assert.deepEqual(opsReachingRepos(r.ops, reposReal, "chown"), [], "no chown may dereference onto repos/ via the runner root symlink");
+      assert.ok(
+        !r.ops.some((o) => (o.startsWith("chown") || o.startsWith("chmod")) && o.includes(`${h.data}/runner`)),
+        "the symlinked runner root must never be a chown/chmod target",
+      );
+      // Positive control: a real per-run HOME beside the symlinked root is still migrated.
+      assert.ok(opMatches(r.ops, CHOWN_R_PREFIX, `${legit}/.claude`), "a real per-run HOME is still migrated");
+
+      const after = fs.statSync(witness);
+      assert.equal(fs.readFileSync(witness, "utf8"), witnessBody, "repos witness bytes intact");
+      assert.equal(after.uid, before.uid, "repos witness owner unchanged");
+      assert.equal(after.gid, before.gid, "repos witness group unchanged");
       assert.equal(after.ctimeMs, before.ctimeMs, "repos witness ctime unchanged (never re-owned)");
     } finally {
       fs.rmSync(h.root, { recursive: true, force: true });

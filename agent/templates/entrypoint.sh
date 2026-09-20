@@ -230,6 +230,16 @@ migrate_tree "$DATA_DIR" "$WORKER_OWNER"
 RUNNER_TREE_OWNER=worker:runner
 for d in runner agent-home provision; do
   "$MKDIR" -p "$DATA_DIR/$d"
+  # SYMLINK-ROOT GUARD (PRD #1493 M2 rework, BLOCKING): a legacy single-uid /data was
+  # attacker-writable, so a carve-out ROOT itself may be a planted symlink (e.g.
+  # `agent-home -> repos`). `mkdir -p` on an existing symlink-to-dir SUCCEEDS without
+  # replacing the link, so this guard comes AFTER the mkdir to catch the pre-existing link,
+  # and skips it: a legitimate carve-out root is ALWAYS a real dir directly under /data.
+  # Without it the `[ -O ]`+chmod below DEREFERENCES onto the symlink target (chmod follows
+  # symlinks), re-moding e.g. the worker-only repos/ cache to 3775, and the chown re-owns
+  # it — a runner->worker escape. (`[ -L ]` is not the last command in the AND-OR list, so
+  # `set -eu` does not fire when it is false — the same idiom as the descendant guards.)
+  [ -L "$DATA_DIR/$d" ] && continue
   # 🔴 SC3067 IS A TRUE PORTABILITY STATEMENT AND A FALSE BUG REPORT AGAINST THIS
   # IMAGE, AND IT STOPS BEING FALSE THE MOMENT THE SHEBANG OR THE BASE IMAGE MOVES.
   # This file is `#!/bin/sh` and both worker Dockerfiles ship it on the same
@@ -307,26 +317,44 @@ LEGACY_SENTINEL="$DATA_DIR/.uzi-legacy-split-migrated"
 if [ ! -f "$LEGACY_SENTINEL" ]; then
   echo "uzi-entrypoint: one-time ownership-aware migration of legacy $DATA_DIR [PRD #1493 M2]" >&2
   for d in runner agent-home provision; do
+    [ -L "$DATA_DIR/$d" ] && continue                  # symlinked root: never dereference it (chmod below would follow onto its target, e.g. repos/); see the defense note below
     if [ -d "$DATA_DIR/$d" ]; then
       "$CHOWN" 0:0 "$DATA_DIR/$d"                       # reclaim (no CAP_FOWNER at runtime)
       "$CHMOD" 3775 "$DATA_DIR/$d"                      # setgid + group-write + STICKY (change 4 / D7)
       "$CHOWN" "$RUNNER_TREE_OWNER" "$DATA_DIR/$d"
     fi
   done
-  # SYMLINK GIVE-AWAY DEFENSE (PRD #1493 M2 audit, HIGH): a legacy single-uid /data was writable
-  # by the untrusted agent uid, so a descendant of these carve-out trees may be an attacker-planted
-  # symlink (e.g. agent-home/evil -> ../repos, or -> /). A `chown -R` whose argument OR whose
-  # mid-path prefix resolves through such a link would re-own an unrelated tree — notably the
-  # worker-only bare-repo cache repos/ (the B2 code-exec surface) — to `runner`, letting the
-  # untrusted identity plant a git hook the PAT-holding worker later executes: it defeats the uid
-  # split. The kernel ALWAYS resolves mid-path components regardless of busybox chown's
-  # no-dereference default, so every descendant loop below skips a symlink entry outright (`[ -L ]`)
-  # and only ever descends REAL directories. A legitimate carve-out child / per-run HOME / epoch is
-  # always a real path; a symlink there is never something the migration needs to re-own.
+  # SYMLINK GIVE-AWAY DEFENSE (PRD #1493 M2 audit, BLOCKING): a legacy single-uid /data was
+  # writable by the untrusted agent uid, so it could plant a symlink either AT a carve-out ROOT
+  # itself (e.g. `agent-home -> repos`, or `runner -> ../repos`) or as a DESCENDANT of one (e.g.
+  # `agent-home/evil -> ../repos`, or a run HOME's `codex-data -> ../../repos`). Either lets a
+  # `chmod`/`chown`/`chown -R` dereference onto — or a glob descend through — an unrelated tree,
+  # notably the worker-only bare-repo cache repos/ (the B2 code-exec surface): re-owning repos/ to
+  # `runner` lets the untrusted identity plant a git hook the PAT-holding worker later executes,
+  # defeating the uid split. The kernel ALWAYS resolves mid-path components regardless of busybox
+  # chown's no-dereference default, so a symlinked ROOT poisons every op keyed on it and a symlinked
+  # DESCENDANT poisons its sub-walk. TWO GUARD LAYERS close the whole class:
+  #   (a) ROOTS — every place a carve-out root {runner,agent-home,provision} is chmod'd, chown'd or
+  #       used as a glob/mid-path prefix rejects it when it is a symlink: the every-boot (a2) loop
+  #       and the parent-reclaim loop above `[ -L ] && continue`; the `for tree` loop below likewise;
+  #       and the agent-home block below gates on `[ -d ] && [ ! -L ]`. So no chmod dereferences onto
+  #       a symlink target and no glob ever descends through a symlinked root. A legitimate carve-out
+  #       root is ALWAYS a real directory directly under /data.
+  #   (b) DESCENDANTS — every descendant loop below skips a symlink entry outright (`[ -L ]`) and only
+  #       ever descends REAL directories. A legitimate carve-out child / per-run HOME / epoch is
+  #       always a real path; a symlink there is never something the migration needs to re-own.
+  #
+  # KNOWN, ACCEPTED, NARROW RESIDUAL (deliberately NOT "fixed" with an nlink filter): `[ -L ]` cannot
+  # catch a HARDLINK. A legacy-planted hardlink from inside a migrated tree to an existing
+  # repos/<repo> FILE would transfer that single inode's ownership to `runner` via `chown -R` (files
+  # only, same-fs, the target must pre-exist). This is far narrower than the symlink class (no
+  # directory trees, no new inodes), and a general defense is impractical: git LEGITIMATELY hardlinks
+  # pack/object files, so an `nlink > 1` skip would break real clones. Documented and accepted.
   #
   # "$DATA_DIR"/runner + /provision: re-own retained content to `runner`, preserving it. Only the
   # PARENT's CHILDREN are re-owned (the parents stay worker:runner, set just above).
   for tree in runner provision; do
+    [ -L "$DATA_DIR/$tree" ] && continue               # symlinked root: never becomes a glob/mid-path prefix (layer (a) above)
     if [ -d "$DATA_DIR/$tree" ]; then
       for c in "$DATA_DIR/$tree"/* "$DATA_DIR/$tree"/.[!.]* "$DATA_DIR/$tree"/..?*; do
         [ -e "$c" ] || continue
@@ -336,7 +364,7 @@ if [ ! -f "$LEGACY_SENTINEL" ]; then
     fi
   done
   # "$DATA_DIR"/agent-home: the mixed per-subtree map above.
-  if [ -d "$DATA_DIR/agent-home" ]; then
+  if [ -d "$DATA_DIR/agent-home" ] && [ ! -L "$DATA_DIR/agent-home" ]; then   # symlinked root: never glob through it (layer (a) above)
     for home in "$DATA_DIR"/agent-home/* "$DATA_DIR"/agent-home/.[!.]* "$DATA_DIR"/agent-home/..?*; do
       [ -d "$home" ] || continue
       [ -L "$home" ] && continue                        # a legit per-run HOME is always a REAL dir; skip a planted symlink so it can never become a mid-path prefix
