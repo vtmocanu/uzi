@@ -42,7 +42,7 @@ if [ "${1:-}" = run ] && [ "${2:-}" = list ]; then
       esac
       ;;
     failure)
-      printf '104\tin_progress\t\tCI\n'
+      printf '104\tin_progress\t\tCI\033[2J\n'
       ;;
     *) echo "unknown MODE=$MODE" >&2; exit 1 ;;
   esac
@@ -50,7 +50,7 @@ if [ "${1:-}" = run ] && [ "${2:-}" = list ]; then
 fi
 if [ "${1:-}" = run ] && [ "${2:-}" = view ]; then
   if [ "$MODE" = failure ]; then
-    printf 'completed\tfailure\tlint-repo\thttps://github.com/test/repo/actions/runs/104/job/999\t999\n'
+    printf 'completed\tfailure\tlint\033[31m-repo\thttps://github.com/test/repo/actions/runs/104/job/999\t999\n'
   elif [ "$MODE" = transient ]; then
     n=0; [ -f "$VIEW_COUNT" ] && n=$(cat "$VIEW_COUNT")
     n=$((n+1)); printf '%s' "$n" > "$VIEW_COUNT"
@@ -107,7 +107,21 @@ set -e
 [ "$rc" -eq 1 ] || fail "confirmed failed job did not exit 1, rc=$rc: $(cat "$WORK/failure.out")"
 grep -Fq 'live log: gh api --allow-escape-sequences repos/test/repo/actions/jobs/999/logs' "$WORK/failure.out" \
   || fail "failed job omitted live-log command: $(cat "$WORK/failure.out")"
-grep -Fq 'after run terminal: gh run view 104 --job 999 --log-failed' "$WORK/failure.out" \
+grep -Fq 'after run terminal: gh run view 104 --repo test/repo --job 999 --log-failed' "$WORK/failure.out" \
   || fail "failed job omitted terminal log command: $(cat "$WORK/failure.out")"
+if LC_ALL=C grep -Fq $'\033' "$WORK/failure.out"; then
+  fail "untrusted workflow/job name emitted a raw escape byte: $(cat "$WORK/failure.out")"
+fi
+
+: > "$CALLS"
+set +e
+bash "$SCRIPT" --sha "$FULL_SHA" --interval 0 --max-ticks 2 > "$WORK/failure-derived.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 1 ] || fail "URL-derived failure case did not exit 1, rc=$rc: $(cat "$WORK/failure-derived.out")"
+grep -Fq 'live log: gh api --allow-escape-sequences repos/test/repo/actions/jobs/999/logs' "$WORK/failure-derived.out" \
+  || fail "URL-derived repo missing from live-log command: $(cat "$WORK/failure-derived.out")"
+grep -Fq 'after run terminal: gh run view 104 --repo test/repo --job 999 --log-failed' "$WORK/failure-derived.out" \
+  || fail "URL-derived repo missing from terminal command: $(cat "$WORK/failure-derived.out")"
 
 echo "PASS watch-run-ci: exact SHA discovery, short fallback, transient empty recovery, live failed-job logs"

@@ -59,7 +59,7 @@ GitHub tests each PR as branch **merged with base**, so a broken `main` fails `v
 on every PR at once. A `[skip ci]` doc/PRD commit is the classic cause — it never ran CI,
 so a `check-docs` break (e.g. a backticked `adr/…` or `prds/…` path that does not exist
 yet) sits on `main` unseen. Diagnose from a PR's failing job log (`gh run view --log-failed`,
-or `gh api …/jobs/JOB_ID/logs`), confirm the fault is on `main` (not the PR's own diff),
+or `gh api --allow-escape-sequences …/jobs/JOB_ID/logs`), confirm the fault is on `main` (not the PR's own diff),
 then fix it. A **docs-only** fix direct to `main` is the norm here (releases land that way);
 the `check-docs` opt-out for a forward-referenced artifact is a `check-docs:ignore-path`
 HTML-comment marker on the line. **Never push non-doc code to `main`.**
