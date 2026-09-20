@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/google/uuid"
@@ -144,8 +145,10 @@ func TestCollectCodexAccountUsageRealHTTPEndToEndLiveDB(t *testing.T) {
 		gotAuthHeader string
 		gotAccountID  string
 		gotPath       string
+		reqCount      atomic.Int64 // total requests the client actually made to the server
 	)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqCount.Add(1)
 		gotAuthHeader = r.Header.Get("Authorization")
 		gotAccountID = r.Header.Get("ChatGPT-Account-Id")
 		gotPath = r.URL.Path
@@ -205,7 +208,13 @@ func TestCollectCodexAccountUsageRealHTTPEndToEndLiveDB(t *testing.T) {
 		}
 	})
 
-	// (b) A 3xx from the server is REFUSED: the client does not follow it (header un-leaked),
+	// (b) A 3xx from the server is REFUSED: the client does NOT follow it, so ReadUsage's
+	// custom ChatGPT-Account-Id header is never forwarded to the redirect target. The
+	// distinguishing proof is the request count: with the production CheckRedirect the client
+	// returns the 302 as-is and makes EXACTLY ONE request; if it followed (a mutation dropping
+	// CheckRedirect), the rewrite transport sends the Location back to this server and it loops
+	// (>1 request) until net/http aborts. So reqCount==1 is what separates refused from
+	// followed — the count, not the transient verdict (a follow-loop also ends transient).
 	// ReadUsage sees the non-2xx and CollectCodexAccountUsage returns a failure — no reading,
 	// no upsert, last-good (42) preserved.
 	t.Run("redirect_refused", func(t *testing.T) {
@@ -213,7 +222,11 @@ func TestCollectCodexAccountUsageRealHTTPEndToEndLiveDB(t *testing.T) {
 			w.Header().Set("Location", "https://evil.example.invalid/wham/usage")
 			w.WriteHeader(http.StatusFound)
 		}
+		before := reqCount.Load()
 		reading, cerr := fx.svc.CollectCodexAccountUsage(env.ctx, fx.userID, fx.accountID)
+		if made := reqCount.Load() - before; made != 1 {
+			t.Fatalf("a refused redirect must make exactly ONE request (the client must not follow the 3xx), made=%d", made)
+		}
 		if got := mustUsageFailure(t, cerr).Kind; got != CodexUsageFailTransient {
 			t.Fatalf("kind = %v, want transient (a refused 3xx)", got)
 		}
