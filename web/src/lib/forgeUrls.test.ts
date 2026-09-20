@@ -23,6 +23,17 @@ describe("projectWebUrlFromIssue", () => {
       "https://forge.example.com/ns/repo",
     );
   });
+  it("splits at the LAST /issues/ so a repo or owner named 'issues' resolves (#1486)", () => {
+    // A repo literally named "issues": the base must keep it, not truncate at the first
+    // /issues/ (indexOf would yield .../ns and a /pull/ 404).
+    expect(projectWebUrlFromIssue("https://github.com/ns/issues/issues/42")).toBe(
+      "https://github.com/ns/issues",
+    );
+    // An owner literally named "issues".
+    expect(projectWebUrlFromIssue("https://github.com/issues/repo/issues/42")).toBe(
+      "https://github.com/issues/repo",
+    );
+  });
   it("returns '' for a URL that is not an issue URL", () => {
     expect(projectWebUrlFromIssue("https://gitlab.example.com/g/p")).toBe("");
     expect(projectWebUrlFromIssue("https://github.com/ns/repo")).toBe("");

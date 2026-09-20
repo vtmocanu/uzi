@@ -221,7 +221,7 @@ export function IssueCard({
   // badge (runBadge → effectiveRunStatus) already reads "revising" in the calm info tone.
   const loud = needsHumanAttention(effectiveRunStatus(run ?? { status: "" }));
   // The MR/PR link (PRD #65 D8): prefer the forge-supplied URL the worker persisted
-  // (the only correct link on Forgejo), guarded through isHttpsUrl by preferForgeUrl
+  // (the forge's own canonical URL), guarded through isHttpsUrl by preferForgeUrl
   // before it becomes an anchor. A null (rows created before it landed) falls back to a
   // forge-aware reconstruction from the project base — the path segment is chosen per
   // forge (GitLab /-/merge_requests/, GitHub /pull/, Forgejo /pulls/) by mergeRequestUrl,
