@@ -975,7 +975,7 @@ async function ensureCodexSharedDirectoryInner(
       const beforeIno = before.ino;
       // Atomically move the pre-existing dir OUT of the live path. This sibling lives in the advice
       // parent's own directory (sdkHomeRoot/agent-home), which under supported uid-split is
-      // worker:runner 2775 — runner-group-writable — so it is only a TRANSIENT holding spot, NEVER
+      // worker:runner 3775 — runner-group-writable — so it is only a TRANSIENT holding spot, NEVER
       // where we recursively remove (issue #1495 CodeRabbit CWE-367: a concurrent runner could
       // rename that path between a check and fs.rm's recursive walk).
       const tombstone = `${dir}.uzi-tomb-${randomUUID()}`;
@@ -1035,7 +1035,7 @@ async function ensureCodexSharedDirectoryInner(
 
 /** Safely dispose of a recovery tombstone (issue #1495 CodeRabbit TOCTOU/CWE-367). The tombstone
  *  sits beside the live advice parent, whose directory is runner-group-writable under supported
- *  uid-split (worker:runner 2775), so it must NOT be recursively removed in place — a concurrent
+ *  uid-split (worker:runner 3775), so it must NOT be recursively removed in place — a concurrent
  *  runner could swap that path between a check and the recursive walk, and entry removal/rename
  *  depends on the PARENT's permissions, so a 0700 dir *under* agent-home would still be swappable.
  *  Instead relocate the tombstone into a freshly-created, validated 0700 quarantine rooted at

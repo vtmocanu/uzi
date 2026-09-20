@@ -199,6 +199,83 @@ func TestProbeExitCodes(t *testing.T) {
 	}
 }
 
+// TestApplyPolicyDispatch pins applyPolicy's mapping of a decidePolicy action onto
+// the actual enforcement primitives — the most safety-critical wiring. confine()
+// needs a real kernel, so the two primitives are injected as recording fakes; the
+// assertions are which primitive ran, never that it succeeded. This reddens on a
+// branch swap (actionApply calling the unconfined path, or vice versa) and on
+// dropping applyNoNewPrivs() from the unconfined branch.
+func TestApplyPolicyDispatch(t *testing.T) {
+	const wantABI = 3
+	tests := []struct {
+		name           string
+		probe          versionProbe
+		mode           sandboxMode
+		wantConfine    bool
+		wantNoNewPrivs bool
+		wantErr        bool
+	}{
+		{
+			// actionApply → confine() runs (required path is NEVER unconfined).
+			name:        "actionApply confines and never runs the unconfined-only path",
+			probe:       fakeProbe(wantABI, 0),
+			mode:        modeRequired,
+			wantConfine: true,
+		},
+		{
+			// actionUnconfined → confine() does NOT run, but no_new_privs is STILL set.
+			name:           "actionUnconfined skips confine but still sets no_new_privs",
+			probe:          fakeProbe(0, syscall.ENOSYS),
+			mode:           modeBestEffort,
+			wantNoNewPrivs: true,
+		},
+		{
+			// actionFatal → neither enforcement runs and the fatal error propagates.
+			name:    "actionFatal runs neither enforcement and propagates the error",
+			probe:   fakeProbe(0, syscall.ENOSYS),
+			mode:    modeRequired,
+			wantErr: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var confineCalled, noNewPrivsCalled bool
+			var gotRoot, gotTmp string
+			var gotABI int
+			confineFake := func(root, tmp string, abi int) error {
+				confineCalled = true
+				gotRoot, gotTmp, gotABI = root, tmp, abi
+				return nil
+			}
+			noNewPrivsFake := func() error {
+				noNewPrivsCalled = true
+				return nil
+			}
+			err := applyPolicy("/data/run", "/tmp/run", test.mode, test.probe, confineFake, noNewPrivsFake)
+			switch {
+			case test.wantErr && err == nil:
+				t.Fatal("actionFatal must propagate the fatal error")
+			case !test.wantErr && err != nil:
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if confineCalled != test.wantConfine {
+				t.Fatalf("confine() invoked = %v, want %v", confineCalled, test.wantConfine)
+			}
+			if noNewPrivsCalled != test.wantNoNewPrivs {
+				t.Fatalf("applyNoNewPrivs() invoked = %v, want %v", noNewPrivsCalled, test.wantNoNewPrivs)
+			}
+			if test.wantConfine {
+				// confine() must receive the worktree/tmp roots and the ABI
+				// decidePolicy resolved — proof this is the real confine path, not
+				// the unconfined one.
+				if gotRoot != "/data/run" || gotTmp != "/tmp/run" || gotABI != wantABI {
+					t.Fatalf("confine() args: root=%q tmp=%q abi=%d, want /data/run /tmp/run %d", gotRoot, gotTmp, gotABI, wantABI)
+				}
+			}
+		})
+	}
+}
+
 func TestConfinementDenyProbe(t *testing.T) {
 	readable := func(string) (*os.File, error) { return os.Open(os.DevNull) }
 	denied := func(string) (*os.File, error) { return nil, os.ErrPermission }

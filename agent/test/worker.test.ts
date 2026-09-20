@@ -790,8 +790,9 @@ describe("Worker — diff-review dispatch (PRD #400 M4b)", () => {
 // absent result leaves the always-present protocol capabilities unchanged, so a
 // stripped/split-less/Landlock-less worker keeps serving Claude. The server silently
 // filters the string until the vocabulary-admission unit lands — this test pins the
-// WORKER side: what it puts on the wire, and only that. The combining logic itself is
-// unit-tested in codex-capability.test.ts.
+// WORKER side: what it puts on the wire, and only that. The combining logic itself
+// (resolveCodexHarnessAvailability / probeLandlockAvailability) is unit-tested in
+// codex-runtime-probe.test.ts.
 describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / #1493 M3)", () => {
   // A client whose register() captures the protocol-capabilities argument (5th param) so a
   // test can assert exactly what the worker advertised, then idles both claim lanes.

@@ -141,7 +141,7 @@ func realMain(args []string) int {
 	if err := os.Chmod(tmp, 0o700); err != nil {
 		return setupFailure("harden private tmp", err)
 	}
-	if err := applyPolicy(root, tmp, mode, realVersionProbe); err != nil {
+	if err := applyPolicy(root, tmp, mode, realVersionProbe, confine, applyNoNewPrivs); err != nil {
 		return setupFailure("apply Landlock policy", err)
 	}
 	if err := os.Chdir(cwd); err != nil {
@@ -275,21 +275,33 @@ func decidePolicy(probe versionProbe, mode sandboxMode) (action policyAction, ab
 	}
 }
 
+// confineFunc and noNewPrivsFunc are injectable seams for applyPolicy's two
+// enforcement primitives (mirroring the probeOpen/versionProbe seams in this
+// file), so the mode→enforcement dispatch is hermetically testable without a real
+// kernel. Production always passes the real confine/applyNoNewPrivs, so shipped
+// behaviour is byte-identical; confine() still calls the real applyNoNewPrivs
+// internally regardless of these seams.
+type confineFunc func(root, tmp string, abi int) error
+
+type noNewPrivsFunc func() error
+
 // applyPolicy decides from mode + probe what to do, then does it. actionApply
 // applies Landlock and fails closed on any apply error (both modes);
 // actionUnconfined (best-effort, kernel without Landlock) runs the child without
 // filesystem confinement but STILL sets no_new_privs; actionFatal returns the
-// error so realMain fails closed.
-func applyPolicy(root, tmp string, mode sandboxMode, probe versionProbe) error {
+// error so realMain fails closed. The two enforcement primitives are injected
+// (confineFn/noNewPrivsFn) so the dispatch itself is unit-testable; realMain
+// passes the real confine/applyNoNewPrivs.
+func applyPolicy(root, tmp string, mode sandboxMode, probe versionProbe, confineFn confineFunc, noNewPrivsFn noNewPrivsFunc) error {
 	action, abi, err := decidePolicy(probe, mode)
 	switch action {
 	case actionApply:
-		return confine(root, tmp, abi)
+		return confineFn(root, tmp, abi)
 	case actionUnconfined:
 		// Degraded best-effort: no worktree confinement, but the uid split and
 		// no_new_privs still hold (the private 0700 tmp and cwd-inside-root check
 		// are enforced by realMain/parseArgs regardless of this branch).
-		return applyNoNewPrivs()
+		return noNewPrivsFn()
 	default:
 		return err
 	}
