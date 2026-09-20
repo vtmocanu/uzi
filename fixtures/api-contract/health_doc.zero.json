@@ -1,0 +1,14 @@
+{
+  "status": "",
+  "checked_at": "",
+  "counts": {
+    "ok": 0,
+    "warn": 0,
+    "danger": 0,
+    "unknown": 0,
+    "na": 0
+  },
+  "snoozed_until": null,
+  "episode_id": null,
+  "checks": null
+}

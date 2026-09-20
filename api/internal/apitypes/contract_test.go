@@ -137,6 +137,12 @@ func contractCases() []contractCase {
 		// normalizes to []; last_success_at/stale are omitempty and drop on the zero value.
 		newContractCase[CodexAccountRateLimitDTO]("codex_account_rate_limit"),
 		newContractCase[CodexAdminRateLimitRowDTO]("codex_admin_rate_limit_row"),
+		// PRD #1484 M1: the admin-health document. Its Checks slice is non-omitempty (its
+		// zero.json carries a null the registry normalizes to []); snoozed_until and
+		// episode_id are nullable pointers present-as-null on the zero value; counts is a
+		// nested all-int struct (no null). The nested HealthCheckDTO / HealthEvidenceDTO
+		// ride inside the full fixture's checks[0], no standalone row (never returned alone).
+		newContractCase[HealthDocDTO]("health_doc"),
 	}
 }
 

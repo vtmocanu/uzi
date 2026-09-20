@@ -677,6 +677,15 @@ LIMIT 500;
 -- excluded so a live chat never inflates "N/M runs" past the run-lane cap). The
 -- embedded worker carries max_concurrent_runs (the advertised cap, NULL when
 -- unadvertised).
+--
+-- Roll health (PRD #1484 M1), LEFT JOINed exactly as ListWorkersByUser does so the
+-- admin fleet view and the cross-user health checks (fleet.roll, fleet.disk) can read
+-- the controller's per-worker roll signal instead of the always-null placeholder the
+-- old admin list carried. A worker with no report — every external worker, any hosted
+-- worker the controller has not reached, and the whole fleet under docker-compose where
+-- no controller runs — still lists (LEFT JOIN). observed_at is the API's own receipt
+-- time and the only freshness input; controller_reported_at is deliberately NOT
+-- selected (it is display-only and must not reach a freshness classifier).
 SELECT sqlc.embed(w),
        EXISTS (
            SELECT 1 FROM runs r
@@ -689,9 +698,18 @@ SELECT sqlc.embed(w),
              AND r.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
              AND r.kind <> 'chat'
        ) AS active_runs,
-       u.email AS owner_email
+       u.email AS owner_email,
+       rh.phase              AS roll_phase,
+       rh.phase_since        AS roll_phase_since,
+       rh.blocking_container AS roll_blocking_container,
+       rh.blocking_reason    AS roll_blocking_reason,
+       rh.restart_count      AS roll_restart_count,
+       rh.last_exit_code     AS roll_last_exit_code,
+       rh.observed_at        AS roll_observed_at,
+       rh.worker_image_tag   AS roll_worker_image_tag
 FROM workers w
 JOIN users u ON u.id = w.user_id
+LEFT JOIN worker_upgrade_reports rh ON rh.worker_id = w.id
 ORDER BY w.created_at DESC;
 
 -- name: GetRunOwnedByWorker :one
@@ -5831,3 +5849,70 @@ RETURNING contract_revision;
 -- match it; the worker must re-request a permit at the new revision. Returns the count invalidated.
 UPDATE run_completion_permits SET consumed_at = now()
 WHERE run_id = @run_id AND consumed_at IS NULL AND contract_revision < @new_revision;
+
+-- ════════════════════════════════════════════════════════════════════════════════════════
+-- Admin health checks (PRD #1484 M1). Each is an indexed count/min over a table the api
+-- already holds; healthsvc composes the server-authored summary and applies the named
+-- thresholds. board.drift reuses ListGaveUpColumnMoves and custody.holds reuses
+-- ListOwnersOverCustodyLimit, so only these four are new.
+-- ════════════════════════════════════════════════════════════════════════════════════════
+
+-- name: ListOwnersWaitingNoCapacity :many
+-- health fleet.capacity: the owners who have at least one run parked in
+-- health='waiting_worker' AND own ZERO usable workers — online (fresh heartbeat), not
+-- draining. Per owner the OLDEST health_since (the wait's start); healthsvc applies the
+-- 5-minute danger threshold. The heartbeat-freshness definition (last_heartbeat_at >=
+-- @heartbeat_cutoff, cutoff = now - WORKER_HEARTBEAT_STALE) mirrors the "online worker"
+-- window the recovery/claim queries use, so this stays truthful even when the controller
+-- is silent (a heartbeat-based signal, not status-based). The conjunction with "zero
+-- usable workers" is what makes waiting_worker a CAPACITY failure rather than one of its
+-- other causes (vault locked, custody limit, all workers busy) — those surface through
+-- queue.waiting by age instead.
+SELECT r.user_id,
+       min(r.health_since)::timestamptz AS oldest_health_since
+FROM runs r
+WHERE r.health = 'waiting_worker'
+  AND r.health_since IS NOT NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM workers w
+      WHERE w.user_id = r.user_id
+        AND w.draining_since IS NULL
+        AND w.last_heartbeat_at IS NOT NULL
+        AND w.last_heartbeat_at >= @heartbeat_cutoff
+  )
+GROUP BY r.user_id;
+
+-- name: OldestWaitingWorkerRun :one
+-- health queue.waiting: the oldest health_since across every run in
+-- health='waiting_worker', or NULL when none is waiting. healthsvc applies warn >= 10 min
+-- and danger >= 30 min. This is the sole reader of the age; the writer (detectRunHealth)
+-- is gated by health_enabled, so when that setting is off the check reports unknown, not
+-- ok, rather than reading this NULL as "nothing waiting".
+SELECT min(health_since)::timestamptz AS oldest_health_since
+FROM runs
+WHERE health = 'waiting_worker';
+
+-- name: OldestUndispatchedTaskRun :one
+-- health queue.undispatched: the oldest created_at across every task run stuck queued
+-- with no dispatch (the #1367 failure class), or NULL when none exists. healthsvc applies
+-- danger when older than 10 min. The kind='task' scope is load-bearing: dispatched_at is
+-- only ever set on a task run, so unscoped the predicate would match every queued run.
+SELECT min(created_at)::timestamptz AS oldest_created_at
+FROM runs
+WHERE kind = 'task' AND status = 'queued' AND dispatched_at IS NULL;
+
+-- name: CountUsersPausedWithEnabledSchedules :one
+-- health schedules.paused: how many users have a pause-all in force AND own at least one
+-- ENABLED schedule — the set whose labelled issues look queued forever. A pause is in
+-- force when schedules_paused is true OR schedules_paused_until is still ahead of @now.
+-- The HAVING filter counts only enabled schedules, so a user who paused but has only
+-- disabled schedules does not count. healthsvc warns when the count is >= 1.
+SELECT count(*) FROM (
+    SELECT u.id
+    FROM users u
+    JOIN run_schedules rs ON rs.user_id = u.id
+    WHERE u.schedules_paused = true
+       OR (u.schedules_paused_until IS NOT NULL AND u.schedules_paused_until > @now)
+    GROUP BY u.id
+    HAVING count(*) FILTER (WHERE rs.enabled) >= 1
+) paused_users;

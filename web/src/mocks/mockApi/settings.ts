@@ -1,6 +1,8 @@
 import {
   type AppSettings,
   type BindMode,
+  type HealthCheck,
+  type HealthDoc,
   type ReleaseCheckStatus,
   type SettingSource,
   type SettingsResponse,
@@ -334,6 +336,46 @@ function releaseCheckStatus(): ReleaseCheckStatus {
   };
 }
 
+// healthyDoc builds an all-passing admin-health document for mock mode (PRD #1484 M1).
+// It carries the full M1 registry in the server's stable order, every check ok, so the
+// demo client fn has a well-formed response. The degraded/incident/silent scenarios that
+// drive the Health tab and the banner land with that UI in M4.
+function healthyDoc(): HealthDoc {
+  const okCheck = (id: string, group: string, title: string, summary: string): HealthCheck => ({
+    id,
+    group,
+    title,
+    severity: "ok",
+    summary,
+    since: null,
+    evidence: [],
+    action: null,
+    command: null,
+    doc: null,
+  });
+  const checks: HealthCheck[] = [
+    okCheck("fleet.roll", "workers", "Worker image roll", "No hosted workers are configured on this deployment."),
+    okCheck("fleet.capacity", "workers", "Worker capacity", "Every owner with queued work has a usable worker."),
+    okCheck("fleet.disk", "workers", "Worker disk", "No worker is under sustained disk pressure."),
+    okCheck("queue.waiting", "queue", "Runs waiting for a worker", "No run is waiting for a worker."),
+    okCheck("queue.undispatched", "queue", "Undispatched task runs", "No task run is stuck undispatched."),
+    okCheck("db", "control", "Database", "Database reachable (2ms); schema at head."),
+    okCheck("slack.socket", "integrations", "Slack socket", "Slack is not configured."),
+    okCheck("schedules.paused", "housekeeping", "Paused schedules", "No user has paused schedules while owning enabled ones."),
+    okCheck("board.drift", "housekeeping", "Board drift", "No column move has been given up in the last 24 hours."),
+    okCheck("custody.holds", "housekeeping", "Recovery custody holds", "No owner is at the custody-hold admission limit."),
+    okCheck("release.check", "housekeeping", "Upstream release", "This instance is on a recent release."),
+  ];
+  return {
+    status: "ok",
+    checked_at: new Date().toISOString(),
+    counts: { ok: checks.length, warn: 0, danger: 0, unknown: 0, na: 0 },
+    snoozed_until: null,
+    episode_id: null,
+    checks,
+  };
+}
+
 let userSettings: UserSettings = loadedSettings.userSettings;
 
 export let appSettings: AppSettings = loadedSettings.appSettings;
@@ -523,6 +565,14 @@ export const settingsApi = {
     requireSession();
     releaseBannerSnoozeTag = releaseCheckFacts.latest_tag;
     return delay({ release_check: releaseCheckStatus() });
+  },
+  // ── Admin health (PRD #1484) ─────────────────────────────────────────────────
+  // Admin read (RequireAdminRO): the health document backing the Health tab and the
+  // Overview card. M1 wires only a healthy placeholder so the client fn has a demo
+  // response; the degraded/incident/silent scenarios land with the Health UI in M4.
+  getAdminHealth: async (): Promise<HealthDoc> => {
+    requireSession();
+    return delay(healthyDoc());
   },
 
   updateSettings: async (updates: UpdateSettingsPayload) => {
