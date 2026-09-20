@@ -160,7 +160,7 @@ Each Track U milestone ends green on its named gates, each run once to a log (`C
 
 ### M5: docs and specs (Track U)
 
-- Operator doc (the hosted-workers page under `docs/`): both knobs, the posture each trades, the one-line Landlock check, that a knob flip rolls the fleet, and how `no Codex-capable worker is online` reads for a split-less or Landlock-less fleet, including that Codex advice queues too. Run `task docs:sync` and commit the mirror.
+- Operator doc (`docs/configuration.md`, the operator-audience page — with a short user-facing pointer added to `docs/hosted-workers.md`): both knobs, the posture each trades, the one-line Landlock check, that a knob flip rolls the fleet, and how `no Codex-capable worker is online` reads for a split-less or Landlock-less fleet, including that Codex advice queues too. Run `task docs:sync` and commit the mirror.
 - `ARCHITECTURE.md`: one paragraph under the hosted-workers section; link this PRD rather than restating it.
 - `specs/human.md`: terse entry, tagged `(AI-synced 2026-09-20)`.
 - `prds/1106-codex-harness-phase1.md` M6: record this prerequisite (the issue notes M6 omits it).

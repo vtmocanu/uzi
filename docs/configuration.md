@@ -78,7 +78,7 @@ A new component, one per deployment, the only thing in uzi holding a kube-API cr
 | `CONTROLLER_POLL_INTERVAL` | `10s` | How often the controller fetches desired state and reconciles the fleet. The controller is stateless, so a restart loses nothing between polls. |
 | `CONTROLLER_HTTP_TIMEOUT` | `15s` | Per-call timeout on every request to the api. |
 
-**Checking for Landlock before turning `UZI_CODEX_COMMAND_SANDBOX=required` on.** From a node the workers actually schedule to, check whether the node kernel provides Landlock: `grep -q CONFIG_SECURITY_LANDLOCK /boot/config-$(uname -r)` (exit `0` means it is built in), or read the running kernel's active LSM list (e.g. `cat /sys/kernel/security/lsm`) for `landlock`. Many enterprise and vendor kernels omit it.
+**Checking for Landlock before turning `UZI_CODEX_COMMAND_SANDBOX=required` on.** From a node the workers actually schedule to, check whether the node kernel provides Landlock: `grep -q '^CONFIG_SECURITY_LANDLOCK=y' /boot/config-$(uname -r)` (exit `0` means it is built in — anchor the match, or the disabled line `# CONFIG_SECURITY_LANDLOCK is not set` matches too and reports a false positive), or, more authoritatively, read the running kernel's active LSM list (`cat /sys/kernel/security/lsm`) and confirm `landlock` is present (a built-in Landlock must also be in the active LSM list to work). Many enterprise and vendor kernels omit it.
 
 **Flipping either knob rolls the whole worker fleet** — both change the rendered pod spec (its hash moves), the same as any other pod-template change, so plan the flip for a quiet window: capacity drops to zero for the workers being replaced.
 

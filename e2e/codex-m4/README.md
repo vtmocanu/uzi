@@ -222,9 +222,9 @@ These are known, accepted limitations recorded honestly, not defects hiding behi
   `codex-o-command-root-home-denial`, and the base64/variable-indirection residual above — are
   `required`-mode claims.** They are proven on a Landlock-capable host running the command
   sandbox's default `required` mode. On [PRD #1493](../../prds/1493-codex-k8s-uid-split-profile.md)'s
-  opt-in `best-effort` mode, on a kernel that reports Landlock unavailable, none of them hold: the
-  command runs unconfined, and containment is the uid split alone (the worker/runner/runner-cmd
-  separation), not Landlock filesystem confinement. `best-effort` is never claimed to be
+  opt-in `best-effort` mode, on a kernel that reports Landlock unavailable, their Landlock-confinement
+  guarantee no longer holds: the command runs unconfined, and containment is the uid split alone (the
+  worker/runner/runner-cmd separation), not Landlock filesystem confinement. `best-effort` is never claimed to be
   equivalent to `required`; a worker only advertises Codex in `best-effort` on such a kernel, it
   never silently degrades a `required` claim.
 - **The native-bypass advertised-schema absence oracle** asserts no native tool schema appears
