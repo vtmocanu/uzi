@@ -189,28 +189,40 @@ wait_spilled() {
   done
   return 1
 }
-# wait_journaled RUN [TIMEOUT] — block until the worker has JOURNALED run RUN's terminal outcome
-# write-ahead, read from the agent's own log ("outbox: terminal journaled write-ahead", emitted by
-# terminal-resolve.ts on the durable-before-first-send success path). This is the M6 analogue of
-# wait_spilled: the run must REACH and JOURNAL its terminal while the api is down, and how long the
-# ~UZI_STUB_OUTBOX_TICKS-tick stream takes to get there is a property of the runner's speed (the CI
-# lane's ~10s-per-failed-flush connect timeout stretches it), not of this phase — so a fixed sleep
-# cannot bound it and under-shot the journal on the slow gitlab lane. Gate on the EVENT instead. By
-# the time the line is observed the terminal's FIRST send has already been attempted and lost (the
-# api is still down), so the caller can bring the api back immediately and still exercise the replay.
-# TIMEOUT stays well under the 90s heartbeat-stale window raised below, so a worst-case wait still
-# recovers before the sweeper would requeue the run. Returns 0 once observed and 1 on timeout; it
-# never calls `fail` itself (it runs with the api STOPPED) — the caller restores the api and judges.
-wait_journaled() {
-  local run="$1" timeout="${2:-60}" f="$RUNROOT/.outbox-journal.log"
+# wait_terminal_lost RUN [TIMEOUT] — block until run RUN has both REACHED+JOURNALED its terminal
+# write-ahead AND had its FIRST live send of that terminal FAIL against the down api, read as an
+# ORDERED pair from the agent's own log:
+#   1. "outbox: terminal journaled write-ahead" (terminal-resolve.ts, the durable-before-first-send
+#      success path) — the outcome is on disk;
+#   2. AFTER it, for the same run, a send failure of that terminal: the per-attempt
+#      "state report failed, retrying" (client.ts, the first transient miss, ~one connect timeout in)
+#      or the terminal exhaustion "terminal report send failed; leaving the journal for a later
+#      resolve" (terminal-resolve.ts). Once the run is journaled it produces no further NON-terminal
+#      /state report, so the first post-journal send failure IS the terminal send's — which is what
+#      forces recovery through the persisted journal rather than a fresh live report.
+# This is the M6 analogue of wait_spilled, and it closes the race CodeRabbit flagged on the naive
+# "journaled" gate: gating on the journal event alone let api_back race the FIRST send and let that
+# send succeed post-recovery, so neither replay path was exercised. Gating on the send FAILURE proves
+# it by construction. We key on the per-attempt retry rather than the full retry-exhaustion event on
+# purpose: the terminal retry schedule is [1,2,4,8,16]s over 6 attempts, and on the CI lane where each
+# failed connect black-holes ~10s, exhaustion is ~90s — over the 90s heartbeat-stale window raised
+# below, which would swap this into a stale-requeue failure. The FIRST failed attempt is the same
+# proof and fires ~one connect timeout after the terminal, keeping the whole outage well under the
+# window. TIMEOUT bounds it likewise. Returns 0 once observed and 1 on timeout; it never calls `fail`
+# itself (it runs with the api STOPPED) — the caller restores the api and judges after.
+wait_terminal_lost() {
+  local run="$1" timeout="${2:-60}" f="$RUNROOT/.outbox-terminal.log"
   local start=$SECONDS deadline=$((SECONDS + timeout))
   while [ "$SECONDS" -lt "$deadline" ]; do
     "${COMPOSE[@]}" logs --no-color agent > "$f" 2>/dev/null || true
-    # awk, not `grep … | grep -q` (CLAUDE.md): reads to EOF so no SIGPIPE, and matches BOTH literals
-    # on the SAME structured-log line, so a terminal journaled for an earlier case's run cannot satisfy
-    # this one.
-    if awk -v r="$run" 'index($0, "terminal journaled write-ahead") && index($0, r) { hit = 1 } END { exit(hit ? 0 : 1) }' "$f"; then
-      pass "worker journaled run $run's terminal write-ahead $((SECONDS - start))s into the outage"
+    # awk, not `grep … | grep -q` (CLAUDE.md): reads to EOF so no SIGPIPE. Each structured-log line
+    # carries run_id, so `index($0, r)` scopes to THIS run; the journaled line must be seen FIRST
+    # (j=1) before a send failure counts, so an earlier case's line can never satisfy this one.
+    if awk -v r="$run" '
+        index($0, r) && index($0, "terminal journaled write-ahead") { j = 1 }
+        j && index($0, r) && (index($0, "state report failed, retrying") || index($0, "terminal report send failed")) { hit = 1 }
+        END { exit(hit ? 0 : 1) }' "$f"; then
+      pass "run $run reached its terminal (journaled) and lost its first send to the outage $((SECONDS - start))s in"
       return 0
     fi
     sleep 1
@@ -373,11 +385,12 @@ pass "agent recreated with WORKER_TRANSIENT_TRIP_MS=3s + a short UZI_STUB_OUTBOX
 # THIS file, never user input). Empty string for a SQL NULL (the 42-readoption idiom).
 rb_run_field() { db_psql "SELECT $2 FROM runs WHERE id = '$1'"; }
 
-# Each M6 outage is EVENT-GATED on the write-ahead terminal journal (wait_journaled), not a fixed
-# sleep: the run must REACH and JOURNAL its terminal while the api is unreachable, and how long the
-# short stream takes to get there depends on the runner's speed, not this phase (a fixed 30s
-# under-shot the journal on the slow gitlab CI lane — the #1391 M6 regression this replaces). The
-# gate's timeout stays well under the 90s heartbeat-stale window, so the worker is never swept stale
+# Each M6 outage is EVENT-GATED on the terminal being journaled AND its first live send lost to the
+# outage (wait_terminal_lost), not a fixed sleep: the run must REACH+JOURNAL its terminal AND have its
+# first send fail while the api is unreachable, so recovery is forced through the persisted journal.
+# How long the short stream takes to get there depends on the runner's speed, not this phase (a fixed
+# 30s under-shot it on the slow gitlab CI lane — the #1391 M6 regression this replaces). The gate's
+# timeout stays well under the 90s heartbeat-stale window, so the worker is never swept stale
 # mid-outage and the run is never requeued.
 
 # =============================================================================
@@ -389,12 +402,12 @@ RUN_B1="$OUTBOX_RUN"
 GEN_B1="$(rb_run_field "$RUN_B1" claim_generation)"
 say "cutting the api so run $RUN_B1 reaches AND journals its terminal (write-ahead) while it is down"
 "${COMPOSE[@]}" stop api >/dev/null 2>&1
-journaled_b1=0; if wait_journaled "$RUN_B1"; then journaled_b1=1; fi
+terminal_lost_b1=0; if wait_terminal_lost "$RUN_B1"; then terminal_lost_b1=1; fi
 api_back
-# Judge the journal only AFTER the api is back: a `fail` with it still stopped would take every later
-# phase down with this one.
-[ "$journaled_b1" = 1 ] \
-  || fail "case 3: run $RUN_B1 never journaled its terminal write-ahead while the api was down — the finish-during-outage precondition never held, so there is nothing for the fence to replay"
+# Judge only AFTER the api is back: a `fail` with it still stopped would take every later phase down
+# with this one.
+[ "$terminal_lost_b1" = 1 ] \
+  || fail "case 3: run $RUN_B1 never reached+journaled its terminal AND lost its first send while the api was down — the finish-during-outage precondition never held, so the first send could have landed post-recovery and the fence replay was never exercised"
 # On recovery the drainer replays the run's messages FIRST; the terminal SetState is then fenced
 # on runs.last_seq (409 messages_pending until the trace is contiguous through the journal's
 # messages_through_seq), so `completed` — and the judge/notification enqueue that rides the SAME
@@ -428,12 +441,13 @@ GEN_B2="$(rb_run_field "$RUN_B2" claim_generation)"
 RQ_B2="$(rb_run_field "$RUN_B2" requeue_count)"
 say "cutting the api so run $RUN_B2 spills its messages and journals its terminal while down"
 "${COMPOSE[@]}" stop api >/dev/null 2>&1
-# Gate on the journal BEFORE the restart: the run must have spilled its messages AND installed its
-# terminal journal (the batcher is final-flushed before the terminal is journaled, so the message
-# spill is already on disk by the time the journal line lands) so the restarted worker's boot gate
-# has an on-disk outcome to replay. Judged after api_back — a `fail` with the api down would wedge
+# Gate BEFORE the restart on the terminal being journaled AND its first live send lost: the run must
+# have spilled its messages AND installed its terminal journal (the batcher is final-flushed before
+# the terminal is journaled, so the message spill is already on disk by the time the journal line
+# lands) AND had its first send fail unresolved, so the restarted worker's boot gate is the only path
+# left to land the on-disk outcome. Judged after api_back — a `fail` with the api down would wedge
 # every later phase.
-journaled_b2=0; if wait_journaled "$RUN_B2"; then journaled_b2=1; fi
+terminal_lost_b2=0; if wait_terminal_lost "$RUN_B2"; then terminal_lost_b2=1; fi
 # Restart the agent CONTAINER while the api is still down. Its original execution process dies, so
 # the ONLY path left to terminal is the boot gate replaying the on-disk journal. `restart` reuses
 # the same container + the same /data volume, so the existing outbox tree is what the worker boots
@@ -445,8 +459,8 @@ say "restarting the agent container mid-outage (its /data outbox tree persists a
 # claim loops start.
 api_back
 wait_worker_online
-[ "$journaled_b2" = 1 ] \
-  || fail "case 4: run $RUN_B2 never journaled its terminal write-ahead before the restart — the original process died with no on-disk outcome, so the boot gate had nothing to replay"
+[ "$terminal_lost_b2" = 1 ] \
+  || fail "case 4: run $RUN_B2 never journaled its terminal AND lost its first send before the restart — the original process died with no unresolved on-disk outcome, so the boot gate had nothing to replay"
 wait_status "$RUN_B2" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
 wait_drained "$RUN_B2"
 assert_contiguous "$RUN_B2"
@@ -492,10 +506,10 @@ pass "case 5: past-wall interlocked run held at 'running' across the sweep (carv
 # forever (the carve-out spares it from the timeout sweep AND the judge sweep never touches it).
 say "cutting the api so the interlocked run's terminal is journaled and its first send lost"
 "${COMPOSE[@]}" stop api >/dev/null 2>&1
-journaled_b3=0; if wait_journaled "$RUN_B3"; then journaled_b3=1; fi
+terminal_lost_b3=0; if wait_terminal_lost "$RUN_B3"; then terminal_lost_b3=1; fi
 api_back
-[ "$journaled_b3" = 1 ] \
-  || fail "case 5: the interlocked run $RUN_B3 never journaled its terminal write-ahead while the api was down — with no journal it would sit non-terminal forever (the carve-out spares it from both sweeps), which is the exact loss this case proves is repaired"
+[ "$terminal_lost_b3" = 1 ] \
+  || fail "case 5: the interlocked run $RUN_B3 never journaled its terminal AND lost its first send while the api was down — with the outcome unresolved through a journal it would sit non-terminal forever (the carve-out spares it from both sweeps), which is the exact loss this case proves is repaired"
 # The journal replays: the run reaches `completed` (never the sweep's run_timeout `failed`), at its
 # original generation, with a gapless trace.
 wait_status "$RUN_B3" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
