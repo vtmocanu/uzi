@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/notifysvc"
 	"github.com/vtmocanu/uzi/api/internal/slacksvc"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
@@ -343,22 +344,94 @@ type fakeEpisodeStore struct {
 	openReturn uuid.UUID
 	openRetErr error
 	closed     []uuid.UUID
+
+	// M6 fan-out state.
+	admins    []uuid.UUID
+	adminsErr error
+	claimErr  error
+	claims    []store.ClaimHealthEpisodeNoticeParams // every claim attempted, in order
+	claimed   map[string]bool                        // (episode|user) keys already claimed (first claim inserts, repeats no-op)
 }
 
 func (f *fakeEpisodeStore) GetOpenHealthEpisode(context.Context) (store.GetOpenHealthEpisodeRow, error) {
 	return f.open, f.openErr
 }
-func (f *fakeEpisodeStore) OpenHealthEpisode(context.Context, pgtype.Timestamptz) (uuid.UUID, error) {
+
+// OpenHealthEpisode records the attempt and, on success, REFLECTS the new open episode so the
+// NEXT GetOpenHealthEpisode returns it — letting a single fake drive the two-tick debounce
+// sequence (opener tick, then the notify tick). openRetErr (e.g. a 23505) returns without
+// flipping state, exactly as a losing replica sees.
+func (f *fakeEpisodeStore) OpenHealthEpisode(_ context.Context, openedAt pgtype.Timestamptz) (uuid.UUID, error) {
 	f.opened++
-	return f.openReturn, f.openRetErr
-}
-func (f *fakeEpisodeStore) CloseHealthEpisode(_ context.Context, arg store.CloseHealthEpisodeParams) error {
-	f.closed = append(f.closed, arg.ID)
-	return nil
+	if f.openRetErr != nil {
+		return uuid.Nil, f.openRetErr
+	}
+	f.open = store.GetOpenHealthEpisodeRow{ID: f.openReturn, OpenedAt: openedAt}
+	f.openErr = nil
+	return f.openReturn, nil
 }
 
+// CloseHealthEpisode records the close and clears the open state (the re-arm), so a later
+// GetOpenHealthEpisode reports pgx.ErrNoRows and a fresh danger opens a new episode.
+func (f *fakeEpisodeStore) CloseHealthEpisode(_ context.Context, arg store.CloseHealthEpisodeParams) error {
+	f.closed = append(f.closed, arg.ID)
+	f.open = store.GetOpenHealthEpisodeRow{}
+	f.openErr = pgx.ErrNoRows
+	return nil
+}
+func (f *fakeEpisodeStore) ListAdmins(context.Context) ([]uuid.UUID, error) {
+	return f.admins, f.adminsErr
+}
+
+// ClaimHealthEpisodeNotice models the real query's :execrows contract: the FIRST claim of a
+// (episode, user) slot inserts (returns 1), every repeat is an ON CONFLICT DO NOTHING no-op
+// (returns 0) — the atomicity the store live-DB test proves for real.
+func (f *fakeEpisodeStore) ClaimHealthEpisodeNotice(_ context.Context, arg store.ClaimHealthEpisodeNoticeParams) (int64, error) {
+	if f.claimErr != nil {
+		return 0, f.claimErr
+	}
+	f.claims = append(f.claims, arg)
+	if f.claimed == nil {
+		f.claimed = map[string]bool{}
+	}
+	key := arg.EpisodeID.String() + "|" + arg.UserID.String()
+	if f.claimed[key] {
+		return 0, nil
+	}
+	f.claimed[key] = true
+	return 1, nil
+}
+
+// fakeEpisodeNotifier records every notice Notify is asked to send (and can inject an error).
+type fakeEpisodeNotifier struct {
+	sent []notifysvc.Notification
+	err  error
+}
+
+func (f *fakeEpisodeNotifier) Notify(_ context.Context, n notifysvc.Notification) (store.Notification, error) {
+	f.sent = append(f.sent, n)
+	return store.Notification{}, f.err
+}
+
+// fakeEpisodeSettings is the reconciler's enablement gate + base-URL seam.
+type fakeEpisodeSettings struct {
+	enabled    bool
+	enabledErr error
+	baseURL    string
+}
+
+func (f *fakeEpisodeSettings) HealthEnabled(context.Context) (bool, error) {
+	return f.enabled, f.enabledErr
+}
+func (f *fakeEpisodeSettings) PublicBaseURL(context.Context) (string, error) {
+	return f.baseURL, nil
+}
+
+// newEpisodeReconciler wires the OPEN/CLOSE lifecycle tests: the gate defaults ON and no
+// admins are configured, so the danger-and-already-open path reaches notifyAdmins but sends
+// nothing. The M6 notice tests build the reconciler directly to drive the fan-out.
 func newEpisodeReconciler(status string, st *fakeEpisodeStore) *EpisodeReconciler {
-	r := NewEpisodeReconciler(fakeEvaluator{doc: Doc{Status: status}}, st, nil)
+	r := NewEpisodeReconciler(fakeEvaluator{doc: Doc{Status: status}}, st, &fakeEpisodeNotifier{}, &fakeEpisodeSettings{enabled: true}, nil)
 	r.now = func() time.Time { return fixedNow }
 	return r
 }
