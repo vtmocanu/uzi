@@ -9,7 +9,8 @@ import { useEffect, useRef } from "react";
 import { NavLink, useLocation } from "react-router-dom";
 import type { ReactNode } from "react";
 import { cx, PageHeader } from "./ui";
-import { useAdminHealth, healthAttentionCount } from "../lib/useAdminHealth";
+import { HealthPip } from "./healthSeverity";
+import { useHealthStatus } from "../lib/useAdminHealth";
 
 // Health is LAST (PRD #1484 D1), after Branding — its entry points are the sidebar pip
 // (M5) and the Overview card (M5), not tab position. `pip: true` marks the one tab that
@@ -25,12 +26,10 @@ const TABS = [
 ];
 
 export function AdminShell({ description, children }: { description: ReactNode; children: ReactNode }) {
-  // The tab pip must show on EVERY admin tab, not only while viewing Health, so AdminShell
-  // (which wraps every admin page) owns the health read. Best-effort, last-good on failure,
-  // 10 s cadence — the same shared hook the Health page uses (PRD #1484 M4). Double-fetch
-  // is cheap: the endpoint caches one evaluation for 5 s.
-  const health = useAdminHealth();
-  const attention = health ? healthAttentionCount(health) : 0;
+  // The tab pip must show on EVERY admin tab, not only while viewing Health. Both this pip
+  // and the page read the ONE shared HealthStatusProvider mounted in AppShell (PRD #1484 M5),
+  // so there is a single poll app-wide and the isAdmin gate lives in the provider alone.
+  const { doc: health, attentionCount: attention } = useHealthStatus();
   // Danger dominates the pip colour, else warn (warn covers unknown, which ranks as warn).
   const pipDanger = (health?.counts.danger ?? 0) > 0;
 
@@ -84,25 +83,5 @@ export function AdminShell({ description, children }: { description: ReactNode; 
       {description && <p className="text-sm text-muted">{description}</p>}
       {children}
     </div>
-  );
-}
-
-// HealthPip is the Health tab's severity marker: a coloured dot (form: a round pip) plus
-// the attention count. Severity is NOT colour-only — the count is visible text and the
-// aria-label names the severity in words, so a screen reader and a colour-blind admin both
-// get the signal (PRD #1484 accessibility discipline).
-function HealthPip({ count, danger }: { count: number; danger: boolean }) {
-  const word = danger ? "danger" : "warning";
-  return (
-    <span
-      className={cx(
-        "inline-flex items-center gap-1 rounded-full px-1.5 text-[11px] font-semibold tabular-nums",
-        danger ? "bg-danger/15 text-danger" : "bg-warn/15 text-warn",
-      )}
-      aria-label={`${count} health ${count === 1 ? "check" : "checks"} need attention (${word})`}
-    >
-      <span aria-hidden="true" className={cx("h-1.5 w-1.5 rounded-full", danger ? "bg-danger" : "bg-warn")} />
-      {count}
-    </span>
   );
 }
