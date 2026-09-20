@@ -75,7 +75,6 @@ export interface EmittedMessage {
 }
 
 /**
-/**
  * PRD #1497 M2: the outcome of a capture-first wall park ({@link RunContext.parkForWall}). See that
  * seam's doc for the full contract. "parked"/"undeliverable" both END the flight keeping clone +
  * HOME (never a terminal report); "refused" continues the run (the owner extended); "cancelled"

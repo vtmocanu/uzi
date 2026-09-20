@@ -250,6 +250,39 @@ describe("SdkExecutor wall park (PRD #1497 M2)", () => {
     assert.strictEqual(result.walled, undefined, "the resulting hold is the completion hold, not a wall park");
   });
 
+  it("a genuine `wall` PauseNowSignal with NO completion attempt PARKS through the turn catch (parked outcome)", async () => {
+    // Turn 2 (the implement turn) is aborted by a `wall` PauseNowSignal — the sweep's system-authored
+    // wall park delivered through the steering channel, NOT the wall timer. No completion attempt has
+    // run (completionInterlock off), so the PauseNowSignal arm's `wall` branch reaches parkForWall
+    // directly (it never routes to the completion hold). parkForWall returns "parked", so the run
+    // latches `walled` and ends non-terminal. This proves the PARKED outcome through the PauseNowSignal
+    // catch site, complementing the wall-TIMER PARKED case above.
+    const runSignal = new AbortController();
+    const spiesRef: { s?: Spies } = {};
+    const { queryFn } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      (signal) => ({
+        async *[Symbol.asyncIterator]() {
+          spiesRef.s!.mode.value = "wall";
+          runSignal.abort(new PauseNowSignal());
+          yield* hangUntilAbort(signal);
+        },
+      }),
+    ]);
+    const { ctx, spies } = makeCtx({ signal: runSignal.signal });
+    spies.parkForWallOutcome = "parked";
+    spiesRef.s = spies;
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    assert.deepStrictEqual(
+      result.walled,
+      { reason: "run exceeded its wall-clock timeout" },
+      "the `wall` PauseNowSignal parked the run through the catch site",
+    );
+    assert.strictEqual(spies.parkForWallCalls, 1, "the wall pause reached parkForWall");
+    assert.strictEqual(spies.enterCompletionHoldCalls.length, 0, "a pre-attempt wall pause never enters the completion hold");
+    assert.strictEqual(spies.clearWallModeCalls, 0, "a PARKED outcome does not clear the wall mode (only a refusal does)");
+  });
+
   it("a REFUSED wall park (turn catch) clears the sticky wall mode and restarts the turn (extension after the input aborted the turn)", async () => {
     // Turn 2 is aborted by a `wall` PauseNowSignal; parkForWall returns "refused" (the owner extended
     // in the window). The executor clears the sticky wall mode and restarts — turn 3 signals done.

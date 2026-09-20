@@ -1974,8 +1974,26 @@ export class CodexExecutor implements Executor {
       signal?.reason instanceof PauseNowSignal ? REASON_PAUSE : REASON_CANCEL;
     const onCancel = (): void => trip(reasonFor(ctx.signal));
     if (ctx.signal) {
-      if (ctx.signal.aborted) trip(reasonFor(ctx.signal));
-      else ctx.signal.addEventListener("abort", onCancel, { once: true });
+      if (ctx.signal.aborted) {
+        // PRD #1497 M2 (Fix): ctx.signal is a run-lifetime, once-only controller — a `wall`
+        // PauseNowSignal aborts it PERMANENTLY. Mirror the SDK executor, which reads ctx.signal
+        // ONCE at run start and drives each turn off a FRESH per-turn abort keyed on a CLEARABLE
+        // trip state (sdk-executor.ts: `currentAbort` + `state.tripReason = undefined` on a
+        // refused park). Here each driveCodexTurn already gets a fresh `turnAbort`, but this
+        // synchronous re-read of the already-fired shared signal is the one place a restart
+        // re-trips: after a REFUSED wall park (the owner extended in the request-then-park
+        // window) the loop clears the sticky wall mode (clearWallMode) and RE-DRIVES this turn,
+        // yet ctx.signal stays aborted with its PauseNowSignal reason. That abort has already
+        // been HANDLED, so re-tripping it would cancel a run the owner just kept alive
+        // (REASON_PAUSE with a now-null mode → tryCodexWallPark throws REASON_CANCEL). Suppress
+        // it in exactly that case: a PauseNowSignal abort whose sticky pause mode is gone. A
+        // genuine cancel/shutdown (reason is not a PauseNowSignal) and a still-pending pause
+        // (mode is non-null — an unhandled `wall` request, or an ordinary now/milestone that on
+        // Codex still routes to REASON_CANCEL) both keep tripping, unchanged.
+        const handledWallPause =
+          ctx.signal.reason instanceof PauseNowSignal && ctx.pauseModeRequested?.() == null;
+        if (!handledWallPause) trip(reasonFor(ctx.signal));
+      } else ctx.signal.addEventListener("abort", onCancel, { once: true });
     }
     let idleTimer: ReturnType<typeof setTimeout> | undefined;
     const armIdle = (): void => {

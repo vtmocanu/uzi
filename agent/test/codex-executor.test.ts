@@ -976,6 +976,81 @@ describe("CodexExecutor: wall park (PRD #1497 M2)", () => {
     assert.deepStrictEqual(result.walled, { reason: "codex run wall-clock timeout" }, "the plan-turn wall timer parked the run");
     assert.equal(spies.parkForWallCalls, 1, "the plan-turn local REASON_WALL reached the wall park");
   });
+
+  // A responder scripting an implement run whose FIRST turn goes quiet (so a wall trip aborts it)
+  // and whose SECOND turn — the refused-park re-drive — completes with signal_done. Frames are
+  // pushed on turn/start (as the app-server sends them); both turns reuse turn id tn-1 so the
+  // default signal_done / turn_completed frames route to the active turn.
+  function refusedRestartResponder(): Responder {
+    return (c) => {
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") {
+        if (c.turnStartCount === 1) c.transport.push(threadStarted());
+        else c.transport.push(signalDone()).push(turnCompleted("completed"));
+        return { turn: { id: "tn-1" } };
+      }
+      return {};
+    };
+  }
+
+  // PRD #1497 M2 (Fix) — a Codex Extend in the refused-park window must CONTINUE the run, not cancel
+  // it (D7/D15). A `wall` PauseNowSignal aborts the SHARED, once-only ctx.signal PERMANENTLY. When
+  // the owner extends in the request-then-park window, parkForWall answers "refused": the loop clears
+  // the sticky wall mode and RE-DRIVES the turn. Before the fix the re-driven driveCodexTurn re-read
+  // the still-aborted ctx.signal, tripped REASON_PAUSE with a now-null mode, and threw REASON_CANCEL
+  // — cancelling a run the owner just kept alive (verified: reverting the driveCodexTurn fix reddens
+  // this with /run cancelled/). The re-drive must instead run cleanly to a normal result.
+  it("(implement) a REFUSED `wall` PauseNowSignal CONTINUES the run — the re-drive is not cancelled by the stale shared signal", async () => {
+    const controller = new AbortController();
+    const rig = makeRig({ responder: refusedRestartResponder() });
+    const { ctx, spies } = wallCtx({ signal: controller.signal });
+    spies.mode = "wall";
+    spies.outcome = "refused"; // the owner extended in the request-then-park window
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    await waitFor(() => rig.transport.turnStartCount >= 1, "implement turn 1 started");
+    controller.abort(new PauseNowSignal());
+    const result = await withTimeout(running, 3000, "codex refused wall-pause restart");
+    // The run RESOLVED normally rather than rejecting /run cancelled/, AND it did not park.
+    assert.strictEqual(result.walled, undefined, "a refused park does NOT park — the run continued");
+    assert.strictEqual(result.branch, "agent/issue-42", "the restarted turn re-drove to a normal result");
+    assert.equal(spies.parkForWallCalls, 1, "the `wall` pause reached the wall park once");
+    assert.equal(spies.clearWallModeCalls, 1, "the refused park cleared the sticky wall mode");
+    assert.equal(spies.mode, null, "the sticky wall mode is cleared for the re-drive");
+    assert.ok(rig.transport.turnStartCount >= 2, "the turn actually re-drove (a second turn/start was issued)");
+  });
+
+  // The same defect fires when the FIRST trip is the worker's OWN wall timer (REASON_WALL) and a
+  // `wall` request ALSO lands in the park window (aborting the shared signal either way). The
+  // re-drive must continue, not cancel. parkForWall models the request landing: it sets the sticky
+  // wall mode and aborts the shared signal, then answers "refused".
+  it("(implement) an own-timer REASON_WALL refused re-drive with a pending `wall` request CONTINUES the run", async () => {
+    const controller = new AbortController();
+    const rig = makeRig({ responder: refusedRestartResponder() });
+    rig.deps = { ...rig.deps, idleMs: 2000, wallMs: 25 }; // the own wall timer trips turn 1
+    const spies = { parkForWallCalls: 0, clearWallModeCalls: 0, mode: null as "wall" | null };
+    const { ctx } = makeCtx({
+      signal: controller.signal,
+      pauseModeRequested: () => spies.mode,
+      clearWallMode: () => {
+        spies.clearWallModeCalls++;
+        spies.mode = null;
+      },
+      parkForWall: async () => {
+        spies.parkForWallCalls++;
+        // A `wall` request lands in the request-then-park window (steering route('pause','wall')):
+        // set the sticky mode and abort the shared signal, so the RE-DRIVE sees an aborted ctx.signal.
+        spies.mode = "wall";
+        if (!controller.signal.aborted) controller.abort(new PauseNowSignal());
+        return "refused";
+      },
+    });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "codex own-timer refused re-drive");
+    assert.strictEqual(result.walled, undefined, "a refused park does NOT park — the run continued");
+    assert.strictEqual(result.branch, "agent/issue-42", "the restarted turn re-drove to a normal result");
+    assert.equal(spies.parkForWallCalls, 1, "the own-timer wall trip reached the wall park once");
+    assert.equal(spies.clearWallModeCalls, 1, "the refused park cleared the sticky wall mode");
+    assert.equal(spies.mode, null, "the sticky wall mode is cleared for the re-drive");
+  });
 });
 
 // ================================================================================
