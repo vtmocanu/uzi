@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -492,6 +493,44 @@ func TestHandoffPushFailureDoesNotDispatch(t *testing.T) {
 	}
 	if strings.Contains(stderr, "uzi handoff rm") {
 		t.Errorf("push-failure stderr must not recommend 'uzi handoff rm' (it refuses a non-terminal run):\n%s", stderr)
+	}
+}
+
+// A REALISTIC git push rejection is long and multi-line, and the push-failure remediation
+// hint follows the error in the message. When the hint was folded into the returned error,
+// root.go's 200-rune one-line cap (cellText) truncated the 'uzi run cancel <id>' tail away
+// for exactly this class of error. This pins that: with a long push error the cancel
+// guidance must still reach the user. Fails on the pre-fix truncating path (the tail is cut
+// past rune 200); passes once the hint is printed independently of the error's length.
+func TestHandoffPushFailureHintSurvivesLongError(t *testing.T) {
+	longRejection := errors.New(
+		"remote: error: GH006: Protected branch update failed for refs/heads/uzi/task/r4.\n" +
+			"remote: error: At least 1 approving review is required by reviewers with write access.\n" +
+			"! [remote rejected] HEAD -> uzi/task/r4 (protected branch hook declined)\n" +
+			"error: failed to push some refs to 'https://example.com/vtmocanu/uzi.git'")
+	fc := &uzicli.FakeClient{
+		CreatedTaskRun: taskRun("r4", "uzi/task/r4"),
+		DispatchedRun:  taskRun("r4", "uzi/task/r4"),
+	}
+	rec := &handoffRecorder{
+		gitErr: map[string]error{"push origin HEAD:refs/heads/uzi/task/r4": longRejection},
+	}
+	env, _ := handoffEnv(fc, rec)
+
+	_, stderr, code := runCLI(t, env, "handoff", "--repo", "p1", "-m", "x")
+	if code == uzicli.ExitOK {
+		t.Fatalf("push failure must be non-zero exit, got %d", code)
+	}
+	if fc.LastDispatchRunID != "" {
+		t.Errorf("dispatch ran after a failed push (run id %q); the run must NOT become claimable", fc.LastDispatchRunID)
+	}
+	// The actionable cleanup must survive even when the git error is long — the whole reason
+	// the hint is emitted separately from the returned error.
+	if !strings.Contains(stderr, "uzi run cancel r4") {
+		t.Errorf("push-failure hint 'uzi run cancel r4' must survive a long git error:\n%s", stderr)
+	}
+	if strings.Contains(stderr, "uzi handoff rm") {
+		t.Errorf("push-failure stderr must not recommend 'uzi handoff rm':\n%s", stderr)
 	}
 }
 
