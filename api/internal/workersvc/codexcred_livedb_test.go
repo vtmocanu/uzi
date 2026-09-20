@@ -642,3 +642,60 @@ func TestReconcileCodexStaleFailureWriteFencedLiveDB(t *testing.T) {
 		t.Fatal("alias lost its provider account under a stale failure write")
 	}
 }
+
+// TestReconcileCodexTransientDiscoveryStaysStagingLiveDB (issue #1209 review): a TRANSIENT
+// DiscoverIdentity failure — a 5xx, a 429, or a transport error — must leave the alias
+// 'staging' so the next poller sweep retries it, NOT 'failed'. A 'failed' alias is dropped
+// from ListStagedCodexAliases forever, so a temporary provider outage would permanently stop
+// account linking. Only a proven bad credential (401/403) or an incomplete identity is
+// terminal (that terminal contract is covered by TestReconcileCodexIncompleteIdentityStaysFailedLiveDB).
+//
+// FAILS OLD: the pre-fix reconciler called markFailed on EVERY discovery error, so each of
+// these transient faults flipped the alias to 'failed'.
+func TestReconcileCodexTransientDiscoveryStaysStagingLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	userID := env.seedUser(t)
+
+	cases := []struct {
+		name  string
+		label string
+		err   error
+	}{
+		{"provider_5xx", "codex-transient-5xx", &codexauth.AuthError{Op: "discover_identity", StatusCode: 503}},
+		{"rate_limited", "codex-transient-429", &codexauth.AuthError{Op: "discover_identity", StatusCode: 429}},
+		{"transport", "codex-transient-net", errors.New("codexauth: identity request: connection refused")},
+	}
+
+	fake := newFakeCodexIdentity()
+	aliases := make([]uuid.UUID, len(cases))
+	for i, tc := range cases {
+		tok := codexToken("access-" + tc.name)
+		aliases[i] = env.seedStagingAlias(t, userID, tc.label, codexLoginBlob{AccessToken: tok, RefreshToken: codexToken("r")})
+		fake.errByToken[tok] = tc.err
+	}
+	r := NewCodexReconciler(env.q, nil, env.box, fake, env.pool)
+
+	for i, tc := range cases {
+		alias := aliases[i]
+		err := r.ReconcileCodexAuthIdentity(env.ctx, userID, alias)
+		if err == nil {
+			t.Fatalf("%s: want a discovery error, got nil", tc.name)
+		}
+		st, gerr := env.q.GetCodexCredentialState(env.ctx, store.GetCodexCredentialStateParams{UserSecretID: alias, UserID: userID})
+		if gerr != nil {
+			t.Fatalf("%s: read state: %v", tc.name, gerr)
+		}
+		if st.Status != "staging" {
+			t.Fatalf("%s: status = %q, want staging (a transient discovery fault must stay staging so it is re-probed)", tc.name, st.Status)
+		}
+		if st.ProviderAccountID.Valid {
+			t.Fatalf("%s: must have no provider account bound", tc.name)
+		}
+	}
+	if fake.refreshCalls != 0 {
+		t.Fatalf("refresh counter = %d, want 0 (no pre-identity rotation)", fake.refreshCalls)
+	}
+	if n := env.countProviderAccounts(t, userID); n != 0 {
+		t.Fatalf("provider accounts = %d, want 0 for unlinked imports", n)
+	}
+}

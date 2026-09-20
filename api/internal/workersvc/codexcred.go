@@ -210,12 +210,19 @@ func (r *CodexReconciler) ReconcileCodexAuthIdentity(ctx context.Context, userID
 		return fmt.Errorf("%w: missing access token", ErrCodexLoginBlob)
 	}
 
-	// NONROTATING identity read. On ANY failure: mark failed with the reason and
-	// return, having made zero oauth/refresh calls. Refresh is never invoked here.
-	// This is a NETWORK call and MUST stay OUTSIDE the transaction opened below.
+	// NONROTATING identity read, having made zero oauth/refresh calls; Refresh is never
+	// invoked here. This is a NETWORK call and MUST stay OUTSIDE the transaction opened below.
+	// On a PROVEN unusable credential (a 401/403 auth rejection, or a 2xx whose identity was
+	// incomplete) mark the alias 'failed'. A TRANSIENT provider fault — a transport timeout, a
+	// 429, a 5xx, or an undecodable body — leaves the alias 'staging' so the next poller sweep
+	// retries it under backoff; marking it 'failed' would drop it from the staging list
+	// (ListStagedCodexAliases selects status='staging' only), permanently stopping account
+	// linking and meter collection until the user re-adds the credential (issue #1209 review).
 	id, err := r.ident.DiscoverIdentity(ctx, blob.AccessToken)
 	if err != nil {
-		r.markFailed(ctx, userID, userSecretID, discoveryFailureReason(err), st.MaterialRevision)
+		if reason, terminal := classifyDiscoveryFailure(err); terminal {
+			r.markFailed(ctx, userID, userSecretID, reason, st.MaterialRevision)
+		}
 		return fmt.Errorf("codex reconcile: discover identity: %w", err)
 	}
 
@@ -449,23 +456,24 @@ func (r *CodexReconciler) sealLogin(userID uuid.UUID, plaintext []byte) (sealed 
 	return sealed, store.SealedWithMaster, err
 }
 
-// discoveryFailureReason maps a DiscoverIdentity error to a short, secret-free
-// last_error string. It names WHY the identity could not be established so a user
-// reading the alias state knows whether to re-log-in (auth) or retry (transient),
-// without echoing any token or response body. "Identity incomplete" now means neither
-// the usage response nor the access-token JWT claim yielded an account id (or user_id
-// was absent) — the personal-seat token fallback in DiscoverIdentity was also exhausted.
-func discoveryFailureReason(err error) string {
-	switch {
-	case errors.Is(err, codexauth.ErrIdentityIncomplete):
-		return "provider did not return a complete identity (missing user or account id)"
+// classifyDiscoveryFailure maps a DiscoverIdentity error to (reason, terminal). terminal is
+// true only for a PROVEN unusable credential — a 401/403 auth rejection, or a 2xx reply whose
+// identity was incomplete — which marks the alias 'failed' (terminal, dropped from the staging
+// list, not re-probed). terminal is false for a TRANSIENT provider fault (a transport timeout,
+// a 429, a 5xx, or an undecodable 2xx body): those leave the alias 'staging' so a later poller
+// sweep retries it, because a failure that becomes permanent would silently stop account
+// linking on a temporary outage (issue #1209 review). reason is the short, secret-free
+// last_error text and is written only on the terminal path; it never echoes any token or
+// response body. "Identity incomplete" means neither the usage response nor the access-token
+// JWT claim yielded an account id (or user_id was absent).
+func classifyDiscoveryFailure(err error) (reason string, terminal bool) {
+	if errors.Is(err, codexauth.ErrIdentityIncomplete) {
+		return "provider did not return a complete identity (missing user or account id)", true
 	}
 	var authErr *codexauth.AuthError
-	if errors.As(err, &authErr) {
-		if authErr.Unauthorized() {
-			return "provider rejected the login token; re-login required"
-		}
-		return fmt.Sprintf("provider identity lookup failed with status %d", authErr.StatusCode)
+	if errors.As(err, &authErr) && authErr.Unauthorized() {
+		return "provider rejected the login token; re-login required", true
 	}
-	return "provider identity lookup failed"
+	// Transport error, 429, 5xx, other non-2xx, or an undecodable 2xx body: transient.
+	return "", false
 }
