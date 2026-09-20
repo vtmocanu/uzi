@@ -176,9 +176,15 @@ LIMIT 1;
 -- gets. kind='task' is a guard against dispatching any other kind. dispatched_at IS NULL
 -- makes the stamp idempotent: a second dispatch matches 0 rows and the caller reads it
 -- as not-found rather than re-broadcasting a claimable signal.
+--
+-- issue #1367: the added status='queued' guard closes the dispatch-vs-expiry race with the
+-- undispatched-handoff reaper (SweepTaskNeverDispatched). If that sweep already failed the row
+-- (status='failed', dispatched_at still NULL), a late dispatch matches 0 rows instead of
+-- stamping dispatched_at onto a terminal run and re-broadcasting a claimable signal for a run
+-- the server already expired.
 UPDATE runs
 SET dispatched_at = now(), updated_at = now()
-WHERE id = @run_id AND user_id = @user_id AND kind = 'task' AND dispatched_at IS NULL
+WHERE id = @run_id AND user_id = @user_id AND kind = 'task' AND status = 'queued' AND dispatched_at IS NULL
 RETURNING *;
 
 -- name: TaskBranchRmStats :one

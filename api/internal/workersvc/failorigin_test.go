@@ -35,8 +35,10 @@ func TestCoerceFailOrigin(t *testing.T) {
 	// guardrail_blocked/forge_unreachable into the trusted classification, nor steer Gate 4b
 	// via a forged guardrail_blocked/forge_unreachable. Each must still be a real stored member
 	// (else the split is stale). forge_unreachable (PRD #1392 M1) is server-derived: SetState's
-	// forge-park transaction stamps it directly, never the worker.
-	serverOnly := []string{"worker_lost", "run_timeout", "plan_rejected", "auto_stopped", "guardrail_blocked", "forge_unreachable"}
+	// forge-park transaction stamps it directly, never the worker. task_undispatched (issue
+	// #1367) is server-derived too: the undispatched-handoff sweep stamps it inside its own
+	// conditional UPDATE, never a worker report.
+	serverOnly := []string{"worker_lost", "run_timeout", "plan_rejected", "auto_stopped", "guardrail_blocked", "forge_unreachable", "task_undispatched"}
 	for _, s := range serverOnly {
 		if !failOriginSet[s] {
 			t.Fatalf("%q is in the server-only list but not in the stored vocabulary", s)

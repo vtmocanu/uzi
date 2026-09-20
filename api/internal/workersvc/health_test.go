@@ -588,6 +588,56 @@ func TestHealthQueuedReasons(t *testing.T) {
 	}
 }
 
+// TestHealthQueuedHandoffSetup drives the PRD #400 Decision 6 / issue #1367 M2 saga-setup
+// rung: an UNDISPATCHED task run (kind='task', dispatched_at NULL) is not waiting for a
+// worker — ClaimRun never offers it — so queuedReason reports reasonHandoffSetup AHEAD of
+// every fleet reason, without consulting any worker count. A DISPATCHED task run and a
+// non-task run both skip the short-circuit and fall through to the normal rungs (here an
+// idle online worker → reasonWaitingWorker). The FLAG stays healthWaitingWorker throughout
+// (the enum never changes; only the reason string differs).
+func TestHealthQueuedHandoffSetup(t *testing.T) {
+	dispatched := ago(5 * time.Minute)
+	cases := []struct {
+		name       string
+		kind       string
+		dispatched pgtype.Timestamptz
+		// no online workers: the undispatched-task branch returns BEFORE any worker
+		// count, so the fall-through cases set a worker/free slot to reach reasonWaitingWorker.
+		workers int64
+		free    int64
+		want    string
+	}{
+		// Undispatched task: the honest saga-setup reason, no worker fakes consulted.
+		{"undispatched task", "task", pgtype.Timestamptz{}, 0, 0, reasonHandoffSetup},
+		// Dispatched task: skips the short-circuit, falls through to the normal rungs.
+		{"dispatched task falls through", "task", dispatched, 1, 1, reasonWaitingWorker},
+		// Non-task (undispatched) run: the short-circuit is task-only, so it falls through.
+		{"non-task run falls through", "issue", pgtype.Timestamptz{}, 1, 1, reasonWaitingWorker},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := runRow("queued")
+			r.StatusSince = ago(15 * time.Minute) // > 10m queued
+			r.Kind = tc.kind
+			r.DispatchedAt = tc.dispatched
+			fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}, onlineWorkers: tc.workers, freeSlotWorkers: tc.free}
+			svc := healthSvc(fs, defaultHealthSettings()) // vlt nil → treated unlocked
+
+			svc.detectRunHealth(context.Background(), t0)
+			w := lastWrite(t, fs, r.ID)
+			if w.Health != healthWaitingWorker {
+				t.Fatalf("health = %q, want waiting_worker (the enum never changes)", w.Health)
+			}
+			if w.HealthReason.String != tc.want {
+				t.Fatalf("reason = %q, want %q", w.HealthReason.String, tc.want)
+			}
+			if tc.want != reasonHandoffSetup && w.HealthReason.String == reasonHandoffSetup {
+				t.Fatalf("reason = %q, must NOT be reasonHandoffSetup for %s", w.HealthReason.String, tc.name)
+			}
+		})
+	}
+}
+
 // TestHealthQueuedCustodyLimit drives the PRD #1296 M4 (D4) custody-limit rung through
 // detectRunHealth: a queued run whose OWNER is at the custody-hold admission limit reports
 // reasonCustodyLimit (flag healthWaitingWorker), resolved against the SAME predicate the
@@ -680,6 +730,11 @@ func TestHealthQueuedRepoNotDockerAllowed(t *testing.T) {
 			r.StatusSince = ago(15 * time.Minute) // > 10m queued
 			r.RepoID = tc.repoID
 			r.Kind = tc.kind
+			// A task run reaching the fleet rungs is DISPATCHED (issue #1367 M2): an
+			// undispatched task run short-circuits to reasonHandoffSetup ahead of these
+			// arms, so mark it dispatched to exercise the docker-allowlist logic here.
+			// Harmless for the non-task case (dispatched_at is only consulted for task).
+			r.DispatchedAt = ago(15 * time.Minute)
 			fs := &healthFakeStore{
 				active:          []store.ListActiveRunsForHealthRow{r},
 				onlineWorkers:   tc.onlineWorkers,
@@ -729,6 +784,9 @@ func TestHealthQueuedRepoNotDockerAllowedThreadsCaps(t *testing.T) {
 			r := queuedRunPastThreshold()
 			r.RepoID = validRepo
 			r.Kind = "task"
+			// Dispatched task run (issue #1367 M2): an undispatched one short-circuits to
+			// reasonHandoffSetup ahead of rung 5, so mark it dispatched to reach the arm.
+			r.DispatchedAt = ago(15 * time.Minute)
 			r.RequiredCapabilities = tc.req
 			fs := &healthFakeStore{
 				active:          []store.ListActiveRunsForHealthRow{r},

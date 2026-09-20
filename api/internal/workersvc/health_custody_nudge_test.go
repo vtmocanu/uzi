@@ -52,6 +52,49 @@ func TestHealthCustodyLimitNudgeSuppressed(t *testing.T) {
 	}
 }
 
+// TestHealthHandoffSetupNudgeSuppressed pins issue #1367: an UNDISPATCHED task (handoff) run gets
+// its health STATE written and broadcast (waiting_worker / reasonHandoffSetup), but its per-run
+// Slack NUDGE is SUPPRESSED — the waiting_worker nudge head ("waiting for a worker to pick it up")
+// is FALSE of a run ClaimRun never offers, so a nudge would DM a self-contradicting head + honest
+// reason. Without the suppression this first flag would nudge (Health==ok, no prior
+// health_notified_at), so the false nudge below is the discriminating assertion.
+func TestHealthHandoffSetupNudgeSuppressed(t *testing.T) {
+	r := runRow("queued")
+	r.StatusSince = ago(15 * time.Minute) // > 10m queued → past the threshold
+	r.Kind = "task"                       // DispatchedAt left zero/invalid → undispatched → reasonHandoffSetup
+	fs := &healthFakeStore{
+		active:        []store.ListActiveRunsForHealthRow{r},
+		onlineWorkers: 0, // irrelevant: the handoff-setup branch returns before any worker count
+	}
+	svc := healthSvc(fs, defaultHealthSettings()) // no prior nudge → would nudge absent the suppression
+	b := &fakeBroadcaster{}
+	svc.SetBroadcaster(b)
+
+	if n := svc.detectRunHealth(context.Background(), t0); n != 1 {
+		t.Fatalf("changed = %d, want 1 (the STATE is still written)", n)
+	}
+	// STATE/pill unchanged: the waiting_worker flag + the honest handoff-setup reason are persisted.
+	w := lastWrite(t, fs, r.ID)
+	if w.Health != healthWaitingWorker {
+		t.Fatalf("health = %q, want waiting_worker (the pill must be unchanged)", w.Health)
+	}
+	if w.HealthReason.String != reasonHandoffSetup {
+		t.Fatalf("reason = %q, want %q (the honest reason must still be written)", w.HealthReason.String, reasonHandoffSetup)
+	}
+	// A suppressed nudge must not stamp the cooldown.
+	if w.HealthNotifiedAt.Valid {
+		t.Fatalf("health_notified_at = %v, want NULL (a suppressed nudge must not stamp the cooldown)", w.HealthNotifiedAt)
+	}
+	// The broadcast fires (the web pill updates) but carries nudge=false, so slacksvc posts no
+	// threaded DM — the false "waiting for a worker" head is never sent for a handoff-setup run.
+	if len(b.healths) != 1 || b.healths[0] != healthWaitingWorker {
+		t.Fatalf("broadcast healths = %v, want [waiting_worker]", b.healths)
+	}
+	if len(b.healthNudges) != 1 || b.healthNudges[0] {
+		t.Fatalf("broadcast nudge = %v, want [false] (the per-run handoff-setup nudge is suppressed)", b.healthNudges)
+	}
+}
+
 // TestHealthNonCustodyQueuedReasonStillNudges is the discriminating control: a queued run blocked
 // for a NON-custody reason (no worker online) DOES nudge on its first flag. The M6 suppression is
 // keyed strictly to reasonCustodyLimit, not to the shared waiting_worker enum, so every other

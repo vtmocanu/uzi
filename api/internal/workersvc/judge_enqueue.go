@@ -51,6 +51,11 @@ var preStartInfraFailOrigins = map[string]bool{
 // vocabulary. TestNeverJudgeFailOriginsExact pins the exact set.
 var neverJudgeFailOrigins = map[string]bool{
 	"forge_unreachable": true,
+	// issue #1367: an undispatched handoff terminalized by SweepTaskNeverDispatched was never
+	// claimed (no worker, no agent attempt or trace), so there is nothing to retrospect — it
+	// skips the judge regardless of iteration_count. Server-derived (see failorigin.go); the
+	// sweep already declines to enqueue a judge for these rows, so this is belt-and-braces.
+	"task_undispatched": true,
 }
 
 // envPublishFailOrigins is the fail_origin set for ENVIRONMENT-CAUSED publish failures (issue

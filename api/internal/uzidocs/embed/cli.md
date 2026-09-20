@@ -802,8 +802,13 @@ first two fails:
    `--base` seeds the branch from a named ref instead of local HEAD.
 3. **Dispatch** — only now can a worker claim the run. If the push in step 2
    fails, the run is left created but never dispatched — it has no seed
-   content, so nothing will claim it — and the error tells you to clean it up
-   with `uzi handoff rm <id>`.
+   content, so nothing will claim it — and the error tells you to cancel it
+   with `uzi run cancel <id>`. If the dispatch itself fails, the outcome is
+   ambiguous (the run may or may not have become claimable), so the error
+   tells you to check with `uzi run get <id>` and either let the server
+   expire it or cancel it once you've confirmed it's still undispatched. The
+   server now automatically expires an undispatched task run past its setup
+   deadline, so a stranded run no longer lingers forever.
 
 The worker clones `uzi/task/<id>`, works your inline context (from `-m`, or
 `-f <file>`/`-f -` for stdin, or piped bare stdin), commits, and pushes back

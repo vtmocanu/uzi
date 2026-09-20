@@ -28,6 +28,10 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 	// heartbeat can re-adopt it. The REQUEUE keeps the single window (staleCutoff).
 	failCutoff := pgconv.Time(now.Add(-2 * s.p.WorkerHeartbeatStale))
 	claimCutoff := pgconv.Time(now.Add(-s.p.ClaimGrace))
+	// issue #1367: the undispatched-handoff reaper cutoff — a kind='task' run queued with
+	// dispatched_at NULL and created before this is past its dispatch grace window. Mirrors
+	// claimCutoff, but off DispatchGrace (a separate, longer window; see Params.DispatchGrace).
+	dispatchCutoff := pgconv.Time(now.Add(-s.p.DispatchGrace))
 	max := int32(s.p.RunMaxRequeues) //nolint:gosec // G115: RunMaxRequeues is a small bounded config int (env RUN_MAX_REQUEUES), never near int32 range
 
 	// PRD #1390 M1 (D1): the boot grace. While active, the three stale-worker passes
@@ -64,6 +68,24 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 		// A fresh attempt starts with no evidence against it (PRD #108 M5). See the
 		// requeue loop below for the argument; this reset is the same event.
 		s.persistFail.evict(r.ID)
+	}
+
+	// Undispatched-handoff reaper (issue #1367): a kind='task' run left queued with
+	// dispatched_at NULL past DispatchGrace — the CLI never landed its push/dispatch — is
+	// terminalized (fail_origin='task_undispatched'). Modelled on the claimed-never-started
+	// block above (broadcast the transition), NOT on the running-timeout block below: an
+	// undispatched row was never claimed, so it has no agent attempt/trace and MUST NOT be
+	// handed to the judge (belt-and-braces: task_undispatched is also in neverJudgeFailOrigins).
+	undispatched, err := s.q.SweepTaskNeverDispatched(ctx, store.SweepTaskNeverDispatchedParams{
+		FailureReason: pgconv.TextOrNull("handoff was not dispatched before its setup deadline"),
+		Cutoff:        dispatchCutoff,
+	})
+	if err != nil {
+		return res, fmt.Errorf("sweep task-never-dispatched: %w", err)
+	}
+	res.TaskUndispatchedFailed = int64(len(undispatched))
+	for _, r := range undispatched {
+		s.publishSwept(r.ID, r.Status)
 	}
 
 	// PRD #122 M2 (Decision 5b): a PER-RUN cutoff now — the sweep honours each run's

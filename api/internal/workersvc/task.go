@@ -178,9 +178,11 @@ func (s *Service) handoffBudget(interactive bool) (budgetWall, budgetIters pgtyp
 // making it genuinely claimable. The CLI calls this AFTER it has pushed local HEAD to
 // the run's uzi/task/<id> branch — that push is what the ClaimRun gate
 // (dispatched_at IS NOT NULL) waits for, closing the claim-before-seed race. The query
-// is owner-scoped and guarded on kind='task' AND dispatched_at IS NULL, so a foreign
-// run id, a non-task run, and an already-dispatched run all match 0 rows and surface as
-// ErrRunNotFound (mapped to 404) rather than re-broadcasting a claimable signal.
+// is owner-scoped and guarded on kind='task' AND status='queued' AND dispatched_at IS
+// NULL, so a foreign run id, a non-task run, an already-dispatched run, and a run the
+// undispatched-handoff reaper already expired (status<>'queued'; issue #1367) all match 0
+// rows and surface as ErrRunNotFound (mapped to 404) rather than re-broadcasting a
+// claimable signal for a run the server no longer considers queued.
 func (s *Service) DispatchTaskRun(ctx context.Context, userID, runID uuid.UUID) (store.Run, error) {
 	run, err := s.q.DispatchTaskRun(ctx, store.DispatchTaskRunParams{RunID: runID, UserID: userID})
 	if err != nil {

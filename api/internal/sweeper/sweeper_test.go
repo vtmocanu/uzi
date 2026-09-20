@@ -166,6 +166,11 @@ func TestSweeperPassLogsResumeOnlyTicks(t *testing.T) {
 		// the guard sum AND emit list both include RecoveryExpired, else a retention-only tick
 		// logs nothing and the byte reclamation is invisible.
 		{name: "recovery expired alone", res: workersvc.SweepResult{RecoveryExpired: 1}, attr: "recovery_expired"},
+		// issue #1367: a tick that ONLY reaps undispatched handoff runs (a kind='task' run left
+		// queued with dispatched_at NULL past DispatchGrace) must raise the line too — the guard
+		// sum AND emit list both include TaskUndispatchedFailed, else an undispatched-orphan reap
+		// logs nothing and the terminalized reservation is invisible in the operator log.
+		{name: "task undispatched failed alone", res: workersvc.SweepResult{TaskUndispatchedFailed: 1}, attr: "task_undispatched_failed"},
 		{name: "idle tick logs nothing", res: workersvc.SweepResult{}, attr: ""},
 	}
 	for _, tc := range cases {

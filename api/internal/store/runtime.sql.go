@@ -5342,7 +5342,7 @@ SELECT id, user_id, status, auto_approve,
        started_at, last_activity_at, updated_at, status_since,
        health, health_reason, health_since, health_notified_at,
        budget_wall_seconds, budget_paused_seconds, budget_extension_seconds, interactive,
-       repo_id, kind, required_capabilities, completion_contract_version,
+       repo_id, kind, dispatched_at, required_capabilities, completion_contract_version,
        harness, codex_material_revision, codex_secret_id, worker_id
 FROM runs
 WHERE status IN ('queued', 'running', 'awaiting_approval')
@@ -5368,6 +5368,7 @@ type ListActiveRunsForHealthRow struct {
 	Interactive               bool               `json:"interactive"`
 	RepoID                    pgtype.UUID        `json:"repo_id"`
 	Kind                      string             `json:"kind"`
+	DispatchedAt              pgtype.Timestamptz `json:"dispatched_at"`
 	RequiredCapabilities      []string           `json:"required_capabilities"`
 	CompletionContractVersion pgtype.Int4        `json:"completion_contract_version"`
 	Harness                   string             `json:"harness"`
@@ -5440,6 +5441,7 @@ func (q *Queries) ListActiveRunsForHealth(ctx context.Context) ([]ListActiveRuns
 			&i.Interactive,
 			&i.RepoID,
 			&i.Kind,
+			&i.DispatchedAt,
 			&i.RequiredCapabilities,
 			&i.CompletionContractVersion,
 			&i.Harness,
@@ -12113,6 +12115,63 @@ func (q *Queries) SweepRunningTimeout(ctx context.Context, arg SweepRunningTimeo
 	items := []SweepRunningTimeoutRow{}
 	for rows.Next() {
 		var i SweepRunningTimeoutRow
+		if err := rows.Scan(&i.ID, &i.UserID, &i.Status); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const sweepTaskNeverDispatched = `-- name: SweepTaskNeverDispatched :many
+UPDATE runs SET status = 'failed', status_since = now(), failure_reason = $1,
+    fail_origin = 'task_undispatched',
+    finished_at = now(),
+    -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag or in-progress snapshot.
+    milestones_in_progress = NULL,
+    milestones_agents = NULL,
+    pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
+    credential_switch_requested_at = NULL, credential_switch_generation = NULL,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE kind = 'task' AND status = 'queued' AND dispatched_at IS NULL AND created_at < $2
+RETURNING id, user_id, status
+`
+
+type SweepTaskNeverDispatchedParams struct {
+	FailureReason pgtype.Text        `json:"failure_reason"`
+	Cutoff        pgtype.Timestamptz `json:"cutoff"`
+}
+
+type SweepTaskNeverDispatchedRow struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+	Status string    `json:"status"`
+}
+
+// PRD #400 Decision 6 orphan reaper (issue #1367): a kind='task' (handoff) run is created
+// status='queued' with dispatched_at NULL and is claimable only once the CLI seeds its
+// uzi/task/<id> branch and stamps dispatched_at (DispatchTaskRun). If the push or the dispatch
+// call never lands (push failure, dispatch UPDATE never commits, client crash/SIGKILL), the row
+// is queued+undispatched forever — ClaimRun never offers it (kind<>'task' OR dispatched_at IS
+// NOT NULL) and no other sweep touches it. Past the dispatch grace window, terminalize it.
+// No D11 terminal-pending-lease carve-out is needed: an undispatched task was never claimed
+// (worker_id NULL, no worker_active_runs row), so the lease/pending_overflow predicates are
+// vacuously false. status='queued' AND dispatched_at IS NULL makes this the single winner against
+// a racing DispatchTaskRun (which now also guards status='queued'): exactly one conditional
+// UPDATE matches the row.
+func (q *Queries) SweepTaskNeverDispatched(ctx context.Context, arg SweepTaskNeverDispatchedParams) ([]SweepTaskNeverDispatchedRow, error) {
+	rows, err := q.db.Query(ctx, sweepTaskNeverDispatched, arg.FailureReason, arg.Cutoff)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []SweepTaskNeverDispatchedRow{}
+	for rows.Next() {
+		var i SweepTaskNeverDispatchedRow
 		if err := rows.Scan(&i.ID, &i.UserID, &i.Status); err != nil {
 			return nil, err
 		}
