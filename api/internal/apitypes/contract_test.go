@@ -130,6 +130,12 @@ func contractCases() []contractCase {
 		// normalizes to []); every other field is a required scalar, so its zero.json
 		// carries no other null.
 		newContractCase[GuardrailOverrideRequestDTO]("guardrail_override_request"),
+		// PRD #1484 M1: the admin-health document. Its Checks slice is non-omitempty (its
+		// zero.json carries a null the registry normalizes to []); snoozed_until and
+		// episode_id are nullable pointers present-as-null on the zero value; counts is a
+		// nested all-int struct (no null). The nested HealthCheckDTO / HealthEvidenceDTO
+		// ride inside the full fixture's checks[0], no standalone row (never returned alone).
+		newContractCase[HealthDocDTO]("health_doc"),
 	}
 }
 

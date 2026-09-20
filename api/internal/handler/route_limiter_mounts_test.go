@@ -277,6 +277,9 @@ var wantRouteMounts = []routeMount{
 	// like POST /{id}/privilege-check — it makes the same class of upstream forge
 	// reads (2 + 2×repos), so it draws from the forge pocket rather than none.
 	{"GET", "/api/admin/guardrail-impact", limForge},
+	// PRD #1484 M1: the admin-health document — a cache-backed read, no forge call →
+	// noLimiter, like the release-check GET.
+	{"GET", "/api/admin/health", noLimiter},
 	// PRD #1184 M1: the admin "All users" judge aggregate reads — deduped recommendations,
 	// the cross-user triage strip and filter-chip counts. Reads of stored review rows, no
 	// forge call → noLimiter, like /admin/runs beside them.

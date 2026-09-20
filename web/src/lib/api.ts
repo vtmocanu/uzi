@@ -49,6 +49,7 @@ import type {
   ForgeConfig,
   ForgeConnection,
   Harness,
+  HealthDoc,
   HostedConfig,
   IncidentalFinding,
   IncidentalFindingBacklog,
@@ -448,6 +449,11 @@ const realApi = {
   // keys above), never here. Both return the same envelope shape.
   getReleaseCheck: () =>
     request<{ release_check: ReleaseCheckStatus }>("GET", "/admin/release-check"),
+  // Admin-health document (PRD #1484 M1): the closed registry of checks with the overall
+  // verdict, tally and evidence, backing the Admin > Health tab and the Overview card.
+  // RequireAdminRO (a uza_ CLI token or an admin session); unlike release-check it returns
+  // the document unwrapped. The endpoint caches one evaluation for 5s server-side.
+  getAdminHealth: () => request<HealthDoc>("GET", "/admin/health"),
   checkReleaseNow: () =>
     request<{ release_check: ReleaseCheckStatus }>("POST", "/admin/release-check"),
   // Snooze the admin escalation banner (PRD #836 M6) for the current release: upserts

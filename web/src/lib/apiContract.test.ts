@@ -41,6 +41,7 @@ import type {
   RecoveryCustodyAggregate,
   RecoveryCustodyHolds,
   GuardrailOverrideRequest,
+  HealthDoc,
 } from "./apiTypes";
 
 import runZero from "../../../fixtures/api-contract/run.zero.json";
@@ -123,6 +124,8 @@ import recoveryCustodyHoldsZero from "../../../fixtures/api-contract/recovery_cu
 import recoveryCustodyHoldsFull from "../../../fixtures/api-contract/recovery_custody_holds.full.json";
 import guardrailOverrideRequestZero from "../../../fixtures/api-contract/guardrail_override_request.zero.json";
 import guardrailOverrideRequestFull from "../../../fixtures/api-contract/guardrail_override_request.full.json";
+import healthDocZero from "../../../fixtures/api-contract/health_doc.zero.json";
+import healthDocFull from "../../../fixtures/api-contract/health_doc.full.json";
 
 // The api ⇄ SPA JSON wire-contract (PRD #982). This is the VITEST HALF; the Go
 // half is api/internal/apitypes/contract_test.go. Neither reads the other: each
@@ -275,6 +278,24 @@ type ZeroOf<T, NeverNull extends keyof T = never> = {
   void _gorExtra;
   void _gorZero;
   void _gorFull;
+}
+
+// ── HealthDoc (PRD #1484 M1) ──────────────────────────────────────────────────
+// The admin-health document. ZeroOf exemption: checks — the registry always emits a
+// non-nil slice, but json.Marshal(HealthDocDTO{}) is a null nil-slice (same idiom as
+// GuardrailOverrideRequest.findings). snoozed_until/episode_id are string|null (present
+// as null on the zero value, so they need no exemption — Widen<string|null> accepts
+// null). counts is a nested all-number object. The nested HealthCheck/HealthEvidence
+// types ride inside checks[0] of the full fixture.
+{
+  const _healthDocMissing: never = null as unknown as Exclude<keyof HealthDoc, keyof typeof healthDocFull>;
+  const _healthDocExtra: never = null as unknown as Exclude<keyof typeof healthDocFull, keyof HealthDoc>;
+  const _healthDocZero: ZeroOf<HealthDoc, "checks"> = healthDocZero;
+  const _healthDocFull: Widen<HealthDoc> = healthDocFull;
+  void _healthDocMissing;
+  void _healthDocExtra;
+  void _healthDocZero;
+  void _healthDocFull;
 }
 
 // ── RunMessage (M2) ─────────────────────────────────────────────────────────
@@ -963,6 +984,10 @@ const dtos: { stem: string; nullable: boolean }[] = [
   // slice the handler normalizes to [], so its zero.json carries a null (the nil-slice
   // marshal) that the "findings" ZeroOf exemption above accounts for.
   { stem: "guardrail_override_request", nullable: true },
+  // PRD #1484 M1: the admin-health document. snoozed_until/episode_id are present-as-null
+  // pointers and checks is a non-omitempty slice (a null nil-slice marshal the registry
+  // normalizes to []), so its zero.json carries nulls.
+  { stem: "health_doc", nullable: true },
 ];
 
 describe("api-contract fixtures are present and discriminating", () => {

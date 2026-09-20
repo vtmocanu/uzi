@@ -1,0 +1,32 @@
+{
+  "status": "x",
+  "checked_at": "x",
+  "counts": {
+    "ok": 1,
+    "warn": 1,
+    "danger": 1,
+    "unknown": 1,
+    "na": 1
+  },
+  "snoozed_until": "x",
+  "episode_id": "x",
+  "checks": [
+    {
+      "id": "x",
+      "group": "x",
+      "title": "x",
+      "severity": "x",
+      "summary": "x",
+      "since": "x",
+      "evidence": [
+        {
+          "label": "x",
+          "value": "x"
+        }
+      ],
+      "action": "x",
+      "command": "x",
+      "doc": "x"
+    }
+  ]
+}
