@@ -66,7 +66,7 @@ interface Harness {
   script: string;
 }
 
-function makeHarness(): Harness {
+function makeHarness(opts: { mutate?: (patched: string) => string } = {}): Harness {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-entrypoint-m2-"));
   const data = path.join(root, "data");
   const nix = path.join(root, "nix");
@@ -114,13 +114,31 @@ function makeHarness(): Harness {
     '#!/bin/sh\nprintf "rm %s\\n" "$*" >> "$OPLOG"\n' +
       '[ -n "${STUB_NOOP:-}" ] && exit 0\n/bin/rm "$@" 2>/dev/null || true\nexit 0\n',
   );
-  // busybox -> stat returns $STUB_TOKEN_POSTURE (default a valid kube posture); cat is real.
+  // busybox stub. `stat` inspects its flags: with -L (dereferenced) it returns the TARGET
+  // posture (STUB_TOKEN_TARGET_POSTURE, default a valid kube posture) but fails (exit 1) on a
+  // dangling chain ([ -e ] false) or when STUB_TOKEN_STAT_FAIL is set; without -L (lstat) it
+  // returns the symlink's own 0777 (STUB_TOKEN_LINK_POSTURE). `cat` honors STUB_TOKEN_UNREADABLE
+  // (exit 1) as the dropped-worker read-denial seam, else reads for real.
   writeStub(
     stubDir,
     "busybox",
     '#!/bin/sh\nsub=$1; shift\ncase "$sub" in\n' +
-      '  stat) printf "%s\\n" "${STUB_TOKEN_POSTURE:-0 10001 440}" ;;\n' +
-      '  cat) /bin/cat "$@" 2>/dev/null || exit 1 ;;\n' +
+      "  stat)\n" +
+      "    follow=\n" +
+      '    for a in "$@"; do [ "$a" = "-L" ] && follow=1; done\n' +
+      '    for p in "$@"; do target=$p; done\n' +
+      '    if [ -n "$follow" ]; then\n' +
+      '      [ -n "${STUB_TOKEN_STAT_FAIL:-}" ] && exit 1\n' +
+      '      [ -e "$target" ] || exit 1\n' +
+      '      printf "%s\\n" "${STUB_TOKEN_TARGET_POSTURE:-0 10001 440}"\n' +
+      "    else\n" +
+      '      printf "%s\\n" "${STUB_TOKEN_LINK_POSTURE:-0 10001 777}"\n' +
+      "    fi\n" +
+      "    ;;\n" +
+      "  cat)\n" +
+      '    [ -n "${STUB_TOKEN_UNREADABLE:-}" ] && exit 1\n' +
+      '    /bin/cat "$@" 2>/dev/null || exit 1\n' +
+      "    ;;\n" +
       "  *) exit 1 ;;\nesac\n",
   );
 
@@ -141,8 +159,20 @@ function makeHarness(): Harness {
   for (const marker of [stubDir, data, nix, token]) {
     assert.ok(patched.includes(marker), `entrypoint patch did not apply for ${marker}`);
   }
-  fs.writeFileSync(script, patched, { mode: 0o755 });
+  const finalText = opts.mutate ? opts.mutate(patched) : patched;
+  fs.writeFileSync(script, finalText, { mode: 0o755 });
   return { root, data, nix, token, stubDir, opLog, script };
+}
+
+/** Build a Kubernetes atomic-writer-style symlink chain so h.token is the top symlink. */
+function buildAtomicWriterChain(h: Harness, body = "join-token-body"): void {
+  const dir = path.dirname(h.token);
+  const base = path.basename(h.token);
+  const realDir = path.join(dir, "..2026_09_21_00_00_00.000000000");
+  fs.mkdirSync(realDir);
+  fs.writeFileSync(path.join(realDir, base), body);
+  fs.symlinkSync("..2026_09_21_00_00_00.000000000", path.join(dir, "..data"));
+  fs.symlinkSync(path.join("..data", base), h.token);
 }
 
 function run(h: Harness, extraEnv: Record<string, string> = {}): RunResult {
@@ -177,13 +207,14 @@ function opMatches(ops: string[], ...fragments: string[]): boolean {
 // ─── Group 1: portable (any uid) — the ownership MAP + env, from the op-log ──────────────
 
 describe("PRD #1493 M2: root-branch migration ownership map (portable, record-only)", () => {
-  it("token: a READ-ONLY kube mount is verified, NOT aborted (uid=0 gid=10001 mode=0440, worker-readable)", () => {
+  it("token (AC4): a READ-ONLY kube Secret symlink chain is DEREFERENCED and verified, NOT aborted", () => {
     const h = makeHarness();
     try {
       fs.mkdirSync(h.data);
       fs.mkdirSync(h.nix);
-      fs.writeFileSync(h.token, "join-token-body");
-      const r = run(h, { STUB_NOOP: "1", STUB_ROFS_TOKEN: h.token, STUB_TOKEN_POSTURE: "0 10001 440" });
+      buildAtomicWriterChain(h);
+      // STUB_ROFS_TOKEN forces the read-only (else) branch; the default target posture is valid.
+      const r = run(h, { STUB_NOOP: "1", STUB_ROFS_TOKEN: h.token });
       assert.equal(r.status, 0, `read-only token must NOT abort the entrypoint (stderr: ${r.stderr})`);
       assert.match(r.stderr, /read-only kube Secret .*worker-readable/, "must log the accepted read-only posture");
       // The split still activates (we reached the drop's env dump).
@@ -193,14 +224,105 @@ describe("PRD #1493 M2: root-branch migration ownership map (portable, record-on
     }
   });
 
-  it("token: FAILS CLOSED on a read-only mount whose posture is wrong (e.g. gid != 10001)", () => {
+  it("token (AC5): MUTATION CONTROL — reverting `stat -L` to lstat sees the symlink's own 0777 and fails closed", () => {
+    // Prove `-L` is load-bearing: with lstat (no -L) the posture read returns the atomic-writer
+    // symlink's OWN 0777 rather than the target's 0440, so the fail-closed check rejects it.
+    const h = makeHarness({ mutate: (t) => t.replace("stat -L -c", "stat -c") });
+    try {
+      fs.mkdirSync(h.data);
+      fs.mkdirSync(h.nix);
+      buildAtomicWriterChain(h);
+      const r = run(h, { STUB_NOOP: "1", STUB_ROFS_TOKEN: h.token });
+      assert.notEqual(r.status, 0, "lstat of the projected-Secret symlink must fail closed");
+      assert.match(r.stderr, /refusing to start \(posture:/, "must log the fail-closed refusal");
+      assert.ok(r.stderr.includes("0 10001 777"), "the observed symlink lstat posture proves -L is load-bearing");
+    } finally {
+      fs.rmSync(h.root, { recursive: true, force: true });
+    }
+  });
+
+  it("token (AC3): FAILS CLOSED on a chain whose TARGET owner is wrong", () => {
     const h = makeHarness();
     try {
       fs.mkdirSync(h.data);
       fs.mkdirSync(h.nix);
-      fs.writeFileSync(h.token, "join-token-body");
-      const r = run(h, { STUB_NOOP: "1", STUB_ROFS_TOKEN: h.token, STUB_TOKEN_POSTURE: "0 0 440" });
-      assert.notEqual(r.status, 0, "a wrong read-only posture must fail closed (non-zero exit)");
+      buildAtomicWriterChain(h);
+      const r = run(h, { STUB_NOOP: "1", STUB_ROFS_TOKEN: h.token, STUB_TOKEN_TARGET_POSTURE: "1 10001 440" });
+      assert.notEqual(r.status, 0, "a wrong target owner must fail closed (non-zero exit)");
+      assert.match(r.stderr, /refusing to start \(posture:/, "must log the fail-closed refusal");
+    } finally {
+      fs.rmSync(h.root, { recursive: true, force: true });
+    }
+  });
+
+  it("token (AC3): FAILS CLOSED on a chain whose TARGET group is wrong", () => {
+    const h = makeHarness();
+    try {
+      fs.mkdirSync(h.data);
+      fs.mkdirSync(h.nix);
+      buildAtomicWriterChain(h);
+      const r = run(h, { STUB_NOOP: "1", STUB_ROFS_TOKEN: h.token, STUB_TOKEN_TARGET_POSTURE: "0 0 440" });
+      assert.notEqual(r.status, 0, "a wrong target group must fail closed (non-zero exit)");
+      assert.match(r.stderr, /refusing to start \(posture:/, "must log the fail-closed refusal");
+    } finally {
+      fs.rmSync(h.root, { recursive: true, force: true });
+    }
+  });
+
+  it("token (AC3): FAILS CLOSED on a chain whose TARGET mode is wrong", () => {
+    const h = makeHarness();
+    try {
+      fs.mkdirSync(h.data);
+      fs.mkdirSync(h.nix);
+      buildAtomicWriterChain(h);
+      const r = run(h, { STUB_NOOP: "1", STUB_ROFS_TOKEN: h.token, STUB_TOKEN_TARGET_POSTURE: "0 10001 400" });
+      assert.notEqual(r.status, 0, "a wrong target mode must fail closed (non-zero exit)");
+      assert.match(r.stderr, /refusing to start \(posture:/, "must log the fail-closed refusal");
+    } finally {
+      fs.rmSync(h.root, { recursive: true, force: true });
+    }
+  });
+
+  it("token (AC3/AC6): a dereference/stat FAILURE on an otherwise-valid chain fails closed", () => {
+    // Distinct from the dangling case below: the chain fully resolves, but the `stat -L` itself
+    // fails. An empty/non-accepted posture must fail closed, not be treated as valid.
+    const h = makeHarness();
+    try {
+      fs.mkdirSync(h.data);
+      fs.mkdirSync(h.nix);
+      buildAtomicWriterChain(h);
+      const r = run(h, { STUB_NOOP: "1", STUB_ROFS_TOKEN: h.token, STUB_TOKEN_STAT_FAIL: "1" });
+      assert.notEqual(r.status, 0, "a stat/dereference failure must fail closed (non-zero exit)");
+      assert.match(r.stderr, /refusing to start \(posture:/, "must log the fail-closed refusal");
+    } finally {
+      fs.rmSync(h.root, { recursive: true, force: true });
+    }
+  });
+
+  it("token (AC1): a DANGLING symlink is routed into the fail-closed branch by the new `[ -L ]` outer guard", () => {
+    // No ..data target exists, so `[ -e "$TOKEN" ]` is false; the added `[ -L "$TOKEN" ]` outer
+    // guard is what routes the dangling link into validation instead of skipping it (fail-open).
+    const h = makeHarness();
+    try {
+      fs.mkdirSync(h.data);
+      fs.mkdirSync(h.nix);
+      fs.symlinkSync("..data/token", h.token); // dangling: no ..data created
+      const r = run(h, { STUB_NOOP: "1", STUB_ROFS_TOKEN: h.token });
+      assert.notEqual(r.status, 0, "a dangling token symlink must fail closed (non-zero exit)");
+      assert.match(r.stderr, /refusing to start \(posture:/, "must log the fail-closed refusal");
+    } finally {
+      fs.rmSync(h.root, { recursive: true, force: true });
+    }
+  });
+
+  it("token (AC6): FAILS CLOSED when the target posture is valid but the worker read-proof fails", () => {
+    const h = makeHarness();
+    try {
+      fs.mkdirSync(h.data);
+      fs.mkdirSync(h.nix);
+      buildAtomicWriterChain(h);
+      const r = run(h, { STUB_NOOP: "1", STUB_ROFS_TOKEN: h.token, STUB_TOKEN_UNREADABLE: "1" });
+      assert.notEqual(r.status, 0, "an unreadable target must fail closed even with a valid posture");
       assert.match(r.stderr, /refusing to start \(posture:/, "must log the fail-closed refusal");
     } finally {
       fs.rmSync(h.root, { recursive: true, force: true });
