@@ -196,6 +196,32 @@ export function scriptedStepsResponder(steps: readonly ScriptedStep[]): (body: R
   };
 }
 
+/**
+ * PRD #1533 — a REPRESENTATIVE code-mode `exec` cell (`custom_tool_call` name="exec"), the ONLY
+ * execution surface the intended-model app-server advertises: each worker dynamic tool is folded
+ * into a NESTED `declare const tools: {...}` inventory inside `exec`'s description, so a real
+ * schema-compliant model NEVER emits a direct `function_call` for a worker tool — it emits THIS
+ * exec cell whose script body calls the nested tool. `input` is that script body. Mirrors
+ * `e2e/codex-m0/managed-code-mode.test.mjs`'s `exec(id, input)`.
+ */
+export function codeModeExecStep(callId: string, input: string): ScriptedStep {
+  return { kind: "raw", item: { type: "custom_tool_call", call_id: callId, name: "exec", input } as ResponseItem };
+}
+
+/**
+ * The EXACT exec-cell script body that invokes one nested worker tool and reaches the client's
+ * `item/tool/call` callback: `text(await tools.<wire>({ ...args }));` (mirrors managed-code-mode's
+ * `text(await tools.exec_command({...}))`). With `code_mode_host=true` this reaches the worker
+ * callback; with `code_mode_host=false` the exec cell fails "code-mode host is disabled" and the
+ * nested call is never issued. `JSON.stringify` yields a valid JS object literal for the args. */
+export function nestedWorkerCallScript(wire: string, args: Record<string, unknown>): string {
+  return `text(await tools.${wire}(${JSON.stringify(args)}));`;
+}
+
+/** The literal `custom_tool_call_output` the app-server returns for an `exec` cell when the
+ *  code-mode execution host is disabled (`code_mode_host=false`) — the sharp #1533 off-signature. */
+export const CODE_MODE_HOST_DISABLED_OUTPUT = "code-mode host is disabled";
+
 /** A native freeform `apply_patch` custom-tool call (the shipped-Codex native patch surface). The
  *  worker advertises `uzi_apply_patch`, never bare `apply_patch`, so this is a native-bypass probe. */
 export function nativeApplyPatchStep(callId: string, filename = "native-marker"): ScriptedStep {
