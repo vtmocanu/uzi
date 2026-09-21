@@ -6464,6 +6464,73 @@ export class RunRunner {
   }
 
   /**
+   * PRD #1349 M2 (D4.5) — transfer THIS run's exact clone-only restore-point head into the TRUSTED
+   * worker bare and POSITIVELY VERIFY it is present there, BEFORE bundle production reads it. Modeled
+   * on the transfer-and-verify half of {@link captureRecoveryRestorePoint} / {@link captureHoldContext}:
+   * worktreeStatus (null ⇒ unreadable, cannot assert clean) → dirty? commitWipMarker (REQUIRE the WIP
+   * committed) → fetchAgentBranch (THROWS on failure) → verifyRunnerTrackingCovers (POSITIVE verify) →
+   * trackingTip. Returns the SHA verified present in the bare (the tracking tip after the transfer),
+   * or null on ANY failure — the caller then preserves the source clone and keeps the hold open.
+   *
+   * The clone-only head only becomes reproducible for {@link GitCache.produceRecoveryBundle}'s
+   * trusted-bare guard (a `rev-parse <sha>^{commit}` in the bare) AFTER this transfer; without it the
+   * settle would feed produceRecoveryBundle a commit absent from the bare, throwing needs_action while
+   * terminal cleanup retires the only source. This is a DISPOSITION source, so it deliberately OMITS
+   * the origin publish + park-sink bridge that {@link captureRecoveryRestorePoint} does: it only needs
+   * the exact head present + reproducible in the bare, never a resumable resume-seed checkpoint.
+   */
+  private async transferRestorePointToTrustedBare(flight: RunFlight, runLog: Logger): Promise<string | null> {
+    const barePath = flight.barePath;
+    const worktreePath = flight.worktreePath;
+    const branch = flight.branch;
+    if (!barePath || !worktreePath || !branch) {
+      runLog.warn("recovery: settle transfer skipped — no clone paths on the flight; nothing to transfer");
+      return null;
+    }
+    // Distinguish dirty vs clean EXPLICITLY (runner-uid porcelain) rather than trusting
+    // commitWipMarker's ambiguous false. A null (unreadable) status cannot assert clean ⇒ do not
+    // transfer: retain the clone.
+    const status = await this.git.worktreeStatus(worktreePath);
+    if (status === null) {
+      runLog.warn("recovery: settle transfer — worktree status unreadable (cannot assert clean)");
+      return null;
+    }
+    if (status.length > 0) {
+      // DIRTY → commit the WIP marker and REQUIRE it committed; a false here is unambiguously a
+      // commit FAILURE (we already know the tree is dirty), so the head is not transferable.
+      const committed = await this.git.commitWipMarker(worktreePath);
+      if (!committed) {
+        runLog.warn("recovery: settle transfer — WIP commit of a dirty tree failed");
+        return null;
+      }
+    }
+    // Fetch the run's tip into the worker bare's tracking ref (refs/uzi-runner/<branch>), so the exact
+    // clone-only head's objects are now present in the trusted bare. fetchAgentBranch THROWS on
+    // failure (unlike the void fetchBackBestEffort), so a failed transfer is caught here.
+    try {
+      await this.git.fetchAgentBranch(barePath, worktreePath, branch, flight.runId);
+    } catch (e) {
+      runLog.warn("recovery: settle transfer fetch-back failed", { error: errMessage(e) });
+      return null;
+    }
+    // POSITIVELY VERIFY the bare's tracking ref now covers the run's current HEAD (incl. any WIP
+    // marker) before trusting it as the bundle source.
+    const verified = await this.git.verifyRunnerTrackingCovers(barePath, worktreePath, branch);
+    if (!verified) {
+      runLog.warn("recovery: settle transfer — the tracking ref does not cover the run HEAD");
+      return null;
+    }
+    // The verified head is the tracking tip. A verified ref whose tip is unresolvable is treated as
+    // a transfer failure (retain) — bundle production needs a real 40-hex head.
+    const head = await this.git.trackingTip(barePath, branch);
+    if (head === null) {
+      runLog.warn("recovery: settle transfer — tracking ref verified but its tip is unresolvable");
+      return null;
+    }
+    return head;
+  }
+
+  /**
    * PRD #1349 M2 (D4) — settle THIS run's exact-generation custody hold at a park / early
    * terminal exit that never reached the finalization pin. Pins the verified restore-point
    * head under the exact claim generation, then runs the SAME fresh-forge disposition the
@@ -6491,8 +6558,26 @@ export class RunRunner {
     const barePath = flight.barePath;
     if (!barePath) return;
     try {
-      const head = await this.currentRestorePointHead(flight);
-      const record = await this.pinRecoveryGeneration(claim, flight, head);
+      const verifiedSha = await this.transferRestorePointToTrustedBare(flight, runLog);
+      if (verifiedSha === null) {
+        // Transfer/verification failed: no durable replacement exists in the trusted bare yet, so
+        // the runner clone is the only recoverable source. Preserve it and keep the hold OPEN;
+        // never feed a clone-only SHA to bundle production (it would fail the trusted-bare guard,
+        // and terminal cleanup would then retire the only source). Keep the generation-evidence pin.
+        flight.preserveRecoveryClone = true;
+        await this.pinRecoveryGeneration(claim, flight, await this.currentRestorePointHead(flight));
+        runLog.warn(
+          "recovery: could not transfer the restore-point head into the trusted bare; preserving the source clone and retaining the hold",
+          { run_id: claim.run_id, claim_generation: claim.claim_generation },
+        );
+        return;
+      }
+      // Transfer succeeded — verifiedSha is positively verified present in the bare. Pin THAT SHA
+      // (pin advances a pinned record's source), then run the SAME fresh-forge disposition. On a
+      // bundle/upload failure AFTER this verified transfer the covered bare tracking ref (and/or a
+      // journaled bundle) is the retained source, so the whole clone need not persist; the hold stays
+      // open (needs_action). A provably-empty proof releases; committed work archives.
+      const record = await this.pinRecoveryGeneration(claim, flight, verifiedSha);
       if (!record) return; // recovery disabled, no head, or pin failed — the hold stays protected
       const defaultBranch =
         claim.repo.default_branch?.trim() ||
