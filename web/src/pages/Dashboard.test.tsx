@@ -458,8 +458,13 @@ describe("Dashboard usage cards (PRD #40)", () => {
     expect(screen.getByText("Your usage")).toBeTruthy();
     // lifetime total = 1.61M + 16.1M + 0.71M = 18.42M tokens.
     expect(container.textContent).toContain("18.42M");
-    expect(screen.getByText(/Across/)).toBeTruthy();
-    expect(screen.getByText(/in the last 7 days/)).toBeTruthy();
+    const tokenSummary = screen.getByText(/Across/);
+    expect(tokenSummary).toBeTruthy();
+    expect(screen.getByText(/last 7d/)).toBeTruthy();
+    // Scoped negative: the token-summary node carries the trimmed "last 7d" and no longer
+    // the retired "in the last 7 days" wording.
+    expect(tokenSummary.textContent).toContain("last 7d");
+    expect(tokenSummary.textContent).not.toContain("in the last 7 days");
   });
 
   it("renders the empty 'nothing yet' state when the user has no usage", async () => {

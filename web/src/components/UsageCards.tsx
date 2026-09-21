@@ -105,7 +105,7 @@ function Subrow({ usage, disclosure }: { usage: RunUsage; disclosure?: Aggregate
 // landing) with a legend and an aria-label, and the top fail_origin causes. The last two
 // segments split the single `failed` bucket (issue #1418) but sum to the same width.
 // `lifetime` drives everything except the
-// "in the last 7 days" clause, which reads `last7`. Hidden entirely when the scope has no
+// "last 7d" clause, which reads `last7`. Hidden entirely when the scope has no
 // finished runs (mirrors the run_count === 0 precedent — never a fabricated 0%). The block
 // counts a different population from the card's run_count (D2), so they are never combined
 // into one fraction.
@@ -151,8 +151,7 @@ function FailedRunsBlock({ lifetime, last7 }: { lifetime: RunOutcomes; last7: Ru
         <span className="text-xs text-muted">
           <span className="tabular-nums text-fg">{lifetime.failed}</span> of{" "}
           <span className="tabular-nums text-fg">{lifetime.finished}</span> finished runs ·{" "}
-          <span className="tabular-nums text-fg">{failRate(last7)}</span> ({last7.failed} of {last7.finished}) in the
-          last 7 days
+          <span className="tabular-nums text-fg">{failRate(last7)}</span> ({last7.failed} of {last7.finished}) last 7d
         </span>
       </div>
       <div className="mt-2.5 flex h-2 gap-0.5 overflow-hidden rounded" role="img" aria-label={barLabel}>
@@ -205,7 +204,7 @@ export function YourUsageCard({ usage }: { usage: SelfUsage }) {
           <p className="mt-2.5 text-[11px] text-faint">
             Across <span className="tabular-nums text-muted">{usage.run_count}</span> run{usage.run_count === 1 ? "" : "s"}, all
             time · <span className="tabular-nums text-muted">{formatTokens(last7.total)}</span> tok /{" "}
-            <span className="tabular-nums text-muted">{formatCost(last7.cost)}</span> in the last 7 days
+            <span className="tabular-nums text-muted">{formatCost(last7.cost)}</span> last 7d
             {last7Disclosure.incomplete && <> ({last7Disclosure.text})</>} ·{" "}
             <Link to="/runs" className="text-info hover:underline whitespace-nowrap">
               see per-run detail{"\u00A0"}→

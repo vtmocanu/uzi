@@ -4,6 +4,7 @@ import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { RateLimitAnnouncer, RateLimitCard, SidebarRateLimits } from "./RateLimitMeters";
 import { api, type MyRateLimits } from "../lib/api";
+import { MICRO_METER_GRID_COLS } from "../lib/rateLimitLayout";
 
 vi.mock("../lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/api")>();
@@ -193,6 +194,20 @@ describe("SidebarRateLimits", () => {
     expect(screen.getByText("5h")).toBeTruthy();
     expect(screen.getByText("7d")).toBeTruthy();
     expect(screen.getByText("8%")).toBeTruthy();
+  });
+
+  // PRD #1519 M2: the MicroRow uses the shared grid-template constant so its 1fr meter
+  // track lines up with the Codex sidebar bar (CodexRateLimitMeters.test.tsx asserts the
+  // Codex side uses the SAME constant). jsdom does no layout, so this asserts the shared
+  // class is applied, not pixel geometry.
+  it("lays each micro-row out on the shared grid-template constant", async () => {
+    mockApi.getMyRateLimits.mockResolvedValue(tokens(okReading));
+    render(<SidebarRateLimits />);
+    await screen.findByLabelText("Claude rate limits");
+    const row = screen.getByText("5h").parentElement as HTMLElement;
+    expect(row.className).toContain(MICRO_METER_GRID_COLS);
+    // The constant must be the complete arbitrary-value literal (Tailwind content-scan).
+    expect(MICRO_METER_GRID_COLS).toBe("grid-cols-[1.4rem_1fr_2.6rem]");
   });
 
   it("renders nothing for no_token / unavailable (no dead chrome)", async () => {
