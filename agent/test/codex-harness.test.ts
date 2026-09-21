@@ -222,7 +222,7 @@ function codexError(
   const willRetry = opts.willRetry ?? false;
   const threadId = opts.threadId ?? "th-1";
   const turnId = opts.turnId ?? "tn-1";
-  const error: Record<string, unknown> = { codexErrorInfo, ...(opts.extraError ?? {}) };
+  const error: Record<string, unknown> = { codexErrorInfo, ...opts.extraError };
   return { kind: "codex_error", method: "error", threadId, turnId, willRetry, params: { error, willRetry, threadId, turnId } };
 }
 
