@@ -50,7 +50,7 @@ while [ $# -gt 0 ]; do
     --no-delete-branch) DELETE=0; shift;;
     --no-rework-check) REWORK_CHECK=0; shift;;
     --confirm-only) CONFIRM_ONLY=1; shift;;
-    -h|--help) sed -n '2,24p' "$0"; exit 2;;
+    -h|--help) sed -n '2,25p' "$0"; exit 2;;
     -*) echo "unknown flag: $1" >&2; exit 2;;
     *) if [ -z "$REPO" ]; then REPO="$1"; elif [ -z "$PR" ]; then PR="$1"; else echo "unexpected arg: $1" >&2; exit 2; fi; shift;;
   esac
@@ -66,8 +66,12 @@ ms=$(printf '%s' "$pj" | jq -r .mergeStateStatus); mg=$(printf '%s' "$pj" | jq -
 # MERGED + MERGE_SHA, append the trail's terminal line (trail.sh dedupes an identical last
 # line), THEN release the claim with --purge. Called after this script's own merge, and by
 # --confirm-only for a merge that already happened out of band.
-report_merged() {  # $1 = merge commit sha
+report_merged() {  # $1 = merge commit sha; return 1 (write NOTHING) when the sha is empty
   local sha=$1
+  # GitHub can report state=MERGED before mergeCommit is populated (eventual consistency).
+  # Emitting MERGE_SHA= / a bare `admin-merged ` trail / a --sha-less next command would be
+  # broken terminal evidence, so refuse instead and let the caller retry.
+  [ -n "$sha" ] || return 1
   echo "MERGED #$PR"; echo "MERGE_SHA=$sha"
   "$HERE/trail.sh" "#$PR" "admin-merged ${sha:0:8}" 2>/dev/null || true
   "$HERE/claims.sh" release "#$PR" --purge 2>/dev/null || true
@@ -80,8 +84,16 @@ report_merged() {  # $1 = merge commit sha
 # never a merge, never a purge of a still-open PR's claim.
 if [ "$CONFIRM_ONLY" -eq 1 ]; then
   if [ "$state" = "MERGED" ]; then
-    report_merged "$(printf '%s' "$pj" | jq -r '.mergeCommit.oid // empty')"
-    exit 0
+    sha=$(printf '%s' "$pj" | jq -r '.mergeCommit.oid // empty')
+    # Re-read a few times if the merge commit is not populated yet, rather than write an
+    # empty MERGE_SHA / trail (report_merged refuses an empty sha with rc 1).
+    for _ in 1 2 3; do
+      [ -n "$sha" ] && break
+      sleep 2
+      sha=$(gh pr view "$PR" --repo "$REPO" --json mergeCommit -q '.mergeCommit.oid // empty' 2>/dev/null || true)
+    done
+    if report_merged "$sha"; then exit 0; fi
+    echo "PR #$PR is MERGED but its merge commit is not available yet (GitHub lag); re-run --confirm-only shortly"; exit 9
   fi
   echo "PR #$PR is $state, not MERGED — nothing to confirm (run the guarded merge to land it)"; exit 9
 fi
@@ -162,8 +174,9 @@ fi
 for _ in 1 2 3 4 5 6; do
   mj=$(gh pr view "$PR" --repo "$REPO" --json state,mergeCommit 2>/dev/null || true)
   if [ "$(printf '%s' "$mj" | jq -r .state 2>/dev/null)" = "MERGED" ]; then
-    report_merged "$(printf '%s' "$mj" | jq -r '.mergeCommit.oid // empty')"
-    exit 0
+    # report_merged writes nothing and returns 1 while the merge commit is not populated yet
+    # (state MERGED can lead mergeCommit); keep polling rather than emit empty evidence.
+    if report_merged "$(printf '%s' "$mj" | jq -r '.mergeCommit.oid // empty')"; then exit 0; fi
   fi
   sleep 10
 done

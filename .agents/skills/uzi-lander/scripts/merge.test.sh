@@ -16,26 +16,53 @@ HEAD=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef
 MSHA=abcabcabcabcabcabcabcabcabcabcabcabcabca
 
 mkdir -p "$WORK/bin" "$WORK/state"
+cat > "$WORK/bin/sleep" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
 cat > "$WORK/bin/gh" <<STUB
 #!/usr/bin/env bash
 set -eu
 if [ "\${1:-}" = pr ] && [ "\${2:-}" = view ]; then
-  if [ "\$MERGE_STATE" = MERGED ]; then
-    echo '{"state":"MERGED","headRefOid":"$HEAD","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","mergeCommit":{"oid":"$MSHA"}}'
-  else
-    echo '{"state":"OPEN","headRefOid":"$HEAD","mergeStateStatus":"BLOCKED","mergeable":"MERGEABLE","mergeCommit":null}'
-  fi
+  # Resolve (state, oid) for this call. merged_lagging returns state=MERGED but a null oid on
+  # the FIRST view, then the real oid — GitHub's eventual-consistency lag. merged_no_oid never
+  # populates it.
+  st=MERGED; oid='$MSHA'
+  case "\$MERGE_STATE" in
+    OPEN) st=OPEN; oid= ;;
+    merged_no_oid) oid= ;;
+    merged_lagging)
+      c=0; [ -f "$WORK/calls" ] && c=\$(cat "$WORK/calls"); c=\$((c+1)); echo "\$c" > "$WORK/calls"
+      [ "\$c" -ge 2 ] || oid= ;;
+  esac
+  case "\$*" in
+    *-q*)  printf '%s\n' "\$oid" ;;   # the retry: gh -q '.mergeCommit.oid // empty' prints the oid
+    *)     if [ -n "\$oid" ]; then
+             echo '{"state":"'"\$st"'","headRefOid":"$HEAD","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","mergeCommit":{"oid":"'"\$oid"'"}}'
+           else
+             echo '{"state":"'"\$st"'","headRefOid":"$HEAD","mergeStateStatus":"BLOCKED","mergeable":"MERGEABLE","mergeCommit":null}'
+           fi ;;
+  esac
   exit 0
 fi
 echo "unexpected gh call: \$*" >&2
 exit 1
 STUB
-chmod +x "$WORK/bin/gh"
+chmod +x "$WORK/bin/gh" "$WORK/bin/sleep"
 export PATH="$WORK/bin:$PATH"
 export UZI_LANDER_STATE_DIR="$WORK/state"
 
-# 1. Already MERGED out of band → --confirm-only emits the owed evidence and exits 0.
+CL="$WORK/state/claims"; TR="$WORK/state/trail"
+mkdir -p "$CL" "$TR"
+seed_state() {  # a live claim + a pre-merge trail for #42, so the terminal side effects are observable
+  printf '{"key":"#42","owner":"tester","state":"pushed"}\n' > "$CL/#42.json"
+  printf 'pr opened\nci green\n' > "$TR/#42.trail"
+}
+
+# 1. Already MERGED out of band → --confirm-only emits the owed terminal evidence (MERGED, the
+#    true MERGE_SHA, the trail's admin-merged line) THEN purges the claim and trail.
 MERGE_STATE=MERGED; export MERGE_STATE
+seed_state
 set +e
 bash "$SCRIPT" test/repo 42 --confirm-only > "$WORK/confirm.out" 2>&1
 rc=$?
@@ -43,14 +70,44 @@ set -e
 [ "$rc" -eq 0 ] || fail "--confirm-only on a merged PR returned rc=$rc: $(cat "$WORK/confirm.out")"
 grep -q '^MERGED #42$' "$WORK/confirm.out" || fail "--confirm-only did not confirm MERGED: $(cat "$WORK/confirm.out")"
 grep -q "^MERGE_SHA=$MSHA$" "$WORK/confirm.out" || fail "--confirm-only did not print the true MERGE_SHA: $(cat "$WORK/confirm.out")"
+# trail.sh prints the whole trail to stdout BEFORE report_merged purges it, so a deleted
+# trail.sh call (the #1510 regression) would drop this line.
+grep -q "admin-merged ${MSHA:0:8}" "$WORK/confirm.out" || fail "--confirm-only did not write the terminal trail line: $(cat "$WORK/confirm.out")"
+# ...and the claim + trail are then purged (a deleted claims.sh release leaves the claim).
+[ ! -e "$CL/#42.json" ] || fail "--confirm-only did not release the claim"
+[ ! -e "$TR/#42.trail" ] || fail "--confirm-only did not purge the trail"
 
-# 2. Still OPEN → --confirm-only refuses (exit 9): never a merge, never a purge of a live claim.
+# 2. state=MERGED but mergeCommit not populated yet (GitHub lag) → re-read recovers the oid.
+MERGE_STATE=merged_lagging; export MERGE_STATE
+rm -f "$WORK/calls"; seed_state
+set +e
+bash "$SCRIPT" test/repo 42 --confirm-only > "$WORK/lag.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 0 ] || fail "--confirm-only did not recover a lagging mergeCommit, rc=$rc: $(cat "$WORK/lag.out")"
+grep -q "^MERGE_SHA=$MSHA$" "$WORK/lag.out" || fail "--confirm-only did not re-read the populated oid: $(cat "$WORK/lag.out")"
+
+# 3. state=MERGED but mergeCommit never populates → refuse (exit 9): NEVER an empty MERGE_SHA
+#    or a bare admin-merged trail, and the claim stays.
+MERGE_STATE=merged_no_oid; export MERGE_STATE
+seed_state
+set +e
+bash "$SCRIPT" test/repo 42 --confirm-only > "$WORK/nooid.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 9 ] || fail "--confirm-only emitted evidence with no merge commit, rc=$rc: $(cat "$WORK/nooid.out")"
+if grep -qE '^MERGE_SHA=$|admin-merged $' "$WORK/nooid.out"; then fail "--confirm-only wrote empty terminal evidence: $(cat "$WORK/nooid.out")"; fi
+[ -e "$CL/#42.json" ] || fail "--confirm-only purged the claim without confirming the merge"
+
+# 4. Still OPEN → refuse (exit 9): never a merge, never a purge of a live claim/trail.
 MERGE_STATE=OPEN; export MERGE_STATE
+seed_state
 set +e
 bash "$SCRIPT" test/repo 42 --confirm-only > "$WORK/open.out" 2>&1
 rc=$?
 set -e
 [ "$rc" -eq 9 ] || fail "--confirm-only on an OPEN PR returned rc=$rc, want 9: $(cat "$WORK/open.out")"
 grep -q 'not MERGED' "$WORK/open.out" || fail "--confirm-only OPEN did not report not-merged: $(cat "$WORK/open.out")"
+{ [ -e "$CL/#42.json" ] && [ -e "$TR/#42.trail" ]; } || fail "--confirm-only OPEN mutated the claim/trail: $(cat "$WORK/open.out")"
 
 echo "PASS merge: --confirm-only reconciles an out-of-band merge"

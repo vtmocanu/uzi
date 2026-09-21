@@ -46,14 +46,21 @@ Your [plan](https://docs.coderabbit.ai/management/plans#fair-usage-limits-policy
   # A large body AFTER the match phrase forces the `printf … | grep -qF` SIGPIPE the fix
   # removed: grep -q matches near the top and closes the pipe before printf finishes writing
   # the (>64 KiB pipe-buffer) tail, so under pipefail the old match test returned 141 (false).
+  # The big body is fed to jq via --rawfile, NOT --arg: a 500 KB value passed as one argv
+  # element exceeds Linux MAX_ARG_STRLEN (~128 KiB) and execve(jq) fails there (it passed only
+  # on macOS). The file still yields a >pipe-buffer body, so it exercises the same SIGPIPE.
   if [ "${BIG_BODY:-0}" = 1 ]; then
-    reply="$reply
-$(head -c 500000 </dev/zero | tr '\0' x)"
+    { printf '%s\n' "$reply"; head -c 500000 </dev/zero | tr '\0' x; } > "$COMMENTS.big"
+    jq -n --arg a "$asked" --arg r "$replied" --rawfile reply "$COMMENTS.big" '[
+      {user:{login:"tester"},body:"@coderabbitai rate limit",created_at:$a,updated_at:$a},
+      {user:{login:"coderabbitai[bot]"},body:$reply,created_at:$r,updated_at:$r}
+    ]' > "$COMMENTS"
+  else
+    jq -n --arg a "$asked" --arg r "$replied" --arg reply "$reply" '[
+      {user:{login:"tester"},body:"@coderabbitai rate limit",created_at:$a,updated_at:$a},
+      {user:{login:"coderabbitai[bot]"},body:$reply,created_at:$r,updated_at:$r}
+    ]' > "$COMMENTS"
   fi
-  jq -n --arg a "$asked" --arg r "$replied" --arg reply "$reply" '[
-    {user:{login:"tester"},body:"@coderabbitai rate limit",created_at:$a,updated_at:$a},
-    {user:{login:"coderabbitai[bot]"},body:$reply,created_at:$r,updated_at:$r}
-  ]' > "$COMMENTS"
   if [ "${LATER_WALKTHROUGH:-0}" = 1 ]; then
     later=$(jq -nr 'now+4|todate')
     jq --arg t "$later" '. + [{

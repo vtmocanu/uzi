@@ -48,6 +48,6 @@ started that way is not seen until its check-run exists.
 1. Head SHA from `gh pr view --json headRefOid`; every signal is tested against it.
 2. CR: status description → pending / limited / skipped / absent; reviewed = (a) or (c) or (e) or (d); command reply can require the agent to decide on one full review.
 3. Greptile: check-run on head → absent / in_progress / completed(+M).
-4. If either bot is active, defer finding output; the set is incomplete even when the other bot already satisfies the gate.
-5. Live findings = CR live + Greptile live, regardless of which bot the gate requires. Greptile live = current-head review, else its newest earlier verdict.
-6. Ready only when required CI is settled green, every active review settled, the required reviewer(s) reviewed this exact head, live = 0, no `mr_rework` active, and the head re-reads unchanged (TOCTOU).
+4. If a COUNTED bot is active, defer finding output; the set is incomplete even when the other bot already satisfies the gate. A bot an explicit `--reviewer coderabbit|greptile` ignores is NOT waited on.
+5. Live findings = the COUNTED bots' live findings. `--reviewer any`/`none` count both; an explicit `--reviewer coderabbit|greptile` counts only the selected bot (the other bot's in-flight state and findings are both ignored). Greptile live = current-head review, else its newest earlier verdict. The poll log always prints the raw per-bot counts, counted or not.
+6. Ready only when required CI is settled green, every COUNTED active review settled, the required reviewer(s) reviewed this exact head, counted live = 0, no `mr_rework` active, and the head re-reads unchanged (TOCTOU).

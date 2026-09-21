@@ -118,7 +118,8 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    scopes which bot BLOCKS: `coderabbit`|`greptile` selects one bot AND makes the other fully
    non-blocking (its in-flight review is not waited on, its findings do not gate) — the way to
    land on one reviewer while explicitly ignoring the other, e.g. when the user says to ignore
-   CodeRabbit. `any` waits for and counts both; `none` gates on neither bot.
+   CodeRabbit. `any` waits for and counts both bots' findings; `none` requires no reviewed-head
+   signal (the local-review/Renovate lane) but STILL counts live findings from both bots.
 3. **The selected bot review is absent.** This step applies only when step 2 selected
    CodeRabbit or Greptile; `--reviewer none` is an intentional local-review or
    CI-sufficient Renovate lane, not a missing review. First run `S/review-quota.sh
