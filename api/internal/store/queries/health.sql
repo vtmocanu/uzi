@@ -85,7 +85,7 @@ WITH latest_per_branch AS (
            r.repo_id, r.branch, r.mr_iid, r.mr_state, r.status, r.finished_at, r.created_at
     FROM runs r
     WHERE r.branch IS NOT NULL AND r.branch <> ''
-    ORDER BY r.repo_id, r.branch, r.created_at DESC
+    ORDER BY r.repo_id, r.branch, r.created_at DESC, r.id DESC
 )
 SELECT latest_per_branch.repo_id, repo.path_with_namespace AS repo_path, count(*) AS eligible_refs
 FROM latest_per_branch

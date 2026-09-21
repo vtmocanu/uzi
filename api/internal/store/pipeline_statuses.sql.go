@@ -169,7 +169,7 @@ WITH latest_per_branch AS (
     FROM runs r
     WHERE r.repo_id = $3::uuid
       AND r.branch IS NOT NULL AND r.branch <> ''
-    ORDER BY r.branch, r.created_at DESC
+    ORDER BY r.branch, r.created_at DESC, r.id DESC
 )
 SELECT branch, mr_iid
 FROM latest_per_branch
