@@ -2131,6 +2131,17 @@ export class RunRunner {
       payload: { text: reason },
     });
     await batcher.close().catch(() => undefined);
+    // PRD #1349 M2 (D4.5) / #1531: REAP THIS generation's provider FIRST, BEFORE the `failed`
+    // report. A steering-cancel and an early agent failure both land here (a cancel aborts the
+    // controller with the same error, then reports failed), and neither reaches the finalization
+    // pin — so without a disposition the hold leaks. A Codex run's pre-settle reap runs the
+    // per-sink credential reconcile (refreshCodex/releaseCodex) INSIDE withBoundary, which the api
+    // authorizes ONLY while the run is actively-claimed (codexActivelyClaimedStatuses); once the
+    // status is terminal the reconcile is refused (409), which would block the reap and leak the
+    // hold as source_only. So reap while the run is still `running`. The reap is deadline-bounded;
+    // a Claude/SDK reap is an idempotent killAgentTree on an already-dead tree; a pre-clone
+    // failure has no clone and no-ops (returns false). The settle runs AFTER the report below.
+    const reaped = await this.reapRecoveryProviderForSettle(claim, flight, runLog, "terminal");
     // Cap what lands in the run row (matches the GitLab error-body cap). Journal it WRITE-AHEAD then
     // resolve it (D3): on reserve_exhausted it degrades to today's direct send, whose throw the
     // .catch below still logs; on the journaled path journalAndSendTerminal never throws (a send that
@@ -2149,18 +2160,12 @@ export class RunRunner {
         error: errMessage(e),
       }),
     );
-    // PRD #1349 M2 (D4.5): before this live worker cleans its clone, disposition its exact
-    // generation hold. A steering-cancel and an early agent failure both land here (a cancel
-    // aborts the controller with the same error, then reports failed), and neither reaches
-    // the finalization pin — so without this the empty hold leaks. The credentialed
-    // fresh-forge comparison MUST run reaped, so REAP FIRST (F2): a Claude/SDK run self-reaps
-    // in its run() finally, but a Codex run does NOT (killAgentTree is a no-op and its provider
-    // root is disposed only in this method's `finally`, AFTER this catch), so a bare settle
-    // here would race a still-alive Codex provider — reapThenSettleRecoveryGeneration reaps
-    // Codex-aware first. A provably empty run then RELEASES its exact hold, a run that committed
-    // work then failed CAPTURES it, and a failed/unverifiable comparison RETAINS — never a
-    // wrong release. A pre-clone failure has no clone and no-ops. Best-effort.
-    await this.reapThenSettleRecoveryGeneration(claim, flight, runLog, "terminal");
+    // PRD #1349 M2 (D4.5) / #1531: now the provider is reaped, run the non-status-gated custody
+    // settle AFTER the terminal report. The credentialed fresh-forge comparison is safe reaped: a
+    // provably empty run RELEASES its exact hold, a run that committed work then failed CAPTURES
+    // it, and a failed/unverifiable comparison RETAINS — never a wrong release. Best-effort;
+    // skipped on a reap that did not confirm (guard miss or a blocked/failed reap keeps the hold).
+    if (reaped) await this.settleRecoveryGeneration(claim, flight, runLog);
   }
 
   /**
@@ -6728,6 +6733,45 @@ export class RunRunner {
   }
 
   /**
+   * PRD #1349 M2 (F2) — the REAP half of {@link reapThenSettleRecoveryGeneration}, split out
+   * (#1531) so a terminal-reporting caller can run the reap FIRST while the run is still
+   * actively-claimed and run the non-status-gated settle AFTER the terminal report. The Codex
+   * per-sink credential reconcile inside `withBoundary` (refreshCodex/releaseCodex) is authorized
+   * by the api ONLY while the run is actively-claimed (codexActivelyClaimedStatuses); once the run
+   * is terminal it is refused (409), the blocked reconcile throws `CodexBoundaryError`, and the
+   * hold would leak as source_only. Returns `false` on any guard miss (nothing to settle) and
+   * `false` on a reap failure (keep the hold); returns `true` only after the reap succeeds, at
+   * which point the caller may run the credentialed {@link settleRecoveryGeneration}.
+   */
+  private async reapRecoveryProviderForSettle(
+    claim: ClaimResponse,
+    flight: RunFlight,
+    runLog: Logger,
+    boundary: BoundaryRequest["boundary"],
+  ): Promise<boolean> {
+    if (!this.recovery.enabled) return false; // token-less harness: no credentialed settle, no reap needed
+    if (!isCodePublishingKind(resolveRunKind(claim.kind))) return false;
+    if (!flight.barePath) return false; // no clone → nothing to settle, so nothing to protect
+    try {
+      await this.reapForSink(
+        flight.executor,
+        { boundary, deadlineMs: this.codexBoundaryDeadlineMs },
+        async () => {
+          // Empty body: the reap itself is the point. The credentialed settle runs OUTSIDE the
+          // boundary (mirroring the park path), after the provider root is reaped.
+        },
+      );
+    } catch (err) {
+      runLog.warn("recovery: pre-settle reap failed; retaining the generation hold (reporting unaffected)", {
+        run_id: claim.run_id,
+        error: errMessage(err),
+      });
+      return false; // provider not confirmed reaped → do NOT run the credentialed fetch
+    }
+    return true;
+  }
+
+  /**
    * PRD #1349 M2 (F2) — reap the agent tree (Codex-aware) BEFORE the credentialed
    * {@link settleRecoveryGeneration}, then settle. Every credentialed settle site that is NOT
    * already behind a reap MUST go through this. settle does a PAT-bearing fresh-forge fetch, and
@@ -6750,26 +6794,9 @@ export class RunRunner {
     runLog: Logger,
     boundary: BoundaryRequest["boundary"],
   ): Promise<void> {
-    if (!this.recovery.enabled) return; // token-less harness: no credentialed settle, no reap needed
-    if (!isCodePublishingKind(resolveRunKind(claim.kind))) return;
-    if (!flight.barePath) return; // no clone → nothing to settle, so nothing to protect
-    try {
-      await this.reapForSink(
-        flight.executor,
-        { boundary, deadlineMs: this.codexBoundaryDeadlineMs },
-        async () => {
-          // Empty body: the reap itself is the point. The credentialed settle runs OUTSIDE the
-          // boundary below (mirroring the park path), after the provider root is reaped.
-        },
-      );
-    } catch (err) {
-      runLog.warn("recovery: pre-settle reap failed; retaining the generation hold (reporting unaffected)", {
-        run_id: claim.run_id,
-        error: errMessage(err),
-      });
-      return; // provider not confirmed reaped → do NOT run the credentialed fetch
+    if (await this.reapRecoveryProviderForSettle(claim, flight, runLog, boundary)) {
+      await this.settleRecoveryGeneration(claim, flight, runLog);
     }
-    await this.settleRecoveryGeneration(claim, flight, runLog);
   }
 
   /**
