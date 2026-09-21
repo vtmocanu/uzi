@@ -93,8 +93,9 @@ GHR=()
 
 # Resolve an abbreviated or full SHA through GitHub before the poll starts. Without this,
 # a mistyped 40-hex value is indistinguishable from a workflow that has not appeared yet and
-# burns the whole wait budget printing "no run yet". Canonicalizing also lets every invocation
-# use gh's server-side --commit filter instead of the capped branch-list prefix fallback.
+# burns the whole wait budget printing "no run yet". One retry absorbs a transient API blip;
+# two unreadable results fail closed. Canonicalizing also lets every invocation use gh's
+# server-side --commit filter instead of the capped branch-list prefix fallback.
 if [ "$SHA_MODE" -eq 1 ]; then
   case "$SHA" in
     *[!0-9A-Fa-f]*|'') echo "watch-run-ci: --sha must be 7-40 hexadecimal digits (got '$SHA')" >&2; exit 3 ;;
@@ -111,9 +112,17 @@ if [ "$SHA_MODE" -eq 1 ]; then
       exit 3
     fi
   fi
-  resolved_sha="$(gh api "repos/${repo_path}/commits/${SHA}" --jq '.sha' 2>/dev/null)"
+  resolved_sha=""
+  for attempt in 1 2; do
+    resolved_sha="$(gh api "repos/${repo_path}/commits/${SHA}" --jq '.sha' 2>/dev/null)"
+    [[ "$resolved_sha" =~ ^[0-9A-Fa-f]{40}$ ]] && break
+    if [ "$attempt" -lt 2 ]; then
+      echo "watch-run-ci: --sha '$SHA' did not resolve on attempt $attempt/2; retrying in 2s" >&2
+      sleep 2
+    fi
+  done
   if ! [[ "$resolved_sha" =~ ^[0-9A-Fa-f]{40}$ ]]; then
-    echo "watch-run-ci: --sha '$SHA' did not resolve to a commit in $repo_path; check the value, auth, and network" >&2
+    echo "watch-run-ci: --sha '$SHA' did not resolve to a commit in $repo_path after 2 attempts; check the value, auth, and network" >&2
     exit 3
   fi
   SHA="$resolved_sha"

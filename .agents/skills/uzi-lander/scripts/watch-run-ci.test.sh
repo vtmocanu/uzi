@@ -27,6 +27,11 @@ if [ "${1:-}" = repo ] && [ "${2:-}" = view ]; then
 fi
 if [ "${1:-}" = api ]; then
   [ "$MODE" != missing ] || exit 1
+  if [ "$MODE" = resolve-transient ]; then
+    n=0; [ -f "$API_COUNT" ] && n=$(cat "$API_COUNT")
+    n=$((n+1)); printf '%s' "$n" > "$API_COUNT"
+    [ "$n" -gt 1 ] || exit 1
+  fi
   case "${2:-}" in
     "repos/test/repo/commits/$FULL_SHA"|"repos/test/repo/commits/$SHORT_SHA") printf '%s\n' "$FULL_SHA" ;;
     *) exit 1 ;;
@@ -35,7 +40,7 @@ if [ "${1:-}" = api ]; then
 fi
 if [ "${1:-}" = run ] && [ "${2:-}" = list ]; then
   case "$MODE" in
-    full)
+    full|resolve-transient)
       case " $* " in
         *" --commit $FULL_SHA "*) printf '101\tcompleted\tsuccess\tCI\n' ;;
       esac
@@ -81,7 +86,7 @@ exit 1
 STUB
 chmod +x "$WORK/bin/gh" "$WORK/bin/sleep"
 export PATH="$WORK/bin:$PATH"
-export CALLS="$WORK/calls" LIST_COUNT="$WORK/list-count" VIEW_COUNT="$WORK/view-count"
+export CALLS="$WORK/calls" LIST_COUNT="$WORK/list-count" VIEW_COUNT="$WORK/view-count" API_COUNT="$WORK/api-count"
 
 : > "$CALLS"
 MODE=full; export MODE
@@ -107,6 +112,18 @@ grep -Fq -- "api repos/test/repo/commits/$SHORT_SHA --jq .sha" "$CALLS" \
 grep -q -- "--commit $FULL_SHA" "$CALLS" || fail "short SHA did not use its canonical full SHA with --commit"
 if grep -Fq -- "--commit $SHORT_SHA " "$CALLS"; then fail "unresolved short SHA reached gh run list"; fi
 
+: > "$CALLS"; rm -f "$API_COUNT"
+MODE=resolve-transient; export MODE
+set +e
+bash "$SCRIPT" --sha "$FULL_SHA" --repo test/repo --interval 0 --max-ticks 2 > "$WORK/resolve-transient.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 0 ] || fail "one transient commit-resolution failure did not recover, rc=$rc: $(cat "$WORK/resolve-transient.out")"
+[ "$(grep -c '^api ' "$CALLS")" -eq 2 ] || fail "commit resolution did not make exactly two attempts: $(cat "$CALLS")"
+grep -Fq 'retrying in 2s' "$WORK/resolve-transient.out" \
+  || fail "transient commit-resolution failure did not announce its retry: $(cat "$WORK/resolve-transient.out")"
+grep -q '^run list ' "$CALLS" || fail "resolved SHA never entered the polling loop"
+
 : > "$CALLS"
 MODE=missing; export MODE
 set +e
@@ -116,6 +133,7 @@ set -e
 [ "$rc" -eq 3 ] || fail "unknown full SHA did not fail fast with exit 3, rc=$rc: $(cat "$WORK/missing.out")"
 grep -Fq "did not resolve to a commit" "$WORK/missing.out" \
   || fail "unknown full SHA omitted the resolution error: $(cat "$WORK/missing.out")"
+[ "$(grep -c '^api ' "$CALLS")" -eq 2 ] || fail "unknown full SHA did not exhaust exactly two resolution attempts: $(cat "$CALLS")"
 if grep -q '^run list ' "$CALLS"; then fail "unknown full SHA entered the polling loop"; fi
 
 : > "$CALLS"
@@ -162,4 +180,4 @@ grep -Fq 'live log: gh api --allow-escape-sequences repos/test/repo/actions/jobs
 grep -Fq 'after run terminal: gh run view 104 --repo test/repo --job 999 --log-failed' "$WORK/failure-derived.out" \
   || fail "URL-derived repo missing from terminal command: $(cat "$WORK/failure-derived.out")"
 
-echo "PASS watch-run-ci: SHA validation/canonicalization, transient empty recovery, live failed-job logs"
+echo "PASS watch-run-ci: SHA validation/retry/canonicalization, transient empty recovery, live failed-job logs"
