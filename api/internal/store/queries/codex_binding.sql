@@ -479,3 +479,27 @@ WHERE operation_id = @operation_id AND user_id = @user_id;
 -- the partial index idx_codex_refresh_intent_unresolved (00201).
 SELECT * FROM codex_refresh_intent
 WHERE user_id = @user_id AND provider_account_id = @provider_account_id AND state = 'rotating';
+
+-- name: ListUnresolvedCodexRefreshAccounts :many
+-- The always-on survivor scan's candidate set (issue #1532): every codex_provider_account a
+-- survivor pass must reconcile — an 'in_progress' account whose lease_deadline has passed (the
+-- wedge), OR any account carrying a still-'rotating' refresh intent that is NOT the live,
+-- non-expired lease-holder (an orphaned intent from a crashed op). Each (id, user_id) is fed
+-- one-by-one to ReconcileUnresolvedCodexRefresh, the per-account reap→quarantine→resolve state
+-- machine. NOT owner-scoped at the account level: this is a service-owned global sweep, not a
+-- user request. The correlated intent subquery IS owner-scoped so it rides the
+-- (user_id, provider_account_id) leading key of idx_codex_refresh_intent_unresolved.
+SELECT cpa.id, cpa.user_id
+FROM codex_provider_account cpa
+WHERE (cpa.coord_state = 'in_progress' AND cpa.lease_deadline < @now::timestamptz)
+   OR (
+        EXISTS (
+            SELECT 1 FROM codex_refresh_intent cri
+            WHERE cri.user_id = cpa.user_id
+              AND cri.provider_account_id = cpa.id
+              AND cri.state = 'rotating'
+        )
+        AND NOT (cpa.coord_state = 'in_progress'
+                 AND cpa.lease_deadline IS NOT NULL
+                 AND cpa.lease_deadline >= @now::timestamptz)
+   );

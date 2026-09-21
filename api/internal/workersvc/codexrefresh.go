@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/codexauth"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
@@ -1027,6 +1028,50 @@ func (s *Service) ReconcileUnresolvedCodexRefresh(ctx context.Context, userID, a
 		}
 	}
 	return resolved, nil
+}
+
+// codexRefreshSweepStore is the one extra query the always-on survivor sweep needs, kept off
+// the broader codexRefreshStore interface so the many test fakes that satisfy the latter
+// (e.g. instrFakeStore) do not have to add a method. *store.Queries satisfies it.
+type codexRefreshSweepStore interface {
+	ListUnresolvedCodexRefreshAccounts(ctx context.Context, now pgtype.Timestamptz) ([]store.ListUnresolvedCodexRefreshAccountsRow, error)
+}
+
+// SweepUnresolvedCodexRefresh is the always-on survivor pass (issue #1532): the missing
+// production entry point for ReconcileUnresolvedCodexRefresh, invoked from Service.Sweep. It
+// lists every account with an expired in_progress lease or an unresolved rotating intent and
+// runs the per-account reap→quarantine→resolve state machine on each, so an interrupted refresh
+// can no longer wedge an account forever. It NEVER re-spends a refresh token or auto-recovers a
+// live op. Returns the total intents it resolved across all accounts; one account's failure is
+// captured and surfaced but does not abort the rest.
+//
+// Invariant (recovery is always observable): a quarantine performed by this sweep always
+// coincides with at least one 'rotating' intent to resolve, because coordinatedRefresh inserts
+// the durable intent BEFORE it acquires the lease, so an in_progress account always carries a
+// rotating intent. Thus a quarantine never returns 0 silently — resolved >= 1 whenever an
+// account is reaped — and the count feeds SweepResult.CodexRefreshRecovered / the sweeper log.
+func (s *Service) SweepUnresolvedCodexRefresh(ctx context.Context) (int64, error) {
+	q, ok := s.q.(codexRefreshSweepStore)
+	if !ok {
+		return 0, errCodexStoreUnavailable // fail loud: this is an always-on safety path
+	}
+	rows, err := q.ListUnresolvedCodexRefreshAccounts(ctx, pgconv.Time(s.codexNow()))
+	if err != nil {
+		return 0, fmt.Errorf("codex survivor sweep: list: %w", err)
+	}
+	var resolved int64
+	var firstErr error
+	for _, r := range rows {
+		n, rerr := s.ReconcileUnresolvedCodexRefresh(ctx, r.UserID, r.ID)
+		if rerr != nil {
+			if firstErr == nil {
+				firstErr = rerr
+			}
+			continue // one account's failure must not skip the others
+		}
+		resolved += int64(n)
+	}
+	return resolved, firstErr
 }
 
 // promoteCodexRecovery attempts to make a quarantined account whose recovery slot holds

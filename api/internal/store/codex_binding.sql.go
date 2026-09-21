@@ -396,6 +396,56 @@ func (q *Queries) InsertCodexRefreshIntent(ctx context.Context, arg InsertCodexR
 	return i, err
 }
 
+const listUnresolvedCodexRefreshAccounts = `-- name: ListUnresolvedCodexRefreshAccounts :many
+SELECT cpa.id, cpa.user_id
+FROM codex_provider_account cpa
+WHERE (cpa.coord_state = 'in_progress' AND cpa.lease_deadline < $1::timestamptz)
+   OR (
+        EXISTS (
+            SELECT 1 FROM codex_refresh_intent cri
+            WHERE cri.user_id = cpa.user_id
+              AND cri.provider_account_id = cpa.id
+              AND cri.state = 'rotating'
+        )
+        AND NOT (cpa.coord_state = 'in_progress'
+                 AND cpa.lease_deadline IS NOT NULL
+                 AND cpa.lease_deadline >= $1::timestamptz)
+   )
+`
+
+type ListUnresolvedCodexRefreshAccountsRow struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+// The always-on survivor scan's candidate set (issue #1532): every codex_provider_account a
+// survivor pass must reconcile — an 'in_progress' account whose lease_deadline has passed (the
+// wedge), OR any account carrying a still-'rotating' refresh intent that is NOT the live,
+// non-expired lease-holder (an orphaned intent from a crashed op). Each (id, user_id) is fed
+// one-by-one to ReconcileUnresolvedCodexRefresh, the per-account reap→quarantine→resolve state
+// machine. NOT owner-scoped at the account level: this is a service-owned global sweep, not a
+// user request. The correlated intent subquery IS owner-scoped so it rides the
+// (user_id, provider_account_id) leading key of idx_codex_refresh_intent_unresolved.
+func (q *Queries) ListUnresolvedCodexRefreshAccounts(ctx context.Context, now pgtype.Timestamptz) ([]ListUnresolvedCodexRefreshAccountsRow, error) {
+	rows, err := q.db.Query(ctx, listUnresolvedCodexRefreshAccounts, now)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListUnresolvedCodexRefreshAccountsRow{}
+	for rows.Next() {
+		var i ListUnresolvedCodexRefreshAccountsRow
+		if err := rows.Scan(&i.ID, &i.UserID); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listUnresolvedCodexRefreshIntents = `-- name: ListUnresolvedCodexRefreshIntents :many
 SELECT operation_id, user_id, provider_account_id, from_generation, state, created_at, updated_at FROM codex_refresh_intent
 WHERE user_id = $1 AND provider_account_id = $2 AND state = 'rotating'
