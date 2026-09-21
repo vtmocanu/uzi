@@ -41,6 +41,8 @@ if [ "${1:-}" = api ]; then
     *'graphql'*)
       if [ "$MODE" = pending_findings ]; then
         echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"isResolved":false,"isOutdated":false,"comments":{"nodes":[{"databaseId":11,"author":{"login":"coderabbitai"},"body":"🟡 **partial finding**","path":"partial.go","line":7,"originalLine":7}],"pageInfo":{"hasNextPage":false}}}],"pageInfo":{"hasNextPage":false}}}}}}'
+      elif [ "$MODE" = cr_ca_findings ]; then
+        echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"isResolved":false,"isOutdated":false,"comments":{"nodes":[{"databaseId":21,"author":{"login":"coderabbitai"},"body":"🟠 **carried finding**","path":"ca.go","line":3,"originalLine":3}],"pageInfo":{"hasNextPage":false}}}],"pageInfo":{"hasNextPage":false}}}}}}'
       elif [ "$MODE" = cr_resolved ]; then
         echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"isResolved":true,"isOutdated":false,"comments":{"nodes":[{"databaseId":12,"author":{"login":"coderabbitai"},"body":"🟡 **resolved finding**","path":"resolved.go","line":8,"originalLine":8}],"pageInfo":{"hasNextPage":false}}}],"pageInfo":{"hasNextPage":false}}}}}}'
       else
@@ -48,7 +50,7 @@ if [ "${1:-}" = api ]; then
       fi ;;
     *'/commits/deadbeefdeadbeefdeadbeefdeadbeefdeadbeef/status'*)
       case "$MODE" in
-        pending_findings) echo '{"statuses":[{"context":"CodeRabbit","description":"Review in progress"}]}' ;;
+        pending_findings|revovr_cr_pending) echo '{"statuses":[{"context":"CodeRabbit","description":"Review in progress"}]}' ;;
         greptile_clean|greptile_race|prior_*|head_*) echo '{"statuses":[]}' ;;
         *) echo '{"statuses":[{"context":"CodeRabbit","description":"Review completed"}]}' ;;
       esac ;;
@@ -84,7 +86,7 @@ if [ "${1:-}" = api ]; then
       esac ;;
     *'/commits/deadbeefdeadbeefdeadbeefdeadbeefdeadbeef/check-runs'*)
       case "$MODE" in
-        greptile_clean) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"Greptile has reviewed the Pull Request.\n\n90 files reviewed, 0 comments added"}}]}' ;;
+        greptile_clean|revovr_cr_pending) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"Greptile has reviewed the Pull Request.\n\n90 files reviewed, 0 comments added"}}]}' ;;
         greptile_race) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"Greptile has reviewed the Pull Request.\n\n90 files reviewed, 1 comments added"}}]}' ;;
         prior_unparseable) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"Reviewed 90 files and raised 3 issues"}}]}' ;;
         head_unreadable) exit 1 ;;
@@ -270,4 +272,44 @@ set -e
 [ "$rc" -eq 3 ] || fail "the older clean head run hid the re-trigger's finding, rc=$rc: $(cat "$WORK/head-two-runs.out")"
 grep -q 'gr_scope=1/1' "$WORK/head-two-runs.out" || fail "the newest head Greptile run was not the one read: $(cat "$WORK/head-two-runs.out")"
 
-echo "PASS watch-pr: settled reviews, resolved-thread scope, earlier-verdict Greptile scope"
+# Signal (e): CodeRabbit dropped the final_review_risk block and marks the reviewed head with
+# change_assessment_commit:"<full-sha>" beside a clean recent_review block (#1502). The exact
+# head marker must count as reviewed so a genuinely-clean incremental reaches ready.
+HEAD=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef
+MODE="cr_ca_clean"; export MODE
+jq -n --arg h "$HEAD" '[{user:{login:"coderabbitai[bot]"},body:("<!-- walkthrough_start -->\n<!-- recent_review_start -->\n\nNo actionable comments were generated in the recent review. 🎉\n\n<!-- recent_review_end -->\n\n<!-- change_assessment_commit:\"" + $h + "\" -->"),created_at:"2026-09-21T09:00:00Z"}]' > "$COMMENTS"
+set +e
+bash "$SCRIPT" test/repo 42 0 1 --reviewer coderabbit --reviewer-grace 0 > "$WORK/ca-clean.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 0 ] || fail "change_assessment_commit head marker was not counted as reviewed, rc=$rc: $(cat "$WORK/ca-clean.out")"
+grep -q '^RESULT=ready$' "$WORK/ca-clean.out" || fail "clean recent_review head did not reach ready: $(cat "$WORK/ca-clean.out")"
+
+# ...and the same marker with a live CodeRabbit thread is reviewed-with-findings, not timeout.
+MODE="cr_ca_findings"; export MODE
+set +e
+bash "$SCRIPT" test/repo 42 0 1 --reviewer coderabbit --reviewer-grace 0 > "$WORK/ca-findings.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 3 ] || fail "change_assessment_commit head with a live thread did not surface findings, rc=$rc: $(cat "$WORK/ca-findings.out")"
+grep -q '^RESULT=findings live=1 cr=1 ' "$WORK/ca-findings.out" || fail "the carried CR finding was not counted on the reviewed head: $(cat "$WORK/ca-findings.out")"
+printf '[]\n' > "$COMMENTS"
+
+# Reviewer override (--reviewer greptile): a CodeRabbit review still in progress must NOT block
+# when Greptile has reviewed the exact head clean — the way to say "ignore CodeRabbit" (#1510).
+MODE="revovr_cr_pending"; export MODE
+set +e
+bash "$SCRIPT" test/repo 42 0 1 --reviewer greptile --reviewer-grace 0 > "$WORK/revovr-ready.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 0 ] || fail "--reviewer greptile blocked on a CodeRabbit review in progress, rc=$rc: $(cat "$WORK/revovr-ready.out")"
+grep -q '^RESULT=ready$' "$WORK/revovr-ready.out" || fail "greptile-clean head did not reach ready while CR was in progress: $(cat "$WORK/revovr-ready.out")"
+
+# ...but the override is scoped to an EXPLICIT bot: --reviewer any still waits for CR in flight.
+set +e
+bash "$SCRIPT" test/repo 42 0 1 --reviewer any --reviewer-grace 0 > "$WORK/revovr-any.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 2 ] || fail "--reviewer any stopped waiting for a CodeRabbit review in progress, rc=$rc: $(cat "$WORK/revovr-any.out")"
+
+echo "PASS watch-pr: settled reviews, resolved-thread scope, earlier-verdict Greptile scope, change_assessment head marker, reviewer override"

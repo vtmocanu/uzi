@@ -3,12 +3,18 @@
 # admin-merge past the ruleset, then CONFIRM it merged and print the merge SHA for the
 # post-merge watch. The decision to merge is the caller's; this is only the mechanics.
 #
-# Usage: merge.sh OWNER/REPO PR [--expect-head SHA] [--method squash|merge] [--no-admin] [--no-delete-branch] [--no-rework-check]
+# Usage: merge.sh OWNER/REPO PR [--expect-head SHA] [--method squash|merge] [--no-admin] [--no-delete-branch] [--no-rework-check] [--confirm-only]
 #   --expect-head   the head you reviewed/watched; a different current head refuses (exit 8)
 #                   so a push that landed after your last look is never merged unseen. The
 #                   merge itself passes --match-head-commit, so a push in the window between
 #                   the preflight and the merge is refused by GitHub as well.
 #   --no-rework-check  skip the mr_rework guard (ONLY for a repo that is not on uzi).
+#   --confirm-only  do NOT merge: the PR was already merged OUT OF BAND (e.g. the harness
+#                   classifier refused the in-script `gh pr merge --admin` and the user ran it
+#                   via a `!` line, so merge.sh's own confirm/trail block never executed).
+#                   Confirm the PR is MERGED, print MERGE_SHA, write the terminal trail line,
+#                   and release the claim — the evidence merge.sh writes itself on its own
+#                   merge. Exit 9 if the PR is not MERGED yet (nothing is written or released).
 #   --method        squash (default; the convention for agent/issue-* branches) or merge
 #                   (uzi-release uses merge commits so the subject keeps the issue branch).
 #   --no-admin      drop --admin (needs the ruleset satisfied: review + up-to-date + checks).
@@ -35,7 +41,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/state.sh
 . "$HERE/lib/state.sh"
 
-REPO=""; PR=""; EXPECT=""; METHOD="squash"; ADMIN=1; DELETE=1; REWORK_CHECK=1
+REPO=""; PR=""; EXPECT=""; METHOD="squash"; ADMIN=1; DELETE=1; REWORK_CHECK=1; CONFIRM_ONLY=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --expect-head) EXPECT="${2:?}"; shift 2;;
@@ -43,6 +49,7 @@ while [ $# -gt 0 ]; do
     --no-admin) ADMIN=0; shift;;
     --no-delete-branch) DELETE=0; shift;;
     --no-rework-check) REWORK_CHECK=0; shift;;
+    --confirm-only) CONFIRM_ONLY=1; shift;;
     -h|--help) sed -n '2,24p' "$0"; exit 2;;
     -*) echo "unknown flag: $1" >&2; exit 2;;
     *) if [ -z "$REPO" ]; then REPO="$1"; elif [ -z "$PR" ]; then PR="$1"; else echo "unexpected arg: $1" >&2; exit 2; fi; shift;;
@@ -51,9 +58,34 @@ done
 [ -n "$REPO" ] && [ -n "$PR" ] || { echo "usage: merge.sh OWNER/REPO PR [--expect-head SHA] [--method squash|merge] [--no-admin]" >&2; exit 2; }
 case "$METHOD" in squash|merge) ;; *) echo "bad --method" >&2; exit 2;; esac
 
-pj=$(gh pr view "$PR" --repo "$REPO" --json state,headRefOid,mergeStateStatus,mergeable 2>/dev/null) || { echo "gh pr view failed" >&2; exit 3; }
+pj=$(gh pr view "$PR" --repo "$REPO" --json state,headRefOid,mergeStateStatus,mergeable,mergeCommit 2>/dev/null) || { echo "gh pr view failed" >&2; exit 3; }
 state=$(printf '%s' "$pj" | jq -r .state); head=$(printf '%s' "$pj" | jq -r .headRefOid)
 ms=$(printf '%s' "$pj" | jq -r .mergeStateStatus); mg=$(printf '%s' "$pj" | jq -r .mergeable)
+
+# The terminal evidence contract, from the ONE place that knows the true merge SHA: print
+# MERGED + MERGE_SHA, append the trail's terminal line (trail.sh dedupes an identical last
+# line), THEN release the claim with --purge. Called after this script's own merge, and by
+# --confirm-only for a merge that already happened out of band.
+report_merged() {  # $1 = merge commit sha
+  local sha=$1
+  echo "MERGED #$PR"; echo "MERGE_SHA=$sha"
+  "$HERE/trail.sh" "#$PR" "admin-merged ${sha:0:8}" 2>/dev/null || true
+  "$HERE/claims.sh" release "#$PR" --purge 2>/dev/null || true
+  echo "next: watch-run-ci.sh --sha $sha --interval 60"
+}
+
+# --confirm-only reconciles a merge that landed OUTSIDE this script (the classifier refused
+# the in-script admin merge and the user ran it via a `!` line, so the confirm/trail block
+# below never ran). Write the evidence that was owed, or exit 9 if it is not merged yet —
+# never a merge, never a purge of a still-open PR's claim.
+if [ "$CONFIRM_ONLY" -eq 1 ]; then
+  if [ "$state" = "MERGED" ]; then
+    report_merged "$(printf '%s' "$pj" | jq -r '.mergeCommit.oid // empty')"
+    exit 0
+  fi
+  echo "PR #$PR is $state, not MERGED — nothing to confirm (run the guarded merge to land it)"; exit 9
+fi
+
 [ "$state" = "OPEN" ] || { echo "PR #$PR is $state"; exit 3; }
 if [ -n "$EXPECT" ] && ! printf '%s' "$head" | grep -q "^$EXPECT"; then
   echo "HEAD MISMATCH: current ${head:0:8}, expected ${EXPECT:0:8} — a push landed after your last look; re-review"; exit 8
@@ -130,11 +162,7 @@ fi
 for _ in 1 2 3 4 5 6; do
   mj=$(gh pr view "$PR" --repo "$REPO" --json state,mergeCommit 2>/dev/null || true)
   if [ "$(printf '%s' "$mj" | jq -r .state 2>/dev/null)" = "MERGED" ]; then
-    sha=$(printf '%s' "$mj" | jq -r '.mergeCommit.oid // empty')
-    echo "MERGED #$PR"; echo "MERGE_SHA=$sha"
-    "$HERE/trail.sh" "#$PR" "admin-merged ${sha:0:8}" 2>/dev/null || true
-    "$HERE/claims.sh" release "#$PR" --purge 2>/dev/null || true
-    echo "next: watch-run-ci.sh --sha $sha --interval 60"
+    report_merged "$(printf '%s' "$mj" | jq -r '.mergeCommit.oid // empty')"
     exit 0
   fi
   sleep 10

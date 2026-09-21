@@ -43,6 +43,13 @@ Your [plan](https://docs.coderabbit.ai/management/plans#fair-usage-limits-policy
     replied=$(jq -nr 'now+2|todate')
     reply="More reviews will be available in ${RESET_MIN:-12} minutes"
   fi
+  # A large body AFTER the match phrase forces the `printf … | grep -qF` SIGPIPE the fix
+  # removed: grep -q matches near the top and closes the pipe before printf finishes writing
+  # the (>64 KiB pipe-buffer) tail, so under pipefail the old match test returned 141 (false).
+  if [ "${BIG_BODY:-0}" = 1 ]; then
+    reply="$reply
+$(head -c 500000 </dev/zero | tr '\0' x)"
+  fi
   jq -n --arg a "$asked" --arg r "$replied" --arg reply "$reply" '[
     {user:{login:"tester"},body:"@coderabbitai rate limit",created_at:$a,updated_at:$a},
     {user:{login:"coderabbitai[bot]"},body:$reply,created_at:$r,updated_at:$r}
@@ -148,4 +155,19 @@ grep -q '^CR_LIMITED=1$' "$WORK/singular.out" || fail "singular-minute reply did
 grep -q '^CR_RESET_MIN=1$' "$WORK/singular.out" || fail "singular-minute reply did not produce a one-minute reset"
 grep -q '^CR_RESET_SOURCE=reply$' "$WORK/singular.out" || fail "singular-minute reply was not authoritative"
 
-echo "PASS cr-rate-limit: exact query, singular minute, available-now, stale status, reset formatting"
+# A LARGE available-now reply must still be recognized: the old `printf … | grep -qF` match
+# test returned 141 (SIGPIPE) under pipefail on a body past the pipe buffer, silently missing a
+# real immediate reset (observed on #1504). The no-pipeline `case` reads it deterministically.
+MODE="available"; AVAILABLE_NOW=1; BIG_BODY=1; unset SINGULAR_MINUTE; export MODE AVAILABLE_NOW BIG_BODY
+printf '[]\n' > "$COMMENTS"
+rm -f "$POSTED"
+set +e
+bash "$SCRIPT" test/repo 42 --query > "$WORK/available-big.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 0 ] || fail "large available-now reply returned rc=$rc, want 0 (SIGPIPE miss?): $(cat "$WORK/available-big.out")"
+grep -q '^CR_LIMITED=0$' "$WORK/available-big.out" || fail "large available-now reply left stale limited state: $(cat "$WORK/available-big.out")"
+grep -q '^CR_RESET_ELAPSED=1$' "$WORK/available-big.out" || fail "large available-now reply did not release the query: $(cat "$WORK/available-big.out")"
+unset BIG_BODY
+
+echo "PASS cr-rate-limit: exact query, singular minute, available-now (small + large), stale status, reset formatting"

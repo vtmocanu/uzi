@@ -17,8 +17,12 @@
 #                    [--reviewer any|coderabbit|greptile|none] [--reviewer-grace MIN]
 #   interval_secs default 60, max_polls default 60.
 #   --reviewer        which bot must have reviewed the head (default any: either one).
-#                     `none` gates on CI + mr_rework only (the local-review fallback path;
-#                     live findings from either bot still count).
+#                     Selecting ONE bot (coderabbit|greptile) also makes the OTHER fully
+#                     non-blocking: its in-flight review is not waited on and its live findings
+#                     do not gate — the way to say "ignore CodeRabbit, land on Greptile" (or the
+#                     reverse). `any` waits for and counts both. `none` gates on CI + mr_rework
+#                     only (the local-review fallback path; live findings from either bot still
+#                     count). The poll log always prints the raw per-bot counts either way.
 #   --reviewer-grace  minutes to wait for an ABSENT reviewer before exit 6 (default 10,
 #                     measured from the first poll). CodeRabbit's walkthrough normally
 #                     lands a few minutes after the PR opens; Greptile's check-run appears
@@ -42,10 +46,12 @@
 #   7  CodeRabbit rejected `@coderabbitai review` because it considers the last commit
 #      already reviewed; post `@coderabbitai full review` once, then re-run this watcher.
 #
-# "CodeRabbit reviewed this head" is the union of three robust signals, because a
+# "CodeRabbit reviewed this head" is the union of robust signals, because a
 # zero-actionable incremental review can post NO new review object AND re-anchor no
 # finding (references/review-signals.md): (a) a CodeRabbit review whose commit_id == the
-# head SHA, (c) the walkthrough comment's final_review_risk marker naming the head SHA, or
+# head SHA, (c) the walkthrough comment's final_review_risk marker naming the head SHA,
+# (e) the walkthrough's change_assessment_commit:"<head>" marker when final_review_risk is
+# gone, or
 # (d) an "equivalent head" — CodeRabbit reviewed an earlier commit A and the delta
 # A..HEAD is only the merge-in of the PR base branch plus regenerated artifacts, so no
 # new branch-authored code exists for it to review (a logic-free merge commit; #819).
@@ -238,6 +244,17 @@ while [ "$i" -lt "$MAX" ]; do
       # shellcheck disable=SC2016  # the backticks are LITERAL text in CodeRabbit's marker, not a subshell
       fr_head=$(printf '%s' "$fr_block" | grep -oE 'up to `[0-9a-f]{5,40}`' | tail -1 | grep -oE '[0-9a-f]{5,40}' || true)
       if [ -n "$fr_head" ] && printf '%s' "$head" | grep -q "^$fr_head"; then cr_reviewed=1; fi
+      # Signal (e): CodeRabbit's newer machine-readable head marker. On some PRs it drops the
+      # final_review_risk block entirely (0 occurrences on #1502, 2026-09-21) and instead emits
+      # an HTML comment naming the exact commit it assessed:
+      #   change_assessment_commit:"<full-40-char-sha>"
+      # alongside a recent_review block whose text is "No actionable comments were generated in
+      # the recent review" when the incremental is clean. Match the FULL head SHA in quotes,
+      # inside the single walkthrough comment only (wt_count==1 above). A mid-review or
+      # post-push walkthrough still names the OLDER commit, so this exact-head match cannot
+      # forge a ready; finding liveness stays with reviewThreads (cr_live), so a clean marker
+      # never zeroes a genuinely unresolved thread.
+      if printf '%s' "$wt_body" | grep -qF "change_assessment_commit:\"$head\""; then cr_reviewed=1; fi
     fi
     rl_row=$(printf '%s' "$issue_c" | jq -rs '[.[][]|select(.user.login=="coderabbitai[bot]")|select(.body|contains("rate limited by coderabbit.ai"))]|last|select(.!=null)|"\(.updated_at)\t\(.body)"' 2>/dev/null || true)
     if [ -n "$rl_row" ]; then
@@ -362,7 +379,20 @@ while [ "$i" -lt "$MAX" ]; do
   # An unconfirmed CodeRabbit review counts as live; Greptile is scoped to its current-head
   # review, cleared by an explicit clean zero-comment summary, or, with no review on this
   # head, scoped to its newest earlier verdict (gr_prior above).
-  live=$((cr_live + gr_live + cr_unconfirmed))
+  #
+  # Reviewer override (--reviewer): selecting ONE bot makes the OTHER fully non-blocking —
+  # its live findings do not gate here, and its in-flight review is not waited on below. This
+  # is the way to say "ignore CodeRabbit, land on Greptile" (or the reverse). `any` and `none`
+  # count both bots' live findings as before (the log line always prints the raw per-bot
+  # counts, so an ignored bot's findings stay visible even when they no longer gate).
+  cr_counts=1; gr_counts=1
+  case "$REVIEWER" in
+    coderabbit) gr_counts=0 ;;
+    greptile)   cr_counts=0 ;;
+  esac
+  live=0
+  [ "$cr_counts" -eq 1 ] && live=$(( live + cr_live + cr_unconfirmed ))
+  [ "$gr_counts" -eq 1 ] && live=$(( live + gr_live ))
 
   # Signal (d): "equivalent head" — a logic-free merge commit CodeRabbit did not re-review
   # (issue #819). When the head is a merge that only brings in the PR base branch plus
@@ -438,9 +468,13 @@ while [ "$i" -lt "$MAX" ]; do
   if [ "$mrw_active" -gt 0 ]; then echo "RESULT=mr_rework_active"; exit 4; fi
   if [ "$pend" -eq 0 ] && [ "$cancel" -eq 0 ]; then
     # A selected or auto-started review can still append findings. Let every in-flight bot
-    # settle before declaring ready or surfacing a partial finding set for local edits.
-    if [ "$cr_pending" -eq 1 ] || [ "$gr_state" = "in_progress" ] || [ "$gr_state" = "queued" ]; then
-      : # a review is in flight; keep polling
+    # that COUNTS (see the --reviewer override above) settle before declaring ready or
+    # surfacing a partial finding set for local edits. An ignored bot's in-flight review is
+    # not waited on: --reviewer greptile does not block on a CodeRabbit review in progress,
+    # and --reviewer coderabbit does not block on a Greptile one.
+    if { [ "$cr_counts" -eq 1 ] && [ "$cr_pending" -eq 1 ]; } \
+       || { [ "$gr_counts" -eq 1 ] && { [ "$gr_state" = "in_progress" ] || [ "$gr_state" = "queued" ]; }; }; then
+      : # a counted review is in flight; keep polling
     elif [ "$reviewed_head" -eq 1 ]; then
       # Revalidate the head right before deciding (TOCTOU): a push during this iteration would
       # otherwise let an exit 0 describe an unreviewed head. Proceed to ready ONLY when the

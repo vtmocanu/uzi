@@ -114,7 +114,11 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    | 6 | no reviewer will come (skipped / absent past grace) | step 3 |
    | 7 | CR says the last commit was already reviewed | step 3, decide whether to request a full review |
 
-   Let an auto-review that is already running finish; never re-trigger it.
+   Let an auto-review that is already running finish; never re-trigger it. `--reviewer` also
+   scopes which bot BLOCKS: `coderabbit`|`greptile` selects one bot AND makes the other fully
+   non-blocking (its in-flight review is not waited on, its findings do not gate) — the way to
+   land on one reviewer while explicitly ignoring the other, e.g. when the user says to ignore
+   CodeRabbit. `any` waits for and counts both; `none` gates on neither bot.
 3. **The selected bot review is absent.** This step applies only when step 2 selected
    CodeRabbit or Greptile; `--reviewer none` is an intentional local-review or
    CI-sufficient Renovate lane, not a missing review. First run `S/review-quota.sh
@@ -140,8 +144,13 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    unreviewed head). Verify each against the current code and label it **real / inherited
    / deliberate / mock-only** (references/coderabbit-triage.md). Before touching the branch,
    check for an `mr_rework` run and defer if one is coming (references/mr-rework.md; on a
-   run created with `--mr-rework=false` none will). Then decide, per finding set:
-   - **small** (localized, no design change): fix locally in the worktree, one push per
+   run created with `--mr-rework=false` none will). When you choose the local-fix path and
+   no rework is needed, DISABLE auto-rework for this PR's run first — `uzi run mr-rework RUN
+   --enabled=false` — so a local push and an auto-triggered rework do not fix the same
+   findings twice (uzi's poller can enqueue one on the same review comments; the lander is
+   the only side that knows a local fix is already in flight). Re-enable (`--enabled`) if you
+   later hand a finding back to rework. Then decide, per finding set:
+   - **small / quick** (localized, no design change): fix locally by default, one push per
      PR via `S/land-prep.sh OWNER/REPO PR` (it re-checks the rework lane and pushes with a
      lease), trail `fix local → pushed`;
    - **big** (design-level, many files, needs the plan's context): `uzi run rework RUN -m
@@ -184,7 +193,10 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    git conflict, takes the repo-wide merge lock (exit 7 = another lander is merging; wait
    for its `main` run to appear), confirms `MERGED`, prints `MERGE_SHA`, writes the trail
    line and releases the claim. A classifier block prints the exact command for the
-   user's `!` line.
+   user's `!` line; after they run it, reconcile the evidence the out-of-band merge skipped
+   with `S/merge.sh OWNER/REPO PR --confirm-only` (confirms `MERGED`, prints `MERGE_SHA`,
+   writes the terminal trail, releases the claim — exit 9 if it is not merged yet). Do this
+   BEFORE `reap`/`release`, or the trail is purged before it was ever written (#1510).
 7. **Post-merge CI.** `S/watch-run-ci.sh --sha MERGE_SHA --interval 60` in the background.
    Exit 0 green (a partial dispatch counts; confirm a gate fix another way), 1 red (use the
    per-job live-log commands it prints, then fix on a branch, never `main`; flake → rerun +

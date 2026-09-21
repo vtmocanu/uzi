@@ -18,6 +18,8 @@ if [ "${1:-}" = api ]; then
     *'graphql'*)
       if [ "$MODE" = cr_resolved ]; then
         echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"isResolved":true,"isOutdated":false,"comments":{"nodes":[{"databaseId":12,"author":{"login":"coderabbitai"},"body":"🟡 **resolved finding**","path":"resolved.go","line":8,"originalLine":8}],"pageInfo":{"hasNextPage":false}}}],"pageInfo":{"hasNextPage":false}}}}}}'
+      elif [ "$MODE" = cr_ca_findings ]; then
+        echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"isResolved":false,"isOutdated":false,"comments":{"nodes":[{"databaseId":31,"author":{"login":"coderabbitai"},"body":"🟠 **carried finding**","path":"ca.go","line":4,"originalLine":4}],"pageInfo":{"hasNextPage":false}}}],"pageInfo":{"hasNextPage":false}}}}}}'
       else
         echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}}'
       fi ;;
@@ -33,6 +35,7 @@ if [ "${1:-}" = api ]; then
       case "$MODE" in
         prior_requested) printf '[{"user":{"login":"lander","type":"User"},"created_at":"%s","body":"@greptileai review"}]\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" ;;
         issue_unreadable) exit 1 ;;
+        cr_ca_clean|cr_ca_findings) echo '[{"user":{"login":"coderabbitai[bot]"},"body":"<!-- walkthrough_start -->\n<!-- recent_review_start -->\nNo actionable comments were generated in the recent review. 🎉\n<!-- recent_review_end -->\n<!-- change_assessment_commit:\"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\" -->"}]' ;;
         *) echo '[]' ;;
       esac ;;
     *'/pulls/42/commits'*)
@@ -47,7 +50,7 @@ if [ "${1:-}" = api ]; then
     *'/commits/deadbeefdeadbeefdeadbeefdeadbeefdeadbeef/status'*) echo '' ;;
     *'/commits/deadbeefdeadbeefdeadbeefdeadbeefdeadbeef/check-runs'*)
       case "$MODE" in
-        prior_*|issue_unreadable) echo '{"check_runs":[]}' ;;
+        prior_*|issue_unreadable|cr_ca_clean|cr_ca_findings) echo '{"check_runs":[]}' ;;
         head_unreadable) exit 1 ;;
         head_failed) echo '{"check_runs":[{"id":10,"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"failure","output":{"summary":""}}]}' ;;
         # Newest first, as the API lists them: the re-trigger (id 2) found something the first run did not.
@@ -58,7 +61,7 @@ if [ "${1:-}" = api ]; then
       esac ;;
     *'/pulls/42/comments'*)
       case "$MODE" in
-        race) echo '[]' ;;
+        race|cr_ca_clean|cr_ca_findings) echo '[]' ;;
         in_progress) echo '[{"user":{"login":"greptile-apps[bot]"},"path":"partial.go","line":9,"body":"<img alt=\"P1\"> partial finding","pull_request_review_id":101}]' ;;
         head_two_runs) echo '[{"user":{"login":"greptile-apps[bot]"},"path":"retrigger.go","line":8,"body":"<img alt=\"P1\"> found by the re-trigger","pull_request_review_id":77}]' ;;
         cr_resolved) echo '[{"user":{"login":"coderabbitai[bot]"},"path":"resolved.go","line":8,"body":"🟡 **resolved finding**","pull_request_review_id":9}]' ;;
@@ -200,4 +203,25 @@ PATH="$WORK/bin:$PATH" bash "$SCRIPT" test/repo 42 > "$WORK/head-two-runs.out" 2
 grep -q 'Greptile: completed on head.*1 comments added' "$WORK/head-two-runs.out" || fail "the newest head Greptile run was not the one read: $(cat "$WORK/head-two-runs.out")"
 grep -q '^  GR  retrigger.go:8' "$WORK/head-two-runs.out" || fail "the re-trigger's finding was hidden by the older clean run: $(cat "$WORK/head-two-runs.out")"
 
-echo "PASS pr-findings: settled, resolved current-head scope, earlier-verdict Greptile scope"
+# Signal (e): CodeRabbit dropped the final_review_risk block and marks the reviewed head with
+# change_assessment_commit:"<sha>" beside a clean recent_review block (#1502). pr-findings must
+# recognize the exact-head marker as reviewed, not report "NOT REVIEWED" on a clean incremental.
+MODE="cr_ca_clean"; export MODE
+PATH="$WORK/bin:$PATH" bash "$SCRIPT" test/repo 42 > "$WORK/ca-clean.out" 2>&1 \
+  || fail "change_assessment_commit head marker did not satisfy the gate: $(cat "$WORK/ca-clean.out")"
+grep -q 'incremental pass covered the head' "$WORK/ca-clean.out" || fail "change_assessment head marker not recognized as reviewed: $(cat "$WORK/ca-clean.out")"
+if grep -q 'NOT REVIEWED on head by any bot' "$WORK/ca-clean.out"; then fail "a clean change_assessment head read as unreviewed: $(cat "$WORK/ca-clean.out")"; fi
+
+# ...and with a live CodeRabbit thread the same head is reviewed-with-findings: the finding is
+# listed as current (not the stale-carried note), and the head is still recognized as reviewed.
+MODE="cr_ca_findings"; export MODE
+set +e
+PATH="$WORK/bin:$PATH" bash "$SCRIPT" test/repo 42 > "$WORK/ca-findings.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 0 ] || fail "change_assessment head with a live CR thread exited rc=$rc, want 0: $(cat "$WORK/ca-findings.out")"
+grep -q 'incremental pass covered the head' "$WORK/ca-findings.out" || fail "change_assessment head not recognized as reviewed with findings: $(cat "$WORK/ca-findings.out")"
+grep -q '^  CR  ca.go:4' "$WORK/ca-findings.out" || fail "the current-head CR finding was not listed: $(cat "$WORK/ca-findings.out")"
+if grep -q 'carried from an earlier review' "$WORK/ca-findings.out"; then fail "a current-head CR finding was mislabeled as carried/stale: $(cat "$WORK/ca-findings.out")"; fi
+
+echo "PASS pr-findings: settled, resolved current-head scope, earlier-verdict Greptile scope, change_assessment head marker"

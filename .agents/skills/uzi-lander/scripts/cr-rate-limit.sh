@@ -92,11 +92,14 @@ reset_from_pr() {
     |last|select(.!=null)|"\(.created_at)\t\(.body)"' 2>/dev/null)
   if [ -n "$b" ]; then
     ts=$(printf '%s' "$b" | head -1 | cut -f1)
-    if printf '%s' "$b" | grep -qF 'Reviews are available now'; then
-      n=0
-    else
-      n=$(printf '%s' "$b" | grep -oE 'More reviews will be available in [0-9]+ minutes?' | tail -1 | grep -oE '[0-9]+' || true)
-    fi
+    # No-pipeline match test: `printf … | grep -qF` can return 141 (SIGPIPE) under
+    # `set -o pipefail` — grep -q closes the pipe on a match before printf finishes writing,
+    # so a real "Reviews are available now" reply reads as no-match (observed on #1504,
+    # flaky by body size). `case` against the captured body has no pipe and no such race.
+    case "$b" in
+      *"Reviews are available now"*) n=0 ;;
+      *) n=$(printf '%s' "$b" | grep -oE 'More reviews will be available in [0-9]+ minutes?' | tail -1 | grep -oE '[0-9]+' || true) ;;
+    esac
     if [ -n "$n" ] && [ -n "$ts" ] && base=$(iso2epoch "$ts") && [ -n "$base" ]; then
       if [ -z "$best_base" ] || [ "$base" -ge "$best_base" ]; then
         best_base=$base; best_ts=$(( base + n*60 )); best_src="reply"
@@ -119,11 +122,12 @@ reset_from_reply_after() {
      |last|select(.!=null)|"\(.created_at)\t\(.body)"' 2>/dev/null)
   [ -n "$b" ] || return 0
   ts=$(printf '%s' "$b" | head -1 | cut -f1)
-  if printf '%s' "$b" | grep -qF 'Reviews are available now'; then
-    n=0
-  else
-    n=$(printf '%s' "$b" | grep -oE 'More reviews will be available in [0-9]+ minutes?' | tail -1 | grep -oE '[0-9]+' || true)
-  fi
+  # No-pipeline match test: see reset_from_pr — `printf … | grep -qF` can return 141 (SIGPIPE)
+  # under pipefail and misread a real "available now" reply as no-match.
+  case "$b" in
+    *"Reviews are available now"*) n=0 ;;
+    *) n=$(printf '%s' "$b" | grep -oE 'More reviews will be available in [0-9]+ minutes?' | tail -1 | grep -oE '[0-9]+' || true) ;;
+  esac
   if [ -n "$n" ] && [ -n "$ts" ] && base=$(iso2epoch "$ts") && [ -n "$base" ]; then
     printf '%s\treply\n' "$(( base + n*60 ))"
   fi
