@@ -1,11 +1,11 @@
 # PRD #1493: Codex on hosted k8s, an opt-in uid-split worker profile
 
 **Issue:** [#1493](https://github.com/vtmocanu/uzi/issues/1493)
-**Status:** Track U (M1 to M5) implemented on branch `agent/issue-1493`, 2026-09-20. Track M: M6 real-kubelet validation has started and is **blocked on #1523** (the uid-split worker crash-loops on the read-only Secret symlink); M7 live verification has not started.
+**Status:** Track U (M1 to M5) implemented on branch `agent/issue-1493`, 2026-09-20. Track M: M6 real-kubelet validation has started; its first live-kubelet pass discovered blocker #1523. M6 remains incomplete pending a published fix and a successful repeat; M7 live verification has not started.
 **Parent:** #1106 M6 (Codex on hosted k8s). Follows #1492 / #1495 (shared-directory ownership, fixed in 0.84.0-rc.3).
 **Execution:** two tracks.
 - **Track U (send to uzi, Auto mode, gated plan):** M1 to M5 — **implemented on this branch.** Controller + agent image entrypoint + agent probe and command sandbox + chart + docs. No migration. **No `.github/workflows/**` touched** in implementation or validation (`.claude/rules/prds.md`).
-- **Track M (maintainer, local):** M6 — **started, blocked on #1523** (read-only Secret symlink crash-loop); M7 — **not started.** A real-kubelet validation and live verification. A uzi worker can do neither. No workflow edit is needed anywhere in this PRD.
+- **Track M (maintainer, local):** M6 — **started, incomplete.** Its first live-kubelet pass discovered blocker #1523; completion now waits for a published fix and a successful repeat. M7 — **not started.** A uzi worker can do neither validation. No workflow edit is needed anywhere in this PRD.
 
 Use current `main` and a new working branch, never write to `main`.
 
