@@ -463,6 +463,13 @@ func (m tuiModel) renderBoard() string {
 	var sb strings.Builder
 	rows := m.board.visible()
 
+	// ONE per-frame meter snapshot with ONE now (PRD 1519 M4): boardMeterLayout decides
+	// combined-vs-split once and returns the rendered header meter line(s). The SAME snapshot
+	// feeds both the draw below and the row reservation (boardCapacityWith), so the reserved
+	// chrome can never disagree with what is drawn.
+	now := time.Now()
+	meters := m.boardMeterLayout(now)
+
 	// The wordmark is now a tab strip (PRD #1255 D1): ▚▚ uzi · floor  pulls  ci, the active
 	// tab bold. tabStrip relabels the floor tab "active runs" on the admin board (AdminListRuns
 	// returns non-terminal runs only, so promising completed rows would be a claim the API
@@ -482,7 +489,7 @@ func (m tuiModel) renderBoard() string {
 	// cursor still indexes RUN rows only (via visible()), so selection/enter/clamp are unchanged.
 	// The window keeps the selected run row on screen so the wordmark and footer never scroll off.
 	items := m.buildBoardItems(rows)
-	capacity := m.boardCapacity()
+	capacity := m.boardCapacityWith(len(meters.lines))
 	selItem := selectedBoardItem(items, m.board.cursor)
 	start, end := boardWindow(selItem, m.board.scroll, len(items), capacity)
 
@@ -494,17 +501,13 @@ func (m tuiModel) renderBoard() string {
 		summary += m.pal.faint.Render(" · " + itoa(lo) + "–" + itoa(hi))
 	}
 	sb.WriteString(clampVisual(padVisual(" "+brand, m.width-visualWidth(summary)-1)+summary, m.width) + "\n")
-	// The viewer's own rate-limit meters, mirroring the web sidebar's selection. One line,
-	// only when at least one token is readable AND shown; otherwise nothing (no strip).
-	if strip := m.boardRateLimitStrip(time.Now()); strip != "" {
-		sb.WriteString(strip + "\n")
-	}
-	// The Codex meters get their OWN provider line under the Claude strip (PRD #1209 M3), so
-	// their percentages stay legible at a standard width instead of being clipped off the end
-	// of a combined line. Drawn only when ≥1 selected readable Codex account exists;
-	// boardCapacity reserves this physical line exactly as it reserves the Claude strip's.
-	if codex := m.boardCodexRateLimitStrip(time.Now()); codex != "" {
-		sb.WriteString(codex + "\n")
+	// The viewer's own rate-limit meters, mirroring the web sidebar's selection (PRD #1209 M3 /
+	// 1519 M4). boardMeterLayout adaptively renders the Claude and Codex meters on ONE combined
+	// header line when they fit m.width, or on two lines (Claude, then Codex) when they do not.
+	// len(meters.lines) is 0, 1, or 2, and boardCapacityWith reserved exactly that many rows from
+	// the SAME snapshot, so this loop can never overdraw the run list.
+	for _, line := range meters.lines {
+		sb.WriteString(line + "\n")
 	}
 	// The tier-1 vault-locked hint (PRD #1251 M2, D5): its OWN line directly under the strip,
 	// never replacing or hiding it — both are distinct signals and can show together. Its row
@@ -781,11 +784,85 @@ func (m tuiModel) boardShowCred() bool {
 	return m.board.admin || m.tokenCount > 1
 }
 
+// boardMeterLayout is the ONE per-frame snapshot of the header rate-limit meter line(s) (PRD 1519
+// M4). It decides — ONCE per frame, with ONE now — whether the Claude and Codex meters share a
+// single combined line or fall back to two, and returns the rendered line string(s). len(lines) is
+// the physical row count the meters occupy (0, 1, or 2). renderBoard draws lines and boardCapacityWith
+// reserves exactly len(lines) rows from the SAME snapshot, so the reserved chrome can never disagree
+// with what is drawn: a countdown/reset-in text can change visual width at a reset boundary between two
+// now values and flip the combined-vs-split decision, so deriving the layout twice (two nows) is banned.
+type boardMeterLayout struct{ lines []string }
+
+// boardCodexProviderTag is the single faint LOWERCASE provider tag "codex " — P in the PRD 1519 D3
+// label-precedence matrix. It is a hardcoded literal, so it needs no renderer.Plain; only the
+// user-authored account aliases and bucket names (inside boardCodexAccountsSeg) go through Plain (D7).
+// P and the per-account label A are SEMANTICALLY DISTINCT and BOTH render even when an account alias
+// literally equals "codex": that yields the "codex" provider tag PLUS that account's own "codex"
+// label, which is correct — NOT the old redundant hardcoded prefix. P is never suppressed to match an
+// alias.
+func (m tuiModel) boardCodexProviderTag() string {
+	return paintSeg(m.pal.faintC, nil, false, "codex ")
+}
+
+// boardMeterLayout builds the snapshot (PRD 1519 D3/D4). claudeStr is the Claude section (" " +
+// the 3-space-joined per-token segments); codexAccounts is the Codex ACCOUNTS section with NO
+// provider tag; P is the single faint "codex " tag placed by THIS layout code, not by the sections.
+//
+// P-placement rule (matrix invariant: at most one provider-level token ever renders):
+//   - neither section present → 0 lines.
+//   - Claude only → the Claude line; no P (there is no Codex section).
+//   - Codex only → one line " " + P + codexAccounts; P IS included — there is no Claude line above
+//     to disambiguate the provider, and under Ascii/NoTTY the accent-bar tint is stripped and the ▎
+//     glyph is identical for both providers, so the tag is the only provider signal.
+//   - both, and the combined line fits m.width → one line claudeStr + gap + P + codexAccounts; exactly
+//     one P (the D3 combined-line invariant), so the provider stays unambiguous under Ascii/NoTTY.
+//   - both, and it does NOT fit → two lines (Claude, then Codex); P is OMITTED on the fallback Codex
+//     line (matrix "default omit"): the line position, the accent bar, and the P/S window labels
+//     disambiguate, and re-adding P here would risk clipping the readings the fallback exists to save.
+//
+// The Claude↔Codex section gap on the combined line is the same 3-space token gap the sections use
+// internally; the per-account accent bar ▎ still delimits the account groups.
+func (m tuiModel) boardMeterLayout(now time.Time) boardMeterLayout {
+	claudeSegs := m.boardClaudeMeterSegs(now)
+	codexAccounts := m.boardCodexAccountsSeg(now)
+	hasClaude := len(claudeSegs) > 0
+	hasCodex := codexAccounts != ""
+	switch {
+	case !hasClaude && !hasCodex:
+		return boardMeterLayout{nil}
+	case !hasCodex: // Claude only — no Codex section, so no provider tag.
+		claudeStr := " " + strings.Join(claudeSegs, "   ")
+		return boardMeterLayout{[]string{clampVisual(claudeStr, m.width)}}
+	case !hasClaude: // Codex only — include P (no Claude line above to disambiguate).
+		return boardMeterLayout{[]string{clampVisual(" "+m.boardCodexProviderTag()+codexAccounts, m.width)}}
+	default: // both
+		claudeStr := " " + strings.Join(claudeSegs, "   ")
+		combined := claudeStr + "   " + m.boardCodexProviderTag() + codexAccounts
+		if visualWidth(combined) <= m.width {
+			return boardMeterLayout{[]string{clampVisual(combined, m.width)}} // exactly one P
+		}
+		// Fallback: two lines, P omitted on the Codex line (matrix default-omit).
+		return boardMeterLayout{[]string{
+			clampVisual(claudeStr, m.width),
+			clampVisual(" "+codexAccounts, m.width),
+		}}
+	}
+}
+
 // boardCapacity is how many display lines fit between the wordmark block and the footer at the
-// current terminal height. It counts the same chrome renderBoard draws: the wordmark line, the
-// blank below it, the footer (3), plus the optional adminDenied and error lines. At least one
-// line is always shown.
+// current terminal height. It is the zero-arg form for callers that do not already hold a meter
+// snapshot (syncedScroll, tests): it derives the meter row count from a fresh boardMeterLayout.
+// renderBoard MUST use boardCapacityWith with its own per-frame snapshot instead, so the reserved
+// meter rows match exactly what it draws.
 func (m tuiModel) boardCapacity() int {
+	return m.boardCapacityWith(len(m.boardMeterLayout(time.Now()).lines))
+}
+
+// boardCapacityWith is boardCapacity given the number of header meter rows the caller is drawing
+// (0, 1, or 2 from boardMeterLayout). It counts the same chrome renderBoard draws: the wordmark
+// line, the blank below it, the footer (3), the meter rows, plus the optional adminDenied, error,
+// vault-hint, and selected-row second lines. At least one content line is always shown.
+func (m tuiModel) boardCapacityWith(meterLines int) int {
 	chrome := 3
 	if m.board.adminDenied {
 		chrome++
@@ -793,16 +870,9 @@ func (m tuiModel) boardCapacity() int {
 	if m.board.err != nil {
 		chrome++
 	}
-	// The rate-limit strip, when present, adds one line between the wordmark and the blank
-	// below it. Recomputed here (cheap) so the row-window math matches renderBoard's layout.
-	if m.boardRateLimitStrip(time.Now()) != "" {
-		chrome++
-	}
-	// The Codex meters ride their own second strip line (PRD #1209 M3), reserved exactly like
-	// the Claude strip's row so the extra line never overdraws the run list.
-	if m.boardCodexRateLimitStrip(time.Now()) != "" {
-		chrome++
-	}
+	// The adaptive rate-limit meter line(s) (PRD 1519 M4): reserve exactly the row count the caller
+	// is drawing from its snapshot, so the combined-vs-split decision cannot drift by a line.
+	chrome += meterLines
 	// The tier-1 vault-locked hint (PRD #1251 M2) is its own line under the strip when shown;
 	// reserve one row for it the SAME way (calling vaultIndicatorLine, not re-deriving the
 	// show-condition) so the row window and renderBoard's layout cannot drift by a line.

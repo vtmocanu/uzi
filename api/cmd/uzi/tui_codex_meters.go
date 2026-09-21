@@ -1,7 +1,7 @@
 package main
 
 // Codex per-account rate-limit meters (PRD #1209 M3), drawn beside the Claude meters on
-// BOTH the board strip (boardCodexMeterSeg) and the detail rail (railCodexRateMeters).
+// BOTH the board strip (boardCodexAccountsSeg) and the detail rail (railCodexRateMeters).
 // The selection mirrors the Claude side (selectedRateMeters): the default account plus
 // sidebar_codex_account_ids, but keyed on AccountID and with "readable" = a status that
 // carries a reading (fresh or stale). A stale reading is shown DIMMED. Aliases and bucket
@@ -142,13 +142,18 @@ func (m tuiModel) codexRateWindowCell(label string, w *apitypes.CodexRateLimitWi
 		paintSeg(m.pal.faintC, nil, false, pctSeg)
 }
 
-// boardCodexMeterSeg renders the board strip's Codex section — a faint "Codex" provider
-// label so the two providers never look merged, then one segment per shown account. ""
-// when nothing is selected. Each account carries a per-group accent bar ▎ tinted by its
-// peak window pct (alarm ≥ rateDangerPct, faint otherwise), an optional account label
-// (when showLabel), and its buckets' primary/secondary windows. A stale account is drawn
-// dimmed. The whole board strip is width-clamped downstream, so this rides one line.
-func (m tuiModel) boardCodexMeterSeg(now time.Time) string {
+// boardCodexAccountsSeg builds the board strip's Codex ACCOUNTS section — one segment per shown
+// account, joined with the 3-space token gap — and returns "" when nothing is selected. It
+// carries NO provider tag: the single faint lowercase "codex" provider tag (P in the PRD 1519
+// D3 matrix) is added by the layout code (boardMeterLayout) depending on the chosen layout, so
+// the Codex section mirrors the Claude side, which likewise has no group prefix. The old
+// hardcoded "Codex " group prefix is gone (PRD 1519 M3): it was redundant chrome and, when a
+// user aliased an account "codex", read as a literal "Codex codex" duplication. Each account
+// segment carries a per-group accent bar ▎ tinted by its peak window pct (alarm ≥ rateDangerPct,
+// faint otherwise), an optional per-account label A (when showLabel — two or more readable
+// accounts), and its buckets' primary/secondary windows; a stale account is drawn dimmed.
+// Aliases/bucket names ride renderer.Plain (D7), inside boardCodexAccountSeg.
+func (m tuiModel) boardCodexAccountsSeg(now time.Time) string {
 	shown, showLabel := m.selectedCodexRateMeters()
 	if len(shown) == 0 {
 		return ""
@@ -157,7 +162,7 @@ func (m tuiModel) boardCodexMeterSeg(now time.Time) string {
 	for _, a := range shown {
 		accts = append(accts, m.boardCodexAccountSeg(a, showLabel, now))
 	}
-	return paintSeg(m.pal.faintC, nil, false, "Codex ") + strings.Join(accts, "   ")
+	return strings.Join(accts, "   ")
 }
 
 // boardCodexAccountSeg renders one Codex account's board-strip segment: the accent bar,

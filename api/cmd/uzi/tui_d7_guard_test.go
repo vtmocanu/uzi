@@ -136,7 +136,7 @@ var d7UntrustedFields = []string{
 	"AnthropicSecretLabel",
 	// Codex meter labels (PRD #1209 M3). Aliases (a Codex account's linked-alias labels) and
 	// DisplayName (a Codex bucket's human name) are user-/provider-authored free text drawn on
-	// the board strip (boardCodexMeterSeg) and the detail rail (railCodexRateMeters) via
+	// the board strip (boardCodexAccountsSeg) and the detail rail (railCodexRateMeters) via
 	// codexAccountLabel / codexBucketLabel, each of which folds the field through renderer.Plain.
 	// Same defence as AnthropicSecretLabel: this guard (both are drawn directly inside Plain, so
 	// a raw draw would redden it) + the hostile-value case in the Codex render test.
