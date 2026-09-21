@@ -162,18 +162,34 @@ apipatch() { curl -fsS -b "$JAR" -X PATCH "$BASE$1" -H 'Content-Type: applicatio
 # had its helpers, so the cleanup itself then died on `report_margins: command not
 # found` and the real cause was two errors up. Memoized, so repeat calls cost nothing.
 PGPW=""
+# A psql DML command-completion TAG (`INSERT 0 1`, `UPDATE 1`, `DELETE 1`, `MERGE n`) is written to
+# stdout on its OWN line even under `-t`, alongside any returned row. Two ways it corrupts a scalar
+# read (#1351, and the trap phase 37 already documents):
+#   - SAME statement: an `INSERT … RETURNING id` emits `<id>\nINSERT 0 1`;
+#   - CROSS invocation: a discarded DML in a PRIOR phase (`db_psql "INSERT …" >/dev/null`) can bleed
+#     its tag into the FIRST read of the next phase, so a plain SELECT comes back `<value>\nINSERT 0 1`.
+# Either way the old `tr -d '\r\n'` fused `<value>INSERT 0 1` — non-empty (passes a `-n` guard) and
+# only exploding statements later inside an unrelated INSERT (`invalid input syntax for type uuid`).
+# Drop the tag LINE at the chokepoint (a FULL-line match; no real scalar is `INSERT 0 1`-shaped) so
+# every caller gets the clean scalar it already assumes. This retires the per-phase guards in 37/39.
+_PSQL_TAG_RE='^(INSERT [0-9]+ [0-9]+|UPDATE [0-9]+|DELETE [0-9]+|MERGE [0-9]+)$'
+# _psql_strip_tags — from stdin, strip `\r` and drop any DML command-completion tag LINE. The shared
+# guts of db_psql/db_psql_rows, split out so e2e/lib.test.sh can exercise it hermetically.
+_psql_strip_tags() { tr -d '\r' | awk -v re="$_PSQL_TAG_RE" '$0 !~ re'; }
 db_psql() {
   [ -n "$PGPW" ] || PGPW="$(grep '^POSTGRES_PASSWORD=' "$ENVFILE" | cut -d= -f2-)"
-  "${COMPOSE[@]}" exec -T -e PGPASSWORD="$PGPW" db psql -U uzi -d uzi -tAc "$1" | tr -d '\r\n'
+  "${COMPOSE[@]}" exec -T -e PGPASSWORD="$PGPW" db psql -U uzi -d uzi -tAc "$1" | _psql_strip_tags | tr -d '\n'
 }
 # db_psql_rows SQL — like db_psql but PRESERVES row boundaries (one row per line).
 # db_psql collapses newlines (tr -d '\r\n') for scalar reads; use THIS for any
 # query whose result is enumerated row-by-row (the quarantine id sweep, the
 # multi-row artifact dumps) so 2+ rows don't fuse into one garbage token. It strips
-# only `\r`, keeping `\n` row separators. PGPW is the memoized module var db_psql uses.
+# only `\r`, keeping `\n` row separators, and drops any DML command-completion tag LINE
+# (see db_psql) so a stray `INSERT 0 1` can never masquerade as an enumerated row. PGPW
+# is the memoized module var db_psql uses.
 db_psql_rows() {
   [ -n "$PGPW" ] || PGPW="$(grep '^POSTGRES_PASSWORD=' "$ENVFILE" | cut -d= -f2-)"
-  "${COMPOSE[@]}" exec -T -e PGPASSWORD="$PGPW" db psql -U uzi -d uzi -tAc "$1" | tr -d '\r'
+  "${COMPOSE[@]}" exec -T -e PGPASSWORD="$PGPW" db psql -U uzi -d uzi -tAc "$1" | _psql_strip_tags
 }
 # create_run REPO_ID ISSUE_IID — POST a run, tolerating ONLY the transient
 # `404 "issue not found on this repo's board"`. That 404 is a create-then-immediately-use

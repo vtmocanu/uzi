@@ -305,6 +305,10 @@ tasks:
       # semantics AND guards the tally (>= 8 cases, c == p) so a gutted driver test cannot
       # read green. Before `scan:secrets`, which is deliberately last because it dominates.
       - task: test:e2e-driver
+      # hermetic (~instant): extracts lib.sh's _psql_strip_tags and asserts a psql DML command tag
+      # welded onto / bled into a db_psql scalar read is stripped (#1351). Tally-guarded like the two
+      # siblings above so a gutted run cannot read green.
+      - task: test:e2e-lib
       # Hermetic end-to-end tests for the repo-local uzi-watcher backup scripts. They use
       # fake uzi/kubectl commands and temporary git repos: no cluster, forge or live backup
       # directory is touched. This gates clone capture, bare-ref fallback, fail-closed
@@ -877,6 +881,15 @@ tasks:
       # asserts the tally exists, c == p, and c >= 8 (the 8 PRD #966 M2 driver behaviours;
       # the test emits more as sub-cases are added). See the script header.
       - ./scripts/check-e2e-driver.sh
+
+  test:e2e-lib:
+    desc: hermetic regression for lib.sh's db_psql tag-strip (#1351), tally-guarded (no stack, no docker)
+    cmds:
+      # e2e/lib.test.sh extracts the real _psql_strip_tags out of e2e/lib.sh (which cannot be sourced
+      # -- its top level provisions the whole stack) and drives it over stdin. It prints a mandatory
+      # `cases=N passed=N` tally and exits nonzero unless every case (>= 10) is green, so a gutted
+      # zero-case run cannot read green. Guards the psql command-tag corruption fix for scalar reads.
+      - ./e2e/lib.test.sh
 
   test:uzi-watcher-backups:
     desc: hermetic tests of uzi-watcher live-clone/bare-ref backups, retention and detached loop

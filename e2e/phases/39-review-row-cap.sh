@@ -138,11 +138,9 @@ pass "seeded 4 dedicated runs for the B4' fixture (run_reviews.target_run_id is 
 # the variable instead of on screen. `set -e` would still stop the run, on an assignment,
 # with no message. Assigning through `printf -v` keeps the check in the caller's shell.
 #
-# NOT `RETURNING id` either: db_psql is `psql -tAc … | tr -d '\r\n'`, so psql's command TAG
-# is welded onto the returned row and yields `<uuid>INSERT 0 1` — non-empty, passes a bare
-# -n guard, and explodes several statements later. Read it back with a SELECT and assert the
-# SHAPE. (Measured on this branch by the M8c fixture above; repeated here because the trap
-# belongs to the helper, not to one call site.)
+# db_psql now strips psql's command TAG at the chokepoint (#1351), so `RETURNING id` no longer
+# welds `<uuid>INSERT 0 1` onto the returned row. Kept as a separate read-back SELECT plus a
+# uuid-SHAPE assertion for defense-in-depth, independent of the helper's tag handling.
 b4_seed_review() {
   local var="$1" run="$2" summary="$3" age="$4" id
   db_psql "INSERT INTO run_reviews (target_run_id, user_id, verdict, summary_md, updated_at)
