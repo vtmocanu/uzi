@@ -6581,8 +6581,10 @@ export class RunRunner {
     if (!barePath) return;
     try {
       // issue #1507 — the pin ref anchoring the transferred head is keyed on this run's exact claim
-      // generation; a v1 claim without one falls back to 0 (the same generation recovery.pin then
-      // records), so the anchor and the journal record agree.
+      // generation; a v1 claim without one falls back to 0. This value need NOT match the journal
+      // record's generation (recovery.pin stores claim.claim_generation verbatim — undefined for a
+      // v1 claim, never 0): anchorRecoveryHead and deleteRecoveryPin both use THIS local value, so
+      // the pin ref's create and delete stay paired regardless of the journal.
       const generation = claim.claim_generation ?? 0;
       const verifiedSha = await this.transferRestorePointToTrustedBare(flight, runLog, claim.run_id, generation);
       if (verifiedSha === null) {
