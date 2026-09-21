@@ -1,0 +1,97 @@
+# PRD 1519: Consistent one-line rendering for usage and rate-limit surfaces
+
+**Issue**: [#1519](https://github.com/vtmocanu/uzi/issues/1519)
+**Priority**: Low (presentation and consistency; no behavior or data change)
+**Status**: Draft
+
+## Problem
+
+Three small layout inconsistencies across the usage and rate-limit UI make related rows fail to line up:
+
+1. **Dashboard "Failed runs" line wraps unevenly.** The "Your usage" card renders the failed-runs detail line ("N of M finished runs, X% (a of b) in the last 7 days") on one line, while the wider "Factory total, all users, admin" card wraps the same line to two lines. The two cards sit side by side in an equal-width grid, so the mismatch is visible.
+
+2. **Codex sidebar bar is shorter than the Anthropic bars.** In the sidebar micro-meters the Codex ("CODEX") rate-limit bar track is visibly shorter than, and does not align with, the Anthropic ("META") bar tracks.
+
+3. **TUI header carries a redundant Codex group label and uses a second line.** The board header renders the Codex meters on a separate second line and prefixes them with a hardcoded "Codex " group label that the Claude side has no equivalent of. When a per-account label is also shown (two or more readable accounts), the group label sits next to the account label; in the reported screenshot the account is aliased "codex", so it reads as a literal "Codex codex" duplication. Either way the prefix is redundant chrome and costs horizontal width.
+
+None of these change data, totals, or behavior. They are alignment and copy fixes.
+
+## Root causes (verified in code, 2026-09-21)
+
+### 1. Failed-runs line (web)
+`web/src/components/UsageCards.tsx:146-157`, component `FailedRunsBlock`, shared by both cards (`YourUsageCard` at `:216`, `FactoryTotalCard` at `:243`). The header label, the big percentage, and the detail text are three flex children of one `flex flex-wrap items-baseline gap-x-3 gap-y-1` row (`:146`). Markup is identical for both cards. The right card wraps only because its rendered numbers are wider (for example "110 of 1021" and "(20 of 100)") and exceed the half-width column, so `flex-wrap` drops the detail span to a second line. The detail copy currently ends "in the last 7 days" (`:154-155`). The two cards sit side by side only for admins at md width and above (`web/src/pages/Dashboard.tsx:375`, `grid gap-4 md:grid-cols-2`, rendered when `data.adminUsage` is non-null); a non-admin sees a single full-width "Your usage" card. Separately, the "Your usage" token-summary line (`UsageCards.tsx:205-208`) also ends "in the last 7 days".
+
+**Key point**: `flex-wrap` already gives the desired "one line if it fits, two lines if not" behavior. The fix is to buy a little horizontal room so the normal desktop width fits one line, while keeping the wrap as the narrow-viewport fallback. Counts grow over time, so a copy trim is a headroom improvement, not a permanent guarantee; the `flex-wrap` fallback covers the overflow case by design.
+
+### 2. Codex sidebar bar width (web)
+Two separate components render the two provider groups:
+- Anthropic row `MicroRow` (`web/src/components/RateLimitMeters.tsx:314`): grid `grid-cols-[1.4rem_1fr_2.6rem]`.
+- Codex row `CodexMicroRow` (`web/src/components/CodexRateLimitMeters.tsx:292`): grid `grid-cols-[2.2rem_1fr_2.6rem]`.
+
+The bar track (`1fr`) and the percentage column (`2.6rem`) are identical. Only the first (label) column differs: 2.2rem for Codex vs 1.4rem for Anthropic. Since the track is `1fr`, the wider Codex label column leaves roughly 0.8rem less room, so the Codex track is shorter. The "»" projection marker is not involved: it is absolutely positioned (`web/src/components/RateLimitForecast.tsx`) and reserves no layout width.
+
+Label content that renders in the Codex first column is `formatCodexWindowLabel(...)` (`web/src/lib/codexRateLimits.ts:35-42`). Real-world values are two characters ("5h", "7d", "3h"); three-character values ("24h", "30d", "12h") are possible; a six-character "window" fallback appears only when the window length is missing. The Codex chip span already carries `truncate` (`CodexRateLimitMeters.tsx:293`), so an over-wide label clips instead of overflowing. The admin table already uses `1.5rem` for the same chip set (`web/src/pages/AdminRateLimits.tsx:183,193`), and the Anthropic sidebar uses `1.4rem` for its fixed "5h"/"7d" labels. Matching the Anthropic column exactly (1.4rem) is what makes the two tracks the same length.
+
+### 3. TUI Codex header line (Go)
+- The Codex meters are rendered as their own second strip and written on a separate line with an explicit newline: `renderBoard` at `api/cmd/uzi/tui_board.go:496-508` writes the Claude strip (`boardRateLimitStrip`, `api/cmd/uzi/tui_board_rows.go:88-99`) then the Codex strip (`boardCodexRateLimitStrip`, `tui_board_rows.go:109-116`). `boardCapacity` (`tui_board.go:788-811`) reserves one chrome line for each strip (`:798-800` and `:803-805`).
+- The redundant label: `boardCodexMeterSeg` (`api/cmd/uzi/tui_codex_meters.go:151-161`) prefixes a hardcoded faint "Codex " group label (`:160`). Separately, `boardCodexAccountSeg` (`:165-186`) draws a per-account label via `codexAccountLabel` (`:90-101`, the account's joined aliases or its AccountID, plus a " (default)" badge) only when two or more Codex accounts are readable (`showLabel`, `:70,167-168`). So with a single account only the "Codex " prefix shows (redundant, not duplicated); with two or more accounts the group label sits beside each account label and reads as a literal duplication when an alias happens to equal "codex" (the reported case). The Claude line has no group prefix, only the per-account label, which is why it never looks duplicated. The window labels are hardcoded literals: "5h"/"7d" for Claude (`tui_board_rows.go:133`), "P" (Primary) and "S" (Secondary) for Codex (`tui_codex_meters.go:174,176`).
+- The two-line split was a deliberate decision (PRD 1209 M3), documented at `tui_board_rows.go:83-87` and `tui_codex_meters.go:145-150`: a worst-case combined line (two Claude tokens with two windows each plus two Codex windows, roughly 173 columns) was truncated by `clampVisual` (`api/cmd/uzi/tui_text.go`, truncates rather than wraps) at 80 and 100 columns, dropping the Codex percentages. With the common configuration (one to two meta windows plus one Codex window) the combined line is roughly 72 columns and fits comfortably even at 80 columns, so the split is only needed for heavy configurations on narrow terminals.
+
+## Decisions
+
+- **D1 (item 1): copy trim plus keep `flex-wrap`.** Change the detail copy from "in the last 7 days" to "last 7d" and keep `flex-wrap` so both cards fit one line at normal width and fall back to two lines on narrow viewports. Do not force a single line unconditionally: with a half-width column and growing counts, forcing one line would require truncating real numbers. The two-lines-on-narrow fallback is the intended safety net. For intra-card consistency, also trim the "Your usage" token-summary line (`UsageCards.tsx:205-208`, "...tok / $X in the last 7 days") to "last 7d"; otherwise that card would show both phrasings of the same window.
+- **D2 (item 2): match the Anthropic column exactly, 1.4rem.** Set the Codex first column to `1.4rem` so the tracks align pixel for pixel with the Anthropic bars. Real Codex labels are two characters and fit; the rare three-character and "window" cases clip gracefully via the existing `truncate` class (as they already partially do at 2.2rem). Extract a shared grid-template constant used by both `MicroRow` and `CodexMicroRow` so the two components cannot drift apart again. The constant must hold the complete literal class string (for example `grid-cols-[1.4rem_1fr_2.6rem]`), not a composed or concatenated value, because Tailwind's content scanner only emits CSS for class names that appear literally in source.
+- **D3 (item 3a): drop the "Codex " group prefix, keep exactly one provider identifier.** Remove the hardcoded "Codex " prefix so the Codex section mirrors the Claude section. Guarantee exactly one provider-level identifier for the Codex section whenever it shares a line with the meta meters (the combined case, D4), so the provider stays unambiguous including under an Ascii/NoTTY profile, where the accent-bar tint is stripped and the ▎ glyph is identical for both providers. Per-account labels may render in addition only when two or more accounts exist (they identify the account, not the provider); never render two provider-level "Codex"/"codex" tokens, and suppress the provider tag where an account label would duplicate it. On the two-line fallback the provider tag may be omitted, since line position already disambiguates. Any user-authored alias stays routed through `m.renderer.Plain` (D7 terminal-injection guard). The exact single- vs multi-account label composition is settled in implementation and confirmed by the `tui-ux` review.
+
+  Label-precedence matrix (P = the single faint provider tag "codex"; A = the per-account label from `codexAccountLabel`, rendered only when two or more accounts are readable, `showLabel`):
+
+  | accounts | alias | combined line (shares the meta line) | two-line fallback |
+  |---|---|---|---|
+  | 0 | n/a | section not rendered | section not rendered |
+  | 1 | absent or any value | P only (a single account never shows A) | P optional, default omit (line position disambiguates) |
+  | 2+ | all differ from "codex" | P once at section start, then A per account | A per account; P optional, default omit |
+  | 2+ | one A equals "codex" | P once, then A per account; do not add a second provider tag | A per account; P optional, default omit |
+
+  Invariant: at most one provider-level token ever renders; the combined line always renders exactly one P, so the provider is unambiguous under Ascii/NoTTY; the removed hardcoded "Codex " group prefix never returns. An account a user has literally aliased "codex" yields P plus that account's own A, which is one provider token plus one account token (semantically distinct), not the old redundant prefix.
+- **D4 (item 3b): adaptive one-line, not unconditional.** Combine the Claude and Codex strips onto one header line when the combined visual width fits `m.width`; fall back to the current separate second line when it does not. This honors the request (one line in the common case) without regressing PRD 1209 M3 (legibility at 80 and 100 columns, where `clampVisual` would otherwise truncate the Codex percentages). Introduce one shared layout helper that both `renderBoard` and `boardCapacity` consult so the reserved row count always matches what is drawn (the same "reserve exactly what renderBoard draws" discipline the surrounding code already follows).
+
+## User experience
+
+- Dashboard: both usage cards render the failed-runs detail on one line at normal desktop width; on a narrow viewport the detail wraps to a second line on both cards consistently.
+- Sidebar: the Codex bar track is the same length as and aligned with the Anthropic bars.
+- TUI: at a standard terminal width the Codex meters sit on the same header line as the meta meters with a single, non-duplicated provider label; on a narrow terminal or a heavy multi-account configuration they fall back to a second line, preserving today's legibility.
+
+## Milestones
+
+- [ ] **M1: Dashboard failed-runs line fits one line at normal width (web).** Trim the detail copy to "last 7d" in `FailedRunsBlock` and, for intra-card consistency, in the "Your usage" token-summary line (`UsageCards.tsx:205-208`); keep `flex-wrap`. Repoint only the affected assertions in `UsageCards.test.tsx` and `Dashboard.test.tsx` (the FailedRunsBlock detail and the token-summary line), leaving unrelated "in the last" copy elsewhere untouched and keeping any paired positive/negative guard intact (per the web rule on copy changes disarming negative assertions). Verify via a mock-browser pass that both cards render one line at md two-column width and wrap consistently when narrow (jsdom does no layout, so this is not a vitest assertion; see M5).
+- [ ] **M2: Codex sidebar bar aligned with the Anthropic bars (web).** Set the Codex first column to 1.4rem to match Anthropic; extract a shared grid-template constant (a complete literal class string, per D2) consumed by both `MicroRow` and `CodexMicroRow`; keep the `truncate` class on the Codex label. In vitest assert both components render the same shared class; verify pixel alignment of the tracks and that two-character chips fit while a wide chip clips rather than overflows via a mock-browser pass (see M5).
+- [ ] **M3: TUI Codex label no longer duplicated (Go).** Drop the hardcoded "Codex " group prefix in `boardCodexMeterSeg`; ensure exactly one provider identifier remains (the per-account alias when present, otherwise a single faint "codex" tag) so the provider stays distinguishable including on a combined line. Preserve the `renderer.Plain` D7 routing for any user-authored alias and bucket name.
+- [ ] **M4: TUI adaptive one-line Codex meters (Go).** Combine the Claude and Codex strips onto one header line when the combined visual width fits `m.width`, else fall back to the current separate second line. Route both `renderBoard` and `boardCapacity` through one shared helper that reports the line count so the reserved chrome rows match what is drawn (no blank reserved line, no overdraw of the run list).
+- [ ] **M5: Tests and screenshots.** Web (vitest under jsdom does no layout, so pin strings and classes only): M1 asserts the rendered copy is "last 7d" and the old "in the last 7 days" wording is gone from both the FailedRunsBlock detail and the token-summary line; M2 asserts `MicroRow` and `CodexMicroRow` render the same shared grid-template class. The layout properties (one-line vs wrap, pixel-aligned tracks) are verified manually via a mock-browser pass, the only web layout instrument in this repo. Go: `View()`-seam tests (`tui_render_test.go` / `tui_model_test.go`) asserting one combined line with a single provider identifier at a wide width and the two-line fallback at a narrow width, plus a colorprofile downgrade (Ascii/NoTTY) check that asserts the Codex section renders the labels required by the D3 label-precedence matrix and stays provider-distinguishable, explicitly including the multi-account combined-line case where the tint is stripped. Regenerate the uxlab screenshots (confirm PNG mtimes are newer than the frames) and review the header via the `tui-ux` agent.
+- [ ] **M6: Gates green.** `task gate:web` and `task gate:api` pass (including lint and deadcode); `task check-docs:web` passes for this PRD; no fixture or doc drift introduced. Confirm no CLI (`api/cmd/uzi` non-TUI) surface needs a matching change (the affected surfaces are the web dashboard, the web sidebar, and the TUI, all covered here).
+
+## Risks and mitigations
+
+- **Copy change breaks negative test assertions, or over-broad repoint (M1).** The web rule notes that retiring a string makes negative assertions vacuous, and "in the last 7 days" / "in the last" also appears in unrelated copy (health reasons, sync). Mitigation: repoint only the FailedRunsBlock detail and the "Your usage" token-summary assertions, in `UsageCards.test.tsx` and `Dashboard.test.tsx`; leave unrelated "in the last" copy and its assertions untouched, and keep any paired positive/negative guard intact.
+- **Narrowing the Codex column clips a long label (M2).** Only the rare three-character and "window" fallback labels are affected, and the existing `truncate` class already handles them (they already partially clip at 2.2rem). Real data is two characters. Mitigation: verify with the "window" fallback fixture that the clip is graceful, not an overflow.
+- **TUI row-math drift (M4).** The board reserves chrome rows separately from rendering, so a one-line vs two-line decision made in two places could disagree and either leave a blank line or overdraw the run list. Mitigation: a single shared helper is the source of truth for both the draw and the reservation, following the existing D4 discipline in `boardCapacity`.
+- **Losing provider distinguishability on a combined line (M3/M4).** Dropping the group prefix while a single Codex account has no alias could leave the Codex section unlabeled next to the meta section. Mitigation: D3 keeps exactly one provider identifier present (fallback faint "codex" tag when no alias), and the per-provider accent bar plus the "P"/"S" window labels remain as secondary cues.
+- **Screenshot staleness (M5).** A timed-out uxlab render leaves stale PNGs beside current frames. Mitigation: run the full uxlab build and confirm PNG mtimes are newer than the frames before reviewing, per the TUI rule.
+
+## Dependencies
+
+- None external. All changes are within `web/src/components/` (plus `web/src/lib` for the shared constant if placed there), `web/src/pages/AdminRateLimits.tsx` is only referenced as precedent and is not changed, and `api/cmd/uzi/tui_*.go`. No API, DTO, migration, or schedule changes.
+
+## Out of scope
+
+- Any change to what the numbers mean, how failure rate or rate-limit usage is computed, or the "»" projection marker behavior.
+- The admin rate-limit page (`AdminRateLimits.tsx`), which already uses a consistent grid and does not exhibit the mismatch.
+- Restructuring the two web meter components into one shared component beyond extracting the shared grid-template constant (kept minimal to limit risk).
+
+## Decision Log
+
+- 2026-09-21: Chose copy trim ("last 7d") plus keeping `flex-wrap` over forcing a single line, because a half-width column with growing counts cannot guarantee one line without truncating real numbers; the wrap is the intended narrow-width fallback (D1).
+- 2026-09-21: Chose to match the Anthropic column at exactly 1.4rem (not 1.5rem) so the Codex and Anthropic tracks align pixel for pixel, accepting graceful `truncate` clipping for the rare wide label, and to extract a shared grid constant to prevent future drift (D2).
+- 2026-09-21: Chose adaptive one-line for the TUI over unconditional one-line, to satisfy the one-line request in the common case without regressing PRD 1209 M3's legibility guarantee at 80 and 100 columns; a single shared helper keeps the draw and the row reservation in sync (D3, D4).
+- 2026-09-21 (post-review): Corrected the item-3 framing from "duplication" to "redundant group prefix" (a literal "Codex codex" only occurs when an account alias equals "codex"); scoped item 1 to admins at md width and above (`Dashboard.tsx:375`); extended the copy trim to the "Your usage" token-summary line for intra-card consistency; clarified that web layout properties are verified by a mock-browser pass rather than vitest (jsdom does no layout), with vitest pinning only the copy string and the shared grid class; recorded the Tailwind complete-literal constraint on the shared grid constant; and tightened D3 to keep exactly one provider identifier on the combined line, including the Ascii multi-account case.
+- 2026-09-21 (CodeRabbit review of PR #1521): added the explicit D3 label-precedence matrix (zero / one / two-plus accounts against alias absent, equal to "codex", or different, for both the combined and two-line-fallback layouts) and pointed M5 at it, per CodeRabbit's one actionable finding.
