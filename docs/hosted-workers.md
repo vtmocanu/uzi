@@ -102,14 +102,28 @@ way to cordon a worker yourself; it's driven entirely by the cluster.
 
 ## My Codex run says "no Codex-capable worker is online"
 
-A hosted worker only claims a Codex run once it can actually run one. Two
-things can leave it unable to, and both mean the run stays queued rather than
-being claimed and then failing partway through: the fleet may not have the
-opt-in uid-split profile Codex needs turned on, or a node's kernel may lack
-Landlock while the fleet requires it. This applies to a full Codex run and
-to Codex judge/review advice alike — ask your admin to check the
-[operator knobs](./configuration.md#controller) (`UZI_WORKER_UID_SPLIT`,
-`UZI_CODEX_COMMAND_SANDBOX`) that control this.
+A hosted worker only claims a Codex run once it can actually run one, so an
+unmet precondition leaves the run queued rather than claimed and then failing
+partway through. This applies to a full Codex run and to Codex judge/review
+advice alike. Four things can hold a worker back:
+
+- The fleet does not have the opt-in uid-split profile Codex needs turned on.
+  Ask your admin to enable it (`UZI_WORKER_UID_SPLIT`).
+- A node's kernel lacks Landlock while the fleet requires it. Either move the
+  fleet onto Landlock-capable nodes, or, if running commands unconfined is
+  acceptable, set the command sandbox to best-effort
+  (`UZI_CODEX_COMMAND_SANDBOX`).
+- The Landlock probe fails outright — it could not run, or the kernel returned
+  an unexpected result. This is distinct from a clean "unavailable" and is
+  fatal even in best-effort, so no knob re-enables Codex: check the node's
+  kernel/Landlock support and that the command-sandbox binary is present on the
+  worker image.
+- The worker's Codex installer receipt is not intact (the Codex runtime is
+  missing or corrupt on the image). Re-provision or rebuild the hosted worker
+  so the runtime is reinstalled; an operator knob does not fix this.
+
+The [operator knobs](./configuration.md#controller) that control the first two
+are `UZI_WORKER_UID_SPLIT` and `UZI_CODEX_COMMAND_SANDBOX`.
 
 ## Disk self-heal
 
