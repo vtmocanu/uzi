@@ -39,12 +39,17 @@ import { RUN_ID_RE } from "./util.js";
  * check is the only guard left past `minAgeMs`. Terminal state can be stamped
  * server-side while a worker is still executing:
  *
- *  - `SweepRunningTimeout` (`api/internal/store/queries/runtime.sql`) sets
- *    `status = 'failed'` for a run past `RUN_TIMEOUT` and enqueues **no** stop
- *    verdict; there is no worker state poll, so the worker keeps running and keeps
- *    writing into this HOME while the row reads `failed`.
- *  - `FailRunsOfStaleWorkersOverCap` does the same for a worker that stopped
- *    heartbeating but is alive — a network partition, not a dead process.
+ *  - `SweepRunningTimeout` (`api/internal/store/queries/runtime.sql`) USED to be the
+ *    canonical case: it failed a run past `RUN_TIMEOUT` with no worker state poll, so
+ *    the worker kept writing into this HOME while the row read `failed`. Since PRD
+ *    #1497 it no longer fails at the wall — a run out of time PARKS (`status =
+ *    'paused'`, `hold_reason = 'budget_exhausted'`), a NON-terminal status this sweep
+ *    skips, so a run out of time keeps its HOME for the resume rather than risking
+ *    this race. The race below is now carried by the stale-worker path alone.
+ *  - `FailRunsOfStaleWorkersOverCap` fails a run whose worker stopped heartbeating
+ *    but is alive — a network partition, not a dead process — so the row reads
+ *    `failed` while that worker keeps running and keeps writing into this HOME. This
+ *    is the live example of terminal state stamped while a worker still executes.
  *
  * So a sibling worker booting in that window can delete a HOME an SDK is actively
  * using. The consequence is bounded rather than absent: the run is already terminal

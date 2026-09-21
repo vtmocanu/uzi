@@ -109,10 +109,16 @@ const (
 // health.go's own header already says this machinery is not a guardrail.
 //
 // Why the residual is acceptable: a buggy old worker looping on invalid batches is
-// FLAGGED by M4 and bounded by RUN_TIMEOUT, which is the PRD's own accepted
-// baseline (on a single-active-run instance M5 permanently never kills, so flag +
-// RUN_TIMEOUT is already the documented outcome for the motivating incident
-// itself). And decisively: a worker defect is per-BUILD, not per-RUN. Every run
+// FLAGGED by M4 and, since PRD #1497, PARKED — not failed — when it runs out of
+// time. A wedged worker is exactly the "dead, incapable, or unresponsive" case the
+// wall-park sweep parks server-side (an old worker cannot speak the wall-park
+// protocol, so its out-of-time run is parked at once; a live-but-wedged one is
+// parked at RUN_TIMEOUT plus a fixed grace, D5): the run leaves `running`, its old
+// flight's reports are fenced, and the owner is asked to extend, stop or cancel —
+// nothing is thrown away, where the old baseline failed it at RUN_TIMEOUT. (On a
+// single-active-run instance M5 permanently never kills, so flag + wall park is the
+// documented outcome for the motivating incident itself.) And decisively: a worker
+// defect is per-BUILD, not per-RUN. Every run
 // that worker touches fails identically, and the flag makes that visible across all
 // of them in ~10 seconds — the signal that says roll the image. Auto-stopping them
 // one at a time would make the affected runs DISAPPEAR while the broken build keeps
@@ -131,8 +137,11 @@ var autoStopKillableKinds = map[persistFailKind]bool{
 const stopKindAutoStopped = "auto_stopped"
 
 // autoStopReason is human prose, like every other failure_reason in this codebase
-// ("worker lost; exceeded re-queue budget", "run exceeded RUN_TIMEOUT", "run
-// cancelled"). The PRD's `message_persist_permanent` would have been the only
+// ("worker lost; exceeded re-queue budget", "worker restarted; run orphaned and out
+// of re-queue budget", "run cancelled"). The old "run exceeded RUN_TIMEOUT" reason is
+// no longer among them: since PRD #1497 a run out of time PARKS (paused,
+// hold_reason=budget_exhausted) rather than being failed for the clock alone. The
+// PRD's `message_persist_permanent` would have been the only
 // identifier-shaped value in a column both the CLI (FAILURE_REASON) and the web
 // render verbatim to humans — and per the paragraph above it is decoration anyway.
 const autoStopReason = "uzi stopped this run: its updates could not be saved"

@@ -84,6 +84,16 @@ func runWait(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, runI
 			}
 			lastStatus = run.Status
 			sawStatus = true
+			// PRD #1497 M3: a run parked at its wall-clock limit (paused with
+			// hold_reason=budget_exhausted) is NOT a target — it waits for the owner exactly like
+			// any paused run — but the bare "→ paused" transition does not say WHY it stopped or
+			// what unblocks it. One informative line, printed once per entry into the state (this
+			// block only runs on a status change), names the wall park and the extend command;
+			// the wait then keeps going, since paused is non-terminal.
+			if run.Status == statusPaused && run.HoldReason != nil && *run.HoldReason == holdBudgetExhausted {
+				_, _ = fmt.Fprintf(env.Stderr,
+					"run %s: parked at its time limit; waiting for the owner (uzi run extend %s --by 2h)\n", runID, runID)
+			}
 		}
 		// A status outside the twelve-value enum means the server is newer than this
 		// binary. Surface it once and keep waiting (it can never be a target — `--until`
