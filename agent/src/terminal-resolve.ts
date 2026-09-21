@@ -154,7 +154,7 @@ export async function journalAndResolveTerminal(
   // The outcome is now DURABLE on disk (before its first send). Emitted on the success path so an
   // observer can tell the terminal has been journaled write-ahead — the e2e outbox phase (case 3/4/5)
   // gates its api outage on this line instead of a fixed sleep, holding the api down until the run has
-  // actually reached AND journaled its terminal regardless of runner speed (`wait_journaled`).
+  // actually reached AND journaled its terminal regardless of runner speed (`wait_terminal_lost`).
   log.info("outbox: terminal journaled write-ahead", {
     run_id: runId,
     claim_generation: claimGeneration,
