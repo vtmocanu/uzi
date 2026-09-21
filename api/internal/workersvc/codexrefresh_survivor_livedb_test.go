@@ -262,11 +262,14 @@ func TestSweepThenRelinkRecoversCodexAccountLiveDB(t *testing.T) {
 // lease nor a rotating intent), so a promotion that DEFERRED transiently (here: a transient
 // DiscoverIdentity blip) was never retried and the account stayed quarantined forever.
 //
-// Tick 1 proves honest counting: the transient blip defers the promotion, so the sweep changes
-// nothing about the account and does NOT count it as recovered (CodexRefreshRecovered == 0).
-// Tick 2 proves the always-on retry: arm (c) of the scan re-lists the account, the discovery
-// now matches, and the material is promoted (generation advanced, quarantine cleared, recovery
-// slot emptied, live login usable) — and this time it IS counted.
+// Tick 1 proves honest counting per-account: the transient blip defers the promotion, so the
+// reconcile changes nothing (changed == false) — the exact input SweepUnresolvedCodexRefresh
+// gates its recovered++ on, asserted directly on this account so a shared, never-truncated
+// LiveDB and the global (non-owner-scoped) survivor scan cannot make it depend on cross-test
+// ordering. Tick 2 proves the always-on retry through the production Service.Sweep seam: arm (c)
+// of the scan re-lists the account, the discovery now matches, and the material is promoted
+// (generation advanced, quarantine cleared, recovery slot emptied, live login usable) — counted
+// with a robust lower bound.
 //
 // MUTATION PROOF (documented, run, and restored): removing arm (c) from
 // ListUnresolvedCodexRefreshAccounts (codex_binding.sql) makes tick 2 no longer list this
@@ -277,8 +280,9 @@ func TestSweepSurvivorRetriesDeferredRecoveryViaServiceSweepLiveDB(t *testing.T)
 	recTok := codexToken("recovery-access")
 	// Transient-first, token-specific fake: the FIRST discovery of recTok returns a transient
 	// (non-ErrIdentityIncomplete) blip — a deferral — and later discoveries MATCH this account's
-	// frozen tuple. discoverDefaultErr makes every OTHER user's leftover recovery blob defer, so
-	// this GLOBAL survivor sweep's recovered count is attributable to this test's account alone.
+	// frozen tuple. discoverDefaultErr defers every OTHER user's leftover recovery blob under the
+	// global tick-2 sweep, so it never spuriously promotes a foreign account; tick 2 still asserts
+	// only a lower bound on the global counter, and tick 1's no-false-count proof is per-account.
 	fake := &fakeRefreshClient{
 		discoverTransientTok: recTok,
 		discoverTransientErr: errors.New("transient discovery blip"),
@@ -320,14 +324,21 @@ func TestSweepSurvivorRetriesDeferredRecoveryViaServiceSweepLiveDB(t *testing.T)
 	svc.SetReadyAt(time.Now())
 	svc.SetCodexRefresh(fake)
 
-	// Tick 1: the promotion DEFERS on the transient blip. The account is untouched and, the point
-	// of honest counting, it is NOT counted as recovered.
-	res, err := svc.Sweep(env.ctx)
+	// Tick 1: the promotion DEFERS on the transient blip. Assert honest counting at the
+	// per-account level — this is the exact `changed` value SweepUnresolvedCodexRefresh gates its
+	// `recovered++` on, so `changed == false` for a deferral IS the "no false recovery count"
+	// property. We assert it directly on THIS account via the internal reconcile rather than on
+	// Sweep's global CodexRefreshRecovered counter, because run-store-it.sh runs the whole
+	// package's *LiveDB tests against one shared, never-truncated Postgres and the survivor scan
+	// is global — another test's leftover candidate could contribute to a global count and make an
+	// exact `== 0` assertion depend on undocumented cross-test ordering. (Tick 2 below still drives
+	// the promoting retry through the production Service.Sweep seam, with a robust lower bound.)
+	resolved, changed, err := svc.reconcileUnresolvedCodexRefresh(env.ctx, f.userID, f.accountID)
 	if err != nil {
-		t.Fatalf("tick 1 Sweep: %v", err)
+		t.Fatalf("tick 1 reconcile: %v", err)
 	}
-	if res.CodexRefreshRecovered != 0 {
-		t.Fatalf("tick 1 CodexRefreshRecovered = %d, want 0 (a deferred promotion is not a recovery)", res.CodexRefreshRecovered)
+	if resolved != 0 || changed {
+		t.Fatalf("tick 1 reconcile = (resolved=%d changed=%t), want (0, false) — a deferred promotion is not a recovery", resolved, changed)
 	}
 	acct1 := env.mustAccount(t, f.userID, f.accountID)
 	if acct1.CoordState != codexCoordQuarantined || acct1.Generation != 0 {
