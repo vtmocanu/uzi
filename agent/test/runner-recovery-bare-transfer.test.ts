@@ -360,4 +360,117 @@ describe("RunRunner — settle transfers the clone-only head into the trusted ba
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
+
+  it("6. positive-verify failure (fetch reports success, tracking ref does NOT cover HEAD) PRESERVES the source clone and keeps the hold open", async () => {
+    const { gitlab } = fakeGitlab();
+    const { coord, fakeClient, root } = makeCoord();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-bare-xfer-verifyfail-"));
+    const originalVerify = git.verifyRunnerTrackingCovers.bind(git);
+    try {
+      const iid = 5106;
+      const claim = gitlabClaim(iid, { claim_generation: 13 });
+      // Model a partial-fetch / race: fetchAgentBranch is REAL and succeeds, but the positive verify
+      // reports the bare's tracking ref does NOT cover the run HEAD. Every other case in this file has
+      // the fetch genuinely cover HEAD, so a verify that passes for real and a verify that is bypassed
+      // outright are otherwise indistinguishable — this is the mutation guard for that gap.
+      git.verifyRunnerTrackingCovers = async () => false;
+      await runnerWith(commitThenFailFactory(homeRoot), gitlab, undefined, nullLogger(), {
+        recovery: coord,
+      }).execute(claim);
+      assert.ok(hasStatus(claim.run_id, "failed"), "the run reported failed");
+      assert.equal(fakeClient.reserveCalls.length, 0, "no bundle production on an unverified transfer");
+      assert.equal(fakeClient.uploadCalls.length, 0, "nothing uploaded on an unverified transfer");
+      assert.equal(fakeClient.releaseCalls.length, 0, "never a fabricated release");
+      assert.equal(
+        fs.existsSync(worktreeDirFor(iid)),
+        true,
+        "the runner clone (the only recoverable source) SURVIVES cleanup",
+      );
+    } finally {
+      git.verifyRunnerTrackingCovers = originalVerify;
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("7. a dirty tree at settle time is WIP-committed by commitWipMarker before the transfer, and the marker reaches the trusted bare", async () => {
+    const { gitlab } = fakeGitlab();
+    const { coord, fakeClient, root } = makeCoord();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-bare-xfer-dirty-"));
+    try {
+      const iid = 5107;
+      const claim = gitlabClaim(iid, { claim_generation: 14 });
+      const factory: ExecutorFactory = (runId) => {
+        const runHome = path.join(homeRoot, runId);
+        return {
+          homeDir: runHome,
+          executor: {
+            run: async (ctx: RunContext): Promise<ExecutorResult> => {
+              fs.mkdirSync(runHome, { recursive: true });
+              // UNCOMMITTED work — no `git commit`, so worktreeStatus reports the tree dirty and the
+              // helper takes the commitWipMarker branch every other case here leaves unexercised.
+              fs.writeFileSync(path.join(ctx.worktreePath, "WIP.txt"), "uncommitted wip content\n");
+              throw new Error("agent failed hard");
+            },
+          },
+        };
+      };
+      await runnerWith(factory, gitlab, undefined, nullLogger(), { recovery: coord }).execute(claim);
+      assert.ok(hasStatus(claim.run_id, "failed"), "the run reported failed");
+      assert.equal(fakeClient.reserveCalls.length, 1, "the WIP-committed head is reserved");
+      assert.equal(fakeClient.reserveCalls[0]!.generation, claim.claim_generation, "the reserve binds the exact generation");
+      assert.equal(fakeClient.uploadCalls.length, 1, "the generation-bound bundle is uploaded");
+      assert.equal(fakeClient.releaseCalls.length, 0, "committed work is NEVER released");
+      const bare = git.barePathFor(fx.originPath);
+      assert.equal(
+        gitRead(bare, "show", `refs/uzi-runner/agent/issue-${iid}:WIP.txt`),
+        "uncommitted wip content",
+        "the WIP-marker-committed content is present in the trusted bare tracking ref",
+      );
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("8. commitWipMarker returning false on a dirty tree PRESERVES the source clone and keeps the hold open", async () => {
+    const { gitlab } = fakeGitlab();
+    const { coord, fakeClient, root } = makeCoord();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-bare-xfer-wipfail-"));
+    const originalCommitWip = git.commitWipMarker.bind(git);
+    try {
+      const iid = 5108;
+      const claim = gitlabClaim(iid, { claim_generation: 15 });
+      // The helper REQUIRES commitWipMarker to succeed on a dirty tree (an ambiguous `false` there is
+      // treated as a commit FAILURE, since the tree is already known dirty) — model that failure.
+      git.commitWipMarker = async () => false;
+      const factory: ExecutorFactory = (runId) => {
+        const runHome = path.join(homeRoot, runId);
+        return {
+          homeDir: runHome,
+          executor: {
+            run: async (ctx: RunContext): Promise<ExecutorResult> => {
+              fs.mkdirSync(runHome, { recursive: true });
+              fs.writeFileSync(path.join(ctx.worktreePath, "WIP.txt"), "uncommitted wip content\n");
+              throw new Error("agent failed hard");
+            },
+          },
+        };
+      };
+      await runnerWith(factory, gitlab, undefined, nullLogger(), { recovery: coord }).execute(claim);
+      assert.ok(hasStatus(claim.run_id, "failed"), "the run reported failed");
+      assert.equal(fakeClient.reserveCalls.length, 0, "no bundle production when the WIP commit failed");
+      assert.equal(fakeClient.uploadCalls.length, 0, "nothing uploaded when the WIP commit failed");
+      assert.equal(fakeClient.releaseCalls.length, 0, "never a fabricated release");
+      assert.equal(
+        fs.existsSync(worktreeDirFor(iid)),
+        true,
+        "the runner clone (the only recoverable source) SURVIVES cleanup",
+      );
+    } finally {
+      git.commitWipMarker = originalCommitWip;
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
