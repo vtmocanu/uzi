@@ -203,6 +203,8 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    writes the terminal trail, releases the claim — exit 9 if it is not merged yet). Do this
    BEFORE `reap`/`release`, or the trail is purged before it was ever written (#1510).
 7. **Post-merge CI.** `S/watch-run-ci.sh --sha MERGE_SHA --interval 60` in the background.
+   Pass the exact SHA from `merge.sh`; never hand-complete a prefix. The poller resolves it
+   through GitHub and exits 3 before polling when it is invalid or unknown.
    Exit 0 green (a partial dispatch counts; confirm a gate fix another way), 1 red (use the
    per-job live-log commands it prints, then fix on a branch, never `main`; flake → rerun +
    file), 3 no run appeared, 4 superseded → re-watch the current `main` head

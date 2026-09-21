@@ -596,12 +596,12 @@ if [ -n "$PROMOTED_TAG" ]; then
   echo "  # push order (D5): STABLE tag, then main, then the RC tag —"
   echo "  git push origin $PROMOTED_TAG"
   echo "  git push origin main               # triggers ci.yml"
-  echo "  .../watch-run-ci.sh --branch main --workflow ci.yml   # wait for green"
+  echo "  .../watch-run-ci.sh --sha \"\$(git rev-parse HEAD)\" --branch main   # validate exact release HEAD, then wait for green"
   echo "  git tag -a $TAG -m $TAG HEAD  # then push it with the user's go-ahead; if the classifier blocks you, hand them: ! git push origin $TAG"
 else
   echo "  git show HEAD                 # review"
   echo "  git push origin main         # triggers ci.yml"
-  echo "  .../watch-run-ci.sh --branch main --workflow ci.yml   # wait for green"
+  echo "  .../watch-run-ci.sh --sha \"\$(git rev-parse HEAD)\" --branch main   # validate exact release HEAD, then wait for green"
   echo "  git tag -a $TAG -m $TAG HEAD  # then push it with the user's go-ahead; if the classifier blocks you, hand them: ! git push origin $TAG"
 fi
 echo "  .../release-watch.sh $CHARTVER && .../release-verify.sh $CHARTVER"

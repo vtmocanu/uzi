@@ -8,7 +8,8 @@
 #                   run minted by a concurrent push is picked up (release flow).
 #   --sha SHA       EVERY workflow run for one commit on --branch (default main): the
 #                   post-merge watch, pinned to the merge SHA so a supersession by a newer
-#                   push is reported as such (exit 4), not as red.
+#                   push is reported as such (exit 4), not as red. SHA is 7-40 hex digits;
+#                   it is resolved through GitHub before polling, so a typo fails fast.
 #
 # Usage:
 #   watch-run-ci.sh <run-id> [--interval SECS] [--max-ticks N] [--repo OWNER/REPO]
@@ -33,8 +34,9 @@
 #      the next real code-change dispatch).
 #   1  a job completed with a failing conclusion (name + url printed) — react now
 #   2  timed out: still pending after --max-ticks
-#   3  usage / gh error; in --sha mode also "no run ever appeared for the SHA" (a push to
-#      main sometimes spawns none: re-point at a descendant commit rather than waiting)
+#   3  usage / gh error; in --sha mode also an invalid/unresolvable SHA or "no run ever
+#      appeared for the SHA" (a push to main sometimes spawns none: re-point at a descendant
+#      commit rather than waiting)
 #   4  --sha mode only: the SHA's runs were cancelled by concurrency (a newer commit
 #      superseded it) and nothing failed. `git fetch origin main` and re-watch the CURRENT
 #      head, whose run exercises this change plus the newer one. Not a failure.
@@ -89,28 +91,47 @@ if [ -n "$SHA" ]; then SHA_MODE=1; BRANCH="${BRANCH:-main}"; fi
 GHR=()
 [ -n "$REPO" ] && GHR=(--repo "$REPO")
 
+# Resolve an abbreviated or full SHA through GitHub before the poll starts. Without this,
+# a mistyped 40-hex value is indistinguishable from a workflow that has not appeared yet and
+# burns the whole wait budget printing "no run yet". Canonicalizing also lets every invocation
+# use gh's server-side --commit filter instead of the capped branch-list prefix fallback.
+if [ "$SHA_MODE" -eq 1 ]; then
+  case "$SHA" in
+    *[!0-9A-Fa-f]*|'') echo "watch-run-ci: --sha must be 7-40 hexadecimal digits (got '$SHA')" >&2; exit 3 ;;
+  esac
+  if [ "${#SHA}" -lt 7 ] || [ "${#SHA}" -gt 40 ]; then
+    echo "watch-run-ci: --sha must be 7-40 hexadecimal digits (got ${#SHA})" >&2
+    exit 3
+  fi
+  repo_path="$REPO"
+  if [ -z "$repo_path" ]; then
+    repo_path="$(gh repo view --json nameWithOwner --jq '.nameWithOwner' 2>/dev/null)"
+    if [ -z "$repo_path" ]; then
+      echo "watch-run-ci: could not infer OWNER/REPO to resolve --sha (pass --repo)" >&2
+      exit 3
+    fi
+  fi
+  resolved_sha="$(gh api "repos/${repo_path}/commits/${SHA}" --jq '.sha' 2>/dev/null)"
+  if ! [[ "$resolved_sha" =~ ^[0-9A-Fa-f]{40}$ ]]; then
+    echo "watch-run-ci: --sha '$SHA' did not resolve to a commit in $repo_path; check the value, auth, and network" >&2
+    exit 3
+  fi
+  SHA="$resolved_sha"
+fi
+
 # Resolve the latest run id on a branch (used when --branch given and RUN not fixed).
 resolve_run() {
   gh run list "${GHR[@]}" --branch "$BRANCH" --workflow "$WORKFLOW" --limit 1 \
     --json databaseId --jq '.[0].databaseId // empty' 2>/dev/null
 }
 
-# --sha mode: every run whose head matches SHA, one line per run:
-# databaseId<TAB>status<TAB>conclusion<TAB>workflowName. A full 40-hex SHA uses GitHub's
-# server-side --commit filter, so a busy main cannot push it out of a branch-list window.
-# gh does not resolve abbreviated values for --commit, so a short SHA keeps the capped branch
-# listing plus prefix filter for compatibility with hand-typed invocations.
+# --sha mode: every run whose head matches the canonical 40-hex SHA, one line per run:
+# databaseId<TAB>status<TAB>conclusion<TAB>workflowName. GitHub's server-side --commit
+# filter means a busy main cannot push it out of a capped branch-list window.
 runs_for_sha() {
-  if [ "${#SHA}" -eq 40 ] && [[ "$SHA" != *[!0-9A-Fa-f]* ]]; then
-    gh run list "${GHR[@]}" --branch "$BRANCH" --commit "$SHA" --limit 50 \
-      --json databaseId,status,conclusion,workflowName \
-      --jq '.[] | [.databaseId, .status, (.conclusion // ""), .workflowName] | @tsv' \
-      2>/dev/null
-    return
-  fi
-  gh run list "${GHR[@]}" --branch "$BRANCH" --limit 50 \
-    --json databaseId,headSha,status,conclusion,workflowName \
-    --jq ".[] | select(.headSha | startswith(\"$SHA\")) | [.databaseId, .status, (.conclusion // \"\"), .workflowName] | @tsv" \
+  gh run list "${GHR[@]}" --branch "$BRANCH" --commit "$SHA" --limit 50 \
+    --json databaseId,status,conclusion,workflowName \
+    --jq '.[] | [.databaseId, .status, (.conclusion // ""), .workflowName] | @tsv' \
     2>/dev/null
 }
 
