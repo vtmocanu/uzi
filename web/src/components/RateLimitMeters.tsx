@@ -9,6 +9,7 @@ import { isShownInSidebar, onSidebarTokensChanged } from "../lib/sidebarTokens";
 import { api, type RateLimitWindow, type TokenRateLimits } from "../lib/api";
 import { useAsyncData } from "../lib/useAsyncData";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
+import { MICRO_METER_GRID_COLS } from "../lib/rateLimitLayout";
 import {
   formatAgo,
   formatCountdown,
@@ -311,7 +312,7 @@ function MicroRow({
 }) {
   const countdown = formatCountdown(win.resets_at, now);
   return (
-    <div className="grid grid-cols-[1.4rem_1fr_2.6rem] items-center gap-2 text-[11px]">
+    <div className={`grid ${MICRO_METER_GRID_COLS} items-center gap-2 text-[11px]`}>
       <span className="font-mono text-faint">{label}</span>
       <RateLimitForecastMeter
         className="h-[5px]"

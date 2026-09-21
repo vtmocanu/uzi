@@ -69,8 +69,14 @@ describe("YourUsageCard", () => {
     // total = 1.61M + 16.1M + 0.71M = 18.42M
     expect(container.textContent).toContain("18.42M");
     expect(container.textContent).toContain("$26.40");
-    expect(getByText(/Across/)).toBeTruthy();
-    expect(getByText(/in the last 7 days/)).toBeTruthy();
+    const tokenSummary = getByText(/Across/);
+    expect(tokenSummary).toBeTruthy();
+    expect(getByText(/last 7d/)).toBeTruthy();
+    // Scoped to the token-summary node: the trimmed "last 7d" is present and the retired
+    // "in the last 7 days" wording is gone from this specific node (not a vacuous
+    // document-wide negative, which would pass trivially once the string is retired).
+    expect(tokenSummary.textContent).toContain("last 7d");
+    expect(tokenSummary.textContent).not.toContain("in the last 7 days");
   });
 
   it("shows the nothing-yet state (no fabricated 0) when run_count is 0", () => {
@@ -242,7 +248,11 @@ describe("FailedRunsBlock (PRD #1293)", () => {
     expect(container.textContent).toContain("10.4%");
     expect(container.textContent).toContain("106 of 1024 finished runs");
     expect(container.textContent).toContain("7.9%");
-    expect(container.textContent).toContain("(3 of 38) in the last 7 days");
+    // FailedRunsBlock detail node: trimmed to "last 7d". Scoped to the detail node itself,
+    // the retired "in the last 7 days" wording is gone (not a document-wide negative).
+    const detailNode = getByText(/finished runs/);
+    expect(detailNode.textContent).toContain("(3 of 38) last 7d");
+    expect(detailNode.textContent).not.toContain("in the last 7 days");
     // Legend: the four outcome labels each beside their lifetime count.
     expect(container.textContent).toContain("completed 861");
     expect(container.textContent).toContain("cancelled 45");

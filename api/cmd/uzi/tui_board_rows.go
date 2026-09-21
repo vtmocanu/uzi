@@ -80,11 +80,13 @@ func (m tuiModel) selectedRateMeters() (shown []apitypes.TokenRateLimitDTO, show
 // tone) keeps the legible signal — colour is never the only cue. Clamped to one physical line.
 // The Label is USER-AUTHORED and drawn through renderer.Plain (D7).
 //
-// The Codex meters ride their OWN second strip line (boardCodexRateLimitStrip), NOT this one:
-// a combined line (2 Claude + 2 Codex ≈ 173 cols) clipped the Codex percentages away entirely
-// at 100/80 cols, defeating the point of the feature (PRD #1209 M3). Splitting the providers
-// onto two lines keeps each legible at a standard width. This method's output stays byte-
-// identical to before whenever no Codex account is shown, so the Claude-only render is unmoved.
+// The Codex meters share this header line ADAPTIVELY (PRD 1519 M4): boardMeterLayout combines the
+// Claude and Codex sections onto one line when their combined visual width fits m.width, and falls
+// back to a separate second Codex line when it does not — restoring PRD #1209 M3's legibility floor
+// at 80/100 cols, where a worst-case combined line (2 Claude + 2 Codex ≈ 163 cols) would otherwise
+// be truncated and drop the Codex percentages. This method renders only the Claude section (its
+// output is byte-identical to boardMeterLayout's Claude-only line); the layout, not this method,
+// owns the combined-vs-split decision and the single provider tag placement.
 func (m tuiModel) boardRateLimitStrip(now time.Time) string {
 	segs := m.boardClaudeMeterSegs(now)
 	if len(segs) == 0 {
@@ -98,27 +100,10 @@ func (m tuiModel) boardRateLimitStrip(now time.Time) string {
 	return clampVisual(strip, m.width)
 }
 
-// boardCodexRateLimitStrip is the Codex provider's OWN board strip line, drawn under the Claude
-// strip (or under the wordmark when no Claude token is shown) whenever ≥1 selected readable Codex
-// account exists — mirroring boardRateLimitStrip but for the Codex meters (PRD #1209 M3). Giving
-// Codex its own line is what keeps its bars/percentages reachable at a standard width (≤120 cols):
-// riding the Claude line, the combined strip overran and clampVisual chopped the Codex section off
-// entirely. The board's row math reserves this extra physical line via boardCapacity, exactly as
-// it reserves the Claude strip's row. "" when nothing is selected. Aliases/bucket names ride
-// renderer.Plain (D7), inside boardCodexMeterSeg.
-func (m tuiModel) boardCodexRateLimitStrip(now time.Time) string {
-	codex := m.boardCodexMeterSeg(now)
-	if codex == "" {
-		return ""
-	}
-	// The same leading space as the Claude strip aligns the Codex line under the brand block.
-	return clampVisual(" "+codex, m.width)
-}
-
 // boardClaudeMeterSegs builds the per-token Claude segments of the board strip (the
 // Anthropic 5h/7d meters), one string per shown token, empty when nothing is selected.
-// Split out of boardRateLimitStrip so the Codex section can ride the same line after it
-// without perturbing the Claude bytes.
+// Split out of boardRateLimitStrip so boardMeterLayout can measure and combine them with the
+// Codex accounts section onto one adaptive header line without perturbing the Claude bytes.
 func (m tuiModel) boardClaudeMeterSegs(now time.Time) []string {
 	shown, showLabel := m.selectedRateMeters()
 	if len(shown) == 0 {

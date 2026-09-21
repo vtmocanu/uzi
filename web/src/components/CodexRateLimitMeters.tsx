@@ -19,6 +19,7 @@ import {
   type CodexRateLimitWindow,
 } from "../lib/api";
 import { onSidebarTokensChanged } from "../lib/sidebarTokens";
+import { MICRO_METER_GRID_COLS } from "../lib/rateLimitLayout";
 import { useAsyncData } from "../lib/useAsyncData";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import { formatAgo, formatCountdown, formatResetLabel, useNow, type PaceForecast } from "../lib/rateLimits";
@@ -289,7 +290,7 @@ function CodexMicroRow({
   const countdown = formatCountdown(resetsAt, now);
   const forecast = codexWindowForecast(dim, win, now);
   return (
-    <div className="grid grid-cols-[2.2rem_1fr_2.6rem] items-center gap-2 text-[11px]">
+    <div className={`grid ${MICRO_METER_GRID_COLS} items-center gap-2 text-[11px]`}>
       <span className="truncate font-mono text-faint">{chip}</span>
       <RateLimitForecastMeter
         className="h-[5px]"

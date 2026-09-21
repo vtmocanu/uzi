@@ -5,6 +5,7 @@ import { MemoryRouter } from "react-router-dom";
 import { CodexRateLimitCard, SidebarCodexRateLimits } from "./CodexRateLimitMeters";
 import { emitSidebarTokensChanged } from "../lib/sidebarTokens";
 import { api, type CodexAccountRateLimit, type CodexRateLimitBucket, type CodexRateLimitWindow, type CodexRateLimitStatus, type UserSettings } from "../lib/api";
+import { MICRO_METER_GRID_COLS } from "../lib/rateLimitLayout";
 
 vi.mock("../lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/api")>();
@@ -286,6 +287,25 @@ describe("SidebarCodexRateLimits", () => {
     await waitFor(() => expect(screen.getByText("77%")).toBeTruthy());
     expect(screen.getByText("28%")).toBeTruthy();
     expect(screen.queryByRole("link")).toBeNull();
+  });
+
+  // PRD #1519 M2: CodexMicroRow must use the SAME shared grid-template constant as the
+  // Anthropic MicroRow (RateLimitMeters.test.tsx asserts the same constant on that side),
+  // so the label column is 1.4rem on both and the 1fr meter tracks align. jsdom does no
+  // layout, so this asserts the shared class, not pixel geometry.
+  it("lays each Codex micro-row out on the shared grid-template constant", async () => {
+    mockApi.getMyCodexRateLimits.mockResolvedValue({ accounts: [freshDefault] });
+    mockApi.getMySettings.mockResolvedValue(settings([]));
+    render(
+      <MemoryRouter>
+        <SidebarCodexRateLimits />
+      </MemoryRouter>,
+    );
+    await screen.findByLabelText("Codex rate limits");
+    const row = screen.getByText("5h").parentElement as HTMLElement;
+    expect(row.className).toContain(MICRO_METER_GRID_COLS);
+    // The constant must be the complete arbitrary-value literal (Tailwind content-scan).
+    expect(MICRO_METER_GRID_COLS).toBe("grid-cols-[1.4rem_1fr_2.6rem]");
   });
 
   it("renders nothing when no surfaced account has a reading (pending default)", async () => {

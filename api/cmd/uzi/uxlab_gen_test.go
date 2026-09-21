@@ -307,9 +307,11 @@ func boardPopulated(dark bool, now time.Time) string {
 }
 
 // boardCodex is boardPopulated PLUS the viewer's own Codex meters and Codex sidebar selection, so
-// the board's SECOND provider strip line (boardCodexRateLimitStrip, PRD #1209 M3) renders under
-// the Claude strip and its percentages stay legible at the lab's 100 cols. The single settings
-// message carries BOTH sidebar selections (Claude + Codex) so the two strip lines show together.
+// the board's adaptive header meters render (PRD 1519 M4): boardMeterLayout combines the Claude and
+// Codex meters onto one line when they fit m.width, else falls the Codex meters back to a second
+// line under the Claude strip. At the lab's 100 cols with this configuration (2 Claude + 3 Codex
+// accounts) they take the two-line fallback. The single settings message carries BOTH sidebar
+// selections (Claude + Codex) so both provider sections show.
 func boardCodex(dark bool, now time.Time) string {
 	fake := &uzicli.FakeClient{Runs: boardRuns(now)}
 	m := uxModel(fake, "", dark)
