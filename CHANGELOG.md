@@ -27,6 +27,11 @@ through `[0.52.0]`.)
 - **An admin-only Health tab shows whether uzi can actually run work right now, with an app-wide Danger banner and a per-episode notice ([#1484](https://github.com/vtmocanu/uzi/issues/1484)).**
   A closed registry of 14 checks (worker rolls, queue and capacity, controller liveness, background loops, the database, integrations, housekeeping) rolls up into a verdict on a new Admin → Health tab, a self-hiding Overview card, and a Danger-only app-wide banner with a per-admin 1h snooze; `uzi admin health` (exit 8 on danger, for cron probes) and roll-health columns on `uzi admin workers` give the same view from the CLI, and each admin gets one web-inbox/Slack notice per Danger episode. It never reads the Kubernetes API — every Kubernetes-derived fact still arrives over the existing controller report — and a stale or disabled signal always reads `unknown`, never green.
 
+### Changed
+
+- **A run that reaches its wall-clock time limit now parks instead of failing ([#1497](https://github.com/vtmocanu/uzi/issues/1497)).**
+  At its deadline a run no longer fails with `run exceeded RUN_TIMEOUT`; it parks (`paused`, `hold_reason: budget_exhausted`) on a pushed checkpoint where possible and asks its owner to extend, stop (finalize the finished milestones into a merge request, milestone issue runs only), or cancel it. The park never expires and isn't configurable. Both the Claude and Codex harnesses park the same way, and a worker that cannot cooperate (dead, incapable, or unresponsive) has its run parked server-side instead.
+
 ## [0.84.0] - 2026-09-20
 
 ### Added

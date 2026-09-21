@@ -19,7 +19,7 @@ left to the deadline (e.g. `1h 5m left`).
 |---|---|---|
 | ⚠ looping | The agent has repeated the exact same tool call 4+ times recently — or its updates can't be saved, so it keeps resending them. | Open the run view and check what it's stuck repeating (or whether it's stuck retrying a save); it may need a nudge or a cancel. |
 | ⚠ stalled | No new activity for a while, and nothing is currently running (a long build or test suite in progress does **not** count as stalled). | Open the run view — it's either quietly working on something the flag doesn't see, or genuinely wedged. |
-| ⚠ near timeout | Has used most (default 85%) of its wall-clock budget while running, gate time excluded; it will be stopped at the timeout. | Let it finish if it is on its last milestone, `uzi run scope --through N` / `run stop` to finalize what is committed, or [give it more time](#giving-a-run-more-time) instead. Raising `RUN_TIMEOUT` only helps a run whose budget isn't already frozen — a milestone-scaled run freezes its `budget_wall_seconds` at plan approval, so a later `RUN_TIMEOUT` bump won't extend it. |
+| ⚠ near timeout | Has used most (default 85%) of its wall-clock budget while running, gate time excluded; it will park and wait for you at the timeout, not fail — see [Running out of time](#running-out-of-time). | Let it finish if it is on its last milestone, `uzi run scope --through N` / `run stop` to finalize what is committed, or [give it more time](#giving-a-run-more-time) instead. Raising `RUN_TIMEOUT` only helps a run whose budget isn't already frozen — a milestone-scaled run freezes its `budget_wall_seconds` at plan approval, so a later `RUN_TIMEOUT` bump won't extend it. |
 | ⚠ waiting for worker | Queued longer than expected with no worker claiming it. | The reason names why, if you own the run: no worker online, your vault is locked, or just a wait — start a worker or unlock your vault as needed. A judge or self-improve run instead reads **deprioritized** (yielding to interactive work on purpose, not stuck) or, once it's waited past the grace window, **priority restored** — see [Queue priority](#queue-priority). |
 | ⚠ needs approval | Sitting at `awaiting_approval` longer than expected (never shown for autopilot runs, which approve themselves). | Approve, reject, or request changes to the plan — see [Plan approval gate](./run-activity.md#plan-approval-gate). |
 
@@ -59,6 +59,19 @@ used up its allowance, or an admin has turned extending off entirely, the
 button and the CLI command both stop working — see [Admin
 settings](admin-settings.md#run-health) for that setting.
 
+## Running out of time
+
+If nobody extends it in time, a run's wall-clock deadline doesn't fail it —
+the run parks (`hold_reason: budget_exhausted`) instead and waits for its
+owner, the same non-terminal `paused` status [a requested
+pause](run-pause.md) uses. It is never failed for the clock alone, and the
+park has no expiry — there's no setting that brings back the old
+fail-at-the-timeout behavior. From there: **extend** it (`uzi run extend
+<run-id> --by 2h`, which both adds time and resumes it in one step),
+**stop** it (`uzi run stop <run-id>`, milestone issue runs only —
+finalizes the milestones already done into a merge request), or **cancel**
+it (`uzi run cancel <run-id>`).
+
 ## Queue priority
 
 Interactive runs (issue, ci_fix, anything you start by hand) are claimed
@@ -77,11 +90,13 @@ even after hours.** It isn't stuck — see
 
 ## This is an early-warning aid, not a guardrail
 
-A flag never stops, kills, or requeues a run — `RUN_TIMEOUT` and the
-idle/iteration caps remain the only things that actually end a run, exactly
-as before. Run health exists so you notice a sick run sooner than a hard
-timeout would tell you, nothing more. Treat the badge as a hint to go look,
-not as proof something is wrong (or that nothing is).
+A flag never stops, kills, or requeues a run — the idle and iteration caps
+remain the only things that actually end a run outright; reaching
+`RUN_TIMEOUT` no longer does (see [Running out of
+time](#running-out-of-time) above) — it parks and waits for you instead. Run
+health exists so you notice a sick run sooner than a hard deadline would
+tell you, nothing more. Treat the badge as a hint to go look, not as proof
+something is wrong (or that nothing is).
 
 ## Timing
 

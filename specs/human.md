@@ -414,6 +414,7 @@ Tracked as GitLab issue vtmocanu/uzi#47; PRD at `prds/done/47-loop-hang-detectio
     [AI-proposed; NEEDS USER RATIFICATION]
 - The "slow" health flag is a near-timeout warning at a share of the run's wall-clock budget, not a bare timer. [user, #1170]
 - A run's owner can extend its wall-clock budget from the web or CLI, up to an admin-set allowance; the frozen budget itself never changes. [user, #1189]
+- A run that runs out of time is parked and its owner is asked to extend or stop; it is never failed for the clock alone, the park never expires, and this is not configurable. [user, #1497]
 
 ## Feature #49 — Worker resource stats (live per-worker CPU/memory)
 

@@ -91,6 +91,10 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    is `uzi-watcher`'s job; `limit_wait` / `pool_wait` / `recovery_wait` / `paused` → one
    trail line, keep polling. `failed` / `cancelled` → `uzi-watcher`. `completed` → the PR
    is `uzi run get RUN --field mr_web_url`; trail `pr opened`; re-snapshot.
+   A run that hits its wall-clock time limit lands in the `paused` bucket above with
+   `hold_reason: budget_exhausted` (PRD #1497), never `failed` — do not wait for a
+   `failed` state the clock no longer produces; extend it (`uzi run extend RUN --by
+   2h`) or recover it like any other park.
 2. **Choose the review lane, then wait for readiness.** For a Renovate-class PR, inspect
    the effective diff against the current base and decide whether review is needed. If not,
    state why and use `--reviewer none`; green CI is the independent signal. If review adds
