@@ -928,6 +928,16 @@ describe("the shared root-entry drop wrapper", () => {
     assert.match(entrypoint, /if\s+"\$CHOWN"\s+0:0\s+"\$TOKEN"\s+2>\/dev\/null;\s*then/, "the token reclaim must be guarded (EROFS must not abort under set -eu)");
     // Read-only branch: POSITIVELY verify the exact kube posture uid=0 gid=10001 mode=0440
     // (both busybox mode spellings) AND a real worker-read via setpriv, else fail closed.
+    assert.match(
+      entrypoint,
+      /if\s+\[\s+-e\s+"\$TOKEN"\s+\]\s+\|\|\s+\[\s+-L\s+"\$TOKEN"\s+\]/,
+      "the token outer guard must also accept an existing symlink so a dangling link reaches the fail-closed branch",
+    );
+    assert.match(
+      entrypoint,
+      /"\$BUSYBOX"\s+stat\s+-L\s+-c/,
+      "the read-only posture read must dereference the projected-Secret symlink (stat -L), not lstat it",
+    );
     assert.match(entrypoint, /"0 10001 440"\|"0 10001 0440"/, "must verify the exact kube token posture (uid=0 gid=10001 mode=0440)");
     assert.match(
       entrypoint,

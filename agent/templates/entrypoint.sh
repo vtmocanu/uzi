@@ -500,12 +500,15 @@ done
 # by the dropped worker and unreadable by `runner`/`runner-cmd` (whose --init-groups drops
 # the fsGroup) — the same containment the compose 0400 worker:worker gives.
 TOKEN=/run/secrets/worker_token
-if [ -e "$TOKEN" ]; then
+if [ -e "$TOKEN" ] || [ -L "$TOKEN" ]; then
   if "$CHOWN" 0:0 "$TOKEN" 2>/dev/null; then
     "$CHMOD" 0400 "$TOKEN"
     "$CHOWN" "$WORKER_OWNER" "$TOKEN"
   else
-    token_posture="$("$BUSYBOX" stat -c '%u %g %a' "$TOKEN" 2>/dev/null || true)"
+    # Dereference the projected-Secret symlink chain: `stat -L` reads the TARGET's posture
+    # (0 10001 440), not the atomic-writer symlink's own 0777 lstat. A dangling link or a
+    # stat failure makes the dereference fail -> empty posture -> fail closed below.
+    token_posture="$("$BUSYBOX" stat -L -c '%u %g %a' "$TOKEN" 2>/dev/null || true)"
     case "$token_posture" in
       "0 10001 440"|"0 10001 0440") token_posture_ok=1 ;;
       *) token_posture_ok= ;;
