@@ -3,13 +3,13 @@
 #
 # CodeRabbit names the reset window in two places, and in neither on a bare re-trigger:
 #   1. the walkthrough/status comment it edits in place: a "rate limited by coderabbit.ai"
-#      block reading "Next included review available in N minutes" (free to read);
+#      block reading "Next included review available in N minute(s)" (free to read);
 #   2. its reply to the exact two-word command `@coderabbitai rate limit`: either "More
-#      reviews will be available in N minutes" or "Reviews are available now" (costs one
+#      reviews will be available in N minute(s)" or "Reviews are available now" (costs one
 #      comment; `@coderabbitai ratelimits` and plain-English questions get a non-answer).
 #   A `@coderabbitai review` while limited only replies "Review rate limited" with no time,
 #   and its commit status on the head reads "Review rate limited" with state=success.
-# Every "N minutes" is relative to the comment's own timestamp, so this script converts it
+# Every countdown is relative to the comment's own timestamp, so this script converts it
 # to an absolute reset instant and prints the REMAINING minutes as of now.
 #
 # Usage: cr-rate-limit.sh OWNER/REPO PR [--ask] [--query] [--wait] [--max-wait-min N] [--interval S]
@@ -80,7 +80,7 @@ reset_from_pr() {
   if [ -n "$b" ]; then
     ts=$(printf '%s' "$b" | head -1 | cut -f1)
     n=$(printf '%s' "$b" | awk '/auto-generated comment: rate limited by coderabbit.ai/{f=1} f{print} /end of auto-generated comment: rate limited/{f=0}' \
-        | grep -oE 'available in [0-9]+ minutes' | tail -1 | grep -oE '[0-9]+' || true)
+        | grep -oE 'available in [0-9]+ minutes?' | tail -1 | grep -oE '[0-9]+' || true)
     if [ -n "$n" ] && [ -n "$ts" ] && base=$(iso2epoch "$ts") && [ -n "$base" ]; then
       best_base=$base; best_ts=$(( base + n*60 )); best_src="walkthrough"
     fi
@@ -88,14 +88,14 @@ reset_from_pr() {
   # (2) the newest `rate limit` reply. The statement with the LATER base timestamp wins
   # (its countdown or immediate availability is the fresher figure), not the later reset.
   b=$(printf '%s' "$comments" | jq -r '[.[]|select(.user.login=="coderabbitai[bot]" and
-    ((.body // "")|test("More reviews will be available in [0-9]+ minutes|Reviews are available now")))]
+    ((.body // "")|test("More reviews will be available in [0-9]+ minutes?|Reviews are available now")))]
     |last|select(.!=null)|"\(.created_at)\t\(.body)"' 2>/dev/null)
   if [ -n "$b" ]; then
     ts=$(printf '%s' "$b" | head -1 | cut -f1)
     if printf '%s' "$b" | grep -qF 'Reviews are available now'; then
       n=0
     else
-      n=$(printf '%s' "$b" | grep -oE 'More reviews will be available in [0-9]+ minutes' | tail -1 | grep -oE '[0-9]+' || true)
+      n=$(printf '%s' "$b" | grep -oE 'More reviews will be available in [0-9]+ minutes?' | tail -1 | grep -oE '[0-9]+' || true)
     fi
     if [ -n "$n" ] && [ -n "$ts" ] && base=$(iso2epoch "$ts") && [ -n "$base" ]; then
       if [ -z "$best_base" ] || [ "$base" -ge "$best_base" ]; then
@@ -115,14 +115,14 @@ reset_from_reply_after() {
   printf '%s' "$comments" | jq -e 'type=="array"' >/dev/null 2>&1 || return 1
   b=$(printf '%s' "$comments" | jq -r --arg a "$asked_at" \
     '[.[]|select(.user.login=="coderabbitai[bot]" and .created_at>$a
-                 and ((.body // "")|test("More reviews will be available in [0-9]+ minutes|Reviews are available now")))]
+                 and ((.body // "")|test("More reviews will be available in [0-9]+ minutes?|Reviews are available now")))]
      |last|select(.!=null)|"\(.created_at)\t\(.body)"' 2>/dev/null)
   [ -n "$b" ] || return 0
   ts=$(printf '%s' "$b" | head -1 | cut -f1)
   if printf '%s' "$b" | grep -qF 'Reviews are available now'; then
     n=0
   else
-    n=$(printf '%s' "$b" | grep -oE 'More reviews will be available in [0-9]+ minutes' | tail -1 | grep -oE '[0-9]+' || true)
+    n=$(printf '%s' "$b" | grep -oE 'More reviews will be available in [0-9]+ minutes?' | tail -1 | grep -oE '[0-9]+' || true)
   fi
   if [ -n "$n" ] && [ -n "$ts" ] && base=$(iso2epoch "$ts") && [ -n "$base" ]; then
     printf '%s\treply\n' "$(( base + n*60 ))"

@@ -20,7 +20,7 @@ these; read this when you must hand-roll a check or extend a script.
 
 **Rate limit, the three places the reset appears:** the walkthrough block above (free);
 the reply to the exact two-word `@coderabbitai rate limit` (`More reviews will be available
-in N minutes`, relative to the reply's `created_at`, or `Reviews are available now` for an
+in N minute(s)`, relative to the reply's `created_at`, or `Reviews are available now` for an
 immediate reset); nowhere on a bare `@coderabbitai review` while limited (it replies `Review
 rate limited`, no time). When timing matters, the exact query is authoritative: never infer
 from a review timestamp or nominal hourly rate.

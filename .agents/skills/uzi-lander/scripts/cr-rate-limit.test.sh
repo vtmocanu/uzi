@@ -29,10 +29,16 @@ if [ "${1:-}" = pr ] && [ "${2:-}" = comment ]; then
   done
   printf '%s\n' "$body" >> "$POSTED"
   asked=$(jq -nr 'now|todate')
-  if [ "${AVAILABLE_NOW:-0}" = 1 ]; then
+  if [ "${SINGULAR_MINUTE:-0}" = 1 ]; then
     /bin/sleep 1
     replied=$(jq -nr 'now|todate')
-    reply='Reviews are available now.'
+    reply='<!-- This is an auto-generated reply by CodeRabbit -->
+Your [plan](https://docs.coderabbit.ai/management/plans#fair-usage-limits-policy) includes PR reviews subject to [rate limits](https://docs.coderabbit.ai/management/plans#rate-limits). More reviews will be available in 1 minute.'
+  elif [ "${AVAILABLE_NOW:-0}" = 1 ]; then
+    /bin/sleep 1
+    replied=$(jq -nr 'now|todate')
+    reply='<!-- This is an auto-generated reply by CodeRabbit -->
+Your [plan](https://docs.coderabbit.ai/management/plans#fair-usage-limits-policy) includes PR reviews subject to [rate limits](https://docs.coderabbit.ai/management/plans#rate-limits). Reviews are available now.'
   else
     replied=$(jq -nr 'now+2|todate')
     reply="More reviews will be available in ${RESET_MIN:-12} minutes"
@@ -129,4 +135,17 @@ set -e
 grep -q '^CR_LIMITED=0$' "$WORK/available.out" || fail "available-now reply left stale limited state"
 grep -q '^CR_RESET_ELAPSED=1$' "$WORK/available.out" || fail "available-now reply did not release the query"
 
-echo "PASS cr-rate-limit: exact query, available-now, stale status, reset formatting"
+# CodeRabbit grammatically uses singular "1 minute"; it is the same authoritative countdown.
+MODE="singular"; SINGULAR_MINUTE=1; unset AVAILABLE_NOW; export MODE SINGULAR_MINUTE
+printf '[]\n' > "$COMMENTS"
+rm -f "$POSTED"
+set +e
+bash "$SCRIPT" test/repo 42 --query > "$WORK/singular.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 1 ] || fail "singular-minute reply returned rc=$rc, want 1: $(cat "$WORK/singular.out")"
+grep -q '^CR_LIMITED=1$' "$WORK/singular.out" || fail "singular-minute reply did not keep the active limit"
+grep -q '^CR_RESET_MIN=1$' "$WORK/singular.out" || fail "singular-minute reply did not produce a one-minute reset"
+grep -q '^CR_RESET_SOURCE=reply$' "$WORK/singular.out" || fail "singular-minute reply was not authoritative"
+
+echo "PASS cr-rate-limit: exact query, singular minute, available-now, stale status, reset formatting"
