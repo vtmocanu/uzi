@@ -40,6 +40,7 @@ CHOWN=/bin/chown
 CHMOD=/bin/chmod
 MKDIR=/bin/mkdir
 RM=/bin/rm
+FIND=/usr/bin/find
 
 # --- PRD #58: tolerate a NON-ROOT start ---------------------------------------
 # Started non-root (k8s runAsUser: 10001, PRD #58 single-uid v1)? Then there is no
@@ -432,11 +433,19 @@ fi
 # root deliberately lacks CAP_FOWNER, so it cannot unlink either entry through that parent.
 # Reclaim each existing entry itself with CAP_CHOWN before removing it. `-h` is load-bearing:
 # a planted symlink is re-owned rather than dereferenced, then `rm -rf` unlinks the link itself.
+# A real tree may itself contain sticky directories with runtime-owned files. Reclaim only its
+# directories, then clear their modes to 0700 before removal; this gives root ownership of every
+# deletion parent without chowning files (which could be hardlinks to state outside this scratch
+# tree). find does not follow symlinks by default, and -xdev bounds traversal to one filesystem.
 # These paths hold only disposable per-uid scratch (git/npm/node temp); no resumed-run state
 # lives here (that is under /data/agent-home + the clone), so a boot-time wipe is safe.
 for tmpdir in "$WORKER_TMPDIR" "$RUNNER_TMPDIR"; do
   if [ -e "$tmpdir" ] || [ -L "$tmpdir" ]; then
     "$CHOWN" -h 0:0 "$tmpdir"
+    if [ -d "$tmpdir" ] && [ ! -L "$tmpdir" ]; then
+      "$FIND" "$tmpdir" -xdev -type d -exec "$CHOWN" 0:0 '{}' +
+      "$FIND" "$tmpdir" -xdev -type d -exec "$CHMOD" 0700 '{}' +
+    fi
   fi
 done
 "$RM" -rf "$WORKER_TMPDIR" "$RUNNER_TMPDIR"

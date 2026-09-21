@@ -238,16 +238,21 @@ describe("PRD #1493 M2: root-branch migration ownership map (portable, record-on
         [path.join(sharedTmp, "uzi-runner"), "runner:runner"],
       ] as const;
       // Two-boot equivalent: the prior boot left each persistent entry owned by its runtime uid.
-      // The stub records the root window's required no-dereference reclaim before the reset.
+      // Include attacker-controlled nested sticky content: reclaiming only the top-level entry
+      // is insufficient without CAP_FOWNER because rm cannot unlink another owner inside it.
       for (const [dir] of dirs) fs.mkdirSync(dir, { recursive: true });
+      const nestedSticky = path.join(dirs[1][0], "sticky");
+      fs.mkdirSync(nestedSticky);
+      fs.chmodSync(nestedSticky, 0o1777);
+      fs.writeFileSync(path.join(nestedSticky, "runner-owned"), "scratch");
       const r = run(h, { STUB_NOOP: "1", TMPDIR: sharedTmp });
       assert.equal(r.status, 0, `persistent tmpdir restart must succeed (stderr: ${r.stderr})`);
       for (const [dir, owner] of dirs) {
         const preclaim = r.ops.findIndex((o) => o.startsWith("chown -h 0:0 ") && o.includes(dir));
         const rm = r.ops.findIndex((o) => o.startsWith("rm ") && o.includes(dir));
         const mkdir = r.ops.findIndex((o) => o.startsWith("mkdir ") && o.includes(dir));
-        const reclaim = r.ops.findIndex((o) => o.startsWith("chown 0:0 ") && o.includes(dir));
-        const chmod0700 = r.ops.findIndex((o) => o.startsWith("chmod 0700 ") && o.includes(dir));
+        const reclaim = r.ops.findIndex((o, i) => i > mkdir && o.startsWith("chown 0:0 ") && o.includes(dir));
+        const chmod0700 = r.ops.findIndex((o, i) => i > reclaim && o.startsWith("chmod 0700 ") && o.includes(dir));
         const handover = r.ops.findIndex((o) => o.startsWith(`chown ${owner} `) && o.includes(dir));
         assert.ok(
           preclaim >= 0 && rm >= 0 && mkdir >= 0 && reclaim >= 0 && chmod0700 >= 0 && handover >= 0,
@@ -259,6 +264,11 @@ describe("PRD #1493 M2: root-branch migration ownership map (portable, record-on
         assert.ok(reclaim < chmod0700, `${dir}: chown 0:0 must precede chmod 0700`);
         assert.ok(chmod0700 < handover, `${dir}: chmod 0700 must precede the owner hand-over`);
       }
+      const nestedReclaim = r.ops.findIndex((o) => o.startsWith("chown 0:0 ") && o.includes(nestedSticky));
+      const nestedChmod = r.ops.findIndex((o) => o.startsWith("chmod 0700 ") && o.includes(nestedSticky));
+      const runnerRm = r.ops.findIndex((o) => o.startsWith("rm ") && o.includes(dirs[1][0]));
+      assert.ok(nestedReclaim >= 0 && nestedChmod >= 0, "nested sticky directories must be reclaimed and de-stickied");
+      assert.ok(nestedReclaim < nestedChmod && nestedChmod < runnerRm, "nested directory hardening must precede recursive removal");
     } finally {
       fs.rmSync(h.root, { recursive: true, force: true });
     }
