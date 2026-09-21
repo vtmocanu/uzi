@@ -229,18 +229,23 @@ migrate_tree "$DATA_DIR" "$WORKER_OWNER"
 #     Owning only the ROOTS leaves runner-owned content untouched; a fresh volume's roots
 #     are empty, and an upgrade's stale content was re-owned by migrate_tree /data above.
 RUNNER_TREE_OWNER=worker:runner
+require_real_carveout_root() {
+  if [ -L "$1" ]; then
+    echo "uzi-entrypoint: refusing to start: $1 is a symlink" >&2
+    exit 1
+  fi
+}
 for d in runner agent-home provision; do
   "$MKDIR" -p "$DATA_DIR/$d"
   # SYMLINK-ROOT GUARD (PRD #1493 M2 rework, BLOCKING): a legacy single-uid /data was
   # attacker-writable, so a carve-out ROOT itself may be a planted symlink (e.g.
   # `agent-home -> repos`). `mkdir -p` on an existing symlink-to-dir SUCCEEDS without
-  # replacing the link, so this guard comes AFTER the mkdir to catch the pre-existing link,
-  # and skips it: a legitimate carve-out root is ALWAYS a real dir directly under /data.
-  # Without it the `[ -O ]`+chmod below DEREFERENCES onto the symlink target (chmod follows
-  # symlinks), re-moding e.g. the worker-only repos/ cache to 3775, and the chown re-owns
-  # it — a runner->worker escape. (`[ -L ]` is not the last command in the AND-OR list, so
-  # `set -eu` does not fire when it is false — the same idiom as the descendant guards.)
-  [ -L "$DATA_DIR/$d" ] && continue
+  # replacing the link, so this guard comes AFTER the mkdir to catch the pre-existing link.
+  # Fail closed: skipping it would leave the symlink for the runtime's lexical path joins to
+  # follow after the privilege drop. A legitimate carve-out root is always a real directory
+  # directly under /data. Without this check the chmod/chown below would also dereference the
+  # link and could re-own the worker-only repos/ cache to the runner identity.
+  require_real_carveout_root "$DATA_DIR/$d"
   # 🔴 SC3067 IS A TRUE PORTABILITY STATEMENT AND A FALSE BUG REPORT AGAINST THIS
   # IMAGE, AND IT STOPS BEING FALSE THE MOMENT THE SHEBANG OR THE BASE IMAGE MOVES.
   # This file is `#!/bin/sh` and both worker Dockerfiles ship it on the same
@@ -318,7 +323,7 @@ LEGACY_SENTINEL="$DATA_DIR/.uzi-legacy-split-migrated"
 if [ ! -f "$LEGACY_SENTINEL" ]; then
   echo "uzi-entrypoint: one-time ownership-aware migration of legacy $DATA_DIR [PRD #1493 M2]" >&2
   for d in runner agent-home provision; do
-    [ -L "$DATA_DIR/$d" ] && continue                  # symlinked root: never dereference it (chmod below would follow onto its target, e.g. repos/); see the defense note below
+    require_real_carveout_root "$DATA_DIR/$d"
     if [ -d "$DATA_DIR/$d" ]; then
       "$CHOWN" 0:0 "$DATA_DIR/$d"                       # reclaim (no CAP_FOWNER at runtime)
       "$CHMOD" 3775 "$DATA_DIR/$d"                      # setgid + group-write + STICKY (change 4 / D7)
@@ -336,11 +341,9 @@ if [ ! -f "$LEGACY_SENTINEL" ]; then
   # chown's no-dereference default, so a symlinked ROOT poisons every op keyed on it and a symlinked
   # DESCENDANT poisons its sub-walk. TWO GUARD LAYERS close the whole class:
   #   (a) ROOTS — every place a carve-out root {runner,agent-home,provision} is chmod'd, chown'd or
-  #       used as a glob/mid-path prefix rejects it when it is a symlink: the every-boot (a2) loop
-  #       and the parent-reclaim loop above `[ -L ] && continue`; the `for tree` loop below likewise;
-  #       and the agent-home block below gates on `[ -d ] && [ ! -L ]`. So no chmod dereferences onto
-  #       a symlink target and no glob ever descends through a symlinked root. A legitimate carve-out
-  #       root is ALWAYS a real directory directly under /data.
+  #       used as a glob/mid-path prefix calls require_real_carveout_root first. A symlink aborts
+  #       startup before the sentinel or privilege drop, so no migration op or later runtime path
+  #       can follow it. A legitimate carve-out root is always a real directory directly under /data.
   #   (b) DESCENDANTS — every descendant loop below skips a symlink entry outright (`[ -L ]`) and only
   #       ever descends REAL directories. A legitimate carve-out child / per-run HOME / epoch is
   #       always a real path; a symlink there is never something the migration needs to re-own.
@@ -355,7 +358,7 @@ if [ ! -f "$LEGACY_SENTINEL" ]; then
   # "$DATA_DIR"/runner + /provision: re-own retained content to `runner`, preserving it. Only the
   # PARENT's CHILDREN are re-owned (the parents stay worker:runner, set just above).
   for tree in runner provision; do
-    [ -L "$DATA_DIR/$tree" ] && continue               # symlinked root: never becomes a glob/mid-path prefix (layer (a) above)
+    require_real_carveout_root "$DATA_DIR/$tree"
     if [ -d "$DATA_DIR/$tree" ]; then
       for c in "$DATA_DIR/$tree"/* "$DATA_DIR/$tree"/.[!.]* "$DATA_DIR/$tree"/..?*; do
         [ -e "$c" ] || continue
@@ -365,7 +368,8 @@ if [ ! -f "$LEGACY_SENTINEL" ]; then
     fi
   done
   # "$DATA_DIR"/agent-home: the mixed per-subtree map above.
-  if [ -d "$DATA_DIR/agent-home" ] && [ ! -L "$DATA_DIR/agent-home" ]; then   # symlinked root: never glob through it (layer (a) above)
+  require_real_carveout_root "$DATA_DIR/agent-home"
+  if [ -d "$DATA_DIR/agent-home" ]; then
     for home in "$DATA_DIR"/agent-home/* "$DATA_DIR"/agent-home/.[!.]* "$DATA_DIR"/agent-home/..?*; do
       [ -d "$home" ] || continue
       [ -L "$home" ] && continue                        # a legit per-run HOME is always a REAL dir; skip a planted symlink so it can never become a mid-path prefix
@@ -423,11 +427,18 @@ fi
 # PERSISTENT shared volume on the docker lane (render_dind.go pre-sets it to /data/runner),
 # so an untrusted principal can pre-create uzi-worker/uzi-runner. `mkdir -p` NO-OPS on an
 # existing dir (it keeps that dir's mode AND contents), and a planted SYMLINK at that name
-# would make the chmod/chown below DEREFERENCE onto its target. So RESET each path first:
-# `rm -rf` on a trailing symlink unlinks the LINK itself (never its target) and clears any
-# planted dir + contents. These hold only disposable per-uid scratch (git/npm/node temp);
-# no resumed-run state lives here (that is under /data/agent-home + the clone), so a
-# boot-time wipe is safe on the /tmp writable layer and on the docker-lane PVC alike.
+# would make the chmod/chown below DEREFERENCE onto its target. A persistent docker-lane
+# parent is sticky (3775), and after the first boot these entries are worker/runner-owned;
+# root deliberately lacks CAP_FOWNER, so it cannot unlink either entry through that parent.
+# Reclaim each existing entry itself with CAP_CHOWN before removing it. `-h` is load-bearing:
+# a planted symlink is re-owned rather than dereferenced, then `rm -rf` unlinks the link itself.
+# These paths hold only disposable per-uid scratch (git/npm/node temp); no resumed-run state
+# lives here (that is under /data/agent-home + the clone), so a boot-time wipe is safe.
+for tmpdir in "$WORKER_TMPDIR" "$RUNNER_TMPDIR"; do
+  if [ -e "$tmpdir" ] || [ -L "$tmpdir" ]; then
+    "$CHOWN" -h 0:0 "$tmpdir"
+  fi
+done
 "$RM" -rf "$WORKER_TMPDIR" "$RUNNER_TMPDIR"
 "$MKDIR" -p "$WORKER_TMPDIR" "$RUNNER_TMPDIR"
 # Then RECLAIM to root and re-assert 0700 UNCONDITIONALLY (no `[ -O ]` guard): root reclaims

@@ -226,31 +226,34 @@ describe("PRD #1493 M2: root-branch migration ownership map (portable, record-on
     }
   });
 
-  it("tmpdir: RESETS each per-uid dir (rm) then reclaims -> chmod 0700 -> hand-over (CWE-732)", () => {
+  it("tmpdir: reclaims prior-boot entries before removing them through a sticky parent", () => {
     const h = makeHarness();
     try {
       fs.mkdirSync(h.data);
       fs.mkdirSync(h.nix);
       fs.writeFileSync(h.token, "t");
-      // Compose path (no ambient TMPDIR) => /tmp/uzi-worker + /tmp/uzi-runner. STUB_NOOP so the
-      // recorded rm/mkdir/chown/chmod are never really applied to the live worker's /tmp.
-      const r = run(h, { STUB_NOOP: "1" });
-      assert.equal(r.status, 0, `compose tmpdir run must succeed (stderr: ${r.stderr})`);
-      for (const [dir, owner] of [
-        ["/tmp/uzi-worker", "worker:worker"],
-        ["/tmp/uzi-runner", "runner:runner"],
-      ] as const) {
+      const sharedTmp = path.join(h.root, "shared-tmp");
+      const dirs = [
+        [path.join(sharedTmp, "uzi-worker"), "worker:worker"],
+        [path.join(sharedTmp, "uzi-runner"), "runner:runner"],
+      ] as const;
+      // Two-boot equivalent: the prior boot left each persistent entry owned by its runtime uid.
+      // The stub records the root window's required no-dereference reclaim before the reset.
+      for (const [dir] of dirs) fs.mkdirSync(dir, { recursive: true });
+      const r = run(h, { STUB_NOOP: "1", TMPDIR: sharedTmp });
+      assert.equal(r.status, 0, `persistent tmpdir restart must succeed (stderr: ${r.stderr})`);
+      for (const [dir, owner] of dirs) {
+        const preclaim = r.ops.findIndex((o) => o.startsWith("chown -h 0:0 ") && o.includes(dir));
         const rm = r.ops.findIndex((o) => o.startsWith("rm ") && o.includes(dir));
         const mkdir = r.ops.findIndex((o) => o.startsWith("mkdir ") && o.includes(dir));
         const reclaim = r.ops.findIndex((o) => o.startsWith("chown 0:0 ") && o.includes(dir));
         const chmod0700 = r.ops.findIndex((o) => o.startsWith("chmod 0700 ") && o.includes(dir));
         const handover = r.ops.findIndex((o) => o.startsWith(`chown ${owner} `) && o.includes(dir));
         assert.ok(
-          rm >= 0 && mkdir >= 0 && reclaim >= 0 && chmod0700 >= 0 && handover >= 0,
-          `${dir} needs rm + mkdir + reclaim + chmod 0700 + hand-over (${owner})`,
+          preclaim >= 0 && rm >= 0 && mkdir >= 0 && reclaim >= 0 && chmod0700 >= 0 && handover >= 0,
+          `${dir} needs preclaim + rm + mkdir + reclaim + chmod 0700 + hand-over (${owner})`,
         );
-        // rm BEFORE mkdir (reset a planted dir/symlink before adoption), then reclaim -> chmod ->
-        // hand-over so the UNCONDITIONAL 0700 cannot EPERM on a worker/runner-owned dir.
+        assert.ok(preclaim < rm, `${dir}: no-dereference reclaim must precede sticky-parent removal`);
         assert.ok(rm < mkdir, `${dir}: rm must precede mkdir`);
         assert.ok(mkdir < reclaim, `${dir}: mkdir must precede the root reclaim`);
         assert.ok(reclaim < chmod0700, `${dir}: chown 0:0 must precede chmod 0700`);
@@ -574,7 +577,7 @@ describe("PRD #1493 M2: legacy migration resists a symlink give-away (portable, 
     }
   });
 
-  it("a TOP-LEVEL agent-home -> repos symlink ROOT is rejected: no chmod/chown reaches repos/, real siblings still migrate", () => {
+  it("a TOP-LEVEL agent-home -> repos symlink ROOT fails before migration or runtime launch", () => {
     const h = makeHarness();
     try {
       fs.mkdirSync(h.nix);
@@ -597,7 +600,10 @@ describe("PRD #1493 M2: legacy migration resists a symlink give-away (portable, 
       fs.writeFileSync(h.token, "t");
 
       const r = run(h, { STUB_NOOP: "1" });
-      assert.equal(r.status, 0, `migration run must succeed (stderr: ${r.stderr})`);
+      assert.notEqual(r.status, 0, "a symlinked agent-home root must fail startup");
+      assert.match(r.stderr, /refusing to start: .*agent-home.* is a symlink/, "the refusal names the planted root");
+      assert.ok(!fs.existsSync(path.join(h.data, ".uzi-legacy-split-migrated")), "failed migration must not record its sentinel");
+      assert.equal(r.env.size, 0, "startup must fail before the runtime privilege drop can follow the planted root");
 
       // (a) NO chown -R runner:runner resolves under repos/ (the auditor's demonstrated give-away
       //     `chown -R runner:runner .../repos/mybare/config`).
@@ -611,8 +617,10 @@ describe("PRD #1493 M2: legacy migration resists a symlink give-away (portable, 
         !r.ops.some((o) => (o.startsWith("chown") || o.startsWith("chmod")) && o.includes(`${h.data}/agent-home`)),
         "the symlinked agent-home root must never be a chown/chmod target",
       );
-      // Positive control: a real sibling carve-out's content is still migrated.
-      assert.ok(opMatches(r.ops, CHOWN_R_PREFIX, `${h.data}/provision/cache`), "a real carve-out's content is still migrated");
+      assert.ok(
+        !opMatches(r.ops, CHOWN_R_PREFIX, `${h.data}/provision/cache`),
+        "migration must stop before touching a real sibling after the rejected root",
+      );
 
       // (d) the witness under repos/ is byte-identical with unchanged ownership/ctime.
       const after = fs.statSync(witness);
@@ -625,7 +633,7 @@ describe("PRD #1493 M2: legacy migration resists a symlink give-away (portable, 
     }
   });
 
-  it("a TOP-LEVEL runner -> ../repos symlink ROOT (escaping the data volume) is rejected: no chmod/chown reaches repos/", () => {
+  it("a TOP-LEVEL runner -> ../repos symlink ROOT fails before migration or runtime launch", () => {
     const h = makeHarness();
     try {
       fs.mkdirSync(h.nix);
@@ -650,7 +658,10 @@ describe("PRD #1493 M2: legacy migration resists a symlink give-away (portable, 
       fs.writeFileSync(h.token, "t");
 
       const r = run(h, { STUB_NOOP: "1" });
-      assert.equal(r.status, 0, `migration run must succeed (stderr: ${r.stderr})`);
+      assert.notEqual(r.status, 0, "a symlinked runner root must fail startup");
+      assert.match(r.stderr, /refusing to start: .*runner.* is a symlink/, "the refusal names the planted root");
+      assert.ok(!fs.existsSync(path.join(h.data, ".uzi-legacy-split-migrated")), "failed migration must not record its sentinel");
+      assert.equal(r.env.size, 0, "startup must fail before the runtime privilege drop can follow the planted root");
 
       // The auditor's demonstrated give-away `chown -R runner:runner .../repos/mybare`.
       assert.deepEqual(chownRReaching(r.ops, reposReal), [], "no chown -R may resolve under repos/ via the runner root symlink");
@@ -660,8 +671,10 @@ describe("PRD #1493 M2: legacy migration resists a symlink give-away (portable, 
         !r.ops.some((o) => (o.startsWith("chown") || o.startsWith("chmod")) && o.includes(`${h.data}/runner`)),
         "the symlinked runner root must never be a chown/chmod target",
       );
-      // Positive control: a real per-run HOME beside the symlinked root is still migrated.
-      assert.ok(opMatches(r.ops, CHOWN_R_PREFIX, `${legit}/.claude`), "a real per-run HOME is still migrated");
+      assert.ok(
+        !opMatches(r.ops, CHOWN_R_PREFIX, `${legit}/.claude`),
+        "migration must stop before touching a real sibling after the rejected root",
+      );
 
       const after = fs.statSync(witness);
       assert.equal(fs.readFileSync(witness, "utf8"), witnessBody, "repos witness bytes intact");
