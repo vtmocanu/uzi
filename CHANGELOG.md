@@ -22,16 +22,6 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
-### Added
-
-- **An admin-only Health tab shows whether uzi can actually run work right now, with an app-wide Danger banner and a per-episode notice ([#1484](https://github.com/vtmocanu/uzi/issues/1484)).**
-  A closed registry of 14 checks (worker rolls, queue and capacity, controller liveness, background loops, the database, integrations, housekeeping) rolls up into a verdict on a new Admin → Health tab, a self-hiding Overview card, and a Danger-only app-wide banner with a per-admin 1h snooze; `uzi admin health` (exit 8 on danger, for cron probes) and roll-health columns on `uzi admin workers` give the same view from the CLI, and each admin gets one web-inbox/Slack notice per Danger episode. It never reads the Kubernetes API — every Kubernetes-derived fact still arrives over the existing controller report — and a stale or disabled signal always reads `unknown`, never green.
-
-### Changed
-
-- **A run that reaches its wall-clock time limit now parks instead of failing ([#1497](https://github.com/vtmocanu/uzi/issues/1497)).**
-  At its deadline a run no longer fails with `run exceeded RUN_TIMEOUT`; it parks (`paused`, `hold_reason: budget_exhausted`) on a pushed checkpoint where possible and asks its owner to extend, stop (finalize the finished milestones into a merge request, milestone issue runs only), or cancel it. The park never expires and isn't configurable. Both the Claude and Codex harnesses park the same way, and a worker that cannot cooperate (dead, incapable, or unresponsive) has its run parked server-side instead.
-
 ## [0.84.0] - 2026-09-20
 
 ### Added
@@ -44,6 +34,10 @@ through `[0.52.0]`.)
   `uzi tui` now prompts at startup when a newer stable release is available (update now, postpone, or stop reminding), offers a direct "Update now" path on Homebrew installs, gives security releases extra emphasis, and shows an at-a-glance indicator when the per-user vault is locked.
 - **Merged-run signalling now covers helper runs, with a clearer merged chip ([#1478](https://github.com/vtmocanu/uzi/pull/1478)).**
   MR-state tracking was broadened beyond issue runs to prompt, self-improve, CI-fix, chat, and task runs; a terminal merged or closed MR now cancels its associated rework and stops being watched; and the run's merged chip reads more clearly.
+- **An admin-only Health tab shows whether uzi can actually run work right now, with an app-wide Danger banner and a per-episode notice ([#1484](https://github.com/vtmocanu/uzi/issues/1484), [#1498](https://github.com/vtmocanu/uzi/pull/1498)).**
+  A closed registry of 14 checks (worker rolls, queue and capacity, controller liveness, background loops, the database, integrations, housekeeping) rolls up into a verdict on a new Admin → Health tab, a self-hiding Overview card, and a Danger-only app-wide banner with a per-admin 1h snooze; `uzi admin health` (exit 8 on danger, for cron probes) and roll-health columns on `uzi admin workers` give the same view from the CLI, and each admin gets one web-inbox/Slack notice per Danger episode. It never reads the Kubernetes API; every Kubernetes-derived fact still arrives over the existing controller report, and a stale or disabled signal always reads `unknown`, never green.
+- **Codex can run on hosted k8s workers under an opt-in distinct-UID execution profile ([#1493](https://github.com/vtmocanu/uzi/issues/1493), [#1502](https://github.com/vtmocanu/uzi/pull/1502)).**
+  A new opt-in uid-split worker profile starts the hosted worker pod as root long enough to establish Codex's three-identity separation, with an optional Landlock sandbox, then advertises the Codex capability only when the required isolation checks pass, so a worker that cannot satisfy them keeps queuing other work instead of claiming and failing a Codex run. Off by default; the compose path and existing single-UID k8s path are unchanged.
 
 ### Fixed
 
@@ -53,6 +47,8 @@ through `[0.52.0]`.)
   Two similarly named agents can no longer hide each other's live activity, and the global "now" indicator stays visible for unassigned or distinct same-role agents.
 - **Codex runs start cleanly on non-root hosted (k8s) workers ([#1494](https://github.com/vtmocanu/uzi/pull/1494), [#1496](https://github.com/vtmocanu/uzi/pull/1496)).**
   Per-run home, data, advice, and working directory setup now prepares and revalidates those directories before provisioning, repairing the group a non-root hosted start inherits (including directories the provisioner pre-creates) and using shared worker-lifetime paths, while still refusing tampered or wrongly-owned directories and serializing concurrent recovery.
+- **A failed or cancelled run's early recovery bundle no longer loses source that existed only in the runner's private clone ([#1510](https://github.com/vtmocanu/uzi/pull/1510)).**
+  An early-terminal run could pin a source commit that had not yet reached the trusted bare repository; the recovery bundle build then refused that commit and degraded, and terminal cleanup discarded the only clone holding it, leaving an open custody hold protecting nothing. The commit is now transferred into and verified in the trusted bare before the bundle is produced.
 
 ### Changed
 
@@ -60,6 +56,8 @@ through `[0.52.0]`.)
   Go toolchain 1.27 with golangci-lint v2.13.2 and govulncheck v1.8.0, the go-toolchain and golangci-lint Renovate bumps now grouped with a hardened lint wrapper, and the golang base-image digest refreshed.
 - **Merge and pull-request links work on GitHub and Forgejo, not just GitLab ([#1488](https://github.com/vtmocanu/uzi/pull/1488)).**
   Reconstructed MR/PR web links now pick the forge's own path segment (GitHub `/pull/`, Forgejo `/pulls/`, GitLab `/-/merge_requests/`) instead of always building a GitLab path, so a run's PR chip links correctly on every forge.
+- **A run that reaches its wall-clock time limit now parks instead of failing ([#1497](https://github.com/vtmocanu/uzi/issues/1497), [#1504](https://github.com/vtmocanu/uzi/pull/1504)).**
+  At its deadline a run no longer fails with `run exceeded RUN_TIMEOUT`; it parks (`paused`, `hold_reason: budget_exhausted`) on a pushed checkpoint where possible and asks its owner to extend, stop (finalize the finished milestones into a merge request, milestone issue runs only), or cancel it. The park never expires and is not configurable. Both the Claude and Codex harnesses park the same way, and a worker that cannot cooperate (dead, incapable, or unresponsive) has its run parked server-side instead.
 
 ## [0.83.1] - 2026-09-19
 
