@@ -473,6 +473,29 @@ UPDATE codex_refresh_intent
 SET state = @state, updated_at = now()
 WHERE operation_id = @operation_id AND user_id = @user_id;
 
+-- name: SetCodexRefreshIntentStateFenced :execrows
+-- Fenced survivor intent-state write (issue #1532, race 2): the reconcile pass decides a
+-- terminal state from a snapshot that can be stale (the durable intent is inserted BEFORE the
+-- lease, so the survivor can pick an account up mid-window). Only advance the intent when it is
+-- still 'rotating' AND the account is still at the generation the verdict was computed from AND
+-- the account is NOT a live in-progress lease-holder of THIS intent's op — so a concurrently
+-- committed intent, a generation that advanced under us, or a genuinely live in-flight op is
+-- never overwritten. Owner-scoped; the owning-op writes stay on the unconditional
+-- SetCodexRefreshIntentState. 0 rows means the guard rejected the stale write.
+UPDATE codex_refresh_intent cri
+SET state = @state, updated_at = now()
+WHERE cri.operation_id = @operation_id AND cri.user_id = @user_id
+  AND cri.state = 'rotating'
+  AND EXISTS (
+      SELECT 1 FROM codex_provider_account cpa
+      WHERE cpa.id = cri.provider_account_id AND cpa.user_id = cri.user_id
+        AND cpa.generation = @expected_generation::bigint
+        AND NOT (cpa.coord_state = 'in_progress'
+                 AND cpa.coord_operation_id = cri.operation_id
+                 AND cpa.lease_deadline IS NOT NULL
+                 AND cpa.lease_deadline > @now::timestamptz)
+  );
+
 -- name: ListUnresolvedCodexRefreshIntents :many
 -- The recovery scan (PRD #1147 M2): every still-'rotating' intent for an account, which a
 -- survivor reconciles against the account's actual generation. Owner-scoped; backed by
@@ -484,11 +507,17 @@ WHERE user_id = @user_id AND provider_account_id = @provider_account_id AND stat
 -- The always-on survivor scan's candidate set (issue #1532): every codex_provider_account a
 -- survivor pass must reconcile — an 'in_progress' account whose lease_deadline has passed (the
 -- wedge), OR any account carrying a still-'rotating' refresh intent that is NOT the live,
--- non-expired lease-holder (an orphaned intent from a crashed op). Each (id, user_id) is fed
--- one-by-one to ReconcileUnresolvedCodexRefresh, the per-account reap→quarantine→resolve state
--- machine. NOT owner-scoped at the account level: this is a service-owned global sweep, not a
--- user request. The correlated intent subquery IS owner-scoped so it rides the
--- (user_id, provider_account_id) leading key of idx_codex_refresh_intent_unresolved.
+-- non-expired lease-holder (an orphaned intent from a crashed op), OR any quarantined account
+-- still holding un-promoted recovery material at the current generation (issue #1532, race 1):
+-- a promotion that DEFERRED transiently (vault locked, incomplete/absent identity, nil seam, or
+-- a transient discovery error) drove its intents terminal and so is no longer surfaced by the
+-- rotating-intent arm — this arm re-lists it every tick until promotion succeeds (advances the
+-- generation and clears the slot → no longer matches) or a verified mismatch clears the slot.
+-- The arm mirrors ReconcileUnresolvedCodexRefresh's promotion precondition exactly. Each
+-- (id, user_id) is fed one-by-one to ReconcileUnresolvedCodexRefresh, the per-account
+-- reap→quarantine→resolve state machine. NOT owner-scoped at the account level: this is a
+-- service-owned global sweep, not a user request. The correlated intent subquery IS owner-scoped
+-- so it rides the (user_id, provider_account_id) leading key of idx_codex_refresh_intent_unresolved.
 SELECT cpa.id, cpa.user_id
 FROM codex_provider_account cpa
 WHERE (cpa.coord_state = 'in_progress' AND cpa.lease_deadline < @now::timestamptz)
@@ -502,4 +531,39 @@ WHERE (cpa.coord_state = 'in_progress' AND cpa.lease_deadline < @now::timestampt
         AND NOT (cpa.coord_state = 'in_progress'
                  AND cpa.lease_deadline IS NOT NULL
                  AND cpa.lease_deadline >= @now::timestamptz)
-   );
+   )
+   OR (cpa.coord_state = 'quarantined'
+       AND cpa.recovery_sealed IS NOT NULL
+       AND cpa.recovery_generation = cpa.generation);
+
+-- name: ClearMismatchedCodexRecoverySlot :execrows
+-- Clear a VERIFIED-MISMATCH recovery slot (issue #1532, race 1): the promotion path proved (via
+-- a full-network DiscoverIdentity) that the protected material belongs to a DIFFERENT account,
+-- so it is safe to drop — and dropping it is what makes the always-on retry TERMINATE, because
+-- ListUnresolvedCodexRefreshAccounts's arm (c) stops selecting an account once its recovery slot
+-- is empty. The generation-CAS (recovery_generation = @from_generation) makes this a no-op if a
+-- concurrent re-link/promotion already advanced the account under us (the slot moved), so a
+-- verified mismatch never clobbers freshly-promoted material. Owner-scoped; the (recovery_sealed,
+-- recovery_generation, recovery_sealed_with) triple is cleared together so 00199's
+-- (recovery_sealed IS NULL) = (recovery_sealed_with IS NULL) CHECK stays satisfied. 0 rows means
+-- the account moved under the caller — do NOT then touch its intents.
+UPDATE codex_provider_account
+SET recovery_sealed = NULL, recovery_generation = NULL, recovery_sealed_with = NULL, updated_at = now()
+WHERE id = @id AND user_id = @user_id
+  AND coord_state = 'quarantined'
+  AND recovery_generation = @from_generation::bigint;
+
+-- name: MarkCodexRecoveryMismatchIntents :execrows
+-- Mark the recovery-mismatch intents unrecoverable (issue #1532, race 1): the cross-pass-safe
+-- replacement for the in-memory intents-slice loop the old promoteCodexRecovery ran. It targets
+-- exactly the intents the reconcile main loop OPTIMISTICALLY reconciled off the (now-untrusted)
+-- recovery copy — those still 'reconciled' at from_generation == the recovery generation — and
+-- flips them to 'unrecoverable', which is durable across passes rather than confined to one
+-- reconcile's local slice. An intent reconciled because the account's generation independently
+-- ADVANCED past its from_generation is at a LOWER from_generation and is excluded automatically
+-- (this path runs only with recovery_generation == generation). Owner-scoped.
+UPDATE codex_refresh_intent
+SET state = 'unrecoverable', updated_at = now()
+WHERE user_id = @user_id AND provider_account_id = @provider_account_id
+  AND from_generation = @recovery_generation::bigint
+  AND state = 'reconciled';

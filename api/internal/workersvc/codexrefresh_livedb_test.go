@@ -49,6 +49,20 @@ type fakeRefreshClient struct {
 	freshClaims     codexauth.FreshAccessTokenIdentityClaims
 	freshClaimsSet  bool
 	onRefresh       func() // fires inside Refresh, after counting (audit #3b hook)
+
+	// Recovery-promotion transient-then-success control (issue #1532, race 1). Opt-in and
+	// token-specific (NOT a global counter) so it is robust against the shared LiveDB: the
+	// FIRST DiscoverIdentity for discoverTransientTok returns discoverTransientErr (a
+	// deferral), and every later call for it falls through to the normal identity answer.
+	discoverTransientTok  string
+	discoverTransientErr  error
+	discoverTransientDone bool
+	// discoverDefaultErr, when set, is the answer for any token NOT in identityByToken /
+	// errByToken (superseding matchIdentity). A test that must reconcile ONLY its own
+	// account under a global survivor sweep sets it to codexauth.ErrIdentityIncomplete so
+	// every OTHER user's leftover recovery blob DEFERS (is neither promoted nor mismatch-
+	// cleared), leaving the sweep's recovered count attributable to this test alone.
+	discoverDefaultErr error
 }
 
 func (f *fakeRefreshClient) Refresh(_ context.Context, refreshToken string) (codexauth.RefreshResult, error) {
@@ -71,11 +85,18 @@ func (f *fakeRefreshClient) Refresh(_ context.Context, refreshToken string) (cod
 
 func (f *fakeRefreshClient) DiscoverIdentity(_ context.Context, accessToken string) (codexauth.Identity, error) {
 	f.discoverCalls++
+	if f.discoverTransientTok != "" && accessToken == f.discoverTransientTok && !f.discoverTransientDone {
+		f.discoverTransientDone = true
+		return codexauth.Identity{}, f.discoverTransientErr
+	}
 	if err, ok := f.errByToken[accessToken]; ok {
 		return codexauth.Identity{}, err
 	}
 	if id, ok := f.identityByToken[accessToken]; ok {
 		return id, nil
+	}
+	if f.discoverDefaultErr != nil {
+		return codexauth.Identity{}, f.discoverDefaultErr
 	}
 	return f.matchIdentity, nil
 }

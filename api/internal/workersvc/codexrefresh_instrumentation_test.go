@@ -135,8 +135,10 @@ func (f *instrFakeRefresh) DiscoverIdentity(_ context.Context, _ string) (codexa
 	return f.identity, nil
 }
 
-// instrFakeStore implements all 12 codexRefreshStore methods. Only the 5 reached on the
-// advanced happy path return success; the other 7 are unreachable here and panic if hit.
+// instrFakeStore implements all codexRefreshStore methods. Only the 5 reached on the advanced
+// happy path return success; the recovery/reconcile-only writes (issue #1532's fenced +
+// mismatch queries) are unreached here and return (0, nil); the 7 read/quarantine methods are
+// unreachable here and panic if hit.
 type instrFakeStore struct{}
 
 func (instrFakeStore) InsertCodexRefreshIntent(context.Context, store.InsertCodexRefreshIntentParams) (store.CodexRefreshIntent, error) {
@@ -153,6 +155,18 @@ func (instrFakeStore) CommitCodexRefresh(context.Context, store.CommitCodexRefre
 
 func (instrFakeStore) SetCodexRefreshIntentState(context.Context, store.SetCodexRefreshIntentStateParams) (int64, error) {
 	return int64(1), nil
+}
+
+func (instrFakeStore) SetCodexRefreshIntentStateFenced(context.Context, store.SetCodexRefreshIntentStateFencedParams) (int64, error) {
+	return int64(0), nil
+}
+
+func (instrFakeStore) ClearMismatchedCodexRecoverySlot(context.Context, store.ClearMismatchedCodexRecoverySlotParams) (int64, error) {
+	return int64(0), nil
+}
+
+func (instrFakeStore) MarkCodexRecoveryMismatchIntents(context.Context, store.MarkCodexRecoveryMismatchIntentsParams) (int64, error) {
+	return int64(0), nil
 }
 
 func (instrFakeStore) ResetCodexCoordIdle(context.Context, store.ResetCodexCoordIdleParams) (int64, error) {

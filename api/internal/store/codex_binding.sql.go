@@ -60,6 +60,38 @@ func (q *Queries) AcquireCodexRefreshLease(ctx context.Context, arg AcquireCodex
 	return result.RowsAffected(), nil
 }
 
+const clearMismatchedCodexRecoverySlot = `-- name: ClearMismatchedCodexRecoverySlot :execrows
+UPDATE codex_provider_account
+SET recovery_sealed = NULL, recovery_generation = NULL, recovery_sealed_with = NULL, updated_at = now()
+WHERE id = $1 AND user_id = $2
+  AND coord_state = 'quarantined'
+  AND recovery_generation = $3::bigint
+`
+
+type ClearMismatchedCodexRecoverySlotParams struct {
+	ID             uuid.UUID `json:"id"`
+	UserID         uuid.UUID `json:"user_id"`
+	FromGeneration int64     `json:"from_generation"`
+}
+
+// Clear a VERIFIED-MISMATCH recovery slot (issue #1532, race 1): the promotion path proved (via
+// a full-network DiscoverIdentity) that the protected material belongs to a DIFFERENT account,
+// so it is safe to drop — and dropping it is what makes the always-on retry TERMINATE, because
+// ListUnresolvedCodexRefreshAccounts's arm (c) stops selecting an account once its recovery slot
+// is empty. The generation-CAS (recovery_generation = @from_generation) makes this a no-op if a
+// concurrent re-link/promotion already advanced the account under us (the slot moved), so a
+// verified mismatch never clobbers freshly-promoted material. Owner-scoped; the (recovery_sealed,
+// recovery_generation, recovery_sealed_with) triple is cleared together so 00199's
+// (recovery_sealed IS NULL) = (recovery_sealed_with IS NULL) CHECK stays satisfied. 0 rows means
+// the account moved under the caller — do NOT then touch its intents.
+func (q *Queries) ClearMismatchedCodexRecoverySlot(ctx context.Context, arg ClearMismatchedCodexRecoverySlotParams) (int64, error) {
+	result, err := q.db.Exec(ctx, clearMismatchedCodexRecoverySlot, arg.ID, arg.UserID, arg.FromGeneration)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const commitCodexRefresh = `-- name: CommitCodexRefresh :one
 UPDATE codex_provider_account
 SET generation           = generation + 1,
@@ -411,6 +443,9 @@ WHERE (cpa.coord_state = 'in_progress' AND cpa.lease_deadline < $1::timestamptz)
                  AND cpa.lease_deadline IS NOT NULL
                  AND cpa.lease_deadline >= $1::timestamptz)
    )
+   OR (cpa.coord_state = 'quarantined'
+       AND cpa.recovery_sealed IS NOT NULL
+       AND cpa.recovery_generation = cpa.generation)
 `
 
 type ListUnresolvedCodexRefreshAccountsRow struct {
@@ -421,11 +456,17 @@ type ListUnresolvedCodexRefreshAccountsRow struct {
 // The always-on survivor scan's candidate set (issue #1532): every codex_provider_account a
 // survivor pass must reconcile — an 'in_progress' account whose lease_deadline has passed (the
 // wedge), OR any account carrying a still-'rotating' refresh intent that is NOT the live,
-// non-expired lease-holder (an orphaned intent from a crashed op). Each (id, user_id) is fed
-// one-by-one to ReconcileUnresolvedCodexRefresh, the per-account reap→quarantine→resolve state
-// machine. NOT owner-scoped at the account level: this is a service-owned global sweep, not a
-// user request. The correlated intent subquery IS owner-scoped so it rides the
-// (user_id, provider_account_id) leading key of idx_codex_refresh_intent_unresolved.
+// non-expired lease-holder (an orphaned intent from a crashed op), OR any quarantined account
+// still holding un-promoted recovery material at the current generation (issue #1532, race 1):
+// a promotion that DEFERRED transiently (vault locked, incomplete/absent identity, nil seam, or
+// a transient discovery error) drove its intents terminal and so is no longer surfaced by the
+// rotating-intent arm — this arm re-lists it every tick until promotion succeeds (advances the
+// generation and clears the slot → no longer matches) or a verified mismatch clears the slot.
+// The arm mirrors ReconcileUnresolvedCodexRefresh's promotion precondition exactly. Each
+// (id, user_id) is fed one-by-one to ReconcileUnresolvedCodexRefresh, the per-account
+// reap→quarantine→resolve state machine. NOT owner-scoped at the account level: this is a
+// service-owned global sweep, not a user request. The correlated intent subquery IS owner-scoped
+// so it rides the (user_id, provider_account_id) leading key of idx_codex_refresh_intent_unresolved.
 func (q *Queries) ListUnresolvedCodexRefreshAccounts(ctx context.Context, now pgtype.Timestamptz) ([]ListUnresolvedCodexRefreshAccountsRow, error) {
 	rows, err := q.db.Query(ctx, listUnresolvedCodexRefreshAccounts, now)
 	if err != nil {
@@ -528,6 +569,36 @@ func (q *Queries) MarkCodexReauthRequired(ctx context.Context, arg MarkCodexReau
 		arg.ID,
 		arg.UserID,
 	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const markCodexRecoveryMismatchIntents = `-- name: MarkCodexRecoveryMismatchIntents :execrows
+UPDATE codex_refresh_intent
+SET state = 'unrecoverable', updated_at = now()
+WHERE user_id = $1 AND provider_account_id = $2
+  AND from_generation = $3::bigint
+  AND state = 'reconciled'
+`
+
+type MarkCodexRecoveryMismatchIntentsParams struct {
+	UserID             uuid.UUID `json:"user_id"`
+	ProviderAccountID  uuid.UUID `json:"provider_account_id"`
+	RecoveryGeneration int64     `json:"recovery_generation"`
+}
+
+// Mark the recovery-mismatch intents unrecoverable (issue #1532, race 1): the cross-pass-safe
+// replacement for the in-memory intents-slice loop the old promoteCodexRecovery ran. It targets
+// exactly the intents the reconcile main loop OPTIMISTICALLY reconciled off the (now-untrusted)
+// recovery copy — those still 'reconciled' at from_generation == the recovery generation — and
+// flips them to 'unrecoverable', which is durable across passes rather than confined to one
+// reconcile's local slice. An intent reconciled because the account's generation independently
+// ADVANCED past its from_generation is at a LOWER from_generation and is excluded automatically
+// (this path runs only with recovery_generation == generation). Owner-scoped.
+func (q *Queries) MarkCodexRecoveryMismatchIntents(ctx context.Context, arg MarkCodexRecoveryMismatchIntentsParams) (int64, error) {
+	result, err := q.db.Exec(ctx, markCodexRecoveryMismatchIntents, arg.UserID, arg.ProviderAccountID, arg.RecoveryGeneration)
 	if err != nil {
 		return 0, err
 	}
@@ -840,6 +911,52 @@ type SetCodexRefreshIntentStateParams struct {
 // for a foreign or missing operation.
 func (q *Queries) SetCodexRefreshIntentState(ctx context.Context, arg SetCodexRefreshIntentStateParams) (int64, error) {
 	result, err := q.db.Exec(ctx, setCodexRefreshIntentState, arg.State, arg.OperationID, arg.UserID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const setCodexRefreshIntentStateFenced = `-- name: SetCodexRefreshIntentStateFenced :execrows
+UPDATE codex_refresh_intent cri
+SET state = $1, updated_at = now()
+WHERE cri.operation_id = $2 AND cri.user_id = $3
+  AND cri.state = 'rotating'
+  AND EXISTS (
+      SELECT 1 FROM codex_provider_account cpa
+      WHERE cpa.id = cri.provider_account_id AND cpa.user_id = cri.user_id
+        AND cpa.generation = $4::bigint
+        AND NOT (cpa.coord_state = 'in_progress'
+                 AND cpa.coord_operation_id = cri.operation_id
+                 AND cpa.lease_deadline IS NOT NULL
+                 AND cpa.lease_deadline > $5::timestamptz)
+  )
+`
+
+type SetCodexRefreshIntentStateFencedParams struct {
+	State              string             `json:"state"`
+	OperationID        uuid.UUID          `json:"operation_id"`
+	UserID             uuid.UUID          `json:"user_id"`
+	ExpectedGeneration int64              `json:"expected_generation"`
+	Now                pgtype.Timestamptz `json:"now"`
+}
+
+// Fenced survivor intent-state write (issue #1532, race 2): the reconcile pass decides a
+// terminal state from a snapshot that can be stale (the durable intent is inserted BEFORE the
+// lease, so the survivor can pick an account up mid-window). Only advance the intent when it is
+// still 'rotating' AND the account is still at the generation the verdict was computed from AND
+// the account is NOT a live in-progress lease-holder of THIS intent's op — so a concurrently
+// committed intent, a generation that advanced under us, or a genuinely live in-flight op is
+// never overwritten. Owner-scoped; the owning-op writes stay on the unconditional
+// SetCodexRefreshIntentState. 0 rows means the guard rejected the stale write.
+func (q *Queries) SetCodexRefreshIntentStateFenced(ctx context.Context, arg SetCodexRefreshIntentStateFencedParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setCodexRefreshIntentStateFenced,
+		arg.State,
+		arg.OperationID,
+		arg.UserID,
+		arg.ExpectedGeneration,
+		arg.Now,
+	)
 	if err != nil {
 		return 0, err
 	}
