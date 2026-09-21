@@ -163,28 +163,27 @@ func (q *Queries) ListRunPipelineStatusesForRepo(ctx context.Context, repoID uui
 }
 
 const listWatchedRunRefsForRepo = `-- name: ListWatchedRunRefsForRepo :many
-WITH per_branch AS (
+WITH latest_per_branch AS (
     SELECT DISTINCT ON (r.branch)
-           r.branch, r.mr_iid, r.created_at
+           r.branch, r.mr_iid, r.mr_state, r.status, r.finished_at, r.created_at
     FROM runs r
-    WHERE r.repo_id = $2::uuid
+    WHERE r.repo_id = $3::uuid
       AND r.branch IS NOT NULL AND r.branch <> ''
-      AND (
-        r.status NOT IN ('completed', 'failed', 'cancelled')
-        OR (r.mr_iid IS NOT NULL AND r.finished_at IS NOT NULL AND r.finished_at > $3)
-      )
-    ORDER BY r.branch, r.created_at DESC
+    ORDER BY r.branch, r.created_at DESC, r.id DESC
 )
 SELECT branch, mr_iid
-FROM per_branch
+FROM latest_per_branch
+WHERE status NOT IN ('completed', 'failed', 'cancelled')
+   OR (mr_iid IS NOT NULL AND finished_at IS NOT NULL AND finished_at > $1
+       AND mr_state IS DISTINCT FROM 'merged' AND mr_state IS DISTINCT FROM 'closed')
 ORDER BY created_at DESC
-LIMIT $1
+LIMIT $2
 `
 
 type ListWatchedRunRefsForRepoParams struct {
+	FinishedAfter pgtype.Timestamptz `json:"finished_after"`
 	MaxRefs       int32              `json:"max_refs"`
 	RepoID        uuid.UUID          `json:"repo_id"`
-	FinishedAfter pgtype.Timestamptz `json:"finished_after"`
 }
 
 type ListWatchedRunRefsForRepoRow struct {
@@ -192,16 +191,28 @@ type ListWatchedRunRefsForRepoRow struct {
 	MrIid  pgtype.Int8 `json:"mr_iid"`
 }
 
-// Watched run branches for a repo's pipeline sync (PRD #6): each distinct run
-// branch and the MR iid of its most-recent run, for runs that are either
-// non-terminal, or terminal-with-an-MR and finished within the watch window
-// (@finished_after = now() - CI_WATCH_RUN_WINDOW, computed caller-side). DISTINCT
-// ON collapses a branch's several runs to the newest; the outer ORDER BY + LIMIT
-// keeps the newest @max_refs branches (hitting the cap is logged caller-side).
-// A run has no branch until the worker creates its worktree, so blank branches
-// are excluded.
+// Watched run branches for a repo's pipeline sync (PRD #6), selected in TWO steps.
+// First collapse each branch to its NEWEST run (DISTINCT ON (branch), created_at
+// DESC); THEN keep the branch iff that newest run is either non-terminal, OR
+// terminal-with-an-MR finished inside the watch window (@finished_after = now() -
+// CI_WATCH_RUN_WINDOW, computed caller-side) whose MR has NOT reached a terminal
+// state (mr_state IS DISTINCT FROM 'merged'/'closed'; NULL/'opened'/'locked' stay
+// eligible). The merged/closed exclusion sits INSIDE the terminal arm on purpose,
+// so a non-terminal newest run stays watched no matter what mr_state was cached.
+// Newest-run-FIRST (not filter-then-collapse) is load-bearing because mr_state is
+// PER-RUN, and IN THE ISSUE LANE it is recorded only on the newest run per issue
+// (ListMRWatchCandidates, DISTINCT ON (issue_iid)) — so on a REUSED branch (a re-run
+// of the same issue) the newest run can be 'merged' while an older run on the same
+// branch keeps a stale 'opened'/NULL. Filtering before the collapse would drop the
+// merged newest row and resurface that stale older run; collapsing first excludes
+// the branch correctly. (The board-free lane, SyncBoardFreeMRStates, records
+// mr_state per-run on issue-LESS runs, so this is not "newest run per issue"
+// unqualified.) A run has no branch until the worker creates its worktree, so blank
+// branches are excluded; the row returns the newest run's mr_iid, and the outer
+// ORDER BY + LIMIT keeps the newest @max_refs branches (hitting the cap is logged
+// caller-side).
 func (q *Queries) ListWatchedRunRefsForRepo(ctx context.Context, arg ListWatchedRunRefsForRepoParams) ([]ListWatchedRunRefsForRepoRow, error) {
-	rows, err := q.db.Query(ctx, listWatchedRunRefsForRepo, arg.MaxRefs, arg.RepoID, arg.FinishedAfter)
+	rows, err := q.db.Query(ctx, listWatchedRunRefsForRepo, arg.FinishedAfter, arg.MaxRefs, arg.RepoID)
 	if err != nil {
 		return nil, err
 	}
