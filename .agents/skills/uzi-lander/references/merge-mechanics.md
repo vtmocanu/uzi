@@ -66,13 +66,15 @@ HTML-comment marker on the line. **Never push non-doc code to `main`.**
 
 ## Post-merge CI, and fixing failures
 
-Poll every run for the merge SHA with **`scripts/watch-run-ci.sh --sha <merge-sha>`**,
-launched with `run_in_background` (job-level: it exits on the first confirmed failing job
-rather than waiting for the whole run; the same reaping reason as `watch-run.sh`; do not
-re-author a heredoc per merge, which is how a path typo crept in on 2026-08-23):
+Poll every run for the merge SHA with **`scripts/watch-run-ci.sh --sha "$MERGE_SHA"`**,
+launched with `run_in_background`. `MERGE_SHA` is the exact full SHA emitted by `merge.sh`;
+never type or hand-complete a prefix. The watcher resolves it through GitHub before polling
+and exits 3 when it is invalid or unknown. It exits on the first confirmed failing job rather
+than waiting for the whole run (the same reaping reason as `watch-run.sh`; do not re-author a
+heredoc per merge, which is how a path typo crept in on 2026-08-23):
 
 ```
-<this skill's directory>/scripts/watch-run-ci.sh --sha <merge-sha> --interval 60
+<this skill's directory>/scripts/watch-run-ci.sh --sha "$MERGE_SHA" --interval 60
 ```
 
 It exits **0** when every run that exists for the SHA is green, **1** on a real red
