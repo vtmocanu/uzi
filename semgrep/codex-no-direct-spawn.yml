@@ -11,7 +11,7 @@
 # Imports are matched as well as calls because a child_process binding can be assigned to an
 # arbitrary local callee. Semgrep matches destructured imports by subset, so the exact
 # sanctioned import exception also suppresses a superset with extra named bindings. The third
-# rule rejects every dangerous extra binding, aliased or unaliased, in codex-capability.ts.
+# rule rejects every extra named binding, aliased or unaliased, in codex-capability.ts.
 # Other files need no companion: their general rule flags every child_process import directly.
 #
 # RELIABILITY BOUNDARY. This is a syntactic, file-glob-scoped gate. It cannot trace a spawn
@@ -100,30 +100,20 @@ rules:
       - pattern-not: 'spawn(bin, ["--probe"])'
 
   # Semgrep's destructured-import match is subset-based. The sanctioned import exception
-  # above therefore also suppresses a superset. Catch every extra dangerous binding at the
-  # import, before an assignment can hide its callee behind an arbitrary local name.
-  - id: codex-capability-no-extra-child-process-bindings
+  # above therefore also suppresses any superset, including APIs not in the direct-call list
+  # (for example ChildProcess). Match the source text instead: the ONE exact static import is
+  # allowed, and every other named child_process import is rejected generically before an
+  # assignment can hide its callee behind an arbitrary local name.
+  - id: codex-capability-exact-child-process-import
     languages: [typescript]
     severity: ERROR
     message: >-
-      codex-capability.ts permits only its sanctioned spawnSync binding and type.
-      An extra child_process binding can hide a raw callee behind an arbitrary local
-      name and widen the trusted startup seam.
+      codex-capability.ts permits exactly one child_process import: spawnSync plus the
+      type-only SpawnSyncReturns. Any extra value or type binding widens the trusted
+      startup seam.
     paths:
       include:
         - /agent/src/codex/codex-capability.ts
-    pattern-either:
-      - pattern: import { ..., spawn, ... } from "node:child_process"
-      - pattern: import { ..., exec, ... } from "node:child_process"
-      - pattern: import { ..., execSync, ... } from "node:child_process"
-      - pattern: import { ..., execFile, ... } from "node:child_process"
-      - pattern: import { ..., execFileSync, ... } from "node:child_process"
-      - pattern: import { ..., fork, ... } from "node:child_process"
-      - pattern: import { ..., spawn, ... } from "child_process"
-      - pattern: import { ..., exec, ... } from "child_process"
-      - pattern: import { ..., execSync, ... } from "child_process"
-      - pattern: import { ..., execFile, ... } from "child_process"
-      - pattern: import { ..., execFileSync, ... } from "child_process"
-      - pattern: import { ..., fork, ... } from "child_process"
-      - pattern: import { ..., $X as $Y, ... } from "node:child_process"
-      - pattern: import { ..., $X as $Y, ... } from "child_process"
+    patterns:
+      - pattern-regex: '(?ms)^[ \t]*import[ \t]*\{[^}]+\}[ \t\r\n]*from[ \t\r\n]*["''](?:node:)?child_process["''][ \t]*;?[ \t]*$'
+      - pattern-not-regex: '(?ms)^[ \t]*import[ \t]*\{[ \t\r\n]*spawnSync[ \t\r\n]*,[ \t\r\n]*type[ \t]+SpawnSyncReturns[ \t\r\n]*\}[ \t\r\n]*from[ \t\r\n]*["'']node:child_process["''][ \t]*;?[ \t]*$'
