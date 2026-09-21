@@ -158,6 +158,88 @@ describe("Worker outbox drainer (PRD #1391 M2)", () => {
     assert.ok(rearmed >= 1, "a retired run re-arms its batcher exactly through the shared registry hook");
   });
 
+  it("re-resolves a run's pending terminal once its segments retire (finish-during-outage lands with no restart)", async () => {
+    // PRD #1391 Run B regression: a run that FINISHED during an outage journals its terminal and
+    // loses its first send. On recovery the terminal-resolve can reach the api BEFORE this run's own
+    // message drain completes, get messages_pending, and DEFER via the N3 guard (gapFillLoop leaves
+    // the journal "for a later resolve after the drain"). Boot ran long before the run and there is
+    // no re-claim, so ONLY the drainer's retire can re-fire that resolve. Without it the terminal
+    // strands non-terminal until a restart. This asserts the drainer re-resolves at the retire point.
+    //
+    // Determinism: drainRun BLOCKS on a gate so no retire happens until the test releases it. While
+    // blocked, `retired` is false, so listPendingTerminals is empty and the boot resolve
+    // (resolveBootTerminals, awaited in run()) provably no-ops — it cannot be the source of the
+    // resolve. The single-flight guard holds the heartbeat drains off while the one boot drain blocks.
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let retired = false;
+    const reports: string[] = [];
+    let r1Resolved = false;
+    let retiredTerminal = 0;
+    const outbox = {
+      uncleanRuns: () => [],
+      isDisabled: () => false,
+      // Empty until the drain retires the segments — mirroring a terminal journaled AFTER boot and
+      // only re-resolvable once the N3 undrained-messages guard would let it through.
+      listPendingTerminals: () => (retired ? [{ run_id: "r1", claim_generation: 5 }] : []),
+      runsWithPending: () => (retired ? [] : ["r1"]),
+      depthFor: (id: string) => depth(id),
+      drainRun: async () => {
+        await gate; // hold the ONE (boot) drain open so boot-resolve sees an empty pending list
+        retired = true;
+        return { retired: true, staleRetired: 0 };
+      },
+      readTerminalJournal: async (_id: string, gen: number) => ({
+        blocked: false,
+        body: { status: "completed" },
+        messagesThroughSeq: 0,
+        claim_generation: gen,
+      }),
+      retireTerminal: async () => {
+        retiredTerminal += 1;
+      },
+    } as unknown as Outbox;
+
+    const client = {
+      ...idleClient(),
+      hasFeature: () => false, // no terminal_fence → the send carries no messages_through_seq
+      reportState: async (runId: string) => {
+        reports.push(runId);
+        if (runId === "r1") r1Resolved = true;
+        return { applied: true, status: "completed" };
+      },
+    } as unknown as WorkerClient;
+
+    const controller = new AbortController();
+    const worker = new Worker(
+      fakeConfig({ gapFillMax: 1000, outboxTerminalMaxBytes: 1 << 20 } as unknown as Partial<Config>),
+      client,
+      idleRunner,
+      idleChat,
+      noJudge,
+      noReview,
+      nullLogger(),
+      okPreflight,
+      outbox,
+      new Map(),
+    );
+    const done = worker.run(controller.signal);
+    try {
+      // Boot resolve has run against an empty pending list: it is NOT the source of any resolve.
+      await sleep(40);
+      assert.deepStrictEqual(reports, [], "the boot resolve did not resolve the terminal (nothing pending yet)");
+      // Let the drain retire the segments; the drainer must now re-resolve the pending terminal.
+      release();
+      await pollUntil(() => r1Resolved, 2000, "the drainer re-resolves the run's pending terminal after retire");
+    } finally {
+      release(); // idempotent: never leave the drain gate blocking on a failure path (fail cleanly, no hang)
+      controller.abort();
+      await done;
+    }
+    assert.ok(r1Resolved, "the post-drain resolve sent the terminal for r1");
+    assert.ok(retiredTerminal >= 1, "the landed terminal (200) retired the journal — it did not strand");
+  });
+
   it("the heartbeat-triggered drain is FIRE-AND-FORGET: a slow drain never delays the next heartbeat", async () => {
     // drainOutbox replays the ENTIRE per-run backlog with no time budget. If the
     // heartbeat loop AWAITED it, a slow drain would push the next heartbeat past the
