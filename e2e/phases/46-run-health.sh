@@ -66,9 +66,8 @@ pass "worker back online advertising cap 3 (room for three concurrent health leg
 # own claims. The underlying cross-phase accumulation is tracked with the custody-recovery work.
 H47_ADMIN_ID="$(db_psql "SELECT id FROM users WHERE email = '$ADMIN_EMAIL'")"
 [ -n "$H47_ADMIN_ID" ] || fail "run-health: could not resolve the admin owner id for '$ADMIN_EMAIL'"
-# CTE so the TOP-LEVEL statement is a SELECT: a DELETE's command tag would weld onto the count
-# under db_psql's `psql -tA | tr -d '\r\n'` (the phase-37/39/72 trap); a top-level SELECT emits
-# only the tuple.
+# CTE so the TOP-LEVEL statement is a SELECT, returning a bare count. db_psql now also strips any
+# DML command tag at the chokepoint (#1351), so this is belt-and-braces rather than required.
 H47_CLEARED="$(db_psql "WITH del AS (DELETE FROM recovery_custody_holds
                                        WHERE user_id = '$H47_ADMIN_ID' AND state = 'open'
                                        RETURNING 1)

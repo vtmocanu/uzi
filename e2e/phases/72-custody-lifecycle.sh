@@ -149,11 +149,10 @@ pass "server confirms the block: aggregate.blocked_runs=$BLOCKED (queued code ru
 # reachable through the shipped owner API against a real owned run id. Sibling seeds and
 # the owner's baseline holds are untouched.
 #
-# NOT `RETURNING id`: db_psql is `psql -tAc … | tr -d '\r\n'`, so psql's command TAG is
-# welded onto the returned row and yields `<uuid>UPDATE 1` — non-empty, passes a bare -n
-# guard, and only breaks the later `uzi run recovery` id match. Same trap the phase-37/39
-# fixtures document. Attach the row without RETURNING, then read the id back with a SELECT
-# (the wedge run_id + seed identity uniquely name the just-attached hold) and assert its SHAPE.
+# db_psql now strips psql's command TAG at the chokepoint (#1351), so `RETURNING id` no longer
+# welds `<uuid>UPDATE 1` onto the returned row. Kept as a separate read-back SELECT plus a
+# uuid-SHAPE assertion for defense-in-depth (the wedge run_id + seed identity uniquely name the
+# just-attached hold), independent of the helper's tag handling.
 db_psql "UPDATE recovery_custody_holds SET run_id = '$WEDGE_RUN'
          WHERE id = (SELECT id FROM recovery_custody_holds
                        WHERE user_id = '$ADMIN_ID' AND original_worker_identity = '$SEED_IDENT' AND state = 'open'

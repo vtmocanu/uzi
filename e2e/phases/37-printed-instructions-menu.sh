@@ -111,11 +111,10 @@ PI_TODO_PRESEED="$(uzi_cli review stats --json | jq -r '.todo')"
 db_psql "INSERT INTO run_reviews (target_run_id, user_id, verdict, summary_md)
          SELECT '$RUN_CLI', user_id, 'ok', 'PRD #98 M8c printed-instruction fixture'
          FROM run_reviews WHERE id='$F_REVIEW'" >/dev/null
-# NOT `RETURNING id`, and this is a measured trap rather than a style choice: db_psql is
-# `psql -tAc … | tr -d '\r\n'`, and psql writes the command TAG to stdout alongside the
-# returned row, so `tr` welds them into `<uuid>INSERT 0 1` — a string that is non-empty,
-# passes a bare -n guard, and only explodes three statements later inside an unrelated
-# INSERT. Read the id back with a SELECT, and assert its SHAPE, not merely that it is set.
+# db_psql now strips psql's DML command-completion tag at the chokepoint (#1351), so an
+# `INSERT … RETURNING id` no longer welds `<uuid>INSERT 0 1` onto the returned row. This keeps
+# the read-back SELECT plus a uuid-SHAPE assertion anyway as defense-in-depth — a non-vacuous
+# check the id was set, and independent of the helper's tag handling.
 PI_REVIEW2="$(db_psql "SELECT id FROM run_reviews WHERE target_run_id='$RUN_CLI'")"
 printf '%s' "$PI_REVIEW2" | grep -qE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' \
   || fail "PRD #98 M8c: the seeded review id is not a bare uuid: '$PI_REVIEW2'"
