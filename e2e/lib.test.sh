@@ -15,6 +15,8 @@ LIB="$ROOT/e2e/lib.sh"
 # Extract ONLY the two single-line tag-strip definitions (the RE var and the function) from the
 # shipped lib.sh and eval them. This exercises the real code; if the fix is reverted (the function
 # removed, back to an inline `tr -d '\r\n'`) the extraction yields nothing and the guard below fails.
+# NOTE: this couples to _psql_strip_tags being ONE line in lib.sh; a future multi-line reformat would
+# extract a truncated body — it fails safe (the guard/cases go red), so keep the def single-line.
 eval "$(awk '/^_PSQL_TAG_RE=/ || /^_psql_strip_tags\(\)/' "$LIB")"
 if ! type _psql_strip_tags >/dev/null 2>&1; then
   echo "FAIL: _psql_strip_tags not defined — extraction failed or the tag-strip fix was reverted" >&2

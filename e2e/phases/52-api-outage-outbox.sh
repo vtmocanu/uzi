@@ -241,8 +241,8 @@ pass "api recreated with a 90s heartbeat-stale window so the outage cannot reque
 # Clear the admin owner's accumulated cross-phase recovery custody holds so the claim
 # admission gate (workersvc/budget.go: custodyHoldLimit=8) does not wedge our claims in
 # 'queued' — the same guard phase 46 applies (the cross-phase accumulation is tracked
-# with the custody-recovery work). A CTE keeps the TOP-LEVEL statement a SELECT so the
-# scalar read is a bare count, not a welded command tag.
+# with the custody-recovery work). A CTE keeps the TOP-LEVEL statement a SELECT so the scalar
+# read is a bare count; db_psql also strips any DML command tag at the chokepoint now (#1351).
 OB_ADMIN_ID="$(db_psql "SELECT id FROM users WHERE email = '$ADMIN_EMAIL'")"
 [ -n "$OB_ADMIN_ID" ] || fail "outbox phase: could not resolve the admin owner id for '$ADMIN_EMAIL'"
 OB_CLEARED="$(db_psql "WITH del AS (DELETE FROM recovery_custody_holds

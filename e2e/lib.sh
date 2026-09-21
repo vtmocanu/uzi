@@ -164,14 +164,16 @@ apipatch() { curl -fsS -b "$JAR" -X PATCH "$BASE$1" -H 'Content-Type: applicatio
 PGPW=""
 # A psql DML command-completion TAG (`INSERT 0 1`, `UPDATE 1`, `DELETE 1`, `MERGE n`) is written to
 # stdout on its OWN line even under `-t`, alongside any returned row. Two ways it corrupts a scalar
-# read (#1351, and the trap phase 37 already documents):
-#   - SAME statement: an `INSERT … RETURNING id` emits `<id>\nINSERT 0 1`;
-#   - CROSS invocation: a discarded DML in a PRIOR phase (`db_psql "INSERT …" >/dev/null`) can bleed
-#     its tag into the FIRST read of the next phase, so a plain SELECT comes back `<value>\nINSERT 0 1`.
+# read (#1351, and the trap phases 37/39/72 already document):
+#   - SAME statement (verified against real psql): an `INSERT … RETURNING id` emits `<id>\nINSERT 0 1`;
+#   - CROSS invocation (OBSERVED in CI 3/3, mechanism unconfirmed): after a PRIOR phase's discarded
+#     `db_psql "INSERT …" >/dev/null`, the FIRST read of the next phase came back `<value>\nINSERT 0 1`
+#     (phase 74→75, #1209 triage). A separate `docker compose exec … psql` per call should not bleed a
+#     discarded tag, so the exact path is unproven — but the strip below fixes it regardless of cause.
 # Either way the old `tr -d '\r\n'` fused `<value>INSERT 0 1` — non-empty (passes a `-n` guard) and
 # only exploding statements later inside an unrelated INSERT (`invalid input syntax for type uuid`).
 # Drop the tag LINE at the chokepoint (a FULL-line match; no real scalar is `INSERT 0 1`-shaped) so
-# every caller gets the clean scalar it already assumes. This retires the per-phase guards in 37/39.
+# every caller gets the clean scalar it already assumes. This retires the per-phase guards in 37/39/72.
 _PSQL_TAG_RE='^(INSERT [0-9]+ [0-9]+|UPDATE [0-9]+|DELETE [0-9]+|MERGE [0-9]+)$'
 # _psql_strip_tags — from stdin, strip `\r` and drop any DML command-completion tag LINE. The shared
 # guts of db_psql/db_psql_rows, split out so e2e/lib.test.sh can exercise it hermetically.
