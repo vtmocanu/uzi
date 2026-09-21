@@ -1100,6 +1100,60 @@ describe("CodexExecutor: wall park (PRD #1497 M2)", () => {
     assert.equal(rig.transport.turnStartCount, 1, "the turn did NOT re-drive — the cancel was honored before the re-drive");
     assert.equal(spies.clearWallModeCalls, 0, "cancel-wins throws before the refused branch clears the wall mode / re-drives");
   });
+
+  // PRD #1497 M2 (CodeRabbit !1504) — the SIBLING race: a genuine owner `cancel` that lands DURING the
+  // refused RE-DRIVE (after the pre-redrive check already passed), not before it. tryCodexWallPark's
+  // refused branch re-checks the sticky cancel only BEFORE re-driving; the `wall` pause already aborted
+  // the SHARED, once-only ctx.signal PERMANENTLY, so a cancel arriving while turn 2 runs cannot abort it
+  // (driveCodexTurn's handledWallPause suppression continues it). If turn 2 then returns `done`, the
+  // implement loop's `if (result.done) break` would complete the run and DROP the cancel. The implement
+  // loop's post-redrive ctx.cancelRequested re-check honors it — cancel WINS over the completed re-drive.
+  // Verified this REDDENS without the fix: turn 2 re-drives to a normal signal_done completion (branch
+  // agent/issue-42) and this assert.rejects(/run cancelled/) fails.
+  it("(implement) an owner cancel arriving DURING the refused re-drive CANCELS the run — a cancel after the pre-redrive check is not dropped", async () => {
+    const controller = new AbortController();
+    let cancelled = false;
+    // Turn 1 goes quiet (the `wall` pause aborts it); the re-drive (turn 2) flips the sticky cancel as
+    // it starts, then completes with signal_done — the exact case the pre-redrive check cannot see.
+    const responder: Responder = (c) => {
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") {
+        if (c.turnStartCount === 1) c.transport.push(threadStarted());
+        else {
+          cancelled = true; // the owner cancel lands DURING the re-drive, after the pre-redrive check
+          c.transport.push(signalDone()).push(turnCompleted("completed"));
+        }
+        return { turn: { id: "tn-1" } };
+      }
+      return {};
+    };
+    const rig = makeRig({ responder });
+    const spies = { parkForWallCalls: 0, clearWallModeCalls: 0, mode: "wall" as "wall" | null };
+    const { ctx } = makeCtx({
+      signal: controller.signal,
+      pauseModeRequested: () => spies.mode,
+      cancelRequested: () => cancelled,
+      clearWallMode: () => {
+        spies.clearWallModeCalls++;
+        spies.mode = null;
+      },
+      // REFUSED with NO cancel pending yet, so the pre-redrive check in tryCodexWallPark passes and the
+      // turn re-drives — the cancel only lands once turn 2 is running (see the responder above).
+      parkForWall: async () => {
+        spies.parkForWallCalls++;
+        return "refused";
+      },
+    });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    await waitFor(() => rig.transport.turnStartCount >= 1, "implement turn 1 started");
+    controller.abort(new PauseNowSignal());
+    // The run cancels rather than completing turn 2's signal_done. A dropped cancel would resolve to
+    // branch agent/issue-42, so the rejection proves the post-redrive check honored the sticky cancel.
+    await assert.rejects(withTimeout(running, 3000, "codex cancel during refused re-drive"), /run cancelled/);
+    assert.equal(spies.parkForWallCalls, 1, "the `wall` pause reached the wall park once");
+    assert.ok(rig.transport.turnStartCount >= 2, "the turn DID re-drive (the pre-redrive check passed); the cancel was honored AFTER by the post-redrive check");
+    assert.equal(spies.clearWallModeCalls, 1, "the refused branch cleared the wall mode (no cancel was pending pre-redrive)");
+  });
 });
 
 // ================================================================================
