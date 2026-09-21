@@ -49,6 +49,8 @@ through `[0.52.0]`.)
   Per-run home, data, advice, and working directory setup now prepares and revalidates those directories before provisioning, repairing the group a non-root hosted start inherits (including directories the provisioner pre-creates) and using shared worker-lifetime paths, while still refusing tampered or wrongly-owned directories and serializing concurrent recovery.
 - **A failed or cancelled run's early recovery bundle no longer loses source that existed only in the runner's private clone ([#1510](https://github.com/vtmocanu/uzi/pull/1510)).**
   An early-terminal run could pin a source commit that had not yet reached the trusted bare repository; the recovery bundle build then refused that commit and degraded, and terminal cleanup discarded the only clone holding it, leaving an open custody hold protecting nothing. The commit is now transferred into and verified in the trusted bare before the bundle is produced.
+- **A run that finishes during an API outage now reaches its terminal state after recovery without a worker restart ([#1391](https://github.com/vtmocanu/uzi/issues/1391), [#1501](https://github.com/vtmocanu/uzi/pull/1501)).**
+  When terminal replay raced the run's own spilled-message drain, the resolver deferred behind `messages_pending` but nothing retried it after the drain, leaving finished work shown as running until the worker restarted and exposed to a false timeout. The worker now re-resolves the durable terminal journal as soon as that run's outbox retires, and outage tests wait on journal and send-failure events instead of runner-speed sleeps.
 
 ### Changed
 
