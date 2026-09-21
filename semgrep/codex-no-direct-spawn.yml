@@ -8,20 +8,20 @@
 # rule, so putting them on the general rule would also allow those forms in broker.ts or
 # any future provider file.
 #
-# Imports are matched as well as calls because an aliased child_process binding can hide
-# the callee name. Semgrep matches destructured imports by subset, so the exact sanctioned
-# import exception can also suppress a superset containing an alias. The third rule closes
-# that hole inside codex-capability.ts. Other files need no companion: their general rule
-# flags every child_process import directly.
+# Imports are matched as well as calls because a child_process binding can be assigned to an
+# arbitrary local callee. Semgrep matches destructured imports by subset, so the exact
+# sanctioned import exception also suppresses a superset with extra named bindings. The third
+# rule rejects every dangerous extra binding, aliased or unaliased, in codex-capability.ts.
+# Other files need no companion: their general rule flags every child_process import directly.
 #
 # RELIABILITY BOUNDARY. This is a syntactic, file-glob-scoped gate. It cannot trace a spawn
 # hidden behind an imported helper and does not prove a sanctioned spawner is correct. A new
 # seam needs an explicit path or pattern exception plus positive and negative controls.
 #
 # POSITIVE CONTROLS (verified before commit): broker.ts fires on the bare, namespace,
-# aliased-import and verbatim-probe forms; codex-capability.ts fires on a new bare spawn and
-# an aliased superset import. NEGATIVE CONTROL: the committed tree reports zero findings;
-# regexp.exec(...) remains outside the namespace-member patterns.
+# aliased-import and verbatim-probe forms; codex-capability.ts fires on a new bare spawn plus
+# aliased and unaliased dangerous superset imports. NEGATIVE CONTROL: the committed tree
+# reports zero findings; regexp.exec(...) remains outside the namespace-member patterns.
 rules:
   - id: codex-no-direct-spawn
     languages: [typescript]
@@ -100,17 +100,30 @@ rules:
       - pattern-not: 'spawn(bin, ["--probe"])'
 
   # Semgrep's destructured-import match is subset-based. The sanctioned import exception
-  # above therefore also suppresses a superset such as
-  # `import { spawnSync, exec as sh, type SpawnSyncReturns } ...`. Catch the alias itself.
-  - id: codex-capability-no-aliased-child-process
+  # above therefore also suppresses a superset. Catch every extra dangerous binding at the
+  # import, before an assignment can hide its callee behind an arbitrary local name.
+  - id: codex-capability-no-extra-child-process-bindings
     languages: [typescript]
     severity: ERROR
     message: >-
-      An aliased child_process binding hides a raw callee behind an arbitrary local
-      name. codex-capability.ts permits only its unaliased sanctioned import.
+      codex-capability.ts permits only its sanctioned spawnSync binding and type.
+      An extra child_process binding can hide a raw callee behind an arbitrary local
+      name and widen the trusted startup seam.
     paths:
       include:
         - /agent/src/codex/codex-capability.ts
     pattern-either:
+      - pattern: import { ..., spawn, ... } from "node:child_process"
+      - pattern: import { ..., exec, ... } from "node:child_process"
+      - pattern: import { ..., execSync, ... } from "node:child_process"
+      - pattern: import { ..., execFile, ... } from "node:child_process"
+      - pattern: import { ..., execFileSync, ... } from "node:child_process"
+      - pattern: import { ..., fork, ... } from "node:child_process"
+      - pattern: import { ..., spawn, ... } from "child_process"
+      - pattern: import { ..., exec, ... } from "child_process"
+      - pattern: import { ..., execSync, ... } from "child_process"
+      - pattern: import { ..., execFile, ... } from "child_process"
+      - pattern: import { ..., execFileSync, ... } from "child_process"
+      - pattern: import { ..., fork, ... } from "child_process"
       - pattern: import { ..., $X as $Y, ... } from "node:child_process"
       - pattern: import { ..., $X as $Y, ... } from "child_process"
