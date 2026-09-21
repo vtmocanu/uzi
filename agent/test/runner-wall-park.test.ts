@@ -15,6 +15,7 @@ import {
   git,
   gitlabClaim,
   installHarness,
+  worktreeDirFor,
 } from "./runner-harness.js";
 
 installHarness();
@@ -263,8 +264,13 @@ describe("RunRunner — capture-first wall park (PRD #1497 M2)", () => {
         (m) => m.kind === "status" && /lives on this worker only|could not be verified/i.test(String(m.payload.text ?? "")),
       );
       assert.ok(note, "a feed message notes the latest local work is unverified and lives on this worker only");
-      // The clone is kept (the run is non-terminal for resume): the HOME dir survives.
+      // The clone is kept (the run is non-terminal for resume): the HOME dir survives AND the
+      // runner clone survives. The two are gated by SEPARATE flags — the HOME by flight.parked /
+      // preserveSession, the clone by preserveRecoveryClone — so asserting only the HOME lets a
+      // clone-cleanup regression (dropping preserveRecoveryClone on a wall park) pass unseen. Assert
+      // the clone that carries the captured commit is retained too (idiom: runner-completion-hold).
       assert.ok(fs.existsSync(path.join(homeRoot, claim.run_id)), "the run's HOME is preserved for resume");
+      assert.strictEqual(fs.existsSync(worktreeDirFor(1503)), true, "the runner clone is preserved for resume");
     } finally {
       (git as unknown as { verifyRunnerTrackingCovers: unknown }).verifyRunnerTrackingCovers = origVerify;
       restore();
@@ -292,6 +298,7 @@ describe("RunRunner — capture-first wall park (PRD #1497 M2)", () => {
       );
       assert.ok(!statuses.includes("completed"), "no terminal completed report either");
       assert.ok(fs.existsSync(path.join(homeRoot, claim.run_id)), "the HOME is retained for a resume");
+      assert.strictEqual(fs.existsSync(worktreeDirFor(1504)), true, "the runner clone is retained for a resume");
     } finally {
       restore();
       fs.rmSync(homeRoot, { recursive: true, force: true });
@@ -319,7 +326,8 @@ describe("RunRunner — capture-first wall park (PRD #1497 M2)", () => {
         !statuses.includes("failed") && !statuses.includes("completed"),
         `a server-parked flight ends NON-TERMINAL, got ${JSON.stringify(statuses)}`,
       );
-      assert.ok(fs.existsSync(path.join(homeRoot, claim.run_id)), "clone + HOME retained for a resume on another incarnation");
+      assert.ok(fs.existsSync(path.join(homeRoot, claim.run_id)), "the HOME retained for a resume on another incarnation");
+      assert.strictEqual(fs.existsSync(worktreeDirFor(1505)), true, "the runner clone retained for a resume on another incarnation");
     } finally {
       restore();
       fs.rmSync(homeRoot, { recursive: true, force: true });
