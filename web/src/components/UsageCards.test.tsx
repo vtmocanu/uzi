@@ -137,27 +137,29 @@ describe("YourUsageCard", () => {
     // the $ figure is never read as the complete total.
     expect(container.textContent).toContain("2 subscription + 1 unreported runs excluded from the $ total");
     expect(container.textContent).toContain("1 subscription run excluded from the $ total");
+    // Differing windows → BOTH notes render (the dedup must NOT collapse them).
+    expect((container.textContent ?? "").split("excluded from the $ total").length - 1).toBe(2);
   });
 
-  it("keeps the 'see per-run detail →' arrow glued to 'detail' (no orphaned arrow)", () => {
+  it("dedups the exclusion disclosure: one note when lifetime and last-7d texts match", () => {
     const usage: SelfUsage = {
-      lifetime: bundle(1_000_000, 0, 200_000, 1.23),
-      last_7_days: bundle(100_000, 0, 50_000, 0.5),
-      run_count: 3,
-      outcomes: noOutcomes(),
-      lifetime_subscription_run_count: 0,
+      lifetime: bundle(1_000_000, 0, 200_000, 12.5),
+      last_7_days: bundle(100_000, 0, 20_000, 1.25),
+      run_count: 10,
+      lifetime_subscription_run_count: 2,
       lifetime_unreported_run_count: 0,
-      last7_subscription_run_count: 0,
+      last7_subscription_run_count: 2,
       last7_unreported_run_count: 0,
+      outcomes: noOutcomes(),
     };
     const { container } = wrap(<YourUsageCard usage={usage} />);
-    const link = container.querySelector('a[href="/runs"]');
-    expect(link).toBeTruthy();
-    // (a) whitespace-nowrap prevents the link itself from wrapping.
-    expect(link?.className).toContain("whitespace-nowrap");
-    // (b) positive pin: the arrow stays glued to "detail" by a genuine non-breaking
-    // space — assert via the \u00A0 escape (not a literal glyph) so it stays greppable.
-    expect(link?.textContent).toMatch(/detail\u00A0→/);
+    const text = container.textContent ?? "";
+    // Positive: the standalone lifetime note (no parens) is still shown...
+    expect(text).toContain("2 subscription runs excluded from the $ total");
+    // ...exactly once (the parenthetical last-7d copy is suppressed when its text matches).
+    expect(text.split("excluded from the $ total").length - 1).toBe(1);
+    // Paired negative on the NEW behaviour: the parenthesised last-7d form is gone.
+    expect(text).not.toContain("(2 subscription runs excluded from the $ total)");
   });
 });
 
