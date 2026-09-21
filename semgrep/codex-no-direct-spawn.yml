@@ -1,95 +1,82 @@
 # DARK CODEX GUARD (issue #1171 M5) -- no raw child_process spawn in
-# agent/src/codex/** outside the sanctioned seams (the supervisor launcher, plus
-# three EXACT pattern-level exceptions in codex-capability.ts -- see below).
+# agent/src/codex/** outside the sanctioned launcher and boot-time Landlock probe.
 #
-# WHAT THIS ENFORCES. Inside the Codex provider tree, raw subprocess creation is
-# confined to deliberately sanctioned seams. launcher.ts (the supervisor spawn plus
-# the id/provision spawnSync probes) is excluded as a WHOLE file -- it has many
-# varied spawn forms, so a file-level exclude fits it. codex-capability.ts stays IN
-# SCOPE: only three EXACT forms of its one fixed-arg one-shot Landlock probe at
-# worker boot are excepted -- the child_process import, the default-arg spawnSync,
-# and the injected spawn call (the `pattern-not` clauses below). Every other file in
-# agent/src/codex/** -- AND any OTHER spawn form or child_process import added to
-# codex-capability.ts itself -- must reach a subprocess through that seam, never by
-# importing child_process and spawning its own; a raw spawn elsewhere escapes the
-# supervisor/registry lifecycle and the seam boundary. Shell, fileop and
-# boundary-action processes reserve and register through it.
+# The general rule covers every Codex provider file except the supervisor launcher and
+# codex-capability.ts. The capability-specific rule then covers ONLY codex-capability.ts,
+# with exact exceptions for its sanctioned import, fixed spawnSync probe and injectable
+# test seam. Splitting the rules is load-bearing: pattern-not exceptions are global to a
+# rule, so putting them on the general rule would also allow those forms in broker.ts or
+# any future provider file.
 #
-# THE PATTERN. A top-level `patterns:` (AND) of two parts. First, a `pattern-either`
-# over three shapes: (1) the bare-callee child_process call forms
-# (spawn/spawnSync/exec/execSync/execFile/execFileSync/fork); (2) the
-# namespace-member forms (cp.spawn(...) etc.) for the names that do not collide with
-# common member methods; and (3) an aliased or namespaced child_process IMPORT itself
-# (import * as cp / import { spawn as start }), whose local name is arbitrary and so
-# escapes (1) and (2). Second, three `pattern-not` clauses that subtract EXACTLY the
-# three sanctioned codex-capability.ts forms; `patterns:` ANDs its children and a
-# `pattern-not` removes matches. A bare, namespaced or default child_process import,
-# or a bare dangerous callee, in codex-capability.ts or e.g. broker.ts still fires via
-# THIS rule; an ALIASED child_process binding (`import { x as y }`) instead fires via
-# the codex-no-aliased-child-process COMPANION rule below. The companion is required
-# because semgrep's destructured-import matching is SUBSET-based, so `pattern-not` #1
-# also suppresses any SUPERSET of the sanctioned import (see the companion's header).
-# ACCEPTED RESIDUAL (LOW, defense-in-depth): the three `pattern-not` clauses are GLOBAL
-# to all in-scope codex files, so the exact sanctioned CALL forms
-# (`spawnSync(command, [...args], { stdio: "ignore", timeout: 10_000 })` and
-# `spawn(bin, ["--probe"])`) are also tolerated if copied verbatim into ANOTHER codex
-# file -- the same class of syntactic limitation as the helper-indirected spawns this
-# rule already cannot trace. On the clean tree these are the only child_process users
-# in agent/src/codex/**, so BOTH rules report ZERO findings; the same call/import in
-# e.g. broker.ts fires. `exec(...)` matches only a bare `exec` callee, and no $NS.exec
-# member pattern is used, so `regexp.exec(...)` / `str.exec(...)` never fire. Codex
-# tests live under agent/test/, outside this rule's /agent/src/codex scope.
+# Imports are matched as well as calls because an aliased child_process binding can hide
+# the callee name. Semgrep matches destructured imports by subset, so the exact sanctioned
+# import exception can also suppress a superset containing an alias. The third rule closes
+# that hole inside codex-capability.ts. Other files need no companion: their general rule
+# flags every child_process import directly.
 #
-# 🔴 RELIABILITY BOUNDARY. This is a SYNTACTIC, FILE-GLOB-SCOPED match on the direct
-# child_process call APIs and imports by name. It does NOT trace a spawn hidden behind a helper
-# imported from another module (intraprocedural limit), and it does NOT prove the
-# sanctioned spawner itself is correct -- only that no NEW file in the
-# tree grows its own raw spawn, and that codex-capability.ts grows no spawn/import
-# beyond its three excepted forms. A spawner added under a new sanctioned seam must
-# be excepted deliberately (a whole-file `paths.exclude`, or an EXACT `pattern-not`),
-# the same way the include glob is kept in sync.
+# RELIABILITY BOUNDARY. This is a syntactic, file-glob-scoped gate. It cannot trace a spawn
+# hidden behind an imported helper and does not prove a sanctioned spawner is correct. A new
+# seam needs an explicit path or pattern exception plus positive and negative controls.
 #
-# POSITIVE CONTROL (verified before commit): in agent/src/codex/broker.ts each of
-# `spawn("x");`, `cp.spawn("x");` (with `import * as cp from "node:child_process"`), and
-# an aliased `import { spawn as start } from "node:child_process"; start("x");` fires;
-# a bare `spawn("x");` added INSIDE codex-capability.ts also fires (it is not one of
-# the three excepted forms), proving the file is in scope; and an ALIASED superset
-# import in codex-capability.ts
-# (`import { spawnSync, exec as sh, type SpawnSyncReturns } from "node:child_process"`)
-# fires via the codex-no-aliased-child-process companion rule even though `pattern-not`
-# #1 suppresses it for codex-no-direct-spawn; reverting returns to zero.
-# NEGATIVE CONTROL: the committed tree reports zero findings from BOTH rules -- the only
-# child_process users are launcher.ts (whole-file excluded) and codex-capability.ts's
-# three excepted forms (whose sanctioned import has NO `as` alias -- `type
-# SpawnSyncReturns` is a type specifier -- so the companion rule does not fire either),
-# and `regexp.exec(...)` does not match.
+# POSITIVE CONTROLS (verified before commit): broker.ts fires on the bare, namespace,
+# aliased-import and verbatim-probe forms; codex-capability.ts fires on a new bare spawn and
+# an aliased superset import. NEGATIVE CONTROL: the committed tree reports zero findings;
+# regexp.exec(...) remains outside the namespace-member patterns.
 rules:
   - id: codex-no-direct-spawn
     languages: [typescript]
     severity: ERROR
     message: >-
-      Raw child_process spawn is confined to the sanctioned Codex seams (the
-      supervisor launcher, plus the three excepted forms of codex-capability.ts's
-      boot-time Landlock probe). A spawn/exec/fork in any other agent/src/codex file
-      -- or any NEW spawn form or child_process import in codex-capability.ts --
-      escapes the supervisor/registry lifecycle and the seam boundary. Route the
-      subprocess through the launcher / command / fileop seam.
+      Raw child_process spawn is confined to the sanctioned Codex seams. A
+      spawn/exec/fork or child_process import in another agent/src/codex file escapes
+      the supervisor/registry lifecycle. Route it through the launcher / command /
+      fileop seam.
     paths:
-      # Root-anchored (leading `/`) to silence semgrep's Semgrepignore-v2
-      # deprecation warning about bare relative includes, mirroring canary.yml.
-      # The gate scans `.` from the repo root, so this resolves to agent/src/codex/.
+      # Root-anchored to silence Semgrepignore-v2 warnings. The gate scans from repo root.
       include:
         - /agent/src/codex
-      # The one file that legitimately creates a subprocess in agent/src/codex/** and
-      # is excluded as a WHOLE. codex-capability.ts is NOT excluded here -- it stays
-      # in scope with the three exact `pattern-not` exceptions below.
       exclude:
-        # The supervisor spawn plus its fixed id/provisioning spawnSync probes. Many
-        # varied spawn forms, so a file-level exclude fits it.
+        # The supervisor spawn plus its fixed id/provisioning probes.
         - /agent/src/codex/launcher.ts
+        # Covered by codex-capability-no-extra-direct-spawn below, where its exact
+        # exceptions cannot leak into any other provider file.
+        - /agent/src/codex/codex-capability.ts
+    pattern-either:
+      # Bare-callee forms from destructured imports.
+      - pattern: spawn(...)
+      - pattern: spawnSync(...)
+      - pattern: exec(...)
+      - pattern: execSync(...)
+      - pattern: execFile(...)
+      - pattern: execFileSync(...)
+      - pattern: fork(...)
+      # Namespace-member forms whose names do not collide with common methods.
+      # Deliberately omit $NS.exec/$NS.execSync so regexp.exec(...) does not fire.
+      - pattern: $NS.spawn(...)
+      - pattern: $NS.spawnSync(...)
+      - pattern: $NS.execFile(...)
+      - pattern: $NS.execFileSync(...)
+      - pattern: $NS.fork(...)
+      # Imports catch arbitrary aliases and namespace names.
+      - pattern: import * as $X from "node:child_process"
+      - pattern: import * as $X from "child_process"
+      - pattern: import { ... } from "node:child_process"
+      - pattern: import { ... } from "child_process"
+      - pattern: import $X from "node:child_process"
+      - pattern: import $X from "child_process"
+
+  - id: codex-capability-no-extra-direct-spawn
+    languages: [typescript]
+    severity: ERROR
+    message: >-
+      codex-capability.ts may use only the exact child_process import and fixed
+      boot-time Landlock probe forms. Any other spawn/exec/fork or child_process
+      import widens the trusted startup seam.
+    paths:
+      include:
+        - /agent/src/codex/codex-capability.ts
     patterns:
       - pattern-either:
-          # (1) BARE-CALLEE call forms (a destructured `import { spawn } from ...`).
           - pattern: spawn(...)
           - pattern: spawnSync(...)
           - pattern: exec(...)
@@ -97,66 +84,33 @@ rules:
           - pattern: execFile(...)
           - pattern: execFileSync(...)
           - pattern: fork(...)
-          # (2) NAMESPACE-MEMBER call forms (`import * as cp from ...; cp.spawn(...)`). Only
-          # the child_process-specific names that do NOT collide with common member methods
-          # are listed -- `$NS.exec`/`$NS.execSync` are DELIBERATELY omitted so `regexp.exec(...)`
-          # / a string `.exec` member never false-fires (the same exclusion the bare `exec`
-          # note above relies on).
           - pattern: $NS.spawn(...)
           - pattern: $NS.spawnSync(...)
           - pattern: $NS.execFile(...)
           - pattern: $NS.execFileSync(...)
           - pattern: $NS.fork(...)
-          # (3) THE IMPORT ITSELF. An aliased (`import { spawn as start }`) or namespaced
-          # (`import * as cp`) child_process import escapes both (1) and (2) because the local
-          # name is arbitrary, so flag the import in any non-excluded codex file. Both the
-          # `node:`-prefixed and bare specifiers are covered.
           - pattern: import * as $X from "node:child_process"
           - pattern: import * as $X from "child_process"
           - pattern: import { ... } from "node:child_process"
           - pattern: import { ... } from "child_process"
           - pattern: import $X from "node:child_process"
           - pattern: import $X from "child_process"
-      # EXACT pattern-level exceptions for codex-capability.ts's one-shot Landlock
-      # probe (PRD #1493). These three -- and ONLY these three -- are sanctioned in
-      # that file; a bare/namespaced/default import or a bare dangerous callee there
-      # still fires via THIS rule (the file is IN SCOPE, not whole-file excluded), and
-      # an ALIASED binding fires via the companion rule below (pattern-not #1's SUBSET
-      # match would otherwise swallow a superset of the sanctioned import). Kept as
-      # specific as possible so the residual global allowance across all in-scope codex
-      # files is minimal (see ACCEPTED RESIDUAL in the header).
       - pattern-not: 'import { spawnSync, type SpawnSyncReturns } from "node:child_process"'
       - pattern-not: 'spawnSync(command, [...args], { stdio: "ignore", timeout: 10_000 })'
       - pattern-not: 'spawn(bin, ["--probe"])'
 
-  # ── COMPANION RULE: re-close the aliased-superset-import hole ────────────────
-  # codex-no-aliased-child-process closes a hole that ANY `pattern-not` on a
-  # DESTRUCTURED child_process import necessarily opens. semgrep's destructured-import
-  # matching is SUBSET-based, so codex-no-direct-spawn's pattern-not #1
-  # (`import { spawnSync, type SpawnSyncReturns }`) suppresses not just the EXACT
-  # sanctioned import but any SUPERSET of it -- e.g.
-  # `import { spawnSync, exec as sh, type SpawnSyncReturns } from "node:child_process"`.
-  # A superset like that can smuggle in an ALIASED dangerous callee (`sh(...)`) whose
-  # local name matches none of rule 1's bare-callee patterns, so rule 1 alone reports
-  # ZERO. This rule flags the aliased BINDING itself, independent of pattern-not #1's
-  # global suppression, so the alias-hidden callee cannot escape. The sanctioned import
-  # has NO `as` alias (`type SpawnSyncReturns` is a type specifier, not an alias), so
-  # this rule does NOT fire on the clean tree. Same scope as rule 1 (all of
-  # /agent/src/codex, launcher.ts excluded), so codex-capability.ts stays IN scope.
-  - id: codex-no-aliased-child-process
+  # Semgrep's destructured-import match is subset-based. The sanctioned import exception
+  # above therefore also suppresses a superset such as
+  # `import { spawnSync, exec as sh, type SpawnSyncReturns } ...`. Catch the alias itself.
+  - id: codex-capability-no-aliased-child-process
     languages: [typescript]
     severity: ERROR
     message: >-
-      An aliased node:child_process binding (import { x as y }) hides a raw
-      spawn/exec/fork callee behind an arbitrary local name, escaping both the
-      bare-callee patterns and codex-no-direct-spawn's exact import exception.
-      Import child_process only through the sanctioned launcher/probe seams,
-      never under an alias.
+      An aliased child_process binding hides a raw callee behind an arbitrary local
+      name. codex-capability.ts permits only its unaliased sanctioned import.
     paths:
       include:
-        - /agent/src/codex
-      exclude:
-        - /agent/src/codex/launcher.ts
+        - /agent/src/codex/codex-capability.ts
     pattern-either:
       - pattern: import { ..., $X as $Y, ... } from "node:child_process"
       - pattern: import { ..., $X as $Y, ... } from "child_process"
