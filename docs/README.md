@@ -76,8 +76,8 @@ path), not while the file is merely a placeholder.
 ## Links
 
 - Doc-to-doc: `./<file>.md`, preserving any `#anchor`.
-- Repo-root files (`../ARCHITECTURE.md`, `../plan.md`): the in-app viewer
-  rewrites these to the pinned GitLab blob URL, since they aren't bundled.
+- Repo-root files (`../ARCHITECTURE.md`, `../CONTRIBUTING.md`): the in-app viewer
+  rewrites these to the pinned GitHub blob URL, since they aren't bundled.
 - **Inline links only** (`[text](target)`, `![alt](target)`): reference-style
   links and images (`[text][ref]`, `[label]: target`) fail the validator,
   since they're invisible to its link-existence check.
