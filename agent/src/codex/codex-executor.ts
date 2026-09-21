@@ -706,6 +706,9 @@ export function makeProductionLaunchAdviceRoot(homeRoot: string, authMode: Codex
       cwd,
       useAppServerAuth: true,
       authMode,
+      // The advice lane keeps the host DISABLED — its "pure in-memory ceiling" posture is
+      // preserved by this call-site scoping (no dynamic tools; no execution surface).
+      codeModeHost: false,
     });
     const stdout = handle.transport.stdout;
     const stdin = handle.transport.stdin;
@@ -2649,6 +2652,11 @@ async function defaultLaunchProviderRoot(
     cwd: spec.cwd,
     useAppServerAuth: true,
     authMode,
+    // The run lane enables the code-mode execution host; the intended models route their
+    // tool calls through code-mode, and the host is authority-free (environments:[] +
+    // untrusted project + broker-mediated callbacks). Subagent threads that run on this same
+    // app-server share the host.
+    codeModeHost: true,
     seedSession: spec.seedSession,
   }, openAIBaseUrlForTest === undefined
     ? undefined

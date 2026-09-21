@@ -196,8 +196,9 @@ function definition(name: string): Omit<CodexDynamicToolSpec, "type" | "name"> {
 }
 
 /** Build the stable model-visible callback list for one immutable role grant.
- * Code-mode lifecycle callback names remain recognized by the broker defensively,
- * but code mode is disabled and those internal names are never offered to the model. */
+ * The code-mode LIFECYCLE callback names remain recognized by the broker defensively and
+ * are never offered to the model. The run lane now enables the code-mode host (an execution
+ * surface) via the launcher (`codeModeHost`), so worker callbacks route through it. */
 export function buildCodexDynamicTools(grants: RunGrants): readonly CodexDynamicToolSpec[] {
   return [...grants.allowedTools]
     .filter((canonical) => !CODEX_DELEGATE_TOOLS.has(canonical) || canonical === "spawn_agent")
