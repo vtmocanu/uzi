@@ -275,6 +275,12 @@ func TestBoardMeterLayoutCombinedWide(t *testing.T) {
 	if strings.Contains(plain, "Codex") {
 		t.Errorf("the retired capitalised \"Codex \" group prefix must never return:\n%s", plain)
 	}
+	// Anti-clip invariant: the combined branch is taken ONLY when it fits, so a len==1 line must
+	// never exceed m.width — this locks the load-bearing anti-clip guarantee so a future change to
+	// the section gap or the provider-tag width cannot silently reintroduce a clipped combined line.
+	if w := visualWidth(layout.lines[0]); w > m.width {
+		t.Errorf("a combined (len==1) line must fit m.width=%d, got visual width %d:\n%s", m.width, w, plain)
+	}
 
 	// Through the full renderBoard seam: both readings ride the SAME physical line, which carries
 	// exactly one provider tag.
@@ -293,6 +299,38 @@ func TestBoardMeterLayoutCombinedWide(t *testing.T) {
 	}
 	if n := strings.Count(combinedLine, "codex"); n != 1 {
 		t.Errorf("the composed combined line must carry exactly ONE provider tag \"codex\", got %d:\n%q", n, combinedLine)
+	}
+}
+
+// TestBoardMeterLayoutCodexOnlyIncludesProviderTag (PRD 1519 D3, Codex-only row) — when the viewer
+// has a readable Codex account but no readable/selected Anthropic token, boardMeterLayout renders the
+// Codex meters on ONE line that MUST carry the single provider tag "codex": there is no Claude line
+// above to disambiguate the provider, and under Ascii/NoTTY the accent-bar tint is stripped (the ▎
+// glyph is identical for both providers), so the tag is the only provider signal. This pins the
+// `case !hasClaude:` branch, which the both-providers layout tests never exercise.
+func TestBoardMeterLayoutCodexOnlyIncludesProviderTag(t *testing.T) {
+	m := codexStripModel(t, []apitypes.CodexAccountRateLimitDTO{
+		codexAcct("cx-primary", "primary", true, "fresh", cwin(71), cwin(29)),
+	}, nil)
+	layout := m.boardMeterLayout(time.Now())
+	if len(layout.lines) != 1 {
+		t.Fatalf("a Codex-only viewer must render ONE meter line, got %d: %q", len(layout.lines), layout.lines)
+	}
+	plain := stripANSI(layout.lines[0])
+	// A single account never shows a per-account label (showLabel is false for one account), so the
+	// only "codex" token must be the provider tag P — dropping P here would leave the section
+	// unlabelled with no Claude line above to disambiguate it.
+	if n := strings.Count(plain, "codex"); n != 1 {
+		t.Errorf("the Codex-only line must carry exactly ONE provider tag \"codex\", got %d:\n%s", n, plain)
+	}
+	if strings.Contains(plain, "Codex") {
+		t.Errorf("the retired capitalised \"Codex \" group prefix must never return:\n%s", plain)
+	}
+	if !strings.Contains(plain, "71%") {
+		t.Errorf("the Codex-only line is missing the reading %q:\n%s", "71%", plain)
+	}
+	if w := visualWidth(layout.lines[0]); w > m.width {
+		t.Errorf("the Codex-only line must fit m.width=%d, got visual width %d:\n%s", m.width, w, plain)
 	}
 }
 
