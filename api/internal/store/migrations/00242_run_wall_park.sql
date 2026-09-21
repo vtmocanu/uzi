@@ -4,10 +4,10 @@
 -- changes ride ONE migration because they are one feature and must land atomically: the
 -- new 'wall' pause mode the system-authored request carries, the finalize allowance the
 -- Stop action grants, and the released-incarnation pair a server-side park captures to
--- fence the old flight and bar it from the next claim (D19). 00242 validates the two
+-- fence the old flight and bar it from the next claim (D19). 00243 validates the two
 -- CHECKs added NOT VALID below.
 --
--- NOTE (goose numbering): drafted as 00241, immediately after the live head 00240;
+-- NOTE (goose numbering): drafted as 00242, immediately after the live head 00240;
 -- renumber the PAIR above the live head together at landing via `task migration:renumber`
 -- if another migration lands first.
 
@@ -19,7 +19,7 @@
 ALTER TABLE runs DROP CONSTRAINT IF EXISTS runs_pause_mode_check;
 -- Added NOT VALID: skip the validating table scan (and the ACCESS EXCLUSIVE lock it would
 -- otherwise hold to check every existing row) at add-time; new/updated rows are still
--- enforced. 00242 runs VALIDATE CONSTRAINT to confirm the backlog under a lock-cheap scan.
+-- enforced. 00243 runs VALIDATE CONSTRAINT to confirm the backlog under a lock-cheap scan.
 ALTER TABLE runs ADD CONSTRAINT runs_pause_mode_check
     CHECK (pause_mode IS NULL OR pause_mode IN ('milestone', 'now', 'wall')) NOT VALID;
 
@@ -28,7 +28,7 @@ ALTER TABLE runs ADD CONSTRAINT runs_pause_mode_check
 -- owner extension cap never sees it, and the column doubles as the once-only marker (Stop
 -- refuses when it is already non-zero). NOT NULL DEFAULT 0 leaves every existing row's
 -- deadline unchanged. The nonnegativity CHECK is added SEPARATELY as NOT VALID and
--- validated in 00242, not inline on the ADD COLUMN: an inline CHECK is created
+-- validated in 00243, not inline on the ADD COLUMN: an inline CHECK is created
 -- already-valid and, on a large live runs table, has PostgreSQL scan every row under the
 -- ACCESS EXCLUSIVE lock the ALTER already holds. Mirrors 00219's two-step for
 -- budget_extension_seconds.
