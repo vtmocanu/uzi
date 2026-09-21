@@ -5906,12 +5906,14 @@ type SweepResult struct {
 	// because their message writes are in a confirmed permanent-failure loop
 	// (PRD #108 M5). Normally 0 — the candidate set is usually empty.
 	AutoStopped int64
-	// CodexRefreshRecovered is the number of stranded Codex refresh intents this pass resolved
-	// while reaping accounts wedged by an interrupted subscription refresh (issue #1532): an
-	// in_progress account with an expired lease, or an orphaned rotating intent, is quarantined
-	// and its intents driven to a terminal state so a re-link can recover it. Normally 0 (the
-	// candidate scan matches nothing on a healthy instance); a non-zero count means an account
-	// was un-wedged.
+	// CodexRefreshRecovered is the number of ACCOUNTS this pass recovered while reaping accounts
+	// wedged by an interrupted subscription refresh (issue #1532): an in_progress account with an
+	// expired lease, or an orphaned rotating intent, is quarantined and its intents driven to a
+	// terminal state so a re-link can recover it. Normally 0 (the candidate scan matches nothing
+	// on a healthy instance); a non-zero count means that many accounts were un-wedged. Counts
+	// accounts, not intents, so a reap that resolves zero intents (the rare crash window where an
+	// account is left in_progress with an already-terminal intent) is still observable — see
+	// SweepUnresolvedCodexRefresh.
 	CodexRefreshRecovered int64
 	// LimitPromoted is the number of runs this pass brought back from limit_wait to
 	// queued because their retry_not_before elapsed (PRD #35). Normally 0: the

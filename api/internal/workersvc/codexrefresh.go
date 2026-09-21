@@ -1042,14 +1042,16 @@ type codexRefreshSweepStore interface {
 // lists every account with an expired in_progress lease or an unresolved rotating intent and
 // runs the per-account reap→quarantine→resolve state machine on each, so an interrupted refresh
 // can no longer wedge an account forever. It NEVER re-spends a refresh token or auto-recovers a
-// live op. Returns the total intents it resolved across all accounts; one account's failure is
-// captured and surfaced but does not abort the rest.
+// live op. One account's failure is captured and surfaced but does not abort the rest.
 //
-// Invariant (recovery is always observable): a quarantine performed by this sweep always
-// coincides with at least one 'rotating' intent to resolve, because coordinatedRefresh inserts
-// the durable intent BEFORE it acquires the lease, so an in_progress account always carries a
-// rotating intent. Thus a quarantine never returns 0 silently — resolved >= 1 whenever an
-// account is reaped — and the count feeds SweepResult.CodexRefreshRecovered / the sweeper log.
+// Returns the number of ACCOUNTS this pass recovered (reaped and/or had intents resolved), not
+// the intent count. Counting accounts — one per candidate the list query returned that
+// reconciled without error — is deliberate: a rare crash between advanceCodexRefresh's
+// intent→'unrecoverable' write and its QuarantineCodexAccount write can leave an in_progress
+// account with NO 'rotating' intent, so a later reap of that account resolves zero intents yet
+// still un-wedges it. Counting intents would make that reap invisible in the sweeper log;
+// counting accounts keeps recovery observable — every state change this pass makes raises the
+// SweepResult.CodexRefreshRecovered count and the "sweeper pass" line.
 func (s *Service) SweepUnresolvedCodexRefresh(ctx context.Context) (int64, error) {
 	q, ok := s.q.(codexRefreshSweepStore)
 	if !ok {
@@ -1059,19 +1061,21 @@ func (s *Service) SweepUnresolvedCodexRefresh(ctx context.Context) (int64, error
 	if err != nil {
 		return 0, fmt.Errorf("codex survivor sweep: list: %w", err)
 	}
-	var resolved int64
+	var recovered int64
 	var firstErr error
 	for _, r := range rows {
-		n, rerr := s.ReconcileUnresolvedCodexRefresh(ctx, r.UserID, r.ID)
-		if rerr != nil {
+		// The list query already excluded healthy live rotations, so every candidate genuinely
+		// needs the state machine; a clean reconcile is a recovered account. (The intent count
+		// itself is unused here — see the account-vs-intent counting note above.)
+		if _, rerr := s.ReconcileUnresolvedCodexRefresh(ctx, r.UserID, r.ID); rerr != nil {
 			if firstErr == nil {
 				firstErr = rerr
 			}
 			continue // one account's failure must not skip the others
 		}
-		resolved += int64(n)
+		recovered++
 	}
-	return resolved, firstErr
+	return recovered, firstErr
 }
 
 // promoteCodexRecovery attempts to make a quarantined account whose recovery slot holds
