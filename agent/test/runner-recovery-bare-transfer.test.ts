@@ -473,4 +473,74 @@ describe("RunRunner — settle transfers the clone-only head into the trusted ba
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
+
+  it("9. a concurrent run moving the shared tracking ref between verify and retrieval never pins the foreign head, and the verified head stays durable through a prune (issue #1507)", async () => {
+    const { gitlab } = fakeGitlab();
+    const { coord, fakeClient, root } = makeCoord();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-bare-xfer-toctou-"));
+    const originalVerify = git.verifyRunnerTrackingCovers.bind(git);
+    const originalProduce = git.produceRecoveryBundle.bind(git);
+    try {
+      const iid = 5109;
+      const branch = `agent/issue-${iid}`;
+      const trackingRef = `refs/uzi-runner/${branch}`;
+      const claim = gitlabClaim(iid, { claim_generation: 21 });
+      const bare = git.barePathFor(fx.originPath);
+      let ourHead = "";
+      let foreignSha = "";
+
+      // After the REAL positive-verify passes, model a concurrent run on the same bare+branch:
+      // capture THIS run's verified head, mint a FOREIGN root commit (ourHead is NOT its ancestor —
+      // it reuses ourHead's tree but has no parent, so ourHead becomes unreachable once the ref
+      // moves), and move the shared tracking ref to it. The UNFIXED reread would then pin foreignSha.
+      git.verifyRunnerTrackingCovers = async (bp, wt, br) => {
+        const verified = await originalVerify(bp, wt, br);
+        if (verified && br === branch && !foreignSha) {
+          ourHead = gitRead(bare, "rev-parse", trackingRef);
+          const ourTree = gitRead(bare, "rev-parse", `${ourHead}^{tree}`);
+          foreignSha = gitRead(
+            bare,
+            "-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false",
+            "commit-tree", ourTree, "-m", "foreign concurrent run",
+          );
+          gitRead(bare, "update-ref", trackingRef, foreignSha);
+        }
+        return verified;
+      };
+
+      // Model a maintenance/prune pass in the settle→produce window. Reflogs are off on a --bare
+      // clone, so once the tracking ref points at the foreign root commit, OUR head is reachable
+      // ONLY via the run+generation pin the fix plants — gc --prune=now removes it otherwise, and
+      // the real produceRecoveryBundle's rev-parse then fails (fixed-but-no-pin RED).
+      git.produceRecoveryBundle = async (bp, opts) => {
+        gitRead(bare, "gc", "--prune=now");
+        return originalProduce(bp, opts);
+      };
+
+      await runnerWith(commitThenFailFactory(homeRoot), gitlab, undefined, nullLogger(), {
+        recovery: coord,
+      }).execute(claim);
+
+      assert.ok(hasStatus(claim.run_id, "failed"), "the run reported failed");
+      assert.ok(ourHead && foreignSha && ourHead !== foreignSha, "the injection captured two distinct heads");
+      assert.equal(fakeClient.reserveCalls.length, 1, "the verified head is reserved");
+      assert.equal(
+        fakeClient.reserveCalls[0]!.source_sha,
+        ourHead,
+        "the pinned/reserved source is THIS run's verified head, never the concurrently-moved foreign head",
+      );
+      assert.notEqual(fakeClient.reserveCalls[0]!.source_sha, foreignSha, "the foreign head is never pinned");
+      assert.equal(fakeClient.reserveCalls[0]!.generation, claim.claim_generation, "the reserve binds the exact generation");
+      assert.equal(fakeClient.uploadCalls.length, 1, "the generation-bound bundle is uploaded (our head survived the prune)");
+      assert.equal(fakeClient.releaseCalls.length, 0, "committed work is NEVER released");
+      // The verified head is still a reachable commit in the bare after settle — the durable pin held
+      // it through the prune, and the foreign move never displaced it as the pinned source.
+      assert.equal(gitRead(bare, "cat-file", "-t", ourHead), "commit", "the verified head survives as a commit");
+    } finally {
+      git.verifyRunnerTrackingCovers = originalVerify;
+      git.produceRecoveryBundle = originalProduce;
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
 });

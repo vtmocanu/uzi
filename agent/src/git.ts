@@ -222,6 +222,21 @@ function runnerTrackingRef(branch: string): string {
   return `${RUNNER_TRACKING_PREFIX}${branch}`;
 }
 
+// issue #1507 — a run+generation-scoped ANCHOR for the exact restore-point head a park /
+// early-terminal settle transfers into the trusted bare. Unlike the per-BRANCH tracking ref
+// `refs/uzi-runner/<branch>` (which a concurrent run sharing this bare+branch can move with its own
+// `fetchAgentBranch`/`updateTrackingRef`), this ref is keyed on the SETTLING run's id + claim
+// generation, so it is immune to another run's fetch and keeps the verified head durably reachable
+// through bundle production even after the branch tracking ref moves. The runId is sanitized into a
+// SINGLE path component (mirroring `refs/uzi-archive/<sanitized>/<sha>`) and the numeric generation
+// is the leaf, so the namespace is D/F-safe and dodges the branch-slash D/F hazard that affected
+// `refs/uzi-runner` (issue #887) — it never carries the branch.
+const RECOVERY_PIN_PREFIX = "refs/uzi-recovery-pin/";
+function recoveryPinRef(runId: string, generation: number): string {
+  const rid = runId.replace(/[^A-Za-z0-9_-]/g, "-");
+  return `${RECOVERY_PIN_PREFIX}${rid}/${generation}`;
+}
+
 // PRD #218 — the run-identity ANCHOR for a tracking ref. `refs/uzi-runner/<branch>` is
 // per-BRANCH and nothing ever deletes it, so on its own it cannot tell "the run that
 // wrote this parked its own work" from "a DIFFERENT, permanently-dead run left an orphan
@@ -1529,6 +1544,75 @@ export class GitCache {
       });
       return false;
     }
+  }
+
+  /**
+   * issue #1507 — the RUNNER clone's current HEAD (`HEAD^{commit}`), read as the RUNNER uid
+   * because the clone is runner-owned (a worker-uid read there would hit the B2 dubious-ownership
+   * boundary, git.ts B2), or null when unresolvable. This is the EXACT SHA
+   * {@link verifyRunnerTrackingCovers} compares the bare tracking ref against, so a settle that has
+   * just positively verified coverage can pin THIS value — the run's own PRIVATE, single-writer head
+   * — instead of rereading the shared, mutable `refs/uzi-runner/<branch>` (which a concurrent run on
+   * the same bare+branch could have moved since the verify). Reading HEAD is a pure ref read (no
+   * checkout/diff), so no attacker-chosen filter driver fires. Best-effort: swallows to null.
+   */
+  async worktreeHead(worktreePath: string): Promise<string | null> {
+    const sha = (
+      await this.runGitAsRunner(worktreePath, ["rev-parse", "--verify", "HEAD^{commit}"]).catch(() => "")
+    ).trim();
+    return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
+  }
+
+  /**
+   * issue #1507 — durably ANCHOR a KNOWN-verified restore-point head in the trusted bare under a
+   * run+generation-scoped pin ref, so a concurrent run moving the shared per-branch tracking ref
+   * `refs/uzi-runner/<branch>` cannot leave `sha` dangling before {@link produceRecoveryBundle}
+   * resolves it. UNDER THE BARE LOCK: re-confirm `sha` is a real commit present in the bare, then
+   * point the pin ref at it. Returns true iff present + pinned; false (→ the caller retains the
+   * source clone and keeps the hold open) when the object is absent or the update fails.
+   *
+   * Worker-uid, local, credential-free (no forge PAT), so it does NOT disturb the
+   * reap-before-credentialed-git ordering — the credentialed forge fetch still runs later. The pin
+   * ref is named from `runId` + `generation`, never the branch, so it is immune to another run's
+   * fetch of the branch tracking ref. It is a custom-namespace ref (a `--all` reachability root, the
+   * same posture `refs/uzi-runner` / `refs/uzi-archive` rely on to survive gc), so the anchored
+   * object stays reachable through bundle production even after the tracking ref moves.
+   */
+  async anchorRecoveryHead(
+    barePath: string,
+    runId: string,
+    generation: number,
+    sha: string,
+  ): Promise<boolean> {
+    if (!/^[0-9a-f]{40}$/.test(sha)) return false;
+    const pinRef = recoveryPinRef(runId, generation);
+    try {
+      return await this.withLock(barePath, async () => {
+        const present = (
+          await this.runGit(barePath, ["rev-parse", "--verify", `${sha}^{commit}`]).catch(() => "")
+        ).trim();
+        if (present !== sha) return false;
+        await this.runGit(barePath, ["update-ref", pinRef, sha]);
+        return true;
+      });
+    } catch (err) {
+      this.log.warn("recovery: could not anchor the verified restore-point head in the trusted bare", {
+        bare: barePath,
+        pin_ref: pinRef,
+        error: gitErrorMessage(err),
+      });
+      return false;
+    }
+  }
+
+  /**
+   * issue #1507 — best-effort remove a pin ref planted by {@link anchorRecoveryHead}, once a durable
+   * replacement exists (the bundle was archived, or the head is already forge-published). Never
+   * throws: a failed cleanup only leaves a harmless ref on the long-lived bare (the same
+   * never-deleted posture `refs/uzi-runner` already carries, PRD #218).
+   */
+  async deleteRecoveryPin(barePath: string, runId: string, generation: number): Promise<void> {
+    await this.tryGit(barePath, ["update-ref", "-d", recoveryPinRef(runId, generation)]);
   }
 
   /** Record clone ownership BEFORE running the model, so disk pressure during a

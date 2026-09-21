@@ -6479,7 +6479,12 @@ export class RunRunner {
    * the origin publish + park-sink bridge that {@link captureRecoveryRestorePoint} does: it only needs
    * the exact head present + reproducible in the bare, never a resumable resume-seed checkpoint.
    */
-  private async transferRestorePointToTrustedBare(flight: RunFlight, runLog: Logger): Promise<string | null> {
+  private async transferRestorePointToTrustedBare(
+    flight: RunFlight,
+    runLog: Logger,
+    runId: string,
+    generation: number,
+  ): Promise<string | null> {
     const barePath = flight.barePath;
     const worktreePath = flight.worktreePath;
     const branch = flight.branch;
@@ -6520,11 +6525,28 @@ export class RunRunner {
       runLog.warn("recovery: settle transfer — the tracking ref does not cover the run HEAD");
       return null;
     }
-    // The verified head is the tracking tip. A verified ref whose tip is unresolvable is treated as
-    // a transfer failure (retain) — bundle production needs a real 40-hex head.
-    const head = await this.git.trackingTip(barePath, branch);
+    // issue #1507 — do NOT reread the shared, per-branch tracking ref refs/uzi-runner/<branch> here.
+    // With WORKER_MAX_CONCURRENT_RUNS > 1 a concurrent run sharing this bare+branch can have moved it
+    // to ITS tip since the positive verify above, and a reread (the old trackingTip call) would pin
+    // THAT run's commit under THIS run's id+generation. The verify just proved the tracking ref
+    // equals this clone's HEAD, so the run's own PRIVATE, single-writer HEAD IS the exact verified
+    // SHA — read it from the clone, never the shared ref. (The sibling captureHoldContext reread is
+    // deliberately left: there bridgeParkSinkBestEffort MOVES the ref to a synthesised bridge commit
+    // between verify and read, so its reread is by-design, and its head feeds a PRD #218
+    // owner-stamp-gated same-worker reseed, not a directly-archived cross-run bundle.)
+    const head = await this.git.worktreeHead(worktreePath);
     if (head === null) {
-      runLog.warn("recovery: settle transfer — tracking ref verified but its tip is unresolvable");
+      runLog.warn("recovery: settle transfer — verified, but the run HEAD is unresolvable");
+      return null;
+    }
+    // Durably anchor the exact verified head under a run+generation-scoped pin ref, so it stays
+    // referenced through bundle production / journal handoff even if another run moves the branch
+    // tracking ref afterward. A false anchor (the object is absent in the bare, or the update
+    // failed) means no durable replacement exists yet ⇒ retain the source clone and keep the hold
+    // open, never a clone-only SHA fed to bundle production.
+    const anchored = await this.git.anchorRecoveryHead(barePath, runId, generation, head);
+    if (!anchored) {
+      runLog.warn("recovery: settle transfer — could not durably anchor the verified head in the trusted bare");
       return null;
     }
     return head;
@@ -6558,7 +6580,11 @@ export class RunRunner {
     const barePath = flight.barePath;
     if (!barePath) return;
     try {
-      const verifiedSha = await this.transferRestorePointToTrustedBare(flight, runLog);
+      // issue #1507 — the pin ref anchoring the transferred head is keyed on this run's exact claim
+      // generation; a v1 claim without one falls back to 0 (the same generation recovery.pin then
+      // records), so the anchor and the journal record agree.
+      const generation = claim.claim_generation ?? 0;
+      const verifiedSha = await this.transferRestorePointToTrustedBare(flight, runLog, claim.run_id, generation);
       if (verifiedSha === null) {
         // Transfer/verification failed: no durable replacement exists in the trusted bare yet, so
         // the runner clone is the only recoverable source. Preserve it and keep the hold OPEN;
@@ -6592,6 +6618,13 @@ export class RunRunner {
         forgeUsername: claim.secrets.forge_username,
         signal,
       });
+      // issue #1507 — a durable replacement now exists on the SUCCESS outcomes (the bundle is
+      // archived, or the head was already forge-published — both surface state "uploaded"), so the
+      // transient bare pin can go. On any retain (needs_action) LEAVE it as the durable anchor that
+      // keeps the retained source's exact head reachable in the bare.
+      if (outcome.state === "uploaded") {
+        await this.git.deleteRecoveryPin(barePath, claim.run_id, generation);
+      }
       runLog.info("recovery: park/early-terminal disposition outcome", {
         run_id: claim.run_id,
         claim_generation: claim.claim_generation,
