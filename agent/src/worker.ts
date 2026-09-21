@@ -169,6 +169,52 @@ export class Worker {
     }
   }
 
+  /**
+   * PRD #1391 Run B: re-resolve ONE run's pending terminal journal after its spilled messages have
+   * fully drained (called from the drainer at the retire point). This closes the gap the N3 guard
+   * (`gapFillLoop`, terminal-resolve.ts) leaves open: a run that FINISHED during the outage journals
+   * its terminal and loses its first send; on recovery the terminal-resolve can reach the api BEFORE
+   * this run's own message drain completes, get `messages_pending`, and defer ("leaving the journal
+   * for a later resolve after the drain completes") — but in a live worker nothing re-fired that
+   * resolve (boot and re-claim were the only re-resolve sites, and a finish-during-outage recovery has
+   * neither). The terminal then stranded until a restart, so a completed run could sit non-terminal or
+   * be false-timeouted. Now the drain's own retire is that "later resolve": the segments are gone, so
+   * the N3 guard passes and the fenced terminal lands. Mirrors resolveBootTerminals, scoped to runId;
+   * a no-op when the run has no pending terminal. Never throws on an expected failure — a still-failing
+   * send is left listed for the next drain / boot, exactly as the boot resolve leaves it.
+   */
+  private async resolveRunTerminal(runId: string, signal?: AbortSignal): Promise<void> {
+    const outbox = this.outbox;
+    if (!outbox) return;
+    const deps = makeTerminalOutboxDeps(outbox, this.client, {
+      gapFillMax: this.config.gapFillMax,
+      terminalMaxBytes: this.config.outboxTerminalMaxBytes,
+      log: this.log,
+    });
+    if (!deps) return; // no usable outbox (failed closed) — nothing durable to resolve
+    for (const entry of outbox.listPendingTerminals()) {
+      if (entry.run_id !== runId) continue;
+      if (signal?.aborted) return;
+      const gen = entry.claim_generation;
+      try {
+        await resolvePendingTerminal(deps, {
+          runId,
+          claimGeneration: gen,
+          // State-only send stamped with the journal's generation (mirrors resolveBootTerminals): a
+          // superseded generation is refused stale_claim and local-retired (D11), never mis-applied.
+          send: (body: StateRequest, sig?: AbortSignal) =>
+            this.client.reportState(runId, { ...body, claim_generation: gen }, sig),
+          signal,
+        });
+      } catch (err) {
+        this.log.warn("outbox: post-drain terminal resolve failed for a run; leaving it listed for a later resolve", {
+          run_id: runId,
+          error: errMessage(err),
+        });
+      }
+    }
+  }
+
   private async registerWithRetry(signal: AbortSignal): Promise<void> {
     // PRD #1391 Run B M4 (D7/SC3): if this worker holds any pending terminal journal, carry an
     // initial snapshot with an EMPTY pending subset + `pending_overflow: true` ON the register
@@ -379,7 +425,13 @@ export class Worker {
           const res = await outbox.drainRun(runId, (msgs, gen) =>
             replaySegment(this.client, runId, msgs, gen, this.log),
           );
-          if (res.retired) this.rearm?.get(runId)?.();
+          if (res.retired) {
+            this.rearm?.get(runId)?.();
+            // The run's spilled messages are now fully drained (segments retired), so the N3 guard
+            // that deferred any pending terminal journal no longer holds — re-resolve it here so a
+            // finish-during-outage outcome lands without waiting for a restart / re-claim (PRD #1391).
+            await this.resolveRunTerminal(runId, signal);
+          }
         } catch (err) {
           this.log.warn("outbox drain failed for a run; will retry next heartbeat", {
             run_id: runId,
