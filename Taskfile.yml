@@ -914,6 +914,7 @@ tasks:
       - ./.agents/skills/uzi-lander/scripts/land-prep.test.sh
       - ./.agents/skills/uzi-lander/scripts/watch-pr.test.sh
       - ./.agents/skills/uzi-lander/scripts/pr-findings.test.sh
+      - ./.agents/skills/uzi-lander/scripts/merge.test.sh
       - ./.agents/skills/uzi-lander/scripts/takeover.test.sh
       - ./.agents/skills/uzi-lander/scripts/watch-run-ci.test.sh
 

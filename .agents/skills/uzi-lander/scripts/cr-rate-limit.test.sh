@@ -29,18 +29,38 @@ if [ "${1:-}" = pr ] && [ "${2:-}" = comment ]; then
   done
   printf '%s\n' "$body" >> "$POSTED"
   asked=$(jq -nr 'now|todate')
-  if [ "${AVAILABLE_NOW:-0}" = 1 ]; then
+  if [ "${SINGULAR_MINUTE:-0}" = 1 ]; then
     /bin/sleep 1
     replied=$(jq -nr 'now|todate')
-    reply='Reviews are available now.'
+    reply='<!-- This is an auto-generated reply by CodeRabbit -->
+Your [plan](https://docs.coderabbit.ai/management/plans#fair-usage-limits-policy) includes PR reviews subject to [rate limits](https://docs.coderabbit.ai/management/plans#rate-limits). More reviews will be available in 1 minute.'
+  elif [ "${AVAILABLE_NOW:-0}" = 1 ]; then
+    /bin/sleep 1
+    replied=$(jq -nr 'now|todate')
+    reply='<!-- This is an auto-generated reply by CodeRabbit -->
+Your [plan](https://docs.coderabbit.ai/management/plans#fair-usage-limits-policy) includes PR reviews subject to [rate limits](https://docs.coderabbit.ai/management/plans#rate-limits). Reviews are available now.'
   else
     replied=$(jq -nr 'now+2|todate')
     reply="More reviews will be available in ${RESET_MIN:-12} minutes"
   fi
-  jq -n --arg a "$asked" --arg r "$replied" --arg reply "$reply" '[
-    {user:{login:"tester"},body:"@coderabbitai rate limit",created_at:$a,updated_at:$a},
-    {user:{login:"coderabbitai[bot]"},body:$reply,created_at:$r,updated_at:$r}
-  ]' > "$COMMENTS"
+  # A large body AFTER the match phrase forces the `printf … | grep -qF` SIGPIPE the fix
+  # removed: grep -q matches near the top and closes the pipe before printf finishes writing
+  # the (>64 KiB pipe-buffer) tail, so under pipefail the old match test returned 141 (false).
+  # The big body is fed to jq via --rawfile, NOT --arg: a 500 KB value passed as one argv
+  # element exceeds Linux MAX_ARG_STRLEN (~128 KiB) and execve(jq) fails there (it passed only
+  # on macOS). The file still yields a >pipe-buffer body, so it exercises the same SIGPIPE.
+  if [ "${BIG_BODY:-0}" = 1 ]; then
+    { printf '%s\n' "$reply"; head -c 500000 </dev/zero | tr '\0' x; } > "$COMMENTS.big"
+    jq -n --arg a "$asked" --arg r "$replied" --rawfile reply "$COMMENTS.big" '[
+      {user:{login:"tester"},body:"@coderabbitai rate limit",created_at:$a,updated_at:$a},
+      {user:{login:"coderabbitai[bot]"},body:$reply,created_at:$r,updated_at:$r}
+    ]' > "$COMMENTS"
+  else
+    jq -n --arg a "$asked" --arg r "$replied" --arg reply "$reply" '[
+      {user:{login:"tester"},body:"@coderabbitai rate limit",created_at:$a,updated_at:$a},
+      {user:{login:"coderabbitai[bot]"},body:$reply,created_at:$r,updated_at:$r}
+    ]' > "$COMMENTS"
+  fi
   if [ "${LATER_WALKTHROUGH:-0}" = 1 ]; then
     later=$(jq -nr 'now+4|todate')
     jq --arg t "$later" '. + [{
@@ -129,4 +149,32 @@ set -e
 grep -q '^CR_LIMITED=0$' "$WORK/available.out" || fail "available-now reply left stale limited state"
 grep -q '^CR_RESET_ELAPSED=1$' "$WORK/available.out" || fail "available-now reply did not release the query"
 
-echo "PASS cr-rate-limit: exact query, available-now, stale status, reset formatting"
+# CodeRabbit grammatically uses singular "1 minute"; it is the same authoritative countdown.
+MODE="singular"; SINGULAR_MINUTE=1; unset AVAILABLE_NOW; export MODE SINGULAR_MINUTE
+printf '[]\n' > "$COMMENTS"
+rm -f "$POSTED"
+set +e
+bash "$SCRIPT" test/repo 42 --query > "$WORK/singular.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 1 ] || fail "singular-minute reply returned rc=$rc, want 1: $(cat "$WORK/singular.out")"
+grep -q '^CR_LIMITED=1$' "$WORK/singular.out" || fail "singular-minute reply did not keep the active limit"
+grep -q '^CR_RESET_MIN=1$' "$WORK/singular.out" || fail "singular-minute reply did not produce a one-minute reset"
+grep -q '^CR_RESET_SOURCE=reply$' "$WORK/singular.out" || fail "singular-minute reply was not authoritative"
+
+# A LARGE available-now reply must still be recognized: the old `printf … | grep -qF` match
+# test returned 141 (SIGPIPE) under pipefail on a body past the pipe buffer, silently missing a
+# real immediate reset (observed on #1504). The no-pipeline `case` reads it deterministically.
+MODE="available"; AVAILABLE_NOW=1; BIG_BODY=1; unset SINGULAR_MINUTE; export MODE AVAILABLE_NOW BIG_BODY
+printf '[]\n' > "$COMMENTS"
+rm -f "$POSTED"
+set +e
+bash "$SCRIPT" test/repo 42 --query > "$WORK/available-big.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 0 ] || fail "large available-now reply returned rc=$rc, want 0 (SIGPIPE miss?): $(cat "$WORK/available-big.out")"
+grep -q '^CR_LIMITED=0$' "$WORK/available-big.out" || fail "large available-now reply left stale limited state: $(cat "$WORK/available-big.out")"
+grep -q '^CR_RESET_ELAPSED=1$' "$WORK/available-big.out" || fail "large available-now reply did not release the query: $(cat "$WORK/available-big.out")"
+unset BIG_BODY
+
+echo "PASS cr-rate-limit: exact query, singular minute, available-now (small + large), stale status, reset formatting"

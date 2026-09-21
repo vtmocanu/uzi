@@ -93,15 +93,24 @@ for n in "$@"; do
   # down; a failed fetch becomes garbage there on purpose, so it fails closed rather than
   # reading as "no trigger comment".
   gr_issue="x"
+  wt_body=""
   if wt_all=$(gh api --paginate "repos/${repo}/issues/${n}/comments" 2>/dev/null | jq -s 'add // []' 2>/dev/null) \
      && gr_issue="$wt_all" \
      && [ "$(printf '%s' "$wt_all" | jq '[.[]|select(.user.login=="coderabbitai[bot]" and (.body|contains("<!-- walkthrough_start -->")))]|length' 2>/dev/null)" = "1" ]; then
+    wt_body=$(printf '%s' "$wt_all" | jq -r '.[]|select(.user.login=="coderabbitai[bot]" and (.body|contains("<!-- walkthrough_start -->")))|.body' 2>/dev/null || true)
     # shellcheck disable=SC2016  # literal backticks in CodeRabbit's marker
-    wt_head=$(printf '%s' "$wt_all" | jq -r '.[]|select(.user.login=="coderabbitai[bot]" and (.body|contains("<!-- walkthrough_start -->")))|.body' \
+    wt_head=$(printf '%s' "$wt_body" \
       | awk '/final_review_risk_start/{f=1} f{print} /final_review_risk_end/{f=0}' | grep -oE 'up to `[0-9a-f]{5,40}`' | tail -1 | grep -oE '[0-9a-f]{5,40}' || true)
   fi
   cr_walk=0
   if [ -n "$wt_head" ] && [ -n "$head" ] && printf '%s' "$head" | grep -q "^$wt_head"; then cr_walk=1; fi
+  # Signal (e), matching watch-pr.sh: CodeRabbit's newer machine-readable head marker. When it
+  # drops the final_review_risk block (0 occurrences on #1502, 2026-09-21), it names the exact
+  # commit it assessed as change_assessment_commit:"<full-sha>". Match the FULL head in quotes,
+  # inside the single walkthrough comment only; a mid-review/post-push walkthrough still names
+  # the OLDER commit, so this cannot forge a "reviewed" on an unreviewed head.
+  if [ "$cr_walk" -eq 0 ] && [ -n "$wt_body" ] && [ -n "$head" ] \
+     && printf '%s' "$wt_body" | grep -qF "change_assessment_commit:\"$head\""; then cr_walk=1; fi
   # The commit status description names WHY CR did not review (rate limited / skipped).
   crdesc=""
   if [ -n "$head" ]; then
@@ -218,6 +227,13 @@ for n in "$@"; do
       echo "  🔴 Greptile finding set incomplete (${gr_scoped_total}/${gr_added} current-review comments readable) — NOT confirmed clean"
       unconfirmed="${unconfirmed} #${n}"
     fi
+  fi
+  # When CodeRabbit did NOT review the current head, any live CR thread below is carried from
+  # an earlier head (a push re-anchors it), so label it as stale-relative-to-head rather than
+  # letting it read as a current-head finding (the "stale thread + unreviewed head" case).
+  cr_thread_ct=$(printf '%s' "$thread_nodes" | jq '[.[]|select(.isResolved==false and .isOutdated==false)|select(any(.comments.nodes[]?; ((.author.login // "")|startswith("coderabbitai"))))]|length' 2>/dev/null || echo 0)
+  if [ "$cr_ok" -eq 0 ] && [ "${cr_thread_ct:-0}" -gt 0 ]; then
+    echo "  note: CodeRabbit has no verdict on head ${head:0:8}; the ${cr_thread_ct} CR finding(s) below are carried from an earlier review, not this head"
   fi
   # $sev/$t/$p below are jq variables, not shell expansions — single quotes are correct.
   # One output row per unresolved, non-outdated CR thread, using its first bot comment.
