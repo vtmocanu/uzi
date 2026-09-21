@@ -97,30 +97,49 @@ export const CODEX_CLAUSES: ClauseRow[] = [
     },
   },
   {
-    // C1 SEED — an `owed` O row: no descendant code-mode-host reaping proof exists in this
-    // candidate. A direct harness spawn cannot prove the ABSENCE of a descendant code-mode
-    // host (PRD "Required clause inventory"); only verified supervisor/descendant evidence
-    // can. It is OWED to the maintainer, which is why the receipts gate rejects it at C1.
+    // C1 SEED (reframed #1533) — an `owed` O row for the run-lane code-mode host's descendant
+    // posture. On the RUN provider root a codex-code-mode-host descendant appears during a turn
+    // (separate pgid) but leaves NO RETAINED descendant after provider-root disposal (adopted and
+    // reaped whole by its own supervisor, ECHILD+__WALL); on the ADVICE/stock root none ever
+    // appears. The run-posture O test (e2e/codex-m3a/code-mode-host-run-posture.test.ts) drives the
+    // REAL launcher + config.ts builder to prove BOTH postures, but a fresh PACKAGED snapshot below
+    // the real Go supervisor on the merge-candidate images is still OWED to the maintainer — the uzi
+    // worker cannot produce packaged descendant evidence from a direct harness spawn — which is why
+    // the receipts gate keeps rejecting it until a discharging manifest record exists.
     id: "codex-o-descendant-code-mode-host-absence",
     adapter: "codex",
     layer: "O",
     family: "Native execution bypass",
-    seam: "agent/codex/supervisor: subreaper descendant reaping (no code-mode-host descendant)",
+    seam: "agent/codex/supervisor: run-root code-mode-host descendant appears during a turn (separate pgid) then reaps whole (ECHILD+__WALL); advice/stock root launches none",
     positiveControl:
-      "M3a control A proves a code-mode host DOES appear below the supervisor when enabled",
+      "the run-posture O test drives the REAL launchCodexRoot + config.ts builder with "
+      + "codeModeHost=true and observes a real codex-code-mode-host below the supervisor with a "
+      + "SEPARATE pgid while a worker callback is in flight",
     negativeOracle:
-      "a packaged snapshot below the real supervisor must show NO codex-code-mode-host "
-      + "descendant under the shipped stock (code_mode_host=false) config",
+      "on the RUN provider root the code-mode-host descendant leaves NO RETAINED descendant after "
+      + "provider-root disposal — handle.dispose() reaps BOTH the app-server AND the host clean "
+      + "(state:drained, authority:ECHILD+__WALL), so nothing survives; on the ADVICE/stock root "
+      + "(codeModeHost=false) NO codex-code-mode-host descendant ever appears and dispose reaps ONLY "
+      + "the app-server",
     intendedOutcome:
-      "no retained descendant native execution host exists on the production packaged path",
-    tests: [],
+      "the run-lane code-mode host is a transient per-turn descendant reaped whole by its own "
+      + "supervisor (no retained descendant native execution host survives provider-root disposal), "
+      + "and the advice/stock lane launches no such host at all",
+    tests: [
+      "production launcher run posture: code_mode_host=true launches a real code-mode host below the supervisor with a separate pgid and reaps it clean",
+      "production launcher advice posture: code_mode_host=false launches NO code-mode host below the supervisor and reaps only the app-server",
+    ],
     o: {
       kind: "owed",
-      target: "codex worker image (base + jvm) descendant-reaping snapshot",
+      target: "codex worker image (base + jvm) run-posture code-mode-host appearance+reaping snapshot",
       reason:
-        "descendant/code-mode-host absence needs a fresh packaged snapshot below the REAL Go "
-        + "supervisor on a Landlock-capable runtime; the uzi worker cannot prove a descendant "
-        + "ABSENCE from a direct harness spawn.",
+        "the run-posture proof (e2e/codex-m3a/code-mode-host-run-posture.test.ts: 'production "
+        + "launcher run posture …' and 'production launcher advice posture …') drives the REAL "
+        + "launchCodexRoot + config.ts builder and, on a Landlock-capable Linux runtime, observes the "
+        + "run-root code-mode host appear (separate pgid) then reap clean (ECHILD+__WALL) and the "
+        + "advice/stock root launch none; a fresh PACKAGED snapshot below the real Go supervisor on "
+        + "the merge-candidate images is still owed for the O-layer receipt — the uzi worker cannot "
+        + "produce that packaged descendant evidence from a direct harness spawn.",
       owner: "maintainer (D8: fresh packaged O proof, k8s-first Linux runtime)",
     },
   },
@@ -344,9 +363,12 @@ export const CODEX_CLAUSES: ClauseRow[] = [
     positiveControl: "the real executor completes a fresh-start run and a resumed run",
     negativeOracle:
       "the fixed config template pins project_doc_max_bytes=0 + trust_level untrusted and every native "
-      + "feature off, rejects any unknown (smuggled repo/hook) key, and references no AGENTS.md/.codex; "
-      + "thread/start (start) AND thread/resume (resume) RE-assert the untrusted config and turn/start "
-      + "reasserts environments:[]; no repo trust surface rides any construction request",
+      + "feature off EXCEPT the run-lane code_mode_host — the authority-free callback-routing host, off "
+      + "on the default/advice lane and enabled (codeModeHost:true → code_mode_host=true) on the run lane "
+      + "with every OTHER native feature and trust still off; it rejects any unknown (smuggled repo/hook) "
+      + "key, and references no AGENTS.md/.codex; thread/start (start) AND thread/resume (resume) "
+      + "RE-assert the untrusted config and turn/start reasserts environments:[]; no repo trust surface "
+      + "rides any construction request",
     intendedOutcome: "untrusted repo content cannot install instructions, callbacks or execution authority at start, resume or a subsequent turn",
     tests: [CODEX_U_TRUST_CONSTRUCTION_TITLE],
   },
@@ -540,16 +562,23 @@ export const CODEX_CLAUSES: ClauseRow[] = [
       + "provider (no override block) and the loopback builder wires an authenticated fake provider "
       + "(requires_openai_auth=true) — so the disabled hooks are a real deny inside a working config",
     negativeOracle:
-      "every builder (prod api_key, prod subscription, loopback) pins hooks=false with NO hooks=true, "
-      + "NO bypass_hook_trust / dangerously-bypass-hook-trust, every native execution feature "
-      + "(shell_tool/unified_exec/code_mode*/apply_patch_freeform/multi_agent*/plugins/apps/remote_models) "
-      + "off, project_doc_max_bytes=0 and trust_level=untrusted; a non-loopback provider URL is rejected. "
-      + "The upstream hook serialization/spawn/timeout/malformed-output CHARACTERIZATION is the M0 "
-      + "test-only process (e2e/codex-m0/hooks-stdin.test.mjs, harness-errors.test.mjs) — referenced "
-      + "(its files exist), NOT re-run in this gate; production hooks being off is the production-side proof",
+      "every builder in the DEFAULT/advice posture (prod api_key, prod subscription, loopback) pins "
+      + "hooks=false with NO hooks=true, NO bypass_hook_trust / dangerously-bypass-hook-trust, every "
+      + "native EXECUTION feature (shell_tool/unified_exec/code_mode/code_mode_only/code_mode_prewarm/"
+      + "apply_patch_freeform/shell_snapshot*/multi_agent*/plugins/apps/remote_models) off, "
+      + "project_doc_max_bytes=0 and trust_level=untrusted; a non-loopback provider URL is rejected. "
+      + "code_mode_host is the ONE posture-dependent exception: it is the authority-free callback-routing "
+      + "execution HOST (environments:[], untrusted project, broker-mediated callbacks only), pinned OFF "
+      + "on the default/advice/stock lane and enabled ONLY on the run lane (codeModeHost:true → "
+      + "code_mode_host=true) with every OTHER native feature and hooks still off — NOT a native "
+      + "execution grant. The upstream hook serialization/spawn/timeout/malformed-output "
+      + "CHARACTERIZATION is the M0 test-only process (e2e/codex-m0/hooks-stdin.test.mjs, "
+      + "harness-errors.test.mjs) — referenced (its files exist), NOT re-run in this gate; production "
+      + "hooks being off is the production-side proof",
     intendedOutcome:
       "an upstream hook serialization/spawn/timeout/malformed-output failure can NEVER become production "
-      + "permission, because production Codex hooks (and every native feature) are disabled",
+      + "permission, because production Codex hooks (and every native EXECUTION feature) are disabled; the "
+      + "run-lane code_mode_host is the authority-free callback-routing host, not such a permission",
     tests: [CODEX_U_FAILURE_HOOKS_DISABLED_TITLE],
   },
   {

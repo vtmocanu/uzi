@@ -1,9 +1,13 @@
 // PRD #1156 M3a — a driver for the PRODUCTION Go supervisor + real Codex app-server,
 // used by the real-code-mode-host lifecycle suite (control A).
 //
-// This deliberately does NOT go through `launchCodexRoot`/`config.ts` (that ships the
-// HARDENED stock config with `code_mode_host=false`, which correctly does not launch a
-// host). Instead it drives the SAME production supervisor binary the launcher drives —
+// This deliberately does NOT go through `launchCodexRoot`/`config.ts`. config.ts's STOCK builder
+// stays host-disabled (`code_mode_host=false`, which correctly does not launch a host), while its
+// PRODUCTION/loopback builders enable the host on the RUN lane (`codeModeHost:true →
+// code_mode_host=true`) — that real-builder run posture is proven by
+// `e2e/codex-m3a/code-mode-host-run-posture.test.ts`, which DOES drive config.ts. This driver
+// remains the hand-rolled Control A instrument: it drives the SAME production supervisor binary
+// the launcher drives —
 // `uzi-codex-supervisor --expect-uid <N> -- <codex> app-server` spawned as the runner
 // uid — with a TEST-ONLY CODEX_HOME whose config ENABLES the code-mode host, so the real
 // `codex-code-mode-host` process actually launches below the supervisor. It speaks the

@@ -104,11 +104,21 @@ Two rows have **no prior packaged evidence at all** — a direct harness spawn c
 absence of a descendant process or the completeness of supervisor reaping, only a real packaged
 snapshot below the real supervisor can:
 
-- **`codex-o-descendant-code-mode-host-absence`** (Native execution bypass): no
-  `codex-code-mode-host` descendant appears below the supervisor under the shipped stock
-  (`code_mode_host=false`) config. M3a control A already proves a code-mode host **does** appear
-  when *enabled* — the positive control exists — but its converse absence under the shipped
-  config has never been packaged-proven.
+- **`codex-o-descendant-code-mode-host-absence`** (Native execution bypass): on the RUN provider
+  root a `codex-code-mode-host` descendant appears below the supervisor during a turn (a **separate
+  pgid**) but leaves **no retained descendant** after provider-root disposal — it is adopted and
+  reaped whole by its own supervisor (`state:"drained"`, `authority:"ECHILD+__WALL"`); on the
+  ADVICE/stock (`code_mode_host=false`) root **no** code-mode-host descendant ever appears and
+  dispose reaps only the app-server. The run-posture O test
+  `e2e/codex-m3a/code-mode-host-run-posture.test.ts` — its `production launcher run posture:
+  code_mode_host=true launches a real code-mode host below the supervisor with a separate pgid and
+  reaps it clean` and `production launcher advice posture: code_mode_host=false launches NO
+  code-mode host below the supervisor and reaps only the app-server` cases — drives the REAL
+  `launchCodexRoot` + `config.ts` builder to prove both postures, but a fresh packaged snapshot
+  below the real Go supervisor on the merge-candidate images has never been packaged-proven and
+  must be **re-proven and pinned at a fresh `provenBaseCommit` at landing** (the #1533 run-lane M1
+  change touches `agent/src/codex/config.ts`, a runtime path, so an older proof's fixed point
+  cannot ride it).
 - **`codex-o-packaged-descendant-reaping`** (Delegation and cleanup): the real Go supervisor
   reaps a boundary-action/command root's WHOLE descendant set to `ECHILD(+__WALL)` — including a
   backgrounded/process-group-escapee descendant — BEFORE any checkpoint/finalize publication.
