@@ -1154,6 +1154,92 @@ describe("CodexExecutor: wall park (PRD #1497 M2)", () => {
     assert.ok(rig.transport.turnStartCount >= 2, "the turn DID re-drive (the pre-redrive check passed); the cancel was honored AFTER by the post-redrive check");
     assert.equal(spies.clearWallModeCalls, 1, "the refused branch cleared the wall mode (no cancel was pending pre-redrive)");
   });
+
+  it("(plan) an owner cancel arriving DURING the refused re-drive cancels before the plan gate", async () => {
+    const controller = new AbortController();
+    let cancelled = false;
+    let gateCalls = 0;
+    const responder: Responder = (c) => {
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-plan" } };
+      if (c.method === "turn/start") {
+        const turnId = `tn-plan-${c.turnStartCount}`;
+        if (c.turnStartCount === 1) c.transport.push(threadStarted("th-plan"));
+        else {
+          cancelled = true;
+          c.transport
+            .push(toolCall(2, "submit_plan", { plan_md: "plan after refused park" }, "th-plan", turnId, "c-plan"))
+            .push(turnCompleted("completed", "th-plan", turnId));
+        }
+        return { turn: { id: turnId } };
+      }
+      return {};
+    };
+    const rig = makeRig({ responder });
+    const { ctx, spies } = wallCtx({
+      signal: controller.signal,
+      planApproved: false,
+      approvedPlan: undefined,
+      cancelRequested: () => cancelled,
+      gatePlan: async () => {
+        gateCalls++;
+        throw new Error("plan gate reached after cancel");
+      },
+    });
+    spies.mode = "wall";
+    spies.outcome = "refused";
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    await waitFor(() => rig.transport.turnStartCount >= 1, "plan turn 1 started");
+    controller.abort(new PauseNowSignal());
+    await assert.rejects(withTimeout(running, 3000, "codex plan cancel during refused re-drive"), /run cancelled/);
+    assert.ok(rig.transport.turnStartCount >= 2, "the plan turn re-drove before the cancel arrived");
+    assert.equal(gateCalls, 0, "the cancelled re-drive never reaches the plan gate");
+  });
+
+  it("(revision) an owner cancel arriving DURING the refused re-drive cancels before the revised plan gate", async () => {
+    const controller = new AbortController();
+    let cancelled = false;
+    let gateCalls = 0;
+    const responder: Responder = (c) => {
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-revise" } };
+      if (c.method === "turn/start") {
+        const turnId = `tn-revise-${c.turnStartCount}`;
+        if (c.turnStartCount === 1) {
+          c.transport
+            .push(threadStarted("th-revise"))
+            .push(toolCall(1, "submit_plan", { plan_md: "initial plan" }, "th-revise", turnId, "c-plan-1"))
+            .push(turnCompleted("completed", "th-revise", turnId));
+        } else if (c.turnStartCount >= 3) {
+          cancelled = true;
+          c.transport
+            .push(toolCall(3, "submit_plan", { plan_md: "revised plan" }, "th-revise", turnId, "c-plan-2"))
+            .push(turnCompleted("completed", "th-revise", turnId));
+        }
+        return { turn: { id: turnId } };
+      }
+      return {};
+    };
+    const rig = makeRig({ responder });
+    const { ctx, spies } = wallCtx({
+      signal: controller.signal,
+      planApproved: false,
+      approvedPlan: undefined,
+      cancelRequested: () => cancelled,
+      gatePlan: async () => {
+        gateCalls++;
+        if (gateCalls === 1) return { kind: "revise", feedback: "revise it" };
+        throw new Error("revised plan gate reached after cancel");
+      },
+      config: { plan_max_revisions: 1 },
+    });
+    spies.outcome = "refused";
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    await waitFor(() => rig.transport.turnStartCount >= 2, "revision turn 1 started");
+    spies.mode = "wall";
+    controller.abort(new PauseNowSignal());
+    await assert.rejects(withTimeout(running, 3000, "codex revision cancel during refused re-drive"), /run cancelled/);
+    assert.ok(rig.transport.turnStartCount >= 3, "the revision turn re-drove before the cancel arrived");
+    assert.equal(gateCalls, 1, "the cancelled re-drive never reaches the revised plan gate");
+  });
 });
 
 // ================================================================================

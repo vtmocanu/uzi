@@ -1610,15 +1610,6 @@ export class CodexExecutor implements Executor {
         // runner's captureHoldContext) instead of failing it.
         const implTurn = await this.driveTurnWithWallPark(ctx, epoch.harness, reducer, "implement", turnPrompt, epoch.resumeSessionId, idleMs, wallMs, epoch.buildPhaseBroker, { completedCount: latestProgress?.completed?.length ?? 0 });
         if (implTurn.kind === "walled") return { branch: ctx.branch, walled: { reason: REASON_WALL } };
-        // PRD #1497 M2 (CodeRabbit !1504): honor a sticky owner cancel that RACED the REFUSED re-drive
-        // INSIDE driveTurnWithWallPark. A `wall` PauseNowSignal aborts the SHARED, once-only ctx.signal
-        // PERMANENTLY, so a `cancel` that lands during the refused re-drive cannot abort that turn
-        // (driveCodexTurn's handledWallPause suppression continues it). tryCodexWallPark's refused branch
-        // re-checks the cancel only BEFORE re-driving; a cancel arriving DURING the re-drive that then
-        // returns `done` would break the loop below and complete the run, silently dropping the cancel.
-        // Re-check here, before handling the result — mirrors the sdk-executor loop-top ctx.cancelRequested
-        // re-check and complements the pre-redrive check. Cancel WINS over a completed re-drive.
-        if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
         const result = implTurn.result;
         if (result.sessionId) lastSessionId = result.sessionId;
         // Only overwrite when THIS turn reported progress (a quiet turn keeps the last value).
@@ -2097,6 +2088,12 @@ export class CodexExecutor implements Executor {
         const result = await this.driveCodexTurn(
           ctx, harness, reducer, phase, prompt, resumeId, idleMs, wallMs, buildPhaseBroker,
         );
+        // PRD #1497 M2 (CodeRabbit !1504): honor a sticky owner cancel that RACED a REFUSED
+        // wall-park re-drive in EVERY phase. The wall PauseNowSignal permanently spent the shared
+        // signal, so a later cancel cannot abort the re-driven turn and survives only in this sticky
+        // predicate. Check before returning the result to the plan, revision, or implement caller;
+        // otherwise that caller can gate or complete the run and silently drop the cancel.
+        if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
         return { kind: "turn", result };
       } catch (err) {
         const outcome = await this.tryCodexWallPark(ctx, err, at);
