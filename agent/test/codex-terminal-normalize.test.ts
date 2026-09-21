@@ -2,6 +2,8 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  formatCodexClassification,
+  normalizeCodexErrorInfo,
   normalizeCodexStatus,
   normalizeCodexTerminalErrors,
   normalizeCodexUsage,
@@ -61,6 +63,27 @@ describe("normalizeCodexTerminalErrors", () => {
     const errors = normalizeCodexTerminalErrors("unknown", "failed");
     assert.ok(!errors.join(" ").includes(secret));
   });
+
+  it("appends the classification suffix on failure when info is given", () => {
+    assert.deepEqual(normalizeCodexTerminalErrors("failed", "failed", { classification: "unauthorized" }), [
+      "codex turn ended with status: failed (unauthorized)",
+    ]);
+  });
+
+  it("appends the classification AND http status when info carries one", () => {
+    assert.deepEqual(
+      normalizeCodexTerminalErrors("failed", "failed", { classification: "httpConnectionFailed", httpStatus: 503 }),
+      ["codex turn ended with status: failed (httpConnectionFailed; http 503)"],
+    );
+  });
+
+  it("is byte-identical to the 2-arg form when info is absent (backward-compatible)", () => {
+    assert.deepEqual(normalizeCodexTerminalErrors("failed", "failed"), ["codex turn ended with status: failed"]);
+  });
+
+  it("is still empty on success even when info is given", () => {
+    assert.deepEqual(normalizeCodexTerminalErrors("completed", "success", { classification: "unauthorized" }), []);
+  });
 });
 
 describe("normalizeCodexUsage", () => {
@@ -115,5 +138,132 @@ describe("normalizeCodexUsage", () => {
     const kept = Object.keys(usage.wire.usage as Record<string, unknown>);
     assert.ok(kept.length < 64, "the retained keys are capped below the raw count");
     assert.ok(kept.length <= 32, "the retained key count honours the cap");
+  });
+});
+
+describe("normalizeCodexErrorInfo", () => {
+  it("resolves an exact lower-camel scalar tag to its display + category", () => {
+    assert.deepEqual(normalizeCodexErrorInfo("unauthorized"), {
+      classification: "unauthorized",
+      category: "authentication",
+    });
+  });
+
+  it("resolves the other scalar categories correctly", () => {
+    assert.deepEqual(normalizeCodexErrorInfo("internalServerError"), {
+      classification: "internalServerError",
+      category: "transport",
+    });
+    assert.deepEqual(normalizeCodexErrorInfo("badRequest"), { classification: "badRequest", category: "unknown" });
+    assert.deepEqual(normalizeCodexErrorInfo("sandboxError"), { classification: "sandboxError", category: "unknown" });
+  });
+
+  it("resolves an exact tagged variant with a bounded http status", () => {
+    assert.deepEqual(normalizeCodexErrorInfo({ httpConnectionFailed: { httpStatusCode: 503 } }), {
+      classification: "httpConnectionFailed",
+      category: "transport",
+      httpStatus: 503,
+    });
+    assert.deepEqual(normalizeCodexErrorInfo({ responseStreamConnectionFailed: { httpStatusCode: 502 } }), {
+      classification: "responseStreamConnectionFailed",
+      category: "transport",
+      httpStatus: 502,
+    });
+    assert.deepEqual(normalizeCodexErrorInfo({ responseStreamDisconnected: { httpStatusCode: 504 } }), {
+      classification: "responseStreamDisconnected",
+      category: "transport",
+      httpStatus: 504,
+    });
+    assert.deepEqual(normalizeCodexErrorInfo({ responseTooManyFailedAttempts: { httpStatusCode: 429 } }), {
+      classification: "responseTooManyFailedAttempts",
+      category: "transport",
+      httpStatus: 429,
+    });
+  });
+
+  it("ignores the activeTurnNotSteerable payload entirely (no http status extracted)", () => {
+    // Payload carries a well-formed httpStatusCode, yet this tagged variant is NOT an
+    // `http` entry — so the status MUST still be dropped. This pins the no-extraction
+    // behavior against a mutation that flips activeTurnNotSteerable to `http: true`.
+    const result = normalizeCodexErrorInfo({ activeTurnNotSteerable: { turnKind: "regular", httpStatusCode: 503 } });
+    assert.deepEqual(result, { classification: "activeTurnNotSteerable", category: "unknown" });
+    assert.equal(result?.httpStatus, undefined);
+  });
+
+  it("collapses a shape MISMATCH to unknown (tagged tag as a bare string)", () => {
+    assert.deepEqual(normalizeCodexErrorInfo("httpConnectionFailed"), {
+      classification: "unknown",
+      category: "unknown",
+    });
+  });
+
+  it("collapses a shape MISMATCH to unknown (scalar tag given as an object)", () => {
+    assert.deepEqual(normalizeCodexErrorInfo({ unauthorized: {} }), {
+      classification: "unknown",
+      category: "unknown",
+    });
+  });
+
+  it("is casing-sensitive: PascalCase does NOT match (a casing regression must fail this)", () => {
+    assert.deepEqual(normalizeCodexErrorInfo("Unauthorized"), { classification: "unknown", category: "unknown" });
+  });
+
+  it("drops an out-of-range or non-integer httpStatusCode but keeps the classification", () => {
+    for (const bad of [503.7, Number.NaN, 42, 700]) {
+      const result = normalizeCodexErrorInfo({ httpConnectionFailed: { httpStatusCode: bad } });
+      assert.equal(result?.classification, "httpConnectionFailed");
+      assert.equal(result?.category, "transport");
+      assert.equal(result?.httpStatus, undefined, `httpStatusCode ${String(bad)} must be dropped`);
+    }
+  });
+
+  it("keeps the boundary statuses 100 and 599", () => {
+    assert.equal(normalizeCodexErrorInfo({ httpConnectionFailed: { httpStatusCode: 100 } })?.httpStatus, 100);
+    assert.equal(normalizeCodexErrorInfo({ httpConnectionFailed: { httpStatusCode: 599 } })?.httpStatus, 599);
+  });
+
+  it("collapses an unknown tag to unknown", () => {
+    assert.deepEqual(normalizeCodexErrorInfo("totallyMadeUp"), { classification: "unknown", category: "unknown" });
+  });
+
+  it("returns undefined for null / undefined", () => {
+    assert.equal(normalizeCodexErrorInfo(null), undefined);
+    assert.equal(normalizeCodexErrorInfo(undefined), undefined);
+  });
+
+  it("collapses every other shape to unknown", () => {
+    for (const shape of [{}, { a: 1, b: 2 }, [], 5, true]) {
+      assert.deepEqual(normalizeCodexErrorInfo(shape), { classification: "unknown", category: "unknown" });
+    }
+  });
+
+  it("NEVER leaks a secret-shaped value in any of the three positions it can appear", () => {
+    const secret = ["sk", "leak", "SHOULDNOTAPPEAR9999"].join("-");
+    // (1) as a bare-string codexErrorInfo
+    const asBareString = normalizeCodexErrorInfo(secret);
+    // (2) as a one-key tag
+    const asTag = normalizeCodexErrorInfo({ [secret]: { httpStatusCode: 503 } });
+    // (3) as the value under a recognized tag's payload
+    const inPayload = normalizeCodexErrorInfo({ httpConnectionFailed: { httpStatusCode: 503, detail: secret } });
+    for (const result of [asBareString, asTag, inPayload]) {
+      assert.ok(!JSON.stringify(result).includes(secret), "the secret substring never appears in the output");
+    }
+    assert.deepEqual(asBareString, { classification: "unknown", category: "unknown" });
+    assert.deepEqual(asTag, { classification: "unknown", category: "unknown" });
+    // The recognized tag still resolves; only the range-gated status is read, the secret detail is ignored.
+    assert.deepEqual(inPayload, { classification: "httpConnectionFailed", category: "transport", httpStatus: 503 });
+  });
+});
+
+describe("formatCodexClassification", () => {
+  it("renders just the classification when no http status is present", () => {
+    assert.equal(formatCodexClassification({ classification: "unauthorized" }), "unauthorized");
+  });
+
+  it("renders classification + http status when present", () => {
+    assert.equal(
+      formatCodexClassification({ classification: "httpConnectionFailed", httpStatus: 503 }),
+      "httpConnectionFailed; http 503",
+    );
   });
 });
