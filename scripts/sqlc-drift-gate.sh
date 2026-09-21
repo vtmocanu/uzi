@@ -83,6 +83,23 @@ if [ "$rc" -ne 0 ]; then
   exit 2
 fi
 
+# A generated *.sql.go that sqlc produces but that was never committed stays UNTRACKED,
+# and `git diff --exit-code` below (tracked-only) reads it as clean -- so required codegen
+# can be missing from the commit while the gate reports green. sqlc's out: dir
+# (api/internal/store) also holds hand-written *_test.go and the queries/ + migrations/
+# sources, so scope to the generated suffix: any untracked *.sql.go here is codegen missing
+# from the commit, whether sqlc just created it or it was generated earlier and never staged.
+# --exclude-standard so a gitignored scratch file is not counted; `|| true` keeps a no-match
+# grep (rc 1) from tripping errexit.
+untracked_gen="$(git -C "$ROOT" ls-files --others --exclude-standard -- "api/$GEN_SUBDIR" | grep '\.sql\.go$' || true)"
+if [ -n "$untracked_gen" ]; then
+  echo "sqlc-drift-gate: DRIFT -- untracked generated file(s) under api/$GEN_SUBDIR (missing from the commit):" >&2
+  printf '%s\n' "$untracked_gen" >&2
+  echo "  Regenerate and stage the codegen:  cd api && go run $SQLC_PKG generate && git add -A internal/store" >&2
+  echo "  (CI's validate-api job would report clean here; this untracked-file check catches it before the push.)" >&2
+  exit 1
+fi
+
 # `git diff --exit-code` returns 1 for "differences found" and >1 (e.g. 128) for a
 # git error. Keep the 2/1/0 contract honest: only rc==1 is drift; a git failure is
 # an instrument problem (exit 2), not a stale-codegen finding.

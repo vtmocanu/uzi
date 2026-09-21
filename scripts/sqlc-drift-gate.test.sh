@@ -47,6 +47,8 @@ case "${FAKE_SQLC_MODE:-clean}" in
   clean)  exit 0 ;;                                            # regenerate == committed
   drift)  printf 'regenerated\n' > internal/store/models.go   # cwd is api/
           exit 0 ;;
+  newfile) printf 'package store\n' > internal/store/new_query.sql.go  # cwd is api/; untracked
+          exit 0 ;;
   broken) echo "fake sqlc: config error" >&2; exit 1 ;;       # tool failed to run
   *) echo "fake go: unknown FAKE_SQLC_MODE" >&2; exit 3 ;;
 esac
@@ -104,5 +106,33 @@ repo="$(make_repo no-version)"
 run_gate "$repo" clean "$TMP/noversion.out"
 assert_eq 2 "$GATE_RC" "missing version exit code"
 assert_contains "$TMP/noversion.out" "could not read SQLC_VERSION"
+
+# 5. New untracked file: regenerate creates an uncommitted *.sql.go under the codegen
+#    dir -> exit 1. `git diff` alone reads clean (tracked-only); the untracked-file check
+#    is what catches a generated file missing from the commit.
+repo="$(make_repo with-version)"
+run_gate "$repo" newfile "$TMP/newfile.out"
+assert_eq 1 "$GATE_RC" "new untracked file exit code"
+assert_contains "$TMP/newfile.out" "untracked"
+
+# 6. Generated file already on disk but never `git add`ed (produced in an earlier run,
+#    forgotten at commit) while regeneration is a no-op -> exit 1. `git diff` reads clean
+#    and a before/after snapshot would cancel it; scoping to the *.sql.go suffix catches it.
+repo="$(make_repo with-version)"
+printf 'package store\n' > "$repo/api/internal/store/orphan.sql.go"
+run_gate "$repo" clean "$TMP/orphan.out"
+assert_eq 1 "$GATE_RC" "pre-existing untracked generated file exit code"
+assert_contains "$TMP/orphan.out" "untracked"
+
+# 7. Untracked NON-generated files under the codegen dir (a WIP test, a new query source)
+#    are NOT drift -- only the generated *.sql.go suffix is scoped, since that dir also
+#    holds hand-written *_test.go and the queries/ + migrations/ sources. Clean -> exit 0.
+repo="$(make_repo with-version)"
+printf 'package store\n' > "$repo/api/internal/store/wip_test.go"
+mkdir -p "$repo/api/internal/store/queries"
+printf '%s\n' '-- name: Wip :one' 'SELECT 1;' > "$repo/api/internal/store/queries/wip.sql"
+run_gate "$repo" clean "$TMP/wip.out"
+assert_eq 0 "$GATE_RC" "untracked non-generated files are not drift"
+assert_contains "$TMP/wip.out" "clean"
 
 printf 'sqlc-drift-gate tests: PASS\n'
