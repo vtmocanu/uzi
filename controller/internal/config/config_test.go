@@ -886,3 +886,104 @@ func TestLoadWorkerEphemeralRequestsPerTier(t *testing.T) {
 		}
 	})
 }
+
+// --- Codex uid-split profile (PRD #1493 M1) --------------------------------
+
+// UZI_WORKER_UID_SPLIT defaults false, honours an explicit true, and treats a
+// set-but-non-boolean value as a BOOT error — the same strict parse as UZI_WORKER_FORCE_ROLL,
+// so an operator opting the fleet into (or out of) the split can never have the choice
+// silently flipped by a typo.
+func TestLoadParsesTheUIDSplit(t *testing.T) {
+	t.Run("defaults false when unset", func(t *testing.T) {
+		setWorkerEnv(t)
+		t.Setenv("UZI_API_URL", "https://uzi.example.com")
+		t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.WorkerUIDSplit {
+			t.Error("WorkerUIDSplit = true, want the default false when UZI_WORKER_UID_SPLIT is unset")
+		}
+	})
+
+	t.Run("true parses true", func(t *testing.T) {
+		setWorkerEnv(t)
+		t.Setenv("UZI_API_URL", "https://uzi.example.com")
+		t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
+		t.Setenv("UZI_WORKER_UID_SPLIT", "true")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if !cfg.WorkerUIDSplit {
+			t.Error("UZI_WORKER_UID_SPLIT=true must set WorkerUIDSplit")
+		}
+	})
+
+	t.Run("a non-boolean value is a boot error", func(t *testing.T) {
+		setWorkerEnv(t)
+		t.Setenv("UZI_API_URL", "https://uzi.example.com")
+		t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
+		t.Setenv("UZI_WORKER_UID_SPLIT", "maybe")
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "UZI_WORKER_UID_SPLIT") {
+			t.Fatalf("err = %v, want a boot refusal naming UZI_WORKER_UID_SPLIT", err)
+		}
+	})
+}
+
+// UZI_CODEX_COMMAND_SANDBOX defaults to "required", accepts "best-effort", and rejects any
+// other value at boot (strict allow-list). An empty/unset value takes the default rather than
+// erroring — the same "fail at boot, not at the far end" rule its neighbours follow.
+func TestLoadParsesTheCommandSandboxMode(t *testing.T) {
+	t.Run("defaults to required when unset", func(t *testing.T) {
+		setWorkerEnv(t)
+		t.Setenv("UZI_API_URL", "https://uzi.example.com")
+		t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.WorkerCommandSandbox != "required" {
+			t.Errorf("WorkerCommandSandbox = %q, want the default \"required\" when unset", cfg.WorkerCommandSandbox)
+		}
+	})
+
+	t.Run("best-effort parses", func(t *testing.T) {
+		setWorkerEnv(t)
+		t.Setenv("UZI_API_URL", "https://uzi.example.com")
+		t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
+		t.Setenv("UZI_CODEX_COMMAND_SANDBOX", "best-effort")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.WorkerCommandSandbox != "best-effort" {
+			t.Errorf("WorkerCommandSandbox = %q, want best-effort", cfg.WorkerCommandSandbox)
+		}
+	})
+
+	t.Run("required parses", func(t *testing.T) {
+		setWorkerEnv(t)
+		t.Setenv("UZI_API_URL", "https://uzi.example.com")
+		t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
+		t.Setenv("UZI_CODEX_COMMAND_SANDBOX", "required")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.WorkerCommandSandbox != "required" {
+			t.Errorf("WorkerCommandSandbox = %q, want required", cfg.WorkerCommandSandbox)
+		}
+	})
+
+	t.Run("an unknown value is a boot error", func(t *testing.T) {
+		setWorkerEnv(t)
+		t.Setenv("UZI_API_URL", "https://uzi.example.com")
+		t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
+		t.Setenv("UZI_CODEX_COMMAND_SANDBOX", "off")
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "UZI_CODEX_COMMAND_SANDBOX") {
+			t.Fatalf("err = %v, want a boot refusal naming UZI_CODEX_COMMAND_SANDBOX", err)
+		}
+	})
+}

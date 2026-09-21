@@ -91,6 +91,22 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 
 {{- /*
+  uzi.validateCommandSandbox: fail fast on an unrecognized workers.codex.commandSandbox
+  (PRD #1493 M4). The controller and the worker both parse it as a strict allow-list
+  (required|best-effort) and refuse to boot on anything else, so this catches a typo at
+  `helm template` time — where the message can name the fix — rather than as a controller
+  CrashLoop after deploy. Called unconditionally from api-deployment.yaml alongside
+  uzi.validateDatabaseMode, so it fires even with workers disabled; renders nothing on a
+  valid value, so a good install is byte-unchanged.
+*/ -}}
+{{- define "uzi.validateCommandSandbox" -}}
+{{- $s := .Values.workers.codex.commandSandbox -}}
+{{- if not (has $s (list "required" "best-effort")) -}}
+{{- fail (printf "workers.codex.commandSandbox must be one of required|best-effort, got %q" $s) -}}
+{{- end -}}
+{{- end -}}
+
+{{- /*
   uzi.apiServiceName: the in-cluster name of the api Service. LOAD-BEARING: the web
   nginx reverse-proxies `/api/*` to this exact name (same-origin, no CORS), so it
   MUST resolve to the api pods in the release namespace. Defaults to "api" (what the

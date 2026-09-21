@@ -733,8 +733,8 @@ export class GitCache {
       await fs.rm(clonePath, { recursive: true, force: true });
       // The clone's parent dir. Under the M4 split it must be group-`runner`-writable so
       // the runner-uid `git clone` can create <key> inside it: /data/runner is
-      // worker:runner 2775 (setgid) from the entrypoint, and the worker runs with umask
-      // 002 (main.ts), so this mkdir is 2775 group `runner` — the runner creates the
+      // worker:runner 3775 (setgid+sticky) from the entrypoint, and the worker runs with umask
+      // 002 (main.ts), so this mkdir is 2775 group `runner` (setgid inherited, sticky is not) — the runner creates the
       // clone and the isolated runner-cmd identity can write it through the same group.
       // Single-uid (#58): plain worker dir.
       await fs.mkdir(path.dirname(clonePath), { recursive: true });

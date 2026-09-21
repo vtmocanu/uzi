@@ -60,6 +60,7 @@ import { buildLeadSystemPrompt, buildRevisePlanPrompt, publishedTipNote } from "
 import { RUNNER_UID, WORKER_UID, uidSplitActive } from "../runner-uid.js";
 import { errMessage } from "../util.js";
 import type { AgentTemplate, ClaimSkill } from "../protocol.js";
+import type { CommandSandboxMode } from "../config.js";
 
 import { ExecutionRegistry, newLocalExecutionEpoch, type RegisteredRoot } from "./registry.js";
 import {
@@ -665,7 +666,7 @@ export function makeProductionLaunchAdviceRoot(homeRoot: string, authMode: Codex
     // worker:worker (gid WORKER_UID) would EEXIST and be REJECTED by the strict gid check, so
     // they opt in to the narrowly-scoped destructive recovery: a pre-existing worker-group
     // parent is atomically renamed OUT of the live path and recreated FRESH (worker:runner
-    // 2770) — NEVER chgrp'd/adopted. The per-call UUID leaves below stay plain strict calls.
+    // 3770) — NEVER chgrp'd/adopted. The per-call UUID leaves below stay plain strict calls.
     await ensureCodexSharedDirectory(dataParent, undefined, { recreateDisposableWorkerGroupDir: true });
     await ensureCodexSharedDirectory(cwdParent, undefined, { recreateDisposableWorkerGroupDir: true });
     const ownedDataRoot = path.join(dataParent, id);
@@ -939,7 +940,7 @@ async function ensureCodexSharedDirectoryInner(
 ): Promise<void> {
   let created = false;
   try {
-    await fs.mkdir(dir, { mode: 0o2770 });
+    await fs.mkdir(dir, { mode: 0o3770 });
     created = true;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
@@ -974,7 +975,7 @@ async function ensureCodexSharedDirectoryInner(
       const beforeIno = before.ino;
       // Atomically move the pre-existing dir OUT of the live path. This sibling lives in the advice
       // parent's own directory (sdkHomeRoot/agent-home), which under supported uid-split is
-      // worker:runner 2775 — runner-group-writable — so it is only a TRANSIENT holding spot, NEVER
+      // worker:runner 3775 — runner-group-writable — so it is only a TRANSIENT holding spot, NEVER
       // where we recursively remove (issue #1495 CodeRabbit CWE-367: a concurrent runner could
       // rename that path between a check and fs.rm's recursive walk).
       const tombstone = `${dir}.uzi-tomb-${randomUUID()}`;
@@ -982,7 +983,7 @@ async function ensureCodexSharedDirectoryInner(
       // Recreate the live path fresh through the strict create path. The live path is now correct
       // regardless of the tombstone's fate; the disposal below is best-effort and never throws.
       await handle.close();
-      await fs.mkdir(dir, { mode: 0o2770 });
+      await fs.mkdir(dir, { mode: 0o3770 });
       created = true;
       handle = await fs.open(dir, FS.O_RDONLY | FS.O_DIRECTORY | FS.O_NOFOLLOW);
       before = await handle.stat();
@@ -995,7 +996,7 @@ async function ensureCodexSharedDirectoryInner(
       // the live path (out of the live path, in the runner-writable parent) and never recursively
       // removed; on a post-move inode mismatch the moved content stays in the private quarantine and
       // is not removed. GUARANTEE: pre-existing content is never adopted or unsafely removed, and
-      // the live path is always fresh worker:runner 2770.
+      // the live path is always fresh worker:runner 3770.
       await disposeCodexRecoveryTombstone(tombstone, dir, expect.uid, beforeDev, beforeIno);
     }
 
@@ -1014,9 +1015,17 @@ async function ensureCodexSharedDirectoryInner(
     if (owned.uid !== expect.uid || owned.gid !== expect.gid) {
       throw new Error("Codex shared data directory has an unexpected owner or group");
     }
-    await handle.chmod(0o2770);
+    // PRD #1493 M3 (D7): enforce 3770 — sticky PLUS setgid — for EVERY caller (per-run
+    // HOME, codex-data, and the two disposable advice parents). The sticky bit makes a
+    // runner-group-writable parent unlink/rename-safe: uid 10003 (runner-cmd, a `runner`
+    // group member) cannot rename, unlink or replace an active provider root it does not
+    // own — including codex-session-store under the per-run HOME — through the group-writable
+    // parent, even without Landlock. chmod is what actually sets the special bits (mkdir's
+    // mode is umask/POSIX-unspecified for setgid+sticky), and it re-applies them after the
+    // create-only chown above (a non-root chown clears setgid).
+    await handle.chmod(0o3770);
     const after = await handle.stat();
-    if ((after.mode & 0o7777) !== 0o2770) {
+    if ((after.mode & 0o7777) !== 0o3770) {
       throw new Error("Codex shared data directory has an unexpected mode");
     }
   } finally {
@@ -1026,7 +1035,7 @@ async function ensureCodexSharedDirectoryInner(
 
 /** Safely dispose of a recovery tombstone (issue #1495 CodeRabbit TOCTOU/CWE-367). The tombstone
  *  sits beside the live advice parent, whose directory is runner-group-writable under supported
- *  uid-split (worker:runner 2775), so it must NOT be recursively removed in place — a concurrent
+ *  uid-split (worker:runner 3775), so it must NOT be recursively removed in place — a concurrent
  *  runner could swap that path between a check and the recursive walk, and entry removal/rename
  *  depends on the PARENT's permissions, so a 0700 dir *under* agent-home would still be swappable.
  *  Instead relocate the tombstone into a freshly-created, validated 0700 quarantine rooted at
@@ -1179,6 +1188,21 @@ export interface CodexExecutorOptions {
    *  per-run `homeRoot`. Defaults to `path.dirname(provisionHomeDir)/provision` when
    *  omitted (parity with SdkExecutor). */
   readonly provisionRoot?: string;
+  /**
+   * PRD #1493 M3: the command-sandbox enforcement mode this worker was configured
+   * with (`config.codexCommandSandbox`). Threaded into `commandSandboxArgv` as the
+   * `--mode` token the Go sandbox reads. It comes ONLY from the worker Config, never
+   * from run/repo/model input; omitted defaults to `required` (today's fail-closed
+   * behaviour), so a caller/test that does not set it is unchanged.
+   */
+  readonly commandSandbox?: CommandSandboxMode;
+  /**
+   * PRD #1493 M3: true when this worker is advertising Codex DEGRADED (best-effort on
+   * a Landlock-less kernel, so commands run without filesystem confinement). When set,
+   * `run()` writes ONE line into the run's feed at startup (never a per-command
+   * model-visible warning). Absent/false is the normal (confined or required) case.
+   */
+  readonly commandSandboxDegraded?: boolean;
 }
 
 // ─── The per-epoch provider bundle + shared executor-claim context (m4) ─────────
@@ -1199,6 +1223,9 @@ interface EpochSharedContext {
   readonly boundaryDeadlineMs: number;
   readonly childTurnDeadlineMs: number;
   readonly commandEnv: NodeJS.ProcessEnv;
+  /** PRD #1493 M3: the worker-configured command-sandbox mode, threaded into every
+   *  epoch's command + fileop effect argv (`commandSandboxArgv`'s `--mode` token). */
+  readonly commandSandbox: CommandSandboxMode;
   readonly screenPolicy: ScreenPolicy;
   readonly toolHandlers: ReadonlyMap<string, ToolHandler>;
   readonly registerToken: (token: string) => void;
@@ -1291,6 +1318,23 @@ export class CodexExecutor implements Executor {
     const worktreePath = ctx.worktreePath;
     const storeDir = path.join(this.homeRoot, "codex-session-store");
     const boundaryDeadlineMs = this.deps.boundaryDeadlineMs ?? DEFAULT_BOUNDARY_DEADLINE_MS;
+    // PRD #1493 M3: the command-sandbox mode is the WORKER's Config value (never run/
+    // repo/model input); absent defaults to `required` (today's fail-closed sandbox).
+    const commandSandbox = this.opts.commandSandbox ?? "required";
+
+    // PRD #1493 M3: when the worker is advertising Codex DEGRADED (best-effort on a
+    // Landlock-less kernel), write ONE line into this run's feed — a worker status line,
+    // never a per-command model-visible warning. main.ts already logged it once at
+    // startup; this makes the posture visible per run.
+    if (this.opts.commandSandboxDegraded === true) {
+      ctx.emit({
+        kind: "status",
+        agent: "worker",
+        payload: {
+          text: "codex command sandbox is running best-effort on a kernel without Landlock: model-authorized commands run WITHOUT filesystem confinement (the uid split is still enforced)",
+        },
+      });
+    }
 
     if (uidSplitActive()) await assertCommandWorktreePosture(worktreePath);
 
@@ -1334,7 +1378,7 @@ export class CodexExecutor implements Executor {
       // fresh-PVC/zero-package run would otherwise ENOENT (mirrors sdk-executor.ts:820-826). It
       // creates only the PARENT (`provisionHomeDir` === dirname(homeRoot) in production), never
       // the per-run home itself, so the create-only gid repair still fires. `prepareCodexRunHome`
-      // then creates the fresh per-run home (created=true → repair → worker:runner 2770) BEFORE
+      // then creates the fresh per-run home (created=true → repair → worker:runner 3770) BEFORE
       // devbox materializes it with the wrong (inherited) gid. Gated on the same
       // `launchProviderRoot === undefined` production gate the per-epoch prepare uses, so injected
       // launcher tests keep owning their synthetic filesystem.
@@ -1393,7 +1437,7 @@ export class CodexExecutor implements Executor {
         this.deps.spawnBoundaryRoot ??
         ((): Promise<RegisteredRoot> =>
           Promise.reject(new Error("codex boundary-action spawn seam is not wired (the runner drives spawnBoundaryProcess)")));
-      const boundaryProcessSpawner = makeBoundaryProcessSpawner(launchEffectRoot);
+      const boundaryProcessSpawner = makeBoundaryProcessSpawner(launchEffectRoot, commandSandbox);
       const reconcile = this.makeBoundaryReconcile(ctx.runId, registerToken, committedGeneration);
       // (C, F1) Terminal eviction of tokens released by the POST-RUN sink reconciles. The runner
       // calls safety.dispose after the last durability sink — by which point run()'s finally has
@@ -1418,6 +1462,7 @@ export class CodexExecutor implements Executor {
         boundaryDeadlineMs,
         childTurnDeadlineMs: this.deps.childTurnDeadlineMs ?? DEFAULT_CHILD_TURN_DEADLINE_MS,
         commandEnv,
+        commandSandbox,
         // D6 (PRD #1287, user-approved 2026-09-12): carry the trusted provider-HOME prefix into
         // the shell/file screener so a literal read of a provider-owned credential file UNDER
         // codex-data/ is DENIED before the command launcher, not left to OS containment. The
@@ -1620,7 +1665,7 @@ export class CodexExecutor implements Executor {
   ): Promise<ProviderEpoch> {
     const {
       provider, binding, worktreePath, storeDir, homeRoot, boundaryDeadlineMs, childTurnDeadlineMs,
-      commandEnv, screenPolicy, toolHandlers, registerToken, committedGeneration, launchEffectRoot,
+      commandEnv, commandSandbox, screenPolicy, toolHandlers, registerToken, committedGeneration, launchEffectRoot,
       spawnBoundaryRoot, boundaryProcessSpawner, reconcile, evictTokens, accountant,
     } = shared;
 
@@ -1629,7 +1674,7 @@ export class CodexExecutor implements Executor {
     // shared parents are runner-group-writable, so a checkpoint-driven epoch recreation must
     // re-verify rather than assume nothing mutated between checkpoints. The call is cheap and
     // idempotent: on the already-initialized home (run() initialized it before provisioning) it
-    // hits created=false and validates the correct worker:runner 2770, or throws if tampered.
+    // hits created=false and validates the correct worker:runner 3770, or throws if tampered.
     // Injected launchProviderRoot tests own their synthetic filesystem and skip this production step.
     if (this.deps.launchProviderRoot === undefined) {
       await prepareCodexRunHome(homeRoot);
@@ -1676,12 +1721,13 @@ export class CodexExecutor implements Executor {
         boundaryDeadlineMs,
         worktreePath,
         commandEnv,
+        commandSandbox,
       );
       const spawnCommand: SpawnCommandSeam = (argv, spawnOpts) => baseSpawnCommand(argv, { ...spawnOpts, env: commandEnv });
       const fileopRoot = await launchRegisteredEffectRoot(
         registry,
         launchEffectRoot,
-        commandEffectSpec(worktreePath, worktreePath, FILEOP_BIN, ["--root", worktreePath], commandEnv),
+        commandEffectSpec(worktreePath, worktreePath, FILEOP_BIN, ["--root", worktreePath], commandEnv, commandSandbox),
         boundaryDeadlineMs,
         "command",
       );
@@ -2226,13 +2272,20 @@ async function launchRegisteredEffectRoot(
 /** Build the fixed argv for the root-owned Landlock wrapper used by uid 10003.
  * Landlock allowlists only this run's worktree, its random private tmp and
  * read-only system/toolchain paths, so sibling `/data`, `/run`, `/proc` and `/tmp`
- * state cannot be enumerated even though every run shares numeric uid 10003. */
+ * state cannot be enumerated even though every run shares numeric uid 10003.
+ *
+ * PRD #1493 M3: the worker-supplied sandbox `mode` is emitted as a `--mode <mode>`
+ * token BEFORE the `--` separator. It is the trusted worker's Config value (never
+ * run/repo/model input); a `--mode` token that the model puts in `command`/`args`
+ * lands AFTER `--` and the Go sandbox reads it as part of the child, never as the
+ * mode. */
 export function commandSandboxArgv(
   worktreePath: string,
   cwd: string,
   command: string,
   args: readonly string[],
   privateTmp: string,
+  mode: CommandSandboxMode,
 ): string[] {
   const worktree = path.resolve(worktreePath);
   const workCwd = path.resolve(cwd);
@@ -2247,6 +2300,7 @@ export function commandSandboxArgv(
     "--root", worktree,
     "--tmp", privateTmp,
     "--cwd", workCwd,
+    "--mode", mode,
     "--", command, ...args,
   ];
 }
@@ -2288,13 +2342,14 @@ function commandEffectSpec(
   command: string,
   args: readonly string[],
   env: NodeJS.ProcessEnv,
+  mode: CommandSandboxMode,
 ): CodexEffectLaunchSpec {
   const cleanupToken = randomUUID();
   const privateTmp = `/tmp/uzi-codex-command-${cleanupToken}`;
   return {
     identity: "command",
     command: COMMAND_SANDBOX_BIN,
-    args: commandSandboxArgv(worktreePath, cwd, command, args, privateTmp),
+    args: commandSandboxArgv(worktreePath, cwd, command, args, privateTmp, mode),
     cwd: worktreePath,
     env: { ...env, HOME: privateTmp, TMPDIR: privateTmp },
     supervisorBin: SUPERVISOR_BIN,
@@ -2311,13 +2366,14 @@ export function makeDefaultSpawnCommand(
   reapDeadlineMs: number,
   worktreePath: string,
   commandEnv: NodeJS.ProcessEnv,
+  mode: CommandSandboxMode,
 ): SpawnCommandSeam {
   return async (argv, opts): Promise<SpawnCommandResult> => {
       const [cmd, ...rest] = argv;
       const launched = await launchRegisteredEffectRoot(
         registry,
         launch,
-        commandEffectSpec(worktreePath, opts.cwd ?? worktreePath, cmd ?? "/bin/sh", rest, opts.env ?? commandEnv),
+        commandEffectSpec(worktreePath, opts.cwd ?? worktreePath, cmd ?? "/bin/sh", rest, opts.env ?? commandEnv, mode),
         reapDeadlineMs,
         "command",
       );
@@ -2397,12 +2453,13 @@ export function makeDefaultSpawnCommand(
 
 function makeBoundaryProcessSpawner(
   launch: (spec: CodexEffectLaunchSpec, deadlineMs?: number) => Promise<CodexRootHandle>,
+  mode: CommandSandboxMode,
 ): SpawnBoundaryProcessSeam {
   return async (request: BoundaryProcessRequest, deadlineMs: number): Promise<SpawnedBoundaryProcess> => {
     const [command, ...args] = request.argv;
     if (!command) throw new Error("boundary process argv is empty");
     const spec: CodexEffectLaunchSpec = request.identity === "command"
-      ? commandEffectSpec(request.cwd, request.cwd, command, args, request.env)
+      ? commandEffectSpec(request.cwd, request.cwd, command, args, request.env, mode)
       : {
           identity: "worker_pat",
           command,

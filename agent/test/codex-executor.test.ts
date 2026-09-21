@@ -416,7 +416,7 @@ interface Rig {
   disposed: () => number;
   fileopDisposed: () => number;
   spawnCommandCalls: { argv: readonly string[]; opts: { cwd?: string } }[];
-  fileopSpawns: { worktreePath: string; env: NodeJS.ProcessEnv }[];
+  fileopSpawns: { worktreePath: string; env: NodeJS.ProcessEnv; args: readonly string[] }[];
   effectDisposes: () => number;
   providerLaunches: () => number;
   sessionOps: { adopt: number; removeCalls: number; inspect: number; persist: number };
@@ -449,7 +449,7 @@ function makeRig(opts: { responder?: Responder; token?: string } = {}): Rig {
       return { code: 0, stdout: "ok", stderr: "" };
     },
     launchEffectRoot: async (spec: CodexEffectLaunchSpec): Promise<CodexRootHandle> => {
-      fileopSpawns.push({ worktreePath: WORKSPACE, env: spec.env });
+      fileopSpawns.push({ worktreePath: WORKSPACE, env: spec.env, args: spec.args });
       const stdin = new PassThrough();
       const stdout = new PassThrough();
       const stderr = new PassThrough();
@@ -1504,6 +1504,7 @@ describe("CodexExecutor: default command capture is byte-capped (A — untrusted
       1000,
       "/data/runner/repo/run-1",
       runEnv,
+      "required",
     );
     const res = await withTimeout(
       spawnCommand(["/bin/sh", "-c", `head -c ${bytesToEmit} /dev/zero`], { cwd: "/data/runner/repo/run-1" }),
@@ -1526,6 +1527,7 @@ describe("CodexExecutor: default command capture is byte-capped (A — untrusted
       1000,
       "/data/runner/repo/run-1",
       runEnv,
+      "required",
     );
     const res = await withTimeout(
       spawnCommand(["/bin/sh", "-c", "printf 'hello world'"], { cwd: "/data/runner/repo/run-1" }),
@@ -1561,7 +1563,7 @@ describe("CodexExecutor: default command capture is byte-capped (A — untrusted
         whenFailed: new Promise<Error>(() => undefined),
       };
     };
-    const spawnCommand = makeDefaultSpawnCommand(registry, launch, 1000, "/data/runner/repo/run-2", runEnv);
+    const spawnCommand = makeDefaultSpawnCommand(registry, launch, 1000, "/data/runner/repo/run-2", runEnv, "required");
     const abort = new AbortController();
     const running = spawnCommand(["/bin/sh", "-c", "sleep 60"], {
       cwd: "/data/runner/repo/run-2",
@@ -1576,20 +1578,61 @@ describe("CodexExecutor: default command capture is byte-capped (A — untrusted
     assert.equal(registry.hasLiveCommandRoot(), false);
   });
 
-  it("builds the fixed Landlock wrapper argv for only the current worktree/private tmp", () => {
+  it("builds the fixed Landlock wrapper argv for only the current worktree/private tmp, with the --mode token before --", () => {
     const args = commandSandboxArgv(
       "/data/runner/repo/run-a",
       "/data/runner/repo/run-a/sub",
       "/bin/sh",
       ["-c", "pwd"],
       "/tmp/uzi-codex-command-test-a",
+      "required",
     );
     assert.deepEqual(args, [
       "--root", "/data/runner/repo/run-a",
       "--tmp", "/tmp/uzi-codex-command-test-a",
       "--cwd", "/data/runner/repo/run-a/sub",
+      "--mode", "required",
       "--", "/bin/sh", "-c", "pwd",
     ]);
+  });
+
+  it("emits the worker's best-effort mode as the --mode token", () => {
+    const args = commandSandboxArgv(
+      "/data/runner/repo/run-a",
+      "/data/runner/repo/run-a",
+      "/bin/sh",
+      [],
+      "/tmp/uzi-codex-command-test-a",
+      "best-effort",
+    );
+    // The --mode token sits immediately before the -- separator.
+    const sep = args.indexOf("--");
+    assert.deepEqual(args.slice(sep - 2, sep), ["--mode", "best-effort"]);
+  });
+
+  it("a model-supplied --mode in the command/args lands AFTER -- and cannot become the sandbox mode", () => {
+    // The worker's mode is `required`; the model tries to smuggle `--mode best-effort`
+    // as command arguments. It must appear only AFTER the -- separator (the child), so the
+    // Go sandbox reads it as part of the child, never as the sandbox mode.
+    const args = commandSandboxArgv(
+      "/data/runner/repo/run-a",
+      "/data/runner/repo/run-a",
+      "/bin/sh",
+      ["-c", "echo hi", "--mode", "best-effort"],
+      "/tmp/uzi-codex-command-test-a",
+      "required",
+    );
+    const sep = args.indexOf("--");
+    // The ONLY --mode before the separator is the worker's trusted `required`.
+    assert.deepEqual(args.slice(0, sep), [
+      "--root", "/data/runner/repo/run-a",
+      "--tmp", "/tmp/uzi-codex-command-test-a",
+      "--cwd", "/data/runner/repo/run-a",
+      "--mode", "required",
+    ]);
+    // The model's --mode best-effort is entirely inside the child argv (after --).
+    assert.deepEqual(args.slice(sep + 1), ["/bin/sh", "-c", "echo hi", "--mode", "best-effort"]);
+    assert.equal(args.slice(0, sep).filter((a) => a === "--mode").length, 1, "exactly one trusted --mode before --");
   });
 });
 
@@ -2585,6 +2628,90 @@ describe("CodexExecutor: credential-free command env (item 6)", () => {
     assert.equal(env.LOCALE_ARCHIVE, "/nix/locale-archive");
     assert.equal(env.UZI_CODEX_COMMANDENV_CANARY, undefined, "process.env is not inherited into the credential-free command identity");
   });
+
+  // PRD #1493 M3 (part C) — the sandbox mode in the emitted --mode token comes ONLY from the
+  // worker Config, never from a UZI_CODEX_COMMAND_SANDBOX value smuggled through the
+  // model-influenced tool env. The fileop root's sandbox argv is the observable proof.
+  function modeFlagOf(args: readonly string[]): string | undefined {
+    const i = args.indexOf("--mode");
+    return i >= 0 && i < args.indexOf("--") ? args[i + 1] : undefined;
+  }
+
+  it("a fake UZI_CODEX_COMMAND_SANDBOX in the TOOL env does NOT change the emitted --mode (stays the worker's required)", async () => {
+    const rig = makeRig();
+    rig.deps = {
+      ...rig.deps,
+      // The model-influenced tool env tries to smuggle a best-effort override.
+      provisionRunTools: async () => ({ toolEnv: { UZI_CODEX_COMMAND_SANDBOX: "best-effort" } as Record<string, string> }),
+    };
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    const { ctx } = makeCtx();
+    const executor = new CodexExecutor(
+      noopLog,
+      "/data/agent-home/run-1",
+      { binding: bindingOf(SUBSCRIPTION), client: rig.client as never, provider, commandSandbox: "required" },
+      rig.deps,
+    );
+    await withTimeout(executor.run(ctx), 3000, "tool-env mode run");
+    const args = rig.fileopSpawns[0]!.args;
+    assert.equal(modeFlagOf(args), "required", "the --mode token is the worker's required, not the tool env's best-effort");
+    // Belt-and-braces: the smuggled value never appears anywhere in the sandbox argv.
+    assert.ok(!args.includes("best-effort"), "the tool env's best-effort value is nowhere in the sandbox argv");
+  });
+
+  it("the worker Config best-effort mode flows into the emitted --mode token", async () => {
+    const rig = makeRig();
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    const { ctx } = makeCtx();
+    const executor = new CodexExecutor(
+      noopLog,
+      "/data/agent-home/run-1",
+      { binding: bindingOf(SUBSCRIPTION), client: rig.client as never, provider, commandSandbox: "best-effort" },
+      rig.deps,
+    );
+    await withTimeout(executor.run(ctx), 3000, "best-effort mode run");
+    assert.equal(modeFlagOf(rig.fileopSpawns[0]!.args), "best-effort", "the worker's best-effort mode reaches the sandbox argv");
+  });
+
+  it("writes ONE degraded-mode line into the run feed when commandSandboxDegraded is set, none otherwise", async () => {
+    // Degraded on: exactly one worker status line naming the unconfined posture.
+    const rigOn = makeRig();
+    rigOn.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    const { ctx: ctxOn, emitted: emittedOn } = makeCtx();
+    await withTimeout(
+      new CodexExecutor(
+        noopLog,
+        "/data/agent-home/run-1",
+        { binding: bindingOf(SUBSCRIPTION), client: rigOn.client as never, provider, commandSandbox: "best-effort", commandSandboxDegraded: true },
+        rigOn.deps,
+      ).run(ctxOn),
+      3000,
+      "degraded feed run",
+    );
+    const degradedLines = emittedOn.filter(
+      (m) => m.kind === "status" && m.agent === "worker" && /without filesystem confinement/i.test(String((m.payload as { text?: string }).text ?? "")),
+    );
+    assert.equal(degradedLines.length, 1, "exactly one degraded-mode feed line per run");
+
+    // Degraded off (the default): no such line.
+    const rigOff = makeRig();
+    rigOff.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    const { ctx: ctxOff, emitted: emittedOff } = makeCtx();
+    await withTimeout(
+      new CodexExecutor(
+        noopLog,
+        "/data/agent-home/run-1",
+        { binding: bindingOf(SUBSCRIPTION), client: rigOff.client as never, provider, commandSandbox: "required" },
+        rigOff.deps,
+      ).run(ctxOff),
+      3000,
+      "non-degraded feed run",
+    );
+    assert.ok(
+      !emittedOff.some((m) => /without filesystem confinement/i.test(String((m.payload as { text?: string }).text ?? ""))),
+      "no degraded-mode line when the sandbox is not degraded",
+    );
+  });
 });
 
 // ================================================================================
@@ -2639,7 +2766,7 @@ describe("CodexExecutor: provisioning + init target the SHARED provisioning HOME
       : "requires running as WORKER_UID with WORKER_UID + RUNNER_UID group membership";
 
   it(
-    "run() initializes the FRESH per-run HOME to worker:runner 2770 BEFORE provisioning materializes it",
+    "run() initializes the FRESH per-run HOME to worker:runner 3770 BEFORE provisioning materializes it",
     { skip: INIT_SKIP },
     async () => {
       // Single-uid (#58) non-root k8s: no UZI_UID_SPLIT, so run()'s worktree-posture assert is inert.
@@ -2651,9 +2778,9 @@ describe("CodexExecutor: provisioning + init target the SHARED provisioning HOME
         // exists here (setgid parent), also exercising the recursive-mkdir no-op path; do NOT
         // pre-create the per-run home.
         const provisionHomeDir = path.join(base, "agent-home");
-        await fs.mkdir(provisionHomeDir, { mode: 0o2770 });
+        await fs.mkdir(provisionHomeDir, { mode: 0o3770 });
         await fs.chown(provisionHomeDir, WORKER_UID, WORKER_UID);
-        await fs.chmod(provisionHomeDir, 0o2770);
+        await fs.chmod(provisionHomeDir, 0o3770);
         const homeRoot = path.join(provisionHomeDir, "run-1495"); // == sdkHomeRoot/<runId>
 
         const sentinel = new Error("SENTINEL: provisioning short-circuit after devbox materialized its HOME");
@@ -2678,13 +2805,14 @@ describe("CodexExecutor: provisioning + init target the SHARED provisioning HOME
         await assert.rejects(executor.run(ctx), /SENTINEL/, "the run short-circuits at the provisioning stub");
 
         // run()'s initialization created the per-run home FRESH (created=true → create-only repair)
-        // BEFORE provisioning could touch it: worker:runner 2770. PRE-FIX (no init block,
-        // provisioning HOME = the per-run home) this dir would EXIST with the inherited gid worker,
-        // unrepaired — so gid === RUNNER_UID is the load-bearing regression assertion.
+        // BEFORE provisioning could touch it: worker:runner 3770 (sticky + setgid, PRD #1493 M3).
+        // PRE-FIX (no init block, provisioning HOME = the per-run home) this dir would EXIST with
+        // the inherited gid worker, unrepaired — so gid === RUNNER_UID is the load-bearing
+        // regression assertion.
         const st = await fs.lstat(homeRoot);
         assert.equal(st.uid, WORKER_UID, "per-run home owner is worker");
         assert.equal(st.gid, RUNNER_UID, "per-run home was repaired FRESH to gid runner (init ordering)");
-        assert.equal(st.mode & 0o7777, 0o2770, "per-run home mode is 2770");
+        assert.equal(st.mode & 0o7777, 0o3770, "per-run home mode is 3770 (sticky + setgid)");
         const codexData = await fs.lstat(path.join(homeRoot, "codex-data"));
         assert.equal(codexData.gid, RUNNER_UID, "codex-data is runner-group-owned (init ordering)");
         assert.equal(provisionHomeSeen, provisionHomeDir, "provisioning HOME is the SHARED root, never the per-run home");

@@ -49,6 +49,8 @@ function baseDeps(overrides: Partial<BuildRunExecutorDeps> = {}): BuildRunExecut
     stubPlanGate: false,
     workerTokenFile: undefined,
     dockerWiring: {},
+    codexCommandSandbox: "required",
+    codexSandboxDegraded: false,
     ...overrides,
   };
 }

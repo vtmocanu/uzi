@@ -393,6 +393,20 @@ type RenderConfig struct {
 	// controller already creates — no new RBAC verb, so Decision 1's Secrets line
 	// stays verbatim. Empty means the worker verifies against the system roots.
 	APICAPEM []byte
+	// UIDSplit opts into the Codex uid-split worker profile (PRD #1493 M1). When true the
+	// worker + seed-nix containers start as root with a short fixed capability set (see
+	// podTemplate) so the image's root entrypoint branch can establish Codex's three-identity
+	// (worker/runner/runner-cmd) split; the pod-level runAsNonRoot is relaxed to admit those
+	// uid-0 containers. When false the rendered pod is byte-identical to before this field
+	// existed. Any pod-template change moves the spec hash, so flipping the knob rolls the
+	// fleet once (the intended behaviour).
+	UIDSplit bool
+	// CommandSandbox is the Codex command sandbox mode ("required" or "best-effort"). It is
+	// rendered onto the worker container as UZI_CODEX_COMMAND_SANDBOX ONLY when it is not the
+	// default "required" (an empty value normalizes to "required" in podTemplate), so a
+	// default install's pod carries no such env and stays byte-identical. Worker container
+	// only — the mode never comes off the wire and never touches the seed/dind containers.
+	CommandSandbox string
 }
 
 // names for one worker's objects.
@@ -713,23 +727,81 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 		// by design), so tmp being dind-visible adds no exposure beyond the checkout that
 		// M-workdir already shares.
 		//
-		// The agent honours this: on the current non-root k8s start entrypoint.sh takes the
+		// The agent honours this: on a single-uid non-root k8s start entrypoint.sh takes the
 		// single-uid branch (it unsets UZI_RUNNER_TMPDIR and does NOT set its own TMPDIR), so
 		// this pod-spec TMPDIR survives and runnerTmpdir() (= UZI_RUNNER_TMPDIR || TMPDIR)
 		// returns it — reaching both the worker and the repo's docker/compose. Render-only,
 		// verified against agent/templates/entrypoint.sh + agent/src/runner-uid.ts.
-		// FUTURE COUPLING: PRD #51 M4's runner-uid split (root-started A1 path, not yet on
-		// k8s) makes the entrypoint export its OWN tmpdirs UNDER /tmp — worker TMPDIR
-		// /tmp/uzi-worker (overriding this value) and UZI_RUNNER_TMPDIR /tmp/uzi-runner — both
-		// OUTSIDE /data/runner, so repo bind sources would land back outside the dind-shared
-		// workdir. When that split lands on k8s, both tmpdirs must be relocated under
-		// dindWorkdirDir. Not a 0.8.1 concern (the split does not run on the non-root start).
+		// COUPLING: the root-started A1 uid-split path (PRD #51 / PRD #1493) NOW runs on k8s
+		// behind UZI_WORKER_UID_SPLIT. Its root entrypoint branch would otherwise export its
+		// OWN tmpdirs UNDER /tmp — worker TMPDIR /tmp/uzi-worker (overriding this value) and
+		// UZI_RUNNER_TMPDIR /tmp/uzi-runner — both OUTSIDE /data/runner, landing repo bind
+		// sources outside the dind-shared workdir. Under the split the entrypoint instead
+		// relocates both tmpdirs BENEATH dindWorkdirDir (this TMPDIR), so a docker bind source
+		// staged under $TMPDIR still resolves in the daemon. M1 renders the TMPDIR the split
+		// then derives beneath; PRD #1493 M2 owns that entrypoint change.
 		env = append(env, corev1.EnvVar{Name: "TMPDIR", Value: dindWorkdirDir})
+	}
+
+	// The Codex command sandbox mode (PRD #1493 M1), worker container only. Normalize an
+	// empty (Go zero) value to "required" locally so a zero value never leaks out, then emit
+	// UZI_CODEX_COMMAND_SANDBOX ONLY when it is NOT the default "required" — "required" and an
+	// unset value render NO env key at all, keeping a default install's pod byte-identical.
+	// Only "best-effort" is ever emitted, and only on the worker container.
+	mode := cfg.CommandSandbox
+	if mode == "" {
+		mode = "required"
+	}
+	if mode != "" && mode != "required" {
+		env = append(env, corev1.EnvVar{Name: "UZI_CODEX_COMMAND_SANDBOX", Value: mode})
 	}
 
 	containerSecurity := &corev1.SecurityContext{
 		AllowPrivilegeEscalation: &allowPrivilegeEscalation,
 		Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+	}
+	// By default the seed-nix init and worker containers share #58's restricted posture
+	// above (drop ALL, allowPrivilegeEscalation:false, no added caps, no per-container uid).
+	// Under the opt-in uid-split profile (PRD #1493 M1) each instead starts as ROOT with a
+	// short fixed capability set, so the image's root entrypoint branch can establish Codex's
+	// three-identity (worker/runner/runner-cmd) split. Modelled on render_dind.go's
+	// per-container root+caps precedent (dind-init/dind). Kubernetes has NO ambient
+	// capabilities, so a capabilities.add is only effective after execve when the container
+	// runs as uid 0 (Decision D5); a non-root uid with added caps is inert. With the knob OFF
+	// both keep the shared pointer, so the rendered containers are byte-identical to today.
+	seedSecurity, workerSecurity := containerSecurity, containerSecurity
+	if cfg.UIDSplit {
+		root := int64(0)
+		containerRunAsNonRoot := false
+		workerSecurity = &corev1.SecurityContext{
+			RunAsUser:                &root,
+			RunAsGroup:               &root,
+			RunAsNonRoot:             &containerRunAsNonRoot,
+			AllowPrivilegeEscalation: &allowPrivilegeEscalation,
+			// The exact five capabilities compose grants the root startup window
+			// (docker-compose.yml), all inside PodSecurity `baseline`: SETUID/SETGID/SETPCAP
+			// to carve the runner identities and setpriv-drop into them, CHOWN/DAC_OVERRIDE to
+			// migrate ownership of the run trees. Everything else stays dropped.
+			Capabilities: &corev1.Capabilities{
+				Drop: []corev1.Capability{"ALL"},
+				Add:  []corev1.Capability{"SETUID", "SETGID", "SETPCAP", "CHOWN", "DAC_OVERRIDE"},
+			},
+		}
+		seedSecurity = &corev1.SecurityContext{
+			RunAsUser:                &root,
+			RunAsGroup:               &root,
+			RunAsNonRoot:             &containerRunAsNonRoot,
+			AllowPrivilegeEscalation: &allowPrivilegeEscalation,
+			// The reseed must chmod, remove and replace a nix store owned by EITHER the legacy
+			// worker uid or (after the first split start) the runner uid, and clear the shared
+			// /data provisioning state whichever uid owns it: CHOWN + DAC_OVERRIDE + FOWNER
+			// (chmod a dir it does not own). No SETUID/SETGID/SETPCAP — the seed never drops
+			// identity — so its cap set is narrower than the worker's.
+			Capabilities: &corev1.Capabilities{
+				Drop: []corev1.Capability{"ALL"},
+				Add:  []corev1.Capability{"CHOWN", "DAC_OVERRIDE", "FOWNER"},
+			},
+		}
 	}
 
 	// Init containers, worker volume mounts and pod volumes all grow (only) for a
@@ -743,21 +815,23 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 		Image:           spec.Image,
 		Command:         []string{"/bin/sh", "-c", nixSeedScript(nixMountPath, nixSeedMountPath, toolchainProfileMarker, dataSeedMountPath)},
 		Resources:       seedResources,
-		SecurityContext: containerSecurity,
+		SecurityContext: seedSecurity,
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: "nix", MountPath: nixSeedMountPath},
 			// The DATA PVC too, at a NON-/data path: a reseed must clear the shared
 			// devbox/nix provisioning state persisted here or it dangles into the wiped
 			// store (PRD #92 M2). Mounted at dataSeedMountPath for the same masking
 			// rationale as the nix mount above.
-			// FUTURE COUPLING: PRD #51 M4's runner-uid split (root-started A1 path, not yet
-			// on k8s) makes /data shared across the worker and a distinct `runner` uid. This
-			// init runs as the pod runAsUser; today (single-uid) that IS the uid that owns the
-			// devbox/nix state, so the best-effort `rm -rf` succeeds. Once the split lands on
-			// k8s, this container's uid + the cleared paths' ownership must be re-derived —
-			// otherwise the clear EACCESes and, being best-effort (`|| true`), silently
-			// no-ops, regressing the dangling-store heal onto M4's "devbox install re-realizes"
-			// fallback. Re-derive alongside the TMPDIR relocation noted above.
+			// COUPLING: the root-started A1 uid-split path (PRD #51 / PRD #1493) NOW runs on
+			// k8s behind UZI_WORKER_UID_SPLIT, and after the first split start /nix is
+			// runner-owned and /data is shared across the worker and a distinct `runner` uid.
+			// In the SINGLE-UID posture this init runs as the pod runAsUser (10001), which owns
+			// the devbox/nix state, so the best-effort `rm -rf` succeeds. Under the split this
+			// init instead runs as uid 0 with CHOWN/DAC_OVERRIDE/FOWNER (see seedSecurity in
+			// podTemplate), so a reseed can chmod, remove and replace a store owned by EITHER
+			// uid and clear the shared /data provisioning state whichever uid owns it — the
+			// clear no longer fails silently. M1 renders that identity; PRD #1493 M2 owns the
+			// entrypoint's matching behaviour.
 			{Name: "data", MountPath: dataSeedMountPath},
 		},
 	}}
@@ -855,6 +929,34 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 		}
 	}
 
+	// The pod-level SecurityContext. Single-uid (the default): the worker runs as 10001
+	// non-root. Under the uid-split profile (PRD #1493 M1) the worker + seed-nix containers
+	// override runAsUser to 0, and a pod-level runAsNonRoot:true would REJECT those uid-0
+	// containers at admission — so relax it to false and DROP the pod-level
+	// runAsUser/runAsGroup, letting each container decide. fsGroup, its change policy and the
+	// seccomp profile are KEPT either way: the token stays root:<fsGroup> 0440 (readable by
+	// the worker's gid 10001), the RWO PVCs stay writable, and #58's RuntimeDefault seccomp
+	// still applies. With the knob OFF this is byte-identical to the pre-#1493 pod.
+	podSecurity := &corev1.PodSecurityContext{
+		RunAsNonRoot: &runAsNonRoot,
+		RunAsUser:    &uid,
+		RunAsGroup:   &gid,
+		// fsGroup is load-bearing TWICE. (a) an RWO PVC mounts root:root 0755, so
+		// uid 10001 cannot write it, and the usual initContainer-chown escape needs
+		// root, which PodSecurity `restricted` forbids. (b) a Secret volume's files
+		// are owned root:<fsGroup>, so without it the token would be root:root and
+		// unreadable — see the 0440 note on the volume below.
+		FSGroup:             &fsGroup,
+		FSGroupChangePolicy: &fsGroupPolicy,
+		SeccompProfile:      &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+	}
+	if cfg.UIDSplit {
+		podRunAsNonRoot := false
+		podSecurity.RunAsNonRoot = &podRunAsNonRoot
+		podSecurity.RunAsUser = nil
+		podSecurity.RunAsGroup = nil
+	}
+
 	return corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{
 			Labels: objectLabels(w.ID),
@@ -869,20 +971,8 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 			// Soft anti-affinity for docker workers ONLY (nil for a plain worker, so its
 			// spec/hash is untouched). Keeps the pod off nodes running the crown-jewel
 			// pods — see dockerNodeAntiAffinity.
-			Affinity: dockerNodeAntiAffinity(w),
-			SecurityContext: &corev1.PodSecurityContext{
-				RunAsNonRoot: &runAsNonRoot,
-				RunAsUser:    &uid,
-				RunAsGroup:   &gid,
-				// fsGroup is load-bearing TWICE. (a) an RWO PVC mounts root:root 0755, so
-				// uid 10001 cannot write it, and the usual initContainer-chown escape needs
-				// root, which PodSecurity `restricted` forbids. (b) a Secret volume's files
-				// are owned root:<fsGroup>, so without it the token would be root:root and
-				// unreadable — see the 0440 note on the volume below.
-				FSGroup:             &fsGroup,
-				FSGroupChangePolicy: &fsGroupPolicy,
-				SeccompProfile:      &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
-			},
+			Affinity:        dockerNodeAntiAffinity(w),
+			SecurityContext: podSecurity,
 			// Built above: [seed-nix] for a plain worker, [seed-nix, dind-init, dind]
 			// for a docker one. The docker sidecars are native (restartPolicy: Always),
 			// so k8s orders and gates them ahead of the worker container.
@@ -916,7 +1006,7 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 						corev1.ResourceMemory: spec.Size.MemoryLimit,
 					},
 				},
-				SecurityContext: containerSecurity,
+				SecurityContext: workerSecurity,
 				// Built above: [token, data, nix] plus, for a docker worker, the shared
 				// run workdir (M-workdir) and — rootless only — the shared socket dir.
 				VolumeMounts: workerMounts,

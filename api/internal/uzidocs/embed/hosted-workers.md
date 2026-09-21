@@ -100,6 +100,31 @@ That's expected while it's cordoned — it isn't a bug, and it isn't stuck. It
 resumes claiming runs on its own once the roll finishes. There's no manual
 way to cordon a worker yourself; it's driven entirely by the cluster.
 
+## My Codex run says "no Codex-capable worker is online"
+
+A hosted worker only claims a Codex run once it can actually run one, so an
+unmet precondition leaves the run queued rather than claimed and then failing
+partway through. This applies to a full Codex run and to Codex judge/review
+advice alike. Four things can hold a worker back:
+
+- The fleet does not have the opt-in uid-split profile Codex needs turned on.
+  Ask your admin to enable it (`UZI_WORKER_UID_SPLIT`).
+- A node's kernel lacks Landlock while the fleet requires it. Either move the
+  fleet onto Landlock-capable nodes, or, if running commands unconfined is
+  acceptable, set the command sandbox to best-effort
+  (`UZI_CODEX_COMMAND_SANDBOX`).
+- The Landlock probe fails outright: it could not run, or the kernel returned
+  an unexpected result. This is distinct from a clean "unavailable" and is
+  fatal even in best-effort, so no knob re-enables Codex: check the node's
+  kernel/Landlock support and that the command-sandbox binary is present on the
+  worker image.
+- The worker's Codex installer receipt is not intact (the Codex runtime is
+  missing or corrupt on the image). Re-provision or rebuild the hosted worker
+  so the runtime is reinstalled; an operator knob does not fix this.
+
+The [operator knobs](./configuration.md#controller) that control the first two
+are `UZI_WORKER_UID_SPLIT` and `UZI_CODEX_COMMAND_SANDBOX`.
+
 ## Disk self-heal
 
 A hosted worker also reports its disk usage now — the same CPU/memory gauges
@@ -133,11 +158,15 @@ within the outbox's configured quotas (`WORKER_OUTBOX_RUN_MAX_BYTES`,
 `WORKER_OUTBOX_MAX_BYTES`, `WORKER_OUTBOX_SPILL_BUFFER_BYTES`); beyond them, some
 message frames are dropped and replayed as contiguous per-seq gap markers rather
 than the original messages. One caveat is worth restating here rather
-than at length: a hosted worker runs the `#58` single-uid posture, so the model
-process shares its uid and could read, forge, truncate, or delete its own outbox —
-the outbox protects against the outage, not against a hostile model, on this
-runtime. See [worker-setup.md](./worker-setup.md#message-outbox) for the full
-caveat and the tunable quotas.
+than at length, and which profile the worker runs decides it. On the default
+single-uid profile a hosted worker runs the `#58` posture, so the model process
+shares the worker's uid and could read, forge, truncate, or delete its own outbox —
+there the outbox protects against the outage, not against a hostile model. On the
+opt-in uid-split Codex profile the model runs under a distinct uid while the outbox
+tree stays worker-owned and `0700`-private, so a hostile model can no longer read or
+tamper with it (see ["no Codex-capable worker is online"](#my-codex-run-says-no-codex-capable-worker-is-online)
+for that profile). See [worker-setup.md](./worker-setup.md#message-outbox) for the
+full caveat and the tunable quotas.
 
 ## Surviving an api restart mid-run
 

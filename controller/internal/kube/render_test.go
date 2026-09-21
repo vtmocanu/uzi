@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -1393,6 +1394,268 @@ func TestDockerFlagRollsThePodButAbsentDockerIsInert(t *testing.T) {
 	nonRootless := SpecHashOf(dockerTestConfigNonRootless(), desiredDocker("abc"), testSpec(t, "base", "m"))
 	if rootless == nonRootless {
 		t.Error("flipping the posture (rootless -> non-rootless) must change the docker worker's spec hash")
+	}
+}
+
+// --- Codex uid-split profile (PRD #1493 M1) --------------------------------
+
+// findContainer is the non-fatal sibling of containerByName: it reports presence rather
+// than fatalling, which the DinD-unchanged test needs (dind-init exists only rootless).
+func findContainer(cs []corev1.Container, name string) (corev1.Container, bool) {
+	for _, c := range cs {
+		if c.Name == name {
+			return c, true
+		}
+	}
+	return corev1.Container{}, false
+}
+
+// assertRootWithCaps pins a container's uid-split SecurityContext: uid/gid 0, runAsNonRoot
+// false, allowPrivilegeEscalation false, drop ALL, and EXACTLY the given added caps and no
+// others. Kubernetes has no ambient capabilities, so the uid-0 requirement is load-bearing:
+// a non-root uid with capabilities.add is inert after execve (Decision D5).
+func assertRootWithCaps(t *testing.T, name string, sc *corev1.SecurityContext, wantAdd []corev1.Capability) {
+	t.Helper()
+	if sc == nil {
+		t.Fatalf("%s: nil SecurityContext under the uid-split profile", name)
+	}
+	if sc.RunAsUser == nil || *sc.RunAsUser != 0 || sc.RunAsGroup == nil || *sc.RunAsGroup != 0 {
+		t.Errorf("%s: must run as uid/gid 0 (K8s has no ambient caps, so added caps are inert on a non-root uid), got uid=%v gid=%v",
+			name, sc.RunAsUser, sc.RunAsGroup)
+	}
+	if sc.RunAsNonRoot == nil || *sc.RunAsNonRoot {
+		t.Errorf("%s: must set runAsNonRoot:false at container scope (the pod is not runAsNonRoot under the split, but be explicit), got %v", name, sc.RunAsNonRoot)
+	}
+	if sc.AllowPrivilegeEscalation == nil || *sc.AllowPrivilegeEscalation {
+		t.Errorf("%s: must keep allowPrivilegeEscalation:false even under the split", name)
+	}
+	if sc.Capabilities == nil || len(sc.Capabilities.Drop) != 1 || sc.Capabilities.Drop[0] != "ALL" {
+		t.Errorf("%s: must drop ALL, got %v", name, sc.Capabilities)
+	}
+	gotAdd := map[corev1.Capability]bool{}
+	for _, c := range sc.Capabilities.Add {
+		gotAdd[c] = true
+	}
+	if len(sc.Capabilities.Add) != len(wantAdd) {
+		t.Fatalf("%s: added caps = %v, want EXACTLY %v", name, sc.Capabilities.Add, wantAdd)
+	}
+	for _, c := range wantAdd {
+		if !gotAdd[c] {
+			t.Errorf("%s: missing capability %q; added caps = %v, want exactly %v", name, c, sc.Capabilities.Add, wantAdd)
+		}
+	}
+}
+
+// With the uid-split profile OFF (the default), the worker and seed-nix containers keep
+// #58's shared restricted posture VERBATIM in BOTH lanes: drop ALL, no added capabilities,
+// no per-container runAsUser/runAsGroup/runAsNonRoot. Pinning this is what makes
+// "byte-identical when off" real rather than merely asserted by the hash test below.
+func TestUIDSplitOffKeepsTheRestrictedContainerPosture(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  RenderConfig
+		w    protocol.DesiredWorker
+	}{
+		{"plain", testConfig(), desired("abc")},
+		{"docker rootless", dockerTestConfig(), desiredDocker("abc")},
+		{"docker non-rootless", dockerTestConfigNonRootless(), desiredDocker("abc")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := RenderDeployment(tc.cfg, tc.w, testSpec(t, "base", "m")).Spec.Template.Spec
+			all := append(append([]corev1.Container{}, pod.InitContainers...), pod.Containers...)
+			for _, name := range []string{workerContainerName, seedContainerName} {
+				c := containerByName(t, all, name)
+				sc := c.SecurityContext
+				if sc == nil {
+					t.Fatalf("%s: nil SecurityContext", name)
+				}
+				if sc.RunAsUser != nil || sc.RunAsGroup != nil || sc.RunAsNonRoot != nil {
+					t.Errorf("%s: uid-split OFF must leave the container-level runAsUser/Group/NonRoot unset, got %v/%v/%v",
+						name, sc.RunAsUser, sc.RunAsGroup, sc.RunAsNonRoot)
+				}
+				if sc.Capabilities == nil || len(sc.Capabilities.Add) != 0 {
+					t.Errorf("%s: uid-split OFF must add NO capabilities, got %v", name, sc.Capabilities)
+				}
+				if sc.Capabilities == nil || len(sc.Capabilities.Drop) != 1 || sc.Capabilities.Drop[0] != "ALL" {
+					t.Errorf("%s: uid-split OFF must still drop ALL, got %v", name, sc.Capabilities)
+				}
+			}
+			// The pod-level identity is unchanged: 10001 non-root.
+			psc := pod.SecurityContext
+			if psc.RunAsUser == nil || *psc.RunAsUser != 10001 || psc.RunAsNonRoot == nil || !*psc.RunAsNonRoot {
+				t.Errorf("uid-split OFF must keep the pod-level 10001 non-root identity, got uid=%v nonRoot=%v", psc.RunAsUser, psc.RunAsNonRoot)
+			}
+		})
+	}
+}
+
+// The uid-split profile ON (PRD #1493 M1): the worker and seed-nix containers start as
+// ROOT with a short fixed capability set, and the pod-level runAsNonRoot is relaxed so
+// admission accepts the uid-0 containers while fsGroup/seccomp are preserved. The exact
+// Add sets are asserted here because the generic TestRenderedPodPosture loop only checks
+// Drop==["ALL"], never the Add sets.
+func TestUIDSplitOnStartsWorkerAndSeedAsRootWithExactCaps(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		base RenderConfig
+		w    protocol.DesiredWorker
+	}{
+		{"plain", testConfig(), desired("abc")},
+		{"docker rootless", dockerTestConfig(), desiredDocker("abc")},
+		{"docker non-rootless", dockerTestConfigNonRootless(), desiredDocker("abc")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := tc.base
+			cfg.UIDSplit = true
+			pod := RenderDeployment(cfg, tc.w, testSpec(t, "base", "m")).Spec.Template.Spec
+
+			all := append(append([]corev1.Container{}, pod.InitContainers...), pod.Containers...)
+			worker := containerByName(t, all, workerContainerName)
+			seed := containerByName(t, all, seedContainerName)
+
+			assertRootWithCaps(t, "worker", worker.SecurityContext,
+				[]corev1.Capability{"SETUID", "SETGID", "SETPCAP", "CHOWN", "DAC_OVERRIDE"})
+			assertRootWithCaps(t, "seed-nix", seed.SecurityContext,
+				[]corev1.Capability{"CHOWN", "DAC_OVERRIDE", "FOWNER"})
+
+			// The pod-level SecurityContext must not contradict the uid-0 containers.
+			psc := pod.SecurityContext
+			if psc.RunAsNonRoot == nil || *psc.RunAsNonRoot {
+				t.Error("uid-split ON must relax the pod-level runAsNonRoot to false, or admission rejects the uid-0 containers")
+			}
+			if psc.RunAsUser != nil || psc.RunAsGroup != nil {
+				t.Errorf("uid-split ON must drop the pod-level runAsUser/runAsGroup (each container decides), got %v/%v", psc.RunAsUser, psc.RunAsGroup)
+			}
+			// fsGroup, its change policy and seccomp are KEPT.
+			if psc.FSGroup == nil || *psc.FSGroup != 10001 {
+				t.Error("uid-split ON must keep fsGroup 10001 (the token is root:10001 0440, readable via the group)")
+			}
+			if psc.FSGroupChangePolicy == nil || *psc.FSGroupChangePolicy != corev1.FSGroupChangeOnRootMismatch {
+				t.Error("uid-split ON must keep FSGroupChangePolicy OnRootMismatch")
+			}
+			if psc.SeccompProfile == nil || psc.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
+				t.Error("uid-split ON must keep the RuntimeDefault seccomp profile")
+			}
+		})
+	}
+}
+
+// The uid-split profile must NOT touch the DinD containers — only the worker and seed-nix
+// containers change posture. A dind/dind-init drift would be a real security change (their
+// privileged posture is deliberate and separate), so pin them byte-identical on vs off in
+// both postures.
+func TestUIDSplitLeavesDinDContainersUnchanged(t *testing.T) {
+	for _, p := range dindPostures() {
+		t.Run(p.name, func(t *testing.T) {
+			on := p.cfg
+			on.UIDSplit = true
+			offPod := RenderDeployment(p.cfg, desiredDocker("abc"), testSpec(t, "base", "m")).Spec.Template.Spec
+			onPod := RenderDeployment(on, desiredDocker("abc"), testSpec(t, "base", "m")).Spec.Template.Spec
+
+			for _, name := range []string{dindContainerName, dindInitContainerName} {
+				offC, offOK := findContainer(offPod.InitContainers, name)
+				onC, onOK := findContainer(onPod.InitContainers, name)
+				if offOK != onOK {
+					t.Fatalf("%s presence changed with the uid-split knob (off=%v on=%v)", name, offOK, onOK)
+				}
+				if !offOK {
+					continue // dind-init is absent in the non-rootless posture, on both sides.
+				}
+				if !reflect.DeepEqual(offC, onC) {
+					t.Errorf("%s changed under the uid-split profile; the knob must touch only the worker and seed-nix containers\noff=%+v\non=%+v",
+						name, offC, onC)
+				}
+			}
+		})
+	}
+}
+
+// Flipping the uid-split knob is a real re-render, so it must move the spec hash (the fleet
+// rolls onto the new posture on its next roll). And with the knob OFF the spec hash must NOT
+// depend on the setting being present at all — mirroring TestDockerFlagRollsThePodButAbsentDockerIsInert
+// — so upgrading to a build that CAN render the split never rolls an existing fleet.
+func TestUIDSplitRollsThePodButOffIsInert(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		base RenderConfig
+		w    protocol.DesiredWorker
+	}{
+		{"plain", testConfig(), desired("abc")},
+		{"docker rootless", dockerTestConfig(), desiredDocker("abc")},
+		{"docker non-rootless", dockerTestConfigNonRootless(), desiredDocker("abc")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			on := tc.base
+			on.UIDSplit = true
+			offHash := SpecHashOf(tc.base, tc.w, testSpec(t, "base", "m"))
+			onHash := SpecHashOf(on, tc.w, testSpec(t, "base", "m"))
+			if offHash == onHash {
+				t.Error("turning the uid-split profile ON must change the spec hash, or the profile never reaches the fleet")
+			}
+		})
+	}
+
+	// Knob OFF: the OFF render is byte-identical to today's baseline. A config that leaves
+	// the new fields at their zero value (UIDSplit false, CommandSandbox "") must hash the
+	// same as one that explicitly sets the config default CommandSandbox "required" — the
+	// render normalizes "" to "required" and emits no env for either, so neither can re-hash
+	// an existing worker on upgrade.
+	baseline := testConfig()
+	offDefaulted := testConfig()
+	offDefaulted.CommandSandbox = "required"
+	if a, b := SpecHashOf(baseline, desired("abc"), testSpec(t, "base", "m")),
+		SpecHashOf(offDefaulted, desired("abc"), testSpec(t, "base", "m")); a != b {
+		t.Error("a plain worker's spec hash changed between a zero-value config and one with the knob off + CommandSandbox=required; the off render must be byte-identical to today's baseline")
+	}
+}
+
+// UZI_CODEX_COMMAND_SANDBOX is rendered on the WORKER container ONLY, and ONLY when the mode
+// is the non-default "best-effort". "required" and an unset/zero value emit NO env key — not
+// an empty one — so a default install's pod stays byte-identical. It never lands on any other
+// container.
+func TestCommandSandboxEnvOnlyForBestEffort(t *testing.T) {
+	workerEnv := func(cfg RenderConfig, name string) (string, bool) {
+		dep := RenderDeployment(cfg, desired("abc"), testSpec(t, "base", "m"))
+		worker := containerByName(t, dep.Spec.Template.Spec.Containers, workerContainerName)
+		for _, e := range worker.Env {
+			if e.Name == name {
+				return e.Value, true
+			}
+		}
+		return "", false
+	}
+
+	// best-effort: the env is present on the worker with the mode value.
+	best := testConfig()
+	best.CommandSandbox = "best-effort"
+	if v, ok := workerEnv(best, "UZI_CODEX_COMMAND_SANDBOX"); !ok || v != "best-effort" {
+		t.Errorf("best-effort must render UZI_CODEX_COMMAND_SANDBOX=best-effort on the worker, got %q/%v", v, ok)
+	}
+	// ...and on the worker container ALONE — never on the seed (or any other) container.
+	bestPod := RenderDeployment(best, desired("abc"), testSpec(t, "base", "m")).Spec.Template.Spec
+	for _, c := range append(append([]corev1.Container{}, bestPod.InitContainers...), bestPod.Containers...) {
+		if c.Name == workerContainerName {
+			continue
+		}
+		for _, e := range c.Env {
+			if e.Name == "UZI_CODEX_COMMAND_SANDBOX" {
+				t.Errorf("container %q carries UZI_CODEX_COMMAND_SANDBOX; it belongs on the worker container only", c.Name)
+			}
+		}
+	}
+
+	// required: no env at all (today's behaviour).
+	req := testConfig()
+	req.CommandSandbox = "required"
+	if v, ok := workerEnv(req, "UZI_CODEX_COMMAND_SANDBOX"); ok {
+		t.Errorf("required must emit NO UZI_CODEX_COMMAND_SANDBOX env, got %q", v)
+	}
+
+	// The zero value ("") normalizes to required, so still NO env — and crucially never an
+	// empty-valued key.
+	zero := testConfig() // CommandSandbox left at its zero value ""
+	if v, ok := workerEnv(zero, "UZI_CODEX_COMMAND_SANDBOX"); ok {
+		t.Errorf("a zero-value CommandSandbox must emit NO UZI_CODEX_COMMAND_SANDBOX env (it normalizes to required), got %q", v)
 	}
 }
 

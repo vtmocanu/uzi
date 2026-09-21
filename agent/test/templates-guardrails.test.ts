@@ -865,9 +865,9 @@ describe("the shared root-entry drop wrapper", () => {
     assert.match(entrypoint, /single-uid non-root mode \(PRD #58\)/, "non-root path must log the single-uid posture");
   });
 
-  it("carves out the runner-owned /data subtree ROOTS to worker:runner 2775, keeping repos/ worker-only (PRD #51 M4 (b))", () => {
+  it("carves out the runner-owned /data subtree ROOTS to worker:runner STICKY 3775, keeping repos/ worker-only (PRD #51 M4 (b); PRD #1493 M2 change 4 / D7)", () => {
     // The runner clone store + SDK/provision HOMEs are runner-writable (worker:runner,
-    // setgid+group-write); the worker bare cache repos/ (the B2 code-exec surface) is
+    // setgid+group-write+STICKY); the worker bare cache repos/ (the B2 code-exec surface) is
     // NOT in the carve-out list.
     assert.match(entrypoint, /RUNNER_TREE_OWNER=worker:runner/, "must own the runner subtrees worker:runner");
     assert.match(entrypoint, /for d in runner agent-home provision; do/, "must carve out runner/agent-home/provision");
@@ -876,32 +876,145 @@ describe("the shared root-entry drop wrapper", () => {
       /for d in [^\n]*\brepos\b/,
       "the worker bare cache repos/ must NOT be in the runner-writable carve-out",
     );
-    // chmod 2775 (setgid+group-write) BEFORE chown (no CAP_FOWNER; setgid survives a
-    // dir chown), so children inherit group `runner` for the runner's per-run dirs.
-    const chmodAt = entrypoint.search(/"\$CHMOD"\s+2775\s+"\/data\/\$d"/);
-    const chownAt = entrypoint.search(/"\$CHOWN"\s+"\$RUNNER_TREE_OWNER"\s+"\/data\/\$d"/);
-    assert.ok(chmodAt >= 0 && chownAt >= 0 && chmodAt < chownAt, "chmod 2775 must precede the chown (no CAP_FOWNER)");
-    // Resume guard (PRD #51 M4): the carve-out chown is NON-recursive (roots only) so an
-    // every-boot re-own never clobbers the runner's own per-run resume state.
+    // The paths are variables (DATA_DIR/NIX_DIR) so the shell tests can point them at a
+    // sandbox; the shipped defaults are the literal /data + /nix.
+    assert.match(entrypoint, /^DATA_DIR=\/data$/m, "DATA_DIR defaults to /data");
+    assert.match(entrypoint, /^NIX_DIR=\/nix$/m, "NIX_DIR defaults to /nix");
+    // chmod 3775 (setgid+group-write+STICKY, change 4 / D7) BEFORE chown (no CAP_FOWNER;
+    // setgid+sticky survive a dir chown), so children inherit group `runner` for the
+    // runner's per-run dirs while a runner-group member cannot rename/unlink an entry it
+    // does not own.
+    const chmodAt = entrypoint.search(/"\$CHMOD"\s+3775\s+"\$DATA_DIR\/\$d"/);
+    const chownAt = entrypoint.search(/"\$CHOWN"\s+"\$RUNNER_TREE_OWNER"\s+"\$DATA_DIR\/\$d"/);
+    assert.ok(chmodAt >= 0 && chownAt >= 0 && chmodAt < chownAt, "chmod 3775 must precede the chown (no CAP_FOWNER)");
+    // Sticky must be present (leading 3), never a plain 2775 anywhere in the carve-out.
+    assert.doesNotMatch(entrypoint, /"\$CHMOD"\s+2775\s+"\$DATA_DIR\/\$d"/, "the carve-out mode must be sticky 3775, never 2775");
+    // Resume guard (PRD #51 M4): the EVERY-BOOT carve-out chown is NON-recursive (roots only)
+    // so an every-boot re-own never clobbers the runner's own per-run resume state.
     assert.doesNotMatch(
       entrypoint,
       /"\$CHOWN"\s+-R\s+"\$RUNNER_TREE_OWNER"/,
       "the carve-out chown must be NON-recursive (resume guard) — never chown -R the runner subtrees",
     );
-    // Restart-safety (tester e2e crash-on-restart): the carve-out chmod is guarded on
-    // root-ownership (`[ -O ]`), so it runs ONLY on a fresh (root-owned) dir. An
+    // Restart-safety (tester e2e crash-on-restart): the EVERY-BOOT carve-out chmod is guarded
+    // on root-ownership (`[ -O ]`), so it runs ONLY on a fresh (root-owned) dir. An
     // unconditional chmod on a persisted, now-worker-owned dir EPERMs (no CAP_FOWNER) ->
     // set -eu -> deterministic crash on every restart.
     assert.match(
       entrypoint,
-      /\[\s*-O\s+"\/data\/\$d"\s*\]\s*&&\s*"\$CHMOD"\s+2775\s+"\/data\/\$d"/,
-      "the carve-out chmod must be guarded on root-ownership ([ -O ]) for restart safety",
+      /\[\s*-O\s+"\$DATA_DIR\/\$d"\s*\]\s*&&\s*"\$CHMOD"\s+3775\s+"\$DATA_DIR\/\$d"/,
+      "the every-boot carve-out chmod must be guarded on root-ownership ([ -O ]) for restart safety",
     );
-    assert.doesNotMatch(
+    // The legacy-migration chmod IS unconditional (not [ -O ]-guarded) but is restart-safe by a
+    // different mechanism: it is sentinel-gated (one-time, never per-boot) AND each chmod is
+    // IMMEDIATELY preceded by a reclaim `"$CHOWN" 0:0` so root owns the dir before chmod-ing it.
+    assert.match(
       entrypoint,
-      /^\s*"\$CHMOD"\s+2775\s+"\/data\/\$d"/m,
-      "there must be NO unconditional chmod 2775 of the runner subtree (the restart-crash)",
+      /"\$CHOWN"\s+0:0\s+"\$DATA_DIR\/\$d"\s*[^\n]*\n\s*"\$CHMOD"\s+3775\s+"\$DATA_DIR\/\$d"/,
+      "the legacy-migration chmod must be immediately preceded by a reclaim (chown 0:0) — restart-safe without [ -O ]",
     );
+  });
+
+  it("PRD #1493 M2 change 1: read-only join token is verified-not-aborted, compose reclaim preserved", () => {
+    // Compose (writable secret): the reclaim `chown 0:0` succeeds and today's exact
+    // reclaim -> chmod 0400 -> hand-over sequence runs unchanged.
+    assert.match(
+      entrypoint,
+      /if\s+"\$CHOWN"\s+0:0\s+"\$TOKEN"\s+2>\/dev\/null;\s*then\s*\n\s*"\$CHMOD"\s+0400\s+"\$TOKEN"\s*\n\s*"\$CHOWN"\s+"\$WORKER_OWNER"\s+"\$TOKEN"/,
+      "on a writable secret the reclaim->chmod 0400->hand-over sequence must be preserved exactly",
+    );
+    // The reclaim runs inside an `if` (whose failure is exempt from set -e) so an EROFS
+    // read-only kube mount does NOT abort the entrypoint.
+    assert.match(entrypoint, /if\s+"\$CHOWN"\s+0:0\s+"\$TOKEN"\s+2>\/dev\/null;\s*then/, "the token reclaim must be guarded (EROFS must not abort under set -eu)");
+    // Read-only branch: POSITIVELY verify the exact kube posture uid=0 gid=10001 mode=0440
+    // (both busybox mode spellings) AND a real worker-read via setpriv, else fail closed.
+    assert.match(entrypoint, /"0 10001 440"\|"0 10001 0440"/, "must verify the exact kube token posture (uid=0 gid=10001 mode=0440)");
+    assert.match(
+      entrypoint,
+      /"\$SETPRIV"\s+--reuid\s+"\$WORKER_USER"\s+--regid\s+"\$WORKER_USER"\s+--init-groups\s*\\?\s*\n?\s*--\s+"\$BUSYBOX"\s+cat\s+"\$TOKEN"\s+>\/dev\/null\s+2>&1/,
+      "must positively check `worker` can READ the read-only token (setpriv -> busybox cat)",
+    );
+    assert.match(entrypoint, /refusing to start \(posture:/, "must FAIL CLOSED (exit 1) on any non-matching read-only posture");
+    // The read-only branch must NOT chmod/chown the token (a RO mount would EROFS).
+    const roBranch = entrypoint.slice(entrypoint.search(/token_posture=/), entrypoint.search(/refusing to start \(posture:/));
+    assert.doesNotMatch(roBranch, /"\$CHMOD"[^\n]*"\$TOKEN"/, "the read-only branch must not attempt to chmod the token");
+  });
+
+  it("PRD #1493 M2 change 2: private tmpdirs derive beneath an ambient TMPDIR, else /tmp fallback", () => {
+    // Docker lane (pod-supplied TMPDIR): derive both private per-uid tmpdirs beneath it so a
+    // bind source staged under $TMPDIR resolves in the DinD-shared workdir.
+    assert.match(
+      entrypoint,
+      /if\s+\[\s+-n\s+"\$\{TMPDIR:-\}"\s+\];\s*then\s*\n\s*WORKER_TMPDIR="\$TMPDIR\/uzi-worker"\s*\n\s*RUNNER_TMPDIR="\$TMPDIR\/uzi-runner"/,
+      "with an ambient TMPDIR both private tmpdirs must derive beneath it",
+    );
+    // Compose (no ambient TMPDIR): keep /tmp/uzi-worker + /tmp/uzi-runner EXACTLY as before.
+    assert.match(
+      entrypoint,
+      /else\s*\n\s*WORKER_TMPDIR=\/tmp\/uzi-worker\s*\n\s*RUNNER_TMPDIR=\/tmp\/uzi-runner\s*\n\s*fi/,
+      "with no ambient TMPDIR the tmpdirs must stay under /tmp exactly as on compose",
+    );
+    // The derived worker tmp is still exported as TMPDIR across the drop.
+    assert.match(entrypoint, /export TMPDIR="\$WORKER_TMPDIR"/, "the derived worker tmp is exported as TMPDIR across the drop");
+  });
+
+  it("PRD #1493 M2 change 3: sentinel-gated ownership-aware legacy /data migration, codex-session-store untouched", () => {
+    // One-time, sentinel-gated like migrate_tree.
+    assert.match(entrypoint, /LEGACY_SENTINEL="\$DATA_DIR\/\.uzi-legacy-split-migrated"/, "must gate on a dedicated legacy-migration sentinel");
+    assert.match(entrypoint, /if\s+\[\s+!\s+-f\s+"\$LEGACY_SENTINEL"\s+\]/, "the legacy migration must be skipped once the sentinel exists");
+    // NEVER a blanket recursive chown of the whole /data tree in either direction.
+    assert.doesNotMatch(entrypoint, /"\$CHOWN"\s+-R\s+\S+\s+"\$DATA_DIR"(?!\/)/, "must never chown -R the whole $DATA_DIR (blanket) — the map is per-subtree");
+    // Plain-lane clones + provision: re-owned to `runner`, content preserved (never purged).
+    assert.match(entrypoint, /for tree in runner provision; do/, "must re-own /data/runner + /data/provision content to runner");
+    assert.match(entrypoint, /"\$CHOWN"\s+-R\s+runner:runner\s+"\$c"/, "retained clone/provision content is re-owned recursively to runner (not purged)");
+    assert.doesNotMatch(entrypoint, /\brm\s+-rf?\b[^\n]*\$DATA_DIR/, "the migration must NEVER purge (no rm of $DATA_DIR content)");
+    // Run HOME root + codex-data root STAY worker:runner (owner worker preserved).
+    assert.match(entrypoint, /"\$CHOWN"\s+worker:runner\s+"\$home"/, "the run HOME root stays worker:runner (owner worker, gid runner)");
+    assert.match(entrypoint, /"\$CHOWN"\s+worker:runner\s+"\$home\/codex-data"/, "the codex-data root stays worker:runner");
+    // Provider epoch trees + Claude SDK descendants become runner-owned.
+    assert.match(entrypoint, /"\$CHOWN"\s+-R\s+runner:runner\s+"\$epoch"/, "provider per-epoch trees become runner-owned");
+    assert.match(entrypoint, /"\$CHOWN"\s+-R\s+runner:runner\s+"\$entry"/, "ordinary Claude SDK HOME descendants become runner-owned");
+    // codex-session-store is NEVER touched (worker-private): it must be in the skip case and
+    // never appear as a chown/chmod target.
+    assert.match(entrypoint, /case\s+"\$\{entry##\*\/\}"\s+in\s*\n\s*codex-data\|codex-session-store\)\s+continue/, "codex-session-store must be skipped in the descendant walk");
+    assert.doesNotMatch(entrypoint, /"\$CHOWN"[^\n]*codex-session-store/, "codex-session-store must never be a chown target");
+    assert.doesNotMatch(entrypoint, /"\$CHMOD"[^\n]*codex-session-store/, "codex-session-store must never be a chmod target");
+    // No chmod of worker-owned descendants (no CAP_FOWNER): only the reclaim-guarded parents
+    // are chmod'd; descendants are chown/chgrp only.
+    assert.doesNotMatch(entrypoint, /"\$CHMOD"[^\n]*"\$entry"/, "descendants must not be chmod'd (no CAP_FOWNER on worker-owned files)");
+  });
+
+  it("PRD #1493 M2 change 5: PVC-root fsGroup alignment, gated on the setgid fingerprint (compose no-op)", () => {
+    // The k8s-only signal is captured BEFORE migrate_tree flips /nix's group.
+    assert.match(entrypoint, /NIX_HAD_FSGROUP=\s*\n\s*\[\s+-g\s+"\$NIX_DIR"\s+\]\s+&&\s+NIX_HAD_FSGROUP=1/, "must capture the setgid fingerprint before migrate_tree");
+    const fingerprintAt = entrypoint.search(/\[\s+-g\s+"\$NIX_DIR"\s+\]\s+&&\s+NIX_HAD_FSGROUP=1/);
+    const migrateNixAt = entrypoint.search(/migrate_tree\s+"\$NIX_DIR"/);
+    assert.ok(fingerprintAt >= 0 && migrateNixAt >= 0 && fingerprintAt < migrateNixAt, "the fingerprint must be captured BEFORE migrate_tree /nix");
+    // Alignment: reclaim -> chmod 2775 (setgid+group-rwx) -> restore owner + group 10001, on
+    // the ROOT dir only (non-recursive), gated on the fingerprint.
+    assert.match(entrypoint, /align_pvc_root\(\)\s*\{/, "must define an align_pvc_root helper");
+    assert.match(
+      entrypoint,
+      /"\$CHOWN"\s+0:0\s+"\$root"\s*[^\n]*\n\s*"\$CHMOD"\s+2775\s+"\$root"\s*[^\n]*\n\s*"\$CHOWN"\s+"\$owner:\$FSGROUP"\s+"\$root"/,
+      "alignment must reclaim -> chmod 2775 -> restore owner:fsGroup on the root dir",
+    );
+    assert.match(entrypoint, /if\s+\[\s+-n\s+"\$NIX_HAD_FSGROUP"\s+\];\s*then\s*\n\s*align_pvc_root\s+"\$NIX_DIR"\s+runner\s*\n\s*align_pvc_root\s+"\$DATA_DIR"\s+"\$WORKER_USER"/, "alignment must run for /nix and /data only when the fingerprint says k8s");
+    assert.match(entrypoint, /^FSGROUP=10001$/m, "the fsGroup restored on the roots is 10001 (the worker gid)");
+  });
+
+  it("PRD #1493 M2: the NON-ROOT (single-uid) branch is unchanged and never references the migration vars", () => {
+    // The non-root branch runs from `single-uid non-root mode` to its `exec "$TINI"`. It must
+    // still unset the split env and exec tini single-uid, and must reference NONE of the
+    // root-only migration machinery (DATA_DIR/NIX_DIR/BUSYBOX/FSGROUP/legacy sentinel), which
+    // is defined AFTER it in the root branch.
+    const branchStart = entrypoint.search(/echo "uzi-entrypoint: single-uid non-root mode/);
+    const branchEnd = entrypoint.search(/exec "\$TINI" -- "\$@"/);
+    assert.ok(branchStart >= 0 && branchEnd > branchStart, "must locate the non-root branch");
+    const branch = entrypoint.slice(branchStart, branchEnd);
+    assert.match(branch, /unset UZI_UID_SPLIT UZI_RUNNER_PATH UZI_RUNNER_TMPDIR/, "the non-root branch still unsets the split env");
+    for (const token of ["DATA_DIR", "NIX_DIR", "BUSYBOX", "FSGROUP", "NIX_HAD_FSGROUP", "LEGACY_SENTINEL", "align_pvc_root"]) {
+      assert.doesNotMatch(branch, new RegExp(token), `the non-root branch must NOT reference the root-only ${token}`);
+    }
   });
 
   it("activates the M4 uid split: /nix runner-owned, worker PATH stripped, split env exported (PRD #51 M4)", () => {

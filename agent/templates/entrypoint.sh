@@ -39,6 +39,8 @@ SETPRIV=/bin/setpriv
 CHOWN=/bin/chown
 CHMOD=/bin/chmod
 MKDIR=/bin/mkdir
+RM=/bin/rm
+FIND=/usr/bin/find
 
 # --- PRD #58: tolerate a NON-ROOT start ---------------------------------------
 # Started non-root (k8s runAsUser: 10001, PRD #58 single-uid v1)? Then there is no
@@ -139,6 +141,27 @@ WORKER_OWNER=worker:worker   # /data, /app: worker-owned (the worker's own trees
 # the image layer and the single-uid worker still provisions.
 NIX_OWNER=runner:runner
 
+# The two persisted volume roots and the join-token mount, as variables (the migration and
+# token logic below reference nothing else), so the shell tests can point them at a sandbox.
+DATA_DIR=/data
+NIX_DIR=/nix
+# busybox is the canonical absolute binary in the pinned node:24-alpine (the same base whose
+# /bin/{chown,chmod,mkdir} the constants above resolve). Its `stat`/`cat` applets back the
+# read-only-token posture + read checks; invoked via `busybox <applet>` so the exact applet
+# symlink location does not matter.
+BUSYBOX=/bin/busybox
+# The pod fsGroup == the `worker` gid; the PVC-root alignment below restores it on the
+# migrated mount roots so the kubelet skips its recursive fsGroup walk (PRD #1493 M2 change 5).
+FSGROUP=10001
+
+# fsGroup FINGERPRINT, captured BEFORE migrate_tree flips /nix's group: the kubelet applies
+# fsGroup by setting the mount-root's group to 10001 AND the setgid bit on it; the image bakes
+# /nix with `chmod -R a+rX` (never setgid), and compose has no kubelet, so a setgid /nix root
+# is a reliable "this is a k8s fsGroup mount" signal. On compose it is unset and the alignment
+# step is a no-op, keeping compose behaviour byte-for-byte.
+NIX_HAD_FSGROUP=
+[ -g "$NIX_DIR" ] && NIX_HAD_FSGROUP=1
+
 # --- (a) B4: migrate persisted named volumes to the current uid layout --------
 # agentnix (/nix) and agentdata (/data) seed from the image on first use and then
 # persist their ORIGINAL ownership. When an existing install upgrades to this image the
@@ -176,18 +199,21 @@ migrate_tree() {
   : > "$sentinel" 2>/dev/null && "$CHOWN" "$owner" "$sentinel" 2>/dev/null \
     || echo "uzi-entrypoint: warning: could not persist $sentinel (re-runs next boot)" >&2
 }
-migrate_tree /nix "$NIX_OWNER"
-migrate_tree /data "$WORKER_OWNER"
+migrate_tree "$NIX_DIR" "$NIX_OWNER"
+migrate_tree "$DATA_DIR" "$WORKER_OWNER"
 
 # --- (a2) PRD #51 M4: runner-owned /data subtree carve-out ((b) ownership model) --
 # Under (b) separate-runner-clone the RUNNER clone store + the SDK/provision HOMEs are
 # runner-owned trees (the agent checks out + commits there as uid `runner`), while the
 # WORKER bare cache repos/ stays worker-only (its config/hooks/refs are the B2 code-exec
 # surface — the runner must never write it). migrate_tree above set ALL of /data to
-# worker:worker, so own these subtree ROOTS worker:runner + setgid/group-write (2775) so
-# children inherit group `runner` and the runner (a `runner`-group member) can create its
-# per-run dirs under them; the worker runs umask 002 (main.ts) so those worker-created
-# per-run dirs are group-`runner`-writable. repos/ is deliberately NOT in this list.
+# worker:worker, so own these subtree ROOTS worker:runner + setgid/group-write + STICKY
+# (3775) so children inherit group `runner` and the runner (a `runner`-group member) can
+# create its per-run dirs under them, while the sticky bit stops a `runner`-group member
+# (incl. uid 10003) that does NOT own a top-level entry from renaming/unlinking/replacing it
+# (PRD #1493 M2 change 4 / D7 — closes the provider-root swap for the ancestors the
+# entrypoint creates); the worker runs umask 002 (main.ts) so those worker-created per-run
+# dirs are group-`runner`-writable. repos/ is deliberately NOT in this list.
 #
 # RESTART-SAFE + resume guard (two independent fixes, same block — reviewer flag B +
 # tester e2e crash-on-restart):
@@ -204,8 +230,23 @@ migrate_tree /data "$WORKER_OWNER"
 #     Owning only the ROOTS leaves runner-owned content untouched; a fresh volume's roots
 #     are empty, and an upgrade's stale content was re-owned by migrate_tree /data above.
 RUNNER_TREE_OWNER=worker:runner
+require_real_carveout_root() {
+  if [ -L "$1" ]; then
+    echo "uzi-entrypoint: refusing to start: $1 is a symlink" >&2
+    exit 1
+  fi
+}
 for d in runner agent-home provision; do
-  "$MKDIR" -p "/data/$d"
+  "$MKDIR" -p "$DATA_DIR/$d"
+  # SYMLINK-ROOT GUARD (PRD #1493 M2 rework, BLOCKING): a legacy single-uid /data was
+  # attacker-writable, so a carve-out ROOT itself may be a planted symlink (e.g.
+  # `agent-home -> repos`). `mkdir -p` on an existing symlink-to-dir SUCCEEDS without
+  # replacing the link, so this guard comes AFTER the mkdir to catch the pre-existing link.
+  # Fail closed: skipping it would leave the symlink for the runtime's lexical path joins to
+  # follow after the privilege drop. A legitimate carve-out root is always a real directory
+  # directly under /data. Without this check the chmod/chown below would also dereference the
+  # link and could re-own the worker-only repos/ cache to the runner identity.
+  require_real_carveout_root "$DATA_DIR/$d"
   # 🔴 SC3067 IS A TRUE PORTABILITY STATEMENT AND A FALSE BUG REPORT AGAINST THIS
   # IMAGE, AND IT STOPS BEING FALSE THE MOMENT THE SHEBANG OR THE BASE IMAGE MOVES.
   # This file is `#!/bin/sh` and both worker Dockerfiles ship it on the same
@@ -245,9 +286,116 @@ for d in runner agent-home provision; do
   #     image moving, and the cost of being wrong is a permission mode that is
   #     never applied on a tree nobody is looking at.
   # shellcheck disable=SC3067
-  [ -O "/data/$d" ] && "$CHMOD" 2775 "/data/$d"   # only on a fresh (root-owned) dir
-  "$CHOWN" "$RUNNER_TREE_OWNER" "/data/$d"
+  [ -O "$DATA_DIR/$d" ] && "$CHMOD" 3775 "$DATA_DIR/$d"   # only on a fresh (root-owned) dir
+  "$CHOWN" "$RUNNER_TREE_OWNER" "$DATA_DIR/$d"
 done
+
+# --- (a2b) PRD #1493 M2: one-time, ownership-aware migration of a POPULATED legacy
+# single-uid /data volume, so uid 10002 (runner) can use it after first split enablement ----
+# migrate_tree "$DATA_DIR" above left every legacy descendant worker:worker, and the carve-out
+# `[ -O ]`-guarded chmod is SKIPPED on a legacy (worker-owned, not root-owned) parent, so
+# without this the three carve-out trees stay unusable by the runner (uid 10002). This is
+# ONE-TIME and sentinel-gated like migrate_tree; it is NEVER a blanket `chown -R "$DATA_DIR"`
+# (which would clobber the mixed agent-home map), NEVER purges working state (a retained clone
+# or resume state may be the only copy of unpublished work), and NEVER runs per-boot (a
+# per-boot recursive chown would clobber a requeued run's resume state). Only `chown`/`chgrp`
+# (CAP_CHOWN) touch descendants — never `chmod` (the root window has no CAP_FOWNER, so it
+# cannot chmod a path it does not own); the two dirs that STAY worker-owned (the run HOME root
+# + codex-data root) are chgrp'd to `runner` while the executor's ensureCodexSharedDirectory
+# re-asserts their exact 2770 mode on the next resume. The EXACT ownership map (change 3):
+#
+#   * carve-out parents "$DATA_DIR"/{runner,agent-home,provision}: reclaim to root (no
+#     CAP_FOWNER), then worker:runner + setgid + group-write + STICKY == 3775 (the legacy
+#     counterpart of the fresh-dir carve-out above).
+#   * "$DATA_DIR"/runner (plain-lane runner working clones): PRESERVED byte-for-byte, re-owned
+#     one-time to the `runner` identity (uid 10002) that adopts them on resume. NEVER purged.
+#   * "$DATA_DIR"/agent-home per-run HOMEs (Codex AND Claude SDK):
+#       - the run HOME root + its codex-data root STAY worker:runner (owner worker, gid
+#         runner) so ensureCodexSharedDirectory still validates them on resume.
+#       - codex-session-store (worker-private resume state, 0700/0600) is NEVER touched — it is
+#         deliberately worker-private; exposing it to group `runner` would let uid 10003 read
+#         or tamper with resume state.
+#       - every OTHER descendant — the Claude SDK .claude tree / .claude.json / history / todos
+#         / shell snapshots AND the provider-owned codex-data/epoch-N trees — is re-owned to
+#         the `runner` identity, which runs the SDK/provider under the split and must read AND
+#         update this state or every resumed run on a migrated volume fails on its own HOME.
+#   * "$DATA_DIR"/provision (shared provisioning state, written by the runner): re-owned to runner.
+LEGACY_SENTINEL="$DATA_DIR/.uzi-legacy-split-migrated"
+if [ ! -f "$LEGACY_SENTINEL" ]; then
+  echo "uzi-entrypoint: one-time ownership-aware migration of legacy $DATA_DIR [PRD #1493 M2]" >&2
+  for d in runner agent-home provision; do
+    require_real_carveout_root "$DATA_DIR/$d"
+    if [ -d "$DATA_DIR/$d" ]; then
+      "$CHOWN" 0:0 "$DATA_DIR/$d"                       # reclaim (no CAP_FOWNER at runtime)
+      "$CHMOD" 3775 "$DATA_DIR/$d"                      # setgid + group-write + STICKY (change 4 / D7)
+      "$CHOWN" "$RUNNER_TREE_OWNER" "$DATA_DIR/$d"
+    fi
+  done
+  # SYMLINK GIVE-AWAY DEFENSE (PRD #1493 M2 audit, BLOCKING): a legacy single-uid /data was
+  # writable by the untrusted agent uid, so it could plant a symlink either AT a carve-out ROOT
+  # itself (e.g. `agent-home -> repos`, or `runner -> ../repos`) or as a DESCENDANT of one (e.g.
+  # `agent-home/evil -> ../repos`, or a run HOME's `codex-data -> ../../repos`). Either lets a
+  # `chmod`/`chown`/`chown -R` dereference onto — or a glob descend through — an unrelated tree,
+  # notably the worker-only bare-repo cache repos/ (the B2 code-exec surface): re-owning repos/ to
+  # `runner` lets the untrusted identity plant a git hook the PAT-holding worker later executes,
+  # defeating the uid split. The kernel ALWAYS resolves mid-path components regardless of busybox
+  # chown's no-dereference default, so a symlinked ROOT poisons every op keyed on it and a symlinked
+  # DESCENDANT poisons its sub-walk. TWO GUARD LAYERS close the whole class:
+  #   (a) ROOTS — every place a carve-out root {runner,agent-home,provision} is chmod'd, chown'd or
+  #       used as a glob/mid-path prefix calls require_real_carveout_root first. A symlink aborts
+  #       startup before the sentinel or privilege drop, so no migration op or later runtime path
+  #       can follow it. A legitimate carve-out root is always a real directory directly under /data.
+  #   (b) DESCENDANTS — every descendant loop below skips a symlink entry outright (`[ -L ]`) and only
+  #       ever descends REAL directories. A legitimate carve-out child / per-run HOME / epoch is
+  #       always a real path; a symlink there is never something the migration needs to re-own.
+  #
+  # KNOWN, ACCEPTED, NARROW RESIDUAL (deliberately NOT "fixed" with an nlink filter): `[ -L ]` cannot
+  # catch a HARDLINK. A legacy-planted hardlink from inside a migrated tree to an existing
+  # repos/<repo> FILE would transfer that single inode's ownership to `runner` via `chown -R` (files
+  # only, same-fs, the target must pre-exist). This is far narrower than the symlink class (no
+  # directory trees, no new inodes), and a general defense is impractical: git LEGITIMATELY hardlinks
+  # pack/object files, so an `nlink > 1` skip would break real clones. Documented and accepted.
+  #
+  # "$DATA_DIR"/runner + /provision: re-own retained content to `runner`, preserving it. Only the
+  # PARENT's CHILDREN are re-owned (the parents stay worker:runner, set just above).
+  for tree in runner provision; do
+    require_real_carveout_root "$DATA_DIR/$tree"
+    if [ -d "$DATA_DIR/$tree" ]; then
+      for c in "$DATA_DIR/$tree"/* "$DATA_DIR/$tree"/.[!.]* "$DATA_DIR/$tree"/..?*; do
+        [ -e "$c" ] || continue
+        [ -L "$c" ] && continue                          # never dereference an attacker-planted symlink into a chown -R
+        "$CHOWN" -R runner:runner "$c"
+      done
+    fi
+  done
+  # "$DATA_DIR"/agent-home: the mixed per-subtree map above.
+  require_real_carveout_root "$DATA_DIR/agent-home"
+  if [ -d "$DATA_DIR/agent-home" ]; then
+    for home in "$DATA_DIR"/agent-home/* "$DATA_DIR"/agent-home/.[!.]* "$DATA_DIR"/agent-home/..?*; do
+      [ -d "$home" ] || continue
+      [ -L "$home" ] && continue                        # a legit per-run HOME is always a REAL dir; skip a planted symlink so it can never become a mid-path prefix
+      "$CHOWN" worker:runner "$home"                    # run HOME / advice-parent root STAYS worker-owned, gid runner
+      if [ -d "$home/codex-data" ] && [ ! -L "$home/codex-data" ]; then   # only descend a REAL codex-data, never a planted symlink
+        "$CHOWN" worker:runner "$home/codex-data"       # codex-data root STAYS worker:runner
+        for epoch in "$home"/codex-data/* "$home"/codex-data/.[!.]* "$home"/codex-data/..?*; do
+          [ -e "$epoch" ] || continue
+          [ -L "$epoch" ] && continue                   # skip a planted epoch symlink before the recursive chown
+          "$CHOWN" -R runner:runner "$epoch"            # provider-owned per-epoch trees -> runner
+        done
+      fi
+      for entry in "$home"/* "$home"/.[!.]* "$home"/..?*; do
+        [ -e "$entry" ] || continue
+        [ -L "$entry" ] && continue                     # skip a planted symlink so the recursive chown never dereferences it
+        case "${entry##*/}" in
+          codex-data|codex-session-store) continue ;;   # codex-data handled above; store is worker-private
+        esac
+        "$CHOWN" -R runner:runner "$entry"              # Claude SDK state + advice provider roots -> runner
+      done
+    done
+  fi
+  : > "$LEGACY_SENTINEL" 2>/dev/null && "$CHOWN" "$WORKER_OWNER" "$LEGACY_SENTINEL" 2>/dev/null \
+    || echo "uzi-entrypoint: warning: could not persist $LEGACY_SENTINEL (re-runs next boot)" >&2
+fi
 
 # --- (a3) PRD #51 M3 / 5-bis: distinct per-uid TMPDIR on 0700 trees -------------
 # git/npm/node scratch writes would otherwise share a sticky /tmp (symlink races +
@@ -255,33 +403,62 @@ done
 # runner each a private 0700 tmp. The worker's is exported as TMPDIR below; the runner's
 # is exported as UZI_RUNNER_TMPDIR (the runner env builders put it on the agent/checks/
 # provision children — runner-uid.ts). Its 0700/runner mode is owner-only, so the worker
-# (a `runner`-GROUP member) still cannot read it. The chmod is guarded on root-ownership
-# for the same restart-safety reason as the carve-out above: /tmp is the container's
-# writable layer (NOT a named volume), so a `docker restart` reuses it — an unconditional
-# chmod on the now-worker/runner-owned dir would EPERM (no CAP_FOWNER) -> set -eu crash.
-WORKER_TMPDIR=/tmp/uzi-worker
-RUNNER_TMPDIR=/tmp/uzi-runner
+# (a `runner`-GROUP member) still cannot read it. The mode is re-asserted every boot by
+# reclaiming ownership to root FIRST and only then chmod'ing: /tmp is the container's
+# writable layer (NOT a named volume), so a `docker restart` reuses it and a prior boot
+# may have left the dir worker/runner-owned. Rather than guard the chmod on root-ownership,
+# we `chown 0:0` each dir back to root (CAP_CHOWN, which the root startup window has; no
+# CAP_FOWNER needed) and then chmod — so an unconditional chmod can never EPERM here.
+#
+# DOCKER-LANE TMPDIR (PRD #1493 M2 change 2 / coupling #2): the k8s docker lane pre-sets an
+# ambient TMPDIR to the DinD-shared run workdir (render_dind.go: /data/runner) so a
+# `docker run -v <src>` bind source staged under $TMPDIR resolves in the daemon's filesystem.
+# When that ambient TMPDIR is present, derive BOTH private per-uid tmpdirs BENEATH it (still
+# one per uid, still 0700, still worker-/runner-owned) so bind sources stay inside the shared
+# workdir. With no ambient TMPDIR (compose, and plain-lane k8s), keep /tmp/uzi-worker +
+# /tmp/uzi-runner EXACTLY as before.
+if [ -n "${TMPDIR:-}" ]; then
+  WORKER_TMPDIR="$TMPDIR/uzi-worker"
+  RUNNER_TMPDIR="$TMPDIR/uzi-runner"
+else
+  WORKER_TMPDIR=/tmp/uzi-worker
+  RUNNER_TMPDIR=/tmp/uzi-runner
+fi
+# HARDEN ADOPTION (PRD #1493 rework / CWE-732 CodeRabbit): TMPDIR is an ambient, possibly
+# PERSISTENT shared volume on the docker lane (render_dind.go pre-sets it to /data/runner),
+# so an untrusted principal can pre-create uzi-worker/uzi-runner. `mkdir -p` NO-OPS on an
+# existing dir (it keeps that dir's mode AND contents), and a planted SYMLINK at that name
+# would make the chmod/chown below DEREFERENCE onto its target. A persistent docker-lane
+# parent is sticky (3775), and after the first boot these entries are worker/runner-owned;
+# root deliberately lacks CAP_FOWNER, so it cannot unlink either entry through that parent.
+# Reclaim each existing entry itself with CAP_CHOWN before removing it. `-h` is load-bearing:
+# a planted symlink is re-owned rather than dereferenced, then `rm -rf` unlinks the link itself.
+# A real tree may itself contain sticky directories with runtime-owned files. Reclaim only its
+# directories, then clear their modes to 0700 before removal; this gives root ownership of every
+# deletion parent without chowning files (which could be hardlinks to state outside this scratch
+# tree). find does not follow symlinks by default, and -xdev bounds traversal to one filesystem.
+# These paths hold only disposable per-uid scratch (git/npm/node temp); no resumed-run state
+# lives here (that is under /data/agent-home + the clone), so a boot-time wipe is safe.
+for tmpdir in "$WORKER_TMPDIR" "$RUNNER_TMPDIR"; do
+  if [ -e "$tmpdir" ] || [ -L "$tmpdir" ]; then
+    "$CHOWN" -h 0:0 "$tmpdir"
+    if [ -d "$tmpdir" ] && [ ! -L "$tmpdir" ]; then
+      "$FIND" "$tmpdir" -xdev -type d -exec "$CHOWN" 0:0 '{}' +
+      "$FIND" "$tmpdir" -xdev -type d -exec "$CHMOD" 0700 '{}' +
+    fi
+  fi
+done
+"$RM" -rf "$WORKER_TMPDIR" "$RUNNER_TMPDIR"
 "$MKDIR" -p "$WORKER_TMPDIR" "$RUNNER_TMPDIR"
-# SC3067: `-O` is undefined in POSIX sh and implemented by busybox ash 1.37.0, the
-# /bin/sh this file actually runs under in the pinned node:22-alpine (measured
-# 2026-08-03, with an unsupported-operator control). Per-instance rather than an rc
-# entry because the hazard is LOCAL: change the interpreter and `[ -O ... ]` goes
-# false, the `&&` short-circuits, this chmod never runs, and `set -eu` cannot see it
-# (POSIX exempts the left of an AND-list from errexit). A 0700 that silently became
-# 0755 is the whole point of the line. See the (a2) block above for the full argument.
-# shellcheck disable=SC3067
-[ -O "$WORKER_TMPDIR" ] && "$CHMOD" 0700 "$WORKER_TMPDIR"; "$CHOWN" "$WORKER_OWNER" "$WORKER_TMPDIR"
-# runner:runner 0700 — owner-only, so even the worker (a `runner`-GROUP member) cannot
-# reach it (0700 grants the group nothing); true per-uid isolation.
-# SC3067: same operator, same shell, same reason as the line above -- busybox ash
-# 1.37.0 in the pinned node:22-alpine implements `-O` (measured 2026-08-03 with an
-# unsupported-operator control), POSIX does not. Per-instance because a changed
-# interpreter turns this into a SKIPPED chmod with no error: `[ -O ... ]` is false,
-# `&&` short-circuits, and errexit does not apply to the left of an AND-list. Here
-# that would leave the runner's private tmp readable by the worker uid, which is the
-# isolation this line exists to create.
-# shellcheck disable=SC3067
-[ -O "$RUNNER_TMPDIR" ] && "$CHMOD" 0700 "$RUNNER_TMPDIR"; "$CHOWN" runner:runner "$RUNNER_TMPDIR"
+# Then RECLAIM to root and re-assert 0700 UNCONDITIONALLY (no `[ -O ]` guard): root reclaims
+# via CAP_CHOWN (the root startup window has CHOWN, no FOWNER), so the chmod always succeeds
+# even when a prior boot left the dir worker/runner-owned -- the SAME restart-safe reclaim the
+# token block and the legacy-migration roots use. No `if`-wrapper (unlike the token's EROFS
+# read-only Secret mount): these tmpdirs are ALWAYS a writable mount, never read-only.
+"$CHOWN" 0:0 "$WORKER_TMPDIR"; "$CHMOD" 0700 "$WORKER_TMPDIR"; "$CHOWN" "$WORKER_OWNER" "$WORKER_TMPDIR"
+# runner:runner 0700 -- owner-only, so even the worker (a `runner`-GROUP member) cannot reach
+# it (0700 grants the group nothing); true per-uid isolation.
+"$CHOWN" 0:0 "$RUNNER_TMPDIR"; "$CHMOD" 0700 "$RUNNER_TMPDIR"; "$CHOWN" runner:runner "$RUNNER_TMPDIR"
 
 # --- (b) token: force 0400 worker on the join-token secret ---------------------
 # Compose delivers the env-sourced `worker_token` secret 0444 root:root (world-readable
@@ -310,11 +487,62 @@ RUNNER_TMPDIR=/tmp/uzi-runner
 # left 0444 worker:worker by a previous boot, an ownership-guarded chmod leaves it 0444
 # while this sequence restores 0400. The transient root ownership never widens anything
 # (0400 carries no setuid/setgid bit for the final chown to strip).
+#
+# READ-ONLY KUBE SECRET MOUNT (PRD #1493 M2 change 1 / coupling #4): on k8s the join token
+# is a Secret volume the kubelet presents READ-ONLY as uid=0 gid=10001 mode=0440. The
+# reclaim `chown 0:0` there fails with EROFS; under `set -eu` an unconditional chown aborts
+# the entrypoint and the pod crash-loops. So the reclaim is run in an `if` (whose failure is
+# exempt from errexit): on SUCCESS (a writable compose secret) keep today's exact
+# reclaim -> chmod 0400 -> hand-over sequence and result; on FAILURE do NOT abort but
+# POSITIVELY verify the exact kube posture (uid=0 gid=10001 mode=0440) AND that `worker` can
+# actually read it, failing CLOSED (exit non-zero) on anything else. gid 10001 is the
+# `worker` primary group and 0440 is group-readable, so a token in that posture is readable
+# by the dropped worker and unreadable by `runner`/`runner-cmd` (whose --init-groups drops
+# the fsGroup) — the same containment the compose 0400 worker:worker gives.
 TOKEN=/run/secrets/worker_token
 if [ -e "$TOKEN" ]; then
-  "$CHOWN" 0:0 "$TOKEN"
-  "$CHMOD" 0400 "$TOKEN"
-  "$CHOWN" "$WORKER_OWNER" "$TOKEN"
+  if "$CHOWN" 0:0 "$TOKEN" 2>/dev/null; then
+    "$CHMOD" 0400 "$TOKEN"
+    "$CHOWN" "$WORKER_OWNER" "$TOKEN"
+  else
+    token_posture="$("$BUSYBOX" stat -c '%u %g %a' "$TOKEN" 2>/dev/null || true)"
+    case "$token_posture" in
+      "0 10001 440"|"0 10001 0440") token_posture_ok=1 ;;
+      *) token_posture_ok= ;;
+    esac
+    if [ -n "$token_posture_ok" ] \
+      && "$SETPRIV" --reuid "$WORKER_USER" --regid "$WORKER_USER" --init-groups \
+           -- "$BUSYBOX" cat "$TOKEN" >/dev/null 2>&1; then
+      echo "uzi-entrypoint: join token is a read-only kube Secret (uid=0 gid=10001 mode=0440), worker-readable — keeping as mounted" >&2
+    else
+      echo "uzi-entrypoint: join token at $TOKEN cannot be re-owned and is NOT the expected read-only kube posture (uid=0 gid=10001 mode=0440, worker-readable); refusing to start (posture: '$token_posture')" >&2
+      exit 1
+    fi
+  fi
+fi
+
+# --- (b2) PRD #1493 M2 change 5: restore the kubelet fsGroup alignment on migrated roots ---
+# The kubelet's FSGroupChangeOnRootMismatch skips its recursive fsGroup walk only while a
+# mounted volume's ROOT directory already matches the pod fsGroup (group 10001) with the
+# setgid bit set. migrate_tree's `chown -R "$NIX_OWNER" "$NIX_DIR"` flips the /nix mount-root's
+# group to `runner` (10002), so without this the kubelet re-walks the whole nix store on EVERY
+# start. Restore each migrated root to group 10001 + setgid + group-rwx WITHOUT touching
+# content ownership (a NON-recursive chmod/chown of the ROOT dir only; the owner is preserved).
+# Reclaim to root first because the root window has no CAP_FOWNER (it cannot chmod a dir it does
+# not own). Gated on the fsGroup fingerprint captured BEFORE migrate_tree, so this is a strict
+# NO-OP on compose (whose volume roots never carry the setgid bit) — compose behaviour is
+# byte-for-byte preserved.
+align_pvc_root() {
+  # $1 = mounted volume root; $2 = owner to restore (owner preserved; only group + mode change).
+  root="$1"; owner="$2"
+  [ -d "$root" ] || return 0
+  "$CHOWN" 0:0 "$root"                 # reclaim (CAP_CHOWN; the root window has no CAP_FOWNER)
+  "$CHMOD" 2775 "$root"                # setgid + group-rwx == what OnRootMismatch expects
+  "$CHOWN" "$owner:$FSGROUP" "$root"   # restore owner, set group to the pod fsGroup (10001)
+}
+if [ -n "$NIX_HAD_FSGROUP" ]; then
+  align_pvc_root "$NIX_DIR" runner
+  align_pvc_root "$DATA_DIR" "$WORKER_USER"
 fi
 
 # --- (c) drop root -> worker, keeping ONLY setuid/setgid (ambient) -------------

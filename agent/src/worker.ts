@@ -259,19 +259,21 @@ export class Worker {
           // held-state `set-token` verb 409s naming the worker.
           "credential_switch_v1",
         ];
-        // PRD #1332 D3 (M5A / C2): advertise the Codex harness PROTOCOL capability ONLY
-        // after a successful startup runtime probe of the pinned, image-baked Codex
-        // package. main.ts resolved that probe ONCE (like dockerWiring) and stored the
-        // boolean on config; a positive result APPENDS codex_harness_v1, a failed/absent
-        // one leaves the array unchanged so a stripped/corrupt/mismatched/old image keeps
-        // serving Claude. The `?.` degrades safe to "not capable" if the field is somehow
-        // unset — registration must never throw on a config quirk. The server now ADMITS
-        // codex_harness_v1 into its protocol vocabulary (FilterProtocol keeps it) and gates
-        // run placement/claim on it (the ClaimRun dedicated Codex clause admits a
-        // Codex-indicating run only for a worker that self-reported it). M5A stays dark
-        // regardless: no public DTO/CLI/web selector exposes Codex, so advertising this
-        // protocol fact is invisible to users until a later milestone lights it up.
-        if (this.config.codexProbe?.capable) {
+        // PRD #1332 D3 (M5A / C2), refined by PRD #1493 M3: advertise the Codex harness
+        // PROTOCOL capability ONLY on an HONEST availability result. The old gate was the
+        // receipt probe alone; it is now the combined decision main.ts resolved ONCE (like
+        // dockerWiring) and stored on config.codexHarness — receipt intact AND the uid
+        // split active AND (Landlock available OR best-effort on a Landlock-less kernel).
+        // A positive result APPENDS codex_harness_v1; a failed precondition leaves the
+        // array unchanged so a stripped/corrupt/mismatched/old image, a split-less worker,
+        // or a Landlock-less worker in `required` mode keeps serving Claude — its Codex
+        // runs queue with the api's existing `no Codex-capable worker is online` reason
+        // instead of being claimed and failed. The `?.` degrades safe to "not advertising"
+        // if the field is somehow unset — registration must never throw on a config quirk.
+        // The server ADMITS codex_harness_v1 into its protocol vocabulary (FilterProtocol
+        // keeps it) and gates run placement/claim on it (the ClaimRun dedicated Codex
+        // clause admits a Codex-indicating run only for a worker that self-reported it).
+        if (this.config.codexHarness?.advertise) {
           protocolCapabilities.push(CODEX_HARNESS_CAPABILITY);
         }
         const res = await this.client.register(
