@@ -39,7 +39,15 @@
 //     NEVER returned after a timeout.
 
 import { renderCodexAdvice } from "./render.js";
-import { normalizeCodexStatus, normalizeCodexTerminalErrors, normalizeCodexUsage } from "./terminal-normalize.js";
+import {
+  formatCodexClassification,
+  normalizeCodexErrorInfo,
+  normalizeCodexStatus,
+  normalizeCodexTerminalErrors,
+  normalizeCodexUsage,
+  pickCodexClassification,
+  type CodexErrorClassification,
+} from "./terminal-normalize.js";
 import { errMessage } from "../util.js";
 
 import type { Logger } from "../log.js";
@@ -351,7 +359,7 @@ export class CodexAdviceHarness implements AdviceHarness {
     // Authentication is setup, so it completes before any thread/model work.
     await this.appServerAuth?.authenticate(transport, signal);
     const threadId = await this.startThread(transport, cwd, rendered, model, signal);
-    await this.startTurnRpc(transport, threadId, rendered, model, signal);
+    const turnId = await this.startTurnRpc(transport, threadId, rendered, model, signal);
 
     // Single-consumer: obtain the notifications iterator exactly once.
     const notes = transport.notifications();
@@ -360,6 +368,10 @@ export class CodexAdviceHarness implements AdviceHarness {
     // unbounded/looping stream (see MAX_ADVICE_TEXT_BYTES). Kept O(n) total: each appended
     // chunk is measured EXACTLY ONCE here, never a re-scan of the whole `text`.
     let textBytes = 0;
+    // PRD #1534: the classification captured from the active advice turn's final non-retrying
+    // provider method:"error" frame, folded into the terminal at decode. A local var is
+    // correct here — advice is single-turn/single-thread, so there is no instance field.
+    let pendingCodexError: CodexErrorClassification | undefined;
 
     // Abort race: an aborted signal (timeout OR external) ends the stream promptly rather
     // than blocking forever on notes.next().
@@ -400,11 +412,22 @@ export class CodexAdviceHarness implements AdviceHarness {
           continue;
         }
 
+        if (note.kind === "codex_error") {
+          // PRD #1534: bind the provider ErrorNotification to the ACTIVE advice turn and
+          // retain its classification ONLY on an explicit non-retrying frame (willRetry ===
+          // false) — final-non-retrying-wins. A stale/foreign identity is ignored. Parsing
+          // stays in the single-source normalizer; no raw provider text is kept.
+          if (note.threadId === threadId && note.turnId === turnId && note.willRetry === false) {
+            pendingCodexError = normalizeCodexErrorInfo(asObject(asObject(note.params)?.error)?.codexErrorInfo);
+          }
+          continue;
+        }
+
         if (note.kind === "turn_completed") {
           // A same-chunk refresh is owned by the auth interceptor. Advice cannot return a
           // terminal verdict until it settles, and a sticky auth poison fails closed.
           await this.appServerAuth?.drainInterceptedRequests();
-          const terminal = this.decodeTerminal(note);
+          const terminal = this.decodeTerminal(note, pendingCodexError);
           const isError = terminal.outcome === "failed";
           // The synchronous uzi policy runs HERE, inside terminal consumption, BEFORE the
           // iterator is closed and BEFORE HOME cleanup (mirror ClaudeAdviceHarness). It
@@ -513,7 +536,7 @@ export class CodexAdviceHarness implements AdviceHarness {
     rendered: RenderedCodexAdvice,
     model: string | undefined,
     signal: AbortSignal,
-  ): Promise<void> {
+  ): Promise<string> {
     const params: Record<string, unknown> = {
       threadId,
       input: [{ type: "text", text: rendered.prompt }],
@@ -525,6 +548,7 @@ export class CodexAdviceHarness implements AdviceHarness {
     if (typeof id !== "string" || id.length === 0) {
       throw new CodexAdviceError({ category: "protocol", message: "codex advice turn/start returned no turn id" });
     }
+    return id;
   }
 
   /** Refuse a server→client request fail-closed — advice is tool-less. There is no broker
@@ -557,17 +581,27 @@ export class CodexAdviceHarness implements AdviceHarness {
   /** Decode a `turn/completed` note into a neutral {@link HarnessTerminal}. Outcome is
    *  success only for status `completed`; anything else (incl. absent) is fail-closed
    *  `failed`. Usage is labeled `basis:"turn"` (Codex declares turn usage). A terminal
-   *  PROVIDER failure is DATA here — it is never also thrown. */
-  private decodeTerminal(note: Extract<CodexNotification, { kind: "turn_completed" }>): HarnessTerminal {
+   *  PROVIDER failure is DATA here — it is never also thrown. The optional `pending`
+   *  classification is the active advice turn's final non-retrying method:"error" frame; it
+   *  is preferred over the terminal `turn.error` fallback and folded into the errors, the
+   *  failure category and the message suffix. */
+  private decodeTerminal(
+    note: Extract<CodexNotification, { kind: "turn_completed" }>,
+    pending?: CodexErrorClassification,
+  ): HarnessTerminal {
     const turn = asObject(asObject(note.params)?.turn);
     const rawStatus = note.status ?? asString(turn?.status);
     // Route through the single-source-of-truth normalizers so this advice decoder and the
     // run-lane decoder (codex-harness.ts) cannot diverge and no raw provider field is ever
-    // retained: subtype/outcome come from the CLOSED vocabulary, errors are provider-text-
-    // free (the raw, possibly secret-bearing `turn.error` is never read), and usage is a
-    // bounded numeric-only subset (the raw, possibly multi-megabyte object is never kept).
+    // retained: subtype/outcome come from the CLOSED vocabulary, and usage is a bounded
+    // numeric-only subset (the raw, possibly multi-megabyte object is never kept).
     const { subtype, outcome } = normalizeCodexStatus(rawStatus);
-    const errors = normalizeCodexTerminalErrors(subtype, outcome);
+    // PRD #1534: prefer the active turn's final non-retrying method:"error" classification,
+    // else the terminal turn.error's codexErrorInfo. Single-source normalizer → only a CLOSED
+    // display token + bounded httpStatus surface; no raw message/additionalDetails/misalignment.
+    const fromTerminal = normalizeCodexErrorInfo(asObject(turn?.error)?.codexErrorInfo);
+    const classification = pickCodexClassification(pending, fromTerminal);
+    const errors = normalizeCodexTerminalErrors(subtype, outcome, classification);
     const usage = normalizeCodexUsage(turn?.usage, "turn");
     return {
       outcome,
@@ -576,13 +610,17 @@ export class CodexAdviceHarness implements AdviceHarness {
       usage,
       metrics: { cost: { kind: "unreported" } },
       failure: {
-        // Deferred, invoked only at the owner's classification point. Codex M3 carries no
-        // limit facts, so this constructs the generic terminal exception; it never invents
-        // an auth/model/effort category from a provider status, and its message is based on
-        // the CLOSED subtype, never the raw provider status string.
+        // Deferred, invoked only at the owner's classification point. The category now comes
+        // from the CLOSED classification MAP (never invented from a raw provider status), and
+        // the message suffix is the CLOSED display token plus a bounded http status only — no
+        // raw provider text (message/additionalDetails/misalignment) is ever retained. With no
+        // classification the message stays based on the CLOSED subtype alone and the category
+        // defaults to "unknown", byte-identical to before #1534.
         materialize: (_limit): HarnessThrownFailure => {
-          const original = new Error(`codex advice turn failed: ${subtype}`);
-          return { failure: { category: "unknown", message: original.message }, original };
+          const suffix = classification !== undefined ? ` (${formatCodexClassification(classification)})` : "";
+          const original = new Error(`codex advice turn failed: ${subtype}${suffix}`);
+          const category = classification?.category ?? "unknown";
+          return { failure: { category, message: original.message }, original };
         },
       },
     };
