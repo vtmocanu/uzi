@@ -236,7 +236,7 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 	// the run is parked, how long ago, its milestone progress, and (for a wall park) the
 	// extend command. Emit-only-when-held, so a run with a null hold_reason adds nothing and
 	// renders byte-for-byte as before. Placed after the completion block so a completion hold
-	// reads its HOLD summary line above the HOLD_CONTEXT durability row that block emits.
+	// reads its HOLD summary line just below the HOLD_CONTEXT durability row that block emits.
 	if row := holdRow(r, time.Now()); row != nil {
 		rows = append(rows, row)
 	}

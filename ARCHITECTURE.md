@@ -1041,7 +1041,7 @@ chain in the diagram above, with no intervening `running`.
   5 minutes is re-queued; a running run older than `RUN_TIMEOUT` (default 2h)
   **parks** — non-terminal `paused`, `hold_reason='budget_exhausted'` — and asks
   its owner to extend or stop it, never failed for the clock alone (PRD #1497,
-  see the **running → paused (wall park)** entry below); a worker whose
+  see the **running → paused (wall park)** entry above); a worker whose
   heartbeat is stale past `WORKER_HEARTBEAT_STALE`
   (default 45s) is marked offline and its non-terminal runs re-queued,
   incrementing `requeue_count` — only after a *second* consecutive stale
