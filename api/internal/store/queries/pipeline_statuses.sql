@@ -38,28 +38,39 @@ JOIN repos r ON r.id = ps.repo_id
 WHERE ps.repo_id = ANY(@repo_ids::uuid[]) AND ps.ref = r.default_branch;
 
 -- name: ListWatchedRunRefsForRepo :many
--- Watched run branches for a repo's pipeline sync (PRD #6): each distinct run
--- branch and the MR iid of its most-recent run, for runs that are either
--- non-terminal, or terminal-with-an-MR and finished within the watch window
--- (@finished_after = now() - CI_WATCH_RUN_WINDOW, computed caller-side). DISTINCT
--- ON collapses a branch's several runs to the newest; the outer ORDER BY + LIMIT
--- keeps the newest @max_refs branches (hitting the cap is logged caller-side).
--- A run has no branch until the worker creates its worktree, so blank branches
--- are excluded.
-WITH per_branch AS (
+-- Watched run branches for a repo's pipeline sync (PRD #6), selected in TWO steps.
+-- First collapse each branch to its NEWEST run (DISTINCT ON (branch), created_at
+-- DESC); THEN keep the branch iff that newest run is either non-terminal, OR
+-- terminal-with-an-MR finished inside the watch window (@finished_after = now() -
+-- CI_WATCH_RUN_WINDOW, computed caller-side) whose MR has NOT reached a terminal
+-- state (mr_state IS DISTINCT FROM 'merged'/'closed'; NULL/'opened'/'locked' stay
+-- eligible). The merged/closed exclusion sits INSIDE the terminal arm on purpose,
+-- so a non-terminal newest run stays watched no matter what mr_state was cached.
+-- Newest-run-FIRST (not filter-then-collapse) is load-bearing because mr_state is
+-- PER-RUN, and IN THE ISSUE LANE it is recorded only on the newest run per issue
+-- (ListMRWatchCandidates, DISTINCT ON (issue_iid)) — so on a REUSED branch (a re-run
+-- of the same issue) the newest run can be 'merged' while an older run on the same
+-- branch keeps a stale 'opened'/NULL. Filtering before the collapse would drop the
+-- merged newest row and resurface that stale older run; collapsing first excludes
+-- the branch correctly. (The board-free lane, SyncBoardFreeMRStates, records
+-- mr_state per-run on issue-LESS runs, so this is not "newest run per issue"
+-- unqualified.) A run has no branch until the worker creates its worktree, so blank
+-- branches are excluded; the row returns the newest run's mr_iid, and the outer
+-- ORDER BY + LIMIT keeps the newest @max_refs branches (hitting the cap is logged
+-- caller-side).
+WITH latest_per_branch AS (
     SELECT DISTINCT ON (r.branch)
-           r.branch, r.mr_iid, r.created_at
+           r.branch, r.mr_iid, r.mr_state, r.status, r.finished_at, r.created_at
     FROM runs r
     WHERE r.repo_id = @repo_id::uuid
       AND r.branch IS NOT NULL AND r.branch <> ''
-      AND (
-        r.status NOT IN ('completed', 'failed', 'cancelled')
-        OR (r.mr_iid IS NOT NULL AND r.finished_at IS NOT NULL AND r.finished_at > @finished_after)
-      )
     ORDER BY r.branch, r.created_at DESC
 )
 SELECT branch, mr_iid
-FROM per_branch
+FROM latest_per_branch
+WHERE status NOT IN ('completed', 'failed', 'cancelled')
+   OR (mr_iid IS NOT NULL AND finished_at IS NOT NULL AND finished_at > @finished_after
+       AND mr_state IS DISTINCT FROM 'merged' AND mr_state IS DISTINCT FROM 'closed')
 ORDER BY created_at DESC
 LIMIT @max_refs;
 

@@ -56,20 +56,21 @@ func (q *Queries) CloseHealthEpisode(ctx context.Context, arg CloseHealthEpisode
 }
 
 const countEligibleCIWatchRefsPerRepo = `-- name: CountEligibleCIWatchRefsPerRepo :many
-WITH per_branch AS (
-    SELECT DISTINCT r.repo_id, r.branch
+WITH latest_per_branch AS (
+    SELECT DISTINCT ON (r.repo_id, r.branch)
+           r.repo_id, r.branch, r.mr_iid, r.mr_state, r.status, r.finished_at, r.created_at
     FROM runs r
     WHERE r.branch IS NOT NULL AND r.branch <> ''
-      AND (
-        r.status NOT IN ('completed', 'failed', 'cancelled')
-        OR (r.mr_iid IS NOT NULL AND r.finished_at IS NOT NULL AND r.finished_at > $1)
-      )
+    ORDER BY r.repo_id, r.branch, r.created_at DESC
 )
-SELECT pb.repo_id, repo.path_with_namespace AS repo_path, count(*) AS eligible_refs
-FROM per_branch pb
-JOIN repos repo ON repo.id = pb.repo_id
-GROUP BY pb.repo_id, repo.path_with_namespace
-ORDER BY pb.repo_id
+SELECT latest_per_branch.repo_id, repo.path_with_namespace AS repo_path, count(*) AS eligible_refs
+FROM latest_per_branch
+JOIN repos repo ON repo.id = latest_per_branch.repo_id
+WHERE status NOT IN ('completed', 'failed', 'cancelled')
+   OR (mr_iid IS NOT NULL AND finished_at IS NOT NULL AND finished_at > $1
+       AND mr_state IS DISTINCT FROM 'merged' AND mr_state IS DISTINCT FROM 'closed')
+GROUP BY latest_per_branch.repo_id, repo.path_with_namespace
+ORDER BY latest_per_branch.repo_id
 `
 
 type CountEligibleCIWatchRefsPerRepoRow struct {
@@ -78,15 +79,20 @@ type CountEligibleCIWatchRefsPerRepoRow struct {
 	EligibleRefs int64       `json:"eligible_refs"`
 }
 
-// The number of ELIGIBLE run branches PER REPO, computed with the SAME eligibility
-// predicate ListWatchedRunRefsForRepo's per_branch CTE uses (a non-blank branch on a run
-// that is either non-terminal, or terminal-with-an-MR finished inside the watch window),
-// but WITHOUT that query's per-repo LIMIT MaxRefs. The forge.ciwatch check (M2-B) compares
-// each repo's count to CIWatchMaxRefs to find repos whose eligible branches exceed the cap
-// and therefore go unwatched. @finished_after = now() - CI_WATCH_RUN_WINDOW, computed
-// caller-side exactly as ListWatchedRunRefsForRepo receives it. DISTINCT (repo_id, branch)
-// collapses a branch's several runs to one, matching the DISTINCT ON (branch) the watcher
-// does per repo (branch is unique within a repo). One row per repo with >=1 eligible branch.
+// The number of ELIGIBLE run branches PER REPO, using the SAME eligibility predicate as
+// ListWatchedRunRefsForRepo (kept in lockstep), but WITHOUT that query's per-repo LIMIT
+// MaxRefs. Selected in TWO steps to match the watcher: first collapse each (repo, branch)
+// to its NEWEST run (DISTINCT ON (repo_id, branch), created_at DESC), THEN keep the branch
+// iff that newest run is either non-terminal, or terminal-with-an-MR finished inside the
+// watch window whose MR has NOT reached a terminal state (mr_state IS DISTINCT FROM
+// 'merged'/'closed'). Newest-run-first (not filter-then-collapse) is required for the same
+// reason as the watcher: mr_state is per-run and, on a REUSED branch, only the newest run
+// carries the fresh 'merged'/'closed' — filtering first would drop it and resurface a stale
+// older 'opened'/NULL run (see ListWatchedRunRefsForRepo's note). The forge.ciwatch check
+// (M2-B) compares each repo's count to CIWatchMaxRefs to find repos whose eligible branches
+// exceed the cap and therefore go unwatched. @finished_after = now() - CI_WATCH_RUN_WINDOW,
+// computed caller-side exactly as ListWatchedRunRefsForRepo receives it. Blank branches are
+// excluded. One row per repo with >=1 eligible branch.
 func (q *Queries) CountEligibleCIWatchRefsPerRepo(ctx context.Context, finishedAfter pgtype.Timestamptz) ([]CountEligibleCIWatchRefsPerRepoRow, error) {
 	rows, err := q.db.Query(ctx, countEligibleCIWatchRefsPerRepo, finishedAfter)
 	if err != nil {

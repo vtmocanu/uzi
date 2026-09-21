@@ -55,34 +55,51 @@ func TestPipelineStatusesLiveDB(t *testing.T) {
 		repoID, connID)
 
 	now := time.Now()
-	// run inserts one run. mrIID<=0 → NULL mr_iid; terminal runs get finished_at =
-	// now + finishedOffset (negative = in the past); createdAtOffset orders runs.
-	run := func(iid int64, branch, status string, mrIID int64, finishedOffset, createdOffset time.Duration) {
+	// run inserts one run. mrIID<=0 → NULL mr_iid; mrState=="" → NULL mr_state;
+	// terminal runs get finished_at = now + finishedOffset (negative = in the past);
+	// createdAtOffset orders runs.
+	run := func(iid int64, branch, status string, mrIID int64, mrState string, finishedOffset, createdOffset time.Duration) {
 		var mr any
 		if mrIID > 0 {
 			mr = mrIID
+		}
+		var mrSt any
+		if mrState != "" {
+			mrSt = mrState
 		}
 		var finished any
 		if status == "completed" || status == "failed" || status == "cancelled" {
 			finished = now.Add(finishedOffset)
 		}
 		mustExec(ctx, t, pool,
-			`INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, status, branch, mr_iid, finished_at, created_at)
-			 VALUES ($1, $2, $3, 't', 'd', $4, $5, $6, $7, $8)`,
-			userID, repoID, iid, status, branch, mr, finished, now.Add(createdOffset))
+			`INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, status, branch, mr_iid, mr_state, finished_at, created_at)
+			 VALUES ($1, $2, $3, 't', 'd', $4, $5, $6, $7, $8, $9)`,
+			userID, repoID, iid, status, branch, mr, mrSt, finished, now.Add(createdOffset))
 	}
 
 	// ── watched-ref selection fixtures ──
-	run(1, "agent/issue-1", "running", 0, 0, -5*time.Minute)                  // non-terminal → watched
-	run(2, "agent/issue-2", "completed", 5, -time.Hour, -6*time.Minute)       // terminal+MR, in window → watched (mr 5)
-	run(3, "agent/issue-3", "completed", 0, -time.Hour, -7*time.Minute)       // terminal, NO MR → NOT watched
-	run(4, "agent/issue-4", "completed", 9, -30*24*time.Hour, -8*time.Minute) // terminal+MR but OUTSIDE window → NOT watched
+	run(1, "agent/issue-1", "running", 0, "", 0, -5*time.Minute)                  // non-terminal → watched
+	run(2, "agent/issue-2", "completed", 5, "", -time.Hour, -6*time.Minute)       // terminal+MR, in window → watched (mr 5)
+	run(3, "agent/issue-3", "completed", 0, "", -time.Hour, -7*time.Minute)       // terminal, NO MR → NOT watched
+	run(4, "agent/issue-4", "completed", 9, "", -30*24*time.Hour, -8*time.Minute) // terminal+MR but OUTSIDE window → NOT watched
 	// issue-5 has two runs on the same branch: an older completed+MR, a newer
 	// running. DISTINCT ON must collapse to the newest (running, no MR) → watched.
-	run(5, "agent/issue-5", "completed", 7, -time.Hour, -20*time.Minute)
-	run(5, "agent/issue-5", "running", 0, 0, -1*time.Minute)
+	run(5, "agent/issue-5", "completed", 7, "", -time.Hour, -20*time.Minute)
+	run(5, "agent/issue-5", "running", 0, "", 0, -1*time.Minute)
 	// A queued run with no branch must never be a watched ref.
-	run(6, "", "queued", 0, 0, -2*time.Minute)
+	run(6, "", "queued", 0, "", 0, -2*time.Minute)
+	// Reused branch, newest run MERGED → branch drops out even though an older run is still 'opened'.
+	run(9, "agent/issue-9", "completed", 8, "opened", -time.Hour, -15*time.Minute)
+	run(9, "agent/issue-9", "completed", 8, "merged", -time.Hour, -14*time.Minute)
+	// Reused branch, newest run CLOSED → also excluded.
+	run(10, "agent/issue-10", "completed", 9, "opened", -time.Hour, -17*time.Minute)
+	run(10, "agent/issue-10", "completed", 9, "closed", -time.Hour, -16*time.Minute)
+	// Non-terminal newest run stays watched regardless of a stale merged mr_state (exclusion is terminal-arm-only).
+	run(11, "agent/issue-11", "completed", 10, "merged", -time.Hour, -13*time.Minute)
+	run(11, "agent/issue-11", "running", 0, "merged", 0, -3*time.Minute)
+	// Terminal + MR + in-window with mr_state opened / locked → still watched.
+	run(12, "agent/issue-12", "completed", 11, "opened", -time.Hour, -12*time.Minute)
+	run(13, "agent/issue-13", "completed", 12, "locked", -time.Hour, -11*time.Minute)
 
 	window := 14 * 24 * time.Hour
 	watched, err := q.ListWatchedRunRefsForRepo(ctx, store.ListWatchedRunRefsForRepoParams{
@@ -97,7 +114,7 @@ func TestPipelineStatusesLiveDB(t *testing.T) {
 	for _, w := range watched {
 		gotRefs[w.Branch.String] = w.MrIid
 	}
-	wantWatched := []string{"agent/issue-1", "agent/issue-2", "agent/issue-5"}
+	wantWatched := []string{"agent/issue-1", "agent/issue-2", "agent/issue-5", "agent/issue-11", "agent/issue-12", "agent/issue-13"}
 	for _, w := range wantWatched {
 		if _, ok := gotRefs[w]; !ok {
 			t.Errorf("expected %q to be watched, got %v", w, keys(gotRefs))
@@ -106,6 +123,11 @@ func TestPipelineStatusesLiveDB(t *testing.T) {
 	for _, notW := range []string{"agent/issue-3", "agent/issue-4", ""} {
 		if _, ok := gotRefs[notW]; ok {
 			t.Errorf("%q must NOT be watched (terminal-no-MR / out-of-window / blank)", notW)
+		}
+	}
+	for _, notW := range []string{"agent/issue-9", "agent/issue-10"} {
+		if _, ok := gotRefs[notW]; ok {
+			t.Errorf("%q must NOT be watched (its newest run's MR is merged/closed)", notW)
 		}
 	}
 	// issue-2's watched ref carries its MR iid; issue-5's newest run has no MR.

@@ -409,42 +409,66 @@ func TestCountEligibleCIWatchRefsPerRepoLiveDB(t *testing.T) {
 	seedRepo(repoA, "g/repoA-"+repoA.String()[:8], int64(uuid.New().ID()))
 	seedRepo(repoB, "g/repoB-"+repoB.String()[:8], int64(uuid.New().ID()))
 	seedRepo(repoC, "g/repoC-"+repoC.String()[:8], int64(uuid.New().ID()))
+	repoD := uuid.New()
+	seedRepo(repoD, "g/repoD-"+repoD.String()[:8], int64(uuid.New().ID()))
 
 	var iid int64 = 900000
-	seedRun := func(repo uuid.UUID, branch, status string, mrIID *int64, finishedAt *time.Time) {
+	seedRun := func(repo uuid.UUID, branch, status string, mrIID *int64, mrState string, finishedAt *time.Time, createdAt time.Time) {
 		iid++
-		var mr, fin any
+		var mr, mrSt, fin any
 		if mrIID != nil {
 			mr = *mrIID
+		}
+		if mrState != "" {
+			mrSt = mrState
 		}
 		if finishedAt != nil {
 			fin = *finishedAt
 		}
 		mustExec(ctx, t, pool,
-			`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, branch, status, mr_iid, finished_at)
-			 VALUES ($1, $2, $3, 'issue', $4, 't', 'd', $5, $6, $7, $8)`,
-			uuid.New(), userID, repo, iid, branch, status, mr, fin)
+			`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, branch, status, mr_iid, mr_state, finished_at, created_at)
+			 VALUES ($1, $2, $3, 'issue', $4, 't', 'd', $5, $6, $7, $8, $9, $10)`,
+			uuid.New(), userID, repo, iid, branch, status, mr, mrSt, fin, createdAt)
 	}
 
 	now := time.Now()
 	recent := now.Add(-5 * time.Minute) // inside the finished-after window
 	old := now.Add(-2 * time.Hour)      // outside it
+	older := now.Add(-30 * time.Minute) // orders reused-branch runs deterministically
+	newer := now.Add(-10 * time.Minute) // the newer run of a reused branch
 	mrB3 := int64(6001)
 	mrB5 := int64(6005)
+	mrB7 := int64(6007)
+	mrB8 := int64(6008)
+	mrD1 := int64(6011)
+	mrD2 := int64(6012)
+	mrD3 := int64(6013)
 
 	// Repo A: two DISTINCT eligible branches. b1 appears twice (different runs) and must collapse
-	// to one; b2 once. Both non-terminal (always eligible).
-	seedRun(repoA, "b1", "running", nil, nil)
-	seedRun(repoA, "b1", "queued", nil, nil)
-	seedRun(repoA, "b2", "running", nil, nil)
+	// to one; b2 once. Both non-terminal (always eligible). b1's two runs get distinct created_at
+	// so the DISTINCT ON (repo_id, branch) collapse is deterministic.
+	seedRun(repoA, "b1", "running", nil, "", nil, now)
+	seedRun(repoA, "b1", "queued", nil, "", nil, now.Add(-time.Minute))
+	seedRun(repoA, "b2", "running", nil, "", nil, now)
 	// Repo B: one eligible (b3: terminal + MR + finished in-window); three ineligible (b4 terminal
 	// no MR; b5 terminal + MR but finished OUT of window; blank branch).
-	seedRun(repoB, "b3", "completed", &mrB3, &recent)
-	seedRun(repoB, "b4", "completed", nil, &recent)
-	seedRun(repoB, "b5", "completed", &mrB5, &old)
-	seedRun(repoB, "", "running", nil, nil)
+	seedRun(repoB, "b3", "completed", &mrB3, "", &recent, now)
+	seedRun(repoB, "b4", "completed", nil, "", &recent, now)
+	seedRun(repoB, "b5", "completed", &mrB5, "", &old, now)
+	seedRun(repoB, "", "running", nil, "", nil, now)
 	// Repo C: only an ineligible run (terminal, no MR) → must NOT appear at all.
-	seedRun(repoC, "b6", "completed", nil, &recent)
+	seedRun(repoC, "b6", "completed", nil, "", &recent, now)
+	// repoB reused branches: newest MR merged/closed → NOT counted (older 'opened' must not resurface).
+	seedRun(repoB, "b7", "completed", &mrB7, "opened", &recent, older)
+	seedRun(repoB, "b7", "completed", &mrB7, "merged", &recent, newer)
+	seedRun(repoB, "b8", "completed", &mrB8, "opened", &recent, older)
+	seedRun(repoB, "b8", "completed", &mrB8, "closed", &recent, newer)
+	// repoD positive controls (all eligible → count 3): opened, locked, and a reused branch whose
+	// NEWEST run is non-terminal with a stale merged mr_state.
+	seedRun(repoD, "d1", "completed", &mrD1, "opened", &recent, now)
+	seedRun(repoD, "d2", "completed", &mrD2, "locked", &recent, now)
+	seedRun(repoD, "d3", "completed", &mrD3, "merged", &recent, older)
+	seedRun(repoD, "d3", "running", nil, "merged", nil, newer)
 
 	cutoff := now.Add(-time.Hour)
 	rows, err := q.CountEligibleCIWatchRefsPerRepo(ctx, ts(cutoff))
@@ -468,7 +492,10 @@ func TestCountEligibleCIWatchRefsPerRepoLiveDB(t *testing.T) {
 		t.Errorf("repoA repo_path is empty; the JOIN to repos must carry the identifier")
 	}
 	if counts[repoB] != 1 {
-		t.Errorf("repoB eligible refs = %d, want 1 (only b3: terminal + MR + in-window)", counts[repoB])
+		t.Errorf("repoB eligible refs = %d, want 1 (only b3; reused b7/b8 excluded because their newest run is merged/closed)", counts[repoB])
+	}
+	if counts[repoD] != 3 {
+		t.Errorf("repoD eligible refs = %d, want 3 (d1 opened + d2 locked + d3 whose newest run is non-terminal)", counts[repoD])
 	}
 	if c, ok := counts[repoC]; ok {
 		t.Errorf("repoC present with %d eligible refs; a repo with zero eligible branches must produce NO row", c)
