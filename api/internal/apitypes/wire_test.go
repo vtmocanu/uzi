@@ -113,6 +113,10 @@ var runDTOKeys = []string{
 	// meaningful) and the derived total/used seconds (nil for a kind that never times out /
 	// a run that never started).
 	"budget_extension_seconds", "budget_extension_cap_seconds", "budget_total_seconds", "budget_used_seconds",
+	// PRD #1497 M1: the one-time finalize allowance (0, or 1800 once Stop granted it), the third
+	// budget_total term; always present (a plain int). budget_total/used are now emitted for a
+	// paused row too (decoupled from deadline_at), with used FROZEN at status_since while parked.
+	"budget_finalize_seconds",
 	// PRD #634 M2: the operator scope ceiling (nil ⇒ null ⇒ unbounded), always on the wire;
 	// like budget_* it is load-bearing on the state-ack, not just display — the worker honors
 	// it at the loop top.
@@ -133,6 +137,12 @@ var runDTOKeys = []string{
 	// so they cannot disagree. completion_unmet is a never-null array ([] over null); all six always
 	// on the wire.
 	"completion_interlock", "completion_attempts", "completion_unmet", "hold_reason", "hold_context", "completion_phase",
+	// PRD #1497 M1 (run detail): worker_name (the run's worker display name, null when it has none),
+	// and the server-derived can_stop_at_wall gate for the Stop action on a wall park (true iff a
+	// budget_exhausted hold on a milestone issue run with a completed milestone and the finalize
+	// allowance unused). Both always on the wire; worker_name is null unless the run-detail read
+	// enriched it.
+	"worker_name", "can_stop_at_wall",
 	// PRD #1227 M1: the owner-decision contract projection. completion_revision is the run's current
 	// contract_revision (null when unfrozen); completion_deferred / completion_accepted are the
 	// owner-deferred milestones and owner-accepted criteria decoded from the frozen contract, STABLE
@@ -266,11 +276,13 @@ func TestRunDTOTags(t *testing.T) {
 }
 
 func TestRunListItemDTOTags(t *testing.T) {
-	// Embeds RunDTO (keys flatten in) plus repo_path + worker_name; owner_email is
-	// omitempty (absent when nil).
+	// Embeds RunDTO (keys flatten in) plus repo_path; owner_email is omitempty (absent when nil).
+	// PRD #1497 M1: worker_name is now on RunDTO too, so it is in runDTOKeys — RunListItemDTO's own
+	// worker_name field shadows the embedded one (json collapses the duplicate tag to one key), so it
+	// is NOT appended here any more.
 	// is_revising (issue #750) is on RunListItemDTO only, deliberately NOT on RunDTO —
 	// so it is listed here, not in runDTOKeys.
-	want := append(append([]string{}, runDTOKeys...), "repo_path", "worker_name", "judge_verdict", "judge_todo_count", "is_revising")
+	want := append(append([]string{}, runDTOKeys...), "repo_path", "judge_verdict", "judge_todo_count", "is_revising")
 	assertTags(t, "RunListItemDTO(no owner)", RunListItemDTO{}, want...)
 	// owner_email present when set.
 	email := "u@example.test"
@@ -313,6 +325,10 @@ func TestRunInputTags(t *testing.T) {
 	now := time.Unix(0, 0)
 	assertTags(t, "RunInputResponse(with row)", RunInputResponse{ID: &id, CreatedAt: &now},
 		"server_side", "id", "created_at")
+	// PRD #1497 M1: an owner action on a wall park resumes the run in one step; resumed is omitempty
+	// (absent on every non-resuming path), present when true.
+	assertTags(t, "RunInputResponse(resumed)", RunInputResponse{Resumed: true},
+		"server_side", "resumed")
 }
 
 func TestSteerInputDTOTags(t *testing.T) {

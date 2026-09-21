@@ -130,11 +130,13 @@ func extendAuditRows(ctx context.Context, t *testing.T, pool *pgxpool.Pool, runI
 
 func extendBody(s string) pgtype.Text { return pgtype.Text{String: s, Valid: true} }
 
-// TestSweepHonoursBudgetExtensionLiveDB pins the `+ budget_extension_seconds` term in
-// SweepRunningTimeout's per-run interval: a running 8h-budget run with a 2h extension has an
-// effective 10h wall, so it is NOT swept at 8h01m active (which WOULD be past a bare 8h
-// budget — the mutation-sensitive assertion) and IS swept once past 10h. global_timeout is
-// arbitrary (7200) since the run carries a non-NULL budget_wall_seconds.
+// TestSweepHonoursBudgetExtensionLiveDB pins the `+ budget_extension_seconds` term in the
+// wall-park sweep's per-run interval (PRD #1189, carried into PRD #1497's ParkRunsAtWall): a
+// running 8h-budget run with a 2h extension has an effective 10h wall, so it is NOT parked at
+// 8h01m active (which WOULD be past a bare 8h budget — the mutation-sensitive assertion) and IS
+// parked once past 10h. The wall PARKS now (never fails, PRD #1497 D2): the run's worker is stale,
+// so ParkRunsAtWall parks it server-side (paused, hold_reason='budget_exhausted'). global_timeout
+// is arbitrary (7200) since the run carries a non-NULL budget_wall_seconds.
 func TestSweepHonoursBudgetExtensionLiveDB(t *testing.T) {
 	ctx, pool, q := extendSteeringDB(t)
 	userID, repoID := extendSeedRepo(ctx, t, pool)
@@ -142,47 +144,67 @@ func TestSweepHonoursBudgetExtensionLiveDB(t *testing.T) {
 	// 8h frozen budget + 2h extension = 10h effective wall, no pause.
 	runID := extendSeedIssueRun(ctx, t, pool, userID, repoID, "running",
 		8*60*60, 0, 2*60*60, time.Now().Add(-(8*time.Hour + 1*time.Minute)))
+	// The wall park operates on a run's WORKER (ParkRunsAtWall locks the owning worker). Give the
+	// run a STALE worker so the stale arm parks it once it is past the deadline.
+	staleWorker := uuid.New()
+	mustExec(ctx, t, pool,
+		`INSERT INTO workers (id, user_id, name, token_hash, status, last_heartbeat_at)
+		 VALUES ($1, $2, 'stale', $3, 'offline', now() - interval '10 years')`, staleWorker, userID, staleWorker[:])
+	mustExec(ctx, t, pool, `UPDATE runs SET worker_id = $2 WHERE id = $1`, runID, staleWorker)
 
+	staleCutoff := pgtype.Timestamptz{Time: time.Now().UTC().Add(-5 * time.Minute), Valid: true}
 	sweep := func() map[uuid.UUID]bool {
 		t.Helper()
-		swept, err := q.SweepRunningTimeout(ctx, store.SweepRunningTimeoutParams{
-			FailureReason:        extendBody("run exceeded its wall-clock timeout"),
-			Now:                  pgtype.Timestamptz{Time: time.Now().UTC(), Valid: true},
-			GlobalTimeoutSeconds: 7200,
+		now := pgtype.Timestamptz{Time: time.Now().UTC(), Valid: true}
+		if _, err := q.RequestWallParks(ctx, store.RequestWallParksParams{
+			Now: now, GlobalTimeoutSeconds: 7200, WorkerStaleCutoff: staleCutoff,
+		}); err != nil {
+			t.Fatalf("RequestWallParks: %v", err)
+		}
+		parked, err := q.ParkRunsAtWall(ctx, store.ParkRunsAtWallParams{
+			Now: now, GlobalTimeoutSeconds: 7200, WorkerStaleCutoff: staleCutoff, GraceSeconds: 600,
 		})
 		if err != nil {
-			t.Fatalf("SweepRunningTimeout: %v", err)
+			t.Fatalf("ParkRunsAtWall: %v", err)
 		}
 		ids := map[uuid.UUID]bool{}
-		for _, s := range swept {
+		for _, s := range parked {
 			ids[s.ID] = true
 		}
 		return ids
 	}
 
-	// 8h01m active is BELOW the extended 10h wall → not swept, still running. Without the
-	// extension term this would be past the bare 8h budget and swept — this is the assertion
+	// 8h01m active is BELOW the extended 10h wall → not parked, still running. Without the
+	// extension term this would be past the bare 8h budget and parked — this is the assertion
 	// that reddens when `+ budget_extension_seconds` is dropped from the interval.
 	if sweep()[runID] {
-		t.Fatalf("run swept at 8h01m active despite a 2h extension (effective 10h wall) — " +
-			"the sweep interval is not adding budget_extension_seconds")
+		t.Fatalf("run parked at 8h01m active despite a 2h extension (effective 10h wall) — " +
+			"the wall-park interval is not adding budget_extension_seconds")
 	}
 	if status, _ := extendRunStatus(ctx, t, pool, runID); status != "running" {
 		t.Fatalf("run status = %q after the first sweep, want running (untouched)", status)
 	}
 
-	// Age it past the extended 10h wall → now swept as run_timeout.
+	// Age it past the extended 10h wall → now parked at the wall.
 	mustExec(ctx, t, pool, `UPDATE runs SET started_at = $2 WHERE id = $1`,
 		runID, pgtype.Timestamptz{Time: time.Now().Add(-(10*time.Hour + 1*time.Minute)), Valid: true})
 	if !sweep()[runID] {
-		t.Fatalf("run NOT swept at 10h01m active (past the 8h+2h extended wall) — it must be failed")
+		t.Fatalf("run NOT parked at 10h01m active (past the 8h+2h extended wall) — it must be parked")
 	}
 	status, failOrigin := extendRunStatus(ctx, t, pool, runID)
-	if status != "failed" {
-		t.Fatalf("run status = %q after aging past the extended wall, want failed", status)
+	if status != "paused" {
+		t.Fatalf("run status = %q after aging past the extended wall, want paused (never failed)", status)
 	}
-	if !failOrigin.Valid || failOrigin.String != "run_timeout" {
-		t.Fatalf("fail_origin = %+v, want run_timeout", failOrigin)
+	// PRD #1497 D2: the wall never fails a run, so it stamps no fail_origin.
+	if failOrigin.Valid {
+		t.Fatalf("fail_origin = %+v, want none (a wall park is not a failure)", failOrigin)
+	}
+	var holdReason pgtype.Text
+	if err := pool.QueryRow(ctx, `SELECT hold_reason FROM runs WHERE id = $1`, runID).Scan(&holdReason); err != nil {
+		t.Fatalf("read hold_reason: %v", err)
+	}
+	if !holdReason.Valid || holdReason.String != "budget_exhausted" {
+		t.Fatalf("hold_reason = %+v, want budget_exhausted", holdReason)
 	}
 }
 

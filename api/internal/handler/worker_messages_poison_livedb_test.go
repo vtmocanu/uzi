@@ -21,7 +21,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
@@ -730,7 +729,7 @@ func (s *foldingStore) GetRunOwnedByWorker(context.Context, store.GetRunOwnedByW
 }
 
 func (s *foldingStore) InsertRunMessage(context.Context, store.InsertRunMessageParams) (store.InsertRunMessageRow, error) {
-	return store.InsertRunMessageRow{Inserted: true, GenerationLive: pgtype.Bool{Bool: true, Valid: true}}, nil
+	return store.InsertRunMessageRow{Inserted: true, GenerationLive: true}, nil
 }
 
 func (s *foldingStore) UpdateRunLastSeq(context.Context, store.UpdateRunLastSeqParams) (int64, error) {

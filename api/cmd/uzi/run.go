@@ -95,6 +95,19 @@ const statusRecoveryWait = "recovery_wait"
 // `run wait` keep waiting on it rather than exiting.
 const statusPaused = "paused"
 
+// holdBudgetExhausted and holdCompletionBlocked are the two run.HoldReason values a
+// `paused` run can carry (PRD #1497 M1 / PRD #1226). A wall park — a run that reached its
+// wall-clock time limit — carries budget_exhausted; a structural completion hold carries
+// completion_blocked. Both are surfaced by the `uzi run get` HOLD row and the `run wait`
+// informative line; named here so those two surfaces compare against one literal, the same
+// convention the status constants above follow. hold_reason is unconstrained text on the
+// wire, so a renderer that branches on these still passes an UNRECOGNISED value through the
+// terminal-safe path rather than trusting it.
+const (
+	holdBudgetExhausted   = "budget_exhausted"
+	holdCompletionBlocked = "completion_blocked"
+)
+
 // logsPollInterval is how often `uzi run logs --follow` re-polls
 // /api/runs/{id}/messages?after=<seq>. REST polling ships instead of a WebSocket
 // (PRD #64 Out of scope). A var, not a const, only so tests can shrink the wait;

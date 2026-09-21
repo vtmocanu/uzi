@@ -13,6 +13,7 @@ import {
   type CompletionAttemptResponse,
   type CompletionPermitRequest,
   type CompletionPermitResponse,
+  type WallParkRequest,
   type ReportFindingRequest,
   type HeartbeatRequest,
   type MessagesRequest,
@@ -618,6 +619,10 @@ export class WorkerClient {
             applied: res.status === 200,
             status: fields.status,
           };
+          // PRD #1497 M2: carry the run's hold_reason off the SAME body so the reportState closure
+          // can recognise a SERVER-side wall park (paused + budget_exhausted) on a fenced stale ACK.
+          if (fields.holdReason !== undefined)
+            ack.holdReason = fields.holdReason;
           if (fields.budgetMaxIterations !== undefined)
             ack.budgetMaxIterations = fields.budgetMaxIterations;
           if (fields.budgetWallSeconds !== undefined)
@@ -1108,6 +1113,42 @@ export class WorkerClient {
     });
   }
 
+  /** Report a WALL-CLOCK PARK to the server (POST /worker/runs/:id/wall-park, PRD #1497 M2, D4).
+   *  The worker dropped its turn at the run's deadline and captured the tree; the server parks the
+   *  run (→ paused, hold_reason='budget_exhausted') via the fenced SetRunWallPark whose SOLE
+   *  authority is the three-term deadline. Like requestCompletionHold, the server returns
+   *  `{run: RunDTO}` on BOTH 200 (park landed, status becomes "paused") AND 409 (park REFUSED — the
+   *  owner extended in the request-then-park window, so the run's real status rides the body). A 409
+   *  is NOT an error here: the worker keys its park order off the RETURNED status. A 404
+   *  (ErrRunNotOwned — the claim was reclaimed) DOES throw, and a genuine transport/5xx throws —
+   *  either surfaces as an UNDELIVERABLE park (enterWallPark keeps the work and ends non-terminal,
+   *  D17). Returns `{ status }` = the run's status from the body ("paused" on a landed park, the
+   *  real status on a refusal); an unmodelled 2xx or an unreadable body yields "" (never "paused" ⇒
+   *  treated as refused, the safe default). */
+  async reportWallPark(
+    runId: string,
+    args: { head: string; published: boolean; claimGeneration?: number },
+  ): Promise<{ status: string }> {
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/wall-park`;
+    // Stamp the claim-lane generation through the shared send-gate + skew-safe fallback, exactly as
+    // requestCompletionHold does: a wall_park_v1 worker also advertises credential_switch_v1, so it
+    // stamps OPTIMISTICALLY, and a rolled-back api answering the field with a strict-decode 400 is
+    // retried stripped ONCE (the first, rejected, request parks nothing).
+    const included = this.includeClaimGeneration(args.claimGeneration);
+    return this.withGenerationFallback(included, async (includeField) => {
+      const body: WallParkRequest = { head: args.head, published: args.published };
+      if (includeField) body.claim_generation = args.claimGeneration;
+      const res = await this.fetchRaw("POST", path, body);
+      if (res.status === 200 || res.status === 409) {
+        const fields = await readRunAck(res);
+        return { status: fields.status ?? "" };
+      }
+      if (res.status >= 400) throw await this.toError("POST", path, res);
+      // A 2xx we do not model: no status came back, which is not "paused" ⇒ treated as refused.
+      return { status: "" };
+    });
+  }
+
   // ── Inline run summaries (PRD #362 M3c) ────────────────────────────────────
   // Two thin POSTs mirroring reportFinding/saveMemory: the api derives (user, repo)
   // from the CLAIMED run and re-validates + sanitises everything (it, not the worker,
@@ -1404,6 +1445,7 @@ export class WorkerClient {
  */
 export async function readRunAck(res: Response): Promise<{
   status?: string;
+  holdReason?: string | null;
   budgetMaxIterations?: number;
   budgetWallSeconds?: number;
   budgetTotalSeconds?: number;
@@ -1425,6 +1467,9 @@ export async function readRunAck(res: Response): Promise<{
       reason?: unknown;
       run?: {
         status?: unknown;
+        // PRD #1497 M2: the run's hold_reason on the RunDTO, read beside `status` to recognise a
+        // SERVER-side wall park (paused + budget_exhausted) from a fenced stale-claim ACK.
+        hold_reason?: unknown;
         budget_max_iterations?: unknown;
         budget_wall_seconds?: unknown;
         budget_total_seconds?: unknown;
@@ -1443,6 +1488,7 @@ export async function readRunAck(res: Response): Promise<{
     const run = parsed?.run;
     const out: {
       status?: string;
+      holdReason?: string | null;
       budgetMaxIterations?: number;
       budgetWallSeconds?: number;
       budgetTotalSeconds?: number;
@@ -1457,6 +1503,10 @@ export async function readRunAck(res: Response): Promise<{
       credentialSwitchReleased?: boolean;
     } = {};
     if (typeof run?.status === "string") out.status = run.status;
+    // PRD #1497 M2: the RunDTO's hold_reason rides the SAME body as `status`. A string only — a
+    // non-string (older server that omits it, a null hold, an unparseable value) leaves it absent,
+    // which the ServerWallParkedError check reads as "no hold" (never a wall park).
+    if (typeof run?.hold_reason === "string") out.holdReason = run.hold_reason;
     if (typeof run?.budget_max_iterations === "number")
       out.budgetMaxIterations = run.budget_max_iterations;
     if (typeof run?.budget_wall_seconds === "number")

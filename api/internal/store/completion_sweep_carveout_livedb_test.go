@@ -13,20 +13,23 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// TestCompletionInterlockSweepCarveOutLiveDB pins PRD #1226 M3 (D3) against a REAL Postgres: the
-// SweepRunningTimeout completion-interlock carve-out. A run that has recorded at least one
-// completion attempt (completion_attempts > 0) AND whose worker heartbeat is still inside the
-// staleness bound (a LIVE worker) is EXCLUDED from the wall-clock sweep — its live lead is working
-// the checkpoint-first completion protocol and will itself enter the verified hold (M4). The
-// carve-out is DELIBERATELY NARROW:
+// TestCompletionInterlockSweepCarveOutLiveDB pins PRD #1226 M3 (D3), rewritten for PRD #1497 M1
+// against a REAL Postgres: the completion-interlock carve-out on the wall-clock sweep. The wall
+// sweep now PARKS instead of failing (RequestWallParks + ParkRunsAtWall), but it KEEPS the carve-out
+// — a post-attempt run with a LIVE worker is still spared (its live lead works the completion
+// protocol and StampCompletionBudgetExhausted steers it into the hold). DELIBERATELY NARROW:
 //
-//   - live worker + post-attempt + past wall  → NOT failed (the carve-out; mutation reddens this).
-//   - live worker + PRE-attempt  + past wall  → still failed (unchanged; attempts=0 is not carved).
-//   - stale worker + post-attempt + past wall → still failed by the sweep (the carve-out needs a
-//     LIVE worker, so a dead-worker run can never be held indefinitely).
-//   - stale worker + post-attempt + within budget → NOT swept (within wall) then REQUEUED by the
-//     existing RequeueRunsOfStaleWorkers path (the carve-out lives only in SweepRunningTimeout and
-//     never blocks stale-worker recovery).
+//   - live worker + post-attempt + past wall  → NEITHER requested NOR parked (the carve-out; the
+//     completion-attempt mutation on either statement reddens this).
+//   - live CAPABLE worker + PRE-attempt + past wall → wall REQUEST filed (pause_mode='wall', a wall
+//     input inserted), NOT parked and NOT failed — the worker will self-park.
+//   - live INCAPABLE worker + PRE-attempt + past wall → PARKED server-side (no wall_park_v1).
+//   - stale worker + post-attempt + past wall → PARKED server-side (the carve-out needs a LIVE
+//     worker, so a dead-worker run is never held indefinitely) — paused, not failed.
+//   - stale worker + post-attempt + within budget → NOT parked (within wall) then REQUEUED by the
+//     existing RequeueRunsOfStaleWorkers path (the carve-out never blocks stale-worker recovery).
+//
+// No run is ever `failed` by the wall now (PRD #1497 D2).
 //
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres; mirrors the other
 // *_livedb / *_integration_test.go in this package.
@@ -56,11 +59,14 @@ func TestCompletionInterlockSweepCarveOutLiveDB(t *testing.T) {
 		`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
 		 VALUES ($1, $2, 1, 'g/r', 'https://forge.e2e/g/r', 'main', true)`, repoID, connID)
 
-	// One LIVE worker (fresh heartbeat) and one STALE worker (heartbeat well before the cutoff).
-	liveWorker, staleWorker := uuid.New(), uuid.New()
+	// A LIVE worker WITHOUT wall_park_v1, a LIVE worker WITH it, and a STALE worker.
+	liveWorker, capableWorker, staleWorker := uuid.New(), uuid.New(), uuid.New()
 	mustExec(ctx, t, pool,
 		`INSERT INTO workers (id, user_id, name, token_hash, status, last_heartbeat_at)
 		 VALUES ($1, $2, 'live', $3, 'online', now())`, liveWorker, userID, liveWorker[:])
+	mustExec(ctx, t, pool,
+		`INSERT INTO workers (id, user_id, name, token_hash, status, last_heartbeat_at, protocol_capabilities)
+		 VALUES ($1, $2, 'capable', $3, 'online', now(), ARRAY['wall_park_v1'])`, capableWorker, userID, capableWorker[:])
 	mustExec(ctx, t, pool,
 		`INSERT INTO workers (id, user_id, name, token_hash, status, last_heartbeat_at)
 		 VALUES ($1, $2, 'stale', $3, 'offline', now() - interval '10 years')`, staleWorker, userID, staleWorker[:])
@@ -81,31 +87,45 @@ func TestCompletionInterlockSweepCarveOutLiveDB(t *testing.T) {
 		return id
 	}
 
-	// A: LIVE worker + post-attempt + past wall → the carve-out protects it.
+	// A: LIVE (incapable) worker + post-attempt + past wall → the carve-out spares it.
 	protectedID := seedRun(liveWorker, 1, true)
-	// C: LIVE worker + PRE-attempt + past wall → attempts=0 is not carved → failed.
+	// R: LIVE CAPABLE worker + PRE-attempt + past wall → a wall REQUEST is filed (self-park path).
+	requestID := seedRun(capableWorker, 0, true)
+	// C: LIVE (incapable) worker + PRE-attempt + past wall → parked server-side (no wall_park_v1).
 	preAttemptID := seedRun(liveWorker, 0, true)
-	// D: STALE worker + post-attempt + past wall → carve-out needs a LIVE worker → failed by the sweep.
+	// D: STALE worker + post-attempt + past wall → parked server-side (carve-out needs a LIVE worker).
 	staleePastWallID := seedRun(staleWorker, 1, true)
-	// B: STALE worker + post-attempt + within budget → survives the sweep (within wall), then requeued.
+	// B: STALE worker + post-attempt + within budget → survives the passes (within wall), then requeued.
 	staleRequeueID := seedRun(staleWorker, 1, false)
 
-	// The staleness bound: the SAME cutoff SweepRunningTimeout's carve-out and the requeue path
-	// both key on. liveWorker's heartbeat (now) is >= cutoff (live); staleWorker's (10y ago) is <.
+	// The staleness bound: the SAME cutoff the carve-out and the requeue path both key on.
 	cutoff := pgtype.Timestamptz{Time: time.Now().UTC().Add(-5 * time.Minute), Valid: true}
+	now := pgtype.Timestamptz{Time: time.Now().UTC(), Valid: true}
 
-	swept, err := q.SweepRunningTimeout(ctx, store.SweepRunningTimeoutParams{
-		FailureReason:        pgtype.Text{String: "run exceeded RUN_TIMEOUT", Valid: true},
-		Now:                  pgtype.Timestamptz{Time: time.Now().UTC(), Valid: true},
+	requested, err := q.RequestWallParks(ctx, store.RequestWallParksParams{
+		Now:                  now,
 		GlobalTimeoutSeconds: 3600,
 		WorkerStaleCutoff:    cutoff,
 	})
 	if err != nil {
-		t.Fatalf("SweepRunningTimeout: %v", err)
+		t.Fatalf("RequestWallParks: %v", err)
 	}
-	sweptIDs := map[uuid.UUID]bool{}
-	for _, s := range swept {
-		sweptIDs[s.ID] = true
+	requestedIDs := map[uuid.UUID]bool{}
+	for _, s := range requested {
+		requestedIDs[s.ID] = true
+	}
+	parked, err := q.ParkRunsAtWall(ctx, store.ParkRunsAtWallParams{
+		Now:                  now,
+		GlobalTimeoutSeconds: 3600,
+		WorkerStaleCutoff:    cutoff,
+		GraceSeconds:         600,
+	})
+	if err != nil {
+		t.Fatalf("ParkRunsAtWall: %v", err)
+	}
+	parkedIDs := map[uuid.UUID]bool{}
+	for _, s := range parked {
+		parkedIDs[s.ID] = true
 	}
 
 	readStatus := func(id uuid.UUID) string {
@@ -117,38 +137,63 @@ func TestCompletionInterlockSweepCarveOutLiveDB(t *testing.T) {
 		return status
 	}
 
-	// A: the carve-out excludes it. This is the assertion that reddens if the carve-out WHERE
-	// clause is removed (the run would then be swept as a plain past-wall running run).
-	if sweptIDs[protectedID] {
-		t.Fatalf("a LIVE-worker post-attempt run past its wall was swept by SweepRunningTimeout; the M3 "+
-			"carve-out (completion_attempts > 0 AND a live worker heartbeat) must exclude it so its live "+
-			"lead can work the completion protocol / enter the hold: %+v", swept)
+	// A: the carve-out excludes it from BOTH passes. This is the assertion that reddens if the
+	// carve-out WHERE clause is removed (the run would then be parked as a plain past-wall run).
+	if requestedIDs[protectedID] || parkedIDs[protectedID] {
+		t.Fatalf("a LIVE-worker post-attempt run past its wall was requested/parked by the wall sweep; the " +
+			"M3 carve-out (completion_attempts > 0 AND a live worker heartbeat) must exclude it so its live " +
+			"lead can work the completion protocol / enter the hold")
 	}
 	if got := readStatus(protectedID); got != "running" {
-		t.Fatalf("protected run status = %q after sweep, want running (untouched)", got)
+		t.Fatalf("protected run status = %q after the wall passes, want running (untouched)", got)
 	}
 
-	// C: pre-attempt control MUST be swept — same live worker + past wall, only completion_attempts
-	// differs, so this proves the carve-out is gated on attempts > 0, not on the worker being live.
-	if !sweptIDs[preAttemptID] {
-		t.Fatalf("the PRE-attempt (completion_attempts=0) run was NOT swept; a run past its wall with no "+
-			"completion attempt is failed unchanged — the contrast is what makes the carve-out non-vacuous: %+v", swept)
+	// R: a live CAPABLE worker's pre-attempt run gets a wall REQUEST, not a park and not a failure.
+	if !requestedIDs[requestID] {
+		t.Fatalf("a live wall_park_v1-capable worker's past-wall run was NOT wall-requested: %+v", requested)
 	}
-	if got := readStatus(preAttemptID); got != "failed" {
-		t.Fatalf("pre-attempt run status = %q after sweep, want failed", got)
+	if parkedIDs[requestID] {
+		t.Fatal("a run that received a wall REQUEST was also parked server-side; a live capable worker self-parks")
+	}
+	if got := readStatus(requestID); got != "running" {
+		t.Fatalf("wall-requested run status = %q, want running (the worker will self-park)", got)
+	}
+	var reqMode string
+	var wallInputs int
+	if err := pool.QueryRow(ctx, `SELECT pause_mode FROM runs WHERE id = $1`, requestID).Scan(&reqMode); err != nil {
+		t.Fatalf("read pause_mode: %v", err)
+	}
+	if reqMode != "wall" {
+		t.Fatalf("wall-requested run pause_mode = %q, want wall", reqMode)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM run_user_inputs WHERE run_id = $1 AND kind = 'pause' AND body = 'wall'`, requestID).Scan(&wallInputs); err != nil {
+		t.Fatalf("count wall inputs: %v", err)
+	}
+	if wallInputs != 1 {
+		t.Fatalf("wall-requested run has %d 'wall' inputs, want exactly 1", wallInputs)
 	}
 
-	// D: stale-worker post-attempt past-wall MUST be swept — proves the carve-out requires a LIVE
-	// worker (a dead-worker post-attempt run is never held indefinitely by the exception).
-	if !sweptIDs[staleePastWallID] {
-		t.Fatalf("a STALE-worker post-attempt run past its wall was NOT swept; the carve-out is narrow "+
-			"(live worker only), so a dead-worker run must still be failed by the wall sweep: %+v", swept)
+	// C: an incapable-worker pre-attempt run is PARKED server-side (paused), never failed.
+	if !parkedIDs[preAttemptID] {
+		t.Fatalf("a live INCAPABLE worker's pre-attempt past-wall run was NOT parked server-side: %+v", parked)
+	}
+	if got := readStatus(preAttemptID); got != "paused" {
+		t.Fatalf("incapable-worker pre-attempt run status = %q, want paused (never failed)", got)
 	}
 
-	// B: stale-worker post-attempt WITHIN budget survives the sweep (not past wall) and then
+	// D: stale-worker post-attempt past-wall is PARKED server-side (the carve-out needs a LIVE worker).
+	if !parkedIDs[staleePastWallID] {
+		t.Fatalf("a STALE-worker post-attempt run past its wall was NOT parked; the carve-out is narrow "+
+			"(live worker only), so a dead-worker run is parked (not failed) by the wall sweep: %+v", parked)
+	}
+	if got := readStatus(staleePastWallID); got != "paused" {
+		t.Fatalf("stale-worker post-attempt run status = %q, want paused", got)
+	}
+
+	// B: stale-worker post-attempt WITHIN budget survives the wall passes (not past wall) then
 	// follows the existing requeue path.
-	if sweptIDs[staleRequeueID] {
-		t.Fatalf("a within-budget stale-worker run was swept by the wall sweep; it should survive to the requeue path")
+	if requestedIDs[staleRequeueID] || parkedIDs[staleRequeueID] {
+		t.Fatalf("a within-budget stale-worker run was touched by the wall passes; it should survive to the requeue path")
 	}
 	requeued, err := q.RequeueRunsOfStaleWorkers(ctx, store.RequeueRunsOfStaleWorkersParams{
 		MaxRequeues: 3,
@@ -162,8 +207,8 @@ func TestCompletionInterlockSweepCarveOutLiveDB(t *testing.T) {
 		requeuedIDs[r.ID] = true
 	}
 	if !requeuedIDs[staleRequeueID] {
-		t.Fatalf("a stale-worker post-attempt run within budget was NOT requeued; the M3 carve-out lives "+
-			"only in SweepRunningTimeout and must never block the stale-worker requeue path: %+v", requeued)
+		t.Fatalf("a stale-worker post-attempt run within budget was NOT requeued; the carve-out lives "+
+			"only in the wall sweep and must never block the stale-worker requeue path: %+v", requeued)
 	}
 	if got := readStatus(staleRequeueID); got != "queued" {
 		t.Fatalf("stale-worker post-attempt run status = %q after requeue, want queued", got)

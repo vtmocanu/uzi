@@ -187,8 +187,8 @@ func TestSubmitInputExtendDeadlineFromCommittedTotal(t *testing.T) {
 		t.Fatalf("result ExtensionSeconds = %v, want %d (the committed total)", res.ExtensionSeconds, committed)
 	}
 	run := fs.runByID
-	wantDeadline := RunDeadline(run.StartedAt, run.BudgetWallSeconds, run.BudgetPausedSeconds, run.Kind, run.Interactive, run.Status, svc.p.RunTimeout, committed)
-	staleDeadline := RunDeadline(run.StartedAt, run.BudgetWallSeconds, run.BudgetPausedSeconds, run.Kind, run.Interactive, run.Status, svc.p.RunTimeout, 3600)
+	wantDeadline := RunDeadline(run.StartedAt, run.BudgetWallSeconds, run.BudgetPausedSeconds, run.Kind, run.Interactive, run.Status, svc.p.RunTimeout, committed, run.BudgetFinalizeSeconds)
+	staleDeadline := RunDeadline(run.StartedAt, run.BudgetWallSeconds, run.BudgetPausedSeconds, run.Kind, run.Interactive, run.Status, svc.p.RunTimeout, 3600, run.BudgetFinalizeSeconds)
 	if res.DeadlineAt == nil || wantDeadline == nil {
 		t.Fatal("a running issue run must have a non-nil deadline")
 	}

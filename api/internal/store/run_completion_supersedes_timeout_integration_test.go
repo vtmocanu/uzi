@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"testing"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -98,32 +97,17 @@ func TestRunCompletionSupersedesTimeoutLiveDB(t *testing.T) {
 	// ── Supersede: a worker completion overrides a run_timeout failure ──────────
 	t.Run("Supersede", func(t *testing.T) {
 		runID := uuid.New()
-		// running, started long ago so the sweep's wall (60s) has elapsed.
+		// PRD #1497 M1: the wall no longer FAILS a run, so the sweep no longer PRODUCES a
+		// run_timeout failure — but the 'run_timeout' fail_origin stays in the enum for HISTORY, and
+		// SetRunCompleted's issue #329 supersede of such a legacy failure is unchanged. Seed the
+		// terminal run_timeout state directly (a historical row) so this pins that supersede without
+		// relying on the retired sweep-to-failed path.
 		mustExec(ctx, t, pool,
-			`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, status, worker_id, started_at)
-			 VALUES ($1, $2, $3, 'issue', 1001, 't', 'd', 'running', $4, now() - interval '10 years')`,
+			`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, status, worker_id, started_at, fail_origin, failure_reason, finished_at)
+			 VALUES ($1, $2, $3, 'issue', 1001, 't', 'd', 'failed', $4, now() - interval '10 years', 'run_timeout', 'run exceeded RUN_TIMEOUT', now())`,
 			runID, userID, repoID, wkr.ID)
-
-		swept, err := q.SweepRunningTimeout(ctx, store.SweepRunningTimeoutParams{
-			FailureReason:        pgtype.Text{String: "run exceeded RUN_TIMEOUT", Valid: true},
-			Now:                  pgtype.Timestamptz{Time: time.Now().UTC(), Valid: true},
-			GlobalTimeoutSeconds: 60,
-		})
-		if err != nil {
-			t.Fatalf("SweepRunningTimeout: %v", err)
-		}
-		found := false
-		for _, s := range swept {
-			if s.ID == runID {
-				found = true
-				break
-			}
-		}
-		if !found {
-			t.Fatalf("sweep did not return our run %s; got %+v", runID, swept)
-		}
 		if r := read(runID); r.status != "failed" || r.failOrigin.String != "run_timeout" {
-			t.Fatalf("after sweep: status=%q fail_origin=%q, want failed/run_timeout", r.status, r.failOrigin.String)
+			t.Fatalf("precondition: status=%q fail_origin=%q, want failed/run_timeout", r.status, r.failOrigin.String)
 		}
 
 		// The still-owning worker reports completion carrying the MR it opened.

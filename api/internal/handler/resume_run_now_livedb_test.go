@@ -76,6 +76,24 @@ func TestResumeRunNowDispatchLiveDB(t *testing.T) {
 		}
 		return s
 	}
+	// newHold seeds a PAUSED issue run carrying hold_reason, started 3h ago and parked 1m ago (so a
+	// paused row's active elapsed is ~3h). Remaining budget for a paused row is
+	// total - (status_since - started_at - budget_paused_seconds): budgetPaused banks the elapsed, so
+	// a large budgetPaused leaves budget while a zero one leaves the run out of time.
+	newHold := func(holdReason string, budgetWall, budgetPaused int) uuid.UUID {
+		iid++
+		id := uuid.New()
+		exec(`INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, status, kind, started_at, status_since, hold_reason, budget_wall_seconds, budget_paused_seconds)
+		      VALUES ($1,$2,$3,$4,'t','d','paused','issue', now() - interval '3 hours', now() - interval '1 minute', $5, $6, $7)`,
+			id, owner.ID, repoID, iid, holdReason, budgetWall, budgetPaused)
+		return id
+	}
+	errBody := func(rec *httptest.ResponseRecorder) string {
+		var body map[string]any
+		_ = json.Unmarshal(rec.Body.Bytes(), &body)
+		msg, _ := body["error"].(string)
+		return msg
+	}
 
 	t.Run("paused resumes to queued and writes a resume audit row", func(t *testing.T) {
 		id := newRun("paused")
@@ -130,6 +148,58 @@ func TestResumeRunNowDispatchLiveDB(t *testing.T) {
 		}
 		if statusOf(id) != "paused" {
 			t.Fatal("a foreign resume must not move the run")
+		}
+	})
+
+	// PRD #1497 M1: the two wall-park 409s that resume.go's `case "paused"` returns. Both are distinct
+	// from the generic running→409 default the subtests above cover, and each asserts the EXACT body
+	// text resume.go produces (copied literally). The positive control below keeps them non-vacuous.
+	t.Run("a completion_blocked hold is a 409 naming the decision endpoint (D6)", func(t *testing.T) {
+		// resume.go reads hold_reason BEFORE ResumePausedRun: a completion_blocked hold resumes ONLY
+		// through POST /api/runs/{id}/completion/decision, so this generic resume 409s naming it.
+		// (Removing that hold_reason branch would silently resume the hold to queued instead.)
+		id := newHold("completion_blocked", 3600, 0)
+		rec := call(id, owner)
+		if rec.Code != http.StatusConflict {
+			t.Fatalf("code = %d, want 409; body=%s", rec.Code, rec.Body.String())
+		}
+		want := "this run is blocked on a completion decision; resolve it at POST /api/runs/{id}/completion/decision"
+		if msg := errBody(rec); msg != want {
+			t.Fatalf("409 message = %q, want %q", msg, want)
+		}
+		if statusOf(id) != "paused" {
+			t.Fatal("a refused resume must not move the completion hold")
+		}
+	})
+
+	t.Run("a budget_exhausted hold with no remaining budget is a 409 naming extend (D7)", func(t *testing.T) {
+		// budgetPaused 0 → the ~3h active elapsed exceeds the 1h wall → ResumePausedRun's
+		// remaining-budget guard refuses (pgx.ErrNoRows), and resume.go answers the out-of-time 409.
+		id := newHold("budget_exhausted", 3600, 0)
+		rec := call(id, owner)
+		if rec.Code != http.StatusConflict {
+			t.Fatalf("code = %d, want 409; body=%s", rec.Code, rec.Body.String())
+		}
+		want := fmt.Sprintf("this run is out of time; extend it to resume: uzi run extend %s --by 2h", id)
+		if msg := errBody(rec); msg != want {
+			t.Fatalf("409 message = %q, want %q", msg, want)
+		}
+		if statusOf(id) != "paused" {
+			t.Fatal("an out-of-time budget_exhausted hold must stay paused")
+		}
+	})
+
+	// Positive control: a budget_exhausted hold WITH remaining budget resumes 200/queued, so neither
+	// 409 above is vacuous — the endpoint genuinely resumes a budget_exhausted park when it can.
+	t.Run("a budget_exhausted hold with remaining budget resumes to queued", func(t *testing.T) {
+		// budgetPaused banks the whole ~3h elapsed → remaining budget > 0 → ResumePausedRun resumes.
+		id := newHold("budget_exhausted", 3600, 3*3600)
+		rec := call(id, owner)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("code = %d, want 200; body=%s", rec.Code, rec.Body.String())
+		}
+		if statusOf(id) != "queued" {
+			t.Fatalf("resumed status = %q, want queued", statusOf(id))
 		}
 	})
 }

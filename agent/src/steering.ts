@@ -207,8 +207,17 @@ export class SteeringChannel {
    *  executor can honour a seeded/steered pause at its FIRST loop boundary as an ACK-independent
    *  fallback (getPauseMode → ctx.pauseModeRequested, PRD #1190 rework N1). The immediate turn-drop
    *  of a `now` pause is done by the abort + the re-armable interrupt in route(), NOT by this flag.
-   *  DISTINCT slot from stopRequested — a stop and a pause are independent. */
-  private pauseMode: "milestone" | "now" | null = null;
+   *  DISTINCT slot from stopRequested — a stop and a pause are independent.
+   *
+   *  PRD #1497 M2: `wall` joins the union — the SYSTEM-authored pause the sweep files when a run
+   *  reaches its wall-clock limit (a `pause` input whose body is "wall"). It aborts the in-flight
+   *  turn exactly like `now` (route below), but it is STICKY-STICKY: `pause_cancel` cannot clear it
+   *  (only the owner extending — cleared via clearWallMode after a REFUSED wall_park — or the park
+   *  landing does), because it is the server's involuntary park, not an owner request the owner may
+   *  withdraw. The mode is read via getPauseMode()/ctx.pauseModeRequested(); the PauseNowSignal that
+   *  drops the turn carries NO mode, so the executor branches on getPauseMode() to route a `wall`
+   *  abort to the capture-first wall park instead of handlePausePark. */
+  private pauseMode: "milestone" | "now" | "wall" | null = null;
   /** PRD #1190 rework (N2): a RE-ARMABLE interrupt the executor registers (via ctx.onPauseNow) so a
    *  `now` pause can drop the in-flight turn EVERY time — not only the first. The shared cancel
    *  AbortController fires 'abort' exactly once, so a SECOND `now` after a declined park (which
@@ -321,15 +330,29 @@ export class SteeringChannel {
    *  recognised mode; ignores a garbage value (leaves pauseMode null). Idempotent with a later
    *  live `pause` input. */
   seedPauseRequested(mode: string | undefined): void {
-    if (mode === "milestone" || mode === "now") this.pauseMode = mode;
+    // PRD #1497 M2: `wall` is seeded too — a run re-claimed with pause_pending + pause_mode='wall'
+    // (its worker died with the sweep's wall request pending, or it was resumed after a server-side
+    // park) parks at its FIRST loop boundary before spending a turn (the executor reads getPauseMode
+    // → routes to the wall seam), an ACK-independent fallback beside the running-report's pauseRequested.
+    if (mode === "milestone" || mode === "now" || mode === "wall") this.pauseMode = mode;
   }
 
   /** The sticky owner-requested pause mode, or null when none is pending (PRD #1190 M2). Read in
    *  PRODUCTION by the executor at its first loop boundary (via the runner's ctx.pauseModeRequested
    *  wiring) so a seeded/steered pause parks even if the running-report ACK's pauseRequested
    *  regressed — see seedPauseRequested. Also read by the M2 tests. */
-  getPauseMode(): "milestone" | "now" | null {
+  getPauseMode(): "milestone" | "now" | "wall" | null {
     return this.pauseMode;
+  }
+
+  /** PRD #1497 M2: clear a STICKY `wall` pause mode. Called by the executor after a REFUSED
+   *  wall_park (the server answered a non-`paused` status because the owner extended in the
+   *  request-then-park window): the run continues, so the sticky wall mode must be cleared or the
+   *  next loop boundary would route to the wall seam again. Deliberately clears ONLY when the mode
+   *  is `wall` — a concurrent owner `now`/`milestone` pause set after the wall was refused must
+   *  survive. Idempotent; a no-op when no wall is pending. */
+  clearWallMode(): void {
+    if (this.pauseMode === "wall") this.pauseMode = null;
   }
 
   /** True once a `cancel` input has been seen (sticky, PRD #1190 rework N2). The executor reads it
@@ -805,9 +828,16 @@ export class SteeringChannel {
         //    it) cannot re-fire it; the interrupt trips the executor's current turn each time, so
         //    the second `now` still drops the (restarted) turn instead of degrading to a
         //    milestone-boundary park. Before the rework a second `now` silently degraded.
-        const mode = body?.trim() === "now" ? "now" : "milestone";
+        //
+        // PRD #1497 M2: `wall` (the sweep's system-authored wall-clock park) is treated EXACTLY
+        // like `now` for the turn-drop mechanism — it must abort the in-flight turn so the run parks
+        // in seconds rather than at the next milestone (D3). The mode recorded is `wall`, which the
+        // executor reads (getPauseMode) to route the abort to the capture-first wall park seam
+        // instead of handlePausePark. Any non-"now"/"wall" body is the safe "milestone" default.
+        const trimmed = body?.trim();
+        const mode = trimmed === "now" ? "now" : trimmed === "wall" ? "wall" : "milestone";
         this.pauseMode = mode;
-        if (mode === "now") {
+        if (mode === "now" || mode === "wall") {
           if (!this.cancel.signal.aborted)
             this.cancel.abort(new PauseNowSignal());
           this.pauseNowInterrupt?.();
@@ -819,7 +849,13 @@ export class SteeringChannel {
         // own columns via CancelPauseInput. Does NOT un-abort a turn already dropped by a prior
         // `now` (an AbortController cannot be reset) — a pause_cancel after a `now` is a rare
         // race the server's boundary ACK settles.
-        this.pauseMode = null;
+        //
+        // PRD #1497 M2: an owner `pause_cancel` CANNOT clear a `wall` park — the server's
+        // involuntary wall park is not an owner request the owner may withdraw (the M1 server-side
+        // CancelPauseInput has the matching `pause_mode IS DISTINCT FROM 'wall'` guard, so the
+        // columns stay set too). Only clearWallMode (a refused wall_park) or the park landing clears
+        // it. A `wall` mode therefore SURVIVES a pause_cancel here.
+        if (this.pauseMode !== "wall") this.pauseMode = null;
         break;
       case "follow_up":
         // issue #559 M2: carry the input id alongside the body so a delivery (takeFollowUp)

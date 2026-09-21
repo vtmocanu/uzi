@@ -2409,6 +2409,11 @@ export interface Run {
    *  left) so it agrees with the same-header deadline. */
   budget_extension_seconds?: number;
   budget_extension_cap_seconds?: number;
+  /** PRD #1497 M1: the one-time finalize allowance the Stop action grants a wall-parked milestone
+   *  issue run (0, or 1800 once granted). It lives OUTSIDE budget_extension_seconds (the owner
+   *  extension cap never sees it) and is the THIRD term of budget_total_seconds. Optional for
+   *  rollout skew: a pre-feature api pod omits the key. */
+  budget_finalize_seconds?: number;
   budget_total_seconds?: number | null;
   budget_used_seconds?: number | null;
   claimed_at: string | null;
@@ -2563,7 +2568,9 @@ export interface Run {
    *  rollout skew exactly like `pause_requested`; the server always sends it. */
   completion_budget_exhausted?: boolean;
   pause_requested_at?: string | null;
-  pause_mode?: "milestone" | "now" | null;
+  /** PRD #1497 M1 widens pause_mode with "wall": the system-authored wall-park request mode the
+   *  timeout sweep stamps at the deadline (alongside the owner's "milestone"/"now"). */
+  pause_mode?: "milestone" | "now" | "wall" | null;
   pause_after_count?: number | null;
   checkpoint_tip_at?: string | null;
   /** PRD #1226 M5 (D8): the honest-state completion fields — the wire contract the web + CLI
@@ -2595,6 +2602,12 @@ export interface Run {
   completion_unmet?: string[];
   hold_reason?: string | null;
   hold_context?: string | null;
+  /** PRD #1497 M1 (run detail): worker_name is the run's worker display name (null when it has
+   *  none — a server-side wall park nulls worker_id on resume); can_stop_at_wall is the
+   *  server-derived Stop gate (true iff a budget_exhausted wall park on a milestone issue run with
+   *  a completed milestone and the finalize allowance unused). Both OPTIONAL for rollout skew. */
+  worker_name?: string | null;
+  can_stop_at_wall?: boolean;
   completion_phase?: "checking" | "reworking" | "blocked" | "";
   /** PRD #1227 M1: the owner-decision contract projection — contract-derived (no extra DB read),
    *  all OPTIONAL for api/web rollout skew exactly like the completion block above; the server

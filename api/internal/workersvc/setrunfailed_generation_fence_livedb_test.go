@@ -28,12 +28,15 @@ import (
 //	    (the run stays running at G+1, not failed).
 //	(c) legitimate in-generation, unreleased: run at G, claim_released_at NULL — a gen-G fail SUCCEEDS
 //	    (the run becomes failed).
-//	(d) legacy nil: a nil-generation fail applies UNFENCED even on a released claim (the run becomes
-//	    failed), proving the outer-lock/legacy callers are unaffected by the new conjunct.
+//	(d) legacy nil on a LIVE claim: a nil-generation fail on an UNRELEASED run applies (the run becomes
+//	    failed) — the compatibility contract for a legacy worker is preserved.
+//	(e) legacy nil on a RELEASED claim: PRD #1497 M1 (D16) closes the released window for a
+//	    generation-less report too — a nil-generation fail on a released claim is now REJECTED (the
+//	    run stays queued), not applied unfenced as before.
 //
 // Mutation-check: removing ONLY the `claim_generation = ...` conjunct reddens (b) (the stale report
-// would fail the reclaimed run); removing ONLY `claim_released_at IS NULL` reddens (a) (the released
-// report would fail the requeued run).
+// would fail the reclaimed run); removing ONLY `claim_released_at IS NULL` reddens (a) and (e) (a
+// released report — with or without a generation — would fail the requeued run).
 func TestSetLimitWaitNonParkOptOutGenerationFenceLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	// Real store + the pool as the tx beginner (the FOR UPDATE fence opens a tx when a report
@@ -98,18 +101,34 @@ func TestSetLimitWaitNonParkOptOutGenerationFenceLiveDB(t *testing.T) {
 		t.Fatalf("status = %q, want failed after the in-generation opt-out", got)
 	}
 
-	// (d) legacy nil: a nil-generation opt-out fail applies UNFENCED even on the SAME released-claim
-	// state as (a), proving the legacy / outer-lock-fenced callers are unaffected by the new conjunct.
-	legacy := seedHeldRun(t, env, o, 6203, "queued", g, false, true /* released */)
-	env.exec(`UPDATE runs SET wait_on_limit = false WHERE id = $1`, legacy)
-	_, applied, err = svc.SetState(env.ctx, wkr, legacy, StateRequest{State: "limit_wait"}) // nil generation
+	// (d) legacy nil on a LIVE claim: a nil-generation opt-out fail on an UNRELEASED run at G applies
+	// (the compatibility contract for a legacy worker is preserved — a live claim honours a NULL gen).
+	legacyLive := seedHeldRun(t, env, o, 6203, "running", g, false, false)
+	env.exec(`UPDATE runs SET wait_on_limit = false WHERE id = $1`, legacyLive)
+	_, applied, err = svc.SetState(env.ctx, wkr, legacyLive, StateRequest{State: "limit_wait"}) // nil generation
 	if err != nil {
-		t.Fatalf("legacy nil opt-out: %v", err)
+		t.Fatalf("legacy nil opt-out (live): %v", err)
 	}
 	if !applied {
-		t.Fatal("a legacy nil-generation opt-out fail must apply UNFENCED")
+		t.Fatal("a legacy nil-generation opt-out fail on a LIVE (unreleased) claim must apply (compatibility contract)")
 	}
-	if got := statusOf(t, env, legacy); got != "failed" {
-		t.Fatalf("status = %q, want failed (a legacy nil-generation fail bypasses the fence, even on a released claim)", got)
+	if got := statusOf(t, env, legacyLive); got != "failed" {
+		t.Fatalf("status = %q, want failed (a legacy nil-generation fail on a live claim applies)", got)
+	}
+
+	// (e) legacy nil on a RELEASED claim: PRD #1497 M1 (D16) closes the released window for a
+	// generation-less report too — the SAME released-claim state as (a), but reported with NO
+	// generation, is now REJECTED (0 rows, not applied; the run stays queued), not applied unfenced.
+	legacyReleased := seedHeldRun(t, env, o, 6204, "queued", g, false, true /* released */)
+	env.exec(`UPDATE runs SET wait_on_limit = false WHERE id = $1`, legacyReleased)
+	_, applied, err = svc.SetState(env.ctx, wkr, legacyReleased, StateRequest{State: "limit_wait"}) // nil generation
+	if err != nil {
+		t.Fatalf("legacy nil opt-out (released): err = %v, want nil (0-row no-op ack)", err)
+	}
+	if applied {
+		t.Fatal("a legacy nil-generation opt-out fail against a RELEASED claim must NOT apply (D16 closes the released window for generation-less reports too)")
+	}
+	if got := statusOf(t, env, legacyReleased); got != "queued" {
+		t.Fatalf("status = %q, want the released run UNCHANGED at queued (D16: a released claim is rejected even without a generation)", got)
 	}
 }

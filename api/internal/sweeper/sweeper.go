@@ -124,11 +124,16 @@ func (e *Engine) runOnce(ctx context.Context) {
 	}
 	// Only log when the pass actually did something, to keep the log quiet on an
 	// idle system.
-	if res.WorkersOffline+res.ClaimedReset+res.RunningTimeout+res.StaleFailed+res.StaleRequeued+res.ChatIdleCompleted+res.ProposalsRecovered+res.HealthChanged+res.AutoStopped+res.LimitPromoted+res.PoolResumed+res.LimitReevaluated+res.RecoveryPromoted+res.CompletionBudgetExhausted+res.CustodyReleased+res.RecoveryStalled+res.RecoveryExpired+res.TaskUndispatchedFailed > 0 {
+	if res.WorkersOffline+res.ClaimedReset+res.WallParkRequested+res.WallParked+res.StaleFailed+res.StaleRequeued+res.ChatIdleCompleted+res.ProposalsRecovered+res.HealthChanged+res.AutoStopped+res.LimitPromoted+res.PoolResumed+res.LimitReevaluated+res.RecoveryPromoted+res.CompletionBudgetExhausted+res.CustodyReleased+res.RecoveryStalled+res.RecoveryExpired+res.TaskUndispatchedFailed > 0 {
 		slog.Info("sweeper pass",
 			"workers_offline", res.WorkersOffline,
 			"claimed_reset", res.ClaimedReset,
-			"running_timeout", res.RunningTimeout,
+			// PRD #1497 M1: the wall no longer fails a run — it parks it. wall_park_requested counts
+			// runs asked to self-park (live capable worker); wall_parked counts runs parked
+			// server-side (dead/incapable/unresponsive worker). Both in the sum above and emitted
+			// here, so a park-only tick still raises this line.
+			"wall_park_requested", res.WallParkRequested,
+			"wall_parked", res.WallParked,
 			"stale_failed", res.StaleFailed,
 			"stale_requeued", res.StaleRequeued,
 			"chat_idle_completed", res.ChatIdleCompleted,

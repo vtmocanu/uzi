@@ -476,6 +476,15 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 			dto.ForgeType = ft
 		}
 	}
+	// PRD #1497 M1: the run's worker display name for the run-detail wall-park panel. runToDTO is
+	// pure and carries only worker_id, so the name is resolved here through the service (which owns
+	// the store). Best-effort: a lookup error (or a run with no worker — a server-side park nulled
+	// worker_id) leaves worker_name null rather than failing the read of an otherwise-fine run.
+	if name, err := h.wsvc.WorkerNameForRun(r.Context(), run); err != nil {
+		slog.Error("resolve run worker name", "run_id", run.ID, "error", err)
+	} else {
+		dto.WorkerName = name
+	}
 	// issue #1418: overlay the capture-aware landing_state on the single-run detail read.
 	// runToDTO seeded it capture-unaware (preserved_patch only); only a human-landable
 	// fail_origin can ever reach needs_landing/unrecoverable, so the extra capture query
@@ -938,6 +947,9 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 		resp.ExtensionSeconds = res.ExtensionSeconds
 		resp.DeadlineAt = res.DeadlineAt
 	}
+	// PRD #1497 M1: an owner action on a wall park (extend-and-resume, or stop) resumes the run in
+	// one step; surface it so the CLI/web can say the run resumed, not merely that time was added.
+	resp.Resumed = res.Resumed
 	httpx.JSON(w, http.StatusAccepted, resp)
 }
 

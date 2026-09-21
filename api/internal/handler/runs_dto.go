@@ -62,13 +62,16 @@ func (h *Handler) runPriorityClass(ctx context.Context, r store.Run) string {
 // the worker holding it should park at its next boundary. The worker honors this boolean off
 // the running-report ACK, so the comparison lives in exactly one place and one test table.
 //   - "now"       → park immediately (drop the in-flight turn).
+//   - "wall"      → park immediately, exactly like "now" (PRD #1497 M1): the system's wall
+//     request means the deadline is reached, so the worker drops the in-flight turn and takes
+//     the capture-first wall park at once.
 //   - "milestone" → park once there is no frozen list to wait on (park at the next turn
 //     boundary) OR the in-flight milestone has completed (completed count now exceeds the
 //     count captured at request time).
 //   - any other value (empty / no pause pending) → false.
 func pauseRequestedRule(pauseMode string, frozenLen, completedLen, afterCount int) bool {
 	switch pauseMode {
-	case "now":
+	case "now", "wall":
 		return true
 	case "milestone":
 		return frozenLen == 0 || completedLen > afterCount
@@ -243,7 +246,7 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 		// PRD #1170: the server-computed wall-clock deadline the near-timeout badge
 		// counts down to. RunDeadline returns nil for a run with no wall deadline
 		// (not running, chat/judge/interactive, or no started_at).
-		DeadlineAt: workersvc.RunDeadline(r.StartedAt, r.BudgetWallSeconds, r.BudgetPausedSeconds, r.Kind, r.Interactive, r.Status, globalTimeout, r.BudgetExtensionSeconds),
+		DeadlineAt: workersvc.RunDeadline(r.StartedAt, r.BudgetWallSeconds, r.BudgetPausedSeconds, r.Kind, r.Interactive, r.Status, globalTimeout, r.BudgetExtensionSeconds, r.BudgetFinalizeSeconds),
 		PlanMd:     textPtrValue(r.PlanMd.Valid, r.PlanMd.String),
 		PlanSource: r.PlanSource,
 		// PRD #362 M1: plain-English summaries. Intent/plan are nullable text; deltas
@@ -435,33 +438,47 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 	// The cap is the same value RunExtensionCapSeconds returns (0 = extending disabled).
 	dto.BudgetExtensionSeconds = int(r.BudgetExtensionSeconds)
 	dto.BudgetExtensionCapSeconds = extensionCapSeconds
-	// PRD #1189: budget_total_seconds is COALESCE(budget_wall_seconds, RUN_TIMEOUT) +
-	// extension in seconds, but ONLY for a run that actually has a wall deadline — the same
-	// running/timed predicate RunDeadline/runWallClock use — so a client never shows a budget
-	// where none applies. Reusing dto.DeadlineAt (set above) as that predicate keeps the total
-	// and the deadline from ever disagreeing.
-	if dto.DeadlineAt != nil {
+	// PRD #1497 M1: the finalize allowance (0, or 1800 once Stop granted it); the third
+	// budget_total term, outside the extension cap.
+	dto.BudgetFinalizeSeconds = int(r.BudgetFinalizeSeconds)
+	// PRD #1189 / #1497 M1: budget_total_seconds is the THREE-TERM total,
+	// COALESCE(budget_wall_seconds, RUN_TIMEOUT) + budget_extension_seconds +
+	// budget_finalize_seconds. It is emitted for every STARTED, TIMED (non-chat/judge,
+	// non-interactive), NON-TERMINAL row — INCLUDING paused — decoupled from DeadlineAt (which
+	// stays nil while parked). The predicate is the started/timed one RunDeadline uses, minus the
+	// running-only status restriction, so a parked run carries its budget.
+	timedBudget := r.StartedAt.Valid && !r.Interactive && r.Kind != "chat" && r.Kind != "judge" && !apitypes.IsTerminalRunStatus(r.Status)
+	if timedBudget {
 		wall := int(globalTimeout / time.Second)
 		if r.BudgetWallSeconds.Valid && r.BudgetWallSeconds.Int32 > 0 {
 			wall = int(r.BudgetWallSeconds.Int32)
 		}
-		total := wall + int(r.BudgetExtensionSeconds)
+		total := wall + int(r.BudgetExtensionSeconds) + int(r.BudgetFinalizeSeconds)
 		dto.BudgetTotalSeconds = &total
 	}
-	// PRD #1189: budget_used_seconds is ACTIVE time so far — now - started_at - budget_paused,
-	// clamped at 0 — valid in every status and nil when the run never started. It subtracts only
-	// BANKED pause time (budget_paused_seconds is credited at resume), so a currently-paused run's
-	// figure keeps creeping until resume banks the in-progress pause; that drift is display-only
-	// and self-corrects on resume — the sweep and the health arm, which own the kill, run only
-	// while status='running'. This is the paused-aware "used" the header measures against the
-	// budget (aged client-side for a running run), NOT raw wall elapsed.
+	// PRD #1189 / #1497 M1: budget_used_seconds is ACTIVE time so far — end - started_at -
+	// budget_paused, clamped at 0 — valid in every started status and nil when the run never
+	// started. For a PAUSED row `end` is FROZEN at status_since (the park instant), so the figure
+	// does not drift upward while parked (it was banked into budget_paused only at resume, so a
+	// live now would otherwise creep — the #1497 fix). For every other started row `end` is now,
+	// aged client-side. It subtracts only BANKED pause time (budget_paused_seconds is credited at
+	// resume). The sweep and the health arm, which own the kill, run only while status='running'.
 	if r.StartedAt.Valid {
-		used := int(now.Sub(r.StartedAt.Time).Seconds()) - int(r.BudgetPausedSeconds)
+		end := now
+		if r.Status == "paused" && r.StatusSince.Valid {
+			end = r.StatusSince.Time
+		}
+		used := int(end.Sub(r.StartedAt.Time).Seconds()) - int(r.BudgetPausedSeconds)
 		if used < 0 {
 			used = 0
 		}
 		dto.BudgetUsedSeconds = &used
 	}
+	// PRD #1497 M1: the server-derived Stop gate — true iff a budget_exhausted wall park on a
+	// milestone ISSUE run with >= 1 completed milestone and the finalize allowance unused. Read
+	// after MilestonesCompleted is decoded above so len() is the real completed count.
+	dto.CanStopAtWall = r.Status == "paused" && r.HoldReason.Valid && r.HoldReason.String == "budget_exhausted" &&
+		r.Kind == "issue" && !r.Interactive && r.BudgetFinalizeSeconds == 0 && len(dto.MilestonesCompleted) >= 1
 	// PRD #634 M2: the operator scope ceiling rides the running-report ACK and the claim
 	// payload (both built here) so the worker honors it at the loop top and across a
 	// re-claim. pgtype.Int4 → *int, null (unbounded) when no scope directive was written.

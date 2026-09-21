@@ -262,9 +262,29 @@ func parseDurationWithDays(s string) (time.Duration, error) {
 // not carry are dropped rather than fabricated: a run extended while queued/parked carries no
 // deadline_at yet (the sweep only computes one for a running run), so the deadline clause is
 // omitted; and a failed cap read drops just the "of <cap> allowed" tail.
+//
+// PRD #1497 M3: an Extend on a `budget_exhausted` WALL PARK is not a plain time grant — the
+// server adds the time AND resumes the parked run in one action, and says so with resumed:true.
+// The line then reads "Extended <id> by 2h and resumed it. 2h left, times out 17:20." — it names
+// the resume, renders the remaining time with shortDuration (so a whole-hour grant reads "2h left"
+// rather than the two-unit "2h00m left" the ordinary extend uses), and drops the allowance tail:
+// the owner is un-parking a run, not managing a budget cap. The ordinary (non-hold) extend of a
+// running/queued run is unchanged (resumed is false), so its output is byte-for-byte as before.
 func extendSuccessLine(runID string, requestedSeconds int, res apitypes.RunInputResponse, capSeconds int, now time.Time) string {
+	requested := shortDuration(time.Duration(requestedSeconds) * time.Second)
 	var b strings.Builder
-	fmt.Fprintf(&b, "Extended %s by %s.", runID, shortDuration(time.Duration(requestedSeconds)*time.Second))
+	if res.Resumed {
+		fmt.Fprintf(&b, "Extended %s by %s and resumed it.", runID, requested)
+		if res.DeadlineAt != nil {
+			left := res.DeadlineAt.Sub(now)
+			if left < 0 {
+				left = 0
+			}
+			fmt.Fprintf(&b, " %s left, times out %s.", shortDuration(left), res.DeadlineAt.Local().Format("15:04"))
+		}
+		return b.String()
+	}
+	fmt.Fprintf(&b, "Extended %s by %s.", runID, requested)
 	if res.DeadlineAt != nil {
 		left := res.DeadlineAt.Sub(now)
 		if left < 0 {

@@ -186,6 +186,10 @@ SELECT r.id, r.user_id, r.status, r.issue_iid, r.issue_title,
        r.checkpoint_tip,
        r.started_at, r.budget_wall_seconds, r.budget_paused_seconds, r.interactive,
        r.budget_extension_seconds, r.checkpoint_tip_at,
+       -- PRD #1497 M1: hold_reason lets the Slack reply branch on the wall park ('budget_exhausted')
+       -- vs the completion hold; budget_finalize_seconds lets it omit Stop once the allowance is used
+       -- and feeds the three-term deadline the Go notifier computes with RunDeadline.
+       r.hold_reason, r.budget_finalize_seconds,
        r.fail_origin,
        (r.preserved_patch IS NOT NULL)::boolean AS has_preserved_patch,
        (EXISTS (SELECT 1 FROM recovery_captures c WHERE c.run_id = r.id AND c.user_id = r.user_id AND c.state = 'available'))::boolean AS has_available_capture,

@@ -390,6 +390,13 @@ behind-on-workflows rejection is `workflow_scope_missing`, a base-align conflict
 `limit_wait` is a separate parked status, not a `fail_origin`, and clears on its own.
 Report the `failure_reason` verbatim and decide re-run vs. revise vs. hand back to the user.
 
+**A run that hit its wall-clock time limit is `paused` with `hold_reason:
+budget_exhausted`, not `failed` (PRD #1497).** It no longer has a
+`fail_origin` for the clock alone — do not wait for a `failed` state that no
+longer comes from the wall. Extend it (`uzi run extend RUN --by 2h`, which
+resumes it in one step) or recover it the same way you would any other
+non-terminal park.
+
 ## Cross-session handoff
 
 This watcher role is handed between sessions (a closing session passes you its run ids). On

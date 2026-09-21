@@ -11,7 +11,7 @@ import {
   isWorkflowScopeRejection,
 } from "./git.js";
 import type { SecretFinding } from "./secret-scan-guard.js";
-import type { Executor, ExecutorResult, RunContext } from "./executor.js";
+import type { Executor, ExecutorResult, RunContext, WallParkOutcome } from "./executor.js";
 import { PlanRejectedError } from "./executor.js";
 import type { BoundaryPermit, BoundaryRequest } from "./harness.js";
 import { skillsPluginDir } from "./skills-plugin.js";
@@ -223,6 +223,26 @@ class StaleClaimError extends Error {
   constructor() {
     super("run claim superseded server-side (stale_claim)");
     this.name = "StaleClaimError";
+  }
+}
+
+/**
+ * PRD #1497 M2 (D5/D16): a fenced /state report came back stale AND the run is SERVER-PARKED at its
+ * wall-clock limit — the ACK carried `disposition:"stale_claim"` (the fence rejected this flight's
+ * report) together with the run's `status:"paused"` + `hold_reason:"budget_exhausted"` (the sweep
+ * parked the row and armed claim_released_at). This is DISTINCT from a plain StaleClaimError: the
+ * run was not superseded by a reclaim, it was parked at the wall by the server (a dead/incapable/
+ * unresponsive worker's row, D5), so this flight must STOP but RETAIN everything — the run is
+ * non-terminal and a safe incarnation will resume it from the last checkpoint. Thrown from the
+ * flight.reportState closure the moment any report reads that pair, AHEAD of the StaleClaimError
+ * throw; caught in executeClaim's catch chain BEFORE the StaleClaimError arm, where it sets the
+ * preserve flags, closes the batcher, reports NOTHING terminal, and keeps clone + HOME. Local, like
+ * StaleClaimError: thrown and caught entirely within this file.
+ */
+class ServerWallParkedError extends Error {
+  constructor() {
+    super("run parked server-side at its wall-clock limit (budget_exhausted); retaining work and stopping this flight");
+    this.name = "ServerWallParkedError";
   }
 }
 
@@ -1655,6 +1675,23 @@ export class RunRunner {
         if (outcome === "fail") {
           await this.reportGenericFailure(claim, flight, err);
         }
+      } else if (err instanceof ServerWallParkedError) {
+        // PRD #1497 M2 (D5/D16/D17): a fenced report revealed the run was SERVER-PARKED at its
+        // wall-clock limit (paused + budget_exhausted). Caught BEFORE the StaleClaimError arm below:
+        // unlike a plain stale supersede, KEEP everything — the run is non-terminal and a safe
+        // incarnation will resume it from the last checkpoint, so set the preserve flags (retain the
+        // clone + HOME), report NO terminal state (a `failed`/`completed` here would fight the park
+        // and, per D17, could replay a journaled failure over the park), and close the batcher. The
+        // finally's park carve-out then preserves the HOME + plugin dir; preserveRecoveryClone keeps
+        // the clone. Mirrors the CredentialSwitchRetainedStop arm's retain-and-stop posture.
+        flight.preserveRecoveryClone = true;
+        flight.preserveSession = true;
+        flight.parked = true;
+        runLog.info(
+          "run parked server-side at its wall-clock limit; retaining clone + HOME and leaving it non-terminal for a resume",
+          { run_id: flight.runId },
+        );
+        await batcher.close().catch(() => undefined);
       } else if (err instanceof StaleClaimError) {
         // PRD #1247 M5b: a /state report came back with the stale_claim disposition — a held-state
         // credential switch RELEASED this claim, or a reclaim SUPERSEDED it. Another claim owns the
@@ -2612,6 +2649,22 @@ export class RunRunner {
       runLog.info("run entered the completion hold; skipping finalization", {
         run_id: runId,
         reason: result.completionHeld.reason,
+      });
+      return;
+    }
+    // PRD #1497 M2: the run PARKED at its WALL-CLOCK limit (ctx.parkForWall → "parked", or
+    // "undeliverable" so the flight ends non-terminal keeping the work, D17). Like the pause park and
+    // the completion hold above, the run is non-terminal and the wall seam already handled it (a
+    // `paused` report on "parked", NOTHING on "undeliverable"), so there is nothing to finalize (no
+    // push, no MR, no terminal report). Reap + close the batcher and return; the finally preserves
+    // clone + HOME (enterWallPark set the flags) for a resume. Keyed on the executor's result so no
+    // non-wall path can reach this branch.
+    if (result.walled) {
+      executor.killAgentTree?.();
+      await closeBatcher().catch(() => undefined);
+      runLog.info("run parked at its wall-clock limit; skipping finalization", {
+        run_id: runId,
+        reason: result.walled.reason,
       });
       return;
     }
@@ -4408,6 +4461,21 @@ export class RunRunner {
         // stale_claim check below; the two never co-occur (workerStateAck omits the switch signal
         // from the stale_claim disposition), so ordering is immaterial to correctness.
         if (ack.credentialSwitch) flight.steering.tripCredentialSwitch(ack.credentialSwitch.generation);
+        // PRD #1497 M2 (D5/D16): recognise a SERVER-side wall park BEFORE the generic stale handling.
+        // A fenced report whose ACK reads disposition:"stale_claim" (the fence rejected it) AND
+        // status:"paused" + hold_reason:"budget_exhausted" (the sweep parked the row at the wall)
+        // is not an ordinary supersede: the run is parked, non-terminal, and a safe incarnation will
+        // resume it. Throw the DISTINCT ServerWallParkedError so executeClaim's catch chain RETAINS
+        // clone + HOME and reports nothing terminal — its arm runs AHEAD of the StaleClaimError arm,
+        // which would instead run ordinary teardown (removing this worker's clone). Checked before the
+        // staleClaim throw below so the pair is caught here, not there.
+        if (
+          ack.staleClaim &&
+          ack.status === "paused" &&
+          ack.holdReason === "budget_exhausted"
+        ) {
+          throw new ServerWallParkedError();
+        }
         // PRD #1247 M5b: a stale_claim disposition means a held-state switch RELEASED this claim
         // (or a reclaim SUPERSEDED it) — the flight no longer owns the run and MUST STOP. Throw so
         // executeClaim's catch chain closes the batcher and ends the flight with NO terminal
@@ -5438,6 +5506,12 @@ export class RunRunner {
             ? b
             : undefined;
         } catch (e) {
+          // PRD #1497 M2: a SERVER-side wall park (recognised by the reportState closure) must NOT be
+          // swallowed here — rethrow it so it reaches executeClaim's catch chain, which retains clone
+          // + HOME and ends the flight non-terminal. Swallowing it (as with an ordinary transient
+          // report error) would let the flight keep running a whole turn on a run the sweep already
+          // parked; the fence rejects every write, but the wasted turn is avoided by stopping now.
+          if (e instanceof ServerWallParkedError) throw e;
           runLog.warn("could not report iteration", { error: errMessage(e) });
           return undefined;
         }
@@ -5686,6 +5760,17 @@ export class RunRunner {
       // returning whether the run parked. Called from the implement loop's pause boundary and
       // its `now`-pause turn catch.
       parkForPause: (pausedAt) => this.handlePausePark(claim, flight, pausedAt),
+      // PRD #1497 M2 (D4): park the run at its WALL-CLOCK limit — the CAPTURE-FIRST wall park,
+      // NOT handlePausePark. Delegates to enterWallPark, which reaps, captures a verified restore
+      // point via the SHARED captureHoldContext, reports the wall_park transition, and returns the
+      // outcome the executor branches on (parked/undeliverable/refused/cancelled). Called from the
+      // implement loop's wall-pause turn catch, its pre-attempt REASON_WALL arm, and the loop-top
+      // wall boundary.
+      parkForWall: () => this.enterWallPark(flight, claim, runLog),
+      // PRD #1497 M2: clear a sticky `wall` pause mode after a REFUSED wall_park (the owner extended
+      // in the window, so the run continues) — else the next loop boundary would re-route to the
+      // wall seam. Delegates to the steering channel; a no-op when no wall is pending.
+      clearWallMode: () => steering.clearWallMode(),
       // PRD #1226 M3 (D1/D2): this run is INTERLOCKED when the claim's WORKER-ONLY
       // completion_contract_version is non-null. The executor then runs the structural completion
       // protocol on signal_done instead of finalizing directly. false/absent (legacy run, rollout
@@ -7277,6 +7362,132 @@ export class RunRunner {
       head,
     });
     return true;
+  }
+
+  /**
+   * PRD #1497 M2 (D4): enter the CAPTURE-FIRST WALL PARK — the runner side of ctx.parkForWall,
+   * called when the executor's turn tripped at the run's wall-clock limit (a `wall` pause aborted
+   * the turn, or a pre-attempt REASON_WALL fired, or a re-claim boundary with pause_mode='wall').
+   * Modeled on enterCompletionHold (reap → set-preserve-flags-up-front → bounded VERIFIED capture via
+   * the SHARED captureHoldContext), but with THREE differences the wall park requires:
+   *
+   *   - it reports the WALL_PARK transition (client.reportWallPark → fenced SetRunWallPark), not the
+   *     completion hold;
+   *   - a capture that never verifies does NOT abandon the park (D4): it parks DEGRADED — the flags
+   *     stay set, the clone + HOME are retained, the head is reported EMPTY, and a feed message notes
+   *     the latest local work is unverified and lives on this worker only. The wall park NEVER fails
+   *     a run and never reports pause_failed (D2/D17);
+   *   - it returns the richer WallParkOutcome the executor branches on (parked / undeliverable /
+   *     refused / cancelled), not a bool.
+   *
+   * On "parked"/"undeliverable" the preserve flags STAY set (the run is non-terminal, clone + HOME
+   * kept for resume); on "refused" (the owner extended in the window) and "cancelled" they are
+   * CLEARED so the continuing/terminal run cleans up normally. This mints NO Codex permit itself —
+   * captureHoldContext runs the credentialed publish under its own withCodexBoundaryOnly (harness-
+   * aware), the SAME reuse the completion hold relies on.
+   */
+  private async enterWallPark(
+    flight: RunFlight,
+    claim: ClaimResponse,
+    runLog: Logger,
+  ): Promise<WallParkOutcome> {
+    const { batcher } = flight;
+    // 1. Reap the agent tree BEFORE any credentialed capture git (REAP-BEFORE-GIT), like the
+    //    completion hold. Idempotent — phasePublish's walled branch reaps again.
+    flight.executor.killAgentTree?.();
+    // 2. Retain EVERYTHING up front (D4/D17): the wall park NEVER fails, so — unlike the completion
+    //    hold, which clears the flags when it gives up — these STAY set through a degraded park and a
+    //    landed/undeliverable park, and are cleared only when the server REFUSES (the owner extended,
+    //    so the run continues) or the run was cancelled (terminal cleanup).
+    flight.preserveRecoveryClone = true;
+    flight.preserveSession = true;
+    // 3-5. Capture a VERIFIED same-worker restore point via the SHARED captureHoldContext (do NOT
+    //    fork a third WIP-commit-and-fetch-back — the #1190 stale-tip bug's lesson), bounded retry.
+    let captured:
+      | { verified: boolean; published: boolean; mode: "same_worker_only"; head: string | null }
+      | undefined;
+    for (let attempt = 0; attempt < COMPLETION_HOLD_CAPTURE_ATTEMPTS; attempt++) {
+      if (flight.active?.shuttingDown || flight.steering.isCancelled()) break;
+      try {
+        const result = await this.captureHoldContext(claim, flight, runLog);
+        if (result.verified) {
+          captured = result;
+          break;
+        }
+      } catch (captureError) {
+        runLog.warn("wall park capture failed; retaining live work for retry", {
+          error: errMessage(captureError),
+        });
+      }
+      if (attempt < COMPLETION_HOLD_CAPTURE_ATTEMPTS - 1) await this.waitRecoveryRetry(flight);
+    }
+    const head = captured?.head ?? null;
+    const published = captured?.published ?? false;
+    if (head === null) {
+      // DEGRADED park (D4): the capture could not be verified after the bounded retry. Park anyway —
+      // the flags stay set (clone + HOME retained), the head is reported empty, and a feed message
+      // tells the owner the latest local work is unverified and lives on this worker only.
+      batcher.emit({
+        kind: "status",
+        agent: "worker",
+        payload: {
+          text: "Reached the time limit and parked. The latest local work could not be verified and lives on this worker only — keep this worker until you decide.",
+        },
+      });
+    }
+    // 6. Report the WALL PARK. reportWallPark reads the status off BOTH a 200 (paused) and a 409
+    //    (refused) body; a 404 (a reclaim — ErrRunNotOwned) or a transport/5xx error THROWS, which is
+    //    an UNDELIVERABLE park (D17): keep the flags, report nothing terminal, end non-terminal.
+    let status: string;
+    try {
+      ({ status } = await this.client.reportWallPark(flight.runId, {
+        // Empty on a degraded park (the server column is nullable and treats "" as null).
+        head: head ?? "",
+        published,
+        // PRD #1497 M1 (D16): stamp the claim-lane generation so the fence refuses a
+        // released/superseded stale flight's reclaimed run (the SAME value the reportState closure stamps).
+        claimGeneration: flight.claimGeneration,
+      }));
+    } catch (err) {
+      runLog.warn(
+        "wall park report undeliverable; retaining clone + HOME and ending the flight non-terminal (D17)",
+        { run_id: flight.runId, error: errMessage(err) },
+      );
+      return "undeliverable";
+    }
+    if (status === "paused") {
+      // 7. Durably parked. Mark the flight parked so the finally's carve-out preserves the HOME +
+      //    plugin dir; preserveRecoveryClone (set above) keeps the clone. phasePublish's walled branch
+      //    reaps again (idempotent) and skips finalize.
+      flight.parked = true;
+      runLog.info("run parked at its wall-clock limit; preserving clone + HOME for resume", {
+        run_id: flight.runId,
+        published,
+        head,
+        degraded: head === null,
+      });
+      return "parked";
+    }
+    if (status === "cancelled") {
+      // The run was cancelled concurrently: it is terminal, nothing to resume, so CLEAR the preserve
+      // flags for normal terminal cleanup. The executor ends the run as a cancel.
+      flight.preserveRecoveryClone = false;
+      flight.preserveSession = false;
+      runLog.info("wall park found the run cancelled; ending the run as a cancel", {
+        run_id: flight.runId,
+      });
+      return "cancelled";
+    }
+    // REFUSED (the owner extended in the request-then-park window, so the deadline moved and
+    // SetRunWallPark returned 0 rows): the run CONTINUES. Clear the preserve flags — a continuing run
+    // finalizes normally and its clone/HOME are cleaned up by the ordinary terminal path, not preserved.
+    flight.preserveRecoveryClone = false;
+    flight.preserveSession = false;
+    runLog.info("wall park refused (the owner extended in the window); the run continues", {
+      run_id: flight.runId,
+      server_status: status || "unknown",
+    });
+    return "refused";
   }
 
   /**

@@ -231,6 +231,15 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 	// the milestone block it references (COMPLETION_UNMET names frozen-list ids). Every row is
 	// emit-only-when-set, so a non-interlocked run (the rollout OFF) adds nothing here.
 	rows = append(rows, completionRows(r)...)
+	// The HOLD row (PRD #1497 M3): a one-line summary of ANY held run — a wall park
+	// (hold_reason=budget_exhausted) or a completion hold (completion_blocked) — naming why
+	// the run is parked, how long ago, its milestone progress, and (for a wall park) the
+	// extend command. Emit-only-when-held, so a run with a null hold_reason adds nothing and
+	// renders byte-for-byte as before. Placed after the completion block so a completion hold
+	// reads its HOLD summary line just below the HOLD_CONTEXT durability row that block emits.
+	if row := holdRow(r, time.Now()); row != nil {
+		rows = append(rows, row)
+	}
 	if r.BudgetMaxIterations != nil {
 		rows = append(rows, []string{"BUDGET_ITERATIONS", itoa(*r.BudgetMaxIterations)})
 	}
@@ -400,6 +409,64 @@ func completionRows(r apitypes.RunDTO) [][]string {
 		rows = append(rows, []string{"HOLD_CONTEXT", sanitizeTTY(*r.HoldContext)})
 	}
 	return rows
+}
+
+// holdRow renders the HOLD row of `uzi run get` for ANY held run (PRD #1497 M3), the CLI
+// summary of a parked run's reason and the owner's next step. It returns nil for a run with a
+// null hold_reason, so a run that is not held adds nothing (emit-only-when-set, like the rows
+// around it). The value cell is a "·"-joined line:
+//
+//   - budget_exhausted (a wall park): "time limit reached · parked HH:MM (dur) · C/N milestones ·
+//     extend: uzi run extend <id> --by 2h"
+//   - completion_blocked (the PRD #1226 hold): "completion blocked · parked HH:MM (dur) · C/N milestones"
+//
+// The milestone clause is dropped when the run carries no frozen milestones (a prompt-kind park),
+// and the extend clause rides ONLY the wall park (a completion hold resumes through its own
+// decision, not by extending the clock). hold_reason is unconstrained text on the wire, so an
+// UNRECOGNISED value (a newer server than this binary) is passed through sanitizeTTY as a neutral
+// label rather than dropped — the same terminal-safety obligation the HOLD_CONTEXT row above
+// carries — so a future hold still surfaces honestly instead of vanishing.
+//
+// It takes now so the parked-since clock unit-tests deterministically, matching pausedSummary.
+func holdRow(r apitypes.RunDTO, now time.Time) []string {
+	if r.HoldReason == nil || *r.HoldReason == "" {
+		return nil
+	}
+	clauses := []string{holdReasonLabel(*r.HoldReason), holdParkedClause(r, now)}
+	if done, total, _ := milestoneProgress(r); total > 0 {
+		clauses = append(clauses, fmt.Sprintf("%d/%d milestones", done, total))
+	}
+	if *r.HoldReason == holdBudgetExhausted {
+		clauses = append(clauses, "extend: uzi run extend "+r.ID+" --by 2h")
+	}
+	return []string{"HOLD", strings.Join(clauses, " · ")}
+}
+
+// holdReasonLabel maps a run.HoldReason to its human label for the HOLD row. The two known
+// values get the same words every #1497 surface uses; an unrecognised value (a newer server)
+// is passed through sanitizeTTY so a future hold reads as its raw-but-terminal-safe reason
+// rather than being dropped or trusted.
+func holdReasonLabel(reason string) string {
+	switch reason {
+	case holdBudgetExhausted:
+		return "time limit reached"
+	case holdCompletionBlocked:
+		return "completion blocked"
+	default:
+		return sanitizeTTY(reason)
+	}
+}
+
+// holdParkedClause renders "parked HH:MM (dur)" from the run's status timestamp (updated_at,
+// stamped at the park), the hold-row twin of pauseSinceClause — same UTC derivation and the same
+// two-unit duration in parens (fmtUntil), worded "parked" for a hold rather than "since" for an
+// owner pause. A negative elapsed (clock skew) floors to 0s.
+func holdParkedClause(r apitypes.RunDTO, now time.Time) string {
+	d := now.Sub(r.UpdatedAt)
+	if d < 0 {
+		d = 0
+	}
+	return "parked " + r.UpdatedAt.UTC().Format("15:04") + " (" + fmtUntil(d) + ")"
 }
 
 // limitWaitRows is the usage-limit park block of `uzi run get` (PRD #35), split out

@@ -789,9 +789,12 @@ func TestSetRunCompletionHoldLiveDB(t *testing.T) {
 		t.Fatalf("a refused hold must leave status unchanged; got %q, want queued", run4.Status)
 	}
 
-	// Case 5: SetRunPaused — the sibling this must not weaken — still pauses an owner-pause run.
+	// Case 5: SetRunPaused — the sibling this must not weaken — still pauses an owner-pause run. The
+	// pending request carries pause_mode='milestone', exactly as CreatePauseInput writes it (PRD #1497
+	// M1 added SetRunPaused's `pause_mode IN ('milestone','now')` guard so an owner-pause report can
+	// never consume a system 'wall' request; a realistic owner pause always has a mode set).
 	ownerPause := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
-	e.exec(t, `UPDATE runs SET pause_requested_at = now() WHERE id = $1`, ownerPause)
+	e.exec(t, `UPDATE runs SET pause_requested_at = now(), pause_mode = 'milestone' WHERE id = $1`, ownerPause)
 	rows, err := e.q.SetRunPaused(e.ctx, store.SetRunPausedParams{ID: ownerPause, WorkerID: pgconv.UUID(wid)})
 	if err != nil {
 		t.Fatalf("SetRunPaused: %v", err)

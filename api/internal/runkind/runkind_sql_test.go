@@ -10,11 +10,12 @@ import (
 )
 
 // runkind_sql_test.go pins the `kind NOT IN (...)` filter in
-// store/queries/runtime.sql to Listed(). Four named query blocks carry the
+// store/queries/runtime.sql to Listed(). Five named query blocks carry the
 // byte-identical filter today — CountInProgressRunsForUser, ListRunsForUser,
-// ListActiveRunsAll, SweepRunningTimeout — and each block's excluded set must
-// equal { k in All() : !Listed(k) } (i.e. {chat, judge}). All four are checked,
-// not a representative one, so a divergence introduced in any sibling is red.
+// ListActiveRunsAll, and (PRD #1497 M1, replacing the retired SweepRunningTimeout)
+// the two wall-park passes RequestWallParks + ParkRunsAtWall — and each block's
+// excluded set must equal { k in All() : !Listed(k) } (i.e. {chat, judge}). All are
+// checked, not a representative one, so a divergence introduced in any sibling is red.
 // This file lives inside the api/ module, so Go's test cache rechecks it.
 
 func TestRuntimeSQLKindFilterMatchesListed(t *testing.T) {
@@ -40,7 +41,8 @@ func TestRuntimeSQLKindFilterMatchesListed(t *testing.T) {
 		"CountInProgressRunsForUser",
 		"ListRunsForUser",
 		"ListActiveRunsAll",
-		"SweepRunningTimeout",
+		"RequestWallParks",
+		"ParkRunsAtWall",
 	}
 
 	// Split the file into named-query blocks on `-- name:` boundaries.

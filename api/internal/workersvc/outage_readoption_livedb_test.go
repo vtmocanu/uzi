@@ -93,14 +93,19 @@ type terminalWriter struct {
 }
 
 func outageTerminalWriters() []terminalWriter {
-	fireSweepRunningTimeout := func(t *testing.T, env codexTestEnv, workerID, runID uuid.UUID) {
-		if _, err := env.q.SweepRunningTimeout(env.ctx, store.SweepRunningTimeoutParams{
-			FailureReason:        pgconv.TextOrNull("run exceeded RUN_TIMEOUT"),
+	// PRD #1497 M1: the wall-clock sweep now PARKS at the deadline instead of failing. The seeded
+	// worker advertises no protocol_capabilities, so it lacks 'wall_park_v1' and ParkRunsAtWall parks
+	// its past-deadline run server-side (running -> paused, hold_reason='budget_exhausted'). It keeps
+	// the SAME D11 terminal-pending / pending_overflow guards SweepRunningTimeout had, so this writer
+	// still exercises those guards — only the swept status changed from 'failed' to 'paused'.
+	fireParkRunsAtWall := func(t *testing.T, env codexTestEnv, workerID, runID uuid.UUID) {
+		if _, err := env.q.ParkRunsAtWall(env.ctx, store.ParkRunsAtWallParams{
 			Now:                  pgconv.Time(time.Now()),
 			GlobalTimeoutSeconds: 7200,
 			WorkerStaleCutoff:    pgconv.Time(time.Now().Add(-45 * time.Second)),
+			GraceSeconds:         600,
 		}); err != nil {
-			t.Fatalf("SweepRunningTimeout: %v", err)
+			t.Fatalf("ParkRunsAtWall: %v", err)
 		}
 	}
 	fireClaimedNeverStarted := func(t *testing.T, env codexTestEnv, workerID, runID uuid.UUID) {
@@ -151,7 +156,7 @@ func outageTerminalWriters() []terminalWriter {
 		}
 	}
 	return []terminalWriter{
-		{name: "SweepRunningTimeout", initStatus: "running", sweptStatus: "failed", staleFor: 0, fire: fireSweepRunningTimeout},
+		{name: "ParkRunsAtWall", initStatus: "running", sweptStatus: "paused", staleFor: 0, fire: fireParkRunsAtWall},
 		{name: "SweepClaimedNeverStarted", initStatus: "claimed", sweptStatus: "queued", staleFor: 0, fire: fireClaimedNeverStarted},
 		{name: "FailRunAutoStop", initStatus: "running", sweptStatus: "failed", staleFor: 0, fire: fireAutoStop},
 		{name: "FailRunsOfStaleWorkersOverCap", initStatus: "running", sweptStatus: "failed", staleFor: 120 * time.Second, fire: fireStaleFail},
@@ -303,7 +308,7 @@ func TestSweepBootGraceSkipsStalePassesLiveDB(t *testing.T) {
 	svc.SetBackground(func(func()) {}) // no detached work outliving the pool
 
 	// A worker stale for 120s (well past both windows) with a within-budget running run whose
-	// wall clock is fresh (so SweepRunningTimeout never fires and only the stale passes matter).
+	// wall clock is fresh (so the wall-park passes never fire and only the stale passes matter).
 	wk := seedOutageWorker(t, env, userID, 120*time.Second)
 	run := seedOutageRun(t, env, userID, repoID, wk, "running", "issue", 1, 0)
 	env.exec(`UPDATE runs SET started_at = now() - interval '5 minutes', status_since = now() - interval '5 minutes' WHERE id = $1`, run)

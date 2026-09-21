@@ -80,6 +80,10 @@ export class FakeApi {
       // "stale_claim"), the shape the server produces when a held-state switch released this
       // claim or a reclaim superseded it. readRunAck reads it into StateAck.staleClaim.
       disposition?: string;
+      // PRD #1497 M2: when set, the 409 refusal's run DTO carries this hold_reason (e.g.
+      // "budget_exhausted"), the shape the server produces on a SERVER-side wall park — paired with
+      // runStatus:"paused" + disposition:"stale_claim" it drives the ServerWallParkedError path.
+      holdReason?: string;
       fired: boolean;
     }
   >();
@@ -146,6 +150,16 @@ export class FakeApi {
   }> = [];
   private completionHoldStatus = "paused";
   private completionHoldHttpStatus = 200;
+  // PRD #1497 M2: the wall-park endpoint. Records each request (run + body: head, published,
+  // claim_generation) and answers a configurable {run:{status}} at a configurable HTTP status — the
+  // worker keys its park order off the RETURNED status (paused ⇒ parked), reading it off both a 200
+  // and a 409. A 404/5xx httpStatus makes the client THROW (an UNDELIVERABLE park, D17).
+  readonly wallParkRequests: Array<{
+    runId: string;
+    body: Record<string, unknown>;
+  }> = [];
+  private wallParkStatus = "paused";
+  private wallParkHttpStatus = 200;
   // PRD #1226 M4 (D5): the completion-permit endpoint. Records each request (run + body) and answers
   // a configurable decision — {granted:true} by default, or {granted:false, deny_reason} — at a
   // configurable HTTP status (a non-200 models a transport/HTTP error the client THROWS on, distinct
@@ -279,13 +293,14 @@ export class FakeApi {
   failStateWhen(
     runId: string,
     matchesState: (body: StateRequest) => boolean,
-    opts: { httpStatus?: number; runStatus?: string; disposition?: string } = {},
+    opts: { httpStatus?: number; runStatus?: string; disposition?: string; holdReason?: string } = {},
   ): void {
     this.stateFailWhen.set(runId, {
       matchesState,
       httpStatus: opts.httpStatus ?? 409,
       runStatus: opts.runStatus,
       disposition: opts.disposition,
+      holdReason: opts.holdReason,
       fired: false,
     });
   }
@@ -355,6 +370,15 @@ export class FakeApi {
   setCompletionHoldResponse(status: string, httpStatus = 200): void {
     this.completionHoldStatus = status;
     this.completionHoldHttpStatus = httpStatus;
+  }
+
+  /** PRD #1497 M2: set the {run:{status}} the wall-park endpoint answers, and the HTTP status it
+   *  answers with (default 200/"paused" = a landed park; 409 with a non-"paused" status models a
+   *  REFUSED park the client must NOT throw on; a 404/5xx models an UNDELIVERABLE report the client
+   *  THROWS on, D17). */
+  setWallParkResponse(status: string, httpStatus = 200): void {
+    this.wallParkStatus = status;
+    this.wallParkHttpStatus = httpStatus;
   }
 
   /** PRD #1226 M4 (D5): set the completion-permit decision. `granted:true` is the issued permit;
@@ -601,6 +625,21 @@ export class FakeApi {
       });
     }
 
+    // PRD #1497 M2: the wall-park endpoint. Records the request and answers the configured
+    // {run:{status}} at the configured HTTP status (200 landed / 409 refused / 404|5xx undeliverable).
+    // On an undeliverable status the RunDTO is still shaped but the client throws on the non-200/409.
+    const wallParkMatch = /^\/api\/worker\/runs\/([^/]+)\/wall-park$/.exec(p);
+    if (req.method === "POST" && wallParkMatch) {
+      const runId = wallParkMatch[1] as string;
+      this.wallParkRequests.push({ runId, body: json });
+      if (this.wallParkHttpStatus !== 200 && this.wallParkHttpStatus !== 409) {
+        return send(res, this.wallParkHttpStatus, { error: "run not found for this worker" });
+      }
+      return send(res, this.wallParkHttpStatus, {
+        run: { id: runId, status: this.wallParkStatus },
+      });
+    }
+
     return send(res, 404, { error: "not found", path: p });
   }
 
@@ -682,7 +721,14 @@ export class FakeApi {
       if (when.httpStatus === 409) {
         return send(res, 409, {
           error: "run already moved on",
-          run: { id: runId, status: when.runStatus ?? "cancelled" },
+          run: {
+            id: runId,
+            status: when.runStatus ?? "cancelled",
+            // PRD #1497 M2: a SERVER-side wall park's run DTO carries hold_reason:"budget_exhausted"
+            // beside status:"paused"; the reportState closure reads the pair (+ disposition) to throw
+            // ServerWallParkedError. Absent unless armed, so existing stale_claim tests are unchanged.
+            ...(when.holdReason ? { hold_reason: when.holdReason } : {}),
+          },
           // PRD #1247 M5b: a stale_claim (or other) disposition rides TOP-LEVEL when armed.
           ...(when.disposition ? { disposition: when.disposition } : {}),
         });

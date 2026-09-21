@@ -60,6 +60,7 @@
   "budget_wall_seconds": 1,
   "budget_extension_seconds": 1,
   "budget_extension_cap_seconds": 1,
+  "budget_finalize_seconds": 1,
   "budget_total_seconds": 1,
   "budget_used_seconds": 1,
   "scope_ceiling": 1,
@@ -76,6 +77,7 @@
   ],
   "hold_reason": "x",
   "hold_context": "x",
+  "can_stop_at_wall": true,
   "completion_phase": "x",
   "completion_revision": 1,
   "completion_deferred": [

@@ -776,6 +776,18 @@ chain in the diagram above, with no intervening `running`.
   [adr/1225-structural-completion-interlock-invariants.md](adr/1225-structural-completion-interlock-invariants.md)
   for the negative-space invariants a future edit could break silently.
 
+- **running → paused (wall park)** ([PRD #1497](prds/1497-park-at-wall.md)) — a third,
+  distinct reason a run reaches `paused`: a run that hits its wall-clock deadline
+  (`RUN_TIMEOUT` plus any extension) parks instead of failing, `hold_reason=
+  'budget_exhausted'`, on a pushed checkpoint where possible. The sweep asks a live,
+  `wall_park_v1`-capable worker to capture and park; it parks the row itself when
+  the worker is dead, incapable, or has not parked within a fixed grace, fencing
+  that worker's old flight out. The owner extends (resumes with the granted time),
+  stops (milestone issue runs only — finalizes the completed milestones into a
+  merge request), or cancels; the park has no expiry and the behavior is not
+  configurable. Both harnesses park; none fails at the wall. See
+  [docs/run-pause.md](docs/run-pause.md) and [docs/run-health.md](docs/run-health.md).
+
 - **Affinity holds through a worker roll** ([PRD #1030](prds/done/1030-worker-resume-durability.md)).
   The fix distinguishes a **roll** (sets `draining_since`, keeps the worker row)
   from a **teardown** (deletes the row API-side), so `teardown ⟺ row absent` and
@@ -1027,7 +1039,10 @@ chain in the diagram above, with no intervening `running`.
 - **Sweeper** (a goroutine beside the forge poller) enforces what workers
   can't be trusted to self-report: a claimed-but-never-started run older than
   5 minutes is re-queued; a running run older than `RUN_TIMEOUT` (default 2h)
-  is failed; a worker whose heartbeat is stale past `WORKER_HEARTBEAT_STALE`
+  **parks** — non-terminal `paused`, `hold_reason='budget_exhausted'` — and asks
+  its owner to extend or stop it, never failed for the clock alone (PRD #1497,
+  see the **running → paused (wall park)** entry above); a worker whose
+  heartbeat is stale past `WORKER_HEARTBEAT_STALE`
   (default 45s) is marked offline and its non-terminal runs re-queued,
   incrementing `requeue_count` — only after a *second* consecutive stale
   window is the run failed instead of re-queued again, giving a worker that

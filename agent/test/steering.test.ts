@@ -227,6 +227,65 @@ describe("SteeringChannel — pause (PRD #1190 M2)", () => {
   });
 });
 
+// PRD #1497 M2 — the wall-clock park. The sweep files a system-authored `pause` input whose body is
+// "wall". It aborts the in-flight turn EXACTLY like `now` (so the run parks in seconds, not at the
+// next milestone), records mode "wall", and is STICKY-STICKY: `pause_cancel` cannot clear it (only
+// clearWallMode after a refused wall_park, or the park landing, does). The mode is read via
+// getPauseMode(); the PauseNowSignal that drops the turn carries no mode.
+describe("SteeringChannel — wall park (PRD #1497 M2)", () => {
+  it("route('pause','wall') aborts the turn with a PauseNowSignal (like now) and records mode 'wall'", async () => {
+    const { ch, cancel } = makeChannel([[inp("pause", "wall")]]);
+    ch.start();
+    await tick();
+    assert.strictEqual(ch.getPauseMode(), "wall", "the wall mode is recorded");
+    assert.strictEqual(cancel.signal.aborted, true, "a wall pause drops the in-flight turn like a now pause");
+    assert.ok(
+      cancel.signal.reason instanceof PauseNowSignal,
+      `the abort reason must be a PauseNowSignal, got ${String(cancel.signal.reason)}`,
+    );
+    await ch.stop();
+  });
+
+  it("onPauseNow fires for a wall pause (it drops the in-flight turn, like now)", async () => {
+    const { ch } = makeChannel([[inp("pause", "wall")]]);
+    let fired = 0;
+    ch.onPauseNow(() => {
+      fired++;
+    });
+    ch.start();
+    await tick();
+    assert.strictEqual(fired, 1, "a wall pause drops the in-flight turn via the re-armable interrupt");
+    await ch.stop();
+  });
+
+  it("seedPauseRequested('wall') seeds the sticky wall mode (a re-claim with pause_pending + wall)", () => {
+    const { ch } = makeChannel([[]]);
+    assert.strictEqual(ch.getPauseMode(), null, "no pause pending on a fresh channel");
+    ch.seedPauseRequested("wall");
+    assert.strictEqual(ch.getPauseMode(), "wall", "the claim's pause_mode='wall' seeds the sticky flag");
+  });
+
+  it("pause_cancel does NOT clear a pending 'wall' mode (the system's involuntary park is not the owner's to withdraw)", async () => {
+    // pause (wall) then pause_cancel in ONE batch: the pause sets wall, the pause_cancel must NOT clear it.
+    const { ch } = makeChannel([[inp("pause", "wall"), inp("pause_cancel")]]);
+    ch.start();
+    await tick();
+    assert.strictEqual(ch.getPauseMode(), "wall", "pause_cancel cannot withdraw a wall park");
+    await ch.stop();
+  });
+
+  it("clearWallMode() clears a 'wall' mode but a following owner pause survives; it is a no-op with no wall pending", () => {
+    const { ch } = makeChannel([[]]);
+    ch.seedPauseRequested("wall");
+    ch.clearWallMode();
+    assert.strictEqual(ch.getPauseMode(), null, "clearWallMode cleared the wall mode (refused wall_park path)");
+    // clearWallMode on a NON-wall mode is a no-op (only wall is cleared).
+    ch.seedPauseRequested("now");
+    ch.clearWallMode();
+    assert.strictEqual(ch.getPauseMode(), "now", "clearWallMode leaves a non-wall mode intact");
+  });
+});
+
 // PRD #1247 M5b — the held-state credential switch. A `credential_switch {generation}` field rides
 // EVERY /inputs response (incl. an empty one). The channel acts on it ONLY when the generation
 // matches THIS claim's (claimGeneration): it records the pending switch, trips the shared controller

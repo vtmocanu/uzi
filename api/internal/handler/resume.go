@@ -56,11 +56,29 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	case "paused":
-		// PRD #1190 M1: resume an owner-paused run. ResumePausedRun banks the parked time into
-		// budget_paused_seconds and keeps started_at (gate-park accounting, Decision 2);
-		// owner+status-scoped. pgx.ErrNoRows means a race moved the run out of paused → 409.
-		if _, err := h.q.ResumePausedRun(r.Context(), store.ResumePausedRunParams{ID: runID, UserID: user.ID}); err != nil {
+		// PRD #1497 M1 (D6): a completion hold resumes ONLY through its own decision endpoint, never
+		// this generic resume — 409 naming it (today this would silently resume the hold).
+		if run.HoldReason.Valid && run.HoldReason.String == "completion_blocked" {
+			httpx.Error(w, http.StatusConflict, "this run is blocked on a completion decision; resolve it at POST /api/runs/{id}/completion/decision")
+			return
+		}
+		// PRD #1190 M1 / #1497 M1: resume an owner-paused run or a budget_exhausted wall park.
+		// ResumePausedRun banks the parked time into budget_paused_seconds and keeps started_at
+		// (gate-park accounting, Decision 2); owner+status-scoped, and it refuses a completion hold
+		// (allow=false) and a budget_exhausted park with no remaining budget (D7). pgx.ErrNoRows means
+		// a race moved the run out of paused, or — for a budget_exhausted hold — that there is no
+		// budget left to resume on.
+		if _, err := h.q.ResumePausedRun(r.Context(), store.ResumePausedRunParams{
+			ID:                         runID,
+			UserID:                     user.ID,
+			AllowCompletionBlockedHold: false,
+			GlobalTimeoutSeconds:       int32(h.cfg.RunTimeout.Seconds()),
+		}); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
+				if run.HoldReason.Valid && run.HoldReason.String == "budget_exhausted" {
+					httpx.Error(w, http.StatusConflict, fmt.Sprintf("this run is out of time; extend it to resume: uzi run extend %s --by 2h", runID))
+					return
+				}
 				httpx.Error(w, http.StatusConflict, "run is no longer paused")
 				return
 			}

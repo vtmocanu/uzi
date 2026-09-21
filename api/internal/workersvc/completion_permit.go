@@ -606,6 +606,14 @@ func (s *Service) completeRunWithPermit(ctx context.Context, wkr store.Worker, o
 		}
 	case slices.Contains(wkr.ProtocolCapabilities, capability.CredentialSwitchV1):
 		return 0, false, ErrMissingClaimGeneration
+	default:
+		// PRD #1497 M1 (D16): the released window closes for a generation-less (legacy) completion
+		// too — a completion on a RELEASED claim (a held-state switch or a server-side wall park set
+		// claim_released_at) is rejected even without a stamped generation, checked on the LOCKED row.
+		// A legacy completion on a LIVE claim stays honoured unfenced, byte-identical to before.
+		if run.ClaimReleasedAt.Valid {
+			return 0, false, ErrStaleClaim
+		}
 	}
 
 	// The revision that binds the permit identity MUST come from the LOCKED row, not the pre-tx

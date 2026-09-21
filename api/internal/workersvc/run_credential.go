@@ -273,7 +273,16 @@ func (s *Service) applyCredentialTransition(ctx context.Context, userID, runID u
 			return ErrCredentialSwitchRaced
 		}
 	case "paused":
-		if _, err := s.q.ResumePausedRun(ctx, store.ResumePausedRunParams{ID: runID, UserID: userID}); err != nil {
+		// PRD #1497 M1: the set-token resume preserves its prior behaviour of resuming any paused run
+		// (AllowCompletionBlockedHold so a completion hold still resumes here as before). A
+		// budget_exhausted wall park with no remaining budget is refused by the budget guard (0 rows
+		// -> ErrCredentialSwitchRaced); the owner extends such a run rather than set-token-ing it.
+		if _, err := s.q.ResumePausedRun(ctx, store.ResumePausedRunParams{
+			ID:                         runID,
+			UserID:                     userID,
+			AllowCompletionBlockedHold: true,
+			GlobalTimeoutSeconds:       int32(s.p.RunTimeout.Seconds()),
+		}); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return ErrCredentialSwitchRaced
 			}

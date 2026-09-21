@@ -104,6 +104,18 @@ requested boundary, your pause request survives that wait and takes effect
 at the first boundary once the run is running again — you don't have to ask
 twice.
 
+## Not the same as running out of time
+
+A run that reaches its wall-clock time limit also parks — `hold_reason:
+budget_exhausted` — instead of failing; it is never failed for the clock
+alone, and this park has no expiry either. It isn't the pause on this page
+(nobody asked for it) and it isn't the completion hold above (nothing is
+unfinished by the plan's own criteria — the run simply ran out of budget).
+From the CLI: **extend** it (`uzi run extend <id> --by 2h`, which adds time
+and resumes it in one step), **stop** it (`uzi run stop <id>`, milestone
+issue runs only — finalizes the milestones already done into a merge
+request), or **cancel** it (`uzi run cancel <id>`).
+
 ## The CLI
 
 ```

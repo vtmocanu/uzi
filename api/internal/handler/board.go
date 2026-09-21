@@ -138,6 +138,10 @@ type latestRunDTO struct {
 	Health       string     `json:"health"`
 	HealthReason *string    `json:"health_reason"`
 	HealthSince  *time.Time `json:"health_since"`
+	// HoldReason is the paused-run hold class (PRD #1226 'completion_blocked' / PRD #1497
+	// 'budget_exhausted'), null otherwise. Non-sensitive like Health/StopKind, so it rides the
+	// shared card unconditionally: the board badge reads it to render a wall park as needing the owner.
+	HoldReason *string `json:"hold_reason"`
 	// DeadlineAt is the server-computed wall-clock deadline a running run will be stopped
 	// at (PRD #1170 D9), null when the run has no wall deadline (not running, chat/judge/
 	// interactive, or no started_at). Non-sensitive like HealthSince, so it rides the
@@ -171,7 +175,7 @@ type latestRunDTO struct {
 // the email (PRD #33 Decision 5): a shared board must not leak another user's email
 // on a card, and the web already renders a no-owner badge for empty. The query no
 // longer even selects the email, so there is nothing to fall back to here.
-func mapLatestRun(runID, ownerID uuid.UUID, status string, kind string, iterationCount int32, hasPlanMd bool, mrIID pgtype.Int8, mrWebURL, mrState, failureReason, stopKind, stopReason pgtype.Text, health string, healthReason pgtype.Text, healthSince pgtype.Timestamptz, startedAt pgtype.Timestamptz, budgetWallSeconds pgtype.Int4, budgetPausedSeconds, budgetExtensionSeconds int32, interactive bool, ownerName, workerName pgtype.Text, runCount int64, createdAt, updatedAt pgtype.Timestamptz, viewerID uuid.UUID, globalTimeout time.Duration) *latestRunDTO {
+func mapLatestRun(runID, ownerID uuid.UUID, status string, kind string, iterationCount int32, hasPlanMd bool, mrIID pgtype.Int8, mrWebURL, mrState, failureReason, stopKind, stopReason pgtype.Text, health string, healthReason pgtype.Text, healthSince pgtype.Timestamptz, holdReason pgtype.Text, startedAt pgtype.Timestamptz, budgetWallSeconds pgtype.Int4, budgetPausedSeconds, budgetExtensionSeconds, budgetFinalizeSeconds int32, interactive bool, ownerName, workerName pgtype.Text, runCount int64, createdAt, updatedAt pgtype.Timestamptz, viewerID uuid.UUID, globalTimeout time.Duration) *latestRunDTO {
 	dto := &latestRunDTO{
 		ID:          runID.String(),
 		Status:      status,
@@ -180,9 +184,11 @@ func mapLatestRun(runID, ownerID uuid.UUID, status string, kind string, iteratio
 		StopKind:    textPtrValue(stopKind.Valid, stopKind.String),
 		Health:      health,
 		HealthSince: timePtr(healthSince.Valid, healthSince.Time),
+		// PRD #1497 M1: the paused-run hold class, so the board badge can render a wall park.
+		HoldReason: textPtrValue(holdReason.Valid, holdReason.String),
 		// PRD #1170: the wall-clock deadline the near-timeout badge counts down to; nil
 		// for a run with no wall deadline (not running, chat/judge/interactive, no start).
-		DeadlineAt: workersvc.RunDeadline(startedAt, budgetWallSeconds, budgetPausedSeconds, kind, interactive, status, globalTimeout, budgetExtensionSeconds),
+		DeadlineAt: workersvc.RunDeadline(startedAt, budgetWallSeconds, budgetPausedSeconds, kind, interactive, status, globalTimeout, budgetExtensionSeconds, budgetFinalizeSeconds),
 		IsPlanning: isPlanningPhase(kind, status, iterationCount, hasPlanMd),
 		WorkerName: textPtrValue(workerName.Valid, workerName.String),
 		IsMine:     ownerID == viewerID,
@@ -580,8 +586,8 @@ func assembleCards(issues []store.Issue, runRows []store.ListLatestRunsForRepoRo
 	latestByIID := make(map[int64]*latestRunDTO, len(runRows))
 	for _, rr := range runRows {
 		dto := mapLatestRun(rr.ID, rr.UserID, rr.Status, rr.Kind, rr.IterationCount, rr.HasPlanMd.Bool, rr.MrIid, rr.MrWebUrl,
-			rr.MrState, rr.FailureReason, rr.StopKind, rr.StopReason, rr.Health, rr.HealthReason, rr.HealthSince,
-			rr.StartedAt, rr.BudgetWallSeconds, rr.BudgetPausedSeconds, rr.BudgetExtensionSeconds, rr.Interactive,
+			rr.MrState, rr.FailureReason, rr.StopKind, rr.StopReason, rr.Health, rr.HealthReason, rr.HealthSince, rr.HoldReason,
+			rr.StartedAt, rr.BudgetWallSeconds, rr.BudgetPausedSeconds, rr.BudgetExtensionSeconds, rr.BudgetFinalizeSeconds, rr.Interactive,
 			rr.OwnerName, rr.WorkerName, rr.RunCount, rr.CreatedAt, rr.UpdatedAt, viewerID, globalTimeout)
 		dto.IsRevising = revising[rr.ID] // nil map ⇒ false (issue #750)
 		latestByIID[rr.IssueIid.Int64] = dto
@@ -982,8 +988,8 @@ func (h *Handler) MoveIssue(w http.ResponseWriter, r *http.Request) {
 	// blanks the run badge the board is showing (the client replaces the card).
 	if lr, err := h.q.GetLatestRunForIssue(r.Context(), store.GetLatestRunForIssueParams{RepoID: repo.ID, IssueIid: pgtype.Int8{Int64: iid, Valid: true}}); err == nil {
 		card.LatestRun = mapLatestRun(lr.ID, lr.UserID, lr.Status, lr.Kind, lr.IterationCount, lr.HasPlanMd.Bool, lr.MrIid, lr.MrWebUrl,
-			lr.MrState, lr.FailureReason, lr.StopKind, lr.StopReason, lr.Health, lr.HealthReason, lr.HealthSince,
-			lr.StartedAt, lr.BudgetWallSeconds, lr.BudgetPausedSeconds, lr.BudgetExtensionSeconds, lr.Interactive,
+			lr.MrState, lr.FailureReason, lr.StopKind, lr.StopReason, lr.Health, lr.HealthReason, lr.HealthSince, lr.HoldReason,
+			lr.StartedAt, lr.BudgetWallSeconds, lr.BudgetPausedSeconds, lr.BudgetExtensionSeconds, lr.BudgetFinalizeSeconds, lr.Interactive,
 			lr.OwnerName, lr.WorkerName, lr.RunCount, lr.CreatedAt, lr.UpdatedAt, repo.UserID, h.cfg.RunTimeout)
 		h.setLatestRunRevising(r.Context(), card.LatestRun, lr.ID) // issue #750
 	} else if !errors.Is(err, pgx.ErrNoRows) {
@@ -1087,8 +1093,8 @@ func (h *Handler) PromoteIssue(w http.ResponseWriter, r *http.Request) {
 	card := issueToCard(updated, position, repo.ForgeType)
 	if lr, err := h.q.GetLatestRunForIssue(r.Context(), store.GetLatestRunForIssueParams{RepoID: repo.ID, IssueIid: pgtype.Int8{Int64: iid, Valid: true}}); err == nil {
 		card.LatestRun = mapLatestRun(lr.ID, lr.UserID, lr.Status, lr.Kind, lr.IterationCount, lr.HasPlanMd.Bool, lr.MrIid, lr.MrWebUrl,
-			lr.MrState, lr.FailureReason, lr.StopKind, lr.StopReason, lr.Health, lr.HealthReason, lr.HealthSince,
-			lr.StartedAt, lr.BudgetWallSeconds, lr.BudgetPausedSeconds, lr.BudgetExtensionSeconds, lr.Interactive,
+			lr.MrState, lr.FailureReason, lr.StopKind, lr.StopReason, lr.Health, lr.HealthReason, lr.HealthSince, lr.HoldReason,
+			lr.StartedAt, lr.BudgetWallSeconds, lr.BudgetPausedSeconds, lr.BudgetExtensionSeconds, lr.BudgetFinalizeSeconds, lr.Interactive,
 			lr.OwnerName, lr.WorkerName, lr.RunCount, lr.CreatedAt, lr.UpdatedAt, repo.UserID, h.cfg.RunTimeout)
 		h.setLatestRunRevising(r.Context(), card.LatestRun, lr.ID) // issue #750
 	} else if !errors.Is(err, pgx.ErrNoRows) {

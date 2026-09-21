@@ -29,7 +29,7 @@ import type {
   SDKMessage,
   SpawnOptions,
 } from "@anthropic-ai/claude-agent-sdk";
-import type { Executor, ExecutorResult, RunContext } from "./executor.js";
+import type { Executor, ExecutorResult, RunContext, WallParkOutcome } from "./executor.js";
 import type { Logger } from "./log.js";
 import { buildCheckEnv, buildSdkEnv } from "./sdk-env.js";
 import type { DockerWiring } from "./docker-wiring.js";
@@ -1959,6 +1959,12 @@ export class SdkExecutor implements Executor {
       let completionStallStreak = 0;
       let lastCompletionFingerprint: string | undefined;
       let completionHeld: { reason: string } | undefined;
+      // PRD #1497 M2: latched when the run PARKED at its wall-clock limit (the capture-first wall
+      // park took, or its report was undeliverable so the flight ends non-terminal keeping the work,
+      // D17). Hoisted like completionHeld/pausedAt so it survives the `break` into the ExecutorResult;
+      // the runner reads it in phasePublish to SKIP finalize (the wall seam already parked the run or
+      // left it non-terminal, and the finally preserves clone + HOME).
+      let walled: { reason: string } | undefined;
       // Hoisted: `turn` is declared INSIDE the loop, so the return below cannot see
       // it and the terminating turn's declaration would be discarded by `break`.
       let declaredPrdPath: string | undefined;
@@ -2093,7 +2099,25 @@ export class SdkExecutor implements Executor {
               served?.completedCount ?? latestProgress?.completed.length ?? 0,
             total: frozenMilestones?.length,
           };
-          if (await this.requestPause(ctx, at)) {
+          // PRD #1497 M2: a `wall` pause takes the CAPTURE-FIRST wall park (D4), NOT handlePausePark.
+          // The sweep makes pauseRequested true for a `wall` request at once (M1), and a re-claim with
+          // pause_pending + pause_mode='wall' arrives here via seedPauseFallback — either way the
+          // pending mode reads `wall`. A post-attempt run never reaches here for a wall (the server's
+          // #1226 carve-out steers it to the completion hold via budgetExhausted below instead), so
+          // this pre-attempt boundary parks it at the wall.
+          if (ctx.pauseModeRequested?.() === "wall") {
+            const outcome = await this.parkForWall(ctx, at);
+            if (outcome === "parked" || outcome === "undeliverable") {
+              walled = { reason: REASON_WALL };
+              break;
+            }
+            if (outcome === "cancelled") throw new Error(REASON_CANCELLED);
+            // "refused": the owner extended in the window, so the run CONTINUES. Clear the sticky
+            // wall mode (else the next boundary re-routes here) and fall through to the turn; the
+            // wall lifts from the next reportIteration's served total. "undefined" (no seam wired —
+            // stub/test) also falls through, treating the wall as un-parkable (legacy behaviour).
+            if (outcome === "refused") ctx.clearWallMode?.();
+          } else if (await this.requestPause(ctx, at)) {
             pausedAt = at;
             break;
           }
@@ -2270,6 +2294,35 @@ export class SdkExecutor implements Executor {
                 served?.completedCount ?? latestProgress?.completed.length ?? 0,
               total: frozenMilestones?.length,
             };
+            // PRD #1497 M2: a `wall` pause (the sweep's system-authored wall-clock park) rides the
+            // SAME PauseNowSignal that drops the turn but carries no mode; branch on getPauseMode.
+            if (ctx.pauseModeRequested?.() === "wall") {
+              // D6/D14: the completion hold WINS the race. A `wall` pause arriving after the FIRST
+              // completion attempt routes to routeCompletionHold FIRST and never reaches the wall
+              // seam — the completion hold's server write (SetRunCompletionHold) settles both the
+              // wall columns and the wall input. routeCompletionHold returns true only when the hold
+              // was entered; false (no attempt yet, or the hold could not enter) falls through to the
+              // wall seam so the wall NEVER becomes a terminal failure (D2/D17).
+              if (
+                completionAttempted &&
+                (await this.routeCompletionHold(ctx, REASON_WALL, completionAttempted))
+              ) {
+                completionHeld = { reason: REASON_WALL };
+                break;
+              }
+              const outcome = await this.parkForWall(ctx, at);
+              if (outcome === "parked" || outcome === "undeliverable") {
+                walled = { reason: REASON_WALL };
+                break;
+              }
+              if (outcome === "cancelled") throw new Error(REASON_CANCELLED);
+              // "refused" (the owner extended) / "undefined" (no seam wired): the run CONTINUES.
+              // Clear the sticky wall mode on a refusal, then restart the aborted turn (the
+              // declined-`now` path below): the wall lifts from the next reportIteration's total.
+              if (outcome === "refused") ctx.clearWallMode?.();
+              state.tripReason = undefined;
+              continue;
+            }
             if (await this.requestPause(ctx, at)) {
               pausedAt = at;
               break;
@@ -2300,6 +2353,33 @@ export class SdkExecutor implements Executor {
           ) {
             completionHeld = { reason: err.message };
             break;
+          }
+          // PRD #1497 M2: a REASON_WALL trip that the completion-hold route above did NOT claim (a
+          // PRE-attempt wall — the worker's own wall timer fired before any completion attempt — or a
+          // post-attempt wall whose hold could not enter) takes the CAPTURE-FIRST wall park instead of
+          // the legacy terminal throw. This makes reportGenericFailure UNREACHABLE from a REASON_WALL
+          // trip in either case (D2/D17: no live run is failed by the wall). REASON_IDLE stays a
+          // legacy terminal failure (out of scope), so only REASON_WALL is routed here.
+          if (err instanceof Error && err.message === REASON_WALL) {
+            const at = {
+              completedCount:
+                served?.completedCount ?? latestProgress?.completed.length ?? 0,
+              total: frozenMilestones?.length,
+            };
+            const outcome = await this.parkForWall(ctx, at);
+            if (outcome === "parked" || outcome === "undeliverable") {
+              walled = { reason: REASON_WALL };
+              break;
+            }
+            if (outcome === "cancelled") throw new Error(REASON_CANCELLED);
+            // "refused" (extended in the window) / "undefined" (no seam wired — stub/test): the run
+            // CONTINUES. Clear any sticky wall mode and restart the turn; on the unwired stub path the
+            // fall-through below re-throws REASON_WALL, the legacy terminal, byte-identical to before.
+            if (outcome === "refused") {
+              ctx.clearWallMode?.();
+              state.tripReason = undefined;
+              continue;
+            }
           }
           throw err;
         }
@@ -2862,6 +2942,12 @@ export class SdkExecutor implements Executor {
       // it to SKIP finalization exactly like pausedAt. OMITTED (not undefined) on every normal
       // completion so the result shape is unchanged and existing deepStrictEqual assertions hold.
       if (completionHeld) result.completionHeld = completionHeld;
+      // PRD #1497 M2: forward the wall-park disposition. Set only when the run PARKED at its
+      // wall-clock limit (ctx.parkForWall returned "parked", or "undeliverable" so the flight ends
+      // non-terminal keeping the work, D17). phasePublish reads it to SKIP finalization exactly like
+      // pausedAt/completionHeld. NOT gated on isIssueRun (all six timed kinds park). OMITTED (not
+      // undefined) on every normal completion so existing deepStrictEqual assertions hold.
+      if (walled) result.walled = walled;
       // PRD #1247 M5b (data-integrity fix): forward the released-in-place disposition. Set only when a
       // held-state credential switch RELEASED the claim (ctx.attemptCredentialSwitch → "released")
       // from the implement loop, an ask_user question, or an interactive follow-up wait — the loop
@@ -3564,6 +3650,34 @@ export class SdkExecutor implements Executor {
       },
     });
     return (await ctx.parkForPause?.(at)) ?? false;
+  }
+
+  /**
+   * PRD #1497 M2: request the CAPTURE-FIRST wall park (D4). Emits the steer_ack that acknowledges
+   * the wall-clock limit (mirroring requestPause's steer_ack) and delegates the actual park to the
+   * runner's ctx.parkForWall — which reaps, captures a verified restore point via the SHARED
+   * captureHoldContext, reports the wall_park transition, and returns the outcome. Returns the seam's
+   * WallParkOutcome, or undefined when no seam is wired (the stub/test executors) so the caller can
+   * fall back to the legacy behaviour instead of treating an inert seam as a park.
+   */
+  private async parkForWall(
+    ctx: RunContext,
+    at: { completedCount: number; total?: number },
+  ): Promise<WallParkOutcome | undefined> {
+    ctx.emit({
+      kind: "steer_ack",
+      agent: "worker",
+      payload: {
+        text:
+          at.total !== undefined
+            ? `reached the time limit after ${at.completedCount}/${at.total} milestone(s); parking the run`
+            : "reached the time limit; parking the run",
+        directive: "pause",
+        completed: at.completedCount,
+        ...(at.total !== undefined ? { total: at.total } : {}),
+      },
+    });
+    return ctx.parkForWall ? await ctx.parkForWall(at) : undefined;
   }
 
   /**
