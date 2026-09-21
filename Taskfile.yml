@@ -293,6 +293,10 @@ tasks:
       # build-Go guard: no network and no real release binary. It protects the
       # archive-cache trust boundary and the go/toolchain compatibility seam.
       - task: test:golangci-wrapper
+      # Hermetic exit-code contract for the sqlc-drift gate (scripts/sqlc-drift-gate.sh):
+      # a fake `go` + throwaway repos, no real sqlc and no network, proving 2/1/0 fire so
+      # a gutted check cannot read green. The REAL drift check runs in gate:api, not here.
+      - task: test:sqlc-drift-gate
       # Hermetic extraction and ordered package-rule regression for the three
       # golangci aliases and the outer Go-toolchain group. No registry lookup.
       - task: test:renovate-go-toolchain
@@ -375,6 +379,15 @@ tasks:
       - task: fmt-check:api
       - task: vet:api
       - task: build:api
+      # sqlc drift AFTER build (the tree compiles) and BEFORE the -race test:api:
+      # cheapest-first + fail-fast, mirroring CI's validate-api sqlc step so a stale
+      # committed codegen is caught locally instead of on the first PR pipeline. The
+      # pinned sqlc version is read from ci.yml so local `go run` stays in lockstep
+      # with CI's release binary (scripts/sqlc-drift-gate.sh). NOT in gate:repo: it
+      # needs the Go toolchain + a warm module cache, unlike gate:repo's offline
+      # sub-second checks, and CI's lint-repo runs gate:repo (validate-api already
+      # runs this drift check), so gate:repo would only duplicate it at cold cost.
+      - task: check:sqlc-drift
       # lint AFTER build and BEFORE test, and the ordering is asymmetric with the
       # npm gates below on purpose (PRD #103 M3). AFTER build because
       # golangci-lint TYPE-CHECKS: on a tree that does not compile it reports
@@ -854,6 +867,11 @@ tasks:
     cmds:
       - ./scripts/golangci-lint.test.sh
 
+  test:sqlc-drift-gate:
+    desc: hermetic exit-code contract for the sqlc-drift gate (fake go, no real sqlc, no network)
+    cmds:
+      - ./scripts/sqlc-drift-gate.test.sh
+
   test:renovate-go-toolchain:
     desc: hermetic extraction and grouping contract for Go-toolchain Renovate updates
     cmds:
@@ -949,6 +967,17 @@ tasks:
       # exits 2 (instrument broken). The canary arg is explicit so this echo shows exactly what
       # is scanned; the sibling fixtures are found beside it. See the script header.
       - ./scripts/check-migration-additive.sh scripts/migration-additive-canary.sql api/internal/store/migrations
+
+  check:sqlc-drift:
+    desc: sqlc regeneration is a no-op (committed api/internal/store codegen matches its source)
+    cmds:
+      # The local mirror of CI's validate-api "sqlc drift" step (not offline: `go run`
+      # fetches sqlc on a cold module cache). Regenerates with the
+      # pinned sqlc (version read from .github/workflows/ci.yml, so local `go run` never
+      # drifts from CI's release binary) and fails if the committed codegen moved. Wired
+      # into gate:api. Exit 2 = sqlc could not run (never a silent green), 1 = drift,
+      # 0 = clean -- see the script header.
+      - ./scripts/sqlc-drift-gate.sh
 
   check:migration-numbering:
     desc: goose migration number prefixes are unique (whole-dir), with a canary proving the detector fired

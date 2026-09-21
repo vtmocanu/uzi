@@ -126,6 +126,7 @@ Compare("v0.11.8", "v0.14.0") = -1   IsValid true/true     <- what a fixture "na
 
 ## sqlc
 
+- `task check:sqlc-drift` (a member of `gate:api`) is the local mirror of CI's `validate-api` "sqlc drift" step (it is NOT offline: `go run` fetches sqlc on a cold module cache): it regenerates and fails when the committed `internal/store` codegen is stale, so an edited query or migration whose `*.sql.go` was never regenerated reddens locally instead of on the first PR pipeline. It reads the pinned sqlc version from `.github/workflows/ci.yml`, so the local `go run` cannot drift from CI's release binary. Exit 2 = sqlc could not run (never a silent green), 1 = drift, 0 = clean.
 - Cast any expression you intend to consume as a typed Go value; sqlc's inference is weaker on expressions than on columns. `(m.user_id IS NOT NULL)` types as `interface{}`, `(m.user_id IS NOT NULL)::boolean` gives a usable `bool`.
 - A green `sqlc generate` is not evidence the query runs; sqlc's type deduction is not Postgres's. A `CASE WHEN … THEN @observed_at ELSE NULL END` whose sibling arm is a bare `NULL` generated clean Go, passed `go build` and `go vet`, and drew `inconsistent types deduced for parameter $10` (SQLSTATE 42P08) at prepare time.
 - A new or edited query is not verified until a live-DB test has executed it. Never write "sqlc regenerated cleanly" in a report as though it were a measurement.
