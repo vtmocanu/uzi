@@ -338,6 +338,123 @@ describe("codex transport: notification decoding", () => {
     }
     await transport.close();
   });
+
+  it("decodes a well-formed provider ErrorNotification (method `error`) as a TYPED codex_error bound to the turn (PRD #1534)", async () => {
+    // The app-server emits an ErrorNotification — a JSON-RPC notification method `error` with
+    // camelCase params { error, willRetry, threadId, turnId }. Decode it as a typed codex_error
+    // so the harness (a later milestone) can bind it to the active turn, instead of discarding
+    // it as generic `activity`.
+    const { inbound, transport } = makePair();
+    const notes = transport.notifications();
+    writeFrame(inbound, {
+      method: "error",
+      params: { error: { message: "x", codexErrorInfo: "unauthorized" }, willRetry: false, threadId: "th-1", turnId: "tn-1" },
+    });
+    const v = (await notes.next()).value as CodexNotification;
+    assert.equal(v.kind, "codex_error");
+    assert.equal(v.kind === "codex_error" ? v.willRetry : undefined, false);
+    assert.equal(v.kind === "codex_error" ? v.threadId : undefined, "th-1");
+    assert.equal(v.kind === "codex_error" ? v.turnId : undefined, "tn-1");
+    await transport.close();
+  });
+
+  it("decodes an ErrorNotification with willRetry:true as codex_error (PRD #1534)", async () => {
+    const { inbound, transport } = makePair();
+    const notes = transport.notifications();
+    writeFrame(inbound, {
+      method: "error",
+      params: { error: { message: "transient" }, willRetry: true, threadId: "th-1", turnId: "tn-1" },
+    });
+    const v = (await notes.next()).value as CodexNotification;
+    assert.equal(v.kind, "codex_error");
+    assert.equal(v.kind === "codex_error" ? v.willRetry : undefined, true);
+    await transport.close();
+  });
+
+  it("an error frame with willRetry ABSENT falls to activity (fail-safe, PRD #1534)", async () => {
+    // A malformed/future-shaped error frame must degrade to liveness — willRetry is NOT
+    // defaulted to false — so the terminal turn.error fallback (a later milestone) covers it.
+    const { inbound, transport } = makePair();
+    const notes = transport.notifications();
+    writeFrame(inbound, {
+      method: "error",
+      params: { error: { message: "x" }, threadId: "th-1", turnId: "tn-1" },
+    });
+    const v = (await notes.next()).value as CodexNotification;
+    assert.equal(v.kind, "activity");
+    assert.equal(v.kind === "activity" ? v.method : undefined, "error");
+    await transport.close();
+  });
+
+  it("an error frame with a non-boolean willRetry falls to activity (fail-safe, PRD #1534)", async () => {
+    const { inbound, transport } = makePair();
+    const notes = transport.notifications();
+    writeFrame(inbound, {
+      method: "error",
+      params: { error: { message: "x" }, willRetry: "yes", threadId: "th-1", turnId: "tn-1" },
+    });
+    const v = (await notes.next()).value as CodexNotification;
+    assert.equal(v.kind, "activity");
+    assert.equal(v.kind === "activity" ? v.method : undefined, "error");
+    await transport.close();
+  });
+
+  it("an error frame missing turnId (or an empty turnId) falls to activity (fail-safe, PRD #1534)", async () => {
+    const { inbound, transport } = makePair();
+    const notes = transport.notifications();
+    // No turnId at all.
+    writeFrame(inbound, { method: "error", params: { error: { message: "x" }, willRetry: false, threadId: "th-1" } });
+    const v1 = (await notes.next()).value as CodexNotification;
+    assert.equal(v1.kind, "activity");
+    assert.equal(v1.kind === "activity" ? v1.method : undefined, "error");
+    // An empty-string turnId is also not a valid binding id.
+    writeFrame(inbound, {
+      method: "error",
+      params: { error: { message: "x" }, willRetry: false, threadId: "th-1", turnId: "" },
+    });
+    const v2 = (await notes.next()).value as CodexNotification;
+    assert.equal(v2.kind, "activity");
+    assert.equal(v2.kind === "activity" ? v2.method : undefined, "error");
+    await transport.close();
+  });
+
+  it("an error frame missing threadId (or an empty threadId) falls to activity (fail-safe, PRD #1534)", async () => {
+    const { inbound, transport } = makePair();
+    const notes = transport.notifications();
+    // No threadId at all — the other binding id is equally load-bearing.
+    writeFrame(inbound, { method: "error", params: { error: { message: "x" }, willRetry: false, turnId: "tn-1" } });
+    const v1 = (await notes.next()).value as CodexNotification;
+    assert.equal(v1.kind, "activity");
+    assert.equal(v1.kind === "activity" ? v1.method : undefined, "error");
+    // An empty-string threadId is also not a valid binding id.
+    writeFrame(inbound, {
+      method: "error",
+      params: { error: { message: "x" }, willRetry: false, threadId: "", turnId: "tn-1" },
+    });
+    const v2 = (await notes.next()).value as CodexNotification;
+    assert.equal(v2.kind, "activity");
+    assert.equal(v2.kind === "activity" ? v2.method : undefined, "error");
+    await transport.close();
+  });
+
+  it("a SERVER-REQUEST form of `error` (method + id) is NOT codex_error, it stays activity (PRD #1534)", async () => {
+    // The requestId === undefined guard: a frame with BOTH method `error` and an id is a
+    // server→client request, never a notification, so it must not decode as codex_error.
+    const { inbound, transport } = makePair();
+    const notes = transport.notifications();
+    writeFrame(inbound, {
+      id: 7,
+      method: "error",
+      params: { error: { message: "x" }, willRetry: false, threadId: "th-1", turnId: "tn-1" },
+    });
+    const v = (await notes.next()).value as CodexNotification;
+    assert.equal(v.kind, "activity");
+    if (v.kind === "activity") {
+      assert.equal(v.method, "error");
+      assert.equal(v.requestId, 7);
+    }
+    await transport.close();
+  });
 });
 
 describe("codex transport: server-request interceptor", () => {

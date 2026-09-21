@@ -843,6 +843,11 @@ export class CodexHarness implements RunHarness {
         // demux; on the event stream this is pure liveness (no frame, no items). A child's
         // token-usage note never reaches here (the demux routes it to the child sink first).
         return { kind: "activity", sessionId: note.threadId };
+      case "codex_error":
+        // PRD #1534: a fail-safe-decoded provider ErrorNotification. Bound to the active
+        // turn and folded into the terminal classification in a later milestone; here it is
+        // liveness only (byte-identical to today's fall-through to activity).
+        return { kind: "activity", sessionId: note.threadId };
       case "turn_completed": {
         // The harness serves ONLY the ACTIVE root turn. A terminal for a stale turn id or
         // a child/foreign thread is liveness ONLY — it must never latch `terminalEmitted`
