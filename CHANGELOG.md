@@ -51,6 +51,10 @@ through `[0.52.0]`.)
   An early-terminal run could pin a source commit that had not yet reached the trusted bare repository; the recovery bundle build then refused that commit and degraded, and terminal cleanup discarded the only clone holding it, leaving an open custody hold protecting nothing. The commit is now transferred into and verified in the trusted bare before the bundle is produced.
 - **A run that finishes during an API outage now reaches its terminal state after recovery without a worker restart ([#1391](https://github.com/vtmocanu/uzi/issues/1391), [#1501](https://github.com/vtmocanu/uzi/pull/1501)).**
   When terminal replay raced the run's own spilled-message drain, the resolver deferred behind `messages_pending` but nothing retried it after the drain, leaving finished work shown as running until the worker restarted and exposed to a false timeout. The worker now re-resolves the durable terminal journal as soon as that run's outbox retires, and outage tests wait on journal and send-failure events instead of runner-speed sleeps.
+- **CI-watch stops following a run's branch once its MR merges or closes, so dead branches no longer evict live MRs from the watch cap ([#1525](https://github.com/vtmocanu/uzi/pull/1525)).**
+  A run whose MR had already merged or closed kept its branch in the CI-watch set for the full run window, pushing still-open MRs past the per-repo watched-ref cap and inflating the CI-watch health warning; the eligibility queries now collapse each branch to its newest run before applying eligibility and confine the merged/closed exclusion to that terminal arm.
+- **The opt-in uid-split hosted worker no longer crash-loops on its Kubernetes join-token Secret ([#1523](https://github.com/vtmocanu/uzi/issues/1523), [#1526](https://github.com/vtmocanu/uzi/pull/1526)).**
+  The root-started uid-split entrypoint validated the read-only join-token Secret without dereferencing its atomic-writer symlink, so every real projected Secret failed the fail-closed posture check and the worker crash-looped; it now validates the dereferenced Secret target, while dangling, unreadable, or stat-failed tokens still fail closed and the compose path is unchanged.
 
 ### Changed
 
@@ -60,6 +64,8 @@ through `[0.52.0]`.)
   Reconstructed MR/PR web links now pick the forge's own path segment (GitHub `/pull/`, Forgejo `/pulls/`, GitLab `/-/merge_requests/`) instead of always building a GitLab path, so a run's PR chip links correctly on every forge.
 - **A run that reaches its wall-clock time limit now parks instead of failing ([#1497](https://github.com/vtmocanu/uzi/issues/1497), [#1504](https://github.com/vtmocanu/uzi/pull/1504)).**
   At its deadline a run no longer fails with `run exceeded RUN_TIMEOUT`; it parks (`paused`, `hold_reason: budget_exhausted`) on a pushed checkpoint where possible and asks its owner to extend, stop (finalize the finished milestones into a merge request, milestone issue runs only), or cancel it. The park never expires and is not configurable. Both the Claude and Codex harnesses park the same way, and a worker that cannot cooperate (dead, incapable, or unresponsive) has its run parked server-side instead.
+- **Usage and rate-limit surfaces render on one line consistently across the dashboard, sidebar meters, and TUI header ([#1519](https://github.com/vtmocanu/uzi/issues/1519), [#1529](https://github.com/vtmocanu/uzi/pull/1529)).**
+  The two dashboard usage cards use shorter "last 7d" detail copy so they align at normal width, the Codex sidebar meters share the Anthropic meters' grid track, and the TUI header shows a single "codex" provider tag and combines the Claude and Codex meter strips onto one line when the terminal is wide enough, falling back to a second line otherwise.
 
 ## [0.83.1] - 2026-09-19
 
