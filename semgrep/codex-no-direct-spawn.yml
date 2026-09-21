@@ -115,5 +115,9 @@ rules:
       include:
         - /agent/src/codex/codex-capability.ts
     patterns:
-      - pattern-regex: '(?ms)^[ \t]*import[ \t]*\{[^}]+\}[ \t\r\n]*from[ \t\r\n]*["''](?:node:)?child_process["''][ \t]*;?[ \t]*$'
+      # Keep selection structural so comments or newlines between JavaScript tokens cannot
+      # hide an unsafe import. Subtract only the exact sanctioned source spelling.
+      - pattern-either:
+          - pattern: import { ... } from "node:child_process"
+          - pattern: import { ... } from "child_process"
       - pattern-not-regex: '(?ms)^[ \t]*import[ \t]*\{[ \t\r\n]*spawnSync[ \t\r\n]*,[ \t\r\n]*type[ \t]+SpawnSyncReturns[ \t\r\n]*\}[ \t\r\n]*from[ \t\r\n]*["'']node:child_process["''][ \t]*;?[ \t]*$'
