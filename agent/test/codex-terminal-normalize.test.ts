@@ -7,6 +7,7 @@ import {
   normalizeCodexStatus,
   normalizeCodexTerminalErrors,
   normalizeCodexUsage,
+  pickCodexClassification,
 } from "../src/codex/terminal-normalize.js";
 
 // PRD #1171 (M3, milestone 3) — the pure provider-terminal normalizers. These bound and
@@ -265,5 +266,39 @@ describe("formatCodexClassification", () => {
       formatCodexClassification({ classification: "httpConnectionFailed", httpStatus: 503 }),
       "httpConnectionFailed; http 503",
     );
+  });
+});
+
+describe("pickCodexClassification", () => {
+  const recognized = { classification: "unauthorized", category: "authentication" } as const;
+  const unknown = { classification: "unknown", category: "unknown" } as const;
+  const terminalRecognized = { classification: "usageLimitExceeded", category: "rate_limit" } as const;
+
+  it("prefers a RECOGNIZED notification over a recognized terminal", () => {
+    assert.deepEqual(pickCodexClassification(recognized, terminalRecognized), recognized);
+  });
+
+  it("prefers the RECOGNIZED terminal when the notification collapsed to 'unknown' (precedence guard)", () => {
+    // A malformed notification's "unknown" must NOT mask a valid terminal turn.error.
+    assert.deepEqual(pickCodexClassification(unknown, terminalRecognized), terminalRecognized);
+  });
+
+  it("returns an 'unknown' when BOTH are unknown (neither recognized)", () => {
+    const other = { classification: "unknown", category: "transport" } as const;
+    assert.deepEqual(pickCodexClassification(unknown, other), unknown);
+  });
+
+  it("returns the notification when the terminal is undefined", () => {
+    assert.deepEqual(pickCodexClassification(recognized, undefined), recognized);
+    // Even an 'unknown' notification is surfaced when there is no terminal fallback.
+    assert.deepEqual(pickCodexClassification(unknown, undefined), unknown);
+  });
+
+  it("returns undefined when BOTH are undefined", () => {
+    assert.equal(pickCodexClassification(undefined, undefined), undefined);
+  });
+
+  it("returns the terminal when the notification is undefined", () => {
+    assert.deepEqual(pickCodexClassification(undefined, terminalRecognized), terminalRecognized);
   });
 });

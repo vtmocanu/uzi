@@ -14,6 +14,16 @@
 
 import type { HarnessErrorCategory, HarnessUsage } from "../harness.js";
 
+/** The CLOSED classification both harness lanes surface for a Codex terminal error: a
+ *  fixed `display` token (or the literal `"unknown"`), its harness `category`, and an
+ *  optional bounded `httpStatus`. Shared so the run decoder and the advice decoder cannot
+ *  diverge on the shape. Never carries raw provider text. */
+export interface CodexErrorClassification {
+  classification: string;
+  category: HarnessErrorCategory;
+  httpStatus?: number;
+}
+
 /** The CLOSED set of provider statuses we are willing to echo as a display `subtype`.
  *  Any status outside it collapses to the fixed token {@link UNKNOWN_STATUS}, so an
  *  arbitrary (or oversize/attacker-shaped) provider string never reaches a run message. */
@@ -126,9 +136,7 @@ const CODEX_ERROR_INFO_MAP: ReadonlyMap<string, CodexErrorInfoEntry> = new Map<s
  * `additionalDetails` / `misalignment` / `turnKind` / other raw value is ever read. Pure and
  * allocation-bounded (the own-key check never iterates an unbounded structure).
  */
-export function normalizeCodexErrorInfo(
-  raw: unknown,
-): { classification: string; category: HarnessErrorCategory; httpStatus?: number } | undefined {
+export function normalizeCodexErrorInfo(raw: unknown): CodexErrorClassification | undefined {
   if (raw == null) return undefined;
 
   // Scalar wire form: a bare lower-camel tag string. Echo only on a scalar-shaped map hit.
@@ -147,7 +155,7 @@ export function normalizeCodexErrorInfo(
     if (key !== undefined) {
       const entry = CODEX_ERROR_INFO_MAP.get(key);
       if (entry !== undefined && entry.shape === "tagged") {
-        const result: { classification: string; category: HarnessErrorCategory; httpStatus?: number } = {
+        const result: CodexErrorClassification = {
           classification: entry.display,
           category: entry.category,
         };
@@ -168,6 +176,18 @@ export function normalizeCodexErrorInfo(
 
   // Any other shape (array, number, boolean) — never echoed.
   return { classification: "unknown", category: "unknown" };
+}
+
+/** Choose the classification to surface: prefer a RECOGNIZED (non-"unknown") one — the
+ *  notification first, then the terminal turn.error fallback — else whichever exists
+ *  (an "unknown", or undefined when neither is present). */
+export function pickCodexClassification(
+  fromNotification: CodexErrorClassification | undefined,
+  fromTerminal: CodexErrorClassification | undefined,
+): CodexErrorClassification | undefined {
+  if (fromNotification !== undefined && fromNotification.classification !== "unknown") return fromNotification;
+  if (fromTerminal !== undefined && fromTerminal.classification !== "unknown") return fromTerminal;
+  return fromNotification ?? fromTerminal;
 }
 
 /**
