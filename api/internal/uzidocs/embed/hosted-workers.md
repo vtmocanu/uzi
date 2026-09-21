@@ -113,7 +113,7 @@ advice alike. Four things can hold a worker back:
   fleet onto Landlock-capable nodes, or, if running commands unconfined is
   acceptable, set the command sandbox to best-effort
   (`UZI_CODEX_COMMAND_SANDBOX`).
-- The Landlock probe fails outright — it could not run, or the kernel returned
+- The Landlock probe fails outright: it could not run, or the kernel returned
   an unexpected result. This is distinct from a clean "unavailable" and is
   fatal even in best-effort, so no knob re-enables Codex: check the node's
   kernel/Landlock support and that the command-sandbox binary is present on the
