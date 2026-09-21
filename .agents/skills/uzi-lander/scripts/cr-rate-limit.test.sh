@@ -29,10 +29,17 @@ if [ "${1:-}" = pr ] && [ "${2:-}" = comment ]; then
   done
   printf '%s\n' "$body" >> "$POSTED"
   asked=$(jq -nr 'now|todate')
-  replied=$(jq -nr 'now+2|todate')
-  jq -n --arg a "$asked" --arg r "$replied" --arg n "${RESET_MIN:-12}" '[
+  if [ "${AVAILABLE_NOW:-0}" = 1 ]; then
+    /bin/sleep 1
+    replied=$(jq -nr 'now|todate')
+    reply='Reviews are available now.'
+  else
+    replied=$(jq -nr 'now+2|todate')
+    reply="More reviews will be available in ${RESET_MIN:-12} minutes"
+  fi
+  jq -n --arg a "$asked" --arg r "$replied" --arg reply "$reply" '[
     {user:{login:"tester"},body:"@coderabbitai rate limit",created_at:$a,updated_at:$a},
-    {user:{login:"coderabbitai[bot]"},body:("More reviews will be available in " + $n + " minutes"),created_at:$r,updated_at:$r}
+    {user:{login:"coderabbitai[bot]"},body:$reply,created_at:$r,updated_at:$r}
   ]' > "$COMMENTS"
   if [ "${LATER_WALKTHROUGH:-0}" = 1 ]; then
     later=$(jq -nr 'now+4|todate')
@@ -52,6 +59,8 @@ if [ "${1:-}" = api ]; then
     *'/commits/'*'/status'*)
       if [ "$MODE" = query ]; then
         echo 'Review completed'
+      elif [ "$MODE" = available ]; then
+        echo 'Review rate limited'
       else
         n=0; [ -f "$STATUS_COUNT" ] && n=$(cat "$STATUS_COUNT")
         n=$((n + 1)); echo "$n" > "$STATUS_COUNT"
@@ -108,4 +117,16 @@ bash "$SCRIPT" test/repo 42 --query --wait --interval 0 --max-wait-min 1 > "$WOR
 grep -q '^CR_RESET_ELAPSED=1$' "$WORK/exact-wait.out" || fail "exact reset did not release the wait"
 if grep -q '^CR_RESUMED=1$' "$WORK/exact-wait.out"; then fail "stale status ended exact wait early"; fi
 
-echo "PASS cr-rate-limit: exact query, stale status, reset formatting"
+# "Reviews are available now" is an authoritative zero-minute reply, even with stale limited status.
+MODE="available"; AVAILABLE_NOW=1; export MODE AVAILABLE_NOW
+printf '[]\n' > "$COMMENTS"
+rm -f "$POSTED"
+set +e
+bash "$SCRIPT" test/repo 42 --query > "$WORK/available.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 0 ] || fail "available-now reply returned rc=$rc, want 0: $(cat "$WORK/available.out")"
+grep -q '^CR_LIMITED=0$' "$WORK/available.out" || fail "available-now reply left stale limited state"
+grep -q '^CR_RESET_ELAPSED=1$' "$WORK/available.out" || fail "available-now reply did not release the query"
+
+echo "PASS cr-rate-limit: exact query, available-now, stale status, reset formatting"

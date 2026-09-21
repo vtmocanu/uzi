@@ -4,9 +4,9 @@
 # CodeRabbit names the reset window in two places, and in neither on a bare re-trigger:
 #   1. the walkthrough/status comment it edits in place: a "rate limited by coderabbit.ai"
 #      block reading "Next included review available in N minutes" (free to read);
-#   2. its reply to the exact two-word command `@coderabbitai rate limit`: "More reviews
-#      will be available in N minutes" (costs one comment; `@coderabbitai ratelimits` and a
-#      plain-English question get a useless "I cannot view the quota" non-answer).
+#   2. its reply to the exact two-word command `@coderabbitai rate limit`: either "More
+#      reviews will be available in N minutes" or "Reviews are available now" (costs one
+#      comment; `@coderabbitai ratelimits` and plain-English questions get a non-answer).
 #   A `@coderabbitai review` while limited only replies "Review rate limited" with no time,
 #   and its commit status on the head reads "Review rate limited" with state=success.
 # Every "N minutes" is relative to the comment's own timestamp, so this script converts it
@@ -69,8 +69,8 @@ cr_status() {
 
 # Find the newest reset statement on the PR. Prints "<epoch-of-reset>\t<source>" or nothing.
 # Reads the issue comments once; considers (1) the rate-limited block in the comment CR
-# edits in place (base = its updated_at) and (2) the newest bot reply carrying "More reviews
-# will be available in N minutes" (base = its created_at). The later base wins.
+# edits in place (base = its updated_at) and (2) the newest bot reply carrying a countdown
+# or "Reviews are available now" (base = its created_at). The later base wins.
 reset_from_pr() {
   local comments best_ts="" best_base="" best_src="" b n ts base
   comments=$(gh api --paginate "repos/$REPO/issues/$PR/comments" 2>/dev/null | jq -s 'add // []') || return 1
@@ -86,11 +86,17 @@ reset_from_pr() {
     fi
   fi
   # (2) the newest `rate limit` reply. The statement with the LATER base timestamp wins
-  # (its "N minutes" is the fresher figure), not the later reset instant.
-  b=$(printf '%s' "$comments" | jq -r '[.[]|select(.user.login=="coderabbitai[bot]" and (.body|test("More reviews will be available in [0-9]+ minutes")))]|last|select(.!=null)|"\(.created_at)\t\(.body)"' 2>/dev/null)
+  # (its countdown or immediate availability is the fresher figure), not the later reset.
+  b=$(printf '%s' "$comments" | jq -r '[.[]|select(.user.login=="coderabbitai[bot]" and
+    ((.body // "")|test("More reviews will be available in [0-9]+ minutes|Reviews are available now")))]
+    |last|select(.!=null)|"\(.created_at)\t\(.body)"' 2>/dev/null)
   if [ -n "$b" ]; then
     ts=$(printf '%s' "$b" | head -1 | cut -f1)
-    n=$(printf '%s' "$b" | grep -oE 'More reviews will be available in [0-9]+ minutes' | tail -1 | grep -oE '[0-9]+' || true)
+    if printf '%s' "$b" | grep -qF 'Reviews are available now'; then
+      n=0
+    else
+      n=$(printf '%s' "$b" | grep -oE 'More reviews will be available in [0-9]+ minutes' | tail -1 | grep -oE '[0-9]+' || true)
+    fi
     if [ -n "$n" ] && [ -n "$ts" ] && base=$(iso2epoch "$ts") && [ -n "$base" ]; then
       if [ -z "$best_base" ] || [ "$base" -ge "$best_base" ]; then
         best_base=$base; best_ts=$(( base + n*60 )); best_src="reply"
@@ -109,11 +115,15 @@ reset_from_reply_after() {
   printf '%s' "$comments" | jq -e 'type=="array"' >/dev/null 2>&1 || return 1
   b=$(printf '%s' "$comments" | jq -r --arg a "$asked_at" \
     '[.[]|select(.user.login=="coderabbitai[bot]" and .created_at>$a
-                 and ((.body // "")|test("More reviews will be available in [0-9]+ minutes")))]
+                 and ((.body // "")|test("More reviews will be available in [0-9]+ minutes|Reviews are available now")))]
      |last|select(.!=null)|"\(.created_at)\t\(.body)"' 2>/dev/null)
   [ -n "$b" ] || return 0
   ts=$(printf '%s' "$b" | head -1 | cut -f1)
-  n=$(printf '%s' "$b" | grep -oE 'More reviews will be available in [0-9]+ minutes' | tail -1 | grep -oE '[0-9]+' || true)
+  if printf '%s' "$b" | grep -qF 'Reviews are available now'; then
+    n=0
+  else
+    n=$(printf '%s' "$b" | grep -oE 'More reviews will be available in [0-9]+ minutes' | tail -1 | grep -oE '[0-9]+' || true)
+  fi
   if [ -n "$n" ] && [ -n "$ts" ] && base=$(iso2epoch "$ts") && [ -n "$base" ]; then
     printf '%s\treply\n' "$(( base + n*60 ))"
   fi
@@ -162,7 +172,9 @@ if { [ "$QUERY" -eq 1 ] || [ -z "$reset_ts" ]; } && [ "$ASK" -eq 1 ]; then
   pending_ask=$(printf '%s' "$comments_now" | jq -r '
     ([.[]|select(((.user.login|test("\\[bot\\]$"))|not) and ((.body|gsub("^\\s+|\\s+$";""))=="@coderabbitai rate limit"))]|last) as $a
     | if $a==null then "" else
-        ([.[]|select(.user.login=="coderabbitai[bot]" and (.body|test("More reviews will be available")) and .created_at > $a.created_at)]|length) as $replied
+        ([.[]|select(.user.login=="coderabbitai[bot]" and
+          (.body|test("More reviews will be available|Reviews are available now")) and
+          .created_at > $a.created_at)]|length) as $replied
         | if $replied>0 then "" else $a.created_at end end' 2>/dev/null) || { echo "cannot parse the PR comments; not posting" >&2; exit 3; }
   if [ -n "$pending_ask" ] && [ $(( $(date +%s) - $(iso2epoch "$pending_ask") )) -lt 600 ]; then
     asked_at="$pending_ask"; echo "ASK_IN_FLIGHT_SINCE=$asked_at (not posting again)"
@@ -182,7 +194,10 @@ if { [ "$QUERY" -eq 1 ] || [ -z "$reset_ts" ]; } && [ "$ASK" -eq 1 ]; then
   done
 fi
 
-[ -n "$reset_ts" ] && [ "$reset_ts" -gt "$(date +%s)" ] && status_limited=1
+if [ -n "$reset_ts" ]; then
+  status_limited=0
+  [ "$reset_ts" -gt "$(date +%s)" ] && status_limited=1
+fi
 echo "CR_LIMITED=$status_limited"
 report "$reset_ts" "${src:-}"
 

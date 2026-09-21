@@ -122,8 +122,10 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    - **Rate-limited (exit 5).** Tell the user in one line with the default wait and the
      local alternative. When quota timing matters, run
      `S/cr-rate-limit.sh OWNER/REPO PR --query --wait`: the exact two-word query is
-     authoritative; never infer a reset from review timestamps or a nominal hourly rate.
-     On exit 0 with no user override, post `@coderabbitai review` once and return to step 2.
+     authoritative; its reply is either a countdown or "Reviews are available now," which
+     the script treats as an immediate reset. Never infer a reset from review timestamps or
+     a nominal hourly rate. On exit 0 with no user override, post `@coderabbitai review` once
+     and return to step 2.
      On `greptile`, post `@greptileai review`, then use `--reviewer greptile
      --reviewer-grace 2`; on `local`, dispatch a local reviewer and use `--reviewer none`.
    - **Full review offered (exit 7).** CodeRabbit answered the normal trigger with
