@@ -1,6 +1,6 @@
 ---
 name: uzi-watcher
-description: "Dispatches one or more uzi PRD issues in Auto mode on this GitHub-hosted repo and steers each to an approved plan: makes the issue eligible, creates the gated run, reviews, revises or approves the plan (plan-trap checks for workflow-file edits and cookie-only routes), then hands the running run to uzi-lander, which lands its PR. Owns uzi's workflow-scope guardrail (the worker PAT cannot push .github/workflows changes), proactive backups of in-flight run work from hosted worker PVCs (scripts/backup-runs.sh, scripts/backup-loop.sh), and recovery of a lost, push-rejected or secret-blocked run's commits plus uncommitted work. Use when the user says send or ship an issue to uzi, watch a uzi run to its plan gate, steer a plan, run several uzi runs in parallel, back up the runs, or recover a lost run's work. Triggers include send it to uzi, uzi auto mode, uzi watcher, back up the runs, snapshot in-flight work, recover a lost run, recover a run's work from the worker PVC."
+description: "Dispatches one or more uzi PRD issues in Auto mode on this GitHub-hosted repo and steers each to an approved plan: makes the issue eligible, creates the gated run, reviews, revises or approves the plan (plan-trap checks, e.g. workflow edits, cookie-only routes, gate mechanics), then hands the running run to uzi-lander, which lands its PR. Owns uzi's workflow-scope guardrail (the worker PAT cannot push .github/workflows changes), proactive backups of in-flight run work from hosted worker PVCs (scripts/backup-runs.sh, scripts/backup-loop.sh), and recovery of a lost, push-rejected or secret-blocked run's commits plus uncommitted work. Use when the user says send or ship an issue to uzi, watch a uzi run to its plan gate, steer a plan, run several uzi runs in parallel, back up the runs, or recover a lost run's work. Triggers include send it to uzi, uzi auto mode, uzi watcher, back up the runs, snapshot in-flight work, recover a lost run, recover a run's work from the worker PVC."
 ---
 
 # uzi watcher — send PRD issues to uzi and steer them to an approved plan
@@ -80,7 +80,10 @@ Below, a run id is written `RUN` and a PR number `PR` in the example commands.
    uzi run logs RUN --json | jq -r 'select(.kind=="plan") | .payload.plan_md'
    ```
 
-   Judge it as you would any plan, and run the **plan-trap checks** below. Sound plan →
+   Judge it as you would any plan, and run the **plan-trap checks** below. Before approving a
+   higher-risk or multi-component plan, ask an available peer session for a second opinion
+   (the `session-peers` skill); it supplements the plan-trap checks, it does not replace them.
+   Sound plan →
    `uzi run approve`. Salvageable but wrong in places → `uzi run revise` with a `-m`
    message naming the precise change (re-plans without ending the run; then watch for the
    gate again). Not sound → `uzi run reject` with a `-m` reason, then stop.
@@ -137,8 +140,7 @@ revised plan at the next gate to confirm your instruction landed clean.
 
 ## Plan-trap checks (run before every approve)
 
-Two traps have shipped from real runs here; both pass a naive read and fail only at
-runtime or push:
+Check these traps before every approve:
 
 - **Workflow-file edits.** grep the plan for `.github/workflows`. Any edit there means the
   run **will fail at push** (see *The workflow-scope guardrail*). `revise` the plan so the
@@ -153,7 +155,20 @@ runtime or push:
   differential-auth test — a `FakeClient` test bypasses the real router and cannot catch
   the mis-mount.
 
-Both are worth a `revise`, not a reject — the rest of a good plan stays.
+- **A gate step that inlines gate mechanics** — in the lead's plan, or in a `revise` you
+  write. Keep any gate instruction high-level: have the worker run the component's canonical
+  `task gate:*` recipe exactly as its rule file documents, not prepended env vars or
+  infrastructure setup. Inlining gate internals can contradict that rule — telling `gate:api`
+  to set `UZI_TEST_DATABASE_URL` or provision Postgres makes its LiveDB package binaries race
+  one shared database and redden the gate. Run `gate:api` with `UZI_TEST_DATABASE_URL` UNSET
+  (its LiveDB tests then skip cleanly) and run LiveDB separately via `./e2e/run-store-it.sh`
+  only when needed (`.claude/rules/go.md`).
+- **A plan that contradicts its own PRD.** Pause and identify the conflicting clauses. Ask
+  the user which takes precedence, then `revise` the plan and require the PRD correction in
+  the same branch before approval.
+
+Each is a `revise` (or, for a genuine plan/PRD conflict, a question to the user), not a
+reject — the rest of a good plan stays.
 
 ## The workflow-scope guardrail (the big one)
 
