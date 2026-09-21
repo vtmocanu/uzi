@@ -1399,7 +1399,7 @@ rationale.
   the `is_admin` gate filters the index/routing/search, not what is downloaded.
 - **Link rewriting.** A relative link to another in-app-routable page becomes an
   in-app route (`/docs/:slug`) — `user` pages for everyone, `operator` pages for
-  admins (`rewriteHref(href, isAdmin)`); a link to a repo-only file (`../plan.md`,
+  admins (`rewriteHref(href, isAdmin)`); a link to a repo-only file (`../CONTRIBUTING.md`,
   a `design`/`contributor` doc) rewrites to the pinned GitHub blob URL instead
   (`REPO_BLOB_BASE`, `web/src/lib/docs.ts`). `#anchor` fragments are preserved
   either way.
