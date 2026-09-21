@@ -55,6 +55,8 @@ through `[0.52.0]`.)
   A run whose MR had already merged or closed kept its branch in the CI-watch set for the full run window, pushing still-open MRs past the per-repo watched-ref cap and inflating the CI-watch health warning; the eligibility queries now collapse each branch to its newest run before applying eligibility and confine the merged/closed exclusion to that terminal arm.
 - **The opt-in uid-split hosted worker no longer crash-loops on its Kubernetes join-token Secret ([#1523](https://github.com/vtmocanu/uzi/issues/1523), [#1526](https://github.com/vtmocanu/uzi/pull/1526)).**
   The root-started uid-split entrypoint validated the read-only join-token Secret without dereferencing its atomic-writer symlink, so every real projected Secret failed the fail-closed posture check and the worker crash-looped; it now validates the dereferenced Secret target, while dangling, unreadable, or stat-failed tokens still fail closed and the compose path is unchanged.
+- **A first-turn Codex failure no longer leaks an open `source_only` custody hold ([#1531](https://github.com/vtmocanu/uzi/issues/1531)).**
+  When a Codex run failed on its first turn, the generic-failure path reported the terminal `failed` state before reaping the provider, so the reap's per-sink credential reconcile ran against an already-terminal run and the API refused it (409), blocking the reap and leaving the custody hold open; the failure path now reaps the Codex provider while the run is still actively claimed and performs the exact custody settlement (release, capture, or retain) after recording the terminal failure.
 
 ### Changed
 
