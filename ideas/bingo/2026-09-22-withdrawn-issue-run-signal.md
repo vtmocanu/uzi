@@ -99,7 +99,7 @@ withdrawal.
   forge-unreachable early returns. It costs nothing on the wire, exactly as the two
   close-edge passes above.
 - **One query modelled on `ListFindingIssueCloseEdges`** (`-- name:` at
-  `finding_issue_close.sql:6`; body `:7-39`): keep its join-key warning (join on
+  `finding_issue_close.sql:6`; comment `:7-27`, statement `:28-40`): keep its join-key warning (join on
   `(repo_id, forge_issue_iid)`, never iid alone, `:10-13`), its EDGE rationale (`:20-21`)
   and its reopen-not-handled note (`:22-23`). Working set: `kind = 'issue'` runs with
   `status NOT IN ('completed','failed','cancelled')` and a new `runs.issue_withdrawn_at
@@ -173,14 +173,15 @@ State explicitly (a blocking review finding on the plan's first draft) that
 `CancelRunServerSide` at `:53`), and every fenced path to `paused` is worker- or
 owner-scoped — `SetRunPaused` (`api/internal/store/queries/runtime.sql:2288`; its `WHERE
 id = @id AND worker_id = @worker_id AND status = 'running' AND pause_requested_at IS NOT
-NULL`, and it writes no `hold_reason`). The only server-side SWEEPER park is
+NULL … AND pause_mode IN ('milestone', 'now')`, `:2328-2335`, and its `SET` list writes no
+`hold_reason`). The only server-side SWEEPER park is
 `ParkRunsAtWall` (`runtime.sql:3645`, PRD #1497 M1) with claim-fence / custody /
 codex-cap bookkeeping this idea does not want to clone. So **M2 parks NOTHING
 server-side**: for a `running` run it requests a pause exactly as the owner would —
 `api/internal/workersvc/submit.go:232` (`if kind == "pause" {`) then `:240`
 (`CreatePauseInput`), whose comment (`:225-228`) writes the pending-pause columns + audit
 row in one statement and LEAVES the run running; the worker parks at its boundary. Mode
-`milestone` by default, `now` selectable (`docs/run-pause.md:9-12`, `:24-26`;
+`milestone` by default, `now` selectable (`docs/run-pause.md:19-23`, `:24-26`;
 `run_user_inputs.kind` enum at `00219_run_budget_extension.sql:34`; the HTTP allowlist at
 `api/internal/handler/runs_lifecycle.go:32`; resume is `/resume-now`). Any other
 non-terminal status (queued, awaiting_approval, pool_wait, paused) spends nothing, so the
@@ -224,13 +225,15 @@ drivers (no new API call), `main`.
 - **No `mr_state = 'merged'` exclusion.** `mr_state` is written only for completed runs
   (`forge.sql:614`, `WHERE l.status = 'completed'`), so for the non-terminal set this pass
   targets it is inert. The pass must not gate on it.
-- **Latency asymmetry.** A close on the forge is seen on the next incremental poll (its
-  `updated_at` bumps); de-labelling and deletion only within one full reconcile
-  (`docs/configuration.md:134`). Note that `docs/board.md:307` groups closing with
+- **Latency asymmetry.** For a uzi-labelled issue, a close on the forge is seen on the
+  next incremental poll (its `updated_at` bumps); de-labelling and deletion only within one
+  full reconcile (`docs/configuration.md:134`). A bot-assigned-only issue that is closed is
+  in none of the incremental fetches (uzi-labelled, open, finding-labelled), so its close
+  surfaces at the next full reconcile as `evicted`, not `closed`. Note that `docs/board.md:307` groups closing with
   de-labeling and deleting under "one (less / frequent) reconcile pass", so the two docs
   disagree about closing — fix `board.md` in passing.
 - **One run per issue.** `uq_runs_one_active_per_issue`
-  (`00170_run_pool_wait.sql:35-37`, which excludes `pool_wait` — see its rationale at
+  (`00170_run_pool_wait.sql:34-37`, which excludes `pool_wait` — see its rationale at
   `:24-29`) PLUS the Go pre-check `HasActiveRunForIssue`
   (`api/internal/workersvc/service.go:5337-5346`, query `autopilot.sql:96-102`), so one
   withdrawal edge maps to at most one run.
@@ -262,7 +265,7 @@ Commands re-run at `a10da71b`:
 |---|---|---|
 | Marker name is unused | `git grep -n -i -F 'issue_withdrawn' -- .` | Empty (rc 1) |
 | No issue-close→cancel already | `git grep -n -i -E 'CancelRunForIssue\|cancel.*issue.*closed\|issue.*closed.*cancel' -- api/ agent/src` | Empty (rc 1) |
-| Prior withdrawal/de-label prose | `git grep -n -i -E 'withdrawn\|eligibility revoked\|de-?label' -- prds/ ideas/ adr/ docs/ specs/human.md` | Only adjacents: `docs/board.md:307`, `docs/configuration.md:134` (de-label/close/delete latency), `prds/done/19:31` (autopilot label), plus unrelated `withdrawn` in `adr/1190`/`adr/0216`; the `de-node-label` HTML hits in `docs/diagrams/` are noise |
+| Prior withdrawal/de-label prose | `git grep -n -i -E 'withdrawn\|eligibility revoked\|de-?label' -- prds/ ideas/ adr/ docs/ specs/human.md` | 85 `de-node-label` HTML hits in `docs/diagrams/` (noise) plus 31 hits in 16 files, all incidental: the two latency docs (`docs/board.md:307`, `docs/configuration.md:134`); cache-eviction/reconcile prose (`prds/done/2-forge-integration-kanban.md:130,133,170,179,185,196`, `prds/done/4-agent-runtime-workers.md:96`, `prds/done/527-mr-merged-state-recording.md:53,118,149`, `prds/done/98-judge-menu.md:729`); "withdrawn" meaning a retracted bullet or a withdrawn pause request (`prds/done/224-worker-ephemeral-storage.md:96,249,260,1153,2945`, `prds/done/65-forgejo-support.md:502,1194`, `prds/done/98-judge-menu.md:512`, `adr/0216-fleet-aware-claim.md:45`, `adr/1190-run-pause-invariants.md:69,71`, `prds/1190-run-pause-resume.md:58`, `prds/mockups/run-budget-extend-pause-mock.html:472`); label-word coincidences such as `decodeLabels` (`prds/done/22-prdless-label.md:98`, `prds/done/982-api-contract-fixtures.md:221,371`, `prds/done/1208-web-ux-polish.md:32`, `prds/1296-durable-run-recovery.md:207`). None proposes a live run reacting to its issue's withdrawal |
 | A forge-observation stop function | `git grep -n -E '^func .*\) (Cancel\|Supersede\|Abort\|Halt)[A-Za-z]*\(' -- api/ \| grep -v _test` | Only `CancelReworkForMR` keys on a forge observation, and on an MR — not an issue |
 | Close-edge query passes | `grep -rn '^-- name:' api/internal/store/queries/ \| grep -i -E 'close\|reopen\|withdraw\|label'` | The two close-edge passes (`ListFindingIssueCloseEdges`, judge twin) settle dispositions, never a run |
 | Any withdrawal/completion notification kind | `git grep -n -P 'Kind:\s+"' -- api/internal \| grep -v _test` | Kinds are `ci_autofix_*`, `mr_rework_halted`, `run_failed`, `schedule_error` (+ const-declared siblings); the `completion_decision`/`follow_up` hits are run-input kinds, not notifications — no withdrawal or completion kind |
