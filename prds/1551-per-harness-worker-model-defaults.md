@@ -1,9 +1,13 @@
 # PRD #1551: Per-harness worker model defaults
 
-**Issue:** [#1551](https://github.com/vtmocanu/uzi/issues/1551)  
-**Status:** Draft, ready for review. Not queued or dispatched to uzi.  
-**Priority:** Medium  
-**Related:** [PRD #1106](1106-codex-harness-phase1.md), completed public activation [PRD #1429](done/1429-codex-public-activation.md), judge-model follow-up [#1454](https://github.com/vtmocanu/uzi/issues/1454).  
+**Issue:** [#1551](https://github.com/vtmocanu/uzi/issues/1551)
+
+**Status:** Reviewed by two independent lenses and committed for later implementation. Not queued or dispatched to uzi.
+
+**Priority:** Medium
+
+**Related:** [PRD #1106](1106-codex-harness-phase1.md), completed public activation [PRD #1429](done/1429-codex-public-activation.md), judge-model follow-up [#1454](https://github.com/vtmocanu/uzi/issues/1454).
+
 **Reviewed UI direction:** [interactive grouped-settings mock](mockups/1551-per-harness-model-defaults.html).
 
 Use current `main` and a short-lived worktree. Never switch the `main/` worktree away from `main`. This PRD changes no workflow file.
@@ -241,3 +245,7 @@ M1 to M3 touch separate primary files and can run concurrently. M3 may code agai
 | 2026-09-22 | Add two explicit lane columns and retain the legacy column for one compatibility release | It is additive, keeps upgrade/rollback data, and follows the established appearance-settings expansion pattern |
 | 2026-09-22 | Keep custom Codex narrow to the root user default | Schedule and role-pin values lack equivalent provider provenance and need a separate design |
 | 2026-09-22 | Require `codex_custom_model_v1` for custom worker-root execution | A mixed hosted fleet must never silently substitute Astra on an old renderer |
+
+## Review record
+
+- 2026-09-22: Two independent reviews covered architecture/data/API/runtime compatibility and product/UX/testability. Their findings were folded in before handoff: rollback-safe explicit lane storage, the zero-credential state, stale-client routing, custom-model worker capability gating, advice-source provenance, accurate subscription/API-key cost semantics, literal-Claude Chat preservation, provider-specific custom-field copy, `docs/worker-effort.md`, and hosted-k8s acceptance.
