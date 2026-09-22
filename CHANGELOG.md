@@ -22,11 +22,6 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
-### Fixed
-
-- **A failed Codex run now shows why it failed instead of a bare `codex turn failed: failed` ([#1534](https://github.com/vtmocanu/uzi/issues/1534)).**
-  A failed Codex turn now surfaces a normalized, closed error classification (and a bounded HTTP status where the provider reports one) in the run feed and the run's failure reason, on both the run and advice lanes, decoded from the provider's final non-retrying `error` notification with the terminal `turn.error` as a fallback, so an owner can tell an auth-refresh failure from a rate limit or a context-window overflow instead of seeing only `codex turn failed: failed`; the raw, possibly secret-bearing provider message is never retained.
-
 ## [0.84.0] - 2026-09-20
 
 ### Added
@@ -62,6 +57,14 @@ through `[0.52.0]`.)
   The root-started uid-split entrypoint validated the read-only join-token Secret without dereferencing its atomic-writer symlink, so every real projected Secret failed the fail-closed posture check and the worker crash-looped; it now validates the dereferenced Secret target, while dangling, unreadable, or stat-failed tokens still fail closed and the compose path is unchanged.
 - **A first-turn Codex failure no longer leaks an open `source_only` custody hold ([#1531](https://github.com/vtmocanu/uzi/issues/1531)).**
   When a Codex run failed on its first turn, the generic-failure path reported the terminal `failed` state before reaping the provider, so the reap's per-sink credential reconcile ran against an already-terminal run and the API refused it (409), blocking the reap and leaving the custody hold open; the failure path now reaps the Codex provider while the run is still actively claimed and performs the exact custody settlement (release, capture, or retain) after recording the terminal failure.
+- **A failed Codex run now shows why it failed instead of a bare `codex turn failed: failed` ([#1534](https://github.com/vtmocanu/uzi/issues/1534)).**
+  A failed Codex turn now surfaces a normalized, closed error classification (and a bounded HTTP status where the provider reports one) in the run feed and the run's failure reason, on both the run and advice lanes, decoded from the provider's final non-retrying `error` notification with the terminal `turn.error` as a fallback, so an owner can tell an auth-refresh failure from a rate limit or a context-window overflow instead of seeing only `codex turn failed: failed`; the raw, possibly secret-bearing provider message is never retained.
+- **A Codex plan turn no longer comes back empty when the selected model is code-mode-only ([#1533](https://github.com/vtmocanu/uzi/issues/1533), [#1541](https://github.com/vtmocanu/uzi/pull/1541)).**
+  Run-mode Codex sessions now provision a code-mode execution host (with nested execution callbacks and authorized shell commands) so a catalog model marked code-mode-only can actually produce a plan, and session model selection now honors the server-provided default model with a provider fallback when none is specified; advice and standard sessions keep code-mode execution disabled and the run-mode host is isolated and cleaned up when the session ends.
+- **A wedged Codex subscription refresh can now recover on its own ([#1532](https://github.com/vtmocanu/uzi/issues/1532), [#1538](https://github.com/vtmocanu/uzi/pull/1538)).**
+  The recovery survivor pass that unwedges a stuck Codex account subscription refresh never ran in production, so an account could stay permanently wedged; the pass now runs, letting a stuck refresh recover without manual intervention.
+- **The two Dashboard usage cards keep their FAILED RUNS bands aligned ([#1535](https://github.com/vtmocanu/uzi/issues/1535), [#1536](https://github.com/vtmocanu/uzi/pull/1536)).**
+  The failed-run band now stays anchored to the bottom of each usage card so the two cards line up, the duplicated exclusion note is dropped when the lifetime and recent-period text is identical (and kept when they differ), and the redundant "see per-run detail" link is removed from the recent usage line.
 
 ### Changed
 
