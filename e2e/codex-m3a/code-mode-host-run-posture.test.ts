@@ -327,12 +327,39 @@ test("production launcher advice posture: code_mode_host=false launches NO code-
   transport = createCodexTransport({ inbound: handle.transport.stdout as Readable, outbound: handle.transport.stdin as Writable });
   const rpc = new RootRpc(transport, hold);
   await rpc.initialize(credential);
+
+  // Observe the disabled posture across the FULL turn lifetime, not only after it settles: a
+  // code-mode host that briefly appeared DURING the active turn and exited before the post-turn
+  // snapshot would otherwise slip past. `handle.snapshot` is id-multiplexed over the supervisor
+  // control channel (launcher.ts), disjoint from the app-server transport, so sampling
+  // concurrently with the turn is race-safe. (`outcome.event.reaped` below is the disposal-drain
+  // ledger, not a run-lifetime process record — hence this separate lifetime observation.)
+  let sawCodeModeHost = false;
+  let samples = 0;
+  let turnSettled = false;
+  const sampler = (async (): Promise<void> => {
+    while (!turnSettled) {
+      try {
+        const live = (await handle!.snapshot(20_000)).processes as readonly Row[];
+        samples += 1;
+        if (live.some((p) => p.comm.includes("code-mode"))) sawCodeModeHost = true;
+      } catch {
+        return; // the supervisor is gone (post-dispose); stop sampling
+      }
+      await new Promise((r) => setTimeout(r, 20));
+    }
+  })();
+
   await rpc.startThreadAndTurn(cwd);
 
   // The exec cell fails "code-mode host is disabled" and the turn completes with NO callback.
   await waitFor(() => rpc.turnStatus !== undefined, "turn completion");
+  turnSettled = true;
+  await sampler;
+  t.diagnostic(JSON.stringify({ posture: "off", lifetimeSamples: samples, sawCodeModeHost }));
   assert.equal(rpc.turnStatus, "completed", "the turn completes cleanly with the host disabled");
   assert.equal(rpc.callbackStarted, false, "no worker callback fired with the host disabled");
+  assert.equal(sawCodeModeHost, false, `no code-mode host appeared at any point during the disabled turn (lifetimeSamples=${samples})`);
 
   const snap = await handle.snapshot(20_000);
   const processes = snap.processes as readonly Row[];
