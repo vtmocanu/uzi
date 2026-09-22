@@ -28,7 +28,7 @@ set -eu
 # succeeds with filesystem-formatted text and therefore is not a portable feature probe.
 if [ "${1:-}" = -c ]; then
   last="${!#}"
-  case "$last" in *'#stale.trail') echo 946684800;; *) date +%s;; esac
+  if [ "$(uname -s)" = Darwin ]; then /usr/bin/stat -f %m "$last"; else /usr/bin/stat -c %Y "$last"; fi
   exit 0
 fi
 if [ "${1:-}" = -f ]; then
@@ -122,6 +122,18 @@ bash "$HERE/claims.sh" reap > "$WORK/reap-merged.out"
 [ -e "$TR/#42.trail" ] || fail "reap deleted the merged PR trail before post-merge CI"
 grep -q 'reaped #42 (PR MERGED; trail preserved)' "$WORK/reap-merged.out" \
   || fail "reap did not report terminal claim-only cleanup: $(cat "$WORK/reap-merged.out")"
+bash "$HERE/claims.sh" release '#42' --purge > /dev/null
+
+# A terminal claim can carry a trail older than the orphan TTL after a long review wait.
+# Terminal cleanup refreshes its mtime, so neither that reap nor the next immediate reap
+# can delete the history before post-merge CI appends its result.
+seed_state
+touch -t 200001010000 "$TR/#42.trail"
+bash "$HERE/claims.sh" reap > "$WORK/reap-stale-terminal.out"
+[ ! -e "$CL/#42.json" ] || fail "reap left the stale terminal claim on the live board"
+[ -e "$TR/#42.trail" ] || fail "terminal reap deleted an old trail instead of refreshing it"
+bash "$HERE/claims.sh" reap > "$WORK/reap-stale-terminal-again.out"
+[ -e "$TR/#42.trail" ] || fail "the next immediate reap deleted the refreshed terminal trail"
 bash "$HERE/claims.sh" release '#42' --purge > /dev/null
 
 # 2. state=MERGED but mergeCommit not populated yet (GitHub lag) → re-read recovers the oid.

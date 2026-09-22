@@ -145,7 +145,7 @@ if [ -n "$SD" ]; then
   me=$(self_identity 2>/dev/null); my_uuid=$(printf '%s' "$me" | cut -f2); my_name=$(printf '%s' "$me" | cut -f1)
   if ! mkdir "$LOCK" 2>/dev/null; then
     o_uuid=$(cat "$LOCK/uuid" 2>/dev/null || echo ""); o_name=$(cat "$LOCK/name" 2>/dev/null || echo "?")
-    age=$(( $(date +%s) - $(stat -f %m "$LOCK" 2>/dev/null || stat -c %Y "$LOCK" 2>/dev/null || date +%s) ))
+    age=$(( $(date +%s) - $(stat -c %Y "$LOCK" 2>/dev/null || stat -f %m "$LOCK" 2>/dev/null || date +%s) ))
     # Break the lock when it is ours, older than the TTL, or its owner is provably dead
     # (is_live rc 1; rc 2 = registry unknown keeps it, the TTL covers that case).
     dead=0

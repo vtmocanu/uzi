@@ -13,6 +13,23 @@ cat > "$WORK/bin/sleep" <<'STUB'
 #!/usr/bin/env bash
 exit 0
 STUB
+cat > "$WORK/bin/stat" <<'STUB'
+#!/usr/bin/env bash
+set -eu
+# Model GNU stat: `-c %Y` returns a numeric mtime, while BSD-first `-f %m` succeeds
+# with filesystem text and is therefore not a portable feature probe.
+if [ "${1:-}" = -c ]; then
+  last="${!#}"
+  if [ "$(uname -s)" = Darwin ]; then /usr/bin/stat -f %m "$last"; else /usr/bin/stat -c %Y "$last"; fi
+  exit 0
+fi
+if [ "${1:-}" = -f ]; then
+  echo '  File: "%m"'
+  echo '    ID: deadbeef Namelen: 255 Type: ext2/ext3'
+  exit 0
+fi
+exec /usr/bin/stat "$@"
+STUB
 cat > "$WORK/bin/gh" <<'STUB'
 #!/usr/bin/env bash
 set -eu
@@ -99,7 +116,7 @@ fi
 echo "unexpected gh call: $*" >&2
 exit 1
 STUB
-chmod +x "$WORK/bin/gh" "$WORK/bin/sleep"
+chmod +x "$WORK/bin/gh" "$WORK/bin/sleep" "$WORK/bin/stat"
 cat > "$WORK/bin/watch-pr-stub" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$WATCHED"
@@ -241,5 +258,29 @@ set -e
 [ "$rc" -eq 3 ] || fail "atomic mode did not propagate watch-pr findings rc=3 (got $rc): $(cat "$WORK/trigger-findings.out")"
 grep -q '^WATCH_RESULT=findings$' "$WORK/trigger-findings.out" || fail "atomic mode did not execute the findings watcher: $(cat "$WORK/trigger-findings.out")"
 unset HEAD_OID WATCH_EXIT WATCH_RESULT
+
+# A fresh review-trigger lock fails closed without posting; once that exact lock is stale,
+# GNU-mode mtime detection reclaims it and completes the atomic trigger + watcher handoff.
+review_lock="$WORK/state/locks/cr-review-test_repo-42"
+mkdir -p "$review_lock"
+MODE="available"; AVAILABLE_NOW=1; HEAD_OID=locktest; export MODE AVAILABLE_NOW HEAD_OID
+printf '[]\n' > "$COMMENTS"
+rm -f "$POSTED" "$WATCHED"
+set +e
+bash "$SCRIPT" test/repo 42 --trigger-review --interval 0 --max-wait-min 1 > "$WORK/trigger-lock-fresh.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 3 ] || fail "fresh review-trigger lock did not fail closed (rc=$rc): $(cat "$WORK/trigger-lock-fresh.out")"
+grep -q '^REVIEW_TRIGGER_LOCK_HELD=1 ' "$WORK/trigger-lock-fresh.out" || fail "fresh lock refusal was not reported: $(cat "$WORK/trigger-lock-fresh.out")"
+[ "$(cat "$POSTED")" = '@coderabbitai rate limit' ] || fail "fresh lock still posted a review trigger: $(cat "$POSTED")"
+
+touch -t 200001010000 "$review_lock"
+HEAD_OID=stalelock; export HEAD_OID
+printf '[]\n' > "$COMMENTS"
+rm -f "$POSTED" "$WATCHED"
+bash "$SCRIPT" test/repo 42 --trigger-review --interval 0 --max-wait-min 1 > "$WORK/trigger-lock-stale.out" 2>&1
+[ "$(awk 'NR==2{print; exit}' "$POSTED")" = '@coderabbitai review' ] || fail "stale GNU-mode lock was not reclaimed: $(cat "$POSTED")"
+grep -q '^WATCH_RESULT=ready$' "$WORK/trigger-lock-stale.out" || fail "stale-lock recovery did not enter the watcher: $(cat "$WORK/trigger-lock-stale.out")"
+unset HEAD_OID
 
 echo "PASS cr-rate-limit: exact query, singular minute, available-now, atomic review trigger, stale status, reset formatting"

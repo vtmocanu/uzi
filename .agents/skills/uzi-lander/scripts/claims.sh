@@ -80,7 +80,7 @@ case "$verb" in
     lock="$CL/.lock.$key"; got=0
     for _ in 1 2 3 4 5 6 7 8 9 10; do
       if mkdir "$lock" 2>/dev/null; then got=1; break; fi
-      lage=$(( $(date +%s) - $(stat -f %m "$lock" 2>/dev/null || stat -c %Y "$lock" 2>/dev/null || date +%s) ))
+      lage=$(( $(date +%s) - $(stat -c %Y "$lock" 2>/dev/null || stat -f %m "$lock" 2>/dev/null || date +%s) ))
       [ "$lage" -gt 60 ] && rm -rf "$lock"
       sleep 0.3
     done
@@ -165,6 +165,7 @@ case "$verb" in
         # The post-merge watcher still needs the complete trail. Drop the terminal claim so
         # the board shows only live work, but leave a fresh trail for explicit final cleanup;
         # the orphan-TTL pass below collects it if that landing session died.
+        [ -f "$SD/trail/$key.trail" ] && touch "$SD/trail/$key.trail"
         rm -f "$f"
         echo "reaped $key ($why; trail preserved)"
       else

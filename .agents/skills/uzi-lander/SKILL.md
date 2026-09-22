@@ -262,9 +262,9 @@ session-peers registry, so a Codex thread with a shim is a peer like any Claude 
 - **Cleanup spans the post-merge watch.** `merge.sh` releases the live claim on `MERGED`
   but preserves its trail; after the final `main ci ...` line is printed, `release --purge`
   removes that trail and `reap` removes stale claims. A session that dies before the explicit
-  purge leaves a claimless trail; `reap` removes it only after the same 6-hour stale TTL, never
-  during a healthy post-merge watch. Nothing here is a lock on the PR itself, only on the
-  merge step.
+  purge leaves a claimless trail; its 6-hour stale TTL starts when terminal claim cleanup
+  preserves it, so `reap` never removes it during the same pass or a healthy post-merge watch.
+  Nothing here is a lock on the PR itself, only on the merge step.
 
 ## Waiting, uniformly
 
