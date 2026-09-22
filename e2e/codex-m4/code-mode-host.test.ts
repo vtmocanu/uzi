@@ -37,16 +37,34 @@ import {
   toolCallbackTexts,
 } from "./fake-provider.js";
 import { loadProtocolModules, runProtocolTurn, P_SUITE_DEADLINE_MS, type ProtocolModules } from "./harness-p.js";
+import { loadPackagedReducer } from "./packaged-modules.js";
 import { P_LAYER_SKIP } from "./p-platform.js";
 
 import type { RunGrants, SpawnCommandSeam, FileopClient } from "../../agent/src/codex/broker.js";
+import type { HarnessContext, HarnessContextHook, TurnSignals } from "../../agent/src/harness.js";
+
+/** A no-op context hook so the REAL run-lane reducer can fold a signal in isolation; mirrors the
+ *  neutral reducer characterization in e2e/harness-m2/harness-reducer.test.ts. */
+class FakeContextHook implements HarnessContextHook {
+  request(): void {
+    /* the plan fold needs no lead-context read */
+  }
+  async get(): Promise<HarnessContext | undefined> {
+    return undefined;
+  }
+}
+
+/** The REAL `RunTurnReducerImpl` constructor, loaded from the packaged src (container-safe). */
+type ReducerCtor = (typeof import("../../agent/src/harness-reducer.js"))["RunTurnReducerImpl"];
 
 let mods: ProtocolModules;
+let Reducer: ReducerCtor;
 before(async () => {
   // node:test runs before() even when all tests skip; on a non-Linux host route to the container
   // (P_LAYER_SKIP) and do NO load/resolve work here.
   if (P_LAYER_SKIP !== false) return;
   mods = await loadProtocolModules();
+  Reducer = (await loadPackagedReducer()).RunTurnReducerImpl;
 });
 
 /** The intended (code-mode-advertising) model whose exec cell folds the worker tools into `tools`. */
@@ -197,14 +215,31 @@ test("codex/P run path: a nested exec submit_plan callback is admitted to the br
   const execOutput = toolCallbackTexts(obs.providerRequests, EXEC_CALL_ID).join("\n");
   t.diagnostic(`brokerCalls=${JSON.stringify(brokerCalls)} execOutput=${JSON.stringify(execOutput)} (${obs.binSource}, ${obs.elapsedMs}ms)`);
 
-  // The nested submit_plan callback reached the broker through the host…
+  // The nested submit_plan callback reached the broker through the host and was admitted…
   assert.ok(brokerCalls.includes("submit_plan"), "the nested exec submit_plan callback reached the broker");
   const submit = obs.callbacks.find((c) => c.tool === "submit_plan");
   assert.ok(submit?.result.ok, "submit_plan was admitted (root-origin signal authorized, not lost)");
-  // …and the plan actually reached the run reducer's authoritative signal parser (scanSignals):
-  // dispatchSignal returns the reduced `{ plan }` payload, so the plan is admitted, not dropped.
-  const output = submit && submit.result.ok ? (submit.result.output as { plan?: unknown }) : undefined;
-  assert.equal(output?.plan, planMd, "the submitted plan_md reached the reducer signal path verbatim");
+
+  // …and — the point of this case — the admitted signal actually MOVES the run-lane reducer's
+  // submitted-plan state, not merely the broker's raw output. Production wraps an accepted root
+  // signal as a main-origin frame so `RunTurnReducerImpl.foldSignals` fires
+  // (agent/src/codex/codex-harness.ts:876-891); drive that EXACT frame through the REAL reducer
+  // here and assert its reduced `result.plan` (agent/src/harness-reducer.ts:154-164,224-237).
+  const signals: Readonly<Partial<TurnSignals>> =
+    submit && submit.result.ok ? (submit.result.output as Readonly<Partial<TurnSignals>>) : {};
+  const reducer = new Reducer(new FakeContextHook());
+  reducer.beginTurn();
+  await reducer.accept({
+    kind: "frame",
+    origin: { kind: "main" },
+    attribution: {},
+    items: [],
+    signals,
+    model: INTENDED_MODEL,
+  });
+  const reduced = reducer.finish({ kind: "exhausted" }).result;
+  assert.equal(reduced.plan, planMd, "the submitted plan reached the run-lane reducer's submitted-plan state");
+
   // The reduced signal also flowed back to the model as the exec cell's output.
   assert.match(execOutput, /Script completed/, "the exec cell ran under the enabled host");
   assert.match(execOutput, /"plan"/, "the reduced submit_plan signal flowed back to the model");

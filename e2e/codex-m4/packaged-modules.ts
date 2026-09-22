@@ -26,6 +26,8 @@ export type AppServerAuthModule = typeof import("../../agent/src/codex/appserver
 export type DynamicToolsModule = typeof import("../../agent/src/codex/dynamic-tools.js");
 /** The pure execution registry (idempotency/poison + root/epoch bookkeeping). */
 export type RegistryModule = typeof import("../../agent/src/codex/registry.js");
+/** The run-lane turn reducer (a pure, SDK-free fold) — used to assert reduced signal state. */
+export type ReducerModule = typeof import("../../agent/src/harness-reducer.js");
 
 /** The src dir the modules load from: an explicit `CODEX_M4_SRC` (an image/CI run points it
  *  at `/app/src`), else `<cwd>/src` — which resolves to `agent/src` when the M4 target runs
@@ -67,4 +69,10 @@ export function loadPackagedDynamicTools(): Promise<DynamicToolsModule> {
 
 export function loadPackagedRegistry(): Promise<RegistryModule> {
   return load<RegistryModule>("codex/registry.ts");
+}
+
+// The reducer lives at `agent/src/harness-reducer.ts` (one level ABOVE `codex/`), so it loads
+// bare from srcDir() — resolving under `agent/src` natively and `/app/src` in the container leg.
+export function loadPackagedReducer(): Promise<ReducerModule> {
+  return load<ReducerModule>("harness-reducer.ts");
 }
