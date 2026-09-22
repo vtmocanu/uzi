@@ -159,7 +159,18 @@ case "$verb" in
       if [ -z "$why" ] && [ "$(owner_live "$u" "$f")" = "dead" ]; then why="owner $o dead/stale"; fi
       [ -n "$why" ] || continue
       n=$((n+1))
-      if [ "$dry" -eq 1 ]; then echo "would reap $key ($why)"; else rm -f "$f" "$SD/trail/$key.trail"; echo "reaped $key ($why)"; fi
+      if [ "$dry" -eq 1 ]; then
+        echo "would reap $key ($why)"
+      elif [ "$why" = "PR MERGED" ] || [ "$why" = "PR CLOSED" ]; then
+        # The post-merge watcher still needs the complete trail. Drop the terminal claim so
+        # the board shows only live work, but leave a fresh trail for explicit final cleanup;
+        # the orphan-TTL pass below collects it if that landing session died.
+        rm -f "$f"
+        echo "reaped $key ($why; trail preserved)"
+      else
+        rm -f "$f" "$SD/trail/$key.trail"
+        echo "reaped $key ($why)"
+      fi
     done
     # A merged PR releases its live claim immediately but preserves the trail through the
     # post-merge CI watch. Normal completion purges it explicitly; if that session dies,

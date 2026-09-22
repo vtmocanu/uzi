@@ -54,6 +54,7 @@ if [ "\${1:-}" = pr ] && [ "\${2:-}" = view ]; then
       [ "\$c" -ge 2 ] || oid= ;;
   esac
   case "\$*" in
+    *'-q .state'*) printf '%s\n' "\$st" ;;
     *-q*)  printf '%s\n' "\$oid" ;;   # the retry: gh -q '.mergeCommit.oid // empty' prints the oid
     *)     if [ -n "\$oid" ]; then
              echo '{"state":"'"\$st"'","headRefOid":"$HEAD","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","mergeCommit":{"oid":"'"\$oid"'"}}'
@@ -73,7 +74,7 @@ export UZI_LANDER_STATE_DIR="$WORK/state"
 CL="$WORK/state/claims"; TR="$WORK/state/trail"
 mkdir -p "$CL" "$TR"
 seed_state() {  # a live claim + a pre-merge trail for #42, so the terminal side effects are observable
-  printf '{"key":"#42","owner":"tester","state":"pushed"}\n' > "$CL/#42.json"
+  printf '{"key":"#42","repo":"test/repo","pr":42,"owner":"tester","owner_uuid":"unknown-test","state":"pushed"}\n' > "$CL/#42.json"
   printf 'pr opened\nci green\n' > "$TR/#42.trail"
 }
 
@@ -112,6 +113,16 @@ bash "$HERE/claims.sh" reap > "$WORK/reap.out"
 [ ! -e "$TR/#stale.trail" ] || fail "reap left a stale orphan trail behind"
 grep -q 'reaped #stale (orphan trail stale ' "$WORK/reap.out" || fail "reap did not report stale orphan cleanup: $(cat "$WORK/reap.out")"
 rm -f "$TR/#fresh.trail"
+
+# A concurrent reap can observe MERGED before merge.sh releases the claim. It must remove the
+# terminal claim without deleting the fresh trail the post-merge watcher still needs.
+seed_state
+bash "$HERE/claims.sh" reap > "$WORK/reap-merged.out"
+[ ! -e "$CL/#42.json" ] || fail "reap left a merged claim on the live board"
+[ -e "$TR/#42.trail" ] || fail "reap deleted the merged PR trail before post-merge CI"
+grep -q 'reaped #42 (PR MERGED; trail preserved)' "$WORK/reap-merged.out" \
+  || fail "reap did not report terminal claim-only cleanup: $(cat "$WORK/reap-merged.out")"
+bash "$HERE/claims.sh" release '#42' --purge > /dev/null
 
 # 2. state=MERGED but mergeCommit not populated yet (GitHub lag) → re-read recovers the oid.
 MERGE_STATE=merged_lagging; export MERGE_STATE
