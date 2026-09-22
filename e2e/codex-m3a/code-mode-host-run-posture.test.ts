@@ -339,13 +339,12 @@ test("production launcher advice posture: code_mode_host=false launches NO code-
   let turnSettled = false;
   const sampler = (async (): Promise<void> => {
     while (!turnSettled) {
-      try {
-        const live = (await handle!.snapshot(20_000)).processes as readonly Row[];
-        samples += 1;
-        if (live.some((p) => p.comm.includes("code-mode"))) sawCodeModeHost = true;
-      } catch {
-        return; // the supervisor is gone (post-dispose); stop sampling
-      }
+      // No catch: this sampler is awaited (below) BEFORE handle.dispose(), so snapshot() always
+      // runs while the supervisor is alive. A control-channel/supervisor-exit/deadline rejection
+      // is a real failure and must fail the test, not let it pass vacuously with samples === 0.
+      const live = (await handle!.snapshot(20_000)).processes as readonly Row[];
+      samples += 1;
+      if (live.some((p) => p.comm.includes("code-mode"))) sawCodeModeHost = true;
       await new Promise((r) => setTimeout(r, 20));
     }
   })();
