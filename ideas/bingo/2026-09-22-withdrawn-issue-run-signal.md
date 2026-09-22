@@ -118,7 +118,10 @@ withdrawal.
   absence *is* the signal.
 - **Three reasons in one column `issue_withdrawn_reason`:** `evicted` (row absent from
   the LEFT JOIN), `closed` (`i.state = 'closed'`), `ineligible` (uzi label absent AND not
-  bot-assigned). Express bot assignment with the NUMERIC-containment form
+  bot-assigned). Their precedence is `evicted` > `closed` > `ineligible`, and the SQL
+  `CASE` must test them in that order. A cached issue that is both closed and ineligible
+  is therefore recorded and shown as "issue closed while this run was working"; an absent
+  row is always `evicted`. Express bot assignment with the NUMERIC-containment form
   `assignee_ids @> to_jsonb(@bot_id::bigint)` exactly as `autopilot.sql:44-45` does, never
   `jsonb_exists` on ids — the PRD #767 R3 trap recorded at `autopilot.sql:28-30`
   ("assignee_ids holds NUMERIC ids, so the / string-membership form the label predicates
@@ -232,11 +235,13 @@ drivers (no new API call), `main`.
   surfaces at the next full reconcile as `evicted`, not `closed`. Note that `docs/board.md:307` groups closing with
   de-labeling and deleting under "one (less / frequent) reconcile pass", so the two docs
   disagree about closing — fix `board.md` in passing.
-- **One run per issue.** `uq_runs_one_active_per_issue`
-  (`00170_run_pool_wait.sql:34-37`, which excludes `pool_wait` — see its rationale at
-  `:24-29`) PLUS the Go pre-check `HasActiveRunForIssue`
-  (`api/internal/workersvc/service.go:5337-5346`, query `autopilot.sql:96-102`), so one
-  withdrawal edge maps to at most one run.
+- **Run cardinality.** `uq_runs_one_active_per_issue` guarantees at most one active
+  non-`pool_wait` issue run (`00170_run_pool_wait.sql:34-37`). It deliberately excludes
+  `pool_wait` (`:24-30`), while the Go `HasActiveRunForIssue` pre-check
+  (`api/internal/workersvc/service.go:5337-5346`, query `autopilot.sql:90-102`) normally
+  prevents a second manual start but is not an atomic uniqueness constraint. Multiple
+  held rows are therefore possible. The withdrawal pass must process each matching run
+  independently, with the marker and notification deduplicated per run, never per issue.
 - **Size.** M1 small: one migration, one query pair, one pass, one kind, one badge, one
   fixture; the hidden step is the board self-close stamp. Minimal v1 slice: `closed` +
   `evicted` reasons, the notice, the run-page badge — drop `ineligible` (needs the bot-id
