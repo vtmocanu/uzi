@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Fixed
+
+- **A failed Codex run now shows why it failed instead of a bare `codex turn failed: failed` ([#1534](https://github.com/vtmocanu/uzi/issues/1534)).**
+  A failed Codex turn now surfaces a normalized, closed error classification (and a bounded HTTP status where the provider reports one) in the run feed and the run's failure reason, on both the run and advice lanes, decoded from the provider's final non-retrying `error` notification with the terminal `turn.error` as a fallback, so an owner can tell an auth-refresh failure from a rate limit or a context-window overflow instead of seeing only `codex turn failed: failed`; the raw, possibly secret-bearing provider message is never retained.
+
 ## [0.84.0] - 2026-09-20
 
 ### Added

@@ -211,6 +211,34 @@ function agentMessage(text: string, usage?: unknown, threadId = "th-1"): CodexNo
   return { kind: "activity", method: "item/completed", params: { threadId, item } };
 }
 
+/** PRD #1534: a decoded provider `ErrorNotification` (method "error"), bound to a turn. The
+ *  FakeTransport pushes decoded notes directly, so this builds the typed shape the transport
+ *  would hand the harness. `params.error` mirrors the raw provider payload (codexErrorInfo +
+ *  any extra raw fields), so the harness reads codexErrorInfo through the same path as prod. */
+function codexError(
+  codexErrorInfo: unknown,
+  opts: { willRetry?: boolean; extraError?: Record<string, unknown>; threadId?: string; turnId?: string } = {},
+): CodexNotification {
+  const willRetry = opts.willRetry ?? false;
+  const threadId = opts.threadId ?? "th-1";
+  const turnId = opts.turnId ?? "tn-1";
+  const error: Record<string, unknown> = { codexErrorInfo, ...opts.extraError };
+  return { kind: "codex_error", method: "error", threadId, turnId, willRetry, params: { error, willRetry, threadId, turnId } };
+}
+
+/** A failed `turn/completed` carrying a terminal `turn.error.codexErrorInfo` FALLBACK — the
+ *  base `turnCompleted` builder never sets `turn.error`, so this hand-builds the note. */
+function turnCompletedWithError(codexErrorInfo: unknown, threadId = "th-1", turnId = "tn-1"): CodexNotification {
+  return {
+    kind: "turn_completed",
+    method: "turn/completed",
+    threadId,
+    turnId,
+    status: "failed",
+    params: { threadId, turn: { id: turnId, status: "failed", error: { codexErrorInfo } } },
+  };
+}
+
 function delta(): CodexNotification {
   return { kind: "activity", method: "item/agent_message_delta", params: { delta: "h" } };
 }
@@ -1382,6 +1410,169 @@ describe("CodexHarness: terminal provider fields are bounded + redacted", () => 
     const thrown = terminal.failure!.materialize();
     assert.match(thrown.failure.message, /codex turn failed: unknown/);
     assert.ok(!thrown.failure.message.includes("mystery-provider-status"), "no raw status in the failure message");
+  });
+});
+
+describe("CodexHarness: provider error classification folds into the terminal (PRD #1534)", () => {
+  function terminalOf(events: HarnessEvent[]): HarnessTerminal {
+    const last = events.at(-1)!;
+    assert.equal(last.kind, "turn_finished");
+    if (last.kind !== "turn_finished") throw new Error("expected a turn_finished terminal");
+    return last.terminal;
+  }
+
+  it("captures a non-retrying scalar codex_error and folds it into the terminal (errors + message + category)", async () => {
+    const { harness, transport } = makeHarness();
+    transport
+      .push(threadStarted())
+      .push(codexError("unauthorized"))
+      .push(turnCompleted("failed"))
+      .end();
+
+    const terminal = terminalOf(await collect(harness.startTurn(makeRequest()).events));
+    assert.deepEqual(terminal.errors, ["codex turn ended with status: failed (unauthorized)"]);
+    const thrown = terminal.failure!.materialize();
+    // `failure.message` is `original.message` verbatim; `original` is typed `unknown`.
+    assert.match(thrown.failure.message, /codex turn failed: failed \(unauthorized\)/);
+    assert.equal(thrown.failure.category, "authentication");
+  });
+
+  it("carries a TAGGED classification with a bounded http status into the message/errors/category", async () => {
+    const { harness, transport } = makeHarness();
+    transport
+      .push(threadStarted())
+      .push(codexError({ httpConnectionFailed: { httpStatusCode: 503 } }))
+      .push(turnCompleted("failed"))
+      .end();
+
+    const terminal = terminalOf(await collect(harness.startTurn(makeRequest()).events));
+    assert.deepEqual(terminal.errors, ["codex turn ended with status: failed (httpConnectionFailed; http 503)"]);
+    const thrown = terminal.failure!.materialize();
+    assert.match(thrown.failure.message, /codex turn failed: failed \(httpConnectionFailed; http 503\)/);
+    assert.equal(thrown.failure.category, "transport");
+  });
+
+  it("IGNORES a willRetry:true codex_error (byte-identical to no notification)", async () => {
+    const { harness, transport } = makeHarness();
+    transport
+      .push(threadStarted())
+      .push(codexError("unauthorized", { willRetry: true }))
+      .push(turnCompleted("failed"))
+      .end();
+
+    const terminal = terminalOf(await collect(harness.startTurn(makeRequest()).events));
+    assert.deepEqual(terminal.errors, ["codex turn ended with status: failed"]);
+    const thrown = terminal.failure!.materialize();
+    assert.match(thrown.failure.message, /codex turn failed: failed$/);
+    assert.equal(thrown.failure.category, "unknown");
+  });
+
+  it("IGNORES a codex_error bound to a STALE turn id (the identity gate is load-bearing)", async () => {
+    // A codex_error carrying the active thread but a STALE turnId must NOT latch onto the
+    // active turn — else a prior/foreign turn's error mislabels this one's failure_reason.
+    const { harness, transport } = makeHarness();
+    transport
+      .push(threadStarted())
+      .push(codexError("unauthorized", { turnId: "stale-turn" }))
+      .push(turnCompleted("failed"))
+      .end();
+
+    const terminal = terminalOf(await collect(harness.startTurn(makeRequest()).events));
+    assert.deepEqual(terminal.errors, ["codex turn ended with status: failed"]);
+    const thrown = terminal.failure!.materialize();
+    assert.match(thrown.failure.message, /codex turn failed: failed$/);
+    assert.equal(thrown.failure.category, "unknown");
+  });
+
+  it("IGNORES a codex_error bound to a FOREIGN thread id (the identity gate is load-bearing)", async () => {
+    // A codex_error for an unregistered foreign thread reaches mapNote (only registered child
+    // sinks are demuxed away) and must NOT be captured onto the active root turn.
+    const { harness, transport } = makeHarness();
+    transport
+      .push(threadStarted())
+      .push(codexError("unauthorized", { threadId: "foreign-thread" }))
+      .push(turnCompleted("failed"))
+      .end();
+
+    const terminal = terminalOf(await collect(harness.startTurn(makeRequest()).events));
+    assert.deepEqual(terminal.errors, ["codex turn ended with status: failed"]);
+    const thrown = terminal.failure!.materialize();
+    assert.match(thrown.failure.message, /codex turn failed: failed$/);
+    assert.equal(thrown.failure.category, "unknown");
+  });
+
+  it("FALLS BACK to the terminal turn.error.codexErrorInfo when there is no codex_error notification", async () => {
+    const { harness, transport } = makeHarness();
+    transport.push(threadStarted()).push(turnCompletedWithError("usageLimitExceeded")).end();
+
+    const terminal = terminalOf(await collect(harness.startTurn(makeRequest()).events));
+    assert.deepEqual(terminal.errors, ["codex turn ended with status: failed (usageLimitExceeded)"]);
+    const thrown = terminal.failure!.materialize();
+    assert.match(thrown.failure.message, /codex turn failed: failed \(usageLimitExceeded\)/);
+    assert.equal(thrown.failure.category, "rate_limit");
+  });
+
+  it("PRECEDENCE: a recognized terminal turn.error WINS over an UNRECOGNIZED notification classification", async () => {
+    const { harness, transport } = makeHarness();
+    transport
+      .push(threadStarted())
+      // The notification's codexErrorInfo is unrecognized → classification "unknown", which
+      // must NOT mask the terminal's recognized "unauthorized".
+      .push(codexError("totallyMadeUp"))
+      .push(turnCompletedWithError("unauthorized"))
+      .end();
+
+    const terminal = terminalOf(await collect(harness.startTurn(makeRequest()).events));
+    assert.deepEqual(terminal.errors, ["codex turn ended with status: failed (unauthorized)"]);
+    const thrown = terminal.failure!.materialize();
+    assert.match(thrown.failure.message, /codex turn failed: failed \(unauthorized\)/);
+    assert.ok(!thrown.failure.message.includes("unknown"), "the notification's 'unknown' never surfaces");
+    assert.equal(thrown.failure.category, "authentication");
+  });
+
+  it("NO-LEAK: a secret-shaped message/additionalDetails on the error frame never reaches the terminal", async () => {
+    const { harness, transport } = makeHarness();
+    // Assembled at runtime so no secret-shaped literal sits in the source (scanner-safe).
+    const secretMsg = ["sk", "codexerr", "MUSTNOTLEAK7777"].join("-");
+    const secretDetails = ["sk", "detail", "ALSOHIDDEN4242"].join("-");
+    transport
+      .push(threadStarted())
+      .push(
+        codexError(["madeUp", "provider", "tag"].join("-"), {
+          extraError: { message: secretMsg, additionalDetails: secretDetails },
+        }),
+      )
+      .push(turnCompleted("failed"))
+      .end();
+
+    const terminal = terminalOf(await collect(harness.startTurn(makeRequest()).events));
+    // The unrecognized codexErrorInfo collapses to the fixed "unknown" token; no raw text.
+    assert.deepEqual(terminal.errors, ["codex turn ended with status: failed (unknown)"]);
+    assert.equal(terminal.subtype, "failed");
+    const thrown = terminal.failure!.materialize();
+    for (const s of [secretMsg, secretDetails]) {
+      assert.ok(!terminal.errors.join(" ").includes(s), "no secret leaked into errors");
+      assert.ok(!terminal.subtype.includes(s), "no secret leaked into subtype");
+      // `failure.message` is `original.message` verbatim; `original` is typed `unknown`.
+      assert.ok(!thrown.failure.message.includes(s), "no secret leaked into the failure message");
+    }
+  });
+
+  it("RESETS the captured classification across turns (a later turn with no codex_error is clean)", async () => {
+    const { harness, transport } = makeHarness();
+    // Turn 1 captures a classification from a non-retrying codex_error (queue NOT ended, so
+    // the same single-consumer transport serves turn 2).
+    transport.push(threadStarted()).push(codexError("unauthorized")).push(turnCompleted("failed"));
+    const terminal1 = terminalOf(await collect(harness.startTurn(makeRequest()).events));
+    assert.deepEqual(terminal1.errors, ["codex turn ended with status: failed (unauthorized)"]);
+
+    // Turn 2 has NO codex_error — the prior classification must not leak into it.
+    transport.push(turnCompleted("failed")).end();
+    const terminal2 = terminalOf(await collect(harness.startTurn(makeRequest()).events));
+    assert.deepEqual(terminal2.errors, ["codex turn ended with status: failed"]);
+    const thrown2 = terminal2.failure!.materialize();
+    assert.match(thrown2.failure.message, /codex turn failed: failed$/);
+    assert.equal(thrown2.failure.category, "unknown");
   });
 });
 

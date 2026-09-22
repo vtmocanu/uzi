@@ -12,7 +12,17 @@
 // The three normalizers are PURE (no I/O, no logging, allocation-bounded) so they are
 // trivially unit-testable and safe to call on every terminal frame.
 
-import type { HarnessUsage } from "../harness.js";
+import type { HarnessErrorCategory, HarnessUsage } from "../harness.js";
+
+/** The CLOSED classification both harness lanes surface for a Codex terminal error: a
+ *  fixed `display` token (or the literal `"unknown"`), its harness `category`, and an
+ *  optional bounded `httpStatus`. Shared so the run decoder and the advice decoder cannot
+ *  diverge on the shape. Never carries raw provider text. */
+export interface CodexErrorClassification {
+  classification: string;
+  category: HarnessErrorCategory;
+  httpStatus?: number;
+}
 
 /** The CLOSED set of provider statuses we are willing to echo as a display `subtype`.
  *  Any status outside it collapses to the fixed token {@link UNKNOWN_STATUS}, so an
@@ -54,13 +64,139 @@ export function normalizeCodexStatus(rawStatus: string | undefined): { subtype: 
 /**
  * Build the terminal `errors` array WITHOUT reading any raw provider text. On success it
  * is empty; on failure it is a single fixed diagnostic derived ONLY from the already-
- * CLOSED `subtype` (which is either an allowlisted token or `"unknown"`). It deliberately
- * never reads or embeds the raw `turn.error`, so a secret-bearing provider error string
- * cannot leak through the run message.
+ * CLOSED `subtype` (which is either an allowlisted token or `"unknown"`) and, when given,
+ * the already-CLOSED `info` classification from {@link normalizeCodexErrorInfo}. It
+ * deliberately never reads or embeds the raw `turn.error`, so a secret-bearing provider
+ * error string cannot leak through the run message.
+ *
+ * `info` is OPTIONAL and BACKWARD-COMPATIBLE: a 2-arg call is byte-identical to before.
  */
-export function normalizeCodexTerminalErrors(subtype: string, outcome: "success" | "failed"): string[] {
+export function normalizeCodexTerminalErrors(
+  subtype: string,
+  outcome: "success" | "failed",
+  info?: { classification: string; httpStatus?: number },
+): string[] {
   if (outcome === "success") return [];
-  return [`codex turn ended with status: ${subtype}`];
+  if (info === undefined) return [`codex turn ended with status: ${subtype}`];
+  return [`codex turn ended with status: ${subtype} (${formatCodexClassification(info)})`];
+}
+
+/** One entry in {@link CODEX_ERROR_INFO_MAP}: the wire tag's echo `display` (a fixed literal,
+ *  never the raw value), its harness `category`, its wire `shape` (a bare `"scalar"` string
+ *  vs. an externally-`"tagged"` one-key object), and `http: true` for the four HTTP-transport
+ *  tagged variants whose one-key value object may carry a bounded `httpStatusCode`. */
+interface CodexErrorInfoEntry {
+  shape: "scalar" | "tagged";
+  display: string;
+  category: HarnessErrorCategory;
+  http?: boolean;
+}
+
+/** The CLOSED map of the pinned Codex 0.153.2 `codexErrorInfo` enum (13 scalar + 5 tagged)
+ *  from the exact lower-camel wire tag to its {@link CodexErrorInfoEntry}. A tag ABSENT from
+ *  this map, or present with a shape that does not match the wire form, collapses to the
+ *  fixed `"unknown"` classification — an arbitrary/attacker-shaped provider tag is NEVER
+ *  echoed, and only a range-gated `httpStatusCode` is ever extracted (for the four `http`
+ *  entries). `message` / `additionalDetails` / `misalignment` / `turnKind` and any other raw
+ *  value are never read. */
+const CODEX_ERROR_INFO_MAP: ReadonlyMap<string, CodexErrorInfoEntry> = new Map<string, CodexErrorInfoEntry>([
+  // Scalar variants: a bare lower-camel tag string.
+  ["unauthorized", { shape: "scalar", display: "unauthorized", category: "authentication" }],
+  ["usageLimitExceeded", { shape: "scalar", display: "usageLimitExceeded", category: "rate_limit" }],
+  ["rateLimitExceeded", { shape: "scalar", display: "rateLimitExceeded", category: "rate_limit" }],
+  ["sessionBudgetExceeded", { shape: "scalar", display: "sessionBudgetExceeded", category: "rate_limit" }],
+  ["contextWindowExceeded", { shape: "scalar", display: "contextWindowExceeded", category: "model" }],
+  ["serverOverloaded", { shape: "scalar", display: "serverOverloaded", category: "transport" }],
+  ["internalServerError", { shape: "scalar", display: "internalServerError", category: "transport" }],
+  ["badRequest", { shape: "scalar", display: "badRequest", category: "unknown" }],
+  ["sandboxError", { shape: "scalar", display: "sandboxError", category: "unknown" }],
+  ["cyberPolicy", { shape: "scalar", display: "cyberPolicy", category: "unknown" }],
+  ["misalignmentPolicyViolation", { shape: "scalar", display: "misalignmentPolicyViolation", category: "unknown" }],
+  ["threadRollbackFailed", { shape: "scalar", display: "threadRollbackFailed", category: "unknown" }],
+  ["other", { shape: "scalar", display: "other", category: "unknown" }],
+  // Tagged variants: a one-key externally-tagged object `{ "<tag>": { ... } }`.
+  ["httpConnectionFailed", { shape: "tagged", display: "httpConnectionFailed", category: "transport", http: true }],
+  ["responseTooManyFailedAttempts", { shape: "tagged", display: "responseTooManyFailedAttempts", category: "transport", http: true }],
+  ["responseStreamConnectionFailed", { shape: "tagged", display: "responseStreamConnectionFailed", category: "transport", http: true }],
+  ["responseStreamDisconnected", { shape: "tagged", display: "responseStreamDisconnected", category: "transport", http: true }],
+  // activeTurnNotSteerable carries a turnKind payload that MUST be ignored (no http, no status).
+  ["activeTurnNotSteerable", { shape: "tagged", display: "activeTurnNotSteerable", category: "unknown" }],
+]);
+
+/**
+ * Normalize an UNTRUSTED Codex `codexErrorInfo` (a field inside `TurnError`) into a CLOSED
+ * `{ classification, category, httpStatus? }`, or `undefined` when `raw == null`.
+ *
+ * The wire form is EITHER a bare lower-camel scalar tag string OR a one-key externally-tagged
+ * object `{ "<tag>": { ... } }`. The classification written out is ALWAYS `entry.display` from
+ * a {@link CODEX_ERROR_INFO_MAP} hit whose `shape` matches the input form, or the literal
+ * `"unknown"` — an explicit lookup + shape check BEFORE any echo (never `tag ?? "unknown"`).
+ * `httpStatus` is extracted ONLY for the four `http` tagged entries, and ONLY when the
+ * one-key value object's `httpStatusCode` is an integer in `[100, 599]`. No `message` /
+ * `additionalDetails` / `misalignment` / `turnKind` / other raw value is ever read. Pure and
+ * allocation-bounded (the own-key check never iterates an unbounded structure).
+ */
+export function normalizeCodexErrorInfo(raw: unknown): CodexErrorClassification | undefined {
+  if (raw == null) return undefined;
+
+  // Scalar wire form: a bare lower-camel tag string. Echo only on a scalar-shaped map hit.
+  if (typeof raw === "string") {
+    const entry = CODEX_ERROR_INFO_MAP.get(raw);
+    if (entry !== undefined && entry.shape === "scalar") {
+      return { classification: entry.display, category: entry.category };
+    }
+    return { classification: "unknown", category: "unknown" };
+  }
+
+  // Tagged wire form: a non-null, non-array object with EXACTLY ONE own enumerable key.
+  if (typeof raw === "object" && !Array.isArray(raw)) {
+    const keys = Object.keys(raw as Record<string, unknown>);
+    const key = keys.length === 1 ? keys[0] : undefined;
+    if (key !== undefined) {
+      const entry = CODEX_ERROR_INFO_MAP.get(key);
+      if (entry !== undefined && entry.shape === "tagged") {
+        const result: CodexErrorClassification = {
+          classification: entry.display,
+          category: entry.category,
+        };
+        if (entry.http === true) {
+          const value = (raw as Record<string, unknown>)[key];
+          if (value !== null && typeof value === "object" && !Array.isArray(value)) {
+            const status = (value as Record<string, unknown>).httpStatusCode;
+            if (typeof status === "number" && Number.isInteger(status) && status >= 100 && status <= 599) {
+              result.httpStatus = status;
+            }
+          }
+        }
+        return result;
+      }
+    }
+    return { classification: "unknown", category: "unknown" };
+  }
+
+  // Any other shape (array, number, boolean) — never echoed.
+  return { classification: "unknown", category: "unknown" };
+}
+
+/** Choose the classification to surface: prefer a RECOGNIZED (non-"unknown") one — the
+ *  notification first, then the terminal turn.error fallback — else whichever exists
+ *  (an "unknown", or undefined when neither is present). */
+export function pickCodexClassification(
+  fromNotification: CodexErrorClassification | undefined,
+  fromTerminal: CodexErrorClassification | undefined,
+): CodexErrorClassification | undefined {
+  if (fromNotification !== undefined && fromNotification.classification !== "unknown") return fromNotification;
+  if (fromTerminal !== undefined && fromTerminal.classification !== "unknown") return fromTerminal;
+  return fromNotification ?? fromTerminal;
+}
+
+/**
+ * Render the human classification suffix (WITHOUT surrounding parens) shared by both
+ * harnesses so they display identically: just `info.classification`, or
+ * `` `${classification}; http ${httpStatus}` `` when a bounded status is present.
+ */
+export function formatCodexClassification(info: { classification: string; httpStatus?: number }): string {
+  return info.httpStatus !== undefined ? `${info.classification}; http ${info.httpStatus}` : info.classification;
 }
 
 /**

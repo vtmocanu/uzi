@@ -53,7 +53,15 @@
 import { renderCodexRun } from "./render.js";
 import { buildCodexDynamicTools } from "./dynamic-tools.js";
 import { CODEX_DELEGATE_TOOLS, CODEX_SIGNAL_TOOLS, canonicalizeCodexToolName } from "./broker.js";
-import { normalizeCodexStatus, normalizeCodexTerminalErrors, normalizeCodexUsage } from "./terminal-normalize.js";
+import {
+  formatCodexClassification,
+  normalizeCodexErrorInfo,
+  normalizeCodexStatus,
+  normalizeCodexTerminalErrors,
+  normalizeCodexUsage,
+  pickCodexClassification,
+  type CodexErrorClassification,
+} from "./terminal-normalize.js";
 import { CodexUsageAccountant, deriveCodexRunCost } from "./token-accounting.js";
 
 import type { Logger } from "../log.js";
@@ -319,6 +327,9 @@ export class CodexHarness implements RunHarness {
   private turnClosed = false;
   private terminalEmitted = false;
   private stopRequested = false;
+  // PRD #1534: the classification captured from the active turn's final non-retrying
+  // provider method:"error" frame, folded into the terminal at decode. Reset per turn.
+  private pendingCodexError?: CodexErrorClassification;
   // Resolves the current turn's abort race (see runTurn). The owner-aborted signal
   // resolves it via the listener; requestStop()/close() resolve it directly so a turn
   // WEDGED in a pending broker callback (a never-settling model-selected effect) still
@@ -436,6 +447,7 @@ export class CodexHarness implements RunHarness {
     this.activeTurnId = undefined;
     this.stopRequested = false;
     this.stopTurn = undefined;
+    this.pendingCodexError = undefined;
 
     return {
       events: this.runTurn(request, rendered),
@@ -843,6 +855,18 @@ export class CodexHarness implements RunHarness {
         // demux; on the event stream this is pure liveness (no frame, no items). A child's
         // token-usage note never reaches here (the demux routes it to the child sink first).
         return { kind: "activity", sessionId: note.threadId };
+      case "codex_error": {
+        // PRD #1534: bind the provider ErrorNotification to the ACTIVE root turn and retain
+        // its classification ONLY on an explicit non-retrying frame (willRetry === false) —
+        // final-non-retrying-wins. A retrying frame is liveness/diagnostic, never the terminal
+        // cause; a stale/foreign/child identity is ignored. Never emits a frame or latches the
+        // terminal; parsing stays in the single-source normalizer (no raw provider text kept).
+        if (note.threadId === this.threadId && note.turnId === this.activeTurnId && note.willRetry === false) {
+          const rawInfo = asObject(asObject(note.params)?.error)?.codexErrorInfo;
+          this.pendingCodexError = normalizeCodexErrorInfo(rawInfo);
+        }
+        return { kind: "activity", sessionId: note.threadId };
+      }
       case "turn_completed": {
         // The harness serves ONLY the ACTIVE root turn. A terminal for a stale turn id or
         // a child/foreign thread is liveness ONLY — it must never latch `terminalEmitted`
@@ -1074,7 +1098,13 @@ export class CodexHarness implements RunHarness {
     // ever retained: subtype/outcome come from the CLOSED vocabulary, errors are provider-
     // text-free, and usage is a bounded numeric-only subset.
     const { subtype, outcome } = normalizeCodexStatus(rawStatus);
-    const errors = normalizeCodexTerminalErrors(subtype, outcome);
+    // PRD #1534: prefer the active turn's final non-retrying method:"error" classification,
+    // falling back to the terminal turn.error's codexErrorInfo. Both go through the same
+    // single-source normalizer, so only a CLOSED classification token + a bounded httpStatus
+    // are ever surfaced — no raw provider text (message/additionalDetails/misalignment).
+    const fromTerminal = normalizeCodexErrorInfo(asObject(turn?.error)?.codexErrorInfo);
+    const classification = pickCodexClassification(this.pendingCodexError, fromTerminal);
+    const errors = normalizeCodexTerminalErrors(subtype, outcome, classification);
     // PRD #1332 C4a/C4b: attach the per-model token accounting as the result-frame `modelUsage`,
     // now carrying each model's closed `costStatus` (and `costUSD` when metered) projected from
     // the run's auth mode against the D5 price table (C4b). The reducer emits
@@ -1095,13 +1125,17 @@ export class CodexHarness implements RunHarness {
       usage,
       metrics: { cost },
       failure: {
-        // Deferred, invoked only at the owner's classification point. Codex M3 carries no
-        // limit facts, so this constructs the generic terminal exception; it never invents
-        // an auth/model/effort category from a provider status, and its message is based on
-        // the CLOSED subtype, never the raw provider status string.
+        // Deferred, invoked only at the owner's classification point. The category now comes
+        // from the CLOSED classification MAP (never invented from a raw provider status), and
+        // the message suffix is the CLOSED display token plus a bounded http status only — no
+        // raw provider text (message/additionalDetails/misalignment) is ever retained. When
+        // there is no classification the message stays based on the CLOSED subtype alone and
+        // the category defaults to "unknown", byte-identical to before #1534.
         materialize: (_limit): HarnessThrownFailure => {
-          const original = new Error(`codex turn failed: ${subtype}`);
-          return { failure: { category: "unknown", message: original.message }, original };
+          const suffix = classification !== undefined ? ` (${formatCodexClassification(classification)})` : "";
+          const original = new Error(`codex turn failed: ${subtype}${suffix}`);
+          const category = classification?.category ?? "unknown";
+          return { failure: { category, message: original.message }, original };
         },
       },
     };

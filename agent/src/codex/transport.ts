@@ -152,6 +152,18 @@ export type CodexNotification =
       readonly params: unknown;
     }
   | {
+      // PRD #1534: a fail-safe-decoded provider `ErrorNotification` (method `error`), bound to
+      // the active turn by threadId/turnId. Decoded here ONLY when threadId, turnId and a real
+      // boolean willRetry are all present; parsing of the provider `error`/`willRetry` fields
+      // into a terminal classification is deferred to the harness/normalizer (a later milestone).
+      readonly kind: "codex_error";
+      readonly method: string;
+      readonly threadId: string;
+      readonly turnId: string;
+      readonly willRetry: boolean;
+      readonly params: unknown;
+    }
+  | {
       readonly kind: "activity";
       /** null when a framing-intact frame carried neither a method nor a matched id. */
       readonly method: string | null;
@@ -636,6 +648,27 @@ class CodexTransportImpl implements CodexTransport {
               ? { total, last, modelContextWindow: rawWindow, pricingEvidenceComplete }
               : { total, last, pricingEvidenceComplete };
           return { kind: "token_usage_updated", method, threadId, turnId, usage, params };
+        }
+      } else if (method === "error") {
+        // PRD #1534: decode a provider ErrorNotification, reading threadId/turnId/willRetry
+        // from the TOP LEVEL of params (mirrors the thread/tokenUsage/updated branch above).
+        const threadId = readStringProp(params, "threadId");
+        const turnId = readStringProp(params, "turnId");
+        const rawWillRetry = (params as Record<string, unknown> | undefined)?.willRetry;
+        const willRetry = typeof rawWillRetry === "boolean" ? rawWillRetry : undefined;
+        // FAIL-SAFE GATE: emit codex_error ONLY when threadId and turnId are non-empty strings
+        // AND willRetry is a real boolean. A malformed or future-shaped error frame (an absent
+        // or non-boolean willRetry, a missing binding id) is NOT defaulted — it falls through to
+        // the generic `activity` liveness below, and the terminal turn.error fallback (added in a
+        // later milestone) still covers the turn's classification.
+        if (
+          threadId !== undefined &&
+          threadId.length > 0 &&
+          turnId !== undefined &&
+          turnId.length > 0 &&
+          willRetry !== undefined
+        ) {
+          return { kind: "codex_error", method, threadId, turnId, willRetry, params };
         }
       }
     }
