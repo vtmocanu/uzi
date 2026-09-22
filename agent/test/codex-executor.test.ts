@@ -2585,11 +2585,13 @@ describe("CodexExecutor: plan folding + implement/review loop (m2)", () => {
     // m4 change: plan approval now RECREATES the provider epoch (new-root resume), so the plan
     // turn and the implement turn run on DISTINCT provider roots/transports. Each epoch is scripted
     // independently on its own FakeTransport.
+    const lifecycle: string[] = [];
     const rig = makeMultiEpochRig([
       epochResponder("th-1", "tn-1", (t, th, tn) => {
         t.push(toolCall(1, "submit_plan", { plan_md: "the codex plan body" }, th, tn, "c-plan")).push(turnCompleted("completed", th, tn));
       }),
       epochResponder("resumed-1", "tn-2", (t, th, tn) => {
+        lifecycle.push("implement");
         t.push(toolCall(2, "signal_done", {}, th, tn, "c-done")).push(turnCompleted("completed", th, tn));
       }),
     ]);
@@ -2598,9 +2600,18 @@ describe("CodexExecutor: plan folding + implement/review loop (m2)", () => {
     const gatePlan: NonNullable<RunContext["gatePlan"]> = async (planMd) => {
       gated = true;
       gatedPlan = planMd;
+      lifecycle.push("approve");
       return { kind: "approve", selection: { source: "own", agents: [] } } as never;
     };
-    const { ctx } = makeCtx({ planApproved: false, approvedPlan: undefined, gatePlan });
+    const { ctx } = makeCtx({
+      planApproved: false,
+      approvedPlan: undefined,
+      gatePlan,
+      reportIteration: async (iteration) => {
+        lifecycle.push(`running:${iteration}`);
+        return undefined;
+      },
+    });
     const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "plan→implement run");
 
     // FAIL-OLD/PASS-FIXED: without the m2 signals frame planResult.plan is undefined and run()
@@ -2610,6 +2621,44 @@ describe("CodexExecutor: plan folding + implement/review loop (m2)", () => {
     assert.equal(result.branch, "agent/issue-42", "the implement turn on the NEW epoch finished on a root signal_done");
     assert.equal(rig.epochs[0]!.transport.turnStartCount, 1, "the plan turn ran on epoch 0");
     assert.equal(rig.epochs[1]!.transport.turnStartCount, 1, "the implement turn ran on epoch 1 (the recreated root)");
+    assert.deepEqual(
+      lifecycle,
+      ["approve", "running:1", "implement"],
+      "approval is followed by a running report before the first implementation turn",
+    );
+  });
+
+  it("reject and cancel verdicts never report the run as running", async () => {
+    for (const verdict of [
+      { kind: "reject" as const, reason: "not approved" },
+      { kind: "cancel" as const },
+    ]) {
+      const lifecycle: string[] = [];
+      const rig = makeMultiEpochRig([
+        epochResponder("th-plan", "tn-plan", (t, th, tn) => {
+          t.push(toolCall(1, "submit_plan", { plan_md: "the codex plan body" }, th, tn, "c-plan"))
+            .push(turnCompleted("completed", th, tn));
+        }),
+      ]);
+      const { ctx } = makeCtx({
+        planApproved: false,
+        approvedPlan: undefined,
+        gatePlan: async () => {
+          lifecycle.push(verdict.kind);
+          return verdict as never;
+        },
+        reportIteration: async (iteration) => {
+          lifecycle.push(`running:${iteration}`);
+          return undefined;
+        },
+      });
+
+      await assert.rejects(
+        withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, `${verdict.kind} plan`),
+        verdict.kind === "reject" ? /not approved/ : /run cancelled/,
+      );
+      assert.deepEqual(lifecycle, [verdict.kind], `${verdict.kind} stops before the running report`);
+    }
   });
 
   it("passes reviewer feedback to the revised plan turn and bounds revision attempts", async () => {
@@ -2687,11 +2736,19 @@ describe("CodexExecutor: plan folding + implement/review loop (m2)", () => {
       }),
     ]);
     const checkpoints: { reap: boolean }[] = [];
+    const iterations: number[] = [];
     // Pre-approved by default (makeCtx) → straight to the implement loop, no gate.
-    const { ctx } = makeCtx({ checkpoint: async (opts) => { checkpoints.push({ reap: opts.reap }); } });
+    const { ctx } = makeCtx({
+      checkpoint: async (opts) => { checkpoints.push({ reap: opts.reap }); },
+      reportIteration: async (iteration) => {
+        iterations.push(iteration);
+        return undefined;
+      },
+    });
     const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "checkpoint run");
 
     assert.equal(result.branch, "agent/issue-42");
+    assert.deepEqual(iterations, [1, 2], "a pre-approved run reports every implementation iteration");
     assert.equal(rig.providerLaunches(), 2, "the cooperative checkpoint recreated a fresh provider epoch");
     assert.equal(rig.epochs[1]!.transport.turnStartCount, 1, "the second implement turn ran on the NEW root");
     // Exactly one cooperative reap:true; the done turn breaks before any iteration-boundary fallback.

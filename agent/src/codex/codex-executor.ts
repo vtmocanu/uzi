@@ -1599,6 +1599,10 @@ export class CodexExecutor implements Executor {
       let iteration = 0;
       for (;;) {
         iteration++;
+        // Report the iteration boundary before any implementation work. Besides carrying the
+        // latest progress, this is the post-approval `awaiting_approval` → `running` transition.
+        // Codex does not consume the served budget yet, so the return value is deliberately ignored.
+        await ctx.reportIteration?.(iteration, latestProgress);
         // PRD #1416 M2: drain the worker-authoritative safety steer at the loop top and, when
         // present, PREFIX it (framed as worker guidance, followed by a blank line) to THIS turn's
         // implement prompt only. Codex has no <follow_up> fence; keep it a per-turn prefix so it
