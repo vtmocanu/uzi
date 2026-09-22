@@ -136,9 +136,9 @@ func (f *instrFakeRefresh) DiscoverIdentity(_ context.Context, _ string) (codexa
 }
 
 // instrFakeStore implements all codexRefreshStore methods. Only the 5 reached on the advanced
-// happy path return success; the recovery/reconcile-only writes (issue #1532's fenced +
-// mismatch queries) are unreached here and return (0, nil); the 7 read/quarantine methods are
-// unreachable here and panic if hit.
+// happy path return success; the recovery/reconcile-only writes (issue #1532's fenced intent
+// write + the atomic mismatch clear-and-mark) are unreached here and return their zero values;
+// the 7 read/quarantine methods are unreachable here and panic if hit.
 type instrFakeStore struct{}
 
 func (instrFakeStore) InsertCodexRefreshIntent(context.Context, store.InsertCodexRefreshIntentParams) (store.CodexRefreshIntent, error) {
@@ -161,12 +161,8 @@ func (instrFakeStore) SetCodexRefreshIntentStateFenced(context.Context, store.Se
 	return int64(0), nil
 }
 
-func (instrFakeStore) ClearMismatchedCodexRecoverySlot(context.Context, store.ClearMismatchedCodexRecoverySlotParams) (int64, error) {
-	return int64(0), nil
-}
-
-func (instrFakeStore) MarkCodexRecoveryMismatchIntents(context.Context, store.MarkCodexRecoveryMismatchIntentsParams) (int64, error) {
-	return int64(0), nil
+func (instrFakeStore) ClearMismatchedCodexRecoveryAndMarkIntents(context.Context, store.ClearMismatchedCodexRecoveryAndMarkIntentsParams) (store.ClearMismatchedCodexRecoveryAndMarkIntentsRow, error) {
+	return store.ClearMismatchedCodexRecoveryAndMarkIntentsRow{}, nil
 }
 
 func (instrFakeStore) ResetCodexCoordIdle(context.Context, store.ResetCodexCoordIdleParams) (int64, error) {

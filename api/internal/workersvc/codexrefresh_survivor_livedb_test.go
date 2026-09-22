@@ -485,3 +485,269 @@ func TestReconcileFencedIntentWriteSpareCommittedBarrierLiveDB(t *testing.T) {
 		t.Fatalf("provider Refresh calls = %d, want 0 (the survivor must never exchange)", fake.calls)
 	}
 }
+
+// survivorScanContains reports whether ListUnresolvedCodexRefreshAccounts (the global survivor
+// scan Service.Sweep drives) currently selects accountID — i.e. whether it is still a retry
+// candidate. `now` is irrelevant to arm (c) (quarantined + recovery_sealed present +
+// recovery_generation == generation), which is the arm this file's mismatch tests exercise.
+func survivorScanContains(t *testing.T, env codexTestEnv, accountID uuid.UUID) bool {
+	t.Helper()
+	rows, err := env.q.ListUnresolvedCodexRefreshAccounts(env.ctx, pgtype.Timestamptz{Time: time.Now(), Valid: true})
+	if err != nil {
+		t.Fatalf("list unresolved accounts: %v", err)
+	}
+	for _, r := range rows {
+		if r.ID == accountID {
+			return true
+		}
+	}
+	return false
+}
+
+// TestClearMismatchedCodexRecoveryAndMarkIntentsAtomicLiveDB (issue #1532, race 1) is the
+// STORE-LEVEL all-or-nothing regression for the atomic verified-mismatch clear-and-mark. It
+// drives env.q directly (the raw *store.Queries), so it pins the single data-modifying-CTE
+// statement's own semantics: the gen-CAS-fenced slot clear and the intent correction commit
+// together, or — when the fence lost — neither does. Both subtests seed the exact shape the
+// promotion path's verified-mismatch branch acts on: a quarantined account holding a recovery
+// blob at generation 0, with an intent the main loop optimistically drove to 'reconciled' at
+// from_generation 0 off that (now-untrusted) copy.
+func TestClearMismatchedCodexRecoveryAndMarkIntentsAtomicLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+
+	// seed leaves f's account quarantined with a recovery blob at generation 0 and an intent
+	// forced to 'reconciled' at from_generation 0; it returns the op id keying the intent.
+	seed := func(t *testing.T, f refreshFixture) uuid.UUID {
+		t.Helper()
+		op := uuid.New()
+		future := pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true}
+		if n, err := env.q.AcquireCodexRefreshLease(env.ctx, store.AcquireCodexRefreshLeaseParams{
+			Op: op, Deadline: future, ID: f.accountID, UserID: f.userID, FromGeneration: 0,
+		}); err != nil || n != 1 {
+			t.Fatalf("AcquireCodexRefreshLease = (%d,%v), want (1,nil)", n, err)
+		}
+		raw, merr := json.Marshal(codexLoginBlob{AccessToken: codexToken("mismatch-access"), RefreshToken: codexToken("mismatch-refresh")})
+		if merr != nil {
+			t.Fatalf("marshal recovery blob: %v", merr)
+		}
+		sealed, serr := env.box.Seal(raw)
+		if serr != nil {
+			t.Fatalf("seal recovery blob: %v", serr)
+		}
+		if _, err := env.q.SetCodexRecoverySlot(env.ctx, store.SetCodexRecoverySlotParams{
+			Sealed: sealed, Gen: 0, ID: f.accountID, UserID: f.userID,
+			Op: op, RecoverySealedWith: pgtype.Text{String: store.SealedWithMaster, Valid: true},
+		}); err != nil {
+			t.Fatalf("seed recovery slot: %v", err)
+		}
+		if _, err := env.q.InsertCodexRefreshIntent(env.ctx, store.InsertCodexRefreshIntentParams{
+			OperationID: op, UserID: f.userID, ProviderAccountID: f.accountID, FromGeneration: 0,
+		}); err != nil {
+			t.Fatalf("insert intent: %v", err)
+		}
+		// The reconcile main loop optimistically marks such an intent 'reconciled' off the recovery
+		// copy BEFORE the promotion path re-verifies it; force that precondition directly.
+		if _, err := env.q.SetCodexRefreshIntentState(env.ctx, store.SetCodexRefreshIntentStateParams{
+			State: codexIntentReconciled, OperationID: op, UserID: f.userID,
+		}); err != nil {
+			t.Fatalf("force intent reconciled: %v", err)
+		}
+		return op
+	}
+
+	t.Run("both applied", func(t *testing.T) {
+		f := newRefreshFixture(t, env, &fakeRefreshClient{})
+		op := seed(t, f)
+
+		res, err := env.q.ClearMismatchedCodexRecoveryAndMarkIntents(env.ctx, store.ClearMismatchedCodexRecoveryAndMarkIntentsParams{
+			ID: f.accountID, UserID: f.userID, FromGeneration: 0,
+		})
+		if err != nil {
+			t.Fatalf("clear-and-mark: %v", err)
+		}
+		if res.Cleared != 1 || res.Marked != 1 {
+			t.Fatalf("clear-and-mark = (cleared=%d marked=%d), want (1, 1)", res.Cleared, res.Marked)
+		}
+		acct := env.mustAccount(t, f.userID, f.accountID)
+		if len(acct.RecoverySealed) != 0 || acct.RecoveryGeneration.Valid || acct.RecoverySealedWith.Valid {
+			t.Fatalf("recovery slot not cleared: sealed=%d gen=%v with=%v", len(acct.RecoverySealed), acct.RecoveryGeneration, acct.RecoverySealedWith)
+		}
+		if it := mustIntent(t, env, op, f.userID); it.State != codexIntentUnrecoverable {
+			t.Fatalf("intent state = %q, want unrecoverable", it.State)
+		}
+	})
+
+	t.Run("fence lost touches neither", func(t *testing.T) {
+		f := newRefreshFixture(t, env, &fakeRefreshClient{})
+		op := seed(t, f)
+
+		// Simulate a concurrent promote/re-link that moved the account out from under the caller:
+		// flip it off 'quarantined' so the gen-CAS fence (coord_state='quarantined' AND
+		// recovery_generation=0) no longer holds and the clear matches no row.
+		env.exec("UPDATE codex_provider_account SET coord_state='idle' WHERE id=$1", f.accountID)
+
+		res, err := env.q.ClearMismatchedCodexRecoveryAndMarkIntents(env.ctx, store.ClearMismatchedCodexRecoveryAndMarkIntentsParams{
+			ID: f.accountID, UserID: f.userID, FromGeneration: 0,
+		})
+		if err != nil {
+			t.Fatalf("clear-and-mark: %v", err)
+		}
+		if res.Cleared != 0 || res.Marked != 0 {
+			t.Fatalf("clear-and-mark on lost fence = (cleared=%d marked=%d), want (0, 0) — a lost CAS must touch neither slot nor intents", res.Cleared, res.Marked)
+		}
+		// The recovery slot is UNCHANGED (still present) and — the property the atomic fold buys —
+		// the intent is UNCHANGED (still 'reconciled'): nothing half-applied, so a later pass can
+		// still retry it once the account is a candidate again.
+		acct := env.mustAccount(t, f.userID, f.accountID)
+		if len(acct.RecoverySealed) == 0 {
+			t.Fatalf("recovery slot cleared despite lost fence, want retained")
+		}
+		if it := mustIntent(t, env, op, f.userID); it.State != codexIntentReconciled {
+			t.Fatalf("intent state = %q, want still reconciled (a lost CAS gates the intent update on the slot clear via (SELECT id FROM cleared))", it.State)
+		}
+	})
+}
+
+// clearMismatchFailOnceStore wraps *store.Queries to inject a transient failure into the FIRST
+// ClearMismatchedCodexRecoveryAndMarkIntents call and delegate to the real store thereafter — so
+// a test can drive the verified-mismatch branch's atomic clear-and-mark to a mid-operation
+// failure on tick 1 and let it succeed on tick 2. Pointer receiver so `failNext` persists.
+type clearMismatchFailOnceStore struct {
+	*store.Queries
+	failNext bool
+}
+
+func (h *clearMismatchFailOnceStore) ClearMismatchedCodexRecoveryAndMarkIntents(ctx context.Context, arg store.ClearMismatchedCodexRecoveryAndMarkIntentsParams) (store.ClearMismatchedCodexRecoveryAndMarkIntentsRow, error) {
+	if h.failNext {
+		h.failNext = false
+		return store.ClearMismatchedCodexRecoveryAndMarkIntentsRow{}, errors.New("transient clear-and-mark failure")
+	}
+	return h.Queries.ClearMismatchedCodexRecoveryAndMarkIntents(ctx, arg)
+}
+
+// TestSweepSurvivorMismatchClearIsAtomicAndRetriableLiveDB (issue #1532, race 1) is the
+// SERVICE-LEVEL failure-injection regression proving the atomic clear-and-mark leaves no durable
+// half-state on a crash AND stays retriable through the production Service.Sweep seam. It seeds a
+// quarantined account whose recovery blob is a VERIFIED MISMATCH (its token discovers a DIFFERENT
+// tuple than the account's frozen one), with a 'rotating' intent at generation 0. A store wrapper
+// fails the atomic clear-and-mark exactly once.
+//
+// Tick 1 (failure injected): the survivor main loop first flips the rotating intent to
+// 'reconciled' via the fenced write, then the verified-mismatch branch's atomic clear-and-mark
+// fails. Because the clear + intent-correction are ONE statement, the failure leaves NO durable
+// half-state: the account stays quarantined, the recovery slot STILL PRESENT, the intent still
+// 'reconciled' (NOT 'unrecoverable'), and the account is STILL a survivor candidate (arm (c)).
+//
+// Tick 2 (failure cleared): Service.Sweep re-lists the account via arm (c), re-verifies the
+// mismatch, and the clear-and-mark now succeeds — slot NULL, intent 'unrecoverable', account no
+// longer a candidate.
+//
+// MUTATION PROOF (documented; a separate tester runs it — no revert performed here): reverting
+// ClearMismatchedCodexRecoveryAndMarkIntents back to two separate autocommitted writes (clear the
+// slot, then a SEPARATELY-failing mark) would, at tick 1's injected failure, leave the slot
+// CLEARED, the intent still 'reconciled', and the account NOT a candidate (recovery_sealed NULL) —
+// so tick 2 could never re-list it, never retry, and this test's tick-2 assertions (recovery slot
+// null, intent unrecoverable, CodexRefreshRecovered >= 1) would fail. i.e. fail-old / pass-new.
+func TestSweepSurvivorMismatchClearIsAtomicAndRetriableLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	// discoverDefaultErr defers every OTHER user's leftover recovery blob under the global tick-2
+	// sweep, so a foreign account is never spuriously promoted/mismatch-cleared; the mismatch token
+	// below maps (via identityByToken) to a tuple that positively DIFFERS from this account's frozen
+	// tuple, so its promotion is a VERIFIED MISMATCH.
+	fake := &fakeRefreshClient{discoverDefaultErr: codexauth.ErrIdentityIncomplete}
+	f := newRefreshFixture(t, env, fake)
+
+	// Seed a quarantined account holding a VERIFIED-MISMATCH recovery blob at generation 0 plus a
+	// 'rotating' intent at from_generation 0 (mirrors codexrefresh_livedb_test.go's "mismatched
+	// recovery" fixture): acquire a lease under a known op, protect the recovery blob (quarantines),
+	// insert the intent.
+	mismatchTok := codexToken("access-mismatch")
+	op := uuid.New()
+	future := pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true}
+	if n, err := env.q.AcquireCodexRefreshLease(env.ctx, store.AcquireCodexRefreshLeaseParams{
+		Op: op, Deadline: future, ID: f.accountID, UserID: f.userID, FromGeneration: 0,
+	}); err != nil || n != 1 {
+		t.Fatalf("AcquireCodexRefreshLease = (%d,%v), want (1,nil)", n, err)
+	}
+	raw, merr := json.Marshal(codexLoginBlob{AccessToken: mismatchTok, RefreshToken: codexToken("mismatch-refresh")}) //nolint:gosec // G117: synthetic recovery fixture, master-sealed below
+	if merr != nil {
+		t.Fatalf("marshal recovery blob: %v", merr)
+	}
+	sealedRec, serr := env.box.Seal(raw)
+	if serr != nil {
+		t.Fatalf("seal recovery blob: %v", serr)
+	}
+	if _, err := env.q.SetCodexRecoverySlot(env.ctx, store.SetCodexRecoverySlotParams{
+		Sealed: sealedRec, Gen: 0, ID: f.accountID, UserID: f.userID,
+		Op: op, RecoverySealedWith: pgtype.Text{String: store.SealedWithMaster, Valid: true},
+	}); err != nil {
+		t.Fatalf("seed recovery slot: %v", err)
+	}
+	if _, err := env.q.InsertCodexRefreshIntent(env.ctx, store.InsertCodexRefreshIntentParams{
+		OperationID: op, UserID: f.userID, ProviderAccountID: f.accountID, FromGeneration: 0,
+	}); err != nil {
+		t.Fatalf("insert intent: %v", err)
+	}
+	// The recovery token verifies to a DIFFERENT account than the one it sits under.
+	fake.identityByToken = map[string]codexauth.Identity{
+		mismatchTok: {ProviderUserID: "other-" + uuid.NewString(), WorkspaceAccountID: "other-" + uuid.NewString()},
+	}
+
+	// A FULL Sweep-capable Service (time.Now clock), whose store wrapper fails the atomic
+	// clear-and-mark exactly ONCE.
+	wrapper := &clearMismatchFailOnceStore{Queries: env.q, failNext: true}
+	svc := New(env.q, env.box, testParams())
+	svc.SetReadyAt(time.Now())
+	svc.SetCodexRefresh(fake)
+	svc.q = wrapper
+
+	// Tick 1 (failure injected): the fenced write flips the intent to 'reconciled', then the atomic
+	// clear-and-mark fails. Assert NO durable half-state.
+	_, _, err := svc.reconcileUnresolvedCodexRefresh(env.ctx, f.userID, f.accountID)
+	if err == nil {
+		t.Fatal("tick 1 reconcile: want the injected clear-and-mark failure, got nil")
+	}
+	acct1 := env.mustAccount(t, f.userID, f.accountID)
+	if acct1.CoordState != codexCoordQuarantined {
+		t.Fatalf("tick 1 coord_state = %q, want still quarantined (the failed clear must not move it)", acct1.CoordState)
+	}
+	if len(acct1.RecoverySealed) == 0 {
+		t.Fatalf("tick 1 recovery slot emptied, want STILL PRESENT (the atomic clear failed, so nothing was written)")
+	}
+	if !acct1.RecoveryGeneration.Valid || acct1.RecoveryGeneration.Int64 != acct1.Generation {
+		t.Fatalf("tick 1 recovery_generation=%v generation=%d, want equal (still a survivor candidate)", acct1.RecoveryGeneration, acct1.Generation)
+	}
+	if it := mustIntent(t, env, op, f.userID); it.State != codexIntentReconciled {
+		t.Fatalf("tick 1 intent state = %q, want reconciled — NOT unrecoverable (the atomic clear-and-mark is all-or-nothing, so a failed clear leaves the optimistic reconcile in place)", it.State)
+	}
+	// The account still matches arm (c), so the deferred clear will be retried on a later tick.
+	if !survivorScanContains(t, env, f.accountID) {
+		t.Fatal("tick 1: account is no longer a survivor candidate, want it retriable via arm (c)")
+	}
+
+	// Tick 2 (failure now cleared): drive through the production Service.Sweep seam. arm (c) re-lists
+	// the account; the mismatch re-verifies; the atomic clear-and-mark now succeeds — slot cleared
+	// AND intent flipped to 'unrecoverable' together.
+	res2, err := svc.Sweep(env.ctx)
+	if err != nil {
+		t.Fatalf("tick 2 Sweep: %v", err)
+	}
+	if res2.CodexRefreshRecovered < 1 {
+		t.Fatalf("tick 2 CodexRefreshRecovered = %d, want >= 1 (the retried clear is a real change)", res2.CodexRefreshRecovered)
+	}
+	acct2 := env.mustAccount(t, f.userID, f.accountID)
+	if len(acct2.RecoverySealed) != 0 || acct2.RecoveryGeneration.Valid || acct2.RecoverySealedWith.Valid {
+		t.Fatalf("tick 2 recovery slot not cleared: sealed=%d gen=%v with=%v", len(acct2.RecoverySealed), acct2.RecoveryGeneration, acct2.RecoverySealedWith)
+	}
+	if acct2.CoordState != codexCoordQuarantined {
+		t.Fatalf("tick 2 coord_state = %q, want still quarantined (the clear nulls the recovery slot only, it never un-quarantines)", acct2.CoordState)
+	}
+	if it := mustIntent(t, env, op, f.userID); it.State != codexIntentUnrecoverable {
+		t.Fatalf("tick 2 intent state = %q, want unrecoverable", it.State)
+	}
+	// No longer a survivor candidate: recovery_sealed is NULL, so arm (c) stops selecting it and the
+	// always-on retry TERMINATES.
+	if survivorScanContains(t, env, f.accountID) {
+		t.Fatal("tick 2: account still a survivor candidate after the clear, want it dropped from arm (c)")
+	}
+}

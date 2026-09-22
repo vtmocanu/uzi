@@ -60,36 +60,72 @@ func (q *Queries) AcquireCodexRefreshLease(ctx context.Context, arg AcquireCodex
 	return result.RowsAffected(), nil
 }
 
-const clearMismatchedCodexRecoverySlot = `-- name: ClearMismatchedCodexRecoverySlot :execrows
-UPDATE codex_provider_account
-SET recovery_sealed = NULL, recovery_generation = NULL, recovery_sealed_with = NULL, updated_at = now()
-WHERE id = $1 AND user_id = $2
-  AND coord_state = 'quarantined'
-  AND recovery_generation = $3::bigint
+const clearMismatchedCodexRecoveryAndMarkIntents = `-- name: ClearMismatchedCodexRecoveryAndMarkIntents :one
+WITH cleared AS (
+    UPDATE codex_provider_account
+    SET recovery_sealed = NULL, recovery_generation = NULL, recovery_sealed_with = NULL, updated_at = now()
+    WHERE codex_provider_account.id = $1 AND codex_provider_account.user_id = $2
+      AND codex_provider_account.coord_state = 'quarantined'
+      AND codex_provider_account.recovery_generation = $3::bigint
+    RETURNING codex_provider_account.id
+),
+marked AS (
+    UPDATE codex_refresh_intent
+    SET state = 'unrecoverable', updated_at = now()
+    WHERE codex_refresh_intent.user_id = $2
+      AND codex_refresh_intent.provider_account_id = (SELECT cleared.id FROM cleared)
+      AND codex_refresh_intent.from_generation = $3::bigint
+      AND codex_refresh_intent.state = 'reconciled'
+    RETURNING codex_refresh_intent.operation_id
+)
+SELECT (SELECT count(*) FROM cleared)::bigint AS cleared,
+       (SELECT count(*) FROM marked)::bigint  AS marked
 `
 
-type ClearMismatchedCodexRecoverySlotParams struct {
+type ClearMismatchedCodexRecoveryAndMarkIntentsParams struct {
 	ID             uuid.UUID `json:"id"`
 	UserID         uuid.UUID `json:"user_id"`
 	FromGeneration int64     `json:"from_generation"`
 }
 
-// Clear a VERIFIED-MISMATCH recovery slot (issue #1532, race 1): the promotion path proved (via
-// a full-network DiscoverIdentity) that the protected material belongs to a DIFFERENT account,
-// so it is safe to drop — and dropping it is what makes the always-on retry TERMINATE, because
+type ClearMismatchedCodexRecoveryAndMarkIntentsRow struct {
+	Cleared int64 `json:"cleared"`
+	Marked  int64 `json:"marked"`
+}
+
+// Clear a VERIFIED-MISMATCH recovery slot AND correct its optimistically-reconciled intents in
+// ONE atomic data-modifying-CTE statement (issue #1532, race 1). The promotion path proved (via
+// a full-network DiscoverIdentity) that the protected material belongs to a DIFFERENT account, so
+// it is safe to drop — and dropping it is what makes the always-on retry TERMINATE, because
 // ListUnresolvedCodexRefreshAccounts's arm (c) stops selecting an account once its recovery slot
-// is empty. The generation-CAS (recovery_generation = @from_generation) makes this a no-op if a
-// concurrent re-link/promotion already advanced the account under us (the slot moved), so a
-// verified mismatch never clobbers freshly-promoted material. Owner-scoped; the (recovery_sealed,
-// recovery_generation, recovery_sealed_with) triple is cleared together so 00199's
-// (recovery_sealed IS NULL) = (recovery_sealed_with IS NULL) CHECK stays satisfied. 0 rows means
-// the account moved under the caller — do NOT then touch its intents.
-func (q *Queries) ClearMismatchedCodexRecoverySlot(ctx context.Context, arg ClearMismatchedCodexRecoverySlotParams) (int64, error) {
-	result, err := q.db.Exec(ctx, clearMismatchedCodexRecoverySlot, arg.ID, arg.UserID, arg.FromGeneration)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
+// is empty. This folds the former two autocommitted writes (ClearMismatchedCodexRecoverySlot then
+// MarkCodexRecoveryMismatchIntents) into a single statement: it closes the crash-between-writes
+// window in which a durable half-applied state — the slot cleared (so arm (c) drops the account)
+// while the intents stayed 'reconciled' — could survive, unrepairable by any later sweep.
+//
+// `cleared` preserves the generation-CAS fence unchanged (coord_state = 'quarantined' AND
+// recovery_generation = @from_generation), so a concurrent re-link/promotion that already advanced
+// the account under us matches no row and clobbers no freshly-promoted material. `marked` runs its
+// intent correction ONLY when the fence HELD: its predicate joins on
+// provider_account_id = (SELECT id FROM cleared), and that subselect is NULL when `cleared` matched
+// no row, so a lost CAS touches no intents and the account stays a survivor retry candidate for a
+// later pass (nothing half-applied). It flips exactly the intents the reconcile main loop
+// OPTIMISTICALLY reconciled off the (now-untrusted) recovery copy — those still 'reconciled' at
+// from_generation == the recovery generation — to 'unrecoverable'; an intent reconciled because the
+// account's generation independently ADVANCED past its from_generation is at a LOWER from_generation
+// and is excluded automatically (this path runs only with recovery_generation == generation).
+//
+// Owner-scoped. The (recovery_sealed, recovery_generation, recovery_sealed_with) triple is cleared
+// together so 00199's (recovery_sealed IS NULL) = (recovery_sealed_with IS NULL) CHECK stays
+// satisfied. Postgres evaluates the data-modifying CTEs against ONE snapshot, communicating only
+// via RETURNING, so `marked`'s (SELECT id FROM cleared) sees exactly `cleared`'s result within the
+// same statement. Returns (cleared, marked) counts: cleared == 0 means the account moved under the
+// caller and nothing — slot or intents — was touched.
+func (q *Queries) ClearMismatchedCodexRecoveryAndMarkIntents(ctx context.Context, arg ClearMismatchedCodexRecoveryAndMarkIntentsParams) (ClearMismatchedCodexRecoveryAndMarkIntentsRow, error) {
+	row := q.db.QueryRow(ctx, clearMismatchedCodexRecoveryAndMarkIntents, arg.ID, arg.UserID, arg.FromGeneration)
+	var i ClearMismatchedCodexRecoveryAndMarkIntentsRow
+	err := row.Scan(&i.Cleared, &i.Marked)
+	return i, err
 }
 
 const commitCodexRefresh = `-- name: CommitCodexRefresh :one
@@ -569,36 +605,6 @@ func (q *Queries) MarkCodexReauthRequired(ctx context.Context, arg MarkCodexReau
 		arg.ID,
 		arg.UserID,
 	)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
-}
-
-const markCodexRecoveryMismatchIntents = `-- name: MarkCodexRecoveryMismatchIntents :execrows
-UPDATE codex_refresh_intent
-SET state = 'unrecoverable', updated_at = now()
-WHERE user_id = $1 AND provider_account_id = $2
-  AND from_generation = $3::bigint
-  AND state = 'reconciled'
-`
-
-type MarkCodexRecoveryMismatchIntentsParams struct {
-	UserID             uuid.UUID `json:"user_id"`
-	ProviderAccountID  uuid.UUID `json:"provider_account_id"`
-	RecoveryGeneration int64     `json:"recovery_generation"`
-}
-
-// Mark the recovery-mismatch intents unrecoverable (issue #1532, race 1): the cross-pass-safe
-// replacement for the in-memory intents-slice loop the old promoteCodexRecovery ran. It targets
-// exactly the intents the reconcile main loop OPTIMISTICALLY reconciled off the (now-untrusted)
-// recovery copy — those still 'reconciled' at from_generation == the recovery generation — and
-// flips them to 'unrecoverable', which is durable across passes rather than confined to one
-// reconcile's local slice. An intent reconciled because the account's generation independently
-// ADVANCED past its from_generation is at a LOWER from_generation and is excluded automatically
-// (this path runs only with recovery_generation == generation). Owner-scoped.
-func (q *Queries) MarkCodexRecoveryMismatchIntents(ctx context.Context, arg MarkCodexRecoveryMismatchIntentsParams) (int64, error) {
-	result, err := q.db.Exec(ctx, markCodexRecoveryMismatchIntents, arg.UserID, arg.ProviderAccountID, arg.RecoveryGeneration)
 	if err != nil {
 		return 0, err
 	}

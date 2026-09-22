@@ -536,34 +536,51 @@ WHERE (cpa.coord_state = 'in_progress' AND cpa.lease_deadline < @now::timestampt
        AND cpa.recovery_sealed IS NOT NULL
        AND cpa.recovery_generation = cpa.generation);
 
--- name: ClearMismatchedCodexRecoverySlot :execrows
--- Clear a VERIFIED-MISMATCH recovery slot (issue #1532, race 1): the promotion path proved (via
--- a full-network DiscoverIdentity) that the protected material belongs to a DIFFERENT account,
--- so it is safe to drop — and dropping it is what makes the always-on retry TERMINATE, because
+-- name: ClearMismatchedCodexRecoveryAndMarkIntents :one
+-- Clear a VERIFIED-MISMATCH recovery slot AND correct its optimistically-reconciled intents in
+-- ONE atomic data-modifying-CTE statement (issue #1532, race 1). The promotion path proved (via
+-- a full-network DiscoverIdentity) that the protected material belongs to a DIFFERENT account, so
+-- it is safe to drop — and dropping it is what makes the always-on retry TERMINATE, because
 -- ListUnresolvedCodexRefreshAccounts's arm (c) stops selecting an account once its recovery slot
--- is empty. The generation-CAS (recovery_generation = @from_generation) makes this a no-op if a
--- concurrent re-link/promotion already advanced the account under us (the slot moved), so a
--- verified mismatch never clobbers freshly-promoted material. Owner-scoped; the (recovery_sealed,
--- recovery_generation, recovery_sealed_with) triple is cleared together so 00199's
--- (recovery_sealed IS NULL) = (recovery_sealed_with IS NULL) CHECK stays satisfied. 0 rows means
--- the account moved under the caller — do NOT then touch its intents.
-UPDATE codex_provider_account
-SET recovery_sealed = NULL, recovery_generation = NULL, recovery_sealed_with = NULL, updated_at = now()
-WHERE id = @id AND user_id = @user_id
-  AND coord_state = 'quarantined'
-  AND recovery_generation = @from_generation::bigint;
-
--- name: MarkCodexRecoveryMismatchIntents :execrows
--- Mark the recovery-mismatch intents unrecoverable (issue #1532, race 1): the cross-pass-safe
--- replacement for the in-memory intents-slice loop the old promoteCodexRecovery ran. It targets
--- exactly the intents the reconcile main loop OPTIMISTICALLY reconciled off the (now-untrusted)
--- recovery copy — those still 'reconciled' at from_generation == the recovery generation — and
--- flips them to 'unrecoverable', which is durable across passes rather than confined to one
--- reconcile's local slice. An intent reconciled because the account's generation independently
--- ADVANCED past its from_generation is at a LOWER from_generation and is excluded automatically
--- (this path runs only with recovery_generation == generation). Owner-scoped.
-UPDATE codex_refresh_intent
-SET state = 'unrecoverable', updated_at = now()
-WHERE user_id = @user_id AND provider_account_id = @provider_account_id
-  AND from_generation = @recovery_generation::bigint
-  AND state = 'reconciled';
+-- is empty. This folds the former two autocommitted writes (ClearMismatchedCodexRecoverySlot then
+-- MarkCodexRecoveryMismatchIntents) into a single statement: it closes the crash-between-writes
+-- window in which a durable half-applied state — the slot cleared (so arm (c) drops the account)
+-- while the intents stayed 'reconciled' — could survive, unrepairable by any later sweep.
+--
+-- `cleared` preserves the generation-CAS fence unchanged (coord_state = 'quarantined' AND
+-- recovery_generation = @from_generation), so a concurrent re-link/promotion that already advanced
+-- the account under us matches no row and clobbers no freshly-promoted material. `marked` runs its
+-- intent correction ONLY when the fence HELD: its predicate joins on
+-- provider_account_id = (SELECT id FROM cleared), and that subselect is NULL when `cleared` matched
+-- no row, so a lost CAS touches no intents and the account stays a survivor retry candidate for a
+-- later pass (nothing half-applied). It flips exactly the intents the reconcile main loop
+-- OPTIMISTICALLY reconciled off the (now-untrusted) recovery copy — those still 'reconciled' at
+-- from_generation == the recovery generation — to 'unrecoverable'; an intent reconciled because the
+-- account's generation independently ADVANCED past its from_generation is at a LOWER from_generation
+-- and is excluded automatically (this path runs only with recovery_generation == generation).
+--
+-- Owner-scoped. The (recovery_sealed, recovery_generation, recovery_sealed_with) triple is cleared
+-- together so 00199's (recovery_sealed IS NULL) = (recovery_sealed_with IS NULL) CHECK stays
+-- satisfied. Postgres evaluates the data-modifying CTEs against ONE snapshot, communicating only
+-- via RETURNING, so `marked`'s (SELECT id FROM cleared) sees exactly `cleared`'s result within the
+-- same statement. Returns (cleared, marked) counts: cleared == 0 means the account moved under the
+-- caller and nothing — slot or intents — was touched.
+WITH cleared AS (
+    UPDATE codex_provider_account
+    SET recovery_sealed = NULL, recovery_generation = NULL, recovery_sealed_with = NULL, updated_at = now()
+    WHERE codex_provider_account.id = @id AND codex_provider_account.user_id = @user_id
+      AND codex_provider_account.coord_state = 'quarantined'
+      AND codex_provider_account.recovery_generation = @from_generation::bigint
+    RETURNING codex_provider_account.id
+),
+marked AS (
+    UPDATE codex_refresh_intent
+    SET state = 'unrecoverable', updated_at = now()
+    WHERE codex_refresh_intent.user_id = @user_id
+      AND codex_refresh_intent.provider_account_id = (SELECT cleared.id FROM cleared)
+      AND codex_refresh_intent.from_generation = @from_generation::bigint
+      AND codex_refresh_intent.state = 'reconciled'
+    RETURNING codex_refresh_intent.operation_id
+)
+SELECT (SELECT count(*) FROM cleared)::bigint AS cleared,
+       (SELECT count(*) FROM marked)::bigint  AS marked;

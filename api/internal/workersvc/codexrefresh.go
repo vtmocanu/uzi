@@ -210,15 +210,13 @@ type codexRefreshStore interface {
 	// in-progress lease-holder of this intent's op — so a stale reconcile can never clobber a
 	// concurrently committed intent.
 	SetCodexRefreshIntentStateFenced(ctx context.Context, arg store.SetCodexRefreshIntentStateFencedParams) (int64, error)
-	// ClearMismatchedCodexRecoverySlot drops a verified-mismatch recovery slot (issue #1532,
-	// race 1), CAS-guarded on the recovery generation so a concurrent promote/re-link that
-	// moved the account is a no-op. Called only from promoteCodexRecovery's verified-mismatch
-	// branch.
-	ClearMismatchedCodexRecoverySlot(ctx context.Context, arg store.ClearMismatchedCodexRecoverySlotParams) (int64, error)
-	// MarkCodexRecoveryMismatchIntents flips the intents the main loop optimistically
-	// reconciled off a now-untrusted recovery copy to 'unrecoverable' (issue #1532, race 1),
-	// the cross-pass-safe replacement for the old in-memory intents-slice loop.
-	MarkCodexRecoveryMismatchIntents(ctx context.Context, arg store.MarkCodexRecoveryMismatchIntentsParams) (int64, error)
+	// ClearMismatchedCodexRecoveryAndMarkIntents atomically drops a verified-mismatch recovery
+	// slot (gen-CAS fenced on the recovery generation) AND flips its optimistically-'reconciled'
+	// intents to 'unrecoverable' in ONE statement (issue #1532, race 1), so a crash can never
+	// leave the slot cleared while the intents stay 'reconciled'. Returns (Cleared, Marked);
+	// Cleared == 0 means the fence lost and nothing — slot or intents — was touched. Called only
+	// from promoteCodexRecovery's verified-mismatch branch.
+	ClearMismatchedCodexRecoveryAndMarkIntents(ctx context.Context, arg store.ClearMismatchedCodexRecoveryAndMarkIntentsParams) (store.ClearMismatchedCodexRecoveryAndMarkIntentsRow, error)
 	ListUnresolvedCodexRefreshIntents(ctx context.Context, arg store.ListUnresolvedCodexRefreshIntentsParams) ([]store.CodexRefreshIntent, error)
 	AcquireCodexRefreshLease(ctx context.Context, arg store.AcquireCodexRefreshLeaseParams) (int64, error)
 	CommitCodexRefresh(ctx context.Context, arg store.CommitCodexRefreshParams) (store.CommitCodexRefreshRow, error)
@@ -1143,8 +1141,11 @@ func (s *Service) SweepUnresolvedCodexRefresh(ctx context.Context) (int64, error
 // recovery material as the live login, advancing the generation, clearing the quarantine.
 // A VERIFIED MISMATCH (discovery succeeded, tuple positively differs) means the recovery
 // copy is not this account's material after all, so the recovery slot is CLEARED (CAS-guarded
-// on the recovery generation) and the intents the main loop optimistically reconciled off it
-// are corrected to 'unrecoverable'. An INCOMPLETE identity (ErrIdentityIncomplete — "cannot
+// on the recovery generation) AND the intents the main loop optimistically reconciled off it
+// are corrected to 'unrecoverable' — both in ONE atomic data-modifying-CTE statement
+// (ClearMismatchedCodexRecoveryAndMarkIntents), so there is no ordering-dependent two-write
+// window a crash could leave half-applied (slot cleared, intents still 'reconciled'). An
+// INCOMPLETE identity (ErrIdentityIncomplete — "cannot
 // tell", not a positively-different tuple) or a TRANSIENT DiscoverIdentity error (or a locked
 // vault, or a nil seam) leaves the slot untouched for the next reconcile pass — the material
 // is retained, not lost (PRD #1147 M4, defect 5).
@@ -1210,24 +1211,25 @@ func (s *Service) promoteCodexRecovery(ctx context.Context, q codexRefreshStore,
 	case derr == nil:
 		// VERIFIED MISMATCH (tuple positively differs): the recovery copy is not this
 		// account's. Clear the slot (so arm (c) of the survivor scan stops selecting the
-		// account and the always-on retry TERMINATES) and mark the recovery-dependent intents
-		// unrecoverable — IN THIS ORDER, so a concurrent promote/re-link that moved the account
-		// out from under us is detected by the slot-clear CAS before any intent is touched.
-		cleared, cerr := q.ClearMismatchedCodexRecoverySlot(ctx, store.ClearMismatchedCodexRecoverySlotParams{ID: acct.ID, UserID: userID, FromGeneration: acct.Generation})
+		// account and the always-on retry TERMINATES) AND flip the recovery-dependent intents
+		// (those the main loop optimistically reconciled off this now-untrusted copy) to
+		// 'unrecoverable' in ONE atomic statement. Folding the former two autocommitted writes
+		// into a single data-modifying CTE removes the ordering-dependent two-write window: a
+		// crash between them could leave the slot cleared while the intents stayed 'reconciled',
+		// a durable half-applied state unrepairable by any later sweep. The gen-CAS fence
+		// (recovery_generation == acct.Generation, coord_state quarantined) is preserved in the
+		// clear, and the intent update is gated on the clear having matched a row, so a concurrent
+		// promote/re-link that moved the account out from under us touches neither slot nor
+		// intents. An intent reconciled because the account's generation independently ADVANCED
+		// sits at a LOWER from_generation and is excluded automatically (this path runs only when
+		// recovery_generation == generation), so a bad recovery copy never retroactively
+		// invalidates an independently-committed rotation.
+		res, cerr := q.ClearMismatchedCodexRecoveryAndMarkIntents(ctx, store.ClearMismatchedCodexRecoveryAndMarkIntentsParams{ID: acct.ID, UserID: userID, FromGeneration: acct.Generation})
 		if cerr != nil {
 			return false, fmt.Errorf("codex reconcile: clear mismatched recovery: %w", cerr)
 		}
-		if cleared == 0 {
-			return false, nil // account moved under us (concurrent promote/re-link) — do not touch intents
-		}
-		// MarkCodexRecoveryMismatchIntents flips exactly the intents the main loop optimistically
-		// reconciled off this (now-untrusted) recovery copy (state='reconciled' at
-		// from_generation == the recovery generation) to 'unrecoverable'. An intent reconciled
-		// because the account's generation independently ADVANCED sits at a LOWER from_generation
-		// and is excluded automatically (this path runs only when recovery_generation == generation),
-		// so a bad recovery copy never retroactively invalidates an independently-committed rotation.
-		if _, merr := q.MarkCodexRecoveryMismatchIntents(ctx, store.MarkCodexRecoveryMismatchIntentsParams{UserID: userID, ProviderAccountID: acct.ID, RecoveryGeneration: acct.Generation}); merr != nil {
-			return false, fmt.Errorf("codex reconcile: mark recovery-mismatch intents: %w", merr)
+		if res.Cleared == 0 {
+			return false, nil // account moved under us (concurrent promote/re-link) — the atomic CAS cleared nothing and touched no intents
 		}
 		return true, nil
 	default:
