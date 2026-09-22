@@ -384,6 +384,19 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 	// second"); its own thresholds sit above the flag's, so that ordering is
 	// belt-and-braces rather than the mechanism.
 	res.AutoStopped = s.autoStopWedgedRuns(ctx, now)
+
+	// Codex subscription-refresh survivor (issue #1532): reap any account left wedged by an
+	// interrupted refresh (in_progress + expired lease, or an orphaned rotating intent) →
+	// quarantine + resolve its intents, so a re-link can recover it via reconcileTuple's
+	// quarantined arm. Folded into Sweep — the always-on seam the sweeper Engine calls every
+	// tick and on Boot — rather than an optional sweeper.Pass, so it cannot be silently
+	// unregistered from main.go. Best-effort and non-terminal: a failure is logged and never
+	// aborts run recovery, matching detectRunHealth/autoStopWedgedRuns above.
+	if n, cerr := s.SweepUnresolvedCodexRefresh(ctx); cerr != nil {
+		slog.Error("sweeper: codex refresh survivor failed", "error", cerr)
+	} else {
+		res.CodexRefreshRecovered = n
+	}
 	return res, nil
 }
 

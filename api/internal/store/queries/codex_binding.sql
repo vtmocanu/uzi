@@ -473,9 +473,114 @@ UPDATE codex_refresh_intent
 SET state = @state, updated_at = now()
 WHERE operation_id = @operation_id AND user_id = @user_id;
 
+-- name: SetCodexRefreshIntentStateFenced :execrows
+-- Fenced survivor intent-state write (issue #1532, race 2): the reconcile pass decides a
+-- terminal state from a snapshot that can be stale (the durable intent is inserted BEFORE the
+-- lease, so the survivor can pick an account up mid-window). Only advance the intent when it is
+-- still 'rotating' AND the account is still at the generation the verdict was computed from AND
+-- the account is NOT a live in-progress lease-holder of THIS intent's op — so a concurrently
+-- committed intent, a generation that advanced under us, or a genuinely live in-flight op is
+-- never overwritten. Owner-scoped; the owning-op writes stay on the unconditional
+-- SetCodexRefreshIntentState. 0 rows means the guard rejected the stale write.
+UPDATE codex_refresh_intent cri
+SET state = @state, updated_at = now()
+WHERE cri.operation_id = @operation_id AND cri.user_id = @user_id
+  AND cri.state = 'rotating'
+  AND EXISTS (
+      SELECT 1 FROM codex_provider_account cpa
+      WHERE cpa.id = cri.provider_account_id AND cpa.user_id = cri.user_id
+        AND cpa.generation = @expected_generation::bigint
+        AND NOT (cpa.coord_state = 'in_progress'
+                 AND cpa.coord_operation_id = cri.operation_id
+                 AND cpa.lease_deadline IS NOT NULL
+                 AND cpa.lease_deadline > @now::timestamptz)
+  );
+
 -- name: ListUnresolvedCodexRefreshIntents :many
 -- The recovery scan (PRD #1147 M2): every still-'rotating' intent for an account, which a
 -- survivor reconciles against the account's actual generation. Owner-scoped; backed by
 -- the partial index idx_codex_refresh_intent_unresolved (00201).
 SELECT * FROM codex_refresh_intent
 WHERE user_id = @user_id AND provider_account_id = @provider_account_id AND state = 'rotating';
+
+-- name: ListUnresolvedCodexRefreshAccounts :many
+-- The always-on survivor scan's candidate set (issue #1532): every codex_provider_account a
+-- survivor pass must reconcile — an 'in_progress' account whose lease_deadline has passed (the
+-- wedge), OR any account carrying a still-'rotating' refresh intent that is NOT the live,
+-- non-expired lease-holder (an orphaned intent from a crashed op), OR any quarantined account
+-- still holding un-promoted recovery material at the current generation (issue #1532, race 1):
+-- a promotion that DEFERRED transiently (vault locked, incomplete/absent identity, nil seam, or
+-- a transient discovery error) drove its intents terminal and so is no longer surfaced by the
+-- rotating-intent arm — this arm re-lists it every tick until promotion succeeds (advances the
+-- generation and clears the slot → no longer matches) or a verified mismatch clears the slot.
+-- The arm mirrors ReconcileUnresolvedCodexRefresh's promotion precondition exactly. Each
+-- (id, user_id) is fed one-by-one to ReconcileUnresolvedCodexRefresh, the per-account
+-- reap→quarantine→resolve state machine. NOT owner-scoped at the account level: this is a
+-- service-owned global sweep, not a user request. The correlated intent subquery IS owner-scoped
+-- so it rides the (user_id, provider_account_id) leading key of idx_codex_refresh_intent_unresolved.
+SELECT cpa.id, cpa.user_id
+FROM codex_provider_account cpa
+WHERE (cpa.coord_state = 'in_progress' AND cpa.lease_deadline < @now::timestamptz)
+   OR (
+        EXISTS (
+            SELECT 1 FROM codex_refresh_intent cri
+            WHERE cri.user_id = cpa.user_id
+              AND cri.provider_account_id = cpa.id
+              AND cri.state = 'rotating'
+        )
+        AND NOT (cpa.coord_state = 'in_progress'
+                 AND cpa.lease_deadline IS NOT NULL
+                 AND cpa.lease_deadline >= @now::timestamptz)
+   )
+   OR (cpa.coord_state = 'quarantined'
+       AND cpa.recovery_sealed IS NOT NULL
+       AND cpa.recovery_generation = cpa.generation);
+
+-- name: ClearMismatchedCodexRecoveryAndMarkIntents :one
+-- Clear a VERIFIED-MISMATCH recovery slot AND correct its optimistically-reconciled intents in
+-- ONE atomic data-modifying-CTE statement (issue #1532, race 1). The promotion path proved (via
+-- a full-network DiscoverIdentity) that the protected material belongs to a DIFFERENT account, so
+-- it is safe to drop — and dropping it is what makes the always-on retry TERMINATE, because
+-- ListUnresolvedCodexRefreshAccounts's arm (c) stops selecting an account once its recovery slot
+-- is empty. This folds the former two autocommitted writes (ClearMismatchedCodexRecoverySlot then
+-- MarkCodexRecoveryMismatchIntents) into a single statement: it closes the crash-between-writes
+-- window in which a durable half-applied state — the slot cleared (so arm (c) drops the account)
+-- while the intents stayed 'reconciled' — could survive, unrepairable by any later sweep.
+--
+-- `cleared` preserves the generation-CAS fence unchanged (coord_state = 'quarantined' AND
+-- recovery_generation = @from_generation), so a concurrent re-link/promotion that already advanced
+-- the account under us matches no row and clobbers no freshly-promoted material. `marked` runs its
+-- intent correction ONLY when the fence HELD: its predicate joins on
+-- provider_account_id = (SELECT id FROM cleared), and that subselect is NULL when `cleared` matched
+-- no row, so a lost CAS touches no intents and the account stays a survivor retry candidate for a
+-- later pass (nothing half-applied). It flips exactly the intents the reconcile main loop
+-- OPTIMISTICALLY reconciled off the (now-untrusted) recovery copy — those still 'reconciled' at
+-- from_generation == the recovery generation — to 'unrecoverable'; an intent reconciled because the
+-- account's generation independently ADVANCED past its from_generation is at a LOWER from_generation
+-- and is excluded automatically (this path runs only with recovery_generation == generation).
+--
+-- Owner-scoped. The (recovery_sealed, recovery_generation, recovery_sealed_with) triple is cleared
+-- together so 00199's (recovery_sealed IS NULL) = (recovery_sealed_with IS NULL) CHECK stays
+-- satisfied. Postgres evaluates the data-modifying CTEs against ONE snapshot, communicating only
+-- via RETURNING, so `marked`'s (SELECT id FROM cleared) sees exactly `cleared`'s result within the
+-- same statement. Returns (cleared, marked) counts: cleared == 0 means the account moved under the
+-- caller and nothing — slot or intents — was touched.
+WITH cleared AS (
+    UPDATE codex_provider_account
+    SET recovery_sealed = NULL, recovery_generation = NULL, recovery_sealed_with = NULL, updated_at = now()
+    WHERE codex_provider_account.id = @id AND codex_provider_account.user_id = @user_id
+      AND codex_provider_account.coord_state = 'quarantined'
+      AND codex_provider_account.recovery_generation = @from_generation::bigint
+    RETURNING codex_provider_account.id
+),
+marked AS (
+    UPDATE codex_refresh_intent
+    SET state = 'unrecoverable', updated_at = now()
+    WHERE codex_refresh_intent.user_id = @user_id
+      AND codex_refresh_intent.provider_account_id = (SELECT cleared.id FROM cleared)
+      AND codex_refresh_intent.from_generation = @from_generation::bigint
+      AND codex_refresh_intent.state = 'reconciled'
+    RETURNING codex_refresh_intent.operation_id
+)
+SELECT (SELECT count(*) FROM cleared)::bigint AS cleared,
+       (SELECT count(*) FROM marked)::bigint  AS marked;

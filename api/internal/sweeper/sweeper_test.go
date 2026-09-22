@@ -180,6 +180,11 @@ func TestSweeperPassLogsResumeOnlyTicks(t *testing.T) {
 		// worker's out-of-time run) must raise the line too — the guard sum AND emit list both
 		// include WallParked, else a park-only tick logs nothing and the server-side park is invisible.
 		{name: "wall parked alone", res: workersvc.SweepResult{WallParked: 1}, attr: "wall_parked"},
+		// issue #1532: a tick that ONLY recovers a wedged Codex subscription-refresh account (an
+		// interrupted refresh's expired lease or orphaned rotating intent) must raise the line too —
+		// the guard sum AND emit list both include CodexRefreshRecovered, else the always-on
+		// survivor's recovery is invisible in the operator log.
+		{name: "codex refresh recovered alone", res: workersvc.SweepResult{CodexRefreshRecovered: 1}, attr: "codex_refresh_recovered"},
 		{name: "idle tick logs nothing", res: workersvc.SweepResult{}, attr: ""},
 	}
 	for _, tc := range cases {

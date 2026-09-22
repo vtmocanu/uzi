@@ -124,7 +124,7 @@ func (e *Engine) runOnce(ctx context.Context) {
 	}
 	// Only log when the pass actually did something, to keep the log quiet on an
 	// idle system.
-	if res.WorkersOffline+res.ClaimedReset+res.WallParkRequested+res.WallParked+res.StaleFailed+res.StaleRequeued+res.ChatIdleCompleted+res.ProposalsRecovered+res.HealthChanged+res.AutoStopped+res.LimitPromoted+res.PoolResumed+res.LimitReevaluated+res.RecoveryPromoted+res.CompletionBudgetExhausted+res.CustodyReleased+res.RecoveryStalled+res.RecoveryExpired+res.TaskUndispatchedFailed > 0 {
+	if res.WorkersOffline+res.ClaimedReset+res.WallParkRequested+res.WallParked+res.StaleFailed+res.StaleRequeued+res.ChatIdleCompleted+res.ProposalsRecovered+res.HealthChanged+res.AutoStopped+res.LimitPromoted+res.PoolResumed+res.LimitReevaluated+res.RecoveryPromoted+res.CompletionBudgetExhausted+res.CustodyReleased+res.RecoveryStalled+res.RecoveryExpired+res.TaskUndispatchedFailed+res.CodexRefreshRecovered > 0 {
 		slog.Info("sweeper pass",
 			"workers_offline", res.WorkersOffline,
 			"claimed_reset", res.ClaimedReset,
@@ -185,6 +185,10 @@ func (e *Engine) runOnce(ctx context.Context) {
 			// with dispatched_at NULL past DispatchGrace) still raises this line rather than
 			// failing an orphaned reservation invisibly.
 			"task_undispatched_failed", res.TaskUndispatchedFailed,
+			// issue #1532: same reasoning — in the sum above as well as emitted here, so a
+			// tick that only reaps a wedged Codex account (survivor pass) still raises this
+			// line rather than recovering an account invisibly.
+			"codex_refresh_recovered", res.CodexRefreshRecovered,
 		)
 	}
 }

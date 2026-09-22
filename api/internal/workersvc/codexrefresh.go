@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/codexauth"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
@@ -203,6 +204,19 @@ type codexRefreshStore interface {
 	GetCodexRefreshIntent(ctx context.Context, arg store.GetCodexRefreshIntentParams) (store.CodexRefreshIntent, error)
 	InsertCodexRefreshIntent(ctx context.Context, arg store.InsertCodexRefreshIntentParams) (store.CodexRefreshIntent, error)
 	SetCodexRefreshIntentState(ctx context.Context, arg store.SetCodexRefreshIntentStateParams) (int64, error)
+	// SetCodexRefreshIntentStateFenced is the survivor main-loop's fenced intent-state write
+	// (issue #1532, race 2): it advances the intent ONLY when it is still 'rotating', the
+	// account is still at the verdict's snapshot generation, and the account is not a live
+	// in-progress lease-holder of this intent's op — so a stale reconcile can never clobber a
+	// concurrently committed intent.
+	SetCodexRefreshIntentStateFenced(ctx context.Context, arg store.SetCodexRefreshIntentStateFencedParams) (int64, error)
+	// ClearMismatchedCodexRecoveryAndMarkIntents atomically drops a verified-mismatch recovery
+	// slot (gen-CAS fenced on the recovery generation) AND flips its optimistically-'reconciled'
+	// intents to 'unrecoverable' in ONE statement (issue #1532, race 1), so a crash can never
+	// leave the slot cleared while the intents stay 'reconciled'. Returns (Cleared, Marked);
+	// Cleared == 0 means the fence lost and nothing — slot or intents — was touched. Called only
+	// from promoteCodexRecovery's verified-mismatch branch.
+	ClearMismatchedCodexRecoveryAndMarkIntents(ctx context.Context, arg store.ClearMismatchedCodexRecoveryAndMarkIntentsParams) (store.ClearMismatchedCodexRecoveryAndMarkIntentsRow, error)
 	ListUnresolvedCodexRefreshIntents(ctx context.Context, arg store.ListUnresolvedCodexRefreshIntentsParams) ([]store.CodexRefreshIntent, error)
 	AcquireCodexRefreshLease(ctx context.Context, arg store.AcquireCodexRefreshLeaseParams) (int64, error)
 	CommitCodexRefresh(ctx context.Context, arg store.CommitCodexRefreshParams) (store.CommitCodexRefreshRow, error)
@@ -965,68 +979,159 @@ func (s *Service) ReleaseCodexCredential(ctx context.Context, wkr store.Worker, 
 // It NEVER re-spends the old refresh token and NEVER rotates. Returns how many intents it
 // resolved.
 func (s *Service) ReconcileUnresolvedCodexRefresh(ctx context.Context, userID, accountID uuid.UUID) (int, error) {
+	resolved, _, err := s.reconcileUnresolvedCodexRefresh(ctx, userID, accountID)
+	return resolved, err
+}
+
+// reconcileUnresolvedCodexRefresh is the internal body of ReconcileUnresolvedCodexRefresh
+// (issue #1532). It additionally returns `changed`: whether this pass mutated ANY row (reaped
+// an expired lease, advanced any intent through the fenced write, or promoted recovery
+// material). SweepUnresolvedCodexRefresh counts a recovered account only when `changed` is
+// true, so a pass that merely re-lists a quarantined-with-recovery account (arm (c) of
+// ListUnresolvedCodexRefreshAccounts) and defers its promotion again counts nothing. The
+// public ReconcileUnresolvedCodexRefresh keeps its (int, error) contract for existing callers.
+func (s *Service) reconcileUnresolvedCodexRefresh(ctx context.Context, userID, accountID uuid.UUID) (resolved int, changed bool, err error) {
 	q, ok := s.codexRefreshQueries()
 	if !ok {
-		return 0, errCodexStoreUnavailable
+		return 0, false, errCodexStoreUnavailable
 	}
 
 	// Reap an expired lease → quarantine (never a fresh rotation). Best-effort: a 0-row
-	// result just means the lease is not expired (or the account is not in_progress).
-	if _, err := q.QuarantineExpiredCodexLease(ctx, store.QuarantineExpiredCodexLeaseParams{
+	// result just means the lease is not expired (or the account is not in_progress). A
+	// reaped row (>0) is a real state change — count it toward `changed` so a crash that left
+	// an in_progress account with NO 'rotating' intent (reaped here, zero intents resolved)
+	// still registers as a recovered account (see SweepUnresolvedCodexRefresh's counting note).
+	reaped, err := q.QuarantineExpiredCodexLease(ctx, store.QuarantineExpiredCodexLeaseParams{
 		ID:     accountID,
 		UserID: userID,
 		Now:    pgconv.Time(s.codexNow()),
-	}); err != nil {
-		return 0, fmt.Errorf("codex reconcile: reap lease: %w", err)
+	})
+	if err != nil {
+		return 0, false, fmt.Errorf("codex reconcile: reap lease: %w", err)
+	}
+	if reaped > 0 {
+		changed = true
 	}
 
 	acct, err := q.GetCodexProviderAccountByID(ctx, store.GetCodexProviderAccountByIDParams{UserID: userID, ID: accountID})
 	if err != nil {
-		return 0, fmt.Errorf("codex reconcile: read account: %w", err)
+		return 0, changed, fmt.Errorf("codex reconcile: read account: %w", err)
 	}
 	intents, err := q.ListUnresolvedCodexRefreshIntents(ctx, store.ListUnresolvedCodexRefreshIntentsParams{
 		UserID:            userID,
 		ProviderAccountID: accountID,
 	})
 	if err != nil {
-		return 0, fmt.Errorf("codex reconcile: list intents: %w", err)
+		return 0, changed, fmt.Errorf("codex reconcile: list intents: %w", err)
 	}
 
-	resolved := 0
 	now := s.codexNow()
 	for _, it := range intents {
 		state := codexRefreshResolution(now, acct, it)
 		if state == codexIntentPending {
 			// A LIVE, validly-leased, in-flight rotation under THIS op (PRD #1147 M4, defect
 			// 6): reconciliation must NOT declare it. Leave the intent 'rotating' — no state
-			// write, not counted resolved — so the owning op can still commit, and it is not
-			// force-mutated in the intents slice passed to promoteCodexRecovery below.
+			// write, not counted resolved — so the owning op can still commit.
 			continue
 		}
-		if _, serr := q.SetCodexRefreshIntentState(ctx, store.SetCodexRefreshIntentStateParams{
-			State:       state,
-			OperationID: it.OperationID,
-			UserID:      userID,
-		}); serr != nil {
-			return resolved, fmt.Errorf("codex reconcile: set intent %s state: %w", it.OperationID, serr)
+		// FENCED write (issue #1532, race 2): the verdict `state` was computed from `acct`,
+		// a snapshot that can be stale because the durable intent is inserted BEFORE the lease
+		// (advanceCodexRefresh), so the survivor can select an account mid-window. The store
+		// guard only advances the intent when it is still 'rotating', the account is still at
+		// this verdict's snapshot generation, and the account is not a live in-progress
+		// lease-holder of THIS op — so a concurrently committed intent is never clobbered.
+		// 0 rows means the guard rejected the stale write: don't count it resolved or changed.
+		n, serr := q.SetCodexRefreshIntentStateFenced(ctx, store.SetCodexRefreshIntentStateFencedParams{
+			State:              state,
+			OperationID:        it.OperationID,
+			UserID:             userID,
+			ExpectedGeneration: acct.Generation,
+			Now:                pgconv.Time(now),
+		})
+		if serr != nil {
+			return resolved, changed, fmt.Errorf("codex reconcile: set intent %s state: %w", it.OperationID, serr)
 		}
-		resolved++
+		if n > 0 {
+			resolved++
+			changed = true
+		}
 	}
 
 	// Recovery/re-login promotion (audit #5). A quarantined account whose recovery slot
 	// holds protected material AT THE CURRENT generation is a candidate for roll-forward: a
 	// commit-failure or an absence-branch retention left a known-good login there. Attempt
 	// to make it live again — but ONLY after re-verifying its identity against the account's
-	// frozen tuple, so a poisoned/mismatched recovery blob can never be promoted. The intents
-	// resolved above are passed so a verified mismatch can correct their 'reconciled'
-	// (recoverable) verdict to 'unrecoverable' (the recovery copy turned out to be bad).
+	// frozen tuple, so a poisoned/mismatched recovery blob can never be promoted. A deferred
+	// promotion changes nothing (and is retried next tick by arm (c) of the survivor scan); a
+	// promotion or a verified-mismatch slot clear is a real change.
 	if acct.CoordState == codexCoordQuarantined && len(acct.RecoverySealed) > 0 &&
 		acct.RecoveryGeneration.Valid && acct.RecoveryGeneration.Int64 == acct.Generation {
-		if perr := s.promoteCodexRecovery(ctx, q, userID, acct, intents); perr != nil {
-			return resolved, perr
+		promChanged, perr := s.promoteCodexRecovery(ctx, q, userID, acct)
+		if perr != nil {
+			return resolved, changed, perr
+		}
+		changed = changed || promChanged
+	}
+	return resolved, changed, nil
+}
+
+// codexRefreshSweepStore is the one extra query the always-on survivor sweep needs, kept off
+// the broader codexRefreshStore interface so the many test fakes that satisfy the latter
+// (e.g. instrFakeStore) do not have to add a method. *store.Queries satisfies it.
+type codexRefreshSweepStore interface {
+	ListUnresolvedCodexRefreshAccounts(ctx context.Context, now pgtype.Timestamptz) ([]store.ListUnresolvedCodexRefreshAccountsRow, error)
+}
+
+// SweepUnresolvedCodexRefresh is the always-on survivor pass (issue #1532): the missing
+// production entry point for ReconcileUnresolvedCodexRefresh, invoked from Service.Sweep. It
+// lists every account with an expired in_progress lease, an unresolved rotating intent, or
+// un-promoted recovery material at the current generation (issue #1532, race 1), and runs the
+// per-account reap→quarantine→resolve state machine on each, so an interrupted refresh can no
+// longer wedge an account forever. It NEVER re-spends a refresh token or auto-recovers a live
+// op. One account's failure is captured and surfaced but does not abort the rest.
+//
+// Returns the number of ACCOUNTS this pass CHANGED (reaped, had intents resolved, or promoted /
+// cleared recovery material), not the intent count. Counting CHANGED accounts is deliberate on
+// two fronts. Counting accounts rather than intents (a rare crash between advanceCodexRefresh's
+// intent→'unrecoverable' write and its QuarantineCodexAccount write can leave an in_progress
+// account with NO 'rotating' intent, so a later reap resolves zero intents yet still un-wedges
+// it — counting intents would make that reap invisible). And gating on CHANGE (issue #1532,
+// race 1): arm (c) of the list query re-lists a quarantined-with-recovery account every tick,
+// so a pass that merely re-reads it and DEFERS its promotion again (vault locked, incomplete
+// identity, transient discovery error) must count nothing — otherwise the tally would climb on
+// every idle tick. Every genuine state change raises the SweepResult.CodexRefreshRecovered count
+// and the "sweeper pass" line; a no-op deferral raises neither.
+func (s *Service) SweepUnresolvedCodexRefresh(ctx context.Context) (int64, error) {
+	q, ok := s.q.(codexRefreshSweepStore)
+	if !ok {
+		return 0, errCodexStoreUnavailable // fail loud: this is an always-on safety path
+	}
+	rows, err := q.ListUnresolvedCodexRefreshAccounts(ctx, pgconv.Time(s.codexNow()))
+	if err != nil {
+		return 0, fmt.Errorf("codex survivor sweep: list: %w", err)
+	}
+	var recovered int64
+	var firstErr error
+	for _, r := range rows {
+		// A candidate is counted recovered ONLY when the reconcile pass actually changed a row
+		// (issue #1532, race 1): arm (c) of the list query re-lists a quarantined-with-recovery
+		// account every tick, so a pass that merely re-reads it and DEFERS its promotion again
+		// (vault locked, incomplete identity, transient discovery error) must count nothing —
+		// otherwise the "recovered" tally would climb on every idle tick. `changed` is true for
+		// a reaped expired lease, an intent advanced through the fenced write, or a promotion /
+		// verified-mismatch slot clear.
+		_, changed, rerr := s.reconcileUnresolvedCodexRefresh(ctx, r.UserID, r.ID)
+		if rerr != nil {
+			if firstErr == nil {
+				firstErr = rerr
+			}
+			continue // one account's failure must not skip the others
+		}
+		if changed {
+			recovered++
 		}
 	}
-	return resolved, nil
+	return recovered, firstErr
 }
 
 // promoteCodexRecovery attempts to make a quarantined account whose recovery slot holds
@@ -1035,15 +1140,25 @@ func (s *Service) ReconcileUnresolvedCodexRefresh(ctx context.Context, userID, a
 // on a MATCH promotes it (PromoteCodexRecovery, CAS on from_generation) — installing the
 // recovery material as the live login, advancing the generation, clearing the quarantine.
 // A VERIFIED MISMATCH (discovery succeeded, tuple positively differs) means the recovery
-// copy is not this account's material after all, so every still-recoverable intent is
-// corrected to 'unrecoverable' and the account is left quarantined. An INCOMPLETE identity
-// (ErrIdentityIncomplete — "cannot tell", not a positively-different tuple) or a TRANSIENT
-// DiscoverIdentity error (or a locked vault) leaves the slot untouched for the next
-// reconcile pass — the material is retained, not lost (PRD #1147 M4, defect 5). A nil
-// identity seam (a Service wired without one) likewise defers.
-func (s *Service) promoteCodexRecovery(ctx context.Context, q codexRefreshStore, userID uuid.UUID, acct store.CodexProviderAccount, intents []store.CodexRefreshIntent) error {
+// copy is not this account's material after all, so the recovery slot is CLEARED (CAS-guarded
+// on the recovery generation) AND the intents the main loop optimistically reconciled off it
+// are corrected to 'unrecoverable' — both in ONE atomic data-modifying-CTE statement
+// (ClearMismatchedCodexRecoveryAndMarkIntents), so there is no ordering-dependent two-write
+// window a crash could leave half-applied (slot cleared, intents still 'reconciled'). An
+// INCOMPLETE identity (ErrIdentityIncomplete — "cannot
+// tell", not a positively-different tuple) or a TRANSIENT DiscoverIdentity error (or a locked
+// vault, or a nil seam) leaves the slot untouched for the next reconcile pass — the material
+// is retained, not lost (PRD #1147 M4, defect 5).
+//
+// It returns (changed, err): `changed` is true only when this call actually promoted the
+// material (advanced the generation) or cleared a verified-mismatch slot — every deferral
+// (nil seam, vault locked, incomplete, transient) returns (false, nil). The always-on survivor
+// scan (issue #1532, race 1) re-lists a quarantined-with-recovery account every tick until this
+// promotion succeeds (advances generation + clears the slot → no longer matches arm (c)) or a
+// verified mismatch clears the slot, so a deferral must not be counted as a recovery.
+func (s *Service) promoteCodexRecovery(ctx context.Context, q codexRefreshStore, userID uuid.UUID, acct store.CodexProviderAccount) (bool, error) {
 	if s.codexRefresh == nil {
-		return nil // no identity seam wired: cannot re-verify, leave for a later pass
+		return false, nil // no identity seam wired: cannot re-verify, leave for a later pass
 	}
 	// Open the recovery blob with the key that sealed IT (recovery_sealed_with), NOT the
 	// live sealed_login's key (acct.SealedWith): a master→dek migration can advance
@@ -1054,9 +1169,9 @@ func (s *Service) promoteCodexRecovery(ctx context.Context, q codexRefreshStore,
 	blob, err := s.openCodexSealed(userID, acct.RecoverySealed, acct.RecoverySealedWith.String)
 	if err != nil {
 		if errors.Is(err, errVaultLocked) {
-			return nil // transient: the recovery material stays protected for the next pass
+			return false, nil // transient: the recovery material stays protected for the next pass
 		}
-		return fmt.Errorf("codex reconcile: open recovery: %w", err)
+		return false, fmt.Errorf("codex reconcile: open recovery: %w", err)
 	}
 
 	id, derr := s.codexRefresh.DiscoverIdentity(ctx, blob.AccessToken)
@@ -1068,59 +1183,60 @@ func (s *Service) promoteCodexRecovery(ctx context.Context, q codexRefreshStore,
 		// locked, leave the protected slot untouched for a later reconcile pass.
 		raw, merr := json.Marshal(blob) //nolint:gosec // G117: the merged login is immediately sealed before it leaves this branch
 		if merr != nil {
-			return fmt.Errorf("codex reconcile: encode recovery: %w", merr)
+			return false, fmt.Errorf("codex reconcile: encode recovery: %w", merr)
 		}
 		sealed, sealedWith, serr := s.sealCodexLogin(userID, raw)
 		if errors.Is(serr, errVaultLocked) {
-			return nil
+			return false, nil
 		}
 		if serr != nil {
-			return fmt.Errorf("codex reconcile: re-seal recovery: %w", serr)
+			return false, fmt.Errorf("codex reconcile: re-seal recovery: %w", serr)
 		}
-		// ErrNoRows means the slot moved under us (already promoted, or the
-		// from_generation no longer matches) — an idempotent no-op.
+		// PromoteCodexRecovery is CAS-guarded and :one: ErrNoRows means the slot moved under us
+		// (already promoted, or the from_generation no longer matches) — an idempotent no-op
+		// that changed nothing; a nil error means the generation advanced (a real change).
 		if _, perr := q.PromoteCodexRecovery(ctx, store.PromoteCodexRecoveryParams{
 			ID:             acct.ID,
 			UserID:         userID,
 			FromGeneration: acct.Generation,
 			Sealed:         sealed,
 			SealedWith:     sealedWith,
-		}); perr != nil && !errors.Is(perr, pgx.ErrNoRows) {
-			return fmt.Errorf("codex reconcile: promote recovery: %w", perr)
+		}); perr != nil {
+			if errors.Is(perr, pgx.ErrNoRows) {
+				return false, nil
+			}
+			return false, fmt.Errorf("codex reconcile: promote recovery: %w", perr)
 		}
-		return nil
+		return true, nil
 	case derr == nil:
 		// VERIFIED MISMATCH (tuple positively differs): the recovery copy is not this
-		// account's. Correct ONLY the intents whose 'reconciled' verdict DEPENDED on this
-		// (now-untrusted) recovery copy — i.e. those reconciled via codexRefreshResolution's
-		// recovery-dependent branch, where it.FromGeneration == acct.RecoveryGeneration. An
-		// intent reconciled
-		// because the account's generation independently ADVANCED past its from_generation
-		// (acct.Generation > it.FromGeneration, the generation-superseded branch) reflects a
-		// committed rotation that owes nothing to this recovery blob, so it stays 'reconciled'
-		// — a bad recovery copy does not retroactively invalidate an independently-committed
-		// rotation. The filter mirrors that branch exactly: since this promotion path runs only
-		// when acct.RecoveryGeneration == acct.Generation, a generation-superseded intent has
-		// it.FromGeneration < acct.RecoveryGeneration and is excluded automatically.
-		for _, it := range intents {
-			recoveryDependent := acct.RecoveryGeneration.Valid && it.FromGeneration == acct.RecoveryGeneration.Int64
-			if !recoveryDependent {
-				continue
-			}
-			if _, serr := q.SetCodexRefreshIntentState(ctx, store.SetCodexRefreshIntentStateParams{
-				State:       codexIntentUnrecoverable,
-				OperationID: it.OperationID,
-				UserID:      userID,
-			}); serr != nil {
-				return fmt.Errorf("codex reconcile: mark recovery-mismatch intent %s: %w", it.OperationID, serr)
-			}
+		// account's. Clear the slot (so arm (c) of the survivor scan stops selecting the
+		// account and the always-on retry TERMINATES) AND flip the recovery-dependent intents
+		// (those the main loop optimistically reconciled off this now-untrusted copy) to
+		// 'unrecoverable' in ONE atomic statement. Folding the former two autocommitted writes
+		// into a single data-modifying CTE removes the ordering-dependent two-write window: a
+		// crash between them could leave the slot cleared while the intents stayed 'reconciled',
+		// a durable half-applied state unrepairable by any later sweep. The gen-CAS fence
+		// (recovery_generation == acct.Generation, coord_state quarantined) is preserved in the
+		// clear, and the intent update is gated on the clear having matched a row, so a concurrent
+		// promote/re-link that moved the account out from under us touches neither slot nor
+		// intents. An intent reconciled because the account's generation independently ADVANCED
+		// sits at a LOWER from_generation and is excluded automatically (this path runs only when
+		// recovery_generation == generation), so a bad recovery copy never retroactively
+		// invalidates an independently-committed rotation.
+		res, cerr := q.ClearMismatchedCodexRecoveryAndMarkIntents(ctx, store.ClearMismatchedCodexRecoveryAndMarkIntentsParams{ID: acct.ID, UserID: userID, FromGeneration: acct.Generation})
+		if cerr != nil {
+			return false, fmt.Errorf("codex reconcile: clear mismatched recovery: %w", cerr)
 		}
-		return nil
+		if res.Cleared == 0 {
+			return false, nil // account moved under us (concurrent promote/re-link) — the atomic CAS cleared nothing and touched no intents
+		}
+		return true, nil
 	default:
 		// ErrIdentityIncomplete ("cannot tell") OR a transient discovery error: leave the
 		// slot untouched for the next reconcile pass, do NOT mark unrecoverable (PRD #1147 M4,
-		// defect 5).
-		return nil
+		// defect 5). Retried next tick by arm (c) of the survivor scan.
+		return false, nil
 	}
 }
 
