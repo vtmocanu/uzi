@@ -65,6 +65,10 @@ through `[0.52.0]`.)
   The recovery survivor pass that unwedges a stuck Codex account subscription refresh never ran in production, so an account could stay permanently wedged; the pass now runs, letting a stuck refresh recover without manual intervention.
 - **The two Dashboard usage cards keep their FAILED RUNS bands aligned ([#1535](https://github.com/vtmocanu/uzi/issues/1535), [#1536](https://github.com/vtmocanu/uzi/pull/1536)).**
   The failed-run band now stays anchored to the bottom of each usage card so the two cards line up, the duplicated exclusion note is dropped when the lifetime and recent-period text is identical (and kept when they differ), and the redundant "see per-run detail" link is removed from the recent usage line.
+- **A Codex run reports "running" as soon as its plan is approved ([#1549](https://github.com/vtmocanu/uzi/issues/1549), [#1552](https://github.com/vtmocanu/uzi/pull/1552)).**
+  An approved Codex run now transitions from `awaiting_approval` to `running` and reports its first implementation iteration through the shared iteration seam before the first implementation turn, so its progress shows up like a Claude run's; a rejected or cancelled plan no longer reports that work has started.
+- **The usage cost-exclusion disclosure reads more clearly ([#1546](https://github.com/vtmocanu/uzi/issues/1546), [#1548](https://github.com/vtmocanu/uzi/pull/1548)).**
+  The aggregate-cost note now states in one sentence that the total excludes Codex subscription runs and runs with unreported cost, with correct singular and plural wording for the excluded-run counts.
 
 ### Changed
 
