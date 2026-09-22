@@ -114,7 +114,7 @@ describe("YourUsageCard", () => {
     const { container } = wrap(<YourUsageCard usage={usage} />);
     expect(container.textContent).toContain("$0.00");
     // No disclosure noise: no subscription/unreported runs exist in this window.
-    expect(container.textContent).not.toContain("excluded from the $ total");
+    expect(container.textContent).not.toContain("Cost excludes");
   });
 
   it("a MIXED aggregate discloses the subscription/unreported run counts beside the metered dollar figure", () => {
@@ -135,10 +135,10 @@ describe("YourUsageCard", () => {
     expect(container.textContent).toContain("$1.25");
     // ...paired with an explicit disclosure of the excluded runs for BOTH windows, so
     // the $ figure is never read as the complete total.
-    expect(container.textContent).toContain("2 subscription + 1 unreported runs excluded from the $ total");
-    expect(container.textContent).toContain("1 subscription run excluded from the $ total");
+    expect(container.textContent).toContain("Cost excludes 2 Codex subscription runs and 1 unreported run");
+    expect(container.textContent).toContain("Cost excludes 1 Codex subscription run");
     // Differing windows → BOTH notes render (the dedup must NOT collapse them).
-    expect((container.textContent ?? "").split("excluded from the $ total").length - 1).toBe(2);
+    expect((container.textContent ?? "").split("Cost excludes").length - 1).toBe(2);
   });
 
   it("dedups the exclusion disclosure: one note when lifetime and last-7d texts match", () => {
@@ -155,11 +155,11 @@ describe("YourUsageCard", () => {
     const { container } = wrap(<YourUsageCard usage={usage} />);
     const text = container.textContent ?? "";
     // Positive: the standalone lifetime note (no parens) is still shown...
-    expect(text).toContain("2 subscription runs excluded from the $ total");
+    expect(text).toContain("Cost excludes 2 Codex subscription runs");
     // ...exactly once (the parenthetical last-7d copy is suppressed when its text matches).
-    expect(text.split("excluded from the $ total").length - 1).toBe(1);
+    expect(text.split("Cost excludes").length - 1).toBe(1);
     // Paired negative on the NEW behaviour: the parenthesised last-7d form is gone.
-    expect(text).not.toContain("(2 subscription runs excluded from the $ total)");
+    expect(text).not.toContain("(Cost excludes 2 Codex subscription runs)");
   });
 });
 
@@ -398,11 +398,11 @@ describe("FactoryTotalCard + PerUserUsageTable cost disclosure (PRD #1429 D7)", 
     };
     const { container: factoryContainer } = wrap(<FactoryTotalCard admin={admin} />);
     expect(factoryContainer.textContent).toContain("$12.50");
-    expect(factoryContainer.textContent).not.toContain("excluded from the $ total");
+    expect(factoryContainer.textContent).not.toContain("Cost excludes");
 
     const { container: tableContainer } = wrap(<PerUserUsageTable admin={admin} />);
     expect(tableContainer.textContent).toContain("$12.50");
-    expect(tableContainer.textContent).not.toContain("excluded from the $ total");
+    expect(tableContainer.textContent).not.toContain("Cost excludes");
   });
 
   it("factory card discloses a MIXED total's excluded subscription/unreported runs beside its metered $", () => {
@@ -425,7 +425,7 @@ describe("FactoryTotalCard + PerUserUsageTable cost disclosure (PRD #1429 D7)", 
     const { container } = wrap(<FactoryTotalCard admin={admin} />);
     // Positive: the metered figure is still shown, paired with the disclosure.
     expect(container.textContent).toContain("$12.50");
-    expect(container.textContent).toContain("2 subscription + 1 unreported runs excluded from the $ total");
+    expect(container.textContent).toContain("Cost excludes 2 Codex subscription runs and 1 unreported run");
   });
 
   it("per-user table discloses each row's OWN excluded runs, and the total row discloses the factory sum", () => {
@@ -453,9 +453,9 @@ describe("FactoryTotalCard + PerUserUsageTable cost disclosure (PRD #1429 D7)", 
     expect(container.textContent).toContain("$30.00");
     expect(container.textContent).toContain("$10.00");
     // ...the disclosed user's row names its own excluded count...
-    expect(container.textContent).toContain("2 subscription runs excluded from the $ total");
+    expect(container.textContent).toContain("Cost excludes 2 Codex subscription runs");
     // ...and the total row discloses the factory-wide sum (3 subscription + 1 unreported),
     // not just this one row's count.
-    expect(container.textContent).toContain("3 subscription + 1 unreported runs excluded from the $ total");
+    expect(container.textContent).toContain("Cost excludes 3 Codex subscription runs and 1 unreported run");
   });
 });

@@ -87,22 +87,19 @@ describe("aggregateDisclosure (PRD #1429 D7 mixed aggregate)", () => {
     expect(d.text).toBe("");
   });
 
-  it("subscription-only mix discloses the count, singular run", () => {
-    const d = aggregateDisclosure(1, 0);
+  it.each([
+    [1, 0, "Cost excludes 1 Codex subscription run"],
+    [4, 0, "Cost excludes 4 Codex subscription runs"],
+    [0, 1, "Cost excludes 1 unreported run"],
+    [0, 3, "Cost excludes 3 unreported runs"],
+    [1, 1, "Cost excludes 1 Codex subscription run and 1 unreported run"],
+    [2, 1, "Cost excludes 2 Codex subscription runs and 1 unreported run"],
+    [1, 2, "Cost excludes 1 Codex subscription run and 2 unreported runs"],
+    [2, 3, "Cost excludes 2 Codex subscription runs and 3 unreported runs"],
+  ])("discloses %i subscription and %i unreported runs with independent grammar", (sub, unrep, text) => {
+    const d = aggregateDisclosure(sub, unrep);
     expect(d.incomplete).toBe(true);
-    expect(d.text).toBe("1 subscription run excluded from the $ total");
-  });
-
-  it("unreported-only mix discloses the count, plural runs", () => {
-    const d = aggregateDisclosure(0, 3);
-    expect(d.incomplete).toBe(true);
-    expect(d.text).toBe("3 unreported runs excluded from the $ total");
-  });
-
-  it("a MIXED aggregate (both subscription and unreported present) discloses both counts together", () => {
-    const d = aggregateDisclosure(2, 3);
-    expect(d.incomplete).toBe(true);
-    expect(d.text).toBe("2 subscription + 3 unreported runs excluded from the $ total");
+    expect(d.text).toBe(text);
   });
 
   it("negative/hostile counts never crash and never disclose below zero", () => {
