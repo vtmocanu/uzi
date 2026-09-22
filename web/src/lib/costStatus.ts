@@ -86,8 +86,8 @@ export interface AggregateDisclosure {
   /** True when one or more subscription/unreported runs are folded into this
    *  window's token totals but excluded from its dollar figure. */
   incomplete: boolean;
-  /** Disclosure text, e.g. "2 subscription + 1 unreported run excluded from the $
-   *  total". Exactly "" (byte-identical) when `incomplete` is false, so a fully-
+  /** Disclosure text, e.g. "Cost excludes 2 Codex subscription runs and 1 unreported
+   *  run". Exactly "" (byte-identical) when `incomplete` is false, so a fully-
    *  metered window renders no disclosure noise at all. */
   text: string;
 }
@@ -97,8 +97,7 @@ export function aggregateDisclosure(subscriptionCount: number, unreportedCount: 
   const unrep = Math.max(0, unreportedCount);
   if (sub <= 0 && unrep <= 0) return { incomplete: false, text: "" };
   const parts: string[] = [];
-  if (sub > 0) parts.push(`${sub} subscription`);
-  if (unrep > 0) parts.push(`${unrep} unreported`);
-  const n = sub + unrep;
-  return { incomplete: true, text: `${parts.join(" + ")} run${n === 1 ? "" : "s"} excluded from the $ total` };
+  if (sub > 0) parts.push(`${sub} Codex subscription run${sub === 1 ? "" : "s"}`);
+  if (unrep > 0) parts.push(`${unrep} unreported run${unrep === 1 ? "" : "s"}`);
+  return { incomplete: true, text: `Cost excludes ${parts.join(" and ")}` };
 }
