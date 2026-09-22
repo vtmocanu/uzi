@@ -13,16 +13,17 @@
 #                   classifier refused the in-script `gh pr merge --admin` and the user ran it
 #                   via a `!` line, so merge.sh's own confirm/trail block never executed).
 #                   Confirm the PR is MERGED, print MERGE_SHA, write the terminal trail line,
-#                   and release the claim — the evidence merge.sh writes itself on its own
-#                   merge. Exit 9 if the PR is not MERGED yet (nothing is written or released).
+#                   and release the claim while retaining the trail for the post-merge CI
+#                   result — the evidence merge.sh writes itself on its own merge. Exit 9 if
+#                   the PR is not MERGED yet (nothing is written or released).
 #   --method        squash (default; the convention for agent/issue-* branches) or merge
 #                   (uzi-release uses merge commits so the subject keeps the issue branch).
 #   --no-admin      drop --admin (needs the ruleset satisfied: review + up-to-date + checks).
 #
 # Coordination: a repo-wide MERGE LOCK (<state dir>/locks/merge, 10-min TTL) serialises
 # landers so two admin merges do not land seconds apart and cancel each other's `main` CI
-# by concurrency; on MERGED the PR's claim and trail are released (claims.sh release --purge)
-# so the shared list only shows live work.
+# by concurrency; on MERGED the PR's claim is released so the shared list only shows live work,
+# while its trail survives until the post-merge CI result is appended and printed.
 #
 # Exit codes:
 #   0  merged — prints MERGE_SHA=<sha>; next: watch-run-ci.sh --sha <sha>
@@ -63,9 +64,9 @@ state=$(printf '%s' "$pj" | jq -r .state); head=$(printf '%s' "$pj" | jq -r .hea
 ms=$(printf '%s' "$pj" | jq -r .mergeStateStatus); mg=$(printf '%s' "$pj" | jq -r .mergeable)
 
 # The terminal evidence contract, from the ONE place that knows the true merge SHA: print
-# MERGED + MERGE_SHA, append the trail's terminal line (trail.sh dedupes an identical last
-# line), THEN release the claim with --purge. Called after this script's own merge, and by
-# --confirm-only for a merge that already happened out of band.
+# MERGED + MERGE_SHA, append the trail's merge line (trail.sh dedupes an identical last line),
+# THEN release the claim while retaining the trail for the post-merge CI result. Called after
+# this script's own merge, and by --confirm-only for a merge that already happened out of band.
 report_merged() {  # $1 = merge commit sha; return 1 (write NOTHING) when the sha is empty
   local sha=$1
   # GitHub can report state=MERGED before mergeCommit is populated (eventual consistency).
@@ -74,7 +75,7 @@ report_merged() {  # $1 = merge commit sha; return 1 (write NOTHING) when the sh
   [ -n "$sha" ] || return 1
   echo "MERGED #$PR"; echo "MERGE_SHA=$sha"
   "$HERE/trail.sh" "#$PR" "admin-merged ${sha:0:8}" 2>/dev/null || true
-  "$HERE/claims.sh" release "#$PR" --purge 2>/dev/null || true
+  "$HERE/claims.sh" release "#$PR" 2>/dev/null || true
   echo "next: watch-run-ci.sh --sha $sha --interval 60"
 }
 
@@ -144,7 +145,7 @@ if [ -n "$SD" ]; then
   me=$(self_identity 2>/dev/null); my_uuid=$(printf '%s' "$me" | cut -f2); my_name=$(printf '%s' "$me" | cut -f1)
   if ! mkdir "$LOCK" 2>/dev/null; then
     o_uuid=$(cat "$LOCK/uuid" 2>/dev/null || echo ""); o_name=$(cat "$LOCK/name" 2>/dev/null || echo "?")
-    age=$(( $(date +%s) - $(stat -f %m "$LOCK" 2>/dev/null || stat -c %Y "$LOCK" 2>/dev/null || date +%s) ))
+    age=$(( $(date +%s) - $(stat -c %Y "$LOCK" 2>/dev/null || stat -f %m "$LOCK" 2>/dev/null || date +%s) ))
     # Break the lock when it is ours, older than the TTL, or its owner is provably dead
     # (is_live rc 1; rc 2 = registry unknown keeps it, the TTL covers that case).
     dead=0

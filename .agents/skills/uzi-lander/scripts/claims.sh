@@ -16,7 +16,7 @@
 #   claims.sh touch <key> [--state TEXT]   # heartbeat + last state (trail.sh calls this)
 #   claims.sh show <key>
 #   claims.sh list [--json] [--all]        # this repo's claims, priority-desc; --all = every state dir key
-#   claims.sh reap [--repo O/R] [--dry-run] # drop claims whose PR is merged/closed or whose owner is dead
+#   claims.sh reap [--repo O/R] [--dry-run] # drop terminal/dead claims and stale orphan trails
 #   claims.sh whoami
 #
 # Priority: sessions decide. The default is the PR's file count (bigger first), because
@@ -80,7 +80,7 @@ case "$verb" in
     lock="$CL/.lock.$key"; got=0
     for _ in 1 2 3 4 5 6 7 8 9 10; do
       if mkdir "$lock" 2>/dev/null; then got=1; break; fi
-      lage=$(( $(date +%s) - $(stat -f %m "$lock" 2>/dev/null || stat -c %Y "$lock" 2>/dev/null || date +%s) ))
+      lage=$(( $(date +%s) - $(stat -c %Y "$lock" 2>/dev/null || stat -f %m "$lock" 2>/dev/null || date +%s) ))
       [ "$lage" -gt 60 ] && rm -rf "$lock"
       sleep 0.3
     done
@@ -159,7 +159,34 @@ case "$verb" in
       if [ -z "$why" ] && [ "$(owner_live "$u" "$f")" = "dead" ]; then why="owner $o dead/stale"; fi
       [ -n "$why" ] || continue
       n=$((n+1))
-      if [ "$dry" -eq 1 ]; then echo "would reap $key ($why)"; else rm -f "$f" "$SD/trail/$key.trail"; echo "reaped $key ($why)"; fi
+      if [ "$dry" -eq 1 ]; then
+        echo "would reap $key ($why)"
+      elif [ "$why" = "PR MERGED" ] || [ "$why" = "PR CLOSED" ]; then
+        # The post-merge watcher still needs the complete trail. Drop the terminal claim so
+        # the board shows only live work, but leave a fresh trail for explicit final cleanup;
+        # the orphan-TTL pass below collects it if that landing session died.
+        [ -f "$SD/trail/$key.trail" ] && touch "$SD/trail/$key.trail"
+        rm -f "$f"
+        echo "reaped $key ($why; trail preserved)"
+      else
+        rm -f "$f" "$SD/trail/$key.trail"
+        echo "reaped $key ($why)"
+      fi
+    done
+    # A merged PR releases its live claim immediately but preserves the trail through the
+    # post-merge CI watch. Normal completion purges it explicitly; if that session dies,
+    # reap a claimless trail only after the same stale-owner TTL so a healthy watch cannot
+    # lose its history to another lander's concurrent reap.
+    for t in "$SD/trail"/*.trail; do
+      [ -f "$t" ] || continue
+      name=${t##*/}; key=${name%.trail}
+      [ -f "$CL/$key.json" ] && continue
+      modified=$(stat -c %Y "$t" 2>/dev/null || stat -f %m "$t" 2>/dev/null || echo "")
+      [ -n "$modified" ] || continue
+      age=$(( $(date +%s) - modified ))
+      [ "$age" -gt "$(( STALE_HOURS * 3600 ))" ] || continue
+      n=$((n+1))
+      if [ "$dry" -eq 1 ]; then echo "would reap $key (orphan trail stale ${age}s)"; else rm -f "$t"; echo "reaped $key (orphan trail stale ${age}s)"; fi
     done
     if [ "$dry" -eq 1 ]; then echo "REAPED=$n (dry-run)"; else echo "REAPED=$n"; fi
     exit 0;;
