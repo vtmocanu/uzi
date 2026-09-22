@@ -169,7 +169,7 @@ case "$verb" in
       [ -f "$t" ] || continue
       name=${t##*/}; key=${name%.trail}
       [ -f "$CL/$key.json" ] && continue
-      modified=$(stat -f %m "$t" 2>/dev/null || stat -c %Y "$t" 2>/dev/null || echo "")
+      modified=$(stat -c %Y "$t" 2>/dev/null || stat -f %m "$t" 2>/dev/null || echo "")
       [ -n "$modified" ] || continue
       age=$(( $(date +%s) - modified ))
       [ "$age" -gt "$(( STALE_HOURS * 3600 ))" ] || continue

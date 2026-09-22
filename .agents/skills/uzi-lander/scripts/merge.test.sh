@@ -21,6 +21,23 @@ cat > "$WORK/bin/sleep" <<'STUB'
 #!/usr/bin/env bash
 exit 0
 STUB
+cat > "$WORK/bin/stat" <<'STUB'
+#!/usr/bin/env bash
+set -eu
+# Model GNU stat: `-c %Y` is the numeric mtime interface, while BSD-first `-f %m`
+# succeeds with filesystem-formatted text and therefore is not a portable feature probe.
+if [ "${1:-}" = -c ]; then
+  last="${!#}"
+  case "$last" in *'#stale.trail') echo 946684800;; *) date +%s;; esac
+  exit 0
+fi
+if [ "${1:-}" = -f ]; then
+  echo '  File: "%m"'
+  echo '    ID: deadbeef Namelen: 255 Type: ext2/ext3'
+  exit 0
+fi
+exec /usr/bin/stat "$@"
+STUB
 cat > "$WORK/bin/gh" <<STUB
 #!/usr/bin/env bash
 set -eu
@@ -49,7 +66,7 @@ fi
 echo "unexpected gh call: \$*" >&2
 exit 1
 STUB
-chmod +x "$WORK/bin/gh" "$WORK/bin/sleep"
+chmod +x "$WORK/bin/gh" "$WORK/bin/sleep" "$WORK/bin/stat"
 export PATH="$WORK/bin:$PATH"
 export UZI_LANDER_STATE_DIR="$WORK/state"
 
