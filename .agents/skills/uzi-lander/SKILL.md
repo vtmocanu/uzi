@@ -130,11 +130,12 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    OWNER/REPO`, then batch fixes into one push.
    - **Rate-limited (exit 5).** Tell the user in one line with the default wait and the
      local alternative. When quota timing matters, run
-     `S/cr-rate-limit.sh OWNER/REPO PR --query --wait`: the exact two-word query is
-     authoritative; its reply is either a countdown or "Reviews are available now," which
-     the script treats as an immediate reset. Never infer a reset from review timestamps or
-     a nominal hourly rate. On exit 0 with no user override, post `@coderabbitai review` once
-     and return to step 2.
+     `S/cr-rate-limit.sh OWNER/REPO PR --trigger-review`: it posts the exact two-word quota
+     query, waits for the authoritative countdown or "Reviews are available now," then posts
+     `@coderabbitai review` itself exactly once under a per-PR lock when safe and immediately
+     execs `watch-pr.sh --reviewer coderabbit`. The atomic flag closes both background-callback
+     gaps; never wait, post, or start the reviewer poller as separate agent steps. Its final exit
+     is the `watch-pr.sh` result, so branch directly on step 2's exit table.
      On `greptile`, post `@greptileai review`, then use `--reviewer greptile
      --reviewer-grace 2`; on `local`, dispatch a local reviewer and use `--reviewer none`.
    - **Full review offered (exit 7).** CodeRabbit answered the normal trigger with
@@ -200,7 +201,8 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    line and releases the claim. A classifier block prints the exact command for the
    user's `!` line; after they run it, reconcile the evidence the out-of-band merge skipped
    with `S/merge.sh OWNER/REPO PR --confirm-only` (confirms `MERGED`, prints `MERGE_SHA`,
-   writes the terminal trail, releases the claim — exit 9 if it is not merged yet). Do this
+   writes the merge trail and releases the claim while preserving that trail through the
+   post-merge CI watch — exit 9 if it is not merged yet). Do this
    BEFORE `reap`/`release`, or the trail is purged before it was ever written (#1510).
 7. **Post-merge CI.** `S/watch-run-ci.sh --sha MERGE_SHA --interval 60` in the background.
    Pass the exact SHA from `merge.sh`; never hand-complete a prefix. The poller resolves it
@@ -208,11 +210,13 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    Exit 0 green (a partial dispatch counts; confirm a gate fix another way), 1 red (use the
    per-job live-log commands it prints, then fix on a branch, never `main`; flake → rerun +
    file), 3 no run appeared, 4 superseded → re-watch the current `main` head
-   (references/merge-mechanics.md). Trail `main ci green`.
-8. **Finish.** Remove the worktrees and branches you created (`git worktree remove`,
-   `git branch -D`), print the final trail line, `S/claims.sh reap --repo OWNER/REPO`
-   (drops claims whose PR merged or closed and orphans of dead sessions), and hand any
-   still-open item on.
+   (references/merge-mechanics.md). Append the terminal result to the preserved trail
+   (`main ci green`, `main ci red`, or `main ci superseded`) and print the whole line.
+8. **Finish.** Remove the worktrees and branches you or your local reviewer created
+   (`git worktree list`, then `git worktree remove` / `git branch -D`), purge the completed
+   trail with `S/claims.sh release '#PR' --purge`, then run
+   `S/claims.sh reap --repo OWNER/REPO` (drops merged/closed claims and orphans of dead
+   sessions), and hand any still-open item on.
 
 ## Always yours, whichever review lane applies
 
@@ -255,8 +259,12 @@ session-peers registry, so a Codex thread with a shim is a peer like any Claude 
   `list` shows it, and B's lander waits on A's owner (trail `waiting #A`).
 - **Contested PR.** Never `--force` a live session's claim; message the owner. A dead or
   stale owner (registry says gone, or no heartbeat for 6 h) is taken over silently.
-- **Cleanup is automatic.** `merge.sh` releases the claim and trail on `MERGED`; `reap`
-  removes the rest. Nothing here is a lock on the PR itself, only on the merge step.
+- **Cleanup spans the post-merge watch.** `merge.sh` releases the live claim on `MERGED`
+  but preserves its trail; after the final `main ci ...` line is printed, `release --purge`
+  removes that trail and `reap` removes stale claims. A session that dies before the explicit
+  purge leaves a claimless trail; `reap` removes it only after the same 6-hour stale TTL, never
+  during a healthy post-merge watch. Nothing here is a lock on the PR itself, only on the
+  merge step.
 
 ## Waiting, uniformly
 

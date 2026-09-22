@@ -18,7 +18,7 @@ cat > "$WORK/bin/gh" <<'STUB'
 set -eu
 
 if [ "${1:-}" = pr ] && [ "${2:-}" = view ]; then
-  echo deadbeef
+  echo "${HEAD_OID:-deadbeef}"
   exit 0
 fi
 if [ "${1:-}" = pr ] && [ "${2:-}" = comment ]; then
@@ -28,6 +28,13 @@ if [ "${1:-}" = pr ] && [ "${2:-}" = comment ]; then
     shift
   done
   printf '%s\n' "$body" >> "$POSTED"
+  if [ "$body" = '@coderabbitai review' ]; then
+    review_at=$(jq -nr 'now|todate')
+    jq --arg t "$review_at" '. + [{user:{login:"tester"},body:"@coderabbitai review",created_at:$t,updated_at:$t}]' \
+      "$COMMENTS" > "$COMMENTS.next"
+    mv "$COMMENTS.next" "$COMMENTS"
+    exit 0
+  fi
   asked=$(jq -nr 'now|todate')
   if [ "${SINGULAR_MINUTE:-0}" = 1 ]; then
     /bin/sleep 1
@@ -93,12 +100,21 @@ echo "unexpected gh call: $*" >&2
 exit 1
 STUB
 chmod +x "$WORK/bin/gh" "$WORK/bin/sleep"
+cat > "$WORK/bin/watch-pr-stub" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$WATCHED"
+echo "WATCH_RESULT=${WATCH_RESULT:-ready}"
+exit "${WATCH_EXIT:-0}"
+STUB
+chmod +x "$WORK/bin/watch-pr-stub"
 
 export PATH="$WORK/bin:$PATH"
 export UZI_LANDER_STATE_DIR="$WORK/state"
 export COMMENTS="$WORK/comments.json"
 export POSTED="$WORK/posted"
 export STATUS_COUNT="$WORK/status-count"
+export WATCHED="$WORK/watched"
+export UZI_LANDER_WATCH_PR_SCRIPT="$WORK/bin/watch-pr-stub"
 
 # A stale success status and later-edited walkthrough must not suppress or override the exact reply.
 MODE="query"; LATER_WALKTHROUGH=1; export MODE LATER_WALKTHROUGH
@@ -177,4 +193,53 @@ grep -q '^CR_LIMITED=0$' "$WORK/available-big.out" || fail "large available-now 
 grep -q '^CR_RESET_ELAPSED=1$' "$WORK/available-big.out" || fail "large available-now reply did not release the query: $(cat "$WORK/available-big.out")"
 unset BIG_BODY
 
-echo "PASS cr-rate-limit: exact query, singular minute, available-now (small + large), stale status, reset formatting"
+# Atomic mode owns the callback: an immediate authoritative reset posts the quota query and
+# the review trigger in one process, with no extra polling interval or agent turn between them.
+MODE="available"; AVAILABLE_NOW=1; export MODE AVAILABLE_NOW
+printf '[]\n' > "$COMMENTS"
+rm -f "$POSTED"
+rm -f "$WATCHED"
+bash "$SCRIPT" test/repo 42 --trigger-review --interval 0 --max-wait-min 1 > "$WORK/trigger.out" 2>&1
+[ "$(awk 'NR==1{print; exit}' "$POSTED")" = '@coderabbitai rate limit' ] || fail "atomic mode did not query quota first: $(cat "$POSTED")"
+[ "$(awk 'NR==2{print; exit}' "$POSTED")" = '@coderabbitai review' ] || fail "atomic mode did not post the review trigger: $(cat "$POSTED")"
+[ "$(wc -l < "$POSTED" | tr -d ' ')" = 2 ] || fail "atomic mode posted an unexpected number of comments: $(cat "$POSTED")"
+grep -q '^CR_REVIEW_TRIGGER=posted$' "$WORK/trigger.out" || fail "atomic mode did not report the trigger: $(cat "$WORK/trigger.out")"
+[ "$(cat "$WATCHED")" = 'test/repo 42 60 60 --reviewer coderabbit' ] || fail "atomic mode did not enter the CodeRabbit watcher: $(cat "$WATCHED")"
+grep -q '^NEXT=watch_pr:coderabbit$' "$WORK/trigger.out" || fail "atomic mode did not report the reviewer handoff: $(cat "$WORK/trigger.out")"
+
+# The durable current-head marker makes callback replay idempotent: the script still obtains the
+# authoritative quota reply, then declines to post a second review command for that head.
+MODE="available"; AVAILABLE_NOW=1; export MODE AVAILABLE_NOW
+printf '[]\n' > "$COMMENTS"
+rm -f "$POSTED"
+rm -f "$WATCHED"
+bash "$SCRIPT" test/repo 42 --trigger-review --interval 0 --max-wait-min 1 > "$WORK/trigger-replay.out" 2>&1
+[ "$(cat "$POSTED")" = '@coderabbitai rate limit' ] || fail "callback replay posted a duplicate review command: $(cat "$POSTED")"
+grep -q '^CR_REVIEW_TRIGGER=already_current_head$' "$WORK/trigger-replay.out" || fail "callback replay did not report current-head idempotence: $(cat "$WORK/trigger-replay.out")"
+[ "$(cat "$WATCHED")" = 'test/repo 42 60 60 --reviewer coderabbit' ] || fail "callback replay did not resume the existing review watch: $(cat "$WATCHED")"
+
+# A new head is a new review target, so the prior head marker must not suppress its trigger.
+MODE="available"; AVAILABLE_NOW=1; HEAD_OID=feedface; export MODE AVAILABLE_NOW HEAD_OID
+printf '[]\n' > "$COMMENTS"
+rm -f "$POSTED"
+rm -f "$WATCHED"
+bash "$SCRIPT" test/repo 42 --trigger-review --interval 0 --max-wait-min 1 > "$WORK/trigger-new-head.out" 2>&1
+[ "$(awk 'NR==2{print; exit}' "$POSTED")" = '@coderabbitai review' ] || fail "new head did not receive its own review trigger: $(cat "$POSTED")"
+grep -q '^CR_REVIEW_TRIGGER=posted$' "$WORK/trigger-new-head.out" || fail "new-head trigger was not reported: $(cat "$WORK/trigger-new-head.out")"
+unset HEAD_OID
+
+# Once triggered, watch-pr owns the final outcome; findings and readiness propagate without a
+# second agent callback or polling process.
+MODE="available"; AVAILABLE_NOW=1; HEAD_OID=watchfail; WATCH_EXIT=3; WATCH_RESULT=findings
+export MODE AVAILABLE_NOW HEAD_OID WATCH_EXIT WATCH_RESULT
+printf '[]\n' > "$COMMENTS"
+rm -f "$POSTED" "$WATCHED"
+set +e
+bash "$SCRIPT" test/repo 42 --trigger-review --interval 0 --max-wait-min 1 > "$WORK/trigger-findings.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 3 ] || fail "atomic mode did not propagate watch-pr findings rc=3 (got $rc): $(cat "$WORK/trigger-findings.out")"
+grep -q '^WATCH_RESULT=findings$' "$WORK/trigger-findings.out" || fail "atomic mode did not execute the findings watcher: $(cat "$WORK/trigger-findings.out")"
+unset HEAD_OID WATCH_EXIT WATCH_RESULT
+
+echo "PASS cr-rate-limit: exact query, singular minute, available-now, atomic review trigger, stale status, reset formatting"

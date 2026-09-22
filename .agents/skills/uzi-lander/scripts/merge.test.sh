@@ -3,7 +3,8 @@
 # On PR #1510 the classifier refused the in-script `gh pr merge --admin`; the user ran it via
 # a `!` line, so merge.sh's own confirm/trail block never executed and NO MERGE_SHA or trail
 # was ever produced. --confirm-only writes that owed terminal evidence from the one place that
-# knows the true merge SHA.
+# knows the true merge SHA. The merge releases the live claim but preserves the trail through
+# post-merge CI, so the final status line still contains the complete landing history.
 set -eu
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -60,7 +61,8 @@ seed_state() {  # a live claim + a pre-merge trail for #42, so the terminal side
 }
 
 # 1. Already MERGED out of band → --confirm-only emits the owed terminal evidence (MERGED, the
-#    true MERGE_SHA, the trail's admin-merged line) THEN purges the claim and trail.
+#    true MERGE_SHA, the trail's admin-merged line) THEN releases the claim but preserves the
+#    trail until the post-merge result is appended, printed and explicitly purged.
 MERGE_STATE=MERGED; export MERGE_STATE
 seed_state
 set +e
@@ -70,12 +72,29 @@ set -e
 [ "$rc" -eq 0 ] || fail "--confirm-only on a merged PR returned rc=$rc: $(cat "$WORK/confirm.out")"
 grep -q '^MERGED #42$' "$WORK/confirm.out" || fail "--confirm-only did not confirm MERGED: $(cat "$WORK/confirm.out")"
 grep -q "^MERGE_SHA=$MSHA$" "$WORK/confirm.out" || fail "--confirm-only did not print the true MERGE_SHA: $(cat "$WORK/confirm.out")"
-# trail.sh prints the whole trail to stdout BEFORE report_merged purges it, so a deleted
+# trail.sh prints the whole trail to stdout and preserves it for post-merge CI, so a deleted
 # trail.sh call (the #1510 regression) would drop this line.
 grep -q "admin-merged ${MSHA:0:8}" "$WORK/confirm.out" || fail "--confirm-only did not write the terminal trail line: $(cat "$WORK/confirm.out")"
-# ...and the claim + trail are then purged (a deleted claims.sh release leaves the claim).
+# The live claim is gone, but the trail survives for the post-merge CI result.
 [ ! -e "$CL/#42.json" ] || fail "--confirm-only did not release the claim"
-[ ! -e "$TR/#42.trail" ] || fail "--confirm-only did not purge the trail"
+[ -e "$TR/#42.trail" ] || fail "--confirm-only purged the trail before post-merge CI"
+final=$(bash "$HERE/trail.sh" '#42' 'main ci green')
+[ "$final" = "#42: pr opened → ci green → admin-merged ${MSHA:0:8} → main ci green" ] \
+  || fail "post-merge CI lost the earlier trail: $final"
+bash "$HERE/claims.sh" release '#42' --purge > /dev/null
+[ ! -e "$TR/#42.trail" ] || fail "final cleanup did not purge the completed trail"
+
+# If the landing session dies before explicit cleanup, a fresh orphan trail survives reap while
+# a stale one is collected after the shared stale-owner TTL. This prevents both callback-time
+# history loss and permanent state leakage.
+printf 'admin-merged deadbeef\n' > "$TR/#fresh.trail"
+printf 'admin-merged deadbeef\n' > "$TR/#stale.trail"
+touch -t 200001010000 "$TR/#stale.trail"
+bash "$HERE/claims.sh" reap > "$WORK/reap.out"
+[ -e "$TR/#fresh.trail" ] || fail "reap removed a fresh post-merge trail"
+[ ! -e "$TR/#stale.trail" ] || fail "reap left a stale orphan trail behind"
+grep -q 'reaped #stale (orphan trail stale ' "$WORK/reap.out" || fail "reap did not report stale orphan cleanup: $(cat "$WORK/reap.out")"
+rm -f "$TR/#fresh.trail"
 
 # 2. state=MERGED but mergeCommit not populated yet (GitHub lag) → re-read recovers the oid.
 MERGE_STATE=merged_lagging; export MERGE_STATE

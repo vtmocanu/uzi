@@ -12,7 +12,7 @@
 # Every countdown is relative to the comment's own timestamp, so this script converts it
 # to an absolute reset instant and prints the REMAINING minutes as of now.
 #
-# Usage: cr-rate-limit.sh OWNER/REPO PR [--ask] [--query] [--wait] [--max-wait-min N] [--interval S]
+# Usage: cr-rate-limit.sh OWNER/REPO PR [--ask] [--query] [--wait] [--trigger-review] [--max-wait-min N] [--interval S]
 #   --ask            when limited and no reset time is on the PR, post `@coderabbitai rate
 #                    limit` ONCE and parse the reply (polls up to ~3 min for it).
 #   --query          post that exact query even when the head status is stale/non-limited;
@@ -21,6 +21,10 @@
 #                    margin) or CR's status leaves "rate limited"; then exit 0. With an
 #                    UNKNOWN reset, --wait waits --max-wait-min as a ceiling. Hitting the
 #                    ceiling with the reset still ahead exits 1 (unknown: 2), never 0.
+#   --trigger-review atomically query, wait, post `@coderabbitai review` exactly once when
+#                    safe, then exec watch-pr.sh with `--reviewer coderabbit`; implies --query
+#                    --wait. A per-PR lock plus a current-head marker and recent-trigger check
+#                    prevent parallel/replayed invocations posting twice.
 #   --max-wait-min   ceiling for --wait (default 180).
 #   --interval       poll seconds for --wait (default 60).
 #
@@ -28,23 +32,27 @@
 # CR_RESET_MIN=<remaining minutes|unknown>, CR_RESET_AT=<UTC>, CR_RESET_SOURCE=<walkthrough|reply>.
 #
 # Exit codes:
-#   0  not limited, OR the limit window has elapsed (safe to post `@coderabbitai review`
-#      ONCE — do not spam it: every trigger while limited is a wasted comment)
+#   0  not limited, OR the limit window has elapsed; with --trigger-review the review command
+#      was posted (or an equivalent recent command already exists)
 #   1  limited, reset known and still in the future (wait; --wait does it for you)
 #   2  limited, reset unknown (re-run with --ask, or --wait with a ceiling)
 #   3  usage / gh error
+# With --trigger-review, a successful trigger hands control to watch-pr.sh and the final exit
+# code is its 0..7 readiness/finding contract; quota-phase failures retain the meanings above.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WATCH_PR_SCRIPT="${UZI_LANDER_WATCH_PR_SCRIPT:-$HERE/watch-pr.sh}"
 # shellcheck source=lib/state.sh
 . "$HERE/lib/state.sh"
 
-REPO=""; PR=""; ASK=0; QUERY=0; WAIT=0; MAX_WAIT=180; INTERVAL=60
+REPO=""; PR=""; ASK=0; QUERY=0; WAIT=0; TRIGGER_REVIEW=0; MAX_WAIT=180; INTERVAL=60
 while [ $# -gt 0 ]; do
   case "$1" in
     --ask) ASK=1; shift;;
     --query) QUERY=1; ASK=1; shift;;
     --wait) WAIT=1; shift;;
+    --trigger-review) TRIGGER_REVIEW=1; QUERY=1; ASK=1; WAIT=1; shift;;
     --max-wait-min) MAX_WAIT="${2:?}"; shift 2;;
     --interval) INTERVAL="${2:?}"; shift 2;;
     -h|--help) sed -n '2,32p' "$0"; exit 3;;
@@ -52,7 +60,7 @@ while [ $# -gt 0 ]; do
     *) if [ -z "$REPO" ]; then REPO="$1"; elif [ -z "$PR" ]; then PR="$1"; else echo "unexpected arg: $1" >&2; exit 3; fi; shift;;
   esac
 done
-[ -n "$REPO" ] && [ -n "$PR" ] || { echo "usage: cr-rate-limit.sh OWNER/REPO PR [--ask] [--query] [--wait] [--max-wait-min N] [--interval S]" >&2; exit 3; }
+[ -n "$REPO" ] && [ -n "$PR" ] || { echo "usage: cr-rate-limit.sh OWNER/REPO PR [--ask] [--query] [--wait] [--trigger-review] [--max-wait-min N] [--interval S]" >&2; exit 3; }
 
 # ISO-8601 (GitHub's "2026-09-17T05:57:46Z") -> epoch seconds, via jq so it is portable
 # across BSD and GNU date. Fractional seconds are stripped first.
@@ -147,6 +155,59 @@ report() {  # $1 = reset epoch or "", $2 = source
   fi
 }
 
+# Post the review trigger inside the same process that proved quota is available. The lock
+# closes the concurrent-invocation window; the successful comment read fails closed and a
+# recent exact trigger makes callback replay idempotent. Run in a subshell so its trap cannot
+# replace the quota-query lock's cleanup trap.
+trigger_review_once() (
+  local sd lock marker age comments recent head marked
+  sd=$(state_dir) || exit 3
+  lock="$sd/locks/cr-review-${REPO//\//_}-$PR"
+  marker="$sd/locks/cr-review-last-${REPO//\//_}-$PR"
+  if ! mkdir "$lock" 2>/dev/null; then
+    age=$(( $(date +%s) - $(stat -f %m "$lock" 2>/dev/null || stat -c %Y "$lock" 2>/dev/null || date +%s) ))
+    if [ "$age" -gt 600 ]; then rm -rf "$lock"; mkdir "$lock" 2>/dev/null || { echo "review-trigger lock busy" >&2; exit 3; }
+    else echo "REVIEW_TRIGGER_LOCK_HELD=1 (another invocation is posting the review trigger)"; exit 3; fi
+  fi
+  trap 'rm -rf "$lock"' EXIT
+  head=$(gh pr view "$PR" --repo "$REPO" --json headRefOid -q .headRefOid 2>/dev/null) \
+    || { echo "cannot resolve the PR head; not posting a review trigger" >&2; exit 3; }
+  marked=""; [ -f "$marker" ] && marked=$(cat "$marker" 2>/dev/null || true)
+  if [ "$marked" = "$head" ]; then
+    echo "CR_REVIEW_TRIGGER=already_current_head"
+    exit 0
+  fi
+  comments=$(gh api --paginate "repos/$REPO/issues/$PR/comments" 2>/dev/null | jq -s 'add // []' 2>/dev/null || true)
+  printf '%s' "$comments" | jq -e 'type=="array"' >/dev/null 2>&1 || { echo "cannot read the PR comments; not posting a review trigger" >&2; exit 3; }
+  recent=$(printf '%s' "$comments" | jq -r --arg asked "${asked_at:-}" '
+    [.[]|select(((.user.login // "")|test("\\[bot\\]$")|not)
+      and ((.body // "")|gsub("^\\s+|\\s+$";"")=="@coderabbitai review")
+      and ($asked=="" or .created_at>=$asked))]|last|.created_at // ""' 2>/dev/null) \
+    || { echo "cannot parse the PR comments; not posting a review trigger" >&2; exit 3; }
+  if [ -n "$recent" ]; then
+    printf '%s\n' "$head" > "$marker" || { echo "cannot record the review-trigger head" >&2; exit 3; }
+    echo "CR_REVIEW_TRIGGER=already_recent"
+    exit 0
+  fi
+  gh pr comment "$PR" --repo "$REPO" --body '@coderabbitai review' >/dev/null 2>&1 \
+    || { echo "could not post the CodeRabbit review trigger" >&2; exit 3; }
+  printf '%s\n' "$head" > "$marker" || { echo "review trigger posted but its head marker could not be recorded" >&2; exit 3; }
+  echo "CR_REVIEW_TRIGGER=posted"
+)
+
+exit_safe() {
+  if [ "$TRIGGER_REVIEW" -eq 1 ]; then
+    trigger_review_once || exit 3
+    echo "NEXT=watch_pr:coderabbit"
+    # exec does not run this shell's EXIT trap. Drop the quota-query lock explicitly before
+    # replacing the process with watch-pr, or every successful atomic handoff leaves a live
+    # lock behind and the next invocation reads as an ask already in flight.
+    if [ -n "${ask_lock:-}" ]; then rm -rf "$ask_lock"; ask_lock=""; trap - EXIT; fi
+    exec "$WATCH_PR_SCRIPT" "$REPO" "$PR" 60 60 --reviewer coderabbit
+  fi
+  exit 0
+}
+
 status=$(cr_status) || { echo "gh error resolving PR $PR on $REPO" >&2; exit 3; }
 echo "CR_STATUS='${status:-absent}'"
 status_limited=0
@@ -205,9 +266,15 @@ fi
 echo "CR_LIMITED=$status_limited"
 report "$reset_ts" "${src:-}"
 
+# An authoritative zero-minute reply is safe NOW. Do not sleep for one polling interval
+# before triggering, which recreates the callback-latency gap this atomic mode removes.
+if [ -n "$reset_ts" ] && [ "$reset_ts" -le "$(date +%s)" ]; then
+  echo "CR_RESET_ELAPSED=1"
+  exit_safe
+fi
+
 if [ "$WAIT" -eq 0 ]; then
   [ -z "$reset_ts" ] && exit 2
-  [ "$reset_ts" -le "$(date +%s)" ] && { echo "CR_RESET_ELAPSED=1"; exit 0; }
   exit 1
 fi
 
@@ -220,7 +287,7 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
   sleep "$INTERVAL"
   if [ "$QUERY" -eq 1 ]; then
     now=$(date +%s)
-    if [ -n "$reset_ts" ] && [ "$now" -ge "$reset_ts" ]; then echo "CR_RESET_ELAPSED=1"; exit 0; fi
+    if [ -n "$reset_ts" ] && [ "$now" -ge "$reset_ts" ]; then echo "CR_RESET_ELAPSED=1"; exit_safe; fi
     echo "$(date +%H:%M:%S) waiting on exact quota reset at $reset_label"
     continue
   fi
@@ -233,6 +300,6 @@ done
 # The wait ended: only a reset that has actually passed is "elapsed". Hitting the ceiling
 # with the reset still ahead (or unknown) is NOT permission to trigger a review.
 now=$(date +%s)
-if [ -n "$reset_ts" ] && [ "$now" -ge "$reset_ts" ]; then echo "CR_RESET_ELAPSED=1"; exit 0; fi
+if [ -n "$reset_ts" ] && [ "$now" -ge "$reset_ts" ]; then echo "CR_RESET_ELAPSED=1"; exit_safe; fi
 if [ -n "$reset_ts" ]; then echo "CR_WAIT_CEILING=1 (reset still $(( (reset_ts - now + 59) / 60 )) min ahead; re-run --wait)"; exit 1; fi
 echo "CR_WAIT_CEILING=1 (reset unknown; re-run with --ask)"; exit 2

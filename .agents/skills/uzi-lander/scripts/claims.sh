@@ -16,7 +16,7 @@
 #   claims.sh touch <key> [--state TEXT]   # heartbeat + last state (trail.sh calls this)
 #   claims.sh show <key>
 #   claims.sh list [--json] [--all]        # this repo's claims, priority-desc; --all = every state dir key
-#   claims.sh reap [--repo O/R] [--dry-run] # drop claims whose PR is merged/closed or whose owner is dead
+#   claims.sh reap [--repo O/R] [--dry-run] # drop terminal/dead claims and stale orphan trails
 #   claims.sh whoami
 #
 # Priority: sessions decide. The default is the PR's file count (bigger first), because
@@ -160,6 +160,21 @@ case "$verb" in
       [ -n "$why" ] || continue
       n=$((n+1))
       if [ "$dry" -eq 1 ]; then echo "would reap $key ($why)"; else rm -f "$f" "$SD/trail/$key.trail"; echo "reaped $key ($why)"; fi
+    done
+    # A merged PR releases its live claim immediately but preserves the trail through the
+    # post-merge CI watch. Normal completion purges it explicitly; if that session dies,
+    # reap a claimless trail only after the same stale-owner TTL so a healthy watch cannot
+    # lose its history to another lander's concurrent reap.
+    for t in "$SD/trail"/*.trail; do
+      [ -f "$t" ] || continue
+      name=${t##*/}; key=${name%.trail}
+      [ -f "$CL/$key.json" ] && continue
+      modified=$(stat -f %m "$t" 2>/dev/null || stat -c %Y "$t" 2>/dev/null || echo "")
+      [ -n "$modified" ] || continue
+      age=$(( $(date +%s) - modified ))
+      [ "$age" -gt "$(( STALE_HOURS * 3600 ))" ] || continue
+      n=$((n+1))
+      if [ "$dry" -eq 1 ]; then echo "would reap $key (orphan trail stale ${age}s)"; else rm -f "$t"; echo "reaped $key (orphan trail stale ${age}s)"; fi
     done
     if [ "$dry" -eq 1 ]; then echo "REAPED=$n (dry-run)"; else echo "REAPED=$n"; fi
     exit 0;;
