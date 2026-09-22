@@ -61,7 +61,12 @@ function toml(value: string): string {
   return JSON.stringify(value);
 }
 
-function nativeDisabledConfigLines(model: string, providerName: string, projectPath: string): string[] {
+function nativeDisabledConfigLines(
+  model: string,
+  providerName: string,
+  projectPath: string,
+  codeModeHost: boolean,
+): string[] {
   return [
     `model = ${toml(model)}`,
     `model_provider = ${toml(providerName)}`,
@@ -89,7 +94,7 @@ function nativeDisabledConfigLines(model: string, providerName: string, projectP
     `shell_snapshot_v2 = false`,
     `code_mode = false`,
     `code_mode_only = false`,
-    `code_mode_host = false`,
+    `code_mode_host = ${codeModeHost}`,
     `code_mode_prewarm = false`,
     `remote_models = false`,
     `unified_exec = false`,
@@ -126,7 +131,7 @@ export function buildCodexConfigToml(opts: CodexConfigOptions): string {
   }
   // A single deterministic template — no caller-shaped branches, no repo config.
   return [
-    ...nativeDisabledConfigLines(model, provider.name, projectPath),
+    ...nativeDisabledConfigLines(model, provider.name, projectPath, false),
     `[model_providers.${toml(provider.name)}]`,
     `name = ${toml(provider.name)}`,
     `base_url = ${toml(provider.baseUrl)}`,
@@ -147,15 +152,21 @@ export interface CodexProductionConfigOptions {
   readonly model: string;
   readonly projectPath: string;
   readonly authMode: CodexAppServerAuthMode;
+  /** A trusted, launcher-fixed value (never model/repo/claim input) that enables ONLY the
+   *  code-mode execution host; absent/false keeps the host disabled. */
+  readonly codeModeHost?: boolean;
 }
 
 function validateProductionConfigOptions(opts: CodexProductionConfigOptions): void {
   const keys = Object.keys(opts);
-  if (keys.some((key) => key !== "model" && key !== "projectPath" && key !== "authMode")) {
+  if (keys.some((key) => key !== "model" && key !== "projectPath" && key !== "authMode" && key !== "codeModeHost")) {
     throw new Error("Codex production config received an unsupported option");
   }
   if (opts.authMode !== "api_key" && opts.authMode !== "subscription") {
     throw new Error("Codex production config requires an explicit supported auth mode");
+  }
+  if (opts.codeModeHost !== undefined && typeof opts.codeModeHost !== "boolean") {
+    throw new Error("Codex production config codeModeHost must be a boolean");
   }
 }
 
@@ -177,7 +188,7 @@ function validateProductionConfigOptions(opts: CodexProductionConfigOptions): vo
  */
 export function buildCodexProductionConfigToml(opts: CodexProductionConfigOptions): string {
   validateProductionConfigOptions(opts);
-  return nativeDisabledConfigLines(opts.model, "openai", opts.projectPath).join("\n");
+  return nativeDisabledConfigLines(opts.model, "openai", opts.projectPath, opts.codeModeHost ?? false).join("\n");
 }
 
 /**
@@ -220,7 +231,7 @@ export function buildCodexLoopbackTestConfigToml(
   validateProductionConfigOptions(opts);
   const providerName = CODEX_M3B_LOOPBACK_PROVIDER_NAME;
   return [
-    ...nativeDisabledConfigLines(opts.model, providerName, opts.projectPath),
+    ...nativeDisabledConfigLines(opts.model, providerName, opts.projectPath, opts.codeModeHost ?? false),
     `[model_providers.${toml(providerName)}]`,
     `name = "OpenAI"`,
     `base_url = ${toml(normalizedBaseUrl)}`,

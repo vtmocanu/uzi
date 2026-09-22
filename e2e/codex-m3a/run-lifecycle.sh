@@ -3,10 +3,10 @@
 # + ISOLATION suites, run under the PRD CONFINEMENT posture.
 #
 # This is the sibling of run.sh (which runs the shell profile controls under the
-# writable-root immutability posture). Here the three TypeScript suites
-# (lifecycle.test.ts / production-launcher.test.ts / isolation.test.ts) run INSIDE the
-# real worker image through its real root-start entrypoint, but under the PRD confinement
-# posture that is DISTINCT from run.sh's:
+# writable-root immutability posture). Here the four TypeScript suites
+# (lifecycle.test.ts / production-launcher.test.ts / isolation.test.ts /
+# code-mode-host-run-posture.test.ts) run INSIDE the real worker image through its real
+# root-start entrypoint, but under the PRD confinement posture that is DISTINCT from run.sh's:
 #
 #   * read-only root filesystem (`--read-only`), read-only mounted fixtures,
 #   * exactly three explicit writable runtime mounts: runner-owned /nix, owned /data and
@@ -20,7 +20,7 @@
 # so the docker run is bounded by an OUTER `timeout --kill-after` watchdog; --rm tears the
 # whole container (and any leaked descendant) down on kill.
 #
-#   ./run-lifecycle.sh                 build (unless skipped) + run all three suites
+#   ./run-lifecycle.sh                 build (unless skipped) + run all four suites
 #
 # Environment:
 #   UZI_M3A_IMAGE       image tag to build/run          (default: uzi-agent-m3a:base)
@@ -47,9 +47,11 @@ else
     --build-arg "UZI_SRC_SHA=$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)" "$REPO"
 fi
 
-# 2. Run the three suites under the CONFINEMENT posture. The tests + frozen M0 protocol
-#    helpers are mounted read-only under /work/e2e. Controls B/C dynamically import the
-#    IMAGE-BAKED production code from /app/src; control A drives installed supervisor/Codex.
+# 2. Run the four suites under the CONFINEMENT posture. The tests + frozen M0 protocol
+#    helpers are mounted read-only under /work/e2e. Controls B/C and the run-posture suite
+#    dynamically import the IMAGE-BAKED production code from /app/src (the run-posture suite
+#    drives the REAL launchCodexRoot + config.ts builder with codeModeHost on/off); control A
+#    drives installed supervisor/Codex.
 #    Type-only source imports are erased and cannot substitute the host tree at runtime.
 log "running lifecycle + isolation suites in $IMAGE under the confinement posture"
 set +e
@@ -65,7 +67,8 @@ timeout --kill-after=60s "$TIMEOUT" docker run --rm --network none \
   "$IMAGE" /bin/sh -c 'cd /app && exec /usr/local/bin/node --import tsx --test --test-concurrency=1 --test-timeout=120000 \
     /work/e2e/codex-m3a/lifecycle.test.ts \
     /work/e2e/codex-m3a/production-launcher.test.ts \
-    /work/e2e/codex-m3a/isolation.test.ts'
+    /work/e2e/codex-m3a/isolation.test.ts \
+    /work/e2e/codex-m3a/code-mode-host-run-posture.test.ts'
 rc=$?
 set -e
 # Best-effort removal of exactly this named container (never a broad sweep).

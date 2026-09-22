@@ -1650,6 +1650,34 @@ describe("CodexExecutor: an api_key run meters the root model end-to-end (execut
     // 300*10 + 600*1 + 100*12.5 + 200*50 = 14850 µ$. Reasoning (50) is a subset of output, never re-added.
     assert.equal(Math.round((astra.costUSD as number) * 1e6), 14850, "the exact summed Standard price in microdollars");
   });
+
+  it("(#1533) honors the server-resolved run/schedule model override on the root init + usage", async () => {
+    // buildRunRequest threads `ctx.config?.default_model ?? provider.model` into the run request,
+    // so a claim carrying the api-resolved, harness-validated `default_model` drives the ROOT thread
+    // (not just per-agent-template child overrides). Both the persisted init event AND the per-model
+    // usage key derive from that one request.model, so both must reflect the override — NOT the
+    // hardcoded provider fallback "gpt-6-astra". The sibling C4b test (no default_model) pins the
+    // FALLBACK to "gpt-6-astra", so the two together prove `?? provider.model`.
+    const rig = makeRig();
+    rig.transport
+      .push(threadStarted())
+      .push(tokenUsageUpdated("th-1", "tn-1", { inputTokens: 100, totalTokens: 100 }))
+      .push(signalDone())
+      .push(turnCompleted("completed"))
+      .end();
+    const { ctx, emitted } = makeCtx({ config: { default_model: "gpt-5.6-sol" } });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "model-override run");
+
+    // The persisted init event carries the resolved model, not the provider default.
+    const initEvents = emitted.filter((m) => m.kind === "status" && rec(m.payload).event === "init");
+    assert.equal(initEvents.length, 1, "exactly one init event for the executor claim");
+    assert.equal(rec(initEvents[0]!.payload).model, "gpt-5.6-sol", "the init event reports the server-resolved model");
+
+    // The per-model usage is charged to the resolved model, not "gpt-6-astra".
+    const modelUsage = lastResultModelUsage(emitted);
+    assert.ok(modelUsage, "the terminal carries per-model usage");
+    assert.deepEqual(Object.keys(modelUsage), ["gpt-5.6-sol"], "usage is charged to the server-resolved model, never the hardcoded default");
+  });
 });
 
 describe("CodexExecutor: one claim-leg accountant survives provider-epoch recreation (CodeRabbit 4004800880)", () => {

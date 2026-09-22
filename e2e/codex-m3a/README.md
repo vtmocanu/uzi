@@ -16,7 +16,7 @@ There are **two suites, run under two different container postures**:
 - The **credential-free lifecycle + isolation suites** (TypeScript;
   `run-lifecycle.sh`, `task test:codex-m3a:lifecycle`) run under the **PRD confinement
   posture** and prove the real code-mode-host lifecycle and the m3 isolation controls
-  (controls A/B/C below). This is the milestone-3 deliverable.
+  (controls A/B/C/D below). This is the milestone-3 deliverable.
 
 ## Supported profile (do not deviate)
 
@@ -118,8 +118,12 @@ required for a dynamic-tool-only cell.
   uninterrupted cell writes its delayed marker (positive control), and
   revoke+settle+interrupt+dispose reaps BOTH the app-server and the differently-grouped
   host via `ECHILD+__WALL` with the late marker absent. NO hook-trust bypass, NO creds.
-  This is intentionally an e2e-only characterization config: production `config.ts`
-  exposes no host-enabling toggle, so the test cannot become a production escape hatch.
+  This is intentionally an e2e-only characterization config driving the supervisor DIRECTLY (never
+  `config.ts`): config.ts's STOCK builder exposes no host-enabling toggle, and its
+  production/loopback builders enable the host only via the trusted launcher-fixed `codeModeHost`
+  flag on the RUN lane — never from model/repo/claim input — so neither this direct-drive test nor a
+  repo can become a production escape hatch. The real-builder run posture (host present on the run
+  lane, absent on advice/stock) is proven by `code-mode-host-run-posture.test.ts` (control D).
 - **B. Production-config app-server lifecycle** (`production-launcher.test.ts`). Launches
   the real app-server through the ACTUAL `launchCodexRoot` + `config.ts` hardened stock
   config (host DISABLED), runs a trivial credential-free turn against the fake provider,
@@ -134,6 +138,15 @@ required for a dynamic-tool-only cell.
   construction (untrusted project, no folded repo config, injection-shaped identifiers
   rejected); C5 asserts the fresh HOME/CODEX_HOME/XDG/TMPDIR land on the owned writable
   `/data` mount, uid 10002, owner-only mode 0700.
+- **D. Run-provider-root code-mode host posture** (`code-mode-host-run-posture.test.ts`, PRD
+  #1533). Launches the real app-server through the ACTUAL `launchCodexRoot` + the REAL `config.ts`
+  loopback builder — the run-lane path M1 (commit 901bfbda) wired `CodexLaunchSpec.codeModeHost`
+  into. With `codeModeHost:true` a real `codex-code-mode-host` appears below the supervisor with a
+  SEPARATE pgid while a worker callback is in flight, and `handle.dispose()` reaps BOTH the
+  app-server AND the host clean (`ECHILD+__WALL`); with `codeModeHost:false` (advice/stock posture)
+  NO code-mode host ever appears and dispose reaps only the app-server. This is the run-lane
+  analogue of control A driven through the REAL builder, and the reviewer-required proof that the
+  advice/stock root launches no host.
 
 ## Integration seam (later M3)
 
@@ -201,10 +214,10 @@ task test:codex-supervisor
 - `evq.mjs` — a tiny NDJSON event-query helper for the launcher's stderr events (avoids
   parsing JSON in shell and avoids running a `/nix` `jq` as the worker uid).
 - `run-lifecycle.sh` — lifecycle + isolation host orchestrator: builds the image and runs
-  the three TypeScript suites inside it under the confinement posture, with the outer
+  the four TypeScript suites inside it under the confinement posture, with the outer
   watchdog.
-- `lifecycle.test.ts` / `production-launcher.test.ts` / `isolation.test.ts` — controls A /
-  B / C (above).
+- `lifecycle.test.ts` / `production-launcher.test.ts` / `isolation.test.ts` /
+  `code-mode-host-run-posture.test.ts` — controls A / B / C / D (above).
 - `fake-provider.ts` — the localhost `/v1/responses` SSE fake provider with runtime dummy
   bearer auth (the m3 analogue of the frozen M0 fixture's server; reuses only the frozen
   pure protocol helpers).

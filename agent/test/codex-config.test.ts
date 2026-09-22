@@ -117,6 +117,28 @@ describe("buildCodexProductionConfigToml: fixed managed-auth provider", () => {
     });
   }
 
+  it("keeps the code-mode host DISABLED by default (no codeModeHost opt)", () => {
+    const toml = buildCodexProductionConfigToml({
+      model: "gpt-6-astra",
+      projectPath: "/work/repo",
+      authMode: "api_key",
+    });
+    assert.match(toml, /^code_mode_host = false$/m);
+  });
+
+  it("enables ONLY the code-mode host when codeModeHost is true", () => {
+    const toml = buildCodexProductionConfigToml({
+      model: "gpt-6-astra",
+      projectPath: "/work/repo",
+      authMode: "api_key",
+      codeModeHost: true,
+    });
+    assert.match(toml, /^code_mode_host = true$/m);
+    assert.match(toml, /^code_mode = false$/m);
+    assert.match(toml, /^code_mode_only = false$/m);
+    assert.match(toml, /^code_mode_prewarm = false$/m);
+  });
+
   it("rejects endpoint/provider injection even from untyped runtime input", () => {
     assert.throws(
       () => buildCodexProductionConfigToml({
@@ -157,6 +179,22 @@ describe("buildCodexLoopbackTestConfigToml: authenticated packaged fake", () => 
     assert.match(toml, /^supports_websockets = false$/m);
     assert.match(toml, /^requires_openai_auth = true$/m);
     assert.doesNotMatch(toml, /env_key/);
+  });
+
+  it("keeps the code-mode host DISABLED by default (no codeModeHost opt)", () => {
+    const toml = buildCodexLoopbackTestConfigToml(opts, "http://127.0.0.1:43123/v1");
+    assert.match(toml, /^code_mode_host = false$/m);
+  });
+
+  it("enables ONLY the code-mode host when codeModeHost is true", () => {
+    const toml = buildCodexLoopbackTestConfigToml(
+      { ...opts, codeModeHost: true },
+      "http://127.0.0.1:43123/v1",
+    );
+    assert.match(toml, /^code_mode_host = true$/m);
+    assert.match(toml, /^code_mode = false$/m);
+    assert.match(toml, /^code_mode_only = false$/m);
+    assert.match(toml, /^code_mode_prewarm = false$/m);
   });
 
   it("rejects every non-literal-loopback redirect and credential-bearing URL", () => {

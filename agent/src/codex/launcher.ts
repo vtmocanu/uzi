@@ -118,6 +118,10 @@ export interface CodexLaunchSpec {
   /** The immutable app-server auth mode, REQUIRED when {@link useAppServerAuth} is set (the
    *  production config builder forces an explicit no-fallback choice). Ignored otherwise. */
   readonly authMode?: CodexAppServerAuthMode;
+  /** Trusted & launcher-fixed (like {@link authMode}), never model/repo-controlled; only
+   *  honoured on the app-server-auth production/loopback path, where it enables ONLY the
+   *  code-mode execution host. Absent/false keeps the host disabled. */
+  readonly codeModeHost?: boolean;
   /** Managed-auth resume only: copy the executor's deterministic, credential-free
    * sibling staging tree into the runner-owned sessions directory before spawn. */
   readonly seedSession?: boolean;
@@ -560,7 +564,7 @@ export async function launchCodexRoot(spec: CodexLaunchSpec, deps: LauncherDeps 
     if (authMode !== "subscription" && authMode !== "api_key") {
       throw new Error("app-server auth requires an explicit subscription or api_key mode");
     }
-    const configOpts = { model: spec.model, projectPath: spec.cwd, authMode };
+    const configOpts = { model: spec.model, projectPath: spec.cwd, authMode, codeModeHost: spec.codeModeHost ?? false };
     configText = deps.appServerAuthOpenAIBaseUrlForTest === undefined
       ? buildCodexProductionConfigToml(configOpts)
       : buildCodexLoopbackTestConfigToml(configOpts, deps.appServerAuthOpenAIBaseUrlForTest);

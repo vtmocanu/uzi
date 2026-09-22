@@ -9,7 +9,7 @@
 // credential bridge ({@link WorkerClient.releaseCodex}/{@link WorkerClient.refreshCodex})
 // into ONE `Executor`.
 //
-// It is DARK: nothing routes to Codex through public paths (M5 owns enablement). It is
+// It is a LIVE production executor (PRD #1429 routes ordinary run origins through Codex). It is
 // selected ONLY by `main.ts`'s `makeExecutor` when a claim carries a COMPLETE, validated
 // `secrets.codex` binding, and it NEVER changes Claude/stub behavior (a claim without the
 // block takes the exact legacy path).
@@ -128,16 +128,16 @@ import {
 
 // ─── Part G: the FIXED production vendor targets ────────────────────────────────
 /**
- * The FIXED production Codex provider targets. NONE of these ever comes from a claim,
- * model, repo, saved label or callback — they are immutable vendor endpoints wired only
+ * The FIXED production Codex provider ENDPOINT targets. The name/baseUrl/envKey NEVER come from
+ * a claim, model, repo, saved label or callback — they are immutable vendor endpoints wired only
  * here. The `wireApi` is pinned to `"responses"` downstream in `launcher.ts`
  * (buildCodexConfigToml), and the binary/supervisor/PATH are already fixed there too.
  *
- * 🔴 MAINTAINER-CONFIRMED-AT-LIVE-ACCEPTANCE: `model:"gpt-6-astra"` is the ADR's INTENDED
- * default (`adr/1106-codex-harness.md:162` marks the model names intended-not-live). These
- * targets are DARK and unreached by production routing; the maintainer confirms the exact
- * endpoint/model at live acceptance. The fake localhost provider stays ONLY in the
- * non-exported `launch-cli.ts` test composition — never reachable from `makeExecutor`.
+ * `model:"gpt-6-astra"` is the FALLBACK DEFAULT model, used only when a claim carries no
+ * server-resolved `default_model`. The effective per-run model is the api-resolved,
+ * harness-validated `ctx.config.default_model` (owner default or PRD #300 schedule freeze) when
+ * present — see `buildRunRequest`. The fake localhost provider stays ONLY in the non-exported
+ * `launch-cli.ts` test composition — never reachable from `makeExecutor`.
  */
 export const CODEX_PRODUCTION_PROVIDER: CodexProviderConfig = {
   name: "openai",
@@ -706,6 +706,9 @@ export function makeProductionLaunchAdviceRoot(homeRoot: string, authMode: Codex
       cwd,
       useAppServerAuth: true,
       authMode,
+      // The advice lane keeps the host DISABLED — its "pure in-memory ceiling" posture is
+      // preserved by this call-site scoping (no dynamic tools; no execution surface).
+      codeModeHost: false,
     });
     const stdout = handle.transport.stdout;
     const stdin = handle.transport.stdin;
@@ -2301,7 +2304,12 @@ export class CodexExecutor implements Executor {
       agents,
       leadSkills,
       signal,
-      model: this.opts.provider.model,
+      // Honor the SERVER-RESOLVED per-run/schedule model (owner default or PRD #300 schedule
+      // freeze) that the api already harness-validated against the closed Codex set and shipped on
+      // the claim; fall back to the fixed provider default when the claim carries none. render.ts's
+      // resolveModel re-validates request.model downstream and codex-harness.ts's
+      // `rendered.lead.model ?? this.provider.model` supplies the same default for an out-of-set value.
+      model: ctx.config?.default_model ?? this.opts.provider.model,
       ...(resumeId !== undefined ? { resumeSessionId: resumeId } : {}),
       ...(effort !== undefined ? { effort } : {}),
     };
@@ -2649,6 +2657,11 @@ async function defaultLaunchProviderRoot(
     cwd: spec.cwd,
     useAppServerAuth: true,
     authMode,
+    // The run lane enables the code-mode execution host; the intended models route their
+    // tool calls through code-mode, and the host is authority-free (environments:[] +
+    // untrusted project + broker-mediated callbacks). Subagent threads that run on this same
+    // app-server share the host.
+    codeModeHost: true,
     seedSession: spec.seedSession,
   }, openAIBaseUrlForTest === undefined
     ? undefined

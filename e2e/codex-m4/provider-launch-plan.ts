@@ -16,6 +16,10 @@ export interface ProviderLaunchPlanInput {
   readonly model: string;
   readonly cwd: string;
   readonly ownedDataRoot: string;
+  /** Trusted, launcher-fixed (mirrors {@link CodexLaunchSpec.codeModeHost}): when true the
+   *  app-server-auth loopback config emits `code_mode_host = true`, enabling the real code-mode
+   *  execution host (PRD #1533). Absent/false keeps the host disabled, byte-identical to before. */
+  readonly codeModeHost?: boolean;
 }
 
 export interface ProviderLaunchPlan {
@@ -40,6 +44,8 @@ export function buildProviderLaunchPlan(
       ownedDataRoot: input.ownedDataRoot,
       useAppServerAuth: true,
       authMode: "api_key",
+      // Only set when explicitly requested, so an absent value keeps the pre-#1533 spec shape.
+      ...(input.codeModeHost !== undefined ? { codeModeHost: input.codeModeHost } : {}),
     },
     executableBin: input.executableBin,
   };

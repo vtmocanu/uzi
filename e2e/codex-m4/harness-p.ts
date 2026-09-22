@@ -149,6 +149,11 @@ export interface ProtocolTurnOptions {
   readonly model?: string;
   /** Optional per-callback origin (default "root"). */
   readonly origin?: "root" | "child" | "unknown";
+  /** PRD #1533: thread `codeModeHost` onto the launch spec so the REAL `config.ts` loopback
+   *  builder emits `code_mode_host = <value>`. `true` enables the real code-mode execution host
+   *  (a nested `exec` cell's worker callback then reaches the broker); `false`/absent keeps it
+   *  disabled (the same exec cell fails with "code-mode host is disabled" and no callback fires). */
+  readonly codeModeHost?: boolean;
   /** How long to wait for the single turn to complete (default 60s). */
   readonly turnDeadlineMs?: number;
 }
@@ -314,6 +319,7 @@ export async function runProtocolTurn(mods: ProtocolModules, opts: ProtocolTurnO
       model,
       cwd,
       ownedDataRoot,
+      ...(opts.codeModeHost !== undefined ? { codeModeHost: opts.codeModeHost } : {}),
     });
     const deps: LauncherDeps = {
       env: opts.launcherEnv ?? { UZI_UID_SPLIT: "1" },
