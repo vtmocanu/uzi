@@ -339,9 +339,10 @@ test("production launcher advice posture: code_mode_host=false launches NO code-
   let turnSettled = false;
   const sampler = (async (): Promise<void> => {
     while (!turnSettled) {
-      // No catch: this sampler is awaited (below) BEFORE handle.dispose(), so snapshot() always
-      // runs while the supervisor is alive. A control-channel/supervisor-exit/deadline rejection
-      // is a real failure and must fail the test, not let it pass vacuously with samples === 0.
+      // No catch: a snapshot() rejection (control-channel failure, supervisor exit, deadline) is a
+      // real failure that must fail the test via `await sampler`, not be swallowed into a vacuous
+      // pass with samples === 0. The sampler is always settled before dispose (finally below), so a
+      // late rejection surfaces there rather than floating unhandled after teardown.
       const live = (await handle!.snapshot(20_000)).processes as readonly Row[];
       samples += 1;
       if (live.some((p) => p.comm.includes("code-mode"))) sawCodeModeHost = true;
@@ -349,12 +350,17 @@ test("production launcher advice posture: code_mode_host=false launches NO code-
     }
   })();
 
-  await rpc.startThreadAndTurn(cwd);
-
-  // The exec cell fails "code-mode host is disabled" and the turn completes with NO callback.
-  await waitFor(() => rpc.turnStatus !== undefined, "turn completion");
-  turnSettled = true;
-  await sampler;
+  try {
+    await rpc.startThreadAndTurn(cwd);
+    // The exec cell fails "code-mode host is disabled" and the turn completes with NO callback.
+    await waitFor(() => rpc.turnStatus !== undefined, "turn completion");
+  } finally {
+    // Always stop and settle the sampler — even if the wait above threw — so its snapshot loop
+    // cannot dangle into dispose/teardown as a floating rejection, and any sampling failure
+    // surfaces here instead.
+    turnSettled = true;
+    await sampler;
+  }
   t.diagnostic(JSON.stringify({ posture: "off", lifetimeSamples: samples, sawCodeModeHost }));
   assert.equal(rpc.turnStatus, "completed", "the turn completes cleanly with the host disabled");
   assert.equal(rpc.callbackStarted, false, "no worker callback fired with the host disabled");
