@@ -101,9 +101,9 @@ describe("AdminHealth — the five states", () => {
     // fleet.roll is danger, so its row renders EXPANDED.
     expect(checkDetails(container, "fleet.roll").open).toBe(true);
     // The cross-user fleet table is populated across two owners, with the blocking cause.
-    expect(screen.getAllByText("user.a@uzi.local").length).toBeGreaterThan(0);
-    expect(screen.getAllByText("user.c@uzi.local").length).toBeGreaterThan(0);
-    expect(screen.getAllByText("worker: ImagePullBackOff").length).toBe(4);
+    expect((await screen.findAllByText("user.a@uzi.local")).length).toBeGreaterThan(0);
+    expect((await screen.findAllByText("user.c@uzi.local")).length).toBeGreaterThan(0);
+    expect((await screen.findAllByText("worker: ImagePullBackOff")).length).toBe(4);
   });
 
   it("unknown: an Unknown pill renders and the unknown check is expanded (a stale signal is never green)", async () => {
