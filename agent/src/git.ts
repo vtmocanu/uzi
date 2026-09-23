@@ -2067,16 +2067,16 @@ export class GitCache {
    * guard-critical paths in its MR (PRD #46). Under (b) this is a WORKER-BARE
    * tree-to-tree diff (no working tree, no runner-owned config source read): the
    * caller passes the worker-side tracking ref that fetchAgentBranch wrote, and
-   * `--name-only` fires no diff drivers. Returns null (NOT []) when the diff cannot be
-   * computed, so the caller fails CLOSED — a loud "guard-path check unavailable" note
+   * `--name-only -z` fires no diff drivers and preserves unusual path names.
+   * Returns null (NOT []) when the diff cannot be computed, so the caller fails CLOSED — a loud "guard-path check unavailable" note
    * rather than silently raising no flag on a possibly guard-touching MR (M5 audit).
    * An empty list means "computed, nothing changed".
    */
   async changedFiles(barePath: string, trackingRef: string): Promise<string[] | null> {
     try {
       const baseRef = await this.defaultBranchRef(barePath);
-      const out = await this.runGit(barePath, ["diff", "--name-only", `${baseRef}...${trackingRef}`]);
-      return out.split("\n").map((l) => l.trim()).filter((l) => l !== "");
+      const out = await this.runGit(barePath, ["diff", "--name-only", "-z", `${baseRef}...${trackingRef}`]);
+      return out.split("\0").filter(Boolean);
     } catch {
       return null;
     }
@@ -2090,38 +2090,43 @@ export class GitCache {
   ): Promise<string[] | null> {
     try {
       if (!/^[0-9a-f]{40}$/.test(freshDefaultTip)) return null;
-      // Cap work on pathological histories. The extra commit detects truncation.
+      // Cap branch-only history at 256 commits; the extra commit detects truncation.
+      // Exceeding the cap returns null so the caller fails open rather than guessing.
       const commits = (await this.runGit(barePath, [
         "rev-list", "--max-count=257", trackingRef, `^${freshDefaultTip}`,
       ])).trim().split("\n").filter(Boolean);
       if (commits.length > 256) return null;
       const paths = new Set<string>();
+      // A single octopus merge can have many parents even when the branch has few commits.
+      const maxParents = 32;
       for (const commit of commits) {
         const parts = (await this.runGit(barePath, ["rev-list", "--parents", "-n", "1", commit]))
           .trim().split(" ");
         const parents = parts.slice(1);
+        if (parents.length > maxParents) return null;
         // A merge may contain changes absent from either parent's individual history.
         const comparisons = parents.length ? parents : ["--root"];
         const touched = new Set<string>();
         for (const parent of comparisons) {
           const args = parent === "--root"
-            ? ["diff-tree", "--root", "--no-commit-id", "--no-renames", "--name-only", "-r", commit]
-            : ["diff", "--no-renames", "--name-only", parent, commit];
+            ? ["diff-tree", "--root", "--no-commit-id", "--no-renames", "--name-only", "-z", "-r", commit]
+            : ["diff", "--no-renames", "--name-only", "-z", parent, commit];
           const out = await this.runGit(barePath, args);
-          for (const file of out.split("\n")) if (file.startsWith(".github/workflows/")) touched.add(file);
+          for (const file of out.split("\0")) if (file.startsWith(".github/workflows/")) touched.add(file);
         }
         if (touched.size === 0) continue;
         let align = false;
         if (parents.length === 1) {
           const subject = (await this.runGit(barePath, ["log", "-1", "--format=%s", commit])).trim();
           const match = /^chore: align \.github\/workflows with ([0-9a-f]{40})$/.exec(subject);
-          if (match) {
-            const named = match[1];
-            const changed = (await this.runGit(barePath, ["diff", "--no-renames", "--name-only", parents[0], commit]))
-              .split("\n").filter(Boolean);
+          const named = match?.[1];
+          const parent = parents[0];
+          if (named && parent) {
+            const changed = (await this.runGit(barePath, ["diff", "--no-renames", "--name-only", "-z", parent, commit]))
+              .split("\0").filter(Boolean);
             const inFreshHistory = await this.runGit(barePath, ["merge-base", "--is-ancestor", named, freshDefaultTip])
               .then(() => true, () => false);
-            const inParentHistory = await this.runGit(barePath, ["merge-base", "--is-ancestor", named, parents[0]])
+            const inParentHistory = await this.runGit(barePath, ["merge-base", "--is-ancestor", named, parent])
               .then(() => true, () => false);
             // ls-tree succeeds with empty output when the default deleted the entire
             // workflow directory; a matching deletion is a valid align.

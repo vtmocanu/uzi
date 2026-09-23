@@ -155,7 +155,7 @@ function spyFetchDefaultTip(): { count: () => number } {
 
 describe("RunRunner — finalize base-align (PRD #456)", () => {
   for (const [iid, advanceAgain] of [[165, true], [166, false]] as const) {
-    it(`prior published align ${advanceAgain ? "behind D2" : "at current D1"} survives rework and opens a PR`, async () => {
+    it(`prior published align ${advanceAgain ? "behind D2 is not falsely workflow_scope_missing but may hit base-align conflict" : "at current D1 survives rework and opens a PR"}`, async () => {
       publishPriorAlign(iid, advanceAgain);
       const { github, calls } = fakeGitHub();
       const strategies = spyAlign();
@@ -626,6 +626,31 @@ describe("RunRunner — finalize base-align (PRD #456)", () => {
     assert.match(failed.preserved_patch!, /workflows\/ci\.yml/, "the preserved patch carries the branch's workflow edit");
     assert.strictEqual(pushed, false, "no clobbering push");
     assert.strictEqual(calls.length, 0, "no PR opened on the conflict fail");
+  });
+
+  it("unicode workflow edit is seen by the real overlay guard and cannot be clobbered", async () => {
+    const workflow = ".github/workflows/café.yml";
+    seedWorkflowsOnOrigin({ [workflow]: "name: original\n" });
+    const { github, calls } = fakeGitHub();
+    const strategies = spyAlign();
+    // Let the run reach base-align while retaining the real changedFiles overlay check.
+    git.branchWorkflowFiles = (async () => null) as typeof git.branchWorkflowFiles;
+    const realChanged = git.changedFiles.bind(git);
+    let sawUnicode = false;
+    git.changedFiles = (async (...args: Parameters<typeof git.changedFiles>) => {
+      const changed = await realChanged(...args);
+      if (changed?.includes(workflow)) sawUnicode = true;
+      return changed;
+    }) as typeof git.changedFiles;
+    const claim = githubClaim(167);
+    await githubRunner(github, committingExecutor(
+      { [workflow]: "name: branch\n" },
+      { [workflow]: "name: default\n" },
+    )).execute(claim);
+    assert.strictEqual(sawUnicode, true, "the real diff retains the unicode path");
+    assert.ok(!strategies.includes("workflow-subtree"), "overlay cannot overwrite the branch edit");
+    assert.strictEqual(api.states.at(-1)?.body.fail_origin, "finalize_base_align_conflict");
+    assert.strictEqual(calls.length, 0);
   });
 
   it("a genuine workflow edit fails typed and preserves its exact content", async () => {

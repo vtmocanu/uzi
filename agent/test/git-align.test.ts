@@ -97,6 +97,57 @@ describe("fetchDefaultTip", () => {
 });
 
 describe("branchWorkflowFiles", () => {
+  it("preserves unicode and newline workflow paths in both diff consumers", async () => {
+    const bare = await git.ensureClone(fx.originPath);
+    const base = await git.fetchDefaultTip(bare, "main");
+    const rc = await git.createOrAttachRunnerClone(bare, 104);
+    const paths = [".github/workflows/café.yml", ".github/workflows/line\nfeed.yml"];
+    for (const rel of paths) {
+      fs.writeFileSync(path.join(rc.path, rel), "name: branch\n");
+    }
+    gitIn(rc.path, ["add", "--", ...paths]);
+    gitIn(rc.path, [...IDENT, "commit", "-m", "workflow paths"]);
+    const ref = await git.fetchAgentBranch(bare, rc.path, "agent/issue-104", "run-paths");
+    assert.deepStrictEqual(await git.changedFiles(bare, ref), [...paths].sort());
+    assert.deepStrictEqual(await git.branchWorkflowFiles(bare, base, ref), [...paths].sort());
+  });
+
+  it("reads unicode workflow paths from a root commit", async () => {
+    const bare = await git.ensureClone(fx.originPath);
+    const base = await git.fetchDefaultTip(bare, "main");
+    const rc = await git.createOrAttachRunnerClone(bare, 105);
+    gitIn(rc.path, ["checkout", "--orphan", "root-path"]);
+    gitIn(rc.path, ["rm", "-r", "--cached", "."]);
+    const workflow = ".github/workflows/café.yml";
+    fs.writeFileSync(path.join(rc.path, workflow), "name: root\n");
+    gitIn(rc.path, ["add", "--", workflow]);
+    gitIn(rc.path, [...IDENT, "commit", "-m", "root workflow"]);
+    const root = gitIn(rc.path, ["rev-parse", "HEAD"]);
+    gitIn(bare, ["fetch", rc.path, root]);
+    assert.deepStrictEqual(await git.branchWorkflowFiles(bare, base, root), [workflow]);
+  });
+
+  it("fails open when branch-only history exceeds 256 commits", async () => {
+    const bare = await git.ensureClone(fx.originPath);
+    const base = await git.fetchDefaultTip(bare, "main");
+    const tree = gitIn(bare, ["rev-parse", `${base}^{tree}`]);
+    let tip = base;
+    for (let n = 0; n < 257; n++) {
+      tip = gitIn(bare, [...IDENT, "commit-tree", tree, "-p", tip, "-m", `empty ${n}`]);
+    }
+    assert.strictEqual(await git.branchWorkflowFiles(bare, base, tip), null);
+  });
+
+  it("fails open when one merge has more than 32 parents", async () => {
+    const bare = await git.ensureClone(fx.originPath);
+    const base = await git.fetchDefaultTip(bare, "main");
+    const tree = gitIn(bare, ["rev-parse", `${base}^{tree}`]);
+    const parents = Array.from({ length: 33 }, (_, n) =>
+      gitIn(bare, [...IDENT, "commit-tree", tree, "-p", base, "-m", `parent ${n}`]));
+    const merge = gitIn(bare, [...IDENT, "commit-tree", tree, ...parents.flatMap((p) => ["-p", p]), "-m", "wide merge"]);
+    assert.strictEqual(await git.branchWorkflowFiles(bare, base, merge), null);
+  });
+
   it("ignores a stale default mirror older than the branch base", async () => {
     const bare = await git.ensureClone(fx.originPath);
     advanceOriginMain(fx.originPath, { ".github/workflows/ci.yml": "name: base\n" }, "branch base");
