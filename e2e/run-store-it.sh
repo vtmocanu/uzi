@@ -36,7 +36,7 @@ say() { printf '\n\033[1m==> %s\033[0m\n' "$1"; }
 
 cleanup() {
   local code=$?
-  docker rm -f "$NAME" >/dev/null 2>&1 || true
+  docker rm -f -v "$NAME" >/dev/null 2>&1 || true
   exit $code
 }
 trap cleanup EXIT
