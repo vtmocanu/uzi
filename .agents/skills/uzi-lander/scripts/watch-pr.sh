@@ -169,9 +169,10 @@ while [ "$i" -lt "$MAX" ]; do
   # "ignored keyword in the PR title" — and "Review in progress" while it works. The
   # `state` is `success` even when rate-limited, so only the description is read. Absent
   # (no context) = CR has not touched this head at all.
-  cr_desc=""; cr_pending=0; cr_limited=0; cr_skipped=0; cr_absent=0
+  cr_desc=""; cr_pending=0; cr_limited=0; cr_skipped=0; cr_absent=0; cr_status_at=""
   if st=$(gh api "repos/$REPO/commits/$head/status" 2>/dev/null) && printf '%s' "$st" | jq -e 'has("statuses")' >/dev/null 2>&1; then
     cr_desc=$(printf '%s' "$st" | jq -r '[.statuses[]|select(.context=="CodeRabbit")]|last|.description // empty' 2>/dev/null) || unknown=1
+    cr_status_at=$(printf '%s' "$st" | jq -r '[.statuses[]|select(.context=="CodeRabbit")]|last|.updated_at // empty' 2>/dev/null || true)
     case "$cr_desc" in
       "") cr_absent=1 ;;
       *"in progress"*) cr_pending=1 ;;
@@ -255,6 +256,18 @@ while [ "$i" -lt "$MAX" ]; do
       # forge a ready; finding liveness stays with reviewThreads (cr_live), so a clean marker
       # never zeroes a genuinely unresolved thread.
       if printf '%s' "$wt_body" | grep -qF "change_assessment_commit:\"$head\""; then cr_reviewed=1; fi
+    fi
+    # A "Review triggered." acknowledgement NEWER than a "Review rate limited" status means
+    # the quota reset and the review was accepted; CodeRabbit flips the status to "in
+    # progress" only some seconds later. Reading the stale status in that window exited 5
+    # six seconds after cr-rate-limit.sh's trigger (#1574, 2026-09-23). Treat it as in
+    # flight. A status re-stamped AFTER the ack (a genuine second refusal) still reads
+    # rate-limited, and an unparseable or missing timestamp keeps the old reading.
+    if [ "$cr_limited" -eq 1 ] && [ -n "$cr_status_at" ]; then
+      ack_at=$(printf '%s' "$issue_c" | jq -rs '[.[][]|select(.user.login=="coderabbitai[bot]")|select(.body|test("(Full review|Review) triggered\\."))|.created_at]|max // empty' 2>/dev/null || true)
+      if [ -n "$ack_at" ] && [ "$(jq -rn --arg a "$ack_at" --arg s "$cr_status_at" '($a|sub("\\.[0-9]+";"")|fromdateiso8601) > ($s|sub("\\.[0-9]+";"")|fromdateiso8601)' 2>/dev/null)" = true ]; then
+        cr_limited=0; cr_pending=1; cr_desc="$cr_desc (superseded by review triggered $ack_at)"
+      fi
     fi
     rl_row=$(printf '%s' "$issue_c" | jq -rs '[.[][]|select(.user.login=="coderabbitai[bot]")|select(.body|contains("rate limited by coderabbit.ai"))]|last|select(.!=null)|"\(.updated_at)\t\(.body)"' 2>/dev/null || true)
     if [ -n "$rl_row" ]; then

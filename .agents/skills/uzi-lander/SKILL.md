@@ -193,7 +193,8 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    Exit 5 = conflict, worktree left mid-rebase: resolve (a union of both sides is usual for
    a shared list), `git rebase --continue`, re-run with `--skip-rebase`. Exit 6 = the
    renumber helper reported references to fix by hand. Exit 7 = a gate failed (log path
-   printed). Exit 8 = branch or base moved during preparation: restart with `--fresh`.
+   printed). Exit 8 = branch or base moved during preparation: restart with `--fresh`; it
+   resets to the remote, so cherry-pick back any commit it names under `FRESH_BACKUP=`.
    A push re-enters the chosen review lane in step 2. Trail `rebase+renumber → pushed`.
    Say what you resolved in the merge note; do not ask first.
 6. **Merge.** When the readiness poll says ready and the *Always yours* checks below have
