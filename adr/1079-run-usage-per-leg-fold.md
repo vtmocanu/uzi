@@ -1,12 +1,17 @@
 # ADR-1079: `run_usage` keys each leg by its position-absolute `init`-frame count, not by a mutable counter
 
-**Status**: Accepted (implemented, issue #1079, M1–M3 landed)
+**Status**: Accepted (implemented, issue #1079, M1–M3 landed). Amended by [ADR-1562](1562-run-usage-session-cumulative-basis.md) (2026-09-23): from Claude Agent SDK 0.3.277 a resumed leg reports the running session total, not just its own `query()` leg, so the per-leg SUM below over-counts a resumed run and is now only the `per_leg` half of a two-basis fold.
 **Date**: 2026-09-03
 **Deciders**: architect + fact-check pass over the first PRD draft (2026-09-03), coder (implementation), reviewer (M3 poison-batch finding addressed).
 **Supersedes**: [ADR-632](0632-run-usage-lineage-epoch.md) — its within-lineage MAX rationale, its `resume_lineage_break`-driven epoch bump, and the `runs.lineage_epoch` counter. [ADR-195](0195-run-usage-per-model-fold.md) is **unchanged**: the client still folds `modelUsage` per model, and parity between the two readers is still pinned by a fixture both halves read (this ADR adds a second such fixture pair).
 **PRD**: [prds/done/1079-run-usage-per-leg-fold.md](../prds/done/1079-run-usage-per-leg-fold.md) — carries the full milestone breakdown, code anchors and Decision Log D1–D10; this ADR restates the load-bearing shipped contract and the two things a future reader most needs and will not re-derive from the diff: why ADR-632's design was wrong in a way its own tests couldn't see, and what the backfill does and does not reach.
 
 ## Decision (summary)
+
+> **Amended by ADR-1562.** The per-leg SUM this section describes is exactly right for a
+> `per_leg` frame, but a Claude result frame from SDK >= 0.3.277 that continues a resumed
+> session is `session_cumulative` instead, and must be high-water-folded rather than
+> summed — see [ADR-1562](1562-run-usage-session-cumulative-basis.md).
 
 `run_usage` under-reported the cost of every multi-iteration run, because the Agent SDK reports cost **per `query()` call**, not cumulatively over a resumed session, while `run_usage` keyed rows `(run_id, session_id, model)` and merged with `GREATEST` on the assumption that later frames carried the earlier ones forward. The worker starts one `query()` per turn (planning, then each implement iteration), all resumed under the same `runs.session_id`, so every turn's result frame is one **leg** reporting only that leg's cost — and the `GREATEST` merge silently kept only the largest leg.
 

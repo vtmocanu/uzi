@@ -109,7 +109,11 @@ export interface PhaseUsage {
    *  at 0. The mark resets at every `init` frame (PRD #1079), so for the common case of
    *  one result frame per leg this is just that leg's own figures; within a multi-frame
    *  leg it is a clamped delta. See the header for how the legs SUM to the run total the
-   *  server stores, and for the within-leg price a repeated frame buys (it reads 0). */
+   *  server stores, and for the within-leg price a repeated frame buys (it reads 0).
+   *  A `usage_basis: "session_cumulative"` frame (ADR-1562) is differenced instead
+   *  against its session lineage's running total R, which survives `init` resets, so
+   *  its phase figure is the frame's EXCESS over everything already counted in that
+   *  session, not the leg's own (cumulative) figures. */
   fresh: number; // Δ inputTokens + Δ cacheCreationInputTokens, differenced apart
   cached: number; // cacheReadInputTokens
   out: number; // outputTokens
