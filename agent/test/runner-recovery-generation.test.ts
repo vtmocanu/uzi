@@ -1262,4 +1262,303 @@ describe("RunRunner — recovery cancellation reaps BEFORE the terminal report (
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
+
+  // #1539 M1 COVERAGE GAP — the OTHER settle site in handleRecoveryExhausted: the terminal-ownership
+  // EARLY-RETURN branch (`if (terminal.has(status)) { … if (cancelReap) settle }`). It fires when the
+  // cancel report returns a STATUSLESS ack (so the ack-terminal branch is skipped), and the NEXT loop
+  // turn reads a terminal `cancelled` ownership. That read runs the deferred custody settle the
+  // pre-report reap earned. The status-bearing-ack cases above settle on the ack itself and never
+  // reach this line. MUTATION control: deleting that `if (cancelReap) settle` line → no release here.
+  it("statusless cancel ack + terminal ownership read: the early-return branch settles the exact-generation release", async () => {
+    const { gitlab } = fakeGitlab();
+    const events: string[] = [];
+    const claim = gitlabClaim(4714, { claim_generation: 41 });
+    // The 409 model: the reconcile throws ONCE a terminal failed state has been recorded for the run.
+    const decideThrow = (): boolean =>
+      api.states.some((s) => s.runId === claim.run_id && s.body.status === "failed");
+    const { coord, client, git: fakeGit, safety, root } = fixture(events, decideThrow);
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-1539-statusless-home-"));
+    try {
+      fakeGit.alreadyPublished = true; // provably empty → RELEASE the exact hold
+      const { armAllow, captureFailed } = failCaptureUntilReport();
+      // CAVEAT: ONE combined hook (fake-api keeps one per run). On the `failed` report it records the
+      // event, re-allows the settle fetch, arms a STATUSLESS ack for THIS report (so the ack-terminal
+      // branch is skipped), and sets a terminal `cancelled` ownership so the NEXT loop turn reaches
+      // the early-return settle branch. It does NOT overrideStateStatus to a terminal value — that
+      // would settle on the ack instead and never exercise this line.
+      api.onState(claim.run_id, (body) => {
+        if (body.status === "failed") {
+          events.push("failed");
+          armAllow();
+          api.omitStateAckStatus(claim.run_id);
+          api.setOwnershipStatus(claim.run_id, "cancelled");
+        }
+      });
+      const runner = runnerWith(codexTransientFactory(homeRoot, safety, false), gitlab, undefined, nullLogger(), {
+        recovery: coord,
+        recoveryRetryMs: 5,
+      });
+      const execution = runner.execute(claim);
+      await Promise.race([
+        captureFailed.promise,
+        execution.then(() => { throw new Error("execution exited before reaching the cancel branch"); }),
+      ]);
+      api.setInputs(claim.run_id, [{ id: 1, kind: "cancel" }]);
+      await execution;
+
+      assert.ok(
+        api.states.some((s) => s.body.status === "failed" && s.body.failure_reason === "run cancelled"),
+        "the cancel is reported as a terminal failed(run cancelled)",
+      );
+      assert.ok(events.indexOf("reconcile") >= 0, "the reap boundary ran the per-sink reconcile");
+      assert.ok(
+        events.lastIndexOf("reconcile") < events.indexOf("failed"),
+        `every reap reconcile must precede the failed report; got ${JSON.stringify(events)}`,
+      );
+      assert.ok(
+        events.indexOf("failed") < events.indexOf("release"),
+        `the settle release must run after the failed report; got ${JSON.stringify(events)}`,
+      );
+      assert.deepEqual(
+        client.releasedGenerations(),
+        [41],
+        "the terminal-ownership early-return branch released the EXACT claim generation (41)",
+      );
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+// PRD #1349 M2 (F2/F4) / #1539 — the usage-LIMIT arm of executeClaim's catch must reap the Codex
+// provider WHILE the run is still actively-claimed (BEFORE handleLimitReached reports anything),
+// then settle AFTER the report on the non-parked branch. Same 409 hazard as #1531/#1539's other
+// terminal sites: the Codex per-sink reconcile inside withBoundary is authorized ONLY while the run
+// is actively-claimed; once handleLimitReached reports `failed` (or the server COERCES a park to
+// `failed`) the reconcile is refused, and a settle-then-report ordering would block the reap and
+// leak the exact-generation `source_only` hold. This reuses the SAME real Codex boundary + ordered
+// event log, drives the executor to a LimitReachedError, and asserts the split order across all
+// three non-parked outcomes (opt-out, server-declined park) plus the parked regression. MUTATION
+// control: restore the terminal-first `reapThenSettleRecoveryGeneration(..., "terminal")` in the
+// else and drop the pre-report reap → the 409-shaped reconcile blocks it → (a)-(c) redden.
+describe("RunRunner — the usage-limit arm reaps BEFORE the terminal report (PRD #1349 M2 F2/F4 / #1539)", () => {
+  /** A Codex-shaped executor (carries `.safety`, NO killAgentTree) that (optionally) commits, then
+   *  throws a LimitReachedError — the usage-limit death handleLimitReached owns. */
+  function codexLimitFactory(homeRoot: string, safety: CodexExecutionSafety, commit: boolean): ExecutorFactory {
+    return (runId) => {
+      const runHome = path.join(homeRoot, runId);
+      return {
+        homeDir: runHome,
+        executor: {
+          safety,
+          run: async (ctx: RunContext): Promise<ExecutorResult> => {
+            fs.mkdirSync(runHome, { recursive: true });
+            if (commit) commitInTree(ctx.worktreePath, "WORK.txt", "committed before the limit\n");
+            throw new LimitReachedError({ resetsAtMs: Date.now() + 5 * 3600_000, rateLimitType: "five_hour" });
+          },
+        },
+      };
+    };
+  }
+
+  /** ONE hook per run (fake-api keeps one): record the terminal-ish report boundary into the event
+   *  log. The opt-out reports `failed`; a wait_on_limit park reports `limit_wait` (the server may
+   *  then coerce its ACK to `failed`). Both are pushed so a case asserts against its own boundary. */
+  function armLimitEvents(runId: string, events: string[]): void {
+    api.onState(runId, (body) => {
+      if (body.status === "failed") events.push("failed");
+      if (body.status === "limit_wait") events.push("limit_wait");
+    });
+  }
+
+  it("(a) wait_on_limit=false, clean tree: reap (reconcile) precedes the failed report, then the exact-generation release settles after it", async () => {
+    const { gitlab } = fakeGitlab();
+    const events: string[] = [];
+    const claim = gitlabClaim(4801, { claim_generation: 51, wait_on_limit: false });
+    const decideThrow = (): boolean =>
+      api.states.some((s) => s.runId === claim.run_id && s.body.status === "failed");
+    const { coord, client, git, safety, root } = fixture(events, decideThrow);
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-1539-limit-optout-clean-"));
+    try {
+      git.alreadyPublished = true; // provably empty → RELEASE the exact hold
+      armLimitEvents(claim.run_id, events);
+      await runnerWith(codexLimitFactory(homeRoot, safety, false), gitlab, undefined, nullLogger(), {
+        recovery: coord,
+      }).execute(claim);
+      assert.ok(hasStatus(claim.run_id, "failed"), "an opt-out usage-limit hit reports failed");
+      assert.ok(events.indexOf("reconcile") >= 0, "the reap boundary ran the per-sink reconcile");
+      assert.ok(
+        events.indexOf("reconcile") < events.indexOf("failed"),
+        `reap-reconcile must precede the failed report; got ${JSON.stringify(events)}`,
+      );
+      assert.ok(
+        events.indexOf("failed") < events.indexOf("release"),
+        `the settle release must run after the failed report; got ${JSON.stringify(events)}`,
+      );
+      assert.deepEqual(client.releasedGenerations(), [51], "the release named the EXACT claim generation (51)");
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("(b) wait_on_limit=false, committed work: reap precedes the failed report, then the generation-bound CAPTURE settles after it (never releases)", async () => {
+    const { gitlab } = fakeGitlab();
+    const events: string[] = [];
+    const claim = gitlabClaim(4802, { claim_generation: 52, wait_on_limit: false });
+    const decideThrow = (): boolean =>
+      api.states.some((s) => s.runId === claim.run_id && s.body.status === "failed");
+    const { coord, client, git, safety, root } = fixture(events, decideThrow);
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-1539-limit-optout-commit-"));
+    try {
+      git.alreadyPublished = false; // unpublished committed work → CAPTURE
+      armLimitEvents(claim.run_id, events);
+      await runnerWith(codexLimitFactory(homeRoot, safety, true), gitlab, undefined, nullLogger(), {
+        recovery: coord,
+      }).execute(claim);
+      assert.ok(hasStatus(claim.run_id, "failed"));
+      assert.ok(
+        events.indexOf("reconcile") < events.indexOf("failed"),
+        `reap-reconcile must precede the failed report; got ${JSON.stringify(events)}`,
+      );
+      assert.ok(
+        events.indexOf("failed") < events.indexOf("reserve"),
+        `the capture reserve must run after the failed report; got ${JSON.stringify(events)}`,
+      );
+      assert.equal(client.reserveCalls.length, 1, "committed work is captured");
+      assert.equal(client.releaseCalls.length, 0, "committed work is NEVER released");
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("(c) wait_on_limit=true but the server DECLINED the park (ack coerced to failed), clean tree: reap precedes the report, then the exact-generation release settles after it", async () => {
+    const { gitlab } = fakeGitlab();
+    const events: string[] = [];
+    const claim = gitlabClaim(4803, { claim_generation: 53, wait_on_limit: true });
+    // The server coerces the limit_wait ACK to `failed`; the reported BODY stays limit_wait, so the
+    // 409 model keys on that recorded report — the reap (before it) is authorized, a reap after it
+    // (the mutation) is refused.
+    const decideThrow = (): boolean =>
+      api.states.some(
+        (s) => s.runId === claim.run_id && (s.body.status === "limit_wait" || s.body.status === "failed"),
+      );
+    const { coord, client, git, safety, root } = fixture(events, decideThrow);
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-1539-limit-declined-clean-"));
+    try {
+      git.alreadyPublished = true; // provably empty → RELEASE the exact hold
+      armLimitEvents(claim.run_id, events);
+      // 200 + "failed": the park request is acknowledged with a status that is NOT limit_wait, so
+      // handleLimitReached returns parked=false while wait_on_limit stays true (the server-coerced fail).
+      api.overrideStateStatus(claim.run_id, "failed");
+      await runnerWith(codexLimitFactory(homeRoot, safety, false), gitlab, undefined, nullLogger(), {
+        recovery: coord,
+      }).execute(claim);
+      assert.ok(hasStatus(claim.run_id, "limit_wait"), "the worker reported a limit_wait park (the server declined it)");
+      assert.ok(events.indexOf("reconcile") >= 0, "the reap boundary ran the per-sink reconcile");
+      assert.ok(
+        events.indexOf("reconcile") < events.indexOf("limit_wait"),
+        `reap-reconcile must precede the (declined) park report; got ${JSON.stringify(events)}`,
+      );
+      assert.ok(
+        events.indexOf("limit_wait") < events.indexOf("release"),
+        `the settle release must run after the report; got ${JSON.stringify(events)}`,
+      );
+      assert.deepEqual(client.releasedGenerations(), [53], "the release named the EXACT claim generation (53)");
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("(c') wait_on_limit=true declined park, committed work: reap precedes the report, then the generation-bound CAPTURE settles after it", async () => {
+    const { gitlab } = fakeGitlab();
+    const events: string[] = [];
+    const claim = gitlabClaim(4804, { claim_generation: 54, wait_on_limit: true });
+    const decideThrow = (): boolean =>
+      api.states.some(
+        (s) => s.runId === claim.run_id && (s.body.status === "limit_wait" || s.body.status === "failed"),
+      );
+    const { coord, client, git, safety, root } = fixture(events, decideThrow);
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-1539-limit-declined-commit-"));
+    try {
+      git.alreadyPublished = false; // unpublished committed work → CAPTURE
+      armLimitEvents(claim.run_id, events);
+      api.overrideStateStatus(claim.run_id, "failed");
+      await runnerWith(codexLimitFactory(homeRoot, safety, true), gitlab, undefined, nullLogger(), {
+        recovery: coord,
+      }).execute(claim);
+      assert.ok(
+        events.indexOf("reconcile") < events.indexOf("limit_wait"),
+        `reap-reconcile must precede the (declined) park report; got ${JSON.stringify(events)}`,
+      );
+      assert.ok(
+        events.indexOf("limit_wait") < events.indexOf("reserve"),
+        `the capture reserve must run after the report; got ${JSON.stringify(events)}`,
+      );
+      assert.equal(client.reserveCalls.length, 1, "committed work is captured");
+      assert.equal(client.releaseCalls.length, 0, "committed work is NEVER released");
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("(d) a blocked pre-report reap (contended reconcile), wait_on_limit=false: no release/reserve, but the failure is still reported", async () => {
+    const { gitlab } = fakeGitlab();
+    const events: string[] = [];
+    const claim = gitlabClaim(4805, { claim_generation: 55, wait_on_limit: false });
+    // alwaysBlock: the reconcile throws even while the run is still `running`, so the pre-report reap
+    // fails and the hold is retained (source_only) — but the run must still report its failure, and
+    // there is NO post-report retry (a blocked reap poisons the registry stickily).
+    const { coord, client, git, safety, root } = fixture(events, () => true);
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-1539-limit-blocked-"));
+    try {
+      git.alreadyPublished = true;
+      armLimitEvents(claim.run_id, events);
+      await runnerWith(codexLimitFactory(homeRoot, safety, false), gitlab, undefined, nullLogger(), {
+        recovery: coord,
+      }).execute(claim);
+      assert.equal(client.releaseCalls.length, 0, "a blocked reap retains the hold — never releases");
+      assert.equal(client.reserveCalls.length, 0, "a blocked reap retains the hold — never captures");
+      assert.ok(
+        hasStatus(claim.run_id, "failed"),
+        "the terminal failure is still reported (the hold is left open, not the report)",
+      );
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("(e) parked regression: wait_on_limit=true, server ACKs the park — the run parks and the park-path settle still runs", async () => {
+    const { gitlab } = fakeGitlab();
+    const events: string[] = [];
+    const claim = gitlabClaim(4806, { claim_generation: 56, wait_on_limit: true });
+    // A genuine park: the park-boundary reconcile (and the settle after it) must SUCCEED, so the
+    // reconcile is never blocked — limit_wait is actively-claimed, so its reconcile is authorized.
+    const { coord, client, git, safety, root } = fixture(events, () => false);
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-1539-limit-park-"));
+    try {
+      git.alreadyPublished = true; // provably empty → the park settle RELEASES the exact hold
+      armLimitEvents(claim.run_id, events);
+      await runnerWith(codexLimitFactory(homeRoot, safety, false), gitlab, undefined, nullLogger(), {
+        recovery: coord,
+      }).execute(claim);
+      assert.ok(hasStatus(claim.run_id, "limit_wait"), "the run parked (limit_wait)");
+      // The pre-report reap ran a reconcile AND the park boundary ran its own — two in all. Assert
+      // only the robust facts: at least the two reconciles, and the park-path settle released.
+      assert.equal(
+        events.filter((e) => e === "reconcile").length,
+        2,
+        `both the pre-report reap and the park boundary reconcile; got ${JSON.stringify(events)}`,
+      );
+      assert.deepEqual(client.releasedGenerations(), [56], "the park-path settle released the EXACT claim generation (56)");
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
 });

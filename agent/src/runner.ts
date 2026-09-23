@@ -1369,6 +1369,24 @@ export class RunRunner {
       // generic path below because that path is terminal in both senses — it reports
       // `failed` and it lets the finally erase the session this run wants to resume from.
       if (err instanceof LimitReachedError) {
+        // PRD #1349 M2 (F2) / #1539: REAP THIS generation's provider FIRST, BEFORE
+        // handleLimitReached reports anything, while the run is still actively-claimed
+        // (the catch was entered from a `running` turn). A Codex run's pre-settle reap runs
+        // the per-sink credential reconcile inside withBoundary (refreshCodex/releaseCodex),
+        // which the api authorizes ONLY while actively-claimed (codexActivelyClaimedStatuses);
+        // once handleLimitReached reports `failed` (or the server coerces a park to `failed`)
+        // the reconcile is refused (409), which would block the reap and leak the
+        // exact-generation hold as source_only. The credentialed settle runs AFTER the report
+        // on the non-parked branch below. The PARKED path keeps its OWN park-boundary reconcile
+        // (limit_wait is actively-claimed, so its second reconcile is authorized) — a blocked
+        // pre-reap here poisons the registry (codex/registry.ts) so the park publish's reap also
+        // fails, but the park still stands (D4).
+        const limitReaped = await this.reapRecoveryProviderForSettle(
+          claim,
+          flight,
+          runLog,
+          "terminal",
+        );
         flight.parked = await this.handleLimitReached(
           err,
           claim,
@@ -1472,21 +1490,21 @@ export class RunRunner {
           // comparison or upload retains. Best-effort; runs after the park report landed.
           await this.settleRecoveryGeneration(claim, flight, runLog);
         } else {
-          // PRD #1349 M2 (F4): EVERY non-parked limit outcome, not just the opt-out.
+          // PRD #1349 M2 (F4) / #1539: EVERY non-parked limit outcome, not just the opt-out.
           // handleLimitReached returns parked=false on THREE distinct paths: the usage-limit
           // OPT-OUT (wait_on_limit=false, reported `failed`), a park report that THREW, and a
-          // server ACK whose status is not `limit_wait`. The last two carry wait_on_limit=true,
-          // so a `} else if (!claim.wait_on_limit)` guard skipped them — and with the park
-          // durability block above also skipped and the error never reaching the generic catch's
-          // disposition, a code-publishing run whose park failed to land tore down its clone with
-          // NO disposition: committed-since-checkpoint work dropped, the early pin left an
-          // unreproducible needs_action. That is the exact "early-terminal path bypasses the
-          // coordinator" M2 set out to eliminate, so it must NOT be gated on the opt-out flag.
-          // Route ALL of them through the SAME exact-generation disposition the limit-park uses,
-          // reap-first (Codex-aware, F2): committed work CAPTURES into the generation-bound
-          // archive, a provably-empty outcome RELEASES its exact hold, and a failed/unverifiable
-          // comparison RETAINS — never a silent drop. Best-effort; runs after the report landed.
-          await this.reapThenSettleRecoveryGeneration(claim, flight, runLog, "terminal");
+          // server ACK whose status is not `limit_wait` — including a server that COERCED a park
+          // to `failed` because policy refused it. All three land here, and #1539 moves the reap
+          // AHEAD of handleLimitReached's report (above), so by the time control reaches this
+          // branch the provider is already reaped-or-not while the run was still actively-claimed.
+          // Settle the exact-generation hold IFF that pre-report reap confirmed (limitReaped):
+          // committed work CAPTURES into the generation-bound archive, a provably-empty outcome
+          // RELEASES its exact hold, and a failed/unverifiable comparison RETAINS — never a silent
+          // drop. NO post-report retry: the report has already made the run terminal, so a second
+          // reap's Codex reconcile would be refused (409); and a blocked pre-reap poisons the
+          // registry stickily (codex/registry.ts) so re-reaping cannot recover it anyway, while a
+          // Claude/stub killAgentTree cannot fail. Best-effort; runs after the report landed.
+          if (limitReaped) await this.settleRecoveryGeneration(claim, flight, runLog);
         }
       } else if (err instanceof TransientRecoveryError) {
         // Retry capture without abandoning the live claim. Only verified local
