@@ -208,7 +208,11 @@ export interface HarnessEventMeta {
 export type HarnessEvent = HarnessEventMeta &
   (
     | { kind: "activity" }
-    | { kind: "initialized"; model?: string }
+    // issue #1562 (ADR-1562): `freshSession` marks that this SDK process did NOT
+    // continue the requested session (no resume requested, or the init session_id
+    // differed). Threaded to projectInit so the persisted init frame gains
+    // `fresh_session: true`. Optional and absent on a Codex init (unflagged).
+    | { kind: "initialized"; model?: string; freshSession?: boolean }
     | {
         kind: "frame";
         origin: HarnessOrigin;

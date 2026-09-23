@@ -216,6 +216,11 @@ export class ClaudeHarness implements RunHarness {
   private lastConfig: ClaudeTurnConfig | undefined;
   private lastOptions: SdkOptions | undefined;
 
+  /** issue #1562: the session id the OWNER requested this turn resume (undefined =
+   *  no resume requested). Recorded per turn in startTurn and read by `decode`'s
+   *  init branch to decide `freshSession`. Turns run strictly sequentially. */
+  private requestedResumeId: string | undefined;
+
   /** Per-turn lead context read state, re-pointed at each turn's query. The hook is
    *  a stable per-run object the reducer holds; turns run strictly sequentially so
    *  request()/get() always route to the active turn. */
@@ -278,6 +283,9 @@ export class ClaudeHarness implements RunHarness {
     const turnOptions: SdkOptions = { ...base, abortController: sdkAbort };
     if (request.resumeSessionId) turnOptions.resume = request.resumeSessionId;
     else delete turnOptions.resume;
+    // issue #1562: record the requested resume id for this turn so decode's init
+    // branch can compare it against the SDK's own init session_id (fresh_session).
+    this.requestedResumeId = request.resumeSessionId;
     // Spawn the CLI in its own process group (the owner's injected spawn is
     // detached) so a watchdog trip can group-kill the whole tree; record the pid
     // for the done-path reap and expose it to trip via the owner's currentChild.
@@ -395,9 +403,23 @@ export class ClaudeHarness implements RunHarness {
       };
     }
     if (type === "system" && rec["subtype"] === "init") {
+      // issue #1562 (ADR-1562): flag a FRESH session — the SDK process did NOT
+      // continue the requested session — when (a) no resume was requested, OR (b) a
+      // resume was requested but this init frame's session_id differs from it. When
+      // the requested id matches, the SDK continued the session (not fresh). An
+      // ABSENT init session_id is UNKNOWN and treated as NOT fresh (flag omitted),
+      // since we cannot prove the SDK started a different session.
+      const requested = this.requestedResumeId;
+      let freshSession: boolean | undefined;
+      if (requested === undefined) {
+        freshSession = true;
+      } else if (sessionId !== undefined && sessionId !== requested) {
+        freshSession = true;
+      }
       return {
         kind: "initialized",
         model: asString(rec["model"]),
+        freshSession,
         sessionId,
         orphanInstanceFrameKind,
       };

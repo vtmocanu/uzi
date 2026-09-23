@@ -194,11 +194,19 @@ export function decodeUserItems(msg: Record<string, unknown>): HarnessItem[] {
  * modelUsage carry the token accounting the API folds into run_usage, PRD #40 M1)
  * — when the SDK frame omits one it lands as `undefined` and projectResult still
  * constructs the key, so the shape is preserved before JSON serialization drops
- * it. Result totals are CUMULATIVE-across-resume (PRD #40 Decision 3 verdict b);
- * the server merges with GREATEST per (run_id, session_id, model), never a sum
- * across a model's sessions, then SUMs across models. The SDKResultError carries
- * the same accounting as a success frame, so a failed run's pre-death spend is
- * still forwarded (Decision 4). Exported so the adapter reuses this exact decode.
+ * it. How the server READS these totals depends on the Claude Agent SDK version,
+ * which the worker now STAMPS onto the frame instead of the server guessing: before
+ * SDK 0.3.277 a result frame reports only its own `query()` leg (per_leg, ADR-1079,
+ * summed across legs), and from 0.3.277 it reports the running SESSION total
+ * (a resumed leg carries the whole session's spend). The caller marks the
+ * session-cumulative case via projectResult's `usageBasis` (issue #1562 / ADR-1562):
+ * the server then folds by HIGH-WATER within a session lineage rather than summing
+ * legs. This decode is basis-agnostic — it forwards the raw wire numbers; the
+ * marking decision lives with the caller (the run-lane reducer keys it off the
+ * terminal's `basis === "session"`; mapResult, a Claude single-query path, always
+ * marks). The SDKResultError carries the same accounting as a success frame, so a
+ * failed run's pre-death spend is still forwarded (Decision 4). Exported so the
+ * adapter reuses this exact decode.
  */
 export function decodeResult(msg: Record<string, unknown>): {
   outcome: "success" | "failed";
@@ -297,9 +305,12 @@ function mapUser(msg: Record<string, unknown>): EmittedMessage[] {
   return decodeUserItems(msg).map((item) => projectItem(item, at));
 }
 
-/** Map the terminal `result` frame to a status (success) or error message. */
+/** Map the terminal `result` frame to a status (success) or error message. This is
+ *  a Claude SDK path (judge/chat/advice single-query), so every result frame is
+ *  session-cumulative from the SDK — mark it `session_cumulative` (issue #1562 /
+ *  ADR-1562), mirroring the run-lane reducer's session-basis marking. */
 function mapResult(msg: Record<string, unknown>): EmittedMessage[] {
-  return [projectResult(decodeResult(msg))];
+  return [projectResult({ ...decodeResult(msg), usageBasis: "session_cumulative" })];
 }
 
 /**
@@ -398,9 +409,11 @@ export function sessionIdOf(message: unknown): string | undefined {
  * signal filter (PRD #40 Decision 11 — the attach is executor-side, not here,
  * because mapAssistant explodes one frame into N messages and cannot see that
  * later drop). This is PER-CALL usage: it is what the per-agent table sums, and is
- * a DELIBERATELY different data path from the terminal result frame's usage, which
- * the CLI reports from a cumulative-across-resume accumulator (Decision 3 verdict
- * b). Undefined for any non-assistant frame, or one with no object-shaped usage.
+ * a DELIBERATELY different data path from the terminal result frame's usage, whose
+ * reading depends on the SDK version (per_leg before 0.3.277 per ADR-1079, the
+ * running session total from 0.3.277, stamped via `usage_basis` per ADR-1562 so the
+ * server folds it by high-water within a session lineage). Undefined for any
+ * non-assistant frame, or one with no object-shaped usage.
  */
 export function assistantUsageOf(message: unknown): Record<string, unknown> | undefined {
   const msg = asRecord(message);

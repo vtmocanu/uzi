@@ -19,7 +19,7 @@ import { ClaudeHarness, type ClaudeTurnConfig } from "../src/claude-harness.js";
 import { ClaudeAdviceHarness } from "../src/claude-advice-harness.js";
 import { screenBashCommand, buildPreToolUseHook, buildAgentGuardHook } from "../src/guardrails.js";
 import { scanSignals } from "../src/signals.js";
-import type { RunTurnRequest } from "../src/harness.js";
+import type { HarnessEvent, RunTurnRequest } from "../src/harness.js";
 import type { SdkQueryFn } from "../src/sdk-executor.js";
 import { nullLogger } from "./helpers.js";
 // PRD #1287 C5: record executed-test evidence for the strict completeness gate. `t.name` is the
@@ -315,3 +315,65 @@ async function captureAdviceOptions(): Promise<{ options: SdkOptions }> {
   );
   return { options: captured! };
 }
+
+// issue #1562 (ADR-1562): the ClaudeHarness fresh_session verdict on the decoded
+// `initialized` event. The adapter records the requested resume id per turn and
+// compares it to the SDK system/init frame's own session_id. Drive a real turn with
+// a fake query that yields exactly one system/init frame and collect the verdict.
+async function driveInitFreshSession(
+  resumeSessionId: string | undefined,
+  initSessionId: string | undefined,
+): Promise<boolean | undefined> {
+  const initFrame: Record<string, unknown> = { type: "system", subtype: "init", model: "m" };
+  if (initSessionId !== undefined) initFrame["session_id"] = initSessionId;
+  const queryFn = (() => {
+    return (async function* () {
+      yield initFrame;
+    })();
+  }) as unknown as SdkQueryFn;
+  const harness = new ClaudeHarness({
+    queryFn,
+    spawn: () => ({ pid: undefined }),
+    kill: () => true,
+    log: nullLogger(),
+    contextUsageTimeoutMs: 2000,
+    spawnedPids: new Set<number>(),
+    homeDir: path.join(os.tmpdir(), "uzi-1562-run-home-does-not-exist"),
+  });
+  harness.prepareTurn(runLaneConfig, { pid: undefined });
+  const request: RunTurnRequest = {
+    prompt: "p",
+    systemPrompt: "sys",
+    signal: new AbortController().signal,
+    phase: "implement",
+    agents: {},
+    leadSkills: [],
+    ...(resumeSessionId !== undefined ? { resumeSessionId } : {}),
+  };
+  const turn = harness.startTurn(request);
+  let fresh: boolean | undefined;
+  for await (const ev of turn.events as AsyncIterable<HarnessEvent>) {
+    if (ev.kind === "initialized") fresh = ev.freshSession;
+  }
+  return fresh;
+}
+
+test("issue #1562 ClaudeHarness: no resume requested ⇒ freshSession true", async (t) => {
+  assert.equal(await driveInitFreshSession(undefined, "sess-new"), true);
+  recordConformanceEvidence(t.name, "pass");
+});
+
+test("issue #1562 ClaudeHarness: resume requested + mismatched init session_id ⇒ freshSession true", async (t) => {
+  assert.equal(await driveInitFreshSession("sess-requested", "sess-different"), true);
+  recordConformanceEvidence(t.name, "pass");
+});
+
+test("issue #1562 ClaudeHarness: resume requested + matching init session_id ⇒ freshSession omitted", async (t) => {
+  assert.equal(await driveInitFreshSession("sess-requested", "sess-requested"), undefined);
+  recordConformanceEvidence(t.name, "pass");
+});
+
+test("issue #1562 ClaudeHarness: resume requested + absent init session_id ⇒ freshSession omitted (unknown, not fresh)", async (t) => {
+  assert.equal(await driveInitFreshSession("sess-requested", undefined), undefined);
+  recordConformanceEvidence(t.name, "pass");
+});

@@ -83,7 +83,10 @@ export class RunTurnReducerImpl implements RunTurnReducer {
       case "activity":
         break;
       case "initialized":
-        reduction.messages.push(projectInit(event.model));
+        // issue #1562: thread the adapter's fresh-session verdict so the persisted
+        // init frame gains `fresh_session: true` when the SDK did not continue the
+        // requested session. Codex leaves it undefined (unflagged).
+        reduction.messages.push(projectInit(event.model, event.freshSession));
         break;
       case "frame":
         this.acceptFrame(event, reduction);
@@ -203,6 +206,13 @@ export class RunTurnReducerImpl implements RunTurnReducer {
       outcome: terminal.outcome,
       subtype: terminal.subtype,
       errors: terminal.errors,
+      // issue #1562 (ADR-1562): mark the frame session-cumulative ONLY when the
+      // adapter reported a session-basis terminal. Claude sets `basis: "session"`
+      // (its result frame is the running session total from SDK >= 0.3.277); Codex
+      // sets `basis: "turn"` → left unmarked (per_leg). Any other/absent basis is
+      // also unmarked.
+      usageBasis:
+        terminal.usage?.basis === "session" ? "session_cumulative" : undefined,
       wire: {
         usage: terminal.usage?.wire?.usage,
         modelUsage: terminal.usage?.wire?.modelUsage,
