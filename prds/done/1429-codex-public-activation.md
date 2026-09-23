@@ -113,6 +113,8 @@ The product-owned Codex picker remains exactly `gpt-6-astra` and `gpt-5.6-sol`; 
 
 The existing default model/effort storage remains shared. Widen server validation so the two closed harness vocabularies are accepted without treating the Claude alias set as universal. A UI selection is validated against the currently selected harness. When an inherited or later-resolved harness makes a stored model incompatible, the runtime uses that harness's default and implements the D9-required nonsecret fallback/status fact; it never sends a Claude alias to Codex or a Codex alias to Claude. Switching the Run Defaults harness in the UI resets an incompatible model to inherit rather than persisting a knowingly invalid pair.
 
+**Superseded 2026-09-23** by [PRD #1551](../1551-per-harness-worker-model-defaults.md) for per-user defaults only: the shared model-default storage above is replaced by separate, retained Claude and Codex lanes that survive a harness switch, and Codex's per-user default gained a custom-ID escape hatch. The closed schedule/role-pin vocabularies this decision established remain in force.
+
 ### D7: cost status is part of the public truth
 
 M5A already persists per-run `cost_status` and computes lifetime/last-seven-day `subscription_run_count` and `unreported_run_count`. M5B exposes and consumes them:

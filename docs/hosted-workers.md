@@ -125,6 +125,23 @@ advice alike. Four things can hold a worker back:
 The [operator knobs](./configuration.md#controller) that control the first two
 are `UZI_WORKER_UID_SPLIT` and `UZI_CODEX_COMMAND_SANDBOX`.
 
+## My Codex run says "no worker supporting custom Codex models is online"
+
+This is a narrower version of the message above, and only shows up when the
+run's effective Codex model is a [custom worker-root
+ID](./worker-model.md#custom-codex-model) rather than a curated one. A
+curated Codex model (`gpt-6-astra`, `gpt-5.6-sol`, `gpt-6-sol`) needs only
+the ordinary Codex capability covered above; a custom root model additionally
+needs a worker advertising `codex_custom_model_v1`, which only ships with a
+newer worker image.
+
+- Ask your admin to upgrade or roll the hosted worker fleet to an image that
+  advertises `codex_custom_model_v1`. An old worker never claims the run and
+  never silently substitutes `gpt-6-astra` — it stays queued instead.
+- Or switch to one of the curated Codex models in [Settings → Run
+  defaults](./worker-model.md#harness-and-worker-models) if you don't need
+  the custom ID right now.
+
 ## Disk self-heal
 
 A hosted worker also reports its disk usage now — the same CPU/memory gauges

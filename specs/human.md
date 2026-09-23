@@ -177,6 +177,9 @@ Tracked as GitLab issue vtmocanu/uzi#17; PRD at `prds/done/17-lead-template-and-
 - Model choices offered as curated aliases plus a custom free-text escape hatch for any model ID.
 - Precedence: a user's default model wins over the lead template's model (unset = inherit the lead template's model, opus by default).
 - Sequence this PRD before PRD #16 so #16 inherits the decoupled-builtins convention.
+- Claude and Codex now keep **separate, retained** worker-model defaults instead of one shared value; switching the default harness never clears either one, and both save together from one grouped card in one request. [PRD #1551] (AI-synced 2026-09-23)
+- Codex's model default also accepts a custom model ID, the same escape hatch Claude has always had, but scoped to the worker root only — it never reaches a schedule pin or a per-role agent-template pin. [PRD #1551] (AI-synced 2026-09-23)
+- Task review uses its own built-in model (Codex: `gpt-6-sol`) independent of these saved defaults; there is no setting to choose the task-review model in this release. [PRD #1551] (AI-synced 2026-09-23)
 
 ## Feature #18 — Worker templates, per-repo tools & agent scopes
 

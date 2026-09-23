@@ -22,6 +22,13 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Added
+
+- **Claude and Codex now keep separate worker-model defaults, saved together from one grouped card ([#1551](https://github.com/vtmocanu/uzi/issues/1551)).**
+  Settings → Run defaults replaces the old single-model card with one "Harness and worker models" card holding a retained lane per usable harness, so switching your default harness no longer clears the other one's saved model; the Codex lane also gains the same "Other (custom model ID)" escape hatch Claude has always had, scoped to your worker root and gated behind a `codex_custom_model_v1` worker capability so an old hosted worker never silently substitutes `gpt-6-astra`.
+- **Codex task review now runs on a built-in `gpt-6-sol` model, independent of your saved defaults ([#1551](https://github.com/vtmocanu/uzi/issues/1551)).**
+  Task review no longer reads your worker-model settings on either harness; there's no setting to change it in this release, and the ordinary Codex run fallback and shared provider default stay `gpt-6-astra`.
+
 ### Fixed
 
 - **Run, user, and factory usage totals were overstated for multi-turn Claude runs on v0.84.0-rc.8 workers, and are now folded correctly ([#1562](https://github.com/vtmocanu/uzi/issues/1562)).**
