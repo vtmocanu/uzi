@@ -39,12 +39,15 @@ func codexDelegation(t *testing.T, dispatchID, role, description string, at time
 			"id": dispatchID, "name": "Agent",
 			"input": map[string]any{"subagent_type": role, "description": description},
 		}, at, seq),
+		// Codex's dynamic Read tool accepts file_path (dynamic-tools.ts), which RunActivity
+		// folds into Detail. (Codex's Bash schema has no description, so a Bash row's Detail
+		// is empty by design: the command is never surfaced.)
 		codexFrame(t, "tool_use", role, dispatchID, description, map[string]any{
-			"id": dispatchID + "/call_bash1", "name": "Bash",
-			"input": map[string]any{"command": "go test ./...", "description": "run the api tests"},
+			"id": dispatchID + "/call_read1", "name": "Read",
+			"input": map[string]any{"file_path": "api/internal/foo.go"},
 		}, at, seq+1),
 		codexFrame(t, "tool_result", role, dispatchID, description, map[string]any{
-			"tool_use_id": dispatchID + "/call_bash1", "content": "ok", "is_error": false,
+			"tool_use_id": dispatchID + "/call_read1", "content": "ok", "is_error": false,
 		}, at, seq+2),
 		codexFrame(t, "text", role, dispatchID, description, map[string]any{"text": "tests pass"}, at, seq+3),
 	}
@@ -66,8 +69,8 @@ func TestDeriveCodexDelegationLaneLiveThenCompleted(t *testing.T) {
 	}
 	lane := got[0].Lanes[0]
 	if lane.Agent != "coder" || lane.AgentInstance != codexDispatchID || lane.AgentLabel != "Wire it" ||
-		lane.Tool != "Bash" || lane.Detail != "run the api tests" {
-		t.Fatalf("lane = %+v, want coder/%s/Wire it/Bash/run the api tests", lane, codexDispatchID)
+		lane.Tool != "Read" || lane.Detail != "api/internal/foo.go" {
+		t.Fatalf("lane = %+v, want coder/%s/Wire it/Read/api/internal/foo.go", lane, codexDispatchID)
 	}
 
 	if got := Derive(append(live, completion), ms, []string{"m1"}, now); got != nil {
@@ -93,16 +96,17 @@ func TestDeriveCodexUntaggedDispatchHasNoLaneButRunActivity(t *testing.T) {
 		})
 	}
 	act := runactivity.Latest(ra)
-	if act == nil || act.Agent != "coder" || act.AgentInstance != codexDispatchID || act.Tool != "Bash" || act.Detail != "run the api tests" {
-		t.Fatalf("RunActivity = %+v, want the child's Bash with its description", act)
+	if act == nil || act.Agent != "coder" || act.AgentInstance != codexDispatchID || act.Tool != "Read" || act.Detail != "api/internal/foo.go" {
+		t.Fatalf("RunActivity = %+v, want the child's Read with its file_path", act)
 	}
 }
 
 func TestDeriveCodexEarlierAttemptCompletionDoesNotEndNewDispatch(t *testing.T) {
 	now := time.Date(2026, 9, 23, 12, 0, 0, 0, time.UTC)
 	at := now.Add(-time.Minute)
-	// A resumed attempt reuses the provider call id, but the harness nonce differs, so the
-	// earlier attempt's completion names a different tool_use_id.
+	// Derive matches a completion to its dispatch by EXACT id. That a resumed attempt reusing a
+	// provider call id gets a different id (per-harness nonce) is the worker's property, pinned by
+	// agent/test/codex-executor.test.ts (m2-6); this only pins the exact-id match.
 	earlierID := "cx-ffffffffffff-t1-call_spawn1"
 	_, earlierCompletion := codexDelegation(t, earlierID, "coder", "[m1] Wire it", at.Add(-2*time.Minute), 1)
 	live, _ := codexDelegation(t, codexDispatchID, "coder", "[m1] Wire it", at, 10)
