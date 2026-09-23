@@ -48,6 +48,12 @@ export class FakeApi {
   private msgFailStatus = 503;
   private readonly alreadyTerminal = new Set<string>();
   private readonly stateStatusOverride = new Map<string, string>();
+  // #1539: runs whose 200 /state ACK OMITS run.status entirely (a "statusless" ack). The real
+  // server can 200-ack a report without echoing a run status the client can branch on; the worker
+  // then falls through to its next ownership read for the terminal signal. A test arms this to
+  // reach handleRecoveryExhausted's terminal-ownership early-return settle branch, which a normal
+  // status-bearing ack skips (it settles on the ack itself instead).
+  private readonly omitStateAckStatusRuns = new Set<string>();
   // PRD #1190 M2: runs whose running-report ACK carries `pause_requested: true` (the
   // server-decided pause boundary). The real server sets it on the RunDTO the ACK wraps; the
   // worker reads it off the same body (readRunAck). A resumed run whose pause columns survived a
@@ -260,6 +266,14 @@ export class FakeApi {
    */
   overrideStateStatus(runId: string, status: string): void {
     this.stateStatusOverride.set(runId, status);
+  }
+
+  /** #1539: 200-ack this run's /state reports WITHOUT a run.status field (a statusless ack), so the
+   *  client's StateAck.status is undefined and a terminal report's ack-terminal branch is skipped —
+   *  the worker falls through to its next ownership read for the terminal signal. */
+  omitStateAckStatus(runId: string, omit = true): void {
+    if (omit) this.omitStateAckStatusRuns.add(runId);
+    else this.omitStateAckStatusRuns.delete(runId);
   }
 
   /** Answer /state for this run with a verbatim body — for the malformed and
@@ -754,7 +768,11 @@ export class FakeApi {
     send(res, 200, {
       run: {
         id: runId,
-        status: this.stateStatusOverride.get(runId) ?? body.status,
+        // #1539: a statusless ack OMITS run.status entirely (undefined, not "") so readRunAck leaves
+        // StateAck.status undefined — the client cannot branch on it and falls through to ownership.
+        ...(this.omitStateAckStatusRuns.has(runId)
+          ? {}
+          : { status: this.stateStatusOverride.get(runId) ?? body.status }),
         // PRD #1190 M2: the server-decided pause boundary rides the RunDTO the ACK wraps. Only
         // present when a test armed it; otherwise absent (the worker reads it as "no pause").
         ...(this.pauseRequestedRuns.has(runId) ? { pause_requested: true } : {}),

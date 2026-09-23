@@ -45,8 +45,9 @@ import {
 import { MessageBatcher } from "./batcher.js";
 import type { Outbox } from "./outbox.js";
 import {
-  journalAndResolveTerminal,
+  installTerminalWriteAhead,
   resolvePendingTerminal,
+  sendUnjournaledTerminal,
   type SendTerminalState,
   type TerminalOutboxDeps,
 } from "./terminal-resolve.js";
@@ -724,6 +725,18 @@ interface RunFlight {
    *  latch closes. Distinct from `hasPendingTerminal`: that reads the on-disk journal (kept), this
    *  survives the journal's retirement. false until the first terminal resolve. */
   terminalResolved: boolean;
+  /** #1539: the outcome of the permanent-failure hook's pre-settle reap, or undefined when the
+   *  hook never ran (every ordinary path). true iff the reap confirmed while the run was still
+   *  actively-claimed; false on a guard miss or a blocked/failed reap. reportGenericFailure reads it
+   *  to settle custody ONCE without a second reap — the hook already reaped between the install and
+   *  the send. Gated by {@link RunRunner.permanentFailureReapValid} against `permanentFailureReapSafety`. */
+  permanentFailureReap?: boolean;
+  /** #1539: the executor safety epoch the permanent-failure hook reaped, captured beside
+   *  `permanentFailureReap`. The stale-epoch guard settles only while `executor.safety` still equals
+   *  this — CodexExecutor swaps `this.safety` after each checkpoint, so a hook that tripped during a
+   *  checkpoint boundary reaped the OLD epoch and must NOT settle against the new provider. `undefined`
+   *  for Claude/stub (no safety), which equals the live `executor.safety` and settles as before. */
+  permanentFailureReapSafety?: unknown;
   preserveSession: boolean;
   /** PRD #1392 M2: this run parked on a PRE-CLONE forge-unreachable transient error, so it
    *  captured no clone and no model session. Unlike a limit_wait/recovery park, it preserves its
@@ -1369,6 +1382,24 @@ export class RunRunner {
       // generic path below because that path is terminal in both senses — it reports
       // `failed` and it lets the finally erase the session this run wants to resume from.
       if (err instanceof LimitReachedError) {
+        // PRD #1349 M2 (F2) / #1539: REAP THIS generation's provider FIRST, BEFORE
+        // handleLimitReached reports anything, while the run is still actively-claimed
+        // (the catch was entered from a `running` turn). A Codex run's pre-settle reap runs
+        // the per-sink credential reconcile inside withBoundary (refreshCodex/releaseCodex),
+        // which the api authorizes ONLY while actively-claimed (codexActivelyClaimedStatuses);
+        // once handleLimitReached reports `failed` (or the server coerces a park to `failed`)
+        // the reconcile is refused (409), which would block the reap and leak the
+        // exact-generation hold as source_only. The credentialed settle runs AFTER the report
+        // on the non-parked branch below. The PARKED path keeps its OWN park-boundary reconcile
+        // (limit_wait is actively-claimed, so its second reconcile is authorized) — a blocked
+        // pre-reap here poisons the registry (codex/registry.ts) so the park publish's reap also
+        // fails, but the park still stands (D4).
+        const limitReaped = await this.reapRecoveryProviderForSettle(
+          claim,
+          flight,
+          runLog,
+          "terminal",
+        );
         flight.parked = await this.handleLimitReached(
           err,
           claim,
@@ -1472,21 +1503,21 @@ export class RunRunner {
           // comparison or upload retains. Best-effort; runs after the park report landed.
           await this.settleRecoveryGeneration(claim, flight, runLog);
         } else {
-          // PRD #1349 M2 (F4): EVERY non-parked limit outcome, not just the opt-out.
+          // PRD #1349 M2 (F4) / #1539: EVERY non-parked limit outcome, not just the opt-out.
           // handleLimitReached returns parked=false on THREE distinct paths: the usage-limit
           // OPT-OUT (wait_on_limit=false, reported `failed`), a park report that THREW, and a
-          // server ACK whose status is not `limit_wait`. The last two carry wait_on_limit=true,
-          // so a `} else if (!claim.wait_on_limit)` guard skipped them — and with the park
-          // durability block above also skipped and the error never reaching the generic catch's
-          // disposition, a code-publishing run whose park failed to land tore down its clone with
-          // NO disposition: committed-since-checkpoint work dropped, the early pin left an
-          // unreproducible needs_action. That is the exact "early-terminal path bypasses the
-          // coordinator" M2 set out to eliminate, so it must NOT be gated on the opt-out flag.
-          // Route ALL of them through the SAME exact-generation disposition the limit-park uses,
-          // reap-first (Codex-aware, F2): committed work CAPTURES into the generation-bound
-          // archive, a provably-empty outcome RELEASES its exact hold, and a failed/unverifiable
-          // comparison RETAINS — never a silent drop. Best-effort; runs after the report landed.
-          await this.reapThenSettleRecoveryGeneration(claim, flight, runLog, "terminal");
+          // server ACK whose status is not `limit_wait` — including a server that COERCED a park
+          // to `failed` because policy refused it. All three land here, and #1539 moves the reap
+          // AHEAD of handleLimitReached's report (above), so by the time control reaches this
+          // branch the provider is already reaped-or-not while the run was still actively-claimed.
+          // Settle the exact-generation hold IFF that pre-report reap confirmed (limitReaped):
+          // committed work CAPTURES into the generation-bound archive, a provably-empty outcome
+          // RELEASES its exact hold, and a failed/unverifiable comparison RETAINS — never a silent
+          // drop. NO post-report retry: the report has already made the run terminal, so a second
+          // reap's Codex reconcile would be refused (409); and a blocked pre-reap poisons the
+          // registry stickily (codex/registry.ts) so re-reaping cannot recover it anyway, while a
+          // Claude/stub killAgentTree cannot fail. Best-effort; runs after the report landed.
+          if (limitReaped) await this.settleRecoveryGeneration(claim, flight, runLog);
         }
       } else if (err instanceof TransientRecoveryError) {
         // Retry capture without abandoning the live claim. Only verified local
@@ -1768,6 +1799,14 @@ export class RunRunner {
         await this.reportGenericFailure(claim, flight, err);
       }
     } finally {
+      // #1539: AWAIT the permanent-failure hook's settlement BEFORE the Codex registry disposal
+      // below. The arms that do NOT go through reportGenericFailure (limit, pause, forge-unreachable,
+      // shutdown, stale/credential-switch stops) never await it themselves, so without this a hook
+      // reap still queued or running on the boundary `queueTail` would race safety.dispose (which
+      // tears the registry down). awaitPermanentFailureSettled resolves immediately when the breaker
+      // never tripped, swallows the handler's rejection, and is bounded by the reap deadline, so it
+      // never throws and never stalls the finally.
+      await batcher.awaitPermanentFailureSettled();
       // PRD #1171 m4 (F1): the FINAL Codex registry disposal, after EVERY durability sink has
       // settled. A Codex executor's run() no longer disposes its registry on the normal path —
       // its post-run sinks (park/shutdown/finalize) reap the provider root through withBoundary,
@@ -1991,42 +2030,67 @@ export class RunRunner {
     phase: string,
     body: Parameters<RunFlight["reportState"]>[0],
     send: SendTerminalState,
+    // #1539: an optional hook that runs AFTER the durable install and BEFORE the resolve/send (on
+    // the no-outbox branch too, before the direct `send`). The permanent-failure hook uses it to abort
+    // the attempt and reap the provider WHILE the run is still actively-claimed — the journal is on
+    // disk first (D5), the reap runs before the terminal is sent, and the reconcile is authorized
+    // because the abort has not yet reported terminal. Every other caller passes nothing, so their
+    // behaviour is identical.
+    beforeResolve?: () => Promise<void>,
   ): Promise<void> {
     const deps = this.terminalDeps();
     if (!deps) {
-      // No usable outbox: send un-journaled exactly as today. A stale ack still THROWS
-      // StaleClaimError out of `send` and propagates to executeClaim's catch (there is no journal to
-      // stale-retire on this degradation path), so this branch is byte-for-byte unchanged.
+      // No usable outbox: run beforeResolve (abort + reap) then send un-journaled exactly as today. A
+      // stale ack still THROWS StaleClaimError out of `send` and propagates to executeClaim's catch
+      // (there is no journal to stale-retire on this degradation path), so this branch is otherwise
+      // byte-for-byte unchanged.
+      await beforeResolve?.();
       await send(body);
       flight.terminalResolved = true;
       return;
     }
-    await journalAndResolveTerminal(deps, {
+    // PRD #1391 Run B M3b (B1): the run-lane reportState choke point (flight.reportState, reached
+    // through every `send` closure a terminal site passes here) THROWS StaleClaimError on a stale ack
+    // instead of RETURNING it — the shape resolvePendingTerminal's catch would otherwise read as a
+    // transport failure and KEEP the journal forever, leaking the run's whole outbox tree and holding
+    // its terminal_pending lease (and, past the cap, pending_overflow) open (D11). Normalize the throw
+    // into the `{applied:false, staleClaim:true}` ack actOnAck stale-retires on, so a superseded
+    // generation local-retires the journal UNIFORMLY across lanes (the judge/review/boot lanes already
+    // return this shape via raw client.reportState). StaleClaimError is defined and caught entirely
+    // within this file — it never leaks into terminal-resolve.ts. A genuine transport error still
+    // propagates, and resolvePendingTerminal keeps the journal for a later resolve, exactly as
+    // designed. #1539: this wrapper wraps the send passed to BOTH branches (the reserve-exhausted
+    // unjournaled send and the journaled resolve), the same as journalAndResolveTerminal does today.
+    const wrappedSend: SendTerminalState = async (b, sig) => {
+      try {
+        return await send(b, sig);
+      } catch (err) {
+        if (err instanceof StaleClaimError) return { applied: false, staleClaim: true };
+        throw err;
+      }
+    };
+    const fence = flight.batcher.currentSeq();
+    const installed = await installTerminalWriteAhead(deps, {
       runId: flight.runId,
       claimGeneration: flight.claimGeneration,
       phase,
-      messagesThroughSeq: flight.batcher.currentSeq(),
+      messagesThroughSeq: fence,
       body,
-      // PRD #1391 Run B M3b (B1): the run-lane reportState choke point (flight.reportState, reached
-      // through every `send` closure a terminal site passes here) THROWS StaleClaimError on a stale
-      // ack instead of RETURNING it — the shape resolvePendingTerminal's catch would otherwise read
-      // as a transport failure and KEEP the journal forever, leaking the run's whole outbox tree and
-      // holding its terminal_pending lease (and, past the cap, pending_overflow) open (D11). Normalize
-      // the throw into the `{applied:false, staleClaim:true}` ack actOnAck stale-retires on, so a
-      // superseded generation local-retires the journal UNIFORMLY across lanes (the judge/review/boot
-      // lanes already return this shape via raw client.reportState). StaleClaimError is defined and
-      // caught entirely within this file — it never leaks into terminal-resolve.ts. A genuine
-      // transport error still propagates, and resolvePendingTerminal keeps the journal for a later
-      // resolve, exactly as designed.
-      send: async (b, sig) => {
-        try {
-          return await send(b, sig);
-        } catch (err) {
-          if (err instanceof StaleClaimError) return { applied: false, staleClaim: true };
-          throw err;
-        }
-      },
     });
+    // #1539: the durable install is now on disk. Run the hook (abort + reap for the permanent
+    // failure hook) BEFORE the resolve/send.
+    await beforeResolve?.();
+    if (!installed.journaled) {
+      // reserve_exhausted: send unjournaled. A throw here propagates (skipping the latch below), so the
+      // executor catch finds NO journal and takes today's fallback — unchanged from journalAndResolveTerminal.
+      await sendUnjournaledTerminal(deps, installed.canonical, fence, wrappedSend);
+    } else {
+      await resolvePendingTerminal(deps, {
+        runId: flight.runId,
+        claimGeneration: flight.claimGeneration,
+        send: wrappedSend,
+      });
+    }
     // PRD #1391 Run B M3 (N2/D5): latch that a terminal outcome for this generation has resolved, so
     // a later reportGenericFailure never reports a SECOND `failed` — even after a 200 RETIRED the
     // journal (hasPendingTerminal then reads false). Skipped on a throw above (reserve_exhausted's
@@ -2035,18 +2099,38 @@ export class RunRunner {
   }
 
   /**
-   * PRD #1391 Run B M3 (D5): the permanent message-failure hook body, extracted from the batcher's
-   * onPermanentFailureReport closure so its ORDERING is unit-testable against the REAL shipping code
-   * (runner-terminal-journal.test.ts) rather than a synthetic hand-rolled handler. The `failed`
-   * journal is durably installed and resolved BEFORE `flight.cancel.abort()` is observable, so a
-   * completion racing the trip can never reverse the first durable winner (the no-replace install in
-   * journalTerminal arbitrates, D4). journalAndSendTerminal awaits the durable install; only then does
-   * the abort fire, unwinding execute() into reportGenericFailure — which awaits this settlement,
-   * finds the durable journal / the terminalResolved latch, and reports no second `failed` (fact 2).
-   * When no outbox is wired this degrades to today's direct `failed` report + abort. The abort is
-   * guarded so a concurrent abort (a racing steering-cancel/shutdown) is never doubled.
+   * PRD #1391 Run B M3 (D5) / #1539: the permanent message-failure hook body, extracted from the
+   * batcher's onPermanentFailureReport closure so its ORDERING is unit-testable against the REAL
+   * shipping code (runner-terminal-journal.test.ts) rather than a synthetic hand-rolled handler.
+   *
+   * The order is: (1) DURABLE first-writer-wins install of the `failed` journal, then (2) ABORT the
+   * attempt, then (3) REAP this generation's provider WHILE the run is still actively-claimed, then
+   * (4) resolve/send the terminal. Steps 2+3 run in the `beforeResolve` hook, between the install and
+   * the send, so a completion racing the trip can never reverse the first durable winner (the
+   * no-replace install in journalTerminal arbitrates, D4) AND the Codex per-sink credential reconcile
+   * inside the reap's withBoundary is authorized (the abort has not yet reported terminal, so the run
+   * is still in codexActivelyClaimedStatuses — reaping AFTER the terminal report would be refused 409
+   * and leak the hold as source_only, the #1539 bug). The install must NOT move after the abort and
+   * the reap must NOT move before the install, or the #1391 completion race reopens.
+   *
+   * The reap outcome is recorded on the flight (`permanentFailureReap`) together with the safety epoch
+   * it reaped (`permanentFailureReapSafety`), so reportGenericFailure's already-journaled arm settles
+   * custody ONCE — only when the reap confirmed and the executor's safety epoch has not since swapped
+   * (the stale-epoch guard, {@link permanentFailureReapValid}). execute() unwinds into
+   * reportGenericFailure, which awaits this settlement, finds the durable journal / the terminalResolved
+   * latch, and reports no second `failed` (fact 2). When no outbox is wired this degrades to today's
+   * direct `failed` report + abort + reap. The abort is guarded so a concurrent abort (a racing
+   * steering-cancel/shutdown) is never doubled.
+   *
+   * A process-local resolve hold (Outbox.holdTerminalResolve) is taken BEFORE the install and released
+   * in the `finally`, so the per-worker drainer (Worker.resolveRunTerminal) cannot send the journaled
+   * `failed` during the abort-then-reap window and race this hook's own resolve. If the release reports
+   * the drainer skipped a resolve while the journal is still pending, the hook re-drives one resolve so
+   * the terminal is not stranded until boot (N4).
    */
-  private async handlePermanentFailure(flight: RunFlight, reason: string): Promise<void> {
+  private async handlePermanentFailure(claim: ClaimResponse, flight: RunFlight, reason: string): Promise<void> {
+    const outbox = this.outbox;
+    if (outbox) outbox.holdTerminalResolve(flight.runId, flight.claimGeneration);
     try {
       await this.journalAndSendTerminal(
         flight,
@@ -2056,16 +2140,73 @@ export class RunRunner {
           failure_reason: reason.slice(0, MAX_FAILURE_REASON_LEN),
         },
         (b, sig) => flight.reportState(b, sig),
+        async () => {
+          // (2) Abort the attempt ONLY AFTER the durable journal is installed (D5/D4), so execute()
+          // falls into its catch (→ reportGenericFailure, which awaits this handler's settlement,
+          // finds the durable journal / the terminalResolved latch, and does NOT report a second
+          // `failed`). (3) Then reap this generation's provider while the run is still actively-claimed
+          // and record the outcome + the reaped safety epoch, for reportGenericFailure to settle on.
+          if (!flight.cancel.signal.aborted) flight.cancel.abort();
+          // Capture the epoch BEFORE the await: reapForSink reads executor.safety synchronously at
+          // entry, and a checkpoint can swap it while the reap is in flight. Recording it afterwards
+          // would compare the NEW epoch with itself and let the settle run under a provider this
+          // reap never quiesced.
+          const reapedSafety = flight.executor.safety;
+          flight.permanentFailureReap = await this.reapRecoveryProviderForSettle(
+            claim,
+            flight,
+            flight.runLog,
+            "terminal",
+          );
+          flight.permanentFailureReapSafety = reapedSafety;
+        },
       );
     } catch (e) {
       flight.runLog.error("could not journal/report the message-transport failure", {
         error: errMessage(e),
       });
+      // The install threw before beforeResolve could run, so the fallback abort still fires (guarded
+      // so a concurrent abort is never doubled), unwinding execute() into reportGenericFailure.
+      if (!flight.cancel.signal.aborted) flight.cancel.abort();
+    } finally {
+      if (outbox) {
+        const { skipped } = outbox.releaseTerminalResolve(flight.runId, flight.claimGeneration);
+        // N4: the drainer skipped a resolve while the hold was set and the journal is still pending
+        // (this hook's own resolve did not retire it — e.g. a benign 409 running). Re-drive one
+        // resolve with the same stale-normalized send so the terminal is not stranded until boot.
+        const deps = this.terminalDeps();
+        if (skipped && deps && deps.outbox.hasPendingTerminal(flight.runId, flight.claimGeneration)) {
+          await resolvePendingTerminal(deps, {
+            runId: flight.runId,
+            claimGeneration: flight.claimGeneration,
+            send: async (b, sig) => {
+              try {
+                return await flight.reportState(b, sig);
+              } catch (err) {
+                if (err instanceof StaleClaimError) return { applied: false, staleClaim: true };
+                throw err;
+              }
+            },
+          }).catch((e) =>
+            flight.runLog.warn("outbox: post-release terminal re-resolve failed; leaving the journal", {
+              run_id: flight.runId,
+              error: errMessage(e),
+            }),
+          );
+        }
+      }
     }
-    // Abort the attempt ONLY AFTER the durable journal is installed (D5/D4), so execute() falls into
-    // its catch (→ reportGenericFailure, which awaits this handler's settlement, finds the durable
-    // journal / the terminalResolved latch, and does NOT report a second `failed`).
-    if (!flight.cancel.signal.aborted) flight.cancel.abort();
+  }
+
+  /** #1539: the stale-epoch guard for the permanent-failure hook's reap. The hook records the
+   *  reap outcome AND the executor safety epoch it reaped; a consumer settles custody ONLY IF the reap
+   *  confirmed AND the executor's safety epoch is still the one reaped. CodexExecutor swaps
+   *  `this.safety = epoch.safety` after each checkpoint (codex/codex-executor.ts), so a hook that
+   *  tripped during a checkpoint boundary reaped the OLD epoch while a new provider started — settling
+   *  then would run the credentialed fetch against a live newer provider. For Claude/stub both sides
+   *  are `undefined` (equal), so it settles as before. Otherwise it fails closed and keeps the hold. */
+  private permanentFailureReapValid(flight: RunFlight): boolean {
+    return flight.permanentFailureReap === true && flight.executor.safety === flight.permanentFailureReapSafety;
   }
 
   /**
@@ -2122,6 +2263,15 @@ export class RunRunner {
         claim_generation: flight.claimGeneration,
       });
       await batcher.close().catch(() => undefined);
+      // #1539: when the permanent-failure hook handled this terminal it ALREADY reaped the
+      // provider between the install and the send (while still actively-claimed), so there is no
+      // second reap here — settle custody ONCE, gated by the stale-epoch guard. Any OTHER writer that
+      // reaches this arm (the finalize sites at :2600/:2611) already settles via driveRecoveryTerminal
+      // under the finalize boundary, so its reapThenSettle here is a redundant backstop kept unchanged.
+      if (flight.permanentFailureReap !== undefined) {
+        if (this.permanentFailureReapValid(flight)) await this.settleRecoveryGeneration(claim, flight, runLog);
+        return;
+      }
       await this.reapThenSettleRecoveryGeneration(claim, flight, runLog, "terminal");
       return;
     }
@@ -2141,7 +2291,13 @@ export class RunRunner {
     // hold as source_only. So reap while the run is still `running`. The reap is deadline-bounded;
     // a Claude/SDK reap is an idempotent killAgentTree on an already-dead tree; a pre-clone
     // failure has no clone and no-ops (returns false). The settle runs AFTER the report below.
-    const reaped = await this.reapRecoveryProviderForSettle(claim, flight, runLog, "terminal");
+    // #1539: this fall-through is reached under the hook when its UNJOURNALED send threw (no latch,
+    // no journal) — the hook already reaped, so reuse that outcome under the stale-epoch guard rather
+    // than reap a second time (a second reap would be refused if the lost-ack send had actually landed).
+    const reaped =
+      flight.permanentFailureReap !== undefined
+        ? this.permanentFailureReapValid(flight)
+        : await this.reapRecoveryProviderForSettle(claim, flight, runLog, "terminal");
     // Cap what lands in the run row (matches the GitLab error-body cap). Journal it WRITE-AHEAD then
     // resolve it (D3): on reserve_exhausted it degrades to today's direct send, whose throw the
     // .catch below still logs; on the journaled path journalAndSendTerminal never throws (a send that
@@ -4521,6 +4677,10 @@ export class RunRunner {
       // the moment any completed/failed for this generation is sent/resolved (write-ahead or not),
       // so reportGenericFailure never falls through to a SECOND `failed` once one is final.
       terminalResolved: false,
+      // #1539: set by the permanent-failure hook (undefined until then) — the pre-settle reap
+      // outcome and the safety epoch it reaped, for reportGenericFailure's one-time custody settle.
+      permanentFailureReap: undefined,
+      permanentFailureReapSafety: undefined,
       // PRD #556 M1 / #1197: set by shutdown or a pending recovery capture/report.
       // Like `parked`, it gates EXACTLY the two filesystem removals in the
       // finally (the sibling skills plugin dir and the per-run HOME) and nothing else — so
@@ -4537,20 +4697,22 @@ export class RunRunner {
       result: undefined,
     };
 
-    // PRD #1391 Run B M3 (D5): a PERMANENT message failure now journals `failed` WRITE-AHEAD
-    // (durable), resolves it, then ABORTS the attempt so execute() unwinds — replacing today's
-    // fire-and-forget `failed` report that left the executor running (the split-brain in miniature,
-    // fact 1). The handler is ASYNC and trip() captures its promise into
-    // batcher.permanentFailureSettled, which reportGenericFailure AWAITS before it checks the journal
-    // — so the abort's terminal `failed` is observable ONLY AFTER the outcome is durable, and a
-    // completion that races the trip can never reverse the first durable winner (the no-replace
-    // install in journalTerminal arbitrates, D4). journalAndSendTerminal awaits the durable journal
-    // install, so by the time the abort fires the `failed` is on disk. Chat keeps today's non-journal
-    // behaviour (chat-runner.ts). When no outbox is wired this degrades to today's direct `failed`
-    // report + abort.
-    // The hook body lives in handlePermanentFailure (a named method) so its journal-BEFORE-abort
-    // ordering is unit-testable against the REAL code — a mutation to abort-first reddens that test.
-    batcher.onPermanentFailureReport(({ reason }) => this.handlePermanentFailure(flight, reason));
+    // PRD #1391 Run B M3 (D5) / #1539: a PERMANENT message failure now journals `failed` WRITE-AHEAD
+    // (durable), then ABORTS the attempt, then REAPS this generation's provider while the run is still
+    // actively-claimed, then resolves/sends the terminal — replacing today's fire-and-forget `failed`
+    // report that left the executor running (the split-brain in miniature, fact 1). The handler is
+    // ASYNC and trip() captures its promise into batcher.permanentFailureSettled, which
+    // reportGenericFailure AWAITS before it checks the journal — so the abort's terminal `failed` is
+    // observable ONLY AFTER the outcome is durable, and a completion that races the trip can never
+    // reverse the first durable winner (the no-replace install in journalTerminal arbitrates, D4). The
+    // reap runs between the install and the send (in beforeResolve), so the Codex reconcile is
+    // authorized (still actively-claimed) rather than refused 409 after a terminal report — the #1539
+    // fix. Chat keeps today's non-journal behaviour (chat-runner.ts). When no outbox is wired this
+    // degrades to today's direct `failed` report + abort + reap.
+    // The hook body lives in handlePermanentFailure (a named method) so its install-BEFORE-abort,
+    // abort-BEFORE-reap, reap-BEFORE-send ordering is unit-testable against the REAL code — a mutation
+    // to any of those orderings reddens a test.
+    batcher.onPermanentFailureReport(({ reason }) => this.handlePermanentFailure(claim, flight, reason));
 
     return flight;
   }
@@ -6826,6 +6988,10 @@ export class RunRunner {
     flight.preserveSession = true;
     let capture: { verified: boolean; published: boolean } | undefined;
     let notified = false;
+    // #1539: the outcome of the cancel branch's pre-report reap, run ONCE while the run is
+    // still actively-claimed. undefined = not yet attempted; true = reaped (settle after the
+    // terminal report); false = a blocked/failed reap (RETAIN the hold, still report the cancel).
+    let cancelReap: boolean | undefined;
     const terminal = TERMINAL_RUN_STATUSES;
     try {
       for (;;) {
@@ -6845,10 +7011,29 @@ export class RunRunner {
           if (terminal.has(status)) {
             flight.preserveRecoveryClone = false;
             flight.preserveSession = false;
+            // PRD #1349 M2 (D4.5) / #1539: a statusless cancel ack (HTTP 204), or a thrown cancel
+            // report that actually LANDED, followed by a terminal ownership read arrives here with
+            // the cancel branch's reap already done. Settle the exact-generation hold IFF that reap
+            // confirmed (cancelReap) — the report is terminal now, so this is the deferred settle
+            // that earlier reap earned. No reap here: the run is no longer actively-claimed.
+            if (cancelReap) await this.settleRecoveryGeneration(claim, flight, runLog);
           }
           return status === "recovery_wait";
         }
         if (flight.steering.isCancelled()) {
+          // PRD #1349 M2 (D4.5) / #1539: REAP THIS generation's provider FIRST, BEFORE the `failed`
+          // report, while the run is still actively-claimed (the loop just verified status ===
+          // "running"). A Codex run's pre-settle reap runs the per-sink credential reconcile inside
+          // withBoundary (refreshCodex/releaseCodex), which the api authorizes ONLY while
+          // actively-claimed (codexActivelyClaimedStatuses); once this report makes the run terminal
+          // the reconcile is refused (409), which would block the reap and leak the exact-generation
+          // hold as source_only. Reap ONCE, no retry: a blocked Codex reconcile poisons the registry
+          // stickily (codex/registry.ts), so re-reaping cannot recover it. The killAgentTree at the
+          // top of this handler reaps Claude/stub but is a NO-OP for Codex, so this reap is what
+          // closes Codex admission. The credentialed settle runs AFTER the terminal report below (on
+          // the ack, or on a later terminal ownership read via the early return above).
+          if (cancelReap === undefined)
+            cancelReap = await this.reapRecoveryProviderForSettle(claim, flight, runLog, "terminal");
           try {
             // Consuming cancel only stamps stop_kind. This existing terminal
             // report is what makes Service route it to CancelRunByWorker.
@@ -6856,15 +7041,12 @@ export class RunRunner {
             if (ack.status && terminal.has(ack.status)) {
               flight.preserveRecoveryClone = false;
               flight.preserveSession = false;
-              // PRD #1349 M2 (D4.5): a cancel that terminates the recovery loop cleans the clone
-              // like any other terminal exit, so disposition this generation's hold first. The
-              // credentialed fresh-forge comparison MUST run reaped: the killAgentTree at the top
-              // of this handler reaps Claude/stub but is a NO-OP for Codex (whose provider root is
-              // disposed only in executeClaim's finally, and captureRecoveryRestorePoint's reap may
-              // not have run yet on a cancel that arrives before the first capture attempt), so REAP
-              // FIRST (F2). Then verified-empty releases, committed work captures, a failed
-              // comparison retains.
-              await this.reapThenSettleRecoveryGeneration(claim, flight, runLog, "terminal");
+              // PRD #1349 M2 (D4.5) / #1539: the provider was reaped above while actively-claimed;
+              // now the terminal report has landed, so run the non-status-gated custody settle. A
+              // verified-empty run RELEASES its exact hold, committed work CAPTURES it, and a
+              // blocked/failed reap (cancelReap false) RETAINS the hold — the cancel is still
+              // reported either way.
+              if (cancelReap) await this.settleRecoveryGeneration(claim, flight, runLog);
               return false;
             }
             if (ack.status && ack.status !== "running") return false;
