@@ -15,7 +15,7 @@
 #   --fresh          start the landing over: reset the (clean) worktree to origin/<branch>
 #                    and drop the recorded lease. The answer to RESULT=remote_moved.
 #                    Local commits the remote lacks are kept under
-#                    refs/uzi-lander/fresh-backup/pr-<PR> (printed as FRESH_BACKUP=) and
+#                    refs/uzi-lander/fresh-backup/pr-<PR>/<old HEAD sha> (FRESH_BACKUP=) and
 #                    named, for a cherry-pick back after the rebase.
 #   --gate           which `task gate:<c>` targets to run before pushing. `auto` (default)
 #                    derives them from the changed paths (api/, web/, agent/, controller/);
@@ -158,10 +158,14 @@ if [ "$FRESH" -eq 1 ]; then
   # The reset would silently drop local commits the remote lacks (a local fix committed
   # after the rebase, #1574). Keep the old HEAD under a backup ref and name the commits
   # whose patch the remote does not carry, so they can be cherry-picked back.
-  local_only=$(git cherry "origin/$BRANCH" HEAD | awk '$1=="+"{print $2}')
+  # A failed cherry must not read as "nothing local": abort before the reset.
+  cherry=$(git cherry "origin/$BRANCH" HEAD) || { echo "git cherry failed; --fresh refuses to reset without knowing which local commits it would drop" >&2; exit 3; }
+  local_only=$(printf '%s\n' "$cherry" | awk '$1=="+"{print $2}')
   if [ -n "$local_only" ]; then
-    backup="refs/uzi-lander/fresh-backup/pr-$PR"
-    git update-ref "$backup" HEAD
+    # One immutable ref per reset (keyed by the old HEAD), so a later --fresh never
+    # overwrites an earlier backup.
+    backup="refs/uzi-lander/fresh-backup/pr-$PR/$(git rev-parse HEAD)"
+    git update-ref "$backup" HEAD || { echo "could not write $backup; not resetting" >&2; exit 3; }
     log "--fresh: kept the old HEAD $(git rev-parse --short HEAD) as $backup; local commit(s) not on origin/$BRANCH (re-apply with git cherry-pick after the rebase):"
     while IFS= read -r c; do log "  $(git log -1 --format='%h %s' "$c")"; done <<< "$local_only"
     echo "FRESH_BACKUP=$backup"

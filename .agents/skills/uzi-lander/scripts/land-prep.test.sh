@@ -97,11 +97,40 @@ git -C "$WT" commit -qm 'local fix after rebase'
 LOCAL_FIX=$(git -C "$WT" rev-parse HEAD)
 PATH="$WORK/bin:$PATH" bash "$SCRIPT" test/uzi 99 --repo-root "$ROOT" --worktree "$WT" --fresh --no-push --gate none > "$WORK/fresh.out" 2>&1 \
   || fail "--fresh restart failed: $(cat "$WORK/fresh.out")"
-grep -q '^FRESH_BACKUP=refs/uzi-lander/fresh-backup/pr-99$' "$WORK/fresh.out" || fail "--fresh kept no backup of the local commit: $(cat "$WORK/fresh.out")"
-[ "$(git -C "$WT" rev-parse refs/uzi-lander/fresh-backup/pr-99)" = "$LOCAL_FIX" ] || fail "backup ref does not hold the old HEAD"
+grep -q "^FRESH_BACKUP=refs/uzi-lander/fresh-backup/pr-99/$LOCAL_FIX\$" "$WORK/fresh.out" || fail "--fresh kept no backup of the local commit: $(cat "$WORK/fresh.out")"
+[ "$(git -C "$WT" rev-parse "refs/uzi-lander/fresh-backup/pr-99/$LOCAL_FIX")" = "$LOCAL_FIX" ] || fail "backup ref does not hold the old HEAD"
 grep -q 'local fix after rebase' "$WORK/fresh.out" || fail "the dropped local commit was not named: $(cat "$WORK/fresh.out")"
 if grep -q 'feature$' "$WORK/fresh.out"; then fail "a commit the remote already carries was listed as local-only"; fi
 grep -q '^RESULT=prepared ' "$WORK/fresh.out" || fail "--fresh did not re-prepare: $(cat "$WORK/fresh.out")"
+# A second --fresh with a different local commit keeps BOTH backups: no overwrite.
+printf 'second fix\n' > "$WT/web/fix2.txt"
+git -C "$WT" add web/fix2.txt
+git -C "$WT" commit -qm 'second local fix'
+SECOND_FIX=$(git -C "$WT" rev-parse HEAD)
+PATH="$WORK/bin:$PATH" bash "$SCRIPT" test/uzi 99 --repo-root "$ROOT" --worktree "$WT" --fresh --no-push --gate none > "$WORK/fresh2.out" 2>&1 \
+  || fail "second --fresh failed: $(cat "$WORK/fresh2.out")"
+[ "$(git -C "$WT" rev-parse "refs/uzi-lander/fresh-backup/pr-99/$SECOND_FIX")" = "$SECOND_FIX" ] || fail "second backup missing"
+[ "$(git -C "$WT" rev-parse "refs/uzi-lander/fresh-backup/pr-99/$LOCAL_FIX")" = "$LOCAL_FIX" ] || fail "the first backup was overwritten by the second --fresh"
+# A failed git cherry aborts before the reset: HEAD (with a local commit) must survive.
+printf 'third fix\n' > "$WT/web/fix3.txt"
+git -C "$WT" add web/fix3.txt
+git -C "$WT" commit -qm 'third local fix'
+THIRD_FIX=$(git -C "$WT" rev-parse HEAD)
+REAL_GIT=$(command -v git)
+cat > "$WORK/bin/git" <<STUB
+#!/usr/bin/env bash
+for a in "\$@"; do [ "\$a" = cherry ] && { echo "fatal: simulated cherry failure" >&2; exit 128; }; done
+exec "$REAL_GIT" "\$@"
+STUB
+chmod +x "$WORK/bin/git"
+set +e
+PATH="$WORK/bin:$PATH" bash "$SCRIPT" test/uzi 99 --repo-root "$ROOT" --worktree "$WT" --fresh --no-push --gate none > "$WORK/fresh-cherry-fail.out" 2>&1
+rc=$?
+set -e
+rm -f "$WORK/bin/git"
+[ "$rc" -eq 3 ] || fail "a failed git cherry did not abort --fresh, rc=$rc: $(cat "$WORK/fresh-cherry-fail.out")"
+[ "$(git -C "$WT" rev-parse HEAD)" = "$THIRD_FIX" ] || fail "--fresh reset the worktree after git cherry failed"
+git -C "$WT" reset -q --hard "$THIRD_FIX~1" # back to the prepared head of the second --fresh
 
 # A REBASE_HEAD left behind by a COMPLETED rebase is not a rebase in progress (#1574).
 git -C "$WT" update-ref REBASE_HEAD HEAD
