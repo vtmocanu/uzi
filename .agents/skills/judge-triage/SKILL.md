@@ -67,14 +67,14 @@ belongs — the three copies are decoupled and nothing propagates between them:
 |---|---|---|---|
 | **Upstream** | `vtmocanu/skills` `agent-team/roles.yaml` | a GENERIC role-body improvement any repo's team would want | edit the source, bump that role's `version:`, commit + push, `npx skills update` globally, verify the installed copy by content. Mechanics live in the agent-team skill. |
 | **Builtins** | `api/internal/agenttmpl/builtins/{role}.md` | the PRODUCT agents that run in uzi worker runs | edit the body (builtins carry no `version:`), then `cd api && go test ./internal/agenttmpl/... -count=1`. |
-| **Repo agents** | `.claude/agents/{role}.md` | THIS repo's dev-team roster | `sync.py apply {role}` (from the agent-team skill) for a generic-body sync, or edit by hand. PRESERVE the `model:` pin — repo agents pin an exact id (`claude-opus-4-8`) where the library floats an alias `opus`; never let a sync revert it. |
+| **Repo agents** | `.claude/agents/{role}.md` | THIS repo's dev-team roster | `sync.py apply {role}` (from the agent-team skill) for a generic-body sync, or edit by hand. `model:` uses aliases (`opus`/`sonnet`); never pin an exact model id. `tester` stays `sonnet` (library: `opus`) by design. |
 
 Checks that make this correct, each learned the hard way:
 
 - **A generic improvement usually lands in ALL THREE.** Upstream is the source
   of truth; builtins and repo agents are decoupled copies updated separately.
-  `sync.py check` (agent-team skill) reports repo-agent drift, where
-  `MODIFIED (model pin only)` is the expected steady state, not real drift.
+  `sync.py check` (agent-team skill) reports repo-agent drift; a `tester`
+  model-only `MODIFIED` is the expected steady state, not real drift.
 - **The worker sandbox blocks writes outside the run worktree**
   (`agent/src/guardrails.ts`, `REASON_OUTSIDE_WORKTREE`). A rec that says
   "write to /tmp" is impossible for a BUILTIN — reword to a worktree-local path.
