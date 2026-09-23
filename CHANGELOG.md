@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Fixed
+
+- **Codex runs now implement the plan you approved, not the original issue text ([#1586](https://github.com/vtmocanu/uzi/issues/1586)).**
+  After a gated Codex run's plan (first submission, a revision, or an auto-approval) passed the gate, every implement turn was built from the issue title and the description captured when the run was queued, so the lead could ignore or re-plan the approved work; implement turns, including those after a checkpoint's fresh session, now carry the exact approved plan framed as approved, and a resume with an already-approved plan is unchanged.
+
 ## [0.84.0] - 2026-09-20
 
 ### Added

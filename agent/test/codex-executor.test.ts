@@ -2896,6 +2896,177 @@ describe("CodexExecutor: plan folding + implement/review loop (m2)", () => {
 });
 
 // ================================================================================
+// #1586 — the plan the in-process gate APPROVED drives every implement turn. Before the fix
+// implementPrompt read only ctx.approvedPlan (the claim-time plan_md, undefined on a gated run),
+// so every implement turn fell back to the queue-time issue title + description. These drive a
+// real gated run and read the prompt text the transport actually received (turn/start
+// input[0].text), across a same-epoch fallback iteration, a revise loop, and a new-root
+// continuation after a cooperative checkpoint.
+describe("CodexExecutor — in-process approved plan drives implement (#1586)", () => {
+  const APPROVAL_FRAMING = "Your plan was approved at the gate";
+  const ISSUE_TEXT = "the description"; // makeCtx's default issueDescription
+  const turnTexts = (t: FakeTransport): string[] =>
+    t.requests
+      .filter((r) => r.method === "turn/start")
+      .map((r) => (r.params as { input?: { text?: string }[] }).input?.[0]?.text ?? "");
+  const planEpoch = (plans: string[]): Responder => (c) => {
+    if (c.method === "thread/start") return { thread: { id: "th-plan" } };
+    if (c.method === "turn/start") {
+      const turnId = `tn-plan-${c.turnStartCount}`;
+      if (c.turnStartCount === 1) c.transport.push(threadStarted("th-plan"));
+      const plan = plans[c.turnStartCount - 1] ?? "unexpected-extra-plan";
+      c.transport
+        .push(toolCall(c.turnStartCount, "submit_plan", { plan_md: plan }, "th-plan", turnId, `c-plan-${c.turnStartCount}`))
+        .push(turnCompleted("completed", "th-plan", turnId));
+      return { turn: { id: turnId } };
+    }
+    return {};
+  };
+  const approve = { kind: "approve", selection: { source: "own", agents: [] } } as never;
+  const assertApprovedPlanPrompt = (text: string, plan: string, label: string, notPlans: string[] = []): void => {
+    assert.ok(text.includes(APPROVAL_FRAMING), `${label}: carries the approval framing`);
+    assert.ok(text.includes(`<approved_plan>\n${plan}\n</approved_plan>`), `${label}: carries the gated plan in its fence`);
+    assert.ok(!text.includes(ISSUE_TEXT), `${label}: the queue-time issue description is left out`);
+    for (const p of notPlans) assert.ok(!text.includes(p), `${label}: a superseded plan (${p}) is absent`);
+  };
+
+  it("a gated approve feeds the approved plan to EVERY implement turn, including the same-epoch fallback iteration", async () => {
+    const PLAN = "PLAN-ALPHA-111";
+    const order: string[] = [];
+    const implResponder: Responder = (c) => {
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "resumed-1" } };
+      if (c.method === "turn/start") {
+        order.push(`implement:${c.turnStartCount}`);
+        const turnId = `tn-impl-${c.turnStartCount}`;
+        if (c.turnStartCount === 1) c.transport.push(threadStarted("resumed-1"));
+        // Turn 1 completes WITHOUT done/checkpoint → iteration-boundary fallback, SAME epoch.
+        if (c.turnStartCount >= 2) c.transport.push(toolCall(50 + c.turnStartCount, "signal_done", {}, "resumed-1", turnId, `c-done-${c.turnStartCount}`));
+        c.transport.push(turnCompleted("completed", "resumed-1", turnId));
+        return { turn: { id: turnId } };
+      }
+      return {};
+    };
+    const rig = makeMultiEpochRig([planEpoch([PLAN]), implResponder]);
+    const checkpoints: { reap: boolean }[] = [];
+    const { ctx } = makeCtx({
+      planApproved: false,
+      approvedPlan: undefined,
+      config: { max_iterations: 5 },
+      checkpoint: async (opts) => { checkpoints.push({ reap: opts.reap }); },
+      gatePlan: async (planMd) => {
+        order.push(`gate:${planMd}`);
+        return approve;
+      },
+    });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#1586 gated fallback run");
+
+    assert.equal(result.branch, "agent/issue-42");
+    assert.equal(rig.providerLaunches(), 2, "plan epoch + ONE implement epoch (the fallback does not recreate)");
+    assert.deepEqual(checkpoints, [{ reap: false }], "exactly one iteration-boundary fallback between the two implement turns");
+    assert.deepEqual(order, [`gate:${PLAN}`, "implement:1", "implement:2"], "no implement turn starts before the gate approves");
+    const texts = turnTexts(rig.epochs[1]!.transport);
+    assert.equal(texts.length, 2, "two implement turns ran on the implement epoch");
+    texts.forEach((text, i) => assertApprovedPlanPrompt(text, PLAN, `implement turn ${i + 1}`));
+  });
+
+  it("revise then approve: every implement turn carries the LAST gated plan, never the superseded one", async () => {
+    const P1 = "PLAN-ALPHA-111";
+    const P2 = "PLAN-BRAVO-222";
+    const implResponder: Responder = (c) => {
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "resumed-plan" } };
+      if (c.method === "turn/start") {
+        const turnId = `tn-impl-${c.turnStartCount}`;
+        if (c.turnStartCount === 1) c.transport.push(threadStarted("resumed-plan"));
+        if (c.turnStartCount >= 2) c.transport.push(toolCall(60 + c.turnStartCount, "signal_done", {}, "resumed-plan", turnId, `c-done-${c.turnStartCount}`));
+        c.transport.push(turnCompleted("completed", "resumed-plan", turnId));
+        return { turn: { id: turnId } };
+      }
+      return {};
+    };
+    const rig = makeMultiEpochRig([planEpoch([P1, P2]), implResponder]);
+    const gated: string[] = [];
+    const { ctx } = makeCtx({
+      planApproved: false,
+      approvedPlan: undefined,
+      config: { plan_max_revisions: 1, max_iterations: 5 },
+      gatePlan: async (planMd) => {
+        gated.push(planMd);
+        return gated.length === 1 ? { kind: "revise", feedback: "tighten it" } : approve;
+      },
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#1586 revise run");
+
+    assert.deepEqual(gated, [P1, P2], "the gate saw P1, then the revised P2");
+    const texts = turnTexts(rig.epochs[1]!.transport);
+    assert.equal(texts.length, 2, "two implement turns ran");
+    texts.forEach((text, i) => assertApprovedPlanPrompt(text, P2, `implement turn ${i + 1}`, [P1]));
+  });
+
+  it("a cooperative checkpoint's new-root continuation still carries the gated plan on the NEW epoch", async () => {
+    const P1 = "PLAN-ALPHA-111";
+    const P2 = "PLAN-BRAVO-222";
+    const rig = makeMultiEpochRig([
+      planEpoch([P1, P2]),
+      // Implement epoch A: a cooperative checkpoint, NOT done → persist, reap, recreate.
+      epochResponder("resumed-a", "tn-impl-a", (t, th, tn) => {
+        t.push(toolCall(71, "checkpoint", {}, th, tn, "c-ckpt")).push(turnCompleted("completed", th, tn));
+      }),
+      // Implement epoch B (the NEW root): done.
+      epochResponder("resumed-b", "tn-impl-b", (t, th, tn) => {
+        t.push(toolCall(72, "signal_done", {}, th, tn, "c-done")).push(turnCompleted("completed", th, tn));
+      }),
+    ]);
+    const checkpoints: { reap: boolean }[] = [];
+    let gateCalls = 0;
+    const { ctx } = makeCtx({
+      planApproved: false,
+      approvedPlan: undefined,
+      config: { plan_max_revisions: 1 },
+      checkpoint: async (opts) => { checkpoints.push({ reap: opts.reap }); },
+      gatePlan: async () => {
+        gateCalls += 1;
+        return gateCalls === 1 ? { kind: "revise", feedback: "tighten it" } : approve;
+      },
+    });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#1586 new-root run");
+
+    assert.equal(result.branch, "agent/issue-42");
+    assert.equal(rig.providerLaunches(), 3, "plan epoch + implement epoch + the recreated NEW root");
+    assert.deepEqual(checkpoints, [{ reap: true }], "the cooperative checkpoint reaped exactly once");
+    const before = turnTexts(rig.epochs[1]!.transport);
+    const after = turnTexts(rig.epochs[2]!.transport);
+    assert.equal(before.length, 1);
+    assert.equal(after.length, 1, "the continuation turn ran on the recreated epoch");
+    assertApprovedPlanPrompt(before[0]!, P2, "pre-checkpoint implement turn", [P1]);
+    assertApprovedPlanPrompt(after[0]!, P2, "new-root continuation turn", [P1]);
+  });
+
+  it("negative control: a pre-approved resume never gates and sends the raw persisted plan, unframed", async () => {
+    const rig = makeMultiEpochRig([
+      epochResponder("th-1", "tn-1", (t, th, tn) => {
+        t.push(toolCall(81, "signal_done", {}, th, tn, "c-done")).push(turnCompleted("completed", th, tn));
+      }),
+    ]);
+    let gateCalls = 0;
+    // makeCtx default: planApproved true + approvedPlan "the approved plan" (the claim-time plan_md).
+    const { ctx } = makeCtx({
+      gatePlan: async () => {
+        gateCalls += 1;
+        return approve;
+      },
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#1586 pre-approved run");
+
+    assert.equal(gateCalls, 0, "a pre-approved resume skips the in-process gate");
+    const texts = turnTexts(rig.epochs[0]!.transport);
+    assert.equal(texts.length, 1);
+    assert.equal(texts[0], "the approved plan", "the implement prompt is exactly the raw persisted plan");
+    assert.ok(!texts[0]!.includes(APPROVAL_FRAMING), "no approval framing on the pre-approved path");
+    assert.ok(!texts[0]!.includes("<approved_plan>"), "no plan fence on the pre-approved path");
+  });
+});
+
+// ================================================================================
 // PRD #1171 m4 — new-root resume + the runner-owned session persist/adopt lifecycle. A recreated
 // provider root requires a BRAND-NEW ExecutionRegistry (a durability boundary permanently closes
 // the prior one) and a fresh credential release, and it adopts the credential-free session subset
@@ -3448,6 +3619,8 @@ describe("CodexExecutor prompts — published-tip note (PRD #1416 M1)", () => {
     (exec as unknown as { planPrompt(c: RunContext): string }).planPrompt(ctx);
   const implementPrompt = (ctx: RunContext): string =>
     (exec as unknown as { implementPrompt(c: RunContext): string }).implementPrompt(ctx);
+  const implementPromptGated = (ctx: RunContext, gatedPlan?: string): string =>
+    (exec as unknown as { implementPrompt(c: RunContext, g?: string): string }).implementPrompt(ctx, gatedPlan);
 
   it("planPrompt prepends the paragraph when publishedTip is set, omits it when absent", () => {
     const withP = planPrompt(makeCtx({ publishedTip: P, defaultBranchCommit: DFLT }).ctx);
@@ -3495,6 +3668,38 @@ describe("CodexExecutor prompts — published-tip note (PRD #1416 M1)", () => {
     );
     assert.ok(autoImpl.includes("state the constraint plainly in the plan"), "autopilot implement gives plan-only guidance");
     assert.ok(!autoImpl.includes("stop and call `ask_user`"), "autopilot implement does not call ask_user");
+  });
+
+  // #1586: the plan approved at the in-process gate is framed as approved and replaces the issue text.
+  it("#1586 implementPrompt with a gated plan frames it as approved and leaves out the issue description", () => {
+    const out = implementPromptGated(makeCtx({ approvedPlan: undefined }).ctx, "GATED-PLAN-XYZ");
+    assert.ok(out.startsWith("Your plan was approved at the gate."), "the approval framing leads the prompt");
+    assert.ok(out.includes("<approved_plan>\nGATED-PLAN-XYZ\n</approved_plan>"), "the gated plan sits in its fence");
+    assert.ok(!out.includes("the description"), "the issue description is not sent");
+    assert.ok(!out.includes("Issue #42"), "the issue heading is not sent");
+    // The gated plan wins over a stale claim-time plan_md too.
+    const withStale = implementPromptGated(makeCtx({ approvedPlan: "STALE-CLAIM-PLAN" }).ctx, "GATED-PLAN-XYZ");
+    assert.ok(withStale.includes("GATED-PLAN-XYZ") && !withStale.includes("STALE-CLAIM-PLAN"));
+  });
+
+  it("#1586 implementPrompt with a gated plan still prepends the published-tip note before the framing", () => {
+    const out = implementPromptGated(makeCtx({ approvedPlan: undefined, publishedTip: P, defaultBranchCommit: DFLT }).ctx, "GATED-PLAN-XYZ");
+    const noteIdx = out.indexOf("already published on the forge");
+    const framingIdx = out.indexOf("Your plan was approved at the gate.");
+    assert.ok(noteIdx >= 0 && out.includes(P), "the published-tip note is present");
+    assert.ok(framingIdx > noteIdx, "the note is prepended before the approved-plan body");
+    assert.ok(out.includes("<approved_plan>\nGATED-PLAN-XYZ\n</approved_plan>"));
+  });
+
+  it("#1586 implementPrompt without a gated plan is byte-identical to the one-argument form", () => {
+    for (const overrides of [{}, { approvedPlan: undefined }, { approvedPlan: undefined, publishedTip: P }, { publishedTip: P, defaultBranchCommit: DFLT }]) {
+      const ctx = makeCtx(overrides).ctx;
+      const out = implementPromptGated(ctx, undefined);
+      assert.equal(out, implementPrompt(ctx));
+      assert.ok(!out.includes("Your plan was approved at the gate"), "no framing without a gated plan");
+    }
+    assert.equal(implementPrompt(makeCtx().ctx), "the approved plan", "pre-approved: the raw persisted plan");
+    assert.equal(implementPrompt(makeCtx({ approvedPlan: undefined }).ctx), "Issue #42: do a thing\n\nthe description", "no plan: the issue fallback");
   });
 });
 

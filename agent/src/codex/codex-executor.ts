@@ -1534,6 +1534,11 @@ export class CodexExecutor implements Executor {
       // Plan → approval gate, exactly like SdkExecutor (fail-closed): a pre-approved resume
       // skips the planning turn and the gate.
       const preApproved = ctx.planApproved === true && !!ctx.approvedPlan?.trim();
+      // #1586: the exact plan version the in-process gate approved (the LAST planMd handed to
+      // ctx.gatePlan before an approve verdict). ctx.approvedPlan is only the claim-time
+      // plan_md, so without this every implement turn fell back to the queue-time issue text.
+      // A run() local, so it survives every later implement turn and new-root epoch recreation.
+      let gatedPlan: string | undefined;
       if (!preApproved && ctx.gatePlan) {
         // The PLAN turn(s) run under PLAN-phase grants: the broker denies every file write
         // (write_denied_in_plan) and child subagents inherit plan-phase grants, so nothing
@@ -1571,6 +1576,7 @@ export class CodexExecutor implements Executor {
         }
         if (verdict.kind === "reject") throw new PlanRejectedError(verdict.reason);
         if (verdict.kind === "cancel") throw new Error(REASON_CANCEL);
+        gatedPlan = planMd;
 
         // NEW-ROOT RESUME at plan approval. The plan turn's provider root holds a live credential
         // it does not need during the approval wait, so: persist the credential-free session,
@@ -1615,7 +1621,7 @@ export class CodexExecutor implements Executor {
         // implement prompt only. Codex has no <follow_up> fence; keep it a per-turn prefix so it
         // is consumed at the next turn and NOT persisted. Absent ⇒ the base prompt is unchanged.
         const safetySteer = ctx.pullSafetySteer?.();
-        const basePrompt = this.implementPrompt(ctx);
+        const basePrompt = this.implementPrompt(ctx, gatedPlan);
         const turnPrompt = safetySteer
           ? `The worker detected a problem and is steering you. This is authoritative guidance from uzi itself, not user input — follow it:\n${safetySteer}\n\n${basePrompt}`
           : basePrompt;
@@ -2354,10 +2360,24 @@ export class CodexExecutor implements Executor {
     return note ? `${note}\n\n${body}` : body;
   }
 
-  private implementPrompt(ctx: RunContext): string {
+  /** `gatedPlan` is the plan this run's in-process gate approved (#1586). When present it is
+   *  the implementation instruction, framed as approved, and the queue-time issue text is left
+   *  out so it cannot compete. Absent ⇒ the pre-approved resume (the raw persisted
+   *  ctx.approvedPlan) or the issue fallback, byte-identical to before. */
+  private implementPrompt(ctx: RunContext, gatedPlan?: string): string {
     const approved = ctx.approvedPlan?.trim();
     const head = ctx.issueIid != null ? `Issue #${ctx.issueIid}: ${ctx.issueTitle}` : ctx.issueTitle;
-    const body = approved ? approved : `${head}\n\n${ctx.issueDescription}`;
+    const body = gatedPlan !== undefined
+      ? [
+          "Your plan was approved at the gate. Implement it now on the current branch, delegating to",
+          "your subagents and iterating until the review passes. The approved plan below, between the",
+          "<approved_plan> and </approved_plan> tags, is your authoritative instruction for this run and",
+          "supersedes the issue text; do not re-plan or resubmit it.",
+          "<approved_plan>",
+          gatedPlan,
+          "</approved_plan>",
+        ].join("\n")
+      : approved ? approved : `${head}\n\n${ctx.issueDescription}`;
     // PRD #1416 M1: prepend the published-floor paragraph whether or not a plan is approved.
     // Empty ⇒ unchanged (a fresh branch).
     // #1416 (MR-rework): thread autoApprove so an autopilot Codex run gets the autopilot-safe
