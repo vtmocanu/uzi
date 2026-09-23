@@ -306,6 +306,15 @@ interface DelegationDispatch {
   readonly label: string;
   readonly ordinal: number;
   state: "pending" | "bound" | "closed";
+  /** The child binding once bound; kept after the child sink unregisters so a close can still
+   *  settle its open child tools. */
+  child?: ChildBinding;
+}
+
+/** A projected child tool `started` awaiting its `finished`. */
+interface OpenChildTool {
+  readonly id: string;
+  readonly name: string;
 }
 
 /** A child thread bound to its dispatch: the projected (scrubbed, bounded) admitted role, and the
@@ -315,7 +324,9 @@ interface ChildBinding {
   readonly role: string;
   counter: number;
   readonly issuedIds: Set<string>;
-  readonly openTools: Map<string, string>;
+  /** Raw provider call id -> the projected starteds still open under it, oldest first: a reused
+   *  raw id queues, and each `finished` closes the oldest. An empty queue is deleted. */
+  readonly openTools: Map<string, OpenChildTool[]>;
   /** Projected child items / JSON bytes emitted so far for this dispatch (see
    *  {@link MAX_CHILD_ITEMS_PER_DISPATCH}); `capped` once this dispatch's or the turn's budget
    *  was exhausted and its one {@link CHILD_OUTPUT_CAPPED} marker went out. */
@@ -336,7 +347,8 @@ const DISPATCH_TOOL_NAME = "Agent";
 /** The per-dispatch budget of projected child items and of their JSON-serialized bytes. A child
  *  producing more (one frame with a huge part list, or many frames) gets ONE
  *  {@link CHILD_OUTPUT_CAPPED} text item and nothing further except the `finished` of a child
- *  tool whose `started` was already projected; its lead completion is unaffected. */
+ *  tool whose `started` was already projected, whose output is then replaced by
+ *  {@link CHILD_TOOL_OUTPUT_OMITTED}; its lead completion is unaffected. */
 const MAX_CHILD_ITEMS_PER_DISPATCH = 2000;
 const MAX_CHILD_BYTES_PER_DISPATCH = 4 * 1024 * 1024;
 /** The same budget summed over EVERY dispatch of one turn, so N dispatches cannot project N times
@@ -344,6 +356,11 @@ const MAX_CHILD_BYTES_PER_DISPATCH = 4 * 1024 * 1024;
 const MAX_CHILD_ITEMS_PER_TURN = 10_000;
 const MAX_CHILD_BYTES_PER_TURN = 16 * 1024 * 1024;
 const CHILD_OUTPUT_CAPPED = "[further subagent output not shown]";
+/** The output of a child tool `finished` that closes a projected `started` but does not fit the
+ *  budget: the pair still closes, at a small constant size. */
+const CHILD_TOOL_OUTPUT_OMITTED = "[output not shown: subagent output cap reached]";
+/** The output synthesized for a child tool still open when its dispatch was closed. */
+const CHILD_TOOL_UNCONFIRMED = "tool result not confirmed: delegation closed";
 
 // --- the harness --------------------------------------------------------------
 
@@ -549,7 +566,7 @@ export class CodexHarness implements RunHarness {
         role = "unknown";
       }
       dispatch.state = "bound";
-      this.childBindings.set(childThreadId, {
+      const binding: ChildBinding = {
         dispatch,
         role,
         counter: 0,
@@ -558,7 +575,9 @@ export class CodexHarness implements RunHarness {
         items: 0,
         bytes: 0,
         capped: false,
-      });
+      };
+      dispatch.child = binding;
+      this.childBindings.set(childThreadId, binding);
       this.emitProjected(
         this.leadFrame({
           kind: "tool",
@@ -587,16 +606,19 @@ export class CodexHarness implements RunHarness {
    * is dropped), its `name` the canonical tool name, its `input` the raw args and its `output` the
    * raw output value (the broker's message on failure).
    *
-   * Bounded per dispatch AND per turn: once {@link MAX_CHILD_ITEMS_PER_DISPATCH} items or
-   * {@link MAX_CHILD_BYTES_PER_DISPATCH} projected bytes of this dispatch, or
-   * {@link MAX_CHILD_ITEMS_PER_TURN} / {@link MAX_CHILD_BYTES_PER_TURN} summed over every dispatch
-   * of the turn, would be exceeded (counted item by item, so one oversized frame is cut too), a
-   * single {@link CHILD_OUTPUT_CAPPED} text item is emitted for this dispatch and every later
-   * child item of it is dropped, EXCEPT the `finished` of a child tool whose `started` was already
-   * projected: that one always passes (each is bounded by the projection's output bound), so no
-   * projected tool is left running forever. An item that would trip the cap is never projected,
-   * so a `started` past the cap never goes out. The lead completion is NOT a child item and is
-   * always still emitted. Fail-safe: never throws.
+   * Bounded per dispatch AND per turn: every projected item is counted against
+   * {@link MAX_CHILD_ITEMS_PER_DISPATCH} / {@link MAX_CHILD_BYTES_PER_DISPATCH} for this dispatch and
+   * {@link MAX_CHILD_ITEMS_PER_TURN} / {@link MAX_CHILD_BYTES_PER_TURN} summed over every dispatch of
+   * the turn (item by item, so one oversized frame is cut too). The first item that would exceed
+   * any of them caps the dispatch: a single {@link CHILD_OUTPUT_CAPPED} text item is emitted for
+   * it, and every later child item of it is dropped, EXCEPT a `finished` that closes a projected
+   * `started`. Such a closer is emitted in full while it fits; once it does not (or the dispatch is
+   * already capped) it is still emitted, so no projected tool is left running, but with its output
+   * replaced by {@link CHILD_TOOL_OUTPUT_OMITTED}, so each over-budget closer costs a small constant
+   * number of bytes (still counted). A `started` that would exceed a budget is never projected.
+   * Child tools still open when the dispatch is closed are settled by
+   * {@link closeOpenDispatches}. The lead completion is NOT a child item and is always still
+   * emitted. Fail-safe: never throws.
    */
   emitChildFrame(childThreadId: string, items: readonly HarnessItem[]): void {
     try {
@@ -606,25 +628,25 @@ export class CodexHarness implements RunHarness {
       if (binding.capped && binding.openTools.size === 0) return;
       const projected: HarnessItem[] = [];
       for (const item of items) {
-        // A finished whose started was projected always passes: it closes a visible tool.
         const closesOpen = item.kind === "tool" && item.phase === "finished" && binding.openTools.has(item.id ?? "");
         if (binding.capped && !closesOpen) continue;
-        const one = this.projectChildItem(binding, item);
+        let one = this.projectChildItem(binding, item);
         if (one === undefined) continue;
-        const size = Buffer.byteLength(JSON.stringify(one), "utf8");
-        if (
-          !closesOpen &&
-          (binding.items + 1 > MAX_CHILD_ITEMS_PER_DISPATCH ||
-            binding.bytes + size > MAX_CHILD_BYTES_PER_DISPATCH ||
-            this.childTurnItems + 1 > MAX_CHILD_ITEMS_PER_TURN ||
-            this.childTurnBytes + size > MAX_CHILD_BYTES_PER_TURN)
-        ) {
-          binding.capped = true;
-          projected.push({ kind: "text", text: CHILD_OUTPUT_CAPPED });
-          continue;
-        }
-        if (item.kind === "tool" && one.kind === "tool" && one.phase === "started" && one.id !== undefined) {
-          binding.openTools.set(item.id ?? "", one.id);
+        let size = Buffer.byteLength(JSON.stringify(one), "utf8");
+        if (binding.capped || this.exceedsChildBudget(binding, size)) {
+          if (!binding.capped) {
+            binding.capped = true;
+            projected.push({ kind: "text", text: CHILD_OUTPUT_CAPPED });
+          }
+          if (!closesOpen || one.kind !== "tool" || one.phase !== "finished") continue;
+          // Close the visible tool anyway, at a constant size.
+          one = { ...one, output: CHILD_TOOL_OUTPUT_OMITTED };
+          size = Buffer.byteLength(JSON.stringify(one), "utf8");
+        } else if (one.kind === "tool" && one.phase === "started" && one.id !== undefined) {
+          const rawId = item.kind === "tool" ? (item.id ?? "") : "";
+          const queue = binding.openTools.get(rawId) ?? [];
+          queue.push({ id: one.id, name: one.name ?? "unknown" });
+          binding.openTools.set(rawId, queue);
         }
         binding.items += 1;
         binding.bytes += size;
@@ -632,25 +654,42 @@ export class CodexHarness implements RunHarness {
         this.childTurnBytes += size;
         projected.push(one);
       }
-      if (projected.length === 0) return;
-      const { dispatch, role } = binding;
-      this.emitProjected(
-        {
-          kind: "frame",
-          origin: { kind: "subagent", role, instanceId: dispatch.dispatchId },
-          attribution: {
-            agent: role,
-            agentInstance: dispatch.dispatchId,
-            ...(dispatch.label.length > 0 ? { agentLabel: dispatch.label } : {}),
-          },
-          items: projected,
-          sessionId: this.threadId,
-        },
-        dispatch.ordinal,
-      );
+      this.emitChildItems(binding, projected);
     } catch {
       /* projection is best-effort: the child runs regardless */
     }
+  }
+
+  /** Whether one more projected child item of `size` bytes would exceed the dispatch's or the
+   *  turn's item/byte budget. */
+  private exceedsChildBudget(binding: ChildBinding, size: number): boolean {
+    return (
+      binding.items + 1 > MAX_CHILD_ITEMS_PER_DISPATCH ||
+      binding.bytes + size > MAX_CHILD_BYTES_PER_DISPATCH ||
+      this.childTurnItems + 1 > MAX_CHILD_ITEMS_PER_TURN ||
+      this.childTurnBytes + size > MAX_CHILD_BYTES_PER_TURN
+    );
+  }
+
+  /** Push already-projected child items as one subagent-origin frame of the binding's dispatch
+   *  (nothing when empty). */
+  private emitChildItems(binding: ChildBinding, items: HarnessItem[]): void {
+    if (items.length === 0) return;
+    const { dispatch, role } = binding;
+    this.emitProjected(
+      {
+        kind: "frame",
+        origin: { kind: "subagent", role, instanceId: dispatch.dispatchId },
+        attribution: {
+          agent: role,
+          agentInstance: dispatch.dispatchId,
+          ...(dispatch.label.length > 0 ? { agentLabel: dispatch.label } : {}),
+        },
+        items,
+        sessionId: this.threadId,
+      },
+      dispatch.ordinal,
+    );
   }
 
   /** Project one raw child item (see {@link emitChildFrame}); undefined drops it. A projected
@@ -675,9 +714,11 @@ export class CodexHarness implements RunHarness {
       }
       return { kind: "tool", phase: "started", id, name, input };
     }
-    const id = binding.openTools.get(rawId);
-    if (id === undefined) return undefined;
-    binding.openTools.delete(rawId);
+    const queue = binding.openTools.get(rawId);
+    const open = queue?.shift();
+    if (queue === undefined || open === undefined) return undefined;
+    if (queue.length === 0) binding.openTools.delete(rawId);
+    const id = open.id;
     let output: string;
     try {
       output = projectOutputValue(item.output, scrub);
@@ -1520,11 +1561,14 @@ export class CodexHarness implements RunHarness {
   }
 
   /** Queue the lead completion (`tool_result` for the dispatch id) of a BOUND dispatch whose
-   *  broker call settled, and close it. Runs before the reply; an unbound or already-closed
+   *  broker call settled, and close it. A child tool still open (the child timed out or aborted
+   *  mid-tool) first gets its synthesized error `finished` (see {@link closeOpenChildTools}), so
+   *  the child frames precede the completion. Runs before the reply; an unbound or already-closed
    *  dispatch (child never started, or the turn stopped first) projects nothing. */
   private completeDispatch(dispatch: DelegationDispatch, result: CallbackResult): void {
     if (dispatch.state !== "bound") return;
     dispatch.state = "closed";
+    this.closeOpenChildTools(dispatch);
     let output: string;
     try {
       output = projectToolOutput(result, this.scrubProjected);
@@ -1537,10 +1581,11 @@ export class CodexHarness implements RunHarness {
     );
   }
 
-  /** Close every dispatch of turn `ordinal`: a BOUND one gets a synthesized error completion
-   *  carrying `content` (its child's settlement is not confirmed), a pending one can no longer
-   *  bind. A later real settlement of a closed dispatch projects nothing, so there is never a
-   *  duplicate completion. Fail-safe: never throws. */
+  /** Close every dispatch of turn `ordinal`: a BOUND one first gets a synthesized error `finished`
+   *  ({@link CHILD_TOOL_UNCONFIRMED}) for each child tool still open, in one child frame, then a
+   *  synthesized error completion carrying `content` (its child's settlement is not confirmed); a
+   *  pending one can no longer bind. A later real settlement of a closed dispatch projects nothing,
+   *  so there is never a duplicate completion. Fail-safe: never throws. */
   private closeOpenDispatches(ordinal: number, content: string): void {
     try {
       for (const dispatch of this.dispatches) {
@@ -1548,6 +1593,7 @@ export class CodexHarness implements RunHarness {
         const wasBound = dispatch.state === "bound";
         dispatch.state = "closed";
         if (!wasBound) continue;
+        this.closeOpenChildTools(dispatch);
         this.emitProjected(
           this.leadFrame({
             kind: "tool",
@@ -1560,6 +1606,25 @@ export class CodexHarness implements RunHarness {
           ordinal,
         );
       }
+    } catch {
+      /* projection is best-effort */
+    }
+  }
+
+  /** Emit a synthesized error `finished` for every child tool of `dispatch` still open (oldest
+   *  first per raw id), so none is left running once its dispatch closes. Fail-safe. */
+  private closeOpenChildTools(dispatch: DelegationDispatch): void {
+    try {
+      const binding = dispatch.child;
+      if (binding === undefined || binding.openTools.size === 0) return;
+      const closers: HarnessItem[] = [];
+      for (const queue of binding.openTools.values()) {
+        for (const open of queue) {
+          closers.push({ kind: "tool", phase: "finished", id: open.id, name: open.name, output: CHILD_TOOL_UNCONFIRMED, isError: true });
+        }
+      }
+      binding.openTools.clear();
+      this.emitChildItems(binding, closers);
     } catch {
       /* projection is best-effort */
     }

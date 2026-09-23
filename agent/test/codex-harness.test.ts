@@ -17,7 +17,7 @@ import {
   type CallbackRuntimeId,
 } from "../src/codex/broker.js";
 import { renderCodexRun } from "../src/codex/render.js";
-import type { HarnessEvent, HarnessTerminal, RunTurnRequest } from "../src/harness.js";
+import type { HarnessEvent, HarnessItem, HarnessTerminal, RunTurnRequest } from "../src/harness.js";
 import type { CodexNotification, CodexTransport, CodexUsageBreakdown } from "../src/codex/transport.js";
 import type { Logger } from "../src/log.js";
 import {
@@ -2361,7 +2361,7 @@ describe("CodexHarness: delegation dispatch binding + child frames (issue #1583 
     );
   });
 
-  it("a cap tripping between a child tool's started and finished still passes that finished, paired; a started past the cap never goes out", async () => {
+  it("a cap tripping between a child tool's started and finished still passes that finished (output omitted), paired; a started past the cap never goes out", async () => {
     let harnessRef!: CodexHarness;
     const broker = stubBroker(async (rt, name) => {
       if (name !== "spawn_agent") return { ok: true, output: {} };
@@ -2398,7 +2398,15 @@ describe("CodexHarness: delegation dispatch binding + child frames (issue #1583 
     assert.equal(childItems.length, 2002, "started + 1999 texts + marker + the paired finished");
     assert.deepEqual(childItems[0], { kind: "tool", phase: "started", id: `${dispatchId}/t1`, name: "Bash", input: { command: "ls" } });
     assert.deepEqual(childItems[2000], { kind: "text", text: "[further subagent output not shown]" });
-    assert.deepEqual(childItems[2001], { kind: "tool", phase: "finished", id: `${dispatchId}/t1`, name: "Bash", output: "ok", isError: false });
+    // Past the cap the closer still goes out, but with its output replaced by the constant.
+    assert.deepEqual(childItems[2001], {
+      kind: "tool",
+      phase: "finished",
+      id: `${dispatchId}/t1`,
+      name: "Bash",
+      output: "[output not shown: subagent output cap reached]",
+      isError: false,
+    });
     const tools = childItems.flatMap((i) => (i.kind === "tool" ? [`${i.phase}:${i.id}`] : []));
     assert.deepEqual(tools, [`started:${dispatchId}/t1`, `finished:${dispatchId}/t1`], "every projected started is paired");
   });
@@ -2461,6 +2469,262 @@ describe("CodexHarness: delegation dispatch binding + child frames (issue #1583 
       });
     }
     assert.ok(total <= 16 * 1024 * 1024 + 64 * 1024, `the turn total stays bounded (${total} bytes)`);
+  });
+
+  const MARKER = "[further subagent output not shown]";
+  const OMITTED = "[output not shown: subagent output cap reached]";
+  const jsonBytes = (i: unknown): number => Buffer.byteLength(JSON.stringify(i), "utf8");
+  const isMarker = (i: HarnessItem): boolean => i.kind === "text" && i.text === MARKER;
+
+  /** Run ONE turn (on an un-ended transport, so a later turn can follow) whose spawn_agent calls
+   *  `calls` each bind child `th-<call>` and run `body` on it synchronously, then settle. */
+  async function runDispatchTurn(
+    harness: CodexHarness,
+    transport: ReturnType<typeof makeHarness>["transport"],
+    calls: readonly string[],
+    opts: { first: boolean; end: boolean },
+  ): Promise<HarnessEvent[]> {
+    const before = transport.responses.length;
+    if (opts.first) transport.push(threadStarted());
+    calls.forEach((c, i) => transport.push(toolCall(before + i + 1, "spawn_agent", { subagent_type: "coder" }, "th-1", "tn-1", c)));
+    const eventsP = collect(harness.startTurn(makeRequest()).events);
+    await waitUntil(() => transport.responses.length === before + calls.length, "every parent reply");
+    transport.push(turnCompleted("completed"));
+    if (opts.end) transport.end();
+    return withTimeout(eventsP, 20000, "dispatch turn");
+  }
+
+  function dispatchBroker(harnessRef: () => CodexHarness, body: (h: CodexHarness, child: string) => void): CodexCallbackBroker {
+    return stubBroker(async (rt, name) => {
+      if (name !== "spawn_agent") return { ok: true, output: {} };
+      const h = harnessRef();
+      const child = `th-${rt.callId}`;
+      h.registerChildSink(child, { push: () => {} });
+      h.bindChildDispatch(child, rt, "coder");
+      body(h, child);
+      h.unregisterChildSink(child);
+      return { ok: true, output: { text: `done ${rt.callId}` } };
+    });
+  }
+
+  const childItemsOf = (events: HarnessEvent[], dispatchId: string): HarnessItem[] =>
+    frames(events)
+      .filter((f) => f.origin.kind === "subagent" && f.origin.instanceId === dispatchId)
+      .flatMap((f) => f.items);
+
+  it("a closing finished is COUNTED against the budgets; past them it closes its pair with the constant output (1999 starteds then 1999 16 KB finisheds)", async () => {
+    let harnessRef!: CodexHarness;
+    const n = 1999;
+    const out = "o".repeat(16_000);
+    const broker = dispatchBroker(
+      () => harnessRef,
+      (h, child) => {
+        h.emitChildFrame(child, Array.from({ length: n }, (_, i) => ({ kind: "tool" as const, phase: "started" as const, id: `t${i}`, name: "Bash", input: {} })));
+        h.emitChildFrame(
+          child,
+          Array.from({ length: n }, (_, i) => ({ kind: "tool" as const, phase: "finished" as const, id: `t${i}`, name: "Bash", output: out })),
+        );
+      },
+    );
+    const { harness, transport } = makeHarness({ broker, idNonce: "abcdef012345" });
+    harnessRef = harness;
+    const calls = ["c-1", "c-2", "c-3", "c-4"];
+    const events = await runDispatchTurn(harness, transport, calls, { first: true, end: true });
+
+    const SMALL = 256; // an upper bound on one started or one constant-output closer, in JSON bytes
+    let turnBytes = 0;
+    let turnCount = 0;
+    for (const c of calls) {
+      const dispatchId = `cx-abcdef012345-t1-${c}`;
+      const items = childItemsOf(events, dispatchId);
+      const real = items.filter((i) => !isMarker(i));
+      const bytes = real.reduce((b, i) => b + jsonBytes(i), 0);
+      turnBytes += bytes;
+      turnCount += real.length;
+      assert.equal(items.filter(isMarker).length, 1, `${c} is capped with exactly one marker`);
+      assert.ok(bytes <= 4 * 1024 * 1024 + real.length * SMALL, `${c} stays within its dispatch budget (${bytes} bytes)`);
+      const started = real.flatMap((i) => (i.kind === "tool" && i.phase === "started" ? [i.id] : []));
+      const finished = real.flatMap((i) => (i.kind === "tool" && i.phase === "finished" ? [i.id] : []));
+      assert.deepEqual(finished, started, `${c}: every projected started has exactly one finished, in order`);
+      const full = real.filter((i) => i.kind === "tool" && i.phase === "finished" && i.output !== OMITTED);
+      assert.ok(full.length < 300, `${c}: only the closers within budget carry their output (${full.length})`);
+      for (const i of real) if (i.kind === "tool" && i.phase === "finished" && i.output === OMITTED) assert.ok(jsonBytes(i) <= SMALL);
+      const completion = frames(events).flatMap((f) => f.items).find((i) => i.kind === "tool" && i.phase === "finished" && i.id === dispatchId);
+      assert.ok(completion?.kind === "tool" && completion.phase === "finished" && completion.isError === false, `${c} still completes`);
+    }
+    assert.ok(turnBytes <= 16 * 1024 * 1024 + turnCount * SMALL, `the turn stays within its budget (${turnBytes} bytes)`);
+    assert.ok(turnBytes < 4 * 1024 * 1024, `the 16 KB outputs of over-budget closers were not projected (${turnBytes} bytes)`);
+  });
+
+  it("caps projected child ITEMS per turn when every dispatch stays under its own item cap", async () => {
+    let harnessRef!: CodexHarness;
+    const perDispatch = 1500; // under the 2000 per-dispatch cap; 8 x 1500 = 12000 > the 10000 per-turn cap
+    const broker = dispatchBroker(
+      () => harnessRef,
+      (h, child) => {
+        h.emitChildFrame(child, Array.from({ length: perDispatch }, (_, i) => ({ kind: "text" as const, text: `p${i}` })));
+        h.emitChildFrame(child, [{ kind: "text", text: "tail" }]);
+      },
+    );
+    const { harness, transport } = makeHarness({ broker, idNonce: "abcdef012345" });
+    harnessRef = harness;
+    const calls = ["c-1", "c-2", "c-3", "c-4", "c-5", "c-6", "c-7", "c-8"];
+    const events = await runDispatchTurn(harness, transport, calls, { first: true, end: true });
+
+    let total = 0;
+    const markers: number[] = [];
+    for (const c of calls) {
+      const items = childItemsOf(events, `cx-abcdef012345-t1-${c}`);
+      total += items.filter((i) => !isMarker(i)).length;
+      markers.push(items.filter(isMarker).length);
+    }
+    assert.equal(total, 10_000, "exactly the per-turn item budget is projected");
+    assert.deepEqual(markers, [0, 0, 0, 0, 0, 0, 1, 1], "the dispatches past the turn item budget get one marker each");
+  });
+
+  it("the per-turn child budget resets in startTurn: turn 2 projects fully after a turn 1 near both turn budgets", async () => {
+    let harnessRef!: CodexHarness;
+    // 1999 x ~1.6 KB per dispatch: under the per-dispatch item and byte caps. Five dispatches reach
+    // 9995 items and ~16.2 MB, just under both per-turn budgets; one more dispatch would exceed both.
+    const text = "x".repeat(1600);
+    const broker = dispatchBroker(
+      () => harnessRef,
+      (h, child) => h.emitChildFrame(child, Array.from({ length: 1999 }, () => ({ kind: "text" as const, text }))),
+    );
+    const { harness, transport } = makeHarness({ broker, idNonce: "abcdef012345" });
+    harnessRef = harness;
+    const turn1Calls = ["c-1", "c-2", "c-3", "c-4", "c-5"];
+    const events1 = await runDispatchTurn(harness, transport, turn1Calls, { first: true, end: false });
+    const turn1 = turn1Calls.flatMap((c) => childItemsOf(events1, `cx-abcdef012345-t1-${c}`));
+    assert.equal(turn1.filter(isMarker).length, 0, "turn 1 stays under the turn budget");
+    assert.equal(turn1.length, 5 * 1999);
+
+    const events2 = await runDispatchTurn(harness, transport, ["c-6"], { first: false, end: true });
+    const turn2 = childItemsOf(events2, "cx-abcdef012345-t2-c-6");
+    assert.equal(turn2.filter(isMarker).length, 0, "turn 2 starts with a fresh turn budget");
+    assert.equal(turn2.length, 1999, "turn 2 projects fully");
+  });
+
+  it("closing a bound dispatch with child tools still open synthesizes their finisheds BEFORE the lead completion (also after the child sink unregistered)", async () => {
+    let harnessRef!: CodexHarness;
+    let bound = 0;
+    const broker = stubBroker(async (rt, name) => {
+      if (name !== "spawn_agent") return { ok: true, output: {} };
+      const h = harnessRef;
+      const child = `th-${rt.callId}`;
+      h.registerChildSink(child, { push: () => {} });
+      h.bindChildDispatch(child, rt, "coder");
+      h.emitChildFrame(child, [
+        { kind: "tool", phase: "started", id: "a", name: "Bash", input: {} },
+        { kind: "tool", phase: "started", id: "b", name: "Read", input: {} },
+        { kind: "tool", phase: "finished", id: "b", name: "Read", output: "ok" },
+        { kind: "tool", phase: "started", id: "a", name: "Bash", input: {} },
+      ]);
+      if (rt.callId === "c-2") h.unregisterChildSink(child);
+      bound += 1;
+      return new Promise<CallbackResult>(() => {});
+    });
+    const { harness, transport } = makeHarness({ broker, idNonce: "abcdef012345" });
+    harnessRef = harness;
+    transport
+      .push(threadStarted())
+      .push(toolCall(1, "spawn_agent", { subagent_type: "coder" }, "th-1", "tn-1", "c-1"))
+      .push(toolCall(2, "spawn_agent", { subagent_type: "coder" }, "th-1", "tn-1", "c-2"));
+    const turn = harness.startTurn(makeRequest());
+    const eventsP = collect(turn.events);
+    await waitUntil(() => bound === 2, "both dispatches bound");
+    turn.requestStop("cancel");
+    const events = await withTimeout(eventsP, 2000, "stopped turn");
+
+    for (const c of ["c-1", "c-2"]) {
+      const dispatchId = `cx-abcdef012345-t1-${c}`;
+      const items = childItemsOf(events, dispatchId);
+      const started = items.flatMap((i) => (i.kind === "tool" && i.phase === "started" ? [i.id] : []));
+      const finished = items.flatMap((i) => (i.kind === "tool" && i.phase === "finished" ? [i.id] : []));
+      assert.equal(started.length, 3);
+      assert.deepEqual([...finished].sort(), [...started].sort(), `${c}: every child started is finished`);
+      const synthesized = items.slice(-2);
+      assert.deepEqual(synthesized, [
+        { kind: "tool", phase: "finished", id: started[0], name: "Bash", output: "tool result not confirmed: delegation closed", isError: true },
+        { kind: "tool", phase: "finished", id: started[2], name: "Bash", output: "tool result not confirmed: delegation closed", isError: true },
+      ]);
+      const lastChildAt = events.findLastIndex((e) => e.kind === "frame" && e.origin.kind === "subagent" && e.origin.instanceId === dispatchId);
+      const completionAt = events.findIndex(
+        (e) => e.kind === "frame" && e.origin.kind === "main" && e.items.some((i) => i.kind === "tool" && i.phase === "finished" && i.id === dispatchId),
+      );
+      assert.ok(lastChildAt >= 0 && completionAt > lastChildAt, `${c}: the synthesized child finisheds precede the lead completion`);
+    }
+  });
+
+  it("a dispatch that SETTLES (child_timeout) with a child tool still open synthesizes its finished BEFORE the lead completion", async () => {
+    let harnessRef!: CodexHarness;
+    const broker = stubBroker(async (rt, name) => {
+      if (name !== "spawn_agent") return { ok: true, output: {} };
+      const h = harnessRef;
+      h.registerChildSink("th-c", { push: () => {} });
+      h.bindChildDispatch("th-c", rt, "coder");
+      // The child starts a tool and is wedged in it; the per-child deadline then settles the delegate.
+      h.emitChildFrame("th-c", [
+        { kind: "tool", phase: "started", id: "w", name: "Bash", input: { command: "sleep 1d" } },
+        { kind: "tool", phase: "started", id: "d", name: "Read", input: {} },
+        { kind: "tool", phase: "finished", id: "d", name: "Read", output: "ok" },
+      ]);
+      h.unregisterChildSink("th-c");
+      return { ok: false, code: "child_timeout", message: "child turn exceeded its deadline" };
+    });
+    const { harness, transport } = makeHarness({ broker, idNonce: "abcdef012345" });
+    harnessRef = harness;
+    const events = await runDispatchTurn(harness, transport, ["c-1"], { first: true, end: true });
+
+    const dispatchId = "cx-abcdef012345-t1-c-1";
+    const items = childItemsOf(events, dispatchId);
+    assert.deepEqual(items.at(-1), {
+      kind: "tool",
+      phase: "finished",
+      id: `${dispatchId}/w`,
+      name: "Bash",
+      output: "tool result not confirmed: delegation closed",
+      isError: true,
+    });
+    const started = items.flatMap((i) => (i.kind === "tool" && i.phase === "started" ? [i.id] : []));
+    const finished = items.flatMap((i) => (i.kind === "tool" && i.phase === "finished" ? [i.id] : []));
+    assert.deepEqual([...finished].sort(), [...started].sort(), "no child tool is left running");
+    const lastChildAt = events.findLastIndex((e) => e.kind === "frame" && e.origin.kind === "subagent");
+    const completionAt = events.findIndex(
+      (e) => e.kind === "frame" && e.origin.kind === "main" && e.items.some((i) => i.kind === "tool" && i.phase === "finished" && i.id === dispatchId),
+    );
+    assert.ok(lastChildAt >= 0 && completionAt > lastChildAt, "the synthesized child finished precedes the lead completion");
+    const completionFrame = events[completionAt];
+    const completion = completionFrame?.kind === "frame" ? completionFrame.items[0] : undefined;
+    assert.ok(completion?.kind === "tool" && completion.phase === "finished" && completion.isError === true, "the lead completion reports the timeout");
+  });
+
+  it("two child starteds sharing a raw call id each get their own finished, first finished closing the first started", async () => {
+    let harnessRef!: CodexHarness;
+    const broker = dispatchBroker(
+      () => harnessRef,
+      (h, child) => {
+        h.emitChildFrame(child, [
+          { kind: "tool", phase: "started", id: "dup", name: "Bash", input: { n: 1 } },
+          { kind: "tool", phase: "started", id: "dup", name: "Bash", input: { n: 2 } },
+        ]);
+        h.emitChildFrame(child, [
+          { kind: "tool", phase: "finished", id: "dup", name: "Bash", output: "first" },
+          { kind: "tool", phase: "finished", id: "dup", name: "Bash", output: "second" },
+          { kind: "tool", phase: "finished", id: "dup", name: "Bash", output: "third: nothing open" },
+        ]);
+      },
+    );
+    const { harness, transport } = makeHarness({ broker, idNonce: "abcdef012345" });
+    harnessRef = harness;
+    const events = await runDispatchTurn(harness, transport, ["c-1"], { first: true, end: true });
+    const items = childItemsOf(events, "cx-abcdef012345-t1-c-1");
+    assert.equal(items.length, 4);
+    const [s1, s2, f1, f2] = items as [HarnessItem, HarnessItem, HarnessItem, HarnessItem];
+    assert.ok(s1.kind === "tool" && s2.kind === "tool" && f1.kind === "tool" && f2.kind === "tool");
+    assert.notEqual(s1.id, s2.id, "distinct projected ids");
+    assert.deepEqual([f1.id, f1.phase === "finished" ? f1.output : undefined], [s1.id, "first"]);
+    assert.deepEqual([f2.id, f2.phase === "finished" ? f2.output : undefined], [s2.id, "second"]);
   });
 });
 
