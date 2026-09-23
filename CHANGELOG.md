@@ -22,23 +22,14 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+## [0.84.0] - 2026-09-20
+
 ### Added
 
 - **Claude and Codex now keep separate worker-model defaults, saved together from one grouped card ([#1551](https://github.com/vtmocanu/uzi/issues/1551)).**
   Settings → Run defaults replaces the old single-model card with one "Harness and worker models" card holding a retained lane per usable harness, so switching your default harness no longer clears the other one's saved model; the Codex lane also gains the same "Other (custom model ID)" escape hatch Claude has always had, scoped to your worker root and gated behind a `codex_custom_model_v1` worker capability so an old hosted worker never silently substitutes `gpt-6-astra`.
 - **Codex task review now runs on a built-in `gpt-6-sol` model, independent of your saved defaults ([#1551](https://github.com/vtmocanu/uzi/issues/1551)).**
   Task review no longer reads your worker-model settings on either harness; there's no setting to change it in this release, and the ordinary Codex run fallback and shared provider default stay `gpt-6-astra`.
-
-### Fixed
-
-- **Run, user, and factory usage totals were overstated for multi-turn Claude runs on v0.84.0-rc.8 workers, and are now folded correctly ([#1562](https://github.com/vtmocanu/uzi/issues/1562)).**
-  From Claude Agent SDK 0.3.277 a resumed leg reports the session's running total instead of just that leg, and the old per-leg SUM (ADR-1079) counted it several times over; the worker now marks which reading a frame carries and the server folds it by a per-session high-water mark, but a run already recorded on rc.8 stays overstated (not re-derived; see ADR-1562).
-- **Cancelled, usage-limited, and message-transport-failed Codex runs no longer leak an open `source_only` custody hold ([#1539](https://github.com/vtmocanu/uzi/issues/1539)).**
-  Three more failure paths reported the terminal state before reaping the Codex provider, so the API refused the reap's credential reconcile (409) and the hold stayed open, showing a false "Held work needs your attention": a cancellation during transient recovery, a usage-limit hit that fails (opt-out, or a park the server declines), and a permanent message-delivery failure. Each path now reaps while the run is still actively claimed, then reports its honest terminal outcome, then settles custody: provably empty work releases, committed work is captured or stays protected, and a blocked reap still retains the hold. The message-failure path keeps its durable journal-before-abort ordering and still reports exactly one `failed`.
-
-## [0.84.0] - 2026-09-20
-
-### Added
 
 - **Codex is now a selectable agent runtime across every run origin ([#1449](https://github.com/vtmocanu/uzi/pull/1449)).**
   The Codex harness, previously dark, is publicly activated in one atomic step: the API, web, CLI/TUI, schedules, and chat can all point a run at Codex instead of the default runtime, and per-run cost status is presented conservatively. Completes M5B of the Codex worker phase-1 work ([#1106](https://github.com/vtmocanu/uzi/issues/1106)).
@@ -58,6 +49,11 @@ through `[0.52.0]`.)
   The pinned Codex runtime moves from 0.153.2 to 0.156.1 and `gpt-6-sol` joins the Codex model picker in the web UI, API and agent, priced from OpenAI's published Standard rates; every existing guardrail check was re-verified against the new runtime, and the native-tool bypass suite now also runs on `gpt-6-sol`.
 
 ### Fixed
+
+- **Run, user, and factory usage totals were overstated for multi-turn Claude runs on v0.84.0-rc.8 workers, and are now folded correctly ([#1562](https://github.com/vtmocanu/uzi/issues/1562)).**
+  From Claude Agent SDK 0.3.277 a resumed leg reports the session's running total instead of just that leg, and the old per-leg SUM (ADR-1079) counted it several times over; the worker now marks which reading a frame carries, and the server folds it by a per-session high-water mark; a run already recorded on rc.8 stays overstated (not re-derived; see ADR-1562).
+- **Cancelled, usage-limited, and message-transport-failed Codex runs no longer leak an open `source_only` custody hold ([#1539](https://github.com/vtmocanu/uzi/issues/1539)).**
+  Three more failure paths reported the terminal state before reaping the Codex provider, so the API refused the reap's credential reconcile (409) and the hold stayed open, showing a false "Held work needs your attention": a cancellation during transient recovery, a usage-limit hit that fails (opt-out, or a park the server declines), and a permanent message-delivery failure. Each path now reaps while the run is still actively claimed, then reports its honest terminal outcome, then settles custody: provably empty work releases, committed work is captured or stays protected, and a blocked reap still retains the hold. The message-failure path keeps its durable journal-before-abort ordering and still reports exactly one `failed`.
 
 - **Undispatched task and handoff runs no longer sit queued forever ([#1477](https://github.com/vtmocanu/uzi/pull/1477)).**
   A handoff run that was never dispatched now expires after its setup deadline and drops out of claimable work, instead of showing "waiting for a worker" indefinitely even with a healthy idle worker present.
@@ -91,6 +87,9 @@ through `[0.52.0]`.)
   The forge-view pulls screen trusted GitLab's `approved` flag, which is vacuously `true` on Enterprise Edition (gitlab.com and the default self-managed build) when a project has no approval rules, so clean merge requests were reported as approved without a review; the driver now requires at least one real approver, matching the GitHub/Forgejo behavior and the `approved` review-decision contract.
 
 ### Changed
+
+- **The worker toolchain uses a refreshed nixpkgs pin ([#1530](https://github.com/vtmocanu/uzi/pull/1530)).**
+  The worker's Devbox lock now includes Chromium 153.0.8010.52 and Helm 4.3.0; the scheduled base-image build validated the updated toolchain.
 
 - **Go toolchain and dependency bumps ([#1485](https://github.com/vtmocanu/uzi/pull/1485), [#1467](https://github.com/vtmocanu/uzi/pull/1467), [#1435](https://github.com/vtmocanu/uzi/pull/1435)).**
   Go toolchain 1.27 with golangci-lint v2.13.2 and govulncheck v1.8.0, the go-toolchain and golangci-lint Renovate bumps now grouped with a hardened lint wrapper, and the golang base-image digest refreshed.
