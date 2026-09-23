@@ -1200,7 +1200,14 @@ export class CodexHarness implements RunHarness {
    *  two that sanitise identically) gets a `-n<counter>` suffix until it is unique. */
   private issueProjectionId(ordinal: number, callId: string): string {
     this.projectionCounter += 1;
-    const base = projectedId(this.idNonce, ordinal, callId, this.projectionCounter, this.scrubProjected);
+    let base: string;
+    try {
+      base = projectedId(this.idNonce, ordinal, callId, this.projectionCounter, this.scrubProjected);
+    } catch {
+      // A throwing scrub must not drop the projection: fall back to the counter id, which
+      // carries no provider-supplied text at all.
+      base = projectedId(this.idNonce, ordinal, "", this.projectionCounter);
+    }
     let id = base;
     while (this.issuedProjectionIds.has(id)) {
       this.projectionCounter += 1;
