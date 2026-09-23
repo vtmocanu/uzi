@@ -1017,6 +1017,49 @@ describe("Run defaults — harness and worker models card (PRD #1551 M3)", () =>
     expect(screen.queryByLabelText("Default harness")).toBeNull();
   });
 
+  // Stale-pin edge cases (PRD #1551 M3 review): a stored default_harness that is no
+  // longer usable. The server's D11 resolver (harness_resolver.go, rung 2) SKIPS an
+  // unusable stored default and falls through to availability, so the badge must follow
+  // the same resolution — not short-circuit on the raw stored pin, which would light no
+  // lane at all when the pin is unusable and the selector is hidden.
+  it("stale Claude pin, only Codex usable: badge is on the sole visible (Codex) lane", async () => {
+    mockAuth(baseUser);
+    // Only Codex usable, but the stored default is a now-stale "claude".
+    mockApi.listSecrets.mockResolvedValue({ secrets: [codexKey] });
+    mockApi.getMySettings.mockResolvedValue(settings({ default_harness: "claude" }));
+    render(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+    // Positive control: the Codex lane renders and the selector is hidden.
+    expect(await screen.findByLabelText("Codex model")).toBeTruthy();
+    expect(screen.queryByLabelText("Default harness")).toBeNull();
+    // The badge follows the effective harness (Codex, the sole usable one) onto the only
+    // visible lane. Fails before the fix — the raw "claude" pin short-circuits the
+    // resolver, so NO lane gets the badge.
+    expect(within(laneOf("Codex")).getByText("Default harness")).toBeTruthy();
+  });
+
+  it("stale Codex pin, only Claude usable: badge is on the sole visible (Claude) lane", async () => {
+    mockAuth(baseUser);
+    // Only Claude usable, but the stored default is a now-stale "codex".
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken] });
+    mockApi.getMySettings.mockResolvedValue(settings({ default_harness: "codex" }));
+    render(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+    // Positive control: the Claude lane renders and the selector is hidden.
+    expect(await screen.findByLabelText("Claude model")).toBeTruthy();
+    expect(screen.queryByLabelText("Default harness")).toBeNull();
+    // The badge follows the effective harness (Claude, the sole usable one) onto the
+    // only visible lane. Fails before the fix — the raw "codex" pin short-circuits the
+    // resolver, so NO lane gets the badge.
+    expect(within(laneOf("Anthropic")).getByText("Default harness")).toBeTruthy();
+  });
+
   it("zero credentials: preserves the Claude lane so a model can be preconfigured, with no selector", async () => {
     mockAuth(baseUser);
     mockApi.listSecrets.mockResolvedValue({ secrets: [] });

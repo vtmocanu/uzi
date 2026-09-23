@@ -385,11 +385,25 @@ export function RunDefaults() {
   const bothLanes = showClaudeLane && showCodexLane;
 
   // The active-lane badge follows the EFFECTIVE harness (D11), the same resolver the
-  // rest of the web mirrors: an explicit pick wins; "inherit" resolves to the sole
-  // usable harness, or Claude when both are usable. So a Codex-only user (no selector)
-  // still sees the badge on their one lane, and a both-usable user sees it move as the
-  // selector changes.
-  const effectiveIsCodex = effectiveHarnessIsCodex(defaultHarness, claudeUsable, codexUsable);
+  // rest of the web mirrors: "inherit" resolves to a USABLE stored default, else the
+  // sole usable harness, else Claude. So a Codex-only user (no selector) still sees the
+  // badge on their one lane, and a both-usable user sees it move as the selector changes.
+  //
+  // The stored default_harness is passed as resolveHarness's rung-2 DEFAULT, NOT as the
+  // rung-1 explicit selection — mirroring harness_resolver.go, which SKIPS an unusable
+  // stored default rather than short-circuiting on it. Passing it as `selection` would
+  // make effectiveHarnessIsCodex short-circuit unconditionally, so a stale "claude" pin
+  // with only Codex usable (or a stale "codex" pin with only Claude usable) would light
+  // NO lane's badge; feeding it as the rung-2 default lets availability win when the pin
+  // is unusable, exactly as the server resolves it. A user's LIVE selector change still
+  // moves the badge immediately when both are usable, since the pick is then a usable
+  // default.
+  const effectiveIsCodex = effectiveHarnessIsCodex(
+    "inherit",
+    claudeUsable,
+    codexUsable,
+    defaultHarness === "inherit" ? null : defaultHarness,
+  );
   const badgeOnClaude = showClaudeLane && !effectiveIsCodex;
   const badgeOnCodex = showCodexLane && effectiveIsCodex;
 

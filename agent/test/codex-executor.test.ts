@@ -1809,6 +1809,46 @@ describe("CodexExecutor: one claim-leg accountant survives provider-epoch recrea
       "SUM across the two init-delimited lineage rows preserves the full 150-token run total",
     );
   });
+
+  it("(#1551) a RESUMED run still threads the custom worker-default root model, never gpt-6-astra", async () => {
+    // The executor-level #1551 fresh-start test above only exercises buildRunRequest with
+    // resumeId === undefined. This pins the RESUME leg: a cross-worker resume
+    // (ctx.sessionId set) whose claim carries a custom `default_model` must thread that id
+    // into the resumed turn's request.model exactly as a fresh start does — buildRunRequest
+    // derives request.model from `ctx.config?.default_model ?? provider.model` on EVERY
+    // phase, resume included. Discriminating: a mutation that drops the model only on resume
+    // (`model: resumeId !== undefined ? undefined : …`) leaves the fresh-start test green but
+    // reddens this one, because request.model then falls back to the provider default and both
+    // the init event and the per-model usage key become "gpt-6-astra".
+    const rig = makeMultiEpochRig([
+      resumedEpochResponder("th-1", "tn-2", (t, th, tn) => {
+        // A resumed claim replays the restored cumulative first (a no-op baseline), then a
+        // genuinely-newer note charges the delta — so a per-model usage entry exists to key on.
+        t.push(tokenUsageUpdated(th, tn, { inputTokens: 100, totalTokens: 100 }, { inputTokens: 100, totalTokens: 100 }))
+          .push(tokenUsageUpdated(th, tn, { inputTokens: 150, totalTokens: 150 }, { inputTokens: 50, totalTokens: 50 }))
+          .push(toolCall(1, "signal_done", {}, th, tn, "c-done"))
+          .push(turnCompleted("completed", th, tn));
+      }),
+    ]);
+    const { ctx, emitted } = makeCtx({ sessionId: "th-1", config: { default_model: "gpt-7-custom-preview" } });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "resumed custom-model run");
+
+    const initEvents = emitted.filter((m) => m.kind === "status" && rec(m.payload).event === "init");
+    assert.equal(initEvents.length, 1, "one init event for the resumed executor claim");
+    assert.equal(
+      rec(initEvents[0]!.payload).model,
+      "gpt-7-custom-preview",
+      "the resumed turn's init reports the custom worker-default model, never the provider fallback",
+    );
+
+    const modelUsage = lastResultModelUsage(emitted);
+    assert.ok(modelUsage, "the resumed terminal carries per-model usage");
+    assert.deepEqual(
+      Object.keys(modelUsage),
+      ["gpt-7-custom-preview"],
+      "the resumed run charges usage to the custom model, never gpt-6-astra",
+    );
+  });
 });
 
 function initMessageCount(emitted: EmittedMessage[]): number {
