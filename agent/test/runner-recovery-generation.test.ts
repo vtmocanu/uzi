@@ -37,6 +37,7 @@ import {
   api,
   deferred,
   fakeGitlab,
+  git,
   gitlabClaim,
   installHarness,
   runnerWith,
@@ -792,6 +793,156 @@ describe("RunRunner — credentialed settle reaps the Codex provider FIRST (PRD 
   });
 });
 
+// PRD #1349 M2 (D4.5) / #1531 & #1539 — shared Codex-reap fixtures. Lifted to file scope so the
+// #1539 recovery-cancellation describe below reuses the SAME real Codex boundary + event log.
+const SUBSCRIPTION = {
+  auth_mode: "subscription",
+  access_token: "claim-tok-XXXXXXXX",
+  capability: "run-cap-XXXXXXXX",
+  generation: 3,
+  chatgpt_account_id: "verified-account",
+  chatgpt_plan_type: null,
+};
+const RELEASE_TOK = "codex-release-tok-XXXXXXXX";
+const REFRESH_TOK = "codex-refresh-tok-XXXXXXXX";
+
+function bindingOf(block: Record<string, unknown>): CodexBinding {
+  const sel = selectCodexBinding({ codex: block });
+  if (sel.kind !== "codex") throw new Error("expected a codex selection");
+  return sel.binding;
+}
+
+/** A registry-ownable provider root whose reap/dispose are idempotent no-ops. */
+function trackedRoot(): RegisteredRoot {
+  return {
+    kind: "provider",
+    reap: async () => ({ ok: true }),
+    dispose: async () => {},
+  };
+}
+
+function registerRoot(reg: ExecutionRegistry, root: RegisteredRoot): void {
+  const reserved = reg.reserveLaunch(root.kind);
+  if (reserved.kind === "reserved") reg.registerRoot(reserved.reservation, root);
+}
+
+/** A REAL Codex safety (via createCodexExecutionSafety over a real registry + a tracked provider
+ *  root + the real run-lane reconcile) whose per-sink reconcile pushes "reconcile" on each call,
+ *  then throws when `decideThrow()` says so — modelling either the api's 409 once a terminal
+ *  state has been recorded, or a genuinely contended reconcile even while active. */
+function codexReapSafety(events: string[], decideThrow: () => boolean): CodexExecutionSafety {
+  const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
+  registerRoot(registry, trackedRoot());
+  const binding = bindingOf(SUBSCRIPTION);
+  const reconcileClient = {
+    releaseCodex: async () => {
+      events.push("reconcile");
+      if (decideThrow()) throw new Error("codex reconcile refused (409): run is terminal");
+      return { access_token: RELEASE_TOK };
+    },
+    refreshCodex: async () => {
+      events.push("reconcile");
+      if (decideThrow()) throw new Error("codex reconcile refused (409): run is terminal");
+      return { access_token: REFRESH_TOK, generation: 7, outcome: "advanced" };
+    },
+  };
+  const reconcile = buildRunLaneReconcile("run-1531-codex", reconcileClient as never, binding, () => {});
+  return createCodexExecutionSafety(
+    registry,
+    async () => {
+      throw new Error("boundary-action spawn is not used by the reap-only path");
+    },
+    reconcile,
+    undefined,
+    async (request) => {
+      const [command, ...args] = request.argv;
+      if (!command) throw new Error("empty test process argv");
+      const child = spawn(command, args, { cwd: request.cwd, env: request.env, stdio: ["pipe", "pipe", "pipe"] });
+      const terminal = new Promise<{ code: number }>((resolve, reject) => {
+        child.once("error", reject);
+        child.once("exit", (code, signal) => resolve({ code: code ?? (signal ? 128 : 1) }));
+      });
+      return {
+        root: {
+          kind: "boundary_action",
+          reap: async () => { await terminal; return { ok: true }; },
+          dispose: async () => { if (child.exitCode === null) child.kill("SIGKILL"); await terminal.catch(() => undefined); },
+        },
+        stdin: child.stdin,
+        stdout: child.stdout,
+        stderr: child.stderr,
+        waitChild: async () => terminal,
+      };
+    },
+  );
+}
+
+/** The injected recovery client that additionally records "reserve"/"release" into the SHARED
+ *  ordered event log, so the settle's disposition is ordered relative to reconcile/failed. */
+class EventRecoveryClient extends FakeRecoveryClient {
+  constructor(private readonly events: string[]) {
+    super();
+  }
+  override async reserveRecoveryCapture(
+    runId: string,
+    req: RecoveryReserveRequest,
+  ): Promise<RecoveryReserveResponse> {
+    this.events.push("reserve");
+    return super.reserveRecoveryCapture(runId, req);
+  }
+  override async releaseRecoveryCustody(
+    runId: string,
+    generation?: number,
+    releaseEvidence?: string,
+  ): Promise<RecoveryReleaseResponse> {
+    this.events.push("release");
+    return super.releaseRecoveryCustody(runId, generation, releaseEvidence);
+  }
+}
+
+interface CodexReapFixture {
+  coord: RecoveryCoordinator;
+  client: EventRecoveryClient;
+  git: FakeRecoveryGit;
+  safety: CodexExecutionSafety;
+  root: string;
+}
+
+function fixture(events: string[], decideThrow: () => boolean): CodexReapFixture {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-1531-codex-"));
+  const client = new EventRecoveryClient(events);
+  const git = new FakeRecoveryGit();
+  const coord = new RecoveryCoordinator({
+    client,
+    git,
+    log: nullLogger(),
+    recoveryRoot: root,
+    workerToken: "m2-worker-join-token-0123456789",
+    now: () => 1_700_000_000_000,
+  });
+  const safety = codexReapSafety(events, decideThrow);
+  return { coord, client, git, safety, root };
+}
+
+/** A Codex-shaped executor: carries `.safety`, NO killAgentTree, (optionally) commits, then
+ *  throws a generic error — the first-turn Codex failure that reaches reportGenericFailure. */
+function codexFailFactory(homeRoot: string, safety: CodexExecutionSafety, commit: boolean): ExecutorFactory {
+  return (runId) => {
+    const runHome = path.join(homeRoot, runId);
+    return {
+      homeDir: runHome,
+      executor: {
+        safety,
+        run: async (ctx: RunContext): Promise<ExecutorResult> => {
+          fs.mkdirSync(runHome, { recursive: true });
+          if (commit) commitInTree(ctx.worktreePath, "WORK.txt", "committed before the codex failure\n");
+          throw new Error("codex agent failed hard");
+        },
+      },
+    };
+  };
+}
+
 // PRD #1349 M2 (D4.5) / #1531 — a FIRST-TURN Codex failure via reportGenericFailure must reap the
 // Codex provider WHILE the run is still actively-claimed (BEFORE the terminal `failed` report),
 // then run the non-status-gated custody settle AFTER the report. The Codex per-sink credential
@@ -805,154 +956,6 @@ describe("RunRunner — credentialed settle reaps the Codex provider FIRST (PRD 
 // `reconcile < failed < settle`. The mutation control: move the reap back AFTER the failed report
 // and the 409-shaped reconcile blocks it → no release/no capture (cases 1 & 2 redden).
 describe("RunRunner — first-turn Codex failure reaps BEFORE the terminal report (PRD #1349 M2 D4.5 / #1531)", () => {
-  const SUBSCRIPTION = {
-    auth_mode: "subscription",
-    access_token: "claim-tok-XXXXXXXX",
-    capability: "run-cap-XXXXXXXX",
-    generation: 3,
-    chatgpt_account_id: "verified-account",
-    chatgpt_plan_type: null,
-  };
-  const RELEASE_TOK = "codex-release-tok-XXXXXXXX";
-  const REFRESH_TOK = "codex-refresh-tok-XXXXXXXX";
-
-  function bindingOf(block: Record<string, unknown>): CodexBinding {
-    const sel = selectCodexBinding({ codex: block });
-    if (sel.kind !== "codex") throw new Error("expected a codex selection");
-    return sel.binding;
-  }
-
-  /** A registry-ownable provider root whose reap/dispose are idempotent no-ops. */
-  function trackedRoot(): RegisteredRoot {
-    return {
-      kind: "provider",
-      reap: async () => ({ ok: true }),
-      dispose: async () => {},
-    };
-  }
-
-  function registerRoot(reg: ExecutionRegistry, root: RegisteredRoot): void {
-    const reserved = reg.reserveLaunch(root.kind);
-    if (reserved.kind === "reserved") reg.registerRoot(reserved.reservation, root);
-  }
-
-  /** A REAL Codex safety (via createCodexExecutionSafety over a real registry + a tracked provider
-   *  root + the real run-lane reconcile) whose per-sink reconcile pushes "reconcile" on each call,
-   *  then throws when `decideThrow()` says so — modelling either the api's 409 once a terminal
-   *  state has been recorded, or a genuinely contended reconcile even while active. */
-  function codexReapSafety(events: string[], decideThrow: () => boolean): CodexExecutionSafety {
-    const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
-    registerRoot(registry, trackedRoot());
-    const binding = bindingOf(SUBSCRIPTION);
-    const reconcileClient = {
-      releaseCodex: async () => {
-        events.push("reconcile");
-        if (decideThrow()) throw new Error("codex reconcile refused (409): run is terminal");
-        return { access_token: RELEASE_TOK };
-      },
-      refreshCodex: async () => {
-        events.push("reconcile");
-        if (decideThrow()) throw new Error("codex reconcile refused (409): run is terminal");
-        return { access_token: REFRESH_TOK, generation: 7, outcome: "advanced" };
-      },
-    };
-    const reconcile = buildRunLaneReconcile("run-1531-codex", reconcileClient as never, binding, () => {});
-    return createCodexExecutionSafety(
-      registry,
-      async () => {
-        throw new Error("boundary-action spawn is not used by the reap-only path");
-      },
-      reconcile,
-      undefined,
-      async (request) => {
-        const [command, ...args] = request.argv;
-        if (!command) throw new Error("empty test process argv");
-        const child = spawn(command, args, { cwd: request.cwd, env: request.env, stdio: ["pipe", "pipe", "pipe"] });
-        const terminal = new Promise<{ code: number }>((resolve, reject) => {
-          child.once("error", reject);
-          child.once("exit", (code, signal) => resolve({ code: code ?? (signal ? 128 : 1) }));
-        });
-        return {
-          root: {
-            kind: "boundary_action",
-            reap: async () => { await terminal; return { ok: true }; },
-            dispose: async () => { if (child.exitCode === null) child.kill("SIGKILL"); await terminal.catch(() => undefined); },
-          },
-          stdin: child.stdin,
-          stdout: child.stdout,
-          stderr: child.stderr,
-          waitChild: async () => terminal,
-        };
-      },
-    );
-  }
-
-  /** The injected recovery client that additionally records "reserve"/"release" into the SHARED
-   *  ordered event log, so the settle's disposition is ordered relative to reconcile/failed. */
-  class EventRecoveryClient extends FakeRecoveryClient {
-    constructor(private readonly events: string[]) {
-      super();
-    }
-    override async reserveRecoveryCapture(
-      runId: string,
-      req: RecoveryReserveRequest,
-    ): Promise<RecoveryReserveResponse> {
-      this.events.push("reserve");
-      return super.reserveRecoveryCapture(runId, req);
-    }
-    override async releaseRecoveryCustody(
-      runId: string,
-      generation?: number,
-      releaseEvidence?: string,
-    ): Promise<RecoveryReleaseResponse> {
-      this.events.push("release");
-      return super.releaseRecoveryCustody(runId, generation, releaseEvidence);
-    }
-  }
-
-  interface CodexReapFixture {
-    coord: RecoveryCoordinator;
-    client: EventRecoveryClient;
-    git: FakeRecoveryGit;
-    safety: CodexExecutionSafety;
-    root: string;
-  }
-
-  function fixture(events: string[], decideThrow: () => boolean): CodexReapFixture {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-1531-codex-"));
-    const client = new EventRecoveryClient(events);
-    const git = new FakeRecoveryGit();
-    const coord = new RecoveryCoordinator({
-      client,
-      git,
-      log: nullLogger(),
-      recoveryRoot: root,
-      workerToken: "m2-worker-join-token-0123456789",
-      now: () => 1_700_000_000_000,
-    });
-    const safety = codexReapSafety(events, decideThrow);
-    return { coord, client, git, safety, root };
-  }
-
-  /** A Codex-shaped executor: carries `.safety`, NO killAgentTree, (optionally) commits, then
-   *  throws a generic error — the first-turn Codex failure that reaches reportGenericFailure. */
-  function codexFailFactory(homeRoot: string, safety: CodexExecutionSafety, commit: boolean): ExecutorFactory {
-    return (runId) => {
-      const runHome = path.join(homeRoot, runId);
-      return {
-        homeDir: runHome,
-        executor: {
-          safety,
-          run: async (ctx: RunContext): Promise<ExecutorResult> => {
-            fs.mkdirSync(runHome, { recursive: true });
-            if (commit) commitInTree(ctx.worktreePath, "WORK.txt", "committed before the codex failure\n");
-            throw new Error("codex agent failed hard");
-          },
-        },
-      };
-    };
-  }
-
   it("clean tree: reap (reconcile) runs BEFORE the failed report, then the exact-generation release settles after it", async () => {
     const { gitlab } = fakeGitlab();
     const events: string[] = [];
@@ -1052,6 +1055,207 @@ describe("RunRunner — first-turn Codex failure reaps BEFORE the terminal repor
       assert.ok(
         hasStatus(claim.run_id, "failed"),
         "the terminal failure is still reported (the hold is left open, not the report)",
+      );
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+// PRD #1349 M2 (D4.5) / #1539 — a recovery CANCELLATION (a steering-cancel that terminates
+// handleRecoveryExhausted's hold loop) must reap the Codex provider WHILE the run is still
+// actively-claimed (BEFORE the terminal `failed`/cancelled report), then run the non-status-gated
+// custody settle AFTER the report. Same 409 hazard as #1531's reportGenericFailure site: the Codex
+// per-sink reconcile inside withBoundary is authorized ONLY while actively-claimed; once the report
+// makes the run terminal it is refused, and a settle-then-report ordering would block the reap and
+// leak the exact-generation `source_only` hold. This reuses the SAME real Codex boundary + ordered
+// event log as #1531, drives the executor to a TransientRecoveryError (so handleRecoveryExhausted
+// owns it), fails recovery capture BEFORE its publish boundary (so capture runs no reconcile and the
+// loop keeps looping until the cancel lands), and asserts the split order `reconcile < failed <
+// settle`. MUTATION control: restore the old `reapThenSettleRecoveryGeneration` AFTER the report and
+// drop the pre-report reap → the 409-shaped reconcile blocks it → cases (a)/(b) redden.
+describe("RunRunner — recovery cancellation reaps BEFORE the terminal report (PRD #1349 M2 D4.5 / #1539)", () => {
+  /** A Codex-shaped executor (carries `.safety`, NO killAgentTree) that (optionally) commits, then
+   *  throws a TransientRecoveryError — the recovery-hold entry that handleRecoveryExhausted owns. */
+  function codexTransientFactory(homeRoot: string, safety: CodexExecutionSafety, commit: boolean): ExecutorFactory {
+    return (runId) => {
+      const runHome = path.join(homeRoot, runId);
+      return {
+        homeDir: runHome,
+        executor: {
+          safety,
+          run: async (ctx: RunContext): Promise<ExecutorResult> => {
+            fs.mkdirSync(runHome, { recursive: true });
+            if (commit) commitInTree(ctx.worktreePath, "WORK.txt", "committed before the codex cancel\n");
+            throw new TransientRecoveryError();
+          },
+        },
+      };
+    };
+  }
+
+  /** Fail recovery capture at the fetch-back seam (BEFORE captureRecoveryRestorePoint's publish
+   *  boundary, so it never runs a reconcile), keeping the hold loop looping until the cancel lands.
+   *  The settle transfer AFTER the failed report needs the SAME real-git seam to SUCCEED, so it is
+   *  re-allowed the instant the terminal report lands (flipped inside the combined onState hook).
+   *  Returns a { flip } setter the hook calls and a `captureFailed` deferred that resolves once the
+   *  loop has reached (and failed) a capture — the cue to inject the cancel. */
+  function failCaptureUntilReport(): { armAllow: () => void; captureFailed: ReturnType<typeof deferred> } {
+    let allowFetch = false;
+    const realFetch = git.fetchAgentBranch.bind(git);
+    const captureFailed = deferred();
+    git.fetchAgentBranch = async (...args: Parameters<typeof realFetch>) => {
+      if (allowFetch) return realFetch(...args);
+      captureFailed.resolve();
+      throw new Error("injected recovery-capture fetch failure (before publish)");
+    };
+    return { armAllow: () => { allowFetch = true; }, captureFailed };
+  }
+
+  /** CAVEAT 1: api.onState keeps ONE hook per run. This single combined hook records `failed` into
+   *  the ordered event log, re-allows the settle fetch, and maps failed→cancelled (Service.SetState:
+   *  the cancel input only stamps stop_kind; the worker's failed report performs CancelRunByWorker). */
+  function armCancelMapping(runId: string, events: string[], armAllow: () => void): void {
+    api.onState(runId, (body) => {
+      if (body.status === "failed") {
+        events.push("failed");
+        armAllow();
+      }
+      const mapped = body.status === "failed" ? "cancelled" : body.status;
+      api.setOwnershipStatus(runId, mapped);
+      api.overrideStateStatus(runId, mapped);
+    });
+  }
+
+  it("clean tree: reap (reconcile) runs BEFORE the cancel report, then the exact-generation release settles after it", async () => {
+    const { gitlab } = fakeGitlab();
+    const events: string[] = [];
+    const claim = gitlabClaim(4711, { claim_generation: 31 });
+    // The 409 model: the reconcile throws ONCE a terminal failed state has been recorded for the run.
+    const decideThrow = (): boolean =>
+      api.states.some((s) => s.runId === claim.run_id && s.body.status === "failed");
+    const { coord, client, git: fakeGit, safety, root } = fixture(events, decideThrow);
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-1539-clean-home-"));
+    try {
+      fakeGit.alreadyPublished = true; // provably empty → RELEASE the exact hold
+      const { armAllow, captureFailed } = failCaptureUntilReport();
+      armCancelMapping(claim.run_id, events, armAllow);
+      const runner = runnerWith(codexTransientFactory(homeRoot, safety, false), gitlab, undefined, nullLogger(), {
+        recovery: coord,
+        recoveryRetryMs: 5,
+      });
+      const execution = runner.execute(claim);
+      await Promise.race([
+        captureFailed.promise,
+        execution.then(() => { throw new Error("execution exited before reaching the cancel branch"); }),
+      ]);
+      api.setInputs(claim.run_id, [{ id: 1, kind: "cancel" }]);
+      await execution;
+
+      assert.ok(
+        api.states.some((s) => s.body.status === "failed" && s.body.failure_reason === "run cancelled"),
+        "the cancel is reported as a terminal failed(run cancelled)",
+      );
+      // The reap's per-sink reconcile ran while still actively-claimed — BEFORE the report — so it
+      // was authorized (no 409); the settle then released AFTER the report.
+      assert.ok(events.indexOf("reconcile") >= 0, "the reap boundary ran the per-sink reconcile");
+      assert.equal(
+        events.filter((e) => e === "reconcile").length,
+        1,
+        `capture must NOT reach its publish boundary (which would add a reconcile); got ${JSON.stringify(events)}`,
+      );
+      assert.ok(
+        events.lastIndexOf("reconcile") < events.indexOf("failed"),
+        `every reap reconcile must precede the failed report; got ${JSON.stringify(events)}`,
+      );
+      assert.ok(
+        events.indexOf("failed") < events.indexOf("release"),
+        `the settle release must run after the failed report; got ${JSON.stringify(events)}`,
+      );
+      assert.deepEqual(client.releasedGenerations(), [31], "the release named the EXACT claim generation (31)");
+      assert.equal(client.reserveCalls.length, 0, "a provably-empty cancel reserves nothing");
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("committed tree: reap precedes the cancel report, then the generation-bound CAPTURE settles after it (never releases)", async () => {
+    const { gitlab } = fakeGitlab();
+    const events: string[] = [];
+    const claim = gitlabClaim(4712, { claim_generation: 31 });
+    const decideThrow = (): boolean =>
+      api.states.some((s) => s.runId === claim.run_id && s.body.status === "failed");
+    const { coord, client, git: fakeGit, safety, root } = fixture(events, decideThrow);
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-1539-commit-home-"));
+    try {
+      fakeGit.alreadyPublished = false; // unpublished committed work → CAPTURE
+      const { armAllow, captureFailed } = failCaptureUntilReport();
+      armCancelMapping(claim.run_id, events, armAllow);
+      const runner = runnerWith(codexTransientFactory(homeRoot, safety, true), gitlab, undefined, nullLogger(), {
+        recovery: coord,
+        recoveryRetryMs: 5,
+      });
+      const execution = runner.execute(claim);
+      await Promise.race([
+        captureFailed.promise,
+        execution.then(() => { throw new Error("execution exited before reaching the cancel branch"); }),
+      ]);
+      api.setInputs(claim.run_id, [{ id: 1, kind: "cancel" }]);
+      await execution;
+
+      assert.ok(hasStatus(claim.run_id, "failed"), "the cancel is reported as a terminal failed");
+      assert.equal(
+        events.filter((e) => e === "reconcile").length,
+        1,
+        `capture must NOT reach its publish boundary; got ${JSON.stringify(events)}`,
+      );
+      assert.ok(
+        events.lastIndexOf("reconcile") < events.indexOf("failed"),
+        `every reap reconcile must precede the failed report; got ${JSON.stringify(events)}`,
+      );
+      assert.ok(
+        events.indexOf("failed") < events.indexOf("reserve"),
+        `the capture reserve must run after the failed report; got ${JSON.stringify(events)}`,
+      );
+      assert.equal(client.reserveCalls.length, 1, "committed work is captured");
+      assert.equal(client.releaseCalls.length, 0, "committed work is NEVER released");
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("a blocked reap (contended reconcile) RETAINS the hold: no release/reserve, but the cancel is still reported", async () => {
+    const { gitlab } = fakeGitlab();
+    const events: string[] = [];
+    const claim = gitlabClaim(4713, { claim_generation: 31 });
+    // alwaysBlock: the reconcile throws even while the run is still `running`, so the pre-report reap
+    // fails and the hold is retained (source_only) — but the cancel must still be reported.
+    const { coord, client, git: fakeGit, safety, root } = fixture(events, () => true);
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-1539-retain-home-"));
+    try {
+      fakeGit.alreadyPublished = true;
+      const { armAllow, captureFailed } = failCaptureUntilReport();
+      armCancelMapping(claim.run_id, events, armAllow);
+      const runner = runnerWith(codexTransientFactory(homeRoot, safety, false), gitlab, undefined, nullLogger(), {
+        recovery: coord,
+        recoveryRetryMs: 5,
+      });
+      const execution = runner.execute(claim);
+      await Promise.race([
+        captureFailed.promise,
+        execution.then(() => { throw new Error("execution exited before reaching the cancel branch"); }),
+      ]);
+      api.setInputs(claim.run_id, [{ id: 1, kind: "cancel" }]);
+      await execution;
+
+      assert.equal(client.releaseCalls.length, 0, "a blocked reap retains the hold — never releases");
+      assert.equal(client.reserveCalls.length, 0, "a blocked reap retains the hold — never captures");
+      assert.ok(
+        api.states.some((s) => s.body.status === "failed" && s.body.failure_reason === "run cancelled"),
+        "the cancel is still reported (the hold is left open, not the report)",
       );
     } finally {
       fs.rmSync(homeRoot, { recursive: true, force: true });

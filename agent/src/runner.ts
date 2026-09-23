@@ -6826,6 +6826,10 @@ export class RunRunner {
     flight.preserveSession = true;
     let capture: { verified: boolean; published: boolean } | undefined;
     let notified = false;
+    // #1539: the outcome of the cancel branch's pre-report reap, run ONCE while the run is
+    // still actively-claimed. undefined = not yet attempted; true = reaped (settle after the
+    // terminal report); false = a blocked/failed reap (RETAIN the hold, still report the cancel).
+    let cancelReap: boolean | undefined;
     const terminal = TERMINAL_RUN_STATUSES;
     try {
       for (;;) {
@@ -6845,10 +6849,29 @@ export class RunRunner {
           if (terminal.has(status)) {
             flight.preserveRecoveryClone = false;
             flight.preserveSession = false;
+            // PRD #1349 M2 (D4.5) / #1539: a statusless cancel ack (HTTP 204), or a thrown cancel
+            // report that actually LANDED, followed by a terminal ownership read arrives here with
+            // the cancel branch's reap already done. Settle the exact-generation hold IFF that reap
+            // confirmed (cancelReap) — the report is terminal now, so this is the deferred settle
+            // that earlier reap earned. No reap here: the run is no longer actively-claimed.
+            if (cancelReap) await this.settleRecoveryGeneration(claim, flight, runLog);
           }
           return status === "recovery_wait";
         }
         if (flight.steering.isCancelled()) {
+          // PRD #1349 M2 (D4.5) / #1539: REAP THIS generation's provider FIRST, BEFORE the `failed`
+          // report, while the run is still actively-claimed (the loop just verified status ===
+          // "running"). A Codex run's pre-settle reap runs the per-sink credential reconcile inside
+          // withBoundary (refreshCodex/releaseCodex), which the api authorizes ONLY while
+          // actively-claimed (codexActivelyClaimedStatuses); once this report makes the run terminal
+          // the reconcile is refused (409), which would block the reap and leak the exact-generation
+          // hold as source_only. Reap ONCE, no retry: a blocked Codex reconcile poisons the registry
+          // stickily (codex/registry.ts), so re-reaping cannot recover it. The killAgentTree at the
+          // top of this handler reaps Claude/stub but is a NO-OP for Codex, so this reap is what
+          // closes Codex admission. The credentialed settle runs AFTER the terminal report below (on
+          // the ack, or on a later terminal ownership read via the early return above).
+          if (cancelReap === undefined)
+            cancelReap = await this.reapRecoveryProviderForSettle(claim, flight, runLog, "terminal");
           try {
             // Consuming cancel only stamps stop_kind. This existing terminal
             // report is what makes Service route it to CancelRunByWorker.
@@ -6856,15 +6879,12 @@ export class RunRunner {
             if (ack.status && terminal.has(ack.status)) {
               flight.preserveRecoveryClone = false;
               flight.preserveSession = false;
-              // PRD #1349 M2 (D4.5): a cancel that terminates the recovery loop cleans the clone
-              // like any other terminal exit, so disposition this generation's hold first. The
-              // credentialed fresh-forge comparison MUST run reaped: the killAgentTree at the top
-              // of this handler reaps Claude/stub but is a NO-OP for Codex (whose provider root is
-              // disposed only in executeClaim's finally, and captureRecoveryRestorePoint's reap may
-              // not have run yet on a cancel that arrives before the first capture attempt), so REAP
-              // FIRST (F2). Then verified-empty releases, committed work captures, a failed
-              // comparison retains.
-              await this.reapThenSettleRecoveryGeneration(claim, flight, runLog, "terminal");
+              // PRD #1349 M2 (D4.5) / #1539: the provider was reaped above while actively-claimed;
+              // now the terminal report has landed, so run the non-status-gated custody settle. A
+              // verified-empty run RELEASES its exact hold, committed work CAPTURES it, and a
+              // blocked/failed reap (cancelReap false) RETAINS the hold — the cancel is still
+              // reported either way.
+              if (cancelReap) await this.settleRecoveryGeneration(claim, flight, runLog);
               return false;
             }
             if (ack.status && ack.status !== "running") return false;
