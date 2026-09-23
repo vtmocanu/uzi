@@ -138,7 +138,7 @@ write_provider_spec() {
   "ownedDataRoot": "$_root",
   "provider": { "name": "fakeprov", "baseUrl": "http://127.0.0.1:9/v1", "envKey": "FAKE_PROVIDER_API_KEY", "credentialValue": "$_cred" },
   "model": "gpt-5-codex",
-  "codexBin": "/opt/uzi-codex/0.153.2/bin/codex",
+  "codexBin": "/opt/uzi-codex/0.156.1/bin/codex",
   "supervisorBin": "$SUP",
   "kind": "provider",
   "childArgv": ["app-server"],

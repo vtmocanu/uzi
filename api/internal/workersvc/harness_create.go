@@ -48,12 +48,14 @@ type RawCredentialOverride struct {
 	SecretID *uuid.UUID
 }
 
-// codexModels is the CLOSED Codex model vocabulary (PRD #1429 D6): the product-owned picker is
-// EXACTLY these two ids and catalog discovery never adds more. It mirrors the agent's
+// codexModels is the CLOSED Codex model vocabulary (PRD #1429 D6; gpt-6-sol added with the Codex
+// 0.156.1 pin, whose catalog requires client >= 0.155.0): the product-owned picker is EXACTLY these
+// ids and catalog discovery never adds more. It mirrors the agent's
 // agent/src/codex/render.ts CONTRACT_MODELS and codex-pricing.ts price table.
 var codexModels = map[string]bool{
 	"gpt-6-astra": true,
 	"gpt-5.6-sol": true,
+	"gpt-6-sol":   true,
 }
 
 // harnessModelCompatible reports whether the stored model may ride a claim for harness h, given
@@ -64,7 +66,7 @@ var codexModels = map[string]bool{
 //   - Codex harness: ONLY a known Codex model is compatible. A Claude alias, or a custom/unknown
 //     id whose Codex-compatibility cannot be known here, is refused so the worker falls back to
 //     its own Codex default — the conservative direction the PRD requires (Codex has a closed
-//     two-model vocabulary, so anything else is unsafe to forward).
+//     closed vocabulary, so anything else is unsafe to forward).
 //   - Claude harness: a known Codex-only model is refused; every other value (a Claude alias OR a
 //     custom full Claude id like claude-opus-4-8) passes through unchanged, preserving today's
 //     honour-any-custom-id behaviour.

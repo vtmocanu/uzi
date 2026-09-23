@@ -3,7 +3,7 @@
 // This is the reusable library the production worker adapter (and the m3a lifecycle
 // test) calls to launch ONE supervisor root: a static Go supervisor
 // (`/usr/local/bin/uzi-codex-supervisor`, built by a sibling unit) which forks the
-// pinned Codex app-server (`/opt/uzi-codex/0.153.2/bin/codex app-server`). It
+// pinned Codex app-server (`/opt/uzi-codex/0.156.1/bin/codex app-server`). It
 // composes the worker→runner/runner-cmd uid boundaries in `runner-uid.ts`.
 //
 // SUPPORTED PROFILE (fail-closed): this primitive is supported ONLY under the A1
@@ -65,7 +65,7 @@ const CODEX_LAUNCH_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sb
 /** The pinned, image-baked Codex app-server binary. Exported so the production adapter
  *  composition (codex-executor.ts) can build a provider {@link CodexLaunchSpec} without
  *  re-typing the literal; the launcher still re-validates a provider spec names exactly it. */
-export const CODEX_BIN = "/opt/uzi-codex/0.153.2/bin/codex";
+export const CODEX_BIN = "/opt/uzi-codex/0.156.1/bin/codex";
 /** The pinned, image-baked supervisor trust anchor. Exported for the same reason. */
 export const SUPERVISOR_BIN = "/usr/local/bin/uzi-codex-supervisor";
 /** The fixed provider child argv (`codex app-server`). Exported so the production

@@ -339,7 +339,7 @@ RUN command -v agent-browser \
 # does not hit the un-chmodable-root abort the non-root seed would.
 RUN chmod -R a+rX /nix
 
-# --- PRD #1156 M3a: package pinned Codex 0.153.2 (CLI + code-mode host) ------------------
+# --- PRD #1156 M3a: package pinned Codex 0.156.1 (CLI + code-mode host) ------------------
 # Install the COMBINED native package (not the bare CLI) into a stable, immutable,
 # root-owned root at /opt/uzi-codex/<version>/ — OUTSIDE writable /app, /data and the
 # per-run homes, and on NO PATH: the launcher resolves Codex by absolute path only, so a
@@ -353,7 +353,7 @@ RUN chmod -R a+rX /nix
 # manifest field or an unsupported arch BEFORE installing. assert-codex.sh is the
 # build-time runner-uid guard: it execs `codex --version` as the cap-less `runner` uid
 # (setpriv --reuid runner, fresh throwaway HOME, replaced env, bounded timeout), asserting EXACTLY
-# `codex-cli 0.153.2` + exit 0 AND the fake-GNU-ldd PATH case AND the code-mode host
+# `codex-cli 0.156.1` + exit 0 AND the fake-GNU-ldd PATH case AND the code-mode host
 # sibling — so a broken binary/loader or a missing host fails the BUILD, not a run. The
 # helpers + lock are removed after (no residue); NO auth/config/session state is baked.
 # MIRRORED in templates/jvm (jvm is NOT `FROM base`) — keep the two in lockstep.

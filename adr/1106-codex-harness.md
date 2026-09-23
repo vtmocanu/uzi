@@ -272,6 +272,17 @@ sanitized error could not distinguish unsupported effort from a narrower server
 or entitlement failure. The SDK's open model string and wider effort union are
 therefore transport types, not picker authority.
 
+**Amendment (2026-09-23, Codex 0.156.1 pin).** The picker adds `gpt-6-sol`. Its bundled
+0.156.1 catalog entry requires client `>= 0.155.0`, lists `low` through `ultra` (so uzi's
+`low | medium | high | xhigh | max` contract still maps one-to-one), and differs from the two
+initial models in three catalog fields, each checked against the 0.156.1 source:
+`shell_type: "shell_command"` is a serde alias of `unified_exec`, still gated off by
+`shell_tool = false` (the native-bypass P suite now runs on both `gpt-6-astra` and `gpt-6-sol`);
+`default_service_tier: "priority"` is applied only by the interactive TUI, so uzi requests carry no
+tier, as for the other models, and pricing stays Standard; its experimental
+`send_user_message_async` / `clock` tools match what `gpt-6-astra` already had. The vocabulary
+stays closed and product-owned.
+
 ## Review disposition / blockers
 
 The whole-PRD review found six blockers that the successful probes did not

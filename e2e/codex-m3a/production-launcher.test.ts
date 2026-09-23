@@ -24,7 +24,7 @@ let launchCodexRoot: LauncherModule["launchCodexRoot"];
 before(async () => { ({ launchCodexRoot } = await loadPackagedLauncher()); });
 
 const SUPERVISOR_BIN = process.env.M3A_SUPERVISOR_BIN ?? "/usr/local/bin/uzi-codex-supervisor";
-const CODEX_BIN = process.env.M3A_CODEX_BIN ?? "/opt/uzi-codex/0.153.2/bin/codex";
+const CODEX_BIN = process.env.M3A_CODEX_BIN ?? "/opt/uzi-codex/0.156.1/bin/codex";
 // A worker-writable base: /data/runner is worker-owned 2775 (entrypoint), so the worker
 // can mkdtemp directly under it; the launcher creates the runner-owned 0700 trees below.
 const DATA_BASE = process.env.M3A_DATA_BASE ?? "/data/runner";

@@ -565,7 +565,7 @@ describe("worker template Dockerfiles keep guardrail layers", () => {
         `${name}/Dockerfile must RUN the Codex runner-uid build guard`,
       );
       assert.match(text, /setpriv --reuid runner\b/, `${name}/Dockerfile must document the runner-uid setpriv guard`);
-      assert.match(text, /codex-cli 0\.153\.2\b/, `${name}/Dockerfile must document the exact pinned Codex version`);
+      assert.match(text, /codex-cli 0\.156\.1\b/, `${name}/Dockerfile must document the exact pinned Codex version`);
       assert.match(text, /fake-GNU-ldd\b/, `${name}/Dockerfile must document the fake-GNU-ldd PATH case`);
       // ...and the SHARED guard script must carry that substance, not merely the comment: the
       // setpriv --reuid to the runner uid, the `codex --version` exec, the expected `codex-cli`

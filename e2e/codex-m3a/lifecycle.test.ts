@@ -28,7 +28,7 @@ import {
 } from "./supervisor-driver.js";
 
 const SUPERVISOR_BIN = process.env.M3A_SUPERVISOR_BIN ?? "/usr/local/bin/uzi-codex-supervisor";
-const CODEX_BIN = process.env.M3A_CODEX_BIN ?? "/opt/uzi-codex/0.153.2/bin/codex";
+const CODEX_BIN = process.env.M3A_CODEX_BIN ?? "/opt/uzi-codex/0.156.1/bin/codex";
 const DATA_ROOT = process.env.M3A_DATA_ROOT ?? "/data/runner/m3a";
 const RUNNER_UID = Number(process.env.M3A_RUNNER_UID ?? "10002");
 const ENV_KEY = "FAKE_PROVIDER_API_KEY";

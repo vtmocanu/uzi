@@ -20,7 +20,7 @@ import { runLaunchCli, type LaunchCliDeps } from "../src/codex/launch-cli.js";
 // NO setpriv/root: the supervisor is a FAKE process, every privileged/uid-resolving
 // step is injected.
 
-const CODEX_BIN = "/opt/uzi-codex/0.153.2/bin/codex";
+const CODEX_BIN = "/opt/uzi-codex/0.156.1/bin/codex";
 const SUPERVISOR_BIN = "/usr/local/bin/uzi-codex-supervisor";
 const RUNNER_UID = 10002;
 const DATA_ROOT = "/data/run/root-1";

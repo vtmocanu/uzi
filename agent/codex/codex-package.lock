@@ -16,9 +16,9 @@
 # unknown/missing TARGETARCH resolves to no key and the install script fails loudly.
 
 # --- Package identity (upstream release coordinates) -------------------------------
-CODEX_VERSION=0.153.2
-CODEX_TAG=rust-v0.153.2
-CODEX_SOURCE_COMMIT=657a993cbee87acf52d14b758ce49dbd46d1b8eb
+CODEX_VERSION=0.156.1
+CODEX_TAG=rust-v0.156.1
+CODEX_SOURCE_COMMIT=b412ff32c417f855c2b2d1581b77058eed87c84b
 # Artifacts live at ${CODEX_BASE_URL}/${CODEX_TAG}/${artifact}.
 CODEX_BASE_URL=https://github.com/openai/codex/releases/download
 
@@ -26,7 +26,7 @@ CODEX_BASE_URL=https://github.com/openai/codex/releases/download
 # The extracted manifest MUST match these before the package is installed; `target`
 # is asserted per-arch against CODEX_TARGET_<arch> below (musl target, no libc sniff).
 CODEX_MANIFEST_LAYOUT_VERSION=1
-CODEX_MANIFEST_VERSION=0.153.2
+CODEX_MANIFEST_VERSION=0.156.1
 CODEX_MANIFEST_VARIANT=codex
 CODEX_MANIFEST_ENTRYPOINT=bin/codex
 CODEX_MANIFEST_RESOURCES_DIR=codex-resources
@@ -41,9 +41,9 @@ CODEX_MEMBERS=bin/codex bin/codex-code-mode-host codex-package.json codex-path/r
 # amd64 -> x86_64 musl
 CODEX_TARGET_amd64=x86_64-unknown-linux-musl
 CODEX_ARTIFACT_amd64=codex-package-x86_64-unknown-linux-musl.tar.gz
-CODEX_SHA256_amd64=e10fa0cee78e9f0bd395880f03fd4fd227d903ca7af649bbc08d1649101e9225
+CODEX_SHA256_amd64=8b711520beddf385467b8da4d2c93736637c6ba1e46811cf0d8606b7c490b6f6
 
 # arm64 -> aarch64 musl
 CODEX_TARGET_arm64=aarch64-unknown-linux-musl
 CODEX_ARTIFACT_arm64=codex-package-aarch64-unknown-linux-musl.tar.gz
-CODEX_SHA256_arm64=a3bfaf4b62fcb17e0a0338dfe0502413ddce0ab1b39028679390539c45d2c6e3
+CODEX_SHA256_arm64=fdd47ed6aade0360796fd3f6f95a45096f327c15e19e8c7339f9dc5633041786

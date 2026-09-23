@@ -7,10 +7,10 @@ import { Input, Select } from "./ui";
 // Claude keeps today's aliases (this is the single shared source for that set, PRD
 // #17 risk: alias drift — reused by the agent-template editor and the per-user
 // default-model setting) plus a free-text "Other…" custom escape hatch. Codex's
-// picker is EXACTLY `gpt-6-astra`/`gpt-5.6-sol` — no custom option, no catalog
+// picker is EXACTLY `gpt-6-astra`/`gpt-5.6-sol`/`gpt-6-sol` — no custom option, no catalog
 // discovery — matching D6's "the product-owned Codex picker remains exactly" rule.
 const CLAUDE_MODEL_ALIASES = ["opus", "sonnet", "haiku", "fable"] as const;
-const CODEX_MODEL_ALIASES = ["gpt-6-astra", "gpt-5.6-sol"] as const;
+const CODEX_MODEL_ALIASES = ["gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol"] as const;
 
 // aliasesForHarness is the single place this component resolves which curated list
 // applies. Defaults to Claude for an omitted/unrecognised harness — the safe,
@@ -23,7 +23,7 @@ function aliasesForHarness(harness: Harness | undefined): readonly string[] {
 // modelCompatibleWithHarness is the D6 compatibility rule Run Defaults uses to decide
 // whether SWITCHING the default harness must reset a stored model to inherit rather
 // than persist a knowingly-invalid pair (PRD #1429 D6): blank/inherit is always
-// compatible; a Codex target accepts only its two curated aliases (Codex has no
+// compatible; a Codex target accepts only its curated aliases (Codex has no
 // custom escape hatch); a Claude target accepts anything EXCEPT a known Codex-only
 // alias (Claude keeps its curated-plus-custom freedom, but must never inherit a
 // Codex-specific model id it cannot run).

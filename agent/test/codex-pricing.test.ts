@@ -18,6 +18,7 @@ import type { CodexUsageBreakdown } from "../src/codex/transport.js";
 
 const ASTRA = "gpt-6-astra";
 const SOL = "gpt-5.6-sol";
+const SOL6 = "gpt-6-sol";
 // A clock well before any promotional review boundary — the "priceable" default for these tests.
 const BEFORE_SOL_REVIEW = new Date("2026-01-01T00:00:00Z");
 
@@ -41,7 +42,7 @@ function micro(usd: number | undefined): number | undefined {
 
 describe("codex-pricing: the version id and boundary constants are the pinned D5 values", () => {
   it("records the table version and the Sol review boundary with the table", () => {
-    assert.equal(CODEX_PRICE_TABLE_VERSION, "openai-standard-2026-09-13");
+    assert.equal(CODEX_PRICE_TABLE_VERSION, "openai-standard-2026-09-23");
     assert.equal(SOL_PROMO_REVIEW_DATE, "2026-11-21");
     assert.equal(CODEX_INPUT_TIER_THRESHOLD_TOKENS, 272_000);
   });
@@ -76,6 +77,21 @@ describe("codex-pricing: each cache bucket is priced at its own rate (low tier)"
     assert.equal(micro(priceCodexResponse(SOL, bd({ outputTokens: 1000 }), BEFORE_SOL_REVIEW)), 20000); // 1000 * 20.00
   });
 
+  // gpt-6-sol low: uncached 2.00 / cached 0.20 / cacheWrite 2.50 / output 10.00 per 1e6 (official
+  // model page, 2026-09-23; not promotional).
+  it("gpt-6-sol prices uncached, cached, cacheWrite and output independently", () => {
+    assert.equal(micro(priceCodexResponse(SOL6, bd({ inputTokens: 100 }), BEFORE_SOL_REVIEW)), 200); // 100 * 2.00
+    assert.equal(
+      micro(priceCodexResponse(SOL6, bd({ inputTokens: 500, cachedInputTokens: 500 }), BEFORE_SOL_REVIEW)),
+      100, // 500 * 0.20
+    );
+    assert.equal(
+      micro(priceCodexResponse(SOL6, bd({ inputTokens: 400, cacheWriteInputTokens: 400 }), BEFORE_SOL_REVIEW)),
+      1000, // 400 * 2.50
+    );
+    assert.equal(micro(priceCodexResponse(SOL6, bd({ outputTokens: 1000 }), BEFORE_SOL_REVIEW)), 10000); // 1000 * 10.00
+  });
+
   it("a full mixed breakdown sums the four buckets (uncached = input - cached - cacheWrite)", () => {
     // input 1000, cached 600, cacheWrite 100 → uncached 300. astra low:
     // 300*10 + 600*1 + 100*12.5 + 200*50 = 3000 + 600 + 1250 + 10000 = 14850 µ$.
@@ -99,6 +115,12 @@ describe("codex-pricing: the >272K tier boundary is per-response and strictly gr
     const over = bd({ inputTokens: CODEX_INPUT_TIER_THRESHOLD_TOKENS + 1, outputTokens: 100 });
     // sol high: uncached*8 + output*30.
     assert.equal(micro(priceCodexResponse(SOL, over, BEFORE_SOL_REVIEW)), 272001 * 8 + 100 * 30); // 2_176_008 + 3000
+  });
+
+  it("the high tier applies to gpt-6-sol: 2x input and cache, 1.5x output", () => {
+    const over = bd({ inputTokens: CODEX_INPUT_TIER_THRESHOLD_TOKENS + 1, cachedInputTokens: 1000, cacheWriteInputTokens: 1000, outputTokens: 100 });
+    // sol6 high: uncached*4 + cached*0.4 + cacheWrite*5 + output*15.
+    assert.equal(micro(priceCodexResponse(SOL6, over, BEFORE_SOL_REVIEW)), 270001 * 4 + 1000 * 0.4 + 1000 * 5 + 100 * 15);
   });
 });
 
@@ -144,5 +166,13 @@ describe("codex-pricing: the gpt-5.6-sol promotional review boundary flips on th
   it("gpt-6-astra is UNAFFECTED by the Sol review date — still priced on 2026-11-21", () => {
     // astra low, uncached 1000: 1000*10 + 200*50 = 10000 + 10000 = 20000 µ$.
     assert.equal(micro(priceCodexResponse(ASTRA, astraResponse, new Date("2026-11-21T00:00:00Z"))), 20000);
+  });
+});
+
+describe("codex-pricing: gpt-6-sol has no promotional review boundary", () => {
+  it("gpt-6-sol stays priced on and after the gpt-5.6-sol review date", () => {
+    const onReview = new Date(`${SOL_PROMO_REVIEW_DATE}T00:00:00Z`);
+    assert.equal(micro(priceCodexResponse(SOL6, bd({ inputTokens: 100 }), onReview)), 200);
+    assert.equal(micro(priceCodexResponse(SOL6, bd({ inputTokens: 100 }), new Date("2027-06-01T00:00:00Z"))), 200);
   });
 });

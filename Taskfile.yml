@@ -2220,7 +2220,7 @@ tasks:
       - task: test:codex-m4
 
   test:codex-m0:
-    desc: Opt-in credential-free Codex 0.153.2 app-server characterization
+    desc: Opt-in credential-free Codex 0.156.1 app-server characterization
     cmds:
       # External binary only; no installation or production dependency. Serial
       # cases avoid child/process contention. The timeout catches harness hangs.

@@ -38,7 +38,7 @@ before(async () => {
 });
 
 const SUPERVISOR_BIN = process.env.M3A_SUPERVISOR_BIN ?? "/usr/local/bin/uzi-codex-supervisor";
-const CODEX_BIN = process.env.M3A_CODEX_BIN ?? "/opt/uzi-codex/0.153.2/bin/codex";
+const CODEX_BIN = process.env.M3A_CODEX_BIN ?? "/opt/uzi-codex/0.156.1/bin/codex";
 const CODEX_PREFIX = process.env.M3A_CODEX_PREFIX ?? "/opt/uzi-codex";
 const DATA_BASE = process.env.M3A_DATA_BASE ?? "/data/runner";
 const ENV_KEY = "FAKE_PROVIDER_API_KEY";
