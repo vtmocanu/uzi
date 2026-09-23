@@ -26,6 +26,8 @@ through `[0.52.0]`.)
 
 - **Run, user, and factory usage totals were overstated for multi-turn Claude runs on v0.84.0-rc.8 workers, and are now folded correctly ([#1562](https://github.com/vtmocanu/uzi/issues/1562)).**
   From Claude Agent SDK 0.3.277 a resumed leg reports the session's running total instead of just that leg, and the old per-leg SUM (ADR-1079) counted it several times over; the worker now marks which reading a frame carries and the server folds it by a per-session high-water mark, but a run already recorded on rc.8 stays overstated (not re-derived; see ADR-1562).
+- **Cancelled, usage-limited, and message-transport-failed Codex runs no longer leak an open `source_only` custody hold ([#1539](https://github.com/vtmocanu/uzi/issues/1539)).**
+  Three more failure paths reported the terminal state before reaping the Codex provider, so the API refused the reap's credential reconcile (409) and the hold stayed open, showing a false "Held work needs your attention": a cancellation during transient recovery, a usage-limit hit that fails (opt-out, or a park the server declines), and a permanent message-delivery failure. Each path now reaps while the run is still actively claimed, then reports its honest terminal outcome, then settles custody: provably empty work releases, committed work is captured or stays protected, and a blocked reap still retains the hold. The message-failure path keeps its durable journal-before-abort ordering and still reports exactly one `failed`.
 
 ## [0.84.0] - 2026-09-20
 
