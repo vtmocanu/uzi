@@ -281,3 +281,74 @@ Go module, so a fixture-only edit is invisible to `go test`'s cache key):
 cd api && go test -count=1 ./internal/workersvc/
 cd web && npx vitest run src/lib/runUsageContract.test.ts
 ```
+
+## The `cumulative` pair: session-cumulative resumed legs (issue #1562)
+
+`result-frames-cumulative.json` / `run-usage-cumulative.json` is a third contract pair,
+added for issue #1562 (ADR-1562, which amends ADR-1079). From Claude Agent SDK 0.3.277
+a resumed session's result frame reports the **running session total**, not only its own
+`query()` leg, so summing legs (the ADR-1079 rule, which the `02854d5e` pair pins for
+unmarked frames) over-counts. The worker now says which reading applies instead of the
+server guessing from a version:
+
+| marker | on | meaning |
+|---|---|---|
+| `usage_basis: "session_cumulative"` | a Claude `result` frame | its `modelUsage` is the running total of the session the leg continued |
+| `fresh_session: true` | an `init` frame | this SDK process did not continue the requested session (no resume requested, or the SDK's init `session_id` differs from the requested one) |
+
+A frame without `usage_basis` is `per_leg` (every frame recorded before #1562, every
+Codex frame, the stub executor). The server ignores the marker on a Codex run.
+
+### The rule both folds implement
+
+- `lineage_epoch` (the leg) is unchanged: the count of `init` frames with a lower seq.
+- `lineage_index` (the session) = the count of `init` frames carrying
+  `fresh_session: true` with a lower seq, **excluding the run's first `init`**. Lineage 0
+  is the run's initial session, whether or not its first init is flagged; only a fresh
+  session that starts after a prior one began opens lineage 1, 2, …
+- Per `(model, lineage_index)`, legs in epoch order, per column, a running total `R`
+  starts at 0: a `per_leg` leg does `R += v`; a `session_cumulative` leg does
+  `R = max(R, v)`. The model's total is the SUM of `R` over lineages. A leg's value is
+  still the MAX of its frames (GREATEST within the row).
+
+This is a high-water mark, not "subtract the previous leg": a column that goes down, or
+a model missing from a later leg, adds nothing. It is not a run-wide MAX: a fresh session
+restarts `R`. An unmarked leg followed by a marked leg in the same lineage (a run in
+flight across the deploy) never double counts: the marked leg only raises `R`.
+
+### What it pins
+
+Five scenarios, each self-contained (its own frames, rows, `model_totals`, `totals`, and
+`sum_fold_totals` = the pre-#1562 per-leg SUM of the same rows):
+
+| scenario | source | new total (USD) | per-leg SUM (USD) |
+|---|---|---|---|
+| `live-rc8-five-resumed-legs` | **live-derived**: the rc.8 run from the #1562 triage, sanitized to accounting fields, synthetic identifiers | 10.490726 | 42.725704 |
+| `model-disappears` | authored | 2.5021 | 3.7521 |
+| `non-monotonic-column` | authored | 3.5 | 6.5 |
+| `in-flight-across-deploy` | authored | 2.0 | 3.75 |
+| `fresh-session-restart` | authored | 3.15 | 5.05 |
+
+The live scenario's true session total is 10.4907258 USD (the frames' own
+`total_cost_usd`); the rollup answers 10.490726 because each model's cost is quantized to
+microdollars first, exactly as `numericUSD` stores it. Every reader asserts
+`sum_fold_totals` too, so a fold that regresses to the per-leg SUM fails on a named value.
+
+### Why the rollup is AUTHORED, and the frames partly so
+
+The rollup is an independent reduction of the rule above (a throwaway script, not either
+production fold), for the same reason as the `02854d5e` pair: the shipped server's answer
+for these frames is the defect. Unlike the other two pairs, the frames of four scenarios
+are authored too: each isolates one edge of the rule that no single live run exhibits.
+Only the fields the folds read are kept (`event`, `usage_basis`, `fresh_session`,
+`modelUsage`, a few scalars).
+
+### Readers
+
+| | reads | asserts |
+|---|---|---|
+| Go unit | `api/internal/workersvc/run_usage_contract_test.go` | `rows` (basis, lineage per leg) through `foldUsageFrames` |
+| Go live-DB | `api/internal/store` (a `…LiveDB` test) | `totals` via `GetRunUsageTotal` over the stored rows |
+| vitest | `web/src/lib/runUsageContract.test.ts` | `model_totals` and `totals` via `deriveRunUsage` |
+
+The Go halves need `-count=1` (this directory is outside the `api` module).
