@@ -1,8 +1,7 @@
 # Landing the whole open-PR set
 
-Moved from the `uzi-release` skill (2026-09-23); this is the canonical home. Use it when the
-user asks to merge the open PRs, land the batch, or clear the queue before a release. Each PR
-still goes through SKILL.md's loop; this file adds the cross-PR order and checks.
+Use it when the user asks to merge the open PRs, land the batch, or clear the queue
+before a release. Each PR still goes through SKILL.md's loop; this file adds the cross-PR order and checks.
 `uzi-release` starts only after this is done. `S` is `.agents/skills/uzi-lander/scripts/`.
 
 ## 1. Survey

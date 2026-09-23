@@ -1,7 +1,6 @@
 # Renovate and other dependency PRs
 
-Moved from the `uzi-release` skill (2026-09-23); this is the canonical home. The review
-lane for Renovate-class work is SKILL.md step 2; this file is what to read before and
+The review lane for Renovate-class work is SKILL.md step 2; this file is what to read before and
 around it. `S` is `.agents/skills/uzi-lander/scripts/`.
 
 ## Before touching one
@@ -35,7 +34,7 @@ CI is the arbiter, and two classes redden a green-looking bump:
   backlog the zero-tolerance gates (`deadcode:web`, `lint:*`) reject. It needs a
   triage/ignore pass, not a merge; land the safe siblings and defer it.
 - **k8s node image** (`kindest/node`): can outrun the SHA-pinned `helm/kind-action` that
-  ships `kind`. A newer node (observed at v1.37.0) rejects the obsolete
+  ships `kind`. A newer node (v1.37.0+) rejects the obsolete
   `kubeadm.k8s.io/v1beta3` config the pinned `kind` emits (`Create KinD cluster` fails with
   `uses an old API spec`), so bump the action in tandem.
 
@@ -76,8 +75,7 @@ fix, and let Renovate auto-close its PR.
 1. **Diagnose against both versions first.** Reproduce in a throwaway worktree (off the
    Renovate branch, or off `main` with the version installed) and run the same thing on the
    current and target versions. A new failure may be a stricter check, an equivalent
-   behaviour change, or a tool now reporting something always true (go-chi/chi v5.3.2, PR
-   #1148). Establish which, so the fix matches the change and you can state the production
+   behaviour change, or a tool now reporting something always true. Establish which, so the fix matches the change and you can state the production
    impact (often "none").
 2. **One branch off `main`** (`fix/<dep>-<version>` or `chore/<dep>-<version>`): bump the
    dep yourself (`go get <mod>@<v> && go mod tidy`, or `npm install <pkg>@<v>`), apply only

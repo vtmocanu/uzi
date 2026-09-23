@@ -18,8 +18,7 @@ stop rather than forcing.
   for the rare case that wants a merge commit.
 - **The PR author is the bot account** (e.g. `vtmocanu-uzi`), distinct from your `gh`
   identity, so a human review from you satisfies the review rule — it is not a self-review.
-- **Renovate PRs are the exception: Renovate authors as the repo owner** (verified
-  2026-08-20). GitHub forbids self-approval, and a granted approval is dismissed by the next
+- **Renovate PRs are the exception: Renovate authors as the repo owner.** GitHub forbids self-approval, and a granted approval is dismissed by the next
   update-branch push, so the approval rule can never be met: `--admin` is the only path.
   Reach for it directly rather than update-branching first.
 - **Lockfile stacking.** Back-to-back merges of PRs sharing a generated lockfile
