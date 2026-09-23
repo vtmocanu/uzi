@@ -119,10 +119,9 @@ by anything on the PR itself.
      finding was *explicitly* skipped or resolved-without-code; if so, proceed to merge on
      the existing green state, otherwise return it to triage or local handling.
 4. **When it pushed a commit, that push retriggers CodeRabbit.** Wait for the re-review on
-   the **new head** (signal (c), the walkthrough `final_review_risk` block's `up to
-   SHORT_SHA` marker covering the new SHA — the `recent_review` range is a retired
-   format; see `coderabbit-triage.md` and `review-signals.md`, this dir),
-   confirm no active `mr_rework` remains and CI is green on that head, THEN merge.
+   the **new head** (the walkthrough's `final_review_risk` marker or exact-head
+   `change_assessment_commit`; see `review-signals.md`, this dir), confirm no active
+   `mr_rework` remains and CI is green on that head, THEN merge.
 
    **`scripts/watch-pr.sh OWNER/REPO PR [interval] [max]` runs this whole readiness poll**
    so you do not hand-roll it each time: it exits **0** merge-ready (CI green on the head,

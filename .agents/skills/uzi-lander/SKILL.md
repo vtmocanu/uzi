@@ -122,9 +122,16 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    Let an auto-review that is already running finish; never re-trigger it. `--reviewer` also
    scopes which bot BLOCKS: `coderabbit`|`greptile` selects one bot AND makes the other fully
    non-blocking (its in-flight review is not waited on, its findings do not gate) — the way to
-   land on one reviewer while explicitly ignoring the other, e.g. when the user says to ignore
-   CodeRabbit. `any` waits for and counts both bots' findings; `none` requires no reviewed-head
-   signal (the local-review/Renovate lane) but STILL counts live findings from both bots.
+   land on one bot while explicitly ignoring the other. `any` waits for and counts both bots'
+   findings; `none` requires no reviewed-head signal (the local-review/Renovate lane) but
+   STILL counts live findings from both bots.
+
+   **Ask CodeRabbit to ignore this PR:** put the exact text `@coderabbitai ignore` in the
+   PR **description**, not a comment (https://docs.coderabbit.ai/guides/commands,
+   "Disable automatic code reviews"). Preserve the existing description; the command
+   disables automatic reviews while it remains there. Remove it to resume on the next
+   commit. This does not waive independent review: use a local reviewer pinned to the head
+   and `watch-pr.sh --reviewer none`, and assess any already-live bot findings.
 3. **The selected bot review is absent.** This step applies only when step 2 selected
    CodeRabbit or Greptile; `--reviewer none` is an intentional local-review or
    CI-sufficient Renovate lane, not a missing review. First run `S/review-quota.sh
