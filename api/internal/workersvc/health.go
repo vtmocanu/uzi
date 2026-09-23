@@ -153,6 +153,17 @@ const (
 	// reachable only for them (no public origin can create a Codex run yet). Maps to the SAME
 	// healthWaitingWorker enum (no migration — runs.health_reason is free text).
 	reasonNoCodexCapableWorker = "no Codex-capable worker is online"
+	// reasonNoCustomCodexCapableWorker (PRD #1551 M4, D6) is emitted for a CUSTOM-Codex-root queued
+	// run (harness='codex', not task-review/judge/chat, whose effective worker-root model is a
+	// non-curated id) whose owner has NO online worker advertising BOTH 'codex_harness_v1' AND
+	// 'codex_custom_model_v1'. Like reasonNoCodexCapableWorker it names a NON-BYPASSABLE block:
+	// ClaimRun's dedicated custom-Codex clause sits outside fn_worker_can_claim,
+	// required_capabilities and the capability-aware kill-switch, so a custom-root run in a fleet of
+	// codex_harness_v1-only workers is genuinely unclaimable until a passthrough-capable worker comes
+	// online (rather than silently running Astra). Placed one rung below the plain Codex-harness rung
+	// so the more general "no Codex-capable worker" reason keeps precedence when the fleet has no
+	// Codex worker at all. Maps to the SAME healthWaitingWorker enum (runs.health_reason is free text).
+	reasonNoCustomCodexCapableWorker = "no worker supporting custom Codex models is online"
 	// reasonRepoNotDockerAllowed (PRD #361) is the queued reason for a repo-bearing run
 	// that no online worker is eligible to claim because every online worker is a Docker
 	// worker and the repo is not on the Docker-worker allowlist (fn_worker_can_claim,
@@ -245,7 +256,7 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 	if !enabled {
 		return 0
 	}
-	runs, err := s.q.ListActiveRunsForHealth(ctx)
+	runs, err := s.q.ListActiveRunsForHealth(ctx, codexCuratedModelsSlice())
 	if err != nil {
 		slog.Error("health: list active runs", "error", err)
 		return 0
@@ -712,6 +723,23 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 			slog.Error("health: count online workers satisfying codex harness", "run_id", r.ID, "error", cerr)
 		} else if c == 0 {
 			return reasonNoCodexCapableWorker
+		}
+	}
+	// PRD #1551 M4 (D6): a CUSTOM-Codex-root run whose owner has NO online worker advertising BOTH
+	// codex_harness_v1 AND codex_custom_model_v1 is genuinely UNPLACEABLE — the run's non-bypassable
+	// custom-model claim clause can never be satisfied. r.CodexCustomRoot is the SQL-computed
+	// projection of that exact clause (task-review/judge/chat already excluded there), so the pill and
+	// the claim gate can never disagree. Placed right after the plain Codex-harness rung and AHEAD of
+	// the priority-class re-label, for the same reason those rungs are: an actionable "provision a
+	// capable worker" block must not be hidden behind a yield/restored message. The per-run Count sits
+	// behind the queued-threshold guard in healthTargetFor, so it runs for ~0 runs/tick; a read error
+	// falls through to the generic reasons below rather than inventing a reason on a failed lookup.
+	if r.CodexCustomRoot {
+		c, cerr := s.q.CountOnlineWorkersSatisfyingCustomCodex(ctx, r.UserID)
+		if cerr != nil {
+			slog.Error("health: count online workers satisfying custom codex", "run_id", r.ID, "error", cerr)
+		} else if c == 0 {
+			return reasonNoCustomCodexCapableWorker
 		}
 	}
 	// A queued run the kind-derived priority DEMOTED (PRD #320 D9) is not stuck — it is

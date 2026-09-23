@@ -706,13 +706,39 @@ WITH target AS (
       -- workers.protocol_capabilities, passed by the Go caller).
       AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
            OR 'codex_harness_v1' = ANY($11::text[]))
+      -- PRD #1551 M4 (D6): the NON-BYPASSABLE custom-Codex-model claim clause, a SIBLING of the
+      -- codex-harness clause directly above. A Codex run whose EFFECTIVE worker-root model is a
+      -- CUSTOM (non-curated) id may be claimed ONLY by a worker whose protocol_capabilities contain
+      -- 'codex_custom_model_v1'. The effective root follows D4 precedence rendered in SQL: a frozen
+      -- r.model that is itself a curated id wins (curated ⇒ no new requirement), otherwise the
+      -- owner's default_codex_model lane. Task-review (review_target_run_id IS NOT NULL), judge and
+      -- chat are EXEMPT — assembly reads no Codex lane for them — so the exemption is keyed on
+      -- review_target_run_id/kind, NEVER on all of kind='task'. NULL-safe via COALESCE: a NULL
+      -- r.model AND NULL lane make the effective root NULL, so the inner NOT(... = ANY ...) is NULL
+      -- and COALESCE(...,false) is false ⇒ not custom ⇒ no new requirement. Same standalone posture
+      -- as the harness clause (OUTSIDE fn_worker_can_claim, required_capabilities and the
+      -- capability_aware kill-switch); the effective-root expression is written identically here,
+      -- in the peer mirror below, and in CountOnlineWorkersClaimableForRun.
+      AND (
+          NOT (
+              r.harness = 'codex'
+              AND r.kind NOT IN ('judge', 'chat')
+              AND r.review_target_run_id IS NULL
+              AND COALESCE(
+                  NOT ((CASE WHEN r.model = ANY($12::text[]) THEN r.model
+                             ELSE (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id) END)
+                       = ANY($12::text[])),
+                  false)
+          )
+          OR 'codex_custom_model_v1' = ANY($11::text[])
+      )
       -- PRD #529 Decision 4: an ephemeral worker exists to serve exactly one run and
       -- must never take foreign work — otherwise it could hold a non-owning run when
       -- its bound run terminates, blocking the busy-guarded teardown (M4). So an
       -- ephemeral claimant (@is_ephemeral) matches ONLY its bound run
       -- (@ephemeral_run_id); a non-ephemeral worker short-circuits true and the
       -- (NULL) run id is never compared.
-      AND (NOT $12::boolean OR r.id = $13::uuid)
+      AND (NOT $13::boolean OR r.id = $14::uuid)
       -- PRD #216 fleet-aware spread (D3/D4/D7/D8/R3). Defer this run to a peer
       -- ONLY when a strictly-better peer exists. Resume affinity (worker_id = me)
       -- and a run older than @spread_cutoff both BYPASS the spread, so the spread
@@ -730,7 +756,7 @@ WITH target AS (
       -- claim (a minimum-loaded worker never defers, guaranteeing claimability).
       AND (
           r.worker_id = $1
-          OR r.updated_at < $14
+          OR r.updated_at < $15
           OR NOT EXISTS (
               SELECT 1
               FROM workers p
@@ -773,6 +799,24 @@ WITH target AS (
                 -- claimant's @worker_protocol_caps).
                 AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                      OR 'codex_harness_v1' = ANY(p.protocol_capabilities))
+                -- PRD #1551 M4 (D6): MIRROR the non-bypassable custom-Codex-model clause for the peer, or
+                -- fleet-spread could DEFER a CUSTOM-root Codex run to an INCAPABLE peer that could never
+                -- claim it (its OWN custom-model clause above blocks it) — making the run permanently
+                -- unclaimable by being preferred. The effective-root expression is written IDENTICALLY to
+                -- the claimant clause, reading the peer's OWN workers.protocol_capabilities (no Go param).
+                AND (
+                    NOT (
+                        r.harness = 'codex'
+                        AND r.kind NOT IN ('judge', 'chat')
+                        AND r.review_target_run_id IS NULL
+                        AND COALESCE(
+                            NOT ((CASE WHEN r.model = ANY($12::text[]) THEN r.model
+                                       ELSE (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id) END)
+                                 = ANY($12::text[])),
+                            false)
+                    )
+                    OR 'codex_custom_model_v1' = ANY(p.protocol_capabilities)
+                )
                 AND pa.active < p.max_concurrent_runs
                 AND pa.active * (SELECT w.max_concurrent_runs FROM workers w WHERE w.id = $1)
                     < (SELECT count(*) FROM runs mr
@@ -802,7 +846,7 @@ WITH target AS (
             -- PRD #1497 M1 (D16): a RELEASED flight's fresh snapshot must NOT block the reclaim of a
             -- server-parked run — the release is exactly the signal the old flight is over.
             AND r.claim_released_at IS NULL
-            AND (a.reported_at >= $15
+            AND (a.reported_at >= $16
                  OR (a.terminal_pending AND a.terminal_pending_until > now())))
       -- (2) Request-array exclusion (fact 7): the claimant's OWN request snapshot excludes its
       -- listed runs at the CURRENT generation, so the exclusion holds BEFORE the first heartbeat
@@ -812,8 +856,8 @@ WITH target AS (
       -- Empty arrays (no request snapshot, or the no-snapshot path) match nothing → no exclusion.
       AND NOT EXISTS (
           SELECT 1
-          FROM unnest($16::uuid[]) WITH ORDINALITY AS req_id(id, ord)
-          JOIN unnest($17::bigint[]) WITH ORDINALITY AS req_gen(gen, ord)
+          FROM unnest($17::uuid[]) WITH ORDINALITY AS req_id(id, ord)
+          JOIN unnest($18::bigint[]) WITH ORDINALITY AS req_gen(gen, ord)
                ON req_gen.ord = req_id.ord
           WHERE req_id.id = r.id AND req_gen.gen = r.claim_generation)
       -- (3) Overflow closure (D11): never claim a run whose OWNER is under an unexpired
@@ -844,7 +888,7 @@ WITH target AS (
     -- fail-open: a demoted run created before it reads as stale, so
     -- fn_run_priority returns normal and background work never starves.
     ORDER BY COALESCE(r.worker_id = $1, false) DESC,
-             fn_run_priority(r.kind, r.priority, r.created_at < $18) DESC,
+             fn_run_priority(r.kind, r.priority, r.created_at < $19) DESC,
              r.created_at ASC
     FOR UPDATE SKIP LOCKED
     LIMIT 1
@@ -864,9 +908,9 @@ hold AS (
          original_worker_id, original_worker_identity, live_worker_id, live_run_id,
          created_at, updated_at)
     SELECT gen_random_uuid(), t.user_id, t.repo_id, t.id, t.claim_generation + 1, 'open',
-           $1, $19::text, $1, t.id, now(), now()
+           $1, $20::text, $1, t.id, now(), now()
     FROM target t
-    WHERE $20::boolean
+    WHERE $21::boolean
       AND t.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework')
     RETURNING 1
 )
@@ -916,6 +960,7 @@ type ClaimRunParams struct {
 	CapabilityAware       bool               `json:"capability_aware"`
 	CustodyHoldLimit      int32              `json:"custody_hold_limit"`
 	WorkerProtocolCaps    []string           `json:"worker_protocol_caps"`
+	CodexCuratedModels    []string           `json:"codex_curated_models"`
 	IsEphemeral           bool               `json:"is_ephemeral"`
 	EphemeralRunID        pgtype.UUID        `json:"ephemeral_run_id"`
 	SpreadCutoff          pgtype.Timestamptz `json:"spread_cutoff"`
@@ -975,6 +1020,7 @@ func (q *Queries) ClaimRun(ctx context.Context, arg ClaimRunParams) (Run, error)
 		arg.CapabilityAware,
 		arg.CustodyHoldLimit,
 		arg.WorkerProtocolCaps,
+		arg.CodexCuratedModels,
 		arg.IsEphemeral,
 		arg.EphemeralRunID,
 		arg.SpreadCutoff,
@@ -1543,6 +1589,23 @@ WHERE run.id = $1
        OR 'completion_interlock_v1' = ANY(w.protocol_capabilities))
   AND (NOT (run.harness = 'codex' OR run.codex_material_revision IS NOT NULL OR run.codex_secret_id IS NOT NULL)
        OR 'codex_harness_v1' = ANY(w.protocol_capabilities))
+  -- PRD #1551 M4 (D6): MIRROR ClaimRun's non-bypassable custom-Codex-model clause, so this
+  -- claimable count and the claim gate never disagree. The effective-root expression is written
+  -- IDENTICALLY to ClaimRun (run.model/curated-else-lane, NULL-safe via COALESCE), reading the
+  -- candidate worker's OWN protocol_capabilities.
+  AND (
+      NOT (
+          run.harness = 'codex'
+          AND run.kind NOT IN ('judge', 'chat')
+          AND run.review_target_run_id IS NULL
+          AND COALESCE(
+              NOT ((CASE WHEN run.model = ANY($5::text[]) THEN run.model
+                         ELSE (SELECT u.default_codex_model FROM users u WHERE u.id = run.user_id) END)
+                   = ANY($5::text[])),
+              false)
+      )
+      OR 'codex_custom_model_v1' = ANY(w.protocol_capabilities)
+  )
   AND (NOT w.ephemeral OR w.ephemeral_run_id = run.id)
   AND (run.released_worker_id IS NULL
        OR run.released_worker_id <> w.id
@@ -1554,6 +1617,7 @@ type CountOnlineWorkersClaimableForRunParams struct {
 	HeartbeatCutoff     pgtype.Timestamptz `json:"heartbeat_cutoff"`
 	DockerRepoAllowlist []uuid.UUID        `json:"docker_repo_allowlist"`
 	CapabilityAware     bool               `json:"capability_aware"`
+	CodexCuratedModels  []string           `json:"codex_curated_models"`
 }
 
 // PRD #1497 M1 (D19): how many of the run's owner's workers could ACTUALLY claim THIS ONE run right
@@ -1576,6 +1640,7 @@ func (q *Queries) CountOnlineWorkersClaimableForRun(ctx context.Context, arg Cou
 		arg.HeartbeatCutoff,
 		arg.DockerRepoAllowlist,
 		arg.CapabilityAware,
+		arg.CodexCuratedModels,
 	)
 	var count int64
 	err := row.Scan(&count)
@@ -1671,6 +1736,40 @@ WHERE w.user_id = $1
 // Codex-indicating queued run already past its health threshold, so it is off the hot path.
 func (q *Queries) CountOnlineWorkersSatisfyingCodexHarness(ctx context.Context, userID uuid.UUID) (int64, error) {
 	row := q.db.QueryRow(ctx, countOnlineWorkersSatisfyingCodexHarness, userID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
+const countOnlineWorkersSatisfyingCustomCodex = `-- name: CountOnlineWorkersSatisfyingCustomCodex :one
+SELECT count(*) FROM workers w
+WHERE w.user_id = $1
+  AND w.status = 'online'
+  AND w.draining_since IS NULL
+  AND NOT w.ephemeral
+  AND 'codex_harness_v1' = ANY(w.protocol_capabilities)
+  AND 'codex_custom_model_v1' = ANY(w.protocol_capabilities)
+`
+
+// PRD #1551 M4 (D6): how many of a user's ONLINE, non-draining, non-ephemeral workers self-report
+// BOTH the 'codex_harness_v1' AND 'codex_custom_model_v1' PROTOCOL capabilities. This is the
+// custom-Codex-model analogue of CountOnlineWorkersSatisfyingCodexHarness: it answers "does the
+// fleet have ANY worker that can execute a CUSTOM Codex root model?", NOT "can THIS run be claimed
+// right now?". It drives the queued-reason resolver's custom-Codex rung (reasonNoCustomCodexCapable
+// Worker): a 0 here for a CUSTOM-root queued run means every online worker predates the passthrough
+// renderer, so the run's NON-BYPASSABLE custom-model claim clause (ClaimRun's
+// 'codex_custom_model_v1' = ANY(@worker_protocol_caps)) can never be satisfied — a persistent block
+// distinct from the plain Codex-harness gap, the generic wait, or the docker-allowlist fence.
+//
+// It requires codex_harness_v1 too because a custom-root run must first pass the Codex-harness gate:
+// a worker with codex_custom_model_v1 but not codex_harness_v1 cannot claim it (both ClaimRun
+// clauses apply), and such a worker cannot exist in practice (the agent advertises the pair
+// together), but the AND keeps this count exactly the set that could actually claim. Reads
+// workers.protocol_capabilities DIRECTLY, like its siblings; draining_since IS NULL and NOT
+// w.ephemeral for the same reasons. Only called for a custom-root queued run already past its
+// health threshold, so it is off the hot path.
+func (q *Queries) CountOnlineWorkersSatisfyingCustomCodex(ctx context.Context, userID uuid.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, countOnlineWorkersSatisfyingCustomCodex, userID)
 	var count int64
 	err := row.Scan(&count)
 	return count, err
@@ -5642,7 +5741,15 @@ SELECT id, user_id, status, auto_approve,
        health, health_reason, health_since, health_notified_at,
        budget_wall_seconds, budget_paused_seconds, budget_extension_seconds, budget_finalize_seconds, interactive,
        repo_id, kind, dispatched_at, required_capabilities, completion_contract_version,
-       harness, codex_material_revision, codex_secret_id, worker_id, released_worker_id
+       harness, codex_material_revision, codex_secret_id, worker_id, released_worker_id,
+       (runs.harness = 'codex'
+        AND runs.kind NOT IN ('judge', 'chat')
+        AND runs.review_target_run_id IS NULL
+        AND COALESCE(
+            NOT ((CASE WHEN runs.model = ANY($1::text[]) THEN runs.model
+                       ELSE (SELECT u.default_codex_model FROM users u WHERE u.id = runs.user_id) END)
+                 = ANY($1::text[])),
+            false))::boolean AS codex_custom_root
 FROM runs
 WHERE status IN ('queued', 'running', 'awaiting_approval')
   AND kind <> 'chat'
@@ -5676,6 +5783,7 @@ type ListActiveRunsForHealthRow struct {
 	CodexSecretID             pgtype.UUID        `json:"codex_secret_id"`
 	WorkerID                  pgtype.UUID        `json:"worker_id"`
 	ReleasedWorkerID          pgtype.UUID        `json:"released_worker_id"`
+	CodexCustomRoot           bool               `json:"codex_custom_root"`
 }
 
 // Run health detector (PRD #47) ----------------------------------------------
@@ -5717,8 +5825,16 @@ type ListActiveRunsForHealthRow struct {
 // PRD #1497 M1: budget_finalize_seconds rides this read so the near-timeout arm measures against
 // the full three-term effective timeout; released_worker_id rides it so the queued arm can surface
 // the "restart worker <name>" reason when a server-side wall park barred the only capable incarnation.
-func (q *Queries) ListActiveRunsForHealth(ctx context.Context) ([]ListActiveRunsForHealthRow, error) {
-	rows, err := q.db.Query(ctx, listActiveRunsForHealth)
+// PRD #1551 M4 (D6): codex_custom_root is a SQL-computed boolean projecting ClaimRun's
+// custom-Codex-model predicate onto each row, so the queued arm can surface a custom-Codex-capability
+// reason for a run whose EFFECTIVE worker-root model is a CUSTOM (non-curated) id that no online
+// worker advertising codex_custom_model_v1 can claim. The effective-root expression is written
+// IDENTICALLY to ClaimRun (a frozen curated runs.model wins, otherwise the owner's default_codex_model
+// lane; NULL-safe via COALESCE), and the exemption is keyed on review_target_run_id/kind (task-review,
+// judge and chat are exempt), NEVER on all of kind='task'. Cast ::boolean so sqlc types it as a usable
+// bool (an expression is interface{} without the cast, per .claude/rules/go.md).
+func (q *Queries) ListActiveRunsForHealth(ctx context.Context, codexCuratedModels []string) ([]ListActiveRunsForHealthRow, error) {
+	rows, err := q.db.Query(ctx, listActiveRunsForHealth, codexCuratedModels)
 	if err != nil {
 		return nil, err
 	}
@@ -5754,6 +5870,7 @@ func (q *Queries) ListActiveRunsForHealth(ctx context.Context) ([]ListActiveRuns
 			&i.CodexSecretID,
 			&i.WorkerID,
 			&i.ReleasedWorkerID,
+			&i.CodexCustomRoot,
 		); err != nil {
 			return nil, err
 		}

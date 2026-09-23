@@ -73,6 +73,23 @@ const RecoveryArchiveV2 = "recovery_archive_v2"
 // which is a calibrated failure case: the capable-worker claim test then fails.
 const CodexHarnessV1 = "codex_harness_v1"
 
+// CodexCustomModelV1 is the PROTOCOL capability a worker self-reports (PRD #1551 M4, D6) after its
+// Codex renderer can pass a validated CUSTOM (non-curated) worker-root model to the fixed OpenAI
+// provider WITHOUT substituting the curated Astra fallback. It is a strict addition on top of
+// CodexHarnessV1: a worker advertising it also advertises codex_harness_v1 (agent commit 9ed8d6b6).
+// Like CodexHarnessV1 it is a worker/server protocol fact, NOT a scheduler capability or a
+// user-chosen repo requirement, so it lives in the protocol vocabulary below, NEVER in
+// `vocabulary`, `required_capabilities` or the web capability picker. It is the fail-closed
+// old-worker discriminator for custom Codex roots: ClaimRun's dedicated custom-Codex clause (D6,
+// a sibling of the codex-harness clause) admits a run whose EFFECTIVE worker-root model is custom
+// ONLY for a worker whose workers.protocol_capabilities contains it — OUTSIDE fn_worker_can_claim,
+// required_capabilities, ClearRunRequiredCapabilities and the capability_aware kill-switch — so an
+// old codex_harness_v1-only worker can never be sent a custom root and silently run Astra. A
+// task-review/judge/chat run reads no Codex lane and is exempt. FilterProtocol drops it on
+// registration if removed from protocolVocabulary, which is a calibrated failure case: the
+// capable-worker custom-model claim test then fails.
+const CodexCustomModelV1 = "codex_custom_model_v1"
+
 // CredentialSwitchV1 is the PROTOCOL capability a worker self-reports (PRD #1247 M5, D3/D4)
 // to declare it implements the HELD-STATE credential-switch protocol — the two-phase local
 // release (quiesce -> verified capture -> teardown -> {status:"credential_switch"} report) and
@@ -105,13 +122,14 @@ var protocolVocabulary = map[string]struct{}{
 	RecoveryArchiveV1:     {},
 	RecoveryArchiveV2:     {},
 	CodexHarnessV1:        {},
+	CodexCustomModelV1:    {},
 	CredentialSwitchV1:    {},
 	WallParkV1:            {},
 }
 
 // protocolOrder fixes FilterProtocol's stable output order (protocolVocabulary is a map,
 // so its own iteration order is not stable). Keep in lockstep with protocolVocabulary.
-var protocolOrder = []string{CompletionInterlockV1, RecoveryArchiveV1, RecoveryArchiveV2, CodexHarnessV1, CredentialSwitchV1, WallParkV1}
+var protocolOrder = []string{CompletionInterlockV1, RecoveryArchiveV1, RecoveryArchiveV2, CodexHarnessV1, CodexCustomModelV1, CredentialSwitchV1, WallParkV1}
 
 // FilterProtocol returns the members of in that are in the PROTOCOL vocabulary, DROPPING
 // unknowns silently (never an error), deduped, in stable order. It mirrors Filter but

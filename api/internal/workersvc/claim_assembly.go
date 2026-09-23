@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"unicode/utf8"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/privcheck"
@@ -240,34 +242,56 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		return nil, fmt.Errorf("list claim agent templates: %w", err)
 	}
 
-	// The run owner's per-user default model overrides the lead template's model
-	// on the worker (PRD #17 Decision 6). NULL ⇒ nil ⇒ omitted from the payload,
-	// so the worker falls back to the lead template's model. PRD #300 layers a
-	// per-schedule freeze on top of this (see the run.Model override just below).
-	defaultModel, err := s.q.GetUserDefaultModel(ctx, run.UserID)
-	if err != nil {
-		return nil, fmt.Errorf("default model lookup: %w", err)
-	}
-	// PRD #300: a schedule can freeze a per-run model onto the run at fire time
-	// (runs.model). When present it takes precedence over the owner's per-user Worker
-	// default for THIS run's DefaultModel, and is delivered on the SAME default_model
-	// claim field the worker already consumes — so the worker is unchanged (Decision 7)
-	// and a subagent template's own model: pin, carried separately on each agent, still
-	// wins. NULL run.model = inherit = today's behaviour (byte-identical for every
-	// non-scheduled run and every schedule without a model).
-	if run.Model.Valid {
-		defaultModel = run.Model
+	// PRD #1551 M4 (D4): read the per-harness model lane matching the ALREADY-FROZEN run
+	// harness, replacing the legacy shared default_model. A REVIEW run (kind='task' with
+	// review_target_run_id set) reads NO Codex lane: a Codex task review uses the agent's
+	// built-in gpt-6-sol, so a Codex review ships no default_model at all; a Claude review
+	// still ships the Claude lane, keeping Claude reviews equivalent to today's shared slot.
+	// Judge runs never reach here (they forked to assembleJudgeClaim above), and chat has its
+	// own Claude-only lane read (chat.go). Empty lane ⇒ nil ⇒ the worker's own harness default.
+	harness := Harness(run.Harness)
+	isReviewRun := run.ReviewTargetRunID.Valid
+	var defaultModel pgtype.Text
+	if !(harness == HarnessCodex && isReviewRun) {
+		lanes, lerr := s.q.GetUserHarnessModelDefaults(ctx, run.UserID)
+		if lerr != nil {
+			return nil, fmt.Errorf("harness model defaults lookup: %w", lerr)
+		}
+		if harness == HarnessCodex {
+			defaultModel = lanes.DefaultCodexModel
+		} else {
+			defaultModel = lanes.DefaultClaudeModel
+		}
+		// PRD #300 / PRD #1551 D4: a schedule can freeze a per-run model onto the run
+		// (runs.model). It wins over the owner's lane ONLY when it is compatible with the run
+		// harness; delivered on the SAME default_model claim field, so the worker is unchanged
+		// (Decision 7) and a subagent template's own model: pin still wins. An INCOMPATIBLE
+		// frozen model records the existing visible fallback note and falls back to the owner's
+		// lane for that harness (D4 as written), never the worker's bare harness default. Lane
+		// values already carry their harness and NEVER traverse harnessModelCompatible — it now
+		// screens only frozen run.model values.
+		if run.Model.Valid {
+			if harnessModelCompatible(harness, run.Model.String) {
+				defaultModel = run.Model
+			} else {
+				recordedLastSeq = s.recordHarnessModelFallbackNote(ctx, run, recordedLastSeq, harness, run.Model.String)
+			}
+		}
 	}
 
-	// PRD #1429 D6: the model vocabulary is harness-owned. If the resolved model belongs to the
-	// OTHER harness (a Claude alias on a Codex run, or a Codex-only model on a Claude run), drop it
-	// so the worker uses its own harness default, and record a VISIBLE nonsecret status note — a
-	// Claude alias must NEVER reach a Codex claim, nor a Codex model a Claude claim. Empty/inherit
-	// and same-harness models pass through unchanged, so every existing claim stays byte-identical.
-	if defaultModel.Valid && !harnessModelCompatible(Harness(run.Harness), defaultModel.String) {
-		dropped := defaultModel.String
-		defaultModel = pgtype.Text{} // omit → the worker falls back to its own harness default
-		recordedLastSeq = s.recordHarnessModelFallbackNote(ctx, run, recordedLastSeq, Harness(run.Harness), dropped)
+	// PRD #1551 M4 (D6): post-claim custom-Codex capability re-check. ClaimRun commits BEFORE
+	// assembleClaim runs (service.go), so the owner's Codex lane could have flipped to a CUSTOM
+	// (non-curated) id in the window between the claim's SQL gate and here. For an ordinary
+	// (non-review) Codex run whose effective root is custom, refuse to ship it to a worker that
+	// lacks codex_custom_model_v1 and return an error recoverClaimAssembly REQUEUES — the run
+	// goes back to queued for a capable worker rather than silently running Astra or failing. A
+	// review run left defaultModel nil above and is exempt; judge/chat never reach here. A custom
+	// id is exactly one harnessModelCompatible rejects for the Codex harness (non-empty,
+	// non-curated), so the same closed vocabulary decides the claim gate and this re-check.
+	if harness == HarnessCodex && !isReviewRun &&
+		defaultModel.Valid && !harnessModelCompatible(HarnessCodex, defaultModel.String) &&
+		!slices.Contains(wkr.ProtocolCapabilities, capability.CodexCustomModelV1) {
+		return nil, errCustomModelCapabilityMissing
 	}
 
 	// The run owner's per-user default reasoning effort (PRD #617). NULL now

@@ -161,6 +161,14 @@ func (e interlockLiveDB) claimParams(workerID uuid.UUID, protocolCaps []string, 
 		WorkerCaps:            []string{},
 		CapabilityAware:       capAware,
 		WorkerProtocolCaps:    protocolCaps,
+		// PRD #1551 M4 (D6): the curated Codex vocabulary, EXACTLY as production passes it
+		// (codexCuratedModelsSlice). It is load-bearing here, not decorative: the custom-Codex
+		// clause's `effective_root = ANY(@codex_curated_models)` relies on a NON-empty array so a
+		// NULL effective root evaluates to NULL (⇒ not custom via COALESCE). An empty array would
+		// make `NULL = ANY('{}')` return false, flipping every NULL-lane Codex run to "custom" and
+		// wrongly gating the plain codex_harness_v1 tests. Passing the real set keeps those tests
+		// valid and lets the M4 tests below set a real custom lane to exercise the gate.
+		CodexCuratedModels: codexCuratedModelsSlice(),
 	}
 }
 

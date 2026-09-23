@@ -143,15 +143,10 @@ SELECT judge_anthropic_bind_mode, judge_anthropic_secret_id FROM users WHERE id 
 -- availability and the M1 binding/auth-mode reads — are served by EXISTING queries the
 -- resolver reuses (UserHasAnthropicToken, GetDefaultUserSecretMeta/ID, GetUserSecretIDByLabel,
 -- CountCodexSecrets, GetCodexCredentialState, GetUserSecretMetaByID, GetRunCodexAuthContext).
--- Narrow single-column read keyed on the user, mirroring GetUserDefaultModel/GetUserDefaultEffort.
+-- Narrow single-column read keyed on the user, mirroring GetUserDefaultEffort.
 -- default_harness is written by SetUserHarnessModels (the grouped PUT /api/me/settings write,
 -- PRD #1551 M1 / D1); the CHECK closes it to claude|codex and the handler validates the enum.
 SELECT default_harness FROM users WHERE id = $1;
-
--- name: GetUserDefaultModel :one
--- The current user's per-user default worker model (PRD #17); NULL = inherit. Retained as the
--- legacy compatibility projection while claim/chat assembly (PRD #1551 M4) still reads it.
-SELECT default_model FROM users WHERE id = $1;
 
 -- name: GetUserHarnessModelDefaults :one
 -- The current user's per-harness worker-model lanes (PRD #1551 M1 / D2 / D4): the retained

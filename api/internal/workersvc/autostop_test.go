@@ -1125,7 +1125,7 @@ func (f *autoStopSweepStore) ListLimitWaitReeval(context.Context, pgtype.Timesta
 func (f *autoStopSweepStore) ListReleasableCustodyHolds(context.Context) ([]store.ListReleasableCustodyHoldsRow, error) {
 	return nil, nil
 }
-func (f *autoStopSweepStore) ListActiveRunsForHealth(context.Context) ([]store.ListActiveRunsForHealthRow, error) {
+func (f *autoStopSweepStore) ListActiveRunsForHealth(context.Context, []string) ([]store.ListActiveRunsForHealthRow, error) {
 	return f.active, nil
 }
 func (f *autoStopSweepStore) ListRunToolWindow(context.Context, store.ListRunToolWindowParams) ([]store.ListRunToolWindowRow, error) {

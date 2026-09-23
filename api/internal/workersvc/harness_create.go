@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"sort"
 	"strings"
 
 	"github.com/google/uuid"
@@ -58,15 +59,35 @@ var codexModels = map[string]bool{
 	"gpt-6-sol":   true,
 }
 
-// harnessModelCompatible reports whether the stored model may ride a claim for harness h, given
-// the two closed harness vocabularies (PRD #1429 D6). An empty (inherit) model is always
-// compatible — the worker uses its own harness default. The rule NEVER lets a Claude alias reach
-// a Codex claim or a Codex-only model reach a Claude claim:
+// codexCuratedModelsSlice returns the curated Codex model ids (codexModels) as a sorted slice,
+// for the @codex_curated_models::text[] param that feeds the PRD #1551 M4 (D6) custom-Codex-model
+// capability gate in ClaimRun / CountOnlineWorkersClaimableForRun / ListActiveRunsForHealth. The
+// SQL effective-root CASE treats a curated id as a claimable root (no new requirement) and a
+// non-curated effective root as CUSTOM (requires codex_custom_model_v1). Sorting is only for a
+// stable, reviewable param value; membership, not order, is what the SQL `= ANY(...)` tests.
+func codexCuratedModelsSlice() []string {
+	out := make([]string, 0, len(codexModels))
+	for m := range codexModels {
+		out = append(out, m)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// harnessModelCompatible screens a FROZEN run.model value (a schedule/per-run pin) against harness
+// h's closed vocabulary (PRD #1429 D6, narrowed by PRD #1551 M4). Since M4 the per-harness user
+// lanes are read straight from GetUserHarnessModelDefaults and already carry their harness, so a
+// LANE VALUE NEVER traverses this function — its ONLY remaining caller is the frozen-run.model
+// precedence check in claim/judge assembly (and the Go mirror of the custom-Codex re-check, which
+// exploits that the Codex arm below is true iff the id is empty or curated). An empty (inherit)
+// model is always compatible — the worker uses its own harness default. The rule NEVER lets a
+// Claude alias reach a Codex claim or a Codex-only model reach a Claude claim:
 //
 //   - Codex harness: ONLY a known Codex model is compatible. A Claude alias, or a custom/unknown
-//     id whose Codex-compatibility cannot be known here, is refused so the worker falls back to
-//     its own Codex default — the conservative direction the PRD requires (Codex has a closed
-//     closed vocabulary, so anything else is unsafe to forward).
+//     id whose Codex-compatibility cannot be known here, is refused so a frozen pin falls back to
+//     the owner's Codex lane — the conservative direction the PRD requires (Codex has a closed
+//     vocabulary, so a frozen non-curated pin is never forwarded; a CUSTOM Codex id reaches a run
+//     only through the per-user Codex lane, D5, never through this frozen-pin path).
 //   - Claude harness: a known Codex-only model is refused; every other value (a Claude alias OR a
 //     custom full Claude id like claude-opus-4-8) passes through unchanged, preserving today's
 //     honour-any-custom-id behaviour.
