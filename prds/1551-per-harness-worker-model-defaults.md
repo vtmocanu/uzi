@@ -81,7 +81,7 @@ Default harness and per-harness models are one user decision and share one card.
 
 Add nullable `users.default_claude_model` and `users.default_codex_model`. Renaming or dropping `users.default_model` would violate the repository's additive rolling-compatibility discipline and would make an immediate rollback lose the migrated value. Public JSON gains the two explicit names; `default_model` stays as a deprecated compatibility projection for one release and is not removed by this PRD.
 
-The additive migration copies `gpt-6-astra` and `gpt-5.6-sol` from the legacy slot into `default_codex_model`; every other non-null legacy value copies into `default_claude_model`. It does not clear or reinterpret `default_model`. This is conservative: #1429 allowed only those two Codex values to reach a run, so an unknown legacy value was never an effective Codex default and must not become newly executable merely because the migration ran.
+The additive migration copies the curated Codex IDs (`gpt-6-astra`, `gpt-5.6-sol` and `gpt-6-sol`) from the legacy slot into `default_codex_model`; every other non-null legacy value copies into `default_claude_model`. It does not clear or reinterpret `default_model`. This is conservative: #1429 (widened by #1567) allowed only those curated Codex values to reach a run, so an unknown legacy value was never an effective Codex default and must not become newly executable merely because the migration ran.
 
 The Down migration first projects the currently selected lane back into `default_model`, then drops only the two new columns. Two independent values cannot collapse losslessly into one on rollback, so the inactive lane may be lost after a post-upgrade edit; the active preference is retained and the limitation is stated in the migration comment and release notes. The Up path itself discards no value.
 
@@ -139,7 +139,7 @@ This PRD separates model defaults only. The existing per-user reasoning-effort v
 
 #### M1: additive persistence and atomic settings contract
 
-- Add nullable `users.default_claude_model` and `users.default_codex_model` in a draft-numbered migration. Backfill only the two previously effective Codex IDs into Codex, copy every other non-null legacy value into Claude, and leave `default_model` untouched. Down projects the active lane into the legacy slot before removing the new columns and documents its unavoidable inactive-lane loss.
+- Add nullable `users.default_claude_model` and `users.default_codex_model` in a draft-numbered migration. Backfill only the three previously effective curated Codex IDs into Codex, copy every other non-null legacy value into Claude, and leave `default_model` untouched. Down projects the active lane into the legacy slot before removing the new columns and documents its unavoidable inactive-lane loss.
 - Extend sqlc settings reads and the public DTO/contract fixtures with explicit Claude and Codex fields while retaining the deprecated legacy field.
 - Add one PATCH-like SQL update for `default_harness`, both explicit lanes and the legacy projection, with present/null/value semantics for each. When any grouped field is supplied, one statement applies the entire group and returns the saved values.
 - Implement D3's legacy request/response bridge without string-prefix guessing and without making credential availability a prerequisite for settings. Validate the complete request before the atomic write.
@@ -220,9 +220,9 @@ M1 to M3 touch separate primary files and can run concurrently. M3 may code agai
 6. An old worker without `codex_custom_model_v1` cannot claim a run whose worker root is a custom model; task-review and judge runs are unaffected. It remains queued with a specific capability reason rather than silently running Astra.
 7. Unknown API-key model pricing reports unreported; subscription reports subscription; both retain token totals and neither fabricates dollars.
 8. Schedule-model precedence, per-role pins, judge/summary models, shared reasoning effort, literal-Claude Chat and the claim wire retain their pre-#1551 behavior. Task review is independent of the saved defaults and is not configurable in #1551.
-11. Codex task review uses the built-in `gpt-6-sol` regardless of the saved defaults, while the ordinary no-model Codex fallback and the shared provider default stay `gpt-6-astra`.
-9. Existing data migrates conservatively into explicit lanes while the legacy value stays intact. Immediate rollback restores the active lane; its documented inactive-lane limitation is accepted.
-10. The grouped update is atomic, all new API fields are contract-tested, focused live-DB tests execute with zero skips, all named gates pass, and M6 passes on hosted k8s.
+9. Codex task review uses the built-in `gpt-6-sol` regardless of the saved defaults, while the ordinary no-model Codex fallback and the shared provider default stay `gpt-6-astra`.
+10. Existing data migrates conservatively into explicit lanes while the legacy value stays intact. Immediate rollback restores the active lane; its documented inactive-lane limitation is accepted.
+11. The grouped update is atomic, all new API fields are contract-tested, focused live-DB tests execute with zero skips, all named gates pass, and M6 passes on hosted k8s.
 
 ## Risks
 
@@ -255,7 +255,7 @@ M1 to M3 touch separate primary files and can run concurrently. M3 may code agai
 | 2026-09-23 | The capability exemption for task review is `review_target_run_id IS NOT NULL`, not `kind='task'` | An ordinary task handoff is also `kind='task'` and does read the Codex lane |
 | 2026-09-23 | The curated Codex set is `gpt-6-astra`, `gpt-5.6-sol`, `gpt-6-sol` | `gpt-6-sol` landed with #1567 after this PRD was written; the migration and capability predicate use all three |
 | 2026-09-23 | An incompatible frozen schedule model falls back to the owner's lane for the run harness, with the visible fallback note | D4 precedence as written; previously it fell to the worker's harness default |
-| 2026-09-23 | Down projects the active lane using D11 rendered in SQL; grouped saves also keep the legacy column equal to the effective lane | Image-only rollback reads the maintained legacy value; an explicit goose Down recomputes against current credentials. Tested in an isolated database |
+| 2026-09-23 | Down projects the active lane using the PRD #1106 D11 harness resolver rendered in SQL; grouped saves also keep the legacy column equal to the effective lane | Image-only rollback reads the maintained legacy value; an explicit goose Down recomputes against current credentials. Tested in an isolated database |
 | 2026-09-23 | Cross-vocabulary validation uses only the closed lists: a curated Codex ID is rejected in the Claude lane and a known Claude alias in the Codex lane | Satisfies D3's no-prefix-guessing rule |
 
 ## Review record
