@@ -78,6 +78,8 @@ through `[0.52.0]`.)
   An approved Codex run now transitions from `awaiting_approval` to `running` and reports its first implementation iteration through the shared iteration seam before the first implementation turn, so its progress shows up like a Claude run's; a rejected or cancelled plan no longer reports that work has started.
 - **The usage cost-exclusion disclosure reads more clearly ([#1546](https://github.com/vtmocanu/uzi/issues/1546), [#1548](https://github.com/vtmocanu/uzi/pull/1548)).**
   The aggregate-cost note now states in one sentence that the total excludes Codex subscription runs and runs with unreported cost, with correct singular and plural wording for the excluded-run counts.
+- **GitLab merge requests no longer show as review-approved when nobody approved them ([#1560](https://github.com/vtmocanu/uzi/pull/1560)).**
+  The forge-view pulls screen trusted GitLab's `approved` flag, which is vacuously `true` on Enterprise Edition (gitlab.com and the default self-managed build) when a project has no approval rules, so clean merge requests were reported as approved without a review; the driver now requires at least one real approver, matching the GitHub/Forgejo behavior and the `approved` review-decision contract.
 
 ### Changed
 

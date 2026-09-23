@@ -127,9 +127,9 @@ func (g *gitLab) mergeRequestSummary(ctx context.Context, projectID int64, mr *g
 }
 
 // reviewDecision derives the neutral decision the GitLab free-tier way (D6): an
-// unresolved blocking discussion ⇒ changes_requested; else an approved MR (when the
-// Premium approvals endpoint answers) ⇒ approved; else a requested reviewer ⇒
-// review_required; else none.
+// unresolved blocking discussion ⇒ changes_requested; else an MR with at least one
+// approver (when the approvals endpoint answers) ⇒ approved; else a requested
+// reviewer ⇒ review_required; else none.
 func (g *gitLab) reviewDecision(ctx context.Context, projectID int64, mr *gitlab.BasicMergeRequest) (ReviewDecision, error) {
 	if !mr.BlockingDiscussionsResolved {
 		return ReviewChangesRequested, nil
@@ -147,10 +147,18 @@ func (g *gitLab) reviewDecision(ctx context.Context, projectID int64, mr *gitlab
 	return ReviewNone, nil
 }
 
-// mrApproved reads the MR's approval configuration. answered is false when the
-// endpoint 403s/404s — approvals are a GitLab Premium feature, and a CE instance
-// answers one of those (D6), which the driver skips rather than fails on. Any other
-// error propagates (a rate-limit or outage must not read as "not approved").
+// mrApproved reports whether at least one reviewer has approved the MR, honouring the
+// ReviewApproved contract ("at least one reviewer approved"). It counts the approvals
+// endpoint's approved_by rather than trusting its `approved` boolean: that boolean means
+// "the MR's approval RULES are satisfied", which on GitLab Enterprise Edition (gitlab.com
+// and the default self-managed build) is vacuously true — approved=true with an empty
+// approved_by — when no approval rules apply, so trusting it would band every clean MR
+// "approved" even when nobody reviewed it (D6, corrected). len(ApprovedBy)>0 is
+// edition-agnostic (it agrees with `approved` on Community Edition) and matches the
+// GitHub/Forgejo foldReviewDecision "any approval wins" rule. answered is false when the
+// endpoint 403s/404s — absent, or denied by permissions on some instances (the read
+// endpoint itself is available on all tiers) — which the driver skips rather than fails
+// on; any other error propagates (a rate-limit or outage must not read as "not approved").
 func (g *gitLab) mrApproved(ctx context.Context, projectID, mrIID int64) (approved, answered bool, err error) {
 	cfg, resp, e := g.client.MergeRequestApprovals.GetConfiguration(projectID, mrIID, gitlab.WithContext(ctx))
 	if e != nil {
@@ -159,7 +167,7 @@ func (g *gitLab) mrApproved(ctx context.Context, projectID, mrIID int64) (approv
 		}
 		return false, false, g.wrapErr("merge request approvals", e)
 	}
-	return cfg.Approved, true, nil
+	return len(cfg.ApprovedBy) > 0, true, nil
 }
 
 // ListMergeRequestReviews returns no per-reviewer reviews for GitLab (PRD #1255 D6):
