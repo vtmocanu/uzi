@@ -20,20 +20,6 @@ function aliasesForHarness(harness: Harness | undefined): readonly string[] {
   return harness === "codex" ? CODEX_MODEL_ALIASES : CLAUDE_MODEL_ALIASES;
 }
 
-// modelCompatibleWithHarness is the D6 compatibility rule Run Defaults uses to decide
-// whether SWITCHING the default harness must reset a stored model to inherit rather
-// than persist a knowingly-invalid pair (PRD #1429 D6): blank/inherit is always
-// compatible; a Codex target accepts only its curated aliases (Codex has no
-// custom escape hatch); a Claude target accepts anything EXCEPT a known Codex-only
-// alias (Claude keeps its curated-plus-custom freedom, but must never inherit a
-// Codex-specific model id it cannot run).
-export function modelCompatibleWithHarness(model: string, harness: Harness): boolean {
-  const trimmed = model.trim();
-  if (trimmed === "") return true;
-  if (harness === "codex") return (CODEX_MODEL_ALIASES as readonly string[]).includes(trimmed);
-  return !(CODEX_MODEL_ALIASES as readonly string[]).includes(trimmed);
-}
-
 type Mode = "inherit" | string | "custom";
 
 function deriveMode(value: string, aliases: readonly string[]): Mode {
@@ -43,22 +29,27 @@ function deriveMode(value: string, aliases: readonly string[]): Mode {
 }
 
 // ModelSelect is the shared model picker: a dropdown of the curated aliases plus
-// an "Inherit" (empty) option and — for Claude only — an "Other…" custom free-text
-// model ID (PRD #1429 D6: Codex's picker is closed, no custom escape hatch). The
-// effective model string is surfaced through onChange ("" = inherit). An incoming
-// value that is not one of the CURRENT harness's aliases initializes into the custom
-// state with its text prefilled — never silently reset to inherit (PRD #17 §2) —
-// even for Codex, so a value that predates a harness switch is still visible rather
-// than vanishing; the caller (Run Defaults) is what resets an incompatible stored
-// model to inherit on an explicit harness switch (D6). Submit gating stays with the
-// caller: it keeps passing the emitted value through frontmatterFieldWarning, so an
+// an "Inherit" (empty) option and — when custom entry is allowed — an "Other…"
+// custom free-text model ID. The effective model string is surfaced through onChange
+// ("" = inherit). An incoming value that is not one of the CURRENT harness's aliases
+// initializes into the custom state with its text prefilled — never silently reset to
+// inherit (PRD #17 §2) — even when custom entry is disabled, so a value that predates a
+// harness switch is still visible rather than vanishing. Submit gating stays with the
+// caller: it keeps passing the emitted value through modelFieldWarning, so an
 // injection-suspect custom ID still blocks the form.
+//
+// PRD #1551 M3: `allowCustom` is an explicit opt-in that overrides the harness default.
+// Historically custom entry was "Claude yes, Codex no" (PRD #1429 D6). Codex's picker
+// stayed closed for schedule/template callers, but the per-user Codex worker-model lane
+// on Run Defaults now needs an "Other…" escape hatch, so ONLY that caller passes
+// allowCustom. Every other caller omits it and keeps the harness-derived default.
 export function ModelSelect({
   value,
   onChange,
   id,
   customAriaLabel = "Custom model ID",
   harness,
+  allowCustom,
 }: {
   value: string;
   onChange: (model: string) => void;
@@ -68,9 +59,17 @@ export function ModelSelect({
   // Claude, so every pre-M4a caller (the agent-template editor, the schedule modal
   // before its own harness picker lands) renders exactly as before.
   harness?: Harness;
+  // Whether the "Other… (custom model ID)" menu entry is offered. Omitted ⇒ the
+  // historical harness default (Claude allows custom, Codex does not), so
+  // ScheduleModal / AgentTemplateEditor render unchanged. Run Defaults' Codex lane
+  // passes `allowCustom` to open the escape hatch there and there only (PRD #1551 D5).
+  allowCustom?: boolean;
 }) {
   const aliases = aliasesForHarness(harness);
-  const allowCustom = harness !== "codex";
+  const customAllowed = allowCustom ?? harness !== "codex";
+  // A provider-specific placeholder example, so the custom input hints at the right
+  // vocabulary (a Codex id looks like gpt-…, a Claude id like claude-…).
+  const customPlaceholder = harness === "codex" ? "gpt-…" : "claude-…";
   const [mode, setMode] = useState<Mode>(() => deriveMode(value, aliases));
   const [custom, setCustom] = useState(() => (deriveMode(value, aliases) === "custom" ? value : ""));
   // What we last emitted, so a parent echoing our own value back does not
@@ -84,9 +83,9 @@ export function ModelSelect({
   const lastHarness = useRef(harness);
 
   // ONE effect keyed on BOTH [value, harness], not two separate effects each keyed
-  // on one (PRD #1429 M4a). Run Defaults' saveHarness PATCHes default_harness and
-  // default_model TOGETHER (D6), so a harness switch and a value reset can land in
-  // the same render. Two independent single-dependency effects would each see only
+  // on one (PRD #1429 M4a). A harness switch and an externally-driven value change can
+  // land in the same render (an async settings load seeds both at once). Two
+  // independent single-dependency effects would each see only
   // ITS OWN dependency change and recompute mode/custom from a value/harness pair
   // that was current when THAT effect last fired — reading the other, unchanged
   // half from a potentially stale closure. A single effect that always recomputes
@@ -143,13 +142,13 @@ export function ModelSelect({
             value names an absent option silently falls back to the first option
             (selectedIndex 0), which would show "Inherit" while still emitting the
             stale custom string underneath it. */}
-        {(allowCustom || mode === "custom") && <option value="custom">Other (custom model ID)…</option>}
+        {(customAllowed || mode === "custom") && <option value="custom">Other (custom model ID)…</option>}
       </Select>
       {mode === "custom" && (
         <Input
           value={custom}
           onChange={(e) => onCustom(e.target.value)}
-          placeholder="claude-…"
+          placeholder={customPlaceholder}
           aria-label={customAriaLabel}
           autoCapitalize="off"
           autoCorrect="off"

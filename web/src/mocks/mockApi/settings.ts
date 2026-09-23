@@ -21,10 +21,19 @@ import {
   type Theme,
 } from "../../lib/theme";
 import { daysAgo, mockBuildInfo } from "../data";
+import { hasAnthropicToken, isCodexUsable } from "../../lib/hasToken";
 import { state } from "../store";
 import { delay, oidcDemo, requireSession, users } from "./shared";
 import { agentSource, mockAllowedAgentSourceHosts } from "./agentSource";
 import { secrets } from "./secrets";
+
+// PRD #1551 D3: the two closed cross-vocabulary sets, mirroring the server's lane
+// validation (and web/src/components/ModelSelect.tsx's curated lists). A curated Codex
+// id may not be saved into the Claude lane; a known Claude alias may not be saved into
+// the Codex lane (which otherwise accepts a custom id, D5). Kept module-local so knip
+// does not flag them.
+const CURATED_CODEX_IDS = ["gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol"];
+const KNOWN_CLAUDE_ALIASES = ["opus", "sonnet", "haiku", "fable"];
 
 // ── Settings persistence (demo build) ────────────────────────────────────────
 // The mock persists ONLY the settings maps to localStorage so a hard reload of
@@ -45,9 +54,16 @@ import { secrets } from "./secrets";
 // PRD #1429 M1 (default_harness joined UserSettings) does NOT bump the key: default_harness
 // is validated tolerantly (undefined/null/string, like default_effort/judge_model) and
 // merged over the SEED on load, so a stale v4 blob stays valid and reads default_harness=null.
+// PRD #1551 M1 (default_claude_model / default_codex_model joined UserSettings) does NOT
+// bump the key: like default_harness, both are validated tolerantly (undefined/null/string)
+// and merged over the SEED on load, so a stale v4 blob stays valid and reads them as null.
 const MOCK_SETTINGS_KEY = "uzi.mock.v4";
 const SEED_USER_SETTINGS: UserSettings = {
   default_model: null,
+  // PRD #1551 M1/D2: the two explicit per-harness worker-model lanes; null = inherit.
+  // The legacy default_model above stays as a server-projected compatibility field.
+  default_claude_model: null,
+  default_codex_model: null,
   default_effort: null,
   judge_model: null,
   summary_model: null,
@@ -148,6 +164,11 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
   const a = as as Record<string, unknown>;
   const okUser =
     (u.default_model === null || typeof u.default_model === "string") &&
+    // PRD #1551 M1: optional so a pre-split blob stays valid; absent/null reads as
+    // inherit (treated as null), and the SEED fills them going forward — the same
+    // tolerance default_harness uses, so no storage-key bump is needed.
+    (u.default_claude_model === undefined || u.default_claude_model === null || typeof u.default_claude_model === "string") &&
+    (u.default_codex_model === undefined || u.default_codex_model === null || typeof u.default_codex_model === "string") &&
     // Optional so a pre-#617 blob stays valid; absent reads as inherit, and the SEED
     // provides it going forward (like judge_model).
     (u.default_effort === undefined || u.default_effort === null || typeof u.default_effort === "string") &&
@@ -233,10 +254,25 @@ function loadSettings(): { userSettings: UserSettings; appSettings: AppSettings 
         // PRD #1170: drop the retired health_slow_seconds key a pre-migration v3 blob
         // carries, so it doesn't ride along into the served settings / get re-persisted.
         delete (appSettings as Record<string, unknown>).health_slow_seconds;
-        return {
-          userSettings: { ...SEED_USER_SETTINGS, ...parsed.userSettings },
-          appSettings,
-        };
+        const userSettings = { ...SEED_USER_SETTINGS, ...parsed.userSettings };
+        // PRD #1551 D2 migration parity: a pre-split blob carries only default_model
+        // with null lanes. Backfill the curated Codex ids into the Codex lane and every
+        // other non-null legacy value into the Claude lane — exactly the additive
+        // migration — so a persisted pre-#1551 demo default keeps working under the new
+        // lanes (and the projected legacy field stays coherent). Only when both lanes are
+        // still empty, so a post-split blob's explicit lanes are never overwritten.
+        if (
+          userSettings.default_claude_model == null &&
+          userSettings.default_codex_model == null &&
+          userSettings.default_model
+        ) {
+          if (CURATED_CODEX_IDS.includes(userSettings.default_model)) {
+            userSettings.default_codex_model = userSettings.default_model;
+          } else {
+            userSettings.default_claude_model = userSettings.default_model;
+          }
+        }
+        return { userSettings, appSettings };
       }
     }
   } catch {
@@ -335,6 +371,30 @@ function releaseCheckStatus(): ReleaseCheckStatus {
 }
 
 let userSettings: UserSettings = loadedSettings.userSettings;
+
+// PRD #1551 D3: the effective-harness lane the deprecated default_model projects to and
+// bridges through. A codex pin resolves to Codex, a claude pin to Claude; with no pin it
+// follows D11 — Codex only when it is the SOLE usable harness — and falls back to Claude
+// when no harness is usable at all. The grouped Run Defaults card never sends or reads
+// default_model, so this serves only the bounded stale-client bridge and the response
+// projection, mirroring the server.
+function effectiveLegacyLane(harness: UserSettings["default_harness"]): "claude" | "codex" {
+  if (harness === "codex") return "codex";
+  if (harness === "claude") return "claude";
+  const claudeUsable = hasAnthropicToken(secrets);
+  const codexUsable = isCodexUsable(secrets);
+  return codexUsable && !claudeUsable ? "codex" : "claude";
+}
+
+// mySettingsResponse projects the deprecated default_model from the effective-harness
+// lane so a stale client still reads a coherent single model, while the two explicit
+// lanes remain the stored source of truth.
+function mySettingsResponse(): { settings: UserSettings } {
+  const lane = effectiveLegacyLane(userSettings.default_harness);
+  const projected =
+    lane === "codex" ? userSettings.default_codex_model : userSettings.default_claude_model;
+  return { settings: { ...userSettings, default_model: projected ?? null } };
+}
 
 export let appSettings: AppSettings = loadedSettings.appSettings;
 // PRD #685: whether a logo asset exists for each slot. The demo tracks only
@@ -929,7 +989,7 @@ export const settingsApi = {
     if (stored) stored.ephemeral_workers_enabled = enabled;
     return delay({ user: { ...u } }, 200);
   },
-  getMySettings: async () => delay({ settings: { ...userSettings } }),
+  getMySettings: async () => delay(mySettingsResponse()),
   putMySettings: async (patch: UserSettingsPatch) => {
     // PATCH-like: apply only the fields present in the body, mirroring the real
     // handler so a theme-only save never clears the model and vice versa. Staged
@@ -939,8 +999,54 @@ export const settingsApi = {
     // handler's validate-all-then-write ordering.
     let next = { ...userSettings };
     if (patch.default_model !== undefined) {
+      // PRD #1551 D3: the deprecated legacy field is bridged to the effective-harness
+      // lane, never stored on its own. The effective harness is the pin supplied in
+      // THIS patch when present, else the stored pin (resolved through D11). A value that
+      // conflicts with an explicit lane sent in the same body is a 400, and the same
+      // cross-vocabulary rule as the explicit lane applies. New clients never send this.
+      const pin = patch.default_harness !== undefined ? patch.default_harness : userSettings.default_harness;
+      const lane = effectiveLegacyLane(pin);
       const trimmed = patch.default_model?.trim() ?? "";
-      next = { ...next, default_model: trimmed === "" ? null : trimmed };
+      const val = trimmed === "" ? null : trimmed;
+      if (lane === "codex") {
+        if (val !== null && KNOWN_CLAUDE_ALIASES.includes(val)) {
+          throw new ApiError(400, "default_codex_model: a Claude model is not valid for the Codex lane");
+        }
+        if (patch.default_codex_model !== undefined && (patch.default_codex_model?.trim() || null) !== val) {
+          throw new ApiError(400, "default_model conflicts with default_codex_model");
+        }
+        next = { ...next, default_codex_model: val };
+      } else {
+        if (val !== null && CURATED_CODEX_IDS.includes(val)) {
+          throw new ApiError(400, "default_claude_model: a Codex model is not valid for the Claude lane");
+        }
+        if (patch.default_claude_model !== undefined && (patch.default_claude_model?.trim() || null) !== val) {
+          throw new ApiError(400, "default_model conflicts with default_claude_model");
+        }
+        next = { ...next, default_claude_model: val };
+      }
+    }
+    if (patch.default_claude_model !== undefined) {
+      // PRD #1551 M1/D3: blank clears to inherit (null); a curated Codex id is rejected
+      // here (cross-vocabulary 400). The Claude lane otherwise keeps its curated-plus-custom
+      // freedom, so any other id is stored as given.
+      const trimmed = patch.default_claude_model?.trim() ?? "";
+      const val = trimmed === "" ? null : trimmed;
+      if (val !== null && CURATED_CODEX_IDS.includes(val)) {
+        throw new ApiError(400, "default_claude_model: a Codex model is not valid for the Claude lane");
+      }
+      next = { ...next, default_claude_model: val };
+    }
+    if (patch.default_codex_model !== undefined) {
+      // PRD #1551 M1/D3/D5: blank clears to inherit (null); a known Claude alias is
+      // rejected here (cross-vocabulary 400). Unlike the other lanes the Codex lane
+      // accepts a custom id, so any non-Claude-alias id is stored as given.
+      const trimmed = patch.default_codex_model?.trim() ?? "";
+      const val = trimmed === "" ? null : trimmed;
+      if (val !== null && KNOWN_CLAUDE_ALIASES.includes(val)) {
+        throw new ApiError(400, "default_codex_model: a Claude model is not valid for the Codex lane");
+      }
+      next = { ...next, default_codex_model: val };
     }
     if (patch.default_effort !== undefined) {
       // Closed enum (PRD #617 M5): blank clears to inherit; any other value must be one
@@ -1048,7 +1154,7 @@ export const settingsApi = {
     // Every field validated: commit the staged copy in one shot, then persist.
     userSettings = next;
     persistSettings();
-    return delay({ settings: { ...userSettings } });
+    return delay(mySettingsResponse());
   },
   // ── Slack linking (PRD #25 M3) ───────────────────────────────────────────────
   getMySlack: async () => delay(slackLinkResponse()),

@@ -869,8 +869,12 @@ describe("Run defaults — CI autofix tri-state display (PRD #914 M3)", () => {
   });
 });
 
-// PRD #1429 M4a, D2/D3/D6: the Default harness card.
-describe("Run defaults — default harness card (PRD #1429 M4a)", () => {
+
+// PRD #1551 M3: the grouped "Harness and worker models" card. The default harness and
+// the two retained per-harness model lanes are one decision saved in ONE PUT; changing
+// the harness never touches a model; the active-lane badge follows the effective harness;
+// a failed save keeps the form dirty. Each test names the mutation it fails on.
+describe("Run defaults — harness and worker models card (PRD #1551 M3)", () => {
   const anthropicToken = {
     id: "sec-anthropic",
     kind: "anthropic_token",
@@ -890,168 +894,317 @@ describe("Run defaults — default harness card (PRD #1429 M4a)", () => {
     updated_at: "2026-01-01T00:00:00Z",
   };
 
-  it("renders no harness card for a Claude-only user (today's flow, unchanged)", async () => {
+  // A complete UserSettings response with the two lanes, overridable per test.
+  const settings = (over: Record<string, unknown> = {}) => ({
+    settings: {
+      default_harness: null,
+      default_model: null,
+      default_claude_model: null,
+      default_codex_model: null,
+      default_effort: null,
+      judge_model: null,
+      summary_model: null,
+      appearance_mode: null,
+      light_theme: null,
+      dark_theme: null,
+      typeface: null,
+      theme: null,
+      ...over,
+    },
+  });
+
+  // Locate the lane <div> that contains a provider heading, so a badge/label assertion
+  // can be scoped to one lane rather than the whole card.
+  const laneOf = (heading: string) =>
+    screen.getByRole("heading", { name: heading }).closest("div.rounded-lg") as HTMLElement;
+
+  const saveButton = () =>
+    screen.getByRole("button", { name: "Save defaults" }) as HTMLButtonElement;
+
+  it("both usable: shows the harness selector, both lanes, and the badge on the effective (Claude) lane", async () => {
+    mockAuth(baseUser);
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken, codexKey] });
+    mockApi.getMySettings.mockResolvedValue(settings());
+    render(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+    // Selector present (this same query is the positive control the single-lane tests
+    // below pair their "no selector" negatives against).
+    const selector = (await screen.findByLabelText("Default harness")) as HTMLSelectElement;
+    expect(selector.value).toBe("inherit");
+    // Both lanes present.
+    expect(screen.getByLabelText("Claude model")).toBeTruthy();
+    expect(screen.getByLabelText("Codex model")).toBeTruthy();
+    // Inherit with both usable resolves to Claude (D11), so the badge is on the
+    // Anthropic lane and NOT on the Codex lane (paired positive/negative).
+    expect(within(laneOf("Anthropic")).getByText("Default harness")).toBeTruthy();
+    expect(within(laneOf("Codex")).queryByText("Default harness")).toBeNull();
+  });
+
+  it("both usable: the badge moves to the Codex lane when Codex is selected", async () => {
+    mockAuth(baseUser);
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken, codexKey] });
+    mockApi.getMySettings.mockResolvedValue(settings());
+    render(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+    const selector = (await screen.findByLabelText("Default harness")) as HTMLSelectElement;
+    // Before: badge on Anthropic (positive control that the badge exists to move).
+    expect(within(laneOf("Anthropic")).getByText("Default harness")).toBeTruthy();
+    fireEvent.change(selector, { target: { value: "codex" } });
+    // After: badge is on Codex and gone from Anthropic. Fails if the badge is pinned
+    // to a static lane instead of following the effective harness.
+    expect(within(laneOf("Codex")).getByText("Default harness")).toBeTruthy();
+    expect(within(laneOf("Anthropic")).queryByText("Default harness")).toBeNull();
+  });
+
+  it("both usable: the retention copy names the current default harness", async () => {
+    mockAuth(baseUser);
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken, codexKey] });
+    mockApi.getMySettings.mockResolvedValue(settings());
+    const { container } = render(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+    const selector = (await screen.findByLabelText("Default harness")) as HTMLSelectElement;
+    // Inherit → automatic.
+    expect(container.textContent ?? "").toMatch(/Harness selection is automatic/i);
+    fireEvent.change(selector, { target: { value: "codex" } });
+    expect(container.textContent ?? "").toMatch(/Codex is your default harness/i);
+    // Fails if the copy is static rather than keyed on the selection.
+    expect(container.textContent ?? "").not.toMatch(/Harness selection is automatic/i);
+  });
+
+  it("Claude-only: shows just the Claude lane with the badge and no selector", async () => {
     mockAuth(baseUser);
     mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken] });
+    mockApi.getMySettings.mockResolvedValue(settings());
     render(
       <MemoryRouter>
         <RunDefaults />
       </MemoryRouter>,
     );
-    await screen.findByText("Worker model");
-    expect(screen.queryByText("Default harness")).toBeNull();
+    // Positive: the Claude lane and its badge render.
+    expect(await screen.findByLabelText("Claude model")).toBeTruthy();
+    expect(within(laneOf("Anthropic")).getByText("Default harness")).toBeTruthy();
+    // Negatives, each paired with a positive control proving the query works when the
+    // element IS present: the selector (found in the both-usable test above) and the
+    // Codex lane (found in the both-usable test above).
+    expect(screen.queryByLabelText("Default harness")).toBeNull();
+    expect(screen.queryByLabelText("Codex model")).toBeNull();
   });
 
-  it("shows the harness card once both harnesses are usable, defaulting to inherit", async () => {
-    mockAuth(baseUser);
-    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken, codexKey] });
-    render(
-      <MemoryRouter>
-        <RunDefaults />
-      </MemoryRouter>,
-    );
-    const picker = (await screen.findByLabelText("Default harness")) as HTMLSelectElement;
-    expect(picker.value).toBe("inherit");
-    // Save is disabled until the picker actually changes.
-    expect(screen.getByRole("button", { name: "Save harness" }) as HTMLButtonElement).toHaveProperty(
-      "disabled",
-      true,
-    );
-  });
-
-  it("saves the picked harness via PATCH /me/settings", async () => {
-    mockAuth(baseUser);
-    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken, codexKey] });
-    mockApi.getMySettings.mockResolvedValue({
-      settings: {
-        default_harness: null,
-        default_model: null,
-        default_effort: null,
-        judge_model: null,
-        summary_model: null,
-        appearance_mode: null,
-        light_theme: null,
-        dark_theme: null,
-        typeface: null,
-        theme: null,
-      },
-    });
-    mockApi.putMySettings.mockResolvedValue({
-      settings: {
-        default_harness: "codex",
-        default_model: null,
-        default_effort: null,
-        judge_model: null,
-        summary_model: null,
-        appearance_mode: null,
-        light_theme: null,
-        dark_theme: null,
-        typeface: null,
-        theme: null,
-      },
-    });
-    render(
-      <MemoryRouter>
-        <RunDefaults />
-      </MemoryRouter>,
-    );
-    const picker = (await screen.findByLabelText("Default harness")) as HTMLSelectElement;
-    fireEvent.change(picker, { target: { value: "codex" } });
-    fireEvent.click(screen.getByRole("button", { name: "Save harness" }));
-    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({ default_harness: "codex" }));
-    await screen.findByText(/Default harness set to codex/);
-  });
-
-  // D6: switching the default harness to Codex resets an incompatible SAVED worker
-  // model (a Claude alias) to inherit in the SAME write, rather than persist a
-  // knowingly-invalid pair.
-  it("resets an incompatible saved worker model to inherit when switching to Codex", async () => {
-    mockAuth(baseUser);
-    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken, codexKey] });
-    mockApi.getMySettings.mockResolvedValue({
-      settings: {
-        default_harness: null,
-        default_model: "opus",
-        default_effort: null,
-        judge_model: null,
-        summary_model: null,
-        appearance_mode: null,
-        light_theme: null,
-        dark_theme: null,
-        typeface: null,
-        theme: null,
-      },
-    });
-    mockApi.putMySettings.mockResolvedValue({
-      settings: {
-        default_harness: "codex",
-        default_model: null,
-        default_effort: null,
-        judge_model: null,
-        summary_model: null,
-        appearance_mode: null,
-        light_theme: null,
-        dark_theme: null,
-        typeface: null,
-        theme: null,
-      },
-    });
-    render(
-      <MemoryRouter>
-        <RunDefaults />
-      </MemoryRouter>,
-    );
-    const picker = (await screen.findByLabelText("Default harness")) as HTMLSelectElement;
-    fireEvent.change(picker, { target: { value: "codex" } });
-    fireEvent.click(screen.getByRole("button", { name: "Save harness" }));
-    await waitFor(() =>
-      expect(mockApi.putMySettings).toHaveBeenCalledWith({ default_harness: "codex", default_model: null }),
-    );
-    await screen.findByText(/worker model was reset to Inherit/);
-    // The Worker model picker itself now reflects the cleared value. ModelSelect
-    // derives its own <select> mode from a passive effect one render AFTER the
-    // `value` prop changes, so this settles on a LATER tick than the notice text
-    // above (which commits in the SAME render as the prop change) — wrapped in
-    // waitFor rather than a bare synchronous read, or this assertion can run before
-    // that effect has flushed and see the stale "custom" mode.
-    await waitFor(() => {
-      const modelSelect = screen.getByLabelText("Model") as HTMLSelectElement;
-      expect(modelSelect.value).toBe("inherit");
-    });
-  });
-
-  it("offers the Codex model vocabulary on Worker model once Codex is the selected harness", async () => {
-    mockAuth(baseUser);
-    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken, codexKey] });
-    render(
-      <MemoryRouter>
-        <RunDefaults />
-      </MemoryRouter>,
-    );
-    const picker = (await screen.findByLabelText("Default harness")) as HTMLSelectElement;
-    fireEvent.change(picker, { target: { value: "codex" } });
-    // Scoped to the Worker model <select> itself: the Judge/Summary model pickers
-    // stay Claude-only and also render an "opus" option, so an unscoped query is
-    // ambiguous across all three.
-    const modelSelect = screen.getByLabelText("Model") as HTMLSelectElement;
-    expect(within(modelSelect).getByRole("option", { name: "gpt-6-astra" })).toBeTruthy();
-    expect(within(modelSelect).queryByRole("option", { name: "opus" })).toBeNull();
-  });
-
-  // PR #1449 review: a Codex-only user never sees the harness card (D2), so the pick
-  // stays "inherit" while every run resolves to Codex. Keyed on the raw pick, Worker
-  // model offered only Claude aliases, and a saved one was dropped at claim.
-  it("offers the Codex model vocabulary on Worker model to a Codex-only user with no harness card", async () => {
+  it("Codex-only: shows just the Codex lane with the badge and no selector", async () => {
     mockAuth(baseUser);
     mockApi.listSecrets.mockResolvedValue({ secrets: [codexKey] });
+    mockApi.getMySettings.mockResolvedValue(settings());
     render(
       <MemoryRouter>
         <RunDefaults />
       </MemoryRouter>,
     );
-    const modelSelect = (await screen.findByLabelText("Model")) as HTMLSelectElement;
-    await waitFor(() => expect(within(modelSelect).getByRole("option", { name: "gpt-6-astra" })).toBeTruthy());
-    expect(within(modelSelect).queryByRole("option", { name: "opus" })).toBeNull();
-    expect(screen.queryByText("Default harness")).toBeNull();
+    // Positive: the Codex lane and its badge render (inherit resolves to Codex when it
+    // is the sole usable harness, so the badge follows onto the only lane).
+    expect(await screen.findByLabelText("Codex model")).toBeTruthy();
+    expect(within(laneOf("Codex")).getByText("Default harness")).toBeTruthy();
+    // Negatives paired with the both-usable positives.
+    expect(screen.queryByLabelText("Claude model")).toBeNull();
+    expect(screen.queryByLabelText("Default harness")).toBeNull();
+  });
+
+  it("zero credentials: preserves the Claude lane so a model can be preconfigured, with no selector", async () => {
+    mockAuth(baseUser);
+    mockApi.listSecrets.mockResolvedValue({ secrets: [] });
+    mockApi.getMySettings.mockResolvedValue(settings());
+    render(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+    // Positive: the Claude lane is shown even with no usable harness (success criterion 4).
+    expect(await screen.findByLabelText("Claude model")).toBeTruthy();
+    // Negatives paired with the both-usable positives.
+    expect(screen.queryByLabelText("Codex model")).toBeNull();
+    expect(screen.queryByLabelText("Default harness")).toBeNull();
+  });
+
+  it("switching the harness leaves both saved model choices intact", async () => {
+    mockAuth(baseUser);
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken, codexKey] });
+    mockApi.getMySettings.mockResolvedValue(
+      settings({ default_claude_model: "opus", default_codex_model: "gpt-6-sol" }),
+    );
+    render(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+    const claudeSel = (await screen.findByLabelText("Claude model")) as HTMLSelectElement;
+    const codexSel = screen.getByLabelText("Codex model") as HTMLSelectElement;
+    await waitFor(() => expect(claudeSel.value).toBe("opus"));
+    await waitFor(() => expect(codexSel.value).toBe("gpt-6-sol"));
+    // Switch the harness — the two lanes must not change. Fails if a reset-on-switch
+    // rule (the retired D6 behaviour) is reintroduced.
+    fireEvent.change(screen.getByLabelText("Default harness"), { target: { value: "codex" } });
+    expect((screen.getByLabelText("Claude model") as HTMLSelectElement).value).toBe("opus");
+    expect((screen.getByLabelText("Codex model") as HTMLSelectElement).value).toBe("gpt-6-sol");
+  });
+
+  it("Save sends exactly one PUT carrying the three fields and never default_model", async () => {
+    mockAuth(baseUser);
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken, codexKey] });
+    mockApi.getMySettings.mockResolvedValue(settings());
+    mockApi.putMySettings.mockResolvedValue(
+      settings({ default_harness: "codex", default_claude_model: "sonnet", default_codex_model: "gpt-6-sol" }),
+    );
+    render(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+    const selector = (await screen.findByLabelText("Default harness")) as HTMLSelectElement;
+    fireEvent.change(selector, { target: { value: "codex" } });
+    fireEvent.change(screen.getByLabelText("Claude model"), { target: { value: "sonnet" } });
+    fireEvent.change(screen.getByLabelText("Codex model"), { target: { value: "gpt-6-sol" } });
+    fireEvent.click(saveButton());
+    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledTimes(1));
+    // Deep-equality: the exact three keys, and NO default_model. Fails if the page
+    // splits the save into several PUTs or smuggles the legacy field.
+    expect(mockApi.putMySettings).toHaveBeenCalledWith({
+      default_harness: "codex",
+      default_claude_model: "sonnet",
+      default_codex_model: "gpt-6-sol",
+    });
+    await screen.findByText(/Defaults saved/i);
+  });
+
+  it("clearing a lane to Inherit sends null for that lane", async () => {
+    mockAuth(baseUser);
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken, codexKey] });
+    mockApi.getMySettings.mockResolvedValue(settings({ default_claude_model: "opus" }));
+    mockApi.putMySettings.mockResolvedValue(settings());
+    render(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+    const claudeSel = (await screen.findByLabelText("Claude model")) as HTMLSelectElement;
+    await waitFor(() => expect(claudeSel.value).toBe("opus"));
+    fireEvent.change(claudeSel, { target: { value: "inherit" } });
+    fireEvent.click(saveButton());
+    await waitFor(() =>
+      expect(mockApi.putMySettings).toHaveBeenCalledWith({
+        default_harness: null,
+        default_claude_model: null,
+        default_codex_model: null,
+      }),
+    );
+  });
+
+  it("Codex lane: offers a custom ID with a Codex-specific label and placeholder", async () => {
+    mockAuth(baseUser);
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken, codexKey] });
+    mockApi.getMySettings.mockResolvedValue(settings());
+    mockApi.putMySettings.mockResolvedValue(settings({ default_codex_model: "gpt-5.6-terra" }));
+    render(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+    const codexSel = (await screen.findByLabelText("Codex model")) as HTMLSelectElement;
+    // Positive control: the Other… escape hatch is present on the Run Defaults Codex lane
+    // (it is withheld for schedule/template Codex callers).
+    expect(within(codexSel).getByRole("option", { name: /Other/ })).toBeTruthy();
+    fireEvent.change(codexSel, { target: { value: "custom" } });
+    const custom = screen.getByLabelText("Custom Codex model ID") as HTMLInputElement;
+    // Provider-specific placeholder — fails if the Claude placeholder leaks into the Codex lane.
+    expect(custom.placeholder).toBe("gpt-…");
+    fireEvent.change(custom, { target: { value: "gpt-5.6-terra" } });
+    fireEvent.click(saveButton());
+    await waitFor(() =>
+      expect(mockApi.putMySettings).toHaveBeenCalledWith({
+        default_harness: null,
+        default_claude_model: null,
+        default_codex_model: "gpt-5.6-terra",
+      }),
+    );
+  });
+
+  it("Claude lane: the custom input carries a Claude-specific label and placeholder", async () => {
+    mockAuth(baseUser);
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken, codexKey] });
+    mockApi.getMySettings.mockResolvedValue(settings({ default_claude_model: "claude-opus-4-8" }));
+    render(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+    // A non-alias saved value initializes the lane into custom mode.
+    const custom = (await screen.findByLabelText("Custom Claude model ID")) as HTMLInputElement;
+    expect(custom.value).toBe("claude-opus-4-8");
+    expect(custom.placeholder).toBe("claude-…");
+  });
+
+  it("a failed save keeps the form dirty and shows one actionable error", async () => {
+    mockAuth(baseUser);
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken, codexKey] });
+    mockApi.getMySettings.mockResolvedValue(settings());
+    mockApi.putMySettings.mockRejectedValue(new ApiError(400, "a Codex model is not valid for the Claude lane"));
+    render(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+    const selector = (await screen.findByLabelText("Default harness")) as HTMLSelectElement;
+    fireEvent.change(selector, { target: { value: "codex" } });
+    // Positive control: Save is enabled once the form is dirty.
+    expect(saveButton().disabled).toBe(false);
+    fireEvent.click(saveButton());
+    expect(await screen.findByText("a Codex model is not valid for the Claude lane")).toBeTruthy();
+    // Still dirty, so Save stays live for a retry. Fails if a failed save wrongly
+    // advances the saved snapshot (which would disable Save).
+    expect(saveButton().disabled).toBe(false);
+  });
+
+  it("Save is disabled until something is dirty", async () => {
+    mockAuth(baseUser);
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken, codexKey] });
+    mockApi.getMySettings.mockResolvedValue(settings());
+    render(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+    await screen.findByLabelText("Default harness");
+    // Clean form: disabled.
+    expect(saveButton().disabled).toBe(true);
+    // Dirtying any one field enables it (positive control).
+    fireEvent.change(screen.getByLabelText("Codex model"), { target: { value: "gpt-6-sol" } });
+    expect(saveButton().disabled).toBe(false);
+  });
+
+  it("labels the model selects and keeps keyboard focus on them (a11y)", async () => {
+    mockAuth(baseUser);
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken, codexKey] });
+    mockApi.getMySettings.mockResolvedValue(settings());
+    render(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+    const claudeSel = (await screen.findByLabelText("Claude model")) as HTMLSelectElement;
+    // The visible label names ONLY the select (SELECT tag), and focus lands on it by
+    // identity (web.md: assert focus by identity, not text).
+    expect(claudeSel.tagName).toBe("SELECT");
+    claudeSel.focus();
+    expect(document.activeElement).toBe(claudeSel);
+    const codexSel = screen.getByLabelText("Codex model") as HTMLSelectElement;
+    codexSel.focus();
+    expect(document.activeElement).toBe(codexSel);
   });
 });
