@@ -233,6 +233,10 @@ func (s *Service) NoteOversizeBatch(ctx context.Context, wkr store.Worker, runID
 //     should retry, never a "batch poisoned" 400. A CLEARED suspect, written out for
 //     the same reason as foldRunUsage below — it is the fold's other store call and
 //     the check is what keeps this placement defensible.
+//   - CountRunLineageRestartsBefore — foldRunUsage's per-frame lineage-index READ
+//     (ADR-1562). Identical shape and clearance to CountRunInitFramesBefore above: run
+//     id (uuid) + server-side int32 seq, a COUNT read, no worker-controlled value written
+//     and a read cannot poison a row, so its error is returned RAW (500).
 //   - foldRunUsage → UpsertRunUsage — every column it writes, checked one by one
 //     because "I cannot think of a case" is not the same as "there is no case".
 //     Read this as a CLEARED suspect, not a live hazard: it is written out because
@@ -255,7 +259,11 @@ func (s *Service) NoteOversizeBatch(ctx context.Context, wkr store.Worker, runID
 //     on its own sufficient. `run_id` is a uuid. The token columns are bigint and
 //     take an int64, which always fits. `cost_usd` is numeric(12,6) and numericUSD
 //     clamps to that domain (its own comment names 22003 as the poison-loop trigger
-//     it exists to prevent).
+//     it exists to prevent). `usage_basis` (ADR-1562) is NOT worker text: the fold
+//     resolves it to one of two fixed literals ('per_leg'/'session_cumulative') before
+//     the upsert, so no worker string reaches the CHECK-closed column. `lineage_index`
+//     is a server-side int32 count (CountRunLineageRestartsBefore), bounded like
+//     lineage_epoch, so it always fits and satisfies its >= 0 CHECK.
 //
 // A broader wrap was considered and rejected: with the above holding it catches
 // nothing extra, while reintroducing exactly the misattribution this narrowness
@@ -520,6 +528,7 @@ func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uu
 type usageFoldQuerier interface {
 	UpsertRunUsage(ctx context.Context, arg store.UpsertRunUsageParams) error
 	CountRunInitFramesBefore(ctx context.Context, arg store.CountRunInitFramesBeforeParams) (int64, error)
+	CountRunLineageRestartsBefore(ctx context.Context, arg store.CountRunLineageRestartsBeforeParams) (int64, error)
 }
 
 // foldRunUsage upserts run_usage for every delivered result frame in the batch
@@ -546,6 +555,15 @@ func (s *Service) foldRunUsage(ctx context.Context, run store.Run, msgs []Incomi
 // none); it stays in the key as the cross-worker row-splitter (a fresh process also
 // emits a fresh init, so the two agree). GREATEST in UpsertRunUsage then only de-dups
 // re-delivery of the SAME leg.
+//
+// ADR-1562: each result frame also carries a usage_basis and a lineage_index. usage_basis
+// is 'session_cumulative' iff the payload marker is EXACTLY that string AND the run is not
+// Codex (the marker is never honoured on Codex — its frames are always per_leg); anything
+// else is per_leg. lineage_index is the run's session index for this frame, read per frame
+// via CountRunLineageRestartsBefore (fresh_session:true inits before it, excluding the
+// run's first). Both are pure functions of (run_id, seq)/payload, so re-delivery recomputes
+// the same values; the run_usage_totals view (00244) uses them to high-water-fold a resumed
+// session's cumulative legs instead of summing them.
 func foldUsageFrames(ctx context.Context, q usageFoldQuerier, run store.Run, frames []IncomingMessage) error {
 	// Fold work runs — issue AND ci_fix both spend the user's tokens working a card
 	// or a pipeline end to end — and exclude ONLY chat. Chat-run spend is explicitly
@@ -600,6 +618,32 @@ func foldUsageFrames(ctx context.Context, q usageFoldQuerier, run store.Run, fra
 		} else {
 			frameEpoch = math.MaxInt32
 		}
+		// The frame's lineage (session) index (ADR-1562): the count of fresh_session:true
+		// init frames before it, excluding the run's first init. Same shape and bound as
+		// frameEpoch — a pure function of (run_id, seq), a handful per run — so its cast is
+		// proven identically for gosec/CodeQL.
+		restartCount, err := q.CountRunLineageRestartsBefore(ctx, store.CountRunLineageRestartsBeforeParams{
+			RunID: run.ID,
+			Seq:   m.Seq,
+		})
+		if err != nil {
+			return fmt.Errorf("count lineage restarts before seq %d (run %s): %w", m.Seq, run.ID, err)
+		}
+		var frameLineage int32
+		if restartCount >= 0 && restartCount <= math.MaxInt32 {
+			frameLineage = int32(restartCount)
+		} else {
+			frameLineage = math.MaxInt32
+		}
+		// The reading marker (ADR-1562): honour 'session_cumulative' ONLY when the payload
+		// value is exactly that string AND the run is not Codex. A Codex frame is always
+		// per_leg (its modelUsage is per query() call), so the marker is ignored there even
+		// if a worker stamps it. Everything else (absent, any other value, pre-#1562 frame)
+		// is per_leg.
+		usageBasis := usageBasisPerLeg
+		if p.UsageBasis == usageBasisSessionCumulative && run.Harness != harnessCodex {
+			usageBasis = usageBasisSessionCumulative
+		}
 		for model, mu := range p.ModelUsage {
 			if model == "" {
 				continue
@@ -632,6 +676,13 @@ func foldUsageFrames(ctx context.Context, q usageFoldQuerier, run store.Run, fra
 				CostUsd:             costUSD,
 				Harness:             run.Harness,
 				CostStatus:          costStatus,
+				// ADR-1562: the per-leg reading marker and the run's session index for this
+				// frame. usageBasis is the run-derived resolution above (never a raw worker
+				// string reaching the store — only the two fixed literals), lineage_index is
+				// the pure (run_id, seq) count. On conflict usage_basis upgrades one-way and
+				// lineage_index is kept (both sides equal), so re-delivery is idempotent.
+				UsageBasis:   usageBasis,
+				LineageIndex: frameLineage,
 				// PRD #1247 M9 (D7): attribute this leg to the epoch the FRAME was produced under
 				// (the incremental path stamps effectiveClaimGen onto every frame; the refold reads
 				// each frame's persisted run_messages.claim_generation). COALESCE in UpsertRunUsage
@@ -689,6 +740,12 @@ const (
 	costStatusSubscription = "subscription"
 	costStatusMetered      = "metered"
 	costStatusUnreported   = "unreported"
+
+	// usage_basis literals (ADR-1562), matching run_usage.usage_basis's CHECK vocabulary
+	// (migration 00244). per_leg is the ADR-1079 default; session_cumulative is honoured
+	// only for a Claude frame whose worker marker is exactly that string.
+	usageBasisPerLeg            = "per_leg"
+	usageBasisSessionCumulative = "session_cumulative"
 )
 
 // costMarkerInvalid is the sentinel resolveCostStatusMarker returns for a costStatus that is

@@ -530,6 +530,14 @@ func (f *persistFakeStore) CountRunInitFramesBefore(context.Context, store.Count
 	return 0, nil
 }
 
+// CountRunLineageRestartsBefore answers the fold's per-frame lineage-index read (ADR-1562).
+// These persistfail/autostop fakes don't model init frames, so no leg has a fresh-session
+// restart before it — 0 (lineage 0) is enough for the fold to reach UpsertRunUsage. Without
+// it the embedded (nil) Store panics when the fold makes this read.
+func (f *persistFakeStore) CountRunLineageRestartsBefore(context.Context, store.CountRunLineageRestartsBeforeParams) (int64, error) {
+	return 0, nil
+}
+
 func unstorableErr() error { return classifyStoreError(&pgconn.PgError{Code: "22P05"}) }
 
 func msg(seq int32) IncomingMessage {

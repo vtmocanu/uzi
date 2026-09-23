@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -1021,6 +1022,51 @@ func (f *fakeStore) CountRunInitFramesBefore(_ context.Context, arg store.CountR
 	}
 	return int64(len(seen)), nil
 }
+
+// CountRunLineageRestartsBefore answers the fold's per-frame lineage-index read (ADR-1562)
+// from the fake's retained insertedMessages: the count of DISTINCT-seq fresh_session:true
+// init frames with a lower seq, EXCLUDING the run's FIRST init (seq > MIN(seq) of the run's
+// inits). DISTINCT for the same reason as CountRunInitFramesBefore — the fake appends every
+// call including seq-deduped re-deliveries, whereas run_messages is UNIQUE(run_id, seq).
+func (f *fakeStore) CountRunLineageRestartsBefore(_ context.Context, arg store.CountRunLineageRestartsBeforeParams) (int64, error) {
+	if f.initCountErr != nil {
+		return 0, f.initCountErr
+	}
+	type initFrame struct {
+		fresh bool
+	}
+	inits := map[int32]initFrame{}
+	for _, m := range f.insertedMessages {
+		if m.RunID != arg.RunID || m.Kind != "status" {
+			continue
+		}
+		var ev struct {
+			Event        string `json:"event"`
+			FreshSession bool   `json:"fresh_session"`
+		}
+		if err := json.Unmarshal(m.Payload, &ev); err != nil || ev.Event != "init" {
+			continue
+		}
+		inits[m.Seq] = initFrame{fresh: ev.FreshSession}
+	}
+	if len(inits) == 0 {
+		return 0, nil
+	}
+	firstSeq := int32(math.MaxInt32)
+	for seq := range inits {
+		if seq < firstSeq {
+			firstSeq = seq
+		}
+	}
+	var n int64
+	for seq, fr := range inits {
+		if fr.fresh && seq < arg.Seq && seq > firstSeq {
+			n++
+		}
+	}
+	return n, nil
+}
+
 func (f *fakeStore) SetRunRunning(_ context.Context, arg store.SetRunRunningParams) (int64, error) {
 	f.setRunningParams = &arg
 	return f.setRunningRows, nil

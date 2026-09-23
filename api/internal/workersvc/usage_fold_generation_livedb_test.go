@@ -69,7 +69,7 @@ func TestUpsertRunUsageClaimGenerationCoalesceLiveDB(t *testing.T) {
 	gen2 := int64(2)
 	base := store.UpsertRunUsageParams{
 		RunID: runID, SessionID: "sess-coalesce", Model: "claude-test", LineageEpoch: 0,
-		InputTokens: 10, OutputTokens: 1, Harness: "claude", CostStatus: "metered", CostUsd: numericUSD(0),
+		InputTokens: 10, OutputTokens: 1, Harness: "claude", CostStatus: "metered", CostUsd: numericUSD(0), UsageBasis: "per_leg",
 	}
 
 	// First frame at generation 1 → the row adopts 1.

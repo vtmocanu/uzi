@@ -4352,20 +4352,34 @@ LIMIT @lim;
 
 -- name: UpsertRunUsage :exec
 -- Fold one model's usage from a delivered result frame into the run's accounting
--- (Decision 2). Each result frame is ONE SDK query() LEG and reports only that leg
--- (PRD #1079: the Agent SDK cost-tracking docs — "the cost reported is limited to
--- the individual query call rather than the entire session"), so lineage_epoch is
--- part of the key and each leg lands in its own row. GREATEST here is for RE-DELIVERY
--- idempotency — a crash-retry that re-delivers the SAME leg (same run_id/session_id/
--- model/lineage_epoch) must not regress the row — and for the case of MULTIPLE
--- cumulative result frames inside ONE process (a multi-turn query() reporting running
--- totals under one epoch); it is NEVER a cross-leg collapse. That collapse was the
--- pre-#1079 under-count: distinct legs sharing runs.session_id merged at the old
--- three-column key and GREATEST kept only the largest. The API calls this for every
+-- (Decision 2). Each result frame is ONE SDK query() LEG; how that leg's modelUsage
+-- reads is now stamped per row by usage_basis (ADR-1562, amending ADR-1079):
+--   * 'per_leg' — the ADR-1079 semantics: the value is ONLY this leg (every pre-#1562
+--     frame, every Codex frame, the stub executor). lineage_epoch is part of the key and
+--     each leg lands in its own row; the view SUMs those legs.
+--   * 'session_cumulative' — the SDK >= 0.3.277 reading (Claude only): the value is the
+--     RUNNING TOTAL of the session this leg continued, so the view high-water-folds the
+--     legs of one (model, lineage_index) instead of summing them.
+-- GREATEST here is for RE-DELIVERY idempotency — a crash-retry that re-delivers the SAME
+-- leg (same run_id/session_id/model/lineage_epoch) must not regress the row — and for the
+-- case of MULTIPLE cumulative result frames inside ONE process (a multi-turn query()
+-- reporting running totals under one epoch); it is NEVER a cross-leg collapse. The pre-#1079
+-- under-count was distinct legs sharing runs.session_id merging at the old three-column key;
+-- keying per lineage_epoch fixed that, and #1562's usage_basis fixes the opposite over-count
+-- a resumed session's cumulative frames caused when summed. The API calls this for every
 -- delivered result frame incl. seq-deduped replays, so at-least-once delivery + this
 -- idempotent monotonic merge = correct totals with no crash window. The run_usage_totals
--- view (00177) MAXes within (run_id, model, lineage_epoch) then SUMs across, which is
--- exactly the per-leg rule once every leg has its own epoch.
+-- view (00244) MAXes within (run_id, model, lineage_epoch), then per (run_id, model,
+-- lineage_index) sums per_leg legs and high-water-folds session_cumulative legs, then SUMs
+-- across models.
+--
+-- ADR-1562: usage_basis and lineage_index ride the fold. usage_basis upgrades ONE-WAY on
+-- conflict — once any frame of a leg reads 'session_cumulative' the row stays cumulative,
+-- so an unmarked (per_leg) frame arriving before or after a marked one for the same leg (a
+-- run in flight across the #1562 deploy) never downgrades it back to a summed reading.
+-- lineage_index is a pure function of (run_id, seq) like lineage_epoch (the fold derives it
+-- from the persisted init frames via CountRunLineageRestartsBefore), so on conflict the two
+-- sides are equal and the existing value is kept.
 --
 -- PRD #1332 M5A (D2/D5): harness and cost_status ride the fold. harness is the run's
 -- immutable, run-derived harness (foldUsageFrames sources it from runs.harness, never a
@@ -4387,10 +4401,10 @@ LIMIT @lim;
 -- never its evidence — the frame stamp on run_messages is the evidence.
 INSERT INTO run_usage (
     run_id, session_id, model, lineage_epoch,
-    input_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, cost_usd, harness, cost_status, claim_generation, updated_at
+    input_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, cost_usd, harness, cost_status, usage_basis, lineage_index, claim_generation, updated_at
 ) VALUES (
     @run_id, @session_id, @model, @lineage_epoch,
-    @input_tokens, @cache_read_tokens, @cache_creation_tokens, @output_tokens, @cost_usd, @harness, @cost_status, sqlc.narg('claim_generation')::bigint, now()
+    @input_tokens, @cache_read_tokens, @cache_creation_tokens, @output_tokens, @cost_usd, @harness, @cost_status, @usage_basis, @lineage_index, sqlc.narg('claim_generation')::bigint, now()
 )
 ON CONFLICT (run_id, session_id, model, lineage_epoch) DO UPDATE SET
     input_tokens          = GREATEST(run_usage.input_tokens,          EXCLUDED.input_tokens),
@@ -4399,6 +4413,17 @@ ON CONFLICT (run_id, session_id, model, lineage_epoch) DO UPDATE SET
     output_tokens         = GREATEST(run_usage.output_tokens,         EXCLUDED.output_tokens),
     -- The run's harness is immutable, so existing == EXCLUDED on conflict; keep existing.
     harness               = run_usage.harness,
+    -- usage_basis upgrades ONE-WAY (ADR-1562): once either side reads 'session_cumulative'
+    -- the leg is cumulative for good, so a stray per_leg frame never downgrades a resumed
+    -- leg back to a summed reading (the in-flight-across-deploy case). Both-per_leg stays
+    -- per_leg.
+    usage_basis           = CASE
+                                WHEN run_usage.usage_basis = 'session_cumulative' OR EXCLUDED.usage_basis = 'session_cumulative' THEN 'session_cumulative'
+                                ELSE 'per_leg'
+                            END,
+    -- lineage_index is a pure function of (run_id, seq), so existing == EXCLUDED on
+    -- conflict; keep existing (mirrors lineage_epoch, which is in the key).
+    lineage_index         = run_usage.lineage_index,
     -- Provenance is set-once: keep an established non-null generation, never clobber it with a
     -- later same-leg frame's EXCLUDED (M9, D7). A NULL existing value adopts EXCLUDED.
     claim_generation      = COALESCE(run_usage.claim_generation, EXCLUDED.claim_generation),
@@ -4424,10 +4449,35 @@ ON CONFLICT (run_id, session_id, model, lineage_epoch) DO UPDATE SET
 -- which maps the result frame), so this counts the legs that preceded the frame. It is a pure function of
 -- (run_id, seq): a re-delivered frame recomputes the same value and lands in the same
 -- run_usage row whatever else has landed since. Backed by idx_run_messages_init (00188),
--- so it is O(legs), not O(messages).
+-- so it is O(legs), not O(messages). Its sibling CountRunLineageRestartsBefore (ADR-1562)
+-- counts the SESSION a leg belongs to (lineage_index) off the same index.
 SELECT COUNT(*) FROM run_messages
 WHERE run_id = @run_id AND kind = 'status'
   AND payload->>'event' = 'init' AND seq < @seq;
+
+-- name: CountRunLineageRestartsBefore :one
+-- The lineage (session) index of a result frame (ADR-1562): the count of persisted `init`
+-- status frames of this run that are flagged fresh_session:true and have a lower seq,
+-- EXCLUDING the run's FIRST init. lineage_epoch (CountRunInitFramesBefore) counts the LEG;
+-- this counts the SESSION a leg belongs to. Lineage 0 is the run's initial session, whether
+-- or not its first init is flagged (a fresh session that starts BEFORE any prior one is not a
+-- restart) — hence the `seq > MIN(seq)` exclusion of the run's own first init. Each fresh
+-- session that starts after a prior one opens lineage 1, 2, … The worker stamps
+-- fresh_session:true on the init frame of an SDK process that did NOT continue the requested
+-- session (no resume requested, or the SDK's init session_id differs from the one requested).
+-- Like CountRunInitFramesBefore it is a pure function of (run_id, seq): a re-delivered frame
+-- recomputes the same value and lands in the same run_usage row. Backed by the SAME partial
+-- index idx_run_messages_init (00188) — the outer count and the MIN subquery both scan only
+-- the run's init frames, so it is O(legs), not O(messages).
+SELECT COUNT(*) FROM run_messages rm
+WHERE rm.run_id = @run_id AND rm.kind = 'status'
+  AND rm.payload->>'event' = 'init'
+  AND rm.payload->>'fresh_session' = 'true'
+  AND rm.seq < @seq
+  AND rm.seq > (
+      SELECT MIN(first_init.seq) FROM run_messages first_init
+      WHERE first_init.run_id = @run_id AND first_init.kind = 'status' AND first_init.payload->>'event' = 'init'
+  );
 
 -- name: GetRunUsageTotal :one
 -- One run's rollup totals (PRD #40 M3), for the run-detail usage strip. Reads the

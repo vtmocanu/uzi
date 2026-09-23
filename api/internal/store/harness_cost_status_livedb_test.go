@@ -395,7 +395,7 @@ func TestUpsertRunUsageCostStatusConflictLiveDB(t *testing.T) {
 		if err := q.UpsertRunUsage(ctx, store.UpsertRunUsageParams{
 			RunID: runID, SessionID: "s", Model: model, LineageEpoch: 0,
 			InputTokens: 100, CacheReadTokens: 0, CacheCreationTokens: 0, OutputTokens: 50,
-			CostUsd: micro(costMicros), Harness: harness, CostStatus: status,
+			CostUsd: micro(costMicros), Harness: harness, CostStatus: status, UsageBasis: "per_leg",
 		}); err != nil {
 			t.Fatalf("UpsertRunUsage(%s,%s): %v", model, status, err)
 		}
@@ -574,7 +574,7 @@ func TestRunUsageTotalsCrossModelCostStatusFoldLiveDB(t *testing.T) {
 		if err := q.UpsertRunUsage(ctx, store.UpsertRunUsageParams{
 			RunID: runID, SessionID: "s", Model: model, LineageEpoch: 0,
 			InputTokens: 100, CacheReadTokens: 0, CacheCreationTokens: 0, OutputTokens: 50,
-			CostUsd: micro(costMicros), Harness: "claude", CostStatus: status,
+			CostUsd: micro(costMicros), Harness: "claude", CostStatus: status, UsageBasis: "per_leg",
 		}); err != nil {
 			t.Fatalf("UpsertRunUsage(run=%s model=%s status=%s): %v", runID, model, status, err)
 		}

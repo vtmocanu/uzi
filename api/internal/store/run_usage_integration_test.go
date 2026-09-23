@@ -71,7 +71,8 @@ func TestUpsertRunUsageMergeLiveDB(t *testing.T) {
 			InputTokens: in, CacheReadTokens: cacheR, CacheCreationTokens: cacheC, OutputTokens: out,
 			// PRD #1332 M5A: these Claude rows are metered; harness/cost_status are now
 			// NOT NULL and CHECK-closed (migration 00226), so the fold must supply them.
-			CostUsd: numericFromMicros(cost), Harness: "claude", CostStatus: "metered",
+			// ADR-1562: usage_basis is NOT NULL + CHECK-closed too (migration 00244).
+			CostUsd: numericFromMicros(cost), Harness: "claude", CostStatus: "metered", UsageBasis: "per_leg",
 		}); err != nil {
 			t.Fatalf("UpsertRunUsage(%s): %v", session, err)
 		}
@@ -145,7 +146,8 @@ func TestUpsertRunUsageMergeLiveDB(t *testing.T) {
 			RunID: runID2, SessionID: legSession, Model: legModel, LineageEpoch: epoch,
 			InputTokens: in, CacheReadTokens: cacheR, CacheCreationTokens: cacheC, OutputTokens: out,
 			// PRD #1332 M5A: Claude/metered rows; harness/cost_status are NOT NULL + CHECK-closed.
-			CostUsd: numericFromMicros(cost), Harness: "claude", CostStatus: "metered",
+			// ADR-1562: usage_basis is NOT NULL + CHECK-closed too (migration 00244).
+			CostUsd: numericFromMicros(cost), Harness: "claude", CostStatus: "metered", UsageBasis: "per_leg",
 		}); err != nil {
 			t.Fatalf("UpsertRunUsage(leg %d): %v", epoch, err)
 		}
@@ -195,6 +197,244 @@ func TestUpsertRunUsageMergeLiveDB(t *testing.T) {
 	if legTotal2.InputTokens != 1200 || legTotal2.OutputTokens != 850 {
 		t.Fatalf("re-delivering both legs must not change the total: got in %d/out %d, want 1200/850", legTotal2.InputTokens, legTotal2.OutputTokens)
 	}
+}
+
+// TestRunUsageTotalsSessionCumulativeLiveDB proves the run_usage_totals view (migration
+// 00244, issue #1562) against a REAL Postgres for EVERY scenario in the cumulative fixture:
+// insert the fixture's per-leg rows via UpsertRunUsage, then assert GetRunUsageTotal equals
+// the fixture `totals` EXACTLY (tokens + cost by SQL numeric equality) and DIFFERS from the
+// pre-#1562 per-leg SUM (`sum_fold_totals`) — so a fold that regressed to summing resumed
+// legs reddens on a named value. It also asserts an old-data parity case (per_leg rows,
+// lineage 0, a leg split across two session_ids equal to the 00228 answer), replay
+// idempotency, and the one-way usage_basis upgrade on conflict.
+//
+// Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres.
+func TestRunUsageTotalsSessionCumulativeLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via the store integration runner for live-DB coverage")
+	}
+	ctx := context.Background()
+	if err := store.Migrate(ctx, dsn); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	pool, err := store.OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	defer pool.Close()
+	q := store.New(pool)
+
+	// Read the cumulative rollup fixture (rows + totals + sum_fold_totals per scenario).
+	type cumRow struct {
+		Model               string  `json:"model"`
+		LineageEpoch        int32   `json:"lineage_epoch"`
+		LineageIndex        int32   `json:"lineage_index"`
+		UsageBasis          string  `json:"usage_basis"`
+		InputTokens         int64   `json:"input_tokens"`
+		CacheReadTokens     int64   `json:"cache_read_tokens"`
+		CacheCreationTokens int64   `json:"cache_creation_tokens"`
+		OutputTokens        int64   `json:"output_tokens"`
+		CostUSD             float64 `json:"cost_usd"`
+	}
+	type cumTotals struct {
+		InputTokens         int64   `json:"input_tokens"`
+		CacheReadTokens     int64   `json:"cache_read_tokens"`
+		CacheCreationTokens int64   `json:"cache_creation_tokens"`
+		OutputTokens        int64   `json:"output_tokens"`
+		CostUSD             float64 `json:"cost_usd"`
+	}
+	type cumScenario struct {
+		Name          string    `json:"name"`
+		Rows          []cumRow  `json:"rows"`
+		Totals        cumTotals `json:"totals"`
+		SumFoldTotals cumTotals `json:"sum_fold_totals"`
+	}
+	var rollup struct {
+		Scenarios []cumScenario `json:"scenarios"`
+	}
+	b, err := os.ReadFile(filepath.Join("..", "..", "..", "fixtures", "run-usage", "run-usage-cumulative.json"))
+	if err != nil {
+		t.Fatalf("read cumulative fixture: %v", err)
+	}
+	if err := json.Unmarshal(b, &rollup); err != nil {
+		t.Fatalf("parse cumulative fixture: %v", err)
+	}
+	if len(rollup.Scenarios) == 0 {
+		t.Fatal("cumulative fixture broken: no scenarios")
+	}
+
+	// Seed one user/connection/repo the scenarios' runs hang off.
+	userID, connID, repoID := uuid.New(), uuid.New(), uuid.New()
+	mustExec(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
+		userID, fmt.Sprintf("cumusage-%s@e2e", userID))
+	mustExec(ctx, t, pool,
+		`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
+		 VALUES ($1, $2, 'gitlab', 'https://forge.e2e', 'bot', 1, $3)`, connID, userID, []byte{0x1})
+	mustExec(ctx, t, pool,
+		`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
+		 VALUES ($1, $2, 1, 'g/r-cum', 'https://forge.e2e/g/r', 'main', true)`, repoID, connID)
+
+	iid := int64(5_000_000)
+	seedRun := func() uuid.UUID {
+		iid++
+		id := uuid.New()
+		mustExec(ctx, t, pool,
+			`INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, status)
+			 VALUES ($1, $2, $3, $4, 't', 'd', 'running')`, id, userID, repoID, iid)
+		return id
+	}
+	// numericFromMicros mirrors the fold's numericUSD (round to microdollars) so the stored
+	// numeric(12,6) is exact for the SQL equality below.
+	numericFromMicros := func(usd float64) pgtype.Numeric {
+		return pgtype.Numeric{Int: big.NewInt(int64(usd*1e6 + 0.5)), Exp: -6, Valid: true}
+	}
+	// upsert each fixture row. session_id is fixed per run — the leg key is (epoch), which is
+	// unique per row here, so one session suffices; the view ignores session_id.
+	insertRow := func(runID uuid.UUID, session string, r cumRow) {
+		t.Helper()
+		if err := q.UpsertRunUsage(ctx, store.UpsertRunUsageParams{
+			RunID: runID, SessionID: session, Model: r.Model,
+			LineageEpoch: r.LineageEpoch, LineageIndex: r.LineageIndex, UsageBasis: r.UsageBasis,
+			InputTokens: r.InputTokens, CacheReadTokens: r.CacheReadTokens,
+			CacheCreationTokens: r.CacheCreationTokens, OutputTokens: r.OutputTokens,
+			CostUsd: numericFromMicros(r.CostUSD), Harness: "claude", CostStatus: "metered",
+		}); err != nil {
+			t.Fatalf("UpsertRunUsage(%s epoch %d): %v", r.Model, r.LineageEpoch, err)
+		}
+	}
+	// costEquals compares the view's cost_usd to a want via SQL numeric equality.
+	costEquals := func(runID uuid.UUID, want float64) bool {
+		t.Helper()
+		var ok bool
+		if err := pool.QueryRow(ctx,
+			`SELECT cost_usd = $2::numeric FROM run_usage_totals WHERE run_id = $1`,
+			runID, fmt.Sprintf("%.6f", want)).Scan(&ok); err != nil {
+			t.Fatalf("read view cost (run %s): %v", runID, err)
+		}
+		return ok
+	}
+
+	for _, sc := range rollup.Scenarios {
+		t.Run(sc.Name, func(t *testing.T) {
+			runID := seedRun()
+			for _, r := range sc.Rows {
+				insertRow(runID, "sess-cum", r)
+			}
+			total, err := q.GetRunUsageTotal(ctx, runID)
+			if err != nil {
+				t.Fatalf("GetRunUsageTotal: %v", err)
+			}
+			if total.InputTokens != sc.Totals.InputTokens ||
+				total.CacheReadTokens != sc.Totals.CacheReadTokens ||
+				total.CacheCreationTokens != sc.Totals.CacheCreationTokens ||
+				total.OutputTokens != sc.Totals.OutputTokens {
+				t.Fatalf("run total = in %d/cr %d/cw %d/out %d, want %d/%d/%d/%d",
+					total.InputTokens, total.CacheReadTokens, total.CacheCreationTokens, total.OutputTokens,
+					sc.Totals.InputTokens, sc.Totals.CacheReadTokens, sc.Totals.CacheCreationTokens, sc.Totals.OutputTokens)
+			}
+			if !costEquals(runID, sc.Totals.CostUSD) {
+				t.Fatalf("run total cost must be the session-cumulative fold %.6f", sc.Totals.CostUSD)
+			}
+			// The pre-#1562 per-leg SUM must DIFFER (unless the scenario is all-per_leg, in
+			// which case the two coincide by construction — none of the fixture scenarios are).
+			if total.InputTokens == sc.SumFoldTotals.InputTokens &&
+				total.CacheReadTokens == sc.SumFoldTotals.CacheReadTokens &&
+				total.OutputTokens == sc.SumFoldTotals.OutputTokens &&
+				costEquals(runID, sc.SumFoldTotals.CostUSD) {
+				t.Fatalf("run total collapsed to the pre-#1562 per-leg SUM (in %d/out %d, cost %.6f) -- the view is summing resumed legs",
+					sc.SumFoldTotals.InputTokens, sc.SumFoldTotals.OutputTokens, sc.SumFoldTotals.CostUSD)
+			}
+
+			// Replay idempotency: re-upsert every row unchanged -> the total is unchanged.
+			for _, r := range sc.Rows {
+				insertRow(runID, "sess-cum", r)
+			}
+			total2, err := q.GetRunUsageTotal(ctx, runID)
+			if err != nil {
+				t.Fatalf("GetRunUsageTotal after replay: %v", err)
+			}
+			if total2.InputTokens != sc.Totals.InputTokens || total2.OutputTokens != sc.Totals.OutputTokens ||
+				!costEquals(runID, sc.Totals.CostUSD) {
+				t.Fatalf("replay changed the total: in %d/out %d", total2.InputTokens, total2.OutputTokens)
+			}
+		})
+	}
+
+	// --- old-data parity: per_leg rows (the DEFAULT), lineage 0, a single leg split across
+	// TWO session_ids. This is the exact pre-#1562 shape, and the view must answer 00228's
+	// number: MAX within (run, model, epoch) across the two sessions, then SUM across epochs.
+	t.Run("old-data-parity-per-leg-two-sessions", func(t *testing.T) {
+		runID := seedRun()
+		insLegacy := func(session, model string, epoch int32, in, out int64) {
+			mustExec(ctx, t, pool,
+				`INSERT INTO run_usage (run_id, session_id, model, lineage_epoch, input_tokens, output_tokens, cost_usd)
+				 VALUES ($1, $2, $3, $4, $5, $6, 0)`, runID, session, model, epoch, in, out)
+		}
+		// Leg (epoch 0) split across two sessions: MAX per (run, model, epoch) = 1500/700.
+		insLegacy("sA", "modelX", 0, 1000, 400)
+		insLegacy("sB", "modelX", 0, 1500, 700)
+		// A second leg (epoch 1) sums onto it: total = 1500 + 300 = 1800 in, 700 + 100 = 800.
+		insLegacy("sB", "modelX", 1, 300, 100)
+		total, err := q.GetRunUsageTotal(ctx, runID)
+		if err != nil {
+			t.Fatalf("GetRunUsageTotal(parity): %v", err)
+		}
+		if total.InputTokens != 1800 || total.OutputTokens != 800 {
+			t.Fatalf("old-data parity total = in %d/out %d, want 1800/800 (MAX across sessions per epoch, SUM across epochs)",
+				total.InputTokens, total.OutputTokens)
+		}
+		// The DEFAULT usage_basis must be per_leg and lineage_index 0 (migration defaults),
+		// so a legacy INSERT with neither column named still folds as before.
+		var basis string
+		var lineage int32
+		if err := pool.QueryRow(ctx,
+			`SELECT usage_basis, lineage_index FROM run_usage WHERE run_id=$1 AND session_id='sA' AND model='modelX' AND lineage_epoch=0`,
+			runID).Scan(&basis, &lineage); err != nil {
+			t.Fatalf("read legacy row defaults: %v", err)
+		}
+		if basis != "per_leg" || lineage != 0 {
+			t.Fatalf("legacy row defaults = basis %q / lineage %d, want per_leg / 0", basis, lineage)
+		}
+	})
+
+	// --- one-way usage_basis upgrade on conflict (the in-flight-across-deploy case): a leg
+	// first folded per_leg, then re-delivered as session_cumulative, latches cumulative and
+	// never downgrades back.
+	t.Run("one-way-basis-upgrade-on-conflict", func(t *testing.T) {
+		runID := seedRun()
+		readBasis := func() string {
+			var basis string
+			if err := pool.QueryRow(ctx,
+				`SELECT usage_basis FROM run_usage WHERE run_id=$1 AND session_id='sX' AND model='modelX' AND lineage_epoch=0`,
+				runID).Scan(&basis); err != nil {
+				t.Fatalf("read basis: %v", err)
+			}
+			return basis
+		}
+		upsert := func(basis string, in int64) {
+			if err := q.UpsertRunUsage(ctx, store.UpsertRunUsageParams{
+				RunID: runID, SessionID: "sX", Model: "modelX", LineageEpoch: 0, LineageIndex: 0,
+				UsageBasis: basis, InputTokens: in, OutputTokens: 10,
+				CostUsd: numericFromMicros(0.001), Harness: "claude", CostStatus: "metered",
+			}); err != nil {
+				t.Fatalf("UpsertRunUsage(%s): %v", basis, err)
+			}
+		}
+		upsert("per_leg", 100)
+		if got := readBasis(); got != "per_leg" {
+			t.Fatalf("after first per_leg upsert, basis = %q, want per_leg", got)
+		}
+		upsert("session_cumulative", 200)
+		if got := readBasis(); got != "session_cumulative" {
+			t.Fatalf("a session_cumulative frame must upgrade the leg, basis = %q", got)
+		}
+		// A later per_leg frame for the same leg must NOT downgrade it.
+		upsert("per_leg", 300)
+		if got := readBasis(); got != "session_cumulative" {
+			t.Fatalf("a later per_leg frame downgraded the leg to %q -- the upgrade must be one-way", got)
+		}
+	})
 }
 
 // TestUsageRollupsLiveDB proves the M3 read rollups against a REAL Postgres — the
