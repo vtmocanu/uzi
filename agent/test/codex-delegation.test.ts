@@ -482,7 +482,9 @@ describe("CodexDelegationRunner: child projection hook (issue #1583 m2)", () => 
     const finished = controller.projected.flat().find((i) => i.kind === "tool" && i.phase === "finished");
     assert.ok(finished !== undefined && finished.kind === "tool" && finished.phase === "finished");
     assert.equal(finished.isError, true);
-    assert.equal(finished.output, replyText(controller, 0), "a failure projects the broker's message the child received");
+    const received = replyText(controller, 0);
+    assert.ok(typeof received === "string" && received.length > 0, "the child received a non-empty failure message");
+    assert.equal(finished.output, received, "a failure projects the broker's message the child received");
     assert.equal(respondSuccess(controller, 0), false);
   });
 
