@@ -5,15 +5,33 @@ Moved from the `uzi-watcher` skill (2026-09-17); this is the canonical home. Pat
 
 ## Merging past branch protection
 
-`main` is guarded by a **ruleset** (not classic protection, so a
-`gh api …/branches/main/protection` call 404s while rules are still enforced): 1 approving
-review + up-to-date branch (`strict`) + required status checks.
+`main` is guarded by a **ruleset** (`protect-main`, not classic protection, so a
+`gh api …/branches/main/protection` call 404s while rules are still enforced; read the live
+rules with `gh api repos/OWNER/REPO/rules/branches/main`): 1 approving non-author review
+(`require_last_push_approval`, `dismiss_stale_reviews_on_push`) + up-to-date branch
+(`strict`) + required status checks + no force-push/deletion. The admin role bypasses the
+whole ruleset (`bypass_mode: always`). If a push or merge is refused, read the refusal and
+stop rather than forcing.
 
-- **Convention: squash** for `agent/issue-*` branches (a recent merged one's commit carries
-  the PR title, not a "Merge pull request" subject). Add `--delete-branch`. `uzi-release`
-  uses merge commits instead so the subject keeps the issue branch for the changelog oracle.
+- **Convention: squash** for every PR (the commit carries the PR title and `(#PR)`, which is
+  what the release CHANGELOG cites). Add `--delete-branch`. `merge.sh --method merge` exists
+  for the rare case that wants a merge commit.
 - **The PR author is the bot account** (e.g. `vtmocanu-uzi`), distinct from your `gh`
   identity, so a human review from you satisfies the review rule — it is not a self-review.
+- **Renovate PRs are the exception: Renovate authors as the repo owner** (verified
+  2026-08-20). GitHub forbids self-approval, and a granted approval is dismissed by the next
+  update-branch push, so the approval rule can never be met: `--admin` is the only path.
+  Reach for it directly rather than update-branching first.
+- **Lockfile stacking.** Back-to-back merges of PRs sharing a generated lockfile
+  (`api/go.mod`+`api/go.sum`, `agent/package-lock.json`) conflict once one lands, though each
+  was clean alone; GitHub refuses the next with `Pull Request has merge conflicts`. For your
+  own branch, `git fetch origin main` first (a stale `origin/main` silently omits a sibling's
+  bump), `git merge origin/main`, take the union of the bumps, regenerate (`go mod tidy`, or
+  `npm install --package-lock-only` in the package dir), `go build ./...`, push, merge. CI
+  runs `npm ci`, so a lockfile regenerated under a newer local npm is fine while consistent
+  with `package.json`. A Renovate branch you never push to: Renovate rebases it itself
+  (references/renovate.md). Right after a resolution push, a stale `merge conflicts` is
+  GitHub's async mergeability lag: re-check `mergeable` after a few seconds and retry.
 - **`gh pr merge` is intermittently blocked by the harness auto-mode classifier.** It is
   not deterministic; a retry often succeeds. When the user has authorized admin merges,
   merge with `--admin` (it clears the review, up-to-date, and status-check gates at once).
@@ -36,7 +54,7 @@ review + up-to-date branch (`strict`) + required status checks.
 - **Merge each PR the moment it is review-clean and CI-green — do NOT hold the whole
   batch to the end.** A landed PR exercises `main` CI while you work the rest, so an
   integration break surfaces early instead of all at once at the finish. Keep the phase
-  order (our PRs before the routine renovate batch — see `uzi-release`).
+  order (our PRs before the routine renovate batch — references/batch.md).
 - **`--admin` does NOT bypass a real git conflict.** It clears the ruleset gates (review,
   up-to-date, status checks), but a `gh pr merge` returning `Pull Request has merge
   conflicts` or `the merge commit cannot be cleanly created` is a git-level conflict —

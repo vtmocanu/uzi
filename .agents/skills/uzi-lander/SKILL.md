@@ -1,6 +1,6 @@
 ---
 name: uzi-lander
-description: "Lands a uzi run's pull request on this GitHub-hosted repo, taking over at any point after dispatch: polls a running run blind to its terminal state, decides whether Renovate-class PRs need independent review, chooses local or bot reviewers for other PRs by risk, handles findings, uzi's own mr_rework, local fixes, rebase and migration renumbering, the admin merge and post-merge CI, reporting one status line per state change. Claims each PR in a shared per-repo board so several landing sessions (Claude or Codex) coordinate priority and quota. The deterministic steps are bundled scripts (takeover, claims, watch-pr, cr-rate-limit, review-quota, land-prep, merge, watch-run-ci, trail). Use when the user says take over run X, land PR N, babysit the PR, drive it home, watch the PR to merge, wait for CodeRabbit, or fix the review findings. Triggers include take over the run, land the PR, babysit, drive it home, uzi lander, CR rate limited, greptile review, merge it when green."
+description: "Lands a uzi run's pull request on this GitHub-hosted repo, taking over at any point after dispatch: polls a running run blind to its terminal state, decides whether Renovate-class PRs need independent review, chooses local or bot reviewers for other PRs by risk, handles findings, uzi's own mr_rework, local fixes, rebase and migration renumbering, the admin merge and post-merge CI, reporting one status line per state change. Also lands the whole open-PR set in order (reds, ours, then Renovate) and owns the dependency-PR rules. Claims each PR in a shared per-repo board so several landing sessions (Claude or Codex) coordinate priority and quota; deterministic steps are bundled scripts. Use when the user says take over run X, land PR N, babysit or drive home the PR, wait for CodeRabbit, fix the review findings, or merge the open or renovate PRs. Triggers include take over the run, land the PR, uzi lander, CR rate limited, greptile review, merge it when green, merge the uzi PRs, land the batch."
 ---
 
 # uzi lander — take over a run and land its PR
@@ -11,9 +11,10 @@ that already happened. From there to "merged, `main` green" is this skill. This 
 
 **Boundary.** `uzi-watcher` dispatches an issue, steers the plan gate, and owns backups and
 recovery of a lost run; it hands off here the moment a run is past its plan gate.
-`uzi-release` merges a whole batch and cuts a release; it uses this skill's review, merge
-and CI mechanics rather than restating them. Load `uzi-cli` first (the Skill tool): every
-`uzi` verb, exit code and `--json` envelope quirk lives there.
+`uzi-release` only cuts a release, once this skill has landed what should ship. Landing the
+whole open-PR set is references/batch.md; Renovate and other dependency PRs are
+references/renovate.md. Load `uzi-cli` first (the Skill tool): every `uzi` verb, exit code
+and `--json` envelope quirk lives there.
 
 Below, `RUN` is a run id, `PR` a PR number, `S` this skill's `scripts/` directory.
 
@@ -47,7 +48,7 @@ Below, `RUN` is a run id, `PR` a PR number, `S` this skill's `scripts/` director
   may rely on green CI; code/config semantics, install scripts, native binaries, security or
   toolchain risk, and unexplained lockfile changes need review. State the decision. Reserve
   CodeRabbit/Greptile for large or high-risk work, and get user approval before requesting
-  a review bot for Renovate-class work.
+  a review bot for Renovate-class work. Read references/renovate.md before landing one.
 - **Absent user = time is cheap.** In a large/high-risk bot lane, when the choice is wait
   for CodeRabbit or switch reviewer, say it in one line with the default, start the patient
   path in the same turn, and let a reply override it.
@@ -311,7 +312,9 @@ a user reply that arrives first wins.
   hermetic regressions, wired through `task test:uzi-lander` and `gate:repo`.
 - `references/review-signals.md` every pollable surface per bot; `references/coderabbit-triage.md`
   verifying and deciding findings; `references/mr-rework.md` coordinating with uzi's own
-  rework; `references/merge-mechanics.md` ruleset, red `main`, post-merge CI.
+  rework; `references/merge-mechanics.md` ruleset, red `main`, post-merge CI;
+  `references/batch.md` landing the whole open-PR set in order; `references/renovate.md`
+  Renovate, devbox and other dependency PRs.
 
 ## Safety
 
