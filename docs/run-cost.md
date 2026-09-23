@@ -26,17 +26,26 @@ names them, then asks the harder question: is the cheaper run as good?
 
 A run's lead makes one SDK `query()` call per turn — the planning turn, then
 each implement/review iteration, each resumed on the previous turn's session
-id. The Agent SDK reports cost **per `query()` call, not cumulatively over
-the resumed session**, so every one of those turns is its own leg and its
-`result` frame reports only that leg's tokens and cost. The run's stored
-total (`run_usage`, and every rollup that reads it — the board, `uzi run
-list`, `/api/usage`, `/api/admin/usage`) is the SUM of every leg, and the run
-page's per-phase table shows each leg's figures exactly, not a running total
-telescoped down to whichever leg happened to be largest. Historical runs
-that predate this fold were re-folded once, automatically, from their still-
-persisted message history on the first boot after the fix landed — no
-action needed on a self-hosted instance. See [ADR-1079](../adr/1079-run-usage-per-leg-fold.md)
-for the full design and the measured under-count this replaced.
+id. Before Claude Agent SDK 0.3.277, the SDK reported cost **per `query()`
+call, not cumulatively over the resumed session**, so every one of those
+turns was its own leg reporting only that leg's tokens and cost, and the
+run's total was the SUM of every leg. From SDK 0.3.277 a resumed leg's
+`result` frame instead reports the **running total of the whole session**,
+so the worker now marks such a frame (`usage_basis: session_cumulative`) and
+the server folds it by a per-session high-water mark instead of summing it —
+otherwise a resumed run's total inflates several-fold. The run's stored
+total (`run_usage_totals`, and every rollup that reads it — the board, `uzi
+run list`, `/api/usage`, `/api/admin/usage`) folds each leg by whichever
+rule its own frame carries, and the run page's per-phase table shows each
+leg's figures exactly, not a running total telescoped down to whichever leg
+happened to be largest. Historical runs that predate the per-leg fold were
+re-folded once, automatically, from their still-persisted message history on
+the first boot after that fix landed; a run that ran on the affected SDK
+version before the session-cumulative fix shipped is **not** re-derived —
+see [ADR-1079](../adr/1079-run-usage-per-leg-fold.md) for the per-leg design
+and the measured under-count it replaced, and
+[ADR-1562](../adr/1562-run-usage-session-cumulative-basis.md) for the
+session-cumulative fold and what it does not backfill.
 
 ## The model tier is not the difference
 

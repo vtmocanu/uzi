@@ -125,6 +125,9 @@ describe("mapSdkMessage", () => {
           total_cost_usd: undefined,
           usage: undefined,
           modelUsage: undefined,
+          // issue #1562: mapResult (a Claude single-query path) marks the frame
+          // session-cumulative; the key is appended last.
+          usage_basis: "session_cumulative",
         },
       },
     ]);
@@ -155,6 +158,7 @@ describe("mapSdkMessage", () => {
           total_cost_usd: 0.0731,
           usage,
           modelUsage,
+          usage_basis: "session_cumulative",
         },
       },
     ]);
@@ -187,6 +191,7 @@ describe("mapSdkMessage", () => {
           total_cost_usd: 0.031,
           num_turns: 7,
           duration_ms: 44000,
+          usage_basis: "session_cumulative",
         },
       },
     ]);
@@ -207,12 +212,15 @@ describe("mapSdkMessage", () => {
           total_cost_usd: undefined,
           num_turns: undefined,
           duration_ms: undefined,
+          usage_basis: "session_cumulative",
         },
       },
     ]);
   });
 
-  it("maps a system init frame to a status heartbeat", () => {
+  it("maps a system init frame to a status heartbeat (no fresh_session on the mapSdkMessage path)", () => {
+    // issue #1562: the sdk-messages init path passes no freshSession, so the key is
+    // omitted here — the run-lane adapter (claude-harness) is the only fresh_session source.
     const out = mapSdkMessage({ type: "system", subtype: "init", model: "claude-fable-5" });
     assert.deepStrictEqual(out, [{ kind: "status", agent: "lead", payload: { event: "init", model: "claude-fable-5" } }]);
   });

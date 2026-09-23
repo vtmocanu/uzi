@@ -394,6 +394,204 @@ func TestRunUsagePerLegFixtureDiscriminates(t *testing.T) {
 	}
 }
 
+// --- issue #1562: the session-cumulative contract over the `cumulative` pair ----------
+//
+// From Claude Agent SDK 0.3.277 a resumed session's result frame reports the RUNNING
+// SESSION TOTAL, not only its own query() leg, so summing legs (the ADR-1079 rule) over-
+// counts. The worker now stamps usage_basis:"session_cumulative" on such a Claude frame and
+// fresh_session:true on the init frame of a process that did not continue the requested
+// session. This half asserts the FOLD's per-leg rows (basis + lineage per leg); the store
+// live-DB half (run_usage_integration_test.go) asserts the view totals.
+
+type cumulativeRow struct {
+	Model               string  `json:"model"`
+	LineageEpoch        int32   `json:"lineage_epoch"`
+	LineageIndex        int32   `json:"lineage_index"`
+	UsageBasis          string  `json:"usage_basis"`
+	InputTokens         int64   `json:"input_tokens"`
+	CacheReadTokens     int64   `json:"cache_read_tokens"`
+	CacheCreationTokens int64   `json:"cache_creation_tokens"`
+	OutputTokens        int64   `json:"output_tokens"`
+	CostUSD             float64 `json:"cost_usd"`
+}
+
+type cumulativeFramesScenario struct {
+	Name   string          `json:"name"`
+	Frames []recordedFrame `json:"frames"`
+}
+
+type cumulativeRollupScenario struct {
+	Name          string          `json:"name"`
+	Rows          []cumulativeRow `json:"rows"`
+	Totals        recordedTotals  `json:"totals"`
+	SumFoldTotals recordedTotals  `json:"sum_fold_totals"`
+}
+
+// cumLegKey adds lineage_index to legKey: a fold row is a (model, lineage_epoch), and a leg
+// carries its own lineage_index (asserted, not keyed on, since epoch is unique per model).
+type cumLegKey struct {
+	model string
+	epoch int32
+}
+
+// foldCumulativeScenario drives the REAL AppendMessages path over one scenario's frames with
+// the given harness, and merges the resulting upserts the way UpsertRunUsage's ON CONFLICT
+// does — GREATEST per column, ONE-WAY usage_basis upgrade, lineage_index kept — per
+// (run_id, session_id, model, lineage_epoch).
+func foldCumulativeScenario(t *testing.T, harness string, frames []recordedFrame) map[cumLegKey]store.UpsertRunUsageParams {
+	t.Helper()
+	w := worker()
+	fs := &fakeStore{runOwned: store.Run{
+		ID:        uuid.New(),
+		WorkerID:  pgconv.UUID(w.ID),
+		SessionID: pgconv.TextOrNull("sess-cumulative"),
+		Harness:   harness,
+	}}
+	svc := New(fs, newBox(t), testParams())
+
+	msgs := make([]IncomingMessage, 0, len(frames))
+	for _, f := range frames {
+		msgs = append(msgs, IncomingMessage{Seq: f.Seq, Kind: f.Kind, Agent: "lead", Payload: f.Payload})
+	}
+	if err := svc.AppendMessages(context.Background(), w, fs.runOwned.ID, msgs); err != nil {
+		t.Fatalf("AppendMessages over the cumulative scenario frames: %v", err)
+	}
+
+	merged := map[cumLegKey]store.UpsertRunUsageParams{}
+	for _, u := range fs.upsertedUsage {
+		k := cumLegKey{model: u.Model, epoch: u.LineageEpoch}
+		prev, ok := merged[k]
+		if !ok {
+			merged[k] = u
+			continue
+		}
+		prev.InputTokens = max64(prev.InputTokens, u.InputTokens)
+		prev.OutputTokens = max64(prev.OutputTokens, u.OutputTokens)
+		prev.CacheReadTokens = max64(prev.CacheReadTokens, u.CacheReadTokens)
+		prev.CacheCreationTokens = max64(prev.CacheCreationTokens, u.CacheCreationTokens)
+		if costFloat(t, u.CostUsd) > costFloat(t, prev.CostUsd) {
+			prev.CostUsd = u.CostUsd
+		}
+		if prev.UsageBasis == "session_cumulative" || u.UsageBasis == "session_cumulative" {
+			prev.UsageBasis = "session_cumulative"
+		}
+		merged[k] = prev
+	}
+	return merged
+}
+
+// TestRunUsageSessionCumulativeFoldMatchesFixture is the issue #1562 fold contract: for
+// EVERY scenario in the cumulative pair, the shipped fold (Claude harness) over the frames
+// reproduces the fixture's per-leg rows exactly — model, lineage_epoch, lineage_index,
+// usage_basis, and the five accounting columns.
+func TestRunUsageSessionCumulativeFoldMatchesFixture(t *testing.T) {
+	var framesFile struct {
+		Scenarios []cumulativeFramesScenario `json:"scenarios"`
+	}
+	readFixture(t, "result-frames-cumulative.json", &framesFile)
+	var rollupFile struct {
+		Scenarios []cumulativeRollupScenario `json:"scenarios"`
+	}
+	readFixture(t, "run-usage-cumulative.json", &rollupFile)
+
+	if len(framesFile.Scenarios) == 0 {
+		t.Fatal("cumulative fixture broken: no scenarios in result-frames-cumulative.json")
+	}
+	if len(framesFile.Scenarios) != len(rollupFile.Scenarios) {
+		t.Fatalf("cumulative fixture broken: %d frame scenarios but %d rollup scenarios",
+			len(framesFile.Scenarios), len(rollupFile.Scenarios))
+	}
+	framesByName := map[string][]recordedFrame{}
+	for _, s := range framesFile.Scenarios {
+		framesByName[s.Name] = s.Frames
+	}
+
+	for _, rollup := range rollupFile.Scenarios {
+		t.Run(rollup.Name, func(t *testing.T) {
+			frames, ok := framesByName[rollup.Name]
+			if !ok {
+				t.Fatalf("cumulative fixture broken: rollup scenario %q has no frames", rollup.Name)
+			}
+			got := foldCumulativeScenario(t, "claude", frames)
+			if len(got) != len(rollup.Rows) {
+				t.Fatalf("fold produced %d (model, epoch) rows, the fixture records %d -- a leg was dropped, invented or collapsed",
+					len(got), len(rollup.Rows))
+			}
+			for _, want := range rollup.Rows {
+				g, ok := got[cumLegKey{model: want.Model, epoch: want.LineageEpoch}]
+				if !ok {
+					t.Fatalf("fold produced no row for (model %q, epoch %d)", want.Model, want.LineageEpoch)
+				}
+				if g.UsageBasis != want.UsageBasis {
+					t.Errorf("(model %s, epoch %d) usage_basis = %q, want %q",
+						want.Model, want.LineageEpoch, g.UsageBasis, want.UsageBasis)
+				}
+				if g.LineageIndex != want.LineageIndex {
+					t.Errorf("(model %s, epoch %d) lineage_index = %d, want %d",
+						want.Model, want.LineageEpoch, g.LineageIndex, want.LineageIndex)
+				}
+				if g.InputTokens != want.InputTokens || g.OutputTokens != want.OutputTokens ||
+					g.CacheReadTokens != want.CacheReadTokens || g.CacheCreationTokens != want.CacheCreationTokens {
+					t.Errorf("(model %s, epoch %d) tokens disagree:\n got in=%d out=%d cr=%d cw=%d\nwant in=%d out=%d cr=%d cw=%d",
+						want.Model, want.LineageEpoch, g.InputTokens, g.OutputTokens, g.CacheReadTokens, g.CacheCreationTokens,
+						want.InputTokens, want.OutputTokens, want.CacheReadTokens, want.CacheCreationTokens)
+				}
+				if d := math.Abs(costFloat(t, g.CostUsd) - want.CostUSD); d > 5e-7 {
+					t.Errorf("(model %s, epoch %d) cost disagrees: got %v, want %v (delta %v)",
+						want.Model, want.LineageEpoch, costFloat(t, g.CostUsd), want.CostUSD, d)
+				}
+			}
+		})
+	}
+}
+
+// TestRunUsageSessionCumulativeCodexFoldsPerLeg pins the Codex exclusion (ADR-1562): a Codex
+// run whose frames carry usage_basis:"session_cumulative" still folds every leg as per_leg —
+// the marker is NEVER honoured on Codex. Uses the `non-monotonic-column` scenario, whose two
+// frames are both marked session_cumulative in the fixture.
+func TestRunUsageSessionCumulativeCodexFoldsPerLeg(t *testing.T) {
+	var framesFile struct {
+		Scenarios []cumulativeFramesScenario `json:"scenarios"`
+	}
+	readFixture(t, "result-frames-cumulative.json", &framesFile)
+
+	var frames []recordedFrame
+	for _, s := range framesFile.Scenarios {
+		if s.Name == "non-monotonic-column" {
+			frames = s.Frames
+		}
+	}
+	if len(frames) == 0 {
+		t.Fatal("cumulative fixture broken: scenario non-monotonic-column has no frames")
+	}
+	// Sanity: the frames carry the cumulative marker, so per_leg here is the Codex OVERRIDE,
+	// not the fixture's own basis leaking through.
+	marked := false
+	for _, f := range frames {
+		var p struct {
+			Event      string `json:"event"`
+			UsageBasis string `json:"usage_basis"`
+		}
+		if err := json.Unmarshal(f.Payload, &p); err == nil && p.Event == "result" && p.UsageBasis == "session_cumulative" {
+			marked = true
+		}
+	}
+	if !marked {
+		t.Fatal("fixture broken: non-monotonic-column must carry session_cumulative result frames for this test to prove the Codex override")
+	}
+
+	got := foldCumulativeScenario(t, harnessCodex, frames)
+	if len(got) == 0 {
+		t.Fatal("Codex fold produced no rows")
+	}
+	for k, u := range got {
+		if u.UsageBasis != "per_leg" {
+			t.Errorf("(model %s, epoch %d) usage_basis = %q on a Codex run, want per_leg -- the marker must be ignored for Codex",
+				k.model, k.epoch, u.UsageBasis)
+		}
+	}
+}
+
 // TestRunUsageFixtureDiscriminates is the self-check. Without it a "tidied" fixture --
 // one frame, or models stable across frames -- would pass against the very reading
 // #195 was, and this file would certify nothing while staying green.

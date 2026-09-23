@@ -428,3 +428,115 @@ describe("deriveRunUsage matches the per-leg run_usage fold (02854d5e)", () => {
     expect(sum).toBe(d.total.out);
   });
 });
+
+// ── Issue #1562 (ADR-1562): session-cumulative resumed legs. A third contract pair,
+// added by fixture commit 8e41d369. Claude Agent SDK >= 0.3.277 reports the running
+// SESSION total on a resumed leg, so the worker marks such result frames
+// `usage_basis: "session_cumulative"` (and fresh SDK sessions' init frames
+// `fresh_session: true`); summing those legs (the ADR-1079 rule the 02854d5e pair pins
+// for unmarked frames) over-counts. Each scenario is self-contained — its own frames,
+// per-model `model_totals`, run `totals`, and `sum_fold_totals` (the pre-#1562 per-leg
+// SUM of the same rows, the RED value a regressed fold reproduces). The rollup is
+// AUTHORED (an independent reduction, not either production fold), same rationale as the
+// 02854d5e pair. The Go halves need -count=1; this vitest half has no such cache.
+
+type CumulativeModelTotal = {
+  model: string;
+  input_tokens: number;
+  cache_read_tokens: number;
+  cache_creation_tokens: number;
+  output_tokens: number;
+  cost_usd: number;
+};
+type CumulativeScenario = {
+  name: string;
+  frames: Frame[];
+  model_totals: CumulativeModelTotal[];
+  totals: Totals;
+  sum_fold_totals: Totals;
+};
+const cumulativeScenarios: CumulativeScenario[] = (
+  JSON.parse(read("result-frames-cumulative.json")) as { scenarios: { name: string; frames: Frame[] }[] }
+).scenarios.map((framesEntry) => {
+  const rollupScenarios = (
+    JSON.parse(read("run-usage-cumulative.json")) as {
+      scenarios: { name: string; model_totals: CumulativeModelTotal[]; totals: Totals; sum_fold_totals: Totals }[];
+    }
+  ).scenarios;
+  const rollup = rollupScenarios.find((s) => s.name === framesEntry.name);
+  if (!rollup) {
+    fatal(`fixture broken: no rollup scenario named ${framesEntry.name} in run-usage-cumulative.json`);
+  }
+  return { frames: framesEntry.frames, ...rollup };
+});
+
+if (cumulativeScenarios.length === 0) {
+  fatal("fixture broken: result-frames-cumulative.json has no scenarios");
+}
+
+/** A scenario's frames as the run page receives them off /api/runs/:id/messages. */
+function cumulativeMessages(frames: Frame[]): RunMessage[] {
+  return frames.map((f) => ({
+    seq: f.seq,
+    kind: f.kind,
+    agent: "lead",
+    agent_instance: null,
+    agent_label: null,
+    payload: f.payload,
+    created_at: "2026-09-23T00:00:00Z",
+  }));
+}
+
+describe("deriveRunUsage matches the session-cumulative fold (issue #1562)", () => {
+  for (const s of cumulativeScenarios) {
+    describe(s.name, () => {
+      it("agrees per model on all five columns", () => {
+        const got = new Map(deriveRunUsage(cumulativeMessages(s.frames)).modelTotals.map((t) => [t.model, t]));
+        expect([...got.keys()].sort()).toEqual(s.model_totals.map((t) => t.model).sort());
+        for (const want of s.model_totals) {
+          const g = got.get(want.model);
+          if (!g) fatal(`deriveRunUsage produced no row for model ${want.model}, which the rollup holds`);
+          expect(g.input, `${want.model} input_tokens`).toBe(want.input_tokens);
+          expect(g.cacheCreation, `${want.model} cache_creation_tokens`).toBe(want.cache_creation_tokens);
+          expect(g.cached, `${want.model} cache_read_tokens`).toBe(want.cache_read_tokens);
+          expect(g.out, `${want.model} output_tokens`).toBe(want.output_tokens);
+          // Per-model cost is a SUM of per-leg microdollar-quantized deltas; only
+          // float-summation noise separates it from the authored value.
+          expect(g.costUsd, `${want.model} cost_usd`).toBeCloseTo(want.cost_usd, 6);
+        }
+      });
+
+      it("agrees on the run total, and does NOT reproduce the per-leg SUM fold", () => {
+        const d = deriveRunUsage(cumulativeMessages(s.frames));
+        expect(d.hasConfirmed).toBe(true);
+
+        // fresh = input + cache_creation (the client folds the two into one column).
+        expect(d.total.fresh, "input+cache_creation").toBe(s.totals.input_tokens + s.totals.cache_creation_tokens);
+        expect(d.total.cached, "cache_read").toBe(s.totals.cache_read_tokens);
+        expect(d.total.out, "output").toBe(s.totals.output_tokens);
+        const costBudget = s.model_totals.length * 5e-7 + 1e-9;
+        expect(
+          Math.abs(d.total.costUsd - s.totals.cost_usd),
+          `cost beyond the microdollar quantization budget: client ${d.total.costUsd}, want ${s.totals.cost_usd}`,
+        ).toBeLessThanOrEqual(costBudget);
+
+        // The RED assertion: a fold that regressed to the pre-#1562 per-leg SUM would
+        // land on `sum_fold_totals`. Assert the derived total is NOT that, on every
+        // column where the two differ (output and cost differ in every scenario).
+        const sumFoldFresh = s.sum_fold_totals.input_tokens + s.sum_fold_totals.cache_creation_tokens;
+        if (sumFoldFresh !== s.totals.input_tokens + s.totals.cache_creation_tokens) {
+          expect(d.total.fresh, "fresh must not equal the per-leg SUM").not.toBe(sumFoldFresh);
+        }
+        if (s.sum_fold_totals.cache_read_tokens !== s.totals.cache_read_tokens) {
+          expect(d.total.cached, "cache_read must not equal the per-leg SUM").not.toBe(s.sum_fold_totals.cache_read_tokens);
+        }
+        if (s.sum_fold_totals.output_tokens !== s.totals.output_tokens) {
+          expect(d.total.out, "output must not equal the per-leg SUM").not.toBe(s.sum_fold_totals.output_tokens);
+        }
+        if (s.sum_fold_totals.cost_usd !== s.totals.cost_usd) {
+          expect(d.total.costUsd, "cost must not equal the per-leg SUM").not.toBeCloseTo(s.sum_fold_totals.cost_usd, 3);
+        }
+      });
+    });
+  }
+});

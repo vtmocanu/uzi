@@ -759,6 +759,8 @@ type RunUsage struct {
 	Harness             string             `json:"harness"`
 	CostStatus          string             `json:"cost_status"`
 	ClaimGeneration     pgtype.Int8        `json:"claim_generation"`
+	UsageBasis          string             `json:"usage_basis"`
+	LineageIndex        int32              `json:"lineage_index"`
 }
 
 type RunUsageTotal struct {

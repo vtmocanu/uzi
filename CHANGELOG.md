@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Fixed
+
+- **Run, user, and factory usage totals were overstated for multi-turn Claude runs on v0.84.0-rc.8 workers, and are now folded correctly ([#1562](https://github.com/vtmocanu/uzi/issues/1562)).**
+  From Claude Agent SDK 0.3.277 a resumed leg reports the session's running total instead of just that leg, and the old per-leg SUM (ADR-1079) counted it several times over; the worker now marks which reading a frame carries and the server folds it by a per-session high-water mark, but a run already recorded on rc.8 stays overstated (not re-derived; see ADR-1562).
+
 ## [0.84.0] - 2026-09-20
 
 ### Added

@@ -963,6 +963,12 @@ type Store interface {
 	// count of persisted `init` status frames of the run with a lower seq. The fold
 	// reads it once per result frame to key run_usage per SDK query() leg.
 	CountRunInitFramesBefore(ctx context.Context, arg store.CountRunInitFramesBeforeParams) (int64, error)
+	// CountRunLineageRestartsBefore returns a result frame's lineage (session) index
+	// (ADR-1562): the count of persisted fresh_session:true `init` frames of the run with
+	// a lower seq, excluding the run's first init. The fold reads it once per result frame
+	// so the run_usage_totals view can restart the session_cumulative high-water fold at a
+	// fresh session instead of collapsing it into the previous one.
+	CountRunLineageRestartsBefore(ctx context.Context, arg store.CountRunLineageRestartsBeforeParams) (int64, error)
 	// Usage read rollups (PRD #40 M3), all over the run_usage_totals view.
 	GetRunUsageTotal(ctx context.Context, runID uuid.UUID) (store.GetRunUsageTotalRow, error)
 	SelfUsage(ctx context.Context, userID uuid.UUID) (store.SelfUsageRow, error)
@@ -2757,6 +2763,14 @@ type IncomingMessage struct {
 type resultUsagePayload struct {
 	Event      string                      `json:"event"`
 	ModelUsage map[string]resultModelUsage `json:"modelUsage"`
+	// UsageBasis is the worker's per-frame reading marker (ADR-1562). The only value the
+	// fold honours is the exact string "session_cumulative", stamped on a Claude result
+	// frame whose modelUsage is the running total of the session the leg continued (SDK >=
+	// 0.3.277). Any other value, or absence, is per_leg — the ADR-1079 semantics of every
+	// pre-#1562 frame, every Codex frame and the stub executor. The marker is NEVER honoured
+	// on a Codex run (see foldUsageFrames), and it is a server-internal marker the worker
+	// stamps, not a public field.
+	UsageBasis string `json:"usage_basis"`
 }
 
 type resultModelUsage struct {

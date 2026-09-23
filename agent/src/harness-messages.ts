@@ -68,11 +68,20 @@ export function projectItem(
  * value is `undefined`, unknown members survive inside the wire capsule, and the
  * per-branch KEY ORDER is preserved exactly (success and failed differ, and the
  * existing tests assert the object shape before JSON serialization).
+ *
+ * `usageBasis` (issue #1562 / ADR-1562) is the OPTIONAL cumulative-reading marker.
+ * When set to `"session_cumulative"` the key `usage_basis` is APPENDED (last) to
+ * the payload in BOTH branches, telling the server that `modelUsage` is the running
+ * total of the session the leg continued (Claude Agent SDK >= 0.3.277), so it folds
+ * by high-water within a session lineage rather than summing legs. When UNSET the
+ * key is omitted entirely, keeping the payload byte-identical to a pre-#1562 frame
+ * (the existing shape assertions rely on this); an unmarked frame is `per_leg`.
  */
 export function projectResult(f: {
   outcome: "success" | "failed";
   subtype: string;
   errors: readonly string[];
+  usageBasis?: "session_cumulative";
   wire: {
     usage: unknown;
     modelUsage: unknown;
@@ -82,7 +91,7 @@ export function projectResult(f: {
   };
 }): EmittedMessage {
   if (f.outcome === "success") {
-    return {
+    const em: EmittedMessage = {
       kind: "status",
       agent: LEAD,
       payload: {
@@ -95,8 +104,10 @@ export function projectResult(f: {
         modelUsage: f.wire.modelUsage,
       },
     };
+    if (f.usageBasis !== undefined) em.payload["usage_basis"] = f.usageBasis;
+    return em;
   }
-  return {
+  const em: EmittedMessage = {
     kind: "error",
     agent: LEAD,
     payload: {
@@ -110,13 +121,28 @@ export function projectResult(f: {
       duration_ms: f.wire.duration_ms,
     },
   };
+  if (f.usageBasis !== undefined) em.payload["usage_basis"] = f.usageBasis;
+  return em;
 }
 
-/** The system/init persisted status message (mapSdkMessage init case). */
-export function projectInit(model: string | undefined): EmittedMessage {
-  return {
+/**
+ * The system/init persisted status message (mapSdkMessage init case). When
+ * `freshSession` is true the key `fresh_session: true` is APPENDED to the payload
+ * (issue #1562 / ADR-1562), marking that this SDK process did NOT continue the
+ * requested session — either no resume was requested, or the SDK's init
+ * `session_id` differed from the requested one. The server uses it to open a new
+ * usage lineage. When it is not true the key is omitted, keeping the payload
+ * byte-identical to a pre-#1562 init frame.
+ */
+export function projectInit(
+  model: string | undefined,
+  freshSession?: boolean,
+): EmittedMessage {
+  const em: EmittedMessage = {
     kind: "status",
     agent: LEAD,
     payload: { event: "init", model },
   };
+  if (freshSession === true) em.payload["fresh_session"] = true;
+  return em;
 }

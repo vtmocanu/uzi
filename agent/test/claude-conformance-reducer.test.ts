@@ -109,6 +109,58 @@ test("claude C2 reducer: signals from a main-origin frame are folded once", asyn
   recordConformanceEvidence(t.name, "pass");
 });
 
+const terminalWithBasis = (basis: "session" | "turn" | undefined): HarnessEvent => ({
+  kind: "turn_finished",
+  terminal: {
+    outcome: "success",
+    subtype: "success",
+    errors: [],
+    usage:
+      basis === undefined
+        ? undefined
+        : { basis, tokens: {}, wire: { usage: { input_tokens: 1 }, modelUsage: { m: { costUSD: 1 } } } },
+    metrics: { cost: { kind: "unreported" }, wire: { num_turns: 1, duration_ms: 1, total_cost_usd: 0 } },
+  },
+});
+
+test("issue #1562 reducer: a session-basis terminal marks the result frame session_cumulative", async (t) => {
+  const { messages } = await reduceCollect([{ kind: "initialized", model: "m" }, terminalWithBasis("session")]);
+  const result = messages.find((m) => m.payload["event"] === "result")!;
+  assert.equal(result.payload["usage_basis"], "session_cumulative", "Claude session basis ⇒ marked");
+  recordConformanceEvidence(t.name, "pass");
+});
+
+test("issue #1562 reducer: a turn-basis terminal leaves the result frame unmarked (per_leg)", async (t) => {
+  const { messages } = await reduceCollect([{ kind: "initialized", model: "m" }, terminalWithBasis("turn")]);
+  const result = messages.find((m) => m.payload["event"] === "result")!;
+  assert.ok(!("usage_basis" in result.payload), "Codex/turn basis ⇒ no marker key");
+  recordConformanceEvidence(t.name, "pass");
+});
+
+test("issue #1562 reducer: an absent-usage terminal leaves the result frame unmarked", async (t) => {
+  const { messages } = await reduceCollect([{ kind: "initialized", model: "m" }, terminalWithBasis(undefined)]);
+  const result = messages.find((m) => m.payload["event"] === "result")!;
+  assert.ok(!("usage_basis" in result.payload), "no usage ⇒ no marker key");
+  recordConformanceEvidence(t.name, "pass");
+});
+
+test("issue #1562 reducer: an initialized event with freshSession marks the init frame", async (t) => {
+  const { messages } = await reduceCollect([
+    { kind: "initialized", model: "m", freshSession: true },
+    successTerminal(),
+  ]);
+  const init = messages.find((m) => m.payload["event"] === "init")!;
+  assert.equal(init.payload["fresh_session"], true, "freshSession ⇒ fresh_session: true");
+  recordConformanceEvidence(t.name, "pass");
+});
+
+test("issue #1562 reducer: an initialized event without freshSession omits the key", async (t) => {
+  const { messages } = await reduceCollect([{ kind: "initialized", model: "m" }, successTerminal()]);
+  const init = messages.find((m) => m.payload["event"] === "init")!;
+  assert.ok(!("fresh_session" in init.payload), "no freshSession ⇒ no key");
+  recordConformanceEvidence(t.name, "pass");
+});
+
 test("claude C2 reducer: lead text becomes finalText while subagent text only sets subagentActivity", async (t) => {
   const leadText: HarnessEvent = {
     kind: "frame",
