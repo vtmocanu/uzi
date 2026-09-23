@@ -39,7 +39,11 @@
 //                               as `activity` (NOT a frame), while an ACCEPTED ROOT SIGNAL call
 //                               (submit_plan/signal_done/checkpoint/progress/questions) ALSO
 //                               yields a main-origin `frame` carrying the scanned `signals` so
-//                               the run-lane reducer folds them (the model reply is unchanged)
+//                               the run-lane reducer folds them (the model reply is unchanged).
+//                               An ACTIVE-TURN non-signal, non-delegation root call is ALSO
+//                               projected (issue #1583) as a lead tool started/finished frame
+//                               pair, queued on the turn's outbox and drained ahead of its
+//                               `activity`
 //   auth refresh request      → narrow auth owner (never broker), then `activity`
 //   other server→client req   → fail-closed JSON-RPC method error, then `activity`
 //   turn/completed            → `turn_finished` (decoded terminal; success/failed by
@@ -63,6 +67,14 @@ import {
   type CodexErrorClassification,
 } from "./terminal-normalize.js";
 import { CodexUsageAccountant, deriveCodexRunCost } from "./token-accounting.js";
+import {
+  newProjectionNonce,
+  projectedId,
+  projectToolInput,
+  projectToolName,
+  projectToolOutput,
+  type ProjectionScrub,
+} from "./projection.js";
 
 import type { Logger } from "../log.js";
 import type {
@@ -201,6 +213,13 @@ export interface CodexHarnessOptions {
    *  this true; recreated internal epochs set it false, so each worker claim creates exactly one
    *  persisted usage-lineage marker regardless of app-server `thread/started` behavior. */
   readonly emitClaimInit?: boolean;
+  /** Issue #1583: the redactor applied to every PROJECTED tool input/output string BEFORE it is
+   *  bounded (the executor wires the run's runtime-released Codex tokens, which the batcher's
+   *  claim-secret redactor never sees). Identity when absent; the batcher still redacts at persist. */
+  readonly scrubProjected?: ProjectionScrub;
+  /** Issue #1583: the 12-hex-char namespace of this harness's projected tool ids. Generated from
+   *  `crypto.randomBytes` when absent; injectable so a test can pin the ids. */
+  readonly idNonce?: string;
 }
 
 // --- small pure helpers -------------------------------------------------------
@@ -312,6 +331,21 @@ export class CodexHarness implements RunHarness {
   private readonly emitClaimInit: boolean;
   private claimInitEmitted = false;
 
+  // Issue #1583: the tool-projection OUTBOX. A root callback is awaited inside mapNote, but its
+  // `started` tool frame must reach the stream BEFORE the (possibly long) broker effect settles,
+  // so routeToolCall pushes projected frames here and runTurn races `outboxReady()` against the
+  // note/mapNote awaits, draining the queue whenever it wakes. Frames are accepted ONLY for the
+  // turn whose stream is live (`liveProjectionTurn`): a wedged callback that settles after its
+  // turn ended (abort/stop) can never leak a frame into a later turn's stream.
+  private readonly scrubProjected: ProjectionScrub;
+  private readonly idNonce: string;
+  private outbox: HarnessEvent[] = [];
+  private wakeOutbox?: () => void;
+  private turnOrdinal = 0;
+  private liveProjectionTurn?: number;
+  // Fallback id counter for a callback whose call id is empty after sanitising (per turn).
+  private projectionCounter = 0;
+
   // Child-thread demux (part C): a registered sink receives every frame carrying its
   // child thread id off the SAME transport, so a delegation's child turn can consume its
   // own notifications while the root loop keeps reading. Empty on the non-delegation path.
@@ -357,6 +391,8 @@ export class CodexHarness implements RunHarness {
     this.authMode = opts.authMode;
     this.accountant = opts.accountant ?? new CodexUsageAccountant();
     this.emitClaimInit = opts.emitClaimInit ?? true;
+    this.scrubProjected = opts.scrubProjected ?? ((s: string): string => s);
+    this.idNonce = opts.idNonce ?? newProjectionNonce();
   }
 
   inspectSession(id: string): Promise<SessionPresence> {
@@ -448,6 +484,9 @@ export class CodexHarness implements RunHarness {
     this.stopRequested = false;
     this.stopTurn = undefined;
     this.pendingCodexError = undefined;
+    this.turnOrdinal += 1;
+    this.projectionCounter = 0;
+    this.outbox = [];
 
     return {
       events: this.runTurn(request, rendered),
@@ -534,8 +573,37 @@ export class CodexHarness implements RunHarness {
 
   // --- setup + stream -----------------------------------------------------------
 
+  // --- projection outbox (issue #1583) ---------------------------------------------
+
+  /** Queue one projected event for the turn `ordinal` and wake the run loop. Dropped when that
+   *  turn's stream is no longer live (a late callback settling after its turn ended). */
+  private emitProjected(ev: HarnessEvent, ordinal: number): void {
+    if (ordinal !== this.liveProjectionTurn) return;
+    this.outbox.push(ev);
+    const wake = this.wakeOutbox;
+    this.wakeOutbox = undefined;
+    wake?.();
+  }
+
+  /** Resolves once the outbox holds at least one event. Only the run loop awaits it, and it
+   *  races one at a time, so a single wake slot suffices; a superseded waiter simply never
+   *  resolves (it is only ever referenced by a race that already settled). */
+  private outboxReady(): Promise<"outbox"> {
+    if (this.outbox.length > 0) return Promise.resolve("outbox");
+    return new Promise((resolve) => {
+      this.wakeOutbox = (): void => resolve("outbox");
+    });
+  }
+
+  /** Yield every queued projected event, including any queued while a yield was pending. */
+  private *drainOutbox(): Generator<HarnessEvent> {
+    for (let ev = this.outbox.shift(); ev !== undefined; ev = this.outbox.shift()) yield ev;
+  }
+
   private async *runTurn(request: RunTurnRequest, rendered: RenderedCodexRun): AsyncGenerator<HarnessEvent> {
     this.currentModel = rendered.lead.model ?? this.provider.model;
+    const ordinal = this.turnOrdinal;
+    this.liveProjectionTurn = ordinal;
 
     // A local watchdog/cancel (owner-aborted signal) ends the stream FIRST (rule 9).
     // requestStop()/close() also settle it via `stopTurn`, so a turn wedged in a pending
@@ -600,13 +668,24 @@ export class CodexHarness implements RunHarness {
       }
 
       // 4. Consume the notification stream, mapping each raw frame to ONE neutral event.
+      //    Every return path below first drains the projection outbox (issue #1583), so a
+      //    projected tool frame queued before the stream ends is never silently lost.
       for (;;) {
-        if (this.turnClosed) return;
+        if (this.turnClosed) {
+          yield* this.drainOutbox();
+          return;
+        }
         const notePromise = this.pendingNote ?? notes.next();
         this.pendingNote = notePromise;
-        let step: IteratorResult<CodexNotification> | "aborted";
+        let step: IteratorResult<CodexNotification> | "aborted" | "outbox";
         try {
-          step = await Promise.race([notePromise, abortPromise]);
+          // An outbox wake drains + yields the queued frames and re-races the SAME pending
+          // note (still held in `pendingNote`), so no provider notification is ever dropped.
+          for (;;) {
+            step = await Promise.race([notePromise, abortPromise, this.outboxReady()]);
+            if (step !== "outbox") break;
+            yield* this.drainOutbox();
+          }
         } catch (error) {
           if (this.pendingNote === notePromise) this.pendingNote = undefined;
           throw error;
@@ -614,6 +693,7 @@ export class CodexHarness implements RunHarness {
         if (step === "aborted") {
           // Owner cancel/watchdog wins: interrupt the turn and end the stream cleanly.
           this.endTurnOnStop();
+          yield* this.drainOutbox();
           return;
         }
         if (this.pendingNote === notePromise) this.pendingNote = undefined;
@@ -621,7 +701,10 @@ export class CodexHarness implements RunHarness {
           // A deliberate close or an already-emitted terminal ends cleanly. Otherwise
           // this is Codex's own unexpected EOF → a protocol throw (rule 9), never a
           // fabricated success.
-          if (this.terminalEmitted || this.turnClosed) return;
+          if (this.terminalEmitted || this.turnClosed) {
+            yield* this.drainOutbox();
+            return;
+          }
           throw new CodexHarnessError({
             category: "protocol",
             message: "codex app-server stream ended before turn completion",
@@ -671,11 +754,25 @@ export class CodexHarness implements RunHarness {
         // at the safety boundary, and a late broker reply is guarded in routeToolCall so it
         // never throws into a closed transport. The happy path is unchanged: a callback
         // that settles normally still replies via transport.respond after the broker settles.
-        const mapped = await Promise.race([this.mapNote(transport, step.value, request.signal), abortPromise]);
+        //
+        // mapNote is invoked EXACTLY ONCE per note (so a callback is brokered and replied
+        // once); an outbox wake (issue #1583: a projected `started` frame queued while the
+        // broker effect is still running) drains + yields the queue and re-races that SAME
+        // promise. The outbox is drained again before `mapped` itself is yielded, so a
+        // callback's started/finished pair always precedes the note's own event.
+        const mappedPromise = this.mapNote(transport, step.value, request.signal);
+        let mapped: HarnessEvent | "aborted" | "outbox";
+        for (;;) {
+          mapped = await Promise.race([mappedPromise, abortPromise, this.outboxReady()]);
+          if (mapped !== "outbox") break;
+          yield* this.drainOutbox();
+        }
         if (mapped === "aborted") {
           this.endTurnOnStop();
+          yield* this.drainOutbox();
           return;
         }
+        yield* this.drainOutbox();
         yield mapped;
         if (mapped.kind === "turn_finished") {
           // Flush any concurrently-running delegation callbacks: each drives a child turn
@@ -684,12 +781,20 @@ export class CodexHarness implements RunHarness {
           // child self-bounds via its own per-child deadline (delegation.ts), so this
           // await is finite. The non-delegation path has an empty set and never waits.
           if (this.pendingToolCalls.size > 0) await Promise.allSettled(this.pendingToolCalls);
+          // Nothing projects from a background (delegation) callback yet, so this is empty
+          // today; it keeps the "drain before return" invariant for when one does.
+          yield* this.drainOutbox();
           return; // close the iterator after the terminal
         }
       }
     } finally {
       if (onAbort) request.signal.removeEventListener("abort", onAbort);
       if (this.stopTurn === settleStop) this.stopTurn = undefined;
+      // Close the outbox for this turn: a callback settling after the stream ended drops its
+      // projection rather than leaking it into a later turn.
+      if (this.liveProjectionTurn === ordinal) this.liveProjectionTurn = undefined;
+      this.outbox = [];
+      this.wakeOutbox = undefined;
     }
   }
 
@@ -903,7 +1008,8 @@ export class CodexHarness implements RunHarness {
               // already went out via routeToolCall (replyOf) — this frame is IN ADDITION, never
               // instead. Every other tool call (denied, non-signal, delegation, or a child/
               // foreign/stale identity) returns undefined and falls through to the
-              // byte-identical `activity` below.
+              // `activity` below; an active-turn non-signal root call's projected tool
+              // frames (issue #1583) travel separately, on the outbox.
               return {
                 kind: "frame",
                 origin: { kind: "main" },
@@ -973,7 +1079,9 @@ export class CodexHarness implements RunHarness {
       this.safeRespond(transport, requestId, { ok: false, code: "not_active_turn", message: "callback does not match the active turn" });
       return undefined;
     }
-    const runAndReply = async (): Promise<CallbackResult> => {
+    // `beforeReply` runs once the broker settled (or threw → broker_error) and BEFORE the model
+    // reply, so a projected `finished` frame is queued ahead of anything the reply triggers.
+    const runAndReply = async (beforeReply?: (result: CallbackResult) => void): Promise<CallbackResult> => {
       let result: CallbackResult;
       try {
         // A matched callback is, by construction, the root turn's — origin is "root".
@@ -981,11 +1089,13 @@ export class CodexHarness implements RunHarness {
       } catch {
         result = { ok: false, code: "broker_error", message: "the callback failed" };
       }
+      beforeReply?.(result);
       this.safeRespond(transport, requestId, result);
       return result;
     };
     const toolName = asString(p.tool);
     const canonical = toolName !== undefined ? canonicalizeCodexToolName(toolName) : undefined;
+    const isSignal = canonical !== undefined && CODEX_SIGNAL_TOOLS.has(canonical);
     // A DELEGATION callback (spawn_agent / the collaboration*/Subagent* family) drives a
     // CHILD turn whose frames THIS root loop demuxes off the SAME transport
     // (registerChildSink). It therefore MUST run CONCURRENTLY with continued note
@@ -1002,16 +1112,62 @@ export class CodexHarness implements RunHarness {
       void task.finally(() => this.pendingToolCalls.delete(task));
       return undefined;
     }
-    const result = await runAndReply();
+    // Issue #1583: project every other ACTIVE-TURN root callback (shell/file/mcp/unknown) as a
+    // lead tool_use/tool_result pair — Codex hands uzi no tool blocks of its own, so without
+    // this the lanes see no tool activity at all. Signal tools are NOT projected (their
+    // signals-frame path below stays byte-identical, and the reducer drops signal tool_use
+    // anyway); a denied/stale/foreign identity already returned above, unprojected.
+    const project = isSignal ? undefined : this.beginToolProjection(callId, canonical, p.arguments);
+    const result = await runAndReply(project);
     // Route a TRUSTED ROOT SIGNAL callback's scanned result into the run-lane reducer: when
     // the tool canonicalizes to a signal tool AND the broker ACCEPTED it, `result.output` is
     // the scanned Partial<TurnSignals> (broker.dispatchSignal returns `{ok:true, output:
     // scanned}`), which the caller surfaces on a main-origin signals frame. A DENIED signal
     // (result.ok === false) folds nothing; a non-signal effect (shell/file/mcp) is undefined.
-    if (canonical !== undefined && CODEX_SIGNAL_TOOLS.has(canonical) && result.ok) {
+    if (isSignal && result.ok) {
       return { signals: result.output as Readonly<Partial<TurnSignals>> };
     }
     return undefined;
+  }
+
+  /** Issue #1583: queue the projected `started` tool frame for one root callback NOW (before the
+   *  broker is awaited) and return the hook that queues its `finished` frame once the broker
+   *  settles. Both frames are main-origin, lead-attributed, share one namespaced id, and carry
+   *  only scrubbed + bounded input/output (see projection.ts). They carry NO `signals`. */
+  private beginToolProjection(
+    callId: string,
+    canonical: string | undefined,
+    args: unknown,
+  ): (result: CallbackResult) => void {
+    const ordinal = this.turnOrdinal;
+    this.projectionCounter += 1;
+    const id = projectedId(this.idNonce, ordinal, callId, this.projectionCounter);
+    const name = projectToolName(canonical, this.scrubProjected);
+    const frame = (item: HarnessItem): HarnessEvent => ({
+      kind: "frame",
+      origin: { kind: "main" },
+      attribution: { agent: "lead" },
+      items: [item],
+      model: this.currentModel,
+      sessionId: this.threadId,
+    });
+    this.emitProjected(
+      frame({ kind: "tool", phase: "started", id, name, input: projectToolInput(args, this.scrubProjected) }),
+      ordinal,
+    );
+    return (result) => {
+      this.emitProjected(
+        frame({
+          kind: "tool",
+          phase: "finished",
+          id,
+          name,
+          output: projectToolOutput(result, this.scrubProjected),
+          isError: !result.ok,
+        }),
+        ordinal,
+      );
+    };
   }
 
   /** Reply to a server→client tool-call with a broker {@link CallbackResult}, mapped to the

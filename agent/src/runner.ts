@@ -5329,6 +5329,8 @@ export class RunRunner {
       // floor. Absent (fresh branch) ⇒ no note.
       publishedTip: flight.publishedTip,
       emit: (m) => batcher.emit(m),
+      // Issue #1583: the claim-secret text redactor, for projections that bound text pre-batcher.
+      redactText: flight.redactText,
       oauthToken: claim.secrets.anthropic_oauth_token,
       // PRD #362 M3c: the run-summary model resolved server-side (user-value-wins),
       // and whether the intent summary is already set so the executor skips

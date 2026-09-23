@@ -67,6 +67,7 @@ import { RunTurnReducerImpl } from "../harness-reducer.js";
 import { buildLeadSystemPrompt, buildRevisePlanPrompt, publishedTipNote } from "../prompt.js";
 import { RUNNER_UID, WORKER_UID, uidSplitActive } from "../runner-uid.js";
 import { errMessage } from "../util.js";
+import { makeTextRedactor } from "../redact.js";
 import type { AgentTemplate, ClaimSkill } from "../protocol.js";
 import type { CommandSandboxMode } from "../config.js";
 
@@ -1253,6 +1254,11 @@ interface EpochSharedContext {
   readonly screenPolicy: ScreenPolicy;
   readonly toolHandlers: ReadonlyMap<string, ToolHandler>;
   readonly registerToken: (token: string) => void;
+  /** Issue #1583: scrubs a projected tool input/output string BEFORE it is bounded, of every
+   *  runtime-released Codex token (the live `releasedTokens` set, read per call; the batcher's
+   *  redactor never sees these) AND of the claim secrets (`ctx.redactText`), so neither can leave
+   *  an unredacted prefix straddling the bound's cut. */
+  readonly scrubProjected: (s: string) => string;
   readonly committedGeneration: CodexCommittedGenerationCell;
   readonly launchEffectRoot: (spec: CodexEffectLaunchSpec, deadlineMs?: number) => Promise<CodexRootHandle>;
   readonly spawnBoundaryRoot: SpawnRootSeam;
@@ -1477,6 +1483,7 @@ export class CodexExecutor implements Executor {
       // The per-run state every epoch is built from. Everything here is SHARED and closed over
       // ONCE; startProviderEpoch mints only the per-epoch registry/safety/harness/effect roots +
       // its own fresh credential + owned HOME on top of it.
+      const claimRedact = ctx.redactText ?? ((s: string): string => s);
       const shared: EpochSharedContext = {
         provider,
         binding,
@@ -1505,6 +1512,9 @@ export class CodexExecutor implements Executor {
         screenPolicy: { dockerWired: false, extraSecretPaths: [path.join(this.homeRoot, "codex-data") + path.sep] },
         toolHandlers,
         registerToken,
+        // Issue #1583: BOTH secret sets are scrubbed before a projection is bounded — the claim
+        // secrets (ctx.redactText, the batcher's set) and the runtime-released Codex tokens.
+        scrubProjected: (s: string): string => claimRedact(makeTextRedactor([...releasedTokens])(s)),
         committedGeneration,
         launchEffectRoot,
         spawnBoundaryRoot,
@@ -1712,7 +1722,7 @@ export class CodexExecutor implements Executor {
     const {
       provider, binding, worktreePath, storeDir, homeRoot, boundaryDeadlineMs, childTurnDeadlineMs,
       commandEnv, commandSandbox, screenPolicy, toolHandlers, registerToken, committedGeneration, launchEffectRoot,
-      spawnBoundaryRoot, boundaryProcessSpawner, reconcile, evictTokens, accountant,
+      spawnBoundaryRoot, boundaryProcessSpawner, reconcile, evictTokens, accountant, scrubProjected,
     } = shared;
 
     // Per-epoch trust-boundary REVALIDATION: re-verify the run HOME + codex-data parent's
@@ -1883,6 +1893,8 @@ export class CodexExecutor implements Executor {
         // a fresh lineage even when thread/resume emits no thread/started notification.
         accountant,
         emitClaimInit: epochIndex === 0,
+        // Issue #1583: projected tool frames are scrubbed of runtime-released Codex tokens.
+        scrubProjected,
       });
 
       const epochHarness = harness;

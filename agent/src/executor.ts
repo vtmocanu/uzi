@@ -145,6 +145,10 @@ export interface RunContext {
   interactive?: boolean;
   /** Append a message to the run's live stream. */
   emit(msg: EmittedMessage): void;
+  /** Issue #1583: the run's claim-secret TextRedactor, the same secret set the batcher's payload
+   *  redactor is built from. The Codex executor applies it to projected tool text BEFORE bounding,
+   *  so a claim secret straddling the cut cannot leave an unredacted prefix. Absent ⇒ identity. */
+  redactText?: (s: string) => string;
   /** Anthropic subscription OAuth token (CLAUDE_CODE_OAUTH_TOKEN) for the SDK. */
   oauthToken?: string;
   /** PRD #362 M3c: the model the inline run-summary generator runs on, resolved

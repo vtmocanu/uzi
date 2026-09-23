@@ -339,6 +339,8 @@ function makeHarness(
     appServerAuth?: CodexAppServerAuthSession;
     credentialValue?: string;
     authMode?: CodexAppServerAuthMode;
+    scrubProjected?: (s: string) => string;
+    idNonce?: string;
   } = {},
 ): HarnessBits {
   const transport = opts.transport ?? new FakeTransport();
@@ -357,6 +359,8 @@ function makeHarness(
     appServerAuth: opts.appServerAuth,
     credentialValue: opts.credentialValue,
     authMode: opts.authMode,
+    scrubProjected: opts.scrubProjected,
+    idNonce: opts.idNonce,
   });
   return { harness, transport, registry };
 }
@@ -1146,8 +1150,15 @@ describe("CodexHarness: server→client tool-call routing", () => {
 
     const events = await collect(harness.startTurn(request).events);
 
-    // The tool-call is intercepted (activity), never a frame.
-    assert.equal(events.filter((e) => e.kind === "frame").length, 0);
+    // The tool-call is intercepted (activity). Issue #1583: it is ALSO projected as exactly one
+    // lead tool started/finished frame pair, neither of which carries `signals`.
+    const frames = events.filter((e) => e.kind === "frame");
+    assert.equal(frames.length, 2);
+    assert.deepEqual(
+      frames.map((f) => (f.kind === "frame" ? f.items.map((i) => (i.kind === "tool" ? i.phase : i.kind)) : [])),
+      [["started"], ["finished"]],
+    );
+    for (const f of frames) if (f.kind === "frame") assert.equal(f.signals, undefined);
     assert.equal(spawnCalls.length, 1);
     assert.deepEqual(spawnCalls[0]!.argv, ["/bin/sh", "-c", "echo hello"]);
 
@@ -1187,9 +1198,13 @@ describe("CodexHarness: server→client tool-call routing", () => {
     const { harness, transport } = makeHarness({ registry, broker });
     transport.push(threadStarted()).push(toolCall(9, "DangerTool", {})).push(turnCompleted("completed")).end();
 
-    await collect(harness.startTurn(request).events);
+    const events = await collect(harness.startTurn(request).events);
     const result = rec(rec(transport.responses[0]!.response).result);
     assert.equal(result.success, false);
+    // Issue #1583: the denied call's projected finished frame is an error result.
+    const finished = events.flatMap((e) => (e.kind === "frame" ? e.items : [])).find((i) => i.kind === "tool" && i.phase === "finished");
+    assert.ok(finished && finished.kind === "tool" && finished.phase === "finished");
+    assert.equal(finished.isError, true);
   });
 
   it("a tool-call SPOOFING a different threadId is denied fail-closed: the broker is never invoked", async () => {
@@ -1352,7 +1367,7 @@ describe("CodexHarness: trusted ROOT signal callbacks route scanned signals into
     }
   });
 
-  it("a non-signal tool call still yields activity and NO signals frame (byte-identical path)", async () => {
+  it("a non-signal tool call still yields activity, NO signals frame, and only its projected tool pair", async () => {
     const request = makeRequest();
     const { harness, transport } = makeHarness({ broker: signalBroker(request) });
     transport
@@ -1362,8 +1377,14 @@ describe("CodexHarness: trusted ROOT signal callbacks route scanned signals into
       .end();
 
     const events = await collect(harness.startTurn(request).events);
-    assert.equal(events.filter((e) => e.kind === "frame").length, 0, "a shell effect emits no signals frame");
-    // The tool call was still intercepted + replied, surfaced only as activity.
+    const frames = events.filter((e) => e.kind === "frame");
+    for (const f of frames) if (f.kind === "frame") assert.equal(f.signals, undefined, "a shell effect emits no signals frame");
+    // Issue #1583: the only frames are the call's projected tool started/finished pair.
+    assert.deepEqual(
+      frames.map((f) => (f.kind === "frame" ? f.items.map((i) => (i.kind === "tool" ? i.phase : i.kind)) : [])),
+      [["started"], ["finished"]],
+    );
+    // The tool call was still intercepted + replied once.
     assert.equal(transport.responses.length, 1);
     assert.equal(rec(rec(transport.responses[0]!.response).result).success, true);
   });
@@ -1650,8 +1671,12 @@ describe("CodexHarness: owner abort cancels a turn wedged in a broker callback",
     assert.equal(first.done, false);
     assert.equal((first.value as HarnessEvent).kind, "initialized");
 
-    const pending = iter.next(); // drives the tool-call → wedges in the broker callback
+    // Drives the tool-call. Issue #1583: its projected `started` tool frame is yielded while
+    // the broker callback is still pending; the NEXT pull wedges in that callback.
+    const started = await withTimeout(iter.next(), 1000, "the projected started frame");
+    assert.equal((started.value as HarnessEvent).kind, "frame");
     await withTimeout(entered, 1000, "the broker callback to be entered");
+    const pending = iter.next(); // wedges in the broker callback
 
     ac.abort(); // owner abort WHILE the callback is pending
     const ended = await withTimeout(pending, 1000, "the stream to end on abort");
@@ -1666,8 +1691,11 @@ describe("CodexHarness: owner abort cancels a turn wedged in a broker callback",
     const iter = turn.events[Symbol.asyncIterator]();
 
     await iter.next(); // initialized
-    const pending = iter.next(); // wedges in the broker callback
+    // Issue #1583: the projected `started` tool frame comes first; the next pull wedges.
+    const started = await withTimeout(iter.next(), 1000, "the projected started frame");
+    assert.equal((started.value as HarnessEvent).kind, "frame");
     await withTimeout(entered, 1000, "the broker callback to be entered");
+    const pending = iter.next(); // wedges in the broker callback
 
     turn.requestStop("cancel");
     const ended = await withTimeout(pending, 1000, "the stream to end on requestStop");
@@ -1685,11 +1713,15 @@ describe("CodexHarness: owner abort cancels a turn wedged in a broker callback",
     const iter = turn.events[Symbol.asyncIterator]();
 
     await iter.next(); // initialized
-    const pending = iter.next(); // wedges
+    // Issue #1583: the projected `started` tool frame comes first; the next pull wedges.
+    const started = await withTimeout(iter.next(), 1000, "the projected started frame");
+    assert.equal((started.value as HarnessEvent).kind, "frame");
     await withTimeout(entered, 1000, "the broker callback to be entered");
+    const pending = iter.next(); // wedges
 
     ac.abort();
-    await withTimeout(pending, 1000, "the stream to end on abort");
+    const ended = await withTimeout(pending, 1000, "the stream to end on abort");
+    assert.equal(ended.done, true);
     await turn.close(); // tears the transport down under the still-pending callback
 
     // The broker finally settles AFTER close: routeToolCall's guard must swallow the
@@ -1699,6 +1731,167 @@ describe("CodexHarness: owner abort cancels a turn wedged in a broker callback",
     await tick();
     assert.equal(transport.respondAttempts, 1, "the broker reply reached the guarded respond seam once");
     assert.equal(transport.responses.length, 0, "the undeliverable reply was dropped");
+  });
+});
+
+describe("CodexHarness: root tool projection outbox (issue #1583)", () => {
+  function toolItems(events: HarnessEvent[]): Extract<HarnessEvent, { kind: "frame" }>["items"][number][] {
+    return events.flatMap((e) => (e.kind === "frame" ? e.items : [])).filter((i) => i.kind === "tool");
+  }
+
+  it("yields the started tool frame BEFORE a slow inline broker settles, then finished < turn_finished, one reply", async () => {
+    let brokerCalls = 0;
+    let settled = false;
+    let release!: (r: CallbackResult) => void;
+    const gate = new Promise<CallbackResult>((r) => {
+      release = r;
+    });
+    const broker = stubBroker(async () => {
+      brokerCalls += 1;
+      const r = await gate;
+      settled = true;
+      return r;
+    });
+    const { harness, transport } = makeHarness({ broker, idNonce: "abcdef012345" });
+    transport
+      .push(threadStarted())
+      .push(toolCall(7, "Bash", { command: "echo hi" }, "th-1", "tn-1", "call_7"))
+      .push(turnCompleted("completed"))
+      .end();
+    const iter = harness.startTurn(makeRequest()).events[Symbol.asyncIterator]();
+
+    const init = await iter.next();
+    assert.equal((init.value as HarnessEvent).kind, "initialized");
+    const startedStep = await withTimeout(iter.next(), 1000, "the started frame before the broker settles");
+    const started = startedStep.value as HarnessEvent;
+    assert.equal(settled, false, "the broker has NOT settled when the started frame is yielded");
+    assert.equal(brokerCalls, 1);
+    assert.equal(transport.responses.length, 0, "no reply before the broker settles");
+    assert.ok(started.kind === "frame");
+    assert.deepEqual(started.origin, { kind: "main" });
+    assert.deepEqual(started.attribution, { agent: "lead" });
+    assert.equal(started.signals, undefined);
+    assert.equal(started.model, provider.model);
+    assert.equal(started.sessionId, "th-1");
+    assert.deepEqual(started.items, [
+      { kind: "tool", phase: "started", id: "cx-abcdef012345-t1-call_7", name: "Bash", input: { command: "echo hi" } },
+    ]);
+
+    release({ ok: true, output: { code: 0, stdout: "hi", stderr: "" } });
+    const rest: HarnessEvent[] = [];
+    for (let step = await iter.next(); !step.done; step = await iter.next()) rest.push(step.value);
+
+    const kinds = rest.map((e) => (e.kind === "frame" ? `frame:${e.items[0]?.kind === "tool" ? e.items[0].phase : "?"}` : e.kind));
+    assert.deepEqual(kinds, ["frame:finished", "activity", "turn_finished"], "started < finished < turn_finished");
+    const finished = rest[0]!;
+    assert.ok(finished.kind === "frame");
+    assert.deepEqual(finished.attribution, { agent: "lead" });
+    assert.deepEqual(finished.items, [
+      {
+        kind: "tool",
+        phase: "finished",
+        id: "cx-abcdef012345-t1-call_7",
+        name: "Bash",
+        output: JSON.stringify({ code: 0, stdout: "hi", stderr: "" }),
+        isError: false,
+      },
+    ]);
+    // Exactly one reply for the request, and the broker ran exactly once.
+    assert.equal(transport.responses.filter((r) => r.requestId === 7).length, 1);
+    assert.equal(transport.responses.length, 1);
+    assert.equal(brokerCalls, 1);
+  });
+
+  it("a broker THROW projects a finished error frame (broker_error) before the single reply", async () => {
+    const broker = stubBroker(async () => {
+      throw new Error("boom");
+    });
+    const { harness, transport } = makeHarness({ broker });
+    transport.push(threadStarted()).push(toolCall(3, "Bash", { command: "x" })).push(turnCompleted("completed")).end();
+    const events = await collect(harness.startTurn(makeRequest()).events);
+    const tools = toolItems(events);
+    assert.equal(tools.length, 2);
+    const fin = tools[1]!;
+    assert.ok(fin.kind === "tool" && fin.phase === "finished");
+    assert.equal(fin.isError, true);
+    assert.equal(fin.output, "the callback failed");
+    assert.equal(transport.responses.length, 1);
+  });
+
+  it("scrubs projected input and output with scrubProjected (the model reply is untouched)", async () => {
+    const secret = ["tok", "RUNTIME", "released", "0123456789"].join("-");
+    const broker = stubBroker(async () => ({ ok: true, output: { code: 0, stdout: `value=${secret}`, stderr: "" } }));
+    const { harness, transport } = makeHarness({
+      broker,
+      scrubProjected: (s) => s.split(secret).join("***REDACTED***"),
+    });
+    transport
+      .push(threadStarted())
+      .push(toolCall(4, "Bash", { command: `echo ${secret}` }))
+      .push(turnCompleted("completed"))
+      .end();
+    const events = await collect(harness.startTurn(makeRequest()).events);
+    const projected = JSON.stringify(toolItems(events));
+    assert.ok(!projected.includes(secret), "no raw secret in any projected item");
+    assert.equal((projected.match(/\*\*\*REDACTED\*\*\*/g) ?? []).length, 2, "input and output both scrubbed");
+    assert.equal(transport.responses.length, 1);
+  });
+
+  it("a denied stale-turn call is not projected; a reused call id is namespaced per turn", async () => {
+    let turnNumber = 0;
+    const transport = new FakeTransport((method) => {
+      if (method === "turn/start") {
+        turnNumber += 1;
+        return { turn: { id: `tn-${turnNumber}` } };
+      }
+      return defaultResponder(method);
+    });
+    const { harness } = makeHarness({ transport, idNonce: "0123456789ab" });
+    transport
+      .push(threadStarted())
+      .push(toolCall(1, "Bash", { command: "a" }, "th-1", "stale-turn", "same"))
+      .push(toolCall(2, "Bash", { command: "b" }, "th-1", "tn-1", "same"))
+      .push(turnCompleted("completed", undefined, "th-1", "tn-1"));
+    const first = toolItems(await collect(harness.startTurn(makeRequest()).events));
+    transport.push(toolCall(3, "Bash", { command: "c" }, "th-1", "tn-2", "same")).push(turnCompleted("completed", undefined, "th-1", "tn-2"));
+    const second = toolItems(await collect(harness.startTurn(makeRequest()).events));
+    assert.equal(first.length, 2, "the stale-turn call is not projected");
+    assert.equal(second.length, 2);
+    const idOf = (i: (typeof first)[number]): unknown => (i.kind === "tool" ? i.id : undefined);
+    assert.equal(idOf(first[0]!), "cx-0123456789ab-t1-same");
+    assert.equal(idOf(second[0]!), "cx-0123456789ab-t2-same", "a reused call id is namespaced per turn");
+  });
+
+  it("a callback settling after its turn ended projects nothing into the next turn", async () => {
+    let turnNumber = 0;
+    const transport = new FakeTransport((method) => {
+      if (method === "turn/start") {
+        turnNumber += 1;
+        return { turn: { id: `tn-${turnNumber}` } };
+      }
+      return defaultResponder(method);
+    });
+    const ac = new AbortController();
+    const { broker, entered, release } = wedgeBroker();
+    const { harness } = makeHarness({ transport, broker });
+    transport.push(threadStarted()).push(toolCall(1, "Bash", { command: "sleep 999" }, "th-1", "tn-1"));
+    const iter = harness.startTurn(makeRequest({ signal: ac.signal })).events[Symbol.asyncIterator]();
+    await iter.next(); // initialized
+    await withTimeout(iter.next(), 1000, "the started frame"); // started
+    await withTimeout(entered, 1000, "the broker callback to be entered");
+    const pending = iter.next();
+    ac.abort();
+    assert.equal((await withTimeout(pending, 1000, "the stream to end")).done, true);
+
+    const second = harness.startTurn(makeRequest()).events[Symbol.asyncIterator]();
+    const turn2Events: HarnessEvent[] = [];
+    // Settle the OLD turn's callback while turn 2 is live, then finish turn 2.
+    release({ ok: true, output: {} });
+    await tick();
+    transport.push(turnCompleted("completed", undefined, "th-1", "tn-2")).end();
+    for (let step = await second.next(); !step.done; step = await second.next()) turn2Events.push(step.value);
+    assert.equal(turn2Events.filter((e) => e.kind === "frame").length, 0, "the late finished frame is dropped");
+    assert.equal(turn2Events.at(-1)?.kind, "turn_finished");
   });
 });
 

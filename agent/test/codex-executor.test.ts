@@ -39,6 +39,10 @@ import type {
 } from "../src/codex/codex-advice-harness.js";
 import { CodexAdviceHarness } from "../src/codex/codex-advice-harness.js";
 import { makeRedactor, makeTextRedactor } from "../src/redact.js";
+import { MessageBatcher } from "../src/batcher.js";
+import { MAX_PROJECTED_BYTES } from "../src/codex/projection.js";
+import type { WorkerClient } from "../src/client.js";
+import type { OutgoingMessage } from "../src/protocol.js";
 import type { CodexNotification, CodexTransport } from "../src/codex/transport.js";
 import type { RunContext, EmittedMessage, Executor, WallParkOutcome } from "../src/executor.js";
 import { PauseNowSignal } from "../src/steering.js";
@@ -1407,6 +1411,118 @@ describe("CodexExecutor: credential bridge + isolation", () => {
     assert.ok(exec.safety, "safety populated");
     assert.equal(exec.safety?.kind, "codex");
     assert.equal((exec as Executor).killAgentTree, undefined, "no killAgentTree (async evidence-based reap)");
+  });
+});
+
+// ================================================================================
+describe("CodexExecutor: root tool projection (issue #1583)", () => {
+  it("a root Bash emits a lead tool_use + tool_result pair with matching namespaced ids", async () => {
+    const rig = makeRig();
+    rig.transport
+      .push(threadStarted())
+      .push(toolCall(1, "Bash", { command: "echo root" }, "th-1", "tn-1", "call-1"))
+      .push(signalDone())
+      .push(turnCompleted("completed"))
+      .end();
+    const { ctx, emitted } = makeCtx();
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "projected root Bash run");
+
+    const uses = emitted.filter((m) => m.kind === "tool_use");
+    const results = emitted.filter((m) => m.kind === "tool_result");
+    assert.equal(uses.length, 1, "exactly one projected tool_use (signal_done is not projected)");
+    assert.equal(results.length, 1);
+    const use = uses[0]!;
+    const res = results[0]!;
+    assert.equal(use.agent, "lead");
+    assert.equal(res.agent, "lead");
+    assert.equal(use.payload.name, "Bash");
+    assert.deepEqual(use.payload.input, { command: "echo root" });
+    assert.match(String(use.payload.id), /^cx-[0-9a-f]{12}-t\d+-call-1$/);
+    assert.equal(res.payload.tool_use_id, use.payload.id, "the result pairs with its tool_use");
+    assert.equal(res.payload.content, JSON.stringify({ code: 0, stdout: "ok", stderr: "" }));
+    assert.equal(res.payload.is_error, false);
+    assert.ok(emitted.indexOf(use) < emitted.indexOf(res));
+  });
+
+  it("the POSTED tool_result redacts a claim secret (batcher) AND a runtime-released Codex token (harness scrub)", async () => {
+    // Assembled from fragments at runtime so no provider-token-shaped literal sits in source.
+    const claimSecret = "glpat-" + "abcdefghij" + "0123456789";
+    const rig = makeRig();
+    const deps: CodexExecutorDeps = {
+      ...rig.deps,
+      spawnCommand: async () => ({ code: 0, stdout: `pat=${claimSecret} tok=${FRESH_TOKEN}`, stderr: "" }),
+    };
+    rig.transport
+      .push(threadStarted())
+      .push(toolCall(1, "Bash", { command: "cat notes.txt" }, "th-1", "tn-1", "call-1"))
+      .push(signalDone())
+      .push(turnCompleted("completed"))
+      .end();
+
+    // The run's persisted boundary, as runner.buildFlight builds it: a real MessageBatcher over
+    // the CLAIM secrets only. FRESH_TOKEN is released at runtime (registerToken), never listed.
+    const posted: OutgoingMessage[] = [];
+    const client = {
+      async postMessages(_runId: string, msgs: OutgoingMessage[]): Promise<void> {
+        posted.push(...msgs);
+      },
+    } as unknown as WorkerClient;
+    const secrets = [claimSecret, SUBSCRIPTION.access_token, SUBSCRIPTION.capability];
+    assert.ok(!secrets.includes(FRESH_TOKEN));
+    const batcher = new MessageBatcher(client, "run-1", 0, 5, noopLog, makeRedactor(secrets), makeTextRedactor(secrets));
+    const { ctx } = makeCtx({ emit: (m) => batcher.emit(m) });
+
+    await withTimeout(makeExecutor({ client: rig.client, deps }, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "redaction run");
+    await batcher.close();
+
+    assert.ok(rig.client.releaseCalls.length >= 1, "the Codex token was released at runtime");
+    const result = posted.find((m) => m.kind === "tool_result");
+    assert.ok(result, "a tool_result was posted");
+    const body = JSON.stringify(result.payload);
+    assert.match(body, /\*\*\*REDACTED\*\*\*/);
+    assert.ok(!body.includes(claimSecret), "the claim secret is redacted at persist");
+    assert.ok(!body.includes(FRESH_TOKEN), "the runtime-released Codex token is redacted");
+    assert.ok(!posted.some((m) => JSON.stringify(m.payload).includes(FRESH_TOKEN)), "no posted payload carries the token");
+  });
+
+  it("a claim secret straddling the 16 KiB cut leaves no prefix in the POSTED tool_result (ctx.redactText scrubs before bounding)", async () => {
+    // Assembled from fragments at runtime so no provider-token-shaped literal sits in source.
+    const claimSecret = "glpat-" + "abcdefghij" + "0123456789";
+    // The projected output is `{"code":0,"stdout":"<stdout>",...}` (a 20-byte prefix), so the
+    // secret starts ~40 bytes before the cap while the bound (cap minus its ~26-byte marker)
+    // cuts ~14 bytes into it: without a pre-bound scrub a secret prefix would survive.
+    const stdout = "x".repeat(MAX_PROJECTED_BYTES - 60) + claimSecret + "y".repeat(500);
+    const rig = makeRig();
+    const deps: CodexExecutorDeps = {
+      ...rig.deps,
+      spawnCommand: async () => ({ code: 0, stdout, stderr: "" }),
+    };
+    rig.transport
+      .push(threadStarted())
+      .push(toolCall(1, "Bash", { command: "cat big.txt" }, "th-1", "tn-1", "call-1"))
+      .push(signalDone())
+      .push(turnCompleted("completed"))
+      .end();
+    const posted: OutgoingMessage[] = [];
+    const client = {
+      async postMessages(_runId: string, msgs: OutgoingMessage[]): Promise<void> {
+        posted.push(...msgs);
+      },
+    } as unknown as WorkerClient;
+    const secrets = [claimSecret, SUBSCRIPTION.access_token, SUBSCRIPTION.capability];
+    const redactText = makeTextRedactor(secrets);
+    const batcher = new MessageBatcher(client, "run-1", 0, 5, noopLog, makeRedactor(secrets), redactText);
+    const { ctx } = makeCtx({ emit: (m) => batcher.emit(m), redactText });
+
+    await withTimeout(makeExecutor({ client: rig.client, deps }, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "straddle run");
+    await batcher.close();
+
+    const result = posted.find((m) => m.kind === "tool_result");
+    assert.ok(result, "a tool_result was posted");
+    const content = String(result.payload.content);
+    assert.match(content, /…\[truncated \d+ bytes\]$/, "the output was bounded");
+    assert.ok(!content.includes(claimSecret.slice(0, 12)), "no 12-char prefix of the claim secret survives the cut");
+    assert.ok(content.includes("***REDACTED***"), "the secret was scrubbed before the cut");
   });
 });
 
