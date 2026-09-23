@@ -2082,6 +2082,64 @@ export class GitCache {
     }
   }
 
+  /** Workflow paths touched by branch-only commits, excluding verified subtree align commits. */
+  async branchWorkflowFiles(
+    barePath: string,
+    freshDefaultTip: string,
+    trackingRef: string,
+  ): Promise<string[] | null> {
+    try {
+      if (!/^[0-9a-f]{40}$/.test(freshDefaultTip)) return null;
+      // Cap work on pathological histories. The extra commit detects truncation.
+      const commits = (await this.runGit(barePath, [
+        "rev-list", "--max-count=257", trackingRef, `^${freshDefaultTip}`,
+      ])).trim().split("\n").filter(Boolean);
+      if (commits.length > 256) return null;
+      const paths = new Set<string>();
+      for (const commit of commits) {
+        const parts = (await this.runGit(barePath, ["rev-list", "--parents", "-n", "1", commit]))
+          .trim().split(" ");
+        const parents = parts.slice(1);
+        // A merge may contain changes absent from either parent's individual history.
+        const comparisons = parents.length ? parents : ["--root"];
+        const touched = new Set<string>();
+        for (const parent of comparisons) {
+          const args = parent === "--root"
+            ? ["diff-tree", "--root", "--no-commit-id", "--no-renames", "--name-only", "-r", commit]
+            : ["diff", "--no-renames", "--name-only", parent, commit];
+          const out = await this.runGit(barePath, args);
+          for (const file of out.split("\n")) if (file.startsWith(".github/workflows/")) touched.add(file);
+        }
+        if (touched.size === 0) continue;
+        let align = false;
+        if (parents.length === 1) {
+          const subject = (await this.runGit(barePath, ["log", "-1", "--format=%s", commit])).trim();
+          const match = /^chore: align \.github\/workflows with ([0-9a-f]{40})$/.exec(subject);
+          if (match) {
+            const named = match[1];
+            const changed = (await this.runGit(barePath, ["diff", "--no-renames", "--name-only", parents[0], commit]))
+              .split("\n").filter(Boolean);
+            const inFreshHistory = await this.runGit(barePath, ["merge-base", "--is-ancestor", named, freshDefaultTip])
+              .then(() => true, () => false);
+            const inParentHistory = await this.runGit(barePath, ["merge-base", "--is-ancestor", named, parents[0]])
+              .then(() => true, () => false);
+            // ls-tree succeeds with empty output when the default deleted the entire
+            // workflow directory; a matching deletion is a valid align.
+            const commitTree = await this.runGit(barePath, ["ls-tree", commit, "--", ".github/workflows"]);
+            const namedTree = await this.runGit(barePath, ["ls-tree", named, "--", ".github/workflows"]);
+            const treesEqual = commitTree === namedTree;
+            align = changed.length > 0 && changed.every((file) => file.startsWith(".github/workflows/")) &&
+              inFreshHistory && !inParentHistory && treesEqual;
+          }
+        }
+        if (!align) for (const file of touched) paths.add(file);
+      }
+      return [...paths].sort();
+    } catch {
+      return null;
+    }
+  }
+
   /**
    * PRD #212: the plan-turn changed-file list for the approval gate. Runs
    * `git status --porcelain` in the runner clone AS THE RUNNER UID (runGitAsRunner),

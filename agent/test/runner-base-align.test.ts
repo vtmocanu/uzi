@@ -55,6 +55,20 @@ function seedWorkflowsOnOrigin(extra: Record<string, string> = {}): void {
   commitToOriginMain({ ".github/workflows/ci.yml": CI_V1, ...extra }, "seed workflows");
 }
 
+/** Publish a legitimate prior align, then leave main one workflow revision ahead. */
+function publishPriorAlign(iid: number, advanceAgain = true): void {
+  seedWorkflowsOnOrigin();
+  gitIn(fx.originPath, ["branch", `agent/issue-${iid}`]);
+  commitToOriginMain({ ".github/workflows/ci.yml": CI_V2 }, "default D1");
+  const d1 = gitIn(fx.originPath, ["rev-parse", "main"]);
+  gitIn(fx.originPath, ["checkout", `agent/issue-${iid}`]);
+  fs.writeFileSync(path.join(fx.originPath, ".github/workflows/ci.yml"), CI_V2);
+  gitIn(fx.originPath, ["add", ".github/workflows/ci.yml"]);
+  gitIn(fx.originPath, [...IDENT, "commit", "-m", `chore: align .github/workflows with ${d1}`]);
+  gitIn(fx.originPath, ["checkout", "main"]);
+  if (advanceAgain) commitToOriginMain({ ".github/workflows/ci.yml": "name: ci\non: [schedule]\njobs: {}\n" }, "default D2");
+}
+
 function githubRunner(github: GitHubClient, executor: Executor): RunRunner {
   return new RunRunner(
     client,
@@ -140,6 +154,31 @@ function spyFetchDefaultTip(): { count: () => number } {
 }
 
 describe("RunRunner — finalize base-align (PRD #456)", () => {
+  for (const [iid, advanceAgain] of [[165, true], [166, false]] as const) {
+    it(`prior published align ${advanceAgain ? "behind D2" : "at current D1"} survives rework and opens a PR`, async () => {
+      publishPriorAlign(iid, advanceAgain);
+      const { github, calls } = fakeGitHub();
+      const strategies = spyAlign();
+      const claim = githubClaim(iid);
+      await githubRunner(github, committingExecutor({ "impl.ts": "export const result = 1;\n" })).execute(claim);
+      const states = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body);
+      if (advanceAgain) {
+        // The conservative overlay guard still refuses the old align path. The
+        // fallback can conflict at D2, but the precheck must not misclassify it.
+        assert.deepStrictEqual(states.map((s) => s.status), ["running", "running", "failed"]);
+        assert.strictEqual(states.at(-1)?.fail_origin, "finalize_base_align_conflict");
+        assert.deepStrictEqual(strategies, ["merge", "rebase"]);
+        assert.strictEqual(calls.length, 0);
+      } else {
+        assert.deepStrictEqual(states.map((s) => s.status), ["running", "running", "completed"]);
+        assert.strictEqual(calls.length, 1);
+        assert.strictEqual(gitIn(fx.originPath, ["show", `agent/issue-${iid}:impl.ts`]), "export const result = 1;");
+        assert.strictEqual(gitIn(fx.originPath, ["show", `agent/issue-${iid}:.github/workflows/ci.yml`]), CI_V2.trim());
+        assert.deepStrictEqual(strategies, []);
+      }
+    });
+  }
+
   // (a) behind-on-workflows: main advanced a workflow file the branch never touched → the
   // merge aligns the tree and the push proceeds, landing BOTH the agent's work and the fresh
   // workflow content on origin.
@@ -317,6 +356,20 @@ describe("RunRunner — finalize base-align (PRD #456)", () => {
     assert.strictEqual(pushCalls, 1, "exactly one push");
     assert.strictEqual(calls.length, 1, "the PR was opened once");
     assert.strictEqual(gitIn(fx.originPath, ["show", "agent/issue-53:impl.ts"]), "export const x = 1;");
+  });
+
+  it("default-tip fetch failure falls through to the normal push", async () => {
+    seedWorkflowsOnOrigin();
+    const { github, calls } = fakeGitHub();
+    const strategies = spyAlign();
+    git.fetchDefaultTip = (async () => { throw new Error("fetch unavailable"); }) as typeof git.fetchDefaultTip;
+    const claim = githubClaim(153);
+    await githubRunner(github, committingExecutor({ "impl.ts": "export const x = 1;\n" })).execute(claim);
+    assert.deepStrictEqual(api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body.status),
+      ["running", "running", "completed"]);
+    assert.deepStrictEqual(strategies, []);
+    assert.strictEqual(calls.length, 1);
+    assert.strictEqual(gitIn(fx.originPath, ["show", "agent/issue-153:impl.ts"]), "export const x = 1;");
   });
 
   // An UNEXPECTED throw from alignBranchWithDefault (e.g. the S3 count-mismatch guard, or any
@@ -551,7 +604,8 @@ describe("RunRunner — finalize base-align (PRD #456)", () => {
     git.pushBranch = (async () => {
       pushed = true;
     }) as typeof git.pushBranch;
-    // null diff → #377 fails open AND canOverlay is false → the overlay must be skipped.
+    // A failed precheck and overlay diff must both fail open without clobbering work.
+    git.branchWorkflowFiles = (async () => null) as typeof git.branchWorkflowFiles;
     git.changedFiles = (async () => null) as typeof git.changedFiles;
     // The branch edits the SAME workflow file main diverges, forcing the whole-tree conflict.
     const exec = committingExecutor(
@@ -572,6 +626,21 @@ describe("RunRunner — finalize base-align (PRD #456)", () => {
     assert.match(failed.preserved_patch!, /workflows\/ci\.yml/, "the preserved patch carries the branch's workflow edit");
     assert.strictEqual(pushed, false, "no clobbering push");
     assert.strictEqual(calls.length, 0, "no PR opened on the conflict fail");
+  });
+
+  it("a genuine workflow edit fails typed and preserves its exact content", async () => {
+    seedWorkflowsOnOrigin();
+    const { github, calls } = fakeGitHub();
+    const branchContent = "name: ci\non: [branch-edit]\njobs: {}\n";
+    const claim = githubClaim(159);
+    await githubRunner(github, committingExecutor(
+      { ".github/workflows/ci.yml": branchContent },
+      { ".github/workflows/ci.yml": CI_V2 },
+    )).execute(claim);
+    const failed = api.states.find((s) => s.runId === claim.run_id && s.body.status === "failed")?.body;
+    assert.strictEqual(failed?.fail_origin, "workflow_scope_missing");
+    assert.ok(failed?.preserved_patch?.includes("+on: [branch-edit]"));
+    assert.strictEqual(calls.length, 0);
   });
 
   // (j) issue #627 post-overlay push rejection → fallback. The overlay aligns, but its push is
@@ -707,11 +776,9 @@ describe("RunRunner — finalize base-align (PRD #456)", () => {
     assert.strictEqual(calls.length, 0, "no PR opened");
   });
 
-  // (m) issue #631 (Item 2 dedup): on the overlay-primary path the base-align gate REUSES the
-  // #377 guard's changedFiles result (identical barePath+trackingRef) instead of recomputing
-  // it. The two counted calls are the undeclared-zero-diff guard (:1471) plus the #377 guard;
-  // the align gate adds NONE (pre-fix it recomputed, making it one more — see (n)).
-  it("(m) overlay-primary path reuses the #377 changedFiles result (no redundant recompute)", async () => {
+  // The commit-based precheck does not use changedFiles. The zero-diff guard and the
+  // overlay's independent clobber guard each call it once.
+  it("(m) overlay checks the branch tree independently of the commit precheck", async () => {
     seedWorkflowsOnOrigin();
     const { github, calls } = fakeGitHub();
     let changedCalls = 0;
@@ -739,16 +806,12 @@ describe("RunRunner — finalize base-align (PRD #456)", () => {
     assert.strictEqual(
       changedCalls,
       2,
-      "changedFiles: zero-diff guard + #377 guard; the align gate reuses, not recomputes",
+      "changedFiles: zero-diff guard plus independent overlay clobber guard",
     );
   });
 
-  // (n) issue #631 (Item 2): when #377's changedFiles FAILS OPEN (null diff), the base-align
-  // gate must RECOMPUTE rather than reuse the null — so a transient diff failure still gets a
-  // retry. Here changedFiles always returns null: the zero-diff guard (:1471), the #377 guard,
-  // AND the align-gate recompute all fire → exactly one more call than (m), and the run still
-  // reaches the fallback merge→rebase.
-  it("(n) null #377 diff still recomputes at the base-align gate", async () => {
+  // A null overlay diff must disable the overlay and preserve the workflow edit.
+  it("(n) null overlay diff falls back without clobbering workflow work", async () => {
     seedWorkflowsOnOrigin();
     const { github } = fakeGitHub();
     const strategies = spyAlign();
@@ -757,6 +820,7 @@ describe("RunRunner — finalize base-align (PRD #456)", () => {
       changedCalls++;
       return null;
     }) as typeof git.changedFiles;
+    git.branchWorkflowFiles = (async () => null) as typeof git.branchWorkflowFiles;
     git.pushBranch = (async () => {}) as typeof git.pushBranch;
     // The branch edits the SAME workflow file main diverges → the fallback merge/rebase
     // conflicts (as in (i)), proving the run reached the fallback after the recompute.
@@ -773,8 +837,8 @@ describe("RunRunner — finalize base-align (PRD #456)", () => {
     assert.deepStrictEqual(strategies, ["merge", "rebase"], "the run reached the fallback merge→rebase");
     assert.strictEqual(
       changedCalls,
-      3,
-      "zero-diff guard + #377 guard + align-gate recompute (a null result is not reused)",
+      2,
+      "zero-diff guard plus overlay clobber guard",
     );
   });
 });
