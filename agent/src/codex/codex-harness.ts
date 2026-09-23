@@ -317,7 +317,8 @@ interface ChildBinding {
   readonly issuedIds: Set<string>;
   readonly openTools: Map<string, string>;
   /** Projected child items / JSON bytes emitted so far for this dispatch (see
-   *  {@link MAX_CHILD_ITEMS_PER_DISPATCH}); `capped` once the budget was exhausted. */
+   *  {@link MAX_CHILD_ITEMS_PER_DISPATCH}); `capped` once this dispatch's or the turn's budget
+   *  was exhausted and its one {@link CHILD_OUTPUT_CAPPED} marker went out. */
   items: number;
   bytes: number;
   capped: boolean;
@@ -334,9 +335,14 @@ const DISPATCH_STREAM_FAILED = "delegation ended by a provider stream failure; c
 const DISPATCH_TOOL_NAME = "Agent";
 /** The per-dispatch budget of projected child items and of their JSON-serialized bytes. A child
  *  producing more (one frame with a huge part list, or many frames) gets ONE
- *  {@link CHILD_OUTPUT_CAPPED} text item and nothing further; its lead completion is unaffected. */
+ *  {@link CHILD_OUTPUT_CAPPED} text item and nothing further except the `finished` of a child
+ *  tool whose `started` was already projected; its lead completion is unaffected. */
 const MAX_CHILD_ITEMS_PER_DISPATCH = 2000;
 const MAX_CHILD_BYTES_PER_DISPATCH = 4 * 1024 * 1024;
+/** The same budget summed over EVERY dispatch of one turn, so N dispatches cannot project N times
+ *  the per-dispatch cap. Once it is spent, each still-uncapped dispatch gets its one marker. */
+const MAX_CHILD_ITEMS_PER_TURN = 10_000;
+const MAX_CHILD_BYTES_PER_TURN = 16 * 1024 * 1024;
 const CHILD_OUTPUT_CAPPED = "[further subagent output not shown]";
 
 // --- the harness --------------------------------------------------------------
@@ -402,6 +408,10 @@ export class CodexHarness implements RunHarness {
   // Ids already issued this turn: a reused call id (or two that sanitise identically) gets a
   // `-n<k>` suffix so every started/finished pair stays distinct.
   private issuedProjectionIds = new Set<string>();
+  // Projected child items / JSON bytes emitted this turn across all dispatches (see
+  // MAX_CHILD_ITEMS_PER_TURN); reset in startTurn.
+  private childTurnItems = 0;
+  private childTurnBytes = 0;
 
   // Child-thread demux (part C): a registered sink receives every frame carrying its
   // child thread id off the SAME transport, so a delegation's child turn can consume its
@@ -577,29 +587,49 @@ export class CodexHarness implements RunHarness {
    * is dropped), its `name` the canonical tool name, its `input` the raw args and its `output` the
    * raw output value (the broker's message on failure).
    *
-   * Bounded per dispatch: once {@link MAX_CHILD_ITEMS_PER_DISPATCH} items or
-   * {@link MAX_CHILD_BYTES_PER_DISPATCH} projected bytes would be exceeded (counted item by item,
-   * so one oversized frame is cut too), a single {@link CHILD_OUTPUT_CAPPED} text item is emitted
-   * and every later child item of that dispatch is dropped. The lead completion is NOT a child
-   * item and is always still emitted. Fail-safe: never throws.
+   * Bounded per dispatch AND per turn: once {@link MAX_CHILD_ITEMS_PER_DISPATCH} items or
+   * {@link MAX_CHILD_BYTES_PER_DISPATCH} projected bytes of this dispatch, or
+   * {@link MAX_CHILD_ITEMS_PER_TURN} / {@link MAX_CHILD_BYTES_PER_TURN} summed over every dispatch
+   * of the turn, would be exceeded (counted item by item, so one oversized frame is cut too), a
+   * single {@link CHILD_OUTPUT_CAPPED} text item is emitted for this dispatch and every later
+   * child item of it is dropped, EXCEPT the `finished` of a child tool whose `started` was already
+   * projected: that one always passes (each is bounded by the projection's output bound), so no
+   * projected tool is left running forever. An item that would trip the cap is never projected,
+   * so a `started` past the cap never goes out. The lead completion is NOT a child item and is
+   * always still emitted. Fail-safe: never throws.
    */
   emitChildFrame(childThreadId: string, items: readonly HarnessItem[]): void {
     try {
       if (!this.childSinks.has(childThreadId)) return;
       const binding = this.childBindings.get(childThreadId);
-      if (binding === undefined || binding.dispatch.state !== "bound" || binding.capped) return;
+      if (binding === undefined || binding.dispatch.state !== "bound") return;
+      if (binding.capped && binding.openTools.size === 0) return;
       const projected: HarnessItem[] = [];
       for (const item of items) {
+        // A finished whose started was projected always passes: it closes a visible tool.
+        const closesOpen = item.kind === "tool" && item.phase === "finished" && binding.openTools.has(item.id ?? "");
+        if (binding.capped && !closesOpen) continue;
         const one = this.projectChildItem(binding, item);
         if (one === undefined) continue;
         const size = Buffer.byteLength(JSON.stringify(one), "utf8");
-        if (binding.items + 1 > MAX_CHILD_ITEMS_PER_DISPATCH || binding.bytes + size > MAX_CHILD_BYTES_PER_DISPATCH) {
+        if (
+          !closesOpen &&
+          (binding.items + 1 > MAX_CHILD_ITEMS_PER_DISPATCH ||
+            binding.bytes + size > MAX_CHILD_BYTES_PER_DISPATCH ||
+            this.childTurnItems + 1 > MAX_CHILD_ITEMS_PER_TURN ||
+            this.childTurnBytes + size > MAX_CHILD_BYTES_PER_TURN)
+        ) {
           binding.capped = true;
           projected.push({ kind: "text", text: CHILD_OUTPUT_CAPPED });
-          break;
+          continue;
+        }
+        if (item.kind === "tool" && one.kind === "tool" && one.phase === "started" && one.id !== undefined) {
+          binding.openTools.set(item.id ?? "", one.id);
         }
         binding.items += 1;
         binding.bytes += size;
+        this.childTurnItems += 1;
+        this.childTurnBytes += size;
         projected.push(one);
       }
       if (projected.length === 0) return;
@@ -623,7 +653,8 @@ export class CodexHarness implements RunHarness {
     }
   }
 
-  /** Project one raw child item (see {@link emitChildFrame}); undefined drops it. */
+  /** Project one raw child item (see {@link emitChildFrame}); undefined drops it. A projected
+   *  `started` is NOT recorded as open here: the caller records it only once it is emitted. */
   private projectChildItem(binding: ChildBinding, item: HarnessItem): HarnessItem | undefined {
     const scrub = this.scrubProjected;
     if (item.kind === "text" || item.kind === "thinking") return { kind: item.kind, text: projectText(item.text, scrub) };
@@ -636,7 +667,6 @@ export class CodexHarness implements RunHarness {
     }
     if (item.phase === "started") {
       const id = this.issueChildToolId(binding, rawId);
-      binding.openTools.set(rawId, id);
       let input: unknown;
       try {
         input = projectToolInput(item.input, scrub);
@@ -722,6 +752,8 @@ export class CodexHarness implements RunHarness {
     this.turnOrdinal += 1;
     this.projectionCounter = 0;
     this.issuedProjectionIds = new Set();
+    this.childTurnItems = 0;
+    this.childTurnBytes = 0;
     this.outbox = [];
 
     return {

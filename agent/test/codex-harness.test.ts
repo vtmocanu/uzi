@@ -89,7 +89,9 @@ class FakeTransport implements CodexTransport {
 
   private readonly queue: CodexNotification[] = [];
   private ended = false;
+  private failure: Error | undefined;
   private waiter: ((r: IteratorResult<CodexNotification>) => void) | undefined;
+  private failWaiter: ((error: Error) => void) | undefined;
   private consumed = false;
   private closedFlag = false;
   private interceptor?: (note: CodexNotification, frameBytes: number) => boolean;
@@ -115,6 +117,19 @@ class FakeTransport implements CodexTransport {
     if (this.interceptor?.(note, frameBytes)) return true;
     this.push(note);
     return false;
+  }
+
+  /** Make the notification iterator's pending (or next) `next()` REJECT with `error`, as a
+   *  transport read failure would. */
+  fail(error: Error): this {
+    this.failure = error;
+    if (this.failWaiter) {
+      const f = this.failWaiter;
+      this.waiter = undefined;
+      this.failWaiter = undefined;
+      f(error);
+    }
+    return this;
   }
 
   end(): this {
@@ -160,10 +175,14 @@ class FakeTransport implements CodexTransport {
     if (this.consumed) throw new Error("notifications() is single-consumer");
     this.consumed = true;
     const next = (): Promise<IteratorResult<CodexNotification>> =>
-      new Promise((resolve) => {
+      new Promise((resolve, reject) => {
         const q = this.queue.shift();
         if (q !== undefined) {
           resolve({ value: q, done: false });
+          return;
+        }
+        if (this.failure !== undefined) {
+          reject(this.failure);
           return;
         }
         if (this.ended) {
@@ -171,6 +190,7 @@ class FakeTransport implements CodexTransport {
           return;
         }
         this.waiter = resolve;
+        this.failWaiter = reject;
       });
     return {
       next,
@@ -2124,6 +2144,77 @@ describe("CodexHarness: delegation dispatch binding + child frames (issue #1583 
     });
   });
 
+  /** Drive a turn with one bound, never-settling dispatch; once bound, `fail` makes the stream
+   *  fail. Returns the events seen before the throw, and the throw itself. */
+  async function runBoundDispatchThenFail(
+    fail: (transport: FakeTransport) => void,
+    opts: { appServerAuth?: CodexAppServerAuthSession } = {},
+  ): Promise<{ seen: HarnessEvent[]; thrown: unknown }> {
+    let harnessRef!: CodexHarness;
+    let bound = false;
+    const broker = stubBroker(async (rt, name) => {
+      if (name !== "spawn_agent") return { ok: true, output: {} };
+      harnessRef.registerChildSink("th-c", { push: () => {} });
+      harnessRef.bindChildDispatch("th-c", rt, "coder");
+      bound = true;
+      return new Promise<CallbackResult>(() => {});
+    });
+    const { harness, transport } = makeHarness({ broker, idNonce: "abcdef012345", appServerAuth: opts.appServerAuth });
+    harnessRef = harness;
+    transport.push(threadStarted()).push(toolCall(1, "spawn_agent", { subagent_type: "coder" }, "th-1", "tn-1", "c-1"));
+    const iter = harness.startTurn(makeRequest()).events[Symbol.asyncIterator]();
+    const seen: HarnessEvent[] = [];
+    let thrown: unknown;
+    const drive = (async (): Promise<void> => {
+      try {
+        for (let step = await iter.next(); !step.done; step = await iter.next()) seen.push(step.value);
+      } catch (error) {
+        thrown = error;
+      }
+    })();
+    await waitUntil(() => bound, "the dispatch bound");
+    fail(transport);
+    await withTimeout(drive, 2000, "the failing turn");
+    return { seen, thrown };
+  }
+
+  const streamFailedCompletion = {
+    kind: "tool",
+    phase: "finished",
+    id: "cx-abcdef012345-t1-c-1",
+    name: "Agent",
+    output: "delegation ended by a provider stream failure; child settlement not confirmed",
+    isError: true,
+  };
+
+  it("a REJECTED notification read with a bound open dispatch yields the stream-failure completion BEFORE the rethrow", async () => {
+    const boom = new Error("transport read failed");
+    const { seen, thrown } = await runBoundDispatchThenFail((transport) => transport.fail(boom));
+    assert.equal(thrown, boom, "the read failure is rethrown as-is");
+    const items = frames(seen).flatMap((f) => f.items);
+    assert.equal(items.length, 2, "the dispatch and its synthesized completion");
+    assert.deepEqual(items[1], streamFailedCompletion);
+  });
+
+  it("a REJECTED mapNote (auth drain throws at turn completion) with a bound open dispatch yields the completion BEFORE the rethrow", async () => {
+    const boom = new Error("auth drain poisoned");
+    const appServerAuth: CodexAppServerAuthSession = {
+      mode: "api_key",
+      authenticate: async () => {},
+      handleServerRequest: async () => false,
+      drainInterceptedRequests: () => Promise.reject(boom),
+      closeAdmissionAndCancel: () => {},
+    };
+    const { seen, thrown } = await runBoundDispatchThenFail((transport) => transport.push(turnCompleted("completed")), {
+      appServerAuth,
+    });
+    assert.equal(thrown, boom, "the mapNote failure is rethrown as-is");
+    assert.ok(!seen.some((e) => e.kind === "turn_finished"), "no terminal was published");
+    const items = frames(seen).flatMap((f) => f.items);
+    assert.equal(items.length, 2, "the dispatch and its synthesized completion");
+    assert.deepEqual(items[1], streamFailedCompletion);
+  });
+
   it("a stop closes a PENDING dispatch: a child start completing after the stop binds nothing and projects nothing", async () => {
     // Dispatch c-a is bound (so the stop path yields its synthesized completion and the stream is
     // suspended mid-drain, still live); dispatch c-b is still PENDING (its child turn/start has
@@ -2268,6 +2359,108 @@ describe("CodexHarness: delegation dispatch binding + child frames (issue #1583 
       frames(events).some((f) => f.items.some((i) => i.kind === "tool" && i.phase === "finished" && !i.isError)),
       "the lead completion is still emitted",
     );
+  });
+
+  it("a cap tripping between a child tool's started and finished still passes that finished, paired; a started past the cap never goes out", async () => {
+    let harnessRef!: CodexHarness;
+    const broker = stubBroker(async (rt, name) => {
+      if (name !== "spawn_agent") return { ok: true, output: {} };
+      const h = harnessRef;
+      h.registerChildSink("th-c", { push: () => {} });
+      h.bindChildDispatch("th-c", rt, "coder");
+      h.emitChildFrame("th-c", [{ kind: "tool", phase: "started", id: "t1", name: "Bash", input: { command: "ls" } }]);
+      // 1 + 1999 = exactly the per-dispatch item budget.
+      h.emitChildFrame("th-c", Array.from({ length: 1999 }, (_, i) => ({ kind: "text" as const, text: `part ${i}` })));
+      h.emitChildFrame("th-c", [
+        { kind: "tool", phase: "started", id: "t2", name: "Read", input: {} }, // trips the cap: never projected
+        { kind: "tool", phase: "finished", id: "t1", name: "Bash", output: "ok", isError: false }, // passes
+        { kind: "tool", phase: "finished", id: "t2", name: "Read", output: "x" }, // its started never went out
+      ]);
+      h.emitChildFrame("th-c", [
+        { kind: "text", text: "after the cap" },
+        { kind: "tool", phase: "finished", id: "t1", name: "Bash", output: "again" }, // already closed
+      ]);
+      h.unregisterChildSink("th-c");
+      return { ok: true, output: { text: "done" } };
+    });
+    const { harness, transport } = makeHarness({ broker, idNonce: "abcdef012345" });
+    harnessRef = harness;
+    transport.push(threadStarted()).push(toolCall(1, "spawn_agent", { subagent_type: "coder" }, "th-1", "tn-1", "c-1"));
+    const eventsP = collect(harness.startTurn(makeRequest()).events);
+    await waitUntil(() => transport.responses.length === 1, "the parent reply");
+    transport.push(turnCompleted("completed")).end();
+    const events = await withTimeout(eventsP, 5000, "capped turn");
+
+    const dispatchId = "cx-abcdef012345-t1-c-1";
+    const childItems = frames(events)
+      .filter((f) => f.origin.kind === "subagent")
+      .flatMap((f) => f.items);
+    assert.equal(childItems.length, 2002, "started + 1999 texts + marker + the paired finished");
+    assert.deepEqual(childItems[0], { kind: "tool", phase: "started", id: `${dispatchId}/t1`, name: "Bash", input: { command: "ls" } });
+    assert.deepEqual(childItems[2000], { kind: "text", text: "[further subagent output not shown]" });
+    assert.deepEqual(childItems[2001], { kind: "tool", phase: "finished", id: `${dispatchId}/t1`, name: "Bash", output: "ok", isError: false });
+    const tools = childItems.flatMap((i) => (i.kind === "tool" ? [`${i.phase}:${i.id}`] : []));
+    assert.deepEqual(tools, [`started:${dispatchId}/t1`, `finished:${dispatchId}/t1`], "every projected started is paired");
+  });
+
+  it("caps projected child output per TURN across several dispatches; each later dispatch gets one marker; completions all go out", async () => {
+    let harnessRef!: CodexHarness;
+    // 64 x 60 KiB of text per dispatch stays under the 4 MiB per-dispatch budget, so only the
+    // 16 MiB per-turn budget can cut: it runs out during the 5th dispatch.
+    const big = "a".repeat(60 * 1024);
+    const perDispatch = 64;
+    const broker = stubBroker(async (rt, name) => {
+      if (name !== "spawn_agent") return { ok: true, output: {} };
+      const h = harnessRef;
+      const child = `th-${rt.callId}`;
+      h.registerChildSink(child, { push: () => {} });
+      h.bindChildDispatch(child, rt, "coder");
+      h.emitChildFrame(child, [{ kind: "tool", phase: "started", id: "t", name: "Bash", input: {} }]);
+      for (let i = 0; i < perDispatch; i += 1) h.emitChildFrame(child, [{ kind: "text", text: big }]);
+      h.emitChildFrame(child, [{ kind: "tool", phase: "finished", id: "t", name: "Bash", output: "ok" }]);
+      h.emitChildFrame(child, [{ kind: "text", text: "tail" }]);
+      h.unregisterChildSink(child);
+      return { ok: true, output: { text: `done ${rt.callId}` } };
+    });
+    const { harness, transport } = makeHarness({ broker, idNonce: "abcdef012345" });
+    harnessRef = harness;
+    const calls = ["c-1", "c-2", "c-3", "c-4", "c-5", "c-6"];
+    transport.push(threadStarted());
+    calls.forEach((c, i) => transport.push(toolCall(i + 1, "spawn_agent", { subagent_type: "coder" }, "th-1", "tn-1", c)));
+    const eventsP = collect(harness.startTurn(makeRequest()).events);
+    await waitUntil(() => transport.responses.length === calls.length, "every parent reply");
+    transport.push(turnCompleted("completed")).end();
+    const events = await withTimeout(eventsP, 10000, "turn-capped turn");
+
+    const marker = "[further subagent output not shown]";
+    let total = 0;
+    for (const c of calls) {
+      const dispatchId = `cx-abcdef012345-t1-${c}`;
+      const items = frames(events)
+        .filter((f) => f.origin.kind === "subagent" && f.origin.instanceId === dispatchId)
+        .flatMap((f) => f.items);
+      total += items.filter((i) => !(i.kind === "text" && i.text === marker)).reduce((n, i) => n + Buffer.byteLength(JSON.stringify(i), "utf8"), 0);
+      const markers = items.filter((i) => i.kind === "text" && i.text === marker).length;
+      const tools = items.flatMap((i) => (i.kind === "tool" ? [i.phase] : []));
+      if (c <= "c-4") {
+        assert.equal(markers, 0, `${c} is within the turn budget`);
+        assert.equal(items.length, perDispatch + 3, `${c} projects everything`);
+      } else {
+        assert.equal(markers, 1, `${c} gets exactly one marker`);
+        assert.ok(!items.some((i) => i.kind === "text" && i.text === "tail"), `${c} drops items after the marker`);
+      }
+      assert.equal(tools.filter((p) => p === "started").length, tools.filter((p) => p === "finished").length, `${c} tools are paired`);
+      const completion = frames(events).flatMap((f) => f.items).find((i) => i.kind === "tool" && i.phase === "finished" && i.id === dispatchId);
+      assert.deepEqual(completion, {
+        kind: "tool",
+        phase: "finished",
+        id: dispatchId,
+        name: "Agent",
+        output: JSON.stringify({ text: `done ${c}` }),
+        isError: false,
+      });
+    }
+    assert.ok(total <= 16 * 1024 * 1024 + 64 * 1024, `the turn total stays bounded (${total} bytes)`);
   });
 });
 
