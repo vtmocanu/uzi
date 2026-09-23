@@ -14,7 +14,7 @@ import { makeTerminalOutboxDeps, resolvePendingTerminal } from "./terminal-resol
 import { StatsCollector } from "./stats.js";
 import { errMessage, sleep } from "./util.js";
 import { toolchainPreflight, type PreflightResult } from "./toolchain-preflight.js";
-import { CODEX_HARNESS_CAPABILITY } from "./codex/codex-runtime-probe.js";
+import { CODEX_CUSTOM_MODEL_CAPABILITY, CODEX_HARNESS_CAPABILITY } from "./codex/codex-runtime-probe.js";
 
 /**
  * Outbound-only worker loop (a daemon model): register once, heartbeat on
@@ -294,6 +294,10 @@ export class Worker {
         // clause admits a Codex-indicating run only for a worker that self-reported it).
         if (this.config.codexHarness?.advertise) {
           protocolCapabilities.push(CODEX_HARNESS_CAPABILITY);
+          // PRD #1551 (D6): this build's renderer can pass a validated custom worker-root
+          // model through unchanged, so advertise the custom-model capability under the same
+          // gate. The API holds a custom-root Codex run for a worker that lacks it.
+          protocolCapabilities.push(CODEX_CUSTOM_MODEL_CAPABILITY);
         }
         const res = await this.client.register(
           this.config.workerName,

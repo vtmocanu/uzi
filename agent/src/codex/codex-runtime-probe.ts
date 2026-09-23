@@ -38,6 +38,15 @@ import path from "node:path";
  *  capability, and NOT a required_capability (PRD #1332 D3). */
 export const CODEX_HARNESS_CAPABILITY = "codex_harness_v1";
 
+/** PRD #1551 (D6): the protocol capability advertised ONLY by a worker whose Codex
+ *  renderer can pass a validated CUSTOM (non-curated) worker-root model through unchanged
+ *  (agent/src/codex/render.ts). The API gates every non-bypassable placement seam on it for
+ *  a run whose effective Codex root is a custom model, so an old `codex_harness_v1`-only
+ *  worker cannot claim such a run and silently substitute `gpt-6-astra`. Advertised beside
+ *  {@link CODEX_HARNESS_CAPABILITY} in worker.ts, under the SAME condition (this build's
+ *  renderer always has the passthrough behavior, so the two are advertised together). */
+export const CODEX_CUSTOM_MODEL_CAPABILITY = "codex_custom_model_v1";
+
 /** Default install prefix, matching agent/codex/install-codex.sh's UZI_CODEX_PREFIX
  *  default. The receipt is written at `${prefix}/${version}.receipt.json`. */
 const DEFAULT_CODEX_PREFIX = "/opt/uzi-codex";

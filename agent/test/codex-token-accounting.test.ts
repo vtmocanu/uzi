@@ -299,6 +299,35 @@ describe("CodexUsageAccountant: m3 fail-closed pricing on malformed required evi
     assert.equal(Math.round(astra.costUSD! * 1e6), 13000, "300*10 + 200*50 µ$");
   });
 
+  // PRD #1551 (D5): a CUSTOM (unknown-to-the-price-table) worker-root model has no price row,
+  // so under api_key it is `unreported` with FULL token totals (never a fabricated dollar), and
+  // under subscription it is `subscription` with token totals — same honest accounting as any
+  // other unpriced model. This confirms opening custom root models needs no pricing-table change.
+  const CUSTOM_MODEL = "gpt-7-custom-preview";
+  it("(#1551) a custom (unknown-price) model under api_key is unreported with token totals retained", () => {
+    const acct = new CodexUsageAccountant();
+    acct.registerThread(ROOT, CUSTOM_MODEL, false);
+    acct.record(ROOT, usageEvidence(B, B, true)); // well-shaped, reconciling — only the model is unknown
+    const agg = acct.aggregateByModel(API_KEY);
+    assert.ok(agg);
+    const entry = agg[CUSTOM_MODEL]!;
+    assert.equal(entry.costStatus, "unreported", "an unknown-price model never meters under api_key");
+    assert.ok(!("costUSD" in entry), "no dollar figure invented for an unknown model");
+    assert.equal(entry.inputTokens, 300, "input tokens retained");
+    assert.equal(entry.outputTokens, 200, "output tokens retained");
+    assert.deepEqual(deriveCodexRunCost(agg, "api_key"), { kind: "unreported" });
+  });
+
+  it("(#1551) a custom (unknown-price) model under subscription is subscription with token totals", () => {
+    const acct = new CodexUsageAccountant();
+    acct.registerThread(ROOT, CUSTOM_MODEL, false);
+    acct.record(ROOT, usageEvidence(B, B, true));
+    const entry = acct.aggregateByModel({ authMode: "subscription", now: API_KEY.now })![CUSTOM_MODEL]!;
+    assert.equal(entry.costStatus, "subscription", "subscription usage stays subscription even for an unknown model");
+    assert.equal(entry.inputTokens, 300, "input tokens retained");
+    assert.equal(entry.outputTokens, 200, "output tokens retained");
+  });
+
   it("malformed required evidence → costStatus 'unreported' EVEN THOUGH the numeric reconciliation matches; tokens survive", () => {
     const acct = new CodexUsageAccountant();
     acct.registerThread(ROOT, MODEL_ROOT, false);

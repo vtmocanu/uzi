@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { ReviewRunner, parseTaskReview, fallbackTaskReview, buildReviewPrompt } from "../src/review-runner.js";
+import { CODEX_TASK_REVIEW_MODEL } from "../src/codex/task-review-model.js";
 import { Outbox } from "../src/outbox.js";
 import type { SdkQueryFn } from "../src/sdk-executor.js";
 import type { GitCache } from "../src/git.js";
@@ -388,6 +389,37 @@ describe("ReviewRunner", () => {
     assert.equal(harnessRan, true, "the Codex advice harness's run() must actually execute");
     assert.equal(calls.review?.review.status, "complete", "a real Codex advice result must post, not the missing-token failed review");
     assert.equal(calls.review?.review.summary, "codex review");
+  });
+
+  // PRD #1551 (M2, D5): a Codex task review runs on the BUILT-IN review model (gpt-6-sol),
+  // selected in the advice request's `model`, regardless of the claim's default_model
+  // (including a custom one). Discriminating: dropping `model: CODEX_TASK_REVIEW_MODEL`
+  // in reviewCodex makes `req?.model` undefined and this assertion fails.
+  it("a Codex review runs on the built-in gpt-6-sol, ignoring the claim's default_model (PRD #1551)", async () => {
+    const { client } = fakeClient();
+    const { git } = fakeGit("diff --git a/poller.ts b/poller.ts\n@@ -1 +1 @@\n-old\n+new\n");
+    let reqModel: string | undefined = "UNSET";
+    const codexModelJson = JSON.stringify({ summary: "codex review", findings: [] });
+    const fakeHarness = {
+      kind: "codex" as const,
+      run: async (req: { model?: string }) => {
+        reqModel = req.model;
+        return { text: codexModelJson, end: { kind: "terminal", terminal: { outcome: "success" } } };
+      },
+    };
+    const codexAdviceHarnessFactory = (async () => fakeHarness) as never;
+    const runner = new ReviewRunner(client, git, nullLogger(), { queryFn: forbiddenQueryFn(), codexAdviceHarnessFactory });
+    const codexSecrets = { auth_mode: "api_key", access_token: "codex-tok", capability: "cap-1" };
+    // A custom default_model on the claim must NOT reach the reviewer — review is independent.
+    await runner.execute(
+      reviewClaim({
+        secrets: { forge_pat: "pat", codex: codexSecrets } as never,
+        config: { default_model: "gpt-8-custom-from-claim" } as never,
+      }),
+    );
+
+    assert.equal(reqModel, CODEX_TASK_REVIEW_MODEL, "the review advice request carries the built-in review model");
+    assert.equal(reqModel, "gpt-6-sol", "the built-in review model is gpt-6-sol");
   });
 
   // PRD #1429 M3: the control — an ordinary Claude claim (no codex block) must never touch

@@ -13,6 +13,7 @@ import {
   buildAppServerRefreshBridge,
   makeCodexAdviceHarness,
   CODEX_PRODUCTION_PROVIDER,
+  CODEX_TASK_REVIEW_MODEL,
   makeDefaultSpawnCommand,
   registeredRoot,
   buildCommandEnv,
@@ -1678,6 +1679,31 @@ describe("CodexExecutor: an api_key run meters the root model end-to-end (execut
     assert.ok(modelUsage, "the terminal carries per-model usage");
     assert.deepEqual(Object.keys(modelUsage), ["gpt-5.6-sol"], "usage is charged to the server-resolved model, never the hardcoded default");
   });
+
+  it("(#1551) passes a CUSTOM worker-default root model through to the root init + usage, unchanged", async () => {
+    // buildRunRequest tags a present, non-empty server `default_model` with
+    // modelSource:"worker_default", the one provenance render.ts's resolveModel lets carry a
+    // NON-CURATED id through unchanged (PRD #1551 D4/D5). So a custom worker default reaches the
+    // ROOT thread verbatim — never dropped to the "gpt-6-astra" provider fallback. Discriminating:
+    // reverting the passthrough (or dropping the modelSource tag) reddens this via astra usage.
+    const rig = makeRig();
+    rig.transport
+      .push(threadStarted())
+      .push(tokenUsageUpdated("th-1", "tn-1", { inputTokens: 100, totalTokens: 100 }))
+      .push(signalDone())
+      .push(turnCompleted("completed"))
+      .end();
+    const { ctx, emitted } = makeCtx({ config: { default_model: "gpt-7-custom-preview" } });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "custom-model run");
+
+    const initEvents = emitted.filter((m) => m.kind === "status" && rec(m.payload).event === "init");
+    assert.equal(initEvents.length, 1, "exactly one init event for the executor claim");
+    assert.equal(rec(initEvents[0]!.payload).model, "gpt-7-custom-preview", "the custom worker-default model passes through to init");
+
+    const modelUsage = lastResultModelUsage(emitted);
+    assert.ok(modelUsage, "the terminal carries per-model usage");
+    assert.deepEqual(Object.keys(modelUsage), ["gpt-7-custom-preview"], "usage is charged to the custom model, never gpt-6-astra");
+  });
 });
 
 describe("CodexExecutor: one claim-leg accountant survives provider-epoch recreation (CodeRabbit 4004800880)", () => {
@@ -2446,6 +2472,16 @@ describe("CodexExecutor: production provider constant (mutation evidence)", () =
       envKey: "OPENAI_API_KEY",
       model: "gpt-6-astra",
     });
+  });
+
+  it("(#1551) pins the built-in Codex task-review model at gpt-6-sol, distinct from the provider default", () => {
+    assert.equal(CODEX_TASK_REVIEW_MODEL, "gpt-6-sol");
+    assert.notEqual(
+      CODEX_TASK_REVIEW_MODEL,
+      CODEX_PRODUCTION_PROVIDER.model,
+      "the review model must not silently equal the shared provider default (which stays gpt-6-astra)",
+    );
+    assert.equal(CODEX_PRODUCTION_PROVIDER.model, "gpt-6-astra", "the shared provider default is unchanged by #1551");
   });
 });
 

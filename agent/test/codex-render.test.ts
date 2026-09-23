@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {
   renderCodexRun,
   renderCodexAdvice,
+  CustomWorkerModelError,
   type CodexRenderDiagnostic,
   type CodexRenderDiagnosticKind,
   type RenderedCodexAdvice,
@@ -273,6 +274,88 @@ describe("renderCodexRun — model + effort contract", () => {
     const run = renderCodexRun(runRequest({ model: "gpt-9-imaginary" }));
     assert.equal(run.lead.model, undefined);
     assert.equal(hasDiagnostic(run.diagnostics, "unknown_model", "lead", "gpt-9-imaginary"), true);
+  });
+});
+
+// PRD #1551 (D4/D5): the run ROOT model, and ONLY when sourced from the server worker
+// default (`modelSource: "worker_default"`), may be a validated CUSTOM (non-curated) ID
+// that passes through unchanged. Absent provenance keeps the closed curated behavior.
+describe("renderCodexRun — custom worker-root model passthrough (PRD #1551)", () => {
+  it("passes a valid custom worker-default root model through UNCHANGED, no diagnostic", () => {
+    const run = renderCodexRun(runRequest({ model: "gpt-7-custom-preview", modelSource: "worker_default" }));
+    assert.equal(run.lead.model, "gpt-7-custom-preview");
+    assert.equal(run.diagnostics.length, 0);
+    // A subagent with no pin inherits the (custom) resolved run root.
+    const withRole = renderCodexRun(
+      runRequest({ model: "gpt-7-custom-preview", modelSource: "worker_default", agents: { coder: agent() } }),
+    );
+    assert.equal(withRole.perRoleModels.get("coder")?.model, "gpt-7-custom-preview");
+  });
+
+  it("still keeps a CURATED worker-default model unchanged with no diagnostic", () => {
+    const run = renderCodexRun(runRequest({ model: "gpt-6-sol", modelSource: "worker_default" }));
+    assert.equal(run.lead.model, "gpt-6-sol");
+    assert.equal(run.diagnostics.length, 0);
+  });
+
+  it("DROPS the SAME custom model when provenance is absent (curated-only), no passthrough", () => {
+    // The mutation-discriminating pair with the passthrough test above: without
+    // `modelSource: "worker_default"` a non-curated id is dropped with a diagnostic,
+    // exactly as before #1551. If the passthrough ignored provenance, this would fail.
+    const run = renderCodexRun(runRequest({ model: "gpt-7-custom-preview" }));
+    assert.equal(run.lead.model, undefined);
+    assert.equal(hasDiagnostic(run.diagnostics, "unknown_model", "lead", "gpt-7-custom-preview"), true);
+  });
+
+  it("accepts a hostile-but-validator-legal custom id (TOML-significant chars) unchanged", () => {
+    // `"` and `\` are TOML-significant yet the API model validator allows them (not
+    // control/format/whitespace). render passes them through; config.ts escapes them.
+    const model = 'gpt-6"astra\\x';
+    const run = renderCodexRun(runRequest({ model, modelSource: "worker_default" }));
+    assert.equal(run.lead.model, model);
+    assert.equal(run.diagnostics.length, 0);
+  });
+
+  it("accepts a custom id at exactly the 100-BYTE cap (API MaxModelLen mirror)", () => {
+    const model = "g".repeat(100);
+    const run = renderCodexRun(runRequest({ model, modelSource: "worker_default" }));
+    assert.equal(run.lead.model, model);
+  });
+
+  it("FAILS LOUDLY (throws) on a malformed worker-default model, never substitutes Astra", () => {
+    for (const bad of [
+      "g".repeat(101), // over the 100-byte cap
+      "gpt 6 astra", // interior whitespace (single-token rule)
+      "gpt-6-‮astra", // bidi override (Cf)
+      "gpt-6-\u0007astra", // control char (Cc)
+      "gpt​x", // zero-width space (Cf)
+      "", // present-but-empty
+    ]) {
+      assert.throws(
+        () => renderCodexRun(runRequest({ model: bad, modelSource: "worker_default" })),
+        (err: unknown) => err instanceof CustomWorkerModelError,
+        `expected CustomWorkerModelError for ${JSON.stringify(bad)}`,
+      );
+    }
+  });
+
+  it("does NOT open per-role pins or advice to custom ids even with a custom root", () => {
+    // A per-role CUSTOM pin is still dropped (curated-only) and falls back to the
+    // resolved request model; provenance never flows to a role pin or to advice.
+    const run = renderCodexRun(
+      runRequest({
+        model: "gpt-7-custom-preview",
+        modelSource: "worker_default",
+        agents: { rogue: agent({ model: "gpt-8-role-custom" }) },
+      }),
+    );
+    assert.equal(run.perRoleModels.get("rogue")?.model, "gpt-7-custom-preview");
+    assert.equal(hasDiagnostic(run.diagnostics, "unknown_model", "rogue", "gpt-8-role-custom"), true);
+
+    // Advice carries no provenance: a custom advice model is dropped with a diagnostic.
+    const advice = renderCodexAdvice(adviceRequest({ model: "gpt-8-advice-custom" }));
+    assert.equal(advice.model, undefined);
+    assert.equal(hasDiagnostic(advice.diagnostics, "unknown_model", "advice", "gpt-8-advice-custom"), true);
   });
 });
 

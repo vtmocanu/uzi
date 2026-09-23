@@ -251,6 +251,13 @@ export interface RunTurnRequest {
   resumeSessionId?: string;
   signal: AbortSignal;
   model?: string;
+  /** PRD #1551 (D4/D5): trusted provenance for `model`. `"worker_default"` means the
+   *  executor copied it from the server claim's resolved worker default (owner default
+   *  or a frozen schedule model), which is the ONLY source permitted to carry a
+   *  non-curated (custom) Codex root ID. Absent for any other source (a per-role pin,
+   *  the fixed provider fallback, an advice model), which stays closed to the curated
+   *  set. It never widens judge/summary/task-review advice or per-role agent pins. */
+  modelSource?: "worker_default";
   effort?: HarnessEffort;
   phase: "plan" | "implement";
   agents: Readonly<Record<string, HarnessAgent>>;

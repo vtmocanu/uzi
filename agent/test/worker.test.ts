@@ -9,7 +9,7 @@ import type { ChatRunner } from "../src/chat-runner.js";
 import type { JudgeRunner } from "../src/judge-runner.js";
 import type { ReviewRunner } from "../src/review-runner.js";
 import type { ClaimResponse, ChatClaimResponse, WorkerStats } from "../src/protocol.js";
-import { CODEX_HARNESS_CAPABILITY } from "../src/codex/codex-runtime-probe.js";
+import { CODEX_CUSTOM_MODEL_CAPABILITY, CODEX_HARNESS_CAPABILITY } from "../src/codex/codex-runtime-probe.js";
 import { ActiveRunRegistry } from "../src/active-run-registry.js";
 import { recordingLogger } from "./helpers.js";
 
@@ -842,8 +842,8 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     );
     assert.deepStrictEqual(
       caps,
-      ["completion_interlock_v1", "recovery_archive_v1", "recovery_archive_v2", "credential_switch_v1", "wall_park_v1", CODEX_HARNESS_CAPABILITY],
-      "an advertising result appends codex_harness_v1 after the always-present protocol caps (v2 by PRD #1349 M1, credential_switch_v1 by PRD #1247 M5b, wall_park_v1 by PRD #1497 M2)",
+      ["completion_interlock_v1", "recovery_archive_v1", "recovery_archive_v2", "credential_switch_v1", "wall_park_v1", CODEX_HARNESS_CAPABILITY, CODEX_CUSTOM_MODEL_CAPABILITY],
+      "an advertising result appends codex_harness_v1 then codex_custom_model_v1 (PRD #1551 D6) after the always-present protocol caps (v2 by PRD #1349 M1, credential_switch_v1 by PRD #1247 M5b, wall_park_v1 by PRD #1497 M2)",
     );
   });
 
@@ -891,5 +891,35 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
       assert.ok(caps?.includes("credential_switch_v1"), "credential_switch_v1 always present (PRD #1247 M5b)");
       assert.ok(caps?.includes("wall_park_v1"), "wall_park_v1 always present (PRD #1497 M2)");
     }
+  });
+
+  // PRD #1551 (D6): codex_custom_model_v1 is advertised IFF codex_harness_v1 is — this
+  // build's renderer always carries the custom-root passthrough, so the two ride the same
+  // advertise gate. Discriminating: mutating the worker.ts push to omit the custom cap
+  // fails the advertising case; pushing it unconditionally fails the non-advertising case.
+  it("advertises codex_custom_model_v1 exactly when codex_harness_v1 is advertised (PRD #1551 D6)", async () => {
+    const advertising = await advertisedCapabilities(
+      fakeConfig({ codexHarness: { advertise: true, degraded: false, landlock: "available" } }),
+    );
+    assert.ok(advertising?.includes(CODEX_HARNESS_CAPABILITY), "harness cap present when advertising");
+    assert.ok(
+      advertising?.includes(CODEX_CUSTOM_MODEL_CAPABILITY),
+      "codex_custom_model_v1 present exactly when codex_harness_v1 is",
+    );
+
+    const notAdvertising = await advertisedCapabilities(
+      fakeConfig({ codexHarness: { advertise: false, degraded: false, landlock: "unavailable" } }),
+    );
+    assert.ok(!notAdvertising?.includes(CODEX_HARNESS_CAPABILITY), "harness cap absent when not advertising");
+    assert.ok(
+      !notAdvertising?.includes(CODEX_CUSTOM_MODEL_CAPABILITY),
+      "codex_custom_model_v1 absent when codex_harness_v1 is",
+    );
+
+    const absent = await advertisedCapabilities(fakeConfig());
+    assert.ok(
+      !absent?.includes(CODEX_CUSTOM_MODEL_CAPABILITY),
+      "codex_custom_model_v1 absent when the availability result is absent",
+    );
   });
 });
