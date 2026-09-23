@@ -240,6 +240,24 @@ func (s *Service) resolveRunHarnessQ(ctx context.Context, userID uuid.UUID, expl
 	return resolvedHarness{Harness: h}, nil
 }
 
+// ResolveSettingsHarness resolves the harness the settings surface projects the legacy
+// default_model lane from (PRD #1551 M1 / D3): it runs the same D11 resolver production run
+// creation uses, with no explicit selection, so a usable stored default_harness is honoured.
+// Unlike run creation, a credential-unavailability refusal is NOT an error here — settings
+// GET/PUT must never fail merely because no harness is usable, so errNoUsableCredential and
+// errNoCredentialForHarness both map to (HarnessClaude, nil), matching the zero-credential
+// projection D3 requires. Only a genuine store error propagates. It is reads only (no lock).
+func (s *Service) ResolveSettingsHarness(ctx context.Context, userID uuid.UUID) (Harness, error) {
+	res, err := s.resolveRunHarness(ctx, userID, nil)
+	if err != nil {
+		if errors.Is(err, errCredentialUnavailable) || errors.Is(err, errNoCredentialForHarness) {
+			return HarnessClaude, nil
+		}
+		return "", err
+	}
+	return res.Harness, nil
+}
+
 // userDefaultHarness reads users.default_harness and maps it to a *Harness preference:
 // NULL (or any value outside the CHECK vocabulary, which cannot occur) is nil for "no
 // preference".

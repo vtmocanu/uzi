@@ -991,7 +991,9 @@ func TestUserSettingsDTOTags(t *testing.T) {
 		"default_harness",
 		// PRD #1209 M1: the linked Codex accounts surfaced on the sidebar rail (codex sibling
 		// of sidebar_token_ids).
-		"sidebar_codex_account_ids")
+		"sidebar_codex_account_ids",
+		// PRD #1551 M1 (D2): the retained per-harness worker-model lanes (each null ⇒ inherit).
+		"default_claude_model", "default_codex_model")
 }
 
 // TestAgentMemoryWriteRequestTags pins the worker save body: {title, body} plus the

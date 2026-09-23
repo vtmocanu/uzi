@@ -144,28 +144,40 @@ SELECT judge_anthropic_bind_mode, judge_anthropic_secret_id FROM users WHERE id 
 -- resolver reuses (UserHasAnthropicToken, GetDefaultUserSecretMeta/ID, GetUserSecretIDByLabel,
 -- CountCodexSecrets, GetCodexCredentialState, GetUserSecretMetaByID, GetRunCodexAuthContext).
 -- Narrow single-column read keyed on the user, mirroring GetUserDefaultModel/GetUserDefaultEffort.
--- M5A has NO public writer for default_harness; the column is set only in direct test setup.
+-- default_harness is written by SetUserHarnessModels (the grouped PUT /api/me/settings write,
+-- PRD #1551 M1 / D1); the CHECK closes it to claude|codex and the handler validates the enum.
 SELECT default_harness FROM users WHERE id = $1;
 
 -- name: GetUserDefaultModel :one
--- The current user's per-user default worker model (PRD #17); NULL = inherit.
+-- The current user's per-user default worker model (PRD #17); NULL = inherit. Retained as the
+-- legacy compatibility projection while claim/chat assembly (PRD #1551 M4) still reads it.
 SELECT default_model FROM users WHERE id = $1;
 
--- name: SetUserDefaultModel :one
--- Sets (or clears, when @default_model is NULL) the current user's default
--- worker model. Own-user only; the caller passes the session user's id.
-UPDATE users SET default_model = @default_model WHERE id = @id
-RETURNING default_model;
+-- name: GetUserHarnessModelDefaults :one
+-- The current user's per-harness worker-model lanes (PRD #1551 M1 / D2 / D4): the retained
+-- Claude and Codex defaults, each NULL = inherit. M4 claim assembly reads the lane matching the
+-- already-frozen run harness through this query rather than the deprecated default_model.
+-- Own-user (run-owner) scoped; the caller passes the run owner's id.
+SELECT default_claude_model, default_codex_model FROM users WHERE id = $1;
 
--- name: SetUserDefaultHarness :one
--- Sets (or clears, when @default_harness is NULL) the current user's per-user default
--- harness (PRD #1429 M1 / D3). NULL = no preference (implicit creation falls through D11).
--- Own-user only; the caller passes the session user's id. Mirrors SetUserDefaultModel; the
--- users_default_harness_check CHECK (00226) closes the value to claude|codex, so the handler
--- validates the enum before this write. It gains a static caller in PUT /api/me/settings,
--- which is what satisfies deadcode:api.
-UPDATE users SET default_harness = @default_harness WHERE id = @id
-RETURNING default_harness;
+-- name: SetUserHarnessModels :one
+-- PATCHes the current user's default harness, both per-harness model lanes and the legacy
+-- default_model projection in ONE atomic statement (PRD #1551 M1 / D1), the SetUserAppearance
+-- shape: each field is written only when its @set_* flag is true, otherwise the CASE keeps the
+-- row's own value. A true flag with a NULL value CLEARS that field. Because every unset field
+-- re-writes its own stored value inside the single UPDATE, two concurrent saves that touch
+-- different fields cannot clobber each other and the handler needs no read-merge-write, and a
+-- database error cannot leave the harness changed while a model lane stays stale (D1). The
+-- handler always sets default_model to the effective (post-write) target-lane value so the
+-- deprecated legacy column stays equal to the effective lane for an image-only rollback (D2).
+-- Own-user only; the caller passes the session user's id.
+UPDATE users
+SET default_harness = CASE WHEN @set_harness::bool THEN @default_harness ELSE default_harness END,
+    default_claude_model = CASE WHEN @set_claude::bool THEN @default_claude_model ELSE default_claude_model END,
+    default_codex_model = CASE WHEN @set_codex::bool THEN @default_codex_model ELSE default_codex_model END,
+    default_model = CASE WHEN @set_default_model::bool THEN @default_model ELSE default_model END
+WHERE id = @id
+RETURNING default_harness, default_claude_model, default_codex_model, default_model;
 
 -- name: GetUserDefaultEffort :one
 -- The current user's per-user default reasoning effort (PRD #617); NULL = inherit,
@@ -231,7 +243,10 @@ RETURNING summary_model;
 -- sidebar_codex_account_ids (PRD #1209 M1) rides it as well — the linked Codex accounts the
 -- user surfaced on the sidebar rail, the codex sibling of sidebar_token_ids; NULL/'{}' read
 -- as "no explicit extras".
-SELECT default_model, default_effort, judge_model, summary_model, theme, sidebar_token_ids, mr_rework_enabled, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids FROM users WHERE id = $1;
+-- default_claude_model and default_codex_model (PRD #1551 M1 / D2) ride it too — the retained
+-- per-harness worker-model lanes; each NULL means "inherit". The settings surface exposes both
+-- lanes, and projects the deprecated default_model from the effective harness's lane.
+SELECT default_model, default_effort, judge_model, summary_model, theme, sidebar_token_ids, mr_rework_enabled, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model FROM users WHERE id = $1;
 
 -- name: GetUserSchedulePause :one
 -- The current user's pause-all-schedules state (PRD #1093), returned RAW: the switch

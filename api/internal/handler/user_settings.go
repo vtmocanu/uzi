@@ -30,10 +30,21 @@ import (
 // tokens whose rate meters the user surfaced on the sidebar rail — the default
 // token always shows and is never listed; empty means default-only.
 type userSettingsDTO struct {
-	DefaultModel  *string `json:"default_model"`
-	DefaultEffort *string `json:"default_effort"`
-	JudgeModel    *string `json:"judge_model"`
-	SummaryModel  *string `json:"summary_model"`
+	// DefaultModel is DEPRECATED (PRD #1551 D2/D3): the retained model defaults now live
+	// in the two per-harness lanes below. On GET/PUT this legacy field is a PROJECTION of
+	// the lane for the effective harness (ResolveSettingsHarness), kept one release as a
+	// compatibility field for stale web assets. A legacy-only write is bridged into the
+	// target lane (D3); new clients send the explicit lanes instead.
+	DefaultModel *string `json:"default_model"`
+	// DefaultClaudeModel and DefaultCodexModel are the retained per-harness worker-model
+	// lanes (PRD #1551 M1 / D2): each null = inherit. Changing the default harness never
+	// clears either lane. A curated Codex id is rejected in the Claude lane and a known
+	// Claude alias in the Codex lane (D3 closed-list cross-vocabulary guard).
+	DefaultClaudeModel *string `json:"default_claude_model"`
+	DefaultCodexModel  *string `json:"default_codex_model"`
+	DefaultEffort      *string `json:"default_effort"`
+	JudgeModel         *string `json:"judge_model"`
+	SummaryModel       *string `json:"summary_model"`
 	// Theme is the DEPRECATED legacy single-theme override (PRD #21); kept one
 	// release. The appearance override lives in the four fields below (PRD #1167).
 	Theme *string `json:"theme"`
@@ -82,13 +93,30 @@ func (h *Handler) userSettingsResponse(w http.ResponseWriter, r *http.Request, u
 	if sidebarCodexOverride != nil {
 		sidebarCodexIDs = *sidebarCodexOverride
 	}
+	// The deprecated legacy default_model is a PROJECTION of the effective harness's lane
+	// (PRD #1551 D3), NOT the stored default_model column: GET resolves the effective harness
+	// with the SAME D11 resolver run creation uses (honouring a usable stored default_harness),
+	// so a stale client reading default_model sees the value its harness would actually run.
+	// A zero-credential user resolves to Claude, so the projection never fails on credentials.
+	effHarness, err := h.resolveSettingsHarness(r.Context(), userID)
+	if err != nil {
+		slog.Error("resolve settings harness", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	legacyModel := s.DefaultClaudeModel
+	if effHarness == workersvc.HarnessCodex {
+		legacyModel = s.DefaultCodexModel
+	}
 	// summary_model rides the GetUserSettings one-row read (it is the same users row),
 	// so the settings surface reads it from `s` — no separate query. GetUserSummaryModel
 	// stays the narrow read for issue-run claim assembly, where no other user field is
 	// needed (PRD #362 M2).
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"settings": userSettingsDTO{
-			DefaultModel:           textPtrValue(s.DefaultModel.Valid, s.DefaultModel.String),
+			DefaultModel:           textPtrValue(legacyModel.Valid, legacyModel.String),
+			DefaultClaudeModel:     textPtrValue(s.DefaultClaudeModel.Valid, s.DefaultClaudeModel.String),
+			DefaultCodexModel:      textPtrValue(s.DefaultCodexModel.Valid, s.DefaultCodexModel.String),
 			DefaultEffort:          textPtrValue(s.DefaultEffort.Valid, s.DefaultEffort.String),
 			JudgeModel:             textPtrValue(s.JudgeModel.Valid, s.JudgeModel.String),
 			SummaryModel:           textPtrValue(s.SummaryModel.Valid, s.SummaryModel.String),
@@ -159,13 +187,18 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 	// RawMessage distinguishes an absent field (nil) from a present null (the
 	// bytes `null`); a plain *string cannot, and absent must mean "unchanged".
 	var req struct {
-		DefaultModel    json.RawMessage `json:"default_model"`
-		DefaultEffort   json.RawMessage `json:"default_effort"`
-		JudgeModel      json.RawMessage `json:"judge_model"`
-		SummaryModel    json.RawMessage `json:"summary_model"`
-		Theme           json.RawMessage `json:"theme"`
-		MrReworkEnabled json.RawMessage `json:"mr_rework_enabled"`
-		SidebarTokenIds json.RawMessage `json:"sidebar_token_ids"`
+		DefaultModel json.RawMessage `json:"default_model"`
+		// The two per-harness lanes (PRD #1551 M1 / D2), same absent/null/value tri-state
+		// as default_model: absent ⇒ lane unchanged, null ⇒ clear to inherit, a validated
+		// value ⇒ set. Cross-vocabulary rejection uses closed lists only (D3).
+		DefaultClaudeModel json.RawMessage `json:"default_claude_model"`
+		DefaultCodexModel  json.RawMessage `json:"default_codex_model"`
+		DefaultEffort      json.RawMessage `json:"default_effort"`
+		JudgeModel         json.RawMessage `json:"judge_model"`
+		SummaryModel       json.RawMessage `json:"summary_model"`
+		Theme              json.RawMessage `json:"theme"`
+		MrReworkEnabled    json.RawMessage `json:"mr_rework_enabled"`
+		SidebarTokenIds    json.RawMessage `json:"sidebar_token_ids"`
 		// The linked Codex accounts on the sidebar rail (PRD #1209 M1): same
 		// absent/present tri-state as sidebar_token_ids — absent leaves the stored set,
 		// present (a JSON array, or null) replaces it. Unlike sidebar_token_ids, a
@@ -207,6 +240,50 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		modelVal = v
+	}
+
+	var claudeVal pgtype.Text
+	claudePresent := req.DefaultClaudeModel != nil
+	if claudePresent {
+		var raw *string
+		if err := json.Unmarshal(req.DefaultClaudeModel, &raw); err != nil {
+			httpx.Error(w, http.StatusBadRequest, "invalid default_claude_model")
+			return
+		}
+		v, err := validateModel(raw)
+		if err != nil {
+			httpx.Error(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		// Closed-list cross-vocabulary guard (D3): a curated Codex id must not sit in the
+		// Claude lane. No prefix guessing — only the three known Codex ids are rejected.
+		if err := rejectCodexIDInClaudeLane("default_claude_model", v); err != nil {
+			httpx.Error(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		claudeVal = v
+	}
+
+	var codexVal pgtype.Text
+	codexPresent := req.DefaultCodexModel != nil
+	if codexPresent {
+		var raw *string
+		if err := json.Unmarshal(req.DefaultCodexModel, &raw); err != nil {
+			httpx.Error(w, http.StatusBadRequest, "invalid default_codex_model")
+			return
+		}
+		v, err := validateModel(raw)
+		if err != nil {
+			httpx.Error(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		// Closed-list cross-vocabulary guard (D3): a known Claude alias must not sit in the
+		// Codex lane. Only the closed alias set is rejected; a validated custom id passes.
+		if err := rejectClaudeAliasInCodexLane("default_codex_model", v); err != nil {
+			httpx.Error(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		codexVal = v
 	}
 
 	var effortVal pgtype.Text
@@ -388,18 +465,44 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 		sidebarCodexIDs = ids
 	}
 
+	// The harness/model group (PRD #1551 M1 / D1): default_harness, both lanes and the legacy
+	// default_model save together in ONE statement. Resolve the target harness, bridge a
+	// legacy-only default_model into its lane (or require it to equal an explicit lane), and
+	// compute the effective target-lane value the legacy column must mirror — all in phase 1,
+	// so a conflict is a clean 400 that writes nothing. groupParams is nil when no grouped
+	// field is present.
+	groupParams, ok, err := h.buildHarnessModels(r.Context(), user.ID, harnessModelInputs{
+		modelPresent:   modelPresent,
+		modelVal:       modelVal,
+		claudePresent:  claudePresent,
+		claudeVal:      claudeVal,
+		codexPresent:   codexPresent,
+		codexVal:       codexVal,
+		harnessPresent: harnessPresent,
+		harnessVal:     harnessVal,
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, errHarnessModelConflict):
+			httpx.Error(w, http.StatusBadRequest, err.Error())
+		case errors.Is(err, errHarnessModelCrossVocab):
+			httpx.Error(w, http.StatusBadRequest, err.Error())
+		default:
+			slog.Error("resolve harness models group", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+		}
+		return
+	}
+
 	// ---- Phase 2: writes. Every present field has validated, so nothing below
 	// leaves the row half-updated on a bad input. Each SetUser* is its own
 	// single-column statement (PATCH semantics); the four appearance columns go in
 	// ONE atomic conditional UPDATE (no read-merge-write, so two concurrent saves
 	// of different fields cannot clobber each other).
 
-	if modelPresent {
-		if _, err := h.q.SetUserDefaultModel(r.Context(), store.SetUserDefaultModelParams{
-			ID:           user.ID,
-			DefaultModel: modelVal,
-		}); err != nil {
-			slog.Error("set user default model", "error", err)
+	if ok {
+		if _, err := h.q.SetUserHarnessModels(r.Context(), groupParams); err != nil {
+			slog.Error("set user harness models", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return
 		}
@@ -510,17 +613,6 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 			MrReworkEnabled: mrVal,
 		}); err != nil {
 			slog.Error("set user mr rework enabled", "error", err)
-			httpx.Error(w, http.StatusInternalServerError, "internal error")
-			return
-		}
-	}
-
-	if harnessPresent {
-		if _, err := h.q.SetUserDefaultHarness(r.Context(), store.SetUserDefaultHarnessParams{
-			ID:             user.ID,
-			DefaultHarness: harnessVal,
-		}); err != nil {
-			slog.Error("set user default harness", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return
 		}
@@ -751,6 +843,201 @@ func validateHarness(raw *string) (pgtype.Text, error) {
 	default:
 		return pgtype.Text{}, fmt.Errorf("default_harness: must be one of %s, %s", workersvc.HarnessClaude, workersvc.HarnessCodex)
 	}
+}
+
+// curatedCodexModels is the closed Codex model vocabulary (PRD #1551 D3), a hand-kept
+// mirror of workersvc.codexModels and the web CLAUDE_MODEL_ALIASES sibling. Used ONLY by
+// the closed-list cross-vocabulary guard: a value in this set is rejected from the Claude
+// lane. Deliberately NOT a prefix check — no `gpt-` guessing.
+var curatedCodexModels = map[string]bool{
+	"gpt-6-astra": true,
+	"gpt-5.6-sol": true,
+	"gpt-6-sol":   true,
+}
+
+// knownClaudeAliases is the closed Claude alias set the web ModelSelect curates
+// (CLAUDE_MODEL_ALIASES: opus, sonnet, haiku, fable). Used ONLY by the cross-vocabulary
+// guard: one of these is rejected from the Codex lane. A full custom Claude id (e.g.
+// claude-opus-4-8) is NOT in this set and passes — the guard is a closed list, not a
+// `claude-` prefix check (D3).
+var knownClaudeAliases = map[string]bool{
+	"opus":   true,
+	"sonnet": true,
+	"haiku":  true,
+	"fable":  true,
+}
+
+// rejectCodexIDInClaudeLane fails when a validated model value is a curated Codex id sitting
+// in a Claude-vocabulary field (PRD #1551 D3). A NULL/blank (clear) value never trips it.
+func rejectCodexIDInClaudeLane(field string, v pgtype.Text) error {
+	if v.Valid && curatedCodexModels[v.String] {
+		return fmt.Errorf("%s: %q is a Codex model id and cannot be a Claude model default", field, v.String)
+	}
+	return nil
+}
+
+// rejectClaudeAliasInCodexLane fails when a validated model value is a known Claude alias
+// sitting in a Codex-vocabulary field (PRD #1551 D3). A NULL/blank (clear) value never trips
+// it, and a validated custom id passes.
+func rejectClaudeAliasInCodexLane(field string, v pgtype.Text) error {
+	if v.Valid && knownClaudeAliases[v.String] {
+		return fmt.Errorf("%s: %q is a Claude model alias and cannot be a Codex model default", field, v.String)
+	}
+	return nil
+}
+
+// errHarnessModelConflict is the 400 when a legacy default_model and its target lane's
+// explicit value are both present and disagree (PRD #1551 D3); nothing is written.
+var errHarnessModelConflict = errors.New("default_model conflicts with the explicit model lane for the target harness")
+
+// errHarnessModelCrossVocab is the 400 when a legacy default_model would land in a lane whose
+// closed vocabulary rejects it (PRD #1551 D3).
+var errHarnessModelCrossVocab = errors.New("default_model is not valid for the target harness lane")
+
+// settingsHarnessResolver is the narrow seam over h.wsvc the settings surface uses to resolve
+// the effective harness for the legacy default_model projection/write target (PRD #1551 D3).
+// *workersvc.Service satisfies it. Kept as an interface so the dependency is explicit and the
+// nil-service path (unit tests, pre-wiring) deterministically projects/writes Claude.
+type settingsHarnessResolver interface {
+	ResolveSettingsHarness(ctx context.Context, userID uuid.UUID) (workersvc.Harness, error)
+}
+
+var _ settingsHarnessResolver = (*workersvc.Service)(nil)
+
+// resolveSettingsHarness resolves the effective harness via the D11 resolver on h.wsvc. A nil
+// worker service (unit tests, or a Handler constructed before wsvc is wired) deterministically
+// resolves to Claude, matching D3's "credential availability never makes settings fail" and the
+// zero-credential projection. Only a genuine store error propagates (mapped to 500 by callers).
+func (h *Handler) resolveSettingsHarness(ctx context.Context, userID uuid.UUID) (workersvc.Harness, error) {
+	if h.wsvc == nil {
+		return workersvc.HarnessClaude, nil
+	}
+	return h.wsvc.ResolveSettingsHarness(ctx, userID)
+}
+
+// harnessModelInputs is the validated (phase-1) grouped-field state buildHarnessModels folds
+// into one SetUserHarnessModels statement.
+type harnessModelInputs struct {
+	modelPresent   bool
+	modelVal       pgtype.Text
+	claudePresent  bool
+	claudeVal      pgtype.Text
+	codexPresent   bool
+	codexVal       pgtype.Text
+	harnessPresent bool
+	harnessVal     pgtype.Text
+}
+
+// buildHarnessModels folds the grouped harness/model fields into ONE SetUserHarnessModels
+// statement (PRD #1551 M1 / D1, D3). It returns ok=false when no grouped field is present (no
+// write). Otherwise it:
+//   - resolves the TARGET harness: an explicit non-null default_harness wins with no credential
+//     check; an explicit null clears to Claude; an absent harness uses ResolveSettingsHarness
+//     (a usable stored default is honoured; zero credentials ⇒ Claude);
+//   - bridges a legacy-only default_model into the target lane, or — when that lane's explicit
+//     value is ALSO present — requires them equal (errHarnessModelConflict otherwise), and runs
+//     the closed-list cross-vocabulary guard against the target lane (errHarnessModelCrossVocab);
+//   - sets default_model to the EFFECTIVE (post-write) target-lane value (the new explicit value
+//     when supplied, else the stored lane) so the deprecated legacy column stays equal to the
+//     effective lane for an image-only rollback (D2).
+//
+// All reads/decisions happen before the single write, so a conflict/cross-vocab 400 writes
+// nothing. A store error (resolver or the stored-lane read) is returned raw for a 500.
+func (h *Handler) buildHarnessModels(ctx context.Context, userID uuid.UUID, in harnessModelInputs) (store.SetUserHarnessModelsParams, bool, error) {
+	if !in.modelPresent && !in.claudePresent && !in.codexPresent && !in.harnessPresent {
+		return store.SetUserHarnessModelsParams{}, false, nil
+	}
+
+	// Target harness for the legacy projection/write.
+	var target workersvc.Harness
+	switch {
+	case in.harnessPresent && in.harnessVal.Valid:
+		target = workersvc.Harness(in.harnessVal.String)
+	case in.harnessPresent && !in.harnessVal.Valid:
+		target = workersvc.HarnessClaude
+	default:
+		t, err := h.resolveSettingsHarness(ctx, userID)
+		if err != nil {
+			return store.SetUserHarnessModelsParams{}, false, err
+		}
+		target = t
+	}
+
+	// Local copies so a legacy bridge can promote a lane to "present" without mutating the
+	// caller's phase-1 state.
+	claudePresent, claudeVal := in.claudePresent, in.claudeVal
+	codexPresent, codexVal := in.codexPresent, in.codexVal
+
+	if in.modelPresent {
+		if target == workersvc.HarnessCodex {
+			if err := rejectClaudeAliasInCodexLane("default_model", in.modelVal); err != nil {
+				return store.SetUserHarnessModelsParams{}, false, fmt.Errorf("%w: %s", errHarnessModelCrossVocab, err)
+			}
+			if codexPresent {
+				if !textEqual(codexVal, in.modelVal) {
+					return store.SetUserHarnessModelsParams{}, false, errHarnessModelConflict
+				}
+			} else {
+				codexPresent, codexVal = true, in.modelVal
+			}
+		} else {
+			if err := rejectCodexIDInClaudeLane("default_model", in.modelVal); err != nil {
+				return store.SetUserHarnessModelsParams{}, false, fmt.Errorf("%w: %s", errHarnessModelCrossVocab, err)
+			}
+			if claudePresent {
+				if !textEqual(claudeVal, in.modelVal) {
+					return store.SetUserHarnessModelsParams{}, false, errHarnessModelConflict
+				}
+			} else {
+				claudePresent, claudeVal = true, in.modelVal
+			}
+		}
+	}
+
+	// The effective (post-write) target lane. When the target lane is not being written we
+	// need its stored value, so read the row once.
+	effClaude, effCodex := claudeVal, codexVal
+	needStored := (target == workersvc.HarnessCodex && !codexPresent) ||
+		(target == workersvc.HarnessClaude && !claudePresent)
+	if needStored {
+		cur, err := h.q.GetUserSettings(ctx, userID)
+		if err != nil {
+			return store.SetUserHarnessModelsParams{}, false, err
+		}
+		if !claudePresent {
+			effClaude = cur.DefaultClaudeModel
+		}
+		if !codexPresent {
+			effCodex = cur.DefaultCodexModel
+		}
+	}
+	legacyVal := effClaude
+	if target == workersvc.HarnessCodex {
+		legacyVal = effCodex
+	}
+
+	return store.SetUserHarnessModelsParams{
+		SetHarness:         in.harnessPresent,
+		DefaultHarness:     in.harnessVal,
+		SetClaude:          claudePresent,
+		DefaultClaudeModel: claudeVal,
+		SetCodex:           codexPresent,
+		DefaultCodexModel:  codexVal,
+		SetDefaultModel:    true,
+		DefaultModel:       legacyVal,
+		ID:                 userID,
+	}, true, nil
+}
+
+// textEqual reports whether two nullable text values are equal, NULL==NULL included.
+func textEqual(a, b pgtype.Text) bool {
+	if a.Valid != b.Valid {
+		return false
+	}
+	if !a.Valid {
+		return true
+	}
+	return a.String == b.String
 }
 
 // decodeAppearanceField decodes one tri-state appearance field (PRD #1167) into

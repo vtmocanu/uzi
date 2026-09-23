@@ -15,5 +15,7 @@
   "light_theme": "x",
   "dark_theme": "x",
   "typeface": "x",
-  "default_harness": "x"
+  "default_harness": "x",
+  "default_claude_model": "x",
+  "default_codex_model": "x"
 }

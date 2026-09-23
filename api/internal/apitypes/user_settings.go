@@ -5,6 +5,8 @@ package apitypes
 // decoding-tolerant mirror — the handler owning its own type is intentional; the
 // TUI only reads SidebarTokenIds today, the rest are carried for fidelity.
 type UserSettingsDTO struct {
+	// DefaultModel is DEPRECATED (PRD #1551 D2/D3): a legacy compatibility projection of the
+	// effective harness's lane, kept one release. New clients read the two lanes below.
 	DefaultModel *string `json:"default_model"`
 	// DefaultEffort is the CLI decode mirror of the per-user default reasoning
 	// effort (PRD #617). Fidelity only — carried so a decode never drops it; there
@@ -35,4 +37,8 @@ type UserSettingsDTO struct {
 	// M1 / D3); null = "no preference". Fidelity only — there is deliberately no CLI setter
 	// for the user default (D3), so this is carried so a decode never drops it.
 	DefaultHarness *string `json:"default_harness"`
+	// DefaultClaudeModel and DefaultCodexModel are the CLI decode mirrors of the retained
+	// per-harness worker-model lanes (PRD #1551 M1 / D2); each null = inherit. Fidelity only.
+	DefaultClaudeModel *string `json:"default_claude_model"`
+	DefaultCodexModel  *string `json:"default_codex_model"`
 }
