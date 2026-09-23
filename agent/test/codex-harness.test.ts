@@ -767,6 +767,36 @@ describe("CodexHarness: kind + thread configuration", () => {
     assert.equal(params.modelReasoningEffort, "high");
     assert.deepEqual(params.input, [{ type: "text", text: "do the thing" }]);
   });
+
+  // PRD #1551 (D4/D5): a validated custom worker-default root model reaches the turn/start +
+  // initialized event unchanged (render passes it through on modelSource:"worker_default"),
+  // never the provider fallback gpt-6-astra. Discriminating: the passthrough revert would make
+  // render drop it and the harness fall back to provider.model.
+  it("carries a custom worker-default root model to turn/start + initialized, not the provider fallback", async () => {
+    const { harness, transport } = makeHarness();
+    transport.push(threadStarted()).push(turnCompleted("completed")).end();
+    const events = await collect(
+      harness.startTurn(makeRequest({ model: "gpt-7-custom-preview", modelSource: "worker_default" })).events,
+    );
+    const start = transport.requests.find((r) => r.method === "turn/start");
+    assert.ok(start);
+    assert.equal(rec(start.params).model, "gpt-7-custom-preview", "turn/start carries the custom model");
+    const init = events.find((e) => e.kind === "initialized");
+    assert.ok(init && init.kind === "initialized");
+    if (init.kind === "initialized") assert.equal(init.model, "gpt-7-custom-preview", "initialized reports the custom model");
+  });
+
+  it("carries a custom worker-default root model through a RESUME turn too", async () => {
+    const { harness, transport } = makeHarness();
+    transport.push(threadStarted("resumed-1")).end();
+    const turn = harness.startTurn(
+      makeRequest({ model: "gpt-7-custom-preview", modelSource: "worker_default", resumeSessionId: "resumed-1" }),
+    );
+    await turn.events[Symbol.asyncIterator]().next();
+    const start = transport.requests.find((r) => r.method === "turn/start");
+    assert.ok(start, "turn/start was sent after resume");
+    assert.equal(rec(start.params).model, "gpt-7-custom-preview", "the resumed turn carries the custom model, not gpt-6-astra");
+  });
 });
 
 describe("CodexHarness: frame → neutral event decode", () => {

@@ -84,6 +84,8 @@ A new component, one per deployment, the only thing in uzi holding a kube-API cr
 
 **How `no Codex-capable worker is online` reads once one of these is off (or fails).** A worker advertises the `codex_harness_v1` capability — the one that lets it claim *any* Codex-indicating run — only when its installer receipt is intact, the uid split is active, and Landlock is either available or the sandbox mode is `best-effort`. A worker missing any of those never advertises it, so a Codex run simply stays queued with the api's existing reason, `no Codex-capable worker is online`, instead of being claimed and then failing at launch. Because `codex_harness_v1` gates every Codex-indicating run, this includes tool-less **Codex advice** (the judge and review-advice lane), not just a full implementing run: on a fleet with the uid split off, or on with Landlock unavailable under `required`, Codex advice queues right alongside ordinary Codex runs.
 
+**A second, narrower queued reason: `no worker supporting custom Codex models is online`.** This one is independent of the knobs above and fires only when a run's effective Codex model is a custom worker-root ID rather than a curated one ([PRD #1551](../prds/1551-per-harness-worker-model-defaults.md)). It needs a worker advertising the additional `codex_custom_model_v1` capability, which only ships with a newer worker image; an old `codex_harness_v1`-only worker cannot claim the run and never silently substitutes `gpt-6-astra`. See [Hosted workers](hosted-workers.md#my-codex-run-says-no-worker-supporting-custom-codex-models-is-online).
+
 ## Forge integration
 
 See [gitlab-bot-setup.md](gitlab-bot-setup.md) for the bot-account procedure these variables support.

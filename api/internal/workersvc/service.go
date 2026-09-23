@@ -902,7 +902,7 @@ type Store interface {
 	// Run-health detector (PRD #47): the per-tick active-run scan, the per-running-run
 	// tool window (loop + in-flight), the single health writer, and the queued-run
 	// worker-online count.
-	ListActiveRunsForHealth(ctx context.Context) ([]store.ListActiveRunsForHealthRow, error)
+	ListActiveRunsForHealth(ctx context.Context, codexCuratedModels []string) ([]store.ListActiveRunsForHealthRow, error)
 	ListRunToolWindow(ctx context.Context, arg store.ListRunToolWindowParams) ([]store.ListRunToolWindowRow, error)
 	SetRunHealth(ctx context.Context, arg store.SetRunHealthParams) (int64, error)
 	CountOnlineWorkersForUser(ctx context.Context, userID uuid.UUID) (int64, error)
@@ -927,6 +927,12 @@ type Store interface {
 	// above, and off the hot path for the same reason — it runs only for a Codex-indicating queued
 	// run already past its health threshold.
 	CountOnlineWorkersSatisfyingCodexHarness(ctx context.Context, userID uuid.UUID) (int64, error)
+	// CountOnlineWorkersSatisfyingCustomCodex backs PRD #1551 M4's (D6) queued-reason rung: a
+	// CUSTOM-Codex-root queued run whose owner has NO online worker advertising BOTH
+	// 'codex_harness_v1' AND 'codex_custom_model_v1' gets reasonNoCustomCodexCapableWorker — the
+	// run's non-bypassable custom-model claim clause can never be satisfied. A per-run lookup like
+	// CountOnlineWorkersSatisfyingCodexHarness above, and off the hot path for the same reason.
+	CountOnlineWorkersSatisfyingCustomCodex(ctx context.Context, userID uuid.UUID) (int64, error)
 	// CountOnlineEligibleWorkersForRepo backs PRD #361's queued Docker-allowlist reason:
 	// how many of the caller's online workers fn_worker_can_claim accepts for this repo/kind,
 	// ignoring availability (free slots AND draining). Since issue #512 M2 it is capability-
@@ -1122,7 +1128,10 @@ type Store interface {
 	// at judge-claim time, written by PUT /api/me/judge in one statement (D6).
 	GetUserJudgeAnthropicBinding(ctx context.Context, id uuid.UUID) (store.GetUserJudgeAnthropicBindingRow, error)
 	SetUserJudgeAnthropicBinding(ctx context.Context, arg store.SetUserJudgeAnthropicBindingParams) (store.User, error)
-	GetUserDefaultModel(ctx context.Context, id uuid.UUID) (pgtype.Text, error)
+	// Per-harness worker-model lanes (PRD #1551 M4, D4): read at issue- and chat-run
+	// claim assembly, keyed on the run owner. The lane matching the already-frozen run
+	// harness replaces the legacy shared default_model; each lane NULL ⇒ inherit.
+	GetUserHarnessModelDefaults(ctx context.Context, id uuid.UUID) (store.GetUserHarnessModelDefaultsRow, error)
 	// Per-user default reasoning effort (PRD #617): read at issue- and chat-run
 	// claim assembly, keyed on the run owner. NULL ⇒ inherit, resolved to the uzi
 	// default `xhigh` at claim assembly (issue #1157).
@@ -2360,6 +2369,11 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker, snapshot *ActiveS
 		SnapshotFreshCutoff: pgconv.Time(s.now().Add(-(s.p.WorkerHeartbeatStale + s.p.WorkerHeartbeatInterval))),
 		RequestActiveIds:    reqIDs,
 		RequestActiveGens:   reqGens,
+		// PRD #1551 M4 (D6): the curated Codex model vocabulary, feeding ClaimRun's non-bypassable
+		// custom-Codex-model clause. Its effective-root CASE treats a run.model that IS a curated id
+		// as the shipped root (curated ⇒ no new requirement) and otherwise the owner's Codex lane; a
+		// custom (non-curated) effective root then requires codex_custom_model_v1. Sorted server-side.
+		CodexCuratedModels: codexCuratedModelsSlice(),
 	}
 
 	// No request snapshot (an old worker) or no tx beginner wired (fake-store unit tests): keep
@@ -2519,6 +2533,19 @@ func (s *Service) recoverClaimAssembly(ctx context.Context, run store.Run, err e
 			return rerr
 		}
 		return nil // idle; the run is held in pool_wait, awaiting a pooled token
+	case errors.Is(err, errCustomModelCapabilityMissing):
+		// PRD #1551 M4 (D6): assembly found this Codex run's effective root is a CUSTOM model but
+		// the claiming worker lacks codex_custom_model_v1 (the owner's lane flipped custom in the
+		// window between the claim's SQL gate and assembly). REQUEUE — never fail, never run Astra:
+		// keep worker_id for resume affinity and do NOT bump requeue_count (mirroring the
+		// vault-locked path). ClaimRun's custom-model clause excludes this incapable worker,
+		// while affinity holds capable peers until the worker row disappears or the configured
+		// ceiling expires. Clearing worker_id here would allow a cold peer to bypass the PVC
+		// holding a resumed run's unpublished work. This bounded wait is the approved M4 tradeoff.
+		if _, rerr := s.q.RequeueClaimedRunToQueued(ctx, run.ID); rerr != nil {
+			return rerr
+		}
+		return nil // idle; the run is queued again, awaiting a custom-Codex-capable worker
 	case errors.Is(err, errCredentialUnavailable) || errors.Is(err, errToolPackagesRejected) || errors.Is(err, errGuardrailBlockedClaim):
 		// A guardrail block at claim (D1 layer 3) is TERMINAL — fail-closed even on a
 		// forge blip (R4; the user restarts after fixing protection), matching
@@ -2561,6 +2588,14 @@ var errCredentialUnavailable = errors.New("credential unavailable")
 // errRunVanished marks a claim whose run disappeared before its payload could be
 // assembled (a cascading delete of the forge connection).
 var errRunVanished = errors.New("run vanished before claim assembly")
+
+// errCustomModelCapabilityMissing marks a Codex claim whose effective worker-root model is a
+// CUSTOM (non-curated) id that the claiming worker cannot run — it does not advertise
+// codex_custom_model_v1 (PRD #1551 M4, D6). recoverClaimAssembly treats it as a TRANSIENT
+// requeue (like errVaultLocked, NOT the terminal errCredentialUnavailable): the run returns to
+// queued for a capable worker rather than failing or silently running Astra. Its message carries
+// no secret bytes.
+var errCustomModelCapabilityMissing = errors.New("worker lacks codex_custom_model_v1 for a custom Codex root model")
 
 // errGuardrailBlockedClaim marks a claim the #66 default-branch guardrail refused
 // AT CLAIM (D1 layer 3, the security net): the bot can reach the repo's default

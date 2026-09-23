@@ -164,6 +164,28 @@ func MigrateTo(ctx context.Context, dsn string, version int64) error {
 	return nil
 }
 
+// MigrateDownTo rolls the embedded goose migrations DOWN to version, the sibling of
+// MigrateTo (version is the numeric filename prefix with leading zeros stripped). It
+// runs each intervening migration's Down block in reverse order, stopping once the
+// database is at version.
+//
+// It exists so a test can apply a migration's Up, then its Down, and observe what the
+// Down block actually did — the rollback-projection blind spot a data migration shares
+// with its backfill (issue #187, PRD #1551 M1). ONLY tests call it; production rolls
+// forward via Migrate.
+func MigrateDownTo(ctx context.Context, dsn string, version int64) error {
+	db, err := openForMigrate(ctx, dsn)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = db.Close() }()
+
+	if err := goose.DownToContext(ctx, db, "migrations", version); err != nil {
+		return fmt.Errorf("run migrations down to %d: %w", version, err)
+	}
+	return nil
+}
+
 // openForMigrate opens the sql.DB at dsn, waits for it to become reachable, and
 // prepares goose (base FS + dialect). The caller owns the returned db and must
 // Close it.

@@ -117,6 +117,22 @@ describe("buildCodexProductionConfigToml: fixed managed-auth provider", () => {
     });
   }
 
+  it("renders a hostile-but-valid custom model id as ONE escaped TOML string, injecting no key (PRD #1551)", () => {
+    // A custom worker-root id the API validator allows can still contain TOML-significant
+    // characters (`"`, `\`, `=`). toml()=JSON.stringify must escape them into a single
+    // quoted string so the value cannot terminate the string and add its own key/line.
+    const model = 'gpt-6"astra\\x=evil';
+    const toml = buildCodexProductionConfigToml({
+      model,
+      projectPath: "/work/repo",
+      authMode: "api_key",
+    });
+    assert.match(toml, /^model = "gpt-6\\"astra\\\\x=evil"$/m);
+    const modelLines = toml.split("\n").filter((l) => l.startsWith("model = "));
+    assert.equal(modelLines.length, 1, "the custom id produces exactly one model line");
+    assert.doesNotMatch(toml, /^evil = /m, "the id cannot break out and add a key");
+  });
+
   it("keeps the code-mode host DISABLED by default (no codeModeHost opt)", () => {
     const toml = buildCodexProductionConfigToml({
       model: "gpt-6-astra",

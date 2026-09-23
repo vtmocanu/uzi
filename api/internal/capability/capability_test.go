@@ -173,6 +173,30 @@ func TestFilterProtocol_KeepsCodexHarnessV1(t *testing.T) {
 	}
 }
 
+// TestFilterProtocol_KeepsCodexCustomModelV1 pins PRD #1551 M4 (D6): the custom-Codex-model
+// protocol capability is a member of the protocol vocabulary (so a worker's self-reported
+// codex_custom_model_v1 survives registration and reaches workers.protocol_capabilities, where the
+// fail-closed custom-model claim gate reads it), and is NOT a scheduler capability (so it never
+// leaks into Vocabulary() or the web picker). This is the DB-free half of the vocabulary-removal
+// calibration: removing CodexCustomModelV1 from protocolVocabulary makes FilterProtocol DROP it
+// here (and the capable-worker custom-model claim LiveDB test then fails because Register stores
+// nothing).
+func TestFilterProtocol_KeepsCodexCustomModelV1(t *testing.T) {
+	if got := FilterProtocol([]string{CodexCustomModelV1}); !reflect.DeepEqual(got, []string{CodexCustomModelV1}) {
+		t.Errorf("FilterProtocol(%q) = %v, want it KEPT (missing from the protocol vocabulary?)", CodexCustomModelV1, got)
+	}
+	if got := Filter([]string{CodexCustomModelV1}); len(got) != 0 {
+		t.Errorf("Filter(%q) = %v, want empty (a protocol cap must not be a scheduler cap)", CodexCustomModelV1, got)
+	}
+	if got := SelfReportable([]string{CodexCustomModelV1}); len(got) != 0 {
+		t.Errorf("SelfReportable(%q) = %v, want empty (codex_custom_model_v1 is not a scheduler self-report)", CodexCustomModelV1, got)
+	}
+	// It survives alongside codex_harness_v1 in stable protocolOrder (a real worker advertises both).
+	if got := FilterProtocol([]string{CodexCustomModelV1, CodexHarnessV1}); !reflect.DeepEqual(got, []string{CodexHarnessV1, CodexCustomModelV1}) {
+		t.Errorf("FilterProtocol([custom, harness]) = %v, want [%q %q] in protocolOrder", got, CodexHarnessV1, CodexCustomModelV1)
+	}
+}
+
 // TestUnmet_SubsetPresent pins the empty result when every required capability is present
 // in the effective set — the run is approvable/claimable by that worker (PRD #84 M4 4c).
 func TestUnmet_SubsetPresent(t *testing.T) {

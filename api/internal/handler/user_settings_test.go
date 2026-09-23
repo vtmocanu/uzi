@@ -19,18 +19,19 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// fakeSettingsDB is a store.DBTX holding one user's default_model, default_effort,
-// judge_model, summary_model, theme, and sidebar token set, so the
+// fakeSettingsDB is a store.DBTX holding one user's default_model, per-harness model
+// lanes, default_effort, judge_model, summary_model, theme, and sidebar token set, so the
 // GetMySettings/PutMySettings handlers run end to end (decode -> validate -> store
 // -> respond) without a real database. The
-// SetUserDefaultModel/SetUserDefaultEffort/SetUserJudgeModel/SetUserSummaryModel/SetUserTheme
-// UPDATEs QueryRow a single Text RETURNING column (discarded by the handler) and
-// SetUserSidebarTokens a uuid[] one; GetUserSettings QueryRows thirteen (default_model,
+// SetUserDefaultEffort/SetUserJudgeModel/SetUserSummaryModel/SetUserTheme UPDATEs QueryRow a
+// single Text RETURNING column (discarded by the handler) and SetUserSidebarTokens a uuid[]
+// one; SetUserHarnessModels (PRD #1551 M1) PATCHes the harness, both lanes and the legacy
+// default_model in one conditional UPDATE; GetUserSettings QueryRows fifteen (default_model,
 // default_effort, judge_model, summary_model, theme, sidebar_token_ids,
 // mr_rework_enabled, appearance_mode, light_theme, dark_theme, typeface — the four
 // appearance columns joined the read in PRD #1167 M1 — default_harness, which joined
-// in PRD #1429 M1, and sidebar_codex_account_ids, which joined in PRD #1209 M1) —
-// summary_model rides that
+// in PRD #1429 M1, sidebar_codex_account_ids, which joined in PRD #1209 M1, and the two
+// per-harness lanes, which joined in PRD #1551 M1) — summary_model rides that
 // one-row read, so the settings handler makes no separate GetUserSummaryModel call.
 // The UPDATE paths record the written value so the round-trip is observable.
 type fakeSettingsDB struct {
@@ -47,6 +48,8 @@ type fakeSettingsDB struct {
 	darkTheme       pgtype.Text
 	typeface        pgtype.Text
 	defaultHarness  pgtype.Text
+	claudeModel     pgtype.Text
+	codexModel      pgtype.Text
 	// prunedCodexIDs is PruneUserSidebarCodexAccounts's RETURNING (the pruned set the GET
 	// path threads into the response); pruneCodexErr, when set, makes that prune UPDATE
 	// fail so a test can exercise GetMySettings's best-effort fallback (PRD #1209 M1).
@@ -75,9 +78,31 @@ func (f *fakeSettingsDB) QueryRow(_ context.Context, sql string, args ...any) pg
 			return codexIDsRow{err: f.pruneCodexErr}
 		}
 		return codexIDsRow{ids: f.prunedCodexIDs}
-	case strings.Contains(sql, "UPDATE users SET default_model") && len(args) >= 1:
-		if m, ok := args[0].(pgtype.Text); ok {
-			f.model = m // SetUserDefaultModel: $1 = default_model
+	case strings.Contains(sql, "SET default_harness = CASE") && len(args) >= 9:
+		// SetUserHarnessModels PATCHes the harness, both lanes and the legacy default_model
+		// in ONE conditional UPDATE (PRD #1551 M1 / D1): $1=set_harness(bool),
+		// $2=default_harness, $3=set_claude, $4=default_claude_model, $5=set_codex,
+		// $6=default_codex_model, $7=set_default_model, $8=default_model, $9=id. A field is
+		// written only when its set flag is true, mirroring the SQL CASE.
+		if set, _ := args[0].(bool); set {
+			if v, ok := args[1].(pgtype.Text); ok {
+				f.defaultHarness = v
+			}
+		}
+		if set, _ := args[2].(bool); set {
+			if v, ok := args[3].(pgtype.Text); ok {
+				f.claudeModel = v
+			}
+		}
+		if set, _ := args[4].(bool); set {
+			if v, ok := args[5].(pgtype.Text); ok {
+				f.codexModel = v
+			}
+		}
+		if set, _ := args[6].(bool); set {
+			if v, ok := args[7].(pgtype.Text); ok {
+				f.model = v
+			}
 		}
 	case strings.Contains(sql, "UPDATE users SET default_effort") && len(args) >= 1:
 		if e, ok := args[0].(pgtype.Text); ok {
@@ -110,10 +135,6 @@ func (f *fakeSettingsDB) QueryRow(_ context.Context, sql string, args ...any) pg
 		// alias knowledge to prune with, and the handler discards Prune's result anyway.
 		if ids, ok := args[0].([]uuid.UUID); ok {
 			f.sidebarCodexIDs = ids
-		}
-	case strings.Contains(sql, "UPDATE users SET default_harness") && len(args) >= 1:
-		if h, ok := args[0].(pgtype.Text); ok {
-			f.defaultHarness = h // SetUserDefaultHarness: $1 = default_harness (PRD #1429 M1)
 		}
 	case strings.Contains(sql, "SET appearance_mode") && len(args) >= 8:
 		// SetUserAppearance PATCHes the four columns in one conditional UPDATE
@@ -156,6 +177,8 @@ func (f *fakeSettingsDB) QueryRow(_ context.Context, sql string, args ...any) pg
 		darkTheme:       f.darkTheme,
 		typeface:        f.typeface,
 		defaultHarness:  f.defaultHarness,
+		claudeModel:     f.claudeModel,
+		codexModel:      f.codexModel,
 	}
 }
 
@@ -173,6 +196,8 @@ type fakeSettingsRow struct {
 	darkTheme       pgtype.Text
 	typeface        pgtype.Text
 	defaultHarness  pgtype.Text
+	claudeModel     pgtype.Text
+	codexModel      pgtype.Text
 }
 
 func (r fakeSettingsRow) Scan(dest ...any) error {
@@ -202,13 +227,14 @@ func (r fakeSettingsRow) Scan(dest ...any) error {
 		if p, ok := dest[3].(*pgtype.Text); ok {
 			*p = r.typeface
 		}
-	case 13:
+	case 15:
 		// GetUserSettings: SELECT default_model, default_effort, judge_model,
 		// summary_model, theme, sidebar_token_ids, mr_rework_enabled,
 		// appearance_mode, light_theme, dark_theme, typeface, default_harness,
-		// sidebar_codex_account_ids (the four before default_harness are PRD #1167 M1's
-		// appearance columns; default_harness rides the read as of PRD #1429 M1; the
-		// trailing sidebar_codex_account_ids joined in PRD #1209 M1).
+		// sidebar_codex_account_ids, default_claude_model, default_codex_model (the four
+		// before default_harness are PRD #1167 M1's appearance columns; default_harness
+		// rides the read as of PRD #1429 M1; sidebar_codex_account_ids joined in PRD #1209
+		// M1; the two trailing lanes joined in PRD #1551 M1).
 		if p, ok := dest[0].(*pgtype.Text); ok {
 			*p = r.model
 		}
@@ -247,6 +273,12 @@ func (r fakeSettingsRow) Scan(dest ...any) error {
 		}
 		if p, ok := dest[12].(*[]uuid.UUID); ok {
 			*p = r.sidebarCodexIDs
+		}
+		if p, ok := dest[13].(*pgtype.Text); ok {
+			*p = r.claudeModel
+		}
+		if p, ok := dest[14].(*pgtype.Text); ok {
+			*p = r.codexModel
 		}
 	}
 	return nil
@@ -310,7 +342,7 @@ func TestUserSettingsRequireAuth(t *testing.T) {
 }
 
 func TestGetMySettingsReturnsStoredModel(t *testing.T) {
-	h := &Handler{q: store.New(&fakeSettingsDB{model: pgtype.Text{String: "sonnet", Valid: true}})}
+	h := &Handler{q: store.New(&fakeSettingsDB{model: pgtype.Text{String: "sonnet", Valid: true}, claudeModel: pgtype.Text{String: "sonnet", Valid: true}})}
 	rec := httptest.NewRecorder()
 	h.GetMySettings(rec, authed(httptest.NewRequest(http.MethodGet, "/api/me/settings", nil)))
 
@@ -534,7 +566,7 @@ func TestPutMySettingsRejectsInvalidJudgeModel(t *testing.T) {
 // A judge-model-only PUT must not clobber the stored default_model: the two model
 // controls save independently over the one endpoint (PATCH-like semantics).
 func TestPutMySettingsJudgeModelOnlyLeavesDefaultModelUntouched(t *testing.T) {
-	db := &fakeSettingsDB{model: pgtype.Text{String: "sonnet", Valid: true}}
+	db := &fakeSettingsDB{model: pgtype.Text{String: "sonnet", Valid: true}, claudeModel: pgtype.Text{String: "sonnet", Valid: true}}
 	h := &Handler{q: store.New(db)}
 	rec := httptest.NewRecorder()
 	req := authed(httptest.NewRequest(http.MethodPut, "/api/me/settings", bytes.NewReader([]byte(`{"judge_model":"opus"}`))))
@@ -740,7 +772,7 @@ func TestPutMySettingsRejectsUnknownTheme(t *testing.T) {
 // "leave unchanged" (PATCH-like), which is what lets the two Settings controls
 // save independently over the one endpoint.
 func TestPutMySettingsThemeOnlyLeavesModelUntouched(t *testing.T) {
-	db := &fakeSettingsDB{model: pgtype.Text{String: "opus", Valid: true}}
+	db := &fakeSettingsDB{model: pgtype.Text{String: "opus", Valid: true}, claudeModel: pgtype.Text{String: "opus", Valid: true}}
 	h := &Handler{q: store.New(db)}
 	rec := httptest.NewRecorder()
 	req := authed(httptest.NewRequest(http.MethodPut, "/api/me/settings", bytes.NewReader([]byte(`{"theme":"mission"}`))))

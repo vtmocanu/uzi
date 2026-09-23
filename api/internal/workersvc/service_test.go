@@ -130,9 +130,13 @@ type fakeStore struct {
 	anthropicSealedWith string
 	// onClaimRun, if set, runs inside ClaimRun — used to simulate the vault locking
 	// between the claim gate and the token open (the M3 lock race).
-	onClaimRun      func()
-	defaultModel    pgtype.Text
-	defaultModelErr error
+	onClaimRun func()
+	// defaultModel feeds the Claude lane of GetUserHarnessModelDefaults (fake runs resolve to
+	// Claude); defaultCodexModel feeds the Codex lane; defaultModelErr forces the lane lookup to
+	// fail for the error-path test (PRD #1551 M4 replaced GetUserDefaultModel with the lane read).
+	defaultModel      pgtype.Text
+	defaultCodexModel pgtype.Text
+	defaultModelErr   error
 	// defaultEffort is the run owner's per-user default reasoning effort (PRD #617);
 	// defaultEffortErr forces the lookup to fail for the error-path test.
 	defaultEffort    pgtype.Text
@@ -925,8 +929,11 @@ func (f *fakeStore) SetRunCheckpointTip(_ context.Context, arg store.SetRunCheck
 	}
 	return 1, nil
 }
-func (f *fakeStore) GetUserDefaultModel(context.Context, uuid.UUID) (pgtype.Text, error) {
-	return f.defaultModel, f.defaultModelErr
+func (f *fakeStore) GetUserHarnessModelDefaults(context.Context, uuid.UUID) (store.GetUserHarnessModelDefaultsRow, error) {
+	return store.GetUserHarnessModelDefaultsRow{
+		DefaultClaudeModel: f.defaultModel,
+		DefaultCodexModel:  f.defaultCodexModel,
+	}, f.defaultModelErr
 }
 func (f *fakeStore) GetUserDefaultEffort(context.Context, uuid.UUID) (pgtype.Text, error) {
 	return f.defaultEffort, f.defaultEffortErr
@@ -2045,7 +2052,7 @@ func TestClaimOmitsDefaultModelWhenOwnerHasNone(t *testing.T) {
 
 // scheduleModelStore builds a fakeStore whose claim will succeed, parameterised on
 // the frozen per-run model (runs.model, set by a schedule at fire time — PRD #300)
-// and the owner's per-user Worker default (GetUserDefaultModel). Both are pgtype.Text
+// and the owner's per-user Worker default lane (GetUserHarnessModelDefaults). Both are pgtype.Text
 // so a zero value models NULL/inherit.
 func scheduleModelStore(t *testing.T, runModel, userDefault pgtype.Text) *fakeStore {
 	t.Helper()
@@ -2335,10 +2342,11 @@ func TestClaimFailsOnDefaultModelLookupError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected Claim to fail when the default-model lookup errors")
 	}
-	// The service wraps it as "default model lookup: %w" and propagates (not a
+	// The service wraps it as "harness model defaults lookup: %w" (PRD #1551 M4 replaced the
+	// legacy default_model read with the per-harness lane read) and propagates (not a
 	// credential failure, so the run is not marked failed).
-	if !strings.Contains(err.Error(), "default model lookup") {
-		t.Fatalf("error should be wrapped as a default-model lookup failure, got: %v", err)
+	if !strings.Contains(err.Error(), "harness model defaults lookup") {
+		t.Fatalf("error should be wrapped as a harness-model-defaults lookup failure, got: %v", err)
 	}
 	if !strings.Contains(err.Error(), "db down") {
 		t.Fatalf("error should wrap the underlying cause, got: %v", err)

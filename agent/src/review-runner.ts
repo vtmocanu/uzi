@@ -27,6 +27,7 @@ import { extractJsonObject } from "./judge-runner.js";
 import { selectCodexBinding } from "./codex/select.js"; // PRD #1429 M3: the pure, fail-closed claim-shape discriminator — NOT a Codex class construction
 import type { CodexBinding } from "./codex/select.js";
 import type { CodexAdviceHarnessFactory } from "./codex/codex-executor.js"; // type-only — the injected seam, never constructed here
+import { CODEX_TASK_REVIEW_MODEL } from "./codex/task-review-model.js"; // PRD #1551 M2: leaf value import (no runtime dep on the heavy codex-executor)
 import { errMessage } from "./util.js";
 import type { ClaimResponse, TaskReviewFinding, TaskReviewRequest } from "./protocol.js";
 
@@ -319,6 +320,11 @@ export class ReviewRunner {
       const text = await runReadOnlyModelPass({
         systemPrompt: REVIEW_SYSTEM_PROMPT,
         prompt,
+        // PRD #1551 (M2, D5): Codex task review runs on the built-in review model, NOT the
+        // claim's default_model (which assembly does not even read for a review run). It is
+        // selected here in the advice request's `model`, flows to AdviceRequest.model, and is
+        // a curated contract model the advice renderer accepts.
+        model: CODEX_TASK_REVIEW_MODEL,
         homeRoot: this.homeRoot,
         homePrefix: "uzi-review-",
         label: "review",

@@ -6,10 +6,14 @@ audience: user
 
 # Reasoning effort
 
-Pick how hard the Claude Agent SDK reasons on your own runs — the lead
-orchestrator and the subagents that inherit it. This sets your own
-reasoning effort, overriding uzi's default just for you. Other users' runs
-are unaffected.
+Pick how hard the model reasons on your own runs: the lead orchestrator
+and the subagents that inherit it. This sets your own reasoning effort,
+overriding uzi's default just for you. Other users' runs are unaffected.
+
+**One setting, shared across harnesses.** Unlike [your worker
+model](./worker-model.md), which is a separate choice per harness, your
+reasoning effort is a single value that applies whichever harness (Claude
+or Codex) a run uses.
 
 ## Effort levels
 
@@ -28,12 +32,20 @@ unset.)
 
 ## Good to know
 
-- **Per-model silent downgrade.** `xhigh` and `max` are only honored on
-  models that support them. If the model your run uses doesn't support the
-  level you picked, the SDK **silently downgrades** it to that model's own
-  highest supported level. uzi stores your choice verbatim and does not
-  second-guess it — you may pick `max` and a given model quietly runs at
-  its own highest supported effort instead.
+- **Per-model silent downgrade (Claude).** `xhigh` and `max` are only
+  honored on Claude models that support them. If the Claude model your run
+  uses doesn't support the level you picked, the SDK **silently
+  downgrades** it to that model's own highest supported level. uzi stores
+  your choice verbatim and does not second-guess it. You may pick `max`
+  and a given model quietly runs at its own highest supported effort
+  instead.
+- **Provider rejection (Codex).** Codex maps your chosen level directly to
+  its own reasoning-effort parameter; there's no uzi-side downgrade path.
+  A model, including a custom worker-root ID (see [worker
+  model](./worker-model.md#custom-codex-model)), may reject a particular
+  level. An unsupported level/model pair is rejected by the provider at
+  run time, surfaced in that run's messages like any other agent error,
+  not silently downgraded.
 - **Cost and latency tradeoff.** Lower levels (`low`/`medium`) are cheaper
   and faster; higher levels (`xhigh`/`max`) reason more deeply at higher
   cost.

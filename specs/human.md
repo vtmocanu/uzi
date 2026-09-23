@@ -173,10 +173,12 @@ Tracked as GitLab issue vtmocanu/uzi#17; PRD at `prds/done/17-lead-template-and-
 
 - Ship `lead` as a builtin agent template with a real orchestrator prompt, on model `opus`; editable and resettable in the UI like the other builtins.
 - Builtin templates are the single source of truth; `.claude/agents/` is the dev team's own roster only. Decouples the former 1:1 mirror. [user, 2026-07-05, supersedes the earlier "both dirs" choice]
-- Per-user default worker model: each user can pick the model for their own runs (Settings), stored per user.
-- Model choices offered as curated aliases plus a custom free-text escape hatch for any model ID.
-- Precedence: a user's default model wins over the lead template's model (unset = inherit the lead template's model, opus by default).
+- Per-user worker-model defaults are retained separately for Claude and Codex and saved together with the default harness in Settings. (AI-synced 2026-09-23)
+- Both worker-model defaults offer curated models plus a custom model ID; Codex custom IDs apply only to the worker root, not schedule or role pins. (AI-synced 2026-09-23)
+- Precedence: the user's default for the run's selected harness wins over the lead template's model (unset = inherit the lead template's model, opus by default). (AI-synced 2026-09-23)
 - Sequence this PRD before PRD #16 so #16 inherits the decoupled-builtins convention.
+- Switching the default harness never clears either saved worker-model choice. [PRD #1551] (AI-synced 2026-09-23)
+- Task review uses its own built-in model (Codex: `gpt-6-sol`) independent of these saved defaults; there is no setting to choose the task-review model in this release. [PRD #1551] (AI-synced 2026-09-23)
 
 ## Feature #18 — Worker templates, per-repo tools & agent scopes
 

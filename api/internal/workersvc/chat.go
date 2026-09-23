@@ -222,10 +222,14 @@ func (s *Service) assembleChatClaim(ctx context.Context, run store.Run) (*ChatCl
 	}
 	anthropic := cred.Token
 
-	defaultModel, err := s.q.GetUserDefaultModel(ctx, run.UserID)
+	// PRD #1551 M4 (D4): Chat is the literal-Claude exception and always reads the CLAUDE lane
+	// (this PRD does not enable Codex Chat; assembleChatClaim refuses a Codex-indicating run
+	// above). The Codex lane is never consulted here. NULL ⇒ nil ⇒ the worker's Claude default.
+	lanes, err := s.q.GetUserHarnessModelDefaults(ctx, run.UserID)
 	if err != nil {
-		return nil, fmt.Errorf("default model lookup: %w", err)
+		return nil, fmt.Errorf("harness model defaults lookup: %w", err)
 	}
+	defaultModel := lanes.DefaultClaudeModel
 
 	defaultEffort, err := s.q.GetUserDefaultEffort(ctx, run.UserID)
 	if err != nil {

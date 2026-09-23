@@ -360,7 +360,7 @@ func TestRunPauseQueriesLiveDB(t *testing.T) {
 		// ListActiveRunsForHealth: a running run is listed; the paused one is not.
 		pausedHealth := insertRun(t, "paused", "issue", false, true, false, 0, "", 0)
 		controlHealth := insertRun(t, "running", "issue", false, true, false, 0, "", 0)
-		rows, err := q.ListActiveRunsForHealth(ctx)
+		rows, err := q.ListActiveRunsForHealth(ctx, nil)
 		if err != nil {
 			t.Fatalf("ListActiveRunsForHealth: %v", err)
 		}

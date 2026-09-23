@@ -468,6 +468,35 @@ describe("JudgeRunner", () => {
     assert.equal(calls.review?.review.verdict, "ok");
   });
 
+  // PRD #1551 (M2, D5): the Codex JUDGE path is unchanged — it still passes only the claim's
+  // (trimmed) judge_model. With judge_model UNSET the advice request carries an empty model,
+  // which renderCodexAdvice drops and codex-advice-harness resolves to the provider default
+  // (gpt-6-astra) via `rendered.model ?? provider.model`. The judge NEVER adopts the review
+  // model or a worker default. Discriminating: were the judge to inject gpt-6-sol/a lane model,
+  // req.model would not be empty.
+  it("a Codex judge with judge_model unset passes an empty model (→ provider gpt-6-astra fallback) (PRD #1551)", async () => {
+    const { client } = fakeClient(emptyTrace);
+    let reqModel: string | undefined = "UNSET";
+    const codexModelJson = JSON.stringify({ verdict: "ok", summary: "codex advice", recommendations: [] });
+    const fakeHarness = {
+      kind: "codex" as const,
+      run: async (req: { model?: string }) => {
+        reqModel = req.model;
+        return { text: codexModelJson, end: { kind: "terminal", terminal: { outcome: "success" } } };
+      },
+    };
+    const codexAdviceHarnessFactory = (async () => fakeHarness) as never;
+    const runner = new JudgeRunner(client, nullLogger(), {
+      queryFn: (() => (async function* () {})()) as unknown as SdkQueryFn,
+      codexAdviceHarnessFactory,
+    });
+    const codexSecrets = { auth_mode: "api_key", access_token: "codex-tok", capability: "cap-1" };
+    await runner.execute(
+      judgeClaim({ judge_model: undefined, secrets: { forge_pat: "", codex: codexSecrets } as never }),
+    );
+    assert.equal(reqModel, "", "an unset judge_model reaches the advice request as an empty model, not gpt-6-sol or a lane model");
+  });
+
   // PRD #1429 M3: the control — an ordinary Claude claim (no codex block) must never touch
   // the injected Codex advice-harness factory, even when one is wired.
   it("a Claude judge claim never touches the injected Codex advice-harness factory", async () => {

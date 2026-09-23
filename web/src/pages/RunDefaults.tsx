@@ -11,8 +11,8 @@ import { api, type UserSettingsPatch } from "../lib/api";
 import type { BindMode } from "../lib/apiTypes";
 import { errorMessage } from "../lib/apiError";
 import { useAsyncData } from "../lib/useAsyncData";
-import { Alert, Button, Card, Field, SectionTitle, Select, Skeleton } from "../components/ui";
-import { ModelSelect, modelCompatibleWithHarness } from "../components/ModelSelect";
+import { Alert, Badge, Button, Card, Field, SectionTitle, Select, Skeleton } from "../components/ui";
+import { ModelSelect } from "../components/ModelSelect";
 import { EffortSelect } from "../components/EffortSelect";
 import { HarnessPicker } from "../components/HarnessPicker";
 import { modelFieldWarning } from "../lib/agentTemplates";
@@ -197,21 +197,30 @@ export function RunDefaults() {
     }
   };
 
-  // Worker model: "" = inherit. savedModel is the persisted value, so Save is
-  // only offered when the picker differs from what is stored.
-  const [defaultModel, setDefaultModel] = useState("");
-  const [savedModel, setSavedModel] = useState("");
-  const [modelBusy, setModelBusy] = useState(false);
+  // PRD #1551 M3: the grouped Harness-and-worker-models card. The default harness and
+  // the two retained per-harness model lanes are ONE user decision saved in one PUT
+  // (D1). Each of the three carries its own saved snapshot so their dirty state is
+  // independent — changing the harness never touches either model (D-log 2026-09-22),
+  // and a lane the user has not edited is not re-sent as a no-op.
+  //
+  // Model lanes: "" = inherit. The Claude lane keeps today's curated-plus-custom
+  // vocabulary; the Codex lane keeps its curated set and now also allows a custom id
+  // (D5, only here).
+  const [claudeModel, setClaudeModel] = useState("");
+  const [savedClaudeModel, setSavedClaudeModel] = useState("");
+  const [codexModel, setCodexModel] = useState("");
+  const [savedCodexModel, setSavedCodexModel] = useState("");
 
-  // PRD #1429 M4a, D3/D6: the per-user default harness. "inherit" (no preference) is
-  // the default; a value pins new implicit run creation to that harness (D11's second
-  // rung). Its own saved/busy pair, independent of the model above.
+  // The per-user default harness (PRD #1429 D3/D11 rung 2): "inherit" (no preference)
+  // is the default; a value pins new implicit run creation to that harness.
   const [defaultHarness, setDefaultHarness] = useState<HarnessSelection>(INHERIT_HARNESS);
   const [savedHarness, setSavedHarness] = useState<HarnessSelection>(INHERIT_HARNESS);
-  const [harnessBusy, setHarnessBusy] = useState(false);
-  // D3: the harness card (and its D2 "no redundant picker" rule) appears only when the
-  // user has a usable credential for BOTH harnesses — a single-harness user's flow
-  // stays byte-identical to today, with no card at all.
+
+  // One busy flag for the whole card: the three fields save together in one request,
+  // so there is one in-flight state, not three.
+  const [defaultsBusy, setDefaultsBusy] = useState(false);
+  // D2: the harness SELECTOR appears only when the user has a usable credential for
+  // BOTH harnesses; a single-harness user keeps a one-lane form with no selector.
   const [claudeUsable, setClaudeUsable] = useState(false);
   const [codexUsable, setCodexUsable] = useState(false);
 
@@ -248,9 +257,14 @@ export function RunDefaults() {
         api.listSecrets(),
         api.getMySettings(),
       ]);
-      const model = settings.default_model ?? "";
-      setDefaultModel(model);
-      setSavedModel(model);
+      // PRD #1551: seed each lane from its own explicit field, never from the
+      // legacy default_model projection — the two lanes are the source of truth now.
+      const claude = settings.default_claude_model ?? "";
+      setClaudeModel(claude);
+      setSavedClaudeModel(claude);
+      const codex = settings.default_codex_model ?? "";
+      setCodexModel(codex);
+      setSavedCodexModel(codex);
       const jm = settings.judge_model ?? "";
       setJudgeModel(jm);
       setSavedJudgeModel(jm);
@@ -280,29 +294,6 @@ export function RunDefaults() {
   // Derived rather than fetched: auto_eligible already rides SecretMeta.
   const pooledCount = secrets.filter((s) => s.auto_eligible).length;
 
-  const modelWarning = modelFieldWarning(defaultModel);
-  const modelDirty = defaultModel.trim() !== savedModel;
-
-  const saveModel = async () => {
-    setError("");
-    setNotice("");
-    setModelBusy(true);
-    try {
-      const { settings } = await api.putMySettings({ default_model: defaultModel.trim() || null });
-      const model = settings.default_model ?? "";
-      setDefaultModel(model);
-      setSavedModel(model);
-      setNotice(
-        model === ""
-          ? "Worker model cleared. Your runs now use the lead template's model."
-          : `Worker model set to ${model}. It applies to your next run.`,
-      );
-    } catch (err) {
-      setError(errorMessage(err, "Failed to save worker model"));
-    } finally {
-      setModelBusy(false);
-    }
-  };
 
   // Same validation path as the worker model (PRD #69 M2): the shared modelFieldWarning
   // gates Save, so a per-user judge model can't be saved to a shape the server rejects.
@@ -383,54 +374,95 @@ export function RunDefaults() {
     }
   };
 
-  // PRD #1429 M4a, D2/D3: the harness card appears only when the user has a usable
-  // credential for BOTH harnesses (D2's "no redundant picker" rule extends to Run
-  // Defaults, not just the start dialog).
-  const showHarnessCard = bothHarnessesUsable(claudeUsable, codexUsable);
-  const harnessDirty = defaultHarness !== savedHarness;
-  // The Worker model vocabulary follows the EFFECTIVE harness, not the raw pick: a
-  // Codex-only user never sees the card above, so `defaultHarness` stays "inherit" while
-  // every run resolves to Codex. Keyed on the raw pick they were offered Claude aliases
-  // only, and a saved one was dropped at claim (D6 fallback). `defaultHarness` IS the
-  // default here, so the helper takes no separate default argument.
-  const workerModelOnCodex = effectiveHarnessIsCodex(defaultHarness, claudeUsable, codexUsable);
+  // PRD #1551 M3 / D2: the harness SELECTOR appears only when both harnesses are
+  // usable. Which model LANES appear is separate: the usable ones, and — so a
+  // zero-credential user can still preconfigure — the Claude lane when neither is
+  // usable (success criterion 4). A temporarily unavailable lane stays stored
+  // server-side and simply is not shown.
+  const showHarnessSelector = bothHarnessesUsable(claudeUsable, codexUsable);
+  const showClaudeLane = claudeUsable || !codexUsable;
+  const showCodexLane = codexUsable;
+  const bothLanes = showClaudeLane && showCodexLane;
 
-  // saveHarness persists the pin (present-value sets it, null clears it back to
-  // implicit D11) and — D6 — resets an incompatible STORED default model to inherit
-  // in the SAME write, rather than persist a knowingly-invalid model/harness pair.
-  // Compatibility is checked against the persisted model (savedModel), not an
-  // unsaved draft in the model picker below, since only a SAVED model can ever reach
-  // a run.
-  const saveHarness = async () => {
+  // The active-lane badge follows the EFFECTIVE harness (D11), the same resolver the
+  // rest of the web mirrors: "inherit" resolves to a USABLE stored default, else the
+  // sole usable harness, else Claude. So a Codex-only user (no selector) still sees the
+  // badge on their one lane, and a both-usable user sees it move as the selector changes.
+  //
+  // The stored default_harness is passed as resolveHarness's rung-2 DEFAULT, NOT as the
+  // rung-1 explicit selection — mirroring harness_resolver.go, which SKIPS an unusable
+  // stored default rather than short-circuiting on it. Passing it as `selection` would
+  // make effectiveHarnessIsCodex short-circuit unconditionally, so a stale "claude" pin
+  // with only Codex usable (or a stale "codex" pin with only Claude usable) would light
+  // NO lane's badge; feeding it as the rung-2 default lets availability win when the pin
+  // is unusable, exactly as the server resolves it. A user's LIVE selector change still
+  // moves the badge immediately when both are usable, since the pick is then a usable
+  // default.
+  const effectiveIsCodex = effectiveHarnessIsCodex(
+    "inherit",
+    claudeUsable,
+    codexUsable,
+    defaultHarness === "inherit" ? null : defaultHarness,
+  );
+  const badgeOnClaude = showClaudeLane && !effectiveIsCodex;
+  const badgeOnCodex = showCodexLane && effectiveIsCodex;
+
+  // Independent dirty state per field: changing the harness never dirties a model, and
+  // an untouched lane is not resent. Each lane compares its trimmed draft to its own
+  // saved snapshot (the same "only a saved value reaches a run" rule the model warning
+  // gates on). The model warnings block Save for a shape the server would reject.
+  const claudeWarning = modelFieldWarning(claudeModel);
+  const codexWarning = modelFieldWarning(codexModel);
+  const harnessDirty = defaultHarness !== savedHarness;
+  const claudeDirty = claudeModel.trim() !== savedClaudeModel;
+  const codexDirty = codexModel.trim() !== savedCodexModel;
+  const anyDirty = harnessDirty || claudeDirty || codexDirty;
+  // Only a shown lane's warning can block Save — a hidden lane's stored value is never
+  // edited here, so it cannot be dirty or invalid from this form.
+  const blockingWarning =
+    (showClaudeLane && claudeWarning !== "") || (showCodexLane && codexWarning !== "");
+
+  // saveDefaults writes the harness pin and BOTH lanes in one PUT (D1), never the
+  // legacy default_model (D3: new clients don't send it). Present-value sets, null
+  // clears. On success all three saved snapshots advance together; on failure the
+  // form stays dirty and shows one actionable error.
+  const saveDefaults = async () => {
     setError("");
     setNotice("");
-    setHarnessBusy(true);
+    setDefaultsBusy(true);
     try {
-      const nextHarness = defaultHarness === "inherit" ? null : defaultHarness;
-      const patch: UserSettingsPatch = { default_harness: nextHarness };
-      const resetModel = nextHarness != null && !modelCompatibleWithHarness(savedModel, nextHarness);
-      if (resetModel) patch.default_model = null;
+      const patch: UserSettingsPatch = {
+        default_harness: defaultHarness === "inherit" ? null : defaultHarness,
+        default_claude_model: claudeModel.trim() || null,
+        default_codex_model: codexModel.trim() || null,
+      };
       const { settings } = await api.putMySettings(patch);
       const dh = selectionFromHarness(settings.default_harness);
       setDefaultHarness(dh);
       setSavedHarness(dh);
-      if (resetModel) {
-        const model = settings.default_model ?? "";
-        setDefaultModel(model);
-        setSavedModel(model);
-      }
-      setNotice(
-        dh === "inherit"
-          ? "Default harness cleared. New runs resolve automatically."
-          : `Default harness set to ${dh}. It applies to a new run that doesn't choose one explicitly.` +
-              (resetModel ? " Your worker model was reset to Inherit — it isn't valid for that harness." : ""),
-      );
+      const claude = settings.default_claude_model ?? "";
+      setClaudeModel(claude);
+      setSavedClaudeModel(claude);
+      const codex = settings.default_codex_model ?? "";
+      setCodexModel(codex);
+      setSavedCodexModel(codex);
+      setNotice("Defaults saved. They apply to your next run.");
     } catch (err) {
-      setError(errorMessage(err, "Failed to save default harness"));
+      setError(errorMessage(err, "Failed to save defaults"));
     } finally {
-      setHarnessBusy(false);
+      setDefaultsBusy(false);
     }
   };
+
+  // The retention explanation, worded to the current default-harness choice so it says
+  // what "stays saved" means right now (only shown when the selector — both lanes —
+  // is present). Keyed on the raw pick, which is exactly what the selector controls.
+  const retentionCopy =
+    defaultHarness === "codex"
+      ? "Codex is your default harness. Your Claude model stays saved for runs that explicitly use Claude."
+      : defaultHarness === "claude"
+        ? "Claude is your default harness. Your Codex model stays saved for runs that explicitly use Codex."
+        : "Harness selection is automatic. Both model choices stay saved; uzi uses your only usable harness, or Claude when both are usable.";
 
   return (
     <SettingsShell description="How your runs behave: autopilot, usage limits, the judge, CI fixes, the model, and reasoning effort.">
@@ -779,76 +811,123 @@ export function RunDefaults() {
         </label>
       </Card>
 
-      {/* PRD #1429 M4a, D2/D3: the per-user default harness. Shown ONLY when the user
-          has a usable credential for BOTH harnesses — a single-harness user's flow
-          stays byte-identical to today, with no card at all. Placed right before
-          Worker model: the two are coupled (D6) — switching harness here resets an
-          incompatible saved model rather than leaving a knowingly-invalid pair. */}
-      {showHarnessCard && (
-        <Card className="space-y-4">
-          <div>
-            <SectionTitle>Default harness</SectionTitle>
-            <p className="mt-2 text-sm text-muted">
-              Which agent harness a new run uses when it doesn't choose one explicitly.
-              Leave it on <em>Use my default</em> to let uzi resolve it automatically (the
-              only harness you can use, or Claude when both are available and you haven't
-              set one here).
-            </p>
-          </div>
-
-          {loading ? (
-            <Skeleton className="h-9 w-full max-w-sm" />
-          ) : (
-            <div className="space-y-3">
-              <Field label="Harness" htmlFor="default-harness">
-                <HarnessPicker
-                  id="default-harness"
-                  label="Default harness"
-                  className="w-full max-w-sm"
-                  value={defaultHarness}
-                  onChange={setDefaultHarness}
-                  disabled={harnessBusy}
-                />
-              </Field>
-              <Button type="button" disabled={harnessBusy || !harnessDirty} onClick={saveHarness}>
-                Save harness
-              </Button>
-            </div>
-          )}
-        </Card>
-      )}
-
+      {/* PRD #1551 M3: the grouped Harness-and-worker-models card. Default harness on
+          top (only when both are usable), one retained model lane per usable harness
+          (plus the Claude lane in the zero-credential case), an active-lane badge that
+          follows the effective harness, a retention explanation, and one Save. */}
       <Card className="space-y-5">
         <div>
-          <SectionTitle>Worker model</SectionTitle>
+          <SectionTitle>Harness and worker models</SectionTitle>
           <p className="mt-2 text-sm text-muted">
-            The model your runs use — the lead orchestrator and its subagents that
-            inherit the model. Picking one here overrides the lead template's model for your
-            own runs; other users are unaffected. Leave it on <em>Inherit</em> to use the lead
-            template's model (opus by default). An unrecognized custom ID only fails on the
-            first run.
+            Choose how new runs start, then keep a model default for each harness. The
+            worker model is what your runs use — the lead orchestrator and the subagents
+            that inherit it — and overrides the lead template for your own runs only.{" "}
+            {showHarnessSelector && (
+              <strong className="text-fg">
+                Changing the harness doesn't overwrite either model choice.
+              </strong>
+            )}
           </p>
         </div>
 
         {loading ? (
           <Skeleton className="h-9 w-full max-w-sm" />
         ) : (
-          <div className="space-y-3">
-            <Field label="Model" htmlFor="worker-model">
-              <ModelSelect
-                id="worker-model"
-                value={defaultModel}
-                onChange={setDefaultModel}
-                harness={workerModelOnCodex ? "codex" : defaultHarness === "inherit" ? undefined : defaultHarness}
-              />
-            </Field>
-            {modelWarning && <Alert message={modelWarning} tone="warning" />}
+          <div className="space-y-5">
+            {showHarnessSelector && (
+              <div className="space-y-1.5">
+                <Field label="Harness" htmlFor="default-harness">
+                  <HarnessPicker
+                    id="default-harness"
+                    label="Default harness"
+                    className="w-full max-w-sm"
+                    value={defaultHarness}
+                    onChange={setDefaultHarness}
+                    disabled={defaultsBusy}
+                  />
+                </Field>
+                <p className="text-xs text-faint">
+                  Used when a run or schedule doesn't choose a harness explicitly. Leave it
+                  on <em>Use my default</em> to let uzi resolve it automatically (your only
+                  usable harness, or Claude when both are usable).
+                </p>
+              </div>
+            )}
+
+            <div className={bothLanes ? "grid gap-4 sm:grid-cols-2" : "space-y-4"}>
+              {showClaudeLane && (
+                <div className="space-y-3 rounded-lg border border-edge bg-raised/40 p-4">
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <h3 className="text-sm font-semibold text-fg">Anthropic</h3>
+                      <p className="text-xs text-faint">Used for Claude runs</p>
+                    </div>
+                    {badgeOnClaude && (
+                      <Badge tone="brand" dot>
+                        Default harness
+                      </Badge>
+                    )}
+                  </div>
+                  <Field label="Claude model" htmlFor="default-claude-model">
+                    <ModelSelect
+                      id="default-claude-model"
+                      value={claudeModel}
+                      onChange={setClaudeModel}
+                      harness="claude"
+                      customAriaLabel="Custom Claude model ID"
+                    />
+                  </Field>
+                  {claudeWarning && <Alert message={claudeWarning} tone="warning" />}
+                  <p className="text-xs text-faint">
+                    Curated Claude aliases plus a custom model ID. Leave on{" "}
+                    <em>Inherit</em> to use the lead template's model (opus by default);
+                    an unrecognized custom ID only fails on the first run.
+                  </p>
+                </div>
+              )}
+
+              {showCodexLane && (
+                <div className="space-y-3 rounded-lg border border-edge bg-raised/40 p-4">
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <h3 className="text-sm font-semibold text-fg">Codex</h3>
+                      <p className="text-xs text-faint">Used for Codex runs</p>
+                    </div>
+                    {badgeOnCodex && (
+                      <Badge tone="brand" dot>
+                        Default harness
+                      </Badge>
+                    )}
+                  </div>
+                  <Field label="Codex model" htmlFor="default-codex-model">
+                    <ModelSelect
+                      id="default-codex-model"
+                      value={codexModel}
+                      onChange={setCodexModel}
+                      harness="codex"
+                      allowCustom
+                      customAriaLabel="Custom Codex model ID"
+                    />
+                  </Field>
+                  {codexWarning && <Alert message={codexWarning} tone="warning" />}
+                  <p className="text-xs text-faint">
+                    Curated Codex models plus a custom model ID. Leave on <em>Inherit</em>{" "}
+                    to use the Codex default (currently{" "}
+                    <code className="rounded bg-raised px-1 py-0.5 text-fg">gpt-6-astra</code>
+                    ); an unrecognized custom ID only fails on the first run.
+                  </p>
+                </div>
+              )}
+            </div>
+
+            {showHarnessSelector && <Alert tone="info" message={retentionCopy} />}
+
             <Button
               type="button"
-              disabled={modelBusy || !modelDirty || modelWarning !== ""}
-              onClick={saveModel}
+              disabled={defaultsBusy || !anyDirty || blockingWarning}
+              onClick={saveDefaults}
             >
-              Save model
+              Save defaults
             </Button>
           </div>
         )}

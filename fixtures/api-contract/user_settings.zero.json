@@ -11,5 +11,7 @@
   "light_theme": null,
   "dark_theme": null,
   "typeface": null,
-  "default_harness": null
+  "default_harness": null,
+  "default_claude_model": null,
+  "default_codex_model": null
 }

@@ -75,8 +75,51 @@ const FORGE_TOOL_NAMES = forgeToolNames();
 // --- model + effort contract (adr/1106-codex-harness.md §Model and effort) -----
 
 /** The initial product model picker (ADR :266). Deliberately narrower than the
- *  server catalog; an out-of-picker model is dropped with a diagnostic. */
+ *  server catalog; an out-of-picker model is dropped with a diagnostic — EXCEPT the
+ *  run root sourced from the server worker default (PRD #1551), see {@link resolveModel}. */
 const CONTRACT_MODELS: ReadonlySet<string> = new Set(["gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol"]);
+
+/** The byte ceiling on a custom worker-root model ID. MIRRORS the API validator's
+ *  `MaxModelLen` (api/internal/agenttmpl/model.go) so a value the API accepted on the
+ *  settings write is accepted here and vice-versa. Byte length (UTF-8), NOT code units,
+ *  matches Go's `len(string)`. */
+const MAX_CUSTOM_MODEL_BYTES = 100;
+
+/** Rejects any code point the API validator (`agenttmpl.ValidateModel`) rejects in a
+ *  model token: a Unicode control char (Cc == Go `unicode.IsControl`), a format char
+ *  (Cf == Go `unicode.Is(unicode.Cf)`, e.g. bidi overrides / zero-width joiners), any
+ *  Unicode White_Space code point (== Go `unicode.IsSpace`, so no interior/edge
+ *  whitespace and the value stays a single token), or the replacement char U+FFFD.
+ *  Unicode property escapes are used deliberately: they name the SAME categories the Go
+ *  validator uses, and (unlike a literal control-char class) they do not trip oxlint's
+ *  denied `no-control-regex`. */
+const UNSAFE_MODEL_CHAR_RE = /[\p{Cc}\p{Cf}\p{White_Space}\uFFFD]/u;
+
+/** Thrown when a run-root model sourced from the server worker default (PRD #1551) is
+ *  present but MALFORMED — over the byte cap or carrying a character the API validator
+ *  forbids. It fails the run LOUDLY rather than silently substituting `gpt-6-astra`, so a
+ *  corrupt/hostile default cannot masquerade as the curated fallback. */
+export class CustomWorkerModelError extends Error {
+  constructor(readonly model: string) {
+    super(
+      `codex worker-default root model failed the syntax guard (mirrors the API model validator): ` +
+        `${JSON.stringify(sanitizeName(model))}`,
+    );
+    this.name = "CustomWorkerModelError";
+  }
+}
+
+/** Mirror of `agenttmpl.ValidateModel`'s non-blank acceptance rule (length cap + allowed
+ *  characters), expressed as a boolean guard: a non-empty single token, at most
+ *  {@link MAX_CUSTOM_MODEL_BYTES} UTF-8 bytes, with no control/format/whitespace/replacement
+ *  code point. The API already trimmed and validated the stored value; this re-check makes
+ *  the agent an independent second gate so a wire-tampered claim cannot smuggle a malformed
+ *  root model past the renderer. */
+function isValidCustomModelId(model: string): boolean {
+  if (model.length === 0) return false;
+  if (Buffer.byteLength(model, "utf8") > MAX_CUSTOM_MODEL_BYTES) return false;
+  return !UNSAFE_MODEL_CHAR_RE.test(model);
+}
 
 /** uzi's effort contract, mapped 1:1 to Codex `modelReasoningEffort` (ADR :267).
  *  Provider-only values (`ultra`, `persistent`) are NOT in the uzi contract. */
@@ -256,14 +299,28 @@ function buildAllowedSkills(
 }
 
 /** Validate a model against the uzi picker; an out-of-picker value is dropped
- *  (undefined) with an `unknown_model` diagnostic. Absent ⇒ absent, no diagnostic. */
+ *  (undefined) with an `unknown_model` diagnostic. Absent ⇒ absent, no diagnostic.
+ *
+ *  PRD #1551 (D4/D5): `modelSource === "worker_default"` marks a run ROOT model the
+ *  executor copied from the server claim's resolved worker default — the ONLY source
+ *  allowed to carry a non-curated (custom) ID. Such a value passes through UNCHANGED
+ *  when it satisfies {@link isValidCustomModelId} (the API validator mirror), and FAILS
+ *  LOUDLY (throws {@link CustomWorkerModelError}) when it is present but malformed —
+ *  never silently substituted with `gpt-6-astra`. Every other source (undefined
+ *  provenance: per-role pins, the provider fallback, all advice) keeps the closed
+ *  curated behavior: an out-of-set value is dropped with an `unknown_model` diagnostic. */
 function resolveModel(
   candidate: string | undefined,
   role: string,
   diagnostics: MutableDiagnostics,
+  modelSource?: RunTurnRequest["modelSource"],
 ): string | undefined {
   if (candidate === undefined) return undefined;
   if (CONTRACT_MODELS.has(candidate)) return candidate;
+  if (modelSource === "worker_default") {
+    if (isValidCustomModelId(candidate)) return candidate;
+    throw new CustomWorkerModelError(candidate);
+  }
   diagnostics.push({ kind: "unknown_model", role, name: sanitizeName(candidate) });
   return undefined;
 }
@@ -374,7 +431,7 @@ export function renderCodexRun(request: RunTurnRequest): RenderedCodexRun {
 
   // Resolve the request-scoped model + effort once, attributed to the lead (the
   // root thread that runs on them). Per-role fallbacks reuse these validated values.
-  const requestModel = resolveModel(request.model, LEAD_ROLE, diagnostics);
+  const requestModel = resolveModel(request.model, LEAD_ROLE, diagnostics, request.modelSource);
   const requestEffort = resolveEffort(request.effort, LEAD_ROLE, diagnostics);
   const lead: ResolvedCodexModel = { model: requestModel, modelReasoningEffort: requestEffort };
 

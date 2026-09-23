@@ -88,12 +88,25 @@ export interface SecretMeta {
   updated_at: string;
 }
 
-// UserSettings is the current user's own (non-secret) settings. default_model
-// is the per-user default worker model; null means inherit (PRD #17). theme is
+// UserSettings is the current user's own (non-secret) settings. theme is
 // the per-user UI theme override; null means "use the instance default" (PRD
 // #21).
 export interface UserSettings {
+  /** @deprecated PRD #1551 D2: superseded by the explicit per-harness lanes below.
+   *  Kept for one compatibility release as a server-projected legacy field — the
+   *  server derives it from the effective-harness lane, so a stale client reading it
+   *  still sees a coherent single model. New clients read default_claude_model /
+   *  default_codex_model and never write default_model. Null means inherit. */
   default_model: string | null;
+  /** Per-user Claude worker-model default (PRD #1551 M1/D2); null = inherit the lead
+   *  template's model. Optional so an older server that predates the split reads as
+   *  inherit; the server sends it going forward. Validated by the same model rules as
+   *  default_model, and a curated Codex id is rejected here (D3 cross-vocabulary 400). */
+  default_claude_model?: string | null;
+  /** Per-user Codex worker-model default (PRD #1551 M1/D2); null = inherit the Codex
+   *  fallback (gpt-6-astra). Optional for the same back-compat reason. Unlike the other
+   *  lanes it accepts a custom id (D5), but a known Claude alias is rejected here (D3). */
+  default_codex_model?: string | null;
   /** Per-user default reasoning effort (PRD #617); null means the user has not chosen
    *  (inherit), which resolves to the uzi default (`xhigh`) at claim assembly (issue
    *  #1157). One of low|medium|high|xhigh|max when set. */
@@ -140,7 +153,17 @@ export interface UserSettings {
 // is applied (null clears it), a field absent is left unchanged — so the model
 // card and the Appearance picker save independently over the one endpoint.
 export interface UserSettingsPatch {
+  /** @deprecated PRD #1551 D3: the legacy single-model field. New clients (the grouped
+   *  Run Defaults card) send default_claude_model / default_codex_model instead and never
+   *  send this. Kept only for the bounded stale-client bridge, where the server routes it
+   *  to the effective-harness lane. */
   default_model?: string | null;
+  /** Per-user Claude worker-model default (PRD #1551 M1); present-null clears to inherit,
+   *  a value sets it, absent leaves it untouched. */
+  default_claude_model?: string | null;
+  /** Per-user Codex worker-model default (PRD #1551 M1); present-null clears to inherit,
+   *  a value (curated or custom, D5) sets it, absent leaves it untouched. */
+  default_codex_model?: string | null;
   /** Per-user reasoning effort (PRD #617); present-null clears back to inherit. */
   default_effort?: string | null;
   /** Per-user judge model (PRD #69 M2); present-null clears back to inherit. */

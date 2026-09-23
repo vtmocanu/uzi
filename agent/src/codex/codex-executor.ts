@@ -146,6 +146,13 @@ export const CODEX_PRODUCTION_PROVIDER: CodexProviderConfig = {
   model: "gpt-6-astra",
 };
 
+// PRD #1551 (M2, D5): the built-in Codex task-review model, re-exported here beside the
+// production provider for locality. It lives in the leaf module `task-review-model.ts` so
+// `review-runner.ts` reads it without a runtime import of this heavy module (it references
+// this module type-only). The shared provider default above stays `gpt-6-astra`; only
+// Codex task review uses `CODEX_TASK_REVIEW_MODEL`.
+export { CODEX_TASK_REVIEW_MODEL } from "./task-review-model.js";
+
 /** The pinned, image-baked openat2 fileop helper — built + installed 0555 in both worker
  *  images (base + jvm) alongside the supervisor (m5 packaging). Dark: only reached once a
  *  Codex-bound claim selects the CodexExecutor. */
@@ -2314,6 +2321,15 @@ export class CodexExecutor implements Executor {
       // resolveModel re-validates request.model downstream and codex-harness.ts's
       // `rendered.lead.model ?? this.provider.model` supplies the same default for an out-of-set value.
       model: ctx.config?.default_model ?? this.opts.provider.model,
+      // PRD #1551 (D4/D5): mark the ROOT model's provenance ONLY when it came from the
+      // server worker default (a present, non-empty `default_model`). This is the sole
+      // source render.ts's resolveModel lets carry a validated CUSTOM (non-curated) ID
+      // through unchanged; a malformed worker default then fails the run loudly rather
+      // than silently substituting gpt-6-astra. The provider fallback above carries no
+      // provenance, so it stays closed to the curated set exactly as before.
+      ...(typeof ctx.config?.default_model === "string" && ctx.config.default_model.length > 0
+        ? { modelSource: "worker_default" as const }
+        : {}),
       ...(resumeId !== undefined ? { resumeSessionId: resumeId } : {}),
       ...(effort !== undefined ? { effort } : {}),
     };

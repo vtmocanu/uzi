@@ -3,7 +3,7 @@ import { afterEach, describe, it, expect } from "vitest";
 import { useState } from "react";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import type { Harness as HarnessKind } from "../lib/api";
-import { ModelSelect, modelCompatibleWithHarness } from "./ModelSelect";
+import { ModelSelect } from "./ModelSelect";
 import { Field } from "./ui";
 
 afterEach(cleanup);
@@ -11,11 +11,19 @@ afterEach(cleanup);
 // Controlled harness: mirrors how the editor/Settings wire ModelSelect (the
 // emitted model string is the source of truth). The output node exposes the
 // current value for assertions.
-function Harness({ initial, pickerHarness }: { initial: string; pickerHarness?: HarnessKind }) {
+function Harness({
+  initial,
+  pickerHarness,
+  allowCustom,
+}: {
+  initial: string;
+  pickerHarness?: HarnessKind;
+  allowCustom?: boolean;
+}) {
   const [model, setModel] = useState(initial);
   return (
     <>
-      <ModelSelect value={model} onChange={setModel} harness={pickerHarness} />
+      <ModelSelect value={model} onChange={setModel} harness={pickerHarness} allowCustom={allowCustom} />
       <output data-testid="model">{model}</output>
     </>
   );
@@ -155,29 +163,54 @@ describe("ModelSelect — harness-scoped vocabulary (PRD #1429 D6)", () => {
   });
 });
 
-// PRD #1429 D6: the Run Defaults reset-on-harness-switch rule.
-describe("modelCompatibleWithHarness (PRD #1429 D6)", () => {
-  it("inherit (blank) is always compatible", () => {
-    expect(modelCompatibleWithHarness("", "claude")).toBe(true);
-    expect(modelCompatibleWithHarness("", "codex")).toBe(true);
+// PRD #1551 M3: `allowCustom` explicitly overrides the harness default. The Codex Run
+// Defaults lane opts in; ScheduleModal / AgentTemplateEditor omit it and keep the
+// harness-derived default (Claude yes, Codex no).
+describe("ModelSelect — explicit allowCustom (PRD #1551 M3)", () => {
+  it("opens the Other… escape hatch for Codex when allowCustom is set", () => {
+    render(<Harness initial="" pickerHarness="codex" allowCustom />);
+    // Positive control: the curated Codex option is present…
+    expect(screen.getByRole("option", { name: "gpt-6-astra" })).toBeTruthy();
+    // …and now so is Other…, which the default Codex picker withholds.
+    expect(screen.getByRole("option", { name: /Other/ })).toBeTruthy();
+    fireEvent.change(combo(), { target: { value: "custom" } });
+    fireEvent.change(screen.getByLabelText("Custom model ID"), {
+      target: { value: "gpt-5.6-terra" },
+    });
+    expect(value()).toBe("gpt-5.6-terra");
+    expect(combo().value).toBe("custom");
   });
 
-  it("codex accepts only its curated aliases", () => {
-    expect(modelCompatibleWithHarness("gpt-6-astra", "codex")).toBe(true);
-    expect(modelCompatibleWithHarness("gpt-5.6-sol", "codex")).toBe(true);
-    expect(modelCompatibleWithHarness("gpt-6-sol", "codex")).toBe(true);
-    expect(modelCompatibleWithHarness("opus", "codex")).toBe(false);
-    expect(modelCompatibleWithHarness("some-custom-id", "codex")).toBe(false);
+  it("still withholds Other… for Codex when allowCustom is NOT passed (default caller)", () => {
+    render(<Harness initial="" pickerHarness="codex" />);
+    // Positive control that the picker rendered: the curated Codex option exists.
+    expect(screen.getByRole("option", { name: "gpt-6-astra" })).toBeTruthy();
+    // The negative it guards: no Other… entry without the explicit opt-in.
+    expect(screen.queryByRole("option", { name: /Other/ })).toBeNull();
   });
 
-  it("claude accepts a curated alias or any custom id", () => {
-    expect(modelCompatibleWithHarness("opus", "claude")).toBe(true);
-    expect(modelCompatibleWithHarness("claude-custom-9", "claude")).toBe(true);
+  it("allowCustom={false} closes the escape hatch even for Claude", () => {
+    render(<Harness initial="" pickerHarness="claude" allowCustom={false} />);
+    // Positive control: a Claude curated option is present…
+    expect(screen.getByRole("option", { name: "opus" })).toBeTruthy();
+    // …but the explicit false suppresses Other…, overriding the Claude default.
+    expect(screen.queryByRole("option", { name: /Other/ })).toBeNull();
+  });
+});
+
+// PRD #1551 M3: the custom input placeholder is provider-specific, so a Codex custom id
+// hints at gpt-… and a Claude one at claude-…. Placeholder is an attribute sink, asserted
+// on the attribute, never on textContent (web.md "Untrusted values rendered into attributes").
+describe("ModelSelect — provider-specific custom placeholder (PRD #1551 M3)", () => {
+  it("uses a gpt-… placeholder in the Codex custom input", () => {
+    render(<Harness initial="gpt-5.6-terra" pickerHarness="codex" allowCustom />);
+    const custom = screen.getByLabelText("Custom model ID") as HTMLInputElement;
+    expect(custom.placeholder).toBe("gpt-…");
   });
 
-  it("claude rejects a known Codex-only alias", () => {
-    expect(modelCompatibleWithHarness("gpt-6-astra", "claude")).toBe(false);
-    expect(modelCompatibleWithHarness("gpt-5.6-sol", "claude")).toBe(false);
-    expect(modelCompatibleWithHarness("gpt-6-sol", "claude")).toBe(false);
+  it("uses a claude-… placeholder in the Claude custom input", () => {
+    render(<Harness initial="claude-opus-4-8" pickerHarness="claude" />);
+    const custom = screen.getByLabelText("Custom model ID") as HTMLInputElement;
+    expect(custom.placeholder).toBe("claude-…");
   });
 });

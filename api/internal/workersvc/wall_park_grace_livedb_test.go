@@ -103,7 +103,7 @@ func TestQueuedReasonReleasedWorkerLiveDB(t *testing.T) {
 	          VALUES ($1, $2, $3, 'issue', 987101, 't', 'd', 'queued', NULL, now() - interval '2 hours', now() - interval '5 minutes', $4, 'nonce-A', 2)`,
 		runID, userID, repoID, workerID)
 
-	rows, err := svc.q.ListActiveRunsForHealth(env.ctx)
+	rows, err := svc.q.ListActiveRunsForHealth(env.ctx, nil)
 	if err != nil {
 		t.Fatalf("ListActiveRunsForHealth: %v", err)
 	}
