@@ -1732,6 +1732,363 @@ describe("CodexExecutor: child-thread delegation demux (part C)", () => {
   });
 });
 
+// ================================================================================
+// Issue #1583 (m2): a root delegation is projected as a lead "Agent" dispatch tool_use, the
+// child's own frames attributed to that dispatch (agent = the ADMITTED role, agent_instance = the
+// dispatch id, agent_label = the description), and a lead tool_result closing the lane, all
+// BEFORE the terminal result. Assertions are on the EMITTED run messages (ctx.emit).
+describe("CodexExecutor: delegation projection (issue #1583 m2)", () => {
+  const agents: AgentTemplate[] = [
+    { name: "lead", description: "the lead", prompt_body: "lead body", tools: null, skills: [] },
+    { name: "coder", description: "a coder", prompt_body: "coder body", tools: null, skills: [] },
+  ];
+  const DISPATCH_ID = /^cx-[0-9a-f]{12}-t\d+-/;
+
+  /** Root th-1/tn-1; the k-th child thread is `th-child-k` and its turn `tn-<thread>`. On a
+   *  child turn/start, `childFrames` pushes that child's frames (the sink is registered by then),
+   *  given the child's task input text. `failChildTurnStart` makes every child turn/start throw. */
+  function delegationResponder(
+    childFrames: (t: FakeTransport, threadId: string, turnId: string, input: string) => void,
+    opts: { failChildTurnStart?: boolean } = {},
+  ): Responder {
+    return (c) => {
+      if (c.method === "thread/start") {
+        return { thread: { id: c.threadStartCount === 1 ? "th-1" : `th-child-${c.threadStartCount - 1}` } };
+      }
+      if (c.method === "turn/start") {
+        if (c.turnStartCount === 1) return { turn: { id: "tn-1" } };
+        if (opts.failChildTurnStart) throw new Error("child turn/start refused");
+        const p = rec(c.params);
+        const threadId = String(p.threadId);
+        const turnId = `tn-${threadId}`;
+        const input = String(rec((p.input as unknown[])[0]).text);
+        childFrames(c.transport, threadId, turnId, input);
+        return { turn: { id: turnId } };
+      }
+      return {};
+    };
+  }
+
+  function spawn(requestId: number, callId: string, args: Record<string, unknown>): CodexNotification {
+    return toolCall(requestId, "spawn_agent", args, "th-1", "tn-1", callId);
+  }
+
+  const agentUses = (emitted: EmittedMessage[]): EmittedMessage[] =>
+    emitted.filter((m) => m.kind === "tool_use" && m.payload.name === "Agent");
+  const resultsFor = (emitted: EmittedMessage[], id: unknown): EmittedMessage[] =>
+    emitted.filter((m) => m.kind === "tool_result" && m.payload.tool_use_id === id);
+  const responsesFor = (rig: Rig, id: number): number => rig.transport.responses.filter((r) => r.requestId === id).length;
+
+  /** Push the root's closing signal_done + terminal once the parent spawn reply(ies) went out. */
+  async function finishRoot(rig: Rig, parents: number[]): Promise<void> {
+    await waitFor(() => parents.every((id) => responsesFor(rig, id) > 0), "parent spawn_agent reply");
+    rig.transport.push(signalDone("th-1", "tn-1")).push(turnCompleted("completed", "th-1", "tn-1")).end();
+  }
+
+  it("(m2-1) a confirmed child turn: lead dispatch < child tool_use/tool_result/text < lead completion < terminal, one reply per request", async () => {
+    let releaseBash!: () => void;
+    const bashGate = new Promise<void>((r) => {
+      releaseBash = r;
+    });
+    const rig = makeRig({
+      responder: delegationResponder((t, th, tn) => {
+        t.push(toolCall(11, "uzi_bash", { command: "echo child" }, th, tn, "cc-bash"))
+          .push(agentMessage("child report", th))
+          .push(turnCompleted("completed", th, tn));
+      }),
+    });
+    rig.deps = {
+      ...rig.deps,
+      spawnCommand: async (argv, cmdOpts) => {
+        rig.spawnCommandCalls.push({ argv, opts: cmdOpts });
+        await bashGate;
+        return { code: 0, stdout: "child ok", stderr: "" };
+      },
+    };
+    rig.transport
+      .push(threadStarted())
+      .push(spawn(1, "c-root", { subagent_type: "coder", description: "[m1] wire it", prompt: "wire the thing" }));
+    const { ctx, emitted } = makeCtx({ agents });
+    const runP = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+
+    // The child Bash is wedged in its effect; the ROOT loop still reads and emits meanwhile.
+    await waitFor(() => rig.spawnCommandCalls.some((s) => JSON.stringify(s.argv).includes("echo child")), "child Bash effect");
+    rig.transport.push(agentMessage("root keeps reading"));
+    await waitFor(() => emitted.some((m) => m.kind === "text" && m.payload.text === "root keeps reading"), "root text during delegation");
+    assert.equal(responsesFor(rig, 11), 0, "the child Bash has not replied while its effect is gated");
+    releaseBash();
+    await finishRoot(rig, [1]);
+    await withTimeout(runP, 3000, "confirmed delegation run");
+
+    const uses = agentUses(emitted);
+    assert.equal(uses.length, 1, "exactly one lead dispatch tool_use");
+    const dispatch = uses[0]!;
+    const dispatchId = dispatch.payload.id;
+    assert.match(String(dispatchId), new RegExp(DISPATCH_ID.source + "c-root$"));
+    assert.equal(dispatch.agent, "lead");
+    assert.ok(!("agentInstance" in dispatch), "the lead dispatch carries no agent_instance");
+    assert.deepEqual(dispatch.payload.input, { subagent_type: "coder", description: "[m1] wire it" });
+
+    const childOf = (kind: string): EmittedMessage => {
+      const m = emitted.find((e) => e.kind === kind && e.agent === "coder");
+      assert.ok(m, `a child ${kind}`);
+      assert.equal(m.agentInstance, dispatchId, `the child ${kind} is attributed to the dispatch instance`);
+      assert.equal(m.agentLabel, "[m1] wire it");
+      return m;
+    };
+    const childUse = childOf("tool_use");
+    const childResult = childOf("tool_result");
+    const childText = childOf("text");
+    assert.equal(childUse.payload.name, "Bash");
+    assert.equal(childUse.payload.id, `${String(dispatchId)}:cc-bash`, "the child tool id is namespaced under the dispatch");
+    assert.deepEqual(childUse.payload.input, { command: "echo child" });
+    assert.equal(childResult.payload.tool_use_id, childUse.payload.id);
+    assert.equal(childResult.payload.is_error, false);
+    assert.equal(childText.payload.text, "child report");
+
+    const completions = resultsFor(emitted, dispatchId);
+    assert.equal(completions.length, 1, "exactly one lead completion");
+    const completion = completions[0]!;
+    assert.equal(completion.agent, "lead");
+    assert.equal(completion.payload.is_error, false);
+    assert.match(String(completion.payload.content), /child report/);
+    const terminal = emitted.findIndex((m) => m.kind === "status" && m.payload.event === "result");
+    assert.ok(terminal >= 0, "the terminal result was emitted");
+    const order = [dispatch, childUse, childResult, childText, completion].map((m) => emitted.indexOf(m));
+    assert.deepEqual([...order].sort((a, b) => a - b), order, "dispatch < child tool_use < tool_result < text < completion");
+    assert.ok(order[order.length - 1]! < terminal, "the completion precedes the terminal result");
+
+    assert.equal(responsesFor(rig, 1), 1, "the parent spawn_agent replied exactly once");
+    assert.equal(responsesFor(rig, 11), 1, "the child Bash replied exactly once");
+    assert.equal(rec(rec(rig.transport.responses.find((r) => r.requestId === 1)?.response).result).success, true);
+  });
+
+  it("(m2-2) two dispatches of the same role get distinct instance ids, each with its own completion", async () => {
+    const rig = makeRig({
+      responder: delegationResponder((t, th, tn, input) => {
+        t.push(agentMessage(`done ${input}`, th)).push(turnCompleted("completed", th, tn));
+      }),
+    });
+    rig.transport
+      .push(threadStarted())
+      .push(spawn(1, "c-a", { subagent_type: "coder", description: "[a] one", prompt: "task-A" }))
+      .push(spawn(2, "c-b", { subagent_type: "coder", description: "[b] two", prompt: "task-B" }));
+    const { ctx, emitted } = makeCtx({ agents });
+    const runP = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    await finishRoot(rig, [1, 2]);
+    await withTimeout(runP, 3000, "two-dispatch run");
+
+    const uses = agentUses(emitted);
+    assert.equal(uses.length, 2);
+    const byLabel = new Map(uses.map((u) => [rec(u.payload.input).description, u.payload.id]));
+    const idA = byLabel.get("[a] one");
+    const idB = byLabel.get("[b] two");
+    assert.ok(idA !== undefined && idB !== undefined && idA !== idB, "distinct dispatch ids");
+    for (const [id, task, label] of [[idA, "task-A", "[a] one"], [idB, "task-B", "[b] two"]] as const) {
+      assert.equal(resultsFor(emitted, id).length, 1, `one completion for ${label}`);
+      const text = emitted.find((m) => m.kind === "text" && m.payload.text === `done ${task}`);
+      assert.ok(text, `the ${task} child text`);
+      assert.equal(text.agent, "coder");
+      assert.equal(text.agentInstance, id, `${task}'s frames ride its own dispatch instance`);
+      assert.equal(text.agentLabel, label);
+    }
+    assert.equal(responsesFor(rig, 1), 1);
+    assert.equal(responsesFor(rig, 2), 1);
+  });
+
+  it("(m2-3) mismatched role args: the dispatch and child carry the broker-ADMITTED role only", async () => {
+    const rig = makeRig({
+      responder: delegationResponder((t, th, tn) => {
+        t.push(toolCall(11, "uzi_bash", { command: "echo r" }, th, tn, "cc-1"))
+          .push(agentMessage("reviewed", th))
+          .push(turnCompleted("completed", th, tn));
+      }),
+    });
+    rig.transport.push(threadStarted()).push(
+      spawn(1, "c-root", { subagent_type: "coder", role: "reviewer", agent_type: "tester", description: "[m1] do reviewer work", prompt: "p" }),
+    );
+    const { ctx, emitted } = makeCtx({ agents });
+    const runP = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    await finishRoot(rig, [1]);
+    await withTimeout(runP, 3000, "mismatched-role run");
+
+    const uses = agentUses(emitted);
+    assert.equal(uses.length, 1);
+    assert.deepEqual(uses[0]!.payload.input, { subagent_type: "coder", description: "[m1] do reviewer work" });
+    const childFrames = emitted.filter((m) => m.agentInstance === uses[0]!.payload.id);
+    assert.ok(childFrames.length >= 3, "the child's tool pair and text were projected");
+    assert.ok(childFrames.every((m) => m.agent === "coder"));
+    for (const m of emitted) {
+      assert.ok(m.agent !== "reviewer" && m.agent !== "tester", "no frame is attributed to an unadmitted role");
+      const sub = rec(m.payload.input).subagent_type;
+      assert.ok(sub !== "reviewer" && sub !== "tester", "no subagent_type names an unadmitted role");
+    }
+  });
+
+  it("(m2-4) an untagged dispatch still projects the dispatch and the attributed child frames", async () => {
+    const rig = makeRig({
+      responder: delegationResponder((t, th, tn) => {
+        t.push(agentMessage("untagged child", th)).push(turnCompleted("completed", th, tn));
+      }),
+    });
+    rig.transport.push(threadStarted()).push(spawn(1, "c-root", { subagent_type: "coder", description: "no tag here", prompt: "p" }));
+    const { ctx, emitted } = makeCtx({ agents });
+    const runP = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    await finishRoot(rig, [1]);
+    await withTimeout(runP, 3000, "untagged run");
+
+    const uses = agentUses(emitted);
+    assert.equal(uses.length, 1);
+    assert.deepEqual(uses[0]!.payload.input, { subagent_type: "coder", description: "no tag here" });
+    const text = emitted.find((m) => m.kind === "text" && m.payload.text === "untagged child");
+    assert.ok(text);
+    assert.equal(text.agent, "coder");
+    assert.equal(text.agentInstance, uses[0]!.payload.id);
+    assert.equal(text.agentLabel, "no tag here");
+    assert.equal(resultsFor(emitted, uses[0]!.payload.id).length, 1);
+  });
+
+  it("(m2-5) an abort during delegation emits ONE synthesized unconfirmed completion before the run returns; the late child settlement adds none", async () => {
+    let releaseBash!: () => void;
+    const bashGate = new Promise<void>((r) => {
+      releaseBash = r;
+    });
+    const controller = new AbortController();
+    const rig = makeRig({
+      responder: delegationResponder((t, th, tn) => {
+        t.push(toolCall(11, "uzi_bash", { command: "sleep forever" }, th, tn, "cc-wedge"));
+      }),
+    });
+    rig.deps = {
+      ...rig.deps,
+      // Wedged: ignores the abort and settles only when the test releases the gate.
+      spawnCommand: async (argv, cmdOpts) => {
+        rig.spawnCommandCalls.push({ argv, opts: cmdOpts });
+        await bashGate;
+        return { code: 0, stdout: "late", stderr: "" };
+      },
+    };
+    rig.transport.push(threadStarted()).push(spawn(1, "c-root", { subagent_type: "coder", description: "[m1] wedge", prompt: "p" }));
+    const { ctx, emitted } = makeCtx({ agents, signal: controller.signal });
+    const runP = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    await waitFor(() => rig.spawnCommandCalls.some((s) => JSON.stringify(s.argv).includes("sleep forever")), "wedged child effect");
+    await waitFor(() => agentUses(emitted).length === 1, "the dispatch frame");
+    controller.abort();
+    await assert.rejects(withTimeout(runP, 3000, "abort during delegation"), /run cancelled/);
+
+    const dispatchId = agentUses(emitted)[0]!.payload.id;
+    const completions = resultsFor(emitted, dispatchId);
+    assert.equal(completions.length, 1, "the stop path emitted the completion before the run returned");
+    assert.equal(completions[0]!.payload.is_error, true);
+    assert.match(String(completions[0]!.payload.content), /child settlement not confirmed/);
+
+    releaseBash();
+    for (let i = 0; i < 10; i += 1) await tick();
+    assert.equal(resultsFor(emitted, dispatchId).length, 1, "the later real settlement adds no second completion");
+    assert.ok(
+      !emitted.some((m) => m.kind === "tool_result" && m.payload.tool_use_id === dispatchId && m.payload.is_error === false),
+      "nothing claims the delegation succeeded",
+    );
+  });
+
+  it("(m2-6) the same provider call id in two executor attempts (a resume) yields different dispatch ids", async () => {
+    const ids: unknown[] = [];
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const rig = makeRig({
+        responder: delegationResponder((t, th, tn) => {
+          t.push(turnCompleted("completed", th, tn));
+        }),
+      });
+      rig.transport.push(threadStarted()).push(spawn(1, "c-root", { subagent_type: "coder", description: "[m1] again", prompt: "p" }));
+      const { ctx, emitted } = makeCtx({ agents });
+      const runP = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+      await finishRoot(rig, [1]);
+      await withTimeout(runP, 3000, `attempt ${attempt}`);
+      const uses = agentUses(emitted);
+      assert.equal(uses.length, 1);
+      assert.match(String(uses[0]!.payload.id), /-c-root$/);
+      ids.push(uses[0]!.payload.id);
+    }
+    assert.notEqual(ids[0], ids[1], "a reused call id is namespaced per harness attempt");
+  });
+
+  it("(m2-7) a child submit_plan is neither projected nor folded; the root signal_done still ends the run", async () => {
+    const childSignal = (t: FakeTransport, th: string, tn: string): void => {
+      t.push(toolCall(12, "submit_plan", { plan_md: "the CHILD plan" }, th, tn, "cc-sig"))
+        .push(agentMessage("tried to plan", th))
+        .push(turnCompleted("completed", th, tn));
+    };
+    const rig = makeRig({ responder: delegationResponder(childSignal) });
+    rig.transport.push(threadStarted()).push(spawn(1, "c-root", { subagent_type: "coder", description: "[m1] sig", prompt: "p" }));
+    const { ctx, emitted } = makeCtx({ agents });
+    const runP = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    await finishRoot(rig, [1]);
+    const result = await withTimeout(runP, 3000, "child-signal run");
+    assert.equal(result.branch, "agent/issue-42", "the root signal_done still ended the run");
+    assert.equal(rec(rec(rig.transport.responses.find((r) => r.requestId === 12)?.response).result).success, false);
+    assert.ok(!emitted.some((m) => m.kind === "tool_use" && m.payload.name === "submit_plan"), "a child signal is never a tool frame");
+    assert.ok(emitted.some((m) => m.kind === "text" && m.agent === "coder"), "the child's other frames still project");
+
+    // Plan phase: the child's submit_plan is the ONLY plan in the turn. Were it folded the plan
+    // would reach the gate; instead the plan turn produced none.
+    let gated = false;
+    const planRig = makeRig({ responder: delegationResponder(childSignal) });
+    planRig.transport.push(threadStarted()).push(spawn(1, "c-root", { subagent_type: "coder", description: "[m1] sig", prompt: "p" }));
+    const plan = makeCtx({
+      agents,
+      planApproved: false,
+      approvedPlan: undefined,
+      gatePlan: async () => {
+        gated = true;
+        return { kind: "approve", selection: { source: "own", agents: [] } } as never;
+      },
+    });
+    const planP = makeExecutor(planRig, bindingOf(SUBSCRIPTION)).run(plan.ctx);
+    await waitFor(() => responsesFor(planRig, 1) > 0, "plan-phase parent reply");
+    planRig.transport.push(turnCompleted("completed", "th-1", "tn-1")).end();
+    await assert.rejects(withTimeout(planP, 3000, "plan-phase child signal"), /produced no plan/);
+    assert.equal(gated, false, "the child's plan never reached the gate");
+  });
+
+  it("(m2-8) a late note for a closed child thread, or a foreign thread's note, projects nothing", async () => {
+    const rig = makeRig({
+      responder: delegationResponder((t, th, tn) => {
+        t.push(agentMessage("in-lane child", th)).push(turnCompleted("completed", th, tn));
+      }),
+    });
+    rig.transport.push(threadStarted()).push(spawn(1, "c-root", { subagent_type: "coder", description: "[m1] late", prompt: "p" }));
+    const { ctx, emitted } = makeCtx({ agents });
+    const runP = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    await waitFor(() => responsesFor(rig, 1) > 0, "parent spawn_agent reply");
+    rig.transport
+      .push(agentMessage("late child", "th-child-1"))
+      .push(toolCall(21, "uzi_bash", { command: "late" }, "th-child-1", "tn-th-child-1", "cc-late"))
+      .push(agentMessage("foreign", "th-foreign"));
+    await finishRoot(rig, [1]);
+    await withTimeout(runP, 3000, "late-note run");
+
+    const texts = emitted.flatMap((m) => (m.kind === "text" ? [m.payload.text] : []));
+    assert.ok(texts.includes("in-lane child"));
+    assert.ok(!texts.includes("late child") && !texts.includes("foreign"), "no late or foreign text is projected");
+    assert.ok(!emitted.some((m) => m.kind === "tool_use" && m.payload.name === "Bash"), "the late child call is not projected");
+    assert.equal(rec(rec(rig.transport.responses.find((r) => r.requestId === 21)?.response).result).success, false);
+    assert.equal(emitted.filter((m) => m.kind === "tool_use").length, 1, "only the dispatch tool_use");
+  });
+
+  it("(m2-9) a failed child start (turn/start throws) projects no dispatch and no completion", async () => {
+    const rig = makeRig({ responder: delegationResponder(() => undefined, { failChildTurnStart: true }) });
+    rig.transport.push(threadStarted()).push(spawn(1, "c-root", { subagent_type: "coder", description: "[m1] fail", prompt: "p" }));
+    const { ctx, emitted } = makeCtx({ agents });
+    const runP = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    await finishRoot(rig, [1]);
+    await withTimeout(runP, 3000, "failed-start run");
+    assert.equal(agentUses(emitted).length, 0, "no dispatch frame");
+    assert.equal(emitted.filter((m) => m.kind === "tool_result").length, 0, "no completion");
+    assert.equal(rec(rec(rig.transport.responses.find((r) => r.requestId === 1)?.response).result).success, false);
+    assert.equal(responsesFor(rig, 1), 1);
+  });
+});
+
 describe("CodexExecutor: an api_key run meters the root model end-to-end (executor→harness authMode wiring)", () => {
   it("(C4b) an api_key binding drives a metered root modelUsage entry with the exact Standard costUSD", async () => {
     // The seam under test is codex-executor.ts's `authMode: binding.authMode` into new CodexHarness:

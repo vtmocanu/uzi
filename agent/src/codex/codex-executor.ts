@@ -2286,10 +2286,15 @@ export class CodexExecutor implements Executor {
         sink.end();
         throw err;
       }
+      // Issue #1583: bind the started child to its parent delegation callback, which emits the
+      // lead dispatch frame. Only AFTER turn/start succeeded, so a failed child start projects no
+      // dispatch (and hence no completion). The role is the broker-ADMITTED one, never the args.
+      harness.bindChildDispatch(childThreadId, spec.parent, spec.role);
       return {
         threadId: childThreadId,
         turnId: childTurnId,
         notifications: () => sink.iterator(),
+        project: (items) => harness.emitChildFrame(childThreadId, items),
         respond: (requestId, reply) => harness.respondOnTransport(requestId, reply),
         interrupt: async (): Promise<void> => {
           await harness

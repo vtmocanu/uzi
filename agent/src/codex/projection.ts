@@ -33,6 +33,10 @@ const MAX_DISPLAY_FIELD_BYTES = 1024;
 const MAX_PREVIEW_BYTES = 8 * 1024;
 // A tool name is model-influenced; keep it short.
 const MAX_NAME_BYTES = 256;
+// A delegation label (the model's `description` arg) is display-only; keep it short too.
+const MAX_LABEL_BYTES = 256;
+// One projected child text/thinking item (a subagent's message), bounded on its JSON-escaped size.
+const MAX_PROJECTED_TEXT_BYTES = 64 * 1024;
 // The call-id part of a projected id.
 const MAX_CALL_ID_CHARS = 64;
 // Containers nested deeper than this are replaced by DEPTH_MARKER while scrubbing.
@@ -211,8 +215,27 @@ export function projectToolInput(args: unknown, scrub: ProjectionScrub): unknown
  *  BEFORE bounding, and bounded on its JSON-escaped size, so the persisted
  *  `JSON.stringify(content)` is at most MAX_PROJECTED_BYTES + 2 (the quotes). */
 export function projectToolOutput(result: CallbackResult, scrub: ProjectionScrub): string {
-  const text = result.ok ? safeStringify(result.output) : result.message;
-  return boundJsonString(cleanScrub(text, scrub), MAX_PROJECTED_BYTES);
+  return projectOutputValue(result.ok ? result.output : result.message, scrub);
+}
+
+/** Project a raw tool output VALUE (a string passes through, anything else is JSON-stringified)
+ *  into a bounded `tool_result` content string: scrubbed BEFORE it is bounded on its JSON-escaped
+ *  size, exactly like {@link projectToolOutput}. Used for a delegated child's tool results. */
+export function projectOutputValue(value: unknown, scrub: ProjectionScrub): string {
+  return boundJsonString(cleanScrub(safeStringify(value), scrub), MAX_PROJECTED_BYTES);
+}
+
+/** Project one text/thinking string (a delegated child's message): scrubbed BEFORE it is
+ *  bounded on its JSON-escaped size. */
+export function projectText(text: string, scrub: ProjectionScrub): string {
+  return boundJsonString(cleanScrub(text, scrub), MAX_PROJECTED_TEXT_BYTES);
+}
+
+/** Drop every control and bidi/format code point (the broker's `isUnsafeIdentifierChar` set). */
+function stripUnsafe(s: string): string {
+  let out = "";
+  for (const ch of s) if (!isUnsafeIdentifierChar(ch.codePointAt(0) ?? 0)) out += ch;
+  return out;
 }
 
 /** A bounded, scrubbed display name for a projected tool item. Control and bidi/format code
@@ -222,10 +245,15 @@ export function projectToolOutput(result: CallbackResult, scrub: ProjectionScrub
  *  zero-width/control char had split past the exact-substring redactor. */
 export function projectToolName(name: string | undefined, scrub: ProjectionScrub): string {
   if (name === undefined) return "unknown";
-  let stripped = "";
-  for (const ch of name) if (!isUnsafeIdentifierChar(ch.codePointAt(0) ?? 0)) stripped += ch;
-  const safe = cleanScrub(stripped, scrub);
+  const safe = cleanScrub(stripUnsafe(name), scrub);
   return safe.length === 0 ? "unknown" : boundUtf8(safe, MAX_NAME_BYTES);
+}
+
+/** A bounded, scrubbed display label (a delegation's model-supplied `description`). Unsafe code
+ *  points are stripped BEFORE the scrub, for the same reason as {@link projectToolName}; an empty
+ *  result stays empty (a label is optional). */
+export function projectLabel(label: string, scrub: ProjectionScrub): string {
+  return boundUtf8(cleanScrub(stripUnsafe(label), scrub), MAX_LABEL_BYTES);
 }
 
 /** A fresh per-harness id nonce: 12 lowercase hex chars. */
@@ -245,10 +273,30 @@ export function projectedId(
   counter: number,
   scrub: ProjectionScrub = (s) => s,
 ): string {
+  return `cx-${nonce}-t${turnOrdinal}-${callIdPart(callId, counter, scrub)}`;
+}
+
+/**
+ * The id of one projected tool pair inside a delegated child: `<dispatchId>:<callIdPart>`, so
+ * every child tool id is namespaced under its dispatch (itself namespaced by harness nonce and
+ * turn). The call-id part is restricted, scrubbed and capped exactly like {@link projectedId}.
+ */
+export function childProjectedId(
+  dispatchId: string,
+  callId: string,
+  counter: number,
+  scrub: ProjectionScrub = (s) => s,
+): string {
+  return `${dispatchId}:${callIdPart(callId, counter, scrub)}`;
+}
+
+/** The provider call id restricted to `[A-Za-z0-9_.:-]`, scrubbed and capped at 64 chars, or
+ *  `n<counter>` when nothing survives. */
+function callIdPart(callId: string, counter: number, scrub: ProjectionScrub): string {
   // Restrict, scrub (a restrict-joined secret is matched here), restrict again (the redaction
   // marker's `*` is outside the id alphabet), and only THEN cap, so a long secret's prefix can
   // never survive the cut.
   const restrict = (s: string): string => s.replace(/[^A-Za-z0-9_.:-]/g, "");
   const part = restrict(scrub(restrict(callId))).slice(0, MAX_CALL_ID_CHARS);
-  return `cx-${nonce}-t${turnOrdinal}-${part.length > 0 ? part : `n${counter}`}`;
+  return part.length > 0 ? part : `n${counter}`;
 }

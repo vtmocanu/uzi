@@ -43,7 +43,9 @@
 //                               An ACTIVE-TURN non-signal, non-delegation root call is ALSO
 //                               projected (issue #1583) as a lead tool started/finished frame
 //                               pair, queued on the turn's outbox and drained ahead of its
-//                               `activity`
+//                               `activity`. An active-turn DELEGATION is projected as a lead
+//                               "Agent" dispatch/completion pair around its child's
+//                               subagent-origin frames (bindChildDispatch / emitChildFrame)
 //   auth refresh request      → narrow auth owner (never broker), then `activity`
 //   other server→client req   → fail-closed JSON-RPC method error, then `activity`
 //   turn/completed            → `turn_finished` (decoded terminal; success/failed by
@@ -68,8 +70,12 @@ import {
 } from "./terminal-normalize.js";
 import { CodexUsageAccountant, deriveCodexRunCost } from "./token-accounting.js";
 import {
+  childProjectedId,
   newProjectionNonce,
   projectedId,
+  projectLabel,
+  projectOutputValue,
+  projectText,
   projectToolInput,
   projectToolName,
   projectToolOutput,
@@ -286,6 +292,39 @@ interface RoutedRootSignal {
   readonly signals: Readonly<Partial<TurnSignals>>;
 }
 
+/** Issue #1583: one ACTIVE-TURN root delegation callback, recorded when it is routed so the child
+ *  it starts can be bound to it (see {@link CodexHarness.bindChildDispatch}). `pending` until its
+ *  child starts, `bound` once the lead dispatch frame was emitted, `closed` once a completion was
+ *  emitted (or can no longer be: the turn stopped/ended). Removed when its callback settles. */
+interface DelegationDispatch {
+  readonly threadId: string;
+  readonly turnId: string;
+  readonly callId: string;
+  /** The namespaced projected id: the lead dispatch tool_use id AND the child lane's instance. */
+  readonly dispatchId: string;
+  /** The scrubbed + bounded `description` arg (display only, never authority); may be "". */
+  readonly label: string;
+  readonly ordinal: number;
+  state: "pending" | "bound" | "closed";
+}
+
+/** A child thread bound to its dispatch: the projected (scrubbed, bounded) admitted role, and the
+ *  per-child tool-id bookkeeping (ids unique within the child, started paired to finished). */
+interface ChildBinding {
+  readonly dispatch: DelegationDispatch;
+  readonly role: string;
+  counter: number;
+  readonly issuedIds: Set<string>;
+  readonly openTools: Map<string, string>;
+}
+
+/** The synthesized lead completion for a bound dispatch the run stopped (abort/stop/close). */
+const DISPATCH_STOPPED = "delegation stopped by the run; child settlement not confirmed";
+/** The synthesized lead completion for a bound dispatch still open when its turn finished. */
+const DISPATCH_OPEN_AT_TURN_END = "delegation still open at turn end; child settlement not confirmed";
+/** The lead tool name a dispatch is projected under (the server's milestone-lane contract). */
+const DISPATCH_TOOL_NAME = "Agent";
+
 // --- the harness --------------------------------------------------------------
 
 export class CodexHarness implements RunHarness {
@@ -359,6 +398,10 @@ export class CodexHarness implements RunHarness {
   // deadlock the transport read). It runs in the background, tracked here, and the turn
   // stream flushes it before ending. Every non-delegate callback stays inline.
   private readonly pendingToolCalls = new Set<Promise<unknown>>();
+  // Issue #1583: the in-flight root delegation callbacks (see DelegationDispatch) and the child
+  // threads bound to one of them. A child frame projects ONLY through a binding.
+  private readonly dispatches = new Set<DelegationDispatch>();
+  private readonly childBindings = new Map<string, ChildBinding>();
 
   // Per-turn state (turns run strictly sequentially).
   private activeTurnId?: string;
@@ -441,9 +484,159 @@ export class CodexHarness implements RunHarness {
     this.accountant.registerThread(threadId, model, false);
   }
 
-  /** Stop routing frames for `threadId` to a child sink (the child turn is done). */
+  /** Stop routing frames for `threadId` to a child sink (the child turn is done). Also drops the
+   *  thread's dispatch binding, so a late note for it projects nothing. */
   unregisterChildSink(threadId: string): void {
     this.childSinks.delete(threadId);
+    this.childBindings.delete(threadId);
+  }
+
+  /**
+   * Issue #1583: bind a just-started child thread to the root delegation callback that started it,
+   * and emit the LEAD dispatch frame (`tool_use` named "Agent", id = the dispatch id, input =
+   * `{subagent_type, description}`). `parent` is the callback identity the broker handed the
+   * delegate seam; `admittedRole` is the role the broker ADMITTED (never re-read from the args).
+   *
+   * Binds only a REGISTERED child thread to EXACTLY ONE pending, unbound dispatch of the live turn
+   * with that parent key; none, or an ambiguous key (two in-flight calls sharing it), binds nothing
+   * and the child runs unprojected. Fail-safe: never throws.
+   */
+  bindChildDispatch(
+    childThreadId: string,
+    parent: { readonly threadId: string; readonly turnId: string; readonly callId: string },
+    admittedRole: string,
+  ): void {
+    try {
+      if (!this.childSinks.has(childThreadId) || this.childBindings.has(childThreadId)) return;
+      const matches = [...this.dispatches].filter(
+        (d) =>
+          d.state === "pending" &&
+          d.threadId === parent.threadId &&
+          d.turnId === parent.turnId &&
+          d.callId === parent.callId,
+      );
+      if (matches.length !== 1) return;
+      const dispatch = matches[0]!;
+      if (dispatch.ordinal !== this.liveProjectionTurn) return;
+      let role: string;
+      try {
+        role = projectToolName(admittedRole, this.scrubProjected);
+      } catch {
+        role = "unknown";
+      }
+      dispatch.state = "bound";
+      this.childBindings.set(childThreadId, { dispatch, role, counter: 0, issuedIds: new Set(), openTools: new Map() });
+      this.emitProjected(
+        this.leadFrame({
+          kind: "tool",
+          phase: "started",
+          id: dispatch.dispatchId,
+          name: DISPATCH_TOOL_NAME,
+          input: { subagent_type: role, description: dispatch.label },
+        }),
+        dispatch.ordinal,
+      );
+    } catch {
+      /* projection is best-effort: the child runs regardless */
+    }
+  }
+
+  /**
+   * Issue #1583: project RAW child items as one subagent-origin frame attributed to the bound
+   * dispatch (`agent` = the admitted role, `agentInstance` = the dispatch id, `agentLabel` = its
+   * label when non-empty). Pushed ONLY while `childThreadId` is registered AND bound to a dispatch
+   * that is still open, and under the dispatch's turn ordinal, so nothing projects after its turn
+   * ended. The frame NEVER carries `signals`.
+   *
+   * Items are raw and projected here, so the caller never needs the scrub: text/thinking are
+   * scrubbed then bounded; a tool item's `id` is the provider call id (a `started` is issued a
+   * fresh `<dispatchId>:<callId>` id, and its `finished` reuses it; a finished with no open started
+   * is dropped), its `name` the canonical tool name, its `input` the raw args and its `output` the
+   * raw output value (the broker's message on failure). Fail-safe: never throws.
+   */
+  emitChildFrame(childThreadId: string, items: readonly HarnessItem[]): void {
+    try {
+      if (!this.childSinks.has(childThreadId)) return;
+      const binding = this.childBindings.get(childThreadId);
+      if (binding === undefined || binding.dispatch.state !== "bound") return;
+      const projected: HarnessItem[] = [];
+      for (const item of items) {
+        const one = this.projectChildItem(binding, item);
+        if (one !== undefined) projected.push(one);
+      }
+      if (projected.length === 0) return;
+      const { dispatch, role } = binding;
+      this.emitProjected(
+        {
+          kind: "frame",
+          origin: { kind: "subagent", role, instanceId: dispatch.dispatchId },
+          attribution: {
+            agent: role,
+            agentInstance: dispatch.dispatchId,
+            ...(dispatch.label.length > 0 ? { agentLabel: dispatch.label } : {}),
+          },
+          items: projected,
+          sessionId: this.threadId,
+        },
+        dispatch.ordinal,
+      );
+    } catch {
+      /* projection is best-effort: the child runs regardless */
+    }
+  }
+
+  /** Project one raw child item (see {@link emitChildFrame}); undefined drops it. */
+  private projectChildItem(binding: ChildBinding, item: HarnessItem): HarnessItem | undefined {
+    const scrub = this.scrubProjected;
+    if (item.kind === "text" || item.kind === "thinking") return { kind: item.kind, text: projectText(item.text, scrub) };
+    const rawId = item.id ?? "";
+    let name: string;
+    try {
+      name = projectToolName(item.name, scrub);
+    } catch {
+      name = "unknown";
+    }
+    if (item.phase === "started") {
+      const id = this.issueChildToolId(binding, rawId);
+      binding.openTools.set(rawId, id);
+      let input: unknown;
+      try {
+        input = projectToolInput(item.input, scrub);
+      } catch {
+        input = { truncated: true };
+      }
+      return { kind: "tool", phase: "started", id, name, input };
+    }
+    const id = binding.openTools.get(rawId);
+    if (id === undefined) return undefined;
+    binding.openTools.delete(rawId);
+    let output: string;
+    try {
+      output = projectOutputValue(item.output, scrub);
+    } catch {
+      output = "[projection failed]";
+    }
+    return { kind: "tool", phase: "finished", id, name, output, isError: item.isError === true };
+  }
+
+  /** A `<dispatchId>:<callId>` id not yet issued within this child (a colliding one gets a
+   *  `-n<counter>` suffix until unique). */
+  private issueChildToolId(binding: ChildBinding, callId: string): string {
+    binding.counter += 1;
+    const dispatchId = binding.dispatch.dispatchId;
+    let base: string;
+    try {
+      base = childProjectedId(dispatchId, callId, binding.counter, this.scrubProjected);
+    } catch {
+      base = childProjectedId(dispatchId, "", binding.counter);
+    }
+    let id = base;
+    while (binding.issuedIds.has(id)) {
+      binding.counter += 1;
+      id = `${base}-n${binding.counter}`;
+    }
+    binding.issuedIds.add(id);
+    return id;
   }
 
   /** Send a request on the shared provider transport. The child-thread seam uses it to
@@ -677,6 +870,7 @@ export class CodexHarness implements RunHarness {
       //    projected tool frame queued before the stream ends is never silently lost.
       for (;;) {
         if (this.turnClosed) {
+          this.closeOpenDispatches(ordinal, DISPATCH_STOPPED);
           yield* this.drainOutbox();
           return;
         }
@@ -696,8 +890,10 @@ export class CodexHarness implements RunHarness {
           throw error;
         }
         if (step === "aborted") {
-          // Owner cancel/watchdog wins: interrupt the turn and end the stream cleanly.
+          // Owner cancel/watchdog wins: interrupt the turn and end the stream cleanly. A bound
+          // delegation still open gets a synthesized, unconfirmed lead completion first.
           this.endTurnOnStop();
+          this.closeOpenDispatches(ordinal, DISPATCH_STOPPED);
           yield* this.drainOutbox();
           return;
         }
@@ -707,6 +903,7 @@ export class CodexHarness implements RunHarness {
           // this is Codex's own unexpected EOF → a protocol throw (rule 9), never a
           // fabricated success.
           if (this.terminalEmitted || this.turnClosed) {
+            this.closeOpenDispatches(ordinal, DISPATCH_STOPPED);
             yield* this.drainOutbox();
             return;
           }
@@ -774,9 +971,13 @@ export class CodexHarness implements RunHarness {
         }
         if (mapped === "aborted") {
           this.endTurnOnStop();
+          this.closeOpenDispatches(ordinal, DISPATCH_STOPPED);
           yield* this.drainOutbox();
           return;
         }
+        // The owner stops consuming at `turn_finished`, so a bound delegation still open here
+        // gets its (unconfirmed) lead completion BEFORE the terminal, never after it.
+        if (mapped.kind === "turn_finished") this.closeOpenDispatches(ordinal, DISPATCH_OPEN_AT_TURN_END);
         yield* this.drainOutbox();
         yield mapped;
         if (mapped.kind === "turn_finished") {
@@ -786,8 +987,8 @@ export class CodexHarness implements RunHarness {
           // child self-bounds via its own per-child deadline (delegation.ts), so this
           // await is finite. The non-delegation path has an empty set and never waits.
           if (this.pendingToolCalls.size > 0) await Promise.allSettled(this.pendingToolCalls);
-          // Nothing projects from a background (delegation) callback yet, so this is empty
-          // today; it keeps the "drain before return" invariant for when one does.
+          // Every dispatch of this turn was closed above, so a delegation settling here projects
+          // no completion; this drain only keeps the "drain before return" invariant.
           yield* this.drainOutbox();
           return; // close the iterator after the terminal
         }
@@ -1119,10 +1320,18 @@ export class CodexHarness implements RunHarness {
     // never a workflow signal, so it emits NO signals frame. EVERY OTHER callback is awaited
     // inline exactly as before, so the non-delegation path is byte-identical (the abort race
     // in runTurn still bounds a wedged inline callback).
+    //
+    // Issue #1583: the delegation is recorded as a pending dispatch. The lead dispatch frame is
+    // emitted only once its child actually starts (bindChildDispatch), and its lead completion
+    // is queued once the broker settles, BEFORE the reply; the record is dropped on settle.
     if (canonical !== undefined && CODEX_DELEGATE_TOOLS.has(canonical)) {
-      const task = runAndReply();
+      const dispatch = this.recordDispatch(threadId, turnId, callId, p.arguments);
+      const task = runAndReply(dispatch === undefined ? undefined : (result) => this.completeDispatch(dispatch, result));
       this.pendingToolCalls.add(task);
-      void task.finally(() => this.pendingToolCalls.delete(task));
+      void task.finally(() => {
+        this.pendingToolCalls.delete(task);
+        if (dispatch !== undefined) this.dispatches.delete(dispatch);
+      });
       return undefined;
     }
     // Issue #1583: project every other ACTIVE-TURN root callback (shell/file/mcp/unknown) as a
@@ -1167,14 +1376,7 @@ export class CodexHarness implements RunHarness {
       } catch {
         name = "unknown";
       }
-      const frame = (item: HarnessItem): HarnessEvent => ({
-        kind: "frame",
-        origin: { kind: "main" },
-        attribution: { agent: "lead" },
-        items: [item],
-        model: this.currentModel,
-        sessionId: this.threadId,
-      });
+      const frame = (item: HarnessItem): HarnessEvent => this.leadFrame(item);
       let input: unknown;
       try {
         input = projectToolInput(args, this.scrubProjected);
@@ -1193,6 +1395,87 @@ export class CodexHarness implements RunHarness {
       };
     } catch {
       return undefined;
+    }
+  }
+
+  /** One projected main-origin, lead-attributed frame carrying `item` (never `signals`). */
+  private leadFrame(item: HarnessItem): HarnessEvent {
+    return {
+      kind: "frame",
+      origin: { kind: "main" },
+      attribution: { agent: "lead" },
+      items: [item],
+      model: this.currentModel,
+      sessionId: this.threadId,
+    };
+  }
+
+  /** Issue #1583: record one active-turn root delegation callback as a pending dispatch. Its id
+   *  comes from the same namespaced, per-turn-unique helper as every projected id; its label is
+   *  the `description` arg (scrubbed + bounded) or "". The role is NOT read here: it is bound
+   *  later from what the broker admitted. Fail-safe: undefined on any failure. */
+  private recordDispatch(threadId: string, turnId: string, callId: string, args: unknown): DelegationDispatch | undefined {
+    try {
+      const ordinal = this.turnOrdinal;
+      const dispatchId = this.issueProjectionId(ordinal, callId);
+      let label = "";
+      try {
+        const description = asObject(args)?.description;
+        if (typeof description === "string") label = projectLabel(description, this.scrubProjected);
+      } catch {
+        label = "";
+      }
+      const dispatch: DelegationDispatch = { threadId, turnId, callId, dispatchId, label, ordinal, state: "pending" };
+      this.dispatches.add(dispatch);
+      return dispatch;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Queue the lead completion (`tool_result` for the dispatch id) of a BOUND dispatch whose
+   *  broker call settled, and close it. Runs before the reply; an unbound or already-closed
+   *  dispatch (child never started, or the turn stopped first) projects nothing. */
+  private completeDispatch(dispatch: DelegationDispatch, result: CallbackResult): void {
+    if (dispatch.state !== "bound") return;
+    dispatch.state = "closed";
+    let output: string;
+    try {
+      output = projectToolOutput(result, this.scrubProjected);
+    } catch {
+      output = "[projection failed]";
+    }
+    this.emitProjected(
+      this.leadFrame({ kind: "tool", phase: "finished", id: dispatch.dispatchId, name: DISPATCH_TOOL_NAME, output, isError: !result.ok }),
+      dispatch.ordinal,
+    );
+  }
+
+  /** Close every dispatch of turn `ordinal`: a BOUND one gets a synthesized error completion
+   *  carrying `content` (its child's settlement is not confirmed), a pending one can no longer
+   *  bind. A later real settlement of a closed dispatch projects nothing, so there is never a
+   *  duplicate completion. Fail-safe: never throws. */
+  private closeOpenDispatches(ordinal: number, content: string): void {
+    try {
+      for (const dispatch of this.dispatches) {
+        if (dispatch.ordinal !== ordinal || dispatch.state === "closed") continue;
+        const wasBound = dispatch.state === "bound";
+        dispatch.state = "closed";
+        if (!wasBound) continue;
+        this.emitProjected(
+          this.leadFrame({
+            kind: "tool",
+            phase: "finished",
+            id: dispatch.dispatchId,
+            name: DISPATCH_TOOL_NAME,
+            output: content,
+            isError: true,
+          }),
+          ordinal,
+        );
+      }
+    } catch {
+      /* projection is best-effort */
     }
   }
 

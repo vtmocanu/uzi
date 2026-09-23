@@ -5,8 +5,12 @@ import {
   MAX_PROJECTED_BYTES,
   boundJsonString,
   boundUtf8,
+  childProjectedId,
   newProjectionNonce,
   projectedId,
+  projectLabel,
+  projectOutputValue,
+  projectText,
   projectToolInput,
   projectToolName,
   projectToolOutput,
@@ -244,6 +248,41 @@ describe("codex projection: persisted-path re-join (batcher normalization after 
     const id = projectedId("abcdef012345", 1, released.slice(0, 4) + "\u200b" + released.slice(4) + "x".repeat(80), 1, scrub);
     assert.ok(!id.includes(released.slice(0, 12)), id);
     assert.match(id, /^cx-abcdef012345-t1-[A-Za-z0-9_.:-]+$/);
+  });
+
+  it("a released token CROSSING char 64 of the call id leaves no 12-char prefix (scrub precedes the cap)", () => {
+    // The token starts at char 50 and ends past char 64, so capping first would keep a 14-char
+    // prefix the exact-substring scrub could no longer match.
+    const callId = "x".repeat(50) + released;
+    assert.ok(callId.length > 64 && callId.indexOf(released) < 64);
+    for (const id of [projectedId("abcdef012345", 1, callId, 1, scrub), childProjectedId("cx-abcdef012345-t1-c", callId, 1, scrub)]) {
+      for (let n = 12; n <= released.length; n += 1) assert.ok(!id.includes(released.slice(0, n)), `${n}-char prefix in ${id}`);
+    }
+  });
+});
+
+describe("codex projection: delegation helpers (m2)", () => {
+  const scrub = (s: string): string => s.split("SECRETTOKEN").join("***");
+
+  it("childProjectedId namespaces the sanitised call id under the dispatch id, falling back to n<counter>", () => {
+    assert.equal(childProjectedId("cx-abcdef012345-t2-c-root", "cc\n<b>ash", 1), "cx-abcdef012345-t2-c-root:ccbash");
+    assert.equal(childProjectedId("cx-abcdef012345-t2-c-root", "\u0000", 4), "cx-abcdef012345-t2-c-root:n4");
+  });
+
+  it("projectLabel strips unsafe chars before scrubbing, keeps an empty label empty, and bounds it", () => {
+    assert.equal(projectLabel("[m1] wire\u202e it", scrub), "[m1] wire it");
+    assert.equal(projectLabel("", scrub), "");
+    assert.equal(projectLabel("SECRET\u200bTOKEN here", scrub), "*** here");
+    const long = projectLabel("[m1] " + "y".repeat(1000), scrub);
+    assert.ok(Buffer.byteLength(long, "utf8") <= 256 && long.startsWith("[m1] "));
+  });
+
+  it("projectText and projectOutputValue scrub before bounding", () => {
+    assert.equal(projectText("a SECRETTOKEN b", scrub), "a *** b");
+    assert.equal(projectOutputValue({ out: "SECRETTOKEN" }, scrub), JSON.stringify({ out: "***" }));
+    const big = projectOutputValue("z".repeat(MAX_PROJECTED_BYTES - 5) + "SECRETTOKEN" + "z".repeat(100), scrub);
+    assert.ok(!big.includes("SECRETTOK"), "no fragment survives the cut");
+    assert.ok(Buffer.byteLength(JSON.stringify(big), "utf8") <= MAX_PROJECTED_BYTES + 2);
   });
 });
 

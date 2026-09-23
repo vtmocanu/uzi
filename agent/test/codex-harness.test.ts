@@ -1902,6 +1902,187 @@ describe("CodexHarness: root tool projection outbox (issue #1583)", () => {
   });
 });
 
+describe("CodexHarness: delegation dispatch binding + child frames (issue #1583 m2)", () => {
+  const scrubProjected = (s: string): string => s.split("SECRET").join("***");
+  const frames = (events: HarnessEvent[]): Extract<HarnessEvent, { kind: "frame" }>[] =>
+    events.flatMap((e) => (e.kind === "frame" ? [e] : []));
+
+  async function waitUntil(cond: () => boolean, label: string): Promise<void> {
+    for (let i = 0; i < 2000 && !cond(); i += 1) await tick();
+    if (!cond()) throw new Error(`timed out waiting for ${label}`);
+  }
+
+  it("binds nothing when the parent key is ambiguous (two in-flight calls share an empty call id)", async () => {
+    let harnessRef!: CodexHarness;
+    let entered = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const broker = stubBroker(async (rt, name) => {
+      if (name !== "spawn_agent") return { ok: true, output: {} };
+      entered += 1;
+      const child = `th-child-${entered}`;
+      await gate;
+      harnessRef.registerChildSink(child, { push: () => {} });
+      harnessRef.bindChildDispatch(child, rt, "coder");
+      harnessRef.emitChildFrame(child, [{ kind: "text", text: "child says" }]);
+      harnessRef.unregisterChildSink(child);
+      return { ok: true, output: { text: "done" } };
+    });
+    const { harness, transport } = makeHarness({ broker, idNonce: "abcdef012345" });
+    harnessRef = harness;
+    transport
+      .push(threadStarted())
+      .push(toolCall(1, "spawn_agent", { subagent_type: "coder", description: "[a]" }, "th-1", "tn-1", ""))
+      .push(toolCall(2, "spawn_agent", { subagent_type: "coder", description: "[b]" }, "th-1", "tn-1", ""));
+    const eventsP = collect(harness.startTurn(makeRequest()).events);
+    await waitUntil(() => entered === 2, "both delegations in flight");
+    release();
+    await waitUntil(() => transport.responses.length === 2, "both replies");
+    transport.push(turnCompleted("completed")).end();
+    const events = await withTimeout(eventsP, 2000, "ambiguous turn");
+    assert.deepEqual(frames(events), [], "no dispatch, child or completion frame for an ambiguous key");
+    assert.equal(events[events.length - 1]!.kind, "turn_finished");
+  });
+
+  it("emitChildFrame projects only for a registered AND bound thread, scrubbed, namespaced and signal-free", async () => {
+    let harnessRef!: CodexHarness;
+    const broker = stubBroker(async (rt, name) => {
+      if (name !== "spawn_agent") return { ok: true, output: {} };
+      const h = harnessRef;
+      h.emitChildFrame("th-c", [{ kind: "text", text: "unregistered" }]);
+      h.bindChildDispatch("th-c", rt, "coder"); // not registered yet: binds nothing
+      h.registerChildSink("th-c", { push: () => {} });
+      h.emitChildFrame("th-c", [{ kind: "text", text: "unbound" }]);
+      h.bindChildDispatch("th-c", { ...rt, callId: "other" }, "coder"); // no pending dispatch for that key
+      h.bindChildDispatch("th-c", rt, "co\u001bder");
+      h.bindChildDispatch("th-c", rt, "coder"); // already bound: no second dispatch frame
+      h.emitChildFrame("th-c", [
+        { kind: "text", text: "tok SECRET" },
+        { kind: "tool", phase: "started", id: "call 1", name: "Bash", input: { command: "cat SECRET" }, signal: "submit_plan" },
+        { kind: "tool", phase: "finished", id: "call 1", name: "Bash", output: "SECRET out", isError: false },
+        { kind: "tool", phase: "finished", id: "never-started", name: "Bash", output: "x" },
+      ]);
+      h.unregisterChildSink("th-c");
+      h.emitChildFrame("th-c", [{ kind: "text", text: "late" }]);
+      return { ok: true, output: { text: "done" } };
+    });
+    const { harness, transport } = makeHarness({ broker, idNonce: "abcdef012345", scrubProjected });
+    harnessRef = harness;
+    transport
+      .push(threadStarted())
+      .push(toolCall(1, "spawn_agent", { subagent_type: "coder", description: "[m1] SECRET label" }, "th-1", "tn-1", "c-1"));
+    const eventsP = collect(harness.startTurn(makeRequest()).events);
+    await waitUntil(() => transport.responses.length === 1, "the parent reply");
+    transport.push(turnCompleted("completed")).end();
+    const events = await withTimeout(eventsP, 2000, "bound turn");
+
+    const dispatchId = "cx-abcdef012345-t1-c-1";
+    const fs = frames(events);
+    assert.equal(fs.length, 3, "dispatch, one child frame, completion");
+    const [dispatch, child, completion] = fs as [(typeof fs)[number], (typeof fs)[number], (typeof fs)[number]];
+    assert.deepEqual(dispatch.origin, { kind: "main" });
+    assert.deepEqual(dispatch.attribution, { agent: "lead" });
+    assert.deepEqual(dispatch.items, [
+      { kind: "tool", phase: "started", id: dispatchId, name: "Agent", input: { subagent_type: "coder", description: "[m1] *** label" } },
+    ]);
+    assert.deepEqual(child.origin, { kind: "subagent", role: "coder", instanceId: dispatchId });
+    assert.deepEqual(child.attribution, { agent: "coder", agentInstance: dispatchId, agentLabel: "[m1] *** label" });
+    assert.equal(child.signals, undefined);
+    assert.deepEqual(child.items, [
+      { kind: "text", text: "tok ***" },
+      { kind: "tool", phase: "started", id: `${dispatchId}:call1`, name: "Bash", input: { command: "cat ***" } },
+      { kind: "tool", phase: "finished", id: `${dispatchId}:call1`, name: "Bash", output: "*** out", isError: false },
+    ]);
+    assert.deepEqual(completion.items, [
+      { kind: "tool", phase: "finished", id: dispatchId, name: "Agent", output: JSON.stringify({ text: "done" }), isError: false },
+    ]);
+    assert.ok(events.indexOf(completion) < events.findIndex((e) => e.kind === "turn_finished"));
+    assert.equal(transport.responses.length, 1, "exactly one reply");
+  });
+
+  it("a bound dispatch still open at turn end gets ONE unconfirmed completion before turn_finished; its late settlement adds none", async () => {
+    let harnessRef!: CodexHarness;
+    let release!: (r: CallbackResult) => void;
+    const settle = new Promise<CallbackResult>((r) => {
+      release = r;
+    });
+    let bound = false;
+    const broker = stubBroker(async (rt, name) => {
+      if (name !== "spawn_agent") return { ok: true, output: {} };
+      harnessRef.registerChildSink("th-c", { push: () => {} });
+      harnessRef.bindChildDispatch("th-c", rt, "coder");
+      bound = true;
+      return settle;
+    });
+    const { harness, transport } = makeHarness({ broker, idNonce: "abcdef012345" });
+    harnessRef = harness;
+    transport.push(threadStarted()).push(toolCall(1, "spawn_agent", { subagent_type: "coder" }, "th-1", "tn-1", "c-1"));
+    const iter = harness.startTurn(makeRequest()).events[Symbol.asyncIterator]();
+    const seen: HarnessEvent[] = [];
+    // Pull up to (and including) turn_finished in the background: the generator is lazy.
+    const upToTerminal = (async (): Promise<void> => {
+      for (;;) {
+        const step = await iter.next();
+        assert.ok(!step.done, "the stream ended before turn_finished");
+        seen.push(step.value);
+        if (step.value.kind === "turn_finished") return;
+      }
+    })();
+    await waitUntil(() => bound, "the dispatch bound");
+    transport.push(turnCompleted("completed")).end();
+    await withTimeout(upToTerminal, 2000, "turn events");
+    const tail = iter.next();
+    release({ ok: true, output: { text: "late success" } });
+    for (let step = await withTimeout(tail, 2000, "the late settle"); !step.done; step = await iter.next()) seen.push(step.value);
+
+    const results = frames(seen).flatMap((f) => f.items).filter((i) => i.kind === "tool" && i.phase === "finished");
+    assert.equal(results.length, 1, "exactly one completion");
+    assert.deepEqual(results[0], {
+      kind: "tool",
+      phase: "finished",
+      id: "cx-abcdef012345-t1-c-1",
+      name: "Agent",
+      output: "delegation still open at turn end; child settlement not confirmed",
+      isError: true,
+    });
+    const completionAt = seen.findIndex((e) => e.kind === "frame" && e.items.some((i) => i.kind === "tool" && i.phase === "finished"));
+    assert.ok(completionAt < seen.findIndex((e) => e.kind === "turn_finished"), "the completion precedes turn_finished");
+    assert.equal(transport.responses.filter((r) => r.requestId === 1).length, 1, "the parent still replied exactly once");
+  });
+
+  it("requestStop with a bound open dispatch yields a synthesized stopped completion before the stream ends", async () => {
+    let harnessRef!: CodexHarness;
+    let bound = false;
+    const broker = stubBroker(async (rt, name) => {
+      if (name !== "spawn_agent") return { ok: true, output: {} };
+      harnessRef.registerChildSink("th-c", { push: () => {} });
+      harnessRef.bindChildDispatch("th-c", rt, "coder");
+      bound = true;
+      return new Promise<CallbackResult>(() => {});
+    });
+    const { harness, transport } = makeHarness({ broker, idNonce: "abcdef012345" });
+    harnessRef = harness;
+    transport.push(threadStarted()).push(toolCall(1, "spawn_agent", { subagent_type: "coder" }, "th-1", "tn-1", "c-1"));
+    const turn = harness.startTurn(makeRequest());
+    const eventsP = collect(turn.events);
+    await waitUntil(() => bound, "the dispatch bound");
+    turn.requestStop("cancel");
+    const events = await withTimeout(eventsP, 2000, "stopped turn");
+    const items = frames(events).flatMap((f) => f.items);
+    assert.equal(items.length, 2, "the dispatch and its synthesized completion");
+    assert.deepEqual(items[1], {
+      kind: "tool",
+      phase: "finished",
+      id: "cx-abcdef012345-t1-c-1",
+      name: "Agent",
+      output: "delegation stopped by the run; child settlement not confirmed",
+      isError: true,
+    });
+  });
+});
+
 describe("CodexHarness: projection is fail-safe (issue #1583)", () => {
   function toolItems(events: HarnessEvent[]): Extract<HarnessEvent, { kind: "frame" }>["items"][number][] {
     return events.flatMap((e) => (e.kind === "frame" ? e.items : [])).filter((i) => i.kind === "tool");

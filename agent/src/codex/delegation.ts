@@ -36,7 +36,9 @@
 // wires itself into runner.ts.
 
 import {
+  CODEX_SIGNAL_TOOLS,
   CodexCallbackBroker,
+  canonicalizeCodexToolName,
   type CallbackResult,
   type CallbackRuntimeId,
   type ChildDelegationRequest,
@@ -47,7 +49,7 @@ import {
   type SpawnCommandSeam,
   type ToolHandler,
 } from "./broker.js";
-import type { HarnessEffort } from "../harness.js";
+import type { HarnessEffort, HarnessItem } from "../harness.js";
 import type { ExecutionRegistry } from "./registry.js";
 import type { CodexNotification } from "./transport.js";
 
@@ -99,6 +101,15 @@ export interface ChildThreadController {
   interrupt(): Promise<void>;
   /** Idempotent teardown of the child thread/turn iteration. */
   close(): Promise<void>;
+  /**
+   * Issue #1583: OPTIONAL observability hook projecting RAW child items onto the run stream (the
+   * executor wires it to `CodexHarness.emitChildFrame`, which scrubs, bounds and namespaces them,
+   * so this runner never holds the scrub). Text/thinking carry the child's own message text; a
+   * tool item carries the provider call id as `id`, the canonical tool name as `name`, the raw
+   * args as `input` and the raw output (the broker's message on failure) as `output`. Called only
+   * for the child's OWN active turn and never for a signal tool; best-effort (a throw is ignored).
+   */
+  project?(items: readonly HarnessItem[]): void;
 }
 
 export type StartChildTurnSeam = (spec: StartChildTurnSpec) => Promise<ChildThreadController>;
@@ -168,6 +179,11 @@ function extractText(item: Record<string, unknown>): string[] {
     }
   }
   return out;
+}
+
+function isAgentMessage(item: Record<string, unknown>): boolean {
+  const type = asString(item.type);
+  return type === "agentMessage" || type === "assistantMessage" || type === "agent_message";
 }
 
 /** A child broker's delegate seam: nested delegation is impossible, so this is never
@@ -357,6 +373,7 @@ export class CodexDelegationRunner {
 
         // Assistant text accumulation (bounded). Everything else is liveness only.
         if (note.kind === "activity") {
+          this.projectChild(controller, this.childItems(controller.threadId, note));
           const chunk = this.extractChildText(controller.threadId, note);
           if (chunk.length > 0) {
             const chunkBytes = Buffer.byteLength(chunk, "utf8");
@@ -431,17 +448,32 @@ export class CodexDelegationRunner {
       if (!matchesActive) {
         result = { ok: false, code: "not_active_turn", message: "callback does not match the active child turn" };
       } else {
+        const callId = asString(p.callId) ?? "";
+        // Issue #1583: project the child's own non-signal tool call as a started/finished pair
+        // around the broker (a signal tool is never projected; its denial stays reply-only).
+        const toolName = asString(p.tool);
+        const canonical = toolName !== undefined ? canonicalizeCodexToolName(toolName) : undefined;
+        const projectable = !(canonical !== undefined && CODEX_SIGNAL_TOOLS.has(canonical));
+        if (projectable) {
+          this.projectChild(controller, [{ kind: "tool", phase: "started", id: callId, name: canonical, input: p.arguments }]);
+        }
         try {
           // Honest CHILD attribution + origin "child": the broker's own root-only gates
           // deny a subagent signal (submit_plan/signal_done) and a nested spawn_agent.
           result = await broker.handleToolCall(
-            { threadId: rawThreadId, turnId: rawTurnId, callId: asString(p.callId) ?? "" },
+            { threadId: rawThreadId, turnId: rawTurnId, callId },
             p.tool,
             p.arguments,
             "child",
           );
         } catch {
           result = { ok: false, code: "broker_error", message: "the callback failed" };
+        }
+        if (projectable) {
+          const output = result.ok ? result.output : result.message;
+          this.projectChild(controller, [
+            { kind: "tool", phase: "finished", id: callId, name: canonical, output, isError: !result.ok },
+          ]);
         }
       }
       this.safeRespond(controller, requestId, { result: this.replyBody(result) });
@@ -480,18 +512,43 @@ export class CodexDelegationRunner {
     }
   }
 
+  /** Hand raw child items to the controller's optional projection hook; best-effort. */
+  private projectChild(controller: ChildThreadController, items: readonly HarnessItem[]): void {
+    if (items.length === 0 || controller.project === undefined) return;
+    try {
+      controller.project(items);
+    } catch {
+      // Projection is observability only: it never affects the child's settlement or replies.
+    }
+  }
+
+  /** The `item/completed` item of a note bound to the child's own thread, else undefined (a
+   *  foreign/absent thread id contributes nothing). */
+  private ownCompletedItem(
+    threadId: string,
+    note: Extract<CodexNotification, { kind: "activity" }>,
+  ): Record<string, unknown> | undefined {
+    if (note.method !== "item/completed") return undefined;
+    const params = asObject(note.params);
+    if (params === undefined || params.threadId !== threadId) return undefined;
+    return asObject(params.item);
+  }
+
   /** Extract child assistant text off an `item/completed` agent-message note bound to
    *  the child's own thread (a foreign/absent thread id contributes nothing). */
   private extractChildText(threadId: string, note: Extract<CodexNotification, { kind: "activity" }>): string {
-    if (note.method !== "item/completed") return "";
-    const params = asObject(note.params);
-    if (params === undefined || params.threadId !== threadId) return "";
-    const item = asObject(params.item);
-    if (!item) return "";
-    const type = asString(item.type);
-    if (type === "agentMessage" || type === "assistantMessage" || type === "agent_message") {
-      return extractText(item).join("");
-    }
+    const item = this.ownCompletedItem(threadId, note);
+    if (item !== undefined && isAgentMessage(item)) return extractText(item).join("");
     return "";
+  }
+
+  /** The projectable text/thinking items of a child's own `item/completed` agent-message or
+   *  reasoning note (one item per non-empty text part, like the root decode). */
+  private childItems(threadId: string, note: Extract<CodexNotification, { kind: "activity" }>): HarnessItem[] {
+    const item = this.ownCompletedItem(threadId, note);
+    if (item === undefined) return [];
+    if (isAgentMessage(item)) return extractText(item).map((text) => ({ kind: "text", text }));
+    if (asString(item.type) === "reasoning") return extractText(item).map((text) => ({ kind: "thinking", text }));
+    return [];
   }
 }
