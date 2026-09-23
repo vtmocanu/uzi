@@ -313,6 +313,11 @@ tasks:
       # welded onto / bled into a db_psql scalar read is stripped (#1351). Tally-guarded like the two
       # siblings above so a gutted run cannot read green.
       - task: test:e2e-lib
+      # hermetic (~instant): a fake `docker` on PATH, no daemon. Guards that
+      # run-store-it.sh's teardown removes the throwaway Postgres ANONYMOUS VOLUME
+      # (`docker rm -v`); the missing `-v` leaked one pg volume per run and filled
+      # the worker's Docker data-root. Before `scan:secrets` (deliberately last).
+      - task: test:store-it-cleanup
       # Hermetic end-to-end tests for the repo-local uzi-watcher backup scripts. They use
       # fake uzi/kubectl commands and temporary git repos: no cluster, forge or live backup
       # directory is touched. This gates clone capture, bare-ref fallback, fail-closed
@@ -896,6 +901,16 @@ tasks:
       # asserts only a definitely-dead `uzi-e2e-<pid>` project is torn down (the real
       # `uzi` stack, store-it, the current run, and an EPERM/alive pid are all skipped).
       - ./e2e/reclaim-leaked-e2e.test.sh
+
+  test:store-it-cleanup:
+    desc: behavioral test that run-store-it.sh's teardown removes the throwaway Postgres ANONYMOUS VOLUME (fake docker, hermetic)
+    cmds:
+      # No real docker daemon: the test puts a fake `docker` on PATH, drives the real
+      # run-store-it.sh down its readiness-timeout path (so no Postgres and no `go
+      # test`), and asserts the EXIT-trap teardown runs `docker rm -v`. The missing
+      # `-v` leaked one anonymous pg data volume per run and filled the worker's
+      # Docker data-root. Sibling of test:e2e-reclaim.
+      - ./e2e/run-store-it.test.sh
 
   test:e2e-driver:
     desc: hermetic behavioural test of the e2e phase-registry driver, tally-guarded (fake docker/curl/psql)
