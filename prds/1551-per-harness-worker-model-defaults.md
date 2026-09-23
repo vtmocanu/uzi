@@ -61,9 +61,10 @@ Verified locally against `main` at `698a3109` on 2026-09-22. Recheck anchors bef
 - `api/internal/store/migrations/00031_user_default_model.sql` added the one nullable `users.default_model` column. Migration 00226 later added nullable `users.default_harness`; there is no per-harness model storage.
 - `api/internal/store/queries/users.sql` reads and writes `default_model` independently of `default_harness`. `api/internal/handler/user_settings.go` already decodes and validates every present field before any write, but the individual setting updates are separate statements.
 - `web/src/pages/RunDefaults.tsx` has separate adjacent cards. Saving a harness calls `modelCompatibleWithHarness` and clears the shared model when incompatible. The model picker follows the effective harness, including the Codex-only case fixed during PR #1449 review.
-- `web/src/components/ModelSelect.tsx` owns the curated lists. Claude allows **Other**; Codex is deliberately closed to `gpt-6-astra` and `gpt-5.6-sol`.
+- `web/src/components/ModelSelect.tsx` owns the curated lists. Claude allows **Other**; Codex is deliberately closed to `gpt-6-astra`, `gpt-5.6-sol` and `gpt-6-sol` (the third added with the Codex 0.156.1 pin, #1567).
 - `api/internal/workersvc/harness_create.go` repeats that closed Codex allowlist. `claim_assembly.go` loads the single user default, lets a frozen schedule model override it, then drops a cross-harness value with a visible status note.
-- `agent/src/codex/render.ts` repeats the two-model contract and falls back to `gpt-6-astra` for an unknown model. `agent/src/codex/codex-pricing.ts` already has an `unreported` path for models without a price row, so a custom model does not need guessed pricing.
+- `agent/src/codex/render.ts` repeats the curated contract and drops an unknown model with an `unknown_model` diagnostic; the `gpt-6-astra` fallback is applied by its callers (`codex-executor.ts`, `codex-harness.ts`, `codex-advice-harness.ts`, each `?? provider.model`), not inside the renderer. `agent/src/codex/codex-pricing.ts` already has an `unreported` path for models without a price row, so a custom model does not need guessed pricing.
+- Task review is `kind='task'` with `runs.review_target_run_id` set; an ordinary task handoff is `kind='task'` with it NULL. Claim assembly reads the user default for every kind, but the agent's task reviewer (`agent/src/review-runner.ts`) passes no model, so a Codex task review runs on the provider default. (Corrected 2026-09-23.)
 - The claim wire already carries one effective `default_model`. Separate storage needs no worker-protocol field: the API resolves the run harness and sends only that lane's effective model.
 - The chart runs the API as one replica with `strategy: Recreate`. Schema migration and API replacement therefore do not overlap old and new API pods, but stale browser assets can still call the new API. The legacy settings field remains for that bounded client-skew case.
 - Hosted worker images roll independently of the API/web release and can remain busy on an older image. `codex_harness_v1` proves general Codex support only; it does not prove custom root-model passthrough. An explicit new capability is required before a custom model can be claimed.
@@ -108,11 +109,11 @@ The custom escape hatch applies to the per-user Codex worker default in this PRD
 
 The API uses the existing model-field validator. The Codex renderer treats a server-selected worker root model as an opaque validated ID and passes it to the fixed OpenAI provider. The effort contract remains the independent closed `low|medium|high|xhigh|max` set for curated and custom models alike; the provider accepts or rejects the pair. Uzi never silently substitutes Astra. API-key usage for an unknown price row remains token-complete with `cost_status=unreported`; subscription usage remains token-complete with `cost_status=subscription` regardless of a price row.
 
-The shared renderer must receive trusted model provenance rather than relax one global function. Ordinary run roots and task-review advice that consume the worker default may accept the custom lane. Judge and summary advice remain on their own curated model contracts, and per-role Codex pins remain curated and fall back to the resolved run root when incompatible. Tests prove each source separately. This prevents a customized Claude template, judge model or summary model from becoming an arbitrary Codex model merely because worker-root custom IDs are allowed.
+The shared renderer must receive trusted model provenance rather than relax one global function. Only ordinary run roots accept the custom lane. Task review is independent of the saved worker-model defaults on both harnesses: Codex task review uses the built-in `gpt-6-sol` (a review-specific constant selected in the advice request, not the shared provider default, which stays `gpt-6-astra`), and Claude task review keeps its current ambient default. #1551 ships no review-model setting; configurable review-model defaults are future work in brainstorm issue [#1570](https://github.com/vtmocanu/uzi/issues/1570). Judge and summary advice remain on their own curated model contracts, and per-role Codex pins remain curated and fall back to the resolved run root when incompatible. Tests prove each source separately. This prevents a customized Claude template, judge model or summary model from becoming an arbitrary Codex model merely because worker-root custom IDs are allowed.
 
 ### D6: custom-model support is capability-gated during worker rollout
 
-The agent advertises a new `codex_custom_model_v1` protocol capability only after its renderer can pass a custom worker-root model without substitution. A Codex run or task review whose effective worker model is outside the curated pair requires that capability in every non-bypassable placement seam: claim selection, eligible-worker/peer-spread counts and the queued reason. An old `codex_harness_v1` worker cannot claim it.
+The agent advertises a new `codex_custom_model_v1` protocol capability only after its renderer can pass a custom worker-root model without substitution. A Codex run whose effective worker-root model is outside the curated set requires that capability in every non-bypassable placement seam: claim selection, eligible-worker/peer-spread counts and the queued reason. An old `codex_harness_v1` worker cannot claim it. Task-review runs (`kind='task'` with `review_target_run_id IS NOT NULL`), judge runs and chat read no Codex lane and are exempt; an ordinary task handoff (`review_target_run_id IS NULL`) is not exempt. The exemption is keyed on `review_target_run_id`, never on all of `kind='task'`. Because the claim commits before the payload is assembled, assembly re-checks the same predicate and requeues rather than shipping a custom root to an incapable worker.
 
 The capability predicate follows D4 precedence at claim time: a frozen run/schedule model first, otherwise the owner's current Codex lane. This preserves today's behavior in which a queued ordinary run observes the user default when it is claimed. Curated-model runs still require only `codex_harness_v1` and are not held behind the fleet rollout.
 
@@ -129,6 +130,7 @@ This PRD separates model defaults only. The existing per-user reasoning-effort v
 - OpenAI-compatible custom endpoints, local models or user-controlled provider configuration.
 - A CLI command for user-level defaults. Existing run/schedule `--harness` behavior is unchanged.
 - Changes to credential defaults, explicit run/schedule harness overrides, pricing tables or the default Codex fallback.
+- Configurable task-review model defaults for Claude and Codex, including web and CLI design: future work tracked in brainstorm issue [#1570](https://github.com/vtmocanu/uzi/issues/1570). The only task-review change here is the built-in Codex review model (`gpt-6-sol`).
 - Any `.github/workflows/**` change.
 
 ## Milestones
@@ -147,11 +149,11 @@ This PRD separates model defaults only. The existing per-user reasoning-effort v
 #### M2: custom Codex root-model transport
 
 - Split the agent's curated picker from its root-model transport rule. A validated server-selected worker root ID passes through unchanged instead of falling back to Astra; effort remains the independent closed uzi set.
-- Add trusted provenance to advice rendering: task review may consume the custom worker default, while judge and summary advice stay curated. Keep per-role model pins curated and preserve their existing fallback to the resolved run root.
+- Add trusted provenance to rendering: only the worker root may carry the custom lane; judge, summary and task-review advice stay curated. Codex task review selects the built-in `gpt-6-sol` through the existing advice request's `model` field; the shared production provider default and the ordinary no-model Codex fallback stay `gpt-6-astra`. No review-model setting ships (#1570). Keep per-role model pins curated and preserve their existing fallback to the resolved run root.
 - Advertise `codex_custom_model_v1` only from a worker with the new passthrough behavior.
 - Preserve the fixed provider endpoint and TOML escaping. Model text never selects a provider, URL, environment variable or config key.
 - Preserve honest accounting: known API-key price rows meter normally; unknown API-key models are unreported; subscription remains subscription; all retain token totals.
-- Add discriminating agent tests for a custom root ID reaching start/resume/task review, custom judge/summary and unknown role pins staying closed, malformed input never reaching config, provider rejection remaining visible, both cost-status modes, and capability advertisement.
+- Add discriminating agent tests for a custom root ID reaching start/resume, Codex task review using `gpt-6-sol` whatever the lanes hold, custom judge/summary and unknown role pins staying closed, malformed input never reaching config, provider rejection remaining visible, both cost-status modes, and capability advertisement.
 - Gate: `task gate:agent` and the existing Codex-focused test targets reached by it.
 
 #### M3: grouped Run Defaults experience
@@ -169,7 +171,7 @@ This PRD separates model defaults only. The existing per-user reasoning-effort v
 
 - Update every dynamic user-default consumer to read the lane matching the already-frozen run harness. Chat remains the literal-Claude exception and always reads the Claude lane; this PRD does not enable Codex Chat. Do not alter the claim wire.
 - Preserve schedule-model precedence and the fallback note for incompatible frozen schedule or legacy values. Preserve byte-compatible Claude behavior when the Claude lane is unchanged.
-- Require `codex_custom_model_v1` for a custom effective Codex root in claim, eligible-worker, peer-spread and queued-reason paths. Prove an old `codex_harness_v1` worker cannot claim and the run does not silently start on Astra; curated runs remain eligible there.
+- Require `codex_custom_model_v1` for a custom effective Codex root in claim, eligible-worker, peer-spread, queued-reason and post-claim assembly re-check paths, exempting task-review runs by `review_target_run_id IS NOT NULL` (plus judge and chat), never all of `kind='task'`. Assembly does not read the Codex lane for a review run. A live-DB regression proves a review run with a custom Codex lane is claimable by a `codex_harness_v1`-only worker while an ordinary task handoff with the same lane is not. Prove an old `codex_harness_v1` worker cannot claim and the run does not silently start on Astra; curated runs remain eligible there.
 - Add API/live-DB tests proving: both lane values coexist; a Claude run and literal-Claude Chat receive only Claude; a Codex run receives only Codex; changing the default harness changes the selected lane but mutates neither value; explicit schedule models still win; clearing one lane does not affect the other; a custom root requires the new capability; and a capable worker receives it unchanged.
 - Add a stale-client contract test for D3 and a regression that the old shared-slot/reset behavior fails against the new implementation.
 - Run the joined gates once on the final tree: `task gate:api`, `task gate:agent`, `task gate:web`, `task gate:repo`, and `./e2e/run-store-it.sh`.
@@ -214,10 +216,11 @@ M1 to M3 touch separate primary files and can run concurrently. M3 may code agai
 2. Switching the default harness changes neither saved model. Future implicit runs use the selected harness's lane; explicit run/schedule harness selection still wins.
 3. Claude-only and Codex-only users see one relevant model lane and no redundant harness selector. A temporarily unavailable lane remains stored.
 4. A zero-credential user can still preconfigure the Claude lane, and ordinary settings GET/PUT never fails because D11 has no usable harness.
-5. Both lanes offer curated choices and **Other**. A syntactically valid custom Codex worker-root ID reaches the fixed OpenAI provider unchanged on a capable worker; provider rejection is visible and no fallback model is silently used.
-6. An old worker without `codex_custom_model_v1` cannot claim a custom-model run. It remains queued with a specific capability reason rather than silently running Astra.
+5. Both lanes offer curated choices and **Other**. A syntactically valid custom Codex worker-root ID (ordinary runs, not task review) reaches the fixed OpenAI provider unchanged on a capable worker; provider rejection is visible and no fallback model is silently used.
+6. An old worker without `codex_custom_model_v1` cannot claim a run whose worker root is a custom model; task-review and judge runs are unaffected. It remains queued with a specific capability reason rather than silently running Astra.
 7. Unknown API-key model pricing reports unreported; subscription reports subscription; both retain token totals and neither fabricates dollars.
-8. Schedule-model precedence, per-role pins, judge/summary models, shared reasoning effort, literal-Claude Chat and the claim wire retain their pre-#1551 behavior.
+8. Schedule-model precedence, per-role pins, judge/summary models, shared reasoning effort, literal-Claude Chat and the claim wire retain their pre-#1551 behavior. Task review is independent of the saved defaults and is not configurable in #1551.
+11. Codex task review uses the built-in `gpt-6-sol` regardless of the saved defaults, while the ordinary no-model Codex fallback and the shared provider default stay `gpt-6-astra`.
 9. Existing data migrates conservatively into explicit lanes while the legacy value stays intact. Immediate rollback restores the active lane; its documented inactive-lane limitation is accepted.
 10. The grouped update is atomic, all new API fields are contract-tested, focused live-DB tests execute with zero skips, all named gates pass, and M6 passes on hosted k8s.
 
@@ -225,7 +228,7 @@ M1 to M3 touch separate primary files and can run concurrently. M3 may code agai
 
 | Risk | Mitigation |
 |---|---|
-| A migration assigns an ambiguous legacy custom ID to the wrong provider | Copy only the two IDs that were previously effective on Codex; copy every unknown into Claude and leave the legacy slot intact |
+| A migration assigns an ambiguous legacy custom ID to the wrong provider | Copy only the curated IDs that were previously effective on Codex; copy every unknown into Claude and leave the legacy slot intact |
 | An immediate rollback loses the active preference | Down projects the active lane into the legacy slot before dropping new columns; inactive-lane loss after a post-upgrade edit is explicit and unavoidable |
 | Opening custom Codex accidentally opens role pins or schedules | D5 scopes the escape hatch to the per-user root default; separate tests pin closed callers |
 | An unknown model gets silently replaced by Astra | The root renderer passes validated custom IDs unchanged and treats provider rejection as the run error |
@@ -233,6 +236,8 @@ M1 to M3 touch separate primary files and can run concurrently. M3 may code agai
 | An unknown model produces misleading cost | API-key usage is unreported, subscription stays subscription, token totals remain, and no dollar estimate is invented |
 | Grouped UI looks atomic while backend writes partially | One SQL statement updates harness and both lanes; a failure regression proves no partial state |
 | Stale web assets write the legacy field during deploy | Keep and contract-test the bounded D3 bridge for one release; do not drop the field here |
+| Task review inherits a custom lane, or the shared provider default changes along with the review model | A review-specific built-in constant, assembly skips the lane read for review runs, and regression tests pin the review model and the unchanged `gpt-6-astra` provider default |
+| The capability exemption is keyed on kind and frees ordinary task handoffs | The exemption is `review_target_run_id IS NOT NULL`; a live-DB regression pins both kinds of task run |
 | The refactor changes schedules, judge models or Claude role pins | Those surfaces are explicitly out of scope and get preservation tests at the M4 join |
 
 ## Decision Log
@@ -245,6 +250,13 @@ M1 to M3 touch separate primary files and can run concurrently. M3 may code agai
 | 2026-09-22 | Add two explicit lane columns and retain the legacy column for one compatibility release | It is additive, keeps upgrade/rollback data, and follows the established appearance-settings expansion pattern |
 | 2026-09-22 | Keep custom Codex narrow to the root user default | Schedule and role-pin values lack equivalent provider provenance and need a separate design |
 | 2026-09-22 | Require `codex_custom_model_v1` for custom worker-root execution | A mixed hosted fleet must never silently substitute Astra on an old renderer |
+| 2026-09-23 | Task review is independent of the saved worker-model defaults on both harnesses; Codex task review uses the built-in `gpt-6-sol` | User decision at plan review. The shared provider default and the ordinary no-model Codex fallback stay `gpt-6-astra` |
+| 2026-09-23 | Configurable task-review model defaults (Claude and Codex, web and CLI) are deferred to brainstorm issue #1570 | Out of scope for #1551; no review-model setting ships here |
+| 2026-09-23 | The capability exemption for task review is `review_target_run_id IS NOT NULL`, not `kind='task'` | An ordinary task handoff is also `kind='task'` and does read the Codex lane |
+| 2026-09-23 | The curated Codex set is `gpt-6-astra`, `gpt-5.6-sol`, `gpt-6-sol` | `gpt-6-sol` landed with #1567 after this PRD was written; the migration and capability predicate use all three |
+| 2026-09-23 | An incompatible frozen schedule model falls back to the owner's lane for the run harness, with the visible fallback note | D4 precedence as written; previously it fell to the worker's harness default |
+| 2026-09-23 | Down projects the active lane using D11 rendered in SQL; grouped saves also keep the legacy column equal to the effective lane | Image-only rollback reads the maintained legacy value; an explicit goose Down recomputes against current credentials. Tested in an isolated database |
+| 2026-09-23 | Cross-vocabulary validation uses only the closed lists: a curated Codex ID is rejected in the Claude lane and a known Claude alias in the Codex lane | Satisfies D3's no-prefix-guessing rule |
 
 ## Review record
 
