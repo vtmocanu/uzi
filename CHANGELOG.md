@@ -38,6 +38,10 @@ through `[0.52.0]`.)
   A closed registry of 14 checks (worker rolls, queue and capacity, controller liveness, background loops, the database, integrations, housekeeping) rolls up into a verdict on a new Admin → Health tab, a self-hiding Overview card, and a Danger-only app-wide banner with a per-admin 1h snooze; `uzi admin health` (exit 8 on danger, for cron probes) and roll-health columns on `uzi admin workers` give the same view from the CLI, and each admin gets one web-inbox/Slack notice per Danger episode. It never reads the Kubernetes API; every Kubernetes-derived fact still arrives over the existing controller report, and a stale or disabled signal always reads `unknown`, never green.
 - **Codex can run on hosted k8s workers under an opt-in distinct-UID execution profile ([#1493](https://github.com/vtmocanu/uzi/issues/1493), [#1502](https://github.com/vtmocanu/uzi/pull/1502)).**
   A new opt-in uid-split worker profile starts the hosted worker pod as root long enough to establish Codex's three-identity separation, with an optional Landlock sandbox, then advertises the Codex capability only when the required isolation checks pass, so a worker that cannot satisfy them keeps queuing other work instead of claiming and failing a Codex run. Off by default; the compose path and existing single-UID k8s path are unchanged.
+- **Claude Opus 5.5 is available to Claude runs ([#1564](https://github.com/vtmocanu/uzi/pull/1564)).**
+  The worker's Claude Agent SDK moves to 0.3.280, whose bundled Claude Code adds Claude Opus 5.5 (`claude-opus-5-5`) and makes it the model the `opus` alias resolves to, so runs on `opus` now use Opus 5.5 instead of Opus 5; the full model id also works as a custom model.
+- **Codex runs can use `gpt-6-sol`, on Codex 0.156.1 ([#1567](https://github.com/vtmocanu/uzi/pull/1567)).**
+  The pinned Codex runtime moves from 0.153.2 to 0.156.1 and `gpt-6-sol` joins the Codex model picker in the web UI, API and agent, priced from OpenAI's published Standard rates; every existing guardrail check was re-verified against the new runtime, and the native-tool bypass suite now also runs on `gpt-6-sol`.
 
 ### Fixed
 
