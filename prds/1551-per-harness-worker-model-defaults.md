@@ -2,7 +2,7 @@
 
 **Issue:** [#1551](https://github.com/vtmocanu/uzi/issues/1551)
 
-**Status:** Reviewed by two independent lenses and committed for later implementation. Not queued or dispatched to uzi.
+**Status:** M1-M5 implemented on a recovered branch and locally validated; PR review and hosted-k8s M6 acceptance remain.
 
 **Priority:** Medium
 
@@ -14,15 +14,15 @@ Use current `main` and a short-lived worktree. Never switch the `main/` worktree
 
 ## Problem
 
-Uzi now lets a user choose Claude or Codex for a run, but still stores one shared `users.default_model`. The Run Defaults page therefore presents the model vocabulary for only the currently effective harness. Changing the default harness clears an incompatible saved model instead of retaining one preference for each provider.
+Before #1551, Uzi let a user choose Claude or Codex for a run, but stored one shared `users.default_model`. The Run Defaults page therefore presented the model vocabulary for only the then-effective harness. Changing the default harness cleared an incompatible saved model instead of retaining one preference for each provider.
 
-That creates three user-facing defects:
+That created three user-facing defects:
 
-1. A user who alternates between Claude and Codex must reselect the model after changing the default harness.
-2. The separate **Default harness** and **Worker model** cards present one coupled decision as two unrelated settings.
-3. Codex exposes only the two curated model IDs. Unlike Claude, it has no **Other (custom model ID)** escape hatch, so a newly available or account-specific model cannot be selected until uzi ships a picker update.
+1. A user who alternated between Claude and Codex had to reselect the model after changing the default harness.
+2. The separate **Default harness** and **Worker model** cards presented one coupled decision as two unrelated settings.
+3. Codex exposed only the three curated model IDs. Unlike Claude, it had no **Other (custom model ID)** escape hatch, so a newly available or account-specific model could not be selected until uzi shipped a picker update.
 
-The current behavior was deliberate in #1106/#1429: Codex used a closed two-model vocabulary, and shared model storage made an incompatible value fall back visibly. This PRD intentionally supersedes that part of D9/D6. It does not weaken provider, endpoint, credential or harness boundaries.
+The former behavior was deliberate in #1106/#1429: Codex used a closed curated vocabulary, and shared model storage made an incompatible value fall back visibly. This PRD intentionally supersedes that part of D9/D6. It does not weaken provider, endpoint, credential or harness boundaries.
 
 ## Solution
 
@@ -180,7 +180,7 @@ This PRD separates model defaults only. The existing per-user reasoning-effort v
 
 - Update `docs/worker-model.md` for the grouped card, per-harness precedence, custom Codex behavior, first-run failure semantics, the narrow root-only scope, and honest API-key/subscription cost status. Replace `docs/img/worker-model-settings.png` with the implemented UI.
 - Update `docs/worker-effort.md` to describe the still-shared effort contract for Claude and Codex and the provider-rejection behavior for an unsupported custom model/effort pair.
-- Update `specs/human.md` tersely: separate retained model defaults, grouped save, and custom IDs for both harnesses, tagged `(AI-synced 2026-09-22)`.
+- Update `specs/human.md` tersely: separate retained model defaults, grouped save, and custom IDs for both harnesses, tagged `(AI-synced 2026-09-23)`.
 - Mark #1106 D9 and #1429 D6 as superseded by #1551 for per-user defaults only; their closed schedule/role-pin decisions remain in force. Add the same narrow supersession note to ADR-1106's model decision rather than creating a competing ADR.
 - Run `task docs:sync`, commit the embedded mirror, then run `task check-docs:web` and `task gate:api`.
 - Record implementation decisions below and move this PRD to `prds/done/` only after all acceptance criteria pass.
@@ -261,3 +261,10 @@ M1 to M3 touch separate primary files and can run concurrently. M3 may code agai
 ## Review record
 
 - 2026-09-22: Two independent reviews covered architecture/data/API/runtime compatibility and product/UX/testability. Their findings were folded in before handoff: rollback-safe explicit lane storage, the zero-credential state, stale-client routing, custom-model worker capability gating, advice-source provenance, accurate subscription/API-key cost semantics, literal-Claude Chat preservation, provider-specific custom-field copy, `docs/worker-effort.md`, and hosted-k8s acceptance.
+
+## Progress
+
+- 2026-09-23: Run `08123d18-068b-49b6-aba7-4482830b8223` completed M0-M4, then failed during M5 when its Claude process exited with code 143. The verified recovery archive held the committed M5 docs and screenshot as a park snapshot. The worker clone was gone, and its durable ref matched the archive.
+- 2026-09-23: Recovered the branch in an isolated worktree, rebased onto current `main`, renumbered its new migration from draft `00244` to `00246` after the live `00244`/`00245` pair, and updated the migration-specific live-DB tests.
+- 2026-09-23: M1-M5 code and docs pass `task gate:repo`, `task gate:api`, `task gate:agent`, `task gate:web`, `cd web && npm run build`, `task check-docs:web`, and `./e2e/run-store-it.sh` (1,111 passed, 0 skipped). The first agent gate had a timing-sensitive failure in an untouched test; a focused host rerun and the second full gate passed. Local `gate:repo` skipped Semgrep because it is absent from PATH; CI enforces it.
+- 2026-09-23: M6 remains pending until the worker image is published and the hosted dev fleet is rolled. The PRD stays active until that acceptance is recorded.

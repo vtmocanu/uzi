@@ -137,7 +137,7 @@ newer worker image.
 
 - Ask your admin to upgrade or roll the hosted worker fleet to an image that
   advertises `codex_custom_model_v1`. An old worker never claims the run and
-  never silently substitutes `gpt-6-astra` — it stays queued instead.
+  never silently substitutes `gpt-6-astra`; it stays queued instead.
 - Or switch to one of the curated Codex models in [Settings → Run
   defaults](./worker-model.md#harness-and-worker-models) if you don't need
   the custom ID right now.
