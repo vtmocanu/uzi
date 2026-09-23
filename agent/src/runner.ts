@@ -3631,15 +3631,15 @@ export class RunRunner {
           (await this.git.defaultBranchName(alignBarePath)) ||
           "main";
         // Re-fetch immediately before alignment: default may advance after the precheck.
-        // Detection is best-effort; a failed fetch falls through to the normal push.
-        let defaultTip: string | undefined;
+        // On fetch failure, the precheck tip is still a best-effort alignment target.
+        let defaultTip = freshDefaultTip;
         try {
           defaultTip = await this.git.fetchDefaultTip(
             alignBarePath, alignDefaultBranch, claim.secrets.forge_pat,
             claim.repo.clone_url, claim.secrets.forge_username,
           );
         } catch (e) {
-          runLog.warn("finalize base-align: could not fetch default tip; pushing without aligning", {
+          runLog.warn("finalize base-align: could not refresh default tip; using precheck tip if available", {
             run_id: runId, error: errMessage(e),
           });
         }

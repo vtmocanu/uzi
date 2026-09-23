@@ -450,7 +450,7 @@ describe("RunRunner — finalize base-align (PRD #456)", () => {
     assert.strictEqual(gitIn(fx.originPath, ["show", "agent/issue-154:.github/workflows/ci.yml"]), CI_V2.trim());
   });
 
-  it("second default-tip fetch failure falls through to the normal push", async () => {
+  it("second default-tip fetch failure aligns with the precheck tip when behind", async () => {
     seedWorkflowsOnOrigin();
     const { github, calls } = fakeGitHub();
     const strategies = spyAlign();
@@ -462,13 +462,17 @@ describe("RunRunner — finalize base-align (PRD #456)", () => {
       return fetch(...args);
     }) as typeof git.fetchDefaultTip;
     const claim = githubClaim(155);
-    await githubRunner(github, committingExecutor({ "impl.ts": "export const x = 1;\n" })).execute(claim);
+    await githubRunner(github, committingExecutor(
+      { "impl.ts": "export const x = 1;\n" },
+      { ".github/workflows/ci.yml": CI_V2 },
+    )).execute(claim);
     assert.deepStrictEqual(api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body.status),
       ["running", "running", "completed"]);
     assert.strictEqual(fetches, 2);
-    assert.deepStrictEqual(strategies, []);
+    assert.deepStrictEqual(strategies, ["workflow-subtree"]);
     assert.strictEqual(calls.length, 1);
     assert.strictEqual(gitIn(fx.originPath, ["show", "agent/issue-155:impl.ts"]), "export const x = 1;");
+    assert.strictEqual(gitIn(fx.originPath, ["show", "agent/issue-155:.github/workflows/ci.yml"]), CI_V2.trim());
   });
 
   it("default-tip fetch failure falls through to the normal push", async () => {
