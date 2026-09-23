@@ -133,7 +133,7 @@ export async function journalAndResolveTerminal(
   },
 ): Promise<void> {
   const { runId, claimGeneration, phase, messagesThroughSeq, body, send, signal } = args;
-  // PRD #1539: the write-ahead install and the send/resolve are now the two exported primitives
+  // #1539: the write-ahead install and the send/resolve are now the two exported primitives
   // {@link installTerminalWriteAhead} / {@link sendUnjournaledTerminal} + {@link resolvePendingTerminal},
   // so a caller that must interleave work BETWEEN the durable install and the resolve (the
   // permanent-failure hook's abort-then-reap, RunRunner.journalAndSendTerminal) can. This helper keeps
@@ -148,7 +148,7 @@ export async function journalAndResolveTerminal(
 }
 
 /**
- * PRD #1539: the DURABLE-INSTALL half of the write-ahead terminal path, split out so a caller can run
+ * #1539: the DURABLE-INSTALL half of the write-ahead terminal path, split out so a caller can run
  * work BETWEEN the install and the resolve (the permanent-failure hook aborts + reaps the provider
  * after the `failed` journal is on disk but before it is sent). Canonicalises the body ONCE (D-A1/D2:
  * the SAME bytes are journalled and sent, so the first send and any replay are byte-identical) and
@@ -193,7 +193,7 @@ export async function installTerminalWriteAhead(
 }
 
 /**
- * PRD #1539: the UNJOURNALED-send half (the `reserve_exhausted` fallback of the write-ahead path):
+ * #1539: the UNJOURNALED-send half (the `reserve_exhausted` fallback of the write-ahead path):
  * send the already-canonical body with the fence when advertised. Byte-for-byte today's
  * `send(withTerminalFence(...))`, split out so both {@link journalAndResolveTerminal} and
  * RunRunner.journalAndSendTerminal reuse it. A throw propagates to the caller (the executor catch

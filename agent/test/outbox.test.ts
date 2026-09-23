@@ -1497,7 +1497,7 @@ describe("Outbox M3 terminal-journal store (PRD #1391 Run B)", () => {
   });
 });
 
-describe("Outbox terminal-resolve hold (PRD #1539)", () => {
+describe("Outbox terminal-resolve hold (#1539)", () => {
   it("H1. hold / isTerminalResolveHeld / release track one (runId, gen) pair independently", async () => {
     const root = await mkRoot();
     const o = makeOutbox(root);

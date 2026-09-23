@@ -198,7 +198,7 @@ describe("Worker outbox drainer (PRD #1391 M2)", () => {
       retireTerminal: async () => {
         retiredTerminal += 1;
       },
-      // PRD #1539: not held here — the drain resolves normally.
+      // #1539: not held here — the drain resolves normally.
       isTerminalResolveHeld: () => false,
       noteHeldSkip: () => {},
     } as unknown as Outbox;
@@ -243,7 +243,7 @@ describe("Worker outbox drainer (PRD #1391 M2)", () => {
     assert.ok(retiredTerminal >= 1, "the landed terminal (200) retired the journal — it did not strand");
   });
 
-  it("PRD #1539 (8): a HELD terminal is NOT resolved by the drain, and the skip is recorded", async () => {
+  it("#1539 (8): a HELD terminal is NOT resolved by the drain, and the skip is recorded", async () => {
     // The live run's permanent-failure hook holds this generation's resolve while it aborts + reaps
     // between the durable install and its own send. The drainer must SKIP the held terminal (sending
     // here would race the hook's own resolve) and RECORD the skip, so the hook's release can re-drive

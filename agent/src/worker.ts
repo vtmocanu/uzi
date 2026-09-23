@@ -196,7 +196,7 @@ export class Worker {
       if (entry.run_id !== runId) continue;
       if (signal?.aborted) return;
       const gen = entry.claim_generation;
-      // PRD #1539 (B2/N4): the live run's permanent-failure hook holds this terminal's resolve while it
+      // #1539 (B2/N4): the live run's permanent-failure hook holds this terminal's resolve while it
       // aborts + reaps between its durable install and its own send. Sending here would race the hook's
       // resolve, so SKIP and record the skip — the hook's `finally` release reads it and re-drives one
       // resolve if its own send failed, so the terminal is never stranded until boot.

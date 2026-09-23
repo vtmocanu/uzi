@@ -1004,7 +1004,7 @@ export class Outbox {
     return this.disabled;
   }
 
-  // ── terminal resolve hold (PRD #1539) ──────────────────────────────────────────
+  // ── terminal resolve hold (#1539) ──────────────────────────────────────────
   //
   // A process-local, in-memory hold keyed by (runId, generation). The live run's permanent-failure
   // hook takes it BEFORE it installs its `failed` journal and releases it in a `finally` after its own

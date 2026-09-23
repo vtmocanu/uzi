@@ -241,9 +241,9 @@ describe("RunRunner terminal journaling (PRD #1391 Run B M3b)", () => {
     assert.equal(j?.body.status, "failed", "the journal holds the terminal failed state");
   });
 
-  // PRD #1539: no-outbox degradation — beforeResolve (abort + reap) still runs before the DIRECT send,
+  // #1539: no-outbox degradation — beforeResolve (abort + reap) still runs before the DIRECT send,
   // and exactly one failed is sent, in the order abort < reap < send.
-  it("PRD #1539: no-outbox permanent failure still runs abort < reap < send, exactly one failed", async () => {
+  it("#1539: no-outbox permanent failure still runs abort < reap < send, exactly one failed", async () => {
     const { gitlab } = fakeGitlab();
     const { coord } = makeRecoveryCoordinator(new FakeRecoveryClient(), new FakeRecoveryGit());
     const run = runner(new StubExecutor(nullLogger()), gitlab, undefined, { recovery: coord }); // NO outbox
@@ -265,9 +265,9 @@ describe("RunRunner terminal journaling (PRD #1391 Run B M3b)", () => {
     assert.equal(flight.terminalResolved, true, "the terminal-resolved latch is set");
   });
 
-  // PRD #1539: reserve-exhausted (the terminal-sized reserve cannot admit the journal) — the outcome
+  // #1539: reserve-exhausted (the terminal-sized reserve cannot admit the journal) — the outcome
   // is sent UNJOURNALED, and beforeResolve (abort + reap) still runs before that send.
-  it("PRD #1539: reserve-exhausted permanent failure sends UNJOURNALED, abort < reap < send", async () => {
+  it("#1539: reserve-exhausted permanent failure sends UNJOURNALED, abort < reap < send", async () => {
     const { gitlab } = fakeGitlab();
     const outbox = await mkOutbox({ rawWrite: enospcTerminalWrite });
     const { coord } = makeRecoveryCoordinator(new FakeRecoveryClient(), new FakeRecoveryGit());
@@ -295,13 +295,13 @@ describe("RunRunner terminal journaling (PRD #1391 Run B M3b)", () => {
     assert.equal(flight.terminalResolved, true, "the terminal-resolved latch is set after the unjournaled send");
   });
 
-  // PRD #1539 (test 6): permanent failure END TO END with the REAL Codex boundary + a real Outbox.
+  // #1539 (test 6): permanent failure END TO END with the REAL Codex boundary + a real Outbox.
   // `api.failMessagesNext(100, 401)` trips the breaker on the first flush; the Codex-shaped executor
   // emits a message, awaits the abort, then throws. Asserts: exactly ONE `failed` applied; the reap
   // (reconcile) runs BEFORE the failed report and the committed-tree CAPTURE (reserve) AFTER it; and
   // exactly ONE reconcile — the already-journaled arm does NO second reap. Mutation M-a (reap after
   // the resolve, or restoring the old arm reap) reddens the ordering / the one-reconcile assertion.
-  it("PRD #1539 (6): real Codex boundary — reap BEFORE the failed report, one failed, one reconcile", async () => {
+  it("#1539 (6): real Codex boundary — reap BEFORE the failed report, one failed, one reconcile", async () => {
     const { gitlab } = fakeGitlab();
     const outbox = await mkOutbox();
     const events: string[] = [];
@@ -358,14 +358,14 @@ describe("RunRunner terminal journaling (PRD #1391 Run B M3b)", () => {
     }
   });
 
-  // PRD #1539 (test 7b): stale epoch. The hook records the safety epoch it reaped; if CodexExecutor
+  // #1539 (test 7b): stale epoch. The hook records the safety epoch it reaped; if CodexExecutor
   // then swaps `this.safety` (a checkpoint epoch swap), the settle guard must fail closed — no
   // release/reserve — while the one `failed` journal still stands. Chosen as a focused unit test over
   // the settle guard: orchestrating a deterministic mid-boundary checkpoint swap in an e2e run is
   // racy, whereas driving the REAL hook reap (recording the real safety epoch) and then swapping the
   // executor's safety exercises exactly the identity check the settle consumers gate on, and mutation
   // M-c (dropping the identity check) reddens the swapped-epoch assertion.
-  it("PRD #1539 (7b): a safety-epoch swap after the hook reaps makes the settle guard fail closed", async () => {
+  it("#1539 (7b): a safety-epoch swap after the hook reaps makes the settle guard fail closed", async () => {
     const { gitlab } = fakeGitlab();
     const outbox = await mkOutbox();
     const events: string[] = [];
@@ -402,12 +402,12 @@ describe("RunRunner terminal journaling (PRD #1391 Run B M3b)", () => {
     }
   });
 
-  // PRD #1539 (8, N4): when the drainer skipped a resolve while the hook held it, the hook's `finally`
+  // #1539 (8, N4): when the drainer skipped a resolve while the hook held it, the hook's `finally`
   // release re-drives ONE resolve — so a terminal whose hook send did not retire it (a benign 409
   // running) is not stranded until boot. Here the first (hook) send answers 409 running AND records a
   // drainer skip (a concurrent drainer that skipped the held entry); the release then re-resolves, and
   // the second send applies 200 and retires the journal.
-  it("PRD #1539 (8/N4): a recorded drainer skip makes the hook re-resolve once on release", async () => {
+  it("#1539 (8/N4): a recorded drainer skip makes the hook re-resolve once on release", async () => {
     const { gitlab } = fakeGitlab();
     const outbox = await mkOutbox();
     const { coord } = makeRecoveryCoordinator(new FakeRecoveryClient(), new FakeRecoveryGit());
@@ -439,6 +439,62 @@ describe("RunRunner terminal journaling (PRD #1391 Run B M3b)", () => {
 
     assert.equal(sends, 2, "the hook sent once, then re-resolved once on release after the recorded skip");
     assert.equal(outbox.hasPendingTerminal(runId, gen), false, "the release-driven re-resolve retired the journal (no strand)");
+  });
+
+  // #1539 (hold coverage): the REAL handlePermanentFailure must TAKE the process-local resolve hold
+  // (Outbox.holdTerminalResolve) BEFORE it installs the journal and keep it across the whole
+  // abort → reap → send window, so the per-worker drainer (Worker.resolveRunTerminal) cannot send the
+  // journaled `failed` and race the hook's own resolve; the `finally` must RELEASE it after. The
+  // hold-during-window is observed from inside the recorded reap (a recording killAgentTree) and from
+  // inside the send closure, so the observations survive even if an in-reap assertion were swallowed
+  // by reapRecoveryProviderForSettle's catch. Mutations: delete `holdTerminalResolve` → the
+  // held-during-reap/send assertions go RED; delete `releaseTerminalResolve` → the released-after
+  // assertion goes RED (the hold is never dropped). A benign 409 running keeps the journal so the
+  // hook's own resolve does not retire it — the hold's whole reason to exist.
+  it("#1539: the real hook HOLDS the drainer's terminal resolve across abort→reap→send and RELEASES it after", async () => {
+    const { gitlab } = fakeGitlab();
+    const outbox = await mkOutbox();
+    const { coord } = makeRecoveryCoordinator(new FakeRecoveryClient(), new FakeRecoveryGit());
+    const run = runner(new StubExecutor(nullLogger()), gitlab, undefined, {
+      outbox,
+      outboxTerminalMaxBytes: 1 << 20,
+      gapFillMax: 100,
+      recovery: coord,
+    });
+    const runId = "run-1539-hold";
+    const gen = 7;
+    const events: string[] = [];
+    let heldDuringSend: boolean | undefined;
+    const flight = minimalFailFlight({
+      runId,
+      gen,
+      events,
+      // 409 running keeps the journal, so the hook's own resolve does not retire it.
+      reportState: async () => {
+        heldDuringSend = outbox.isTerminalResolveHeld(runId, gen);
+        return { applied: false, status: "running" };
+      },
+    });
+    // Record the hold state from inside the reap without asserting there (an assertion throw would be
+    // swallowed by reapRecoveryProviderForSettle's catch, which only flips permanentFailureReap).
+    let heldDuringReap: boolean | undefined;
+    const realReap = flight.executor.killAgentTree;
+    flight.executor.killAgentTree = () => {
+      heldDuringReap = outbox.isTerminalResolveHeld(runId, gen);
+      return realReap();
+    };
+    assert.equal(outbox.isTerminalResolveHeld(runId, gen), false, "unheld before the hook runs");
+    await callHandle(run, failClaim(runId, gen), flight, "message persistence failed permanently: 401");
+
+    assert.deepEqual(events, ["abort", "reap", "send"], `order must be abort < reap < send; got ${JSON.stringify(events)}`);
+    assert.equal(heldDuringReap, true, "the resolve is HELD during the reap (delete holdTerminalResolve → RED)");
+    assert.equal(heldDuringSend, true, "the resolve is HELD during the send");
+    assert.equal(
+      outbox.isTerminalResolveHeld(runId, gen),
+      false,
+      "the hold is RELEASED after the hook returns (delete releaseTerminalResolve → RED)",
+    );
+    assert.equal(outbox.hasPendingTerminal(runId, gen), true, "the 409 running kept the durable journal");
   });
 
   // PRD #1391 Run B M3 (N1): a report_only COMPLETED must be journalled WRITE-AHEAD, so an outage at

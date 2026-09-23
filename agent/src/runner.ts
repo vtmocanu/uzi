@@ -725,13 +725,13 @@ interface RunFlight {
    *  latch closes. Distinct from `hasPendingTerminal`: that reads the on-disk journal (kept), this
    *  survives the journal's retirement. false until the first terminal resolve. */
   terminalResolved: boolean;
-  /** PRD #1539: the outcome of the permanent-failure hook's pre-settle reap, or undefined when the
+  /** #1539: the outcome of the permanent-failure hook's pre-settle reap, or undefined when the
    *  hook never ran (every ordinary path). true iff the reap confirmed while the run was still
    *  actively-claimed; false on a guard miss or a blocked/failed reap. reportGenericFailure reads it
    *  to settle custody ONCE without a second reap — the hook already reaped between the install and
    *  the send. Gated by {@link RunRunner.permanentFailureReapValid} against `permanentFailureReapSafety`. */
   permanentFailureReap?: boolean;
-  /** PRD #1539: the executor safety epoch the permanent-failure hook reaped, captured beside
+  /** #1539: the executor safety epoch the permanent-failure hook reaped, captured beside
    *  `permanentFailureReap`. The stale-epoch guard settles only while `executor.safety` still equals
    *  this — CodexExecutor swaps `this.safety` after each checkpoint, so a hook that tripped during a
    *  checkpoint boundary reaped the OLD epoch and must NOT settle against the new provider. `undefined`
@@ -1799,7 +1799,7 @@ export class RunRunner {
         await this.reportGenericFailure(claim, flight, err);
       }
     } finally {
-      // PRD #1539: AWAIT the permanent-failure hook's settlement BEFORE the Codex registry disposal
+      // #1539: AWAIT the permanent-failure hook's settlement BEFORE the Codex registry disposal
       // below. The arms that do NOT go through reportGenericFailure (limit, pause, forge-unreachable,
       // shutdown, stale/credential-switch stops) never await it themselves, so without this a hook
       // reap still queued or running on the boundary `queueTail` would race safety.dispose (which
@@ -2030,7 +2030,7 @@ export class RunRunner {
     phase: string,
     body: Parameters<RunFlight["reportState"]>[0],
     send: SendTerminalState,
-    // PRD #1539: an optional hook that runs AFTER the durable install and BEFORE the resolve/send (on
+    // #1539: an optional hook that runs AFTER the durable install and BEFORE the resolve/send (on
     // the no-outbox branch too, before the direct `send`). The permanent-failure hook uses it to abort
     // the attempt and reap the provider WHILE the run is still actively-claimed — the journal is on
     // disk first (D5), the reap runs before the terminal is sent, and the reconcile is authorized
@@ -2059,7 +2059,7 @@ export class RunRunner {
     // return this shape via raw client.reportState). StaleClaimError is defined and caught entirely
     // within this file — it never leaks into terminal-resolve.ts. A genuine transport error still
     // propagates, and resolvePendingTerminal keeps the journal for a later resolve, exactly as
-    // designed. PRD #1539: this wrapper wraps the send passed to BOTH branches (the reserve-exhausted
+    // designed. #1539: this wrapper wraps the send passed to BOTH branches (the reserve-exhausted
     // unjournaled send and the journaled resolve), the same as journalAndResolveTerminal does today.
     const wrappedSend: SendTerminalState = async (b, sig) => {
       try {
@@ -2077,7 +2077,7 @@ export class RunRunner {
       messagesThroughSeq: fence,
       body,
     });
-    // PRD #1539: the durable install is now on disk. Run the hook (abort + reap for the permanent
+    // #1539: the durable install is now on disk. Run the hook (abort + reap for the permanent
     // failure hook) BEFORE the resolve/send.
     await beforeResolve?.();
     if (!installed.journaled) {
@@ -2193,7 +2193,7 @@ export class RunRunner {
     }
   }
 
-  /** PRD #1539: the stale-epoch guard for the permanent-failure hook's reap. The hook records the
+  /** #1539: the stale-epoch guard for the permanent-failure hook's reap. The hook records the
    *  reap outcome AND the executor safety epoch it reaped; a consumer settles custody ONLY IF the reap
    *  confirmed AND the executor's safety epoch is still the one reaped. CodexExecutor swaps
    *  `this.safety = epoch.safety` after each checkpoint (codex/codex-executor.ts), so a hook that
@@ -2258,7 +2258,7 @@ export class RunRunner {
         claim_generation: flight.claimGeneration,
       });
       await batcher.close().catch(() => undefined);
-      // PRD #1539: when the permanent-failure hook handled this terminal it ALREADY reaped the
+      // #1539: when the permanent-failure hook handled this terminal it ALREADY reaped the
       // provider between the install and the send (while still actively-claimed), so there is no
       // second reap here — settle custody ONCE, gated by the stale-epoch guard. Any OTHER writer that
       // reaches this arm (the finalize sites at :2600/:2611) already settles via driveRecoveryTerminal
@@ -2286,7 +2286,7 @@ export class RunRunner {
     // hold as source_only. So reap while the run is still `running`. The reap is deadline-bounded;
     // a Claude/SDK reap is an idempotent killAgentTree on an already-dead tree; a pre-clone
     // failure has no clone and no-ops (returns false). The settle runs AFTER the report below.
-    // PRD #1539: this fall-through is reached under the hook when its UNJOURNALED send threw (no latch,
+    // #1539: this fall-through is reached under the hook when its UNJOURNALED send threw (no latch,
     // no journal) — the hook already reaped, so reuse that outcome under the stale-epoch guard rather
     // than reap a second time (a second reap would be refused if the lost-ack send had actually landed).
     const reaped =
@@ -4672,7 +4672,7 @@ export class RunRunner {
       // the moment any completed/failed for this generation is sent/resolved (write-ahead or not),
       // so reportGenericFailure never falls through to a SECOND `failed` once one is final.
       terminalResolved: false,
-      // PRD #1539: set by the permanent-failure hook (undefined until then) — the pre-settle reap
+      // #1539: set by the permanent-failure hook (undefined until then) — the pre-settle reap
       // outcome and the safety epoch it reaped, for reportGenericFailure's one-time custody settle.
       permanentFailureReap: undefined,
       permanentFailureReapSafety: undefined,
