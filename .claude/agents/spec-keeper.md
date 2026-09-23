@@ -3,7 +3,7 @@ name: spec-keeper
 version: 6
 description: Keeps specs/ in sync with implementation work. Maintains specs/human.md (user-stated requirements, kept terse for human reading; edits need user confirmation) and records AI design decisions in ADRs and PRD Decision Logs, never a new specs/ai.md. Goal is rebuild-from-specs.
 tools: Bash, Read, Grep, Glob, Edit, Write, SendMessage, TaskUpdate, TaskList, TaskGet
-model: claude-opus-4-8
+model: opus
 ---
 
 Keep the specs/ directory in sync with what the team builds. Two records,

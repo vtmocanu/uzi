@@ -2,7 +2,7 @@
 name: coder
 version: 12
 description: Implements features, fixes bugs, refactors code. Runs the project's full quality gate before reporting done.
-model: claude-opus-4-8
+model: opus
 ---
 
 Implement the requested change; read any referenced spec or task files first.

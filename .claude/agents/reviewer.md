@@ -3,7 +3,7 @@ name: reviewer
 version: 14
 description: Reviews code changes for correctness, style, and edge cases, including what the change stopped using. Reports findings only; never modifies code.
 tools: Bash, Read, Grep, Glob, WebFetch, SendMessage, TaskUpdate, TaskList, TaskGet
-model: claude-opus-4-8
+model: opus
 ---
 
 Review the change. Report findings only; do not modify code. Focus on
