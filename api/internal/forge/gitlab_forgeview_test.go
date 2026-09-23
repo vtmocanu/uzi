@@ -74,7 +74,10 @@ func TestGitLabGetMergeRequestSummary(t *testing.T) {
 			})
 		},
 		"/api/v4/projects/7/merge_requests/13/approvals": func(w http.ResponseWriter, _ *http.Request) {
-			_ = json.NewEncoder(w).Encode(map[string]any{"approved": true})
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"approved":    true,
+				"approved_by": []map[string]any{{"user": map[string]any{"username": "rev1"}}},
+			})
 		},
 		"/api/v4/projects/7/merge_requests/14": func(w http.ResponseWriter, _ *http.Request) {
 			_ = json.NewEncoder(w).Encode(map[string]any{
@@ -118,6 +121,62 @@ func TestGitLabGetMergeRequestSummary(t *testing.T) {
 	if mr14.ReviewDecision != ReviewChangesRequested {
 		t.Errorf("MR 14 (unresolved blocking discussion) ⇒ changes_requested, got %q", mr14.ReviewDecision)
 	}
+}
+
+// TestGitLabGetMergeRequestSummaryVacuousApprovalIsNotApproved pins the corrected D6
+// GitLab mapping: GitLab Enterprise Edition (gitlab.com and the default self-managed
+// build) returns approved=true with an EMPTY approved_by when no approval rules apply,
+// so the driver must NOT band such an MR approved — ReviewApproved requires at least one
+// real approver. This is the regression guard for the vacuous-approval bug: it returns
+// ReviewApproved while mrApproved trusts cfg.Approved, and none/review_required once it
+// counts approved_by. blocking_discussions_resolved:true is load-bearing — an unresolved
+// discussion would short-circuit reviewDecision to changes_requested before mrApproved
+// runs, making the test pass for the wrong reason.
+func TestGitLabGetMergeRequestSummaryVacuousApprovalIsNotApproved(t *testing.T) {
+	t.Run("vacuous approved + no reviewers ⇒ none", func(t *testing.T) {
+		m := newMockGitLab(t, map[string]http.HandlerFunc{
+			"/api/v4/projects/7/merge_requests/50": func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"iid": 50, "title": "clean, nobody approved", "sha": "aa50", "state": "opened",
+					"blocking_discussions_resolved": true})
+			},
+			"/api/v4/projects/7/merge_requests/50/approvals": func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"approved": true, "approvals_required": 0, "approved_by": []map[string]any{}})
+			},
+		})
+		d := newTestDriver(t, m, "glpat-token-value-123456")
+		got, err := d.GetMergeRequestSummary(context.Background(), 7, 50)
+		if err != nil {
+			t.Fatalf("GetMergeRequestSummary(50): %v", err)
+		}
+		if got.ReviewDecision != ReviewNone {
+			t.Fatalf("approved=true but approved_by empty and no reviewers ⇒ none, got %q", got.ReviewDecision)
+		}
+	})
+
+	t.Run("vacuous approved + reviewer requested ⇒ review_required", func(t *testing.T) {
+		m := newMockGitLab(t, map[string]http.HandlerFunc{
+			"/api/v4/projects/7/merge_requests/51": func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"iid": 51, "title": "clean, review requested", "sha": "aa51", "state": "opened",
+					"blocking_discussions_resolved": true,
+					"reviewers":                     []map[string]any{{"username": "rev1"}}})
+			},
+			"/api/v4/projects/7/merge_requests/51/approvals": func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"approved": true, "approvals_required": 0, "approved_by": []map[string]any{}})
+			},
+		})
+		d := newTestDriver(t, m, "glpat-token-value-123456")
+		got, err := d.GetMergeRequestSummary(context.Background(), 7, 51)
+		if err != nil {
+			t.Fatalf("GetMergeRequestSummary(51): %v", err)
+		}
+		if got.ReviewDecision != ReviewRequired {
+			t.Fatalf("approved=true but approved_by empty + reviewer requested ⇒ review_required, got %q", got.ReviewDecision)
+		}
+	})
 }
 
 // TestGitLabGetMergeRequestSummaryConflictsFromDetailedMergeStatus pins that a

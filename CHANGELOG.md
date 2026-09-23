@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Fixed
+
+- **GitLab merge requests no longer show as review-approved when nobody approved them.**
+  The forge-view pulls screen trusted GitLab's `approved` flag, which is vacuously `true` on Enterprise Edition (gitlab.com and the default self-managed build) when a project has no approval rules, so every clean MR banded READY; the driver now requires at least one real approver, matching the GitHub/Forgejo behavior and the `approved` review-decision contract.
+
 ## [0.84.0] - 2026-09-20
 
 ### Added
