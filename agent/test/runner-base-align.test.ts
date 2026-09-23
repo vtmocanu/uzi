@@ -179,6 +179,78 @@ describe("RunRunner — finalize base-align (PRD #456)", () => {
     });
   }
 
+  it("workflow resolution in a published merge fails typed and preserves the patch", async () => {
+    seedWorkflowsOnOrigin();
+    const base = gitIn(fx.originPath, ["rev-parse", "main"]);
+    gitIn(fx.originPath, ["checkout", "-b", "agent/issue-157"]);
+    commitToOriginMain({ "branch.txt": "branch work\n" }, "branch nonworkflow work");
+    const branchParent = gitIn(fx.originPath, ["rev-parse", "HEAD"]);
+    assert.strictEqual(gitIn(fx.originPath, ["diff", "--name-only", base, branchParent]), "branch.txt");
+    gitIn(fx.originPath, ["checkout", "main"]);
+    commitToOriginMain({ ".github/workflows/ci.yml": CI_V2 }, "default workflow");
+    const fresh = gitIn(fx.originPath, ["rev-parse", "main"]);
+    gitIn(fx.originPath, ["checkout", "agent/issue-157"]);
+    gitIn(fx.originPath, ["merge", "--no-ff", "--no-commit", fresh]);
+    // Only this merge resolution changes the workflow relative to both parents.
+    fs.writeFileSync(path.join(fx.originPath, ".github/workflows/ci.yml"), "name: resolved\n");
+    gitIn(fx.originPath, ["add", ".github/workflows/ci.yml"]);
+    gitIn(fx.originPath, [...IDENT, "commit", "-m", "resolve workflow"]);
+    const merge = gitIn(fx.originPath, ["rev-parse", "HEAD"]);
+    assert.strictEqual(gitIn(fx.originPath, ["rev-list", "--parents", "-n", "1", merge]), `${merge} ${branchParent} ${fresh}`);
+    for (const parent of [branchParent, fresh]) {
+      assert.strictEqual(gitIn(fx.originPath, ["diff", "--name-only", parent, merge, "--", ".github/workflows"]), ".github/workflows/ci.yml");
+    }
+    gitIn(fx.originPath, ["checkout", "main"]);
+    const { github, calls } = fakeGitHub();
+    const claim = githubClaim(157);
+    const checked: Array<string[] | null> = [];
+    const original = git.branchWorkflowFiles.bind(git);
+    git.branchWorkflowFiles = (async (...args: Parameters<typeof git.branchWorkflowFiles>) => {
+      const result = await original(...args);
+      checked.push(result);
+      return result;
+    }) as typeof git.branchWorkflowFiles;
+    await githubRunner(github, committingExecutor({ "impl.ts": "export const x = 1;\n" })).execute(claim);
+    assert.deepStrictEqual(checked, [[".github/workflows/ci.yml"]]);
+    const failed = api.states.find((s) => s.runId === claim.run_id && s.body.status === "failed")?.body;
+    assert.strictEqual(failed?.fail_origin, "workflow_scope_missing");
+    assert.match(failed?.preserved_patch ?? "", /\.github\/workflows\/ci\.yml/);
+    assert.match(failed?.preserved_patch ?? "", /branch\.txt/);
+    assert.match(failed?.preserved_patch ?? "", /impl\.ts/);
+    assert.strictEqual(calls.length, 0);
+  });
+
+  it("published clean merge followed by MR rework completes without a workflow-scope failure", async () => {
+    seedWorkflowsOnOrigin();
+    gitIn(fx.originPath, ["checkout", "-b", "agent/issue-158"]);
+    commitToOriginMain({ "branch.txt": "prior work\n" }, "branch work");
+    gitIn(fx.originPath, ["checkout", "main"]);
+    commitToOriginMain({ ".github/workflows/ci.yml": CI_V2 }, "default workflow");
+    const fresh = gitIn(fx.originPath, ["rev-parse", "main"]);
+    gitIn(fx.originPath, ["checkout", "agent/issue-158"]);
+    gitIn(fx.originPath, [...IDENT, "merge", "--no-ff", "-m", "merge default workflows", fresh]);
+    const merge = gitIn(fx.originPath, ["rev-parse", "HEAD"]);
+    assert.strictEqual(gitIn(fx.originPath, ["show", `${merge}:.github/workflows/ci.yml`]), CI_V2.trim());
+    gitIn(fx.originPath, ["checkout", "main"]);
+    const { github, calls } = fakeGitHub();
+    const claim = githubClaim(158, { kind: "mr_rework", branch: "agent/issue-158", issue_iid: null });
+    const checked: Array<string[] | null> = [];
+    const original = git.branchWorkflowFiles.bind(git);
+    git.branchWorkflowFiles = (async (...args: Parameters<typeof git.branchWorkflowFiles>) => {
+      const result = await original(...args);
+      checked.push(result);
+      return result;
+    }) as typeof git.branchWorkflowFiles;
+    await githubRunner(github, committingExecutor({ "impl.ts": "export const reworked = true;\n" })).execute(claim);
+    assert.deepStrictEqual(checked, [[]]);
+    const states = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body);
+    assert.deepStrictEqual(states.map((s) => s.status), ["running", "running", "completed"]);
+    assert.strictEqual(calls.length, 1);
+    assert.strictEqual(gitIn(fx.originPath, ["show", "agent/issue-158:impl.ts"]), "export const reworked = true;");
+    assert.strictEqual(gitIn(fx.originPath, ["show", "agent/issue-158:.github/workflows/ci.yml"]), CI_V2.trim());
+    assert.strictEqual(gitIn(fx.originPath, ["merge-base", "--is-ancestor", merge, "agent/issue-158"]), "");
+  });
+
   // (a) behind-on-workflows: main advanced a workflow file the branch never touched → the
   // merge aligns the tree and the push proceeds, landing BOTH the agent's work and the fresh
   // workflow content on origin.
@@ -330,9 +402,8 @@ describe("RunRunner — finalize base-align (PRD #456)", () => {
     await fsp.rm(dir, { recursive: true, force: true });
   });
 
-  // (d) already aligned: the branch's workflow tree already matches the fresh default (main
-  // never moved on workflows) → no align, a single normal push, exactly one fetchDefaultTip.
-  it("(d) already aligned → no align work, single push, exactly one fetchDefaultTip call", async () => {
+  // (d) already aligned: the branch's workflow tree already matches the fresh default.
+  it("(d) already aligned → no align work, single push, two fetchDefaultTip calls", async () => {
     seedWorkflowsOnOrigin();
     const { github, calls } = fakeGitHub();
     const strategies = spyAlign();
@@ -352,10 +423,52 @@ describe("RunRunner — finalize base-align (PRD #456)", () => {
     const statuses = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body.status);
     assert.deepStrictEqual(statuses, ["running", "running", "completed"]);
     assert.deepStrictEqual(strategies, [], "no align was performed");
-    assert.strictEqual(fetchSpy.count(), 1, "fetchDefaultTip runs exactly once (the detection probe)");
+    assert.strictEqual(fetchSpy.count(), 2, "precheck and alignment each fetch the default tip");
     assert.strictEqual(pushCalls, 1, "exactly one push");
     assert.strictEqual(calls.length, 1, "the PR was opened once");
     assert.strictEqual(gitIn(fx.originPath, ["show", "agent/issue-53:impl.ts"]), "export const x = 1;");
+  });
+
+  it("uses a default tip that advances after precheck and before alignment", async () => {
+    seedWorkflowsOnOrigin();
+    const { github, calls } = fakeGitHub();
+    const strategies = spyAlign();
+    const fetch = git.fetchDefaultTip.bind(git);
+    let fetches = 0;
+    git.fetchDefaultTip = (async (...args: Parameters<typeof git.fetchDefaultTip>) => {
+      fetches++;
+      if (fetches === 2) commitToOriginMain({ ".github/workflows/ci.yml": CI_V2 }, "advance after precheck");
+      return fetch(...args);
+    }) as typeof git.fetchDefaultTip;
+    const claim = githubClaim(154);
+    await githubRunner(github, committingExecutor({ "impl.ts": "export const x = 1;\n" })).execute(claim);
+    assert.deepStrictEqual(api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body.status),
+      ["running", "running", "completed"]);
+    assert.strictEqual(fetches, 2);
+    assert.deepStrictEqual(strategies, ["workflow-subtree"]);
+    assert.strictEqual(calls.length, 1);
+    assert.strictEqual(gitIn(fx.originPath, ["show", "agent/issue-154:.github/workflows/ci.yml"]), CI_V2.trim());
+  });
+
+  it("second default-tip fetch failure falls through to the normal push", async () => {
+    seedWorkflowsOnOrigin();
+    const { github, calls } = fakeGitHub();
+    const strategies = spyAlign();
+    const fetch = git.fetchDefaultTip.bind(git);
+    let fetches = 0;
+    git.fetchDefaultTip = (async (...args: Parameters<typeof git.fetchDefaultTip>) => {
+      fetches++;
+      if (fetches === 2) throw new Error("second fetch unavailable");
+      return fetch(...args);
+    }) as typeof git.fetchDefaultTip;
+    const claim = githubClaim(155);
+    await githubRunner(github, committingExecutor({ "impl.ts": "export const x = 1;\n" })).execute(claim);
+    assert.deepStrictEqual(api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body.status),
+      ["running", "running", "completed"]);
+    assert.strictEqual(fetches, 2);
+    assert.deepStrictEqual(strategies, []);
+    assert.strictEqual(calls.length, 1);
+    assert.strictEqual(gitIn(fx.originPath, ["show", "agent/issue-155:impl.ts"]), "export const x = 1;");
   });
 
   it("default-tip fetch failure falls through to the normal push", async () => {

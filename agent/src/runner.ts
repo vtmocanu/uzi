@@ -3291,7 +3291,7 @@ export class RunRunner {
       // Capture the narrowed bare path in a const the SAME way the push block does
       // (barePath is an outer `let string | undefined` and TS drops the narrowing here).
       const wfBarePath = barePath;
-      // Fetch before the precheck so commit classification uses the same fresh tip as align.
+      // Fetch before the precheck so commit classification sees the current default tip.
       try {
         const defaultBranch = claim.repo.default_branch?.trim() ||
           (await this.git.defaultBranchName(wfBarePath)) || "main";
@@ -3630,10 +3630,19 @@ export class RunRunner {
           claim.repo.default_branch?.trim() ||
           (await this.git.defaultBranchName(alignBarePath)) ||
           "main";
-        // Detection is best-effort (N2/D6 posture): a fetch/diff failure must NOT block a push
-        // that may well succeed (the branch may not actually be behind) — fall through to the
-        // normal push, never fail a run on an inability to compute the align target.
-        const defaultTip = freshDefaultTip;
+        // Re-fetch immediately before alignment: default may advance after the precheck.
+        // Detection is best-effort; a failed fetch falls through to the normal push.
+        let defaultTip: string | undefined;
+        try {
+          defaultTip = await this.git.fetchDefaultTip(
+            alignBarePath, alignDefaultBranch, claim.secrets.forge_pat,
+            claim.repo.clone_url, claim.secrets.forge_username,
+          );
+        } catch (e) {
+          runLog.warn("finalize base-align: could not fetch default tip; pushing without aligning", {
+            run_id: runId, error: errMessage(e),
+          });
+        }
         let differs = false;
         try {
           if (defaultTip) differs = await this.git.workflowTreeDiffers(

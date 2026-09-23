@@ -2104,17 +2104,19 @@ export class GitCache {
           .trim().split(" ");
         const parents = parts.slice(1);
         if (parents.length > maxParents) return null;
-        // A merge may contain changes absent from either parent's individual history.
+        // A merge owns a workflow resolution only when its result differs from
+        // every parent. A clean merge merely carries one parent's workflow tree.
         const comparisons = parents.length ? parents : ["--root"];
-        const touched = new Set<string>();
+        let touched: Set<string> | undefined;
         for (const parent of comparisons) {
           const args = parent === "--root"
             ? ["diff-tree", "--root", "--no-commit-id", "--no-renames", "--name-only", "-z", "-r", commit]
             : ["diff", "--no-renames", "--name-only", "-z", parent, commit];
           const out = await this.runGit(barePath, args);
-          for (const file of out.split("\0")) if (file.startsWith(".github/workflows/")) touched.add(file);
+          const changed = new Set(out.split("\0").filter((file) => file.startsWith(".github/workflows/")));
+          touched = touched === undefined ? changed : new Set([...touched].filter((file) => changed.has(file)));
         }
-        if (touched.size === 0) continue;
+        if (!touched || touched.size === 0) continue;
         let align = false;
         if (parents.length === 1) {
           const subject = (await this.runGit(barePath, ["log", "-1", "--format=%s", commit])).trim();
@@ -2124,10 +2126,12 @@ export class GitCache {
           if (named && parent) {
             const changed = (await this.runGit(barePath, ["diff", "--no-renames", "--name-only", "-z", parent, commit]))
               .split("\0").filter(Boolean);
-            const inFreshHistory = await this.runGit(barePath, ["merge-base", "--is-ancestor", named, freshDefaultTip])
-              .then(() => true, () => false);
-            const inParentHistory = await this.runGit(barePath, ["merge-base", "--is-ancestor", named, parent])
-              .then(() => true, () => false);
+            const freshAncestry = await this.tryGitExit(barePath, ["merge-base", "--is-ancestor", named, freshDefaultTip]);
+            const parentAncestry = await this.tryGitExit(barePath, ["merge-base", "--is-ancestor", named, parent]);
+            if ((freshAncestry !== 0 && freshAncestry !== 1) ||
+                (parentAncestry !== 0 && parentAncestry !== 1)) return null;
+            const inFreshHistory = freshAncestry === 0;
+            const inParentHistory = parentAncestry === 0;
             // ls-tree succeeds with empty output when the default deleted the entire
             // workflow directory; a matching deletion is a valid align.
             const commitTree = await this.runGit(barePath, ["ls-tree", commit, "--", ".github/workflows"]);

@@ -220,6 +220,23 @@ describe("branchWorkflowFiles", () => {
     assert.deepStrictEqual(await git.branchWorkflowFiles(bare, fresh, ref), []);
   });
 
+  it("fails open when a plausible align names a missing commit", async () => {
+    const bare = await git.ensureClone(fx.originPath);
+    const rc = await git.createOrAttachRunnerClone(bare, 106);
+    advanceOriginMain(fx.originPath, { ".github/workflows/ci.yml": "name: current\n" }, "default advances");
+    const fresh = await git.fetchDefaultTip(bare, "main");
+    const missing = "f".repeat(40);
+    assert.throws(
+      () => gitIn(bare, ["merge-base", "--is-ancestor", missing, fresh]),
+      (error: unknown) => (error as { status?: number }).status === 128,
+    );
+    fs.writeFileSync(path.join(rc.path, ".github/workflows/ci.yml"), "name: current\n");
+    gitIn(rc.path, ["add", ".github/workflows/ci.yml"]);
+    gitIn(rc.path, [...IDENT, "commit", "-m", `chore: align .github/workflows with ${missing}`]);
+    const ref = await git.fetchAgentBranch(bare, rc.path, "agent/issue-106", "run-missing");
+    assert.strictEqual(await git.branchWorkflowFiles(bare, fresh, ref), null);
+  });
+
   it("does not exempt a mixed align commit or a default already in its parent", async () => {
     const bare = await git.ensureClone(fx.originPath);
     const rc = await git.createOrAttachRunnerClone(bare, 3);
@@ -242,7 +259,7 @@ describe("branchWorkflowFiles", () => {
     assert.deepStrictEqual(await git.branchWorkflowFiles(bare, fresh, ref), [".github/workflows/ci.yml"]);
   });
 
-  it("counts workflow changes in a merge commit and ignores an empty align commit", async () => {
+  it("ignores a clean merge carrying default workflows and an empty align commit", async () => {
     const bare = await git.ensureClone(fx.originPath);
     const rc = await git.createOrAttachRunnerClone(bare, 5);
     const initial = await git.fetchDefaultTip(bare, "main");
@@ -254,7 +271,30 @@ describe("branchWorkflowFiles", () => {
     gitIn(rc.path, ["fetch", fx.originPath, "main"]);
     gitIn(rc.path, [...IDENT, "merge", "--no-ff", "-m", `chore: align .github/workflows with ${fresh}`, fresh]);
     ref = await git.fetchAgentBranch(bare, rc.path, "agent/issue-5", "run-merge");
-    assert.deepStrictEqual(await git.branchWorkflowFiles(bare, fresh, ref), [".github/workflows/ci.yml"]);
+    assert.deepStrictEqual(await git.branchWorkflowFiles(bare, fresh, ref), []);
+  });
+
+  it("detects a merge resolution that changes workflows against every parent", async () => {
+    const bare = await git.ensureClone(fx.originPath);
+    const rc = await git.createOrAttachRunnerClone(bare, 6);
+    const base = await git.fetchDefaultTip(bare, "main");
+    fs.writeFileSync(path.join(rc.path, ".github/workflows/ci.yml"), "name: branch\n");
+    gitIn(rc.path, ["add", ".github/workflows/ci.yml"]);
+    gitIn(rc.path, [...IDENT, "commit", "-m", "branch workflow"]);
+    advanceOriginMain(fx.originPath, { ".github/workflows/ci.yml": "name: default\n" }, "default workflow");
+    const fresh = await git.fetchDefaultTip(bare, "main");
+    gitIn(rc.path, ["fetch", fx.originPath, "main"]);
+    const branch = gitIn(rc.path, ["rev-parse", "HEAD"]);
+    const tree = gitIn(rc.path, ["write-tree"]);
+    // Build a merge tree with a third resolution, distinct from both parent blobs.
+    fs.writeFileSync(path.join(rc.path, ".github/workflows/ci.yml"), "name: resolved\n");
+    gitIn(rc.path, ["add", ".github/workflows/ci.yml"]);
+    const resolvedTree = gitIn(rc.path, ["write-tree"]);
+    assert.notStrictEqual(tree, resolvedTree);
+    const merge = gitIn(rc.path, [...IDENT, "commit-tree", resolvedTree, "-p", branch, "-p", fresh, "-m", "resolve workflow"]);
+    gitIn(bare, ["fetch", rc.path, merge]);
+    assert.deepStrictEqual(await git.branchWorkflowFiles(bare, fresh, merge), [".github/workflows/ci.yml"]);
+    assert.notStrictEqual(base, fresh);
   });
 
   it("rejects a forged align subject with a workflow tree that differs from its named default", async () => {
