@@ -39,7 +39,13 @@
 //                               as `activity` (NOT a frame), while an ACCEPTED ROOT SIGNAL call
 //                               (submit_plan/signal_done/checkpoint/progress/questions) ALSO
 //                               yields a main-origin `frame` carrying the scanned `signals` so
-//                               the run-lane reducer folds them (the model reply is unchanged)
+//                               the run-lane reducer folds them (the model reply is unchanged).
+//                               An ACTIVE-TURN non-signal, non-delegation root call is ALSO
+//                               projected (issue #1583) as a lead tool started/finished frame
+//                               pair, queued on the turn's outbox and drained ahead of its
+//                               `activity`. An active-turn DELEGATION is projected as a lead
+//                               "Agent" dispatch/completion pair around its child's
+//                               subagent-origin frames (bindChildDispatch / emitChildFrame)
 //   auth refresh request      → narrow auth owner (never broker), then `activity`
 //   other server→client req   → fail-closed JSON-RPC method error, then `activity`
 //   turn/completed            → `turn_finished` (decoded terminal; success/failed by
@@ -63,6 +69,18 @@ import {
   type CodexErrorClassification,
 } from "./terminal-normalize.js";
 import { CodexUsageAccountant, deriveCodexRunCost } from "./token-accounting.js";
+import {
+  childProjectedId,
+  newProjectionNonce,
+  projectedId,
+  projectLabel,
+  projectOutputValue,
+  projectText,
+  projectToolInput,
+  projectToolName,
+  projectToolOutput,
+  type ProjectionScrub,
+} from "./projection.js";
 
 import type { Logger } from "../log.js";
 import type {
@@ -201,6 +219,13 @@ export interface CodexHarnessOptions {
    *  this true; recreated internal epochs set it false, so each worker claim creates exactly one
    *  persisted usage-lineage marker regardless of app-server `thread/started` behavior. */
   readonly emitClaimInit?: boolean;
+  /** Issue #1583: the redactor applied to every PROJECTED tool input/output string BEFORE it is
+   *  bounded (the executor wires the run's runtime-released Codex tokens, which the batcher's
+   *  claim-secret redactor never sees). Identity when absent; the batcher still redacts at persist. */
+  readonly scrubProjected?: ProjectionScrub;
+  /** Issue #1583: the 12-hex-char namespace of this harness's projected tool ids. Generated from
+   *  `crypto.randomBytes` when absent; injectable so a test can pin the ids. */
+  readonly idNonce?: string;
 }
 
 // --- small pure helpers -------------------------------------------------------
@@ -267,6 +292,76 @@ interface RoutedRootSignal {
   readonly signals: Readonly<Partial<TurnSignals>>;
 }
 
+/** Issue #1583: one ACTIVE-TURN root delegation callback, recorded when it is routed so the child
+ *  it starts can be bound to it (see {@link CodexHarness.bindChildDispatch}). `pending` until its
+ *  child starts, `bound` once the lead dispatch frame was emitted, `closed` once a completion was
+ *  emitted (or can no longer be: the turn stopped/ended). Removed when its callback settles. */
+interface DelegationDispatch {
+  readonly threadId: string;
+  readonly turnId: string;
+  readonly callId: string;
+  /** The namespaced projected id: the lead dispatch tool_use id AND the child lane's instance. */
+  readonly dispatchId: string;
+  /** The scrubbed + bounded `description` arg (display only, never authority); may be "". */
+  readonly label: string;
+  readonly ordinal: number;
+  state: "pending" | "bound" | "closed";
+  /** The child binding once bound; kept after the child sink unregisters so a close can still
+   *  settle its open child tools. */
+  child?: ChildBinding;
+}
+
+/** A projected child tool `started` awaiting its `finished`. */
+interface OpenChildTool {
+  readonly id: string;
+  readonly name: string;
+}
+
+/** A child thread bound to its dispatch: the projected (scrubbed, bounded) admitted role, and the
+ *  per-child tool-id bookkeeping (ids unique within the child, started paired to finished). */
+interface ChildBinding {
+  readonly dispatch: DelegationDispatch;
+  readonly role: string;
+  counter: number;
+  readonly issuedIds: Set<string>;
+  /** Raw provider call id -> the projected starteds still open under it, oldest first: a reused
+   *  raw id queues, and each `finished` closes the oldest. An empty queue is deleted. */
+  readonly openTools: Map<string, OpenChildTool[]>;
+  /** Projected child items / JSON bytes emitted so far for this dispatch (see
+   *  {@link MAX_CHILD_ITEMS_PER_DISPATCH}); `capped` once this dispatch's or the turn's budget
+   *  was exhausted and its one {@link CHILD_OUTPUT_CAPPED} marker went out. */
+  items: number;
+  bytes: number;
+  capped: boolean;
+}
+
+/** The synthesized lead completion for a bound dispatch the run stopped (abort/stop/close). */
+const DISPATCH_STOPPED = "delegation stopped by the run; child settlement not confirmed";
+/** The synthesized lead completion for a bound dispatch still open when its turn finished. */
+const DISPATCH_OPEN_AT_TURN_END = "delegation still open at turn end; child settlement not confirmed";
+/** The synthesized lead completion for a bound dispatch whose turn stream failed (a protocol or
+ *  transport throw, e.g. an unexpected provider EOF). */
+const DISPATCH_STREAM_FAILED = "delegation ended by a provider stream failure; child settlement not confirmed";
+/** The lead tool name a dispatch is projected under (the server's milestone-lane contract). */
+const DISPATCH_TOOL_NAME = "Agent";
+/** The per-dispatch budget of projected child items and of their JSON-serialized bytes. A child
+ *  producing more (one frame with a huge part list, or many frames) gets ONE
+ *  {@link CHILD_OUTPUT_CAPPED} text item and nothing further except the `finished` of a child
+ *  tool whose `started` was already projected, whose output is then replaced by
+ *  {@link CHILD_TOOL_OUTPUT_OMITTED}; its lead completion is unaffected. */
+const MAX_CHILD_ITEMS_PER_DISPATCH = 2000;
+const MAX_CHILD_BYTES_PER_DISPATCH = 4 * 1024 * 1024;
+/** The same budget summed over EVERY dispatch of one turn, so N dispatches cannot project N times
+ *  the per-dispatch cap. Once it is spent, each still-uncapped dispatch gets its one marker. */
+const MAX_CHILD_ITEMS_PER_TURN = 10_000;
+const MAX_CHILD_BYTES_PER_TURN = 16 * 1024 * 1024;
+const CHILD_OUTPUT_CAPPED = "[further subagent output not shown]";
+/** The output of a child tool `finished` that closes a projected `started` but does not fit the
+ *  budget: the pair still closes, at a small constant size. */
+const CHILD_TOOL_OUTPUT_OMITTED = "[output not shown: subagent output cap reached]";
+/** The output synthesized for a child tool still open when its dispatch was closed. */
+const CHILD_TOOL_UNCONFIRMED = "tool result not confirmed: delegation closed";
+
 // --- the harness --------------------------------------------------------------
 
 export class CodexHarness implements RunHarness {
@@ -312,6 +407,29 @@ export class CodexHarness implements RunHarness {
   private readonly emitClaimInit: boolean;
   private claimInitEmitted = false;
 
+  // Issue #1583: the tool-projection OUTBOX. A root callback is awaited inside mapNote, but its
+  // `started` tool frame must reach the stream BEFORE the (possibly long) broker effect settles,
+  // so routeToolCall pushes projected frames here and runTurn races `outboxReady()` against the
+  // note/mapNote awaits, draining the queue whenever it wakes. Frames are accepted ONLY for the
+  // turn whose stream is live (`liveProjectionTurn`): a wedged callback that settles after its
+  // turn ended (abort/stop) can never leak a frame into a later turn's stream.
+  private readonly scrubProjected: ProjectionScrub;
+  private readonly idNonce: string;
+  private outbox: HarnessEvent[] = [];
+  private wakeOutbox?: () => void;
+  private turnOrdinal = 0;
+  private liveProjectionTurn?: number;
+  // Per-turn id counter: the fallback for a call id empty after sanitising, and the `-n<k>`
+  // suffix that disambiguates a colliding id.
+  private projectionCounter = 0;
+  // Ids already issued this turn: a reused call id (or two that sanitise identically) gets a
+  // `-n<k>` suffix so every started/finished pair stays distinct.
+  private issuedProjectionIds = new Set<string>();
+  // Projected child items / JSON bytes emitted this turn across all dispatches (see
+  // MAX_CHILD_ITEMS_PER_TURN); reset in startTurn.
+  private childTurnItems = 0;
+  private childTurnBytes = 0;
+
   // Child-thread demux (part C): a registered sink receives every frame carrying its
   // child thread id off the SAME transport, so a delegation's child turn can consume its
   // own notifications while the root loop keeps reading. Empty on the non-delegation path.
@@ -321,6 +439,10 @@ export class CodexHarness implements RunHarness {
   // deadlock the transport read). It runs in the background, tracked here, and the turn
   // stream flushes it before ending. Every non-delegate callback stays inline.
   private readonly pendingToolCalls = new Set<Promise<unknown>>();
+  // Issue #1583: the in-flight root delegation callbacks (see DelegationDispatch) and the child
+  // threads bound to one of them. A child frame projects ONLY through a binding.
+  private readonly dispatches = new Set<DelegationDispatch>();
+  private readonly childBindings = new Map<string, ChildBinding>();
 
   // Per-turn state (turns run strictly sequentially).
   private activeTurnId?: string;
@@ -357,6 +479,8 @@ export class CodexHarness implements RunHarness {
     this.authMode = opts.authMode;
     this.accountant = opts.accountant ?? new CodexUsageAccountant();
     this.emitClaimInit = opts.emitClaimInit ?? true;
+    this.scrubProjected = opts.scrubProjected ?? ((s: string): string => s);
+    this.idNonce = opts.idNonce ?? newProjectionNonce();
   }
 
   inspectSession(id: string): Promise<SessionPresence> {
@@ -401,9 +525,227 @@ export class CodexHarness implements RunHarness {
     this.accountant.registerThread(threadId, model, false);
   }
 
-  /** Stop routing frames for `threadId` to a child sink (the child turn is done). */
+  /** Stop routing frames for `threadId` to a child sink (the child turn is done). Also drops the
+   *  thread's dispatch binding, so a late note for it projects nothing. */
   unregisterChildSink(threadId: string): void {
     this.childSinks.delete(threadId);
+    this.childBindings.delete(threadId);
+  }
+
+  /**
+   * Issue #1583: bind a just-started child thread to the root delegation callback that started it,
+   * and emit the LEAD dispatch frame (`tool_use` named "Agent", id = the dispatch id, input =
+   * `{subagent_type, description}`). `parent` is the callback identity the broker handed the
+   * delegate seam; `admittedRole` is the role the broker ADMITTED (never re-read from the args).
+   *
+   * Binds only a REGISTERED child thread to EXACTLY ONE pending, unbound dispatch of the live turn
+   * with that parent key; none, or an ambiguous key (two in-flight calls sharing it), binds nothing
+   * and the child runs unprojected. Fail-safe: never throws.
+   */
+  bindChildDispatch(
+    childThreadId: string,
+    parent: { readonly threadId: string; readonly turnId: string; readonly callId: string },
+    admittedRole: string,
+  ): void {
+    try {
+      if (!this.childSinks.has(childThreadId) || this.childBindings.has(childThreadId)) return;
+      const matches = [...this.dispatches].filter(
+        (d) =>
+          d.state === "pending" &&
+          d.threadId === parent.threadId &&
+          d.turnId === parent.turnId &&
+          d.callId === parent.callId,
+      );
+      if (matches.length !== 1) return;
+      const dispatch = matches[0]!;
+      if (dispatch.ordinal !== this.liveProjectionTurn) return;
+      let role: string;
+      try {
+        role = projectToolName(admittedRole, this.scrubProjected);
+      } catch {
+        role = "unknown";
+      }
+      dispatch.state = "bound";
+      const binding: ChildBinding = {
+        dispatch,
+        role,
+        counter: 0,
+        issuedIds: new Set(),
+        openTools: new Map(),
+        items: 0,
+        bytes: 0,
+        capped: false,
+      };
+      dispatch.child = binding;
+      this.childBindings.set(childThreadId, binding);
+      this.emitProjected(
+        this.leadFrame({
+          kind: "tool",
+          phase: "started",
+          id: dispatch.dispatchId,
+          name: DISPATCH_TOOL_NAME,
+          input: { subagent_type: role, description: dispatch.label },
+        }),
+        dispatch.ordinal,
+      );
+    } catch {
+      /* projection is best-effort: the child runs regardless */
+    }
+  }
+
+  /**
+   * Issue #1583: project RAW child items as one subagent-origin frame attributed to the bound
+   * dispatch (`agent` = the admitted role, `agentInstance` = the dispatch id, `agentLabel` = its
+   * label when non-empty). Pushed ONLY while `childThreadId` is registered AND bound to a dispatch
+   * that is still open, and under the dispatch's turn ordinal, so nothing projects after its turn
+   * ended. The frame NEVER carries `signals`.
+   *
+   * Items are raw and projected here, so the caller never needs the scrub: text/thinking are
+   * scrubbed then bounded; a tool item's `id` is the provider call id (a `started` is issued a
+   * fresh `<dispatchId>/<callId>` id, and its `finished` reuses it; a finished with no open started
+   * is dropped), its `name` the canonical tool name, its `input` the raw args and its `output` the
+   * raw output value (the broker's message on failure).
+   *
+   * Bounded per dispatch AND per turn: every projected item is counted against
+   * {@link MAX_CHILD_ITEMS_PER_DISPATCH} / {@link MAX_CHILD_BYTES_PER_DISPATCH} for this dispatch and
+   * {@link MAX_CHILD_ITEMS_PER_TURN} / {@link MAX_CHILD_BYTES_PER_TURN} summed over every dispatch of
+   * the turn (item by item, so one oversized frame is cut too). The first item that would exceed
+   * any of them caps the dispatch: a single {@link CHILD_OUTPUT_CAPPED} text item is emitted for
+   * it, and every later child item of it is dropped, EXCEPT a `finished` that closes a projected
+   * `started`. Such a closer is emitted in full while it fits; once it does not (or the dispatch is
+   * already capped) it is still emitted, so no projected tool is left running, but with its output
+   * replaced by {@link CHILD_TOOL_OUTPUT_OMITTED}, so each over-budget closer costs a small constant
+   * number of bytes (still counted). A `started` that would exceed a budget is never projected.
+   * Child tools still open when the dispatch is closed are settled by
+   * {@link closeOpenDispatches}. The lead completion is NOT a child item and is always still
+   * emitted. Fail-safe: never throws.
+   */
+  emitChildFrame(childThreadId: string, items: readonly HarnessItem[]): void {
+    try {
+      if (!this.childSinks.has(childThreadId)) return;
+      const binding = this.childBindings.get(childThreadId);
+      if (binding === undefined || binding.dispatch.state !== "bound") return;
+      if (binding.capped && binding.openTools.size === 0) return;
+      const projected: HarnessItem[] = [];
+      for (const item of items) {
+        const closesOpen = item.kind === "tool" && item.phase === "finished" && binding.openTools.has(item.id ?? "");
+        if (binding.capped && !closesOpen) continue;
+        let one = this.projectChildItem(binding, item);
+        if (one === undefined) continue;
+        let size = Buffer.byteLength(JSON.stringify(one), "utf8");
+        if (binding.capped || this.exceedsChildBudget(binding, size)) {
+          if (!binding.capped) {
+            binding.capped = true;
+            projected.push({ kind: "text", text: CHILD_OUTPUT_CAPPED });
+          }
+          if (!closesOpen || one.kind !== "tool" || one.phase !== "finished") continue;
+          // Close the visible tool anyway, at a constant size.
+          one = { ...one, output: CHILD_TOOL_OUTPUT_OMITTED };
+          size = Buffer.byteLength(JSON.stringify(one), "utf8");
+        } else if (one.kind === "tool" && one.phase === "started" && one.id !== undefined) {
+          const rawId = item.kind === "tool" ? (item.id ?? "") : "";
+          const queue = binding.openTools.get(rawId) ?? [];
+          queue.push({ id: one.id, name: one.name ?? "unknown" });
+          binding.openTools.set(rawId, queue);
+        }
+        binding.items += 1;
+        binding.bytes += size;
+        this.childTurnItems += 1;
+        this.childTurnBytes += size;
+        projected.push(one);
+      }
+      this.emitChildItems(binding, projected);
+    } catch {
+      /* projection is best-effort: the child runs regardless */
+    }
+  }
+
+  /** Whether one more projected child item of `size` bytes would exceed the dispatch's or the
+   *  turn's item/byte budget. */
+  private exceedsChildBudget(binding: ChildBinding, size: number): boolean {
+    return (
+      binding.items + 1 > MAX_CHILD_ITEMS_PER_DISPATCH ||
+      binding.bytes + size > MAX_CHILD_BYTES_PER_DISPATCH ||
+      this.childTurnItems + 1 > MAX_CHILD_ITEMS_PER_TURN ||
+      this.childTurnBytes + size > MAX_CHILD_BYTES_PER_TURN
+    );
+  }
+
+  /** Push already-projected child items as one subagent-origin frame of the binding's dispatch
+   *  (nothing when empty). */
+  private emitChildItems(binding: ChildBinding, items: HarnessItem[]): void {
+    if (items.length === 0) return;
+    const { dispatch, role } = binding;
+    this.emitProjected(
+      {
+        kind: "frame",
+        origin: { kind: "subagent", role, instanceId: dispatch.dispatchId },
+        attribution: {
+          agent: role,
+          agentInstance: dispatch.dispatchId,
+          ...(dispatch.label.length > 0 ? { agentLabel: dispatch.label } : {}),
+        },
+        items,
+        sessionId: this.threadId,
+      },
+      dispatch.ordinal,
+    );
+  }
+
+  /** Project one raw child item (see {@link emitChildFrame}); undefined drops it. A projected
+   *  `started` is NOT recorded as open here: the caller records it only once it is emitted. */
+  private projectChildItem(binding: ChildBinding, item: HarnessItem): HarnessItem | undefined {
+    const scrub = this.scrubProjected;
+    if (item.kind === "text" || item.kind === "thinking") return { kind: item.kind, text: projectText(item.text, scrub) };
+    const rawId = item.id ?? "";
+    let name: string;
+    try {
+      name = projectToolName(item.name, scrub);
+    } catch {
+      name = "unknown";
+    }
+    if (item.phase === "started") {
+      const id = this.issueChildToolId(binding, rawId);
+      let input: unknown;
+      try {
+        input = projectToolInput(item.input, scrub);
+      } catch {
+        input = { truncated: true };
+      }
+      return { kind: "tool", phase: "started", id, name, input };
+    }
+    const queue = binding.openTools.get(rawId);
+    const open = queue?.shift();
+    if (queue === undefined || open === undefined) return undefined;
+    if (queue.length === 0) binding.openTools.delete(rawId);
+    const id = open.id;
+    let output: string;
+    try {
+      output = projectOutputValue(item.output, scrub);
+    } catch {
+      output = "[projection failed]";
+    }
+    return { kind: "tool", phase: "finished", id, name, output, isError: item.isError === true };
+  }
+
+  /** A `<dispatchId>/<callId>` id not yet issued within this child (a colliding one gets a
+   *  `-n<counter>` suffix until unique). */
+  private issueChildToolId(binding: ChildBinding, callId: string): string {
+    binding.counter += 1;
+    const dispatchId = binding.dispatch.dispatchId;
+    let base: string;
+    try {
+      base = childProjectedId(dispatchId, callId, binding.counter, this.scrubProjected);
+    } catch {
+      base = childProjectedId(dispatchId, "", binding.counter);
+    }
+    let id = base;
+    while (binding.issuedIds.has(id)) {
+      binding.counter += 1;
+      id = `${base}-n${binding.counter}`;
+    }
+    binding.issuedIds.add(id);
+    return id;
   }
 
   /** Send a request on the shared provider transport. The child-thread seam uses it to
@@ -448,6 +790,12 @@ export class CodexHarness implements RunHarness {
     this.stopRequested = false;
     this.stopTurn = undefined;
     this.pendingCodexError = undefined;
+    this.turnOrdinal += 1;
+    this.projectionCounter = 0;
+    this.issuedProjectionIds = new Set();
+    this.childTurnItems = 0;
+    this.childTurnBytes = 0;
+    this.outbox = [];
 
     return {
       events: this.runTurn(request, rendered),
@@ -534,8 +882,46 @@ export class CodexHarness implements RunHarness {
 
   // --- setup + stream -----------------------------------------------------------
 
+  // --- projection outbox (issue #1583) ---------------------------------------------
+
+  /** Queue one projected event for the turn `ordinal` and wake the run loop. Dropped when that
+   *  turn's stream is no longer live (a late callback settling after its turn ended). */
+  private emitProjected(ev: HarnessEvent, ordinal: number): void {
+    if (ordinal !== this.liveProjectionTurn) return;
+    this.outbox.push(ev);
+    const wake = this.wakeOutbox;
+    this.wakeOutbox = undefined;
+    wake?.();
+  }
+
+  /** Resolves once the outbox holds at least one event. Only the run loop awaits it, and it
+   *  races one at a time, so a single wake slot suffices; a superseded waiter simply never
+   *  resolves (it is only ever referenced by a race that already settled). */
+  private outboxReady(): Promise<"outbox"> {
+    if (this.outbox.length > 0) return Promise.resolve("outbox");
+    return new Promise((resolve) => {
+      this.wakeOutbox = (): void => resolve("outbox");
+    });
+  }
+
+  /** Before a stream-failure throw: give every bound dispatch of turn `ordinal` its synthesized,
+   *  unconfirmed error completion and yield the drained outbox, so the lead lane settles instead
+   *  of lingering. The caller throws AFTER this returns; a consumer that keeps pulling gets the
+   *  throw, and one that stops early (return()) simply never sees it. */
+  private *closeDispatchesOnFailure(ordinal: number): Generator<HarnessEvent> {
+    this.closeOpenDispatches(ordinal, DISPATCH_STREAM_FAILED);
+    yield* this.drainOutbox();
+  }
+
+  /** Yield every queued projected event, including any queued while a yield was pending. */
+  private *drainOutbox(): Generator<HarnessEvent> {
+    for (let ev = this.outbox.shift(); ev !== undefined; ev = this.outbox.shift()) yield ev;
+  }
+
   private async *runTurn(request: RunTurnRequest, rendered: RenderedCodexRun): AsyncGenerator<HarnessEvent> {
     this.currentModel = rendered.lead.model ?? this.provider.model;
+    const ordinal = this.turnOrdinal;
+    this.liveProjectionTurn = ordinal;
 
     // A local watchdog/cancel (owner-aborted signal) ends the stream FIRST (rule 9).
     // requestStop()/close() also settle it via `stopTurn`, so a turn wedged in a pending
@@ -600,20 +986,36 @@ export class CodexHarness implements RunHarness {
       }
 
       // 4. Consume the notification stream, mapping each raw frame to ONE neutral event.
+      //    Every return path below first drains the projection outbox (issue #1583), so a
+      //    projected tool frame queued before the stream ends is never silently lost.
       for (;;) {
-        if (this.turnClosed) return;
+        if (this.turnClosed) {
+          this.closeOpenDispatches(ordinal, DISPATCH_STOPPED);
+          yield* this.drainOutbox();
+          return;
+        }
         const notePromise = this.pendingNote ?? notes.next();
         this.pendingNote = notePromise;
-        let step: IteratorResult<CodexNotification> | "aborted";
+        let step: IteratorResult<CodexNotification> | "aborted" | "outbox";
         try {
-          step = await Promise.race([notePromise, abortPromise]);
+          // An outbox wake drains + yields the queued frames and re-races the SAME pending
+          // note (still held in `pendingNote`), so no provider notification is ever dropped.
+          for (;;) {
+            step = await Promise.race([notePromise, abortPromise, this.outboxReady()]);
+            if (step !== "outbox") break;
+            yield* this.drainOutbox();
+          }
         } catch (error) {
           if (this.pendingNote === notePromise) this.pendingNote = undefined;
+          yield* this.closeDispatchesOnFailure(ordinal);
           throw error;
         }
         if (step === "aborted") {
-          // Owner cancel/watchdog wins: interrupt the turn and end the stream cleanly.
+          // Owner cancel/watchdog wins: interrupt the turn and end the stream cleanly. A bound
+          // delegation still open gets a synthesized, unconfirmed lead completion first.
           this.endTurnOnStop();
+          this.closeOpenDispatches(ordinal, DISPATCH_STOPPED);
+          yield* this.drainOutbox();
           return;
         }
         if (this.pendingNote === notePromise) this.pendingNote = undefined;
@@ -621,7 +1023,12 @@ export class CodexHarness implements RunHarness {
           // A deliberate close or an already-emitted terminal ends cleanly. Otherwise
           // this is Codex's own unexpected EOF → a protocol throw (rule 9), never a
           // fabricated success.
-          if (this.terminalEmitted || this.turnClosed) return;
+          if (this.terminalEmitted || this.turnClosed) {
+            this.closeOpenDispatches(ordinal, DISPATCH_STOPPED);
+            yield* this.drainOutbox();
+            return;
+          }
+          yield* this.closeDispatchesOnFailure(ordinal);
           throw new CodexHarnessError({
             category: "protocol",
             message: "codex app-server stream ended before turn completion",
@@ -671,11 +1078,34 @@ export class CodexHarness implements RunHarness {
         // at the safety boundary, and a late broker reply is guarded in routeToolCall so it
         // never throws into a closed transport. The happy path is unchanged: a callback
         // that settles normally still replies via transport.respond after the broker settles.
-        const mapped = await Promise.race([this.mapNote(transport, step.value, request.signal), abortPromise]);
+        //
+        // mapNote is invoked EXACTLY ONCE per note (so a callback is brokered and replied
+        // once); an outbox wake (issue #1583: a projected `started` frame queued while the
+        // broker effect is still running) drains + yields the queue and re-races that SAME
+        // promise. The outbox is drained again before `mapped` itself is yielded, so a
+        // callback's started/finished pair always precedes the note's own event.
+        const mappedPromise = this.mapNote(transport, step.value, request.signal);
+        let mapped: HarnessEvent | "aborted" | "outbox";
+        try {
+          for (;;) {
+            mapped = await Promise.race([mappedPromise, abortPromise, this.outboxReady()]);
+            if (mapped !== "outbox") break;
+            yield* this.drainOutbox();
+          }
+        } catch (error) {
+          yield* this.closeDispatchesOnFailure(ordinal);
+          throw error;
+        }
         if (mapped === "aborted") {
           this.endTurnOnStop();
+          this.closeOpenDispatches(ordinal, DISPATCH_STOPPED);
+          yield* this.drainOutbox();
           return;
         }
+        // The owner stops consuming at `turn_finished`, so a bound delegation still open here
+        // gets its (unconfirmed) lead completion BEFORE the terminal, never after it.
+        if (mapped.kind === "turn_finished") this.closeOpenDispatches(ordinal, DISPATCH_OPEN_AT_TURN_END);
+        yield* this.drainOutbox();
         yield mapped;
         if (mapped.kind === "turn_finished") {
           // Flush any concurrently-running delegation callbacks: each drives a child turn
@@ -684,12 +1114,24 @@ export class CodexHarness implements RunHarness {
           // child self-bounds via its own per-child deadline (delegation.ts), so this
           // await is finite. The non-delegation path has an empty set and never waits.
           if (this.pendingToolCalls.size > 0) await Promise.allSettled(this.pendingToolCalls);
+          // Every dispatch of this turn was closed above, so a delegation settling here projects
+          // no completion; this drain only keeps the "drain before return" invariant.
+          yield* this.drainOutbox();
           return; // close the iterator after the terminal
         }
       }
     } finally {
       if (onAbort) request.signal.removeEventListener("abort", onAbort);
       if (this.stopTurn === settleStop) this.stopTurn = undefined;
+      // Close the outbox for this turn: a callback settling after the stream ended drops its
+      // projection rather than leaking it into a later turn. Only the turn that still owns the
+      // outbox clears it, so a late finally (an abandoned iterator returned after a newer turn
+      // went live) cannot wipe the newer turn's queue or wake slot.
+      if (this.liveProjectionTurn === ordinal) {
+        this.liveProjectionTurn = undefined;
+        this.outbox = [];
+        this.wakeOutbox = undefined;
+      }
     }
   }
 
@@ -903,7 +1345,8 @@ export class CodexHarness implements RunHarness {
               // already went out via routeToolCall (replyOf) — this frame is IN ADDITION, never
               // instead. Every other tool call (denied, non-signal, delegation, or a child/
               // foreign/stale identity) returns undefined and falls through to the
-              // byte-identical `activity` below.
+              // `activity` below; an active-turn non-signal root call's projected tool
+              // frames (issue #1583) travel separately, on the outbox.
               return {
                 kind: "frame",
                 origin: { kind: "main" },
@@ -973,7 +1416,9 @@ export class CodexHarness implements RunHarness {
       this.safeRespond(transport, requestId, { ok: false, code: "not_active_turn", message: "callback does not match the active turn" });
       return undefined;
     }
-    const runAndReply = async (): Promise<CallbackResult> => {
+    // `beforeReply` runs once the broker settled (or threw → broker_error) and BEFORE the model
+    // reply, so a projected `finished` frame is queued ahead of anything the reply triggers.
+    const runAndReply = async (beforeReply?: (result: CallbackResult) => void): Promise<CallbackResult> => {
       let result: CallbackResult;
       try {
         // A matched callback is, by construction, the root turn's — origin is "root".
@@ -981,11 +1426,17 @@ export class CodexHarness implements RunHarness {
       } catch {
         result = { ok: false, code: "broker_error", message: "the callback failed" };
       }
+      try {
+        beforeReply?.(result);
+      } catch {
+        /* projection is best-effort (issue #1583): it never blocks the reply */
+      }
       this.safeRespond(transport, requestId, result);
       return result;
     };
     const toolName = asString(p.tool);
     const canonical = toolName !== undefined ? canonicalizeCodexToolName(toolName) : undefined;
+    const isSignal = canonical !== undefined && CODEX_SIGNAL_TOOLS.has(canonical);
     // A DELEGATION callback (spawn_agent / the collaboration*/Subagent* family) drives a
     // CHILD turn whose frames THIS root loop demuxes off the SAME transport
     // (registerChildSink). It therefore MUST run CONCURRENTLY with continued note
@@ -996,22 +1447,208 @@ export class CodexHarness implements RunHarness {
     // never a workflow signal, so it emits NO signals frame. EVERY OTHER callback is awaited
     // inline exactly as before, so the non-delegation path is byte-identical (the abort race
     // in runTurn still bounds a wedged inline callback).
+    //
+    // Issue #1583: the delegation is recorded as a pending dispatch. The lead dispatch frame is
+    // emitted only once its child actually starts (bindChildDispatch), and its lead completion
+    // is queued once the broker settles, BEFORE the reply; the record is dropped on settle.
     if (canonical !== undefined && CODEX_DELEGATE_TOOLS.has(canonical)) {
-      const task = runAndReply();
+      const dispatch = this.recordDispatch(threadId, turnId, callId, p.arguments);
+      const task = runAndReply(dispatch === undefined ? undefined : (result) => this.completeDispatch(dispatch, result));
       this.pendingToolCalls.add(task);
-      void task.finally(() => this.pendingToolCalls.delete(task));
+      void task.finally(() => {
+        this.pendingToolCalls.delete(task);
+        if (dispatch !== undefined) this.dispatches.delete(dispatch);
+      });
       return undefined;
     }
-    const result = await runAndReply();
+    // Issue #1583: project every other ACTIVE-TURN root callback (shell/file/mcp/unknown) as a
+    // lead tool_use/tool_result pair — Codex hands uzi no tool blocks of its own, so without
+    // this the lanes see no tool activity at all. Signal tools are NOT projected (their
+    // signals-frame path below stays byte-identical, and the reducer drops signal tool_use
+    // anyway); a denied/stale/foreign identity already returned above, unprojected.
+    const project = isSignal ? undefined : this.beginToolProjection(callId, canonical, p.arguments);
+    const result = await runAndReply(project);
     // Route a TRUSTED ROOT SIGNAL callback's scanned result into the run-lane reducer: when
     // the tool canonicalizes to a signal tool AND the broker ACCEPTED it, `result.output` is
     // the scanned Partial<TurnSignals> (broker.dispatchSignal returns `{ok:true, output:
     // scanned}`), which the caller surfaces on a main-origin signals frame. A DENIED signal
     // (result.ok === false) folds nothing; a non-signal effect (shell/file/mcp) is undefined.
-    if (canonical !== undefined && CODEX_SIGNAL_TOOLS.has(canonical) && result.ok) {
+    if (isSignal && result.ok) {
       return { signals: result.output as Readonly<Partial<TurnSignals>> };
     }
     return undefined;
+  }
+
+  /** Issue #1583: queue the projected `started` tool frame for one root callback NOW (before the
+   *  broker is awaited) and return the hook that queues its `finished` frame once the broker
+   *  settles. Both frames are main-origin, lead-attributed, share one namespaced id (unique
+   *  within the turn), and carry only scrubbed + bounded input/output (see projection.ts). They
+   *  carry NO `signals`.
+   *
+   *  FAIL-SAFE: projection is observability only, so it never throws into the callback path.
+   *  A failure projecting the input falls back to `{ truncated: true }`, one projecting the
+   *  output to "[projection failed]", and anything else drops the frame; the broker call and
+   *  the model reply proceed regardless. */
+  private beginToolProjection(
+    callId: string,
+    canonical: string | undefined,
+    args: unknown,
+  ): ((result: CallbackResult) => void) | undefined {
+    try {
+      const ordinal = this.turnOrdinal;
+      const id = this.issueProjectionId(ordinal, callId);
+      let name: string;
+      try {
+        name = projectToolName(canonical, this.scrubProjected);
+      } catch {
+        name = "unknown";
+      }
+      const frame = (item: HarnessItem): HarnessEvent => this.leadFrame(item);
+      let input: unknown;
+      try {
+        input = projectToolInput(args, this.scrubProjected);
+      } catch {
+        input = { truncated: true };
+      }
+      this.emitProjected(frame({ kind: "tool", phase: "started", id, name, input }), ordinal);
+      return (result) => {
+        let output: string;
+        try {
+          output = projectToolOutput(result, this.scrubProjected);
+        } catch {
+          output = "[projection failed]";
+        }
+        this.emitProjected(frame({ kind: "tool", phase: "finished", id, name, output, isError: !result.ok }), ordinal);
+      };
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** One projected main-origin, lead-attributed frame carrying `item` (never `signals`). */
+  private leadFrame(item: HarnessItem): HarnessEvent {
+    return {
+      kind: "frame",
+      origin: { kind: "main" },
+      attribution: { agent: "lead" },
+      items: [item],
+      model: this.currentModel,
+      sessionId: this.threadId,
+    };
+  }
+
+  /** Issue #1583: record one active-turn root delegation callback as a pending dispatch. Its id
+   *  comes from the same namespaced, per-turn-unique helper as every projected id; its label is
+   *  the `description` arg (scrubbed + bounded) or "". The role is NOT read here: it is bound
+   *  later from what the broker admitted. Fail-safe: undefined on any failure. */
+  private recordDispatch(threadId: string, turnId: string, callId: string, args: unknown): DelegationDispatch | undefined {
+    try {
+      const ordinal = this.turnOrdinal;
+      const dispatchId = this.issueProjectionId(ordinal, callId);
+      let label = "";
+      try {
+        const description = asObject(args)?.description;
+        if (typeof description === "string") label = projectLabel(description, this.scrubProjected);
+      } catch {
+        label = "";
+      }
+      const dispatch: DelegationDispatch = { threadId, turnId, callId, dispatchId, label, ordinal, state: "pending" };
+      this.dispatches.add(dispatch);
+      return dispatch;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Queue the lead completion (`tool_result` for the dispatch id) of a BOUND dispatch whose
+   *  broker call settled, and close it. A child tool still open (the child timed out or aborted
+   *  mid-tool) first gets its synthesized error `finished` (see {@link closeOpenChildTools}), so
+   *  the child frames precede the completion. Runs before the reply; an unbound or already-closed
+   *  dispatch (child never started, or the turn stopped first) projects nothing. */
+  private completeDispatch(dispatch: DelegationDispatch, result: CallbackResult): void {
+    if (dispatch.state !== "bound") return;
+    dispatch.state = "closed";
+    this.closeOpenChildTools(dispatch);
+    let output: string;
+    try {
+      output = projectToolOutput(result, this.scrubProjected);
+    } catch {
+      output = "[projection failed]";
+    }
+    this.emitProjected(
+      this.leadFrame({ kind: "tool", phase: "finished", id: dispatch.dispatchId, name: DISPATCH_TOOL_NAME, output, isError: !result.ok }),
+      dispatch.ordinal,
+    );
+  }
+
+  /** Close every dispatch of turn `ordinal`: a BOUND one first gets a synthesized error `finished`
+   *  ({@link CHILD_TOOL_UNCONFIRMED}) for each child tool still open, in one child frame, then a
+   *  synthesized error completion carrying `content` (its child's settlement is not confirmed); a
+   *  pending one can no longer bind. A later real settlement of a closed dispatch projects nothing,
+   *  so there is never a duplicate completion. Fail-safe: never throws. */
+  private closeOpenDispatches(ordinal: number, content: string): void {
+    try {
+      for (const dispatch of this.dispatches) {
+        if (dispatch.ordinal !== ordinal || dispatch.state === "closed") continue;
+        const wasBound = dispatch.state === "bound";
+        dispatch.state = "closed";
+        if (!wasBound) continue;
+        this.closeOpenChildTools(dispatch);
+        this.emitProjected(
+          this.leadFrame({
+            kind: "tool",
+            phase: "finished",
+            id: dispatch.dispatchId,
+            name: DISPATCH_TOOL_NAME,
+            output: content,
+            isError: true,
+          }),
+          ordinal,
+        );
+      }
+    } catch {
+      /* projection is best-effort */
+    }
+  }
+
+  /** Emit a synthesized error `finished` for every child tool of `dispatch` still open (oldest
+   *  first per raw id), so none is left running once its dispatch closes. Fail-safe. */
+  private closeOpenChildTools(dispatch: DelegationDispatch): void {
+    try {
+      const binding = dispatch.child;
+      if (binding === undefined || binding.openTools.size === 0) return;
+      const closers: HarnessItem[] = [];
+      for (const queue of binding.openTools.values()) {
+        for (const open of queue) {
+          closers.push({ kind: "tool", phase: "finished", id: open.id, name: open.name, output: CHILD_TOOL_UNCONFIRMED, isError: true });
+        }
+      }
+      binding.openTools.clear();
+      this.emitChildItems(binding, closers);
+    } catch {
+      /* projection is best-effort */
+    }
+  }
+
+  /** A namespaced projected id not yet issued this turn: a colliding id (a reused call id, or
+   *  two that sanitise identically) gets a `-n<counter>` suffix until it is unique. */
+  private issueProjectionId(ordinal: number, callId: string): string {
+    this.projectionCounter += 1;
+    let base: string;
+    try {
+      base = projectedId(this.idNonce, ordinal, callId, this.projectionCounter, this.scrubProjected);
+    } catch {
+      // A throwing scrub must not drop the projection: fall back to the counter id, which
+      // carries no provider-supplied text at all.
+      base = projectedId(this.idNonce, ordinal, "", this.projectionCounter);
+    }
+    let id = base;
+    while (this.issuedProjectionIds.has(id)) {
+      this.projectionCounter += 1;
+      id = `${base}-n${this.projectionCounter}`;
+    }
+    this.issuedProjectionIds.add(id);
+    return id;
   }
 
   /** Reply to a server→client tool-call with a broker {@link CallbackResult}, mapped to the

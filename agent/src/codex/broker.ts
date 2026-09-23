@@ -421,7 +421,7 @@ function boundedString(s: string, maxBytes: number): string {
  *  (0x00-0x1F, incl. TAB/LF/CR/ESC), DEL (0x7F), a C1 control (0x80-0x9F), or a
  *  Unicode bidi/format control (zero-width, line/paragraph separators, bidi
  *  embeddings/overrides/isolates, word joiner, BOM). */
-function isUnsafeIdentifierChar(cp: number): boolean {
+export function isUnsafeIdentifierChar(cp: number): boolean {
   if (cp <= 0x1f) return true; // C0 controls incl. TAB/LF/CR/ESC
   if (cp === 0x7f) return true; // DEL
   if (cp >= 0x80 && cp <= 0x9f) return true; // C1 controls

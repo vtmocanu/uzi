@@ -17,6 +17,7 @@ import type {
 } from "../src/codex/broker.js";
 import { ExecutionRegistry, newLocalExecutionEpoch } from "../src/codex/registry.js";
 import type { CodexNotification } from "../src/codex/transport.js";
+import type { HarnessItem } from "../src/harness.js";
 
 // PRD #1171 (M3, milestone 2) — the synchronous child-thread delegation runner. Every
 // external effect is a FAKE: a scripted {@link ChildThreadController}, spy shell/file
@@ -183,6 +184,12 @@ function turnCompletedNote(ctrl: ChildThreadController, status: string): CodexNo
 function respondSuccess(controller: FakeController, idx: number): boolean {
   const reply = controller.respondCalls[idx]!.reply as { result?: { success?: boolean } };
   return reply.result?.success === true;
+}
+
+/** Read the text the child received off a recorded respond call's `{ result: { contentItems } }`. */
+function replyText(controller: FakeController, idx: number): string | undefined {
+  const reply = controller.respondCalls[idx]!.reply as { result?: { contentItems?: { text?: string }[] } };
+  return reply.result?.contentItems?.[0]?.text;
 }
 
 /** Set a controller's scripted notes after construction (they reference the controller). */
@@ -387,5 +394,107 @@ describe("CodexDelegationRunner: terminal + cancellation", () => {
     assert.equal(res.code, "child_aborted");
     // Nothing was started; the pre-start abort short-circuits.
     assert.equal(b.startSpecs.length, 0);
+  });
+});
+
+// Issue #1583 (m2): the optional `project` hook the executor wires to the harness's child-frame
+// projection. The runner hands it RAW items (no scrub here) and only for the child's own active
+// turn, never for a signal tool.
+describe("CodexDelegationRunner: child projection hook (issue #1583 m2)", () => {
+  class ProjectingController extends FakeController {
+    projected: HarnessItem[][] = [];
+    /** How many replies had gone out when each projection happened. */
+    repliesAtProject: number[] = [];
+    throwOnProject = false;
+    project(items: readonly HarnessItem[]): void {
+      this.projected.push([...items]);
+      this.repliesAtProject.push(this.respondCalls.length);
+      if (this.throwOnProject) throw new Error("projection exploded");
+    }
+  }
+
+  function scripted(controller: ProjectingController): ProjectingController {
+    return withNotes(controller, [
+      // A tool call NOT bound to the active child turn: denied, never projected.
+      {
+        kind: "activity",
+        method: "item/tool/call",
+        requestId: 1,
+        params: { threadId: controller.threadId, turnId: "stale-turn", callId: "c-stale", tool: "Bash", arguments: { command: "stale" } },
+      },
+      toolCallNote(controller, "c-bash", "Bash", { command: "echo hi" }, 2),
+      toolCallNote(controller, "c-plan", "submit_plan", { plan_md: "child plan" }, 3),
+      agentMessageNote(controller, "child says"),
+      { kind: "activity", method: "item/completed", params: { threadId: "foreign-thread", item: { type: "agentMessage", text: "foreign" } } },
+      { kind: "activity", method: "item/completed", params: { threadId: controller.threadId, item: { type: "reasoning", text: "thinking hard" } } },
+      turnCompletedNote(controller, "completed"),
+    ]) as ProjectingController;
+  }
+
+  it("projects the active turn's non-signal tool pair around the broker, plus own text/thinking, and nothing else", async () => {
+    const controller = scripted(new ProjectingController({ notes: [] }));
+    let projectedAtEffect = -1;
+    let respondedAtEffect = -1;
+    const b = makeRunner({
+      controller,
+      spawnImpl: async () => {
+        projectedAtEffect = controller.projected.length;
+        respondedAtEffect = controller.respondCalls.length;
+        return { code: 0, stdout: "hi", stderr: "" };
+      },
+    });
+    const res = await b.runner.run(delegReq());
+    assert.equal(res.ok, true);
+    assert.equal(projectedAtEffect, 1, "the started item was projected BEFORE the child broker ran the effect");
+    assert.equal(respondedAtEffect, 1, "only the stale denial had replied when the effect ran");
+
+    assert.equal(controller.projected.length, 4, "started, finished, text, thinking");
+    const [started, finished, text, thinking] = controller.projected.map((items) => items[0]!);
+    assert.deepEqual(started, { kind: "tool", phase: "started", id: "c-bash", name: "Bash", input: { command: "echo hi" } });
+    assert.ok(finished !== undefined && finished.kind === "tool" && finished.phase === "finished");
+    assert.equal(finished.id, "c-bash");
+    assert.equal(finished.name, "Bash");
+    assert.equal(finished.isError, false);
+    assert.deepEqual(finished.output, { code: 0, stdout: "hi", stderr: "" }, "the finished item carries the RAW broker output");
+    assert.equal(typeof replyText(controller, 1), "string");
+    assert.equal(
+      typeof finished.output === "string" ? finished.output : JSON.stringify(finished.output),
+      replyText(controller, 1),
+      "the finished item carries the broker output the child received",
+    );
+    assert.equal(controller.repliesAtProject[1], 1, "the finished item was projected BEFORE the Bash reply");
+    assert.deepEqual(text, { kind: "text", text: "child says" });
+    assert.deepEqual(thinking, { kind: "thinking", text: "thinking hard" });
+    assert.ok(
+      !controller.projected.flat().some((i) => i.kind === "tool" && (i.name === "submit_plan" || i.id === "c-stale")),
+      "neither the stale call nor the signal tool is projected",
+    );
+    // Replies are unchanged by the hook: stale denied, Bash ok, signal denied.
+    assert.deepEqual(controller.respondCalls.map((c) => c.requestId), [1, 2, 3]);
+    assert.deepEqual([0, 1, 2].map((i) => respondSuccess(controller, i)), [false, true, false]);
+  });
+
+  it("a failed child call projects a finished error item carrying the broker message", async () => {
+    const controller = new ProjectingController({ notes: [] });
+    withNotes(controller, [toolCallNote(controller, "c-web", "WebFetch", { url: "x" }, 5), turnCompletedNote(controller, "completed")]);
+    const b = makeRunner({ controller });
+    await b.runner.run(delegReq());
+    const finished = controller.projected.flat().find((i) => i.kind === "tool" && i.phase === "finished");
+    assert.ok(finished !== undefined && finished.kind === "tool" && finished.phase === "finished");
+    assert.equal(finished.isError, true);
+    const received = replyText(controller, 0);
+    assert.ok(typeof received === "string" && received.length > 0, "the child received a non-empty failure message");
+    assert.equal(finished.output, received, "a failure projects the broker's message the child received");
+    assert.equal(respondSuccess(controller, 0), false);
+  });
+
+  it("a throwing hook never changes the child's replies or its settled result", async () => {
+    const controller = scripted(new ProjectingController({ notes: [] }));
+    controller.throwOnProject = true;
+    const b = makeRunner({ controller });
+    const res = await b.runner.run(delegReq());
+    assert.equal(res.ok, true);
+    assert.deepEqual(res.output, { role: "coder", text: "child says" });
+    assert.deepEqual([0, 1, 2].map((i) => respondSuccess(controller, i)), [false, true, false]);
   });
 });
