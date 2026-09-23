@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Fixed
+
+- **Codex runs now show their tool activity and delegated subagents in By agent and the milestone live lanes ([#1583](https://github.com/vtmocanu/uzi/issues/1583)).**
+  A Codex run's lead tool calls now persist as `tool_use`/`tool_result` messages. Each accepted `spawn_agent` delegation persists a lead `Agent` dispatch and a matching completion. The child's text and tool frames carry its role, dispatch instance and label, so the existing server derivation opens and closes its lane unchanged. Projected tool input and output are redacted before they are capped at 16 KiB, per-dispatch and per-turn caps limit child output, and a stopped, failed or timed-out delegation always closes its lane.
+
 ## [0.84.0] - 2026-09-20
 
 ### Added
