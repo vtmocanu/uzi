@@ -14,6 +14,9 @@
 #                    done) or after a manual renumber fix: skips straight to gates + push.
 #   --fresh          start the landing over: reset the (clean) worktree to origin/<branch>
 #                    and drop the recorded lease. The answer to RESULT=remote_moved.
+#                    Local commits the remote lacks are kept under
+#                    refs/uzi-lander/fresh-backup/pr-<PR>/<old HEAD sha> (FRESH_BACKUP=) and
+#                    named, for a cherry-pick back after the rebase.
 #   --gate           which `task gate:<c>` targets to run before pushing. `auto` (default)
 #                    derives them from the changed paths (api/, web/, agent/, controller/);
 #                    `none` skips gates (only when CI is the arbiter, e.g. a docs-only PR).
@@ -152,6 +155,21 @@ remote_now=$(git ls-remote origin "refs/heads/$BRANCH" | cut -f1)
 [ -n "$remote_now" ] || { echo "cannot read the remote head of $BRANCH" >&2; exit 3; }
 if [ "$FRESH" -eq 1 ]; then
   [ -z "$(git status --porcelain)" ] || { echo "worktree is dirty; --fresh would discard it" >&2; exit 3; }
+  # The reset would silently drop local commits the remote lacks (a local fix committed
+  # after the rebase, #1574). Keep the old HEAD under a backup ref and name the commits
+  # whose patch the remote does not carry, so they can be cherry-picked back.
+  # A failed cherry must not read as "nothing local": abort before the reset.
+  cherry=$(git cherry "origin/$BRANCH" HEAD) || { echo "git cherry failed; --fresh refuses to reset without knowing which local commits it would drop" >&2; exit 3; }
+  local_only=$(printf '%s\n' "$cherry" | awk '$1=="+"{print $2}')
+  if [ -n "$local_only" ]; then
+    # One immutable ref per reset (keyed by the old HEAD), so a later --fresh never
+    # overwrites an earlier backup.
+    backup="refs/uzi-lander/fresh-backup/pr-$PR/$(git rev-parse HEAD)"
+    git update-ref "$backup" HEAD || { echo "could not write $backup; not resetting" >&2; exit 3; }
+    log "--fresh: kept the old HEAD $(git rev-parse --short HEAD) as $backup; local commit(s) not on origin/$BRANCH (re-apply with git cherry-pick after the rebase):"
+    while IFS= read -r c; do log "  $(git log -1 --format='%h %s' "$c")"; done <<< "$local_only"
+    echo "FRESH_BACKUP=$backup"
+  fi
   git reset -q --hard "origin/$BRANCH"; rm -f "$LEASE_FILE" "$BASE_FILE"; log "--fresh: worktree reset to origin/$BRANCH (${remote_now:0:8})"
 fi
 if [ -f "$LEASE_FILE" ]; then
@@ -197,7 +215,10 @@ if [ "$SKIP_REBASE" -eq 0 ]; then
     exit 5
   fi
 else
-  if git rev-parse -q --verify REBASE_HEAD >/dev/null 2>&1 || [ -d .git/rebase-merge ] || [ -d .git/rebase-apply ]; then
+  # Resolve the state dirs through git: in a worktree `.git` is a FILE, so `.git/rebase-merge`
+  # never exists there. REBASE_HEAD is not a signal: git can leave it behind after a rebase
+  # that completed (seen on #1574, 2026-09-23), which blocked a finished landing.
+  if [ -d "$(git rev-parse --git-path rebase-merge)" ] || [ -d "$(git rev-parse --git-path rebase-apply)" ]; then
     echo "a rebase is still in progress in $WT; finish it (git rebase --continue) first" >&2; exit 5
   fi
   log "skip-rebase: continuing from $(git rev-parse --short HEAD)"

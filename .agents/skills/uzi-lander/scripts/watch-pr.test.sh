@@ -51,6 +51,7 @@ if [ "${1:-}" = api ]; then
     *'/commits/deadbeefdeadbeefdeadbeefdeadbeefdeadbeef/status'*)
       case "$MODE" in
         pending_findings|revovr_cr_pending) echo '{"statuses":[{"context":"CodeRabbit","description":"Review in progress"}]}' ;;
+        cr_limited) echo '{"statuses":[{"context":"CodeRabbit","description":"Review rate limited","updated_at":"2026-09-23T10:00:00Z"}]}' ;;
         greptile_clean|greptile_race|prior_*|head_*) echo '{"statuses":[]}' ;;
         *) echo '{"statuses":[{"context":"CodeRabbit","description":"Review completed"}]}' ;;
       esac ;;
@@ -128,6 +129,35 @@ set -e
 [ "$rc" -eq 2 ] || fail "posted full-review command was not suppressed, rc=$rc: $(cat "$WORK/already.out")"
 if grep -q '^RESULT=cr_full_review_required' "$WORK/already.out"; then fail "full-review command would be duplicated"; fi
 
+# A rate-limited status with no newer trigger acknowledgement is a real rate limit (exit 5).
+MODE="cr_limited"; export MODE
+printf '[]\n' > "$COMMENTS"
+set +e
+bash "$SCRIPT" test/repo 42 0 1 --reviewer coderabbit --reviewer-grace 0 > "$WORK/limited.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 5 ] || fail "a genuine rate limit was not reported, rc=$rc: $(cat "$WORK/limited.out")"
+# A "Review triggered." ack NEWER than that status means the review was accepted and the
+# status is stale: keep polling (timeout at max 1 try), never exit 5 (#1574).
+jq -n '[
+  {user:{login:"tester"},body:"@coderabbitai review",created_at:"2026-09-23T10:31:39Z"},
+  {user:{login:"coderabbitai[bot]"},body:"<details><summary>Action performed</summary>\n\nReview triggered.\n\n</details>",created_at:"2026-09-23T10:31:45Z"}
+]' > "$COMMENTS"
+set +e
+bash "$SCRIPT" test/repo 42 0 1 --reviewer coderabbit --reviewer-grace 0 > "$WORK/limited-stale.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 2 ] || fail "a stale rate-limit status overrode a newer review trigger, rc=$rc: $(cat "$WORK/limited-stale.out")"
+grep -q 'superseded by review triggered' "$WORK/limited-stale.out" || fail "stale rate-limit reading was not visible: $(cat "$WORK/limited-stale.out")"
+# An ack OLDER than the rate-limit status (a second refusal after the trigger) stays a rate limit.
+jq -n '[
+  {user:{login:"coderabbitai[bot]"},body:"Review triggered.",created_at:"2026-09-23T09:59:00Z"}
+]' > "$COMMENTS"
+set +e
+bash "$SCRIPT" test/repo 42 0 1 --reviewer coderabbit --reviewer-grace 0 > "$WORK/limited-old-ack.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 5 ] || fail "an ack older than the rate-limit status suppressed it, rc=$rc: $(cat "$WORK/limited-old-ack.out")"
 # Findings are incomplete while a selected reviewer is still in progress; wait, do not edit.
 MODE="pending_findings"; export MODE
 printf '[]\n' > "$COMMENTS"
