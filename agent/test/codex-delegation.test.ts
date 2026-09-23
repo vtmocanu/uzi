@@ -455,6 +455,8 @@ describe("CodexDelegationRunner: child projection hook (issue #1583 m2)", () => 
     assert.equal(finished.id, "c-bash");
     assert.equal(finished.name, "Bash");
     assert.equal(finished.isError, false);
+    assert.deepEqual(finished.output, { code: 0, stdout: "hi", stderr: "" }, "the finished item carries the RAW broker output");
+    assert.equal(typeof replyText(controller, 1), "string");
     assert.equal(
       typeof finished.output === "string" ? finished.output : JSON.stringify(finished.output),
       replyText(controller, 1),
