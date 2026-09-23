@@ -1,8 +1,8 @@
 # Landing the whole open-PR set
 
 Use it when the user asks to merge the open PRs, land the batch, or clear the queue
-before a release. Each PR still goes through SKILL.md's loop; this file adds the cross-PR order and checks.
-`uzi-release` starts only after this is done. `S` is `.agents/skills/uzi-lander/scripts/`.
+before a release. Each PR still goes through SKILL.md's loop; this file adds the cross-PR
+order and checks. `uzi-release` starts only after this is done. `S` is `.agents/skills/uzi-lander/scripts/`.
 
 ## 1. Survey
 
@@ -53,8 +53,10 @@ carve-out is §2: a dependency PR that FIXES a repo-wide red goes first.
 
 **Probe cross-PR conflicts** when several PRs edit a shared hand-edited file
 (ARCHITECTURE.md, a shared handler): in a throwaway worktree off `origin/main`,
-`git merge --no-ff origin/<branch>` each in the intended order, record which conflict,
-`git merge --abort` between probes, remove the worktree after. Declare an ordering with
+`git merge --no-ff origin/<branch>` each in the intended landing order, letting clean merges
+accumulate so each probe sees its predecessors. On a conflict, record it and
+`git merge --abort` (the earlier clean merges stay), then continue with the next. Remove the
+worktree after. Declare an ordering with
 `S/claims.sh claim '#B' --depends-on '#A'`.
 
 ## 4. Per-PR review, then merge each as it is ready
