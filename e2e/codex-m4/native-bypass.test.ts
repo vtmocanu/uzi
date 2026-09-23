@@ -122,6 +122,15 @@ async function nativeBypassFor(t: { diagnostic: (message: string) => void }, mod
 
     t.diagnostic(`[${model}] callbacks=${JSON.stringify(obs.callbacks.map((c) => c.tool))} (source=${obs.binSource}, ${obs.elapsedMs}ms)`);
 
+    // The iteration really ran THIS model: every observed provider request names it, so a silent
+    // fallback to the default model cannot make a later iteration pass on the default's shape.
+    assert.ok(obs.providerRequests.length > 0, `[${model}] the fake provider observed real requests`);
+    assert.deepEqual(
+      [...new Set(obs.providerRequests.map((body) => (body as { model?: unknown }).model))],
+      [model],
+      `[${model}] every provider request uses the iterated model`,
+    );
+
     // NEGATIVE-EFFECT ORACLE: no native execution touched the filesystem.
     for (const name of ["shell", "shellcmd", "exec", "unified", "local", "patch"]) {
       assert.equal(existsSync(marker(name)), false, `native execution must not create ${name} marker`);

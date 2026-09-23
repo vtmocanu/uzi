@@ -7,9 +7,11 @@
 // cumulative `total` deltas the {@link CodexUsageAccountant} reconciles) and it holds NO state.
 //
 // SERVICE TIER (D5): the >272K threshold, the four bucket rates and the whole table assume the
-// OpenAI **Standard** service tier. Uzi sets no `service_tier`, so the outbound request carries
-// none: in pinned 0.156.1 a catalog `default_service_tier` (gpt-6-sol lists `priority`) is applied
-// only by the interactive TUI, never by app-server request building. The pinned 0.156.1
+// OpenAI **Standard** service tier as an ESTIMATION POLICY, not an observed fact. Uzi sets no
+// `service_tier`, and in pinned 0.156.1 a catalog `default_service_tier` (gpt-6-sol lists `priority`)
+// is applied only by the interactive TUI, never by app-server request building, so the request
+// carries none. OpenAI then processes it at the API PROJECT's configured tier, which uzi cannot
+// see: a project set to priority is billed above these rates. The pinned 0.156.1
 // app-server `thread/tokenUsage/updated` notification (source commit
 // b412ff32c417f855c2b2d1581b77058eed87c84b, `codex-rs/app-server-protocol/src/protocol/v2/
 // thread.rs`, unchanged since 0.153.2) carries NO service-tier field on either `total` or `last`, so the tier is NOT

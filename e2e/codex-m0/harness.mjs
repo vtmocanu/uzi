@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
 
-export const CODEX_VERSION = "0.156.1";
+export const CODEX_VERSION = "0.153.2";
 const DEADLINE_MS = 15_000;
 const MAX_BYTES = 4 * 1024 * 1024;
 

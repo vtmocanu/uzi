@@ -279,7 +279,8 @@ initial models in three catalog fields, each checked against the 0.156.1 source:
 `shell_type: "shell_command"` is a serde alias of `unified_exec`, still gated off by
 `shell_tool = false` (the native-bypass P suite now runs on both `gpt-6-astra` and `gpt-6-sol`);
 `default_service_tier: "priority"` is applied only by the interactive TUI, so uzi requests carry no
-tier, as for the other models, and pricing stays Standard; its experimental
+tier, as for the other models. OpenAI then uses the API project's configured tier, which uzi cannot
+observe, so Standard pricing remains the D5 estimation policy, not a measurement; its experimental
 `send_user_message_async` / `clock` tools match what `gpt-6-astra` already had. The vocabulary
 stays closed and product-owned.
 
