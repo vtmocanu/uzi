@@ -450,7 +450,7 @@ describe("RunRunner — finalize base-align (PRD #456)", () => {
     assert.strictEqual(gitIn(fx.originPath, ["show", "agent/issue-154:.github/workflows/ci.yml"]), CI_V2.trim());
   });
 
-  it("second default-tip fetch failure aligns with the precheck tip when behind", async () => {
+  it("second default-tip fetch failure falls through to the normal push", async () => {
     seedWorkflowsOnOrigin();
     const { github, calls } = fakeGitHub();
     const strategies = spyAlign();
@@ -469,10 +469,10 @@ describe("RunRunner — finalize base-align (PRD #456)", () => {
     assert.deepStrictEqual(api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body.status),
       ["running", "running", "completed"]);
     assert.strictEqual(fetches, 2);
-    assert.deepStrictEqual(strategies, ["workflow-subtree"]);
+    assert.deepStrictEqual(strategies, []);
     assert.strictEqual(calls.length, 1);
     assert.strictEqual(gitIn(fx.originPath, ["show", "agent/issue-155:impl.ts"]), "export const x = 1;");
-    assert.strictEqual(gitIn(fx.originPath, ["show", "agent/issue-155:.github/workflows/ci.yml"]), CI_V2.trim());
+    assert.strictEqual(gitIn(fx.originPath, ["show", "agent/issue-155:.github/workflows/ci.yml"]), CI_V1.trim());
   });
 
   it("default-tip fetch failure falls through to the normal push", async () => {
