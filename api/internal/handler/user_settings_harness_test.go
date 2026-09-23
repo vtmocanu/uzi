@@ -48,7 +48,8 @@ func putUserSettings(t *testing.T, db *fakeSettingsDB, bodyJSON string) *httptes
 }
 
 // A single PUT saves the harness and both lanes; RETURNING/GET reflect all three, and the
-// legacy default_model projects the Claude lane (nil wsvc ⇒ Claude effective harness).
+// legacy default_model mirrors the Claude lane (nil wsvc ⇒ Claude effective harness),
+// even when the request pins Codex as the legacy input target.
 func TestPutMySettingsHarnessModelsGroupedWrite(t *testing.T) {
 	db := &fakeSettingsDB{}
 	rec := putUserSettings(t, db, `{"default_harness":"codex","default_claude_model":"opus","default_codex_model":"gpt-6-sol"}`)
@@ -64,9 +65,10 @@ func TestPutMySettingsHarnessModelsGroupedWrite(t *testing.T) {
 	if !db.defaultHarness.Valid || db.defaultHarness.String != "codex" {
 		t.Errorf("stored default_harness = %+v, want codex", db.defaultHarness)
 	}
-	// default_harness=codex is the write target, so the legacy column mirrors the Codex lane.
-	if !db.model.Valid || db.model.String != "gpt-6-sol" {
-		t.Errorf("legacy default_model column = %+v, want the codex lane gpt-6-sol", db.model)
+	// default_harness=codex is the legacy input target, but a nil worker service has no
+	// usable Codex credential, so the compatibility column mirrors the effective Claude lane.
+	if !db.model.Valid || db.model.String != "opus" {
+		t.Errorf("legacy default_model column = %+v, want the effective Claude lane opus", db.model)
 	}
 	got := decodeLanes(t, rec.Body.Bytes())
 	if got.DefaultClaudeModel == nil || *got.DefaultClaudeModel != "opus" {

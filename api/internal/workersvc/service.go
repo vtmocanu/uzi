@@ -2537,9 +2537,11 @@ func (s *Service) recoverClaimAssembly(ctx context.Context, run store.Run, err e
 		// PRD #1551 M4 (D6): assembly found this Codex run's effective root is a CUSTOM model but
 		// the claiming worker lacks codex_custom_model_v1 (the owner's lane flipped custom in the
 		// window between the claim's SQL gate and assembly). REQUEUE — never fail, never run Astra:
-		// keep worker_id for affinity and do NOT bump requeue_count (mirroring the vault-locked
-		// path), and ClaimRun's own custom-model clause now excludes this worker, so a capable
-		// worker picks the run up rather than this one re-winning it.
+		// keep worker_id for resume affinity and do NOT bump requeue_count (mirroring the
+		// vault-locked path). ClaimRun's custom-model clause excludes this incapable worker,
+		// while affinity holds capable peers until the worker row disappears or the configured
+		// ceiling expires. Clearing worker_id here would allow a cold peer to bypass the PVC
+		// holding a resumed run's unpublished work. This bounded wait is the approved M4 tradeoff.
 		if _, rerr := s.q.RequeueClaimedRunToQueued(ctx, run.ID); rerr != nil {
 			return rerr
 		}

@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -77,6 +78,13 @@ func TestAssembleCodexClaimCustomLaneLiveDB(t *testing.T) {
 		}
 		if s := runStatusOf(t, env, f.runID); s != "queued" {
 			t.Fatalf("after the gated claim the run status = %q, want queued (requeued, not failed)", s)
+		}
+		var owner pgtype.UUID
+		if err := env.pool.QueryRow(env.ctx, `SELECT worker_id FROM runs WHERE id = $1`, f.runID).Scan(&owner); err != nil {
+			t.Fatalf("read requeued run affinity: %v", err)
+		}
+		if !owner.Valid || uuid.UUID(owner.Bytes) != f.workerID {
+			t.Fatalf("custom-capability requeue worker_id = %+v, want prior worker %s for bounded resume affinity", owner, f.workerID)
 		}
 	})
 }

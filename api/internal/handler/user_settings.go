@@ -900,6 +900,7 @@ var errHarnessModelCrossVocab = errors.New("default_model is not valid for the t
 // nil-service path (unit tests, pre-wiring) deterministically projects/writes Claude.
 type settingsHarnessResolver interface {
 	ResolveSettingsHarness(ctx context.Context, userID uuid.UUID) (workersvc.Harness, error)
+	ResolveSettingsHarnessWithDefault(ctx context.Context, userID uuid.UUID, proposed *workersvc.Harness) (workersvc.Harness, error)
 }
 
 var _ settingsHarnessResolver = (*workersvc.Service)(nil)
@@ -913,6 +914,22 @@ func (h *Handler) resolveSettingsHarness(ctx context.Context, userID uuid.UUID) 
 		return workersvc.HarnessClaude, nil
 	}
 	return h.wsvc.ResolveSettingsHarness(ctx, userID)
+}
+
+// resolveSettingsHarnessWithDefault projects a proposed harness preference through D11,
+// including the usable-credential fallback. The legacy request field may target a different
+// lane under D3, but the compatibility column must mirror the harness a run would use after
+// the grouped write. A nil worker service retains the unit-test/zero-credential Claude floor.
+func (h *Handler) resolveSettingsHarnessWithDefault(ctx context.Context, userID uuid.UUID, proposed pgtype.Text) (workersvc.Harness, error) {
+	if h.wsvc == nil {
+		return workersvc.HarnessClaude, nil
+	}
+	var preference *workersvc.Harness
+	if proposed.Valid {
+		v := workersvc.Harness(proposed.String)
+		preference = &v
+	}
+	return h.wsvc.ResolveSettingsHarnessWithDefault(ctx, userID, preference)
 }
 
 // harnessModelInputs is the validated (phase-1) grouped-field state buildHarnessModels folds
@@ -937,9 +954,8 @@ type harnessModelInputs struct {
 //   - bridges a legacy-only default_model into the target lane, or — when that lane's explicit
 //     value is ALSO present — requires them equal (errHarnessModelConflict otherwise), and runs
 //     the closed-list cross-vocabulary guard against the target lane (errHarnessModelCrossVocab);
-//   - sets default_model to the EFFECTIVE (post-write) target-lane value (the new explicit value
-//     when supplied, else the stored lane) so the deprecated legacy column stays equal to the
-//     effective lane for an image-only rollback (D2).
+//   - projects the post-write effective harness through D11, independently of the legacy
+//     request's target lane, then mirrors that lane into default_model for image rollback (D2).
 //
 // All reads/decisions happen before the single write, so a conflict/cross-vocab 400 writes
 // nothing. A store error (resolver or the stored-lane read) is returned raw for a 500.
@@ -948,7 +964,8 @@ func (h *Handler) buildHarnessModels(ctx context.Context, userID uuid.UUID, in h
 		return store.SetUserHarnessModelsParams{}, false, nil
 	}
 
-	// Target harness for the legacy projection/write.
+	// Target harness for routing a legacy default_model input (D3). A newly supplied
+	// preference is not necessarily usable; the compatibility mirror is resolved below.
 	var target workersvc.Harness
 	switch {
 	case in.harnessPresent && in.harnessVal.Valid:
@@ -994,11 +1011,25 @@ func (h *Handler) buildHarnessModels(ctx context.Context, userID uuid.UUID, in h
 		}
 	}
 
-	// The effective (post-write) target lane. When the target lane is not being written we
-	// need its stored value, so read the row once.
+	// Resolve the harness a new run would select AFTER this write. A request with an
+	// explicit default_harness uses that proposed preference, including null; an absent
+	// field uses the stored preference already resolved as target above. This is distinct
+	// from the legacy input's target lane: an unusable Codex pin may still target the
+	// Codex lane for that input while new runs and the compatibility mirror use Claude.
+	mirror := target
+	if in.harnessPresent {
+		var err error
+		mirror, err = h.resolveSettingsHarnessWithDefault(ctx, userID, in.harnessVal)
+		if err != nil {
+			return store.SetUserHarnessModelsParams{}, false, err
+		}
+	}
+
+	// A lane absent from the request may supply either the legacy bridge target or the
+	// effective compatibility mirror. Read once when any lane is absent; the grouped web
+	// save supplies both and needs no extra read.
 	effClaude, effCodex := claudeVal, codexVal
-	needStored := (target == workersvc.HarnessCodex && !codexPresent) ||
-		(target == workersvc.HarnessClaude && !claudePresent)
+	needStored := !claudePresent || !codexPresent
 	if needStored {
 		cur, err := h.q.GetUserSettings(ctx, userID)
 		if err != nil {
@@ -1012,7 +1043,7 @@ func (h *Handler) buildHarnessModels(ctx context.Context, userID uuid.UUID, in h
 		}
 	}
 	legacyVal := effClaude
-	if target == workersvc.HarnessCodex {
+	if mirror == workersvc.HarnessCodex {
 		legacyVal = effCodex
 	}
 

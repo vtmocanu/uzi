@@ -142,6 +142,11 @@ newer worker image.
   defaults](./worker-model.md#harness-and-worker-models) if you don't need
   the custom ID right now.
 
+A resumed run can stay tied to its previous worker until the configured
+affinity ceiling (two hours by default), even if another capable worker
+comes online. This preserves unpublished work on the previous worker's
+volume before a cold move is allowed.
+
 ## Disk self-heal
 
 A hosted worker also reports its disk usage now — the same CPU/memory gauges
