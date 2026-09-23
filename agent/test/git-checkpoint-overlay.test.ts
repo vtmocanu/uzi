@@ -205,6 +205,23 @@ describe("checkpoint .github/workflows overlay (PRD #1062 M2, #1036)", () => {
     );
   });
 
+  it("newline workflow edit ships realTip without a clobbering overlay", async () => {
+    const workflow = ".github/workflows/line\nfeed.yml";
+    const fx = mk({ [WF]: "name: ci\n# v1\n", [workflow]: "name: original\n" });
+    const branch = "agent/issue-1037";
+    const gitA = worker(fx, "A");
+    const bareA = await gitA.ensureClone(fx.originPath);
+    const seed = await gitA.createOrAttachRunnerClone(bareA, 1037, "run-A");
+    const realTip = commit(seed.path, workflow, "name: branch\n");
+    advanceOriginWorkflow(fx, "name: ci\n# v2\n");
+    await gitA.fetchAgentBranch(bareA, seed.path, branch, "run-A");
+
+    const packed = await gitA.checkpointPack(bareA, branch, ctx());
+    assert.ok(packed);
+    assert.strictEqual(packed!.tipOid, realTip, "the branch workflow edit is never overlaid");
+    assert.ok(!subjectOf(bareA, packed!.tipOid).startsWith(OVERLAY_COMMIT_PREFIX));
+  });
+
   it("stacked: realTip is a wip(park) marker AND behind ⇒ overlay built; peel then soft-reset the marker", async () => {
     const fx = mk();
     const branch = "agent/issue-1036";

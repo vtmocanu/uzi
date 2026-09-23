@@ -11,7 +11,7 @@ import type { Logger } from "./log.js";
 import type { BoundaryProcessHandle, BoundaryProcessRequest } from "./harness.js";
 import { runnerCommand, runnerPath, runnerTmpdir } from "./runner-uid.js";
 import { withForgeRetry } from "./forge-retry.js";
-import { flagCIConfigPaths } from "./ci-config-guard.js";
+
 import {
   commitsScannedFromStderr,
   gitleaksArgs,
@@ -1754,7 +1754,7 @@ export class GitCache {
     // set means #377 owns this branch at finalize; ship realTip → the clean workflow-scope skip.
     const changed = await this.changedFiles(barePath, trackingRef);
     if (changed === null) return null;
-    if (flagCIConfigPaths(changed, [".github/workflows/**"]).length > 0) return null;
+    if (changed.some((file) => file.startsWith(".github/workflows/"))) return null;
 
     // Temp index + empty throwaway work-tree, both cleaned up in the finally. The work-tree is
     // required ONLY by `read-tree --prefix` (it refuses in a bare repo); WITHOUT `-u` nothing is
