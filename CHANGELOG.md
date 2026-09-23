@@ -22,11 +22,6 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
-### Fixed
-
-- **Codex runs now implement the plan you approved, not the original issue text ([#1586](https://github.com/vtmocanu/uzi/issues/1586)).**
-  After a gated Codex run's plan (first submission, a revision, or an auto-approval) passed the gate, every implement turn was built from the issue title and the description captured when the run was queued, so the lead could ignore or re-plan the approved work; implement turns, including those after a checkpoint's fresh session, now carry the exact approved plan framed as approved, and a resume with an already-approved plan is unchanged.
-
 ## [0.84.0] - 2026-09-20
 
 ### Added
@@ -55,6 +50,10 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Reworks no longer reject workflow files that uzi only synced from the default branch ([#1579](https://github.com/vtmocanu/uzi/issues/1579), [#1585](https://github.com/vtmocanu/uzi/pull/1585)).**
+  The workflow-scope check now distinguishes the agent's edits from uzi's own alignment commits and stale default-branch history, so these false positives no longer stop reworks; genuine workflow edits still fail the pre-check, and a failed default-branch fetch falls through to the normal push path.
+- **Codex runs now implement the plan you approved, not the original issue text ([#1586](https://github.com/vtmocanu/uzi/issues/1586), [#1587](https://github.com/vtmocanu/uzi/pull/1587)).**
+  After a gated Codex run's plan (first submission, a revision, or an auto-approval) passed the gate, every implement turn was built from the issue title and the description captured when the run was queued, so the lead could ignore or re-plan the approved work; implement turns, including those after a checkpoint's fresh session, now carry the exact approved plan framed as approved, and a resume with an already-approved plan is unchanged.
 - **Run, user, and factory usage totals were overstated for multi-turn Claude runs on v0.84.0-rc.8 workers, and are now folded correctly ([#1562](https://github.com/vtmocanu/uzi/issues/1562)).**
   From Claude Agent SDK 0.3.277 a resumed leg reports the session's running total instead of just that leg, and the old per-leg SUM (ADR-1079) counted it several times over; the worker now marks which reading a frame carries, and the server folds it by a per-session high-water mark; a run already recorded on rc.8 stays overstated (not re-derived; see ADR-1562).
 - **Cancelled, usage-limited, and message-transport-failed Codex runs no longer leak an open `source_only` custody hold ([#1539](https://github.com/vtmocanu/uzi/issues/1539)).**
