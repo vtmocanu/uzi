@@ -1004,6 +1004,50 @@ export class Outbox {
     return this.disabled;
   }
 
+  // ── terminal resolve hold (PRD #1539) ──────────────────────────────────────────
+  //
+  // A process-local, in-memory hold keyed by (runId, generation). The live run's permanent-failure
+  // hook takes it BEFORE it installs its `failed` journal and releases it in a `finally` after its own
+  // resolve, so the per-worker DRAINER (`Worker.resolveRunTerminal`, which fires when the run's spilled
+  // segments retire) cannot send the journaled `failed` during the hook's abort-then-reap window and
+  // race the hook's own resolve. It is deliberately NOT gated on `disabled`: it is a coordination flag
+  // between two in-process callers, independent of whether the durable store is writable. The boot
+  // resolve and RunRunner.resolveRunPendingTerminals ignore the hold — only the drainer honours it.
+
+  /** Terminals whose resolve the live run's own hook is currently driving; the drainer skips these. */
+  private readonly heldTerminalResolves = new Set<string>();
+  /** (runId, gen) pairs whose drainer resolve was SKIPPED because the hold was set, recorded so the
+   *  hook's release knows a resolve was deferred and can re-drive it once (N4: no stranding). */
+  private readonly skippedHeldResolves = new Set<string>();
+
+  private static holdKey(runId: string, gen: number): string {
+    return `${runId}\u0000${gen}`;
+  }
+
+  /** Take the resolve hold for (runId, gen). The drainer then skips this terminal until it is released. */
+  holdTerminalResolve(runId: string, gen: number): void {
+    this.heldTerminalResolves.add(Outbox.holdKey(runId, gen));
+  }
+
+  /** Release the resolve hold and report whether the drainer recorded a skip while it was held. When
+   *  `skipped` is true and the journal is still pending, the hook re-drives one resolve (N4). */
+  releaseTerminalResolve(runId: string, gen: number): { skipped: boolean } {
+    const key = Outbox.holdKey(runId, gen);
+    this.heldTerminalResolves.delete(key);
+    const skipped = this.skippedHeldResolves.delete(key);
+    return { skipped };
+  }
+
+  /** Whether (runId, gen)'s resolve is currently held by the live run's own hook. */
+  isTerminalResolveHeld(runId: string, gen: number): boolean {
+    return this.heldTerminalResolves.has(Outbox.holdKey(runId, gen));
+  }
+
+  /** Record that the drainer skipped resolving (runId, gen) because the hold was set. */
+  noteHeldSkip(runId: string, gen: number): void {
+    this.skippedHeldResolves.add(Outbox.holdKey(runId, gen));
+  }
+
   // ── terminal journals (Run B / M3) ─────────────────────────────────────────────
 
   /**

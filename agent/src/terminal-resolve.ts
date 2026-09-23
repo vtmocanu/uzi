@@ -132,24 +132,52 @@ export async function journalAndResolveTerminal(
     signal?: AbortSignal;
   },
 ): Promise<void> {
-  const { outbox, terminalMaxBytes, log } = deps;
   const { runId, claimGeneration, phase, messagesThroughSeq, body, send, signal } = args;
-  // Canonicalise ONCE (D-A1/D2): the SAME bytes are journalled and sent, so the first send and any
-  // replay are byte-identical, and no optional field is byte-cut past the api's scrubber.
+  // PRD #1539: the write-ahead install and the send/resolve are now the two exported primitives
+  // {@link installTerminalWriteAhead} / {@link sendUnjournaledTerminal} + {@link resolvePendingTerminal},
+  // so a caller that must interleave work BETWEEN the durable install and the resolve (the
+  // permanent-failure hook's abort-then-reap, RunRunner.journalAndSendTerminal) can. This helper keeps
+  // the SAME external behaviour for its direct callers (postTerminalState, the terminal-resolve tests):
+  // install → (resolvePendingTerminal | sendUnjournaledTerminal), byte-for-byte as before.
+  const installed = await installTerminalWriteAhead(deps, { runId, claimGeneration, phase, messagesThroughSeq, body });
+  if (!installed.journaled) {
+    await sendUnjournaledTerminal(deps, installed.canonical, messagesThroughSeq, send, signal);
+    return;
+  }
+  await resolvePendingTerminal(deps, { runId, claimGeneration, send, signal });
+}
+
+/**
+ * PRD #1539: the DURABLE-INSTALL half of the write-ahead terminal path, split out so a caller can run
+ * work BETWEEN the install and the resolve (the permanent-failure hook aborts + reaps the provider
+ * after the `failed` journal is on disk but before it is sent). Canonicalises the body ONCE (D-A1/D2:
+ * the SAME bytes are journalled and sent, so the first send and any replay are byte-identical) and
+ * journals it write-ahead.
+ *
+ * On success it emits the same `outbox: terminal journaled write-ahead` info line the e2e outbox
+ * phase gates its api outage on, and returns `{journaled:true}`. On `reserve_exhausted` (the
+ * terminal-sized reserve could not admit the journal) it emits the same SC2 error line and returns
+ * `{journaled:false, canonical}` so the caller sends the canonical body UNJOURNALED via
+ * {@link sendUnjournaledTerminal} — never a silent drop.
+ */
+export async function installTerminalWriteAhead(
+  deps: TerminalOutboxDeps,
+  args: { runId: string; claimGeneration: number; phase: string; messagesThroughSeq: number; body: StateRequest },
+): Promise<{ journaled: true } | { journaled: false; canonical: Record<string, unknown> }> {
+  const { outbox, terminalMaxBytes, log } = deps;
+  const { runId, claimGeneration, phase, messagesThroughSeq, body } = args;
   const canonical = canonicalizeTerminalBody(body as unknown as Record<string, unknown>, terminalMaxBytes);
   const result = await outbox.journalTerminal(runId, claimGeneration, phase, messagesThroughSeq, canonical);
   if (!result.journaled) {
-    // reserve_exhausted (SC2): the terminal-sized reserve could not admit the journal. Send the
-    // canonical body UNJOURNALED, with the fence when advertised, keeping today's semantics — the
-    // send's own retries apply and a throw propagates to the executor catch (which finds NO journal
-    // and takes today's fallback). Logged + counted, never a silent drop.
+    // reserve_exhausted (SC2): the terminal-sized reserve could not admit the journal. The caller
+    // sends the canonical body UNJOURNALED, keeping today's semantics — the send's own retries apply
+    // and a throw propagates to the executor catch (which finds NO journal and takes today's fallback).
     log.error("outbox: terminal journal reserve exhausted; sending outcome unjournaled (SC2)", {
       run_id: runId,
       claim_generation: claimGeneration,
       status: typeof canonical.status === "string" ? canonical.status : "unknown",
     });
-    await send(withTerminalFence(deps, canonical, messagesThroughSeq), signal);
-    return;
+    return { journaled: false, canonical };
   }
   // The outcome is now DURABLE on disk (before its first send). Emitted on the success path so an
   // observer can tell the terminal has been journaled write-ahead — the e2e outbox phase (case 3/4/5)
@@ -161,7 +189,24 @@ export async function journalAndResolveTerminal(
     messages_through_seq: messagesThroughSeq,
     status: typeof canonical.status === "string" ? canonical.status : "unknown",
   });
-  await resolvePendingTerminal(deps, { runId, claimGeneration, send, signal });
+  return { journaled: true };
+}
+
+/**
+ * PRD #1539: the UNJOURNALED-send half (the `reserve_exhausted` fallback of the write-ahead path):
+ * send the already-canonical body with the fence when advertised. Byte-for-byte today's
+ * `send(withTerminalFence(...))`, split out so both {@link journalAndResolveTerminal} and
+ * RunRunner.journalAndSendTerminal reuse it. A throw propagates to the caller (the executor catch
+ * finds NO journal and takes today's fallback).
+ */
+export async function sendUnjournaledTerminal(
+  deps: TerminalOutboxDeps,
+  canonical: Record<string, unknown>,
+  messagesThroughSeq: number,
+  send: SendTerminalState,
+  signal?: AbortSignal,
+): Promise<void> {
+  await send(withTerminalFence(deps, canonical, messagesThroughSeq), signal);
 }
 
 /**

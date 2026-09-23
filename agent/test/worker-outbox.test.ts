@@ -198,6 +198,9 @@ describe("Worker outbox drainer (PRD #1391 M2)", () => {
       retireTerminal: async () => {
         retiredTerminal += 1;
       },
+      // PRD #1539: not held here — the drain resolves normally.
+      isTerminalResolveHeld: () => false,
+      noteHeldSkip: () => {},
     } as unknown as Outbox;
 
     const client = {
@@ -238,6 +241,83 @@ describe("Worker outbox drainer (PRD #1391 M2)", () => {
     }
     assert.ok(r1Resolved, "the post-drain resolve sent the terminal for r1");
     assert.ok(retiredTerminal >= 1, "the landed terminal (200) retired the journal — it did not strand");
+  });
+
+  it("PRD #1539 (8): a HELD terminal is NOT resolved by the drain, and the skip is recorded", async () => {
+    // The live run's permanent-failure hook holds this generation's resolve while it aborts + reaps
+    // between the durable install and its own send. The drainer must SKIP the held terminal (sending
+    // here would race the hook's own resolve) and RECORD the skip, so the hook's release can re-drive
+    // one resolve if its own send failed. Removing the drainer's hold check (mutation M-b) resolves
+    // the held terminal (a reportState for r1) and never records the skip — reddening both asserts.
+    // Gate the ONE (boot) drain so the boot resolve — which deliberately IGNORES the hold — runs
+    // against an empty pending list first (retired=false). Only after release does the drain retire,
+    // reach resolveRunTerminal, and hit the hold. This isolates the drainer's hold check.
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let retired = false;
+    const reports: string[] = [];
+    let skipRecorded = 0;
+    const outbox = {
+      uncleanRuns: () => [],
+      isDisabled: () => false,
+      listPendingTerminals: () => (retired ? [{ run_id: "r1", claim_generation: 5 }] : []),
+      runsWithPending: () => (retired ? [] : ["r1"]),
+      depthFor: (id: string) => depth(id),
+      drainRun: async () => {
+        await gate;
+        retired = true;
+        return { retired: true, staleRetired: 0 };
+      },
+      readTerminalJournal: async (_id: string, gen: number) => ({
+        blocked: false,
+        body: { status: "failed" },
+        messagesThroughSeq: 0,
+        claim_generation: gen,
+      }),
+      retireTerminal: async () => {},
+      // The hook holds r1/gen5's resolve, so the drain must skip it and record the skip.
+      isTerminalResolveHeld: (_id: string, gen: number) => gen === 5,
+      noteHeldSkip: () => {
+        skipRecorded += 1;
+      },
+    } as unknown as Outbox;
+
+    const client = {
+      ...idleClient(),
+      hasFeature: () => false,
+      reportState: async (runId: string) => {
+        reports.push(runId);
+        return { applied: true, status: "failed" };
+      },
+    } as unknown as WorkerClient;
+
+    const controller = new AbortController();
+    const worker = new Worker(
+      fakeConfig({ gapFillMax: 1000, outboxTerminalMaxBytes: 1 << 20 } as unknown as Partial<Config>),
+      client,
+      idleRunner,
+      idleChat,
+      noJudge,
+      noReview,
+      nullLogger(),
+      okPreflight,
+      outbox,
+      new Map(),
+    );
+    const done = worker.run(controller.signal);
+    try {
+      // Boot resolve has run against an empty pending list (nothing pending yet).
+      await sleep(40);
+      assert.deepStrictEqual(reports, [], "the boot resolve did not resolve the terminal (nothing pending yet)");
+      release(); // let the drain retire, reach resolveRunTerminal, and hit the hold
+      await pollUntil(() => skipRecorded > 0, 2000, "the drain records a skip for the held terminal");
+    } finally {
+      release();
+      controller.abort();
+      await done;
+    }
+    assert.equal(skipRecorded, 1, "the held terminal's skip was recorded exactly once");
+    assert.deepStrictEqual(reports, [], "the held terminal was NOT resolved by the drain");
   });
 
   it("the heartbeat-triggered drain is FIRE-AND-FORGET: a slow drain never delays the next heartbeat", async () => {

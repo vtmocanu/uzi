@@ -1497,6 +1497,52 @@ describe("Outbox M3 terminal-journal store (PRD #1391 Run B)", () => {
   });
 });
 
+describe("Outbox terminal-resolve hold (PRD #1539)", () => {
+  it("H1. hold / isTerminalResolveHeld / release track one (runId, gen) pair independently", async () => {
+    const root = await mkRoot();
+    const o = makeOutbox(root);
+    await o.init();
+
+    assert.equal(o.isTerminalResolveHeld("r1", 5), false, "unheld by default");
+    o.holdTerminalResolve("r1", 5);
+    assert.equal(o.isTerminalResolveHeld("r1", 5), true, "held after holdTerminalResolve");
+    // The key is (runId, gen): a different gen / run is unaffected.
+    assert.equal(o.isTerminalResolveHeld("r1", 6), false, "a different generation is not held");
+    assert.equal(o.isTerminalResolveHeld("r2", 5), false, "a different run is not held");
+
+    const res = o.releaseTerminalResolve("r1", 5);
+    assert.deepEqual(res, { skipped: false }, "release with no recorded skip reports skipped:false");
+    assert.equal(o.isTerminalResolveHeld("r1", 5), false, "no longer held after release");
+  });
+
+  it("H2. a recorded skip is reported by the NEXT release, once, and does not leak to a later cycle", async () => {
+    const root = await mkRoot();
+    const o = makeOutbox(root);
+    await o.init();
+
+    o.holdTerminalResolve("r1", 5);
+    o.noteHeldSkip("r1", 5); // the drainer skipped a held resolve
+    const first = o.releaseTerminalResolve("r1", 5);
+    assert.deepEqual(first, { skipped: true }, "the release reports the recorded skip");
+
+    // A second hold/release cycle sees no leftover skip.
+    o.holdTerminalResolve("r1", 5);
+    const second = o.releaseTerminalResolve("r1", 5);
+    assert.deepEqual(second, { skipped: false }, "the skip flag was consumed by the first release");
+  });
+
+  it("H3. a noteHeldSkip with no matching hold is a no-op the release still surfaces once", async () => {
+    const root = await mkRoot();
+    const o = makeOutbox(root);
+    await o.init();
+    // A skip recorded without a prior hold (the release still consumes it exactly once).
+    o.noteHeldSkip("r9", 2);
+    assert.equal(o.isTerminalResolveHeld("r9", 2), false, "recording a skip does not imply a hold");
+    assert.deepEqual(o.releaseTerminalResolve("r9", 2), { skipped: true }, "the release surfaces the recorded skip");
+    assert.deepEqual(o.releaseTerminalResolve("r9", 2), { skipped: false }, "and only once");
+  });
+});
+
 describe("canonicalizeTerminalBody (PRD #1391 Run B / M3, D-A1)", () => {
   it("C1. a max-shape terminal under the cap is byte-identical between two invocations (first-send vs journal)", async () => {
     // Every required field present, plus optionals sized well under a generous cap. The canonicaliser
