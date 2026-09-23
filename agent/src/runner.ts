@@ -2147,13 +2147,18 @@ export class RunRunner {
           // `failed`). (3) Then reap this generation's provider while the run is still actively-claimed
           // and record the outcome + the reaped safety epoch, for reportGenericFailure to settle on.
           if (!flight.cancel.signal.aborted) flight.cancel.abort();
+          // Capture the epoch BEFORE the await: reapForSink reads executor.safety synchronously at
+          // entry, and a checkpoint can swap it while the reap is in flight. Recording it afterwards
+          // would compare the NEW epoch with itself and let the settle run under a provider this
+          // reap never quiesced.
+          const reapedSafety = flight.executor.safety;
           flight.permanentFailureReap = await this.reapRecoveryProviderForSettle(
             claim,
             flight,
             flight.runLog,
             "terminal",
           );
-          flight.permanentFailureReapSafety = flight.executor.safety;
+          flight.permanentFailureReapSafety = reapedSafety;
         },
       );
     } catch (e) {

@@ -402,6 +402,56 @@ describe("RunRunner terminal journaling (PRD #1391 Run B M3b)", () => {
     }
   });
 
+  // #1539 (7c): the epoch swaps WHILE the hook's reap is in flight. reapForSink reads
+  // executor.safety at entry, so the hook must record that same epoch, not whatever is installed
+  // after the await; otherwise the guard compares the new epoch with itself and lets the settle run
+  // under a provider this reap never quiesced. The wrapper swaps the installed epoch at boundary
+  // entry, then delegates to the real boundary.
+  it("#1539 (7c): an epoch swap during the hook's reap records the reaped epoch and fails closed", async () => {
+    const { gitlab } = fakeGitlab();
+    const outbox = await mkOutbox();
+    const events: string[] = [];
+    const { coord, client, safety, root } = fixture(events, () => false); // the reap's reconcile SUCCEEDS
+    try {
+      const run = runner(new StubExecutor(nullLogger()), gitlab, undefined, {
+        outbox,
+        outboxTerminalMaxBytes: 1 << 20,
+        gapFillMax: 100,
+        recovery: coord,
+      });
+      const runId = "run-7c-midreap";
+      const gen = 3;
+      const postCheckpoint = { epoch: "post-checkpoint" };
+      const real = safety as {
+        withBoundary: (...a: unknown[]) => Promise<unknown>;
+        spawnBoundaryProcess: (...a: unknown[]) => unknown;
+      };
+      const flight = minimalFailFlight({
+        runId,
+        gen,
+        events,
+        reportState: async () => ({ applied: false, status: "running" }),
+      });
+      const reaped = {
+        withBoundary: (...a: unknown[]) => {
+          flight.executor.safety = postCheckpoint; // a checkpoint swaps the epoch mid-reap
+          return real.withBoundary(...a);
+        },
+        spawnBoundaryProcess: (...a: unknown[]) => real.spawnBoundaryProcess(...a),
+      };
+      flight.executor.safety = reaped;
+      await callHandle(run, failClaim(runId, gen), flight, "boom");
+
+      assert.equal(flight.permanentFailureReap, true, "the hook reaped through the real boundary");
+      assert.equal(flight.permanentFailureReapSafety, reaped, "it recorded the epoch it reaped, not the swapped-in one");
+      assert.equal(reapValid(run, flight), false, "the installed epoch moved → the guard fails closed: no settle");
+      assert.deepEqual(client.releaseCalls, [], "no release ran under the swapped epoch");
+      assert.deepEqual(client.reserveCalls, [], "no reserve ran under the swapped epoch");
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   // #1539 (8, N4): when the drainer skipped a resolve while the hook held it, the hook's `finally`
   // release re-drives ONE resolve — so a terminal whose hook send did not retire it (a benign 409
   // running) is not stranded until boot. Here the first (hook) send answers 409 running AND records a
