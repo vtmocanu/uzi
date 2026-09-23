@@ -22,15 +22,12 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
-### Fixed
-
-- **Codex runs now show their tool activity and delegated subagents in By agent and the milestone live lanes ([#1583](https://github.com/vtmocanu/uzi/issues/1583)).**
-  A Codex run's lead tool calls now persist as `tool_use`/`tool_result` messages. Each accepted `spawn_agent` delegation persists a lead `Agent` dispatch and a matching completion. The child's text and tool frames carry its role, dispatch instance and label, so the existing server derivation opens and closes its lane unchanged. Projected tool input and output are redacted before they are capped at 16 KiB, per-dispatch and per-turn caps limit child output, and a stopped, failed or timed-out delegation closes its lane (if the worker itself dies, the lane expires after the 10-minute freshness window). Live verification on a Codex run is tracked under #1106 M6.
-
 ## [0.84.0] - 2026-09-20
 
 ### Added
 
+- **Codex runs now show their tool activity and delegated subagents in By agent and the milestone live lanes ([#1583](https://github.com/vtmocanu/uzi/issues/1583), [#1588](https://github.com/vtmocanu/uzi/pull/1588)).**
+  A Codex run's lead tool calls now persist as `tool_use`/`tool_result` messages. Each accepted `spawn_agent` delegation persists a lead `Agent` dispatch and a matching completion. The child's text and tool frames carry its role, dispatch instance and label, so the existing server derivation opens and closes its lane unchanged. Projected tool input and output are redacted before they are capped at 16 KiB, per-dispatch and per-turn caps limit child output, and a stopped, failed or timed-out delegation closes its lane (if the worker itself dies, the lane expires after the 10-minute freshness window). Live verification on a Codex run is tracked under #1106 M6.
 - **Claude and Codex now keep separate worker-model defaults, saved together from one grouped card ([#1551](https://github.com/vtmocanu/uzi/issues/1551)).**
   Settings → Run defaults replaces the old single-model card with one "Harness and worker models" card holding a retained lane per usable harness, so switching your default harness no longer clears the other one's saved model; the Codex lane also gains the same "Other (custom model ID)" escape hatch Claude has always had, scoped to your worker root and gated behind a `codex_custom_model_v1` worker capability so an old hosted worker never silently substitutes `gpt-6-astra`.
 - **Codex task review now runs on a built-in `gpt-6-sol` model, independent of your saved defaults ([#1551](https://github.com/vtmocanu/uzi/issues/1551)).**
