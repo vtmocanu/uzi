@@ -628,18 +628,18 @@ describe("RunRunner — finalize base-align (PRD #456)", () => {
     assert.strictEqual(calls.length, 0, "no PR opened on the conflict fail");
   });
 
-  it("unicode workflow edit is seen by the real overlay guard and cannot be clobbered", async () => {
-    const workflow = ".github/workflows/café.yml";
+  it("newline workflow edit is seen by the real overlay guard and cannot be clobbered", async () => {
+    const workflow = ".github/workflows/line\nfeed.yml";
     seedWorkflowsOnOrigin({ [workflow]: "name: original\n" });
     const { github, calls } = fakeGitHub();
     const strategies = spyAlign();
     // Let the run reach base-align while retaining the real changedFiles overlay check.
     git.branchWorkflowFiles = (async () => null) as typeof git.branchWorkflowFiles;
     const realChanged = git.changedFiles.bind(git);
-    let sawUnicode = false;
+    let sawNewline = false;
     git.changedFiles = (async (...args: Parameters<typeof git.changedFiles>) => {
       const changed = await realChanged(...args);
-      if (changed?.includes(workflow)) sawUnicode = true;
+      if (changed?.includes(workflow)) sawNewline = true;
       return changed;
     }) as typeof git.changedFiles;
     const claim = githubClaim(167);
@@ -647,7 +647,7 @@ describe("RunRunner — finalize base-align (PRD #456)", () => {
       { [workflow]: "name: branch\n" },
       { [workflow]: "name: default\n" },
     )).execute(claim);
-    assert.strictEqual(sawUnicode, true, "the real diff retains the unicode path");
+    assert.strictEqual(sawNewline, true, "the real diff retains the newline path");
     assert.ok(!strategies.includes("workflow-subtree"), "overlay cannot overwrite the branch edit");
     assert.strictEqual(api.states.at(-1)?.body.fail_origin, "finalize_base_align_conflict");
     assert.strictEqual(calls.length, 0);
@@ -665,6 +665,20 @@ describe("RunRunner — finalize base-align (PRD #456)", () => {
     const failed = api.states.find((s) => s.runId === claim.run_id && s.body.status === "failed")?.body;
     assert.strictEqual(failed?.fail_origin, "workflow_scope_missing");
     assert.ok(failed?.preserved_patch?.includes("+on: [branch-edit]"));
+    assert.strictEqual(calls.length, 0);
+  });
+
+  it("newline workflow edit fails the precheck before any overlay", async () => {
+    const workflow = ".github/workflows/line\nfeed.yml";
+    seedWorkflowsOnOrigin({ [workflow]: "name: original\n" });
+    const { github, calls } = fakeGitHub();
+    const strategies = spyAlign();
+    const claim = githubClaim(168);
+    await githubRunner(github, committingExecutor({ [workflow]: "name: branch\n" })).execute(claim);
+    const failed = api.states.find((s) => s.runId === claim.run_id && s.body.status === "failed")?.body;
+    assert.strictEqual(failed?.fail_origin, "workflow_scope_missing");
+    assert.ok(failed?.preserved_patch?.includes("+name: branch"));
+    assert.deepStrictEqual(strategies, []);
     assert.strictEqual(calls.length, 0);
   });
 

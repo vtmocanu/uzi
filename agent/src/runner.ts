@@ -3307,10 +3307,9 @@ export class RunRunner {
       }
       // D6: a null diff (diff-computation failure) fails OPEN to the normal push — do not
       // fail a possibly-legitimate non-workflow run on an inability to compute the diff.
-      const wfHits =
-        changedForWf === null
-          ? null
-          : flagCIConfigPaths(changedForWf, [".github/workflows/**"]);
+      const wfHits = changedForWf === null
+        ? null
+        : changedForWf.filter((file) => file.startsWith(".github/workflows/"));
       if (wfHits && wfHits.length > 0) {
         // Compose an actionable, capped failure_reason that names the offending path(s)
         // (truncating the path LIST if needed, never the doc link) and points at
@@ -3816,10 +3815,9 @@ export class RunRunner {
             // EXISTING merge → rebase → preserve chain, unchanged.
             // Keep the overlay's tree-diff guard independent of the commit-based precheck.
             const alignChanged = await this.git.changedFiles(alignBarePath, trackingRef);
-            const alignWfHits =
-              alignChanged === null
-                ? null
-                : flagCIConfigPaths(alignChanged, [".github/workflows/**"]);
+            const alignWfHits = alignChanged === null
+              ? null
+              : alignChanged.filter((file) => file.startsWith(".github/workflows/"));
             const canOverlay =
               alignChanged !== null && alignWfHits !== null && alignWfHits.length === 0;
 
