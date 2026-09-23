@@ -186,6 +186,12 @@ function respondSuccess(controller: FakeController, idx: number): boolean {
   return reply.result?.success === true;
 }
 
+/** Read the text the child received off a recorded respond call's `{ result: { contentItems } }`. */
+function replyText(controller: FakeController, idx: number): string | undefined {
+  const reply = controller.respondCalls[idx]!.reply as { result?: { contentItems?: { text?: string }[] } };
+  return reply.result?.contentItems?.[0]?.text;
+}
+
 /** Set a controller's scripted notes after construction (they reference the controller). */
 function withNotes(controller: FakeController, notes: CodexNotification[]): FakeController {
   (controller as unknown as { notes: CodexNotification[] }).notes = notes;
@@ -449,7 +455,11 @@ describe("CodexDelegationRunner: child projection hook (issue #1583 m2)", () => 
     assert.equal(finished.id, "c-bash");
     assert.equal(finished.name, "Bash");
     assert.equal(finished.isError, false);
-    assert.notEqual(finished.output, undefined);
+    assert.equal(
+      typeof finished.output === "string" ? finished.output : JSON.stringify(finished.output),
+      replyText(controller, 1),
+      "the finished item carries the broker output the child received",
+    );
     assert.equal(controller.repliesAtProject[1], 1, "the finished item was projected BEFORE the Bash reply");
     assert.deepEqual(text, { kind: "text", text: "child says" });
     assert.deepEqual(thinking, { kind: "thinking", text: "thinking hard" });
@@ -470,7 +480,7 @@ describe("CodexDelegationRunner: child projection hook (issue #1583 m2)", () => 
     const finished = controller.projected.flat().find((i) => i.kind === "tool" && i.phase === "finished");
     assert.ok(finished !== undefined && finished.kind === "tool" && finished.phase === "finished");
     assert.equal(finished.isError, true);
-    assert.equal(typeof finished.output, "string", "a failure projects the broker's message");
+    assert.equal(finished.output, replyText(controller, 0), "a failure projects the broker's message the child received");
     assert.equal(respondSuccess(controller, 0), false);
   });
 
