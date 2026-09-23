@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import {
   MAX_PROJECTED_BYTES,
+  boundJsonString,
   boundUtf8,
   newProjectionNonce,
   projectedId,
@@ -101,8 +102,75 @@ describe("codex projection: tool input/output", () => {
 
   it("bounds and defaults the tool name", () => {
     assert.equal(projectToolName(undefined, scrub), "unknown");
+    assert.equal(projectToolName("", scrub), "unknown");
     assert.equal(projectToolName("Bash", scrub), "Bash");
     assert.ok(Buffer.byteLength(projectToolName("n".repeat(5000), scrub), "utf8") <= 256);
+  });
+
+  it("strips control and bidi/format characters from the tool name", () => {
+    const hostile = "Ba\u001b[31msh\n\r\t\u202eevil\u200b\u2028\u0085\ufeff";
+    const name = projectToolName(hostile, scrub);
+    assert.equal(name, "Ba[31mshevil");
+    for (const bad of ["\u001b", "\n", "\r", "\t", "\u202e", "\u200b", "\u2028", "\u0085", "\ufeff"]) {
+      assert.ok(!name.includes(bad), `stripped ${JSON.stringify(bad)}`);
+    }
+    assert.equal(projectToolName("\u001b\u202e\n", scrub), "unknown", "all-unsafe falls back to unknown");
+  });
+
+  it("an oversized input of backslashes/quotes stays within the cap once SERIALIZED", () => {
+    for (const unit of ["\\", '"', "\u0001", "\n"]) {
+      const B = unit.repeat(40_000);
+      const out = projectToolInput({ description: B, file_path: B, path: B, skill: B, command: B }, scrub) as Record<string, unknown>;
+      assert.equal(out.truncated, true);
+      const bytes = Buffer.byteLength(JSON.stringify(out), "utf8");
+      assert.ok(bytes <= MAX_PROJECTED_BYTES, `serialized ${bytes} > ${MAX_PROJECTED_BYTES} for ${JSON.stringify(unit)}`);
+      assert.equal(typeof out.description, "string", "display fields survive");
+    }
+  });
+
+  it("a backslash/quote/control-heavy output serializes within the cap (+2 quotes)", () => {
+    for (const unit of ["\\", '"', "\u0001", "\n", "😀"]) {
+      const out = projectToolOutput({ ok: true, output: unit.repeat(40_000) }, scrub);
+      assert.ok(Buffer.byteLength(JSON.stringify(out), "utf8") <= MAX_PROJECTED_BYTES + 2, `for ${JSON.stringify(unit)}`);
+      assert.ok(!LONE_SURROGATE.test(out));
+      assert.match(out, /…\[truncated \d+ bytes\]$/);
+    }
+  });
+
+  it("does not overflow the stack on deeply nested input, replacing the deep subtree with a marker", () => {
+    let deep: unknown = [];
+    for (let i = 0; i < 20_000; i++) deep = [deep];
+    const out = projectToolInput({ command: "echo hi", x: deep }, scrub) as Record<string, unknown>;
+    assert.equal(out.command, "echo hi");
+    assert.ok(JSON.stringify(out).includes("[depth limit]"));
+    let d: unknown = out.x;
+    let levels = 0;
+    while (Array.isArray(d)) {
+      d = d[0];
+      levels += 1;
+    }
+    assert.equal(d, "[depth limit]");
+    assert.ok(levels <= 32, `walked ${levels} levels`);
+  });
+
+  it("does not throw on a cyclic object, cutting the cycle with a marker", () => {
+    const a: Record<string, unknown> = { command: "SEKRET-VALUE-42" };
+    a.self = a;
+    const shared = { v: 1 };
+    a.list = [shared, shared];
+    const out = projectToolInput(a, scrub);
+    assert.deepEqual(out, { command: "***REDACTED***", self: "[cycle]", list: [{ v: 1 }, { v: 1 }] });
+  });
+});
+
+describe("codex projection: boundJsonString", () => {
+  it("returns a string whose escaped form fits unchanged, and bounds the escaped form otherwise", () => {
+    assert.equal(boundJsonString('a"b\\c', 7), 'a"b\\c');
+    for (let cap = 30; cap <= 60; cap++) {
+      const out = boundJsonString('\\"\u0000😀'.repeat(50), cap);
+      assert.ok(Buffer.byteLength(JSON.stringify(out), "utf8") - 2 <= cap, `cap ${cap}`);
+      assert.ok(!LONE_SURROGATE.test(out));
+    }
   });
 });
 

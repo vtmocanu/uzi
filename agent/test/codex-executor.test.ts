@@ -1488,10 +1488,11 @@ describe("CodexExecutor: root tool projection (issue #1583)", () => {
   it("a claim secret straddling the 16 KiB cut leaves no prefix in the POSTED tool_result (ctx.redactText scrubs before bounding)", async () => {
     // Assembled from fragments at runtime so no provider-token-shaped literal sits in source.
     const claimSecret = "glpat-" + "abcdefghij" + "0123456789";
-    // The projected output is `{"code":0,"stdout":"<stdout>",...}` (a 20-byte prefix), so the
-    // secret starts ~40 bytes before the cap while the bound (cap minus its ~26-byte marker)
-    // cuts ~14 bytes into it: without a pre-bound scrub a secret prefix would survive.
-    const stdout = "x".repeat(MAX_PROJECTED_BYTES - 60) + claimSecret + "y".repeat(500);
+    // The projected output is `{"code":0,"stdout":"<stdout>",...}`, bounded on its JSON-escaped
+    // size (its quotes count as escaped bytes, ~25-byte prefix). The secret starts ~45 bytes before
+    // the cap while the bound (cap minus its ~26-byte marker) cuts ~19 bytes into it, so without a
+    // pre-bound scrub a 12+-char secret prefix would survive; the shorter ***REDACTED*** still fits.
+    const stdout = "x".repeat(MAX_PROJECTED_BYTES - 70) + claimSecret + "y".repeat(500);
     const rig = makeRig();
     const deps: CodexExecutorDeps = {
       ...rig.deps,

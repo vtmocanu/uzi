@@ -1885,13 +1885,109 @@ describe("CodexHarness: root tool projection outbox (issue #1583)", () => {
 
     const second = harness.startTurn(makeRequest()).events[Symbol.asyncIterator]();
     const turn2Events: HarnessEvent[] = [];
-    // Settle the OLD turn's callback while turn 2 is live, then finish turn 2.
+    // Make turn 2 LIVE first: its first next() runs runTurn's body (which marks turn 2 as the
+    // live projection turn) and parks awaiting the next notification. Only THEN settle the OLD
+    // turn's wedged callback, so the cross-turn guard in emitProjected is what drops its frame.
+    const firstStep = second.next();
+    await tick();
     release({ ok: true, output: {} });
     await tick();
+    await tick();
     transport.push(turnCompleted("completed", undefined, "th-1", "tn-2")).end();
-    for (let step = await second.next(); !step.done; step = await second.next()) turn2Events.push(step.value);
+    for (let step = await withTimeout(firstStep, 1000, "turn 2's first event"); !step.done; step = await second.next()) {
+      turn2Events.push(step.value);
+    }
     assert.equal(turn2Events.filter((e) => e.kind === "frame").length, 0, "the late finished frame is dropped");
     assert.equal(turn2Events.at(-1)?.kind, "turn_finished");
+  });
+});
+
+describe("CodexHarness: projection is fail-safe (issue #1583)", () => {
+  function toolItems(events: HarnessEvent[]): Extract<HarnessEvent, { kind: "frame" }>["items"][number][] {
+    return events.flatMap((e) => (e.kind === "frame" ? e.items : [])).filter((i) => i.kind === "tool");
+  }
+
+  it("a Bash call with 20000-deep nested args still reaches the broker once and gets exactly one reply", async () => {
+    let deep: unknown = [];
+    for (let i = 0; i < 20_000; i++) deep = [deep];
+    let brokerCalls = 0;
+    const broker = stubBroker(async () => {
+      brokerCalls += 1;
+      return { ok: true, output: { code: 0, stdout: "hi", stderr: "" } };
+    });
+    const { harness, transport } = makeHarness({ broker });
+    transport
+      .push(threadStarted())
+      .push(toolCall(9, "Bash", { command: "echo hi", x: deep }, "th-1", "tn-1", "deep"))
+      .push(turnCompleted("completed"))
+      .end();
+    const events = await withTimeout(collect(harness.startTurn(makeRequest()).events), 5000, "the turn to complete");
+    assert.equal(brokerCalls, 1, "the broker ran exactly once");
+    assert.equal(transport.responses.filter((r) => r.requestId === 9).length, 1, "exactly one reply");
+    assert.equal(transport.responses.length, 1);
+    assert.equal(events.at(-1)?.kind, "turn_finished");
+    const tools = toolItems(events);
+    assert.equal(tools.length, 2, "a started/finished pair");
+    const [started, finished] = tools;
+    assert.ok(started?.kind === "tool" && started.phase === "started");
+    assert.ok(finished?.kind === "tool" && finished.phase === "finished");
+    assert.equal(started.id, finished.id);
+    assert.equal(finished.isError, false);
+  });
+
+  it("a projection that throws falls back to a minimal frame pair and never blocks the broker or the reply", async () => {
+    let brokerCalls = 0;
+    const broker = stubBroker(async () => {
+      brokerCalls += 1;
+      return { ok: true, output: { code: 0 } };
+    });
+    const { harness, transport } = makeHarness({
+      broker,
+      scrubProjected: () => {
+        throw new Error("redactor exploded");
+      },
+    });
+    transport.push(threadStarted()).push(toolCall(5, "Bash", { command: "echo hi" })).push(turnCompleted("completed")).end();
+    const events = await withTimeout(collect(harness.startTurn(makeRequest()).events), 5000, "the turn to complete");
+    assert.equal(brokerCalls, 1);
+    assert.equal(transport.responses.length, 1, "exactly one reply");
+    assert.equal(events.at(-1)?.kind, "turn_finished");
+    const tools = toolItems(events);
+    assert.equal(tools.length, 2);
+    const [started, finished] = tools;
+    assert.ok(started?.kind === "tool" && started.phase === "started");
+    assert.equal(started.name, "unknown");
+    assert.deepEqual(started.input, { truncated: true });
+    assert.ok(finished?.kind === "tool" && finished.phase === "finished");
+    assert.equal(finished.output, "[projection failed]");
+  });
+
+  it("two root calls in one turn with the SAME call id get distinct ids, each finished paired with its own started", async () => {
+    const broker = stubBroker(async (_rt, _name, args) => ({ ok: true, output: { echoed: (args as { command: string }).command } }));
+    const { harness, transport } = makeHarness({ broker, idNonce: "abcdef012345" });
+    transport
+      .push(threadStarted())
+      .push(toolCall(1, "Bash", { command: "first" }, "th-1", "tn-1", "dup"))
+      .push(toolCall(2, "Bash", { command: "second" }, "th-1", "tn-1", "dup"))
+      // Two call ids that sanitise to the same part collide too.
+      .push(toolCall(3, "Bash", { command: "third" }, "th-1", "tn-1", "d<u>p"))
+      .push(turnCompleted("completed"))
+      .end();
+    const tools = toolItems(await collect(harness.startTurn(makeRequest()).events));
+    assert.equal(tools.length, 6);
+    const started = tools.filter((t) => t.kind === "tool" && t.phase === "started");
+    const finished = tools.filter((t) => t.kind === "tool" && t.phase === "finished");
+    const ids = started.map((t) => (t.kind === "tool" ? t.id : ""));
+    assert.equal(new Set(ids).size, 3, `distinct ids: ${ids.join(", ")}`);
+    assert.equal(ids[0], "cx-abcdef012345-t1-dup");
+    for (const [i, cmd] of ["first", "second", "third"].entries()) {
+      const s = started[i]!;
+      assert.ok(s.kind === "tool");
+      assert.deepEqual(s.input, { command: cmd });
+      const f = finished.find((t) => t.kind === "tool" && t.id === s.id);
+      assert.ok(f?.kind === "tool", `a finished frame for ${s.id}`);
+      assert.equal(f.output, JSON.stringify({ echoed: cmd }), "the finished frame pairs with its own started");
+    }
   });
 });
 

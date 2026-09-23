@@ -343,8 +343,12 @@ export class CodexHarness implements RunHarness {
   private wakeOutbox?: () => void;
   private turnOrdinal = 0;
   private liveProjectionTurn?: number;
-  // Fallback id counter for a callback whose call id is empty after sanitising (per turn).
+  // Per-turn id counter: the fallback for a call id empty after sanitising, and the `-n<k>`
+  // suffix that disambiguates a colliding id.
   private projectionCounter = 0;
+  // Ids already issued this turn: a reused call id (or two that sanitise identically) gets a
+  // `-n<k>` suffix so every started/finished pair stays distinct.
+  private issuedProjectionIds = new Set<string>();
 
   // Child-thread demux (part C): a registered sink receives every frame carrying its
   // child thread id off the SAME transport, so a delegation's child turn can consume its
@@ -486,6 +490,7 @@ export class CodexHarness implements RunHarness {
     this.pendingCodexError = undefined;
     this.turnOrdinal += 1;
     this.projectionCounter = 0;
+    this.issuedProjectionIds = new Set();
     this.outbox = [];
 
     return {
@@ -791,10 +796,14 @@ export class CodexHarness implements RunHarness {
       if (onAbort) request.signal.removeEventListener("abort", onAbort);
       if (this.stopTurn === settleStop) this.stopTurn = undefined;
       // Close the outbox for this turn: a callback settling after the stream ended drops its
-      // projection rather than leaking it into a later turn.
-      if (this.liveProjectionTurn === ordinal) this.liveProjectionTurn = undefined;
-      this.outbox = [];
-      this.wakeOutbox = undefined;
+      // projection rather than leaking it into a later turn. Only the turn that still owns the
+      // outbox clears it, so a late finally (an abandoned iterator returned after a newer turn
+      // went live) cannot wipe the newer turn's queue or wake slot.
+      if (this.liveProjectionTurn === ordinal) {
+        this.liveProjectionTurn = undefined;
+        this.outbox = [];
+        this.wakeOutbox = undefined;
+      }
     }
   }
 
@@ -1089,7 +1098,11 @@ export class CodexHarness implements RunHarness {
       } catch {
         result = { ok: false, code: "broker_error", message: "the callback failed" };
       }
-      beforeReply?.(result);
+      try {
+        beforeReply?.(result);
+      } catch {
+        /* projection is best-effort (issue #1583): it never blocks the reply */
+      }
       this.safeRespond(transport, requestId, result);
       return result;
     };
@@ -1132,42 +1145,69 @@ export class CodexHarness implements RunHarness {
 
   /** Issue #1583: queue the projected `started` tool frame for one root callback NOW (before the
    *  broker is awaited) and return the hook that queues its `finished` frame once the broker
-   *  settles. Both frames are main-origin, lead-attributed, share one namespaced id, and carry
-   *  only scrubbed + bounded input/output (see projection.ts). They carry NO `signals`. */
+   *  settles. Both frames are main-origin, lead-attributed, share one namespaced id (unique
+   *  within the turn), and carry only scrubbed + bounded input/output (see projection.ts). They
+   *  carry NO `signals`.
+   *
+   *  FAIL-SAFE: projection is observability only, so it never throws into the callback path.
+   *  A failure projecting the input falls back to `{ truncated: true }`, one projecting the
+   *  output to "[projection failed]", and anything else drops the frame; the broker call and
+   *  the model reply proceed regardless. */
   private beginToolProjection(
     callId: string,
     canonical: string | undefined,
     args: unknown,
-  ): (result: CallbackResult) => void {
-    const ordinal = this.turnOrdinal;
+  ): ((result: CallbackResult) => void) | undefined {
+    try {
+      const ordinal = this.turnOrdinal;
+      const id = this.issueProjectionId(ordinal, callId);
+      let name: string;
+      try {
+        name = projectToolName(canonical, this.scrubProjected);
+      } catch {
+        name = "unknown";
+      }
+      const frame = (item: HarnessItem): HarnessEvent => ({
+        kind: "frame",
+        origin: { kind: "main" },
+        attribution: { agent: "lead" },
+        items: [item],
+        model: this.currentModel,
+        sessionId: this.threadId,
+      });
+      let input: unknown;
+      try {
+        input = projectToolInput(args, this.scrubProjected);
+      } catch {
+        input = { truncated: true };
+      }
+      this.emitProjected(frame({ kind: "tool", phase: "started", id, name, input }), ordinal);
+      return (result) => {
+        let output: string;
+        try {
+          output = projectToolOutput(result, this.scrubProjected);
+        } catch {
+          output = "[projection failed]";
+        }
+        this.emitProjected(frame({ kind: "tool", phase: "finished", id, name, output, isError: !result.ok }), ordinal);
+      };
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** A namespaced projected id not yet issued this turn: a colliding id (a reused call id, or
+   *  two that sanitise identically) gets a `-n<counter>` suffix until it is unique. */
+  private issueProjectionId(ordinal: number, callId: string): string {
     this.projectionCounter += 1;
-    const id = projectedId(this.idNonce, ordinal, callId, this.projectionCounter);
-    const name = projectToolName(canonical, this.scrubProjected);
-    const frame = (item: HarnessItem): HarnessEvent => ({
-      kind: "frame",
-      origin: { kind: "main" },
-      attribution: { agent: "lead" },
-      items: [item],
-      model: this.currentModel,
-      sessionId: this.threadId,
-    });
-    this.emitProjected(
-      frame({ kind: "tool", phase: "started", id, name, input: projectToolInput(args, this.scrubProjected) }),
-      ordinal,
-    );
-    return (result) => {
-      this.emitProjected(
-        frame({
-          kind: "tool",
-          phase: "finished",
-          id,
-          name,
-          output: projectToolOutput(result, this.scrubProjected),
-          isError: !result.ok,
-        }),
-        ordinal,
-      );
-    };
+    const base = projectedId(this.idNonce, ordinal, callId, this.projectionCounter);
+    let id = base;
+    while (this.issuedProjectionIds.has(id)) {
+      this.projectionCounter += 1;
+      id = `${base}-n${this.projectionCounter}`;
+    }
+    this.issuedProjectionIds.add(id);
+    return id;
   }
 
   /** Reply to a server→client tool-call with a broker {@link CallbackResult}, mapped to the
