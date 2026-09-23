@@ -11,6 +11,8 @@ import {
   projectToolName,
   projectToolOutput,
 } from "../src/codex/projection.js";
+import { emptyCounts, sanitizePayload } from "../src/sanitize.js";
+import { makeRedactor } from "../src/redact.js";
 
 // Issue #1583 — the pure Codex tool projection: UTF-8 byte bounding, scrub-before-bound, the
 // oversized-input shape and the namespaced id helper.
@@ -212,3 +214,36 @@ describe("codex projection: namespaced ids", () => {
     assert.match(newProjectionNonce(), /^[0-9a-f]{12}$/);
   });
 });
+
+describe("codex projection: persisted-path re-join (batcher normalization after the scrub)", () => {
+  // A runtime-released token: known ONLY to the projection scrub, never to the batcher redactor
+  // (whose secret list is the claim set). Assembled at runtime.
+  const released = "RELEASED-" + "codex-tok-" + "9f3a1c";
+  const claim = "CLAIM-" + "secret-" + "77aa11";
+  const scrub = (s: string): string => s.split(released).join("***REDACTED***").split(claim).join("***REDACTED***");
+  // The batcher's persist path: sanitizePayload (NUL strip, surrogate fix) THEN the claim redactor.
+  const persist = (payload: Record<string, unknown>): string =>
+    JSON.stringify(makeRedactor([claim])(sanitizePayload(payload, emptyCounts())));
+  const nulSplit = (t: string): string => [...t].join("\u0000");
+
+  it("a NUL-split released token in tool OUTPUT is not re-joined on the wire", () => {
+    const content = projectToolOutput({ ok: true, output: "file: " + nulSplit(released) }, scrub);
+    const wire = persist({ tool_use_id: "x", content, is_error: false });
+    assert.ok(!wire.includes(released), wire);
+    assert.ok(wire.includes("***REDACTED***"));
+  });
+
+  it("a NUL-split released token in tool INPUT values and keys is not re-joined on the wire", () => {
+    const split = released.slice(0, 4) + "\u0000" + released.slice(4);
+    const input = projectToolInput({ command: "echo " + split, [split]: "v" }, scrub);
+    const wire = persist({ id: "x", name: "Bash", input });
+    assert.ok(!wire.includes(released), wire);
+  });
+
+  it("a restrict-joined secret in the provider call id is scrubbed before the 64-char cap", () => {
+    const id = projectedId("abcdef012345", 1, released.slice(0, 4) + "\u200b" + released.slice(4) + "x".repeat(80), 1, scrub);
+    assert.ok(!id.includes(released.slice(0, 12)), id);
+    assert.match(id, /^cx-abcdef012345-t1-[A-Za-z0-9_.:-]+$/);
+  });
+});
+

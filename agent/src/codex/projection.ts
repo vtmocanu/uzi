@@ -18,6 +18,7 @@
 import { randomBytes } from "node:crypto";
 
 import { isUnsafeIdentifierChar, type CallbackResult } from "./broker.js";
+import { emptyCounts, sanitizeText } from "../sanitize.js";
 
 /** The byte cap for one projected tool input or output, measured on its JSON serialization
  *  (the persisted payload, not what the model saw: the broker already bounds shell output at
@@ -45,6 +46,15 @@ const DISPLAY_FIELDS = ["description", "file_path", "path", "skill"] as const;
 
 /** The per-projection string redactor (identity when nothing is registered). */
 export type ProjectionScrub = (s: string) => string;
+
+/** Scrub `s` AFTER applying the batcher's own normalization (sanitize.ts: NULs stripped, lone
+ *  surrogates replaced). The batcher re-runs that normalization at persist time, and its
+ *  redactor does not know the runtime-released Codex tokens; normalizing only there would
+ *  re-join a token split by NULs (e.g. UTF-16LE shell output) AFTER this scrub had missed it.
+ *  Normalizing first makes the batcher's pass a no-op on projected strings. */
+function cleanScrub(s: string, scrub: ProjectionScrub): string {
+  return scrub(sanitizeText(s, emptyCounts()));
+}
 
 function codePointBytes(cp: number): number {
   if (cp <= 0x7f) return 1;
@@ -127,7 +137,7 @@ export function boundJsonString(s: string, maxBytes: number): string {
  *  {@link MAX_SCRUB_DEPTH} become {@link DEPTH_MARKER}, and a container already on the current
  *  path becomes {@link CYCLE_MARKER}, so the walk is bounded whatever the value's shape. */
 function scrubDeep(value: unknown, scrub: ProjectionScrub, depth = 0, path: WeakSet<object> = new WeakSet()): unknown {
-  if (typeof value === "string") return scrub(value);
+  if (typeof value === "string") return cleanScrub(value, scrub);
   if (value === null || typeof value !== "object") return value;
   if (depth >= MAX_SCRUB_DEPTH) return DEPTH_MARKER;
   if (path.has(value)) return CYCLE_MARKER;
@@ -138,7 +148,7 @@ function scrubDeep(value: unknown, scrub: ProjectionScrub, depth = 0, path: Weak
     // of re-parenting `out` (which would hide it and let inherited fields leak into the display).
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(value)) {
-      Object.defineProperty(out, scrub(k), {
+      Object.defineProperty(out, cleanScrub(k, scrub), {
         value: scrubDeep(v, scrub, depth + 1, path),
         enumerable: true,
         writable: true,
@@ -202,7 +212,7 @@ export function projectToolInput(args: unknown, scrub: ProjectionScrub): unknown
  *  `JSON.stringify(content)` is at most MAX_PROJECTED_BYTES + 2 (the quotes). */
 export function projectToolOutput(result: CallbackResult, scrub: ProjectionScrub): string {
   const text = result.ok ? safeStringify(result.output) : result.message;
-  return boundJsonString(scrub(text), MAX_PROJECTED_BYTES);
+  return boundJsonString(cleanScrub(text, scrub), MAX_PROJECTED_BYTES);
 }
 
 /** A bounded, scrubbed display name for a projected tool item. Control and bidi/format code
@@ -214,7 +224,7 @@ export function projectToolName(name: string | undefined, scrub: ProjectionScrub
   if (name === undefined) return "unknown";
   let stripped = "";
   for (const ch of name) if (!isUnsafeIdentifierChar(ch.codePointAt(0) ?? 0)) stripped += ch;
-  const safe = scrub(stripped);
+  const safe = cleanScrub(stripped, scrub);
   return safe.length === 0 ? "unknown" : boundUtf8(safe, MAX_NAME_BYTES);
 }
 
@@ -228,7 +238,17 @@ export function newProjectionNonce(): string {
  * is provider-supplied, so it is restricted to `[A-Za-z0-9_.:-]` (every other char is dropped)
  * and capped at 64 chars; a call id empty after that falls back to `n<counter>`.
  */
-export function projectedId(nonce: string, turnOrdinal: number, callId: string, counter: number): string {
-  const part = callId.replace(/[^A-Za-z0-9_.:-]/g, "").slice(0, MAX_CALL_ID_CHARS);
+export function projectedId(
+  nonce: string,
+  turnOrdinal: number,
+  callId: string,
+  counter: number,
+  scrub: ProjectionScrub = (s) => s,
+): string {
+  // Restrict, scrub (a restrict-joined secret is matched here), restrict again (the redaction
+  // marker's `*` is outside the id alphabet), and only THEN cap, so a long secret's prefix can
+  // never survive the cut.
+  const restrict = (s: string): string => s.replace(/[^A-Za-z0-9_.:-]/g, "");
+  const part = restrict(scrub(restrict(callId))).slice(0, MAX_CALL_ID_CHARS);
   return `cx-${nonce}-t${turnOrdinal}-${part.length > 0 ? part : `n${counter}`}`;
 }
