@@ -252,7 +252,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	harness := Harness(run.Harness)
 	isReviewRun := run.ReviewTargetRunID.Valid
 	var defaultModel pgtype.Text
-	if !(harness == HarnessCodex && isReviewRun) {
+	if harness != HarnessCodex || !isReviewRun {
 		lanes, lerr := s.q.GetUserHarnessModelDefaults(ctx, run.UserID)
 		if lerr != nil {
 			return nil, fmt.Errorf("harness model defaults lookup: %w", lerr)

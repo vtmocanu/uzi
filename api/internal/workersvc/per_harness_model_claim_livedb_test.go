@@ -42,16 +42,6 @@ func (e interlockLiveDB) setUserCodexLane(t *testing.T, lane *string) {
 	e.exec(t, `UPDATE users SET default_codex_model = $2 WHERE id = $1`, e.userID, v)
 }
 
-// setUserClaudeLane sets (lane != nil) or clears (nil) the run owner's default_claude_model.
-func (e interlockLiveDB) setUserClaudeLane(t *testing.T, lane *string) {
-	t.Helper()
-	var v any
-	if lane != nil {
-		v = *lane
-	}
-	e.exec(t, `UPDATE users SET default_claude_model = $2 WHERE id = $1`, e.userID, v)
-}
-
 // seedCodexIssueRunWithModel inserts a queued Codex ISSUE run with runs.model set (nil ⇒ NULL, i.e.
 // the effective root falls to the owner's default_codex_model lane). worker_id NULL so affinity
 // never pins it; required_capabilities '{}' so fn_worker_can_claim is trivially satisfiable and the
@@ -289,6 +279,74 @@ func TestClaimCustomCodexReviewExemptLiveDB(t *testing.T) {
 		}
 		if run.ID != handoffID {
 			t.Fatalf("claimed %v, want the handoff %v", run.ID, handoffID)
+		}
+	})
+}
+
+// TestClaimCustomCodexPeerSpreadMirrorLiveDB covers the D6 peer fleet-spread MIRROR clause (the
+// `NOT (r.harness = 'codex' AND ... custom effective root ...) OR 'codex_custom_model_v1' =
+// ANY(p.protocol_capabilities)` inside ClaimRun's NOT EXISTS peer block). Fleet-aware spread
+// (PRD #216) DEFERS a queued run to a strictly-better idle peer instead of a busy claimant taking
+// it — but for a CUSTOM-ROOT Codex run that peer must ALSO advertise codex_custom_model_v1, or the
+// run would be deferred to a peer that can never claim it (the D6 claimant clause blocks the peer's
+// OWN claim), making the run permanently unclaimable by being preferred.
+//
+// The two sub-cases differ ONLY in the idle peer's codex_custom_model_v1 advertisement, isolating the
+// CUSTOM-model peer mirror from the codex-harness peer mirror: BOTH peers advertise codex_harness_v1
+// (so the harness mirror never excludes them and cannot mask this clause), and the run's effective
+// root is custom (NULL r.model + the owner's custom default_codex_model lane).
+//
+// MUTATION (peer custom-model mirror): delete the peer custom-Codex mirror clause in runtime.sql (the
+// mirrored block ending `OR 'codex_custom_model_v1' = ANY(p.protocol_capabilities)` inside the NOT
+// EXISTS peer block, near the codex_harness_v1 peer mirror) and regenerate — the incapable-peer
+// sub-case then DEFERS the custom-root run to the harness-only idle peer (ErrNoRows) instead of the
+// busy claimant claiming, and that sub-case FAILS.
+func TestClaimCustomCodexPeerSpreadMirrorLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	custom := customCodexModel
+	e.setUserCodexLane(t, &custom) // owner's Codex lane is a CUSTOM id ⇒ a NULL-model Codex run is custom-root
+
+	// A busy CAPABLE claimant: cap=2 with 1 active run, so it is NOT minimum-loaded and the spread rule
+	// CAN defer its claim to a strictly-better (idle) peer. It advertises BOTH codex_harness_v1 and
+	// codex_custom_model_v1, so neither of the claimant's OWN D3/D6 clauses blocks it — isolating the
+	// PEER clause.
+	newBusyClaimant := func() uuid.UUID {
+		me := e.seedSpreadWorker(t, []string{capability.CodexHarnessV1, capability.CodexCustomModelV1}, 2)
+		e.seedActiveRunOwnedBy(t, me)
+		return me
+	}
+	claimantCaps := []string{capability.CodexHarnessV1, capability.CodexCustomModelV1}
+
+	t.Run("harness-only idle peer is NOT a custom-root spread target; busy claimant claims", func(t *testing.T) {
+		me := newBusyClaimant()
+		// Idle, cap=2, advertises codex_harness_v1 but NOT codex_custom_model_v1: it clears the
+		// codex-harness peer mirror, so ONLY the custom-model peer mirror can exclude it.
+		e.seedSpreadWorker(t, []string{capability.CodexHarnessV1}, 2)
+		runID := e.seedCodexQueuedRun(t) // NULL model + custom lane ⇒ custom-root
+
+		run, err := e.q.ClaimRun(e.ctx, e.claimParams(me, claimantCaps, false))
+		if err != nil {
+			t.Fatalf("busy claimant must claim the custom-root Codex run — the harness-only peer cannot run a custom root and is not a valid deferral target (err=%v); the custom-model mirror clause must exclude it", err)
+		}
+		if run.ID != runID {
+			t.Fatalf("claimed %v, want %v", run.ID, runID)
+		}
+		if run.Status != "claimed" {
+			t.Fatalf("claimed run status = %q, want claimed", run.Status)
+		}
+	})
+
+	t.Run("custom-capable idle peer IS a custom-root spread target; busy claimant defers", func(t *testing.T) {
+		me := newBusyClaimant()
+		// Idle, cap=2, advertises BOTH capabilities: it can run a custom root, so it is a valid target.
+		e.seedSpreadWorker(t, []string{capability.CodexHarnessV1, capability.CodexCustomModelV1}, 2)
+		runID := e.seedCodexQueuedRun(t)
+
+		if _, err := e.q.ClaimRun(e.ctx, e.claimParams(me, claimantCaps, false)); !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatalf("busy claimant must DEFER the custom-root Codex run to the custom-capable idle peer (err=%v); the mirror clause admits a custom-capable peer as a spread target", err)
+		}
+		if s := e.runStatus(t, runID); s != "queued" {
+			t.Fatalf("deferred run must stay queued; status = %q", s)
 		}
 	})
 }
