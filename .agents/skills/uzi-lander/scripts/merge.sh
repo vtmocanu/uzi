@@ -17,7 +17,7 @@
 #                   result — the evidence merge.sh writes itself on its own merge. Exit 9 if
 #                   the PR is not MERGED yet (nothing is written or released).
 #   --method        squash (default; the convention for agent/issue-* branches) or merge
-#                   (uzi-release uses merge commits so the subject keeps the issue branch).
+#                   (rarely wanted: squash subjects carry (#PR), which the CHANGELOG cites).
 #   --no-admin      drop --admin (needs the ruleset satisfied: review + up-to-date + checks).
 #
 # Coordination: a repo-wide MERGE LOCK (<state dir>/locks/merge, 10-min TTL) serialises

@@ -86,7 +86,7 @@ if [ "$(printf '%s' "$head_repo" | tr '[:upper:]' '[:lower:]')" != "$(printf '%s
 fi
 case "$BRANCH" in
   main|master|"$BASE") echo "refusing: PR head branch is '$BRANCH'" >&2; exit 3;;
-  renovate/*) echo "refusing: '$BRANCH' is a renovate branch (renovate force-pushes it; make your own branch — see uzi-release)" >&2; exit 3;;
+  renovate/*) echo "refusing: '$BRANCH' is a renovate branch (renovate force-pushes it; make your own branch — see references/renovate.md)" >&2; exit 3;;
 esac
 log "branch=$BRANCH base=$BASE head=${HEAD0:0:8}"
 

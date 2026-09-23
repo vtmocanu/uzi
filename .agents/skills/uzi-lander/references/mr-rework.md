@@ -120,7 +120,7 @@ by anything on the PR itself.
      the existing green state, otherwise return it to triage or local handling.
 4. **When it pushed a commit, that push retriggers CodeRabbit.** Wait for the re-review on
    the **new head** (signal (c), the walkthrough `final_review_risk` block's `up to
-   <short-sha>` marker covering the new SHA — the `recent_review` range is a retired
+   SHORT_SHA` marker covering the new SHA — the `recent_review` range is a retired
    format; see `coderabbit-triage.md` and `review-signals.md`, this dir),
    confirm no active `mr_rework` remains and CI is green on that head, THEN merge.
 

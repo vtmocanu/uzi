@@ -19,11 +19,11 @@ session's job, not uzi's; that session runs `uzi-lander`.
   `uzi` verb, its `--json` envelope quirks, exit codes, and the base "Send to uzi"
   Auto-mode recipe. This skill owns the *dispatch playbook and the hazards*, and never
   restates CLI syntax the `uzi-cli` skill already carries — read exact arguments there.
-- **`uzi-lander` is the landing half; `uzi-release` the batch half.** THIS skill stops at
+- **`uzi-lander` is the landing half; `uzi-release` only cuts releases.** THIS skill stops at
   "plan approved, run running" (plus recovery when a run is lost). `uzi-lander` takes over
   any run or PR from there: review bots, CodeRabbit rate limits, uzi's `mr_rework`, local
-  fixes, rebase and migration renumbering, admin merge, post-merge CI. `uzi-release`
-  surveys the whole open-PR set, merges the batch in phase order, then cuts the release.
+  fixes, rebase and migration renumbering, admin merge, post-merge CI, and the whole
+  open-PR set in phase order (Renovate included). `uzi-release` cuts the release after.
   Review/merge/CI-watch mechanics have ONE home, `.agents/skills/uzi-lander/`; land any new
   learning there. **Cutting a release is a separate, explicitly-authorized step, never
   automatic**: a `v*` tag publishes images + chart + GitHub Release + Homebrew UNATTENDED.

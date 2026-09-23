@@ -4,7 +4,7 @@
 # are ALL terminal and none failed.
 #
 # A single PR is a batch of one (the former watch-pr-ci.sh was this script's subset and
-# was folded in). The uzi-release skill's step 1/3 routinely has to watch a whole merge
+# was folded in). Landing a batch (references/batch.md) routinely has to watch a whole merge
 # batch (e.g. several PRs re-running CI after a repo-wide-red fix on main), and a
 # single-PR watcher forces either N background tasks or a hand-rolled loop — the latter
 # is how a fragile poll loop gets written under time pressure. CI only: for
