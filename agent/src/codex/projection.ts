@@ -134,8 +134,17 @@ function scrubDeep(value: unknown, scrub: ProjectionScrub, depth = 0, path: Weak
   path.add(value);
   try {
     if (Array.isArray(value)) return value.map((v) => scrubDeep(v, scrub, depth + 1, path));
+    // defineProperty, not assignment: a JSON `"__proto__"` key stays an ordinary own key instead
+    // of re-parenting `out` (which would hide it and let inherited fields leak into the display).
     const out: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(value)) out[scrub(k)] = scrubDeep(v, scrub, depth + 1, path);
+    for (const [k, v] of Object.entries(value)) {
+      Object.defineProperty(out, scrub(k), {
+        value: scrubDeep(v, scrub, depth + 1, path),
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
+    }
     return out;
   } finally {
     path.delete(value);
@@ -199,11 +208,13 @@ export function projectToolOutput(result: CallbackResult, scrub: ProjectionScrub
 /** A bounded, scrubbed display name for a projected tool item. Control and bidi/format code
  *  points (the broker's `isUnsafeIdentifierChar` set: ESC, newline, RLO, ...) are stripped so a
  *  model-chosen name cannot rewrite a terminal or forge a log line; an empty result is
- *  "unknown". */
+ *  "unknown". The strip runs BEFORE the scrub: stripping after it would re-join a secret that a
+ *  zero-width/control char had split past the exact-substring redactor. */
 export function projectToolName(name: string | undefined, scrub: ProjectionScrub): string {
   if (name === undefined) return "unknown";
-  let safe = "";
-  for (const ch of scrub(name)) if (!isUnsafeIdentifierChar(ch.codePointAt(0) ?? 0)) safe += ch;
+  let stripped = "";
+  for (const ch of name) if (!isUnsafeIdentifierChar(ch.codePointAt(0) ?? 0)) stripped += ch;
+  const safe = scrub(stripped);
   return safe.length === 0 ? "unknown" : boundUtf8(safe, MAX_NAME_BYTES);
 }
 

@@ -117,6 +117,26 @@ describe("codex projection: tool input/output", () => {
     assert.equal(projectToolName("\u001b\u202e\n", scrub), "unknown", "all-unsafe falls back to unknown");
   });
 
+  it("a secret split by a stripped char is NOT re-joined past the scrub in the tool name", () => {
+    for (const splitter of ["\u200b", "\u001b", "\u202e", "\n"]) {
+      const name = projectToolName("mcp__x__SEKRET-" + splitter + "VALUE-42", scrub);
+      assert.ok(!name.includes("SEKRET-VALUE-42"), `re-joined via ${JSON.stringify(splitter)}: ${name}`);
+      assert.equal(name, "mcp__x__***REDACTED***");
+    }
+  });
+
+  it("a JSON __proto__ key stays an own key and cannot inject inherited display fields", () => {
+    const args = JSON.parse('{"command":"ls","__proto__":{"description":"FORGED","command":"rm"}}') as unknown;
+    const out = projectToolInput(args, scrub) as Record<string, unknown>;
+    assert.equal(out.command, "ls");
+    assert.ok(Object.prototype.hasOwnProperty.call(out, "__proto__"), "__proto__ kept as an own key");
+    assert.match(JSON.stringify(out), /"__proto__":\{"description":"FORGED"/);
+    const big = JSON.parse(`{"command":"${"x".repeat(40_000)}","__proto__":{"description":"FORGED"}}`) as unknown;
+    const bounded = projectToolInput(big, scrub) as Record<string, unknown>;
+    assert.equal(bounded.truncated, true);
+    assert.equal(bounded.description, undefined, "no inherited description on the oversized path");
+  });
+
   it("an oversized input of backslashes/quotes stays within the cap once SERIALIZED", () => {
     for (const unit of ["\\", '"', "\u0001", "\n"]) {
       const B = unit.repeat(40_000);
