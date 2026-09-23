@@ -11,7 +11,7 @@ import type { Logger } from "./log.js";
 import type { BoundaryProcessHandle, BoundaryProcessRequest } from "./harness.js";
 import { runnerCommand, runnerPath, runnerTmpdir } from "./runner-uid.js";
 import { withForgeRetry } from "./forge-retry.js";
-import { flagCIConfigPaths } from "./ci-config-guard.js";
+
 import {
   commitsScannedFromStderr,
   gitleaksArgs,
@@ -1754,7 +1754,7 @@ export class GitCache {
     // set means #377 owns this branch at finalize; ship realTip → the clean workflow-scope skip.
     const changed = await this.changedFiles(barePath, trackingRef);
     if (changed === null) return null;
-    if (flagCIConfigPaths(changed, [".github/workflows/**"]).length > 0) return null;
+    if (changed.some((file) => file.startsWith(".github/workflows/"))) return null;
 
     // Temp index + empty throwaway work-tree, both cleaned up in the finally. The work-tree is
     // required ONLY by `read-tree --prefix` (it refuses in a bare repo); WITHOUT `-u` nothing is
@@ -2067,16 +2067,83 @@ export class GitCache {
    * guard-critical paths in its MR (PRD #46). Under (b) this is a WORKER-BARE
    * tree-to-tree diff (no working tree, no runner-owned config source read): the
    * caller passes the worker-side tracking ref that fetchAgentBranch wrote, and
-   * `--name-only` fires no diff drivers. Returns null (NOT []) when the diff cannot be
-   * computed, so the caller fails CLOSED — a loud "guard-path check unavailable" note
+   * `--name-only -z` fires no diff drivers and preserves unusual path names.
+   * Returns null (NOT []) when the diff cannot be computed, so the caller fails CLOSED — a loud "guard-path check unavailable" note
    * rather than silently raising no flag on a possibly guard-touching MR (M5 audit).
    * An empty list means "computed, nothing changed".
    */
   async changedFiles(barePath: string, trackingRef: string): Promise<string[] | null> {
     try {
       const baseRef = await this.defaultBranchRef(barePath);
-      const out = await this.runGit(barePath, ["diff", "--name-only", `${baseRef}...${trackingRef}`]);
-      return out.split("\n").map((l) => l.trim()).filter((l) => l !== "");
+      const out = await this.runGit(barePath, ["diff", "--name-only", "-z", `${baseRef}...${trackingRef}`]);
+      return out.split("\0").filter(Boolean);
+    } catch {
+      return null;
+    }
+  }
+
+  /** Workflow paths touched by branch-only commits, excluding verified subtree align commits. */
+  async branchWorkflowFiles(
+    barePath: string,
+    freshDefaultTip: string,
+    trackingRef: string,
+  ): Promise<string[] | null> {
+    try {
+      if (!/^[0-9a-f]{40}$/.test(freshDefaultTip)) return null;
+      // Cap branch-only history at 256 commits; the extra commit detects truncation.
+      // Exceeding the cap returns null so the caller fails open rather than guessing.
+      const commits = (await this.runGit(barePath, [
+        "rev-list", "--max-count=257", trackingRef, `^${freshDefaultTip}`,
+      ])).trim().split("\n").filter(Boolean);
+      if (commits.length > 256) return null;
+      const paths = new Set<string>();
+      // A single octopus merge can have many parents even when the branch has few commits.
+      const maxParents = 32;
+      for (const commit of commits) {
+        const parts = (await this.runGit(barePath, ["rev-list", "--parents", "-n", "1", commit]))
+          .trim().split(" ");
+        const parents = parts.slice(1);
+        if (parents.length > maxParents) return null;
+        // A merge owns a workflow resolution only when its result differs from
+        // every parent. A clean merge merely carries one parent's workflow tree.
+        const comparisons = parents.length ? parents : ["--root"];
+        let touched: Set<string> | undefined;
+        for (const parent of comparisons) {
+          const args = parent === "--root"
+            ? ["diff-tree", "--root", "--no-commit-id", "--no-renames", "--name-only", "-z", "-r", commit]
+            : ["diff", "--no-renames", "--name-only", "-z", parent, commit];
+          const out = await this.runGit(barePath, args);
+          const changed = new Set(out.split("\0").filter((file) => file.startsWith(".github/workflows/")));
+          touched = touched === undefined ? changed : new Set([...touched].filter((file) => changed.has(file)));
+        }
+        if (!touched || touched.size === 0) continue;
+        let align = false;
+        if (parents.length === 1) {
+          const subject = (await this.runGit(barePath, ["log", "-1", "--format=%s", commit])).trim();
+          const match = /^chore: align \.github\/workflows with ([0-9a-f]{40})$/.exec(subject);
+          const named = match?.[1];
+          const parent = parents[0];
+          if (named && parent) {
+            const changed = (await this.runGit(barePath, ["diff", "--no-renames", "--name-only", "-z", parent, commit]))
+              .split("\0").filter(Boolean);
+            const freshAncestry = await this.tryGitExit(barePath, ["merge-base", "--is-ancestor", named, freshDefaultTip]);
+            const parentAncestry = await this.tryGitExit(barePath, ["merge-base", "--is-ancestor", named, parent]);
+            if ((freshAncestry !== 0 && freshAncestry !== 1) ||
+                (parentAncestry !== 0 && parentAncestry !== 1)) return null;
+            const inFreshHistory = freshAncestry === 0;
+            const inParentHistory = parentAncestry === 0;
+            // ls-tree succeeds with empty output when the default deleted the entire
+            // workflow directory; a matching deletion is a valid align.
+            const commitTree = await this.runGit(barePath, ["ls-tree", commit, "--", ".github/workflows"]);
+            const namedTree = await this.runGit(barePath, ["ls-tree", named, "--", ".github/workflows"]);
+            const treesEqual = commitTree === namedTree;
+            align = changed.length > 0 && changed.every((file) => file.startsWith(".github/workflows/")) &&
+              inFreshHistory && !inParentHistory && treesEqual;
+          }
+        }
+        if (!align) for (const file of touched) paths.add(file);
+      }
+      return [...paths].sort();
     } catch {
       return null;
     }

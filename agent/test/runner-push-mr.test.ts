@@ -711,9 +711,9 @@ describe("RunRunner — workflow-scope early fail (PRD #377 M1)", () => {
     const SYNTH_DIFF =
       "diff --git a/.github/workflows/main-guard.yml b/.github/workflows/main-guard.yml\n" +
       `+ leaked_token=${PAT}\n+on: [push]\n`;
-    git.changedFiles = (async () => [
+    git.branchWorkflowFiles = (async () => [
       ".github/workflows/main-guard.yml",
-    ]) as typeof git.changedFiles;
+    ]) as typeof git.branchWorkflowFiles;
     git.workflowScopeDiff = (async () =>
       SYNTH_DIFF) as typeof git.workflowScopeDiff;
 
@@ -779,9 +779,9 @@ describe("RunRunner — workflow-scope early fail (PRD #377 M1)", () => {
     const SYNTH_DIFF =
       "diff --git a/.github/workflows/release.yml b/.github/workflows/release.yml\n" +
       `+ leaked_token=${PAT}\n+on: [push]\n`;
-    git.changedFiles = (async () => [
+    git.branchWorkflowFiles = (async () => [
       ".github/workflows/release.yml",
-    ]) as typeof git.changedFiles;
+    ]) as typeof git.branchWorkflowFiles;
     git.workflowScopeDiff = (async () =>
       SYNTH_DIFF) as typeof git.workflowScopeDiff;
 

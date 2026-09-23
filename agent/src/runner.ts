@@ -3283,20 +3283,33 @@ export class RunRunner {
     // that preserves the agent's diff for a human to land — instead of face-planting into
     // GitHub's opaque "without workflow scope" rejection and discarding the committed work.
     // Serves every forge-pushing kind (the failed path is not issue-gated).
-    // #377 / issue #631: computed once here, reused by the base-align overlay gate below
-    // (both read changedFiles(barePath, trackingRef)); recomputed there only if this failed open.
+    // The precheck uses branch-only commits; the overlay keeps its separate conservative
+    // changedFiles guard below.
     let changedForWf: string[] | null = null;
+    let freshDefaultTip: string | undefined;
     if (claim.repo.forge_type === "github") {
       // Capture the narrowed bare path in a const the SAME way the push block does
       // (barePath is an outer `let string | undefined` and TS drops the narrowing here).
       const wfBarePath = barePath;
-      changedForWf = await this.git.changedFiles(wfBarePath, trackingRef);
+      // Fetch before the precheck so commit classification sees the current default tip.
+      try {
+        const defaultBranch = claim.repo.default_branch?.trim() ||
+          (await this.git.defaultBranchName(wfBarePath)) || "main";
+        freshDefaultTip = await this.git.fetchDefaultTip(
+          wfBarePath, defaultBranch, claim.secrets.forge_pat,
+          claim.repo.clone_url, claim.secrets.forge_username,
+        );
+        changedForWf = await this.git.branchWorkflowFiles(wfBarePath, freshDefaultTip, trackingRef);
+      } catch (e) {
+        runLog.warn("workflow precheck: could not fetch default tip; pushing normally", {
+          run_id: runId, error: errMessage(e),
+        });
+      }
       // D6: a null diff (diff-computation failure) fails OPEN to the normal push — do not
       // fail a possibly-legitimate non-workflow run on an inability to compute the diff.
-      const wfHits =
-        changedForWf === null
-          ? null
-          : flagCIConfigPaths(changedForWf, [".github/workflows/**"]);
+      const wfHits = changedForWf === null
+        ? null
+        : changedForWf.filter((file) => file.startsWith(".github/workflows/"));
       if (wfHits && wfHits.length > 0) {
         // Compose an actionable, capped failure_reason that names the offending path(s)
         // (truncating the path LIST if needed, never the doc link) and points at
@@ -3617,20 +3630,22 @@ export class RunRunner {
           claim.repo.default_branch?.trim() ||
           (await this.git.defaultBranchName(alignBarePath)) ||
           "main";
-        // Detection is best-effort (N2/D6 posture): a fetch/diff failure must NOT block a push
-        // that may well succeed (the branch may not actually be behind) — fall through to the
-        // normal push, never fail a run on an inability to compute the align target.
+        // Re-fetch immediately before alignment: default may advance after the precheck.
+        // A failed fetch leaves the align target unknown, so try the normal push.
         let defaultTip: string | undefined;
-        let differs = false;
         try {
           defaultTip = await this.git.fetchDefaultTip(
-            alignBarePath,
-            alignDefaultBranch,
-            claim.secrets.forge_pat,
-            claim.repo.clone_url,
-            claim.secrets.forge_username,
+            alignBarePath, alignDefaultBranch, claim.secrets.forge_pat,
+            claim.repo.clone_url, claim.secrets.forge_username,
           );
-          differs = await this.git.workflowTreeDiffers(
+        } catch (e) {
+          runLog.warn("finalize base-align: could not refresh default tip; pushing without aligning", {
+            run_id: runId, error: errMessage(e),
+          });
+        }
+        let differs = false;
+        try {
+          if (defaultTip) differs = await this.git.workflowTreeDiffers(
             alignBarePath,
             trackingRef,
             defaultTip,
@@ -3807,16 +3822,11 @@ export class RunRunner {
             // allowed ONLY when the diff succeeded AND the branch provably modified NO workflow
             // file. Any other case (null diff, or a real workflow edit) falls straight into the
             // EXISTING merge → rebase → preserve chain, unchanged.
-            // Issue #631: reuse the #377 guard's changedFiles result (identical barePath+trackingRef);
-            // recompute only when #377 failed open (null diff), so a transient diff failure gets a retry.
-            const alignChanged =
-              changedForWf === null
-                ? await this.git.changedFiles(alignBarePath, trackingRef)
-                : changedForWf;
-            const alignWfHits =
-              alignChanged === null
-                ? null
-                : flagCIConfigPaths(alignChanged, [".github/workflows/**"]);
+            // Keep the overlay's tree-diff guard independent of the commit-based precheck.
+            const alignChanged = await this.git.changedFiles(alignBarePath, trackingRef);
+            const alignWfHits = alignChanged === null
+              ? null
+              : alignChanged.filter((file) => file.startsWith(".github/workflows/"));
             const canOverlay =
               alignChanged !== null && alignWfHits !== null && alignWfHits.length === 0;
 
