@@ -1733,7 +1733,9 @@ export function RunView() {
   // PRD #40: usage derived client-side from the stream (Decision 5) — a pure
   // reduction re-run as messages grow, so it folds in live (Decision 9) with no
   // accumulator. Feeds the usage panel + the per-phase finish lines in the feed.
-  const usage = useMemo(() => deriveRunUsage(messages), [messages]);
+  // Pass the run's harness so deriveRunUsage honours the session_cumulative marker on
+  // Claude runs and ignores it on Codex (ADR-1562), matching the server's fold.
+  const usage = useMemo(() => deriveRunUsage(messages, { harness: run?.harness ?? null }), [messages, run?.harness]);
 
   // PRD #1064 M3 (D6): the "now" line for the milestone checklist, derived CLIENT-SIDE
   // from the live WS frames rather than the DTO, so it tracks the transcript without a

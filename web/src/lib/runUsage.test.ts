@@ -1166,3 +1166,123 @@ describe("deriveRunUsage.leadContext", () => {
     expect(d.leadContext).toBeUndefined();
   });
 });
+
+// ── Issue #1562 (ADR-1562): session_cumulative resumed legs. From Claude Agent SDK
+// 0.3.277 a resumed session's result frame reports the running SESSION total, so the
+// worker marks such frames `usage_basis: "session_cumulative"`; a marked leg RAISES the
+// per-lineage running total instead of adding to it. The cross-language contract pins the
+// fixture scenarios; these unit tests pin the marker gate (Codex ignores it), the
+// per-phase increments, and the fresh_session lineage reset.
+
+/** Add the session_cumulative marker to a result frame (the worker stamps it). */
+function markCumulative(frame: RunMessage): RunMessage {
+  return { ...frame, payload: { ...(frame.payload as Record<string, unknown>), usage_basis: "session_cumulative" } };
+}
+/** An init frame carrying `fresh_session: true` (a fresh SDK session). The plain
+ *  `initFrame` helper above emits an unflagged init. */
+function initFreshFrame(model: string): RunMessage {
+  return msg("status", "lead", { event: "init", model, fresh_session: true });
+}
+
+describe("deriveRunUsage session_cumulative (issue #1562)", () => {
+  // Two resumed cumulative legs of ONE session (lineage 0), monotonic per column.
+  function cumulativeLegs(): RunMessage[] {
+    beforeEachReset();
+    return [
+      initFreshFrame("claude-opus-5-5"),
+      markCumulative(
+        modelResultFrame(
+          "lead",
+          { "claude-opus-5-5": { input: 100, cacheRead: 1000, cacheCreation: 200, output: 500, cost: 1.0 } },
+          { turns: 1, durationMs: 1000 },
+        ),
+      ),
+      initFrame("claude-opus-5-5"),
+      markCumulative(
+        modelResultFrame(
+          "lead",
+          { "claude-opus-5-5": { input: 150, cacheRead: 1800, cacheCreation: 300, output: 900, cost: 1.7 } },
+          { turns: 1, durationMs: 1000 },
+        ),
+      ),
+    ];
+  }
+
+  it("phase 1 is leg 1 in full and later phases are the cumulative INCREMENTS", () => {
+    const d = deriveRunUsage(cumulativeLegs());
+    expect(d.phases.map((p) => p.label)).toEqual(["Plan", "Implement · iteration 1"]);
+    // Plan = leg 1's whole cumulative figure (R starts at 0).
+    expect(d.phases[0]).toMatchObject({ fresh: 300, cached: 1000, out: 500 }); // 100 input + 200 cache_creation
+    expect(d.phases[0].costUsd).toBeCloseTo(1.0, 6);
+    // Iteration 1 = only what leg 2 ADDS over the running session total (leg 2 − leg 1),
+    // never leg 2 in full — that is the over-count the pre-#1562 SUM fold produced.
+    expect(d.phases[1]).toMatchObject({ fresh: 150, cached: 800, out: 400 }); // (150-100)+(300-200), 1800-1000, 900-500
+    expect(d.phases[1].costUsd).toBeCloseTo(0.7, 6);
+    // The run total is the session high-water (leg 2), NOT the SUM of the two legs.
+    expect(d.total.out).toBe(900);
+    expect(d.total.fresh).toBe(450); // 150 input + 300 cache_creation
+    expect(d.total.costUsd).toBeCloseTo(1.7, 6);
+    const opus = d.modelTotals.find((t) => t.model === "claude-opus-5-5");
+    expect(opus).toMatchObject({ input: 150, cacheCreation: 300, cached: 1800, out: 900 });
+  });
+
+  it("IGNORES the marker on a Codex run — the same frames fold as a per-leg SUM", () => {
+    // The server ignores usage_basis on a Codex run, so the client must too: every leg
+    // folds per_leg and the legs SUM, doubling the totals of the honouring fold above.
+    const d = deriveRunUsage(cumulativeLegs(), { harness: "codex" });
+    expect(d.total.out).toBe(1400); // 500 + 900, the SUM (vs 900 when honoured)
+    expect(d.total.fresh).toBe(750); // (100+200) + (150+300)
+    expect(d.total.costUsd).toBeCloseTo(2.7, 6); // 1.0 + 1.7
+    const opus = d.modelTotals.find((t) => t.model === "claude-opus-5-5");
+    expect(opus).toMatchObject({ input: 250, cacheCreation: 500, cached: 2800, out: 1400 });
+  });
+
+  it("honours the marker for a null / claude / omitted harness alike", () => {
+    for (const opts of [undefined, { harness: null }, { harness: "claude" }] as const) {
+      const d = deriveRunUsage(cumulativeLegs(), opts);
+      expect(d.total.out, `harness=${JSON.stringify(opts)}`).toBe(900);
+    }
+  });
+
+  it("a fresh_session init that is NOT the run's first restarts the running total", () => {
+    beforeEachReset();
+    // Legs 1-2: lineage 0 (the run's first init is flagged but does NOT open a lineage).
+    // Leg 3's init is fresh_session AFTER a session began → lineage 1, totals restart low.
+    // Total = lineage-0 high-water (leg 2) + lineage-1 high-water (leg 4).
+    const messages = [
+      initFreshFrame("claude-opus-5-5"),
+      markCumulative(modelResultFrame("lead", { "claude-opus-5-5": { input: 100, cacheRead: 50_000, cacheCreation: 4_000, output: 1_000, cost: 1.5 } }, { turns: 1, durationMs: 1000 })),
+      initFrame("claude-opus-5-5"),
+      markCumulative(modelResultFrame("lead", { "claude-opus-5-5": { input: 160, cacheRead: 90_000, cacheCreation: 6_000, output: 1_800, cost: 2.25 } }, { turns: 1, durationMs: 1000 })),
+      initFreshFrame("claude-opus-5-5"),
+      markCumulative(modelResultFrame("lead", { "claude-opus-5-5": { input: 20, cacheRead: 10_000, cacheCreation: 1_500, output: 300, cost: 0.4 } }, { turns: 1, durationMs: 1000 })),
+      initFrame("claude-opus-5-5"),
+      markCumulative(modelResultFrame("lead", { "claude-opus-5-5": { input: 60, cacheRead: 30_000, cacheCreation: 2_500, output: 900, cost: 0.9 } }, { turns: 1, durationMs: 1000 })),
+    ];
+    const d = deriveRunUsage(messages);
+    const opus = d.modelTotals.find((t) => t.model === "claude-opus-5-5");
+    // lineage 0 leg-2 high-water + lineage 1 leg-4 high-water.
+    expect(opus).toMatchObject({ input: 220, cacheCreation: 8_500, cached: 120_000, out: 2_700 });
+    expect(opus?.costUsd).toBeCloseTo(3.15, 6);
+    expect(d.total.out).toBe(2_700); // NOT 4_000 (the per-leg SUM)
+  });
+
+  it("an unmarked leg followed by a marked leg in one lineage never double-counts", () => {
+    beforeEachReset();
+    // in-flight-across-deploy: legs 1-2 unmarked (add per-leg), leg 3 marked and its
+    // cumulative figure already includes legs 1-2, so it only raises R to its own value.
+    const messages = [
+      initFrame("claude-opus-5-5"),
+      modelResultFrame("lead", { "claude-opus-5-5": { input: 100, cacheRead: 40_000, cacheCreation: 3_000, output: 1_000, cost: 1.0 } }, { turns: 1, durationMs: 1000 }),
+      initFrame("claude-opus-5-5"),
+      modelResultFrame("lead", { "claude-opus-5-5": { input: 50, cacheRead: 30_000, cacheCreation: 2_000, output: 700, cost: 0.75 } }, { turns: 1, durationMs: 1000 }),
+      initFrame("claude-opus-5-5"),
+      markCumulative(modelResultFrame("lead", { "claude-opus-5-5": { input: 170, cacheRead: 80_000, cacheCreation: 5_500, output: 2_100, cost: 2.0 } }, { turns: 1, durationMs: 1000 })),
+    ];
+    const d = deriveRunUsage(messages);
+    const opus = d.modelTotals.find((t) => t.model === "claude-opus-5-5");
+    expect(opus).toMatchObject({ input: 170, cacheCreation: 5_500, cached: 80_000, out: 2_100 });
+    expect(opus?.costUsd).toBeCloseTo(2.0, 6);
+    expect(d.total.out).toBe(2_100); // NOT 3_800 (the per-leg SUM)
+  });
+});
