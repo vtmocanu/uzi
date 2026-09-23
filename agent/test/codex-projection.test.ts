@@ -259,14 +259,75 @@ describe("codex projection: persisted-path re-join (batcher normalization after 
       for (let n = 12; n <= released.length; n += 1) assert.ok(!id.includes(released.slice(0, n)), `${n}-char prefix in ${id}`);
     }
   });
+
+  // The server's display sanitizer (api runactivity `sanitize`) strips every Cc + Cf rune from the
+  // Detail/label it derives from a persisted payload: the Go-equivalent strip, applied to the
+  // persisted wire string, must not re-join a secret either.
+  const goStrip = (t: string): string => t.replace(/[\p{Cc}\p{Cf}]/gu, "");
+  const splitters: ReadonlyArray<readonly [string, string]> = [
+    ["ZWSP", "\u200b"],
+    ["soft hyphen", "\u00ad"],
+    ["CR", "\r"],
+    ["BS", "\b"],
+    ["LF", "\n"],
+  ];
+  const assertNoSecret = (wire: string, label: string): void => {
+    for (const view of [wire, goStrip(wire)]) assert.ok(!view.includes(released), `${label}: ${view.slice(0, 200)}`);
+    // JSON.parse undoes the escapes (\r, \b ...) so the per-field strip sees the raw runes, as the
+    // server's sanitizer does on each decoded display field.
+    const deep = (v: unknown): void => {
+      if (typeof v === "string") assert.ok(!goStrip(v).includes(released), `${label}: re-joined in ${JSON.stringify(v)}`);
+      else if (Array.isArray(v)) v.forEach(deep);
+      else if (v !== null && typeof v === "object")
+        for (const [k, x] of Object.entries(v)) {
+          assert.ok(!goStrip(k).includes(released), `${label}: re-joined in key ${JSON.stringify(k)}`);
+          deep(x);
+        }
+    };
+    deep(JSON.parse(wire));
+  };
+
+  for (const [label, sep] of splitters) {
+    const split = released.slice(0, 5) + sep + released.slice(5);
+
+    it(`a ${label}-split released token in tool OUTPUT is not re-joined by the persist path or the display strip`, () => {
+      const content = projectToolOutput({ ok: true, output: "file:\n" + split + "\n" }, scrub);
+      assertNoSecret(persist({ tool_use_id: "x", content, is_error: false }), `output/${label}`);
+    });
+
+    it(`a ${label}-split released token in a tool INPUT value and key is not re-joined`, () => {
+      const input = projectToolInput({ description: "run " + split, command: "echo " + split, [split]: "v" }, scrub);
+      assertNoSecret(persist({ id: "x", name: "Bash", input }), `input/${label}`);
+    });
+
+    it(`a ${label}-split released token in a child TEXT item and a child tool input is not re-joined`, () => {
+      const text = projectText("child says " + split, scrub);
+      assertNoSecret(persist({ type: "text", text }), `child text/${label}`);
+      const input = projectToolInput({ description: split, nested: [{ [split]: split }] }, scrub);
+      assertNoSecret(persist({ id: "cx-a/b", name: "Bash", input }), `child input/${label}`);
+      const output = projectOutputValue({ out: split }, scrub);
+      assertNoSecret(persist({ tool_use_id: "cx-a/b", content: output }), `child output/${label}`);
+    });
+  }
+
+  it("ordinary multi-line output with no hidden secret keeps its newlines and tabs", () => {
+    const text = "line one\n\tline two\r\nline three";
+    assert.equal(projectToolOutput({ ok: true, output: text }, scrub), text);
+    assert.equal(projectText(text, scrub), text);
+    assert.deepEqual(projectToolInput({ command: text }, scrub), { command: text });
+  });
+
+  it("an unsplit secret next to newlines is scrubbed and the newlines survive", () => {
+    assert.equal(projectText("a\n" + released + "\nb", scrub), "a\n***REDACTED***\nb");
+  });
 });
 
 describe("codex projection: delegation helpers (m2)", () => {
   const scrub = (s: string): string => s.split("SECRETTOKEN").join("***");
 
   it("childProjectedId namespaces the sanitised call id under the dispatch id, falling back to n<counter>", () => {
-    assert.equal(childProjectedId("cx-abcdef012345-t2-c-root", "cc\n<b>ash", 1), "cx-abcdef012345-t2-c-root:ccbash");
-    assert.equal(childProjectedId("cx-abcdef012345-t2-c-root", "\u0000", 4), "cx-abcdef012345-t2-c-root:n4");
+    assert.equal(childProjectedId("cx-abcdef012345-t2-c-root", "cc\n<b>ash", 1), "cx-abcdef012345-t2-c-root/ccbash");
+    assert.equal(childProjectedId("cx-abcdef012345-t2-c-root", "\u0000", 4), "cx-abcdef012345-t2-c-root/n4");
   });
 
   it("projectLabel strips unsafe chars before scrubbing, keeps an empty label empty, and bounds it", () => {

@@ -55,9 +55,23 @@ export type ProjectionScrub = (s: string) => string;
  *  surrogates replaced). The batcher re-runs that normalization at persist time, and its
  *  redactor does not know the runtime-released Codex tokens; normalizing only there would
  *  re-join a token split by NULs (e.g. UTF-16LE shell output) AFTER this scrub had missed it.
- *  Normalizing first makes the batcher's pass a no-op on projected strings. */
+ *  Normalizing first makes the batcher's pass a no-op on projected strings.
+ *
+ *  The server's display sanitizer (runactivity `sanitize`) additionally strips every control
+ *  and format code point from the Detail/label fields it derives, which would re-join a secret
+ *  split by a zero-width, soft-hyphen or control char past an exact-substring scrub. So after the
+ *  ordinary scrub, its {@link stripUnsafe} view is scrubbed too: when THAT view still hides a
+ *  secret, the stripped-and-scrubbed view is returned (its format/control chars are dropped);
+ *  otherwise the ordinary scrub is returned, so output keeps its newlines and tabs even when it
+ *  also carried an unsplit secret. */
 function cleanScrub(s: string, scrub: ProjectionScrub): string {
-  return scrub(sanitizeText(s, emptyCounts()));
+  const scrubbed = scrub(sanitizeText(s, emptyCounts()));
+  const stripped = stripUnsafe(scrubbed);
+  if (stripped !== scrubbed) {
+    const rescrubbed = scrub(stripped);
+    if (rescrubbed !== stripped) return rescrubbed;
+  }
+  return scrubbed;
 }
 
 function codePointBytes(cp: number): number {
@@ -231,10 +245,19 @@ export function projectText(text: string, scrub: ProjectionScrub): string {
   return boundJsonString(cleanScrub(text, scrub), MAX_PROJECTED_TEXT_BYTES);
 }
 
-/** Drop every control and bidi/format code point (the broker's `isUnsafeIdentifierChar` set). */
+// Unicode general category Cf (format): the broker's predicate lists the zero-width/bidi ranges,
+// but not every Cf code point (U+00AD soft hyphen, U+061C, U+180E, U+FFF9..U+FFFB, tags...).
+const FORMAT_CHAR = /\p{Cf}/u;
+
+/** Drop every control and bidi/format code point: the broker's `isUnsafeIdentifierChar` set
+ *  (C0/DEL/C1 controls incl. TAB/LF/CR, zero-width and bidi chars, U+2028/U+2029) plus every
+ *  other Cf code point, a superset of the server display sanitizer's Cc+Cf strip. */
 function stripUnsafe(s: string): string {
   let out = "";
-  for (const ch of s) if (!isUnsafeIdentifierChar(ch.codePointAt(0) ?? 0)) out += ch;
+  for (const ch of s) {
+    if (isUnsafeIdentifierChar(ch.codePointAt(0) ?? 0) || FORMAT_CHAR.test(ch)) continue;
+    out += ch;
+  }
   return out;
 }
 
@@ -277,9 +300,11 @@ export function projectedId(
 }
 
 /**
- * The id of one projected tool pair inside a delegated child: `<dispatchId>:<callIdPart>`, so
+ * The id of one projected tool pair inside a delegated child: `<dispatchId>/<callIdPart>`, so
  * every child tool id is namespaced under its dispatch (itself namespaced by harness nonce and
  * turn). The call-id part is restricted, scrubbed and capped exactly like {@link projectedId}.
+ * The `/` separator is OUTSIDE the call-id alphabet, so a child id can never equal a root id
+ * (whose call-id part may itself contain `:`).
  */
 export function childProjectedId(
   dispatchId: string,
@@ -287,7 +312,7 @@ export function childProjectedId(
   counter: number,
   scrub: ProjectionScrub = (s) => s,
 ): string {
-  return `${dispatchId}:${callIdPart(callId, counter, scrub)}`;
+  return `${dispatchId}/${callIdPart(callId, counter, scrub)}`;
 }
 
 /** The provider call id restricted to `[A-Za-z0-9_.:-]`, scrubbed and capped at 64 chars, or

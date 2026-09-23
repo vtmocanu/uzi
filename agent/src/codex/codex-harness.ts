@@ -316,14 +316,28 @@ interface ChildBinding {
   counter: number;
   readonly issuedIds: Set<string>;
   readonly openTools: Map<string, string>;
+  /** Projected child items / JSON bytes emitted so far for this dispatch (see
+   *  {@link MAX_CHILD_ITEMS_PER_DISPATCH}); `capped` once the budget was exhausted. */
+  items: number;
+  bytes: number;
+  capped: boolean;
 }
 
 /** The synthesized lead completion for a bound dispatch the run stopped (abort/stop/close). */
 const DISPATCH_STOPPED = "delegation stopped by the run; child settlement not confirmed";
 /** The synthesized lead completion for a bound dispatch still open when its turn finished. */
 const DISPATCH_OPEN_AT_TURN_END = "delegation still open at turn end; child settlement not confirmed";
+/** The synthesized lead completion for a bound dispatch whose turn stream failed (a protocol or
+ *  transport throw, e.g. an unexpected provider EOF). */
+const DISPATCH_STREAM_FAILED = "delegation ended by a provider stream failure; child settlement not confirmed";
 /** The lead tool name a dispatch is projected under (the server's milestone-lane contract). */
 const DISPATCH_TOOL_NAME = "Agent";
+/** The per-dispatch budget of projected child items and of their JSON-serialized bytes. A child
+ *  producing more (one frame with a huge part list, or many frames) gets ONE
+ *  {@link CHILD_OUTPUT_CAPPED} text item and nothing further; its lead completion is unaffected. */
+const MAX_CHILD_ITEMS_PER_DISPATCH = 2000;
+const MAX_CHILD_BYTES_PER_DISPATCH = 4 * 1024 * 1024;
+const CHILD_OUTPUT_CAPPED = "[further subagent output not shown]";
 
 // --- the harness --------------------------------------------------------------
 
@@ -525,7 +539,16 @@ export class CodexHarness implements RunHarness {
         role = "unknown";
       }
       dispatch.state = "bound";
-      this.childBindings.set(childThreadId, { dispatch, role, counter: 0, issuedIds: new Set(), openTools: new Map() });
+      this.childBindings.set(childThreadId, {
+        dispatch,
+        role,
+        counter: 0,
+        issuedIds: new Set(),
+        openTools: new Map(),
+        items: 0,
+        bytes: 0,
+        capped: false,
+      });
       this.emitProjected(
         this.leadFrame({
           kind: "tool",
@@ -550,19 +573,34 @@ export class CodexHarness implements RunHarness {
    *
    * Items are raw and projected here, so the caller never needs the scrub: text/thinking are
    * scrubbed then bounded; a tool item's `id` is the provider call id (a `started` is issued a
-   * fresh `<dispatchId>:<callId>` id, and its `finished` reuses it; a finished with no open started
+   * fresh `<dispatchId>/<callId>` id, and its `finished` reuses it; a finished with no open started
    * is dropped), its `name` the canonical tool name, its `input` the raw args and its `output` the
-   * raw output value (the broker's message on failure). Fail-safe: never throws.
+   * raw output value (the broker's message on failure).
+   *
+   * Bounded per dispatch: once {@link MAX_CHILD_ITEMS_PER_DISPATCH} items or
+   * {@link MAX_CHILD_BYTES_PER_DISPATCH} projected bytes would be exceeded (counted item by item,
+   * so one oversized frame is cut too), a single {@link CHILD_OUTPUT_CAPPED} text item is emitted
+   * and every later child item of that dispatch is dropped. The lead completion is NOT a child
+   * item and is always still emitted. Fail-safe: never throws.
    */
   emitChildFrame(childThreadId: string, items: readonly HarnessItem[]): void {
     try {
       if (!this.childSinks.has(childThreadId)) return;
       const binding = this.childBindings.get(childThreadId);
-      if (binding === undefined || binding.dispatch.state !== "bound") return;
+      if (binding === undefined || binding.dispatch.state !== "bound" || binding.capped) return;
       const projected: HarnessItem[] = [];
       for (const item of items) {
         const one = this.projectChildItem(binding, item);
-        if (one !== undefined) projected.push(one);
+        if (one === undefined) continue;
+        const size = Buffer.byteLength(JSON.stringify(one), "utf8");
+        if (binding.items + 1 > MAX_CHILD_ITEMS_PER_DISPATCH || binding.bytes + size > MAX_CHILD_BYTES_PER_DISPATCH) {
+          binding.capped = true;
+          projected.push({ kind: "text", text: CHILD_OUTPUT_CAPPED });
+          break;
+        }
+        binding.items += 1;
+        binding.bytes += size;
+        projected.push(one);
       }
       if (projected.length === 0) return;
       const { dispatch, role } = binding;
@@ -619,7 +657,7 @@ export class CodexHarness implements RunHarness {
     return { kind: "tool", phase: "finished", id, name, output, isError: item.isError === true };
   }
 
-  /** A `<dispatchId>:<callId>` id not yet issued within this child (a colliding one gets a
+  /** A `<dispatchId>/<callId>` id not yet issued within this child (a colliding one gets a
    *  `-n<counter>` suffix until unique). */
   private issueChildToolId(binding: ChildBinding, callId: string): string {
     binding.counter += 1;
@@ -793,6 +831,15 @@ export class CodexHarness implements RunHarness {
     });
   }
 
+  /** Before a stream-failure throw: give every bound dispatch of turn `ordinal` its synthesized,
+   *  unconfirmed error completion and yield the drained outbox, so the lead lane settles instead
+   *  of lingering. The caller throws AFTER this returns; a consumer that keeps pulling gets the
+   *  throw, and one that stops early (return()) simply never sees it. */
+  private *closeDispatchesOnFailure(ordinal: number): Generator<HarnessEvent> {
+    this.closeOpenDispatches(ordinal, DISPATCH_STREAM_FAILED);
+    yield* this.drainOutbox();
+  }
+
   /** Yield every queued projected event, including any queued while a yield was pending. */
   private *drainOutbox(): Generator<HarnessEvent> {
     for (let ev = this.outbox.shift(); ev !== undefined; ev = this.outbox.shift()) yield ev;
@@ -887,6 +934,7 @@ export class CodexHarness implements RunHarness {
           }
         } catch (error) {
           if (this.pendingNote === notePromise) this.pendingNote = undefined;
+          yield* this.closeDispatchesOnFailure(ordinal);
           throw error;
         }
         if (step === "aborted") {
@@ -907,6 +955,7 @@ export class CodexHarness implements RunHarness {
             yield* this.drainOutbox();
             return;
           }
+          yield* this.closeDispatchesOnFailure(ordinal);
           throw new CodexHarnessError({
             category: "protocol",
             message: "codex app-server stream ended before turn completion",
@@ -964,10 +1013,15 @@ export class CodexHarness implements RunHarness {
         // callback's started/finished pair always precedes the note's own event.
         const mappedPromise = this.mapNote(transport, step.value, request.signal);
         let mapped: HarnessEvent | "aborted" | "outbox";
-        for (;;) {
-          mapped = await Promise.race([mappedPromise, abortPromise, this.outboxReady()]);
-          if (mapped !== "outbox") break;
-          yield* this.drainOutbox();
+        try {
+          for (;;) {
+            mapped = await Promise.race([mappedPromise, abortPromise, this.outboxReady()]);
+            if (mapped !== "outbox") break;
+            yield* this.drainOutbox();
+          }
+        } catch (error) {
+          yield* this.closeDispatchesOnFailure(ordinal);
+          throw error;
         }
         if (mapped === "aborted") {
           this.endTurnOnStop();

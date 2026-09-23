@@ -1992,8 +1992,8 @@ describe("CodexHarness: delegation dispatch binding + child frames (issue #1583 
     assert.equal(child.signals, undefined);
     assert.deepEqual(child.items, [
       { kind: "text", text: "tok ***" },
-      { kind: "tool", phase: "started", id: `${dispatchId}:call1`, name: "Bash", input: { command: "cat ***" } },
-      { kind: "tool", phase: "finished", id: `${dispatchId}:call1`, name: "Bash", output: "*** out", isError: false },
+      { kind: "tool", phase: "started", id: `${dispatchId}/call1`, name: "Bash", input: { command: "cat ***" } },
+      { kind: "tool", phase: "finished", id: `${dispatchId}/call1`, name: "Bash", output: "*** out", isError: false },
     ]);
     assert.deepEqual(completion.items, [
       { kind: "tool", phase: "finished", id: dispatchId, name: "Agent", output: JSON.stringify({ text: "done" }), isError: false },
@@ -2080,6 +2080,194 @@ describe("CodexHarness: delegation dispatch binding + child frames (issue #1583 
       output: "delegation stopped by the run; child settlement not confirmed",
       isError: true,
     });
+  });
+
+  it("an unexpected EOF with a bound open dispatch yields a synthesized error completion BEFORE the protocol throw", async () => {
+    let harnessRef!: CodexHarness;
+    let bound = false;
+    const broker = stubBroker(async (rt, name) => {
+      if (name !== "spawn_agent") return { ok: true, output: {} };
+      harnessRef.registerChildSink("th-c", { push: () => {} });
+      harnessRef.bindChildDispatch("th-c", rt, "coder");
+      bound = true;
+      return new Promise<CallbackResult>(() => {});
+    });
+    const { harness, transport } = makeHarness({ broker, idNonce: "abcdef012345" });
+    harnessRef = harness;
+    transport.push(threadStarted()).push(toolCall(1, "spawn_agent", { subagent_type: "coder" }, "th-1", "tn-1", "c-1"));
+    const iter = harness.startTurn(makeRequest()).events[Symbol.asyncIterator]();
+    const seen: HarnessEvent[] = [];
+    let thrown: unknown;
+    const drive = (async (): Promise<void> => {
+      try {
+        for (let step = await iter.next(); !step.done; step = await iter.next()) seen.push(step.value);
+      } catch (error) {
+        thrown = error;
+      }
+    })();
+    await waitUntil(() => bound, "the dispatch bound");
+    transport.end(); // the provider stream ends with no turn/completed
+    await withTimeout(drive, 2000, "the EOF turn");
+
+    assert.ok(thrown instanceof CodexHarnessError, "the protocol throw still surfaces");
+    assert.equal(thrown.failure.category, "protocol");
+    assert.match(thrown.message, /ended before turn completion/);
+    const items = frames(seen).flatMap((f) => f.items);
+    assert.equal(items.length, 2, "the dispatch and its synthesized completion");
+    assert.deepEqual(items[1], {
+      kind: "tool",
+      phase: "finished",
+      id: "cx-abcdef012345-t1-c-1",
+      name: "Agent",
+      output: "delegation ended by a provider stream failure; child settlement not confirmed",
+      isError: true,
+    });
+  });
+
+  it("a stop closes a PENDING dispatch: a child start completing after the stop binds nothing and projects nothing", async () => {
+    // Dispatch c-a is bound (so the stop path yields its synthesized completion and the stream is
+    // suspended mid-drain, still live); dispatch c-b is still PENDING (its child turn/start has
+    // not completed). The child of c-b "starts" only after the stop: it must not bind.
+    let harnessRef!: CodexHarness;
+    let aBound = false;
+    let bEntered = false;
+    let bAttempted = false;
+    let releaseB!: () => void;
+    const gateB = new Promise<void>((r) => {
+      releaseB = r;
+    });
+    const broker = stubBroker(async (rt, name) => {
+      if (name !== "spawn_agent") return { ok: true, output: {} };
+      if (rt.callId === "c-a") {
+        harnessRef.registerChildSink("th-a", { push: () => {} });
+        harnessRef.bindChildDispatch("th-a", rt, "coder");
+        aBound = true;
+        return new Promise<CallbackResult>(() => {});
+      }
+      bEntered = true;
+      await gateB;
+      harnessRef.registerChildSink("th-b", { push: () => {} });
+      harnessRef.bindChildDispatch("th-b", rt, "tester");
+      harnessRef.emitChildFrame("th-b", [{ kind: "text", text: "late child text" }]);
+      bAttempted = true;
+      return { ok: true, output: { text: "late done" } };
+    });
+    const { harness, transport } = makeHarness({ broker, idNonce: "abcdef012345" });
+    harnessRef = harness;
+    transport
+      .push(threadStarted())
+      .push(toolCall(1, "spawn_agent", { subagent_type: "coder" }, "th-1", "tn-1", "c-a"))
+      .push(toolCall(2, "spawn_agent", { subagent_type: "tester" }, "th-1", "tn-1", "c-b"));
+    const turn = harness.startTurn(makeRequest());
+    const iter = turn.events[Symbol.asyncIterator]();
+    const seen: HarnessEvent[] = [];
+    // Pull (one outstanding next() at a time) until c-a is bound and c-b is in flight; the last
+    // pull stays outstanding while the stream waits for a provider note.
+    let pending = iter.next();
+    for (;;) {
+      const step = await Promise.race([pending, tick().then(() => undefined)]);
+      if (step === undefined) {
+        if (aBound && bEntered) break;
+        continue;
+      }
+      assert.ok(!step.done, "the stream ended early");
+      seen.push(step.value);
+      pending = iter.next();
+    }
+    turn.requestStop("cancel");
+    // Pull up to c-a's synthesized completion: the generator is then suspended mid-drain, live.
+    for (;;) {
+      const step = await withTimeout(pending, 2000, "the stop completion");
+      assert.ok(!step.done, "the stream ended before the stop completion");
+      seen.push(step.value);
+      if (step.value.kind === "frame" && step.value.items.some((i) => i.kind === "tool" && i.phase === "finished")) break;
+      pending = iter.next();
+    }
+    releaseB();
+    await waitUntil(() => bAttempted, "the late c-b child start");
+    for (let step = await iter.next(); !step.done; step = await iter.next()) seen.push(step.value);
+
+    const items = frames(seen).flatMap((f) => f.items);
+    assert.deepEqual(
+      items.map((i) => (i.kind === "tool" ? `${i.phase}:${i.id}` : i.kind)),
+      ["started:cx-abcdef012345-t1-c-a", "finished:cx-abcdef012345-t1-c-a"],
+      "no dispatch, child frame or completion for the pending c-b",
+    );
+    assert.ok(!frames(seen).some((f) => f.origin.kind === "subagent"), "no child frame");
+  });
+
+  it("caps projected child items per dispatch: one 'not shown' marker, later items dropped, the completion still emitted", async () => {
+    let harnessRef!: CodexHarness;
+    const broker = stubBroker(async (rt, name) => {
+      if (name !== "spawn_agent") return { ok: true, output: {} };
+      const h = harnessRef;
+      h.registerChildSink("th-c", { push: () => {} });
+      h.bindChildDispatch("th-c", rt, "coder");
+      // One frame with far more parts than the per-dispatch item budget.
+      h.emitChildFrame("th-c", Array.from({ length: 2500 }, (_, i) => ({ kind: "text" as const, text: `part ${i}` })));
+      h.emitChildFrame("th-c", [{ kind: "text", text: "after the cap" }]);
+      h.unregisterChildSink("th-c");
+      return { ok: true, output: { text: "done" } };
+    });
+    const { harness, transport } = makeHarness({ broker, idNonce: "abcdef012345" });
+    harnessRef = harness;
+    transport.push(threadStarted()).push(toolCall(1, "spawn_agent", { subagent_type: "coder" }, "th-1", "tn-1", "c-1"));
+    const eventsP = collect(harness.startTurn(makeRequest()).events);
+    await waitUntil(() => transport.responses.length === 1, "the parent reply");
+    transport.push(turnCompleted("completed")).end();
+    const events = await withTimeout(eventsP, 5000, "capped turn");
+
+    const childFrames = frames(events).filter((f) => f.origin.kind === "subagent");
+    assert.equal(childFrames.length, 1, "nothing projects after the cap");
+    const items = childFrames[0]!.items;
+    assert.equal(items.length, 2001, "2000 items plus the marker");
+    assert.deepEqual(items[1999], { kind: "text", text: "part 1999" });
+    assert.deepEqual(items[2000], { kind: "text", text: "[further subagent output not shown]" });
+    assert.deepEqual(childFrames[0]!.attribution, { agent: "coder", agentInstance: "cx-abcdef012345-t1-c-1" });
+    const completion = frames(events).flatMap((f) => f.items).find((i) => i.kind === "tool" && i.phase === "finished");
+    assert.deepEqual(completion, {
+      kind: "tool",
+      phase: "finished",
+      id: "cx-abcdef012345-t1-c-1",
+      name: "Agent",
+      output: JSON.stringify({ text: "done" }),
+      isError: false,
+    });
+  });
+
+  it("caps projected child BYTES per dispatch across frames, then emits the marker once", async () => {
+    let harnessRef!: CodexHarness;
+    const big = "a".repeat(60 * 1024);
+    const broker = stubBroker(async (rt, name) => {
+      if (name !== "spawn_agent") return { ok: true, output: {} };
+      const h = harnessRef;
+      h.registerChildSink("th-c", { push: () => {} });
+      h.bindChildDispatch("th-c", rt, "coder");
+      for (let i = 0; i < 100; i += 1) h.emitChildFrame("th-c", [{ kind: "text", text: big }]);
+      h.unregisterChildSink("th-c");
+      return { ok: true, output: { text: "done" } };
+    });
+    const { harness, transport } = makeHarness({ broker, idNonce: "abcdef012345" });
+    harnessRef = harness;
+    transport.push(threadStarted()).push(toolCall(1, "spawn_agent", { subagent_type: "coder" }, "th-1", "tn-1", "c-1"));
+    const eventsP = collect(harness.startTurn(makeRequest()).events);
+    await waitUntil(() => transport.responses.length === 1, "the parent reply");
+    transport.push(turnCompleted("completed")).end();
+    const events = await withTimeout(eventsP, 5000, "byte-capped turn");
+
+    const childItems = frames(events)
+      .filter((f) => f.origin.kind === "subagent")
+      .flatMap((f) => f.items);
+    const markers = childItems.filter((i) => i.kind === "text" && i.text === "[further subagent output not shown]");
+    assert.equal(markers.length, 1, "exactly one marker");
+    assert.equal(childItems[childItems.length - 1], markers[0], "the marker is last");
+    assert.ok(childItems.length < 100, `the byte budget cut the stream (${childItems.length} items)`);
+    const projectedBytes = childItems.slice(0, -1).reduce((n, i) => n + Buffer.byteLength(JSON.stringify(i), "utf8"), 0);
+    assert.ok(projectedBytes <= 4 * 1024 * 1024, `${projectedBytes} bytes`);
+    assert.ok(
+      frames(events).some((f) => f.items.some((i) => i.kind === "tool" && i.phase === "finished" && !i.isError)),
+      "the lead completion is still emitted",
+    );
   });
 });
 

@@ -1840,7 +1840,7 @@ describe("CodexExecutor: delegation projection (issue #1583 m2)", () => {
     const childResult = childOf("tool_result");
     const childText = childOf("text");
     assert.equal(childUse.payload.name, "Bash");
-    assert.equal(childUse.payload.id, `${String(dispatchId)}:cc-bash`, "the child tool id is namespaced under the dispatch");
+    assert.equal(childUse.payload.id, `${String(dispatchId)}/cc-bash`, "the child tool id is namespaced under the dispatch");
     assert.deepEqual(childUse.payload.input, { command: "echo child" });
     assert.equal(childResult.payload.tool_use_id, childUse.payload.id);
     assert.equal(childResult.payload.is_error, false);
@@ -2086,6 +2086,83 @@ describe("CodexExecutor: delegation projection (issue #1583 m2)", () => {
     assert.equal(emitted.filter((m) => m.kind === "tool_result").length, 0, "no completion");
     assert.equal(rec(rec(rig.transport.responses.find((r) => r.requestId === 1)?.response).result).success, false);
     assert.equal(responsesFor(rig, 1), 1);
+  });
+
+  /** The dispatch's lead completions, asserting exactly one is_error completion before the terminal. */
+  function assertOneErrorCompletion(emitted: EmittedMessage[]): void {
+    const uses = agentUses(emitted);
+    assert.equal(uses.length, 1, "one dispatch");
+    const completions = resultsFor(emitted, uses[0]!.payload.id);
+    assert.equal(completions.length, 1, "exactly one lead completion");
+    assert.equal(completions[0]!.agent, "lead");
+    assert.equal(completions[0]!.payload.is_error, true);
+    const terminal = emitted.findIndex((m) => m.kind === "status" && m.payload.event === "result");
+    assert.ok(terminal >= 0, "the terminal result was emitted");
+    assert.ok(emitted.indexOf(completions[0]!) < terminal, "the completion precedes the terminal result");
+  }
+
+  it("(m2-10) a child turn that completes FAILED gives exactly one is_error lead completion before the terminal", async () => {
+    const rig = makeRig({
+      responder: delegationResponder((t, th, tn) => {
+        t.push(agentMessage("child tried", th)).push(turnCompleted("failed", th, tn));
+      }),
+    });
+    rig.transport.push(threadStarted()).push(spawn(1, "c-root", { subagent_type: "coder", description: "[m1] fails", prompt: "p" }));
+    const { ctx, emitted } = makeCtx({ agents });
+    const runP = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    await finishRoot(rig, [1]);
+    await withTimeout(runP, 3000, "failed-child run");
+    assertOneErrorCompletion(emitted);
+    assert.match(String(resultsFor(emitted, agentUses(emitted)[0]!.payload.id)[0]!.payload.content), /child turn failed/);
+    assert.equal(responsesFor(rig, 1), 1);
+  });
+
+  it("(m2-11) a child that hits its per-child deadline (child_timeout) gives exactly one is_error lead completion before the terminal", async () => {
+    const rig = makeRig({
+      // The child starts and then never completes its turn.
+      responder: delegationResponder(() => undefined),
+    });
+    rig.deps = { ...rig.deps, childTurnDeadlineMs: 50 };
+    rig.transport.push(threadStarted()).push(spawn(1, "c-root", { subagent_type: "coder", description: "[m1] hangs", prompt: "p" }));
+    const { ctx, emitted } = makeCtx({ agents });
+    const runP = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    await finishRoot(rig, [1]);
+    await withTimeout(runP, 3000, "timed-out-child run");
+    assertOneErrorCompletion(emitted);
+    const reply = rec(rec(rig.transport.responses.find((r) => r.requestId === 1)?.response).result);
+    assert.equal(reply.success, false);
+    // The deadline is the only cancel source here (no run abort); with the rig's 5000ms default
+    // this run would not settle inside the 3000ms bound above.
+    assert.match(JSON.stringify(reply), /the delegated child was cancelled/);
+    assert.equal(responsesFor(rig, 1), 1);
+  });
+
+  it("(m2-12) an EMPTY subagent_type is skipped: the admitted role is the next non-empty key (role), never agent_type", async () => {
+    const withTester: AgentTemplate[] = [
+      ...agents,
+      { name: "tester", description: "a tester", prompt_body: "tester body", tools: null, skills: [] },
+    ];
+    const rig = makeRig({
+      responder: delegationResponder((t, th, tn) => {
+        t.push(agentMessage("coded", th)).push(turnCompleted("completed", th, tn));
+      }),
+    });
+    rig.transport
+      .push(threadStarted())
+      .push(spawn(1, "c-root", { subagent_type: "", role: "coder", agent_type: "tester", description: "[m1] which role", prompt: "p" }));
+    const { ctx, emitted } = makeCtx({ agents: withTester });
+    const runP = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    await finishRoot(rig, [1]);
+    await withTimeout(runP, 3000, "empty-subagent_type run");
+
+    const uses = agentUses(emitted);
+    assert.equal(uses.length, 1);
+    assert.deepEqual(uses[0]!.payload.input, { subagent_type: "coder", description: "[m1] which role" });
+    const text = emitted.find((m) => m.kind === "text" && m.payload.text === "coded");
+    assert.ok(text);
+    assert.equal(text.agent, "coder");
+    assert.equal(text.agentInstance, uses[0]!.payload.id);
+    assert.ok(!emitted.some((m) => m.agent === "tester"), "nothing is attributed to agent_type's role");
   });
 });
 
