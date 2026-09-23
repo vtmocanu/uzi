@@ -111,8 +111,8 @@ func TestAssembleCodexReviewClaimShipsNoModelLiveDB(t *testing.T) {
 		targetID, userID, repoID, "uzi/task/"+targetID.String())
 
 	reviewID := uuid.New()
-	env.exec(`INSERT INTO runs (id, user_id, repo_id, kind, branch, base_branch, review_target_run_id, dispatched_at, issue_title, issue_description, status, worker_id)
-	          VALUES ($1, $2, $3, 'task', $4, 'main', $5, now(), 't', 'd', 'claimed', $6)`,
+	env.exec(`INSERT INTO runs (id, user_id, repo_id, kind, branch, base_branch, review_target_run_id, dispatched_at, issue_title, issue_description, status, worker_id, harness)
+	          VALUES ($1, $2, $3, 'task', $4, 'main', $5, now(), 't', 'd', 'claimed', $6, 'codex')`,
 		reviewID, userID, repoID, "uzi/task/"+reviewID.String(), targetID, workerID)
 
 	aliasID := env.seedLinkedSubscription(t, userID, "codex-review-"+uuid.NewString(), codexToken("access"), codexToken("refresh"))
@@ -124,6 +124,9 @@ func TestAssembleCodexReviewClaimShipsNoModelLiveDB(t *testing.T) {
 	run := mustRun(t, env, reviewID)
 	if !run.ReviewTargetRunID.Valid {
 		t.Fatal("fixture review run must carry review_target_run_id")
+	}
+	if run.Harness != string(HarnessCodex) {
+		t.Fatalf("fixture review run harness = %q, want codex", run.Harness)
 	}
 	// A codex_harness_v1-ONLY worker assembles it (no codex_custom_model_v1) and it ships no model.
 	harnessOnly := store.Worker{ID: workerID, UserID: userID, ProtocolCapabilities: []string{capability.CodexHarnessV1}}
