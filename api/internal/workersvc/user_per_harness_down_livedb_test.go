@@ -14,7 +14,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// user_per_harness_down_livedb_test.go proves migration 00244's Down projection (PRD #1551
+// user_per_harness_down_livedb_test.go proves migration 00246's Down projection (PRD #1551
 // D2 / decision log 2026-09-23) across the full credential matrix, in an ISOLATED database
 // (never the shared store-IT DB). For each cell it computes the EXPECTED active lane with
 // the REAL Go resolver (ResolveSettingsHarness against the same database), THEN rolls the
@@ -66,9 +66,9 @@ func TestUserPerHarnessDownProjectionLiveDB(t *testing.T) {
 	u.Path = "/" + name
 	newDSN := u.String()
 
-	// Migrate to 244 (lanes present) so we can seed lanes and run the resolver.
-	if err := store.MigrateTo(ctx, newDSN, 244); err != nil {
-		t.Fatalf("MigrateTo(244): %v", err)
+	// Migrate to 246 (lanes present) so we can seed lanes and run the resolver.
+	if err := store.MigrateTo(ctx, newDSN, 246); err != nil {
+		t.Fatalf("MigrateTo(246): %v", err)
 	}
 	pool, err := store.OpenPool(ctx, newDSN)
 	if err != nil {
@@ -171,8 +171,8 @@ func TestUserPerHarnessDownProjectionLiveDB(t *testing.T) {
 	}
 
 	// Roll Down: project the active lane into default_model, then drop the two lanes.
-	if err := store.MigrateDownTo(ctx, newDSN, 243); err != nil {
-		t.Fatalf("MigrateDownTo(243): %v", err)
+	if err := store.MigrateDownTo(ctx, newDSN, 245); err != nil {
+		t.Fatalf("MigrateDownTo(245): %v", err)
 	}
 
 	// Prove the lanes are gone (Down actually ran its DROP).

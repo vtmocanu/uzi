@@ -17,7 +17,7 @@ import (
 
 // user_harness_models_livedb_test.go proves the PRD #1551 M1 store seam against a real
 // Postgres: the atomic grouped SetUserHarnessModels write, its all-or-nothing atomicity
-// under an injected write failure, and the additive migration 00244's Up backfill
+// under an injected write failure, and the additive migration 00246's Up backfill
 // classification. Each test stands its OWN isolated database (the appearance_backfill /
 // set_user_appearance DB-per-test pattern) so a data-migration test never migrates the
 // shared store-IT database, and the atomicity trigger cannot touch a parallel test.
@@ -243,15 +243,15 @@ func TestSetUserHarnessModelsAtomicityLiveDB(t *testing.T) {
 	}
 }
 
-// TestUserPerHarnessBackfillLiveDB proves migration 00244's Up backfill classification in an
-// isolated database standing at 243 (the version BEFORE 00244): the three curated Codex ids
+// TestUserPerHarnessBackfillLiveDB proves migration 00246's Up backfill classification in an
+// isolated database standing at 245 (the version BEFORE 00246): the three curated Codex ids
 // copy into the Codex lane, every other non-null legacy value copies into the Claude lane, a
 // NULL legacy value backfills neither lane, and default_model itself is never touched.
 func TestUserPerHarnessBackfillLiveDB(t *testing.T) {
 	ctx, dsn := standIsolatedDB(t, "harness_backfill_")
 
-	if err := store.MigrateTo(ctx, dsn, 243); err != nil {
-		t.Fatalf("MigrateTo(243): %v", err)
+	if err := store.MigrateTo(ctx, dsn, 245); err != nil {
+		t.Fatalf("MigrateTo(245): %v", err)
 	}
 	pool, err := store.OpenPool(ctx, dsn)
 	if err != nil {
@@ -265,10 +265,10 @@ func TestUserPerHarnessBackfillLiveDB(t *testing.T) {
 		`SELECT count(*) FROM information_schema.columns
 		 WHERE table_schema='public' AND table_name='users'
 		   AND column_name IN ('default_claude_model','default_codex_model')`).Scan(&cols); err != nil {
-		t.Fatalf("probe lane columns at v243: %v", err)
+		t.Fatalf("probe lane columns at v245: %v", err)
 	}
 	if cols != 0 {
-		t.Fatalf("lane columns already exist at v243 (found %d); MigrateTo(243) over-migrated", cols)
+		t.Fatalf("lane columns already exist at v245 (found %d); MigrateTo(245) over-migrated", cols)
 	}
 
 	// Seed users with a spread of legacy default_model values via RAW SQL (the generated
@@ -297,9 +297,9 @@ func TestUserPerHarnessBackfillLiveDB(t *testing.T) {
 		}
 	}
 
-	// Apply 00244.
-	if err := store.MigrateTo(ctx, dsn, 244); err != nil {
-		t.Fatalf("MigrateTo(244): %v", err)
+	// Apply 00246.
+	if err := store.MigrateTo(ctx, dsn, 246); err != nil {
+		t.Fatalf("MigrateTo(246): %v", err)
 	}
 
 	read := func(id uuid.UUID) (model, claude, codex pgtype.Text) {
