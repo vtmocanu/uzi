@@ -243,6 +243,7 @@ export function nativeApplyPatchStep(callId: string, filename = "native-marker")
  *  never mistaken for native execution. */
 export const CODEX_NATIVE_TOOL_NAMES: readonly string[] = [
   "shell",
+  "shell_command",
   "local_shell",
   "exec_command",
   "exec",

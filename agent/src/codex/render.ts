@@ -76,7 +76,7 @@ const FORGE_TOOL_NAMES = forgeToolNames();
 
 /** The initial product model picker (ADR :266). Deliberately narrower than the
  *  server catalog; an out-of-picker model is dropped with a diagnostic. */
-const CONTRACT_MODELS: ReadonlySet<string> = new Set(["gpt-6-astra", "gpt-5.6-sol"]);
+const CONTRACT_MODELS: ReadonlySet<string> = new Set(["gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol"]);
 
 /** uzi's effort contract, mapped 1:1 to Codex `modelReasoningEffort` (ADR :267).
  *  Provider-only values (`ultra`, `persistent`) are NOT in the uzi contract. */

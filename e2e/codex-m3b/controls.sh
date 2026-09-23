@@ -20,7 +20,7 @@ FILEOP=/usr/local/bin/uzi-codex-fileop
 SANDBOX=/usr/local/bin/uzi-codex-command-sandbox
 NODE=/usr/local/bin/node
 TSX=/app/node_modules/.bin/tsx
-CODEX=/opt/uzi-codex/0.153.2/bin/codex
+CODEX=/opt/uzi-codex/0.156.1/bin/codex
 EXECUTOR_SRC=/app/src/codex/codex-executor.ts
 
 PASS=0

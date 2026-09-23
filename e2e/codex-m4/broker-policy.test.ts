@@ -39,7 +39,7 @@ describe("codex U broker policy (real broker / screener / fileop)", () => {
     // native one). `write_stdin` is the retained-terminal probe; `apply_patch` bare is the native
     // freeform surface (config `apply_patch_freeform=false`) — the worker file-write is the
     // DISTINCT `uzi_apply_patch`/canonical apply_patch, not this raw native name via the broker.
-    const nativeNames = ["shell", "exec_command", "unified_exec", "write_stdin", "local_shell", "container.exec", "exec", "code_interpreter"];
+    const nativeNames = ["shell", "shell_command", "exec_command", "unified_exec", "write_stdin", "local_shell", "container.exec", "exec", "code_interpreter"];
     for (const name of nativeNames) {
       const r = await h.broker.handleToolCall(rt(), name, { command: ["/bin/sh", "-c", "touch /tmp/native"] }, "root");
       assert.equal(r.ok, false, `native "${name}" is denied`);

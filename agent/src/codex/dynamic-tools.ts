@@ -1,4 +1,4 @@
-// Pinned Codex 0.153.2 app-server dynamic-tool registration for the worker-owned
+// Pinned Codex 0.156.1 app-server dynamic-tool registration for the worker-owned
 // callback boundary. The app-server receives only the immutable grant's model-visible
 // subset. Native environments are disabled separately on every fresh thread.
 

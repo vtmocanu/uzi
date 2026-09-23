@@ -71,11 +71,11 @@ for template in "${TEMPLATES[@]}"; do
 
     printf '==> negative missing host %s × %s\n' "$template" "$arch"
     run_negative "codex-m3a-host-${template}-${arch}-$$" "$image" "$arch" \
-      'host=/opt/uzi-codex/0.153.2/bin/codex-code-mode-host; mv "$host" "$host.missing"; if bash /m3a/assert-codex.sh; then echo "missing host unexpectedly passed" >&2; exit 1; fi'
+      'host=/opt/uzi-codex/0.156.1/bin/codex-code-mode-host; mv "$host" "$host.missing"; if bash /m3a/assert-codex.sh; then echo "missing host unexpectedly passed" >&2; exit 1; fi'
 
     printf '==> negative broken binary %s × %s\n' "$template" "$arch"
     run_negative "codex-m3a-binary-${template}-${arch}-$$" "$image" "$arch" \
-      'codex=/opt/uzi-codex/0.153.2/bin/codex; printf "not-an-elf\n" > "$codex"; chmod 0755 "$codex"; if bash /m3a/assert-codex.sh; then echo "broken binary unexpectedly passed" >&2; exit 1; fi'
+      'codex=/opt/uzi-codex/0.156.1/bin/codex; printf "not-an-elf\n" > "$codex"; chmod 0755 "$codex"; if bash /m3a/assert-codex.sh; then echo "broken binary unexpectedly passed" >&2; exit 1; fi'
 
     printf 'PASS %s × linux/%s: positive + checksum + missing-host + broken-binary\n' "$template" "$arch"
     CELLS=$((CELLS + 1))

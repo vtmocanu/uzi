@@ -3,7 +3,7 @@
 // Under the SHIPPED production native-disabled template (config.ts, `shell_tool=false`,
 // `unified_exec=false`, `code_mode*=false`, `apply_patch_freeform=false`, `hooks=false`, …) and
 // NO `/etc/codex`, the model must hold NO native execution authority. The oracle is BEHAVIORAL and
-// discriminating (D4): a fake provider that FORCES a native `shell`/`exec_command`/`unified_exec`/
+// discriminating (D4): a fake provider that FORCES a native `shell`/`shell_command`/`exec_command`/`unified_exec`/
 // `write_stdin`/`local_shell` function-call and a native freeform `apply_patch` custom-tool-call
 // must produce NO worker callback and NO native side effect (no marker file, no command spawn, no
 // fileop), while the intended-model exec — the dynamic `uzi_bash` callback — DOES reach its
@@ -62,7 +62,20 @@ function leadEffectGrants(): RunGrants {
   };
 }
 
+/** One contract model per catalog `shell_type` spelling. The 0.156.1 catalog gives gpt-6-astra (and
+ *  gpt-5.6-sol) `shell_type: "unified_exec"` but gpt-6-sol `shell_type: "shell_command"` (a serde
+ *  alias of the same internal type, gated by `shell_tool = false`), so the native-disabled template
+ *  is proven for both catalog shapes, not only the default model. */
+const NATIVE_BYPASS_MODELS = ["gpt-6-astra", "gpt-6-sol"] as const;
+
 test(CODEX_P_NATIVE_ABSENT_TITLE, { skip: P_LAYER_SKIP }, async (t) => {
+  for (const model of NATIVE_BYPASS_MODELS) {
+    await nativeBypassFor(t, model);
+  }
+  recordEvidence(CODEX_P_NATIVE_ABSENT_TITLE, "pass");
+});
+
+async function nativeBypassFor(t: { diagnostic: (message: string) => void }, model: string): Promise<void> {
   const credential = dummyCredential();
   const bashArg = bashArgCanary();
 
@@ -89,9 +102,11 @@ test(CODEX_P_NATIVE_ABSENT_TITLE, { skip: P_LAYER_SKIP }, async (t) => {
     const obs = await runProtocolTurn(mods, {
       grants: leadEffectGrants(),
       credential,
+      model,
       // Force every native surface, then the intended-model worker exec (positive control), then done.
       respond: scriptedStepsResponder([
         { kind: "call", callId: "n-shell", name: "shell", args: { command: ["/bin/sh", "-c", `touch ${marker("shell")}`] } },
+        { kind: "call", callId: "n-shell-command", name: "shell_command", args: { command: `touch ${marker("shellcmd")}` } },
         { kind: "call", callId: "n-exec", name: "exec_command", args: { command: `touch ${marker("exec")}` } },
         { kind: "call", callId: "n-unified", name: "unified_exec", args: { input: `touch ${marker("unified")}` } },
         { kind: "call", callId: "n-write-stdin", name: "write_stdin", args: { data: "x" } },
@@ -105,10 +120,19 @@ test(CODEX_P_NATIVE_ABSENT_TITLE, { skip: P_LAYER_SKIP }, async (t) => {
       turnDeadlineMs: 60_000,
     });
 
-    t.diagnostic(`callbacks=${JSON.stringify(obs.callbacks.map((c) => c.tool))} (source=${obs.binSource}, ${obs.elapsedMs}ms)`);
+    t.diagnostic(`[${model}] callbacks=${JSON.stringify(obs.callbacks.map((c) => c.tool))} (source=${obs.binSource}, ${obs.elapsedMs}ms)`);
+
+    // The iteration really ran THIS model: every observed provider request names it, so a silent
+    // fallback to the default model cannot make a later iteration pass on the default's shape.
+    assert.ok(obs.providerRequests.length > 0, `[${model}] the fake provider observed real requests`);
+    assert.deepEqual(
+      [...new Set(obs.providerRequests.map((body) => (body as { model?: unknown }).model))],
+      [model],
+      `[${model}] every provider request uses the iterated model`,
+    );
 
     // NEGATIVE-EFFECT ORACLE: no native execution touched the filesystem.
-    for (const name of ["shell", "exec", "unified", "local", "patch"]) {
+    for (const name of ["shell", "shellcmd", "exec", "unified", "local", "patch"]) {
       assert.equal(existsSync(marker(name)), false, `native execution must not create ${name} marker`);
     }
     // No native call reached the worker command/file surfaces (native is NOT routed as a worker
@@ -171,12 +195,10 @@ test(CODEX_P_NATIVE_ABSENT_TITLE, { skip: P_LAYER_SKIP }, async (t) => {
     assert.equal(obs.turnStatus, "completed", "the turn completed through the allowed callback");
     assert.deepEqual(obs.providerErrors, [], "the fake provider recorded no errors");
     assert.ok(obs.elapsedMs < P_SUITE_DEADLINE_MS, `startup+turn ${obs.elapsedMs}ms under the ${P_SUITE_DEADLINE_MS}ms bound`);
-
-    recordEvidence(CODEX_P_NATIVE_ABSENT_TITLE, "pass");
   } finally {
     rmSync(markerDir, { recursive: true, force: true });
   }
-});
+}
 
 test(CODEX_P_ISOLATION_ENV_TITLE, { skip: P_LAYER_SKIP }, async (t) => {
   const credential = dummyCredential();

@@ -41,7 +41,7 @@ interface MemberSpec {
 const DEFAULT_MEMBERS: MemberSpec[] = [
   { member: "bin/codex", content: "codex-cli-binary\n", mode: 0o755 },
   { member: "bin/codex-code-mode-host", content: "code-mode-host-binary\n", mode: 0o755 },
-  { member: "codex-package.json", content: '{"version":"0.153.2"}\n', mode: 0o644 },
+  { member: "codex-package.json", content: '{"version":"0.156.1"}\n', mode: 0o644 },
   { member: "codex-path/rg", content: "ripgrep-binary\n", mode: 0o755 },
   { member: "codex-resources/bwrap", content: "bwrap-binary\n", mode: 0o755 },
   { member: "codex-resources/zsh/bin/zsh", content: "zsh-binary\n", mode: 0o755 },
@@ -131,7 +131,7 @@ describe("probeCodexRuntime — valid receipt", () => {
 
   it("uses the baked CODEX_PROBE_EXPECTATION defaults when version/lock are not overridden", async () => {
     // No expectedVersion/expectedLockDigest passed: the probe must fall back to the pinned
-    // constants (0.153.2 + this arch's lock digest) and still find + verify the fixture.
+    // constants (0.156.1 + this arch's lock digest) and still find + verify the fixture.
     const { prefix } = await buildFixture();
     const result = await probeCodexRuntime({ prefix, arch: ARCH });
     assert.strictEqual(result.capable, true, `expected capable via baked defaults, got: ${result.reason ?? ""}`);

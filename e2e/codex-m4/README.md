@@ -111,8 +111,8 @@ task test:codex-m3b:host
 task check:codex-m4-receipts
 ```
 
-`test:codex-m4` needs the pinned `codex-cli 0.153.2` package (`agent/codex/codex-package.lock`):
-either the image-baked absolute path at `/opt/uzi-codex/0.153.2`, or a rootless test-cache
+`test:codex-m4` needs the pinned `codex-cli 0.156.1` package (`agent/codex/codex-package.lock`):
+either the image-baked absolute path at `/opt/uzi-codex/0.156.1`, or a rootless test-cache
 provision via `provision.ts` (`install-codex.sh` with SHA256-verified layout) on a Linux
 contributor/CI host without the baked package. D7 point 3's strict macOS Linux-container
 invocation is now reproducibly callable: `task test:codex-m4:macos` runs

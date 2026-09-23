@@ -96,7 +96,7 @@ describe("ModelSelect label association", () => {
 
 // PRD #1429 D6: the two closed harness vocabularies. Claude keeps today's aliases
 // (defaulting harness omitted, so every pre-M4a call site is unaffected); Codex is
-// EXACTLY gpt-6-astra/gpt-5.6-sol with NO custom escape hatch.
+// EXACTLY gpt-6-astra/gpt-5.6-sol/gpt-6-sol with NO custom escape hatch.
 describe("ModelSelect — harness-scoped vocabulary (PRD #1429 D6)", () => {
   it("offers today's Claude aliases plus Other… when harness is omitted (back-compat)", () => {
     render(<Harness initial="" />);
@@ -112,10 +112,11 @@ describe("ModelSelect — harness-scoped vocabulary (PRD #1429 D6)", () => {
     expect(screen.getByRole("option", { name: /Other/ })).toBeTruthy();
   });
 
-  it("offers ONLY the two Codex models, with no custom escape hatch", () => {
+  it("offers ONLY the curated Codex models, with no custom escape hatch", () => {
     render(<Harness initial="" pickerHarness="codex" />);
     expect(screen.getByRole("option", { name: "gpt-6-astra" })).toBeTruthy();
     expect(screen.getByRole("option", { name: "gpt-5.6-sol" })).toBeTruthy();
+    expect(screen.getByRole("option", { name: "gpt-6-sol" })).toBeTruthy();
     expect(screen.getByRole("option", { name: "Inherit (account default)" })).toBeTruthy();
     expect(screen.queryByRole("option", { name: /Other/ })).toBeNull();
     // No Claude alias leaks into the Codex vocabulary.
@@ -161,9 +162,10 @@ describe("modelCompatibleWithHarness (PRD #1429 D6)", () => {
     expect(modelCompatibleWithHarness("", "codex")).toBe(true);
   });
 
-  it("codex accepts only its two curated aliases", () => {
+  it("codex accepts only its curated aliases", () => {
     expect(modelCompatibleWithHarness("gpt-6-astra", "codex")).toBe(true);
     expect(modelCompatibleWithHarness("gpt-5.6-sol", "codex")).toBe(true);
+    expect(modelCompatibleWithHarness("gpt-6-sol", "codex")).toBe(true);
     expect(modelCompatibleWithHarness("opus", "codex")).toBe(false);
     expect(modelCompatibleWithHarness("some-custom-id", "codex")).toBe(false);
   });
@@ -176,5 +178,6 @@ describe("modelCompatibleWithHarness (PRD #1429 D6)", () => {
   it("claude rejects a known Codex-only alias", () => {
     expect(modelCompatibleWithHarness("gpt-6-astra", "claude")).toBe(false);
     expect(modelCompatibleWithHarness("gpt-5.6-sol", "claude")).toBe(false);
+    expect(modelCompatibleWithHarness("gpt-6-sol", "claude")).toBe(false);
   });
 });

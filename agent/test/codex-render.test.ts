@@ -256,7 +256,7 @@ describe("renderCodexRun — model + effort contract", () => {
   });
 
   it("keeps an in-contract model and reports nothing", () => {
-    for (const model of ["gpt-6-astra", "gpt-5.6-sol"]) {
+    for (const model of ["gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol"]) {
       const run = renderCodexRun(runRequest({ model }));
       assert.equal(run.lead.model, model);
       assert.equal(run.diagnostics.length, 0);

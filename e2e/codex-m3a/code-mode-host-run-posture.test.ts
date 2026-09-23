@@ -59,7 +59,7 @@ type RunnerUidModule = typeof import("../../agent/src/runner-uid.js");
 // the module-eval skip guard AND the spec — they must equal the launcher's own pinned values so
 // its trusted-construction contract accepts the spec. Mirrors production-launcher.test.ts.
 const SUPERVISOR_BIN = process.env.M3A_SUPERVISOR_BIN ?? "/usr/local/bin/uzi-codex-supervisor";
-const CODEX_BIN = process.env.M3A_CODEX_BIN ?? "/opt/uzi-codex/0.153.2/bin/codex";
+const CODEX_BIN = process.env.M3A_CODEX_BIN ?? "/opt/uzi-codex/0.156.1/bin/codex";
 const PROVIDER_CHILD_ARGV = ["app-server"] as const;
 const DATA_BASE = process.env.M3A_DATA_BASE ?? "/data/runner";
 const MODEL = "gpt-6-astra";

@@ -113,8 +113,11 @@ import type { SessionPresence } from "../harness.js";
  *  is the first allowlist gate. */
 export const SESSION_ALLOWED_SUBDIR = "sessions";
 
-/** Allowed rollout/transcript file extensions. Pinned Codex 0.153.2 writes the
- * resumable rollout as JSONL, verified by the 2026-09-10 both-image packaged proof;
+/** Allowed rollout/transcript file extensions. Pinned Codex writes the resumable rollout as
+ * JSONL, verified on 0.153.2 by the 2026-09-10 both-image packaged proof and unchanged in
+ * 0.156.1. 0.156.1 can also write compressed `.jsonl.zst` rollouts, but only behind the
+ * default-off `local_thread_store_compression` feature or the explicit `rollout/compress` RPC,
+ * neither of which uzi uses; a `.zst` file would be EXCLUDED here (a resume then starts fresh).
  * anything else under `sessions/` is treated as uncertain and EXCLUDED. */
 export const SESSION_ALLOWED_EXTENSIONS: readonly string[] = [".jsonl"];
 
