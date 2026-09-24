@@ -1300,12 +1300,17 @@ func (s *Service) assembleJudgeClaim(ctx context.Context, wkr store.Worker, run 
 			if errors.Is(err, errVaultLocked) || errors.Is(err, errRunVanished) {
 				return nil, err
 			}
-			return nil, fmt.Errorf("%w: %w", errCredentialUnavailable, err)
+			return nil, wrapJudgeCodexClaimError(err)
 		}
 		payload.Secrets.Codex = codex
 	}
 
 	return payload, nil
+}
+
+// Preserve Codex mint sentinels and the private epoch/hash through judge assembly.
+func wrapJudgeCodexClaimError(err error) error {
+	return fmt.Errorf("%w: %w", errCredentialUnavailable, err)
 }
 
 // targetCostContext reads the reviewed run's folded cost-observability status (PRD #1429
