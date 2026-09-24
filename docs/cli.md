@@ -439,15 +439,25 @@ A few worth knowing:
   schedule), one line per skipped candidate with a human reason label
   (`not eligible`, `already running`, `description too large`, `fetch
   failed` — the raw wire reason for anything newer), and, when a capped fire
-  reached nobody, a hint to raise `--max-issues` or add the `uzi` label; a
-  never-fired schedule reads `Last fire: never fired`, and `--json` carries the
-  same detail under `.last_fire`. `run-now` prints the matching per-candidate
-  breakdown inline — a `Started N run(s)` header with the created run id(s), a
-  line per started run, then a `Matched N candidate(s), skipped K:` tally with a
-  reason label per skip (and a `# add the uzi label, or raise
-  --max-issues` hint for `not eligible`) — or `no run started` when a benign
+  reached nobody, a hint that newer eligible issues weren't reached (it no
+  longer suggests raising `--max-issues`; a label sweep filters ineligible
+  matches out of its scan window entirely, so widening the cap doesn't help a
+  thin eligible backlog). A label sweep also prints how many open issues
+  match its selector but aren't eligible (`ineligible_matched`), when known;
+  a never-fired schedule reads `Last fire: never fired`, and `--json` carries
+  the same detail under `.last_fire` (including `.last_fire.ineligible_matched`
+  when present — absent means unknown, not zero). `run-now` prints the
+  matching per-candidate breakdown inline — a `Started N run(s)` header with
+  the created run id(s), a line per started run, then a `Matched N
+  candidate(s), skipped K:` tally with a reason label per skip (`add the
+  configured uzi label or assign the issue to uzi` for `not eligible`, with no
+  `--max-issues` hint), and the same `ineligible_matched` line when a label
+  sweep reports it — or `no run started from <id>: no eligible candidates`
+  when the selector matched only ineligible issues, or the plain `no run
+  started from <id> (a matching run may already be active)` when a benign
   dedup fired none; `--json` dumps the raw response (`created`, `run_ids`,
-  `matched`, `capped`, `started`, `skips`).
+  `matched`, `capped`, `started`, `skips`, and `ineligible_matched` when
+  known).
 - **`schedule pause-all` / `resume-all` / `pause-status`** work on **every
   schedule you own, on every repo** — a user-level kill switch, distinct
   from the per-schedule `pause <id>`/`resume <id>` above, which toggles one

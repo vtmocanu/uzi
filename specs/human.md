@@ -222,6 +222,7 @@ Tracked as GitLab issue vtmocanu/uzi#22; PRD at `prds/done/22-prdless-label.md`.
 - A `prds/*.md` link is OPTIONAL — still auto-detected, implemented when present, and shown as a PRD-presence badge, but never required to start a run. (AI-synced 2026-08-29)
 - Also removed with `PRDLESS`: the `eligible_label_waives_prd_link` waiver, the `run_eligible_labels`/`board_extra_labels` sets, and the `prd_label` special-casing. `Planned`/`bug` stay sweep selectors that fire only when the issue also carries `uzi`; `autopilot` is unchanged. (AI-synced 2026-08-29)
 - (AI-synced 2026-08-29) An issue is ALSO runnable when assigned to the uzi-bot account (matched on the connection's numeric bot user id, rename-safe) — a second, equivalent expression of the same single eligibility concept, additive to the `uzi` label (PRD #767). Assignment grants eligibility ONLY; it never auto-runs (unattended execution still needs `autopilot` or an enabled sweep). uzi only reads assignees, never auto-assigns. New `assigned-sweep` default schedule fires the oldest few bot-assigned issues (auto-approve ON, like the other default sweeps).
+- (AI-synced 2026-09-24) A label sweep reaches eligible issues (`uzi`-labelled or bot-assigned) no matter how many ineligible selector matches precede them: ineligible matches never consume the per-fire scan window, and the fire reports them as one aggregate count rather than per-issue skips (#1543).
 
 ## Feature #23 — Web UX polish: live dashboard, collapsible sidebar, hide empty board columns
 

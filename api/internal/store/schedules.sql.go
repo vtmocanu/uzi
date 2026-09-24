@@ -249,9 +249,10 @@ type CountSweepCandidateIssuesRow struct {
 }
 
 // The truncation probe for the sweep fire outcome's Capped flag (PRD #308 M1), over the
-// same selector as ListSweepCandidateIssues WITHOUT the max_issues LIMIT. It is called
-// only when the schedule carries a set cap (a NULL cap can never truncate → Capped stays
-// false), so the extra count never runs on the unbounded path. @selector/@bot_id
+// same selector as ListSweepCandidateIssues WITHOUT the max_issues LIMIT. It runs for
+// every LABEL sweep (the ineligible_matched diagnostic covers the whole backlog, cap or
+// not) and for an assigned sweep only when a cap is set; Capped is derived only when a cap
+// is set (a NULL cap can never truncate). @selector/@bot_id
 // discriminate the label vs. assigned kinds exactly as in ListSweepCandidateIssues — the
 // assigned branch uses the numeric-containment form `assignee_ids @> to_jsonb(@bot_id::bigint)`
 // (NOT jsonb_exists, which is string-only), guarded by `@bot_id > 0` (PRD #767 M4/R3).

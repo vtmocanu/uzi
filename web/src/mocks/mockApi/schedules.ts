@@ -145,17 +145,20 @@ const userSchedules: Omit<
     override_subagent_model: true,
     enabled: true, status: "active", created_at: daysFromNow(-14, 9),
     updated_at: daysFromNow(-1, 2), next_fires: [],
-    // Fired on time, started nothing: the one candidate within the cap was skipped
-    // for a benign reason, and `capped` says there were older candidates behind it —
-    // the amber cell + the cap hint (Goal 2). The whole point of PRD #308.
+    // Fired on time, started nothing: the one eligible candidate within the cap was
+    // skipped for a benign reason, and `capped` says more eligible issues sit behind it —
+    // the amber cell + the cap hint (Goal 2). `ineligible_matched` (issue #1543) counts
+    // the selector-matching issues that lack the uzi label / bot assignment, which are
+    // filtered out before the scan window rather than listed as skips.
     last_fire: {
       fired_at: daysFromNow(-1, 2), matched: 1, capped: true,
+      ineligible_matched: 16,
       started: [],
       skips: [
         {
           issue_iid: 96,
           title: "Mid-run worker restart discards all un-pushed commits on resume",
-          reason: "not_eligible",
+          reason: "already_running",
           web_url: "https://gitlab.example.com/vtmocanu/uzi/-/issues/96",
         },
       ],

@@ -79,15 +79,21 @@ create-time default, not a retroactive change.
 ## Sweep cap
 
 A label sweep also has a **max issues per fire**, applied oldest issue first
-(lowest issue number). The cap counts runs **started**, not candidates
-matched: when the oldest candidate can't start — missing the `uzi` label,
-already mid-run from a previous fire, or a transient fetch error — the fire flags it
-(see [Fire outcomes](#fire-outcomes)) and walks on to the next eligible
-issue, so a stale issue at the head of the backlog no longer wastes a slot or
+(lowest issue number). Candidates are filtered down to **eligible** issues —
+carrying the configured `uzi` label, or assigned to the uzi-bot account —
+*before* the cap is applied, so an ineligible selector match (a `bug`-labeled
+issue with neither the `uzi` label nor a bot assignment) is never fetched and
+never occupies a slot; it is not a candidate at all, and the sweep's whole
+selector backlog is unaffected by how many of those precede the eligible
+ones. The cap itself still counts runs **started**, not candidates matched:
+when an eligible candidate can't start — already mid-run from a previous
+fire, or a transient fetch error — the fire flags it (see [Fire
+outcomes](#fire-outcomes)) and walks on to the next eligible issue, so a
+stale issue at the head of the eligible backlog no longer wastes a slot or
 blocks newer work. That walk is bounded by a **scan window** — the cap plus a
-fixed headroom — so one fire's cost stays predictable even when the head is a
-wall of ineligible issues; if every issue in that window is ineligible the
-fire under-fills, and each skipped issue stays flagged for you to fix. A new
+fixed headroom — so one fire's cost stays predictable even when the eligible
+backlog is thin; if the window runs out before the cap is filled the fire
+under-fills, and each skipped issue stays flagged for you to fix. A new
 sweep defaults to **10**, so one fire can't fan out across an entire label's
 backlog at once; raise it, or in the web modal blank the field for unlimited
 (today's original behavior — the CLI always sends a cap, defaulting to 10, so
@@ -242,22 +248,30 @@ which carries the `schedules_paused` skip reason.
 
 A schedule can fire right on time and still start **zero** runs — every
 candidate can be benign-skipped by the same gate a manual start goes
-through. The motivating case: a `bug` label sweep whose oldest candidates
-all lack the `uzi` label — [backfill](#sweep-cap)
-walks past them to start any runnable issue in reach, but when the whole
-scan window is `uzi`-less the fire runs every night, `Last run` keeps
+through. The motivating case: a `bug` label sweep whose oldest matches all
+lack the `uzi` label and aren't assigned to the uzi-bot — those matches are
+never eligible, so they are filtered out before the scan window is even
+cut and simply never become candidates; [backfill](#sweep-cap) then walks
+the eligible backlog to start any runnable issue in reach. When there is no
+eligible issue at all, the fire runs every night, `Last run` keeps
 advancing, and nothing ever starts. Without a fire outcome, that looks
-identical to a healthy schedule.
+identical to a healthy schedule — which is why a label sweep also reports
+`ineligible_matched` (below): how many of the selector's matches were
+filtered out, so a run of `uzi`-less issues is visible instead of silent.
 
 Each fire records how many candidates it **examined** (attempted — this can
 exceed `max_issues` once backfill walks past a skip), which ones
 **started** (paired with the run they produced), and which were
 **skipped**, each with a typed reason — never free text:
 
-- `not_eligible` — the candidate carries neither the `uzi` label nor a
-  bot assignment, so the eligibility gate refuses it. A bare selector-only
-  candidate (say, `bug` with no `uzi` and not assigned to the uzi-bot)
-  skips here; it's benign, and the schedule advances normally.
+- `not_eligible` — the candidate carried neither the `uzi` label nor a
+  bot assignment at the time it was fetched and created a run for, so
+  `createRun`'s own gate refused it. On a label sweep this is now rare: an
+  ineligible selector match is filtered out before it's ever a candidate
+  (see [Sweep cap](#sweep-cap)), so this reason only fires on a race —
+  eligibility changed between candidate selection and run creation — or on
+  a pinned-issue fire, where no upfront filter applies. It's benign, and
+  the schedule advances normally.
 - `already_running` — an active run already exists for that issue (or,
   for the schedule itself, a dedup at fire time).
 - `description_too_large` — the composed run instruction (issue body
@@ -287,10 +301,27 @@ the issue on the forge for the issues the fire actually fetched
 (started rows, and a sweep's post-fetch skip); a candidate skipped
 before it was fetched (e.g. `already_running`) shows a plain number
 instead — the CLI's `Last fire` block always prints a plain number. A
-sweep fire with more `uzi`-labeled issues than its [scan
-window](#sweep-cap) reached that still started nothing also carries the
-actionable hint — raise `max_issues` or add `uzi` to the
-issues behind it.
+capped sweep fire with more **eligible** issues than its [scan
+window](#sweep-cap) reached that still started nothing also carries a hint
+that newer eligible issues weren't reached, pointing back at the skip
+reasons above for why the candidates ahead of them were skipped — it no
+longer suggests raising `max_issues`, since a thin eligible backlog isn't
+fixed by widening the cap.
+
+A label sweep's fire also reports `ineligible_matched`: the number of open
+issues that match the sweep's selector but aren't eligible (neither
+carrying the configured `uzi` label nor assigned to the bot), counted over
+the sweep's **whole** selector backlog, not just the scan window that was
+reached. This is the diagnostic for the case above: it tells you a fire
+that started nothing (or fewer than expected) is being starved by
+`uzi`-less matches, and roughly how many there are, without waiting for
+[backfill](#sweep-cap) to walk past each one individually. It's shown in
+`uzi schedule get`'s **Last fire** block, `uzi schedule run-now`'s summary,
+and `--json` (`.last_fire.ineligible_matched` and `run-now`'s
+`ineligible_matched`). It's **absent, not zero, on a fire from before this
+count existed and on an assigned-selector sweep** (an assigned candidate is
+eligible by construction, so the count doesn't apply) — read a missing key
+as unknown, never as "no ineligible matches."
 
 Only the **last** fire is kept, and only the last *scheduled* one:
 `last_fire` is written on the same path that advances the schedule, so

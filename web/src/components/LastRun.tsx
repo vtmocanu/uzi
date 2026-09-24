@@ -121,7 +121,13 @@ function OutcomeBadge({ fire }: { fire: LastFire }) {
 // LastFireDetail is the expandable "Last fire" panel (mock §2): a header with the
 // fire timestamp + a status badge, an examined/started/skipped/max-issues tally, one
 // row per started run (linking to the run) and per skipped candidate (with its
-// typed reason), and the actionable cap hint when a capped fire started nothing.
+// typed reason), the cap hint when a capped fire started nothing, and — for a label
+// sweep (issue #1543) — the count of selector-matching issues that are not eligible.
+//
+// Since #1543 a sweep filters by eligibility (the configured uzi label OR assignment to
+// the bot) BEFORE its scan window, so selector-only issues are no longer per-candidate
+// `not_eligible` skips: they surface only as the aggregate `ineligible_matched`, and
+// `capped` means more ELIGIBLE issues sit beyond the window.
 export function LastFireDetail({ s, fire }: { s: Schedule; fire: LastFire }) {
   const { uziLabel } = useAuth();
   const good = fire.started.length > 0;
@@ -134,10 +140,23 @@ export function LastFireDetail({ s, fire }: { s: Schedule; fire: LastFire }) {
     fire.started.length === 0 &&
     fire.skips.length > 0 &&
     fire.skips.every((sk) => sk.reason === "schedules_paused");
-  // The hint that is the whole point of Goal 2: a capped fire that reached only the
-  // oldest candidate(s) and started nothing — raising the cap or labelling the head
-  // candidate is the fix. Rendered ONLY under exactly that condition.
+  // The cap hint (PRD #308 Goal 2): a capped fire whose in-window candidates were all
+  // skipped, so the newer eligible issues behind them were never tried. The copy stays
+  // generic on purpose — the skip rows above carry the actual reasons (already running,
+  // fetch failed, …), and raising the cap would not help while the head stays skipped.
+  // Rendered ONLY under exactly that condition.
   const showHint = fire.capped && fire.skips.length > 0 && fire.started.length === 0;
+  // Selector-matching issues that are not eligible (issue #1543). Absent/null is UNKNOWN
+  // (an older fire, or a non-label sweep), not zero, so only a positive count renders. It
+  // renders independently of the candidate list: a zero-candidate "matched 0" fire is
+  // exactly where it explains why nothing ran.
+  const ineligible =
+    typeof fire.ineligible_matched === "number" && fire.ineligible_matched > 0
+      ? fire.ineligible_matched
+      : 0;
+  // Anything rendered between the tally and the note (candidate rows, the paused row, the
+  // cap hint — all imply started or skips) earns the note a top margin.
+  const hasBody = fire.started.length > 0 || fire.skips.length > 0;
   return (
     <div
       className={cx(
@@ -220,11 +239,29 @@ export function LastFireDetail({ s, fire }: { s: Schedule; fire: LastFire }) {
             →
           </span>
           <div>
-            <span className="font-semibold text-fg">Nothing newer was reached.</span> max issues is{" "}
-            <span className="font-semibold text-fg">{s.max_issues ?? "—"}</span>, so only the oldest
-            candidate{fire.skips.length === 1 ? " was" : "s were"} tried. Raise the cap so the sweep
-            reaches the candidates behind them, or add the{" "}
-            <code className="rounded bg-raised px-1 text-fg">{uziLabel}</code> label so they become runnable.
+            <span className="font-semibold text-fg">Nothing newer was reached.</span> The{" "}
+            {fire.skips.length === 1 ? "candidate" : "candidates"} ahead of the newer eligible issues{" "}
+            {fire.skips.length === 1 ? "was" : "were"} skipped. See the{" "}
+            {fire.skips.length === 1 ? "reason" : "reasons"} above.
+          </div>
+        </div>
+      )}
+
+      {ineligible > 0 && (
+        <div
+          role="note"
+          className={cx(
+            "flex items-start gap-2.5 rounded-lg border border-edge bg-raised/50 px-3 py-2.5 text-[12.5px] text-muted",
+            hasBody && "mt-3.5",
+          )}
+        >
+          <div>
+            <span className="font-semibold text-fg">
+              {ineligible} open {ineligible === 1 ? "issue matches" : "issues match"}
+            </span>{" "}
+            the selector but {ineligible === 1 ? "isn't" : "aren't"} eligible. Add the{" "}
+            <code className="rounded bg-raised px-1 text-fg">{uziLabel}</code> label or assign{" "}
+            {ineligible === 1 ? "it" : "them"} to uzi to make {ineligible === 1 ? "it" : "them"} runnable.
           </div>
         </div>
       )}

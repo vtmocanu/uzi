@@ -3,7 +3,8 @@
 // LastRun (PRD #308 / PRD #1093 M4): the "Last fire" detail panel. A pause-all fire
 // (its only skip carries the schedules_paused reason) renders ONE explanatory row instead
 // of a per-candidate list; an ordinary skip fire still renders the candidate list, so the
-// pause branch is discriminating in both directions.
+// pause branch is discriminating in both directions. Issue #1543 adds the
+// ineligible_matched note and the generic (no raise-the-cap) cap-hint copy.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
@@ -91,5 +92,106 @@ describe("LastFireDetail — schedules_paused fire (PRD #1093)", () => {
     expect(screen.getByText("not eligible")).toBeTruthy();
     // ...and the pause explanatory copy does NOT appear.
     expect(screen.queryByText(/All your schedules were paused/)).toBeNull();
+  });
+});
+
+// Issue #1543: a label sweep filters by eligibility before its scan window, so
+// selector-only issues surface as the aggregate `ineligible_matched`, not as skip rows.
+// The note is selected by its role="note" handle (not its copy), so the negative
+// assertions below cannot rot into vacuity on a copy change; each negative also proves
+// the panel itself rendered.
+describe("LastFireDetail — ineligible_matched note (issue #1543)", () => {
+  const started = {
+    issue_iid: 7,
+    run_id: "77777777-0000-0000-0000-000000000000",
+    title: "an eligible one",
+    web_url: null,
+  };
+  const skip: LastFireSkip = { issue_iid: 8, title: "busy one", reason: "already_running", web_url: null };
+
+  function panelRendered() {
+    // The panel's own header + tally prove it mounted (non-vacuous negatives).
+    expect(screen.getByText("Last fire")).toBeTruthy();
+    expect(screen.getByText("examined")).toBeTruthy();
+  }
+
+  it("renders nothing for a legacy fire that predates the field", () => {
+    renderDetail({ ...fire([skip]), started: [started] });
+    panelRendered();
+    expect(screen.getByText("busy one")).toBeTruthy();
+    expect(screen.queryByRole("note")).toBeNull();
+  });
+
+  it.each([
+    ["0", 0],
+    ["null", null],
+  ])("renders nothing when ineligible_matched is %s", (_, n) => {
+    renderDetail({ ...fire([skip]), started: [started], ineligible_matched: n });
+    panelRendered();
+    expect(screen.getByText("an eligible one")).toBeTruthy();
+    expect(screen.queryByRole("note")).toBeNull();
+  });
+
+  it("renders the count and the uzi label alongside started runs and skips", () => {
+    renderDetail({ ...fire([skip]), matched: 2, started: [started], ineligible_matched: 16 });
+    const note = screen.getByRole("note");
+    expect(note.textContent).toMatch(/16 open issues match the selector but aren't eligible/);
+    expect(note.textContent).toMatch(/assign them to uzi/);
+    expect(note.querySelector("code")?.textContent).toBe("uzi");
+    // The candidate list still renders next to it.
+    expect(screen.getByText("an eligible one")).toBeTruthy();
+    expect(screen.getByText("busy one")).toBeTruthy();
+  });
+
+  it("renders for a zero-candidate fire (matched 0, no started, no skips)", () => {
+    renderDetail({
+      fired_at: "2026-09-02T02:00:00Z",
+      matched: 0,
+      capped: false,
+      started: [],
+      skips: [],
+      ineligible_matched: 16,
+    });
+    expect(screen.getByText("matched 0")).toBeTruthy();
+    expect(screen.getByRole("note").textContent).toMatch(/16 open issues match the selector/);
+  });
+
+  it("pluralizes a single ineligible issue", () => {
+    renderDetail({ ...fire([]), ineligible_matched: 1 });
+    const text = screen.getByRole("note").textContent ?? "";
+    expect(text).toMatch(/1 open issue matches the selector but isn't eligible/);
+    expect(text).toMatch(/assign it to uzi to make it runnable/);
+  });
+});
+
+describe("LastFireDetail — the cap hint copy (issue #1543)", () => {
+  function hintBox(): HTMLElement {
+    // The lead-in is the stable handle (also used by Schedules.test.tsx).
+    const lead = screen.getByText("Nothing newer was reached.");
+    return lead.closest<HTMLElement>("div.rounded-lg")!;
+  }
+
+  it("is generic: no raise-the-cap advice and no specific skip reason", () => {
+    renderDetail({
+      ...fire([
+        { issue_iid: 8, title: "busy one", reason: "already_running", web_url: null },
+        { issue_iid: 9, title: "flaky one", reason: "fetch_failed", web_url: null },
+      ]),
+      capped: true,
+    });
+    const text = hintBox().textContent ?? "";
+    expect(text).toMatch(/candidates ahead of the newer eligible issues were skipped/);
+    expect(text).toMatch(/See the reasons above/);
+    expect(text).not.toMatch(/raise the cap/i);
+    expect(text).not.toMatch(/max issues/i);
+    expect(text).not.toMatch(/already running|fetch failed|too large|not eligible/i);
+  });
+
+  it("pluralizes a single skipped head candidate", () => {
+    renderDetail({
+      ...fire([{ issue_iid: 8, title: "busy one", reason: "already_running", web_url: null }]),
+      capped: true,
+    });
+    expect(hintBox().textContent).toMatch(/The candidate ahead of the newer eligible issues was skipped\. See the reason above\./);
   });
 });

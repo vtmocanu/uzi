@@ -44,11 +44,10 @@ through `[0.52.0]`.)
   `/api/runs` no longer `LEFT JOIN`s the `run_usage_totals` view; the page's usage is now fetched separately, keyed by the page's run ids, a query shape PostgreSQL pushes to an index scan regardless of which plan it picks for the statement. `/api/usage` folds its own usage the same per-run way. See [ADR-1620](adr/1620-custom-plan-cache-mode.md) for the query-plan measurement behind the fix and the durable rule new consumers of the view must follow.
 - **A CLI request that times out now says so, instead of "cannot reach uzi" ([#1620](https://github.com/vtmocanu/uzi/issues/1620)).**
   Hitting a request deadline now reports "uzi at <url> did not respond in time (the server may be slow or unreachable): …", distinguishing a slow/overloaded server from one that's actually unreachable; the exit code is unchanged.
-
-### Fixed
-
 - **The Codex startup orphan reaper no longer strands orphans past its first 4,096 entries or 64 candidates ([#1621](https://github.com/vtmocanu/uzi/issues/1621)).**
   Both roots (command tmps in `/tmp` and the per-run cache root) are now read to their end in bounded pages within the existing five-minute pass budget, instead of stopping after the first page. The reap line gains `truncated` and `dirents_examined`, and a pass the budget cut short, or one in which a removal hit its deadline, is logged as a startup warning (orphans may remain until a later startup) without blocking the worker. Deletion stays fail-closed, unchanged.
+- **A label sweep no longer starves eligible issues behind a long run of ineligible ones ([#1543](https://github.com/vtmocanu/uzi/issues/1543)).**
+  Sweep candidates are now filtered to eligible issues (carrying the configured `uzi` label, or assigned to the uzi-bot) before the scan window is cut, so a `bug`-labeled backlog with no `uzi` label at its head no longer permanently starves the eligible issues behind it; a capped fire's hint no longer suggests raising `--max-issues`, and a label sweep now reports `ineligible_matched`, the count of selector matches that aren't eligible, over its whole backlog rather than just the scan window.
 
 ## [0.84.0] - 2026-09-20
 
