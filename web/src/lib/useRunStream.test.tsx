@@ -354,6 +354,39 @@ describe("useRunStream stale fetch after run change (issue #1430)", () => {
     expect(result.current.canSteer).toBe(true);
   });
 
+  it("an old run's submit() resolving after navigation does not fetch and show that run", async () => {
+    const submitted = deferred<{ server_side: boolean }>();
+    vi.spyOn(api, "submitRunInput").mockReturnValue(submitted.promise as ReturnType<typeof api.submitRunInput>);
+    const { result, rerender } = renderHook(({ id }) => useRunStream(id), { initialProps: { id: "run-a" } });
+    await act(async () => {
+      pending.run["run-a"][0].resolve({ run: runWith("run-a") });
+    });
+    await waitFor(() => expect(result.current.run?.id).toBe("run-a"));
+
+    // Start A's submit, then navigate to B and load it.
+    let submitting!: Promise<void>;
+    act(() => {
+      submitting = result.current.submit("approve_plan");
+    });
+    rerender({ id: "run-b" });
+    await act(async () => {
+      pending.run["run-b"][0].resolve({ run: runWith("run-b") });
+    });
+    await waitFor(() => expect(result.current.run?.id).toBe("run-b"));
+
+    // A's submit completes and calls A's refreshRun. It must not start a read of A:
+    // one started now would capture B's generation and be accepted.
+    await act(async () => {
+      submitted.resolve({ server_side: false });
+      await submitting;
+    });
+    expect(pending.run["run-a"]).toHaveLength(1);
+    await act(async () => {
+      pending.run["run-a"][1]?.resolve({ run: runWith("run-a") });
+    });
+    expect(result.current.run?.id).toBe("run-b");
+  });
+
   it("drops the first visit's read after navigating A -> B -> A (same id, older generation)", async () => {
     const { result, rerender } = renderHook(({ id }) => useRunStream(id), { initialProps: { id: "run-a" } });
     rerender({ id: "run-b" });
@@ -370,5 +403,47 @@ describe("useRunStream stale fetch after run change (issue #1430)", () => {
       pending.run["run-a"][0].resolve({ run: runWith("run-a") });
     });
     expect(result.current.run?.status).toBe("completed");
+  });
+});
+
+// Issue #1430 review: the previous run's terminal status must not leak into the next
+// run and stop its socket from reconnecting before the new run's own status arrives.
+describe("useRunStream reconnect after switching from a terminal run (issue #1430)", () => {
+  beforeEach(() => {
+    LiveSocket.last = null;
+    vi.stubGlobal("WebSocket", LiveSocket as unknown as typeof WebSocket);
+    vi.spyOn(api, "getRunMessages").mockResolvedValue({ messages: [] });
+    vi.spyOn(api, "getRunInputs").mockResolvedValue({ inputs: [] });
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it("reconnects B's socket while B's run read is still pending, after A was completed", async () => {
+    vi.spyOn(api, "getRun").mockImplementation((id: string) =>
+      id === "run-a"
+        ? Promise.resolve({ run: { ...fakeRun(), id: "run-a", status: "completed" } })
+        : new Promise(() => {}), // B's status never arrives in this test
+    );
+    const { result, rerender } = renderHook(({ id }) => useRunStream(id), { initialProps: { id: "run-a" } });
+    await waitFor(() => expect(result.current.run?.status).toBe("completed"));
+    await act(async () => {
+      LiveSocket.last!.open();
+    });
+    expect(result.current.connected).toBe(true);
+
+    rerender({ id: "run-b" });
+    const bSocket = LiveSocket.last!;
+    expect(bSocket.url).toContain("run-b");
+    // B has not opened yet: the view must not still claim A's connection.
+    expect(result.current.connected).toBe(false);
+
+    const setTimeoutSpy = vi.spyOn(window, "setTimeout");
+    act(() => {
+      bSocket.close();
+    });
+    // A's "completed" leaking into B would skip the reconnect entirely.
+    expect(setTimeoutSpy.mock.calls.some(([, ms]) => ms === 1500)).toBe(true);
   });
 });

@@ -34,7 +34,7 @@ through `[0.52.0]`.)
 - **The pipeline-watch ref-cap warning no longer repeats on every sync tick ([#1483](https://github.com/vtmocanu/uzi/issues/1483)).**
   A repo whose run branches stay over `CI_WATCH_MAX_REFS` now logs one WARN when it starts dropping branches and one INFO when it drops back under, instead of the same WARN every tick (measured at 99% of all WARN output on a busy instance). The watcher now reads one row past the cap, so a repo with exactly the cap and nothing dropped no longer warns. The admin Health tab's CI-watch check still shows the current cap status.
 - **Switching runs no longer lets the previous run's slow response overwrite the one you opened ([#1430](https://github.com/vtmocanu/uzi/issues/1430)).**
-  A run-page load (run details, message history or the follow-up queue) that was still in flight when you navigated to another run could land afterwards and briefly or persistently show the old run's data. Each load now carries the navigation it was issued for and is dropped if you have moved on, including after going back to the same run.
+  A run-page load (run details, message history or the follow-up queue) that was still in flight when you navigated to another run could land afterwards and briefly or persistently show the old run's data. Each load now carries the navigation it was issued for and is dropped if you have moved on, including after going back to the same run; an action you sent on the old run no longer reloads it into the new one. Switching away from a finished run also no longer stops the next run's live connection from reconnecting, and the live indicator resets on the switch.
 
 ## [0.84.0] - 2026-09-20
 
