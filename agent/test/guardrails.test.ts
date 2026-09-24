@@ -324,7 +324,7 @@ describe("existing denies still fire on a wired docker worker (PRD #83 B3)", () 
 // "deny reasons carry the user-facing phrase" table below reaches it too.
 describe("mass-signal guardrail (#1576)", () => {
   const MASS_SIGNAL_REASON =
-    "denied by guardrail: mass-signal kill commands (pkill, killall, fuser -k, kill of a broadcast/process-group target, or kill of PIDs enumerated by lsof/pgrep/ps/fuser) can kill the agent's own process tree; stop a background task through the harness, or kill \"$pid\" with the exact PID saved at launch";
+    "denied by guardrail: mass-signal kill commands (pkill, killall, fuser -k, kill of a broadcast/process-group target, or kill of PIDs enumerated by lsof/pgrep/ps/fuser/pidof) can kill the agent's own process tree; stop a background task through the harness, or kill \"$pid\" with the exact PID saved at launch (run it as its own command, without lsof/pgrep/ps/fuser/pidof in the same command)";
 
   const DENIED_MASS = [
     "pkill -f vite",
@@ -351,6 +351,33 @@ describe("mass-signal guardrail (#1576)", () => {
     'kill "$(ps -o pid= -g 1)"',
     "lsof -ti :3000 | xargs kill",
     "bash -c 'kill $(fuser 3000/tcp)'",
+    // Wrapper option values are skipped, not taken as the command word.
+    "lsof -ti :3000 | xargs -n 1 kill",
+    "lsof -ti :3000 | xargs -P 4 kill",
+    "sudo -u root pkill node",
+    // xargs placeholders are dynamic targets.
+    "lsof -ti :3000 | xargs -I{} kill -9 {}",
+    "lsof -ti :3000 | xargs -I % kill -9 %",
+    // Shell reserved words do not hide the command word.
+    "lsof -ti :3000 | while read p; do kill $p; done",
+    "for p in $(lsof -ti :3000); do kill -9 $p; done",
+    // Numeric targets <= 0, and padded negatives.
+    "kill -9 00",
+    "kill -9 +0",
+    'kill -9 " -1"',
+    'kill -0 " -1"',
+    // Enumerators found from tokens, so escaping does not hide them.
+    "kill $(\\lsof -t)",
+    "kill $(ls''of -t)",
+    "\\lsof -ti :3000 | xargs kill",
+    "kill $(pidof node)",
+    "pidof node | xargs kill",
+    // An unquoted backtick is a segment boundary.
+    "echo `pkill node`",
+    "x=`killall node`",
+    "skill -KILL -u runner",
+    // Pins the keep-scanning loop in screenWithDepth: the pgrep segment denies first.
+    "pid=$(pgrep node); kill $pid",
   ];
   for (const cmd of DENIED_MASS) {
     it(`denies with the mass-signal reason: ${cmd}`, () => {
@@ -372,10 +399,34 @@ describe("mass-signal guardrail (#1576)", () => {
     "kill -l",
     "fuser 3000/tcp",
     'pid=$!; sleep 1; kill "$pid"',
+    // An enumerator NAME that is not a command word is not an enumerator.
+    "kill $pid; echo ps",
+    'kill "$pid" # ps',
+    "kill $pid; cat notes/ps",
+    "kill %vite",
   ];
   for (const cmd of ALLOWED_KILLS) {
     it(`allows: ${cmd}`, () => {
       assert.strictEqual(screenBashCommand(cmd).denied, false, `expected allowed for: ${cmd}`);
+    });
+  }
+
+  it("allows docker compose ps next to kill $pid on a wired worker", () => {
+    assert.strictEqual(screenBashCommand("docker compose ps && kill $pid", [], true).denied, false);
+  });
+
+  it("keeps a prior non-ps denial reason (git push) over the mass-signal reason", () => {
+    const r = screenBashCommand("git push origin main; kill $(pgrep x)");
+    assert.strictEqual(r.denied, true);
+    assert.ok(r.reason?.includes("git push"), `unexpected reason: ${r.reason}`);
+  });
+
+  // The wrapper-value and reserved-word peels tighten every rule, not only this one.
+  for (const cmd of ["sudo -u root git push origin x", "timeout -s 9 5 git push", "if true; then git push origin x; fi"]) {
+    it(`denies git push behind a wrapper option value or reserved word: ${cmd}`, () => {
+      const r = screenBashCommand(cmd);
+      assert.strictEqual(r.denied, true, `expected denied for: ${cmd}`);
+      assert.ok(r.reason?.includes("git push"), `unexpected reason: ${r.reason}`);
     });
   }
 });
