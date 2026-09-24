@@ -131,7 +131,7 @@ func (s *Service) SyncPipelines(ctx context.Context, repoID uuid.UUID, forgeProj
 // logRefCapTransition logs a repo's pipeline watch entering or leaving the capped
 // state (issue #1483). On a busy repo being over the cap is a steady state, so a
 // per-tick line would drown every other warning; the ongoing fact lives on the
-// admin Health tab's forge.ciwatch check, which also carries the unwatched count.
+// admin Health tab's forge.ciwatch check (repos over the cap, busiest repo's count).
 // A repo's first sync that is not capped logs nothing.
 func (s *Service) logRefCapTransition(repoID uuid.UUID, maxRefs int, capped bool) {
 	s.cappedMu.Lock()
@@ -150,7 +150,7 @@ func (s *Service) logRefCapTransition(repoID uuid.UUID, maxRefs int, capped bool
 
 	switch {
 	case capped && !was:
-		slog.Warn("forgesvc: pipeline watch hit the ref cap; at least one older run branch is not watched until it clears (admin Health forge.ciwatch has the count)",
+		slog.Warn("forgesvc: pipeline watch hit the ref cap; at least one older run branch is not watched until it clears (admin Health forge.ciwatch shows the current cap status)",
 			"repo", repoID, "cap", maxRefs)
 	case !capped && was:
 		slog.Info("forgesvc: pipeline watch back under the ref cap; every eligible run branch is watched",
