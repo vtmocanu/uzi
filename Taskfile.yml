@@ -924,12 +924,13 @@ tasks:
       - ./scripts/check-e2e-driver.sh
 
   test:e2e-lib:
-    desc: hermetic regression for lib.sh's db_psql tag-strip (#1351), tally-guarded (no stack, no docker)
+    desc: hermetic regression for lib.sh's db_psql tag-strip (#1351) and its phase chokepoint (#1511), tally-guarded (no stack, no docker)
     cmds:
       # e2e/lib.test.sh extracts the real _psql_strip_tags out of e2e/lib.sh (which cannot be sourced
       # -- its top level provisions the whole stack) and drives it over stdin. It prints a mandatory
-      # `cases=N passed=N` tally and exits nonzero unless every case (>= 10) is green, so a gutted
-      # zero-case run cannot read green. Guards the psql command-tag corruption fix for scalar reads.
+      # `cases=N passed=N` tally and exits nonzero unless every case (>= 11) is green, so a gutted
+      # zero-case run cannot read green. Guards the psql command-tag corruption fix for scalar reads,
+      # and that no e2e phase invokes psql outside db_psql/db_psql_rows (#1511).
       - ./e2e/lib.test.sh
 
   test:uzi-watcher-backups:

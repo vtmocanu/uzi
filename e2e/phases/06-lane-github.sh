@@ -7,7 +7,7 @@
 # requires: -
 # provides: -
 # handoff:  -
-# mutates:  forge_connections.forge_type gitlab->github (test DB, :41); $ENVFILE+=E2E_FORGE_POLL_INTERVAL=2s,FORGE_RECONCILE_EVERY=2 (:50)+recreates api
+# mutates:  forge_connections.forge_type gitlab->github (test DB, :39); $ENVFILE+=E2E_FORGE_POLL_INTERVAL=2s,FORGE_RECONCILE_EVERY=2 (:48)+recreates api
 # restores: - (github-lane-only; runs instead of the gitlab suite, so the flip is never undone)
 # =============================================================================
 # PRD #238 M8 — the GitHub lane (UZI_E2E_FORGE=github). A FOCUSED lifecycle
@@ -36,11 +36,9 @@
 # through a live claim in this lane. See the run report.
 # =============================================================================
 say "PRD #238 M8 (GitHub lane): flip the seeded connection to github in the test DB"
-GHPGPW="$(grep '^POSTGRES_PASSWORD=' "$ENVFILE" | cut -d= -f2-)"
-gh_psql() { "${COMPOSE[@]}" exec -T -e PGPASSWORD="$GHPGPW" db psql -U uzi -d uzi -tAc "$1" | tr -d '\r\n'; }
-GHFLIP="$(gh_psql "UPDATE forge_connections SET forge_type='github' WHERE forge_type='gitlab' RETURNING id")"
+GHFLIP="$(db_psql "UPDATE forge_connections SET forge_type='github' WHERE forge_type='gitlab' RETURNING id")"
 [ -n "$GHFLIP" ] || fail "github flip updated no connection row"
-[ "$(gh_psql "SELECT forge_type FROM forge_connections")" = github ] || fail "connection is not github after the flip"
+[ "$(db_psql "SELECT forge_type FROM forge_connections")" = github ] || fail "connection is not github after the flip"
 pass "connection flipped to forge_type=github (test DB only; production dark-landing intact)"
 
 # Speed the reconcile poller and recreate the api so it rebuilds the GitHub driver

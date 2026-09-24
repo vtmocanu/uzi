@@ -25,11 +25,9 @@
 # until M6b and is validated there; it is unit-tested in forgejo_test.go today.
 # =============================================================================
 say "PRD #65 M9 (Forgejo lane): flip the seeded connection to forgejo in the test DB"
-FJPGPW="$(grep '^POSTGRES_PASSWORD=' "$ENVFILE" | cut -d= -f2-)"
-fj_psql() { "${COMPOSE[@]}" exec -T -e PGPASSWORD="$FJPGPW" db psql -U uzi -d uzi -tAc "$1" | tr -d '\r\n'; }
-FJFLIP="$(fj_psql "UPDATE forge_connections SET forge_type='forgejo' WHERE forge_type='gitlab' RETURNING id")"
+FJFLIP="$(db_psql "UPDATE forge_connections SET forge_type='forgejo' WHERE forge_type='gitlab' RETURNING id")"
 [ -n "$FJFLIP" ] || fail "forgejo flip updated no connection row"
-[ "$(fj_psql "SELECT forge_type FROM forge_connections")" = forgejo ] || fail "connection is not forgejo after the flip"
+[ "$(db_psql "SELECT forge_type FROM forge_connections")" = forgejo ] || fail "connection is not forgejo after the flip"
 pass "connection flipped to forge_type=forgejo (test DB only; production dark-landing intact)"
 
 CONN_ID="$(apiget /api/forge/connections | jq -r '.connections[0].id // empty')"
