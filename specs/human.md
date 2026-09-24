@@ -846,6 +846,20 @@ Tracked as GitHub issue vtmocanu/uzi#1594.
 - A Codex login the provider rejects (an allowlisted refresh-token rejection code, on a 400/401) surfaces to its owner as re-login required with the reason that the provider rejected it; any other refresh failure stays ambiguous and never releases or re-spends a token. (AI-synced 2026-09-24)
 - The documented way to add a Codex login is a login dedicated to uzi, isolated from the owner's everyday Codex CLI; a re-paste after a failure comes from a new isolated login. (AI-synced 2026-09-24)
 
+## Issue #1593 — A prose-only plan turn parks for the owner instead of failing
+
+Tracked as GitHub issue vtmocanu/uzi#1593.
+
+- A gated plan (or plan-revision) turn that ends with prose only — no `submit_plan`, no `ask_user`, just lead text — gets exactly one corrective nudge, resuming the same session with fixed text; no second nudge is given on the same planning attempt. [user, #1593]
+- If the nudged turn is still prose only, an attended run falls back to an attended park: a fixed, server-authored question ("Plan missing"), marked as worker/system-authored, not the lead's. [user, #1593]
+- The lead's final message is never put in the question, its header, its options, or the prompt that resumes planning after guidance — it appears only in a separate, bounded, escaped, secret-scrubbed field on a feed status card. [user, #1593]
+- The owner's only choices at that park are to give guidance (which resumes planning in the same session) or to cancel the run — there is no "revise the PRD and retry" option, because an answer cannot refresh the checked-out PRD or branch; changing the PRD means cancelling and re-dispatching. [user, #1593]
+- An answer is never plan approval: after guidance, planning still has to produce a plan, and that plan still goes through the ordinary approval gate. [user, #1593]
+- The existing `awaiting_input` answer deadline (`QUESTION_TIMEOUT_SECONDS`) applies unchanged, and an unanswered attended run timing out is the intended outcome here, not a special case. [user, #1593]
+- An unattended run (autopilot, or otherwise with no one to ask) never parks a second time: it fails closed with the distinct fail_origin `plan_missing` and a fixed `failure_reason`. [user, #1593]
+- Nothing is ever inferred from the lead's prose — it never becomes a plan, a question, or part of a later prompt. [user, #1593]
+- `plan_missing` is judge-eligible (an agent defect, not an environment-caused failure), unlike the #1418 landing-bucket origins. (AI-synced 2026-09-24)
+
 ## Startup admin seed
 
 - Seed an admin user from env at startup (`UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME`) so the user survives DB wipes.

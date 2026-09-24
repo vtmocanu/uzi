@@ -1,7 +1,7 @@
 // failOriginLabel maps a run's typed fail_origin to a human label for the dashboard's
-// "Top causes" line (PRD #1293 M2). The keys are the closed failorigin.go vocabulary
-// (server-coerced; the CHECK last widened in migration 00235) plus "unknown", which the
-// API keys a NULL fail_origin as (rows failed before the column existed, pre-00126).
+// "Top causes" line (PRD #1293 M2). The keys track the closed failorigin.go vocabulary
+// (server-coerced, and mirrored by the runs.fail_origin CHECK constraint) plus "unknown",
+// which the API keys a NULL fail_origin as (rows failed before the column existed).
 //
 // Forward-compatible by design: a future migration can widen the vocabulary before this
 // map knows the key, so an unrecognised origin renders with its raw name rather than being
@@ -21,6 +21,7 @@ const labels: Record<string, string> = {
   push_secret_blocked: "push secret blocked",
   forge_unreachable: "forge unreachable",
   history_rewritten: "history rewritten",
+  plan_missing: "plan missing",
   unknown: "unknown",
 };
 
