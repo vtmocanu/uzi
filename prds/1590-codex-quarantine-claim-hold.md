@@ -2,11 +2,11 @@
 
 **Issue:** [#1590](https://github.com/vtmocanu/uzi/issues/1590)
 
-**Status:** M1 in progress (2026-09-24). Part of M2 landed with it (the ClaimRun gate, its peer mirror, and both timer promoters skipping the new cause). The rest of M2 (amendment A1's gate case, the sweeper park, the health projection and the behaviour tests) is implemented on the branch and awaits review. M3's account-driven promoter, which must ship in the same MR as M1 (without it a `codex_account_unavailable` run has no automatic way back to `queued`), is implemented on the branch and awaits review. M4 (D5 re-admission and the promoter's terminal exits) is implemented on the branch and awaits review; M5–M7 are pending.
+**Status:** M1–M5 implemented on the branch `agent/issue-1590`, pending review (2026-09-24); M6 (docs, specs, ADR) in progress; M7 (hosted acceptance) pending. The milestone checkboxes stay unticked until the lead confirms each against its evidence.
 
 **Priority:** High
 
-**Related:** #1532 / PR #1538 (the always-on Codex refresh survivor pass), [PRD #1392](1392-forge-unreachable-preclone-park.md) (the typed `recovery_wait` park this PRD extends), [PRD #1349](1349-recovery-custody-hardening.md) (recovery custody), [PRD #1147](done/1147-codex-credentials-foundation.md) (Codex credentials, coordinated refresh and quarantine).
+**Related:** #1532 / PR #1538 (the always-on Codex refresh survivor pass), [PRD #1392](1392-forge-unreachable-preclone-park.md) (the typed `recovery_wait` park this PRD extends), [PRD #1349](1349-recovery-custody-hardening.md) (recovery custody), [PRD #1147](done/1147-codex-credentials-foundation.md) (Codex credentials, coordinated refresh and quarantine). ADR: [`adr/1590-codex-binding-same-identity-readmission.md`](../adr/1590-codex-binding-same-identity-readmission.md) (D1, D4 and D5: the write-once binding relaxation and its fences).
 
 Use current `main` and a short-lived worktree. Never switch the `main/` worktree away from `main`. This PRD changes no file under `.github/workflows/`, in either its implementation or its validation.
 
@@ -318,10 +318,15 @@ Each milestone ends green on `task gate:api`, plus `task gate:web` for M5 and `t
   - The derived `codex_account_action` (D6) in the DTO and the api-contract fixture.
   - A web `RecoveryWaitPanel` branch with the settings link, CLI `run get` and `run list` rendering, and TUI rows (`renderer.Plain` for the label, per `.claude/rules/tui.md`).
   - Tests per surface, including one per action string.
+  - As built (not ticked, pending review):
+    - TUI: a `relogin_required` hold is the owner's turn, so it bands into NEEDS YOU on the board, and its state token reads "⚿ codex login" (`tui_render.go`). The board header gains a ⚿ counter of such holds (`boardSummary`, `tui_board.go`). Every other Codex hold (reconciling, verifying the login, resuming) resolves without the owner and stays ON THE FLOOR (`runBandOf`).
+    - CLI: the `uzi run list` / `uzi admin runs` STATUS cell appends a short, label-free form of the action (`codexAccountActionShort`, `api/cmd/uzi/run_render.go`), so one held run's user-authored alias label cannot widen the column for every row. `uzi run get` shows the full labelled line (`codexAccountActionLine`) on its own row.
+    - Web: the `RecoveryWaitPanel` branch announces the hold with one sentence per action (`codexHoldCopy`, `web/src/pages/RunView.tsx`), so a transition such as verifying_login → resuming is announced rather than silent.
 - [ ] **M6: Docs and specs.** Depends on M1-M5.
   - A "Codex account unavailable" section in `docs/run-recovery-wait.md` covering reason strings, owner actions and no expiry, then `task docs:sync`.
   - A `specs/human.md` entry.
-  - An ADR for D1, D4 and D5 (the write-once binding relaxation and its fences), named for this issue number. Do not backtick its path until the file exists.
+  - An ADR for D1, D4 and D5 (the write-once binding relaxation and its fences), named for this issue number.
+    - Written: [`adr/1590-codex-binding-same-identity-readmission.md`](../adr/1590-codex-binding-same-identity-readmission.md). It covers the hold class, the source-holder affinity preference, the `ReadmitRunCodexBinding` fences including the exact-key fence, the run → alias → account lock order with `NOWAIT`, and the rule that a re-admission commits only together with its promotion.
   - `task check-docs:web`.
 - [ ] **M7: Acceptance on hosted k8s (maintainer).** On the first deployed release candidate carrying M1-M6 (the dev cluster auto-tracks RC charts). The PRD is not marked done, or moved to `prds/done/`, until M7 passes; local gates alone do not complete it.
   - Reproduce with a test account on the dev cluster: force a quarantine (for example, deny provider egress during a boundary refresh), evict or roll the worker, then check that:

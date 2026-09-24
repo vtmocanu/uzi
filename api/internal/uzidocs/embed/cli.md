@@ -1067,10 +1067,16 @@ A newer release is available.
   rules. The list windows to the terminal height so the wordmark and key
   legend stay on screen however many runs there are, with the visible run
   span (`lo–hi`) and a rounded floor total shown in the top-right summary
-  cluster (`⚑ N · ✎ N · ▲ N · $N · T runs`) — the total is the sum of every
+  cluster (`⚑ N · ✎ N · ➤ N · ⚿ N · ▲ N · $N · T runs`) — the total is the sum of every
   usage-bearing run's cost, rounded from the raw sum rather than added up
   from the visible per-row cells (so the two won't always visibly agree —
-  the total is the accurate figure), and it's dropped when zero. The whole
+  the total is the accurate figure), and it's dropped when zero. Each
+  segment is dropped when its count is zero, so a healthy factory reads
+  simply `N runs`: `⚑` is the plan gate, `✎` a clarifying question, `➤` an
+  interactive task waiting on your next follow-up, `⚿` a Codex run needing
+  you to log in again (see [Codex account
+  unavailable](run-recovery-wait.md#codex-account-unavailable)), and `▲` a
+  stalled/looping/near-timeout run. The whole
   board refreshes on the poll, so status, health, milestones, age, cost and
   the judge verdict stay live. **A locked vault gets its own line** beside
   the per-token rate-limit strip under the wordmark — the strip is never
@@ -1736,7 +1742,11 @@ A run's `status` (on `run get` and `run list`) is one of exactly **thirteen** va
 - `recovery_wait` — parked to recover from a resumed turn that came back empty
   (no model activity) or hit a transient provider error; the sweep auto-resumes
   it on a capped backoff until it recovers or you cancel it — see [Recovering
-  from a transient interruption](run-recovery-wait.md).
+  from a transient interruption](run-recovery-wait.md). A Codex subscription
+  run can also park here because its account is quarantined or needs a fresh
+  login (cause `codex_account_unavailable`); unlike the timed parks above it
+  has no backoff or cap and resumes only when the account does — see [Codex
+  account unavailable](run-recovery-wait.md#codex-account-unavailable).
 - `paused`: an owner-requested hold (`uzi run pause`), resumed on demand from
   the run page or `uzi run resume <id>`. See [Pausing and resuming a
   run](run-pause.md). It does **not** auto-resume. A `paused` run can instead
