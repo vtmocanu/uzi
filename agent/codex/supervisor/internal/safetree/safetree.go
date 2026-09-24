@@ -35,7 +35,8 @@
 // /proc that is not procfs. If the magic link cannot be resolved (no /proc)
 // the chmod fails and the walk stops with ErrIO. Remove reports ErrNotExist
 // only when the root's first O_PATH open finds no entry; the root vanishing
-// after that is ErrMismatch.
+// after that (between the two opens, at the recheck, or before its rmdir) is
+// ErrMismatch, because a verified root that disappeared was moved, not removed.
 //
 // Every entry is lstat'ed (fstatat AT_SYMLINK_NOFOLLOW), must sit on the pinned
 // root's filesystem (st_dev == Pin.Dev), and must be owned by the pinned uid; a
@@ -49,11 +50,15 @@
 // the name it just mkdirat'ed with the same two steps but restores no bits: a
 // directory that is not owned by uid, lacks any owner rwx bit (mkdirat asked
 // for 0700), or is not empty (getdents shows more than "." and "..") is
-// rejected, so a peer that exchanged its own directory into the name between
-// the mkdirat and the open gets neither a pin nor a chmod on it (ErrMismatch,
-// or ErrOwner for a foreign owner). Only after those checks pass does Create
-// fchmod the directory to exactly 0700. A umask that strips owner bits from
-// the mkdirat therefore also makes Create fail.
+// rejected, so a peer that exchanged a NON-EMPTY directory, or one lacking
+// owner rwx, into the name between the mkdirat and the open gets neither a pin
+// nor a chmod on it (ErrMismatch, or ErrOwner for a foreign owner). An EMPTY
+// same-uid directory with owner rwx is indistinguishable from the one Create
+// made and is accepted (pinned, then fchmod'ed to 0700): the peer gains nothing
+// it could not do by opening the real directory after Create returns. Only
+// after those checks pass does Create fchmod the directory to exactly 0700. A
+// umask that strips owner bits from the mkdirat therefore also makes Create
+// fail.
 //
 // # Documented residual
 //
@@ -64,7 +69,8 @@
 // verified. It can never make Remove follow a link or chmod an unverified inode:
 // every open is O_NOFOLLOW, every chmod goes through an fd whose identity and
 // owner were checked first (Create's only after the emptiness check too), and
-// rmdir refuses a non-empty directory.
+// rmdir refuses a non-empty directory. Create's one accepted substitution is an
+// empty, owner-rwx, same-uid directory, which is indistinguishable from its own.
 package safetree
 
 import (
@@ -383,6 +389,11 @@ func Remove(parentFd int, name string, pin Pin) error {
 	}
 	var re unix.Stat_t
 	if err := fstatat(parentFd, name, &re, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			// The verified root was renamed away mid-walk: it still exists
+			// elsewhere, so this is a mismatch, never "absent".
+			return fmt.Errorf("%w: root recheck: %w", ErrMismatch, err)
+		}
 		return ioErr("recheck root", err)
 	}
 	if !isDir(&re) || uint64(re.Dev) != pin.Dev || re.Ino != pin.Ino {
@@ -392,6 +403,9 @@ func Remove(parentFd int, name string, pin Pin) error {
 		return ErrOwner
 	}
 	if err := unix.Unlinkat(parentFd, name, unix.AT_REMOVEDIR); err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			return fmt.Errorf("%w: rmdir root: %w", ErrMismatch, err)
+		}
 		return ioErr("rmdir root", err)
 	}
 	return nil

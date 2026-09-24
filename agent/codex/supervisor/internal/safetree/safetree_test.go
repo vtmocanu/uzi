@@ -1214,3 +1214,68 @@ func TestOpenDirNoFollow(t *testing.T) {
 	}
 	_ = unix.Close(fd)
 }
+
+// A verified root that disappears at the recheck (renamed away, nothing put
+// back) was moved, not removed: ErrMismatch, never "absent".
+func TestRemoveRootVanishedAtRecheckIsMismatch(t *testing.T) {
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	f := newFixture(t)
+	pin := f.createTree(t)
+	buildModuleCache(t, f.root())
+	setRootRecheckHook(t, func(int, string) {
+		if err := os.Rename(f.root(), f.root()+".orig"); err != nil {
+			t.Errorf("rename: %v", err)
+		}
+	})
+
+	err := Remove(f.parentFd, treeName, pin)
+	if !errors.Is(err, ErrMismatch) || errors.Is(err, ErrNotExist) || Reason(err) != "mismatch" {
+		t.Fatalf("Remove = %v (reason %q), want ErrMismatch", err, Reason(err))
+	}
+	assertExists(t, f.root()+".orig")
+}
+
+// A descendant directory deleted between its fstatat and its open is a failed
+// walk (ErrIO), never ErrNotExist: only the root's first open may say "absent".
+func TestRemoveDescendantVanishedBeforeOpenIsNotAbsent(t *testing.T) {
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	f := newFixture(t)
+	pin := f.createTree(t)
+	mustMkdir(t, filepath.Join(f.root(), "gone"))
+	setStatOpenHook(t, func(dirfd int, name string) {
+		if name == "gone" {
+			if err := unix.Unlinkat(dirfd, name, unix.AT_REMOVEDIR); err != nil {
+				t.Errorf("rmdir: %v", err)
+			}
+		}
+	})
+
+	err := Remove(f.parentFd, treeName, pin)
+	if err == nil || errors.Is(err, ErrNotExist) || Reason(err) == "absent" {
+		t.Fatalf("Remove = %v (reason %q), want a non-absent failure", err, Reason(err))
+	}
+	assertExists(t, f.root())
+}
+
+// A umask stripping owner bits from the mkdirat makes Create fail closed
+// rather than restore bits on a directory it cannot prove it made.
+func TestCreateFailsUnderOwnerStrippingUmask(t *testing.T) {
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	f := newFixture(t)
+	old := unix.Umask(0o100)
+	fd, _, err := Create(f.parentFd, treeName, os.Geteuid())
+	unix.Umask(old)
+	if err == nil {
+		_ = unix.Close(fd)
+		t.Fatal("Create succeeded under umask 0100, want ErrMismatch")
+	}
+	if !errors.Is(err, ErrMismatch) {
+		t.Fatalf("Create = %v, want ErrMismatch", err)
+	}
+}
