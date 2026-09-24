@@ -369,7 +369,8 @@ describe("RunRunner — checkpoint on graceful shutdown (PRD #1030 M4)", () => {
     const { gitlab } = fakeGitlab();
     const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-1030-shut-hang-"));
     const { entered, restore } = spyPublishHang();
-    const BUDGET = 43_210;
+    // Above the 60s hang guard, so a budget armed on a real clock (bypassing `setTimer`) fails.
+    const BUDGET = 10 * 60_000 + 1;
     const setTimer = (cb: () => void, ms: number): (() => void) => {
       if (ms === BUDGET) {
         void entered.then(cb);
