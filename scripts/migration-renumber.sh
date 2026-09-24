@@ -11,7 +11,7 @@
 # test). This helper renames the branch's new migration(s) to CONSECUTIVE numbers above
 # the live main head, rewrites the renamed migrations' OWN cross-reference comments, and
 # REPORTS every other reference (Go, docs, sibling migrations) for a human to fix by
-# hand. It is the mechanical form of CLAUDE.md's "numbers are assigned at merge time,
+# hand; binary files in the diff are skipped with a notice. It is the mechanical form of CLAUDE.md's "numbers are assigned at merge time,
 # renumbered above the live head".
 #
 # 🔴 IT IS A TREE-WRITER, NOT A GATE. It `git mv`s files and edits comment lines, so it
@@ -251,6 +251,57 @@ awk -F"$TAB" '{ print $3 "\t" $5 }'        "$WORKDIR/plan" > "$WORKDIR/phase1"  
 awk -F"$TAB" '{ print $5 "\t" $4 }'        "$WORKDIR/plan" > "$WORKDIR/phase2"   # tmppath -> newpath
 awk -F"$TAB" '{ print $4 }'                "$WORKDIR/plan" > "$WORKDIR/newpaths"
 
+# ---- reference scan: read-only, BEFORE any mutation ---------------------------------
+# Other = (all files HEAD changed over origin/main) MINUS the renamed migrations (their OLD
+# paths, i.e. the branch-new set). It runs before the git mv so a scan error leaves the
+# tree untouched and the helper retryable (issue #1581: a PNG killed the scan AFTER the
+# rename, leaving a staged half-run). Its report is printed after the rename. Git's
+# numstat classifies binaries (`-<TAB>-`), which are skipped with a notice; text is
+# scanned under LC_ALL=C so a non-UTF-8 byte cannot abort a UTF-8-locale awk. Token-exact
+# 5-digit scan in awk (this host's ugrep mishandles negated bracket classes in -E mode,
+# so awk digit-run scanning is used).
+# core.quotePath=false hands non-ASCII paths through verbatim; a path git must STILL quote
+# (tab, newline, backslash, double quote) cannot be read back safely here, so it is
+# reported as unscanned rather than silently dropped by the -f test below.
+git -c core.quotePath=false diff --no-renames --numstat origin/main HEAD > "$WORKDIR/numstat" ||
+  die "git diff --numstat (all changed files) failed"
+awk -F"$TAB" 'NR==FNR { skip[$0]=1; next } !($3 in skip) { print ($1 == "-" ? "B" : "T") "\t" $3 }' \
+  "$WORKDIR/branch_new" "$WORKDIR/numstat" > "$WORKDIR/other"
+
+report=""
+skipped=""
+while IFS="$TAB" read -r kind f; do
+  [ -n "$f" ] || continue
+  case "$f" in
+    \"*)
+      skipped="${skipped}migration-renumber: NOT scanned (git-quoted path, check by hand): $f
+"
+      continue
+      ;;
+  esac
+  [ -f "$f" ] || continue
+  if [ "$kind" = "B" ]; then
+    skipped="${skipped}migration-renumber: skipped binary file: $f
+"
+    continue
+  fi
+  hits="$(LC_ALL=C awk 'NR==FNR { m[$1]=$2; next }
+    {
+      rest=$0
+      while (match(rest, /[0-9]+/)) {
+        tok=substr(rest, RSTART, RLENGTH)
+        if (length(tok)==5 && (tok in m))
+          print FILENAME ":" FNR "\t" tok " -> " m[tok] "\t" $0
+        rest=substr(rest, RSTART+RLENGTH)
+      }
+    }' "$WORKDIR/map" "$f")" ||
+    die "reference scan failed for $f; nothing was renamed or edited"
+  if [ -n "$hits" ]; then
+    report="$report$hits
+"
+  fi
+done < "$WORKDIR/other"
+
 # ---- rename: TWO-PHASE so overlapping ranges never collide ---------------------------
 # Draft 00231/00232 -> new 00232/00233 means a new path can equal another file's OLD path,
 # so a direct git mv would collide with a still-present file. Phase 1 moves every old path
@@ -268,35 +319,11 @@ while IFS= read -r np; do
   rewrite_comments "$WORKDIR/map" "$np" || die "comment rewrite failed for $np"
 done < "$WORKDIR/newpaths"
 
-# ---- postflight report: scan OTHER branch-changed files, never auto-edit, never abort --
-# Other = (all files HEAD changed over origin/main) MINUS the renamed migrations (their OLD
-# paths, i.e. the branch-new set). Token-exact 5-digit scan in awk (this host's ugrep
-# mishandles negated bracket classes in -E mode, so awk digit-run scanning is used).
-git diff --no-renames --name-only origin/main HEAD > "$WORKDIR/all_changed" ||
-  die "git diff (all changed files) failed"
-awk 'NR==FNR { skip[$0]=1; next } !($0 in skip)' "$WORKDIR/branch_new" "$WORKDIR/all_changed" \
-  > "$WORKDIR/other"
-
-report=""
-while IFS= read -r f; do
-  [ -n "$f" ] || continue
-  [ -f "$f" ] || continue
-  hits="$(awk 'NR==FNR { m[$1]=$2; next }
-    {
-      rest=$0
-      while (match(rest, /[0-9]+/)) {
-        tok=substr(rest, RSTART, RLENGTH)
-        if (length(tok)==5 && (tok in m))
-          print FILENAME ":" FNR "\t" tok " -> " m[tok] "\t" $0
-        rest=substr(rest, RSTART+RLENGTH)
-      }
-    }' "$WORKDIR/map" "$f")"
-  if [ -n "$hits" ]; then
-    report="$report$hits
-"
-  fi
-done < "$WORKDIR/other"
-
+# ---- postflight report: other files are REPORTED, never auto-edited -----------------
+if [ -n "$skipped" ]; then
+  echo ""
+  printf '%s' "$skipped"
+fi
 if [ -n "$report" ]; then
   echo ""
   echo "migration-renumber: POSTFLIGHT -- other files reference an OLD migration number."

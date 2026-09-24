@@ -14,6 +14,9 @@
 #   D. an OVERLAPPING-range renumber (a same-slug pair straddling the head) is renamed
 #      correctly, and by IDENTITY, by the two-phase git mv -- where a single-phase mv
 #      would collide with a still-present sibling and fail.
+#   E. a binary file in the branch diff is skipped with a notice (not scanned, not
+#      touched), and a non-UTF-8 text file is still scanned (issue 1581).
+#   F. a reference-scan failure refuses BEFORE any rename, leaving the tree unchanged.
 #
 # 🔴 100% OFFLINE AND HERMETIC. Every git repo is built under `mktemp -d`; the "remote" is
 # a LOCAL bare repo (`git init --bare`), so the helper's `git fetch origin main` is a local
@@ -480,6 +483,65 @@ assert_eq "D: no leftover .renumber-tmp-* file after success" "" "$_leftover"
 ( cd "$REPOD" && ./scripts/check-migration-numbering.sh scripts/migration-numbering-canary "$MIGDIR" ) >/dev/null 2>&1
 D_NUMRC=$?
 assert_eq "D: check-migration-numbering.sh green after overlapping renumber" "0" "$D_NUMRC"
+
+# =============================================================================
+echo "=== E. integration -- binary and non-UTF-8 files in the branch diff (issue 1581) ==="
+# =============================================================================
+# A PNG in the branch diff made the postflight awk scan die on its bytes under a UTF-8
+# locale ("towc: multibyte conversion failure") AFTER the git mv, leaving a staged rename
+# and a nonzero exit that a rerun then refused on the dirty tree. The helper must skip the
+# binary file with a notice, and still scan a non-UTF-8 TEXT file byte-wise.
+CASE_E="$ROOT/caseE"; build_base "$CASE_E"; REPOE="$CASE_E/repo"
+add_forge_pair "$REPOE"
+mkdir -p "$REPOE/docs/img"
+# PNG signature + a NUL-bearing IHDR chunk and high bytes: git classifies it binary.
+printf '\211PNG\r\n\032\n\000\000\000\rIHDR\000\000\000\001\377\376\351\000' > "$REPOE/docs/img/shot.png"
+# Latin-1 text (0xE9, no NUL): git calls it text, and it references an OLD draft number.
+printf 'Caf\351 notes: see migration 00230.\n' > "$REPOE/docs/latin1.txt"
+# Paths git quotes by default: non-ASCII (must be scanned verbatim under core.quotePath=false)
+# and a TAB (still quoted, so it must be named as unscanned, never silently dropped).
+printf 'see migration 00231\n' > "$REPOE/docs/caf$(printf '\303\251').md"
+printf 'see migration 00230\n' > "$REPOE/docs/tab$(printf '\t')name.md"
+git -C "$REPOE" add -A
+git -C "$REPOE" commit -q -m "branch: a PNG and a Latin-1 note"
+PNG_BEFORE="$(od -An -tx1 "$REPOE/docs/img/shot.png")"
+
+E_OUT="$( ( cd "$REPOE" && LC_ALL=en_US.UTF-8 sh "$HELPER" ) 2>&1 )"
+E_RC=$?
+ME="$REPOE/$MIGDIR"
+assert_eq "E: renumber with a PNG in the diff exits 0" "0" "$E_RC"
+if [ -f "$ME/00232_forge_x.sql" ]; then pass "E: 00232_forge_x.sql created"; else fail "E: 00232_forge_x.sql created"; fi
+assert_eq       "E: PNG byte-identical"                     "$PNG_BEFORE" "$(od -An -tx1 "$REPOE/docs/img/shot.png")"
+assert_contains "E: binary skip notice names the PNG"       "skipped binary file: docs/img/shot.png" "$E_OUT"
+assert_contains "E: non-UTF-8 text file still scanned"      "docs/latin1.txt:1"                      "$E_OUT"
+assert_contains "E: non-ASCII path scanned verbatim"        "$(printf 'docs/caf\303\251.md:1')"     "$E_OUT"
+assert_contains "E: git-quoted path named as NOT scanned"   "NOT scanned (git-quoted path"           "$E_OUT"
+
+# =============================================================================
+echo "=== F. a reference-scan failure happens BEFORE any rename (issue 1581) ==="
+# =============================================================================
+# The scan is the last fallible read before the tree is written, so it runs first: a scan
+# error must leave nothing staged, keeping the helper retryable. A PATH-local awk wrapper
+# fails only on the poisoned file and delegates every other awk call.
+CF="$ROOT/caseF"; build_base "$CF"; RF="$CF/repo"
+add_forge_pair "$RF"
+wf "$RF/docs/poison.txt" <<'TXT'
+migration 00230
+TXT
+git -C "$RF" add -A
+git -C "$RF" commit -q -m "branch: a file the wrapped awk refuses to scan"
+FAKEBINF="$CF/bin"
+REAL_AWKF="$(command -v awk)"
+mkdir -p "$FAKEBINF"
+wf "$FAKEBINF/awk" <<EOF
+#!/bin/sh
+for _a in "\$@"; do
+  case "\$_a" in *poison.txt) echo "awk: injected scan failure" >&2; exit 71 ;; esac
+done
+exec "$REAL_AWKF" "\$@"
+EOF
+chmod +x "$FAKEBINF/awk"
+run_refusal "F scan failure" "$RF" "reference scan failed" "$FAKEBINF:$PATH"
 
 # --- tally -------------------------------------------------------------------
 TOTAL=$((PASSES + FAILS))
