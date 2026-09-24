@@ -8,8 +8,8 @@ code change)
 there is no PRD file; the issue carries the reproduction and the milestone breakdown. This
 ADR carries the decision, its invariants, and the alternatives most likely to look
 attractive to a future reader who has not walked the same failure.
-**Numbering**: `0122` and `1036` (below) are PRD numbers; `1597` is an **issue** number.
-ADRs are numbered by their tracking item, whichever kind it is.
+**Numbering**: `0122` is a PRD number (PRD #122); `1036` and `1597` are **issue** numbers
+(issue #1036's PRD is #1062). ADRs are numbered by their tracking item, whichever kind it is.
 **Related**: extends [ADR-122](0122-checkpoint-push-broker.md) (the credential-free,
 api-brokered checkpoint push this ADR's tick reuses without changing the broker) and
 [ADR-1036](1036-checkpoint-workflow-overlay.md) (the workflow overlay this tick's
@@ -25,23 +25,28 @@ whole turn, in the worst case. This closes that gap **inside** the turn:
 
 1. **A repeating mid-turn tick**, `CHECKPOINT_TICK_INTERVAL` (default `5m`; `0` disables),
    fetches the runner clone's committed work back into the worker's bare repository at
-   most once per tick, when the branch tip has moved and the clone is not busy, and, once
-   `CHECKPOINT_INTERVAL` (default `20m`, unchanged from PRD #267) has elapsed since the last
-   publish *attempt* and the branch tip has moved, publishes it to origin through the
-   existing ADR-122 broker — credential-free, worker-side, unchanged wire contract.
+   most once per tick, when the branch tip has moved and the clone is not busy, and, once the
+   branch tip differs from the last *confirmed* published tip and `CHECKPOINT_INTERVAL`
+   (default `20m`, unchanged from PRD #267) has elapsed since the last publish *attempt* —
+   not the last success, so a persistent broker failure is retried at most once per
+   interval — publishes it to origin through the existing ADR-122 broker — credential-free,
+   worker-side, unchanged wire contract.
 2. **A per-flight sink gate** serializes the tick against every other path that moves the
    run's durable state — the checkpoint closure, the pause/wall/completion-hold parks, and
    the credential switch — so a tick can never interleave with one of those and fetch or
    publish a marker a park path is about to undo, or race the checkpoint floor.
-3. **A stat-only git-busy probe** skips the tick, rather than racing git, whenever any lock
-   or merge/rebase marker is present in the runner clone, regardless of its age.
+3. **A metadata-only git-busy probe** (one non-blocking open of `.git`, then `lstat` of
+   each marker; no git child), rather than racing git, skips the tick whenever one of a
+   fixed set of git lock files or merge/rebase/cherry-pick/revert markers is present in the
+   runner clone, or its gitdir is unreadable, regardless of age.
 4. **Every checkpoint publish that goes through the checkpoint body without an overlay
    context is secret-scanned** — the mid-turn tick, the time-gated iteration-boundary tier,
    and milestone publishes on non-GitHub forges — over the pinned commit range being
    packed, minus content already public, before the pack is built; a finding or an
    untrusted scan skips the remote publish and falls back to the local fetch-back only. On
-   a Codex run a milestone publish is instead deferred (`scan_deferred`) rather than
-   scanned inside the boundary permit.
+   a Codex run such an overlay-less (non-GitHub) milestone publish is instead deferred
+   (`scan_deferred`) rather than scanned inside the boundary permit; a GitHub milestone —
+   Codex or otherwise — always carries an overlay context and publishes unscanned.
 5. **The tick runs in a cancellable process scope**: a quiescing run, shutdown, or a
    preempting sink waits for every tick child to exit, every lock wait to resolve, and any
    in-flight publish to settle before the clone or bare is touched again.
@@ -122,6 +127,10 @@ every *scanned* publish until it leaves that range (fail closed); the unscanned
 park/shutdown/pause/capture and GitHub-milestone publishers would still ship it, unaffected by
 the block. gitleaks git mode also skips files with a NUL byte (binary content) — a known
 instrument limit this scan shares with the finalize pre-push scan, not a regression.
+Another known limit shared with the finalize scan: a multi-line secret (e.g. a PEM key
+body swapped between existing BEGIN/END lines) is not detected when only its middle lines
+are added — the same as gitleaks git mode for ordinary commits, and now for merges too
+(only the lines a merge adds are fed to gitleaks).
 
 ### The scan hardening
 
@@ -130,16 +139,20 @@ instrument limit this scan shares with the finalize pre-push scan, not a regress
   therefore enforces its **own** hard deadline on every gitleaks child process and classes
   an overrun as **untrusted** (`deadline`); it never passes `--timeout` to a `git`-mode
   invocation, because that flag cannot be trusted to do anything there.
-- **gitleaks never runs inside a Codex boundary permit.** An overlay-less milestone on a
-  Codex run instead fetches back and **defers** the remote publish (`scan_deferred`): a tick
-  is kicked to run about 1s later; if the sink gate is still held it retries shortly,
-  otherwise the publish waits for the next tick. With `CHECKPOINT_TICK_INTERVAL=0` the
-  deferred scan+publish runs right after the permit ends, before the milestone checkpoint
-  returns. This avoids either starving the permit's own deadline for scan time or running
-  the scan un-timed inside a window the permit's supervisor cannot individually kill a
-  child in.
-- **The scan range is floored at content already public.** Three floors, the maximum of
-  which excludes nothing already known to be visible: `excludeSha` (`origin/<branch>` when
+- **The checkpoint secret scan never runs inside a Codex boundary permit** (the finalize
+  pre-push scan, unchanged by this issue, still runs under the finalize permit). An
+  overlay-less milestone on a Codex run instead fetches back and **defers** the remote
+  publish (`scan_deferred`): a tick is kicked to run about 1s later; if that tick finds the
+  sink gate held (`gate_busy`) it is kicked once more about 1s later, and a second miss
+  leaves the owed publish to the next overlay-less checkpoint (the next regular tick or
+  iteration boundary), which publishes it regardless of the time gate. With
+  `CHECKPOINT_TICK_INTERVAL=0` the deferred scan+publish runs right after the permit ends,
+  before the milestone checkpoint returns. This avoids either starving the permit's own
+  deadline for scan time or running the scan un-timed inside a window the permit's
+  supervisor cannot individually kill a child in.
+- **The scan range is floored at content already public.** Three floors, each excluded
+  from the scan (`tipSha ^excludeSha ^<default tip> ^<confirmed tip>`), so nothing
+  reachable from any of them is re-scanned: `excludeSha` (`origin/<branch>` when
   it exists, else the default branch), the last **confirmed** published checkpoint tip
   (only when it is an ancestor of the pinned tip), and the origin default-branch tip. The
   pack range stays exactly `tipSha ^excludeSha` — unchanged from the pre-tick pinned-range
@@ -186,8 +199,8 @@ blocking on a writer, and a symlink is refused with `ELOOP`), then classifies it
 `fstat` on that same file handle — never a separate stat-then-open, which would leave a
 TOCTOU window. "Busy" is one of a fixed set of lock and in-progress markers (`index.lock`,
 `HEAD.lock`, `packed-refs.lock`, `refs/heads/<branch>.lock`, `MERGE_HEAD`,
-`CHERRY_PICK_HEAD`, `REVERT_HEAD`, `rebase-merge/`, `rebase-apply/`), or an
-unreadable/non-regular `.git`. Any marker present makes the tick skip, **whatever its
+`CHERRY_PICK_HEAD`, `REVERT_HEAD`, `rebase-merge/`, `rebase-apply/`), or a `.git` that is
+unreadable or neither a regular gitfile nor a directory. Any marker present makes the tick skip, **whatever its
 age**: an old, abandoned lock is treated exactly like a fresh one, because the probe cannot
 distinguish "still being written" from "leaked" without racing the writer. Two residuals
 follow directly from this design, not from a bug: (1) the TOCTOU window between the probe's
@@ -234,19 +247,23 @@ correctly keeps rather than risks deleting something it cannot verify.
 
 The graceful-shutdown feed line now says `published`, or names one bounded reason class
 when it is not: `timeout`, `boundary_blocked`, `publish_rejected`, `publish_skipped`,
-`publish_error`, `no_local_tip`, or `bare_lock_retained` (the last is this issue's own
-addition — a cancelled tick's retained lock, still present, is what is blocking the
-fetch-back or publish). **A publish that landed wins over a late Codex boundary error**: if
-the checkpoint body's publish was ACKed before the boundary itself later throws (e.g. a
-deadline or cleanup failure after the ACK), the feed reports `published`, not the boundary
-error — a checkpoint that is real on origin must never be reported as failed because of an
-unrelated failure downstream of it. On the **generic publish-failure feed** an aborted
-publish is silent (run log only, because it never attempted to publish in the first place —
-e.g. the sink was never reached). On the **shutdown line specifically**, an aborted publish
-is instead named: `timeout` when the permit/deadline signal is what aborted it, else
+`publish_error`, `no_local_tip`, or `bare_lock_retained` — every one of these classes is
+new in this issue (the last was added in M2 — a cancelled tick's retained lock, still
+present, is what is blocking the fetch-back or publish). **A publish that landed wins over
+a late Codex boundary error**: if the checkpoint body's publish was ACKed before the
+boundary itself later throws (e.g. a deadline or cleanup failure after the ACK), the feed
+reports `published`, not the boundary error — a checkpoint that is real on origin must
+never be reported as failed because of an unrelated failure downstream of it. On the
+**generic publish-failure feed** an aborted publish is silent (run log only), because a
+deadline/permit abort is an expected bounded stop rather than a publish fault; it can land
+before or during the upload, and an abort after the pack tip is known is recorded as an
+ambiguous attempted tip. On the **shutdown line specifically**, an aborted publish is
+instead named: `timeout` when the permit/deadline signal is what aborted it, else
 `publish_error` for any other abort. No raw error message, remote text, or credential is
 ever placed on the feed; only the class. A checkpoint later confirmed to have landed, after
-an earlier report of failure, emits one recovery line.
+an earlier report of failure, emits one recovery line. A deferred Codex milestone's
+post-permit publish (the `CHECKPOINT_TICK_INTERVAL=0` inline case above) is itself skipped,
+not retried, when the run is already being cancelled or shut down by the time it would run.
 
 ### The #1416 steer's feed timing
 
@@ -346,7 +363,7 @@ substitute for.
   the controller**, so hosted workers run the defaults (`5m`/`20m`); overriding either needs
   a worker-env change outside the chart's current surface.
 - **A planted lock or marker can defer the tick indefinitely**; visible to an operator after
-  3 consecutive deferrals for the same cause, but not auto-resolved — the busy probe
+  3 consecutive git-busy ticks (any marker), but not auto-resolved — the busy probe
   deliberately never races a writer to decide otherwise.
 - **The #1416 safety steer can now be armed up to one turn before the agent consumes it**,
   a direct, expected consequence of `pullSafetySteer` staying a turn-boundary-only drain
