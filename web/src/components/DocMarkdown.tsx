@@ -6,7 +6,7 @@ import { MarkdownCore } from "./MarkdownCore";
 
 // Trusted-docs policy for the shared MarkdownCore. Content is repo-authored and
 // reviewed; the pipeline (react-markdown, no rehype-raw) plus these overrides
-// give links repo-aware routing (internal → SPA route, repo-only → pinned GitHub blob)
+// give links repo-aware routing (internal → SPA route, repo-only → GitHub blob)
 // and images their hashed asset URLs. `isAdmin` decides whether operator-doc
 // links route in-app (issue #75 M1), so the components object is built per render
 // keyed on it. Typography lives in the `.docs-prose` rules in index.css. The

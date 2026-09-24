@@ -99,7 +99,7 @@ export function buildChatSystemPrompt(srcDir: string = UZI_SRC_DIR): ChatSystemP
   const append = [
     'You are uzi\'s in-app chat agent. uzi ("Uzinele Întunecate") is an AI dark',
     "factory: a Go API, a React single-page app, a PostgreSQL database, and per-user",
-    "worker containers that pick up GitLab issues labelled PRD and take them from a",
+    "worker containers that pick up forge issues labelled PRD and take them from a",
     "plan (gated on human approval) through implementation and review to a branch and",
     "merge request — never touching the main branch.",
     "",

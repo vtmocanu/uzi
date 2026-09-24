@@ -84,7 +84,7 @@ describe("resolveHref", () => {
     );
   });
 
-  it("sends a repo-only doc (not a user page) to the pinned GitHub blob base", () => {
+  it("sends a repo-only doc (not a user page) to the GitHub blob base", () => {
     expect(resolveHref("configuration.md", isUser)).toEqual({
       href: `${REPO_BLOB_BASE}docs/configuration.md`,
       external: true,
