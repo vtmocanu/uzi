@@ -887,6 +887,12 @@ Tracked as GitHub issue vtmocanu/uzi#1590; PRD at `prds/1590-codex-quarantine-cl
 - A binding change (the re-login resolved to a different identity, the credential was deleted, or the account credential revision or auth mode no longer matches) fails the run `credential_unavailable`. (AI-synced 2026-09-24)
 - The owner sees why the run is held and what to do next (reconciling, re-log in the named credential, verifying the new login, resuming) on the web, CLI and TUI. (AI-synced 2026-09-24)
 
+## Bug #1624 — ephemeral worker cap
+
+Tracked as GitHub issue vtmocanu/uzi#1624.
+
+- (AI-synced 2026-09-24) An ephemeral (run-bound) worker reports `max_concurrent_runs` 1 and never counts as a free slot for another run; persistent workers report their advertised cap.
+
 ## Startup admin seed
 
 - Seed an admin user from env at startup (`UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME`) so the user survives DB wipes.

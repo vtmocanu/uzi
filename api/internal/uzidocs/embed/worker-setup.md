@@ -235,7 +235,9 @@ controller renders into the pod's `WORKER_MAX_CONCURRENT_RUNS` env for you. Rais
 it is an operator action — it needs a new controller/chart release to take effect,
 since hosted workers only roll on release — and the operator must size the preset
 to hold that many concurrent runs. It's the same knob described above, and raising
-it opts into the same intra-user residuals just covered.
+it opts into the same intra-user residuals just covered. An ephemeral (run-bound)
+hosted worker is always recorded with a cap of 1, whatever it advertises, since it
+only ever runs the one run it was created for.
 
 ## Multiple workers, removing a worker
 

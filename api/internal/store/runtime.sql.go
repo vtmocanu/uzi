@@ -1901,6 +1901,11 @@ WHERE w.user_id = $1
   -- A draining worker has no free slot for NEW work (it claims nothing), so the
   -- queued-run reason resolver must not count it as an idle worker (PRD #422 Decision 7).
   AND w.draining_since IS NULL
+  -- AND NOT w.ephemeral (PRD #529 M2, Correction B; issue #1624): an ephemeral worker is
+  -- bound to ONE run (it can claim only its ephemeral_run_id), so it never has a free
+  -- slot for ANOTHER run, even when idle, with a NULL cap, or below an advertised cap.
+  -- Counting it would make a saturated fleet read as having an idle worker.
+  AND NOT w.ephemeral
   AND (w.max_concurrent_runs IS NULL
        OR (SELECT count(*) FROM runs r
             WHERE r.worker_id = w.id

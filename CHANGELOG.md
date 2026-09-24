@@ -57,6 +57,11 @@ through `[0.52.0]`.)
 - **Stopping a server by port no longer kills the agent ([#1575](https://github.com/vtmocanu/uzi/issues/1575)).**
   The worker image's `lsof` was the BusyBox applet, which ignores its options, so `lsof -ti tcp:<port>` listed every process and `kill $(lsof -ti tcp:<port>)` terminated the agent's own run. Both worker images now bake real `lsof` and `procps` (`pgrep`, `pkill`, `ps`) into the toolchain ahead of BusyBox, and the image build fails if `lsof`, `pgrep` or `pkill` resolve to BusyBox or if `lsof -ti tcp:<port>` stops returning only the listener's PID.
 
+### Fixed
+
+- **An ephemeral hosted worker no longer shows or counts as having a spare run slot ([#1624](https://github.com/vtmocanu/uzi/issues/1624)).**
+  A run-bound ephemeral worker can only ever claim the one run it was created for, so the server now records its cap as 1 whatever it advertises (the API reports `max_concurrent_runs: 1` and the Workers badge reads busy instead of a false 1/2), and the queued-run reason check no longer counts it as a worker with a free slot, so a saturated fleet is no longer reported as having an idle worker. Persistent workers keep their advertised cap.
+
 ## [0.84.0] - 2026-09-20
 
 ### Added
