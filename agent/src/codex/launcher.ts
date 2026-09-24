@@ -73,6 +73,9 @@ export const SUPERVISOR_BIN = "/usr/local/bin/uzi-codex-supervisor";
 /** The fixed provider child argv (`codex app-server`). Exported so the production
  *  composition supplies exactly the launcher-required value. */
 export const PROVIDER_CHILD_ARGV = ["app-server"] as const;
+/** A lowercase (canonical `randomUUID()`) UUID: the only token shape the supervisor's
+ *  --cleanup-token / --cache-token flags accept. */
+const LOWERCASE_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const RESERVED_PROVIDER_ENV_KEYS = new Set([
   "HOME", "CODEX_HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",
   "TMPDIR", "PATH", "SHELL", "LANG", "TERM", "NODE_OPTIONS", "BASH_ENV", "ENV", "SHELLOPTS",
@@ -711,7 +714,7 @@ export async function launchCodexEffectRoot(
   if (expectedUid !== requiredUid) {
     throw new Error(`effect identity resolved unexpected uid ${String(expectedUid)}`);
   }
-  if (spec.cleanupToken !== undefined && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(spec.cleanupToken)) {
+  if (spec.cleanupToken !== undefined && !LOWERCASE_UUID_RE.test(spec.cleanupToken)) {
     throw new Error("effect cleanup token must be a lowercase UUID");
   }
   const supervisorArgv = [
@@ -988,5 +991,583 @@ async function createHandle(
     dispose,
     get failed() { return failure; },
     whenFailed,
+  };
+}
+
+// ─── Issue #1598: the per-run command cache and the startup orphan reaper ────────
+//
+// Three STANDALONE supervisor modes (agent/codex/supervisor/doc.go, "Standalone modes"),
+// each run as the command uid (COMMAND_UID, via commandRootCommand) with a minimal
+// replaced env. None of them uses fd 3/4: each writes JSON lines to stdout, which is
+// parsed strictly here: a bounded line length, a bounded line count, exactly the key
+// set of a known event, and an exit code consistent with that event. Anything else
+// fails closed (an error value, never a guessed success).
+
+/** The worker-only per-run command cache root (entrypoint-prepared, uid 10003, 0700,
+ *  present only under the uid split; a k8s emptyDir). Each run's cache is
+ *  `<root>/<lowercase uuid>` with the subdirectories gomod, gocache and npm. */
+export const CODEX_COMMAND_CACHE_ROOT = "/var/cache/uzi-codex-cmd";
+
+/** The standalone modes print short fixed-shape lines; a line past this is garbage. */
+const MAX_MODE_LINE_BYTES = 4096;
+/** A reap pass may take up to its own 5-minute budget plus the proof scans. */
+const DEFAULT_REAP_TIMEOUT_MS = 6 * 60 * 1000;
+/** `--remove-cache` removes one run's cache with no deadline of its own. */
+export const DEFAULT_REMOVE_CACHE_TIMEOUT_MS = 2 * 60 * 1000;
+/** The holder creates and locks one directory before it reports ready. */
+const DEFAULT_HOLDER_READY_TIMEOUT_MS = 10 * 1000;
+/** The only env a standalone mode sees: nothing from the worker crosses. */
+const STANDALONE_MODE_ENV: NodeJS.ProcessEnv = { PATH: "/usr/bin:/bin", LANG: "C" };
+
+const REAP_PROOFS: ReadonlySet<string> = new Set(["held", "unknown", "user_alive"]);
+const REAP_ERROR_REASONS: ReadonlySet<string> = new Set(["fd_hygiene", "args", "uid", "tmp_root", "cache_root", "list"]);
+const HOLD_ERROR_REASONS: ReadonlySet<string> = new Set([
+  "dumpable", "fd_hygiene", "args", "uid", "root", "create", "subdir", "lock", "recheck",
+]);
+const REMOVE_ERROR_REASONS: ReadonlySet<string> = new Set(["fd_hygiene", "args", "uid", "root"]);
+/** A holder retains with "unattested" or a tmpCleanup word; --remove-cache with "live" or one. */
+const HOLD_RETAINED_REASONS: ReadonlySet<string> = new Set([...TMP_RETAINED_REASONS, "unattested"]);
+const REMOVE_RETAINED_REASONS: ReadonlySet<string> = new Set([...TMP_RETAINED_REASONS, "live"]);
+
+/** The process surface a standalone mode needs. Node's ChildProcess satisfies it
+ *  structurally; unit tests inject a fake. `close` fires with (code, signal) once the
+ *  process exited AND its stdio closed; `exit` fires with (code, signal) at exit. */
+export interface StandaloneModeProcess {
+  readonly pid?: number;
+  readonly stdin: Writable | null;
+  readonly stdout: Readable | null;
+  once(event: string, listener: (...args: never[]) => void): unknown;
+  on(event: string, listener: (...args: never[]) => void): unknown;
+}
+export type SpawnStandaloneMode = (
+  command: string,
+  args: readonly string[],
+  options: { cwd: string; env: NodeJS.ProcessEnv; stdio: readonly ("pipe" | "ignore")[] },
+) => StandaloneModeProcess;
+
+export interface StandaloneModeDeps {
+  readonly spawn?: SpawnStandaloneMode;
+  /** Overrides the mode's default bound (ms). */
+  readonly timeoutMs?: number;
+  /** Reaper only: signal a reaper still running at its deadline (or on abort). The worker
+   *  lacks CAP_KILL over uid 10003, so the default forks a `kill -KILL` as the command uid.
+   *  Returns whether the kill was delivered (a thrown error counts as not delivered). */
+  readonly killAsCommandUid?: (pid: number) => boolean;
+  /** Reaper only: the synchronous runner of the default kill (production: spawnSync). */
+  readonly runKill?: (command: string, args: readonly string[]) => { readonly status: number | null; readonly error?: Error };
+  /** Reaper only: how long to wait for a killed reaper's `close` (default 10 s). */
+  readonly killWaitMs?: number;
+  /** Reaper only: abort the pass (worker shutdown). The reaper is killed as on a timeout. */
+  readonly signal?: AbortSignal;
+}
+
+const defaultSpawnStandaloneMode: SpawnStandaloneMode = (command, args, options) =>
+  spawn(command, [...args], { cwd: options.cwd, env: options.env, stdio: [...options.stdio] }) as unknown as StandaloneModeProcess;
+
+/** How long a killed reaper gets to close before it is reported unkilled. */
+const DEFAULT_REAPER_KILL_WAIT_MS = 10 * 1000;
+
+function defaultKillAsCommandUid(pid: number, runKill: NonNullable<StandaloneModeDeps["runKill"]>): boolean {
+  if (!Number.isInteger(pid) || pid <= 1) return false;
+  const kill = commandRootCommand("kill", ["-KILL", String(pid)]);
+  const result = runKill(kill.command, kill.args);
+  return result.error === undefined && result.status === 0;
+}
+
+const defaultRunKill: NonNullable<StandaloneModeDeps["runKill"]> = (command, args) =>
+  spawnSync(command, [...args], { env: STANDALONE_MODE_ENV, stdio: "ignore", timeout: 10_000 });
+
+function spawnStandaloneMode(
+  mode: "--reap-orphans" | "--hold-cache" | "--remove-cache",
+  token: string | undefined,
+  stdin: "pipe" | "ignore",
+  deps: StandaloneModeDeps,
+): StandaloneModeProcess {
+  const args = [
+    mode,
+    "--expect-uid", String(COMMAND_UID),
+    "--cache-root", CODEX_COMMAND_CACHE_ROOT,
+    ...(token === undefined ? [] : ["--cache-token", token]),
+  ];
+  const wrapped = commandRootCommand(SUPERVISOR_BIN, args);
+  return (deps.spawn ?? defaultSpawnStandaloneMode)(wrapped.command, wrapped.args, {
+    cwd: "/",
+    env: { ...STANDALONE_MODE_ENV },
+    stdio: [stdin, "pipe", "ignore"],
+  });
+}
+
+/** Split a mode's stdout into bounded lines. Any breach (an over-long line, more lines
+ *  than the mode may print, a trailing partial line, a stream error) is reported once and
+ *  every later byte is ignored, so garbage can never be half-believed. */
+function readModeLines(
+  stream: Readable,
+  maxLines: number,
+  onLine: (line: string) => void,
+  onBreach: (why: string) => void,
+): void {
+  let pending = Buffer.alloc(0);
+  let lines = 0;
+  let broken = false;
+  const breach = (why: string): void => {
+    if (broken) return;
+    broken = true;
+    onBreach(why);
+  };
+  stream.on("data", (chunk: Buffer | string) => {
+    if (broken) return;
+    pending = Buffer.concat([pending, typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk]);
+    for (;;) {
+      const nl = pending.indexOf(0x0a);
+      if (nl < 0) break;
+      const line = pending.subarray(0, nl);
+      pending = pending.subarray(nl + 1);
+      if (line.length > MAX_MODE_LINE_BYTES) { breach("oversized line"); return; }
+      lines += 1;
+      if (lines > maxLines) { breach("too many lines"); return; }
+      onLine(line.toString("utf8"));
+      if (broken) return;
+    }
+    if (pending.length > MAX_MODE_LINE_BYTES) breach("oversized line");
+  });
+  stream.on("end", () => { if (pending.length > 0) breach("truncated line"); });
+  stream.on("error", () => breach("stream error"));
+}
+
+/** Parse one line as a JSON object with EXACTLY `keys`; undefined on anything else. */
+function parseExactObject(line: string, keys: readonly string[]): Record<string, unknown> | undefined {
+  let value: unknown;
+  try { value = JSON.parse(line); } catch { return undefined; }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  const got = Object.keys(record);
+  if (got.length !== keys.length || !keys.every((k) => got.includes(k))) return undefined;
+  return record;
+}
+
+function eventOf(line: string): unknown {
+  try {
+    const value: unknown = JSON.parse(line);
+    return typeof value === "object" && value !== null ? (value as Record<string, unknown>).event : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+const isCount = (v: unknown): v is number => typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
+
+function validToken(token: string): boolean {
+  return typeof token === "string" && LOWERCASE_UUID_RE.test(token);
+}
+
+/** The settled state of one one-line mode run. A `timeout` or `aborted` run is still
+ *  running (or its stdio still open): `closed` resolves at its `close`. */
+type OneLineRun =
+  | { readonly kind: "done"; readonly line: string | undefined; readonly code: number | null; readonly breach?: string }
+  | StillRunningMode
+  | { readonly kind: "spawn"; readonly message: string };
+type StillRunningMode =
+  | { readonly kind: "timeout"; readonly pid?: number; readonly closed: Promise<void> }
+  | { readonly kind: "aborted"; readonly pid?: number; readonly closed: Promise<void> };
+
+/** One run of a one-line mode: spawn, read at most two lines (a second is a breach),
+ *  and settle at `close`, the deadline, or an abort of `signal`. An already-aborted
+ *  signal spawns nothing. Never throws. */
+function runOneLineMode(
+  mode: "--reap-orphans" | "--remove-cache",
+  token: string | undefined,
+  timeoutMs: number,
+  deps: StandaloneModeDeps,
+  signal?: AbortSignal,
+): Promise<OneLineRun> {
+  return new Promise((resolve) => {
+    if (signal?.aborted) {
+      resolve({ kind: "aborted", closed: Promise.resolve() });
+      return;
+    }
+    let settled = false;
+    let child: StandaloneModeProcess | undefined;
+    const lines: string[] = [];
+    let breach: string | undefined;
+    let markClosed!: () => void;
+    const closed = new Promise<void>((r) => { markClosed = r; });
+    const onAbort = (): void => settle({ kind: "aborted", pid: child?.pid, closed });
+    const settle = (value: OneLineRun): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      resolve(value);
+    };
+    const timer = setTimeout(() => settle({ kind: "timeout", pid: child?.pid, closed }), timeoutMs);
+    if (typeof timer.unref === "function") timer.unref();
+    signal?.addEventListener("abort", onAbort, { once: true });
+    try {
+      child = spawnStandaloneMode(mode, token, "ignore", deps);
+    } catch (error) {
+      settle({ kind: "spawn", message: error instanceof Error ? error.message : String(error) });
+      return;
+    }
+    child.on("error", (err: Error) => settle({ kind: "spawn", message: err.message }));
+    if (!child.stdout) {
+      settle({ kind: "spawn", message: "no stdout channel" });
+      return;
+    }
+    readModeLines(child.stdout, 1, (line) => lines.push(line), (why) => { breach = why; });
+    child.once("close", (code: number | null) => {
+      markClosed();
+      settle({ kind: "done", line: lines.length === 1 ? lines[0] : undefined, code, ...(breach ? { breach } : {}) });
+    });
+  });
+}
+
+/** Resolve true if `p` settles within `ms`, false otherwise. */
+async function settlesWithin(p: Promise<void>, ms: number): Promise<boolean> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      p.then(() => true),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), Math.max(0, ms));
+        if (typeof timer.unref === "function") timer.unref();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/** Kill a reaper that outlived its deadline or was aborted, as the command uid, and
+ *  wait (bounded) for its `close`. A reaper that did not close is `timeout_unkilled`:
+ *  it may still be scanning, so the caller must not launch a run. */
+async function stopReaper(
+  run: StillRunningMode,
+  deps: StandaloneModeDeps,
+): Promise<ReapOrphansResult> {
+  let killed = false;
+  if (run.pid !== undefined) {
+    const kill = deps.killAsCommandUid ?? ((pid: number) => defaultKillAsCommandUid(pid, deps.runKill ?? defaultRunKill));
+    try { killed = kill(run.pid) === true; } catch { killed = false; }
+  }
+  const killNote = run.pid !== undefined && !killed ? "kill not delivered" : undefined;
+  if (await settlesWithin(run.closed, deps.killWaitMs ?? DEFAULT_REAPER_KILL_WAIT_MS)) {
+    return { ok: false, reason: run.kind, ...(killNote ? { detail: killNote } : {}) };
+  }
+  return {
+    ok: false,
+    reason: "timeout_unkilled",
+    detail: `${run.kind}; ${killNote ?? "kill delivered"}; the reaper did not exit`,
+  };
+}
+
+/** The parsed startup reap. `ok:false` carries a reap_error reason or one of the
+ *  worker-side reasons "timeout" / "aborted" (the reaper was killed and closed), "spawn",
+ *  "protocol" (garbage, a missing line or an exit code inconsistent with the line), or
+ *  "timeout_unkilled" (a timed-out or aborted reaper did not close after the kill, so it
+ *  may still be running: no run may start). */
+export type ReapOrphansResult =
+  | {
+      readonly ok: true;
+      readonly scanned: number;
+      readonly live: number;
+      readonly removed: number;
+      readonly retained: number;
+      readonly foreign: number;
+      readonly proof: "held" | "unknown" | "user_alive";
+    }
+  | { readonly ok: false; readonly reason: string; readonly detail?: string };
+
+/**
+ * Run one `--reap-orphans` pass as the command uid and parse its one line.
+ *
+ * INVARIANT (the reaper's proof assumes it): call this ONLY before the worker launches
+ * any run, in the container's fresh PID namespace. A reaper still running at the
+ * deadline, or when `deps.signal` aborts, is SIGKILLed as the command uid (a killed pass
+ * leaves its partial progress and releases its candidate locks) and awaited (bounded,
+ * 10 s by default) until it closes. One that does not close is `timeout_unkilled`, and
+ * the caller must not launch a run. Bounded (6 minutes plus the kill wait by default);
+ * never throws.
+ */
+export async function reapCodexCommandOrphans(deps: StandaloneModeDeps = {}): Promise<ReapOrphansResult> {
+  try {
+    const run = await runOneLineMode("--reap-orphans", undefined, deps.timeoutMs ?? DEFAULT_REAP_TIMEOUT_MS, deps, deps.signal);
+    if (run.kind === "spawn") return { ok: false, reason: "spawn", detail: run.message };
+    if (run.kind === "timeout" || run.kind === "aborted") return await stopReaper(run, deps);
+    if (run.breach !== undefined || run.line === undefined) {
+      return { ok: false, reason: "protocol", detail: run.breach ?? "no result line" };
+    }
+    const event = eventOf(run.line);
+    if (event === "reap") {
+      const r = parseExactObject(run.line, ["event", "scanned", "live", "removed", "retained", "foreign", "proof"]);
+      if (r && isCount(r.scanned) && isCount(r.live) && isCount(r.removed) && isCount(r.retained) && isCount(r.foreign)
+        && r.scanned === r.live + r.removed + r.retained + r.foreign
+        && typeof r.proof === "string" && REAP_PROOFS.has(r.proof) && run.code === 0) {
+        return {
+          ok: true,
+          scanned: r.scanned,
+          live: r.live,
+          removed: r.removed,
+          retained: r.retained,
+          foreign: r.foreign,
+          proof: r.proof as "held" | "unknown" | "user_alive",
+        };
+      }
+    } else if (event === "reap_error") {
+      const r = parseExactObject(run.line, ["event", "reason"]);
+      if (r && typeof r.reason === "string" && REAP_ERROR_REASONS.has(r.reason) && run.code === 2) {
+        return { ok: false, reason: r.reason };
+      }
+    }
+    return { ok: false, reason: "protocol", detail: "unexpected result line or exit code" };
+  } catch (error) {
+    return { ok: false, reason: "protocol", detail: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+/** The outcome of removing one run's cache. `removed`/`absent` carry reason "".
+ *  `retained` carries the supervisor's word. `pending` is a holder release or a
+ *  `--remove-cache` that did not answer in time (the process is not killed: it keeps
+ *  running and settles on its own). `error` is a worker-side failure ("spawn",
+ *  "protocol", "exited", "token") or a cache_error reason. */
+export interface CacheCleanupResult {
+  readonly state: "removed" | "absent" | "retained" | "pending" | "error";
+  readonly reason: string;
+}
+
+/** Parse a cache_cleanup / cache_error line against the mode's vocabulary. */
+function parseCacheOutcome(
+  line: string,
+  code: number | null | undefined,
+  mode: "hold" | "remove",
+): CacheCleanupResult | undefined {
+  const event = eventOf(line);
+  if (event === "cache_cleanup") {
+    const r = parseExactObject(line, ["event", "state", "reason"]);
+    if (!r || typeof r.reason !== "string") return undefined;
+    const retainedWords = mode === "hold" ? HOLD_RETAINED_REASONS : REMOVE_RETAINED_REASONS;
+    // `code` is undefined when the caller has the line but not (yet) the exit status.
+    const codeOk = (want: number): boolean => code === undefined || code === want;
+    if (r.state === "removed" && r.reason === "" && codeOk(0)) return { state: "removed", reason: "" };
+    if (mode === "remove" && r.state === "absent" && r.reason === "" && codeOk(0)) return { state: "absent", reason: "" };
+    if (r.state === "retained" && retainedWords.has(r.reason) && codeOk(3)) return { state: "retained", reason: r.reason };
+    return undefined;
+  }
+  if (event === "cache_error") {
+    const r = parseExactObject(line, ["event", "reason"]);
+    const words = mode === "hold" ? HOLD_ERROR_REASONS : REMOVE_ERROR_REASONS;
+    if (r && typeof r.reason === "string" && words.has(r.reason) && (code === undefined || code === 2)) {
+      return { state: "error", reason: r.reason };
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Remove one run's cache whose holder died mid-run, as the command uid. The caller
+ * attests that every command root that used the cache drained; the supervisor still
+ * refuses a held lock ("retained"/"live"). Bounded (2 minutes by default; a slower
+ * remover is "pending", never killed); never throws.
+ */
+export async function removeCommandCache(token: string, deps: StandaloneModeDeps = {}): Promise<CacheCleanupResult> {
+  if (!validToken(token)) return { state: "error", reason: "token" };
+  try {
+    const run = await runOneLineMode("--remove-cache", token, deps.timeoutMs ?? DEFAULT_REMOVE_CACHE_TIMEOUT_MS, deps);
+    if (run.kind === "spawn") return { state: "error", reason: "spawn" };
+    // Not killed: the remover keeps running and removes or retains on its own.
+    if (run.kind !== "done") return { state: "pending", reason: "" };
+    if (run.breach !== undefined || run.line === undefined) return { state: "error", reason: "protocol" };
+    return parseCacheOutcome(run.line, run.code, "remove") ?? { state: "error", reason: "protocol" };
+  } catch {
+    return { state: "error", reason: "protocol" };
+  }
+}
+
+/** Thrown by {@link startCommandCacheHolder} when no usable cache is held. `reason` is a
+ *  cache_error word or one of "token", "spawn", "timeout", "protocol", "exited". */
+export class CommandCacheStartError extends Error {
+  readonly reason: string;
+  constructor(reason: string) {
+    super(`codex command cache holder did not start (${reason})`);
+    this.name = "CommandCacheStartError";
+    this.reason = reason;
+  }
+}
+
+/** A live per-run command cache held by a `--hold-cache` process for the whole run. */
+export interface CommandCacheHolder {
+  readonly token: string;
+  /** `<CODEX_COMMAND_CACHE_ROOT>/<token>`. */
+  readonly path: string;
+  /** True while the holder runs, has printed nothing past ready, and was not released.
+   *  Once false it never becomes true again, and the holder's stdin is ended then (so a
+   *  holder that was not released sees EOF and retains its directory as "unattested"). */
+  alive(): boolean;
+  /**
+   * Write the one release line (only to a holder still alive), end stdin, and wait
+   * (bounded) for the holder's `close`: its outcome is the cleanup line checked against
+   * the exit code (removed means 0, retained means 3). A timeout returns
+   * `{state:"pending"}` WITHOUT killing the holder: it keeps running and removes or
+   * retains on its own. Idempotent: a second call returns the first result. Never throws.
+   */
+  release(drained: boolean, timeoutMs: number): Promise<CacheCleanupResult>;
+}
+
+/**
+ * Start the per-run cache holder as the command uid and wait (bounded, 10 s by default)
+ * for `cache_ready` naming exactly `<root>/<token>`.
+ *
+ * FAILURE CONTRACT: this THROWS a {@link CommandCacheStartError} (never returns a
+ * half-usable handle) on an invalid token, a spawn failure, a cache_error, garbage, an
+ * early exit or the deadline. On every failure it ends the holder's stdin, so a holder
+ * that did get ready sees EOF without a release and retains the directory as
+ * "unattested" for the startup reaper; nothing is killed.
+ */
+export async function startCommandCacheHolder(token: string, deps: StandaloneModeDeps = {}): Promise<CommandCacheHolder> {
+  if (!validToken(token)) throw new CommandCacheStartError("token");
+  const path = `${CODEX_COMMAND_CACHE_ROOT}/${token}`;
+  let child: StandaloneModeProcess;
+  try {
+    child = spawnStandaloneMode("--hold-cache", token, "pipe", deps);
+  } catch {
+    throw new CommandCacheStartError("spawn");
+  }
+  const stdin = child.stdin;
+  // An EPIPE on a dead holder's stdin must never become an unhandled 'error'.
+  stdin?.on("error", () => undefined);
+  const endStdin = (): void => {
+    try { if (stdin && !stdin.destroyed && !stdin.writableEnded) stdin.end(); } catch { /* holder already gone */ }
+  };
+
+  let ready = false;
+  // `exit` makes the holder not alive at once; its OUTCOME waits for `close`, which Node
+  // emits only after stdout is drained (an `exit` can precede the cleanup line's data).
+  let exitedFlag = false;
+  let closed = false;
+  let closeCode: number | null = null;
+  let breach: string | undefined;
+  let afterReady: string | undefined;
+  let released = false;
+  const waiters = new Set<() => void>();
+  const notify = (): void => { for (const w of waiters) w(); };
+
+  let resolveReady!: () => void;
+  let rejectReady!: (e: CommandCacheStartError) => void;
+  const readyPromise = new Promise<void>((resolve, reject) => { resolveReady = resolve; rejectReady = reject; });
+  // A late rejection (an exit after the deadline already won the race) is expected.
+  readyPromise.catch(() => undefined);
+
+  const onBreach = (why: string): void => {
+    breach = why;
+    if (!ready) rejectReady(new CommandCacheStartError("protocol"));
+    // Fail closed: an unreadable holder gets EOF with no release and retains.
+    endStdin();
+    notify();
+  };
+  const onLine = (line: string): void => {
+    if (!ready) {
+      const event = eventOf(line);
+      if (event === "cache_ready") {
+        const r = parseExactObject(line, ["event", "path"]);
+        if (r && r.path === path) { ready = true; resolveReady(); return; }
+        onBreach("bad ready line");
+        return;
+      }
+      const outcome = parseCacheOutcome(line, undefined, "hold");
+      rejectReady(new CommandCacheStartError(outcome?.state === "error" ? outcome.reason : "protocol"));
+      endStdin();
+      return;
+    }
+    // Any line past ready makes the holder not alive: end stdin so an unreleased holder
+    // sees EOF (and retains) instead of holding its lock until the worker exits.
+    afterReady = line;
+    endStdin();
+    notify();
+  };
+
+  child.on("error", () => {
+    if (!ready) rejectReady(new CommandCacheStartError("spawn"));
+    endStdin();
+    notify();
+  });
+  child.once("exit", () => {
+    exitedFlag = true;
+    if (!ready) rejectReady(new CommandCacheStartError("exited"));
+    endStdin();
+    notify();
+  });
+  child.once("close", (code: number | null) => {
+    exitedFlag = true;
+    closed = true;
+    closeCode = code;
+    if (!ready) rejectReady(new CommandCacheStartError("exited"));
+    notify();
+  });
+  if (!child.stdout || !stdin) {
+    endStdin();
+    throw new CommandCacheStartError("spawn");
+  }
+  readModeLines(child.stdout, 2, onLine, onBreach);
+
+  const timeoutMs = deps.timeoutMs ?? DEFAULT_HOLDER_READY_TIMEOUT_MS;
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      readyPromise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new CommandCacheStartError("timeout")), timeoutMs);
+        if (typeof timer.unref === "function") timer.unref();
+      }),
+    ]);
+  } catch (error) {
+    endStdin();
+    throw error instanceof CommandCacheStartError ? error : new CommandCacheStartError("protocol");
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+
+  const isAlive = (): boolean => !exitedFlag && breach === undefined && afterReady === undefined;
+  /** The holder's final outcome, or undefined while it has not closed. A breach (garbage,
+   *  or a line past the 2-line cap) is final at once. */
+  const settledOutcome = (): CacheCleanupResult | undefined => {
+    if (breach !== undefined) return { state: "error", reason: "protocol" };
+    if (!closed) return undefined;
+    if (afterReady === undefined) return { state: "error", reason: "exited" };
+    return parseCacheOutcome(afterReady, closeCode, "hold") ?? { state: "error", reason: "protocol" };
+  };
+
+  let releasePromise: Promise<CacheCleanupResult> | undefined;
+  return {
+    token,
+    path,
+    alive: () => !released && isAlive(),
+    release: (drained: boolean, releaseTimeoutMs: number): Promise<CacheCleanupResult> => {
+      if (releasePromise) return releasePromise;
+      releasePromise = new Promise<CacheCleanupResult>((resolve) => {
+        const wasAlive = isAlive();
+        released = true;
+        if (wasAlive) {
+          try {
+            stdin.write(`${JSON.stringify({ op: "release", drained: drained === true })}\n`);
+          } catch { /* the EOF below still settles the holder (unattested) */ }
+        }
+        endStdin();
+        let releaseTimer: NodeJS.Timeout | undefined;
+        const check = (): void => {
+          const outcome = settledOutcome();
+          if (outcome === undefined) return;
+          waiters.delete(check);
+          if (releaseTimer) clearTimeout(releaseTimer);
+          resolve(outcome);
+        };
+        waiters.add(check);
+        releaseTimer = setTimeout(() => {
+          waiters.delete(check);
+          resolve({ state: "pending", reason: "" });
+        }, Math.max(0, releaseTimeoutMs));
+        if (typeof releaseTimer.unref === "function") releaseTimer.unref();
+        check();
+      });
+      return releasePromise;
+    },
   };
 }

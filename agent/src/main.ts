@@ -24,8 +24,82 @@ import { uidSplitActive } from "./runner-uid.js";
 import { resolveDockerWiring, dockerSidecarExpected, type DockerWiring } from "./docker-wiring.js";
 import { probeCodexRuntime } from "./codex/codex-runtime-probe.js";
 import { probeLandlockAvailability, resolveCodexHarnessAvailability } from "./codex/codex-capability.js";
+import { reapCodexCommandOrphans, type ReapOrphansResult } from "./codex/launcher.js";
 import type { ClaimCodexSecrets } from "./protocol.js";
 import type { CommandSandboxMode } from "./config.js";
+
+/**
+ * Issue #1598: the worker-startup pass of the Codex command orphan reaper (command tmps
+ * and per-run command caches left behind by a retained cleanup, an unconfirmed drain, or
+ * a killed supervisor/holder). Gated only by the uid split, the one profile with a
+ * command uid, a cache root and the supervisor. It never throws: a missing binary or a
+ * failed pass is logged and startup continues (see {@link startupReapVerdict} for the
+ * two results that stop it).
+ *
+ * `signal` is the worker's shutdown signal: an abort kills the reaper (as on its own
+ * deadline) and returns promptly.
+ *
+ * INVARIANT: call this BEFORE the worker launches ANY run (before `worker.run()`). The
+ * reaper's no-command-user proof assumes a fresh container PID namespace in which no new
+ * command-uid process can start during the pass.
+ */
+export async function reapCodexOrphansAtStartup(
+  log: Pick<Logger, "info" | "warn" | "error">,
+  deps: {
+    readonly splitActive?: boolean;
+    readonly reap?: (signal?: AbortSignal) => Promise<ReapOrphansResult>;
+    readonly signal?: AbortSignal;
+  } = {},
+): Promise<ReapOrphansResult | undefined> {
+  if (!(deps.splitActive ?? uidSplitActive())) return undefined;
+  let result: ReapOrphansResult;
+  try {
+    result = await (deps.reap ?? ((signal?: AbortSignal) => reapCodexCommandOrphans({ signal })))(deps.signal);
+  } catch (err) {
+    // reapCodexCommandOrphans never throws; an injected one might.
+    result = { ok: false, reason: "protocol", detail: errMessage(err) };
+  }
+  if (result.ok) {
+    const fields = {
+      scanned: result.scanned,
+      live: result.live,
+      removed: result.removed,
+      retained: result.retained,
+      foreign: result.foreign,
+      proof: result.proof,
+    };
+    // A retained or live candidate, or an unproven pass, leaves disk behind for the next startup.
+    if (result.retained > 0 || result.live > 0 || result.proof !== "held") log.warn("codex command orphan reap left candidates", fields);
+    else log.info("codex command orphan reap", fields);
+  } else if (result.reason === "timeout_unkilled") {
+    log.error("codex command orphan reaper could not be stopped; no run may start while it may still run", {
+      reason: result.reason,
+      ...(result.detail ? { detail: result.detail } : {}),
+    });
+  } else if (result.reason === "aborted") {
+    log.info("codex command orphan reap aborted by shutdown");
+  } else {
+    log.warn("codex command orphan reap failed", { reason: result.reason, ...(result.detail ? { detail: result.detail } : {}) });
+  }
+  return result;
+}
+
+/**
+ * Issue #1598: what main() does after the startup reap.
+ *   - "exit": the reaper timed out or was aborted and did not close after its kill, so it
+ *     may still be scanning. Starting a run would break the reaper's proof (doc.go: the
+ *     reaper must never overlap a run), so the worker exits non-zero instead: the
+ *     container restart ends every process in its PID namespace, the reaper included,
+ *     and the next start takes a fresh pass.
+ *   - "shutdown": the worker was signalled during the pass; it is stopping anyway, so it
+ *     does not start the claim loops.
+ *   - "run": start the worker (a failed but finished pass only leaves disk behind).
+ */
+export function startupReapVerdict(result: ReapOrphansResult | undefined, aborted: boolean): "run" | "shutdown" | "exit" {
+  if (result !== undefined && !result.ok && result.reason === "timeout_unkilled") return "exit";
+  if (aborted) return "shutdown";
+  return "run";
+}
 
 // Set once the logger exists so the last-resort fatal handler can scrub through
 // the SecretRegistry instead of writing a raw (unredacted) line.
@@ -528,6 +602,23 @@ async function main(): Promise<void> {
       },
       log,
     ).catch((err) => log.warn("run HOME reclaim failed", { error: errMessage(err) }));
+  }
+
+  // Issue #1598: reap Codex command orphans (tmps + per-run caches) from a previous
+  // container. MUST run here, before worker.run(): nothing may launch a run (and so no
+  // command-uid process may start) while the reaper's proof is being taken.
+  const reap = await reapCodexOrphansAtStartup(log, { signal: controller.signal });
+  const verdict = startupReapVerdict(reap, controller.signal.aborted);
+  if (verdict === "exit") {
+    // A reaper that may still run must never overlap a run: exit non-zero so the
+    // container restarts (its PID namespace, and the reaper with it, goes away). The
+    // error was logged above. An explicit exit, not exitCode: the reaper's still-open
+    // child handle would otherwise keep the event loop alive.
+    process.exit(1);
+  }
+  if (verdict === "shutdown") {
+    log.info("uzi-agent stopped during the startup reap; the worker was not started");
+    return;
   }
 
   await worker.run(controller.signal);

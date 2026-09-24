@@ -522,7 +522,9 @@ export function createCodexExecutionSafety(
   // true terminal — which is AFTER run()'s finally under deferRegistryTeardown — so the
   // executor uses this to evict tokens released by the POST-RUN sink reconciles (which
   // run()'s already-completed finally could not have evicted). Idempotent by contract.
-  onDispose?: () => void | Promise<void>,
+  // It receives the dispose request's absolute deadline (epoch ms, taken as the dispose
+  // begins) so bounded terminal work can cap itself by what remains of it.
+  onDispose?: (deadlineAt: number) => void | Promise<void>,
   spawnProcess?: SpawnBoundaryProcessSeam,
 ): CodexExecutionSafetyImpl {
   return new CodexExecutionSafetyImpl(
@@ -531,6 +533,7 @@ export function createCodexExecutionSafety(
       quiesce: (request) => registry.quiesceChildren(request.deadlineMs),
       reap: (request, closedEpoch) => registry.reapProcesses(request.deadlineMs, closedEpoch),
       dispose: async (request) => {
+        const deadlineAt = Date.now() + Math.max(0, request.deadlineMs);
         // `onDispose` (the executor's post-run sink token eviction) must run even if
         // `disposeTools` ever rejects — otherwise those tokens would leak. `disposeTools`
         // catches internally today (never throws), so the `finally` is future-proofing;
@@ -538,7 +541,7 @@ export function createCodexExecutionSafety(
         try {
           return await registry.disposeTools(request.deadlineMs);
         } finally {
-          await onDispose?.();
+          await onDispose?.(deadlineAt);
         }
       },
       spawnRoot,

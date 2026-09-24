@@ -108,12 +108,18 @@ import { CodexSessionStore } from "./session-state.js";
 import { wireFileopHelper, type FileopHelperHandle } from "./fileop-client.js";
 import {
   CODEX_BIN,
+  CODEX_COMMAND_CACHE_ROOT,
   PROVIDER_CHILD_ARGV,
   SUPERVISOR_BIN,
   launchCodexEffectRoot,
   launchCodexRoot,
+  DEFAULT_REMOVE_CACHE_TIMEOUT_MS,
+  removeCommandCache,
+  startCommandCacheHolder,
+  type CacheCleanupResult,
   type CodexEffectLaunchSpec,
   type CodexRootHandle,
+  type CommandCacheHolder,
   type DisposeOutcome,
 } from "./launcher.js";
 import { createCodexTransport } from "./transport.js";
@@ -186,12 +192,27 @@ const COMMAND_ENV_PROTECTED_KEYS: ReadonlySet<string> = new Set([
   "TMPDIR",
   "LANG",
   "HOME",
+  // Issue #1598: the per-run command cache variables. Only commandEffectSpec sets them,
+  // and only to the run's held cache; a provisioned toolEnv can never point a command's
+  // module/build/npm cache anywhere else. NPM_CONFIG_CACHE is npm's upper-case spelling
+  // of the same setting.
+  "GOMODCACHE",
+  "GOCACHE",
+  "npm_config_cache",
+  "NPM_CONFIG_CACHE",
   // Mirror of sdk-env.ts PROTECTED_ENV_KEYS (module-private there; cannot be imported).
   "CLAUDE_CODE_OAUTH_TOKEN",
   "ANTHROPIC_API_KEY",
   "ANTHROPIC_AUTH_TOKEN",
   "AGENT_BROWSER_ARGS",
 ]);
+
+/** Issue #1598: whether `key` is a cache variable commandEffectSpec alone owns (set to the
+ *  held cache or removed). npm reads any `npm_config_*` key case-insensitively, so every
+ *  spelling of npm_config_cache matches; Go reads GOMODCACHE/GOCACHE exactly. */
+function isCommandCacheEnvKey(key: string): boolean {
+  return key === "GOMODCACHE" || key === "GOCACHE" || /^npm_config_cache$/i.test(key);
+}
 
 const DEFAULT_IDLE_MS = 5 * 60 * 1000;
 const DEFAULT_WALL_MS = 60 * 60 * 1000;
@@ -201,6 +222,11 @@ const DEFAULT_WALL_MS = 60 * 60 * 1000;
 // small: the server sweep is periodic, so the local wall must stay a real watchdog.
 const REDRIVE_RACE_ALLOWANCE_MS = 5 * 1000;
 const DEFAULT_BOUNDARY_DEADLINE_MS = 30 * 1000;
+/** Issue #1598: how long the terminal settle waits for the cache holder's cleanup line.
+ *  A slower removal is not killed: the holder finishes on its own ("pending"). */
+const DEFAULT_CACHE_RELEASE_TIMEOUT_MS = 30 * 1000;
+/** Issue #1598: the least a terminal dispose's remaining budget caps a cache wait to. */
+const MIN_CACHE_SETTLE_WAIT_MS = 1000;
 const DEFAULT_CHILD_TURN_DEADLINE_MS = 10 * 60 * 1000;
 // The single-milestone implement/review iteration budget when the claim omits one, matching
 // sdk-executor's DEFAULT_MAX_ITERATIONS (PRD: RUN_MAX_ITERATIONS default 5). Codex carries no
@@ -1222,6 +1248,19 @@ export interface CodexExecutorDeps {
    *  runner sink), `run()`'s finally is the sole teardown and reaps+disposes the registry
    *  itself (the backstop). The runner (main.ts) sets it true. */
   readonly deferRegistryTeardown?: boolean;
+  /** Issue #1598: start the run's command cache holder. Production uses
+   *  {@link startCommandCacheHolder} when the uid split is active and holds no cache
+   *  otherwise; a test injects a fake (which applies regardless of the split). A rejection
+   *  means the run proceeds WITHOUT cache variables. */
+  readonly startCacheHolder?: (token: string) => Promise<CommandCacheHolder>;
+  /** Issue #1598: remove a cache whose holder died mid-run (production:
+   *  {@link removeCommandCache}), waiting at most `timeoutMs`. Called only when every root
+   *  that used it drained. */
+  readonly removeCommandCache?: (token: string, timeoutMs: number) => Promise<CacheCleanupResult>;
+  /** Issue #1598: the bound on the holder's release answer (default 30 s). */
+  readonly cacheReleaseTimeoutMs?: number;
+  /** Issue #1598: the bound on a `--remove-cache` answer (default 2 minutes). */
+  readonly cacheRemoveTimeoutMs?: number;
 }
 
 export interface CodexExecutorOptions {
@@ -1291,7 +1330,12 @@ interface EpochSharedContext {
   readonly spawnBoundaryRoot: SpawnRootSeam;
   readonly boundaryProcessSpawner: SpawnBoundaryProcessSeam;
   readonly reconcile: ReconcileBeforeBoundary;
-  readonly evictTokens: () => void;
+  /** The FINAL epoch's safety.dispose hook: evicts the post-run sink tokens, then settles
+   *  the run's command cache (issue #1598) within the dispose's absolute deadline
+   *  (`deadlineAt`, epoch ms) when one is known. Never throws. */
+  readonly onTerminalDispose: (deadlineAt?: number) => Promise<void>;
+  /** Issue #1598: the run's held command cache, or undefined when none is held. */
+  readonly commandCache: RunCommandCache | undefined;
   /** PRD #1332 C4a / CodeRabbit 4004800880: one accountant for this executor claim leg, shared
    *  across provider-epoch recreation. A later worker claim constructs a new executor/accountant and
    *  emits a new init lineage, so its resumed-thread delta is summed rather than GREATEST-folded into
@@ -1471,6 +1515,29 @@ export class CodexExecutor implements Executor {
     let epoch: ProviderEpoch | undefined;
     let epochIndex = 0;
     let provisionDir: string | undefined;
+    // Issue #1598: the run's ONE command cache (a `--hold-cache` process as the command uid),
+    // or undefined when none is held. Settled exactly once at the run's TERMINAL registry
+    // teardown (see settleCommandCache below), never earlier, because post-run durability
+    // sinks can still launch command-identity boundary processes carrying its env.
+    let runCache: HeldRunCommandCache | undefined;
+    // `deadlineAt` (epoch ms) is the terminal dispose's own deadline: each wait is capped
+    // to what remains of it (never below MIN_CACHE_SETTLE_WAIT_MS), so the settle cannot
+    // hold the dispose past its budget by the full configured bound. An expired wait is
+    // "pending": the holder (or remover) is not killed and finishes on its own; a cache
+    // it leaves behind is the startup reaper's.
+    const settleCommandCache = async (deadlineAt?: number): Promise<void> => {
+      if (runCache === undefined) return;
+      const capped = (configured: number): number =>
+        deadlineAt === undefined ? configured : Math.min(configured, Math.max(MIN_CACHE_SETTLE_WAIT_MS, deadlineAt - Date.now()));
+      await runCache.settle(
+        this.log,
+        this.deps.removeCommandCache ?? ((token: string, timeoutMs: number) => removeCommandCache(token, { timeoutMs })),
+        {
+          releaseMs: capped(this.deps.cacheReleaseTimeoutMs ?? DEFAULT_CACHE_RELEASE_TIMEOUT_MS),
+          removeMs: capped(this.deps.cacheRemoveTimeoutMs ?? DEFAULT_REMOVE_CACHE_TIMEOUT_MS),
+        },
+      );
+    };
     try {
       // INITIALIZATION (trust boundary): materialize the SHARED provisioning root and a FRESH
       // per-run HOME BEFORE anything (a devbox/nix subprocess with HOME=provisionHomeDir) can
@@ -1514,6 +1581,23 @@ export class CodexExecutor implements Executor {
         provisioned.toolEnv,
       );
 
+      // Issue #1598: hold ONE per-run command cache BEFORE any command root can launch (the
+      // epoch-0 fileop root below launches first but never gets the cache). Under the uid split only (the cache root
+      // exists only there), or through the injected test seam. A failed start is not a run
+      // failure: commands then get no cache variables (Go/npm fall back to a cold cache
+      // inside the per-command private tmp, which the supervisor still cleans).
+      const startCacheHolder = this.deps.startCacheHolder
+        ?? (uidSplitActive() ? (token: string) => startCommandCacheHolder(token) : undefined);
+      if (startCacheHolder !== undefined) {
+        try {
+          runCache = new HeldRunCommandCache(await startCacheHolder(randomUUID()));
+        } catch (error) {
+          this.log.warn("codex command cache unavailable; commands run without a shared cache", {
+            error: errMessage(error),
+          });
+        }
+      }
+
       // The ONE per-run MCP/forge/memory/findings/skill handler map, SHARED by EVERY epoch's root
       // + child brokers. Built HERE (once per run(), NOT per epoch/turn) because the forge + memory
       // handlers hold per-RUN budget counters a rebuild would reset. render.ts decides WHICH names
@@ -1539,7 +1623,7 @@ export class CodexExecutor implements Executor {
         this.deps.spawnBoundaryRoot ??
         ((): Promise<RegisteredRoot> =>
           Promise.reject(new Error("codex boundary-action spawn seam is not wired (the runner drives spawnBoundaryProcess)")));
-      const boundaryProcessSpawner = makeBoundaryProcessSpawner(launchEffectRoot, commandSandbox, this.log);
+      const boundaryProcessSpawner = makeBoundaryProcessSpawner(launchEffectRoot, commandSandbox, this.log, runCache);
       const reconcile = this.makeBoundaryReconcile(ctx.runId, registerToken, committedGeneration);
       // (C, F1) Terminal eviction of tokens released by the POST-RUN sink reconciles. The runner
       // calls safety.dispose after the last durability sink — by which point run()'s finally has
@@ -1550,6 +1634,14 @@ export class CodexExecutor implements Executor {
       const evictTokens = (): void => {
         for (const token of releasedTokens) this.log.removeSecret(token);
         releasedTokens.clear();
+      };
+      // Issue #1598: the same terminal point settles the command cache, AFTER the registry's
+      // tools are disposed (safety.dispose runs disposeTools, then this hook) and so after every
+      // post-run sink's command-identity boundary process. The settle is idempotent and never
+      // throws, so a dispose can never change the run outcome.
+      const onTerminalDispose = async (deadlineAt?: number): Promise<void> => {
+        evictTokens();
+        await settleCommandCache(deadlineAt);
       };
 
       // The per-run state every epoch is built from. Everything here is SHARED and closed over
@@ -1592,7 +1684,8 @@ export class CodexExecutor implements Executor {
         spawnBoundaryRoot,
         boundaryProcessSpawner,
         reconcile,
-        evictTokens,
+        onTerminalDispose,
+        commandCache: runCache,
         // One accountant for this executor claim leg. Internal provider epochs share its cumulative;
         // a later worker claim gets a new accountant and a new explicit init lineage.
         accountant: new CodexUsageAccountant(),
@@ -1847,6 +1940,12 @@ export class CodexExecutor implements Executor {
       // tokens are evicted by the onDispose hook wired into the FINAL epoch's safety.dispose.
       for (const token of releasedTokens) this.log.removeSecret(token);
       releasedTokens.clear();
+      // Issue #1598: settle the command cache HERE only when this finally IS the terminal
+      // teardown: a standalone executor (the registry was just torn down above), or a deferred
+      // one that never built an epoch (so `this.safety` is unset and the runner has no dispose
+      // to call). Otherwise the FINAL epoch's safety.dispose hook settles it after the runner's
+      // post-run sinks. Never throws.
+      if (!this.deps.deferRegistryTeardown || epoch === undefined) await settleCommandCache();
       // Remove the per-run provisioning dir (the synthesized devbox.json + profile symlinks).
       // The nix STORE is global (on the data volume), NOT here, so this never evicts the
       // warm-start cache. Best-effort, mirroring sdk-executor. Absent ⇒ nothing was provisioned.
@@ -1881,7 +1980,8 @@ export class CodexExecutor implements Executor {
     const {
       provider, binding, worktreePath, storeDir, homeRoot, boundaryDeadlineMs, childTurnDeadlineMs,
       commandEnv, commandSandbox, screenPolicy, toolHandlers, registerToken, committedGeneration, launchEffectRoot,
-      spawnBoundaryRoot, boundaryProcessSpawner, reconcile, evictTokens, accountant, scrubProjected,
+      spawnBoundaryRoot, boundaryProcessSpawner, reconcile, onTerminalDispose, accountant, scrubProjected,
+      commandCache,
     } = shared;
 
     // Per-epoch trust-boundary REVALIDATION: re-verify the run HOME + codex-data parent's
@@ -1905,7 +2005,16 @@ export class CodexExecutor implements Executor {
     // closures (so credential/generation state is continuous across epochs). Only the FINAL
     // epoch's safety.dispose ever runs evictTokens (an abandoned epoch's dispose tears its
     // registry down directly, never through this facade).
-    const safety = createCodexExecutionSafety(registry, spawnBoundaryRoot, reconcile, evictTokens, boundaryProcessSpawner);
+    commandCache?.watchRegistry(registry);
+    // Issue #1598: the terminal hook is handed the dispose request's absolute deadline, so
+    // the command cache settle is capped by what remains of it.
+    const safety = createCodexExecutionSafety(
+      registry,
+      spawnBoundaryRoot,
+      reconcile,
+      (deadlineAt) => onTerminalDispose(deadlineAt),
+      boundaryProcessSpawner,
+    );
 
     let harness: CodexHarness | undefined;
     let fileopHandle: FileopHelperHandle | undefined;
@@ -1938,8 +2047,11 @@ export class CodexExecutor implements Executor {
         commandEnv,
         commandSandbox,
         this.log,
+        commandCache,
       );
       const spawnCommand: SpawnCommandSeam = (argv, spawnOpts) => baseSpawnCommand(argv, { ...spawnOpts, env: commandEnv });
+      // Issue #1598: least privilege: the fileop helper never runs Go or npm, so it gets no
+      // `--cache` (and commandEffectSpec strips the cache variables from its env).
       const fileopRoot = await launchRegisteredEffectRoot(
         registry,
         launchEffectRoot,
@@ -2633,9 +2745,9 @@ interface RegisteredEffectRoot {
  *  private tmp: on a clean disposal (the drained dispose's tmpCleanup) and on an
  *  unclean one (the tmpCleanup of an abnormal event whose cleanup drained, or of a
  *  drained dispose the exit then contradicted). Diagnostic only: a retained tmp is
- *  disk left behind for the startup orphan reaper (supervisor --reap-orphans,
- *  added with the reaper), so the
- *  reap/dispose result is unchanged. */
+ *  disk left behind for the startup orphan reaper (`reapCodexCommandOrphans`, which
+ *  main.ts runs before the worker launches any run), so the reap/dispose result is
+ *  unchanged. */
 function makeTmpRetainedReporter(log: Pick<Logger, "warn"> | undefined): (outcome: DisposeOutcome) => void {
   let reported = false;
   return (outcome) => {
@@ -2670,6 +2782,161 @@ export function registeredRoot(
   };
 }
 
+type EffectLaunch = (spec: CodexEffectLaunchSpec, deadlineMs?: number) => Promise<CodexRootHandle>;
+
+/** Issue #1598: the run's command cache as a command-identity launch site sees it. */
+export interface RunCommandCache {
+  /** The cache a NEW command launch may use, or undefined: none is held, the holder
+   *  exited or misbehaved, or the run's cache was already settled. Once undefined it stays
+   *  undefined, so a command launched after holder loss never gets `--cache` (a later
+   *  `--remove-cache` could otherwise race it). */
+  current(): { readonly dir: string } | undefined;
+  /** Wrap a launch whose spec carries this cache, so its root's disposal outcome counts
+   *  toward the drained attestation. */
+  track(launch: EffectLaunch): EffectLaunch;
+  /** Record a registry whose poison makes the attestation false. */
+  watchRegistry(registry: ExecutionRegistry): void;
+}
+
+/** Resolve the cache for ONE command-identity launch: its directory plus the tracked
+ *  launch, or no directory and the launch unchanged. */
+function cacheForLaunch(cache: RunCommandCache | undefined, launch: EffectLaunch): { readonly dir?: string; readonly launch: EffectLaunch } {
+  const current = cache?.current();
+  return current !== undefined && cache !== undefined ? { dir: current.dir, launch: cache.track(launch) } : { launch };
+}
+
+/**
+ * Issue #1598: the run's held command cache plus the evidence for its release.
+ *
+ * DRAINED ATTESTATION: true iff every command-identity root launched WITH this cache
+ * reported a clean disposal (its registeredRoot reap/dispose, which both go through
+ * the handle's dispose) AND no provider-epoch registry of the run was ever poisoned
+ * (`isPoisoned()` is sticky across disposal). A launch that threw after the spec named the
+ * cache, an unclean or rejected disposal, or a root never disposed by the terminal settle
+ * makes it false. False is the safe direction: the directory is retained for the startup
+ * reaper.
+ */
+export class HeldRunCommandCache implements RunCommandCache {
+  private readonly holder: CommandCacheHolder;
+  private readonly registries: ExecutionRegistry[] = [];
+  private openRoots = 0;
+  private unclean = false;
+  private settling: Promise<void> | undefined;
+
+  constructor(holder: CommandCacheHolder) {
+    this.holder = holder;
+  }
+
+  current(): { readonly dir: string } | undefined {
+    if (this.settling !== undefined || !this.holder.alive()) return undefined;
+    return { dir: this.holder.path };
+  }
+
+  watchRegistry(registry: ExecutionRegistry): void {
+    this.registries.push(registry);
+  }
+
+  track(launch: EffectLaunch): EffectLaunch {
+    return async (spec, deadlineMs) => {
+      this.openRoots += 1;
+      let settled = false;
+      const settle = (clean: boolean): void => {
+        if (!clean) this.unclean = true;
+        if (!settled) {
+          settled = true;
+          this.openRoots -= 1;
+        }
+      };
+      let handle: CodexRootHandle;
+      try {
+        handle = await launch(spec, deadlineMs);
+      } catch (error) {
+        // The spec named the cache; whether the command ran is unknown.
+        settle(false);
+        throw error;
+      }
+      return {
+        started: handle.started,
+        supervisorPid: handle.supervisorPid,
+        transport: handle.transport,
+        snapshot: (timeoutMs) => handle.snapshot(timeoutMs),
+        waitChild: (timeoutMs) => handle.waitChild(timeoutMs),
+        dispose: async (timeoutMs) => {
+          let outcome: DisposeOutcome;
+          try {
+            outcome = await handle.dispose(timeoutMs);
+          } catch (error) {
+            settle(false);
+            throw error;
+          }
+          settle(outcome.clean);
+          return outcome;
+        },
+        get failed() { return handle.failed; },
+        whenFailed: handle.whenFailed,
+      };
+    };
+  }
+
+  drained(): boolean {
+    return !this.unclean && this.openRoots === 0 && !this.registries.some((registry) => registry.isPoisoned());
+  }
+
+  /**
+   * Settle the cache once, at the run's terminal registry teardown. Idempotent; never
+   * throws; logs every outcome and never changes the run's.
+   *   - holder alive: release(drained); a retained or failed result is a warn with its reason,
+   *     a slow answer is "pending" (the holder settles on its own, never killed);
+   *   - holder lost and drained: `--remove-cache` (the worker's registry attests the drain),
+   *     a slow answer is likewise "pending";
+   *   - holder lost and not drained: retained for the startup reaper.
+   * `waits` bounds the release and the removal answers (ms).
+   */
+  settle(
+    log: Pick<Logger, "info" | "warn">,
+    remove: (token: string, timeoutMs: number) => Promise<CacheCleanupResult>,
+    waits: { readonly releaseMs: number; readonly removeMs: number },
+  ): Promise<void> {
+    if (this.settling !== undefined) return this.settling;
+    const token = this.holder.token;
+    // Compute BEFORE the flag flips current(): no launch can start past this point.
+    const alive = this.holder.alive();
+    const drained = this.drained();
+    this.settling = (async () => {
+      try {
+        if (alive) {
+          const result = await this.holder.release(drained, waits.releaseMs);
+          logCacheOutcome(log, "codex command cache released", token, drained, result);
+        } else if (drained) {
+          const result = await remove(token, waits.removeMs);
+          logCacheOutcome(log, "codex command cache removed after holder loss", token, drained, result);
+        } else {
+          log.warn("codex command cache retained for the startup reaper", { cache: token, drained, reason: "holder lost" });
+        }
+      } catch (error) {
+        log.warn("codex command cache settle failed; retained for the startup reaper", { cache: token, error: errMessage(error) });
+      }
+    })();
+    return this.settling;
+  }
+}
+
+function logCacheOutcome(
+  log: Pick<Logger, "info" | "warn">,
+  msg: string,
+  token: string,
+  drained: boolean,
+  result: CacheCleanupResult,
+): void {
+  const fields = { cache: token, drained, state: result.state, reason: result.reason };
+  if (result.state === "pending") {
+    // Not killed: the holder (or remover) finishes on its own; anything it leaves behind is
+    // the startup reaper's.
+    log.info(`${msg}: pending, the cache process finishes on its own`, fields);
+  } else if (result.state === "removed" || result.state === "absent") log.info(msg, fields);
+  else log.warn(msg, fields);
+}
+
 async function launchRegisteredEffectRoot(
   registry: ExecutionRegistry,
   launch: (spec: CodexEffectLaunchSpec, deadlineMs?: number) => Promise<CodexRootHandle>,
@@ -2701,6 +2968,9 @@ async function launchRegisteredEffectRoot(
  * read-only system/toolchain paths, so sibling `/data`, `/run`, `/proc` and `/tmp`
  * state cannot be enumerated even though every run shares numeric uid 10003.
  *
+ * Issue #1598: an optional per-run `cacheDir` (`<cache root>/<uuid>`) is emitted as
+ * `--cache <dir>` after `--cwd` and before `--mode`; the sandbox Landlock-grants exactly it.
+ *
  * PRD #1493 M3: the worker-supplied sandbox `mode` is emitted as a `--mode <mode>`
  * token BEFORE the `--` separator. It is the trusted worker's Config value (never
  * run/repo/model input); a `--mode` token that the model puts in `command`/`args`
@@ -2713,6 +2983,7 @@ export function commandSandboxArgv(
   args: readonly string[],
   privateTmp: string,
   mode: CommandSandboxMode,
+  cacheDir?: string,
 ): string[] {
   const worktree = path.resolve(worktreePath);
   const workCwd = path.resolve(cwd);
@@ -2723,10 +2994,14 @@ export function commandSandboxArgv(
   if (!path.isAbsolute(privateTmp) || privateTmp === path.parse(privateTmp).root) {
     throw new Error("command private tmp must be an absolute non-root path");
   }
+  if (cacheDir !== undefined && (path.dirname(cacheDir) !== CODEX_COMMAND_CACHE_ROOT || path.resolve(cacheDir) !== cacheDir)) {
+    throw new Error("command cache must be a clean child of the command cache root");
+  }
   return [
     "--root", worktree,
     "--tmp", privateTmp,
     "--cwd", workCwd,
+    ...(cacheDir === undefined ? [] : ["--cache", cacheDir]),
     "--mode", mode,
     "--", command, ...args,
   ];
@@ -2770,15 +3045,26 @@ function commandEffectSpec(
   args: readonly string[],
   env: NodeJS.ProcessEnv,
   mode: CommandSandboxMode,
+  cacheDir?: string,
 ): CodexEffectLaunchSpec {
   const cleanupToken = randomUUID();
   const privateTmp = `/tmp/uzi-codex-command-${cleanupToken}`;
+  // Issue #1598: HOME and TMPDIR always stay the per-command private tmp. Only the three
+  // cache variables point into the run's shared cache, and only when one is held; without
+  // one they are removed, so a command never names a cache the sandbox did not grant.
+  const commandEnv: NodeJS.ProcessEnv = { ...env };
+  for (const key of Object.keys(commandEnv)) if (isCommandCacheEnvKey(key)) delete commandEnv[key];
+  if (cacheDir !== undefined) {
+    commandEnv.GOMODCACHE = `${cacheDir}/gomod`;
+    commandEnv.GOCACHE = `${cacheDir}/gocache`;
+    commandEnv.npm_config_cache = `${cacheDir}/npm`;
+  }
   return {
     identity: "command",
     command: COMMAND_SANDBOX_BIN,
-    args: commandSandboxArgv(worktreePath, cwd, command, args, privateTmp, mode),
+    args: commandSandboxArgv(worktreePath, cwd, command, args, privateTmp, mode, cacheDir),
     cwd: worktreePath,
-    env: { ...env, HOME: privateTmp, TMPDIR: privateTmp },
+    env: { ...commandEnv, HOME: privateTmp, TMPDIR: privateTmp },
     supervisorBin: SUPERVISOR_BIN,
     cleanupToken,
   };
@@ -2795,13 +3081,15 @@ export function makeDefaultSpawnCommand(
   commandEnv: NodeJS.ProcessEnv,
   mode: CommandSandboxMode,
   log?: Pick<Logger, "warn">,
+  cache?: RunCommandCache,
 ): SpawnCommandSeam {
   return async (argv, opts): Promise<SpawnCommandResult> => {
       const [cmd, ...rest] = argv;
+      const withCache = cacheForLaunch(cache, launch);
       const launched = await launchRegisteredEffectRoot(
         registry,
-        launch,
-        commandEffectSpec(worktreePath, opts.cwd ?? worktreePath, cmd ?? "/bin/sh", rest, opts.env ?? commandEnv, mode),
+        withCache.launch,
+        commandEffectSpec(worktreePath, opts.cwd ?? worktreePath, cmd ?? "/bin/sh", rest, opts.env ?? commandEnv, mode, withCache.dir),
         reapDeadlineMs,
         "command",
         log,
@@ -2884,12 +3172,16 @@ function makeBoundaryProcessSpawner(
   launch: (spec: CodexEffectLaunchSpec, deadlineMs?: number) => Promise<CodexRootHandle>,
   mode: CommandSandboxMode,
   log?: Pick<Logger, "warn">,
+  cache?: RunCommandCache,
 ): SpawnBoundaryProcessSeam {
   return async (request: BoundaryProcessRequest, deadlineMs: number): Promise<SpawnedBoundaryProcess> => {
     const [command, ...args] = request.argv;
     if (!command) throw new Error("boundary process argv is empty");
+    // Issue #1598: a command-identity boundary process (a post-run durability sink) uses the
+    // run's cache like any command; a worker_pat one never does.
+    const withCache = request.identity === "command" ? cacheForLaunch(cache, launch) : { launch };
     const spec: CodexEffectLaunchSpec = request.identity === "command"
-      ? commandEffectSpec(request.cwd, request.cwd, command, args, request.env, mode)
+      ? commandEffectSpec(request.cwd, request.cwd, command, args, request.env, mode, withCache.dir)
       : {
           identity: "worker_pat",
           command,
@@ -2898,7 +3190,7 @@ function makeBoundaryProcessSpawner(
           env: request.env,
           supervisorBin: SUPERVISOR_BIN,
         };
-    const handle = await launch(spec, deadlineMs);
+    const handle = await withCache.launch(spec, deadlineMs);
     // stderr is consumed by GitCache for all boundary processes. The provider
     // adapter below drains its otherwise-unused stderr independently.
     return {
