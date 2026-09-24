@@ -59,6 +59,14 @@
 //    defense-in-depth to keep a wired worker on ITS OWN sidecar, and mount-ns (Decision 3)
 //    — not this redirect check — is the containment. A modelling of shell env state is out
 //    of scope and would risk the tokenizer.
+//  - The mass-signal rule (#1576: pkill, killall, fuser -k, a broadcast/process-group
+//    `kill`, or `kill` of PIDs enumerated by lsof/pgrep/ps/fuser) is defense in depth,
+//    NOT containment. A shell parser cannot prove that a variable-expanded PID lies
+//    outside the agent's own process tree, so `kill "$pid"` stays allowed; the
+//    lsof/pgrep/ps/fuser co-occurrence test for a dynamic `kill` target is a heuristic a
+//    determined command evades (e.g. a PID read from a file an earlier call wrote). The
+//    primary fixes are the worker image shipping a real lsof (#1575, a busybox lsof
+//    ignores its filters and lists every process) and the role guidance.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -154,6 +162,7 @@ const REASON_ENV = "denied by guardrail: reading the process environment is not 
 const ENV_READ_ALLOWLIST: ReadonlySet<string> = new Set(["PATH", "TMPDIR"]);
 const REASON_PS = "denied by guardrail: inspecting the process table is not permitted";
 const REASON_PROC = "denied by guardrail: reading /proc is not permitted";
+const REASON_MASS_SIGNAL = "denied by guardrail: mass-signal kill commands (pkill, killall, fuser -k, kill of a broadcast/process-group target, or kill of PIDs enumerated by lsof/pgrep/ps/fuser) can kill the agent's own process tree; stop a background task through the harness, or kill \"$pid\" with the exact PID saved at launch";
 const REASON_SECRET_FILE = "denied by guardrail: reading the worker credential file is not permitted";
 // PRD #83 M1 (Q3): docker is inert without a daemon sidecar wired (DOCKER_HOST/keystone
 // resolver). Content-free — never echo the command.
@@ -477,10 +486,72 @@ function analyzeDocker(cmd: string[], assignments: readonly string[], dockerWire
   return ALLOW;
 }
 
+/** Whole-command state collected while screening, read once by screenBashCommand after
+ *  every segment (including `sh -c`/`eval` inner screens) has been analyzed. */
+interface ScreenCtx {
+  /** A `kill` whose target PID is only known at run time (`$…`/backtick, or none at
+   *  all because it arrives on stdin through a peeled `xargs`). */
+  dynamicKill: boolean;
+}
+
+/** Signal-by-name commands that always target every matching process (#1576). */
+const MASS_SIGNAL_BASES = new Set(["pkill", "killall", "killall5"]);
+
+/** `kill` options that only list signal names; they send nothing. */
+const KILL_LIST_FLAGS = new Set(["-l", "-L", "--list", "--table"]);
+
+/** A PID enumerator named anywhere in the raw command string, optionally path-prefixed.
+ *  Paired with ScreenCtx.dynamicKill to catch `kill $(lsof -ti :3000)` and friends. The
+ *  boundaries include quotes, `$`, `(`, and backtick because the tokenizer does not parse
+ *  command substitution, so this runs on the raw string, not on tokens (#1576). */
+const ENUMERATOR_RE = /(?:^|[\s;&|()`"'/$,])(?:lsof|pgrep|ps|fuser)(?=$|[\s;&|)`"'])/;
+
+/**
+ * Screen a `kill` simple command (#1576). Positional parse: `-s`/`-n` consume the next
+ * word as the signal; a list flag (`-l`) is harmless; `--` ends options; the FIRST
+ * `-X` before any target is the signal spec, and every word after the signal spec (or
+ * `--`) is a target. So `kill -9 -1` targets -1 (every process) while a bare `kill -1`
+ * is only a signal spec with no target.
+ *
+ * A target of `0` (the caller's own process group) or any negative target (a broadcast
+ * or a process group) is denied outright. A target carrying `$` or a backtick, or no
+ * target at all (`xargs kill`, whose PIDs arrive on stdin), is only MARKED dynamic here:
+ * screenBashCommand denies it when the same command also names a PID enumerator. This is
+ * defense in depth, not containment (see the file header's Residual list).
+ */
+function analyzeKill(args: string[], ctx: ScreenCtx): BashScreenResult {
+  let signalSeen = false;
+  let optionsDone = false;
+  let targets = 0;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if (!optionsDone && !signalSeen && targets === 0) {
+      if (KILL_LIST_FLAGS.has(a)) return ALLOW;
+      if (a === "--") { optionsDone = true; continue; }
+      if (a === "-s" || a === "-n") { signalSeen = true; i++; continue; }
+      if (a.startsWith("-") && a.length > 1) { signalSeen = true; continue; }
+    } else if (!optionsDone && targets === 0 && a === "--") {
+      optionsDone = true;
+      continue;
+    }
+    targets++;
+    if (a === "0" || a.startsWith("-")) return deny(REASON_MASS_SIGNAL);
+    if (a.includes("$") || a.includes("`")) ctx.dynamicKill = true;
+  }
+  if (targets === 0) ctx.dynamicKill = true;
+  return ALLOW;
+}
+
+/** `fuser` only signals with `-k`/`--kill` (alone or in a short-flag cluster like `-km`);
+ *  a plain `fuser 3000/tcp` just reports PIDs. */
+function fuserKills(args: string[]): boolean {
+  return args.some((a) => a === "--kill" || (a.startsWith("-") && !a.startsWith("--") && a.slice(1).includes("k")));
+}
+
 /** Analyze one simple command (operator-free word list) after wrapper + leading-
  *  assignment peeling. `assignments` are the peeled `VAR=value` prefixes (from
  *  analyzeSegment), inspected only for a DOCKER_HOST= daemon redirect (B5). */
-function analyzeSimple(cmd: string[], secretPaths: readonly string[], dockerWired: boolean, assignments: readonly string[]): BashScreenResult {
+function analyzeSimple(cmd: string[], secretPaths: readonly string[], dockerWired: boolean, assignments: readonly string[], ctx: ScreenCtx): BashScreenResult {
   if (cmd.length === 0) return ALLOW; // only env assignments, no command word — runs nothing
   if (cmd.some((w) => w.includes("/proc/"))) return deny(REASON_PROC);
   if (cmd.some((w) => hitsSecret(w, secretPaths))) return deny(REASON_SECRET_FILE);
@@ -500,6 +571,11 @@ function analyzeSimple(cmd: string[], secretPaths: readonly string[], dockerWire
     return deny(REASON_ENV);
   }
   if (base === "ps" || base === "pgrep") return deny(REASON_PS);
+  // Mass-signal kills (#1576): these reach the agent's own process tree. Checked here,
+  // after the wrapper peel, so `sudo`/`timeout`/`sh -c`/`eval` forms are caught too.
+  if (MASS_SIGNAL_BASES.has(base)) return deny(REASON_MASS_SIGNAL);
+  if (base === "fuser" && fuserKills(cmd.slice(1))) return deny(REASON_MASS_SIGNAL);
+  if (base === "kill") return analyzeKill(cmd.slice(1), ctx);
   if (base === "git") return analyzeGit(cmd.slice(1));
   if (DOCKER_BASES.has(base)) return analyzeDocker(cmd, assignments, dockerWired);
   // B5 compound form: `export DOCKER_HOST=…; docker …` / `declare -x DOCKER_CONTEXT=…`
@@ -524,7 +600,7 @@ function analyzeSimple(cmd: string[], secretPaths: readonly string[], dockerWire
  * docker analyzer for the B5 DOCKER_HOST= redirect check, INCLUDING across an `sh -c`/
  * `eval` wrapper (a prefix assignment is exported to that subshell).
  */
-function analyzeSegment(words: string[], depth: number, secretPaths: readonly string[], dockerWired: boolean, inherited: readonly string[]): BashScreenResult {
+function analyzeSegment(words: string[], depth: number, secretPaths: readonly string[], dockerWired: boolean, inherited: readonly string[], ctx: ScreenCtx): BashScreenResult {
   const assignments: string[] = [...inherited];
   let i = 0;
   while (i < words.length) {
@@ -554,12 +630,12 @@ function analyzeSegment(words: string[], depth: number, secretPaths: readonly st
       const inner = shellDashCArg(words, i + 1);
       // A prefix env-assignment is exported to the subshell, so carry it into the inner
       // screen (`DOCKER_HOST=x sh -c 'docker ps'` must still see the redirect).
-      if (inner !== undefined) return screenWithDepth(inner, depth + 1, secretPaths, dockerWired, assignments);
+      if (inner !== undefined) return screenWithDepth(inner, depth + 1, secretPaths, dockerWired, ctx, assignments);
       return ALLOW; // `bash script.sh` — the script file cannot be inspected statically
     }
 
     if (base === "eval") {
-      return screenWithDepth(words.slice(i + 1).join(" "), depth + 1, secretPaths, dockerWired, assignments);
+      return screenWithDepth(words.slice(i + 1).join(" "), depth + 1, secretPaths, dockerWired, ctx, assignments);
     }
 
     if (GENERIC_WRAPPERS.has(base)) {
@@ -570,7 +646,7 @@ function analyzeSegment(words: string[], depth: number, secretPaths: readonly st
     }
     break;
   }
-  return analyzeSimple(words.slice(i), secretPaths, dockerWired, assignments);
+  return analyzeSimple(words.slice(i), secretPaths, dockerWired, assignments, ctx);
 }
 
 function screenWithDepth(
@@ -578,16 +654,21 @@ function screenWithDepth(
   depth: number,
   secretPaths: readonly string[],
   dockerWired: boolean,
+  ctx: ScreenCtx,
   assignments: readonly string[] = [],
 ): BashScreenResult {
   if (depth > MAX_DEPTH) return deny(REASON_DEPTH);
   if (command.includes("/proc/")) return deny(REASON_PROC);
   if (hitsSecret(command, secretPaths)) return deny(REASON_SECRET_FILE);
+  // Keep scanning after the first denial so `ctx` sees every segment: the mass-signal
+  // check in screenBashCommand must see the `kill` in `kill -9 $(pgrep node)` even though
+  // the `pgrep` segment already denied. The FIRST denial is still the one returned.
+  let first: BashScreenResult | undefined;
   for (const seg of splitSegments(tokenize(command))) {
-    const r = analyzeSegment(seg, depth, secretPaths, dockerWired, assignments);
-    if (r.denied) return r;
+    const r = analyzeSegment(seg, depth, secretPaths, dockerWired, assignments, ctx);
+    if (r.denied && !first) first = r;
   }
-  return ALLOW;
+  return first ?? ALLOW;
 }
 
 /**
@@ -607,7 +688,15 @@ export function screenBashCommand(
   extraSecretPaths: readonly string[] = [],
   dockerWired = false,
 ): BashScreenResult {
-  return screenWithDepth(command, 0, [...SECRET_PATH_PREFIXES, ...extraSecretPaths], dockerWired);
+  const ctx: ScreenCtx = { dynamicKill: false };
+  const result = screenWithDepth(command, 0, [...SECRET_PATH_PREFIXES, ...extraSecretPaths], dockerWired, ctx);
+  // #1576: a `kill` of a run-time PID in the same command as a PID enumerator
+  // (`kill $(lsof -ti :3000)`, `lsof -ti :3000 | xargs kill`) is a mass-signal kill: a
+  // busybox lsof ignores its filters and lists every process, the agent's own included.
+  // Takes precedence over another reason (REASON_PS for `kill $(pgrep x)`) because it
+  // names the supported alternative. A heuristic, not containment (file header).
+  if (ctx.dynamicKill && ENUMERATOR_RE.test(command)) return deny(REASON_MASS_SIGNAL);
+  return result;
 }
 
 /** Extract the `command` field from a Bash tool_input, if present. */

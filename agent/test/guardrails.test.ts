@@ -318,6 +318,68 @@ describe("existing denies still fire on a wired docker worker (PRD #83 B3)", () 
   });
 });
 
+// #1576: mass-signal kill commands reach the agent's own process tree (a busybox lsof
+// ignores its filters and lists every process, so `kill $(lsof -ti :3000)` kills the
+// agent). The reason literal is module-private, so it is spelled out here; the
+// "deny reasons carry the user-facing phrase" table below reaches it too.
+describe("mass-signal guardrail (#1576)", () => {
+  const MASS_SIGNAL_REASON =
+    "denied by guardrail: mass-signal kill commands (pkill, killall, fuser -k, kill of a broadcast/process-group target, or kill of PIDs enumerated by lsof/pgrep/ps/fuser) can kill the agent's own process tree; stop a background task through the harness, or kill \"$pid\" with the exact PID saved at launch";
+
+  const DENIED_MASS = [
+    "pkill -f vite",
+    "pkill node",
+    "killall node",
+    "sudo killall -9 node",
+    "sh -c 'pkill -f npm'",
+    'eval "killall node"',
+    "timeout 5 pkill x",
+    "fuser -k 3000/tcp",
+    "fuser -km /mnt",
+    "kill -- -1",
+    "kill -9 -1",
+    "kill -KILL -1",
+    "kill -s KILL -1",
+    "kill 0",
+    "kill -- -4242",
+    "kill -TERM -- -$pgid",
+    "kill $(lsof -ti :3000)",
+    "kill -9 $(pgrep node)",
+    "kill `pgrep node`",
+    "kill `lsof -t -i :5173`",
+    "pid=$(lsof -ti :3000); kill $pid",
+    'kill "$(ps -o pid= -g 1)"',
+    "lsof -ti :3000 | xargs kill",
+    "bash -c 'kill $(fuser 3000/tcp)'",
+  ];
+  for (const cmd of DENIED_MASS) {
+    it(`denies with the mass-signal reason: ${cmd}`, () => {
+      const r = screenBashCommand(cmd);
+      assert.strictEqual(r.denied, true, `expected denied for: ${cmd}`);
+      assert.strictEqual(r.reason, MASS_SIGNAL_REASON);
+    });
+  }
+
+  const ALLOWED_KILLS = [
+    'kill "$pid"',
+    "kill $pid",
+    'kill -9 "$pid"',
+    "kill %1",
+    "kill 12345",
+    "kill -9 12345",
+    "kill -s TERM 12345",
+    "kill -1",
+    "kill -l",
+    "fuser 3000/tcp",
+    'pid=$!; sleep 1; kill "$pid"',
+  ];
+  for (const cmd of ALLOWED_KILLS) {
+    it(`allows: ${cmd}`, () => {
+      assert.strictEqual(screenBashCommand(cmd).denied, false, `expected allowed for: ${cmd}`);
+    });
+  }
+});
+
 function baseInput(): Omit<HookInput, "hook_event_name" | "tool_name" | "tool_input" | "tool_use_id"> {
   return { session_id: "s", transcript_path: "/t", cwd: "/w" };
 }
@@ -683,7 +745,7 @@ describe("file-tool path guard is UNCHANGED by agent memory (PRD #90 M2)", () =>
 // the UI (which nobody would notice, because the run still works).
 //
 // Two tests, deliberately overlapping, because neither alone is sufficient:
-//   (a) behavioural — drives all 15 deny paths that exist TODAY through the public
+//   (a) behavioural — drives all 16 deny paths that exist TODAY through the public
 //       API, which is the only way to reach the reasons (they are module-private).
 //       It cannot cover a reason that does not exist yet.
 //   (b) source scan — greps the reason literals straight out of guardrails.ts, so a
@@ -720,7 +782,7 @@ describe("deny reasons carry the user-facing phrase (PRD #116)", () => {
   // they already exist — if a case ever stops denying, the TRIGGER is wrong (fix it),
   // never the assertion.
   const REASON_CASES: Array<{ name: string; trigger: () => Promise<string | undefined> }> = [
-    // 12 reachable via screenBashCommand(command, extraSecretPaths?, dockerWired?).
+    // 13 reachable via screenBashCommand(command, extraSecretPaths?, dockerWired?).
     { name: "git push", trigger: async () => screenBashCommand("git push origin main").reason },
     { name: "git remote mutation", trigger: async () => screenBashCommand("git remote set-url origin https://evil.example/x.git").reason },
     { name: "forced git operation", trigger: async () => screenBashCommand("git checkout --force other").reason },
@@ -728,6 +790,7 @@ describe("deny reasons carry the user-facing phrase (PRD #116)", () => {
     { name: "git config write", trigger: async () => screenBashCommand("git config remote.origin.url https://evil.example/x.git").reason },
     { name: "environment dump", trigger: async () => screenBashCommand("env").reason },
     { name: "process table", trigger: async () => screenBashCommand("ps aux").reason },
+    { name: "mass-signal kill", trigger: async () => screenBashCommand("pkill -f vite").reason },
     { name: "/proc read", trigger: async () => screenBashCommand(`cat ${PROC_PATH}`).reason },
     // The built-in /run/secrets/ prefix; extraSecretPaths reaches the same reason.
     { name: "secret file read", trigger: async () => screenBashCommand(`cat ${SECRET_PATH}`).reason },
@@ -755,12 +818,12 @@ describe("deny reasons carry the user-facing phrase (PRD #116)", () => {
     });
   }
 
-  // 15 cases producing 15 DISTINCT strings is what proves the table actually exercises
-  // 15 different deny paths, rather than the same path fifteen times.
-  it("covers all 15 deny reasons, and each case reaches a DISTINCT one", async () => {
-    assert.strictEqual(REASON_CASES.length, 15, "expected one case per REASON_* constant in src/guardrails.ts");
+  // 16 cases producing 16 DISTINCT strings is what proves the table actually exercises
+  // 16 different deny paths, rather than the same path sixteen times.
+  it("covers all 16 deny reasons, and each case reaches a DISTINCT one", async () => {
+    assert.strictEqual(REASON_CASES.length, 16, "expected one case per REASON_* constant in src/guardrails.ts");
     const reasons = await Promise.all(REASON_CASES.map((c) => c.trigger()));
-    assert.strictEqual(new Set(reasons).size, 15, `expected 15 distinct reasons, got: ${JSON.stringify(reasons, null, 2)}`);
+    assert.strictEqual(new Set(reasons).size, 16, `expected 16 distinct reasons, got: ${JSON.stringify(reasons, null, 2)}`);
   });
 
   // (b) The future-proofing half: read the reason literals out of the source itself.
