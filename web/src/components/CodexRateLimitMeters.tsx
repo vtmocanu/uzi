@@ -157,7 +157,7 @@ function CodexAccountBlock({
   onToggle: (accountId: string, shown: boolean) => void;
   busy: boolean;
 }) {
-  const badge = codexStatusBadge(account.status);
+  const badge = codexStatusBadge(account);
   // A non-fresh reading (stale / vault-locked / polling-off snapshot) is dimmed and draws
   // no forecast; pending / no_reading / action-required carry no buckets at all.
   const dim = account.status !== "fresh";

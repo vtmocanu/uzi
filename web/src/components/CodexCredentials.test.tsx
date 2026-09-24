@@ -7,9 +7,6 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { afterEach, describe, expect, it, vi, beforeEach } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { CodexCredentials, codexShapeError } from "./CodexCredentials";
-// Imported from the single "dark" flag so these tests PROVE the copy comes from
-// there, not from an inlined duplicate (issue #1174 item 6).
-import { CODEX_DARK_COPY } from "./codexCredentialsCopy";
 import { api, type SecretMeta } from "../lib/api";
 
 // A valid codex_auth JSON paste — a flat object with access_token/refresh_token.
@@ -252,10 +249,55 @@ describe("CodexCredentials", () => {
     // The "How to get this" disclosure is a native <summary> (keyboard/touch/SR).
     const summary = screen.getByText("How to get this", { selector: "summary" });
     expect(summary.tagName).toBe("SUMMARY");
-    // The copy recipe names the login-status prereq and the do-not-share warning.
+    // The disclosure keeps the do-not-share warning and the full-guide link.
     const details = summary.closest("details")!;
-    expect(within(details).getByText(/codex login status/)).toBeTruthy();
     expect(within(details).getByText(/do not commit it, log it/i)).toBeTruthy();
+    expect(within(details).getByText("Full guide")).toBeTruthy();
+  });
+
+  // ── issue #1594: a login dedicated to uzi, isolated from the everyday Codex CLI ──
+
+  it("renders the isolated-login recipe verbatim, and not the old shared-file recipe", () => {
+    renderCard([secret()]);
+    const details = screen
+      .getByText("How to get this", { selector: "summary" })
+      .closest("details")!;
+    const code = details.querySelector("pre > code");
+    expect(code).not.toBeNull();
+    // The block preserves its layout (whitespace-pre) and every character.
+    expect(code!.parentElement!.className).toContain("whitespace-pre");
+    expect(code!.textContent).toBe(
+      [
+        '( export CODEX_HOME="$(mktemp -d)"',
+        "  codex login -c cli_auth_credentials_store=file",
+        `  jq -e '.auth_mode == "chatgpt" and (.tokens.access_token | type == "string" and length > 0) and (.tokens.refresh_token | type == "string" and length > 0)' "$CODEX_HOME/auth.json" >/dev/null \\`,
+        '    || { echo "isolated login did not produce a usable file-based auth.json" >&2; exit 1; }',
+        "  jq -c '{access_token: .tokens.access_token, refresh_token: .tokens.refresh_token}' \"$CODEX_HOME/auth.json\" | pbcopy",
+        '  echo "Copied. Paste it into uzi, then remove $CODEX_HOME" )',
+      ].join("\n"),
+    );
+    expect(code!.textContent).toContain("codex login -c cli_auth_credentials_store=file");
+    expect(code!.textContent).toContain('"$CODEX_HOME/auth.json"');
+    // The old recipe read the user's everyday login file; paired with the presence
+    // checks above on the same render, so this absence is not vacuous.
+    expect(details.textContent).not.toContain("~/.codex/auth.json");
+    // The Linux clipboard note survives.
+    expect(within(details).getByText("xclip -selection clipboard")).toBeTruthy();
+    expect(within(details).getByText("wl-copy")).toBeTruthy();
+  });
+
+  it("warns beside the Codex login field (outside the disclosure), never beside the API key field", () => {
+    renderCard([secret()]);
+    const warning = /Use a login dedicated to uzi\. Pasting from a Codex login your own CLI keeps using breaks one side or the other, because the refresh token rotates\. After a failure, re-paste from a new isolated login, never the old file\./;
+    const matches = screen.getAllByText(warning);
+    // Exactly one: the codex_auth form carries it, the openai_api_key form does not.
+    expect(matches).toHaveLength(1);
+    const codexForm = screen.getByPlaceholderText("Paste your Codex login JSON").closest("form")!;
+    const keyForm = screen.getByPlaceholderText("Paste your OpenAI API key").closest("form")!;
+    expect(codexForm.contains(matches[0])).toBe(true);
+    expect(keyForm.contains(matches[0])).toBe(false);
+    // Visible without opening the disclosure.
+    expect(matches[0].closest("details")).toBeNull();
   });
 
   it("renders a keyboard-reachable status legend explaining all four statuses, and keeps per-badge sr-only scaffolding", () => {
@@ -269,16 +311,16 @@ describe("CodexCredentials", () => {
     }
     expect(within(legend).getByText(/has not been verified/i)).toBeTruthy();
     expect(within(legend).getByText(/No\s+provider\s+or\s+secret\s+details/i)).toBeTruthy();
-    // The closing dark note comes from the flag.
-    expect(
-      within(legend).getByText((c) => c.includes(CODEX_DARK_COPY.notUsedForRuns)),
-    ).toBeTruthy();
+    // The staging entry says what happens next: uzi verifies it automatically.
+    expect(within(legend).getByText(/uzi verifies a new Codex login automatically/)).toBeTruthy();
     // The per-badge sr-only description + aria-describedby scaffolding is retained.
     const badge = within(screen.getByTestId("codex-sec-1")).getByText("staging");
     expect(badge.getAttribute("aria-describedby")).toBe("codex-status-sec-1");
     const srOnly = document.getElementById("codex-status-sec-1");
     expect(srOnly?.className).toContain("sr-only");
-    expect(srOnly?.textContent).toContain(CODEX_DARK_COPY.stagingNotAutoVerified);
+    expect(srOnly?.textContent).toBe(
+      "Saved and encrypted; identity not yet verified. uzi verifies a new Codex login automatically; it moves to linked once verified.",
+    );
   });
 
   it("renders all four status badges straight from codex_status", () => {
@@ -319,7 +361,7 @@ describe("CodexCredentials", () => {
     expect(screen.getByRole("link", { name: /full guide/i })).toBeTruthy();
   });
 
-  it("blocks the whole ~/.codex/auth.json paste with the flat-object message and sends nothing", () => {
+  it("blocks a whole Codex auth.json paste with the flat-object message and sends nothing", () => {
     renderCard([]);
     fireEvent.change(screen.getByPlaceholderText("Paste your Codex login JSON"), {
       target: {
@@ -382,8 +424,7 @@ describe("CodexCredentials", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save Codex login" }));
     await waitFor(() =>
       expect(onNotice).toHaveBeenCalledWith(
-        "Saved and encrypted. Status: staging (not verified). " +
-          CODEX_DARK_COPY.notUsedForRuns,
+        "Saved and encrypted. Status: staging (not verified).",
       ),
     );
   });
@@ -398,21 +439,20 @@ describe("CodexCredentials", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save OpenAI API key" }));
     await waitFor(() =>
       expect(onNotice).toHaveBeenCalledWith(
-        "Saved and encrypted. Status: static. " + CODEX_DARK_COPY.notUsedForRuns,
+        "Saved and encrypted. Status: static.",
       ),
     );
   });
 
-  it("routes the dark copy through the single flag (header/legend + staging hint)", () => {
-    renderCard([secret()]);
-    // The not-used-for-runs sentence appears (header + legend), sourced from the flag.
-    expect(
-      screen.getAllByText((c) => c.includes(CODEX_DARK_COPY.notUsedForRuns)).length,
-    ).toBeGreaterThan(0);
-    // The staging hint carries the staging flag sentence (sr-only description).
-    expect(
-      screen.getAllByText((c) => c.includes(CODEX_DARK_COPY.stagingNotAutoVerified))
-        .length,
-    ).toBeGreaterThan(0);
+  it("no longer says Codex does not run agents or that logins are not auto-verified (#1594)", () => {
+    const { container } = renderCard([secret()]);
+    // Presence on the same render: the header and the accurate staging copy are there.
+    expect(screen.getByText(/Store your OpenAI Codex logins and API keys\./)).toBeTruthy();
+    expect(container.textContent).toContain("uzi verifies a new Codex login automatically");
+    // The retired sentences are gone from visible and sr-only text alike.
+    expect(container.textContent).not.toContain("Codex is not yet used to run agents");
+    expect(container.textContent).not.toContain(
+      "This build does not verify Codex logins automatically",
+    );
   });
 });

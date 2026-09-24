@@ -61,11 +61,12 @@ function acct(
   is_default: boolean,
   status: CodexRateLimitStatus,
   buckets: CodexRateLimitBucket[],
-  opts: { lastSuccessMins?: number; stale?: boolean } = {},
+  opts: { lastSuccessMins?: number; stale?: boolean; reason?: "provider_rejected" } = {},
 ): CodexAccountRateLimit {
   const a: CodexAccountRateLimit = { account_id, aliases, is_default, status, buckets };
   if (opts.lastSuccessMins != null) a.last_success_at = minsAgo(opts.lastSuccessMins);
   if (opts.stale) a.stale = true;
+  if (opts.reason) a.reason = opts.reason;
   return a;
 }
 
@@ -235,7 +236,13 @@ export const mockAdminCodexRateLimits: CodexAdminRateLimitRow[] = [
     email: "carmen@example.com",
     name: "carmen",
     vault_locked: false,
-    accounts: [acct("cdx-carmen-default", ["carmen-codex"], true, "credential_action_required", [])],
+    // The provider REJECTED carmen's saved login (issue #1594): the same action-required
+    // badge, but the hint tells her to add a login used only by uzi.
+    accounts: [
+      acct("cdx-carmen-default", ["carmen-codex"], true, "credential_action_required", [], {
+        reason: "provider_rejected",
+      }),
+    ],
   },
   {
     id: "u-radu",

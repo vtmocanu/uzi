@@ -24,9 +24,6 @@ import { Badge, Button, Card, Field, Input, SectionTitle, Skeleton } from "./ui"
 import type { BadgeTone } from "./ui";
 import { DocLink } from "./DocLink";
 import { DOC_CODEX_CREDENTIALS } from "../lib/doclinks";
-// Every "dark" sentence on this card comes from ONE flag, so the milestone that
-// enables Codex routing flips it in a single place (issue #1174 item 6).
-import { CODEX_DARK_COPY } from "./codexCredentialsCopy";
 
 // vaultLockedMessage is the shared copy for a 409 vault_locked: the global handler
 // has already refreshed the session, so the unlock banner is showing above.
@@ -37,6 +34,23 @@ const VAULT_LOCKED =
 // description the disabled-looking Delete points at, so the two cannot drift.
 const D6_HINT =
   "Make another credential the default first; every account needs one default while any credential exists.";
+
+// What happens to a `staging` login next, in one place: the badge hint and the status
+// legend both say it, so the two cannot drift. uzi's usage poller verifies a staged
+// login and links it on its own; the user does not have to do anything.
+const STAGING_NEXT =
+  "uzi verifies a new Codex login automatically; it moves to linked once verified.";
+
+// The isolated-login recipe (issue #1594). A login dedicated to uzi lives in a throwaway
+// CODEX_HOME so the user's everyday Codex CLI never refreshes (and so rotates) the same
+// refresh token. Rendered verbatim in a whitespace-preserving block; keep every
+// character, including the backslash-newline.
+const ISOLATED_LOGIN_RECIPE = `( export CODEX_HOME="$(mktemp -d)"
+  codex login -c cli_auth_credentials_store=file
+  jq -e '.auth_mode == "chatgpt" and (.tokens.access_token | type == "string" and length > 0) and (.tokens.refresh_token | type == "string" and length > 0)' "$CODEX_HOME/auth.json" >/dev/null \\
+    || { echo "isolated login did not produce a usable file-based auth.json" >&2; exit 1; }
+  jq -c '{access_token: .tokens.access_token, refresh_token: .tokens.refresh_token}' "$CODEX_HOME/auth.json" | pbcopy
+  echo "Copied. Paste it into uzi, then remove $CODEX_HOME" )`;
 
 function errText(err: unknown, fallback: string): string {
   if (isVaultLocked(err)) return VAULT_LOCKED;
@@ -71,21 +85,17 @@ function apiForKind(kind: string) {
 // read STRAIGHT off secret.codex_status (never a second fetch). Absent → no badge (an
 // anthropic_token would omit the field; a codex row always carries one). The hint is
 // rendered both as a title tooltip AND as an sr-only description (mirroring the
-// Anthropic chip): it conveys what the status means and that, while the card is dark,
-// nothing here is actionable yet — Codex is not used for runs.
+// Anthropic chip): it conveys what the status means.
 function statusBadge(
   status?: string,
 ): { tone: BadgeTone; label: string; hint: string } | null {
   switch (status) {
     case "staging":
-      // The one place a `staging` login says WHY it is not yet linked: this build
-      // does not auto-verify (routed through the flag so retirement is one edit).
+      // A `staging` login says what happens next: uzi verifies it on its own.
       return {
         tone: "info",
         label: "staging",
-        hint:
-          "Saved and encrypted; identity not yet verified. " +
-          CODEX_DARK_COPY.stagingNotAutoVerified,
+        hint: "Saved and encrypted; identity not yet verified. " + STAGING_NEXT,
       };
     case "linked":
       return { tone: "ok", label: "linked", hint: "Provider identity verified." };
@@ -136,7 +146,7 @@ export function codexShapeError(raw: string): string | null {
     typeof (nested as Record<string, unknown>).access_token === "string" &&
     ((nested as Record<string, unknown>).access_token as string).trim() !== ""
   ) {
-    return "This looks like the whole ~/.codex/auth.json file. Uzi needs a flat object with just access_token and refresh_token; use the copy command in “How to get this”.";
+    return "This looks like the whole Codex auth.json file. Uzi needs a flat object with just access_token and refresh_token; use the copy command in “How to get this”.";
   }
   return "This JSON has no access_token. See “How to get this” below.";
 }
@@ -253,9 +263,8 @@ function CredentialRow({
             <Badge tone="neutral">{kindLabel(secret.kind)}</Badge>
             {badge && (
               <>
-                {/* The status word alone states a DIAGNOSIS but not its meaning or
-                    that nothing is actionable yet while dark; the hint carries both,
-                    as a title AND an sr-only description that the badge points at —
+                {/* The status word alone states a DIAGNOSIS but not its meaning; the
+                    hint carries it, as a title AND an sr-only description that the badge points at —
                     the same idiom AnthropicTokens uses for its auto chip. */}
                 <Badge
                   tone={badge.tone}
@@ -410,13 +419,11 @@ function AddCredentialForm({
       setToken("");
       setLabel("");
       // Name the resulting lifecycle state (issue #1174 item 5): a login is born
-      // `staging` (not verified), a key is born `static`. The dark clause comes
-      // from the one flag so it retires everywhere at once.
+      // `staging` (not verified), a key is born `static`.
       onNotice(
         isCodexLogin
-          ? "Saved and encrypted. Status: staging (not verified). " +
-              CODEX_DARK_COPY.notUsedForRuns
-          : "Saved and encrypted. Status: static. " + CODEX_DARK_COPY.notUsedForRuns,
+          ? "Saved and encrypted. Status: staging (not verified)."
+          : "Saved and encrypted. Status: static.",
       );
       await reload();
     } catch (err) {
@@ -467,6 +474,13 @@ function AddCredentialForm({
             for renewal). It is <strong className="text-fg">not</strong> an OpenAI
             API key.
           </p>
+          {/* Visible without opening the disclosure (issue #1594): the refresh token
+              rotates, so a login shared with the user's own Codex CLI breaks one side. */}
+          <p className="text-warn">
+            Use a login dedicated to uzi. Pasting from a Codex login your own CLI keeps
+            using breaks one side or the other, because the refresh token rotates. After a
+            failure, re-paste from a new isolated login, never the old file.
+          </p>
           {shapeError && (
             // The pre-check verdict, inline and value-free. Its text ends with
             // See "How to get this" below. — pointing at the disclosure just below.
@@ -488,22 +502,12 @@ function AddCredentialForm({
             </summary>
             <div className="mt-2 space-y-2 text-muted">
               <p>
-                First sign in with{" "}
-                <code className="rounded bg-raised px-1 py-0.5 text-fg">codex login</code>
-                , then confirm it with{" "}
-                <code className="rounded bg-raised px-1 py-0.5 text-fg">
-                  codex login status
-                </code>
-                .
+                Sign in to a fresh Codex login kept apart from your everyday Codex CLI,
+                check it, and copy JUST the two fields uzi needs, never the whole file:
               </p>
-              <p>Then copy JUST the two fields uzi needs, never the whole file:</p>
-              <p>
-                <code className="block overflow-x-auto rounded bg-raised px-2 py-1 text-fg">
-                  {
-                    "jq -c '{access_token: .tokens.access_token, refresh_token: .tokens.refresh_token}' ~/.codex/auth.json | pbcopy"
-                  }
-                </code>
-              </p>
+              <pre className="overflow-x-auto whitespace-pre rounded bg-raised px-2 py-1 text-fg">
+                <code>{ISOLATED_LOGIN_RECIPE}</code>
+              </pre>
               <p>
                 On Linux swap{" "}
                 <code className="rounded bg-raised px-1 py-0.5 text-fg">pbcopy</code>{" "}
@@ -607,8 +611,7 @@ export function CodexCredentials({
       <div>
         <SectionTitle>OpenAI / Codex credentials</SectionTitle>
         <p className="mt-2 text-sm text-muted">
-          Store your OpenAI Codex logins and API keys. {CODEX_DARK_COPY.notUsedForRuns}{" "}
-          Paste a Codex login or an OpenAI API key, and give each one a name. A single{" "}
+          Store your OpenAI Codex logins and API keys. Paste a Codex login or an OpenAI API key, and give each one a name. A single{" "}
           <strong className="text-fg">default</strong> is shared across both kinds.
         </p>
       </div>
@@ -670,7 +673,7 @@ export function CodexCredentials({
               <dt className="font-medium text-fg">staging</dt>
               <dd>
                 Saved and encrypted, but the provider identity has not been verified.{" "}
-                {CODEX_DARK_COPY.stagingNotAutoVerified}
+                {STAGING_NEXT}
               </dd>
             </div>
             <div>
@@ -692,7 +695,6 @@ export function CodexCredentials({
               </dd>
             </div>
           </dl>
-          <p className="mt-2 text-xs text-faint">{CODEX_DARK_COPY.notUsedForRuns}</p>
         </details>
       )}
 

@@ -154,13 +154,26 @@ describe("hasCodexReading / codexStatusBadge", () => {
     }
   });
   it("maps each status to a tone and label", () => {
-    expect(codexStatusBadge("fresh")).toMatchObject({ tone: "ok", label: "Live" });
-    expect(codexStatusBadge("credential_action_required")).toMatchObject({ tone: "danger", label: "Action required" });
-    expect(codexStatusBadge("no_reading")).toMatchObject({ tone: "warning", label: "No reading yet" });
-    expect(codexStatusBadge("stale").label).toBe("Stale");
-    expect(codexStatusBadge("pending").label).toBe("Pending");
-    expect(codexStatusBadge("vault_locked").label).toBe("🔒 Vault locked");
-    expect(codexStatusBadge("polling_disabled").label).toBe("Polling off");
+    expect(codexStatusBadge({ status: "fresh" })).toMatchObject({ tone: "ok", label: "Live" });
+    expect(codexStatusBadge({ status: "credential_action_required" })).toMatchObject({ tone: "danger", label: "Action required" });
+    expect(codexStatusBadge({ status: "no_reading" })).toMatchObject({ tone: "warning", label: "No reading yet" });
+    expect(codexStatusBadge({ status: "stale" }).label).toBe("Stale");
+    expect(codexStatusBadge({ status: "pending" }).label).toBe("Pending");
+    expect(codexStatusBadge({ status: "vault_locked" }).label).toBe("🔒 Vault locked");
+    expect(codexStatusBadge({ status: "polling_disabled" }).label).toBe("Polling off");
+  });
+  it("overrides the action-required hint only when the provider rejected the login (#1594)", () => {
+    const REJECTED =
+      "The saved Codex login was rejected by the provider; add a login used only by uzi.";
+    const GENERIC =
+      "This Codex login needs re-authentication before uzi can read its usage again. Replace the login in your credentials.";
+    const rejected = codexStatusBadge({ status: "credential_action_required", reason: "provider_rejected" });
+    expect(rejected.hint).toBe(REJECTED);
+    // Tone and label stay the action-required ones; only the hint is refined.
+    expect(rejected).toMatchObject({ tone: "danger", label: "Action required" });
+    expect(codexStatusBadge({ status: "credential_action_required" }).hint).toBe(GENERIC);
+    // A reason on any other status is ignored (the server only sets it with action-required).
+    expect(codexStatusBadge({ status: "fresh", reason: "provider_rejected" }).hint).toBe("A current usage reading.");
   });
 });
 
