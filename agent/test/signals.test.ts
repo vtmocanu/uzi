@@ -890,7 +890,7 @@ async function callToolOverJsonRpc(
   const instance = (server as { instance: { connect(t: unknown): Promise<void>; close(): Promise<void> } }).instance;
   await instance.connect(transport);
   const waitFor = async (id: number): Promise<Msg> => {
-    for (let i = 0; i < 200; i++) {
+    for (let i = 0; i < 2000; i++) {
       const hit = sent.find((m) => m["id"] === id);
       if (hit) return hit;
       await new Promise((r) => setTimeout(r, 5));

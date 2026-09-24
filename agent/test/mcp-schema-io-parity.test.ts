@@ -1,9 +1,10 @@
 // Issue #1555: every uzi MCP tool's input schema must render the SAME `required` set in
 // Zod v4's output-mode JSON Schema (`z.toJSONSchema(s)`, the default) as in input mode
 // (`{ io: "input" }`). A field built with `.optional().default(x)` is optional on INPUT
-// but always present on OUTPUT, so output mode lists it in `required`. Claude's deferred
-// ToolSearch path enforces the published schema, so a call omitting that field was
-// rejected (MCP -32602 "expected nonoptional") even though the handler never needed it.
+// but always present on OUTPUT, so output mode lists it in `required`. MCP tool-call
+// validation acting on output semantics (observed via the deferred ToolSearch path)
+// rejected a call omitting that field (MCP -32602 "expected nonoptional") even though
+// the handler never needed it.
 //
 // The guard: for every tool on every uzi MCP server (all optional tools/fields enabled),
 // output-mode `required` must be a subset of input-mode `required` at every nested path.

@@ -395,9 +395,10 @@ export function buildSignalMcpServer(
                 "It is purely informational: it does not commit, checkpoint, or gate anything.",
               {
                 // No `.default([])` on these (issue #1555): a Zod v4 defaulted field is
-                // listed as `required` in output-mode JSON Schema, and Claude's deferred
-                // ToolSearch path enforces that, rejecting a call that omits it. The
-                // handler ignores args and scanSignals treats a missing array as [].
+                // treated as nonoptional by output-mode validation (and listed as
+                // `required` in output-mode JSON Schema), so MCP tool-call validation
+                // rejected a call omitting it (-32602, seen via the deferred ToolSearch
+                // path). The handler ignores args; scanSignals treats a missing array as [].
                 completed: z
                   .array(z.string())
                   .optional()
