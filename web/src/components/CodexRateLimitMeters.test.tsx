@@ -185,6 +185,31 @@ describe("CodexRateLimitCard (Settings)", () => {
     expect(badges.map((b) => b.getAttribute("title")).sort()).toEqual([generic, rejected].sort());
   });
 
+  it("shows the provider-rejected guidance visibly under polling_disabled, with and without buckets (#1594)", async () => {
+    mockApi.getMyCodexRateLimits.mockResolvedValue({
+      accounts: [
+        { ...acct("cdx-off-empty", ["off-empty"], false, "polling_disabled", []), reason: "provider_rejected" },
+        {
+          ...acct("cdx-off-buckets", ["off-buckets"], false, "polling_disabled", [
+            bucket("requests", "Requests", win(52, 18000, null)),
+          ]),
+          reason: "provider_rejected",
+          stale: true,
+        },
+      ],
+    });
+    render(<CodexRateLimitCard sidebarAccountIds={[]} onToggleSidebarAccount={noop} />);
+    await screen.findByText("Codex limits");
+    const rejected = "The saved Codex login was rejected by the provider; add a login used only by uzi.";
+    // Each account carries the sentence twice: its sr-only badge description and one VISIBLE
+    // paragraph (in place of the meters, or under the kept buckets).
+    const visible = screen.getAllByText(rejected).filter((el) => !el.classList.contains("sr-only"));
+    expect(visible).toHaveLength(2);
+    // The bucketed account still draws its stored meter.
+    expect(screen.getByText("52%")).toBeTruthy();
+    expect(screen.getAllByText("Polling off")).toHaveLength(2);
+  });
+
   it("shows 'no reading yet' for a partial window beside a real one", async () => {
     mockApi.getMyCodexRateLimits.mockResolvedValue({
       accounts: [

@@ -172,8 +172,17 @@ describe("hasCodexReading / codexStatusBadge", () => {
     // Tone and label stay the action-required ones; only the hint is refined.
     expect(rejected).toMatchObject({ tone: "danger", label: "Action required" });
     expect(codexStatusBadge({ status: "credential_action_required" }).hint).toBe(GENERIC);
-    // A reason on any other status is ignored (the server only sets it with action-required).
+    // A reason on any other status is ignored (the server only sets it with action-required
+    // or polling_disabled).
     expect(codexStatusBadge({ status: "fresh", reason: "provider_rejected" }).hint).toBe("A current usage reading.");
+  });
+  it("names a provider-rejected login under polling_disabled too, keeping its label (#1594)", () => {
+    const REJECTED =
+      "The saved Codex login was rejected by the provider; add a login used only by uzi.";
+    const POLLING_OFF = "Usage polling is turned off on this instance, so this snapshot will not refresh.";
+    const rejected = codexStatusBadge({ status: "polling_disabled", reason: "provider_rejected" });
+    expect(rejected).toMatchObject({ tone: "neutral", label: "Polling off", hint: REJECTED });
+    expect(codexStatusBadge({ status: "polling_disabled" }).hint).toBe(POLLING_OFF);
   });
 });
 

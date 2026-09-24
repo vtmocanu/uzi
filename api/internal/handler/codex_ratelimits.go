@@ -36,7 +36,12 @@ const (
 
 // codexRateLimitReasonProviderRejected is the only CodexAccountRateLimitDTO.Reason value
 // (issue #1594): the account's reauth_reason as stored by the provider-rejection refresh
-// transaction. Any other stored reason maps to "" (no reason shown).
+// transaction. Any other stored reason maps to "" (no reason shown). It is surfaced for a
+// reauth_required account under every derived status except vault_locked: while the vault
+// is locked the only actionable step is unlocking it, and once unlocked the status becomes
+// credential_action_required and the reason shows. A polling_disabled account (interval
+// <= 0, which outranks vault_locked in codexRateLimitStatus) therefore shows it even when
+// the vault is locked.
 const codexRateLimitReasonProviderRejected = "provider_rejected"
 
 // SelfCodexRateLimits returns the caller's Codex account rate-limit meters, ONE PER
@@ -124,7 +129,13 @@ func (h *Handler) AdminCodexRateLimits(w http.ResponseWriter, r *http.Request) {
 // deriving the status and normalizing the two collection fields to non-nil slices (the
 // contract keeps aliases and buckets PRESENT, never null). Both store reads carry these
 // same fields, so the two handlers share this one builder. reauthReason becomes the DTO's
-// reason only under credential_action_required and only for the closed-set value.
+// reason only for the closed-set value, only when the account is flagged reauth_required,
+// and under any derived status except vault_locked (issue #1594). polling_disabled is
+// included so a disabled poller does not hide a provider-rejected login from its owner or
+// an admin. vault_locked keeps hiding it by decision: while locked the only actionable step
+// is unlocking, and after unlock the status becomes credential_action_required and the
+// reason shows. Because polling_disabled outranks vault_locked in codexRateLimitStatus, a
+// locked vault with the poller off still shows the reason.
 func (h *Handler) codexAccountDTO(accountID uuid.UUID, aliases []string, isDefault, reauthRequired bool, reauthReason pgtype.Text, buckets []byte, lastSuccessAt, lastAttemptAt pgtype.Timestamptz, vaultLocked bool) apitypes.CodexAccountRateLimitDTO {
 	status := codexRateLimitStatus(h.cfg.CodexUsagePollInterval, vaultLocked, reauthRequired, lastSuccessAt, lastAttemptAt, time.Now())
 
@@ -155,7 +166,7 @@ func (h *Handler) codexAccountDTO(accountID uuid.UUID, aliases []string, isDefau
 		Status:    status,
 		Buckets:   bucketsDTO,
 	}
-	if status == codexRateLimitStatusCredentialActionRequired && reauthReason.Valid && reauthReason.String == codexRateLimitReasonProviderRejected {
+	if reauthRequired && status != codexRateLimitStatusVaultLocked && reauthReason.Valid && reauthReason.String == codexRateLimitReasonProviderRejected {
 		dto.Reason = codexRateLimitReasonProviderRejected
 	}
 	if lastSuccessAt.Valid {

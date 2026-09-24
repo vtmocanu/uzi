@@ -377,6 +377,54 @@ func TestCodexRateLimitsReadSurfaceLiveDB(t *testing.T) {
 				t.Errorf("account %v stale = %v, want true when the poller is disabled", a.Aliases, a.Stale)
 			}
 		}
+		// issue #1594: a disabled poller must not hide a provider-rejected login. The
+		// flagged account keeps its reason under polling_disabled; no other account has one.
+		byAlias := byFirstAlias(accounts)
+		if got := byAlias["reauth-sub"].Reason; got != "provider_rejected" {
+			t.Errorf("polling off: reauth-sub reason = %q, want provider_rejected", got)
+		}
+		for alias, a := range byAlias {
+			if alias != "reauth-sub" && a.Reason != "" {
+				t.Errorf("polling off: %s reason = %q, want absent", alias, a.Reason)
+			}
+		}
+
+		// The admin read through the same disabled-poller handler carries it too.
+		adminRec := httptest.NewRecorder()
+		hOff.AdminCodexRateLimits(adminRec, codexRLReq(uuid.New(), true))
+		if adminRec.Code != http.StatusOK {
+			t.Fatalf("admin code = %d, want 200; body=%s", adminRec.Code, adminRec.Body.String())
+		}
+		var adminBody struct {
+			Users []struct {
+				Email    string             `json:"email"`
+				Accounts []codexAccountJSON `json:"accounts"`
+			} `json:"users"`
+		}
+		if err := json.Unmarshal(adminRec.Body.Bytes(), &adminBody); err != nil {
+			t.Fatalf("admin decode: %v", err)
+		}
+		var adminA []codexAccountJSON
+		for _, u := range adminBody.Users {
+			if u.Email == emailA {
+				adminA = u.Accounts
+			}
+		}
+		if len(adminA) != 6 {
+			t.Fatalf("admin polling off: %s has %d accounts, want 6", emailA, len(adminA))
+		}
+		for alias, a := range byFirstAlias(adminA) {
+			if a.Status != codexRateLimitStatusPollingDisabled {
+				t.Errorf("admin polling off: %s status = %q, want polling_disabled", alias, a.Status)
+			}
+			want := ""
+			if alias == "reauth-sub" {
+				want = "provider_rejected"
+			}
+			if a.Reason != want {
+				t.Errorf("admin polling off: %s reason = %q, want %q", alias, a.Reason, want)
+			}
+		}
 	})
 }
 

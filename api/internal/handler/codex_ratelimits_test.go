@@ -120,10 +120,11 @@ func TestCodexAuthSavePokesPollerOpenAIDoesNot(t *testing.T) {
 }
 
 // TestCodexAccountDTOReason pins the reason field (issue #1594): it is set to
-// provider_rejected only when the derived status is credential_action_required AND the
-// stored reauth_reason is exactly provider_rejected. Every other status (including a
-// vault_locked or polling_disabled account that is also flagged) and every other stored
-// value leaves it absent.
+// provider_rejected only when the account is flagged reauth_required, the stored
+// reauth_reason is exactly provider_rejected, and the derived status is not vault_locked.
+// So it shows under credential_action_required and under polling_disabled (including a
+// locked vault with the poller off, since polling_disabled outranks vault_locked), and is
+// absent for vault_locked, an unflagged account, and every other stored value.
 func TestCodexAccountDTOReason(t *testing.T) {
 	now := time.Now()
 	rejected := pgtype.Text{String: codexRateLimitReasonProviderRejected, Valid: true}
@@ -141,7 +142,10 @@ func TestCodexAccountDTOReason(t *testing.T) {
 		{"flagged other stored reason", 5 * time.Minute, false, true, pgtype.Text{String: "something_else", Valid: true}, codexRateLimitStatusCredentialActionRequired, ""},
 		{"flagged empty stored reason", 5 * time.Minute, false, true, pgtype.Text{String: "", Valid: true}, codexRateLimitStatusCredentialActionRequired, ""},
 		{"vault_locked takes precedence", 5 * time.Minute, true, true, rejected, codexRateLimitStatusVaultLocked, ""},
-		{"polling_disabled takes precedence", 0, false, true, rejected, codexRateLimitStatusPollingDisabled, ""},
+		{"polling off, flagged provider_rejected", 0, false, true, rejected, codexRateLimitStatusPollingDisabled, "provider_rejected"},
+		{"polling off, flagged no reason", 0, false, true, pgtype.Text{}, codexRateLimitStatusPollingDisabled, ""},
+		{"polling off, not flagged, stale reason ignored", 0, false, false, rejected, codexRateLimitStatusPollingDisabled, ""},
+		{"polling off outranks vault_locked, reason shown", 0, true, true, rejected, codexRateLimitStatusPollingDisabled, "provider_rejected"},
 		{"not flagged, stale reason ignored", 5 * time.Minute, false, false, rejected, codexRateLimitStatusFresh, ""},
 	}
 	for _, tc := range cases {

@@ -25,6 +25,7 @@ import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import { formatAgo, formatCountdown, formatResetLabel, useNow, type PaceForecast } from "../lib/rateLimits";
 import {
   codexAccountLabel,
+  codexLoginRejected,
   codexResetEpoch,
   codexStatusBadge,
   codexWindowForecast,
@@ -195,6 +196,11 @@ function CodexAccountBlock({
         </div>
       ) : (
         // No buckets to draw: state the explicit reason in place of the meters.
+        <p className="mt-2 text-xs text-muted">{badge.hint}</p>
+      )}
+      {/* A rejected login keeps its (dimmed) last buckets, so the bucket-less hint above never
+          renders: state the re-login guidance under the meters instead (#1594). */}
+      {account.buckets.length > 0 && codexLoginRejected(account) && (
         <p className="mt-2 text-xs text-muted">{badge.hint}</p>
       )}
 
