@@ -52,7 +52,20 @@ check "enum scalar untouched"               "usage_endpoint\n"     "usage_endpoi
 check "CRLF-terminated tag stripped"        "abc\r\nINSERT 0 1\r\n" "abc"
 check "non-tag INSERT-ish text kept"        "INSERT INTO foo\n"    "INSERT INTO foo"
 
+# Chokepoint guard (#1511): the strip only helps callers that go through it. A phase that defines
+# its own `… db psql … | tr -d '\r\n'` helper re-welds `<id>UPDATE 1` on a DML RETURNING read, as
+# the forgejo/github lane flips once did. Every phase must read the DB via db_psql/db_psql_rows.
+cases=$((cases + 1))
+raw="$(grep -nF 'db psql' "$ROOT"/e2e/phases/*.sh || true)"
+if [ -z "$raw" ]; then
+  passed=$((passed + 1))
+  echo "PASS: no phase invokes psql outside lib.sh's db_psql/db_psql_rows"
+else
+  echo "FAIL: phases invoke psql directly (use db_psql/db_psql_rows):"
+  printf '%s\n' "$raw"
+fi
+
 echo "cases=$cases passed=$passed"
-# Tally guard (the driver.test.sh idiom): a real run has all 10 cases green; a zero-case or
+# Tally guard (the driver.test.sh idiom): a real run has all 11 cases green; a zero-case or
 # partially-red run must exit nonzero.
-[ "$cases" -ge 10 ] && [ "$cases" -eq "$passed" ]
+[ "$cases" -ge 11 ] && [ "$cases" -eq "$passed" ]
