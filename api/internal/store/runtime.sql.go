@@ -10010,10 +10010,19 @@ type RequeueClaimAssemblyExactParams struct {
 
 // PRD #1590 D2: the transient claim-assembly outcomes (vault locked, custom-model capability
 // missing, empty auto pool), fenced to the exact locked claim. @pool_wait=false is the
-// RequeueClaimedRunToQueued field set (claimed -> queued, started_at kept); @pool_wait=true is
-// the SetRunPoolWait field set (claimed -> pool_wait, a fresh wall: started_at NULL and
-// budget_paused_seconds 0), keeping SetRunPoolWait's `kind <> 'judge'` guard (Decision 14).
-// Both revoke the claim's Codex capability, clear health and keep worker_id for affinity.
+// RequeueClaimedRunToQueued field set (claimed -> queued, started_at kept). @pool_wait=true
+// is the only writer of the empty-pool hold (PRD #754 M4): claimed -> pool_wait, a
+// non-terminal, non-locking hold that M5 resumes. The pool_wait arm:
+//   - gives a later resume a FRESH RUN_TIMEOUT wall (started_at NULL, Decision 6d) and clears
+//     the pause banked against the old baseline (budget_paused_seconds 0, issue #783);
+//   - is NOT a usage park (Decision 9): limit_wait_count, limit_resets_at, retry_not_before
+//     and rate_limit_type are untouched, and limit_dead_secret_id is kept because M3's
+//     exclude-relax reads it on resume;
+//   - never holds a judge (`kind <> 'judge'`, Decision 14).
+//
+// Both arms keep the POSITIVE source guard (status = 'claimed'), revoke the claim's Codex
+// capability (PRD #1147 F7), reset health (the status itself is the signal; never write a
+// sentence into health_reason) and keep worker_id for resume affinity.
 func (q *Queries) RequeueClaimAssemblyExact(ctx context.Context, arg RequeueClaimAssemblyExactParams) (int64, error) {
 	result, err := q.db.Exec(ctx, requeueClaimAssemblyExact,
 		arg.PoolWait,
@@ -12260,77 +12269,6 @@ func (q *Queries) SetRunPlanSummary(ctx context.Context, arg SetRunPlanSummaryPa
 		arg.ID,
 		arg.ExpectedPlanMd,
 	)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
-}
-
-const setRunPoolWait = `-- name: SetRunPoolWait :execrows
-UPDATE runs SET
-    status       = 'pool_wait',
-    status_since = now(),
-    started_at   = NULL,
-    -- Issue #783: the fresh wall discards started_at, so the pause banked against the
-    -- OLD baseline must be cleared too — otherwise it over-credits the new deadline.
-    budget_paused_seconds = 0,
-    -- PRD #1147 F7 (defense-in-depth): revoke the per-claim Codex capability on the
-    -- claimed→pool_wait hold. A held run no longer has a live owner executing it, so any
-    -- capability minted for the claim must not survive the park; clearing the hash and
-    -- bumping the epoch supersedes it, mirroring the claimed→queued revocation sites.
-    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
-    health = 'ok', health_reason = NULL, health_since = NULL,
-    updated_at   = now()
-WHERE id = $1 AND worker_id = $2
-  AND status = 'claimed'
-  AND kind <> 'judge'
-`
-
-type SetRunPoolWaitParams struct {
-	ID       uuid.UUID   `json:"id"`
-	WorkerID pgtype.UUID `json:"worker_id"`
-}
-
-// Hold an `auto` run whose token pool is genuinely empty (PRD #754 M4). claimed →
-// pool_wait, NON-TERMINAL and NON-LOCKING: the run keeps its worker_id affinity, and
-// M5 resumes it (reactively when a token is pooled, or manually). This REPLACES M2's
-// interim requeue (RequeueClaimedRunToQueued on errAutoPoolEmpty): the auto lane must
-// never spend the non-pooled owner default and must not hard-fail a holdable run, so
-// a distinct status is the hold rather than churning the queue.
-//
-// 🔴 THE SOURCE GUARD IS POSITIVE (status = 'claimed'), like SetRunLimitWait's
-// status='running' and unlike the negative sibling guards above. A held run only ever
-// comes from a JUST-CLAIMED run in assembleClaim (PRD #1590 M1: the run lane now holds
-// through RequeueClaimAssemblyExact's fenced pool_wait field set, which mirrors this one;
-// this statement remains only on recoverClaimAssembly's chat-lane arm, which runs on the
-// claim path, before the worker starts), so 'claimed' is the only legitimate source.
-// Every other transition is a 0-row no-op, so a re-delivered or out-of-order report
-// cannot re-hold a run that a concurrent path already advanced. kind <> 'judge'
-// mirrors SetRunLimitWait: a judge never holds (Decision 14).
-//
-// 🔴 THIS IS NOT A USAGE PARK (PRD Decision 9). An empty pool is not a usage-limit
-// event, so the limit-wait budget must be untouched: limit_wait_count is NOT bumped,
-// and limit_resets_at / retry_not_before / rate_limit_type are NOT set. Folding an
-// empty-pool hold into the usage-limit machinery would let a pooling gap consume the
-// RUN_LIMIT_MAX_WAITS budget a genuine limit event needs.
-//
-// limit_dead_secret_id is LEFT AS-IS (deliberately not cleared): M3's exclude-relax
-// reads it on resume to know which just-parked credential's window is still closed, so
-// clearing it here would lose the exclusion across the hold.
-//
-// started_at = NULL so a later resume gets a FRESH RUN_TIMEOUT wall (Decision 6d, same
-// as PromoteLimitWaitRuns): without it SweepRunningTimeout would measure the resumed
-// run against a started_at from before a hold that may have lasted a long time.
-//
-// Health reset (health='ok', health_reason=NULL, health_since=NULL) exactly as
-// SetRunLimitWait does: ListActiveRunsForHealth is a POSITIVE allowlist that never
-// revisits a held run, so whatever flag was live at hold time would freeze for the
-// whole hold with nothing to clear it. The DISTINCT STATUS is the signal — do NOT
-// write a human sentence into health_reason (that would break the detector's
-// single-writer invariant; the UI/CLI render the "add a token to the pool" copy as
-// fixed text keyed on the status). worker_id is kept for resume affinity.
-func (q *Queries) SetRunPoolWait(ctx context.Context, arg SetRunPoolWaitParams) (int64, error) {
-	result, err := q.db.Exec(ctx, setRunPoolWait, arg.ID, arg.WorkerID)
 	if err != nil {
 		return 0, err
 	}

@@ -453,7 +453,7 @@ func (s *Service) resumePoolWaitRuns(ctx context.Context) (int64, error) {
 		// set-token verb and D8) breaks that invariant: an `auto` run switched early whose
 		// only pooled token is its own dead credential is held with a FUTURE stamp, so
 		// claimExclude keeps excluding that sole token and Floor.ok is false — the run must
-		// NOT resume (it would only re-hold, churning every tick while SetRunPoolWait never
+		// NOT resume (it would only re-hold, churning every tick while the pool_wait hold never
 		// counts against RUN_LIMIT_MAX_WAITS). Behaviour is identical in the no-future-stamp
 		// case (claimExclude relaxes to Nil, so Floor.ok == the old PoolNonEmpty there); it
 		// differs only for a future-stamp pool_wait run, which it correctly holds.

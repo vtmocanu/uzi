@@ -63,8 +63,14 @@ func (t *fakeClaimFinishTx) LockOpenCustodyHoldsForRunWorkerGeneration(context.C
 }
 
 func (t *fakeClaimFinishTx) ReleaseCustodyHoldExact(context.Context, store.ReleaseCustodyHoldExactParams) (int64, error) {
-	t.pending = append(t.pending, func() { t.f.claimReleased++ })
-	return 1, nil
+	n := int64(1)
+	if t.f.claimReleaseRows != nil {
+		n = *t.f.claimReleaseRows
+	}
+	if n > 0 {
+		t.pending = append(t.pending, func() { t.f.claimReleased += int(n) })
+	}
+	return n, nil
 }
 
 func (t *fakeClaimFinishTx) ParkRunCodexAccountUnavailable(_ context.Context, arg store.ParkRunCodexAccountUnavailableParams) (store.Run, error) {
@@ -110,7 +116,7 @@ func finishFixture(t *testing.T) (*fakeStore, *Service, store.Run, claimRecovery
 // TestFinishRunClaimRefusesWithoutTransaction (PRD #1590 R1): with no pgx transaction and no
 // transactional store there is no fenced writer, so finishRunClaim returns an error with no
 // payload for a success AND for every assembly outcome, and never reaches the unfenced
-// MarkRunFailedByID / RequeueClaimedRunToQueued / SetRunPoolWait writers.
+// MarkRunFailedByID / RequeueClaimedRunToQueued writers.
 func TestFinishRunClaimRefusesWithoutTransaction(t *testing.T) {
 	for _, assemblyErr := range []error{nil, errCredentialUnavailable, errToolPackagesRejected,
 		errGuardrailBlockedClaim, errVaultLocked, errAutoPoolEmpty, errCustomModelCapabilityMissing} {
@@ -123,7 +129,7 @@ func TestFinishRunClaimRefusesWithoutTransaction(t *testing.T) {
 		if assemblyErr != nil && !errors.Is(err, assemblyErr) {
 			t.Fatalf("assembly %v: refusal lost the assembly error: %v", assemblyErr, err)
 		}
-		if fs.markedFailed != nil || fs.requeuedRun != nil || fs.poolWaitHeld != nil ||
+		if fs.markedFailed != nil || fs.requeuedRun != nil ||
 			fs.claimFailed != nil || fs.claimRequeued != nil {
 			t.Fatalf("assembly %v: a refused finish wrote the run", assemblyErr)
 		}
@@ -233,8 +239,50 @@ func TestFinishRunClaimTransientOutcomes(t *testing.T) {
 			fs.claimRequeued.ClaimGeneration != run.ClaimGeneration || fs.claimRequeued.WorkerID != pgconv.UUID(id.workerID) {
 			t.Fatalf("%v: requeue = %+v, want exact-claim pool_wait=%v", tc.err, fs.claimRequeued, tc.poolWait)
 		}
-		if fs.claimFailed != nil || fs.markedFailed != nil || fs.requeuedRun != nil || fs.poolWaitHeld != nil {
+		if fs.claimFailed != nil || fs.markedFailed != nil || fs.requeuedRun != nil {
 			t.Fatalf("%v: a transient outcome failed the run or used an unfenced writer", tc.err)
 		}
+	}
+}
+
+// TestFinishRunClaimReleaseRowCountMismatchRollsBack (PRD #1590 D2): the hold lock saw exactly
+// the one expected hold, but the exact release affected 0 (or more than 1) rows. The whole
+// transaction rolls back with errClaimRecoveryCustody and no payload: no committed release and
+// no fail, requeue or park, for a terminal and for a transient outcome alike.
+func TestFinishRunClaimReleaseRowCountMismatchRollsBack(t *testing.T) {
+	for _, rows := range []int64{0, 2} {
+		for _, assemblyErr := range []error{errCredentialUnavailable, errVaultLocked} {
+			fs, svc, run, id := finishFixture(t)
+			id.recoveryCapable = true
+			fs.claimFinishHolds = []uuid.UUID{uuid.New()}
+			fs.claimReleaseRows = &rows
+			payload, err := svc.finishRunClaim(context.Background(), run, &ClaimPayload{RunID: run.ID.String()}, assemblyErr, id)
+			if payload != nil || !errors.Is(err, errClaimRecoveryCustody) {
+				t.Fatalf("release rows=%d, %v: finishRunClaim = (%v, %v), want (nil, errClaimRecoveryCustody)", rows, assemblyErr, payload, err)
+			}
+			if fs.claimReleased != 0 || fs.claimFailed != nil || fs.claimRequeued != nil || fs.claimParked != nil ||
+				fs.markedFailed != nil || fs.requeuedRun != nil {
+				t.Fatalf("release rows=%d, %v: a mismatched release committed a write: released=%d failed=%v requeued=%v",
+					rows, assemblyErr, fs.claimReleased, fs.claimFailed, fs.claimRequeued)
+			}
+		}
+	}
+}
+
+// TestFinishRunClaimRetryHonoursCancel (PRD #1590 N4): a caller whose context ends during the
+// 55P03 retry wait gets the context's error, not the stale 55P03, and nothing is written.
+func TestFinishRunClaimRetryHonoursCancel(t *testing.T) {
+	defer func(d time.Duration) { finishRunClaimRetryDelay = d }(finishRunClaimRetryDelay)
+	finishRunClaimRetryDelay = time.Hour
+	fs, svc, run, id := finishFixture(t)
+	fs.claimFinishLockErrs = []error{&pgconn.PgError{Code: "55P03"}}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	payload, err := svc.finishRunClaim(ctx, run, nil, errCredentialUnavailable, id)
+	if payload != nil || !errors.Is(err, context.Canceled) || isLockNotAvailable(err) {
+		t.Fatalf("cancelled retry = (%v, %v), want (nil, context.Canceled) without the 55P03", payload, err)
+	}
+	if fs.claimFinishBegins != 1 || fs.claimFailed != nil {
+		t.Fatalf("attempts=%d failed=%v, want one attempt and no write", fs.claimFinishBegins, fs.claimFailed)
 	}
 }

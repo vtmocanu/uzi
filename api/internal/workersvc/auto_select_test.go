@@ -294,7 +294,7 @@ func TestSelfImproveIgnoresTheWorkerBindMode(t *testing.T) {
 //     recorded as pool_stale with no headroom — the SPENT id is the pooled token, not
 //     f.fs.defaultCredID();
 //   - a GENUINELY empty pool holds: the claim transitions the run to pool_wait
-//     (errAutoPoolEmpty ⇒ SetRunPoolWait, PRD #754 M4), records no credential at all,
+//     (errAutoPoolEmpty ⇒ RequeueClaimAssemblyExact pool_wait, PRD #754 M4), records no credential at all,
 //     and above all never records the default.
 //
 // MUTATION THIS CATCHES: reinstating the owner-default fallback on either rung — the
@@ -374,7 +374,7 @@ func TestAutoFloorsOntoAPooledTokenNeverTheDefault(t *testing.T) {
 						f.fs.recordedCreds)
 				}
 				// PRD #754 M4: the empty-pool claim now HOLDS the run in pool_wait
-				// (SetRunPoolWait) instead of the M2 interim requeue-to-queued.
+				// (RequeueClaimAssemblyExact's pool_wait arm) instead of the M2 interim requeue.
 				if f.fs.claimRequeued == nil || !f.fs.claimRequeued.PoolWait || f.fs.claimRequeued.ID != f.runID {
 					t.Fatalf("run not held in pool_wait: %v — an empty pool holds the run, not requeues it", f.fs.claimRequeued)
 				}

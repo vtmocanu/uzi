@@ -177,7 +177,7 @@ FOR SHARE NOWAIT;
 -- lives in every claimed→queued path in runtime.sql (the three Requeue* queries plus
 -- SweepClaimedNeverStarted), which clear the hash + bump the epoch on ownership loss.
 -- PRD #1147 F7 (defense-in-depth) extends the same revoke to the park/promote paths that
--- likewise leave a run without a live owner: SetRunPoolWait (claimed→pool_wait hold),
+-- likewise leave a run without a live owner: RequeueClaimAssemblyExact (claimed→pool_wait hold),
 -- PromotePoolWaitRun (pool_wait→queued), and PromoteLimitWaitRuns (limit_wait→queued).
 -- SetRunLimitWait is INTENTIONALLY EXCLUDED: limit_wait is an actively-claimed status that
 -- keeps its live capability by design (persist-before-park), so revoking there would strip

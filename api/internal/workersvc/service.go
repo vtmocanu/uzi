@@ -858,11 +858,6 @@ type Store interface {
 	// RequeueClaimedRunToQueued resets one just-claimed run to queued when its
 	// owner's vault locked between the claim gate and the token open (PRD #32 M3).
 	RequeueClaimedRunToQueued(ctx context.Context, id uuid.UUID) (int64, error)
-	// SetRunPoolWait holds one just-claimed `auto` run whose token pool is genuinely
-	// empty (PRD #754 M4). claimed → pool_wait, a non-locking hold; positive source
-	// guard (status='claimed'), keeps worker_id for affinity, and does NOT touch the
-	// usage-limit budget (an empty pool is not a usage park). M5 resumes it.
-	SetRunPoolWait(ctx context.Context, arg store.SetRunPoolWaitParams) (int64, error)
 	// HasActiveRunForIssue reports whether the issue already has a non-terminal run.
 	// CreateRun uses it as the manual-path dedup pre-check that replaces the
 	// uq_runs_one_active_per_issue index for pool_wait runs (PRD #754 M4 Decision 8):
@@ -2525,8 +2520,9 @@ func requestActivePairs(snap *ActiveSnapshot) ([]uuid.UUID, []int64) {
 //     safe (no-secret-bytes) reason and fire the failed notify;
 //   - a vanished run (its forge connection cascade-deleted the repo → run) is dropped.
 //
-// The empty-pool and custom-model arms have no chat producer today (a chat spends the
-// owner's default token and has no custom Codex root); they stay as the run lane left them.
+// A chat spends the owner's default token and has no custom Codex root, so it produces
+// neither errAutoPoolEmpty nor errCustomModelCapabilityMissing and has no arm for them:
+// either would fall through to the default and propagate.
 //
 // The returned error is nil for every handled case (report idle) and non-nil only
 // for an unexpected error the caller must propagate.
@@ -2537,34 +2533,6 @@ func (s *Service) recoverClaimAssembly(ctx context.Context, run store.Run, err e
 			return rerr
 		}
 		return nil // idle; the run is queued again, awaiting unlock
-	case errors.Is(err, errAutoPoolEmpty):
-		// An auto claim with a genuinely empty pool must not spend the non-pooled default
-		// nor hard-fail (PRD #754). It is HELD in the non-locking pool_wait status (M4,
-		// replacing M2's interim requeue): SetRunPoolWait keeps worker_id for affinity,
-		// does not touch the usage-limit budget, and — unlike the requeue — does not churn
-		// the queue. The run is idle (nil payload) exactly as before; M5 adds the reactive
-		// + manual resume off pool_wait. Still "never spends the default, never hard-fails".
-		// Positive source guard (status='claimed'), so a re-delivered claim is a no-op.
-		if _, rerr := s.q.SetRunPoolWait(ctx, store.SetRunPoolWaitParams{
-			ID:       run.ID,
-			WorkerID: run.WorkerID,
-		}); rerr != nil {
-			return rerr
-		}
-		return nil // idle; the run is held in pool_wait, awaiting a pooled token
-	case errors.Is(err, errCustomModelCapabilityMissing):
-		// PRD #1551 M4 (D6): assembly found this Codex run's effective root is a CUSTOM model but
-		// the claiming worker lacks codex_custom_model_v1 (the owner's lane flipped custom in the
-		// window between the claim's SQL gate and assembly). REQUEUE — never fail, never run Astra:
-		// keep worker_id for resume affinity and do NOT bump requeue_count (mirroring the
-		// vault-locked path). ClaimRun's custom-model clause excludes this incapable worker,
-		// while affinity holds capable peers until the worker row disappears or the configured
-		// ceiling expires. Clearing worker_id here would allow a cold peer to bypass the PVC
-		// holding a resumed run's unpublished work. This bounded wait is the approved M4 tradeoff.
-		if _, rerr := s.q.RequeueClaimedRunToQueued(ctx, run.ID); rerr != nil {
-			return rerr
-		}
-		return nil // idle; the run is queued again, awaiting a custom-Codex-capable worker
 	case errors.Is(err, errCredentialUnavailable) || errors.Is(err, errToolPackagesRejected) || errors.Is(err, errGuardrailBlockedClaim):
 		// A guardrail block at claim (D1 layer 3) is TERMINAL — fail-closed even on a
 		// forge blip (R4; the user restarts after fixing protection), matching
@@ -2638,8 +2606,8 @@ var errVaultLocked = errors.New("vault locked during claim")
 // and it must NOT hard-fail a run for a transient/holdable condition — so this is
 // HOLDABLE like errVaultLocked, and finishRunClaim HOLDS the run in the
 // non-locking pool_wait status (PRD #754 M4, via RequeueClaimAssemblyExact's pool_wait
-// field set, which mirrors SetRunPoolWait) rather than failing
-// it — M5 resumes it reactively or manually. Its message carries no secret bytes.
+// arm) rather than failing it — M5 resumes it reactively or manually. Its message
+// carries no secret bytes.
 var errAutoPoolEmpty = errors.New("auto pool is empty")
 
 // Worker Anthropic bind modes (PRD #111 M3, D1), mirroring migration 00088's CHECK.

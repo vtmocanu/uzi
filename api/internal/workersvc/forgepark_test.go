@@ -3,6 +3,7 @@ package workersvc
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -85,8 +86,10 @@ func TestSetStateServerOnlyRecoveryCauseRejected(t *testing.T) {
 	_, applied, err := svc.SetState(context.Background(), wkr, run.ID, StateRequest{
 		State: "recovery_wait", RecoveryCause: strPtr(recoveryCauseCodexAccountUnavailable), ClaimGeneration: i64Ptr(1),
 	})
-	if !errors.Is(err, ErrInvalidState) {
-		t.Fatalf("SetState err = %v, want ErrInvalidState for a server-only recovery_cause", err)
+	// The server-only refusal, not the generic unknown-cause one: without the
+	// serverRecoveryWaitCauses check the cause is still refused, but only as "unknown".
+	if !errors.Is(err, ErrInvalidState) || !strings.Contains(err.Error(), "server-only") {
+		t.Fatalf("SetState err = %v, want ErrInvalidState naming the cause server-only", err)
 	}
 	if applied || fs.setRecoveryWait != nil || fs.setFailed != nil {
 		t.Fatalf("a refused server-only cause mutated the run: applied=%v recovery_wait=%v failed=%v",

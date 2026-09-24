@@ -169,7 +169,8 @@ func (s *Service) finishRunClaim(ctx context.Context, run store.Run, payload *Cl
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return nil, err
+			// The caller gave up: report that, not the 55P03 a later attempt might have cleared.
+			return nil, fmt.Errorf("finish run claim retry: %w", ctx.Err())
 		case <-timer.C:
 		}
 	}

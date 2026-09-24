@@ -166,10 +166,6 @@ type fakeStore struct {
 	// requeuedRun records the run id reset to queued by the vault lock-race path
 	// (PRD #32 M3); nil unless RequeueClaimedRunToQueued was called.
 	requeuedRun *uuid.UUID
-	// poolWaitHeld records the args of the pool_wait hold (PRD #754 M4); nil unless
-	// SetRunPoolWait was called. A held run records NO credential and is NOT failed —
-	// tests assert on this to distinguish the hold from the old requeue and from a fail.
-	poolWaitHeld *store.SetRunPoolWaitParams
 	// The run lane's exact-claim finish transaction (PRD #1590 M1, claim_finish_fake_test.go).
 	// claimFailed / claimRequeued / claimParked record the COMMITTED fenced write, nil unless
 	// the transaction committed it. claimFinishLocked overrides the locked row (default: the
@@ -181,6 +177,9 @@ type fakeStore struct {
 	claimFinishLocked *store.Run
 	claimFinishHolds  []uuid.UUID
 	claimReleased     int
+	// claimReleaseRows overrides ReleaseCustodyHoldExact's affected-row count (default 1, the
+	// single exact hold) so a test can stage a release that matched no row.
+	claimReleaseRows *int64
 	// claimFinishLockErrs is consumed one per exact-claim row lock (then nil): a test stages
 	// SQLSTATE errors to drive finishRunClaim's bounded 55P03 retry.
 	claimFinishLockErrs []error
@@ -1268,10 +1267,6 @@ func (f *fakeStore) SweepTaskNeverDispatched(_ context.Context, arg store.SweepT
 }
 func (f *fakeStore) RequeueClaimedRunToQueued(_ context.Context, id uuid.UUID) (int64, error) {
 	f.requeuedRun = &id
-	return 1, nil
-}
-func (f *fakeStore) SetRunPoolWait(_ context.Context, arg store.SetRunPoolWaitParams) (int64, error) {
-	f.poolWaitHeld = &arg
 	return 1, nil
 }
 func (f *fakeStore) HasActiveRunForIssue(_ context.Context, _ store.HasActiveRunForIssueParams) (bool, error) {

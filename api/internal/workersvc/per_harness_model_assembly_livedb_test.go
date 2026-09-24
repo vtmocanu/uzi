@@ -72,9 +72,13 @@ func TestAssembleCodexClaimCustomLaneLiveDB(t *testing.T) {
 		if payload != nil {
 			t.Fatalf("a gated custom-model claim must return no payload; got %+v", payload)
 		}
-		// recoverClaimAssembly REQUEUES the claimed run to queued (check-then-use), never fails it.
-		if rerr := svc.recoverClaimAssembly(env.ctx, run, err); rerr != nil {
-			t.Fatalf("recoverClaimAssembly: %v", rerr)
+		// finishRunClaim REQUEUES the claimed run to queued through the fenced exact-claim
+		// transaction (PRD #1590 M1), never fails it. The capable sub-case minted a capability,
+		// so the finish compares against the current row, which this incapable claim left as is.
+		svc.SetTxBeginner(env.pool)
+		current := mustRun(t, env, f.runID)
+		if got, rerr := svc.finishRunClaim(env.ctx, current, payload, err, claimRecoveryIdentity{workerID: f.workerID}); rerr != nil || got != nil {
+			t.Fatalf("finishRunClaim = (%v, %v), want idle", got != nil, rerr)
 		}
 		if s := runStatusOf(t, env, f.runID); s != "queued" {
 			t.Fatalf("after the gated claim the run status = %q, want queued (requeued, not failed)", s)

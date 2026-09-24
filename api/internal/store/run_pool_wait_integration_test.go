@@ -12,7 +12,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// Live-DB coverage for PRD #754 M4's SetRunPoolWait, the non-locking hold an `auto`
+// Live-DB coverage for PRD #754 M4's pool_wait hold, the non-locking hold an `auto`
 // claim transitions to when the token pool is genuinely empty, plus the two schema
 // changes 00165 rides: 'pool_wait' in runs_status_check, and its EXCLUSION from
 // uq_runs_one_active_per_issue (the non-locking property).
@@ -20,10 +20,14 @@ import (
 // 🔴 EXECUTION IS THE POINT, NOT JUST THE ASSERTIONS. A green `sqlc generate` is not
 // evidence a query runs (sqlc's type deduction is not Postgres's), and — the defect no
 // other test in the repo catches — a status CHECK that does not spell 'pool_wait' the
-// way SetRunPoolWait does migrates cleanly, passes `sqlc generate`, and passes every Go
+// way the hold does migrates cleanly, passes `sqlc generate`, and passes every Go
 // package, yet raises 23514 the first time this UPDATE fires. This is the entire
 // permanent guard for the widened domain, which matters most at the landing rebase when
 // the migration is renumbered and retyped.
+//
+// Since PRD #1590 M1 the only writer of the hold is RequeueClaimAssemblyExact's pool_wait arm
+// (fenced to the exact claim: id, worker_id, claim_generation), so this drives that statement.
+// Every run here is inserted at the column default claim_generation 0.
 //
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres.
 func TestRunPoolWaitQueriesLiveDB(t *testing.T) {
@@ -109,12 +113,14 @@ func TestRunPoolWaitQueriesLiveDB(t *testing.T) {
 	}
 	hold := func(t *testing.T, id uuid.UUID, w pgtype.UUID) int64 {
 		t.Helper()
-		rows, err := q.SetRunPoolWait(ctx, store.SetRunPoolWaitParams{ID: id, WorkerID: w})
+		rows, err := q.RequeueClaimAssemblyExact(ctx, store.RequeueClaimAssemblyExactParams{
+			PoolWait: true, ID: id, WorkerID: w, ClaimGeneration: 0,
+		})
 		if err != nil {
 			// 23514 here means 00165's status CHECK does not spell 'pool_wait' as this
 			// query does (check the renumbered migration); 42P08 means sqlc accepted a
 			// statement Postgres will not prepare. Nothing else in the repo catches either.
-			t.Fatalf("SetRunPoolWait(%s): %v", id, err)
+			t.Fatalf("RequeueClaimAssemblyExact pool_wait (%s): %v", id, err)
 		}
 		return rows
 	}

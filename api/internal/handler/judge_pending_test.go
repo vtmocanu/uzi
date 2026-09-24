@@ -65,7 +65,7 @@ func TestPendingJudgeState(t *testing.T) {
 				"the query can return it"},
 		{"pool_wait", "running",
 			"inside the active set (00170) — PRD #754's empty-token-pool hold; out of reach for a judge " +
-				"(SetRunPoolWait carries AND kind <> 'judge', and only an auto run is ever held), but " +
+				"(RequeueClaimAssemblyExact's pool_wait arm carries AND kind <> 'judge', and only an auto run is ever held), but " +
 				"schema-permitted like the rest, so the query can return it"},
 		{"recovery_wait", "running",
 			"inside the active set (00203) — issue #1197's transient-recovery park; out of reach for a " +
