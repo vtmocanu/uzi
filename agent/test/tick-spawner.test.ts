@@ -161,11 +161,19 @@ setInterval(() => {}, 1000);
   });
 });
 
+/** Proven-ownership removal and the `foreign` / `inode_mismatch` reasons need the /proc fd
+ *  evidence tick-spawner.ts reads only on Linux; elsewhere every such lock is retained as
+ *  `no_proc_evidence` by design, so those cases do not apply. */
+const NEEDS_PROC: string | false =
+  process.platform !== "linux"
+    ? "lock-ownership proof reads /proc (Linux only); non-Linux retains every lock as no_proc_evidence by design"
+    : false;
+
 describe("TickSpawner lock custody (issue #1597 M2)", () => {
   const branch = "agent/issue-7";
   const trackingLock = (): string => path.join(bare, "refs", "uzi-runner", "agent", "issue-7.lock");
 
-  it("proven-owned: a SIGKILLed child's held lock (absent pre-spawn, same inode) is removed", async () => {
+  it("proven-owned: a SIGKILLed child's held lock (absent pre-spawn, same inode) is removed", { skip: NEEDS_PROC }, async () => {
     const ac = new AbortController();
     const sp = new TickSpawner({ signal: ac.signal, barePath: bare, branch, killGraceMs: 200 });
     const h = await sp.spawn(req([NODE, stubborn(trackingLock())]));
@@ -182,7 +190,7 @@ describe("TickSpawner lock custody (issue #1597 M2)", () => {
     assert.deepEqual(await sp.reconcileLocks(), { removed: [], retained: [] });
   });
 
-  it("foreign: a lock another process created during the cancellation is RETAINED with evidence", async () => {
+  it("foreign: a lock another process created during the cancellation is RETAINED with evidence", { skip: NEEDS_PROC }, async () => {
     const ac = new AbortController();
     const sp = new TickSpawner({ signal: ac.signal, barePath: bare, branch, killGraceMs: 300 });
     const h = await sp.spawn(req([NODE, stubborn()]));
@@ -206,7 +214,7 @@ describe("TickSpawner lock custody (issue #1597 M2)", () => {
     assert.ok(fs.existsSync(path.join(bare, "packed-refs.lock")), "never deleted");
   });
 
-  it("replaced: the child held the lock but the path now has a different inode — RETAINED", async () => {
+  it("replaced: the child held the lock but the path now has a different inode — RETAINED", { skip: NEEDS_PROC }, async () => {
     const ac = new AbortController();
     const sp = new TickSpawner({ signal: ac.signal, barePath: bare, branch, killGraceMs: 200 });
     const h = await sp.spawn(req([NODE, stubborn(trackingLock())]));
