@@ -648,9 +648,18 @@ workers:
   #     a quota on this resource cannot bind (see the docker tier's ephemeralStorage
   #     comment). So when unsure, err LOW.
   #
-  # 512Mi is ~10x kubelet's default per-container log-rotation ceiling (10Mi x 5),
-  # which is essentially all a plain worker keeps on ephemeral storage: its working
-  # tree lives on the /data PVC, not on an emptyDir.
+  # 512Mi is ~10x kubelet's default per-container log-rotation ceiling (10Mi x 5).
+  # That ceiling, plus logs and the writable layer, is roughly what a plain
+  # worker's ephemeral-storage footprint consists of; its OWN working tree
+  # lives on the /data PVC, not on an emptyDir, so it does not count against
+  # this request. It is NOT the whole ephemeral picture any more: since issue
+  # #1598 every worker pod, plain or docker, also carries a worker-only
+  # emptyDir (codex-cmd-cache, /var/cache/uzi-codex-cmd, in addition to any the
+  # docker lane adds) for a run's Codex command build cache, which counts
+  # toward this same request/ranking. This number is deliberately NOT raised
+  # for that yet — see codex-cmd-cache's own comment in
+  # controller/internal/kube/render.go and adr/1598-codex-command-storage.md
+  # for why (the hosted-worker measurement to size it correctly is pending).
   #
   # NEVER add a matching LIMIT, here or in limitRange. A limit on ANY container makes
   # kubelet enforce the SUM of declared limits against pod usage that includes the
@@ -960,14 +969,17 @@ workers:
     # emptyDir is mounted ONLY for a docker worker, and it holds the run's entire
     # working tree — one clone per run, times maxConcurrentRuns, with $TMPDIR pointed
     # at the same volume. A plain worker's working tree is on the /data PVC instead
-    # and never touches ephemeral storage at all. uzi's own repo is a ~170 MiB runner
-    # clone before a single dependency install; 4Gi covers roughly two concurrent
-    # heavy runs.
+    # and never touches ephemeral storage FOR THE CHECKOUT at all — but as of issue
+    # #1598 every worker, plain or docker, also carries the worker-only codex-cmd-cache
+    # emptyDir (a run's Codex command build cache), which counts toward this request too
+    # regardless of tier. uzi's own repo is a ~170 MiB runner clone before a single
+    # dependency install; 4Gi covers roughly two concurrent heavy runs.
     #
     # It is 4Gi rather than the larger figure an emptyDir-based design needed because
     # dindDataSize above moved the daemon's image cache to a PVC, which was ~99% of
     # the measured footprint. Re-derive what is left on ephemeral storage before
-    # raising it.
+    # raising it — that re-derivation must now also account for codex-cmd-cache; see
+    # adr/1598-codex-command-storage.md (the hosted-worker measurement is pending).
     ephemeralRequest: 4Gi
   # The CNI-INDEPENDENT floor: default-deny both directions, plus the two in-cluster
   # destinations an FQDN rule structurally cannot express (AntreaProxy rewrites a

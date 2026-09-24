@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -16,73 +17,29 @@ func main() {
 	os.Exit(realMain(os.Args[1:]))
 }
 
-// realMain is the whole flow: parse the trusted argv, establish + verify the
-// subreaper/nondumpable posture, verify the container profile BEFORE fork, launch
-// the child with fd3/fd4 closed at its execve, then run the control loop. Every
-// pre-fork failure emits a sanitized abnormal event on fd 4 and exits non-zero
-// WITHOUT forking.
+// realMain is the whole flow: the pre-fork sequence (prelaunch: fd hygiene,
+// argv, the verified profile, the command tmp, the launch) wired to the real
+// syscalls, then the control loop. A first argument naming a standalone mode
+// (--reap-orphans, --hold-cache, --remove-cache) runs that mode instead,
+// before anything of the supervisor's own flow: it uses no fd 3/4 and forks
+// no child.
 func realMain(args []string) int {
+	if len(args) > 0 && isModeFlag(args[0]) {
+		return runMode(args, realModeEnv())
+	}
+	// os.NewFile opens nothing; prelaunch's first step is the fd hygiene.
 	ev := &evidence{w: os.NewFile(4, "evidence")}
-
-	expectUID, cleanupToken, dropControllerCaps, childArgv, err := parseArgs(args)
-	if err != nil {
-		_ = ev.writeJSON(abnormalEvidence("invalid arguments", nil))
+	tmp, childPid, st, ok := prelaunch(ev, args, prelaunchSeams{
+		fdHygiene: func() error { return markStrayFdsCloexec(realFdHygiene) },
+		dropCaps:  clearAllCaps,
+		profile:   verifyProfile,
+		trustFds:  markTrustedFdsCloexec,
+		setup:     openCommandTmp,
+		launch:    launchChild,
+	})
+	if !ok {
 		return 2
 	}
-	if dropControllerCaps {
-		if err := clearAllCaps(); err != nil {
-			_ = ev.writeJSON(abnormalEvidence("profile:capDrop", nil))
-			return 2
-		}
-	}
-
-	// (1) Establish + verify subreaper and nondumpability BEFORE fork. PR_SET_DUMPABLE
-	// 0 makes the supervisor's /proc/<pid> root-owned, so a same-uid child cannot
-	// open /proc/<sup>/fd/3|4 and forge the trusted channels.
-	subreaper := establishSubreaper()
-	nondumpable := establishNondumpable()
-
-	// (2) Profile verification, fail-before-fork.
-	statusText, rerr := os.ReadFile("/proc/self/status")
-	if rerr != nil {
-		_ = ev.writeJSON(abnormalEvidence("profile:parse", nil))
-		return 2
-	}
-	st, perr := parseProcStatus(string(statusText))
-	if perr != nil {
-		_ = ev.writeJSON(abnormalEvidence("profile:parse", nil))
-		return 2
-	}
-	if ok, field := evaluateProfile(st, expectUID, subreaper, nondumpable); !ok {
-		_ = ev.writeJSON(abnormalEvidence("profile:"+field, nil))
-		return 2
-	}
-
-	// (3) Launch. Mark the trusted descriptors close-on-exec so they auto-close
-	// at the child's execve (the child inherits only stdio 0/1/2), then ForkExec
-	// into a fresh session.
-	unix.CloseOnExec(3)
-	unix.CloseOnExec(4)
-	childPid, lerr := launchChild(childArgv)
-	if lerr != nil {
-		_ = ev.writeJSON(abnormalEvidence("child launch failed", nil))
-		return 2
-	}
-	// The supervised child inherited stdio 0/1/2. Drop the supervisor's copies so
-	// EOF/backpressure describe the child tree rather than this long-lived control
-	// process; control/evidence remain isolated on fd3/fd4.
-	_ = unix.Close(0)
-	_ = unix.Close(1)
-	_ = unix.Close(2)
-	childReady, readyErr := watchChild(childPid)
-	if readyErr != nil {
-		deadline := time.Now().Add(time.Duration(defaultDisposeTimeoutMs) * time.Millisecond)
-		cleanup := drain(deadline, time.Now, func() { time.Sleep(2 * time.Millisecond) }, selfDirectChildren, realKill, realReap)
-		_ = ev.writeJSON(abnormalEvidence("child watch failed", &cleanup))
-		removeCommandTmp(cleanupToken)
-		return 2
-	}
-
 	sup := &supervisor{
 		ev:      ev,
 		control: &controlReader{r: os.NewFile(3, "control")},
@@ -91,22 +48,104 @@ func realMain(args []string) int {
 			directChildren: selfDirectChildren,
 			kill:           realKill,
 			reap:           realReap,
-			childReady:     childReady,
 			reapChild:      realReapChild,
 			snapshot:       func() ([]procRow, error) { return walkDescendants(os.Getpid()) },
 			now:            time.Now,
 			sleep:          func() { time.Sleep(2 * time.Millisecond) },
+			tmpCleanup:     tmpCleanupFor(tmp),
 		},
 	}
-	code := sup.run(childPid, st)
-	removeCommandTmp(cleanupToken)
-	return code
+	// The supervised child inherited stdio 0/1/2. Drop the supervisor's copies so
+	// EOF/backpressure describe the child tree rather than this long-lived control
+	// process; control/evidence remain isolated on fd3/fd4.
+	_ = unix.Close(0)
+	_ = unix.Close(1)
+	_ = unix.Close(2)
+	// A child-watch failure goes through sup.abnormal, which touches the tmp only
+	// after a confirmed drain. The lock fd held in tmp stays open until process
+	// exit, after any cleanup.
+	return sup.runWatched(childPid, st, watchChild)
 }
 
-func removeCommandTmp(token string) {
-	if token != "" {
-		_ = os.RemoveAll("/tmp/uzi-codex-command-" + token)
+// prelaunchSeams are prelaunch's steps; realMain wires the real ones.
+type prelaunchSeams struct {
+	// fdHygiene marks every fd from firstStrayFd upward close-on-exec.
+	fdHygiene func() error
+	// dropCaps clears every capability (--drop-controller-caps only).
+	dropCaps func() error
+	// profile establishes and verifies the pre-fork posture; a non-empty
+	// reason is the abnormal reason.
+	profile func(expectUID int) (st procStatus, reason string)
+	// trustFds marks the trusted fd3/fd4 close-on-exec.
+	trustFds func()
+	setup    tmpSetup
+	launch   func([]string) (int, error)
+}
+
+// prelaunch is the pre-fork sequence, in this order: fd hygiene (before
+// anything is opened, so no fd above the trusted 3/4 inherited from our own
+// parent can reach the child), the trusted argv, the optional cap drop, the
+// profile verification, then the command tmp and the launch. Every failure
+// emits one sanitized abnormal event on ev and returns ok == false WITHOUT
+// running any later step, so nothing is forked.
+func prelaunch(ev *evidence, args []string, p prelaunchSeams) (tmp *commandTmp, childPid int, st procStatus, ok bool) {
+	if err := p.fdHygiene(); err != nil {
+		_ = ev.writeJSON(abnormalEvidence("fd hygiene failed", nil))
+		return nil, 0, st, false
 	}
+	expectUID, cleanupToken, dropControllerCaps, childArgv, err := parseArgs(args)
+	if err != nil {
+		_ = ev.writeJSON(abnormalEvidence("invalid arguments", nil))
+		return nil, 0, st, false
+	}
+	if dropControllerCaps {
+		if err := p.dropCaps(); err != nil {
+			_ = ev.writeJSON(abnormalEvidence("profile:capDrop", nil))
+			return nil, 0, st, false
+		}
+	}
+	st, reason := p.profile(expectUID)
+	if reason != "" {
+		_ = ev.writeJSON(abnormalEvidence(reason, nil))
+		return nil, 0, st, false
+	}
+	// Command tmp + launch. With a cleanup token the supervisor alone creates
+	// /tmp/uzi-codex-command-<token>, flocks it for its whole lifetime (the fd is
+	// close-on-exec, so the child never inherits the lock) and rechecks the name,
+	// all before fork. The trusted descriptors are close-on-exec so they
+	// auto-close at the child's execve (the child inherits only stdio 0/1/2),
+	// then ForkExec runs into a fresh session.
+	p.trustFds()
+	tmp, childPid, ok = setupAndLaunch(ev, cleanupToken, expectUID, p.setup, p.launch, childArgv)
+	return tmp, childPid, st, ok
+}
+
+// markTrustedFdsCloexec marks the control/evidence pair close-on-exec.
+func markTrustedFdsCloexec() {
+	unix.CloseOnExec(3)
+	unix.CloseOnExec(4)
+}
+
+// verifyProfile establishes and verifies subreaper and nondumpability, then
+// verifies the container profile, all BEFORE fork. PR_SET_DUMPABLE 0 makes the
+// supervisor's /proc/<pid> root-owned, so a same-uid child cannot open
+// /proc/<sup>/fd/3|4 and forge the trusted channels. It returns "" or the
+// abnormal reason.
+func verifyProfile(expectUID int) (procStatus, string) {
+	subreaper := establishSubreaper()
+	nondumpable := establishNondumpable()
+	statusText, err := os.ReadFile("/proc/self/status")
+	if err != nil {
+		return procStatus{}, "profile:parse"
+	}
+	st, err := parseProcStatus(string(statusText))
+	if err != nil {
+		return procStatus{}, "profile:parse"
+	}
+	if ok, field := evaluateProfile(st, expectUID, subreaper, nondumpable); !ok {
+		return st, "profile:" + field
+	}
+	return st, ""
 }
 
 // watchChild returns a one-shot readiness channel backed by a pidfd. Readiness
@@ -159,7 +198,7 @@ var errBadArgs = errors.New("invalid arguments")
 
 // parseArgs parses the trusted, caller-supplied argv:
 //
-//	--expect-uid <N> [--drop-controller-caps] -- <child-exec-abspath> [child args...]
+//	--expect-uid <N> [--cleanup-token <lowercase-uuid>] [--drop-controller-caps] -- <child-exec-abspath> [child args...]
 //
 // The child exec path must be absolute (never a model-selected relative target),
 // and --expect-uid is mandatory.
@@ -225,6 +264,120 @@ func validCleanupToken(token string) bool {
 		}
 	}
 	return true
+}
+
+// firstStrayFd is the lowest fd markStrayFdsCloexec touches: 0/1/2 are the
+// child's stdio and 3/4 the trusted control/evidence pair.
+const firstStrayFd = 5
+
+// procSelfFdDir lists this process's open fds.
+const procSelfFdDir = "/proc/self/fd"
+
+// fdHygiene is markStrayFdsCloexec's seams.
+type fdHygiene struct {
+	// closeRange marks every fd from first upward close-on-exec at once.
+	closeRange func(first uint) error
+	// listOpen returns the fds open in this process, excluding its own.
+	listOpen func() ([]int, error)
+	// set marks one fd close-on-exec.
+	set func(fd int) error
+}
+
+var realFdHygiene = fdHygiene{
+	closeRange: closeRangeCloexec,
+	listOpen:   listOpenFds,
+	set:        setCloexec,
+}
+
+// listOpenFds reads the open fd numbers from procSelfFdDir through one
+// O_CLOEXEC directory fd, which it leaves out of the result. A name that is
+// not a number is an error.
+func listOpenFds() ([]int, error) {
+	dfd, err := unix.Open(procSelfFdDir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = unix.Close(dfd) }()
+	buf := make([]byte, 4096)
+	var fds []int
+	var names []string
+	for {
+		n, err := unix.Getdents(dfd, buf)
+		if errors.Is(err, unix.EINTR) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if n <= 0 {
+			return fds, nil
+		}
+		_, _, names = unix.ParseDirent(buf[:n], -1, names[:0])
+		for _, name := range names {
+			fd, err := strconv.Atoi(name)
+			if err != nil {
+				return nil, fmt.Errorf("fd entry %q is not a number", name)
+			}
+			if fd != dfd {
+				fds = append(fds, fd)
+			}
+		}
+	}
+}
+
+// closeRangeCloexec sets close-on-exec on every fd from first upward in one
+// close_range(CLOSE_RANGE_CLOEXEC) call, without closing any.
+func closeRangeCloexec(first uint) error {
+	return unix.CloseRange(first, ^uint(0), unix.CLOSE_RANGE_CLOEXEC)
+}
+
+// setCloexec sets FD_CLOEXEC on one fd (the only fd flag).
+func setCloexec(fd int) error {
+	_, err := unix.FcntlInt(uintptr(fd), unix.F_SETFD, unix.FD_CLOEXEC)
+	return err
+}
+
+// markStrayFdsCloexec makes every fd from firstStrayFd upward close-on-exec,
+// so an fd the supervisor itself inherited without close-on-exec can never
+// reach the child, whatever its number. It tries, in order:
+//
+//  1. close_range(CLOSE_RANGE_CLOEXEC) over the whole range. It fails with
+//     ENOSYS or EINVAL on a kernel without it or without CLOSE_RANGE_CLOEXEC,
+//     and with EPERM where a seccomp profile denies it (as measured in this
+//     repo's dev sandbox);
+//  2. set on every fd procSelfFdDir lists (the open ones, at any number).
+//
+// An EBADF from set is an fd that is not (or no longer) open and is skipped.
+// There is deliberately no third, numeric sweep: RLIMIT_NOFILE does not bound
+// the fds already open (lowering it closes nothing), so a sweep to any limit
+// could miss a stray fd above it. When both steps fail the error is returned
+// and the caller must not fork (fail closed).
+func markStrayFdsCloexec(h fdHygiene) error {
+	crErr := h.closeRange(firstStrayFd)
+	if crErr == nil {
+		return nil
+	}
+	fds, err := h.listOpen()
+	if err != nil {
+		return fmt.Errorf("close_range: %v; fd listing: %w", crErr, err)
+	}
+	if err := setEach(fds, h.set); err != nil {
+		return fmt.Errorf("close_range: %v; fd listing set: %w", crErr, err)
+	}
+	return nil
+}
+
+// setEach runs set on every fd in fds from firstStrayFd upward, skipping EBADF.
+func setEach(fds []int, set func(fd int) error) error {
+	for _, fd := range fds {
+		if fd < firstStrayFd {
+			continue
+		}
+		if err := set(fd); err != nil && !errors.Is(err, unix.EBADF) {
+			return err
+		}
+	}
+	return nil
 }
 
 // establishSubreaper sets PR_SET_CHILD_SUBREAPER then CONFIRMS it via

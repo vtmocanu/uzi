@@ -1,0 +1,70 @@
+# PRD #1598 M5 boundary measurement — FALLBACK minimal image.
+#
+# This is NOT the real worker image (agent/templates/base/Dockerfile): building
+# that image bakes a full nix + devbox toolchain that does not fit this box's
+# disk budget (see run.sh / README.md "deviation"). This fallback builds the
+# REAL uzi-codex-supervisor and uzi-codex-command-sandbox from the exact
+# sources at the ref under measurement, vendored, so no network is needed for
+# the supervisor's own build, on a plain golang:1.26-alpine base, with the
+# same three runtime uids the real worker image creates (PRD #51 A1 / PRD
+# #1171 M1).
+#
+# The numbers this produces are a PROXY: real /tmp, cache and network behavior
+# under the real supervisor + sandbox binaries, but without the real worker's
+# read-only root, seccomp profile, or nix-provisioned Go toolchain version
+# pinning. A capability drop IS applied here (run.sh passes `--cap-drop ALL`
+# plus a small hand-picked `--cap-add` set, and every supervisor invocation
+# additionally clears the bounding set to fully empty via `setpriv
+# --bounding-set -all`) -- just not the k8s pod's own posture, which retains a
+# residual SETUID|SETGID bounding set (0xc0) from its controller-only
+# entrypoint. This harness's fully-empty bounding set is therefore STRICTER
+# than production's residue, not a missing drop. See README.md's "capability
+# set differs from production's residue" note for the full detail.
+#
+# Build context is a SYNTHETIC directory `run.sh` assembles per invocation
+# (NOT the ref's checkout root, and not just `agent/codex/supervisor/`
+# either): it copies in `agent/codex/supervisor/` (this Dockerfile's first
+# COPY, below), `api/` (this repo's API module under test, this Dockerfile's
+# second COPY), and this directory's own `measure-inner.sh`. run.sh builds a
+# fresh context directory rather than pointing docker at the worktree root
+# because the repo-root `.dockerignore` (which excludes `agent/`, `api/` and
+# `e2e/` for the WEB image) applies to ANY build whose context is the repo
+# root, and the synthetic context has no `.dockerignore` of its own to fight
+# (see README.md "The repo's .dockerignore and the synthetic build context").
+# Separately, everything is baked in at BUILD time (not bind-mounted) because
+# the docker CLI here may talk to a possibly-remote/sibling daemon over
+# DOCKER_HOST with no shared host filesystem at run time — see README.md
+# "Why everything is baked into the image".
+FROM golang:1.26-alpine
+
+# util-linux setpriv (the busybox applet cannot --reuid, same guard the real
+# Dockerfile uses); bash for the driver; coreutils/git for measurement + go.
+RUN apk add --no-cache bash util-linux coreutils git \
+    && setpriv --help 2>&1 | grep -q -- --reuid
+
+# The three runtime uids (mirrors agent/templates/base/Dockerfile exactly).
+RUN addgroup -g 10001 worker && adduser -u 10001 -G worker -h /home/worker -D worker \
+    && addgroup -g 10002 runner && adduser -u 10002 -G runner -h /home/runner -D runner \
+    && addgroup -g 10003 runner-cmd && adduser -u 10003 -G runner-cmd -h /home/runner-cmd -D runner-cmd \
+    && addgroup worker runner \
+    && addgroup runner-cmd runner
+
+WORKDIR /src/supervisor
+COPY agent/codex/supervisor/ .
+# CGO_ENABLED=0: a statically linked binary, same as the real image's build
+# (doc.go: "STATICALLY LINKED Go binary (CGO_ENABLED=0 ...)"). -mod=vendor: the
+# module vendors its own (small) dependency, golang.org/x/sys, so this build
+# needs no network. The cmdsandbox subpackage is built the same way; on the
+# base ref it has no --cache flag, on the branch ref it does — both build
+# fine from source as-is.
+RUN CGO_ENABLED=0 go build -mod=vendor -o /usr/local/bin/uzi-codex-supervisor . \
+    && CGO_ENABLED=0 go build -mod=vendor -o /usr/local/bin/uzi-codex-command-sandbox ./cmdsandbox \
+    && chmod 0555 /usr/local/bin/uzi-codex-supervisor /usr/local/bin/uzi-codex-command-sandbox
+
+# The API module under test, baked in read-only; the driver copies it to a
+# writable, uid-10003-owned tree at container start (see measure-inner.sh).
+COPY api/ /work/api-src/
+COPY e2e/codex-tmp-measure/measure-inner.sh /measure-inner.sh
+RUN chmod 0755 /measure-inner.sh
+
+WORKDIR /

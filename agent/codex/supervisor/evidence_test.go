@@ -161,3 +161,16 @@ func TestEvidenceWriterSizeCap(t *testing.T) {
 		t.Errorf("nothing should have been written, got %d bytes", buf.Len())
 	}
 }
+
+func TestWithTmpCleanup(t *testing.T) {
+	d := drainResult{State: stateDrained, Authority: authorityECHILD}
+	m := decode(t, withTmpCleanup(disposeEvidence(1, d), &tmpCleanupResult{State: tmpCleanupRetained, Reason: "absent"}))
+	tc, ok := m["tmpCleanup"].(map[string]any)
+	if !ok || tc["state"] != "retained" || tc["reason"] != "absent" || len(tc) != 2 {
+		t.Fatalf("tmpCleanup = %v", m["tmpCleanup"])
+	}
+	m2 := decode(t, withTmpCleanup(abnormalEvidence("control EOF", &d), nil))
+	if _, ok := m2["tmpCleanup"]; ok {
+		t.Fatal("a nil result must leave the event without tmpCleanup")
+	}
+}

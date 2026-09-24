@@ -861,6 +861,12 @@ Tracked as GitHub issue vtmocanu/uzi#1593.
 - An auto-approved (autopilot) run, or any run with no one to ask, never parks: after the nudge it fails closed with the distinct fail_origin `plan_missing` and a fixed `failure_reason`. [user, #1593]
 - Nothing is ever inferred from the lead's prose — it never becomes a plan, a question, or part of a later prompt. [user, #1593]
 
+## Feature #1598 — Codex command storage no longer accumulates in the writable layer
+
+Tracked as GitHub issue vtmocanu/uzi#1598.
+
+- (AI-synced 2026-09-24) A Codex model-authorized command's per-command tmp still lives in `/tmp` while the command runs, and a run's per-run Codex build/module cache lives on k8s in a worker-only emptyDir, on compose in the container layer; but both are now removed (fail-closed and fd-safe: a dedicated no-follow tree-removal primitive, not `os.RemoveAll`) after the command drains or at run end, with leftovers reaped at worker startup (gated on a kernel process-table proof rather than an unlocked-name guess), so neither accumulates the way it used to. The cache is a storage/performance boundary only, never a trust boundary. The hosted-worker measurement needed to raise the worker ephemeral-storage requests for it is pending, not delivered by this issue.
+
 ## Startup admin seed
 
 - Seed an admin user from env at startup (`UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME`) so the user survives DB wipes.

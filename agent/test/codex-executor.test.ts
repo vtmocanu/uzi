@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { PassThrough } from "node:stream";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -21,6 +22,7 @@ import {
   MAX_COMMAND_CAPTURE_BYTES,
   COMMAND_CAPTURE_KILLED_CODE,
   commandSandboxArgv,
+  HeldRunCommandCache,
   type CodexExecutorDeps,
   type CodexCommittedGenerationCell,
 } from "../src/codex/codex-executor.js";
@@ -49,7 +51,14 @@ import { PauseNowSignal } from "../src/steering.js";
 import type { Logger } from "../src/log.js";
 import type { AgentTemplate } from "../src/protocol.js";
 import type { BoundaryRequest } from "../src/harness.js";
-import type { CodexEffectLaunchSpec, CodexRootHandle } from "../src/codex/launcher.js";
+import type {
+  CacheCleanupResult,
+  CodexEffectLaunchSpec,
+  CodexRootHandle,
+  CommandCacheHolder,
+  DisposeEvidence,
+  DisposeOutcome,
+} from "../src/codex/launcher.js";
 import { CODEX_M3B_LOOPBACK_PROVIDER_NAME } from "../src/codex/config.js";
 import { MAX_LEAD_FINAL_MESSAGE_LEN, PLAN_MISSING_NUDGE, REASON_PLAN_MISSING } from "../src/plan-missing.js";
 
@@ -2970,6 +2979,114 @@ describe("CodexExecutor: advice lane app-server refresh bridge — generation-af
   });
 });
 
+describe("CodexExecutor: retained command tmp is logged, never an unclean reap", () => {
+  function tmpHandle(tmpCleanup: DisposeEvidence["tmpCleanup"]): { handle: CodexRootHandle; disposes: () => number } {
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    let disposes = 0;
+    const handle: CodexRootHandle = {
+      started: { event: "started", supervisorPid: 40, childPid: 41, subreaper: true, nondumpable: true, uid: 10003, liveCapsZero: true, capBoundingSet: "0xc0", noNewPrivs: true },
+      supervisorPid: 40,
+      transport: { stdin: new PassThrough(), stdout, stderr },
+      snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
+      waitChild: async () => ({ event: "child_exit", code: 0 }),
+      dispose: async () => {
+        disposes += 1;
+        stdout.end(); stderr.end();
+        return {
+          clean: true,
+          event: { event: "dispose", id: 1, state: "drained", authority: "ECHILD+__WALL", ...(tmpCleanup ? { tmpCleanup } : {}) },
+        };
+      },
+      failed: undefined,
+      whenFailed: new Promise<Error>(() => undefined),
+    };
+    return { handle, disposes: () => disposes };
+  }
+  const warnings = (lines: readonly string[]): Array<Record<string, unknown>> =>
+    lines.map((l) => JSON.parse(l) as Record<string, unknown>).filter((l) => l.level === "warn");
+
+  it("a command whose clean dispose retained the tmp logs one warn with the reason and still succeeds", async () => {
+    const registry = new ExecutionRegistry(newLocalExecutionEpoch(3));
+    const rlog = recordingLog();
+    const { handle } = tmpHandle({ state: "retained", reason: "mismatch" });
+    const spawnCommand = makeDefaultSpawnCommand(registry, async () => handle, 1000, "/data/runner/repo/run-3", {}, "required", rlog.log);
+    const res = await withTimeout(spawnCommand(["/bin/true"], { cwd: "/data/runner/repo/run-3" }), 5000, "retained command");
+    assert.equal(res.code, 0, "a retained tmp is not an unclean reap");
+    const warns = warnings(rlog.lines);
+    assert.equal(warns.length, 1);
+    assert.equal(warns[0]?.msg, "codex command tmp retained");
+    assert.equal(warns[0]?.reason, "mismatch");
+  });
+
+  it("a removed tmp (or no tmpCleanup) logs nothing", async () => {
+    for (const tmpCleanup of [{ state: "removed" as const, reason: "" }, undefined]) {
+      const registry = new ExecutionRegistry(newLocalExecutionEpoch(4));
+      const rlog = recordingLog();
+      const { handle } = tmpHandle(tmpCleanup);
+      const spawnCommand = makeDefaultSpawnCommand(registry, async () => handle, 1000, "/data/runner/repo/run-4", {}, "required", rlog.log);
+      await withTimeout(spawnCommand(["/bin/true"], { cwd: "/data/runner/repo/run-4" }), 5000, "removed command");
+      assert.deepEqual(warnings(rlog.lines), []);
+    }
+  });
+
+  function abnormalHandle(outcome: DisposeOutcome): CodexRootHandle {
+    const { handle } = tmpHandle(undefined);
+    return { ...handle, dispose: async () => outcome };
+  }
+
+  it("an unclean dispose carrying a drained abnormal's retained tmpCleanup logs one warn and stays unclean", async () => {
+    const rlog = recordingLog();
+    const root = registeredRoot(
+      abnormalHandle({ clean: false, reason: "supervisor abnormal: control EOF", tmpCleanup: { state: "retained", reason: "mismatch" } }),
+      "command",
+      rlog.log,
+    );
+    const reaped = await root.reap(100);
+    assert.equal(reaped.ok, false, "the abnormal still makes the reap unclean");
+    await assert.rejects(root.dispose(100), /disposal not clean/);
+    const warns = warnings(rlog.lines);
+    assert.equal(warns.length, 1, "logged once across reap and dispose");
+    assert.equal(warns[0]?.msg, "codex command tmp retained");
+    assert.equal(warns[0]?.reason, "mismatch");
+    assert.equal(warns[0]?.clean, false);
+  });
+
+  it("an unclean dispose whose drained dispose event retained the tmp logs it", async () => {
+    const rlog = recordingLog();
+    const event: DisposeEvidence = { event: "dispose", id: 1, state: "drained", authority: "ECHILD+__WALL", tmpCleanup: { state: "retained", reason: "io" } };
+    const root = registeredRoot(abnormalHandle({ clean: false, reason: "supervisor exited non-zero", event }), "command", rlog.log);
+    assert.equal((await root.reap(100)).ok, false);
+    const warns = warnings(rlog.lines);
+    assert.equal(warns.length, 1);
+    assert.equal(warns[0]?.reason, "io");
+  });
+
+  it("an unclean dispose with a removed or no tmpCleanup logs nothing", async () => {
+    for (const outcome of [
+      { clean: false, reason: "supervisor abnormal: control EOF", tmpCleanup: { state: "removed", reason: "" } },
+      { clean: false, reason: "supervisor abnormal: control EOF" },
+    ] as const) {
+      const rlog = recordingLog();
+      const root = registeredRoot(abnormalHandle(outcome), "command", rlog.log);
+      assert.equal((await root.reap(100)).ok, false);
+      assert.deepEqual(warnings(rlog.lines), []);
+    }
+  });
+
+  it("registeredRoot reports a retained tmp once across reap and a repeat dispose, and the reap stays ok", async () => {
+    const rlog = recordingLog();
+    const { handle, disposes } = tmpHandle({ state: "retained", reason: "absent" });
+    const root = registeredRoot(handle, "command", rlog.log);
+    assert.deepEqual(await root.reap(100), { ok: true });
+    await root.dispose(100);
+    assert.equal(disposes(), 2);
+    const warns = warnings(rlog.lines);
+    assert.equal(warns.length, 1, "logged once, not per idempotent dispose");
+    assert.equal(warns[0]?.reason, "absent");
+  });
+});
+
 describe("CodexExecutor: F1 registry teardown relocation", () => {
   it("an unconfirmed launcher dispose is a failing RegisteredRoot.dispose, never marked disposed", async () => {
     const handle: CodexRootHandle = {
@@ -5009,5 +5126,486 @@ describe("CodexExecutor: run-wide wall and served lift (issue #1600)", () => {
     const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "codex refused fallback");
     assert.strictEqual(result.walled, undefined);
     assert.equal(spies.parkForWallCalls, 1, "the 100ms re-drive fits the 300ms claim-time fallback");
+  });
+});
+
+// ================================================================================
+// Issue #1598 M5: the per-run command cache. One `--hold-cache` holder per run(); every
+// command-identity launch gets `--cache <dir>` + GOMODCACHE/GOCACHE/npm_config_cache while
+// HOME/TMPDIR stay the per-command private tmp; the release attests the drain and happens at
+// the TERMINAL registry teardown (after post-run sinks under deferRegistryTeardown).
+describe("CodexExecutor: per-run command cache (issue #1598)", () => {
+  // Built at runtime: a literal UUID in source trips secret scanners (generic-api-key).
+  const CACHE_TOKEN = randomUUID();
+  const CACHE_DIR = `/var/cache/uzi-codex-cmd/${CACHE_TOKEN}`;
+  const CACHE_KEYS = ["GOMODCACHE", "GOCACHE", "npm_config_cache"] as const;
+
+  interface FakeHolder {
+    holder: CommandCacheHolder;
+    releases: boolean[];
+    /** The timeoutMs each release was given. */
+    releaseTimeouts: number[];
+    die: () => void;
+  }
+  function fakeHolder(events: string[], result: CacheCleanupResult = { state: "removed", reason: "" }): FakeHolder {
+    let alive = true;
+    const releases: boolean[] = [];
+    const releaseTimeouts: number[] = [];
+    const holder: CommandCacheHolder = {
+      token: CACHE_TOKEN,
+      path: CACHE_DIR,
+      alive: () => alive,
+      release: async (drained, timeoutMs) => {
+        events.push(`release:${String(drained)}`);
+        releases.push(drained);
+        releaseTimeouts.push(timeoutMs);
+        alive = false;
+        return result;
+      },
+    };
+    return { holder, releases, releaseTimeouts, die: () => { alive = false; } };
+  }
+
+  /** A clean (or, per `unclean`, unclean) supervised effect root whose dispose ends its streams. */
+  function effectHandle(unclean: boolean): CodexRootHandle {
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    let ended = false;
+    return {
+      started: { event: "started", supervisorPid: 60, childPid: 61, subreaper: true, nondumpable: true, uid: 10003, liveCapsZero: true, capBoundingSet: "0xc0", noNewPrivs: true },
+      supervisorPid: 60,
+      transport: { stdin: new PassThrough(), stdout, stderr },
+      snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
+      waitChild: async () => ({ event: "child_exit", code: 0 }),
+      dispose: async (): Promise<DisposeOutcome> => {
+        if (!ended) { ended = true; stdout.end(); stderr.end(); }
+        return unclean
+          ? { clean: false, reason: "dispose unconfirmed" }
+          : { clean: true, event: { event: "dispose", id: 1, state: "drained", authority: "ECHILD+__WALL" } };
+      },
+      failed: undefined,
+      whenFailed: new Promise<Error>(() => undefined),
+    };
+  }
+
+  interface CacheRig {
+    rig: Rig;
+    specs: CodexEffectLaunchSpec[];
+    events: string[];
+    removals: string[];
+    /** The timeoutMs each removal was given. */
+    removeTimeouts: number[];
+    holder: FakeHolder;
+  }
+  function cacheRig(opts: {
+    startFails?: boolean;
+    unclean?: (index: number, spec: CodexEffectLaunchSpec) => boolean;
+    onLaunch?: (index: number, h: FakeHolder) => void;
+    toolEnv?: Record<string, string>;
+    defer?: boolean;
+    holderResult?: CacheCleanupResult;
+  } = {}): CacheRig {
+    const rig = makeRig();
+    const specs: CodexEffectLaunchSpec[] = [];
+    const events: string[] = [];
+    const removals: string[] = [];
+    const removeTimeouts: number[] = [];
+    const holder = fakeHolder(events, opts.holderResult);
+    rig.deps = {
+      ...rig.deps,
+      // The PRODUCTION command seam (makeDefaultSpawnCommand) over a faked supervisor.
+      spawnCommand: undefined,
+      deferRegistryTeardown: opts.defer,
+      provisionRunTools: async () => ({ toolEnv: opts.toolEnv ?? {} }),
+      startCacheHolder: async (token) => {
+        events.push("start");
+        assert.match(token, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/, "a fresh lowercase uuid");
+        if (opts.startFails) throw new Error("cache_error lock");
+        return holder.holder;
+      },
+      removeCommandCache: async (token, timeoutMs) => {
+        events.push("remove");
+        removals.push(token);
+        removeTimeouts.push(timeoutMs);
+        return { state: "removed", reason: "" };
+      },
+      launchEffectRoot: async (spec: CodexEffectLaunchSpec): Promise<CodexRootHandle> => {
+        const index = specs.length;
+        specs.push(spec);
+        events.push(`launch:${spec.args[spec.args.indexOf("--") + 1] ?? "?"}:${spec.args.includes("--cache") ? "cache" : "nocache"}`);
+        opts.onLaunch?.(index, holder);
+        return effectHandle(opts.unclean?.(index, spec) ?? false);
+      },
+    };
+    return { rig, specs, events, removals, removeTimeouts, holder };
+  }
+
+  /** The sandbox flags before `--`. */
+  const flagsOf = (spec: CodexEffectLaunchSpec): string[] => spec.args.slice(0, spec.args.indexOf("--"));
+
+  function pushBashTurn(rig: Rig, commands: readonly string[]): void {
+    rig.transport.push(threadStarted());
+    commands.forEach((command, i) => rig.transport.push(toolCall(10 + i, "Bash", { command }, "th-1", "tn-1", `c-bash-${i}`)));
+    rig.transport.push(signalDone()).push(turnCompleted("completed")).end();
+  }
+
+  it("a command root gets --cache before --mode and the three cache vars, while HOME/TMPDIR stay the private tmp; the fileop root gets no cache", async () => {
+    const c = cacheRig();
+    pushBashTurn(c.rig, ["go build ./..."]);
+    await withTimeout(makeExecutor(c.rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx), 3000, "cache run");
+    assert.equal(c.specs.length, 2, "the fileop root and one command root");
+    assert.equal(c.events[0], "start", "the holder starts before any command root launches");
+    const [fileop, command] = c.specs as [CodexEffectLaunchSpec, CodexEffectLaunchSpec];
+    const fileopFlags = flagsOf(fileop);
+    assert.equal(fileop.args[fileop.args.indexOf("--") + 1], "/usr/local/bin/uzi-codex-fileop");
+    assert.deepEqual(
+      fileopFlags,
+      ["--root", WORKSPACE, "--tmp", fileopFlags[fileopFlags.indexOf("--tmp") + 1], "--cwd", WORKSPACE, "--mode", "required"],
+      "least privilege: the fileop helper never runs Go or npm, so no --cache",
+    );
+    for (const key of CACHE_KEYS) assert.equal(fileop.env[key], undefined, key);
+    const flags = flagsOf(command);
+    const tmp = flags[flags.indexOf("--tmp") + 1];
+    assert.match(String(tmp), /^\/tmp\/uzi-codex-command-/);
+    assert.deepEqual(flags, ["--root", WORKSPACE, "--tmp", tmp, "--cwd", WORKSPACE, "--cache", CACHE_DIR, "--mode", "required"]);
+    assert.equal(command.env.GOMODCACHE, `${CACHE_DIR}/gomod`);
+    assert.equal(command.env.GOCACHE, `${CACHE_DIR}/gocache`);
+    assert.equal(command.env.npm_config_cache, `${CACHE_DIR}/npm`);
+    assert.equal(command.env.HOME, tmp, "HOME stays the per-command private tmp");
+    assert.equal(command.env.TMPDIR, tmp, "TMPDIR stays the per-command private tmp");
+    assert.deepEqual(c.holder.releases, [true], "all roots clean and no poison: released drained:true exactly once");
+    assert.deepEqual(c.holder.releaseTimeouts, [30_000], "run()'s own finally has no dispose deadline: the configured bound");
+  });
+
+  it("a provisioned toolEnv can never set the cache variables (with or without a held cache)", async () => {
+    const evil = { GOMODCACHE: "/evil/mod", GOCACHE: "/evil/build", npm_config_cache: "/evil/npm", NPM_CONFIG_CACHE: "/evil/NPM" };
+    assert.deepEqual(
+      Object.keys(buildCommandEnv("/private/tmp", evil)).filter((k) => k in evil),
+      [],
+      "buildCommandEnv drops all of them",
+    );
+    const held = cacheRig({ toolEnv: evil });
+    pushBashTurn(held.rig, ["npm ci"]);
+    await withTimeout(makeExecutor(held.rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx), 3000, "held toolEnv run");
+    const heldCommand = held.specs[1]!;
+    assert.equal(heldCommand.env.GOMODCACHE, `${CACHE_DIR}/gomod`);
+    assert.equal(heldCommand.env.npm_config_cache, `${CACHE_DIR}/npm`);
+    assert.equal(heldCommand.env.NPM_CONFIG_CACHE, undefined);
+    const none = cacheRig({ toolEnv: evil, startFails: true });
+    pushBashTurn(none.rig, ["npm ci"]);
+    await withTimeout(makeExecutor(none.rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx), 3000, "no-cache toolEnv run");
+    for (const spec of none.specs) for (const key of [...CACHE_KEYS, "NPM_CONFIG_CACHE"]) assert.equal(spec.env[key], undefined, key);
+  });
+
+  it("a failed holder start warns and runs WITHOUT cache variables or --cache (still no removal)", async () => {
+    const c = cacheRig({ startFails: true });
+    pushBashTurn(c.rig, ["go test ./..."]);
+    const rlog = recordingLog();
+    await withTimeout(makeExecutor(c.rig, bindingOf(SUBSCRIPTION), rlog.log).run(makeCtx().ctx), 3000, "no-holder run");
+    assert.equal(c.specs.length, 2);
+    for (const spec of c.specs) {
+      assert.ok(!spec.args.includes("--cache"), "no --cache without a holder");
+      for (const key of CACHE_KEYS) assert.equal(spec.env[key], undefined, key);
+    }
+    assert.ok(rlog.lines.some((l) => l.includes("codex command cache unavailable")), "the start failure is a warn");
+    assert.deepEqual(c.removals, []);
+  });
+
+  it("no holder is started when the split is off and no seam is injected", async () => {
+    const c = cacheRig();
+    c.rig.deps = { ...c.rig.deps, startCacheHolder: undefined };
+    const saved = process.env.UZI_UID_SPLIT;
+    delete process.env.UZI_UID_SPLIT;
+    try {
+      pushBashTurn(c.rig, ["true"]);
+      await withTimeout(makeExecutor(c.rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx), 3000, "single-uid run");
+    } finally {
+      if (saved !== undefined) process.env.UZI_UID_SPLIT = saved;
+    }
+    assert.ok(c.specs.every((spec) => !spec.args.includes("--cache")));
+  });
+
+  it("after the holder dies mid-run, later commands get no cache; a drained run then removes it via --remove-cache", async () => {
+    // Launch 0 is the fileop root, 1 the first command: the holder dies DURING that launch.
+    const c = cacheRig({ onLaunch: (i, h) => { if (i === 1) h.die(); } });
+    pushBashTurn(c.rig, ["echo one", "echo two"]);
+    await withTimeout(makeExecutor(c.rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx), 3000, "holder-death run");
+    assert.equal(c.specs.length, 3);
+    assert.ok(!c.specs[0]!.args.includes("--cache"), "the fileop root never gets the cache");
+    assert.ok(c.specs[1]!.args.includes("--cache"), "launched before the loss: cached");
+    assert.ok(!c.specs[2]!.args.includes("--cache"), "launched after the loss: no --cache");
+    for (const key of CACHE_KEYS) assert.equal(c.specs[2]!.env[key], undefined, key);
+    assert.deepEqual(c.holder.releases, [], "a dead holder is never released");
+    assert.deepEqual(c.removals, [CACHE_TOKEN], "every cached root drained, so the worker attests the removal");
+  });
+
+  it("holder death plus an unclean cached root: NO removal (retained for the startup reaper)", async () => {
+    const c = cacheRig({
+      onLaunch: (i, h) => { if (i === 1) h.die(); },
+      unclean: (i) => i === 1,
+    });
+    pushBashTurn(c.rig, ["echo one"]);
+    const rlog = recordingLog();
+    await withTimeout(makeExecutor(c.rig, bindingOf(SUBSCRIPTION), rlog.log).run(makeCtx().ctx).catch(() => undefined), 3000, "unclean holder-death run");
+    assert.deepEqual(c.removals, []);
+    assert.deepEqual(c.holder.releases, []);
+    assert.ok(rlog.lines.some((l) => l.includes("retained for the startup reaper")));
+  });
+
+  it("an unclean command root releases with drained:false", async () => {
+    const c = cacheRig({ unclean: (i) => i === 1 });
+    pushBashTurn(c.rig, ["echo one"]);
+    await withTimeout(makeExecutor(c.rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx).catch(() => undefined), 3000, "unclean run");
+    assert.deepEqual(c.holder.releases, [false]);
+  });
+
+  it("under deferRegistryTeardown the release waits for the terminal dispose, AFTER a post-run sink's cached boundary process", async () => {
+    const c = cacheRig({ defer: true });
+    pushBashTurn(c.rig, ["echo one"]);
+    const exec = makeExecutor(c.rig, bindingOf(SUBSCRIPTION));
+    await withTimeout(exec.run(makeCtx().ctx), 3000, "deferred cache run");
+    c.events.push("run-returned");
+    assert.deepEqual(c.holder.releases, [], "run()'s finally does NOT release under deferRegistryTeardown");
+
+    // A runner post-run durability sink launches a command-identity boundary process.
+    await exec.safety!.withBoundary({ boundary: "finalize", deadlineMs: 500 }, async (permit) => {
+      const proc = await exec.safety!.spawnBoundaryProcess(permit, {
+        argv: ["/usr/bin/git", "status"],
+        cwd: WORKSPACE,
+        env: { PATH: "/usr/bin:/bin", LANG: "C" },
+        identity: "command",
+      });
+      await proc.completed;
+    });
+    c.events.push("sink-done");
+    const sinkSpec = c.specs.at(-1)!;
+    assert.ok(sinkSpec.args.includes("--cache"), "the post-run command boundary process still carries the live cache");
+    assert.equal(sinkSpec.env.GOMODCACHE, `${CACHE_DIR}/gomod`);
+    assert.deepEqual(c.holder.releases, [], "still unreleased after the sink");
+
+    await exec.safety!.dispose({ boundary: "terminal", deadlineMs: 500 });
+    assert.deepEqual(c.events, [
+      "start",
+      "launch:/usr/local/bin/uzi-codex-fileop:nocache",
+      "launch:/bin/sh:cache",
+      "run-returned",
+      "launch:/usr/bin/git:cache",
+      "sink-done",
+      "release:true",
+    ]);
+    // Idempotent: a second terminal dispose never releases twice.
+    await exec.safety!.dispose({ boundary: "terminal", deadlineMs: 500 });
+    assert.deepEqual(c.holder.releases, [true]);
+  });
+
+  it("deferred mode with NO epoch built (setup failure) releases in run()'s finally", async () => {
+    const c = cacheRig({ defer: true });
+    c.rig.deps = {
+      ...c.rig.deps,
+      wireFileop: () => { throw new Error("fileop wiring failed"); },
+    };
+    await assert.rejects(withTimeout(makeExecutor(c.rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx), 3000, "setup failure"), /fileop wiring failed/);
+    assert.deepEqual(c.holder.releases, [true], "the partial epoch's fileop root was reaped clean before the release");
+  });
+
+  describe("HeldRunCommandCache", () => {
+    const cleanLaunch = async (): Promise<CodexRootHandle> => effectHandle(false);
+    const spec = {} as CodexEffectLaunchSpec;
+    const WAITS = { releaseMs: 100, removeMs: 100 };
+
+    it("once settle has begun, current() is undefined and a launch gets no cache (even while the holder is alive)", async () => {
+      let answer!: (r: CacheCleanupResult) => void;
+      const releaseAnswer = new Promise<CacheCleanupResult>((r) => { answer = r; });
+      const base = fakeHolder([]);
+      const cache = new HeldRunCommandCache({ ...base.holder, release: () => releaseAnswer });
+      assert.deepEqual(cache.current(), { dir: CACHE_DIR });
+      const settling = cache.settle(noopLog, async () => ({ state: "removed", reason: "" }), WAITS);
+      assert.equal(base.holder.alive(), true, "the holder has not answered the release yet");
+      assert.equal(cache.current(), undefined, "no cache is handed out once settle has begun");
+
+      const launched: CodexEffectLaunchSpec[] = [];
+      const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
+      const spawnCommand = makeDefaultSpawnCommand(
+        registry,
+        async (s) => { launched.push(s); return effectHandle(false); },
+        1000,
+        WORKSPACE,
+        { PATH: "/usr/bin:/bin" },
+        "required",
+        noopLog,
+        cache,
+      );
+      await spawnCommand(["/bin/true"], { cwd: WORKSPACE });
+      assert.equal(launched.length, 1);
+      assert.ok(!launched[0]!.args.includes("--cache"), "a launch after settle began gets no --cache");
+      for (const key of CACHE_KEYS) assert.equal(launched[0]!.env[key], undefined, key);
+      answer({ state: "removed", reason: "" });
+      await settling;
+    });
+
+    it("drained is true with no roots and with every tracked root disposed clean", async () => {
+      const cache = new HeldRunCommandCache(fakeHolder([]).holder);
+      assert.equal(cache.drained(), true);
+      const h = await cache.track(cleanLaunch)(spec);
+      assert.equal(cache.drained(), false, "a launched, not yet disposed root is not drained");
+      await h.dispose(10);
+      assert.equal(cache.drained(), true);
+    });
+
+    it("an unclean dispose, a rejected dispose or a failed launch makes it false (sticky)", async () => {
+      const unclean = new HeldRunCommandCache(fakeHolder([]).holder);
+      await (await unclean.track(async () => effectHandle(true))(spec)).dispose(10);
+      assert.equal(unclean.drained(), false);
+
+      const rejected = new HeldRunCommandCache(fakeHolder([]).holder);
+      const h = await rejected.track(async () => ({ ...effectHandle(false), dispose: async () => { throw new Error("boom"); } }))(spec);
+      await assert.rejects(h.dispose(10), /boom/);
+      assert.equal(rejected.drained(), false);
+
+      const failed = new HeldRunCommandCache(fakeHolder([]).holder);
+      await assert.rejects(failed.track(async () => { throw new Error("launch failed"); })(spec), /launch failed/);
+      assert.equal(failed.drained(), false);
+    });
+
+    it("a poisoned registry makes it false even when every root was clean", async () => {
+      const cache = new HeldRunCommandCache(fakeHolder([]).holder);
+      const registry = new ExecutionRegistry(newLocalExecutionEpoch(9));
+      cache.watchRegistry(registry);
+      await (await cache.track(cleanLaunch)(spec)).dispose(10);
+      assert.equal(cache.drained(), true);
+      registry.poison({ category: "protocol", message: "poisoned" });
+      assert.equal(cache.drained(), false);
+    });
+
+    it("settle: alive releases once; dead+drained removes; dead+undrained only logs; never throws", async () => {
+      const events: string[] = [];
+      const removals: string[] = [];
+      const remove = async (token: string): Promise<CacheCleanupResult> => { removals.push(token); return { state: "retained", reason: "live" }; };
+
+      const alive = fakeHolder(events, { state: "retained", reason: "mismatch" });
+      const a = new HeldRunCommandCache(alive.holder);
+      const rlog = recordingLog();
+      await a.settle(rlog.log, remove, WAITS);
+      await a.settle(rlog.log, remove, WAITS);
+      assert.deepEqual(alive.releases, [true]);
+      assert.equal(a.current(), undefined, "no cache is handed out after settle");
+      assert.ok(rlog.lines.some((l) => l.includes('"level":"warn"') && l.includes('"reason":"mismatch"')), "a retained release is a warn with its reason");
+
+      const dead = fakeHolder(events);
+      const d = new HeldRunCommandCache(dead.holder);
+      assert.deepEqual(d.current(), { dir: CACHE_DIR });
+      dead.die();
+      assert.equal(d.current(), undefined, "no cache after holder loss");
+      await d.settle(noopLog, remove, WAITS);
+      assert.deepEqual(removals, [CACHE_TOKEN]);
+
+      const undrained = fakeHolder(events);
+      const u = new HeldRunCommandCache(undrained.holder);
+      await (await u.track(async () => effectHandle(true))(spec)).dispose(10);
+      undrained.die();
+      await u.settle(noopLog, remove, WAITS);
+      assert.deepEqual(removals, [CACHE_TOKEN], "not drained: no removal");
+
+      const throwing = fakeHolder(events);
+      const t = new HeldRunCommandCache({ ...throwing.holder, release: async () => { throw new Error("pipe"); } });
+      await t.settle(noopLog, remove, WAITS);
+    });
+  });
+
+  it("the terminal dispose caps the release and remove waits by its remaining deadline (floor 1 s) and logs pending", async () => {
+    const pending: CacheCleanupResult = { state: "pending", reason: "" };
+    for (const [deadlineMs, lo, hi] of [[3000, 1000, 3000], [0, 1000, 1000]] as const) {
+      const c = cacheRig({ defer: true, holderResult: pending });
+      c.rig.deps = { ...c.rig.deps, cacheReleaseTimeoutMs: 60_000 };
+      pushBashTurn(c.rig, ["echo one"]);
+      const rlog = recordingLog();
+      const exec = makeExecutor(c.rig, bindingOf(SUBSCRIPTION), rlog.log);
+      await withTimeout(exec.run(makeCtx().ctx), 3000, "deferred cache run");
+      await exec.safety!.dispose({ boundary: "terminal", deadlineMs });
+      assert.equal(c.holder.releaseTimeouts.length, 1);
+      const t = c.holder.releaseTimeouts[0]!;
+      assert.ok(t >= lo && t <= hi, `release wait ${t} within [${lo}, ${hi}], not the configured 60 s`);
+      assert.ok(rlog.lines.some((l) => l.includes("pending")), "an expired wait is logged pending");
+    }
+
+    // Holder lost + drained: the --remove-cache wait is capped the same way.
+    const lost = cacheRig({ defer: true, onLaunch: (i, h) => { if (i === 1) h.die(); } });
+    lost.rig.deps = { ...lost.rig.deps, cacheRemoveTimeoutMs: 120_000 };
+    pushBashTurn(lost.rig, ["echo one"]);
+    const exec = makeExecutor(lost.rig, bindingOf(SUBSCRIPTION));
+    await withTimeout(exec.run(makeCtx().ctx), 3000, "deferred holder-loss run");
+    await exec.safety!.dispose({ boundary: "terminal", deadlineMs: 2000 });
+    assert.equal(lost.removeTimeouts.length, 1);
+    assert.ok(lost.removeTimeouts[0]! >= 1000 && lost.removeTimeouts[0]! <= 2000, `remove wait ${lost.removeTimeouts[0]}`);
+  });
+
+  it("every spelling of npm_config_cache, plus GOMODCACHE/GOCACHE, is stripped from an explicit spawnCommand env and a boundary env", async () => {
+    const hostile: NodeJS.ProcessEnv = {
+      PATH: "/usr/bin:/bin",
+      GOMODCACHE: "/evil/mod",
+      GOCACHE: "/evil/build",
+      npm_config_cache: "/evil/npm1",
+      NPM_CONFIG_CACHE: "/evil/npm2",
+      npm_config_CACHE: "/evil/npm3",
+      Npm_Config_Cache: "/evil/npm4",
+    };
+    const npmSpellings = (env: NodeJS.ProcessEnv): string[] => Object.keys(env).filter((k) => /^npm_config_cache$/i.test(k));
+
+    // (a) opts.env through the production command seam, with and without a held cache.
+    for (const held of [true, false]) {
+      const cache = held ? new HeldRunCommandCache(fakeHolder([]).holder) : undefined;
+      const launched: CodexEffectLaunchSpec[] = [];
+      const spawnCommand = makeDefaultSpawnCommand(
+        new ExecutionRegistry(newLocalExecutionEpoch(1)),
+        async (s) => { launched.push(s); return effectHandle(false); },
+        1000,
+        WORKSPACE,
+        {},
+        "required",
+        noopLog,
+        cache,
+      );
+      await spawnCommand(["/bin/true"], { cwd: WORKSPACE, env: hostile });
+      const env = launched[0]!.env;
+      if (held) {
+        assert.deepEqual(npmSpellings(env), ["npm_config_cache"]);
+        assert.equal(env.npm_config_cache, `${CACHE_DIR}/npm`);
+        assert.equal(env.GOMODCACHE, `${CACHE_DIR}/gomod`);
+        assert.equal(env.GOCACHE, `${CACHE_DIR}/gocache`);
+      } else {
+        assert.deepEqual(npmSpellings(env), []);
+        assert.equal(env.GOMODCACHE, undefined);
+        assert.equal(env.GOCACHE, undefined);
+      }
+      assert.equal(env.PATH, "/usr/bin:/bin", "unrelated keys survive");
+    }
+
+    // (b) request.env of a command-identity boundary process (a post-run sink).
+    for (const startFails of [false, true]) {
+      const c = cacheRig({ defer: true, startFails });
+      pushBashTurn(c.rig, ["echo one"]);
+      const exec = makeExecutor(c.rig, bindingOf(SUBSCRIPTION));
+      await withTimeout(exec.run(makeCtx().ctx), 3000, "deferred run");
+      await exec.safety!.withBoundary({ boundary: "finalize", deadlineMs: 500 }, async (permit) => {
+        const proc = await exec.safety!.spawnBoundaryProcess(permit, {
+          argv: ["/usr/bin/git", "status"],
+          cwd: WORKSPACE,
+          env: hostile,
+          identity: "command",
+        });
+        await proc.completed;
+      });
+      const env = c.specs.at(-1)!.env;
+      assert.deepEqual(npmSpellings(env), startFails ? [] : ["npm_config_cache"]);
+      assert.equal(env.GOMODCACHE, startFails ? undefined : `${CACHE_DIR}/gomod`);
+      assert.equal(env.GOCACHE, startFails ? undefined : `${CACHE_DIR}/gocache`);
+      if (!startFails) assert.equal(env.npm_config_cache, `${CACHE_DIR}/npm`);
+      await exec.safety!.dispose({ boundary: "terminal", deadlineMs: 500 });
+    }
+  });
+
+  it("commandSandboxArgv refuses a cache outside the cache root", () => {
+    assert.throws(() => commandSandboxArgv(WORKSPACE, WORKSPACE, "/bin/true", [], "/tmp/uzi-codex-command-x", "required", "/tmp/evil"), /cache/);
+    assert.throws(() => commandSandboxArgv(WORKSPACE, WORKSPACE, "/bin/true", [], "/tmp/uzi-codex-command-x", "required", `${CACHE_DIR}/../x`), /cache/);
   });
 });

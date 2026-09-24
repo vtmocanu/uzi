@@ -19,6 +19,10 @@ type seams struct {
 	snapshot       func() ([]procRow, error)
 	now            func() time.Time
 	sleep          func()
+	// tmpCleanup removes the command tmp, giving up at deadline, and reports
+	// the outcome. nil when no --cleanup-token was given; the evidence then
+	// carries no tmpCleanup field.
+	tmpCleanup func(deadline time.Time) *tmpCleanupResult
 }
 
 // supervisor runs the fd 3 control loop and emits fd 4 evidence.
@@ -26,12 +30,36 @@ type supervisor struct {
 	ev      *evidence
 	control *controlReader
 	seams   seams
+	// tmpCleaned records that tmpCleanup already ran, so it runs at most once.
+	tmpCleaned bool
 }
 
-// drainWith runs one bounded drain using the given timeout.
-func (s *supervisor) drainWith(timeoutMs int) drainResult {
-	deadline := s.seams.now().Add(time.Duration(timeoutMs) * time.Millisecond)
-	return drain(deadline, s.seams.now, s.seams.sleep, s.seams.directChildren, s.seams.kill, s.seams.reap)
+// maxCleanupMargin caps the part of an op's budget kept back from the tmp
+// cleanup for writing the evidence line and exiting.
+const maxCleanupMargin = 250 * time.Millisecond
+
+// drainWith runs one bounded drain using the given timeout. It also returns
+// the deadline the command tmp cleanup that may follow must meet: the drain's
+// own deadline, computed once at the start of the op, less
+// min(maxCleanupMargin, timeout/10) so the evidence write and the exit still
+// fit inside the op's budget.
+func (s *supervisor) drainWith(timeoutMs int) (drainResult, time.Time) {
+	timeout := time.Duration(timeoutMs) * time.Millisecond
+	deadline := s.seams.now().Add(timeout)
+	cleanupDeadline := deadline.Add(-min(maxCleanupMargin, timeout/10))
+	return drain(deadline, s.seams.now, s.seams.sleep, s.seams.directChildren, s.seams.kill, s.seams.reap), cleanupDeadline
+}
+
+// runWatched watches the primary child through watch and then runs the control
+// loop. A watch failure ends the run through abnormal, the one path that
+// gates the command tmp cleanup on a drained drain and runs it at most once.
+func (s *supervisor) runWatched(childPid int, st procStatus, watch func(pid int) (<-chan error, error)) int {
+	ready, err := watch(childPid)
+	if err != nil {
+		return s.abnormal("child watch failed")
+	}
+	s.seams.childReady = ready
+	return s.run(childPid, st)
 }
 
 // run emits the started evidence, then services control frames until a dispose
@@ -106,11 +134,21 @@ func (s *supervisor) run(childPid int, st procStatus) int {
 				}
 				_ = s.ev.writeJSON(snapshotEvidence{Event: opSnapshot, ID: op.ID, Processes: rows})
 			case opDispose:
-				drained := s.drainWith(op.TimeoutMs)
-				_ = s.ev.writeJSON(disposeEvidence(op.ID, drained))
+				drained, cleanupDeadline := s.drainWith(op.TimeoutMs)
+				m := disposeEvidence(op.ID, drained)
 				if drained.State == stateDrained {
+					// Remove the tmp BEFORE reporting, so the dispose line carries
+					// the outcome, within what is left of the dispose's own
+					// deadline: a tree too big for it is retained "deadline".
+					// The deadline is checked between entries, so the reply can
+					// overrun it by at most one entry's unlinkat (e.g. freeing a
+					// heavily fragmented file).
+					// It never changes the exit code.
+					withTmpCleanup(m, s.cleanupTmp(cleanupDeadline))
+					_ = s.ev.writeJSON(m)
 					return 0
 				}
+				_ = s.ev.writeJSON(m)
 				// unconfirmed dispose is retained state, not success; keep serving
 				// (a repeat dispose is safe/idempotent).
 			}
@@ -120,8 +158,28 @@ func (s *supervisor) run(childPid int, st procStatus) int {
 
 // abnormal emits a best-effort-drained abnormal event and returns the non-zero
 // exit code. The reason is already a short, sanitized sentinel string.
+//
+// The command tmp is removed only when that drain reached drained. An
+// unconfirmed drain may leave a live descendant still using the tmp, so it is
+// left untouched for the startup orphan reaper (the --reap-orphans mode in
+// reaper.go). A drained cleanup removes it within what is left of
+// that drain's defaultDisposeTimeoutMs deadline.
 func (s *supervisor) abnormal(reason string) int {
-	cleanup := s.drainWith(defaultDisposeTimeoutMs)
-	_ = s.ev.writeJSON(abnormalEvidence(reason, &cleanup))
+	cleanup, cleanupDeadline := s.drainWith(defaultDisposeTimeoutMs)
+	m := abnormalEvidence(reason, &cleanup)
+	if cleanup.State == stateDrained {
+		withTmpCleanup(m, s.cleanupTmp(cleanupDeadline))
+	}
+	_ = s.ev.writeJSON(m)
 	return 2
+}
+
+// cleanupTmp runs the tmpCleanup seam at most once, with deadline. It returns
+// nil (no evidence field) when there is no seam or it already ran.
+func (s *supervisor) cleanupTmp(deadline time.Time) *tmpCleanupResult {
+	if s.seams.tmpCleanup == nil || s.tmpCleaned {
+		return nil
+	}
+	s.tmpCleaned = true
+	return s.seams.tmpCleanup(deadline)
 }

@@ -460,6 +460,33 @@ done
 # it (0700 grants the group nothing); true per-uid isolation.
 "$CHOWN" 0:0 "$RUNNER_TMPDIR"; "$CHMOD" 0700 "$RUNNER_TMPDIR"; "$CHOWN" runner:runner "$RUNNER_TMPDIR"
 
+# --- (a4) issue #1598: the Codex command-cache root, runner-cmd 0700 ---------------
+# The supervisor's uid-10003 cache holder creates ONE random per-run dir under this root
+# (GOMODCACHE, GOCACHE and the npm cache for every Codex command in the run), and its uid-10003
+# reaper deletes stale ones. Owning the root runner-cmd (10003:10003) 0700 means only uid 10003
+# can create, traverse or delete in it: worker 10001 and runner 10002 get nothing (the group is
+# runner-cmd's own primary group, which neither joins). A storage boundary, not a trust
+# boundary. Compose uses the image-baked root-owned dir (writable layer); k8s mounts a
+# worker-only emptyDir here (controller/internal/kube/render.go), which already exists.
+#
+# ROOT ONLY, NOT RECURSIVE: this re-owns the root dir alone and never touches its contents;
+# existing per-run dirs from a previous boot are the reaper's to remove, not ours.
+# SYMLINK GUARD: a symlink at the path is refused (before and after `mkdir -p`, which succeeds
+# on a link to a dir), so nothing below is ever chowned or chmod'ed THROUGH a link. `chown -h`
+# is belt-and-braces on top of that. RECLAIM FIRST: the root window has no CAP_FOWNER, so a dir
+# a prior boot left 10003-owned cannot be chmod'ed until root owns it again (same restart-safe
+# reclaim -> chmod -> hand-over as the (a3) tmpdirs and the token).
+# Unreachable on the non-root (#58) start: that branch exec'd above, so no uid split, no cache
+# root.
+CODEX_CMD_CACHE_DIR=/var/cache/uzi-codex-cmd
+CODEX_CMD_CACHE_OWNER=10003:10003   # runner-cmd:runner-cmd
+require_real_carveout_root "$CODEX_CMD_CACHE_DIR"
+"$MKDIR" -p "$CODEX_CMD_CACHE_DIR"
+require_real_carveout_root "$CODEX_CMD_CACHE_DIR"
+"$CHOWN" -h 0:0 "$CODEX_CMD_CACHE_DIR"
+"$CHMOD" 0700 "$CODEX_CMD_CACHE_DIR"
+"$CHOWN" -h "$CODEX_CMD_CACHE_OWNER" "$CODEX_CMD_CACHE_DIR"
+
 # --- (b) token: force 0400 worker on the join-token secret ---------------------
 # Compose delivers the env-sourced `worker_token` secret 0444 root:root (world-readable
 # — the runner uid could read it), and an env-sourced secret's uid/gid/mode are

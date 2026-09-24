@@ -3,16 +3,21 @@ package main
 import (
 	"errors"
 	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"syscall"
 	"testing"
+	"unsafe"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestParseArgs(t *testing.T) {
-	root, tmp, cwd, mode, child, err := parseArgs([]string{
+	root, tmp, cwd, cache, mode, child, err := parseArgs([]string{
 		"--root", "/data/run", "--tmp", "/tmp/run", "--cwd", "/data/run/sub", "--", "/bin/sh", "-c", "true",
 	})
-	if err != nil || root != "/data/run" || tmp != "/tmp/run" || cwd != "/data/run/sub" || mode != modeRequired || !reflect.DeepEqual(child, []string{"/bin/sh", "-c", "true"}) {
+	if err != nil || root != "/data/run" || tmp != "/tmp/run" || cwd != "/data/run/sub" || cache != "" || mode != modeRequired || !reflect.DeepEqual(child, []string{"/bin/sh", "-c", "true"}) {
 		t.Fatalf("unexpected parse: root=%q tmp=%q cwd=%q mode=%q child=%v err=%v", root, tmp, cwd, mode, child, err)
 	}
 }
@@ -20,7 +25,7 @@ func TestParseArgs(t *testing.T) {
 func TestParseArgsMode(t *testing.T) {
 	// (present) an explicit --mode before -- is honored.
 	for _, want := range []sandboxMode{modeRequired, modeBestEffort} {
-		root, tmp, cwd, mode, child, err := parseArgs([]string{
+		root, tmp, cwd, _, mode, child, err := parseArgs([]string{
 			"--root", "/data/run", "--tmp", "/tmp/run", "--cwd", "/data/run", "--mode", string(want), "--", "/bin/true",
 		})
 		if err != nil || mode != want || root != "/data/run" || tmp != "/tmp/run" || cwd != "/data/run" || !reflect.DeepEqual(child, []string{"/bin/true"}) {
@@ -29,7 +34,7 @@ func TestParseArgsMode(t *testing.T) {
 	}
 
 	// (absent) defaults to required.
-	if _, _, _, mode, _, err := parseArgs([]string{
+	if _, _, _, _, mode, _, err := parseArgs([]string{
 		"--root", "/data/run", "--tmp", "/tmp/run", "--cwd", "/data/run", "--", "/bin/true",
 	}); err != nil || mode != modeRequired {
 		t.Fatalf("absent --mode should default to required: mode=%q err=%v", mode, err)
@@ -37,7 +42,7 @@ func TestParseArgsMode(t *testing.T) {
 
 	// (after --) a --mode token in the CHILD command is NOT parsed as the sandbox
 	// mode — the trust property: the mode comes only from the trusted worker argv.
-	root, _, _, mode, child, err := parseArgs([]string{
+	root, _, _, _, mode, child, err := parseArgs([]string{
 		"--root", "/data/run", "--tmp", "/tmp/run", "--cwd", "/data/run", "--", "/bin/sh", "--mode", "best-effort",
 	})
 	if err != nil || root != "/data/run" || mode != modeRequired {
@@ -48,7 +53,7 @@ func TestParseArgsMode(t *testing.T) {
 	}
 
 	// (invalid) an unknown mode value is rejected (fail closed).
-	if _, _, _, _, _, err := parseArgs([]string{
+	if _, _, _, _, _, _, err := parseArgs([]string{
 		"--root", "/data/run", "--tmp", "/tmp/run", "--cwd", "/data/run", "--mode", "loose", "--", "/bin/true",
 	}); err == nil {
 		t.Fatal("an unknown --mode value must be rejected")
@@ -92,7 +97,7 @@ func TestParseArgsRejectsEscape(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if _, _, _, _, _, err := parseArgs(test.args); err == nil {
+			if _, _, _, _, _, _, err := parseArgs(test.args); err == nil {
 				t.Fatal("expected argument rejection")
 			}
 		})
@@ -240,18 +245,19 @@ func TestApplyPolicyDispatch(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			var confineCalled, noNewPrivsCalled bool
-			var gotRoot, gotTmp string
+			var gotRoot string
+			var gotFds grantFds
 			var gotABI int
-			confineFake := func(root, tmp string, abi int) error {
+			confineFake := func(root string, fds grantFds, abi int) error {
 				confineCalled = true
-				gotRoot, gotTmp, gotABI = root, tmp, abi
+				gotRoot, gotFds, gotABI = root, fds, abi
 				return nil
 			}
 			noNewPrivsFake := func() error {
 				noNewPrivsCalled = true
 				return nil
 			}
-			err := applyPolicy("/data/run", "/tmp/run", test.mode, test.probe, confineFake, noNewPrivsFake)
+			err := applyPolicy("/data/run", grantFds{tmp: 42, cache: 43}, test.mode, test.probe, confineFake, noNewPrivsFake)
 			switch {
 			case test.wantErr && err == nil:
 				t.Fatal("actionFatal must propagate the fatal error")
@@ -268,8 +274,8 @@ func TestApplyPolicyDispatch(t *testing.T) {
 				// confine() must receive the worktree/tmp roots and the ABI
 				// decidePolicy resolved — proof this is the real confine path, not
 				// the unconfined one.
-				if gotRoot != "/data/run" || gotTmp != "/tmp/run" || gotABI != wantABI {
-					t.Fatalf("confine() args: root=%q tmp=%q abi=%d, want /data/run /tmp/run %d", gotRoot, gotTmp, gotABI, wantABI)
+				if gotRoot != "/data/run" || gotFds != (grantFds{tmp: 42, cache: 43}) || gotABI != wantABI {
+					t.Fatalf("confine() args: root=%q fds=%+v abi=%d, want /data/run {42 43} %d", gotRoot, gotFds, gotABI, wantABI)
 				}
 			}
 		})
@@ -295,5 +301,241 @@ func TestConfinementDenyProbe(t *testing.T) {
 	}
 	if err := requireProbeDenied(landlockDenyProbe, failed); err == nil {
 		t.Fatal("unexpected post-probe error must fail closed")
+	}
+}
+
+// privateTmp makes a real 0700 directory in a t.TempDir parent.
+func privateTmp(t *testing.T) string {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), "uzi-codex-command-x")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+func TestAdoptPrivateTmpAcceptsOwned0700Dir(t *testing.T) {
+	dir := privateTmp(t)
+	fd, err := adoptPrivateTmp(dir, os.Getuid(), unix.Open, unix.Fstat)
+	if err != nil {
+		t.Fatalf("adopt: %v", err)
+	}
+	defer func() { _ = unix.Close(fd) }()
+	// The adopted fd stays open, is close-on-exec, and is the directory itself.
+	flags, ferr := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0)
+	if ferr != nil || flags&unix.FD_CLOEXEC == 0 {
+		t.Fatalf("adopted fd is not close-on-exec (flags=%d err=%v)", flags, ferr)
+	}
+	var byFd, byPath unix.Stat_t
+	if err := unix.Fstat(fd, &byFd); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Lstat(dir, &byPath); err != nil {
+		t.Fatal(err)
+	}
+	if byFd.Dev != byPath.Dev || byFd.Ino != byPath.Ino {
+		t.Fatal("adopted fd does not refer to the tmp directory")
+	}
+	// Adoption never removes or chmods: the dir is still there, still 0700.
+	fi, err := os.Lstat(dir)
+	if err != nil || !fi.IsDir() || fi.Mode().Perm() != 0o700 {
+		t.Fatalf("after adopt: %v %v", fi, err)
+	}
+}
+
+func TestAdoptPrivateTmpRefusesSymlink(t *testing.T) {
+	target := privateTmp(t)
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := adoptPrivateTmp(link, os.Getuid(), unix.Open, unix.Fstat); err == nil {
+		t.Fatal("adopted a symlink to an owned 0700 directory")
+	}
+}
+
+func TestAdoptPrivateTmpRefusesForeignOwner(t *testing.T) {
+	dir := privateTmp(t)
+	foreign := func(fd int, st *unix.Stat_t) error {
+		if err := unix.Fstat(fd, st); err != nil {
+			return err
+		}
+		st.Uid++
+		return nil
+	}
+	_, err := adoptPrivateTmp(dir, os.Getuid(), unix.Open, foreign)
+	if err == nil || !strings.Contains(err.Error(), "owned by uid") {
+		t.Fatalf("adopt with a foreign owner = %v, want an owner refusal", err)
+	}
+	// The uid seam alone must also refuse: the dir is not owned by another uid.
+	if _, err := adoptPrivateTmp(dir, os.Getuid()+1, unix.Open, unix.Fstat); err == nil {
+		t.Fatal("adopted a dir owned by another uid")
+	}
+}
+
+func TestAdoptPrivateTmpRefusesWrongMode(t *testing.T) {
+	dir := privateTmp(t)
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, err := adoptPrivateTmp(dir, os.Getuid(), unix.Open, unix.Fstat)
+	if err == nil || !strings.Contains(err.Error(), "mode 0755") {
+		t.Fatalf("adopt of a 0755 dir = %v, want a mode refusal", err)
+	}
+}
+
+func TestAdoptPrivateTmpRefusesNonDirectory(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(file, nil, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := adoptPrivateTmp(file, os.Getuid(), unix.Open, unix.Fstat); err == nil {
+		t.Fatal("adopted a regular file")
+	}
+	// A stat that reports a non-directory is refused even if the open passed.
+	notDir := func(fd int, st *unix.Stat_t) error {
+		if err := unix.Fstat(fd, st); err != nil {
+			return err
+		}
+		st.Mode = unix.S_IFREG | 0o700
+		return nil
+	}
+	_, err := adoptPrivateTmp(privateTmp(t), os.Getuid(), unix.Open, notDir)
+	if err == nil || !strings.Contains(err.Error(), "not a directory") {
+		t.Fatalf("adopt of a non-dir stat = %v", err)
+	}
+}
+
+func TestAdoptPrivateTmpRefusesMissing(t *testing.T) {
+	if _, err := adoptPrivateTmp(filepath.Join(t.TempDir(), "absent"), os.Getuid(), unix.Open, unix.Fstat); err == nil {
+		t.Fatal("adopted a missing path: the sandbox must never create it")
+	}
+}
+
+// TestAdoptPrivateTmpRefusesNonEmpty: a tmp planted with content (here a
+// .gitconfig) is not fresh and is refused, and its fd is not leaked.
+func TestAdoptPrivateTmpRefusesNonEmpty(t *testing.T) {
+	for _, plant := range []func(dir string) error{
+		func(dir string) error {
+			return os.WriteFile(filepath.Join(dir, ".gitconfig"), []byte("[core]\n"), 0o600)
+		},
+		func(dir string) error { return os.Mkdir(filepath.Join(dir, "sub"), 0o700) },
+		func(dir string) error { return os.Symlink("/etc", filepath.Join(dir, "link")) },
+	} {
+		dir := privateTmp(t)
+		if err := plant(dir); err != nil {
+			t.Fatal(err)
+		}
+		var opened int
+		open := func(p string, flags int, mode uint32) (int, error) {
+			fd, err := unix.Open(p, flags, mode)
+			opened = fd
+			return fd, err
+		}
+		fd, err := adoptPrivateTmp(dir, os.Getuid(), open, unix.Fstat)
+		if err == nil || !strings.Contains(err.Error(), "not empty") {
+			t.Fatalf("adopt of a planted tmp = %d/%v, want a not-empty refusal", fd, err)
+		}
+		if _, ferr := unix.FcntlInt(uintptr(opened), unix.F_GETFD, 0); !errors.Is(ferr, unix.EBADF) {
+			t.Fatalf("refused tmp fd %d still open: %v", opened, ferr)
+		}
+	}
+}
+
+// TestAddFdRuleUsesTheFd pins that addFdRule works on the fd itself: with a
+// real Landlock ruleset it accepts the adopted directory fd, and an fd that can
+// never be open (-1) is refused with EBADF rather than resolved by any path.
+func TestAddFdRuleUsesTheFd(t *testing.T) {
+	avail, _, _ := classifyLandlock(realVersionProbe)
+	if avail != landlockAvailable {
+		t.Skip("Landlock is not available on this kernel")
+	}
+	attr := unix.LandlockRulesetAttr{Access_fs: baseRights}
+	rs, _, errno := syscall.Syscall(unix.SYS_LANDLOCK_CREATE_RULESET, uintptr(unsafe.Pointer(&attr)), unsafe.Sizeof(attr), 0)
+	if errno != 0 {
+		t.Fatalf("create ruleset: %v", errno)
+	}
+	defer func() { _ = unix.Close(int(rs)) }()
+	fd, err := adoptPrivateTmp(privateTmp(t), os.Getuid(), unix.Open, unix.Fstat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = unix.Close(fd) }()
+	if err := addFdRule(int(rs), fd, baseRights); err != nil {
+		t.Fatalf("addFdRule on the adopted fd: %v", err)
+	}
+	if err := addFdRule(int(rs), -1, baseRights); !errors.Is(err, unix.EBADF) {
+		t.Fatalf("addFdRule on fd -1 = %v, want EBADF", err)
+	}
+}
+
+// TestAddRulesGrantsTmpThroughTheAdoptedFd: confine's rule set grants the tmp
+// rule through the ADOPTED fd, never by reopening a path, so swapping the
+// --tmp path for another directory after adoption does not move the rule.
+func TestAddRulesGrantsTmpThroughTheAdoptedFd(t *testing.T) {
+	tmp := privateTmp(t)
+	fd, err := adoptPrivateTmp(tmp, os.Getuid(), unix.Open, unix.Fstat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = unix.Close(fd) }()
+	var adopted unix.Stat_t
+	if err := unix.Fstat(fd, &adopted); err != nil {
+		t.Fatal(err)
+	}
+	// Swap the path after adoption: the adopted dir moves away and a fresh
+	// directory takes its name.
+	if err := os.Rename(tmp, tmp+".moved"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(tmp, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	const ruleset, handled = 99, uint64(0x1234)
+	root := t.TempDir()
+	var paths []string
+	type fdRule struct {
+		fd     int
+		access uint64
+		ino    uint64
+	}
+	var fdRules []fdRule
+	err = addRules(ruleset, root, grantFds{tmp: fd, cache: -1}, handled, ruleAdders{
+		path: func(rs int, path string, _ uint64) error {
+			if rs != ruleset {
+				t.Errorf("path rule on ruleset %d", rs)
+			}
+			paths = append(paths, path)
+			return nil
+		},
+		fd: func(rs int, got int, access uint64) error {
+			if rs != ruleset {
+				t.Errorf("fd rule on ruleset %d", rs)
+			}
+			var st unix.Stat_t
+			if err := unix.Fstat(got, &st); err != nil {
+				t.Errorf("fstat of the rule fd %d: %v", got, err)
+			}
+			fdRules = append(fdRules, fdRule{fd: got, access: access, ino: st.Ino})
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("addRules: %v", err)
+	}
+	if len(fdRules) != 1 || fdRules[0].fd != fd || fdRules[0].access != handled || fdRules[0].ino != adopted.Ino {
+		t.Fatalf("fd rules = %+v, want one on the adopted fd %d (ino %d) with %#x", fdRules, fd, adopted.Ino, handled)
+	}
+	for _, p := range paths {
+		if strings.HasPrefix(p, filepath.Dir(tmp)) {
+			t.Fatalf("a path rule named the tmp (%q); the tmp must go through its fd", p)
+		}
+	}
+	if len(paths) == 0 || paths[len(paths)-1] != root {
+		t.Fatalf("path rules %v do not end with the root %q", paths, root)
 	}
 }

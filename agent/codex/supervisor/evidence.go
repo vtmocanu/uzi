@@ -104,6 +104,16 @@ func abnormalEvidence(reason string, cleanup *drainResult) map[string]any {
 	return m
 }
 
+// withTmpCleanup attaches the optional "tmpCleanup" field to a dispose or
+// abnormal event. A nil result (no --cleanup-token, or cleanup already ran)
+// leaves the event without the field.
+func withTmpCleanup(m map[string]any, tc *tmpCleanupResult) map[string]any {
+	if tc != nil {
+		m["tmpCleanup"] = map[string]any{"state": tc.State, "reason": tc.Reason}
+	}
+	return m
+}
+
 // evidence is the bounded writer for fd 4: it caps the total line count and the
 // per-line byte length so no path can turn evidence into an unbounded channel.
 type evidence struct {
