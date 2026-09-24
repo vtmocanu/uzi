@@ -163,3 +163,52 @@ func TestCrewStateForRecoveryWait(t *testing.T) {
 		t.Error("run.go's terminalRunStatuses contains recovery_wait — `uzi run logs --follow` would exit mid-run and truncate the capture")
 	}
 }
+
+// TestStateGlyphWordCodexHold pins the PRD #1590 token: a run held on its Codex account reads
+// "codex wait" in the wait family. Reddening mutation: drop the codex cause branch in
+// stateGlyphWord → it falls back to "recovery wait".
+func TestStateGlyphWordCodexHold(t *testing.T) {
+	glyph, word := stateGlyphWord(statusRecoveryWait, "", false, false, "", codexAccountUnavailableCause)
+	if glyph != "~" || word != "codex wait" {
+		t.Errorf("codex hold token = (%q, %q), want (~, codex wait)", glyph, word)
+	}
+}
+
+// TestCodexHoldTUIDetailAndBoard drives the real model: the run detail draws the action line
+// (with a hostile label rendered inert, and no retry countdown), and the board's selected
+// held row draws it as its second line. Mutation-checked: removing the detail draw in
+// tui_detail.go, and the codex branch in boardSecondLine, each reddened this test.
+func TestCodexHoldTUIDetailAndBoard(t *testing.T) {
+	cause := codexAccountUnavailableCause
+	action := "relogin_required"
+	// Hostile label: ESC, BEL and the bidi override are stripped, so only the printable
+	// residue ("[2J", "]8;;http://evil") survives, inert text that no terminal interprets.
+	label := "\x1b[2J\u202E\x07work\x1b]8;;http://evil\x07"
+	retry := time.Now().Add(20 * time.Minute)
+	run := apitypes.RunDTO{ID: "99999999-codex", Kind: "issue", Status: statusRecoveryWait, IssueTitle: "held run",
+		RecoveryWaitCause: &cause, CodexAccountAction: &action, CodexSecretLabel: &label, RecoveryRetryNotBefore: &retry}
+
+	m := tuiTestModel(t, &uzicli.FakeClient{}, run.ID)
+	m = applyDetail(m, run, nil)
+	raw := m.View().Content
+	assertNoRawControls(t, "codex hold detail", raw)
+	out := stripANSI(raw)
+	if !strings.Contains(out, "re-log in Codex credential [2Jwork]8;;http://evil to continue") {
+		t.Errorf("detail lacks the Codex account action line:\n%s", out)
+	}
+	if !strings.Contains(out, "codex wait") {
+		t.Errorf("detail header lacks the codex wait token:\n%s", out)
+	}
+	if strings.Contains(out, "retry at") || strings.Contains(out, "resumes in") {
+		t.Errorf("a Codex account hold must show no retry countdown:\n%s", out)
+	}
+
+	board := tuiTestModel(t, &uzicli.FakeClient{}, "")
+	board = step(board, boardRunsMsg{reqID: board.board.waitID, runs: []apitypes.RunListItemDTO{{RunDTO: run}}})
+	raw = board.View().Content
+	assertNoRawControls(t, "codex hold board", raw)
+	out = stripANSI(raw)
+	if !strings.Contains(out, "codex wait") || !strings.Contains(out, "▸ re-log in Codex credential [2Jwork]8;;http://evil to continue") {
+		t.Errorf("board lacks the codex wait token or the selected row's action line:\n%s", out)
+	}
+}

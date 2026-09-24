@@ -214,12 +214,16 @@ The run DTO gains a derived `codex_account_action` for a run held on `codex_acco
 
 | condition | action |
 |---|---|
-| alias linked, account quarantined, recovery material at the current generation or a live lease | `reconciling` |
-| alias linked, account quarantined, no material and no live lease, or reauth flag set | `relogin_required` |
+| alias linked, account quarantined, recovery material at the current generation (even with the reauth flag set: the survivor pass promotes the material and `PromoteCodexRecovery` clears the flag) or a live lease | `reconciling` |
+| alias linked, account `in_progress` with a live lease, or with an expired lease the survivor pass reaps on its next tick, while a same-identity re-admission waits on it | `reconciling` |
+| alias linked, account quarantined, no material and no live lease, or reauth flag set without material | `relogin_required` |
 | alias `staging` (new login being verified) | `verifying_login` |
 | alias `failed` (new login unusable) | `relogin_required` |
 | alias deleted (`codex_secret_id` NULL) | transient: the next promoter tick fails the run per D5; until then, `relogin_required` |
 | account not quarantined, release predicate passes | `resuming` (transient until the next tick) |
+| any other state (for example a binding change the next promoter tick will fail) | `relogin_required` |
+
+A pending same-identity re-admission (alias material ahead, account idle or committed) is applied in memory before classifying, so a completed D5 re-login reads `resuming`, not `relogin_required`. Every `resuming` case is checked against the promoter's real decision in a LiveDB test. The DTO also carries `codex_secret_label`, set only alongside a non-null action. (AI-synced 2026-09-24)
 
 The DTO exposes only the run's own snapshotted alias label (`codex_secret_label`), never a label or identity of a different account. The action is never persisted, so it cannot go stale. The api-contract fixture gains the field.
 

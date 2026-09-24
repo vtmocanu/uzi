@@ -41,13 +41,36 @@ func TestCodexAccountActionsForRunsLiveDB(t *testing.T) {
 		{"quarantined, recovery material at the current generation", func(t *testing.T, fx *codexClaimFix) {
 			seedActionRecovery(t, fx)
 		}, CodexAccountActionReconciling},
+		// Recovery material outranks the reauth flag: the survivor pass promotes it and
+		// PromoteCodexRecovery clears reauth_required, so no owner action is needed.
 		{"quarantined, recovery material but reauth required", func(t *testing.T, fx *codexClaimFix) {
 			seedActionRecovery(t, fx)
 			fx.setAccount(t, `reauth_required = true, reauth_generation = generation,
 				reauth_credential_revision = credential_revision`)
+		}, CodexAccountActionReconciling},
+		{"quarantined, reauth required, no recovery material", func(t *testing.T, fx *codexClaimFix) {
+			fx.setAccount(t, `reauth_required = true, reauth_generation = generation,
+				reauth_credential_revision = credential_revision`)
+			t.Cleanup(func() {
+				fx.setAccount(t, `reauth_required = false, reauth_generation = NULL,
+					reauth_credential_revision = NULL, reauth_reason = NULL`)
+			})
 		}, CodexAccountActionReloginRequired},
 		{"quarantined, live lease", func(t *testing.T, fx *codexClaimFix) {
 			fx.setAccount(t, `lease_deadline = now() + interval '1 hour'`)
+		}, CodexAccountActionReconciling},
+		// A same-identity re-login whose re-admission is held back by an in_progress account
+		// with an EXPIRED lease (ReadmitRunCodexBinding's coord_state fence): the survivor pass
+		// reaps the lease into quarantine on its next tick, so this is reconciling, not an owner
+		// action. (Without material ahead an in_progress account passes the release predicate
+		// and the run resumes, whatever its lease.) Restored on cleanup so no other test's
+		// survivor sweep finds a reap candidate.
+		{"re-login ahead, in_progress with an expired lease", func(t *testing.T, fx *codexClaimFix) {
+			sameIdentityRelogin(t, fx.env, fx, codexToken("access-relogin"))
+			fx.setAccount(t, "coord_state = 'in_progress', coord_operation_id = gen_random_uuid(), lease_deadline = now() - interval '1 minute'")
+			t.Cleanup(func() {
+				fx.setAccount(t, "coord_state = 'idle', coord_operation_id = NULL, lease_deadline = NULL")
+			})
 		}, CodexAccountActionReconciling},
 		{"re-login being verified (alias staging)", func(t *testing.T, fx *codexClaimFix) {
 			startRelogin(t, fx.env, fx, "staging")
@@ -89,6 +112,20 @@ func TestCodexAccountActionsForRunsLiveDB(t *testing.T) {
 			}
 			if len(got) != 1 {
 				t.Fatalf("actions = %v, want exactly the held run", got)
+			}
+
+			// "resuming" is a claim about the promoter's next decision, so check it against
+			// the promoter itself: the very next pass must promote this run out of the hold.
+			if tc.want == CodexAccountActionResuming {
+				if n, err := promoteOnly(t, svc, fx.runID); err != nil || n != 1 {
+					t.Fatalf("resuming but promote = (%d, %v), want (1, nil)", n, err)
+				}
+				if r := mustRun(t, env, fx.runID); r.Status == "recovery_wait" {
+					t.Fatalf("resuming but the run is still held after the promoter ran")
+				}
+			} else if n, err := promoteOnly(t, svc, fx.runID); err != nil || n != 0 {
+				// The converse: any other action must not be a run the promoter resumes.
+				t.Fatalf("action %q but promote = (%d, %v), want (0, nil)", tc.want, n, err)
 			}
 		})
 	}

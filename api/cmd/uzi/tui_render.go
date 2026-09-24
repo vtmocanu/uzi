@@ -231,7 +231,8 @@ func displayHealth(health string) string {
 // tail so the many existing call sites without it stay valid. When it is "forge_unreachable"
 // the wait word reads "forge wait" instead of "recovery wait" (glyph and colour unchanged —
 // it is still a wait-family hold). The retry/cap detail does not fit this fixed-width token;
-// it lives on the run-get notice and the web panel.
+// it lives on the run-get notice and the web panel. PRD #1590: "codex_account_unavailable"
+// reads "codex wait", its action living on the board second line and the detail park line.
 //
 // LANDING (issue #1418): landingState is the run's server-derived LandingState. A `failed` run
 // whose value is "needs_landing" reads the word "needs landing" instead of "failed" — its
@@ -280,6 +281,12 @@ func stateGlyphWord(status, health string, isPlanning, isRevising bool, landingS
 		// park reads "forge wait" so it is distinguishable from the empty-turn recovery.
 		if len(cause) > 0 && cause[0] == forgeUnreachableCause {
 			return "~", "forge wait"
+		}
+		// PRD #1590: a run held on its Codex account. The action ("reconciling",
+		// "re-log in …") does not fit this fixed-width token; the board's selected-row
+		// second line and the detail's park line carry it (codexAccountActionLine).
+		if len(cause) > 0 && cause[0] == codexAccountUnavailableCause {
+			return "~", "codex wait"
 		}
 		return "~", "recovery wait"
 	case statusPaused:

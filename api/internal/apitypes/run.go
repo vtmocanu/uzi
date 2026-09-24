@@ -693,8 +693,15 @@ type RunDTO struct {
 	// CodexSecretLabel is the run's OWN snapshotted Codex alias label (runs.codex_secret_label,
 	// frozen when the run bound its alias), shown next to CodexAccountAction so the owner knows
 	// which login to fix (PRD #1590 D6). It is non-null ONLY when CodexAccountAction is non-null,
-	// so no other run (and no admin list) gains a label from it, and it is never read from the
-	// alias row, so it can never name a different account. Null when the snapshot is empty.
+	// so a run that is not held on its Codex account never carries it. A held run carries it on
+	// every read that derives the action: the owner's GetRun and ListRuns, and the admin's
+	// AdminListRuns and GetRun, the same owner-or-admin scope AnthropicSecretLabel rides. It is
+	// never read from the alias row, so it can never name a different account. Null when the
+	// snapshot is empty.
+	//
+	// The label is USER-SUPPLIED text, so any consumer writing it to a terminal must sanitize;
+	// the CLI and TUI route it through cellText (and renderer.Plain), the same obligation as
+	// AnthropicSecretLabel above.
 	CodexSecretLabel *string `json:"codex_secret_label"`
 	// RecoveryRetryNotBefore is when the server will promote a 'recovery_wait' run back to
 	// queued — the retry stamp the forge-park surface counts down to ("retry at HH:MM"). It is

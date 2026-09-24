@@ -47,9 +47,19 @@ func TestDeriveCodexAccountAction(t *testing.T) {
 			in.leaseLive = true
 		}, CodexAccountActionReconciling},
 		{"quarantined, no material and no lease", quarantine, CodexAccountActionReloginRequired},
+		// Recovery material outranks the reauth flag: the survivor pass promotes it and
+		// PromoteCodexRecovery clears reauth_required, so no owner action is needed.
 		{"quarantined, recovery material but reauth flag set", func(in *codexAccountActionInputs) {
 			quarantine(in)
 			in.recoveryAtGeneration, in.reauthRequired = true, true
+		}, CodexAccountActionReconciling},
+		{"quarantined, reauth flag set, no material", func(in *codexAccountActionInputs) {
+			quarantine(in)
+			in.reauthRequired = true
+		}, CodexAccountActionReloginRequired},
+		{"quarantined, reauth flag set with a live lease", func(in *codexAccountActionInputs) {
+			quarantine(in)
+			in.reauthRequired, in.leaseLive = true, true
 		}, CodexAccountActionReloginRequired},
 		{"quarantined, material ahead (no re-admission while quarantined), recovering", func(in *codexAccountActionInputs) {
 			quarantine(in)
@@ -88,7 +98,12 @@ func TestDeriveCodexAccountAction(t *testing.T) {
 			CodexAccountActionReloginRequired},
 		{"fallback: static alias", func(in *codexAccountActionInputs) { in.aliasStatus = "static" },
 			CodexAccountActionReloginRequired},
-		{"fallback: in_progress with expired lease, material ahead", func(in *codexAccountActionInputs) {
+		// An expired in_progress lease is reaped into quarantine by the survivor pass on its
+		// next tick, so it is reconciling, not an owner action.
+		{"in_progress with expired lease, material ahead", func(in *codexAccountActionInputs) {
+			in.release.coordState, in.release.currentMaterialRev, in.leaseExpired = codexCoordInProgress, 5, true
+		}, CodexAccountActionReconciling},
+		{"fallback: in_progress with no lease, material ahead", func(in *codexAccountActionInputs) {
 			in.release.coordState, in.release.currentMaterialRev = codexCoordInProgress, 5
 		}, CodexAccountActionReloginRequired},
 	} {
@@ -118,12 +133,16 @@ func TestCodexAccountActionInputsFromRow(t *testing.T) {
 		ReauthRequired:         pgtype.Bool{Bool: true, Valid: true},
 	}
 	in := codexAccountActionInputsFromRow(row, now)
-	if in.aliasDeleted || !in.aliasPresent || !in.accountLinked || !in.leaseLive || !in.reauthRequired {
+	if in.aliasDeleted || !in.aliasPresent || !in.accountLinked || !in.leaseLive || in.leaseExpired || !in.reauthRequired {
 		t.Fatalf("linked row projected as %+v", in)
 	}
 	row.LeaseDeadline.Time = now
-	if codexAccountActionInputsFromRow(row, now).leaseLive {
-		t.Fatal("a lease at its deadline is not live")
+	if in := codexAccountActionInputsFromRow(row, now); in.leaseLive || !in.leaseExpired {
+		t.Fatalf("a lease at its deadline is expired, not live: %+v", in)
+	}
+	row.LeaseDeadline = pgtype.Timestamptz{}
+	if in := codexAccountActionInputsFromRow(row, now); in.leaseLive || in.leaseExpired {
+		t.Fatalf("a NULL lease is neither live nor expired: %+v", in)
 	}
 	row.CodexSecretID, row.AliasStatus, row.AliasProviderAccountID, row.AccountID = pgtype.UUID{}, pgtype.Text{}, pgtype.UUID{}, pgtype.UUID{}
 	in = codexAccountActionInputsFromRow(row, now)

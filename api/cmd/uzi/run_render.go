@@ -118,6 +118,11 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 		}
 		rows = append(rows, []string{"DEADLINE", cell})
 	}
+	// CODEX_ACCOUNT (PRD #1590 D6): what a run held on its Codex account needs next,
+	// emit-only-when-held. No retry countdown: the hold ends when the account recovers.
+	if line := codexAccountActionLine(r); line != "" {
+		rows = append(rows, []string{"CODEX_ACCOUNT", line})
+	}
 	if r.HealthReason != nil && *r.HealthReason != "" {
 		rows = append(rows, []string{"HEALTH_REASON", sanitizeTTY(*r.HealthReason)})
 	}
@@ -1459,7 +1464,7 @@ func steerKindLabel(kind string) string {
 // PRD #1392 M5: recoveryCause is the optional RecoveryWaitCause of a recovery_wait run — a
 // variadic tail so the ~two dozen existing call sites that do not have it stay valid. When
 // it is "forge_unreachable" the recovery suffix names the forge instead of the transient
-// empty turn.
+// empty turn; "codex_account_unavailable" (PRD #1590) names the Codex account.
 func steerState(kind string, consumedAt *time.Time, disposition *string, runStatus string, recoveryCause ...string) string {
 	// PRD #634: a scope directive's state IS its disposition — it is never consumed, so
 	// consumed_at/runStatus carry no delivery signal for it. A nil disposition means the
@@ -1495,6 +1500,11 @@ func steerState(kind string, consumedAt *time.Time, disposition *string, runStat
 	recoveringSuffix := " (run recovering from a transient interruption)"
 	if len(recoveryCause) > 0 && recoveryCause[0] == forgeUnreachableCause {
 		recoveringSuffix = " (run waiting for the forge)"
+	}
+	// PRD #1590: a run held on its Codex account names the account, not a transient
+	// interruption; the action detail lives on the run-get row and the TUI detail line.
+	if len(recoveryCause) > 0 && recoveryCause[0] == codexAccountUnavailableCause {
+		recoveringSuffix = " (run held on its Codex account)"
 	}
 	if consumedAt == nil {
 		if terminalRunStatuses[runStatus] {
@@ -1548,6 +1558,68 @@ const forgeUnreachableCause = "forge_unreachable"
 // unreachable (PRD #1392 M5) — the one cause that swaps in forge-specific surface wording.
 func isForgePark(r apitypes.RunDTO) bool {
 	return r.Status == statusRecoveryWait && strOr(r.RecoveryWaitCause, "") == forgeUnreachableCause
+}
+
+// codexAccountUnavailableCause is the RecoveryWaitCause of a run held on its Codex
+// subscription account (PRD #1590). Unlike the forge park it has no retry clock: the run
+// resumes when the account does, so no surface renders a countdown for it.
+const codexAccountUnavailableCause = "codex_account_unavailable"
+
+// The RunDTO.CodexAccountAction vocabulary (PRD #1590 D6), kept in sync with
+// workersvc.CodexAccountAction* on the wire.
+const (
+	codexActionReconciling     = "reconciling"
+	codexActionReloginRequired = "relogin_required"
+	codexActionVerifyingLogin  = "verifying_login"
+	codexActionResuming        = "resuming"
+)
+
+// isCodexAccountHold reports whether a recovery_wait run is held on its Codex account
+// (PRD #1590), the one cause whose surface wording is the codex_account_action line.
+func isCodexAccountHold(r apitypes.RunDTO) bool {
+	return r.Status == statusRecoveryWait && strOr(r.RecoveryWaitCause, "") == codexAccountUnavailableCause
+}
+
+// codexAccountActionLine is the held-run sentence (PRD #1590 D6) the CLI, the TUI and the web
+// share, keyed on CodexAccountAction. It returns "" for any run that is not a Codex account
+// hold, so every call site can call it unconditionally. An unrecognised or null action (a newer
+// server, or a best-effort derivation that failed) reads the generic "Codex account
+// unavailable" rather than inventing a meaning.
+//
+// CodexSecretLabel is USER-AUTHORED text (the owner's alias label), so it goes through
+// cellText, which strips control and format runes, folds newlines and bounds its length; a
+// hostile label cannot reach the terminal as an escape sequence. A relogin_required hold with
+// no label still tells the owner what to do, just without naming the credential.
+func codexAccountActionLine(r apitypes.RunDTO) string {
+	if !isCodexAccountHold(r) {
+		return ""
+	}
+	switch strOr(r.CodexAccountAction, "") {
+	case codexActionReconciling:
+		return "Codex account is reconciling"
+	case codexActionReloginRequired:
+		if label := cellText(strOr(r.CodexSecretLabel, "")); label != "" {
+			return "re-log in Codex credential " + label + " to continue"
+		}
+		return "re-log in your Codex credential to continue"
+	case codexActionVerifyingLogin:
+		return "verifying the new Codex login"
+	case codexActionResuming:
+		return "Codex account available again"
+	default:
+		return "Codex account unavailable"
+	}
+}
+
+// runStatusCell is the STATUS cell of the run tables (`uzi run list`, `uzi admin runs`):
+// displayRunStatus, plus the Codex account action in parentheses for a run held on its
+// Codex account (PRD #1590), so the list says what the held run needs without a `run get`.
+func runStatusCell(r apitypes.RunListItemDTO) string {
+	s := displayRunStatus(r.Status, r.IsPlanning, r.IsRevising, r.LandingState)
+	if line := codexAccountActionLine(r.RunDTO); line != "" {
+		s += " (" + line + ")"
+	}
+	return s
 }
 
 // forgeParkLine is the shared "waiting for the forge, retry at HH:MM (N of MAX)" wording

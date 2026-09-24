@@ -88,6 +88,7 @@ type codexAccountActionInputs struct {
 
 	recoveryAtGeneration bool // recovery material at the account's current generation
 	leaseLive            bool // the account's lease_deadline is still in the future
+	leaseExpired         bool // the account's lease_deadline is set and has passed
 	reauthRequired       bool // codex_provider_account.reauth_required
 }
 
@@ -128,6 +129,7 @@ func codexAccountActionInputsFromRow(row store.ListCodexAccountActionInputsRow, 
 		},
 		recoveryAtGeneration: row.RecoveryAtGeneration,
 		leaseLive:            row.LeaseDeadline.Valid && row.LeaseDeadline.Time.After(now),
+		leaseExpired:         row.LeaseDeadline.Valid && !row.LeaseDeadline.Time.After(now),
 		reauthRequired:       row.ReauthRequired.Valid && row.ReauthRequired.Bool,
 	}
 }
@@ -145,13 +147,21 @@ func codexAccountActionInputsFromRow(row store.ListCodexAccountActionInputsRow, 
 //     is ahead of the run's and the account is idle or committed (ReadmitRunCodexBinding's
 //     coord_state fence; its identity and credential-revision fences are classify's own
 //     terminal checks). Promote is resuming (transient until the next tick);
-//   - stay on a quarantined account: relogin_required when the reauth flag is set, reconciling
-//     when recovery material sits at the current generation or a lease is live, otherwise
-//     relogin_required;
+//   - stay on a quarantined account with recovery material at its current generation:
+//     reconciling, EVEN WHEN the reauth flag is set. The survivor pass
+//     (reconcileUnresolvedCodexRefresh) promotes exactly that material, and PromoteCodexRecovery
+//     clears reauth_required in the same statement, so the account recovers with no owner
+//     action; telling the owner to re-log in would ask for work the next tick makes moot;
+//   - stay on a quarantined account otherwise: relogin_required when the reauth flag is set,
+//     reconciling when a lease is live, otherwise relogin_required;
 //   - stay on an in_progress account with a live lease (a refresh in flight, the promoter waits
 //     for it to finish before re-admitting): reconciling. D6's table names the live lease only
 //     under quarantine; an owner re-login would not help a run whose account is mid-refresh,
-//     so this follows that row's intent.
+//     so this follows that row's intent;
+//   - stay on an in_progress account whose lease has expired: reconciling. The survivor pass
+//     lists it (ListUnresolvedCodexRefreshAccounts) and reaps it into quarantine on its next
+//     tick (QuarantineExpiredCodexLease), after which this derivation re-reads the quarantined
+//     account and reports whatever that state warrants.
 //
 // FALLBACK: every other state is relogin_required. That covers a terminal classification the
 // next promoter tick commits (a changed identity, credential revision or auth mode, an
@@ -180,11 +190,13 @@ func deriveCodexAccountAction(in codexAccountActionInputs) string {
 		return CodexAccountActionReloginRequired
 	}
 	switch {
+	case rel.coordState == codexCoordQuarantined && in.recoveryAtGeneration:
+		return CodexAccountActionReconciling // before the reauth flag: the promotion clears it
 	case rel.coordState == codexCoordQuarantined && in.reauthRequired:
 		return CodexAccountActionReloginRequired
-	case rel.coordState == codexCoordQuarantined && (in.recoveryAtGeneration || in.leaseLive):
+	case rel.coordState == codexCoordQuarantined && in.leaseLive:
 		return CodexAccountActionReconciling
-	case rel.coordState == codexCoordInProgress && in.leaseLive:
+	case rel.coordState == codexCoordInProgress && (in.leaseLive || in.leaseExpired):
 		return CodexAccountActionReconciling
 	default:
 		return CodexAccountActionReloginRequired

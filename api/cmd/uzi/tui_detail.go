@@ -764,6 +764,14 @@ func (m tuiModel) renderDetail() string {
 		sb.WriteString(m.pal.state(crewWaiting).Render(m.renderer.Plain(line, 120)) + "\n")
 	}
 
+	// The Codex account hold line (PRD #1590 D6), in the same slot and colour as the park line
+	// above (a recovery_wait run is never limit_wait, so the two never both draw). It carries
+	// the owner's alias label, USER-AUTHORED text: codexAccountActionLine already folds it
+	// through cellText, and renderer.Plain here is the D7 backstop. No retry countdown.
+	if line := codexAccountActionLine(d.run); line != "" {
+		sb.WriteString(m.pal.state(crewWaiting).Render(m.renderer.Plain(line, 120)) + "\n")
+	}
+
 	// The near-timeout countdown (PRD #1170), the run detail's OTHER conditional second
 	// row. Drawn only while the run is flagged `slow` and carries a deadline_at, in the
 	// stall colour that matches the ▲ token above. fitNearTimeoutLine sheds clauses to
