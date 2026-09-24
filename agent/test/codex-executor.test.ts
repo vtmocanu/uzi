@@ -4836,3 +4836,160 @@ describe("CodexExecutor prose-only planning turns (#1593)", () => {
     assert.equal(rev.transport.turnStartCount, 2);
   });
 });
+
+// Issue #1600: the Codex wall is RUN-WIDE (sdk-executor's model). Every turn draws from one
+// remaining budget; a served total (an owner extension) lifts it upward only; and a refused wall
+// park re-arms it from the 409's budget before the re-drive, which skips reportIteration.
+describe("CodexExecutor: run-wide wall and served lift (issue #1600)", () => {
+  // Implement turns that each take `turnMs`, the last one ending with signal_done. When
+  // `quietFirst`, turn 1 never completes (a wall trip must abort it). Frames arrive on a timer, as a
+  // real turn's would.
+  function timedTurns(opts: { turnMs: number; turns: number; quietFirst?: boolean }): Responder {
+    return (c) => {
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") {
+        const n = c.turnStartCount;
+        if (opts.quietFirst && n === 1) c.transport.push(threadStarted());
+        else {
+          const t = setTimeout(() => {
+            if (n >= opts.turns) c.transport.push(signalDone()).push(turnCompleted("completed"));
+            else c.transport.push(turnCompleted("completed"));
+          }, opts.turnMs);
+          t.unref?.();
+        }
+        return { turn: { id: "tn-1" } };
+      }
+      return {};
+    };
+  }
+
+  function lwallCtx(overrides: Partial<RunContext> = {}): {
+    ctx: RunContext;
+    spies: { parkForWallCalls: number; outcome: WallParkOutcome; refreshCalls: number };
+  } {
+    const spies = { parkForWallCalls: 0, outcome: "parked" as WallParkOutcome, refreshCalls: 0 };
+    const { ctx } = makeCtx({
+      config: { max_iterations: 10 },
+      parkForWall: async () => {
+        spies.parkForWallCalls++;
+        return spies.outcome;
+      },
+      clearWallMode: () => undefined,
+      ...overrides,
+    });
+    return { ctx, spies };
+  }
+
+  it("cumulative active time across turns trips the wall; each turn does not get a fresh wall", async () => {
+    const rig = makeRig({ responder: timedTurns({ turnMs: 150, turns: 6 }) });
+    rig.deps = { ...rig.deps, idleMs: 5000, wallMs: 350 };
+    const { ctx, spies } = lwallCtx();
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "codex cumulative wall");
+    // Each 150ms turn fits a 350ms wall on its own, so a per-turn wall never trips. Cumulatively the
+    // budget is spent inside turn 3.
+    assert.deepStrictEqual(result.walled, { reason: "codex run wall-clock timeout" }, "the run-wide budget tripped");
+    assert.equal(spies.parkForWallCalls, 1);
+    assert.equal(rig.transport.turnStartCount, 3, "tripped in turn 3 (150+150 spent, 50ms left)");
+  });
+
+  it("a larger served total from reportIteration lifts the wall before the next turn", async () => {
+    const rig = makeRig({ responder: timedTurns({ turnMs: 250, turns: 2 }) });
+    rig.deps = { ...rig.deps, idleMs: 5000, wallMs: 100 };
+    const { ctx, spies } = lwallCtx({ reportIteration: async () => ({ totalWallSeconds: 2 }) });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "codex served lift");
+    // A 250ms turn outlives the 100ms claim-time wall; only the served 2s total lets it finish.
+    assert.strictEqual(result.walled, undefined, "the served total lifted the wall");
+    assert.strictEqual(result.branch, "agent/issue-42");
+    assert.equal(spies.parkForWallCalls, 0);
+  });
+
+  it("two successive lifts both apply, and a later smaller served value does not shorten the wall", async () => {
+    const rig = makeRig({ responder: timedTurns({ turnMs: 150, turns: 4 }) });
+    rig.deps = { ...rig.deps, idleMs: 5000, wallMs: 100 };
+    const served = [{ totalWallSeconds: 0.4 }, { totalWallSeconds: 0.8 }, { totalWallSeconds: 0.2 }];
+    let calls = 0;
+    const { ctx, spies } = lwallCtx({ reportIteration: async () => served[calls++] });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "codex two lifts");
+    // Budget: 100 → 400 (lift 1) → 250 after turn 1 → 650 (lift 2) → 500 → 350 (0.2s ignored) →
+    // 200 after turn 4. Only lift 1 (400ms for 600ms of turns) would trip in turn 3; a served
+    // value that shortened the wall to 0.2s would trip in turn 3 as well.
+    assert.strictEqual(result.walled, undefined, "both lifts applied and the smaller value was ignored");
+    assert.strictEqual(result.branch, "agent/issue-42");
+    assert.equal(spies.parkForWallCalls, 0);
+    assert.equal(calls, 4, "one reportIteration per implement turn");
+  });
+
+  it("(implement) a refused park after the budget is spent re-arms from the 409's budget, with no immediate re-trip", async () => {
+    const rig = makeRig({ responder: timedTurns({ turnMs: 300, turns: 2, quietFirst: true }) });
+    rig.deps = { ...rig.deps, idleMs: 5000, wallMs: 100, minRedriveWallMs: 10 };
+    const { ctx, spies } = lwallCtx({
+      takeWallParkRefresh: () => {
+        spies.refreshCalls++;
+        return spies.refreshCalls === 1 ? { totalSeconds: 5, usedSeconds: 1 } : undefined;
+      },
+    });
+    spies.outcome = "refused";
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "codex refused implement refresh");
+    // Turn 1 spends the 100ms wall; the refusal's budget (5s total) re-arms it, so the 300ms
+    // re-drive completes. Re-arming only the 100ms claim wall would re-trip and re-park.
+    assert.strictEqual(result.walled, undefined);
+    assert.strictEqual(result.branch, "agent/issue-42");
+    assert.equal(spies.parkForWallCalls, 1, "one refused park, no re-trip after the refresh");
+    assert.equal(spies.refreshCalls, 1);
+  });
+
+  it("(plan) a refused park after the budget is spent re-arms from the 409's budget before the plan re-drive", async () => {
+    const responder: Responder = (c) => {
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-plan" } };
+      if (c.method === "turn/start") {
+        const n = c.turnStartCount;
+        const turnId = `tn-plan-${n}`;
+        if (n === 1) c.transport.push(threadStarted("th-plan"));
+        else if (n === 2) {
+          const t = setTimeout(() => {
+            c.transport
+              .push(toolCall(2, "submit_plan", { plan_md: "plan after refused park" }, "th-plan", turnId, "c-plan"))
+              .push(turnCompleted("completed", "th-plan", turnId));
+          }, 300);
+          t.unref?.();
+        }
+        return { turn: { id: turnId } };
+      }
+      return {};
+    };
+    const rig = makeRig({ responder });
+    rig.deps = { ...rig.deps, idleMs: 5000, wallMs: 100, minRedriveWallMs: 10 };
+    let gateCalls = 0;
+    const { ctx, spies } = lwallCtx({
+      planApproved: false,
+      approvedPlan: undefined,
+      // Stop at the gate: reaching it proves the re-driven plan turn finished. (Approval would
+      // recreate the provider epoch, which this single-transport rig cannot serve.)
+      gatePlan: async () => {
+        gateCalls++;
+        return { kind: "reject", reason: "stop at the gate" };
+      },
+      takeWallParkRefresh: () => {
+        spies.refreshCalls++;
+        return spies.refreshCalls === 1 ? { totalSeconds: 5, usedSeconds: 1 } : undefined;
+      },
+    });
+    spies.outcome = "refused";
+    await assert.rejects(
+      withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "codex refused plan refresh"),
+      /stop at the gate/,
+    );
+    assert.equal(gateCalls, 1, "the re-driven plan turn reached the gate");
+    assert.equal(spies.parkForWallCalls, 1, "one refused park, no re-trip after the refresh");
+  });
+
+  it("a refused park with no server budget (older server) falls back to one claim-time wall", async () => {
+    const rig = makeRig({ responder: timedTurns({ turnMs: 100, turns: 2, quietFirst: true }) });
+    rig.deps = { ...rig.deps, idleMs: 5000, wallMs: 300, minRedriveWallMs: 10 };
+    const { ctx, spies } = lwallCtx({ takeWallParkRefresh: () => undefined });
+    spies.outcome = "refused";
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "codex refused fallback");
+    assert.strictEqual(result.walled, undefined);
+    assert.equal(spies.parkForWallCalls, 1, "the 100ms re-drive fits the 300ms claim-time fallback");
+  });
+});

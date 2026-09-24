@@ -44,7 +44,7 @@ import type { Readable, Writable } from "node:stream";
 
 import type { Logger } from "../log.js";
 import type { WorkerClient } from "../client.js";
-import { PlanRejectedError, type EmittedMessage, type Executor, type ExecutorResult, type RunContext, type WallParkOutcome } from "../executor.js";
+import { PlanRejectedError, type EmittedMessage, type Executor, type ExecutorResult, type RunContext, type WallParkOutcome, type WallParkRefresh } from "../executor.js";
 import { PauseNowSignal } from "../steering.js";
 import { makeMemoryToolHandlers, memoryToolNames, type MemoryToolHandlers } from "../memory-tools.js";
 import { makeFindingsToolHandlers, reportIncidentalIssueToolName, type FindingsToolHandlers } from "../findings-tools.js";
@@ -69,7 +69,7 @@ import { RUNNER_UID, WORKER_UID, uidSplitActive } from "../runner-uid.js";
 import { errMessage } from "../util.js";
 import { appendLeadTextTail, emitPlanMissingNotice, isProseOnlyPlanTurn, PLAN_MISSING_NUDGE, REASON_PLAN_MISSING, resolvePlanMissing } from "../plan-missing.js";
 import { makeTextRedactor } from "../redact.js";
-import type { AgentTemplate, AskUserQuestion, ClaimSkill } from "../protocol.js";
+import type { AgentTemplate, AskUserQuestion, ClaimSkill, IterationBudget } from "../protocol.js";
 import type { CommandSandboxMode } from "../config.js";
 
 import { ExecutionRegistry, newLocalExecutionEpoch, type RegisteredRoot } from "./registry.js";
@@ -194,6 +194,10 @@ const COMMAND_ENV_PROTECTED_KEYS: ReadonlySet<string> = new Set([
 
 const DEFAULT_IDLE_MS = 5 * 60 * 1000;
 const DEFAULT_WALL_MS = 60 * 60 * 1000;
+// Issue #1600: the least wall a refused-park re-drive is armed with. A refusal means the server's
+// deadline has not passed, and the server's own sweep still parks the run at that deadline, so the
+// local wall is only a backstop; the floor keeps it from re-tripping (and re-capturing) at once.
+const MIN_REDRIVE_WALL_MS = 60 * 1000;
 const DEFAULT_BOUNDARY_DEADLINE_MS = 30 * 1000;
 const DEFAULT_CHILD_TURN_DEADLINE_MS = 10 * 60 * 1000;
 // The single-milestone implement/review iteration budget when the claim omits one, matching
@@ -1200,6 +1204,8 @@ export interface CodexExecutorDeps {
   readonly provisionRunTools?: typeof provisionRunTools;
   readonly idleMs?: number;
   readonly wallMs?: number;
+  /** Issue #1600: the refused-park re-drive floor; defaults to MIN_REDRIVE_WALL_MS. */
+  readonly minRedriveWallMs?: number;
   readonly boundaryDeadlineMs?: number;
   readonly childTurnDeadlineMs?: number;
   /** Base TMPDIR exposed to an injected high-level command seam. The production
@@ -1319,6 +1325,51 @@ interface ProviderEpoch {
 }
 
 // ─── The production CodexExecutor ───────────────────────────────────────────────
+/**
+ * Issue #1600: the run-wide wall-clock budget, sdk-executor's model. `remainingMs` is armed at each
+ * turn start and debited by the turn's elapsed time at its end, so plan, revision and implement
+ * turns and refused-park re-drives all draw from one budget, paused between turns (the approval
+ * gate included). `maxServedMs` is the high-water mark of the served total wall: a larger served
+ * value lifts `remainingMs` by the delta, a smaller or equal one never shortens it.
+ */
+interface RunWall {
+  remainingMs: number;
+  maxServedMs: number;
+  /** The claim-time wall: the refused-park fallback when the server sent no budget. */
+  readonly claimMs: number;
+}
+
+/** Issue #1600: lift the run-wide wall to a served total, upward only (sdk-executor's re-arm). */
+function liftWall(wall: RunWall, servedSeconds: number | undefined): void {
+  if (typeof servedSeconds !== "number") return;
+  const servedMs = servedSeconds * 1000;
+  if (servedMs > wall.maxServedMs) {
+    wall.remainingMs += servedMs - wall.maxServedMs;
+    wall.maxServedMs = servedMs;
+  }
+}
+
+/**
+ * Issue #1600: re-arm the run-wide wall after a REFUSED wall park. A refusal means the server's
+ * deadline has not passed. Lift to the refusal's served total, then take the server's own remaining
+ * time (total - used, both server-derived, so no cross-host clock comparison). Without a server
+ * budget (an older server) fall back to one claim-time wall, the pre-#1600 per-turn re-arm. Either
+ * way the re-drive gets at least `floorMs` (MIN_REDRIVE_WALL_MS in production).
+ */
+function refreshWallAfterRefusal(
+  wall: RunWall,
+  refresh: WallParkRefresh | undefined,
+  floorMs: number,
+): void {
+  liftWall(wall, refresh?.totalSeconds);
+  if (refresh?.totalSeconds !== undefined && refresh.usedSeconds !== undefined) {
+    wall.remainingMs = Math.max(wall.remainingMs, (refresh.totalSeconds - refresh.usedSeconds) * 1000);
+  } else {
+    wall.remainingMs = Math.max(wall.remainingMs, wall.claimMs);
+  }
+  wall.remainingMs = Math.max(wall.remainingMs, floorMs);
+}
+
 export class CodexExecutor implements Executor {
   /** M3/M4 (PRD #1171): the Codex outer safety facade, POPULATED at the top of `run()` (before
    *  any model work) with the per-sink auth-mode reconcile closure. The runner's durability
@@ -1559,6 +1610,7 @@ export class CodexExecutor implements Executor {
       const reducer = new RunTurnReducerImpl(NOOP_CONTEXT_HOOK);
       const idleMs = this.deps.idleMs ?? (ctx.config?.idle_timeout_seconds ? ctx.config.idle_timeout_seconds * 1000 : DEFAULT_IDLE_MS);
       const wallMs = this.deps.wallMs ?? (ctx.config?.run_timeout_seconds ? ctx.config.run_timeout_seconds * 1000 : DEFAULT_WALL_MS);
+      const wall: RunWall = { remainingMs: wallMs, maxServedMs: wallMs, claimMs: wallMs };
 
       // Plan → approval gate, exactly like SdkExecutor (fail-closed): a pre-approved resume
       // skips the planning turn and the gate.
@@ -1602,7 +1654,7 @@ export class CodexExecutor implements Executor {
         let fallbackUsed = false;
         // `round` counts clarification rounds only; the prose-only recovery below has its own budget.
         for (let round = 0; ; ) {
-          const turn = await this.driveTurnWithWallPark(ctx, epoch!.harness, reducer, "plan", prompt, epoch!.resumeSessionId, idleMs, wallMs, epoch!.buildPhaseBroker, { completedCount: 0 }, shared.scrubProjected);
+          const turn = await this.driveTurnWithWallPark(ctx, epoch!.harness, reducer, "plan", prompt, epoch!.resumeSessionId, idleMs, wall, epoch!.buildPhaseBroker, { completedCount: 0 }, shared.scrubProjected);
           if (turn.kind === "walled") return turn;
           const result = turn.result;
           if (result.plan?.trim()) {
@@ -1713,8 +1765,10 @@ export class CodexExecutor implements Executor {
         iteration++;
         // Report the iteration boundary before any implementation work. Besides carrying the
         // latest progress, this is the post-approval `awaiting_approval` → `running` transition.
-        // Codex does not consume the served budget yet, so the return value is deliberately ignored.
-        await ctx.reportIteration?.(iteration, latestProgress);
+        // Issue #1600: lift the run-wide wall to the served total (an owner extension included),
+        // as sdk-executor does. The served iteration budget is still not consumed.
+        const served: IterationBudget | void = await ctx.reportIteration?.(iteration, latestProgress);
+        if (served) liftWall(wall, served.totalWallSeconds ?? served.wallSeconds);
         // PRD #1416 M2: drain the worker-authoritative safety steer at the loop top and, when
         // present, PREFIX it (framed as worker guidance, followed by a blank line) to THIS turn's
         // implement prompt only. Codex has no <follow_up> fence; keep it a per-turn prefix so it
@@ -1730,7 +1784,7 @@ export class CodexExecutor implements Executor {
         let nextPrompt = turnPrompt;
         let result: ReducedTurnResult;
         for (let round = 0; ; round++) {
-          const implTurn = await this.driveTurnWithWallPark(ctx, epoch.harness, reducer, "implement", nextPrompt, epoch.resumeSessionId, idleMs, wallMs, epoch.buildPhaseBroker, { completedCount: latestProgress?.completed?.length ?? 0 }, shared.scrubProjected);
+          const implTurn = await this.driveTurnWithWallPark(ctx, epoch.harness, reducer, "implement", nextPrompt, epoch.resumeSessionId, idleMs, wall, epoch.buildPhaseBroker, { completedCount: latestProgress?.completed?.length ?? 0 }, shared.scrubProjected);
           if (implTurn.kind === "walled") return { branch: ctx.branch, walled: { reason: REASON_WALL } };
           result = implTurn.result;
           if (result.sessionId) lastSessionId = result.sessionId;
@@ -2087,7 +2141,7 @@ export class CodexExecutor implements Executor {
     prompt: string,
     resumeId: string | undefined,
     idleMs: number,
-    wallMs: number,
+    wall: RunWall,
     buildPhaseBroker: (phase: "plan" | "implement", signal?: AbortSignal) => CodexCallbackBroker,
     scrubLeadText: (s: string) => string,
   ): Promise<ReducedTurnResult> {
@@ -2137,8 +2191,15 @@ export class CodexExecutor implements Executor {
       idleTimer = setTimeout(() => trip(REASON_IDLE), idleMs);
       idleTimer.unref?.();
     };
-    let wallTimer: ReturnType<typeof setTimeout> | undefined = setTimeout(() => trip(REASON_WALL), wallMs);
-    wallTimer.unref?.();
+    // Issue #1600: arm the RUN-WIDE remaining budget, not a fresh per-turn wall; the finally debits
+    // this turn's elapsed time. An already-spent budget trips before the turn starts.
+    const wallArmedAt = Date.now();
+    let wallTimer: ReturnType<typeof setTimeout> | undefined;
+    if (wall.remainingMs <= 0) trip(REASON_WALL);
+    else {
+      wallTimer = setTimeout(() => trip(REASON_WALL), wall.remainingMs);
+      wallTimer.unref?.();
+    }
 
     reducer.beginTurn();
     let sawTerminal = false;
@@ -2206,6 +2267,7 @@ export class CodexExecutor implements Executor {
     } finally {
       if (idleTimer) clearTimeout(idleTimer);
       if (wallTimer) clearTimeout(wallTimer);
+      wall.remainingMs -= Date.now() - wallArmedAt;
       if (ctx.signal) ctx.signal.removeEventListener("abort", onCancel);
     }
   }
@@ -2233,7 +2295,7 @@ export class CodexExecutor implements Executor {
     prompt: string,
     resumeId: string | undefined,
     idleMs: number,
-    wallMs: number,
+    wall: RunWall,
     buildPhaseBroker: (phase: "plan" | "implement", signal?: AbortSignal) => CodexCallbackBroker,
     at: { completedCount: number; total?: number },
     scrubLeadText: (s: string) => string,
@@ -2241,7 +2303,7 @@ export class CodexExecutor implements Executor {
     for (;;) {
       try {
         const result = await this.driveCodexTurn(
-          ctx, harness, reducer, phase, prompt, resumeId, idleMs, wallMs, buildPhaseBroker, scrubLeadText,
+          ctx, harness, reducer, phase, prompt, resumeId, idleMs, wall, buildPhaseBroker, scrubLeadText,
         );
         // PRD #1497 M2 (CodeRabbit !1504): honor a sticky owner cancel that RACED a REFUSED
         // wall-park re-drive in EVERY phase. The wall PauseNowSignal permanently spent the shared
@@ -2253,7 +2315,12 @@ export class CodexExecutor implements Executor {
       } catch (err) {
         const outcome = await this.tryCodexWallPark(ctx, err, at);
         if (outcome === "parked") return { kind: "walled" };
-        if (outcome === "refused") continue; // the owner extended in the window; re-drive the turn
+        if (outcome === "refused") {
+          // The owner extended: re-drive the turn. It skips reportIteration, so re-arm the run-wide
+          // wall from the refusal's own budget first, or the re-drive would trip at once.
+          refreshWallAfterRefusal(wall, ctx.takeWallParkRefresh?.(), this.deps.minRedriveWallMs ?? MIN_REDRIVE_WALL_MS);
+          continue;
+        }
         throw err; // "rethrow": not a wall trip (or no seam wired) — legacy propagation
       }
     }

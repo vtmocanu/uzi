@@ -166,6 +166,8 @@ export class FakeApi {
   }> = [];
   private wallParkStatus = "paused";
   private wallParkHttpStatus = 200;
+  // Issue #1600: the budget_total_seconds / budget_used_seconds the wall-park RunDTO carries.
+  private wallParkBudget: { total?: number; used?: number } | undefined;
   // PRD #1226 M4 (D5): the completion-permit endpoint. Records each request (run + body) and answers
   // a configurable decision — {granted:true} by default, or {granted:false, deny_reason} — at a
   // configurable HTTP status (a non-200 models a transport/HTTP error the client THROWS on, distinct
@@ -390,9 +392,10 @@ export class FakeApi {
    *  answers with (default 200/"paused" = a landed park; 409 with a non-"paused" status models a
    *  REFUSED park the client must NOT throw on; a 404/5xx models an UNDELIVERABLE report the client
    *  THROWS on, D17). */
-  setWallParkResponse(status: string, httpStatus = 200): void {
+  setWallParkResponse(status: string, httpStatus = 200, budget?: { total?: number; used?: number }): void {
     this.wallParkStatus = status;
     this.wallParkHttpStatus = httpStatus;
+    this.wallParkBudget = budget;
   }
 
   /** PRD #1226 M4 (D5): set the completion-permit decision. `granted:true` is the issued permit;
@@ -649,9 +652,10 @@ export class FakeApi {
       if (this.wallParkHttpStatus !== 200 && this.wallParkHttpStatus !== 409) {
         return send(res, this.wallParkHttpStatus, { error: "run not found for this worker" });
       }
-      return send(res, this.wallParkHttpStatus, {
-        run: { id: runId, status: this.wallParkStatus },
-      });
+      const run: Record<string, unknown> = { id: runId, status: this.wallParkStatus };
+      if (this.wallParkBudget?.total !== undefined) run.budget_total_seconds = this.wallParkBudget.total;
+      if (this.wallParkBudget?.used !== undefined) run.budget_used_seconds = this.wallParkBudget.used;
+      return send(res, this.wallParkHttpStatus, { run });
     }
 
     return send(res, 404, { error: "not found", path: p });
