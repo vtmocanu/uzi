@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"math"
 	"time"
 
 	"github.com/google/uuid"
@@ -70,10 +71,15 @@ func (s *Service) SyncPipelines(ctx context.Context, repoID uuid.UUID, forgeProj
 	// 2. Watched agent run branches (windowed + capped, newest first). Fetch one past
 	//    the cap so "a full page" and "a branch was dropped" are distinguishable: a
 	//    repo with exactly MaxRefs watched branches drops nothing and must not warn.
+	//    Clamped so an absurd CI_WATCH_MAX_REFS cannot wrap the int32 LIMIT negative.
+	limit := int32(math.MaxInt32)
+	if opts.MaxRefs < math.MaxInt32 {
+		limit = int32(opts.MaxRefs) + 1
+	}
 	refs, err := s.q.ListWatchedRunRefsForRepo(ctx, store.ListWatchedRunRefsForRepoParams{
 		RepoID:        repoID,
 		FinishedAfter: pgtype.Timestamptz{Time: time.Now().Add(-opts.Window), Valid: true},
-		MaxRefs:       int32(opts.MaxRefs + 1),
+		MaxRefs:       limit,
 	})
 	if err != nil {
 		return err
