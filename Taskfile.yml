@@ -2330,6 +2330,18 @@ tasks:
       - go vet ./...
       - go test ./...
 
+  test:home-uid-split:
+    desc: Opt-in run the HOME cleanup suite as the worker uid under the real uid split (#1607)
+    # Builds the base worker image and runs e2e/home-uid-split/fixture.test.ts through its
+    # root entrypoint under compose's hardened cap set, so cleanup runs as uid 10001
+    # against runner-written trees. A host or single-uid run cannot manufacture that
+    # ownership split and a root run passes vacuously, which is why this is not a unit
+    # test. Requires a working docker daemon. NOT wired into gate. Set
+    # HOME_SPLIT_SKIP_BUILD=1 HOME_SPLIT_IMAGE=<tag> to reuse an image, plus
+    # HOME_SPLIT_MOUNT_SRC=1 to test this tree's agent/src against it.
+    cmds:
+      - ./e2e/home-uid-split/run.sh
+
   test:codex-m3a:matrix:
     desc: Opt-in real base and jvm package matrix for amd64 and arm64 with negative controls
     # Builds every actual template/architecture cell. Each Dockerfile executes the positive

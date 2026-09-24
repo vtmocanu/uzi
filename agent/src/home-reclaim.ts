@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { Logger } from "./log.js";
-import { rmTreeForce } from "./rmtree.js";
+import { rmHomeTree } from "./rmtree.js";
 import { RUN_ID_RE } from "./util.js";
 
 /**
@@ -308,7 +308,7 @@ export async function reclaimStrandedRunHomes(
     }
 
     try {
-      await rmTreeForce(dir);
+      await rmHomeTree(dir);
       summary.removed += 1;
     } catch {
       // Do not log the error object: it carries a filesystem path, nothing more,
