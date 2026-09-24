@@ -495,7 +495,7 @@ for RID in "${RUNS[@]}"; do
       # A typed missing-source/no-new-commits result is deterministic; retrying the same
       # pod three times cannot create a clone or tracking ref. Other failures may be a
       # transient kubectl stream break, so retry those.
-      case "$kc_rc" in 3|4|5) break ;; esac
+      case "$kc_rc" in 3|4|5|7) break ;; esac
       [ "$kc_rc" -ne 0 ] && continue
       break
     fi
