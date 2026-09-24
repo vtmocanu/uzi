@@ -54,8 +54,9 @@ func (c *HTTPClient) DownloadRecoveryArchive(ctx context.Context, runID, capture
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		// Dial refused, DNS, TLS, timeout, context deadline, or a refused redirect:
-		// ExitUnreachable, worded by transportExit as with doJSONRead (a timeout reads
-		// "did not respond in time", anything else "cannot reach").
+		// ExitUnreachable, worded by transportExit as with doJSONRead (any timeout,
+		// connect/TLS/DNS timeouts included, reads "did not respond in time",
+		// anything else "cannot reach").
 		return 0, transportExit(c.BaseURL, err)
 	}
 	defer func() { _ = resp.Body.Close() }()

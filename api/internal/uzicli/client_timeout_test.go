@@ -2,6 +2,7 @@ package uzicli
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -120,4 +121,24 @@ func TestTransportExitCanceledIsNotTimeout(t *testing.T) {
 	if got := ExitCodeFor(err); got != ExitUnreachable {
 		t.Errorf("ExitCodeFor = %d, want %d", got, ExitUnreachable)
 	}
+}
+
+// fakeTimeoutErr is a net.Error whose Timeout() is true but which, unlike every
+// timeout the standard library produces today, does NOT match
+// context.DeadlineExceeded: it isolates isTimeout's net.Error branch.
+type fakeTimeoutErr struct{}
+
+func (fakeTimeoutErr) Error() string   { return "fake connect timeout" }
+func (fakeTimeoutErr) Timeout() bool   { return true }
+func (fakeTimeoutErr) Temporary() bool { return true }
+
+// TestTransportExitNetErrorTimeout: a connect timeout surfaced only as a
+// net.Error (Timeout() true, no context.DeadlineExceeded in the chain) still gets
+// the "did not respond in time" wording.
+func TestTransportExitNetErrorTimeout(t *testing.T) {
+	cause := &net.OpError{Op: "dial", Net: "tcp", Err: fakeTimeoutErr{}}
+	if errors.Is(cause, context.DeadlineExceeded) {
+		t.Fatal("fixture matches context.DeadlineExceeded; it no longer isolates the net.Error branch")
+	}
+	assertTimeoutMessage(t, transportExit("http://uzi.example", cause))
 }

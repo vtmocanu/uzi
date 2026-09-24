@@ -22,11 +22,13 @@ import (
 // run_usage leg each time (13.9 s against 60 ms for the custom plan).
 //
 // The assertion is on PLAN SHAPE, never wall-clock: under plan_cache_mode =
-// force_generic_plan, every plan node whose subtree scans run_usage may emit at most
-// 4 × count(*) run_usage rows in total (Actual Rows × Actual Loops). One full fold of the
-// view is ~1× (the window/aggregate levels above the scan each see at most the scanned
-// rows), so a correct plan stays within a small constant of the table, while a per-row
-// re-fold is (runs on the page) × table — here ≥ 300×, far outside the bound. A second,
+// force_generic_plan, every plan node whose subtree scans run_usage may do at most
+// 4 × count(*) run_usage rows of work in total (see nodeWork: Actual Rows × Actual Loops,
+// plus the rows a scan read and discarded by its Filter). One full fold of the view is
+// ~1× (the window/aggregate levels above the scan each see at most the scanned rows), so
+// a correct plan stays within a small constant of the table, while a per-row re-fold
+// repeats the fold once per run row on the page, two orders of magnitude over the table
+// at this seed, far outside the bound. A second,
 // tighter bound applies to the user-scoped reads (see scopedBound): their run_usage scans
 // may touch no more legs than the user owns, which catches a plan that folds EVERY user's
 // usage once per call (the old SelfUsage hash-joined the whole view).
@@ -155,6 +157,8 @@ func TestRunUsageGenericPlanLiveDB(t *testing.T) {
 		scoped          bool
 	}{
 		// $1 background_grace_cutoff, $2 user_id, $3 repo_id (NULL = no filter), $4 issue_iid.
+		// At HEAD ListRunsForUser's plan does not touch run_usage at all: this case guards
+		// against the view join coming back into the run-list query.
 		{"ListRunsForUser", store.ListRunsForUserSQL, cutoff + ", " + u(userID) + ", NULL::uuid, NULL::bigint", true},
 		{"ListRunUsageTotalsForRuns", store.ListRunUsageTotalsForRunsSQL, "'{" + strings.Join(pageIDs, ",") + "}'::uuid[]", true},
 		{"SelfUsage", store.SelfUsageSQL, u(userID), true},
@@ -223,16 +227,18 @@ func TestRunUsageGenericPlanLiveDB(t *testing.T) {
 		}
 		var offenders []string
 		walkUsagePlan(&doc[0].Plan, func(n *planNode) {
-			if total := n.ActualRows * n.ActualLoops; total > bound {
-				offenders = append(offenders, fmt.Sprintf("%s (rows %.0f × loops %.0f = %.0f)", n.NodeType, n.ActualRows, n.ActualLoops, total))
+			if total, _ := nodeWork(n); total > bound {
+				offenders = append(offenders, fmt.Sprintf("%s (rows %.0f + removed by filter %.0f, × loops %.0f = %.0f)",
+					n.NodeType, n.ActualRows, n.RowsRemovedByFilter, n.ActualLoops, total))
 			}
 			if c.scoped && n.RelationName == "run_usage" {
-				// EXPLAIN prints Actual Rows as the per-loop average ROUNDED to an integer, so
-				// rows × loops can overshoot the true total by up to half a row per loop
-				// (1201 legs over 301 loops prints as 4 × 301 = 1204); allow exactly that.
-				if total := n.ActualRows * n.ActualLoops; total > scopedBound+n.ActualLoops/2 {
-					offenders = append(offenders, fmt.Sprintf("%s on run_usage (rows %.0f × loops %.0f = %.0f > the user's own %d legs: folds other users' usage)",
-						n.NodeType, n.ActualRows, n.ActualLoops, total, ownLegs))
+				// EXPLAIN prints each per-loop count as an average ROUNDED to an integer, so
+				// count × loops can overshoot the true total by up to half a row per loop per
+				// rounded count (1201 legs over 301 loops prints as 4 × 301 = 1204); allow
+				// exactly that.
+				if total, rounded := nodeWork(n); total > scopedBound+rounded*n.ActualLoops/2 {
+					offenders = append(offenders, fmt.Sprintf("%s on run_usage (rows %.0f + removed by filter %.0f, × loops %.0f = %.0f > the user's own %d legs: folds other users' usage)",
+						n.NodeType, n.ActualRows, n.RowsRemovedByFilter, n.ActualLoops, total, ownLegs))
 				}
 			}
 		})
@@ -247,12 +253,28 @@ func TestRunUsageGenericPlanLiveDB(t *testing.T) {
 // planNode is the subset of EXPLAIN (ANALYZE, FORMAT JSON) this test reads. InitPlans and
 // SubPlans appear as ordinary children in "Plans", so walking Plans covers them.
 type planNode struct {
-	NodeType     string     `json:"Node Type"`
-	RelationName string     `json:"Relation Name"`
-	IndexName    string     `json:"Index Name"`
-	ActualRows   float64    `json:"Actual Rows"`
-	ActualLoops  float64    `json:"Actual Loops"`
-	Plans        []planNode `json:"Plans"`
+	NodeType            string     `json:"Node Type"`
+	RelationName        string     `json:"Relation Name"`
+	IndexName           string     `json:"Index Name"`
+	ActualRows          float64    `json:"Actual Rows"`
+	ActualLoops         float64    `json:"Actual Loops"`
+	RowsRemovedByFilter float64    `json:"Rows Removed by Filter"`
+	Plans               []planNode `json:"Plans"`
+}
+
+// nodeWork is a node's total row work across all its loops: the rows it emitted, plus,
+// for a scan node (one with a Relation Name), the rows it read and discarded by its
+// Filter. Without the second term a per-outer-row Seq Scan of run_usage filtered down to
+// that row's legs would emit only a few rows per loop and pass, while reading the whole
+// table every loop. It also returns how many per-loop rounded counts the total sums, for
+// the rounding tolerance.
+func nodeWork(n *planNode) (total, roundedCounts float64) {
+	total, roundedCounts = n.ActualRows*n.ActualLoops, 1
+	if n.RelationName != "" {
+		total += n.RowsRemovedByFilter * n.ActualLoops
+		roundedCounts++
+	}
+	return total, roundedCounts
 }
 
 // walkUsagePlan calls visit on every node whose subtree (itself included) scans run_usage,
@@ -281,7 +303,11 @@ func renderPlan(n *planNode, depth int) string {
 	if n.IndexName != "" {
 		fmt.Fprintf(&b, " using %s", n.IndexName)
 	}
-	fmt.Fprintf(&b, " (rows=%.0f loops=%.0f)\n", n.ActualRows, n.ActualLoops)
+	fmt.Fprintf(&b, " (rows=%.0f loops=%.0f", n.ActualRows, n.ActualLoops)
+	if n.RowsRemovedByFilter > 0 {
+		fmt.Fprintf(&b, " removed_by_filter=%.0f", n.RowsRemovedByFilter)
+	}
+	b.WriteString(")\n")
 	for i := range n.Plans {
 		b.WriteString(renderPlan(&n.Plans[i], depth+1))
 	}

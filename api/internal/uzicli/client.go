@@ -838,7 +838,8 @@ func (c *HTTPClient) doJSONRead(ctx context.Context, method, path string, reqBod
 	if err != nil {
 		// Any error from Do is a transport failure (dial refused, DNS, TLS,
 		// timeout, context deadline): exit ExitUnreachable either way, but
-		// transportExit words a timeout differently from a connection failure.
+		// transportExit words any timeout (including a connect/TLS/DNS timeout)
+		// differently from a non-timeout connection failure.
 		return nil, nil, transportExit(c.BaseURL, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
@@ -930,11 +931,13 @@ func decode2xx(resp *http.Response, body []byte, path string, out any) error {
 }
 
 // transportExit maps an error from http.Client.Do to the ExitUnreachable
-// *ExitError. A timeout (the caller's context deadline, or the http.Client
-// Timeout, which surfaces as a *url.Error whose Timeout() is true) is worded as
-// "did not respond in time" rather than "cannot reach": the server may be
-// reachable but slow, and the old wording pointed an investigation at the network
-// first. context.Canceled is not a timeout and keeps the "cannot reach" wording.
+// *ExitError. Any timeout (see isTimeout) is worded as "did not respond in time
+// (the server may be slow or unreachable)" rather than "cannot reach": the server
+// may be reachable but slow, and the old wording pointed an investigation at the
+// network first. That includes a connect, TLS-handshake or DNS timeout, which is
+// why the wording still names "unreachable". A refused connection, a DNS
+// no-such-host, a TLS verification failure, context.Canceled or any other
+// non-timeout error keeps the "cannot reach" wording.
 func transportExit(baseURL string, err error) *ExitError {
 	if isTimeout(err) {
 		return Exitf(ExitUnreachable, "uzi at %s did not respond in time (the server may be slow or unreachable): %v", baseURL, transportMsg(err))
@@ -944,7 +947,9 @@ func transportExit(baseURL string, err error) *ExitError {
 
 // isTimeout reports whether err is a deadline/timeout: context.DeadlineExceeded
 // anywhere in the chain, or a net.Error (which *url.Error implements) whose
-// Timeout() is true.
+// Timeout() is true. On current Go the caller's context deadline, the
+// http.Client Timeout and a dial timeout all match BOTH checks; the net.Error
+// check is kept for a timeout that does not wrap context.DeadlineExceeded.
 func isTimeout(err error) bool {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return true
