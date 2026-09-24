@@ -73,6 +73,7 @@ function makeHarness(opts: { mutate?: (patched: string) => string } = {}): Harne
   const token = path.join(root, "token");
   const stubDir = path.join(root, "stubs");
   const opLog = path.join(root, "ops.log");
+  const codexCmdCache = path.join(root, "codex-cmd-cache");
   fs.mkdirSync(stubDir);
   fs.writeFileSync(opLog, "");
 
@@ -154,9 +155,12 @@ function makeHarness(opts: { mutate?: (patched: string) => string } = {}): Harne
     .replace("BUSYBOX=/bin/busybox", `BUSYBOX=${path.join(stubDir, "busybox")}`)
     .replace("DATA_DIR=/data", `DATA_DIR=${data}`)
     .replace("NIX_DIR=/nix", `NIX_DIR=${nix}`)
+    // Issue #1598: keep the Codex command-cache root inside the sandbox, never the host's
+    // /var/cache. Its own behaviour is covered by entrypoint-codex-cache.test.ts.
+    .replace("CODEX_CMD_CACHE_DIR=/var/cache/uzi-codex-cmd", `CODEX_CMD_CACHE_DIR=${codexCmdCache}`)
     .replace("TOKEN=/run/secrets/worker_token", `TOKEN=${token}`);
   // Every constant we depend on must actually have been rewritten.
-  for (const marker of [stubDir, data, nix, token]) {
+  for (const marker of [stubDir, data, nix, token, codexCmdCache]) {
     assert.ok(patched.includes(marker), `entrypoint patch did not apply for ${marker}`);
   }
   const finalText = opts.mutate ? opts.mutate(patched) : patched;

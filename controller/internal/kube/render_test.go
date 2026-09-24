@@ -1122,8 +1122,13 @@ func TestDindContainersMountNoneOfTheWorkersVolumes(t *testing.T) {
 	// side must touch none of them, by EITHER name or mount path — POSTURE-INDEPENDENT.
 	// (The shared run workdir at dindWorkdirDir is a SEPARATE no-secrets emptyDir; it is
 	// deliberately not in this set — M-workdir shares only it, never token/data/nix.)
-	forbiddenNames := map[string]bool{"token": true, "data": true, "nix": true}
-	forbiddenPaths := map[string]bool{secretMountPath: true, dataMountPath: true, nixMountPath: true, nixSeedMountPath: true}
+	// The Codex command-cache emptyDir (issue #1598) is worker-only too: the dind side must
+	// never see the untrusted build caches uid 10003 writes there.
+	forbiddenNames := map[string]bool{"token": true, "data": true, "nix": true, codexCmdCacheVolume: true}
+	forbiddenPaths := map[string]bool{
+		secretMountPath: true, dataMountPath: true, nixMountPath: true, nixSeedMountPath: true,
+		codexCmdCacheDir: true,
+	}
 
 	for _, p := range dindPostures() {
 		t.Run(p.name, func(t *testing.T) {
@@ -1155,6 +1160,79 @@ func TestDindContainersMountNoneOfTheWorkersVolumes(t *testing.T) {
 			}
 			if checked != wantChecked {
 				t.Fatalf("expected to check %d dind container(s), checked %d", wantChecked, checked)
+			}
+		})
+	}
+}
+
+// The Codex command-cache root (issue #1598) is a worker-only emptyDir with NO sizeLimit,
+// rendered for every worker pod (plain and both docker postures, uid split on or off): the
+// `worker` container mounts it exactly once at codexCmdCacheDir, and no init or sidecar
+// container (seed-nix, dind-init, dind) mounts it by name or path. A sizeLimit would be an
+// eviction path of its own, the same trap ephemeralRequest's header documents for
+// limits.ephemeral-storage.
+func TestCodexCmdCacheIsAWorkerOnlyEmptyDirWithNoSizeLimit(t *testing.T) {
+	split := func(cfg RenderConfig) RenderConfig { cfg.UIDSplit = true; return cfg }
+	for _, tc := range []struct {
+		name string
+		cfg  RenderConfig
+		w    protocol.DesiredWorker
+	}{
+		{"plain", testConfig(), desired("abc")},
+		{"plain uid-split", split(testConfig()), desired("abc")},
+		{"docker rootless", dockerTestConfig(), desiredDocker("abc")},
+		{"docker non-rootless uid-split", split(dockerTestConfigNonRootless()), desiredDocker("abc")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := RenderDeployment(tc.cfg, tc.w, testSpec(t, "base", "m")).Spec.Template.Spec
+
+			if len(pod.Containers) != 1 || pod.Containers[0].Name != workerContainerName {
+				t.Fatalf("expected exactly the worker container, got %d container(s)", len(pod.Containers))
+			}
+			var workerMounts []corev1.VolumeMount
+			for _, vm := range pod.Containers[0].VolumeMounts {
+				if vm.Name == codexCmdCacheVolume || vm.MountPath == codexCmdCacheDir {
+					workerMounts = append(workerMounts, vm)
+				}
+			}
+			want := corev1.VolumeMount{Name: codexCmdCacheVolume, MountPath: codexCmdCacheDir}
+			if len(workerMounts) != 1 || !reflect.DeepEqual(workerMounts[0], want) {
+				t.Errorf("worker cache mounts = %+v, want exactly [%+v]", workerMounts, want)
+			}
+
+			if len(pod.InitContainers) == 0 {
+				t.Fatal("no init containers rendered; the worker-only assertion would be vacuous")
+			}
+			for _, c := range pod.InitContainers {
+				for _, vm := range c.VolumeMounts {
+					if vm.Name == codexCmdCacheVolume || vm.MountPath == codexCmdCacheDir {
+						t.Errorf("init/sidecar container %q mounts the Codex command cache (%+v); it is worker-only", c.Name, vm)
+					}
+				}
+			}
+
+			var vols []corev1.Volume
+			for _, v := range pod.Volumes {
+				if v.Name == codexCmdCacheVolume {
+					vols = append(vols, v)
+				}
+			}
+			if len(vols) != 1 {
+				t.Fatalf("expected exactly one %q volume, got %d", codexCmdCacheVolume, len(vols))
+			}
+			ed := vols[0].EmptyDir
+			if ed == nil {
+				t.Fatalf("%q must be an emptyDir (per-pod, never beside the data PVC's credentials), got %+v",
+					codexCmdCacheVolume, vols[0].VolumeSource)
+			}
+			if ed.SizeLimit != nil {
+				t.Errorf("%q declares sizeLimit %s. NEVER set one: a sizeLimit is an eviction path of its own; "+
+					"per-run cleanup bounds this cache. Read ephemeralRequest's header in render.go.",
+					codexCmdCacheVolume, ed.SizeLimit.String())
+			}
+			if ed.Medium != corev1.StorageMediumDefault {
+				t.Errorf("%q medium = %q, want the node-disk default (a tmpfs would charge the cache to memory)",
+					codexCmdCacheVolume, ed.Medium)
 			}
 		})
 	}

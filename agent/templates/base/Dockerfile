@@ -397,6 +397,15 @@ RUN bash /tmp/codex/assert-codex.sh \
 COPY agent/codex/supervisor /build/uzi-codex-supervisor
 RUN cd /build/uzi-codex-supervisor && export GOTOOLCHAIN=local CGO_ENABLED=0 GOFLAGS="-mod=vendor -buildvcs=false" && go build -trimpath -o /usr/local/bin/uzi-codex-supervisor . && chmod 0555 /usr/local/bin/uzi-codex-supervisor && go build -trimpath -o /usr/local/bin/uzi-codex-fileop ./fileop && chmod 0555 /usr/local/bin/uzi-codex-fileop && go build -trimpath -o /usr/local/bin/uzi-codex-command-sandbox ./cmdsandbox && chmod 0555 /usr/local/bin/uzi-codex-command-sandbox && rm -rf /build/uzi-codex-supervisor
 RUN addgroup -g 10004 codex-session && addgroup worker codex-session && addgroup runner codex-session
+# Issue #1598: the Codex command-cache ROOT. The supervisor's uid-10003 cache holder puts
+# ONE random per-run dir here carrying GOMODCACHE, GOCACHE and the npm cache, instead of a
+# per-command /tmp dir that re-downloads the module cache on every command. Baked root-owned
+# 0755 only so the path exists; the ROOT-started entrypoint re-owns it runner-cmd
+# (10003:10003) 0700 every boot, so worker 10001 and runner 10002 cannot traverse it. A
+# storage boundary, not a trust boundary. In compose it lives in the container writable
+# layer; on k8s the controller mounts a worker-only emptyDir over it. Per-run cleanup (the
+# supervisor's reaper) bounds its size.
+RUN mkdir -p /var/cache/uzi-codex-cmd && chmod 0755 /var/cache/uzi-codex-cmd
 
 COPY agent/tsconfig.json ./
 COPY agent/src ./src

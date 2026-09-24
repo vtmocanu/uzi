@@ -106,6 +106,25 @@ const (
 	// a reseed, not to run as /data.
 	dataSeedMountPath = "/data-seed"
 
+	// codexCmdCacheVolume / codexCmdCacheDir: the Codex command-cache root (issue #1598).
+	// The supervisor's uid-10003 cache holder puts ONE random per-run dir here carrying
+	// GOMODCACHE, GOCACHE and the npm cache for the run's Codex commands; the ROOT-started
+	// entrypoint re-owns the root runner-cmd (10003:10003) 0700, so it is inert without the
+	// uid split (UIDSplit) but rendered for every worker pod so the pod shape does not fork
+	// on it. It is mounted into the `worker` container ONLY, never into seed-nix, dind-init
+	// or dind.
+	//
+	// Why an emptyDir: it is per-pod, so untrusted build caches never persist beside the
+	// credentials and resume state on the data PVC, and it is neither the checkout nor the
+	// dind-shared run workdir (dindWorkdirDir), so a `docker run -v` never sees it. Its
+	// bytes count toward the pod's ephemeral-storage usage and so toward the kubelet's
+	// eviction ranking against the worker's REQUEST (see ephemeralRequest); it carries NO
+	// sizeLimit on purpose, because a sizeLimit is an eviction path of its own (the same
+	// argument as the no-`limits.ephemeral-storage` rule). What bounds it is per-run
+	// cleanup: the supervisor's reaper deletes each run's dir.
+	codexCmdCacheVolume = "codex-cmd-cache"
+	codexCmdCacheDir    = "/var/cache/uzi-codex-cmd"
+
 	// toolchainProfileMarker is the image-baked toolchain-identity file (PRD #92 M1):
 	// `readlink -f /opt/uzi-toolchain`, the realized nix store profile path — the
 	// "store hash". Keying the reseed on this (NOT the image appVersion) fires a
@@ -805,9 +824,11 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 	}
 
 	// Init containers, worker volume mounts and pod volumes all grow (only) for a
-	// docker worker. Built as slices so the NON-docker render stays byte-identical to
-	// #58 — same spec hash, so enabling docker in the product never rolls an existing
-	// plain worker.
+	// docker worker. Built as slices so enabling docker in the product never changes the
+	// NON-docker render (same spec hash), so it never rolls an existing plain worker. The
+	// base set is [token, data, nix, codex-cmd-cache]; the codex-cmd-cache entry (issue
+	// #1598) is rendered for EVERY worker, so the controller upgrade that adds it rolls
+	// each worker once.
 	initContainers := []corev1.Container{{
 		Name: seedContainerName,
 		// The SAME per-template agent image as the worker, so the store it copies is
@@ -839,6 +860,8 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 		{Name: "token", MountPath: secretMountPath, ReadOnly: true},
 		{Name: "data", MountPath: dataMountPath},
 		{Name: "nix", MountPath: nixMountPath},
+		// Worker-only (issue #1598): see codexCmdCacheDir.
+		{Name: codexCmdCacheVolume, MountPath: codexCmdCacheDir},
 	}
 	volumes := []corev1.Volume{
 		{
@@ -871,6 +894,13 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 					ClaimName: nixPVCName(w.ID),
 				},
 			},
+		},
+		// The Codex command-cache root (issue #1598). An emptyDir with NO SizeLimit: see
+		// codexCmdCacheDir for why, and ephemeralRequest's header for why no limit of any
+		// kind is declared.
+		{
+			Name:         codexCmdCacheVolume,
+			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
 		},
 	}
 	if w.Docker {
@@ -1007,11 +1037,11 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 					},
 				},
 				SecurityContext: workerSecurity,
-				// Built above: [token, data, nix] plus, for a docker worker, the shared
+				// Built above: [token, data, nix, codex-cmd-cache] plus, for a docker worker, the shared
 				// run workdir (M-workdir) and — rootless only — the shared socket dir.
 				VolumeMounts: workerMounts,
 			}},
-			// Built above: [token, data, nix] plus, for a docker worker, the daemon's
+			// Built above: [token, data, nix, codex-cmd-cache] plus, for a docker worker, the daemon's
 			// private data-root PVC (issue #224 M-a) + the shared run workdir emptyDir
 			// (and, rootless only, the shared socket-dir emptyDir).
 			Volumes: volumes,
