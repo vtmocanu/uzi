@@ -56,6 +56,8 @@ import {
   type RecoveryReleaseResponse,
   type RecoveryReleaseRequest,
   type RecoveryHoldsResponse,
+  type RecoverySettleRequest,
+  type RecoverySettleResponse,
 } from "./protocol.js";
 
 /** Error carrying the server's HTTP status + (truncated) body for retry logic. */
@@ -839,6 +841,29 @@ export class WorkerClient {
     return (await this.getJSON(
       `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/recovery-holds`,
     )) as RecoveryHoldsResponse;
+  }
+
+  /** settleRecoveryHold asks the api to settle ONE older-generation custody hold on a completed
+   *  run by ANCESTRY (issue #1582): POST /runs/{id}/recovery-holds/{holdID}/settle with the strict
+   *  candidate body. The api proves ancestry through the forge itself; the worker never sends a
+   *  verdict. Throws RequestError on 4xx/5xx (429/5xx/404 are retried later by the caller). */
+  async settleRecoveryHold(
+    runId: string,
+    holdId: string,
+    req: RecoverySettleRequest,
+  ): Promise<RecoverySettleResponse> {
+    // Build the body field-by-field so nothing beyond the five strict fields can ride along.
+    const body: RecoverySettleRequest = {
+      predecessor_generation: req.predecessor_generation,
+      successor_generation: req.successor_generation,
+      pushed_sha: req.pushed_sha,
+      source_sha: req.source_sha,
+      adopted_sha: req.adopted_sha,
+    };
+    return (await this.postJSON(
+      `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/recovery-holds/${encodeURIComponent(holdId)}/settle`,
+      body,
+    )) as RecoverySettleResponse;
   }
 
   async getInputs(runId: string): Promise<{ inputs: UserInput[]; credentialSwitch?: { generation: number } }> {

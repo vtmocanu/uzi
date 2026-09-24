@@ -16,6 +16,9 @@ import { errMessage, sleep } from "./util.js";
 import { toolchainPreflight, type PreflightResult } from "./toolchain-preflight.js";
 import { CODEX_CUSTOM_MODEL_CAPABILITY, CODEX_HARNESS_CAPABILITY } from "./codex/codex-runtime-probe.js";
 
+/** issue #1582 M2: default re-sweep interval of the ancestry-settlement journal. */
+const SETTLEMENT_SWEEP_MS = 5 * 60_000;
+
 /**
  * Outbound-only worker loop (a daemon model): register once, heartbeat on
  * an interval, and poll for claims. No inbound ports.
@@ -59,6 +62,9 @@ export class Worker {
     // concurrency/semaphore unit tests that never negotiate the feature — buildActiveSnapshot
     // then returns undefined and no snapshot is ever sent.
     private readonly activeRuns?: ActiveRunRegistry,
+    // issue #1582 M2: the interval (ms) of the ancestry-settlement re-sweep. Test seam; production
+    // uses the 5-minute default.
+    private readonly settlementSweepMs: number = SETTLEMENT_SWEEP_MS,
   ) {}
 
   /** PRD #1391 M2: single-flight guard — never two outbox drains at once (a heartbeat
@@ -122,8 +128,25 @@ export class Worker {
     // background above. The heartbeat promise is created once and awaited alongside the claim loops.
     const heartbeat = this.heartbeatLoop(signal);
     await this.resolveBootTerminals(signal);
+    // issue #1582 M2: ONLY after the boot pending-terminal gate, start the ancestry-settlement loop
+    // alongside the claim loops (it never gates them): an immediate sweep of every due
+    // `pending_settle` record, then a re-sweep on a timer until abort. No forge credential needed.
+    const settlement = this.settlementLoop(signal);
     // The run lane and the chat lane join the already-running heartbeat until abort.
-    await Promise.all([heartbeat, this.claimLoop(signal), this.chatClaimLoop(signal)]);
+    await Promise.all([heartbeat, settlement, this.claimLoop(signal), this.chatClaimLoop(signal)]);
+  }
+
+  /** issue #1582 M2: sweep the settlement journal now, then every `settlementSweepMs` until the
+   *  signal aborts. Never throws (a failed sweep is logged and retried at the next tick). */
+  private async settlementLoop(signal: AbortSignal): Promise<void> {
+    while (!signal.aborted) {
+      try {
+        await this.runner.settlePendingPredecessors(signal);
+      } catch (err) {
+        this.log.warn("recovery settlement: sweep failed", { error: errMessage(err) });
+      }
+      await sleep(this.settlementSweepMs, signal);
+    }
   }
 
   /**

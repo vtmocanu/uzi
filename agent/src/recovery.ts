@@ -201,8 +201,9 @@ export interface RecoveryCoordinatorOptions {
 const JOURNAL_KEY_LABEL = "uzi-recovery-journal-v1";
 const JOURNAL_VERSION = 1 as const;
 
-/** Stable, key-sorted JSON so the MAC is deterministic regardless of insertion order. */
-function canonicalJson(value: unknown): string {
+/** Stable, key-sorted JSON so the MAC is deterministic regardless of insertion order. Shared
+ *  with the issue #1582 settlement journal (recovery-settlement.ts). */
+export function canonicalJson(value: unknown): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
   if (Array.isArray(value)) return `[${value.map((v) => canonicalJson(v)).join(",")}]`;
   const obj = value as Record<string, unknown>;
@@ -626,6 +627,17 @@ export class RecoveryCoordinator {
         }
       }
     }
+  }
+
+  /**
+   * issue #1582 M2 — drop the local journal record(s) + bundle files of ONE predecessor
+   * generation whose custody hold the api RELEASED by ancestry settlement. Generation-scoped
+   * exactly like a real exact-generation {@link release}: every sibling generation's record stays.
+   * Local-only (no RPC); the caller invokes it only after a `released` settle outcome.
+   */
+  async forgetGeneration(runId: string, generation: number): Promise<void> {
+    if (!this.enabled) return;
+    await this.removeGenerationRecords(runId, generation);
   }
 
   /** All AUTHENTICATED records for a run (a tampered/unreadable record is omitted, never

@@ -37,6 +37,12 @@ import type { ActiveRunRegistry } from "./active-run-registry.js";
 import { deriveCloneKey, resolveRunKind, RUN_KIND_PROFILES } from "./run-kind.js";
 import { RecoveryCoordinator, isCodePublishingKind, type RecoveryRecord } from "./recovery.js";
 import {
+  PredecessorSettler,
+  SettlementJournal,
+  type RecoverySettleClient,
+  type SettlementRecord,
+} from "./recovery-settlement.js";
+import {
   describeRepoAgentNote,
   detectRepoAgents,
   repoAgentSummaries,
@@ -860,6 +866,11 @@ export interface RunnerOptions {
   /** PRD #1296 M3 — inject a pre-built recovery coordinator (a fake client/git) for tests;
    *  production builds one from the run lane's own client + git cache + join token. */
   recovery?: RecoveryCoordinator;
+  /** issue #1582 M2 — inject a pre-built ancestry-settlement journal for tests; production builds
+   *  one over `git.recoverySettlementRoot` keyed from the join token (absent ⇒ disabled). */
+  settlement?: SettlementJournal;
+  /** issue #1582 M2 — the settle RPC client for tests; production uses the run lane's client. */
+  settleClient?: RecoverySettleClient;
   /** PRD #1391 M2 — the worker-owned message outbox the batcher SPILLS to after a
    *  sustained transient outage (instead of tripping). main.ts builds + inits it once
    *  and injects it here + into the Worker + ChatRunner. Undefined ⇒ the batcher keeps
@@ -925,6 +936,10 @@ export class RunRunner {
   /** PRD #1296 M3 — durable-recovery capture/journal/upload coordinator (D1/D3/D5).
    *  Disabled when the worker has no join token (a token-less test harness). */
   private readonly recovery: RecoveryCoordinator;
+  /** issue #1582 M2 — the authenticated ancestry-settlement journal (adopted predecessor holds)
+   *  and the settler that drives the api settle for them. Disabled without a worker token. */
+  private readonly settlement: SettlementJournal;
+  private readonly settler: PredecessorSettler;
   /** PRD #1391 M2 — the worker message outbox the batcher spills to, the shared re-arm
    *  registry, the spill trip window and the spill-buffer cap. All threaded into every
    *  run's MessageBatcher; `outbox`/`rearm` undefined ⇒ today's trip behaviour. */
@@ -1042,6 +1057,28 @@ export class RunRunner {
         workerToken: this.joinToken,
         now: opts.now,
       });
+    // issue #1582 M2 — the settlement journal is a SIBLING of recovery/ (never inside it), keyed
+    // from the join token under its own domain-separation label.
+    this.settlement =
+      opts.settlement ??
+      new SettlementJournal({
+        root: this.git.recoverySettlementRoot,
+        workerToken: this.joinToken,
+        log: this.log,
+        now: opts.now,
+      });
+    const recovery = this.recovery;
+    const gitCache = this.git;
+    this.settler = new PredecessorSettler({
+      journal: this.settlement,
+      client: opts.settleClient ?? this.client,
+      cleanup: {
+        deleteSettlementRefs: (bare, runId, holdId) => gitCache.deleteSettlementRefs(bare, runId, holdId),
+        deleteRecoveryPin: (bare, runId, gen) => gitCache.deleteRecoveryPin(bare, runId, gen),
+        forgetGeneration: (runId, gen) => recovery.forgetGeneration(runId, gen),
+      },
+      log: this.log,
+    });
     this.detect = opts.detectRepoAgents ?? detectRepoAgents;
     this.checkRunner = opts.checkRunner;
     // PRD #1391 M2: spill collaborators, threaded into each run's batcher (buildFlight).
@@ -1085,6 +1122,28 @@ export class RunRunner {
   async resumePendingRecoveries(signal?: AbortSignal): Promise<void> {
     await this.recovery.resumePending(signal).catch((err) => {
       this.log.warn("recovery: resume sweep failed", { error: errMessage(err) });
+    });
+  }
+
+  /**
+   * issue #1582 M2 — the restart/retry sweep of the ancestry-settlement journal (called by the
+   * worker after the boot pending-terminal gate, then on a timer). Settles every DUE
+   * `pending_settle` record with NO forge credential (the api proves ancestry itself). A run whose
+   * completion is still an unresolved pending terminal in the outbox is skipped until it resolves.
+   * Records still `adopted` (no pushed head) are never sent. Best-effort; never throws.
+   */
+  async settlePendingPredecessors(signal?: AbortSignal): Promise<void> {
+    const outbox = this.outbox;
+    const pendingRuns = (): Set<string> => {
+      try {
+        return new Set((outbox?.listPendingTerminals() ?? []).map((e) => e.run_id));
+      } catch {
+        return new Set();
+      }
+    };
+    const pending = pendingRuns();
+    await this.settler.sweep(signal, (runId) => pending.has(runId)).catch((err) => {
+      this.log.warn("recovery settlement: sweep failed", { error: errMessage(err) });
     });
   }
 
@@ -2678,6 +2737,7 @@ export class RunRunner {
     // so every error is swallowed. Runs AFTER the state report lands.
     const driveRecoveryTerminal = async (
       body: Parameters<RunFlight["reportState"]>[0],
+      ack?: StateAck,
     ): Promise<void> => {
       const status = (body as { status?: string }).status;
       try {
@@ -2705,6 +2765,14 @@ export class RunRunner {
               ? "publication"
               : undefined;
           await this.recovery.release(claim.run_id, claim.claim_generation, releaseEvidence);
+          // issue #1582 M2: only once the completion is ACKNOWLEDGED — the ack reads the run
+          // `completed` (applied now, or already terminal-completed), or an applied ack carries no
+          // status (an older server) — ask the api to settle each adopted predecessor hold whose
+          // pushed head was persisted before this report. An ack naming any OTHER status (the
+          // server failed the run instead) settles nothing. Best-effort; the worker sweep retries.
+          if (ack && (ack.status === "completed" || (ack.status === undefined && ack.applied))) {
+            await this.settler.settleRun(claim.run_id);
+          }
         } else if (status === "failed" || status === "cancelled") {
           const capBarePath = flight.barePath;
           if (!capBarePath) return;
@@ -2748,7 +2816,7 @@ export class RunRunner {
     };
     const reportState = async (body: Parameters<RunFlight["reportState"]>[0]) => {
       const res = await flight.reportState(body, boundarySignal);
-      await driveRecoveryTerminal(body);
+      await driveRecoveryTerminal(body, res);
       return res;
     };
     const closeBatcher = () => batcher.close(boundarySignal);
@@ -2756,8 +2824,12 @@ export class RunRunner {
     // `reportState` choke point (which stamps claim_generation and drives recovery). The caller must
     // have closed the batcher first, so the fence is the durable emitted tail. Every terminal site in
     // this phase routes through here instead of a raw `reportState(body)`.
-    const journalTerminalReport = (body: Parameters<RunFlight["reportState"]>[0]) =>
-      this.journalAndSendTerminal(flight, TERMINAL_JOURNAL_PHASE, body, reportState);
+    // issue #1582 M2: a completed report with a pushed branch first persists the successor's pushed
+    // head on this run's adopted settlement records (write-ahead of the report itself).
+    const journalTerminalReport = async (body: Parameters<RunFlight["reportState"]>[0]) => {
+      await this.persistSettlementPushedHead(claim, flight, body);
+      await this.journalAndSendTerminal(flight, TERMINAL_JOURNAL_PHASE, body, reportState);
+    };
     const finishCommittedPublish = async (
       body: Parameters<RunFlight["reportState"]>[0],
       logMessage: string,
@@ -2768,9 +2840,10 @@ export class RunRunner {
           await batcher.close();
           // Journal write-ahead here too (D3): the deferred Codex sink sends through
           // flight.reportState + driveRecoveryTerminal, so wrap that pair as the resolve `send`.
+          await this.persistSettlementPushedHead(claim, flight, body);
           await this.journalAndSendTerminal(flight, TERMINAL_JOURNAL_PHASE, body, async (b) => {
             const res = await flight.reportState(b);
-            await driveRecoveryTerminal(b);
+            await driveRecoveryTerminal(b, res);
             return res;
           });
           runLog.info(logMessage, fields);
@@ -6710,12 +6783,125 @@ export class RunRunner {
             capture_state: h.capture_state,
           })),
         });
+        await this.recordAdoptionEvidence(claim, flight, holds);
       }
     } catch (err) {
       flight.runLog.warn(
         "recovery: generation-evidence pin/inventory failed (source stays protected by the server hold)",
         { run_id: claim.run_id, error: errMessage(err) },
       );
+    }
+  }
+
+  /**
+   * issue #1582 M2 — record ADOPTION evidence for each inventoried OLDER-generation hold whose work
+   * this generation adopted: only when the clone was seeded from this run's own tracking ref or its
+   * own mirrored checkpoint (never a default/origin reseed). For each hold with generation below
+   * the current claim generation, the predecessor's source comes ONLY from its MAC-authenticated
+   * recovery-journal record for that exact generation (none/invalid ⇒ skip, the hold stays
+   * retained). The source and adopted tip are pinned under `refs/uzi-settle/...` (both must be
+   * present in the bare) before the record is written. Best-effort, local and credential-free.
+   */
+  private async recordAdoptionEvidence(
+    claim: ClaimResponse,
+    flight: RunFlight,
+    holds: Array<{ hold_id: string; generation: number }>,
+  ): Promise<void> {
+    if (!this.settlement.enabled) return;
+    const clone = flight.runnerClone;
+    const barePath = flight.barePath;
+    const successor = claim.claim_generation;
+    if (!clone || !barePath || successor === undefined) return;
+    if (clone.seededFrom !== "tracking" && clone.seededFrom !== "checkpoint") return;
+    const seededFrom = clone.seededFrom;
+    try {
+      const records = await this.recovery.inspect(claim.run_id);
+      for (const hold of holds) {
+        if (!Number.isSafeInteger(hold.generation) || hold.generation >= successor) continue;
+        const pred = records.find((r) => r.generation === hold.generation);
+        if (!pred) continue; // no authenticated predecessor source → no evidence; hold retained
+        const pinned = await this.git.pinSettlementRefs(barePath, claim.run_id, hold.hold_id, {
+          source: pred.sourceSha,
+          adopted: clone.baseCommit,
+        });
+        if (!pinned) continue;
+        const record: SettlementRecord = {
+          version: 1,
+          runId: claim.run_id,
+          holdId: hold.hold_id,
+          predecessorGeneration: hold.generation,
+          successorGeneration: successor,
+          sourceSha: pred.sourceSha,
+          sourceCaptureId: pred.captureId,
+          adoptedSha: clone.baseCommit,
+          seededFrom,
+          branch: clone.branch,
+          barePath,
+          createdAt: this.now(),
+          state: "adopted",
+          attempts: 0,
+        };
+        if (await this.settlement.put(record)) {
+          flight.runLog.info("recovery settlement: adoption evidence recorded for a predecessor hold", {
+            run_id: claim.run_id,
+            hold_id: hold.hold_id,
+            predecessor_generation: hold.generation,
+            successor_generation: successor,
+            seeded_from: seededFrom,
+          });
+        }
+      }
+    } catch (err) {
+      flight.runLog.warn("recovery settlement: adoption evidence not recorded (predecessor hold retained)", {
+        run_id: claim.run_id,
+        error: errMessage(err),
+      });
+    }
+  }
+
+  /**
+   * issue #1582 M2 — BEFORE a completed report with a pushed branch is sent, persist the
+   * successor's pushed head on every `adopted` settlement record of this run and move it to
+   * `pending_settle` (disposition `publication`), pinning the head under `.../pushed`. A completion
+   * with no branch (report_only / not_code) leaves the records untouched. Best-effort.
+   */
+  private async persistSettlementPushedHead(
+    claim: ClaimResponse,
+    flight: RunFlight,
+    body: Parameters<RunFlight["reportState"]>[0],
+  ): Promise<void> {
+    if (!this.settlement.enabled) return;
+    const b = body as StateRequest;
+    if (b.status !== "completed" || typeof b.branch !== "string" || b.branch === "") return;
+    const barePath = flight.barePath;
+    if (!barePath) return;
+    try {
+      const adopted = (await this.settlement.listRun(claim.run_id)).filter(
+        (r) => r.state === "adopted" && r.successorGeneration === claim.claim_generation,
+      );
+      if (adopted.length === 0) return;
+      // The interlocked completion carries the exact permitted head; otherwise read the landed tip
+      // off the tracking ref the finalize push wrote.
+      const pushed =
+        typeof b.head === "string" && /^[0-9a-f]{40}$/.test(b.head)
+          ? b.head
+          : await this.git.trackingTip(barePath, b.branch);
+      if (!pushed) return;
+      for (const rec of adopted) {
+        const pinned = await this.git.pinSettlementRefs(barePath, rec.runId, rec.holdId, { pushed });
+        if (!pinned) continue;
+        await this.settlement.put({
+          ...rec,
+          pushedSha: pushed,
+          disposition: "publication",
+          state: "pending_settle",
+        });
+      }
+    } catch (err) {
+      flight.runLog.warn("recovery settlement: pushed head not persisted (predecessor holds retained)", {
+        run_id: claim.run_id,
+        error: errMessage(err),
+      });
     }
   }
 
