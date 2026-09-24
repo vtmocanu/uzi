@@ -56,8 +56,8 @@ WHERE ps.repo_id = ANY(@repo_ids::uuid[]) AND ps.ref = r.default_branch;
 -- mr_state per-run on issue-LESS runs, so this is not "newest run per issue"
 -- unqualified.) A run has no branch until the worker creates its worktree, so blank
 -- branches are excluded; the row returns the newest run's mr_iid, and the outer
--- ORDER BY + LIMIT keeps the newest @max_refs branches (hitting the cap is logged
--- caller-side).
+-- ORDER BY + LIMIT keeps the newest @max_refs branches (the caller passes cap+1 and
+-- logs entering/leaving the capped state, issue #1483).
 WITH latest_per_branch AS (
     SELECT DISTINCT ON (r.branch)
            r.branch, r.mr_iid, r.mr_state, r.status, r.finished_at, r.created_at

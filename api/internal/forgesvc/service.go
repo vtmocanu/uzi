@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"regexp"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -182,6 +183,13 @@ type Service struct {
 	// state (issue #853). Optional (nil-safe): set via SetReworkCanceller, unset means
 	// the mid-flight abort is skipped — every other MR-sync behaviour is unaffected.
 	reworkCanceller ReworkCanceller
+
+	// cappedRepos remembers which repos' pipeline watch dropped branches at the ref
+	// cap on their last sync, so SyncPipelines logs the transition into and out of
+	// the capped state rather than once per tick (issue #1483). Lazily initialised;
+	// guarded by cappedMu because the handlers and the poller share one Service.
+	cappedMu    sync.Mutex
+	cappedRepos map[uuid.UUID]bool
 }
 
 // ReworkCanceller aborts an active mr_rework run when its MR leaves the opened
