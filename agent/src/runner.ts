@@ -237,6 +237,7 @@ function shutdownOutcomeOf(
 /** issue #1597 M2: the class one run of the checkpoint body ended in (the mid-turn tick logs it).
  *  `publish_failed:<reason>` carries the {@link PublishFailClass} of a publish that did not land. */
 type CheckpointBodyOutcome =
+  | "scan_deferred"
   | "published"
   | "time_gate_closed"
   | "no_new_work"
@@ -263,9 +264,9 @@ type CheckpointBodyOpts = Parameters<NonNullable<RunContext["checkpoint"]>>[0] &
 /** issue #1597 M2: the hard cap on one mid-turn tick (probe excluded): its signal aborts at this
  *  deadline, killing every child it spawned. */
 const MIDTURN_TICK_TIMEOUT_MS = 120_000;
-/** issue #1597 M2 (review item 7): the share of codexBoundaryDeadlineMs a secret scan may use
- *  inside a Codex permit (the rest covers the reap, fetch-back, pack and publish). */
-const PERMIT_SCAN_FRACTION = 0.4;
+/** issue #1597 M2 (round 3): how soon a tick is kicked after a publish was deferred out of a Codex
+ *  permit (`scan_deferred`), instead of waiting a full tick interval. */
+const MIDTURN_KICK_DELAY_MS = 1_000;
 /** issue #1597 M2: the sentinel a tick's pre-scope await resolves to when its controller aborted. */
 const ABORTED: unique symbol = Symbol("aborted");
 /** issue #1597 M2: consecutive git-busy ticks before the deferred line reaches the feed. */
@@ -924,6 +925,12 @@ interface RunFlight {
    *  ticks skip (`bare_lock_retained`) and a shutdown checkpoint that does not land names that
    *  class; entries whose file is gone are dropped. */
   retainedBareLocks: string[];
+  /** issue #1597 M2 (round 3): a milestone publish was DEFERRED out of a Codex permit
+   *  (`scan_deferred`) and is owed — the next overlay-less checkpoint outside a permit publishes
+   *  regardless of the time gate; cleared by a confirmed pinned publish. */
+  pendingPublish: boolean;
+  /** issue #1597 M2 (round 3): set by the running mid-turn ticker — schedule a tick soon. */
+  kickMidTurnTick?: () => void;
   runnerClone: RunnerClone | undefined;
   ciFixHumanApproved: boolean;
   result: ExecutorResult | undefined;
@@ -977,6 +984,10 @@ export interface CheckpointTestHooks {
   onTickOutcome?: (outcome: string) => void;
   /** SIGTERM → SIGKILL grace for a cancelled tick child (default 2s). */
   tickKillGraceMs?: number;
+  /** The checkpoint secret-scan deadline (default CHECKPOINT_SCAN_TIMEOUT_MS, 60s). */
+  scanDeadlineMs?: number;
+  /** Observe the flight bookkeeping right after a confirmed PINNED publish. */
+  afterPinnedPublish?: (state: { publishedTip: string; lastPublishedTip?: string; checkpointFloor?: string }) => void;
 }
 
 /** Tuning the runner needs beyond the collaborators (defaults keep M2/M3 tests terse). */
@@ -4984,6 +4995,7 @@ export class RunRunner {
       // latch a cancelled tick sets when it had to RETAIN a lock file in the worker bare.
       sinkGate: new SinkGate(),
       retainedBareLocks: [],
+      pendingPublish: false,
       // PRD #218 M1: the run's branch, hoisted so the park/shutdown fetch-back in the
       // catch can name it. `runnerClone` is declared inside the try and there is no
       // `result` on those paths, so `runnerClone.branch` is the source of truth and it is
@@ -5707,93 +5719,113 @@ export class RunRunner {
           this.checkpointIntervalMs > 0 &&
           this.now() - flight.lastPublish >= this.checkpointIntervalMs;
         let published = false;
-        if (hasNewWork && (opts.reap || timeGateOpen)) {
+        // issue #1597 M2 (round 3): a publish DEFERRED out of a Codex permit (below) is owed: the
+        // next overlay-less checkpoint outside a permit publishes regardless of the time gate.
+        if (hasNewWork && (opts.reap || timeGateOpen || flight.pendingPublish)) {
           // issue #1597 M2: an overlay-less publish (the mid-turn tick, the iteration boundary, and a
           // milestone whose overlay is undefined) is SCANNED first, over a range PINNED to SHAs, and
           // packs exactly that range. An overlay publish (and every park/shutdown/pause/capture sink,
           // which do not come through here) is byte-unchanged and not scanned.
-          const scanned = overlay
-            ? { kind: "unscanned" as const }
-            : await this.scanCheckpointForPublish(
+          if (!overlay && inPermit) {
+            // issue #1597 M2 (round 3): NEVER run gitleaks inside a Codex permit. A permit-held child
+            // cannot be killed on its own and execScoped's scoped branch ignores `timeout`, while
+            // gitleaks' own git-mode `--timeout` yields a silent clean partial scan — so a slow scan
+            // could only either push the permit past its deadline (a CodexBoundaryError fails the
+            // run) or be trusted wrongly. The fetch-back above already made the milestone durable
+            // locally; the remote publish is owed to the next tick OUTSIDE any permit, which is
+            // kicked to run soon and publishes regardless of the time gate.
+            flight.pendingPublish = true;
+            bodyOutcome = "scan_deferred";
+            runLog.info("checkpoint publish deferred out of the Codex permit (scan_deferred)", {
+              run_id: runId,
+              branch: runnerClone.branch,
+            });
+            flight.kickMidTurnTick?.();
+            // Falls through to the running report below (the milestone's progress is reported).
+          } else {
+            const scanned = overlay
+              ? { kind: "unscanned" as const }
+              : await this.scanCheckpointForPublish(flight, barePath, runnerClone.branch, opts.scanScope);
+            if (opts.signal?.aborted) {
+              // Cancelled mid-scan (only the QUIET tick carries a signal, so there is no report to
+              // keep): no attempt was made, so the time gate is NOT advanced.
+              bodyOutcome = "aborted";
+              return;
+            }
+            if (scanned.kind === "blocked") {
+              // Finding or untrusted scan: do NOT publish. The fetch-back above stays (local only,
+              // never reported durable); lastPublish advances like any attempt so the next interval
+              // retries; lastPublishedTip does NOT advance. Falls through to the running report, so a
+              // milestone's progress is still reported.
+              flight.lastPublish = this.now();
+              bodyOutcome = scanned.outcome;
+            } else {
+              const outcome = await this.publishCheckpointOutcome(
                 flight,
                 barePath,
                 runnerClone.branch,
-                inPermit ? this.permitScanDeadlineMs() : CHECKPOINT_SCAN_TIMEOUT_MS,
-                opts.scanScope,
+                overlay,
+                opts.signal,
+                scanned.kind === "pinned" ? scanned.range : undefined,
               );
-          if (opts.signal?.aborted) {
-            // Cancelled mid-scan (only the QUIET tick carries a signal, so there is no report to
-            // keep): no attempt was made, so the time gate is NOT advanced.
-            bodyOutcome = "aborted";
-            return;
-          }
-          if (scanned.kind === "blocked") {
-            // Finding or untrusted scan: do NOT publish. The fetch-back above stays (local only,
-            // never reported durable); lastPublish advances like any attempt so the next interval
-            // retries; lastPublishedTip does NOT advance. Falls through to the running report, so a
-            // milestone's progress is still reported.
-            flight.lastPublish = this.now();
-            bodyOutcome = scanned.outcome;
-          } else {
-            const outcome = await this.publishCheckpointOutcome(
-              flight,
-              barePath,
-              runnerClone.branch,
-              overlay,
-              opts.signal,
-              scanned.kind === "pinned" ? scanned.range : undefined,
-            );
-            published = outcome.published;
-            bodyOutcome = outcome.published
-              ? "published"
-              : outcome.reason === "aborted" || opts.signal?.aborted
-                ? "aborted"
-                : `publish_failed:${outcome.reason}`;
-            // Advance the time-gate on every ATTEMPT (not just success): bounds broker retry
-            // cadence to <= 1 publish/interval/run even under a persistent broker failure.
-            flight.lastPublish = this.now();
-            // PRD #267 Fix 1 (Decision 9): advance lastPublishedTip ONLY on a CONFIRMED landed
-            // publish, so a transient broker failure leaves hasNewWork true and the time-gate
-            // retries the SAME tip at the next interval boundary (bounded loss).
-            if (published && scanned.kind === "pinned") {
-              // issue #1597 M2 (review item 3): the PINNED path published exactly `range.tipSha`, read
-              // from the tracking ref AFTER the fetch-back/bridge — not `cloneTip`, read at the top
-              // of this body: the agent may commit (or reset) in between, and recording cloneTip
-              // would either republish the same tip next interval or set floor C to a commit that
-              // was never published (a false #1416 steer, or a bridge resurrecting a dropped commit).
-              // When THIS body bridged, tipSha is the bridge B: C = B (the durable floor) while
-              // lastPublishedTip = the fetched H that B wraps (it drives hasNewWork against cloneTip,
-              // exactly as the unpinned path keeps H there).
-              const tipSha = scanned.range.tipSha;
-              const bridgedTip = bridgeOutcome.kind === "bridged" && bridgeOutcome.bridge === tipSha;
-              flight.lastPublishedTip = bridgedTip && fetchedTip ? fetchedTip : tipSha;
-              flight.checkpointFloor = tipSha;
-              if (!opts.reap) {
-                runLog.info("checkpoint published to origin (time-based)", {
-                  run_id: runId,
-                  branch: runnerClone.branch,
-                  tip: tipSha,
+              published = outcome.published;
+              bodyOutcome = outcome.published
+                ? "published"
+                : outcome.reason === "aborted" || opts.signal?.aborted
+                  ? "aborted"
+                  : `publish_failed:${outcome.reason}`;
+              // Advance the time-gate on every ATTEMPT (not just success): bounds broker retry
+              // cadence to <= 1 publish/interval/run even under a persistent broker failure.
+              flight.lastPublish = this.now();
+              // PRD #267 Fix 1 (Decision 9): advance lastPublishedTip ONLY on a CONFIRMED landed
+              // publish, so a transient broker failure leaves hasNewWork true and the time-gate
+              // retries the SAME tip at the next interval boundary (bounded loss).
+              if (published && scanned.kind === "pinned") {
+                // issue #1597 M2 (review item 3): the PINNED path published exactly `range.tipSha`, read
+                // from the tracking ref AFTER the fetch-back/bridge — not `cloneTip`, read at the top
+                // of this body: the agent may commit (or reset) in between, and recording cloneTip
+                // would either republish the same tip next interval or set floor C to a commit that
+                // was never published (a false #1416 steer, or a bridge resurrecting a dropped commit).
+                // When THIS body bridged, tipSha is the bridge B: C = B (the durable floor) while
+                // lastPublishedTip = the fetched H that B wraps (it drives hasNewWork against cloneTip,
+                // exactly as the unpinned path keeps H there).
+                const tipSha = scanned.range.tipSha;
+                flight.pendingPublish = false;
+                const bridgedTip = bridgeOutcome.kind === "bridged" && bridgeOutcome.bridge === tipSha;
+                flight.lastPublishedTip = bridgedTip && fetchedTip ? fetchedTip : tipSha;
+                flight.checkpointFloor = tipSha;
+                this.checkpointTestHooks?.afterPinnedPublish?.({
+                  publishedTip: tipSha,
+                  lastPublishedTip: flight.lastPublishedTip,
+                  checkpointFloor: flight.checkpointFloor,
                 });
-              }
-            } else if (published) {
-              flight.lastPublishedTip = cloneTip ?? flight.lastPublishedTip;
-              // PRD #1416 M3 (C2): advance the checkpoint floor C to the DURABLE published floor on
-              // EVERY confirmed publish (PRD line 62). When this tick BRIDGED, C is already B (the
-              // helper set it) and cloneTip is the un-bridged H — so DO NOT regress C back to H;
-              // otherwise C is the confirmed checkpoint tip cloneTip. lastPublishedTip stays cloneTip
-              // (H) above: it drives hasNewWork, a separate concern from the floor.
-              flight.checkpointFloor =
-                bridgeOutcome.kind === "bridged"
-                  ? bridgeOutcome.bridge
-                  : (cloneTip ?? flight.checkpointFloor);
-              // PRD #267 M3: make the time-based publish observable, only for the time path so
-              // we do not double-log the milestone case.
-              if (!opts.reap) {
-                runLog.info("checkpoint published to origin (time-based)", {
-                  run_id: runId,
-                  branch: runnerClone.branch,
-                  tip: cloneTip,
-                });
+                if (!opts.reap) {
+                  runLog.info("checkpoint published to origin (time-based)", {
+                    run_id: runId,
+                    branch: runnerClone.branch,
+                    tip: tipSha,
+                  });
+                }
+              } else if (published) {
+                flight.lastPublishedTip = cloneTip ?? flight.lastPublishedTip;
+                // PRD #1416 M3 (C2): advance the checkpoint floor C to the DURABLE published floor on
+                // EVERY confirmed publish (PRD line 62). When this tick BRIDGED, C is already B (the
+                // helper set it) and cloneTip is the un-bridged H — so DO NOT regress C back to H;
+                // otherwise C is the confirmed checkpoint tip cloneTip. lastPublishedTip stays cloneTip
+                // (H) above: it drives hasNewWork, a separate concern from the floor.
+                flight.checkpointFloor =
+                  bridgeOutcome.kind === "bridged"
+                    ? bridgeOutcome.bridge
+                    : (cloneTip ?? flight.checkpointFloor);
+                // PRD #267 M3: make the time-based publish observable, only for the time path so
+                // we do not double-log the milestone case.
+                if (!opts.reap) {
+                  runLog.info("checkpoint published to origin (time-based)", {
+                    run_id: runId,
+                    branch: runnerClone.branch,
+                    tip: cloneTip,
+                  });
+                }
               }
             }
           }
@@ -6868,17 +6900,9 @@ export class RunRunner {
     };
   }
 
-  /**
-   * issue #1597 M2 (review item 7) — the secret-scan deadline for a publish running INSIDE a Codex
-   * permit (an overlay-less reap:true milestone). The permit's own deadline (codexBoundaryDeadlineMs)
-   * also covers the reap, the fetch-back, the pack and the publish, and BoundaryPermit exposes only
-   * its abort signal (not the time left), so the scan gets a fixed fraction of it, capped by the
-   * normal scan budget. On expiry the gitleaks child ENDS ITSELF (`--timeout`; a permit-held child
-   * cannot be killed individually) → an untrusted scan → the publish is skipped, while the permit
-   * itself completes in time (no CodexBoundaryError, the run continues).
-   */
-  private permitScanDeadlineMs(): number {
-    return Math.min(CHECKPOINT_SCAN_TIMEOUT_MS, Math.floor(this.codexBoundaryDeadlineMs * PERMIT_SCAN_FRACTION));
+  /** issue #1597 M2: the checkpoint secret-scan deadline (a test may shorten it). */
+  private scanDeadlineMs(): number {
+    return this.checkpointTestHooks?.scanDeadlineMs ?? CHECKPOINT_SCAN_TIMEOUT_MS;
   }
 
   /**
@@ -6924,16 +6948,17 @@ export class RunRunner {
    * never published. Never throws.
    *
    * BY DESIGN the park / shutdown / pause / capture publishes (and every overlay publish) are NOT
-   * scanned: they are the run's last chance to be durable before the worker stops working on it, a
-   * blocked or slow scan there would lose the work outright, and their bytes still reach a push only
-   * through finalize's own scan and the GH013 backstop. The scan guards the frequent, mid-run
-   * checkpoint stream only.
+   * scanned: the api pushes them UNSCANNED to the forge's refs/uzi-checkpoints/<branch>
+   * (api/internal/workersvc/service.go PublishCheckpoint) — they are the run's last chance to be
+   * durable before the worker stops working on it, and a blocked or slow scan there would lose the
+   * work outright. The scan guards the frequent, mid-run checkpoint stream only; a Codex milestone
+   * inside a permit DEFERS its publish to the next tick outside the permit instead of scanning there
+   * (`scan_deferred`, see doCheckpointPublish).
    */
   private async scanCheckpointForPublish(
     flight: RunFlight,
     barePath: string,
     branch: string,
-    deadlineMs: number,
     scanScope?: <T>(fn: () => Promise<T>) => Promise<T>,
   ): Promise<
     | { kind: "pinned"; range: CheckpointRange }
@@ -6950,13 +6975,16 @@ export class RunRunner {
       return { kind: "blocked", outcome: "secret_scan_untrusted" };
     };
     try {
-      const range = await this.git.resolveCheckpointRange(barePath, branch);
+      // Scan floors: the default branch and the last CONFIRMED checkpoint tip (already public).
+      const range = await this.git.resolveCheckpointRange(barePath, branch, {
+        confirmedTip: flight.lastCheckpointRefTip,
+      });
       if (!range) {
         if ((await this.git.trackingTip(barePath, branch)) === null) return { kind: "none" };
         return untrusted("range_unresolved");
       }
       const scan = await (scanScope ?? ((fn) => fn()))(() =>
-        this.git.secretScanCheckpointRange(barePath, range, { deadlineMs }),
+        this.git.secretScanCheckpointRange(barePath, range, { deadlineMs: this.scanDeadlineMs() }),
       );
       if (scan.findings.length > 0) {
         this.reportPublishOutcome(
@@ -7151,7 +7179,7 @@ export class RunRunner {
                   const onTick = (): void => scanAc.abort();
                   if (ac.signal.aborted) scanAc.abort();
                   else ac.signal.addEventListener("abort", onTick, { once: true });
-                  const cancelScan = this.setTimer(() => scanAc.abort(), CHECKPOINT_SCAN_TIMEOUT_MS);
+                  const cancelScan = this.setTimer(() => scanAc.abort(), this.scanDeadlineMs());
                   return this.git
                     .withBoundaryProcessSpawner(spawner.scoped(scanAc.signal), scanAc.signal, fn, {
                       beforeLockRelease,
@@ -7220,10 +7248,17 @@ export class RunRunner {
       inFlight = current;
     };
     cancelTimer = this.setTickTimer(fire, this.checkpointTickIntervalMs);
+    // issue #1597 M2 (round 3): a deferred publish asks for a tick SOON (re-arms the timer).
+    flight.kickMidTurnTick = () => {
+      if (stopped) return;
+      cancelTimer?.();
+      cancelTimer = this.setTickTimer(fire, MIDTURN_KICK_DELAY_MS);
+    };
 
     return {
       stop: async () => {
         stopped = true;
+        flight.kickMidTurnTick = undefined;
         cancelTimer?.();
         cancelTimer = undefined;
         inFlightAbort?.abort();

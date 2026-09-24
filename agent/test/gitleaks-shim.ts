@@ -4,21 +4,28 @@
 // `{ gitleaksBin: defaultGitleaksShim() }`; a test that wants the real binary or a
 // finding/failing scanner overrides it.
 //
-// The shim is a small node script (absolute shebang, so PATH need not carry node). It walks the
-// range with git plumbing and reports a finding for any ADDED line carrying a GitHub-PAT-shaped
-// value (so on ordinary fixtures it is a clean, trusted scan), writes the gitleaks-shaped JSON
-// report and the `N commits scanned` stderr line scanIsTrustworthy reads. Like the real v8.30
-// binary, git mode neither diffs nor counts MERGE commits, and `stdin` mode scans a diff fed on
-// stdin (the per-merge contribution scan). `fail` exits nonzero (an instrument failure); `slow`
-// honours `--timeout` by ending itself with an ERR line at the deadline (as gitleaks does) and
-// otherwise hangs. Every call is appended to `<shim>.calls` as "<mode> <range>".
+// The shim is a small node script (absolute shebang, so PATH need not carry node) modelling the
+// MEASURED behaviour of gitleaks v8.30.1:
+//  - git mode walks the `--log-opts` revisions (space-separated, `^` floors honoured) and COUNTS
+//    only commits whose `git log -p` has a textual hunk in a non-deleted file — reproduced with
+//    `git log --numstat --diff-filter=d` — and neither diffs nor counts merges; it reports a finding
+//    for any ADDED line carrying a GitHub-PAT-shaped value (so ordinary fixtures scan clean);
+//  - stdin mode scans a diff fed on stdin and prints `scanned ~<bytes fed> bytes`.
+// Modes: `detect` (the above), `fail` (exits nonzero: an instrument failure), `slowclean` (sleeps
+// `sleepMs` IGNORING `--timeout` — as git mode does — then exits 0 with a clean report and a
+// matching "N commits scanned": a silent partial scan our deadline must catch). Every call is
+// appended to `<shim>.calls` as "<mode> <log-opts>".
 
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-export function writeGitleaksShim(dir: string, mode: "detect" | "fail" | "slow"): string {
-  const shim = path.join(dir, `gitleaks-shim-${mode}`);
+export function writeGitleaksShim(
+  dir: string,
+  mode: "detect" | "fail" | "slowclean",
+  opts: { sleepMs?: number } = {},
+): string {
+  const shim = path.join(dir, `gitleaks-shim-${mode}-${opts.sleepMs ?? 0}`);
   fs.writeFileSync(
     shim,
     `#!${process.execPath}
@@ -29,12 +36,6 @@ const opt = (name) => (a.indexOf(name) >= 0 ? a[a.indexOf(name) + 1] : undefined
 const mode = ${JSON.stringify(mode)};
 fs.appendFileSync(${JSON.stringify(`${shim}.calls`)}, a[0] + " " + (opt("--log-opts") || "-") + "\\n");
 if (mode === "fail") { process.stderr.write("fatal: instrument broke\\n"); process.exit(2); }
-if (mode === "slow") {
-  // Like gitleaks --timeout: end ITSELF (rc 1, an ERR line) at the deadline; without one, hang long.
-  const t = opt("--timeout");
-  setTimeout(() => { process.stderr.write("ERR context deadline exceeded\\n"); process.exit(1); }, t ? Number(t) * 1000 : 60000);
-  return;
-}
 const report = opt("--report-path");
 const re = new RegExp("gh" + "p_[A-Za-z0-9]{36}");
 const findings = [];
@@ -48,19 +49,31 @@ const scanDiff = (text, commit) => {
   }
 };
 if (a[0] === "stdin") {
-  const text = fs.readFileSync(0, "utf8");
-  scanDiff(text, "");
+  const text = fs.readFileSync(0);
+  scanDiff(text.toString("utf8"), "");
   fs.writeFileSync(report, JSON.stringify(findings));
-  process.stderr.write("INF scanned ~" + text.length + " bytes\\n");
+  process.stderr.write("INF scanned ~" + text.length + " bytes (" + text.length + " bytes) in 1ms\\n");
   return;
 }
-// git mode — like gitleaks' git log -p walk, merges are neither diffed nor counted.
 const src = a[1];
-const git = (args) => execFileSync("git", ["-C", src, ...args], { encoding: "utf8" });
-const commits = git(["rev-list", "--no-merges", opt("--log-opts")]).split("\\n").filter(Boolean);
-for (const c of commits) scanDiff(git(["show", "--format=", "--unified=0", c]), c);
-fs.writeFileSync(report, JSON.stringify(findings));
-process.stderr.write("INF " + commits.length + " commits scanned.\\n");
+const revs = opt("--log-opts").split(" ").filter(Boolean);
+const git = (args) => execFileSync("git", ["-C", src, ...args], { encoding: "utf8", maxBuffer: 1 << 28 });
+const numstat = git(["log", "--no-merges", "--format=%x00%H", "--numstat", "--diff-filter=d", ...revs]);
+const counted = numstat.split("\\0").slice(1).filter((b) =>
+  b.split("\\n").slice(1).some((l) => { const m = /^(\\d+)\\t(\\d+)\\t/.exec(l); return m && Number(m[1]) + Number(m[2]) > 0; }),
+).length;
+const finish = () => {
+  if (mode === "detect") {
+    for (const c of git(["rev-list", "--no-merges", ...revs]).split("\\n").filter(Boolean)) {
+      scanDiff(git(["show", "--format=", "--unified=0", c]), c);
+    }
+  }
+  fs.writeFileSync(report, JSON.stringify(findings));
+  process.stderr.write("INF " + counted + " commits scanned.\\n");
+  process.exit(0);
+};
+if (mode === "slowclean") setTimeout(finish, ${opts.sleepMs ?? 0});
+else finish();
 `,
     { mode: 0o755 },
   );

@@ -114,6 +114,9 @@ function runtimeSecret(): string {
 
 interface Ctl {
   setTimer: NonNullable<RunnerOptions["setTimer"]>;
+  /** Captures EVERY tick-timer arm (interval or kick); `armedDelay()` is the latest delay. */
+  setTickTimer: NonNullable<RunnerOptions["setTickTimer"]>;
+  armedDelay: () => number | undefined;
   now: () => number;
   advance: (ms: number) => void;
   /** Fire the captured tick timer and resolve with the tick's outcome class. */
@@ -130,6 +133,7 @@ interface Ctl {
 
 function control(extraHooks: Partial<NonNullable<RunnerOptions["checkpointTestHooks"]>> = {}): Ctl {
   let tickCb: (() => void) | undefined;
+  let tickDelay: number | undefined;
   let fakeNow = 0;
   const outcomes: string[] = [];
   const waiters: Array<{ n: number; resolve: (o: string) => void }> = [];
@@ -148,16 +152,21 @@ function control(extraHooks: Partial<NonNullable<RunnerOptions["checkpointTestHo
     outcomes.length > n ? Promise.resolve(outcomes[n]!) : new Promise((resolve) => waiters.push({ n, resolve }));
   const ctl: Ctl = {
     setTimer: (cb, ms) => {
-      if (ms === TICK_MS) {
-        tickCb = cb;
-        return () => {
-          if (tickCb === cb) tickCb = undefined;
-        };
-      }
       const t = setTimeout(cb, ms);
       t.unref?.();
       return () => clearTimeout(t);
     },
+    setTickTimer: (cb, ms) => {
+      tickCb = cb;
+      tickDelay = ms;
+      return () => {
+        if (tickCb === cb) {
+          tickCb = undefined;
+          tickDelay = undefined;
+        }
+      };
+    },
+    armedDelay: () => tickDelay,
     now: () => fakeNow,
     advance: (ms) => {
       fakeNow += ms;
@@ -247,7 +256,7 @@ function mkRunner(
     gitlab,
     checkpointIntervalMs: INTERVAL_MS,
     checkpointTickIntervalMs: TICK_MS,
-    ...(ctl ? { setTimer: ctl.setTimer, setTickTimer: ctl.setTimer, now: ctl.now, checkpointTestHooks: ctl.hooks } : {}),
+    ...(ctl ? { setTimer: ctl.setTimer, setTickTimer: ctl.setTickTimer, now: ctl.now, checkpointTestHooks: ctl.hooks } : {}),
     ...extra,
   });
 }
@@ -776,7 +785,7 @@ describe("mid-turn checkpoint tick (issue #1597 M2)", () => {
         }),
         ctl,
       ).execute(claim);
-      assert.deepEqual(scanned, { tipSha: c1, excludeSha: o1 }, "the scan walked O1..C1");
+      assert.deepEqual(scanned && { tipSha: scanned.tipSha, excludeSha: scanned.excludeSha }, { tipSha: c1, excludeSha: o1 }, "the scan walked O1..C1");
       assert.equal(pub.tips[0], c1, "the declared tip is the SCANNED tip, not the moved tracking ref");
       // index-pack the captured pack into a scratch repo and list its commits.
       const scratch = path.join(tmp, "scratch");
@@ -1209,7 +1218,7 @@ describe("GitCache mid-turn primitives (issue #1597 M2)", () => {
 
   it("resolveCheckpointRange pins the tracking tip and the SAME floor checkpointPack excludes", async () => {
     const { g, bare, branch, tip, base } = bareWithBranch();
-    assert.deepEqual(await g.resolveCheckpointRange(bare, branch), { tipSha: tip, excludeSha: base });
+    assert.deepEqual(await g.resolveCheckpointRange(bare, branch), { tipSha: tip, excludeSha: base, scanFloorShas: [] });
     assert.equal(await g.resolveCheckpointRange(bare, "agent/none"), null, "no tracking ref → null");
   });
 
@@ -1531,27 +1540,101 @@ describe("mid-turn checkpoint review follow-ups (issue #1597 M2)", () => {
     }
   });
 
-  // ── item 7: a slow scan inside a Codex milestone permit ─────────────────────────────────
-  it("(item 7) Codex milestone: a slow scanner ends itself inside the permit — publish skipped untrusted, no CodexBoundaryError, run completes", async () => {
-    const tmp = scratchDir("codexslow");
-    const slow = writeShim(tmp, "slow");
-    const DEADLINE = 5_000; // → a 2s scan budget (PERMIT_SCAN_FRACTION 0.4)
+  // ── round 3 item 1: our own deadline; never gitleaks inside a Codex permit ──────────────
+  it("(r3 1a) a scanner that ignores --timeout and exits 0 CLEAN after the deadline is `deadline`, never trusted", async () => {
+    const tmp = scratchDir("slowclean");
+    try {
+      const { bare, range } = await (async () => {
+        const b = path.join(fx.dataDir, "sc.git");
+        execFileSync("git", ["clone", "-q", "--bare", fx.originPath, b], { env: GIT_ENV });
+        const base = gitIn(b, ["rev-parse", "main"]);
+        const blob = gitIn(b, ["hash-object", "-w", "--stdin"], "text\n");
+        const tree = gitIn(b, ["mktree"], `100644 blob ${blob}\tt.txt\n`);
+        const tip = gitIn(b, [...IDENT, "commit-tree", tree, "-p", base, "-m", "t"]);
+        return { bare: b, range: { tipSha: tip, excludeSha: base } };
+      })();
+      // Exits 0 with a clean, count-matching report just INSIDE the deadline (within the margin).
+      const late = new GitCache(fx.dataDir, nullLogger(), undefined, {
+        gitleaksBin: writeShim(tmp, "slowclean", { sleepMs: 1_400 }),
+      });
+      assert.deepEqual(await late.secretScanCheckpointRange(bare, range, { deadlineMs: 1_500 }), {
+        trusted: false,
+        findings: [],
+        reason: "deadline",
+      });
+      // Would exit 0 clean long AFTER the deadline: our kill ends it at the deadline.
+      const hung = new GitCache(fx.dataDir, nullLogger(), undefined, {
+        gitleaksBin: writeShim(tmp, "slowclean", { sleepMs: 30_000 }),
+      });
+      const t0 = Date.now();
+      assert.deepEqual(await hung.secretScanCheckpointRange(bare, range, { deadlineMs: 1_500 }), {
+        trusted: false,
+        findings: [],
+        reason: "deadline",
+      });
+      assert.ok(Date.now() - t0 < 10_000, "killed at our deadline, not the scanner's");
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("(r3 1a) outside a permit: a milestone whose scan outlives the deadline is killed, classed deadline, and not published", async () => {
+    const tmp = scratchDir("milestone-deadline");
+    const pub = stubPublish(async (_n, _tip, pack) => {
+      await drain(pack);
+      return LANDED;
+    });
+    const ctl = control({ scanDeadlineMs: 1_500 });
+    const { logger, lines } = recordingLogger();
+    const claim = gitlabClaim(1597_250);
+    const t0 = Date.now();
+    try {
+      await mkRunner(
+        mkGit(fx.dataDir, writeShim(tmp, "slowclean", { sleepMs: 30_000 })),
+        turn(async (ctx) => {
+          commitIn(ctx.worktreePath, "M.txt", "m\n");
+          await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] } });
+        }),
+        ctl,
+        {},
+        logger,
+      ).execute(claim);
+      assert.equal(finalStatus(claim.run_id), "completed");
+      assert.equal(pub.count(), 0, "a scan cut by the deadline never publishes");
+      assert.ok(
+        (lines as Array<Record<string, unknown>>).some(
+          (l) => l.msg === "checkpoint publish skipped: secret_scan_untrusted" && l.why === "deadline",
+        ),
+      );
+      assert.ok(Date.now() - t0 < 25_000);
+    } finally {
+      pub.restore();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("(r3 1c) Codex milestone: gitleaks never runs inside the permit — the publish is deferred and the next (kicked) tick publishes it", async () => {
+    const tmp = scratchDir("codexdefer");
+    const shim = writeShim(tmp, "detect");
     const boundaryErrors: string[] = [];
-    // A fake Codex facade that ENFORCES the permit deadline like the real one: after the deadline
-    // the permit aborts and a boundary whose action finished late throws CodexBoundaryError.
+    let inPermit = false;
+    const scansInPermit: number[] = [];
     const safety: CodexExecutionSafety = {
       kind: "codex",
       withBoundary: async (req, action) => {
         const ac = new AbortController();
         const timer = setTimeout(() => ac.abort(new Error("boundary deadline")), req.deadlineMs);
+        inPermit = true;
         try {
           const value = await action({ epoch: 1, boundary: req.boundary, signal: ac.signal } as unknown as BoundaryPermit);
+          scansInPermit.push(shimCalls(shim).length);
           if (ac.signal.aborted) {
             boundaryErrors.push(req.boundary);
             throw new CodexBoundaryError("action", [{ category: "timeout", message: "late" }]);
           }
           return value;
         } finally {
+          inPermit = false;
           clearTimeout(timer);
         }
       },
@@ -1567,37 +1650,42 @@ describe("mid-turn checkpoint review follow-ups (issue #1597 M2)", () => {
       dispose: async () => ({ kind: "disposed" }),
     };
     const pub = stubPublish(async (_n, _tip, pack) => {
+      assert.equal(inPermit, false, "never published from inside the permit");
       await drain(pack);
       return LANDED;
     });
-    const claim = gitlabClaim(1597_244);
+    const ctl = control();
+    const claim = gitlabClaim(1597_251);
     const { logger, lines } = recordingLogger();
+    let milestoneSha = "";
+    let kickDelay: number | undefined;
+    let tickOutcome = "";
     try {
       const factory: ExecutorFactory = () => ({
         executor: {
           run: async (ctx: RunContext) => {
             await recordingTurnErrors(async () => {
-              commitIn(ctx.worktreePath, "K.txt", "k\n");
+              milestoneSha = commitIn(ctx.worktreePath, "K.txt", "k\n");
               await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] } });
+              kickDelay = ctl.armedDelay();
+              tickOutcome = await ctl.fire(); // the kicked tick, outside any permit
             });
             return { branch: ctx.branch };
           },
           safety,
         },
       });
-      await mkRunner(mkGit(fx.dataDir, slow), factory, undefined, { codexBoundaryDeadlineMs: DEADLINE, checkpointTickIntervalMs: 0 }, logger)
-        .execute(claim);
-      assert.deepEqual(boundaryErrors, [], "the checkpoint permit completed inside its deadline");
+      await mkRunner(mkGit(fx.dataDir, shim), factory, ctl, { codexBoundaryDeadlineMs: 5_000 }, logger).execute(claim);
+      assert.deepEqual(boundaryErrors, []);
       assert.equal(finalStatus(claim.run_id), "completed");
-      assert.equal(pub.count(), 0, "the milestone publish was skipped");
-      assert.ok(statusTexts(claim.run_id).includes("checkpoint publish skipped: secret_scan_untrusted"));
+      assert.equal(scansInPermit[0], 0, "no gitleaks call inside the checkpoint permit");
       assert.ok(
-        (lines as Array<Record<string, unknown>>).some(
-          (l) => l.msg === "checkpoint publish skipped: secret_scan_untrusted" && l.why === "deadline",
-        ),
-        "the scan was cut by its own sub-deadline",
+        (lines as Array<Record<string, unknown>>).some((l) => l.msg === "checkpoint publish deferred out of the Codex permit (scan_deferred)"),
       );
-      assert.ok(shimCalls(slow).length >= 1, "the slow scanner was reached");
+      assert.equal(kickDelay, 1_000, "a tick was kicked soon after the deferral (not a full interval)");
+      assert.equal(tickOutcome, "published", "the deferred publish went out on the next tick, time gate or not");
+      assert.deepEqual(pub.tips, [milestoneSha]);
+      assert.ok(shimCalls(shim).length >= 1, "the scan ran — outside the permit");
     } finally {
       pub.restore();
       fs.rmSync(tmp, { recursive: true, force: true });
@@ -1712,5 +1800,271 @@ describe("mid-turn checkpoint review follow-ups (issue #1597 M2)", () => {
   });
   it("(item 9) attemptCredentialSwitch holds the sink gate: a tick firing inside it is gate_busy", async () => {
     assert.equal(await gatedPathExcludesTick("attemptCredentialSwitch", 1597_248), "gate_busy");
+  });
+});
+
+// ── round 3 (issue #1597 M2): scan floors, old-side cap, remerge-diff, gitleaks' counting rule ──
+
+/** A throwaway working repo cloned from the fixture origin, for GitCache-level scan tests (every
+ *  scan command runs `git -C <repo>`, so a non-bare repo works as the "bare"). */
+function workRepo(name: string): { dir: string; base: string; git: (args: string[], input?: string | Buffer) => string } {
+  const dir = path.join(fx.dataDir, name);
+  execFileSync("git", ["clone", "-q", fx.originPath, dir], { env: GIT_ENV });
+  const g = (args: string[], input?: string | Buffer): string => gitIn(dir, [...IDENT, ...args], input);
+  return { dir, base: g(["rev-parse", "HEAD"]), git: g };
+}
+
+/** Run `fn` once per scanner: the CI shim always, and the real binary when on PATH. */
+async function eachScanner(
+  t: { skip: (m: string) => void },
+  fn: (bin: string, label: string) => Promise<void>,
+): Promise<void> {
+  const tmp = scratchDir("scanners");
+  try {
+    await fn(writeShim(tmp, "detect"), "shim");
+    const real = realGitleaks();
+    if (real) await fn(real, "real gitleaks");
+    else t.skip("gitleaks is not on PATH in this environment; only the shim variant ran");
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+describe("mid-turn checkpoint round 3 (issue #1597 M2)", () => {
+  it("(r3 5) commits gitleaks does not count (pure mv, --allow-empty, chmod, binary-only, empty file, whole-file delete) do not wedge the scan", async (t) => {
+    await eachScanner(t, async (bin, label) => {
+      const w = workRepo(`count-${label.replace(/\W/g, "")}`);
+      const f = (n: string, c: string | Buffer): void => fs.writeFileSync(path.join(w.dir, n), c);
+      f("n.txt", "normal\n");
+      w.git(["add", "-A"]);
+      w.git(["commit", "-q", "-m", "normal"]);
+      w.git(["mv", "n.txt", "m.txt"]);
+      w.git(["commit", "-q", "-m", "pure mv"]);
+      w.git(["commit", "-q", "--allow-empty", "-m", "empty"]);
+      fs.chmodSync(path.join(w.dir, "m.txt"), 0o755);
+      w.git(["add", "-A"]);
+      w.git(["commit", "-q", "-m", "chmod"]);
+      f("bin.dat", Buffer.from([0x61, 0x00, 0x62]));
+      w.git(["add", "-A"]);
+      w.git(["commit", "-q", "-m", "binary"]);
+      f("empty.txt", "");
+      w.git(["add", "-A"]);
+      w.git(["commit", "-q", "-m", "empty file"]);
+      w.git(["rm", "-q", "README.md"]);
+      w.git(["commit", "-q", "-m", "delete a text file"]);
+      const tip = w.git(["rev-parse", "HEAD"]);
+      const g = new GitCache(fx.dataDir, nullLogger(), undefined, { gitleaksBin: bin });
+      assert.deepEqual(
+        await g.secretScanCheckpointRange(w.dir, { tipSha: tip, excludeSha: w.base }),
+        { trusted: true, findings: [] },
+        label,
+      );
+    });
+  });
+
+  it("(r3 2) the size cap charges the OLD side: deleting a blob over the per-blob cap is scan_too_large", async () => {
+    const tmp = scratchDir("oldside");
+    try {
+      const shim = writeShim(tmp, "detect");
+      const w = workRepo("oldside");
+      fs.writeFileSync(path.join(w.dir, "big.txt"), randomBytes(9 * 1024 * 1024).toString("base64").slice(0, 9 * 1024 * 1024 + 10));
+      w.git(["add", "-A"]);
+      w.git(["commit", "-q", "-m", "big (already public)"]);
+      const floor = w.git(["rev-parse", "HEAD"]);
+      w.git(["rm", "-q", "big.txt"]);
+      w.git(["commit", "-q", "-m", "delete big"]);
+      const tip = w.git(["rev-parse", "HEAD"]);
+      const g = new GitCache(fx.dataDir, nullLogger(), undefined, { gitleaksBin: shim });
+      assert.deepEqual(await g.secretScanCheckpointRange(w.dir, { tipSha: tip, excludeSha: floor }), {
+        trusted: false,
+        findings: [],
+        reason: "scan_too_large",
+      });
+      assert.equal(shimCalls(shim).length, 0);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("(r3 3) merges: an OCTOPUS evil merge is found; a plain merge across a rename is trusted", async (t) => {
+    await eachScanner(t, async (bin, label) => {
+      const w = workRepo(`octo-${label.replace(/\W/g, "")}`);
+      const main = w.git(["rev-parse", "--abbrev-ref", "HEAD"]);
+      for (const b of ["s1", "s2"]) {
+        w.git(["checkout", "-q", "-b", b, w.base]);
+        fs.writeFileSync(path.join(w.dir, `${b}.txt`), `${b}\n`);
+        w.git(["add", "-A"]);
+        w.git(["commit", "-q", "-m", b]);
+      }
+      w.git(["checkout", "-q", main]);
+      fs.writeFileSync(path.join(w.dir, "line.txt"), "line\n");
+      w.git(["add", "-A"]);
+      w.git(["commit", "-q", "-m", "line"]);
+      w.git(["merge", "-q", "--no-commit", "s1", "s2"]);
+      fs.writeFileSync(path.join(w.dir, "evil.env"), `TOKEN=${runtimeSecret()}\n`);
+      w.git(["add", "-A"]);
+      w.git(["commit", "-q", "-m", "octopus evil"]);
+      const octo = w.git(["rev-parse", "HEAD"]);
+      assert.equal(w.git(["rev-list", "--parents", "-n", "1", octo]).split(" ").length, 4, "a real octopus");
+      const g = new GitCache(fx.dataDir, nullLogger(), undefined, { gitleaksBin: bin });
+      const r = await g.secretScanCheckpointRange(w.dir, { tipSha: octo, excludeSha: w.base });
+      assert.equal(r.findings.length > 0, true, `${label}: ${JSON.stringify(r)}`);
+      assert.equal(r.findings[0]!.commit, octo);
+
+      // A plain two-parent merge where one side renamed a file the other side edited.
+      w.git(["checkout", "-q", "-b", "ren", octo]);
+      w.git(["mv", "line.txt", "renamed.txt"]);
+      w.git(["commit", "-q", "-m", "rename"]);
+      w.git(["checkout", "-q", main]);
+      fs.writeFileSync(path.join(w.dir, "line.txt"), "line\nmore\n");
+      w.git(["commit", "-q", "-am", "edit"]);
+      w.git(["merge", "-q", "--no-edit", "ren"]);
+      const merged = w.git(["rev-parse", "HEAD"]);
+      assert.deepEqual(await g.secretScanCheckpointRange(w.dir, { tipSha: merged, excludeSha: octo }), {
+        trusted: true,
+        findings: [],
+      }, label);
+    });
+  });
+
+  it("(r3 2) resolveCheckpointRange adds the default-branch tip and an ANCESTOR confirmed tip as scan-only floors", async () => {
+    const g = mkGit(fx.dataDir);
+    const bare = path.join(fx.dataDir, "floors.git");
+    execFileSync("git", ["clone", "-q", "--bare", fx.originPath, bare], { env: GIT_ENV });
+    const main = gitIn(bare, ["rev-parse", "main"]);
+    const tree = gitIn(bare, ["rev-parse", `${main}^{tree}`]);
+    const c1 = gitIn(bare, [...IDENT, "commit-tree", tree, "-p", main, "-m", "c1"]);
+    const c2 = gitIn(bare, [...IDENT, "commit-tree", tree, "-p", c1, "-m", "c2"]);
+    const other = gitIn(bare, [...IDENT, "commit-tree", tree, "-p", main, "-m", "other"]);
+    // A default branch AHEAD of the pack floor, so it is a distinct scan floor.
+    const newMain = gitIn(bare, [...IDENT, "commit-tree", tree, "-p", main, "-m", "main moved"]);
+    gitIn(bare, ["update-ref", "refs/remotes/origin/agent/issue-9", main]);
+    gitIn(bare, ["update-ref", "refs/heads/main", newMain]);
+    gitIn(bare, ["update-ref", "refs/uzi-runner/agent/issue-9", c2]);
+    assert.deepEqual(await g.resolveCheckpointRange(bare, "agent/issue-9", { confirmedTip: c1 }), {
+      tipSha: c2,
+      excludeSha: main,
+      scanFloorShas: [newMain, c1],
+    });
+    assert.deepEqual(await g.resolveCheckpointRange(bare, "agent/issue-9", { confirmedTip: other }), {
+      tipSha: c2,
+      excludeSha: main,
+      scanFloorShas: [newMain],
+    }, "a confirmed tip that is not an ancestor of the tip is not a floor");
+  });
+
+  it("(r3 2) runner: content an UNSCANNED pause publish already made public is not re-scanned (no permanent wedge)", async () => {
+    const ctl = control();
+    const pub = stubPublish(async (_n, _tip, pack) => {
+      await drain(pack);
+      return LANDED;
+    });
+    const claim = gitlabClaim(1597_260);
+    let outcome = "";
+    let parked: boolean | undefined;
+    try {
+      await mkRunner(
+        mkGit(fx.dataDir),
+        () => ({
+          executor: {
+            run: async (ctx: RunContext) => {
+              // A secret committed and removed, then made public by the (unscanned, by design) pause
+              // publish — which the server confirmed.
+              commitIn(ctx.worktreePath, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
+              commitIn(ctx.worktreePath, "cfg.env", "TOKEN=\n");
+              parked = await ctx.parkForPause!({ completedCount: 0 });
+              commitIn(ctx.worktreePath, "after.txt", "after the pause\n");
+              ctl.advance(INTERVAL_MS + 1);
+              outcome = await ctl.fire();
+              return { branch: ctx.branch };
+            },
+          },
+        }),
+        ctl,
+      )
+        .execute(claim)
+        .catch(() => undefined);
+      assert.equal(parked, true, "the pause publish landed (confirmed)");
+      assert.equal(outcome, "published", "the confirmed checkpoint is a scan floor: only the new commit is scanned");
+      assert.equal(pub.count(), 2);
+    } finally {
+      pub.restore();
+    }
+  });
+
+  it("(r3 2/3) merging default-branch content that carries a secret-shaped fixture does not wedge publishing", async (t) => {
+    await eachScanner(t, async (bin, label) => {
+      const iid = label === "shim" ? 1597_261 : 1597_262;
+      const branch = `agent/issue-${iid}`;
+      // The run's branch is published at the current main; main then gains a fixture commit.
+      const at = gitIn(fx.originPath, ["rev-parse", "main"]);
+      gitIn(fx.originPath, ["branch", "-f", branch, at]);
+      const fixture = commitIn(fx.originPath, `fixtures/${iid}.env`, `EXAMPLE_TOKEN=${runtimeSecret()}\n`);
+      const ctl = control();
+      const pub = stubPublish(async (_n, _tip, pack) => {
+        await drain(pack);
+        return LANDED;
+      });
+      const claim = gitlabClaim(iid);
+      let outcome = "";
+      try {
+        await mkRunner(
+          mkGit(fx.dataDir, bin),
+          turn(async (ctx) => {
+            commitIn(ctx.worktreePath, "work.txt", "work\n");
+            gitIn(ctx.worktreePath, [...IDENT, "merge", "-q", "--no-edit", fixture]);
+            ctl.advance(INTERVAL_MS + 1);
+            outcome = await ctl.fire();
+          }),
+          ctl,
+        ).execute(claim);
+        assert.equal(finalStatus(claim.run_id), "completed", label);
+        assert.equal(outcome, "published", label);
+        assert.equal(pub.count(), 1, label);
+      } finally {
+        pub.restore();
+      }
+    });
+  });
+
+  it("(r3 6) bridged bookkeeping: lastPublishedTip = the fetched H, checkpointFloor = the published bridge B", async () => {
+    const iid = 1597_263;
+    const branch = `agent/issue-${iid}`;
+    const main = gitIn(fx.originPath, ["rev-parse", "main"]);
+    gitIn(fx.originPath, ["checkout", "-q", "-b", branch]);
+    commitIn(fx.originPath, "P.txt", "published P\n");
+    gitIn(fx.originPath, ["checkout", "-q", "main"]);
+    const states: Array<{ publishedTip: string; lastPublishedTip?: string; checkpointFloor?: string }> = [];
+    const ctl = control({ afterPinnedPublish: (s) => states.push(s) });
+    const pub = stubPublish(async (_n, _tip, pack) => {
+      await drain(pack);
+      return LANDED;
+    });
+    const claim = gitlabClaim(iid);
+    let h = "";
+    let second = "";
+    try {
+      await mkRunner(
+        mkGit(fx.dataDir),
+        turn(async (ctx) => {
+          // Rewrite history BELOW the published floor P: the tick must bridge (B wraps H over P).
+          gitIn(ctx.worktreePath, ["reset", "-q", "--hard", main]);
+          h = commitIn(ctx.worktreePath, "H.txt", "rewritten work\n");
+          ctl.advance(INTERVAL_MS + 1);
+          assert.equal(await ctl.fire(), "published");
+          ctl.advance(INTERVAL_MS + 1);
+          second = await ctl.fire();
+        }),
+        ctl,
+      ).execute(claim);
+      assert.equal(states.length, 1, JSON.stringify(states));
+      const s = states[0]!;
+      assert.notEqual(s.publishedTip, h, "the published tip is the bridge B, not H");
+      assert.equal(s.lastPublishedTip, h, "lastPublishedTip is the fetched H (it drives hasNewWork against the clone)");
+      assert.equal(s.checkpointFloor, s.publishedTip, "the checkpoint floor is the published bridge B");
+      assert.equal(second, "no_new_work", "no republish of the same work");
+    } finally {
+      pub.restore();
+    }
   });
 });
