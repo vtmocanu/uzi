@@ -122,8 +122,10 @@ function stores(gitCache: GitCache, now?: () => number): Stores {
   return { recoveryClient, coord, settlement };
 }
 
-/** gen1: commit work, then park recovery_wait (a persistently-empty turn). Returns gen1's head. */
-async function runGen1(s: Stores, claim: ClaimResponse): Promise<string> {
+/** gen1: commit work, then park recovery_wait (a persistently-empty turn). Returns gen1's head.
+ *  `opts.file` names the committed file (default GEN1.txt); `opts.dirty` also leaves that file
+ *  UNCOMMITTED in the tree, so the park captures it as a `wip(park):` marker on top of the head. */
+async function runGen1(s: Stores, claim: ClaimResponse, opts: { file?: string; dirty?: string } = {}): Promise<string> {
   const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-settle-g1-"));
   let head = "";
   const factory: ExecutorFactory = (runId) => ({
@@ -131,7 +133,8 @@ async function runGen1(s: Stores, claim: ClaimResponse): Promise<string> {
     executor: {
       run: async (ctx: RunContext): Promise<ExecutorResult> => {
         fs.mkdirSync(path.join(homeRoot, runId), { recursive: true });
-        head = commitInTree(ctx.worktreePath, "GEN1.txt", "gen1 committed work\n");
+        head = commitInTree(ctx.worktreePath, opts.file ?? "GEN1.txt", "committed work\n");
+        if (opts.dirty) fs.writeFileSync(path.join(ctx.worktreePath, opts.dirty), "uncommitted parked work\n");
         throw new TransientRecoveryError();
       },
     },
@@ -277,6 +280,66 @@ describe("real-git adoption → settle (issue #1582 M2)", () => {
     });
     assert.ok(isAncestor(fx.originPath, gen1Head, pushed));
     assert.deepEqual(await s.settlement.listRun(gen2Claim.run_id), []);
+  });
+
+  it("a recovered wip(park) marker: no generation that adopts past it records evidence for it (gen2 and gen3); a contained sibling still settles", async () => {
+    const iid = 6105;
+    const branch = branchOf(iid);
+    const s = stores(git);
+    // gen1 commits work and parks with UNCOMMITTED work → the park commits a real wip(park) marker.
+    const gen1Claim = gitlabClaim(iid, { claim_generation: 1 });
+    const gen1Head = await runGen1(s, gen1Claim, { dirty: "WIP.txt" });
+    const g1 = (await s.coord.inspect(gen1Claim.run_id)).find((r) => r.generation === 1);
+    assert.ok(g1, "gen1 left an authenticated journal record");
+    const marker = g1!.sourceSha;
+    assert.notEqual(marker, gen1Head, "precondition: gen1's journaled source is the marker, not its committed head");
+    assert.match(gitOut(bare(), "log", "-1", "--format=%s", marker), /^wip\(park\):/, "precondition: a real wip(park) marker");
+    assert.equal(gitOut(bare(), "rev-parse", `${marker}^`), gen1Head, "the marker sits on gen1's committed head");
+
+    // gen2 resumes on the REAL tracking leg, recovers the marker (reset --soft), commits, parks again.
+    const seeds: Array<{ seededFrom: string; wipRecovered?: boolean; baseCommit: string }> = [];
+    const orig = git.createOrAttachRunnerClone.bind(git);
+    git.createOrAttachRunnerClone = async (...args: Parameters<GitCache["createOrAttachRunnerClone"]>) => {
+      const clone = await orig(...args);
+      seeds.push({ seededFrom: clone.seededFrom, wipRecovered: clone.wipRecovered, baseCommit: clone.baseCommit });
+      return clone;
+    };
+    s.recoveryClient.holds = [{ hold_id: HOLD_G1, generation: 1, has_available_capture: true }];
+    const gen2Claim = { ...gen1Claim, claim_generation: 2 } as ClaimResponse;
+    const gen2Head = await runGen1(s, gen2Claim, { file: "GEN2.txt" });
+    assert.deepEqual(seeds[0], { seededFrom: "tracking", wipRecovered: true, baseCommit: gen1Head }, "gen2 recovered the marker");
+    assert.ok(!isAncestor(bare(), marker, gen2Head), "the marker is out of gen2's history");
+    assert.deepEqual(await s.settlement.listRun(gen1Claim.run_id), [], "gen2 recorded no evidence for gen1's marker");
+    assert.equal(refOrNull(bare(), `refs/uzi-settle/${gen1Claim.run_id}/${HOLD_G1}/source`), null, "no pin for gen1");
+
+    // gen3 resumes NORMALLY on gen2's committed tip (no marker to recover) and completes.
+    s.recoveryClient.holds = [
+      { hold_id: HOLD_G1, generation: 1, has_available_capture: true },
+      { hold_id: HOLD_OTHER, generation: 2, has_available_capture: true },
+    ];
+    const gen3Claim = { ...gen1Claim, claim_generation: 3 } as ClaimResponse;
+    const settleClient = new FakeSettleClient(released);
+    await runGen2(s, gen3Claim, settleClient);
+    assert.equal(seeds[1]!.seededFrom, "tracking");
+    assert.notEqual(seeds[1]!.wipRecovered, true, "gen3 recovered no marker of its own");
+    const pushed = gitOut(fx.originPath, "rev-parse", branch);
+    assert.deepEqual(
+      settleClient.calls.map((c) => [c.holdId, c.req]),
+      [
+        [
+          HOLD_OTHER,
+          { predecessor_generation: 2, successor_generation: 3, pushed_sha: pushed, source_sha: gen2Head, adopted_sha: gen2Head },
+        ],
+      ],
+      "only gen2's contained source is settled; gen1's marker is never sent",
+    );
+    assert.equal(refOrNull(bare(), `refs/uzi-settle/${gen3Claim.run_id}/${HOLD_G1}/source`), null, "no pin for gen1's marker");
+    assert.deepEqual(await s.settlement.listRun(gen3Claim.run_id), [], "gen2's hold released; nothing recorded for gen1");
+    assert.deepEqual(
+      (await s.coord.inspect(gen3Claim.run_id)).map((r) => r.generation),
+      [1],
+      "gen1's journal (the marker source) is retained",
+    );
   });
 });
 

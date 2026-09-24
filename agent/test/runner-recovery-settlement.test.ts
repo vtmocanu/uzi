@@ -52,9 +52,21 @@ function refOrNull(bare: string, ref: string): string | null {
   }
 }
 
-/** A real commit on a side branch of the origin fixture (fetched into the worker bare at clone),
- *  standing in for a predecessor generation's journaled source. */
+/** A real commit on the origin fixture's `main` (fetched into the worker bare at clone), standing in
+ *  for a predecessor generation's journaled source. It is contained in the adopted base (the clone
+ *  seeds off main's tip), which the runner's local pre-filter requires before recording evidence. */
 function originCommit(branch: string, file: string): string {
+  const o = fx.originPath;
+  fs.writeFileSync(path.join(o, file), `${branch}\n`);
+  gitOut(o, "add", file);
+  gitOut(o, ...IDENT, "commit", "-q", "-m", `prior ${branch}`);
+  return gitOut(o, "rev-parse", "HEAD");
+}
+
+/** A real commit on a SIDE branch of the origin fixture: present in the worker bare after clone but
+ *  NOT an ancestor of the adopted base (the shape of a recovered wip(park) marker, which the reseed
+ *  resets --soft out of history). */
+function sideCommit(branch: string, file: string): string {
   const o = fx.originPath;
   gitOut(o, "checkout", "-q", "-b", branch, "main");
   fs.writeFileSync(path.join(o, file), `${branch}\n`);
@@ -91,7 +103,7 @@ interface Rig {
 
 /** A token-keyed coordinator + settlement journal over temp roots, and (optionally) the real
  *  clone seeding re-labelled as `seededFrom` so the adoption gate can be exercised per leg. */
-function rig(seededFrom?: RunnerClone["seededFrom"], events?: string[], opts: { wipRecovered?: boolean } = {}): Rig {
+function rig(seededFrom?: RunnerClone["seededFrom"], events?: string[]): Rig {
   const recoveryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-settle-rec-"));
   const settlementRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-settle-set-"));
   const recoveryClient = new FakeRecoveryClient();
@@ -109,8 +121,7 @@ function rig(seededFrom?: RunnerClone["seededFrom"], events?: string[], opts: { 
   const orig = g.createOrAttachRunnerClone.bind(g);
   g.createOrAttachRunnerClone = async (...args: Parameters<GitCache["createOrAttachRunnerClone"]>) => {
     const clone = await orig(...args);
-    let out = seededFrom ? { ...clone, seededFrom } : clone;
-    if (opts.wipRecovered !== undefined) out = { ...out, wipRecovered: opts.wipRecovered };
+    const out = seededFrom ? { ...clone, seededFrom } : clone;
     seeded.push(out);
     return out;
   };
@@ -358,6 +369,31 @@ describe("RunRunner — adoption evidence + settle of an older-generation hold (
       r.cleanup();
     }
   });
+
+  it("the containment pre-filter is PER HOLD: a contained source settles while a sibling outside the adopted base gets nothing", async () => {
+    const r = rig("tracking");
+    try {
+      const srcOut = sideCommit("prior-out", "OUT.txt"); // gen2's source: not in the adopted base
+      const srcIn = originCommit("prior-in", "IN.txt"); // gen1's source: contained in the adopted base
+      const claim = gitlabClaim(5107, { claim_generation: 3 });
+      await r.coord.pin({ runId: claim.run_id, sourceSha: srcIn, kind: "issue", branch: "b", generation: 1 });
+      await r.coord.pin({ runId: claim.run_id, sourceSha: srcOut, kind: "issue", branch: "b", generation: 2 });
+      r.recoveryClient.holds = [
+        { hold_id: HOLD_A, generation: 1, has_available_capture: true },
+        { hold_id: HOLD_B, generation: 2, has_available_capture: true },
+      ];
+      r.settleClient.answer = (h) => released(claim.run_id, h);
+      await runCompleting(r, claim);
+      assert.ok(hasStatus(claim.run_id, "completed"));
+      assert.deepEqual(r.settleClient.calls.map((c) => [c.holdId, c.req.source_sha]), [[HOLD_A, srcIn]]);
+      assert.deepEqual(await r.settlement.listRun(claim.run_id), [], "no record for the skipped hold");
+      const pins = gitOut(bare(), "for-each-ref", "--format=%(refname)", `refs/uzi-settle/${claim.run_id}/`);
+      assert.equal(pins, "", "the settled hold's pins are cleaned up; the skipped hold was never pinned");
+      assert.deepEqual((await r.coord.inspect(claim.run_id)).map((p) => p.generation), [2], "gen2's journal retained");
+    } finally {
+      r.cleanup();
+    }
+  });
 });
 
 describe("RunRunner — NO adoption evidence (issue #1582 M2)", () => {
@@ -388,16 +424,23 @@ describe("RunRunner — NO adoption evidence (issue #1582 M2)", () => {
     }
   });
 
-  it("a tracking adoption that recovered a wip(park) marker records nothing (the marker is out of history)", async () => {
-    const r = rig("tracking", undefined, { wipRecovered: true });
+  it("a tracking adoption whose predecessor source is NOT contained in the adopted base records nothing (no pin, hold retained)", async () => {
+    const r = rig("tracking");
     try {
-      const src = originCommit("prior-wip", "PRIOR.txt");
+      // The predecessor's journaled source is a real commit present in the bare but outside the
+      // adopted base's history, the shape of a wip(park) marker the reseed reset --soft away.
+      const src = sideCommit("prior-wip", "PRIOR.txt");
       const claim = gitlabClaim(5205, { claim_generation: 2 });
       const pred = await r.coord.pin({ runId: claim.run_id, sourceSha: src, kind: "issue", branch: "agent/issue-5205", generation: 1 });
       assert.ok(pred, "precondition: the predecessor's authenticated journal record exists");
       r.recoveryClient.holds = [{ hold_id: HOLD_A, generation: 1, has_available_capture: true }];
       await expectNothing(r, claim);
-      assert.equal(r.seeded[0]!.wipRecovered, true);
+      const adopted = r.seeded[0]!.baseCommit;
+      assert.equal(gitOut(bare(), "rev-parse", "--verify", `${src}^{commit}`), src, "precondition: the source is in the bare");
+      assert.throws(
+        () => gitOut(bare(), "merge-base", "--is-ancestor", src, adopted),
+        "precondition: the source is not an ancestor of the adopted base",
+      );
       const pins = gitOut(bare(), "for-each-ref", "--format=%(refname)", `refs/uzi-settle/${claim.run_id}/`);
       assert.equal(pins, "", "no settlement pin");
       assert.equal((await r.coord.inspect(claim.run_id)).length, 1, "predecessor journal untouched");
@@ -425,7 +468,8 @@ describe("RunRunner — NO adoption evidence (issue #1582 M2)", () => {
       const pred = await r.coord.pin({ runId: claim.run_id, sourceSha: src, kind: "issue", branch: "b", generation: 1 });
       const file = path.join(r.recoveryRoot, claim.run_id, `${pred!.captureId}.json`);
       const obj = JSON.parse(fs.readFileSync(file, "utf8"));
-      obj.sourceSha = gitOut(fx.originPath, "rev-parse", "main"); // redirect the source
+      obj.sourceSha = gitOut(fx.originPath, "rev-parse", "main~1"); // redirect the source (still contained)
+      assert.notEqual(obj.sourceSha, src, "precondition: the tamper changes the source");
       fs.writeFileSync(file, JSON.stringify(obj));
       r.recoveryClient.holds = [{ hold_id: HOLD_A, generation: 1, has_available_capture: true }];
       await expectNothing(r, claim);

@@ -6826,8 +6826,9 @@ export class RunRunner {
    * own mirrored checkpoint (never a default/origin reseed). For each hold with generation below
    * the current claim generation, the predecessor's source comes ONLY from its MAC-authenticated
    * recovery-journal record for that exact generation (none/invalid ⇒ skip, the hold stays
-   * retained). The source and adopted tip are pinned under `refs/uzi-settle/...` (both must be
-   * present in the bare) before the record is written. Best-effort, local and credential-free.
+   * retained), and only a source contained in the adopted base is kept (a local skip-only filter).
+   * The source and adopted tip are pinned under `refs/uzi-settle/...` (both must be present in the
+   * bare) before the record is written. Best-effort, local and credential-free.
    */
   private async recordAdoptionEvidence(
     claim: ClaimResponse,
@@ -6840,11 +6841,6 @@ export class RunRunner {
     const successor = claim.claim_generation;
     if (!clone || !barePath || successor === undefined) return;
     if (clone.seededFrom !== "tracking" && clone.seededFrom !== "checkpoint") return;
-    // A recovered wip(park) marker is reset --soft out of history (git.ts createOrAttachRunnerClone;
-    // baseCommit is the marker's parent), so the predecessor's journaled source (the marker) can
-    // never be an ancestor of the published head: evidence here would only yield a certain
-    // not_ancestor terminal. Record nothing; the hold stays retained (fail-closed).
-    if (clone.wipRecovered === true) return;
     const seededFrom = clone.seededFrom;
     try {
       const records = await this.recovery.inspect(claim.run_id);
@@ -6855,6 +6851,13 @@ export class RunRunner {
         if (!isSafeSettlementId(claim.run_id) || !isSafeSettlementId(hold.hold_id)) continue;
         const pred = records.find((r) => r.generation === hold.generation);
         if (!pred) continue; // no authenticated predecessor source → no evidence; hold retained
+        // Local pre-filter (it can only skip, never release; the server does the forge proof): record
+        // evidence only when the predecessor's source is contained in (an ancestor of, or equal to)
+        // the adopted base in the trusted bare. A recovered wip(park) marker is reset --soft out of
+        // history, so it is never contained, and neither is any other source the adopted base does
+        // not include. Not contained, or the check errors → no pin, no record; the hold is retained.
+        if (!/^[0-9a-f]{40}$/.test(pred.sourceSha)) continue;
+        if (!(await this.git.isAncestorRef(barePath, pred.sourceSha, clone.baseCommit))) continue;
         const pinned = await this.git.pinSettlementRefs(barePath, claim.run_id, hold.hold_id, {
           source: pred.sourceSha,
           adopted: clone.baseCommit,

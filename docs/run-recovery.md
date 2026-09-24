@@ -179,10 +179,12 @@ rate-limited, erroring, or inconclusive answer, or a run whose state changed
 underneath the check, keeps the hold open and the worker retries later with
 backoff (up to a bounded number of attempts); a definite "not contained", a
 candidate that contradicts the server's record, or a branch that no longer
-exists stops automatic settlement for that hold. A resume that recovered
-uncommitted parked work (a `wip(park)` checkpoint restored as uncommitted
-changes) does not attempt automatic settlement, so that older hold stays open
-for `uzi run export` or `uzi run discard`. A hold that settlement can't clear behaves
+exists stops automatic settlement for that hold. Before reporting anything,
+the worker also checks locally that the older generation's recorded source is
+contained in the commit the resume adopted. When it isn't (for example, a
+resume that restored uncommitted parked work from a `wip(park)` checkpoint),
+that hold gets no settlement attempt from this resume and stays open unless a
+later publication proves it. A hold that settlement can't clear behaves
 exactly like any other open hold: it still shows up under **Recovery
 archives**, and you can still resolve it yourself with `uzi run export` or
 `uzi run discard`.
