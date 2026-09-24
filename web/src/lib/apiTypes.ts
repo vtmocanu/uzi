@@ -2523,6 +2523,20 @@ export interface Run {
    *  newer server may ship a cause this build has not heard of), the same rule as
    *  rate_limit_type. */
   recovery_wait_cause: string | null;
+  /** PRD #1590 D6: what a run held on its Codex subscription account needs next. Non-null
+   *  only for a `recovery_wait` run whose recovery_wait_cause is "codex_account_unavailable";
+   *  derived at read time from the run's frozen binding and never persisted. Known values:
+   *  "reconciling" (the account recovers on its own), "relogin_required" (the owner must log
+   *  in again), "verifying_login" (a new login is being verified) and "resuming" (usable
+   *  again; the run resumes on the next sweep tick). Null on any other run, or when the
+   *  server's best-effort derivation failed. Render an unrecognised value honestly, the same
+   *  rule as recovery_wait_cause. */
+  codex_account_action: string | null;
+  /** PRD #1590 D6: the run's OWN snapshotted Codex alias label, shown beside
+   *  codex_account_action so the owner knows which login to fix. Non-null only when
+   *  codex_account_action is non-null. User-authored: render as text through sanitizeLabel,
+   *  never as markup. */
+  codex_secret_label: string | null;
   /** PRD #1392 M1: when the server will promote a `recovery_wait` run back to queued — the
    *  retry stamp the forge-park surface counts down to ("retry at HH:MM"). The
    *  recovery-park analog of retry_not_before (the usage-limit park's stamp) and a SEPARATE

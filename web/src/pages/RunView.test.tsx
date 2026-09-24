@@ -189,6 +189,8 @@ function run(over: Partial<Run>): Run {
     limit_wait_count: 0,
     rate_limit_type: null,
     recovery_wait_cause: null,
+    codex_account_action: null,
+    codex_secret_label: null,
     recovery_retry_not_before: null,
     forge_park_count: 0,
     forge_park_max: 0,
@@ -4651,6 +4653,101 @@ describe("RecoveryWaitPanel (issue #1197)", () => {
     );
     expect(container.textContent).toContain("transient interruption");
     expect(container.textContent).not.toContain("Waiting for the forge");
+  });
+});
+
+// PRD #1590 D6: a run held on an unusable Codex account. The copy is keyed on the
+// server-derived codex_account_action; the hold has no timer, so nothing counts down.
+describe("RecoveryWaitPanel: codex_account_unavailable (PRD #1590)", () => {
+  const codexRun = (over: Partial<Run> = {}) =>
+    run({
+      status: "recovery_wait",
+      recovery_wait_cause: "codex_account_unavailable",
+      // A stale forge retry stamp must not leak a countdown into this cause.
+      recovery_retry_not_before: "2026-01-01T09:30:00Z",
+      forge_park_count: 2,
+      forge_park_max: 5,
+      ...over,
+    });
+  const renderPanel = (r: Run) =>
+    render(
+      <MemoryRouter>
+        <RecoveryWaitPanel run={r} />
+      </MemoryRouter>,
+    );
+
+  it.each([
+    ["reconciling", "Waiting: Codex account is reconciling"],
+    ["verifying_login", "Waiting: verifying the new Codex login"],
+    ["resuming", "Resuming: Codex account available again"],
+  ])("renders the %s action", (action, heading) => {
+    const { container } = renderPanel(codexRun({ codex_account_action: action, codex_secret_label: "work" }));
+    expect(container.querySelector('[role="status"]')?.textContent).toContain(heading);
+    // Only relogin_required sends the owner to Settings.
+    expect(container.querySelector('a[href="/settings"]')).toBeNull();
+    expect(container.textContent).not.toContain("transient interruption");
+    expect(container.textContent).not.toContain("Waiting for the forge");
+  });
+
+  it("renders relogin_required with the run's label and a link to the Codex credentials settings", () => {
+    const { container } = renderPanel(
+      codexRun({ codex_account_action: "relogin_required", codex_secret_label: "work-codex" }),
+    );
+    expect(container.querySelector('[role="status"]')?.textContent).toBe(
+      "⏸ Waiting: re-log in Codex credential “work-codex” to continue",
+    );
+    const link = container.querySelector('a[href="/settings"]');
+    expect(link).not.toBeNull();
+    expect(link?.textContent).toBe("Log in again in Settings");
+  });
+
+  it("uses label-less wording for relogin_required when the run has no label", () => {
+    for (const label of [null, "", "\u200b"]) {
+      cleanup();
+      const { container } = renderPanel(codexRun({ codex_account_action: "relogin_required", codex_secret_label: label }));
+      expect(container.querySelector('[role="status"]')?.textContent).toBe(
+        "⏸ Waiting: re-log in the run's Codex credential to continue",
+      );
+      expect(container.querySelector('a[href="/settings"]')).not.toBeNull();
+    }
+  });
+
+  it("renders the label as text only, never as markup, with format characters stripped", () => {
+    const { container } = renderPanel(
+      codexRun({ codex_account_action: "relogin_required", codex_secret_label: "<img src=x onerror=alert(1)>\u202eab" }),
+    );
+    expect(container.querySelector("img")).toBeNull();
+    const heading = container.querySelector('[role="status"]')?.textContent ?? "";
+    expect(heading).toContain("“<img src=x onerror=alert(1)>ab”");
+    expect(heading).not.toContain("\u202e");
+  });
+
+  it("falls back to an honest generic line for an unknown or null action", () => {
+    for (const action of [null, "some_future_action"]) {
+      cleanup();
+      const { container } = renderPanel(codexRun({ codex_account_action: action, codex_secret_label: "work" }));
+      const heading = container.querySelector('[role="status"]')?.textContent ?? "";
+      expect(heading).toContain("Waiting: Codex account unavailable");
+      // It never claims a known action, never shows the label and never links out.
+      expect(heading).not.toContain("work");
+      expect(container.querySelector('a[href="/settings"]')).toBeNull();
+      expect(container.textContent).not.toContain("transient interruption");
+    }
+  });
+
+  it("shows no countdown, retry time or park count: the hold has no timer", () => {
+    for (const action of ["reconciling", "relogin_required", "verifying_login", "resuming", null]) {
+      cleanup();
+      const { container } = renderPanel(codexRun({ codex_account_action: action, codex_secret_label: "work" }));
+      const text = container.textContent ?? "";
+      expect(text).not.toMatch(/Retry at/);
+      expect(text).not.toMatch(/Attempt/);
+      expect(text).not.toContain("2 of 5");
+      expect(text).not.toContain("Resumes in");
+      expect(text).toContain("This hold does not expire");
+      // Cancel stays the page's Stop control; the panel offers no button of its own.
+      expect(container.querySelector("button")).toBeNull();
+    }
   });
 });
 
