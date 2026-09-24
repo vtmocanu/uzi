@@ -220,7 +220,7 @@ describe("rmHomeTree (#1607)", () => {
         }
         await rmTreeForce(t);
       },
-      purgeChildrenAsRunner: async () => {
+      purgeChildrenAsAgents: async () => {
         calls.push("purge");
       },
     };
@@ -251,7 +251,7 @@ describe("rmHomeTree (#1607)", () => {
     await fs.chmod(root, 0o700);
     let modeAtPurge = -1;
     const { deps, calls } = fakeDeps(true, 1);
-    deps.purgeChildrenAsRunner = async (t) => {
+    deps.purgeChildrenAsAgents = async (t) => {
       calls.push("purge");
       modeAtPurge = (await fs.lstat(t)).mode & 0o777;
     };
@@ -264,7 +264,7 @@ describe("rmHomeTree (#1607)", () => {
   it("split: the helper's own failure is not the verdict; the worker's final pass is", async () => {
     const root = await mktmp();
     const { deps, calls } = fakeDeps(true, 1);
-    deps.purgeChildrenAsRunner = async () => {
+    deps.purgeChildrenAsAgents = async () => {
       calls.push("purge");
       throw new Error("helper exited 1");
     };

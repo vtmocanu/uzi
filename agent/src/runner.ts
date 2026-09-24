@@ -750,6 +750,11 @@ interface RunFlight {
   preClonePark: boolean;
   /** Retain the only copy of unverified recovery work; never guard non-filesystem cleanup. */
   preserveRecoveryClone: boolean;
+  /** #1607: this claim was superseded (stale_claim). Another claim owns the run and, on a
+   *  same-worker re-claim, the SAME `agent-home/<runId>`, so the teardown must not delete that
+   *  HOME. It does not preserve anything else, and it is not a resume signal: the startup reclaim
+   *  removes the HOME once the api reports the run terminal. */
+  superseded: boolean;
   lastPublish: number;
   lastPublishedTip: string | undefined;
   /** PRD #1062 M2 (#1036): the current tip of `refs/uzi-checkpoints/<branch>` as this run last
@@ -1733,7 +1738,9 @@ export class RunRunner {
         // run now, so STOP this flight. Caught here BEFORE the generic terminal path (mirroring the
         // PauseNowSignal arm above, but WITHOUT its park): log, close the batcher, and report NO
         // terminal state — a `failed` here would fight the owning claim — and set NO preserve flag
-        // (normal teardown: the new claim has its own clone). The finally then runs ordinary cleanup.
+        // (normal teardown: the new claim has its own clone). The finally then runs ordinary cleanup,
+        // except the HOME: `superseded` keeps it, since a same-worker re-claim shares it (#1607).
+        flight.superseded = true;
         runLog.info("run claim superseded server-side (stale_claim); stopping this flight");
         await batcher.close().catch(() => undefined);
       } else if (err instanceof RunningAckTerminalError) {
@@ -1965,7 +1972,11 @@ export class RunRunner {
       // measured for one run). Still best-effort and still swallowing its own
       // error: this is a `finally`, and a cleanup that threw would convert a
       // completed run into a failed one, which is strictly worse than a leak.
-      if (runHome && !preserveResumeArtifacts) {
+      //
+      // A superseded claim (#1607) keeps the HOME too: the owning claim may be a same-worker
+      // re-claim using this very `agent-home/<runId>`. The startup reclaim collects it once the
+      // api reports the run terminal.
+      if (runHome && !preserveResumeArtifacts && !flight.superseded) {
         await rmHomeTree(runHome).catch((e) =>
           runLog.warn("run HOME cleanup failed", { error: errMessage(e) }),
         );
@@ -4706,6 +4717,7 @@ export class RunRunner {
       // else, so no other path's HOME preservation semantics change.
       preClonePark: false,
       preserveRecoveryClone: false,
+      superseded: false,
       ciFixHumanApproved: false,
       runnerClone: undefined,
       result: undefined,

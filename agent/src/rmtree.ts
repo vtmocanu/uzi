@@ -3,7 +3,7 @@ import { constants } from "node:fs";
 import { execFile } from "node:child_process";
 import path from "node:path";
 import { promisify } from "node:util";
-import { runnerCommand, uidSplitActive } from "./runner-uid.js";
+import { commandRootCommand, runnerCommand, uidSplitActive } from "./runner-uid.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -134,9 +134,13 @@ export async function restoreTreeWritability(target: string): Promise<void> {
  *  2. Only under the split and only on a permission error: make the worker-owned
  *     root traversable by group `runner` (an `fchmod` on an `O_NOFOLLOW` handle,
  *     refusing anything that is not a directory the worker owns), then delete the
- *     root's CHILDREN as `runner` through the existing cap-clearing `setpriv`
- *     wrapper ({@link runnerCommand}). This is not an escalation: the helper holds
- *     exactly the privileges the agent that wrote those files already had.
+ *     root's CHILDREN as each agent uid through the existing cap-clearing `setpriv`
+ *     wrappers: `runner`, then `runner-cmd` (Codex command roots are members of group
+ *     `runner` and can write into a group-writable HOME), then `runner` again for
+ *     what the second pass unblocked. Each pass also opens its own directories to
+ *     group `runner`, so the other uid can reach entries nested inside. This is not
+ *     an escalation: each helper holds exactly the privileges of the agent surface
+ *     that wrote those files, and every caller runs after those surfaces are reaped.
  *  3. Finish with {@link rmTreeForce} as the worker, which removes the root (a
  *     `runner` helper cannot: the root is worker-owned under the sticky
  *     `agent-home` parent) plus any worker-owned leftovers.
@@ -159,7 +163,7 @@ export async function rmHomeTree(target: string, deps: HomeRemovalDeps = default
   // The helper's exit status is not the verdict: it cannot remove the root and may
   // legitimately leave worker-owned entries. The final worker pass below is what
   // throws if anything is still in the way.
-  await deps.purgeChildrenAsRunner(target).catch(() => undefined);
+  await deps.purgeChildrenAsAgents(target).catch(() => undefined);
   await deps.removeTree(target);
 }
 
@@ -167,14 +171,14 @@ export async function rmHomeTree(target: string, deps: HomeRemovalDeps = default
 export interface HomeRemovalDeps {
   splitActive: boolean;
   removeTree: (target: string) => Promise<void>;
-  purgeChildrenAsRunner: (target: string) => Promise<void>;
+  purgeChildrenAsAgents: (target: string) => Promise<void>;
 }
 
 function defaultHomeRemovalDeps(env: NodeJS.ProcessEnv = process.env): HomeRemovalDeps {
   return {
     splitActive: uidSplitActive(env),
     removeTree: rmTreeForce,
-    purgeChildrenAsRunner: purgeChildrenAsRunner,
+    purgeChildrenAsAgents: purgeChildrenAsAgents,
   };
 }
 
@@ -203,9 +207,10 @@ async function openRootToRunnerGroup(target: string): Promise<void> {
 }
 
 /**
- * The script the `runner` helper runs, as `node -e <script> <target>`. It walks the
- * root's children adding owner `rwx` to directories (the `0555` Go module cache),
- * then removes each child. Both steps refuse to follow symlinks: the walk opens with
+ * The script each agent-uid helper runs, as `node -e <script> <target>`. It walks the
+ * root's children adding owner and group `rwx` to the directories it owns (the `0555`
+ * Go module cache, a private `0700` dir the other agent uid must traverse), then
+ * removes each child it can. Both steps refuse to follow symlinks: the walk opens with
  * `O_NOFOLLOW`, readdir types entries from `lstat`, and `rmSync` unlinks a symlink
  * rather than its target. It never touches the root itself. Errors are swallowed per
  * entry; the worker's final pass reports what remains.
@@ -218,7 +223,7 @@ const flags = fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_
 function widen(dir) {
   let fd;
   try { fd = fs.openSync(dir, flags); } catch { return; }
-  try { fs.fchmodSync(fd, (fs.fstatSync(fd).mode & 0o7777) | 0o700); } catch {} finally { fs.closeSync(fd); }
+  try { fs.fchmodSync(fd, (fs.fstatSync(fd).mode & 0o7777) | 0o770); } catch {} finally { fs.closeSync(fd); }
   let entries;
   try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
   for (const e of entries) if (e.isDirectory()) widen(path.join(dir, e.name));
@@ -233,20 +238,27 @@ for (const e of children) {
 process.exit(failed === 0 ? 0 : 1);
 `;
 
-/** Hard ceiling on the helper, so a pathological tree cannot hang a run's teardown. */
+/** Hard ceiling per helper pass, so a pathological tree cannot hang a run's teardown. */
 const PURGE_TIMEOUT_MS = 120_000;
 
 /**
- * Run {@link PURGE_CHILDREN_SCRIPT} as `runner` (or directly single-uid, where it is
- * the same uid and only reached from tests). The env is minimal and explicit: the
- * helper needs no credential, and the worker's own env (PAT, join token) must not
- * reach a runner process.
+ * Run {@link PURGE_CHILDREN_SCRIPT} as `runner`, then `runner-cmd`, then `runner` again
+ * (or directly single-uid, where it is the same uid and only reached from tests). Each
+ * pass's failure is expected (it cannot remove what the other uid owns), so only a
+ * spawn that could not run at all is surfaced, and the caller ignores even that: the
+ * worker's final pass is the verdict. The env is minimal and explicit: the helpers need
+ * no credential, and the worker's own env (PAT, join token) must not reach them.
  */
-async function purgeChildrenAsRunner(target: string): Promise<void> {
-  const wrapped = runnerCommand(process.execPath, ["-e", PURGE_CHILDREN_SCRIPT, target]);
-  await execFileAsync(wrapped.command, wrapped.args, {
-    env: { PATH: "/usr/local/bin:/usr/bin:/bin" },
-    timeout: PURGE_TIMEOUT_MS,
-    maxBuffer: 64 * 1024,
-  });
+async function purgeChildrenAsAgents(target: string): Promise<void> {
+  for (const wrap of [runnerCommand, commandRootCommand, runnerCommand]) {
+    const wrapped = wrap(process.execPath, ["-e", PURGE_CHILDREN_SCRIPT, target]);
+    await execFileAsync(wrapped.command, wrapped.args, {
+      env: { PATH: "/usr/local/bin:/usr/bin:/bin" },
+      timeout: PURGE_TIMEOUT_MS,
+      maxBuffer: 64 * 1024,
+    }).catch((e: NodeJS.ErrnoException & { code?: unknown }) => {
+      // A non-zero exit is the expected partial pass; only a helper that could not run is news.
+      if (typeof e.code !== "number") throw e;
+    });
+  }
 }

@@ -41,6 +41,12 @@ function asRunner(script: string, ...args: string[]): void {
   execFileSync(wrapped.command, wrapped.args, { stdio: "inherit", env: { PATH: "/usr/bin:/bin" } });
 }
 
+/** Run a shell snippet as the Codex command-root uid `runner-cmd` (10003). */
+function asCommand(script: string, ...args: string[]): void {
+  const wrapped = runnerUid.commandRootCommand("/bin/sh", ["-c", script, "sh", ...args]);
+  execFileSync(wrapped.command, wrapped.args, { stdio: "inherit", env: { PATH: "/usr/bin:/bin" } });
+}
+
 /**
  * Create a HOME the way production does (worker-owned root, group `runner` via the setgid
  * parent) and fill it as `runner` with the leaked shape, including symlinks that point at
@@ -52,6 +58,7 @@ async function makeLeakedHome(name: string, rootMode: number): Promise<string> {
   await fs.chmod(home, 0o2770);
   asRunner(
     `set -e
+     umask 002
      h="$1"; s="$2"
      mod="$h/go/pkg/mod/gopkg.in/inf.v0@v0.9.1"
      mkdir -p "$mod" "$h/.claude/projects/-app"
@@ -64,6 +71,19 @@ async function makeLeakedHome(name: string, rootMode: number): Promise<string> {
      chmod 0700 "$h/.claude/projects" "$h/.claude/projects/-app"`,
     home,
     SENTINEL_DIR,
+  );
+  // Codex command roots (runner-cmd, a member of group runner) can write into the
+  // group-writable HOME and into runner's group-writable dirs. Their private 0700 dirs are
+  // opaque to both the worker and runner (#1607 review).
+  asCommand(
+    `set -e
+     umask 002
+     h="$1"
+     mkdir -p "$h/cmd-private/deep" "$h/go/cmd-private"
+     echo x > "$h/cmd-private/deep/out.txt"
+     echo x > "$h/go/cmd-private/out.txt"
+     chmod 0700 "$h/cmd-private/deep" "$h/cmd-private" "$h/go/cmd-private"`,
+    home,
   );
   // The root mode last: advice HOMEs were observed at 2700 on a hosted worker.
   await fs.chmod(home, rootMode);
