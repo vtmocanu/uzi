@@ -142,8 +142,7 @@ func (s *supervisor) run(childPid int, st procStatus) int {
 					// deadline: a tree too big for it is retained "deadline".
 					// The deadline is checked between entries, so the reply can
 					// overrun it by at most one entry's unlinkat (e.g. freeing a
-					// heavily fragmented file), which a command could already
-					// stall a drain with.
+					// heavily fragmented file).
 					// It never changes the exit code.
 					withTmpCleanup(m, s.cleanupTmp(cleanupDeadline))
 					_ = s.ev.writeJSON(m)
@@ -162,8 +161,8 @@ func (s *supervisor) run(childPid int, st procStatus) int {
 //
 // The command tmp is removed only when that drain reached drained. An
 // unconfirmed drain may leave a live descendant still using the tmp, so it is
-// left untouched for the startup orphan reaper (supervisor --reap-orphans,
-// added with the reaper). A drained cleanup removes it within what is left of
+// left untouched for the startup orphan reaper (the --reap-orphans mode in
+// reaper.go). A drained cleanup removes it within what is left of
 // that drain's defaultDisposeTimeoutMs deadline.
 func (s *supervisor) abnormal(reason string) int {
 	cleanup, cleanupDeadline := s.drainWith(defaultDisposeTimeoutMs)

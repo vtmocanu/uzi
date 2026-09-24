@@ -11,7 +11,8 @@
 //     failing closed if applying it fails); ONLY a probe result of "unavailable"
 //     (ENOSYS/EOPNOTSUPP) runs the command WITHOUT filesystem confinement,
 //     relying on the uid split. It never relaxes no_new_privs, the private 0700
-//     tmp adoption check, the cwd-inside-root check or exit-status passthrough.
+//     tmp and cache adoption checks, the cwd-inside-root check or exit-status
+//     passthrough.
 //
 // The private tmp (--tmp) is created, locked and removed by the supervisor
 // above this process: it holds the creation pin and outlives any backgrounded
@@ -19,6 +20,14 @@
 // cleanup role. It only ADOPTS --tmp, refusing it unless it is a real directory
 // (not a symlink) owned by the calling uid with mode exactly 0700 and EMPTY, and
 // grants the Landlock tmp rule through the adopted fd, never by path again.
+//
+// The optional per-run cache (--cache) is created, locked and held by the
+// supervisor's --hold-cache mode, not by this command. It is adopted like the
+// tmp (a real directory, not a symlink, owned by the calling uid, mode exactly
+// 0700) EXCEPT that it need not be empty, because it persists across a run's
+// commands, and it is granted the same full rights through its adopted fd: a
+// rule on that run's directory only, never on the cache root above it. The
+// adoption checks run in every mode, including the best-effort degrade.
 //
 // "Unavailable" is defined by errno (D8): a version probe returning ENOSYS or
 // EOPNOTSUPP is unavailable; any other errno, an ABI below 1, and every later
@@ -137,7 +146,7 @@ func setupFailure(stage string, err error) int {
 }
 
 func realMain(args []string) int {
-	root, tmp, cwd, mode, child, err := parseArgs(args)
+	root, tmp, cwd, cache, mode, child, err := parseArgs(args)
 	if err != nil {
 		return setupFailure("invalid arguments", err)
 	}
@@ -145,9 +154,17 @@ func realMain(args []string) int {
 	if err != nil {
 		return setupFailure("adopt private tmp", err)
 	}
-	// The adopted fd is close-on-exec, so the child never inherits it.
+	// The adopted fds are close-on-exec, so the child never inherits them.
 	defer unix.Close(tmpFd)
-	if err := applyPolicy(root, tmpFd, mode, realVersionProbe, confine, applyNoNewPrivs); err != nil {
+	cacheFd := -1
+	if cache != "" {
+		cacheFd, err = adoptCache(cache, os.Getuid(), unix.Open, unix.Fstat)
+		if err != nil {
+			return setupFailure("adopt cache", err)
+		}
+		defer unix.Close(cacheFd)
+	}
+	if err := applyPolicy(root, grantFds{tmp: tmpFd, cache: cacheFd}, mode, realVersionProbe, confine, applyNoNewPrivs); err != nil {
 		return setupFailure("apply Landlock policy", err)
 	}
 	if err := os.Chdir(cwd); err != nil {
@@ -195,6 +212,32 @@ func adoptPrivateTmp(tmp string, uid int, open func(string, int, uint32) (int, e
 }
 
 func verifyAdoptedTmp(fd int, uid int, fstat func(int, *unix.Stat_t) error) error {
+	if err := verifyPrivateDir(fd, uid, fstat); err != nil {
+		return err
+	}
+	return requireEmptyDir(fd)
+}
+
+// adoptCache verifies the per-run cache exactly as adoptPrivateTmp verifies
+// the tmp (an O_NOFOLLOW|O_DIRECTORY|O_CLOEXEC open, then a directory owned
+// by uid with mode exactly 0700) but without the emptiness check: the cache
+// persists across a run's commands. It returns the verified fd, still open and
+// close-on-exec, for the Landlock cache rule; on failure it closes it.
+func adoptCache(cache string, uid int, open func(string, int, uint32) (int, error), fstat func(int, *unix.Stat_t) error) (int, error) {
+	fd, err := open(cache, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return -1, fmt.Errorf("open: %w", err)
+	}
+	if err := verifyPrivateDir(fd, uid, fstat); err != nil {
+		_ = unix.Close(fd)
+		return -1, err
+	}
+	return fd, nil
+}
+
+// verifyPrivateDir requires fd to be a directory owned by uid with permission
+// bits exactly 0700.
+func verifyPrivateDir(fd int, uid int, fstat func(int, *unix.Stat_t) error) error {
 	var st unix.Stat_t
 	if err := fstat(fd, &st); err != nil {
 		return fmt.Errorf("fstat: %w", err)
@@ -208,7 +251,7 @@ func verifyAdoptedTmp(fd int, uid int, fstat func(int, *unix.Stat_t) error) erro
 	if mode := st.Mode & 0o7777; mode != 0o700 {
 		return fmt.Errorf("mode %04o, want 0700", mode)
 	}
-	return requireEmptyDir(fd)
+	return nil
 }
 
 // requireEmptyDir reads fd's entries with getdents and fails on the first one
@@ -232,45 +275,57 @@ func requireEmptyDir(fd int) error {
 
 // parseArgs reads the trusted worker-built argv. Grammar:
 //
-//	--root R --tmp T --cwd C [--mode required|best-effort] -- CMD...
+//	--root R --tmp T --cwd C [--cache K] [--mode required|best-effort] -- CMD...
 //
-// The three path flags stay positional (as before); the mode flag is OPTIONAL
-// and, when present, sits immediately before the `--` separator. Everything
-// after `--` is the child command verbatim, so a `--mode` token there is part of
-// the CHILD and is NEVER read as the sandbox mode (the trust property: the mode
-// comes only from this argv, built by the trusted worker).
-func parseArgs(args []string) (root, tmp, cwd string, mode sandboxMode, child []string, err error) {
+// The three path flags stay positional (as before). The cache and mode flags
+// are OPTIONAL and, when present, come in that order after --cwd and before
+// the `--` separator. Everything after `--` is the child command verbatim, so a
+// `--cache` or `--mode` token there is part of the CHILD and is NEVER read as
+// a sandbox flag (the trust property: both come only from this argv, built by
+// the trusted worker). cache is "" when --cache is absent.
+func parseArgs(args []string) (root, tmp, cwd, cache string, mode sandboxMode, child []string, err error) {
+	fail := func(err error) (string, string, string, string, sandboxMode, []string, error) {
+		return "", "", "", "", "", nil, err
+	}
 	mode = modeRequired
 	if len(args) < 7 || args[0] != "--root" || args[2] != "--tmp" || args[4] != "--cwd" {
-		return "", "", "", "", nil, errors.New("invalid arguments")
+		return fail(errors.New("invalid arguments"))
 	}
 	root, tmp, cwd = args[1], args[3], args[5]
 	rest := args[6:]
-	// An OPTIONAL `--mode <value>` may precede the separator. Parsed only here,
-	// before `--`, so a child argument spelled `--mode` can never reach it.
+	// An OPTIONAL `--cache <dir>`, then an OPTIONAL `--mode <value>`, may
+	// precede the separator. Parsed only here, before `--`, so a child argument
+	// spelled `--cache` or `--mode` can never reach them.
+	if len(rest) >= 2 && rest[0] == "--cache" {
+		cache = rest[1]
+		if !filepath.IsAbs(cache) || filepath.Clean(cache) == string(filepath.Separator) {
+			return fail(errors.New("cache must be an absolute directory other than /"))
+		}
+		rest = rest[2:]
+	}
 	if len(rest) >= 2 && rest[0] == "--mode" {
 		parsed, modeErr := parseMode(rest[1])
 		if modeErr != nil {
-			return "", "", "", "", nil, modeErr
+			return fail(modeErr)
 		}
 		mode = parsed
 		rest = rest[2:]
 	}
 	if len(rest) < 1 || rest[0] != "--" {
-		return "", "", "", "", nil, errors.New("missing -- separator")
+		return fail(errors.New("missing -- separator"))
 	}
 	child = rest[1:]
 	if !filepath.IsAbs(root) || !filepath.IsAbs(tmp) || !filepath.IsAbs(cwd) || len(child) == 0 || !filepath.IsAbs(child[0]) {
-		return "", "", "", "", nil, errors.New("paths must be absolute")
+		return fail(errors.New("paths must be absolute"))
 	}
 	if filepath.Clean(root) == string(filepath.Separator) {
-		return "", "", "", "", nil, errors.New("root sandbox is forbidden")
+		return fail(errors.New("root sandbox is forbidden"))
 	}
 	rel, relErr := filepath.Rel(root, cwd)
 	if relErr != nil || rel == ".." || (len(rel) >= 3 && rel[:3] == ".."+string(filepath.Separator)) {
-		return "", "", "", "", nil, errors.New("cwd escapes root")
+		return fail(errors.New("cwd escapes root"))
 	}
-	return root, tmp, cwd, mode, child, nil
+	return root, tmp, cwd, cache, mode, child, nil
 }
 
 // parseMode strictly maps a mode token to a sandboxMode; an unknown value is
@@ -344,7 +399,14 @@ func decidePolicy(probe versionProbe, mode sandboxMode) (action policyAction, ab
 // kernel. Production always passes the real confine/applyNoNewPrivs, so shipped
 // behaviour is byte-identical; confine() still calls the real applyNoNewPrivs
 // internally regardless of these seams.
-type confineFunc func(root string, tmpFd int, abi int) error
+type confineFunc func(root string, fds grantFds, abi int) error
+
+// grantFds are the adopted directories confine grants through their fds: the
+// private tmp, and the per-run cache (-1 when --cache is absent).
+type grantFds struct {
+	tmp   int
+	cache int
+}
 
 type noNewPrivsFunc func() error
 
@@ -355,15 +417,16 @@ type noNewPrivsFunc func() error
 // error so realMain fails closed. The two enforcement primitives are injected
 // (confineFn/noNewPrivsFn) so the dispatch itself is unit-testable; realMain
 // passes the real confine/applyNoNewPrivs.
-func applyPolicy(root string, tmpFd int, mode sandboxMode, probe versionProbe, confineFn confineFunc, noNewPrivsFn noNewPrivsFunc) error {
+func applyPolicy(root string, fds grantFds, mode sandboxMode, probe versionProbe, confineFn confineFunc, noNewPrivsFn noNewPrivsFunc) error {
 	action, abi, err := decidePolicy(probe, mode)
 	switch action {
 	case actionApply:
-		return confineFn(root, tmpFd, abi)
+		return confineFn(root, fds, abi)
 	case actionUnconfined:
 		// Degraded best-effort: no worktree confinement, but the uid split and
-		// no_new_privs still hold (the private 0700 tmp and cwd-inside-root check
-		// are enforced by realMain/parseArgs regardless of this branch).
+		// no_new_privs still hold (the private 0700 tmp and cache adoption and
+		// the cwd-inside-root check are enforced by realMain/parseArgs
+		// regardless of this branch).
 		return noNewPrivsFn()
 	default:
 		return err
@@ -381,10 +444,10 @@ func applyNoNewPrivs() error {
 // the access rights this kernel understands (from the version probe). EVERY
 // failure here (real create, add-rule, restrict_self, deny-probe) is an ERROR
 // that fails closed in BOTH modes; the caller only reaches confine when the probe
-// classified the kernel as available. The tmp rule is granted through tmpFd,
-// the fd adoptPrivateTmp verified, so a rename or symlink swap of the --tmp
-// path after adoption cannot redirect it.
-func confine(root string, tmpFd int, abi int) error {
+// classified the kernel as available. The tmp and cache rules are granted
+// through the fds adoptPrivateTmp and adoptCache verified, so a rename or
+// symlink swap of either path after adoption cannot redirect them.
+func confine(root string, fds grantFds, abi int) error {
 	handled := baseRights
 	if abi >= 2 {
 		handled |= unix.LANDLOCK_ACCESS_FS_REFER
@@ -403,7 +466,7 @@ func confine(root string, tmpFd int, abi int) error {
 		return errno
 	}
 	defer unix.Close(int(fd))
-	if err := addRules(int(fd), root, tmpFd, handled, realRuleAdders); err != nil {
+	if err := addRules(int(fd), root, fds, handled, realRuleAdders); err != nil {
 		return err
 	}
 	if err := requireProbeReadable(landlockDenyProbe, os.Open); err != nil {
@@ -433,10 +496,12 @@ var realRuleAdders = ruleAdders{path: addPathRule, fd: addFdRule}
 
 // addRules adds confine's allowlist to ruleset: read/execute on the system
 // dirs (a missing one is skipped), read/write on /dev, every handled right
-// beneath root, and every handled right beneath the adopted tmp through tmpFd
-// itself. The tmp is never named by path here, so a rename or symlink swap of
-// the --tmp path after adoption cannot redirect its rule.
-func addRules(ruleset int, root string, tmpFd int, handled uint64, add ruleAdders) error {
+// beneath root, every handled right beneath the adopted tmp through fds.tmp
+// itself, and, when fds.cache is not -1, every handled right beneath that
+// run's cache directory through fds.cache (never the cache root above it).
+// Neither is named by path here, so a rename or symlink swap of the --tmp or
+// --cache path after adoption cannot redirect its rule.
+func addRules(ruleset int, root string, fds grantFds, handled uint64, add ruleAdders) error {
 	read := uint64(unix.LANDLOCK_ACCESS_FS_EXECUTE | unix.LANDLOCK_ACCESS_FS_READ_FILE | unix.LANDLOCK_ACCESS_FS_READ_DIR)
 	for _, path := range []string{"/bin", "/sbin", "/usr", "/lib", "/lib64", "/etc", "/nix", "/opt/uzi-toolchain"} {
 		if err := add.path(ruleset, path, read&handled); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -450,7 +515,13 @@ func addRules(ruleset int, root string, tmpFd int, handled uint64, add ruleAdder
 	if err := add.path(ruleset, root, handled); err != nil {
 		return err
 	}
-	return add.fd(ruleset, tmpFd, handled)
+	if err := add.fd(ruleset, fds.tmp, handled); err != nil {
+		return err
+	}
+	if fds.cache >= 0 {
+		return add.fd(ruleset, fds.cache, handled)
+	}
+	return nil
 }
 
 type probeOpen func(string) (*os.File, error)

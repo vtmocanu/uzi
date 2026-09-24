@@ -14,10 +14,10 @@ import (
 )
 
 func TestParseArgs(t *testing.T) {
-	root, tmp, cwd, mode, child, err := parseArgs([]string{
+	root, tmp, cwd, cache, mode, child, err := parseArgs([]string{
 		"--root", "/data/run", "--tmp", "/tmp/run", "--cwd", "/data/run/sub", "--", "/bin/sh", "-c", "true",
 	})
-	if err != nil || root != "/data/run" || tmp != "/tmp/run" || cwd != "/data/run/sub" || mode != modeRequired || !reflect.DeepEqual(child, []string{"/bin/sh", "-c", "true"}) {
+	if err != nil || root != "/data/run" || tmp != "/tmp/run" || cwd != "/data/run/sub" || cache != "" || mode != modeRequired || !reflect.DeepEqual(child, []string{"/bin/sh", "-c", "true"}) {
 		t.Fatalf("unexpected parse: root=%q tmp=%q cwd=%q mode=%q child=%v err=%v", root, tmp, cwd, mode, child, err)
 	}
 }
@@ -25,7 +25,7 @@ func TestParseArgs(t *testing.T) {
 func TestParseArgsMode(t *testing.T) {
 	// (present) an explicit --mode before -- is honored.
 	for _, want := range []sandboxMode{modeRequired, modeBestEffort} {
-		root, tmp, cwd, mode, child, err := parseArgs([]string{
+		root, tmp, cwd, _, mode, child, err := parseArgs([]string{
 			"--root", "/data/run", "--tmp", "/tmp/run", "--cwd", "/data/run", "--mode", string(want), "--", "/bin/true",
 		})
 		if err != nil || mode != want || root != "/data/run" || tmp != "/tmp/run" || cwd != "/data/run" || !reflect.DeepEqual(child, []string{"/bin/true"}) {
@@ -34,7 +34,7 @@ func TestParseArgsMode(t *testing.T) {
 	}
 
 	// (absent) defaults to required.
-	if _, _, _, mode, _, err := parseArgs([]string{
+	if _, _, _, _, mode, _, err := parseArgs([]string{
 		"--root", "/data/run", "--tmp", "/tmp/run", "--cwd", "/data/run", "--", "/bin/true",
 	}); err != nil || mode != modeRequired {
 		t.Fatalf("absent --mode should default to required: mode=%q err=%v", mode, err)
@@ -42,7 +42,7 @@ func TestParseArgsMode(t *testing.T) {
 
 	// (after --) a --mode token in the CHILD command is NOT parsed as the sandbox
 	// mode — the trust property: the mode comes only from the trusted worker argv.
-	root, _, _, mode, child, err := parseArgs([]string{
+	root, _, _, _, mode, child, err := parseArgs([]string{
 		"--root", "/data/run", "--tmp", "/tmp/run", "--cwd", "/data/run", "--", "/bin/sh", "--mode", "best-effort",
 	})
 	if err != nil || root != "/data/run" || mode != modeRequired {
@@ -53,7 +53,7 @@ func TestParseArgsMode(t *testing.T) {
 	}
 
 	// (invalid) an unknown mode value is rejected (fail closed).
-	if _, _, _, _, _, err := parseArgs([]string{
+	if _, _, _, _, _, _, err := parseArgs([]string{
 		"--root", "/data/run", "--tmp", "/tmp/run", "--cwd", "/data/run", "--mode", "loose", "--", "/bin/true",
 	}); err == nil {
 		t.Fatal("an unknown --mode value must be rejected")
@@ -97,7 +97,7 @@ func TestParseArgsRejectsEscape(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if _, _, _, _, _, err := parseArgs(test.args); err == nil {
+			if _, _, _, _, _, _, err := parseArgs(test.args); err == nil {
 				t.Fatal("expected argument rejection")
 			}
 		})
@@ -246,18 +246,18 @@ func TestApplyPolicyDispatch(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			var confineCalled, noNewPrivsCalled bool
 			var gotRoot string
-			var gotTmpFd int
+			var gotFds grantFds
 			var gotABI int
-			confineFake := func(root string, tmpFd int, abi int) error {
+			confineFake := func(root string, fds grantFds, abi int) error {
 				confineCalled = true
-				gotRoot, gotTmpFd, gotABI = root, tmpFd, abi
+				gotRoot, gotFds, gotABI = root, fds, abi
 				return nil
 			}
 			noNewPrivsFake := func() error {
 				noNewPrivsCalled = true
 				return nil
 			}
-			err := applyPolicy("/data/run", 42, test.mode, test.probe, confineFake, noNewPrivsFake)
+			err := applyPolicy("/data/run", grantFds{tmp: 42, cache: 43}, test.mode, test.probe, confineFake, noNewPrivsFake)
 			switch {
 			case test.wantErr && err == nil:
 				t.Fatal("actionFatal must propagate the fatal error")
@@ -274,8 +274,8 @@ func TestApplyPolicyDispatch(t *testing.T) {
 				// confine() must receive the worktree/tmp roots and the ABI
 				// decidePolicy resolved — proof this is the real confine path, not
 				// the unconfined one.
-				if gotRoot != "/data/run" || gotTmpFd != 42 || gotABI != wantABI {
-					t.Fatalf("confine() args: root=%q tmpFd=%d abi=%d, want /data/run 42 %d", gotRoot, gotTmpFd, gotABI, wantABI)
+				if gotRoot != "/data/run" || gotFds != (grantFds{tmp: 42, cache: 43}) || gotABI != wantABI {
+					t.Fatalf("confine() args: root=%q fds=%+v abi=%d, want /data/run {42 43} %d", gotRoot, gotFds, gotABI, wantABI)
 				}
 			}
 		})
@@ -504,7 +504,7 @@ func TestAddRulesGrantsTmpThroughTheAdoptedFd(t *testing.T) {
 		ino    uint64
 	}
 	var fdRules []fdRule
-	err = addRules(ruleset, root, fd, handled, ruleAdders{
+	err = addRules(ruleset, root, grantFds{tmp: fd, cache: -1}, handled, ruleAdders{
 		path: func(rs int, path string, _ uint64) error {
 			if rs != ruleset {
 				t.Errorf("path rule on ruleset %d", rs)

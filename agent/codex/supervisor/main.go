@@ -19,8 +19,14 @@ func main() {
 
 // realMain is the whole flow: the pre-fork sequence (prelaunch: fd hygiene,
 // argv, the verified profile, the command tmp, the launch) wired to the real
-// syscalls, then the control loop.
+// syscalls, then the control loop. A first argument naming a standalone mode
+// (--reap-orphans, --hold-cache, --remove-cache) runs that mode instead,
+// before anything of the supervisor's own flow: it uses no fd 3/4 and forks
+// no child.
 func realMain(args []string) int {
+	if len(args) > 0 && isModeFlag(args[0]) {
+		return runMode(args, realModeEnv())
+	}
 	// os.NewFile opens nothing; prelaunch's first step is the fd hygiene.
 	ev := &evidence{w: os.NewFile(4, "evidence")}
 	tmp, childPid, st, ok := prelaunch(ev, args, prelaunchSeams{

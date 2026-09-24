@@ -12,7 +12,10 @@ import (
 
 // commandTmpPrefix is the fixed path a --cleanup-token names: the token is the
 // only variable part, so the argv can never point the supervisor at another path.
-const commandTmpPrefix = "/tmp/uzi-codex-command-"
+const commandTmpPrefix = "/tmp/" + commandTmpNamePrefix
+
+// commandTmpNamePrefix is the command tmp's name under /tmp, less the token.
+const commandTmpNamePrefix = "uzi-codex-command-"
 
 // Wire values of the tmpCleanup evidence field.
 const (
@@ -40,8 +43,8 @@ type tmpCleanupResult struct {
 
 // commandTmp is the supervisor-owned per-command scratch directory. The
 // supervisor creates it before fork, holds an exclusive flock on dirFd for its
-// whole lifetime (the liveness signal for the startup orphan reaper, supervisor
-// --reap-orphans, added with the reaper), and removes it only after a confirmed
+// whole lifetime (the liveness signal for the orphan reaper, the
+// --reap-orphans mode in reaper.go), and removes it only after a confirmed
 // drain. parentFd and dirFd are
 // close-on-exec, so the child never inherits either; neither is closed before
 // process exit.
@@ -94,7 +97,7 @@ func openCommandTmpIn(parentDir, token string, uid int) (*commandTmp, error) {
 // (AT_SYMLINK_NOFOLLOW) that the name still names the pinned dev/ino, which
 // closes the window between the mkdir and the lock. On failure it closes the
 // directory fd (dropping the lock) and leaves the directory for the startup
-// orphan reaper (supervisor --reap-orphans, added with the reaper): nothing is
+// orphan reaper (the --reap-orphans mode in reaper.go): nothing is
 // removed here.
 func createCommandTmp(parentFd int, name string, uid int) (*commandTmp, error) {
 	dirFd, pin, err := safetree.Create(parentFd, name, uid)
@@ -127,8 +130,8 @@ type tmpSetup func(token string, uid int) (*commandTmp, error)
 // given) and then launches the child. Any setup failure emits the pre-fork
 // abnormal "command tmp setup failed" and returns ok == false WITHOUT calling
 // launch. A launch failure emits "child launch failed"; the tmp is then left
-// for the startup orphan reaper (supervisor --reap-orphans, added with the
-// reaper), because cleanup runs only after a confirmed drain.
+// for the startup orphan reaper (the --reap-orphans mode in reaper.go),
+// because cleanup runs only after a confirmed drain.
 func setupAndLaunch(ev *evidence, token string, uid int, setup tmpSetup, launch func([]string) (int, error), argv []string) (*commandTmp, int, bool) {
 	var ct *commandTmp
 	if token != "" {
