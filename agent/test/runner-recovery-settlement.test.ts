@@ -547,7 +547,7 @@ describe("RunRunner — NO adoption evidence (issue #1582 M2)", () => {
     }
   });
 
-  it("a predecessor source ABSENT from the bare pins nothing and records nothing", async () => {
+  it("a predecessor source ABSENT from the bare is gated by the containment pre-filter: pins nothing and records nothing", async () => {
     const r = rig("tracking");
     try {
       const claim = gitlabClaim(5206, { claim_generation: 2 });

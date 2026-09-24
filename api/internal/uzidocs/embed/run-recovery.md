@@ -183,8 +183,9 @@ exists stops automatic settlement for that hold. Before reporting anything,
 the worker also checks locally that the older generation's recorded source is
 contained in the commit the resume adopted. When it isn't (for example, a
 resume that restored uncommitted parked work from a `wip(park)` checkpoint),
-that hold gets no settlement attempt from this resume and stays open unless a
-later publication proves it. A hold that settlement can't clear behaves
+that hold gets no settlement attempt from this resume, and a later resume
+settles it only if the commit it adopts contains that source; otherwise it
+stays open for `uzi run export` or `uzi run discard`. A hold that settlement can't clear behaves
 exactly like any other open hold: it still shows up under **Recovery
 archives**, and you can still resolve it yourself with `uzi run export` or
 `uzi run discard`.
