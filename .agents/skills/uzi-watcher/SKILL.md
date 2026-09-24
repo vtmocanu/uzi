@@ -217,9 +217,14 @@ no kube access:
   until #1417 lands (the CLI listing truncates them).
 - `uzi run get RUN --json | jq -r .preserved_patch`: the diff a typed push failure preserves.
 
-Fall back to the worker PVC only for a **persistent** hosted worker: the branch survives at
-`refs/uzi-runner/agent/issue-N` (the worker-side tracking ref) because a roll replaces the
-container, not the data volume. An **ephemeral** (run-bound) worker is removed automatically,
+Fall back to the worker PVC only for a **persistent** hosted worker: the bare repository's
+`refs/uzi-runner/agent/issue-N` tracking ref survives a pod roll on its data PVC. On
+Docker-capable workers, the live working clone is on `/data/runner`, an `emptyDir` lost with
+the pod. A graceful shutdown first commits non-ignored WIP and fetches the branch into the
+bare ref. A hard kill or failed commit/fetch can lose work absent from that ref; ignored
+files are never captured. Plain workers keep the clone on the data PVC. Snapshot active runs
+promptly.
+An **ephemeral** (run-bound) worker is removed automatically,
 PVC included, once its run is terminal and recovery custody has released, so skip PVC recovery
 when the live worker reads `(ephemeral)` in `uzi worker list` or the finished run's `worker_id`
 is already null. Needs kube access to your deployment's worker namespace — **read the context
@@ -236,9 +241,10 @@ and namespace from your own kubeconfig; they are deployment-specific, do not har
    `uzi-hw-*` pod for the live clone, then falls back to the exact `refs/uzi-runner/...`
    tracking ref when no clone survives. For a manual recovery, perform the same
    `git --git-dir=BARE for-each-ref refs/uzi-runner/` enumeration and recover from whichever
-   pod holds the tip. Worker PVCs are **persistent and survive a pod
-   *roll*** (an image upgrade replaces the pod, not the volume), so the previous worker's
-   *current* pod still holds the ref. (Measured 2026-09-02, run #1009: an
+   pod holds the tip. Worker data PVCs survive a pod roll, so the previous worker's
+   current pod still holds the bare ref from its last checkpoint or graceful-shutdown
+   fetch-back. A Docker worker's working clone does not survive the roll.
+   (Measured 2026-09-02, run #1009: an
    `agent-base` image auto-roll landed at the same instant as the 5-hour-limit resume, so the
    run was re-claimed on a fresh worker and cold-started from the default branch while its
    full reviewed tip sat on the previous worker's PVC; `jq .worker_id` pointed at the cold
