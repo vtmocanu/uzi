@@ -177,9 +177,9 @@ ancestor of the branch's current published head, using the forge's own
 comparison API. Only a positive, unambiguous answer releases the hold. A
 rate-limited, erroring, or inconclusive answer, or a run whose state changed
 underneath the check, keeps the hold open and the worker retries later with
-backoff; a definite "not contained", a candidate that contradicts the
-server's record, or a branch that no longer exists keeps the hold open for
-good. A hold that settlement can't clear behaves
+backoff (up to a bounded number of attempts); a definite "not contained", a
+candidate that contradicts the server's record, or a branch that no longer
+exists stops automatic settlement for that hold. A hold that settlement can't clear behaves
 exactly like any other open hold: it still shows up under **Recovery
 archives**, and you can still resolve it yourself with `uzi run export` or
 `uzi run discard`.
