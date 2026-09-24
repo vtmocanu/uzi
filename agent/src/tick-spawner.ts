@@ -7,7 +7,9 @@
 // exited before it touches the clone or the bare. Each child is spawned in its OWN process group
 // (`detached: true`); on the tick signal the group gets SIGTERM, then SIGKILL after a grace, and a
 // child's `completed` resolves only once the leader has exited. `settled()` resolves once every
-// child spawned so far has exited.
+// child's WHOLE process group is gone, not just its leader: a grandchild (a git subprocess) that
+// outlives its leader is SIGKILLed after the grace, and a group still alive past a bounded deadline
+// is logged and listed by `survivors()` rather than silently counted as settled.
 //
 // Lock custody. git removes its own `*.lock` files on SIGTERM, but a child that survives SIGTERM
 // and is SIGKILLed leaves them behind, and a leftover lock in the worker bare would fail every
@@ -35,6 +37,10 @@ import { runnerCommand, uidSplitActive } from "./runner-uid.js";
 
 /** SIGTERM → SIGKILL grace for a cancelled tick child. */
 const DEFAULT_KILL_GRACE_MS = 2_000;
+/** How often a leader-less process group is probed for remaining members. */
+const GROUP_POLL_MS = 25;
+/** After the group SIGKILL, how long to wait for the kernel to reap the group before reporting it. */
+const GROUP_KILL_WAIT_MS = 2_000;
 
 /** Presence + identity of one candidate lock path at a point in time. */
 export interface LockStat {
@@ -104,6 +110,10 @@ interface Tracked {
   identity: BoundaryProcessRequest["identity"];
   exited: Promise<void>;
   isExited: () => boolean;
+  /** Resolves once no member of the child's process group is left (or the bounded wait gave up). */
+  groupGone: Promise<void>;
+  /** Set when members of the group were still alive when the bounded wait gave up. */
+  survived: boolean;
   snapshot: Map<string, LockStat> | undefined;
   /** Set once the child was signalled because of a cancellation. */
   signalled: boolean;
@@ -212,11 +222,17 @@ export class TickSpawner {
     return this.all.map((t) => t.pid);
   }
 
-  /** Resolves once every child spawned so far has exited. */
+  /** Resolves once every child spawned so far has exited AND its whole process group is gone (or
+   *  was reported via {@link survivors} after the bounded wait). */
   async settled(): Promise<void> {
     while (this.live.size > 0) {
-      await Promise.all([...this.live].map((t) => t.exited));
+      await Promise.all([...this.live].map((t) => t.groupGone));
     }
+  }
+
+  /** Leader pids whose process group still had live members when the bounded wait gave up. */
+  survivors(): number[] {
+    return this.all.filter((t) => t.survived).map((t) => t.pid);
   }
 
   /** True when any child had to be signalled by a cancellation (so lock reconcile is due). */
@@ -250,12 +266,16 @@ export class TickSpawner {
     let exitedFlag = false;
     let resolveExit!: () => void;
     const exited = new Promise<void>((r) => (resolveExit = r));
+    let resolveGroup!: () => void;
+    const groupGone = new Promise<void>((r) => (resolveGroup = r));
     const tracked: Tracked = {
       pid: child.pid ?? -1,
       argvClass: argvClass(request.argv),
       identity: req.identity,
       exited,
       isExited: () => exitedFlag,
+      groupGone,
+      survived: false,
       snapshot,
       signalled: false,
       killed: false,
@@ -263,17 +283,29 @@ export class TickSpawner {
       reconciled: false,
     };
     const completed = new Promise<{ code: number }>((resolve, reject) => {
+      // Settlement is the whole GROUP: wait (bounded) for any member that outlived the leader.
+      // Started once, from whichever of 'error' / 'exit' comes first; a spawn failure has no group.
+      let groupWaitStarted = false;
+      const startGroupWait = (): void => {
+        if (groupWaitStarted) return;
+        groupWaitStarted = true;
+        const wait = child.pid === undefined ? Promise.resolve() : this.awaitGroupGone(tracked);
+        void wait.finally(() => {
+          this.live.delete(tracked);
+          resolveGroup();
+        });
+      };
       child.once("error", (err) => {
         exitedFlag = true;
-        this.live.delete(tracked);
         resolveExit();
+        startGroupWait();
         reject(err);
       });
       child.once("exit", (code, sig) => {
         exitedFlag = true;
-        this.live.delete(tracked);
         resolveExit();
         resolve({ code: code ?? (sig ? 128 : 1) });
+        startGroupWait();
       });
     });
     completed.catch(() => undefined);
@@ -295,6 +327,40 @@ export class TickSpawner {
     const bare = this.opts.barePath!;
     for (const p of await candidateLockPaths(bare, this.opts.branch)) snap.set(p, await statLock(p));
     return snap;
+  }
+
+  /** True while any member of the child's process group is alive. EPERM (a member exists but runs
+   *  as another uid) counts as alive; under the uid split the probe runs as the runner uid. */
+  private groupAlive(t: Tracked): boolean {
+    if (t.identity === "command" && uidSplitActive()) {
+      const w = runnerCommand("kill", ["-0", `-${t.pid}`]);
+      return spawnSync(w.command, w.args, { stdio: "ignore" }).status === 0;
+    }
+    try {
+      process.kill(-t.pid, 0);
+      return true;
+    } catch (e) {
+      return (e as NodeJS.ErrnoException).code === "EPERM";
+    }
+  }
+
+  /** After the leader exited: wait for its group to empty. Members still alive after the grace are
+   *  SIGKILLed; a group still alive {@link GROUP_KILL_WAIT_MS} after that is logged and marked
+   *  `survived` instead of blocking settlement forever. */
+  private async awaitGroupGone(t: Tracked): Promise<void> {
+    const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+    const graceEnd = Date.now() + this.killGraceMs;
+    while (this.groupAlive(t) && Date.now() < graceEnd) await sleep(GROUP_POLL_MS);
+    if (!this.groupAlive(t)) return;
+    this.signalGroup(t, "SIGKILL");
+    const killEnd = Date.now() + GROUP_KILL_WAIT_MS;
+    while (this.groupAlive(t) && Date.now() < killEnd) await sleep(GROUP_POLL_MS);
+    if (!this.groupAlive(t)) return;
+    t.survived = true;
+    this.opts.log?.warn("mid-turn checkpoint: a tick child's process group outlived its leader and a SIGKILL", {
+      pid: t.pid,
+      argv_class: t.argvClass,
+    });
   }
 
   private signalGroup(t: Tracked, sig: "SIGTERM" | "SIGKILL"): void {

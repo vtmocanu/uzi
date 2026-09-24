@@ -119,11 +119,53 @@ setInterval(() => {}, 1000);
     await h.completed;
     await sp.settled();
     assert.equal(alive(pid!), false, "the child is gone");
-    // The group SIGTERM reached the grandchild too (it does not trap it).
-    const deadline = Date.now() + 3_000;
-    while (alive(grandchild) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 20));
+    // settled() covers the whole group: the grandchild is already gone, no polling needed.
     assert.equal(alive(grandchild), false, "the grandchild in the child's process group is gone");
     assert.equal(sp.cancelledAny(), true);
+    assert.deepEqual(sp.survivors(), []);
+  });
+
+  /** A leader that spawns a SIGTERM-IGNORING grandchild in its own group, prints `ready <pid>`,
+   *  then exits on SIGTERM (default handler) or, with `exitAfterMs`, on its own. */
+  function leaderWithStubbornGrandchild(exitAfterMs?: number): string {
+    return script(
+      `leader-${Math.random().toString(36).slice(2)}`,
+      `const { spawn } = require("child_process");
+const c = spawn(${JSON.stringify(NODE)}, ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], { stdio: "ignore" });
+process.stdout.write("ready " + c.pid + "\\n");
+${exitAfterMs === undefined ? "setInterval(() => {}, 1000);" : `setTimeout(() => process.exit(0), ${exitAfterMs});`}
+`,
+    );
+  }
+
+  async function grandchildOf(h: BoundaryProcessHandle): Promise<number> {
+    let out = "";
+    h.stdout!.on("data", (c: Buffer) => (out += String(c)));
+    await ready(h);
+    return Number(/ready (\d+)/.exec(out)![1]);
+  }
+
+  it("cancelled: settled() waits until a SIGTERM-ignoring grandchild outliving its leader is gone", async () => {
+    const ac = new AbortController();
+    const sp = new TickSpawner({ signal: ac.signal, killGraceMs: 200 });
+    const h = await sp.spawn(req([NODE, leaderWithStubbornGrandchild()]));
+    const grandchild = await grandchildOf(h);
+    ac.abort();
+    await h.completed; // the leader dies on SIGTERM at once; its group gets the SIGKILL next
+    await sp.settled();
+    assert.equal(alive(grandchild), false, "settled() did not resolve while the grandchild lived");
+    assert.deepEqual(sp.survivors(), []);
+  });
+
+  it("not cancelled: a grandchild left behind by a leader that exited normally is reaped before settled()", async () => {
+    const ac = new AbortController();
+    const sp = new TickSpawner({ signal: ac.signal, killGraceMs: 200 });
+    const h = await sp.spawn(req([NODE, leaderWithStubbornGrandchild(100)]));
+    const grandchild = await grandchildOf(h);
+    assert.deepEqual(await h.completed, { code: 0 }, "completed still tracks the leader alone");
+    await sp.settled();
+    assert.equal(alive(grandchild), false, "settled() did not resolve while the grandchild lived");
+    assert.equal(sp.cancelledAny(), false);
   });
 
   it("escalates to SIGKILL after the grace for a SIGTERM-ignoring child; completed only after exit", async () => {

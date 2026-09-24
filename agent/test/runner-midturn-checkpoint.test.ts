@@ -465,10 +465,12 @@ async function settleAndClean(spec: {
       teardownErrors.push(e);
     }
     if (spec.ctl) {
-      // Settlement is defined on the group LEADER (tick-spawner.ts: `completed` resolves once the
-      // leader exited), so only a live leader is a failure; group stragglers are just reaped below.
-      const alive = spec.ctl.pids.filter(isAlive);
-      if (alive.length > 0) teardownErrors.push(new Error(`teardown: tick child pid(s) ${alive.join(", ")} outlived settlement`));
+      // Settlement is defined on the whole process GROUP (tick-spawner.ts settled()), so ANY live
+      // member of a tick child's group is a failure, not only a live leader; it is reaped below.
+      const alive = spec.ctl.pids.filter((p) => isAlive(p) || groupAlive(p));
+      if (alive.length > 0) {
+        teardownErrors.push(new Error(`teardown: tick child process group(s) ${alive.join(", ")} outlived settlement`));
+      }
       await killAndReap(spec.ctl.pids).catch((e: unknown) => teardownErrors.push(e));
     }
   } finally {
