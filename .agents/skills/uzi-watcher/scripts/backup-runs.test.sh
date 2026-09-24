@@ -163,9 +163,9 @@ echo "PASS case1: uncommitted-only -> no bundle, PART, patch kept"
 # Git then refuses every clone operation unless this exact clone is trusted.
 L1_DUBIOUS="$(UZI_TEST_DUBIOUS=1 run_backup dubious)"
 [ -f "$L1_DUBIOUS/issue-4242.tgz" ] || fail "dubious owner: no archive"
-tar -xOzf "$L1_DUBIOUS/issue-4242.tgz" issue-4242.uncommitted.patch | grep -qF '+dirty' \
+tar -xOzf "$L1_DUBIOUS/issue-4242.tgz" ./issue-4242.uncommitted.patch | grep -qF '+dirty' \
   || fail "dubious owner: live uncommitted work was not captured"
-tar -xOzf "$L1_DUBIOUS/issue-4242.tgz" issue-4242.meta.txt | grep -qF "head=$MAIN" \
+tar -xOzf "$L1_DUBIOUS/issue-4242.tgz" ./issue-4242.meta.txt | grep -qF "head=$MAIN" \
   || fail "dubious owner: Git HEAD was not captured"
 echo "PASS dubious owner: exact clone trusted; patch and HEAD kept"
 
