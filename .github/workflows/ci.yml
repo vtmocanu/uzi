@@ -54,7 +54,9 @@ jobs:
           # manifest lookup. This is the bootstrap Go, like the Dockerfiles'
           # golang:<minor> builder base: go.mod's `go` line is the language floor and
           # its `toolchain` line, which Go auto-downloads when newer, is the floor for
-          # the Go that actually builds. Renovate groups those surfaces on a minor bump.
+          # the Go that actually builds. Renovate groups the toolchain line, this
+          # go-version and the builder image on a minor bump; the `go` floor is
+          # raised by hand (Renovate leaves that directive alone by default).
           go-version: "1.27"
           check-latest: true
           cache-dependency-path: api/go.sum
@@ -125,7 +127,9 @@ jobs:
           # manifest lookup. This is the bootstrap Go, like the Dockerfiles'
           # golang:<minor> builder base: go.mod's `go` line is the language floor and
           # its `toolchain` line, which Go auto-downloads when newer, is the floor for
-          # the Go that actually builds. Renovate groups those surfaces on a minor bump.
+          # the Go that actually builds. Renovate groups the toolchain line, this
+          # go-version and the builder image on a minor bump; the `go` floor is
+          # raised by hand (Renovate leaves that directive alone by default).
           go-version: "1.27"
           check-latest: true
           cache-dependency-path: api/go.sum
@@ -155,7 +159,9 @@ jobs:
           # manifest lookup. This is the bootstrap Go, like the Dockerfiles'
           # golang:<minor> builder base: go.mod's `go` line is the language floor and
           # its `toolchain` line, which Go auto-downloads when newer, is the floor for
-          # the Go that actually builds. Renovate groups those surfaces on a minor bump.
+          # the Go that actually builds. Renovate groups the toolchain line, this
+          # go-version and the builder image on a minor bump; the `go` floor is
+          # raised by hand (Renovate leaves that directive alone by default).
           go-version: "1.27"
           check-latest: true
           cache-dependency-path: api/go.sum
@@ -206,7 +212,9 @@ jobs:
           # manifest lookup. This is the bootstrap Go, like the Dockerfiles'
           # golang:<minor> builder base: go.mod's `go` line is the language floor and
           # its `toolchain` line, which Go auto-downloads when newer, is the floor for
-          # the Go that actually builds. Renovate groups those surfaces on a minor bump.
+          # the Go that actually builds. Renovate groups the toolchain line, this
+          # go-version and the builder image on a minor bump; the `go` floor is
+          # raised by hand (Renovate leaves that directive alone by default).
           go-version: "1.27"
           check-latest: true
           cache-dependency-path: api/go.sum
@@ -420,7 +428,9 @@ jobs:
           # manifest lookup. This is the bootstrap Go, like the Dockerfiles'
           # golang:<minor> builder base: go.mod's `go` line is the language floor and
           # its `toolchain` line, which Go auto-downloads when newer, is the floor for
-          # the Go that actually builds. Renovate groups those surfaces on a minor bump.
+          # the Go that actually builds. Renovate groups the toolchain line, this
+          # go-version and the builder image on a minor bump; the `go` floor is
+          # raised by hand (Renovate leaves that directive alone by default).
           go-version: "1.27"
           check-latest: true
           cache-dependency-path: api/go.sum
