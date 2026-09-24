@@ -16,6 +16,11 @@
  *  3. A prose-only turn after that guidance → the status card again, then
  *     {@link REASON_PLAN_MISSING}. No second nudge, no second park.
  *
+ * The one-nudge/one-park budget is per EXECUTOR INVOCATION of the plan turn: a requeue, a
+ * wall-park extend or a credential-switch re-drive re-enters the executor and starts a fresh
+ * budget. Accepted: each of those is bounded by its own mechanism's cap. The askUser path's
+ * existing reuse of the open_question_id on a requeue applies to this park too.
+ *
  * Two invariants hold throughout: nothing is ever DERIVED from the prose (it never becomes
  * a plan, a question or part of a prompt), and an answer is never plan approval — any plan
  * still goes to the approval gate.
@@ -46,15 +51,37 @@ export const REASON_PLAN_MISSING =
 /** The cap on the lead's final message as carried on the status card, marker included. */
 export const MAX_LEAD_FINAL_MESSAGE_LEN = 4000;
 
-const TRUNCATED_MARKER = "…[truncated]";
+/** How many characters beyond the cap {@link boundLeadFinalMessage} reads, and how many it
+ *  then discards from the left edge of that window. 1024 exceeds any plausible secret (API
+ *  keys and tokens run to a few hundred characters at most), so a secret split by the window
+ *  edge, whose surviving suffix the redactor cannot recognise, is always inside the discarded
+ *  strip. */
+export const LEAD_MESSAGE_SECRET_MARGIN = 1024;
 
-// C0 controls except \t (U+0009) and \n (U+000A), DEL, the C1 block, and every Unicode
-// format character (Cf: bidi embeddings/overrides/isolates, zero-width marks, BOM). The
-// message is rendered to a human as data; none of these belong in it, and the bidi class
-// can make it read differently from what it says.
+/** How much of a turn's lead text an executor holds while collecting it (the most recent
+ *  characters). Far above the bounder's window, so holding only this tail changes nothing
+ *  the status card shows, while the executor never holds unbounded model output. */
+export const LEAD_TEXT_TAIL_KEEP = 64 * 1024;
+
+const TRUNCATED_MARKER = "[truncated]…";
+
+// C0 controls except \t (U+0009) and \n (U+000A), DEL, the C1 block, the Unicode line and
+// paragraph separators (U+2028/U+2029), and every Unicode format character (Cf: bidi
+// embeddings/overrides/isolates, zero-width marks, BOM). The message is rendered to a human
+// as data; none of these belong in it, and the bidi class can make it read differently from
+// what it says.
 // Matching control characters is the whole job of this pattern.
 // eslint-disable-next-line no-control-regex
-const CONTROL_OR_FORMAT = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]|\p{Cf}/gu;
+const CONTROL_OR_FORMAT = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u2028\u2029]|\p{Cf}/gu;
+
+const isLowSurrogate = (c: number): boolean => c >= 0xdc00 && c <= 0xdfff;
+
+/** Append one chunk of lead text (newline-joined) and keep only the most recent
+ *  {@link LEAD_TEXT_TAIL_KEEP} characters, so a collector's memory stays bounded. */
+export function appendLeadTextTail(acc: string, chunk: string): string {
+  const joined = acc ? `${acc}\n${chunk}` : chunk;
+  return joined.length > LEAD_TEXT_TAIL_KEEP ? joined.slice(-LEAD_TEXT_TAIL_KEEP) : joined;
+}
 
 /** The shape both executors' turn results share for the prose-only test. */
 interface PlanTurnSignals {
@@ -71,19 +98,34 @@ export function isProseOnlyPlanTurn(t: PlanTurnSignals): boolean {
 }
 
 /**
- * Bound the lead's final message for the status card. Order matters: redact FIRST, so a
- * secret straddling the cap is replaced whole rather than leaving an unredacted prefix;
- * then strip NUL/unpaired surrogates and the control/format classes; THEN cap, marker
- * included, without splitting a surrogate pair.
+ * Bound the lead's final message for the status card, keeping its TAIL (the end of the
+ * turn's text, which is what "the lead's final message" means). The work is bounded by the
+ * cap, never by the input:
+ *
+ *  1. Take a tail WINDOW of at most cap + {@link LEAD_MESSAGE_SECRET_MARGIN} characters.
+ *  2. Strip NUL/unpaired surrogates and the control/format classes FIRST, so a secret split
+ *     by an invisible character is reassembled before the redactor looks at it.
+ *  3. Redact, so a secret straddling the final cut is replaced whole.
+ *  4. Keep the last characters up to the cap, marker included. When step 1 cut the input,
+ *     at least the margin is dropped from the window's left edge, discarding any secret
+ *     fragment the window split (its suffix does not match the redactor). The kept tail
+ *     never starts on the low half of a surrogate pair.
  */
 export function boundLeadFinalMessage(text: string, redactText?: (s: string) => string): string {
-  const redacted = redactText ? redactText(text) : text;
-  const clean = sanitizeText(redacted, emptyCounts()).replace(CONTROL_OR_FORMAT, "");
-  if (clean.length <= MAX_LEAD_FINAL_MESSAGE_LEN) return clean;
-  let cut = MAX_LEAD_FINAL_MESSAGE_LEN - TRUNCATED_MARKER.length;
-  const last = clean.charCodeAt(cut - 1);
-  if (last >= 0xd800 && last <= 0xdbff) cut -= 1;
-  return clean.slice(0, cut) + TRUNCATED_MARKER;
+  const windowLen = MAX_LEAD_FINAL_MESSAGE_LEN + LEAD_MESSAGE_SECRET_MARGIN;
+  const windowCut = text.length > windowLen;
+  const window = windowCut ? text.slice(-windowLen) : text;
+  const clean = sanitizeText(window, emptyCounts()).replace(CONTROL_OR_FORMAT, "");
+  const redacted = redactText ? redactText(clean) : clean;
+  if (!windowCut && redacted.length <= MAX_LEAD_FINAL_MESSAGE_LEN) return redacted;
+  const keep = Math.min(
+    MAX_LEAD_FINAL_MESSAGE_LEN - TRUNCATED_MARKER.length,
+    redacted.length - (windowCut ? LEAD_MESSAGE_SECRET_MARGIN : 0),
+  );
+  if (keep <= 0) return TRUNCATED_MARKER;
+  let start = redacted.length - keep;
+  if (isLowSurrogate(redacted.charCodeAt(start))) start += 1;
+  return TRUNCATED_MARKER + redacted.slice(start);
 }
 
 /** The prompt that resumes planning on the owner's guidance. Carries the OWNER's text
@@ -99,14 +141,14 @@ export function buildPlanMissingGuidancePrompt(guidance: string): string {
 
 /** Emit the plan-missing status card: the fixed notice plus the lead's bounded final
  *  message as a separate, untrusted payload field. */
-export function emitPlanMissingNotice(ctx: RunContext, finalText: string): void {
+export function emitPlanMissingNotice(ctx: RunContext, finalText: string, redactText = ctx.redactText): void {
   ctx.emit({
     kind: "status",
     agent: "worker",
     payload: {
       event: "plan_missing",
       text: PLAN_MISSING_NOTICE,
-      lead_final_message: boundLeadFinalMessage(finalText, ctx.redactText),
+      lead_final_message: boundLeadFinalMessage(finalText, redactText),
     },
   });
 }
@@ -119,8 +161,9 @@ export function emitPlanMissingNotice(ctx: RunContext, finalText: string): void 
 export async function resolvePlanMissing(
   ctx: RunContext,
   finalText: string,
+  redactText = ctx.redactText,
 ): Promise<{ kind: "guidance"; prompt: string } | { kind: "cancel" }> {
-  emitPlanMissingNotice(ctx, finalText);
+  emitPlanMissingNotice(ctx, finalText, redactText);
   if (!ctx.askPlanMissing) throw new Error(REASON_PLAN_MISSING);
   const v = await ctx.askPlanMissing();
   if (v.kind === "unattended") throw new Error(REASON_PLAN_MISSING);

@@ -4614,6 +4614,15 @@ describe("CodexExecutor prose-only planning turns (#1593)", () => {
     .map((r) => (r.params as { input?: { text?: string }[] }).input?.[0]?.text ?? "");
   const cards = (emitted: EmittedMessage[]) => emitted.filter((m) => m.kind === "status" && m.payload.event === "plan_missing");
   const approve = { kind: "approve", selection: { source: "own", agents: [] } } as never;
+  // The nudge and guidance turns RESUME the prose turn's session: one thread/start, no fresh
+  // thread, and every root turn/start targets the same thread id.
+  const assertSameSession = (t: FakeTransport, turns: number, th = "th-plan"): void => {
+    assert.equal(t.requests.filter((r) => r.method === "thread/start").length, 1, "one thread for the whole planning loop");
+    assert.equal(t.requests.filter((r) => r.method === "thread/resume").length, 0, "no cold re-attach between planning turns");
+    const starts = t.requests.filter((r) => r.method === "turn/start");
+    assert.equal(starts.length, turns);
+    for (const r of starts) assert.equal((r.params as { threadId?: string }).threadId, th, "each turn targets the same thread");
+  };
 
   it("nudges once with the fixed prompt, then gates the plan the nudged turn submits", async () => {
     const rig = makeMultiEpochRig([scripted([["prose"], ["plan"]]), scripted([["done"]])]);
@@ -4626,6 +4635,7 @@ describe("CodexExecutor prose-only planning turns (#1593)", () => {
     });
     await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "nudge then plan");
     assert.equal(promptTexts(rig.epochs[0]!.transport)[1], PLAN_MISSING_NUDGE);
+    assertSameSession(rig.epochs[0]!.transport, 2);
     assert.deepEqual(gated, ["approved plan"]);
     assert.equal(parks, 0);
     assert.equal(cards(emitted).length, 0);
@@ -4674,6 +4684,7 @@ describe("CodexExecutor prose-only planning turns (#1593)", () => {
     });
     await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "guidance");
     const prompts = promptTexts(rig.epochs[0]!.transport);
+    assertSameSession(rig.epochs[0]!.transport, 3);
     assert.deepEqual(parkArgs, [[]], "the park takes no model text");
     assert.match(prompts[2]!, /use the server path/);
     assert.ok(!prompts[2]!.includes(PROSE), "the lead's prose never re-enters a prompt");
@@ -4719,7 +4730,7 @@ describe("CodexExecutor prose-only planning turns (#1593)", () => {
     it(`fails REASON_PLAN_MISSING with a bounded status card when no human can answer: ${mode}`, async () => {
       const secret = "sekret-" + "value-1593";
       const long = "x".repeat(MAX_LEAD_FINAL_MESSAGE_LEN) + " tail";
-      const rig = makeRig({ responder: scripted([["prose"], ["prose"]], "th-plan", `${secret} ${long}`) });
+      const rig = makeRig({ responder: scripted([["prose"], ["prose"]], "th-plan", `${secret} ${long} ${secret} tail`) });
       const { ctx, emitted } = makeCtx({
         planApproved: false, approvedPlan: undefined,
         redactText: (s) => s.split(secret).join("[REDACTED]"),
@@ -4733,11 +4744,82 @@ describe("CodexExecutor prose-only planning turns (#1593)", () => {
       assert.equal(c[0]!.agent, "worker");
       const msg = String(c[0]!.payload.lead_final_message);
       assert.ok(msg.length <= MAX_LEAD_FINAL_MESSAGE_LEN);
-      assert.ok(msg.startsWith("[REDACTED] "));
-      assert.ok(msg.endsWith("…[truncated]"));
+      assert.ok(msg.startsWith("[truncated]…"), "the head was cut: the card shows the message's tail");
+      assert.ok(msg.endsWith(" [REDACTED] tail"));
       assert.ok(!msg.includes(secret));
     });
   }
+
+  it("scrubs runtime-released Codex tokens from the status card, whole and split by an invisible char", async () => {
+    const split = FRESH_TOKEN.slice(0, 5) + "\u200b" + FRESH_TOKEN.slice(5);
+    const rig = makeRig({ responder: scripted([["prose"], ["prose"]], "th-plan", `tok=${FRESH_TOKEN} split=${split} end`) });
+    const { ctx, emitted } = makeCtx({ planApproved: false, approvedPlan: undefined, gatePlan: async () => approve });
+    await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "runtime token"),
+      (e: Error) => e.message === REASON_PLAN_MISSING);
+    assert.ok(rig.client.releaseCalls.length >= 1, "the Codex token was released at runtime");
+    const msg = String(cards(emitted)[0]!.payload.lead_final_message);
+    assert.ok(!msg.includes(FRESH_TOKEN.slice(5)), `runtime token survived: ${JSON.stringify(msg)}`);
+    assert.match(msg, /^tok=\S+ split=\S+ end$/);
+  });
+
+  describe("child/subagent text never becomes the lead's final message", () => {
+    const agents: AgentTemplate[] = [
+      { name: "lead", description: "the lead", prompt_body: "lead body", tools: null, skills: [] },
+      { name: "coder", description: "a coder", prompt_body: "coder body", tools: null, skills: [] },
+    ];
+    const CHILD = "CHILD-SUBAGENT-TEXT-1593";
+    // Root turns come from `rootTurns` (by root turn index); a root turn marked `spawn` issues a
+    // spawn_agent whose child turn streams CHILD text. The root terminal of a spawning turn is
+    // pushed by the test once the parent callback has replied, so the child settles first.
+    const delegating = (rootTurns: Array<{ prose?: string; spawn?: boolean }>): Responder => {
+      let root = 0;
+      return (c) => {
+        if (c.method === "thread/start") return { thread: { id: c.threadStartCount === 1 ? "th-plan" : "th-child" } };
+        if (c.method === "thread/resume") return { thread: { id: "th-plan" } };
+        if (c.method !== "turn/start") return {};
+        if ((c.params as { threadId?: string }).threadId === "th-child") {
+          c.transport.push(agentMessage(CHILD, "th-child")).push(turnCompleted("completed", "th-child", "tn-child"));
+          return { turn: { id: "tn-child" } };
+        }
+        const i = root++;
+        const tn = `tn-root-${i}`;
+        const spec = rootTurns[i] ?? {};
+        if (i === 0) c.transport.push(threadStarted("th-plan"));
+        if (spec.prose) c.transport.push(agentMessage(spec.prose, "th-plan"));
+        if (spec.spawn) c.transport.push(toolCall(100 + i, "spawn_agent", { role: "coder", prompt: "look around" }, "th-plan", tn, `c-spawn-${i}`));
+        else c.transport.push(turnCompleted("completed", "th-plan", tn));
+        return { turn: { id: tn } };
+      };
+    };
+    const finishSpawn = async (rig: Rig, requestId: number, tn: string): Promise<void> => {
+      await waitFor(() => rig.transport.responses.some((r) => r.requestId === requestId), `spawn ${requestId} reply`);
+      rig.transport.push(turnCompleted("completed", "th-plan", tn));
+    };
+
+    it("a plan turn with child text only keeps the 'produced no plan' failure", async () => {
+      const rig = makeRig({ responder: delegating([{ spawn: true }]) });
+      const { ctx, emitted } = makeCtx({ agents, planApproved: false, approvedPlan: undefined, gatePlan: async () => approve });
+      const runP = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+      await finishSpawn(rig, 100, "tn-root-0");
+      await assert.rejects(withTimeout(runP, 5000, "child-only plan turn"),
+        (e: Error) => e.message === "codex plan turn produced no plan");
+      assert.ok(emitted.some((m) => m.payload.text === CHILD), "the child text did reach the feed");
+      assert.equal(cards(emitted).length, 0);
+      assert.equal(promptTexts(rig.transport).filter((p) => p === PLAN_MISSING_NUDGE).length, 0, "child text does not trigger a nudge");
+    });
+
+    it("a turn with lead prose and child text carries only the lead prose on the status card", async () => {
+      const rig = makeRig({ responder: delegating([{ prose: PROSE }, { prose: "LEAD-AFTER-NUDGE", spawn: true }]) });
+      const { ctx, emitted } = makeCtx({ agents, planApproved: false, approvedPlan: undefined, gatePlan: async () => approve });
+      const runP = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+      await finishSpawn(rig, 101, "tn-root-1");
+      await assert.rejects(withTimeout(runP, 5000, "lead + child"), (e: Error) => e.message === REASON_PLAN_MISSING);
+      assert.ok(emitted.some((m) => m.payload.text === CHILD), "the child text did reach the feed");
+      const c = cards(emitted);
+      assert.equal(c.length, 1);
+      assert.equal(c[0]!.payload.lead_final_message, "LEAD-AFTER-NUDGE");
+    });
+  });
 
   it("keeps today's throw for a no-plan turn with no text, initial and on revision", async () => {
     const rig = makeRig({ responder: scripted([[]]) });

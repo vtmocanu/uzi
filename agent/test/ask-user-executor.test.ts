@@ -299,7 +299,7 @@ describe("PRD #88 — fail-open and the shared budget", () => {
 // instead of failing REASON_NO_PLAN outright. A turn with no text at all still fails as before.
 describe("issue #1593 — a prose-only planning turn is nudged, then parked on the owner", () => {
   const PROSE = "I think we should refactor the widget; let me know what you think.";
-  const prose = (text = PROSE): SDKMessage[] => [assistantText(text), resultSuccess()];
+  const prose = (text = PROSE, sessionId = "sess-1"): SDKMessage[] => [assistantText(text, sessionId), resultSuccess(sessionId)];
   const plan = (md = "# Plan"): SDKMessage[] => [submitPlan(md), resultSuccess()];
   const done: SDKMessage[] = [assistantText("implementing"), signalDone(), resultSuccess()];
   const cards = (emits: EmittedMessage[]) => emits.filter((m) => m.kind === "status" && m.payload["event"] === "plan_missing");
@@ -367,6 +367,28 @@ describe("issue #1593 — a prose-only planning turn is nudged, then parked on t
     assert.equal(probe.asked.length, 0, "the fallback park is not a lead question");
   });
 
+  it("resumes the prose turn's own session for the nudge and for the guidance turn", async () => {
+    const { queryFn, turns } = fakeTurns([prose(PROSE, "sess-prose-1"), prose(PROSE, "sess-prose-2"), plan("# guided"), done]);
+    const probe = makeCtx({ askPlanMissing: async () => ({ kind: "answer", answers: ["go"] }) });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.ok((turns[1]!.promptText ?? "").includes(PLAN_MISSING_NUDGE));
+    assert.equal(turns[1]!.options.resume, "sess-prose-1", "the nudge resumes the prose turn's session");
+    assert.match(turns[2]!.promptText ?? "", /go/);
+    assert.equal(turns[2]!.options.resume, "sess-prose-2", "the guidance turn resumes the nudged turn's session");
+  });
+
+  it("treats a whitespace-only submit_plan as no plan (nudged, never gated)", async () => {
+    const { queryFn, turns } = fakeTurns([[assistantText(PROSE), submitPlan("  \n "), resultSuccess()], plan("# real"), done]);
+    const gated: string[] = [];
+    const probe = makeCtx({
+      gatePlan: async (md) => { gated.push(md); return { kind: "approve", selection: { status: "absent" } }; },
+      askPlanMissing: async () => { throw new Error("must not park"); },
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.ok((turns[1]!.promptText ?? "").includes(PLAN_MISSING_NUDGE));
+    assert.deepEqual(gated, ["# real"]);
+  });
+
   it("fails REASON_PLAN_MISSING when the turn after guidance is prose again, without a second nudge or park", async () => {
     const { queryFn, turns } = fakeTurns([prose(), prose(), prose(), plan()]);
     let parks = 0;
@@ -395,7 +417,7 @@ describe("issue #1593 — a prose-only planning turn is nudged, then parked on t
     it(`fails REASON_PLAN_MISSING with a bounded status card when no human can answer: ${mode}`, async () => {
       const secret = "sekret-" + "value-1593";
       const long = "x".repeat(MAX_LEAD_FINAL_MESSAGE_LEN) + " tail";
-      const { queryFn } = fakeTurns([prose(`${secret} ${long}`)]);
+      const { queryFn } = fakeTurns([prose(`${secret} ${long} ${secret} tail`)]);
       const probe = makeCtx({
         redactText: (s) => s.split(secret).join("[REDACTED]"),
         askPlanMissing: mode === "unwired" ? undefined : async () => ({ kind: "unattended" }),
@@ -407,8 +429,8 @@ describe("issue #1593 — a prose-only planning turn is nudged, then parked on t
       assert.equal(c[0]!.agent, "worker");
       const msg = String(c[0]!.payload["lead_final_message"]);
       assert.ok(msg.length <= MAX_LEAD_FINAL_MESSAGE_LEN);
-      assert.ok(msg.startsWith("[REDACTED] "));
-      assert.ok(msg.endsWith("…[truncated]"));
+      assert.ok(msg.startsWith("[truncated]…"), "the head was cut: the card shows the message's tail");
+      assert.ok(msg.endsWith(" [REDACTED] tail"));
       assert.ok(!msg.includes(secret));
     });
   }

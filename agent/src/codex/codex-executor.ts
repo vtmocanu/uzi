@@ -67,7 +67,7 @@ import { RunTurnReducerImpl } from "../harness-reducer.js";
 import { buildLeadSystemPrompt, buildRevisePlanPrompt, publishedTipNote } from "../prompt.js";
 import { RUNNER_UID, WORKER_UID, uidSplitActive } from "../runner-uid.js";
 import { errMessage } from "../util.js";
-import { emitPlanMissingNotice, isProseOnlyPlanTurn, PLAN_MISSING_NUDGE, REASON_PLAN_MISSING, resolvePlanMissing } from "../plan-missing.js";
+import { appendLeadTextTail, emitPlanMissingNotice, isProseOnlyPlanTurn, PLAN_MISSING_NUDGE, REASON_PLAN_MISSING, resolvePlanMissing } from "../plan-missing.js";
 import { makeTextRedactor } from "../redact.js";
 import type { AgentTemplate, AskUserQuestion, ClaimSkill } from "../protocol.js";
 import type { CommandSandboxMode } from "../config.js";
@@ -1602,7 +1602,7 @@ export class CodexExecutor implements Executor {
         let fallbackUsed = false;
         // `round` counts clarification rounds only; the prose-only recovery below has its own budget.
         for (let round = 0; ; ) {
-          const turn = await this.driveTurnWithWallPark(ctx, epoch!.harness, reducer, "plan", prompt, epoch!.resumeSessionId, idleMs, wallMs, epoch!.buildPhaseBroker, { completedCount: 0 });
+          const turn = await this.driveTurnWithWallPark(ctx, epoch!.harness, reducer, "plan", prompt, epoch!.resumeSessionId, idleMs, wallMs, epoch!.buildPhaseBroker, { completedCount: 0 }, shared.scrubProjected);
           if (turn.kind === "walled") return turn;
           const result = turn.result;
           if (result.plan?.trim()) {
@@ -1619,11 +1619,13 @@ export class CodexExecutor implements Executor {
               prompt = PLAN_MISSING_NUDGE;
               continue;
             }
+            // The card's redactor is scrubProjected (claim secrets AND runtime-released Codex
+            // tokens), applied after the bounder strips invisible characters.
             if (fallbackUsed) {
-              emitPlanMissingNotice(ctx, result.finalText!);
+              emitPlanMissingNotice(ctx, result.finalText!, shared.scrubProjected);
               throw new Error(REASON_PLAN_MISSING);
             }
-            const r = await resolvePlanMissing(ctx, result.finalText!);
+            const r = await resolvePlanMissing(ctx, result.finalText!, shared.scrubProjected);
             if (r.kind === "cancel") throw new Error(REASON_CANCEL);
             fallbackUsed = true;
             prompt = r.prompt;
@@ -1728,7 +1730,7 @@ export class CodexExecutor implements Executor {
         let nextPrompt = turnPrompt;
         let result: ReducedTurnResult;
         for (let round = 0; ; round++) {
-          const implTurn = await this.driveTurnWithWallPark(ctx, epoch.harness, reducer, "implement", nextPrompt, epoch.resumeSessionId, idleMs, wallMs, epoch.buildPhaseBroker, { completedCount: latestProgress?.completed?.length ?? 0 });
+          const implTurn = await this.driveTurnWithWallPark(ctx, epoch.harness, reducer, "implement", nextPrompt, epoch.resumeSessionId, idleMs, wallMs, epoch.buildPhaseBroker, { completedCount: latestProgress?.completed?.length ?? 0 }, shared.scrubProjected);
           if (implTurn.kind === "walled") return { branch: ctx.branch, walled: { reason: REASON_WALL } };
           result = implTurn.result;
           if (result.sessionId) lastSessionId = result.sessionId;
@@ -2087,6 +2089,7 @@ export class CodexExecutor implements Executor {
     idleMs: number,
     wallMs: number,
     buildPhaseBroker: (phase: "plan" | "implement", signal?: AbortSignal) => CodexCallbackBroker,
+    scrubLeadText: (s: string) => string,
   ): Promise<ReducedTurnResult> {
     const turnAbort = new AbortController();
     let tripReason: string | undefined;
@@ -2143,8 +2146,9 @@ export class CodexExecutor implements Executor {
     // #1593: the root thread's own text this turn. The harness projects root agent messages
     // with NO agent attribution (children carry their role), so the shared reducer, which keys
     // lead text on agent "lead", never sets finalText for a Codex turn. Collected here so the
-    // planning loop can tell a prose-only turn from a genuinely empty one.
-    const rootText: string[] = [];
+    // planning loop can tell a prose-only turn from a genuinely empty one. Only the most recent
+    // LEAD_TEXT_TAIL_KEEP characters are held, so a long turn never grows this without bound.
+    let rootText = "";
 
     const request = this.buildRunRequest(ctx, phase, prompt, resumeId, turnAbort.signal);
     try {
@@ -2165,7 +2169,7 @@ export class CodexExecutor implements Executor {
         for (const em of reduction.messages) {
           if (em.kind === "text" && (em.agent === undefined || em.agent === "lead")) {
             const t = em.payload["text"];
-            if (typeof t === "string" && t) rootText.push(t);
+            if (typeof t === "string" && t) rootText = appendLeadTextTail(rootText, t);
           }
           ctx.emit(em);
         }
@@ -2189,7 +2193,11 @@ export class CodexExecutor implements Executor {
       // (d) clean terminal / exhausted.
       const end: TurnStreamEnd = sawTerminal && terminal ? { kind: "terminal", terminal } : { kind: "exhausted" };
       const result = reducer.finish(end).result;
-      if (result.finalText === undefined && rootText.length > 0) result.finalText = rootText.join("\n");
+      // The capture (not the emitted feed frames, which the batcher redacts) is scrubbed of the
+      // claim secrets and the runtime-released Codex tokens before it leaves the turn. It wins
+      // over any reducer-set finalText, so the only lead text a Codex turn returns is this
+      // bounded, scrubbed tail.
+      if (rootText) result.finalText = scrubLeadText(rootText);
       return result;
     } catch (err) {
       // (a) again: a trip beats the raw aborted/protocol error the iterator threw.
@@ -2228,11 +2236,12 @@ export class CodexExecutor implements Executor {
     wallMs: number,
     buildPhaseBroker: (phase: "plan" | "implement", signal?: AbortSignal) => CodexCallbackBroker,
     at: { completedCount: number; total?: number },
+    scrubLeadText: (s: string) => string,
   ): Promise<{ kind: "turn"; result: ReducedTurnResult } | { kind: "walled" }> {
     for (;;) {
       try {
         const result = await this.driveCodexTurn(
-          ctx, harness, reducer, phase, prompt, resumeId, idleMs, wallMs, buildPhaseBroker,
+          ctx, harness, reducer, phase, prompt, resumeId, idleMs, wallMs, buildPhaseBroker, scrubLeadText,
         );
         // PRD #1497 M2 (CodeRabbit !1504): honor a sticky owner cancel that RACED a REFUSED
         // wall-park re-drive in EVERY phase. The wall PauseNowSignal permanently spent the shared

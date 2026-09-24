@@ -3151,7 +3151,9 @@ export class SdkExecutor implements Executor {
         idleMs,
       );
       resumeId = turn.sessionId ?? resumeId;
-      if (turn.plan !== undefined)
+      // Issue #1593: a whitespace-only plan is not a plan (aligned with Codex); it falls through
+      // to the prose-only / no-plan handling below instead of reaching the gate.
+      if (turn.plan?.trim())
         return { ...turn, sessionId: resumeId, plan: turn.plan };
 
       // Issue #1593: prose only (no plan, no question, some lead text). Nudge once with fixed
