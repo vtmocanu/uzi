@@ -7,6 +7,7 @@ import path from "node:path";
 import { type ExecutorResult, type RunContext } from "../src/executor.js";
 import { RunRunner, type ExecutorFactory } from "../src/runner.js";
 import { GitCache, WIP_PARK_COMMIT_PREFIX } from "../src/git.js";
+import { defaultGitleaksShim } from "./gitleaks-shim.js";
 import { Worker } from "../src/worker.js";
 import type { Config } from "../src/config.js";
 import type { ChatRunner } from "../src/chat-runner.js";
@@ -443,7 +444,7 @@ describe("RunRunner — durable park (PRD #218 M1/M2/M3)", () => {
       const iid = 205;
       // A real GitCache whose ONLY broken method is the fetch-back — ensureClone and
       // the reseed must still work so the run gets far enough to park.
-      const brokenGit = new GitCache(fx.dataDir, nullLogger());
+      const brokenGit = new GitCache(fx.dataDir, nullLogger(), undefined, { gitleaksBin: defaultGitleaksShim() });
       brokenGit.fetchAgentBranch = async () => {
         throw new Error("fetch-back boom");
       };
@@ -1519,7 +1520,7 @@ describe("RunRunner — worker-shutdown fetch-back (PRD #218 M1)", () => {
     const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-218-d-"));
     try {
       const iid = 222;
-      const brokenGit = new GitCache(fx.dataDir, nullLogger());
+      const brokenGit = new GitCache(fx.dataDir, nullLogger(), undefined, { gitleaksBin: defaultGitleaksShim() });
       brokenGit.fetchAgentBranch = async () => {
         throw new Error("fetch-back boom");
       };

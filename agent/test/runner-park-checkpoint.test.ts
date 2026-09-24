@@ -8,6 +8,7 @@ import type { Readable } from "node:stream";
 import { type ExecutorResult, type RunContext } from "../src/executor.js";
 import { RunRunner, type ExecutorFactory } from "../src/runner.js";
 import { GitCache } from "../src/git.js";
+import { defaultGitleaksShim } from "./gitleaks-shim.js";
 import { LimitReachedError } from "../src/limit.js";
 import { nullLogger } from "./helpers.js";
 import {
@@ -256,7 +257,7 @@ describe("RunRunner — checkpoint on the limit-park path (PRD #628 M2)", () => 
     try {
       // A real GitCache whose ONLY broken method is the fetch-back: no tracking ref is
       // written, so checkpointPack finds no tip and returns null — no RPC at all.
-      const brokenGit = new GitCache(fx.dataDir, nullLogger());
+      const brokenGit = new GitCache(fx.dataDir, nullLogger(), undefined, { gitleaksBin: defaultGitleaksShim() });
       brokenGit.fetchAgentBranch = async () => {
         throw new Error("fetch-back boom");
       };

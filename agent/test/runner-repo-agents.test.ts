@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { makeFixture } from "./fixture-repo.js";
 import { makeClaim, nullLogger } from "./helpers.js";
 import { GitCache } from "../src/git.js";
+import { defaultGitleaksShim } from "./gitleaks-shim.js";
 import { StubExecutor, type Executor } from "../src/executor.js";
 import { RunRunner } from "../src/runner.js";
 import {
@@ -40,7 +41,7 @@ describe("RunRunner — repo agent detection (PRD #37)", () => {
       });
       const repoRunner = new RunRunner(
         client,
-        new GitCache(repoFx.dataDir, nullLogger()),
+        new GitCache(repoFx.dataDir, nullLogger(), undefined, { gitleaksBin: defaultGitleaksShim() }),
         () => ({ executor: new StubExecutor(nullLogger()) }),
         nullLogger(),
         20,
@@ -144,7 +145,7 @@ describe("RunRunner — repo agent detection (PRD #37)", () => {
       });
       const runner = new RunRunner(
         client,
-        new GitCache(repoFx.dataDir, nullLogger()),
+        new GitCache(repoFx.dataDir, nullLogger(), undefined, { gitleaksBin: defaultGitleaksShim() }),
         () => ({ executor: new StubExecutor(nullLogger()) }),
         nullLogger(),
         20,
@@ -217,7 +218,7 @@ describe("RunRunner — repo agent detection (PRD #37)", () => {
       });
       const r = new RunRunner(
         client,
-        new GitCache(repoFx.dataDir, nullLogger()),
+        new GitCache(repoFx.dataDir, nullLogger(), undefined, { gitleaksBin: defaultGitleaksShim() }),
         () => ({
           executor: new StubExecutor(nullLogger(), { planGate: true }),
         }),
@@ -294,7 +295,7 @@ describe("RunRunner — repo agent detection (PRD #37)", () => {
         });
         const r = new RunRunner(
           client,
-          new GitCache(repoFx.dataDir, nullLogger()),
+          new GitCache(repoFx.dataDir, nullLogger(), undefined, { gitleaksBin: defaultGitleaksShim() }),
           () => ({
             executor: new StubExecutor(nullLogger(), { planGate: true }),
           }),

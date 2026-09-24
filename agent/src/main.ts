@@ -423,6 +423,8 @@ async function main(): Promise<void> {
     pollMs: config.pollIntervalMs,
     planApprovalTimeoutMs: config.planApprovalTimeoutMs,
     checkpointIntervalMs: config.checkpointIntervalMs,
+    // issue #1597 M2: the mid-turn checkpoint tick cadence (CHECKPOINT_TICK_INTERVAL; 0 disables).
+    checkpointTickIntervalMs: config.checkpointTickIntervalMs,
     // PRD #1391 M2: spill collaborators for every run's batcher.
     outbox,
     rearm,

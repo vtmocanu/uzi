@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import type { WorkerClient } from "./client.js";
 import { RequestError } from "./client.js";
-import type { GitCache, RunnerClone, CheckpointOverlayContext } from "./git.js";
+import type { GitCache, RunnerClone, CheckpointOverlayContext, CheckpointRange } from "./git.js";
 import {
   gitBasicCredential,
   isNonFastForwardRejection,
@@ -14,6 +14,8 @@ import type { SecretFinding } from "./secret-scan-guard.js";
 import type { Executor, ExecutorResult, RunContext, WallParkOutcome, WallParkRefresh } from "./executor.js";
 import { PlanRejectedError } from "./executor.js";
 import type { BoundaryPermit, BoundaryRequest } from "./harness.js";
+import { SinkGate } from "./sink-gate.js";
+import { TickSpawner, type RetainedLock, type TickSpawnerTestHooks } from "./tick-spawner.js";
 import { skillsPluginDir } from "./skills-plugin.js";
 import { describeLimit, LimitReachedError } from "./limit.js";
 import type { Logger } from "./log.js";
@@ -72,7 +74,12 @@ import { classifyForgeError, withForgeRetry } from "./forge-retry.js";
 import { makeRedactor, makeTextRedactor } from "./redact.js";
 import { sessionTranscriptResolvable } from "./sdk-session.js";
 import { errMessage, RUN_ID_RE, sleep } from "./util.js";
-import { CapturePathMismatchError, ForeignCaptureBlockedError, PendingRecoveryCaptureError } from "./git.js";
+import {
+  CHECKPOINT_SCAN_TIMEOUT_MS,
+  CapturePathMismatchError,
+  ForeignCaptureBlockedError,
+  PendingRecoveryCaptureError,
+} from "./git.js";
 import {
   buildCheckEnv,
   defaultCheckRunner,
@@ -170,10 +177,13 @@ function publishSkipLabel(raw: unknown): PublishSkipLabel {
   return (PUBLISH_SKIP_LABELS as readonly unknown[]).includes(raw) ? (raw as PublishSkipLabel) : "other";
 }
 
-/** issue #1597 M1: why a checkpoint publish did not land. `no_local_tip` = checkpointPack found
- *  no tracking ref (nothing to publish; silent), `skipped` = a 2xx best-effort server skip,
- *  `rejected` = a non-2xx, `aborted` = the caller's signal (permit/deadline) aborted or the throw
- *  was an AbortError (silent on the feed), `error` = any other throw. */
+/** issue #1597 M1: why a checkpoint publish did not land. `no_local_tip` = the tracking tip was
+ *  unresolved (no tracking ref, or it could not be read — trackingTip swallows a git failure to
+ *  null), so checkpointPack had nothing to pack (silent), `skipped` = a 2xx best-effort server skip,
+ *  `rejected` = a non-2xx, `aborted` = the caller's signal (permit/deadline/tick) aborted OR the throw
+ *  was an AbortError even with no aborted signal (e.g. the client's own request timeout) — silent on
+ *  the feed either way; the shutdown sink names the latter `publish_error`, since its permit did not
+ *  expire — and `error` = any other throw. */
 type PublishFailClass = "no_local_tip" | "skipped" | "rejected" | "aborted" | "error";
 
 /** issue #1597 M1: the typed result of {@link RunRunner.publishCheckpointOutcome}. Only the
@@ -186,8 +196,11 @@ type PublishOutcome =
   | { published: false; reason: "rejected"; httpStatus: number };
 
 /** issue #1597 M1: the class a graceful-shutdown checkpoint ended in, named on the run feed and
- *  in the run log. Published WINS over a later boundary error. This is the type slot issue #1597
- *  M2 extends (e.g. `bare_lock_retained`); the feed line prints the class verbatim. */
+ *  in the run log. Published WINS over a later boundary error. `no_local_tip` = the tracking tip
+ *  was unresolved (no tracking ref, or it could not be read). issue #1597 M2 adds
+ *  `bare_lock_retained`: the checkpoint did not land while a cancelled mid-turn tick had left a git
+ *  lock file in the worker bare that could not be proven the tick's own (so it was kept). The feed
+ *  line prints the class verbatim. */
 type ShutdownCheckpointOutcome =
   | "published"
   | "timeout"
@@ -195,7 +208,8 @@ type ShutdownCheckpointOutcome =
   | "publish_rejected"
   | "publish_skipped"
   | "publish_error"
-  | "no_local_tip";
+  | "no_local_tip"
+  | "bare_lock_retained";
 
 /** issue #1597 M1: map the shutdown body's publish result to its shutdown class. An `aborted`
  *  publish is a `timeout` when the permit/deadline signal is what aborted it, else a
@@ -219,6 +233,38 @@ function shutdownOutcomeOf(
       return "publish_error";
   }
 }
+
+/** issue #1597 M2: the class one run of the checkpoint body ended in (the mid-turn tick logs it).
+ *  `publish_failed:<reason>` carries the {@link PublishFailClass} of a publish that did not land. */
+type CheckpointBodyOutcome =
+  | "published"
+  | "time_gate_closed"
+  | "no_new_work"
+  | "secret_found"
+  | "secret_scan_untrusted"
+  | `publish_failed:${Exclude<PublishFailClass, "aborted">}`
+  | "aborted";
+
+/** issue #1597 M2: the class one MID-TURN checkpoint tick ended in, logged as
+ *  runLog.info("mid-turn checkpoint tick", {outcome}). A local fetch-back alone is never
+ *  `published` — only a publish the broker confirmed is. */
+type MidTurnTickOutcome = CheckpointBodyOutcome | "git_busy" | "gate_busy" | "bare_lock_retained";
+
+/** issue #1597 M2: the checkpoint body's options — ctx.checkpoint's plus the tick-only knobs. */
+type CheckpointBodyOpts = Parameters<NonNullable<RunContext["checkpoint"]>>[0] & {
+  /** No `running` reportState (the mid-turn tick). */
+  quiet?: boolean;
+  /** The tick's cancellation signal: checked between steps and handed to the publish RPC. */
+  signal?: AbortSignal;
+  /** Run the secret scan under a tighter sub-scope (the tick's 60s scan deadline). */
+  scanScope?: <T>(fn: () => Promise<T>) => Promise<T>;
+};
+
+/** issue #1597 M2: the hard cap on one mid-turn tick (probe excluded): its signal aborts at this
+ *  deadline, killing every child it spawned. */
+const MIDTURN_TICK_TIMEOUT_MS = 120_000;
+/** issue #1597 M2: consecutive git-busy ticks before the deferred line reaches the feed. */
+const MIDTURN_BUSY_FEED_AFTER = 3;
 
 function isAbortLikeError(err: unknown): boolean {
   return err instanceof Error && err.name === "AbortError";
@@ -861,6 +907,16 @@ interface RunFlight {
    *  the feed line so the ~20-min time-gated retry of a persistently-failing publish does
    *  not spam the feed. */
   reportedPublishOutcomes: Set<string>;
+  /** issue #1597 M2: the per-flight SINK GATE. Every path that moves the run's durable state while
+   *  the turn is live (the checkpoint closure, parkForPause, parkForWall, enterCompletionHold and
+   *  the credential-switch attempt) runs under `sinkGate.run`; the mid-turn checkpoint tick only
+   *  `tryAcquire`s it and is PREEMPTED (aborted, then awaited to full settlement) by a gated path.
+   *  See agent/src/sink-gate.ts. */
+  readonly sinkGate: SinkGate;
+  /** issue #1597 M2: a cancelled mid-turn tick left a `*.lock` in the worker bare it could not
+   *  prove its own, so it was RETAINED (never deleted). Later ticks skip (`bare_lock_retained`) and
+   *  a shutdown checkpoint that does not land names that class. Never reset within a flight. */
+  bareLockRetained: boolean;
   runnerClone: RunnerClone | undefined;
   ciFixHumanApproved: boolean;
   result: ExecutorResult | undefined;
@@ -902,6 +958,18 @@ function snapshotPhaseOf(status: StateRequest["status"]): ActiveSnapshotPhase | 
   return SNAPSHOT_PHASES.has(status as ActiveSnapshotPhase) ? (status as ActiveSnapshotPhase) : undefined;
 }
 
+/** issue #1597 M2: test-only seams for the mid-turn checkpoint tick and the scanned publish. */
+export interface CheckpointTestHooks {
+  /** Fires between the pinned secret scan and the pack of an overlay-less checkpoint publish. */
+  afterCheckpointScan?: (ctx: { barePath: string; branch: string; range: CheckpointRange }) => Promise<void>;
+  /** Rewrite / observe the tick's child processes (see TickSpawnerTestHooks). */
+  tickSpawn?: TickSpawnerTestHooks;
+  /** Observe every tick's outcome class (the same value logged as "mid-turn checkpoint tick"). */
+  onTickOutcome?: (outcome: string) => void;
+  /** SIGTERM → SIGKILL grace for a cancelled tick child (default 2s). */
+  tickKillGraceMs?: number;
+}
+
 /** Tuning the runner needs beyond the collaborators (defaults keep M2/M3 tests terse). */
 export interface RunnerOptions {
   /** How often the steering channel polls /inputs (default 3s). */
@@ -927,6 +995,12 @@ export interface RunnerOptions {
   /** PRD #267: min interval between time-based origin checkpoint publishes on the
    *  reap:false path; 0 disables. Default 20m. */
   checkpointIntervalMs?: number;
+  /** issue #1597 M2: how often the MID-TURN checkpoint tick fires while `executor.run` is in flight
+   *  (a busy probe, then a quiet reap:false checkpoint body — fetch-back, steer/bridge, time-gated
+   *  scanned publish). 0 disables. Default 5m (CHECKPOINT_TICK_INTERVAL). */
+  checkpointTickIntervalMs?: number;
+  /** issue #1597 M2: TEST-ONLY seams for the mid-turn checkpoint machinery. Production passes none. */
+  checkpointTestHooks?: CheckpointTestHooks;
   /** PRD #1030 M4: CLIENT-side cap (ms) on the graceful-shutdown durability sequence
    *  (WIP-marker commit + fetch-back + checkpoint publish) so a slow/unreachable forge
    *  cannot hang the shutdown past the k8s termination grace. Default 15s — see the
@@ -947,6 +1021,12 @@ export interface RunnerOptions {
    *  fact about the `remaining` the second park arms — instead of racing a wall-clock
    *  bound that flakes under CPU contention. Returns a canceller. */
   setTimer?: (cb: () => void, ms: number) => () => void;
+  /** issue #1597 M2: the injectable timer that arms the REPEATING mid-turn checkpoint tick (same
+   *  cancel-fn shape as `setTimer`; default a real unref'd setTimeout). Deliberately separate from
+   *  `setTimer`, whose arm count existing tests pin (e.g. "the answer deadline is armed exactly once
+   *  per park") — arming the tick through it would add an arm to every run. The tick's own 120s /
+   *  60s deadlines still use `setTimer`; they arm only while a tick runs. */
+  setTickTimer?: (cb: () => void, ms: number) => () => void;
   /** PRD #1296 M3 — inject a pre-built recovery coordinator (a fake client/git) for tests;
    *  production builds one from the run lane's own client + git cache + join token. */
   recovery?: RecoveryCoordinator;
@@ -1052,6 +1132,10 @@ export class RunRunner {
   private readonly checkpointIntervalMs: number;
   /** PRD #1030 M4: client-side cap (ms) on the graceful-shutdown durability sequence. */
   private readonly shutdownPublishTimeoutMs: number;
+  /** issue #1597 M2: the mid-turn checkpoint tick cadence (0 disables). */
+  private readonly checkpointTickIntervalMs: number;
+  /** issue #1597 M2: test-only seams (undefined in production). */
+  private readonly checkpointTestHooks: CheckpointTestHooks | undefined;
   private readonly recoveryRetryMs: number;
   /** PRD #1171 m4: bounded absolute deadline (ms) for a Codex durability-sink withBoundary. */
   private readonly codexBoundaryDeadlineMs: number;
@@ -1062,6 +1146,8 @@ export class RunRunner {
   /** PRD #88: injectable answer-deadline timer (defaults to setTimeout/clearTimeout),
    *  so a test can arm and observe the per-run answer budget without a wall-clock race. */
   private readonly setTimer: (cb: () => void, ms: number) => () => void;
+  /** issue #1597 M2: arms the repeating mid-turn checkpoint tick (see RunnerOptions.setTickTimer). */
+  private readonly setTickTimer: (cb: () => void, ms: number) => () => void;
   /** PRD #41: absolute plan-approval deadline (epoch ms) per runId, set on the FIRST
    *  gate entry and reused across every revision round so N rounds share ONE budget (not
    *  24h per round). Cleared when the gate resolves terminally (approve/reject/cancel/
@@ -1183,6 +1269,8 @@ export class RunRunner {
     // PRD #1390 M2a: the shared active-run registry the worker reads to build snapshots.
     this.snapshotRegistry = opts.activeRuns;
     this.checkpointIntervalMs = opts.checkpointIntervalMs ?? 20 * 60_000;
+    this.checkpointTickIntervalMs = opts.checkpointTickIntervalMs ?? 5 * 60_000;
+    this.checkpointTestHooks = opts.checkpointTestHooks;
     this.shutdownPublishTimeoutMs = opts.shutdownPublishTimeoutMs ?? 15_000;
     this.recoveryRetryMs = Math.max(1, Math.min(opts.recoveryRetryMs ?? 1_000, 30_000));
     // PRD #1171 m4: bounded, never unbounded. Clamp a caller-supplied 0/negative to the default.
@@ -1191,13 +1279,13 @@ export class RunRunner {
         ? opts.codexBoundaryDeadlineMs
         : 30_000;
     this.now = opts.now ?? (() => Date.now());
-    this.setTimer =
-      opts.setTimer ??
-      ((cb, ms) => {
-        const t = setTimeout(cb, ms);
-        t.unref?.();
-        return () => clearTimeout(t);
-      });
+    const realTimer = (cb: () => void, ms: number): (() => void) => {
+      const t = setTimeout(cb, ms);
+      t.unref?.();
+      return () => clearTimeout(t);
+    };
+    this.setTimer = opts.setTimer ?? realTimer;
+    this.setTickTimer = opts.setTickTimer ?? realTimer;
   }
 
   /** PRD #1296 M3 — restart-safe recovery resume (called once by the worker after
@@ -1804,12 +1892,18 @@ export class RunRunner {
           // bounded deadline, and we await actual action/root settlement before terminal
           // safety.dispose or run-home cleanup can proceed.
           // issue #1597 M1: the Claude budget race resolving `undefined` IS the timeout class.
-          const outcome: ShutdownCheckpointOutcome = executor.safety
+          const raced: ShutdownCheckpointOutcome = executor.safety
             ? await durability
             : ((await this.raceShutdownBudget(durability, this.shutdownPublishTimeoutMs)) ?? "timeout");
+          // issue #1597 M2: when a cancelled mid-turn tick left a git lock in the worker bare that
+          // could not be proven its own (flight.bareLockRetained), a shutdown checkpoint that did not
+          // land is named for that cause — the retained lock is what blocks the fetch-back/publish.
+          const outcome: ShutdownCheckpointOutcome =
+            raced !== "published" && flight.bareLockRetained ? "bare_lock_retained" : raced;
           runLog.info("shutdown checkpoint outcome", { run_id: runId, outcome });
-          // issue #1030 M4: surface the outcome on the feed the same way the park path does,
-          // reusing the batcher emit + the reportPublishOutcome dedupe from M1. This lands
+          // issue #1030 M4: surface the outcome on the feed the same way the park path does — a
+          // direct batcher.emit, NOT deduped (it fires once per shutdown; only the generic
+          // publish-failure lines go through the reportPublishOutcome dedupe). This lands
           // because it is emitted BEFORE the single batcher.close() below — the shutdown
           // branch closes the batcher exactly once, further down, never here.
           batcher.emit({
@@ -1817,14 +1911,16 @@ export class RunRunner {
             agent: "worker",
             payload: {
               // issue #1597 M1: the class only — no error message, remote text or credential. The
-              // tail names the real restart point: a checkpoint this run (or its claim) already
-              // knows landed, else the default branch.
+              // tail names the likely restart point. A checkpoint this run (or its claim) knows
+              // landed is only adopted by a resume while it is still adoptable (runnerCloneForBranch
+              // sets it aside when e.g. origin/<branch> exists and it does not descend it), so that
+              // case is hedged; with no known checkpoint the default branch is named, as before.
               text:
                 outcome === "published"
                   ? "shutdown checkpoint published to origin"
                   : `shutdown checkpoint NOT published (reason: ${outcome}) — a resume on another worker will restart from ${
                       flight.lastCheckpointRefTip
-                        ? "the last published checkpoint"
+                        ? "the last published checkpoint if it is still adoptable, else the branch or default branch"
                         : "the default branch"
                     }`,
             },
@@ -4874,6 +4970,10 @@ export class RunRunner {
       lastAttemptedCheckpointRefTip: undefined,
       // issue #1030: per-run dedupe set for checkpoint-publish outcome feed lines.
       reportedPublishOutcomes: new Set<string>(),
+      // issue #1597 M2: the per-flight sink gate (mid-turn tick vs every durable-state path) and the
+      // latch a cancelled tick sets when it had to RETAIN a lock file in the worker bare.
+      sinkGate: new SinkGate(),
+      bareLockRetained: false,
       // PRD #218 M1: the run's branch, hoisted so the park/shutdown fetch-back in the
       // catch can name it. `runnerClone` is declared inside the try and there is no
       // `result` on those paths, so `runnerClone.branch` is the source of truth and it is
@@ -5499,6 +5599,233 @@ export class RunRunner {
       return run;
     };
 
+    // PRD #122 M6 / issue #1597 M2: the checkpoint BODY, un-gated. ctx.checkpoint (below) runs it
+    // under the flight's sink gate; the mid-turn tick calls it DIRECTLY while it already holds the
+    // gate via tryAcquire (so it can never self-deadlock), in QUIET mode (no `running` report) with
+    // reap:false semantics, its own cancellation signal, and a sub-scope for the 60s secret scan.
+    // See the ctx.checkpoint comment for the reap-before-git and best-effort invariants.
+    const checkpointBody = async (opts: CheckpointBodyOpts): Promise<CheckpointBodyOutcome> => {
+      // `barePath` is the outer `let` (string | undefined); it is set before the run
+      // reaches the executor, but narrow it so the closure is honest rather than `!`.
+      if (!barePath) return "no_new_work";
+      // Decision 6 tip-movement check: has the runner clone's branch tip moved since the
+      // last checkpoint wrote the tracking ref? A null trackTip (never checkpointed) or a
+      // null cloneTip (unresolvable) is NOT a match, so it falls through to a real fetch.
+      const cloneTip = await this.git.branchTip(runnerClone.path, runnerClone.branch);
+      const trackTip = await this.git.trackingTip(barePath, runnerClone.branch);
+      const tipUnmovedSinceFetch =
+        trackTip !== null && cloneTip !== null && trackTip === cloneTip;
+
+      // PRD #267: "new committed work not yet on origin". Depends ONLY on cloneTip (read at
+      // the top) and flight.lastPublishedTip, neither of which the fetch-back changes, so it
+      // is safe to compute here — before the reap decision — and close over it below.
+      const hasNewWork = cloneTip !== null && cloneTip !== flight.lastPublishedTip;
+
+      // PRD #1171 m4: the fetch-back + origin-publish + running-report body, extracted so the
+      // reap:true (milestone) path routes it through the Codex reap facade while the reap:false
+      // (iteration-boundary) path calls it DIRECTLY (credential-free, no permit). `overlay` is
+      // the reap:true `.github/workflows` overlay (undefined off the reaped path and when
+      // nothing publishes); its default-tip fetch is a PAT git op, so it is only ever passed on
+      // a reaped path (REAP-BEFORE-GIT).
+      // issue #1597 M2: the class this body ended in — read by the mid-turn tick (the gated
+      // ctx.checkpoint discards it). Default: nothing new to publish.
+      let bodyOutcome: CheckpointBodyOutcome = "no_new_work";
+      const doCheckpointPublish = async (overlay?: CheckpointOverlayContext): Promise<void> => {
+        // issue #1597 M2: a cancelled tick (quiescence, shutdown, a preempting sink) starts nothing.
+        if (opts.signal?.aborted) {
+          bodyOutcome = "aborted";
+          return;
+        }
+        // Skip ONLY the fetch when there is nothing new to fetch — do NOT return, so the
+        // origin-publish gate below still runs (Decision 9: a commit fetched at an earlier
+        // iteration can become publish-eligible on a later tip-unmoved iteration).
+        if (!tipUnmovedSinceFetch) {
+          // Fetch back, credential-free (#218's helper): brings the committed work into
+          // refs/uzi-runner/<branch> where the reseed reads it. Best-effort, never fails.
+          await this.fetchBackBestEffort(
+            barePath,
+            runnerClone.path,
+            runnerClone.branch,
+            runId,
+            runLog,
+          );
+        } else {
+          runLog.info("checkpoint fetch skipped: branch tip unmoved since last checkpoint", {
+            run_id: runId,
+            branch: runnerClone.branch,
+          });
+        }
+
+        // PRD #1416 M2: on the tip that was just fetched into the bare, detect a history
+        // rewrite at/below the published floor P (and floor C) and steer the agent to restore
+        // it — never blocks a git command (D2). Read the tip FRESH from the bare tracking ref
+        // (refs/uzi-runner/<branch>) since fetchBackBestEffort returns nothing and the
+        // top-of-checkpoint trackTip predates this fetch; never the runner clone (that crosses
+        // the worker-uid/runner-uid ownership seam branchTip exists to avoid). MID-RUN
+        // checkpoint tick only — the finalize/park/capture fetch-backs are M3's territory.
+        const fetchedTip = await this.git.trackingTip(barePath, runnerClone.branch);
+        await this.maybeSteerOnDivergence(barePath, flight, fetchedTip, batcher, steering, runLog);
+
+        // PRD #1416 M3 (C1): AFTER the steer (which must see the agent's rewritten H) and BEFORE
+        // the publish, non-destructively bridge a divergent tracking tip so the checkpoint pack —
+        // and therefore a reseed on resume — carries B instead of the rewritten H. Best-effort:
+        // a checkpoint must never crash the run (D4), so "failed"/"unknown" only log and continue.
+        const bridgeOutcome = await this.bridgeBareTrackingRefIfDivergent(
+          barePath,
+          runnerClone.branch,
+          flight,
+          runLog,
+        );
+        if (bridgeOutcome.kind === "failed" || bridgeOutcome.kind === "unknown") {
+          runLog.info("PRD #1416 M3: mid-run checkpoint bridge did not advance the tracking ref", {
+            run_id: runId,
+            branch: runnerClone.branch,
+            outcome: bridgeOutcome.kind,
+          });
+        }
+
+        // PRD #267: origin-publish gate. The publish is CREDENTIAL-FREE (a pack brokered to the
+        // api via publishCheckpoint, no PAT — checkpointPack local objects → client join token)
+        // EXCEPT the reap:true `overlay`'s default-tip fetch.
+        //   - reap:true  (milestone): publish whenever there is new committed work.
+        //   - reap:false (iteration boundary, PRD #267): publish only when the time-gate is
+        //     open AND there is new committed work — "new work" keys on lastPublishedTip, NOT
+        //     the fetch-skip above, so an idle commit still ships exactly once.
+        const timeGateOpen =
+          this.checkpointIntervalMs > 0 &&
+          this.now() - flight.lastPublish >= this.checkpointIntervalMs;
+        let published = false;
+        if (hasNewWork && (opts.reap || timeGateOpen)) {
+          // issue #1597 M2: an overlay-less publish (the mid-turn tick, the iteration boundary, and a
+          // milestone whose overlay is undefined) is SCANNED first, over a range PINNED to SHAs, and
+          // packs exactly that range. An overlay publish (and every park/shutdown/pause/capture sink,
+          // which do not come through here) is byte-unchanged and not scanned.
+          const scanned = overlay
+            ? { kind: "unscanned" as const }
+            : await this.scanCheckpointForPublish(flight, barePath, runnerClone.branch, opts.scanScope);
+          if (opts.signal?.aborted) {
+            // Cancelled mid-scan (only the QUIET tick carries a signal, so there is no report to
+            // keep): no attempt was made, so the time gate is NOT advanced.
+            bodyOutcome = "aborted";
+            return;
+          }
+          if (scanned.kind === "blocked") {
+            // Finding or untrusted scan: do NOT publish. The fetch-back above stays (local only,
+            // never reported durable); lastPublish advances like any attempt so the next interval
+            // retries; lastPublishedTip does NOT advance. Falls through to the running report, so a
+            // milestone's progress is still reported.
+            flight.lastPublish = this.now();
+            bodyOutcome = scanned.outcome;
+          } else {
+            const outcome = await this.publishCheckpointOutcome(
+              flight,
+              barePath,
+              runnerClone.branch,
+              overlay,
+              opts.signal,
+              scanned.kind === "pinned" ? scanned.range : undefined,
+            );
+            published = outcome.published;
+            bodyOutcome = outcome.published
+              ? "published"
+              : outcome.reason === "aborted" || opts.signal?.aborted
+                ? "aborted"
+                : `publish_failed:${outcome.reason}`;
+            // Advance the time-gate on every ATTEMPT (not just success): bounds broker retry
+            // cadence to <= 1 publish/interval/run even under a persistent broker failure.
+            flight.lastPublish = this.now();
+            // PRD #267 Fix 1 (Decision 9): advance lastPublishedTip ONLY on a CONFIRMED landed
+            // publish, so a transient broker failure leaves hasNewWork true and the time-gate
+            // retries the SAME tip at the next interval boundary (bounded loss).
+            if (published) {
+              flight.lastPublishedTip = cloneTip ?? flight.lastPublishedTip;
+              // PRD #1416 M3 (C2): advance the checkpoint floor C to the DURABLE published floor on
+              // EVERY confirmed publish (PRD line 62). When this tick BRIDGED, C is already B (the
+              // helper set it) and cloneTip is the un-bridged H — so DO NOT regress C back to H;
+              // otherwise C is the confirmed checkpoint tip cloneTip. lastPublishedTip stays cloneTip
+              // (H) above: it drives hasNewWork, a separate concern from the floor.
+              flight.checkpointFloor =
+                bridgeOutcome.kind === "bridged"
+                  ? bridgeOutcome.bridge
+                  : (cloneTip ?? flight.checkpointFloor);
+              // PRD #267 M3: make the time-based publish observable, only for the time path so
+              // we do not double-log the milestone case.
+              if (!opts.reap) {
+                runLog.info("checkpoint published to origin (time-based)", {
+                  run_id: runId,
+                  branch: runnerClone.branch,
+                  tip: cloneTip,
+                });
+              }
+            }
+          }
+        } else {
+          bodyOutcome = hasNewWork ? "time_gate_closed" : "no_new_work";
+        }
+        // Report the checkpointed milestone as a `running` report (additive-optional; NO
+        // iteration_count so it never regresses the server's GREATEST-merged counter). PRD
+        // #267 Fix 2: emit ONLY on real activity (a fetch or a publish); stay silent on a
+        // pure-idle checkpoint. issue #1597 M2: the mid-turn tick runs QUIET (no report).
+        if (!opts.quiet && (!tipUnmovedSinceFetch || published)) {
+          // PRD #1064 M1: enqueue onto the per-run chain so this checkpoint report stays
+          // ordered behind any pending immediate `reportProgress` push.
+          await enqueueRunningReport(() =>
+            reportState({
+              status: "running",
+              ...(opts.progress
+                ? {
+                    milestones_completed: opts.progress.completed,
+                    milestones_in_progress: opts.progress.in_progress,
+                    // PRD #1224 M1: project the OPTIONAL per-milestone agent attribution,
+                    // omitted when undefined so an old-worker wire shape is preserved.
+                    ...(opts.progress.milestones_agents
+                      ? { milestones_agents: opts.progress.milestones_agents }
+                      : {}),
+                  }
+                : {}),
+            }),
+          ).catch((e) =>
+            runLog.warn("could not report checkpoint progress", {
+              error: errMessage(e),
+            }),
+          );
+        }
+      };
+
+      if (opts.reap) {
+        // reap:true (milestone). REAP-BEFORE-GIT (Decision 10b, B1/M4 audit): the facade reaps
+        // the agent tree — killAgentTree for Claude/stub; withBoundary quiesce+reap (after the
+        // per-sink auth-mode reconcile) for Codex — STRICTLY before ANY git below (the
+        // credential-free fetch-back AND the #1036 overlay's PAT default-fetch). The overlay is
+        // built INSIDE the reaped action (only when it will be used) so its PAT fetch never
+        // precedes the reap.
+        //
+        // CODEX (m4): a cooperative CodexExecutor checkpoint now invokes ctx.checkpoint({reap:true}),
+        // so this Codex withBoundary branch IS reached. reapForSink reads executor.safety fresh and a
+        // Codex run always sets it, so the per-sink auth-mode reconcile runs and the reap is credentialed
+        // (the executor then recreates the reaped provider epoch — see startProviderEpoch). A blocked
+        // reconcile (e.g. a transient refresh failure) surfaces a CodexBoundaryError that propagates and
+        // fails the run — the intended fail-closed behavior for a credentialed durability boundary.
+        await this.reapForSink(
+          executor,
+          { boundary: "checkpoint", deadlineMs: this.codexBoundaryDeadlineMs },
+          async () => {
+            const midRunOverlay = hasNewWork
+              ? await this.buildCheckpointOverlay(claim, flight, barePath)
+              : undefined;
+            await doCheckpointPublish(midRunOverlay);
+          },
+        );
+      } else {
+        // reap:false (iteration boundary): NO reap, NO permit, NO overlay — the agent tree
+        // stays ALIVE (a backgrounded dev server survives to the next iteration) and the
+        // publish is credential-free, so it is safe with the agent alive. A credential-free
+        // fetch-back / join-token publish never mints a permit.
+        await doCheckpointPublish(undefined);
+      }
+      return bodyOutcome;
+    };
+
     const ctx: RunContext = {
       runId,
       kind: resolveRunKind(claim.kind),
@@ -5638,7 +5965,9 @@ export class RunRunner {
       // false) so the finally retires the clone and keeps the HOME for resume. The clear lives HERE,
       // not inside enterCredentialSwitch, because the outer-catch safety net cannot continue in
       // place and must KEEP the flags to leave the run non-terminal for a requeue.
-      attemptCredentialSwitch: async () => {
+      // issue #1597 M2: gated end to end — from the wip marker captureRecoveryRestorePoint commits to
+      // the give-up's undoWipMarker — so a mid-turn tick can never publish that throwaway marker.
+      attemptCredentialSwitch: () => flight.sinkGate.run(async () => {
         const outcome = await this.enterCredentialSwitch(claim, flight, runLog);
         if (outcome === "retained_stop") {
           // The switch could not be confirmed (BLOCKING-2/3 rework). enterCredentialSwitch RETAINED
@@ -5664,7 +5993,7 @@ export class RunRunner {
           }
         }
         return outcome;
-      },
+      }),
       resumePhase: claim.resume_phase,
       // Persist the SDK session id the moment the executor learns it, so a
       // re-queued run can resume it. Best-effort.
@@ -5952,186 +6281,11 @@ export class RunRunner {
       // credential-bearing-CLASS op here is the fetch-back, itself credential-free
       // (file://, no PAT) — so a future credentialed git op MUST stay after the reap.
       // Best-effort throughout: a checkpoint must NEVER fail the run.
-      checkpoint: async (opts) => {
-        // `barePath` is the outer `let` (string | undefined); it is set before the run
-        // reaches the executor, but narrow it so the closure is honest rather than `!`.
-        if (!barePath) return;
-        // Decision 6 tip-movement check: has the runner clone's branch tip moved since the
-        // last checkpoint wrote the tracking ref? A null trackTip (never checkpointed) or a
-        // null cloneTip (unresolvable) is NOT a match, so it falls through to a real fetch.
-        const cloneTip = await this.git.branchTip(runnerClone.path, runnerClone.branch);
-        const trackTip = await this.git.trackingTip(barePath, runnerClone.branch);
-        const tipUnmovedSinceFetch =
-          trackTip !== null && cloneTip !== null && trackTip === cloneTip;
-
-        // PRD #267: "new committed work not yet on origin". Depends ONLY on cloneTip (read at
-        // the top) and flight.lastPublishedTip, neither of which the fetch-back changes, so it
-        // is safe to compute here — before the reap decision — and close over it below.
-        const hasNewWork = cloneTip !== null && cloneTip !== flight.lastPublishedTip;
-
-        // PRD #1171 m4: the fetch-back + origin-publish + running-report body, extracted so the
-        // reap:true (milestone) path routes it through the Codex reap facade while the reap:false
-        // (iteration-boundary) path calls it DIRECTLY (credential-free, no permit). `overlay` is
-        // the reap:true `.github/workflows` overlay (undefined off the reaped path and when
-        // nothing publishes); its default-tip fetch is a PAT git op, so it is only ever passed on
-        // a reaped path (REAP-BEFORE-GIT).
-        const doCheckpointPublish = async (overlay?: CheckpointOverlayContext): Promise<void> => {
-          // Skip ONLY the fetch when there is nothing new to fetch — do NOT return, so the
-          // origin-publish gate below still runs (Decision 9: a commit fetched at an earlier
-          // iteration can become publish-eligible on a later tip-unmoved iteration).
-          if (!tipUnmovedSinceFetch) {
-            // Fetch back, credential-free (#218's helper): brings the committed work into
-            // refs/uzi-runner/<branch> where the reseed reads it. Best-effort, never fails.
-            await this.fetchBackBestEffort(
-              barePath,
-              runnerClone.path,
-              runnerClone.branch,
-              runId,
-              runLog,
-            );
-          } else {
-            runLog.info("checkpoint fetch skipped: branch tip unmoved since last checkpoint", {
-              run_id: runId,
-              branch: runnerClone.branch,
-            });
-          }
-
-          // PRD #1416 M2: on the tip that was just fetched into the bare, detect a history
-          // rewrite at/below the published floor P (and floor C) and steer the agent to restore
-          // it — never blocks a git command (D2). Read the tip FRESH from the bare tracking ref
-          // (refs/uzi-runner/<branch>) since fetchBackBestEffort returns nothing and the
-          // top-of-checkpoint trackTip predates this fetch; never the runner clone (that crosses
-          // the worker-uid/runner-uid ownership seam branchTip exists to avoid). MID-RUN
-          // checkpoint tick only — the finalize/park/capture fetch-backs are M3's territory.
-          const fetchedTip = await this.git.trackingTip(barePath, runnerClone.branch);
-          await this.maybeSteerOnDivergence(barePath, flight, fetchedTip, batcher, steering, runLog);
-
-          // PRD #1416 M3 (C1): AFTER the steer (which must see the agent's rewritten H) and BEFORE
-          // the publish, non-destructively bridge a divergent tracking tip so the checkpoint pack —
-          // and therefore a reseed on resume — carries B instead of the rewritten H. Best-effort:
-          // a checkpoint must never crash the run (D4), so "failed"/"unknown" only log and continue.
-          const bridgeOutcome = await this.bridgeBareTrackingRefIfDivergent(
-            barePath,
-            runnerClone.branch,
-            flight,
-            runLog,
-          );
-          if (bridgeOutcome.kind === "failed" || bridgeOutcome.kind === "unknown") {
-            runLog.info("PRD #1416 M3: mid-run checkpoint bridge did not advance the tracking ref", {
-              run_id: runId,
-              branch: runnerClone.branch,
-              outcome: bridgeOutcome.kind,
-            });
-          }
-
-          // PRD #267: origin-publish gate. The publish is CREDENTIAL-FREE (a pack brokered to the
-          // api via publishCheckpoint, no PAT — checkpointPack local objects → client join token)
-          // EXCEPT the reap:true `overlay`'s default-tip fetch.
-          //   - reap:true  (milestone): publish whenever there is new committed work.
-          //   - reap:false (iteration boundary, PRD #267): publish only when the time-gate is
-          //     open AND there is new committed work — "new work" keys on lastPublishedTip, NOT
-          //     the fetch-skip above, so an idle commit still ships exactly once.
-          const timeGateOpen =
-            this.checkpointIntervalMs > 0 &&
-            this.now() - flight.lastPublish >= this.checkpointIntervalMs;
-          let published = false;
-          if (hasNewWork && (opts.reap || timeGateOpen)) {
-            published = await this.publishCheckpointBestEffort(
-              flight,
-              barePath,
-              runnerClone.branch,
-              overlay,
-            );
-            // Advance the time-gate on every ATTEMPT (not just success): bounds broker retry
-            // cadence to <= 1 publish/interval/run even under a persistent broker failure.
-            flight.lastPublish = this.now();
-            // PRD #267 Fix 1 (Decision 9): advance lastPublishedTip ONLY on a CONFIRMED landed
-            // publish, so a transient broker failure leaves hasNewWork true and the time-gate
-            // retries the SAME tip at the next interval boundary (bounded loss).
-            if (published) {
-              flight.lastPublishedTip = cloneTip ?? flight.lastPublishedTip;
-              // PRD #1416 M3 (C2): advance the checkpoint floor C to the DURABLE published floor on
-              // EVERY confirmed publish (PRD line 62). When this tick BRIDGED, C is already B (the
-              // helper set it) and cloneTip is the un-bridged H — so DO NOT regress C back to H;
-              // otherwise C is the confirmed checkpoint tip cloneTip. lastPublishedTip stays cloneTip
-              // (H) above: it drives hasNewWork, a separate concern from the floor.
-              flight.checkpointFloor =
-                bridgeOutcome.kind === "bridged"
-                  ? bridgeOutcome.bridge
-                  : (cloneTip ?? flight.checkpointFloor);
-              // PRD #267 M3: make the time-based publish observable, only for the time path so
-              // we do not double-log the milestone case.
-              if (!opts.reap) {
-                runLog.info("checkpoint published to origin (time-based)", {
-                  run_id: runId,
-                  branch: runnerClone.branch,
-                  tip: cloneTip,
-                });
-              }
-            }
-          }
-          // Report the checkpointed milestone as a `running` report (additive-optional; NO
-          // iteration_count so it never regresses the server's GREATEST-merged counter). PRD
-          // #267 Fix 2: emit ONLY on real activity (a fetch or a publish); stay silent on a
-          // pure-idle checkpoint.
-          if (!tipUnmovedSinceFetch || published) {
-            // PRD #1064 M1: enqueue onto the per-run chain so this checkpoint report stays
-            // ordered behind any pending immediate `reportProgress` push.
-            await enqueueRunningReport(() =>
-              reportState({
-                status: "running",
-                ...(opts.progress
-                  ? {
-                      milestones_completed: opts.progress.completed,
-                      milestones_in_progress: opts.progress.in_progress,
-                      // PRD #1224 M1: project the OPTIONAL per-milestone agent attribution,
-                      // omitted when undefined so an old-worker wire shape is preserved.
-                      ...(opts.progress.milestones_agents
-                        ? { milestones_agents: opts.progress.milestones_agents }
-                        : {}),
-                    }
-                  : {}),
-              }),
-            ).catch((e) =>
-              runLog.warn("could not report checkpoint progress", {
-                error: errMessage(e),
-              }),
-            );
-          }
-        };
-
-        if (opts.reap) {
-          // reap:true (milestone). REAP-BEFORE-GIT (Decision 10b, B1/M4 audit): the facade reaps
-          // the agent tree — killAgentTree for Claude/stub; withBoundary quiesce+reap (after the
-          // per-sink auth-mode reconcile) for Codex — STRICTLY before ANY git below (the
-          // credential-free fetch-back AND the #1036 overlay's PAT default-fetch). The overlay is
-          // built INSIDE the reaped action (only when it will be used) so its PAT fetch never
-          // precedes the reap.
-          //
-          // CODEX (m4): a cooperative CodexExecutor checkpoint now invokes ctx.checkpoint({reap:true}),
-          // so this Codex withBoundary branch IS reached. reapForSink reads executor.safety fresh and a
-          // Codex run always sets it, so the per-sink auth-mode reconcile runs and the reap is credentialed
-          // (the executor then recreates the reaped provider epoch — see startProviderEpoch). A blocked
-          // reconcile (e.g. a transient refresh failure) surfaces a CodexBoundaryError that propagates and
-          // fails the run — the intended fail-closed behavior for a credentialed durability boundary.
-          await this.reapForSink(
-            executor,
-            { boundary: "checkpoint", deadlineMs: this.codexBoundaryDeadlineMs },
-            async () => {
-              const midRunOverlay = hasNewWork
-                ? await this.buildCheckpointOverlay(claim, flight, barePath)
-                : undefined;
-              await doCheckpointPublish(midRunOverlay);
-            },
-          );
-        } else {
-          // reap:false (iteration boundary): NO reap, NO permit, NO overlay — the agent tree
-          // stays ALIVE (a backgrounded dev server survives to the next iteration) and the
-          // publish is credential-free, so it is safe with the agent alive. A credential-free
-          // fetch-back / join-token publish never mints a permit.
-          await doCheckpointPublish(undefined);
-        }
-      },
+      checkpoint: (opts) =>
+        // issue #1597 M2: gated — waits for (and preempts) an in-flight mid-turn tick.
+        flight.sinkGate.run(async () => {
+          await checkpointBody({ reap: opts.reap, progress: opts.progress });
+        }),
       // Issue #281: a cheap fingerprint of the runner clone's committed + working-tree
       // state for the executor's no-progress detector — the runner-owned clone's branch
       // tip (committed work) plus `git status --porcelain` (uncommitted changes). Both are
@@ -6154,14 +6308,16 @@ export class RunRunner {
       // which publishes a checkpoint FIRST and reports `paused` only if it lands (Decision 8),
       // returning whether the run parked. Called from the implement loop's pause boundary and
       // its `now`-pause turn catch.
-      parkForPause: (pausedAt) => this.handlePausePark(claim, flight, pausedAt),
+      // issue #1597 M2: gated — a tick can never fetch/publish the wip marker this path commits.
+      parkForPause: (pausedAt) => flight.sinkGate.run(() => this.handlePausePark(claim, flight, pausedAt)),
       // PRD #1497 M2 (D4): park the run at its WALL-CLOCK limit — the CAPTURE-FIRST wall park,
       // NOT handlePausePark. Delegates to enterWallPark, which reaps, captures a verified restore
       // point via the SHARED captureHoldContext, reports the wall_park transition, and returns the
       // outcome the executor branches on (parked/undeliverable/refused/cancelled). Called from the
       // implement loop's wall-pause turn catch, its pre-attempt REASON_WALL arm, and the loop-top
       // wall boundary.
-      parkForWall: () => this.enterWallPark(flight, claim, runLog),
+      // issue #1597 M2: gated against the mid-turn tick (it reaps and captures a restore point).
+      parkForWall: () => flight.sinkGate.run(() => this.enterWallPark(flight, claim, runLog)),
       // Issue #1600: hand the executor the budget a refused wall park carried, once.
       takeWallParkRefresh: () => {
         const refresh = flight.wallParkRefresh;
@@ -6199,8 +6355,9 @@ export class RunRunner {
       // back to the legacy throw and the run's normal terminal cleanup runs. The feature is
       // rollout-OFF (completion_interlock_rollout defaults OFF)
       // until #1232, so this seam is inert in production — completionInterlock above is false.
+      // issue #1597 M2: gated against the mid-turn tick (it reaps and captures a restore point).
       enterCompletionHold: (reason) =>
-        this.enterCompletionHold(flight, claim, reason, runLog),
+        flight.sinkGate.run(() => this.enterCompletionHold(flight, claim, reason, runLog)),
       // PRD #1226 M5 (D6): the completion-question LIVE window, wired as a SIBLING to
       // enterCompletionHold. The executor calls THIS at the completion-STALL point (STALL_LIMIT
       // identical no-progress completion attempts) INSTEAD of parking straight away — it authors an
@@ -6237,10 +6394,24 @@ export class RunRunner {
     // `completed` next; on a reject the catch in execute() sends `failed` (or takes the
     // park/requeue branch). Draining on the reject path keeps a late push from no-oping against
     // that terminal report too — the original success-only drain left this leg exposed.
+    //
+    // issue #1597 M2: the MID-TURN checkpoint tick runs only while executor.run is in flight. Its
+    // stop() is awaited FIRST in the finally: it cancels the timer, aborts an in-flight tick and
+    // waits for FULL settlement (every tick child exited, the sink gate released, the publish
+    // rejected, lock custody done) — no Promise.race abandonment — before the report chain drains
+    // and before anything after this (the killAgentTree reap, finalize, or the catch's park /
+    // shutdown sinks) can touch the clone or the bare. A shutdown aborts flight.cancel, which the
+    // tick is linked to, so the same settlement happens before the shutdown branch runs.
+    const ticker = barePath
+      ? this.startMidTurnTicker(flight, barePath, runnerClone.path, runnerClone.branch, (tickOpts) =>
+          checkpointBody({ reap: false, quiet: true, ...tickOpts }),
+        )
+      : undefined;
     let result: ExecutorResult;
     try {
       result = await executor.run(ctx);
     } finally {
+      await ticker?.stop();
       await runningReportChain;
     }
 
@@ -6659,15 +6830,303 @@ export class RunRunner {
     };
   }
 
+  /**
+   * issue #1597 M2 — the pinned SCAN-then-pack gate for an overlay-less checkpoint publish.
+   * Resolves the range to SHAs (the same floor checkpointPack excludes), scans exactly that range
+   * with gitleaks, fires the test seam, and returns:
+   *   - `pinned`  — trusted and clean: publish exactly `range` (checkpointPack's pinned path);
+   *   - `blocked` — a finding (`secret_found`) or an untrusted scan (`secret_scan_untrusted`): the
+   *                 caller must NOT publish. The feed gets one deduped line naming the class; the
+   *                 rule id / commit / path of each finding go to the run log only (the report is
+   *                 --redact'd, so the secret itself is never read);
+   *   - `none`    — no tracking tip at all: nothing to scan, and checkpointPack will report
+   *                 no_local_tip (silent) exactly as before.
+   * A tracking tip whose floor does not resolve is `secret_scan_untrusted` — an unscanned range is
+   * never published. Never throws.
+   */
+  private async scanCheckpointForPublish(
+    flight: RunFlight,
+    barePath: string,
+    branch: string,
+    scanScope?: <T>(fn: () => Promise<T>) => Promise<T>,
+  ): Promise<
+    | { kind: "pinned"; range: CheckpointRange }
+    | { kind: "blocked"; outcome: "secret_found" | "secret_scan_untrusted" }
+    | { kind: "none" }
+  > {
+    const untrusted = (why: string): { kind: "blocked"; outcome: "secret_scan_untrusted" } => {
+      this.reportPublishOutcome(
+        flight,
+        "secret:untrusted",
+        "checkpoint publish skipped: secret_scan_untrusted",
+        { why },
+      );
+      return { kind: "blocked", outcome: "secret_scan_untrusted" };
+    };
+    try {
+      const range = await this.git.resolveCheckpointRange(barePath, branch);
+      if (!range) {
+        if ((await this.git.trackingTip(barePath, branch)) === null) return { kind: "none" };
+        return untrusted("range_unresolved");
+      }
+      const scan = await (scanScope ?? ((fn) => fn()))(() =>
+        this.git.secretScanCheckpointRange(barePath, range),
+      );
+      if (scan.findings.length > 0) {
+        this.reportPublishOutcome(
+          flight,
+          "secret:found",
+          "checkpoint publish skipped: secret_found",
+          {
+            trusted: scan.trusted,
+            findings: scan.findings.slice(0, 20).map((f) => ({
+              rule_id: f.ruleId,
+              commit: f.commit,
+              path: f.file,
+            })),
+          },
+        );
+        return { kind: "blocked", outcome: "secret_found" };
+      }
+      if (!scan.trusted) return untrusted("scan_untrusted");
+      await this.checkpointTestHooks?.afterCheckpointScan?.({ barePath, branch, range });
+      return { kind: "pinned", range };
+    } catch (e) {
+      flight.runLog.warn("checkpoint secret scan threw; not publishing", {
+        run_id: flight.runId,
+        error: errMessage(e),
+      });
+      return untrusted("scan_threw");
+    }
+  }
+
+  /**
+   * issue #1597 M2 — arm the MID-TURN checkpoint tick for one executor.run. A repeating timer on the
+   * injectable `this.setTickTimer`; a tick that finds the previous one still running is skipped. Each
+   * tick:
+   *   1. probes the runner clone for an in-progress git operation (fs.stat only — no git child, no
+   *      credentials); busy ⇒ `git_busy`, and after {@link MIDTURN_BUSY_FEED_AFTER} consecutive busy
+   *      ticks ONE deduped feed line (reset once a tick gets past the probe);
+   *   2. opens a cancellable scope: its own AbortController, linked to flight.cancel (so shutdown()
+   *      and a steering cancel abort it) and to a {@link MIDTURN_TICK_TIMEOUT_MS} deadline, with a
+   *      {@link TickSpawner} (own process group per child, SIGTERM → SIGKILL, settled()) as the
+   *      GitCache boundary spawner;
+   *   3. try-acquires the flight's sink gate (miss ⇒ `gate_busy`) — a gated path that wants it
+   *      later PREEMPTS this tick and waits for it to settle;
+   *   4. runs the checkpoint body QUIET with reap:false semantics (fetch-back → #1416 steer/bridge →
+   *      time gate → pinned scan → pack → publish with the tick signal);
+   *   5. after settlement, reconciles lock files a SIGKILLed child left in the bare (proven
+   *      ownership only — see tick-spawner.ts), under the per-bare lock.
+   * Every throw is caught: a tick never fails or stalls the run. `stop()` cancels the timer, aborts
+   * the in-flight tick and awaits its full settlement; it never rejects.
+   */
+  private startMidTurnTicker(
+    flight: RunFlight,
+    barePath: string,
+    clonePath: string,
+    branch: string,
+    body: (opts: Pick<CheckpointBodyOpts, "signal" | "scanScope">) => Promise<CheckpointBodyOutcome>,
+  ): { stop: () => Promise<void> } | undefined {
+    if (this.checkpointTickIntervalMs <= 0) return undefined;
+    const { runLog, batcher, runId } = flight;
+    const hooks = this.checkpointTestHooks;
+    let stopped = false;
+    let cancelTimer: (() => void) | undefined;
+    let inFlight: Promise<void> | undefined;
+    let inFlightAbort: AbortController | undefined;
+    let busyStreak = 0;
+    let busyLineEmitted = false;
+
+    const handleLocks = (res: { removed: string[]; retained: RetainedLock[] }): boolean => {
+      for (const p of res.removed) {
+        runLog.info("mid-turn checkpoint removed a lock file its cancelled child provably owned", {
+          run_id: runId,
+          path: p,
+        });
+      }
+      if (res.retained.length === 0) return false;
+      runLog.warn("mid-turn checkpoint retained a git lock file in the worker bare", {
+        run_id: runId,
+        retained: res.retained.map((r) => ({
+          path: r.path,
+          dev: r.dev,
+          ino: r.ino,
+          size: r.size,
+          mtime_ms: r.mtimeMs,
+          pre_spawn: r.preSpawn,
+          reason: r.reason,
+          argv_class: r.argvClass,
+        })),
+      });
+      if (!flight.bareLockRetained) {
+        flight.bareLockRetained = true;
+        batcher.emit({
+          kind: "status",
+          agent: "worker",
+          payload: { text: "mid-turn checkpoint sink blocked: a git lock file remains in the worker repository" },
+        });
+      }
+      return true;
+    };
+
+    const tick = async (): Promise<MidTurnTickOutcome> => {
+      if (flight.bareLockRetained) return "bare_lock_retained";
+      if (flight.cancel.signal.aborted) return "aborted";
+      const probe = await this.git.runnerCloneBusy(clonePath, branch);
+      if (probe.busy) {
+        busyStreak++;
+        runLog.info("mid-turn checkpoint deferred: git busy in the runner clone", {
+          run_id: runId,
+          markers: probe.markers,
+          streak: busyStreak,
+        });
+        if (busyStreak >= MIDTURN_BUSY_FEED_AFTER && !busyLineEmitted) {
+          busyLineEmitted = true;
+          batcher.emit({
+            kind: "status",
+            agent: "worker",
+            payload: {
+              text: "mid-turn checkpoint deferred: a git operation is in progress in the working tree",
+            },
+          });
+        }
+        return "git_busy";
+      }
+      busyStreak = 0;
+      busyLineEmitted = false;
+
+      const ac = new AbortController();
+      inFlightAbort = ac;
+      const onFlightAbort = (): void => ac.abort();
+      if (flight.cancel.signal.aborted) ac.abort();
+      else flight.cancel.signal.addEventListener("abort", onFlightAbort, { once: true });
+      const cancelDeadline = this.setTimer(() => ac.abort(), MIDTURN_TICK_TIMEOUT_MS);
+      const spawner = new TickSpawner({
+        signal: ac.signal,
+        barePath,
+        branch,
+        log: runLog,
+        ...(hooks?.tickKillGraceMs !== undefined ? { killGraceMs: hooks.tickKillGraceMs } : {}),
+        ...(hooks?.tickSpawn ? { hooks: hooks.tickSpawn } : {}),
+      });
+      let retainedHere = false;
+      // Settle + reconcile WHILE the per-bare lock is still held (GitCache.withLock's pre-release
+      // hook), so no other bare mutation can run between a SIGKILLed child and its lock's removal.
+      const beforeLockRelease = async (key: string): Promise<void> => {
+        if (key !== barePath || !ac.signal.aborted) return;
+        await spawner.settled();
+        if (handleLocks(await spawner.reconcileLocks())) retainedHere = true;
+      };
+      const release = flight.sinkGate.tryAcquire(() => ac.abort());
+      try {
+        if (!release) return "gate_busy";
+        let outcome: MidTurnTickOutcome;
+        try {
+          outcome = await this.git.withBoundaryProcessSpawner(
+            spawner.spawn,
+            ac.signal,
+            () =>
+              body({
+                signal: ac.signal,
+                scanScope: <T>(fn: () => Promise<T>): Promise<T> => {
+                  const scanAc = new AbortController();
+                  const onTick = (): void => scanAc.abort();
+                  if (ac.signal.aborted) scanAc.abort();
+                  else ac.signal.addEventListener("abort", onTick, { once: true });
+                  const cancelScan = this.setTimer(() => scanAc.abort(), CHECKPOINT_SCAN_TIMEOUT_MS);
+                  return this.git
+                    .withBoundaryProcessSpawner(spawner.scoped(scanAc.signal), scanAc.signal, fn, {
+                      beforeLockRelease,
+                    })
+                    .finally(() => {
+                      cancelScan();
+                      ac.signal.removeEventListener("abort", onTick);
+                    });
+                },
+              }),
+            { beforeLockRelease },
+          );
+        } catch (e) {
+          runLog.warn("mid-turn checkpoint tick threw", { run_id: runId, error: errMessage(e) });
+          outcome = ac.signal.aborted ? "aborted" : "publish_failed:error";
+        }
+        if (ac.signal.aborted && outcome !== "published") outcome = "aborted";
+        // FULL settlement before the gate is released: every child exited, then lock custody for a
+        // child cancelled outside a withLock section (pack-objects, rev-parse), under the bare lock.
+        await spawner.settled();
+        if (spawner.cancelledAny()) {
+          const res = await this.git
+            .withBareLock(barePath, () => spawner.reconcileLocks())
+            .catch((e: unknown) => {
+              runLog.warn("mid-turn checkpoint lock reconcile failed", { run_id: runId, error: errMessage(e) });
+              return { removed: [], retained: [] };
+            });
+          if (handleLocks(res)) retainedHere = true;
+        }
+        if (retainedHere) outcome = "bare_lock_retained";
+        return outcome;
+      } finally {
+        cancelDeadline();
+        flight.cancel.signal.removeEventListener("abort", onFlightAbort);
+        // Released only now — after settlement — so a preempting sink waits for all of the above.
+        release?.();
+        if (inFlightAbort === ac) inFlightAbort = undefined;
+      }
+    };
+
+    const fire = (): void => {
+      cancelTimer = undefined;
+      if (stopped) return;
+      cancelTimer = this.setTickTimer(fire, this.checkpointTickIntervalMs);
+      if (inFlight) {
+        runLog.info("mid-turn checkpoint tick skipped: the previous tick is still running", { run_id: runId });
+        return;
+      }
+      // Declared first: the IIFE reads it after its first await (identity check below).
+      let current: Promise<void> | undefined;
+      current = (async () => {
+        let outcome: MidTurnTickOutcome;
+        try {
+          outcome = await tick();
+        } catch (e) {
+          runLog.warn("mid-turn checkpoint tick failed", { run_id: runId, error: errMessage(e) });
+          outcome = "publish_failed:error";
+        }
+        // Cleared BEFORE the outcome is reported, so an observer that fires the next tick at once
+        // is never mistaken for an overlap.
+        if (inFlight === current) inFlight = undefined;
+        runLog.info("mid-turn checkpoint tick", { run_id: runId, outcome });
+        try {
+          hooks?.onTickOutcome?.(outcome);
+        } catch {
+          /* a test observer never fails a tick */
+        }
+      })();
+      inFlight = current;
+    };
+    cancelTimer = this.setTickTimer(fire, this.checkpointTickIntervalMs);
+
+    return {
+      stop: async () => {
+        stopped = true;
+        cancelTimer?.();
+        cancelTimer = undefined;
+        inFlightAbort?.abort();
+        await inFlight?.catch(() => undefined);
+      },
+    };
+  }
+
   private async publishCheckpointBestEffort(
     flight: RunFlight,
     barePath: string,
     branch: string,
     overlay?: CheckpointOverlayContext,
     signal?: AbortSignal,
+    pinned?: CheckpointRange,
   ): Promise<boolean> {
     // issue #1597 M1: a thin wrapper — every existing caller only needs "did it land".
-    return (await this.publishCheckpointOutcome(flight, barePath, branch, overlay, signal)).published;
+    return (await this.publishCheckpointOutcome(flight, barePath, branch, overlay, signal, pinned)).published;
   }
 
   /**
@@ -6685,6 +7144,8 @@ export class RunRunner {
     branch: string,
     overlay?: CheckpointOverlayContext,
     signal?: AbortSignal,
+    /** issue #1597 M2: the scanned range — pack exactly these SHAs (see GitCache.checkpointPack). */
+    pinned?: CheckpointRange,
   ): Promise<PublishOutcome> {
     // issue #1086 (F2): two-tip reconciliation. The CONFIRMED tip advances only on a real ACK; an
     // ambiguous result (non-2xx, or a throw after the pack tip is known) records the ATTEMPTED tip
@@ -6694,8 +7155,13 @@ export class RunRunner {
     // the first landed ACK.
     let packedTip: string | undefined;
     try {
-      const packed = await this.git.checkpointPack(barePath, branch, overlay);
-      // nothing to publish (no tracking ref) — not a failure, stay silent
+      // issue #1597 M2: `pinned` is passed only by the scanned (overlay-less) publish; every other
+      // caller keeps the unpinned 3-argument call shape.
+      const packed = pinned
+        ? await this.git.checkpointPack(barePath, branch, overlay, pinned)
+        : await this.git.checkpointPack(barePath, branch, overlay);
+      // tracking tip unresolved (no tracking ref, or it could not be read) — nothing to pack; not a
+      // publish failure, stay silent
       if (!packed) return { published: false, reason: "no_local_tip" };
       packedTip = packed.tipOid;
       const res = await this.client.publishCheckpoint(flight.runId, packed.tipOid, packed.pack, signal);

@@ -137,7 +137,51 @@ export type BoundaryProcessSpawner = (request: BoundaryProcessRequest) => Promis
 interface BoundaryProcessScope {
   spawn: BoundaryProcessSpawner;
   signal: AbortSignal;
+  /** issue #1597 M2: awaited by {@link GitCache.withLock} AFTER its critical section and BEFORE the
+   *  per-bare lock is released, so a scope (the mid-turn checkpoint tick) can settle a cancelled child
+   *  and remove a lock file it provably owned while no other bare mutation can interleave. Never
+   *  throws into withLock (a failure is swallowed there). Absent on every other scope. */
+  beforeLockRelease?: (key: string) => Promise<void>;
 }
+
+/** issue #1597 M2: what {@link GitCache.runnerCloneBusy} observed in the runner clone's gitdir. */
+export interface RunnerCloneBusy {
+  busy: boolean;
+  /** The markers observed (gitdir-relative, e.g. `index.lock`, `rebase-merge/`), or `unreadable`
+   *  when the probe itself could not read the gitdir. */
+  markers: string[];
+}
+
+/** issue #1597 M2: a checkpoint range pinned to two 40-hex commit SHAs — the tip that is scanned
+ *  and packed, and the floor it is packed against. See {@link GitCache.resolveCheckpointRange}. */
+export interface CheckpointRange {
+  tipSha: string;
+  excludeSha: string;
+}
+
+/** issue #1597 M2: optional GitCache construction knobs. */
+export interface GitCacheOptions {
+  /** The gitleaks executable. Default `"gitleaks"` (PATH outside a boundary scope, the image's
+   *  absolute `/usr/local/bin/gitleaks` inside one via resolveBoundaryExecutable). A test injects an
+   *  absolute path to a shim. */
+  gitleaksBin?: string;
+}
+
+/** issue #1597 M2: the mid-turn checkpoint secret scan's hard deadline. */
+export const CHECKPOINT_SCAN_TIMEOUT_MS = 60_000;
+
+/** issue #1597 M2: the git-busy markers a runner clone's gitdir can carry while a git operation is
+ *  in progress. Directory markers end in `/`. The branch ref lock is added per call. */
+const RUNNER_CLONE_BUSY_MARKERS = [
+  "index.lock",
+  "HEAD.lock",
+  "packed-refs.lock",
+  "MERGE_HEAD",
+  "CHERRY_PICK_HEAD",
+  "REVERT_HEAD",
+  "rebase-merge/",
+  "rebase-apply/",
+] as const;
 
 // PRD #400 M4b — byte cap on the review diff a ReviewRunner feeds the reviewer model.
 // A huge diff must not blow the model's context window or the worker's memory, so the
@@ -203,6 +247,9 @@ export class RecoveryBundleTooLargeError extends Error {
 // past memory; an over-cap report is treated as an untrusted scan (fail open to the GH013
 // backstop) rather than read into memory. 16 MiB holds far more findings than any honest push.
 const SECRET_SCAN_REPORT_MAX_BYTES = 16 * 1024 * 1024;
+
+/** A full 40-hex commit SHA (issue #1597 M2: pinned checkpoint ranges are validated with it). */
+const SHA40_RE = /^[0-9a-f]{40}$/;
 
 // PRD #1416 M3 — cap on the EXTRA parents (beyond the first) a worker-bridge marker candidate may
 // carry in rangeContainsBridge before it is rejected outright. A legitimate bridge has at most 2
@@ -523,6 +570,8 @@ export class GitCache {
   /** Per-bare-path serialization: git's lockfiles can't take parallel mutations. */
   private readonly locks = new Map<string, Promise<unknown>>();
   private readonly boundaryProcesses = new AsyncLocalStorage<BoundaryProcessScope>();
+  /** issue #1597 M2: the gitleaks executable (see {@link GitCacheOptions.gitleaksBin}). */
+  private readonly gitleaksBin: string;
 
   constructor(
     dataDir: string,
@@ -530,7 +579,9 @@ export class GitCache {
     /** Test-only seam for the ensureClone network-op retry. Undefined in production,
      *  so withForgeRetry falls back to its own FORGE_RETRY_SCHEDULE + real sleep. */
     private readonly retry?: { schedule?: number[]; sleep?: (ms: number) => Promise<void> },
+    opts: GitCacheOptions = {},
   ) {
+    this.gitleaksBin = opts.gitleaksBin ?? "gitleaks";
     this.reposRoot = path.join(dataDir, "repos");
     this.runnerRoot = path.join(dataDir, "runner");
     this.runnerHoldingRoot = path.join(dataDir, "runner-quarantine");
@@ -545,8 +596,66 @@ export class GitCache {
     spawner: BoundaryProcessSpawner,
     signal: AbortSignal,
     action: () => Promise<T>,
+    hooks: { beforeLockRelease?: (key: string) => Promise<void> } = {},
   ): Promise<T> {
-    return this.boundaryProcesses.run({ spawn: spawner, signal }, action);
+    return this.boundaryProcesses.run(
+      { spawn: spawner, signal, ...(hooks.beforeLockRelease ? { beforeLockRelease: hooks.beforeLockRelease } : {}) },
+      action,
+    );
+  }
+
+  /** issue #1597 M2: run `fn` holding the per-bare serialization lock (the same one every bare
+   *  mutation takes). Used by the mid-turn checkpoint tick to reconcile a cancelled child's lock
+   *  files OUTSIDE its (already-aborted) boundary scope, so no other bare op interleaves. */
+  withBareLock<T>(barePath: string, fn: () => Promise<T>): Promise<T> {
+    return this.withLock(barePath, fn);
+  }
+
+  /**
+   * issue #1597 M2 — is a git operation in progress in the runner clone? A pure `fs.stat` probe of
+   * the clone's gitdir (no git child, no credentials): resolves the gitdir (a `.git` FILE carrying
+   * `gitdir: <path>` is followed, relative to the clone), then looks for each marker in
+   * {@link RUNNER_CLONE_BUSY_MARKERS} plus `refs/heads/<branch>.lock`. ANY observed marker is busy,
+   * whatever its age — there is deliberately no staleness heuristic (an old `index.lock` may belong
+   * to a still-running agent git). A probe that cannot read the gitdir (EACCES, a malformed `.git`
+   * file, a missing clone) reports busy with the single marker `unreadable`, so a tick never
+   * fetches from a clone it could not inspect.
+   */
+  async runnerCloneBusy(clonePath: string, branch: string): Promise<RunnerCloneBusy> {
+    const unreadable = (err: unknown): RunnerCloneBusy => {
+      this.log.warn("runner clone busy probe could not read the gitdir; treating as busy", {
+        clone: clonePath,
+        error: gitErrorMessage(err),
+      });
+      return { busy: true, markers: ["unreadable"] };
+    };
+    let gitdir = path.join(clonePath, ".git");
+    try {
+      const st = await fs.stat(gitdir);
+      if (st.isFile()) {
+        const raw = (await fs.readFile(gitdir, "utf8")).trim();
+        const m = /^gitdir:\s*(.+)$/m.exec(raw);
+        if (!m) return unreadable(new Error("malformed .git file"));
+        gitdir = path.resolve(clonePath, m[1]!.trim());
+      } else if (!st.isDirectory()) {
+        return unreadable(new Error(".git is neither a file nor a directory"));
+      }
+    } catch (err) {
+      return unreadable(err);
+    }
+    const candidates: string[] = [...RUNNER_CLONE_BUSY_MARKERS, `refs/heads/${branch}.lock`];
+    const markers: string[] = [];
+    for (const marker of candidates) {
+      try {
+        await fs.stat(path.join(gitdir, marker));
+        markers.push(marker);
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code === "ENOENT" || code === "ENOTDIR") continue;
+        return unreadable(err);
+      }
+    }
+    return { busy: markers.length > 0, markers };
   }
 
   barePathFor(repoUrl: string): string {
@@ -1730,13 +1839,26 @@ export class GitCache {
     barePath: string,
     branch: string,
     overlay?: CheckpointOverlayContext,
+    pinned?: CheckpointRange,
   ): Promise<{ tipOid: string; pack: Readable } | null> {
+    // issue #1597 M2: a PINNED range (the exact SHAs the secret scan walked) packs exactly
+    // `tipSha ^excludeSha` — no ref is re-resolved, so a tracking/origin ref that moved between the
+    // scan and the pack can neither widen the range to an unscanned commit nor swap the tip. Only
+    // honoured WITHOUT an overlay (an overlay publish is not scanned and stays byte-unchanged).
+    if (pinned && !overlay) {
+      if (!SHA40_RE.test(pinned.tipSha) || !SHA40_RE.test(pinned.excludeSha)) {
+        throw new Error("checkpointPack: pinned range must be two 40-hex commit SHAs");
+      }
+      const { stdout } = await this.spawnGit(
+        barePath,
+        ["pack-objects", "--revs", "--stdout"],
+        `${pinned.tipSha}\n^${pinned.excludeSha}\n`,
+      );
+      return { tipOid: pinned.tipSha, pack: stdout };
+    }
     const realTip = await this.trackingTip(barePath, branch);
     if (!realTip) return null;
-    const originRef = `refs/remotes/origin/${branch}`;
-    const excludeRef = (await this.refExists(barePath, originRef))
-      ? originRef
-      : await this.defaultBranchRef(barePath);
+    const excludeRef = await this.checkpointExcludeRef(barePath, branch);
     const trackingRef = runnerTrackingRef(branch);
 
     // PRD #1062 M2 (#1036) — the `.github/workflows` overlay. When an overlay context is
@@ -1766,6 +1888,59 @@ export class GitCache {
       `${wanted}\n^${excludeRef}\n`,
     );
     return { tipOid: wantRev, pack: stdout };
+  }
+
+  /** issue #1597 M2 — the floor a checkpoint pack excludes: `refs/remotes/origin/<branch>` when
+   *  origin carries the branch, else the default branch (defaultBranchRef). The ONE choice shared by
+   *  {@link checkpointPack}'s unpinned path and {@link resolveCheckpointRange}. */
+  private async checkpointExcludeRef(barePath: string, branch: string): Promise<string> {
+    const originRef = `refs/remotes/origin/${branch}`;
+    return (await this.refExists(barePath, originRef))
+      ? originRef
+      : await this.defaultBranchRef(barePath);
+  }
+
+  /**
+   * issue #1597 M2 — resolve the checkpoint range to PINNED SHAs: `tipSha` = the tracking ref
+   * `refs/uzi-runner/<branch>`, `excludeSha` = the same floor {@link checkpointPack} excludes, each
+   * via `rev-parse --verify <ref>^{commit}` and validated as 40-hex. Null when either does not
+   * resolve (no tracking ref yet, or no resolvable floor). Never throws.
+   */
+  async resolveCheckpointRange(barePath: string, branch: string): Promise<CheckpointRange | null> {
+    try {
+      const tipSha = await this.trackingTip(barePath, branch);
+      if (!tipSha) return null;
+      const excludeRef = await this.checkpointExcludeRef(barePath, branch);
+      const excludeSha = await this.revParse(barePath, `${excludeRef}^{commit}`);
+      if (!excludeSha) return null;
+      return { tipSha, excludeSha };
+    } catch (err) {
+      this.log.warn("checkpoint range could not be resolved", { bare: barePath, error: gitErrorMessage(err) });
+      return null;
+    }
+  }
+
+  /**
+   * issue #1597 M2 — secret-scan a PINNED checkpoint range (`excludeSha..tipSha`) before a mid-run
+   * checkpoint publish, with the same credential-free core as the finalize {@link secretScanRange}
+   * (gitleaks' embedded default ruleset, all three silencers disabled, `--redact`, the report size
+   * cap and the {@link scanIsTrustworthy} liveness gate). Unlike finalize, the CALLER treats an
+   * untrusted scan as "do not publish" (a checkpoint has no GH013 backstop to fail open to). Zero
+   * commits in range is trusted-clean. A {@link CHECKPOINT_SCAN_TIMEOUT_MS} deadline applies outside
+   * a boundary scope (inside one, the scope's own signal bounds it — see the runner's tick).
+   */
+  async secretScanCheckpointRange(
+    barePath: string,
+    range: CheckpointRange,
+  ): Promise<{ trusted: boolean; findings: SecretFinding[] }> {
+    if (!SHA40_RE.test(range.tipSha) || !SHA40_RE.test(range.excludeSha)) {
+      return { trusted: false, findings: [] };
+    }
+    return this.scanLogRange(barePath, `${range.excludeSha}..${range.tipSha}`, {
+      label: "checkpoint secret scan",
+      timeoutMs: CHECKPOINT_SCAN_TIMEOUT_MS,
+      onUntrusted: "untrusted, not publishing",
+    });
   }
 
   /**
@@ -2602,7 +2777,25 @@ export class GitCache {
       );
       return { trusted: false, findings: [] };
     }
-    const logRange = `${base}..${trackingRef}`;
+    return this.scanLogRange(barePath, `${base}..${trackingRef}`, {
+      label: "finalize secret scan",
+      timeoutMs: GIT_TIMEOUT_MS,
+      onUntrusted: "failing open",
+    });
+  }
+
+  /**
+   * The credential-free core shared by {@link secretScanRange} (finalize) and
+   * {@link secretScanCheckpointRange} (issue #1597 M2): count `logRange`, run gitleaks over it in the
+   * bare with the silencers disabled, read the size-capped report and apply the liveness gate.
+   * `label` prefixes every log line and `onUntrusted` ends the untrusted ones (the finalize wording
+   * is byte-identical to before the split).
+   */
+  private async scanLogRange(
+    barePath: string,
+    logRange: string,
+    opts: { label: string; timeoutMs: number; onUntrusted: string },
+  ): Promise<{ trusted: boolean; findings: SecretFinding[] }> {
     let expectedCommits = 0;
     try {
       const out = await this.runGit(barePath, ["rev-list", "--count", logRange]);
@@ -2610,7 +2803,7 @@ export class GitCache {
       if (Number.isNaN(expectedCommits)) expectedCommits = 0;
     } catch {
       // A failed count is an untrusted scan setup — do NOT block; fail open to the backstop.
-      this.log.warn("finalize secret scan: could not count the push range; failing open", {
+      this.log.warn(`${opts.label}: could not count the push range; ${opts.onUntrusted}`, {
         barePath,
       });
       return { trusted: false, findings: [] };
@@ -2634,7 +2827,7 @@ export class GitCache {
       let execOk = true;
       let stderr = "";
       try {
-        const res = await this.execScoped("gitleaks", args, {
+        const res = await this.execScoped(this.gitleaksBin, args, {
           // gitEnv(): the hardened REPLACEMENT env (no join token / API URL, plus the
           // core.hooksPath / GIT_CONFIG_NOSYSTEM / global=/dev/null pins), so gitleaks'
           // internal `git -C … log -p` runs WITHOUT worker credentials in its environment and
@@ -2642,7 +2835,7 @@ export class GitCache {
           // carries PATH+HOME (+TMPDIR), so gitleaks itself still runs; it needs no secret env.
           env: gitEnv(),
           maxBuffer: GIT_MAX_BUFFER,
-          timeout: GIT_TIMEOUT_MS,
+          timeout: opts.timeoutMs,
         });
         stderr = res.stderr ?? "";
       } catch (err) {
@@ -2663,7 +2856,7 @@ export class GitCache {
         const st = await fs.stat(reportPath);
         if (st.size > SECRET_SCAN_REPORT_MAX_BYTES) {
           this.log.warn(
-            "finalize secret scan: gitleaks report exceeds the size cap; failing open",
+            `${opts.label}: gitleaks report exceeds the size cap; ${opts.onUntrusted}`,
             { barePath, bytes: st.size, cap: SECRET_SCAN_REPORT_MAX_BYTES },
           );
           return { trusted: false, findings: [] };
@@ -2671,7 +2864,7 @@ export class GitCache {
         const raw = await fs.readFile(reportPath, "utf8");
         findings = parseGitleaksReport(raw);
       } catch {
-        this.log.warn("finalize secret scan: could not read the gitleaks report; failing open", {
+        this.log.warn(`${opts.label}: could not read the gitleaks report; ${opts.onUntrusted}`, {
           barePath,
         });
         return { trusted: false, findings: [] };
@@ -2679,7 +2872,7 @@ export class GitCache {
 
       const scannedCommits = commitsScannedFromStderr(stderr);
       const trusted = scanIsTrustworthy({ stderr, scannedCommits, expectedCommits, execOk });
-      this.log.debug("finalize secret scan complete", {
+      this.log.debug(`${opts.label} complete`, {
         barePath,
         expectedCommits,
         scannedCommits,
@@ -3917,14 +4110,21 @@ export class GitCache {
       }
       started = true;
       removeAbortListener();
+      let outcome: { ok: true; value: T } | { ok: false; error: unknown };
       try {
-        const value = await fn();
-        settled = true;
-        resolveResult(value);
+        outcome = { ok: true, value: await fn() };
       } catch (error) {
-        settled = true;
-        rejectResult(error);
+        outcome = { ok: false, error };
       }
+      // issue #1597 M2: a scope's pre-release hook runs while this lock is STILL held (the chain
+      // below does not advance until `run` returns), so a cancelled tick can settle its children and
+      // reconcile lock files before any other bare mutation starts. It never fails the op.
+      if (scope?.beforeLockRelease) {
+        await scope.beforeLockRelease(key).catch(() => undefined);
+      }
+      settled = true;
+      if (outcome.ok) resolveResult(outcome.value);
+      else rejectResult(outcome.error);
     };
     const next = prev.then(run, run);
     // Keep the serialization chain alive but swallow its stored result so one

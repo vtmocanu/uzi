@@ -448,12 +448,17 @@ const LANDED = { ok: true, body: { published: true, ref: "refs/uzi-checkpoints/a
 /** A fake Codex safety whose `shutdown` boundary is scripted. `before` throws the given error
  *  WITHOUT running the action (the boundary could not be established); `after` runs the action
  *  under a held permit, then throws (a late boundary failure); `abortAfterMs` runs the action
- *  under a permit whose signal aborts after the delay (the boundary deadline). Other boundaries
- *  run their action plainly. Permit-held git subprocesses are spawned directly. */
+ *  under a permit whose signal aborts after the delay (the boundary deadline). `onPermit` hands the
+ *  test a function that aborts the shutdown permit ON DEMAND (issue #1597 M2 follow-up: a test
+ *  triggers the deadline from inside the publish RPC, deterministically), and — as the real facade
+ *  does — a boundary whose permit aborted throws a CodexBoundaryError(timeout) once the action
+ *  returns. Other boundaries run their action plainly. Permit-held git subprocesses are spawned
+ *  directly. */
 function fakeSafety(script: {
   before?: () => Error;
   after?: () => Error;
   abortAfterMs?: number;
+  onPermit?: (abort: () => void) => void;
 }): CodexExecutionSafety {
   const permitFor = (boundary: string, signal: AbortSignal): BoundaryPermit =>
     ({ epoch: 1, boundary, signal }) as unknown as BoundaryPermit;
@@ -467,9 +472,13 @@ function fakeSafety(script: {
       if (script.abortAfterMs !== undefined) {
         timer = setTimeout(() => ac.abort(new Error("boundary deadline")), script.abortAfterMs);
       }
+      script.onPermit?.(() => ac.abort(new Error("boundary deadline")));
       try {
         const value = await action(permitFor(req.boundary, ac.signal));
         if (script.after) throw script.after();
+        if (script.onPermit && ac.signal.aborted) {
+          throw new CodexBoundaryError("action", [harnessError("timeout")]);
+        }
         return value;
       } finally {
         clearTimeout(timer);
@@ -542,6 +551,32 @@ describe("RunRunner — typed shutdown checkpoint outcome (issue #1597 M1)", () 
       assert.ok(feed.includes("shutdown checkpoint published to origin"), JSON.stringify(feed));
       assert.ok(!feed.some((t) => t.includes("NOT published")), JSON.stringify(feed));
       assert.equal(loggedOutcome(lines), "published");
+      // A first-time success had no failure line to recover from: NO recovery line.
+      assert.ok(!feed.some((t) => t.includes("recovered")), JSON.stringify(feed));
+      assert.ok(!lines.some((l) => l.msg === "checkpoint publishing recovered"), "no recovery log line");
+    } finally {
+      restore();
+    }
+  });
+
+  it("an AbortError thrown with NO aborted signal is silent on the feed and names publish_error", async () => {
+    // e.g. the client's own request timeout surfacing as an AbortError: publishCheckpointOutcome
+    // classes it `aborted` (silent — no "checkpoint publish failed" line, no message on the feed),
+    // and the shutdown sink names it publish_error because its permit/budget did not expire.
+    const { restore, count } = spyPublishWith(async (_n, signal) => {
+      assert.ok(!signal?.aborted, "the caller's signal (if any) is NOT aborted");
+      const e = new Error("request aborted boom-secret-remote-text");
+      e.name = "AbortError";
+      throw e;
+    });
+    try {
+      const { feed, lines } = await shutdownOnce(1597_14);
+      assert.equal(count(), 1);
+      assert.ok(!feed.some((t) => t.includes("checkpoint publish failed")), JSON.stringify(feed));
+      assert.ok(!feed.some((t) => t.includes("boom")), JSON.stringify(feed));
+      assert.ok(feed.includes(notPublished("publish_error")), JSON.stringify(feed));
+      assert.equal(loggedOutcome(lines), "publish_error");
+      assert.ok(lines.some((l) => l.msg === "checkpoint publish aborted"), "runLog records the abort");
     } finally {
       restore();
     }
@@ -683,7 +718,13 @@ describe("RunRunner — typed shutdown checkpoint outcome (issue #1597 M1)", () 
   });
 
   it("aborted is silent (Codex): a permit-deadline abort emits no publish-failed line and names timeout", async () => {
-    const { restore } = spyPublishWith(async (_n, signal) => {
+    // issue #1597 M2 follow-up: the permit is aborted from INSIDE the publish RPC (once it is
+    // entered), never on a wall-clock timer — an early timer abort could land before the pack and
+    // read as no_local_tip. The fake boundary then throws CodexBoundaryError(timeout) like the real
+    // facade.
+    let abortPermit: (() => void) | undefined;
+    const { restore, count } = spyPublishWith(async (_n, signal) => {
+      abortPermit!();
       await new Promise<void>((resolve) => {
         if (signal?.aborted) resolve();
         else signal?.addEventListener("abort", () => resolve(), { once: true });
@@ -691,8 +732,9 @@ describe("RunRunner — typed shutdown checkpoint outcome (issue #1597 M1)", () 
       throw new Error("upload aborted boom-secret-remote-text");
     });
     try {
-      const safety = fakeSafety({ abortAfterMs: 150 });
+      const safety = fakeSafety({ onPermit: (abort) => (abortPermit = abort) });
       const { feed, lines } = await shutdownOnce(1597_11, { safety });
+      assert.equal(count(), 1, "the publish RPC was entered (the abort came from inside it)");
       assert.ok(!feed.some((t) => t.includes("checkpoint publish failed")), JSON.stringify(feed));
       assert.ok(!feed.some((t) => t.includes("boom")), JSON.stringify(feed));
       assert.ok(feed.includes(notPublished("timeout")), JSON.stringify(feed));
@@ -717,7 +759,7 @@ describe("RunRunner — typed shutdown checkpoint outcome (issue #1597 M1)", () 
         feed.includes(
           notPublished(
             "publish_rejected",
-            "a resume on another worker will restart from the last published checkpoint",
+            "a resume on another worker will restart from the last published checkpoint if it is still adoptable, else the branch or default branch",
           ),
         ),
         JSON.stringify(feed),

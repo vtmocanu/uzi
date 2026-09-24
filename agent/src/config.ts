@@ -93,6 +93,13 @@ export interface Config {
    */
   checkpointIntervalMs: number;
   /**
+   * issue #1597 M2: how often the runner arms a MID-TURN checkpoint tick while one long agent turn
+   * is in flight (a fetch-back into the worker bare, then a publish once CHECKPOINT_INTERVAL has
+   * elapsed and there is new committed work). Default 5m; `0` disables the tick. Read from
+   * CHECKPOINT_TICK_INTERVAL as a Go-style duration string (e.g. "5m", "0").
+   */
+  checkpointTickIntervalMs: number;
+  /**
    * Chat run (PRD #39) lifecycle knobs. Chat rides the run machinery as a third
    * kind but has its own clocks (Decision 3): a per-conversation turn cap, a
    * per-turn wall-clock backstop, an idle window that completes a parked chat, and
@@ -411,6 +418,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     // reap:false path. Default 20m; `0` disables the time-based origin publish
     // (milestone-only). A Go-style duration string, NOT a `_SECONDS` variant.
     checkpointIntervalMs: duration(env, "CHECKPOINT_INTERVAL", "20m"),
+    // issue #1597 M2: the mid-turn checkpoint tick cadence. Default 5m; `0` disables it.
+    checkpointTickIntervalMs: duration(env, "CHECKPOINT_TICK_INTERVAL", "5m"),
     // Chat lifecycle (PRD #39 Decisions 2/3). Defaults raised from the earlier
     // 15/20m draft because idle-death discards the conversation; poll is faster
     // than the run lane so a turn starts within ~1s of a user message.
