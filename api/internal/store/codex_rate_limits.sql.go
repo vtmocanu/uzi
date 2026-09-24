@@ -18,6 +18,7 @@ SELECT
     COALESCE(al.labels, '{}')::text[] AS aliases,
     COALESCE(al.is_default, false)    AS is_default,
     a.reauth_required,
+    a.reauth_reason,
     rl.buckets,
     rl.observed_generation,
     rl.observed_credential_revision,
@@ -48,6 +49,7 @@ type GetCodexAccountRateLimitsForUserRow struct {
 	Aliases                    []string           `json:"aliases"`
 	IsDefault                  bool               `json:"is_default"`
 	ReauthRequired             bool               `json:"reauth_required"`
+	ReauthReason               pgtype.Text        `json:"reauth_reason"`
 	Buckets                    []byte             `json:"buckets"`
 	ObservedGeneration         pgtype.Int8        `json:"observed_generation"`
 	ObservedCredentialRevision pgtype.Int8        `json:"observed_credential_revision"`
@@ -79,6 +81,7 @@ func (q *Queries) GetCodexAccountRateLimitsForUser(ctx context.Context, userID u
 			&i.Aliases,
 			&i.IsDefault,
 			&i.ReauthRequired,
+			&i.ReauthReason,
 			&i.Buckets,
 			&i.ObservedGeneration,
 			&i.ObservedCredentialRevision,
@@ -106,6 +109,7 @@ SELECT
     COALESCE(al.labels, '{}')::text[] AS aliases,
     COALESCE(al.is_default, false)    AS is_default,
     a.reauth_required,
+    a.reauth_reason,
     rl.buckets,
     rl.observed_generation,
     rl.observed_credential_revision,
@@ -139,6 +143,7 @@ type ListCodexAccountRateLimitsRow struct {
 	Aliases                    []string           `json:"aliases"`
 	IsDefault                  bool               `json:"is_default"`
 	ReauthRequired             bool               `json:"reauth_required"`
+	ReauthReason               pgtype.Text        `json:"reauth_reason"`
 	Buckets                    []byte             `json:"buckets"`
 	ObservedGeneration         pgtype.Int8        `json:"observed_generation"`
 	ObservedCredentialRevision pgtype.Int8        `json:"observed_credential_revision"`
@@ -172,6 +177,7 @@ func (q *Queries) ListCodexAccountRateLimits(ctx context.Context) ([]ListCodexAc
 			&i.Aliases,
 			&i.IsDefault,
 			&i.ReauthRequired,
+			&i.ReauthReason,
 			&i.Buckets,
 			&i.ObservedGeneration,
 			&i.ObservedCredentialRevision,
