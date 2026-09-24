@@ -41,8 +41,8 @@ import (
 // A re-admission commits only together with its promotion. If a re-admitted run classifies as
 // anything else, promoteCodexAccountRun rolls the whole transaction back (no re-admission, no
 // feed line, nothing counted or published) and decides the run again in a fresh transaction
-// with re-admission disabled; that second decision is the one committed (see
-// promoteCodexAccountRun).
+// with re-admission disabled; that second decision is committed if terminal, and a stay commits
+// nothing (see promoteCodexAccountRun).
 
 // codexAccountPromoteStore is the pass's page read. *store.Queries satisfies it; a fake Store
 // that does not is reported as errCodexStoreUnavailable, like the park pass.

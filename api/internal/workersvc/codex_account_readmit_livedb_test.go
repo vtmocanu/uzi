@@ -627,12 +627,24 @@ func TestCodexReadmitNonCanonicalFrozenKeyLiveDB(t *testing.T) {
 		t.Fatalf("seeded key %q vs canonical %q (jsonb-equal %v), want a different text with equal jsonb",
 			held.CodexAccountKey.String, canonical, jsonbEqual)
 	}
+	var rows []int64
+	txs := 0
+	svc.codexPromoteHooks = &codexPromoteTestHooks{wrapQueries: func(q codexPromoteQueries) codexPromoteQueries {
+		txs++
+		return &readmitProbeWrapper{codexPromoteQueries: q, rows: &rows, diverge: divergeNever}
+	}}
 	rec := newReadmitRecorder()
 	svc.SetBroadcaster(rec)
 
 	res := promoteOnlyResult(t, svc, fx.runID)
 	if res.Readmitted != 0 || res.Promoted != 0 || res.Failed != 1 {
 		t.Fatalf("tick: %+v, want one terminal failure and nothing re-admitted", res)
+	}
+	// The key fence itself must refuse: one transaction, whose ReadmitRunCodexBinding matched 0
+	// rows. A re-admission that matched and was then rolled back and redecided (a second
+	// transaction) ends in the same failure, so the outcome alone does not pin the fence.
+	if txs != 1 || len(rows) != 1 || rows[0] != 0 {
+		t.Fatalf("transactions=%d readmit rows=%v, want one transaction whose re-admission matched 0 rows", txs, rows)
 	}
 	assertHoldFailed(t, env, fx.runID, held, ErrCodexAccountTupleMismatch)
 	msgs, states := rec.published(fx.runID)
@@ -641,25 +653,37 @@ func TestCodexReadmitNonCanonicalFrozenKeyLiveDB(t *testing.T) {
 	}
 }
 
-// readmitThenDivergeWrapper makes a re-admitted transaction classify as a terminal failure: once
-// its ReadmitRunCodexBinding has matched a row, the following GetRunCodexAuthContext re-read
-// returns the frozen key in a non-canonical form, the divergence the SQL key fence now prevents.
-type readmitThenDivergeWrapper struct {
+// readmitDiverge selects which GetRunCodexAuthContext re-reads readmitProbeWrapper corrupts.
+type readmitDiverge int
+
+const (
+	divergeNever        readmitDiverge = iota // pass every read through unchanged
+	divergeAfterReadmit                       // corrupt reads once ReadmitRunCodexBinding matched a row
+	divergeAlways                             // corrupt every read, in every transaction
+)
+
+// readmitProbeWrapper records each ReadmitRunCodexBinding row count and, per diverge, makes the
+// GetRunCodexAuthContext read return the frozen key in a non-canonical form, so the run classifies
+// as a terminal tuple mismatch (the divergence the SQL key fence prevents). readmitCodexAccountHold
+// encodes its key from the identity columns, not from the frozen key, so a corrupted read does
+// not change what ReadmitRunCodexBinding is called with.
+type readmitProbeWrapper struct {
 	codexPromoteQueries
+	diverge    readmitDiverge
 	readmitted bool
 	rows       *[]int64
 }
 
-func (w *readmitThenDivergeWrapper) ReadmitRunCodexBinding(ctx context.Context, arg store.ReadmitRunCodexBindingParams) (int64, error) {
+func (w *readmitProbeWrapper) ReadmitRunCodexBinding(ctx context.Context, arg store.ReadmitRunCodexBindingParams) (int64, error) {
 	n, err := w.codexPromoteQueries.ReadmitRunCodexBinding(ctx, arg)
 	*w.rows = append(*w.rows, n)
 	w.readmitted = w.readmitted || n == 1
 	return n, err
 }
 
-func (w *readmitThenDivergeWrapper) GetRunCodexAuthContext(ctx context.Context, id uuid.UUID) (store.GetRunCodexAuthContextRow, error) {
+func (w *readmitProbeWrapper) GetRunCodexAuthContext(ctx context.Context, id uuid.UUID) (store.GetRunCodexAuthContextRow, error) {
 	row, err := w.codexPromoteQueries.GetRunCodexAuthContext(ctx, id)
-	if err == nil && w.readmitted {
+	if err == nil && (w.diverge == divergeAlways || (w.diverge == divergeAfterReadmit && w.readmitted)) {
 		row.CodexAccountKey.String = strings.Replace(row.CodexAccountKey.String, `","`, `", "`, 1)
 	}
 	return row, err
@@ -680,7 +704,7 @@ func TestCodexReadmitWithoutPromoteRollsBackLiveDB(t *testing.T) {
 	txs := 0
 	svc.codexPromoteHooks = &codexPromoteTestHooks{wrapQueries: func(q codexPromoteQueries) codexPromoteQueries {
 		txs++
-		return &readmitThenDivergeWrapper{codexPromoteQueries: q, rows: &rows}
+		return &readmitProbeWrapper{codexPromoteQueries: q, rows: &rows, diverge: divergeAfterReadmit}
 	}}
 	rec := newReadmitRecorder()
 	svc.SetBroadcaster(rec)
@@ -698,6 +722,39 @@ func TestCodexReadmitWithoutPromoteRollsBackLiveDB(t *testing.T) {
 	}
 	if msgs, states := rec.published(fx.runID); len(msgs) != 0 || len(states) != 0 {
 		t.Fatalf("published messages=%v states=%v, want nothing", msgs, states)
+	}
+}
+
+// TestCodexReadmitWithoutPromoteRedecidesTerminalLiveDB pins the other exit of the redecide: the
+// re-admitting transaction classifies as terminal and is rolled back, and the second transaction,
+// without re-admission, classifies as terminal too (a test wrapper corrupts the re-read in both)
+// and commits the failure. The run ends failed credential_unavailable at its frozen material
+// revision, with no feed line written or published, Failed counted once and Readmitted not at
+// all, and exactly two transactions: one re-admission that matched, then none attempted.
+func TestCodexReadmitWithoutPromoteRedecidesTerminalLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	fx, svc := heldCodexFix(t, env)
+	sameIdentityRelogin(t, env, fx, codexToken("access-relogin"))
+	held := mustRun(t, env, fx.runID)
+	var rows []int64
+	txs := 0
+	svc.codexPromoteHooks = &codexPromoteTestHooks{wrapQueries: func(q codexPromoteQueries) codexPromoteQueries {
+		txs++
+		return &readmitProbeWrapper{codexPromoteQueries: q, rows: &rows, diverge: divergeAlways}
+	}}
+	rec := newReadmitRecorder()
+	svc.SetBroadcaster(rec)
+
+	res := promoteOnlyResult(t, svc, fx.runID)
+	if res.Failed != 1 || res.Promoted != 0 || res.Readmitted != 0 {
+		t.Fatalf("tick: %+v, want one terminal failure and nothing re-admitted", res)
+	}
+	if txs != 2 || len(rows) != 1 || rows[0] != 1 {
+		t.Fatalf("transactions=%d readmit rows=%v, want a re-admitting transaction then one without re-admission", txs, rows)
+	}
+	assertHoldFailed(t, env, fx.runID, held, ErrCodexAccountTupleMismatch)
+	if msgs, states := rec.published(fx.runID); len(msgs) != 0 || len(states) != 1 || states[0] != "failed" {
+		t.Fatalf("published messages=%v states=%v, want no feed line and one failed state", msgs, states)
 	}
 }
 

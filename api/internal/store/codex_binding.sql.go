@@ -550,10 +550,14 @@ type InsertCodexReadmitRunMessageParams struct {
 // starts past it and never collides with it. That does not cover a zombie: a worker of the
 // displaced flight that still holds an unreleased claim at the run's generation keeps its own
 // seq counter. If it appends at the seq this line took, its InsertRunMessage hits
-// ON CONFLICT (run_id, seq) DO NOTHING, reads as a benign duplicate, and that frame is lost; if
-// its frame lands first, this insert returns no row (below). Fenced on the hold. No row back (a seq collision, or the run left the hold) is
-// pgx.ErrNoRows; the caller rolls back and the run stays held for the next tick. The payload is
-// built by the caller and carries no token material.
+// ON CONFLICT (run_id, seq) DO NOTHING, reads as a benign duplicate, and that frame is lost. A
+// zombie frame committed before this statement's snapshot is part of MAX(seq), so this insert
+// takes the seq after it. Only a zombie insert at the same seq that this statement's snapshot
+// does not see (still in flight, or committed after the snapshot) makes this insert return no
+// row: ON CONFLICT waits for an in-flight one and does nothing once it commits. Fenced on the
+// hold. No row back (that seq collision, or the run left the hold) is pgx.ErrNoRows; the caller
+// rolls back and the run stays held for the next tick. The payload is built by the caller and
+// carries no token material.
 func (q *Queries) InsertCodexReadmitRunMessage(ctx context.Context, arg InsertCodexReadmitRunMessageParams) (int32, error) {
 	row := q.db.QueryRow(ctx, insertCodexReadmitRunMessage, arg.RunID, arg.Payload)
 	var seq int32
