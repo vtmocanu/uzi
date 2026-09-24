@@ -180,7 +180,10 @@ A linked account's meter can land in a state that needs your attention:
   from the recipe above — never a re-paste of the old one, and never a copy
   of your everyday Codex CLI's `auth.json`. `uzi rate-limits --provider
   codex` shows the same state as `credential_action_required (login
-  rejected by provider)` when the provider rejection is the cause.
+  rejected by provider)` when the provider rejection is the cause. If
+  Codex usage polling is turned off, the state reads **Polling off**
+  instead (`polling_disabled (login rejected by provider)` in the CLI), and
+  the rejection hint still shows.
 - **Vault locked** — uzi can't open the login to poll it until you unlock
   your vault again. The last known reading stays on screen, greyed and
   marked stale, rather than disappearing.

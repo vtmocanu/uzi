@@ -160,7 +160,8 @@ function CodexAccountBlock({
 }) {
   const badge = codexStatusBadge(account);
   // A non-fresh reading (stale / vault-locked / polling-off snapshot) is dimmed and draws
-  // no forecast; pending / no_reading / action-required carry no buckets at all.
+  // no forecast; pending / no_reading carry no buckets, and any other status may still carry
+  // the last stored buckets.
   const dim = account.status !== "fresh";
   const resetLabel = accountResetLabel(account, now);
   const label = codexAccountLabel(account);

@@ -46,13 +46,15 @@ type CodexRateLimitBucketDTO struct {
 //	no_subscription | pending | no_reading | fresh | stale | vault_locked |
 //	credential_action_required | polling_disabled
 //
-// reason (omitempty) says WHY a credential_action_required account needs action. It is a
-// CLOSED set, set only when status is credential_action_required (issue #1594):
+// reason (omitempty) says WHY a re-login-flagged account needs action. It is a CLOSED set,
+// set for a reauth-flagged account under credential_action_required or polling_disabled
+// (a disabled poller outranks the reauth status but must not hide the reason), never
+// under vault_locked, where unlocking is the only actionable step (issue #1594):
 //
 //	provider_rejected — the saved Codex login was rejected by the provider; add a login
 //	                    used only by uzi.
 //
-// It is absent for every other status and for a re-login flagged for any other reason.
+// It is absent under every other status and for a re-login flagged for any other reason.
 type CodexAccountRateLimitDTO struct {
 	AccountID     string                    `json:"account_id"`
 	Aliases       []string                  `json:"aliases"`

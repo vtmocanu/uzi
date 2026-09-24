@@ -3068,9 +3068,10 @@ export interface CodexAccountRateLimit {
   aliases: string[];
   is_default: boolean;
   status: CodexRateLimitStatus;
-  // reason refines credential_action_required (issue #1594): "provider_rejected" means the
-  // provider rejected the saved login's refresh material, so re-pasting the same file will
-  // not help. Absent for every other status and for a generic re-auth.
+  // reason names why a re-login-flagged account needs action (issue #1594):
+  // "provider_rejected" means the provider rejected the saved login's refresh material, so
+  // re-pasting the same file will not help. Sent under credential_action_required or
+  // polling_disabled; absent under vault_locked, every other status, and a generic re-auth.
   reason?: "provider_rejected";
   last_success_at?: string;
   stale?: boolean;
