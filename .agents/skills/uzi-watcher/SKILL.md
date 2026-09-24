@@ -251,10 +251,14 @@ and namespace from your own kubeconfig; they are deployment-specific, do not har
    full reviewed tip sat on the previous worker's PVC; `jq .worker_id` pointed at the cold
    worker.) Its pod is `uzi-hw-WORKER_ID-*` in the worker namespace.
 2. **Bundle the branch out**, base excluded so it stays small. The bare tracking ref
-   advances only at checkpoint boundaries (milestone/iteration checkpoints, park, shutdown via
-   `fetchBackBestEffort`; finalize via `fetchAgentBranch`), not on every commit, so after a
-   hard mid-milestone kill the **working-clone branch HEAD**, when its pod still lives, is
-   the fresher committed tip. For
+   advances at checkpoint boundaries (milestone/iteration checkpoints, park, shutdown via
+   `fetchBackBestEffort`; finalize via `fetchAgentBranch`) and, mid-turn, on the
+   `CHECKPOINT_TICK_INTERVAL` tick (default 5m; issue #1597) whenever the tip has moved, the
+   clone is not git-busy, the tick can acquire the per-flight sink gate, and no retained
+   bare lock blocks the sink (adr/1597-midturn-checkpoint-durability.md, "Per-flight sink
+   gate and preemption" and "Lock ownership proof") — but still not on every commit, so
+   after a hard mid-milestone/mid-tick kill the **working-clone branch HEAD** is the fresher
+   committed tip, when its pod still lives. For
    a run still claimed on the worker holding the clone, `scripts/backup-runs.sh RUN` is easiest
    and also saves the uncommitted patch + untracked files separately. By hand (committed
    history only; add `git -C CLONE diff HEAD` and an untracked tar for WIP):

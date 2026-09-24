@@ -127,6 +127,23 @@ describe("loadConfig CHECKPOINT_INTERVAL (PRD #267)", () => {
   });
 });
 
+describe("loadConfig CHECKPOINT_TICK_INTERVAL (issue #1597 M2)", () => {
+  it("defaults to 5 minutes when unset", () => {
+    assert.strictEqual(loadConfig(baseEnv()).checkpointTickIntervalMs, 5 * 60_000);
+  });
+
+  it("treats 0 as disabled", () => {
+    assert.strictEqual(loadConfig(baseEnv({ CHECKPOINT_TICK_INTERVAL: "0" })).checkpointTickIntervalMs, 0);
+  });
+
+  it("parses a Go-style duration string", () => {
+    assert.strictEqual(
+      loadConfig(baseEnv({ CHECKPOINT_TICK_INTERVAL: "90s" })).checkpointTickIntervalMs,
+      90_000,
+    );
+  });
+});
+
 // PRD #108 M6: UZI_HOME_RECLAIM gates a DESTRUCTIVE startup sweep and ships ON, so
 // its polarity is the whole point — a default-on safety feature that a deployment
 // can disable without meaning to is worse than no kill switch at all.

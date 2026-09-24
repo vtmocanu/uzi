@@ -642,6 +642,13 @@ Tracked as GitLab issue vtmocanu/uzi#218; PRD at `prds/done/218-park-resume-work
   [user 2026-08-04]
 - When prior work genuinely cannot be recovered, the run says so in the feed rather
   than silently re-treading it. [user 2026-08-04]
+- A long implementation turn's committed work must have a best-effort opportunity
+  to reach a worker-independent checkpoint within a bounded interval, without
+  waiting for a milestone. A busy clone, a blocked or untrusted secret scan, or a
+  failed publish can prevent that checkpoint, and the work is then never reported
+  as durable. [user, #1597] (AI-synced 2026-09-24)
+- When the checkpoint is not published, the shutdown feed must name a bounded
+  reason class. [user, #1597] (AI-synced 2026-09-24)
 
 ## Feature #1392 — Park a run on a transient forge failure at clone or fetch
 

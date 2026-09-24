@@ -22,6 +22,16 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Added
+
+- **A long implementation turn now reaches a checkpoint without waiting for a milestone ([#1597](https://github.com/vtmocanu/uzi/issues/1597)).**
+  A repeating mid-turn tick (`CHECKPOINT_TICK_INTERVAL`, default 5m, 0 disables) fetches committed work into the worker's bare repository and publishes it to origin through the existing credential-free broker once `CHECKPOINT_INTERVAL` has elapsed, giving a best-effort bound of roughly `CHECKPOINT_INTERVAL` plus one tick interval (~25m at defaults) on worst-case data loss even mid-turn. The bound holds only while the tick runs (the clone is not git-busy), the scan is trusted and finding-free, and the broker accepts the publish; origin reachability alone does not provide it. Every such publish (the tick, the iteration-boundary tier, and a non-GitHub-forge milestone) is secret-scanned over the pinned range being packed, minus content already public, before it ships; a finding or an untrusted scan keeps the fetch-back local instead of publishing. Park/shutdown/pause/capture and every GitHub milestone publish stay unscanned, unchanged from before.
+
+### Changed
+
+- **The graceful-shutdown checkpoint feed line names a bounded reason class instead of raw error text ([#1597](https://github.com/vtmocanu/uzi/issues/1597)).**
+  A checkpoint that did not reach origin now reports one of a fixed set of classes (`timeout`, `boundary_blocked`, `publish_rejected`, `publish_skipped`, `publish_error`, `no_local_tip`, `tick_process_survived`, `bare_lock_retained`) rather than a thrown error's message or remote text, and a publish that lands wins over a later, unrelated boundary error.
+
 ## [0.84.0] - 2026-09-20
 
 ### Added

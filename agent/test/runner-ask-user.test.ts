@@ -8,6 +8,7 @@ import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { makeClaim, nullLogger } from "./helpers.js";
 import { WorkerClient } from "../src/client.js";
 import { GitCache } from "../src/git.js";
+import { defaultGitleaksShim } from "./gitleaks-shim.js";
 import {
   StubExecutor,
   STUB_ASK_SENTINEL,
@@ -59,7 +60,7 @@ beforeEach(async () => {
   api = new FakeApi(TOKEN);
   const baseUrl = await api.listen();
   fx = makeFixture();
-  git = new GitCache(fx.dataDir, nullLogger());
+  git = new GitCache(fx.dataDir, nullLogger(), undefined, { gitleaksBin: defaultGitleaksShim() });
   client = new WorkerClient(baseUrl, TOKEN, "0.1.0-test", nullLogger(), {
     sleep: async () => {},
     terminalRetrySchedule: [1, 1],
