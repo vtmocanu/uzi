@@ -81,7 +81,9 @@ var neverJudgeFailOrigins = map[string]bool{
 // history_rewritten is DELIBERATELY NOT a member: uzi never force-pushes, so a branch rewritten
 // below the published tip is an AGENT DEFECT (the agent rewrote published history against the
 // steer) and stays JUDGE-ELIGIBLE — the one worker-reportable finalize-failure origin kept out of
-// this set on purpose (see failorigin.go and TestHistoryRewrittenStillJudged).
+// this set on purpose (see failorigin.go and TestHistoryRewrittenStillJudged). plan_missing
+// (issue #1593, a gated plan turn that ended prose-only after one nudge) is likewise an agent
+// defect and deliberately absent from all three skip sets (TestPlanMissingIsWorkerReportableAndJudged).
 var envPublishFailOrigins = map[string]bool{
 	"finalize_base_align_conflict": true,
 	"workflow_scope_missing":       true,

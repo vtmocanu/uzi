@@ -83,6 +83,15 @@ var failOrigins = []string{
 	// judge_enqueue.go): an undispatched run was never claimed, so there is no agent attempt or
 	// trace to retrospect.
 	"task_undispatched",
+	// issue #1593: a gated plan (or plan-revision) turn that ended with prose only (no
+	// submit_plan, no ask_user), was nudged once, and still produced neither on an unattended
+	// run (or after owner guidance), so the worker fails the run typed with a fixed
+	// failure_reason instead of the generic agent_failure. WORKER-REPORTABLE (see
+	// workerReportableFailOrigins). It is an AGENT DEFECT (model noncompliance with the plan
+	// contract), so it is JUDGE-ELIGIBLE — deliberately absent from preStartInfraFailOrigins,
+	// neverJudgeFailOrigins and envPublishFailOrigins (judge_enqueue.go) — and it is not
+	// human-landable (no finalize ran, so there is no committed work to land).
+	"plan_missing",
 }
 
 // failOriginSet is the lookup form. Built once; failOrigins stays the declaration so
@@ -123,7 +132,9 @@ func AllFailOrigins() []string {
 // the detected secret), and history_rewritten (PRD #1416 M4: the worker cannot build or
 // validate the ancestry bridge for a published branch whose history was rewritten below the
 // published floor, so finalize fails typed with the preserved diff instead of the generic
-// catch); agent_failure is included because it is the judgeable
+// catch), and plan_missing (issue #1593: a gated plan turn ended prose-only, with no
+// submit_plan and no ask_user, after one corrective nudge, so the worker fails the run typed
+// with a fixed failure_reason); agent_failure is included because it is the judgeable
 // default the `failed` arm applies anyway, so an explicit worker agent_failure is
 // harmless and semantically correct. The partition (worker-reportable + server-only ==
 // vocabulary) is pinned by TestCoerceFailOrigin.
@@ -138,6 +149,9 @@ var workerReportableFailOrigins = map[string]bool{
 	// PRD #1416 M4: the worker detects an un-bridgeable published-history rewrite at
 	// finalize and reports it typed with preserved_patch (judge-eligible; see failOrigins).
 	"history_rewritten": true,
+	// issue #1593: the worker fails a gated plan turn that ended prose-only after one
+	// corrective nudge (judge-eligible; see failOrigins).
+	"plan_missing": true,
 }
 
 // CoerceFailOrigin maps a worker-reported fail_origin onto the WORKER-REPORTABLE subset.

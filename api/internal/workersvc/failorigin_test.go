@@ -63,6 +63,33 @@ func TestCoerceFailOrigin(t *testing.T) {
 	}
 }
 
+// TestPlanMissingIsWorkerReportableAndJudged pins issue #1593's origin: plan_missing is a
+// stored vocabulary member, the worker may report it (CoerceFailOrigin passes it through
+// verbatim, so the typed failure is not flattened to agent_failure), and it is an AGENT
+// DEFECT (a gated plan turn that ended prose-only after one corrective nudge), so it sits in
+// NONE of the three judge-skip sets and stays judge-eligible, like history_rewritten. It is
+// not human-landable either: no finalize ran, so there is no committed work to land.
+func TestPlanMissingIsWorkerReportableAndJudged(t *testing.T) {
+	const o = "plan_missing"
+	if !failOriginSet[o] {
+		t.Fatalf("%q is not in the stored fail_origin vocabulary", o)
+	}
+	v := o
+	if got := CoerceFailOrigin(&v); got == nil || *got != o {
+		t.Fatalf("CoerceFailOrigin(%q) = %v, want passthrough (worker-reportable)", o, got)
+	}
+	for name, set := range map[string]map[string]bool{
+		"preStartInfraFailOrigins": preStartInfraFailOrigins,
+		"neverJudgeFailOrigins":    neverJudgeFailOrigins,
+		"envPublishFailOrigins":    envPublishFailOrigins,
+		"humanLandableFailOrigins": humanLandableFailOrigins,
+	} {
+		if set[o] {
+			t.Fatalf("%q must not be in %s: it is a judge-eligible agent defect with no landable work", o, name)
+		}
+	}
+}
+
 // TestFailOriginVocabularyMatchesCheck is the instrument migration 00126's comment
 // promises, copied from TestRateLimitTypeVocabularyMatchesCheck (00091's) for the same
 // reason it exists there: a value Go writes and the CHECK rejects becomes a constraint
