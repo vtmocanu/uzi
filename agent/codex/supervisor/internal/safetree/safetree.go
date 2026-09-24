@@ -21,13 +21,21 @@
 // an O_PATH|O_NOFOLLOW|O_DIRECTORY open, which needs no permission on the
 // directory itself and refuses a symlink with ELOOP/ENOTDIR; that fd is
 // fstat'ed and must be a directory owned by the pinned uid with the dev/ino the
-// parent's fstatat reported (the root: the Pin taken at Create). Only then, if
-// the owner rwx bits are missing (modes like 0000, 0100, 0300, 0555), are they
-// restored on that verified inode through its /proc/self/fd magic link, which
-// resolves to the already-opened inode and not to a pathname. Second, the
+// parent's fstatat reported (the root: the Pin taken at Create). Second, the
 // directory is opened O_RDONLY|O_NOFOLLOW|O_DIRECTORY and its fstat must show
-// the same dev/ino, so an entry swapped between the two opens is a mismatch.
-// Without /proc/self/fd the chmod fails and the walk stops with ErrIO.
+// the same dev/ino, so an entry swapped between the two opens (renamed away,
+// replaced by another directory or by a symlink) is ErrMismatch.
+//
+// During Remove only, between those two opens, missing owner rwx bits (modes
+// like 0000, 0100, 0300, 0555) are added on that verified inode through its
+// /proc/self/fd magic link, which resolves to the already-opened inode and not
+// to a pathname. The chmod only adds the owner bits (old mode | 0700); the fd
+// is then fstat'ed again and must be the same directory with exactly that mode,
+// or the walk stops with ErrMismatch, which catches a chmod misdirected by a
+// /proc that is not procfs. If the magic link cannot be resolved (no /proc)
+// the chmod fails and the walk stops with ErrIO. Remove reports ErrNotExist
+// only when the root's first O_PATH open finds no entry; the root vanishing
+// after that is ErrMismatch.
 //
 // Every entry is lstat'ed (fstatat AT_SYMLINK_NOFOLLOW), must sit on the pinned
 // root's filesystem (st_dev == Pin.Dev), and must be owned by the pinned uid; a
@@ -37,10 +45,15 @@
 // first mismatch, foreign owner, bound breach or other syscall error aborts the
 // whole walk and retains whatever remains: nothing continues to siblings.
 //
-// Create verifies the directory it just made (a directory, owned by uid) before
-// it chmods it to exactly 0700, and requires it to be empty with st_nlink == 2,
-// so a peer that exchanged a pre-filled directory into the name between the
-// mkdirat and the open gets ErrMismatch rather than a pin on its directory.
+// Create never chmods a directory before it has proven it made it. It opens
+// the name it just mkdirat'ed with the same two steps but restores no bits: a
+// directory that is not owned by uid, lacks any owner rwx bit (mkdirat asked
+// for 0700), or is not empty (getdents shows more than "." and "..") is
+// rejected, so a peer that exchanged its own directory into the name between
+// the mkdirat and the open gets neither a pin nor a chmod on it (ErrMismatch,
+// or ErrOwner for a foreign owner). Only after those checks pass does Create
+// fchmod the directory to exactly 0700. A umask that strips owner bits from
+// the mkdirat therefore also makes Create fail.
 //
 // # Documented residual
 //
@@ -50,7 +63,8 @@
 // (and so could itself remove), or unlink a NAME in a directory the walk already
 // verified. It can never make Remove follow a link or chmod an unverified inode:
 // every open is O_NOFOLLOW, every chmod goes through an fd whose identity and
-// owner were checked first, and rmdir refuses a non-empty directory.
+// owner were checked first (Create's only after the emptiness check too), and
+// rmdir refuses a non-empty directory.
 package safetree
 
 import (
@@ -74,7 +88,9 @@ var (
 	ErrBound = errors.New("safetree: bound exceeded")
 	// ErrIO: a syscall failed; the underlying errno is wrapped.
 	ErrIO = errors.New("safetree: io")
-	// ErrNotExist: the root was absent at the first open.
+	// ErrNotExist: Remove's first O_PATH open of the root found no entry. An
+	// ENOENT at any later step (the reopen, the chmod, a descendant) is not
+	// this error.
 	ErrNotExist = errors.New("safetree: absent")
 	// ErrName: a caller-supplied name is not a single path component.
 	ErrName = errors.New("safetree: invalid name")
@@ -101,8 +117,9 @@ const (
 // contents are gone and before the final root fstatat;
 // hookCreateBetweenMkdirAndOpen runs in Create after mkdirat and before the
 // open; hookBetweenPathAndReadOpen runs between openDir's O_PATH and O_RDONLY
-// opens. fstatat is the lstat used for every entry and for the root re-check;
-// fstat is used on every opened fd.
+// opens, after any owner-bit restore. fstatat is the lstat used for every entry
+// and for the root re-check; fstat is used on every opened fd. procFdPrefix is
+// the magic-link directory the owner-bit restore chmods through.
 var (
 	hookBetweenStatAndOpen        func(dirfd int, name string)
 	hookBeforeRootRecheck         func(parentFd int, name string)
@@ -110,6 +127,7 @@ var (
 	hookBetweenPathAndReadOpen    func(dirfd int, name string)
 	fstatat                       = unix.Fstatat
 	fstat                         = unix.Fstat
+	procFdPrefix                  = "/proc/self/fd/"
 )
 
 // Pin is the identity a tree root must still have when it is removed.
@@ -201,13 +219,27 @@ type ident struct {
 	set      bool
 }
 
+// openFlag selects openDir's behaviour for its caller.
+type openFlag int
+
+const (
+	// restoreOwnerBits adds missing owner rwx bits on the verified inode (the
+	// Remove walk). Without it a directory lacking any owner bit is ErrMismatch.
+	restoreOwnerBits openFlag = 1 << iota
+	// rootOpen maps ENOENT at the first O_PATH open, and only there, to
+	// ErrNotExist.
+	rootOpen
+)
+
 // openDir opens name under dirfd as a readable directory owned by uid (and, when
-// want is set, with want's dev/ino), restoring missing owner rwx bits on the
-// verified inode first. It returns the fd and its fstat.
-func openDir(dirfd int, name string, want ident, uid int, op string) (int, unix.Stat_t, error) {
+// want is set, with want's dev/ino). It returns the fd and its fstat.
+func openDir(dirfd int, name string, want ident, uid int, flags openFlag, op string) (int, unix.Stat_t, error) {
 	var st unix.Stat_t
 	pfd, err := unix.Openat(dirfd, name, pathOpenFlags, 0)
 	if err != nil {
+		if flags&rootOpen != 0 && errors.Is(err, unix.ENOENT) {
+			return -1, st, fmt.Errorf("%w: %s: %w", ErrNotExist, op, err)
+		}
 		return -1, st, openErr(op, err)
 	}
 	defer func() { _ = unix.Close(pfd) }()
@@ -221,11 +253,11 @@ func openDir(dirfd int, name string, want ident, uid int, op string) (int, unix.
 		return -1, st, ErrOwner
 	}
 	if st.Mode&0o700 != 0o700 {
-		// fchmod refuses an O_PATH fd and kernel 6.1 has no fchmodat2 with
-		// AT_EMPTY_PATH; the magic link names the inode pfd already holds.
-		magic := "/proc/self/fd/" + strconv.Itoa(pfd)
-		if err := unix.Fchmodat(unix.AT_FDCWD, magic, (st.Mode&0o7777)|0o700, 0); err != nil {
-			return -1, st, ioErr(op+": chmod", err)
+		if flags&restoreOwnerBits == 0 {
+			return -1, st, fmt.Errorf("%w: %s: owner bits missing", ErrMismatch, op)
+		}
+		if err := addOwnerBits(pfd, &st, op); err != nil {
+			return -1, st, err
 		}
 	}
 
@@ -234,7 +266,11 @@ func openDir(dirfd int, name string, want ident, uid int, op string) (int, unix.
 	}
 	fd, err := unix.Openat(dirfd, name, dirOpenFlags, 0)
 	if err != nil {
-		return -1, st, openErr(op, err)
+		if errors.Is(err, unix.ENOENT) {
+			// The verified entry left the name between the two opens.
+			return -1, st, fmt.Errorf("%w: %s reopen: %w", ErrMismatch, op, err)
+		}
+		return -1, st, openErr(op+" reopen", err)
 	}
 	var fst unix.Stat_t
 	if err := fstat(fd, &fst); err != nil {
@@ -248,6 +284,28 @@ func openDir(dirfd int, name string, want ident, uid int, op string) (int, unix.
 		return -1, st, fmt.Errorf("%w: %s reopen", ErrMismatch, op)
 	}
 	return fd, fst, nil
+}
+
+// addOwnerBits sets the owner rwx bits, and only those, on the directory pfd
+// holds, then re-fstats pfd and requires the same directory with exactly the
+// old mode plus 0700; st is updated to that stat. fchmod refuses an O_PATH fd
+// and kernel 6.1 has no fchmodat2 with AT_EMPTY_PATH, so the chmod goes through
+// the magic link naming the inode pfd already holds.
+func addOwnerBits(pfd int, st *unix.Stat_t, op string) error {
+	want := (st.Mode & 0o7777) | 0o700
+	magic := procFdPrefix + strconv.Itoa(pfd)
+	if err := unix.Fchmodat(unix.AT_FDCWD, magic, want, 0); err != nil {
+		return ioErr(op+": chmod", err)
+	}
+	var after unix.Stat_t
+	if err := fstat(pfd, &after); err != nil {
+		return ioErr(op+": fstat after chmod", err)
+	}
+	if !isDir(&after) || after.Dev != st.Dev || after.Ino != st.Ino || after.Mode&0o7777 != want {
+		return fmt.Errorf("%w: %s: chmod did not reach the verified inode", ErrMismatch, op)
+	}
+	*st = after
+	return nil
 }
 
 // Create makes name under parentFd as a fresh 0700 directory owned by uid and
@@ -265,11 +323,12 @@ func Create(parentFd int, name string, uid int) (int, Pin, error) {
 	if hookCreateBetweenMkdirAndOpen != nil {
 		hookCreateBetweenMkdirAndOpen(parentFd, name)
 	}
-	fd, st, err := openDir(parentFd, name, ident{}, uid, "create open")
+	// No restoreOwnerBits: nothing is chmodded until requireFresh has passed.
+	fd, st, err := openDir(parentFd, name, ident{}, uid, 0, "create open")
 	if err != nil {
 		return -1, Pin{}, err
 	}
-	if err := requireFresh(fd, &st); err != nil {
+	if err := requireFresh(fd); err != nil {
 		_ = unix.Close(fd)
 		return -1, Pin{}, err
 	}
@@ -280,12 +339,9 @@ func Create(parentFd int, name string, uid int) (int, Pin, error) {
 	return fd, pinOf(&st), nil
 }
 
-// requireFresh verifies the directory fd is empty: st_nlink == 2 and one
-// getdents shows only "." and "..".
-func requireFresh(fd int, st *unix.Stat_t) error {
-	if st.Nlink != 2 {
-		return fmt.Errorf("%w: create: nlink %d", ErrMismatch, st.Nlink)
-	}
+// requireFresh verifies the directory fd is empty: one getdents shows only "."
+// and "..". st_nlink is not checked: btrfs reports 1 for every directory.
+func requireFresh(fd int) error {
 	buf := make([]byte, getdentsBufSize)
 	n, err := unix.Getdents(fd, buf)
 	for errors.Is(err, unix.EINTR) {
@@ -310,11 +366,8 @@ func Remove(parentFd int, name string, pin Pin) error {
 	if !validName(name) {
 		return ErrName
 	}
-	fd, _, err := openDir(parentFd, name, ident{dev: pin.Dev, ino: pin.Ino, set: true}, pin.UID, "open root")
+	fd, _, err := openDir(parentFd, name, ident{dev: pin.Dev, ino: pin.Ino, set: true}, pin.UID, restoreOwnerBits|rootOpen, "open root")
 	if err != nil {
-		if errors.Is(err, unix.ENOENT) {
-			return ErrNotExist
-		}
 		return err
 	}
 
@@ -431,7 +484,7 @@ func (w *walker) removeEntry(dirfd int, name string, depth int) error {
 	if hookBetweenStatAndOpen != nil {
 		hookBetweenStatAndOpen(dirfd, name)
 	}
-	child, _, err := openDir(dirfd, name, ident{dev: uint64(st.Dev), ino: st.Ino, set: true}, w.uid, "openat")
+	child, _, err := openDir(dirfd, name, ident{dev: uint64(st.Dev), ino: st.Ino, set: true}, w.uid, restoreOwnerBits, "openat")
 	if err != nil {
 		return err
 	}

@@ -977,3 +977,240 @@ func TestRemoveFailsClosedOnSwapBetweenOpens(t *testing.T) {
 	assertExists(t, filepath.Join(f.root(), moduleCacheRel, "sub"))
 	assertExists(t, filepath.Join(f.root(), moduleCacheRel, "sub.moved", "sub.go"))
 }
+
+func setPathReadHook(t *testing.T, h func(dirfd int, name string)) {
+	t.Helper()
+	prev := hookBetweenPathAndReadOpen
+	hookBetweenPathAndReadOpen = h
+	t.Cleanup(func() { hookBetweenPathAndReadOpen = prev })
+}
+
+func setProcFdPrefix(t *testing.T, prefix string) {
+	t.Helper()
+	prev := procFdPrefix
+	procFdPrefix = prefix
+	t.Cleanup(func() { procFdPrefix = prev })
+}
+
+func modeOf(t *testing.T, p string) uint32 {
+	t.Helper()
+	var st unix.Stat_t
+	if err := unix.Lstat(p, &st); err != nil {
+		t.Fatal(err)
+	}
+	return st.Mode & 0o7777
+}
+
+// An ENOENT after the root's first open is not "absent": the tree still exists.
+func TestRemoveRootRenamedBetweenOpensIsMismatch(t *testing.T) {
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	f := newFixture(t)
+	pin := f.createTree(t)
+	buildModuleCache(t, f.root())
+	fired := false
+	setPathReadHook(t, func(dirfd int, name string) {
+		if fired || name != treeName {
+			return
+		}
+		fired = true
+		if err := unix.Renameat(dirfd, name, dirfd, name+".moved"); err != nil {
+			t.Errorf("rename: %v", err)
+		}
+	})
+
+	err := Remove(f.parentFd, treeName, pin)
+	if !fired {
+		t.Fatal("hook never fired")
+	}
+	if !errors.Is(err, ErrMismatch) || errors.Is(err, ErrNotExist) || Reason(err) != "mismatch" {
+		t.Fatalf("Remove = %v (reason %q), want ErrMismatch, not ErrNotExist", err, Reason(err))
+	}
+	assertExists(t, filepath.Join(f.root()+".moved", moduleCacheRel, "go.mod"))
+}
+
+// An ENOENT from the magic-link chmod (no /proc) is an I/O failure, not "absent".
+func TestRemoveChmodENOENTIsIO(t *testing.T) {
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	f := newFixture(t)
+	pin := f.createTree(t)
+	buildModuleCache(t, f.root())
+	mustChmod(t, f.root(), 0o000)
+	setProcFdPrefix(t, filepath.Join(f.base, "no-such-dir")+"/")
+
+	err := Remove(f.parentFd, treeName, pin)
+	if !errors.Is(err, ErrIO) || !errors.Is(err, unix.ENOENT) || errors.Is(err, ErrNotExist) || Reason(err) != "io" {
+		t.Fatalf("Remove = %v (reason %q), want ErrIO wrapping ENOENT", err, Reason(err))
+	}
+	if got := modeOf(t, f.root()); got != 0 {
+		t.Fatalf("root mode = %o, want untouched 0000", got)
+	}
+	mustChmod(t, f.root(), 0o700)
+	assertExists(t, filepath.Join(f.root(), moduleCacheRel, "go.mod"))
+}
+
+// A magic-link directory that is not procfs misdirects the chmod; the post-chmod
+// fstat of the verified fd must catch it.
+func TestRemoveMisdirectedChmodIsMismatch(t *testing.T) {
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	f := newFixture(t)
+	pin := f.createTree(t)
+	buildModuleCache(t, f.root())
+	decoy := filepath.Join(f.base, "decoy")
+	mustMkdir(t, decoy)
+	mustChmod(t, decoy, 0o755)
+	fake := filepath.Join(f.base, "fakefd")
+	mustMkdir(t, fake)
+	for i := range 1024 {
+		if err := os.Symlink(decoy, filepath.Join(fake, strconv.Itoa(i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	setProcFdPrefix(t, fake+"/")
+	mustChmod(t, f.root(), 0o000)
+
+	err := Remove(f.parentFd, treeName, pin)
+	if !errors.Is(err, ErrMismatch) {
+		t.Fatalf("Remove = %v, want ErrMismatch", err)
+	}
+	if got := modeOf(t, decoy); got != 0o700 {
+		t.Fatalf("decoy mode = %o, want 0700 (the chmod must have been misdirected there)", got)
+	}
+	if got := modeOf(t, f.root()); got != 0 {
+		t.Fatalf("root mode = %o, want untouched 0000", got)
+	}
+	mustChmod(t, f.root(), 0o700)
+	assertExists(t, filepath.Join(f.root(), moduleCacheRel, "go.mod"))
+}
+
+// The restore adds the owner bits and nothing else.
+func TestRemoveChmodOnlyAddsOwnerBits(t *testing.T) {
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	f := newFixture(t)
+	pin := f.createTree(t)
+	want := map[string]uint32{"m0055": 0o755, "m0000": 0o700}
+	orig := map[string]os.FileMode{"m0055": 0o055, "m0000": 0o000}
+	for name := range want {
+		dir := filepath.Join(f.root(), name)
+		mustMkdir(t, dir)
+		mustWrite(t, filepath.Join(dir, "f"), "x")
+		mustChmod(t, dir, orig[name])
+	}
+	got := map[string]uint32{}
+	setPathReadHook(t, func(dirfd int, name string) {
+		if _, ok := want[name]; !ok {
+			return
+		}
+		var st unix.Stat_t
+		if err := unix.Fstatat(dirfd, name, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+			t.Errorf("fstatat %s: %v", name, err)
+			return
+		}
+		got[name] = st.Mode & 0o7777
+	})
+
+	if err := Remove(f.parentFd, treeName, pin); err != nil {
+		t.Fatalf("Remove: %v (reason %q)", err, Reason(err))
+	}
+	for name, w := range want {
+		if g, ok := got[name]; !ok || g != w {
+			t.Errorf("%s mode after chmod = %o (seen %v), want %o", name, g, ok, w)
+		}
+	}
+	assertGone(t, f.root())
+}
+
+// The O_RDONLY reopen must not follow a symlink swapped in after the O_PATH
+// open, even one pointing back at the verified inode.
+func TestRemoveReopenIsNoFollow(t *testing.T) {
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	f := newFixture(t)
+	pin := f.createTree(t)
+	buildModuleCache(t, f.root())
+	fired := false
+	setPathReadHook(t, func(dirfd int, name string) {
+		if fired || name != "sub" {
+			return
+		}
+		fired = true
+		if err := unix.Renameat(dirfd, name, dirfd, name+".moved"); err != nil {
+			t.Errorf("rename: %v", err)
+			return
+		}
+		if err := unix.Symlinkat(name+".moved", dirfd, name); err != nil {
+			t.Errorf("symlink: %v", err)
+		}
+	})
+
+	err := Remove(f.parentFd, treeName, pin)
+	if !fired {
+		t.Fatal("hook never fired")
+	}
+	if !errors.Is(err, ErrMismatch) || (!errors.Is(err, unix.ELOOP) && !errors.Is(err, unix.ENOTDIR)) {
+		t.Fatalf("Remove = %v, want ErrMismatch from ELOOP/ENOTDIR at the reopen", err)
+	}
+	assertExists(t, filepath.Join(f.root(), moduleCacheRel, "sub.moved", "sub.go"))
+	assertExists(t, filepath.Join(f.root(), moduleCacheRel, "sub.moved", "deeper", "d.go"))
+}
+
+// Create must never chmod a directory it has not proven it made.
+func TestCreateNeverChmodsSubstitutedDir(t *testing.T) {
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	f := newFixture(t)
+	var planted string
+	setCreateHook(t, func(parentFd int, name string) {
+		if err := unix.Renameat(parentFd, name, parentFd, name+".fresh"); err != nil {
+			t.Errorf("rename: %v", err)
+			return
+		}
+		mustMkdir(t, f.root())
+		planted = filepath.Join(f.root(), "planted")
+		mustWrite(t, planted, "x")
+		mustChmod(t, f.root(), 0o555)
+	})
+	fd, _, err := Create(f.parentFd, treeName, os.Geteuid())
+	if err == nil {
+		_ = unix.Close(fd)
+	}
+	if !errors.Is(err, ErrMismatch) || fd != -1 {
+		t.Fatalf("Create = %d, %v; want -1, ErrMismatch", fd, err)
+	}
+	if got := modeOf(t, f.root()); got != 0o555 {
+		t.Fatalf("planted dir mode = %o, want untouched 0555", got)
+	}
+	assertExists(t, planted)
+}
+
+func TestOpenDirNoFollow(t *testing.T) {
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	f := newFixture(t)
+	if err := os.Symlink(f.sentinel, filepath.Join(f.base, "link")); err != nil {
+		t.Fatal(err)
+	}
+	// With O_DIRECTORY, Linux refuses a final symlink under O_NOFOLLOW with
+	// ENOTDIR rather than ELOOP; without O_NOFOLLOW this open would succeed.
+	if fd, err := OpenDirNoFollow(f.parentFd, "link"); !errors.Is(err, unix.ELOOP) && !errors.Is(err, unix.ENOTDIR) {
+		if err == nil {
+			_ = unix.Close(fd)
+		}
+		t.Fatalf("OpenDirNoFollow(symlink) = %d, %v; want ELOOP/ENOTDIR", fd, err)
+	}
+	fd, err := OpenDirNoFollow(f.parentFd, sentinelName)
+	if err != nil {
+		t.Fatalf("OpenDirNoFollow(dir): %v", err)
+	}
+	_ = unix.Close(fd)
+}
