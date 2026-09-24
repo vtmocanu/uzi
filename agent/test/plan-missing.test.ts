@@ -13,6 +13,7 @@ import {
   resolvePlanMissing,
 } from "../src/plan-missing.js";
 import type { EmittedMessage, RunContext } from "../src/executor.js";
+import { makeTextRedactor } from "../src/redact.js";
 
 // Issue #1593: the shared pieces of the prose-only planning-turn recovery. The executor
 // wiring is covered in codex-executor / ask-user-executor tests; this pins the bounding,
@@ -62,6 +63,31 @@ describe("boundLeadFinalMessage", () => {
     // Degenerate: a window that is almost all stripped characters keeps only the marker.
     const allNul = "p".repeat(50) + secret + "\u0000".repeat(window);
     assert.equal(boundLeadFinalMessage(allNul, redact), MARKER);
+  });
+
+  it("drops the tail of a ~3000-char JWT-shaped secret split at the window's left edge", () => {
+    // Pins LEAD_MESSAGE_SECRET_MARGIN against the longest secrets the redactor holds (Codex
+    // OAuth JWTs can run past 1024 chars). Clearly synthetic: a deterministic base64url-ish
+    // sequence assembled at runtime, so no token-shaped literal sits in source.
+    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    const body = (n: number, seed: number) =>
+      Array.from({ length: n }, (_, i) => alphabet[(i * 37 + seed * 11 + ((i * i) % 61)) % 64]).join("");
+    const secret = "eyJ" + body(197, 1) + "." + "eyJ" + body(2493, 2) + "." + body(302, 3);
+    assert.equal(secret.length, 3000);
+    const redact = makeTextRedactor([secret]);
+    const window = MAX_LEAD_FINAL_MESSAGE_LEN + LEAD_MESSAGE_SECRET_MARGIN;
+    const inside = 2500; // the secret's last 2500 chars sit just inside the window's left edge
+    const tail = " the end";
+    const text = "p".repeat(50) + secret + "~".repeat(window - inside - tail.length) + tail;
+    assert.ok(text.length > window);
+    const out = boundLeadFinalMessage(text, redact);
+    assert.ok(out.startsWith(MARKER));
+    assert.ok(out.endsWith(tail));
+    const secretTail = secret.slice(-inside);
+    for (let i = 0; i + 16 <= secretTail.length; i++) {
+      const frag = secretTail.slice(i, i + 16);
+      assert.ok(!out.includes(frag), `a 16-char fragment of the secret's tail survived at offset ${i}`);
+    }
   });
 
   it("redacts BEFORE the cut, so a secret straddling the cap leaves no suffix", () => {

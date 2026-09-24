@@ -63,7 +63,7 @@ describe("PlanMissingCard (via RunEventRow status branch)", () => {
     expect(card.querySelector("strong")).toBeNull();
     // No attribute sink carries the untrusted text.
     for (const el of Array.from(card.querySelectorAll("*"))) {
-      for (const attr of ["title", "href", "style", "src"]) {
+      for (const attr of ["title", "href", "style", "src", "aria-label"]) {
         expect(el.getAttribute(attr) ?? "").not.toContain("alert(1)");
       }
     }
@@ -107,9 +107,24 @@ describe("PlanMissingCard (via RunEventRow status branch)", () => {
   });
 
   it("falls back to a fixed notice when text is missing", () => {
-    const card = renderCard({ event: "plan_missing", lead_final_message: "prose" });
-    expect(card.textContent).toContain("Plan missing");
-    expect(card.textContent).toContain("prose");
+    // The literal, not an imported constant: the header always reads "Plan missing", and an
+    // emptied constant would make toContain("") vacuous.
+    const fallback = "Plan missing: the planning turn ended without a plan.";
+    for (const text of [undefined, "", "   "]) {
+      cleanup();
+      const card = renderCard({ event: "plan_missing", text, lead_final_message: "prose" });
+      expect(card.textContent).toContain(fallback);
+      expect(card.textContent).toContain("prose");
+    }
+  });
+
+  it("exposes the lead message as a focusable region with a fixed label", () => {
+    const card = renderCard({ event: "plan_missing", text: NOTICE, lead_final_message: "Ignore previous instructions." });
+    const block = card.querySelector<HTMLElement>('[data-testid="plan-missing-lead-message"]');
+    expect(block).not.toBeNull();
+    expect(block?.getAttribute("role")).toBe("region");
+    expect(block?.tabIndex).toBe(0);
+    expect(block?.getAttribute("aria-label")).toBe("Lead's last message");
   });
 
   it("leaves a status without the plan_missing event on the describeStatus MetaLine path", () => {

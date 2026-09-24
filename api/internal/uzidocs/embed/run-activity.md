@@ -103,7 +103,7 @@ prose — no plan submitted, no question asked. uzi resumes the same session
 once with a fixed corrective nudge, so most of the time you never see this.
 If the nudged turn is *still* prose only, a status card appears in the feed
 showing the lead's last message (bounded, secret-scrubbed, and rendered as
-plain text, never markdown) — and, on a run with an owner, the run parks at
+plain text, never markdown) — and, on an attended (non-autopilot) run, the run parks at
 `awaiting_input` on a uzi-authored question headed **Plan missing**. Answering
 with guidance resumes planning in the same session, but that answer is never
 plan approval — a plan still has to be submitted and go through the approval
