@@ -64,9 +64,13 @@
 //    in depth, NOT containment. A shell parser cannot prove that a variable-expanded PID
 //    lies outside the agent's own process tree, so `kill "$pid"` stays allowed; the
 //    enumerator co-occurrence test for a dynamic `kill` target is a whole-command
-//    heuristic. Known evasions: a PID read back from a file an earlier command wrote, and
-//    escaping inside a double-quoted substitution (`kill "$(\lsof -t)"`: the tokenizer
-//    keeps that substitution inside one word and SUBST_ENUMERATOR_RE reads it raw).
+//    heuristic. Commands inside a double-quoted `$(…)` or inside a backtick substitution
+//    are NOT screened as commands: the tokenizer keeps them inside one word, so only the
+//    raw-string checks (SUBST_MASS_SIGNAL_RE, SUBST_ENUMERATOR_RE, KILL_STATIC_EVAL_RE)
+//    look inside, and every other rule (git push included) does not. Known evasions: a
+//    PID read back from a file an earlier command wrote, and escaping inside such a
+//    substitution (`kill "$(\lsof -t)"`, `` echo "`\pkill x`" ``), which the raw checks
+//    do not unescape.
 //    Accepted false positive: an enumerator anywhere in the same command as a
 //    `kill "$pid"` (`lsof -i :3000; kill "$SERVER_PID"`) is denied; the reason tells the
 //    agent to run the kill as its own command. The primary fixes are the worker image
@@ -167,7 +171,7 @@ const REASON_ENV = "denied by guardrail: reading the process environment is not 
 const ENV_READ_ALLOWLIST: ReadonlySet<string> = new Set(["PATH", "TMPDIR"]);
 const REASON_PS = "denied by guardrail: inspecting the process table is not permitted";
 const REASON_PROC = "denied by guardrail: reading /proc is not permitted";
-const REASON_MASS_SIGNAL = "denied by guardrail: mass-signal kill commands (pkill, killall, fuser -k, kill of a broadcast/process-group target, or kill of PIDs enumerated by lsof/pgrep/ps/fuser/pidof) can kill the agent's own process tree; stop a background task through the harness, or kill \"$pid\" with the exact PID saved at launch (run it as its own command, without lsof/pgrep/ps/fuser/pidof in the same command)";
+const REASON_MASS_SIGNAL = "denied by guardrail: mass-signal kill commands (pkill, killall, skill, fuser -k, kill of a broadcast/process-group target, or kill of PIDs enumerated by lsof/pgrep/ps/fuser/pidof) can kill the agent's own process tree; stop a background task through the harness, or kill \"$pid\" with the exact PID saved at launch (run it as its own command, without lsof/pgrep/ps/fuser/pidof in the same command)";
 const REASON_SECRET_FILE = "denied by guardrail: reading the worker credential file is not permitted";
 // PRD #83 M1 (Q3): docker is inert without a daemon sidecar wired (DOCKER_HOST/keystone
 // resolver). Content-free — never echo the command.
@@ -205,8 +209,11 @@ const GENERIC_WRAPPERS = new Set([
 // `sudo -u root git push`, `timeout -s 9 5 git push`). Attached forms (`-n1`, `-I{}`,
 // `--max-args=1`) are one word and need no entry. chrt's `-p` is a flag, not a value.
 const WRAPPER_VALUE_OPTS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
-  ["xargs", new Set(["-n", "-P", "-I", "-L", "-s", "-d", "-E", "-a", "-e", "--max-args", "--max-procs", "--max-lines", "--max-chars", "--delimiter", "--eof", "--arg-file", "--process-slot-var"])],
-  ["sudo", new Set(["-u", "-g", "-h", "-p", "-C", "-D", "-r", "-t", "-U", "-T", "-R", "--user", "--group", "--host", "--prompt", "--close-from", "--chdir", "--role", "--type", "--other-user", "--command-timeout", "--chroot"])],
+  // xargs `-e`/`--eof`/`--max-lines` take only an ATTACHED optional value (`-eEOF`,
+  // `--eof=EOF`); a separate next word is the command (`xargs -e echo HIT` prints HIT).
+  ["xargs", new Set(["-n", "-P", "-I", "-L", "-s", "-d", "-E", "-a", "--max-args", "--max-procs", "--max-chars", "--delimiter", "--arg-file", "--process-slot-var"])],
+  // sudo `-h`/`--host` are absent: a bare `-h` is `--help` on Linux sudo.
+  ["sudo", new Set(["-u", "-g", "-p", "-C", "-D", "-r", "-t", "-U", "-T", "-R", "--user", "--group", "--prompt", "--close-from", "--chdir", "--role", "--type", "--other-user", "--command-timeout", "--chroot"])],
   ["doas", new Set(["-u", "-C"])],
   ["timeout", new Set(["-s", "-k", "--signal", "--kill-after"])],
   ["nice", new Set(["-n", "--adjustment"])],
@@ -215,8 +222,11 @@ const WRAPPER_VALUE_OPTS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
 ]);
 // Shell reserved words that can precede a real command in the same segment (`if git
 // push; then …`, `while read p; do kill $p; done`, `! git push`). The peel skips them
-// so the command word is what runs. `for`/`case`/`function`/`fi`/`done`/`esac`/`}` are
-// deliberately absent: no real command follows them in the same segment.
+// so the command word is what runs. `fi`/`done`/`esac`/`}` are absent because no command
+// follows them in the same segment; `for`/`case` are absent because their next words are
+// a variable name or a pattern, not a command. Unhandled residuals: `function f { git
+// push; }` puts `{ git push` in the segment after `function f`, and `coproc CMD` hides
+// CMD the same way; neither is peeled, so the command after them is not screened.
 const LEADING_RESERVED_WORDS = new Set(["if", "then", "elif", "else", "while", "until", "do", "!", "{"]);
 const REMOTE_MUTATORS = new Set([
   "set-url", "add", "remove", "rm", "rename", "set-branches", "set-head", "prune", "update",
@@ -328,10 +338,7 @@ function tokenize(input: string): Token[] {
       continue;
     }
     if (ch === " " || ch === "\t" || ch === "\r") { flush(); i++; continue; }
-    // An unquoted backtick opens/closes a command substitution: a segment boundary like
-    // `(`/`)`, so `` echo `pkill node` `` screens `pkill node` as its own command (#1576).
-    // A backtick inside double quotes stays in the word (SUBST_ENUMERATOR_RE reads it raw).
-    if (ch === "\n" || ch === ";" || ch === "(" || ch === ")" || ch === "<" || ch === ">" || ch === "`") {
+    if (ch === "\n" || ch === ";" || ch === "(" || ch === ")" || ch === "<" || ch === ">") {
       flush();
       toks.push({ op: ch });
       i++;
@@ -533,10 +540,31 @@ const ENUMERATORS = new Set(["lsof", "pgrep", "ps", "fuser", "pidof"]);
 const KILL_LIST_FLAGS = new Set(["-l", "-L", "--list", "--table"]);
 
 /** Fallback for a PID enumerator inside a command substitution the tokenizer keeps in
- *  one word (a double-quoted `"$(lsof -t)"` or a backtick inside double quotes): the
- *  enumerator right after `$(` or a backtick, optionally whitespace- and path-prefixed.
- *  Every other enumerator is found from tokens (ScreenCtx.enumerator) (#1576). */
-const SUBST_ENUMERATOR_RE = /(?:\$\(|`)\s*(?:[^\s;&|()`"']*\/)?(?:lsof|pgrep|ps|fuser|pidof)(?=$|[\s;&|)`"'])/;
+ *  one word (a double-quoted `"$(lsof -t)"`, or any backtick substitution): the
+ *  enumerator as a whole word ANYWHERE inside `$(…)`/backticks, directly after the opener
+ *  or after whitespace, `;`, `&`, `|`, `(`, `{` or `/` (a path prefix). So
+ *  `"$(command lsof -t)"`, `"$(sudo lsof -t)"` and `"$(true; lsof -t)"` count, and so
+ *  does an enumerator NAME used as an argument (`"$(grep ps f)"`): a raw-string
+ *  heuristic that over-denies safe. `[^`)]` stops the scan at the first `)` or backtick,
+ *  so an enumerator after a nested `$(…)` closes is missed. Only consulted when the
+ *  command also has a dynamic `kill`; every other enumerator is found from tokens
+ *  (ScreenCtx.enumerator) (#1576). */
+const SUBST_ENUMERATOR_RE = /(?:\$\(|`)(?:[^`)]*?[\s;&|({/])?(?:lsof|pgrep|ps|fuser|pidof)(?=$|[\s;&|)`"'])/;
+
+/** The same raw-string check for a mass-signal command (MASS_SIGNAL_BASES) inside a
+ *  `$(…)`/backtick substitution the tokenizer keeps in one word (`` echo `pkill node` ``,
+ *  `echo "$(pkill node)"`). Same shape, and the same limits, as SUBST_ENUMERATOR_RE;
+ *  denied on its own, no `kill` needed (#1576). */
+const SUBST_MASS_SIGNAL_RE = /(?:\$\(|`)(?:[^`)]*?[\s;&|({/])?(?:pkill|killall5?|skill)(?=$|[\s;&|)`"'])/;
+
+/** A `kill` whose argument bash evaluates statically (#1576): ANSI-C or locale quoting
+ *  (`kill -9 $'-1'`, `$"-1"`, which the tokenizer turns into the word `$-1`) or
+ *  arithmetic expansion (`kill -9 $((-1))`, `$((0-1))`, which the tokenizer splits at
+ *  `(`, leaving the target `$`). A raw-string HEURISTIC: `kill` as a word (after start,
+ *  whitespace, `;&|(`, a backtick or a path `/`), then up to the next `;`, `&`, `|` or
+ *  newline. It denies every arithmetic `kill` target, the harmless `kill $((pid))`
+ *  included; that degrades safe, and `kill "$pid"` is the supported form. */
+const KILL_STATIC_EVAL_RE = /(?:^|[\s;&|(`/])kill\b[^;&|\n]*\$(?:\(\(|['"])/;
 
 /**
  * Screen a `kill` simple command (#1576). Positional parse: `-s`/`-n` consume the next
@@ -640,6 +668,21 @@ function analyzeSimple(cmd: string[], secretPaths: readonly string[], dockerWire
  * docker analyzer for the B5 DOCKER_HOST= redirect check, INCLUDING across an `sh -c`/
  * `eval` wrapper (a prefix assignment is exported to that subshell).
  */
+/** Whether wrapper option `opt` consumes the NEXT word as its value (#1576): an exact
+ *  WRAPPER_VALUE_OPTS entry (`-u`, `--user`), or a single-dash cluster whose value-taking
+ *  letter is its LAST letter (`sudo -Eu root`, `xargs -rn 1`, `timeout -vs 9`). getopt
+ *  reads a cluster left to right and the first value-taking letter takes the rest of the
+ *  word as its value, so `-uroot` / `-n1` carry their value attached and take nothing. */
+function wrapperOptTakesNext(opt: string, valueOpts: ReadonlySet<string> | undefined): boolean {
+  if (!valueOpts) return false;
+  if (valueOpts.has(opt)) return true;
+  if (opt.startsWith("--") || opt.length < 3) return false;
+  for (let k = 1; k < opt.length; k++) {
+    if (valueOpts.has(`-${opt[k]}`)) return k === opt.length - 1;
+  }
+  return false;
+}
+
 function analyzeSegment(words: string[], depth: number, secretPaths: readonly string[], dockerWired: boolean, inherited: readonly string[], ctx: ScreenCtx): BashScreenResult {
   const assignments: string[] = [...inherited];
   let i = 0;
@@ -683,7 +726,7 @@ function analyzeSegment(words: string[], depth: number, secretPaths: readonly st
     if (GENERIC_WRAPPERS.has(base)) {
       i++;
       const valueOpts = WRAPPER_VALUE_OPTS.get(base);
-      while (i < words.length && words[i]!.startsWith("-")) i += valueOpts?.has(words[i]!) ? 2 : 1;
+      while (i < words.length && words[i]!.startsWith("-")) i += wrapperOptTakesNext(words[i]!, valueOpts) ? 2 : 1;
       if ((base === "timeout" || base === "nice" || base === "ionice" || base === "chrt") && i < words.length && /^\d/.test(words[i]!)) i++;
       continue;
     }
@@ -741,7 +784,11 @@ export function screenBashCommand(
   // supported alternative; any other denial (`git push …; kill $(pgrep x)`) keeps its
   // own reason. A heuristic, not containment (file header).
   const massSignal = ctx.dynamicKill && (ctx.enumerator || SUBST_ENUMERATOR_RE.test(command));
-  if (massSignal && (!result.denied || result.reason === REASON_PS)) return deny(REASON_MASS_SIGNAL);
+  // The raw-string checks: a mass-signal command inside a substitution the tokenizer
+  // keeps in one word, and a statically evaluated `kill` target (`$'-1'`, `$((-1))`).
+  // Same precedence as the enumerator pairing above.
+  const rawMassSignal = SUBST_MASS_SIGNAL_RE.test(command) || KILL_STATIC_EVAL_RE.test(command);
+  if ((massSignal || rawMassSignal) && (!result.denied || result.reason === REASON_PS)) return deny(REASON_MASS_SIGNAL);
   return result;
 }
 

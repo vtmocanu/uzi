@@ -324,7 +324,7 @@ describe("existing denies still fire on a wired docker worker (PRD #83 B3)", () 
 // "deny reasons carry the user-facing phrase" table below reaches it too.
 describe("mass-signal guardrail (#1576)", () => {
   const MASS_SIGNAL_REASON =
-    "denied by guardrail: mass-signal kill commands (pkill, killall, fuser -k, kill of a broadcast/process-group target, or kill of PIDs enumerated by lsof/pgrep/ps/fuser/pidof) can kill the agent's own process tree; stop a background task through the harness, or kill \"$pid\" with the exact PID saved at launch (run it as its own command, without lsof/pgrep/ps/fuser/pidof in the same command)";
+    "denied by guardrail: mass-signal kill commands (pkill, killall, skill, fuser -k, kill of a broadcast/process-group target, or kill of PIDs enumerated by lsof/pgrep/ps/fuser/pidof) can kill the agent's own process tree; stop a background task through the harness, or kill \"$pid\" with the exact PID saved at launch (run it as its own command, without lsof/pgrep/ps/fuser/pidof in the same command)";
 
   const DENIED_MASS = [
     "pkill -f vite",
@@ -372,12 +372,29 @@ describe("mass-signal guardrail (#1576)", () => {
     "\\lsof -ti :3000 | xargs kill",
     "kill $(pidof node)",
     "pidof node | xargs kill",
-    // An unquoted backtick is a segment boundary.
+    // A mass-signal command inside a backtick or double-quoted substitution, which the
+    // tokenizer keeps in one word: SUBST_MASS_SIGNAL_RE reads the raw string.
     "echo `pkill node`",
     "x=`killall node`",
+    'echo "$(pkill node)"',
+    'echo "`pkill node`"',
     "skill -KILL -u runner",
     // Pins the keep-scanning loop in screenWithDepth: the pgrep segment denies first.
     "pid=$(pgrep node); kill $pid",
+    // An enumerator anywhere inside a quoted substitution, not only right after `$(`.
+    'kill "$(command lsof -ti :3000)"',
+    'kill "$(sudo lsof -ti :3000)"',
+    'kill "$(true; lsof -ti :3000)"',
+    'kill "`command pgrep node`"',
+    // Clustered wrapper flags whose last letter takes the next word as its value.
+    "lsof -ti :3000 | xargs -rn 1 kill",
+    "lsof -ti :3000 | xargs -rI {} kill {}",
+    // xargs -e takes only an attached value, so `kill` is the command word.
+    "lsof -ti :3000 | xargs -e kill",
+    // Targets bash evaluates statically to -1 (KILL_STATIC_EVAL_RE).
+    "kill -9 $'-1'",
+    "kill -9 $((-1))",
+    "kill -9 $((0-1))",
   ];
   for (const cmd of DENIED_MASS) {
     it(`denies with the mass-signal reason: ${cmd}`, () => {
@@ -421,12 +438,43 @@ describe("mass-signal guardrail (#1576)", () => {
     assert.ok(r.reason?.includes("git push"), `unexpected reason: ${r.reason}`);
   });
 
-  // The wrapper-value and reserved-word peels tighten every rule, not only this one.
-  for (const cmd of ["sudo -u root git push origin x", "timeout -s 9 5 git push", "if true; then git push origin x; fi"]) {
-    it(`denies git push behind a wrapper option value or reserved word: ${cmd}`, () => {
+  // A statically evaluated arithmetic target is caught by a raw-string heuristic, so a
+  // harmless `kill $((pid))` is over-denied too (degrades safe; documented at the regex).
+  it("denies the harmless kill $((pid)) (accepted over-denial of the arithmetic heuristic)", () => {
+    assert.strictEqual(screenBashCommand("kill $((pid))").reason, MASS_SIGNAL_REASON);
+  });
+
+  // The wrapper-value and reserved-word peels reach every rule, not only this one.
+  for (const cmd of [
+    "sudo -u root git push origin x",
+    "timeout -s 9 5 git push",
+    "if true; then git push origin x; fi",
+    // Clustered short flags: the last letter takes the next word.
+    "sudo -Eu root git push",
+    "timeout -vs 9 5 git push",
+    // Options that take NO separate value must not swallow the command word
+    // (regression pins: base 613f1434 denied all of these).
+    "true | xargs -e git push --force",
+    "true | xargs --eof git push",
+    "true | xargs --max-lines git push origin HEAD:main",
+    "sudo -h git push --force",
+    // A backtick is a plain word character to the tokenizer, so push stays the
+    // subcommand after a backtick-substituted global option value.
+    "git -C `pwd` push",
+    "git -C `pwd` push --force origin main",
+    "git --git-dir `pwd`/.git push",
+  ]) {
+    it(`denies git push behind a wrapper option, reserved word or backtick: ${cmd}`, () => {
       const r = screenBashCommand(cmd);
       assert.strictEqual(r.denied, true, `expected denied for: ${cmd}`);
       assert.ok(r.reason?.includes("git push"), `unexpected reason: ${r.reason}`);
+    });
+  }
+
+  // Backticks in plain text (a commit message, a markdown heredoc body) are not commands.
+  for (const cmd of ['git commit -m "use `foo`"', "cat > notes.md <<'X'\nRun `npm test` first\nX"]) {
+    it(`allows backticks in plain text: ${JSON.stringify(cmd)}`, () => {
+      assert.strictEqual(screenBashCommand(cmd).denied, false, `expected allowed for: ${cmd}`);
     });
   }
 });
