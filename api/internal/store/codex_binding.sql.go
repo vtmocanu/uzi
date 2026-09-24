@@ -602,6 +602,117 @@ func (q *Queries) InsertCodexRefreshIntent(ctx context.Context, arg InsertCodexR
 	return i, err
 }
 
+const listCodexAccountActionInputs = `-- name: ListCodexAccountActionInputs :many
+SELECT
+    r.id,
+    r.codex_secret_id,
+    r.codex_auth_mode,
+    r.codex_account_key,
+    r.codex_material_revision,
+    r.codex_account_revision,
+    r.codex_secret_label,
+    r.status,
+    us.kind                 AS bound_kind,
+    ccs.status              AS alias_status,
+    ccs.material_revision   AS current_material_revision,
+    ccs.provider_account_id AS alias_provider_account_id,
+    cpa.id                  AS account_id,
+    cpa.credential_revision AS current_credential_revision,
+    cpa.provider_user_id,
+    cpa.workspace_account_id,
+    cpa.coord_state         AS current_coord_state,
+    COALESCE(length(cpa.recovery_sealed) > 0
+             AND cpa.recovery_generation = cpa.generation, false)::boolean AS recovery_at_generation,
+    cpa.lease_deadline,
+    cpa.reauth_required
+FROM runs r
+LEFT JOIN user_secrets us
+    ON us.id = r.codex_secret_id AND us.user_id = r.user_id
+LEFT JOIN codex_credential_state ccs
+    ON ccs.user_secret_id = r.codex_secret_id AND ccs.user_id = r.user_id
+LEFT JOIN codex_provider_account cpa
+    ON cpa.id = ccs.provider_account_id AND cpa.user_id = r.user_id
+WHERE r.id = ANY($1::uuid[])
+  AND r.status = 'recovery_wait'
+  AND r.recovery_wait_cause = 'codex_account_unavailable'
+`
+
+type ListCodexAccountActionInputsRow struct {
+	ID                        uuid.UUID          `json:"id"`
+	CodexSecretID             pgtype.UUID        `json:"codex_secret_id"`
+	CodexAuthMode             pgtype.Text        `json:"codex_auth_mode"`
+	CodexAccountKey           pgtype.Text        `json:"codex_account_key"`
+	CodexMaterialRevision     pgtype.Int8        `json:"codex_material_revision"`
+	CodexAccountRevision      pgtype.Int8        `json:"codex_account_revision"`
+	CodexSecretLabel          pgtype.Text        `json:"codex_secret_label"`
+	Status                    string             `json:"status"`
+	BoundKind                 pgtype.Text        `json:"bound_kind"`
+	AliasStatus               pgtype.Text        `json:"alias_status"`
+	CurrentMaterialRevision   pgtype.Int8        `json:"current_material_revision"`
+	AliasProviderAccountID    pgtype.UUID        `json:"alias_provider_account_id"`
+	AccountID                 pgtype.UUID        `json:"account_id"`
+	CurrentCredentialRevision pgtype.Int8        `json:"current_credential_revision"`
+	ProviderUserID            pgtype.Text        `json:"provider_user_id"`
+	WorkspaceAccountID        pgtype.Text        `json:"workspace_account_id"`
+	CurrentCoordState         pgtype.Text        `json:"current_coord_state"`
+	RecoveryAtGeneration      bool               `json:"recovery_at_generation"`
+	LeaseDeadline             pgtype.Timestamptz `json:"lease_deadline"`
+	ReauthRequired            pgtype.Bool        `json:"reauth_required"`
+}
+
+// PRD #1590 D6: the read-time inputs of the derived codex_account_action, batched over one
+// page of run ids. A plain read with no locks: the action is display-only, never persisted,
+// and the promoter re-decides every run under its own locks. Only runs still held on
+// codex_account_unavailable come back, so a run that left the hold since the page read gets
+// no row (and no action). Every join is LEFT and owner-scoped (the joined alias, state and
+// account rows must belong to the run's own user): a deleted alias (codex_secret_id NULL),
+// a missing state row, and an alias linked to no account each come back with NULL columns
+// instead of dropping the run. The account is the alias's CURRENTLY linked one, the same join
+// as GetRunCodexAuthContext. The recovery slot is reduced to one boolean (material present at
+// the account's current generation, the survivor pass's promotion test), so no sealed
+// material leaves the database on this path. The label is the run's OWN snapshot
+// (runs.codex_secret_label), never the alias row's current label.
+func (q *Queries) ListCodexAccountActionInputs(ctx context.Context, runIds []uuid.UUID) ([]ListCodexAccountActionInputsRow, error) {
+	rows, err := q.db.Query(ctx, listCodexAccountActionInputs, runIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListCodexAccountActionInputsRow{}
+	for rows.Next() {
+		var i ListCodexAccountActionInputsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.CodexSecretID,
+			&i.CodexAuthMode,
+			&i.CodexAccountKey,
+			&i.CodexMaterialRevision,
+			&i.CodexAccountRevision,
+			&i.CodexSecretLabel,
+			&i.Status,
+			&i.BoundKind,
+			&i.AliasStatus,
+			&i.CurrentMaterialRevision,
+			&i.AliasProviderAccountID,
+			&i.AccountID,
+			&i.CurrentCredentialRevision,
+			&i.ProviderUserID,
+			&i.WorkspaceAccountID,
+			&i.CurrentCoordState,
+			&i.RecoveryAtGeneration,
+			&i.LeaseDeadline,
+			&i.ReauthRequired,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listUnresolvedCodexRefreshAccounts = `-- name: ListUnresolvedCodexRefreshAccounts :many
 SELECT cpa.id, cpa.user_id
 FROM codex_provider_account cpa

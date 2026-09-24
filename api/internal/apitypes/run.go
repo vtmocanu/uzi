@@ -676,6 +676,26 @@ type RunDTO struct {
 	// honestly (a newer server may ship a cause this client has not heard of), the same rule
 	// as RateLimitType.
 	RecoveryWaitCause *string `json:"recovery_wait_cause"`
+	// CodexAccountAction is what a run held on its Codex subscription account needs next
+	// (PRD #1590 D6). It is non-null only for a 'recovery_wait' run whose RecoveryWaitCause is
+	// "codex_account_unavailable", and is derived at read time from the run's frozen binding
+	// plus its alias and account rows; it is never persisted. Values:
+	//   - "reconciling": the account is quarantined but recovering on its own (recovery
+	//     material at its current generation, or a live lease);
+	//   - "relogin_required": the owner must log in again (also the fallback for any state
+	//     the next promoter tick will end, e.g. a deleted alias or a changed binding);
+	//   - "verifying_login": a new login is being verified;
+	//   - "resuming": the account is usable again and the run resumes on the next sweep tick.
+	// Null on a read whose derivation failed (best effort). Clients render an unrecognised
+	// value honestly, the same rule as RecoveryWaitCause. It is a closed enum and carries no
+	// account label or identity; the label travels only in CodexSecretLabel.
+	CodexAccountAction *string `json:"codex_account_action"`
+	// CodexSecretLabel is the run's OWN snapshotted Codex alias label (runs.codex_secret_label,
+	// frozen when the run bound its alias), shown next to CodexAccountAction so the owner knows
+	// which login to fix (PRD #1590 D6). It is non-null ONLY when CodexAccountAction is non-null,
+	// so no other run (and no admin list) gains a label from it, and it is never read from the
+	// alias row, so it can never name a different account. Null when the snapshot is empty.
+	CodexSecretLabel *string `json:"codex_secret_label"`
 	// RecoveryRetryNotBefore is when the server will promote a 'recovery_wait' run back to
 	// queued — the retry stamp the forge-park surface counts down to ("retry at HH:MM"). It is
 	// the recovery-park analog of RetryNotBefore (the usage-limit park's stamp) and is a

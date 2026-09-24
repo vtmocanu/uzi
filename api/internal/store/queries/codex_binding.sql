@@ -819,3 +819,49 @@ marked AS (
 )
 SELECT (SELECT count(*) FROM cleared)::bigint AS cleared,
        (SELECT count(*) FROM marked)::bigint  AS marked;
+
+-- name: ListCodexAccountActionInputs :many
+-- PRD #1590 D6: the read-time inputs of the derived codex_account_action, batched over one
+-- page of run ids. A plain read with no locks: the action is display-only, never persisted,
+-- and the promoter re-decides every run under its own locks. Only runs still held on
+-- codex_account_unavailable come back, so a run that left the hold since the page read gets
+-- no row (and no action). Every join is LEFT and owner-scoped (the joined alias, state and
+-- account rows must belong to the run's own user): a deleted alias (codex_secret_id NULL),
+-- a missing state row, and an alias linked to no account each come back with NULL columns
+-- instead of dropping the run. The account is the alias's CURRENTLY linked one, the same join
+-- as GetRunCodexAuthContext. The recovery slot is reduced to one boolean (material present at
+-- the account's current generation, the survivor pass's promotion test), so no sealed
+-- material leaves the database on this path. The label is the run's OWN snapshot
+-- (runs.codex_secret_label), never the alias row's current label.
+SELECT
+    r.id,
+    r.codex_secret_id,
+    r.codex_auth_mode,
+    r.codex_account_key,
+    r.codex_material_revision,
+    r.codex_account_revision,
+    r.codex_secret_label,
+    r.status,
+    us.kind                 AS bound_kind,
+    ccs.status              AS alias_status,
+    ccs.material_revision   AS current_material_revision,
+    ccs.provider_account_id AS alias_provider_account_id,
+    cpa.id                  AS account_id,
+    cpa.credential_revision AS current_credential_revision,
+    cpa.provider_user_id,
+    cpa.workspace_account_id,
+    cpa.coord_state         AS current_coord_state,
+    COALESCE(length(cpa.recovery_sealed) > 0
+             AND cpa.recovery_generation = cpa.generation, false)::boolean AS recovery_at_generation,
+    cpa.lease_deadline,
+    cpa.reauth_required
+FROM runs r
+LEFT JOIN user_secrets us
+    ON us.id = r.codex_secret_id AND us.user_id = r.user_id
+LEFT JOIN codex_credential_state ccs
+    ON ccs.user_secret_id = r.codex_secret_id AND ccs.user_id = r.user_id
+LEFT JOIN codex_provider_account cpa
+    ON cpa.id = ccs.provider_account_id AND cpa.user_id = r.user_id
+WHERE r.id = ANY(@run_ids::uuid[])
+  AND r.status = 'recovery_wait'
+  AND r.recovery_wait_cause = 'codex_account_unavailable';
