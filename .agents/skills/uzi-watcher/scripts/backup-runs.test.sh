@@ -268,7 +268,7 @@ echo "PASS case6: no worker binding refuses stale all-pod branch adoption"
 
 # A queued run has no clone to capture yet. Its status belongs in this cycle,
 # and the next cycle must still be free to capture work once it is claimed.
-L6_QUEUED="$(run_backup 6.queued queued-1)"
+run_backup 6.queued queued-1 >/dev/null  # status-only: read latest-attempt, not latest
 L6_QUEUED_ATTEMPT="$WORK/out.6.queued/latest-attempt"
 [ -f "$L6_QUEUED_ATTEMPT/issue-4242.run.json" ] || fail "queued: status missing"
 if rg --files "$L6_QUEUED_ATTEMPT" | grep -q '[.]tgz$'; then
