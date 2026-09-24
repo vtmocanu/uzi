@@ -464,6 +464,7 @@ export function isSignalToolName(name: unknown): boolean {
  *  untrusted-text sinks (web feed, Slack DM, CLI render), so they are clamped where
  *  they enter the worker rather than at each sink. */
 const MAX_QUESTIONS = 10;
+const MAX_RAW_QUESTION_ITEMS = 64;
 const MAX_OPTIONS = 10;
 const MAX_QUESTION_RUNES = 2000;
 const MAX_HEADER_RUNES = 60;
@@ -498,9 +499,9 @@ function clamp(s: string, n: number): string {
 function parseQuestions(raw: unknown, limit = MAX_QUESTIONS): AskUserQuestion[] {
   if (!Array.isArray(raw)) return [];
   const out: AskUserQuestion[] = [];
-  // Bound raw parsing per tool call while counting only valid questions toward
-  // the remaining frame capacity.
-  for (const item of raw.slice(0, MAX_QUESTIONS)) {
+  // Inspect at most 64 raw entries per call so malformed entries cannot displace
+  // valid questions inside that bound, while parser work stays bounded.
+  for (const item of raw.slice(0, MAX_RAW_QUESTION_ITEMS)) {
     if (out.length >= limit) break;
     const q = asRecord(item);
     if (!q) continue;
