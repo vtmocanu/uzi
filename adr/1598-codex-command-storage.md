@@ -53,38 +53,38 @@ delete what this issue produces:
   directory is.
 - On the already-verified, owner-checked inode it may add the missing owner
   rwx bits (e.g. 0555 becomes 0755) so it can traverse and unlink a Go module
-  cache's read-only directories as their owner — the chmod goes through the
+  cache's read-only directories as their owner: the chmod goes through the
   inode's own `/proc/self/fd/N` magic link (`addOwnerBits`), never the
   entry's own pathname, and the inode is re-checked against the same
   dev/ino/mode afterwards. This is what `os.RemoveAll` cannot do as the owner of a
   directory it made read-only.
 - Removal is bounded by a caller-supplied deadline; hitting it stops the walk
-  at the first failure and keeps whatever has not yet been removed — what the
-  walk already removed stays removed, nothing is rolled back — reporting
+  at the first failure and keeps whatever has not yet been removed (what the
+  walk already removed stays removed, nothing is rolled back), reporting
   "deadline" so a retry converges rather than blocking forever: the tree may
   be left partly removed; a later RemoveBy resumes and converges.
 
 ### Cleanup belongs to the supervisor, not cmdsandbox
 
-The `uzi-codex-supervisor` binary — already the trusted, statically linked,
+The `uzi-codex-supervisor` binary, already the trusted, statically linked,
 root-owned 0555 process-supervision anchor for the Codex launcher (see
-`agent/codex/supervisor/doc.go`) — now also owns the per-command tmp's whole
+`agent/codex/supervisor/doc.go`), now also owns the per-command tmp's whole
 lifecycle:
 
 - It creates `/tmp/uzi-codex-command-<token>` itself, before fork, through a
   no-follow fd on `/tmp`, and pins the directory's device/inode.
 - It holds `LOCK_EX` on that directory's fd (close-on-exec, so no descendant
-  inherits it) for its own lifetime — this is the liveness signal the startup
+  inherits it) for its own lifetime: this is the liveness signal the startup
   orphan reaper reads (below).
-- It removes the tmp only **after** a confirmed ECHILD+`__WALL` drain — the
+- It removes the tmp only **after** a confirmed ECHILD+`__WALL` drain (the
   same process-tree-empty proof the supervisor already established for its
-  core reap responsibility — and only within the drain's own deadline, via
+  core reap responsibility) and only within the drain's own deadline, via
   `internal/safetree` against the pinned fd. The outcome (`removed` or
   `retained`, with a fixed-word reason) is reported in the dispose evidence as
   `tmpCleanup`.
 
 **Why the supervisor and not cmdsandbox.** cmdsandbox is the thing that
-*executes inside* the tmp — it is scoped to one command's lifetime, has no
+*executes inside* the tmp; it is scoped to one command's lifetime, has no
 independent knowledge of when the command's whole process tree (including any
 detached grandchildren) is actually empty, and is not the process holding the
 liveness lock a startup reaper can check. The supervisor already computes the
@@ -92,12 +92,12 @@ ECHILD+`__WALL` drain proof for its unrelated core responsibility (confirming
 the tracked tree is empty before reporting `dispose`), so ownership of "is it
 safe to delete this tmp yet" falls out of a fact the supervisor already knows
 and cmdsandbox does not. cmdsandbox therefore only **adopts** the tmp the
-supervisor already created — it never creates or removes it. Any uid-10003
+supervisor already created; it never creates or removes it. Any uid-10003
 process can already delete the tmp's contents (and, without Landlock, the
 directory itself); the supervisor instead holds removal RESPONSIBILITY, not
 exclusive authority: it is the only process that knows the pin and holds the
 liveness lock, and it is the process that proves (ECHILD+`__WALL`) that no
-descendant remains before removing — so it, rather than a peer of the command
+descendant remains before removing, so it, rather than a peer of the command
 process it supervises, decides when removal is safe. When that proof fails
 (an unconfirmed drain, or a killed supervisor) descendants can outlive it and
 the tmp is left for the startup reaper. ("Root-owned 0555" describes the supervisor binary itself, not the
@@ -116,7 +116,7 @@ supervisor/holder being killed outright) needs a second sweep, run once at
 worker startup before any run is launched:
 
 - **A held flock always protects a directory from removal.** An *unlocked*
-  directory is only a **candidate** — the lock follows the supervisor or
+  directory is only a **candidate**: the lock follows the supervisor or
   holder process, not the command descendants that can outlive it (none of
   them inherits the close-on-exec lock fd), so an unlocked name is not proof
   of anything by itself.
@@ -126,12 +126,12 @@ worker startup before any run is launched:
   filesystem uid. The proof fails closed on every ambiguity it cannot
   resolve: a `hidepid`/`subset` proc mount option that could hide a matching
   process, a parse error reading `/proc/<pid>/status`, a scan that would
-  exceed its pid bound, and — critically — any listed pid vanishing between
+  exceed its pid bound, and, critically, any listed pid vanishing between
   being listed and being read (`maxProofScans = 5`: up to 5 scans in total,
   i.e. at most 4 retakes, before giving up). Every
   one of those outcomes means "retain", never "assume dead and remove".
 - **The reaper's own exemption is narrow and explicit.** Only the reaper's own
-  pid is excluded from the "is anyone still running as this uid" check — not
+  pid is excluded from the "is anyone still running as this uid" check: not
   its ancestors, because `setpriv` execs into the reaper as the same process
   rather than forking a child, so there genuinely is no ancestor running as
   the command uid to exempt.
@@ -139,8 +139,8 @@ worker startup before any run is launched:
   namespace was created.** The kernel allocates pids cyclically from the last
   allocated pid, so a wrap makes a freshly-created child's pid indistinguishable
   from a stale, already-scanned one. This holds for the reaper's one intended
-  call site — once, at worker startup, in a fresh container PID namespace,
-  before any run has launched anything — and would NOT hold if the reaper were
+  call site (once, at worker startup, in a fresh container PID namespace,
+  before any run has launched anything) and would NOT hold if the reaper were
   ever invoked mid-lifetime after arbitrarily many processes had already been
   forked and reaped. This is why the worker invokes the reaper only at
   startup, never on a timer or between runs.
@@ -152,8 +152,8 @@ addition to any the docker lane adds), `codex-cmd-cache` (mounted only into
 the `worker` container, never into seed-nix, dind-init or dind), prepared
 0700 owned by uid 10003 by the entrypoint, only under the uid split.
 
-- **Not the `/data` PVC.** The PVC holds durable, trusted state — the bare
-  repo, resume state, credentials-adjacent material — across pod restarts and
+- **Not the `/data` PVC.** The PVC holds durable, trusted state (the bare
+  repo, resume state, credentials-adjacent material) across pod restarts and
   reprovisions. A Go module/build cache produced by model-authorized commands
   has none of those properties: it is untrusted, per-run, and disposable, so
   persisting it durably would be paying a durability cost for data that is
@@ -196,11 +196,11 @@ attestation** from the worker: the holder removes its directory only when told
 `{"op":"release","drained":true}` with no `drained:false` at all before EOF;
 removal happens at EOF (sticky: once a `false` arrives, a later `true` cannot
 undo it). If the holder dies
-mid-run, later commands in that run simply get no cache (never a crash — the
+mid-run, later commands in that run simply get no cache (never a crash: the
 absence just means no cache reuse for the rest of that run), and
-`--remove-cache` — which trusts the worker's own attestation that every
+`--remove-cache`, which trusts the worker's own attestation that every
 command root using the cache has drained, taking no process-table proof of its
-own, since a held lock still means live — runs only once every root has
+own, since a held lock still means live, runs only once every root has
 drained.
 
 ### Trust statement
@@ -214,7 +214,7 @@ Landlock is unavailable (the best-effort degrade) is there no such isolation,
 and the cache must be treated as **untrusted**: no secret is ever written there, its
 contents are never reused across runs (each run gets a fresh random uuid
 directory and it is torn down at that run's end), and nothing that comes out
-of it is treated as trusted output — it is disposable build-tool cache
+of it is treated as trusted output: it is disposable build-tool cache
 content, nothing more.
 
 ### Requests deliberately unchanged
@@ -225,7 +225,7 @@ consumer of a worker pod's ephemeral-storage budget, but issue #1598 requires
 measuring a Go-heavy Codex run's actual peak and retention on hosted workers
 before that number can be picked correctly, and that hosted measurement is
 still pending. `e2e/codex-tmp-measure/` has landed, but it is a boundary-level
-proxy against the same primitives run outside a hosted worker — it cannot
+proxy against the same primitives run outside a hosted worker; it cannot
 measure a real hosted-worker Codex run, so the hosted measurement stays a
 pending post-deploy maintainer check. The proxy did measure a ~957 MiB
 per-run cache peak for one `go build`/`test` of `api/` on a cold cache, above
@@ -242,7 +242,7 @@ never a new failure mode.
 Both the plain and docker worker pod specs now render the `codex-cmd-cache`
 volume and mount unconditionally (the same rendered pod shape for every
 worker, split or not, so enabling the uid split later never forks the spec on
-this axis) — this changes every hosted worker's pod spec hash, so every hosted
+this axis); this changes every hosted worker's pod spec hash, so every hosted
 worker pod rolls exactly once on this change, gated the same way every other
 worker roll is: an idle worker rolls straight away, while a busy worker is
 cordoned and drained before `Recreate`, up to the configurable
@@ -255,22 +255,22 @@ no analogous emptyDir concept to add.
 
 ## Consequences and residuals
 
-- A retained cache — a `drained:false`, a bare EOF, a stdin error on the
-  holder, or a crashed run — stays on disk **until the next container start**,
+- A retained cache (a `drained:false`, a bare EOF, a stdin error on the
+  holder, or a crashed run) stays on disk **until the next container start**,
   when the startup orphan reaper's process-table proof allows it to be
   removed. It is never garbage-collected mid-lifetime.
 - Tmp removal that hits the drain deadline is reported "retained: deadline"
   and keeps its partial progress; the tree is picked up by the same startup
   reaper pass on the next container start.
 - The reaper's correctness depends on the PID-namespace pid-wrap assumption
-  holding — true at its one call site (worker startup, before any run), false
+  holding: true at its one call site (worker startup, before any run), false
   if it were ever invoked later in the container's lifetime.
 - Landlock isolation between two runs' caches is **best-effort**, not
   guaranteed: best-effort mode applies Landlock whenever the kernel offers it,
-  and only an unavailable kernel runs unconfined — only `required` mode then
+  and only an unavailable kernel runs unconfined; only `required` mode then
   refuses to run at all. This is why the cache is explicitly a
   non-trust-boundary (above), not an incidental gap.
-- **A command process in one run can kill another run's cache holder** — all
+- **A command process in one run can kill another run's cache holder**: all
   command roots share uid 10003, and nothing prevents one uid-10003 process
   from signalling another. This is an availability cost only (the victim
   run loses caching for its remainder, next commands simply re-populate a

@@ -1620,8 +1620,8 @@ runs, but it and the per-run cache are now removed (fd-safe, fail-closed)
 after the command drains or at run end, with leftovers reaped at startup, so
 they no longer accumulate the way they used to. Every Codex model-authorized
 command still gets a fresh `HOME=TMPDIR`, but the `uzi-codex-supervisor`
-binary — not `os.RemoveAll`, which cannot delete a Go module cache's read-only
-directories as their non-root owner — creates, liveness-locks, and removes
+binary (not `os.RemoveAll`, which cannot delete a Go module cache's read-only
+directories as their non-root owner) creates, liveness-locks, and removes
 that tmp through a dedicated fd-relative, no-follow tree-removal primitive
 (`internal/safetree`) once a confirmed drain proves it is safe. A worker-only
 emptyDir (in addition to any the docker lane adds), `codex-cmd-cache`
@@ -1630,7 +1630,7 @@ emptyDir (in addition to any the docker lane adds), `codex-cmd-cache`
 by a uid-10003 holder process for the run and released only on an attested
 drain; a startup orphan reaper (`--reap-orphans`) sweeps anything a crash or an
 unconfirmed drain left behind, gated on a kernel process-table proof that fails
-closed. The cache is a storage/performance boundary, not a trust boundary — see
+closed. The cache is a storage/performance boundary, not a trust boundary; see
 [ADR-1598](adr/1598-codex-command-storage.md) for the full mechanism, the
 supersession of `specs/ai.md`'s "only remaining emptyDir" sentence (the
 cache is a worker-only emptyDir in addition to any the docker lane adds),

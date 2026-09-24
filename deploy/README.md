@@ -604,7 +604,7 @@ The path mirrors `agent/src/git.ts`'s `runnerRoot` — if that root ever moves,
 
 **Codex command cache (issue #1598).** A worker pod also carries a worker-only
 `emptyDir` (in addition to any the docker lane adds), `codex-cmd-cache`
-(`/var/cache/uzi-codex-cmd`), mounted into the `worker` container only — never
+(`/var/cache/uzi-codex-cmd`), mounted into the `worker` container only: never
 into seed-nix, dind-init or dind. It holds one per-run directory
 (`GOMODCACHE`/`GOCACHE`/npm cache) for a run's Codex model-authorized
 commands, so they reuse a build cache instead of re-downloading every
