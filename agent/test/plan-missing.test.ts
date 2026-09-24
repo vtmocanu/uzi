@@ -1,7 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
-  LEAD_MESSAGE_SECRET_MARGIN,
   LEAD_TEXT_TAIL_KEEP,
   MAX_LEAD_FINAL_MESSAGE_LEN,
   PLAN_MISSING_QUESTION,
@@ -36,57 +35,44 @@ describe("boundLeadFinalMessage", () => {
     assert.ok(!boundLeadFinalMessage("z".repeat(MAX_LEAD_FINAL_MESSAGE_LEN)).startsWith(MARKER));
   });
 
-  it("processes only a bounded tail window of an arbitrarily long input", () => {
+  it("hands the redactor the complete sanitized input, so a secret far from the tail is redacted", () => {
+    const secret = "sekret-" + "fullinput-1593-" + "abcdefghijklmnop";
     const seen: number[] = [];
-    const redact = (s: string) => { seen.push(s.length); return s; };
-    boundLeadFinalMessage("w".repeat(2_000_000), redact);
-    assert.ok(seen.length > 0);
-    assert.ok(Math.max(...seen) <= MAX_LEAD_FINAL_MESSAGE_LEN + LEAD_MESSAGE_SECRET_MARGIN,
-      `the redactor saw ${Math.max(...seen)} chars`);
-  });
-
-  it("drops a secret split at the window's left edge, even when stripping shrinks the window", () => {
-    const secret = "sekret-" + "leftedge-1593-" + "abcdefghijklmnop";
-    const redact = (s: string) => s.split(secret).join("[REDACTED]");
-    const window = MAX_LEAD_FINAL_MESSAGE_LEN + LEAD_MESSAGE_SECRET_MARGIN;
-    // Only the secret's last 12 chars fall inside the window, and 2000 NULs (stripped) shrink
-    // what is left, so without an explicit left-edge drop the unmatched suffix would sit inside
-    // the cap.
-    const suffix = secret.slice(-12);
+    const redact = (s: string) => { seen.push(s.length); return s.split(secret).join("[REDACTED]"); };
     const tail = " the end";
-    const nuls = "\u0000".repeat(2000);
-    const text = "p".repeat(50) + secret + nuls + "f".repeat(window - suffix.length - nuls.length - tail.length) + tail;
+    const text = secret + "\u0000".repeat(10) + "w".repeat(200_000) + tail;
     const out = boundLeadFinalMessage(text, redact);
-    assert.ok(!out.includes(suffix), JSON.stringify(out.slice(0, 40)));
-    assert.ok(out.endsWith(tail));
+    assert.deepEqual(seen, [text.length - 10], "the redactor saw the whole input, NULs stripped");
     assert.ok(out.startsWith(MARKER));
-    // Degenerate: a window that is almost all stripped characters keeps only the marker.
-    const allNul = "p".repeat(50) + secret + "\u0000".repeat(window);
-    assert.equal(boundLeadFinalMessage(allNul, redact), MARKER);
+    assert.ok(out.endsWith(tail));
+    assert.ok(!out.includes("sekret-"));
   });
 
-  it("drops the tail of a ~3000-char JWT-shaped secret split at the window's left edge", () => {
-    // Pins LEAD_MESSAGE_SECRET_MARGIN against the longest secrets the redactor holds (Codex
-    // OAuth JWTs can run past 1024 chars). Clearly synthetic: a deterministic base64url-ish
-    // sequence assembled at runtime, so no token-shaped literal sits in source.
+  it("redacts a 5000-char secret that starts left of the old bounded window", () => {
+    // Regression: the bounder used to slice a tail window of cap + 4096 chars BEFORE
+    // redacting, so a secret longer than that margin, starting left of the window, left an
+    // unrecognisable suffix. Clearly synthetic: a deterministic base64url-ish sequence
+    // assembled at runtime, so no token-shaped literal sits in source.
     const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     const body = (n: number, seed: number) =>
       Array.from({ length: n }, (_, i) => alphabet[(i * 37 + seed * 11 + ((i * i) % 61)) % 64]).join("");
-    const secret = "eyJ" + body(197, 1) + "." + "eyJ" + body(2493, 2) + "." + body(302, 3);
-    assert.equal(secret.length, 3000);
+    const secret = body(5000, 4);
+    assert.equal(secret.length, 5000);
     const redact = makeTextRedactor([secret]);
-    const window = MAX_LEAD_FINAL_MESSAGE_LEN + LEAD_MESSAGE_SECRET_MARGIN;
-    const inside = 2500; // the secret's last 2500 chars sit just inside the window's left edge
+    // The old implementation's window: the cap (4000) plus its 4096-char secret margin.
+    const oldWindow = 4000 + 4096;
+    const inside = 4500; // 4500 of the secret's chars fall inside the old window, 500 left of it
     const tail = " the end";
-    const text = "p".repeat(50) + secret + "~".repeat(window - inside - tail.length) + tail;
-    assert.ok(text.length > window);
+    // A long prefix left of the secret keeps the redacted text over the cap, so it is cut.
+    const prefix = "p".repeat(1000);
+    const text = prefix + secret + "~".repeat(oldWindow - inside - tail.length) + tail;
+    assert.equal(text.length - (prefix.length + secret.length - inside), oldWindow);
     const out = boundLeadFinalMessage(text, redact);
     assert.ok(out.startsWith(MARKER));
     assert.ok(out.endsWith(tail));
-    const secretTail = secret.slice(-inside);
-    for (let i = 0; i + 16 <= secretTail.length; i++) {
-      const frag = secretTail.slice(i, i + 16);
-      assert.ok(!out.includes(frag), `a 16-char fragment of the secret's tail survived at offset ${i}`);
+    for (let i = 0; i + 16 <= secret.length; i++) {
+      const frag = secret.slice(i, i + 16);
+      assert.ok(!out.includes(frag), `a 16-char fragment of the secret survived at offset ${i}`);
     }
   });
 
@@ -134,8 +120,8 @@ describe("appendLeadTextTail", () => {
     assert.ok(acc.endsWith("chunk-199-" + "x".repeat(1000)));
     const big = appendLeadTextTail("", "y".repeat(LEAD_TEXT_TAIL_KEEP * 3) + "END");
     assert.ok(big.length <= LEAD_TEXT_TAIL_KEEP && big.endsWith("END"));
-    assert.ok(LEAD_TEXT_TAIL_KEEP >= MAX_LEAD_FINAL_MESSAGE_LEN + LEAD_MESSAGE_SECRET_MARGIN,
-      "the held tail covers the bounder's whole window");
+    assert.ok(LEAD_TEXT_TAIL_KEEP >= MAX_LEAD_FINAL_MESSAGE_LEN,
+      "the held tail covers the status card's cap");
   });
 });
 

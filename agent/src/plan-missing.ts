@@ -51,17 +51,9 @@ export const REASON_PLAN_MISSING =
 /** The cap on the lead's final message as carried on the status card, marker included. */
 export const MAX_LEAD_FINAL_MESSAGE_LEN = 4000;
 
-/** How many characters beyond the cap {@link boundLeadFinalMessage} reads, and how many it
- *  then discards from the left edge of that window, so a secret split by the window edge,
- *  whose surviving suffix the redactor cannot recognise, falls inside the discarded strip.
- *  Sized for the longest secret the redactor holds, not a typical API key: Codex OAuth
- *  access tokens (claim.secrets.codex and runtime-released tokens) are JWTs that can run
- *  past 1024 characters. A secret longer than this margin could leave its tail. */
-export const LEAD_MESSAGE_SECRET_MARGIN = 4096;
-
 /** How much of a turn's lead text an executor holds while collecting it (the most recent
- *  characters). Far above the bounder's window, so holding only this tail changes nothing
- *  the status card shows, while the executor never holds unbounded model output. */
+ *  characters). Far above the status card's cap, so holding only this tail changes nothing
+ *  the card shows, while the executor never holds unbounded model output. */
 export const LEAD_TEXT_TAIL_KEEP = 64 * 1024;
 
 const TRUNCATED_MARKER = "[truncated]…";
@@ -100,31 +92,24 @@ export function isProseOnlyPlanTurn(t: PlanTurnSignals): boolean {
 
 /**
  * Bound the lead's final message for the status card, keeping its TAIL (the end of the
- * turn's text, which is what "the lead's final message" means). The work is bounded by the
- * cap, never by the input:
+ * turn's text, which is what "the lead's final message" means):
  *
- *  1. Take a tail WINDOW of at most cap + {@link LEAD_MESSAGE_SECRET_MARGIN} characters.
- *  2. Strip NUL/unpaired surrogates and the control/format classes FIRST, so a secret split
- *     by an invisible character is reassembled before the redactor looks at it.
- *  3. Redact, so a secret straddling the final cut is replaced whole.
- *  4. Keep the last characters up to the cap, marker included. When step 1 cut the input,
- *     at least the margin is dropped from the window's left edge, discarding any secret
- *     fragment the window split (its suffix does not match the redactor). The kept tail
- *     never starts on the low half of a surrogate pair.
+ *  1. Strip NUL/unpaired surrogates and the control/format classes from the COMPLETE input,
+ *     so a secret split by an invisible character is reassembled before the redactor looks.
+ *  2. Redact the complete sanitized input, so a secret anywhere in it, of any length, is
+ *     replaced whole before anything is cut.
+ *  3. Keep the last characters up to the cap, marker included. The kept tail never starts
+ *     on the low half of a surrogate pair.
+ *
+ * What arrives depends on the caller: the SDK path passes the reducer's full lead text,
+ * the Codex path the most recent {@link LEAD_TEXT_TAIL_KEEP} characters collected by
+ * {@link appendLeadTextTail}.
  */
 export function boundLeadFinalMessage(text: string, redactText?: (s: string) => string): string {
-  const windowLen = MAX_LEAD_FINAL_MESSAGE_LEN + LEAD_MESSAGE_SECRET_MARGIN;
-  const windowCut = text.length > windowLen;
-  const window = windowCut ? text.slice(-windowLen) : text;
-  const clean = sanitizeText(window, emptyCounts()).replace(CONTROL_OR_FORMAT, "");
+  const clean = sanitizeText(text, emptyCounts()).replace(CONTROL_OR_FORMAT, "");
   const redacted = redactText ? redactText(clean) : clean;
-  if (!windowCut && redacted.length <= MAX_LEAD_FINAL_MESSAGE_LEN) return redacted;
-  const keep = Math.min(
-    MAX_LEAD_FINAL_MESSAGE_LEN - TRUNCATED_MARKER.length,
-    redacted.length - (windowCut ? LEAD_MESSAGE_SECRET_MARGIN : 0),
-  );
-  if (keep <= 0) return TRUNCATED_MARKER;
-  let start = redacted.length - keep;
+  if (redacted.length <= MAX_LEAD_FINAL_MESSAGE_LEN) return redacted;
+  let start = redacted.length - (MAX_LEAD_FINAL_MESSAGE_LEN - TRUNCATED_MARKER.length);
   if (isLowSurrogate(redacted.charCodeAt(start))) start += 1;
   return TRUNCATED_MARKER + redacted.slice(start);
 }
