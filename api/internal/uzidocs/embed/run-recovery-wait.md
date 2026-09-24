@@ -114,12 +114,13 @@ run still fails immediately (you're present to react to it), and so does a
 judge run (it's advisory).
 
 The run card, `uzi run get`, `uzi run list`/`uzi admin runs`, and the TUI
-board each name one of four states:
+board each name one of four states (a state this client does not recognise
+reads **Codex account unavailable**):
 
 - **Codex account is reconciling** — the account is repairing its login on
   its own. No action is needed; the run resumes automatically once it
   clears.
-- **Re-log in Codex credential "\<label\>"** — the account has no way back on
+- **Re-log in Codex credential \<label\> to continue** — the account has no way back on
   its own. Log in again in Settings, on the **same** credential — the same
   alias, the same ChatGPT account. Logging in with a different account does
   not resume the run (see below).
@@ -127,8 +128,8 @@ board each name one of four states:
   confirming the new login belongs to the same account before releasing
   anything.
 - **Codex account available again** — the account cleared; the run is going
-  back into the queue and will pick up where it left off, preferring the
-  worker that held its source.
+  back into the queue and will pick up where it left off. When the hold
+  began at claim time, it prefers the worker that held its source.
 
 A successful same-credential re-login re-admits the run: the activity feed
 records the re-admission, naming the credential and what changed.
@@ -141,11 +142,11 @@ cancel. Cancel works exactly as it does for any `recovery_wait` run.
 
 ### When it fails instead
 
-Logging in with a different ChatGPT account, or one whose credential
-revision has changed since the run started, does not resume the run: it
+Logging in with a different ChatGPT account does not resume the run: it
 fails with `credential_unavailable` and a reason naming the change. The
-same happens if the credential is deleted while the run waits. This PRD
-does not add Codex to `uzi run set-token`; a Codex subscription run whose
+same happens if the credential is deleted while the run waits, or if the
+account's credential revision no longer matches the one the run started
+with. `uzi run set-token` does not accept Codex credentials; a Codex subscription run whose
 credential is gone cannot be re-pointed at a different one, only
 cancelled and re-created.
 

@@ -1744,8 +1744,9 @@ A run's `status` (on `run get` and `run list`) is one of exactly **thirteen** va
   it on a capped backoff until it recovers or you cancel it — see [Recovering
   from a transient interruption](run-recovery-wait.md). A Codex subscription
   run can also park here because its account is quarantined or needs a fresh
-  login (cause `codex_account_unavailable`); unlike the timed parks above it
-  has no backoff or cap and resumes only when the account does — see [Codex
+  login (cause `codex_account_unavailable`); unlike the transient park it has
+  no backoff or cap, and it resumes when the account is usable again, or fails
+  if the run's credential binding changed — see [Codex
   account unavailable](run-recovery-wait.md#codex-account-unavailable).
 - `paused`: an owner-requested hold (`uzi run pause`), resumed on demand from
   the run page or `uzi run resume <id>`. See [Pausing and resuming a

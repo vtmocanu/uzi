@@ -43,7 +43,7 @@ hours of work, with a second custody hold left open. Quarantine is a correct saf
 failing the run on first sight of it was the defect.
 
 Recovering from that quarantine needs the owner to re-login. A re-login
-(`PATCH /api/secrets/codex-auth/{id}` → `BumpCodexMaterialRevision`) moves the alias to
+(`PATCH /api/me/secrets/codex_auth/{id}` → `BumpCodexMaterialRevision`) moves the alias to
 `staging`, bumps `material_revision` and clears the account link. The usage poller then
 verifies the new login and, via `installAndLink`, resolves the account by its full identity
 tuple: a same-identity login lands on the **same** account row, restored from quarantine by

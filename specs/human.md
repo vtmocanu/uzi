@@ -881,7 +881,7 @@ Tracked as GitHub issue vtmocanu/uzi#1590; PRD at `prds/1590-codex-quarantine-cl
 - A Codex subscription run whose account is quarantined or needs a re-login is held (`recovery_wait`), never failed for that; chat and judge runs keep failing. (AI-synced 2026-09-24)
 - The hold has no automatic expiry; it ends by resuming, by owner cancel, or by a binding change. (AI-synced 2026-09-24)
 - A held run resumes by itself once the account is usable, including after a re-login on the same credential that resolves to the same Codex identity. (AI-synced 2026-09-24)
-- A re-login that changes the binding (different identity or credential revision, changed auth mode, deleted credential) fails the run `credential_unavailable`. (AI-synced 2026-09-24)
+- A binding change (the re-login resolved to a different identity, the credential was deleted, or the account credential revision or auth mode no longer matches) fails the run `credential_unavailable`. (AI-synced 2026-09-24)
 - The owner sees why the run is held and what to do next (reconciling, re-log in the named credential, verifying the new login, resuming) on the web, CLI and TUI. (AI-synced 2026-09-24)
 
 ## Startup admin seed
