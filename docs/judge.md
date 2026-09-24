@@ -9,10 +9,12 @@ audience: user
 With the run judge on, every one of your **finished** runs gets a
 retrospective: an LLM reads the run's trace (agents, tools, plan, review
 cycles, delivery) and produces a verdict plus structured recommendations —
-never code changes, only advice. It runs on **your own Anthropic token** —
-your default one, a token you name for the judge lane specifically, or
-auto-selected from your token pool — so it's opt-in and off by default; your
-instance admin also has to enable it globally first.
+never code changes, only advice. It's opt-in and off by default; your
+instance admin also has to enable it globally first. The judge always
+inherits the reviewed run's own harness: a Claude run is judged on **your
+own Anthropic token** — your default one, a token you name for the judge
+lane specifically, or auto-selected from your token pool — and a Codex run
+is judged on the Codex credential frozen onto it at creation.
 
 ## 1. Enable it
 
@@ -56,6 +58,11 @@ see the next section.
 
 ## Which token the judge spends
 
+**This picker covers Claude judge runs only.** A Codex run's judge always
+spends the Codex credential frozen onto that run at creation — the same
+credential the run itself used — with no separate judge-lane pick; the
+picker below never applies to it.
+
 By default the judge auto-selects from your Anthropic [token
 pool](./anthropic-token.md#letting-uzi-pick-the-token-auto-selection). If you
 hold more than one token, **Settings → Run judge** offers a **Token the judge
@@ -64,12 +71,14 @@ specifically, or **Auto-select from the pool** — so retrospectives can bill a
 different account from the work they review (a cheaper console key for the
 reviewing, a subscription for the runs).
 
-The picker also covers uzi's **self-improvement** runs, for the same reason:
-they are uzi reviewing and improving itself, not work you asked a particular
-worker to do, so they follow the judge's credential rather than the claiming
-worker's. Everything else — issue runs, autopilot, CI-fix, chat — is unaffected
-by this setting. Leave it on **your default token** to keep everything on one
-account.
+The picker also covers uzi's **self-improvement** runs that resolve to the
+Claude harness, for the same reason: they are uzi reviewing and improving
+itself, not work you asked a particular worker to do, so they follow the
+judge's credential rather than the claiming worker's. A self-improvement run
+that resolves to Codex instead spends your Codex credential, unaffected by
+this picker, the same as any other Codex run. Everything else — issue runs,
+autopilot, CI-fix, chat — is unaffected by this setting. Leave it on **your
+default token** to keep everything on one account.
 
 **Auto-select from the pool** picks whichever pooled token has the most
 rate-limit headroom, same as an auto worker. It differs from a worker in one
@@ -79,6 +88,13 @@ empty pool it spends your default token instead, so finished runs never pile
 up waiting on a judge that can't run.
 
 ## Which model it runs on
+
+**The Judge model picker below is Claude-only too.** A Codex judge's model
+follows [your Codex worker model](./worker-model.md), the same as an
+ordinary Codex run: `gpt-6-astra` unless you've set your own Codex worker
+model default. If your Judge model picks a Claude alias, a Codex run's
+judge drops it and falls back to your Codex default instead, with a visible
+note on the run — a Claude model can never reach a Codex judge call.
 
 The instance default is **opus** — the strongest model, since the judge's
 recommendations feed the [self-improvement job](./scheduling.md#default-jobs)

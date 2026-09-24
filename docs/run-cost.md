@@ -47,6 +47,31 @@ and the measured under-count it replaced, and
 [ADR-1562](../adr/1562-run-usage-session-cumulative-basis.md) for the
 session-cumulative fold and what it does not backfill.
 
+## Metered, subscription, and unreported cost
+
+Not every run's cost is a real dollar figure. Each run's folded `run_usage`
+row carries a `cost_status` of `metered`, `subscription`, or `unreported`,
+and every reader (the run page, `uzi run list`, `/api/usage`, the admin
+usage pages) branches on that status rather than guessing from `cost_usd`
+alone.
+
+A Claude run is always `metered`: the SDK reports a dollar figure per
+call, folded exactly as described above. A Codex run's status instead
+follows the credential mode the run is bound to: an OpenAI **API key** run
+is `metered` from OpenAI's own price table, with `unreported` as the safe
+fallback when the model has no price row (e.g. an unrecognized custom
+Codex model); a **subscription** Codex login has no per-token charge at
+all, so every one of its runs is `subscription`, cost pinned to $0.
+
+The UI never renders a non-metered run as a bare "$0" or dash, since that
+would be ambiguous with a real zero-cost metered call. It spells the status
+out instead: a headline of "Subscription" or "Unavailable" (in place of a
+dollar figure), a sub-label like "subscription usage · no metered cost" or
+"tokens only · cost unavailable", and a dense table cell of `sub` or `n/a`.
+An aggregate (Self usage, Admin usage) totals only the metered subset and
+discloses what it left out, e.g. "Cost excludes 2 Codex subscription runs
+and 1 unreported run".
+
 ## The model tier is not the difference
 
 `override_subagent_model` (added by migration `00119_schedule_run_override_subagent_model.sql`,

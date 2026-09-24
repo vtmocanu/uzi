@@ -170,6 +170,27 @@ reference](./cli.md#commands)) or in the web schedule modal.
 - **CLI**: `uzi schedule create | list | get | pause | resume | run-now |
   delete` — see [the CLI reference](./cli.md#commands) for the full flag list.
 
+### Which harness a schedule runs on
+
+A schedule either **pins** a harness (Claude or Codex) or leaves it
+**unpinned**. Pin it with the modal's "Harness for this schedule" picker
+(shown only when you hold a usable credential for both harnesses) or with
+`uzi schedule create/edit --harness claude|codex`; `--harness ""` clears the
+pin.
+
+- **Unpinned** (the default): each fire resolves the harness afresh, the same
+  way a manual start does — your default harness if its credential is usable,
+  otherwise whichever harness you have a usable credential for, Claude if
+  both. If neither is usable, the fire records the `no_usable_credential`
+  skip (see [Fire outcomes](#fire-outcomes)).
+- **Pinned**: every fire uses that harness and never falls back to the
+  other. If its credential is missing or unusable, the fire starts nothing,
+  records no outcome and does not advance; it retries each tick until the
+  credential is usable again or you change the pin.
+
+Each run a fire starts records the harness it actually ran on, shown on the
+run.
+
 ### Running a schedule on several repos
 
 Creating a custom schedule can target more than one repo at once: the "New
@@ -288,6 +309,11 @@ exceed `max_issues` once backfill walks past a skip), which ones
   came due, so nothing started. It's benign and self-resolving: the
   schedule's cadence advances normally and re-fires on schedule next time,
   and nothing replays on resume.
+- `no_usable_credential` — neither harness has a usable credential for the
+  owner (no Anthropic token and no usable Codex login), and the fire has no
+  explicit harness pin forcing one. It's benign: the schedule's cadence
+  advances normally and re-fires next time, once the owner configures a
+  usable credential for either harness.
 
 `examined == started + skipped` always holds — every candidate the fire
 reaches lands in exactly one bucket, so the tally never silently drops one.

@@ -1542,7 +1542,11 @@ on.
   floor) reaching only `cache.nixos.org`, the forge (derived from
   `FORGE_ALLOWED_BASE_URLS` through one chart value `forge.allowedBaseURLs`, since
   [PRD #808](prds/done/808-worker-egress-single-source.md), so the SSRF allowlist
-  and the FQDN list cannot drift), `*.anthropic.com`, `search.devbox.sh`,
+  and the FQDN list cannot drift), `*.anthropic.com`, `api.openai.com`,
+  `chatgpt.com` and `auth.openai.com` (the Codex API, ChatGPT-subscription
+  backend and OpenAI auth host, PRD #1106 D12 — fleet-wide once shipped, since
+  the allowlist is a namespace-level policy with no per-harness split, so a
+  worker that only ever runs Claude still carries these three), `search.devbox.sh`,
   `api.github.com` (the devbox/nixpkgs resolver host), and the CNPG chart's OCI pair
   (`ghcr.io` + `pkg-containers.githubusercontent.com`); `codeload.github.com` stays
   **off**-allowlist there (**TIMEOUT**). The **docker** tier reaches arbitrary
@@ -1612,7 +1616,12 @@ active and Landlock is usable under the configured mode; otherwise it never
 claims a Codex-indicating run, which stays queued instead. See
 [PRD #1493](prds/1493-codex-k8s-uid-split-profile.md) for the full design and
 Decision Log, and [docs/configuration.md](docs/configuration.md#controller)
-for the operator-facing knobs.
+for the operator-facing knobs. See [ADR-1106](adr/1106-codex-harness.md) for
+the Codex harness's own execution design (the app-server architecture,
+capability owners, and the untrusted-construction boundary the uid split
+exists to satisfy), and [ADR-0285](adr/0285-worker-egress-tier-trust-model.md)
+for the two-tier egress trust model the Codex hosts above (restricted-tier
+allowlist) were added against.
 
 **A Codex command's tmp and cache no longer accumulate in the writable layer,
 and removal is owned by the trusted supervisor, not the command itself.** The
