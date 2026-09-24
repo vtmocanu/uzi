@@ -127,6 +127,9 @@ interface Ctl {
   nextOutcome: () => Promise<string>;
   outcomes: string[];
   armed: () => boolean;
+  /** Resolves once every tick this control STARTED has reported its outcome (i.e. no tick is in
+   *  flight); rejects after `ms`. */
+  settled: (ms: number) => Promise<void>;
   hooks: NonNullable<RunnerOptions["checkpointTestHooks"]>;
   pids: number[];
   spawned: string[][];
@@ -140,6 +143,11 @@ function control(extraHooks: Partial<NonNullable<RunnerOptions["checkpointTestHo
   const waiters: Array<{ n: number; resolve: (o: string) => void }> = [];
   const pids: number[] = [];
   const spawned: string[][] = [];
+  // Ticks this control STARTED. The runner reports exactly one outcome per started tick, clears its
+  // in-flight marker synchronously just before reporting it, and starts nothing on a fire while a
+  // tick is in flight (the timer is only armed while the ticker is not stopped). So a tick is in
+  // flight exactly while `started > outcomes.length`, and a fire starts one iff none is.
+  let started = 0;
   const onOutcome = (o: string): void => {
     outcomes.push(o);
     for (const w of waiters.slice()) {
@@ -184,11 +192,14 @@ function control(extraHooks: Partial<NonNullable<RunnerOptions["checkpointTestHo
     fireNoWait: () => {
       const cb = tickCb;
       assert.ok(cb, "the tick timer is armed");
+      const starts = started === outcomes.length;
       cb();
+      if (starts) started++;
     },
     nextOutcome: () => waitIdx(outcomes.length),
     outcomes,
     armed: () => tickCb !== undefined,
+    settled: (ms) => waitFor(() => outcomes.length >= started, ms),
     pids,
     spawned,
     hooks: {
@@ -232,8 +243,19 @@ function stubPublish(
   };
 }
 
-/** A publish that hangs until its signal aborts, then rejects like an aborted fetch. */
+/** A publish that hangs until its signal aborts, then rejects like an aborted fetch.
+ *
+ *  It stops being the pack's consumer while the pack-objects child may still be running, so it
+ *  keeps an `error` listener on the pack for good. The abort SIGTERMs that child; a child killed by
+ *  a signal completes with code 128, and GitCache.spawnGit then destroys the pack with
+ *  `git pack-objects --revs --stdout exited 128`. That destroy reaches the stream only when the
+ *  child's `exit` is delivered BEFORE its stdout reaches EOF. On Linux EOF was observed to arrive
+ *  first, so the destroy is a no-op there. When `exit` comes first (forced on Linux by leaving a
+ *  SIGTERM-ignoring grandchild holding stdout; the macOS `exited 128` failures fit the same
+ *  ordering), the destroy emits an `error` nobody listens for and the test fails with an uncaught
+ *  exception. */
 async function hangUntilAborted(pack: Readable, signal?: AbortSignal): Promise<never> {
+  pack.on("error", () => undefined);
   pack.resume();
   await waitAbort(signal!);
   const e = new Error("publish aborted");
@@ -270,8 +292,13 @@ function mkRunner(
  *  (the runner catches it), so every such error is recorded here and the afterEach below fails the
  *  test on it (review item 1) — in addition to the explicit finalStatus checks. */
 const turnErrors: unknown[] = [];
+/** Failures of {@link settleAndClean} (a runner or tick that did not settle, a tick child still
+ *  alive after settlement). Reported from the afterEach below rather than thrown from a test's
+ *  `finally`, so they never replace the test's own assertion error: node:test keeps the first
+ *  error a test records. */
+const teardownErrors: unknown[] = [];
 afterEach(() => {
-  const errs = turnErrors.splice(0);
+  const errs = [...turnErrors.splice(0), ...teardownErrors.splice(0)];
   if (errs.length > 0) throw errs[0];
 });
 
@@ -358,6 +385,95 @@ async function waitFor(pred: () => boolean, ms = 5_000): Promise<void> {
   while (!pred()) {
     if (Date.now() > deadline) throw new Error("waitFor timed out");
     await sleepMs(10);
+  }
+}
+
+/** How long teardown waits for each phase: execute() resolving, tick settlement, child death. */
+const TEARDOWN_MS = 20_000;
+
+async function bounded<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
+  let t: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      p,
+      new Promise<never>((_, reject) => {
+        t = setTimeout(() => reject(new Error(`teardown: ${what} did not happen within ${ms}ms`)), ms);
+      }),
+    ]);
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+/** True while the process group `pgid` has any member. */
+function groupAlive(pgid: number): boolean {
+  try {
+    process.kill(-pgid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** SIGKILL each pid's process group, then the pid itself (ESRCH ignored), and wait for them to go. A
+ *  pid whose leader and group are both already gone is skipped; that narrows, but does not remove,
+ *  the chance of signalling a pid the OS has since reused. */
+async function killAndReap(pids: readonly number[]): Promise<void> {
+  const live = pids.filter((pid) => isAlive(pid) || groupAlive(pid));
+  for (const pid of live) {
+    for (const target of [-pid, pid]) {
+      try {
+        process.kill(target, "SIGKILL");
+      } catch {
+        /* ESRCH: already gone */
+      }
+    }
+  }
+  await waitFor(() => live.every((pid) => !isAlive(pid) && !groupAlive(pid)), TEARDOWN_MS);
+}
+
+/**
+ * The teardown every runner-driven test with a tick runs in its `finally`, BEFORE any temp dir it
+ * (or the harness afterEach, via fx.cleanup) removes is gone:
+ *   1. shut down `runners` and await every `running` execute() promise (a rejection is fine);
+ *   2. await `ctl.settled()`: no tick is in flight;
+ *   3. every tick child (a group leader) must be dead by now, and a live one is reported as a
+ *      failure; any leader or group still alive is SIGKILLed and waited for, so no child outlives
+ *      the test;
+ *   4. `restore` the publish stub, then remove `paths` (both happen even if a phase above failed).
+ * A failed phase is recorded in teardownErrors, never thrown, so it cannot mask the test's own error.
+ */
+async function settleAndClean(spec: {
+  ctl?: Ctl;
+  runners?: ReadonlyArray<{ shutdown: () => void }>;
+  running?: ReadonlyArray<Promise<unknown> | undefined>;
+  restore?: () => void;
+  paths?: readonly string[];
+}): Promise<void> {
+  try {
+    try {
+      for (const r of spec.runners ?? []) r.shutdown();
+      await bounded(
+        Promise.all((spec.running ?? []).map((p) => p?.catch(() => undefined))),
+        TEARDOWN_MS,
+        "the runner's execute()",
+      );
+      await spec.ctl?.settled(TEARDOWN_MS).catch((e: unknown) => {
+        throw new Error(`teardown: a started tick never reported its outcome (${String(e)})`);
+      });
+    } catch (e) {
+      teardownErrors.push(e);
+    }
+    if (spec.ctl) {
+      // Settlement is defined on the group LEADER (tick-spawner.ts: `completed` resolves once the
+      // leader exited), so only a live leader is a failure; group stragglers are just reaped below.
+      const alive = spec.ctl.pids.filter(isAlive);
+      if (alive.length > 0) teardownErrors.push(new Error(`teardown: tick child pid(s) ${alive.join(", ")} outlived settlement`));
+      await killAndReap(spec.ctl.pids).catch((e: unknown) => teardownErrors.push(e));
+    }
+  } finally {
+    spec.restore?.();
+    for (const p of spec.paths ?? []) fs.rmSync(p, { recursive: true, force: true });
   }
 }
 
@@ -553,8 +669,9 @@ describe("mid-turn checkpoint tick (issue #1597 M2)", () => {
     });
     const claim = gitlabClaim(1597_205);
     const t0 = Date.now();
+    let running: Promise<unknown> | undefined;
     try {
-      await mkRunner(
+      running = mkRunner(
         mkGit(fx.dataDir, shim),
         turn(async (ctx) => {
           commitIn(ctx.worktreePath, "H.txt", "h\n");
@@ -564,14 +681,14 @@ describe("mid-turn checkpoint tick (issue #1597 M2)", () => {
         }),
         ctl,
       ).execute(claim);
+      await running;
       assert.deepEqual(ctl.outcomes, ["aborted"]);
       assert.equal(pub.count(), 1);
       assert.ok(Date.now() - t0 < 20_000, "teardown did not wait out the hang");
       assert.equal(finalStatus(claim.run_id), "completed");
       assert.ok(!statusTexts(claim.run_id).some((t) => t.startsWith("checkpoint publish failed")), "an abort is silent");
     } finally {
-      pub.restore();
-      fs.rmSync(tmp, { recursive: true, force: true });
+      await settleAndClean({ ctl, running: [running], restore: pub.restore, paths: [tmp] });
     }
   });
 
@@ -826,8 +943,9 @@ describe("mid-turn checkpoint tick (issue #1597 M2)", () => {
     const claim = gitlabClaim(1597_211);
     let parked: boolean | undefined;
     let headSubject = "";
+    let running: Promise<unknown> | undefined;
     try {
-      await mkRunner(
+      running = mkRunner(
         mkGit(fx.dataDir, shim),
         turn(async (ctx) => {
           commitIn(ctx.worktreePath, "G.txt", "g\n");
@@ -837,14 +955,14 @@ describe("mid-turn checkpoint tick (issue #1597 M2)", () => {
         }),
         ctl,
       ).execute(claim);
+      await running;
       assert.equal(finalStatus(claim.run_id), "completed");
       assert.equal(parked, false);
       assert.equal(headSubject.startsWith("wip(park):"), false, "the marker was undone");
       assert.equal(tickOutcome, "gate_busy");
       assert.equal(pub.count(), 1, "only the pause's own publish ran — the tick never published the marker");
     } finally {
-      pub.restore();
-      fs.rmSync(tmp, { recursive: true, force: true });
+      await settleAndClean({ ctl, running: [running], restore: pub.restore, paths: [tmp] });
     }
   });
 
@@ -869,8 +987,9 @@ describe("mid-turn checkpoint tick (issue #1597 M2)", () => {
       return LANDED;
     });
     const claim = gitlabClaim(1597_212);
+    let running: Promise<unknown> | undefined;
     try {
-      await mkRunner(
+      running = mkRunner(
         mkGit(fx.dataDir, shim),
         turn(async (ctx) => {
           commitIn(ctx.worktreePath, "P.txt", "p\n");
@@ -882,6 +1001,7 @@ describe("mid-turn checkpoint tick (issue #1597 M2)", () => {
         }),
         ctl,
       ).execute(claim);
+      await running;
       assert.deepEqual(events, [
         "tick:publish",
         "tick:publish-aborted",
@@ -889,8 +1009,7 @@ describe("mid-turn checkpoint tick (issue #1597 M2)", () => {
         "milestone:done (tick outcome: aborted)",
       ]);
     } finally {
-      pub.restore();
-      fs.rmSync(tmp, { recursive: true, force: true });
+      await settleAndClean({ ctl, running: [running], restore: pub.restore, paths: [tmp] });
     }
   });
 });
@@ -948,8 +1067,9 @@ async function quiescence(iid: number, stuck: Stuck, teardown: "turn_end" | "shu
   const factory = teardown === "turn_end" ? turn(body) : blockingTurn(body);
   const runner = mkRunner(g, factory, ctl);
   const started = Date.now();
+  let p: Promise<unknown> | undefined;
   try {
-    const p = runner.execute(claim);
+    p = runner.execute(claim);
     if (teardown === "shutdown") {
       await waitFor(() => sha !== "" && (stuck !== "fetch_child" || isReady(hang)));
       if (stuck === "publish") await stuckIn.promise;
@@ -980,8 +1100,7 @@ async function quiescence(iid: number, stuck: Stuck, teardown: "turn_end" | "shu
     }
   } finally {
     releaseLock?.();
-    pub.restore();
-    fs.rmSync(tmp, { recursive: true, force: true });
+    await settleAndClean({ ctl, runners: [runner], running: [p], restore: pub.restore, paths: [tmp] });
   }
 }
 
@@ -1005,8 +1124,16 @@ describe("mid-turn checkpoint quiescence (issue #1597 M2)", () => {
 
 // ── (i) lock ownership ──────────────────────────────────────────────────────────────────────
 
+/** Proven-ownership lock removal, and the `foreign` / `inode_mismatch` reasons for a SIGKILLed
+ *  child, need the /proc fd evidence tick-spawner.ts reads only on Linux. Elsewhere every such lock
+ *  is retained as `no_proc_evidence`, by design, so these cases do not apply. */
+const NEEDS_PROC: string | false =
+  process.platform !== "linux"
+    ? "lock-ownership proof reads /proc (Linux only); non-Linux retains every lock as no_proc_evidence by design"
+    : false;
+
 describe("mid-turn checkpoint lock custody (issue #1597 M2)", () => {
-  it("(i) proven-owned: the SIGKILLed fetch child's own refs/uzi-runner lock is removed and the next fetch-back works", async () => {
+  it("(i) proven-owned: the SIGKILLed fetch child's own refs/uzi-runner lock is removed and the next fetch-back works", { skip: NEEDS_PROC }, async () => {
     const tmp = scratchDir("owned");
     const shim = writeShim(tmp, "detect");
     const iid = 1597_230;
@@ -1024,8 +1151,10 @@ describe("mid-turn checkpoint lock custody (issue #1597 M2)", () => {
     const lines = rawLines as Array<Record<string, unknown>>;
     const claim = gitlabClaim(iid);
     let sha = "";
+    let runner: RunRunner | undefined;
+    let p: Promise<unknown> | undefined;
     try {
-      const runner = mkRunner(
+      runner = mkRunner(
         g,
         blockingTurn(async (ctx) => {
           sha = commitIn(ctx.worktreePath, "I.txt", "i\n");
@@ -1037,7 +1166,7 @@ describe("mid-turn checkpoint lock custody (issue #1597 M2)", () => {
         {},
         logger,
       );
-      const p = runner.execute(claim);
+      p = runner.execute(claim);
       await waitFor(() => fs.existsSync(lock));
       runner.shutdown();
       await p;
@@ -1047,12 +1176,11 @@ describe("mid-turn checkpoint lock custody (issue #1597 M2)", () => {
       assert.equal(refOr(bare, `refs/uzi-runner/${branch}`), sha, "the shutdown fetch-back then worked");
       assert.ok(statusTexts(claim.run_id).includes("shutdown checkpoint published to origin"));
     } finally {
-      pub.restore();
-      fs.rmSync(tmp, { recursive: true, force: true });
+      await settleAndClean({ ctl, runners: runner ? [runner] : [], running: [p], restore: pub.restore, paths: [tmp] });
     }
   });
 
-  it("(i) foreign: a lock a separate process created during the cancellation is RETAINED; later ticks skip; shutdown names bare_lock_retained", async () => {
+  it("(i) foreign: a lock a separate process created during the cancellation is RETAINED; later ticks skip; shutdown names bare_lock_retained", { skip: NEEDS_PROC }, async () => {
     const tmp = scratchDir("foreign");
     const shim = writeShim(tmp, "detect");
     const iid = 1597_231;
@@ -1069,8 +1197,10 @@ describe("mid-turn checkpoint lock custody (issue #1597 M2)", () => {
     const lines = rawLines as Array<Record<string, unknown>>;
     const claim = gitlabClaim(iid);
     const later: string[] = [];
+    let runner: RunRunner | undefined;
+    let p: Promise<unknown> | undefined;
     try {
-      const runner = mkRunner(
+      runner = mkRunner(
         g,
         blockingTurn(async (ctx) => {
           commitIn(ctx.worktreePath, "F.txt", "f\n");
@@ -1093,7 +1223,7 @@ describe("mid-turn checkpoint lock custody (issue #1597 M2)", () => {
         {},
         logger,
       );
-      const p = runner.execute(claim);
+      p = runner.execute(claim);
       await waitFor(() => later.length === 1, 20_000);
       runner.shutdown();
       await p;
@@ -1119,12 +1249,11 @@ describe("mid-turn checkpoint lock custody (issue #1597 M2)", () => {
         JSON.stringify(feed),
       );
     } finally {
-      pub.restore();
-      fs.rmSync(tmp, { recursive: true, force: true });
+      await settleAndClean({ ctl, runners: runner ? [runner] : [], running: [p], restore: pub.restore, paths: [tmp] });
     }
   });
 
-  it("(i) replaced: the child held the lock but after its exit the path is a different inode — RETAINED", async () => {
+  it("(i) replaced: the child held the lock but after its exit the path is a different inode — RETAINED", { skip: NEEDS_PROC }, async () => {
     const tmp = scratchDir("replaced");
     const shim = writeShim(tmp, "detect");
     const iid = 1597_232;
@@ -1148,8 +1277,10 @@ describe("mid-turn checkpoint lock custody (issue #1597 M2)", () => {
     const { logger, lines: rawLines } = recordingLogger();
     const lines = rawLines as Array<Record<string, unknown>>;
     const claim = gitlabClaim(iid);
+    let runner: RunRunner | undefined;
+    let p: Promise<unknown> | undefined;
     try {
-      const runner = mkRunner(
+      runner = mkRunner(
         g,
         blockingTurn(async (ctx) => {
           commitIn(ctx.worktreePath, "R.txt", "r\n");
@@ -1161,7 +1292,7 @@ describe("mid-turn checkpoint lock custody (issue #1597 M2)", () => {
         {},
         logger,
       );
-      const p = runner.execute(claim);
+      p = runner.execute(claim);
       await waitFor(() => fs.existsSync(lock));
       runner.shutdown();
       await p;
@@ -1172,8 +1303,7 @@ describe("mid-turn checkpoint lock custody (issue #1597 M2)", () => {
         | undefined;
       assert.equal(warn?.retained?.[0]?.reason, "inode_mismatch");
     } finally {
-      pub.restore();
-      fs.rmSync(tmp, { recursive: true, force: true });
+      await settleAndClean({ ctl, runners: runner ? [runner] : [], running: [p], restore: pub.restore, paths: [tmp] });
     }
   });
 });
@@ -1754,6 +1884,7 @@ describe("mid-turn checkpoint review follow-ups (issue #1597 M2)", () => {
     let kickDelay: number | undefined;
     let tickOutcome = "";
     let lockPresentAtReconcile = false;
+    let running: Promise<unknown> | undefined;
     try {
       const factory: ExecutorFactory = () => ({
         executor: {
@@ -1781,7 +1912,8 @@ describe("mid-turn checkpoint review follow-ups (issue #1597 M2)", () => {
           safety,
         },
       });
-      await mkRunner(g, factory, ctl, { codexBoundaryDeadlineMs: 5_000 }, logger).execute(claim);
+      running = mkRunner(g, factory, ctl, { codexBoundaryDeadlineMs: 5_000 }, logger).execute(claim);
+      await running;
       assert.equal(kickDelay, 1_000, "the milestone kicked a tick");
       assert.ok(
         lines.some((l) => l.msg === "checkpoint publish deferred out of the Codex permit (scan_deferred)"),
@@ -1802,18 +1934,9 @@ describe("mid-turn checkpoint review follow-ups (issue #1597 M2)", () => {
       assert.equal(ev.reason, "foreign");
       assert.equal(finalStatus(claim.run_id), "completed");
     } finally {
-      pub.restore();
-      // Never leave the (detached) stand-in child behind a failed assertion.
-      for (const pid of ctl.pids) {
-        try {
-          process.kill(-pid, "SIGKILL");
-        } catch {
-          /* already gone */
-        }
-      }
-      await waitFor(() => ctl.pids.every((pid) => !isAlive(pid)));
-      fs.rmSync(foreignLock, { force: true });
-      fs.rmSync(tmp, { recursive: true, force: true });
+      // Never leave the (detached) stand-in child behind a failed assertion; the lock and the temp
+      // dir are removed even if that wait times out, and a timeout never masks the test's error.
+      await settleAndClean({ ctl, running: [running], restore: pub.restore, paths: [foreignLock, tmp] });
     }
   });
 
@@ -1836,8 +1959,9 @@ describe("mid-turn checkpoint review follow-ups (issue #1597 M2)", () => {
     });
     const claim = gitlabClaim(iid);
     const seen: string[] = [];
+    let running: Promise<unknown> | undefined;
     try {
-      await mkRunner(
+      running = mkRunner(
         g,
         turn(async (ctx) => {
           commitIn(ctx.worktreePath, "U.txt", "u\n");
@@ -1858,14 +1982,14 @@ describe("mid-turn checkpoint review follow-ups (issue #1597 M2)", () => {
         }),
         ctl,
       ).execute(claim);
+      await running;
       assert.equal(finalStatus(claim.run_id), "completed");
       assert.equal(seen[0], "bare_lock_retained");
       assert.equal(seen[1], "bare_lock_retained");
       assert.notEqual(seen[2], "bare_lock_retained", JSON.stringify(seen));
       assert.equal(seen[2], "published", JSON.stringify(seen));
     } finally {
-      pub.restore();
-      fs.rmSync(tmp, { recursive: true, force: true });
+      await settleAndClean({ ctl, running: [running], restore: pub.restore, paths: [tmp] });
     }
   });
 
