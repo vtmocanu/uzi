@@ -1,17 +1,25 @@
 # CANARY: liveness fixture for the Codex egress SHAPE check (check_codex_egress) in
 # scripts/assert-chart-render.sh (PRD #1106 D12, issue #1623). This is a
-# DELIBERATELY-WRONG slice of a worker egress render, carrying one error per finding
-# class the check must name:
-#   - `chatgpt.com` is allowed on port 80, not TCP 443 only (wrong ports);
-#   - an extra `*.openai.com` Allow, a wildcard widening D12 forbids (unexpected host);
-#   - `auth.openai.com` has NO Allow entry at all (missing host).
-# `api.openai.com` on TCP 443 is CORRECT on purpose, so the check must NOT name it.
-# assert-chart-render.sh runs the check against this file before checking the real
-# render and requires rc=1 with all three exact FAIL lines; any other outcome means
-# the instrument is broken (exit 2).
+# DELIBERATELY-WRONG slice of a worker egress render. Each planted defect proves one
+# detector path; the self-test requires rc=1, EXACTLY the six FAIL lines below, and
+# the absence of every must-not-report host:
+#   - `chatgpt.com` on port 80 (ports path) -> "chatgpt.com: ports are TCP/80 ...";
+#   - a second chatgpt.com Allow written `ChatGPT.com.` (duplicate path, and the
+#     exact-host lowercase/trailing-dot normalization) -> "chatgpt.com: 2 Allow entries";
+#   - `*.openai.com` (suffix widening path) -> "*.openai.com: unexpected ...";
+#   - `*.ChatGPT.com.` (normalization before the widening rules) -> "*.chatgpt.com:
+#     unexpected ...";
+#   - `*` (wildcard-glob path) -> "*: wildcard Allow covers api.openai.com ...";
+#   - NO auth.openai.com entry (missing path) -> "auth.openai.com: no Allow entry".
+# Must NOT be reported:
+#   - `api.openai.com` on TCP 443 is correct (no false positive on a good entry);
+#   - `*.anthropic.com` is a wildcard that covers no OpenAI/ChatGPT host;
+#   - `evil.chatgpt.com` sits in a Drop entry (proves the Allow-only filter);
+#   - `platform.openai.com` is allowed in a SECOND Antrea policy, uzi-other-egress
+#     (proves the check is scoped to the -worker-egress document).
 #
-# Do NOT "fix" this file: correcting any of the three errors silences the canary and
-# the gate would stop proving the shape check works. This file holds no secrets.
+# Do NOT "fix" this file: correcting any defect silences part of the canary and the
+# gate would stop proving the shape check works. This file holds no secrets.
 apiVersion: crd.antrea.io/v1beta1
 kind: NetworkPolicy
 metadata:
@@ -30,6 +38,14 @@ spec:
       to:
         - ipBlock:
             cidr: 169.254.169.254/32
+    # NOT REPORTED ON PURPOSE: a Drop entry, outside the Allow-only filter.
+    - name: drop-evil-chatgpt
+      action: Drop
+      to:
+        - fqdn: "evil.chatgpt.com"
+      ports:
+        - protocol: TCP
+          port: 443
     - name: allow-anthropic
       action: Allow
       to:
@@ -52,6 +68,14 @@ spec:
       ports:
         - protocol: TCP
           port: 80
+    # WRONG ON PURPOSE: a duplicate chatgpt.com, upper-case with a trailing dot.
+    - name: allow-chatgpt-again
+      action: Allow
+      to:
+        - fqdn: "ChatGPT.com."
+      ports:
+        - protocol: TCP
+          port: 443
     # WRONG ON PURPOSE: a wildcard OpenAI widening -- see the CANARY header above.
     - name: allow-openai-wildcard
       action: Allow
@@ -60,11 +84,56 @@ spec:
       ports:
         - protocol: TCP
           port: 443
+    # WRONG ON PURPOSE: a ChatGPT widening that only fails once normalized.
+    - name: allow-chatgpt-wildcard
+      action: Allow
+      to:
+        - fqdn: "*.ChatGPT.com."
+      ports:
+        - protocol: TCP
+          port: 443
+    # WRONG ON PURPOSE: a catch-all wildcard that covers every OpenAI host.
+    - name: allow-everything
+      action: Allow
+      to:
+        - fqdn: "*"
+      ports:
+        - protocol: TCP
+          port: 443
     # allow-openai-auth (auth.openai.com) is OMITTED ON PURPOSE -- see the CANARY header.
     - name: allow-forge-gitlab-example-com
       action: Allow
       to:
         - fqdn: "gitlab.example.com"
+      ports:
+        - protocol: TCP
+          port: 443
+---
+# NOT REPORTED ON PURPOSE: an unrelated Antrea policy; its Allow must not count.
+apiVersion: crd.antrea.io/v1beta1
+kind: NetworkPolicy
+metadata:
+  name: uzi-other-egress
+  namespace: uzi-workers
+spec:
+  priority: 6
+  tier: application
+  appliedTo:
+    - podSelector:
+        matchLabels:
+          app.kubernetes.io/name: uzi-other
+  egress:
+    - name: allow-openai-platform
+      action: Allow
+      to:
+        - fqdn: "platform.openai.com"
+      ports:
+        - protocol: TCP
+          port: 443
+    - name: allow-example
+      action: Allow
+      to:
+        - fqdn: "example.com"
       ports:
         - protocol: TCP
           port: 443

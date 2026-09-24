@@ -214,18 +214,24 @@ check_completeness() {
 # Completeness above only proves each Codex host is PRESENT somewhere in the Allow set.
 # D12 is narrower than that: exactly api.openai.com, chatgpt.com and auth.openai.com,
 # each on TCP 443 only, and NO wildcard or further OpenAI/ChatGPT host. A widening
-# (`*.openai.com`, `*.chatgpt.com`, another port) renders fine and passes completeness,
+# (`*.openai.com`, `*`, `*openai*`, another port) renders fine and passes completeness,
 # so this check asserts the shape directly.
 #
 # check_codex_egress <file> -- within the crd.antrea.io `-worker-egress` NetworkPolicy
-# only (the same document scoping as collect_allow_fqdns), for each Codex host require
-# exactly one Allow egress entry whose fqdn equals it (string equality) and whose ports
-# are exactly one `protocol: TCP` + `port: 443`. Also flag any other Allow fqdn that
-# equals or ends with `openai.com` or `chatgpt.com`, compared as literal strings, so a
-# `*` is never a glob. Forge-derived Allows that are not OpenAI/ChatGPT hosts are
-# ignored. One FAIL line per finding on stdout; returns 1 on a finding, 2 when the
-# -worker-egress document is absent, 0 (with an OK line) otherwise.
+# only (the same document scoping as collect_allow_fqdns), and over Allow entries only,
+# with every fqdn lowercased and one trailing `.` stripped first:
+#   - each Codex host must match exactly one Allow entry (string equality), and every
+#     entry matching it must have ports of exactly one `protocol: TCP` + `port: 443`;
+#   - any other Allow fqdn that equals or ends with `openai.com` or `chatgpt.com`
+#     (literal string comparison) is a finding;
+#   - any other Allow fqdn containing `*` is read as a glob (`*` = any run of
+#     characters, anchored at both ends) and is a finding if it matches a host in
+#     CODEX_PROBES, so `*`, `*.com` and `*openai*` fail while `*.anthropic.com` passes.
+# Forge-derived Allows that are not OpenAI/ChatGPT hosts are ignored. One FAIL line per
+# finding on stdout; returns 1 on a finding, 2 when the -worker-egress document is
+# absent, 0 (with an OK line) otherwise.
 CODEX_HOSTS="api.openai.com chatgpt.com auth.openai.com"
+CODEX_PROBES="api.openai.com chatgpt.com auth.openai.com platform.openai.com x.openai.com x.chatgpt.com"
 
 check_codex_egress() {
   _file="$1"
@@ -234,7 +240,7 @@ check_codex_egress() {
     echo "        the Codex egress shape check has nothing to inspect." >&2
     return 2
   fi
-  awk -v hosts="$CODEX_HOSTS" '
+  awk -v hosts="$CODEX_HOSTS" -v probes="$CODEX_PROBES" '
     # Value after the first `key:`, quotes and whitespace stripped.
     function val(line,   v) {
       v = line
@@ -261,6 +267,18 @@ check_codex_egress() {
     function endswith(s, suf) {
       return length(s) >= length(suf) && substr(s, length(s) - length(suf) + 1) == suf
     }
+    # Anchored regex for a wildcard fqdn: `*` matches any run, everything else literal.
+    function globre(s,   i, ch, r) {
+      r = "^"
+      for (i = 1; i <= length(s); i++) {
+        ch = substr(s, i, 1)
+        if (ch == "*") r = r ".*"
+        else if (ch ~ /[a-z0-9-]/) r = r ch
+        else if (ch == "\\" || ch == "^" || ch == "]") r = r "\\" ch
+        else r = r "[" ch "]"
+      }
+      return r "$"
+    }
     /^---[[:space:]]*$/                       { if (we) flush(); antrea = 0; we = 0; eg = 0; next }
     /^apiVersion:[[:space:]]*crd\.antrea\.io/ { antrea = 1; next }
     antrea && !we && /^[[:space:]]+name:[[:space:]].*-worker-egress[[:space:]]*$/ { we = 1; next }
@@ -272,7 +290,7 @@ check_codex_egress() {
     /^[[:space:]]*action:/                    { action = val($0); next }
     /^[[:space:]]*to:[[:space:]]*$/           { closeitem(); inports = 0; next }
     /^[[:space:]]*ports:/                     { closeitem(); inports = 1; next }
-    /^[[:space:]]*(-[[:space:]]+)?fqdn:/      { fq[++nf] = val($0); next }
+    /^[[:space:]]*(-[[:space:]]+)?fqdn:/      { v = tolower(val($0)); sub(/\.$/, "", v); fq[++nf] = v; next }
     inports && /^[[:space:]]*-[[:space:]]/    { closeitem(); item = 1 }
     inports && item {
       k = $0
@@ -286,14 +304,16 @@ check_codex_egress() {
       if (we) flush()
       bad = 0
       nh = split(hosts, H, " ")
-      for (j = 1; j <= nh; j++) { want[H[j]] = 1; c = 0; got = ""
-        for (i = 1; i <= n; i++) if (F[i] == H[j]) { c++; got = S[i] }
+      np = split(probes, P, " ")
+      for (j = 1; j <= nh; j++) { want[H[j]] = 1; c = 0
+        for (i = 1; i <= n; i++) if (F[i] == H[j]) c++
         if (c == 0) {
           printf "FAIL: Codex worker egress %s: no Allow entry\n", H[j]; bad = 1
         } else if (c > 1) {
           printf "FAIL: Codex worker egress %s: %d Allow entries, want exactly one\n", H[j], c; bad = 1
-        } else if (got != "TCP/443") {
-          printf "FAIL: Codex worker egress %s: ports are %s, want exactly TCP/443\n", H[j], got; bad = 1
+        }
+        for (i = 1; i <= n; i++) if (F[i] == H[j] && S[i] != "TCP/443") {
+          printf "FAIL: Codex worker egress %s: ports are %s, want exactly TCP/443\n", H[j], S[i]; bad = 1
         }
       }
       for (i = 1; i <= n; i++) {
@@ -302,6 +322,13 @@ check_codex_egress() {
         if (endswith(f, "openai.com") || endswith(f, "chatgpt.com")) {
           printf "FAIL: Codex worker egress %s: unexpected OpenAI/ChatGPT Allow (only the exact api.openai.com, chatgpt.com and auth.openai.com are permitted)\n", f
           bad = 1
+        } else if (index(f, "*")) {
+          re = globre(f)
+          for (p = 1; p <= np; p++) if (P[p] ~ re) {
+            printf "FAIL: Codex worker egress %s: wildcard Allow covers %s (only the exact api.openai.com, chatgpt.com and auth.openai.com are permitted)\n", f, P[p]
+            bad = 1
+            break
+          }
         }
       }
       if (bad) exit 1
@@ -335,21 +362,35 @@ else
 fi
 
 # --- Codex canary self-test: prove the shape check fires ---------------------------
-# The committed canary is deliberately wrong in three ways, one per finding class:
-# chatgpt.com is on port 80 (wrong ports), an extra `*.openai.com` Allow (a widening)
-# and NO auth.openai.com (missing). api.openai.com on TCP 443 is correct and must NOT
-# be named. A working check returns 1 with all three exact FAIL lines; anything else
-# means the instrument is broken.
+# The committed canary plants one defect per detector path (its header lists them):
+# a wrong port, a duplicate (written upper-case with a trailing dot), a suffix
+# widening, a widening that only matches once normalized, a catch-all `*` glob and a
+# missing host. It also carries entries that must NOT be reported: a correct
+# api.openai.com, `*.anthropic.com`, a Drop entry (Allow-only filter) and an Allow in
+# a second Antrea policy (document scoping). A working check returns 1 with EXACTLY
+# the six FAIL lines below and none of the must-not-report hosts; anything else means
+# the instrument is broken.
 CODEX_CANARY="$SCRIPT_DIR/codex-egress-canary.yaml"
 [ -f "$CODEX_CANARY" ] || { echo "BROKEN: Codex canary fixture missing at $CODEX_CANARY" >&2; exit 2; }
 
+CODEX_ONLY="(only the exact api.openai.com, chatgpt.com and auth.openai.com are permitted)"
 codex_out=$(check_codex_egress "$CODEX_CANARY") && codex_rc=0 || codex_rc=$?
+codex_ok=0
 if [ "$codex_rc" -eq 1 ] \
+   && [ "$(printf '%s\n' "$codex_out" | grep -c '^FAIL: ')" -eq 6 ] \
    && printf '%s\n' "$codex_out" | is_present "FAIL: Codex worker egress chatgpt.com: ports are TCP/80, want exactly TCP/443" \
-   && printf '%s\n' "$codex_out" | is_present "FAIL: Codex worker egress *.openai.com: unexpected OpenAI/ChatGPT Allow (only the exact api.openai.com, chatgpt.com and auth.openai.com are permitted)" \
-   && printf '%s\n' "$codex_out" | is_present "FAIL: Codex worker egress auth.openai.com: no Allow entry" \
-   && ! printf '%s\n' "$codex_out" | grep -F -q "api.openai.com:"; then
-  echo "OK: Codex canary self-test named all three findings (chatgpt.com port, *.openai.com widening, auth.openai.com missing)"
+   && printf '%s\n' "$codex_out" | is_present "FAIL: Codex worker egress chatgpt.com: 2 Allow entries, want exactly one" \
+   && printf '%s\n' "$codex_out" | is_present "FAIL: Codex worker egress *.openai.com: unexpected OpenAI/ChatGPT Allow $CODEX_ONLY" \
+   && printf '%s\n' "$codex_out" | is_present "FAIL: Codex worker egress *.chatgpt.com: unexpected OpenAI/ChatGPT Allow $CODEX_ONLY" \
+   && printf '%s\n' "$codex_out" | is_present "FAIL: Codex worker egress *: wildcard Allow covers api.openai.com $CODEX_ONLY" \
+   && printf '%s\n' "$codex_out" | is_present "FAIL: Codex worker egress auth.openai.com: no Allow entry"; then
+  codex_ok=1
+  for _absent in "api.openai.com:" "*.anthropic.com" "evil.chatgpt.com" "platform.openai.com"; do
+    if printf '%s\n' "$codex_out" | grep -F -q -- "$_absent"; then codex_ok=0; fi
+  done
+fi
+if [ "$codex_ok" -eq 1 ]; then
+  echo "OK: Codex canary self-test named exactly its six findings (port, duplicate, two widenings, catch-all glob, missing host) and none of the out-of-scope entries"
 else
   echo "BROKEN: Codex canary self-test did not fire as expected (rc=$codex_rc) on a" >&2
   echo "        known-wrong render -- the Codex egress shape check is not working," >&2
@@ -380,11 +421,15 @@ CHART_DIR="$SCRIPT_DIR/../deploy/chart"
 [ -f "$CHART_DIR/Chart.yaml" ] || { echo "BROKEN: no Chart.yaml under $CHART_DIR" >&2; exit 2; }
 
 WORK=$(mktemp -d)
-trap 'rm -rf "$WORK"' EXIT INT TERM
+trap 'rm -rf "$WORK"' EXIT
+trap 'exit 2' INT TERM
 
 STRIPPED="$WORK/chart"
 cp -R "$CHART_DIR" "$STRIPPED"
 rm -f "$STRIPPED/Chart.lock"
+# Drop any built subchart archives (CI runs `helm dependency build` first), so the
+# defaults render the same offline chart everywhere, without the CNPG subchart.
+rm -rf "$STRIPPED/charts"
 awk '
   BEGIN { skip = 0 }
   /^dependencies:/ { skip = 1; next }        # drop the dependencies: list ...
