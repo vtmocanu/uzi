@@ -5,17 +5,20 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { StubExecutor } from "../src/executor.js";
+import { StubExecutor, type ExecutorResult, type RunContext } from "../src/executor.js";
 import type { GitCache, RunnerClone } from "../src/git.js";
+import { Outbox, canonicalizeTerminalBody } from "../src/outbox.js";
 import { RecoveryCoordinator } from "../src/recovery.js";
+import type { ExecutorFactory } from "../src/runner.js";
 import {
+  PUSHED_HEAD_UNRECORDED,
   SettlementJournal,
   type RecoverySettleClient,
   type SettlementRecord,
 } from "../src/recovery-settlement.js";
 import type { RecoverySettleRequest, RecoverySettleResponse } from "../src/protocol.js";
-import { FakeRecoveryClient, FakeRecoveryGit } from "./codex-reap-fixture.js";
-import { nullLogger } from "./helpers.js";
+import { FakeRecoveryClient, FakeRecoveryGit, commitInTree, fixture as codexFixture } from "./codex-reap-fixture.js";
+import { nullLogger, recordingLogger } from "./helpers.js";
 import { api, fakeGitlab, fx, git, gitlabClaim, installHarness, runnerWith } from "./runner-harness.js";
 
 installHarness();
@@ -492,4 +495,181 @@ describe("RunRunner — NO adoption evidence (issue #1582 M2)", () => {
       r.cleanup();
     }
   });
+});
+
+describe("RunRunner — settlement promotion on every terminal path (issue #1582 M2 follow-up)", () => {
+  function pushedRecord(runId: string, gen: number): SettlementRecord {
+    return {
+      version: 1,
+      runId,
+      holdId: HOLD_A,
+      predecessorGeneration: gen - 1,
+      successorGeneration: gen,
+      sourceSha: "1".repeat(40),
+      sourceCaptureId: "cap-qd",
+      adoptedSha: "2".repeat(40),
+      seededFrom: "tracking",
+      branch: "agent/issue-5301",
+      barePath: "/nonexistent",
+      createdAt: 1,
+      state: "pushed",
+      pushedSha: "3".repeat(40),
+      disposition: "publication",
+      attempts: 0,
+    };
+  }
+
+  it("the queued-duplicate gate's pending-terminal replay promotes pushed → pending_settle BEFORE retiring the outbox entry", async () => {
+    const r = rig();
+    const outboxRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-settle-qd-outbox-"));
+    try {
+      const claim = gitlabClaim(5301, { claim_generation: 2 });
+      const outbox = new Outbox({
+        root: outboxRoot,
+        log: nullLogger(),
+        runMaxBytes: 64 * 1024 * 1024,
+        maxBytes: 512 * 1024 * 1024,
+        retentionMs: 7 * 86_400_000,
+      });
+      await outbox.init();
+      // The previous same-run attempt journaled its completed terminal write-ahead and persisted the
+      // pushed head, then died before the send: the queued duplicate's gate replays it.
+      const journaled = await outbox.journalTerminal(
+        claim.run_id,
+        2,
+        "running",
+        0,
+        canonicalizeTerminalBody({ status: "completed", branch: "agent/issue-5301" }, 1 << 20),
+      );
+      assert.equal(journaled.journaled, true, "precondition: the completed terminal is journaled");
+      await r.settlement.put(pushedRecord(claim.run_id, 2));
+      const pendingAtPromotion: boolean[] = [];
+      const put = r.settlement.put.bind(r.settlement);
+      r.settlement.put = async (rec: SettlementRecord) => {
+        if (rec.state === "pending_settle") pendingAtPromotion.push(outbox.hasPendingTerminal(claim.run_id, 2));
+        return put(rec);
+      };
+      api.setOwnershipStatus(claim.run_id, "completed", 2);
+      r.settleClient.answer = (h) => released(claim.run_id, h);
+      const runner = runnerWith(() => ({ executor: new StubExecutor(nullLogger()) }), fakeGitlab().gitlab, undefined, nullLogger(), {
+        recovery: r.coord,
+        settlement: r.settlement,
+        settleClient: r.settleClient,
+        outbox,
+      });
+      const proceed = await (runner as unknown as { gateQueuedDuplicate(c: typeof claim): Promise<boolean> })
+        .gateQueuedDuplicate(claim);
+      assert.equal(proceed, false, "the run is terminal: the duplicate does not execute");
+      assert.ok(hasStatus(claim.run_id, "completed"), "the pending completed terminal was replayed");
+      assert.equal(outbox.hasPendingTerminal(claim.run_id, 2), false, "the outbox entry was retired");
+      assert.deepEqual(pendingAtPromotion, [true], "promoted while the outbox still held the pending terminal");
+      const [rec] = await r.settlement.listRun(claim.run_id);
+      assert.equal(rec!.state, "pending_settle", "not stranded in `pushed`");
+      await runner.settlePendingPredecessors();
+      assert.deepEqual(r.settleClient.calls.map((c) => c.holdId), [HOLD_A], "the sweep then sends the settle");
+    } finally {
+      fs.rmSync(outboxRoot, { recursive: true, force: true });
+      r.cleanup();
+    }
+  });
+
+  it("a deferred (Codex) committed completion persists the pushed head, promotes it on the ACK, and settles", async () => {
+    const r = rig("tracking");
+    const events: string[] = [];
+    const codex = codexFixture(events, () => false);
+    try {
+      const src = originCommit("prior-codex", "PRIOR.txt");
+      const claim = gitlabClaim(5302, { claim_generation: 2 });
+      await r.coord.pin({ runId: claim.run_id, sourceSha: src, kind: "issue", branch: "b", generation: 1 });
+      r.recoveryClient.holds = [{ hold_id: HOLD_A, generation: 1, has_available_capture: true }];
+      r.settleClient.answer = (h) => released(claim.run_id, h);
+      const states: string[] = [];
+      const put = r.settlement.put.bind(r.settlement);
+      r.settlement.put = async (rec: SettlementRecord) => {
+        states.push(rec.state);
+        return put(rec);
+      };
+      const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-settle-codex-"));
+      const factory: ExecutorFactory = (runId) => ({
+        homeDir: path.join(homeRoot, runId),
+        executor: {
+          safety: codex.safety,
+          run: async (ctx: RunContext): Promise<ExecutorResult> => {
+            fs.mkdirSync(path.join(homeRoot, runId), { recursive: true });
+            commitInTree(ctx.worktreePath, "CODEX.txt", "codex work\n");
+            return { branch: ctx.branch };
+          },
+        },
+      });
+      try {
+        await runnerWith(factory, fakeGitlab().gitlab, undefined, nullLogger(), {
+          recovery: r.coord,
+          settlement: r.settlement,
+          settleClient: r.settleClient,
+        }).execute(claim);
+      } finally {
+        fs.rmSync(homeRoot, { recursive: true, force: true });
+      }
+      assert.ok(hasStatus(claim.run_id, "completed"));
+      assert.deepEqual(states, ["adopted", "pushed", "pending_settle"], "write-ahead pushed, then promoted on the ACK");
+      const branch = r.seeded[0]!.branch;
+      assert.deepEqual(r.settleClient.calls.map((c) => [c.holdId, c.req.pushed_sha]), [
+        [HOLD_A, gitOut(bare(), "rev-parse", `refs/uzi-runner/${branch}`)],
+      ]);
+      assert.deepEqual(await r.settlement.listRun(claim.run_id), [], "released and cleaned up");
+    } finally {
+      fs.rmSync(codex.root, { recursive: true, force: true });
+      r.cleanup();
+    }
+  });
+
+  for (const [mode, label] of [
+    ["pin-false", "a pushed pin that fails"],
+    ["pin-throws", "a pushed pin that throws"],
+    ["tip-null", "an unreadable tracking tip"],
+  ] as const) {
+    it(`${label} marks the record terminal/pushed_head_unrecorded (logged), never sent`, async () => {
+      const r = rig("tracking");
+      try {
+        const src = originCommit(`prior-unrec-${mode}`, "PRIOR.txt");
+        const claim = gitlabClaim(5303, { claim_generation: 2 });
+        await r.coord.pin({ runId: claim.run_id, sourceSha: src, kind: "issue", branch: "b", generation: 1 });
+        r.recoveryClient.holds = [{ hold_id: HOLD_A, generation: 1, has_available_capture: true }];
+        r.settleClient.answer = (h) => released(claim.run_id, h);
+        const pin = git.pinSettlementRefs.bind(git);
+        let pushedPins = 0;
+        git.pinSettlementRefs = async (...args: Parameters<GitCache["pinSettlementRefs"]>) => {
+          if (args[3].pushed !== undefined) {
+            pushedPins += 1;
+            if (mode === "pin-throws") throw new Error("pin exploded");
+            if (mode === "pin-false") return false;
+          }
+          return pin(...args);
+        };
+        if (mode === "tip-null") git.trackingTip = async () => null;
+        const { logger, lines } = recordingLogger();
+        await runnerWith(() => ({ executor: new StubExecutor(nullLogger()) }), fakeGitlab().gitlab, undefined, logger, {
+          recovery: r.coord,
+          settlement: r.settlement,
+          settleClient: r.settleClient,
+        }).execute(claim);
+        assert.ok(hasStatus(claim.run_id, "completed"));
+        const [rec] = await r.settlement.listRun(claim.run_id);
+        assert.equal(rec!.state, "terminal");
+        assert.equal(rec!.lastReason, PUSHED_HEAD_UNRECORDED, "the real cause, not successor_not_published");
+        assert.equal(rec!.pushedSha, undefined);
+        assert.equal(r.settleClient.calls.length, 0, "never sent");
+        assert.equal(pushedPins, mode === "tip-null" ? 0 : 1, "no pushed pin without a head");
+        assert.ok(
+          lines.some((l) => (l as { reason?: string; hold_id?: string }).reason === PUSHED_HEAD_UNRECORDED
+            && (l as { hold_id?: string }).hold_id === HOLD_A),
+          "the unrecorded pushed head is logged with its reason",
+        );
+        assert.ok(refOrNull(bare(), settleRef(claim.run_id, HOLD_A, "source")), "the source pin is kept");
+        assert.equal((await r.coord.inspect(claim.run_id)).length, 1, "the predecessor journal is kept");
+      } finally {
+        r.cleanup();
+      }
+    });
+  }
 });

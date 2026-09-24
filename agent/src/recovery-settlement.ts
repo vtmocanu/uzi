@@ -112,6 +112,10 @@ export function isSafeSettlementId(id: string): boolean {
 }
 const SHA_RE = /^[0-9a-f]{40}$/;
 
+/** Terminal reason for a record whose successor completed WITH a branch but whose pushed head the
+ *  worker could not record (no bare, unreadable tracking tip, or the `.../pushed` pin failed). */
+export const PUSHED_HEAD_UNRECORDED = "pushed_head_unrecorded";
+
 /** Retry backoff base (1 min), cap (6 h) and the attempt cap after which a record goes terminal. */
 export const SETTLE_BACKOFF_BASE_MS = 60_000;
 const SETTLE_BACKOFF_CAP_MS = 6 * 60 * 60_000;
@@ -329,7 +333,9 @@ export class PredecessorSettler {
         if (rec.successorGeneration !== successorGeneration) continue;
         if (rec.state !== "adopted" && rec.state !== "pushed") continue;
         if (outcome === "completed" && rec.state === "pushed" && rec.pushedSha) {
-          await this.journal.put({ ...rec, state: "pending_settle", nextAttemptAt: undefined });
+          // Compare-and-write against the journal's CURRENT copy: the listRun snapshot may be stale
+          // (a concurrent release + remove, or another transition), and a stale put would resurrect it.
+          if (!(await this.replaceUnlocked(rec, { ...rec, state: "pending_settle", nextAttemptAt: undefined }))) continue;
           this.log.info("recovery settlement: completion ACK observed; predecessor hold settle-eligible", {
             run_id: runId,
             hold_id: rec.holdId,
@@ -517,10 +523,29 @@ export class PredecessorSettler {
     return "terminal";
   }
 
-  /** Move an `adopted`/`pushed` record terminal (no settle was ever sent for it). */
-  private async markTerminal(rec: SettlementRecord, reason: string): Promise<void> {
+  /**
+   * Move an `adopted`/`pushed` record terminal (no settle was ever sent for it). Written only if the
+   * journal still holds `rec` unchanged and no settle holds its single-flight key, so a caller's
+   * stale snapshot never resurrects a record released + removed meanwhile. Returns whether it wrote.
+   */
+  async markTerminal(rec: SettlementRecord, reason: string): Promise<boolean> {
     const next: SettlementRecord = { ...rec, state: "terminal", lastReason: reason, nextAttemptAt: undefined };
-    if (await this.journal.put(next)) this.logTerminal(next, reason);
+    if (!(await this.replaceUnlocked(rec, next))) return false;
+    this.logTerminal(next, reason);
+    return true;
+  }
+
+  /** {@link replaceIfUnchanged} for a caller that does NOT hold the (runId, holdId) single-flight
+   *  key: takes it for the read-compare-write, and skips when a settle attempt already holds it. */
+  private async replaceUnlocked(orig: SettlementRecord, next: SettlementRecord): Promise<boolean> {
+    const key = `${orig.runId}/${orig.holdId}`;
+    if (this.inflight.has(key)) return false;
+    this.inflight.add(key);
+    try {
+      return await this.replaceIfUnchanged(orig, next);
+    } finally {
+      this.inflight.delete(key);
+    }
   }
 
   private logTerminal(rec: SettlementRecord, reason: string): void {

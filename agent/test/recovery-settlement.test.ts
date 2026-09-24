@@ -470,6 +470,42 @@ describe("PredecessorSettler terminal-ACK lifecycle (issue #1582 M2)", () => {
     });
   }
 
+  for (const [label, ack] of [
+    ["completed (pushed promotion + adopted terminal)", { applied: true, status: "completed" }],
+    ["failed (both markTerminal)", { applied: true, status: "failed" }],
+  ] as const) {
+    it(`${label}: a record released + removed between the observer's list and its write STAYS removed`, async () => {
+      // The listRun snapshot is taken, then every gen-2 record is released and removed (a concurrent
+      // settle's cleanup) before the observer writes: nothing may be resurrected from the snapshot.
+      const racing = j;
+      const list = racing.listRun.bind(racing);
+      racing.listRun = async (runId: string) => {
+        const snap = await list(runId);
+        for (const r of snap) if (r.successorGeneration === 2) await racing.remove(r.runId, r.holdId);
+        return snap;
+      };
+      await settler.observeTerminalAck(RUN, 2, { status: "completed" }, ack);
+      racing.listRun = list;
+      assert.deepEqual(await states(), { [HOLD3]: ["pushed", undefined] }, "removed records stay removed");
+      assert.equal(fs.existsSync(path.join(root, RUN, `${HOLD}.json`)), false);
+      assert.equal(fs.existsSync(path.join(root, RUN, `${HOLD2}.json`)), false);
+    });
+  }
+
+  it("supersede: a record removed between the list and the write is not resurrected", async () => {
+    const list = j.listRun.bind(j);
+    j.listRun = async (runId: string) => {
+      const snap = await list(runId);
+      await j.remove(RUN, HOLD);
+      return snap;
+    };
+    await settler.supersedeOlderGenerations(RUN, 5);
+    j.listRun = list;
+    const s = await states();
+    assert.equal(s[HOLD], undefined, "the removed record stays removed");
+    assert.deepEqual(s[HOLD2], ["terminal", "superseded"]);
+  });
+
   it("a newer generation supersedes OLDER adopted/pushed records (terminal/superseded); same/newer untouched", async () => {
     await j.put(record({ holdId: "88888888-bbbb-cccc-dddd-eeeeeeeeeeee", state: "pending_settle" }));
     await settler.supersedeOlderGenerations(RUN, 5);

@@ -37,6 +37,7 @@ import type { ActiveRunRegistry } from "./active-run-registry.js";
 import { deriveCloneKey, resolveRunKind, RUN_KIND_PROFILES } from "./run-kind.js";
 import { RecoveryCoordinator, isCodePublishingKind, type RecoveryRecord } from "./recovery.js";
 import {
+  PUSHED_HEAD_UNRECORDED,
   PredecessorSettler,
   SettlementJournal,
   isSafeSettlementId,
@@ -6893,6 +6894,9 @@ export class RunRunner {
    * (never inside the terminal send). Sends every `pending_settle` record of this run — i.e. only
    * when the reportState choke point observed a completion ACK and promoted it. Aborts with the
    * flight's cancel signal (worker shutdown); the worker sweep retries anything left. Best-effort.
+   * The sends are sequential and awaited before the run's finalize returns, so the settle holds the
+   * run slot for at most the worker client's HTTP timeout (`httpTimeoutMs`, 30 s by default) per
+   * `pending_settle` hold (one POST each, no in-call retry), plus the local journal/ref cleanup.
    */
   private async settleAfterCompletion(
     claim: ClaimResponse,
@@ -6915,7 +6919,10 @@ export class RunRunner {
    * the write-ahead `pushed` state (disposition `publication`), pinning the head under `.../pushed`.
    * `pushed` is NEVER sent: only an observed completion ACK promotes it to `pending_settle`
    * ({@link observeSettlementTerminalAck}). A completion with no branch (report_only / not_code)
-   * leaves the records `adopted`; that completion's ACK then moves them terminal. Best-effort.
+   * leaves the records `adopted`; that completion's ACK then moves them terminal. A completion WITH
+   * a branch whose pushed head cannot be recorded (no bare, no readable tracking tip, or the
+   * `.../pushed` pin failed) moves the record `terminal` / `pushed_head_unrecorded` here, so the
+   * owner sees the real cause rather than a later `successor_not_published`. Best-effort.
    */
   private async persistSettlementPushedHead(
     claim: ClaimResponse,
@@ -6926,22 +6933,51 @@ export class RunRunner {
     const b = body as StateRequest;
     if (b.status !== "completed" || typeof b.branch !== "string" || b.branch === "") return;
     const barePath = flight.barePath;
-    if (!barePath) return;
     try {
       const adopted = (await this.settlement.listRun(claim.run_id)).filter(
         (r) => r.state === "adopted" && r.successorGeneration === claim.claim_generation,
       );
       if (adopted.length === 0) return;
+      const unrecorded = async (rec: SettlementRecord, why: string, error?: string): Promise<void> => {
+        flight.runLog.warn("recovery settlement: successor pushed head not recorded; predecessor hold retained", {
+          run_id: claim.run_id,
+          hold_id: rec.holdId,
+          branch: b.branch,
+          reason: PUSHED_HEAD_UNRECORDED,
+          detail: why,
+          ...(error ? { error } : {}),
+        });
+        await this.settler.markTerminal(rec, PUSHED_HEAD_UNRECORDED);
+      };
       // The interlocked completion carries the exact permitted head; otherwise read the landed tip
       // off the tracking ref the finalize push wrote.
-      const pushed =
-        typeof b.head === "string" && /^[0-9a-f]{40}$/.test(b.head)
-          ? b.head
-          : await this.git.trackingTip(barePath, b.branch);
-      if (!pushed) return;
+      let pushed: string | null = null;
+      let tipError: string | undefined;
+      if (typeof b.head === "string" && /^[0-9a-f]{40}$/.test(b.head)) {
+        pushed = b.head;
+      } else if (barePath) {
+        pushed = await this.git.trackingTip(barePath, b.branch).catch((err: unknown) => {
+          tipError = errMessage(err);
+          return null;
+        });
+      }
+      if (!barePath || !pushed) {
+        const why = !barePath ? "no runner bare" : "tracking tip unreadable";
+        for (const rec of adopted) await unrecorded(rec, why, tipError);
+        return;
+      }
       for (const rec of adopted) {
-        const pinned = await this.git.pinSettlementRefs(barePath, rec.runId, rec.holdId, { pushed });
-        if (!pinned) continue;
+        let pinned = false;
+        let pinError: string | undefined;
+        try {
+          pinned = await this.git.pinSettlementRefs(barePath, rec.runId, rec.holdId, { pushed });
+        } catch (err) {
+          pinError = errMessage(err);
+        }
+        if (!pinned) {
+          await unrecorded(rec, "pushed pin failed", pinError);
+          continue;
+        }
         await this.settlement.put({
           ...rec,
           pushedSha: pushed,
