@@ -79,14 +79,54 @@ var ErrNoAccessToken = errors.New("codexauth: refresh response carried no access
 // caller can back off for exactly as long as the provider asked. It is zero when the
 // provider sent no parseable Retry-After (or on any non-429 status); a caller reads it
 // only after checking StatusCode == 429.
+//
+// OAuthCode is set by Refresh only (discover_identity and read_usage leave it ""). It is
+// a member of a CLOSED set (the OAuthCode* constants), never provider text: Refresh reads
+// at most maxOAuthErrorBodyBytes of the error body, extracts the OAuth error code, and
+// keeps it only when it normalises to an allowlisted value. Any other code, a malformed
+// or oversized body, is OAuthCodeUnknown; a body carrying no code is "". The raw
+// provider value, its description and any other free text are never stored.
 type AuthError struct {
 	Op         string
 	StatusCode int
 	RetryAfter time.Duration
+	OAuthCode  string
 }
 
 func (e *AuthError) Error() string {
-	return fmt.Sprintf("codexauth: %s: provider returned status %d", e.Op, e.StatusCode)
+	msg := fmt.Sprintf("codexauth: %s: provider returned status %d", e.Op, e.StatusCode)
+	if e.OAuthCode != "" {
+		msg += " (oauth_error=" + e.OAuthCode + ")"
+	}
+	return msg
+}
+
+// RefreshMaterialRejected reports whether a refresh reply proves the provider rejected
+// the presented refresh-token material itself: Op is "refresh", the status is 400 or
+// 401, and OAuthCode is one of refresh_token_expired, refresh_token_reused,
+// refresh_token_invalidated or invalid_grant. Every other combination is false: a 403,
+// a 5xx, a client/request-level code (invalid_client, unauthorized_client, ...),
+// OAuthCodeUnknown, or no code at all.
+//
+// This is deliberately narrower than the upstream Codex CLI, which treats every 401 on
+// refresh as permanent. Issue #1594 keeps a code-less (or unrecognised-code) 401
+// ambiguous, because a rejection without an explicit material code does not prove the
+// token was unspent or unusable, and acting on it as if it did could discard a login
+// that is still valid.
+func (e *AuthError) RefreshMaterialRejected() bool {
+	if e.Op != "refresh" {
+		return false
+	}
+	if e.StatusCode != http.StatusBadRequest && e.StatusCode != http.StatusUnauthorized {
+		return false
+	}
+	switch e.OAuthCode {
+	case OAuthCodeRefreshTokenExpired, OAuthCodeRefreshTokenReused,
+		OAuthCodeRefreshTokenInvalidated, OAuthCodeInvalidGrant:
+		return true
+	default:
+		return false
+	}
 }
 
 // Unauthorized reports whether the provider rejected the presented token (401/403)
@@ -249,7 +289,9 @@ type usageResponse struct {
 //     an account_id from either source → Identity{user_id, account_id}.
 //   - 2xx with user_id absent, or with no account_id from either source →
 //     ErrIdentityIncomplete (the login authenticated but its account is not yet fully named).
-//   - non-2xx (including 401) → *AuthError carrying the status.
+//   - non-2xx (including 401) → *AuthError carrying the status and OAuthCode: at most
+//     maxOAuthErrorBodyBytes of the error body is read (the rest is drained, bounded by
+//     maxBodyBytes) and only an allowlisted, normalised OAuth error code is kept.
 func (c *Client) DiscoverIdentity(ctx context.Context, accessToken string) (Identity, error) {
 	ctx, cancel := c.requestContext(ctx)
 	defer cancel()
@@ -372,7 +414,9 @@ type refreshResponse struct {
 //   - 2xx with an access_token → RefreshResult with the token pair and purely decoded
 //     identity claims; RefreshToken is nil when the provider omitted a rotated token.
 //   - 2xx without an access_token → ErrNoAccessToken.
-//   - non-2xx (including 401) → *AuthError carrying the status.
+//   - non-2xx (including 401) → *AuthError carrying the status and OAuthCode: at most
+//     maxOAuthErrorBodyBytes of the error body is read (the rest is drained, bounded by
+//     maxBodyBytes) and only an allowlisted, normalised OAuth error code is kept.
 func (c *Client) Refresh(ctx context.Context, refreshToken string) (RefreshResult, error) {
 	payload, err := json.Marshal(refreshRequest{ //nolint:gosec // G117: the refresh request must carry the refresh token to the provider token endpoint
 		ClientID:     c.clientID,
@@ -398,8 +442,8 @@ func (c *Client) Refresh(ctx context.Context, refreshToken string) (RefreshResul
 	defer resp.Body.Close() //nolint:errcheck // best-effort close of a drained response body
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxBodyBytes))
-		return RefreshResult{}, &AuthError{Op: "refresh", StatusCode: resp.StatusCode}
+		code := readOAuthErrorCode(resp.Body)
+		return RefreshResult{}, &AuthError{Op: "refresh", StatusCode: resp.StatusCode, OAuthCode: code}
 	}
 
 	var body refreshResponse
