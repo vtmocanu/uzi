@@ -2,7 +2,7 @@
 
 **Issue:** [#1590](https://github.com/vtmocanu/uzi/issues/1590)
 
-**Status:** M1–M5 implemented on the branch `agent/issue-1590`, pending review (2026-09-24); M6 (docs, specs, ADR) in progress; M7 (hosted acceptance) pending. The milestone checkboxes stay unticked until the lead confirms each against its evidence.
+**Status:** M1–M6 implemented on the branch `agent/issue-1590` and reviewed (2026-09-24); M7 (acceptance on hosted k8s, maintainer) pending, so the PRD stays open. The branch is merged with `main` up to #1611; its draft migrations `00251`/`00252` collide with `main`'s `00251` and are renumbered at landing (`task migration:renumber`).
 
 **Priority:** High
 
@@ -246,7 +246,8 @@ Chat is interactive, with the owner present at the moment of failure, and judge 
 
 Each milestone ends green on `task gate:api`, plus `task gate:web` for M5 and `task gate:repo` for the migration milestone. Each carries a regression test that fails on the unfixed code, observed in both directions.
 
-- [ ] **M1: Sentinel split, exact-claim assembly outcomes and park.** LiveDB execution remains required before this checkbox is ticked. Implementation in progress; final live-DB regression and judge error-path coverage remain to be verified.
+- [x] **M1: Sentinel split, exact-claim assembly outcomes and park.**
+  - Final-pass evidence (2026-09-24): on the tree merged with `main` (#1611 custody ancestry release), the full LiveDB suite passed (1191 passed, 0 skipped, run with the draft migrations temporarily renumbered above `main`'s `00251`), including `TestClaimObservedCaseReplayParksLiveDB` and `TestClaimCodexJudgeQuarantineStaysTerminalLiveDB`; `task gate:api` and `task gate:web` green. The fail-on-unfixed-code direction of the M1–M3 regressions was not re-run in this final pass.
   - The D1 classification table test.
   - The comment update at `codexauthz.go:49-53` (D3), and a test that a capability-scoped release or start-refresh against a `codex_account_unavailable` run is refused (its cap is revoked).
   - The migration widening `runs_recovery_wait_cause_check` with `codex_account_unavailable`, plus a new Go test pinning the cause vocabulary to the CHECK (the `TestFailOriginVocabularyMatchesCheck` pattern).
@@ -261,7 +262,7 @@ Each milestone ends green on `task gate:api`, plus `task gate:web` for M5 and `t
     - the gen-2 hold released with `no_adopted_source` and the gen-1 hold still open;
     - `worker_id = A`.
   - Precedence tests: a cancel or a competing reclaim between claim and park wins (the park refuses on status, worker or generation mismatch, with nothing mutated). A claim by a worker without `recovery_archive_v1` (expected 0, actual 0) parks with no release. Expected 1 with actual 0 (a missing hold) refuses, as do expected 0 with actual 1 and any count of two.
-- [ ] **M2: Pre-claim gate and sweeper park.** Depends on M1.
+- [x] **M2: Pre-claim gate and sweeper park.** Depends on M1.
   - The ClaimRun predicate (D2) and its peer mirror, plus the `park_codex_account_unavailable` pass.
   - Tests:
     - a quarantined account's run is never claimed, and gains no generation or hold;
@@ -270,8 +271,8 @@ Each milestone ends green on `task gate:api`, plus `task gate:web` for M5 and `t
     - `api_key` and Claude runs are unaffected;
     - a claim-versus-quarantine race reaching assembly lands on M1's park;
     - no claim or requeue loop over N sweep ticks.
-  - Implementation note (not ticked, pending review): M3 rework dropped the quarantine case's NULL-key disjunct (see D2's as-built note); `TestUnfrozenQuarantinedRunFailsNotHeldLiveDB` pins that such a run is neither gated nor parked, and fails at claim with `credential_unavailable`. Also: the A1 gate case, `ParkQueuedCodexAccountUnavailablePage` and its sweeper pass, `codex_account_gated` on the health read, draft migration `00252`, the copies-identical store test, the shared fixture table, and the LiveDB tests are on the branch. The claim-versus-quarantine race is covered by M1's `TestClaimObservedCaseReplayParksLiveDB`.
-- [ ] **M3: Account-driven promotion.** Depends on M2 (same files: `runtime.sql`, `sweep.go`).
+  - Implementation note (reviewed): M3 rework dropped the quarantine case's NULL-key disjunct (see D2's as-built note); `TestUnfrozenQuarantinedRunFailsNotHeldLiveDB` pins that such a run is neither gated nor parked, and fails at claim with `credential_unavailable`. Also: the A1 gate case, `ParkQueuedCodexAccountUnavailablePage` and its sweeper pass, `codex_account_gated` on the health read, draft migration `00252`, the copies-identical store test, the shared fixture table, and the LiveDB tests are on the branch. The claim-versus-quarantine race is covered by M1's `TestClaimObservedCaseReplayParksLiveDB`.
+- [x] **M3: Account-driven promotion.** Depends on M2 (same files: `runtime.sql`, `sweep.go`).
   - `promote_codex_account_available` (D3: one transaction locking run, then alias, then account; existing predicate), and both timer promoters skipping this cause.
   - Tests:
     - a valid held run actually reaches `queued` under the existing predicate (recovery_wait passes `codexCheckActivelyClaimed`);
@@ -281,7 +282,7 @@ Each milestone ends green on `task gate:api`, plus `task gate:web` for M5 and `t
     - deadlock interleaving (live-DB): a re-login transaction holds the account row (after `RefreshCodexAccountLogin`) and then requests the alias, while the promoter locks the run and requests alias then account. The promoter gets `55P03` and rolls back with the run still held, the re-login commits, and the next tick promotes. Both finish within a bounded time, with no deadlock and no premature promotion;
     - cancel works from the hold;
     - a resumed run starts with `started_at` NULL.
-  - Implementation note (not ticked, pending review): the pass, its three queries and the LiveDB tests in `codex_account_promote_livedb_test.go` are on the branch:
+  - Implementation note (reviewed): the pass, its three queries and the LiveDB tests in `codex_account_promote_livedb_test.go` are on the branch:
     - a re-logged-in account's held run is promoted by `Sweep` and its claim delivers the re-login's token and generation;
     - survivor leg: an account quarantined with recovery material at its current generation is promoted by the survivor pass, and the held run is `queued` after that same `Sweep` tick; the next claim delivers the recovered access token at the new generation, and the payload carries neither refresh token nor the pre-quarantine access token;
     - quarantined, staging re-login and same-identity relink runs stay held across ticks, and each tick is proven to examine the run;
@@ -289,7 +290,7 @@ Each milestone ends green on `task gate:api`, plus `task gate:web` for M5 and `t
     - with a healthy account whose row another transaction holds `FOR UPDATE`, the promoter passes the alias lock, refuses promptly without promoting, and promotes on the next tick;
     - a cause changed after the list does not promote; the deadlock interleaving; cancel from the hold; both timer promoters skip the cause with a past retry stamp.
     - Mutation evidence: each regression was observed failing under its mutation. Earlier: a blocking account lock (`40P01` deadlock); a timer promoter without the cause fence; the predicate skipped; the run lock and promote without the cause fence. In the M3 rework: the account-lock call deleted; the survivor pass back at the end of `Sweep`; the alias lock without `FOR SHARE NOWAIT` (the relink-waits leg and the deadlock test); the stays-held cursor reset removed. For the unfrozen gate fix, the pre-fix gate reddens the fixture-table row and the claim regression, a Go classifier that holds an unfrozen key reddens the Go table, and a one-copy revert reddens the copies-identical test.
-- [ ] **M4: Same-identity re-admission.** Depends on M3.
+- [x] **M4: Same-identity re-admission.** Depends on M3.
   - `ReadmitRunCodexBinding` (D5), invoked from the M3 pass before the predicate check, plus the feed line.
   - Tests:
     - a same alias, same identity, unchanged `credential_revision` re-login is re-admitted and claimable;
@@ -300,7 +301,7 @@ Each milestone ends green on `task gate:api`, plus `task gate:web` for M5 and `t
     - `staging` or `failed` stays held with no token;
     - a concurrent material change affects 0 rows;
     - a re-admitted run never receives a token captured before quarantine.
-  - Implementation note (not ticked, pending review): see D5's as-built note. LiveDB tests in `codex_account_readmit_livedb_test.go`:
+  - Implementation note (reviewed): see D5's as-built note. LiveDB tests in `codex_account_readmit_livedb_test.go`:
     - `TestCodexReadmitSameIdentityReloginLiveDB`: held while staging, then re-admitted and promoted in one tick; one feed line with the label and the revisions and no token or identity material; `last_seq` past it; the claim delivers only the re-login's token at its generation.
     - `TestCodexReadmitTerminalBindingChangesLiveDB`: a bumped `credential_revision`, a different identity, a changed alias kind, a changed run auth mode (alone and together with the kind), an undecodable frozen key, and a `linked` alias with no account are each terminal `credential_unavailable`, with no re-admission and no feed line.
     - `TestCodexReadmitDeletedAliasAfterParkLiveDB`: the next tick fails the run before any alias lock, and the older custody hold stays open.
@@ -314,15 +315,15 @@ Each milestone ends green on `task gate:api`, plus `task gate:web` for M5 and `t
     - `TestClassifyCodexAccountHold` (unit): the classification.
   - M3 tests adjusted for M4: `TestCodexAccountPromoteStaysHeldLiveDB` drops its same-identity relink leg (now re-admitted) and adds failed re-login, same identity during a live lease, and same identity quarantined with material ahead. `TestCodexAccountPromoteRelinkRaceLiveDB`'s different-identity leg now expects the terminal failure. `TestCodexAccountPromoteRelinkWaitsOnAliasLockLiveDB` now claims after the relink and asserts the `credential_unavailable` failure. `TestCodexAccountHoldNotClaimedThenParkedLiveDB` starts the promotion page past every id, so it still pins the park alone.
   - Mutation evidence: each `ReadmitRunCodexBinding` fence was dropped one at a time against the full LiveDB suite, and each of these reddened at least one test: the status, the cause, the observed alias id, the alias state row pinned to the run's alias, the auth mode, the alias kind, alias status `linked`, the identity comparison, `credential_revision`, `coord_state`, the old material CAS, the new material CAS, and the forward-only guard. Two fences no test can catch, because they are implied by constraints or joins. `ccs.user_id = r.user_id` follows from the two composite foreign keys onto `user_secrets (user_id, id)`, whose `id` is unique. `ccs.provider_account_id IS NOT NULL` follows from the inner join on `cpa.id = ccs.provider_account_id`. Both are kept as explicit documentation of the fence set.
-- [ ] **M5: Surfaces.** Depends on M1 and M4 (the `account_changed` / terminal cases).
+- [x] **M5: Surfaces.** Depends on M1 and M4 (the `account_changed` / terminal cases).
   - The derived `codex_account_action` (D6) in the DTO and the api-contract fixture.
   - A web `RecoveryWaitPanel` branch with the settings link, CLI `run get` and `run list` rendering, and TUI rows (`renderer.Plain` for the label, per `.claude/rules/tui.md`).
   - Tests per surface, including one per action string.
-  - As built (not ticked, pending review):
+  - As built (reviewed):
     - TUI: a `relogin_required` hold is the owner's turn, so it bands into NEEDS YOU on the board, and its state token reads "⚿ codex login" (`tui_render.go`). The board header gains a ⚿ counter of such holds (`boardSummary`, `tui_board.go`). Every other Codex hold (reconciling, verifying the login, resuming) resolves without the owner and stays ON THE FLOOR (`runBandOf`).
     - CLI: the `uzi run list` / `uzi admin runs` STATUS cell appends a short, label-free form of the action (`codexAccountActionShort`, `api/cmd/uzi/run_render.go`), so one held run's user-authored alias label cannot widen the column for every row. `uzi run get` shows the full labelled line (`codexAccountActionLine`) on its own row.
     - Web: the `RecoveryWaitPanel` branch announces the hold with one sentence per action (`codexHoldCopy`, `web/src/pages/RunView.tsx`), so a transition such as verifying_login → resuming is announced rather than silent.
-- [ ] **M6: Docs and specs.** Depends on M1-M5.
+- [x] **M6: Docs and specs.** Depends on M1-M5.
   - A "Codex account unavailable" section in `docs/run-recovery-wait.md` covering reason strings, owner actions and no expiry, then `task docs:sync`.
   - A `specs/human.md` entry.
   - An ADR for D1, D4 and D5 (the write-once binding relaxation and its fences), named for this issue number.
