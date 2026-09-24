@@ -137,8 +137,9 @@ export async function restoreTreeWritability(target: string): Promise<void> {
  *     root's CHILDREN as each agent uid through the existing cap-clearing `setpriv`
  *     wrappers: `runner`, then `runner-cmd` (Codex command roots are members of group
  *     `runner` and can write into a group-writable HOME), then `runner` again for
- *     what the second pass unblocked. Each pass also opens its own directories to
- *     group `runner`, so the other uid can reach entries nested inside. This is not
+ *     what the second pass unblocked. Each pass widens only OWNER bits, never group:
+ *     a `runner-cmd` entry nested inside a `runner`-private dir stays stranded rather
+ *     than exposing that dir to other runs' command roots. This is not
  *     an escalation: each helper holds exactly the privileges of the agent surface
  *     that wrote those files, and every caller runs after those surfaces are reaped.
  *  3. Finish with {@link rmTreeForce} as the worker, which removes the root (a
@@ -208,9 +209,10 @@ async function openRootToRunnerGroup(target: string): Promise<void> {
 
 /**
  * The script each agent-uid helper runs, as `node -e <script> <target>`. It walks the
- * root's children adding owner and group `rwx` to the directories it owns (the `0555`
- * Go module cache, a private `0700` dir the other agent uid must traverse), then
- * removes each child it can. Both steps refuse to follow symlinks: the walk opens with
+ * root's children adding OWNER `rwx` to the directories it owns (the `0555` Go module
+ * cache), then removes each child it can. Owner-only on purpose: widening a private
+ * `0700` dir to group `runner` would expose provider state to every `runner-cmd`
+ * process, including another run's still-live command root. Both steps refuse to follow symlinks: the walk opens with
  * `O_NOFOLLOW`, readdir types entries from `lstat`, and `rmSync` unlinks a symlink
  * rather than its target. It never touches the root itself. Errors are swallowed per
  * entry; the worker's final pass reports what remains.
@@ -223,7 +225,7 @@ const flags = fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_
 function widen(dir) {
   let fd;
   try { fd = fs.openSync(dir, flags); } catch { return; }
-  try { fs.fchmodSync(fd, (fs.fstatSync(fd).mode & 0o7777) | 0o770); } catch {} finally { fs.closeSync(fd); }
+  try { fs.fchmodSync(fd, (fs.fstatSync(fd).mode & 0o7777) | 0o700); } catch {} finally { fs.closeSync(fd); }
   let entries;
   try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
   for (const e of entries) if (e.isDirectory()) widen(path.join(dir, e.name));

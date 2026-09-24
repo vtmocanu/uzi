@@ -140,6 +140,30 @@ describe("HOME cleanup under the real uid split (#1607)", () => {
     await assertSentinelIntact();
   });
 
+  it("a partial pass never widens a runner-private dir to group (runner-cmd must not read it)", async () => {
+    // A runner-private dir that a runner pass CANNOT empty: runner-cmd wrote into it while it
+    // was group-writable, then runner made it private. Run one runner pass of the production
+    // helper script and assert the dir it failed to remove is still owner-only.
+    const home = path.join(HOME_ROOT, "uzi-review-private-mode");
+    await fs.mkdir(home);
+    await fs.chmod(home, 0o2770);
+    asRunner(`umask 002; mkdir -p "$1/priv"`, home);
+    asCommand(`umask 077; mkdir -p "$1/priv/cmd" && echo x > "$1/priv/cmd/out.txt"`, home);
+    asRunner(`chmod 0700 "$1/priv"`, home);
+    const wrapped = runnerUid.runnerCommand(process.execPath, ["-e", rmtree.PURGE_CHILDREN_SCRIPT, home]);
+    try {
+      execFileSync(wrapped.command, wrapped.args, { env: { PATH: "/usr/local/bin:/usr/bin:/bin" } });
+    } catch {
+      // Expected: the runner pass cannot remove runner-cmd's private entry.
+    }
+    const out = execFileSync(
+      runnerUid.runnerCommand("/bin/stat", ["-c", "%a", path.join(home, "priv")]).command,
+      runnerUid.runnerCommand("/bin/stat", ["-c", "%a", path.join(home, "priv")]).args,
+      { env: { PATH: "/usr/bin:/bin" } },
+    ).toString().trim();
+    assert.equal(out, "700", "the runner-private dir must stay owner-only after a partial pass");
+  });
+
   it("the startup reclaim removes only API-confirmed-terminal HOMEs", async () => {
     const terminal = await makeLeakedHome("00000000-0000-4000-8000-00000000000a", 0o2770);
     const running = await makeLeakedHome("00000000-0000-4000-8000-00000000000b", 0o2770);
