@@ -158,6 +158,22 @@ func (s *Service) logRefCapTransition(repoID uuid.UUID, maxRefs int, capped bool
 	}
 }
 
+// PrunePipelineCapState forgets the ref-cap state of every repo not in live (issue
+// #1483 follow-up). A repo deleted or disabled while capped is never synced again, so
+// logRefCapTransition never clears its entry; the poller calls this once per tick with
+// the enabled repos returned for the tick (including any whose sync errored), as it does
+// for its own per-repo state. A pruned repo that comes back still capped logs a fresh
+// WARN, as a first sync would.
+func (s *Service) PrunePipelineCapState(live map[uuid.UUID]struct{}) {
+	s.cappedMu.Lock()
+	defer s.cappedMu.Unlock()
+	for id := range s.cappedRepos {
+		if _, ok := live[id]; !ok {
+			delete(s.cappedRepos, id)
+		}
+	}
+}
+
 // syncOneRef fetches and caches the latest pipeline for a single watched ref.
 // When mrIID is valid the pipeline is read from the MR (catching detached and
 // merged-results pipelines the branch-ref query misses); otherwise from the

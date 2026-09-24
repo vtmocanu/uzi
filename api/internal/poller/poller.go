@@ -341,12 +341,20 @@ func (e *Engine) tick(ctx context.Context) {
 	}
 	wg.Wait()
 
-	// Drop state for repos no longer enabled so a re-enable starts fresh (full
-	// reconcile) and the map does not grow without bound.
+	e.pruneStates(seen)
+}
+
+// pruneStates drops per-repo state for repos no longer enabled (not in seen), so a
+// re-enable starts fresh (full reconcile) and no map grows without bound: the poller's
+// own states and the sync service's pipeline ref-cap state alike.
+func (e *Engine) pruneStates(seen map[uuid.UUID]struct{}) {
 	for id := range e.states {
 		if _, ok := seen[id]; !ok {
 			delete(e.states, id)
 		}
+	}
+	if e.svc != nil {
+		e.svc.PrunePipelineCapState(seen)
 	}
 }
 

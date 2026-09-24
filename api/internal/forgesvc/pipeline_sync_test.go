@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -464,5 +465,56 @@ func TestSyncPipelinesRefCapLogsTransitionsOnly(t *testing.T) {
 		if got, want := len(f.latestPipeRefs), 1+min(tk.refs, testMaxRefs); got != want {
 			t.Fatalf("%s: fetched %d refs, want %d (the cap+1 probe row must not be watched)", tk.name, got, want)
 		}
+	}
+}
+
+// TestPrunePipelineCapStateForgetsDroppedRepos: a repo pruned while capped (deleted or
+// disabled, so never synced again) loses its entry, and a live repo keeps its own
+// (issue #1483 follow-up). Observed through the log: a pruned repo that comes back
+// still capped WARNs again as if new, while a kept repo stays silent.
+func TestPrunePipelineCapStateForgetsDroppedRepos(t *testing.T) {
+	prev := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	var (
+		mu   sync.Mutex
+		msgs []string
+	)
+	slog.SetDefault(slog.New(capLogHandler{mu: &mu, msgs: &msgs}))
+
+	st := &fakeStore{watchedRefs: watchedRefsN(testMaxRefs + 1)}
+	svc := newTestService(st)
+	f := &fakeForge{}
+	dropped, kept := uuid.New(), uuid.New()
+	warns := func() int {
+		n := 0
+		for _, m := range msgs {
+			if strings.HasPrefix(m, "WARN forgesvc: pipeline watch hit the ref cap") {
+				n++
+			}
+		}
+		return n
+	}
+	syncRepo := func(repo uuid.UUID) {
+		t.Helper()
+		if err := svc.SyncPipelines(context.Background(), repo, 7, f, syncOpts(false)); err != nil {
+			t.Fatalf("SyncPipelines: %v", err)
+		}
+	}
+
+	syncRepo(dropped)
+	syncRepo(kept)
+	if got := warns(); got != 2 {
+		t.Fatalf("both repos crossing the cap: %d WARNs, want 2", got)
+	}
+
+	svc.PrunePipelineCapState(map[uuid.UUID]struct{}{kept: {}})
+	msgs = nil
+	syncRepo(kept)
+	if got := warns(); got != 0 {
+		t.Fatalf("kept repo still capped after prune: %d WARNs, want 0 (its entry must survive)", got)
+	}
+	syncRepo(dropped)
+	if got := warns(); got != 1 {
+		t.Fatalf("pruned repo back and still capped: %d WARNs, want 1 (its entry must be gone)", got)
 	}
 }
