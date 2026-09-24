@@ -377,6 +377,23 @@
   // semgrep-core from source — the non-negotiable condition for baking a tool in. Guard row is
   // `semgrep  semgrep  semgrep --version`. Added by hand-editing this file + the sibling
   // devbox.lock entry (never `devbox add`); locks as `source: "nixpkg"` at 20535e48….
+  //
+  // `lsof` + `procps` (2026-09-24, issue #1575) replace busybox applets that are a HAZARD,
+  // not merely missing. Busybox `lsof` ignores every option: `lsof -ti tcp:<port>` prints
+  // every open file of every process (exit 0), so `kill $(lsof -ti tcp:N)` signalled the
+  // whole runner tree, the agent included (run 08123d18 died with exit 143). This profile
+  // is first on PATH, so real lsof and procps's pgrep/pkill/ps shadow the applets, as
+  // coreutils does. procps also shadows free/top/watch/pidof/sysctl/w and more (measured in
+  // the built image; kill/uptime stay coreutils'). assert-toolchain.sh fails the build if
+  // lsof/pgrep/pkill resolve outside /nix/store or `lsof -ti tcp:<port>` stops filtering.
+  // Selectors measured at the lock's rev that day (79b35bf0):
+  //   * `lsof` is single-output (outputs [out], mainProgram lsof); bare attr, bin/lsof.
+  //   * `procps.out`, NOT bare `procps`: the file.out trap again. Outputs are
+  //     [out man dev doc] with every CLI in `out`, yet a bare `procps` realized
+  //     procps-4.0.7-dev in the profile (no pgrep; the guard's `pgrep -V` hit busybox).
+  // Both x86_64-linux narinfos are HTTP 200 on cache.nixos.org (lsof-4.99.7 151 KiB,
+  // procps-4.0.7 574 KiB download; closure glibc/ncurses/systemd-minimal-libs, all
+  // cached). Hand-written lock entries at the pinned rev.
   "packages": [
     "go",
     "gcc",
@@ -400,6 +417,8 @@
     "ripgrep",
     "opentofu",
     "yamllint",
-    "semgrep"
+    "semgrep",
+    "lsof",
+    "procps.out"
   ]
 }
