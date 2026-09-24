@@ -3,6 +3,9 @@ package forgesvc
 import (
 	"context"
 	"errors"
+	"fmt"
+	"log/slog"
+	"sync"
 	"testing"
 	"time"
 
@@ -368,12 +371,98 @@ func TestSyncPipelinesPassesWindowAndCapToQuery(t *testing.T) {
 	if err := svc.SyncPipelines(context.Background(), uuid.New(), 7, f, opts); err != nil {
 		t.Fatalf("SyncPipelines: %v", err)
 	}
-	if st.watchedRefsParam.MaxRefs != 20 {
-		t.Fatalf("cap must reach the query, got MaxRefs=%d", st.watchedRefsParam.MaxRefs)
+	// cap+1: one row past the cap tells "a branch was dropped" from "exactly full"
+	// (issue #1483).
+	if st.watchedRefsParam.MaxRefs != 21 {
+		t.Fatalf("cap+1 must reach the query, got MaxRefs=%d", st.watchedRefsParam.MaxRefs)
 	}
 	// FinishedAfter should be ~now-window (computed caller-side). Allow a small skew.
 	fa := st.watchedRefsParam.FinishedAfter
 	if !fa.Valid || fa.Time.Before(before.Add(-time.Minute)) || fa.Time.After(before.Add(time.Minute)) {
 		t.Fatalf("FinishedAfter must be now-window, got %v (want ~%v)", fa.Time, before)
+	}
+}
+
+// capLogHandler captures the ref-cap log lines SyncPipelines emits (issue #1483).
+type capLogHandler struct {
+	mu   *sync.Mutex
+	msgs *[]string
+}
+
+func (h capLogHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h capLogHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	*h.msgs = append(*h.msgs, r.Level.String()+" "+r.Message)
+	return nil
+}
+func (h capLogHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h capLogHandler) WithGroup(string) slog.Handler      { return h }
+
+func watchedRefsN(n int) []store.ListWatchedRunRefsForRepoRow {
+	rows := make([]store.ListWatchedRunRefsForRepoRow, n)
+	for i := range rows {
+		rows[i] = runRef(fmt.Sprintf("agent/issue-%d", i+1), 0)
+	}
+	return rows
+}
+
+// TestSyncPipelinesRefCapLogsTransitionsOnly: the ref-cap WARN fires once when a
+// repo starts dropping branches, stays silent while it keeps dropping them, and an
+// INFO line marks the drop back under the cap (issue #1483). Exactly MaxRefs watched
+// branches drops nothing, so it is not "capped". Swaps slog.SetDefault
+// (process-global): must not run in parallel.
+func TestSyncPipelinesRefCapLogsTransitionsOnly(t *testing.T) {
+	prev := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	var (
+		mu   sync.Mutex
+		msgs []string
+	)
+	slog.SetDefault(slog.New(capLogHandler{mu: &mu, msgs: &msgs}))
+
+	const (
+		warn = "WARN forgesvc: pipeline watch hit the ref cap; at least one older run branch is not watched until it clears (admin Health forge.ciwatch shows the current cap status)"
+		info = "INFO forgesvc: pipeline watch back under the ref cap; every eligible run branch is watched"
+	)
+	st := &fakeStore{}
+	svc := newTestService(st)
+	repo := uuid.New()
+	f := &fakeForge{}
+
+	ticks := []struct {
+		name string
+		refs int
+		want []string
+	}{
+		{"exactly at the cap drops nothing", testMaxRefs, nil},
+		{"first tick over the cap", testMaxRefs + 5, []string{warn}},
+		{"still over the cap", testMaxRefs + 5, nil},
+		{"still over the cap again", testMaxRefs + 1, nil},
+		{"back at the cap", testMaxRefs, []string{info}},
+		{"stays under", 3, nil},
+		{"over again", testMaxRefs + 1, []string{warn}},
+	}
+	for _, tk := range ticks {
+		msgs = nil
+		st.watchedRefs = watchedRefsN(tk.refs)
+		st.pipelineUpserts = nil
+		f.latestPipeRefs = nil
+		if err := svc.SyncPipelines(context.Background(), repo, 7, f, syncOpts(false)); err != nil {
+			t.Fatalf("%s: SyncPipelines: %v", tk.name, err)
+		}
+		var capLines []string
+		for _, m := range msgs {
+			if m == warn || m == info {
+				capLines = append(capLines, m)
+			}
+		}
+		if fmt.Sprint(capLines) != fmt.Sprint(tk.want) {
+			t.Fatalf("%s: cap log lines = %q, want %q", tk.name, capLines, tk.want)
+		}
+		// The probe row past the cap is never watched: main + min(refs, MaxRefs).
+		if got, want := len(f.latestPipeRefs), 1+min(tk.refs, testMaxRefs); got != want {
+			t.Fatalf("%s: fetched %d refs, want %d (the cap+1 probe row must not be watched)", tk.name, got, want)
+		}
 	}
 }

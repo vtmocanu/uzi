@@ -31,6 +31,8 @@ through `[0.52.0]`.)
 
 - **A plan turn that ends with prose only now parks for the run's owner instead of always failing ([#1593](https://github.com/vtmocanu/uzi/issues/1593)).**
   When a gated plan (or plan-revision) turn calls neither `submit_plan` nor `ask_user` and just writes prose, the worker resumes the same session once with a fixed corrective nudge; if it is still prose only, an attended run parks at `awaiting_input` on a fixed "Plan missing" question while the lead's last message rides along as a bounded, secret-scrubbed feed card, and an autopilot or otherwise-unattended run fails closed with the new judge-eligible `plan_missing` fail origin, backed by a migration that widens `runs_fail_origin_check` to sixteen values.
+- **The pipeline-watch ref-cap warning no longer repeats on every sync tick ([#1483](https://github.com/vtmocanu/uzi/issues/1483)).**
+  A repo whose run branches stay over `CI_WATCH_MAX_REFS` now logs one WARN when it starts dropping branches and one INFO when it drops back under, instead of the same WARN every tick (measured at 99% of all WARN output on a busy instance). The watcher now reads one row past the cap, so a repo with exactly the cap and nothing dropped no longer warns. The admin Health tab's CI-watch check still shows the current cap status.
 
 ## [0.84.0] - 2026-09-20
 

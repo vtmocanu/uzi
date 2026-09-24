@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"math"
 	"time"
 
 	"github.com/google/uuid"
@@ -67,21 +68,27 @@ func (s *Service) SyncPipelines(ctx context.Context, repoID uuid.UUID, forgeProj
 		}
 	}
 
-	// 2. Watched agent run branches (windowed + capped, newest first).
+	// 2. Watched agent run branches (windowed + capped, newest first). Fetch one past
+	//    the cap so "a full page" and "a branch was dropped" are distinguishable: a
+	//    repo with exactly MaxRefs watched branches drops nothing and must not warn.
+	//    Clamped so an absurd CI_WATCH_MAX_REFS cannot wrap the int32 LIMIT negative.
+	limit := int32(math.MaxInt32)
+	if opts.MaxRefs < math.MaxInt32 {
+		limit = int32(opts.MaxRefs) + 1
+	}
 	refs, err := s.q.ListWatchedRunRefsForRepo(ctx, store.ListWatchedRunRefsForRepoParams{
 		RepoID:        repoID,
 		FinishedAfter: pgtype.Timestamptz{Time: time.Now().Add(-opts.Window), Valid: true},
-		MaxRefs:       int32(opts.MaxRefs),
+		MaxRefs:       limit,
 	})
 	if err != nil {
 		return err
 	}
-	if len(refs) >= opts.MaxRefs {
-		// LIMIT returned a full page: there may be older watched branches we dropped.
-		// Logged, not silent (PRD #6 Risks: "hitting the cap logs which refs were dropped").
-		slog.Warn("forgesvc: pipeline watch hit the ref cap; older run branches are not watched",
-			"repo", repoID, "cap", opts.MaxRefs)
+	capped := len(refs) > opts.MaxRefs
+	if capped {
+		refs = refs[:opts.MaxRefs]
 	}
+	s.logRefCapTransition(repoID, opts.MaxRefs, capped)
 	for _, ref := range refs {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -119,6 +126,36 @@ func (s *Service) SyncPipelines(ctx context.Context, repoID uuid.UUID, forgeProj
 		}
 	}
 	return nil
+}
+
+// logRefCapTransition logs a repo's pipeline watch entering or leaving the capped
+// state (issue #1483). On a busy repo being over the cap is a steady state, so a
+// per-tick line would drown every other warning; the ongoing fact lives on the
+// admin Health tab's forge.ciwatch check (repos over the cap, busiest repo's count).
+// A repo's first sync that is not capped logs nothing.
+func (s *Service) logRefCapTransition(repoID uuid.UUID, maxRefs int, capped bool) {
+	s.cappedMu.Lock()
+	was := s.cappedRepos[repoID]
+	if capped != was {
+		if s.cappedRepos == nil {
+			s.cappedRepos = make(map[uuid.UUID]bool)
+		}
+		if capped {
+			s.cappedRepos[repoID] = true
+		} else {
+			delete(s.cappedRepos, repoID)
+		}
+	}
+	s.cappedMu.Unlock()
+
+	switch {
+	case capped && !was:
+		slog.Warn("forgesvc: pipeline watch hit the ref cap; at least one older run branch is not watched until it clears (admin Health forge.ciwatch shows the current cap status)",
+			"repo", repoID, "cap", maxRefs)
+	case !capped && was:
+		slog.Info("forgesvc: pipeline watch back under the ref cap; every eligible run branch is watched",
+			"repo", repoID, "cap", maxRefs)
+	}
 }
 
 // syncOneRef fetches and caches the latest pipeline for a single watched ref.

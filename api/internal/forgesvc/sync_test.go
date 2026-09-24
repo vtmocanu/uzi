@@ -391,7 +391,11 @@ func (s *fakeStore) SetRunMRState(_ context.Context, arg store.SetRunMRStatePara
 }
 func (s *fakeStore) ListWatchedRunRefsForRepo(_ context.Context, arg store.ListWatchedRunRefsForRepoParams) ([]store.ListWatchedRunRefsForRepoRow, error) {
 	s.watchedRefsParam = arg
-	return s.watchedRefs, s.watchedRefsErr
+	refs := s.watchedRefs
+	if arg.MaxRefs > 0 && len(refs) > int(arg.MaxRefs) {
+		refs = refs[:arg.MaxRefs] // the query's LIMIT
+	}
+	return refs, s.watchedRefsErr
 }
 func (s *fakeStore) UpsertPipelineStatus(_ context.Context, arg store.UpsertPipelineStatusParams) (store.PipelineStatus, error) {
 	s.pipelineUpserts = append(s.pipelineUpserts, arg)
