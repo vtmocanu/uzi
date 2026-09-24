@@ -51,7 +51,7 @@ import {
   type SendTerminalState,
   type TerminalOutboxDeps,
 } from "./terminal-resolve.js";
-import { rmTreeForce } from "./rmtree.js";
+import { rmHomeTree } from "./rmtree.js";
 import {
   SteeringChannel,
   PauseNowSignal,
@@ -1958,7 +1958,7 @@ export class RunRunner {
       // session transcript under it is only needed to resume, and a terminal run
       // never resumes. A concurrent sibling's HOME is a distinct dir, untouched.
       //
-      // rmTreeForce, not fs.rm (PRD #108 M6): the Go module cache under this HOME
+      // rmHomeTree, not fs.rm (PRD #108 M6, #1607): the Go module cache under this HOME
       // writes its package directories mode 0555, and `force: true` suppresses
       // ENOENT — not the EACCES that unlinking inside a read-only directory
       // raises. Every Go-touching run stranded its module cache (167.3 MB
@@ -1966,7 +1966,7 @@ export class RunRunner {
       // error: this is a `finally`, and a cleanup that threw would convert a
       // completed run into a failed one, which is strictly worse than a leak.
       if (runHome && !preserveResumeArtifacts) {
-        await rmTreeForce(runHome).catch((e) =>
+        await rmHomeTree(runHome).catch((e) =>
           runLog.warn("run HOME cleanup failed", { error: errMessage(e) }),
         );
       }

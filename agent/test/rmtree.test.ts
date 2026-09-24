@@ -3,7 +3,15 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { rmTreeForce, restoreTreeWritability } from "../src/rmtree.js";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import {
+  PURGE_CHILDREN_SCRIPT,
+  type HomeRemovalDeps,
+  rmHomeTree,
+  rmTreeForce,
+  restoreTreeWritability,
+} from "../src/rmtree.js";
 
 /**
  * PRD #108 M6. `fs.rm(recursive, force)` cannot delete a tree the Go module cache
@@ -188,3 +196,147 @@ async function exists(p: string): Promise<boolean> {
     () => false,
   );
 }
+
+/**
+ * Issue #1607. The cross-uid proof (worker cleanup of a runner-written HOME) needs the
+ * real uid split and lives in `e2e/home-uid-split/` (`task test:home-uid-split`). These
+ * host tests pin the decision logic around it and the purge script's own behaviour,
+ * which is uid-independent.
+ */
+describe("rmHomeTree (#1607)", () => {
+  const eacces = () => Object.assign(new Error("EACCES: permission denied, scandir"), { code: "EACCES" });
+
+  /** Fake deps recording calls; removeTree fails EACCES `failures` times, then really removes. */
+  function fakeDeps(splitActive: boolean, failures: number, firstError: () => Error = eacces) {
+    const calls: string[] = [];
+    let left = failures;
+    const deps: HomeRemovalDeps = {
+      splitActive,
+      removeTree: async (t) => {
+        calls.push("removeTree");
+        if (left > 0) {
+          left -= 1;
+          throw firstError();
+        }
+        await rmTreeForce(t);
+      },
+      purgeChildrenAsAgents: async () => {
+        calls.push("purge");
+      },
+    };
+    return { deps, calls };
+  }
+
+  it("single-uid: a removal that succeeds never reaches the runner helper", async () => {
+    const root = await mktmp();
+    const { deps, calls } = fakeDeps(false, 0);
+    await rmHomeTree(root, deps);
+    assert.deepStrictEqual(calls, ["removeTree"]);
+    assert.strictEqual(await exists(root), false);
+  });
+
+  it("single-uid: a permission failure propagates unchanged (no helper to fall back to)", async () => {
+    const root = await mktmp();
+    try {
+      const { deps, calls } = fakeDeps(false, 1);
+      await assert.rejects(rmHomeTree(root, deps), { code: "EACCES" });
+      assert.deepStrictEqual(calls, ["removeTree"]);
+    } finally {
+      await forceCleanup(root);
+    }
+  });
+
+  it("split: a permission failure purges as runner, widens the root for group runner, then retries as the worker", async () => {
+    const root = await mktmp();
+    await fs.chmod(root, 0o700);
+    let modeAtPurge = -1;
+    const { deps, calls } = fakeDeps(true, 1);
+    deps.purgeChildrenAsAgents = async (t) => {
+      calls.push("purge");
+      modeAtPurge = (await fs.lstat(t)).mode & 0o777;
+    };
+    await rmHomeTree(root, deps);
+    assert.deepStrictEqual(calls, ["removeTree", "purge", "removeTree"]);
+    assert.strictEqual(modeAtPurge & 0o070, 0o070, "group runner must be able to traverse the root when the helper runs");
+    assert.strictEqual(await exists(root), false);
+  });
+
+  it("split: the helper's own failure is not the verdict; the worker's final pass is", async () => {
+    const root = await mktmp();
+    const { deps, calls } = fakeDeps(true, 1);
+    deps.purgeChildrenAsAgents = async () => {
+      calls.push("purge");
+      throw new Error("helper exited 1");
+    };
+    await rmHomeTree(root, deps);
+    assert.deepStrictEqual(calls, ["removeTree", "purge", "removeTree"]);
+    assert.strictEqual(await exists(root), false);
+  });
+
+  it("split: a non-permission error propagates without reaching the helper", async () => {
+    const root = await mktmp();
+    try {
+      const { deps, calls } = fakeDeps(true, 1, () => Object.assign(new Error("ENOSPC"), { code: "ENOSPC" }));
+      await assert.rejects(rmHomeTree(root, deps), { code: "ENOSPC" });
+      assert.deepStrictEqual(calls, ["removeTree"]);
+    } finally {
+      await forceCleanup(root);
+    }
+  });
+
+  it("split: refuses a symlinked root and never runs the helper through it", async () => {
+    const outside = await mktmp();
+    const parent = await mktmp();
+    const link = path.join(parent, "home");
+    try {
+      await fs.symlink(outside, link, "dir");
+      const modeBefore = (await fs.lstat(outside)).mode;
+      const { deps, calls } = fakeDeps(true, 1);
+      await assert.rejects(rmHomeTree(link, deps));
+      assert.deepStrictEqual(calls, ["removeTree"]);
+      assert.strictEqual((await fs.lstat(outside)).mode, modeBefore, "the symlink target's mode is untouched");
+    } finally {
+      await forceCleanup(parent);
+      await forceCleanup(outside);
+    }
+  });
+
+  it("refuses a non-absolute path before touching anything", async () => {
+    const { deps, calls } = fakeDeps(true, 0);
+    await assert.rejects(rmHomeTree("relative/home", deps), /non-absolute/);
+    assert.deepStrictEqual(calls, []);
+  });
+});
+
+describe("PURGE_CHILDREN_SCRIPT (#1607)", () => {
+  const run = promisify(execFile);
+
+  it("removes every child including 0555 dirs, keeps the root, and never follows a symlink out", async (t) => {
+    if (asRoot) {
+      t.skip("running as uid 0 — root bypasses the 0555 fixture, so the widening walk would not be forced");
+      return;
+    }
+    const home = await mktmp();
+    const outside = await mktmp();
+    try {
+      const keep = path.join(outside, "keep");
+      await fs.mkdir(keep);
+      await fs.writeFile(path.join(keep, "precious"), "do not touch\n", "utf8");
+      await fs.chmod(keep, 0o555);
+      const mod = await makeGoModCacheFixture(home);
+      await fs.symlink(keep, path.join(home, "escape"), "dir");
+      await fs.chmod(path.join(home, ".claude", "projects"), 0o700);
+      await assertReadOnlyDir(mod);
+
+      await run(process.execPath, ["-e", PURGE_CHILDREN_SCRIPT, home]);
+
+      assert.deepStrictEqual(await fs.readdir(home), [], "every child is removed");
+      assert.ok(await exists(home), "the root itself is left for the worker's final pass");
+      assert.ok(await exists(path.join(keep, "precious")), "the symlink target's contents survive");
+      assert.strictEqual(((await fs.lstat(keep)).mode & 0o777).toString(8), "555", "the symlink target's mode is untouched");
+    } finally {
+      await forceCleanup(home);
+      await forceCleanup(outside);
+    }
+  });
+});

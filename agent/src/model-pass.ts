@@ -29,7 +29,7 @@ import type { EffortLevel } from "@anthropic-ai/claude-agent-sdk";
 
 import { ClaudeAdviceHarness } from "./claude-advice-harness.js";
 import { uidSplitActive } from "./runner-uid.js";
-import { rmTreeForce } from "./rmtree.js";
+import { rmHomeTree } from "./rmtree.js";
 import { LimitReachedError, type RateLimitObservation } from "./limit.js";
 import { errMessage } from "./util.js";
 import type { Logger } from "./log.js";
@@ -149,8 +149,9 @@ export async function runReadOnlyModelPass(opts: ReadOnlyModelPassOpts): Promise
   // runs in the WORKER process, so the HOME is worker-owned 0700 — the runner gets ZERO
   // access (the setgid /data/agent-home parent sets the dir's group `runner`, but 0700
   // grants the group nothing) and the CLI cannot write $HOME/.claude. Under the split,
-  // widen it to 2770 (group `runner` rwx) so the runner can use it and the worker (a
-  // `runner`-group member) can still rm it on cleanup. The unit-test / single-uid (#58)
+  // widen it to 2770 (group `runner` rwx) so the runner can use it. Group membership
+  // does NOT let the worker rm it: the CLI writes runner-owned private (0700) dirs
+  // inside, which only a `runner`-uid helper can remove (rmHomeTree, #1607). The unit-test / single-uid (#58)
   // path leaves 0700 (the pass runs as the worker — same uid, 0700 is correct + tighter).
   if (uidSplitActive()) await fs.chmod(homeDir, 0o2770);
   // Wall-clock cap: abort the SDK query (native cancellation) AND hard-reject the race,
@@ -210,7 +211,7 @@ export async function runReadOnlyModelPass(opts: ReadOnlyModelPassOpts): Promise
     // it is named `uzi-<label>-*`, not a run UUID, so the sweep's RUN_ID_RE filter skips
     // it BY DESIGN — this warn is the only thing anywhere that will say a dir stranded.
     // Still best-effort: a cleanup must never fail a run.
-    await rmTreeForce(homeDir).catch((e) =>
+    await rmHomeTree(homeDir).catch((e) =>
       opts.log.warn(`${opts.label} HOME cleanup failed`, { home_dir: homeDir, error: errMessage(e) }),
     );
   }
