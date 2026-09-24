@@ -2316,6 +2316,30 @@ describe("mid-turn checkpoint round 3 (issue #1597 M2)", () => {
       pub.restore();
     }
   });
+
+  it("(r3 3) a REJECTED --remerge-diff probe is not cached: a later call probes again", async (t) => {
+    const ver = /git version (\d+)\.(\d+)/.exec(execFileSync("git", ["version"], { encoding: "utf8" }));
+    if (!ver || Number(ver[1]) < 2 || (Number(ver[1]) === 2 && Number(ver[2]) < 36)) {
+      t.skip("local git < 2.36 has no --remerge-diff");
+      return;
+    }
+    const g = new GitCache(fx.dataDir, nullLogger(), undefined, { gitleaksBin: defaultGitleaksShim() });
+    type ExecScoped = (command: string, args: string[], ...rest: unknown[]) => Promise<{ stdout: string; stderr: string }>;
+    const priv = g as unknown as { execScoped: ExecScoped; remergeDiffSupported: () => Promise<boolean> };
+    const original = priv.execScoped.bind(g);
+    let versionCalls = 0;
+    priv.execScoped = (command, args, ...rest) => {
+      if (command === "git" && args[0] === "version" && ++versionCalls === 1) {
+        return Promise.reject(new Error("aborted: tick scan scope ended"));
+      }
+      return original(command, args, ...rest);
+    };
+    assert.equal(await priv.remergeDiffSupported(), false, "the rejected probe answers false for its own call");
+    assert.equal(await priv.remergeDiffSupported(), true, "a later call re-probes instead of reusing the rejection");
+    assert.equal(versionCalls, 2);
+    assert.equal(await priv.remergeDiffSupported(), true, "a completed probe is cached");
+    assert.equal(versionCalls, 2);
+  });
 });
 
 // ── round 4 (issue #1597 M2) ────────────────────────────────────────────────────────────────

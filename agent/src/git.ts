@@ -2237,15 +2237,27 @@ export class GitCache {
     };
   }
 
-  /** issue #1597 M2 — does this git have `--remerge-diff` (git ≥ 2.36)? Probed once. */
+  /** issue #1597 M2 — does this git have `--remerge-diff` (git ≥ 2.36)? Only a COMPLETED probe is
+   *  cached: a rejected one (a tick's scan scope aborted or hit its deadline, a spawn error) answers
+   *  false for that call alone and clears the cache so a later call probes again. Caching the
+   *  rejection would pin every later two-parent merge scan on this long-lived cache to the
+   *  `diff M^1 M` fallback, which re-adds main's changes and blocks checkpoints on main's fixtures. */
   private remergeDiffSupported(): Promise<boolean> {
-    this.remergeProbe ??= this.execScoped("git", ["version"], { env: gitEnv(), timeout: 10_000 })
-      .then(({ stdout }) => {
+    const cached = this.remergeProbe;
+    if (cached) return cached;
+    const probe: Promise<boolean> = this.execScoped("git", ["version"], { env: gitEnv(), timeout: 10_000 }).then(
+      ({ stdout }) => {
         const m = /git version (\d+)\.(\d+)/.exec(stdout);
         return m !== null && (Number(m[1]) > 2 || (Number(m[1]) === 2 && Number(m[2]) >= 36));
-      })
-      .catch(() => false);
-    return this.remergeProbe;
+      },
+      () => {
+        // Clear only our own entry: a later call may already have started a fresh probe.
+        if (this.remergeProbe === probe) this.remergeProbe = undefined;
+        return false;
+      },
+    );
+    this.remergeProbe = probe;
+    return probe;
   }
 
   /** issue #1597 M2 — scan ONE merge commit's own contribution through `gitleaks stdin` (see
