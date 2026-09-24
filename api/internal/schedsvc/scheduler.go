@@ -83,7 +83,7 @@ type Store interface {
 	AdvanceSchedule(ctx context.Context, arg store.AdvanceScheduleParams) (store.RunSchedule, error)
 	SetRunScheduleStatus(ctx context.Context, arg store.SetRunScheduleStatusParams) (store.RunSchedule, error)
 	ListSweepCandidateIssues(ctx context.Context, arg store.ListSweepCandidateIssuesParams) ([]store.ListSweepCandidateIssuesRow, error)
-	CountSweepCandidateIssues(ctx context.Context, arg store.CountSweepCandidateIssuesParams) (int64, error)
+	CountSweepCandidateIssues(ctx context.Context, arg store.CountSweepCandidateIssuesParams) (store.CountSweepCandidateIssuesRow, error)
 	HasActiveRunForIssue(ctx context.Context, arg store.HasActiveRunForIssueParams) (bool, error)
 	HasActiveRunForSchedule(ctx context.Context, scheduleID pgtype.UUID) (bool, error)
 	GetRepoForUser(ctx context.Context, arg store.GetRepoForUserParams) (store.GetRepoForUserRow, error)
@@ -512,21 +512,26 @@ func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) (Fir
 	// empty→uzi bypass this milestone requires); assignment is selected purely by the
 	// connection's numeric bot_forge_user_id. The '[]' labels keep the @labels::jsonb cast
 	// valid even though the assigned branch of the query ignores it.
+	//
+	// Eligibility (issue #1543): the query filters candidates by the run-eligibility gate
+	// (the configured uzi label OR assignment to the connection's bot) BEFORE the scan-window
+	// LIMIT, so both kinds carry the bot id and the label kind carries the resolved uzi label.
 	var (
 		querySelector = selectorKind
 		labelsJSON    []byte
-		botID         int64
+		uziLabel      string
+		botID         = repo.BotForgeUserID
 	)
 	switch selectorKind {
 	case schedtmpl.SelectorAssigned:
 		labelsJSON = []byte("[]")
-		botID = repo.BotForgeUserID
 	default: // schedtmpl.SelectorLabel
 		querySelector = schedtmpl.SelectorLabel
 		labelsJSON, err = e.resolveSweepLabels(ctx, sched.Labels)
 		if err != nil {
 			return FireOutcome{}, err
 		}
+		uziLabel = e.resolveUziLabel(ctx)
 	}
 	// Backfill scan window (issue #416): fetch max_issues + backfillHeadroom candidates so
 	// the loop below can walk past skipped slots and still start up to max_issues runs. The
@@ -537,7 +542,7 @@ func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) (Fir
 		scanLimit = pgtype.Int4{Int32: sched.MaxIssues.Int32 + backfillHeadroom, Valid: true}
 	}
 	candidates, err := e.store.ListSweepCandidateIssues(ctx, store.ListSweepCandidateIssuesParams{
-		RepoID: repo.ID, Selector: querySelector, Labels: labelsJSON, BotID: botID, MaxIssues: scanLimit,
+		RepoID: repo.ID, Selector: querySelector, Labels: labelsJSON, UziLabel: uziLabel, BotID: botID, MaxIssues: scanLimit,
 	})
 	if err != nil {
 		return FireOutcome{}, err // transient DB error
@@ -553,13 +558,13 @@ func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) (Fir
 	// started-nothing hint.
 	capped := false
 	if sched.MaxIssues.Valid {
-		total, err := e.store.CountSweepCandidateIssues(ctx, store.CountSweepCandidateIssuesParams{
-			RepoID: repo.ID, Selector: querySelector, Labels: labelsJSON, BotID: botID,
+		counts, err := e.store.CountSweepCandidateIssues(ctx, store.CountSweepCandidateIssuesParams{
+			RepoID: repo.ID, Selector: querySelector, Labels: labelsJSON, UziLabel: uziLabel, BotID: botID,
 		})
 		if err != nil {
 			return FireOutcome{}, err // transient DB error
 		}
-		capped = total > int64(len(candidates))
+		capped = counts.Eligible > int64(len(candidates))
 	}
 
 	// Matched is set at the END to len(Started)+len(Skips) — the candidates actually
@@ -942,17 +947,27 @@ func (e *Scheduler) resolveSweepLabels(ctx context.Context, stored []byte) ([]by
 	// Drop blanks so a stored `[""]` does not defeat the non-empty invariant.
 	sel = nonBlank(sel)
 	if len(sel) == 0 {
-		uzi, _ := e.settings.UziLabel(ctx)
-		if strings.TrimSpace(uzi) == "" {
-			uzi = settings.DefaultUziLabel
-		}
-		sel = []string{uzi}
+		sel = []string{e.resolveUziLabel(ctx)}
 	}
 	out, err := json.Marshal(sel)
 	if err != nil {
 		return nil, fmt.Errorf("marshal sweep labels: %w", err)
 	}
 	return out, nil
+}
+
+// resolveUziLabel returns the configured run-eligibility (uzi) label, falling back to
+// settings.DefaultUziLabel when it is unset or blank — the same fallback the run-create
+// gate applies, so the sweep's SQL eligibility filter and createRun agree (issue #1543).
+func (e *Scheduler) resolveUziLabel(ctx context.Context) string {
+	if e.settings == nil {
+		return settings.DefaultUziLabel
+	}
+	uzi, _ := e.settings.UziLabel(ctx)
+	if strings.TrimSpace(uzi) == "" {
+		return settings.DefaultUziLabel
+	}
+	return uzi
 }
 
 // sleep pauses for d unless ctx-less; extracted so the test can drive it to a no-op.

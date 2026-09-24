@@ -25,8 +25,10 @@ import (
 //     has_prd_link=false and NO prds link. That last part is the fail-pre-change
 //     discriminator: pre-PRD #764 M1 the removed PRD-link gate (Gate B) would have refused
 //     a link-less swept issue with the old no-PRD-link sentinel, so no run row.
-//   - The `["bug"]`-only issue (bare selector, no `uzi`) is a benign not_eligible skip and
-//     produces NO run row — the real uzi_label gate refuses it with ErrNotPRDIssue.
+//   - The `["bug"]`-only issue (bare selector, no `uzi`) produces NO run row. Since issue
+//     #1543 the candidate query filters eligibility in SQL before the scan window, so it is
+//     never a candidate (no per-issue not_eligible skip); the real uzi_label gate in
+//     createRun remains the authoritative backstop.
 //   - The SCHEDULE ADVANCES: next_fire_at moves to a future instant and status stays
 //     'active' (not parked/errored), so a bare-selector candidate never wedges the cadence.
 //
@@ -60,9 +62,8 @@ func (b sweepGateBuilder) ForgeForConnection(string, string, []byte) (forge.Forg
 	return b.f, nil
 }
 
-// sweepGateSettings satisfies schedsvc.SettingsReader. The sweep selector below is an
-// explicit ["bug"], so resolveSweepLabels never falls back to UziLabel — this is here only
-// to hand New a non-nil reader.
+// sweepGateSettings satisfies schedsvc.SettingsReader. Its UziLabel feeds the sweep's SQL
+// eligibility filter (issue #1543); the explicit ["bug"] selector never falls back to it.
 type sweepGateSettings struct{}
 
 func (sweepGateSettings) UziLabel(context.Context) (string, error)      { return "uzi", nil }
@@ -90,7 +91,7 @@ func TestSweepFiresOnlyUziLabelledCandidateLiveDB(t *testing.T) {
 	projectID := int64(uuid.New().ID())
 	const (
 		uziIID  = int64(101) // ["bug","uzi"] → fires
-		bareIID = int64(102) // ["bug"] only → not_eligible skip
+		bareIID = int64(102) // ["bug"] only → filtered out of the candidates (#1543)
 	)
 
 	t.Cleanup(func() { mustExecT(ctx, t, pool, `DELETE FROM users WHERE id = $1`, owner) })
@@ -166,7 +167,7 @@ func TestSweepFiresOnlyUziLabelledCandidateLiveDB(t *testing.T) {
 		t.Fatalf("count bare-selector runs: %v", err)
 	}
 	if bareRuns != 0 {
-		t.Fatalf("bare-selector ['bug'] issue produced %d runs, want 0 (refused by the uzi_label gate)", bareRuns)
+		t.Fatalf("bare-selector ['bug'] issue produced %d runs, want 0 (not eligible)", bareRuns)
 	}
 
 	// The schedule ADVANCED: next_fire_at moved to a future instant and status stayed active.
@@ -176,14 +177,14 @@ func TestSweepFiresOnlyUziLabelledCandidateLiveDB(t *testing.T) {
 		t.Fatalf("read advanced schedule: %v", err)
 	}
 	if status != "active" {
-		t.Fatalf("schedule status = %q, want active (a benign not_eligible skip must not park it)", status)
+		t.Fatalf("schedule status = %q, want active (an ineligible selector match must not park it)", status)
 	}
 	if !nextFire.After(tickAt) {
 		t.Fatalf("next_fire_at = %s, want a future instant after the tick (%s) — the schedule must advance", nextFire, tickAt)
 	}
 
-	// And the persisted last_fire records the bare candidate as exactly one not_eligible
-	// skip alongside the one start, so "advanced" is not hiding a mis-bucketed fire.
+	// And the persisted last_fire records exactly the one start and NO per-issue skip: the
+	// bare selector match is filtered before the scan window (#1543), so it is not examined.
 	var lastFireRaw []byte
 	if err := pool.QueryRow(ctx, `SELECT last_fire FROM run_schedules WHERE id = $1`, schedID).Scan(&lastFireRaw); err != nil {
 		t.Fatalf("read last_fire: %v", err)
@@ -201,16 +202,10 @@ func TestSweepFiresOnlyUziLabelledCandidateLiveDB(t *testing.T) {
 	if err := json.Unmarshal(lastFireRaw, &lf); err != nil {
 		t.Fatalf("decode last_fire: %v (raw %s)", err, lastFireRaw)
 	}
-	if lf.Matched != 2 || len(lf.Started) != 1 || len(lf.Skips) != 1 {
-		t.Fatalf("last_fire = %+v, want matched:2 one start one skip", lf)
+	if lf.Matched != 1 || len(lf.Started) != 1 || len(lf.Skips) != 0 {
+		t.Fatalf("last_fire = %+v, want matched:1 one start no skips", lf)
 	}
 	if lf.Started[0].IssueIID == nil || *lf.Started[0].IssueIID != uziIID {
 		t.Fatalf("last_fire start iid = %v, want %d", lf.Started[0].IssueIID, uziIID)
-	}
-	if lf.Skips[0].Reason != string(schedsvc.SkipNotEligible) {
-		t.Fatalf("last_fire skip reason = %q, want not_eligible", lf.Skips[0].Reason)
-	}
-	if lf.Skips[0].IssueIID == nil || *lf.Skips[0].IssueIID != bareIID {
-		t.Fatalf("last_fire skip iid = %v, want %d", lf.Skips[0].IssueIID, bareIID)
 	}
 }

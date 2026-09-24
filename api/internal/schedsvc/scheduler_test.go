@@ -173,13 +173,13 @@ func (f *fakeStore) ListSweepCandidateIssues(_ context.Context, arg store.ListSw
 	f.sweepBotIDParam = arg.BotID
 	return f.sweepRows, nil
 }
-func (f *fakeStore) CountSweepCandidateIssues(_ context.Context, arg store.CountSweepCandidateIssuesParams) (int64, error) {
+func (f *fakeStore) CountSweepCandidateIssues(_ context.Context, arg store.CountSweepCandidateIssuesParams) (store.CountSweepCandidateIssuesRow, error) {
 	f.sweepCountCalls++
 	f.countLabelParam = arg.Labels
 	if f.sweepCountErr != nil {
-		return 0, f.sweepCountErr
+		return store.CountSweepCandidateIssuesRow{}, f.sweepCountErr
 	}
-	return f.sweepCount, nil
+	return store.CountSweepCandidateIssuesRow{Eligible: f.sweepCount, Matched: f.sweepCount}, nil
 }
 func (f *fakeStore) HasActiveRunForIssue(_ context.Context, arg store.HasActiveRunForIssueParams) (bool, error) {
 	if f.activeByIssue != nil {
@@ -3018,10 +3018,11 @@ func TestFireSweepAssignedDefaultThreadsSelectorAndBotID(t *testing.T) {
 
 // TestFireSweepLabelSweepThreadsLabelSelector is the regression guard paired with the
 // assigned case: a label sweep (a user-origin row here) still resolves Selector="label",
-// threads its resolved labels, and passes BotID=0 (the assigned branch stays off).
+// threads its resolved labels, and — since issue #1543 filters eligibility in SQL — also
+// threads the repo's bot id, because a bot-assigned issue is eligible under a label selector.
 func TestFireSweepLabelSweepThreadsLabelSelector(t *testing.T) {
 	h := newHarness()
-	h.st.repoRow.BotForgeUserID = 9999  // present but must NOT be threaded for a label sweep
+	h.st.repoRow.BotForgeUserID = 9999  // threaded: bot assignment is an eligibility path (#1543)
 	s := h.sweepSchedule(pgtype.Int4{}) // user-origin, Labels ["PRD"]
 	h.st.sweepRows = []store.ListSweepCandidateIssuesRow{{ForgeIssueIid: 7}}
 
@@ -3038,8 +3039,8 @@ func TestFireSweepLabelSweepThreadsLabelSelector(t *testing.T) {
 	if string(h.st.sweepLabelParam) != `["PRD"]` {
 		t.Fatalf("sweep label param = %s, want the resolved [\"PRD\"] selector", h.st.sweepLabelParam)
 	}
-	if h.st.sweepBotIDParam != 0 {
-		t.Fatalf("sweep bot id param = %d, want 0 (the assigned branch is off for a label sweep)", h.st.sweepBotIDParam)
+	if h.st.sweepBotIDParam != 9999 {
+		t.Fatalf("sweep bot id param = %d, want the repo bot id 9999 (bot assignment is an eligibility path, #1543)", h.st.sweepBotIDParam)
 	}
 }
 
