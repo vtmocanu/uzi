@@ -119,6 +119,24 @@ for (const dep of [...goSurfaces, ...linterDeps]) {
 for (const dep of linterDeps) {
   assertEqual(resolved(dep, "patch").groupName, "golangci-lint", `${dep.depName} patch group`);
 }
+
+// govulncheck: the api + controller Taskfile pins are distinct aliases of one package, so a
+// bump must resolve both into one group rather than two PRs that skew the pins (#1487).
+const vulnDeps = extract(genericManager, read("Taskfile.yml"), "Taskfile.yml").filter(
+  (dep) => dep.depName.startsWith("govulncheck-"),
+);
+assertEqual(
+  vulnDeps.map((dep) => dep.depName).sort().join(","),
+  "govulncheck-api,govulncheck-controller",
+  "govulncheck dependency aliases",
+);
+assertEqual(new Set(vulnDeps.map((dep) => dep.currentValue)).size, 1, "govulncheck pins must agree");
+for (const dep of vulnDeps) {
+  assertEqual(dep.packageName, "golang.org/x/vuln", `${dep.depName} packageName`);
+  for (const updateType of ["patch", "minor", "major"]) {
+    assertEqual(resolved(dep, updateType).groupName, "govulncheck", `${dep.depName} ${updateType} group`);
+  }
+}
 assertEqual(resolved(goSurfaces[0], "patch").groupName, undefined, "Go patch grouping");
 assertEqual(resolved(goSurfaces[2], "digest").groupName, undefined, "golang digest grouping");
 

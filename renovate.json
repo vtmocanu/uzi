@@ -80,6 +80,11 @@
       "separateMajorMinor": false
     },
     {
+      "description": "govulncheck: group the api + controller Taskfile pins so a bump moves both in one PR. Distinct depName aliases avoid same-file deduplication; shared packageName joins them here.",
+      "matchPackageNames": ["golang.org/x/vuln"],
+      "groupName": "govulncheck"
+    },
+    {
       "description": "Go toolchain: keep major and minor go/golang updates eligible for one branch without grouping their patch or digest refreshes.",
       "matchDepNames": ["go", "golang"],
       "separateMajorMinor": false

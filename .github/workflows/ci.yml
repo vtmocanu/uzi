@@ -46,13 +46,15 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7
         with:
-          # Latest 1.26.x patch (mirrors GitLab's rolling golang:1.26 image), so a
-          # stdlib CVE fixed in a patch release does not redden the vulncheck gate on
-          # a pinned-but-stale toolchain. go.mod's `go 1.26.4` is the language floor.
-          # check-latest is load-bearing: without it setup-go resolves "1.26" to
-          # whatever patch the assigned runner image happens to preinstall (observed
-          # 1.26.5 on one runner, 1.26.6 on another), so the "latest patch" promise
-          # above only holds when we force the manifest lookup here.
+          # Latest patch of this Go minor, so a stdlib CVE fixed in a patch release
+          # does not redden the vulncheck gate on a stale toolchain. check-latest is
+          # load-bearing: without it setup-go resolves the minor to whatever patch the
+          # assigned runner image happens to preinstall (observed to differ between
+          # runners), so the "latest patch" promise only holds with the forced
+          # manifest lookup. This is the bootstrap Go, like the Dockerfiles'
+          # golang:<minor> builder base: go.mod's `go` line is the language floor and
+          # its `toolchain` line, which Go auto-downloads when newer, is the floor for
+          # the Go that actually builds. Renovate groups those surfaces on a minor bump.
           go-version: "1.27"
           check-latest: true
           cache-dependency-path: api/go.sum
@@ -115,13 +117,15 @@ jobs:
           fetch-depth: 0
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7
         with:
-          # Latest 1.26.x patch (mirrors GitLab's rolling golang:1.26 image), so a
-          # stdlib CVE fixed in a patch release does not redden the vulncheck gate on
-          # a pinned-but-stale toolchain. go.mod's `go 1.26.4` is the language floor.
-          # check-latest is load-bearing: without it setup-go resolves "1.26" to
-          # whatever patch the assigned runner image happens to preinstall (observed
-          # 1.26.5 on one runner, 1.26.6 on another), so the "latest patch" promise
-          # above only holds when we force the manifest lookup here.
+          # Latest patch of this Go minor, so a stdlib CVE fixed in a patch release
+          # does not redden the vulncheck gate on a stale toolchain. check-latest is
+          # load-bearing: without it setup-go resolves the minor to whatever patch the
+          # assigned runner image happens to preinstall (observed to differ between
+          # runners), so the "latest patch" promise only holds with the forced
+          # manifest lookup. This is the bootstrap Go, like the Dockerfiles'
+          # golang:<minor> builder base: go.mod's `go` line is the language floor and
+          # its `toolchain` line, which Go auto-downloads when newer, is the floor for
+          # the Go that actually builds. Renovate groups those surfaces on a minor bump.
           go-version: "1.27"
           check-latest: true
           cache-dependency-path: api/go.sum
@@ -143,13 +147,15 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7
         with:
-          # Latest 1.26.x patch (mirrors GitLab's rolling golang:1.26 image), so a
-          # stdlib CVE fixed in a patch release does not redden the vulncheck gate on
-          # a pinned-but-stale toolchain. go.mod's `go 1.26.4` is the language floor.
-          # check-latest is load-bearing: without it setup-go resolves "1.26" to
-          # whatever patch the assigned runner image happens to preinstall (observed
-          # 1.26.5 on one runner, 1.26.6 on another), so the "latest patch" promise
-          # above only holds when we force the manifest lookup here.
+          # Latest patch of this Go minor, so a stdlib CVE fixed in a patch release
+          # does not redden the vulncheck gate on a stale toolchain. check-latest is
+          # load-bearing: without it setup-go resolves the minor to whatever patch the
+          # assigned runner image happens to preinstall (observed to differ between
+          # runners), so the "latest patch" promise only holds with the forced
+          # manifest lookup. This is the bootstrap Go, like the Dockerfiles'
+          # golang:<minor> builder base: go.mod's `go` line is the language floor and
+          # its `toolchain` line, which Go auto-downloads when newer, is the floor for
+          # the Go that actually builds. Renovate groups those surfaces on a minor bump.
           go-version: "1.27"
           check-latest: true
           cache-dependency-path: api/go.sum
@@ -192,13 +198,15 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7
         with:
-          # Latest 1.26.x patch (mirrors GitLab's rolling golang:1.26 image), so a
-          # stdlib CVE fixed in a patch release does not redden the vulncheck gate on
-          # a pinned-but-stale toolchain. go.mod's `go 1.26.4` is the language floor.
-          # check-latest is load-bearing: without it setup-go resolves "1.26" to
-          # whatever patch the assigned runner image happens to preinstall (observed
-          # 1.26.5 on one runner, 1.26.6 on another), so the "latest patch" promise
-          # above only holds when we force the manifest lookup here.
+          # Latest patch of this Go minor, so a stdlib CVE fixed in a patch release
+          # does not redden the vulncheck gate on a stale toolchain. check-latest is
+          # load-bearing: without it setup-go resolves the minor to whatever patch the
+          # assigned runner image happens to preinstall (observed to differ between
+          # runners), so the "latest patch" promise only holds with the forced
+          # manifest lookup. This is the bootstrap Go, like the Dockerfiles'
+          # golang:<minor> builder base: go.mod's `go` line is the language floor and
+          # its `toolchain` line, which Go auto-downloads when newer, is the floor for
+          # the Go that actually builds. Renovate groups those surfaces on a minor bump.
           go-version: "1.27"
           check-latest: true
           cache-dependency-path: api/go.sum
@@ -404,13 +412,15 @@ jobs:
       # Go is needed for scan:secrets (gitleaks via `go run pkg@version`).
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7
         with:
-          # Latest 1.26.x patch (mirrors GitLab's rolling golang:1.26 image), so a
-          # stdlib CVE fixed in a patch release does not redden the vulncheck gate on
-          # a pinned-but-stale toolchain. go.mod's `go 1.26.4` is the language floor.
-          # check-latest is load-bearing: without it setup-go resolves "1.26" to
-          # whatever patch the assigned runner image happens to preinstall (observed
-          # 1.26.5 on one runner, 1.26.6 on another), so the "latest patch" promise
-          # above only holds when we force the manifest lookup here.
+          # Latest patch of this Go minor, so a stdlib CVE fixed in a patch release
+          # does not redden the vulncheck gate on a stale toolchain. check-latest is
+          # load-bearing: without it setup-go resolves the minor to whatever patch the
+          # assigned runner image happens to preinstall (observed to differ between
+          # runners), so the "latest patch" promise only holds with the forced
+          # manifest lookup. This is the bootstrap Go, like the Dockerfiles'
+          # golang:<minor> builder base: go.mod's `go` line is the language floor and
+          # its `toolchain` line, which Go auto-downloads when newer, is the floor for
+          # the Go that actually builds. Renovate groups those surfaces on a minor bump.
           go-version: "1.27"
           check-latest: true
           cache-dependency-path: api/go.sum
