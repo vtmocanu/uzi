@@ -410,8 +410,8 @@ for RID in "${RUNS[@]}"; do
     if pod_has_clone "$ns" "$pod" "$STEM" "$RUN_BRANCH" "$RID"; then capture_kind="clone"; fi
   fi
 
-  # A run may have resumed on a new worker, or its pod may have rolled while an older
-  # persistent PVC still holds the clone. Search all running worker pods before giving up.
+  # A run may have resumed on a new worker. Search all running worker pods for its
+  # clone before falling back to the bare ref. A rolled Docker pod loses its emptyDir clone.
   if [ -z "$capture_kind" ]; then
     while read -r cns cpod; do
       [ -n "$cpod" ] || continue
