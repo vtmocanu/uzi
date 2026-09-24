@@ -649,14 +649,16 @@ workers:
   #     comment). So when unsure, err LOW.
   #
   # 512Mi is ~10x kubelet's default per-container log-rotation ceiling (10Mi x 5).
-  # That ceiling, plus logs and the writable layer, is what a plain worker keeps
-  # on ephemeral storage from its OWN working tree, which lives on the /data PVC,
-  # not on an emptyDir. It is NOT the whole ephemeral picture any more: since
-  # issue #1598 every worker pod, plain or docker, also carries a second,
-  # worker-only emptyDir (codex-cmd-cache, /var/cache/uzi-codex-cmd) for a run's
-  # Codex command build cache, which counts toward this same request/ranking.
-  # This number is deliberately NOT raised for that yet — see codex-cmd-cache's
-  # own comment in controller/internal/kube/render.go and adr/1598-codex-command-storage.md
+  # That ceiling, plus logs and the writable layer, is roughly what a plain
+  # worker's ephemeral-storage footprint consists of; its OWN working tree
+  # lives on the /data PVC, not on an emptyDir, so it does not count against
+  # this request. It is NOT the whole ephemeral picture any more: since issue
+  # #1598 every worker pod, plain or docker, also carries a worker-only
+  # emptyDir (codex-cmd-cache, /var/cache/uzi-codex-cmd, in addition to any the
+  # docker lane adds) for a run's Codex command build cache, which counts
+  # toward this same request/ranking. This number is deliberately NOT raised
+  # for that yet — see codex-cmd-cache's own comment in
+  # controller/internal/kube/render.go and adr/1598-codex-command-storage.md
   # for why (the hosted-worker measurement to size it correctly is pending).
   #
   # NEVER add a matching LIMIT, here or in limitRange. A limit on ANY container makes

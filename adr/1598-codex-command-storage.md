@@ -1,4 +1,4 @@
-# ADR-1598: Codex command storage moves off the writable layer, cleanup moves to the supervisor, and per-run caching gets its own worker-only emptyDir
+# ADR-1598: Codex command tmp and cache no longer accumulate in the writable layer, cleanup moves to the supervisor, and per-run caching gets its own worker-only emptyDir
 
 **Status**: Accepted (implemented, issue #1598)
 **Date**: 2026-09-24
@@ -6,10 +6,12 @@
 **Supersedes (in part)**: `specs/ai.md` §480's "`run-workdir` is the only remaining
 emptyDir and must NEVER get a `sizeLimit`" (issue #224 M-a). That sentence is
 frozen text and is not edited here; this ADR records that a worker pod now has a
-SECOND emptyDir, `codex-cmd-cache`, and states explicitly that the same
-never-a-`sizeLimit` rule binds it too, for the same reason (a `sizeLimit` is a
-kubelet eviction path of its own, see issue #225's eviction hazard below).
-**Related**: issue #1598, issue #225, issue #1597, issue #1582.
+worker-only emptyDir, `codex-cmd-cache` (in addition to any the docker lane
+adds), and states explicitly that the same never-a-`sizeLimit` rule binds it
+too, for the same reason: a `sizeLimit` is a kubelet eviction path of its own
+(issue #224 / `specs/ai.md` §480; issue #225 is unrelated node image
+accumulation, not this eviction rule).
+**Related**: issue #1598, issue #224, issue #1597, issue #1582.
 
 ## Context: the evidence
 
@@ -18,9 +20,11 @@ a fresh directory per command. Any `go` invocation in that tree re-downloaded it
 module graph into `GOMODCACHE`/`GOCACHE` under that per-command tmp, because
 nothing persisted a cache across commands, let alone across runs. Worse, cleanup
 used `os.RemoveAll`, which cannot delete a Go module cache's read-only (mode
-0555) directories as the non-root owner that wrote them — `RemoveAll` swallows
-the resulting errors and returns success, so the tree is silently retained.
-Measured impact: 22 GB accumulated in `/tmp` on a single worker, two node
+0555) directories as the non-root owner that wrote them. `os.RemoveAll` returns
+that failure as its own error; the call sites discarded it (`defer
+os.RemoveAll(tmp)` in cmdsandbox, `_ = os.RemoveAll(...)` in the supervisor, at
+the fork point f77d3103), so the tree was silently retained regardless.
+Measured impact: 22 GB accumulated in `/tmp` on a single worker, two worker pod
 evictions traced to it. Fixing the leak, and giving Codex commands a real cache
 instead of re-downloading every time, are the same issue because both live at
 the same boundary: what a command's `HOME`/`TMPDIR`/`GOMODCACHE` point at, and
@@ -33,23 +37,29 @@ who is responsible for removing it.
 A dedicated removal primitive, independent of `os.RemoveAll`, built to actually
 delete what this issue produces:
 
-- It opens the root through a caller-supplied fd (never a path re-resolved from
-  scratch, so a rename/symlink race after the caller pinned the directory
-  cannot redirect the removal), pins the root's device/inode, and checks the
-  **owner** of every entry it descends into. A mismatched device/inode, a
-  foreign owner, an unexpected name, or an I/O error each retain the tree and
-  report why, rather than partially deleting it or guessing.
+- It opens the root relative to a caller-supplied parent fd and name, checked
+  against the pin (never a path re-resolved from scratch, so a rename/symlink
+  race after the caller pinned the directory cannot redirect the removal),
+  pins the root's device/inode, and checks the **owner** of every entry it
+  descends into. A mismatched device/inode, a foreign owner, an unexpected
+  name, or an I/O error each retain the tree and report why, rather than
+  partially deleting it or guessing.
 - It streams entries per `getdents` chunk instead of loading a whole directory
   listing into memory, and hoists deep subdirectories up to be processed from
   the root, so removal is not bounded by depth or by how large any one
   directory is.
-- It never calls `chmod` to force a removal — a Go module cache's read-only
-  0555 directories are removed by opening them for traversal and unlinking
-  their entries via the parent's fd, not by first rewriting their mode. This
-  is what `os.RemoveAll` cannot do as the non-owning writer.
+- On the already-verified, owner-checked inode it may add the missing owner
+  rwx bits (e.g. 0555 becomes 0755) so it can traverse and unlink a Go module
+  cache's read-only directories as their owner — the chmod goes through the
+  inode's own `/proc/self/fd/N` magic link (`addOwnerBits`), never a
+  pathname, and is re-verified against the same dev/ino/mode afterward. This
+  is what `os.RemoveAll` cannot do as the owner of a directory it made
+  read-only.
 - Removal is bounded by a caller-supplied deadline; hitting it stops the walk
-  and reports "deadline", keeping whatever partial progress was made rather
-  than leaving the tree in an inconsistent half-state or blocking forever.
+  at the first failure and keeps whatever has not yet been removed — what the
+  walk already removed stays removed, nothing is rolled back — reporting
+  "deadline" so a retry converges rather than leaving the tree in an
+  inconsistent half-state or blocking forever.
 
 ### Cleanup belongs to the supervisor, not cmdsandbox
 
@@ -109,7 +119,8 @@ worker startup before any run is launched:
   resolve: a `hidepid`/`subset` proc mount option that could hide a matching
   process, a parse error reading `/proc/<pid>/status`, a scan that would
   exceed its pid bound, and — critically — any listed pid vanishing between
-  being listed and being read (retaken up to 5 times before giving up). Every
+  being listed and being read (`maxProofScans = 5`: up to 5 scans in total,
+  i.e. at most 4 retakes, before giving up). Every
   one of those outcomes means "retain", never "assume dead and remove".
 - **The reaper's own exemption is narrow and explicit.** Only the reaper's own
   pid is excluded from the "is anyone still running as this uid" check — not
@@ -128,10 +139,10 @@ worker startup before any run is launched:
 
 ### Cache placement: `/var/cache/uzi-codex-cmd`, a worker-only emptyDir, not the PVC, the checkout, or the dind workdir
 
-The per-run cache root is a **second emptyDir** on the worker pod
-(`codex-cmd-cache`, mounted only into the `worker` container, never into
-seed-nix, dind-init or dind), prepared 0700 owned by uid 10003 by the
-entrypoint, only under the uid split.
+The per-run cache root is a **worker-only emptyDir** on the worker pod (in
+addition to any the docker lane adds), `codex-cmd-cache` (mounted only into
+the `worker` container, never into seed-nix, dind-init or dind), prepared
+0700 owned by uid 10003 by the entrypoint, only under the uid split.
 
 - **Not the `/data` PVC.** The PVC holds durable, trusted state — the bare
   repo, resume state, credentials-adjacent material — across pod restarts and
@@ -156,9 +167,10 @@ entrypoint, only under the uid split.
 - No `sizeLimit` on this emptyDir, matching `run-workdir`'s existing rule and
   for the identical reason: a `sizeLimit` is enforced by kubelet **evicting
   the pod**, which is itself an eviction trigger and defeats the point of a
-  cache that exists to reduce ephemeral churn (issue #225's eviction hazard).
-  No container declares a matching `limits.ephemeral-storage` either, for the
-  same reason the worker's other ephemeral request carries none.
+  cache that exists to reduce ephemeral churn (issue #224 / `specs/ai.md`
+  §480; not issue #225, which is node image accumulation, unrelated to this
+  rule). No container declares a matching `limits.ephemeral-storage` either,
+  for the same reason the worker's other ephemeral request carries none.
 
 ### The lifecycle: holder process, adoption, exact-directory grant
 
@@ -203,12 +215,18 @@ content, nothing more.
 consumer of a worker pod's ephemeral-storage budget, but issue #1598 requires
 measuring a Go-heavy Codex run's actual peak and retention on hosted workers
 before that number can be picked correctly, and that hosted measurement is
-still pending (see `e2e/codex-tmp-measure/`, being built in parallel). Leaving
-the requests as they are means a Go-heavy Codex run may exceed the current
-budget; because a request only **ranks** for eviction and never **limits**
-(this repo's existing conservative-because-of-#225 posture, and no container
-here declares an ephemeral limit), the practical effect of running over
-budget is a worse eviction rank under node pressure, never a new failure mode.
+still pending. `e2e/codex-tmp-measure/` has landed, but it is a boundary-level
+proxy against the same primitives run outside a hosted worker — it cannot
+measure a real hosted-worker Codex run, so the hosted measurement stays a
+pending post-deploy maintainer check. The proxy did measure a ~957 MiB
+per-run cache peak for one `go build`/`test` of `api/` on a cold cache, above
+the unchanged 512Mi plain-tier request; the request is left unchanged pending
+the hosted measurement. Leaving the requests as they are means a Go-heavy
+Codex run may exceed the current budget; because a request only **ranks** for
+eviction and never **limits** (this repo's existing conservative posture from
+issue #224, and no container here declares an ephemeral limit), the practical
+effect of running over budget is a worse eviction rank under node pressure,
+never a new failure mode.
 
 ### Rollout
 
@@ -217,9 +235,12 @@ volume and mount unconditionally (the same rendered pod shape for every
 worker, split or not, so enabling the uid split later never forks the spec on
 this axis) — this changes every hosted worker's pod spec hash, so every hosted
 worker pod rolls exactly once on this change, gated the same way every other
-worker roll is (drained before Recreate; see ADR-422). Compose is unaffected:
-there is no analogous emptyDir concept in compose, and the corresponding
-compose path needs no change.
+worker roll is: cordoned and drained before `Recreate`, bounded by a 24h drain
+deadline past which the controller rolls a busy worker anyway (requeueing its
+runs), or immediately on a force-roll (see ADR-422). Compose needs no
+configuration change: with the uid split its per-run cache lives in the
+container layer and is removed per run, so there is no analogous emptyDir
+concept to add.
 
 ## Consequences and residuals
 
@@ -234,8 +255,10 @@ compose path needs no change.
   holding — true at its one call site (worker startup, before any run), false
   if it were ever invoked later in the container's lifetime.
 - Landlock isolation between two runs' caches is **best-effort**, not
-  guaranteed: it applies only in `required` mode. This is why the cache is
-  explicitly a non-trust-boundary (above), not an incidental gap.
+  guaranteed: best-effort mode applies Landlock whenever the kernel offers it,
+  and only an unavailable kernel runs unconfined — only `required` mode then
+  refuses to run at all. This is why the cache is explicitly a
+  non-trust-boundary (above), not an incidental gap.
 - **A command process in one run can kill another run's cache holder** — all
   command roots share uid 10003, and nothing prevents one uid-10003 process
   from signalling another. This is an availability cost only (the victim
