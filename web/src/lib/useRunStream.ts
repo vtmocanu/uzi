@@ -44,6 +44,14 @@ export function useRunStream(runId: string) {
 
   const streamRef = useRef<StreamState>(emptyStream());
   const statusRef = useRef<string>("");
+  // genRef counts run-id changes (issue #1430). Each REST read captures it before
+  // awaiting and drops its result if it moved, so a slow response for the run the
+  // user navigated away from (even A → B → A) never lands in the current view.
+  // activeRunIdRef closes the other door: a callback from the old run's render (e.g.
+  // a submit() that resolves after navigation) must not START a read, because it
+  // would capture the new generation and be accepted.
+  const genRef = useRef(0);
+  const activeRunIdRef = useRef(runId);
 
   const commit = useCallback((s: StreamState) => {
     streamRef.current = s;
@@ -51,8 +59,11 @@ export function useRunStream(runId: string) {
   }, []);
 
   const replay = useCallback(async () => {
+    if (runId !== activeRunIdRef.current) return;
+    const gen = genRef.current;
     try {
       const { messages: batch } = await api.getRunMessages(runId, streamRef.current.lastSeq);
+      if (gen !== genRef.current) return;
       commit(ingestMany(streamRef.current, batch).state);
     } catch {
       // Transient; the next frame or reconnect retries. The log is durable, so a
@@ -61,11 +72,15 @@ export function useRunStream(runId: string) {
   }, [runId, commit]);
 
   const refreshRun = useCallback(async () => {
+    if (runId !== activeRunIdRef.current) return;
+    const gen = genRef.current;
     try {
       const { run } = await api.getRun(runId);
+      if (gen !== genRef.current) return;
       setRun(run);
       statusRef.current = run.status;
     } catch (e) {
+      if (gen !== genRef.current) return;
       if (e instanceof ApiError) setError(e.message);
     }
   }, [runId]);
@@ -76,8 +91,11 @@ export function useRunStream(runId: string) {
   // once on mount; M3 adds the onopen / state / health / `input`-frame triggers so a
   // dropped frame self-heals.
   const refreshInputs = useCallback(async () => {
+    if (runId !== activeRunIdRef.current) return;
+    const gen = genRef.current;
     try {
       const { inputs } = await api.getRunInputs(runId);
+      if (gen !== genRef.current) return;
       setInputs(inputs);
       // A 200 (even empty) proves this viewer owns the run → allow steering.
       setCanSteer(true);
@@ -86,6 +104,7 @@ export function useRunStream(runId: string) {
       // view itself is owner-or-admin, so it can still be open): hide the steer surface
       // silently (Decision 8/N2). Any other error is transient — leave the queue and the
       // last-known canSteer untouched. Never surface a banner either way.
+      if (gen !== genRef.current) return;
       if (e instanceof ApiError && e.status === 404) setCanSteer(false);
     }
   }, [runId]);
@@ -96,8 +115,14 @@ export function useRunStream(runId: string) {
     let reconnect: number | null = null;
     let catchup: number | null = null;
 
-    // Reset for a new run id.
+    // Reset for a new run id, invalidating any REST read still in flight for the old one.
+    genRef.current += 1;
+    activeRunIdRef.current = runId;
     streamRef.current = emptyStream();
+    // The old run's status must not survive: a terminal one would stop the new run's
+    // socket from reconnecting before its own status arrives.
+    statusRef.current = "";
+    setConnected(false);
     setMessages([]);
     setRun(null);
     setError("");
