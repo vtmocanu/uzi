@@ -4340,12 +4340,28 @@ describe("CodexExecutor clarification turns (#1584)", () => {
     const rig = makeMultiEpochRig([scripted([["ask"], ["plan"]], "th-plan"), scripted([["done"]], "th-plan")]);
     const asked: string[] = [];
     const gated: string[] = [];
+    let releaseGate!: () => void;
+    let gateStarted!: () => void;
+    const pendingGate = new Promise<void>((resolve) => { releaseGate = resolve; });
+    const gateCall = new Promise<void>((resolve) => { gateStarted = resolve; });
     const { ctx, emitted } = makeCtx({
       planApproved: false, approvedPlan: undefined,
       askUser: async (qs) => { asked.push(qs[0]!.question); return { kind: "answer", answers: ["server"] }; },
-      gatePlan: async (plan) => { gated.push(plan); return { kind: "approve", selection: { source: "own", agents: [] } } as never; },
+      gatePlan: async (plan) => {
+        gated.push(plan);
+        gateStarted();
+        await pendingGate;
+        return { kind: "approve", selection: { source: "own", agents: [] } } as never;
+      },
     });
-    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "plan clarification");
+    const run = withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "plan clarification");
+    await withTimeout(gateCall, 5000, "pending plan gate");
+    const launchesBeforeApproval = rig.providerLaunches();
+    const turnsBeforeApproval = rig.epochs[0]!.transport.turnStartCount;
+    releaseGate();
+    await run;
+    assert.equal(launchesBeforeApproval, 1, "implementation must not launch before approval");
+    assert.equal(turnsBeforeApproval, 2, "only question and plan turns ran");
     assert.deepEqual(asked, ["Which target?"]);
     assert.deepEqual(gated, ["approved plan"]);
     assert.equal(promptTexts(rig.epochs[0]!.transport)[1],
