@@ -7,11 +7,11 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -20,6 +20,17 @@ import (
 var errCodexMintAmbiguous = errors.New("codex capability mint outcome ambiguous")
 var errClaimRecoveryStale = errors.New("claim assembly recovery lost exact claim")
 var errClaimRecoveryCustody = errors.New("claim assembly custody count mismatch")
+var errClaimRecoveryNoTx = errors.New("final run claim check requires a transaction")
+
+// finishRunClaimAttempts bounds the whole-transaction retry on 55P03 (lock_not_available)
+// from the classifier's NOWAIT alias/account locks. A concurrent re-login or refresh holds
+// those rows for one short transaction; without a retry a successful claim would strand
+// in 'claimed' until SweepClaimedNeverStarted. Past the budget the claim returns the error
+// with no payload and no mutation.
+const finishRunClaimAttempts = 3
+
+// finishRunClaimRetryDelay is the pause between those attempts. A var so a test can shrink it.
+var finishRunClaimRetryDelay = 75 * time.Millisecond
 
 type codexMintedClaimError struct {
 	cause error
@@ -35,6 +46,69 @@ type claimRecoveryIdentity struct {
 	recoveryCapable bool
 }
 
+// claimFinishQueries is the statement surface of finishRunClaim's exact-claim transaction.
+// *store.Queries bound to the pgx transaction satisfies it.
+type claimFinishQueries interface {
+	GetRunOwnedByWorkerForUpdate(ctx context.Context, arg store.GetRunOwnedByWorkerForUpdateParams) (store.Run, error)
+	LockCodexAliasForShareNowait(ctx context.Context, arg store.LockCodexAliasForShareNowaitParams) (store.LockCodexAliasForShareNowaitRow, error)
+	LockCodexAccountForShareNowait(ctx context.Context, arg store.LockCodexAccountForShareNowaitParams) (uuid.UUID, error)
+	GetRunCodexAuthContext(ctx context.Context, id uuid.UUID) (store.GetRunCodexAuthContextRow, error)
+	LockOpenCustodyHoldsForRunWorkerGeneration(ctx context.Context, arg store.LockOpenCustodyHoldsForRunWorkerGenerationParams) ([]uuid.UUID, error)
+	ReleaseCustodyHoldExact(ctx context.Context, arg store.ReleaseCustodyHoldExactParams) (int64, error)
+	ParkRunCodexAccountUnavailable(ctx context.Context, arg store.ParkRunCodexAccountUnavailableParams) (store.Run, error)
+	RequeueClaimAssemblyExact(ctx context.Context, arg store.RequeueClaimAssemblyExactParams) (int64, error)
+	FailClaimAssemblyExact(ctx context.Context, arg store.FailClaimAssemblyExactParams) (int64, error)
+}
+
+// claimFinishTx is one open exact-claim transaction: its statements plus commit/rollback.
+type claimFinishTx interface {
+	claimFinishQueries
+	Commit(ctx context.Context) error
+	Rollback(ctx context.Context) error
+}
+
+// claimFinishBeginner is an optional Store surface (the codexStore idiom): an in-memory
+// transactional fake-store implements it so unit tests drive the same fenced outcome logic.
+// The production *store.Queries does not; production opens the transaction on txBeginner.
+type claimFinishBeginner interface {
+	BeginClaimFinish(ctx context.Context) (claimFinishTx, error)
+}
+
+// pgxClaimFinishTx binds the generated queries to one pgx transaction.
+type pgxClaimFinishTx struct {
+	*store.Queries
+	tx pgx.Tx
+}
+
+func (t pgxClaimFinishTx) Commit(ctx context.Context) error   { return t.tx.Commit(ctx) }
+func (t pgxClaimFinishTx) Rollback(ctx context.Context) error { return t.tx.Rollback(ctx) }
+
+// beginClaimFinish opens the exact-claim transaction. With neither a pgx transaction source
+// nor a transactional store there is no fenced writer, so it refuses rather than falling back.
+func (s *Service) beginClaimFinish(ctx context.Context) (claimFinishTx, error) {
+	if s.txBeginner != nil {
+		tx, err := s.txBeginner.Begin(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return pgxClaimFinishTx{Queries: store.New(tx), tx: tx}, nil
+	}
+	if b, ok := s.q.(claimFinishBeginner); ok {
+		return b.BeginClaimFinish(ctx)
+	}
+	return nil, errClaimRecoveryNoTx
+}
+
+// claimTestHooks are the LiveDB race seams Service.claimHooks carries (nil in production).
+type claimTestHooks struct {
+	// beforeAssembly runs after ClaimRun commits, before assembleClaim.
+	beforeAssembly func(ctx context.Context, run store.Run)
+	// afterMint runs once codexClaimSecrets' capability mint has persisted.
+	afterMint func(ctx context.Context, run store.Run)
+	// afterAssembly runs with assembleClaim's result, before finishRunClaim.
+	afterAssembly func(ctx context.Context, run store.Run, payload *ClaimPayload, err error)
+}
+
 // This matches ClaimRun's hold CTE, using the boolean passed to that claim.
 func claimOpenedCustody(kind string, recoveryCapable bool) bool {
 	if !recoveryCapable {
@@ -48,8 +122,23 @@ func claimOpenedCustody(kind string, recoveryCapable bool) bool {
 	}
 }
 
+// assembleAndFinishRunClaim is the run lane's single post-ClaimRun tail, shared by both
+// Claim return paths so each outcome goes through the same exact-claim transaction.
+func (s *Service) assembleAndFinishRunClaim(ctx context.Context, wkr store.Worker, run store.Run, recoveryCapable bool) (*ClaimPayload, error) {
+	if h := s.claimHooks; h != nil && h.beforeAssembly != nil {
+		h.beforeAssembly(ctx, run)
+	}
+	payload, err := s.assembleClaim(ctx, wkr, run)
+	if h := s.claimHooks; h != nil && h.afterAssembly != nil {
+		h.afterAssembly(ctx, run, payload, err)
+	}
+	return s.finishRunClaim(ctx, run, payload, err,
+		claimRecoveryIdentity{workerID: wkr.ID, recoveryCapable: recoveryCapable})
+}
+
 // finishRunClaim checks even successful payloads against the exact mint and current
-// authority. A failed assembly and a late authority refusal share one transaction.
+// authority. A failed assembly and a late authority refusal share one transaction, and
+// no run-lane outcome reaches an unfenced writer: without a transaction it refuses.
 func (s *Service) finishRunClaim(ctx context.Context, run store.Run, payload *ClaimPayload, assemblyErr error, identity claimRecoveryIdentity) (*ClaimPayload, error) {
 	if errors.Is(assemblyErr, errCodexMintAmbiguous) || isTransientClaimDBError(assemblyErr) {
 		return nil, assemblyErr // the write may have landed; no mutation is safe
@@ -62,39 +151,51 @@ func (s *Service) finishRunClaim(ctx context.Context, run store.Run, payload *Cl
 	if assemblyErr != nil && !transient && !claimAssemblyTerminal(assemblyErr) {
 		return nil, assemblyErr
 	}
-	if s.txBeginner == nil {
-		// Unit fake stores have no pgx transaction surface. Production uses the
-		// generated store.Queries and wires the pool in server/main.go; a missing
-		// production transaction must fail closed, never use the legacy writer.
-		if _, production := s.q.(*store.Queries); !production {
-			if assemblyErr != nil {
-				return nil, s.recoverClaimAssembly(ctx, run, assemblyErr)
+	for attempt := 1; ; attempt++ {
+		out, failed, err := s.finishRunClaimTx(ctx, run, payload, assemblyErr, transient, identity)
+		if err == nil {
+			if failed {
+				s.notify(run.ID, "failed")
 			}
-			return payload, nil
+			return out, nil
 		}
-		if assemblyErr != nil {
-			return nil, fmt.Errorf("exact claim recovery requires a transaction: %w", assemblyErr)
+		if errors.Is(err, errClaimRecoveryNoTx) && assemblyErr != nil {
+			return nil, fmt.Errorf("%w: %w", err, assemblyErr)
 		}
-		return nil, errors.New("final run claim check requires a transaction")
+		if !isLockNotAvailable(err) || attempt >= finishRunClaimAttempts {
+			return nil, err
+		}
+		timer := time.NewTimer(finishRunClaimRetryDelay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, err
+		case <-timer.C:
+		}
 	}
-	tx, err := s.txBeginner.Begin(ctx)
+}
+
+// finishRunClaimTx is one attempt of finishRunClaim's transaction. It returns the payload to
+// deliver (nil for idle), whether it committed a terminal failure, or an error after which
+// nothing was committed.
+func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *ClaimPayload, assemblyErr error, transient bool, identity claimRecoveryIdentity) (*ClaimPayload, bool, error) {
+	q, err := s.beginClaimFinish(ctx)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	q := store.New(tx)
+	defer func() { _ = q.Rollback(ctx) }()
 	locked, err := q.GetRunOwnedByWorkerForUpdate(ctx, store.GetRunOwnedByWorkerForUpdateParams{
 		ID: run.ID, WorkerID: pgconv.UUID(identity.workerID),
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, nil
+			return nil, false, nil
 		}
-		return nil, err
+		return nil, false, err
 	}
 	if locked.Status != "claimed" || locked.ClaimGeneration != run.ClaimGeneration ||
 		locked.WorkerID != pgconv.UUID(identity.workerID) {
-		return nil, nil // another transition won; idle with no mutation
+		return nil, false, nil // another transition won; idle with no mutation
 	}
 
 	// The claim snapshot is the no-mint identity. A successful mint, including
@@ -108,20 +209,20 @@ func (s *Service) finishRunClaim(ctx context.Context, run store.Run, payload *Cl
 		var ok bool
 		epoch, secret, ok = parseCodexCapability(payload.Secrets.Codex.Capability)
 		if !ok {
-			return nil, errors.New("invalid minted claim capability")
+			return nil, false, errors.New("invalid minted claim capability")
 		}
 		hash = hashCodexCapability(secret)
 	}
 	if locked.CodexClaimEpoch != epoch || !bytes.Equal(locked.CodexCapHash, hash) {
-		return nil, nil // superseded mint; never settle a newer claim's custody
+		return nil, false, nil // superseded mint; never settle a newer claim's custody
 	}
 
 	holdClass := false
+	var authorityErr error
 	if run.Harness == harnessCodex {
-		var authorityErr error
-		holdClass, authorityErr, err = classifyLockedCodexClaim(ctx, tx, q, locked)
+		holdClass, authorityErr, err = classifyLockedCodexClaim(ctx, q, locked)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		// A no-payload quarantine discovered during assembly still parks when
 		// recovery completes before this lock, provided current authority is valid.
@@ -130,23 +231,30 @@ func (s *Service) finishRunClaim(ctx context.Context, run store.Run, payload *Cl
 				errors.Is(assemblyErr, ErrCodexMaterialRevisionStale)) {
 			holdClass = true
 		}
-		if assemblyErr == nil && authorityErr != nil {
-			assemblyErr = fmt.Errorf("%w: %w", errCredentialUnavailable, authorityErr)
-		}
-	}
-	if assemblyErr == nil {
-		if err := tx.Commit(ctx); err != nil {
-			return nil, err
-		}
-		return payload, nil
 	}
 	origin := claimAssemblyOrigin(assemblyErr)
-	if origin == "" && !transient {
-		return nil, assemblyErr
+	// Only credential authority faults may park, and only on a custody-holding kind: a judge
+	// stays terminal. Guardrail and provisioning failures remain terminal even if an account
+	// changes concurrently.
+	holdClass = holdClass && (assemblyErr == nil || origin == "credential_unavailable" || transient) &&
+		claimOpenedCustody(run.Kind, true)
+	decision := assemblyErr
+	if authorityErr != nil && origin != "provisioning_failed" && origin != "guardrail_blocked" {
+		// Lock-time authority is the fresher truth. When it decides the outcome (a park it
+		// classified, or a terminal refusal that overrides a success, a transient requeue or
+		// an assembly-time hold), the recorded reason is the authority error that decided it.
+		decision = fmt.Errorf("%w: %w", errCredentialUnavailable, authorityErr)
+		origin = "credential_unavailable"
+		if !holdClass {
+			transient = false
+		}
 	}
-	// Only credential authority faults may park. Guardrail and provisioning
-	// failures remain terminal even if an account changes concurrently.
-	holdClass = holdClass && (origin == "credential_unavailable" || transient) && claimOpenedCustody(run.Kind, true)
+	if decision == nil {
+		if err := q.Commit(ctx); err != nil {
+			return nil, false, err
+		}
+		return payload, false, nil
+	}
 
 	expected := 0
 	if claimOpenedCustody(run.Kind, identity.recoveryCapable) {
@@ -156,11 +264,11 @@ func (s *Service) finishRunClaim(ctx context.Context, run store.Run, payload *Cl
 		RunID: run.ID, Generation: run.ClaimGeneration, WorkerID: identity.workerID,
 	})
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if len(holds) != expected {
-		slog.Warn("codex claim custody mismatch", "run", run.ID, "expected", expected, "actual", len(holds))
-		return nil, errClaimRecoveryCustody
+		slog.Warn("claim custody mismatch", "run", run.ID, "expected", expected, "actual", len(holds))
+		return nil, false, errClaimRecoveryCustody
 	}
 	if expected == 1 {
 		n, err := q.ReleaseCustodyHoldExact(ctx, store.ReleaseCustodyHoldExactParams{
@@ -168,52 +276,43 @@ func (s *Service) finishRunClaim(ctx context.Context, run store.Run, payload *Cl
 			ReleaseEvidence: pgconv.TextOrNull("no_adopted_source"),
 		})
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		if n != 1 {
-			return nil, errClaimRecoveryCustody
+			return nil, false, errClaimRecoveryCustody
 		}
 	}
-	if holdClass {
+	var n int64
+	switch {
+	case holdClass:
 		_, err = q.ParkRunCodexAccountUnavailable(ctx, store.ParkRunCodexAccountUnavailableParams{
 			ID: run.ID, WorkerID: pgconv.UUID(identity.workerID), ClaimGeneration: run.ClaimGeneration,
 		})
-	} else if transient {
-		status := "queued"
-		if errors.Is(assemblyErr, errAutoPoolEmpty) {
-			status = "pool_wait"
-		}
-		var tag pgconn.CommandTag
-		tag, err = tx.Exec(ctx, "UPDATE runs SET status = $1, status_since = now(), "+
-			"started_at = CASE WHEN $1 = 'pool_wait' THEN NULL ELSE started_at END, "+
-			"budget_paused_seconds = CASE WHEN $1 = 'pool_wait' THEN 0 ELSE budget_paused_seconds END, "+
-			"health = 'ok', health_reason = NULL, health_since = NULL, "+
-			"codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1, updated_at = now() "+
-			"WHERE id = $2 AND worker_id = $3 AND claim_generation = $4 AND status = 'claimed'",
-			status, run.ID, identity.workerID, run.ClaimGeneration)
-		if err == nil && tag.RowsAffected() != 1 {
+		if errors.Is(err, pgx.ErrNoRows) {
 			err = errClaimRecoveryStale
 		}
-	} else {
-		var n int64
+		n = 1
+	case transient:
+		n, err = q.RequeueClaimAssemblyExact(ctx, store.RequeueClaimAssemblyExactParams{
+			PoolWait: errors.Is(decision, errAutoPoolEmpty),
+			ID:       run.ID, WorkerID: pgconv.UUID(identity.workerID), ClaimGeneration: run.ClaimGeneration,
+		})
+	default:
 		n, err = q.FailClaimAssemblyExact(ctx, store.FailClaimAssemblyExactParams{
 			ID: run.ID, WorkerID: pgconv.UUID(identity.workerID), ClaimGeneration: run.ClaimGeneration,
-			FailureReason: pgconv.TextOrNull(assemblyErr.Error()), FailOrigin: pgconv.TextOrNull(origin),
+			FailureReason: pgconv.TextOrNull(decision.Error()), FailOrigin: pgconv.TextOrNull(origin),
 		})
-		if err == nil && n != 1 {
-			err = errClaimRecoveryStale
-		}
+	}
+	if err == nil && n != 1 {
+		err = errClaimRecoveryStale
 	}
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, err
+	if err := q.Commit(ctx); err != nil {
+		return nil, false, err
 	}
-	if !holdClass && !transient {
-		s.notify(run.ID, "failed")
-	}
-	return nil, nil
+	return nil, !holdClass && !transient, nil
 }
 
 func claimAssemblyTerminal(err error) bool { return claimAssemblyOrigin(err) != "" }
@@ -227,6 +326,12 @@ func isTransientClaimDBError(err error) bool {
 	var netErr net.Error
 	return errors.As(err, &netErr) || errors.Is(err, context.DeadlineExceeded) ||
 		errors.Is(err, context.Canceled)
+}
+
+// isLockNotAvailable reports SQLSTATE 55P03, the NOWAIT refusal finishRunClaim retries.
+func isLockNotAvailable(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "55P03"
 }
 
 func claimAssemblyOrigin(err error) string {
@@ -244,26 +349,23 @@ func claimAssemblyOrigin(err error) string {
 
 // Lock the alias before its account, then reread the common release predicate.
 // The run row is already locked by the caller. A removed alias is terminal.
-func classifyLockedCodexClaim(ctx context.Context, tx pgx.Tx, q *store.Queries, run store.Run) (bool, error, error) {
+func classifyLockedCodexClaim(ctx context.Context, q claimFinishQueries, run store.Run) (bool, error, error) {
 	if !run.CodexSecretID.Valid {
 		return false, ErrCodexRunNotBound, nil
 	}
-	var stateStatus string
-	var material int64
-	var accountID pgtype.UUID
-	err := tx.QueryRow(ctx, `SELECT status, material_revision, provider_account_id
-		FROM codex_credential_state WHERE user_secret_id = $1 AND user_id = $2 FOR SHARE NOWAIT`,
-		uuid.UUID(run.CodexSecretID.Bytes), run.UserID).Scan(&stateStatus, &material, &accountID)
+	alias, err := q.LockCodexAliasForShareNowait(ctx, store.LockCodexAliasForShareNowaitParams{
+		UserSecretID: uuid.UUID(run.CodexSecretID.Bytes), UserID: run.UserID,
+	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, ErrCodexRunNotBound, nil
 	}
 	if err != nil {
 		return false, nil, err
 	}
-	if accountID.Valid {
-		var id uuid.UUID
-		err = tx.QueryRow(ctx, `SELECT id FROM codex_provider_account
-			WHERE id = $1 AND user_id = $2 FOR SHARE NOWAIT`, uuid.UUID(accountID.Bytes), run.UserID).Scan(&id)
+	if alias.ProviderAccountID.Valid {
+		_, err = q.LockCodexAccountForShareNowait(ctx, store.LockCodexAccountForShareNowaitParams{
+			ID: uuid.UUID(alias.ProviderAccountID.Bytes), UserID: run.UserID,
+		})
 		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 			return false, nil, err
 		}
@@ -275,7 +377,7 @@ func classifyLockedCodexClaim(ctx context.Context, tx pgx.Tx, q *store.Queries, 
 	if err != nil {
 		return false, nil, err
 	}
-	hold, predicateErr := classifyCodexClaimAuthority(run, row, stateStatus, material)
+	hold, predicateErr := classifyCodexClaimAuthority(run, row, alias.Status, alias.MaterialRevision)
 	return hold, predicateErr, nil
 }
 

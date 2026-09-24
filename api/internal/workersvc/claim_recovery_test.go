@@ -62,6 +62,31 @@ func TestClaimRecoveryAuthorityClasses(t *testing.T) {
 		{"revision revoked", func(_ *store.Run, r *store.GetRunCodexAuthContextRow) { r.CurrentCredentialRevision.Int64 = 2 }, "linked", 1, false, ErrCodexAccountRevisionStale},
 		{"identity changed", func(_ *store.Run, r *store.GetRunCodexAuthContextRow) { r.WorkspaceAccountID.String = "elsewhere" }, "linked", 1, false, ErrCodexAccountTupleMismatch},
 		{"kind mismatch", func(_ *store.Run, r *store.GetRunCodexAuthContextRow) { r.BoundKind = store.KindOpenAIAPIKey }, "linked", 1, false, ErrCodexKindModeMismatch},
+		// PRD #1590 D1: terminal beats hold. The predicate checks the credential revision
+		// before quarantine, so a revoked AND quarantined account is terminal.
+		{"quarantined and revoked", func(_ *store.Run, r *store.GetRunCodexAuthContextRow) {
+			r.CurrentCoordState.String = codexCoordQuarantined
+			r.CurrentCredentialRevision.Int64 = 2
+		}, "linked", 1, false, ErrCodexAccountRevisionStale},
+		// A1: a verified same-identity relink holds even while the relinked account is still
+		// quarantined; the material check fires first and the relink fences decide.
+		{"linked verified relogin still quarantined", func(_ *store.Run, r *store.GetRunCodexAuthContextRow) {
+			r.CurrentMaterialRevision = 2
+			r.CurrentCoordState.String = codexCoordQuarantined
+		}, "linked", 2, true, ErrCodexMaterialRevisionStale},
+		// A1 requires the frozen credential revision: without it a relink cannot be verified.
+		{"linked relogin without frozen revision", func(run *store.Run, r *store.GetRunCodexAuthContextRow) {
+			run.CodexAccountRevision.Valid = false
+			r.CodexAccountRevision.Valid = false
+			r.CurrentMaterialRevision = 2
+		}, "linked", 2, false, ErrCodexMaterialRevisionStale},
+		// An api_key alias has no re-login hold: a new key is a different credential.
+		{"api key material bump", func(run *store.Run, r *store.GetRunCodexAuthContextRow) {
+			run.CodexAuthMode.String = codexAuthModeAPIKey
+			r.CodexAuthMode.String = codexAuthModeAPIKey
+			r.BoundKind = store.KindOpenAIAPIKey
+			r.CurrentMaterialRevision = 2
+		}, "static", 2, false, ErrCodexMaterialRevisionStale},
 		{"first link absent", func(run *store.Run, r *store.GetRunCodexAuthContextRow) {
 			run.CodexAccountKey.Valid = false
 			r.CodexAccountKey.Valid = false

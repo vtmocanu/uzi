@@ -169,11 +169,11 @@ func TestJudgeAutoEmptyPoolSpendsDefaultRecordedPoolEmpty(t *testing.T) {
 	if payload == nil {
 		t.Fatal("an auto judge run with an empty pool went idle; D4 says it spends the default and completes")
 	}
-	if f.fs.poolWaitHeld != nil {
-		t.Fatalf("the judge run was held in pool_wait (%v); D4 says the judge lane does NOT hold", f.fs.poolWaitHeld)
+	if f.fs.claimRequeued != nil && f.fs.claimRequeued.PoolWait {
+		t.Fatalf("the judge run was held in pool_wait (%v); D4 says the judge lane does NOT hold", f.fs.claimRequeued)
 	}
-	if f.fs.markedFailed != nil {
-		t.Fatalf("the judge run was failed terminally (%v); D4 says it spends the default", f.fs.markedFailed)
+	if f.fs.claimFailed != nil {
+		t.Fatalf("the judge run was failed terminally (%v); D4 says it spends the default", f.fs.claimFailed)
 	}
 	rec := onlyRecord(t, f.fs)
 	// The recorded id is the OWNER DEFAULT, opened by id (D8), NOT a pooled token.
@@ -212,8 +212,8 @@ func TestJudgeAutoRetriesOntoAnotherPooledTokenWhenThePickWillNotOpen(t *testing
 	if payload == nil {
 		t.Fatal("an undecryptable auto judge pick went idle; the second pooled token was openable — the retry did not reach the judge lane")
 	}
-	if f.fs.markedFailed != nil {
-		t.Fatalf("the judge run was failed terminally (%v); the D14 retry must reach the judge lane too", f.fs.markedFailed)
+	if f.fs.claimFailed != nil {
+		t.Fatalf("the judge run was failed terminally (%v); the D14 retry must reach the judge lane too", f.fs.claimFailed)
 	}
 	// Two opens: the failing pick, then the SECOND POOLED token — never the default.
 	if len(f.fs.byIDLookups) != 2 || f.fs.byIDLookups[0].ID != f.emptyID || f.fs.byIDLookups[1].ID != f.fullID {

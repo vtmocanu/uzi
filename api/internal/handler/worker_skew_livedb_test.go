@@ -78,11 +78,14 @@ func newSkewFixture(ctx context.Context, t *testing.T) skewFixture {
 
 	q := store.New(pool)
 	box := newHandlerTestBox(t)
+	wsvc := workersvc.New(q, box, workersvc.Params{})
+	// PRD #1590 M1: the run-lane claim settles in an exact-claim transaction, as main.go wires it.
+	wsvc.SetTxBeginner(pool)
 	h := &Handler{
 		pool:      pool,
 		q:         q,
 		box:       box,
-		wsvc:      workersvc.New(q, box, workersvc.Params{}),
+		wsvc:      wsvc,
 		version:   "dev",
 		now:       time.Now,
 		startedAt: time.Now(),

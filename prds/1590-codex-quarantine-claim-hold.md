@@ -2,7 +2,7 @@
 
 **Issue:** [#1590](https://github.com/vtmocanu/uzi/issues/1590)
 
-**Status:** M1 in progress (2026-09-24); M2–M7 pending.
+**Status:** M1 in progress (2026-09-24). Part of M2 landed with it (the ClaimRun gate, its peer mirror, and both timer promoters skipping the new cause); the M2 sweeper park and M2's behaviour tests, and M3–M7, are pending. M3's account-driven promoter must ship in the same MR as M1, because until it exists a `codex_account_unavailable` run has no automatic way back to `queued`.
 
 **Priority:** High
 
@@ -112,7 +112,9 @@ A `failed` staging alias (the new login proved unusable) keeps the run held with
 
 ### D2: gate in ClaimRun; park from the sweeper; assembly is only the race fallback
 
-M1 final-check note: both Claim return paths classify successful assembly and assembly errors in one locked transaction. They check status, worker and generation first, then the attempt's minted epoch/hash before account authority. A stale or superseded attempt returns idle without mutation. A current quarantine, in-flight or verified same-identity re-login parks the exact claim; terminal credential, provisioning and guardrail failures fail it. Each outcome settles only its expected current-generation hold, preserving older holds. If a hold-class assembly error sees a recovered account at this check, the discarded attempt still parks and the account-driven promoter can resume it. An ambiguous mint or transient classification error makes no mutation. The check narrows the handoff race and does not make HTTP delivery atomic with the database. M2's pre-claim gate and sweeper are still pending.
+M1 final-check note: both Claim return paths classify successful assembly and assembly errors in one locked transaction. They check status, worker and generation first, then the attempt's minted epoch/hash before account authority. A stale or superseded attempt returns idle without mutation. A current quarantine, in-flight or verified same-identity re-login parks the exact claim; terminal credential, provisioning and guardrail failures fail it. Each outcome settles only its expected current-generation hold, preserving older holds. If a hold-class assembly error sees a recovered account at this check, the discarded attempt still parks and the account-driven promoter can resume it. An ambiguous mint or transient classification error makes no mutation. The check narrows the handoff race and does not make HTTP delivery atomic with the database. The transaction is the only run-lane assembly writer: with no transaction it refuses with no payload, and a `55P03` from its `NOWAIT` alias/account locks retries the whole transaction a bounded number of times before returning the error unmutated. When lock-time authority decides a terminal outcome, `failure_reason` is that authority error, not the assembly's text.
+
+Landed with M1 from M2 and M3: the ClaimRun account gate and its peer mirror (pinned by SQL-text tests only so far), and `PromoteRecoveryWaitRuns` / `PromoteRecoveryWaitRunNow` skipping `codex_account_unavailable`. Not yet present: the `park_codex_account_unavailable` sweeper pass and M2's behaviour tests, and M3's account-driven promoter. Until the sweeper lands, a queued run on a quarantined account is excluded from claims and waits in `queued` without a visible reason. Until the promoter lands, nothing promotes a parked run back to `queued`; owner cancel still ends it. The promoter therefore ships in the same MR as M1.
 
 - **ClaimRun predicate.** A standalone predicate, shaped like the custom-model clause, excludes a Codex subscription run (`harness='codex'`, `codex_auth_mode='subscription'`) in either of two cases:
   - **quarantine:** the linked account exists and `cpa.coord_state='quarantined'`;
@@ -217,6 +219,7 @@ Each milestone ends green on `task gate:api`, plus `task gate:web` for M5 and `t
   - The comment update at `codexauthz.go:49-53` (D3), and a test that a capability-scoped release or start-refresh against a `codex_account_unavailable` run is refused (its cap is revoked).
   - The migration widening `runs_recovery_wait_cause_check` with `codex_account_unavailable`, plus a new Go test pinning the cause vocabulary to the CHECK (the `TestFailOriginVocabularyMatchesCheck` pattern).
   - `ParkRunCodexAccountUnavailable` (D2 fallback, D4 preference) wired into `recoverClaimAssembly`.
+    - As built: wired into `finishRunClaim` (`claim_recovery.go`), the exact-claim transaction both run-lane `Claim` return paths end in. `recoverClaimAssembly` now serves only the chat lane.
   - Regression: a live-DB replay of the observed case (gen-1 hold on worker A, cold claim by worker B at gen 2, account quarantined) must fail on current `main`. It ends with:
     - status `recovery_wait` and cause `codex_account_unavailable`;
     - `fail_origin` and `failure_reason` NULL;

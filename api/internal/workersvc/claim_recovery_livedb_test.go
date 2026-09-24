@@ -64,7 +64,7 @@ func TestCodexClaimRecoveryTerminalOriginsLiveDB(t *testing.T) {
 			payload, err := f.svc.finishRunClaim(env.ctx, run, nil, tc.cause,
 				claimRecoveryIdentity{workerID: f.workerID, recoveryCapable: tc.capable})
 			if err != nil || payload != nil {
-				t.Fatalf("finishRunClaim = (%v, %v), want idle", payload, err)
+				t.Fatalf("finishRunClaim = (%v, %v), want idle", payload != nil, err)
 			}
 			after := mustRun(t, env, f.runID)
 			if after.Status != "failed" || !after.FailOrigin.Valid || after.FailOrigin.String != tc.origin ||
@@ -94,7 +94,7 @@ func TestCodexClaimRecoveryStaleTransitionLiveDB(t *testing.T) {
 			payload, err := f.svc.finishRunClaim(env.ctx, stale, nil, errCredentialUnavailable,
 				claimRecoveryIdentity{workerID: f.workerID, recoveryCapable: true})
 			if err != nil || payload != nil {
-				t.Fatalf("stale finishRunClaim = (%v, %v), want idle", payload, err)
+				t.Fatalf("stale finishRunClaim = (%v, %v), want idle", payload != nil, err)
 			}
 			after := mustRun(t, env, f.runID)
 			if after.Status != status || after.FailOrigin.Valid || after.FailureReason.Valid ||
@@ -125,7 +125,7 @@ func TestCodexClaimRecoveryRemintQuarantineNoopLiveDB(t *testing.T) {
 		errors.Join(errCredentialUnavailable, ErrCodexAccountQuarantined),
 		claimRecoveryIdentity{workerID: f.workerID, recoveryCapable: true})
 	if err != nil || payload != nil {
-		t.Fatalf("stale remint finishRunClaim = (%v, %v), want idle", payload, err)
+		t.Fatalf("stale remint finishRunClaim = (%v, %v), want idle", payload != nil, err)
 	}
 	after := mustRun(t, env, f.runID)
 	if after.Status != "claimed" || after.CodexClaimEpoch != epoch ||
@@ -158,7 +158,7 @@ func TestCodexClaimRecoverySuccessfulAssemblyAuthorityLiveDB(t *testing.T) {
 			got, err := f.svc.finishRunClaim(env.ctx, minted, payload, nil,
 				claimRecoveryIdentity{workerID: f.workerID, recoveryCapable: true})
 			if err != nil || got != nil {
-				t.Fatalf("finishRunClaim = (%v, %v), want idle", got, err)
+				t.Fatalf("finishRunClaim = (%v, %v), want idle", got != nil, err)
 			}
 			after := mustRun(t, env, f.runID)
 			if after.Status != tc.wantStatus || after.FailOrigin.String != tc.wantOrigin ||
@@ -198,7 +198,7 @@ func TestCodexClaimRecoveryExactHoldLiveDB(t *testing.T) {
 		errors.Join(errCredentialUnavailable, ErrCodexAccountQuarantined),
 		claimRecoveryIdentity{workerID: f.workerID, recoveryCapable: true})
 	if err != nil || payload != nil {
-		t.Fatalf("finishRunClaim = (%v, %v), want idle", payload, err)
+		t.Fatalf("finishRunClaim = (%v, %v), want idle", payload != nil, err)
 	}
 	var status, cause string
 	var hash []byte

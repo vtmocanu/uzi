@@ -70,10 +70,13 @@ func newSeededPlanFixture(ctx context.Context, t *testing.T) seededPlanFixture {
 	box := newHandlerTestBox(t)
 	q := store.New(pool)
 
+	wsvc := workersvc.New(q, box, workersvc.Params{})
+	// PRD #1590 M1: the run-lane claim settles in an exact-claim transaction, as main.go wires it.
+	wsvc.SetTxBeginner(pool)
 	f := seededPlanFixture{
 		pool:   pool,
 		box:    box,
-		svc:    workersvc.New(q, box, workersvc.Params{}),
+		svc:    wsvc,
 		owner:  uuid.New(),
 		repoID: uuid.New(),
 		iid:    42,

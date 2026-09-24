@@ -1292,8 +1292,11 @@ func (s *Service) assembleJudgeClaim(ctx context.Context, wkr store.Worker, run 
 	// here, through the SAME codexClaimSecrets authority path the ordinary lane uses
 	// (claim_assembly.go) — never a separate/duplicated construction. Mirrors that lane's
 	// error handling: errVaultLocked/errRunVanished pass through untouched (transient
-	// requeue / drop by identity); every other codex sentinel is wrapped as
-	// errCredentialUnavailable so the run fails closed rather than falling back to Claude.
+	// requeue / drop by identity). Every other codex error is wrapped as
+	// errCredentialUnavailable with %w, so the judge fails closed rather than falling back to
+	// Claude; a judge never parks (PRD #1590 D7). The one exception is an ambiguous capability
+	// mint (errCodexMintAmbiguous, preserved through the wrap): finishRunClaim returns no
+	// payload and makes no mutation, because the mint write may have landed.
 	if run.Harness == harnessCodex {
 		codex, err := s.codexClaimSecrets(ctx, wkr, run)
 		if err != nil {

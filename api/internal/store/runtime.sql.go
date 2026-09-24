@@ -3155,7 +3155,9 @@ func (q *Queries) ExtendAndResumeWallPark(ctx context.Context, arg ExtendAndResu
 const failClaimAssemblyExact = `-- name: FailClaimAssemblyExact :execrows
 UPDATE runs SET
     status = 'failed', status_since = now(), failure_reason = $1,
-    fail_origin = $2, move_pending_since = now(), finished_at = now(),
+    fail_origin = $2,
+    move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END,
+    finished_at = now(),
     milestones_in_progress = NULL, milestones_agents = NULL,
     pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
     credential_switch_requested_at = NULL, credential_switch_generation = NULL,
@@ -3174,7 +3176,10 @@ type FailClaimAssemblyExactParams struct {
 	ClaimGeneration int64       `json:"claim_generation"`
 }
 
-// Terminal claim assembly failure, fenced to the same locked claim.
+// Terminal claim assembly failure, fenced to the same locked claim (PRD #1590 D2). The
+// SET list mirrors MarkRunFailedByID field for field, including #1482's card-only
+// move_pending_since stamp (a card-less judge or prompt run keeps it NULL). It adds only
+// the claim-capability revoke and the exact-claim WHERE.
 func (q *Queries) FailClaimAssemblyExact(ctx context.Context, arg FailClaimAssemblyExactParams) (int64, error) {
 	result, err := q.db.Exec(ctx, failClaimAssemblyExact,
 		arg.FailureReason,
@@ -9982,6 +9987,46 @@ func (q *Queries) RequestWallParks(ctx context.Context, arg RequestWallParksPara
 	return items, nil
 }
 
+const requeueClaimAssemblyExact = `-- name: RequeueClaimAssemblyExact :execrows
+UPDATE runs SET
+    status = CASE WHEN $1::boolean THEN 'pool_wait' ELSE 'queued' END,
+    status_since = now(),
+    started_at = CASE WHEN $1::boolean THEN NULL ELSE started_at END,
+    budget_paused_seconds = CASE WHEN $1::boolean THEN 0 ELSE budget_paused_seconds END,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
+    updated_at = now()
+WHERE id = $2 AND worker_id = $3 AND claim_generation = $4
+  AND status = 'claimed'
+  AND (NOT $1::boolean OR kind <> 'judge')
+`
+
+type RequeueClaimAssemblyExactParams struct {
+	PoolWait        bool        `json:"pool_wait"`
+	ID              uuid.UUID   `json:"id"`
+	WorkerID        pgtype.UUID `json:"worker_id"`
+	ClaimGeneration int64       `json:"claim_generation"`
+}
+
+// PRD #1590 D2: the transient claim-assembly outcomes (vault locked, custom-model capability
+// missing, empty auto pool), fenced to the exact locked claim. @pool_wait=false is the
+// RequeueClaimedRunToQueued field set (claimed -> queued, started_at kept); @pool_wait=true is
+// the SetRunPoolWait field set (claimed -> pool_wait, a fresh wall: started_at NULL and
+// budget_paused_seconds 0), keeping SetRunPoolWait's `kind <> 'judge'` guard (Decision 14).
+// Both revoke the claim's Codex capability, clear health and keep worker_id for affinity.
+func (q *Queries) RequeueClaimAssemblyExact(ctx context.Context, arg RequeueClaimAssemblyExactParams) (int64, error) {
+	result, err := q.db.Exec(ctx, requeueClaimAssemblyExact,
+		arg.PoolWait,
+		arg.ID,
+		arg.WorkerID,
+		arg.ClaimGeneration,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const requeueClaimedRunToQueued = `-- name: RequeueClaimedRunToQueued :execrows
 UPDATE runs SET status = 'queued', status_since = now(),
     -- Exit contract (PRD #47 Decision 3): mirrors SweepClaimedNeverStarted — a
@@ -12255,7 +12300,9 @@ type SetRunPoolWaitParams struct {
 //
 // 🔴 THE SOURCE GUARD IS POSITIVE (status = 'claimed'), like SetRunLimitWait's
 // status='running' and unlike the negative sibling guards above. A held run only ever
-// comes from a JUST-CLAIMED run in assembleClaim (recoverClaimAssembly runs on the
+// comes from a JUST-CLAIMED run in assembleClaim (PRD #1590 M1: the run lane now holds
+// through RequeueClaimAssemblyExact's fenced pool_wait field set, which mirrors this one;
+// this statement remains only on recoverClaimAssembly's chat-lane arm, which runs on the
 // claim path, before the worker starts), so 'claimed' is the only legitimate source.
 // Every other transition is a 0-row no-op, so a re-delivered or out-of-order report
 // cannot re-hold a run that a concurrent path already advanced. kind <> 'judge'

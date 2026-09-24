@@ -301,6 +301,8 @@ func TestRecoveryWaitLiveDB(t *testing.T) {
 			t.Fatalf("pre-claim status = %q, want queued", r.Status)
 		}
 
+		// PRD #1590 M1: the run-lane claim settles in an exact-claim transaction, as main.go wires it.
+		svc.SetTxBeginner(pool)
 		payload, err := svc.Claim(ctx, wkr, nil)
 		if err != nil {
 			t.Fatalf("svc.Claim: %v", err)

@@ -653,6 +653,57 @@ func (q *Queries) LockCodexAccountForRejection(ctx context.Context, arg LockCode
 	return id, err
 }
 
+const lockCodexAccountForShareNowait = `-- name: LockCodexAccountForShareNowait :one
+SELECT id FROM codex_provider_account
+WHERE id = $1 AND user_id = $2
+FOR SHARE NOWAIT
+`
+
+type LockCodexAccountForShareNowaitParams struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+// PRD #1590 D2/D3: the account half of the classifier's lock pair, after the alias. NOWAIT
+// is required even with the alias held (RefreshCodexAccountLogin holds the account first).
+// Owner-scoped; a missing row is pgx.ErrNoRows.
+func (q *Queries) LockCodexAccountForShareNowait(ctx context.Context, arg LockCodexAccountForShareNowaitParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, lockCodexAccountForShareNowait, arg.ID, arg.UserID)
+	var id uuid.UUID
+	err := row.Scan(&id)
+	return id, err
+}
+
+const lockCodexAliasForShareNowait = `-- name: LockCodexAliasForShareNowait :one
+SELECT status, material_revision, provider_account_id
+FROM codex_credential_state
+WHERE user_secret_id = $1 AND user_id = $2
+FOR SHARE NOWAIT
+`
+
+type LockCodexAliasForShareNowaitParams struct {
+	UserSecretID uuid.UUID `json:"user_secret_id"`
+	UserID       uuid.UUID `json:"user_id"`
+}
+
+type LockCodexAliasForShareNowaitRow struct {
+	Status            string      `json:"status"`
+	MaterialRevision  int64       `json:"material_revision"`
+	ProviderAccountID pgtype.UUID `json:"provider_account_id"`
+}
+
+// PRD #1590 D2/D3: the final claim classifier's alias lock, taken under the exact-claim run
+// row lock and BEFORE the account lock. FOR SHARE blocks a concurrent re-login writer
+// (BumpCodexMaterialRevision, LinkCodexCredentialState) until the decision commits; NOWAIT
+// means the classifier never waits on that writer, which takes the account before the alias
+// (see D3 deadlock avoidance): a held row returns 55P03 and the caller retries. Owner-scoped.
+func (q *Queries) LockCodexAliasForShareNowait(ctx context.Context, arg LockCodexAliasForShareNowaitParams) (LockCodexAliasForShareNowaitRow, error) {
+	row := q.db.QueryRow(ctx, lockCodexAliasForShareNowait, arg.UserSecretID, arg.UserID)
+	var i LockCodexAliasForShareNowaitRow
+	err := row.Scan(&i.Status, &i.MaterialRevision, &i.ProviderAccountID)
+	return i, err
+}
+
 const lockRotatingCodexRefreshIntent = `-- name: LockRotatingCodexRefreshIntent :one
 SELECT operation_id FROM codex_refresh_intent
 WHERE operation_id = $1::uuid AND user_id = $2

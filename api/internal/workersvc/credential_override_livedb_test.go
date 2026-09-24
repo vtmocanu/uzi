@@ -73,6 +73,8 @@ func (e codexTestEnv) seedQueuedRunWithOverride(t *testing.T, userID, repoID uui
 func TestRunOverrideBeatsWorkerBindLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	svc := New(env.q, env.box, testParams())
+	// PRD #1590 M1: the run-lane claim settles in an exact-claim transaction, as main.go wires it.
+	svc.SetTxBeginner(env.pool)
 
 	t.Run("pinned override wins and records run_pinned", func(t *testing.T) {
 		userID, workerID, repoID := env.seedCodexInfra(t)
@@ -151,6 +153,8 @@ func TestRunOverrideBeatsWorkerBindLiveDB(t *testing.T) {
 func TestRecordRunCredentialEpochIdempotentAtGenerationLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	svc := New(env.q, env.box, testParams())
+	// PRD #1590 M1: the run-lane claim settles in an exact-claim transaction, as main.go wires it.
+	svc.SetTxBeginner(env.pool)
 
 	userID, workerID, repoID := env.seedCodexInfra(t)
 	env.sealBotPAT(t, userID)
@@ -233,6 +237,8 @@ func TestRecordRunCredentialEpochIdempotentAtGenerationLiveDB(t *testing.T) {
 func TestRunOverrideRejectsWrongKindSecretLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	svc := New(env.q, env.box, testParams())
+	// PRD #1590 M1: the run-lane claim settles in an exact-claim transaction, as main.go wires it.
+	svc.SetTxBeginner(env.pool)
 	userID, _, _ := env.seedCodexInfra(t)
 
 	// A real, owned secret — but of kind openai_api_key, not anthropic_token.

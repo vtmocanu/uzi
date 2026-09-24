@@ -881,6 +881,9 @@ func (s *Service) codexClaimSecrets(ctx context.Context, wkr store.Worker, run s
 			claimErr = &codexMintedClaimError{cause: claimErr, epoch: epoch, hash: hash}
 		}
 	}()
+	if h := s.claimHooks; h != nil && h.afterMint != nil {
+		h.afterMint(ctx, run)
+	}
 	// Wire the capability off the PERSISTED post-bump epoch the mint returned, not a
 	// re-derived value: the stored epoch is authoritative.
 	wireCap := formatCodexCapability(epoch, plaintext)

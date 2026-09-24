@@ -73,3 +73,26 @@ func TestForgeUnreachableSkipsJudgeRegardlessOfIteration(t *testing.T) {
 		t.Fatal("forge_unreachable is worker-reportable; it must be server-derived only")
 	}
 }
+
+// TestSetStateServerOnlyRecoveryCauseRejected (PRD #1590 C2): codex_account_unavailable is a
+// SERVER-written cause (the exact-claim park). A worker reporting it through SetState is refused
+// as ErrInvalidState before any state SQL, exactly like an unknown cause, so a worker can never
+// park a run on the account hold the promoters treat specially.
+func TestSetStateServerOnlyRecoveryCauseRejected(t *testing.T) {
+	run := runningRun(false)
+	fs, svc, wkr := limitParkFixture(t, run)
+
+	_, applied, err := svc.SetState(context.Background(), wkr, run.ID, StateRequest{
+		State: "recovery_wait", RecoveryCause: strPtr(recoveryCauseCodexAccountUnavailable), ClaimGeneration: i64Ptr(1),
+	})
+	if !errors.Is(err, ErrInvalidState) {
+		t.Fatalf("SetState err = %v, want ErrInvalidState for a server-only recovery_cause", err)
+	}
+	if applied || fs.setRecoveryWait != nil || fs.setFailed != nil {
+		t.Fatalf("a refused server-only cause mutated the run: applied=%v recovery_wait=%v failed=%v",
+			applied, fs.setRecoveryWait, fs.setFailed)
+	}
+	if recoveryWaitCauses[recoveryCauseCodexAccountUnavailable] {
+		t.Fatal("codex_account_unavailable is in the worker-reportable set")
+	}
+}

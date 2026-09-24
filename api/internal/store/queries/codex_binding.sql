@@ -148,6 +148,25 @@ LEFT JOIN codex_provider_account cpa
     ON cpa.id = ccs.provider_account_id AND cpa.user_id = r.user_id
 WHERE r.id = @id;
 
+-- name: LockCodexAliasForShareNowait :one
+-- PRD #1590 D2/D3: the final claim classifier's alias lock, taken under the exact-claim run
+-- row lock and BEFORE the account lock. FOR SHARE blocks a concurrent re-login writer
+-- (BumpCodexMaterialRevision, LinkCodexCredentialState) until the decision commits; NOWAIT
+-- means the classifier never waits on that writer, which takes the account before the alias
+-- (see D3 deadlock avoidance): a held row returns 55P03 and the caller retries. Owner-scoped.
+SELECT status, material_revision, provider_account_id
+FROM codex_credential_state
+WHERE user_secret_id = @user_secret_id AND user_id = @user_id
+FOR SHARE NOWAIT;
+
+-- name: LockCodexAccountForShareNowait :one
+-- PRD #1590 D2/D3: the account half of the classifier's lock pair, after the alias. NOWAIT
+-- is required even with the alias held (RefreshCodexAccountLogin holds the account first).
+-- Owner-scoped; a missing row is pgx.ErrNoRows.
+SELECT id FROM codex_provider_account
+WHERE id = @id AND user_id = @user_id
+FOR SHARE NOWAIT;
+
 -- name: SetRunCodexClaimCapability :one
 -- Mint (or rotate) the per-claim Codex capability (PRD #1147 M2): store the new hash and
 -- bump the epoch so a prior capability is superseded. Guarded on worker_id — only the
