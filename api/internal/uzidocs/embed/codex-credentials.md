@@ -10,7 +10,7 @@ audience: user
 **Codex CLI / ChatGPT-subscription login** into uzi. It is not an OpenAI
 API key; that has its own field on the same card.
 
-A saved Codex login is what a Codex-harness run spends — see
+A saved Codex login is what a Codex-harness run spends; see
 [Worker model](./worker-model.md) for choosing Codex as your default harness
 and its worker model. You still need an [Anthropic
 token](./anthropic-token.md) for a Claude run; the two harnesses' credentials
@@ -41,13 +41,13 @@ recommends one `auth.json` per runner: if your local Codex CLI and uzi share
 one login, a refresh on either side can leave the other holding a stale
 copy of a rotated token, and a re-paste from the file your local CLI keeps
 using can break one side or the other again. A dedicated, isolated login
-avoids this shared-copy failure mode — uzi is a second, independent runner,
+avoids this shared-copy failure mode. uzi is a second, independent runner,
 so it needs its own login, not a copy of yours.
 
 Run this in a fresh shell. It signs in to a throwaway `CODEX_HOME`, verifies
 the login actually produced a usable file-based credential, and copies only
-the two fields uzi needs — never the whole file, never your real
-`~/.codex/auth.json` — to your clipboard:
+the two fields uzi needs (never the whole file, never your real
+`~/.codex/auth.json`) to your clipboard:
 
 **macOS**
 
@@ -99,7 +99,7 @@ What each part is doing:
 - Only after that check passes does the second `jq` project the **flat**
   shape uzi wants (`{"access_token", "refresh_token"}`) out of the **nested**
   file the Codex CLI actually writes (tokens live under a `tokens` object
-  alongside `auth_mode`, `account_id`, `id_token`, and more) — straight to
+  alongside `auth_mode`, `account_id`, `id_token`, and more), straight to
   your clipboard, so the secret never appears in your visible terminal
   output. Pasting the whole nested file into uzi is rejected, because the
   top level has no `access_token` of its own: the web field says it looks
@@ -109,13 +109,13 @@ What each part is doing:
 
 **Do not delete `$CODEX_HOME` yet.** It's the only copy of this login until
 you've confirmed the paste worked (the credential's status moves to
-`linked` in uzi — see [Status legend](#status-legend) below). Once it has,
+`linked` in uzi; see [Status legend](#status-legend) below). Once it has,
 remove the temporary directory; don't reuse it, and don't reuse the login
 it holds anywhere else.
 
 If a managed credential-store policy on your machine overrides the `-c`
-flag — the login doesn't produce a file-based `auth.json` and the `jq -e`
-check fails — this recipe isn't available to you. Don't fall back to your
+flag (the login doesn't produce a file-based `auth.json` and the `jq -e`
+check fails), this recipe isn't available to you. Don't fall back to your
 everyday keyring login or your everyday `~/.codex/auth.json`; ask whoever
 administers your Codex CLI installation for a way to get a file-based,
 uzi-only login instead.
@@ -177,7 +177,7 @@ A linked account's meter can land in a state that needs your attention:
   to renew it automatically, or the provider outright rejected uzi's refresh
   attempt (the hint on this state names which). Either way, use **Replace
   value** and paste a *new* [login dedicated to uzi](#1-sign-in-with-a-login-dedicated-to-uzi)
-  from the recipe above — never a re-paste of the old one, and never a copy
+  from the recipe above, never a re-paste of the old one, and never a copy
   of your everyday Codex CLI's `auth.json`. `uzi rate-limits --provider
   codex` shows the same state as `credential_action_required (login
   rejected by provider)` when the provider rejection is the cause. If
