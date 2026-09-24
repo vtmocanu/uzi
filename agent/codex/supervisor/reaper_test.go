@@ -125,9 +125,10 @@ func killWait(cmd *exec.Cmd) {
 // processes on the host, this test binary's own ancestors included (go test
 // and the shell above it run as the test's uid), do not decide the proof. An
 // invalid scan (a listed pid vanished anywhere on the host) is retaken here up
-// to 100 times before it reaches proveNoUser's own rescan rule, so a busy
-// host does not turn an expected "held" into "unknown"; a vanished scan is
-// still never accepted.
+// to 200 times, 10 ms apart (back-to-back retries exhaust in milliseconds on a
+// busy host), before it reaches proveNoUser's own rescan rule, so a busy host
+// does not turn an expected "held" into "unknown"; a vanished scan is still
+// never accepted.
 type filteredTable struct {
 	keep map[int]bool
 }
@@ -135,11 +136,12 @@ type filteredTable struct {
 func (f filteredTable) rows() ([]procUserRow, error) {
 	var all []procUserRow
 	var err error
-	for range 100 {
+	for range 200 {
 		all, err = procFS{root: procRootPath, self: os.Getpid()}.rows()
 		if !errors.Is(err, errProcVanished) {
 			break
 		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	if err != nil {
 		return nil, err

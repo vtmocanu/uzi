@@ -40,8 +40,12 @@ exit 0`
 // ppid no longer names it) had its pid written by that parent first.
 //
 // A row with the test's uid whose stat is already gone cannot be identified,
-// so the scan is undecidable and rows returns errHopperUndecided: the proof is
-// then "unknown", never "held", which keeps the held assertion exact.
+// so that identification is undecidable. rows then retakes the whole scan, up
+// to maxIdentifyScans times, and only after that returns errHopperUndecided:
+// the proof is then "unknown", never "held", which keeps the held assertion
+// exact. The retake only follows a scan procFS.rows already returned as
+// valid; an errProcVanished from procFS.rows is returned at once, so
+// proveNoUser's own rescan rule stays the only retry around it.
 type hopperTable struct {
 	first int
 	dir   string
@@ -49,20 +53,42 @@ type hopperTable struct {
 
 var errHopperUndecided = errors.New("a same-uid row exited before it could be identified")
 
+// maxIdentifyScans bounds how many valid scans rows takes while the
+// identification step keeps losing a same-uid row.
+const maxIdentifyScans = 20
+
 // hopperComm is the comm of every generation: the command hopScript runs.
 const hopperComm = "sh"
 
+type hopperIdent struct {
+	comm string
+	ppid int
+}
+
 func (h hopperTable) rows() ([]procUserRow, error) {
-	self, uid := os.Getpid(), os.Geteuid()
-	all, err := procFS{root: procRootPath, self: self}.rows()
-	if err != nil {
-		return nil, err
+	self := os.Getpid()
+	for range maxIdentifyScans {
+		all, err := procFS{root: procRootPath, self: self}.rows()
+		if err != nil {
+			return nil, err // errProcVanished included: proveNoUser's rule decides
+		}
+		idents, err := identify(all, self)
+		if errors.Is(err, errHopperUndecided) {
+			continue // a valid scan whose identification lost a row: retake it
+		}
+		if err != nil {
+			return nil, err
+		}
+		return h.hopperRows(all, idents, self)
 	}
-	type ident struct {
-		comm string
-		ppid int
-	}
-	idents := map[int]ident{}
+	return nil, fmt.Errorf("%d scans in a row: %w", maxIdentifyScans, errHopperUndecided)
+}
+
+// identify reads the stat of every same-uid row of all (but self), right
+// after the scan.
+func identify(all []procUserRow, self int) (map[int]hopperIdent, error) {
+	uid := os.Geteuid()
+	idents := map[int]hopperIdent{}
 	for _, r := range all {
 		if r.pid == self || !slices.Contains(r.uids[:], uid) {
 			continue // another uid never decides the proof
@@ -76,8 +102,14 @@ func (h hopperTable) rows() ([]procUserRow, error) {
 		if open < 0 || closing < open || err != nil {
 			return nil, fmt.Errorf("stat of %d: malformed", r.pid)
 		}
-		idents[r.pid] = ident{comm: string(stat[open+1 : closing]), ppid: ppid}
+		idents[r.pid] = hopperIdent{comm: string(stat[open+1 : closing]), ppid: ppid}
 	}
+	return idents, nil
+}
+
+// hopperRows keeps self and the rows of all that idents and the pids file
+// identify as hopper generations.
+func (h hopperTable) hopperRows(all []procUserRow, idents map[int]hopperIdent, self int) ([]procUserRow, error) {
 	data, err := os.ReadFile(filepath.Join(h.dir, "pids"))
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err
@@ -160,14 +192,13 @@ func TestProveNoUserNeverHeldWhileAHopperLives(t *testing.T) {
 	uid := os.Geteuid()
 	counts := map[string]int{}
 	before := generations()
-	// At least minProofs proofs, then more until one sees the hopper or the
-	// budget is spent. Every one of them must not be "held"; "unknown" (an
-	// invalid or undecidable scan, likelier on a busy host) is allowed, so the
-	// liveness check waits for a "user_alive" instead of demanding it within
-	// a fixed count.
-	const minProofs, budget = 50, 10 * time.Second
+	// At least minDecided DECIDED proofs ("held" or "user_alive": an
+	// "unknown" one cannot show "held", so it proves nothing), then more until
+	// one sees the hopper, all within budget. Every proof must not be "held".
+	const minDecided, budget = 50, 20 * time.Second
 	deadline := time.Now().Add(budget)
-	for i := 0; i < minProofs || (counts[proofUserAlive] == 0 && time.Now().Before(deadline)); i++ {
+	decided := func() int { return counts[proofHeld] + counts[proofUserAlive] }
+	for i := 0; (decided() < minDecided || counts[proofUserAlive] == 0) && time.Now().Before(deadline); i++ {
 		got := proveNoUser(table, uid, os.Getpid())
 		if got == proofHeld {
 			t.Fatalf("proof %d is held while the hopper lives (generation %d)", i, generations())
@@ -178,6 +209,9 @@ func TestProveNoUserNeverHeldWhileAHopperLives(t *testing.T) {
 	t.Logf("proofs: %v; generations during them: %d", counts, after-before)
 	if after-before < 2 {
 		t.Fatalf("the hopper did not hop during the proofs (%d generations)", after-before)
+	}
+	if decided() < minDecided {
+		t.Fatalf("only %d decided proofs within %v, want %d: %v", decided(), budget, minDecided, counts)
 	}
 	if counts[proofUserAlive] == 0 {
 		t.Fatalf("no proof saw the hopper within %v: %v", budget, counts)
