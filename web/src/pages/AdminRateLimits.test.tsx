@@ -13,6 +13,7 @@ import {
   type CodexRateLimitWindow,
   type MyRateLimits,
 } from "../lib/api";
+import { mockAdminCodexRateLimits } from "../mocks/data/codexRateLimits";
 
 vi.mock("../lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/api")>();
@@ -376,6 +377,23 @@ describe("AdminRateLimits — Codex section", () => {
     const pendra = within(section()).getByText("pend-codex").closest("tr")!;
     expect(within(pendra).getByText("—")).toBeTruthy();
     expect(within(pendra).getByText("Pending")).toBeTruthy();
+  });
+
+  it("names a provider-rejected login in the status hint, from the account's reason (#1594)", async () => {
+    // The shared mock set: carmen's account carries reason "provider_rejected", so the
+    // page must pass the WHOLE account (status AND reason) to codexStatusBadge.
+    mockApi.getAdminCodexRateLimits.mockResolvedValue({ users: mockAdminCodexRateLimits });
+    render(
+      <MemoryRouter>
+        <AdminRateLimits />
+      </MemoryRouter>,
+    );
+    await screen.findByText("carmen-codex");
+    const carmen = within(section()).getByText("carmen-codex").closest("tr")!;
+    const badge = within(carmen).getByText("Action required");
+    expect(badge.getAttribute("title")).toBe(
+      "The saved Codex login was rejected by the provider; add a login used only by uzi.",
+    );
   });
 
   it("self-hides when no user has a linked Codex account", async () => {

@@ -313,13 +313,19 @@ describe("CodexCredentials", () => {
     expect(within(legend).getByText(/No\s+provider\s+or\s+secret\s+details/i)).toBeTruthy();
     // The staging entry says what happens next: uzi verifies it automatically.
     expect(within(legend).getByText(/uzi verifies a new Codex login automatically/)).toBeTruthy();
+    // ...but only while Codex usage polling is on, and a rejected login goes to failed.
+    expect(legend.textContent).toContain("while Codex usage polling is on (the default)");
+    expect(legend.textContent).toContain("or failed if the provider rejects it");
+    // The failed entry points at a NEW dedicated login, never a re-paste.
+    expect(legend.textContent).toContain("Replace it with a new login dedicated to uzi");
+    expect(legend.textContent).not.toContain("re-add the login");
     // The per-badge sr-only description + aria-describedby scaffolding is retained.
     const badge = within(screen.getByTestId("codex-sec-1")).getByText("staging");
     expect(badge.getAttribute("aria-describedby")).toBe("codex-status-sec-1");
     const srOnly = document.getElementById("codex-status-sec-1");
     expect(srOnly?.className).toContain("sr-only");
     expect(srOnly?.textContent).toBe(
-      "Saved and encrypted; identity not yet verified. uzi verifies a new Codex login automatically; it moves to linked once verified.",
+      "Saved and encrypted; identity not yet verified. uzi verifies a new Codex login automatically while Codex usage polling is on (the default); it moves to linked once verified, or failed if the provider rejects it.",
     );
   });
 
@@ -340,6 +346,12 @@ describe("CodexCredentials", () => {
     expect(within(screen.getByTestId("codex-sec-2")).getByText("linked")).toBeTruthy();
     expect(within(screen.getByTestId("codex-sec-3")).getByText("failed")).toBeTruthy();
     expect(within(screen.getByTestId("codex-sec-4")).getByText("static")).toBeTruthy();
+    // A failed login's hint sends the user to a NEW dedicated login, not a re-paste.
+    const failedBadge = within(screen.getByTestId("codex-sec-3")).getByText("failed");
+    expect(failedBadge.getAttribute("title")).toBe(
+      "Verification failed. Replace it with a new login dedicated to uzi (see “How to get this”), never a re-paste of the old one.",
+    );
+    expect(screen.getByTestId("codex-sec-3").textContent).not.toContain("re-add the login");
   });
 
   // The wrong-shape pre-check: each bad paste shows its OWN message, sends NOTHING,

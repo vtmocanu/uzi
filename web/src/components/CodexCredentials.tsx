@@ -12,8 +12,9 @@
 //
 // What this card deliberately does NOT carry (no Codex analog — see PRD #1147):
 // the auto-selection pool toggle, the sidebar-rail checkbox, the rate-limit chip
-// machinery, and the judge-lane binding. A Codex-only credential set also must NOT
-// make a run startable — that gate stays Anthropic-only (lib/hasToken.ts).
+// machinery, and the judge-lane binding. (A usable Codex default alone, a linked login
+// or an API key, does count as a usable credential: lib/hasToken.ts's
+// hasUsableCredential accepts either harness.)
 
 import { useEffect, useState, type FormEvent } from "react";
 import { api, type SecretMeta } from "../lib/api";
@@ -36,10 +37,15 @@ const D6_HINT =
   "Make another credential the default first; every account needs one default while any credential exists.";
 
 // What happens to a `staging` login next, in one place: the badge hint and the status
-// legend both say it, so the two cannot drift. uzi's usage poller verifies a staged
-// login and links it on its own; the user does not have to do anything.
+// legend both say it, so the two cannot drift. uzi's Codex usage poller is the only
+// verifier: it runs when UZI_CODEX_USAGE_POLL_INTERVAL > 0 (the default, 5m), linking a
+// good login and failing a proven-bad one; with polling off a login stays staging.
 const STAGING_NEXT =
-  "uzi verifies a new Codex login automatically; it moves to linked once verified.";
+  "uzi verifies a new Codex login automatically while Codex usage polling is on (the default); it moves to linked once verified, or failed if the provider rejects it.";
+
+// What to do about a `failed` login, in one place: the badge hint and the legend.
+const FAILED_NEXT =
+  "Replace it with a new login dedicated to uzi (see “How to get this”), never a re-paste of the old one.";
 
 // The isolated-login recipe (issue #1594). A login dedicated to uzi lives in a throwaway
 // CODEX_HOME so the user's everyday Codex CLI never refreshes (and so rotates) the same
@@ -91,7 +97,8 @@ function statusBadge(
 ): { tone: BadgeTone; label: string; hint: string } | null {
   switch (status) {
     case "staging":
-      // A `staging` login says what happens next: uzi verifies it on its own.
+      // A `staging` login says what happens next: uzi verifies it on its own while
+      // Codex usage polling is on.
       return {
         tone: "info",
         label: "staging",
@@ -105,7 +112,7 @@ function statusBadge(
       return {
         tone: "danger",
         label: "failed",
-        hint: "Verification failed. Replace the value or re-add the login.",
+        hint: "Verification failed. " + FAILED_NEXT,
       };
     case "static":
       return {
@@ -120,7 +127,7 @@ function statusBadge(
 
 // codexShapeError is a PURE, IN-MEMORY pre-check for a codex_auth paste (issue
 // #1174 item 2 / AC 2). It exists to catch the two shapes a user actually pastes
-// by mistake — a raw token, and the WHOLE ~/.codex/auth.json file — and answer with
+// by mistake — a raw token, and the whole Codex auth.json file — and answer with
 // a specific, secret-free hint BEFORE any request leaves the browser. It returns a
 // message string, NEVER the pasted value, and logs/persists nothing; the server
 // validator stays the real backstop. Exported because the card and its test both
@@ -683,8 +690,8 @@ export function CodexCredentials({
             <div>
               <dt className="font-medium text-fg">failed</dt>
               <dd>
-                Verification failed. Replace the value or re-add the login. No
-                provider or secret details are shown.
+                Verification failed. {FAILED_NEXT} No provider or secret details are
+                shown.
               </dd>
             </div>
             <div>

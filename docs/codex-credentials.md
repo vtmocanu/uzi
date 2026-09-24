@@ -100,9 +100,11 @@ What each part is doing:
   file the Codex CLI actually writes (tokens live under a `tokens` object
   alongside `auth_mode`, `account_id`, `id_token`, and more) — straight to
   your clipboard, so the secret never appears in your visible terminal
-  output. Pasting the whole nested file into uzi fails with "codex login
-  must contain a non-empty access_token", because the top level has no
-  `access_token` of its own.
+  output. Pasting the whole nested file into uzi is rejected, because the
+  top level has no `access_token` of its own: the web field says it looks
+  like the whole Codex `auth.json` file and asks for the flat object
+  instead, and the API and CLI reply "codex login must contain a non-empty
+  access_token".
 
 **Do not delete `$CODEX_HOME` yet.** It's the only copy of this login until
 you've confirmed the paste worked (the credential's status moves to
@@ -147,9 +149,9 @@ Each stored Codex credential shows one of four statuses:
 
 | Status | Meaning |
 |---|---|
-| `staging` | Saved and encrypted; the provider identity has not been verified yet. uzi verifies it automatically in the background on a read-only, non-rotating identity check, moving it to `linked` once that succeeds, or `failed` once it proves bad; a transient failure (a timeout, a 5xx) leaves it `staging` to retry. |
+| `staging` | Saved and encrypted; the provider identity has not been verified yet. While Codex usage polling is on (the default), uzi verifies it automatically in the background on a read-only, non-rotating identity check, moving it to `linked` once that succeeds, or `failed` once it proves bad; a transient failure (a timeout, a 5xx) leaves it `staging` to retry. With polling turned off (`UZI_CODEX_USAGE_POLL_INTERVAL=0`, see [Codex account limits](rate-limits.md#codex-account-limits)) nothing verifies it, and it stays `staging`. |
 | `linked` | The provider identity has been verified. |
-| `failed` | Verification failed. Replace the value, or re-add the login. |
+| `failed` | Verification failed. Use **Replace value** with a *new* [login dedicated to uzi](#1-sign-in-with-a-login-dedicated-to-uzi), never a re-paste of the old one. |
 | `static` | An OpenAI API key, not a Codex login; provider-account linking doesn't apply to a key. |
 
 ## Usage meters
