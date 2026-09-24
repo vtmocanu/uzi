@@ -5654,7 +5654,13 @@ export class RunRunner {
       let bodyOutcome: CheckpointBodyOutcome = "no_new_work";
       // `inPermit`: this publish runs inside a Codex permit (the reap:true milestone on a Codex run),
       // whose deadline the scan must not push it past (issue #1597 M2 review item 7).
-      const doCheckpointPublish = async (overlay?: CheckpointOverlayContext, inPermit = false): Promise<void> => {
+      // `noReport`: skip the running report (the post-permit deferred publish; the milestone's own
+      // pass already reported it).
+      const doCheckpointPublish = async (
+        overlay?: CheckpointOverlayContext,
+        inPermit = false,
+        noReport = false,
+      ): Promise<void> => {
         // issue #1597 M2: a cancelled tick (quiescence, shutdown, a preempting sink) starts nothing.
         if (opts.signal?.aborted) {
           bodyOutcome = "aborted";
@@ -5758,6 +5764,10 @@ export class RunRunner {
               // retries; lastPublishedTip does NOT advance. Falls through to the running report, so a
               // milestone's progress is still reported.
               flight.lastPublish = this.now();
+              // issue #1597 M2 (round 4): a scan+publish ATTEMPT outside a permit settles an owed
+              // (deferred) publish — the normal time gate now governs the retry, instead of every
+              // tick / iteration boundary bypassing CHECKPOINT_INTERVAL.
+              flight.pendingPublish = false;
               bodyOutcome = scanned.outcome;
             } else {
               const outcome = await this.publishCheckpointOutcome(
@@ -5775,8 +5785,11 @@ export class RunRunner {
                   ? "aborted"
                   : `publish_failed:${outcome.reason}`;
               // Advance the time-gate on every ATTEMPT (not just success): bounds broker retry
-              // cadence to <= 1 publish/interval/run even under a persistent broker failure.
+              // cadence to <= 1 publish/interval/run even under a persistent broker failure. An owed
+              // (deferred) publish is settled by the attempt too (issue #1597 M2 round 4), so the gate
+              // — not pendingPublish — governs every retry.
               flight.lastPublish = this.now();
+              if (bodyOutcome !== "aborted") flight.pendingPublish = false;
               // PRD #267 Fix 1 (Decision 9): advance lastPublishedTip ONLY on a CONFIRMED landed
               // publish, so a transient broker failure leaves hasNewWork true and the time-gate
               // retries the SAME tip at the next interval boundary (bounded loss).
@@ -5790,7 +5803,6 @@ export class RunRunner {
                 // lastPublishedTip = the fetched H that B wraps (it drives hasNewWork against cloneTip,
                 // exactly as the unpinned path keeps H there).
                 const tipSha = scanned.range.tipSha;
-                flight.pendingPublish = false;
                 const bridgedTip = bridgeOutcome.kind === "bridged" && bridgeOutcome.bridge === tipSha;
                 flight.lastPublishedTip = bridgedTip && fetchedTip ? fetchedTip : tipSha;
                 flight.checkpointFloor = tipSha;
@@ -5836,7 +5848,7 @@ export class RunRunner {
         // iteration_count so it never regresses the server's GREATEST-merged counter). PRD
         // #267 Fix 2: emit ONLY on real activity (a fetch or a publish); stay silent on a
         // pure-idle checkpoint. issue #1597 M2: the mid-turn tick runs QUIET (no report).
-        if (!opts.quiet && (!tipUnmovedSinceFetch || published)) {
+        if (!opts.quiet && !noReport && (!tipUnmovedSinceFetch || published)) {
           // PRD #1064 M1: enqueue onto the per-run chain so this checkpoint report stays
           // ordered behind any pending immediate `reportProgress` push.
           await enqueueRunningReport(() =>
@@ -5886,6 +5898,14 @@ export class RunRunner {
             await doCheckpointPublish(midRunOverlay, permit !== undefined);
           },
         );
+        // issue #1597 M2 (round 4): with NO mid-turn ticker running (CHECKPOINT_TICK_INTERVAL=0) a
+        // publish deferred out of the Codex permit is made RIGHT HERE, after the permit has ended
+        // and before the checkpoint returns — the same scanned path, never inside the permit — so a
+        // Codex milestone still publishes like it did before #1597 instead of waiting for the next
+        // iteration boundary. (With a ticker running, the kicked tick publishes it.)
+        if (flight.pendingPublish && !flight.kickMidTurnTick) {
+          await doCheckpointPublish(undefined, false, true);
+        }
       } else {
         // reap:false (iteration boundary): NO reap, NO permit, NO overlay — the agent tree
         // stays ALIVE (a backgrounded dev server survives to the next iteration) and the
@@ -6949,7 +6969,7 @@ export class RunRunner {
    *
    * BY DESIGN the park / shutdown / pause / capture publishes (and every overlay publish) are NOT
    * scanned: the api pushes them UNSCANNED to the forge's refs/uzi-checkpoints/<branch>
-   * (api/internal/workersvc/service.go PublishCheckpoint) — they are the run's last chance to be
+   * (Service.Publish in api/internal/workersvc/service.go) — they are the run's last chance to be
    * durable before the worker stops working on it, and a blocked or slow scan there would lose the
    * work outright. The scan guards the frequent, mid-run checkpoint stream only; a Codex milestone
    * inside a permit DEFERS its publish to the next tick outside the permit instead of scanning there
@@ -7053,6 +7073,7 @@ export class RunRunner {
     let inFlightAbort: AbortController | undefined;
     let busyStreak = 0;
     let busyLineEmitted = false;
+    let gateRetryUsed = false;
 
     const handleLocks = (res: { removed: string[]; retained: RetainedLock[] }): boolean => {
       for (const p of res.removed) {
@@ -7239,6 +7260,15 @@ export class RunRunner {
         // is never mistaken for an overlap.
         if (inFlight === current) inFlight = undefined;
         runLog.info("mid-turn checkpoint tick", { run_id: runId, outcome });
+        // issue #1597 M2 (round 4): an owed (deferred) publish whose tick found the sink gate busy
+        // is retried ONCE more soon (a kick) instead of waiting a full interval; a second miss waits
+        // for the normal cadence. The flag resets on any tick outcome other than `gate_busy`.
+        if (outcome === "gate_busy" && flight.pendingPublish && !gateRetryUsed) {
+          gateRetryUsed = true;
+          flight.kickMidTurnTick?.();
+        } else if (outcome !== "gate_busy") {
+          gateRetryUsed = false;
+        }
         try {
           hooks?.onTickOutcome?.(outcome);
         } catch {

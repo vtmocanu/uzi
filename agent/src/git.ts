@@ -2040,8 +2040,8 @@ export class GitCache {
    * GH013 backstop to fail open to).
    *
    * Park/shutdown/pause/capture publishes are NOT scanned by design: the api pushes them UNSCANNED
-   * to the forge's refs/uzi-checkpoints/<branch> (api/internal/workersvc/service.go
-   * PublishCheckpoint) — they are the run's last chance to be durable, and a blocked or slow scan
+   * to the forge's refs/uzi-checkpoints/<branch> (Service.Publish in
+   * api/internal/workersvc/service.go) — they are the run's last chance to be durable, and a blocked or slow scan
    * there would lose the work outright. This scan guards the frequent mid-run stream only.
    *
    * Same instrument discipline as the finalize {@link secretScanRange}: gitleaks' embedded default
@@ -2062,7 +2062,9 @@ export class GitCache {
    *     exactly an "evil merge"'s content, excluding side-branch commits that are scanned as
    *     ordinary commits or public via the floors); an octopus merge (remerge-diff shows nothing
    *     for it) or a git without remerge-diff falls back to `git diff --text <M>^1 <M>`, a superset.
-   *     Liveness: gitleaks' `scanned ~N bytes` must equal the bytes fed.
+   *     Only the diff's ADDED lines are fed (what git mode scans), so context/'-' lines of content
+   *     already public cannot wedge publishing. Liveness: gitleaks' `scanned ~N bytes` must equal
+   *     the bytes fed.
    *  4. A DEADLINE shared by every child, enforced by OUR kill (exec timeout outside a scope; the
    *     tick's scan sub-scope inside one). git mode is NEVER given `--timeout`: v8.30.1 git mode on
    *     expiry exits 0, still prints "1 commits scanned" and writes `[]` — a silent partial scan.
@@ -2276,11 +2278,16 @@ export class GitCache {
     } catch (err) {
       return { kind: "untrusted", reason: isOutputOverflow(err) ? "merge_diff_too_large" : "count_failed" };
     }
-    if (diff.length === 0) return { kind: "ok", findings: [] };
+    // Feed gitleaks ONLY the lines the merge ADDS (what git mode scans for an ordinary commit):
+    // context and '-' lines would re-flag content already public — e.g. a conflict resolved to the
+    // default branch's side shows main's fixture line as context/removal and would wedge publishing
+    // forever. File headers are skipped by tracking hunks: a '+' line counts only inside a hunk.
+    const added = addedLinesOfDiff(diff);
+    if (added.length === 0) return { kind: "ok", findings: [] };
     const reportPath = path.join(ctx.scratch, `merge-${merge}.json`);
     const run = await this.runCheckpointGitleaks(
       gitleaksStdinArgs({ configPath: ctx.configPath, reportPath }),
-      { cwd: ctx.cwd, reportPath, remaining: ctx.remaining, input: diff, selfTimeout: true },
+      { cwd: ctx.cwd, reportPath, remaining: ctx.remaining, input: added, selfTimeout: true },
     );
     if (run.kind === "deadline") return { kind: "untrusted", reason: "deadline" };
     if (run.kind === "unreadable") return { kind: "untrusted", reason: "scan_untrusted" };
@@ -2289,7 +2296,7 @@ export class GitCache {
       run.execOk &&
       !/\b(err|error|fatal)\b/i.test(run.stderr) &&
       scanned !== null &&
-      Number(scanned[1]) === Buffer.byteLength(diff) &&
+      Number(scanned[1]) === Buffer.byteLength(added) &&
       !/\bskipp/i.test(run.stderr);
     const findings = run.findings.map((f) => ({ ...f, commit: merge }));
     if (!live && findings.length === 0) return { kind: "untrusted", reason: "scan_untrusted" };
@@ -4809,6 +4816,21 @@ export function httpScopeForUrl(rawUrl: string): string | undefined {
     // Not a URL (scp-style or local path) — no http scope.
   }
   return undefined;
+}
+
+/** issue #1597 M2: the ADDED lines of a unified diff (without their leading '+'), newline-joined
+ *  with a trailing newline, or "" when there are none. A '+' line counts only inside a hunk (after
+ *  an `@@` header, until the next `diff ` header), so `+++ b/<path>` file headers are never taken
+ *  for content even when an added line itself starts with "++". */
+function addedLinesOfDiff(diff: string): string {
+  const out: string[] = [];
+  let inHunk = false;
+  for (const line of diff.split("\n")) {
+    if (line.startsWith("diff ")) inHunk = false;
+    else if (line.startsWith("@@")) inHunk = true;
+    else if (inHunk && line.startsWith("+")) out.push(line.slice(1));
+  }
+  return out.length === 0 ? "" : `${out.join("\n")}\n`;
 }
 
 /** issue #1597 M2: did a bounded exec fail because its output exceeded maxBuffer (execFile's code,

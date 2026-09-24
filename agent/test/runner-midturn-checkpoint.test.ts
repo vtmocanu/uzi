@@ -2068,3 +2068,272 @@ describe("mid-turn checkpoint round 3 (issue #1597 M2)", () => {
     }
   });
 });
+
+// ── round 4 (issue #1597 M2) ────────────────────────────────────────────────────────────────
+
+/** A fake Codex facade enforcing the permit deadline (as the real one does). `inPermit()` says
+ *  whether a permit is currently held. */
+function fakeCodex(): { safety: CodexExecutionSafety; inPermit: () => boolean; boundaryErrors: string[] } {
+  let held = false;
+  const boundaryErrors: string[] = [];
+  const safety: CodexExecutionSafety = {
+    kind: "codex",
+    withBoundary: async (req, action) => {
+      const ac = new AbortController();
+      const timer = setTimeout(() => ac.abort(new Error("boundary deadline")), req.deadlineMs);
+      held = true;
+      try {
+        const value = await action({ epoch: 1, boundary: req.boundary, signal: ac.signal } as unknown as BoundaryPermit);
+        if (ac.signal.aborted) {
+          boundaryErrors.push(req.boundary);
+          throw new CodexBoundaryError("action", [{ category: "timeout", message: "late" }]);
+        }
+        return value;
+      } finally {
+        held = false;
+        clearTimeout(timer);
+      }
+    },
+    spawnBoundaryProcess: async (_permit, request) => {
+      const [command, ...args] = request.argv;
+      const child = spawn(command!, args, { cwd: request.cwd, env: request.env, stdio: ["pipe", "pipe", "pipe"] });
+      const completed = new Promise<{ code: number }>((resolve, reject) => {
+        child.once("error", reject);
+        child.once("exit", (code, sig) => resolve({ code: code ?? (sig ? 128 : 1) }));
+      });
+      return { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, completed };
+    },
+    dispose: async () => ({ kind: "disposed" }),
+  };
+  return { safety, inPermit: () => held, boundaryErrors };
+}
+
+describe("mid-turn checkpoint round 4 (issue #1597 M2)", () => {
+  it("(r4 1) an owed publish is settled by a blocked attempt: later ticks obey the time gate (one scan, not one per tick)", async () => {
+    const tmp = scratchDir("owed");
+    const shim = writeShim(tmp, "detect");
+    const codex = fakeCodex();
+    const ctl = control();
+    const pub = stubPublish(async (_n, _tip, pack) => {
+      await drain(pack);
+      return LANDED;
+    });
+    const claim = gitlabClaim(1597_270);
+    const seen: string[] = [];
+    try {
+      await mkRunner(
+        mkGit(fx.dataDir, shim),
+        () => ({
+          executor: {
+            run: async (ctx: RunContext) => {
+              await recordingTurnErrors(async () => {
+                commitIn(ctx.worktreePath, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
+                await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] } }); // deferred
+                seen.push(await ctl.fire()); // the kicked tick: scans, finds the secret
+                seen.push(await ctl.fire()); // frozen clock: the time gate governs now
+                seen.push(await ctl.fire());
+              });
+              return { branch: ctx.branch };
+            },
+            safety: codex.safety,
+          },
+        }),
+        ctl,
+      ).execute(claim);
+      assert.equal(finalStatus(claim.run_id), "completed");
+      assert.deepEqual(seen, ["secret_found", "time_gate_closed", "time_gate_closed"]);
+      assert.equal(shimCalls(shim).filter((c) => c.startsWith("git ")).length, 1, "one gitleaks run, not one per tick");
+      assert.equal(pub.count(), 0);
+    } finally {
+      pub.restore();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("(r4 2) a CONFLICTED merge of main resolved to main's side does not re-flag main's fixture; an evil merge is still caught", async (t) => {
+    await eachScanner(t, async (bin, label) => {
+      const iid = label === "shim" ? 1597_271 : 1597_272;
+      const file = `conf-${iid}.env`;
+      // main and the run's branch start from a commit carrying the file…
+      commitIn(fx.originPath, file, "TOKEN=\n");
+      const at = gitIn(fx.originPath, ["rev-parse", "main"]);
+      gitIn(fx.originPath, ["branch", "-f", `agent/issue-${iid}`, at]);
+      // …then main sets the value to a secret-shaped FIXTURE (public on the default branch).
+      const fixture = commitIn(fx.originPath, file, `TOKEN=${runtimeSecret()}\n`);
+      const ctl = control();
+      const pub = stubPublish(async (_n, _tip, pack) => {
+        await drain(pack);
+        return LANDED;
+      });
+      const claim = gitlabClaim(iid);
+      const seen: string[] = [];
+      try {
+        await mkRunner(
+          mkGit(fx.dataDir, bin),
+          turn(async (ctx) => {
+            const w = ctx.worktreePath;
+            commitIn(w, file, "TOKEN=branch-value\n"); // conflicts with main's edit
+            try {
+              gitIn(w, [...IDENT, "merge", "-q", "--no-edit", fixture]);
+            } catch {
+              /* the expected conflict */
+            }
+            gitIn(w, ["checkout", "--theirs", "--", file]); // resolve to MAIN's side
+            gitIn(w, ["add", file]);
+            gitIn(w, [...IDENT, "commit", "-q", "--no-edit"]);
+            ctl.advance(INTERVAL_MS + 1);
+            seen.push(await ctl.fire());
+            // An evil merge afterwards must still be caught.
+            gitIn(w, ["checkout", "-q", "-b", "side"]);
+            commitIn(w, "side.txt", "side\n");
+            gitIn(w, ["checkout", "-q", ctx.branch]);
+            commitIn(w, "line.txt", "line\n");
+            gitIn(w, [...IDENT, "merge", "-q", "--no-ff", "--no-commit", "side"]);
+            fs.writeFileSync(path.join(w, "evil.env"), `TOKEN=${runtimeSecret()}\n`);
+            gitIn(w, ["add", "evil.env"]);
+            gitIn(w, [...IDENT, "commit", "-q", "-m", "evil merge"]);
+            ctl.advance(INTERVAL_MS + 1);
+            seen.push(await ctl.fire());
+          }),
+          ctl,
+        ).execute(claim);
+        assert.equal(finalStatus(claim.run_id), "completed", label);
+        assert.deepEqual(seen, ["published", "secret_found"], label);
+      } finally {
+        pub.restore();
+      }
+    });
+  });
+
+  it("(r4 3) the merge scan is untrusted when gitleaks reports fewer bytes than it was fed", async () => {
+    const tmp = scratchDir("stdinlie");
+    try {
+      const w = workRepo("stdinlie");
+      const main = w.git(["rev-parse", "--abbrev-ref", "HEAD"]);
+      w.git(["checkout", "-q", "-b", "side"]);
+      fs.writeFileSync(path.join(w.dir, "side.txt"), "side\n");
+      w.git(["add", "-A"]);
+      w.git(["commit", "-q", "-m", "side"]);
+      w.git(["checkout", "-q", main]);
+      fs.writeFileSync(path.join(w.dir, "line.txt"), "line\n");
+      w.git(["add", "-A"]);
+      w.git(["commit", "-q", "-m", "line"]);
+      w.git(["merge", "-q", "--no-ff", "--no-commit", "side"]);
+      fs.writeFileSync(path.join(w.dir, "own.txt"), "content only the merge adds\n");
+      w.git(["add", "-A"]);
+      w.git(["commit", "-q", "-m", "merge with its own (clean) content"]);
+      const tip = w.git(["rev-parse", "HEAD"]);
+      const honest = new GitCache(fx.dataDir, nullLogger(), undefined, { gitleaksBin: writeShim(tmp, "detect") });
+      assert.deepEqual(await honest.secretScanCheckpointRange(w.dir, { tipSha: tip, excludeSha: w.base }), {
+        trusted: true,
+        findings: [],
+      });
+      const liar = new GitCache(fx.dataDir, nullLogger(), undefined, { gitleaksBin: writeShim(tmp, "stdinlie") });
+      assert.deepEqual(await liar.secretScanCheckpointRange(w.dir, { tipSha: tip, excludeSha: w.base }), {
+        trusted: false,
+        findings: [],
+        reason: "scan_untrusted",
+      });
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("(r4 4) CHECKPOINT_TICK_INTERVAL=0: a Codex milestone publishes right after its permit, before the checkpoint returns", async () => {
+    const tmp = scratchDir("notick");
+    const shim = writeShim(tmp, "detect");
+    const codex = fakeCodex();
+    const publishedInPermit: boolean[] = [];
+    const pub = stubPublish(async (_n, _tip, pack) => {
+      publishedInPermit.push(codex.inPermit());
+      await drain(pack);
+      return LANDED;
+    });
+    const claim = gitlabClaim(1597_273);
+    let sha = "";
+    let publishesWhenCheckpointReturned = -1;
+    try {
+      await mkRunner(
+        mkGit(fx.dataDir, shim),
+        () => ({
+          executor: {
+            run: async (ctx: RunContext) => {
+              await recordingTurnErrors(async () => {
+                sha = commitIn(ctx.worktreePath, "N.txt", "n\n");
+                await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] } });
+                publishesWhenCheckpointReturned = pub.count();
+              });
+              return { branch: ctx.branch };
+            },
+            safety: codex.safety,
+          },
+        }),
+        undefined,
+        { checkpointTickIntervalMs: 0 },
+      ).execute(claim);
+      assert.equal(finalStatus(claim.run_id), "completed");
+      assert.deepEqual(codex.boundaryErrors, []);
+      assert.equal(publishesWhenCheckpointReturned, 1, "published before ctx.checkpoint returned");
+      assert.deepEqual(pub.tips.slice(0, 1), [sha]);
+      assert.deepEqual(publishedInPermit.slice(0, 1), [false], "never from inside the permit");
+      assert.ok(shimCalls(shim).length >= 1);
+    } finally {
+      pub.restore();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("mid-turn checkpoint round 4: gate_busy quick retry (issue #1597 M2)", () => {
+  it("(r4 5) an owed publish whose tick finds the sink gate busy arms ONE quick retry; a second miss waits for the normal cadence", async () => {
+    const tmp = scratchDir("gateretry");
+    const shim = writeShim(tmp, "detect");
+    const codex = fakeCodex();
+    const ctl = control();
+    const seen: string[] = [];
+    const delays: Array<number | undefined> = [];
+    const pub = stubPublish(async (n, _tip, pack) => {
+      await drain(pack);
+      if (n === 0) {
+        // The pause path is INSIDE its publish, holding the sink gate, while the deferred
+        // milestone publish is still owed.
+        delays.push(ctl.armedDelay()); // the deferral's kick
+        seen.push(await ctl.fire()); // the kicked tick: gate busy
+        delays.push(ctl.armedDelay()); // → one quick retry armed
+        seen.push(await ctl.fire()); // the quick retry: gate still busy
+        delays.push(ctl.armedDelay()); // → back to the normal cadence
+        return { ok: false, httpStatus: 500 }; // the pause fails; the run carries on
+      }
+      return LANDED;
+    });
+    const claim = gitlabClaim(1597_274);
+    let sha = "";
+    try {
+      await mkRunner(
+        mkGit(fx.dataDir, shim),
+        () => ({
+          executor: {
+            run: async (ctx: RunContext) => {
+              await recordingTurnErrors(async () => {
+                sha = commitIn(ctx.worktreePath, "R.txt", "r\n");
+                await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] } }); // deferred
+                assert.equal(await ctx.parkForPause!({ completedCount: 1 }), false);
+                seen.push(await ctl.fire()); // gate free again: the owed publish goes out
+              });
+              return { branch: ctx.branch };
+            },
+            safety: codex.safety,
+          },
+        }),
+        ctl,
+      ).execute(claim);
+      assert.equal(finalStatus(claim.run_id), "completed");
+      assert.deepEqual(seen, ["gate_busy", "gate_busy", "published"]);
+      assert.deepEqual(delays, [1_000, 1_000, TICK_MS], "one quick retry, then the normal cadence");
+      assert.equal(pub.tips.at(-1), sha);
+    } finally {
+      pub.restore();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});

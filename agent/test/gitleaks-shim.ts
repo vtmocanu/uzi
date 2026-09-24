@@ -13,7 +13,8 @@
 //  - stdin mode scans a diff fed on stdin and prints `scanned ~<bytes fed> bytes`.
 // Modes: `detect` (the above), `fail` (exits nonzero: an instrument failure), `slowclean` (sleeps
 // `sleepMs` IGNORING `--timeout` — as git mode does — then exits 0 with a clean report and a
-// matching "N commits scanned": a silent partial scan our deadline must catch). Every call is
+// matching "N commits scanned": a silent partial scan our deadline must catch), `stdinlie` (as
+// `detect`, but stdin mode reports one byte fewer than it was fed). Every call is
 // appended to `<shim>.calls` as "<mode> <log-opts>".
 
 import fs from "node:fs";
@@ -22,7 +23,7 @@ import path from "node:path";
 
 export function writeGitleaksShim(
   dir: string,
-  mode: "detect" | "fail" | "slowclean",
+  mode: "detect" | "fail" | "slowclean" | "stdinlie",
   opts: { sleepMs?: number } = {},
 ): string {
   const shim = path.join(dir, `gitleaks-shim-${mode}-${opts.sleepMs ?? 0}`);
@@ -49,10 +50,14 @@ const scanDiff = (text, commit) => {
   }
 };
 if (a[0] === "stdin") {
+  // Like gitleaks stdin: EVERY line fed is content (the caller feeds only added lines).
   const text = fs.readFileSync(0);
-  scanDiff(text.toString("utf8"), "");
+  for (const line of text.toString("utf8").split("\\n")) {
+    if (re.test(line)) findings.push({ File: "", StartLine: 1, Commit: "", RuleID: "github-pat", Secret: "REDACTED" });
+  }
   fs.writeFileSync(report, JSON.stringify(findings));
-  process.stderr.write("INF scanned ~" + text.length + " bytes (" + text.length + " bytes) in 1ms\\n");
+  const n = mode === "stdinlie" ? text.length - 1 : text.length;
+  process.stderr.write("INF scanned ~" + n + " bytes (" + n + " bytes) in 1ms\\n");
   return;
 }
 const src = a[1];
@@ -63,7 +68,7 @@ const counted = numstat.split("\\0").slice(1).filter((b) =>
   b.split("\\n").slice(1).some((l) => { const m = /^(\\d+)\\t(\\d+)\\t/.exec(l); return m && Number(m[1]) + Number(m[2]) > 0; }),
 ).length;
 const finish = () => {
-  if (mode === "detect") {
+  if (mode === "detect" || mode === "stdinlie") {
     for (const c of git(["rev-list", "--no-merges", ...revs]).split("\\n").filter(Boolean)) {
       scanDiff(git(["show", "--format=", "--unified=0", c]), c);
     }
