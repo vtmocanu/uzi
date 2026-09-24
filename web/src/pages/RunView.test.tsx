@@ -4677,12 +4677,25 @@ describe("RecoveryWaitPanel: codex_account_unavailable (PRD #1590)", () => {
     );
 
   it.each([
-    ["reconciling", "Waiting: Codex account is reconciling"],
-    ["verifying_login", "Waiting: verifying the new Codex login"],
-    ["resuming", "Resuming: Codex account available again"],
-  ])("renders the %s action", (action, heading) => {
+    [
+      "reconciling",
+      "Waiting: Codex account is reconciling",
+      "The Codex account this run uses is repairing its login on its own. The run resumes automatically once it does, so no action is needed.",
+    ],
+    [
+      "verifying_login",
+      "Waiting: verifying the new Codex login",
+      "uzi is checking that the new login belongs to the same ChatGPT account. The run resumes as soon as it is verified.",
+    ],
+    [
+      "resuming",
+      "Resuming: Codex account available again",
+      "The Codex account is usable again. The run goes back in the queue on the next sweep and picks up where it left off.",
+    ],
+  ])("renders the %s action", (action, heading, body) => {
     const { container } = renderPanel(codexRun({ codex_account_action: action, codex_secret_label: "work" }));
     expect(container.querySelector('[role="status"]')?.textContent).toContain(heading);
+    expect(container.textContent).toContain(body);
     // Only relogin_required sends the owner to Settings.
     expect(container.querySelector('a[href="/settings"]')).toBeNull();
     expect(container.textContent).not.toContain("transient interruption");
@@ -4702,7 +4715,7 @@ describe("RecoveryWaitPanel: codex_account_unavailable (PRD #1590)", () => {
   });
 
   it("uses label-less wording for relogin_required when the run has no label", () => {
-    for (const label of [null, "", "\u200b"]) {
+    for (const label of [null, "", "   ", "\u200b"]) {
       cleanup();
       const { container } = renderPanel(codexRun({ codex_account_action: "relogin_required", codex_secret_label: label }));
       expect(container.querySelector('[role="status"]')?.textContent).toBe(
@@ -4744,7 +4757,9 @@ describe("RecoveryWaitPanel: codex_account_unavailable (PRD #1590)", () => {
       expect(text).not.toMatch(/Attempt/);
       expect(text).not.toContain("2 of 5");
       expect(text).not.toContain("Resumes in");
-      expect(text).toContain("This hold does not expire");
+      // Every held action says the hold does not expire; resuming is no longer a hold.
+      if (action === "resuming") expect(text).not.toContain("This hold does not expire");
+      else expect(text).toContain("This hold does not expire");
       // Cancel stays the page's Stop control; the panel offers no button of its own.
       expect(container.querySelector("button")).toBeNull();
     }
@@ -4950,6 +4965,70 @@ describe("RunView park announcement — recovery_wait (issue #1197, a11y)", () =
     // Mutation guard: it is the recovery copy, NOT the pool_wait or awaiting_input copy.
     expect(region.textContent).not.toContain("pooled Anthropic token");
     expect(region.textContent).not.toContain("asking you a question");
+  });
+
+  // PRD #1590 D6: a Codex account hold announces its own action, never the transient park.
+  const codexHold = (action: string | null): Partial<Run> => ({
+    status: "recovery_wait",
+    recovery_wait_cause: "codex_account_unavailable",
+    codex_account_action: action,
+    codex_secret_label: "work",
+  });
+  const announced = () =>
+    waitFor(() => {
+      const el = document.querySelector('div.sr-only[role="status"]') as HTMLElement | null;
+      if (!el || el.textContent === "") throw new Error("not announced yet");
+      return el;
+    });
+
+  it("announces a relogin_required Codex hold as a re-login, not a transient park or a question", async () => {
+    renderPage(codexHold("relogin_required"));
+    const region = await announced();
+    expect(region.getAttribute("aria-live")).toBe("polite");
+    expect(region.textContent).toBe("This run is waiting for you to log in to its Codex credential again.");
+    expect(region.textContent).not.toContain("transient interruption");
+    expect(region.textContent).not.toContain("asking you a question");
+  });
+
+  it.each([
+    ["reconciling", "This run is waiting while its Codex account repairs its login. No action is needed."],
+    ["verifying_login", "This run is waiting while uzi verifies the new Codex login."],
+    ["resuming", "The Codex account is usable again. This run is resuming."],
+    [null, "This run is waiting on its Codex account and will resume once the account is usable."],
+  ])("announces the %s Codex action with its own sentence", async (action, sentence) => {
+    renderPage(codexHold(action));
+    const region = await announced();
+    expect(region.textContent).toBe(sentence);
+    expect(region.textContent).not.toContain("transient interruption");
+    expect(region.textContent).not.toContain("asking you a question");
+    expect(region.textContent).not.toContain("log in to its Codex credential");
+  });
+
+  it("re-announces on a verifying_login → resuming transition", async () => {
+    const { rerender } = renderPage(codexHold("verifying_login"));
+    expect((await announced()).textContent).toBe("This run is waiting while uzi verifies the new Codex login.");
+    mockUseRunStream.mockReturnValue({
+      run: run(codexHold("resuming")),
+      messages: [],
+      connected: true,
+      error: "",
+      submit: vi.fn(),
+      refreshRun: vi.fn(),
+      inputs: [],
+      canSteer: true,
+    } as unknown as ReturnType<typeof useRunStream>);
+    rerender(
+      <MemoryRouter initialEntries={["/runs/r1"]}>
+        <RunView />
+      </MemoryRouter>,
+    );
+    await waitFor(() => {
+      const el = document.querySelector('div.sr-only[role="status"]') as HTMLElement;
+      expect(el.textContent).toBe("The Codex account is usable again. This run is resuming.");
+    });
+    // Resuming no longer promises a future recovery: the account is already usable.
+    const el = document.querySelector('div.sr-only[role="status"]') as HTMLElement;
+    expect(el.textContent).not.toContain("once the account is usable");
   });
 });
 
