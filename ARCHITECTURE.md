@@ -1613,6 +1613,25 @@ claims a Codex-indicating run, which stays queued instead. See
 Decision Log, and [docs/configuration.md](docs/configuration.md#controller)
 for the operator-facing knobs.
 
+**A Codex command's tmp and cache never leak into the writable layer, and
+removal is owned by the trusted supervisor, not the command itself.** Every
+Codex model-authorized command still gets a fresh `HOME=TMPDIR`, but the
+`uzi-codex-supervisor` binary — not `os.RemoveAll`, which cannot delete a Go
+module cache's read-only directories as their non-root owner — creates,
+liveness-locks, and removes that tmp through a dedicated fd-relative, no-follow
+tree-removal primitive (`internal/safetree`) once a confirmed drain proves it
+is safe. A worker-only second emptyDir, `codex-cmd-cache`
+(`/var/cache/uzi-codex-cmd`), gives each run's Codex commands a real
+`GOMODCACHE`/`GOCACHE`/npm cache instead of re-downloading every command, held
+by a uid-10003 holder process for the run and released only on an attested
+drain; a startup orphan reaper (`--reap-orphans`) sweeps anything a crash or an
+unconfirmed drain left behind, gated on a kernel process-table proof that fails
+closed. The cache is a storage/performance boundary, not a trust boundary — see
+[ADR-1598](adr/1598-codex-command-storage.md) for the full mechanism, the
+supersession of `specs/ai.md`'s "only remaining emptyDir" sentence now that a
+worker pod has two, and the pending hosted-worker ephemeral-request
+measurement (issue #225).
+
 ### Worker version and upgrade health
 
 A worker's `version` is written **only at register** (`workersvc.Register`), so a worker

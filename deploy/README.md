@@ -602,6 +602,19 @@ the same path, so `docker run -v`/compose bind mounts under the run's checkout
 The path mirrors `agent/src/git.ts`'s `runnerRoot` — if that root ever moves,
 `controller/internal/kube/render_dind.go`'s `dindWorkdirDir` (mounted by `render.go`'s `podTemplate`) must move with it.
 
+**Codex command cache (issue #1598).** A worker pod also carries a second,
+worker-only `emptyDir`, `codex-cmd-cache` (`/var/cache/uzi-codex-cmd`), mounted
+into the `worker` container only — never into seed-nix, dind-init or dind. It
+holds one per-run directory (`GOMODCACHE`/`GOCACHE`/npm cache) for a run's
+Codex model-authorized commands, so they reuse a build cache instead of
+re-downloading every command; it is rendered for every worker regardless of
+the uid split, so the render never forks the pod shape, and it carries no
+`sizeLimit` for the same reason `run-workdir` above never gets one — a
+`sizeLimit` is itself a kubelet eviction trigger. It is not a trust boundary:
+every command root for a run shares one uid, so treat its contents as
+untrusted, never reused across runs. See
+[adr/1598-codex-command-storage.md](../adr/1598-codex-command-storage.md).
+
 ### M4/M5 runbook: known items before go-live
 
 Not blockers to M1–M3 landing, but gate the live rollout. Full detail on 2–4 is
