@@ -325,6 +325,57 @@ WHERE run_id = @run_id
   AND live_worker_id = @worker_id::uuid
   AND state = 'open';
 
+-- name: GetCustodyHoldForSettle :one
+-- Issue #1582 M1: the exact hold the predecessor-settle endpoint names, scoped to its run so a
+-- hold id from another run never resolves. The service checks generation / original worker /
+-- state against the request and, for an already-released hold, compares the stored ancestry
+-- audit identity for the idempotent acknowledgement. Read-only; the release itself is the
+-- guarded single-statement ReleasePredecessorCustodyHoldByAncestry below.
+SELECT * FROM recovery_custody_holds
+WHERE id = @hold_id AND run_id = @run_id;
+
+-- name: ReleasePredecessorCustodyHoldByAncestry :execrows
+-- Issue #1582 M1: release ONE older-generation hold on a COMPLETED run whose work the api has
+-- PROVEN (via the forge compare API, never the worker's opinion) is contained in the completed
+-- branch head. Every guard is re-asserted in this one statement so a change between the proof
+-- and the write moves ZERO rows (the caller then re-reads and answers state_changed):
+--   * the hold: exact id + run + predecessor generation, taken by the caller worker, still open,
+--     and strictly older than the successor generation;
+--   * the run: still 'completed', still at the successor claim generation, still held by the
+--     caller worker, on the SAME branch and the SAME completion instant (status_since) the
+--     service captured before it asked the forge.
+-- Stamps release_evidence='ancestry' with all six audit columns (migration 00247's CHECK
+-- refuses an 'ancestry' row missing any of them). Nulls both live FKs like every release.
+-- Never touches a sibling hold: the WHERE names exactly one id.
+UPDATE recovery_custody_holds h
+SET state = 'released',
+    live_worker_id = NULL,
+    live_run_id = NULL,
+    release_evidence = 'ancestry',
+    released_at = now(),
+    updated_at = now(),
+    release_pushed_sha = @pushed_sha::text,
+    release_source_sha = @source_sha::text,
+    release_adopted_sha = @adopted_sha::text,
+    release_final_head_sha = @final_head_sha::text,
+    release_successor_generation = @successor_generation::bigint,
+    release_branch = @branch::text
+WHERE h.id = @hold_id
+  AND h.run_id = @run_id
+  AND h.generation = @predecessor_generation::bigint
+  AND h.original_worker_id = @worker_id::uuid
+  AND h.state = 'open'
+  AND h.generation < @successor_generation::bigint
+  AND EXISTS (
+      SELECT 1 FROM runs r
+      WHERE r.id = h.run_id
+        AND r.status = 'completed'
+        AND r.claim_generation = @successor_generation::bigint
+        AND r.worker_id = @worker_id::uuid
+        AND r.branch = @branch::text
+        AND r.status_since = @completed_since::timestamptz
+  );
+
 -- name: ListCustodyHoldsForWorkerRun :many
 -- PRD #1349 M1 (D3): the caller worker's OWN open holds on a run, for the worker-facing
 -- post-clone generation-exact inventory (M2). Scoped to holds this worker ORIGINALLY took

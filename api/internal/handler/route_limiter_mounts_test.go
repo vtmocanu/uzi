@@ -67,7 +67,11 @@ var limiterNames = [...]string{
 // error rather than a failing row. Spelled `lim*` rather than matching the parameter
 // names exactly, so nothing here shadows a parameter inside Routes.
 //
-// 204 as of this commit (PRD #1484 M2-B added POST /api/admin/health/snooze — the per-admin,
+// 205 as of this commit (issue #1582 M1 added POST
+// /api/worker/runs/{id}/recovery-holds/{holdID}/settle — the worker-authenticated
+// predecessor-hold settle by the api's own forge ancestry proof; noLimiter, like the worker
+// /runs/{id}/forge/... reads it resembles).
+// It was 204 until then (PRD #1484 M2-B added POST /api/admin/health/snooze — the per-admin,
 // per-episode Danger-banner snooze in the admin WRITE group, cookie+CSRF, a single local
 // per-(episode, caller) upsert → noLimiter, like the release-check snooze it sits beside).
 // It was 203 until then (PRD #1484 M1 added GET /api/admin/health — the admin-health document
@@ -692,6 +696,10 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/worker/runs/{id}/archives/release", noLimiter},
 	{"POST", "/api/worker/runs/{id}/archives/reserve", noLimiter},
 	{"POST", "/api/worker/runs/{id}/archives/{captureID}/upload", noLimiter},
+	// Issue #1582 M1: the worker predecessor-hold settle. Worker-authenticated, one bounded
+	// forge proof (a branch head read + at most three compares) per call → noLimiter, like the
+	// worker /runs/{id}/forge/... reads.
+	{"POST", "/api/worker/runs/{id}/recovery-holds/{holdID}/settle", noLimiter},
 	{"POST", "/api/worker/runs/{id}/memory", noLimiter},
 	{"POST", "/api/worker/runs/{id}/messages", noLimiter},
 	{"POST", "/api/worker/runs/{id}/proposals", noLimiter},

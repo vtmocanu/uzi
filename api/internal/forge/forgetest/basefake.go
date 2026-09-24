@@ -1,6 +1,6 @@
 // Package forgetest provides shared test-support scaffolding for the
 // forge.Forge driver contract. Its centrepiece is BaseFake: an embeddable
-// implementation of all 31 Forge methods with safe defaults, so a hand-written
+// implementation of all 34 Forge methods with safe defaults, so a hand-written
 // test fake can embed it and override only the methods it actually exercises.
 //
 // The point is the interface-change tax. Adding a method to forge.Forge used to
@@ -37,7 +37,7 @@ func notStubbed(method string) error {
 }
 
 // BaseFake is an empty struct that implements the entire forge.Forge interface
-// (all 31 methods) with safe defaults, designed to be embedded by value in a
+// (all 34 methods) with safe defaults, designed to be embedded by value in a
 // hand-written test fake used through a pointer. Every method has a pointer
 // receiver so method promotion works when the embedder is used as *fakeForge.
 //
@@ -212,4 +212,16 @@ func (*BaseFake) ListMergeRequestReviews(context.Context, int64, int64) ([]forge
 // ProjectCIConfigPath implements forge.Forge.
 func (*BaseFake) ProjectCIConfigPath(context.Context, int64) (string, error) {
 	return "", notStubbed("ProjectCIConfigPath")
+}
+
+// BranchHead implements forge.Forge.
+func (*BaseFake) BranchHead(context.Context, int64, string) (string, error) {
+	return "", notStubbed("BranchHead")
+}
+
+// CompareAncestry implements forge.Forge. The default is AncestryUnknown alongside the
+// notStubbed error, so an ancestry caller that forgets to stub it fails CLOSED (a hold
+// stays retained) as well as loudly.
+func (*BaseFake) CompareAncestry(context.Context, int64, string, string) (forge.Ancestry, error) {
+	return forge.AncestryUnknown, notStubbed("CompareAncestry")
 }

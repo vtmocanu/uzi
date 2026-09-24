@@ -158,6 +158,54 @@ type RecoveryReleaseRequest struct {
 	ReleaseEvidence *string `json:"release_evidence,omitempty"`
 }
 
+// RecoverySettleRequest is the worker's request that the api settle ONE older-generation
+// custody hold on a completed run by ANCESTRY (issue #1582 M1): the predecessor generation's
+// work was adopted by a same-worker successor that then completed. The worker supplies
+// CANDIDATE SHAs only — what the predecessor pushed, its source, and what the successor
+// adopted — and the api proves, through the forge compare API alone, that each is an
+// ancestor of (or equal to) the completed branch head. There is deliberately NO field for the
+// worker's own ancestry verdict: the handler decodes strictly, so an extra field (for example
+// "ancestry":"ancestor") is a 400. Every SHA must be a 40-char lowercase hex commit id.
+type RecoverySettleRequest struct {
+	PredecessorGeneration int64  `json:"predecessor_generation"`
+	SuccessorGeneration   int64  `json:"successor_generation"`
+	PushedSha             string `json:"pushed_sha"`
+	SourceSha             string `json:"source_sha"`
+	AdoptedSha            string `json:"adopted_sha"`
+}
+
+// Settle outcomes and retained reasons (issue #1582 M1). Outcome is released only when the
+// named hold is (now, or already by an identical earlier settle) released with 'ancestry'
+// evidence; every other answer is retained with one bounded reason.
+const (
+	RecoverySettleReleased = "released"
+	RecoverySettleRetained = "retained"
+
+	// RecoverySettleAncestryUnknown: the forge could not prove ancestry (branch head
+	// unreadable, a rate limit, an error, an unsupported forge, or an inconclusive answer).
+	RecoverySettleAncestryUnknown = "ancestry_unknown"
+	// RecoverySettleNotAncestor: the forge explicitly reported a candidate NOT contained in
+	// the completed branch head.
+	RecoverySettleNotAncestor = "not_ancestor"
+	// RecoverySettleStateChanged: the run or hold changed between the proof and the guarded
+	// release, so nothing was released.
+	RecoverySettleStateChanged = "state_changed"
+	// RecoverySettleNotEligible: the run/hold is not an older-generation hold of this worker
+	// on a run this worker completed at the named successor generation (or it was already
+	// settled with a different identity).
+	RecoverySettleNotEligible = "not_eligible"
+)
+
+// RecoverySettleResponse is the api's answer to a RecoverySettleRequest (issue #1582 M1).
+// FinalHeadSha is the branch head the api proved against, set only on a release.
+type RecoverySettleResponse struct {
+	RunID        string `json:"run_id"`
+	HoldID       string `json:"hold_id"`
+	Outcome      string `json:"outcome"`
+	Reason       string `json:"reason,omitempty"`
+	FinalHeadSha string `json:"final_head_sha,omitempty"`
+}
+
 // RecoveryHoldDTO is one open custody hold this worker holds on a run, in the worker-facing
 // post-clone inventory (PRD #1349 M1, D3). HoldID + Generation are the exact hold identity;
 // HasAvailableCapture is true when a ready archive already covers this hold's source, and

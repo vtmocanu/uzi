@@ -1184,4 +1184,13 @@ func TestRecoveryWorkerRPCTags(t *testing.T) {
 		"hold_id", "generation", "has_available_capture", "capture_state")
 	// holds is NOT omitempty (present-as-null on the zero value; the service normalizes to []).
 	assertTags(t, "RecoveryHoldsResponse", RecoveryHoldsResponse{}, "run_id", "holds")
+	// Issue #1582 M1: the predecessor-settle request carries candidate SHAs only (never an
+	// ancestry verdict), every field always on the wire.
+	assertTags(t, "RecoverySettleRequest", RecoverySettleRequest{},
+		"predecessor_generation", "successor_generation", "pushed_sha", "source_sha", "adopted_sha")
+	// reason (retained only) and final_head_sha (released only) are omitempty.
+	assertTags(t, "RecoverySettleResponse", RecoverySettleResponse{}, "run_id", "hold_id", "outcome")
+	assertTags(t, "RecoverySettleResponse(full)",
+		RecoverySettleResponse{Reason: "r", FinalHeadSha: "h"},
+		"run_id", "hold_id", "outcome", "reason", "final_head_sha")
 }

@@ -402,6 +402,49 @@ func (q *Queries) GetCustodyAggregateForOwner(ctx context.Context, arg GetCustod
 	return i, err
 }
 
+const getCustodyHoldForSettle = `-- name: GetCustodyHoldForSettle :one
+SELECT id, user_id, repo_id, run_id, generation, state, original_worker_id, original_worker_identity, live_worker_id, live_run_id, created_at, updated_at, released_at, release_evidence, release_pushed_sha, release_source_sha, release_adopted_sha, release_final_head_sha, release_successor_generation, release_branch FROM recovery_custody_holds
+WHERE id = $1 AND run_id = $2
+`
+
+type GetCustodyHoldForSettleParams struct {
+	HoldID uuid.UUID `json:"hold_id"`
+	RunID  uuid.UUID `json:"run_id"`
+}
+
+// Issue #1582 M1: the exact hold the predecessor-settle endpoint names, scoped to its run so a
+// hold id from another run never resolves. The service checks generation / original worker /
+// state against the request and, for an already-released hold, compares the stored ancestry
+// audit identity for the idempotent acknowledgement. Read-only; the release itself is the
+// guarded single-statement ReleasePredecessorCustodyHoldByAncestry below.
+func (q *Queries) GetCustodyHoldForSettle(ctx context.Context, arg GetCustodyHoldForSettleParams) (RecoveryCustodyHold, error) {
+	row := q.db.QueryRow(ctx, getCustodyHoldForSettle, arg.HoldID, arg.RunID)
+	var i RecoveryCustodyHold
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.RepoID,
+		&i.RunID,
+		&i.Generation,
+		&i.State,
+		&i.OriginalWorkerID,
+		&i.OriginalWorkerIdentity,
+		&i.LiveWorkerID,
+		&i.LiveRunID,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.ReleasedAt,
+		&i.ReleaseEvidence,
+		&i.ReleasePushedSha,
+		&i.ReleaseSourceSha,
+		&i.ReleaseAdoptedSha,
+		&i.ReleaseFinalHeadSha,
+		&i.ReleaseSuccessorGeneration,
+		&i.ReleaseBranch,
+	)
+	return i, err
+}
+
 const getRecoverySummaryForRun = `-- name: GetRecoverySummaryForRun :one
 SELECT
     (EXISTS (SELECT 1 FROM recovery_custody_holds h
@@ -820,7 +863,7 @@ func (q *Queries) ListOwnersWithClearedCustodyEpisode(ctx context.Context, custo
 }
 
 const listReleasableCustodyHolds = `-- name: ListReleasableCustodyHolds :many
-SELECT h.id, h.user_id, h.repo_id, h.run_id, h.generation, h.state, h.original_worker_id, h.original_worker_identity, h.live_worker_id, h.live_run_id, h.created_at, h.updated_at, h.released_at, h.release_evidence,
+SELECT h.id, h.user_id, h.repo_id, h.run_id, h.generation, h.state, h.original_worker_id, h.original_worker_identity, h.live_worker_id, h.live_run_id, h.created_at, h.updated_at, h.released_at, h.release_evidence, h.release_pushed_sha, h.release_source_sha, h.release_adopted_sha, h.release_final_head_sha, h.release_successor_generation, h.release_branch,
     CASE
         WHEN EXISTS (SELECT 1 FROM runs r
                        WHERE r.id = h.run_id
@@ -843,21 +886,27 @@ ORDER BY h.created_at ASC
 `
 
 type ListReleasableCustodyHoldsRow struct {
-	ID                     uuid.UUID          `json:"id"`
-	UserID                 uuid.UUID          `json:"user_id"`
-	RepoID                 pgtype.UUID        `json:"repo_id"`
-	RunID                  uuid.UUID          `json:"run_id"`
-	Generation             int64              `json:"generation"`
-	State                  string             `json:"state"`
-	OriginalWorkerID       uuid.UUID          `json:"original_worker_id"`
-	OriginalWorkerIdentity string             `json:"original_worker_identity"`
-	LiveWorkerID           pgtype.UUID        `json:"live_worker_id"`
-	LiveRunID              pgtype.UUID        `json:"live_run_id"`
-	CreatedAt              pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt              pgtype.Timestamptz `json:"updated_at"`
-	ReleasedAt             pgtype.Timestamptz `json:"released_at"`
-	ReleaseEvidence        pgtype.Text        `json:"release_evidence"`
-	Reason                 string             `json:"reason"`
+	ID                         uuid.UUID          `json:"id"`
+	UserID                     uuid.UUID          `json:"user_id"`
+	RepoID                     pgtype.UUID        `json:"repo_id"`
+	RunID                      uuid.UUID          `json:"run_id"`
+	Generation                 int64              `json:"generation"`
+	State                      string             `json:"state"`
+	OriginalWorkerID           uuid.UUID          `json:"original_worker_id"`
+	OriginalWorkerIdentity     string             `json:"original_worker_identity"`
+	LiveWorkerID               pgtype.UUID        `json:"live_worker_id"`
+	LiveRunID                  pgtype.UUID        `json:"live_run_id"`
+	CreatedAt                  pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt                  pgtype.Timestamptz `json:"updated_at"`
+	ReleasedAt                 pgtype.Timestamptz `json:"released_at"`
+	ReleaseEvidence            pgtype.Text        `json:"release_evidence"`
+	ReleasePushedSha           pgtype.Text        `json:"release_pushed_sha"`
+	ReleaseSourceSha           pgtype.Text        `json:"release_source_sha"`
+	ReleaseAdoptedSha          pgtype.Text        `json:"release_adopted_sha"`
+	ReleaseFinalHeadSha        pgtype.Text        `json:"release_final_head_sha"`
+	ReleaseSuccessorGeneration pgtype.Int8        `json:"release_successor_generation"`
+	ReleaseBranch              pgtype.Text        `json:"release_branch"`
+	Reason                     string             `json:"reason"`
 }
 
 // PRD #1296 M4 (D3): the custody-release RECONCILER's candidate set — OPEN holds whose
@@ -920,6 +969,12 @@ func (q *Queries) ListReleasableCustodyHolds(ctx context.Context) ([]ListReleasa
 			&i.UpdatedAt,
 			&i.ReleasedAt,
 			&i.ReleaseEvidence,
+			&i.ReleasePushedSha,
+			&i.ReleaseSourceSha,
+			&i.ReleaseAdoptedSha,
+			&i.ReleaseFinalHeadSha,
+			&i.ReleaseSuccessorGeneration,
+			&i.ReleaseBranch,
 			&i.Reason,
 		); err != nil {
 			return nil, err
@@ -1095,6 +1150,84 @@ func (q *Queries) ReleaseCustodyHoldExact(ctx context.Context, arg ReleaseCustod
 		arg.RunID,
 		arg.Generation,
 		arg.WorkerID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const releasePredecessorCustodyHoldByAncestry = `-- name: ReleasePredecessorCustodyHoldByAncestry :execrows
+UPDATE recovery_custody_holds h
+SET state = 'released',
+    live_worker_id = NULL,
+    live_run_id = NULL,
+    release_evidence = 'ancestry',
+    released_at = now(),
+    updated_at = now(),
+    release_pushed_sha = $1::text,
+    release_source_sha = $2::text,
+    release_adopted_sha = $3::text,
+    release_final_head_sha = $4::text,
+    release_successor_generation = $5::bigint,
+    release_branch = $6::text
+WHERE h.id = $7
+  AND h.run_id = $8
+  AND h.generation = $9::bigint
+  AND h.original_worker_id = $10::uuid
+  AND h.state = 'open'
+  AND h.generation < $5::bigint
+  AND EXISTS (
+      SELECT 1 FROM runs r
+      WHERE r.id = h.run_id
+        AND r.status = 'completed'
+        AND r.claim_generation = $5::bigint
+        AND r.worker_id = $10::uuid
+        AND r.branch = $6::text
+        AND r.status_since = $11::timestamptz
+  )
+`
+
+type ReleasePredecessorCustodyHoldByAncestryParams struct {
+	PushedSha             string             `json:"pushed_sha"`
+	SourceSha             string             `json:"source_sha"`
+	AdoptedSha            string             `json:"adopted_sha"`
+	FinalHeadSha          string             `json:"final_head_sha"`
+	SuccessorGeneration   int64              `json:"successor_generation"`
+	Branch                string             `json:"branch"`
+	HoldID                uuid.UUID          `json:"hold_id"`
+	RunID                 uuid.UUID          `json:"run_id"`
+	PredecessorGeneration int64              `json:"predecessor_generation"`
+	WorkerID              uuid.UUID          `json:"worker_id"`
+	CompletedSince        pgtype.Timestamptz `json:"completed_since"`
+}
+
+// Issue #1582 M1: release ONE older-generation hold on a COMPLETED run whose work the api has
+// PROVEN (via the forge compare API, never the worker's opinion) is contained in the completed
+// branch head. Every guard is re-asserted in this one statement so a change between the proof
+// and the write moves ZERO rows (the caller then re-reads and answers state_changed):
+//   - the hold: exact id + run + predecessor generation, taken by the caller worker, still open,
+//     and strictly older than the successor generation;
+//   - the run: still 'completed', still at the successor claim generation, still held by the
+//     caller worker, on the SAME branch and the SAME completion instant (status_since) the
+//     service captured before it asked the forge.
+//
+// Stamps release_evidence='ancestry' with all six audit columns (migration 00247's CHECK
+// refuses an 'ancestry' row missing any of them). Nulls both live FKs like every release.
+// Never touches a sibling hold: the WHERE names exactly one id.
+func (q *Queries) ReleasePredecessorCustodyHoldByAncestry(ctx context.Context, arg ReleasePredecessorCustodyHoldByAncestryParams) (int64, error) {
+	result, err := q.db.Exec(ctx, releasePredecessorCustodyHoldByAncestry,
+		arg.PushedSha,
+		arg.SourceSha,
+		arg.AdoptedSha,
+		arg.FinalHeadSha,
+		arg.SuccessorGeneration,
+		arg.Branch,
+		arg.HoldID,
+		arg.RunID,
+		arg.PredecessorGeneration,
+		arg.WorkerID,
+		arg.CompletedSince,
 	)
 	if err != nil {
 		return 0, err
