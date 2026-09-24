@@ -482,3 +482,42 @@ the first boots after upgrading.
 |---|---|---|
 | `UZI_USAGE_REFOLD_ENABLED` | `true` | Kill-switch for the boot-time history refold. `false` skips it entirely (the incremental fold still keeps new runs correct; pre-migration runs keep their under-counted totals until a boot with this enabled). Like the other control switches, a set-but-unparseable value **aborts boot** rather than silently defaulting to on. |
 | `UZI_USAGE_REFOLD_BATCH` | `50` | How many pending runs the refold processes per batch (each run is its own transaction, so this bounds outstanding rewrites, not one query's size). A per-run failure marks nothing and is retried on the next pass. A set-but-malformed or non-positive value **aborts boot** rather than silently defaulting, so a tuning typo is loud. |
+
+## Database query plans (issue #1620)
+
+**Symptom.** `/api/runs` (the run list backing the web board and TUI) times out with
+"could not refresh: cannot reach uzi … context deadline exceeded", while the database
+itself is healthy. This came from PostgreSQL's query planner: pgx caches statements
+server-side, and after five executions PostgreSQL may switch a prepared statement to a
+generic plan, planned without that call's actual parameter values. A run list that
+`LEFT JOIN`ed the `run_usage_totals` view onto a generic plan's row estimate could
+nested-loop the view once per run row instead of folding it once, turning a 60 ms query
+into 10+ seconds.
+
+**A release with this fix needs no configuration change.** The run list no longer joins
+`run_usage_totals`; the page's usage is fetched separately, keyed by the page's run ids,
+a query shape PostgreSQL pushes to an index scan under either plan. See
+[ADR-1620](../adr/1620-custom-plan-cache-mode.md) for the full measurement and the
+durable query-shape rule new consumers of the view must follow.
+
+**Stopgap for an instance still on an older release.** Force PostgreSQL to plan every
+execution with the actual parameter values, which forecloses the whole failure class at
+the cost of planning on every call:
+
+```sql
+ALTER ROLE <app-role> SET plan_cache_mode = force_custom_plan;
+```
+
+This applies only to **new** connections, so restart the `api` for it to take effect on
+the pool. It is a real trade, not a free fix: the ADR's measurement found it roughly
+triples the per-call time of the worker claim and the message append, two of the
+hottest paths in the system. Revert it once you've upgraded past the fix:
+
+```sql
+ALTER ROLE <app-role> RESET plan_cache_mode;
+```
+
+A per-connection alternative to the role-wide `ALTER ROLE`: a `plan_cache_mode=...` key
+in `DATABASE_URL` is kept by pgx as an unrecognized DSN parameter and passed to
+PostgreSQL as a connection runtime parameter, so it applies only to connections made
+with that DSN.

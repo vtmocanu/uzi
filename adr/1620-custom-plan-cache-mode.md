@@ -10,10 +10,10 @@
 
 The API's pgx pool keeps PostgreSQL's default `plan_cache_mode = auto`. Forcing a custom
 plan on every execution would have made the #1620 failure class impossible for every
-query. But it adds per-execution planning cost that, measured, triples the per-call time of
-the worker claim (`ClaimRun`, 1.09 ms to 3.70 ms) and the message append
-(`InsertRunMessage`, 0.24 ms to 0.69 ms), and costs the Runs list 53%. Those are the
-hottest paths in the system, so the trade is not worth it.
+query. But it adds per-execution planning cost that, measured, roughly triples the
+per-call time of the worker claim (`ClaimRun`, 1.09 ms to 3.70 ms, 3.4×) and nearly
+triples the message append (`InsertRunMessage`, 0.24 ms to 0.69 ms, 2.9×), and costs
+the Runs list 53%. Those are the hottest paths in the system, so the trade is not worth it.
 
 The #1620 regression is instead closed where it arose, by a durable rule on how a query
 may consume `run_usage_totals`:
@@ -33,8 +33,11 @@ plans the first five executions of a prepared statement with the actual paramete
 (custom plans). From the sixth it may switch to one **generic** plan, planned without the
 values, whenever that plan's estimated cost is not worse than the average custom plan.
 
-`ListRunsForUser` then `LEFT JOIN`ed the `run_usage_totals` view, a three-level fold
-(MAX per leg, then a window per lineage, then SUM per run) over `run_usage`. In the
+`ListRunsForUser` then `LEFT JOIN`ed the `run_usage_totals` view. Its current
+definition (migration 00244) folds `run_usage` in four levels: a `GROUP BY` per leg
+`(run_id, model, lineage_epoch)`, a running-sum window per `(run_id, model,
+lineage_index)`, a `GROUP BY` per `(run_id, model, lineage_index)`, and an outer
+`GROUP BY` per run. In the
 generic plan the planner estimated `r.user_id = $1` at a handful of rows. It nested-looped
 the view once per run row, re-folding the whole of `run_usage` each time: **13.9 s**
 against **60 ms** for the custom plan. The M1 fix (commit `1e825700`) removed the view
@@ -52,7 +55,9 @@ setting, and it is what an incident would reach for. This ADR measures its cost.
 **Environment.** A throwaway `postgres:17` container (PostgreSQL 17.11, stock
 configuration, `shared_buffers` 128MB) on a 2-vCPU Linux dev host. The Go client ran on
 the same host over loopback. The schema was migrated through the app's own `store.Migrate`
-(goose head 251), then `ANALYZE`d.
+(goose head 251), then `ANALYZE`d. The measurement harness itself was a throwaway
+script, not kept in this repo; the numbers below are a recorded one-off, reproducible by
+following the method documented in this section, not a re-runnable fixture.
 
 **Seed.** This is the shape of the M1 regression test:
 
@@ -125,15 +130,17 @@ Every write EXPLAIN showed a `ModifyTable` node with exactly 1 actual row:
 | `SelfUsage` | `auto` | generic | 0.017 | 11.126 | 10766 / 10525 / 10689 | 10689 | |
 | `SelfUsage` | `force_custom_plan` | custom | 1.036 | 11.081 | 11785 / 11995 / 11881 | 11881 | +1192 (+11%) |
 | `ClaimRun` | `auto` | generic | 0.051 | 0.713 | 1152 / 1069 / 1092 | 1092 | |
-| `ClaimRun` | `force_custom_plan` | custom | 2.428 | 0.897 | 3870 / 3697 / 3675 | 3697 | +2605 (3.4×) |
+| `ClaimRun` | `force_custom_plan` | custom | 2.428 | 0.897 | 3870 / 3697 / 3675 | 3697 | +2605 (+239%) |
 | `HeartbeatWorker` | `auto` | generic | 0.015 | 0.093 | 313 / 318 / 323 | 318 | |
 | `HeartbeatWorker` | `force_custom_plan` | custom | 0.095 | 0.088 | 356 / 384 / 382 | 382 | +64 (+20%) |
 | `InsertRunMessage` | `auto` | generic | 0.019 | 0.112 | 240 / 276 / 240 | 240 | |
-| `InsertRunMessage` | `force_custom_plan` | custom | 0.323 | 0.210 | 671 / 686 / 745 | 686 | +446 (2.9×) |
+| `InsertRunMessage` | `force_custom_plan` | custom | 0.323 | 0.210 | 671 / 686 / 745 | 686 | +446 (+186%) |
 
 The per-execution delta tracks the planning time: `ClaimRun`'s ~2.4 ms plan appears
 almost one-for-one as +2.6 ms per call. Under a custom plan, planning is paid on every
-execution, and it is a cost that scales with query complexity, not data size. The
+execution. Planning cost is expected to scale with query complexity rather than data
+size, but only one data size was measured here, so that scaling claim is an
+expectation, not something this measurement verifies. The
 absolute numbers are this host's. The ratios are the finding: on the two write hot paths,
 planning costs several times the execution it precedes.
 
@@ -151,7 +158,10 @@ any of them. It fails that bar on four of the six queries:
 
 What the setting would buy is insurance against a *future* query regressing the same way.
 That insurance is bought more cheaply by the rule and the plan-shape test. The test
-forces the generic plan, so it measures exactly the plan `auto` would pick.
+forces the generic plan `auto` may switch to — `auto` uses custom plans for a prepared
+statement's first five executions, and from the sixth may switch to the generic plan
+whenever its estimated cost is not worse than the average custom plan — so the test
+measures exactly the plan shape #1620 hit.
 
 `plan_cache_mode` therefore stays at the server default, and `api/internal/store/pool.go`
 is unchanged.
