@@ -121,8 +121,11 @@ const (
 	// eviction ranking against the worker's REQUEST (see ephemeralRequest); it carries NO
 	// sizeLimit on purpose, because a sizeLimit is an eviction path of its own (the same
 	// argument as the no-`limits.ephemeral-storage` rule). What bounds it is per-run
-	// cleanup: the uid-10003 cache holder removes its run's dir at run end, and the
-	// supervisor's startup orphan reaper removes any dir a crashed run left behind.
+	// cleanup: the uid-10003 cache holder removes its run's dir at run end, but only on
+	// an attested drain. It RETAINS the dir on a drained:false, a bare EOF or a stdin
+	// error, and a crashed run leaves its dir behind too. Either kind of leftover is
+	// bounded only by the next container start, where the supervisor's startup orphan
+	// reaper runs.
 	codexCmdCacheVolume = "codex-cmd-cache"
 	codexCmdCacheDir    = "/var/cache/uzi-codex-cmd"
 
@@ -251,9 +254,10 @@ const (
 	// eviction ranking. This number is deliberately NOT raised for it: issue #1598
 	// requires measuring a Go-heavy Codex run's peak and retention on hosted workers
 	// first, and that post-deploy verification is pending. A Go-heavy Codex run may
-	// therefore exceed 512Mi. That only lowers the pod's eviction rank under node
-	// pressure: a request ranks and never limits, and codex-cmd-cache carries no
-	// sizeLimit and no container an ephemeral limit (the 🔴 rule above).
+	// therefore exceed 512Mi. That moves the pod earlier in the kubelet's eviction
+	// order under node pressure; it never adds an eviction path: a request ranks and
+	// never limits, and codex-cmd-cache carries no sizeLimit and no container declares
+	// an ephemeral limit (the 🔴 never-an-ephemeral-limit rule above).
 	workerDefaultEphemeralRequest = "512Mi"
 	// Docker worker: run-workdir IS an emptyDir, and it holds the run's entire
 	// working tree — one clone per run, multiplied by WORKER_MAX_CONCURRENT_RUNS,

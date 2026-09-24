@@ -102,8 +102,9 @@
 // kernel process table with the candidate's lock held, that no command user
 // can be alive: no process in this PID namespace other than the reaper itself
 // has --expect-uid as its real, effective, saved or filesystem uid. Only the
-// reaper's own pid is exempt: its ancestors (setpriv, which execs into it, the
-// worker and init) never run as the command uid, so any other process with
+// reaper's own pid is exempt: its ancestors (the worker and init; setpriv
+// execs into the reaper, so it is the same process, not an ancestor) never
+// run as the command uid, so any other process with
 // it, ancestor or not, is "user_alive". A command user runs as that uid with
 // zero capabilities and no_new_privs, so it cannot leave it. Without the
 // proof, the candidate is retained.
@@ -117,7 +118,16 @@
 // alive at the listing, which was either read (its uid seen) or seen to
 // vanish (the scan invalid); a new command the worker launches is the one
 // exception, which is why the WORKER MUST INVOKE THE REAPER ONLY BEFORE
-// LAUNCHING RUNS (the TS wiring milestone does). The rule does not detect a pid-counter wrap during one listing.
+// LAUNCHING RUNS (the TS wiring milestone does).
+//
+// The rule assumes the namespace's pid counter has not wrapped since the
+// namespace was created (pid_max, 4194304 by default on 64-bit, pids
+// allocated). The kernel allocates pids cyclically from the last allocated
+// pid, so once the counter has wrapped at any earlier time a child can get a
+// pid behind the listing cursor, and a listed pid can be reused before its
+// status read, with no wrap during the listing. The assumption holds for the
+// reaper's intended use: at worker start, in a fresh container PID namespace,
+// before any run is launched.
 //
 // The proof also fails closed: it is "unknown" when the proc mount (from its
 // self/mountinfo) has a hidepid other than 0/off or any subset= option

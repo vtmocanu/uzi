@@ -336,7 +336,8 @@ func parseArgs(args []string) (root, tmp, cwd, cache string, mode sandboxMode, c
 // and no trailing or doubled separator) whose last element is a lowercase
 // uuid, the same name the orphan reaper takes as a cache candidate. The cache
 // root itself, "/" and any other directory are refused, so the rule the
-// sandbox grants can only ever cover one run's directory.
+// sandbox grants can only ever cover one uuid-named directory, never a cache
+// root. Its parent is not constrained.
 func validCachePath(cache string) bool {
 	if !filepath.IsAbs(cache) || filepath.Clean(cache) != cache {
 		return false

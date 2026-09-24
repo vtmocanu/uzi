@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // statusText is a status file shaped like the kernel's, with the given ids.
@@ -18,25 +19,33 @@ func statusText(ppid int, uids [4]int) string {
 
 func TestParseStatusIDs(t *testing.T) {
 	row, err := parseStatusIDs(statusText(12, [4]int{1, 2, 3, 4}))
-	if err != nil || row.ppid != 12 || row.uids != [4]int{1, 2, 3, 4} {
+	if err != nil || row.uids != [4]int{1, 2, 3, 4} {
 		t.Fatalf("parse = %+v %v", row, err)
 	}
 	good := statusText(12, [4]int{1, 2, 3, 4})
 	for name, text := range map[string]string{
 		"no Uid":          strings.Replace(good, "Uid:", "Xid:", 1),
-		"no PPid":         strings.Replace(good, "PPid:", "XPid:", 1),
 		"three uids":      strings.Replace(good, "\t4\n", "\n", 1),
 		"five uids":       strings.Replace(good, "\t4\n", "\t4\t5\n", 1),
 		"non-numeric uid": strings.Replace(good, "\t3\t", "\tx\t", 1),
 		"negative uid":    strings.Replace(good, "\t3\t", "\t-3\t", 1),
-		"bad PPid":        strings.Replace(good, "PPid:\t12", "PPid:\t1 2", 1),
 		"repeated Uid":    good + "Uid:\t0\t0\t0\t0\n",
-		"repeated PPid":   good + "PPid:\t1\n",
 		"empty":           "",
 		"garbage":         "\x00\x01not a status file",
 	} {
 		if _, err := parseStatusIDs(text); !errors.Is(err, errStatusParse) {
 			t.Errorf("%s: err = %v, want errStatusParse", name, err)
+		}
+	}
+	// Only the Uid line is required: a line the proof does not use, missing
+	// or malformed, never makes the status unparsable.
+	for name, text := range map[string]string{
+		"no PPid":       strings.Replace(good, "PPid:", "XPid:", 1),
+		"bad PPid":      strings.Replace(good, "PPid:\t12", "PPid:\t1 2", 1),
+		"repeated PPid": good + "PPid:\t1\n",
+	} {
+		if row, err := parseStatusIDs(text); err != nil || row.uids != [4]int{1, 2, 3, 4} {
+			t.Errorf("%s: parse = %+v %v, want the uids", name, row, err)
 		}
 	}
 }
@@ -130,7 +139,7 @@ func TestProcFSRowsOnAFakeRoot(t *testing.T) {
 	for _, r := range rows {
 		got[r.pid] = r
 	}
-	if len(got) != 3 || got[77].uids[2] != 10003 || got[77].ppid != 1 || got[self].ppid != 1 {
+	if len(got) != 3 || got[77].uids[2] != 10003 || got[self].uids[0] != 10003 || got[1].uids != [4]int{} {
 		t.Fatalf("rows = %+v", rows)
 	}
 }
@@ -198,9 +207,19 @@ func TestProcFSRowsFailClosed(t *testing.T) {
 }
 
 // TestProcFSRowsReal runs the real scan on this host: it must list this
-// process with its own uid and parent.
+// process with its own uids. A scan invalidated by a listed pid vanishing
+// anywhere on the host (errProcVanished) is retaken, as proveNoUser retakes
+// one, up to 200 times 10ms apart: back-to-back retakes all fail together
+// while a sibling package's pid hopper runs. Any other error fails at once.
 func TestProcFSRowsReal(t *testing.T) {
-	rows, err := procFS{root: procRootPath, self: os.Getpid()}.rows()
+	var rows []procUserRow
+	err := errProcVanished
+	for attempt := 0; attempt < 200 && errors.Is(err, errProcVanished); attempt++ {
+		if attempt > 0 {
+			time.Sleep(10 * time.Millisecond)
+		}
+		rows, err = procFS{root: procRootPath, self: os.Getpid()}.rows()
+	}
 	if errors.Is(err, errProcHidden) {
 		t.Skip("the proc mount here hides processes")
 	}
@@ -209,7 +228,7 @@ func TestProcFSRowsReal(t *testing.T) {
 	}
 	for _, r := range rows {
 		if r.pid == os.Getpid() {
-			if r.ppid != os.Getppid() || r.uids[0] != os.Getuid() || r.uids[1] != os.Geteuid() {
+			if r.uids[0] != os.Getuid() || r.uids[1] != os.Geteuid() {
 				t.Fatalf("own row = %+v", r)
 			}
 			return
@@ -231,10 +250,10 @@ func uids4(u int) [4]int { return [4]int{u, u, u, u} }
 func TestProveNoUser(t *testing.T) {
 	const uid, self = 10003, 500
 	base := []procUserRow{
-		{pid: 1, ppid: 0, uids: uids4(0)},
-		{pid: 400, ppid: 1, uids: uids4(0)}, // an ancestor without the uid
-		{pid: self, ppid: 400, uids: uids4(uid)},
-		{pid: 600, ppid: 1, uids: uids4(10002)},
+		{pid: 1, uids: uids4(0)},
+		{pid: 400, uids: uids4(0)}, // an ancestor without the uid
+		{pid: self, uids: uids4(uid)},
+		{pid: 600, uids: uids4(10002)},
 	}
 	with := func(r procUserRow) []procUserRow { return append(append([]procUserRow{}, base...), r) }
 	tests := []struct {
@@ -245,19 +264,19 @@ func TestProveNoUser(t *testing.T) {
 		{"only self and ancestors", staticTable{list: base}, proofHeld},
 		// Only self is exempt: an ancestor with the uid is a user.
 		{"ancestor with the uid", staticTable{list: []procUserRow{
-			{pid: 1, ppid: 0, uids: uids4(0)},
-			{pid: 400, ppid: 1, uids: uids4(uid)},
-			{pid: self, ppid: 400, uids: uids4(uid)},
+			{pid: 1, uids: uids4(0)},
+			{pid: 400, uids: uids4(uid)},
+			{pid: self, uids: uids4(uid)},
 		}}, proofUserAlive},
 		{"parent with the fs uid", staticTable{list: []procUserRow{
-			{pid: 400, ppid: 1, uids: [4]int{0, 0, 0, uid}},
-			{pid: self, ppid: 400, uids: uids4(uid)},
+			{pid: 400, uids: [4]int{0, 0, 0, uid}},
+			{pid: self, uids: uids4(uid)},
 		}}, proofUserAlive},
-		{"real uid", staticTable{list: with(procUserRow{pid: 700, ppid: 1, uids: [4]int{uid, 1, 1, 1}})}, proofUserAlive},
-		{"effective uid", staticTable{list: with(procUserRow{pid: 700, ppid: 1, uids: [4]int{1, uid, 1, 1}})}, proofUserAlive},
-		{"saved uid", staticTable{list: with(procUserRow{pid: 700, ppid: 1, uids: [4]int{1, 1, uid, 1}})}, proofUserAlive},
-		{"fs uid", staticTable{list: with(procUserRow{pid: 700, ppid: 1, uids: [4]int{1, 1, 1, uid}})}, proofUserAlive},
-		{"child of self", staticTable{list: with(procUserRow{pid: 701, ppid: self, uids: uids4(uid)})}, proofUserAlive},
+		{"real uid", staticTable{list: with(procUserRow{pid: 700, uids: [4]int{uid, 1, 1, 1}})}, proofUserAlive},
+		{"effective uid", staticTable{list: with(procUserRow{pid: 700, uids: [4]int{1, uid, 1, 1}})}, proofUserAlive},
+		{"saved uid", staticTable{list: with(procUserRow{pid: 700, uids: [4]int{1, 1, uid, 1}})}, proofUserAlive},
+		{"fs uid", staticTable{list: with(procUserRow{pid: 700, uids: [4]int{1, 1, 1, uid}})}, proofUserAlive},
+		{"child of self", staticTable{list: with(procUserRow{pid: 701, uids: uids4(uid)})}, proofUserAlive},
 		{"table error", staticTable{err: errProcHidden}, proofUnknown},
 		{"self not listed", staticTable{list: base[:2]}, proofUnknown},
 	}
@@ -286,10 +305,10 @@ func (s *scriptedTable) rows() ([]procUserRow, error) {
 // unknown at once.
 func TestProveNoUserRescansAVanishedPid(t *testing.T) {
 	const uid, self = 10003, 500
-	selfRow := procUserRow{pid: self, ppid: 1, uids: uids4(uid)}
+	selfRow := procUserRow{pid: self, uids: uids4(uid)}
 	vanished := staticTable{err: fmt.Errorf("status of 7: %w", errProcVanished)}
 	clean := staticTable{list: []procUserRow{selfRow}}
-	user := staticTable{list: []procUserRow{selfRow, {pid: 8, ppid: 1, uids: uids4(uid)}}}
+	user := staticTable{list: []procUserRow{selfRow, {pid: 8, uids: uids4(uid)}}}
 	tests := []struct {
 		name      string
 		results   []staticTable

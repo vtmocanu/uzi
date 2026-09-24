@@ -748,7 +748,7 @@ func TestRunModeReapOrphans(t *testing.T) {
 		return
 	}
 	uid := fmt.Sprint(os.Geteuid())
-	selfOnly := staticTable{list: []procUserRow{{pid: os.Getpid(), ppid: 1, uids: uids4(os.Geteuid())}}}
+	selfOnly := staticTable{list: []procUserRow{{pid: os.Getpid(), uids: uids4(os.Geteuid())}}}
 
 	r := newRoots(t)
 	mkTree(t, filepath.Join(r.tmp, tmpNameN(30)))

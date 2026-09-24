@@ -13,10 +13,11 @@ import (
 // a VALID scan of the kernel process table shows that no process in this PID
 // namespace, other than the reaper itself, has the command uid in any of its
 // real/effective/saved/filesystem uids. Only the reaper's own pid is exempt:
-// its ancestors in production (setpriv, which execs into it, the worker and
-// init) do not run as the command uid, so any other process with that uid,
-// ancestor or not, means "user_alive". Every command user runs as that uid
-// with zero capabilities and no_new_privs, so it cannot leave it.
+// its ancestors in production (the worker and init; setpriv execs into the
+// reaper, so it is the same process, not an ancestor) do not run as the
+// command uid, so any other process with that uid, ancestor or not, means
+// "user_alive". Every command user runs as that uid with zero capabilities
+// and no_new_privs, so it cannot leave it.
 //
 // The rescan rule: a scan lists the pids first and then reads each listed
 // pid's status. It is valid only if NO listed pid vanished (ENOENT/ESRCH)
@@ -36,11 +37,20 @@ import (
 // launching runs). That ancestor, or a descendant of it created during the
 // listing, was listed (the listing assumption below), and its status read
 // then either succeeded (its uid is seen, so the proof is "user_alive") or
-// failed because it vanished (the scan is invalid). This rests on the listing returning every process alive
-// throughout it; the proc directory lists tgids in increasing order and new
-// pids are allocated upward, so a hopper stays ahead of the listing cursor
-// unless the pid counter wraps during that one listing, which this rule does
-// not detect.
+// failed because it vanished (the scan is invalid).
+//
+// The listing assumption: the listing returns every process alive throughout
+// it, and a listed pid is not reused before its status read. The proc
+// directory lists tgids in increasing order, and the kernel allocates pids
+// cyclically from the LAST allocated pid (idr_alloc_cyclic), so a child is
+// allocated ahead of the listing cursor only while the counter has never
+// wrapped. Once the namespace's counter has wrapped at ANY earlier time, a
+// child can get a pid behind the cursor, and a listed pid can be reused
+// before its status read, with no wrap during the listing. So the rule
+// assumes the namespace's pid counter has not wrapped since the namespace was
+// created (pid_max, 4194304 by default on 64-bit, pids allocated). This holds
+// for the reaper's intended use: at worker start, in a fresh container PID
+// namespace, before any run is launched.
 const (
 	proofHeld      = "held"
 	proofUnknown   = "unknown"
@@ -49,8 +59,7 @@ const (
 
 // procUserRow is one process's identity for the no-user proof.
 type procUserRow struct {
-	pid  int
-	ppid int
+	pid int
 	// uids are the real, effective, saved and filesystem uids of the Uid line.
 	uids [4]int
 }
@@ -67,7 +76,7 @@ const (
 	procRootPath = "/proc"
 	// maxProcScan is the most pids one scan lists; more is an error.
 	maxProcScan = 100000
-	// maxStatusBytes is the most of one status file read. Uid and PPid come
+	// maxStatusBytes is the most of one status file read. The Uid line comes
 	// long before the one unbounded line (Groups), so a longer file is parsed
 	// up to its last complete line.
 	maxStatusBytes = 64 << 10
@@ -240,44 +249,32 @@ func parsePid(name string) (int, bool) {
 	return pid, err == nil && pid > 0
 }
 
-// parseStatusIDs reads the PPid line (one number) and the Uid line (exactly
-// four numbers) of a status file. A missing, repeated or malformed line is an
-// error, never a zero.
+// parseStatusIDs reads the Uid line (exactly four numbers) of a status file.
+// A missing, repeated or malformed Uid line is an error, never a zero. No
+// other line is required: the proof needs only the uids, so a line it does
+// not use can never turn it "unknown".
 func parseStatusIDs(text string) (procUserRow, error) {
 	var row procUserRow
-	sawUID, sawPPid := false, false
+	sawUID := false
 	for _, line := range strings.Split(text, "\n") {
 		key, val, found := strings.Cut(line, ":")
-		if !found {
+		if !found || key != "Uid" {
 			continue
 		}
-		switch key {
-		case "Uid":
-			fields := strings.Fields(val)
-			if sawUID || len(fields) != 4 {
-				return row, errStatusParse
-			}
-			for i, f := range fields {
-				n, err := strconv.Atoi(f)
-				if err != nil || n < 0 {
-					return row, errStatusParse
-				}
-				row.uids[i] = n
-			}
-			sawUID = true
-		case "PPid":
-			fields := strings.Fields(val)
-			if sawPPid || len(fields) != 1 {
-				return row, errStatusParse
-			}
-			n, err := strconv.Atoi(fields[0])
+		fields := strings.Fields(val)
+		if sawUID || len(fields) != 4 {
+			return row, errStatusParse
+		}
+		for i, f := range fields {
+			n, err := strconv.Atoi(f)
 			if err != nil || n < 0 {
 				return row, errStatusParse
 			}
-			row.ppid, sawPPid = n, true
+			row.uids[i] = n
 		}
+		sawUID = true
 	}
-	if !sawUID || !sawPPid {
+	if !sawUID {
 		return row, errStatusParse
 	}
 	return row, nil
