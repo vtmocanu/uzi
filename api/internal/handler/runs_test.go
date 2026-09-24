@@ -77,8 +77,15 @@ type runsStore struct {
 	lastBeforeLim int32
 	userRuns      []store.ListRunsForUserRow
 	lastRunsArg   *store.ListRunsForUserParams
-	allWorkers    []store.ListAllWorkersRow
-	activeRuns    []store.ListActiveRunsAllRow
+	// runUsageTotals scripts ListRunUsageTotalsForRuns (issue #1620); the fake filters by
+	// the requested ids like the real ANY($1) predicate. runUsageTotalsErr fails it, and
+	// runUsageTotalsArg captures the ids the handler asked for.
+	runUsageTotals    []store.RunUsageTotal
+	runUsageTotalsErr error
+	runUsageTotalsArg []uuid.UUID
+
+	allWorkers []store.ListAllWorkersRow
+	activeRuns []store.ListActiveRunsAllRow
 	// claimTemplates backs GetRun's own-roster resolution (PRD #37 M4-fix): the
 	// owner's allocation-resolved templates, lead included so the handler's strip is
 	// exercised.
@@ -162,6 +169,23 @@ func (s *runsStore) ListClaimAgentTemplates(context.Context, pgtype.UUID) ([]sto
 func (s *runsStore) ListRunsForUser(_ context.Context, arg store.ListRunsForUserParams) ([]store.ListRunsForUserRow, error) {
 	s.lastRunsArg = &arg
 	return s.userRuns, nil
+}
+func (s *runsStore) ListRunUsageTotalsForRuns(_ context.Context, runIds []uuid.UUID) ([]store.RunUsageTotal, error) {
+	s.runUsageTotalsArg = runIds
+	if s.runUsageTotalsErr != nil {
+		return nil, s.runUsageTotalsErr
+	}
+	want := make(map[uuid.UUID]bool, len(runIds))
+	for _, id := range runIds {
+		want[id] = true
+	}
+	var out []store.RunUsageTotal
+	for _, row := range s.runUsageTotals {
+		if want[row.RunID] {
+			out = append(out, row)
+		}
+	}
+	return out, nil
 }
 func (s *runsStore) ListAllWorkers(context.Context) ([]store.ListAllWorkersRow, error) {
 	return s.allWorkers, nil

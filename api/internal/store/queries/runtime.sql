@@ -508,9 +508,13 @@ WHERE r.id = @repo_id;
 -- (repo scope) and the in-app issue history (repo + issue); when both are NULL
 -- this is the unchanged full list. The per-issue narrowing rides the composite
 -- index runs (repo_id, issue_iid, created_at DESC).
--- The usage_* columns are the run's rollup totals (PRD #40 M3), LEFT-joined from
--- run_usage_totals so a run with no usage yields NULLs (rendered as absent, never a
--- fake 0). The view already applies the greatest-wins-per-model rollup (Decision 3b).
+-- Usage is deliberately NOT joined here (issue #1620). It used to be a LEFT JOIN of
+-- run_usage_totals, but under pgx's cached prepared statements PostgreSQL switched to a
+-- GENERIC plan that could not push r.id into the view: it nested-looped the view once
+-- per run row, re-folding all of run_usage each time (13.9 s vs 60 ms custom). The
+-- handler now reads the page's rollup totals with ONE ListRunUsageTotalsForRuns call
+-- over the page's run ids; a run with no usage is absent from that result (rendered as
+-- absent, never a fake 0).
 -- judge_verdict (PRD #98 M4, Decision 7) is a SAFE join: run_reviews.target_run_id is
 -- NOT NULL UNIQUE (00059), so this matches at most one review per run — it cannot fan the
 -- list out and, being a LEFT JOIN, cannot drop an unjudged run either. NULL means "not
@@ -542,16 +546,6 @@ SELECT sqlc.embed(r), rp.path_with_namespace AS repo_path, w.name AS worker_name
        -- before it reads as stale → class `restored` (past grace) rather than `background`.
        fn_run_priority_class(r.kind, r.priority, r.created_at < @background_grace_cutoff) AS priority_class,
        rv.verdict                AS judge_verdict,
-       ru.input_tokens          AS usage_input_tokens,
-       ru.cache_read_tokens      AS usage_cache_read_tokens,
-       ru.cache_creation_tokens  AS usage_cache_creation_tokens,
-       ru.output_tokens          AS usage_output_tokens,
-       ru.cost_usd               AS usage_cost_usd,
-       -- PRD #1429 M1 (D7): the run's folded per-run cost_status from run_usage_totals, so a
-       -- run-list row can surface metered/subscription/unreported and never present a
-       -- subscription/unreported placeholder 0 as a real dollar total. LEFT-joined like the
-       -- token columns, so a run with no usage yields NULL (rendered as absent).
-       ru.cost_status            AS usage_cost_status,
        -- issue #1418: does this run have an available recovery capture to export? The
        -- capture half of the read-path landing_state derivation (workersvc.DeriveLandingState),
        -- owner-scoped and riding idx_recovery_captures_run_owner (run_id, user_id). The
@@ -567,7 +561,6 @@ LEFT JOIN workers w ON w.id = r.worker_id
 LEFT JOIN run_reviews rv
        ON rv.target_run_id = r.id      -- UNIQUE target_run_id → at most one row (PRD #98 M4)
       AND rv.user_id = r.user_id       -- self-standing owner scope; see the note above
-LEFT JOIN run_usage_totals ru ON ru.run_id = r.id
 WHERE r.user_id = @user_id
   -- Exclude chat AND judge (PRD #46): both are repo-less meta-runs the general Runs
   -- list never shows. self_improve has a real repo and stays visible. The repos
@@ -4539,6 +4532,22 @@ SELECT input_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, co
 FROM run_usage_totals
 WHERE run_id = @run_id;
 
+-- name: ListRunUsageTotalsForRuns :many
+-- The rollup totals (PRD #40 M3) for a PAGE of runs, keyed by run_id (issue #1620). The
+-- Runs list (ListRunsForUser) reads its usage here instead of LEFT-joining the view, and
+-- the handler maps each row onto its run; a run with no usage returns NO row (absent,
+-- never a fake 0), exactly like GetRunUsageTotal. cost_status (PRD #1429 M1, D7) rides
+-- along so a subscription/unreported placeholder 0 never reads as a real dollar total.
+--
+-- Why this shape survives a generic plan: the qual is a PARAMETER on run_id, the view's
+-- outermost GROUP BY key and the leading key of every inner GROUP BY / window PARTITION BY,
+-- so PostgreSQL pushes it through all the nested derived tables down to an index scan of
+-- run_usage_pkey (run_id, session_id, model, lineage_epoch) whether the plan is custom or
+-- generic. Only the page's legs are folded, never the whole table.
+SELECT run_id, input_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, cost_usd, cost_status
+FROM run_usage_totals
+WHERE run_id = ANY(@run_ids::uuid[]);
+
 -- name: SelfUsage :one
 -- The requesting user's own usage (PRD #40 M3, GET /api/usage): lifetime totals,
 -- last-7-days totals, and the count of their runs that carry usage. Windowed on the
@@ -4549,11 +4558,28 @@ WHERE run_id = @run_id;
 -- for the SAME window, so no partial dollar total can read as complete — a run is counted by
 -- its folded per-run cost_status from the view. M5A adds no public DTO field for these
 -- counts (the /api/usage response shape stays unchanged); M5B consumes them.
+--
+-- Issue #1620: scoped drives from the user's runs and reads the view through a CROSS JOIN
+-- LATERAL keyed on t.run_id = r.id, rather than a plain JOIN of the view. A plain join
+-- lets the planner fold the WHOLE view (every user's run_usage) and hash-join it, or under
+-- a generic plan nested-loop the full fold per run row; the lateral makes run_id a per-row
+-- qual that pushes down to run_usage_pkey, so only this user's legs are folded. CROSS (not
+-- LEFT) keeps the inner-join semantics: a run with no usage contributes no row, so run_count
+-- still counts only runs that carry usage. The LIMIT 1 is a semantic no-op (the view's
+-- outermost GROUP BY run_id yields at most one row per run) kept as a FENCE: without it the
+-- planner may pull the lateral subquery back up into a plain join and lose the per-row
+-- pushdown this rewrite exists for.
 WITH scoped AS (
     SELECT r.created_at, t.cost_status,
            t.input_tokens, t.cache_read_tokens, t.cache_creation_tokens, t.output_tokens, t.cost_usd
-    FROM run_usage_totals t
-    JOIN runs r ON r.id = t.run_id
+    FROM runs r
+    CROSS JOIN LATERAL (
+        SELECT t.cost_status, t.input_tokens, t.cache_read_tokens, t.cache_creation_tokens,
+               t.output_tokens, t.cost_usd
+        FROM run_usage_totals t
+        WHERE t.run_id = r.id
+        LIMIT 1
+    ) t
     WHERE r.user_id = @user_id AND r.kind <> 'chat'
 )
 SELECT

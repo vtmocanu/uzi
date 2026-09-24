@@ -6853,6 +6853,51 @@ func (q *Queries) ListRunUsageFrames(ctx context.Context, runID uuid.UUID) ([]Ru
 	return items, nil
 }
 
+const listRunUsageTotalsForRuns = `-- name: ListRunUsageTotalsForRuns :many
+SELECT run_id, input_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, cost_usd, cost_status
+FROM run_usage_totals
+WHERE run_id = ANY($1::uuid[])
+`
+
+// The rollup totals (PRD #40 M3) for a PAGE of runs, keyed by run_id (issue #1620). The
+// Runs list (ListRunsForUser) reads its usage here instead of LEFT-joining the view, and
+// the handler maps each row onto its run; a run with no usage returns NO row (absent,
+// never a fake 0), exactly like GetRunUsageTotal. cost_status (PRD #1429 M1, D7) rides
+// along so a subscription/unreported placeholder 0 never reads as a real dollar total.
+//
+// Why this shape survives a generic plan: the qual is a PARAMETER on run_id, the view's
+// outermost GROUP BY key and the leading key of every inner GROUP BY / window PARTITION BY,
+// so PostgreSQL pushes it through all the nested derived tables down to an index scan of
+// run_usage_pkey (run_id, session_id, model, lineage_epoch) whether the plan is custom or
+// generic. Only the page's legs are folded, never the whole table.
+func (q *Queries) ListRunUsageTotalsForRuns(ctx context.Context, runIds []uuid.UUID) ([]RunUsageTotal, error) {
+	rows, err := q.db.Query(ctx, listRunUsageTotalsForRuns, runIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []RunUsageTotal{}
+	for rows.Next() {
+		var i RunUsageTotal
+		if err := rows.Scan(
+			&i.RunID,
+			&i.InputTokens,
+			&i.CacheReadTokens,
+			&i.CacheCreationTokens,
+			&i.OutputTokens,
+			&i.CostUsd,
+			&i.CostStatus,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listRunsForUser = `-- name: ListRunsForUser :many
 SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, r.stop_kind, r.agent_source, r.agent_exclusions, r.repo_agents, r.title, r.resume_of_run_id, r.last_activity_at, r.health, r.health_reason, r.health_since, r.health_notified_at, r.target_run_id, r.mr_web_url, r.prd_done_path, r.prd_patch_settled_at, r.anthropic_secret_id, r.anthropic_secret_label, r.anthropic_select_reason, r.anthropic_headroom_pct, r.wait_on_limit, r.limit_resets_at, r.retry_not_before, r.limit_wait_count, r.rate_limit_type, r.open_question_id, r.revise_count, r.plan_source, r.planned_base_commit, r.require_base_match, r.milestones_candidate, r.milestones_frozen, r.milestones_completed, r.milestones_in_progress, r.budget_max_iterations, r.budget_wall_seconds, r.schedule_id, r.limit_dead_secret_id, r.report_only, r.report_md, r.ci_config_paths, r.model, r.override_subagent_model, r.fail_origin, r.priority, r.summary_intent, r.summary_plan, r.summary_deltas, r.issue_comments, r.base_branch, r.open_mr, r.dispatched_at, r.review_target_run_id, r.review_requested, r.then_fix_requested, r.then_fix_of_run_id, r.preserved_patch, r.required_capabilities, r.stop_reason, r.required_tools, r.size_class, r.interactive, r.open_followup_id, r.plan_changed_files, r.scope_ceiling, r.status_since, r.review_comments, r.budget_paused_seconds, r.mr_rework_enabled, r.trigger_source, r.checkpoint_tip, r.usage_refolded, r.codex_secret_id, r.codex_auth_mode, r.codex_secret_label, r.codex_account_key, r.codex_material_revision, r.codex_account_revision, r.codex_claim_epoch, r.codex_cap_hash, r.pause_requested_at, r.pause_mode, r.pause_after_count, r.checkpoint_tip_at, r.recovery_wait_count, r.recovery_retry_not_before, r.completion_contract_version, r.contract_revision, r.completion_contract, r.completion_attempts, r.latest_completion_attempt, r.milestones_agents, r.hold_reason, r.hold_captured_head, r.completion_budget_exhausted_at, r.completion_question_at, r.budget_extension_seconds, r.claim_generation, r.harness, r.recovery_wait_cause, r.forge_park_count, r.credential_override_mode, r.credential_override_secret_id, r.claim_released_at, r.credential_switch_requested_at, r.credential_switch_generation, r.stale_requeue_generation, r.budget_finalize_seconds, r.released_worker_id, r.released_worker_nonce, rp.path_with_namespace AS repo_path, w.name AS worker_name,
        c.forge_type,
@@ -6863,16 +6908,6 @@ SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_descripti
        -- before it reads as stale → class ` + "`" + `restored` + "`" + ` (past grace) rather than ` + "`" + `background` + "`" + `.
        fn_run_priority_class(r.kind, r.priority, r.created_at < $1) AS priority_class,
        rv.verdict                AS judge_verdict,
-       ru.input_tokens          AS usage_input_tokens,
-       ru.cache_read_tokens      AS usage_cache_read_tokens,
-       ru.cache_creation_tokens  AS usage_cache_creation_tokens,
-       ru.output_tokens          AS usage_output_tokens,
-       ru.cost_usd               AS usage_cost_usd,
-       -- PRD #1429 M1 (D7): the run's folded per-run cost_status from run_usage_totals, so a
-       -- run-list row can surface metered/subscription/unreported and never present a
-       -- subscription/unreported placeholder 0 as a real dollar total. LEFT-joined like the
-       -- token columns, so a run with no usage yields NULL (rendered as absent).
-       ru.cost_status            AS usage_cost_status,
        -- issue #1418: does this run have an available recovery capture to export? The
        -- capture half of the read-path landing_state derivation (workersvc.DeriveLandingState),
        -- owner-scoped and riding idx_recovery_captures_run_owner (run_id, user_id). The
@@ -6888,7 +6923,6 @@ LEFT JOIN workers w ON w.id = r.worker_id
 LEFT JOIN run_reviews rv
        ON rv.target_run_id = r.id      -- UNIQUE target_run_id → at most one row (PRD #98 M4)
       AND rv.user_id = r.user_id       -- self-standing owner scope; see the note above
-LEFT JOIN run_usage_totals ru ON ru.run_id = r.id
 WHERE r.user_id = $2
   -- Exclude chat AND judge (PRD #46): both are repo-less meta-runs the general Runs
   -- list never shows. self_improve has a real repo and stays visible. The repos
@@ -6909,20 +6943,14 @@ type ListRunsForUserParams struct {
 }
 
 type ListRunsForUserRow struct {
-	Run                      Run            `json:"run"`
-	RepoPath                 string         `json:"repo_path"`
-	WorkerName               pgtype.Text    `json:"worker_name"`
-	ForgeType                string         `json:"forge_type"`
-	IssueWebUrl              pgtype.Text    `json:"issue_web_url"`
-	PriorityClass            string         `json:"priority_class"`
-	JudgeVerdict             pgtype.Text    `json:"judge_verdict"`
-	UsageInputTokens         pgtype.Int8    `json:"usage_input_tokens"`
-	UsageCacheReadTokens     pgtype.Int8    `json:"usage_cache_read_tokens"`
-	UsageCacheCreationTokens pgtype.Int8    `json:"usage_cache_creation_tokens"`
-	UsageOutputTokens        pgtype.Int8    `json:"usage_output_tokens"`
-	UsageCostUsd             pgtype.Numeric `json:"usage_cost_usd"`
-	UsageCostStatus          pgtype.Text    `json:"usage_cost_status"`
-	HasAvailableCapture      bool           `json:"has_available_capture"`
+	Run                 Run         `json:"run"`
+	RepoPath            string      `json:"repo_path"`
+	WorkerName          pgtype.Text `json:"worker_name"`
+	ForgeType           string      `json:"forge_type"`
+	IssueWebUrl         pgtype.Text `json:"issue_web_url"`
+	PriorityClass       string      `json:"priority_class"`
+	JudgeVerdict        pgtype.Text `json:"judge_verdict"`
+	HasAvailableCapture bool        `json:"has_available_capture"`
 }
 
 // The user's runs, newest first (Runs index + Agents-status "your runs"), joined
@@ -6931,9 +6959,13 @@ type ListRunsForUserRow struct {
 // (repo scope) and the in-app issue history (repo + issue); when both are NULL
 // this is the unchanged full list. The per-issue narrowing rides the composite
 // index runs (repo_id, issue_iid, created_at DESC).
-// The usage_* columns are the run's rollup totals (PRD #40 M3), LEFT-joined from
-// run_usage_totals so a run with no usage yields NULLs (rendered as absent, never a
-// fake 0). The view already applies the greatest-wins-per-model rollup (Decision 3b).
+// Usage is deliberately NOT joined here (issue #1620). It used to be a LEFT JOIN of
+// run_usage_totals, but under pgx's cached prepared statements PostgreSQL switched to a
+// GENERIC plan that could not push r.id into the view: it nested-looped the view once
+// per run row, re-folding all of run_usage each time (13.9 s vs 60 ms custom). The
+// handler now reads the page's rollup totals with ONE ListRunUsageTotalsForRuns call
+// over the page's run ids; a run with no usage is absent from that result (rendered as
+// absent, never a fake 0).
 // judge_verdict (PRD #98 M4, Decision 7) is a SAFE join: run_reviews.target_run_id is
 // NOT NULL UNIQUE (00059), so this matches at most one review per run — it cannot fan the
 // list out and, being a LEFT JOIN, cannot drop an unjudged run either. NULL means "not
@@ -7121,12 +7153,6 @@ func (q *Queries) ListRunsForUser(ctx context.Context, arg ListRunsForUserParams
 			&i.IssueWebUrl,
 			&i.PriorityClass,
 			&i.JudgeVerdict,
-			&i.UsageInputTokens,
-			&i.UsageCacheReadTokens,
-			&i.UsageCacheCreationTokens,
-			&i.UsageOutputTokens,
-			&i.UsageCostUsd,
-			&i.UsageCostStatus,
 			&i.HasAvailableCapture,
 		); err != nil {
 			return nil, err
@@ -10503,8 +10529,14 @@ const selfUsage = `-- name: SelfUsage :one
 WITH scoped AS (
     SELECT r.created_at, t.cost_status,
            t.input_tokens, t.cache_read_tokens, t.cache_creation_tokens, t.output_tokens, t.cost_usd
-    FROM run_usage_totals t
-    JOIN runs r ON r.id = t.run_id
+    FROM runs r
+    CROSS JOIN LATERAL (
+        SELECT t.cost_status, t.input_tokens, t.cache_read_tokens, t.cache_creation_tokens,
+               t.output_tokens, t.cost_usd
+        FROM run_usage_totals t
+        WHERE t.run_id = r.id
+        LIMIT 1
+    ) t
     WHERE r.user_id = $1 AND r.kind <> 'chat'
 )
 SELECT
@@ -10553,6 +10585,17 @@ type SelfUsageRow struct {
 // for the SAME window, so no partial dollar total can read as complete — a run is counted by
 // its folded per-run cost_status from the view. M5A adds no public DTO field for these
 // counts (the /api/usage response shape stays unchanged); M5B consumes them.
+//
+// Issue #1620: scoped drives from the user's runs and reads the view through a CROSS JOIN
+// LATERAL keyed on t.run_id = r.id, rather than a plain JOIN of the view. A plain join
+// lets the planner fold the WHOLE view (every user's run_usage) and hash-join it, or under
+// a generic plan nested-loop the full fold per run row; the lateral makes run_id a per-row
+// qual that pushes down to run_usage_pkey, so only this user's legs are folded. CROSS (not
+// LEFT) keeps the inner-join semantics: a run with no usage contributes no row, so run_count
+// still counts only runs that carry usage. The LIMIT 1 is a semantic no-op (the view's
+// outermost GROUP BY run_id yields at most one row per run) kept as a FENCE: without it the
+// planner may pull the lateral subquery back up into a plain join and lose the per-row
+// pushdown this rewrite exists for.
 func (q *Queries) SelfUsage(ctx context.Context, userID uuid.UUID) (SelfUsageRow, error) {
 	row := q.db.QueryRow(ctx, selfUsage, userID)
 	var i SelfUsageRow

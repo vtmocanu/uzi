@@ -318,7 +318,7 @@ func judgeRunToDTO(jr *store.GetJudgeRunUsageForTargetRow) *apitypes.JudgeRunDTO
 			CostUSD:             numericToFloat(jr.CostUsd),
 			// PRD #1429 M3 (D7): the judge run's own folded cost_status, so the panel never
 			// reads a subscription/unreported judge spend as a complete $0 (mirrors
-			// usageFromListRow's identical field for a run-list row).
+			// usageFromTotals's identical field for a run-list row).
 			CostStatus: jr.CostStatus.String,
 		}
 	}
