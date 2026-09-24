@@ -143,7 +143,8 @@ export function LastFireDetail({ s, fire }: { s: Schedule; fire: LastFire }) {
   // The cap hint (PRD #308 Goal 2): a capped fire whose in-window candidates were all
   // skipped, so the newer eligible issues behind them were never tried. The copy stays
   // generic on purpose — the skip rows above carry the actual reasons (already running,
-  // fetch failed, …), and raising the cap would not help while the head stays skipped.
+  // fetch failed, …), and clearing those skips is the fix; raising the cap would also raise
+  // how many runs one fire can start, so the copy no longer suggests it (issue #1543).
   // Rendered ONLY under exactly that condition.
   const showHint = fire.capped && fire.skips.length > 0 && fire.started.length === 0;
   // Selector-matching issues that are not eligible (issue #1543). Absent/null is UNKNOWN

@@ -439,16 +439,16 @@ A few worth knowing:
   schedule), one line per skipped candidate with a human reason label
   (`not eligible`, `already running`, `description too large`, `fetch
   failed` — the raw wire reason for anything newer), and, when a capped fire
-  reached nobody, a hint that newer eligible issues weren't reached (it no
-  longer suggests raising `--max-issues`; a label sweep filters ineligible
-  matches out of its scan window entirely, so widening the cap doesn't help a
-  thin eligible backlog). A label sweep also prints how many open issues
+  reached nobody, a hint that newer eligible issues weren't reached because the candidates
+  ahead of them were skipped (it no longer suggests raising `--max-issues`:
+  the fix is to clear those skips, and a higher cap also raises how many runs
+  one fire can start). A label sweep also prints how many open issues
   match its selector but aren't eligible (`ineligible_matched`), when known;
   a never-fired schedule reads `Last fire: never fired`, and `--json` carries
   the same detail under `.last_fire` (including `.last_fire.ineligible_matched`
   when present — absent means unknown, not zero). `run-now` prints the
   matching per-candidate breakdown inline — a `Started N run(s)` header with
-  the created run id(s), a line per started run, then a `Matched N
+  the created run id(s), a line per started run, then an `Examined N
   candidate(s), skipped K:` tally with a reason label per skip (`add the
   configured uzi label or assign the issue to uzi` for `not eligible`, with no
   `--max-issues` hint), and the same `ineligible_matched` line when a label

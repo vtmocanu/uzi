@@ -265,8 +265,8 @@ exceed `max_issues` once backfill walks past a skip), which ones
 **skipped**, each with a typed reason — never free text:
 
 - `not_eligible` — the candidate carried neither the `uzi` label nor a
-  bot assignment at the time it was fetched and created a run for, so
-  `createRun`'s own gate refused it. On a label sweep this is now rare: an
+  bot assignment when uzi went to start its run, so the eligibility gate
+  refused it. On a label sweep this is now rare: an
   ineligible selector match is filtered out before it's ever a candidate
   (see [Sweep cap](#sweep-cap)), so this reason only fires on a race —
   eligibility changed between candidate selection and run creation — or on
@@ -305,8 +305,8 @@ capped sweep fire with more **eligible** issues than its [scan
 window](#sweep-cap) reached that still started nothing also carries a hint
 that newer eligible issues weren't reached, pointing back at the skip
 reasons above for why the candidates ahead of them were skipped — it no
-longer suggests raising `max_issues`, since a thin eligible backlog isn't
-fixed by widening the cap.
+longer suggests raising `max_issues`: the fix is to clear those skips, and a
+higher cap also raises how many runs one fire can start.
 
 A label sweep's fire also reports `ineligible_matched`: the number of open
 issues that match the sweep's selector but aren't eligible (neither
@@ -316,8 +316,8 @@ reached. This is the diagnostic for the case above: it tells you a fire
 that started nothing (or fewer than expected) is being starved by
 `uzi`-less matches, and roughly how many there are, without waiting for
 [backfill](#sweep-cap) to walk past each one individually. It's shown in
-`uzi schedule get`'s **Last fire** block, `uzi schedule run-now`'s summary,
-and `--json` (`.last_fire.ineligible_matched` and `run-now`'s
+the Schedules page's **Last fire** panel, `uzi schedule get`'s **Last
+fire** block, `uzi schedule run-now`'s summary, and `--json` (`.last_fire.ineligible_matched` and `run-now`'s
 `ineligible_matched`). It's **absent, not zero, on a fire from before this
 count existed and on an assigned-selector sweep** (an assigned candidate is
 eligible by construction, so the count doesn't apply) — read a missing key

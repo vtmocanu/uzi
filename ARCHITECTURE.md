@@ -574,8 +574,9 @@ via a dedicated INSERT as a `prompt` run kind: repo-ful, issue-less,
 `schedule_id`-keyed for dedup, MR-opening on the `ci_fix` shape. A **sweep**
 target fans out over the oldest open issues matching its label; `max_issues`
 counts runs *started*, not candidates matched, and `fireSweep` backfills from
-the next eligible issue within a bounded scan window (issue #416) so a stale
-ineligible head no longer under-fills a fire. See
+the next candidate within a bounded scan window (issue #416); since issue #1543
+the candidate query filters on run-eligibility before that window, so an
+ineligible selector prefix can no longer starve a fire (ADR 1543). See
 [docs/scheduling.md](docs/scheduling.md) and
 `prds/done/241-schedule-runs.md`.
 

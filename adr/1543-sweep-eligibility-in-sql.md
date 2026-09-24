@@ -42,8 +42,9 @@ occupies a window slot:
   assignment to the bot (`assignee_ids @> to_jsonb(@bot_id)`, guarded by
   `@bot_id > 0`) — mirroring the predicate `ListAutopilotCandidateIssues`
   already uses for autopilot. The assigned-selector kind is eligible by
-  construction and short-circuits the check. The two predicates are kept
-  byte-identical so "eligible" means the same thing to both.
+  construction and short-circuits the check. The list and count queries
+  carry byte-identical copies of the predicate so "eligible" means the same
+  thing to both.
 - **`CountSweepCandidateIssues`** returns two columns from one statement:
   `eligible` (selector matches that also pass the eligibility predicate,
   unlimited) and `matched` (every open selector match, eligible or not).
@@ -69,13 +70,16 @@ occupies a window slot:
   (`uzi schedule get`, `run-now`, `--json`, the web Last fire panel) must
   treat a missing key as unknown rather than defaulting it to zero.
 - The `--max-issues`-raising advice in the CLI's skip-reason and capped-fire
-  hints no longer applies and was removed: raising the cap does not help a
-  fire starved by a thin eligible backlog, and it also raises how many runs
-  a single fire can start per night, which is not the fix for this problem.
-- The eligibility rule now lives in **two** places that must move together:
-  the SQL predicate (`ListSweepCandidateIssues`/`CountSweepCandidateIssues`)
-  and `createRun`'s per-row gate. A future change to what makes an issue
-  eligible (a third eligibility path, say) must update both, or the SQL
+  hints was removed: eligibility starvation is now fixed at the source, and
+  when a capped fire still starts nothing the fix is to clear the skips ahead
+  of the unreached issues. Raising the cap also raises how many runs a single
+  fire can start per night, which is not the fix for either problem.
+- The eligibility rule now lives in **three** places that must move
+  together: the sweep SQL predicate
+  (`ListSweepCandidateIssues`/`CountSweepCandidateIssues`), the autopilot
+  SQL predicate (`ListAutopilotCandidateIssues`), and `createRun`'s per-row
+  gate. A future change to what makes an issue
+  eligible (a third eligibility path, say) must update all three, or the SQL
   filter and the authoritative gate will silently disagree — the SQL side
   would either wrongly exclude an eligible issue from ever becoming a
   candidate, or wrongly admit one that `createRun` then skips anyway.

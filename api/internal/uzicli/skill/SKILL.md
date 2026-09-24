@@ -672,10 +672,12 @@ nothing a manual start cannot.
   - `--max-issues <n>` caps how many runs one `--sweep` fire **starts**, oldest (lowest
     number) first; defaults to 10, ignored for non-sweep targets. `--max-issues 1` is
     "one run per fire". The cap counts runs *started*, not candidates matched: a
-    candidate that can't start (missing the `uzi` label, already running, transient fetch) is flagged
-    and the fire walks on to the next eligible issue, bounded by a scan window (the cap
+    candidate that can't start (already running, transient fetch) is flagged and the fire
+    walks on to the next eligible issue, bounded by a scan window (the cap
     plus a fixed headroom), so a stale issue at the head of the backlog no longer wastes a
-    slot.
+    slot. A label sweep never spends a slot on a selector match that is not eligible (no
+    `uzi` label, not bot-assigned): those are filtered out up front and reported as one
+    `ineligible_matched` count.
   - `--guidance <text>` (with `--issue`/`--sweep`) injects free owner steering into the
     run instruction ("keep the diff small", "add a failing test first") without editing
     each issue; capped at 8 KiB.
