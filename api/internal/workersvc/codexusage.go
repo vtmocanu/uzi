@@ -43,9 +43,11 @@ type CodexUsageFailureKind int
 const (
 	// CodexUsageFailureUnknown is the zero value, never returned deliberately.
 	CodexUsageFailureUnknown CodexUsageFailureKind = iota
-	// CodexUsageFailReauthRequired: the access token is proven expired with no renewal
-	// material (coordinatedRefresh returned ErrCodexRefreshNoToken). The account has been
-	// flagged reauth_required and the user must re-login.
+	// CodexUsageFailReauthRequired: the user must re-login. Either the access token is
+	// proven expired with no renewal material (coordinatedRefresh returned
+	// ErrCodexRefreshNoToken, and the poll path flags reauth_required), or the provider
+	// explicitly rejected the refresh material (ErrCodexRefreshRejected, issue #1594), in
+	// which case the refresh transaction itself already flagged reauth_required durably.
 	CodexUsageFailReauthRequired
 	// CodexUsageFailVaultLocked: the owner's vault is locked, so the committed login could
 	// not be opened. The prior reading is retained; NO reauth is set.
@@ -284,8 +286,12 @@ func (s *Service) readCodexUsageAttempt(ctx context.Context, reader CodexUsageRe
 // handleCodexUsageUnauthorized resolves a 401 (step 7). It re-reads the canonical generation:
 // a newer committed generation gets ONE retry with the fresh committed token; otherwise, if
 // the account is rotatable, it drives ONE coordinated rotation and retries once. A proven
-// no-renewal expiry (ErrCodexRefreshNoToken) flags reauth_required. It never re-spends a
-// refresh more than once and never sets reauth on anything but the proven-expired case.
+// no-renewal expiry (ErrCodexRefreshNoToken) flags reauth_required here. An explicit
+// provider rejection of the refresh material (ErrCodexRefreshRejected, issue #1594) is
+// reported as reauth-required too; the refresh transaction already set the flag, so nothing
+// more is written. It never re-spends a refresh more than once, and every other refresh
+// failure (contended, quarantined, a 5xx, a transport error, a 400/401 without a
+// material-rejection code) is transient, never reauth.
 func (s *Service) handleCodexUsageUnauthorized(ctx context.Context, q codexUsageStore, reader CodexUsageReader, principal codexPollPrincipal) (codexauth.UsageReading, store.CodexProviderAccount, *CodexUsageFailure) {
 	fresh, err := q.GetCodexProviderAccountByID(ctx, store.GetCodexProviderAccountByIDParams{UserID: principal.userID, ID: principal.accountID})
 	if err != nil {
@@ -323,6 +329,12 @@ func (s *Service) handleCodexUsageUnauthorized(ctx context.Context, q codexUsage
 	// path, not a worker capability. A fresh operation id + the observed generation drive one
 	// bounded rotation.
 	_, rerr := s.coordinatedRefresh(operationCtx, principal.userID, principal.accountID, uuid.New(), principal.generation, leaseDeadline, providerDeadline)
+	if errors.Is(rerr, ErrCodexRefreshRejected) {
+		// The provider rejected the refresh material and the rejection transaction already
+		// quarantined the account with reauth_required durably. Do NOT call
+		// MarkCodexReauthRequired: it is fenced to idle/committed accounts and would no-op.
+		return codexauth.UsageReading{}, store.CodexProviderAccount{}, codexUsageFail(CodexUsageFailReauthRequired)
+	}
 	if errors.Is(rerr, ErrCodexRefreshNoToken) {
 		// Proven expired with no renewal material → flag reauth (fenced on the observed
 		// counters; a 0-row result means the account moved and the flag is discarded).

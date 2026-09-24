@@ -254,6 +254,9 @@ SET generation           = generation + 1,
     reauth_required            = false,
     reauth_generation          = NULL,
     reauth_credential_revision = NULL,
+    -- Issue #1594: the reason is only meaningful while the flag is raised (00248's CHECK),
+    -- so it is cleared in the same statement as the flag.
+    reauth_reason              = NULL,
     updated_at           = now()
 WHERE id = @id AND user_id = @user_id AND generation = @from_generation::bigint
     AND coord_state = 'in_progress' AND coord_operation_id = @op::uuid
@@ -342,6 +345,9 @@ SET sealed_login         = @sealed,
     reauth_required            = false,
     reauth_generation          = NULL,
     reauth_credential_revision = NULL,
+    -- Issue #1594: the reason is only meaningful while the flag is raised (00248's CHECK),
+    -- so it is cleared in the same statement as the flag.
+    reauth_reason              = NULL,
     updated_at           = now()
 WHERE id = @id AND user_id = @user_id
     AND coord_state = 'quarantined'
@@ -396,6 +402,9 @@ SET sealed_login         = @sealed,
     reauth_required            = false,
     reauth_generation          = NULL,
     reauth_credential_revision = NULL,
+    -- Issue #1594: the reason is only meaningful while the flag is raised (00248's CHECK),
+    -- so it is cleared in the same statement as the flag.
+    reauth_reason              = NULL,
     updated_at           = now()
 WHERE id = @id AND user_id = @user_id
     AND generation = @from_generation::bigint
@@ -420,7 +429,9 @@ WHERE id = @id AND user_id = @user_id
 -- FENCED so the flag only lands on a SETTLED account that is STILL at the observed
 -- counters: coord_state IN ('idle','committed') keeps it off an in-flight refresh
 -- ('in_progress') and off a quarantined account (whose reconcile path owns the reauth
--- state); recovery_sealed IS NULL keeps it off an account carrying protected material; and
+-- state; the one other place a reauth flag is raised is the rejection primitive,
+-- ApplyCodexRejectionQuarantine via store.QuarantineRejectedCodexRefresh, which raises it
+-- ON a quarantined account with reauth_reason='provider_rejected'); recovery_sealed IS NULL keeps it off an account carrying protected material; and
 -- generation=@observed_generation AND credential_revision=@observed_credential_revision
 -- make a stale poll (whose account moved between observation and this write) match 0 rows,
 -- so the flag can never describe a superseded generation. :execrows — 0 rows means the
@@ -429,6 +440,9 @@ UPDATE codex_provider_account
 SET reauth_required            = true,
     reauth_generation          = @observed_generation::bigint,
     reauth_credential_revision = @observed_credential_revision::bigint,
+    -- Issue #1594: the poll path records no reason (00248's closed set names only the
+    -- provider-rejection path), so it sets the reason NULL explicitly.
+    reauth_reason              = NULL,
     updated_at                 = now()
 WHERE id = @id AND user_id = @user_id
     AND coord_state IN ('idle', 'committed')
@@ -449,6 +463,76 @@ UPDATE codex_provider_account
 SET coord_state = 'quarantined', updated_at = now()
 WHERE id = @id AND user_id = @user_id
     AND coord_state = 'in_progress' AND coord_operation_id = @op::uuid;
+
+-- name: LockCodexAccountForRejection :one
+-- Step 1 of the provider-rejection primitive (issue #1594, store.QuarantineRejectedCodexRefresh):
+-- row-lock the account the rejected refresh was running against, ONLY IF it is still held by
+-- the rejecting operation (@op) at the generation the refresh started from. The account row is
+-- locked first, then the intent (LockRotatingCodexRefreshIntent); see
+-- store.QuarantineRejectedCodexRefresh for why no lock cycle forms with the other writers of
+-- these two tables. pgx.ErrNoRows means the fence did not hold and the caller applies nothing.
+--
+-- coord_state IN ('in_progress','quarantined'): the quarantined arm exists because a survivor
+-- reap (QuarantineExpiredCodexLease, which keeps coord_operation_id) may land between the
+-- provider's 401 and this transaction; the operation still owns the account and its
+-- rejection must still be recorded. recovery_sealed IS NULL is a fence: a protected recovery
+-- slot is never overwritten, and re-login-required is only raised when none exists (a slot
+-- is the reconcile/promotion path's concern). Owner-scoped. Writes no recovery column.
+SELECT id FROM codex_provider_account
+WHERE id = @id AND user_id = @user_id
+    AND coord_state IN ('in_progress', 'quarantined')
+    AND coord_operation_id = @op::uuid
+    AND generation = @from_generation::bigint
+    AND recovery_sealed IS NULL
+FOR UPDATE;
+
+-- name: LockRotatingCodexRefreshIntent :one
+-- Step 2 of the provider-rejection primitive (issue #1594): row-lock the rejecting operation's
+-- intent, ONLY IF it is still 'rotating' from the same generation on the same account. Taken
+-- AFTER LockCodexAccountForRejection (account row first, then the intent). pgx.ErrNoRows means the
+-- intent already moved (committed/reconciled/unrecoverable) and the caller applies nothing.
+-- Owner-scoped.
+SELECT operation_id FROM codex_refresh_intent
+WHERE operation_id = @op::uuid AND user_id = @user_id
+    AND provider_account_id = @provider_account_id
+    AND from_generation = @from_generation::bigint
+    AND state = 'rotating'
+FOR UPDATE;
+
+-- name: ApplyCodexRejectionQuarantine :execrows
+-- Step 3 of the provider-rejection primitive (issue #1594): the provider rejected the refresh
+-- material with an allowlisted OAuth code, so the account is quarantined AND flagged
+-- re-login-required with reason 'provider_rejected', recording the (generation,
+-- credential_revision) the flag was raised against (00239's coherence CHECK; the reauth arm /
+-- quarantined arm of RefreshCodexAccountLogin clears it). The WHERE repeats
+-- LockCodexAccountForRejection's fence verbatim (same quarantined-arm and recovery_sealed IS
+-- NULL rationale), so the caller requires exactly 1 row. coord_operation_id is kept so the
+-- operation's identity survives on the quarantined row. Writes no recovery column.
+-- Owner-scoped.
+UPDATE codex_provider_account
+SET coord_state                = 'quarantined',
+    reauth_required            = true,
+    reauth_generation          = generation,
+    reauth_credential_revision = credential_revision,
+    reauth_reason              = 'provider_rejected',
+    updated_at                 = now()
+WHERE id = @id AND user_id = @user_id
+    AND coord_state IN ('in_progress', 'quarantined')
+    AND coord_operation_id = @op::uuid
+    AND generation = @from_generation::bigint
+    AND recovery_sealed IS NULL;
+
+-- name: MarkCodexRejectionIntentUnrecoverable :execrows
+-- Step 4 of the provider-rejection primitive (issue #1594): the rejected rotation can never
+-- complete, so its intent moves 'rotating' → 'unrecoverable'. The WHERE repeats
+-- LockRotatingCodexRefreshIntent's fence verbatim, so the caller requires exactly 1 row.
+-- Owner-scoped.
+UPDATE codex_refresh_intent
+SET state = 'unrecoverable', updated_at = now()
+WHERE operation_id = @op::uuid AND user_id = @user_id
+    AND provider_account_id = @provider_account_id
+    AND from_generation = @from_generation::bigint
+    AND state = 'rotating';
 
 -- name: InsertCodexRefreshIntent :one
 -- Record the durable pre-rotation intent (PRD #1147 M2) before touching the provider. The

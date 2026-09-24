@@ -221,3 +221,57 @@ func TestAdminRateLimitsBadProvider(t *testing.T) {
 		t.Errorf("want an unknown-provider usage message, got:\n%s", errOut)
 	}
 }
+
+// TestRateLimitsCodexRejectedReason — issue #1594: a credential_action_required account
+// whose server-reported reason is provider_rejected explains itself in the STATUS cell, on
+// both a bucket-less row and a bucket row; an account with no reason renders its bare
+// status only.
+func TestRateLimitsCodexRejectedReason(t *testing.T) {
+	fc := &uzicli.FakeClient{SelfCodexMeters: []apitypes.CodexAccountRateLimitDTO{
+		{AccountID: "cx-1", Aliases: []string{"rejected"}, Status: "credential_action_required", Reason: "provider_rejected"},
+		{
+			AccountID: "cx-2", Aliases: []string{"rejected-bucket"}, Status: "credential_action_required", Reason: "provider_rejected",
+			Buckets: []apitypes.CodexRateLimitBucketDTO{{ID: "5h", DisplayName: "5h", Primary: cliCwin(10, 0)}},
+		},
+		{AccountID: "cx-3", Aliases: []string{"plain"}, Status: "credential_action_required"},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "rate-limits", "--provider", "codex")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if got := strings.Count(out, "credential_action_required (login rejected by provider)"); got != 2 {
+		t.Fatalf("rejected STATUS cells = %d, want 2:\n%s", got, out)
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, "plain") && strings.Contains(line, "rejected by provider") {
+			t.Fatalf("an account with no reason must render its bare status:\n%s", out)
+		}
+	}
+}
+
+// TestRateLimitsCodexRejectedReasonPollingDisabled — issue #1594: with the usage poller
+// off the server reports polling_disabled AND the provider_rejected reason, and the STATUS
+// cell names the rejection on both the owner and the admin table.
+func TestRateLimitsCodexRejectedReasonPollingDisabled(t *testing.T) {
+	const want = "polling_disabled (login rejected by provider)"
+	acct := apitypes.CodexAccountRateLimitDTO{AccountID: "cx-1", Aliases: []string{"rejected"}, Status: "polling_disabled", Reason: "provider_rejected"}
+
+	out, _, code := runCLI(t, fakeEnv(&uzicli.FakeClient{SelfCodexMeters: []apitypes.CodexAccountRateLimitDTO{acct}}), "rate-limits", "--provider", "codex")
+	if code != uzicli.ExitOK {
+		t.Fatalf("owner exit = %d, want 0", code)
+	}
+	if !strings.Contains(out, want) {
+		t.Errorf("owner codex table missing %q:\n%s", want, out)
+	}
+
+	adminFC := &uzicli.FakeClient{CodexRateLimits: []apitypes.CodexAdminRateLimitRowDTO{
+		{ID: "u1", Email: "a@example.com", Accounts: []apitypes.CodexAccountRateLimitDTO{acct}},
+	}}
+	out, _, code = runCLI(t, fakeEnv(adminFC), "admin", "rate-limits", "--provider", "codex")
+	if code != uzicli.ExitOK {
+		t.Fatalf("admin exit = %d, want 0", code)
+	}
+	if !strings.Contains(out, want) {
+		t.Errorf("admin codex table missing %q:\n%s", want, out)
+	}
+}

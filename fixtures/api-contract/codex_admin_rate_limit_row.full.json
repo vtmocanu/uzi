@@ -11,6 +11,7 @@
       ],
       "is_default": true,
       "status": "x",
+      "reason": "x",
       "last_success_at": "x",
       "stale": true,
       "buckets": [

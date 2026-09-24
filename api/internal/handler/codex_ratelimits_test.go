@@ -10,6 +10,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
+
+	"github.com/vtmocanu/uzi/api/internal/config"
 )
 
 // fakeCodexPoker records Poke calls per user, so a test can assert a credential save or a
@@ -114,5 +116,63 @@ func TestCodexAuthSavePokesPollerOpenAIDoesNot(t *testing.T) {
 	}
 	if got := poker.count(user); got != 1 {
 		t.Fatalf("openai_api_key save poked (count now %d); a static key has no meter to poll", got)
+	}
+}
+
+// TestCodexAccountDTOReason pins the reason field (issue #1594): it is set to
+// provider_rejected only when the account is flagged reauth_required, the stored
+// reauth_reason is exactly provider_rejected, and the derived status is not vault_locked.
+// So it shows under credential_action_required and under polling_disabled (including a
+// locked vault with the poller off, since polling_disabled outranks vault_locked), and is
+// absent for vault_locked, an unflagged account, and every other stored value.
+func TestCodexAccountDTOReason(t *testing.T) {
+	now := time.Now()
+	rejected := pgtype.Text{String: codexRateLimitReasonProviderRejected, Valid: true}
+	cases := []struct {
+		name        string
+		interval    time.Duration
+		vaultLocked bool
+		reauth      bool
+		reason      pgtype.Text
+		wantStatus  string
+		wantReason  string
+	}{
+		{"flagged provider_rejected", 5 * time.Minute, false, true, rejected, codexRateLimitStatusCredentialActionRequired, "provider_rejected"},
+		{"flagged no reason", 5 * time.Minute, false, true, pgtype.Text{}, codexRateLimitStatusCredentialActionRequired, ""},
+		{"flagged other stored reason", 5 * time.Minute, false, true, pgtype.Text{String: "something_else", Valid: true}, codexRateLimitStatusCredentialActionRequired, ""},
+		{"flagged empty stored reason", 5 * time.Minute, false, true, pgtype.Text{String: "", Valid: true}, codexRateLimitStatusCredentialActionRequired, ""},
+		{"vault_locked takes precedence", 5 * time.Minute, true, true, rejected, codexRateLimitStatusVaultLocked, ""},
+		{"polling off, flagged provider_rejected", 0, false, true, rejected, codexRateLimitStatusPollingDisabled, "provider_rejected"},
+		{"polling off, flagged no reason", 0, false, true, pgtype.Text{}, codexRateLimitStatusPollingDisabled, ""},
+		{"polling off, not flagged, stale reason ignored", 0, false, false, rejected, codexRateLimitStatusPollingDisabled, ""},
+		{"polling off outranks vault_locked, reason shown", 0, true, true, rejected, codexRateLimitStatusPollingDisabled, "provider_rejected"},
+		{"not flagged, stale reason ignored", 5 * time.Minute, false, false, rejected, codexRateLimitStatusFresh, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &Handler{cfg: config.Config{CodexUsagePollInterval: tc.interval}}
+			dto := h.codexAccountDTO(uuid.New(), []string{"a"}, false, tc.reauth, tc.reason, nil, validTS(now), validTS(now), tc.vaultLocked)
+			if dto.Status != tc.wantStatus {
+				t.Fatalf("status = %q, want %q", dto.Status, tc.wantStatus)
+			}
+			if dto.Reason != tc.wantReason {
+				t.Fatalf("reason = %q, want %q", dto.Reason, tc.wantReason)
+			}
+			raw, err := json.Marshal(dto)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			var m map[string]any
+			if err := json.Unmarshal(raw, &m); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			got, present := m["reason"]
+			if tc.wantReason == "" && present {
+				t.Fatalf("reason key present (%v), want absent", got)
+			}
+			if tc.wantReason != "" && got != tc.wantReason {
+				t.Fatalf("wire reason = %v, want %q", got, tc.wantReason)
+			}
+		})
 	}
 }

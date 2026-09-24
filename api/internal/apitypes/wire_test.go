@@ -952,8 +952,8 @@ func TestCodexRateLimitBucketDTOTags(t *testing.T) {
 		"id", "display_name", "allowed", "limit_reached", "primary", "secondary")
 }
 
-// TestCodexAccountRateLimitDTOTags pins the per-account meter: last_success_at and stale
-// are omitempty (dropped on a zero value), the rest are always present.
+// TestCodexAccountRateLimitDTOTags pins the per-account meter: reason, last_success_at and
+// stale are omitempty (dropped on a zero value), the rest are always present.
 func TestCodexAccountRateLimitDTOTags(t *testing.T) {
 	assertTags(t, "CodexAccountRateLimitDTO(zero)", CodexAccountRateLimitDTO{},
 		"account_id", "aliases", "is_default", "status", "buckets")
@@ -962,13 +962,14 @@ func TestCodexAccountRateLimitDTOTags(t *testing.T) {
 		AccountID:     "a1",
 		Aliases:       []string{"x"},
 		IsDefault:     true,
-		Status:        "fresh",
+		Status:        "credential_action_required",
+		Reason:        "provider_rejected",
 		LastSuccessAt: time.Now().UTC().Format(time.RFC3339),
 		Stale:         &stale,
 		Buckets:       []CodexRateLimitBucketDTO{},
 	}
 	assertTags(t, "CodexAccountRateLimitDTO(full)", full,
-		"account_id", "aliases", "is_default", "status", "last_success_at", "stale", "buckets")
+		"account_id", "aliases", "is_default", "status", "reason", "last_success_at", "stale", "buckets")
 }
 
 // TestCodexAdminRateLimitRowDTOTags pins the admin row, mirroring AdminRateLimitRowDTO.

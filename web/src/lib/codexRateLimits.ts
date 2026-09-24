@@ -147,11 +147,38 @@ const CODEX_STATUS_BADGES: Record<CodexRateLimitStatus, CodexStatusBadge> = {
   },
 };
 
-// codexStatusBadge renders the server's per-account status verbatim (a MAP lookup). The
-// stored union is closed, so there is no unknown-value branch here — unlike the Anthropic
-// auto-status chip, this field is not deployed ahead of the bundle by a newer server.
-export function codexStatusBadge(status: CodexRateLimitStatus): CodexStatusBadge {
-  return CODEX_STATUS_BADGES[status];
+// PROVIDER_REJECTED_HINT replaces the status hint when the server says the provider REJECTED
+// the saved login's refresh material (issue #1594): a re-paste from the same, shared login
+// would be rejected again, so the fix is a login used only by uzi.
+const PROVIDER_REJECTED_HINT =
+  "The saved Codex login was rejected by the provider; add a login used only by uzi.";
+
+// codexLoginRejected reports whether the account's hint is the provider-rejected one: the
+// server's reason, under action-required or a disabled poller (polling_disabled outranks
+// the reauth status server-side, and must not hide the rejection). The server omits the
+// reason under vault_locked, where unlocking is the only actionable step.
+export function codexLoginRejected(account: Pick<CodexAccountRateLimit, "status" | "reason">): boolean {
+  return (
+    account.reason === "provider_rejected" &&
+    (account.status === "credential_action_required" || account.status === "polling_disabled")
+  );
+}
+
+// codexStatusBadge renders the server's per-account status verbatim (a MAP lookup), and is
+// the ONE place the provider-rejected refinement overrides the hint, so the Settings card
+// and the admin table cannot drift. The stored union is closed, so there is no
+// unknown-value branch here — unlike the Anthropic auto-status chip, this field is not
+// deployed ahead of the bundle by a newer server.
+export function codexStatusBadge(
+  account: Pick<CodexAccountRateLimit, "status" | "reason">,
+): CodexStatusBadge {
+  const badge = CODEX_STATUS_BADGES[account.status];
+  // Tone and label stay the status's own ("Action required" / "Polling off"); only the hint
+  // is refined.
+  if (codexLoginRejected(account)) {
+    return { ...badge, hint: PROVIDER_REJECTED_HINT };
+  }
+  return badge;
 }
 
 // codexAccountWorstPct is the highest used_percent across every window of every bucket on

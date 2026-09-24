@@ -312,7 +312,7 @@ function CodexAdminSection() {
             <tbody className="divide-y divide-edge">
               {rows.flatMap((u) =>
                 u.accounts.map((a, i) => {
-                  const badge = codexStatusBadge(a.status);
+                  const badge = codexStatusBadge(a);
                   return (
                     <tr key={`${u.id}:${a.account_id}`} className="transition-colors hover:bg-raised/30">
                       {i === 0 ? <CodexUserCell user={u} rowSpan={u.accounts.length} /> : null}

@@ -129,7 +129,7 @@ func (q *Queries) GetCodexCredentialState(ctx context.Context, arg GetCodexCrede
 }
 
 const getCodexProviderAccountByID = `-- name: GetCodexProviderAccountByID :one
-SELECT id, user_id, provider_user_id, workspace_account_id, sealed_login, sealed_with, generation, credential_revision, recovery_sealed, recovery_generation, recovery_sealed_with, coord_state, coord_operation_id, lease_deadline, committed_generation, created_at, updated_at, reauth_required, reauth_generation, reauth_credential_revision FROM codex_provider_account
+SELECT id, user_id, provider_user_id, workspace_account_id, sealed_login, sealed_with, generation, credential_revision, recovery_sealed, recovery_generation, recovery_sealed_with, coord_state, coord_operation_id, lease_deadline, committed_generation, created_at, updated_at, reauth_required, reauth_generation, reauth_credential_revision, reauth_reason FROM codex_provider_account
 WHERE user_id = $1 AND id = $2
 `
 
@@ -164,12 +164,13 @@ func (q *Queries) GetCodexProviderAccountByID(ctx context.Context, arg GetCodexP
 		&i.ReauthRequired,
 		&i.ReauthGeneration,
 		&i.ReauthCredentialRevision,
+		&i.ReauthReason,
 	)
 	return i, err
 }
 
 const getCodexProviderAccountByTuple = `-- name: GetCodexProviderAccountByTuple :one
-SELECT id, user_id, provider_user_id, workspace_account_id, sealed_login, sealed_with, generation, credential_revision, recovery_sealed, recovery_generation, recovery_sealed_with, coord_state, coord_operation_id, lease_deadline, committed_generation, created_at, updated_at, reauth_required, reauth_generation, reauth_credential_revision FROM codex_provider_account
+SELECT id, user_id, provider_user_id, workspace_account_id, sealed_login, sealed_with, generation, credential_revision, recovery_sealed, recovery_generation, recovery_sealed_with, coord_state, coord_operation_id, lease_deadline, committed_generation, created_at, updated_at, reauth_required, reauth_generation, reauth_credential_revision, reauth_reason FROM codex_provider_account
 WHERE user_id = $1
   AND provider_user_id = $2
   AND workspace_account_id = $3
@@ -208,6 +209,7 @@ func (q *Queries) GetCodexProviderAccountByTuple(ctx context.Context, arg GetCod
 		&i.ReauthRequired,
 		&i.ReauthGeneration,
 		&i.ReauthCredentialRevision,
+		&i.ReauthReason,
 	)
 	return i, err
 }
@@ -247,7 +249,7 @@ func (q *Queries) InsertCodexCredentialState(ctx context.Context, arg InsertCode
 const insertCodexProviderAccount = `-- name: InsertCodexProviderAccount :one
 INSERT INTO codex_provider_account (user_id, provider_user_id, workspace_account_id, sealed_login, sealed_with)
 VALUES ($1, $2, $3, $4, $5)
-RETURNING id, user_id, provider_user_id, workspace_account_id, sealed_login, sealed_with, generation, credential_revision, recovery_sealed, recovery_generation, recovery_sealed_with, coord_state, coord_operation_id, lease_deadline, committed_generation, created_at, updated_at, reauth_required, reauth_generation, reauth_credential_revision
+RETURNING id, user_id, provider_user_id, workspace_account_id, sealed_login, sealed_with, generation, credential_revision, recovery_sealed, recovery_generation, recovery_sealed_with, coord_state, coord_operation_id, lease_deadline, committed_generation, created_at, updated_at, reauth_required, reauth_generation, reauth_credential_revision, reauth_reason
 `
 
 type InsertCodexProviderAccountParams struct {
@@ -292,6 +294,7 @@ func (q *Queries) InsertCodexProviderAccount(ctx context.Context, arg InsertCode
 		&i.ReauthRequired,
 		&i.ReauthGeneration,
 		&i.ReauthCredentialRevision,
+		&i.ReauthReason,
 	)
 	return i, err
 }

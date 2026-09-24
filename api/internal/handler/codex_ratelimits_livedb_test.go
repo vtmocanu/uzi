@@ -27,6 +27,7 @@ type codexAccountJSON struct {
 	Aliases       []string `json:"aliases"`
 	IsDefault     bool     `json:"is_default"`
 	Status        string   `json:"status"`
+	Reason        string   `json:"reason"`
 	LastSuccessAt string   `json:"last_success_at"`
 	Stale         *bool    `json:"stale"`
 	Buckets       []struct {
@@ -165,7 +166,8 @@ func TestCodexRateLimitsReadSurfaceLiveDB(t *testing.T) {
 	// reauth_required=true requires the observed (generation, credential_revision) set too
 	// (codex_provider_account_reauth_coherence, 00239).
 	mustExecT(ctx, t, pool, `UPDATE codex_provider_account
-		SET reauth_required = true, reauth_generation = 0, reauth_credential_revision = 0 WHERE id = $1`, acctReauth)
+		SET reauth_required = true, reauth_generation = 0, reauth_credential_revision = 0,
+		    reauth_reason = 'provider_rejected' WHERE id = $1`, acctReauth)
 
 	acctDup := seedAccount(t, userA, []string{"dup-a", "dup-b"}, false) // two aliases ⇒ one account
 	seedRL(t, userA, acctDup, buckets(33), now, now)
@@ -262,6 +264,16 @@ func TestCodexRateLimitsReadSurfaceLiveDB(t *testing.T) {
 		if reauth.Status != codexRateLimitStatusCredentialActionRequired {
 			t.Errorf("reauth-sub status = %q, want credential_action_required (reauth overrides a fresh reading)", reauth.Status)
 		}
+		// issue #1594: the stored provider_rejected reason reaches the owner DTO, and no
+		// other account carries a reason.
+		if reauth.Reason != "provider_rejected" {
+			t.Errorf("reauth-sub reason = %q, want provider_rejected", reauth.Reason)
+		}
+		for alias, a := range byAlias {
+			if alias != "reauth-sub" && a.Reason != "" {
+				t.Errorf("%s reason = %q, want absent", alias, a.Reason)
+			}
+		}
 
 		dup := byAlias["dup-a"]
 		if len(dup.Aliases) != 2 || dup.Aliases[0] != "dup-a" || dup.Aliases[1] != "dup-b" {
@@ -307,9 +319,20 @@ func TestCodexRateLimitsReadSurfaceLiveDB(t *testing.T) {
 		// Other live-DB tests may seed their own users; assert only on ours.
 		byEmail := map[string]int{}
 		locked := map[string]bool{}
+		adminReason := ""
 		for _, u := range body.Users {
 			byEmail[u.Email] = len(u.Accounts)
 			locked[u.Email] = u.VaultLocked
+			for _, a := range u.Accounts {
+				if u.Email == emailA && len(a.Aliases) > 0 && a.Aliases[0] == "reauth-sub" {
+					adminReason = a.Reason
+				}
+			}
+		}
+		// issue #1594: the admin read carries the same reason (unless userA's vault is
+		// locked, which takes precedence and suppresses it).
+		if want := map[bool]string{false: "provider_rejected", true: ""}[locked[emailA]]; adminReason != want {
+			t.Errorf("admin: reauth-sub reason = %q, want %q", adminReason, want)
 		}
 		if byEmail[emailA] != 6 {
 			t.Fatalf("admin: %s has %d accounts, want 6 (dup collapsed)", emailA, byEmail[emailA])
@@ -352,6 +375,54 @@ func TestCodexRateLimitsReadSurfaceLiveDB(t *testing.T) {
 			}
 			if a.Stale == nil || !*a.Stale {
 				t.Errorf("account %v stale = %v, want true when the poller is disabled", a.Aliases, a.Stale)
+			}
+		}
+		// issue #1594: a disabled poller must not hide a provider-rejected login. The
+		// flagged account keeps its reason under polling_disabled; no other account has one.
+		byAlias := byFirstAlias(accounts)
+		if got := byAlias["reauth-sub"].Reason; got != "provider_rejected" {
+			t.Errorf("polling off: reauth-sub reason = %q, want provider_rejected", got)
+		}
+		for alias, a := range byAlias {
+			if alias != "reauth-sub" && a.Reason != "" {
+				t.Errorf("polling off: %s reason = %q, want absent", alias, a.Reason)
+			}
+		}
+
+		// The admin read through the same disabled-poller handler carries it too.
+		adminRec := httptest.NewRecorder()
+		hOff.AdminCodexRateLimits(adminRec, codexRLReq(uuid.New(), true))
+		if adminRec.Code != http.StatusOK {
+			t.Fatalf("admin code = %d, want 200; body=%s", adminRec.Code, adminRec.Body.String())
+		}
+		var adminBody struct {
+			Users []struct {
+				Email    string             `json:"email"`
+				Accounts []codexAccountJSON `json:"accounts"`
+			} `json:"users"`
+		}
+		if err := json.Unmarshal(adminRec.Body.Bytes(), &adminBody); err != nil {
+			t.Fatalf("admin decode: %v", err)
+		}
+		var adminA []codexAccountJSON
+		for _, u := range adminBody.Users {
+			if u.Email == emailA {
+				adminA = u.Accounts
+			}
+		}
+		if len(adminA) != 6 {
+			t.Fatalf("admin polling off: %s has %d accounts, want 6", emailA, len(adminA))
+		}
+		for alias, a := range byFirstAlias(adminA) {
+			if a.Status != codexRateLimitStatusPollingDisabled {
+				t.Errorf("admin polling off: %s status = %q, want polling_disabled", alias, a.Status)
+			}
+			want := ""
+			if alias == "reauth-sub" {
+				want = "provider_rejected"
+			}
+			if a.Reason != want {
+				t.Errorf("admin polling off: %s reason = %q, want %q", alias, a.Reason, want)
 			}
 		}
 	})

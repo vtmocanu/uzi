@@ -197,6 +197,7 @@ type CodexProviderAccount struct {
 	ReauthRequired           bool               `json:"reauth_required"`
 	ReauthGeneration         pgtype.Int8        `json:"reauth_generation"`
 	ReauthCredentialRevision pgtype.Int8        `json:"reauth_credential_revision"`
+	ReauthReason             pgtype.Text        `json:"reauth_reason"`
 }
 
 type CodexRefreshIntent struct {

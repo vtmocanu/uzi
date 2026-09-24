@@ -839,6 +839,13 @@ Tracked as GitHub issue vtmocanu/uzi#1484; PRD at `prds/1484-admin-health-tab.md
 - A non-admin gets a platform line on Overview instead of the admin card, derived only from their own runs and workers, so they can tell a platform problem from a problem with their own run. [AI-synced 2026-09-20, #1484]
 - In-app health never reads the Kubernetes API; the api holds no kube credential, and no action (restart, retry, rollback, cordon) is offered — diagnosis only. [AI-synced 2026-09-20, #1484]
 
+## Feature #1594 — Codex provider-rejection surfaces as re-login required
+
+Tracked as GitHub issue vtmocanu/uzi#1594.
+
+- A Codex login the provider rejects (an allowlisted refresh-token rejection code, on a 400/401) surfaces to its owner as re-login required with the reason that the provider rejected it; any other refresh failure stays ambiguous and never releases or re-spends a token. (AI-synced 2026-09-24)
+- The documented way to add a Codex login is a login dedicated to uzi, isolated from the owner's everyday Codex CLI; a re-paste after a failure comes from a new isolated login. (AI-synced 2026-09-24)
+
 ## Startup admin seed
 
 - Seed an admin user from env at startup (`UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME`) so the user survives DB wipes.
