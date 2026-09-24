@@ -158,6 +158,28 @@ Each retained claim keeps its own hold, keyed to the exact claim that
 produced the work, so a later run on the same worker never drops an older
 claim's only copy.
 
+## Automatic settlement of an older held generation
+
+When a run is resumed on the same worker (after a rate-limit park, a
+recovery restart, or a similar restart), the new generation may adopt an
+older generation's committed work as its starting point. If that older
+generation still has an open custody hold and the resumed run goes on to
+publish, uzi can release the older hold automatically once it can *prove*
+the older work is actually contained in what got published — you don't have
+to notice and discard it by hand.
+
+That proof is never taken on trust from the worker. The worker only reports
+which commit it adopted; the server independently asks your forge whether
+that commit is an ancestor of the branch's final published head, using the
+forge's own comparison API. Only a positive, unambiguous answer releases the
+hold. Anything else — the forge is rate-limited or erroring, the comparison
+is inconclusive, the branch or the reported commit no longer matches what
+the server expects, or the run's state changed underneath the check — keeps
+the hold open instead of guessing. A hold that settlement can't clear behaves
+exactly like any other open hold: it still shows up under **Recovery
+archives**, and you can still resolve it yourself with `uzi run export` or
+`uzi run discard`.
+
 ## Reviewing and resolving held work
 
 At most **8 unresolved holds per owner** (the *Unresolved recovery holds*

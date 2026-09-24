@@ -245,6 +245,16 @@ ancestry check runs against the *final* durable head at disposition time. Same-w
 the same branch, a newer MR, a later generation, or capture absence are never proof of
 continuity, and a default-branch reseed can never supply the earlier source.
 
+**Implementation note (issue #1582).** The settlement-time ancestry check above is
+server-side and forge-proven: the worker only reports candidate SHAs (the predecessor's
+journaled source, its adopted tip, and its own pushed head) and the api independently reads
+the branch head once, then asks the forge's own comparison primitive whether each candidate
+is an ancestor of it — GitHub's compare `status`, GitLab's `merge_base`, or, on Forgejo,
+a two-direction compare (`head...candidate` empty AND `candidate...head` nonempty), because
+Forgejo empties the commit list whenever a merge base cannot be found, so an empty
+`head...candidate` alone is not proof of ancestry. Any rate limit, error, truncation, or
+inconclusive answer resolves to unknown, never to a release, and the hold is retained.
+
 ### Graceful park and early-terminal disposition (D4)
 
 PRD #1296 released a verified-empty hold only inside finalization capture. A graceful park
