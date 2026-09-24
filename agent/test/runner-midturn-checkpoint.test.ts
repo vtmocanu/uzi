@@ -1309,7 +1309,7 @@ describe("mid-turn checkpoint lock custody (issue #1597 M2)", () => {
         logger,
       );
       p = runner.execute(claim);
-      await waitFor(() => later.length === 2, 20_000);
+      await waitFor(() => later.length === 2, 60_000); // chained real bounded waits (grace, 2x SURVIVOR_SINK_WAIT_MS) under suite load
       runner.shutdown();
       await p;
       assert.equal(later[0], "tick_process_survived", "a later tick skips while the survivor lives");
@@ -1386,7 +1386,7 @@ describe("mid-turn checkpoint lock custody (issue #1597 M2)", () => {
         logger,
       );
       p = runner.execute(claim);
-      await waitFor(() => milestoneDone, 30_000);
+      await waitFor(() => milestoneDone, 60_000); // chained real bounded waits under suite load
       runner.shutdown();
       await p;
       assert.ok(
