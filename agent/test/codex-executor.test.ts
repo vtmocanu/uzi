@@ -4921,7 +4921,7 @@ describe("CodexExecutor: run-wide wall and served lift (issue #1600)", () => {
 
   it("(implement) a refused park after the budget is spent re-arms from the 409's budget, with no immediate re-trip", async () => {
     const rig = makeRig({ responder: timedTurns({ turnMs: 300, turns: 2, quietFirst: true }) });
-    rig.deps = { ...rig.deps, idleMs: 5000, wallMs: 100, minRedriveWallMs: 10 };
+    rig.deps = { ...rig.deps, idleMs: 5000, wallMs: 100, redriveAllowanceMs: 10 };
     const { ctx, spies } = lwallCtx({
       takeWallParkRefresh: () => {
         spies.refreshCalls++;
@@ -4958,7 +4958,7 @@ describe("CodexExecutor: run-wide wall and served lift (issue #1600)", () => {
       return {};
     };
     const rig = makeRig({ responder });
-    rig.deps = { ...rig.deps, idleMs: 5000, wallMs: 100, minRedriveWallMs: 10 };
+    rig.deps = { ...rig.deps, idleMs: 5000, wallMs: 100, redriveAllowanceMs: 10 };
     let gateCalls = 0;
     const { ctx, spies } = lwallCtx({
       planApproved: false,
@@ -4983,9 +4983,27 @@ describe("CodexExecutor: run-wide wall and served lift (issue #1600)", () => {
     assert.equal(spies.parkForWallCalls, 1, "one refused park, no re-trip after the refresh");
   });
 
+  it("a refused park caps the re-drive at the server's remaining time (plus the race allowance)", async () => {
+    const rig = makeRig({ responder: timedTurns({ turnMs: 300, turns: 2, quietFirst: true }) });
+    rig.deps = { ...rig.deps, idleMs: 5000, wallMs: 100, redriveAllowanceMs: 50 };
+    const { ctx, spies } = lwallCtx({
+      // The 409 serves a 10s total, all of it used: the deadline is only a race away.
+      takeWallParkRefresh: () => (++spies.refreshCalls === 1 ? { totalSeconds: 10, usedSeconds: 10 } : undefined),
+      parkForWall: async () => {
+        spies.parkForWallCalls++;
+        return spies.parkForWallCalls === 1 ? "refused" : "parked";
+      },
+    });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "codex refused cap");
+    // Lifting by the served total alone would allow ~9.9s and let the 300ms re-drive finish; the
+    // server says nothing is left, so the re-drive gets only the 50ms allowance and parks again.
+    assert.deepStrictEqual(result.walled, { reason: "codex run wall-clock timeout" }, "the re-drive was capped and parked");
+    assert.equal(spies.parkForWallCalls, 2);
+  });
+
   it("a refused park with no server budget (older server) falls back to one claim-time wall", async () => {
     const rig = makeRig({ responder: timedTurns({ turnMs: 100, turns: 2, quietFirst: true }) });
-    rig.deps = { ...rig.deps, idleMs: 5000, wallMs: 300, minRedriveWallMs: 10 };
+    rig.deps = { ...rig.deps, idleMs: 5000, wallMs: 300, redriveAllowanceMs: 10 };
     const { ctx, spies } = lwallCtx({ takeWallParkRefresh: () => undefined });
     spies.outcome = "refused";
     const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "codex refused fallback");

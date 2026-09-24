@@ -194,10 +194,11 @@ const COMMAND_ENV_PROTECTED_KEYS: ReadonlySet<string> = new Set([
 
 const DEFAULT_IDLE_MS = 5 * 60 * 1000;
 const DEFAULT_WALL_MS = 60 * 60 * 1000;
-// Issue #1600: the least wall a refused-park re-drive is armed with. A refusal means the server's
-// deadline has not passed, and the server's own sweep still parks the run at that deadline, so the
-// local wall is only a backstop; the floor keeps it from re-tripping (and re-capturing) at once.
-const MIN_REDRIVE_WALL_MS = 60 * 1000;
+// Issue #1600: the precision/race allowance a refused-park re-drive is armed with when the server's
+// remaining budget has (nearly) run out. The budget fields are whole seconds and the refusal raced
+// the deadline, so a zero-or-negative remainder would otherwise re-trip and re-capture at once. Kept
+// small: the server sweep is periodic, so the local wall must stay a real watchdog.
+const REDRIVE_RACE_ALLOWANCE_MS = 5 * 1000;
 const DEFAULT_BOUNDARY_DEADLINE_MS = 30 * 1000;
 const DEFAULT_CHILD_TURN_DEADLINE_MS = 10 * 60 * 1000;
 // The single-milestone implement/review iteration budget when the claim omits one, matching
@@ -1204,8 +1205,8 @@ export interface CodexExecutorDeps {
   readonly provisionRunTools?: typeof provisionRunTools;
   readonly idleMs?: number;
   readonly wallMs?: number;
-  /** Issue #1600: the refused-park re-drive floor; defaults to MIN_REDRIVE_WALL_MS. */
-  readonly minRedriveWallMs?: number;
+  /** Issue #1600: the refused-park race allowance; defaults to REDRIVE_RACE_ALLOWANCE_MS. */
+  readonly redriveAllowanceMs?: number;
   readonly boundaryDeadlineMs?: number;
   readonly childTurnDeadlineMs?: number;
   /** Base TMPDIR exposed to an injected high-level command seam. The production
@@ -1351,23 +1352,23 @@ function liftWall(wall: RunWall, servedSeconds: number | undefined): void {
 
 /**
  * Issue #1600: re-arm the run-wide wall after a REFUSED wall park. A refusal means the server's
- * deadline has not passed. Lift to the refusal's served total, then take the server's own remaining
- * time (total - used, both server-derived, so no cross-host clock comparison). Without a server
- * budget (an older server) fall back to one claim-time wall, the pre-#1600 per-turn re-arm. Either
- * way the re-drive gets at least `floorMs` (MIN_REDRIVE_WALL_MS in production).
+ * deadline has not passed. With the refusal's budget, the server's own remaining time (total - used,
+ * both server-derived, so no cross-host clock comparison) becomes the wall, never more, plus at
+ * least `allowanceMs` for whole-second rounding and the deadline race. The served total still moves
+ * the high-water mark so a later reportIteration does not lift by the same extension twice. Without
+ * a server budget (an older server) fall back to one claim-time wall, the pre-#1600 re-arm.
  */
 function refreshWallAfterRefusal(
   wall: RunWall,
   refresh: WallParkRefresh | undefined,
-  floorMs: number,
+  allowanceMs: number,
 ): void {
   liftWall(wall, refresh?.totalSeconds);
   if (refresh?.totalSeconds !== undefined && refresh.usedSeconds !== undefined) {
-    wall.remainingMs = Math.max(wall.remainingMs, (refresh.totalSeconds - refresh.usedSeconds) * 1000);
+    wall.remainingMs = Math.max((refresh.totalSeconds - refresh.usedSeconds) * 1000, allowanceMs);
   } else {
     wall.remainingMs = Math.max(wall.remainingMs, wall.claimMs);
   }
-  wall.remainingMs = Math.max(wall.remainingMs, floorMs);
 }
 
 export class CodexExecutor implements Executor {
@@ -2318,7 +2319,7 @@ export class CodexExecutor implements Executor {
         if (outcome === "refused") {
           // The owner extended: re-drive the turn. It skips reportIteration, so re-arm the run-wide
           // wall from the refusal's own budget first, or the re-drive would trip at once.
-          refreshWallAfterRefusal(wall, ctx.takeWallParkRefresh?.(), this.deps.minRedriveWallMs ?? MIN_REDRIVE_WALL_MS);
+          refreshWallAfterRefusal(wall, ctx.takeWallParkRefresh?.(), this.deps.redriveAllowanceMs ?? REDRIVE_RACE_ALLOWANCE_MS);
           continue;
         }
         throw err; // "rethrow": not a wall trip (or no seam wired) — legacy propagation
