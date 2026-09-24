@@ -31,6 +31,8 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Opening a Forgejo CI run that no longer exists no longer claims the server lacks Actions support ([#1343](https://github.com/vtmocanu/uzi/issues/1343)).**
+  A missing or deleted run id on a Forgejo server with Actions used to show "not available on this forge version". uzi now checks whether the Actions API answers at all before saying so; when it does, the missing run surfaces as an ordinary forge error, as it already did on GitHub and GitLab.
 - **A plan turn that ends with prose only now parks for the run's owner instead of always failing ([#1593](https://github.com/vtmocanu/uzi/issues/1593)).**
   When a gated plan (or plan-revision) turn calls neither `submit_plan` nor `ask_user` and just writes prose, the worker resumes the same session once with a fixed corrective nudge; if it is still prose only, an attended run parks at `awaiting_input` on a fixed "Plan missing" question while the lead's last message rides along as a bounded, secret-scrubbed feed card, and an autopilot or otherwise-unattended run fails closed with the new judge-eligible `plan_missing` fail origin, backed by a migration that widens `runs_fail_origin_check` to sixteen values.
 - **The pipeline-watch ref-cap warning no longer repeats on every sync tick ([#1483](https://github.com/vtmocanu/uzi/issues/1483)).**
