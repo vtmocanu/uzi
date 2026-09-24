@@ -8,7 +8,7 @@ import type { Readable } from "node:stream";
 import { type ExecutorResult, type RunContext } from "../src/executor.js";
 import { CodexBoundaryError } from "../src/codex/safety.js";
 import type { BoundaryPermit, CodexExecutionSafety, HarnessError } from "../src/harness.js";
-import { type ExecutorFactory } from "../src/runner.js";
+import { type ExecutorFactory, type RunnerOptions } from "../src/runner.js";
 import { skillsPluginDir } from "../src/skills-plugin.js";
 import { nullLogger, recordingLogger } from "./helpers.js";
 import {
@@ -117,24 +117,36 @@ function spyPublishHttpError(httpStatus: number): { restore: () => void } {
   };
 }
 
-/** Spy on client.publishCheckpoint that NEVER resolves — models a slow/unreachable forge
- *  the client-side budget must cap. A bare never-resolving promise (no timer) keeps no
- *  handle alive, so `node --test` still exits. */
-function spyPublishHang(): { entered: Promise<void>; restore: () => void } {
+/** Spy on client.publishCheckpoint that does not settle until the test ends — models a
+ *  slow/unreachable forge the client-side budget must cap. issue #1597 M2 (review item 11): the
+ *  Claude budget race ABANDONS the durability promise, so a hung publish used to outlive its test
+ *  and race the next test's teardown (an uncaught `write EPIPE` under load). `restore()` now
+ *  RELEASES the hang (a non-2xx result) and `drained` resolves once the pack stream finished, so
+ *  the abandoned sequence completes inside the test that started it. */
+function spyPublishHang(): { entered: Promise<void>; restore: () => Promise<void> } {
   const enter = deferred();
+  const release = deferred();
+  const drained = deferred();
+  let wasEntered = false;
   const orig = client.publishCheckpoint.bind(client);
-  (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = (
+  (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = async (
     _runId: string,
     _tipOid: string,
     pack: Readable,
   ) => {
-    pack.resume(); // drain so the pack stream does not itself hold a handle
+    void drain(pack).catch(() => undefined).finally(() => drained.resolve());
+    wasEntered = true;
     enter.resolve();
-    return new Promise(() => {}); // never settles
+    await release.promise;
+    return { ok: false, httpStatus: 599 };
   };
   return {
     entered: enter.promise,
-    restore: () => {
+    restore: async () => {
+      release.resolve();
+      if (wasEntered) await drained.promise;
+      // Let the abandoned sequence's continuation run before the harness tears the fixture down.
+      await new Promise((r) => setImmediate(r));
       (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = orig;
     },
   };
@@ -406,7 +418,7 @@ describe("RunRunner — checkpoint on graceful shutdown (PRD #1030 M4)", () => {
         `expected the NOT-published line when the budget elapses, got ${JSON.stringify(feed)}`,
       );
     } finally {
-      restore();
+      await restore();
       fs.rmSync(homeRoot, { recursive: true, force: true });
     }
   });
@@ -505,7 +517,12 @@ const harnessError = (category: HarnessError["category"]): HarnessError => ({
 /** Run one shutdown with the given publish spy / safety; return the run's feed + log lines. */
 async function shutdownOnce(
   iid: number,
-  opts: { safety?: CodexExecutionSafety; midRun?: (ctx: RunContext) => Promise<void>; budgetMs?: number } = {},
+  opts: {
+    safety?: CodexExecutionSafety;
+    midRun?: (ctx: RunContext) => Promise<void>;
+    budgetMs?: number;
+    setTimer?: RunnerOptions["setTimer"];
+  } = {},
 ): Promise<{ feed: string[]; lines: Array<Record<string, unknown>>; runId: string }> {
   const { gitlab } = fakeGitlab();
   const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), `uzi-1597-shut-${iid}-`));
@@ -517,7 +534,10 @@ async function shutdownOnce(
       gitlab,
       undefined,
       logger,
-      opts.budgetMs !== undefined ? { shutdownPublishTimeoutMs: opts.budgetMs } : undefined,
+      {
+        ...(opts.budgetMs !== undefined ? { shutdownPublishTimeoutMs: opts.budgetMs } : {}),
+        ...(opts.setTimer ? { setTimer: opts.setTimer } : {}),
+      },
     );
     const claim = gitlabClaim(iid);
     const p = runner.execute(claim);
@@ -583,13 +603,26 @@ describe("RunRunner — typed shutdown checkpoint outcome (issue #1597 M1)", () 
   });
 
   it("timeout (Claude): the budget race elapsing names the timeout class", async () => {
-    const { restore } = spyPublishHang();
+    // issue #1597 M2 (review item 11): deterministic — the shutdown budget timer (the only
+    // `setTimer` arm of this delay) fires the moment the hung publish is ENTERED, never on a wall
+    // clock that races git latency under load; restore() releases the hang inside this test.
+    const BUDGET = 54_321;
+    const { entered, restore } = spyPublishHang();
+    const setTimer = (cb: () => void, ms: number): (() => void) => {
+      if (ms === BUDGET) {
+        void entered.then(cb);
+        return () => {};
+      }
+      const t = setTimeout(cb, ms);
+      t.unref?.();
+      return () => clearTimeout(t);
+    };
     try {
-      const { feed, lines } = await shutdownOnce(1597_02, { budgetMs: 300 });
+      const { feed, lines } = await shutdownOnce(1597_02, { budgetMs: BUDGET, setTimer });
       assert.ok(feed.includes(notPublished("timeout")), JSON.stringify(feed));
       assert.equal(loggedOutcome(lines), "timeout");
     } finally {
-      restore();
+      await restore();
     }
   });
 

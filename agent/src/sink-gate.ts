@@ -13,11 +13,19 @@
 //
 // Re-entrant for the OWNER: a gated path that (directly or through a callee) reaches another gated
 // path runs it inline instead of deadlocking on itself. Ownership is tracked with AsyncLocalStorage,
-// so it follows the owner's async call tree and nothing else.
+// so it follows the owner's async call tree — but AsyncLocalStorage context also flows into timers
+// and promises CREATED inside run() that fire after it returned. So the store carries a HOLD token
+// that is marked dead on release: a deferred call from a finished holder sees a dead token and
+// queues for the gate like anyone else (issue #1597 M2 review item 10).
 
 import { AsyncLocalStorage } from "node:async_hooks";
 
-const owned = new AsyncLocalStorage<ReadonlySet<SinkGate>>();
+interface Hold {
+  readonly gate: SinkGate;
+  live: boolean;
+}
+
+const owned = new AsyncLocalStorage<readonly Hold[]>();
 
 export class SinkGate {
   private locked = false;
@@ -32,12 +40,14 @@ export class SinkGate {
   /** Run `fn` holding the gate, waiting (and preempting a holding tick) as needed. Re-entrant for
    *  the async call tree that already holds it. */
   async run<T>(fn: () => Promise<T>): Promise<T> {
-    const store = owned.getStore();
-    if (store?.has(this)) return fn();
+    const store = owned.getStore() ?? [];
+    if (store.some((h) => h.gate === this && h.live)) return fn();
     await this.lock();
+    const hold: Hold = { gate: this, live: true };
     try {
-      return await owned.run(new Set([...(store ?? []), this]), fn);
+      return await owned.run([...store.filter((h) => h.live), hold], fn);
     } finally {
+      hold.live = false;
       this.unlock();
     }
   }

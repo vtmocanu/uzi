@@ -153,3 +153,25 @@ export function gitleaksArgs(opts: {
     opts.reportPath,
   ];
 }
+
+/**
+ * issue #1597 M2 — the argv (after the binary) for `gitleaks stdin`, used to scan ONE merge commit's
+ * own contribution (a `git diff` fed on stdin) with the same discipline as {@link gitleaksArgs}: an
+ * explicit default-ruleset config, inline allows ignored, `--exit-code 0`, `--redact`, a JSON report.
+ */
+export function gitleaksStdinArgs(opts: { configPath: string; reportPath: string }): string[] {
+  return [
+    "stdin",
+    "-c",
+    opts.configPath,
+    "--ignore-gitleaks-allow",
+    "--exit-code",
+    "0",
+    "--no-banner",
+    "--redact",
+    "--report-format",
+    "json",
+    "--report-path",
+    opts.reportPath,
+  ];
+}

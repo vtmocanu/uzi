@@ -76,6 +76,33 @@ describe("SinkGate (issue #1597 M2)", () => {
     assert.equal(gate.isHeld(), false);
   });
 
+  it("a timer created inside run() that fires AFTER release does not inherit the ownership (review item 10)", async () => {
+    const gate = new SinkGate();
+    const events: string[] = [];
+    let deferred!: Promise<void>;
+    await gate.run(async () => {
+      deferred = new Promise<void>((resolve) => {
+        setTimeout(() => {
+          void gate.run(async () => {
+            events.push("deferred:ran");
+          }).then(resolve);
+        }, 20);
+      });
+    });
+    // Another holder takes the gate before the timer fires; the deferred call must WAIT for it.
+    let releaseOther!: () => void;
+    const other = gate.run(async () => {
+      events.push("other:start");
+      await new Promise<void>((r) => (releaseOther = r));
+      events.push("other:end");
+    });
+    await new Promise((r) => setTimeout(r, 60));
+    assert.deepEqual(events, ["other:start"], "the deferred call is queued, not let through");
+    releaseOther();
+    await Promise.all([other, deferred]);
+    assert.deepEqual(events, ["other:start", "other:end", "deferred:ran"]);
+  });
+
   it("releases on a throw", async () => {
     const gate = new SinkGate();
     await assert.rejects(gate.run(async () => { throw new Error("x"); }), /x/);

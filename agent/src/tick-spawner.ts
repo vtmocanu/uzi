@@ -19,6 +19,12 @@
 // path. Everything else — non-Linux, a /proc read failure, an inode mismatch, a lock the child never
 // opened (a foreign process), a lock that pre-existed the spawn — is RETAINED and reported with its
 // evidence. Nothing is ever deleted by age.
+//
+// Expect RETENTION to be the common outcome, not removal: real git holds a ref lock's fd only while
+// it writes the new value, and closes it before the rename/commit step, so a git killed in the
+// window after the close but before the rename leaves a lock NO live process holds open — which
+// this module cannot prove was its child's, and therefore keeps. Removal needs the child to be
+// killed while it still holds the fd (the tests model that with a holder process).
 
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import fs from "node:fs/promises";
@@ -420,7 +426,8 @@ export class TickSpawner {
         }
         if (pre.present) {
           // It existed before this child started: not the child's, not a cancellation artefact.
-          // Keep it, but it is only REPORTED when the child could have been blocked by it.
+          // Keep it AND report it — it blocks the sink whoever made it; the runner only treats the
+          // sink as blocked while the file still exists.
           result.retained.push(evidence("preexisting"));
           continue;
         }

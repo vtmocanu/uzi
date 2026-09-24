@@ -2,7 +2,7 @@ import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { promisify } from "node:util";
 import fs from "node:fs/promises";
-import { createReadStream } from "node:fs";
+import { constants as fsConstants, createReadStream } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
@@ -15,6 +15,7 @@ import { withForgeRetry } from "./forge-retry.js";
 import {
   commitsScannedFromStderr,
   gitleaksArgs,
+  gitleaksStdinArgs,
   parseGitleaksReport,
   scanIsTrustworthy,
   type SecretFinding,
@@ -167,8 +168,76 @@ export interface GitCacheOptions {
   gitleaksBin?: string;
 }
 
-/** issue #1597 M2: the mid-turn checkpoint secret scan's hard deadline. */
+/** issue #1597 M2: the mid-turn checkpoint secret scan's hard deadline (all of its git + gitleaks
+ *  children together). A caller inside a Codex permit passes a tighter one (see runner.ts). */
 export const CHECKPOINT_SCAN_TIMEOUT_MS = 60_000;
+
+// issue #1597 M2 (review item 6) — pre-scan SIZE CAPS on a checkpoint range's NEW objects. gitleaks'
+// cost is dominated by blob bytes and is super-linear on some content: a single 20 MiB blob took
+// 586s and 171 MB RSS in the audit, while 12 MB of ordinary text scanned in ~2s here. The caps keep
+// one scan well inside CHECKPOINT_SCAN_TIMEOUT_MS on ordinary content and bound its memory; a range
+// over any cap is `scan_too_large` → untrusted → NOT published (the fetch-back still keeps it local,
+// and the finalize push path, which has its own scan and the GH013 backstop, is unaffected).
+//  - 8 MiB per blob: far above any hand-written source file; a larger blob is almost always a
+//    generated/binary artefact, which is exactly the pathological case.
+//  - 128 MiB of new blob bytes in total: a multi-hour turn's honest delta is orders of magnitude
+//    smaller; ~128 MiB of ordinary text is ~20-30s of gitleaks here, leaving margin in the 60s budget.
+//  - 100k new objects: bounds the rev-list/cat-file output we buffer (~41 bytes per oid).
+/** Largest single new blob a checkpoint scan accepts (bytes). */
+const CHECKPOINT_SCAN_MAX_BLOB_BYTES = 8 * 1024 * 1024;
+/** Largest total of new blob bytes a checkpoint scan accepts. */
+const CHECKPOINT_SCAN_MAX_TOTAL_BYTES = 128 * 1024 * 1024;
+/** Most new objects (commits + trees + blobs) a checkpoint range may carry. */
+const CHECKPOINT_SCAN_MAX_OBJECTS = 100_000;
+/** Most merge commits whose own contribution is scanned separately (see scanMergeContribution). */
+const CHECKPOINT_SCAN_MAX_MERGES = 32;
+/** Byte cap on one merge's `git diff <M>^1 <M>` fed to `gitleaks stdin`. */
+const CHECKPOINT_SCAN_MAX_MERGE_DIFF_BYTES = 32 * 1024 * 1024;
+
+/** issue #1597 M2: why a checkpoint scan is untrusted (run log only; the feed names the class). */
+export type CheckpointScanUntrustedReason =
+  | "range_invalid"
+  | "scan_too_large"
+  | "count_failed"
+  | "deadline"
+  | "too_many_merges"
+  | "merge_diff_too_large"
+  | "scan_untrusted";
+
+/** issue #1597 M2: the result of {@link GitCache.secretScanCheckpointRange}. */
+export interface CheckpointScanResult {
+  trusted: boolean;
+  findings: SecretFinding[];
+  /** Set when `trusted` is false. */
+  reason?: CheckpointScanUntrustedReason;
+}
+
+/** issue #1597 M2: the most bytes read from a runner clone's `.git` gitfile (a real one is a single
+ *  `gitdir: <path>` line). */
+const GITFILE_MAX_BYTES = 4096;
+
+/** issue #1597 M2 (review item 2): classify an agent-controlled `.git` entry WITHOUT ever blocking,
+ *  from ONE open: O_RDONLY|O_NOFOLLOW|O_NONBLOCK (a FIFO opens at once instead of waiting for a
+ *  writer; a symlink is refused with ELOOP), then fstat THAT fd — there is no separate stat-then-open
+ *  a swap could race. A regular file (≤ `maxBytes`) is read through the same fd; a directory is
+ *  reported as such; anything else (FIFO, socket, device) is `other`. Throws on an open failure. */
+async function readGitEntryNoBlock(
+  p: string,
+  maxBytes: number,
+): Promise<{ kind: "file"; text: string } | { kind: "dir" } | { kind: "other" }> {
+  const fh = await fs.open(p, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+  try {
+    const st = await fh.stat();
+    if (st.isDirectory()) return { kind: "dir" };
+    if (!st.isFile()) return { kind: "other" };
+    if (st.size > maxBytes) throw new Error("file too large");
+    const buf = Buffer.alloc(maxBytes);
+    const { bytesRead } = await fh.read(buf, 0, maxBytes, 0);
+    return { kind: "file", text: buf.subarray(0, bytesRead).toString("utf8") };
+  } finally {
+    await fh.close();
+  }
+}
 
 /** issue #1597 M2: the git-busy markers a runner clone's gitdir can carry while a git operation is
  *  in progress. Directory markers end in `/`. The branch ref lock is added per call. */
@@ -612,14 +681,22 @@ export class GitCache {
   }
 
   /**
-   * issue #1597 M2 — is a git operation in progress in the runner clone? A pure `fs.stat` probe of
+   * issue #1597 M2 — is a git operation in progress in the runner clone? A metadata-only probe of
    * the clone's gitdir (no git child, no credentials): resolves the gitdir (a `.git` FILE carrying
    * `gitdir: <path>` is followed, relative to the clone), then looks for each marker in
    * {@link RUNNER_CLONE_BUSY_MARKERS} plus `refs/heads/<branch>.lock`. ANY observed marker is busy,
    * whatever its age — there is deliberately no staleness heuristic (an old `index.lock` may belong
-   * to a still-running agent git). A probe that cannot read the gitdir (EACCES, a malformed `.git`
-   * file, a missing clone) reports busy with the single marker `unreadable`, so a tick never
-   * fetches from a clone it could not inspect.
+   * to a still-running agent git). A probe that cannot read the gitdir (EACCES, a malformed or
+   * oversized `.git` file, a symlink/FIFO/socket where `.git` should be, a missing clone) reports
+   * busy with the single marker `unreadable`, so a tick never fetches from a clone it could not
+   * inspect.
+   *
+   * The clone is AGENT-CONTROLLED, so the probe must never block (review item 2): `.git` is opened
+   * ONCE with O_NOFOLLOW|O_NONBLOCK and classified by `fstat` on that fd (see readGitEntryNoBlock —
+   * no stat-then-open window), a gitfile is read through the same fd (at most
+   * {@link GITFILE_MAX_BYTES}), and every other check is an `lstat` (never opens, never follows the
+   * final symlink). A FIFO at `.git` therefore opens without waiting for a writer and is rejected,
+   * instead of parking a libuv thread forever.
    */
   async runnerCloneBusy(clonePath: string, branch: string): Promise<RunnerCloneBusy> {
     const unreadable = (err: unknown): RunnerCloneBusy => {
@@ -631,14 +708,14 @@ export class GitCache {
     };
     let gitdir = path.join(clonePath, ".git");
     try {
-      const st = await fs.stat(gitdir);
-      if (st.isFile()) {
-        const raw = (await fs.readFile(gitdir, "utf8")).trim();
-        const m = /^gitdir:\s*(.+)$/m.exec(raw);
+      const entry = await readGitEntryNoBlock(gitdir, GITFILE_MAX_BYTES);
+      if (entry.kind === "file") {
+        const m = /^gitdir:\s*(.+)$/m.exec(entry.text.trim());
         if (!m) return unreadable(new Error("malformed .git file"));
         gitdir = path.resolve(clonePath, m[1]!.trim());
-      } else if (!st.isDirectory()) {
-        return unreadable(new Error(".git is neither a file nor a directory"));
+        if (!(await fs.lstat(gitdir)).isDirectory()) return unreadable(new Error("gitfile target is not a directory"));
+      } else if (entry.kind !== "dir") {
+        return unreadable(new Error(".git is neither a regular file nor a directory"));
       }
     } catch (err) {
       return unreadable(err);
@@ -647,7 +724,7 @@ export class GitCache {
     const markers: string[] = [];
     for (const marker of candidates) {
       try {
-        await fs.stat(path.join(gitdir, marker));
+        await fs.lstat(path.join(gitdir, marker));
         markers.push(marker);
       } catch (err) {
         const code = (err as NodeJS.ErrnoException).code;
@@ -1922,25 +1999,244 @@ export class GitCache {
 
   /**
    * issue #1597 M2 — secret-scan a PINNED checkpoint range (`excludeSha..tipSha`) before a mid-run
-   * checkpoint publish, with the same credential-free core as the finalize {@link secretScanRange}
-   * (gitleaks' embedded default ruleset, all three silencers disabled, `--redact`, the report size
-   * cap and the {@link scanIsTrustworthy} liveness gate). Unlike finalize, the CALLER treats an
-   * untrusted scan as "do not publish" (a checkpoint has no GH013 backstop to fail open to). Zero
-   * commits in range is trusted-clean. A {@link CHECKPOINT_SCAN_TIMEOUT_MS} deadline applies outside
-   * a boundary scope (inside one, the scope's own signal bounds it — see the runner's tick).
+   * checkpoint publish. The CALLER treats anything but a trusted, finding-free result as "do not
+   * publish" (a checkpoint has no GH013 backstop to fail open to). Park/shutdown/pause/capture
+   * publishes are deliberately NOT scanned (they must not be blocked; see runner.ts).
+   *
+   * Same instrument discipline as the finalize {@link secretScanRange}: gitleaks' embedded default
+   * ruleset via an explicit config, the three silencers disabled (`--ignore-gitleaks-allow`, the
+   * bare has no working tree, and gitleaks runs from an EMPTY cwd so no `.gitleaksignore` is found),
+   * `--redact`, the report size cap, and the liveness gate. Differences, each load-bearing:
+   *  1. SIZE PRE-CHECK over the range's new objects (the CHECKPOINT_SCAN_MAX_* caps) → `scan_too_large`.
+   *  2. MERGES. `gitleaks git` walks `git log -p`, which neither diffs nor counts merge commits
+   *     (measured with v8.30: 3 commits in range incl. one merge → "2 commits scanned"). So the
+   *     expected count is `rev-list --no-merges --count`, and EACH merge's own contribution is
+   *     scanned separately: `git diff <M>^1 <M>` through `gitleaks stdin`. That diff is a superset of
+   *     an "evil merge" (content present in M but in neither parent): any line of M absent from its
+   *     first parent appears in it, and a line present in the first parent was introduced by a commit
+   *     that is either in range (scanned by git mode) or below the floor (already published). The
+   *     cost is re-scanning side-branch content, which can only add findings (fail-closed).
+   *  3. A DEADLINE shared by every child (`--timeout` for gitleaks, so the child ends itself even
+   *     inside a Codex permit where it cannot be killed individually; an exec timeout backstop).
+   * Zero commits and zero merges in range is trusted-clean. Never throws.
    */
   async secretScanCheckpointRange(
     barePath: string,
     range: CheckpointRange,
-  ): Promise<{ trusted: boolean; findings: SecretFinding[] }> {
-    if (!SHA40_RE.test(range.tipSha) || !SHA40_RE.test(range.excludeSha)) {
-      return { trusted: false, findings: [] };
+    opts: { deadlineMs?: number } = {},
+  ): Promise<CheckpointScanResult> {
+    const label = "checkpoint secret scan";
+    const untrusted = (reason: CheckpointScanUntrustedReason, fields: Record<string, unknown> = {}): CheckpointScanResult => {
+      this.log.warn(`${label}: untrusted, not publishing`, { barePath, reason, ...fields });
+      return { trusted: false, findings: [], reason };
+    };
+    if (!SHA40_RE.test(range.tipSha) || !SHA40_RE.test(range.excludeSha)) return untrusted("range_invalid");
+    const deadlineAt = Date.now() + (opts.deadlineMs ?? CHECKPOINT_SCAN_TIMEOUT_MS);
+    const remaining = (): number => deadlineAt - Date.now();
+    const logRange = `${range.excludeSha}..${range.tipSha}`;
+
+    // 1. Size pre-check (bounded buffers; any failure is untrusted).
+    const size = await this.checkpointRangeSize(barePath, logRange, remaining).catch((err: unknown) => ({
+      error: gitErrorMessage(err),
+    }));
+    if ("error" in size) return untrusted("count_failed", { error: size.error });
+    if (size.tooLarge) return untrusted("scan_too_large", size.stats);
+
+    // 2. What gitleaks git mode will walk, and the merges it will not.
+    let expectedCommits: number;
+    let merges: string[];
+    try {
+      const count = await this.execScoped("git", withDir(barePath, ["rev-list", "--no-merges", "--count", logRange]), {
+        env: gitEnv(),
+        timeout: Math.max(1, remaining()),
+      });
+      expectedCommits = Number.parseInt(count.stdout.trim(), 10);
+      const m = await this.execScoped("git", withDir(barePath, ["rev-list", "--merges", logRange]), {
+        env: gitEnv(),
+        timeout: Math.max(1, remaining()),
+      });
+      merges = m.stdout.split("\n").map((l) => l.trim()).filter(Boolean);
+    } catch (err) {
+      return untrusted("count_failed", { error: gitErrorMessage(err) });
     }
-    return this.scanLogRange(barePath, `${range.excludeSha}..${range.tipSha}`, {
-      label: "checkpoint secret scan",
-      timeoutMs: CHECKPOINT_SCAN_TIMEOUT_MS,
-      onUntrusted: "untrusted, not publishing",
-    });
+    if (Number.isNaN(expectedCommits) || merges.some((sha) => !SHA40_RE.test(sha))) return untrusted("count_failed");
+    if (merges.length > CHECKPOINT_SCAN_MAX_MERGES) return untrusted("too_many_merges", { merges: merges.length });
+    if (expectedCommits === 0 && merges.length === 0) return { trusted: true, findings: [] };
+
+    const scratch = await fs.mkdtemp(path.join(os.tmpdir(), "uzi-gl-ckpt-"));
+    try {
+      const configPath = path.join(scratch, "config.toml");
+      await fs.writeFile(configPath, "[extend]\nuseDefault = true\n", "utf8");
+      // An EMPTY cwd: gitleaks' default `--gitleaks-ignore-path .` then finds no .gitleaksignore.
+      const cwd = await fs.mkdtemp(path.join(scratch, "cwd-"));
+      const findings: SecretFinding[] = [];
+
+      if (expectedCommits > 0) {
+        const reportPath = path.join(scratch, "git.json");
+        const run = await this.runCheckpointGitleaks(
+          gitleaksArgs({ sourcePath: barePath, logRange, configPath, reportPath }),
+          { cwd, reportPath, remaining },
+        );
+        if (run.kind === "deadline") return untrusted("deadline");
+        if (run.kind === "unreadable") return untrusted("scan_untrusted", { mode: "git", why: run.why });
+        const scannedCommits = commitsScannedFromStderr(run.stderr);
+        if (!scanIsTrustworthy({ stderr: run.stderr, scannedCommits, expectedCommits, execOk: run.execOk }) || /\bskipp/i.test(run.stderr)) {
+          findings.push(...run.findings);
+          if (findings.length === 0) {
+            return untrusted("scan_untrusted", { mode: "git", expectedCommits, scannedCommits, execOk: run.execOk });
+          }
+          return { trusted: false, findings, reason: "scan_untrusted" };
+        }
+        findings.push(...run.findings);
+      }
+
+      for (const merge of merges) {
+        const res = await this.scanMergeContribution(barePath, merge, { configPath, cwd, scratch, remaining });
+        if (res.kind === "untrusted") {
+          if (findings.length > 0) return { trusted: false, findings, reason: res.reason };
+          return untrusted(res.reason, { merge });
+        }
+        findings.push(...res.findings);
+      }
+      this.log.debug(`${label} complete`, { barePath, expectedCommits, merges: merges.length, findings: findings.length });
+      return { trusted: true, findings };
+    } catch (err) {
+      return untrusted("scan_untrusted", { error: gitErrorMessage(err) });
+    } finally {
+      await fs.rm(scratch, { recursive: true, force: true }).catch(() => undefined);
+    }
+  }
+
+  /** issue #1597 M2 — the new-object size of a checkpoint range, against the CHECKPOINT_SCAN_MAX_*
+   *  caps. `rev-list --objects` lists the range's new objects; `cat-file --batch-check` sizes them.
+   *  Both outputs are bounded (an over-large listing is itself `tooLarge`). */
+  private async checkpointRangeSize(
+    barePath: string,
+    logRange: string,
+    remaining: () => number,
+  ): Promise<{ tooLarge: boolean; stats: Record<string, unknown> }> {
+    const listCap = CHECKPOINT_SCAN_MAX_OBJECTS * 42;
+    let list: string;
+    try {
+      list = (
+        await this.execScoped("git", withDir(barePath, ["rev-list", "--objects", "--no-object-names", logRange]), {
+          env: gitEnv(),
+          timeout: Math.max(1, remaining()),
+          maxBuffer: listCap,
+        })
+      ).stdout;
+    } catch (err) {
+      if (isOutputOverflow(err)) {
+        return { tooLarge: true, stats: { why: "object_listing_over_cap" } };
+      }
+      throw err;
+    }
+    const oids = list.split("\n").map((l) => l.trim()).filter(Boolean);
+    if (oids.length > CHECKPOINT_SCAN_MAX_OBJECTS) return { tooLarge: true, stats: { objects: oids.length } };
+    if (oids.length === 0) return { tooLarge: false, stats: { objects: 0 } };
+    const checked = await this.execScoped(
+      "git",
+      withDir(barePath, ["cat-file", "--batch-check=%(objecttype) %(objectsize)"]),
+      { env: gitEnv(), timeout: Math.max(1, remaining()), maxBuffer: oids.length * 32 + 1024, input: `${oids.join("\n")}\n` },
+    );
+    let total = 0;
+    let largest = 0;
+    for (const line of checked.stdout.split("\n")) {
+      const [type, sz] = line.trim().split(" ");
+      if (type !== "blob") continue;
+      const n = Number.parseInt(sz ?? "", 10);
+      if (!Number.isFinite(n)) throw new Error("unparseable cat-file size");
+      total += n;
+      if (n > largest) largest = n;
+    }
+    const stats = { objects: oids.length, blob_bytes: total, largest_blob: largest };
+    return {
+      tooLarge: largest > CHECKPOINT_SCAN_MAX_BLOB_BYTES || total > CHECKPOINT_SCAN_MAX_TOTAL_BYTES,
+      stats,
+    };
+  }
+
+  /** issue #1597 M2 — scan ONE merge commit's own contribution: `git diff <M>^1 <M>` (no external
+   *  diff / textconv drivers, byte-capped) through `gitleaks stdin`. See secretScanCheckpointRange
+   *  for why this covers an evil merge. Liveness: a clean exit, no error token, the `scanned` line. */
+  private async scanMergeContribution(
+    barePath: string,
+    merge: string,
+    ctx: { configPath: string; cwd: string; scratch: string; remaining: () => number },
+  ): Promise<{ kind: "ok"; findings: SecretFinding[] } | { kind: "untrusted"; reason: CheckpointScanUntrustedReason }> {
+    if (ctx.remaining() < 1_000) return { kind: "untrusted", reason: "deadline" };
+    let diff: string;
+    try {
+      diff = (
+        await this.execScoped(
+          "git",
+          withDir(barePath, ["diff", "--no-color", "--no-ext-diff", "--no-textconv", `${merge}^1`, merge]),
+          { env: gitEnv(), timeout: Math.max(1, ctx.remaining()), maxBuffer: CHECKPOINT_SCAN_MAX_MERGE_DIFF_BYTES },
+        )
+      ).stdout;
+    } catch (err) {
+      return { kind: "untrusted", reason: isOutputOverflow(err) ? "merge_diff_too_large" : "count_failed" };
+    }
+    const reportPath = path.join(ctx.scratch, `merge-${merge}.json`);
+    const run = await this.runCheckpointGitleaks(
+      gitleaksStdinArgs({ configPath: ctx.configPath, reportPath }),
+      { cwd: ctx.cwd, reportPath, remaining: ctx.remaining, input: diff },
+    );
+    if (run.kind === "deadline") return { kind: "untrusted", reason: "deadline" };
+    if (run.kind === "unreadable") return { kind: "untrusted", reason: "scan_untrusted" };
+    const live = run.execOk && !/\b(err|error|fatal)\b/i.test(run.stderr) && /\bscanned\b/i.test(run.stderr) && !/\bskipp/i.test(run.stderr);
+    const findings = run.findings.map((f) => ({ ...f, commit: merge }));
+    if (!live && findings.length === 0) return { kind: "untrusted", reason: "scan_untrusted" };
+    return { kind: "ok", findings };
+  }
+
+  /** issue #1597 M2 — one bounded gitleaks invocation for the checkpoint scan: `--timeout` from the
+   *  shared deadline (the child ends ITSELF — inside a Codex permit it cannot be killed alone), an
+   *  exec-timeout backstop, the report size cap. */
+  private async runCheckpointGitleaks(
+    args: string[],
+    ctx: { cwd: string; reportPath: string; remaining: () => number; input?: string },
+  ): Promise<
+    | { kind: "ran"; execOk: boolean; stderr: string; findings: SecretFinding[] }
+    | { kind: "deadline" }
+    | { kind: "unreadable"; why: string }
+  > {
+    const left = ctx.remaining();
+    if (left < 1_000) return { kind: "deadline" };
+    const timeoutSeconds = Math.max(1, Math.floor(left / 1_000));
+    const startedAt = Date.now();
+    let execOk = true;
+    let stderr = "";
+    try {
+      const res = await this.execScoped(this.gitleaksBin, [...args, "--timeout", String(timeoutSeconds)], {
+        env: gitEnv(),
+        cwd: ctx.cwd,
+        maxBuffer: GIT_MAX_BUFFER,
+        timeout: left + 2_000,
+        ...(ctx.input !== undefined ? { input: ctx.input } : {}),
+      });
+      stderr = res.stderr ?? "";
+    } catch (err) {
+      execOk = false;
+      stderr = typeof (err as { stderr?: unknown }).stderr === "string"
+        ? (err as { stderr: string }).stderr
+        : gitErrorMessage(err);
+    }
+    // A failed run that lasted its whole `--timeout` ended on the deadline (gitleaks' own
+    // "context deadline exceeded"), not on an instrument fault: name it so in the log.
+    if (!execOk && Date.now() - startedAt >= timeoutSeconds * 1_000 - 250) return { kind: "deadline" };
+    // gitleaks colours its log lines even when stderr is a pipe (`\x1b[31mERR\x1b[0m`,
+    // `\x1b[1mscanned …`), which defeats a word-boundary token match: strip ANSI SGR sequences
+    // before any liveness check reads the text.
+    // eslint-disable-next-line no-control-regex -- the ESC byte is exactly what is being matched
+    stderr = stderr.replace(/\x1b\[[0-9;]*m/g, "");
+    try {
+      const st = await fs.stat(ctx.reportPath);
+      if (st.size > SECRET_SCAN_REPORT_MAX_BYTES) return { kind: "unreadable", why: "report_over_cap" };
+      return { kind: "ran", execOk, stderr, findings: parseGitleaksReport(await fs.readFile(ctx.reportPath, "utf8")) };
+    } catch {
+      return { kind: "unreadable", why: execOk ? "report_unreadable" : "exec_failed" };
+    }
   }
 
   /**
@@ -3788,18 +4084,27 @@ export class GitCache {
   private async execScoped(
     command: string,
     args: string[],
-    options: { env: NodeJS.ProcessEnv; timeout?: number; maxBuffer?: number; cwd?: string },
+    options: { env: NodeJS.ProcessEnv; timeout?: number; maxBuffer?: number; cwd?: string; input?: string },
     identity: BoundaryProcessRequest["identity"] = "worker_pat",
   ): Promise<{ stdout: string; stderr: string }> {
     const boundary = this.boundaryProcesses.getStore();
+    const { input, ...execOptions } = options;
     if (!boundary) {
-      const result = await execFileAsync(command, args, options);
+      // issue #1597 M2: optional stdin (the checkpoint scan's cat-file / gitleaks stdin). An EPIPE on
+      // an early-exiting child is swallowed here; the exit status carries the failure.
+      const pending = execFileAsync(command, args, execOptions);
+      if (input !== undefined) {
+        pending.child.stdin?.on("error", () => undefined);
+        pending.child.stdin?.end(input);
+      }
+      const result = await pending;
       return { stdout: String(result.stdout), stderr: String(result.stderr) };
     }
     const cwd = options.cwd ?? (identity === "command" ? commandCwd(args) : "/");
     const executable = resolveBoundaryExecutable(command);
     const process = await boundary.spawn({ argv: [executable, ...args], cwd, env: options.env, identity });
-    process.stdin?.end();
+    process.stdin?.on("error", () => undefined);
+    process.stdin?.end(input);
     const cap = options.maxBuffer ?? GIT_MAX_BUFFER;
     const collect = (stream: Readable | null): Promise<{ chunks: Buffer[]; oversized: boolean }> =>
       new Promise((resolve, reject) => {
@@ -3950,6 +4255,9 @@ export class GitCache {
           process.stdout?.destroy(new Error(`git ${args.join(" ")} exited ${code}${detail ? `: ${detail}` : ""}`));
         }
       }, (error: unknown) => process.stdout?.destroy(error instanceof Error ? error : new Error(String(error))));
+      // A child that exits before reading its stdin (e.g. its repo vanished) must not surface an
+      // uncaught EPIPE; the exit status already destroys stdout with the failure.
+      process.stdin?.on("error", () => undefined);
       process.stdin?.end(stdin ?? "");
       return { stdout: process.stdout };
     }
@@ -3965,7 +4273,10 @@ export class GitCache {
         );
       }
     });
-    if (child.stdin) child.stdin.end(stdin ?? "");
+    if (child.stdin) {
+      child.stdin.on("error", () => undefined); // see the scoped branch above
+      child.stdin.end(stdin ?? "");
+    }
     return { child, stdout: child.stdout as Readable };
   }
 
@@ -4390,6 +4701,13 @@ export function httpScopeForUrl(rawUrl: string): string | undefined {
     // Not a URL (scp-style or local path) — no http scope.
   }
   return undefined;
+}
+
+/** issue #1597 M2: did a bounded exec fail because its output exceeded maxBuffer (execFile's code,
+ *  or execScoped's scoped-branch message)? */
+function isOutputOverflow(err: unknown): boolean {
+  const e = err as { code?: unknown; message?: unknown };
+  return e.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" || /output exceeded|maxBuffer/i.test(String(e.message ?? ""));
 }
 
 function gitErrorMessage(err: unknown): string {
