@@ -14,13 +14,16 @@ import (
 )
 
 // hopScript is one generation of a shell pid hopper: unless $D/stop exists or
-// the generation budget $N is spent, it starts the next generation in the
-// background (a NEW process: dash forks and execs sh), appends that child's
-// pid to $D/pids, and exits at once, so the live hopper's pid changes every
-// generation.
+// the generation budget $N is spent, it pauses $P seconds when $P is set (the
+// generation stays alive, so a whole scan can observe its pid), then starts
+// the next generation in the background (a NEW process: dash forks and execs
+// sh), appends that child's pid to $D/pids, and exits, so the live hopper's
+// pid changes every generation. The pause's sleep child is not a generation:
+// its comm is "sleep", so hopperRows never counts it.
 const hopScript = `[ -e "$D/stop" ] && exit 0
 N=$((N - 1)); export N
 [ "$N" -le 0 ] && exit 0
+[ -n "$P" ] && sleep "$P"
 sh -c "$S" </dev/null >/dev/null 2>&1 &
 echo $! >> "$D/pids"
 exit 0`
@@ -138,17 +141,18 @@ func (h hopperTable) hopperRows(all []procUserRow, idents map[int]hopperIdent, s
 	return out, nil
 }
 
-// A live same-uid pid hopper (fork a new process, exit at once, repeat) must
-// never leave the proof "held": a listed pid that vanishes before its status
-// is read invalidates the scan (the rescan rule), because the hopper's next
-// generation, created after the listing, is absent from it.
-func TestProveNoUserNeverHeldWhileAHopperLives(t *testing.T) {
+// startHopper starts a pid hopper whose generations each pause for pause
+// seconds ("" for none), stops it at cleanup, and waits until it has made 5
+// generations. It returns the table restricted to the hopper and a count of
+// its generations so far.
+func startHopper(t *testing.T, pause string) (hopperTable, func() int) {
+	t.Helper()
 	if _, err := (filteredTable{}).rows(); errors.Is(err, errProcHidden) {
 		t.Skip("the proc mount here hides processes")
 	}
 	dir := t.TempDir()
 	cmd := exec.Command("/bin/sh", "-c", hopScript)
-	cmd.Env = append(os.Environ(), "D="+dir, "N=200000", "S="+hopScript)
+	cmd.Env = append(os.Environ(), "D="+dir, "N=200000", "P="+pause, "S="+hopScript)
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -188,20 +192,29 @@ func TestProveNoUserNeverHeldWhileAHopperLives(t *testing.T) {
 			t.Fatalf("the hopper made %d generations in 30s", generations())
 		}
 	}
-	table := hopperTable{first: cmd.Process.Pid, dir: dir}
+	return hopperTable{first: cmd.Process.Pid, dir: dir}, generations
+}
+
+// A live same-uid pid hopper must never leave the proof "held": a listed pid
+// that vanishes before its status is read invalidates the scan (the rescan
+// rule), because the hopper's next generation, created after the listing, is
+// absent from it. Each generation here lives hopperPause before it hops, so a
+// live hopper pid spans whole scans and most proofs are DECIDED ("held" or
+// "user_alive"; an "unknown" one cannot show "held", so it proves nothing)
+// whatever the host's load; the fork rate no longer decides the count.
+func TestProveNoUserNeverHeldWhileAHopperLives(t *testing.T) {
+	const hopperPause = "0.1"
+	table, generations := startHopper(t, hopperPause)
 	uid := os.Geteuid()
 	counts := map[string]int{}
 	before := generations()
-	// At least minDecided DECIDED proofs ("held" or "user_alive": an
-	// "unknown" one cannot show "held", so it proves nothing), then more until
-	// one sees the hopper, all within budget. Every proof must not be "held".
-	// The budget is generous because the decided-proof rate is load-dependent:
-	// on a busy CI runner most proofs race a vanished pid and come back
-	// "unknown" (observed ~70:1), and the loop exits as soon as the minimum is met.
-	const minDecided, budget = 50, 60 * time.Second
+	// At least minDecided decided proofs, at least one seeing the hopper, and
+	// at least minHops generations during them, all within budget. Every
+	// proof must not be "held".
+	const minDecided, minHops, budget = 50, 3, 20 * time.Second
 	deadline := time.Now().Add(budget)
 	decided := func() int { return counts[proofHeld] + counts[proofUserAlive] }
-	for i := 0; (decided() < minDecided || counts[proofUserAlive] == 0) && time.Now().Before(deadline); i++ {
+	for i := 0; (decided() < minDecided || counts[proofUserAlive] == 0 || generations()-before < minHops) && time.Now().Before(deadline); i++ {
 		got := proveNoUser(table, uid, os.Getpid())
 		if got == proofHeld {
 			t.Fatalf("proof %d is held while the hopper lives (generation %d)", i, generations())
@@ -210,7 +223,7 @@ func TestProveNoUserNeverHeldWhileAHopperLives(t *testing.T) {
 	}
 	after := generations()
 	t.Logf("proofs: %v; generations during them: %d", counts, after-before)
-	if after-before < 2 {
+	if after-before < minHops {
 		t.Fatalf("the hopper did not hop during the proofs (%d generations)", after-before)
 	}
 	if decided() < minDecided {
@@ -219,4 +232,24 @@ func TestProveNoUserNeverHeldWhileAHopperLives(t *testing.T) {
 	if counts[proofUserAlive] == 0 {
 		t.Fatalf("no proof saw the hopper within %v: %v", budget, counts)
 	}
+}
+
+// The same property against a hopper that forks and exits at once: nearly
+// every scan then loses a listed pid, so "unknown" is the correct and usual
+// outcome, and how many proofs are decided depends on the host's load. Only
+// "never held" is asserted; an all-"unknown" window passes.
+func TestProveNoUserNeverHeldWhileAFastHopperLives(t *testing.T) {
+	table, generations := startHopper(t, "")
+	uid := os.Geteuid()
+	counts := map[string]int{}
+	before := generations()
+	const window = 3 * time.Second
+	for i, end := 0, time.Now().Add(window); time.Now().Before(end); i++ {
+		got := proveNoUser(table, uid, os.Getpid())
+		if got == proofHeld {
+			t.Fatalf("proof %d is held while the fast hopper lives (generation %d)", i, generations())
+		}
+		counts[got]++
+	}
+	t.Logf("proofs: %v; generations during them: %d", counts, generations()-before)
 }
