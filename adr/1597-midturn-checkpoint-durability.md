@@ -92,12 +92,14 @@ loss, while at least one publish sink (origin, through the broker) is reachable,
 therefore bounded at roughly `CHECKPOINT_INTERVAL` plus one tick interval — the tick that
 was about to publish, plus the interval it waited to notice work had moved. That bound is a
 best-effort opportunity, not a guarantee: sink reachability alone does not provide it. It
-holds only while the tick actually runs (the clone is not git-busy and the sink gate is
-free), the scan of the pinned range is trusted and finding-free, and the broker accepts the
+holds only while the tick actually runs (the clone is not git-busy, the sink gate is free,
+and no retained bare lock remains), the scan of the pinned range is trusted and finding-free, and the broker accepts the
 publish. A git-busy marker defers the tick for as long as it is present, whatever its age; a
-finding or an untrusted scan keeps the work on worker-local storage only; and a failed
-publish is retried at most once per `CHECKPOINT_INTERVAL`. In each of those cases the work
-is at risk from a worker-disk loss, and is never reported as durable.
+finding or an untrusted scan keeps that tick's work on worker-local storage (a later
+unscanned park/shutdown/pause/capture or GitHub milestone publish may still ship it, so this
+is not a containment guarantee); and the tick retries a failed publish at most once per
+`CHECKPOINT_INTERVAL`. In each of those cases the work is at risk from a worker-disk loss,
+and is never reported as durable.
 
 **There is no durability claim while every sink is down.** The tick's fetch-back into the
 worker's own bare is local disk, not a different failure domain from the worker itself; the
