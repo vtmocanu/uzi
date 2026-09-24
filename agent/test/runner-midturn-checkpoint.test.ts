@@ -1,4 +1,5 @@
 import { afterEach, describe, it } from "node:test";
+import { AsyncResource } from "node:async_hooks";
 import assert from "node:assert/strict";
 import { execFile, execFileSync, spawn } from "node:child_process";
 import { promisify } from "node:util";
@@ -157,10 +158,14 @@ function control(extraHooks: Partial<NonNullable<RunnerOptions["checkpointTestHo
       return () => clearTimeout(t);
     },
     setTickTimer: (cb, ms) => {
-      tickCb = cb;
+      // Like a real setTimeout, the callback runs in the async context that ARMED it (not the
+      // context of whoever calls fire()), so a tick armed inside a Codex permit is modelled
+      // faithfully (issue #1597, MR !1618 review).
+      const bound = AsyncResource.bind(cb);
+      tickCb = bound;
       tickDelay = ms;
       return () => {
-        if (tickCb === cb) {
+        if (tickCb === bound) {
           tickCb = undefined;
           tickDelay = undefined;
         }
@@ -1688,6 +1693,126 @@ describe("mid-turn checkpoint review follow-ups (issue #1597 M2)", () => {
       assert.ok(shimCalls(shim).length >= 1, "the scan ran — outside the permit");
     } finally {
       pub.restore();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("(r5) a tick KICKED from inside a Codex permit runs outside it: after the permit ended, its lock reconcile still retains a foreign bare lock", async () => {
+    const tmp = scratchDir("kickctx");
+    const shim = writeShim(tmp, "detect");
+    const g = mkGit(fx.dataDir, shim);
+    const bare = g.barePathFor(fx.originPath);
+    const foreignLock = path.join(bare, "packed-refs.lock");
+    // A SIGTERM-honouring stand-in for the tick's FIRST child — the clone `rev-parse` of the
+    // branch tip, which runs OUTSIDE any withLock section, so its lock custody happens only in
+    // the tick's post-body withBareLock reconcile (the call an inherited permit scope breaks).
+    // It dies on SIGTERM (never SIGKILLed), so a new lock is `foreign` without /proc evidence.
+    const sleeper = path.join(tmp, "sleeper.cjs");
+    fs.writeFileSync(sleeper, "setInterval(() => {}, 1000);\n");
+    let rewritten = false;
+    const ctl = control({
+      tickSpawn: {
+        rewrite: (r) => {
+          if (rewritten || !r.argv.includes("rev-parse") || !r.argv.some((a) => a.startsWith("refs/heads/"))) return r;
+          rewritten = true;
+          return { ...r, argv: [process.execPath, sleeper] };
+        },
+      },
+    });
+    const permitSignals: AbortSignal[] = [];
+    const safety: CodexExecutionSafety = {
+      kind: "codex",
+      withBoundary: async (req, action) => {
+        const ac = new AbortController();
+        permitSignals.push(ac.signal);
+        try {
+          return await action({ epoch: 1, boundary: req.boundary, signal: ac.signal } as unknown as BoundaryPermit);
+        } finally {
+          // The permit is over: its signal aborts (an expired permit), as anything still bound to
+          // it must no longer be able to take the bare lock.
+          ac.abort(new Error("permit ended"));
+        }
+      },
+      spawnBoundaryProcess: async (_permit, request) => {
+        const [command, ...args] = request.argv;
+        const child = spawn(command!, args, { cwd: request.cwd, env: request.env, stdio: ["pipe", "pipe", "pipe"] });
+        const completed = new Promise<{ code: number }>((resolve, reject) => {
+          child.once("error", reject);
+          child.once("exit", (code, sig) => resolve({ code: code ?? (sig ? 128 : 1) }));
+        });
+        return { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, completed };
+      },
+      dispose: async () => ({ kind: "disposed" }),
+    };
+    const pub = stubPublish(async (_n, _tip, pack) => {
+      await drain(pack);
+      return LANDED;
+    });
+    const { logger, lines: rawLines } = recordingLogger();
+    const lines = rawLines as Array<Record<string, unknown>>;
+    const claim = gitlabClaim(1597_261);
+    let kickDelay: number | undefined;
+    let tickOutcome = "";
+    let lockPresentAtReconcile = false;
+    try {
+      const factory: ExecutorFactory = () => ({
+        executor: {
+          run: async (ctx: RunContext) => {
+            await recordingTurnErrors(async () => {
+              commitIn(ctx.worktreePath, "R5.txt", "r5\n");
+              // The milestone defers its publish out of the permit and KICKS a tick from inside it.
+              await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] } });
+              kickDelay = ctl.armedDelay();
+              assert.ok(permitSignals.length >= 1 && permitSignals.every((s) => s.aborted), "every permit has ended");
+              // The kicked tick fires after the permit ended; hold it in its first (lock-free) child.
+              const outcome = ctl.fire();
+              await waitFor(() => rewritten && ctl.pids.length > 0);
+              // A SEPARATE process's lock appears while the child runs (absent at its spawn).
+              fs.writeFileSync(foreignLock, "", { flag: "wx" });
+              // A gated path preempts the tick: the child is SIGTERMed and exits.
+              await ctx.checkpoint!({ reap: false });
+              tickOutcome = await outcome;
+              lockPresentAtReconcile = fs.existsSync(foreignLock);
+              // The owner removes its lock so the run can finish normally.
+              fs.rmSync(foreignLock, { force: true });
+            });
+            return { branch: ctx.branch };
+          },
+          safety,
+        },
+      });
+      await mkRunner(g, factory, ctl, { codexBoundaryDeadlineMs: 5_000 }, logger).execute(claim);
+      assert.equal(kickDelay, 1_000, "the milestone kicked a tick");
+      assert.ok(
+        lines.some((l) => l.msg === "checkpoint publish deferred out of the Codex permit (scan_deferred)"),
+        "the milestone deferred its publish out of the permit",
+      );
+      assert.ok(lockPresentAtReconcile, "the foreign lock was never deleted");
+      assert.equal(
+        lines.find((l) => l.msg === "mid-turn checkpoint lock reconcile failed"),
+        undefined,
+        "the reconcile took the bare lock (it did not inherit the ended permit's scope)",
+      );
+      assert.equal(tickOutcome, "bare_lock_retained");
+      const warn = lines.find((l) => l.msg === "mid-turn checkpoint retained a git lock file in the worker bare") as
+        | { retained?: Array<Record<string, unknown>> }
+        | undefined;
+      const ev = warn?.retained?.find((r) => String(r.path).endsWith("packed-refs.lock"));
+      assert.ok(ev, JSON.stringify(warn));
+      assert.equal(ev.reason, "foreign");
+      assert.equal(finalStatus(claim.run_id), "completed");
+    } finally {
+      pub.restore();
+      // Never leave the (detached) stand-in child behind a failed assertion.
+      for (const pid of ctl.pids) {
+        try {
+          process.kill(-pid, "SIGKILL");
+        } catch {
+          /* already gone */
+        }
+      }
+      await waitFor(() => ctl.pids.every((pid) => !isAlive(pid)));
+      fs.rmSync(foreignLock, { force: true });
       fs.rmSync(tmp, { recursive: true, force: true });
     }
   });

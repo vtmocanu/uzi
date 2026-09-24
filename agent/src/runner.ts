@@ -1,3 +1,4 @@
+import { AsyncResource } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -7245,7 +7246,7 @@ export class RunRunner {
     const fire = (): void => {
       cancelTimer = undefined;
       if (stopped) return;
-      cancelTimer = this.setTickTimer(fire, this.checkpointTickIntervalMs);
+      cancelTimer = this.setTickTimer(armedFire, this.checkpointTickIntervalMs);
       if (inFlight) {
         runLog.info("mid-turn checkpoint tick skipped: the previous tick is still running", { run_id: runId });
         return;
@@ -7281,12 +7282,19 @@ export class RunRunner {
       })();
       inFlight = current;
     };
-    cancelTimer = this.setTickTimer(fire, this.checkpointTickIntervalMs);
+    // issue #1597 M2 (MR !1618 review): every arm uses `fire` BOUND to this (permit-free) async
+    // context. A real timer runs its callback in the context that ARMED it, and the kick below is
+    // armed from inside a Codex permit (the scan_deferred milestone), so an unbound tick would run
+    // under that permit's GitCache boundary scope and SinkGate hold: once the permit has ended its
+    // aborted signal makes the tick's withBareLock reject before acquiring, and a retained lock
+    // would be missed by the reconcile.
+    const armedFire = AsyncResource.bind(fire);
+    cancelTimer = this.setTickTimer(armedFire, this.checkpointTickIntervalMs);
     // issue #1597 M2 (round 3): a deferred publish asks for a tick SOON (re-arms the timer).
     flight.kickMidTurnTick = () => {
       if (stopped) return;
       cancelTimer?.();
-      cancelTimer = this.setTickTimer(fire, MIDTURN_KICK_DELAY_MS);
+      cancelTimer = this.setTickTimer(armedFire, MIDTURN_KICK_DELAY_MS);
     };
 
     return {
