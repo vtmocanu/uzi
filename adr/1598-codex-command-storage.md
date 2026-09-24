@@ -24,8 +24,8 @@ used `os.RemoveAll`, which cannot delete a Go module cache's read-only (mode
 that failure as its own error; the call sites discarded it (`defer
 os.RemoveAll(tmp)` in cmdsandbox, `_ = os.RemoveAll(...)` in the supervisor, at
 the fork point f77d3103), so the tree was silently retained regardless.
-Measured impact: 22 GB accumulated in `/tmp` on a single worker, two worker pod
-evictions traced to it. Fixing the leak, and giving Codex commands a real cache
+Measured impact: two worker pods were evicted (about 26 GB of writable layer
+each), and a live worker measured afterwards held 22 GB in `/tmp`. Fixing the leak, and giving Codex commands a real cache
 instead of re-downloading every time, are the same issue because both live at
 the same boundary: what a command's `HOME`/`TMPDIR`/`GOMODCACHE` point at, and
 who is responsible for removing it.
@@ -42,8 +42,9 @@ delete what this issue produces:
   race after the caller pinned the directory cannot redirect the removal),
   pins the root's device/inode, and checks the **owner** of every entry it
   descends into. A mismatched device/inode, a foreign owner, an unexpected
-  name, or an I/O error each retain the tree and report why, rather than
-  partially deleting it or guessing.
+  name, or an I/O error each stop at the first failure and report why; what
+  was already removed stays removed and the rest is retained, so a later
+  retry resumes and converges.
 - It streams entries per `getdents` chunk instead of loading a whole directory
   listing into memory, and hoists deep subdirectories up to be processed from
   the root, so removal is not bounded by depth or by how large any one
@@ -51,15 +52,16 @@ delete what this issue produces:
 - On the already-verified, owner-checked inode it may add the missing owner
   rwx bits (e.g. 0555 becomes 0755) so it can traverse and unlink a Go module
   cache's read-only directories as their owner — the chmod goes through the
-  inode's own `/proc/self/fd/N` magic link (`addOwnerBits`), never a
-  pathname, and is re-verified against the same dev/ino/mode afterward. This
-  is what `os.RemoveAll` cannot do as the owner of a directory it made
-  read-only.
+  inode's own `/proc/self/fd/N` magic link (`addOwnerBits`), never the
+  entry's own pathname (a lookup of the fd's `/proc/self/fd/N` link,
+  re-verified afterwards), and is re-verified against the same dev/ino/mode
+  afterward. This is what `os.RemoveAll` cannot do as the owner of a
+  directory it made read-only.
 - Removal is bounded by a caller-supplied deadline; hitting it stops the walk
   at the first failure and keeps whatever has not yet been removed — what the
   walk already removed stays removed, nothing is rolled back — reporting
-  "deadline" so a retry converges rather than leaving the tree in an
-  inconsistent half-state or blocking forever.
+  "deadline" so a retry converges rather than blocking forever: the tree may
+  be left partly removed; a later RemoveBy resumes and converges.
 
 ### Cleanup belongs to the supervisor, not cmdsandbox
 
@@ -89,11 +91,14 @@ ECHILD+`__WALL` drain proof for its unrelated core responsibility (confirming
 the tracked tree is empty before reporting `dispose`), so ownership of "is it
 safe to delete this tmp yet" falls out of a fact the supervisor already knows
 and cmdsandbox does not. cmdsandbox therefore only **adopts** the tmp the
-supervisor already created — it never creates or removes it. This also keeps
-the trust anchor (root-owned 0555, immutable) as the one component with
-delete authority over a directory that a same-uid command process wrote into,
-rather than granting a peer of that command process removal rights over
-another peer's directory.
+supervisor already created — it never creates or removes it. Every uid-10003
+process, including any command process, can already remove the directory it
+runs as; the supervisor instead holds removal RESPONSIBILITY, not exclusive
+authority: it is the only process that knows the pin, holds the liveness
+lock, and outlives every descendant, so it — rather than a peer of the
+command process it supervises — is the one that decides when removal is
+safe. ("Root-owned 0555" describes the supervisor binary itself, not the
+directory it removes.)
 
 Stray file descriptors inherited into the supervisor are marked
 close-on-exec (`close_range`, falling back to enumerating `/proc/self/fd`)
@@ -185,8 +190,9 @@ cache without a broader filesystem grant than that one directory.
 
 The cache is released at the terminal registry teardown, gated on a **drained
 attestation** from the worker: the holder removes its directory only when told
-`{"op":"release","drained":true}` with no prior `drained:false` seen (sticky:
-once a `false` arrives, a later `true` cannot undo it). If the holder dies
+`{"op":"release","drained":true}` with no `drained:false` at all before EOF;
+removal happens at EOF (sticky: once a `false` arrives, a later `true` cannot
+undo it). If the holder dies
 mid-run, later commands in that run simply get no cache (never a crash — the
 absence just means no cache reuse for the rest of that run), and
 `--remove-cache` — which trusts the worker's own attestation that every
@@ -199,10 +205,10 @@ drained.
 **This is a storage and performance boundary, not a trust boundary.** Every
 command root for a given run shares uid 10003; the cache does not add
 isolation between commands that did not already exist (or not exist) between
-them. In `required` Landlock mode the exact-directory grant does isolate one
-run's cache directory from another's at the filesystem-access level; in
-`best-effort` mode (no Landlock available) there is no such isolation, and the
-cache must be treated as **untrusted**: no secret is ever written there, its
+them. In `required` mode, or in `best-effort` mode on a kernel that offers Landlock,
+the exact-directory grant isolates one run's cache from another's; only when
+Landlock is unavailable (the best-effort degrade) is there no such isolation,
+and the cache must be treated as **untrusted**: no secret is ever written there, its
 contents are never reused across runs (each run gets a fresh random uuid
 directory and it is torn down at that run's end), and nothing that comes out
 of it is treated as trusted output — it is disposable build-tool cache
@@ -235,12 +241,14 @@ volume and mount unconditionally (the same rendered pod shape for every
 worker, split or not, so enabling the uid split later never forks the spec on
 this axis) — this changes every hosted worker's pod spec hash, so every hosted
 worker pod rolls exactly once on this change, gated the same way every other
-worker roll is: cordoned and drained before `Recreate`, bounded by a 24h drain
-deadline past which the controller rolls a busy worker anyway (requeueing its
-runs), or immediately on a force-roll (see ADR-422). Compose needs no
+worker roll is: an idle worker rolls straight away, while a busy worker is
+cordoned and drained before `Recreate`, up to the configurable
+`workers.drainDeadline` (24h by default) or a force-roll, either of which
+requeues its runs (see ADR-422). Compose needs no
 configuration change: with the uid split its per-run cache lives in the
-container layer and is removed per run, so there is no analogous emptyDir
-concept to add.
+container layer, removed when the run's command roots all drained;
+otherwise it is kept until the next container start's reaper, so there is
+no analogous emptyDir concept to add.
 
 ## Consequences and residuals
 

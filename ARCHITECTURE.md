@@ -1632,8 +1632,8 @@ drain; a startup orphan reaper (`--reap-orphans`) sweeps anything a crash or an
 unconfirmed drain left behind, gated on a kernel process-table proof that fails
 closed. The cache is a storage/performance boundary, not a trust boundary — see
 [ADR-1598](adr/1598-codex-command-storage.md) for the full mechanism, the
-supersession of `specs/ai.md`'s "only remaining emptyDir" sentence now that a
-worker pod has a second one, and the pending hosted-worker ephemeral-request
+supersession of `specs/ai.md`'s "only remaining emptyDir" sentence (in
+addition to any emptyDirs the docker lane adds), and the pending hosted-worker ephemeral-request
 measurement, which is issue #1598's own post-deploy check (issue #225 is
 unrelated node image accumulation).
 

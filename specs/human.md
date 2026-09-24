@@ -865,7 +865,7 @@ Tracked as GitHub issue vtmocanu/uzi#1593.
 
 Tracked as GitHub issue vtmocanu/uzi#1598.
 
-- (AI-synced 2026-09-24) A Codex model-authorized command's per-command tmp still lives in `/tmp` while the command runs, and a run's per-run Codex build/module cache lives in a worker-only emptyDir; but both are now removed (fail-closed and fd-safe: a dedicated no-follow tree-removal primitive, not `os.RemoveAll`) after the command drains or at run end, with leftovers reaped at worker startup (gated on a kernel process-table proof rather than an unlocked-name guess), so neither accumulates the way it used to. The cache is a storage/performance boundary only, never a trust boundary. The hosted-worker measurement needed to raise the worker ephemeral-storage requests for it is pending, not delivered by this issue.
+- (AI-synced 2026-09-24) A Codex model-authorized command's per-command tmp still lives in `/tmp` while the command runs, and a run's per-run Codex build/module cache lives on k8s in a worker-only emptyDir, on compose in the container layer; but both are now removed (fail-closed and fd-safe: a dedicated no-follow tree-removal primitive, not `os.RemoveAll`) after the command drains or at run end, with leftovers reaped at worker startup (gated on a kernel process-table proof rather than an unlocked-name guess), so neither accumulates the way it used to. The cache is a storage/performance boundary only, never a trust boundary. The hosted-worker measurement needed to raise the worker ephemeral-storage requests for it is pending, not delivered by this issue.
 
 ## Startup admin seed
 
