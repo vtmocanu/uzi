@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"path"
+	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -39,8 +40,9 @@ type tmpCleanupResult struct {
 
 // commandTmp is the supervisor-owned per-command scratch directory. The
 // supervisor creates it before fork, holds an exclusive flock on dirFd for its
-// whole lifetime (the liveness signal the startup orphan reaper, --reap-orphans,
-// tests), and removes it only after a confirmed drain. parentFd and dirFd are
+// whole lifetime (the liveness signal for the startup orphan reaper, supervisor
+// --reap-orphans, added with the reaper), and removes it only after a confirmed
+// drain. parentFd and dirFd are
 // close-on-exec, so the child never inherits either; neither is closed before
 // process exit.
 type commandTmp struct {
@@ -48,14 +50,14 @@ type commandTmp struct {
 	name     string
 	dirFd    int
 	pin      safetree.Pin
-	remove   func(parentFd int, name string, pin safetree.Pin) error
+	remove   func(parentFd int, name string, pin safetree.Pin, deadline time.Time) error
 }
 
-// cleanup removes the tree through the pinned identity. Any error, including
-// safetree.ErrNotExist (the pinned directory vanishing is not success), is
-// "retained" with its fixed reason.
-func (c *commandTmp) cleanup() *tmpCleanupResult {
-	if err := c.remove(c.parentFd, c.name, c.pin); err != nil {
+// cleanup removes the tree through the pinned identity, giving up at deadline.
+// Any error, including safetree.ErrNotExist (the pinned directory vanishing is
+// not success) and safetree.ErrDeadline, is "retained" with its fixed reason.
+func (c *commandTmp) cleanup(deadline time.Time) *tmpCleanupResult {
+	if err := c.remove(c.parentFd, c.name, c.pin, deadline); err != nil {
 		return &tmpCleanupResult{State: tmpCleanupRetained, Reason: safetree.Reason(err)}
 	}
 	return &tmpCleanupResult{State: tmpCleanupRemoved}
@@ -92,7 +94,8 @@ func openCommandTmpIn(parentDir, token string, uid int) (*commandTmp, error) {
 // (AT_SYMLINK_NOFOLLOW) that the name still names the pinned dev/ino, which
 // closes the window between the mkdir and the lock. On failure it closes the
 // directory fd (dropping the lock) and leaves the directory for the startup
-// orphan reaper (--reap-orphans): nothing is removed here.
+// orphan reaper (supervisor --reap-orphans, added with the reaper): nothing is
+// removed here.
 func createCommandTmp(parentFd int, name string, uid int) (*commandTmp, error) {
 	dirFd, pin, err := safetree.Create(parentFd, name, uid)
 	if err != nil {
@@ -114,7 +117,7 @@ func createCommandTmp(parentFd int, name string, uid int) (*commandTmp, error) {
 		_ = unix.Close(dirFd)
 		return nil, errTmpRecheck
 	}
-	return &commandTmp{parentFd: parentFd, name: name, dirFd: dirFd, pin: pin, remove: safetree.Remove}, nil
+	return &commandTmp{parentFd: parentFd, name: name, dirFd: dirFd, pin: pin, remove: safetree.RemoveBy}, nil
 }
 
 // tmpSetup is the pre-fork command tmp setup seam.
@@ -124,8 +127,8 @@ type tmpSetup func(token string, uid int) (*commandTmp, error)
 // given) and then launches the child. Any setup failure emits the pre-fork
 // abnormal "command tmp setup failed" and returns ok == false WITHOUT calling
 // launch. A launch failure emits "child launch failed"; the tmp is then left
-// for the startup orphan reaper (--reap-orphans), because cleanup runs only
-// after a confirmed drain.
+// for the startup orphan reaper (supervisor --reap-orphans, added with the
+// reaper), because cleanup runs only after a confirmed drain.
 func setupAndLaunch(ev *evidence, token string, uid int, setup tmpSetup, launch func([]string) (int, error), argv []string) (*commandTmp, int, bool) {
 	var ct *commandTmp
 	if token != "" {
@@ -147,7 +150,7 @@ func setupAndLaunch(ev *evidence, token string, uid int, setup tmpSetup, launch 
 // tmpCleanupFor returns ct's cleanup as a supervisor seam, or nil when there
 // is no command tmp (no token): a nil seam means the evidence carries no
 // tmpCleanup field.
-func tmpCleanupFor(ct *commandTmp) func() *tmpCleanupResult {
+func tmpCleanupFor(ct *commandTmp) func(deadline time.Time) *tmpCleanupResult {
 	if ct == nil {
 		return nil
 	}

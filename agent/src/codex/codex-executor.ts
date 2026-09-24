@@ -2633,7 +2633,8 @@ interface RegisteredEffectRoot {
  *  private tmp: on a clean disposal (the drained dispose's tmpCleanup) and on an
  *  unclean one (the tmpCleanup of an abnormal event whose cleanup drained, or of a
  *  drained dispose the exit then contradicted). Diagnostic only: a retained tmp is
- *  disk left behind for the startup orphan reaper (--reap-orphans), so the
+ *  disk left behind for the startup orphan reaper (supervisor --reap-orphans,
+ *  added with the reaper), so the
  *  reap/dispose result is unchanged. */
 function makeTmpRetainedReporter(log: Pick<Logger, "warn"> | undefined): (outcome: DisposeOutcome) => void {
   let reported = false;

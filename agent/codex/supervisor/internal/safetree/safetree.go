@@ -48,14 +48,14 @@
 // non-directory is removed with unlinkat, which never follows. An entry that
 // vanished after getdents listed it (ENOENT on its fstatat, or on the unlinkat
 // of a non-directory) is skipped: nothing was followed and nothing is left. The
-// first mismatch, foreign owner, exhausted op budget or other syscall error
-// aborts the whole walk and retains whatever remains: nothing continues to
-// siblings.
+// first mismatch, foreign owner, expired deadline or other syscall error aborts
+// the whole walk and retains whatever remains: nothing continues to siblings.
 //
 // # Any size, any depth, bounded fds and memory
 //
-// A tree of any size and depth owned entirely by the pinned uid is removable;
-// the bounds below cap resources, they never decide retention of such a tree.
+// A tree owned entirely by the pinned uid is always removable given enough
+// time: no bound below decides retention of such a tree; they cap fds and
+// memory only.
 //
 // Streaming. A directory's names are never buffered as a whole. Each pass
 // seeks the directory fd to offset 0 and reads getdents chunks into one buffer
@@ -63,12 +63,15 @@
 // it processes that chunk's entries (each one leaves the directory: removed,
 // hoisted, or found already gone), then starts the next pass. A pass that
 // reaches the end of the directory without such an entry means it is empty.
-// Memory is therefore one buffer per open directory level.
+// Memory is therefore one buffer, and the names of one chunk, per open
+// directory level.
 //
-// Hoisting. The walk holds at most maxFdDepth+1 directory fds at once. A
-// subdirectory met at depth maxFdDepth is not descended into: after the same
-// O_PATH identity/owner check (and owner-bit restore, since moving a directory
-// to a new parent needs write permission on it) it is moved with
+// Hoisting. The walk keeps at most maxFdDepth+1 directory fds open (depths 0
+// through maxFdDepth) plus one transient O_PATH fd while it verifies the next
+// entry, so maxFdDepth+2 fds at the peak. A subdirectory met at depth
+// maxFdDepth is not descended into: after the same O_PATH identity/owner check
+// (and owner-bit restore, since moving a directory to a new parent needs write
+// permission on it) it is moved with
 // renameat2(curDirFd, name, rootFd, ".safetree-hoist-<n>", RENAME_NOREPLACE)
 // into the pinned root, retrying the next n on EEXIST. Both dirfds are
 // verified fds, so the rename resolves no path outside the verified tree, and
@@ -79,15 +82,16 @@
 // meets the hoisted directory at depth 1 and removes it like any other entry.
 // Each hoist moves a subtree strictly closer to the root, so the walk ends.
 //
-// Op budget. Every pass, every entry processed and every hoist attempt costs
-// one op from a per-Remove budget (maxOps); past it Remove returns ErrBound and
-// retains the rest. The budget bounds wall time only, not fds or memory. A
-// finite tree with no concurrent writer never reaches it; exhausting it takes a
-// live same-uid writer that keeps adding entries, and retention is the right
-// answer then.
+// Deadline. RemoveBy takes the caller's deadline (Remove has none) and checks
+// it at every pass, every entry and every hoist attempt; past it the walk stops
+// with ErrDeadline. Everything already removed or hoisted stays that way, so a
+// later RemoveBy of the same pin resumes from what is left and converges. The
+// one case that does not converge on its own, a live same-uid writer adding
+// entries faster than the walk removes them, ends at the deadline.
 //
-// Retention therefore happens only on an identity mismatch, a foreign owner,
-// an I/O error, or the op budget being exhausted by a live concurrent writer.
+// Retention therefore happens only on an identity mismatch (ErrMismatch), a
+// foreign owner (ErrOwner), an I/O error (ErrIO), an invalid name (ErrName), or
+// the caller's deadline expiring (ErrDeadline).
 //
 // Create never chmods a directory before it has proven it made it. It opens
 // the name it just mkdirat'ed with the same two steps but restores no bits: a
@@ -124,6 +128,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -136,9 +141,9 @@ var (
 	ErrMismatch = errors.New("safetree: identity mismatch")
 	// ErrOwner: an object is not owned by the pinned uid.
 	ErrOwner = errors.New("safetree: foreign owner")
-	// ErrBound: the walk exhausted its op budget (maxOps), which bounds wall
-	// time; a finite tree without a live concurrent writer never reaches it.
-	ErrBound = errors.New("safetree: bound exceeded")
+	// ErrDeadline: RemoveBy's deadline passed before the tree was gone. The
+	// progress made is kept, so a later retry converges.
+	ErrDeadline = errors.New("safetree: deadline")
 	// ErrIO: a syscall failed; the underlying errno is wrapped.
 	ErrIO = errors.New("safetree: io")
 	// ErrNotExist: Remove's first O_PATH open of the root found no entry. An
@@ -151,12 +156,10 @@ var (
 
 // Walk bounds. Package vars so tests can lower them. maxFdDepth caps the
 // directory fds held at once (deeper subdirectories are hoisted, not refused);
-// maxOps caps the passes, entries and hoist attempts of one Remove, and bounds
-// wall time only; direntBufSize is the one getdents buffer each open directory
-// level streams through (never below minDirentBufSize).
+// direntBufSize is the one getdents buffer each open directory level streams
+// through (never below minDirentBufSize).
 var (
 	maxFdDepth    = 64
-	maxOps        = 50_000_000
 	direntBufSize = getdentsBufSize
 )
 
@@ -184,7 +187,9 @@ const (
 // opens, after any owner-bit restore; hookAfterHoist runs after a hoist's
 // renameat2 and before its identity check. fstatat is the lstat used for every entry
 // and for the root re-check; fstat is used on every opened fd. procFdPrefix is
-// the magic-link directory the owner-bit restore chmods through.
+// the magic-link directory the owner-bit restore chmods through. now is the
+// clock RemoveBy's deadline is checked against; getdents is the Remove walk's
+// directory read.
 var (
 	hookBetweenStatAndOpen        func(dirfd int, name string)
 	hookBeforeRootRecheck         func(parentFd int, name string)
@@ -194,6 +199,8 @@ var (
 	fstatat                       = unix.Fstatat
 	fstat                         = unix.Fstat
 	procFdPrefix                  = "/proc/self/fd/"
+	now                           = time.Now
+	getdents                      = unix.Getdents
 )
 
 // Pin is the identity a tree root must still have when it is removed.
@@ -217,8 +224,8 @@ func Reason(err error) string {
 		return "mismatch"
 	case errors.Is(err, ErrOwner):
 		return "owner"
-	case errors.Is(err, ErrBound):
-		return "bound"
+	case errors.Is(err, ErrDeadline):
+		return "deadline"
 	default:
 		return "io"
 	}
@@ -441,11 +448,18 @@ func requireFresh(fd int) error {
 	return nil
 }
 
-// Remove deletes the tree name under parentFd, provided its root still matches
-// pin. A tree of any depth and size owned by pin.UID is removable. It fails
-// closed on the first mismatch, foreign owner, exhausted op budget or syscall
-// error, and retains whatever remains.
+// Remove is RemoveBy with no deadline.
 func Remove(parentFd int, name string, pin Pin) error {
+	return RemoveBy(parentFd, name, pin, time.Time{})
+}
+
+// RemoveBy deletes the tree name under parentFd, provided its root still
+// matches pin. A tree of any depth and size owned by pin.UID is removable given
+// enough time. It fails closed on the first mismatch, foreign owner or syscall
+// error, and stops with ErrDeadline once deadline has passed (the zero deadline
+// means none); either way it retains whatever remains, and what it already
+// removed stays removed.
+func RemoveBy(parentFd int, name string, pin Pin, deadline time.Time) error {
 	if !validName(name) {
 		return ErrName
 	}
@@ -454,7 +468,7 @@ func Remove(parentFd int, name string, pin Pin) error {
 		return err
 	}
 
-	w := &walker{uid: pin.UID, dev: pin.Dev, rootFd: fd}
+	w := &walker{uid: pin.UID, dev: pin.Dev, rootFd: fd, deadline: deadline}
 	err = w.emptyDir(fd, 0)
 	_ = unix.Close(fd)
 	if err != nil {
@@ -490,18 +504,17 @@ func Remove(parentFd int, name string, pin Pin) error {
 }
 
 type walker struct {
-	uid    int
-	dev    uint64
-	rootFd int    // the pinned, verified root: the hoist destination
-	ops    int    // spent from maxOps
-	hoists uint64 // next hoist name suffix
+	uid      int
+	dev      uint64
+	rootFd   int       // the pinned, verified root: the hoist destination
+	deadline time.Time // zero: none
+	hoists   uint64    // next hoist name suffix
 }
 
-// spend charges one op to the per-Remove budget.
-func (w *walker) spend() error {
-	w.ops++
-	if w.ops > maxOps {
-		return ErrBound
+// checkDeadline returns ErrDeadline once the walk's deadline has passed.
+func (w *walker) checkDeadline() error {
+	if !w.deadline.IsZero() && !now().Before(w.deadline) {
+		return ErrDeadline
 	}
 	return nil
 }
@@ -514,14 +527,14 @@ func (w *walker) emptyDir(fd int, depth int) error {
 	buf := make([]byte, max(direntBufSize, minDirentBufSize))
 	var names []string
 	for {
-		if err := w.spend(); err != nil {
+		if err := w.checkDeadline(); err != nil {
 			return err
 		}
 		if _, err := unix.Seek(fd, 0, unix.SEEK_SET); err != nil {
 			return ioErr("seek", err)
 		}
 		for processed := false; !processed; {
-			n, err := unix.Getdents(fd, buf)
+			n, err := getdents(fd, buf)
 			if err != nil {
 				if errors.Is(err, unix.EINTR) {
 					continue
@@ -532,12 +545,10 @@ func (w *walker) emptyDir(fd int, depth int) error {
 				return nil
 			}
 			_, _, names = unix.ParseDirent(buf[:n], -1, names[:0])
+			// ParseDirent already drops "." and "..".
 			for _, name := range names {
-				if name == "." || name == ".." {
-					continue
-				}
 				processed = true
-				if err := w.spend(); err != nil {
+				if err := w.checkDeadline(); err != nil {
 					return err
 				}
 				if err := w.removeEntry(fd, name, depth); err != nil {
@@ -611,7 +622,7 @@ func (w *walker) hoist(dirfd int, name string, want ident) error {
 
 	var hoistName string
 	for {
-		if err := w.spend(); err != nil {
+		if err := w.checkDeadline(); err != nil {
 			return err
 		}
 		hoistName = hoistPrefix + strconv.FormatUint(w.hoists, 10)

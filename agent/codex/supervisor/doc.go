@@ -34,11 +34,13 @@
 //
 // The optional tmpCleanup field is {"state":"removed"|"retained","reason":"<word>"},
 // where reason is "" when removed and otherwise one of the fixed words
-// "mismatch", "owner", "bound", "io", "absent" or "name" (never a path or errno
-// text). It appears only when a --cleanup-token was given, and then only on
+// "mismatch", "owner", "deadline", "io", "absent" or "name" (never a path or
+// errno text). It appears only when a --cleanup-token was given, and then only on
 // the first event whose drain reached "drained": a drained dispose, or an
 // abnormal event whose best-effort cleanup drained. "retained" leaves the tree
-// on disk; "absent" means the pinned directory was gone, which is not success.
+// on disk; "absent" means the pinned directory was gone, which is not success;
+// "deadline" means the removal ran out of the drain's op deadline (less a small
+// margin for the reply) and kept its partial progress.
 // The cleanup outcome never changes the exit code.
 //
 // ARGV (trusted, caller-supplied, NEVER model-controlled):
@@ -60,8 +62,9 @@
 // entrypoint's controller-only SETUID/SETGID before the unchanged zero-cap check.
 //
 // DESCRIPTORS: before opening anything, the supervisor marks every fd from 5
-// upward close-on-exec (close_range, or a per-fd fallback below 1024 when
-// close_range fails), so the child inherits only stdio 0/1/2 even when the
+// upward close-on-exec (close_range; when that fails, each fd /proc/self/fd
+// lists; when that fails too, each fd below the RLIMIT_NOFILE soft limit, capped
+// at 1<<20), so the child inherits only stdio 0/1/2 even when the
 // supervisor itself inherited a stray fd; a failure is the pre-fork abnormal
 // "fd hygiene failed".
 //

@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -218,11 +219,44 @@ func setForeignOwner(t *testing.T, victim string) {
 	t.Cleanup(func() { fstatat = prev })
 }
 
-func setBounds(t *testing.T, fdDepth, ops int) {
+func setFdDepth(t *testing.T, fdDepth int) {
 	t.Helper()
-	pd, po := maxFdDepth, maxOps
-	maxFdDepth, maxOps = fdDepth, ops
-	t.Cleanup(func() { maxFdDepth, maxOps = pd, po })
+	prev := maxFdDepth
+	maxFdDepth = fdDepth
+	t.Cleanup(func() { maxFdDepth = prev })
+}
+
+// setTickingClock replaces the clock seam with one that advances 1ms per read,
+// starting at the Unix epoch, and returns a pointer to its read count.
+func setTickingClock(t *testing.T) *int {
+	t.Helper()
+	prev := now
+	reads := 0
+	now = func() time.Time {
+		reads++
+		return time.Unix(0, 0).Add(time.Duration(reads) * time.Millisecond)
+	}
+	t.Cleanup(func() { now = prev })
+	return &reads
+}
+
+// countEntries counts every entry under root (not following symlinks).
+func countEntries(t *testing.T, root string) int {
+	t.Helper()
+	n := 0
+	err := filepath.WalkDir(root, func(p string, _ fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if p != root {
+			n++
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk %s: %v", root, err)
+	}
+	return n
 }
 
 // swapHook fires once, on the entry named target: it renames the verified dir
@@ -484,41 +518,95 @@ func TestRemoveDepthIsNotABound(t *testing.T) {
 	f := newFixture(t)
 	pin := f.createTree(t)
 	buildModuleCache(t, f.root())
-	setBounds(t, 3, 50_000_000)
+	setFdDepth(t, 3)
 	if err := Remove(f.parentFd, treeName, pin); err != nil {
 		t.Fatalf("Remove: %v (reason %q)", err, Reason(err))
 	}
 	assertGone(t, f.root())
 }
 
-func TestRemoveReportsOpsBudget(t *testing.T) {
+// TestRemoveBigTreeDeadlineKeepsProgressAndRetryConverges: a finite writer-free
+// tree (read-only levels deeper than maxFdDepth, so the walk hoists) whose
+// deadline expires mid-way is retained with ErrDeadline, having already
+// removed part of it; a second RemoveBy of the same pin with no deadline
+// finishes it.
+func TestRemoveBigTreeDeadlineKeepsProgressAndRetryConverges(t *testing.T) {
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	f := newFixture(t)
+	before := readSentinel(t, f.sentinel)
+	pin := f.createTree(t)
+	for i := range 300 {
+		mustWrite(t, filepath.Join(f.root(), "file-"+strconv.Itoa(i)), "x")
+	}
+	buildChain(t, f.root(), 20, 0o555, 0o444)
+	setFdDepth(t, 3)
+	total := countEntries(t, f.root())
+	reads := setTickingClock(t)
+
+	// The ticking clock starts at 1ms; the walk gets 200 checks.
+	err := RemoveBy(f.parentFd, treeName, pin, time.Unix(0, 0).Add(200*time.Millisecond))
+	if !errors.Is(err, ErrDeadline) || Reason(err) != "deadline" {
+		t.Fatalf("RemoveBy = %v (reason %q), want ErrDeadline", err, Reason(err))
+	}
+	if *reads < 200 {
+		t.Fatalf("the clock was read %d times, want the walk to reach the deadline", *reads)
+	}
+	assertExists(t, f.root())
+	left := countEntries(t, f.root())
+	if left == 0 || left >= total {
+		t.Fatalf("after the deadline %d of %d entries remain, want partial progress", left, total)
+	}
+
+	if err := RemoveBy(f.parentFd, treeName, pin, time.Time{}); err != nil {
+		t.Fatalf("retry RemoveBy: %v (reason %q)", err, Reason(err))
+	}
+	assertGone(t, f.root())
+	assertSentinelUnchanged(t, f.sentinel, before)
+}
+
+// TestRemoveNoDeadlineNeverReadsTheClock: Remove (the zero deadline) never
+// consults the clock, so no clock value can make it stop early.
+func TestRemoveNoDeadlineNeverReadsTheClock(t *testing.T) {
 	if !requireNonRootCommandUID(t) {
 		return
 	}
 	f := newFixture(t)
 	pin := f.createTree(t)
 	buildModuleCache(t, f.root())
-	setBounds(t, 64, 5)
-	err := Remove(f.parentFd, treeName, pin)
-	if !errors.Is(err, ErrBound) || Reason(err) != "bound" {
-		t.Fatalf("Remove = %v, want ErrBound", err)
+	prev := now
+	now = func() time.Time {
+		t.Error("the clock was read without a deadline")
+		return time.Now()
 	}
-	assertExists(t, f.root())
+	t.Cleanup(func() { now = prev })
+	if err := Remove(f.parentFd, treeName, pin); err != nil {
+		t.Fatalf("Remove: %v (reason %q)", err, Reason(err))
+	}
+	assertGone(t, f.root())
 }
 
-// TestRemoveLiveWriterExhaustsOpsBudget: a same-uid writer that adds an entry
-// for every one the walk looks at cannot livelock Remove; the op budget ends
-// it with ErrBound and the tree is retained.
-func TestRemoveLiveWriterExhaustsOpsBudget(t *testing.T) {
+// TestRemoveLiveWriterEndsAtDeadline: a same-uid writer that adds an entry for
+// every one the walk looks at would livelock the walk; the caller's deadline
+// ends it with ErrDeadline and the tree is retained.
+func TestRemoveLiveWriterEndsAtDeadline(t *testing.T) {
 	if !requireNonRootCommandUID(t) {
 		return
 	}
 	f := newFixture(t)
 	pin := f.createTree(t)
 	mustWrite(t, filepath.Join(f.root(), "seed"), "x")
-	setBounds(t, 64, 2000)
+	setTickingClock(t)
+	const writerCap = 20_000
 	added := 0
 	setFstatat(t, func(real func(int, string, *unix.Stat_t, int) error, dirfd int, path string, st *unix.Stat_t, flags int) error {
+		// The writer gives up after writerCap entries, far past the 2000
+		// clock reads the deadline allows, so a walk that ignores its deadline
+		// finishes (and fails this test) instead of livelocking it.
+		if added >= writerCap {
+			return real(dirfd, path, st, flags)
+		}
 		added++
 		fd, err := unix.Openat(dirfd, "w"+strconv.Itoa(added), unix.O_CREAT|unix.O_EXCL|unix.O_WRONLY|unix.O_CLOEXEC, 0o600)
 		if err != nil {
@@ -529,12 +617,12 @@ func TestRemoveLiveWriterExhaustsOpsBudget(t *testing.T) {
 		return real(dirfd, path, st, flags)
 	})
 
-	err := Remove(f.parentFd, treeName, pin)
-	if !errors.Is(err, ErrBound) || Reason(err) != "bound" {
-		t.Fatalf("Remove = %v, want ErrBound", err)
+	err := RemoveBy(f.parentFd, treeName, pin, time.Unix(0, 0).Add(2*time.Second))
+	if !errors.Is(err, ErrDeadline) || Reason(err) != "deadline" {
+		t.Fatalf("RemoveBy = %v, want ErrDeadline", err)
 	}
-	if added < 100 {
-		t.Fatalf("writer added only %d entries", added)
+	if added < 100 || added >= writerCap {
+		t.Fatalf("writer added %d entries, want it still writing (100..%d) when the deadline hit", added, writerCap)
 	}
 	assertExists(t, f.root())
 }
@@ -648,7 +736,7 @@ func TestRemoveHoistsPastFdDepth(t *testing.T) {
 	before := readSentinel(t, f.sentinel)
 	pin := f.createTree(t)
 	buildChain(t, f.root(), 20, 0o555, 0o444)
-	setBounds(t, 3, 50_000_000)
+	setFdDepth(t, 3)
 	root, err := filepath.EvalSymlinks(f.root())
 	if err != nil {
 		t.Fatal(err)
@@ -693,7 +781,7 @@ func TestRemoveHoistSwapIsMismatch(t *testing.T) {
 	before := readSentinel(t, f.sentinel)
 	pin := f.createTree(t)
 	buildChain(t, f.root(), 10, 0, 0)
-	setBounds(t, 3, 50_000_000)
+	setFdDepth(t, 3)
 	fired := false
 	setHoistHook(t, func(rootFd int, hoistName string) {
 		if fired {
@@ -795,7 +883,7 @@ func TestReasonIsFixedVocabulary(t *testing.T) {
 		nil:                               "",
 		ErrMismatch:                       "mismatch",
 		ErrOwner:                          "owner",
-		ErrBound:                          "bound",
+		ErrDeadline:                       "deadline",
 		ErrNotExist:                       "absent",
 		ioErr("openat", unix.EACCES):      "io",
 		openErr("openat", unix.ELOOP):     "mismatch",
@@ -1144,7 +1232,9 @@ func TestRemoveSkipsConcurrentlyDeletedEntries(t *testing.T) {
 }
 
 // TestRemoveStreamsWithMinimalBuffer: with the getdents buffer at its minimum,
-// a directory of 5000 entries takes many rereads and is still removed in full.
+// a directory of 5000 entries is removed in full, and the walk never processes
+// more entries between two getdents reads than one buffer can hold, which a
+// walk that buffers a directory's names before processing them cannot satisfy.
 func TestRemoveStreamsWithMinimalBuffer(t *testing.T) {
 	if !requireNonRootCommandUID(t) {
 		return
@@ -1158,17 +1248,36 @@ func TestRemoveStreamsWithMinimalBuffer(t *testing.T) {
 	prev := direntBufSize
 	direntBufSize = minDirentBufSize
 	t.Cleanup(func() { direntBufSize = prev })
-	stats := 0
+	// The smallest linux_dirent64 is 24 bytes, so one buffer holds at most this
+	// many entries.
+	const perBuffer = minDirentBufSize / 24
+	stats, reads, sinceRead, peak := 0, 0, 0, 0
 	setFstatat(t, func(real func(int, string, *unix.Stat_t, int) error, dirfd int, path string, st *unix.Stat_t, flags int) error {
 		stats++
+		sinceRead++
+		peak = max(peak, sinceRead)
 		return real(dirfd, path, st, flags)
 	})
+	prevGetdents := getdents
+	getdents = func(fd int, buf []byte) (int, error) {
+		reads++
+		sinceRead = 0
+		return prevGetdents(fd, buf)
+	}
+	t.Cleanup(func() { getdents = prevGetdents })
 
 	if err := Remove(f.parentFd, treeName, pin); err != nil {
 		t.Fatalf("Remove: %v (reason %q)", err, Reason(err))
 	}
 	if stats < 5000 {
 		t.Fatalf("only %d entries processed", stats)
+	}
+	// The root recheck is one fstatat after the last read.
+	if peak > perBuffer+1 {
+		t.Fatalf("%d entries were processed between two getdents reads, want <= %d (one buffer)", peak, perBuffer+1)
+	}
+	if reads < 5000/perBuffer {
+		t.Fatalf("only %d getdents reads for 5000 entries", reads)
 	}
 	assertGone(t, f.root())
 }

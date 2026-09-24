@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -108,7 +109,7 @@ func TestCreateCommandTmpLocksPinsAndRemoves(t *testing.T) {
 		}
 	}
 
-	got := ct.cleanup()
+	got := ct.cleanup(time.Now().Add(time.Minute))
 	if got == nil || got.State != tmpCleanupRemoved || got.Reason != "" {
 		t.Fatalf("cleanup = %+v, want removed", got)
 	}
@@ -160,7 +161,7 @@ func TestCommandTmpCleanupReasons(t *testing.T) {
 		{nil, tmpCleanupRemoved, ""},
 		{fmt.Errorf("wrapped: %w", safetree.ErrMismatch), tmpCleanupRetained, "mismatch"},
 		{safetree.ErrOwner, tmpCleanupRetained, "owner"},
-		{safetree.ErrBound, tmpCleanupRetained, "bound"},
+		{safetree.ErrDeadline, tmpCleanupRetained, "deadline"},
 		{safetree.ErrIO, tmpCleanupRetained, "io"},
 		// The pinned dir vanishing is NOT success.
 		{safetree.ErrNotExist, tmpCleanupRetained, "absent"},
@@ -168,15 +169,20 @@ func TestCommandTmpCleanupReasons(t *testing.T) {
 	for _, tc := range tests {
 		var gotName string
 		var gotPin safetree.Pin
+		var gotDeadline time.Time
 		pin := safetree.Pin{Dev: 1, Ino: 2, UID: 10003}
-		ct := &commandTmp{parentFd: 7, name: "n", pin: pin, remove: func(parentFd int, name string, p safetree.Pin) error {
+		deadline := time.Unix(1234, 0)
+		ct := &commandTmp{parentFd: 7, name: "n", pin: pin, remove: func(parentFd int, name string, p safetree.Pin, d time.Time) error {
 			if parentFd != 7 {
 				t.Errorf("parentFd = %d", parentFd)
 			}
-			gotName, gotPin = name, p
+			gotName, gotPin, gotDeadline = name, p, d
 			return tc.err
 		}}
-		got := ct.cleanup()
+		got := ct.cleanup(deadline)
+		if !gotDeadline.Equal(deadline) {
+			t.Errorf("remove got deadline %v, want %v", gotDeadline, deadline)
+		}
 		if got.State != tc.wantState || got.Reason != tc.wantReason {
 			t.Errorf("err %v: cleanup = %+v, want %s/%q", tc.err, got, tc.wantState, tc.wantReason)
 		}
@@ -250,7 +256,7 @@ func TestSetupAndLaunchWithoutTokenSkipsSetup(t *testing.T) {
 func TestSetupAndLaunchLaunchFailureLeavesTmp(t *testing.T) {
 	var buf bytes.Buffer
 	removed := false
-	ct0 := &commandTmp{remove: func(int, string, safetree.Pin) error { removed = true; return nil }}
+	ct0 := &commandTmp{remove: func(int, string, safetree.Pin, time.Time) error { removed = true; return nil }}
 	setup := func(string, int) (*commandTmp, error) { return ct0, nil }
 	launch := func([]string) (int, error) { return 0, errors.New("boom") }
 	_, _, ok := setupAndLaunch(&evidence{w: &buf}, testToken, 10003, setup, launch, []string{"/bin/true"})
@@ -433,7 +439,7 @@ func TestOpenCommandTmpFdsAreCloseOnExec(t *testing.T) {
 			t.Fatalf("%s fd is not close-on-exec (flags=%d err=%v)", label, flags, err)
 		}
 	}
-	if got := ct.cleanup(); got.State != tmpCleanupRemoved {
+	if got := ct.cleanup(time.Now().Add(time.Minute)); got.State != tmpCleanupRemoved {
 		t.Fatalf("cleanup = %+v", got)
 	}
 }

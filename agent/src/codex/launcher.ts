@@ -235,7 +235,7 @@ export interface DisposeEvidence {
   /** Present only for a root launched with a cleanup token: the outcome of the
    *  supervisor removing `/tmp/uzi-codex-command-<token>` after a confirmed drain.
    *  `reason` is "" when removed, otherwise one of the fixed words mismatch, owner,
-   *  bound, io, absent or name. A retained tmp does not make the disposal unclean. */
+   *  deadline, io, absent or name. A retained tmp does not make the disposal unclean. */
   readonly tmpCleanup?: TmpCleanupEvidence;
 }
 
@@ -244,9 +244,11 @@ export interface TmpCleanupEvidence {
   readonly reason: string;
 }
 
-/** The fixed reasons the supervisor reports for a RETAINED tmp (Go
- *  `safetree.Reason`). A removed tmp always reports "". */
-const TMP_RETAINED_REASONS: ReadonlySet<string> = new Set(["mismatch", "owner", "bound", "io", "absent", "name"]);
+/** The fixed reasons the supervisor reports for a RETAINED tmp: exactly the
+ *  non-empty words Go `safetree.Reason` returns (a test holds the two sets
+ *  equal). "deadline" is a removal that ran out of the dispose's own deadline
+ *  and kept its partial progress. A removed tmp always reports "". */
+export const TMP_RETAINED_REASONS: ReadonlySet<string> = new Set(["mismatch", "owner", "deadline", "io", "absent", "name"]);
 
 /** Strict meaning check for the optional `tmpCleanup` evidence field: an object
  *  with exactly `state` and `reason`, where `removed` pairs only with reason ""

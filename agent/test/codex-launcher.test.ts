@@ -1,12 +1,14 @@
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { readFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { PassThrough, Writable } from "node:stream";
 
 import { CODEX_SESSION_GID, COMMAND_UID, WORKER_UID, setprivArgsForUid, setprivRunnerArgs } from "../src/runner-uid.js";
 import {
   CodexUnsupportedProfileError,
+  TMP_RETAINED_REASONS,
   launchCodexRoot,
   launchCodexEffectRoot,
   type CodexLaunchSpec,
@@ -632,12 +634,26 @@ describe("createHandle: strict tmpCleanup evidence", () => {
   });
 });
 
+describe("TMP_RETAINED_REASONS matches Go safetree.Reason", () => {
+  it("holds exactly the non-empty string literals func Reason returns", () => {
+    const goSrc = readFileSync(new URL("../codex/supervisor/internal/safetree/safetree.go", import.meta.url), "utf8");
+    const body = /^func Reason\(err error\) string \{\n([\s\S]*?)^\}$/m.exec(goSrc)?.[1];
+    assert.ok(body !== undefined, "func Reason not found in safetree.go");
+    const returned = [...body.matchAll(/\breturn "([^"]*)"/g)].map((m) => m[1]);
+    // The "" for a nil error is not a retained reason.
+    assert.ok(returned.includes(""), "func Reason no longer returns \"\" for nil");
+    const goReasons = new Set(returned.filter((r) => r !== ""));
+    assert.ok(goReasons.size >= 6, `only ${goReasons.size} reasons parsed from func Reason`);
+    assert.deepEqual([...TMP_RETAINED_REASONS].sort(), [...goReasons].sort());
+  });
+});
+
 describe("createHandle: tmpCleanup must carry meaning, not just shape", () => {
   /** whenFailed, bounded: an accepted record never fails the root, and must redden the test rather than hang it. */
   const failedWithin = (handle: { whenFailed: Promise<Error> }, ms = 1000): Promise<Error> =>
     Promise.race([handle.whenFailed, new Promise<Error>((resolve) => setTimeout(() => resolve(new Error("root did not fail")), ms).unref())]);
 
-  for (const reason of ["mismatch", "owner", "bound", "io", "absent", "name"]) {
+  for (const reason of ["mismatch", "owner", "deadline", "io", "absent", "name"]) {
     it(`accepts a retained tmpCleanup with the fixed reason "${reason}"`, async () => {
       const fake = newFake({ disposeTmpCleanup: { state: "retained", reason } });
       const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));

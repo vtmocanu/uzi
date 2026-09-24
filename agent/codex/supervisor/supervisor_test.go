@@ -2,10 +2,14 @@ package main
 
 import (
 	"bytes"
+	"os"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"uzi.local/codex-supervisor/internal/safetree"
 )
@@ -35,12 +39,14 @@ type cleanupRecorder struct {
 	result      *tmpCleanupResult
 	calls       int
 	linesAtCall int
+	deadline    time.Time
 }
 
-func (c *cleanupRecorder) seam() func() *tmpCleanupResult {
-	return func() *tmpCleanupResult {
+func (c *cleanupRecorder) seam() func(time.Time) *tmpCleanupResult {
+	return func(deadline time.Time) *tmpCleanupResult {
 		c.calls++
 		c.linesAtCall = strings.Count(c.buf.String(), "\n")
+		c.deadline = deadline
 		return c.result
 	}
 }
@@ -107,7 +113,7 @@ func TestRunDrainedDisposeRemovesTmpBeforeReporting(t *testing.T) {
 
 func TestRunDrainedDisposeRetainedReasonKeepsExitCode(t *testing.T) {
 	sup, buf := newTestSupervisor(`{"op":"dispose","id":3}`+"\n", scriptedReaper(reapEmpty))
-	ct := &commandTmp{remove: func(int, string, safetree.Pin) error { return safetree.ErrOwner }}
+	ct := &commandTmp{remove: func(int, string, safetree.Pin, time.Time) error { return safetree.ErrOwner }}
 	sup.seams.tmpCleanup = tmpCleanupFor(ct)
 
 	if code := sup.run(9, procStatus{}); code != 0 {
@@ -213,10 +219,10 @@ func TestCleanupTmpRunsAtMostOnce(t *testing.T) {
 	sup, buf := newTestSupervisor("", scriptedReaper(reapEmpty))
 	rec := &cleanupRecorder{buf: buf, result: &tmpCleanupResult{State: tmpCleanupRemoved}}
 	sup.seams.tmpCleanup = rec.seam()
-	if got := sup.cleanupTmp(); got == nil || got.State != tmpCleanupRemoved {
+	if got := sup.cleanupTmp(time.Time{}); got == nil || got.State != tmpCleanupRemoved {
 		t.Fatalf("first cleanupTmp = %+v", got)
 	}
-	if got := sup.cleanupTmp(); got != nil {
+	if got := sup.cleanupTmp(time.Time{}); got != nil {
 		t.Fatalf("repeat cleanupTmp = %+v, want nil (no re-clean, no field)", got)
 	}
 	if rec.calls != 1 {
@@ -297,5 +303,85 @@ func TestRunWatchedRunsTheLoopAfterAWatch(t *testing.T) {
 	}
 	if watched != 9 {
 		t.Fatalf("watched pid %d, want 9", watched)
+	}
+}
+
+// TestCleanupDeadlineIsTheDrainDeadlineLessMargin: the tmp cleanup gets the
+// deadline of the drain that just completed, computed once at the start of the
+// op (time the drain spent is not given back), less min(250ms, timeout/10).
+func TestCleanupDeadlineIsTheDrainDeadlineLessMargin(t *testing.T) {
+	epoch := time.Unix(0, 0)
+	for _, tc := range []struct {
+		name  string
+		frame string
+		want  time.Duration
+	}{
+		{"dispose small timeout", `{"op":"dispose","id":1,"timeoutMs":1000}`, 900 * time.Millisecond},
+		{"dispose large timeout", `{"op":"dispose","id":1,"timeoutMs":10000}`, 9750 * time.Millisecond},
+		{"dispose default timeout", `{"op":"dispose","id":1}`, (defaultDisposeTimeoutMs - 200) * time.Millisecond},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Three pending reaps make the drain spend 150ms of fake time first.
+			sup, buf := newTestSupervisor(tc.frame+"\n", scriptedReaper(reapEmpty, reapPending, reapPending, reapPending))
+			rec := &cleanupRecorder{buf: buf, result: &tmpCleanupResult{State: tmpCleanupRemoved}}
+			sup.seams.tmpCleanup = rec.seam()
+			if code := sup.run(9, procStatus{}); code != 0 {
+				t.Fatalf("code = %d, want 0", code)
+			}
+			if rec.calls != 1 || !rec.deadline.Equal(epoch.Add(tc.want)) {
+				t.Fatalf("cleanup calls %d with deadline %v, want 1 with %v", rec.calls, rec.deadline.Sub(epoch), tc.want)
+			}
+		})
+	}
+	t.Run("abnormal", func(t *testing.T) {
+		sup, buf := newTestSupervisor("", scriptedReaper(reapEmpty, reapPending, reapPending))
+		rec := &cleanupRecorder{buf: buf, result: &tmpCleanupResult{State: tmpCleanupRemoved}}
+		sup.seams.tmpCleanup = rec.seam()
+		if code := sup.abnormal("control EOF"); code == 0 {
+			t.Fatal("abnormal returned 0")
+		}
+		want := (defaultDisposeTimeoutMs - defaultDisposeTimeoutMs/10) * time.Millisecond
+		if rec.calls != 1 || !rec.deadline.Equal(epoch.Add(want)) {
+			t.Fatalf("cleanup calls %d with deadline %v, want 1 with %v", rec.calls, rec.deadline.Sub(epoch), want)
+		}
+	})
+}
+
+// TestDisposeCleanupPastDeadlineIsRetainedDeadline: a real command tmp whose
+// cleanup deadline has already passed when the drain completes is reported
+// retained "deadline" on the dispose line, the exit stays 0, and the tree is
+// kept for a later retry.
+func TestDisposeCleanupPastDeadlineIsRetainedDeadline(t *testing.T) {
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	parent := t.TempDir()
+	parentFd := openParent(t, parent)
+	ct, err := createCommandTmp(parentFd, commandTmpName(testToken), os.Geteuid())
+	if err != nil {
+		t.Fatalf("createCommandTmp: %v", err)
+	}
+	t.Cleanup(func() { _ = unix.Close(ct.dirFd) })
+	full := filepath.Join(parent, commandTmpName(testToken))
+	if err := os.WriteFile(filepath.Join(full, "f"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// timeoutMs 0: the drain deadline is its start, so the cleanup deadline has
+	// passed (on the real clock the safetree walk reads) before it begins.
+	sup, buf := newTestSupervisor(`{"op":"dispose","id":1,"timeoutMs":0}`+"\n", scriptedReaper(reapEmpty))
+	sup.seams.tmpCleanup = tmpCleanupFor(ct)
+	if code := sup.run(9, procStatus{}); code != 0 {
+		t.Fatalf("code = %d, want 0", code)
+	}
+	lines := decodeLines(t, buf)
+	tc, ok := tmpCleanupField(t, lines[len(lines)-1])
+	if !ok || tc["state"] != "retained" || tc["reason"] != "deadline" {
+		t.Fatalf("tmpCleanup = %v, want retained/deadline", tc)
+	}
+	if _, err := os.Lstat(filepath.Join(full, "f")); err != nil {
+		t.Fatalf("the tree was not retained: %v", err)
+	}
+	if got := ct.cleanup(time.Now().Add(time.Minute)); got.State != tmpCleanupRemoved {
+		t.Fatalf("retry cleanup = %+v, want removed", got)
 	}
 }

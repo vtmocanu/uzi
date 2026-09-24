@@ -403,20 +403,7 @@ func confine(root string, tmpFd int, abi int) error {
 		return errno
 	}
 	defer unix.Close(int(fd))
-	read := uint64(unix.LANDLOCK_ACCESS_FS_EXECUTE | unix.LANDLOCK_ACCESS_FS_READ_FILE | unix.LANDLOCK_ACCESS_FS_READ_DIR)
-	for _, path := range []string{"/bin", "/sbin", "/usr", "/lib", "/lib64", "/etc", "/nix", "/opt/uzi-toolchain"} {
-		if err := addPathRule(int(fd), path, read&handled); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
-	}
-	dev := read | unix.LANDLOCK_ACCESS_FS_WRITE_FILE
-	if err := addPathRule(int(fd), "/dev", dev&handled); err != nil {
-		return err
-	}
-	if err := addPathRule(int(fd), root, handled); err != nil {
-		return err
-	}
-	if err := addFdRule(int(fd), tmpFd, handled); err != nil {
+	if err := addRules(int(fd), root, tmpFd, handled, realRuleAdders); err != nil {
 		return err
 	}
 	if err := requireProbeReadable(landlockDenyProbe, os.Open); err != nil {
@@ -433,6 +420,37 @@ func confine(root string, tmpFd int, abi int) error {
 		return err
 	}
 	return nil
+}
+
+// ruleAdders are addRules' two ways to add a path_beneath rule: by opening a
+// path, or through an fd the caller already holds.
+type ruleAdders struct {
+	path func(ruleset int, path string, access uint64) error
+	fd   func(ruleset int, fd int, access uint64) error
+}
+
+var realRuleAdders = ruleAdders{path: addPathRule, fd: addFdRule}
+
+// addRules adds confine's allowlist to ruleset: read/execute on the system
+// dirs (a missing one is skipped), read/write on /dev, every handled right
+// beneath root, and every handled right beneath the adopted tmp through tmpFd
+// itself. The tmp is never named by path here, so a rename or symlink swap of
+// the --tmp path after adoption cannot redirect its rule.
+func addRules(ruleset int, root string, tmpFd int, handled uint64, add ruleAdders) error {
+	read := uint64(unix.LANDLOCK_ACCESS_FS_EXECUTE | unix.LANDLOCK_ACCESS_FS_READ_FILE | unix.LANDLOCK_ACCESS_FS_READ_DIR)
+	for _, path := range []string{"/bin", "/sbin", "/usr", "/lib", "/lib64", "/etc", "/nix", "/opt/uzi-toolchain"} {
+		if err := add.path(ruleset, path, read&handled); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	dev := read | unix.LANDLOCK_ACCESS_FS_WRITE_FILE
+	if err := add.path(ruleset, "/dev", dev&handled); err != nil {
+		return err
+	}
+	if err := add.path(ruleset, root, handled); err != nil {
+		return err
+	}
+	return add.fd(ruleset, tmpFd, handled)
 }
 
 type probeOpen func(string) (*os.File, error)

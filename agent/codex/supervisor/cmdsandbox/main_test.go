@@ -445,9 +445,9 @@ func TestAdoptPrivateTmpRefusesNonEmpty(t *testing.T) {
 	}
 }
 
-// TestAddFdRuleUsesTheFd pins that the tmp rule is added through the adopted fd:
-// with a real Landlock ruleset it accepts the directory fd, and a closed fd is
-// refused (EBADF) rather than resolved by any path.
+// TestAddFdRuleUsesTheFd pins that addFdRule works on the fd itself: with a
+// real Landlock ruleset it accepts the adopted directory fd, and an fd that can
+// never be open (-1) is refused with EBADF rather than resolved by any path.
 func TestAddFdRuleUsesTheFd(t *testing.T) {
 	avail, _, _ := classifyLandlock(realVersionProbe)
 	if avail != landlockAvailable {
@@ -463,11 +463,79 @@ func TestAddFdRuleUsesTheFd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer func() { _ = unix.Close(fd) }()
 	if err := addFdRule(int(rs), fd, baseRights); err != nil {
 		t.Fatalf("addFdRule on the adopted fd: %v", err)
 	}
-	_ = unix.Close(fd)
-	if err := addFdRule(int(rs), fd, baseRights); !errors.Is(err, unix.EBADF) {
-		t.Fatalf("addFdRule on a closed fd = %v, want EBADF", err)
+	if err := addFdRule(int(rs), -1, baseRights); !errors.Is(err, unix.EBADF) {
+		t.Fatalf("addFdRule on fd -1 = %v, want EBADF", err)
+	}
+}
+
+// TestAddRulesGrantsTmpThroughTheAdoptedFd: confine's rule set grants the tmp
+// rule through the ADOPTED fd, never by reopening a path, so swapping the
+// --tmp path for another directory after adoption does not move the rule.
+func TestAddRulesGrantsTmpThroughTheAdoptedFd(t *testing.T) {
+	tmp := privateTmp(t)
+	fd, err := adoptPrivateTmp(tmp, os.Getuid(), unix.Open, unix.Fstat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = unix.Close(fd) }()
+	var adopted unix.Stat_t
+	if err := unix.Fstat(fd, &adopted); err != nil {
+		t.Fatal(err)
+	}
+	// Swap the path after adoption: the adopted dir moves away and a fresh
+	// directory takes its name.
+	if err := os.Rename(tmp, tmp+".moved"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(tmp, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	const ruleset, handled = 99, uint64(0x1234)
+	root := t.TempDir()
+	var paths []string
+	type fdRule struct {
+		fd     int
+		access uint64
+		ino    uint64
+	}
+	var fdRules []fdRule
+	err = addRules(ruleset, root, fd, handled, ruleAdders{
+		path: func(rs int, path string, _ uint64) error {
+			if rs != ruleset {
+				t.Errorf("path rule on ruleset %d", rs)
+			}
+			paths = append(paths, path)
+			return nil
+		},
+		fd: func(rs int, got int, access uint64) error {
+			if rs != ruleset {
+				t.Errorf("fd rule on ruleset %d", rs)
+			}
+			var st unix.Stat_t
+			if err := unix.Fstat(got, &st); err != nil {
+				t.Errorf("fstat of the rule fd %d: %v", got, err)
+			}
+			fdRules = append(fdRules, fdRule{fd: got, access: access, ino: st.Ino})
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("addRules: %v", err)
+	}
+	if len(fdRules) != 1 || fdRules[0].fd != fd || fdRules[0].access != handled || fdRules[0].ino != adopted.Ino {
+		t.Fatalf("fd rules = %+v, want one on the adopted fd %d (ino %d) with %#x", fdRules, fd, adopted.Ino, handled)
+	}
+	for _, p := range paths {
+		if strings.HasPrefix(p, filepath.Dir(tmp)) {
+			t.Fatalf("a path rule named the tmp (%q); the tmp must go through its fd", p)
+		}
+	}
+	if len(paths) == 0 || paths[len(paths)-1] != root {
+		t.Fatalf("path rules %v do not end with the root %q", paths, root)
 	}
 }
