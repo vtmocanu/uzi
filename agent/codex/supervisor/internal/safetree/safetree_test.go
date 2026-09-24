@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	"golang.org/x/sys/unix"
@@ -314,6 +315,10 @@ func TestRemoveFailsClosedOnDescendantSwapToSymlink(t *testing.T) {
 	if !errors.Is(err, ErrMismatch) || Reason(err) != "mismatch" {
 		t.Fatalf("Remove = %v, want ErrMismatch", err)
 	}
+	// Refused by O_NOFOLLOW at open time, not only by the later inode compare.
+	if !errors.Is(err, unix.ELOOP) && !errors.Is(err, unix.ENOTDIR) {
+		t.Fatalf("Remove = %v, want the open to fail with ELOOP/ENOTDIR", err)
+	}
 	assertExists(t, f.root())
 	assertExists(t, filepath.Join(f.root(), moduleCacheRel, "sub.moved", "deeper", "d.go"))
 	assertSentinelUnchanged(t, f.sentinel, before)
@@ -386,8 +391,9 @@ func TestRemoveFailsClosedOnRootSwap(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if err := Remove(f.parentFd, treeName, pin); !errors.Is(err, ErrMismatch) {
-			t.Fatalf("Remove = %v, want ErrMismatch", err)
+		err := Remove(f.parentFd, treeName, pin)
+		if !errors.Is(err, ErrMismatch) || (!errors.Is(err, unix.ELOOP) && !errors.Is(err, unix.ENOTDIR)) {
+			t.Fatalf("Remove = %v, want ErrMismatch from ELOOP/ENOTDIR at open", err)
 		}
 		assertExists(t, f.root())
 		assertSentinelUnchanged(t, f.sentinel, before)
@@ -575,6 +581,7 @@ func TestReasonIsFixedVocabulary(t *testing.T) {
 		ioErr("openat", unix.EACCES):      "io",
 		openErr("openat", unix.ELOOP):     "mismatch",
 		openErr("openat", unix.EACCES):    "io",
+		ErrName:                           "name",
 		errors.New("/some/secret/path x"): "io",
 	}
 	for err, want := range cases {
@@ -585,4 +592,388 @@ func TestReasonIsFixedVocabulary(t *testing.T) {
 	if !errors.Is(ioErr("x", unix.EACCES), unix.EACCES) {
 		t.Error("ErrIO must wrap the errno")
 	}
+	if !errors.Is(openErr("x", unix.ELOOP), unix.ELOOP) {
+		t.Error("an open ErrMismatch must wrap the errno")
+	}
+}
+
+func setCreateHook(t *testing.T, h func(parentFd int, name string)) {
+	t.Helper()
+	prev := hookCreateBetweenMkdirAndOpen
+	hookCreateBetweenMkdirAndOpen = h
+	t.Cleanup(func() { hookCreateBetweenMkdirAndOpen = prev })
+}
+
+// setFstatat wraps the fstatat seam; wrap receives the real implementation.
+func setFstatat(t *testing.T, wrap func(real func(int, string, *unix.Stat_t, int) error, dirfd int, path string, st *unix.Stat_t, flags int) error) {
+	t.Helper()
+	prev := fstatat
+	fstatat = func(dirfd int, path string, st *unix.Stat_t, flags int) error {
+		return wrap(prev, dirfd, path, st, flags)
+	}
+	t.Cleanup(func() { fstatat = prev })
+}
+
+// setFstat makes the fstat seam apply edit to every result for inode ino.
+func setFstat(t *testing.T, ino uint64, edit func(st *unix.Stat_t)) {
+	t.Helper()
+	prev := fstat
+	fstat = func(fd int, st *unix.Stat_t) error {
+		if err := prev(fd, st); err != nil {
+			return err
+		}
+		if st.Ino == ino {
+			edit(st)
+		}
+		return nil
+	}
+	t.Cleanup(func() { fstat = prev })
+}
+
+func inoOf(t *testing.T, p string) uint64 {
+	t.Helper()
+	var st unix.Stat_t
+	if err := unix.Lstat(p, &st); err != nil {
+		t.Fatal(err)
+	}
+	return st.Ino
+}
+
+func TestCreateVerifiesThenChmodsExactly0700(t *testing.T) {
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	f := newFixture(t)
+	// A setgid parent makes mkdirat's result 02700 even with umask 0, so only
+	// Create's fchmod can make it exactly 0700.
+	parent := filepath.Join(f.base, "sgid")
+	mustMkdir(t, parent)
+	mustChmod(t, parent, 0o755|os.ModeSetgid)
+	var pst unix.Stat_t
+	if err := unix.Stat(parent, &pst); err != nil {
+		t.Fatal(err)
+	}
+	if pst.Mode&unix.S_ISGID == 0 {
+		t.Fatalf("precondition: parent mode %o lacks setgid", pst.Mode)
+	}
+	pfd, err := unix.Open(parent, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = unix.Close(pfd) })
+
+	old := unix.Umask(0)
+	fd, pin, err := Create(pfd, treeName, os.Geteuid())
+	unix.Umask(old)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	t.Cleanup(func() { _ = unix.Close(fd) })
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode&0o7777 != 0o700 {
+		t.Fatalf("mode = %o, want exactly 0700", st.Mode&0o7777)
+	}
+	if err := Remove(pfd, treeName, pin); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+}
+
+func TestCreateRejectsSubstitutedNonEmptyDir(t *testing.T) {
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	for _, tc := range []struct {
+		name  string
+		plant func(t *testing.T, dir string) string
+	}{
+		{"file", func(t *testing.T, dir string) string {
+			p := filepath.Join(dir, "planted")
+			mustWrite(t, p, "x")
+			return p
+		}},
+		{"subdir", func(t *testing.T, dir string) string {
+			p := filepath.Join(dir, "planted")
+			mustMkdir(t, p)
+			return p
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			var planted string
+			setCreateHook(t, func(parentFd int, name string) {
+				// Stand-in for a peer's renameat2(RENAME_EXCHANGE): the fresh dir
+				// leaves, a pre-filled one takes its name.
+				if err := unix.Renameat(parentFd, name, parentFd, name+".fresh"); err != nil {
+					t.Errorf("rename: %v", err)
+					return
+				}
+				mustMkdir(t, f.root())
+				planted = tc.plant(t, f.root())
+			})
+			fd, _, err := Create(f.parentFd, treeName, os.Geteuid())
+			if err == nil {
+				_ = unix.Close(fd)
+			}
+			if !errors.Is(err, ErrMismatch) || fd != -1 {
+				t.Fatalf("Create = %d, %v; want -1, ErrMismatch", fd, err)
+			}
+			assertExists(t, planted)
+		})
+	}
+}
+
+func TestNameValidation(t *testing.T) {
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	f := newFixture(t)
+	for _, name := range []string{"", ".", "..", "a/b", "../" + sentinelName, "/abs", "a\x00b"} {
+		if fd, _, err := Create(f.parentFd, name, os.Geteuid()); !errors.Is(err, ErrName) || Reason(err) != "name" || fd != -1 {
+			t.Errorf("Create(%q) = %d, %v; want ErrName", name, fd, err)
+		}
+		if err := Remove(f.parentFd, name, Pin{UID: os.Geteuid()}); !errors.Is(err, ErrName) || Reason(err) != "name" {
+			t.Errorf("Remove(%q) = %v; want ErrName", name, err)
+		}
+	}
+}
+
+func TestRemoveOwnerUnreadableDirs(t *testing.T) {
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	t.Run("descendants", func(t *testing.T) {
+		f := newFixture(t)
+		before := readSentinel(t, f.sentinel)
+		pin := f.createTree(t)
+		for _, d := range []struct {
+			name string
+			mode os.FileMode
+		}{{"m0000", 0o000}, {"m0300", 0o300}, {"m0100", 0o100}} {
+			dir := filepath.Join(f.root(), d.name)
+			mustMkdir(t, filepath.Join(dir, "nested"))
+			mustWrite(t, filepath.Join(dir, "nested", "f"), "x")
+			mustWrite(t, filepath.Join(dir, "g"), "y")
+			mustChmod(t, filepath.Join(dir, "nested"), 0o000)
+			mustChmod(t, dir, d.mode)
+		}
+		if err := Remove(f.parentFd, treeName, pin); err != nil {
+			t.Fatalf("Remove: %v (reason %q)", err, Reason(err))
+		}
+		assertGone(t, f.root())
+		assertSentinelUnchanged(t, f.sentinel, before)
+	})
+	t.Run("root 0000", func(t *testing.T) {
+		f := newFixture(t)
+		pin := f.createTree(t)
+		buildModuleCache(t, f.root())
+		mustChmod(t, f.root(), 0o000)
+		if err := Remove(f.parentFd, treeName, pin); err != nil {
+			t.Fatalf("Remove: %v (reason %q)", err, Reason(err))
+		}
+		assertGone(t, f.root())
+	})
+}
+
+func TestRemoveFailsClosedOnOtherFilesystem(t *testing.T) {
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	f := newFixture(t)
+	pin := f.createTree(t)
+	buildModuleCache(t, f.root())
+	deeper := filepath.Join(f.root(), moduleCacheRel, "sub", "deeper")
+	ino := inoOf(t, deeper)
+	// A consistent lie in both seams, as a real mount point would present: the
+	// fstatat and the fstat agree, so only the pin.Dev check can catch it.
+	setFstatat(t, func(real func(int, string, *unix.Stat_t, int) error, dirfd int, path string, st *unix.Stat_t, flags int) error {
+		if err := real(dirfd, path, st, flags); err != nil {
+			return err
+		}
+		if path == "deeper" {
+			st.Dev++
+		}
+		return nil
+	})
+	setFstat(t, ino, func(st *unix.Stat_t) { st.Dev++ })
+
+	err := Remove(f.parentFd, treeName, pin)
+	if !errors.Is(err, ErrMismatch) {
+		t.Fatalf("Remove = %v, want ErrMismatch", err)
+	}
+	assertExists(t, filepath.Join(deeper, "deepest", "x.go"))
+}
+
+func TestRemoveFstatOwnerChecks(t *testing.T) {
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	foreign := func(st *unix.Stat_t) { st.Uid++ }
+	t.Run("opened child dir", func(t *testing.T) {
+		f := newFixture(t)
+		pin := f.createTree(t)
+		buildModuleCache(t, f.root())
+		deeper := filepath.Join(f.root(), moduleCacheRel, "sub", "deeper")
+		setFstat(t, inoOf(t, deeper), foreign)
+		if err := Remove(f.parentFd, treeName, pin); !errors.Is(err, ErrOwner) {
+			t.Fatalf("Remove = %v, want ErrOwner", err)
+		}
+		assertExists(t, filepath.Join(deeper, "deepest", "x.go"))
+	})
+	t.Run("root at first open", func(t *testing.T) {
+		f := newFixture(t)
+		pin := f.createTree(t)
+		buildModuleCache(t, f.root())
+		setFstat(t, pin.Ino, foreign)
+		if err := Remove(f.parentFd, treeName, pin); !errors.Is(err, ErrOwner) {
+			t.Fatalf("Remove = %v, want ErrOwner", err)
+		}
+		assertExists(t, filepath.Join(f.root(), moduleCacheRel, "go.mod"))
+	})
+	t.Run("root recheck", func(t *testing.T) {
+		f := newFixture(t)
+		pin := f.createTree(t)
+		buildModuleCache(t, f.root())
+		setForeignOwner(t, treeName)
+		if err := Remove(f.parentFd, treeName, pin); !errors.Is(err, ErrOwner) {
+			t.Fatalf("Remove = %v, want ErrOwner", err)
+		}
+		assertExists(t, f.root())
+	})
+}
+
+func TestRemoveFirstErrorAborts(t *testing.T) {
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	f := newFixture(t)
+	pin := f.createTree(t)
+	const siblings = 64
+	for i := range siblings {
+		mustWrite(t, filepath.Join(f.root(), "f"+strconv.Itoa(i)), "x")
+	}
+	// The first entry stat'ed is reported foreign; any later fstatat call means
+	// the walk went on to a sibling.
+	calls, afterFail := 0, 0
+	setFstatat(t, func(real func(int, string, *unix.Stat_t, int) error, dirfd int, path string, st *unix.Stat_t, flags int) error {
+		calls++
+		if calls > 1 {
+			afterFail++
+		}
+		if err := real(dirfd, path, st, flags); err != nil {
+			return err
+		}
+		if calls == 1 {
+			st.Uid++
+		}
+		return nil
+	})
+
+	if err := Remove(f.parentFd, treeName, pin); !errors.Is(err, ErrOwner) {
+		t.Fatalf("Remove = %v, want ErrOwner", err)
+	}
+	if calls != 1 || afterFail != 0 {
+		t.Fatalf("fstatat called %d times (%d after the failing entry), want exactly 1", calls, afterFail)
+	}
+	entries, err := os.ReadDir(f.root())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != siblings {
+		t.Fatalf("%d entries remain, want all %d", len(entries), siblings)
+	}
+}
+
+func TestRemoveSkipsConcurrentlyDeletedEntries(t *testing.T) {
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	f := newFixture(t)
+	pin := f.createTree(t)
+	buildModuleCache(t, f.root())
+	mustWrite(t, filepath.Join(f.root(), "gone-before-stat"), "x")
+	mustWrite(t, filepath.Join(f.root(), "gone-before-unlink"), "x")
+	var skippedStat, skippedUnlink bool
+	setFstatat(t, func(real func(int, string, *unix.Stat_t, int) error, dirfd int, path string, st *unix.Stat_t, flags int) error {
+		switch path {
+		case "gone-before-stat":
+			if err := unix.Unlinkat(dirfd, path, 0); err != nil {
+				t.Errorf("unlink: %v", err)
+			}
+			err := real(dirfd, path, st, flags)
+			skippedStat = errors.Is(err, unix.ENOENT)
+			return err
+		case "gone-before-unlink":
+			if err := real(dirfd, path, st, flags); err != nil {
+				return err
+			}
+			skippedUnlink = unix.Unlinkat(dirfd, path, 0) == nil
+			return nil
+		}
+		return real(dirfd, path, st, flags)
+	})
+
+	if err := Remove(f.parentFd, treeName, pin); err != nil {
+		t.Fatalf("Remove: %v (reason %q)", err, Reason(err))
+	}
+	if !skippedStat || !skippedUnlink {
+		t.Fatalf("seam did not exercise both ENOENT paths: stat=%v unlink=%v", skippedStat, skippedUnlink)
+	}
+	assertGone(t, f.root())
+}
+
+func TestRemoveReportsNameBytesBound(t *testing.T) {
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	f := newFixture(t)
+	pin := f.createTree(t)
+	for i := range 10 {
+		mustWrite(t, filepath.Join(f.root(), "name-"+strconv.Itoa(i)), "x")
+	}
+	prev := maxNameBytes
+	maxNameBytes = 40
+	t.Cleanup(func() { maxNameBytes = prev })
+
+	if err := Remove(f.parentFd, treeName, pin); !errors.Is(err, ErrBound) || Reason(err) != "bound" {
+		t.Fatalf("Remove = %v, want ErrBound", err)
+	}
+	assertExists(t, filepath.Join(f.root(), "name-0"))
+}
+
+func TestRemoveFailsClosedOnSwapBetweenOpens(t *testing.T) {
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	f := newFixture(t)
+	pin := f.createTree(t)
+	buildModuleCache(t, f.root())
+	fired := false
+	prev := hookBetweenPathAndReadOpen
+	hookBetweenPathAndReadOpen = func(dirfd int, name string) {
+		if fired || name != "sub" {
+			return
+		}
+		fired = true
+		if err := unix.Renameat(dirfd, name, dirfd, name+".moved"); err != nil {
+			t.Errorf("rename: %v", err)
+			return
+		}
+		if err := unix.Mkdirat(dirfd, name, 0o700); err != nil {
+			t.Errorf("mkdir: %v", err)
+		}
+	}
+	t.Cleanup(func() { hookBetweenPathAndReadOpen = prev })
+
+	err := Remove(f.parentFd, treeName, pin)
+	if !fired {
+		t.Fatal("hook never fired")
+	}
+	if !errors.Is(err, ErrMismatch) {
+		t.Fatalf("Remove = %v, want ErrMismatch", err)
+	}
+	assertExists(t, filepath.Join(f.root(), moduleCacheRel, "sub"))
+	assertExists(t, filepath.Join(f.root(), moduleCacheRel, "sub.moved", "sub.go"))
 }
