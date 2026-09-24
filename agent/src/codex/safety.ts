@@ -63,7 +63,21 @@ export interface BoundarySeams {
   dispose(request: BoundaryRequest): Promise<ToolDisposal>;
   spawnRoot: SpawnRootSeam;
   spawnProcess?: SpawnBoundaryProcessSeam;
+  /** Arms the boundary deadline: call `fire` once `ms` has elapsed, and return a cancel
+   *  the boundary calls at teardown. Absent ⇒ {@link defaultArmDeadline} (a wall-clock
+   *  unref'd timer). Tests inject an event-gated trigger so a deadline fires at a chosen
+   *  point instead of racing process load. */
+  armDeadline?: ArmBoundaryDeadline;
 }
+
+export type ArmBoundaryDeadline = (request: BoundaryRequest, ms: number, fire: () => void) => () => void;
+
+// The production deadline: a wall-clock timer that never holds the process open.
+const defaultArmDeadline: ArmBoundaryDeadline = (_request, ms, fire) => {
+  const timer = setTimeout(fire, ms);
+  timer.unref?.();
+  return () => clearTimeout(timer);
+};
 
 export type BoundaryActionOutcome =
   | { kind: "settled" }
@@ -202,8 +216,7 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
       this.registry.poison(errors);
       throw new CodexBoundaryError("quiesce", errors);
     }
-    const boundaryTimer = setTimeout(() => boundaryAbort.abort(), atEntry);
-    boundaryTimer.unref?.();
+    const cancelDeadline = (this.seams.armDeadline ?? defaultArmDeadline)(request, atEntry, () => boundaryAbort.abort());
     const requireRemaining = (stage: "reconcile" | "quiesce" | "reap"): void => {
       if (!boundaryAbort.signal.aborted && remainingMs(deadlineAt) > 0) return;
       const errors: readonly HarnessError[] = [{ category: "timeout", message: `codex boundary deadline expired after ${stage}` }];
@@ -317,7 +330,7 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     if (!outcome.ok) throw outcome.error;
     return outcome.value;
     } finally {
-      clearTimeout(boundaryTimer);
+      cancelDeadline();
     }
   }
 
@@ -526,6 +539,9 @@ export function createCodexExecutionSafety(
   // begins) so bounded terminal work can cap itself by what remains of it.
   onDispose?: (deadlineAt: number) => void | Promise<void>,
   spawnProcess?: SpawnBoundaryProcessSeam,
+  // Optional boundary-deadline trigger (see BoundarySeams.armDeadline); absent in
+  // production, so the deadline is the default wall-clock timer.
+  armDeadline?: ArmBoundaryDeadline,
 ): CodexExecutionSafetyImpl {
   return new CodexExecutionSafetyImpl(
     registry,
@@ -546,6 +562,7 @@ export function createCodexExecutionSafety(
       },
       spawnRoot,
       spawnProcess,
+      armDeadline,
     },
     reconcileBeforeBoundary,
   );

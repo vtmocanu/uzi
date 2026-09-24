@@ -700,3 +700,108 @@ describe("CodexExecutionSafety.withBoundary: primary-failure evidence preservati
     );
   });
 });
+
+describe("CodexExecutionSafety.withBoundary: boundary deadline trigger (issue #1513)", () => {
+  // Timer-free quiesce/reap so the only timer withBoundary arms is the boundary deadline.
+  const timerFreeSeams = (epoch: number): BoundarySeams => ({
+    quiesce: async () => ({ kind: "quiescent", epoch }),
+    reap: async () => ({ kind: "observed_empty", evidence: "supervisor_echild", epoch }),
+    dispose: async () => ({ kind: "disposed" }),
+    spawnRoot: spawnCounter().seam,
+  });
+  const awaitAbort = (signal: AbortSignal): Promise<void> =>
+    signal.aborted
+      ? Promise.resolve()
+      : new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+
+  it("with no armDeadline seam, a short wall-clock deadline still aborts the permit signal", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(40));
+    const safety = createCodexExecutionSafety(reg, spawnCounter().seam);
+    let signal: AbortSignal | undefined;
+    // Real default timer, but a budget wide enough that quiesce/reap/permit acquisition
+    // cannot plausibly outrun it under a loaded event loop: the action is always reached
+    // and then waits only on the deadline's abort, so the rejection stage is "action".
+    await assert.rejects(
+      safety.withBoundary({ boundary: "shutdown", deadlineMs: 250 }, async (permit) => {
+        signal = permit.signal;
+        await awaitAbort(permit.signal);
+      }),
+      (e: unknown) => e instanceof CodexBoundaryError && e.stage === "action",
+    );
+    assert.equal(signal?.aborted, true, "the default deadline aborted the permit signal");
+  });
+
+  it("the default deadline timer is unref'd and cleared at teardown", async () => {
+    const safety = new CodexExecutionSafetyImpl(new ExecutionRegistry(newLocalExecutionEpoch(41)), timerFreeSeams(41));
+    const realSetTimeout = globalThis.setTimeout;
+    const realClearTimeout = globalThis.clearTimeout;
+    const armed: { ms: number | undefined; handle: NodeJS.Timeout }[] = [];
+    const cleared: unknown[] = [];
+    try {
+      globalThis.setTimeout = ((fn: () => void, ms?: number) => {
+        const handle = realSetTimeout(fn, ms);
+        armed.push({ ms, handle });
+        return handle;
+      }) as typeof setTimeout;
+      globalThis.clearTimeout = ((handle?: NodeJS.Timeout) => {
+        cleared.push(handle);
+        realClearTimeout(handle);
+      }) as typeof clearTimeout;
+      const result = await safety.withBoundary({ boundary: "checkpoint", deadlineMs: 60_000 }, async () => "ok");
+      assert.equal(result, "ok");
+    } finally {
+      globalThis.setTimeout = realSetTimeout;
+      globalThis.clearTimeout = realClearTimeout;
+    }
+    // The spy is process-global, so under node's shared-process test mode it can also see
+    // timers scheduled by concurrent work during the await window. Only the boundary's own
+    // deadline is armed for the remaining ~60s budget, so filter on that window.
+    const deadlines = armed.filter(({ ms }) => ms !== undefined && ms > 59_000 && ms <= 60_000);
+    assert.equal(deadlines.length, 1, `exactly one deadline timer armed for the remaining budget: ${armed.map((a) => a.ms).join(",")}`);
+    const [deadline] = deadlines;
+    assert.equal(deadline?.handle.hasRef(), false, "the deadline timer never holds the process open");
+    assert.ok(cleared.includes(deadline?.handle), "teardown cleared the deadline timer");
+  });
+
+  it("an injected armDeadline receives the request and budget; fire aborts the permit signal; cancel runs at teardown", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(42));
+    const calls: { request: BoundaryRequest; ms: number }[] = [];
+    let fire: (() => void) | undefined;
+    let cancels = 0;
+    const safety = createCodexExecutionSafety(reg, spawnCounter().seam, undefined, undefined, undefined, (request, ms, f) => {
+      calls.push({ request, ms });
+      fire = f;
+      return () => {
+        cancels += 1;
+      };
+    });
+    let signal: AbortSignal | undefined;
+    await assert.rejects(
+      safety.withBoundary({ boundary: "finalize", deadlineMs: 60_000 }, async (permit) => {
+        signal = permit.signal;
+        assert.equal(permit.signal.aborted, false, "no wall-clock deadline fired on its own");
+        assert.equal(cancels, 0, "not cancelled while the action runs");
+        fire?.();
+        await awaitAbort(permit.signal);
+      }),
+      (e: unknown) => e instanceof CodexBoundaryError && e.stage === "action",
+    );
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]?.request.boundary, "finalize");
+    assert.ok((calls[0]?.ms ?? 0) > 59_000 && (calls[0]?.ms ?? 0) <= 60_000, `budget forwarded: ${calls[0]?.ms}`);
+    assert.equal(signal?.aborted, true, "fire aborted the permit signal");
+    assert.equal(cancels, 1, "the boundary cancelled its deadline at teardown");
+  });
+
+  it("an injected armDeadline that never fires lets the boundary settle cleanly and is cancelled once", async () => {
+    let cancels = 0;
+    const safety = new CodexExecutionSafetyImpl(new ExecutionRegistry(newLocalExecutionEpoch(43)), {
+      ...timerFreeSeams(43),
+      armDeadline: () => () => {
+        cancels += 1;
+      },
+    });
+    assert.equal(await safety.withBoundary({ boundary: "checkpoint", deadlineMs: 60_000 }, async () => 7), 7);
+    assert.equal(cancels, 1);
+  });
+});

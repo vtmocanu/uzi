@@ -11,6 +11,7 @@ import { LimitReachedError } from "../src/limit.js";
 import { TransientRecoveryError } from "../src/sdk-executor.js";
 import {
   createCodexExecutionSafety,
+  type ArmBoundaryDeadline,
   type ReconcileBeforeBoundary,
 } from "../src/codex/safety.js";
 import { buildRunLaneReconcile } from "../src/codex/codex-executor.js";
@@ -20,7 +21,7 @@ import {
   type RegisteredRoot,
 } from "../src/codex/registry.js";
 import { selectCodexBinding, type CodexBinding } from "../src/codex/select.js";
-import type { CodexExecutionSafety } from "../src/harness.js";
+import type { BoundaryRequest, CodexExecutionSafety } from "../src/harness.js";
 import { resolveBoundaryExecutable } from "../src/git.js";
 import { GitLabClient } from "../src/forge.js";
 import { recordingLogger } from "./helpers.js";
@@ -154,7 +155,54 @@ interface CodexRig {
 const RELEASE_TOK = "codex-release-tok-XXXXXXXX";
 const REFRESH_TOK = "codex-refresh-tok-XXXXXXXX";
 
-function codexRig(opts: { authMode?: "subscription" | "api_key"; blockReconcile?: boolean } = {}): CodexRig {
+/** Issue #1513: an event-gated boundary deadline. For the named boundary the deadline fires
+ *  only when the test calls `fire()`, so a slow (loaded) boundary can never expire before
+ *  the step under test is reached; every other boundary keeps a real unref'd timer. */
+function manualDeadline(boundary: BoundaryRequest["boundary"]): {
+  armDeadline: ArmBoundaryDeadline;
+  armed: () => number;
+  fire: () => void;
+  fired: () => number;
+} {
+  let armed = 0;
+  let fired = 0;
+  let pending: (() => void) | undefined;
+  const armDeadline: ArmBoundaryDeadline = (request, ms, fireDeadline) => {
+    if (request.boundary !== boundary) {
+      const timer = setTimeout(fireDeadline, ms);
+      timer.unref?.();
+      return () => clearTimeout(timer);
+    }
+    armed += 1;
+    pending = fireDeadline;
+    return () => {
+      pending = undefined;
+    };
+  };
+  return {
+    armDeadline,
+    armed: () => armed,
+    fire: () => {
+      if (!pending) throw new Error(`no armed ${boundary} deadline to fire`);
+      fired += 1;
+      pending();
+    },
+    fired: () => fired,
+  };
+}
+
+const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+function codexRig(
+  opts: {
+    authMode?: "subscription" | "api_key";
+    blockReconcile?: boolean;
+    /** Forwarded to createCodexExecutionSafety (issue #1513): event-gates a boundary deadline. */
+    armDeadline?: ArmBoundaryDeadline;
+    /** Delay before each permit-held process spawn: reproduces suite load deterministically. */
+    processSpawnDelayMs?: number;
+  } = {},
+): CodexRig {
   const authMode = opts.authMode ?? "subscription";
   const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
   const tr = trackedRoot();
@@ -200,6 +248,7 @@ function codexRig(opts: { authMode?: "subscription" | "api_key"; blockReconcile?
       processArgv.push(request.argv);
       const [command, ...args] = request.argv;
       if (!command) throw new Error("empty test process argv");
+      if (opts.processSpawnDelayMs) await delay(opts.processSpawnDelayMs);
       const child = spawn(command, args, { cwd: request.cwd, env: request.env, stdio: ["pipe", "pipe", "pipe"] });
       const terminal = new Promise<{ code: number }>((resolve, reject) => {
         child.once("error", reject);
@@ -217,6 +266,7 @@ function codexRig(opts: { authMode?: "subscription" | "api_key"; blockReconcile?
         waitChild: async () => terminal,
       };
     },
+    opts.armDeadline,
   );
   const boundaries: string[] = [];
   const disposeBoundaries: string[] = [];
@@ -265,58 +315,181 @@ function statuses(runId: string): string[] {
   return api.states.filter((s) => s.runId === runId).map((s) => s.body.status);
 }
 
+// Issue #1513: per-spawn delays that make the permit-held Git before the upload / forge call
+// outlast the OLD wall-clock budgets (500ms shutdown, 2000ms finalize), reproducing the
+// suite-load flake deterministically. The event-gated deadline must make that irrelevant.
+// The loaded tests' lower bounds (>= 500 / >= 2000) depend on how many permit-held git
+// spawns precede the upload / forge call: about 8 on the shutdown path and about 11 on the
+// finalize path today. The delays keep headroom against that count shrinking: 5 shutdown
+// spawns alone (550ms) and 8 finalize spawns alone (2000ms) already reach the bound. If a
+// boundary refactor drops spawns below that, raise the delay rather than the bound.
+const SHUTDOWN_LOAD_SPAWN_DELAY_MS = 110;
+const FINALIZE_LOAD_SPAWN_DELAY_MS = 250;
+
+/** The finalize deadline contract: a stuck forge request is aborted by the (event-gated)
+ *  finalize deadline and settles before withBoundary returns and before terminal dispose. */
+async function finalizeDeadlineScenario(
+  issue: number,
+  processSpawnDelayMs?: number,
+): Promise<{ entryToHttpStartMs: number }> {
+  const deadline = manualDeadline("finalize");
+  const events: string[] = [];
+  let httpCalls = 0;
+  let httpSettled = false;
+  let httpStartedAt = 0;
+  let httpSettledAt = 0;
+  let finalizeEnteredAt = 0;
+  const stuckForge = new GitLabClient({
+    httpTimeoutMs: 5_000,
+    fetchFn: async (_url, init) => {
+      httpCalls += 1;
+      httpStartedAt = Date.now();
+      events.push("http-start");
+      await new Promise<void>((_, reject) => {
+        const abort = (): void => {
+          httpSettled = true;
+          httpSettledAt = Date.now();
+          events.push("http-settled");
+          reject(new Error("finalize forge request aborted"));
+        };
+        if (init.signal?.aborted) abort();
+        else init.signal?.addEventListener("abort", abort, { once: true });
+        events.push("deadline-fired");
+        deadline.fire();
+      });
+      throw new Error("unreachable");
+    },
+  });
+  const rig = codexRig({ armDeadline: deadline.armDeadline, processSpawnDelayMs });
+  const originalWithBoundary = rig.safety.withBoundary.bind(rig.safety);
+  rig.safety.withBoundary = async (request, action) => {
+    if (request.boundary === "finalize") finalizeEnteredAt = Date.now();
+    try {
+      return await originalWithBoundary(request, action);
+    } finally {
+      if (request.boundary === "finalize") events.push("finalize-boundary-returned");
+    }
+  };
+  const originalDispose = rig.safety.dispose.bind(rig.safety);
+  let disposeBeforeHttpSettlement = false;
+  rig.safety.dispose = async (request) => {
+    events.push("dispose");
+    if (!httpSettled) disposeBeforeHttpSettlement = true;
+    return originalDispose(request);
+  };
+  const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
+    commitInTree(ctx.worktreePath, "STUCK-FORGE.txt", "finalize must cancel\n");
+    return { branch: ctx.branch };
+  });
+  await runnerWith(() => ({ executor: exec }), stuckForge, undefined, undefined, {
+    codexBoundaryDeadlineMs: 60_000,
+  }).execute(gitlabClaim(issue));
+  assert.equal(httpCalls, 1, "deadline cancellation prevented forge retry/backoff");
+  assert.equal(httpSettled, true, "the in-flight forge request observed permit cancellation");
+  assert.equal(deadline.armed(), 1, "the finalize deadline was armed once");
+  assert.equal(deadline.fired(), 1, "the finalize deadline fired once, from the forge call");
+  const at = (event: string): number => {
+    const i = events.indexOf(event);
+    assert.ok(i >= 0, `${event} recorded; events=${JSON.stringify(events)}`);
+    return i;
+  };
+  assert.ok(at("deadline-fired") < at("http-settled"), `the deadline caused the HTTP settlement; events=${JSON.stringify(events)}`);
+  assert.ok(at("http-settled") < at("finalize-boundary-returned"), `withBoundary returned only after HTTP settlement; events=${JSON.stringify(events)}`);
+  assert.ok(at("http-settled") < at("dispose"), `terminal dispose waited for HTTP settlement; events=${JSON.stringify(events)}`);
+  assert.equal(disposeBeforeHttpSettlement, false, "terminal dispose waited for HTTP settlement");
+  assert.ok(httpSettledAt - httpStartedAt < 4000, "the independent 5s forge timeout did not control finalize");
+  return { entryToHttpStartMs: httpStartedAt - finalizeEnteredAt };
+}
+
+/** The shutdown deadline contract: the (event-gated) shutdown deadline cancels the in-flight
+ *  checkpoint upload, and terminal dispose waits for the upload to settle. */
+async function shutdownDeadlineScenario(
+  issue: number,
+  processSpawnDelayMs?: number,
+): Promise<{ entryToUploadStartMs: number }> {
+  const { gitlab } = fakeGitlab();
+  const deadline = manualDeadline("shutdown");
+  const originalPublish = client.publishCheckpoint.bind(client);
+  let uploadSettled = false;
+  let uploadCalls = 0;
+  let uploadStartedAt = 0;
+  let shutdownEnteredAt = 0;
+  let uploadSignal: AbortSignal | undefined;
+  (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = async (
+    _runId: string,
+    _tipOid: string,
+    pack: Readable,
+    signal?: AbortSignal,
+  ) => {
+    uploadCalls += 1;
+    uploadStartedAt = Date.now();
+    uploadSignal = signal;
+    await drain(pack);
+    if (!signal) throw new Error("the shutdown upload must carry the boundary signal");
+    // Prove the deadline (not an already-aborted signal) is what aborts the upload.
+    assert.equal(signal.aborted, false, "the upload signal is live until the deadline fires");
+    deadline.fire();
+    await new Promise<void>((resolve) => {
+      if (signal.aborted) resolve();
+      else signal.addEventListener("abort", () => resolve(), { once: true });
+    });
+    await delay(30);
+    uploadSettled = true;
+    throw new Error("test upload aborted");
+  };
+  try {
+    const rig = codexRig({ armDeadline: deadline.armDeadline, processSpawnDelayMs });
+    const originalWithBoundary = rig.safety.withBoundary.bind(rig.safety);
+    rig.safety.withBoundary = (request, action) => {
+      if (request.boundary === "shutdown") shutdownEnteredAt = Date.now();
+      return originalWithBoundary(request, action);
+    };
+    const originalDispose = rig.safety.dispose.bind(rig.safety);
+    let disposeBeforeSettlement = false;
+    rig.safety.dispose = async (request) => {
+      if (!uploadSettled) disposeBeforeSettlement = true;
+      return originalDispose(request);
+    };
+    let started!: () => void;
+    const startedP = new Promise<void>((resolve) => { started = resolve; });
+    const runner = runnerWith(() => ({ executor: new FakeCodexExecutor(rig.safety, async (ctx) => {
+      commitInTree(ctx.worktreePath, "SHUT-TIMEOUT.txt", "work before timeout\n");
+      started();
+      await new Promise<void>((_, reject) => ctx.signal!.addEventListener("abort", () => reject(new Error("aborted")), { once: true }));
+      return { branch: ctx.branch };
+    }) }), gitlab, undefined, undefined, {
+      codexBoundaryDeadlineMs: 60_000,
+      shutdownPublishTimeoutMs: 60_000,
+    });
+    const run = runner.execute(gitlabClaim(issue, { wait_on_limit: true }));
+    await startedP;
+    runner.shutdown();
+    await run;
+    assert.equal(uploadSettled, true);
+    assert.equal(disposeBeforeSettlement, false, "terminal dispose cannot overtake the timed-out durability action");
+    assert.deepEqual(rig.disposeBoundaries, ["terminal"]);
+    assert.equal(uploadCalls, 1, "the checkpoint upload was attempted exactly once");
+    assert.equal(deadline.armed(), 1, "the shutdown deadline was armed once");
+    assert.equal(deadline.fired(), 1, "the shutdown deadline fired once, from the upload");
+    assert.equal(uploadSignal?.aborted, true, "the upload's signal was aborted by the shutdown deadline");
+  } finally {
+    (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = originalPublish;
+  }
+  return { entryToUploadStartMs: uploadStartedAt - shutdownEnteredAt };
+}
+
 // ================================================================================
 describe("RunRunner m4 — Codex durability sinks route through withBoundary", () => {
   it("aborts and settles a stuck finalize forge request before withBoundary/dispose returns", async () => {
-    let httpCalls = 0;
-    let httpSettled = false;
-    let httpStartedAt = 0;
-    let httpSettledAt = 0;
-    const stuckForge = new GitLabClient({
-      httpTimeoutMs: 5_000,
-      fetchFn: async (_url, init) => {
-        httpCalls += 1;
-        httpStartedAt = Date.now();
-        await new Promise<void>((_, reject) => {
-          const abort = (): void => {
-            httpSettled = true;
-            httpSettledAt = Date.now();
-            reject(new Error("finalize forge request aborted"));
-          };
-          if (init.signal?.aborted) abort();
-          else init.signal?.addEventListener("abort", abort, { once: true });
-        });
-        throw new Error("unreachable");
-      },
-    });
-    const rig = codexRig();
-    const originalWithBoundary = rig.safety.withBoundary.bind(rig.safety);
-    let finalizeBoundaryReturnedAt = 0;
-    rig.safety.withBoundary = async (request, action) => {
-      try {
-        return await originalWithBoundary(request, action);
-      } finally {
-        if (request.boundary === "finalize") finalizeBoundaryReturnedAt = Date.now();
-      }
-    };
-    const originalDispose = rig.safety.dispose.bind(rig.safety);
-    let disposeBeforeHttpSettlement = false;
-    rig.safety.dispose = async (request) => {
-      if (!httpSettled) disposeBeforeHttpSettlement = true;
-      return originalDispose(request);
-    };
-    const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
-      commitInTree(ctx.worktreePath, "STUCK-FORGE.txt", "finalize must cancel\n");
-      return { branch: ctx.branch };
-    });
-    await runnerWith(() => ({ executor: exec }), stuckForge, undefined, undefined, {
-      codexBoundaryDeadlineMs: 2_000,
-    }).execute(gitlabClaim(1219));
-    assert.equal(httpCalls, 1, "deadline cancellation prevented forge retry/backoff");
-    assert.equal(httpSettled, true, "the in-flight forge request observed permit cancellation");
-    assert.ok(httpSettledAt <= finalizeBoundaryReturnedAt, "withBoundary returned only after HTTP settlement");
-    assert.equal(disposeBeforeHttpSettlement, false, "terminal dispose waited for HTTP settlement");
-    assert.ok(httpSettledAt - httpStartedAt < 4000, "the independent 5s forge timeout did not control finalize");
+    await finalizeDeadlineScenario(1219);
+  });
+
+  it("finalize deadline contract holds when permit-held Git is slow (suite load, issue #1513)", async () => {
+    const r = await finalizeDeadlineScenario(1223, FINALIZE_LOAD_SPAWN_DELAY_MS);
+    assert.ok(
+      r.entryToHttpStartMs >= 2_000,
+      `the loaded finalize boundary outlasted the old 2000ms wall-clock budget before the forge call (${r.entryToHttpStartMs}ms)`,
+    );
   });
 
   it("(1) phasePublish FINALIZE routes through withBoundary; the trusted push/MR runs inside it (subscription reconcile + reap before publish)", async () => {
@@ -479,53 +652,15 @@ describe("RunRunner m4 — Codex durability sinks route through withBoundary", (
   });
 
   it("shutdown deadline cancels the upload and awaits its settlement before safety.dispose", async () => {
-    const { gitlab } = fakeGitlab();
-    const originalPublish = client.publishCheckpoint.bind(client);
-    let uploadSettled = false;
-    (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = async (
-      _runId: string,
-      _tipOid: string,
-      pack: Readable,
-      signal?: AbortSignal,
-    ) => {
-      await drain(pack);
-      await new Promise<void>((resolve) => {
-        if (signal?.aborted) resolve();
-        else signal?.addEventListener("abort", () => resolve(), { once: true });
-      });
-      await new Promise<void>((resolve) => setTimeout(resolve, 30));
-      uploadSettled = true;
-      throw new Error("test upload aborted");
-    };
-    try {
-      const rig = codexRig();
-      const originalDispose = rig.safety.dispose.bind(rig.safety);
-      let disposeBeforeSettlement = false;
-      rig.safety.dispose = async (request) => {
-        if (!uploadSettled) disposeBeforeSettlement = true;
-        return originalDispose(request);
-      };
-      let started!: () => void;
-      const startedP = new Promise<void>((resolve) => { started = resolve; });
-      const runner = runnerWith(() => ({ executor: new FakeCodexExecutor(rig.safety, async (ctx) => {
-        commitInTree(ctx.worktreePath, "SHUT-TIMEOUT.txt", "work before timeout\n");
-        started();
-        await new Promise<void>((_, reject) => ctx.signal!.addEventListener("abort", () => reject(new Error("aborted")), { once: true }));
-        return { branch: ctx.branch };
-      }) }), gitlab, undefined, undefined, {
-        codexBoundaryDeadlineMs: 500,
-        shutdownPublishTimeoutMs: 500,
-      });
-      const run = runner.execute(gitlabClaim(1209, { wait_on_limit: true }));
-      await startedP;
-      runner.shutdown();
-      await run;
-      assert.equal(uploadSettled, true);
-      assert.equal(disposeBeforeSettlement, false, "terminal dispose cannot overtake the timed-out durability action");
-      assert.deepEqual(rig.disposeBoundaries, ["terminal"]);
-    } finally {
-      (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = originalPublish;
-    }
+    await shutdownDeadlineScenario(1209);
+  });
+
+  it("shutdown deadline contract holds when permit-held Git is slow (suite load, issue #1513)", async () => {
+    const r = await shutdownDeadlineScenario(1224, SHUTDOWN_LOAD_SPAWN_DELAY_MS);
+    assert.ok(
+      r.entryToUploadStartMs >= 500,
+      `the loaded shutdown boundary outlasted the old 500ms wall-clock budget before the upload (${r.entryToUploadStartMs}ms)`,
+    );
   });
 
   it("(1) recovery publication routes through withBoundary (boundary=shutdown)", async () => {
