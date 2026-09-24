@@ -104,10 +104,10 @@ const finalStatus = (runId: string): string | undefined =>
     (st) => st === "completed" || st === "failed",
   )[0];
 
-/** A GitHub-PAT-shaped value ASSEMBLED AT RUNTIME (never a complete token literal in source). */
+/** A GitHub-PAT-shaped value ASSEMBLED AT RUNTIME (never a complete token literal in source). The
+ *  36-char body is hex (18 random bytes): uniformly distributed, with no modulo bias. */
 function runtimeSecret(): string {
-  const alnum = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-  const body = [...randomBytes(36)].map((b) => alnum[b % alnum.length]).join("");
+  const body = randomBytes(18).toString("hex");
   return "gh" + "p_" + body;
 }
 
