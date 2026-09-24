@@ -14,7 +14,7 @@ import (
 )
 
 // Issue #1594: the provider-rejection primitive (store.QuarantineRejectedCodexRefresh),
-// the reauth_reason column + CHECK (00247/00248), and the clear sites that null it.
+// the reauth_reason column + CHECK (00248/00249), and the clear sites that null it.
 
 const (
 	rejectGen = int64(7)
@@ -273,7 +273,7 @@ func TestQuarantineRejectedCodexRefreshFencesLiveDB(t *testing.T) {
 	}
 }
 
-// 00247/00248: a reason needs a raised flag and must come from the closed set.
+// 00248/00249: a reason needs a raised flag and must come from the closed set.
 func TestCodexReauthReasonCheckLiveDB(t *testing.T) {
 	ctx, pool, q, user := codexLiveDB(t)
 	f := newRejectionFixture(ctx, t, pool, q, user)
@@ -290,7 +290,7 @@ func TestCodexReauthReasonCheckLiveDB(t *testing.T) {
 	}
 	var validated bool
 	if err := pool.QueryRow(ctx, `SELECT convalidated FROM pg_constraint WHERE conname = 'codex_provider_account_reauth_reason_check'`).Scan(&validated); err != nil || !validated {
-		t.Fatalf("reason CHECK validated = (%v,%v), want (true,nil) after 00248", validated, err)
+		t.Fatalf("reason CHECK validated = (%v,%v), want (true,nil) after 00249", validated, err)
 	}
 }
 

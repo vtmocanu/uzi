@@ -254,7 +254,7 @@ SET generation           = generation + 1,
     reauth_required            = false,
     reauth_generation          = NULL,
     reauth_credential_revision = NULL,
-    -- Issue #1594: the reason is only meaningful while the flag is raised (00247's CHECK),
+    -- Issue #1594: the reason is only meaningful while the flag is raised (00248's CHECK),
     -- so it is cleared in the same statement as the flag.
     reauth_reason              = NULL,
     updated_at           = now()
@@ -345,7 +345,7 @@ SET sealed_login         = @sealed,
     reauth_required            = false,
     reauth_generation          = NULL,
     reauth_credential_revision = NULL,
-    -- Issue #1594: the reason is only meaningful while the flag is raised (00247's CHECK),
+    -- Issue #1594: the reason is only meaningful while the flag is raised (00248's CHECK),
     -- so it is cleared in the same statement as the flag.
     reauth_reason              = NULL,
     updated_at           = now()
@@ -402,7 +402,7 @@ SET sealed_login         = @sealed,
     reauth_required            = false,
     reauth_generation          = NULL,
     reauth_credential_revision = NULL,
-    -- Issue #1594: the reason is only meaningful while the flag is raised (00247's CHECK),
+    -- Issue #1594: the reason is only meaningful while the flag is raised (00248's CHECK),
     -- so it is cleared in the same statement as the flag.
     reauth_reason              = NULL,
     updated_at           = now()
@@ -440,7 +440,7 @@ UPDATE codex_provider_account
 SET reauth_required            = true,
     reauth_generation          = @observed_generation::bigint,
     reauth_credential_revision = @observed_credential_revision::bigint,
-    -- Issue #1594: the poll path records no reason (00247's closed set names only the
+    -- Issue #1594: the poll path records no reason (00248's closed set names only the
     -- provider-rejection path), so it sets the reason NULL explicitly.
     reauth_reason              = NULL,
     updated_at                 = now()
