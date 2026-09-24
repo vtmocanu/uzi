@@ -173,8 +173,11 @@ A few worth knowing:
   or whichever harness you have a usable credential for). `schedule edit
   --harness ""` clears a schedule's pin back to per-fire resolution; leaving
   the flag unset on edit leaves the stored pin unchanged. The resolved
-  harness shows in a `HARNESS` column on `uzi run list`/`run get`, and a
-  schedule's pin (or `implicit` when unset) shows on `uzi schedule get`.
+  harness shows as a `HARNESS` row on `uzi run get`; on `uzi run list` it's
+  a `HARNESS` column that shows `codex` for a Codex run and is left blank
+  for a Claude run (the terse convention the CLI's list view uses
+  throughout). A schedule's pin (or `implicit` when unset) shows on `uzi
+  schedule get`.
   There's no CLI setter for your own default harness; that's a **Settings →
   Run defaults** web-only control (see [Worker model](./worker-model.md)).
 - **`version` reports two coordinates, not one.** It always prints the CLI's own

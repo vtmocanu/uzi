@@ -10,11 +10,15 @@ With the run judge on, every one of your **finished** runs gets a
 retrospective: an LLM reads the run's trace (agents, tools, plan, review
 cycles, delivery) and produces a verdict plus structured recommendations —
 never code changes, only advice. It's opt-in and off by default; your
-instance admin also has to enable it globally first. The judge always
-inherits the reviewed run's own harness: a Claude run is judged on **your
+instance admin also has to enable it globally first. The judge always runs
+on the same harness as the reviewed run: a Claude run is judged on **your
 own Anthropic token** — your default one, a token you name for the judge
 lane specifically, or auto-selected from your token pool — and a Codex run
-is judged on the Codex credential frozen onto it at creation.
+is judged on **your usable Codex credential at the time the judge is
+queued**, freshly resolved and frozen onto the judge run — not necessarily
+the same credential the reviewed run itself used. If you have no usable
+Codex credential when the judge would be queued, the judge is skipped for
+that run, with no fallback to another harness.
 
 ## 1. Enable it
 
@@ -58,10 +62,14 @@ see the next section.
 
 ## Which token the judge spends
 
-**This picker covers Claude judge runs only.** A Codex run's judge always
-spends the Codex credential frozen onto that run at creation — the same
-credential the run itself used — with no separate judge-lane pick; the
-picker below never applies to it.
+**This picker covers Claude judge runs only.** A Codex run's judge spends
+**your usable Codex credential at the time the judge is queued** —
+re-resolved fresh (subscription default first) and frozen onto the judge
+run, which is not guaranteed to be the credential the reviewed run itself
+used — with no separate judge-lane pick; the picker below never applies to
+it. If you have no usable Codex credential when the judge would be queued,
+the judge is skipped for that run rather than falling back to any other
+credential or harness.
 
 By default the judge auto-selects from your Anthropic [token
 pool](./anthropic-token.md#letting-uzi-pick-the-token-auto-selection). If you
@@ -89,12 +97,15 @@ up waiting on a judge that can't run.
 
 ## Which model it runs on
 
-**The Judge model picker below is Claude-only too.** A Codex judge's model
-follows [your Codex worker model](./worker-model.md), the same as an
-ordinary Codex run: `gpt-6-astra` unless you've set your own Codex worker
-model default. If your Judge model picks a Claude alias, a Codex run's
-judge drops it and falls back to your Codex default instead, with a visible
-note on the run — a Claude model can never reach a Codex judge call.
+**The Judge model picker in the web UI only offers Claude aliases** — it is
+not a server-side restriction, just what the picker shows. Your Codex
+worker-model default does **not** reach a Codex judge: unless the effective
+judge model (your own override, or the instance default) happens to be a
+Codex model id itself, a Codex judge runs on the built-in Codex default
+(`gpt-6-astra`), regardless of what you've set as your Codex worker model.
+If the effective judge model is instead a Claude alias, a Codex run's judge
+drops it and falls back to that same built-in default, with a visible note
+on the run — a Claude model can never reach a Codex judge call.
 
 The instance default is **opus** — the strongest model, since the judge's
 recommendations feed the [self-improvement job](./scheduling.md#default-jobs)

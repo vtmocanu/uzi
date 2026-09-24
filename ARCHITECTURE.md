@@ -1544,7 +1544,7 @@ on.
   [PRD #808](prds/done/808-worker-egress-single-source.md), so the SSRF allowlist
   and the FQDN list cannot drift), `*.anthropic.com`, `api.openai.com`,
   `chatgpt.com` and `auth.openai.com` (the Codex API, ChatGPT-subscription
-  backend and OpenAI auth host, PRD #1106 D12 — fleet-wide once shipped, since
+  backend and OpenAI auth host, PRD #1106 D12 — fleet-wide, since
   the allowlist is a namespace-level policy with no per-harness split, so a
   worker that only ever runs Claude still carries these three), `search.devbox.sh`,
   `api.github.com` (the devbox/nixpkgs resolver host), and the CNPG chart's OCI pair

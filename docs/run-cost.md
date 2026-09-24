@@ -51,17 +51,23 @@ session-cumulative fold and what it does not backfill.
 
 Not every run's cost is a real dollar figure. Each run's folded `run_usage`
 row carries a `cost_status` of `metered`, `subscription`, or `unreported`,
-and every reader (the run page, `uzi run list`, `/api/usage`, the admin
-usage pages) branches on that status rather than guessing from `cost_usd`
-alone.
+and every reader that shows a per-run cost branches on that status rather
+than guessing from `cost_usd` alone: the run page, `/api/usage`, the admin
+usage pages, `uzi run get`'s COST row, and the TUI. `uzi run list` shows no
+cost at all (its columns are ID, KIND, STATUS, AGE, HARNESS, TITLE); reach
+for `uzi run get <id>` or the TUI for a run's cost from the CLI.
 
 A Claude run is always `metered`: the SDK reports a dollar figure per
 call, folded exactly as described above. A Codex run's status instead
-follows the credential mode the run is bound to: an OpenAI **API key** run
-is `metered` from OpenAI's own price table, with `unreported` as the safe
-fallback when the model has no price row (e.g. an unrecognized custom
-Codex model); a **subscription** Codex login has no per-token charge at
-all, so every one of its runs is `subscription`, cost pinned to $0.
+follows the credential mode the run is bound to: a **subscription** Codex
+login has no per-token charge at all, so every one of its runs is
+`subscription`, cost pinned to $0. An OpenAI **API key** run is `metered`
+from OpenAI's own price table only when every observed response prices
+cleanly; it falls back to `unreported` whenever that evidence is
+incomplete — no price row for the model (e.g. an unrecognized custom Codex
+model), or no, unreconciled, or malformed usage evidence for one of its
+responses — so a partial or uncertain read is never presented as a real
+metered dollar figure.
 
 The UI never renders a non-metered run as a bare "$0" or dash, since that
 would be ambiguous with a real zero-cost metered call. It spells the status
