@@ -30,7 +30,7 @@ through `[0.52.0]`.)
 ### Changed
 
 - **The graceful-shutdown checkpoint feed line names a bounded reason class instead of raw error text ([#1597](https://github.com/vtmocanu/uzi/issues/1597)).**
-  A checkpoint that did not reach origin now reports one of a fixed set of classes (`timeout`, `boundary_blocked`, `publish_rejected`, `publish_skipped`, `publish_error`, `no_local_tip`, `bare_lock_retained`) rather than a thrown error's message or remote text, and a publish that lands wins over a later, unrelated boundary error.
+  A checkpoint that did not reach origin now reports one of a fixed set of classes (`timeout`, `boundary_blocked`, `publish_rejected`, `publish_skipped`, `publish_error`, `no_local_tip`, `tick_process_survived`, `bare_lock_retained`) rather than a thrown error's message or remote text, and a publish that lands wins over a later, unrelated boundary error.
 
 ## [0.84.0] - 2026-09-20
 

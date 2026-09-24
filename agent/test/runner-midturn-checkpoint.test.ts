@@ -1255,7 +1255,7 @@ describe("mid-turn checkpoint lock custody (issue #1597 M2)", () => {
     }
   });
 
-  it("(i) survivor: a tick process group that outlives its SIGKILL blocks the sink until it is gone", async () => {
+  it("(i) survivor: a tick process group that outlives its SIGKILL blocks ticks, delays gated sinks, and unblocks once gone", async () => {
     const tmp = scratchDir("survivor");
     const shim = writeShim(tmp, "detect");
     const iid = 1597_235;
@@ -1286,9 +1286,20 @@ describe("mid-turn checkpoint lock custody (issue #1597 M2)", () => {
           ctl.advance(INTERVAL_MS + 1);
           ctl.fireNoWait();
           await waitFor(() => isReady(stubborn));
-          await ctx.checkpoint!({ reap: false }); // preempts the tick, which is cancelled
-          assert.equal(ctl.outcomes[0], "bare_lock_retained", "a survivor blocks the sink for its own tick");
-          // The flight re-checks the group with the REAL probe: the SIGKILLed child is gone.
+          // The milestone preempts the tick (cancelled); the gated milestone sink then WAITS, bounded,
+          // for the (forced) survivor before touching the clone, and proceeds with a logged residual.
+          const t0 = Date.now();
+          await ctx.checkpoint!({ reap: false });
+          assert.equal(ctl.outcomes[0], "tick_process_survived", "a survivor names its own tick's class");
+          assert.ok(Date.now() - t0 >= 1_500, "the gated sink waited for the survivor");
+          assert.ok(
+            lines.some((l) => l.msg === "durable sink proceeding while a surviving tick process group is still alive"),
+            "the gated sink logged the residual",
+          );
+          // Still alive: a later tick skips on the survivor.
+          ctl.advance(INTERVAL_MS + 1);
+          later.push(await ctl.fire());
+          // Gone (the flight's probe now falls through to the REAL one: the SIGKILLed child is dead).
           forceAlive = false;
           ctl.advance(INTERVAL_MS + 1);
           later.push(await ctl.fire());
@@ -1298,10 +1309,11 @@ describe("mid-turn checkpoint lock custody (issue #1597 M2)", () => {
         logger,
       );
       p = runner.execute(claim);
-      await waitFor(() => later.length === 1, 20_000);
+      await waitFor(() => later.length === 2, 20_000);
       runner.shutdown();
       await p;
-      assert.notEqual(later[0], "bare_lock_retained", "the sink unblocks once the surviving group is gone");
+      assert.equal(later[0], "tick_process_survived", "a later tick skips while the survivor lives");
+      assert.notEqual(later[1], "tick_process_survived", "the sink unblocks once the surviving group is gone");
       assert.ok(
         lines.some((l) => l.msg === "mid-turn checkpoint: a tick process group survived its SIGKILL; blocking the sink"),
         "the survivor was logged",

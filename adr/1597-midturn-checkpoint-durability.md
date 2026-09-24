@@ -256,9 +256,13 @@ correctly keeps rather than risks deleting something it cannot verify.
 
 The graceful-shutdown feed line now says `published`, or names one bounded reason class
 when it is not: `timeout`, `boundary_blocked`, `publish_rejected`, `publish_skipped`,
-`publish_error`, `no_local_tip`, or `bare_lock_retained` — every one of these classes is
-new in this issue (the last was added in M2 — a cancelled tick's retained lock, still
-present, is what is blocking the fetch-back or publish). **A publish that landed wins over
+`publish_error`, `no_local_tip`, `bare_lock_retained` or `tick_process_survived` — every
+one of these classes is new in this issue (the last two were added in M2: a cancelled tick's
+retained lock, still present, is what is blocking the fetch-back or publish; or a cancelled
+tick's process group was still alive after its SIGKILL). A surviving group also delays every
+gated durable sink, bounded: the sink waits for it to go, then proceeds with a logged
+residual rather than starving milestone, park and shutdown checkpoints for a process stuck
+in the kernel. **A publish that landed wins over
 a late Codex boundary error**: if the checkpoint body's publish was ACKed before the
 boundary itself later throws (e.g. a deadline or cleanup failure after the ACK), the feed
 reports `published`, not the boundary error — a checkpoint that is real on origin must

@@ -206,8 +206,9 @@ type PublishOutcome =
  *  in the run log. Published WINS over a later boundary error. `no_local_tip` = the tracking tip
  *  was unresolved (no tracking ref, or it could not be read). issue #1597 M2 adds
  *  `bare_lock_retained`: the checkpoint did not land while a cancelled mid-turn tick had left a git
- *  lock file in the worker bare that could not be proven the tick's own (so it was kept). The feed
- *  line prints the class verbatim. */
+ *  lock file in the worker bare that could not be proven the tick's own (so it was kept), and
+ *  `tick_process_survived`: it did not land while a cancelled tick's process group was still alive
+ *  after its SIGKILL. The feed line prints the class verbatim. */
 type ShutdownCheckpointOutcome =
   | "published"
   | "timeout"
@@ -216,7 +217,8 @@ type ShutdownCheckpointOutcome =
   | "publish_skipped"
   | "publish_error"
   | "no_local_tip"
-  | "bare_lock_retained";
+  | "bare_lock_retained"
+  | "tick_process_survived";
 
 /** issue #1597 M1: map the shutdown body's publish result to its shutdown class. An `aborted`
  *  publish is a `timeout` when the permit/deadline signal is what aborted it, else a
@@ -256,7 +258,16 @@ type CheckpointBodyOutcome =
 /** issue #1597 M2: the class one MID-TURN checkpoint tick ended in, logged as
  *  runLog.info("mid-turn checkpoint tick", {outcome}). A local fetch-back alone is never
  *  `published` — only a publish the broker confirmed is. */
-type MidTurnTickOutcome = CheckpointBodyOutcome | "git_busy" | "gate_busy" | "bare_lock_retained";
+/** issue #1597 M2: how long a durable sink waits for a surviving tick process group before it
+ *  proceeds anyway (and logs the residual). */
+const SURVIVOR_SINK_WAIT_MS = 2_000;
+
+type MidTurnTickOutcome =
+  | CheckpointBodyOutcome
+  | "git_busy"
+  | "gate_busy"
+  | "bare_lock_retained"
+  | "tick_process_survived";
 
 /** issue #1597 M2: the checkpoint body's options — ctx.checkpoint's plus the tick-only knobs. */
 type CheckpointBodyOpts = Parameters<NonNullable<RunContext["checkpoint"]>>[0] & {
@@ -933,8 +944,9 @@ interface RunFlight {
    *  class; entries whose file is gone are dropped. */
   retainedBareLocks: string[];
   /** issue #1597 M2: tick child process groups that were still alive after their SIGKILL and the
-   *  bounded settlement wait. They block the sink exactly like a retained lock (same
-   *  `bare_lock_retained` class) while any member is still alive; gone groups are dropped. */
+   *  bounded settlement wait. While any member is alive, later ticks skip (`tick_process_survived`),
+   *  every gated sink first waits (bounded) for them to go, and a shutdown checkpoint that does not
+   *  land names that class; gone groups are dropped. */
   survivingTickGroups: SurvivingGroup[];
   /** issue #1597 M2 (round 3): a milestone publish was DEFERRED out of a Codex permit
    *  (`scan_deferred`) and is owed — the next overlay-less checkpoint outside a permit publishes
@@ -1866,6 +1878,8 @@ export class RunRunner {
           const durability = (async (): Promise<ShutdownCheckpointOutcome> => {
             let publishOutcome: PublishOutcome | undefined;
             let permitSignal: AbortSignal | undefined;
+            // issue #1597 M2: a surviving tick process group gets its bounded chance to go first.
+            await this.awaitTickSurvivorsGone(flight);
             try {
               // PRD #1171 m4: the shutdown durability publish routes through the reap facade so
               // deadlineMs ≤ the shutdown publish timeout keeps it inside the k8s grace race
@@ -1932,7 +1946,13 @@ export class RunRunner {
           // not land is named for that cause — the retained lock is what blocks the fetch-back/
           // publish. A lock that has since gone never relabels an unrelated failure.
           const outcome: ShutdownCheckpointOutcome =
-            raced !== "published" && (await this.retainedBareLockRemains(flight)) ? "bare_lock_retained" : raced;
+            raced === "published"
+              ? raced
+              : this.tickSurvivorsRemain(flight)
+                ? "tick_process_survived"
+                : (await this.retainedBareLockRemains(flight))
+                  ? "bare_lock_retained"
+                  : raced;
           runLog.info("shutdown checkpoint outcome", { run_id: runId, outcome });
           // issue #1030 M4: surface the outcome on the feed the same way the park path does — a
           // direct batcher.emit, NOT deduped (it fires once per shutdown; only the generic
@@ -6073,7 +6093,7 @@ export class RunRunner {
       // place and must KEEP the flags to leave the run non-terminal for a requeue.
       // issue #1597 M2: gated end to end — from the wip marker captureRecoveryRestorePoint commits to
       // the give-up's undoWipMarker — so a mid-turn tick can never publish that throwaway marker.
-      attemptCredentialSwitch: () => flight.sinkGate.run(async () => {
+      attemptCredentialSwitch: () => this.runGatedSink(flight, async () => {
         const outcome = await this.enterCredentialSwitch(claim, flight, runLog);
         if (outcome === "retained_stop") {
           // The switch could not be confirmed (BLOCKING-2/3 rework). enterCredentialSwitch RETAINED
@@ -6389,7 +6409,7 @@ export class RunRunner {
       // Best-effort throughout: a checkpoint must NEVER fail the run.
       checkpoint: (opts) =>
         // issue #1597 M2: gated — waits for (and preempts) an in-flight mid-turn tick.
-        flight.sinkGate.run(async () => {
+        this.runGatedSink(flight, async () => {
           await checkpointBody({ reap: opts.reap, progress: opts.progress });
         }),
       // Issue #281: a cheap fingerprint of the runner clone's committed + working-tree
@@ -6415,7 +6435,7 @@ export class RunRunner {
       // returning whether the run parked. Called from the implement loop's pause boundary and
       // its `now`-pause turn catch.
       // issue #1597 M2: gated — a tick can never fetch/publish the wip marker this path commits.
-      parkForPause: (pausedAt) => flight.sinkGate.run(() => this.handlePausePark(claim, flight, pausedAt)),
+      parkForPause: (pausedAt) => this.runGatedSink(flight, () => this.handlePausePark(claim, flight, pausedAt)),
       // PRD #1497 M2 (D4): park the run at its WALL-CLOCK limit — the CAPTURE-FIRST wall park,
       // NOT handlePausePark. Delegates to enterWallPark, which reaps, captures a verified restore
       // point via the SHARED captureHoldContext, reports the wall_park transition, and returns the
@@ -6423,7 +6443,7 @@ export class RunRunner {
       // implement loop's wall-pause turn catch, its pre-attempt REASON_WALL arm, and the loop-top
       // wall boundary.
       // issue #1597 M2: gated against the mid-turn tick (it reaps and captures a restore point).
-      parkForWall: () => flight.sinkGate.run(() => this.enterWallPark(flight, claim, runLog)),
+      parkForWall: () => this.runGatedSink(flight, () => this.enterWallPark(flight, claim, runLog)),
       // Issue #1600: hand the executor the budget a refused wall park carried, once.
       takeWallParkRefresh: () => {
         const refresh = flight.wallParkRefresh;
@@ -6463,7 +6483,7 @@ export class RunRunner {
       // until #1232, so this seam is inert in production — completionInterlock above is false.
       // issue #1597 M2: gated against the mid-turn tick (it reaps and captures a restore point).
       enterCompletionHold: (reason) =>
-        flight.sinkGate.run(() => this.enterCompletionHold(flight, claim, reason, runLog)),
+        this.runGatedSink(flight, () => this.enterCompletionHold(flight, claim, reason, runLog)),
       // PRD #1226 M5 (D6): the completion-question LIVE window, wired as a SIBLING to
       // enterCompletionHold. The executor calls THIS at the completion-STALL point (STALL_LIMIT
       // identical no-progress completion attempts) INSTEAD of parking straight away — it authors an
@@ -6948,20 +6968,50 @@ export class RunRunner {
    * are gone are dropped (and the "sink blocked" feed line may be emitted again for a later
    * episode). lstat only; any error other than ENOENT keeps the entry (cannot prove it is gone).
    */
-  private async retainedBareLockRemains(flight: RunFlight): Promise<boolean> {
-    if (flight.survivingTickGroups.length > 0) {
-      // A tick process that outlived its SIGKILL may still write the bare or the clone: block the
-      // sink while any member of its group is alive (the probe fails safe: unknown = alive).
-      const alive = flight.survivingTickGroups.filter((g) => processGroupAlive(g.pgid, g.identity));
-      if (alive.length === 0) {
-        flight.runLog.info("mid-turn checkpoint sink unblocked: the surviving tick process group(s) are gone", {
-          run_id: flight.runId,
-          pgids: flight.survivingTickGroups.map((g) => g.pgid),
-        });
-      }
-      flight.survivingTickGroups = alive;
-      if (alive.length > 0) return true;
+  /** issue #1597 M2: true while a tick process group that outlived its SIGKILL is still alive (the
+   *  probe fails safe: unknown = alive). Gone groups are dropped, with one "unblocked" log line. */
+  private tickSurvivorsRemain(flight: RunFlight): boolean {
+    if (flight.survivingTickGroups.length === 0) return false;
+    const probe = (g: SurvivingGroup): boolean =>
+      this.checkpointTestHooks?.tickSpawn?.groupAlive?.(g.pgid) ?? processGroupAlive(g.pgid, g.identity);
+    const alive = flight.survivingTickGroups.filter(probe);
+    if (alive.length === 0) {
+      flight.runLog.info("mid-turn checkpoint sink unblocked: the surviving tick process group(s) are gone", {
+        run_id: flight.runId,
+        pgids: flight.survivingTickGroups.map((g) => g.pgid),
+      });
     }
+    flight.survivingTickGroups = alive;
+    return alive.length > 0;
+  }
+
+  /** issue #1597 M2: before a durable sink touches the clone or the bare, wait (bounded) for any
+   *  surviving tick process group to go. A durable sink is NOT skipped for it: a group that survived
+   *  SIGKILL is a process stuck in the kernel, and starving every milestone/park/shutdown checkpoint
+   *  for it would lose the very durability this work adds; the residual is logged instead. */
+  private async awaitTickSurvivorsGone(flight: RunFlight): Promise<void> {
+    if (!this.tickSurvivorsRemain(flight)) return;
+    const deadline = Date.now() + SURVIVOR_SINK_WAIT_MS;
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 25));
+      if (!this.tickSurvivorsRemain(flight)) return;
+    }
+    flight.runLog.warn("durable sink proceeding while a surviving tick process group is still alive", {
+      run_id: flight.runId,
+      pgids: flight.survivingTickGroups.map((g) => g.pgid),
+    });
+  }
+
+  /** issue #1597 M2: run a durable sink under the per-flight sink gate, after surviving tick
+   *  process groups had their bounded chance to go. */
+  private runGatedSink<T>(flight: RunFlight, fn: () => Promise<T>): Promise<T> {
+    return flight.sinkGate.run(async () => {
+      await this.awaitTickSurvivorsGone(flight);
+      return fn();
+    });
+  }
+
+  private async retainedBareLockRemains(flight: RunFlight): Promise<boolean> {
     if (flight.retainedBareLocks.length === 0) return false;
     const still: string[] = [];
     for (const p of flight.retainedBareLocks) {
@@ -7180,6 +7230,7 @@ export class RunRunner {
       const raceAbort = <T>(p: Promise<T>): Promise<T | typeof ABORTED> => Promise.race([p, abortedP]);
       try {
         if (stopped || ac.signal.aborted) return "aborted";
+        if (this.tickSurvivorsRemain(flight)) return "tick_process_survived";
         const blocked = await raceAbort(this.retainedBareLockRemains(flight));
         if (blocked === ABORTED) return "aborted";
         if (blocked) return "bare_lock_retained";
@@ -7227,12 +7278,13 @@ export class RunRunner {
         ...(hooks?.tickSpawn ? { hooks: hooks.tickSpawn } : {}),
       });
       let retainedHere = false;
+      let survivedHere = false;
       // Settle + reconcile WHILE the per-bare lock is still held (GitCache.withLock's pre-release
       // hook), so no other bare mutation can run between a SIGKILLed child and its lock's removal.
       const beforeLockRelease = async (key: string): Promise<void> => {
         if (key !== barePath || !ac.signal.aborted) return;
         await spawner.settled();
-        if (handleSurvivors(spawner.survivors())) retainedHere = true;
+        if (handleSurvivors(spawner.survivors())) survivedHere = true;
         if (handleLocks(await spawner.reconcileLocks())) retainedHere = true;
       };
       const release = flight.sinkGate.tryAcquire(() => ac.abort());
@@ -7272,7 +7324,7 @@ export class RunRunner {
         // FULL settlement before the gate is released: every child exited, then lock custody for a
         // child cancelled outside a withLock section (pack-objects, rev-parse), under the bare lock.
         await spawner.settled();
-        if (handleSurvivors(spawner.survivors())) retainedHere = true;
+        if (handleSurvivors(spawner.survivors())) survivedHere = true;
         if (spawner.cancelledAny()) {
           const res = await this.git
             .withBareLock(barePath, () => spawner.reconcileLocks())
@@ -7283,6 +7335,7 @@ export class RunRunner {
           if (handleLocks(res)) retainedHere = true;
         }
         if (retainedHere) outcome = "bare_lock_retained";
+        if (survivedHere) outcome = "tick_process_survived";
         return outcome;
       } finally {
         // Released only now — after settlement — so a preempting sink waits for all of the above.
