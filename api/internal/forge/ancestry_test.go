@@ -635,5 +635,25 @@ func TestAncestryRedirectsAreRefused(t *testing.T) {
 			}
 			o.assertUntouched(t)
 		})
+		t.Run(fmt.Sprintf("gitlab branch head %d", status), func(t *testing.T) {
+			o := newOffHostTarget(t, branch)
+			m := newMockGitLab(t, map[string]http.HandlerFunc{"/api/v4/projects/7/repository/branches/": redirectTo(o, status)})
+			got, err := newTestDriver(t, m, ancPAT).BranchHead(context.Background(), 7, branch)
+			assertNoPAT(t, err)
+			if err == nil || errors.Is(err, ErrRefNotFound) {
+				t.Fatalf("BranchHead across a %d = (%q, %v), want a non-ErrRefNotFound error", status, got, err)
+			}
+			o.assertUntouched(t)
+		})
+		t.Run(fmt.Sprintf("gitlab compare %d", status), func(t *testing.T) {
+			o := newOffHostTarget(t, branch)
+			m := newMockGitLab(t, map[string]http.HandlerFunc{"/api/v4/projects/7/repository/merge_base": redirectTo(o, status)})
+			got, err := newTestDriver(t, m, ancPAT).CompareAncestry(context.Background(), 7, ancHead, ancCand)
+			assertNoPAT(t, err)
+			if got != AncestryUnknown || err == nil {
+				t.Fatalf("CompareAncestry across a %d = (%q, %v), want unknown + error", status, got, err)
+			}
+			o.assertUntouched(t)
+		})
 	}
 }

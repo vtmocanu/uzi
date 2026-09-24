@@ -6840,6 +6840,11 @@ export class RunRunner {
     const successor = claim.claim_generation;
     if (!clone || !barePath || successor === undefined) return;
     if (clone.seededFrom !== "tracking" && clone.seededFrom !== "checkpoint") return;
+    // A recovered wip(park) marker is reset --soft out of history (git.ts createOrAttachRunnerClone;
+    // baseCommit is the marker's parent), so the predecessor's journaled source (the marker) can
+    // never be an ancestor of the published head: evidence here would only yield a certain
+    // not_ancestor terminal. Record nothing; the hold stays retained (fail-closed).
+    if (clone.wipRecovered === true) return;
     const seededFrom = clone.seededFrom;
     try {
       const records = await this.recovery.inspect(claim.run_id);

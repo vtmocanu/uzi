@@ -91,7 +91,7 @@ interface Rig {
 
 /** A token-keyed coordinator + settlement journal over temp roots, and (optionally) the real
  *  clone seeding re-labelled as `seededFrom` so the adoption gate can be exercised per leg. */
-function rig(seededFrom?: RunnerClone["seededFrom"], events?: string[]): Rig {
+function rig(seededFrom?: RunnerClone["seededFrom"], events?: string[], opts: { wipRecovered?: boolean } = {}): Rig {
   const recoveryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-settle-rec-"));
   const settlementRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-settle-set-"));
   const recoveryClient = new FakeRecoveryClient();
@@ -109,7 +109,8 @@ function rig(seededFrom?: RunnerClone["seededFrom"], events?: string[]): Rig {
   const orig = g.createOrAttachRunnerClone.bind(g);
   g.createOrAttachRunnerClone = async (...args: Parameters<GitCache["createOrAttachRunnerClone"]>) => {
     const clone = await orig(...args);
-    const out = seededFrom ? { ...clone, seededFrom } : clone;
+    let out = seededFrom ? { ...clone, seededFrom } : clone;
+    if (opts.wipRecovered !== undefined) out = { ...out, wipRecovered: opts.wipRecovered };
     seeded.push(out);
     return out;
   };
@@ -381,6 +382,24 @@ describe("RunRunner — NO adoption evidence (issue #1582 M2)", () => {
       r.recoveryClient.holds = [{ hold_id: HOLD_A, generation: 1, has_available_capture: true }];
       await expectNothing(r, claim);
       assert.equal(r.seeded[0]!.seededFrom, "default");
+      assert.equal((await r.coord.inspect(claim.run_id)).length, 1, "predecessor journal untouched");
+    } finally {
+      r.cleanup();
+    }
+  });
+
+  it("a tracking adoption that recovered a wip(park) marker records nothing (the marker is out of history)", async () => {
+    const r = rig("tracking", undefined, { wipRecovered: true });
+    try {
+      const src = originCommit("prior-wip", "PRIOR.txt");
+      const claim = gitlabClaim(5205, { claim_generation: 2 });
+      const pred = await r.coord.pin({ runId: claim.run_id, sourceSha: src, kind: "issue", branch: "agent/issue-5205", generation: 1 });
+      assert.ok(pred, "precondition: the predecessor's authenticated journal record exists");
+      r.recoveryClient.holds = [{ hold_id: HOLD_A, generation: 1, has_available_capture: true }];
+      await expectNothing(r, claim);
+      assert.equal(r.seeded[0]!.wipRecovered, true);
+      const pins = gitOut(bare(), "for-each-ref", "--format=%(refname)", `refs/uzi-settle/${claim.run_id}/`);
+      assert.equal(pins, "", "no settlement pin");
       assert.equal((await r.coord.inspect(claim.run_id)).length, 1, "predecessor journal untouched");
     } finally {
       r.cleanup();
