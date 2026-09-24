@@ -2358,8 +2358,10 @@ type CreateRunParams struct {
 // atomically from the run's repo via a subquery, so the createRun path needs no
 // extra Go read and cannot ship a stale hint. The repo's hint is already Filter-ed
 // against the vocabulary at its write path, so no re-validation is needed here.
-// Repo-less kinds (judge/chat/self_improve) INSERT elsewhere and keep the '{}'
-// column default. Plan inference (M4) later union-merges via a separate UPDATE.
+// Repo-less kinds (judge/chat) INSERT elsewhere and keep the '{}' column default;
+// self_improve also INSERTs elsewhere (selfimprove.sql) but is repo-bearing and copies
+// its repo's hint the same way. Plan inference (M4) later union-merges via a separate
+// UPDATE.
 //
 // 🔴 completion_contract_version (PRD #1226 M1, D1) is listed here for the SAME reason as
 // the fields above: it is a silently-omittable nullable param (sqlc.narg). createRun reads
