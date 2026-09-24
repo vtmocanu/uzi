@@ -260,7 +260,10 @@ awk -F"$TAB" '{ print $4 }'                "$WORKDIR/plan" > "$WORKDIR/newpaths"
 # scanned under LC_ALL=C so a non-UTF-8 byte cannot abort a UTF-8-locale awk. Token-exact
 # 5-digit scan in awk (this host's ugrep mishandles negated bracket classes in -E mode,
 # so awk digit-run scanning is used).
-git diff --no-renames --numstat origin/main HEAD > "$WORKDIR/numstat" ||
+# core.quotePath=false hands non-ASCII paths through verbatim; a path git must STILL quote
+# (tab, newline, backslash, double quote) cannot be read back safely here, so it is
+# reported as unscanned rather than silently dropped by the -f test below.
+git -c core.quotePath=false diff --no-renames --numstat origin/main HEAD > "$WORKDIR/numstat" ||
   die "git diff --numstat (all changed files) failed"
 awk -F"$TAB" 'NR==FNR { skip[$0]=1; next } !($3 in skip) { print ($1 == "-" ? "B" : "T") "\t" $3 }' \
   "$WORKDIR/branch_new" "$WORKDIR/numstat" > "$WORKDIR/other"
@@ -269,6 +272,13 @@ report=""
 skipped=""
 while IFS="$TAB" read -r kind f; do
   [ -n "$f" ] || continue
+  case "$f" in
+    \"*)
+      skipped="${skipped}migration-renumber: NOT scanned (git-quoted path, check by hand): $f
+"
+      continue
+      ;;
+  esac
   [ -f "$f" ] || continue
   if [ "$kind" = "B" ]; then
     skipped="${skipped}migration-renumber: skipped binary file: $f

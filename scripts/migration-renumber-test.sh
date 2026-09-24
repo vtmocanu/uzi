@@ -498,6 +498,10 @@ mkdir -p "$REPOE/docs/img"
 printf '\211PNG\r\n\032\n\000\000\000\rIHDR\000\000\000\001\377\376\351\000' > "$REPOE/docs/img/shot.png"
 # Latin-1 text (0xE9, no NUL): git calls it text, and it references an OLD draft number.
 printf 'Caf\351 notes: see migration 00230.\n' > "$REPOE/docs/latin1.txt"
+# Paths git quotes by default: non-ASCII (must be scanned verbatim under core.quotePath=false)
+# and a TAB (still quoted, so it must be named as unscanned, never silently dropped).
+printf 'see migration 00231\n' > "$REPOE/docs/caf$(printf '\303\251').md"
+printf 'see migration 00230\n' > "$REPOE/docs/tab$(printf '\t')name.md"
 git -C "$REPOE" add -A
 git -C "$REPOE" commit -q -m "branch: a PNG and a Latin-1 note"
 PNG_BEFORE="$(od -An -tx1 "$REPOE/docs/img/shot.png")"
@@ -510,6 +514,8 @@ if [ -f "$ME/00232_forge_x.sql" ]; then pass "E: 00232_forge_x.sql created"; els
 assert_eq       "E: PNG byte-identical"                     "$PNG_BEFORE" "$(od -An -tx1 "$REPOE/docs/img/shot.png")"
 assert_contains "E: binary skip notice names the PNG"       "skipped binary file: docs/img/shot.png" "$E_OUT"
 assert_contains "E: non-UTF-8 text file still scanned"      "docs/latin1.txt:1"                      "$E_OUT"
+assert_contains "E: non-ASCII path scanned verbatim"        "$(printf 'docs/caf\303\251.md:1')"     "$E_OUT"
+assert_contains "E: git-quoted path named as NOT scanned"   "NOT scanned (git-quoted path"           "$E_OUT"
 
 # =============================================================================
 echo "=== F. a reference-scan failure happens BEFORE any rename (issue 1581) ==="
