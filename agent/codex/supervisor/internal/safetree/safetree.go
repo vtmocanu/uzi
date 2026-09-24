@@ -48,8 +48,46 @@
 // non-directory is removed with unlinkat, which never follows. An entry that
 // vanished after getdents listed it (ENOENT on its fstatat, or on the unlinkat
 // of a non-directory) is skipped: nothing was followed and nothing is left. The
-// first mismatch, foreign owner, bound breach or other syscall error aborts the
-// whole walk and retains whatever remains: nothing continues to siblings.
+// first mismatch, foreign owner, exhausted op budget or other syscall error
+// aborts the whole walk and retains whatever remains: nothing continues to
+// siblings.
+//
+// # Any size, any depth, bounded fds and memory
+//
+// A tree of any size and depth owned entirely by the pinned uid is removable;
+// the bounds below cap resources, they never decide retention of such a tree.
+//
+// Streaming. A directory's names are never buffered as a whole. Each pass
+// seeks the directory fd to offset 0 and reads getdents chunks into one buffer
+// (direntBufSize, 8 KiB) until a chunk holds an entry other than "." and "..";
+// it processes that chunk's entries (each one leaves the directory: removed,
+// hoisted, or found already gone), then starts the next pass. A pass that
+// reaches the end of the directory without such an entry means it is empty.
+// Memory is therefore one buffer per open directory level.
+//
+// Hoisting. The walk holds at most maxFdDepth+1 directory fds at once. A
+// subdirectory met at depth maxFdDepth is not descended into: after the same
+// O_PATH identity/owner check (and owner-bit restore, since moving a directory
+// to a new parent needs write permission on it) it is moved with
+// renameat2(curDirFd, name, rootFd, ".safetree-hoist-<n>", RENAME_NOREPLACE)
+// into the pinned root, retrying the next n on EEXIST. Both dirfds are
+// verified fds, so the rename resolves no path outside the verified tree, and
+// renameat2 never follows its final component and never replaces an entry.
+// The hoisted name is then fstatat'ed (AT_SYMLINK_NOFOLLOW) under the root and
+// must be a directory with the same dev/ino and owner as the entry's verified
+// fstatat, or the walk stops with ErrMismatch. The root's streaming loop later
+// meets the hoisted directory at depth 1 and removes it like any other entry.
+// Each hoist moves a subtree strictly closer to the root, so the walk ends.
+//
+// Op budget. Every pass, every entry processed and every hoist attempt costs
+// one op from a per-Remove budget (maxOps); past it Remove returns ErrBound and
+// retains the rest. The budget bounds wall time only, not fds or memory. A
+// finite tree with no concurrent writer never reaches it; exhausting it takes a
+// live same-uid writer that keeps adding entries, and retention is the right
+// answer then.
+//
+// Retention therefore happens only on an identity mismatch, a foreign owner,
+// an I/O error, or the op budget being exhausted by a live concurrent writer.
 //
 // Create never chmods a directory before it has proven it made it. It opens
 // the name it just mkdirat'ed with the same two steps but restores no bits: a
@@ -68,10 +106,13 @@
 // # Documented residual
 //
 // There is an instant between the last check on an entry and the unlinkat that
-// removes it. A same-uid peer swapping the entry in that instant can at most make
+// removes it (or the renameat2 that hoists it). A same-uid peer swapping the entry in that instant can at most make
 // Remove rmdir an EMPTY directory that the peer could itself rename into place
 // (and so could itself remove), or unlink a NAME in a directory the walk already
-// verified. It can never make Remove follow a link or chmod an unverified inode:
+// verified, or make a hoist move whatever the peer put at the name into the
+// verified root, where the post-hoist check sees it and stops the walk with
+// ErrMismatch. It can never make Remove follow a link or chmod an unverified
+// inode:
 // every open is O_NOFOLLOW, every chmod goes through an fd whose identity and
 // owner were checked first (Create's only after the emptiness check too), and
 // rmdir refuses a non-empty directory. Create's one accepted substitution is an
@@ -95,7 +136,8 @@ var (
 	ErrMismatch = errors.New("safetree: identity mismatch")
 	// ErrOwner: an object is not owned by the pinned uid.
 	ErrOwner = errors.New("safetree: foreign owner")
-	// ErrBound: the tree exceeds maxDepth, maxEntries or maxNameBytes.
+	// ErrBound: the walk exhausted its op budget (maxOps), which bounds wall
+	// time; a finite tree without a live concurrent writer never reaches it.
 	ErrBound = errors.New("safetree: bound exceeded")
 	// ErrIO: a syscall failed; the underlying errno is wrapped.
 	ErrIO = errors.New("safetree: io")
@@ -107,16 +149,27 @@ var (
 	ErrName = errors.New("safetree: invalid name")
 )
 
-// Walk bounds. Package vars so tests can lower them. maxNameBytes caps the
-// name bytes buffered for one directory.
+// Walk bounds. Package vars so tests can lower them. maxFdDepth caps the
+// directory fds held at once (deeper subdirectories are hoisted, not refused);
+// maxOps caps the passes, entries and hoist attempts of one Remove, and bounds
+// wall time only; direntBufSize is the one getdents buffer each open directory
+// level streams through (never below minDirentBufSize).
 var (
-	maxDepth     = 256
-	maxEntries   = 1_000_000
-	maxNameBytes = 64 << 20
+	maxFdDepth    = 64
+	maxOps        = 50_000_000
+	direntBufSize = getdentsBufSize
 )
 
-// getdentsBufSize bounds each getdents read; the loop continues until 0.
-const getdentsBufSize = 8192
+const (
+	// getdentsBufSize is Create's emptiness-check buffer and the default
+	// direntBufSize.
+	getdentsBufSize = 8192
+	// minDirentBufSize fits one linux_dirent64 with a 255-byte name
+	// (19-byte header + 256, 8-aligned), so getdents never fails EINVAL.
+	minDirentBufSize = 280
+	// hoistPrefix names a subdirectory hoisted into the root.
+	hoistPrefix = ".safetree-hoist-"
+)
 
 const (
 	dirOpenFlags  = unix.O_RDONLY | unix.O_DIRECTORY | unix.O_NOFOLLOW | unix.O_CLOEXEC
@@ -128,7 +181,8 @@ const (
 // contents are gone and before the final root fstatat;
 // hookCreateBetweenMkdirAndOpen runs in Create after mkdirat and before the
 // open; hookBetweenPathAndReadOpen runs between openDir's O_PATH and O_RDONLY
-// opens, after any owner-bit restore. fstatat is the lstat used for every entry
+// opens, after any owner-bit restore; hookAfterHoist runs after a hoist's
+// renameat2 and before its identity check. fstatat is the lstat used for every entry
 // and for the root re-check; fstat is used on every opened fd. procFdPrefix is
 // the magic-link directory the owner-bit restore chmods through.
 var (
@@ -136,6 +190,7 @@ var (
 	hookBeforeRootRecheck         func(parentFd int, name string)
 	hookCreateBetweenMkdirAndOpen func(parentFd int, name string)
 	hookBetweenPathAndReadOpen    func(dirfd int, name string)
+	hookAfterHoist                func(rootFd int, hoistName string)
 	fstatat                       = unix.Fstatat
 	fstat                         = unix.Fstat
 	procFdPrefix                  = "/proc/self/fd/"
@@ -245,32 +300,11 @@ const (
 // openDir opens name under dirfd as a readable directory owned by uid (and, when
 // want is set, with want's dev/ino). It returns the fd and its fstat.
 func openDir(dirfd int, name string, want ident, uid int, flags openFlag, op string) (int, unix.Stat_t, error) {
-	var st unix.Stat_t
-	pfd, err := unix.Openat(dirfd, name, pathOpenFlags, 0)
+	pfd, st, err := verifyPath(dirfd, name, want, uid, flags, op)
 	if err != nil {
-		if flags&rootOpen != 0 && errors.Is(err, unix.ENOENT) {
-			return -1, st, fmt.Errorf("%w: %s: %w", ErrNotExist, op, err)
-		}
-		return -1, st, openErr(op, err)
+		return -1, st, err
 	}
 	defer func() { _ = unix.Close(pfd) }()
-	if err := fstat(pfd, &st); err != nil {
-		return -1, st, ioErr(op+": fstat", err)
-	}
-	if !isDir(&st) || (want.set && (uint64(st.Dev) != want.dev || st.Ino != want.ino)) {
-		return -1, st, fmt.Errorf("%w: %s", ErrMismatch, op)
-	}
-	if int(st.Uid) != uid {
-		return -1, st, ErrOwner
-	}
-	if st.Mode&0o700 != 0o700 {
-		if flags&restoreOwnerBits == 0 {
-			return -1, st, fmt.Errorf("%w: %s: owner bits missing", ErrMismatch, op)
-		}
-		if err := addOwnerBits(pfd, &st, op); err != nil {
-			return -1, st, err
-		}
-	}
 
 	if hookBetweenPathAndReadOpen != nil {
 		hookBetweenPathAndReadOpen(dirfd, name)
@@ -295,6 +329,43 @@ func openDir(dirfd int, name string, want ident, uid int, flags openFlag, op str
 		return -1, st, fmt.Errorf("%w: %s reopen", ErrMismatch, op)
 	}
 	return fd, fst, nil
+}
+
+// verifyPath is openDir's first step: an O_PATH|O_NOFOLLOW|O_DIRECTORY open of
+// name under dirfd whose fstat must be a directory owned by uid (with want's
+// dev/ino when set) and, with restoreOwnerBits, is given any missing owner rwx
+// bits. It returns the O_PATH fd, which the caller closes, and its stat.
+func verifyPath(dirfd int, name string, want ident, uid int, flags openFlag, op string) (int, unix.Stat_t, error) {
+	var st unix.Stat_t
+	pfd, err := unix.Openat(dirfd, name, pathOpenFlags, 0)
+	if err != nil {
+		if flags&rootOpen != 0 && errors.Is(err, unix.ENOENT) {
+			return -1, st, fmt.Errorf("%w: %s: %w", ErrNotExist, op, err)
+		}
+		return -1, st, openErr(op, err)
+	}
+	fail := func(err error) (int, unix.Stat_t, error) {
+		_ = unix.Close(pfd)
+		return -1, st, err
+	}
+	if err := fstat(pfd, &st); err != nil {
+		return fail(ioErr(op+": fstat", err))
+	}
+	if !isDir(&st) || (want.set && (uint64(st.Dev) != want.dev || st.Ino != want.ino)) {
+		return fail(fmt.Errorf("%w: %s", ErrMismatch, op))
+	}
+	if int(st.Uid) != uid {
+		return fail(ErrOwner)
+	}
+	if st.Mode&0o700 != 0o700 {
+		if flags&restoreOwnerBits == 0 {
+			return fail(fmt.Errorf("%w: %s: owner bits missing", ErrMismatch, op))
+		}
+		if err := addOwnerBits(pfd, &st, op); err != nil {
+			return fail(err)
+		}
+	}
+	return pfd, st, nil
 }
 
 // addOwnerBits sets the owner rwx bits, and only those, on the directory pfd
@@ -371,8 +442,9 @@ func requireFresh(fd int) error {
 }
 
 // Remove deletes the tree name under parentFd, provided its root still matches
-// pin. It fails closed on the first mismatch, foreign owner, bound breach or
-// syscall error, and retains whatever remains.
+// pin. A tree of any depth and size owned by pin.UID is removable. It fails
+// closed on the first mismatch, foreign owner, exhausted op budget or syscall
+// error, and retains whatever remains.
 func Remove(parentFd int, name string, pin Pin) error {
 	if !validName(name) {
 		return ErrName
@@ -382,7 +454,7 @@ func Remove(parentFd int, name string, pin Pin) error {
 		return err
 	}
 
-	w := &walker{uid: pin.UID, dev: pin.Dev}
+	w := &walker{uid: pin.UID, dev: pin.Dev, rootFd: fd}
 	err = w.emptyDir(fd, 0)
 	_ = unix.Close(fd)
 	if err != nil {
@@ -418,65 +490,61 @@ func Remove(parentFd int, name string, pin Pin) error {
 }
 
 type walker struct {
-	uid     int
-	dev     uint64
-	entries int
+	uid    int
+	dev    uint64
+	rootFd int    // the pinned, verified root: the hoist destination
+	ops    int    // spent from maxOps
+	hoists uint64 // next hoist name suffix
 }
 
-// emptyDir removes every entry of the verified directory fd, which openDir
-// already made owner-rwx.
-func (w *walker) emptyDir(fd int, depth int) error {
-	if depth > maxDepth {
+// spend charges one op to the per-Remove budget.
+func (w *walker) spend() error {
+	w.ops++
+	if w.ops > maxOps {
 		return ErrBound
-	}
-	names, err := w.readNames(fd)
-	if err != nil {
-		return err
-	}
-	for _, name := range names {
-		if err := w.removeEntry(fd, name, depth); err != nil {
-			return err
-		}
 	}
 	return nil
 }
 
-// readNames lists fd's entries (without "." and ".."), charging each to the
-// walk-wide entry bound and its bytes to the per-directory name bound before it
-// is retained.
-func (w *walker) readNames(fd int) ([]string, error) {
-	buf := make([]byte, getdentsBufSize)
+// emptyDir removes every entry of the verified directory fd, which openDir
+// already made owner-rwx, streaming: each pass rereads from offset 0 until it
+// finds a chunk with real entries, processes that chunk, and starts over; a
+// pass that reaches the end without one means the directory is empty.
+func (w *walker) emptyDir(fd int, depth int) error {
+	buf := make([]byte, max(direntBufSize, minDirentBufSize))
 	var names []string
-	nameBytes := 0
 	for {
-		n, err := unix.Getdents(fd, buf)
-		if err != nil {
-			if errors.Is(err, unix.EINTR) {
-				continue
-			}
-			return nil, ioErr("getdents", err)
+		if err := w.spend(); err != nil {
+			return err
 		}
-		if n <= 0 {
-			return names, nil
+		if _, err := unix.Seek(fd, 0, unix.SEEK_SET); err != nil {
+			return ioErr("seek", err)
 		}
-		before := len(names)
-		_, _, names = unix.ParseDirent(buf[:n], -1, names)
-		kept := names[:before]
-		for _, name := range names[before:] {
-			if name == "." || name == ".." {
-				continue
+		for processed := false; !processed; {
+			n, err := unix.Getdents(fd, buf)
+			if err != nil {
+				if errors.Is(err, unix.EINTR) {
+					continue
+				}
+				return ioErr("getdents", err)
 			}
-			w.entries++
-			if w.entries > maxEntries {
-				return nil, ErrBound
+			if n <= 0 {
+				return nil
 			}
-			nameBytes += len(name)
-			if nameBytes > maxNameBytes {
-				return nil, ErrBound
+			_, _, names = unix.ParseDirent(buf[:n], -1, names[:0])
+			for _, name := range names {
+				if name == "." || name == ".." {
+					continue
+				}
+				processed = true
+				if err := w.spend(); err != nil {
+					return err
+				}
+				if err := w.removeEntry(fd, name, depth); err != nil {
+					return err
+				}
 			}
-			kept = append(kept, name)
 		}
-		names = kept
 	}
 }
 
@@ -504,7 +572,11 @@ func (w *walker) removeEntry(dirfd int, name string, depth int) error {
 	if hookBetweenStatAndOpen != nil {
 		hookBetweenStatAndOpen(dirfd, name)
 	}
-	child, _, err := openDir(dirfd, name, ident{dev: uint64(st.Dev), ino: st.Ino, set: true}, w.uid, restoreOwnerBits, "openat")
+	want := ident{dev: uint64(st.Dev), ino: st.Ino, set: true}
+	if depth > 0 && depth >= maxFdDepth {
+		return w.hoist(dirfd, name, want)
+	}
+	child, _, err := openDir(dirfd, name, want, w.uid, restoreOwnerBits, "openat")
 	if err != nil {
 		return err
 	}
@@ -520,6 +592,56 @@ func (w *walker) removeEntry(dirfd int, name string, depth int) error {
 			return fmt.Errorf("%w: rmdir: %w", ErrMismatch, err)
 		}
 		return ioErr("rmdir", err)
+	}
+	return nil
+}
+
+// hoist moves the subdirectory name of dirfd, which has the verified identity
+// want, into the root under a fresh hoistPrefix name instead of descending into
+// it, then checks the hoisted entry is still that directory. The root's own
+// streaming loop removes it later.
+func (w *walker) hoist(dirfd int, name string, want ident) error {
+	// Moving a directory to a new parent needs write permission on it, so the
+	// owner bits are restored on the verified inode first.
+	pfd, _, err := verifyPath(dirfd, name, want, w.uid, restoreOwnerBits, "hoist")
+	if err != nil {
+		return err
+	}
+	_ = unix.Close(pfd)
+
+	var hoistName string
+	for {
+		if err := w.spend(); err != nil {
+			return err
+		}
+		hoistName = hoistPrefix + strconv.FormatUint(w.hoists, 10)
+		w.hoists++
+		err := unix.Renameat2(dirfd, name, w.rootFd, hoistName, unix.RENAME_NOREPLACE)
+		if err == nil {
+			break
+		}
+		if errors.Is(err, unix.EEXIST) {
+			continue
+		}
+		if errors.Is(err, unix.ENOENT) {
+			// The verified entry left the name after its O_PATH check.
+			return fmt.Errorf("%w: hoist rename: %w", ErrMismatch, err)
+		}
+		return ioErr("hoist rename", err)
+	}
+
+	if hookAfterHoist != nil {
+		hookAfterHoist(w.rootFd, hoistName)
+	}
+	var hs unix.Stat_t
+	if err := fstatat(w.rootFd, hoistName, &hs, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			return fmt.Errorf("%w: hoist recheck: %w", ErrMismatch, err)
+		}
+		return ioErr("hoist recheck", err)
+	}
+	if !isDir(&hs) || uint64(hs.Dev) != want.dev || hs.Ino != want.ino || int(hs.Uid) != w.uid {
+		return fmt.Errorf("%w: hoist recheck", ErrMismatch)
 	}
 	return nil
 }

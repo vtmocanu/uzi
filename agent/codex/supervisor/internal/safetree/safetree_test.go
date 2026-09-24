@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 
 	"golang.org/x/sys/unix"
@@ -217,11 +218,11 @@ func setForeignOwner(t *testing.T, victim string) {
 	t.Cleanup(func() { fstatat = prev })
 }
 
-func setBounds(t *testing.T, depth, entries int) {
+func setBounds(t *testing.T, fdDepth, ops int) {
 	t.Helper()
-	pd, pe := maxDepth, maxEntries
-	maxDepth, maxEntries = depth, entries
-	t.Cleanup(func() { maxDepth, maxEntries = pd, pe })
+	pd, po := maxFdDepth, maxOps
+	maxFdDepth, maxOps = fdDepth, ops
+	t.Cleanup(func() { maxFdDepth, maxOps = pd, po })
 }
 
 // swapHook fires once, on the entry named target: it renames the verified dir
@@ -474,32 +475,250 @@ func TestRemoveFailsClosedOnForeignOwnedDir(t *testing.T) {
 	assertExists(t, f.root())
 }
 
-func TestRemoveReportsBound(t *testing.T) {
+// TestRemoveDepthIsNotABound: a tree deeper than maxFdDepth is removed in
+// full (by hoisting), where the old depth bound retained it.
+func TestRemoveDepthIsNotABound(t *testing.T) {
 	if !requireNonRootCommandUID(t) {
 		return
 	}
-	t.Run("depth", func(t *testing.T) {
-		f := newFixture(t)
-		pin := f.createTree(t)
-		buildModuleCache(t, f.root())
-		setBounds(t, 3, 1_000_000)
-		err := Remove(f.parentFd, treeName, pin)
-		if !errors.Is(err, ErrBound) || Reason(err) != "bound" {
-			t.Fatalf("Remove = %v, want ErrBound", err)
+	f := newFixture(t)
+	pin := f.createTree(t)
+	buildModuleCache(t, f.root())
+	setBounds(t, 3, 50_000_000)
+	if err := Remove(f.parentFd, treeName, pin); err != nil {
+		t.Fatalf("Remove: %v (reason %q)", err, Reason(err))
+	}
+	assertGone(t, f.root())
+}
+
+func TestRemoveReportsOpsBudget(t *testing.T) {
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	f := newFixture(t)
+	pin := f.createTree(t)
+	buildModuleCache(t, f.root())
+	setBounds(t, 64, 5)
+	err := Remove(f.parentFd, treeName, pin)
+	if !errors.Is(err, ErrBound) || Reason(err) != "bound" {
+		t.Fatalf("Remove = %v, want ErrBound", err)
+	}
+	assertExists(t, f.root())
+}
+
+// TestRemoveLiveWriterExhaustsOpsBudget: a same-uid writer that adds an entry
+// for every one the walk looks at cannot livelock Remove; the op budget ends
+// it with ErrBound and the tree is retained.
+func TestRemoveLiveWriterExhaustsOpsBudget(t *testing.T) {
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	f := newFixture(t)
+	pin := f.createTree(t)
+	mustWrite(t, filepath.Join(f.root(), "seed"), "x")
+	setBounds(t, 64, 2000)
+	added := 0
+	setFstatat(t, func(real func(int, string, *unix.Stat_t, int) error, dirfd int, path string, st *unix.Stat_t, flags int) error {
+		added++
+		fd, err := unix.Openat(dirfd, "w"+strconv.Itoa(added), unix.O_CREAT|unix.O_EXCL|unix.O_WRONLY|unix.O_CLOEXEC, 0o600)
+		if err != nil {
+			t.Errorf("writer create: %v", err)
+		} else {
+			_ = unix.Close(fd)
 		}
-		assertExists(t, f.root())
+		return real(dirfd, path, st, flags)
 	})
-	t.Run("entries", func(t *testing.T) {
-		f := newFixture(t)
-		pin := f.createTree(t)
-		buildModuleCache(t, f.root())
-		setBounds(t, 256, 5)
-		err := Remove(f.parentFd, treeName, pin)
-		if !errors.Is(err, ErrBound) || Reason(err) != "bound" {
-			t.Fatalf("Remove = %v, want ErrBound", err)
+
+	err := Remove(f.parentFd, treeName, pin)
+	if !errors.Is(err, ErrBound) || Reason(err) != "bound" {
+		t.Fatalf("Remove = %v, want ErrBound", err)
+	}
+	if added < 100 {
+		t.Fatalf("writer added only %d entries", added)
+	}
+	assertExists(t, f.root())
+}
+
+// buildChain nests depth directories "d" under root, each level also holding a
+// sibling dir "sib" and a 64-byte file "f". It works
+// fd-relative so path length never limits the depth, and applies dirMode and
+// fileMode (0 = leave) bottom-up at the end; the pinned root keeps its mode.
+func buildChain(t *testing.T, root string, depth int, dirMode, fileMode uint32) {
+	t.Helper()
+	fd, err := unix.Open(root, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = unix.Close(fd) }()
+	var levels []int
+	defer func() {
+		for i := len(levels) - 1; i >= 0; i-- {
+			if dirMode != 0 {
+				if err := unix.Fchmod(levels[i], dirMode); err != nil {
+					t.Errorf("fchmod dir: %v", err)
+				}
+			}
+			_ = unix.Close(levels[i])
 		}
-		assertExists(t, f.root())
+	}()
+	cur := fd
+	for range depth {
+		for _, d := range []string{"d", "sib"} {
+			if err := unix.Mkdirat(cur, d, 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}
+		next, err := unix.Openat(cur, "d", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		levels = append(levels, next)
+		cur = next
+		ffd, err := unix.Openat(cur, "f", unix.O_CREAT|unix.O_EXCL|unix.O_WRONLY|unix.O_CLOEXEC, 0o644)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, werr := unix.Write(ffd, make([]byte, 64))
+		if werr == nil && fileMode != 0 {
+			werr = unix.Fchmod(ffd, fileMode)
+		}
+		_ = unix.Close(ffd)
+		if werr != nil {
+			t.Fatal(werr)
+		}
+	}
+}
+
+// TestRemoveDeepTrees: trees far deeper than maxFdDepth, including the
+// 300-level shape the old depth bound retained forever, are removed in full.
+func TestRemoveDeepTrees(t *testing.T) {
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	for _, depth := range []int{300, 2000} {
+		t.Run(strconv.Itoa(depth), func(t *testing.T) {
+			f := newFixture(t)
+			before := readSentinel(t, f.sentinel)
+			pin := f.createTree(t)
+			buildChain(t, f.root(), depth, 0, 0)
+			mustWrite(t, filepath.Join(f.root(), "d", "big"), string(make([]byte, 1<<20)))
+			if err := Remove(f.parentFd, treeName, pin); err != nil {
+				t.Fatalf("Remove: %v (reason %q)", err, Reason(err))
+			}
+			assertGone(t, f.root())
+			assertSentinelUnchanged(t, f.sentinel, before)
+		})
+	}
+}
+
+// dirDepthUnder is the nesting depth of the directory dirfd holds, relative to
+// root (root itself is 0), read from the fd's magic link.
+func dirDepthUnder(t *testing.T, root string, dirfd int) int {
+	t.Helper()
+	p, err := os.Readlink(procFdPrefix + strconv.Itoa(dirfd))
+	if err != nil {
+		t.Fatalf("readlink: %v", err)
+	}
+	rel, err := filepath.Rel(root, p)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, "../") {
+		t.Fatalf("dirfd %q is not under the root %q", p, root)
+	}
+	if rel == "." {
+		return 0
+	}
+	return strings.Count(rel, "/") + 1
+}
+
+func setHoistHook(t *testing.T, h func(rootFd int, hoistName string)) {
+	t.Helper()
+	prev := hookAfterHoist
+	hookAfterHoist = h
+	t.Cleanup(func() { hookAfterHoist = prev })
+}
+
+// TestRemoveHoistsPastFdDepth: with maxFdDepth lowered to 3, a depth-20 tree of
+// read-only 0555 levels and 0444 files is removed in full, no directory deeper
+// than maxFdDepth is ever opened, and the walk really hoisted, retrying past a
+// hoist name a peer planted just before the first hoist.
+func TestRemoveHoistsPastFdDepth(t *testing.T) {
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	f := newFixture(t)
+	before := readSentinel(t, f.sentinel)
+	pin := f.createTree(t)
+	buildChain(t, f.root(), 20, 0o555, 0o444)
+	setBounds(t, 3, 50_000_000)
+	root, err := filepath.EvalSymlinks(f.root())
+	if err != nil {
+		t.Fatal(err)
+	}
+	deepest, planted := 0, false
+	setStatOpenHook(t, func(dirfd int, _ string) {
+		d := dirDepthUnder(t, root, dirfd)
+		deepest = max(deepest, d)
+		if d == 3 && !planted {
+			planted = true
+			mustMkdir(t, filepath.Join(root, hoistPrefix+"0"))
+		}
 	})
+	var hoisted []string
+	setHoistHook(t, func(_ int, hoistName string) { hoisted = append(hoisted, hoistName) })
+
+	if err := Remove(f.parentFd, treeName, pin); err != nil {
+		t.Fatalf("Remove: %v (reason %q)", err, Reason(err))
+	}
+	// A dir at depth 3 may still be met (and hoisted), never opened into.
+	if deepest > 3 {
+		t.Fatalf("an entry was met under a directory at depth %d, want <= maxFdDepth 3", deepest)
+	}
+	if len(hoisted) == 0 {
+		t.Fatal("the walk never hoisted")
+	}
+	if !planted || hoisted[0] != hoistPrefix+"1" {
+		t.Fatalf("first hoist went to %q (planted %v), want the next free name", hoisted[0], planted)
+	}
+	assertGone(t, f.root())
+	assertSentinelUnchanged(t, f.sentinel, before)
+}
+
+// TestRemoveHoistSwapIsMismatch: a peer that swaps the hoisted entry for a
+// symlink to the sentinel right after the rename stops the walk with
+// ErrMismatch; nothing is followed and the rest is retained.
+func TestRemoveHoistSwapIsMismatch(t *testing.T) {
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	f := newFixture(t)
+	before := readSentinel(t, f.sentinel)
+	pin := f.createTree(t)
+	buildChain(t, f.root(), 10, 0, 0)
+	setBounds(t, 3, 50_000_000)
+	fired := false
+	setHoistHook(t, func(rootFd int, hoistName string) {
+		if fired {
+			return
+		}
+		fired = true
+		if err := unix.Renameat(rootFd, hoistName, rootFd, "moved"); err != nil {
+			t.Errorf("swap rename: %v", err)
+			return
+		}
+		if err := unix.Symlinkat(f.sentinel, rootFd, hoistName); err != nil {
+			t.Errorf("swap symlink: %v", err)
+		}
+	})
+
+	err := Remove(f.parentFd, treeName, pin)
+	if !fired {
+		t.Fatal("hoist hook never fired")
+	}
+	if !errors.Is(err, ErrMismatch) || Reason(err) != "mismatch" {
+		t.Fatalf("Remove = %v, want ErrMismatch", err)
+	}
+	assertExists(t, f.root())
+	assertExists(t, filepath.Join(f.root(), "moved"))
+	assertSentinelUnchanged(t, f.sentinel, before)
 }
 
 func TestRemoveAbsentRoot(t *testing.T) {
@@ -924,23 +1143,34 @@ func TestRemoveSkipsConcurrentlyDeletedEntries(t *testing.T) {
 	assertGone(t, f.root())
 }
 
-func TestRemoveReportsNameBytesBound(t *testing.T) {
+// TestRemoveStreamsWithMinimalBuffer: with the getdents buffer at its minimum,
+// a directory of 5000 entries takes many rereads and is still removed in full.
+func TestRemoveStreamsWithMinimalBuffer(t *testing.T) {
 	if !requireNonRootCommandUID(t) {
 		return
 	}
 	f := newFixture(t)
 	pin := f.createTree(t)
-	for i := range 10 {
-		mustWrite(t, filepath.Join(f.root(), "name-"+strconv.Itoa(i)), "x")
+	for i := range 5000 {
+		mustWrite(t, filepath.Join(f.root(), "entry-with-a-longish-name-"+strconv.Itoa(i)), "x")
 	}
-	prev := maxNameBytes
-	maxNameBytes = 40
-	t.Cleanup(func() { maxNameBytes = prev })
+	mustMkdir(t, filepath.Join(f.root(), "sub", "sub2"))
+	prev := direntBufSize
+	direntBufSize = minDirentBufSize
+	t.Cleanup(func() { direntBufSize = prev })
+	stats := 0
+	setFstatat(t, func(real func(int, string, *unix.Stat_t, int) error, dirfd int, path string, st *unix.Stat_t, flags int) error {
+		stats++
+		return real(dirfd, path, st, flags)
+	})
 
-	if err := Remove(f.parentFd, treeName, pin); !errors.Is(err, ErrBound) || Reason(err) != "bound" {
-		t.Fatalf("Remove = %v, want ErrBound", err)
+	if err := Remove(f.parentFd, treeName, pin); err != nil {
+		t.Fatalf("Remove: %v (reason %q)", err, Reason(err))
 	}
-	assertExists(t, filepath.Join(f.root(), "name-0"))
+	if stats < 5000 {
+		t.Fatalf("only %d entries processed", stats)
+	}
+	assertGone(t, f.root())
 }
 
 func TestRemoveFailsClosedOnSwapBetweenOpens(t *testing.T) {
