@@ -63,6 +63,15 @@ func (s *Service) finishRunClaim(ctx context.Context, run store.Run, payload *Cl
 		return nil, assemblyErr
 	}
 	if s.txBeginner == nil {
+		// Unit fake stores have no pgx transaction surface. Production uses the
+		// generated store.Queries and wires the pool in server/main.go; a missing
+		// production transaction must fail closed, never use the legacy writer.
+		if _, production := s.q.(*store.Queries); !production {
+			if assemblyErr != nil {
+				return nil, s.recoverClaimAssembly(ctx, run, assemblyErr)
+			}
+			return payload, nil
+		}
 		if assemblyErr != nil {
 			return nil, fmt.Errorf("exact claim recovery requires a transaction: %w", assemblyErr)
 		}

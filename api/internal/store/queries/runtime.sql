@@ -2301,7 +2301,8 @@ UPDATE runs SET
     codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
-WHERE status = 'recovery_wait' AND recovery_retry_not_before <= @now
+WHERE status = 'recovery_wait' AND recovery_wait_cause IS DISTINCT FROM 'codex_account_unavailable'
+  AND recovery_retry_not_before <= @now
 RETURNING id, user_id, status;
 
 -- name: PromoteRecoveryWaitRunNow :execrows
@@ -2329,7 +2330,8 @@ UPDATE runs SET
     codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
-WHERE id = @id AND user_id = @user_id AND status = 'recovery_wait';
+WHERE id = @id AND user_id = @user_id AND status = 'recovery_wait'
+  AND recovery_wait_cause IS DISTINCT FROM 'codex_account_unavailable';
 
 -- name: SetRunPaused :execrows
 -- Park a run on the owner's explicit request (PRD #1190 M1). running -> paused,
