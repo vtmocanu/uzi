@@ -264,3 +264,111 @@ describe("useRunStream steer queue (PRD #95 M3)", () => {
     expect(result.current.canSteer).toBe(true);
   });
 });
+
+// Issue #1430: a REST read issued for the previous run must not land after the view
+// moved to another run. Each read is held on a deferred promise so the test decides
+// the resolution order: the new run's reads resolve first, the old run's last.
+describe("useRunStream stale fetch after run change (issue #1430)", () => {
+  type Deferred<T> = { promise: Promise<T>; resolve: (v: T) => void; reject: (e: unknown) => void };
+  function deferred<T>(): Deferred<T> {
+    let resolve!: (v: T) => void;
+    let reject!: (e: unknown) => void;
+    const promise = new Promise<T>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    return { promise, resolve, reject };
+  }
+  const runWith = (id: string): Run => ({ ...fakeRun(), id });
+  const input = (id: number, body: string): SteerInput => ({
+    id,
+    body,
+    created_at: "",
+    consumed_at: null,
+    kind: "follow_up",
+    disposition: null,
+  });
+
+  // pending holds each run id's deferred reads, one per call, in call order.
+  let pending: {
+    run: Record<string, Deferred<{ run: Run }>[]>;
+    msgs: Record<string, Deferred<{ messages: RunMessage[] }>[]>;
+    inputs: Record<string, Deferred<{ inputs: SteerInput[] }>[]>;
+  };
+  const push = <T,>(m: Record<string, Deferred<T>[]>, id: string) => {
+    const d = deferred<T>();
+    (m[id] ??= []).push(d);
+    return d.promise;
+  };
+
+  beforeEach(() => {
+    pending = { run: {}, msgs: {}, inputs: {} };
+    vi.stubGlobal("WebSocket", DeadSocket as unknown as typeof WebSocket);
+    vi.spyOn(api, "getRun").mockImplementation((id: string) => push(pending.run, id));
+    vi.spyOn(api, "getRunMessages").mockImplementation((id: string) => push(pending.msgs, id));
+    vi.spyOn(api, "getRunInputs").mockImplementation((id: string) => push(pending.inputs, id));
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it("drops run A's run, messages and inputs when they resolve after navigating to run B", async () => {
+    const { result, rerender } = renderHook(({ id }) => useRunStream(id), { initialProps: { id: "run-a" } });
+    rerender({ id: "run-b" });
+
+    await act(async () => {
+      pending.run["run-b"][0].resolve({ run: runWith("run-b") });
+      pending.msgs["run-b"][0].resolve({ messages: [msg(1)] });
+      pending.inputs["run-b"][0].resolve({ inputs: [input(2, "for b")] });
+    });
+    await waitFor(() => expect(result.current.run?.id).toBe("run-b"));
+
+    // Run A's reads land last. Before the fix each one overwrote run B's state.
+    await act(async () => {
+      pending.run["run-a"][0].resolve({ run: runWith("run-a") });
+      pending.msgs["run-a"][0].resolve({ messages: [msg(1), msg(2), msg(3)] });
+      pending.inputs["run-a"][0].resolve({ inputs: [input(1, "for a")] });
+    });
+
+    expect(result.current.run?.id).toBe("run-b");
+    expect(result.current.messages.map((m) => m.payload)).toEqual(["m1"]);
+    expect(result.current.inputs.map((i) => i.body)).toEqual(["for b"]);
+  });
+
+  it("drops a stale failure for run A: no error banner and canSteer untouched on run B", async () => {
+    const { result, rerender } = renderHook(({ id }) => useRunStream(id), { initialProps: { id: "run-a" } });
+    rerender({ id: "run-b" });
+    await act(async () => {
+      pending.run["run-b"][0].resolve({ run: runWith("run-b") });
+      pending.inputs["run-b"][0].resolve({ inputs: [] });
+    });
+    await waitFor(() => expect(result.current.run?.id).toBe("run-b"));
+
+    await act(async () => {
+      pending.run["run-a"][0].reject(new ApiError(404, "run not found"));
+      pending.inputs["run-a"][0].reject(new ApiError(404, "run not found"));
+    });
+
+    expect(result.current.error).toBe("");
+    expect(result.current.canSteer).toBe(true);
+  });
+
+  it("drops the first visit's read after navigating A -> B -> A (same id, older generation)", async () => {
+    const { result, rerender } = renderHook(({ id }) => useRunStream(id), { initialProps: { id: "run-a" } });
+    rerender({ id: "run-b" });
+    rerender({ id: "run-a" });
+
+    const fresh = { ...runWith("run-a"), status: "completed" as const };
+    await act(async () => {
+      pending.run["run-a"][1].resolve({ run: fresh });
+    });
+    await waitFor(() => expect(result.current.run?.status).toBe("completed"));
+
+    // The first visit's read (older status) resolves last and must not win.
+    await act(async () => {
+      pending.run["run-a"][0].resolve({ run: runWith("run-a") });
+    });
+    expect(result.current.run?.status).toBe("completed");
+  });
+});
