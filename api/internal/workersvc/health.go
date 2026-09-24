@@ -183,6 +183,16 @@ const (
 	// pool_wait/recovery_wait park reasons (D4): this is an owner-admission block, not a
 	// credential-pool or transient-recovery hold, and its fix is archive retry/discard.
 	reasonCustodyLimit = "you have too much unpublished work awaiting recovery; resolve or discard some recovery archives to start new runs"
+	// reasonCodexAccountUnavailable (PRD #1590 M2, D2) is emitted for a queued Codex subscription
+	// run that ClaimRun's account gate excludes: its linked account is quarantined, or a re-login
+	// on its alias is in flight or has just linked the same identity with newer material. No
+	// worker can clear it, so it is resolved with the other fleet-independent owner-state blocks,
+	// ahead of every worker reason. Read from ListActiveRunsForHealth's codex_account_gated, the
+	// byte-identical copy of the claim gate, so the pill and the claim can never disagree. The
+	// park_codex_account_unavailable pass normally moves such a run to recovery_wait within a
+	// tick or a few; this reason covers the window before it does. Maps to the SAME
+	// healthWaitingWorker enum (runs.health_reason is free text).
+	reasonCodexAccountUnavailable = "your Codex account is unavailable (quarantined or being re-linked), so this run can't start"
 	// reasonOutboxQueued (PRD #1391 M5) replaces the misleading `stalled` reason for a
 	// running run whose worker is holding its updates in the durable outbox during an
 	// api outage: the agent is working and sending, the frames are simply queued on the
@@ -653,6 +663,11 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 		} else if held >= int64(custodyHoldLimit) {
 			return reasonCustodyLimit
 		}
+	}
+	// PRD #1590 M2 (D2): the run-level Codex account gate. Like the vault lock and the custody
+	// limit it is owner-account state no worker can clear, so it precedes every worker reason.
+	if r.CodexAccountGated {
+		return reasonCodexAccountUnavailable
 	}
 	n, err := s.q.CountOnlineWorkersForUser(ctx, r.UserID)
 	if err != nil {

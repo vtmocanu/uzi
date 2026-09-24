@@ -185,6 +185,9 @@ func TestSweeperPassLogsResumeOnlyTicks(t *testing.T) {
 		// the guard sum AND emit list both include CodexRefreshRecovered, else the always-on
 		// survivor's recovery is invisible in the operator log.
 		{name: "codex refresh recovered alone", res: workersvc.SweepResult{CodexRefreshRecovered: 1}, attr: "codex_refresh_recovered"},
+		// PRD #1590 M2: a tick that ONLY parks queued Codex runs on an unavailable account
+		// must raise the line too.
+		{name: "codex account parked alone", res: workersvc.SweepResult{CodexAccountParked: 1}, attr: "codex_account_parked"},
 		{name: "idle tick logs nothing", res: workersvc.SweepResult{}, attr: ""},
 	}
 	for _, tc := range cases {

@@ -359,6 +359,19 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 		}
 	}
 
+	// Codex account park (PRD #1590 M2, D2): move queued Codex subscription runs that
+	// ClaimRun's account gate excludes (quarantined account, or a re-login on the run's alias
+	// in flight) to recovery_wait with cause codex_account_unavailable, so the hold is visible
+	// rather than an unexplained queued wait. A transition, so it runs before the detector and
+	// a parked run is health-consistent in THIS tick. One bounded page per tick (see
+	// parkCodexAccountUnavailable). Best-effort like the survivor pass below: an error is
+	// logged and the sweep continues.
+	if n, perr := s.parkCodexAccountUnavailable(ctx); perr != nil {
+		slog.Error("sweeper: park codex account unavailable failed", "error", perr)
+	} else {
+		res.CodexAccountParked = n
+	}
+
 	// Bound the in-process persistence-failure tracker (PRD #108 M4). This is the
 	// memory bound for the one case no other eviction path reaches: a run whose
 	// worker vanished without the run ever reaching terminal. Pruned BEFORE the

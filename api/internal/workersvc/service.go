@@ -1656,6 +1656,10 @@ type Service struct {
 	// or between assembly and the final exact-claim transaction. Nil in production, so every
 	// hook is inert unless a test sets it (the codexFreezeFn idiom above).
 	claimHooks *claimTestHooks
+	// codexPark is the park_codex_account_unavailable pass's in-memory keyset cursor (PRD
+	// #1590 M2, D2): the last queued Codex subscription run id the pass examined. Zero value is
+	// the start of the id space. Restart-losing by design: losing it only restarts the scan.
+	codexPark codexAccountParkCursor
 	// readyAt is the moment the worker-facing listener(s) became ready (PRD #1390 M1, D1),
 	// stored as Unix nanoseconds (0 = not yet ready). main.go writes it via SetReadyAt after
 	// binding every enabled listener; the sweeper goroutine reads it each tick to anchor the
@@ -5955,6 +5959,12 @@ type SweepResult struct {
 	// account is left in_progress with an already-terminal intent) is still observable — see
 	// SweepUnresolvedCodexRefresh.
 	CodexRefreshRecovered int64
+	// CodexAccountParked is the number of queued Codex subscription runs this pass moved to
+	// recovery_wait with cause codex_account_unavailable (PRD #1590 M2, D2): runs ClaimRun's
+	// account gate excludes because their account is quarantined or a re-login on their alias
+	// is in flight. Normally 0. Each tick examines at most one bounded page of queued Codex
+	// subscription runs, so a gated run deep in a large queue is parked within a few ticks.
+	CodexAccountParked int64
 	// LimitPromoted is the number of runs this pass brought back from limit_wait to
 	// queued because their retry_not_before elapsed (PRD #35). Normally 0: the
 	// partial index this reads covers only parked runs, a set that is empty on a

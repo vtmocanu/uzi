@@ -882,12 +882,29 @@ WITH target AS (
           )
           OR 'codex_custom_model_v1' = ANY(@worker_protocol_caps::text[])
       )
-      -- PRD #1590 M2a (D2): keep a Codex subscription run queued while its
-      -- linked account is quarantined, or while a newer login on its SAME alias
-      -- is staging/failed after the run's first link. This gate is independent
-      -- of worker capabilities and precedes the custody-opening hold CTE.
-      -- The LEFT JOIN preserves an unlinked alias (including a first login);
-      -- every lookup stays scoped to this run's owner.
+      -- PRD #1590 M2 (D2, amendment A1): keep a Codex subscription run queued while
+      -- its SAME alias's account authority is on hold (D1's hold class):
+      --   (1) quarantine: the linked account is quarantined and, once the run is past
+      --       first link, is still the run's frozen identity at its frozen
+      --       credential_revision (a different identity or a bumped revision is
+      --       terminal, so the claim proceeds and fails in assembly as before);
+      --   (2) re-login in flight: past first link, a newer login on the alias is
+      --       staging/failed (the PATCH cleared the link, so (1) cannot see it);
+      --   (3) A1: past first link, that newer login already linked back to the
+      --       frozen identity at the frozen credential_revision (D5 re-admits it;
+      --       until then the run's material_revision is stale).
+      -- This is the SQL twin of classifyCodexClaimAuthority; a shared fixture table
+      -- pins the two against each other. The frozen identity is stored only as the
+      -- Go-encoded JSON array codex_account_key (00202, codexAccountKey), and no SQL
+      -- encoder exists, so it is DECODED with a guarded ::jsonb cast and compared
+      -- structurally to the account's tuple; an undecodable key never matches. The
+      -- gate is run-level, independent of worker capabilities, and precedes the
+      -- custody-opening hold CTE. The LEFT JOIN preserves an unlinked alias
+      -- (including a first login); every lookup stays scoped to this run's owner.
+      -- The SAME predicate text appears in the peer mirror below, in
+      -- ParkQueuedCodexAccountUnavailablePage and in ListActiveRunsForHealth's
+      -- codex_account_gated; a store test pins the copies byte-identical after
+      -- whitespace normalisation.
       AND NOT (
           r.harness = 'codex'
           AND r.codex_auth_mode = 'subscription'
@@ -899,10 +916,22 @@ WITH target AS (
               WHERE ccs.user_secret_id = r.codex_secret_id
                 AND ccs.user_id = r.user_id
                 AND (
-                    cpa.coord_state = 'quarantined'
+                    (cpa.coord_state = 'quarantined'
+                     AND (r.codex_account_key IS NULL
+                          OR (cpa.credential_revision = r.codex_account_revision
+                              AND CASE WHEN pg_input_is_valid(r.codex_account_key, 'jsonb')
+                                       THEN r.codex_account_key::jsonb
+                                            = jsonb_build_array(cpa.provider_user_id, cpa.workspace_account_id)
+                                       ELSE false END)))
                     OR (r.codex_account_key IS NOT NULL
-                        AND ccs.status IN ('staging', 'failed')
-                        AND ccs.material_revision > r.codex_material_revision)
+                        AND ccs.material_revision > r.codex_material_revision
+                        AND (ccs.status IN ('staging', 'failed')
+                             OR (ccs.status = 'linked'
+                                 AND cpa.credential_revision = r.codex_account_revision
+                                 AND CASE WHEN pg_input_is_valid(r.codex_account_key, 'jsonb')
+                                          THEN r.codex_account_key::jsonb
+                                               = jsonb_build_array(cpa.provider_user_id, cpa.workspace_account_id)
+                                          ELSE false END)))
                 )
           )
       )
@@ -991,7 +1020,7 @@ WITH target AS (
                     )
                     OR 'codex_custom_model_v1' = ANY(p.protocol_capabilities)
                 )
-                -- PRD #1590 M2a (D2): mirror the claimant's account gate so a
+                -- PRD #1590 M2 (D2, A1): mirror the claimant's account gate so a
                 -- busy worker never defers this run to a peer that cannot claim it.
                 AND NOT (
                     r.harness = 'codex'
@@ -1004,10 +1033,22 @@ WITH target AS (
                         WHERE ccs.user_secret_id = r.codex_secret_id
                           AND ccs.user_id = r.user_id
                           AND (
-                              cpa.coord_state = 'quarantined'
+                              (cpa.coord_state = 'quarantined'
+                               AND (r.codex_account_key IS NULL
+                                    OR (cpa.credential_revision = r.codex_account_revision
+                                        AND CASE WHEN pg_input_is_valid(r.codex_account_key, 'jsonb')
+                                                 THEN r.codex_account_key::jsonb
+                                                      = jsonb_build_array(cpa.provider_user_id, cpa.workspace_account_id)
+                                                 ELSE false END)))
                               OR (r.codex_account_key IS NOT NULL
-                                  AND ccs.status IN ('staging', 'failed')
-                                  AND ccs.material_revision > r.codex_material_revision)
+                                  AND ccs.material_revision > r.codex_material_revision
+                                  AND (ccs.status IN ('staging', 'failed')
+                                       OR (ccs.status = 'linked'
+                                           AND cpa.credential_revision = r.codex_account_revision
+                                           AND CASE WHEN pg_input_is_valid(r.codex_account_key, 'jsonb')
+                                                    THEN r.codex_account_key::jsonb
+                                                         = jsonb_build_array(cpa.provider_user_id, cpa.workspace_account_id)
+                                                    ELSE false END)))
                           )
                     )
                 )
@@ -3520,6 +3561,88 @@ WHERE runs.id = @id AND runs.worker_id = @worker_id AND runs.claim_generation = 
   AND runs.status = 'claimed' AND runs.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework')
 RETURNING *;
 
+-- name: ParkQueuedCodexAccountUnavailablePage :one
+-- PRD #1590 M2 (D2, A1): the park_codex_account_unavailable sweeper pass. Moves QUEUED Codex
+-- subscription runs that ClaimRun's account gate excludes to recovery_wait with cause
+-- codex_account_unavailable, so the hold is visible instead of an invisible queued wait.
+--
+-- BOUNDED BY ROWS EXAMINED, not rows updated. `page` is a MATERIALIZED keyset page over the
+-- partial index idx_runs_codex_sub_queued (00252): at most @page_cap queued Codex subscription
+-- runs with id > @after_id, in id order. The LIMIT applies BEFORE the alias/account predicate
+-- is evaluated, so a large queue in which few runs are gated still costs one page per tick; the
+-- service advances its in-memory cursor to last_scanned_id and wraps to the start (uuid.Nil)
+-- once a page comes back shorter than the cap.
+--
+-- `locked` takes the page's still-queued rows FOR UPDATE SKIP LOCKED: a row a concurrent
+-- claim or writer holds is skipped this tick and retried after the cursor wraps. The UPDATE
+-- then rechecks status='queued', the hold-opening kinds and the shared account predicate (the
+-- byte-identical copy of ClaimRun's gate, pinned by a store test) on the locked row.
+--
+-- The SET list is the M1 exact-claim park's, minus the worker_id affinity rewrite: a queued run
+-- has no claim of this pass's making, so claim_generation and worker_id are left alone and no
+-- custody hold is opened or released. recovery_retry_not_before is cleared because this cause
+-- is resumed by the account, never by the timer (PromoteRecoveryWaitRuns skips it).
+--
+-- Returns one row even when nothing parks: page_size (rows examined), last_scanned_id (the nil
+-- uuid on an empty page) and the parked ids.
+WITH page AS MATERIALIZED (
+    SELECT runs.id FROM runs
+    WHERE runs.status = 'queued' AND runs.harness = 'codex' AND runs.codex_auth_mode = 'subscription'
+      AND runs.id > @after_id::uuid
+    ORDER BY runs.id
+    LIMIT @page_cap::int
+),
+locked AS (
+    SELECT runs.id FROM runs
+    WHERE runs.id IN (SELECT page.id FROM page) AND runs.status = 'queued'
+    ORDER BY runs.id
+    FOR UPDATE SKIP LOCKED
+),
+parked AS (
+    UPDATE runs r SET
+        status = 'recovery_wait', recovery_wait_cause = 'codex_account_unavailable',
+        status_since = now(), recovery_retry_not_before = NULL,
+        started_at = NULL, budget_paused_seconds = 0,
+        codex_cap_hash = NULL, codex_claim_epoch = r.codex_claim_epoch + 1,
+        health = 'ok', health_reason = NULL, health_since = NULL,
+        updated_at = now()
+    WHERE r.id IN (SELECT locked.id FROM locked)
+      AND r.status = 'queued'
+      AND r.harness = 'codex'
+      AND r.codex_auth_mode = 'subscription'
+      AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework')
+      AND EXISTS (
+          SELECT 1 FROM codex_credential_state ccs
+          LEFT JOIN codex_provider_account cpa
+              ON cpa.id = ccs.provider_account_id AND cpa.user_id = r.user_id
+          WHERE ccs.user_secret_id = r.codex_secret_id
+            AND ccs.user_id = r.user_id
+            AND (
+                (cpa.coord_state = 'quarantined'
+                 AND (r.codex_account_key IS NULL
+                      OR (cpa.credential_revision = r.codex_account_revision
+                          AND CASE WHEN pg_input_is_valid(r.codex_account_key, 'jsonb')
+                                   THEN r.codex_account_key::jsonb
+                                        = jsonb_build_array(cpa.provider_user_id, cpa.workspace_account_id)
+                                   ELSE false END)))
+                OR (r.codex_account_key IS NOT NULL
+                    AND ccs.material_revision > r.codex_material_revision
+                    AND (ccs.status IN ('staging', 'failed')
+                         OR (ccs.status = 'linked'
+                             AND cpa.credential_revision = r.codex_account_revision
+                             AND CASE WHEN pg_input_is_valid(r.codex_account_key, 'jsonb')
+                                      THEN r.codex_account_key::jsonb
+                                           = jsonb_build_array(cpa.provider_user_id, cpa.workspace_account_id)
+                                      ELSE false END)))
+            )
+      )
+    RETURNING r.id
+)
+SELECT (SELECT count(*) FROM page)::bigint AS page_size,
+       COALESCE((SELECT page.id FROM page ORDER BY page.id DESC LIMIT 1),
+                '00000000-0000-0000-0000-000000000000'::uuid)::uuid AS last_scanned_id,
+       COALESCE((SELECT array_agg(parked.id ORDER BY parked.id) FROM parked), '{}')::uuid[] AS parked_ids;
+
 -- name: FailClaimAssemblyExact :execrows
 -- Terminal claim assembly failure, fenced to the same locked claim (PRD #1590 D2). The
 -- SET list mirrors MarkRunFailedByID field for field, including #1482's card-only
@@ -5740,6 +5863,11 @@ UPDATE runs SET checkpoint_tip = @checkpoint_tip, checkpoint_tip_at = now() WHER
 -- lane; NULL-safe via COALESCE), and the exemption is keyed on review_target_run_id/kind (task-review,
 -- judge and chat are exempt), NEVER on all of kind='task'. Cast ::boolean so sqlc types it as a usable
 -- bool (an expression is interface{} without the cast, per .claude/rules/go.md).
+-- PRD #1590 M2 (D2, A1): codex_account_gated projects ClaimRun's Codex account gate onto each
+-- row (the SAME predicate text, evaluated over a self-join aliased r so the copies stay
+-- byte-identical), so the queued arm names the account hold instead of a worker reason for a
+-- queued run the gate excludes in the window before the park_codex_account_unavailable pass
+-- moves it to recovery_wait.
 SELECT id, user_id, status, auto_approve,
        started_at, last_activity_at, updated_at, status_since,
        health, health_reason, health_since, health_notified_at,
@@ -5753,7 +5881,39 @@ SELECT id, user_id, status, auto_approve,
             NOT ((CASE WHEN runs.model = ANY(@codex_curated_models::text[]) THEN runs.model
                        ELSE (SELECT u.default_codex_model FROM users u WHERE u.id = runs.user_id) END)
                  = ANY(@codex_curated_models::text[])),
-            false))::boolean AS codex_custom_root
+            false))::boolean AS codex_custom_root,
+       (EXISTS (
+           SELECT 1 FROM runs r
+           WHERE r.id = runs.id
+             AND r.harness = 'codex'
+             AND r.codex_auth_mode = 'subscription'
+             AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework')
+             AND EXISTS (
+                 SELECT 1 FROM codex_credential_state ccs
+                 LEFT JOIN codex_provider_account cpa
+                     ON cpa.id = ccs.provider_account_id AND cpa.user_id = r.user_id
+                 WHERE ccs.user_secret_id = r.codex_secret_id
+                   AND ccs.user_id = r.user_id
+                   AND (
+                       (cpa.coord_state = 'quarantined'
+                        AND (r.codex_account_key IS NULL
+                             OR (cpa.credential_revision = r.codex_account_revision
+                                 AND CASE WHEN pg_input_is_valid(r.codex_account_key, 'jsonb')
+                                          THEN r.codex_account_key::jsonb
+                                               = jsonb_build_array(cpa.provider_user_id, cpa.workspace_account_id)
+                                          ELSE false END)))
+                       OR (r.codex_account_key IS NOT NULL
+                           AND ccs.material_revision > r.codex_material_revision
+                           AND (ccs.status IN ('staging', 'failed')
+                                OR (ccs.status = 'linked'
+                                    AND cpa.credential_revision = r.codex_account_revision
+                                    AND CASE WHEN pg_input_is_valid(r.codex_account_key, 'jsonb')
+                                             THEN r.codex_account_key::jsonb
+                                                  = jsonb_build_array(cpa.provider_user_id, cpa.workspace_account_id)
+                                             ELSE false END)))
+                   )
+             )
+       ))::boolean AS codex_account_gated
 FROM runs
 WHERE status IN ('queued', 'running', 'awaiting_approval')
   AND kind <> 'chat';
