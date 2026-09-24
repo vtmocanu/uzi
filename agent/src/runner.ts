@@ -11,7 +11,7 @@ import {
   isWorkflowScopeRejection,
 } from "./git.js";
 import type { SecretFinding } from "./secret-scan-guard.js";
-import type { Executor, ExecutorResult, RunContext, WallParkOutcome } from "./executor.js";
+import type { Executor, ExecutorResult, RunContext, WallParkOutcome, WallParkRefresh } from "./executor.js";
 import { PlanRejectedError } from "./executor.js";
 import type { BoundaryPermit, BoundaryRequest } from "./harness.js";
 import { skillsPluginDir } from "./skills-plugin.js";
@@ -758,6 +758,9 @@ interface RunFlight {
   preClonePark: boolean;
   /** Retain the only copy of unverified recovery work; never guard non-filesystem cleanup. */
   preserveRecoveryClone: boolean;
+  /** Issue #1600: the budget off the latest REFUSED wall park's 409, held until the executor
+   *  takes it (RunContext.takeWallParkRefresh). */
+  wallParkRefresh?: WallParkRefresh;
   lastPublish: number;
   lastPublishedTip: string | undefined;
   /** PRD #1062 M2 (#1036): the current tip of `refs/uzi-checkpoints/<branch>` as this run last
@@ -6057,6 +6060,12 @@ export class RunRunner {
       // implement loop's wall-pause turn catch, its pre-attempt REASON_WALL arm, and the loop-top
       // wall boundary.
       parkForWall: () => this.enterWallPark(flight, claim, runLog),
+      // Issue #1600: hand the executor the budget a refused wall park carried, once.
+      takeWallParkRefresh: () => {
+        const refresh = flight.wallParkRefresh;
+        flight.wallParkRefresh = undefined;
+        return refresh;
+      },
       // PRD #1497 M2: clear a sticky `wall` pause mode after a REFUSED wall_park (the owner extended
       // in the window, so the run continues) — else the next loop boundary would re-route to the
       // wall seam. Delegates to the steering channel; a no-op when no wall is pending.
@@ -7958,8 +7967,11 @@ export class RunRunner {
     //    (refused) body; a 404 (a reclaim — ErrRunNotOwned) or a transport/5xx error THROWS, which is
     //    an UNDELIVERABLE park (D17): keep the flags, report nothing terminal, end non-terminal.
     let status: string;
+    let refresh: WallParkRefresh = {};
     try {
-      ({ status } = await this.client.reportWallPark(flight.runId, {
+      let budgetTotalSeconds: number | undefined;
+      let budgetUsedSeconds: number | undefined;
+      ({ status, budgetTotalSeconds, budgetUsedSeconds } = await this.client.reportWallPark(flight.runId, {
         // Empty on a degraded park (the server column is nullable and treats "" as null).
         head: head ?? "",
         published,
@@ -7967,6 +7979,8 @@ export class RunRunner {
         // released/superseded stale flight's reclaimed run (the SAME value the reportState closure stamps).
         claimGeneration: flight.claimGeneration,
       }));
+      if (budgetTotalSeconds !== undefined) refresh.totalSeconds = budgetTotalSeconds;
+      if (budgetUsedSeconds !== undefined) refresh.usedSeconds = budgetUsedSeconds;
     } catch (err) {
       runLog.warn(
         "wall park report undeliverable; retaining clone + HOME and ending the flight non-terminal (D17)",
@@ -8002,6 +8016,9 @@ export class RunRunner {
     // finalizes normally and its clone/HOME are cleaned up by the ordinary terminal path, not preserved.
     flight.preserveRecoveryClone = false;
     flight.preserveSession = false;
+    // Issue #1600: keep the refusal's budget for the executor, which re-drives the turn without
+    // passing reportIteration and would otherwise re-arm an exhausted wall.
+    flight.wallParkRefresh = refresh;
     runLog.info("wall park refused (the owner extended in the window); the run continues", {
       run_id: flight.runId,
       server_status: status || "unknown",

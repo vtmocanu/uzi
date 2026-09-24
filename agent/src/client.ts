@@ -1157,7 +1157,7 @@ export class WorkerClient {
   async reportWallPark(
     runId: string,
     args: { head: string; published: boolean; claimGeneration?: number },
-  ): Promise<{ status: string }> {
+  ): Promise<{ status: string; budgetTotalSeconds?: number; budgetUsedSeconds?: number }> {
     const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/wall-park`;
     // Stamp the claim-lane generation through the shared send-gate + skew-safe fallback, exactly as
     // requestCompletionHold does: a wall_park_v1 worker also advertises credential_switch_v1, so it
@@ -1170,7 +1170,14 @@ export class WorkerClient {
       const res = await this.fetchRaw("POST", path, body);
       if (res.status === 200 || res.status === 409) {
         const fields = await readRunAck(res);
-        return { status: fields.status ?? "" };
+        // Issue #1600: a refused park's 409 carries the run's fresh budget; pass it through so the
+        // executor re-arms from the server's remaining time instead of its exhausted local wall.
+        const out: { status: string; budgetTotalSeconds?: number; budgetUsedSeconds?: number } = {
+          status: fields.status ?? "",
+        };
+        if (fields.budgetTotalSeconds !== undefined) out.budgetTotalSeconds = fields.budgetTotalSeconds;
+        if (fields.budgetUsedSeconds !== undefined) out.budgetUsedSeconds = fields.budgetUsedSeconds;
+        return out;
       }
       if (res.status >= 400) throw await this.toError("POST", path, res);
       // A 2xx we do not model: no status came back, which is not "paused" ⇒ treated as refused.
@@ -1478,6 +1485,7 @@ export async function readRunAck(res: Response): Promise<{
   budgetMaxIterations?: number;
   budgetWallSeconds?: number;
   budgetTotalSeconds?: number;
+  budgetUsedSeconds?: number;
   scopeCeiling?: number;
   completedCount?: number;
   pauseRequested?: boolean;
@@ -1502,6 +1510,7 @@ export async function readRunAck(res: Response): Promise<{
         budget_max_iterations?: unknown;
         budget_wall_seconds?: unknown;
         budget_total_seconds?: unknown;
+        budget_used_seconds?: unknown;
         scope_ceiling?: unknown;
         milestones_completed?: unknown;
         pause_requested?: unknown;
@@ -1521,6 +1530,7 @@ export async function readRunAck(res: Response): Promise<{
       budgetMaxIterations?: number;
       budgetWallSeconds?: number;
       budgetTotalSeconds?: number;
+      budgetUsedSeconds?: number;
       scopeCeiling?: number;
       completedCount?: number;
       pauseRequested?: boolean;
@@ -1545,6 +1555,11 @@ export async function readRunAck(res: Response): Promise<{
     // back to budgetWallSeconds.
     if (typeof run?.budget_total_seconds === "number")
       out.budgetTotalSeconds = run.budget_total_seconds;
+    // Issue #1600: ACTIVE time so far, server-derived beside budget_total_seconds, so a refused
+    // wall park can hand the Codex executor the server's own remaining budget (total - used)
+    // without comparing clocks across hosts.
+    if (typeof run?.budget_used_seconds === "number")
+      out.budgetUsedSeconds = run.budget_used_seconds;
     // PRD #634 M2: the operator scope ceiling (control channel) and the server's fresh
     // completed-milestone count, both off the same {run: RunDTO} body. scope_ceiling is
     // null (unbounded) unless a scope directive was written. A run whose lead never reported

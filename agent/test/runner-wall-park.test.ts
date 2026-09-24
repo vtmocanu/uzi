@@ -374,4 +374,41 @@ describe("RunRunner — capture-first wall park (PRD #1497 M2)", () => {
       fs.rmSync(homeRoot, { recursive: true, force: true });
     }
   });
+
+  // Issue #1600: a REFUSED park's 409 carries the run's fresh budget. The runner hands it to the
+  // executor once via ctx.takeWallParkRefresh, so a Codex re-drive can re-arm its exhausted wall.
+  it("a REFUSED wall_park hands the 409's budget to the executor once via takeWallParkRefresh", async () => {
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-1600-refresh-"));
+    const { restore } = spyPublish();
+    api.setWallParkResponse("running", 409, { total: 7200, used: 3600 });
+    const refreshes: unknown[] = [];
+    try {
+      const factory: ExecutorFactory = (runId) => ({
+        homeDir: path.join(homeRoot, runId),
+        executor: {
+          run: async (ctx: RunContext): Promise<ExecutorResult> => {
+            fs.mkdirSync(path.join(homeRoot, runId), { recursive: true });
+            refreshes.push(ctx.takeWallParkRefresh?.());
+            const outcome = await ctx.parkForWall?.({ completedCount: 0 });
+            refreshes.push(outcome);
+            refreshes.push(ctx.takeWallParkRefresh?.());
+            refreshes.push(ctx.takeWallParkRefresh?.());
+            return { branch: ctx.branch };
+          },
+        },
+      });
+      const claim = gitlabClaim(1600);
+      await runnerWithGit(factory, gitlab).execute(claim);
+      assert.deepEqual(
+        refreshes,
+        [undefined, "refused", { totalSeconds: 7200, usedSeconds: 3600 }, undefined],
+        "nothing before the refusal, the 409's budget once after it, then consumed",
+      );
+    } finally {
+      api.setWallParkResponse("paused", 200);
+      restore();
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
 });

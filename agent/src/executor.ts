@@ -83,6 +83,16 @@ export interface EmittedMessage {
 export type WallParkOutcome = "parked" | "undeliverable" | "refused" | "cancelled";
 
 /**
+ * Issue #1600: the run's budget as the server reported it on a REFUSED wall park's 409 body
+ * ({@link RunContext.takeWallParkRefresh}). `totalSeconds` is the served three-term total wall and
+ * `usedSeconds` the server's active time so far; either may be absent (an older server).
+ */
+export interface WallParkRefresh {
+  totalSeconds?: number;
+  usedSeconds?: number;
+}
+
+/**
  * Everything an executor needs to work one run.
  *
  * The fields below `emit` are consumed only by the SDK executor (M3); the M2
@@ -456,6 +466,14 @@ export interface RunContext {
    * legacy behaviour (the caller treats the absent seam as "no park").
    */
   parkForWall?(at: { completedCount: number; total?: number }): Promise<WallParkOutcome>;
+  /**
+   * Issue #1600: the budget the server returned with the most recent REFUSED wall park, consumed
+   * once (a second call returns undefined until the next refusal). A caller that re-drives a turn
+   * straight after a refusal, without passing reportIteration, reads it to re-arm its wall from the
+   * server's remaining time. Absent on the stub/test executors, and undefined when no refusal
+   * carried a budget.
+   */
+  takeWallParkRefresh?(): WallParkRefresh | undefined;
   /**
    * PRD #1497 M2: clear a STICKY `wall` pause mode (steering.clearWallMode). Called by the executor
    * after a REFUSED wall_park so the sticky wall mode does not re-fire the wall seam on the next loop
