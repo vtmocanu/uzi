@@ -80,6 +80,7 @@ import { isCIConfigPlan } from "./prompt.js";
 import { flagCIConfigPaths, DEFAULT_CI_CONFIG_PATHS } from "./ci-config-guard.js";
 import { REASON_PROVISION_FAILED } from "./provision-run.js";
 import { REASON_NO_TOKEN, TransientRecoveryError } from "./sdk-executor.js";
+import { PLAN_MISSING_QUESTION, PLAN_MISSING_QUESTION_HEADER, REASON_PLAN_MISSING } from "./plan-missing.js";
 
 /** Cap on a reported failure_reason, matching the forge error-body cap
  *  (forge.ts) so a runaway SDK error can't bloat the run row or the stream. */
@@ -306,12 +307,15 @@ class RunningAckTerminalError extends Error {
  *  M7a). Authored WORKER-SIDE from the reason constant the throw site used — it never
  *  parses free text: it matches only the fixed prefixes the two fatal pre-start
  *  throwers emit (provision-run appends `: <detail>` after REASON_PROVISION_FAILED;
- *  sdk-executor throws REASON_NO_TOKEN verbatim). Ordinary agent failures return
- *  undefined, so `fail_origin` is omitted and the server defaults them to
- *  'agent_failure'. Sent unvalidated; the server allowlists it. */
+ *  sdk-executor throws REASON_NO_TOKEN verbatim), and, by EXACT match, the static
+ *  REASON_PLAN_MISSING both executors throw for a planning turn that stayed prose-only
+ *  (issue #1593). Ordinary agent failures return undefined, so `fail_origin` is omitted
+ *  and the server defaults them to 'agent_failure'. Sent unvalidated; the server
+ *  allowlists it. */
 export function failOriginForReason(rawReason: string): string | undefined {
   if (rawReason.startsWith(REASON_PROVISION_FAILED)) return "provisioning_failed";
   if (rawReason.startsWith(REASON_NO_TOKEN)) return "credential_unavailable";
+  if (rawReason === REASON_PLAN_MISSING) return "plan_missing";
   return undefined;
 }
 
@@ -5521,6 +5525,18 @@ export class RunRunner {
           claim.auto_approve ?? false,
           claim.config ?? null,
         ),
+      // Issue #1593: the worker-authored fallback park for a planning turn that stayed
+      // prose-only after a nudge. Fixed question, no model text; autopilot never parks.
+      askPlanMissing: () =>
+        this.askPlanMissing(
+          runId,
+          batcher,
+          steering,
+          reportState,
+          runLog,
+          claim.auto_approve ?? false,
+          claim.config ?? null,
+        ),
       pullFollowUp: () => steering.pullFollowUp(),
       // PRD #1416 M2: drain the worker-authoritative safety steer the divergence detection
       // (maybeSteerOnDivergence) armed on this same steering channel, in-process. Consumed by
@@ -8353,6 +8369,76 @@ export class RunRunner {
       };
     }
 
+    return this.parkQuestion(
+      runId,
+      questions,
+      "lead",
+      undefined,
+      batcher,
+      steering,
+      reportState,
+      runLog,
+      config,
+    );
+  }
+
+  /**
+   * Issue #1593: the worker-authored plan-missing park. An executor calls this after a
+   * planning turn ended in prose only even after a corrective nudge. The question is FIXED
+   * (plan-missing.ts) and emitted as the WORKER with `plan_missing: true` and no options; no
+   * model text is passed in, so the lead's prose cannot reach the question. The lead's last
+   * message reaches the owner only on the executor's status card, as untrusted data.
+   *
+   * Shares askUser's park body, so the id, the ack check, the settle `running` report and the
+   * shared per-run answer deadline (REASON_QUESTION_TIMEOUT) are identical. It does not count
+   * against question_max; that cap lives in the executors. An autopilot run never parks: it
+   * returns `unattended` WITHOUT reporting awaiting_input, and the executor fails the run.
+   */
+  private async askPlanMissing(
+    runId: string,
+    batcher: MessageBatcher,
+    steering: SteeringChannel,
+    reportState: (body: StateRequest) => Promise<unknown>,
+    runLog: Logger,
+    autoApprove: boolean,
+    config: ClaimConfig | null,
+  ): Promise<{ kind: "answer"; answers: string[] } | { kind: "cancel" } | { kind: "unattended" }> {
+    if (autoApprove) {
+      runLog.info("plan missing: not parked (autopilot)", { run_id: runId });
+      return { kind: "unattended" };
+    }
+    const v = await this.parkQuestion(
+      runId,
+      [{ header: PLAN_MISSING_QUESTION_HEADER, question: PLAN_MISSING_QUESTION }],
+      "worker",
+      { plan_missing: true },
+      batcher,
+      steering,
+      reportState,
+      runLog,
+      config,
+    );
+    return v.kind === "answer" ? { kind: "answer", answers: v.answers } : { kind: "cancel" };
+  }
+
+  /**
+   * The clarification park body shared by askUser and askPlanMissing (issue #1593): emit the
+   * question as `emitAgent`, park at awaiting_input, and resolve with the human's answer.
+   * `extraPayload` is merged AFTER `{question_id, questions}`, so askUser (no extra payload)
+   * emits exactly the message it always has. See askUser's doc for the ordering, the ack
+   * check and the deadline.
+   */
+  private async parkQuestion(
+    runId: string,
+    questions: AskUserQuestion[],
+    emitAgent: "lead" | "worker",
+    extraPayload: Record<string, unknown> | undefined,
+    batcher: MessageBatcher,
+    steering: SteeringChannel,
+    reportState: (body: StateRequest) => Promise<unknown>,
+    runLog: Logger,
+    config: ClaimConfig | null,
+  ): Promise<AnswerVerdict> {
     const ordinal = (this.questionCounts.get(runId) ?? 0) + 1;
     this.questionCounts.set(runId, ordinal);
 
@@ -8366,8 +8452,8 @@ export class RunRunner {
 
     batcher.emit({
       kind: "question",
-      agent: "lead",
-      payload: { question_id: questionId, questions },
+      agent: emitAgent,
+      payload: { question_id: questionId, questions, ...extraPayload },
     });
     // Durable before the park is announced — see the doc comment.
     await batcher.flush().catch(() => undefined);

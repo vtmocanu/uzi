@@ -18,6 +18,7 @@ import { GitLabClient, type FetchFn } from "../src/forge.js";
 import { RunRunner, REASON_QUESTION_TIMEOUT } from "../src/runner.js";
 import { SteeringChannel, type AnswerVerdict } from "../src/steering.js";
 import type { AskUserQuestion, UserInput } from "../src/protocol.js";
+import { PLAN_MISSING_QUESTION, PLAN_MISSING_QUESTION_HEADER } from "../src/plan-missing.js";
 
 /**
  * PRD #88 M6 — the `RunRunner` layer of the clarification park.
@@ -637,5 +638,104 @@ describe("PRD #88 M6 — RunRunner.askUser", () => {
       "a timed-out park must NOT emit a settle `running` — there is no answer " +
         `verdict; report bodies were ${JSON.stringify(runStates.map((s) => s.body))}`,
     );
+  });
+});
+
+type PlanMissingVerdict = Awaited<ReturnType<NonNullable<RunContext["askPlanMissing"]>>>;
+
+/**
+ * Issue #1593 — `RunRunner.askPlanMissing`, the worker-authored fallback park for a planning
+ * turn that ended in prose only. It shares askUser's park body (id, ack check, settle, the
+ * shared deadline) but emits as the WORKER with a FIXED question, and takes no model text.
+ */
+describe("issue #1593 — RunRunner.askPlanMissing", () => {
+  const PROSE = "LEAD-PROSE-1593: I think we should refactor the widget.";
+
+  /** Emits the lead's prose on the feed the way the executor's status card does, then parks
+   *  on the plan-missing question (optionally after an ordinary lead question). */
+  function planMissingExecutor(log: { verdicts: PlanMissingVerdict[] }, opts: { askFirst?: boolean } = {}): Executor {
+    return {
+      async run(ctx: RunContext) {
+        if (opts.askFirst) await ctx.askUser!([{ question: "lead question?", header: "LQ" }]);
+        ctx.emit({ kind: "status", agent: "worker", payload: { event: "plan_missing", lead_final_message: PROSE } });
+        const v = await ctx.askPlanMissing!();
+        log.verdicts.push(v);
+        if (v.kind === "cancel") throw new Error("run cancelled");
+        commitMarker(ctx.worktreePath, "plan missing");
+        return { branch: ctx.branch };
+      },
+    };
+  }
+
+  const questionMessages = (runId: string) => api.messages(runId).filter((m) => m.kind === "question");
+
+  it("parks as the worker on the fixed question, with plan_missing and no options, and returns the answer", async () => {
+    const log = { verdicts: [] as PlanMissingVerdict[] };
+    const claim = claimFor(60);
+    api.onState(claim.run_id, (body) => {
+      if (body.status === "awaiting_input" && body.open_question_id) {
+        api.setInputs(claim.run_id, [answerInput(body.open_question_id, "use the server path")]);
+      }
+    });
+    await runnerFor(planMissingExecutor(log)).execute(claim);
+
+    assert.deepStrictEqual(log.verdicts, [{ kind: "answer", answers: ["use the server path"] }]);
+    const qs = questionMessages(claim.run_id);
+    assert.strictEqual(qs.length, 1);
+    assert.strictEqual(qs[0]!.agent, "worker");
+    const payload = qs[0]!.payload as Record<string, unknown>;
+    assert.deepStrictEqual(Object.keys(payload).sort(), ["plan_missing", "question_id", "questions"]);
+    assert.strictEqual(payload.plan_missing, true);
+    assert.deepStrictEqual(payload.questions, [{ header: PLAN_MISSING_QUESTION_HEADER, question: PLAN_MISSING_QUESTION }]);
+    assert.ok(!JSON.stringify(payload).includes(PROSE), "the lead's prose never enters the question");
+    assert.deepStrictEqual(parkedQuestionIds(claim.run_id), [payload.question_id]);
+    const seq = statuses(claim.run_id);
+    assert.ok(seq.slice(seq.indexOf("awaiting_input") + 1).includes("running"), "the answer settles with a running report");
+    assert.strictEqual(seq.at(-1), "completed");
+  });
+
+  it("leaves askUser's question message unchanged: agent lead, no plan_missing", async () => {
+    const log = { verdicts: [] as PlanMissingVerdict[] };
+    const claim = claimFor(61);
+    api.onState(claim.run_id, (body) => {
+      if (body.status === "awaiting_input" && body.open_question_id) {
+        api.setInputs(claim.run_id, [answerInput(body.open_question_id, "ok")]);
+      }
+    });
+    await runnerFor(planMissingExecutor(log, { askFirst: true })).execute(claim);
+    const qs = questionMessages(claim.run_id);
+    assert.strictEqual(qs.length, 2);
+    assert.strictEqual(qs[0]!.agent, "lead");
+    assert.deepStrictEqual(Object.keys(qs[0]!.payload).sort(), ["question_id", "questions"]);
+    assert.strictEqual(qs[1]!.agent, "worker");
+    assert.notStrictEqual((qs[0]!.payload as { question_id?: string }).question_id, (qs[1]!.payload as { question_id?: string }).question_id);
+  });
+
+  it("returns unattended on an autopilot run without parking", async () => {
+    const log = { verdicts: [] as PlanMissingVerdict[] };
+    const claim = claimFor(62, { auto_approve: true });
+    await runnerFor(planMissingExecutor(log)).execute(claim);
+    assert.deepStrictEqual(log.verdicts, [{ kind: "unattended" }]);
+    assert.ok(!statuses(claim.run_id).includes("awaiting_input"), "an autopilot run never parks");
+    assert.strictEqual(questionMessages(claim.run_id).length, 0);
+  });
+
+  it("fails REASON_QUESTION_TIMEOUT when nobody answers", async () => {
+    const log = { verdicts: [] as PlanMissingVerdict[] };
+    const claim = claimFor(63);
+    await runnerFor(planMissingExecutor(log)).execute(claim);
+    assert.ok(statuses(claim.run_id).includes("awaiting_input"));
+    assert.strictEqual(failureReason(claim.run_id), REASON_QUESTION_TIMEOUT);
+    assert.deepStrictEqual(log.verdicts, []);
+  });
+
+  it("resolves cancel when the owner cancels at the park", async () => {
+    const log = { verdicts: [] as PlanMissingVerdict[] };
+    const claim = claimFor(64);
+    api.onState(claim.run_id, (body) => {
+      if (body.status === "awaiting_input" && body.open_question_id) api.setInputs(claim.run_id, [input("cancel")]);
+    });
+    await runnerFor(planMissingExecutor(log)).execute(claim);
+    assert.deepStrictEqual(log.verdicts, [{ kind: "cancel" }]);
   });
 });

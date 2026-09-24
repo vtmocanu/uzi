@@ -27,6 +27,11 @@ through `[0.52.0]`.)
 - **A Codex login the provider outright rejects now surfaces as "re-login required," with a reason ([#1594](https://github.com/vtmocanu/uzi/issues/1594)).**
   When a Codex refresh fails with an allowlisted OAuth rejection code (the provider saying this refresh token can never work again, not an ambiguous timeout or 5xx), uzi quarantines the account and flags it for re-login in one transaction, and both surfaces name the reason: the Codex limits meter's hint says "the saved Codex login was rejected by the provider", and `uzi rate-limits --provider codex` prints `credential_action_required (login rejected by provider)`. The rejection reason now surfaces even when Codex usage polling is turned off (the meter hint and `uzi rate-limits --provider codex` print `polling_disabled (login rejected by provider)`); while polling is on, a locked vault still shows only the vault-locked state until it is unlocked. Any other refresh failure stays on the existing cautious, ambiguous path and is never mislabelled re-login required, and uzi never re-sends a refresh token after a failed exchange. The Codex credentials docs and the web login field now guide toward a login kept dedicated to uzi and isolated from your everyday Codex CLI session, so a copied login's refresh token, which Codex can rotate, doesn't go stale on one side; some stale claims about Codex credentials being inert and about `staging` never resolving on its own are also corrected (a staged login is verified automatically while Codex usage polling is on, the default).
 
+### Fixed
+
+- **A plan turn that ends with prose only now parks for the run's owner instead of always failing ([#1593](https://github.com/vtmocanu/uzi/issues/1593)).**
+  When a gated plan (or plan-revision) turn calls neither `submit_plan` nor `ask_user` and just writes prose, the worker resumes the same session once with a fixed corrective nudge; if it is still prose only, an attended run parks at `awaiting_input` on a fixed "Plan missing" question while the lead's last message rides along as a bounded, secret-scrubbed feed card, and an autopilot or otherwise-unattended run fails closed with the new judge-eligible `plan_missing` fail origin, backed by a migration that widens `runs_fail_origin_check` to sixteen values.
+
 ## [0.84.0] - 2026-09-20
 
 ### Added
