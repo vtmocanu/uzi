@@ -19,6 +19,9 @@ type seams struct {
 	snapshot       func() ([]procRow, error)
 	now            func() time.Time
 	sleep          func()
+	// tmpCleanup removes the command tmp and reports the outcome. nil when no
+	// --cleanup-token was given; the evidence then carries no tmpCleanup field.
+	tmpCleanup func() *tmpCleanupResult
 }
 
 // supervisor runs the fd 3 control loop and emits fd 4 evidence.
@@ -26,6 +29,8 @@ type supervisor struct {
 	ev      *evidence
 	control *controlReader
 	seams   seams
+	// tmpCleaned records that tmpCleanup already ran, so it runs at most once.
+	tmpCleaned bool
 }
 
 // drainWith runs one bounded drain using the given timeout.
@@ -107,10 +112,15 @@ func (s *supervisor) run(childPid int, st procStatus) int {
 				_ = s.ev.writeJSON(snapshotEvidence{Event: opSnapshot, ID: op.ID, Processes: rows})
 			case opDispose:
 				drained := s.drainWith(op.TimeoutMs)
-				_ = s.ev.writeJSON(disposeEvidence(op.ID, drained))
+				m := disposeEvidence(op.ID, drained)
 				if drained.State == stateDrained {
+					// Remove the tmp BEFORE reporting, so the dispose line carries
+					// the outcome. It never changes the exit code.
+					withTmpCleanup(m, s.cleanupTmp())
+					_ = s.ev.writeJSON(m)
 					return 0
 				}
+				_ = s.ev.writeJSON(m)
 				// unconfirmed dispose is retained state, not success; keep serving
 				// (a repeat dispose is safe/idempotent).
 			}
@@ -120,8 +130,26 @@ func (s *supervisor) run(childPid int, st procStatus) int {
 
 // abnormal emits a best-effort-drained abnormal event and returns the non-zero
 // exit code. The reason is already a short, sanitized sentinel string.
+//
+// The command tmp is removed only when that drain reached drained. An
+// unconfirmed drain may leave a live descendant still using the tmp, so it is
+// left untouched for the startup reaper.
 func (s *supervisor) abnormal(reason string) int {
 	cleanup := s.drainWith(defaultDisposeTimeoutMs)
-	_ = s.ev.writeJSON(abnormalEvidence(reason, &cleanup))
+	m := abnormalEvidence(reason, &cleanup)
+	if cleanup.State == stateDrained {
+		withTmpCleanup(m, s.cleanupTmp())
+	}
+	_ = s.ev.writeJSON(m)
 	return 2
+}
+
+// cleanupTmp runs the tmpCleanup seam at most once. It returns nil (no
+// evidence field) when there is no seam or it already ran.
+func (s *supervisor) cleanupTmp() *tmpCleanupResult {
+	if s.seams.tmpCleanup == nil || s.tmpCleaned {
+		return nil
+	}
+	s.tmpCleaned = true
+	return s.seams.tmpCleanup()
 }

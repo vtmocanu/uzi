@@ -114,6 +114,7 @@ import {
   launchCodexRoot,
   type CodexEffectLaunchSpec,
   type CodexRootHandle,
+  type DisposeOutcome,
 } from "./launcher.js";
 import { createCodexTransport } from "./transport.js";
 import type { CodexNotification } from "./transport.js";
@@ -1538,7 +1539,7 @@ export class CodexExecutor implements Executor {
         this.deps.spawnBoundaryRoot ??
         ((): Promise<RegisteredRoot> =>
           Promise.reject(new Error("codex boundary-action spawn seam is not wired (the runner drives spawnBoundaryProcess)")));
-      const boundaryProcessSpawner = makeBoundaryProcessSpawner(launchEffectRoot, commandSandbox);
+      const boundaryProcessSpawner = makeBoundaryProcessSpawner(launchEffectRoot, commandSandbox, this.log);
       const reconcile = this.makeBoundaryReconcile(ctx.runId, registerToken, committedGeneration);
       // (C, F1) Terminal eviction of tokens released by the POST-RUN sink reconciles. The runner
       // calls safety.dispose after the last durability sink — by which point run()'s finally has
@@ -1936,6 +1937,7 @@ export class CodexExecutor implements Executor {
         worktreePath,
         commandEnv,
         commandSandbox,
+        this.log,
       );
       const spawnCommand: SpawnCommandSeam = (argv, spawnOpts) => baseSpawnCommand(argv, { ...spawnOpts, env: commandEnv });
       const fileopRoot = await launchRegisteredEffectRoot(
@@ -1944,6 +1946,7 @@ export class CodexExecutor implements Executor {
         commandEffectSpec(worktreePath, worktreePath, FILEOP_BIN, ["--root", worktreePath], commandEnv, commandSandbox),
         boundaryDeadlineMs,
         "command",
+        this.log,
       );
       try {
         fileopHandle = (this.deps.wireFileop ?? wireFileopHelper)({
@@ -2626,17 +2629,38 @@ interface RegisteredEffectRoot {
   readonly root: RegisteredRoot;
 }
 
-export function registeredRoot(handle: CodexRootHandle, kind: RegisteredRoot["kind"]): RegisteredRoot {
+/** Warn once when a clean disposal reports that the supervisor RETAINED the command's
+ *  private tmp. Diagnostic only: a retained tmp is disk left behind for the startup
+ *  reaper, never an unclean reap, so the reap/dispose result is unchanged. */
+function makeTmpRetainedReporter(log: Pick<Logger, "warn"> | undefined): (outcome: DisposeOutcome) => void {
+  let reported = false;
+  return (outcome) => {
+    if (!log || reported || !outcome.clean) return;
+    const tmp = outcome.event.tmpCleanup;
+    if (tmp?.state !== "retained") return;
+    reported = true;
+    log.warn("codex command tmp retained", { reason: tmp.reason });
+  };
+}
+
+export function registeredRoot(
+  handle: CodexRootHandle,
+  kind: RegisteredRoot["kind"],
+  log?: Pick<Logger, "warn">,
+): RegisteredRoot {
+  const reportTmp = makeTmpRetainedReporter(log);
   return {
     kind,
     reap: async (deadlineMs) => {
       const outcome = await handle.dispose(deadlineMs);
+      reportTmp(outcome);
       return outcome.clean
         ? { ok: true }
         : { ok: false, error: { category: "tool", message: `${kind} supervisor root disposal not clean` } };
     },
     dispose: async (deadlineMs) => {
       const outcome = await handle.dispose(deadlineMs);
+      reportTmp(outcome);
       if (!outcome.clean) throw new Error(`${kind} supervisor root disposal not clean`);
     },
   };
@@ -2648,6 +2672,7 @@ async function launchRegisteredEffectRoot(
   spec: CodexEffectLaunchSpec,
   deadlineMs: number,
   kind: RegisteredRoot["kind"],
+  log?: Pick<Logger, "warn">,
 ): Promise<RegisteredEffectRoot> {
   const reservation = registry.reserveLaunch(kind);
   if (reservation.kind !== "reserved") throw new Error(`${kind} launch admission is closed`);
@@ -2658,7 +2683,7 @@ async function launchRegisteredEffectRoot(
     registry.cancelReservation(reservation.reservation);
     throw error;
   }
-  const root = registeredRoot(handle, kind);
+  const root = registeredRoot(handle, kind, log);
   const admitted = registry.registerRoot(reservation.reservation, root);
   if (!admitted.ok) {
     await root.dispose(deadlineMs).catch(() => undefined);
@@ -2765,6 +2790,7 @@ export function makeDefaultSpawnCommand(
   worktreePath: string,
   commandEnv: NodeJS.ProcessEnv,
   mode: CommandSandboxMode,
+  log?: Pick<Logger, "warn">,
 ): SpawnCommandSeam {
   return async (argv, opts): Promise<SpawnCommandResult> => {
       const [cmd, ...rest] = argv;
@@ -2774,6 +2800,7 @@ export function makeDefaultSpawnCommand(
         commandEffectSpec(worktreePath, opts.cwd ?? worktreePath, cmd ?? "/bin/sh", rest, opts.env ?? commandEnv, mode),
         reapDeadlineMs,
         "command",
+        log,
       );
       let stdout = "";
       let stderr = "";
@@ -2852,6 +2879,7 @@ export function makeDefaultSpawnCommand(
 function makeBoundaryProcessSpawner(
   launch: (spec: CodexEffectLaunchSpec, deadlineMs?: number) => Promise<CodexRootHandle>,
   mode: CommandSandboxMode,
+  log?: Pick<Logger, "warn">,
 ): SpawnBoundaryProcessSeam {
   return async (request: BoundaryProcessRequest, deadlineMs: number): Promise<SpawnedBoundaryProcess> => {
     const [command, ...args] = request.argv;
@@ -2870,7 +2898,7 @@ function makeBoundaryProcessSpawner(
     // stderr is consumed by GitCache for all boundary processes. The provider
     // adapter below drains its otherwise-unused stderr independently.
     return {
-      root: registeredRoot(handle, "boundary_action"),
+      root: registeredRoot(handle, "boundary_action", request.identity === "command" ? log : undefined),
       stdin: handle.transport.stdin,
       stdout: handle.transport.stdout,
       stderr: handle.transport.stderr,

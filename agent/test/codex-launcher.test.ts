@@ -49,6 +49,8 @@ interface FakeOpts {
   exitCode?: number;
   disposeNearBudget?: boolean;
   exitDelayMs?: number;
+  /** When set (even to a malformed value), attached verbatim as the drained dispose's `tmpCleanup`. */
+  disposeTmpCleanup?: unknown;
 }
 
 /** A fake supervisor: 5 PassThrough fds, reads control on fd3, emits the pinned
@@ -66,6 +68,7 @@ class FakeSupervisor extends EventEmitter {
   private readonly exitCode: number;
   private readonly disposeNearBudget: boolean;
   private readonly exitDelayMs: number;
+  private readonly tmpCleanup: { value: unknown } | undefined;
   readonly disposeTimeouts: number[] = [];
 
   constructor(opts: FakeOpts = {}) {
@@ -76,6 +79,7 @@ class FakeSupervisor extends EventEmitter {
     this.exitCode = opts.exitCode ?? 0;
     this.disposeNearBudget = opts.disposeNearBudget ?? false;
     this.exitDelayMs = opts.exitDelayMs ?? 0;
+    this.tmpCleanup = "disposeTmpCleanup" in opts ? { value: opts.disposeTmpCleanup } : undefined;
     createInterface({ input: this.control }).on("line", (line) => this.onControl(line));
     if (opts.autoStarted ?? true) {
       this.writeEvidence({
@@ -100,7 +104,10 @@ class FakeSupervisor extends EventEmitter {
       this.disposeTimeouts.push(cmd.timeoutMs ?? 0);
       if (this.disposeState === "drained") {
         const emit = (): void => {
-          this.writeEvidence({ event: "dispose", id: cmd.id, state: "drained", authority: this.disposeAuthority, killed: [], reaped: [this.pid + 1] });
+          this.writeEvidence({
+            event: "dispose", id: cmd.id, state: "drained", authority: this.disposeAuthority, killed: [], reaped: [this.pid + 1],
+            ...(this.tmpCleanup ? { tmpCleanup: this.tmpCleanup.value } : {}),
+          });
           setTimeout(() => this.exitWith(this.exitCode), this.exitDelayMs);
         };
         if (this.disposeNearBudget) setTimeout(emit, Math.max(0, (cmd.timeoutMs ?? 0) - 5));
@@ -555,6 +562,73 @@ describe("launchCodexRoot: happy-path lifecycle over the fake supervisor", () =>
     const outcome = await handle.dispose(100);
     assert.equal(outcome.clean, true);
     assert.ok((fake.disposeTimeouts[0] ?? 100) <= 80, "drain received no more than four fifths of the total budget");
+  });
+});
+
+describe("createHandle: strict tmpCleanup evidence", () => {
+  it("accepts and surfaces a removed tmpCleanup on the clean dispose outcome", async () => {
+    const fake = newFake({ disposeTmpCleanup: { state: "removed", reason: "" } });
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    const outcome = await handle.dispose(500);
+    assert.equal(outcome.clean, true);
+    assert.deepEqual(outcome.clean ? outcome.event.tmpCleanup : undefined, { state: "removed", reason: "" });
+    assert.equal(handle.failed, undefined);
+  });
+
+  it("a retained tmpCleanup is still a clean disposal and surfaces its reason", async () => {
+    const fake = newFake({ disposeTmpCleanup: { state: "retained", reason: "absent" } });
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    const outcome = await handle.dispose(500);
+    assert.equal(outcome.clean, true, "a retained tmp never makes the process disposal unclean");
+    assert.deepEqual(outcome.clean ? outcome.event.tmpCleanup : undefined, { state: "retained", reason: "absent" });
+  });
+
+  it("a dispose without tmpCleanup carries no field", async () => {
+    const fake = newFake();
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    const outcome = await handle.dispose(500);
+    assert.equal(outcome.clean, true);
+    assert.equal(outcome.clean && "tmpCleanup" in outcome.event, false);
+  });
+
+  const malformed: ReadonlyArray<[string, unknown]> = [
+    ["an unknown state", { state: "deleted", reason: "" }],
+    ["a missing state", { reason: "" }],
+    ["an uppercase reason", { state: "retained", reason: "Mismatch" }],
+    ["a reason over 32 chars", { state: "retained", reason: "a".repeat(33) }],
+    ["a reason with a path", { state: "retained", reason: "/tmp/x" }],
+    ["a non-string reason", { state: "retained", reason: 5 }],
+    ["a missing reason", { state: "removed" }],
+    ["an extra key", { state: "removed", reason: "", path: "/tmp/x" }],
+    ["a string", "removed"],
+    ["null", null],
+    ["an array", ["removed", ""]],
+  ];
+  for (const [label, value] of malformed) {
+    it(`fails closed on a dispose tmpCleanup with ${label}`, async () => {
+      const fake = newFake({ disposeTmpCleanup: value });
+      const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+      const outcome = await handle.dispose(500);
+      assert.equal(outcome.clean, false);
+      assert.match(outcome.clean ? "" : outcome.reason, /malformed tmpCleanup evidence/);
+      assert.match(String(handle.failed?.message), /malformed tmpCleanup evidence/);
+    });
+  }
+
+  it("fails closed on an abnormal event with a malformed tmpCleanup", async () => {
+    const fake = newFake();
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    fake.writeEvidence({ event: "abnormal", reason: "control EOF", cleanup: { state: "drained" }, tmpCleanup: { state: "RETAINED", reason: "" } });
+    const failure = await handle.whenFailed;
+    assert.match(failure.message, /malformed tmpCleanup evidence/);
+  });
+
+  it("an abnormal event with a valid tmpCleanup still fails the root as abnormal", async () => {
+    const fake = newFake();
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    fake.writeEvidence({ event: "abnormal", reason: "control EOF", cleanup: { state: "drained" }, tmpCleanup: { state: "removed", reason: "" } });
+    const failure = await handle.whenFailed;
+    assert.match(failure.message, /supervisor abnormal: control EOF/);
   });
 });
 

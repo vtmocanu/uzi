@@ -49,7 +49,7 @@ import { PauseNowSignal } from "../src/steering.js";
 import type { Logger } from "../src/log.js";
 import type { AgentTemplate } from "../src/protocol.js";
 import type { BoundaryRequest } from "../src/harness.js";
-import type { CodexEffectLaunchSpec, CodexRootHandle } from "../src/codex/launcher.js";
+import type { CodexEffectLaunchSpec, CodexRootHandle, DisposeEvidence } from "../src/codex/launcher.js";
 import { CODEX_M3B_LOOPBACK_PROVIDER_NAME } from "../src/codex/config.js";
 import { MAX_LEAD_FINAL_MESSAGE_LEN, PLAN_MISSING_NUDGE, REASON_PLAN_MISSING } from "../src/plan-missing.js";
 
@@ -2967,6 +2967,70 @@ describe("CodexExecutor: advice lane app-server refresh bridge — generation-af
       [3, 4],
       "the immediate-advance bridge sent an advanced observed generation on the retry (the bug)",
     );
+  });
+});
+
+describe("CodexExecutor: retained command tmp is logged, never an unclean reap", () => {
+  function tmpHandle(tmpCleanup: DisposeEvidence["tmpCleanup"]): { handle: CodexRootHandle; disposes: () => number } {
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    let disposes = 0;
+    const handle: CodexRootHandle = {
+      started: { event: "started", supervisorPid: 40, childPid: 41, subreaper: true, nondumpable: true, uid: 10003, liveCapsZero: true, capBoundingSet: "0xc0", noNewPrivs: true },
+      supervisorPid: 40,
+      transport: { stdin: new PassThrough(), stdout, stderr },
+      snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
+      waitChild: async () => ({ event: "child_exit", code: 0 }),
+      dispose: async () => {
+        disposes += 1;
+        stdout.end(); stderr.end();
+        return {
+          clean: true,
+          event: { event: "dispose", id: 1, state: "drained", authority: "ECHILD+__WALL", ...(tmpCleanup ? { tmpCleanup } : {}) },
+        };
+      },
+      failed: undefined,
+      whenFailed: new Promise<Error>(() => undefined),
+    };
+    return { handle, disposes: () => disposes };
+  }
+  const warnings = (lines: readonly string[]): Array<Record<string, unknown>> =>
+    lines.map((l) => JSON.parse(l) as Record<string, unknown>).filter((l) => l.level === "warn");
+
+  it("a command whose clean dispose retained the tmp logs one warn with the reason and still succeeds", async () => {
+    const registry = new ExecutionRegistry(newLocalExecutionEpoch(3));
+    const rlog = recordingLog();
+    const { handle } = tmpHandle({ state: "retained", reason: "mismatch" });
+    const spawnCommand = makeDefaultSpawnCommand(registry, async () => handle, 1000, "/data/runner/repo/run-3", {}, "required", rlog.log);
+    const res = await withTimeout(spawnCommand(["/bin/true"], { cwd: "/data/runner/repo/run-3" }), 5000, "retained command");
+    assert.equal(res.code, 0, "a retained tmp is not an unclean reap");
+    const warns = warnings(rlog.lines);
+    assert.equal(warns.length, 1);
+    assert.equal(warns[0]?.msg, "codex command tmp retained");
+    assert.equal(warns[0]?.reason, "mismatch");
+  });
+
+  it("a removed tmp (or no tmpCleanup) logs nothing", async () => {
+    for (const tmpCleanup of [{ state: "removed" as const, reason: "" }, undefined]) {
+      const registry = new ExecutionRegistry(newLocalExecutionEpoch(4));
+      const rlog = recordingLog();
+      const { handle } = tmpHandle(tmpCleanup);
+      const spawnCommand = makeDefaultSpawnCommand(registry, async () => handle, 1000, "/data/runner/repo/run-4", {}, "required", rlog.log);
+      await withTimeout(spawnCommand(["/bin/true"], { cwd: "/data/runner/repo/run-4" }), 5000, "removed command");
+      assert.deepEqual(warnings(rlog.lines), []);
+    }
+  });
+
+  it("registeredRoot reports a retained tmp once across reap and a repeat dispose, and the reap stays ok", async () => {
+    const rlog = recordingLog();
+    const { handle, disposes } = tmpHandle({ state: "retained", reason: "absent" });
+    const root = registeredRoot(handle, "command", rlog.log);
+    assert.deepEqual(await root.reap(100), { ok: true });
+    await root.dispose(100);
+    assert.equal(disposes(), 2);
+    const warns = warnings(rlog.lines);
+    assert.equal(warns.length, 1, "logged once, not per idempotent dispose");
+    assert.equal(warns[0]?.reason, "absent");
   });
 });
 

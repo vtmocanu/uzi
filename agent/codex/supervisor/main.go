@@ -17,8 +17,9 @@ func main() {
 }
 
 // realMain is the whole flow: parse the trusted argv, establish + verify the
-// subreaper/nondumpable posture, verify the container profile BEFORE fork, launch
-// the child with fd3/fd4 closed at its execve, then run the control loop. Every
+// subreaper/nondumpable posture, verify the container profile BEFORE fork, create
+// and lock the command tmp when a cleanup token was given, launch the child with
+// fd3/fd4 closed at its execve, then run the control loop. Every
 // pre-fork failure emits a sanitized abnormal event on fd 4 and exits non-zero
 // WITHOUT forking.
 func realMain(args []string) int {
@@ -58,16 +59,19 @@ func realMain(args []string) int {
 		return 2
 	}
 
-	// (3) Launch. Mark the trusted descriptors close-on-exec so they auto-close
-	// at the child's execve (the child inherits only stdio 0/1/2), then ForkExec
-	// into a fresh session.
+	// (3) Command tmp + launch. With a cleanup token the supervisor alone creates
+	// /tmp/uzi-codex-command-<token>, flocks it for its whole lifetime (the fd is
+	// close-on-exec, so the child never inherits the lock) and rechecks the name,
+	// all before fork. Mark the trusted descriptors close-on-exec so they
+	// auto-close at the child's execve (the child inherits only stdio 0/1/2),
+	// then ForkExec into a fresh session.
 	unix.CloseOnExec(3)
 	unix.CloseOnExec(4)
-	childPid, lerr := launchChild(childArgv)
-	if lerr != nil {
-		_ = ev.writeJSON(abnormalEvidence("child launch failed", nil))
+	tmp, childPid, ok := setupAndLaunch(ev, cleanupToken, expectUID, openCommandTmp, launchChild, childArgv)
+	if !ok {
 		return 2
 	}
+	tmpCleanup := tmpCleanupFor(tmp)
 	// The supervised child inherited stdio 0/1/2. Drop the supervisor's copies so
 	// EOF/backpressure describe the child tree rather than this long-lived control
 	// process; control/evidence remain isolated on fd3/fd4.
@@ -78,8 +82,13 @@ func realMain(args []string) int {
 	if readyErr != nil {
 		deadline := time.Now().Add(time.Duration(defaultDisposeTimeoutMs) * time.Millisecond)
 		cleanup := drain(deadline, time.Now, func() { time.Sleep(2 * time.Millisecond) }, selfDirectChildren, realKill, realReap)
-		_ = ev.writeJSON(abnormalEvidence("child watch failed", &cleanup))
-		removeCommandTmp(cleanupToken)
+		m := abnormalEvidence("child watch failed", &cleanup)
+		// The tmp is touched only after a confirmed drain: an unconfirmed one may
+		// leave a live descendant using it, so it stays for the startup reaper.
+		if cleanup.State == stateDrained && tmpCleanup != nil {
+			withTmpCleanup(m, tmpCleanup())
+		}
+		_ = ev.writeJSON(m)
 		return 2
 	}
 
@@ -96,17 +105,11 @@ func realMain(args []string) int {
 			snapshot:       func() ([]procRow, error) { return walkDescendants(os.Getpid()) },
 			now:            time.Now,
 			sleep:          func() { time.Sleep(2 * time.Millisecond) },
+			tmpCleanup:     tmpCleanup,
 		},
 	}
-	code := sup.run(childPid, st)
-	removeCommandTmp(cleanupToken)
-	return code
-}
-
-func removeCommandTmp(token string) {
-	if token != "" {
-		_ = os.RemoveAll("/tmp/uzi-codex-command-" + token)
-	}
+	// The lock fd held in tmp stays open until process exit, after any cleanup.
+	return sup.run(childPid, st)
 }
 
 // watchChild returns a one-shot readiness channel backed by a pidfd. Readiness
@@ -159,7 +162,7 @@ var errBadArgs = errors.New("invalid arguments")
 
 // parseArgs parses the trusted, caller-supplied argv:
 //
-//	--expect-uid <N> [--drop-controller-caps] -- <child-exec-abspath> [child args...]
+//	--expect-uid <N> [--cleanup-token <lowercase-uuid>] [--drop-controller-caps] -- <child-exec-abspath> [child args...]
 //
 // The child exec path must be absolute (never a model-selected relative target),
 // and --expect-uid is mandatory.

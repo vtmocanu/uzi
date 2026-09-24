@@ -16,6 +16,7 @@
 // launcher side to match; we invent no fields):
 //   control  → fd3 (we WRITE): {"op":"snapshot","id"} / {"op":"dispose","id","timeoutMs"}
 //   evidence ← fd4 (we READ):  started / snapshot / dispose(drained|unconfirmed) / abnormal
+//            (dispose/abnormal may carry an optional, strictly validated tmpCleanup)
 //   argv: <supervisor> --expect-uid <N> [--cleanup-token <uuid>] -- <child> <argv...>
 //   stdio: [pipe0, pipe1, pipe2, pipe3=control, pipe4=evidence]; 0/1/2 are the
 //          app-server TRANSPORT the child inherits — exposed on the handle so a
@@ -230,6 +231,30 @@ export interface DisposeEvidence {
   readonly killed?: readonly number[];
   readonly reaped?: readonly number[];
   readonly children?: readonly number[];
+  /** Present only for a root launched with a cleanup token: the outcome of the
+   *  supervisor removing `/tmp/uzi-codex-command-<token>` after a confirmed drain.
+   *  `reason` is "" when removed, otherwise a short fixed word (e.g. "absent",
+   *  "mismatch"). A retained tmp does not make the disposal unclean. */
+  readonly tmpCleanup?: TmpCleanupEvidence;
+}
+
+export interface TmpCleanupEvidence {
+  readonly state: "removed" | "retained";
+  readonly reason: string;
+}
+
+/** Strict shape check for the optional `tmpCleanup` evidence field: an object
+ *  with exactly a `state` of "removed"/"retained" and a `reason` of at most 32
+ *  lowercase ASCII letters. Anything else is a protocol breach. */
+function isValidTmpCleanup(value: unknown): value is TmpCleanupEvidence {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record);
+  if (keys.length !== 2 || !keys.includes("state") || !keys.includes("reason")) return false;
+  return (record.state === "removed" || record.state === "retained")
+    && typeof record.reason === "string"
+    && record.reason.length <= 32
+    && /^[a-z]*$/.test(record.reason);
 }
 
 /** The result of a disposal attempt for exactly THIS owned root. `clean` is true ONLY
@@ -630,8 +655,9 @@ export interface CodexEffectLaunchSpec {
   readonly cwd: string;
   readonly env: NodeJS.ProcessEnv;
   readonly supervisorBin: string;
-  /** Optional UUID token for the supervisor's fixed
-   * `/tmp/uzi-codex-command-<token>` cleanup path. */
+  /** Optional UUID token naming the supervisor-owned private tmp
+   * `/tmp/uzi-codex-command-<token>`: the supervisor creates and locks it before
+   * launch and removes it only after a confirmed drain (reported as `tmpCleanup`). */
   readonly cleanupToken?: string;
 }
 
@@ -771,6 +797,10 @@ async function createHandle(
       }
       case "snapshot":
       case "dispose": {
+        if (record.event === "dispose" && "tmpCleanup" in record && !isValidTmpCleanup(record.tmpCleanup)) {
+          fail(new Error("malformed tmpCleanup evidence"));
+          return;
+        }
         const id = record.id;
         const waiter = typeof id === "number" ? pending.get(id) : undefined;
         if (waiter && typeof id === "number") { pending.delete(id); waiter.resolve(record as unknown as SnapshotEvidence | DisposeEvidence); }
@@ -791,6 +821,10 @@ async function createHandle(
         return;
       }
       case "abnormal": {
+        if ("tmpCleanup" in record && !isValidTmpCleanup(record.tmpCleanup)) {
+          fail(new Error("malformed tmpCleanup evidence"));
+          return;
+        }
         fail(new Error(`supervisor abnormal: ${String(record.reason ?? "unknown")}`));
         return;
       }

@@ -3,9 +3,13 @@ package main
 import (
 	"errors"
 	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"syscall"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestParseArgs(t *testing.T) {
@@ -295,5 +299,99 @@ func TestConfinementDenyProbe(t *testing.T) {
 	}
 	if err := requireProbeDenied(landlockDenyProbe, failed); err == nil {
 		t.Fatal("unexpected post-probe error must fail closed")
+	}
+}
+
+// privateTmp makes a real 0700 directory in a t.TempDir parent.
+func privateTmp(t *testing.T) string {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), "uzi-codex-command-x")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+func TestAdoptPrivateTmpAcceptsOwned0700Dir(t *testing.T) {
+	dir := privateTmp(t)
+	if err := adoptPrivateTmp(dir, os.Getuid(), unix.Open, unix.Fstat); err != nil {
+		t.Fatalf("adopt: %v", err)
+	}
+	// Adoption never removes or chmods: the dir is still there, still 0700.
+	fi, err := os.Lstat(dir)
+	if err != nil || !fi.IsDir() || fi.Mode().Perm() != 0o700 {
+		t.Fatalf("after adopt: %v %v", fi, err)
+	}
+}
+
+func TestAdoptPrivateTmpRefusesSymlink(t *testing.T) {
+	target := privateTmp(t)
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := adoptPrivateTmp(link, os.Getuid(), unix.Open, unix.Fstat); err == nil {
+		t.Fatal("adopted a symlink to an owned 0700 directory")
+	}
+}
+
+func TestAdoptPrivateTmpRefusesForeignOwner(t *testing.T) {
+	dir := privateTmp(t)
+	foreign := func(fd int, st *unix.Stat_t) error {
+		if err := unix.Fstat(fd, st); err != nil {
+			return err
+		}
+		st.Uid++
+		return nil
+	}
+	err := adoptPrivateTmp(dir, os.Getuid(), unix.Open, foreign)
+	if err == nil || !strings.Contains(err.Error(), "owned by uid") {
+		t.Fatalf("adopt with a foreign owner = %v, want an owner refusal", err)
+	}
+	// The uid seam alone must also refuse: the dir is not owned by another uid.
+	if err := adoptPrivateTmp(dir, os.Getuid()+1, unix.Open, unix.Fstat); err == nil {
+		t.Fatal("adopted a dir owned by another uid")
+	}
+}
+
+func TestAdoptPrivateTmpRefusesWrongMode(t *testing.T) {
+	dir := privateTmp(t)
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	err := adoptPrivateTmp(dir, os.Getuid(), unix.Open, unix.Fstat)
+	if err == nil || !strings.Contains(err.Error(), "mode 0755") {
+		t.Fatalf("adopt of a 0755 dir = %v, want a mode refusal", err)
+	}
+}
+
+func TestAdoptPrivateTmpRefusesNonDirectory(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(file, nil, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := adoptPrivateTmp(file, os.Getuid(), unix.Open, unix.Fstat); err == nil {
+		t.Fatal("adopted a regular file")
+	}
+	// A stat that reports a non-directory is refused even if the open passed.
+	notDir := func(fd int, st *unix.Stat_t) error {
+		if err := unix.Fstat(fd, st); err != nil {
+			return err
+		}
+		st.Mode = unix.S_IFREG | 0o700
+		return nil
+	}
+	err := adoptPrivateTmp(privateTmp(t), os.Getuid(), unix.Open, notDir)
+	if err == nil || !strings.Contains(err.Error(), "not a directory") {
+		t.Fatalf("adopt of a non-dir stat = %v", err)
+	}
+}
+
+func TestAdoptPrivateTmpRefusesMissing(t *testing.T) {
+	if err := adoptPrivateTmp(filepath.Join(t.TempDir(), "absent"), os.Getuid(), unix.Open, unix.Fstat); err == nil {
+		t.Fatal("adopted a missing path: the sandbox must never create it")
 	}
 }

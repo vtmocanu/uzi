@@ -11,7 +11,13 @@
 //     failing closed if applying it fails); ONLY a probe result of "unavailable"
 //     (ENOSYS/EOPNOTSUPP) runs the command WITHOUT filesystem confinement,
 //     relying on the uid split. It never relaxes no_new_privs, the private 0700
-//     tmp, the cwd-inside-root check or exit-status passthrough.
+//     tmp adoption check, the cwd-inside-root check or exit-status passthrough.
+//
+// The private tmp (--tmp) is created, locked and removed by the supervisor
+// above this process: it holds the creation pin and outlives any backgrounded
+// descendant, so it alone can tell when removal is safe. This command has no
+// cleanup role. It only ADOPTS --tmp, refusing it unless it is a real directory
+// (not a symlink) owned by the calling uid with mode exactly 0700.
 //
 // "Unavailable" is defined by errno (D8): a version probe returning ENOSYS or
 // EOPNOTSUPP is unavailable; any other errno, an ABI below 1, and every later
@@ -134,12 +140,8 @@ func realMain(args []string) int {
 	if err != nil {
 		return setupFailure("invalid arguments", err)
 	}
-	if err := os.Mkdir(tmp, 0o700); err != nil {
-		return setupFailure("create private tmp", err)
-	}
-	defer os.RemoveAll(tmp)
-	if err := os.Chmod(tmp, 0o700); err != nil {
-		return setupFailure("harden private tmp", err)
+	if err := adoptPrivateTmp(tmp, os.Getuid(), unix.Open, unix.Fstat); err != nil {
+		return setupFailure("adopt private tmp", err)
 	}
 	if err := applyPolicy(root, tmp, mode, realVersionProbe, confine, applyNoNewPrivs); err != nil {
 		return setupFailure("apply Landlock policy", err)
@@ -165,6 +167,33 @@ func realMain(args []string) int {
 		return 1
 	}
 	return 0
+}
+
+// adoptPrivateTmp verifies the supervisor-created private tmp before any policy
+// is applied: an O_NOFOLLOW|O_DIRECTORY open (a symlink or a non-directory
+// fails there), then an fstat of that fd that must show a directory owned by uid
+// with permission bits exactly 0700. It never creates, chmods or removes. open
+// and fstat are seams so tests can inject a foreign owner.
+func adoptPrivateTmp(tmp string, uid int, open func(string, int, uint32) (int, error), fstat func(int, *unix.Stat_t) error) error {
+	fd, err := open(tmp, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("open: %w", err)
+	}
+	defer unix.Close(fd)
+	var st unix.Stat_t
+	if err := fstat(fd, &st); err != nil {
+		return fmt.Errorf("fstat: %w", err)
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFDIR {
+		return errors.New("not a directory")
+	}
+	if st.Uid != uint32(uid) {
+		return fmt.Errorf("owned by uid %d, want %d", st.Uid, uid)
+	}
+	if mode := st.Mode & 0o7777; mode != 0o700 {
+		return fmt.Errorf("mode %04o, want 0700", mode)
+	}
+	return nil
 }
 
 // parseArgs reads the trusted worker-built argv. Grammar:
