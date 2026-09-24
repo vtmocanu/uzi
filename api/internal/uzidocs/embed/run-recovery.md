@@ -168,14 +168,18 @@ publish, uzi can release the older hold automatically once it can *prove*
 the older work is actually contained in what got published — you don't have
 to notice and discard it by hand.
 
-That proof is never taken on trust from the worker. The worker only reports
-which commit it adopted; the server independently asks your forge whether
-that commit is an ancestor of the branch's final published head, using the
-forge's own comparison API. Only a positive, unambiguous answer releases the
-hold. Anything else — the forge is rate-limited or erroring, the comparison
-is inconclusive, the branch or the reported commit no longer matches what
-the server expects, or the run's state changed underneath the check — keeps
-the hold open instead of guessing. A hold that settlement can't clear behaves
+The worker never decides this itself. It reports the candidate commits — the
+older generation's recorded source, the commit it adopted, and the head it
+pushed — and the server checks them against what it has on record (an earlier
+recovery capture of that hold, or the completed run's permitted head, when
+either exists). The server then asks your forge whether each candidate is an
+ancestor of the branch's current published head, using the forge's own
+comparison API. Only a positive, unambiguous answer releases the hold. A
+rate-limited, erroring, or inconclusive answer, or a run whose state changed
+underneath the check, keeps the hold open and the worker retries later with
+backoff; a definite "not contained", a candidate that contradicts the
+server's record, or a branch that no longer exists keeps the hold open for
+good. A hold that settlement can't clear behaves
 exactly like any other open hold: it still shows up under **Recovery
 archives**, and you can still resolve it yourself with `uzi run export` or
 `uzi run discard`.
