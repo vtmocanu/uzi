@@ -103,7 +103,7 @@ What each part is doing:
   output. Pasting the whole nested file into uzi is rejected, because the
   top level has no `access_token` of its own: the web field says it looks
   like the whole Codex `auth.json` file and asks for the flat object
-  instead, and the API and CLI reply "codex login must contain a non-empty
+  instead, and the API replies "codex login must contain a non-empty
   access_token".
 
 **Do not delete `$CODEX_HOME` yet.** It's the only copy of this login until
