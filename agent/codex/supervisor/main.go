@@ -264,10 +264,6 @@ func validCleanupToken(token string) bool {
 // child's stdio and 3/4 the trusted control/evidence pair.
 const firstStrayFd = 5
 
-// maxFallbackFd caps the last-resort per-fd loop, which otherwise runs to the
-// RLIMIT_NOFILE soft limit.
-const maxFallbackFd = 1 << 20
-
 // procSelfFdDir lists this process's open fds.
 const procSelfFdDir = "/proc/self/fd"
 
@@ -277,8 +273,6 @@ type fdHygiene struct {
 	closeRange func(first uint) error
 	// listOpen returns the fds open in this process, excluding its own.
 	listOpen func() ([]int, error)
-	// nofileCur is the RLIMIT_NOFILE soft limit.
-	nofileCur func() (uint64, error)
 	// set marks one fd close-on-exec.
 	set func(fd int) error
 }
@@ -286,7 +280,6 @@ type fdHygiene struct {
 var realFdHygiene = fdHygiene{
 	closeRange: closeRangeCloexec,
 	listOpen:   listOpenFds,
-	nofileCur:  nofileSoftLimit,
 	set:        setCloexec,
 }
 
@@ -326,15 +319,6 @@ func listOpenFds() ([]int, error) {
 	}
 }
 
-// nofileSoftLimit returns the RLIMIT_NOFILE soft limit.
-func nofileSoftLimit() (uint64, error) {
-	var r unix.Rlimit
-	if err := unix.Getrlimit(unix.RLIMIT_NOFILE, &r); err != nil {
-		return 0, err
-	}
-	return r.Cur, nil
-}
-
 // closeRangeCloexec sets close-on-exec on every fd from first upward in one
 // close_range(CLOSE_RANGE_CLOEXEC) call, without closing any.
 func closeRangeCloexec(first uint) error {
@@ -355,31 +339,24 @@ func setCloexec(fd int) error {
 //     ENOSYS or EINVAL on a kernel without it or without CLOSE_RANGE_CLOEXEC,
 //     and with EPERM where a seccomp profile denies it (as measured in this
 //     repo's dev sandbox);
-//  2. set on every fd procSelfFdDir lists (the open ones, at any number);
-//  3. set on every fd below the RLIMIT_NOFILE soft limit, capped at
-//     maxFallbackFd, since no fd at or above the soft limit can be open.
+//  2. set on every fd procSelfFdDir lists (the open ones, at any number).
 //
 // An EBADF from set is an fd that is not (or no longer) open and is skipped.
-// Step 2 falls through to step 3 on any other failure; a failure of step 3 is
-// returned, and the caller must not fork.
+// There is deliberately no third, numeric sweep: RLIMIT_NOFILE does not bound
+// the fds already open (lowering it closes nothing), so a sweep to any limit
+// could miss a stray fd above it. When both steps fail the error is returned
+// and the caller must not fork (fail closed).
 func markStrayFdsCloexec(h fdHygiene) error {
-	if h.closeRange(firstStrayFd) == nil {
+	crErr := h.closeRange(firstStrayFd)
+	if crErr == nil {
 		return nil
 	}
-	if fds, err := h.listOpen(); err == nil {
-		if setEach(fds, h.set) == nil {
-			return nil
-		}
-	}
-	limit, err := h.nofileCur()
+	fds, err := h.listOpen()
 	if err != nil {
-		return fmt.Errorf("RLIMIT_NOFILE: %w", err)
+		return fmt.Errorf("close_range: %v; fd listing: %w", crErr, err)
 	}
-	limit = min(limit, maxFallbackFd)
-	for fd := firstStrayFd; uint64(fd) < limit; fd++ {
-		if err := h.set(fd); err != nil && !errors.Is(err, unix.EBADF) {
-			return err
-		}
+	if err := setEach(fds, h.set); err != nil {
+		return fmt.Errorf("close_range: %v; fd listing set: %w", crErr, err)
 	}
 	return nil
 }

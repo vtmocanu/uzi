@@ -139,8 +139,11 @@ func (s *supervisor) run(childPid int, st procStatus) int {
 				if drained.State == stateDrained {
 					// Remove the tmp BEFORE reporting, so the dispose line carries
 					// the outcome, within what is left of the dispose's own
-					// deadline: a tree too big for it is retained "deadline"
-					// rather than delaying the reply past the controller's wait.
+					// deadline: a tree too big for it is retained "deadline".
+					// The deadline is checked between entries, so the reply can
+					// overrun it by at most one entry's unlinkat (e.g. freeing a
+					// heavily fragmented file), which a command could already
+					// stall a drain with.
 					// It never changes the exit code.
 					withTmpCleanup(m, s.cleanupTmp(cleanupDeadline))
 					_ = s.ev.writeJSON(m)

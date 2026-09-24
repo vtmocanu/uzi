@@ -246,8 +246,9 @@ export interface TmpCleanupEvidence {
 
 /** The fixed reasons the supervisor reports for a RETAINED tmp: exactly the
  *  non-empty words Go `safetree.Reason` returns (a test holds the two sets
- *  equal). "deadline" is a removal that ran out of the dispose's own deadline
- *  and kept its partial progress. A removed tmp always reports "". */
+ *  equal). "deadline" is a removal that ran out of the drain's deadline (the
+ *  dispose's op deadline, or the abnormal drain's default) and kept its partial
+ *  progress. A removed tmp always reports "". */
 export const TMP_RETAINED_REASONS: ReadonlySet<string> = new Set(["mismatch", "owner", "deadline", "io", "absent", "name"]);
 
 /** Strict meaning check for the optional `tmpCleanup` evidence field: an object

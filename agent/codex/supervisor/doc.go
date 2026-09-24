@@ -63,10 +63,10 @@
 //
 // DESCRIPTORS: before opening anything, the supervisor marks every fd from 5
 // upward close-on-exec (close_range; when that fails, each fd /proc/self/fd
-// lists; when that fails too, each fd below the RLIMIT_NOFILE soft limit, capped
-// at 1<<20), so the child inherits only stdio 0/1/2 even when the
-// supervisor itself inherited a stray fd; a failure is the pre-fork abnormal
-// "fd hygiene failed".
+// lists), so the child inherits only stdio 0/1/2 even when the supervisor
+// itself inherited a stray fd. When both fail it does not fork: the pre-fork
+// abnormal "fd hygiene failed" (there is no numeric sweep, because
+// RLIMIT_NOFILE does not bound fds that are already open).
 //
 // EXIT CODE: 0 iff a dispose reached state "drained"; non-zero on abnormal,
 // unconfirmed or profile-fail.

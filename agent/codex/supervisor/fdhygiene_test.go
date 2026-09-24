@@ -37,11 +37,11 @@ func openStrayFd(t *testing.T) int { return openStrayFdAt(t, 100) }
 // fallback; it skips when RLIMIT_NOFILE cannot hold one.
 func openHighStrayFd(t *testing.T) int {
 	t.Helper()
-	cur, err := nofileSoftLimit()
-	if err != nil {
+	var r unix.Rlimit
+	if err := unix.Getrlimit(unix.RLIMIT_NOFILE, &r); err != nil {
 		t.Fatal(err)
 	}
-	if cur <= 1200 {
+	if cur := r.Cur; cur <= 1200 {
 		t.Skipf("RLIMIT_NOFILE soft limit %d is too low for a stray fd at 1100", cur)
 	}
 	return openStrayFdAt(t, 1100)
@@ -79,10 +79,6 @@ func TestMarkStrayFdsCloexecEnumeratesHighFds(t *testing.T) {
 		fd := openHighStrayFd(t)
 		h := realFdHygiene
 		h.closeRange = failCloseRange(errno)
-		h.nofileCur = func() (uint64, error) {
-			t.Fatal("the rlimit fallback ran although the enumeration succeeded")
-			return 0, nil
-		}
 		touched := map[int]bool{}
 		h.set = func(fd int) error {
 			touched[fd] = true
@@ -121,103 +117,45 @@ func TestListOpenFdsExcludesItsOwnFd(t *testing.T) {
 	}
 }
 
-// TestMarkStrayFdsCloexecRlimitFallback: when the enumeration fails too, the
-// loop runs from firstStrayFd to the soft limit (stubbed at 2048 to keep the
-// test fast; the real one is above 1200, see openHighStrayFd), which reaches a
-// stray fd at or above 1024.
-func TestMarkStrayFdsCloexecRlimitFallback(t *testing.T) {
-	fd := openHighStrayFd(t)
-	const limit = 2048
-	for _, listErr := range []bool{true, false} {
-		h := realFdHygiene
-		h.closeRange = failCloseRange(unix.EPERM)
-		h.nofileCur = func() (uint64, error) { return limit, nil }
-		if listErr {
-			h.listOpen = func() ([]int, error) { return nil, unix.ENOENT }
-		} else {
-			// The listing works but a set on a listed fd fails: that also falls
-			// through to the rlimit loop.
-			h.listOpen = func() ([]int, error) { return []int{7}, nil }
-		}
-		failedOnce := false
-		lowest, highest := -1, -1
-		h.set = func(n int) error {
-			if n == 7 && !listErr && !failedOnce {
-				failedOnce = true
-				return unix.EIO
-			}
-			if lowest < 0 || n < lowest {
-				lowest = n
-			}
-			highest = max(highest, n)
-			return setCloexec(n)
-		}
-		if err := markStrayFdsCloexec(h); err != nil {
-			t.Fatalf("markStrayFdsCloexec = %v", err)
-		}
-		if !isCloexec(t, fd) {
-			t.Fatalf("stray fd %d is not close-on-exec after the rlimit fallback", fd)
-		}
-		if lowest != firstStrayFd || highest != limit-1 {
-			t.Fatalf("rlimit loop ran over [%d, %d], want [%d, %d]", lowest, highest, firstStrayFd, limit-1)
-		}
-	}
-}
-
-// TestMarkStrayFdsCloexecRlimitCapped: an unlimited soft limit is capped at
-// maxFallbackFd.
-func TestMarkStrayFdsCloexecRlimitCapped(t *testing.T) {
-	last := -1
+// TestMarkStrayFdsCloexecFailsClosed: when close_range fails and the fd
+// listing fails too, or a set on a listed fd fails with anything but EBADF, the
+// call returns an error (so the supervisor never forks) instead of sweeping a
+// numeric range that could miss a stray fd above it.
+func TestMarkStrayFdsCloexecFailsClosed(t *testing.T) {
+	// The listing fails.
 	err := markStrayFdsCloexec(fdHygiene{
-		closeRange: failCloseRange(unix.ENOSYS),
+		closeRange: failCloseRange(unix.EPERM),
 		listOpen:   func() ([]int, error) { return nil, unix.ENOENT },
-		nofileCur:  func() (uint64, error) { return unix.RLIM_INFINITY, nil },
-		set:        func(fd int) error { last = fd; return unix.EBADF },
+		set:        func(int) error { t.Fatal("set ran without a listing"); return nil },
 	})
-	if err != nil || last != maxFallbackFd-1 {
-		t.Fatalf("err = %v, last fd = %d, want nil and %d", err, last, maxFallbackFd-1)
+	if !errors.Is(err, unix.ENOENT) {
+		t.Fatalf("err = %v, want the listing error", err)
 	}
-}
-
-func TestMarkStrayFdsCloexecFallbackErrors(t *testing.T) {
-	noList := func() ([]int, error) { return nil, unix.ENOENT }
-	// EBADF (an unopened fd) is skipped; any other rlimit-loop error is returned.
+	// A set on a listed fd fails with a non-EBADF error.
 	calls := 0
-	err := markStrayFdsCloexec(fdHygiene{
+	err = markStrayFdsCloexec(fdHygiene{
 		closeRange: failCloseRange(unix.ENOSYS),
-		listOpen:   noList,
-		nofileCur:  func() (uint64, error) { return 1024, nil },
+		listOpen:   func() ([]int, error) { return []int{5, 7, 9}, nil },
 		set: func(fd int) error {
 			calls++
 			if fd == 7 {
 				return unix.EIO
 			}
-			return unix.EBADF
+			return nil
 		},
 	})
-	if !errors.Is(err, unix.EIO) || calls != 3 {
-		t.Fatalf("err = %v after %d calls, want EIO after 3", err, calls)
-	}
-	// A failing rlimit read after a failing enumeration is an error.
-	err = markStrayFdsCloexec(fdHygiene{
-		closeRange: failCloseRange(unix.ENOSYS),
-		listOpen:   noList,
-		nofileCur:  func() (uint64, error) { return 0, unix.EPERM },
-		set:        func(int) error { t.Fatal("set ran without a limit"); return nil },
-	})
-	if !errors.Is(err, unix.EPERM) {
-		t.Fatalf("err = %v, want the rlimit error", err)
+	if !errors.Is(err, unix.EIO) || calls != 2 {
+		t.Fatalf("err = %v after %d calls, want EIO after 2", err, calls)
 	}
 }
 
 // TestMarkStrayFdsCloexecEnumerationSkipsEBADF: a listed fd closed before its
-// set (EBADF) does not send the walk to the rlimit loop.
+// set (EBADF) is skipped and does not fail the call.
 func TestMarkStrayFdsCloexecEnumerationSkipsEBADF(t *testing.T) {
 	var set []int
 	err := markStrayFdsCloexec(fdHygiene{
 		closeRange: failCloseRange(unix.EPERM),
 		listOpen:   func() ([]int, error) { return []int{0, 4, 5, 9, 3000}, nil },
-		nofileCur:  func() (uint64, error) { t.Fatal("rlimit loop ran"); return 0, nil },
 		set: func(fd int) error {
 			set = append(set, fd)
 			if fd == 9 {
@@ -238,7 +176,6 @@ func TestMarkStrayFdsCloexecSkipsFallbackOnSuccess(t *testing.T) {
 	if err := markStrayFdsCloexec(fdHygiene{
 		closeRange: func(uint) error { return nil },
 		listOpen:   func() ([]int, error) { fail(); return nil, nil },
-		nofileCur:  func() (uint64, error) { fail(); return 0, nil },
 		set:        func(int) error { fail(); return nil },
 	}); err != nil {
 		t.Fatalf("err = %v", err)
