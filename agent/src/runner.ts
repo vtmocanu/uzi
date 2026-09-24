@@ -6410,13 +6410,9 @@ export class RunRunner {
       // Best-effort throughout: a checkpoint must NEVER fail the run.
       checkpoint: (opts) =>
         // issue #1597 M2: gated — waits for (and preempts) an in-flight mid-turn tick.
-        this.runGatedSink(
-          flight,
-          async () => {
-            await checkpointBody({ reap: opts.reap, progress: opts.progress });
-          },
-          () => undefined, // best-effort: the next boundary retries
-        ),
+        this.runGatedSink(flight, async () => {
+          await checkpointBody({ reap: opts.reap, progress: opts.progress });
+        }),
       // Issue #281: a cheap fingerprint of the runner clone's committed + working-tree
       // state for the executor's no-progress detector — the runner-owned clone's branch
       // tip (committed work) plus `git status --porcelain` (uncommitted changes). Both are
@@ -7029,21 +7025,17 @@ export class RunRunner {
 
   /**
    * issue #1597 M2: run a durable sink under the per-flight sink gate, after surviving tick process
-   * groups had their bounded chance to go. A `stuck` survivor (SIGKILL confirmed) never blocks a
-   * sink. An `unconfirmed` one may still run git: a sink passed `onUnconfirmed` (the best-effort
-   * milestone checkpoint, which the next boundary retries) is SKIPPED; the last-chance sinks (park,
-   * wall, completion hold, credential switch) proceed, because skipping them loses the only
-   * durable copy, and the error line above records the residual.
+   * groups had their bounded chance to go. Every sink then PROCEEDS, whatever the verdict, as a
+   * deliberate best-effort durability tradeoff: skipping a sink silently loses its fetch-back,
+   * publish and progress report. The residual is real: git's lock files guard individual writes,
+   * not the fetch-back / owner-stamp / publish SEQUENCE, and the fetch-back is a forced update, so a
+   * live straggler could still interleave with it (for example, a later forced update replacing a
+   * newer tracking tip without any lock error). `awaitTickSurvivorsGone` has already logged a
+   * `stuck` (warn) or `unconfirmed` (error) residual.
    */
-  private runGatedSink<T>(flight: RunFlight, fn: () => Promise<T>, onUnconfirmed?: () => T): Promise<T> {
+  private runGatedSink<T>(flight: RunFlight, fn: () => Promise<T>): Promise<T> {
     return flight.sinkGate.run(async () => {
-      const verdict = await this.awaitTickSurvivorsGone(flight);
-      if (verdict === "unconfirmed" && onUnconfirmed) {
-        flight.runLog.warn("checkpoint skipped: a surviving tick process group may still be running", {
-          run_id: flight.runId,
-        });
-        return onUnconfirmed();
-      }
+      await this.awaitTickSurvivorsGone(flight);
       return fn();
     });
   }

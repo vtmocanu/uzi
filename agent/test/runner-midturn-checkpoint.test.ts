@@ -1270,7 +1270,7 @@ describe("mid-turn checkpoint lock custody (issue #1597 M2)", () => {
     });
     const pub = stubPublish(async (_n, _tip, pack) => {
       await drain(pack);
-      return { ok: true };
+      return LANDED;
     });
     const { logger, lines: rawLines } = recordingLogger();
     const lines = rawLines as Array<Record<string, unknown>>;
@@ -1313,7 +1313,7 @@ describe("mid-turn checkpoint lock custody (issue #1597 M2)", () => {
       runner.shutdown();
       await p;
       assert.equal(later[0], "tick_process_survived", "a later tick skips while the survivor lives");
-      assert.notEqual(later[1], "tick_process_survived", "the sink unblocks once the surviving group is gone");
+      assert.equal(later[1], "no_new_work", "the sink unblocks once the surviving group is gone (the tick reaches the work check)");
       assert.ok(
         lines.some((l) => l.msg === "mid-turn checkpoint: a tick process group survived its SIGKILL; blocking the sink"),
         "the survivor was logged",
@@ -1334,7 +1334,7 @@ describe("mid-turn checkpoint lock custody (issue #1597 M2)", () => {
     }
   });
 
-  it("(i) survivor, SIGKILL unconfirmed: the best-effort milestone sink is SKIPPED (no git work, no publish)", async () => {
+  it("(i) survivor, SIGKILL unconfirmed: the milestone sink still runs (never silently skipped) and the residual is an error", async () => {
     const tmp = scratchDir("survivor-unconfirmed");
     const shim = writeShim(tmp, "detect");
     const iid = 1597_236;
@@ -1359,7 +1359,7 @@ describe("mid-turn checkpoint lock custody (issue #1597 M2)", () => {
     });
     const pub = stubPublish(async (_n, _tip, pack) => {
       await drain(pack);
-      return { ok: true };
+      return LANDED;
     });
     const { logger, lines: rawLines } = recordingLogger();
     const lines = rawLines as Array<Record<string, unknown>>;
@@ -1375,9 +1375,18 @@ describe("mid-turn checkpoint lock custody (issue #1597 M2)", () => {
           ctl.advance(INTERVAL_MS + 1);
           ctl.fireNoWait();
           await waitFor(() => isReady(stubborn));
-          await ctx.checkpoint!({ reap: false }); // time gate open: it WOULD publish if it ran
+          // A progress-bearing milestone (Greptile P1: a skip would silently drop its progress report).
+          await ctx.checkpoint!({ reap: false, progress: { completed: ["m1"], in_progress: [] } });
           assert.equal(ctl.outcomes[0], "tick_process_survived");
-          assert.equal(pub.count(), 0, "the skipped milestone sink published nothing");
+          assert.equal(pub.count(), 1, "the milestone sink ran and published despite the unconfirmed survivor");
+          assert.ok(
+            api.states.some(
+              (st) =>
+                st.runId === claim.run_id &&
+                JSON.stringify((st.body as { milestones_completed?: unknown }).milestones_completed) === JSON.stringify(["m1"]),
+            ),
+            "the milestone's progress report was emitted despite the unconfirmed survivor",
+          );
           forceAlive = false;
           milestoneDone = true;
         }),
@@ -1394,8 +1403,8 @@ describe("mid-turn checkpoint lock custody (issue #1597 M2)", () => {
         "the unconfirmed kill was logged at error level",
       );
       assert.ok(
-        lines.some((l) => l.msg === "checkpoint skipped: a surviving tick process group may still be running"),
-        "the milestone sink was skipped",
+        !lines.some((l) => String(l.msg).startsWith("checkpoint skipped")),
+        "no sink is ever skipped for a survivor",
       );
     } finally {
       forceAlive = false;
