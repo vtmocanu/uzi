@@ -157,7 +157,7 @@ func TestRunUsageGenericPlanLiveDB(t *testing.T) {
 		scoped          bool
 	}{
 		// $1 background_grace_cutoff, $2 user_id, $3 repo_id (NULL = no filter), $4 issue_iid.
-		// At HEAD ListRunsForUser's plan does not touch run_usage at all: this case guards
+		// Since #1620 M1 ListRunsForUser's plan does not touch run_usage at all: this case guards
 		// against the view join coming back into the run-list query.
 		{"ListRunsForUser", store.ListRunsForUserSQL, cutoff + ", " + u(userID) + ", NULL::uuid, NULL::bigint", true},
 		{"ListRunUsageTotalsForRuns", store.ListRunUsageTotalsForRunsSQL, "'{" + strings.Join(pageIDs, ",") + "}'::uuid[]", true},

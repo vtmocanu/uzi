@@ -123,9 +123,9 @@ func TestTransportExitCanceledIsNotTimeout(t *testing.T) {
 	}
 }
 
-// fakeTimeoutErr is a net.Error whose Timeout() is true but which, unlike every
-// timeout the standard library produces today, does NOT match
-// context.DeadlineExceeded: it isolates isTimeout's net.Error branch.
+// fakeTimeoutErr is a net.Error whose Timeout() is true but which does NOT match
+// context.DeadlineExceeded, like net/http's TLS handshake timeout (the default
+// transport's 10s TLSHandshakeTimeout): it isolates isTimeout's net.Error branch.
 type fakeTimeoutErr struct{}
 
 func (fakeTimeoutErr) Error() string   { return "fake connect timeout" }

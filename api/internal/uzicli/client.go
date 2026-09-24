@@ -949,7 +949,8 @@ func transportExit(baseURL string, err error) *ExitError {
 // anywhere in the chain, or a net.Error (which *url.Error implements) whose
 // Timeout() is true. On current Go the caller's context deadline, the
 // http.Client Timeout and a dial timeout all match BOTH checks; the net.Error
-// check is kept for a timeout that does not wrap context.DeadlineExceeded.
+// check catches a timeout that does not wrap context.DeadlineExceeded, notably
+// net/http's TLS handshake timeout (the default transport's TLSHandshakeTimeout).
 func isTimeout(err error) bool {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return true
