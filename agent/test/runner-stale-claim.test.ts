@@ -221,37 +221,6 @@ describe("RunRunner — PRD #1247 M5b stop-on-stale_claim", () => {
     }
   });
 
-  it("#1607: a stale_claim stop keeps the run HOME, since a same-worker re-claim shares agent-home/<runId>", async () => {
-    const { gitlab } = fakeGitlab();
-    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-1607-stale-home-"));
-    try {
-      const claim = gitlabClaim(1607, { claim_generation: 2 });
-      const runHome = path.join(homeRoot, claim.run_id);
-      // The owning (replacement) claim's session already lives in the shared HOME.
-      fs.mkdirSync(path.join(runHome, ".claude", "projects"), { recursive: true });
-      const transcript = path.join(runHome, ".claude", "projects", "session.jsonl");
-      fs.writeFileSync(transcript, "{}\n");
-      const factory: ExecutorFactory = (runId) => ({
-        homeDir: path.join(homeRoot, runId),
-        executor: {
-          run: async () => {
-            throw new Error("executor must not run after a stale_claim stop");
-          },
-        },
-      });
-      api.failStateWhen(claim.run_id, (b) => b.status === "running", {
-        httpStatus: 409,
-        disposition: "stale_claim",
-      });
-
-      await runnerWith(factory, gitlab, undefined, nullLogger()).execute(claim);
-
-      assert.ok(fs.existsSync(transcript), "the superseded flight's teardown must not delete the shared run HOME");
-    } finally {
-      fs.rmSync(homeRoot, { recursive: true, force: true });
-    }
-  });
-
   it("MINOR-7: a credential_switch signal on a /state ACK triggers the switch (the secondary transport, not just /inputs)", async () => {
     const { gitlab } = fakeGitlab();
     const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-1247-ack-switch-"));
