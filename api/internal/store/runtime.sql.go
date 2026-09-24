@@ -9045,6 +9045,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE id = $1 AND user_id = $2 AND status = 'recovery_wait'
+  AND recovery_wait_cause IS DISTINCT FROM 'codex_account_unavailable'
 `
 
 type PromoteRecoveryWaitRunNowParams struct {
@@ -9088,7 +9089,8 @@ UPDATE runs SET
     codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
-WHERE status = 'recovery_wait' AND recovery_retry_not_before <= $1
+WHERE status = 'recovery_wait' AND recovery_wait_cause IS DISTINCT FROM 'codex_account_unavailable'
+  AND recovery_retry_not_before <= $1
 RETURNING id, user_id, status
 `
 
