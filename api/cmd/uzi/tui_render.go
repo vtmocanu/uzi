@@ -234,7 +234,8 @@ func displayHealth(health string) string {
 // the wait word reads "forge wait" instead of "recovery wait" (glyph and colour unchanged —
 // it is still a wait-family hold). The retry/cap detail does not fit this fixed-width token;
 // it lives on the run-get notice and the web panel. PRD #1590: "codex_account_unavailable"
-// reads "codex wait", its action living on the board second line and the detail park line.
+// reads "codex wait" here, its action living on the board second line and the detail park line;
+// a relogin_required hold is re-tokened "⚿ codex login" by palette.runStateToken.
 //
 // LANDING (issue #1418): landingState is the run's server-derived LandingState. A `failed` run
 // whose value is "needs_landing" reads the word "needs landing" instead of "failed" — its

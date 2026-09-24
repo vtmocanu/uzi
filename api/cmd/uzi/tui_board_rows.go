@@ -513,7 +513,8 @@ func (m tuiModel) boardShowSecondLine(r apitypes.RunListItemDTO) bool {
 func (m tuiModel) boardSecondLine(r apitypes.RunListItemDTO) string {
 	bg := m.pal.selBg
 	// PRD #1590 D6: a run held on its Codex account has no live activity; its second line is
-	// what the account needs next, in the wait ink of its "codex wait" token. The line carries
+	// what the account needs next, in the wait ink (a relogin_required hold reads "codex login" and
+	// bands into NEEDS YOU via runBandOf; its line keeps the wait ink). The line carries
 	// the owner's alias label (user-authored), folded through cellText by
 	// codexAccountActionLine and through renderer.Plain here (D7).
 	if line := codexAccountActionLine(r.RunDTO); line != "" {
