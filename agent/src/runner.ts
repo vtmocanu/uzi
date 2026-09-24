@@ -145,6 +145,85 @@ function isCodexBoundaryError(err: unknown): boolean {
   return err instanceof Error && err.name === "CodexBoundaryError";
 }
 
+/** issue #1597 M1: whether a CodexBoundaryError failed because its boundary DEADLINE elapsed (a
+ *  `timeout`-category HarnessError among its `errors`). The runner stays harness-agnostic (no
+ *  import from agent/src/codex/**), so `errors` is read defensively by shape: a non-boundary
+ *  error, a missing/non-array `errors`, or malformed entries all read as "not a timeout". */
+function isCodexBoundaryTimeout(err: unknown): boolean {
+  if (!isCodexBoundaryError(err)) return false;
+  const errors: unknown = (err as { errors?: unknown }).errors;
+  if (!Array.isArray(errors)) return false;
+  return errors.some(
+    (e: unknown) =>
+      typeof e === "object" && e !== null && (e as { category?: unknown }).category === "timeout",
+  );
+}
+
+/** issue #1597 M1: the closed set of server best-effort skip labels a checkpoint publish can
+ *  carry onto the run feed — the `Skipped:` values api/internal/workersvc/service.go returns
+ *  (PublishCheckpoint). Anything else the body carries is untrusted free text and is folded to
+ *  `other`, so no server-/forge-shaped string reaches the feed verbatim. */
+const PUBLISH_SKIP_LABELS = ["unsupported", "no_ref", "not_descendant", "workflow_scope"] as const;
+type PublishSkipLabel = (typeof PUBLISH_SKIP_LABELS)[number] | "other";
+
+function publishSkipLabel(raw: unknown): PublishSkipLabel {
+  return (PUBLISH_SKIP_LABELS as readonly unknown[]).includes(raw) ? (raw as PublishSkipLabel) : "other";
+}
+
+/** issue #1597 M1: why a checkpoint publish did not land. `no_local_tip` = checkpointPack found
+ *  no tracking ref (nothing to publish; silent), `skipped` = a 2xx best-effort server skip,
+ *  `rejected` = a non-2xx, `aborted` = the caller's signal (permit/deadline) aborted or the throw
+ *  was an AbortError (silent on the feed), `error` = any other throw. */
+type PublishFailClass = "no_local_tip" | "skipped" | "rejected" | "aborted" | "error";
+
+/** issue #1597 M1: the typed result of {@link RunRunner.publishCheckpointOutcome}. Only the
+ *  allowlisted skip label and the numeric HTTP status are carried — never an error message,
+ *  remote text or credential. */
+type PublishOutcome =
+  | { published: true }
+  | { published: false; reason: Exclude<PublishFailClass, "skipped" | "rejected"> }
+  | { published: false; reason: "skipped"; skipLabel: PublishSkipLabel }
+  | { published: false; reason: "rejected"; httpStatus: number };
+
+/** issue #1597 M1: the class a graceful-shutdown checkpoint ended in, named on the run feed and
+ *  in the run log. Published WINS over a later boundary error. This is the type slot issue #1597
+ *  M2 extends (e.g. `bare_lock_retained`); the feed line prints the class verbatim. */
+type ShutdownCheckpointOutcome =
+  | "published"
+  | "timeout"
+  | "boundary_blocked"
+  | "publish_rejected"
+  | "publish_skipped"
+  | "publish_error"
+  | "no_local_tip";
+
+/** issue #1597 M1: map the shutdown body's publish result to its shutdown class. An `aborted`
+ *  publish is a `timeout` when the permit/deadline signal is what aborted it, else a
+ *  `publish_error`. An undefined result (the body never reached the publish) is `publish_error`. */
+function shutdownOutcomeOf(
+  outcome: PublishOutcome | undefined,
+  permitSignal: AbortSignal | undefined,
+): ShutdownCheckpointOutcome {
+  if (!outcome) return "publish_error";
+  if (outcome.published) return "published";
+  switch (outcome.reason) {
+    case "no_local_tip":
+      return "no_local_tip";
+    case "skipped":
+      return "publish_skipped";
+    case "rejected":
+      return "publish_rejected";
+    case "aborted":
+      return permitSignal?.aborted ? "timeout" : "publish_error";
+    case "error":
+      return "publish_error";
+  }
+}
+
+function isAbortLikeError(err: unknown): boolean {
+  return err instanceof Error && err.name === "AbortError";
+}
+
 /** PRD #974 follow-up (#1077): a terminal push_secret_blocked report whose reportState
  *  exhausted its bounded retries and threw. Carrying the typed origin + safe reason through
  *  execute()'s generic catch preserves fail_origin=push_secret_blocked (instead of defaulting
@@ -1661,8 +1740,12 @@ export class RunRunner {
           // at once; their catch branches race the same wall clock, so the cost is the slowest
           // plus contention, not the sum). 15s is generous for a healthy publish yet caps a
           // hung/unreachable forge well short of both the 30s SIGKILL and the 60s server cap.
-          const durability = (async (): Promise<boolean> => {
-            let published = false;
+          // issue #1597 M1: the sequence resolves to a typed ShutdownCheckpointOutcome instead of a
+          // boolean, so the feed names WHY a shutdown checkpoint did not land (and a published
+          // checkpoint is never misreported by a later boundary error).
+          const durability = (async (): Promise<ShutdownCheckpointOutcome> => {
+            let publishOutcome: PublishOutcome | undefined;
+            let permitSignal: AbortSignal | undefined;
             try {
               // PRD #1171 m4: the shutdown durability publish routes through the reap facade so
               // deadlineMs ≤ the shutdown publish timeout keeps it inside the k8s grace race
@@ -1676,6 +1759,7 @@ export class RunRunner {
                   deadlineMs: Math.min(this.codexBoundaryDeadlineMs, this.shutdownPublishTimeoutMs),
                 },
                 async (permit) => {
+                  permitSignal = permit?.signal;
                   await this.git.commitWipMarker(worktreePath).catch(() => false);
                   await this.fetchBackBestEffort(barePath, worktreePath, branch, runId, runLog);
                   // PRD #1416 M3 (C6): bridge a divergent tracking tip BEFORE the shutdown publish so
@@ -1685,7 +1769,7 @@ export class RunRunner {
                   // PRD #1062 M2 (#1036): the path is reaped above, so the overlay's PAT
                   // default-fetch is permitted — a behind-on-workflows branch checkpoints durably.
                   const shutdownOverlay = await this.buildCheckpointOverlay(claim, flight, barePath);
-                  published = await this.publishCheckpointBestEffort(
+                  publishOutcome = await this.publishCheckpointOutcome(
                     flight,
                     barePath,
                     branch,
@@ -1695,24 +1779,35 @@ export class RunRunner {
                 },
               );
             } catch (err) {
-              // A NON-boundary throw propagates as before. A CodexBoundaryError means the sink
-              // could not reap/publish — nothing landed, the same truthful consequence as a
-              // publish failure (published stays false); it must NOT fail the requeue.
+              // A NON-boundary throw propagates as before. A CodexBoundaryError must NOT fail the
+              // requeue. issue #1597 M1: it no longer implies "nothing landed" — the boundary can
+              // error AFTER the body's publish was ACKed (e.g. a late deadline/cleanup failure), and
+              // the checkpoint on origin is then real: published WINS.
               if (!isCodexBoundaryError(err)) throw err;
-              runLog.warn("shutdown checkpoint boundary blocked; nothing published to origin", {
+              if (publishOutcome?.published === true) {
+                runLog.warn(
+                  "shutdown checkpoint boundary failed after the checkpoint was published to origin",
+                  { run_id: runId, error: errMessage(err) },
+                );
+                return "published";
+              }
+              runLog.warn("shutdown checkpoint boundary blocked; checkpoint not published to origin", {
                 run_id: runId,
                 error: errMessage(err),
               });
+              return isCodexBoundaryTimeout(err) ? "timeout" : "boundary_blocked";
             }
-            return published;
+            return shutdownOutcomeOf(publishOutcome, permitSignal);
           })();
           // Claude retains the literal legacy budget race. Codex must not abandon a held
           // permit: its boundary signal cancels supervised children + the upload at the same
           // bounded deadline, and we await actual action/root settlement before terminal
           // safety.dispose or run-home cleanup can proceed.
-          const published = executor.safety
+          // issue #1597 M1: the Claude budget race resolving `undefined` IS the timeout class.
+          const outcome: ShutdownCheckpointOutcome = executor.safety
             ? await durability
-            : await this.raceShutdownBudget(durability, this.shutdownPublishTimeoutMs);
+            : ((await this.raceShutdownBudget(durability, this.shutdownPublishTimeoutMs)) ?? "timeout");
+          runLog.info("shutdown checkpoint outcome", { run_id: runId, outcome });
           // issue #1030 M4: surface the outcome on the feed the same way the park path does,
           // reusing the batcher emit + the reportPublishOutcome dedupe from M1. This lands
           // because it is emitted BEFORE the single batcher.close() below — the shutdown
@@ -1721,10 +1816,17 @@ export class RunRunner {
             kind: "status",
             agent: "worker",
             payload: {
+              // issue #1597 M1: the class only — no error message, remote text or credential. The
+              // tail names the real restart point: a checkpoint this run (or its claim) already
+              // knows landed, else the default branch.
               text:
-                published === true
+                outcome === "published"
                   ? "shutdown checkpoint published to origin"
-                  : "shutdown checkpoint NOT published — a resume on another worker will restart from the default branch",
+                  : `shutdown checkpoint NOT published (reason: ${outcome}) — a resume on another worker will restart from ${
+                      flight.lastCheckpointRefTip
+                        ? "the last published checkpoint"
+                        : "the default branch"
+                    }`,
             },
           });
           // PRD #1349 M2 (D4.6): record this generation's restore point in the durable journal
@@ -6564,6 +6666,26 @@ export class RunRunner {
     overlay?: CheckpointOverlayContext,
     signal?: AbortSignal,
   ): Promise<boolean> {
+    // issue #1597 M1: a thin wrapper — every existing caller only needs "did it land".
+    return (await this.publishCheckpointOutcome(flight, barePath, branch, overlay, signal)).published;
+  }
+
+  /**
+   * issue #1597 M1: the typed form of {@link publishCheckpointBestEffort} — same params, same
+   * side effects, but returns WHY a publish did not land ({@link PublishOutcome}) so the shutdown
+   * sink can name a class on the feed. Feed discipline: `no_local_tip` and `aborted` are silent
+   * (runLog only); `skipped` names only an allowlisted label; `rejected` names only the numeric
+   * status; `error` never carries the thrown message onto the feed (runLog keeps it). A confirmed
+   * publish after a previously-surfaced failure emits ONE recovery line and clears the dedupe set,
+   * so a recurring failure is shown again.
+   */
+  private async publishCheckpointOutcome(
+    flight: RunFlight,
+    barePath: string,
+    branch: string,
+    overlay?: CheckpointOverlayContext,
+    signal?: AbortSignal,
+  ): Promise<PublishOutcome> {
     // issue #1086 (F2): two-tip reconciliation. The CONFIRMED tip advances only on a real ACK; an
     // ambiguous result (non-2xx, or a throw after the pack tip is known) records the ATTEMPTED tip
     // so the next overlay chains from it. Caveat: under PERSISTENT consecutive ACK loss the
@@ -6573,7 +6695,8 @@ export class RunRunner {
     let packedTip: string | undefined;
     try {
       const packed = await this.git.checkpointPack(barePath, branch, overlay);
-      if (!packed) return false; // nothing to publish — not a failure, stay silent
+      // nothing to publish (no tracking ref) — not a failure, stay silent
+      if (!packed) return { published: false, reason: "no_local_tip" };
       packedTip = packed.tipOid;
       const res = await this.client.publishCheckpoint(flight.runId, packed.tipOid, packed.pack, signal);
       if (res.ok && res.body.published === true) {
@@ -6584,31 +6707,53 @@ export class RunRunner {
         // issue #1086 (F2): a confirmed publish reconciles the broker's ref, so clear any pending
         // attempted tip — the confirmed tip is now authoritative.
         flight.lastAttemptedCheckpointRefTip = undefined;
-        return true;
+        // issue #1597 M1: a failure/skip line is on the feed, so say it recovered — once — and
+        // clear the dedupe set so a recurring failure is surfaced again rather than swallowed.
+        if (flight.reportedPublishOutcomes.size > 0) {
+          flight.reportedPublishOutcomes.clear();
+          flight.runLog.info("checkpoint publishing recovered", { run_id: flight.runId });
+          flight.batcher.emit({
+            kind: "status",
+            agent: "worker",
+            payload: { text: "checkpoint publishing recovered — published to origin" },
+          });
+        }
+        return { published: true };
       }
       if (res.ok) {
         // A 2xx that did NOT publish: a best-effort server-side skip. Name the reason.
         // issue #1086 (F2): record NOTHING as attempted — the server definitively did not advance
         // its ref, so the next overlay must keep chaining from the confirmed tip.
-        const reason = res.body.skipped ?? "unknown";
-        this.reportPublishOutcome(flight, `skip:${reason}`, `checkpoint publish skipped: ${reason}`);
-      } else {
-        // issue #1086 (F2): a non-2xx is AMBIGUOUS — the broker may have accepted the push before
-        // the ACK was lost — so record the attempted tip for the next overlay to chain from.
-        flight.lastAttemptedCheckpointRefTip = packed.tipOid;
-        this.reportPublishOutcome(
-          flight,
-          `http:${res.httpStatus}`,
-          `checkpoint publish failed: HTTP ${res.httpStatus}`,
-        );
+        // issue #1597 M1: only an allowlisted label reaches the feed; anything else is `other`.
+        const skipLabel = publishSkipLabel(res.body.skipped);
+        this.reportPublishOutcome(flight, `skip:${skipLabel}`, `checkpoint publish skipped: ${skipLabel}`);
+        return { published: false, reason: "skipped", skipLabel };
       }
-      return false;
+      // issue #1086 (F2): a non-2xx is AMBIGUOUS — the broker may have accepted the push before
+      // the ACK was lost — so record the attempted tip for the next overlay to chain from.
+      flight.lastAttemptedCheckpointRefTip = packed.tipOid;
+      this.reportPublishOutcome(
+        flight,
+        `http:${res.httpStatus}`,
+        `checkpoint publish failed: HTTP ${res.httpStatus}`,
+      );
+      return { published: false, reason: "rejected", httpStatus: res.httpStatus };
     } catch (e) {
       // issue #1086 (F2): a throw is AMBIGUOUS too, but only after the pack tip was obtained — a
       // throw DURING checkpointPack leaves packedTip undefined and records nothing.
       if (packedTip !== undefined) flight.lastAttemptedCheckpointRefTip = packedTip;
-      this.reportPublishOutcome(flight, "error", `checkpoint publish failed: ${errMessage(e)}`);
-      return false;
+      // issue #1597 M1: a deadline/permit abort is an expected bounded stop, not a publish fault —
+      // runLog only, never the feed (the shutdown sink names it as `timeout` itself).
+      if (signal?.aborted || isAbortLikeError(e)) {
+        flight.runLog.info("checkpoint publish aborted", { run_id: flight.runId, error: errMessage(e) });
+        return { published: false, reason: "aborted" };
+      }
+      // issue #1597 M1: the feed line carries the CLASS only — a thrown message can embed remote
+      // text or a credentialed URL; the runLog keeps it for operators.
+      this.reportPublishOutcome(flight, "error", "checkpoint publish failed: error", {
+        error: errMessage(e),
+      });
+      return { published: false, reason: "error" };
     }
   }
 
@@ -6617,10 +6762,16 @@ export class RunRunner {
    * the outcome; emits a run-feed `status` line at most ONCE per distinct outcome key per
    * run, so the ~20-min time-gated retry of a persistently-failing publish does not spam the
    * feed. Reuses the same `batcher.emit({ kind: "status", agent: "worker", … })` mechanism
-   * every other worker-authored status line uses.
+   * every other worker-authored status line uses. issue #1597 M1: `logFields` reach the runLog
+   * only, never the feed.
    */
-  private reportPublishOutcome(flight: RunFlight, key: string, text: string): void {
-    flight.runLog.warn(text, { run_id: flight.runId });
+  private reportPublishOutcome(
+    flight: RunFlight,
+    key: string,
+    text: string,
+    logFields: Record<string, unknown> = {},
+  ): void {
+    flight.runLog.warn(text, { run_id: flight.runId, ...logFields });
     if (flight.reportedPublishOutcomes.has(key)) return;
     flight.reportedPublishOutcomes.add(key);
     flight.batcher.emit({ kind: "status", agent: "worker", payload: { text } });

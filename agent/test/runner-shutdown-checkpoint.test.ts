@@ -1,19 +1,22 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { Readable } from "node:stream";
 import { type ExecutorResult, type RunContext } from "../src/executor.js";
+import { CodexBoundaryError } from "../src/codex/safety.js";
+import type { BoundaryPermit, CodexExecutionSafety, HarnessError } from "../src/harness.js";
 import { type ExecutorFactory } from "../src/runner.js";
 import { skillsPluginDir } from "../src/skills-plugin.js";
-import { nullLogger } from "./helpers.js";
+import { nullLogger, recordingLogger } from "./helpers.js";
 import {
   api,
   client,
   deferred,
   fakeGitlab,
+  git,
   gitlabClaim,
   installHarness,
   runnerWith,
@@ -159,6 +162,12 @@ function shutdownFactory(
   homeRoot: string,
   iid: number,
   file: string | null,
+  opts: {
+    /** issue #1597 M1: a Codex-shaped executor (its sinks route through `safety.withBoundary`). */
+    safety?: CodexExecutionSafety;
+    /** issue #1597 M1: runs after the commit, before the executor signals it is mid-run. */
+    midRun?: (ctx: RunContext) => Promise<void>;
+  } = {},
 ): { factory: ExecutorFactory; started: Promise<void>; sha: () => string; paths: () => Paths } {
   const pluginDir = skillsPluginDir(worktreeDirFor(iid));
   const start = deferred();
@@ -171,6 +180,7 @@ function shutdownFactory(
       executor: {
         run: async (ctx: RunContext): Promise<ExecutorResult> => {
           if (file) sha = commitInTree(ctx.worktreePath, file, "work before the shutdown\n");
+          if (opts.midRun) await opts.midRun(ctx);
           fs.mkdirSync(pluginDir, { recursive: true });
           fs.writeFileSync(path.join(pluginDir, "marker"), "x");
           fs.mkdirSync(runHome, { recursive: true });
@@ -179,6 +189,7 @@ function shutdownFactory(
           await waitAbort(ctx.signal!);
           throw new Error("aborted mid-run");
         },
+        ...(opts.safety ? { safety: opts.safety } : {}),
       },
     };
   };
@@ -323,7 +334,7 @@ describe("RunRunner — checkpoint on graceful shutdown (PRD #1030 M4)", () => {
       assert.ok(
         feed.some((t) =>
           t.includes(
-            "shutdown checkpoint NOT published — a resume on another worker will restart from the default branch",
+            "shutdown checkpoint NOT published (reason: publish_rejected) — a resume on another worker will restart from the default branch",
           ),
         ),
         `expected the shutdown-not-published consequence line, got ${JSON.stringify(feed)}`,
@@ -389,7 +400,7 @@ describe("RunRunner — checkpoint on graceful shutdown (PRD #1030 M4)", () => {
       assert.ok(
         feed.some((t) =>
           t.includes(
-            "shutdown checkpoint NOT published — a resume on another worker will restart from the default branch",
+            "shutdown checkpoint NOT published (reason: timeout) — a resume on another worker will restart from the default branch",
           ),
         ),
         `expected the NOT-published line when the budget elapses, got ${JSON.stringify(feed)}`,
@@ -397,6 +408,348 @@ describe("RunRunner — checkpoint on graceful shutdown (PRD #1030 M4)", () => {
     } finally {
       restore();
       fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+// ── issue #1597 M1 — a typed shutdown-checkpoint outcome on the feed ─────────────
+//
+// The shutdown feed line used to be binary ("published" / "NOT published — restart from the
+// default branch"), and a Codex boundary error was logged as "nothing published" even when the
+// body's publish had already landed. M1 names the CLASS (never an error message / remote text),
+// lets a published checkpoint WIN over a late boundary error, keeps a permit/deadline abort off
+// the feed, and names the real restart point (the last published checkpoint when one landed).
+
+/** Replace client.publishCheckpoint with `impl` (the pack is drained first). */
+function spyPublishWith(
+  impl: (call: number, signal: AbortSignal | undefined) => Promise<unknown>,
+): { restore: () => void; count: () => number } {
+  const orig = client.publishCheckpoint.bind(client);
+  let n = 0;
+  (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = async (
+    _runId: string,
+    _tipOid: string,
+    pack: Readable,
+    signal?: AbortSignal,
+  ) => {
+    await drain(pack);
+    return impl(n++, signal);
+  };
+  return {
+    restore: () => {
+      (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = orig;
+    },
+    count: () => n,
+  };
+}
+
+const LANDED = { ok: true, body: { published: true, ref: "refs/uzi-checkpoints/agent/issue-x" } };
+
+/** A fake Codex safety whose `shutdown` boundary is scripted. `before` throws the given error
+ *  WITHOUT running the action (the boundary could not be established); `after` runs the action
+ *  under a held permit, then throws (a late boundary failure); `abortAfterMs` runs the action
+ *  under a permit whose signal aborts after the delay (the boundary deadline). Other boundaries
+ *  run their action plainly. Permit-held git subprocesses are spawned directly. */
+function fakeSafety(script: {
+  before?: () => Error;
+  after?: () => Error;
+  abortAfterMs?: number;
+}): CodexExecutionSafety {
+  const permitFor = (boundary: string, signal: AbortSignal): BoundaryPermit =>
+    ({ epoch: 1, boundary, signal }) as unknown as BoundaryPermit;
+  return {
+    kind: "codex",
+    withBoundary: async (req, action) => {
+      const ac = new AbortController();
+      if (req.boundary !== "shutdown") return action(permitFor(req.boundary, ac.signal));
+      if (script.before) throw script.before();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      if (script.abortAfterMs !== undefined) {
+        timer = setTimeout(() => ac.abort(new Error("boundary deadline")), script.abortAfterMs);
+      }
+      try {
+        const value = await action(permitFor(req.boundary, ac.signal));
+        if (script.after) throw script.after();
+        return value;
+      } finally {
+        clearTimeout(timer);
+      }
+    },
+    spawnBoundaryProcess: async (_permit, request) => {
+      const [command, ...args] = request.argv;
+      const child = spawn(command!, args, { cwd: request.cwd, env: request.env, stdio: ["pipe", "pipe", "pipe"] });
+      const completed = new Promise<{ code: number }>((resolve, reject) => {
+        child.once("error", reject);
+        child.once("exit", (code, sig) => resolve({ code: code ?? (sig ? 128 : 1) }));
+      });
+      return { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, completed };
+    },
+    dispose: async () => ({ kind: "disposed" }),
+  };
+}
+
+const harnessError = (category: HarnessError["category"]): HarnessError => ({
+  category,
+  message: `boundary ${category}`,
+});
+
+/** Run one shutdown with the given publish spy / safety; return the run's feed + log lines. */
+async function shutdownOnce(
+  iid: number,
+  opts: { safety?: CodexExecutionSafety; midRun?: (ctx: RunContext) => Promise<void>; budgetMs?: number } = {},
+): Promise<{ feed: string[]; lines: Array<Record<string, unknown>>; runId: string }> {
+  const { gitlab } = fakeGitlab();
+  const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), `uzi-1597-shut-${iid}-`));
+  try {
+    const { factory, started } = shutdownFactory(homeRoot, iid, "WORK.txt", opts);
+    const { logger, lines } = recordingLogger();
+    const runner = runnerWith(
+      factory,
+      gitlab,
+      undefined,
+      logger,
+      opts.budgetMs !== undefined ? { shutdownPublishTimeoutMs: opts.budgetMs } : undefined,
+    );
+    const claim = gitlabClaim(iid);
+    const p = runner.execute(claim);
+    await started;
+    runner.shutdown();
+    await p;
+    assert.strictEqual(terminal(claim.run_id), false, "a shutdown always requeues (best-effort)");
+    return {
+      feed: statusTexts(claim.run_id),
+      lines: lines as Array<Record<string, unknown>>,
+      runId: claim.run_id,
+    };
+  } finally {
+    fs.rmSync(homeRoot, { recursive: true, force: true });
+  }
+}
+
+const DEFAULT_TAIL = "a resume on another worker will restart from the default branch";
+const notPublished = (cls: string, tail = DEFAULT_TAIL): string =>
+  `shutdown checkpoint NOT published (reason: ${cls}) — ${tail}`;
+
+/** The class the runner logged for this shutdown (runLog.info "shutdown checkpoint outcome"). */
+const loggedOutcome = (lines: Array<Record<string, unknown>>): unknown =>
+  lines.find((l) => l.msg === "shutdown checkpoint outcome")?.outcome;
+
+describe("RunRunner — typed shutdown checkpoint outcome (issue #1597 M1)", () => {
+  it("published: a landed publish states published and logs the class", async () => {
+    const { restore } = spyPublishWith(async () => LANDED);
+    try {
+      const { feed, lines } = await shutdownOnce(1597_01);
+      assert.ok(feed.includes("shutdown checkpoint published to origin"), JSON.stringify(feed));
+      assert.ok(!feed.some((t) => t.includes("NOT published")), JSON.stringify(feed));
+      assert.equal(loggedOutcome(lines), "published");
+    } finally {
+      restore();
+    }
+  });
+
+  it("timeout (Claude): the budget race elapsing names the timeout class", async () => {
+    const { restore } = spyPublishHang();
+    try {
+      const { feed, lines } = await shutdownOnce(1597_02, { budgetMs: 300 });
+      assert.ok(feed.includes(notPublished("timeout")), JSON.stringify(feed));
+      assert.equal(loggedOutcome(lines), "timeout");
+    } finally {
+      restore();
+    }
+  });
+
+  it("publish_rejected: a non-2xx names the class and keeps the HTTP-status line", async () => {
+    const { restore } = spyPublishWith(async () => ({ ok: false, httpStatus: 500 }));
+    try {
+      const { feed } = await shutdownOnce(1597_03);
+      assert.ok(feed.includes(notPublished("publish_rejected")), JSON.stringify(feed));
+      assert.ok(feed.includes("checkpoint publish failed: HTTP 500"), JSON.stringify(feed));
+    } finally {
+      restore();
+    }
+  });
+
+  it("publish_skipped: a 2xx skip names the class and the allowlisted skip label", async () => {
+    const { restore } = spyPublishWith(async () => ({
+      ok: true,
+      body: { published: false, ref: "", skipped: "workflow_scope" },
+    }));
+    try {
+      const { feed } = await shutdownOnce(1597_04);
+      assert.ok(feed.includes(notPublished("publish_skipped")), JSON.stringify(feed));
+      assert.ok(feed.includes("checkpoint publish skipped: workflow_scope"), JSON.stringify(feed));
+    } finally {
+      restore();
+    }
+  });
+
+  it("publish_skipped: a non-allowlisted server skip label is folded to `other` on the feed", async () => {
+    const { restore } = spyPublishWith(async () => ({
+      ok: true,
+      body: { published: false, ref: "", skipped: "remote said https://tok@forge/x" },
+    }));
+    try {
+      const { feed } = await shutdownOnce(1597_05);
+      assert.ok(feed.includes("checkpoint publish skipped: other"), JSON.stringify(feed));
+      assert.ok(!feed.some((t) => t.includes("remote said")), JSON.stringify(feed));
+    } finally {
+      restore();
+    }
+  });
+
+  it("publish_error: a throw names the class and NO part of the thrown message reaches the feed", async () => {
+    const { restore } = spyPublishWith(async () => {
+      throw new Error("boom-secret-remote-text");
+    });
+    try {
+      const { feed, lines } = await shutdownOnce(1597_06);
+      assert.ok(feed.includes(notPublished("publish_error")), JSON.stringify(feed));
+      assert.ok(feed.includes("checkpoint publish failed: error"), JSON.stringify(feed));
+      for (const needle of ["boom", "secret", "remote-text"]) {
+        assert.ok(!feed.some((t) => t.includes(needle)), `feed leaked "${needle}": ${JSON.stringify(feed)}`);
+      }
+      // The operator log keeps the message.
+      assert.ok(
+        lines.some((l) => l.msg === "checkpoint publish failed: error" && l.error === "boom-secret-remote-text"),
+        "runLog.warn keeps the thrown message",
+      );
+    } finally {
+      restore();
+    }
+  });
+
+  it("no_local_tip: no tracking ref to pack names the class and publishes nothing", async () => {
+    const { restore, count } = spyPublishWith(async () => LANDED);
+    const origPack = git.checkpointPack.bind(git);
+    (git as unknown as { checkpointPack: unknown }).checkpointPack = async () => null;
+    try {
+      const { feed } = await shutdownOnce(1597_07);
+      assert.equal(count(), 0, "nothing was sent to the publish RPC");
+      assert.ok(feed.includes(notPublished("no_local_tip")), JSON.stringify(feed));
+      assert.ok(!feed.some((t) => t.startsWith("checkpoint publish")), JSON.stringify(feed));
+    } finally {
+      (git as unknown as { checkpointPack: unknown }).checkpointPack = origPack;
+      restore();
+    }
+  });
+
+  it("boundary_blocked (Codex): a non-timeout CodexBoundaryError names boundary_blocked", async () => {
+    const { restore, count } = spyPublishWith(async () => LANDED);
+    try {
+      const safety = fakeSafety({
+        before: () => new CodexBoundaryError("reconcile", [harnessError("protocol")]),
+      });
+      const { feed, lines } = await shutdownOnce(1597_08, { safety });
+      assert.equal(count(), 0, "the blocked boundary never ran the publish");
+      assert.ok(feed.includes(notPublished("boundary_blocked")), JSON.stringify(feed));
+      assert.equal(loggedOutcome(lines), "boundary_blocked");
+    } finally {
+      restore();
+    }
+  });
+
+  it("timeout (Codex): a CodexBoundaryError carrying a timeout-category error names timeout", async () => {
+    const { restore } = spyPublishWith(async () => LANDED);
+    try {
+      const safety = fakeSafety({
+        before: () => new CodexBoundaryError("quiesce", [harnessError("transport"), harnessError("timeout")]),
+      });
+      const { feed, lines } = await shutdownOnce(1597_09, { safety });
+      assert.ok(feed.includes(notPublished("timeout")), JSON.stringify(feed));
+      assert.equal(loggedOutcome(lines), "timeout");
+    } finally {
+      restore();
+    }
+  });
+
+  it("published wins (Codex): a boundary error AFTER the publish landed still states published", async () => {
+    const { restore, count } = spyPublishWith(async () => LANDED);
+    try {
+      const safety = fakeSafety({
+        after: () => new CodexBoundaryError("reap", [harnessError("timeout")]),
+      });
+      const { feed, lines } = await shutdownOnce(1597_10, { safety });
+      assert.equal(count(), 1, "the publish ran and landed inside the boundary");
+      assert.ok(feed.includes("shutdown checkpoint published to origin"), JSON.stringify(feed));
+      assert.ok(!feed.some((t) => t.includes("NOT published")), JSON.stringify(feed));
+      assert.equal(loggedOutcome(lines), "published");
+      assert.ok(
+        !lines.some((l) => typeof l.msg === "string" && l.msg.includes("nothing published")),
+        "no log line claims nothing was published",
+      );
+    } finally {
+      restore();
+    }
+  });
+
+  it("aborted is silent (Codex): a permit-deadline abort emits no publish-failed line and names timeout", async () => {
+    const { restore } = spyPublishWith(async (_n, signal) => {
+      await new Promise<void>((resolve) => {
+        if (signal?.aborted) resolve();
+        else signal?.addEventListener("abort", () => resolve(), { once: true });
+      });
+      throw new Error("upload aborted boom-secret-remote-text");
+    });
+    try {
+      const safety = fakeSafety({ abortAfterMs: 150 });
+      const { feed, lines } = await shutdownOnce(1597_11, { safety });
+      assert.ok(!feed.some((t) => t.includes("checkpoint publish failed")), JSON.stringify(feed));
+      assert.ok(!feed.some((t) => t.includes("boom")), JSON.stringify(feed));
+      assert.ok(feed.includes(notPublished("timeout")), JSON.stringify(feed));
+      assert.equal(loggedOutcome(lines), "timeout");
+    } finally {
+      restore();
+    }
+  });
+
+  it("names the last published checkpoint as the restart point when a prior checkpoint landed", async () => {
+    // Call 0 = the mid-run milestone checkpoint (lands); call 1 = the shutdown publish (HTTP 500).
+    const { restore, count } = spyPublishWith(async (n) => (n === 0 ? LANDED : { ok: false, httpStatus: 500 }));
+    try {
+      const { feed } = await shutdownOnce(1597_12, {
+        midRun: async (ctx) => {
+          await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] } });
+          commitInTree(ctx.worktreePath, "MORE.txt", "after the checkpoint\n");
+        },
+      });
+      assert.equal(count(), 2, "the mid-run checkpoint and the shutdown publish both ran");
+      assert.ok(
+        feed.includes(
+          notPublished(
+            "publish_rejected",
+            "a resume on another worker will restart from the last published checkpoint",
+          ),
+        ),
+        JSON.stringify(feed),
+      );
+    } finally {
+      restore();
+    }
+  });
+
+  it("recovery: fail → succeed emits ONE recovered line; a later failure is shown again", async () => {
+    // Calls: 0 = HTTP 500 (surfaced), 1 = landed (recovered), 2 = HTTP 500 (surfaced AGAIN).
+    const { restore, count } = spyPublishWith(async (n) => (n === 1 ? LANDED : { ok: false, httpStatus: 500 }));
+    try {
+      const { feed } = await shutdownOnce(1597_13, {
+        midRun: async (ctx) => {
+          await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] } }); // 500
+          await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] } }); // retry of the same tip: lands
+          commitInTree(ctx.worktreePath, "MORE.txt", "after the recovery\n");
+        },
+      });
+      assert.equal(count(), 3, "two mid-run publishes plus the shutdown publish");
+      const FAILED = "checkpoint publish failed: HTTP 500";
+      const RECOVERED = "checkpoint publishing recovered — published to origin";
+      // Exactly one recovered line, between two failure lines: the recovery cleared the dedupe
+      // set, so the recurring HTTP 500 is surfaced again instead of being swallowed.
+      assert.deepEqual(
+        feed.filter((t) => t === FAILED || t === RECOVERED),
+        [FAILED, RECOVERED, FAILED],
+        JSON.stringify(feed),
+      );
+    } finally {
+      restore();
     }
   });
 });
