@@ -211,6 +211,31 @@ ${exitAfterMs === undefined ? "setInterval(() => {}, 1000);" : `setTimeout(() =>
     forceAlive = false;
   });
 
+  it("a leader whose SIGKILL is not delivered does not hang settled(): it is reported as an unconfirmed survivor", async () => {
+    const ac = new AbortController();
+    const sp = new TickSpawner({
+      signal: ac.signal,
+      killGraceMs: 100,
+      hooks: { signalGroup: () => false }, // no signal is ever delivered (models EPERM)
+    });
+    const h = await sp.spawn(req([NODE, stubborn()]));
+    await ready(h);
+    const [pid] = sp.pids();
+    try {
+      ac.abort();
+      const outcome = await Promise.race([
+        sp.settled().then(() => "settled"),
+        new Promise((r) => setTimeout(() => r("hung"), 10_000)),
+      ]);
+      assert.equal(outcome, "settled", "settled() must be bounded when the leader cannot be killed");
+      assert.equal(alive(pid!), true, "the leader really is still alive");
+      assert.deepEqual(sp.survivors(), [{ pgid: pid, identity: "worker_pat", killConfirmed: false }]);
+    } finally {
+      process.kill(-pid!, "SIGKILL");
+      await h.completed;
+    }
+  });
+
   it("processGroupAlive: a live group is alive, an exited one is gone", async () => {
     const c = spawn(NODE, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
     try {

@@ -186,6 +186,8 @@ interface Tracked {
   survived: boolean;
   /** Whether the last SIGKILL to the group was confirmed delivered. */
   killConfirmed: boolean;
+  /** Give up on a leader that did not exit after its SIGKILL: settle it now as a survivor. */
+  abandon: () => void;
   snapshot: Map<string, LockStat> | undefined;
   /** Set once the child was signalled because of a cancellation. */
   signalled: boolean;
@@ -352,6 +354,7 @@ export class TickSpawner {
       groupGone,
       survived: false,
       killConfirmed: false,
+      abandon: () => undefined, // replaced below, once the group-wait latch exists
       snapshot,
       signalled: false,
       killed: false,
@@ -370,6 +373,13 @@ export class TickSpawner {
           this.live.delete(tracked);
           resolveGroup();
         });
+      };
+      tracked.abandon = (): void => {
+        if (groupWaitStarted) return;
+        groupWaitStarted = true;
+        tracked.survived = true;
+        this.live.delete(tracked);
+        resolveGroup();
       };
       child.once("error", (err) => {
         exitedFlag = true;
@@ -456,8 +466,25 @@ export class TickSpawner {
     // ownership can be PROVEN afterwards (the fds vanish with the process).
     t.killed = true;
     t.held = await this.readHeldLocks(t.pid);
-    this.signalGroup(t, "SIGKILL");
-    await t.exited;
+    t.killConfirmed = this.signalGroup(t, "SIGKILL");
+    // Bounded: a leader whose SIGKILL was not delivered (EPERM, a failed runner-uid wrapper) or
+    // that is stuck in the kernel would otherwise hold settlement, and with it the sink gate,
+    // forever. It is settled as a survivor instead, which keeps the sink blocked in the runner.
+    let killTimer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      t.exited,
+      new Promise<void>((r) => {
+        killTimer = setTimeout(r, GROUP_KILL_WAIT_MS);
+      }),
+    ]);
+    clearTimeout(killTimer);
+    if (t.isExited()) return;
+    this.opts.log?.warn("mid-turn checkpoint: a cancelled tick child's leader did not exit after its SIGKILL", {
+      pid: t.pid,
+      argv_class: t.argvClass,
+      kill_confirmed: t.killConfirmed,
+    });
+    t.abandon();
   }
 
   private async readHeldLocks(pgid: number): Promise<HeldLock[] | undefined> {
