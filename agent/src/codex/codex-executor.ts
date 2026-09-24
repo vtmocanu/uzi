@@ -68,7 +68,7 @@ import { buildLeadSystemPrompt, buildRevisePlanPrompt, publishedTipNote } from "
 import { RUNNER_UID, WORKER_UID, uidSplitActive } from "../runner-uid.js";
 import { errMessage } from "../util.js";
 import { makeTextRedactor } from "../redact.js";
-import type { AgentTemplate, ClaimSkill } from "../protocol.js";
+import type { AgentTemplate, AskUserQuestion, ClaimSkill } from "../protocol.js";
 import type { CommandSandboxMode } from "../config.js";
 
 import { ExecutionRegistry, newLocalExecutionEpoch, type RegisteredRoot } from "./registry.js";
@@ -216,6 +216,24 @@ const REASON_PAUSE = "codex run paused";
 // mirroring sdk-executor's REASON_MAX_ITERATIONS: the loop reached its iteration budget without
 // the lead signalling done.
 const REASON_MAX_ITERATIONS = "codex run reached its implement/review iteration budget without completing";
+const QUESTION_MAX_DEFAULT = 5;
+const QUESTION_IGNORED_NOTICE = "The agent asked a clarifying question alongside a completed workflow action; the question was ignored.";
+const QUESTION_UNWIRED_NOTICE = "The agent asked a clarifying question, but this run has no way to reach a human — it will proceed on its best judgment.";
+const QUESTION_CAP_NOTICE = "The agent has already asked its maximum number of clarifying questions for this run — it will proceed on its best judgment.";
+
+function questionMax(ctx: RunContext): number {
+  const n = ctx.config?.question_max;
+  return typeof n === "number" && Number.isFinite(n) && n > 0 ? Math.floor(n) : QUESTION_MAX_DEFAULT;
+}
+
+function unansweredPrompt(questions: AskUserQuestion[]): string {
+  return `Your questions could not be put to a human on this run:\n\n${questions.map((q) => `- ${q.question}`).join("\n")}\n\nProceed on your best judgment. State the assumption you are making, and do not ask again.`;
+}
+
+function answeredPrompt(questions: AskUserQuestion[], answers: string[]): string {
+  return `The human answered your questions:\n\n${questions.map((q, i) => `Q: ${q.question}\nA: ${answers[i]?.trim() || "(no answer given)"}`).join("\n\n")}\n\nContinue the work with these answers.`;
+}
+
 
 /** The reducer's lead-context hook is a NO-OP for Codex: `CodexHarness.readContext`
  *  returns `undefined` (no characterized context RPC yet), so the reducer never attaches a
@@ -1549,6 +1567,48 @@ export class CodexExecutor implements Executor {
       // plan_md, so without this every implement turn fell back to the queue-time issue text.
       // A run() local, so it survives every later implement turn and new-root epoch recreation.
       let gatedPlan: string | undefined;
+      const questionBudget = { asked: 0 };
+      const maxClarificationRounds = questionMax(ctx) + 1;
+      const emitIgnoredQuestions = (result: ReducedTurnResult): void => {
+        if (result.questions?.length) ctx.emit({ kind: "status", agent: "worker", payload: { text: QUESTION_IGNORED_NOTICE } });
+      };
+      const clarify = async (questions: AskUserQuestion[]): Promise<string> => {
+        if (!ctx.askUser) {
+          ctx.emit({ kind: "status", agent: "worker", payload: { text: QUESTION_UNWIRED_NOTICE } });
+          return unansweredPrompt(questions);
+        }
+        if (questionBudget.asked >= questionMax(ctx)) {
+          ctx.emit({ kind: "status", agent: "worker", payload: { text: QUESTION_CAP_NOTICE } });
+          return unansweredPrompt(questions);
+        }
+        if (ctx.autoApprove) {
+          // The runner emits its existing auto-approval notice and returns a sentinel.
+          // Do not echo that sentinel as a human answer.
+          await ctx.askUser(questions);
+          return unansweredPrompt(questions);
+        }
+        const verdict = await ctx.askUser(questions);
+        if (verdict.kind === "cancel") throw new Error(REASON_CANCEL);
+        questionBudget.asked++;
+        ctx.emit({ kind: "answer", agent: "lead", payload: { answers: verdict.answers } });
+        return answeredPrompt(questions, verdict.answers);
+      };
+      const drivePlan = async (initialPrompt: string) => {
+        let prompt = initialPrompt;
+        for (let round = 0; ; round++) {
+          const turn = await this.driveTurnWithWallPark(ctx, epoch!.harness, reducer, "plan", prompt, epoch!.resumeSessionId, idleMs, wallMs, epoch!.buildPhaseBroker, { completedCount: 0 });
+          if (turn.kind === "walled") return turn;
+          const result = turn.result;
+          if (result.plan?.trim()) {
+            emitIgnoredQuestions(result);
+            return turn;
+          }
+          if (!result.questions?.length) return turn;
+          if (round >= maxClarificationRounds) throw new Error("codex clarification rounds exhausted during planning");
+          const followUp = await clarify(result.questions);
+          prompt = `${followUp}\n\nNow produce the implementation plan and submit it with submit_plan. Do not begin implementing.`;
+        }
+      };
       if (!preApproved && ctx.gatePlan) {
         // The PLAN turn(s) run under PLAN-phase grants: the broker denies every file write
         // (write_denied_in_plan) and child subagents inherit plan-phase grants, so nothing
@@ -1557,7 +1617,7 @@ export class CodexExecutor implements Executor {
         // PRD #1497 M2: drive the plan turn through the wall-park wrapper — a wall trip (the own
         // timer's REASON_WALL, or a `wall` PauseNowSignal) parks the run instead of failing it, even
         // during planning (no completion attempt exists on a Codex run, so its wall trip always parks).
-        const planTurn = await this.driveTurnWithWallPark(ctx, epoch.harness, reducer, "plan", this.planPrompt(ctx), epoch.resumeSessionId, idleMs, wallMs, epoch.buildPhaseBroker, { completedCount: 0 });
+        const planTurn = await drivePlan(this.planPrompt(ctx));
         if (planTurn.kind === "walled") return { branch: ctx.branch, walled: { reason: REASON_WALL } };
         let planResult = planTurn.result;
         let planMd = planResult.plan;
@@ -1575,7 +1635,7 @@ export class CodexExecutor implements Executor {
           }
           revisions++;
           ctx.emit({ kind: "plan_revising", agent: "worker", payload: { round: revisions } });
-          const reviseTurn = await this.driveTurnWithWallPark(ctx, epoch.harness, reducer, "plan", buildRevisePlanPrompt(feedback), epoch.resumeSessionId, idleMs, wallMs, epoch.buildPhaseBroker, { completedCount: 0 });
+          const reviseTurn = await drivePlan(buildRevisePlanPrompt(feedback));
           if (reviseTurn.kind === "walled") return { branch: ctx.branch, walled: { reason: REASON_WALL } };
           planResult = reviseTurn.result;
           planMd = planResult.plan;
@@ -1602,8 +1662,8 @@ export class CodexExecutor implements Executor {
         await old.dispose();
       }
 
-      // Implement ⇄ review loop (bounded). Each iteration drives ONE implement turn under
-      // IMPLEMENT-phase grants on the CURRENT epoch. Off the reducer's per-turn ReducedTurnResult:
+      // Implement ⇄ review loop (bounded). Each iteration drives implementation under
+      // IMPLEMENT-phase grants on the CURRENT epoch; clarification turns stay inside it. Off the reducer's per-turn ReducedTurnResult:
       //   - carry `latestProgress`, overwriting ONLY when the turn reported progress, so a quiet
       //     turn keeps the last known progress rather than blanking it (mirrors sdk-executor);
       //   - carry `lastSessionId` off each turn so a recreated epoch resumes the RIGHT thread;
@@ -1638,12 +1698,26 @@ export class CodexExecutor implements Executor {
         // PRD #1497 M2: drive the implement turn through the wall-park wrapper — a wall trip (the own
         // timer's REASON_WALL, or a `wall` PauseNowSignal) parks the run (capture-first, reusing the
         // runner's captureHoldContext) instead of failing it.
-        const implTurn = await this.driveTurnWithWallPark(ctx, epoch.harness, reducer, "implement", turnPrompt, epoch.resumeSessionId, idleMs, wallMs, epoch.buildPhaseBroker, { completedCount: latestProgress?.completed?.length ?? 0 });
-        if (implTurn.kind === "walled") return { branch: ctx.branch, walled: { reason: REASON_WALL } };
-        const result = implTurn.result;
-        if (result.sessionId) lastSessionId = result.sessionId;
-        // Only overwrite when THIS turn reported progress (a quiet turn keeps the last value).
-        if (result.progress) latestProgress = result.progress;
+        let nextPrompt = turnPrompt;
+        let result: ReducedTurnResult;
+        for (let round = 0; ; round++) {
+          const implTurn = await this.driveTurnWithWallPark(ctx, epoch.harness, reducer, "implement", nextPrompt, epoch.resumeSessionId, idleMs, wallMs, epoch.buildPhaseBroker, { completedCount: latestProgress?.completed?.length ?? 0 });
+          if (implTurn.kind === "walled") return { branch: ctx.branch, walled: { reason: REASON_WALL } };
+          result = implTurn.result;
+          if (result.sessionId) lastSessionId = result.sessionId;
+          // A quiet clarification turn does not erase milestone progress.
+          if (result.progress) latestProgress = result.progress;
+          if (result.done || result.checkpoint) {
+            emitIgnoredQuestions(result);
+            break;
+          }
+          if (!result.questions?.length) break;
+          // With max_iterations=1, clarify inside this same iteration before the cap check.
+          // This improves on Claude's order, which checks its iteration budget first.
+          if (round >= maxClarificationRounds) throw new Error("codex clarification rounds exhausted during implementation");
+          const followUp = await clarify(result.questions);
+          nextPrompt = `${followUp}\n\nContinue the implementation.`;
+        }
         // A cooperative checkpoint that did not also finish: persist BEFORE the reap (so the live
         // session is captured before the provider root dies), reap the CURRENT epoch's roots, then
         // recreate a fresh provider epoch and continue on the NEW root. A turn that is BOTH

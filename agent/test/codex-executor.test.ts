@@ -4306,3 +4306,284 @@ describe("CodexExecutor — safety-steer prefix at the loop top (PRD #1416 M2)",
     assert.ok(text.includes("the approved plan"), "the base implement prompt is unchanged");
   });
 });
+
+// #1584 transport regressions: callbacks are folded by the real broker/harness.
+describe("CodexExecutor clarification turns (#1584)", () => {
+  const question = { question: "Which target?", header: "Target" };
+  const ask = (id: number, th: string, tn: string) =>
+    toolCall(id, "ask_user", { questions: [question] }, th, tn, `c-ask-${id}`);
+  const scripted = (steps: Array<Array<"ask" | "plan" | "done" | "checkpoint">>, th = "th-1"): Responder => (c) => {
+    if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: th } };
+    if (c.method === "turn/start") {
+      const tn = `tn-${c.turnStartCount}`;
+      if (c.turnStartCount === 1) c.transport.push(threadStarted(th));
+      const stepsNow = steps[c.turnStartCount - 1] ?? [];
+      stepsNow.forEach((step, i) => {
+        const id = c.turnStartCount * 10 + i;
+        const note = step === "ask" ? ask(id, th, tn)
+          : toolCall(id, step === "plan" ? "submit_plan" : step === "done" ? "signal_done" : "checkpoint",
+            step === "plan" ? { plan_md: "approved plan" } : {}, th, tn, `c-${step}-${id}`);
+        c.transport.push(note);
+      });
+      c.transport.push(turnCompleted("completed", th, tn));
+      return { turn: { id: tn } };
+    }
+    return {};
+  };
+  const promptTexts = (t: FakeTransport): string[] => t.requests.filter((r) => r.method === "turn/start")
+    .map((r) => (r.params as { input?: { text?: string }[] }).input?.[0]?.text ?? "");
+  const notices = (emitted: EmittedMessage[]): string[] => emitted
+    .filter((m) => m.kind === "status" && m.agent === "worker")
+    .map((m) => String((m.payload as { text?: string }).text ?? ""));
+
+  it("answers a planning question on the same session, then gates only the submitted plan", async () => {
+    const rig = makeMultiEpochRig([scripted([["ask"], ["plan"]], "th-plan"), scripted([["done"]], "th-plan")]);
+    const asked: string[] = [];
+    const gated: string[] = [];
+    let releaseGate!: () => void;
+    let gateStarted!: () => void;
+    const pendingGate = new Promise<void>((resolve) => { releaseGate = resolve; });
+    const gateCall = new Promise<void>((resolve) => { gateStarted = resolve; });
+    const { ctx, emitted } = makeCtx({
+      planApproved: false, approvedPlan: undefined,
+      askUser: async (qs) => { asked.push(qs[0]!.question); return { kind: "answer", answers: ["server"] }; },
+      gatePlan: async (plan) => {
+        gated.push(plan);
+        gateStarted();
+        await pendingGate;
+        return { kind: "approve", selection: { source: "own", agents: [] } } as never;
+      },
+    });
+    const run = withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "plan clarification");
+    await withTimeout(gateCall, 5000, "pending plan gate");
+    const launchesBeforeApproval = rig.providerLaunches();
+    const turnsBeforeApproval = rig.epochs[0]!.transport.turnStartCount;
+    releaseGate();
+    await run;
+    assert.equal(launchesBeforeApproval, 1, "implementation must not launch before approval");
+    assert.equal(turnsBeforeApproval, 2, "only question and plan turns ran");
+    assert.deepEqual(asked, ["Which target?"]);
+    assert.deepEqual(gated, ["approved plan"]);
+    assert.equal(promptTexts(rig.epochs[0]!.transport)[1],
+      "The human answered your questions:\n\nQ: Which target?\nA: server\n\nContinue the work with these answers.\n\nNow produce the implementation plan and submit it with submit_plan. Do not begin implementing.");
+    assert.equal(rig.epochs[0]!.transport.threadStartCount, 1);
+    assert.equal(emitted.filter((m) => m.kind === "answer").length, 1);
+  });
+
+  for (const mode of ["cancel", "unwired", "auto"] as const) {
+    it(`handles a planning question: ${mode}`, async () => {
+      const rig = makeMultiEpochRig([scripted([["ask"], ["plan"]], "th-plan"), scripted([["done"]], "th-plan")]);
+      let gates = 0;
+      let asks = 0;
+      const { ctx, emitted } = makeCtx({
+        planApproved: false, approvedPlan: undefined, autoApprove: mode === "auto",
+        askUser: mode === "unwired" ? undefined : async () => {
+          asks++;
+          if (mode === "auto") {
+            emitted.push({ kind: "status", agent: "worker", payload: { text: "auto notice" } });
+            return { kind: "answer", answers: ["AUTOPILOT_SENTINEL"] };
+          }
+          return { kind: "cancel" };
+        },
+        gatePlan: async () => { gates++; return { kind: "approve", selection: { source: "own", agents: [] } } as never; },
+      });
+      const run = withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, mode);
+      if (mode === "cancel") {
+        await assert.rejects(run, /run cancelled/);
+        assert.equal(gates, 0);
+        assert.equal(rig.epochs[0]!.transport.turnStartCount, 1);
+      } else {
+        await run;
+        assert.equal(gates, 1);
+        assert.equal(promptTexts(rig.epochs[0]!.transport)[1],
+          "Your questions could not be put to a human on this run:\n\n- Which target?\n\nProceed on your best judgment. State the assumption you are making, and do not ask again.\n\nNow produce the implementation plan and submit it with submit_plan. Do not begin implementing.");
+        if (mode === "auto") assert.doesNotMatch(promptTexts(rig.epochs[0]!.transport)[1]!, /AUTOPILOT_SENTINEL/);
+      }
+      assert.equal(asks, mode === "unwired" ? 0 : 1);
+      assert.equal(emitted.filter((m) => m.kind === "answer").length, 0);
+    });
+  }
+
+  it("forwards only the first ten questions across repeated callbacks in one turn", async () => {
+    const responder: Responder = (c) => {
+      if (c.method === "thread/start") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") {
+        const tn = `tn-${c.turnStartCount}`;
+        if (c.turnStartCount === 1) {
+          c.transport.push(threadStarted());
+          for (let i = 1; i <= 25; i++) {
+            c.transport.push(toolCall(i, "ask_user", { questions: [{ question: `Question ${i}?` }] }, "th-1", tn, `c-ask-${i}`));
+          }
+        } else {
+          c.transport.push(toolCall(30, "signal_done", {}, "th-1", tn, "c-done"));
+        }
+        c.transport.push(turnCompleted("completed", "th-1", tn));
+        return { turn: { id: tn } };
+      }
+      return {};
+    };
+    const rig = makeRig({ responder });
+    const asked: string[][] = [];
+    const { ctx } = makeCtx({
+      config: { max_iterations: 1 },
+      askUser: async (qs) => {
+        asked.push(qs.map((q) => q.question));
+        return { kind: "answer", answers: qs.map(() => "yes") };
+      },
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "question cap");
+    assert.deepEqual(asked, [Array.from({ length: 10 }, (_, i) => `Question ${i + 1}?`)]);
+    const followUp = promptTexts(rig.transport)[1]!;
+    const entries = Array.from({ length: 10 }, (_, i) => `Q: Question ${i + 1}?\nA: yes`);
+    assert.equal(followUp,
+      `The human answered your questions:\n\n${entries.join("\n\n")}\n\nContinue the work with these answers.\n\nContinue the implementation.`);
+  });
+
+  it("shares the human cap across planning, revision, and implementation", async () => {
+    const rig = makeMultiEpochRig([
+      scripted([["ask"], ["plan"], ["ask"], ["plan"]], "th-plan"),
+      scripted([["ask"], ["done"]], "th-plan"),
+    ]);
+    let calls = 0;
+    let gates = 0;
+    const { ctx, emitted } = makeCtx({
+      planApproved: false, approvedPlan: undefined, config: { question_max: 2, max_iterations: 1 },
+      askUser: async () => { calls++; return { kind: "answer", answers: ["yes"] }; },
+      gatePlan: async () => {
+        gates++;
+        return gates === 1 ? { kind: "revise", feedback: "revise" }
+          : { kind: "approve", selection: { source: "own", agents: [] } } as never;
+      },
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "shared cap");
+    assert.equal(calls, 2);
+    assert.equal(gates, 2);
+    assert.ok(notices(emitted).some((s) => s.includes("maximum number")));
+    assert.match(promptTexts(rig.epochs[1]!.transport)[1]!, /could not be put to a human/);
+  });
+
+  for (const phase of ["planning", "implementation"] as const) {
+    it(`bounds question-only ${phase} rounds`, async () => {
+      const plan = phase === "planning";
+      const rig = plan
+        ? makeRig({ responder: scripted(Array.from({ length: 5 }, (): Array<"ask"> => ["ask"]), "th-plan") })
+        : makeRig({ responder: scripted(Array.from({ length: 5 }, (): Array<"ask"> => ["ask"])) });
+      const { ctx } = makeCtx({
+        planApproved: !plan, approvedPlan: plan ? undefined : "plan",
+        config: { question_max: 1, max_iterations: 1 },
+        gatePlan: plan ? async () => { throw new Error("question must not gate"); } : undefined,
+      });
+      await assert.rejects(
+        withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "question exhaustion"),
+        new RegExp(`clarification rounds exhausted during ${phase}`),
+      );
+      assert.equal(rig.transport.turnStartCount, 3);
+    });
+  }
+
+  for (const mode of ["answer", "cancel", "unwired", "auto"] as const) {
+    it(`handles an implementation question: ${mode}`, async () => {
+      const rig = makeRig({ responder: scripted([["ask"], ["done"]]) });
+      let calls = 0;
+      const iterations: number[] = [];
+      const checkpoints: boolean[] = [];
+      const { ctx, emitted } = makeCtx({
+        config: { max_iterations: 1 },
+        autoApprove: mode === "auto",
+        askUser: mode === "unwired" ? undefined : async () => {
+          calls++;
+          if (mode === "auto") {
+            emitted.push({ kind: "status", agent: "worker", payload: { text: "auto notice" } });
+            return { kind: "answer", answers: ["AUTOPILOT_SENTINEL"] };
+          }
+          return mode === "cancel" ? { kind: "cancel" } : { kind: "answer", answers: ["use server"] };
+        },
+        reportIteration: async (i) => { iterations.push(i); },
+        checkpoint: async ({ reap }) => { checkpoints.push(reap); },
+      });
+      const run = withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, mode);
+      if (mode === "cancel") {
+        await assert.rejects(run, /run cancelled/);
+        assert.equal(rig.transport.turnStartCount, 1);
+      } else {
+        await run;
+        assert.deepEqual(iterations, [1]);
+        assert.deepEqual(checkpoints, []);
+        const prompt = promptTexts(rig.transport)[1]!;
+        assert.equal(prompt, mode === "answer"
+          ? "The human answered your questions:\n\nQ: Which target?\nA: use server\n\nContinue the work with these answers.\n\nContinue the implementation."
+          : "Your questions could not be put to a human on this run:\n\n- Which target?\n\nProceed on your best judgment. State the assumption you are making, and do not ask again.\n\nContinue the implementation.");
+        if (mode === "auto") assert.doesNotMatch(prompt, /AUTOPILOT_SENTINEL/);
+      }
+      assert.equal(calls, mode === "answer" || mode === "cancel" || mode === "auto" ? 1 : 0);
+      assert.equal(emitted.filter((m) => m.kind === "answer").length, mode === "answer" ? 1 : 0);
+      if (mode === "unwired") assert.ok(notices(emitted).some((s) => s.includes("no way to reach a human")));
+    });
+  }
+
+  for (const signals of [["done", "ask"], ["checkpoint", "ask"], ["done", "checkpoint", "ask"]] as const) {
+    it(`ignores a question alongside ${signals.join("+")}`, async () => {
+      const checkpointFirst = signals[0] === "checkpoint";
+      const rig = checkpointFirst
+        ? makeMultiEpochRig([scripted([["checkpoint", "ask"]]), scripted([["done"]])])
+        : makeRig({ responder: scripted([signals as unknown as Array<"ask" | "done" | "checkpoint">]) });
+      let asks = 0;
+      const checkpoints: boolean[] = [];
+      const { ctx, emitted } = makeCtx({
+        askUser: async () => { asks++; return { kind: "answer", answers: ["bad"] }; },
+        checkpoint: async ({ reap }) => { checkpoints.push(reap); },
+        config: { max_iterations: 1 },
+      });
+      await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "ignored question");
+      assert.equal(asks, 0);
+      assert.equal(notices(emitted).filter((s) => s.includes("question was ignored")).length, 1);
+      assert.deepEqual(checkpoints, checkpointFirst ? [true] : []);
+    });
+  }
+
+  it("denies a child's ask_user without parking or folding its question", async () => {
+    const agents: AgentTemplate[] = [
+      { name: "lead", description: "lead", prompt_body: "lead body", tools: null, skills: [] },
+      { name: "coder", description: "coder", prompt_body: "coder body", tools: null, skills: [] },
+    ];
+    const responder: Responder = (c) => {
+      if (c.method === "thread/start") return { thread: { id: c.threadStartCount === 1 ? "th-1" : "th-child" } };
+      if (c.method === "turn/start") {
+        if (c.turnStartCount === 1) return { turn: { id: "tn-1" } };
+        c.transport.push(ask(12, "th-child", "tn-child"))
+          .push(turnCompleted("completed", "th-child", "tn-child"));
+        return { turn: { id: "tn-child" } };
+      }
+      return {};
+    };
+    const rig = makeRig({ responder });
+    rig.transport.push(threadStarted()).push(toolCall(1, "spawn_agent", { role: "coder", prompt: "help" }, "th-1", "tn-1", "c-root"));
+    let asks = 0;
+    const { ctx, emitted } = makeCtx({
+      agents,
+      askUser: async () => { asks++; return { kind: "answer", answers: ["wrong"] }; },
+    });
+    const run = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    await waitFor(() => rig.transport.responses.some((r) => r.requestId === 1), "child reply");
+    rig.transport.push(signalDone()).push(turnCompleted()).end();
+    await withTimeout(run, 5000, "child question denial");
+    assert.equal(rec(rec(rig.transport.responses.find((r) => r.requestId === 12)?.response).result).success, false);
+    assert.equal(asks, 0);
+    assert.equal(emitted.filter((m) => m.kind === "answer").length, 0);
+  });
+
+  it("gates a plan alongside a question without asking or counting it", async () => {
+    const rig = makeMultiEpochRig([scripted([["plan", "ask"]], "th-plan"), scripted([["done"]], "th-plan")]);
+    let asks = 0;
+    let gates = 0;
+    const { ctx, emitted } = makeCtx({
+      planApproved: false, approvedPlan: undefined,
+      askUser: async () => { asks++; return { kind: "answer", answers: ["bad"] }; },
+      gatePlan: async () => { gates++; return { kind: "approve", selection: { source: "own", agents: [] } } as never; },
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "plan and question");
+    assert.equal(asks, 0);
+    assert.equal(gates, 1);
+    assert.equal(notices(emitted).filter((s) => s.includes("question was ignored")).length, 1);
+  });
+});
