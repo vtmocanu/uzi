@@ -5,7 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { BoundaryProcessHandle, BoundaryProcessRequest } from "../src/harness.js";
-import { TickSpawner, argvClass } from "../src/tick-spawner.js";
+import { TickSpawner, argvClass, killProbeSaysGone, processGroupAlive } from "../src/tick-spawner.js";
 
 // issue #1597 M2 — the mid-turn checkpoint tick's spawner: own process group per child, SIGTERM
 // then SIGKILL after a grace, `completed` only after exit, settled(), and PROVEN-ownership lock
@@ -194,6 +194,42 @@ ${exitAfterMs === undefined ? "setInterval(() => {}, 1000);" : `setTimeout(() =>
     await sp.settled();
     assert.equal(ac.signal.aborted, false);
     assert.equal(alive(sp.pids()[0]!), false);
+  });
+
+  it("a group that survives SIGKILL past the bounded wait is reported by survivors(); settled() still resolves", async () => {
+    const ac = new AbortController();
+    let forceAlive = true;
+    const sp = new TickSpawner({
+      signal: ac.signal,
+      killGraceMs: 100,
+      hooks: { groupAlive: () => (forceAlive ? true : undefined) },
+    });
+    const h = await sp.spawn(req([NODE, "-e", "process.exit(0)"]));
+    await h.completed;
+    await sp.settled();
+    assert.deepEqual(sp.survivors(), [{ pgid: sp.pids()[0], identity: "worker_pat" }]);
+    forceAlive = false;
+  });
+
+  it("processGroupAlive: a live group is alive, an exited one is gone", async () => {
+    const c = spawn(NODE, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
+    try {
+      assert.equal(processGroupAlive(c.pid!, "worker_pat"), true);
+    } finally {
+      process.kill(-c.pid!, "SIGKILL");
+    }
+    await new Promise((r) => c.once("exit", r));
+    const deadline = Date.now() + 3_000;
+    while (processGroupAlive(c.pid!, "worker_pat") && Date.now() < deadline) await new Promise((r) => setTimeout(r, 20));
+    assert.equal(processGroupAlive(c.pid!, "worker_pat"), false);
+  });
+
+  it("killProbeSaysGone: only a clean 'No such process' means gone; a permission or spawn failure is alive", () => {
+    assert.equal(killProbeSaysGone(1, "kill: (-4242): No such process\n"), true);
+    assert.equal(killProbeSaysGone(0, ""), false);
+    assert.equal(killProbeSaysGone(1, "kill: (-4242): Operation not permitted\n"), false);
+    assert.equal(killProbeSaysGone(null, ""), false);
+    assert.equal(killProbeSaysGone(1, ""), false);
   });
 
   it("argvClass names the git subcommand without paths or config values", () => {

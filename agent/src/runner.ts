@@ -16,7 +16,13 @@ import type { Executor, ExecutorResult, RunContext, WallParkOutcome, WallParkRef
 import { PlanRejectedError } from "./executor.js";
 import type { BoundaryPermit, BoundaryRequest } from "./harness.js";
 import { SinkGate } from "./sink-gate.js";
-import { TickSpawner, type RetainedLock, type TickSpawnerTestHooks } from "./tick-spawner.js";
+import {
+  TickSpawner,
+  processGroupAlive,
+  type RetainedLock,
+  type SurvivingGroup,
+  type TickSpawnerTestHooks,
+} from "./tick-spawner.js";
 import { skillsPluginDir } from "./skills-plugin.js";
 import { describeLimit, LimitReachedError } from "./limit.js";
 import type { Logger } from "./log.js";
@@ -926,6 +932,10 @@ interface RunFlight {
    *  ticks skip (`bare_lock_retained`) and a shutdown checkpoint that does not land names that
    *  class; entries whose file is gone are dropped. */
   retainedBareLocks: string[];
+  /** issue #1597 M2: tick child process groups that were still alive after their SIGKILL and the
+   *  bounded settlement wait. They block the sink exactly like a retained lock (same
+   *  `bare_lock_retained` class) while any member is still alive; gone groups are dropped. */
+  survivingTickGroups: SurvivingGroup[];
   /** issue #1597 M2 (round 3): a milestone publish was DEFERRED out of a Codex permit
    *  (`scan_deferred`) and is owed — the next overlay-less checkpoint outside a permit publishes
    *  regardless of the time gate; cleared by any non-aborted scan+publish attempt outside a permit
@@ -4997,6 +5007,7 @@ export class RunRunner {
       // latch a cancelled tick sets when it had to RETAIN a lock file in the worker bare.
       sinkGate: new SinkGate(),
       retainedBareLocks: [],
+      survivingTickGroups: [],
       pendingPublish: false,
       // PRD #218 M1: the run's branch, hoisted so the park/shutdown fetch-back in the
       // catch can name it. `runnerClone` is declared inside the try and there is no
@@ -6938,6 +6949,19 @@ export class RunRunner {
    * episode). lstat only; any error other than ENOENT keeps the entry (cannot prove it is gone).
    */
   private async retainedBareLockRemains(flight: RunFlight): Promise<boolean> {
+    if (flight.survivingTickGroups.length > 0) {
+      // A tick process that outlived its SIGKILL may still write the bare or the clone: block the
+      // sink while any member of its group is alive (the probe fails safe: unknown = alive).
+      const alive = flight.survivingTickGroups.filter((g) => processGroupAlive(g.pgid, g.identity));
+      if (alive.length === 0) {
+        flight.runLog.info("mid-turn checkpoint sink unblocked: the surviving tick process group(s) are gone", {
+          run_id: flight.runId,
+          pgids: flight.survivingTickGroups.map((g) => g.pgid),
+        });
+      }
+      flight.survivingTickGroups = alive;
+      if (alive.length > 0) return true;
+    }
     if (flight.retainedBareLocks.length === 0) return false;
     const still: string[] = [];
     for (const p of flight.retainedBareLocks) {
@@ -7101,7 +7125,7 @@ export class RunRunner {
           argv_class: r.argvClass,
         })),
       });
-      const wasBlocked = flight.retainedBareLocks.length > 0;
+      const wasBlocked = flight.retainedBareLocks.length > 0 || flight.survivingTickGroups.length > 0;
       for (const r of res.retained) {
         if (!flight.retainedBareLocks.includes(r.path)) flight.retainedBareLocks.push(r.path);
       }
@@ -7112,6 +7136,27 @@ export class RunRunner {
           kind: "status",
           agent: "worker",
           payload: { text: "mid-turn checkpoint sink blocked: a git lock file remains in the worker repository" },
+        });
+      }
+      return true;
+    };
+
+    /** Record tick process groups that survived their SIGKILL; true when any did (sink blocked). */
+    const handleSurvivors = (survivors: readonly SurvivingGroup[]): boolean => {
+      if (survivors.length === 0) return false;
+      runLog.warn("mid-turn checkpoint: a tick process group survived its SIGKILL; blocking the sink", {
+        run_id: runId,
+        pgids: survivors.map((g) => g.pgid),
+      });
+      const wasBlocked = flight.retainedBareLocks.length > 0 || flight.survivingTickGroups.length > 0;
+      for (const g of survivors) {
+        if (!flight.survivingTickGroups.some((x) => x.pgid === g.pgid)) flight.survivingTickGroups.push(g);
+      }
+      if (!wasBlocked) {
+        batcher.emit({
+          kind: "status",
+          agent: "worker",
+          payload: { text: "mid-turn checkpoint sink blocked: a checkpoint process survived being stopped" },
         });
       }
       return true;
@@ -7187,6 +7232,7 @@ export class RunRunner {
       const beforeLockRelease = async (key: string): Promise<void> => {
         if (key !== barePath || !ac.signal.aborted) return;
         await spawner.settled();
+        if (handleSurvivors(spawner.survivors())) retainedHere = true;
         if (handleLocks(await spawner.reconcileLocks())) retainedHere = true;
       };
       const release = flight.sinkGate.tryAcquire(() => ac.abort());
@@ -7226,6 +7272,7 @@ export class RunRunner {
         // FULL settlement before the gate is released: every child exited, then lock custody for a
         // child cancelled outside a withLock section (pack-objects, rev-parse), under the bare lock.
         await spawner.settled();
+        if (handleSurvivors(spawner.survivors())) retainedHere = true;
         if (spawner.cancelledAny()) {
           const res = await this.git
             .withBareLock(barePath, () => spawner.reconcileLocks())

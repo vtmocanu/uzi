@@ -35,6 +35,38 @@ import type { BoundaryProcessHandle, BoundaryProcessRequest } from "./harness.js
 import type { Logger } from "./log.js";
 import { runnerCommand, uidSplitActive } from "./runner-uid.js";
 
+/** A tick child's process group that was still alive after its SIGKILL and the bounded wait. */
+export interface SurvivingGroup {
+  pgid: number;
+  identity: BoundaryProcessRequest["identity"];
+}
+
+/**
+ * True while any member of process group `pgid` is alive. Fails SAFE: only a definite "no such
+ * process" counts as gone. Directly, EPERM (a member runs as another uid) is alive; under the uid
+ * split an identity-`command` group is probed as the runner uid, and a non-zero `kill -0` counts as
+ * gone only when kill says so (a permission or any other failure counts as alive).
+ */
+export function processGroupAlive(pgid: number, identity: BoundaryProcessRequest["identity"]): boolean {
+  if (identity === "command" && uidSplitActive()) {
+    const w = runnerCommand("kill", ["-0", `-${pgid}`]);
+    const r = spawnSync(w.command, w.args, { stdio: ["ignore", "ignore", "pipe"], encoding: "utf8" });
+    return !killProbeSaysGone(r.status, String(r.stderr ?? ""));
+  }
+  try {
+    process.kill(-pgid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
+
+/** A `kill -0 -<pgid>` result means the group is GONE only on a clean "no such process"; exit 0,
+ *  a permission failure, a spawn failure (null status) or any other error all count as alive. */
+export function killProbeSaysGone(status: number | null, stderr: string): boolean {
+  return status !== 0 && status !== null && /no such process/i.test(stderr);
+}
+
 /** SIGTERM → SIGKILL grace for a cancelled tick child. */
 const DEFAULT_KILL_GRACE_MS = 2_000;
 /** How often a leader-less process group is probed for remaining members. */
@@ -89,6 +121,9 @@ export interface TickSpawnerTestHooks {
   /** Runs at the start of a reconcile that has work to do (a cancelled child to reconcile), after
    *  every such child exited — lets a test replace a lock file between exit and the re-check. */
   beforeReconcile?: () => Promise<void>;
+  /** Override the process-group liveness probe (return undefined to use the real one). Lets a test
+   *  model a group that survives SIGKILL, which no real test process can do. */
+  groupAlive?: (pgid: number) => boolean | undefined;
 }
 
 export interface TickSpawnerOptions {
@@ -230,9 +265,10 @@ export class TickSpawner {
     }
   }
 
-  /** Leader pids whose process group still had live members when the bounded wait gave up. */
-  survivors(): number[] {
-    return this.all.filter((t) => t.survived).map((t) => t.pid);
+  /** Process groups that still had live members when the bounded wait gave up. Settlement does not
+   *  wait for them forever, so the caller must treat them as blocking the sink. */
+  survivors(): SurvivingGroup[] {
+    return this.all.filter((t) => t.survived).map((t) => ({ pgid: t.pid, identity: t.identity }));
   }
 
   /** True when any child had to be signalled by a cancellation (so lock reconcile is due). */
@@ -329,19 +365,8 @@ export class TickSpawner {
     return snap;
   }
 
-  /** True while any member of the child's process group is alive. EPERM (a member exists but runs
-   *  as another uid) counts as alive; under the uid split the probe runs as the runner uid. */
   private groupAlive(t: Tracked): boolean {
-    if (t.identity === "command" && uidSplitActive()) {
-      const w = runnerCommand("kill", ["-0", `-${t.pid}`]);
-      return spawnSync(w.command, w.args, { stdio: "ignore" }).status === 0;
-    }
-    try {
-      process.kill(-t.pid, 0);
-      return true;
-    } catch (e) {
-      return (e as NodeJS.ErrnoException).code === "EPERM";
-    }
+    return this.opts.hooks?.groupAlive?.(t.pid) ?? processGroupAlive(t.pid, t.identity);
   }
 
   /** After the leader exited: wait for its group to empty. Members still alive after the grace are

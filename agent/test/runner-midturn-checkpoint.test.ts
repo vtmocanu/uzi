@@ -1255,6 +1255,73 @@ describe("mid-turn checkpoint lock custody (issue #1597 M2)", () => {
     }
   });
 
+  it("(i) survivor: a tick process group that outlives its SIGKILL blocks the sink until it is gone", async () => {
+    const tmp = scratchDir("survivor");
+    const shim = writeShim(tmp, "detect");
+    const iid = 1597_235;
+    const g = mkGit(fx.dataDir, shim);
+    const stubborn = stubbornScript(tmp);
+    // No real process survives SIGKILL: force the spawner's group probe to say "alive" for the
+    // cancelled fetch child, so settlement gives up after its bounded wait and reports it.
+    let forceAlive = true;
+    const ctl = control({
+      tickSpawn: { rewrite: fetchBecomes(stubborn), groupAlive: () => (forceAlive ? true : undefined) },
+      tickKillGraceMs: 300,
+    });
+    const pub = stubPublish(async (_n, _tip, pack) => {
+      await drain(pack);
+      return { ok: true };
+    });
+    const { logger, lines: rawLines } = recordingLogger();
+    const lines = rawLines as Array<Record<string, unknown>>;
+    const claim = gitlabClaim(iid);
+    const later: string[] = [];
+    let runner: RunRunner | undefined;
+    let p: Promise<unknown> | undefined;
+    try {
+      runner = mkRunner(
+        g,
+        blockingTurn(async (ctx) => {
+          commitIn(ctx.worktreePath, "S.txt", "s\n");
+          ctl.advance(INTERVAL_MS + 1);
+          ctl.fireNoWait();
+          await waitFor(() => isReady(stubborn));
+          await ctx.checkpoint!({ reap: false }); // preempts the tick, which is cancelled
+          assert.equal(ctl.outcomes[0], "bare_lock_retained", "a survivor blocks the sink for its own tick");
+          // The flight re-checks the group with the REAL probe: the SIGKILLed child is gone.
+          forceAlive = false;
+          ctl.advance(INTERVAL_MS + 1);
+          later.push(await ctl.fire());
+        }),
+        ctl,
+        {},
+        logger,
+      );
+      p = runner.execute(claim);
+      await waitFor(() => later.length === 1, 20_000);
+      runner.shutdown();
+      await p;
+      assert.notEqual(later[0], "bare_lock_retained", "the sink unblocks once the surviving group is gone");
+      assert.ok(
+        lines.some((l) => l.msg === "mid-turn checkpoint: a tick process group survived its SIGKILL; blocking the sink"),
+        "the survivor was logged",
+      );
+      assert.ok(
+        lines.some((l) => l.msg === "mid-turn checkpoint sink unblocked: the surviving tick process group(s) are gone"),
+        "the unblock was logged",
+      );
+      const feed = statusTexts(claim.run_id);
+      assert.equal(
+        feed.filter((t) => t === "mid-turn checkpoint sink blocked: a checkpoint process survived being stopped").length,
+        1,
+        JSON.stringify(feed),
+      );
+    } finally {
+      forceAlive = false;
+      await settleAndClean({ ctl, runners: runner ? [runner] : [], running: [p], restore: pub.restore, paths: [tmp] });
+    }
+  });
+
   it("(i) replaced: the child held the lock but after its exit the path is a different inode — RETAINED", { skip: NEEDS_PROC }, async () => {
     const tmp = scratchDir("replaced");
     const shim = writeShim(tmp, "detect");
