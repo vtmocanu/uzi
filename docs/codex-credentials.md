@@ -34,14 +34,15 @@ use the **OpenAI API key** field beside it for that.
 
 ## 1. Sign in with a login dedicated to uzi
 
-**Don't paste your everyday Codex CLI login.** Codex rotates the refresh
-token on every refresh and rewrites `auth.json` in place, and OpenAI's own
-[Codex CI/CD auth guidance](https://learn.chatgpt.com/docs/auth/ci-cd-auth)
+**Don't paste your everyday Codex CLI login.** Codex *can* rotate the
+refresh token on a refresh and rewrite `auth.json` in place when it does,
+and OpenAI's own [Codex CI/CD auth guidance](https://learn.chatgpt.com/docs/auth/ci-cd-auth)
 recommends one `auth.json` per runner: if your local Codex CLI and uzi share
-one login, whichever side refreshes first invalidates the token the other
-side is still holding, and a re-paste from the file your local CLI keeps
-using will break one side or the other again. uzi is a second, independent
-runner, so it needs its own isolated login, not a copy of yours.
+one login, a refresh on either side can leave the other holding a stale
+copy of a rotated token, and a re-paste from the file your local CLI keeps
+using can break one side or the other again. A dedicated, isolated login
+avoids this shared-copy failure mode — uzi is a second, independent runner,
+so it needs its own login, not a copy of yours.
 
 Run this in a fresh shell. It signs in to a throwaway `CODEX_HOME`, verifies
 the login actually produced a usable file-based credential, and copies only
