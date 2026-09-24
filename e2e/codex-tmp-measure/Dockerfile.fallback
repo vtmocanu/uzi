@@ -1,0 +1,55 @@
+# PRD #1598 M5 boundary measurement — FALLBACK minimal image.
+#
+# This is NOT the real worker image (agent/templates/base/Dockerfile): building
+# that image bakes a full nix + devbox toolchain that does not fit this box's
+# disk budget (see run.sh / README.md "deviation"). This fallback builds the
+# REAL uzi-codex-supervisor and uzi-codex-command-sandbox from the exact
+# sources at the ref under measurement (build context is that ref's
+# agent/codex/supervisor directory, vendored, so no network is needed for the
+# supervisor's own build), on a plain golang:1.26-alpine base, with the same
+# three runtime uids the real worker image creates (PRD #51 A1 / PRD #1171 M1).
+#
+# The numbers this produces are a PROXY: real /tmp, cache and network behavior
+# under the real supervisor + sandbox binaries, but without the real worker's
+# read-only root, capability drop, seccomp profile, or nix-provisioned Go
+# toolchain version pinning.
+#
+# Build context is the WHOLE ref checkout (run.sh's detached worktree), because
+# the docker CLI here talks to a possibly-remote/sibling daemon over
+# DOCKER_HOST (no shared host filesystem to bind-mount from at run time — see
+# README.md "Why everything is baked into the image"): the API module under
+# test and the driver script are baked in at BUILD time instead, and the
+# per-run writable copy is made from the baked-in reference at container start.
+FROM golang:1.26-alpine
+
+# util-linux setpriv (the busybox applet cannot --reuid, same guard the real
+# Dockerfile uses); bash for the driver; coreutils/git for measurement + go.
+RUN apk add --no-cache bash util-linux coreutils git \
+    && setpriv --help 2>&1 | grep -q -- --reuid
+
+# The three runtime uids (mirrors agent/templates/base/Dockerfile exactly).
+RUN addgroup -g 10001 worker && adduser -u 10001 -G worker -h /home/worker -D worker \
+    && addgroup -g 10002 runner && adduser -u 10002 -G runner -h /home/runner -D runner \
+    && addgroup -g 10003 runner-cmd && adduser -u 10003 -G runner-cmd -h /home/runner-cmd -D runner-cmd \
+    && addgroup worker runner \
+    && addgroup runner-cmd runner
+
+WORKDIR /src/supervisor
+COPY agent/codex/supervisor/ .
+# CGO_ENABLED=0: a statically linked binary, same as the real image's build
+# (doc.go: "STATICALLY LINKED Go binary (CGO_ENABLED=0 ...)"). -mod=vendor: the
+# module vendors its own (small) dependency, golang.org/x/sys, so this build
+# needs no network. The cmdsandbox subpackage is built the same way; on the
+# base ref it has no --cache flag, on the branch ref it does — both build
+# fine from source as-is.
+RUN CGO_ENABLED=0 go build -mod=vendor -o /usr/local/bin/uzi-codex-supervisor . \
+    && CGO_ENABLED=0 go build -mod=vendor -o /usr/local/bin/uzi-codex-command-sandbox ./cmdsandbox \
+    && chmod 0555 /usr/local/bin/uzi-codex-supervisor /usr/local/bin/uzi-codex-command-sandbox
+
+# The API module under test, baked in read-only; the driver copies it to a
+# writable, uid-10003-owned tree at container start (see measure-inner.sh).
+COPY api/ /work/api-src/
+COPY e2e/codex-tmp-measure/measure-inner.sh /measure-inner.sh
+RUN chmod 0755 /measure-inner.sh
+
+WORKDIR /
