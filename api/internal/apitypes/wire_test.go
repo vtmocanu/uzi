@@ -1194,3 +1194,23 @@ func TestRecoveryWorkerRPCTags(t *testing.T) {
 		RecoverySettleResponse{Reason: "r", FinalHeadSha: "h"},
 		"run_id", "hold_id", "outcome", "reason", "final_head_sha")
 }
+
+// TestRecoverySettleReasonValues pins the settle outcome and reason STRINGS (issue #1582 M1):
+// the worker branches on them (candidate_mismatch and branch_missing are terminal,
+// ancestry_unknown is retryable), so a renamed value is a protocol break, not a refactor.
+func TestRecoverySettleReasonValues(t *testing.T) {
+	for got, want := range map[string]string{
+		RecoverySettleReleased:          "released",
+		RecoverySettleRetained:          "retained",
+		RecoverySettleAncestryUnknown:   "ancestry_unknown",
+		RecoverySettleNotAncestor:       "not_ancestor",
+		RecoverySettleStateChanged:      "state_changed",
+		RecoverySettleNotEligible:       "not_eligible",
+		RecoverySettleCandidateMismatch: "candidate_mismatch",
+		RecoverySettleBranchMissing:     "branch_missing",
+	} {
+		if got != want {
+			t.Errorf("settle wire value = %q, want %q", got, want)
+		}
+	}
+}

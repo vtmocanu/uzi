@@ -15,7 +15,8 @@
 --   2. Six nullable AUDIT columns recording the exact evidence an 'ancestry' release rested on:
 --      the three candidate SHAs, the branch head the api read (release_final_head_sha), the
 --      successor generation that completed, and the completed branch. Each SHA is CHECKed to a
---      40-char lowercase hex object id; the branch is length-bounded.
+--      40-char lowercase hex object id, the successor generation to be positive, and the branch
+--      is length-bounded.
 --   3. An all-or-nothing CHECK: an 'ancestry' release carries all six audit columns, so a
 --      partial row (evidence without its proof) is refused by the database, not just the code.
 --
@@ -50,6 +51,9 @@ ALTER TABLE recovery_custody_holds ADD CONSTRAINT recovery_custody_holds_release
     CHECK (release_final_head_sha IS NULL OR release_final_head_sha ~ '^[0-9a-f]{40}$');
 ALTER TABLE recovery_custody_holds ADD CONSTRAINT recovery_custody_holds_release_branch_check
     CHECK (release_branch IS NULL OR (length(release_branch) BETWEEN 1 AND 255));
+-- A successor generation is strictly newer than a predecessor generation (>= 1), so always positive.
+ALTER TABLE recovery_custody_holds ADD CONSTRAINT recovery_custody_holds_release_successor_generation_check
+    CHECK (release_successor_generation IS NULL OR release_successor_generation > 0);
 
 ALTER TABLE recovery_custody_holds ADD CONSTRAINT recovery_custody_holds_ancestry_audit_check
     CHECK (release_evidence IS DISTINCT FROM 'ancestry' OR (
@@ -69,6 +73,7 @@ ALTER TABLE recovery_custody_holds ADD CONSTRAINT recovery_custody_holds_ancestr
 -- state and released_at are untouched).
 ALTER TABLE recovery_custody_holds DROP CONSTRAINT recovery_custody_holds_ancestry_audit_check;
 ALTER TABLE recovery_custody_holds DROP CONSTRAINT recovery_custody_holds_release_branch_check;
+ALTER TABLE recovery_custody_holds DROP CONSTRAINT recovery_custody_holds_release_successor_generation_check;
 ALTER TABLE recovery_custody_holds DROP CONSTRAINT recovery_custody_holds_release_final_head_sha_check;
 ALTER TABLE recovery_custody_holds DROP CONSTRAINT recovery_custody_holds_release_adopted_sha_check;
 ALTER TABLE recovery_custody_holds DROP CONSTRAINT recovery_custody_holds_release_source_sha_check;

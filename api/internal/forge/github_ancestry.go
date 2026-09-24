@@ -5,8 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
+
+	gh "github.com/google/go-github/v91/github"
 )
 
 // githubBranchHeadBody is the ONLY part of GET /repos/{o}/{r}/branches/{branch} that
@@ -27,36 +30,46 @@ type githubCompareBody struct {
 	Status *string `json:"status"`
 }
 
-// githubGetBounded issues an authenticated GET through go-github's BareDo (so the
-// primary/secondary rate-limit shapes are classified exactly as every other GitHub
-// call: a 403-with-remaining-0 or a 429 surfaces as *RateLimitError) and reads the
-// body under a hard ceiling. It returns the HTTP status alongside any error so the
-// caller can recognise a 404 before redaction.
+// githubGetBounded issues an authenticated GET for the ancestry surface and reads the
+// body under a hard ceiling. The request is BUILT by go-github (base URL, Accept,
+// User-Agent, API-version headers) but SENT through g.ancClient, which refuses every
+// redirect: go-github's own client re-adds the Bearer PAT on each hop through its auth
+// transport, so a followed redirect would replay the PAT to the redirect target and
+// read that host's answer as proof. Any 3xx is therefore an error. Other statuses are
+// classified by gh.CheckResponse, the classifier BareDo uses, so a
+// 403-with-remaining-0 or a 429 still surfaces as the neutral *RateLimitError via
+// wrapErr. It returns the HTTP status alongside any error so the caller can recognise
+// a 404 before redaction.
 func (g *github) githubGetBounded(ctx context.Context, op, path string, limit int64) (int, []byte, error) {
 	req, err := g.client.NewRequest(ctx, http.MethodGet, path, nil)
 	if err != nil {
 		return 0, nil, g.wrapErr(op, err)
 	}
-	resp, err := g.client.BareDo(req)
-	status := 0
-	if resp != nil && resp.Response != nil {
-		status = resp.StatusCode
-	}
+	req.Header.Set("Authorization", "Bearer "+g.token)
+	resp, err := g.ancClient.Do(req)
 	if err != nil {
-		return status, nil, g.wrapErr(op, err)
+		return 0, nil, g.wrapErr(op, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode/100 == 3 {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
+		return resp.StatusCode, nil, g.wrapErr(op, fmt.Errorf("refusing to follow a redirect (status %d)", resp.StatusCode))
+	}
+	if err := gh.CheckResponse(resp); err != nil {
+		return resp.StatusCode, nil, g.wrapErr(op, err)
+	}
 	body, err := readBounded(resp.Body, limit)
 	if err != nil {
-		return status, nil, g.wrapErr(op, err)
+		return resp.StatusCode, nil, g.wrapErr(op, err)
 	}
-	return status, body, nil
+	return resp.StatusCode, body, nil
 }
 
 // BranchHead implements Forge (issue #1582 M1). GET /repos/{o}/{r}/branches/{branch},
-// reader-gated like DefaultBranchProtection's call. A 404 is ErrRefNotFound. go-github's
-// BareDo follows GitHub's rename 301 to the NEW branch, so the returned `name` must equal
-// the requested branch — a renamed branch is an error, never another branch's head.
+// reader-gated like DefaultBranchProtection's call. A 404 is ErrRefNotFound. A redirect
+// (GitHub answers a renamed branch with a 301 to the NEW name) is never followed and is an
+// error; the returned `name` must still equal the requested branch, so an answer naming
+// another branch is an error too, never another branch's head.
 func (g *github) BranchHead(ctx context.Context, projectID int64, branch string) (string, error) {
 	if branch == "" {
 		return "", errors.New("github: branch head: empty branch name")

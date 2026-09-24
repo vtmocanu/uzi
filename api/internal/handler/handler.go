@@ -1224,8 +1224,12 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// PRD #1349 M1: the post-clone generation-exact hold inventory for this worker's run.
 		r.Get("/runs/{id}/recovery-holds", h.WorkerListRecoveryHolds)
 		// Issue #1582 M1: settle ONE older-generation hold on a completed run by the api's own
-		// forge ancestry proof. The worker supplies candidate SHAs only (strict decode).
-		r.Post("/runs/{id}/recovery-holds/{holdID}/settle", h.WorkerSettleRecoveryHold)
+		// forge ancestry proof. The worker supplies candidate SHAs only (strict decode). Each
+		// call that reaches the proof spends the OWNER's forge quota (one branch-head read plus
+		// up to three compares, six on Forgejo, which asks both directions), so it reuses the
+		// per-worker proposal limiter, keyed by (route pattern, worker id): a looping worker
+		// cannot burn the owner's forge budget, and the budget is separate from proposals'.
+		r.With(proposalLimiter.PerWorkerMiddleware).Post("/runs/{id}/recovery-holds/{holdID}/settle", h.WorkerSettleRecoveryHold)
 	})
 }
 

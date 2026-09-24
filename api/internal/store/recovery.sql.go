@@ -503,6 +503,37 @@ func (q *Queries) GetRecoverySummaryForRun(ctx context.Context, arg GetRecoveryS
 	return i, err
 }
 
+const getSettleCompletionPermitHead = `-- name: GetSettleCompletionPermitHead :one
+SELECT head FROM run_completion_permits
+WHERE run_id = $1
+  AND contract_revision = $2
+  AND issued_by_worker_id = $3::uuid
+  AND consumed_at IS NOT NULL
+ORDER BY consumed_at DESC, id DESC
+LIMIT 1
+`
+
+type GetSettleCompletionPermitHeadParams struct {
+	RunID            uuid.UUID `json:"run_id"`
+	ContractRevision int32     `json:"contract_revision"`
+	WorkerID         uuid.UUID `json:"worker_id"`
+}
+
+// Issue #1582 M1 rework: the head of the completion permit an INTERLOCKED run's completion
+// consumed — the server-held fact the predecessor-settle request's pushed_sha must match.
+// completeRunWithPermit consumes exactly one permit for (run, the LOCKED row's
+// contract_revision, head) in the same transaction that writes 'completed', fenced to the
+// completing worker. InvalidatePriorCompletionPermits also stamps consumed_at, but only on
+// revisions BELOW the one a decision bumped to, so at the run's current revision every
+// consumed permit was consumed by a completion; the newest is the final completion's.
+// pgx.ErrNoRows when none exists (a non-interlocked run never has one).
+func (q *Queries) GetSettleCompletionPermitHead(ctx context.Context, arg GetSettleCompletionPermitHeadParams) (string, error) {
+	row := q.db.QueryRow(ctx, getSettleCompletionPermitHead, arg.RunID, arg.ContractRevision, arg.WorkerID)
+	var head string
+	err := row.Scan(&head)
+	return head, err
+}
+
 const insertCaptureChunk = `-- name: InsertCaptureChunk :exec
 INSERT INTO recovery_capture_chunks (capture_id, chunk_index, length, sealed)
 VALUES ($1, $2, $3, $4)
@@ -557,6 +588,36 @@ func (q *Queries) ListCaptureChunks(ctx context.Context, captureID uuid.UUID) ([
 			return nil, err
 		}
 		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listCaptureSourceShasForHold = `-- name: ListCaptureSourceShasForHold :many
+SELECT DISTINCT source_sha FROM recovery_captures
+WHERE hold_id = $1
+ORDER BY source_sha
+`
+
+// Issue #1582 M1 rework: the source_sha values of every recovery capture registered under ONE
+// hold — the server-held facts the predecessor-settle request's source_sha must match (a
+// capture's source_sha is the predecessor's committed head H, recorded when the capture was
+// reserved). Empty when the hold never captured; the service then has nothing to bind to.
+func (q *Queries) ListCaptureSourceShasForHold(ctx context.Context, holdID uuid.UUID) ([]string, error) {
+	rows, err := q.db.Query(ctx, listCaptureSourceShasForHold, holdID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []string{}
+	for rows.Next() {
+		var source_sha string
+		if err := rows.Scan(&source_sha); err != nil {
+			return nil, err
+		}
+		items = append(items, source_sha)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -1185,6 +1246,13 @@ WHERE h.id = $7
         AND r.worker_id = $10::uuid
         AND r.branch = $6::text
         AND r.status_since = $11::timestamptz
+  )
+  -- The server-held candidate binding (issue #1582 M1 rework), re-asserted here so a
+  -- capture registered under the hold DURING the proof is honoured too: when any capture
+  -- exists under this hold, one of them must carry the source_sha being stamped.
+  AND (
+      NOT EXISTS (SELECT 1 FROM recovery_captures c WHERE c.hold_id = h.id)
+      OR EXISTS (SELECT 1 FROM recovery_captures c WHERE c.hold_id = h.id AND c.source_sha = $2::text)
   )
 `
 

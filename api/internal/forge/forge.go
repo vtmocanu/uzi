@@ -66,17 +66,11 @@ var ErrMergeRequestNotFound = errors.New("forge: merge request not found")
 
 // ErrRefNotFound is returned by BranchHead when the forge 404s the named branch
 // (issue #1582 M1). A distinct sentinel, not a redacted generic error, so the
-// ancestry-release caller can tell "the branch is gone" from a transport failure;
-// both leave the custody hold retained. Each driver detects the 404 BEFORE its
+// ancestry-release caller can tell "the branch is gone" (retained/branch_missing) from a
+// transport failure (retained/ancestry_unknown). Each driver detects the 404 BEFORE its
 // redactor (which severs the Unwrap chain) and returns this directly; it carries no
 // token material.
 var ErrRefNotFound = errors.New("forge: ref not found")
-
-// ErrAncestryUnsupported is the sentinel a driver returns from CompareAncestry when
-// its forge (or forge version) offers no way to prove ancestry (issue #1582 M1). The
-// caller treats it exactly like AncestryUnknown: the hold stays retained. It carries
-// no token material.
-var ErrAncestryUnsupported = errors.New("forge: ancestry comparison is not supported on this forge")
 
 // Ancestry is the tri-state answer CompareAncestry gives to "is candidate an ancestor
 // of, or equal to, head" (issue #1582 M1). Only AncestryAncestor is a positive proof;
@@ -891,11 +885,13 @@ type Forge interface {
 	// method. Used by the PRD #71 auto-fix guard to know which paths a fix may touch.
 	ProjectCIConfigPath(ctx context.Context, projectID int64) (string, error)
 	// BranchHead returns the 40-hex commit id the named branch currently points at
-	// (issue #1582 M1). GitHub: GET /repos/{o}/{r}/branches/{branch} (commit.sha, no
-	// rename redirect followed); GitLab: GET /projects/:id/repository/branches/:branch
-	// (commit.id); Forgejo: GET /repos/{o}/{r}/branches/{branch} (commit.id). A missing
-	// branch returns ErrRefNotFound; a head that is not a 40-char lowercase hex id is
-	// an error. Errors are PAT-redacted.
+	// (issue #1582 M1). GitHub: GET /repos/{o}/{r}/branches/{branch} (commit.sha);
+	// GitLab: GET /projects/:id/repository/branches/:branch (commit.id); Forgejo: GET
+	// /repos/{o}/{r}/branches/{branch} (commit.id). Every driver sends it through a
+	// redirect-refusing client, so ANY 3xx (a GitHub rename 301 included) is an error,
+	// never ErrRefNotFound and never another host's answer; GitHub and Forgejo also
+	// require the response to name the requested branch. A 404 returns ErrRefNotFound; a
+	// head that is not a 40-char lowercase hex id is an error. Errors are PAT-redacted.
 	BranchHead(ctx context.Context, projectID int64, branch string) (string, error)
 	// CompareAncestry answers "is candidate an ancestor of, or equal to, head" using the
 	// forge's own compare API (issue #1582 M1). Both arguments must be 40-char
@@ -903,8 +899,8 @@ type Forge interface {
 	// an error. head == candidate is AncestryAncestor WITHOUT a request. Every error,
 	// rate limit (a 429, or GitHub's rate-limit 403), oversize body, or unrecognized
 	// response is AncestryUnknown; only an explicit, recognized positive answer is
-	// AncestryAncestor. Errors are PAT-redacted. A forge that cannot answer returns an
-	// error wrapping ErrAncestryUnsupported.
+	// AncestryAncestor. Every driver's compare requests refuse redirects (a 3xx is
+	// AncestryUnknown with an error). Errors are PAT-redacted.
 	CompareAncestry(ctx context.Context, projectID int64, head, candidate string) (Ancestry, error)
 }
 

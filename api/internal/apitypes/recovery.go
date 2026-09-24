@@ -182,7 +182,8 @@ const (
 	RecoverySettleRetained = "retained"
 
 	// RecoverySettleAncestryUnknown: the forge could not prove ancestry (branch head
-	// unreadable, a rate limit, an error, an unsupported forge, or an inconclusive answer).
+	// unreadable, a rate limit, a redirect, an error, or an inconclusive answer). Transient:
+	// the worker may retry later.
 	RecoverySettleAncestryUnknown = "ancestry_unknown"
 	// RecoverySettleNotAncestor: the forge explicitly reported a candidate NOT contained in
 	// the completed branch head.
@@ -191,9 +192,19 @@ const (
 	// release, so nothing was released.
 	RecoverySettleStateChanged = "state_changed"
 	// RecoverySettleNotEligible: the run/hold is not an older-generation hold of this worker
-	// on a run this worker completed at the named successor generation (or it was already
-	// settled with a different identity).
+	// on a run this worker completed at the named successor generation, the run's branch is
+	// not a valid git branch name, an interlocked run has no consumed completion permit to
+	// bind to, or the hold was already settled with a different identity.
 	RecoverySettleNotEligible = "not_eligible"
+	// RecoverySettleCandidateMismatch: a candidate SHA contradicts a fact the server already
+	// holds for this hold or run (issue #1582 M1 rework): source_sha is not the source_sha of
+	// any recovery capture registered under the hold, or pushed_sha is not the head of the
+	// completion permit the run's (interlocked) completion consumed. Terminal: retrying the
+	// same candidates can never succeed.
+	RecoverySettleCandidateMismatch = "candidate_mismatch"
+	// RecoverySettleBranchMissing: the forge reports the completed branch does not exist (a
+	// 404 on the branch read), so there is no head to prove against. Terminal for the worker.
+	RecoverySettleBranchMissing = "branch_missing"
 )
 
 // RecoverySettleResponse is the api's answer to a RecoverySettleRequest (issue #1582 M1).

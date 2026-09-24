@@ -57,6 +57,9 @@ type forgejo struct {
 	token   string
 	client  *http.Client
 	redact  redactor
+	// ancClient is the redirect-refusing client for the ancestry surface's raw GETs
+	// (BranchHead / CompareAncestry, issue #1582 M1). See ancestryClient.
+	ancClient *http.Client
 
 	mu    sync.RWMutex
 	slugs map[int64]repoSlug
@@ -75,11 +78,12 @@ type repoSlug struct {
 // generic "could not initialize forge client".
 func newForgejo(baseURL, token string, timeout time.Duration) *forgejo {
 	return &forgejo{
-		baseURL: strings.TrimSuffix(baseURL, "/"),
-		token:   token,
-		client:  timeoutClient(timeout),
-		redact:  newRedactor(token),
-		slugs:   map[int64]repoSlug{},
+		baseURL:   strings.TrimSuffix(baseURL, "/"),
+		token:     token,
+		client:    timeoutClient(timeout),
+		redact:    newRedactor(token),
+		ancClient: ancestryClient(timeout),
+		slugs:     map[int64]repoSlug{},
 	}
 }
 

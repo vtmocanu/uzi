@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -412,6 +414,14 @@ func TestForgejoBranchHead(t *testing.T) {
 		{"missing commit", func(w http.ResponseWriter, _ *http.Request) {
 			ancWriteJSON(w, 200, map[string]any{"name": branch})
 		}, "", false},
+		// The response must NAME the requested branch: a missing or different name is an
+		// error, never a head (issue #1582 M1 rework).
+		{"missing name", func(w http.ResponseWriter, _ *http.Request) {
+			ancWriteJSON(w, 200, map[string]any{"commit": map[string]any{"id": ancHead}})
+		}, "", false},
+		{"different name", func(w http.ResponseWriter, _ *http.Request) {
+			ancWriteJSON(w, 200, map[string]any{"name": "agent/issue-8", "commit": map[string]any{"id": ancHead}})
+		}, "", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -528,5 +538,102 @@ func TestForgejoCompareAncestryOversizeAndNoRequest(t *testing.T) {
 	}
 	if n.Load() != before {
 		t.Fatalf("head == candidate made a compare request")
+	}
+}
+
+// ── Redirects (issue #1582 M1 rework) ──────────────────────────────────────────────────
+
+// offHostTarget is a SECOND server standing in for an off-allowlist host. It answers every
+// request with a body that WOULD be a positive proof (a valid branch head, an "identical"
+// GitHub compare, a Forgejo total_commits the ancestor rule accepts), so a driver that
+// followed a redirect to it would read success. It records every request it receives and
+// whether one carried a credential header.
+type offHostTarget struct {
+	srv      *httptest.Server
+	requests atomic.Int64
+	sawCred  atomic.Bool
+}
+
+func newOffHostTarget(t *testing.T, branch string) *offHostTarget {
+	t.Helper()
+	o := &offHostTarget{}
+	o.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		o.requests.Add(1)
+		if r.Header.Get("Authorization") != "" || r.Header.Get("PRIVATE-TOKEN") != "" {
+			o.sawCred.Store(true)
+		}
+		total := 0
+		if strings.HasSuffix(r.URL.Path, ancCand+"..."+ancHead) {
+			total = 3
+		}
+		ancWriteJSON(w, 200, map[string]any{
+			"name":          branch,
+			"commit":        map[string]any{"sha": ancHead, "id": ancHead},
+			"status":        "identical",
+			"total_commits": total,
+		})
+	}))
+	t.Cleanup(o.srv.Close)
+	return o
+}
+
+// redirectTo answers with status and a Location on the off-host target, same path + query.
+func redirectTo(o *offHostTarget, status int) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", o.srv.URL+r.URL.RequestURI())
+		w.WriteHeader(status)
+	}
+}
+
+func (o *offHostTarget) assertUntouched(t *testing.T) {
+	t.Helper()
+	if n := o.requests.Load(); n != 0 {
+		t.Fatalf("the off-host redirect target received %d request(s) (credential sent: %v), want 0", n, o.sawCred.Load())
+	}
+}
+
+func TestAncestryRedirectsAreRefused(t *testing.T) {
+	const branch = "agent/issue-7"
+	for _, status := range []int{http.StatusMovedPermanently, http.StatusFound, http.StatusTemporaryRedirect} {
+		t.Run(fmt.Sprintf("github branch head %d", status), func(t *testing.T) {
+			o := newOffHostTarget(t, branch)
+			m := newMockGitHub(t, map[string]http.HandlerFunc{"/repos/acme/widgets/branches/": redirectTo(o, status)})
+			got, err := newGitHubDriver(t, m, ancPAT).BranchHead(context.Background(), 7, branch)
+			assertNoPAT(t, err)
+			if err == nil || errors.Is(err, ErrRefNotFound) {
+				t.Fatalf("BranchHead across a %d = (%q, %v), want a non-ErrRefNotFound error", status, got, err)
+			}
+			o.assertUntouched(t)
+		})
+		t.Run(fmt.Sprintf("github compare %d", status), func(t *testing.T) {
+			o := newOffHostTarget(t, branch)
+			m := newMockGitHub(t, map[string]http.HandlerFunc{"/repos/acme/widgets/compare/": redirectTo(o, status)})
+			got, err := newGitHubDriver(t, m, ancPAT).CompareAncestry(context.Background(), 7, ancHead, ancCand)
+			assertNoPAT(t, err)
+			if got != AncestryUnknown || err == nil {
+				t.Fatalf("CompareAncestry across a %d = (%q, %v), want unknown + error", status, got, err)
+			}
+			o.assertUntouched(t)
+		})
+		t.Run(fmt.Sprintf("forgejo branch head %d", status), func(t *testing.T) {
+			o := newOffHostTarget(t, branch)
+			m := newMockForgejo(t, map[string]http.HandlerFunc{"/repos/acme/widgets/branches/": redirectTo(o, status)})
+			got, err := newForgejoDriver(t, m, ancPAT).BranchHead(context.Background(), 7, branch)
+			assertNoPAT(t, err)
+			if err == nil || errors.Is(err, ErrRefNotFound) {
+				t.Fatalf("BranchHead across a %d = (%q, %v), want a non-ErrRefNotFound error", status, got, err)
+			}
+			o.assertUntouched(t)
+		})
+		t.Run(fmt.Sprintf("forgejo compare %d", status), func(t *testing.T) {
+			o := newOffHostTarget(t, branch)
+			m := newMockForgejo(t, map[string]http.HandlerFunc{"/repos/acme/widgets/compare/": redirectTo(o, status)})
+			got, err := newForgejoDriver(t, m, ancPAT).CompareAncestry(context.Background(), 7, ancHead, ancCand)
+			assertNoPAT(t, err)
+			if got != AncestryUnknown || err == nil {
+				t.Fatalf("CompareAncestry across a %d = (%q, %v), want unknown + error", status, got, err)
+			}
+			o.assertUntouched(t)
+		})
 	}
 }

@@ -396,10 +396,9 @@ func TestRecoverySettleRejectsWorkerClaimsLiveDB(t *testing.T) {
 			f.verdictErr = map[string]error{settleSource: errors.New("transient")}
 			f.verdict = map[string]forge.Ancestry{settleSource: forge.AncestryAncestor}
 		}, apitypes.RecoverySettleAncestryUnknown},
-		{"ErrAncestryUnsupported", func(f *settleFakeForge) {
-			f.verdictErr = map[string]error{settlePushed: forge.ErrAncestryUnsupported}
-		}, apitypes.RecoverySettleAncestryUnknown},
-		{"missing branch head", func(f *settleFakeForge) { f.headErr = forge.ErrRefNotFound }, apitypes.RecoverySettleAncestryUnknown},
+		// A 404 on the branch read is its own terminal reason, not ancestry_unknown.
+		{"missing branch head", func(f *settleFakeForge) { f.headErr = forge.ErrRefNotFound }, apitypes.RecoverySettleBranchMissing},
+		{"branch head transport error", func(f *settleFakeForge) { f.headErr = errors.New("transient") }, apitypes.RecoverySettleAncestryUnknown},
 		{"malformed branch head", func(f *settleFakeForge) { f.head = "not-a-sha" }, apitypes.RecoverySettleAncestryUnknown},
 	}
 	for _, tc := range proofCases {
@@ -567,6 +566,18 @@ func TestRecoverySettleEligibilityLiveDB(t *testing.T) {
 		e.assertNoForgeCalls()
 		e.assertOpen(e.pred)
 	})
+	// Issue #1582 M1 rework: runs.branch is worker-reported, so a value that is not a git
+	// branch name never reaches a forge URL.
+	for _, bad := range []string{"../../../admin", "agent/x?per_page=1", "a b", "/agent", "agent//x", "agent/", "x.lock", "a@{0}", "a\x01b", "a~1", ".hidden"} {
+		t.Run("invalid branch "+strings.ReplaceAll(bad, "/", "_"), func(t *testing.T) {
+			e := newSettleEnv(t)
+			e.exec(`UPDATE runs SET branch = $2 WHERE id = $1`, e.run, bad)
+			code, res, raw := e.settle(e.tokenA, e.run, e.pred, goodBody())
+			e.assertRetained(code, res, raw, apitypes.RecoverySettleNotEligible)
+			e.assertNoForgeCalls()
+			e.assertOpen(e.pred, e.sibGen, e.sibWork)
+		})
+	}
 	t.Run("no bearer is 401", func(t *testing.T) {
 		e := newSettleEnv(t)
 		if code, _, raw := e.settle("uzw_not-a-real-token", e.run, e.pred, goodBody()); code != http.StatusUnauthorized {
@@ -574,4 +585,151 @@ func TestRecoverySettleEligibilityLiveDB(t *testing.T) {
 		}
 		e.assertOpen(e.pred)
 	})
+}
+
+// insertCapture registers a recovery capture under hold with the given source_sha.
+func (e *settleEnv) insertCapture(hold uuid.UUID, source string) {
+	e.t.Helper()
+	e.exec(`INSERT INTO recovery_captures
+	      (id, hold_id, run_id, user_id, original_worker_id, original_worker_identity, source_sha, idempotency_key, state)
+	      VALUES ($1, $2, $3, $4, $5, 'settle-cap', $6, $7, 'preparing')`,
+		uuid.New(), hold, e.run, e.user, e.workerA, source, "settle-"+uuid.NewString())
+}
+
+// makeInterlocked marks the run interlocked at contract revision rev.
+func (e *settleEnv) makeInterlocked(rev int) {
+	e.t.Helper()
+	e.exec(`UPDATE runs SET completion_contract_version = 1, contract_revision = $2, completion_contract = '{}'::jsonb WHERE id = $1`, e.run, rev)
+}
+
+// insertConsumedPermit records a CONSUMED completion permit for the run.
+func (e *settleEnv) insertConsumedPermit(rev int, head string, worker uuid.UUID, consumedAgo time.Duration) {
+	e.t.Helper()
+	e.exec(`INSERT INTO run_completion_permits (run_id, contract_revision, branch, head, issued_by_worker_id, consumed_at)
+	      VALUES ($1, $2, $3, $4, $5, now() - $6::interval)`,
+		e.run, rev, e.branch, head, worker, fmt.Sprintf("%d seconds", int(consumedAgo.Seconds())))
+}
+
+// TestRecoverySettleCandidateBindingLiveDB (issue #1582 M1 rework): the worker-chosen
+// candidates are bound to the facts the server already holds. A source_sha no capture under the
+// hold carries, or a pushed_sha that is not the head of the completion permit an interlocked
+// run's completion consumed, is retained/candidate_mismatch with no forge call and the hold
+// open; matching candidates release.
+func TestRecoverySettleCandidateBindingLiveDB(t *testing.T) {
+	t.Run("capture source mismatch", func(t *testing.T) {
+		e := newSettleEnv(t)
+		e.insertCapture(e.pred, settleOther)
+		code, res, raw := e.settle(e.tokenA, e.run, e.pred, goodBody())
+		e.assertRetained(code, res, raw, apitypes.RecoverySettleCandidateMismatch)
+		e.assertNoForgeCalls()
+		e.assertOpen(e.pred, e.sibGen, e.sibWork)
+	})
+	t.Run("a sibling hold's capture does not bind this hold", func(t *testing.T) {
+		e := newSettleEnv(t)
+		e.insertCapture(e.sibGen, settleOther)
+		code, res, raw := e.settle(e.tokenA, e.run, e.pred, goodBody())
+		if code != http.StatusOK || res.Outcome != apitypes.RecoverySettleReleased {
+			t.Fatalf("settle = %d %+v (%s), want released", code, res, raw)
+		}
+	})
+	t.Run("capture source match releases", func(t *testing.T) {
+		e := newSettleEnv(t)
+		// Two captures with different sources: the request's source_sha must equal ONE of them.
+		e.insertCapture(e.pred, settleOther)
+		e.insertCapture(e.pred, settleSource)
+		code, res, raw := e.settle(e.tokenA, e.run, e.pred, goodBody())
+		if code != http.StatusOK || res.Outcome != apitypes.RecoverySettleReleased || res.FinalHeadSha != settleHead {
+			t.Fatalf("settle = %d %+v (%s), want released", code, res, raw)
+		}
+		if h := e.hold(e.pred); h.state != "released" || h.source != settleSource {
+			t.Fatalf("hold = %+v, want released with the capture's source", h)
+		}
+		e.assertOpen(e.sibGen, e.sibWork)
+	})
+	t.Run("capture registered mid-proof refuses the release", func(t *testing.T) {
+		e := newSettleEnv(t)
+		e.fake.beforeCompare = func() {
+			if _, err := e.pool.Exec(e.ctx, `INSERT INTO recovery_captures
+			      (id, hold_id, run_id, user_id, original_worker_id, original_worker_identity, source_sha, idempotency_key, state)
+			      VALUES ($1, $2, $3, $4, $5, 'settle-cap', $6, 'mid-proof', 'preparing')`,
+				uuid.New(), e.pred, e.run, e.user, e.workerA, settleOther); err != nil {
+				t.Errorf("insert capture: %v", err)
+			}
+		}
+		code, res, raw := e.settle(e.tokenA, e.run, e.pred, goodBody())
+		e.assertRetained(code, res, raw, apitypes.RecoverySettleStateChanged)
+		e.assertOpen(e.pred, e.sibGen, e.sibWork)
+	})
+	t.Run("permit head mismatch", func(t *testing.T) {
+		e := newSettleEnv(t)
+		e.makeInterlocked(2)
+		e.insertConsumedPermit(2, settleOther, e.workerA, 0)
+		code, res, raw := e.settle(e.tokenA, e.run, e.pred, goodBody())
+		e.assertRetained(code, res, raw, apitypes.RecoverySettleCandidateMismatch)
+		e.assertNoForgeCalls()
+		e.assertOpen(e.pred, e.sibGen, e.sibWork)
+	})
+	t.Run("an invalidated older-revision permit does not bind", func(t *testing.T) {
+		e := newSettleEnv(t)
+		e.makeInterlocked(2)
+		// Revision 1's permit (for the pushed candidate) was invalidated by a decision; the
+		// completion consumed revision 2's permit at another head.
+		e.insertConsumedPermit(1, settlePushed, e.workerA, 0)
+		e.insertConsumedPermit(2, settleOther, e.workerA, 60*time.Second)
+		code, res, raw := e.settle(e.tokenA, e.run, e.pred, goodBody())
+		e.assertRetained(code, res, raw, apitypes.RecoverySettleCandidateMismatch)
+		e.assertNoForgeCalls()
+	})
+	t.Run("interlocked run without a consumed permit", func(t *testing.T) {
+		e := newSettleEnv(t)
+		e.makeInterlocked(2)
+		code, res, raw := e.settle(e.tokenA, e.run, e.pred, goodBody())
+		e.assertRetained(code, res, raw, apitypes.RecoverySettleNotEligible)
+		e.assertNoForgeCalls()
+		e.assertOpen(e.pred)
+	})
+	t.Run("permit head match releases", func(t *testing.T) {
+		e := newSettleEnv(t)
+		e.makeInterlocked(2)
+		e.insertConsumedPermit(2, settlePushed, e.workerA, 0)
+		e.insertCapture(e.pred, settleSource)
+		code, res, raw := e.settle(e.tokenA, e.run, e.pred, goodBody())
+		if code != http.StatusOK || res.Outcome != apitypes.RecoverySettleReleased || res.FinalHeadSha != settleHead {
+			t.Fatalf("settle = %d %+v (%s), want released", code, res, raw)
+		}
+		if h := e.hold(e.pred); h.state != "released" || h.evidence != "ancestry" || h.pushed != settlePushed {
+			t.Fatalf("hold = %+v, want released by ancestry with the permit's head", h)
+		}
+		e.assertOpen(e.sibGen, e.sibWork)
+	})
+}
+
+// TestRecoverySettleIsRateLimitedLiveDB (issue #1582 M1 rework): the settle route rides the
+// per-worker limiter on the REAL worker router (WorkerRoutes, the same mount Routes uses), so
+// a looping worker cannot spend the owner's forge quota without bound. With a budget of 2 the
+// third call is a 429 that never reaches the service, while ANOTHER worker keeps its own
+// budget.
+func TestRecoverySettleIsRateLimitedLiveDB(t *testing.T) {
+	e := newSettleEnv(t)
+	e.fake.headErr = errors.New("transient") // each admitted call reaches the forge once
+	e.router = e.routerWithWorkerLimiter(mw.NewLimiter(2, time.Hour, nil))
+	for i := 1; i <= 2; i++ {
+		code, res, raw := e.settle(e.tokenA, e.run, e.pred, goodBody())
+		e.assertRetained(code, res, raw, apitypes.RecoverySettleAncestryUnknown)
+	}
+	if code, _, raw := e.settle(e.tokenA, e.run, e.pred, goodBody()); code != http.StatusTooManyRequests {
+		t.Fatalf("third settle = %d (%s), want 429", code, raw)
+	}
+	if hc, _ := e.fake.calls(); hc != 2 {
+		t.Fatalf("BranchHead calls = %d, want 2 (the limited call must not reach the forge)", hc)
+	}
+	// Worker B has its own bucket: its call is admitted (and not_eligible on A's run).
+	code, res, raw := e.settle(e.tokenB, e.run, e.sibWork, goodBody())
+	e.assertRetained(code, res, raw, apitypes.RecoverySettleNotEligible)
+	e.assertOpen(e.pred, e.sibGen, e.sibWork)
+}
+
+func (e *settleEnv) routerWithWorkerLimiter(lim *mw.Limiter) http.Handler {
+	h := &Handler{pool: e.pool, q: store.New(e.pool), box: newHandlerTestBox(e.t), cfg: config.Config{JWTSecret: cliTestSecret, AuthTokenTTL: time.Hour}, wsvc: e.wsvc}
+	return h.WorkerRoutes(lim)
 }

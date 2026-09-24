@@ -47,6 +47,10 @@ type github struct {
 	// not go-github's auth-transport client) and refuses to follow any further
 	// redirect (CheckRedirect → http.ErrUseLastResponse). See fetchJobLog.
 	logClient *http.Client
+	// ancClient is the redirect-refusing client for the ancestry surface's GETs
+	// (BranchHead / CompareAncestry, issue #1582 M1). Unlike logClient these requests
+	// DO carry the PAT, set per request by githubGetBounded. See ancestryClient.
+	ancClient *http.Client
 	// allowInsecureLogHost relaxes fetchJobLog's https-only + private-host SSRF
 	// guard. It is false in production and set true ONLY by the test harness, whose
 	// blob "host" is an httptest server on loopback http. Never settable through
@@ -104,6 +108,7 @@ func newGitHub(baseURL, token string, timeout time.Duration) (*github, error) {
 		client:    c,
 		redact:    redact,
 		logClient: logClient,
+		ancClient: ancestryClient(timeout),
 		slugs:     map[int64]repoSlug{},
 	}, nil
 }

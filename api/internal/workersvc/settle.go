@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
+	"strings"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -35,6 +37,36 @@ func isSettleSHA(s string) bool {
 	return true
 }
 
+// maxSettleBranchLen bounds the run branch the settle surface will send to a forge; it is
+// also migration 00247's release_branch CHECK ceiling.
+const maxSettleBranchLen = 255
+
+// isSettleBranchName reports whether b is a well-formed git branch name, checked BEFORE the
+// worker-reported runs.branch reaches any forge URL (issue #1582 M1 rework). It applies
+// git-check-ref-format's rules: non-empty and at most maxSettleBranchLen bytes; no "..",
+// "//", "@{", or a component starting with "."; no leading "/" or "."; no trailing "/",
+// "." or ".lock"; not the lone "@"; and no control character, DEL, space, or any of
+// ~ ^ : ? * [ \ .
+func isSettleBranchName(b string) bool {
+	if b == "" || len(b) > maxSettleBranchLen || b == "@" {
+		return false
+	}
+	if strings.Contains(b, "..") || strings.Contains(b, "//") || strings.Contains(b, "@{") || strings.Contains(b, "/.") {
+		return false
+	}
+	if strings.HasPrefix(b, "/") || strings.HasPrefix(b, ".") ||
+		strings.HasSuffix(b, "/") || strings.HasSuffix(b, ".") || strings.HasSuffix(b, ".lock") {
+		return false
+	}
+	for i := 0; i < len(b); i++ {
+		c := b[i]
+		if c < 0x20 || c == 0x7f || strings.IndexByte(" ~^:?*[\\", c) >= 0 {
+			return false
+		}
+	}
+	return true
+}
+
 // validateSettleRequest is the shape gate for a predecessor-settle request. It checks only
 // the request's own form; eligibility (predecessor < successor included) is a server-side
 // decision answered as retained/not_eligible.
@@ -57,20 +89,32 @@ func validateSettleRequest(req apitypes.RecoverySettleRequest) error {
 // candidate SHAs only; the api:
 //
 //  1. reads the run from its own row: it must be 'completed', at claim_generation ==
-//     successor_generation, held by the caller (runs.worker_id), on a non-empty branch. It
-//     captures that completion identity (branch, status_since). A run of another owner is
-//     ErrRunNotOwned (404); any other mismatch is retained/not_eligible.
+//     successor_generation, held by the caller (runs.worker_id), on a branch that is a valid
+//     git branch name (isSettleBranchName). It captures that completion identity (branch,
+//     status_since). A run of another owner is ErrRunNotOwned (404); any other mismatch is
+//     retained/not_eligible.
 //  2. reads the hold by id on that run: generation == predecessor_generation <
 //     successor_generation and original_worker_id == caller. A hold already released with
 //     'ancestry' evidence and the SAME stored identity is an idempotent released; any other
 //     settled hold is retained/not_eligible. Otherwise it must be open.
-//  3. proves: reads the branch head H ONCE from the forge, then asks the forge whether each
-//     candidate (pushed, source, adopted) is an ancestor of H. Any not_ancestor is
-//     retained/not_ancestor; otherwise any unknown or error is retained/ancestry_unknown.
-//  4. releases with the single guarded ReleasePredecessorCustodyHoldByAncestry statement,
-//     which re-asserts every step-1/step-2 guard. One row is released (FinalHeadSha = H);
-//     zero rows re-read the hold and answer released only when the stored identity matches,
-//     else retained/state_changed. It never touches a sibling hold.
+//  3. binds the candidates to the facts the server already holds, where they exist: when any
+//     recovery capture is registered under the hold, source_sha must equal one of those
+//     captures' source_sha; when the run is interlocked, pushed_sha must equal the head of the
+//     completion permit its completion consumed. A mismatch is retained/candidate_mismatch
+//     (an interlocked run with no consumed permit is retained/not_eligible). The worker process
+//     holds the custody, but these candidates must not be free choices where the server knows
+//     the answer.
+//  4. proves: reads the branch head H ONCE from the forge (a 404 is retained/branch_missing),
+//     then asks the forge whether each distinct candidate is an ancestor of H. Any
+//     not_ancestor is retained/not_ancestor; otherwise any unknown or error is
+//     retained/ancestry_unknown.
+//  5. releases with the single guarded ReleasePredecessorCustodyHoldByAncestry statement,
+//     which re-asserts every step-1/step-2 guard and the capture binding. One row is released
+//     (FinalHeadSha = H); zero rows re-read the hold and answer released only when the stored
+//     identity matches, else retained/state_changed. It never touches a sibling hold.
+//
+// Steps 1-3 read only the server's own rows, so every not_eligible or candidate_mismatch
+// answer is given without any forge call.
 func (s *Service) SettlePredecessorHold(ctx context.Context, wkr store.Worker, runID, holdID uuid.UUID, req apitypes.RecoverySettleRequest) (apitypes.RecoverySettleResponse, error) {
 	if err := validateSettleRequest(req); err != nil {
 		return apitypes.RecoverySettleResponse{}, err
@@ -99,7 +143,7 @@ func (s *Service) SettlePredecessorHold(ctx context.Context, wkr store.Worker, r
 	if run.Status != "completed" ||
 		run.ClaimGeneration != req.SuccessorGeneration ||
 		!run.WorkerID.Valid || uuid.UUID(run.WorkerID.Bytes) != wkr.ID ||
-		!run.Branch.Valid || run.Branch.String == "" ||
+		!run.Branch.Valid || !isSettleBranchName(run.Branch.String) ||
 		!run.StatusSince.Valid {
 		return retained(apitypes.RecoverySettleNotEligible), nil
 	}
@@ -126,7 +170,33 @@ func (s *Service) SettlePredecessorHold(ctx context.Context, wkr store.Worker, r
 		return retained(apitypes.RecoverySettleNotEligible), nil
 	}
 
-	// 3. The api's own proof, via the forge compare API.
+	// 3. The server-held candidate binding.
+	sources, err := s.q.ListCaptureSourceShasForHold(ctx, holdID)
+	if err != nil {
+		return apitypes.RecoverySettleResponse{}, err
+	}
+	if len(sources) > 0 && !slices.Contains(sources, req.SourceSha) {
+		return retained(apitypes.RecoverySettleCandidateMismatch), nil
+	}
+	if run.CompletionContractVersion.Valid {
+		if !run.ContractRevision.Valid {
+			return retained(apitypes.RecoverySettleNotEligible), nil
+		}
+		permitHead, err := s.q.GetSettleCompletionPermitHead(ctx, store.GetSettleCompletionPermitHeadParams{
+			RunID: runID, ContractRevision: run.ContractRevision.Int32, WorkerID: wkr.ID,
+		})
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return retained(apitypes.RecoverySettleNotEligible), nil
+			}
+			return apitypes.RecoverySettleResponse{}, err
+		}
+		if permitHead != req.PushedSha {
+			return retained(apitypes.RecoverySettleCandidateMismatch), nil
+		}
+	}
+
+	// 4. The api's own proof, via the forge compare API.
 	if s.forges == nil {
 		return apitypes.RecoverySettleResponse{}, ErrForgesUnavailable
 	}
@@ -148,6 +218,9 @@ func (s *Service) SettlePredecessorHold(ctx context.Context, wkr store.Worker, r
 		return retained(apitypes.RecoverySettleAncestryUnknown), nil
 	}
 	head, err := f.BranchHead(ctx, rc.ForgeProjectID, branch)
+	if errors.Is(err, forge.ErrRefNotFound) {
+		return retained(apitypes.RecoverySettleBranchMissing), nil
+	}
 	if err != nil {
 		logUnknown("branch head", err)
 		return retained(apitypes.RecoverySettleAncestryUnknown), nil
@@ -165,8 +238,8 @@ func (s *Service) SettlePredecessorHold(ctx context.Context, wkr store.Worker, r
 		asked[c] = true
 		a, err := f.CompareAncestry(ctx, rc.ForgeProjectID, head, c)
 		if err != nil {
-			// Any error is unknown, whatever verdict accompanied it (ErrAncestryUnsupported
-			// included): only an explicit error-free positive answer is proof.
+			// Any error is unknown, whatever verdict accompanied it: only an explicit
+			// error-free positive answer is proof.
 			logUnknown("compare ancestry", err)
 			a = forge.AncestryUnknown
 		}
@@ -185,7 +258,7 @@ func (s *Service) SettlePredecessorHold(ctx context.Context, wkr store.Worker, r
 		return retained(apitypes.RecoverySettleAncestryUnknown), nil
 	}
 
-	// 4. The single guarded release.
+	// 5. The single guarded release.
 	n, err := s.q.ReleasePredecessorCustodyHoldByAncestry(ctx, store.ReleasePredecessorCustodyHoldByAncestryParams{
 		PushedSha:             req.PushedSha,
 		SourceSha:             req.SourceSha,

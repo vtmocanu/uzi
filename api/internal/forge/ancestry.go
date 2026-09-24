@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"time"
 )
 
 // ancestryBodyLimit bounds every response body BranchHead / CompareAncestry reads
@@ -22,6 +24,20 @@ const forgejoCompareBodyLimit = 8 << 20 // 8 MiB
 // errAncestryOversize is returned when a response body exceeds its ceiling. It names
 // no URL and carries no token material.
 var errAncestryOversize = errors.New("response body exceeds the ancestry read ceiling")
+
+// ancestryClient builds the redirect-REFUSING client every GitHub and Forgejo
+// BranchHead / CompareAncestry request goes through (issue #1582 M1), the same
+// pattern as the GitLab driver's logClient. It shares the driver's per-call timeout,
+// and CheckRedirect returns http.ErrUseLastResponse, so a 3xx comes back to the
+// caller as a response instead of being followed: the request's credential header is
+// never re-sent to the redirect target, and an answer served from the redirect target
+// is never read as proof. The callers treat any 3xx as an error.
+func ancestryClient(timeout time.Duration) *http.Client {
+	return &http.Client{
+		Timeout:       timeoutClient(timeout).Timeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+}
 
 // isCommitSHA reports whether s is a full 40-char LOWERCASE hex commit id. The
 // ancestry surface accepts nothing else: never a ref name, an abbreviated id, or an

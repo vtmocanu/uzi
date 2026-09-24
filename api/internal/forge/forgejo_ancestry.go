@@ -28,18 +28,20 @@ type forgejoCompareBody struct {
 	TotalCommits *int64 `json:"total_commits"`
 }
 
-// forgejoGetBounded is the ancestry surface's raw GET: rawGetLimited's auth + shared
-// timeout client, but it returns the status (so a 404 is recognisable before
-// redaction), treats a body past the ceiling as an error rather than silently
-// truncating it, and never folds the error body into the message. Every error is
-// PAT-redacted.
+// forgejoGetBounded is the ancestry surface's raw GET: rawGetLimited's auth, but sent
+// through f.ancClient, which REFUSES redirects (the SDK's shared client follows them,
+// re-sending the token header and reading the redirect target's answer as if it were
+// this forge's). Any non-2xx, a 3xx included, is an error. It returns the status (so a
+// 404 is recognisable before redaction), treats a body past the ceiling as an error
+// rather than silently truncating it, and never folds the error body into the message.
+// Every error is PAT-redacted.
 func (f *forgejo) forgejoGetBounded(ctx context.Context, op, path string, limit int64) (int, []byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, f.baseURL+"/api/v1"+path, nil)
 	if err != nil {
 		return 0, nil, f.wrapErr(op, err)
 	}
 	req.Header.Set("Authorization", "token "+f.token)
-	resp, err := f.client.Do(req)
+	resp, err := f.ancClient.Do(req)
 	if err != nil {
 		return 0, nil, f.wrapErr(op, err)
 	}
@@ -68,7 +70,9 @@ func (f *forgejo) forgejoSlug(ctx context.Context, projectID int64) (repoSlug, e
 // BranchHead implements Forge (issue #1582 M1). GET /repos/{o}/{r}/branches/{branch}
 // → commit.id, the reader-gated endpoint DefaultBranchProtection already reads. The
 // branch is escaped per segment exactly as the gitea SDK's GetRepoBranch does (Forgejo
-// routes a slash-bearing branch name by its raw segments). A 404 is ErrRefNotFound.
+// routes a slash-bearing branch name by its raw segments). A 404 is ErrRefNotFound; a
+// redirect is an error. The response's `name` is REQUIRED and must equal the requested
+// branch (missing or different is an error), as on GitHub.
 func (f *forgejo) BranchHead(ctx context.Context, projectID int64, branch string) (string, error) {
 	if branch == "" {
 		return "", errors.New("forgejo: branch head: empty branch name")
@@ -89,8 +93,8 @@ func (f *forgejo) BranchHead(ctx context.Context, projectID int64, branch string
 	if err := json.Unmarshal(body, &b); err != nil {
 		return "", f.wrapErr("branch head: decode", err)
 	}
-	if b.Name != nil && *b.Name != branch {
-		return "", errors.New("forgejo: branch head: response names a different branch")
+	if b.Name == nil || *b.Name != branch {
+		return "", errors.New("forgejo: branch head: response does not name the requested branch")
 	}
 	if b.Commit == nil || b.Commit.ID == nil || !isCommitSHA(*b.Commit.ID) {
 		return "", errors.New("forgejo: branch head: response carries no 40-hex commit id")

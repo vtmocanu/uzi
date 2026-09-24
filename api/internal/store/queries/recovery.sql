@@ -374,7 +374,40 @@ WHERE h.id = @hold_id
         AND r.worker_id = @worker_id::uuid
         AND r.branch = @branch::text
         AND r.status_since = @completed_since::timestamptz
+  )
+  -- The server-held candidate binding (issue #1582 M1 rework), re-asserted here so a
+  -- capture registered under the hold DURING the proof is honoured too: when any capture
+  -- exists under this hold, one of them must carry the source_sha being stamped.
+  AND (
+      NOT EXISTS (SELECT 1 FROM recovery_captures c WHERE c.hold_id = h.id)
+      OR EXISTS (SELECT 1 FROM recovery_captures c WHERE c.hold_id = h.id AND c.source_sha = @source_sha::text)
   );
+
+-- name: ListCaptureSourceShasForHold :many
+-- Issue #1582 M1 rework: the source_sha values of every recovery capture registered under ONE
+-- hold — the server-held facts the predecessor-settle request's source_sha must match (a
+-- capture's source_sha is the predecessor's committed head H, recorded when the capture was
+-- reserved). Empty when the hold never captured; the service then has nothing to bind to.
+SELECT DISTINCT source_sha FROM recovery_captures
+WHERE hold_id = @hold_id
+ORDER BY source_sha;
+
+-- name: GetSettleCompletionPermitHead :one
+-- Issue #1582 M1 rework: the head of the completion permit an INTERLOCKED run's completion
+-- consumed — the server-held fact the predecessor-settle request's pushed_sha must match.
+-- completeRunWithPermit consumes exactly one permit for (run, the LOCKED row's
+-- contract_revision, head) in the same transaction that writes 'completed', fenced to the
+-- completing worker. InvalidatePriorCompletionPermits also stamps consumed_at, but only on
+-- revisions BELOW the one a decision bumped to, so at the run's current revision every
+-- consumed permit was consumed by a completion; the newest is the final completion's.
+-- pgx.ErrNoRows when none exists (a non-interlocked run never has one).
+SELECT head FROM run_completion_permits
+WHERE run_id = @run_id
+  AND contract_revision = @contract_revision
+  AND issued_by_worker_id = @worker_id::uuid
+  AND consumed_at IS NOT NULL
+ORDER BY consumed_at DESC, id DESC
+LIMIT 1;
 
 -- name: ListCustodyHoldsForWorkerRun :many
 -- PRD #1349 M1 (D3): the caller worker's OWN open holds on a run, for the worker-facing

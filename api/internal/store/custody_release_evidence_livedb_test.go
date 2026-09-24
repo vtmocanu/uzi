@@ -208,6 +208,9 @@ func TestCustodyReleaseEvidenceLiveDB(t *testing.T) {
 		`UPDATE recovery_custody_holds SET release_final_head_sha = '` + strings.ToUpper("abcdef"+shaH[6:]) + `' WHERE id = $1`,
 		`UPDATE recovery_custody_holds SET release_branch = '` + strings.Repeat("b", 256) + `' WHERE id = $1`,
 		`UPDATE recovery_custody_holds SET release_evidence = 'worker_says_ancestor' WHERE id = $1`,
+		// Issue #1582 M1 rework: a successor generation is always positive.
+		`UPDATE recovery_custody_holds SET release_successor_generation = 0 WHERE id = $1`,
+		`UPDATE recovery_custody_holds SET release_successor_generation = -3 WHERE id = $1`,
 	} {
 		_, err := pool.Exec(ctx, bad, hPartial)
 		var pgErr *pgconn.PgError
