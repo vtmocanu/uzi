@@ -338,21 +338,65 @@ function snapshot(dir: string, into: string): () => void {
   };
 }
 
+/** Restart a worker over the durable state in fx.dataDir (the forge is unreachable) and wait until
+ *  the settlement journal of `runId` is empty. Returns the boot events (`state:*` replays, `settle:*`)
+ *  and the settle requests. `onPromote` sees every settlement put of a `pending_settle` record. */
+async function bootAndSettle(
+  runId: string,
+  outboxRoot: string,
+  onPromote?: (outbox: Outbox) => void,
+): Promise<{ events: string[]; calls: FakeSettleClient["calls"]; s2: Stores }> {
+  const events: string[] = [];
+  const git2 = new GitCache(fx.dataDir, nullLogger());
+  const s2 = stores(git2);
+  const settleClient2 = new FakeSettleClient((rid, holdId) => {
+    events.push(`settle:${holdId}`);
+    return released(rid, holdId);
+  });
+  const outbox2 = await mkOutbox(outboxRoot);
+  if (onPromote) {
+    const put = s2.settlement.put.bind(s2.settlement);
+    s2.settlement.put = async (rec) => {
+      if (rec.state === "pending_settle") onPromote(outbox2);
+      return put(rec);
+    };
+  }
+  const client2 = bootClient(events);
+  const runner2 = new RunRunner(client2, git2, () => { throw new Error("no claims in this test"); }, nullLogger(), 20, undefined, {
+    recovery: s2.coord,
+    settlement: s2.settlement,
+    settleClient: settleClient2,
+    outbox: outbox2,
+  });
+  const worker = new Worker(fakeConfig(fx.dataDir), client2, runner2, idleChat, noJudge, noReview, nullLogger(), okPreflight, outbox2, new Map(), undefined, 60_000);
+  const controller = new AbortController();
+  const done = worker.run(controller.signal);
+  try {
+    await pollUntil(async () => (await s2.settlement.listRun(runId)).length === 0, 10_000, "the sweep settled the hold");
+  } finally {
+    controller.abort();
+    await done;
+  }
+  return { events, calls: settleClient2.calls, s2 };
+}
+
 describe("settlement crash boundaries (issue #1582 M2)", () => {
-  it("(a) completion ACK applied, crash before settle → boot replays the pending terminal FIRST, then the sweep settles with no PAT", async () => {
+  it("(a) completion ACK applied + outbox retired, crash at the post-completion settle → restart: the sweep settles with no PAT", async () => {
     const iid = 6201;
     const { s, gen2Claim, gen1Head } = await trackingScenario(iid);
     const outboxRoot = path.join(fx.dataDir, "outbox");
     const outbox1 = await mkOutbox(outboxRoot);
     const snapRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-settle-crash-"));
     let restore: Array<() => void> = [];
-    // The "crash": at the instant the post-ACK settle is attempted, freeze the durable state
-    // (outbox terminal journal still pending, settlement record pending_settle, gen1 journal) —
-    // nothing the live process does after this point survives.
+    let pendingAtSettle: boolean | undefined;
+    // The "crash": at the instant the post-completion settle is attempted, freeze the durable state
+    // (settlement record, gen1 journal, outbox) — nothing the live process does after this survives.
     const crashingClient = new FakeSettleClient(
       () => new Error("process died"),
       () => {
         if (restore.length > 0) return;
+        // N4: the in-run settle runs only AFTER the terminal outcome resolved (journal retired).
+        pendingAtSettle = outbox1.hasPendingTerminal(gen2Claim.run_id, 2);
         restore = [
           snapshot(outboxRoot, path.join(snapRoot, "outbox")),
           snapshot(git.recoverySettlementRoot, path.join(snapRoot, "settlement")),
@@ -362,43 +406,22 @@ describe("settlement crash boundaries (issue #1582 M2)", () => {
     );
     await runGen2(s, gen2Claim, crashingClient, outbox1);
     assert.equal(crashingClient.calls.length, 1, "the live settle was attempted after the ACK");
+    assert.equal(pendingAtSettle, false, "the settle ran after the outbox terminal journal was retired, not inside the send");
     for (const r of restore) r();
-    // The durable settlement state the restarted worker reads carries no credential at all.
     const settleDir = path.join(git.recoverySettlementRoot, gen2Claim.run_id);
     for (const f of fs.readdirSync(settleDir)) {
       const bytes = fs.readFileSync(path.join(settleDir, f), "utf8");
       assert.ok(!bytes.includes(PAT), "no forge PAT in the settlement journal");
       assert.doesNotMatch(bytes, /forge_pat|token/i);
     }
+    const [atCrash] = await s.settlement.listRun(gen2Claim.run_id);
+    assert.equal(atCrash!.state, "pending_settle", "the ACK was observed before the crash");
     // No forge is reachable after the restart: the settle needs none (server-side proof).
     fs.renameSync(fx.originPath, `${fx.originPath}.gone`);
     try {
-      const events: string[] = [];
-      const git2 = new GitCache(fx.dataDir, nullLogger());
-      const s2 = stores(git2);
-      const settleClient2 = new FakeSettleClient(
-        (runId, holdId) => {
-          events.push(`settle:${holdId}`);
-          return released(runId, holdId);
-        },
-      );
-      const outbox2 = await mkOutbox(outboxRoot);
-      assert.equal(outbox2.hasPendingTerminal(gen2Claim.run_id, 2), true, "precondition: the terminal is still pending at boot");
-      const client2 = bootClient(events);
-      const runner2 = new RunRunner(client2, git2, () => { throw new Error("no claims in this test"); }, nullLogger(), 20, undefined, {
-        recovery: s2.coord,
-        settlement: s2.settlement,
-        settleClient: settleClient2,
-        outbox: outbox2,
-      });
-      const worker = new Worker(fakeConfig(fx.dataDir), client2, runner2, idleChat, noJudge, noReview, nullLogger(), okPreflight, outbox2, new Map(), undefined, 60_000);
-      const controller = new AbortController();
-      const done = worker.run(controller.signal);
-      await pollUntil(async () => (await s2.settlement.listRun(gen2Claim.run_id)).length === 0, 10_000, "the sweep settled the hold");
-      controller.abort();
-      await done;
-      assert.deepEqual(events, ["state:completed", `settle:${HOLD_G1}`], "pending terminal replayed FIRST, then the settle");
-      assert.deepEqual(settleClient2.calls[0]!.req, {
+      const { events, calls, s2 } = await bootAndSettle(gen2Claim.run_id, outboxRoot);
+      assert.deepEqual(events, [`settle:${HOLD_G1}`], "nothing to replay; the sweep settles");
+      assert.deepEqual(calls[0]!.req, {
         predecessor_generation: 1,
         successor_generation: 2,
         pushed_sha: gitOut(`${fx.originPath}.gone`, "rev-parse", branchOf(iid)),
@@ -406,6 +429,60 @@ describe("settlement crash boundaries (issue #1582 M2)", () => {
         adopted_sha: gen1Head,
       });
       assert.deepEqual(await s2.coord.inspect(gen2Claim.run_id), [], "gen1's journal removed after the release");
+    } finally {
+      fs.renameSync(`${fx.originPath}.gone`, fx.originPath);
+      fs.rmSync(snapRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("(c) completion ACK received, crash BEFORE the promotion → boot replays the terminal, promotes before retiring it, then the sweep settles", async () => {
+    const iid = 6202;
+    const { s, gen2Claim, gen1Head } = await trackingScenario(iid);
+    const outboxRoot = path.join(fx.dataDir, "outbox");
+    const outbox1 = await mkOutbox(outboxRoot);
+    const snapRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-settle-crash-"));
+    let restore: Array<() => void> = [];
+    // The "crash": the completion ACK came back, and the process dies at the instant it would
+    // promote the write-ahead `pushed` record (freeze the durable state BEFORE that write).
+    const put = s.settlement.put.bind(s.settlement);
+    s.settlement.put = async (rec) => {
+      if (rec.state === "pending_settle" && restore.length === 0) {
+        restore = [
+          snapshot(outboxRoot, path.join(snapRoot, "outbox")),
+          snapshot(git.recoverySettlementRoot, path.join(snapRoot, "settlement")),
+          snapshot(git.recoveryRoot, path.join(snapRoot, "recovery")),
+        ];
+      }
+      return put(rec);
+    };
+    await runGen2(s, gen2Claim, new FakeSettleClient(released), outbox1);
+    assert.ok(restore.length > 0, "precondition: the promotion was reached");
+    for (const r of restore) r();
+    const [atCrash] = await s.settlement.listRun(gen2Claim.run_id);
+    assert.equal(atCrash!.state, "pushed", "at the crash the record is write-ahead only (never sendable)");
+    fs.renameSync(fx.originPath, `${fx.originPath}.gone`);
+    try {
+      const outboxProbe = await mkOutbox(outboxRoot);
+      assert.equal(outboxProbe.hasPendingTerminal(gen2Claim.run_id, 2), true, "precondition: the terminal is still pending at boot");
+      const pendingAtPromote: boolean[] = [];
+      const { events, calls, s2 } = await bootAndSettle(gen2Claim.run_id, outboxRoot, (ob) =>
+        pendingAtPromote.push(ob.hasPendingTerminal(gen2Claim.run_id, 2)),
+      );
+      assert.deepEqual(pendingAtPromote, [true], "the replay promoted BEFORE the outbox entry was retired");
+      assert.deepEqual(events, ["state:completed", `settle:${HOLD_G1}`], "pending terminal replayed FIRST, then the settle");
+      assert.deepEqual(calls[0]!.req, {
+        predecessor_generation: 1,
+        successor_generation: 2,
+        pushed_sha: gitOut(`${fx.originPath}.gone`, "rev-parse", branchOf(iid)),
+        source_sha: gen1Head,
+        adopted_sha: gen1Head,
+      });
+      // gen2's own exact-generation record is out of scope here (the crash preceded its own release).
+      assert.deepEqual(
+        (await s2.coord.inspect(gen2Claim.run_id)).filter((r) => r.generation === 1),
+        [],
+        "gen1's journal removed after the release",
+      );
     } finally {
       fs.renameSync(`${fx.originPath}.gone`, fx.originPath);
       fs.rmSync(snapRoot, { recursive: true, force: true });

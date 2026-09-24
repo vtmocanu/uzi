@@ -294,16 +294,102 @@ describe("PredecessorSettler outcome rules (issue #1582 M2)", () => {
     assert.equal((await j.listRun(RUN)).length, 1);
   });
 
-  it("the sweep honours nextAttemptAt, never sends `adopted` records, skips a run with a pending terminal", async () => {
+  it("the sweep honours nextAttemptAt and never sends `adopted` or write-ahead `pushed` records", async () => {
+    const HOLD3 = "99999999-bbbb-cccc-dddd-eeeeeeeeeeee";
     await j.put(record({ nextAttemptAt: NOW + 10_000 }));
     await j.put(record({ holdId: HOLD2, state: "adopted", pushedSha: undefined, disposition: undefined }));
+    await j.put(record({ holdId: HOLD3, state: "pushed" }));
     await settler.sweep();
-    assert.equal(client.calls.length, 0, "not yet due; adopted never sent");
+    assert.equal(client.calls.length, 0, "not yet due; adopted and pushed never sent");
     clock = NOW + 10_000;
-    await settler.sweep(undefined, () => true);
-    assert.equal(client.calls.length, 0, "a run with an unresolved pending terminal is skipped");
     await settler.sweep();
     assert.deepEqual(client.calls.map((c) => c.holdId), [HOLD], "due pending_settle sent once");
+    assert.equal(await settler.settleOne(record({ holdId: HOLD3, state: "pushed" })), "skipped");
+    await settler.settleRun(RUN);
+    assert.ok(!client.calls.some((c) => c.holdId === HOLD3), "a pushed record is never sent by any path");
+  });
+
+  for (const status of [401, 403]) {
+    it(`a ${status} (a rotated join token is transient for the worker) → retry, not terminal`, async () => {
+      await j.put(record());
+      client.answers = [new RequestError("POST", "/x", status, "auth")];
+      assert.equal(await settler.settleOne(record()), "retry");
+      const [r] = await j.listRun(RUN);
+      assert.equal(r!.state, "pending_settle");
+      assert.equal(r!.lastReason, `http_${status}`);
+    });
+  }
+
+  it("a 409 (another unlisted 4xx) stays terminal", async () => {
+    await j.put(record());
+    client.answers = [new RequestError("POST", "/x", 409, "conflict")];
+    assert.equal(await settler.settleOne(record()), "terminal");
+  });
+
+  it("a STALE snapshot of a record already released + removed is dropped: no send, and a 5xx never resurrects it", async () => {
+    await j.put(record());
+    const stale = (await j.listRun(RUN))[0]!;
+    assert.equal(await settler.settleOne(stale), "released");
+    assert.deepEqual(await j.listRun(RUN), []);
+    client.answers = [new RequestError("POST", "/x", 503, "unavailable")];
+    assert.equal(await settler.settleOne(stale), "skipped");
+    assert.equal(client.calls.length, 1, "the stale copy is never sent");
+    assert.deepEqual(await j.listRun(RUN), [], "the record stays removed");
+  });
+
+  it("a record removed WHILE its settle is in flight is not resurrected by the retry (5xx) nor the terminal (400)", async () => {
+    for (const err of [new RequestError("POST", "/x", 503, "u"), new RequestError("POST", "/x", 400, "b")]) {
+      await j.put(record());
+      const racing: RecoverySettleClient = {
+        settleRecoveryHold: async () => {
+          await j.remove(RUN, HOLD); // e.g. a concurrent released cleanup
+          throw err;
+        },
+      };
+      const s2 = new PredecessorSettler({ journal: j, client: racing, cleanup, log: nullLogger() });
+      assert.equal(await s2.settleOne(record()), "skipped");
+      assert.deepEqual(await j.listRun(RUN), [], `record stays removed after ${err.status}`);
+    }
+  });
+
+  it("a snapshot whose journal copy CHANGED (attempts / nextAttemptAt / state / pushedSha) is dropped unsent", async () => {
+    await j.put(record({ attempts: 2, nextAttemptAt: NOW - 1 }));
+    for (const snap of [
+      record({ attempts: 1, nextAttemptAt: NOW - 1 }),
+      record({ attempts: 2, nextAttemptAt: NOW - 2 }),
+      record({ attempts: 2, nextAttemptAt: NOW - 1, pushedSha: "4".repeat(40) }),
+    ]) {
+      assert.equal(await settler.settleOne(snap), "skipped");
+    }
+    await j.put(record({ state: "terminal", lastReason: "not_ancestor" }));
+    assert.equal(await settler.settleOne(record()), "skipped");
+    assert.equal(client.calls.length, 0);
+  });
+
+  it("an abort stops the sweep promptly: the in-flight settle is aborted and consumes no attempt", async () => {
+    await j.put(record());
+    let started!: () => void;
+    const began = new Promise<void>((r) => (started = r));
+    const hanging: RecoverySettleClient = {
+      settleRecoveryHold: (_r, _h, _req, signal) =>
+        new Promise((_resolve, reject) => {
+          started();
+          signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+          // Bound the hang so a missing abort reads as a named assertion failure, not a test timeout.
+          setTimeout(() => reject(new Error("never aborted")), 2_000).unref();
+        }),
+    };
+    const s2 = new PredecessorSettler({ journal: j, client: hanging, cleanup, log: nullLogger() });
+    const ctl = new AbortController();
+    const sweep = s2.sweep(ctl.signal);
+    await began;
+    ctl.abort();
+    const t0 = Date.now();
+    await sweep;
+    assert.ok(Date.now() - t0 < 1_000, "the sweep returned promptly after the abort");
+    const [r] = await j.listRun(RUN);
+    assert.equal(r!.attempts, 0, "an aborted attempt is not counted");
+    assert.equal(r!.state, "pending_settle");
   });
 
   it("backoff doubles from 1 min and is capped at 6 h; the attempt cap turns a record terminal", async () => {
@@ -316,6 +402,82 @@ describe("PredecessorSettler outcome rules (issue #1582 M2)", () => {
     const [r] = await j.listRun(RUN);
     assert.equal(r!.state, "terminal");
     assert.equal(r!.attempts, SETTLE_MAX_ATTEMPTS);
+  });
+});
+
+describe("PredecessorSettler terminal-ACK lifecycle (issue #1582 M2)", () => {
+  let root: string;
+  let j: SettlementJournal;
+  let settler: PredecessorSettler;
+  const HOLD3 = "99999999-bbbb-cccc-dddd-eeeeeeeeeeee";
+
+  beforeEach(async () => {
+    root = tmp("uzi-settle-ack-");
+    j = journal(root);
+    settler = new PredecessorSettler({ journal: j, client: new FakeSettleClient(), cleanup: new RecordingCleanup(), log: nullLogger() });
+    await j.put(record({ state: "pushed" }));
+    await j.put(record({ holdId: HOLD2, state: "adopted", pushedSha: undefined, disposition: undefined }));
+    // another generation's record is never touched by gen 2's ACK
+    await j.put(record({ holdId: HOLD3, state: "pushed", successorGeneration: 5 }));
+  });
+  const states = async (): Promise<Record<string, [string, string | undefined]>> =>
+    Object.fromEntries((await j.listRun(RUN)).map((r) => [r.holdId, [r.state, r.lastReason]]));
+
+  for (const [label, ack] of [
+    ["applied + completed", { applied: true, status: "completed" }],
+    ["409 already completed (a replay after a lost ACK)", { applied: false, status: "completed" }],
+    ["applied with NO status (an older server)", { applied: true }],
+  ] as const) {
+    it(`${label}: pushed → pending_settle; adopted → terminal/successor_not_published`, async () => {
+      await settler.observeTerminalAck(RUN, 2, { status: "completed" }, ack);
+      assert.deepEqual(await states(), {
+        [HOLD]: ["pending_settle", undefined],
+        [HOLD2]: ["terminal", "successor_not_published"],
+        [HOLD3]: ["pushed", undefined],
+      });
+    });
+  }
+
+  for (const status of ["failed", "cancelled"]) {
+    it(`a completed report the server answered ${status}: both → terminal/successor_not_completed (not sendable)`, async () => {
+      await settler.observeTerminalAck(RUN, 2, { status: "completed" }, { applied: true, status });
+      assert.deepEqual(await states(), {
+        [HOLD]: ["terminal", "successor_not_completed"],
+        [HOLD2]: ["terminal", "successor_not_completed"],
+        [HOLD3]: ["pushed", undefined],
+      });
+    });
+  }
+
+  it("the successor's own failed report (applied, no status) → terminal/successor_not_completed", async () => {
+    await settler.observeTerminalAck(RUN, 2, { status: "failed" }, { applied: true });
+    assert.equal((await states())[HOLD2]![1], "successor_not_completed");
+  });
+
+  for (const [label, report, ack] of [
+    ["stale_claim", { status: "completed" }, { applied: false, staleClaim: true, status: "completed" }],
+    ["a non-terminal 409 (running)", { status: "completed" }, { applied: false, status: "running" }],
+    ["an unreadable 409 (no status)", { status: "completed" }, { applied: false }],
+    ["a non-terminal report", { status: "limit_wait" }, { applied: true, status: "failed" }],
+  ] as const) {
+    it(`${label}: nothing changes`, async () => {
+      await settler.observeTerminalAck(RUN, 2, report, ack);
+      assert.deepEqual(await states(), {
+        [HOLD]: ["pushed", undefined],
+        [HOLD2]: ["adopted", undefined],
+        [HOLD3]: ["pushed", undefined],
+      });
+    });
+  }
+
+  it("a newer generation supersedes OLDER adopted/pushed records (terminal/superseded); same/newer untouched", async () => {
+    await j.put(record({ holdId: "88888888-bbbb-cccc-dddd-eeeeeeeeeeee", state: "pending_settle" }));
+    await settler.supersedeOlderGenerations(RUN, 5);
+    const s = await states();
+    assert.deepEqual(s[HOLD], ["terminal", "superseded"]);
+    assert.deepEqual(s[HOLD2], ["terminal", "superseded"]);
+    assert.deepEqual(s[HOLD3], ["pushed", undefined], "the current generation's own record is untouched");
+    assert.deepEqual(s["88888888-bbbb-cccc-dddd-eeeeeeeeeeee"], ["pending_settle", undefined], "settle-eligible kept");
   });
 });
 

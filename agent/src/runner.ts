@@ -39,6 +39,7 @@ import { RecoveryCoordinator, isCodePublishingKind, type RecoveryRecord } from "
 import {
   PredecessorSettler,
   SettlementJournal,
+  isSafeSettlementId,
   type RecoverySettleClient,
   type SettlementRecord,
 } from "./recovery-settlement.js";
@@ -1128,22 +1129,34 @@ export class RunRunner {
   /**
    * issue #1582 M2 — the restart/retry sweep of the ancestry-settlement journal (called by the
    * worker after the boot pending-terminal gate, then on a timer). Settles every DUE
-   * `pending_settle` record with NO forge credential (the api proves ancestry itself). A run whose
-   * completion is still an unresolved pending terminal in the outbox is skipped until it resolves.
-   * Records still `adopted` (no pushed head) are never sent. Best-effort; never throws.
+   * `pending_settle` record with NO forge credential (the api proves ancestry itself). A record is
+   * `pending_settle` only once its successor's completion ACK was OBSERVED
+   * ({@link observeSettlementTerminalAck}); a pushed head persisted write-ahead of the report stays
+   * `pushed` until then and is never sent, so no outbox pending-terminal check is needed here.
+   * Best-effort; never throws.
    */
   async settlePendingPredecessors(signal?: AbortSignal): Promise<void> {
-    const outbox = this.outbox;
-    const pendingRuns = (): Set<string> => {
-      try {
-        return new Set((outbox?.listPendingTerminals() ?? []).map((e) => e.run_id));
-      } catch {
-        return new Set();
-      }
-    };
-    const pending = pendingRuns();
-    await this.settler.sweep(signal, (runId) => pending.has(runId)).catch((err) => {
+    await this.settler.sweep(signal).catch((err) => {
       this.log.warn("recovery settlement: sweep failed", { error: errMessage(err) });
+    });
+  }
+
+  /**
+   * issue #1582 M2 — apply an observed terminal-report ACK for generation `claimGeneration` of
+   * `runId` to that generation's settlement records: a `completed` outcome promotes `pushed` →
+   * `pending_settle`; a completion with no pushed head, or a failed/cancelled outcome, moves the
+   * records `terminal` (pins kept). Every terminal send calls this BEFORE the outbox journal is
+   * retired (the live reportState choke point, and the boot / post-drain / queued-duplicate outbox
+   * replays), so a crash between the ACK and the promotion replays and promotes. Never throws.
+   */
+  async observeSettlementTerminalAck(
+    runId: string,
+    claimGeneration: number,
+    body: StateRequest,
+    ack: StateAck,
+  ): Promise<void> {
+    await this.settler.observeTerminalAck(runId, claimGeneration, body, ack).catch((err) => {
+      this.log.warn("recovery settlement: terminal ACK observation failed", { run_id: runId, error: errMessage(err) });
     });
   }
 
@@ -1311,7 +1324,13 @@ export class RunRunner {
       await resolvePendingTerminal(deps, {
         runId,
         claimGeneration: gen,
-        send: (body, sig) => this.client.reportState(runId, { ...body, claim_generation: gen }, sig),
+        // issue #1582 M2: the replayed ACK is applied to the settlement journal BEFORE the resolve
+        // retires the outbox entry.
+        send: async (body, sig) => {
+          const ack = await this.client.reportState(runId, { ...body, claim_generation: gen }, sig);
+          await this.observeSettlementTerminalAck(runId, gen, body, ack);
+          return ack;
+        },
       });
     }
   }
@@ -2737,7 +2756,6 @@ export class RunRunner {
     // so every error is swallowed. Runs AFTER the state report lands.
     const driveRecoveryTerminal = async (
       body: Parameters<RunFlight["reportState"]>[0],
-      ack?: StateAck,
     ): Promise<void> => {
       const status = (body as { status?: string }).status;
       try {
@@ -2765,14 +2783,6 @@ export class RunRunner {
               ? "publication"
               : undefined;
           await this.recovery.release(claim.run_id, claim.claim_generation, releaseEvidence);
-          // issue #1582 M2: only once the completion is ACKNOWLEDGED — the ack reads the run
-          // `completed` (applied now, or already terminal-completed), or an applied ack carries no
-          // status (an older server) — ask the api to settle each adopted predecessor hold whose
-          // pushed head was persisted before this report. An ack naming any OTHER status (the
-          // server failed the run instead) settles nothing. Best-effort; the worker sweep retries.
-          if (ack && (ack.status === "completed" || (ack.status === undefined && ack.applied))) {
-            await this.settler.settleRun(claim.run_id);
-          }
         } else if (status === "failed" || status === "cancelled") {
           const capBarePath = flight.barePath;
           if (!capBarePath) return;
@@ -2816,7 +2826,7 @@ export class RunRunner {
     };
     const reportState = async (body: Parameters<RunFlight["reportState"]>[0]) => {
       const res = await flight.reportState(body, boundarySignal);
-      await driveRecoveryTerminal(body, res);
+      await driveRecoveryTerminal(body);
       return res;
     };
     const closeBatcher = () => batcher.close(boundarySignal);
@@ -2825,10 +2835,14 @@ export class RunRunner {
     // have closed the batcher first, so the fence is the durable emitted tail. Every terminal site in
     // this phase routes through here instead of a raw `reportState(body)`.
     // issue #1582 M2: a completed report with a pushed branch first persists the successor's pushed
-    // head on this run's adopted settlement records (write-ahead of the report itself).
+    // head on this run's adopted settlement records as `pushed` (write-ahead of the report itself;
+    // never sent). The reportState choke point promotes it to `pending_settle` when it observes the
+    // completion ACK, and the settle itself runs only AFTER the terminal outcome resolved (the
+    // outbox journal retired / terminalResolved latched), off the terminal send path.
     const journalTerminalReport = async (body: Parameters<RunFlight["reportState"]>[0]) => {
       await this.persistSettlementPushedHead(claim, flight, body);
       await this.journalAndSendTerminal(flight, TERMINAL_JOURNAL_PHASE, body, reportState);
+      await this.settleAfterCompletion(claim, flight, body);
     };
     const finishCommittedPublish = async (
       body: Parameters<RunFlight["reportState"]>[0],
@@ -2843,9 +2857,10 @@ export class RunRunner {
           await this.persistSettlementPushedHead(claim, flight, body);
           await this.journalAndSendTerminal(flight, TERMINAL_JOURNAL_PHASE, body, async (b) => {
             const res = await flight.reportState(b);
-            await driveRecoveryTerminal(b, res);
+            await driveRecoveryTerminal(b);
             return res;
           });
+          await this.settleAfterCompletion(claim, flight, body);
           runLog.info(logMessage, fields);
         });
         return;
@@ -4730,6 +4745,12 @@ export class RunRunner {
         // report (another claim owns the run now). A stale ack on the TERMINAL `failed` report is
         // a no-op: that reportState is already `.catch(...)`-guarded, so the throw is swallowed.
         if (ack.staleClaim) throw new StaleClaimError();
+        // issue #1582 M2: a TERMINAL report's ACK drives the settlement lifecycle (promote the
+        // write-ahead `pushed` head on a completed outcome, else stop the records). Here, inside the
+        // send, so it lands BEFORE the terminal resolve retires the outbox journal.
+        if (body.status === "completed" || body.status === "failed") {
+          await this.observeSettlementTerminalAck(runId, flight.claimGeneration, body, ack);
+        }
         return ack;
       },
       barePath: undefined,
@@ -6768,6 +6789,11 @@ export class RunRunner {
   ): Promise<void> {
     if (!this.recovery.enabled) return; // token-less harness: no journal, no inventory call
     if (!isCodePublishingKind(resolveRunKind(claim.kind))) return;
+    // issue #1582 M2 (N3): a newer generation started, so an older successor's still-`adopted` /
+    // `pushed` settlement records can never settle through it: stop them (pins kept).
+    if (claim.claim_generation !== undefined) {
+      await this.settler.supersedeOlderGenerations(claim.run_id, claim.claim_generation);
+    }
     try {
       const startTip = await this.currentRestorePointHead(flight);
       await this.pinRecoveryGeneration(claim, flight, startTip);
@@ -6818,6 +6844,9 @@ export class RunRunner {
       const records = await this.recovery.inspect(claim.run_id);
       for (const hold of holds) {
         if (!Number.isSafeInteger(hold.generation) || hold.generation >= successor) continue;
+        // Ids the journal would refuse are refused BEFORE any pin, so no orphan refs/uzi-settle pin
+        // is left behind and two ids that sanitize alike can never share one.
+        if (!isSafeSettlementId(claim.run_id) || !isSafeSettlementId(hold.hold_id)) continue;
         const pred = records.find((r) => r.generation === hold.generation);
         if (!pred) continue; // no authenticated predecessor source → no evidence; hold retained
         const pinned = await this.git.pinSettlementRefs(barePath, claim.run_id, hold.hold_id, {
@@ -6860,10 +6889,33 @@ export class RunRunner {
   }
 
   /**
+   * issue #1582 M2 — the in-run settle, run AFTER the completed report's terminal outcome resolved
+   * (never inside the terminal send). Sends every `pending_settle` record of this run — i.e. only
+   * when the reportState choke point observed a completion ACK and promoted it. Aborts with the
+   * flight's cancel signal (worker shutdown); the worker sweep retries anything left. Best-effort.
+   */
+  private async settleAfterCompletion(
+    claim: ClaimResponse,
+    flight: RunFlight,
+    body: Parameters<RunFlight["reportState"]>[0],
+  ): Promise<void> {
+    if ((body as StateRequest).status !== "completed") return;
+    if (!isCodePublishingKind(resolveRunKind(claim.kind))) return;
+    await this.settler.settleRun(claim.run_id, flight.cancel.signal).catch((err) => {
+      flight.runLog.warn("recovery settlement: post-completion settle failed (the sweep retries)", {
+        run_id: claim.run_id,
+        error: errMessage(err),
+      });
+    });
+  }
+
+  /**
    * issue #1582 M2 — BEFORE a completed report with a pushed branch is sent, persist the
-   * successor's pushed head on every `adopted` settlement record of this run and move it to
-   * `pending_settle` (disposition `publication`), pinning the head under `.../pushed`. A completion
-   * with no branch (report_only / not_code) leaves the records untouched. Best-effort.
+   * successor's pushed head on every `adopted` settlement record of this generation and move it to
+   * the write-ahead `pushed` state (disposition `publication`), pinning the head under `.../pushed`.
+   * `pushed` is NEVER sent: only an observed completion ACK promotes it to `pending_settle`
+   * ({@link observeSettlementTerminalAck}). A completion with no branch (report_only / not_code)
+   * leaves the records `adopted`; that completion's ACK then moves them terminal. Best-effort.
    */
   private async persistSettlementPushedHead(
     claim: ClaimResponse,
@@ -6894,7 +6946,7 @@ export class RunRunner {
           ...rec,
           pushedSha: pushed,
           disposition: "publication",
-          state: "pending_settle",
+          state: "pushed",
         });
       }
     } catch (err) {

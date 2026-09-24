@@ -214,7 +214,7 @@ describe("RunRunner — adoption evidence + settle of an older-generation hold (
       });
       await runCompleting(r, claim);
       assert.ok(atReport, "the settlement record existed when the completed report landed");
-      assert.equal(atReport!.state, "pending_settle");
+      assert.equal(atReport!.state, "pushed", "write-ahead state: persisted, but never sendable before the ACK");
       assert.match(atReport!.pushedSha ?? "", /^[0-9a-f]{40}$/, "pushedSha persisted before the report");
       assert.equal(atReport!.disposition, "publication");
       assert.deepEqual(events, ["state:completed", `settle:${HOLD_A}`], "settle only after the completion ACK");
@@ -226,6 +226,45 @@ describe("RunRunner — adoption evidence + settle of an older-generation hold (
       assert.equal(rec!.attempts, 1);
       assert.ok(refOrNull(bare(), settleRef(claim.run_id, HOLD_A, "pushed")));
       assert.equal((await r.coord.inspect(claim.run_id)).length, 1, "predecessor journal retained");
+    } finally {
+      r.cleanup();
+    }
+  });
+
+  it("a sweep fired right after the write-ahead persist (before the completion ACK) sends NOTHING; the post-ACK path settles", async () => {
+    const r = rig("tracking");
+    try {
+      const src = originCommit("prior-sweep", "PRIOR.txt");
+      const claim = gitlabClaim(5106, { claim_generation: 2 });
+      await r.coord.pin({ runId: claim.run_id, sourceSha: src, kind: "issue", branch: "b", generation: 1 });
+      r.recoveryClient.holds = [{ hold_id: HOLD_A, generation: 1, has_available_capture: true }];
+      r.settleClient.answer = (h) => released(claim.run_id, h);
+      const { gitlab } = fakeGitlab();
+      const runner = runnerWith(() => ({ executor: new StubExecutor(nullLogger()) }), gitlab, undefined, nullLogger(), {
+        recovery: r.coord,
+        settlement: r.settlement,
+        settleClient: r.settleClient,
+      });
+      // The timer sweep fires at the worst instant: right after the pushed head is persisted, before
+      // the completed report is even sent (no outbox is wired, so no pending-terminal entry exists).
+      let sweptAfterPersist = false;
+      let callsAtSweep = -1;
+      const put = r.settlement.put.bind(r.settlement);
+      r.settlement.put = async (rec: SettlementRecord) => {
+        const ok = await put(rec);
+        if (rec.pushedSha && !sweptAfterPersist) {
+          sweptAfterPersist = true;
+          await runner.settlePendingPredecessors();
+          callsAtSweep = r.settleClient.calls.length;
+        }
+        return ok;
+      };
+      await runner.execute(claim);
+      assert.ok(sweptAfterPersist, "precondition: the sweep ran right after the persist");
+      assert.equal(callsAtSweep, 0, "no settle before the api applied the completion");
+      assert.ok(hasStatus(claim.run_id, "completed"));
+      assert.equal(r.settleClient.calls.length, 1, "the post-ACK path settled exactly once");
+      assert.deepEqual(await r.settlement.listRun(claim.run_id), [], "released and cleaned up");
     } finally {
       r.cleanup();
     }
@@ -243,7 +282,16 @@ describe("RunRunner — adoption evidence + settle of an older-generation hold (
       await runCompleting(r, claim);
       assert.equal(r.settleClient.calls.length, 0, "no settle without a completed ACK");
       const [rec] = await r.settlement.listRun(claim.run_id);
-      assert.equal(rec!.state, "pending_settle", "the evidence is kept for the sweep");
+      assert.equal(rec!.state, "terminal", "never left sendable: the successor did not complete");
+      assert.equal(rec!.lastReason, "successor_not_completed");
+      assert.ok(refOrNull(bare(), settleRef(claim.run_id, HOLD_A, "pushed")), "pins kept for the owner path");
+      assert.equal((await r.coord.inspect(claim.run_id)).length, 1, "predecessor journal kept");
+      await runnerWith(() => ({ executor: new StubExecutor(nullLogger()) }), fakeGitlab().gitlab, undefined, nullLogger(), {
+        recovery: r.coord,
+        settlement: r.settlement,
+        settleClient: r.settleClient,
+      }).settlePendingPredecessors();
+      assert.equal(r.settleClient.calls.length, 0, "the sweep never sends it either");
     } finally {
       r.cleanup();
     }
@@ -364,14 +412,57 @@ describe("RunRunner — NO adoption evidence (issue #1582 M2)", () => {
     }
   });
 
-  it("a hold this worker does not own is never inventoried, so nothing is recorded", async () => {
+  it("a hold id the journal would refuse pins NOTHING (checked before refs/uzi-settle is written)", async () => {
     const r = rig("tracking");
     try {
-      const src = originCommit("prior-foreign", "PRIOR.txt");
+      const src = originCommit("prior-unsafe", "PRIOR.txt");
       const claim = gitlabClaim(5204, { claim_generation: 2 });
       await r.coord.pin({ runId: claim.run_id, sourceSha: src, kind: "issue", branch: "b", generation: 1 });
-      r.recoveryClient.holds = []; // the api lists only this worker's own holds
+      // "bad.hold" sanitizes to the ref component "bad-hold" but is refused by the journal.
+      r.recoveryClient.holds = [{ hold_id: "bad.hold", generation: 1, has_available_capture: true }];
       await expectNothing(r, claim);
+      const pins = gitOut(bare(), "for-each-ref", "--format=%(refname)", `refs/uzi-settle/${claim.run_id}/`);
+      assert.equal(pins, "", "no orphan settlement pin");
+    } finally {
+      r.cleanup();
+    }
+  });
+
+  it("a newer generation marks an older successor's still-adopted/pushed records terminal/superseded (pins kept)", async () => {
+    const r = rig(); // default reseed: this generation adopts nothing itself
+    try {
+      const claim = gitlabClaim(5207, { claim_generation: 3 });
+      const old: SettlementRecord = {
+        version: 1,
+        runId: claim.run_id,
+        holdId: HOLD_A,
+        predecessorGeneration: 1,
+        successorGeneration: 2,
+        sourceSha: "1".repeat(40),
+        sourceCaptureId: "cap-old",
+        adoptedSha: "2".repeat(40),
+        seededFrom: "tracking",
+        branch: "agent/issue-5207",
+        barePath: "/nonexistent",
+        createdAt: 1,
+        state: "pushed",
+        pushedSha: "3".repeat(40),
+        disposition: "publication",
+        attempts: 0,
+      };
+      await r.settlement.put(old);
+      await r.settlement.put({ ...old, holdId: HOLD_B, state: "adopted", pushedSha: undefined, disposition: undefined });
+      r.settleClient.answer = (h) => released(claim.run_id, h);
+      await runCompleting(r, claim);
+      const recs = await r.settlement.listRun(claim.run_id);
+      assert.deepEqual(
+        recs.map((x) => [x.holdId, x.state, x.lastReason]),
+        [
+          [HOLD_A, "terminal", "superseded"],
+          [HOLD_B, "terminal", "superseded"],
+        ],
+      );
+      assert.equal(r.settleClient.calls.length, 0);
     } finally {
       r.cleanup();
     }

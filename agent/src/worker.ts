@@ -8,9 +8,9 @@ import type { JudgeRunner } from "./judge-runner.js";
 import type { ReviewRunner } from "./review-runner.js";
 import type { Logger } from "./log.js";
 import type { Config } from "./config.js";
-import type { ActiveSnapshot, OutboxHeartbeatEntry, StateRequest, WorkerStats } from "./protocol.js";
+import type { ActiveSnapshot, OutboxHeartbeatEntry, StateAck, StateRequest, WorkerStats } from "./protocol.js";
 import type { ActiveRunRegistry } from "./active-run-registry.js";
-import { makeTerminalOutboxDeps, resolvePendingTerminal } from "./terminal-resolve.js";
+import { makeTerminalOutboxDeps, resolvePendingTerminal, type SendTerminalState } from "./terminal-resolve.js";
 import { StatsCollector } from "./stats.js";
 import { errMessage, sleep } from "./util.js";
 import { toolchainPreflight, type PreflightResult } from "./toolchain-preflight.js";
@@ -137,7 +137,8 @@ export class Worker {
   }
 
   /** issue #1582 M2: sweep the settlement journal now, then every `settlementSweepMs` until the
-   *  signal aborts. Never throws (a failed sweep is logged and retried at the next tick). */
+   *  signal aborts. The signal reaches the in-flight settle call and the sleep, so an abort stops the
+   *  loop promptly. Never throws (a failed sweep is logged and retried at the next tick). */
   private async settlementLoop(signal: AbortSignal): Promise<void> {
     while (!signal.aborted) {
       try {
@@ -179,8 +180,7 @@ export class Worker {
           claimGeneration: gen,
           // State-only send stamped with the journal's generation, so a superseded generation is
           // refused as stale_claim (local-retired, D11) rather than mis-applied under the new one.
-          send: (body: StateRequest, sig?: AbortSignal) =>
-            this.client.reportState(entry.run_id, { ...body, claim_generation: gen }, sig),
+          send: this.replaySend(entry.run_id, gen),
           signal,
         });
       } catch (err) {
@@ -190,6 +190,26 @@ export class Worker {
         });
       }
     }
+  }
+
+  /**
+   * The state-only send an outbox REPLAY uses (boot and post-drain): stamped with the journal's
+   * generation, so a superseded generation is refused as stale_claim (local-retired, D11) rather than
+   * mis-applied under the new one. issue #1582 M2: the ACK is handed to the run lane's settlement
+   * lifecycle BEFORE it is returned, i.e. before the resolve retires the outbox entry — a crash after
+   * the ACK but before a promotion replays the journal and promotes then. An observer failure never
+   * disturbs the terminal resolution.
+   */
+  private replaySend(runId: string, gen: number): SendTerminalState {
+    return async (body: StateRequest, sig?: AbortSignal): Promise<StateAck> => {
+      const ack = await this.client.reportState(runId, { ...body, claim_generation: gen }, sig);
+      try {
+        await this.runner.observeSettlementTerminalAck(runId, gen, body, ack);
+      } catch (err) {
+        this.log.warn("recovery settlement: replayed terminal ACK not applied", { run_id: runId, error: errMessage(err) });
+      }
+      return ack;
+    };
   }
 
   /**
@@ -237,8 +257,7 @@ export class Worker {
           claimGeneration: gen,
           // State-only send stamped with the journal's generation (mirrors resolveBootTerminals): a
           // superseded generation is refused stale_claim and local-retired (D11), never mis-applied.
-          send: (body: StateRequest, sig?: AbortSignal) =>
-            this.client.reportState(runId, { ...body, claim_generation: gen }, sig),
+          send: this.replaySend(runId, gen),
           signal,
         });
       } catch (err) {

@@ -846,11 +846,13 @@ export class WorkerClient {
   /** settleRecoveryHold asks the api to settle ONE older-generation custody hold on a completed
    *  run by ANCESTRY (issue #1582): POST /runs/{id}/recovery-holds/{holdID}/settle with the strict
    *  candidate body. The api proves ancestry through the forge itself; the worker never sends a
-   *  verdict. Throws RequestError on 4xx/5xx (429/5xx/404 are retried later by the caller). */
+   *  verdict. Throws RequestError on 4xx/5xx (the caller decides retry vs terminal); `signal` aborts
+   *  an in-flight call on worker shutdown. */
   async settleRecoveryHold(
     runId: string,
     holdId: string,
     req: RecoverySettleRequest,
+    signal?: AbortSignal,
   ): Promise<RecoverySettleResponse> {
     // Build the body field-by-field so nothing beyond the five strict fields can ride along.
     const body: RecoverySettleRequest = {
@@ -863,6 +865,8 @@ export class WorkerClient {
     return (await this.postJSON(
       `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/recovery-holds/${encodeURIComponent(holdId)}/settle`,
       body,
+      undefined,
+      signal,
     )) as RecoverySettleResponse;
   }
 
