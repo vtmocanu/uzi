@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Added
+
+- **A Codex login the provider outright rejects now surfaces as "re-login required," with a reason ([#1594](https://github.com/vtmocanu/uzi/issues/1594)).**
+  When a Codex refresh fails with an allowlisted OAuth rejection code (the provider saying this refresh token can never work again, not an ambiguous timeout or 5xx), uzi quarantines the account and flags it for re-login in one transaction, and the Codex limits meter and `uzi rate-limits --provider codex` name the reason ("the saved Codex login was rejected by the provider"). Any other refresh failure stays on the existing cautious, ambiguous path and is never mislabelled re-login required, and uzi never re-sends a refresh token after a failed exchange. The Codex credentials docs and the web login field now guide toward a login kept dedicated to uzi and isolated from your everyday Codex CLI session, so a shared login can't invalidate itself out from under either side; some stale claims about Codex credentials being inert and about `staging` never resolving on its own are also corrected.
+
 ## [0.84.0] - 2026-09-20
 
 ### Added
