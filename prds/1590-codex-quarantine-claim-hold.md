@@ -95,11 +95,11 @@ Split the Codex claim sentinels into two classes, and pin the split in a table t
 | class | condition | outcome |
 |---|---|---|
 | **hold** | `ErrCodexAccountQuarantined` | park, cause `codex_account_unavailable` |
-| **hold** | `ErrCodexMaterialRevisionStale` on a run already held with cause `codex_account_unavailable`, where the same alias id is `staging` (not yet linked) | stay held, no token, pending D5 |
+| **hold** | `ErrCodexMaterialRevisionStale` on a subscription run past first link (frozen `codex_account_key` set) whose **same** alias id is `staging` or `failed` (a re-login in flight, identity not yet known), whether or not the run was already held | park or stay held, no token, pending D5 |
 | **terminal** | kind↔mode mismatch; login blob; deleted or incoherent alias (PRD #1332 D3) | `credential_unavailable`, unchanged |
 | **terminal** | identity tuple mismatch; `ErrCodexAccountKeyUnfrozen` on a run past first link | `credential_unavailable`, unchanged |
 | **terminal** | `ErrCodexAccountRevisionStale` (revocation fence) | `credential_unavailable`, unchanged |
-| **terminal** | material-revision change on a run **not** in this hold; a relink that fails D5 | `credential_unavailable`, unchanged |
+| **terminal** | a material-revision change that is not a same-alias re-login in flight (the alias is linked to a different identity or credential revision, or its auth mode changed); a relink that fails D5 | `credential_unavailable`, unchanged |
 | **terminal** | any bare store error | `credential_unavailable`, unchanged |
 
 `coord_state='in_progress'` is **not** a hold condition. During a live refresh lease the committed login stays releasable, which is the existing contract of `evalCodexReleasePredicate`, and this PRD does not change it. A lease that expires is reaped into `quarantined` within one survivor tick, and the D2 gate catches it there. Keeping ClaimRun's gate, the sweeper park, and the authority predicate on the identical condition (`coord_state='quarantined'`) removes the SQL-vs-predicate drift.
@@ -108,16 +108,15 @@ A `failed` staging alias (the new login proved unusable) keeps the run held with
 
 ### D2: gate in ClaimRun; park from the sweeper; assembly is only the race fallback
 
-- **ClaimRun predicate.** A standalone predicate, shaped like the custom-model clause, excludes a run when all of these hold:
-  - `harness='codex'` and `codex_auth_mode='subscription'`;
-  - the linked account exists;
-  - `cpa.coord_state='quarantined'`.
+- **ClaimRun predicate.** A standalone predicate, shaped like the custom-model clause, excludes a Codex subscription run (`harness='codex'`, `codex_auth_mode='subscription'`) in either of two cases:
+  - **quarantine:** the linked account exists and `cpa.coord_state='quarantined'`;
+  - **re-login in flight:** the run is past first link (frozen `codex_account_key` set), its **same** alias id is `staging` or `failed`, and the alias `material_revision` is greater than the run's frozen `codex_material_revision`. A PATCH clears `provider_account_id`, so the quarantine case cannot see this one. Without this case, a re-login that starts before the sweeper parks the queued run would let a claim fail on `ErrCodexMaterialRevisionStale`.
 
-  It also excludes a run held under D1's staging row (runs in `recovery_wait` are not claimable anyway). `api_key` bindings and unlinked aliases outside such a hold are unaffected, and assembly's existing checks handle them.
-- **Sweeper park.** A new pass, `park_codex_account_unavailable`, moves `queued` runs matching the same predicate to `recovery_wait` with cause `codex_account_unavailable`. It moves no generation, opens no hold, leaves `worker_id` alone, and fences on `status='queued'` and the observed row.
+  `api_key` bindings, and unlinked aliases on runs that never reached first link, are unaffected; assembly's existing checks handle them.
+- **Sweeper park.** A new pass, `park_codex_account_unavailable`, moves `queued` runs matching either case of the same predicate to `recovery_wait` with cause `codex_account_unavailable`. It moves no generation, opens no hold, leaves `worker_id` alone, and fences on `status='queued'` and the observed row.
 - **Assembly fallback.** When assembly sees a hold-class sentinel, it runs a new transaction, `ParkRunCodexAccountUnavailable`, that composes the two precedents:
   - It locks the run `FOR UPDATE`, and refuses (with nothing mutated) unless `status='claimed'`, `worker_id` is the claimant and `claim_generation` is the claim's generation. A cancel or a competing reclaim wins.
-  - It locks the open holds for (run, claimant, this generation), requires exactly one, and releases it with `release_evidence='no_adopted_source'`. Zero or several means refuse and fail closed to today's behaviour, logged.
+  - It computes the **expected** number of holds this claim opened from the **same claim-time recovery-capable boolean ClaimRun passed to its `hold` CTE** (`runtime.sql` ~1044-1063; carried from the claim into assembly, never re-derived from a later mutable worker row or from the observed count): one when the CTE applied (a claimant advertising `recovery_archive_v1`, on a hold-opening kind), otherwise zero (see `api/internal/workersvc/claim_custody_livedb_test.go` ~98 for the zero-hold claim). It locks the open holds for (run, claimant, this generation) and requires exactly that count. With one, it releases the hold with `release_evidence='no_adopted_source'`. With zero, it releases nothing and parks. Any other count (an unexpected hold, or two) refuses and fails closed to today's behaviour, logged.
   - It sets `status='recovery_wait'`, the cause, `status_since`, `started_at=NULL`, `budget_paused_seconds=0`, `codex_cap_hash=NULL`, `codex_claim_epoch+1`, and clears health (the `SetRunPoolWait` field set).
   - It applies the D4 affinity preference.
   - Older-generation holds stay open, so custody is retained.
@@ -168,6 +167,7 @@ A new CAS-fenced statement, `ReadmitRunCodexBinding`, advances **only** `runs.co
 
 Outcomes:
 - While the alias is `staging` or `failed` (identity unknown), the run stays held with no token.
+- **Alias deleted while held.** Deleting the alias after the park sets `codex_secret_id` to NULL through the FK (`api/internal/store/migrations/00202_run_codex_binding.sql` ~69) and does not end the run. The promoter checks this first, before taking any alias or account lock: a held run with `codex_secret_id IS NULL` (and a non-null frozen `codex_material_revision`) is failed with `fail_origin='credential_unavailable'` and a reason naming the deleted credential. The failure is fenced on `status='recovery_wait'` and the cause, and it retains custody, as any failed run does.
 - A linked alias that fails the identity or credential-revision check makes the run **terminal**, with `credential_unavailable` and a reason naming the binding change.
 - Each re-admission writes a run feed status line naming the alias label and the material-revision change, never token material.
 
@@ -183,7 +183,7 @@ The run DTO gains a derived `codex_account_action` for a run held on `codex_acco
 | alias linked, account quarantined, no material and no live lease, or reauth flag set | `relogin_required` |
 | alias `staging` (new login being verified) | `verifying_login` |
 | alias `failed` (new login unusable) | `relogin_required` |
-| alias deleted (`codex_secret_id` NULL) | none: the run is terminal per D1, so it never reaches this state; defensively `relogin_required` |
+| alias deleted (`codex_secret_id` NULL) | transient: the next promoter tick fails the run per D5; until then, `relogin_required` |
 | account not quarantined, release predicate passes | `resuming` (transient until the next tick) |
 
 The DTO exposes only the run's own snapshotted alias label (`codex_secret_label`), never a label or identity of a different account. The action is never persisted, so it cannot go stale. The api-contract fixture gains the field.
@@ -219,12 +219,13 @@ Each milestone ends green on `task gate:api`, plus `task gate:web` for M5 and `t
     - health `ok`;
     - the gen-2 hold released with `no_adopted_source` and the gen-1 hold still open;
     - `worker_id = A`.
-  - Precedence tests: a cancel or a competing reclaim between claim and park wins (the park refuses on status, worker or generation mismatch, with nothing mutated). Zero or two open gen-2 holds refuse the park.
+  - Precedence tests: a cancel or a competing reclaim between claim and park wins (the park refuses on status, worker or generation mismatch, with nothing mutated). A claim by a worker without `recovery_archive_v1` (expected 0, actual 0) parks with no release. Expected 1 with actual 0 (a missing hold) refuses, as do expected 0 with actual 1 and any count of two.
 - [ ] **M2: Pre-claim gate and sweeper park.** Depends on M1.
   - The ClaimRun predicate (D2) and its peer mirror, plus the `park_codex_account_unavailable` pass.
   - Tests:
     - a quarantined account's run is never claimed, and gains no generation or hold;
     - an `in_progress` account's run is still claimable (unchanged);
+    - a re-login started while the run is still queued (alias PATCHed to `staging`, link cleared, run past first link) is not claimed, is parked by the sweeper, and never fails on `ErrCodexMaterialRevisionStale`;
     - `api_key` and Claude runs are unaffected;
     - a claim-versus-quarantine race reaching assembly lands on M1's park;
     - no claim or requeue loop over N sweep ticks.
@@ -244,7 +245,7 @@ Each milestone ends green on `task gate:api`, plus `task gate:web` for M5 and `t
     - a same alias, same identity, unchanged `credential_revision` re-login is re-admitted and claimable;
     - the same identity with a bumped `credential_revision` is terminal;
     - a different identity is terminal;
-    - a deleted alias is terminal;
+    - a deleted alias is terminal, including an alias deleted after the run was parked (the promoter fails it; no indefinite hold);
     - a changed auth mode is terminal;
     - `staging` or `failed` stays held with no token;
     - a concurrent material change affects 0 rows;
