@@ -242,7 +242,7 @@ redirect stdout to a file to keep the machine-readable record, e.g.:
 
 Each invocation creates its own detached worktree and image (named after the
 resolved commit sha AND a per-invocation id from its throwaway worktree's own
-`mktemp` suffix, e.g. `m1598-img-e648d16c-e648d16cd48f-a1b2c3`, never just the
+`mktemp` suffix, lowercased because Docker image names must be lowercase, e.g. `m1598-img-e648d16c-e648d16cd48f-a1b2c3`, never just the
 sha, so two invocations at the same ref never share an image/container name
 and one's `UZI_M1598_KEEP=1` image can never be retagged/removed by the
 other) and removes both on exit unless `UZI_M1598_KEEP=1`. **This does not

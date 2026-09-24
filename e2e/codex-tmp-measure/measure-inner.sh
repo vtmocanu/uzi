@@ -239,9 +239,10 @@ for i in $(seq 1 "$N"); do
   # though the downstream `tail`/`tr`/second `grep` succeed (pipefail reports
   # the last NON-ZERO stage, not simply the rightmost stage), which would
   # otherwise abort this whole script. An empty match here is not an error --
-  # it happens on every command whose wait loop above timed out and drove
-  # dispose after the supervisor was already killed (dispose's cleanup exits
-  # without ever appending a "dispose"/"child_exit" evidence line) -- so both
+  # it happens when the supervisor had already exited without a "dispose"
+  # line (an abnormal exit writes "abnormal" instead), when the command was
+  # killed by dispose before it exited on its own (no "child_exit"), or if
+  # the evidence copier was stopped before its last line landed -- so both
   # fields must still resolve to JSON `null` rather than kill the run.
   DISPOSE_LINE=$(grep '"event":"dispose"' "$EVLOG" 2>/dev/null | tail -1 | tr -d '\n' || true)
   # The command's own exit code (doc.go: {"event":"child_exit","code":<int>}),

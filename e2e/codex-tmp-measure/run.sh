@@ -54,7 +54,9 @@ CTX="$WORKDIR/ctx"
 # `BUILT` gate correctly stops an invocation from removing an image it never
 # itself built -- the gate does not help when the second invocation legally
 # rebuilds and owns that same shared tag.
-INVOCATION_ID=${WORKDIR##*-}
+# Lowercased: mktemp's suffix is mixed-case and Docker image names must be
+# lowercase.
+INVOCATION_ID=$(printf '%s' "${WORKDIR##*-}" | tr '[:upper:]' '[:lower:]')
 IMAGE="m1598-img-$SLUG-$SHORT-$INVOCATION_ID"
 # Deterministic, unique-per-invocation container name (also passed to `docker
 # run --name` below) so the cleanup trap can target exactly the container this

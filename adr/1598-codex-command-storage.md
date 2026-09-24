@@ -43,8 +43,10 @@ delete what this issue produces:
   pins the root's device/inode, and checks the **owner** of every entry it
   descends into. A mismatched device/inode, a foreign owner, an unexpected
   name, or an I/O error each stop at the first failure and report why; what
-  was already removed stays removed and the rest is retained, so a later
-  retry resumes and converges.
+  was already removed stays removed and the rest is retained. Only the
+  deadline case (and a transient I/O error) converges on a later retry: a
+  foreign-owned entry, a root that no longer matches the pin, or an invalid
+  name fails the same way every time and stays for inspection.
 - It streams entries per `getdents` chunk instead of loading a whole directory
   listing into memory, and hoists deep subdirectories up to be processed from
   the root, so removal is not bounded by depth or by how large any one
@@ -53,9 +55,8 @@ delete what this issue produces:
   rwx bits (e.g. 0555 becomes 0755) so it can traverse and unlink a Go module
   cache's read-only directories as their owner — the chmod goes through the
   inode's own `/proc/self/fd/N` magic link (`addOwnerBits`), never the
-  entry's own pathname (a lookup of the fd's `/proc/self/fd/N` link,
-  re-verified afterwards), and is re-verified against the same dev/ino/mode
-  afterward. This is what `os.RemoveAll` cannot do as the owner of a
+  entry's own pathname, and the inode is re-checked against the same
+  dev/ino/mode afterwards. This is what `os.RemoveAll` cannot do as the owner of a
   directory it made read-only.
 - Removal is bounded by a caller-supplied deadline; hitting it stops the walk
   at the first failure and keeps whatever has not yet been removed — what the
@@ -91,13 +92,15 @@ ECHILD+`__WALL` drain proof for its unrelated core responsibility (confirming
 the tracked tree is empty before reporting `dispose`), so ownership of "is it
 safe to delete this tmp yet" falls out of a fact the supervisor already knows
 and cmdsandbox does not. cmdsandbox therefore only **adopts** the tmp the
-supervisor already created — it never creates or removes it. Every uid-10003
-process, including any command process, can already remove the directory it
-runs as; the supervisor instead holds removal RESPONSIBILITY, not exclusive
-authority: it is the only process that knows the pin, holds the liveness
-lock, and outlives every descendant, so it — rather than a peer of the
-command process it supervises — is the one that decides when removal is
-safe. ("Root-owned 0555" describes the supervisor binary itself, not the
+supervisor already created — it never creates or removes it. Any uid-10003
+process can already delete the tmp's contents (and, without Landlock, the
+directory itself); the supervisor instead holds removal RESPONSIBILITY, not
+exclusive authority: it is the only process that knows the pin and holds the
+liveness lock, and it is the process that proves (ECHILD+`__WALL`) that no
+descendant remains before removing — so it, rather than a peer of the command
+process it supervises, decides when removal is safe. When that proof fails
+(an unconfirmed drain, or a killed supervisor) descendants can outlive it and
+the tmp is left for the startup reaper. ("Root-owned 0555" describes the supervisor binary itself, not the
 directory it removes.)
 
 Stray file descriptors inherited into the supervisor are marked
