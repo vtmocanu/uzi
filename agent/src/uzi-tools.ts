@@ -1,6 +1,6 @@
 // The uzi tools MCP server (PRD #39 M3, Decisions 7/8/10). An in-process SDK MCP
 // server (the signals.ts precedent) the chat agent calls to investigate its OWNER'S
-// runs and to DRAFT — never file — GitLab issues.
+// runs and to DRAFT — never file — forge issues (GitHub, GitLab or Forgejo).
 //
 // Two invariants make this safe:
 //   1. Read-only, user-scoped, API-mediated (Decision 7). Every read goes through a
@@ -279,7 +279,7 @@ export function buildUziToolsServer(deps: UziToolsDeps): {
       tool(
         PROPOSE_ISSUE_TOOL,
         [
-          "DRAFT a GitLab issue for the user to review. This does NOT create the issue: it",
+          "DRAFT a forge issue for the user to review. This does NOT create the issue: it",
           "shows the user a proposal card with Create / Dismiss buttons — only their click",
           "opens the real issue through their own connection. Tell the user to click Create.",
           "Name the repo with repo_path (as list_runs shows it). If the user wants uzi to",

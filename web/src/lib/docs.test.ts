@@ -84,7 +84,7 @@ describe("resolveHref", () => {
     );
   });
 
-  it("sends a repo-only doc (not a user page) to the pinned GitLab blob base", () => {
+  it("sends a repo-only doc (not a user page) to the GitHub blob base", () => {
     expect(resolveHref("configuration.md", isUser)).toEqual({
       href: `${REPO_BLOB_BASE}docs/configuration.md`,
       external: true,
@@ -92,7 +92,7 @@ describe("resolveHref", () => {
     });
   });
 
-  it("sends a repo-root file to GitLab, preserving the anchor", () => {
+  it("sends a repo-root file to the GitHub blob, preserving the anchor", () => {
     expect(resolveHref("../ARCHITECTURE.md#forge-integration", isUser).href).toBe(
       `${REPO_BLOB_BASE}ARCHITECTURE.md#forge-integration`,
     );
@@ -225,7 +225,7 @@ describe("rewriteHref (real bundled corpus, role-aware)", () => {
     });
   });
 
-  it("sends the same operator-doc link to the GitLab blob for a non-admin", () => {
+  it("sends the same operator-doc link to the GitHub blob for a non-admin", () => {
     expect(rewriteHref("configuration.md", false)).toEqual({
       href: `${REPO_BLOB_BASE}docs/configuration.md`,
       external: true,

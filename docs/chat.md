@@ -7,7 +7,7 @@ audience: user
 # Chat with uzi
 
 The **Chat** page lets you talk to uzi about itself: what it can do, how a
-feature works, why one of your runs failed, and turn an idea into a GitLab
+feature works, why one of your runs failed, and turn an idea into a forge
 issue or a run without leaving the app. The conversation is answered by an agent
 running on **your own worker**, billed to **your own Anthropic token** — the
 same worker that executes your runs.
@@ -31,9 +31,9 @@ a meter against what you expected to spend.
 - **Your runs.** It can list your runs and read a run's messages and plan to
   answer "why did run #57 fail?" from the actual activity, not a hallucination.
   It only ever sees **your own** runs — never another user's, even for admins.
-- **Draft a GitLab issue.** Ask it to file an issue and it shows you a
+- **Draft a forge issue.** Ask it to file an issue and it shows you a
   **proposal card** with the draft title, description, and labels plus
-  **Create** / **Dismiss** buttons. Nothing is written to GitLab until *you*
+  **Create** / **Dismiss** buttons. Nothing is written to your forge until *you*
   click Create — the agent can draft, only your click files. Dismiss writes
   nothing at all.
 - **Start, cancel, or steer a run.** Ask it to start a run on an existing
