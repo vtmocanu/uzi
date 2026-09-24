@@ -35,6 +35,7 @@ type codexClaimFix struct {
 	workerA, workerB   uuid.UUID
 	runID              uuid.UUID
 	holdA              uuid.UUID // the gen-1 hold on A; uuid.Nil when not seeded
+	access             string    // the linked login's access token at seed time
 	svc                *Service
 }
 
@@ -43,7 +44,7 @@ func newCodexClaimFix(t *testing.T, env codexTestEnv, olderHold bool) *codexClai
 	f := newSubscriptionFixture(t, env)
 	resealBotPAT(t, env, f.userID)
 	seedDefaultAnthropicToken(t, env, f.userID)
-	fx := &codexClaimFix{env: env, userID: f.userID, aliasID: f.aliasID, workerA: f.workerID, runID: f.runID}
+	fx := &codexClaimFix{env: env, userID: f.userID, aliasID: f.aliasID, workerA: f.workerID, runID: f.runID, access: f.accessToken}
 	fx.repoID = uuid.UUID(mustRun(t, env, f.runID).RepoID.Bytes)
 	if err := env.pool.QueryRow(env.ctx, `SELECT provider_account_id FROM codex_credential_state
 		WHERE user_secret_id = $1`, f.aliasID).Scan(&fx.accountID); err != nil {

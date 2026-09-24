@@ -884,10 +884,13 @@ WITH target AS (
       )
       -- PRD #1590 M2 (D2, amendment A1): keep a Codex subscription run queued while
       -- its SAME alias's account authority is on hold (D1's hold class):
-      --   (1) quarantine: the linked account is quarantined and, once the run is past
-      --       first link, is still the run's frozen identity at its frozen
-      --       credential_revision (a different identity or a bumped revision is
-      --       terminal, so the claim proceeds and fails in assembly as before);
+      --   (1) quarantine: the linked account is quarantined and is still the run's
+      --       frozen identity at its frozen credential_revision. A run with no frozen
+      --       identity (codex_account_key NULL: its alias was unlinked at create, and
+      --       nothing freezes it later) fails evalCodexReleasePredicate with
+      --       ErrCodexAccountKeyUnfrozen whatever the account does, so it is not held
+      --       (D1 holds only what can resume); like a different identity or a bumped
+      --       revision, the claim proceeds and fails in assembly as before;
       --   (2) re-login in flight: past first link, a newer login on the alias is
       --       staging/failed (the PATCH cleared the link, so (1) cannot see it);
       --   (3) A1: past first link, that newer login already linked back to the
@@ -917,12 +920,11 @@ WITH target AS (
                 AND ccs.user_id = r.user_id
                 AND (
                     (cpa.coord_state = 'quarantined'
-                     AND (r.codex_account_key IS NULL
-                          OR (cpa.credential_revision = r.codex_account_revision
-                              AND CASE WHEN pg_input_is_valid(r.codex_account_key, 'jsonb')
-                                       THEN r.codex_account_key::jsonb
-                                            = jsonb_build_array(cpa.provider_user_id, cpa.workspace_account_id)
-                                       ELSE false END)))
+                     AND cpa.credential_revision = r.codex_account_revision
+                     AND CASE WHEN pg_input_is_valid(r.codex_account_key, 'jsonb')
+                              THEN r.codex_account_key::jsonb
+                                   = jsonb_build_array(cpa.provider_user_id, cpa.workspace_account_id)
+                              ELSE false END)
                     OR (r.codex_account_key IS NOT NULL
                         AND ccs.material_revision > r.codex_material_revision
                         AND (ccs.status IN ('staging', 'failed')
@@ -1034,12 +1036,11 @@ WITH target AS (
                           AND ccs.user_id = r.user_id
                           AND (
                               (cpa.coord_state = 'quarantined'
-                               AND (r.codex_account_key IS NULL
-                                    OR (cpa.credential_revision = r.codex_account_revision
-                                        AND CASE WHEN pg_input_is_valid(r.codex_account_key, 'jsonb')
-                                                 THEN r.codex_account_key::jsonb
-                                                      = jsonb_build_array(cpa.provider_user_id, cpa.workspace_account_id)
-                                                 ELSE false END)))
+                               AND cpa.credential_revision = r.codex_account_revision
+                               AND CASE WHEN pg_input_is_valid(r.codex_account_key, 'jsonb')
+                                        THEN r.codex_account_key::jsonb
+                                             = jsonb_build_array(cpa.provider_user_id, cpa.workspace_account_id)
+                                        ELSE false END)
                               OR (r.codex_account_key IS NOT NULL
                                   AND ccs.material_revision > r.codex_material_revision
                                   AND (ccs.status IN ('staging', 'failed')
@@ -3628,12 +3629,11 @@ parked AS (
             AND ccs.user_id = r.user_id
             AND (
                 (cpa.coord_state = 'quarantined'
-                 AND (r.codex_account_key IS NULL
-                      OR (cpa.credential_revision = r.codex_account_revision
-                          AND CASE WHEN pg_input_is_valid(r.codex_account_key, 'jsonb')
-                                   THEN r.codex_account_key::jsonb
-                                        = jsonb_build_array(cpa.provider_user_id, cpa.workspace_account_id)
-                                   ELSE false END)))
+                 AND cpa.credential_revision = r.codex_account_revision
+                 AND CASE WHEN pg_input_is_valid(r.codex_account_key, 'jsonb')
+                          THEN r.codex_account_key::jsonb
+                               = jsonb_build_array(cpa.provider_user_id, cpa.workspace_account_id)
+                          ELSE false END)
                 OR (r.codex_account_key IS NOT NULL
                     AND ccs.material_revision > r.codex_material_revision
                     AND (ccs.status IN ('staging', 'failed')
@@ -3670,10 +3670,12 @@ LIMIT @page_cap::int;
 -- alias and then the account (run -> alias -> account). Status and cause are re-checked here,
 -- so a run cancelled or promoted since the page was listed is pgx.ErrNoRows. SKIP LOCKED: the
 -- sweeper never waits on a run row another transaction holds (a cancel, say); that run is
--- retried on a later tick. No writer in the re-login path touches the run row.
+-- retried on a later tick. No writer in the re-login path touches the run row. NO KEY UPDATE,
+-- the level PromoteCodexAccountWaitRun's own UPDATE takes: it changes no column a foreign key
+-- can reference, so the lock need not block FOR KEY SHARE (a child row's FK check).
 SELECT * FROM runs
 WHERE id = @id AND status = 'recovery_wait' AND recovery_wait_cause = 'codex_account_unavailable'
-FOR UPDATE SKIP LOCKED;
+FOR NO KEY UPDATE SKIP LOCKED;
 
 -- name: PromoteCodexAccountWaitRun :execrows
 -- PRD #1590 M3 (D3): the account-driven promotion recovery_wait -> queued, run inside the
@@ -5945,12 +5947,11 @@ SELECT id, user_id, status, auto_approve,
                    AND ccs.user_id = r.user_id
                    AND (
                        (cpa.coord_state = 'quarantined'
-                        AND (r.codex_account_key IS NULL
-                             OR (cpa.credential_revision = r.codex_account_revision
-                                 AND CASE WHEN pg_input_is_valid(r.codex_account_key, 'jsonb')
-                                          THEN r.codex_account_key::jsonb
-                                               = jsonb_build_array(cpa.provider_user_id, cpa.workspace_account_id)
-                                          ELSE false END)))
+                        AND cpa.credential_revision = r.codex_account_revision
+                        AND CASE WHEN pg_input_is_valid(r.codex_account_key, 'jsonb')
+                                 THEN r.codex_account_key::jsonb
+                                      = jsonb_build_array(cpa.provider_user_id, cpa.workspace_account_id)
+                                 ELSE false END)
                        OR (r.codex_account_key IS NOT NULL
                            AND ccs.material_revision > r.codex_material_revision
                            AND (ccs.status IN ('staging', 'failed')

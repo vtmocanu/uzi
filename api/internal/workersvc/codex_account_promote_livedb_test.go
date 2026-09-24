@@ -5,11 +5,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/codexauth"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -28,6 +31,13 @@ func heldCodexFix(t *testing.T, env codexTestEnv) (*codexClaimFix, *Service) {
 	t.Helper()
 	fx := newCodexClaimFix(t, env, false)
 	fx.setAccount(t, "coord_state = 'quarantined'")
+	return fx, parkHeldCodexFix(t, env, fx)
+}
+
+// parkHeldCodexFix parks fx's queued run (its account already quarantined) with one M2 park page
+// that examines only this run, and returns the Sweep-capable service.
+func parkHeldCodexFix(t *testing.T, env codexTestEnv, fx *codexClaimFix) *Service {
+	t.Helper()
 	svc := gateSweepService(env, fx.svc)
 	svc.codexPark.after, svc.codexPark.capOverride = uuidPredecessor(fx.runID), 1
 	if n, err := svc.parkCodexAccountUnavailable(env.ctx); err != nil || n != 1 {
@@ -38,7 +48,7 @@ func heldCodexFix(t *testing.T, env codexTestEnv) (*codexClaimFix, *Service) {
 	if r := mustRun(t, env, fx.runID); r.Status != "recovery_wait" || r.RecoveryWaitCause.String != recoveryCauseCodexAccountUnavailable {
 		t.Fatalf("seed: status=%s cause=%v, want a codex_account_unavailable hold", r.Status, r.RecoveryWaitCause)
 	}
-	return fx, svc
+	return svc
 }
 
 // promoteOnly runs one promotion page that examines exactly this run (a one-row page starting at
@@ -164,6 +174,9 @@ func TestCodexAccountPromoteHealthyAccountLiveDB(t *testing.T) {
 // TestCodexAccountPromoteStaysHeldLiveDB: a still-quarantined account, a re-login in flight
 // (alias PATCHed to staging, link cleared), and a same-identity relink (material ahead; D5
 // re-admission is M4) all fail the predicate, so the run stays held, untouched, across ticks.
+// Each tick runs a one-row promotion page and then a full Sweep whose promotion page starts at
+// the fixture run; an afterList hook counts the fixture's examinations, so both legs are proven
+// to have decided this run rather than passed it by.
 func TestCodexAccountPromoteStaysHeldLiveDB(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -190,23 +203,42 @@ func TestCodexAccountPromoteStaysHeldLiveDB(t *testing.T) {
 			fx, svc := heldCodexFix(t, env)
 			tc.mutate(t, fx)
 			held := mustRun(t, env, fx.runID)
+			examined := 0
+			svc.codexPromoteHooks = &codexPromoteTestHooks{afterList: func(_ context.Context, id uuid.UUID) {
+				if id == fx.runID {
+					examined++
+				}
+			}}
 			for tick := 0; tick < 3; tick++ {
 				if n, err := promoteOnly(t, svc, fx.runID); err != nil || n != 0 {
 					t.Fatalf("tick %d: promote = (%d, %v), want (0, nil)", tick, n, err)
 				}
+				assertStillHeld(t, env, fx.runID, held)
+				// The Sweep's page starts at this run (other held runs in the shared database
+				// may follow it), so the tick decides the fixture too.
+				svc.codexPromote.after = uuidPredecessor(fx.runID)
+				svc.codexPromote.capOverride = 1 << 20
 				if _, err := svc.Sweep(env.ctx); err != nil {
 					t.Fatalf("tick %d Sweep: %v", tick, err)
 				}
 				assertStillHeld(t, env, fx.runID, held)
+				if examined != 2*(tick+1) {
+					t.Fatalf("tick %d: fixture examined %d times, want %d (once by the page, once by Sweep)",
+						tick, examined, 2*(tick+1))
+				}
 			}
 		})
 	}
 }
 
 // TestCodexAccountPromoteRelinkRaceLiveDB: the account is healthy when the pass lists the run,
-// then (before the run's transaction) the alias is relinked to a DIFFERENT identity, or its
-// material is bumped by a re-login. The in-transaction re-read sees it and the run is not
-// promoted. A control run without the race is promoted, so the refusal is the race's.
+// then the alias is relinked to a DIFFERENT identity, or its material is bumped by a re-login.
+// The race is injected in afterList, which runs BEFORE the run's transaction opens, so the write
+// has committed by the time the promoter locks anything: this pins only that the in-transaction
+// re-read (under the run, alias and account locks) sees a change made after the page was listed,
+// and the run is not promoted. It does not exercise a writer racing the open transaction; that
+// is TestCodexAccountPromoteRelinkWaitsOnAliasLockLiveDB. A control run without the race is
+// promoted, so the refusal is the race's.
 func TestCodexAccountPromoteRelinkRaceLiveDB(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -415,4 +447,216 @@ func TestTimerPromotersSkipCodexAccountHoldLiveDB(t *testing.T) {
 		t.Fatalf("PromoteRecoveryWaitRunNow = (%d, %v), want (0, nil)", n, err)
 	}
 	assertStillHeld(t, env, fx.runID, held)
+}
+
+// TestCodexAccountPromoteAccountLockNowaitLiveDB pins that the promoter really takes the account
+// FOR SHARE NOWAIT lock. The account is healthy and the alias free, so the predicate would pass;
+// only another transaction's FOR UPDATE on the account row stands between the run and queued.
+// The contended tick must pass the alias lock (afterAliasLock fires), come back promptly with
+// nothing promoted (55P03, not a wait for the row), and the next tick, after that transaction
+// ends, promotes. Without the account lock the contended tick promotes on the unlocked re-read;
+// with a blocking lock it waits for the row until promoteOnly's deadline and reports the error.
+func TestCodexAccountPromoteAccountLockNowaitLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	fx, svc := heldCodexFix(t, env)
+	fx.setAccount(t, "coord_state = 'idle'")
+	held := mustRun(t, env, fx.runID)
+
+	lockTx, err := env.pool.Begin(env.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = lockTx.Rollback(env.ctx) }()
+	if _, err := lockTx.Exec(env.ctx, `SELECT 1 FROM codex_provider_account WHERE id = $1 FOR UPDATE`, fx.accountID); err != nil {
+		t.Fatalf("lock account: %v", err)
+	}
+	aliasLocked := 0
+	svc.codexPromoteHooks = &codexPromoteTestHooks{afterAliasLock: func(_ context.Context, id uuid.UUID) {
+		if id == fx.runID {
+			aliasLocked++
+		}
+	}}
+	start := time.Now()
+	n, err := promoteOnly(t, svc, fx.runID)
+	if err != nil || n != 0 {
+		t.Fatalf("contended tick: promote = (%d, %v), want (0, nil): the account lock is held", n, err)
+	}
+	if el := time.Since(start); el > 5*time.Second {
+		t.Fatalf("contended tick took %v, want a prompt NOWAIT refusal", el)
+	}
+	if aliasLocked != 1 {
+		t.Fatalf("alias lock reached %d times, want 1: the hold must come from the account lock", aliasLocked)
+	}
+	assertStillHeld(t, env, fx.runID, held)
+
+	if err := lockTx.Rollback(env.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := promoteOnly(t, svc, fx.runID); err != nil || n != 1 {
+		t.Fatalf("next tick: promote = (%d, %v), want (1, nil)", n, err)
+	}
+	assertPromoted(t, env, fx.runID, held)
+}
+
+// TestCodexAccountPromoteRelinkWaitsOnAliasLockLiveDB is the other half of the relink race: a
+// LinkCodexCredentialState that starts while the promoter's transaction holds the alias FOR SHARE
+// (here, relinking the alias to a DIFFERENT identity) blocks on that row until the promoter's
+// transaction ends. The promoter decides on the state it locked (the frozen identity, healthy),
+// promotes and commits; only then does the relink land. The next claim re-runs the full
+// predicate against the relinked alias, so the promotion never releases a credential by itself.
+func TestCodexAccountPromoteRelinkWaitsOnAliasLockLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	fx, svc := heldCodexFix(t, env)
+	fx.setAccount(t, "coord_state = 'idle'")
+	held := mustRun(t, env, fx.runID)
+	other := env.seedLinkedSubscription(t, fx.userID, "codex-other-"+uuid.NewString(), codexToken("access"), codexToken("refresh"))
+	var otherAccount uuid.UUID
+	var material int64
+	if err := env.pool.QueryRow(env.ctx, `SELECT provider_account_id FROM codex_credential_state WHERE user_secret_id = $1`,
+		other).Scan(&otherAccount); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.pool.QueryRow(env.ctx, `SELECT material_revision FROM codex_credential_state WHERE user_secret_id = $1`,
+		fx.aliasID).Scan(&material); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(env.ctx, 30*time.Second)
+	defer cancel()
+	linkTx, err := env.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = linkTx.Rollback(env.ctx) }()
+	var pid int32
+	if err := linkTx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+		t.Fatal(err)
+	}
+
+	linkDone := make(chan error, 1)
+	blocked := false
+	svc.codexPromoteHooks = &codexPromoteTestHooks{afterAliasLock: func(_ context.Context, id uuid.UUID) {
+		if id != fx.runID {
+			return
+		}
+		go func() {
+			n, err := store.New(linkTx).LinkCodexCredentialState(ctx, store.LinkCodexCredentialStateParams{
+				ProviderAccountID: pgconv.UUID(otherAccount), UserSecretID: fx.aliasID, UserID: fx.userID, MaterialRevision: material,
+			})
+			if err == nil && n != 1 {
+				err = errors.New("link matched no row")
+			}
+			linkDone <- err
+		}()
+		waitForLockWait(t, env, pid) // the relink now waits on the promoter's alias lock
+		select {
+		case <-linkDone:
+			t.Error("the relink completed while the promoter held the alias")
+		default:
+			blocked = true
+		}
+	}}
+
+	n, err := promoteOnly(t, svc, fx.runID)
+	if err != nil || n != 1 || !blocked {
+		t.Fatalf("promote = (%d, %v), relink blocked %v; want (1, nil) with the relink blocked", n, err, blocked)
+	}
+	assertPromoted(t, env, fx.runID, held)
+	select {
+	case err := <-linkDone:
+		if err != nil {
+			t.Fatalf("relink after the promoter's commit: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("the relink never completed after the promoter's transaction ended")
+	}
+	if err := linkTx.Commit(ctx); err != nil {
+		t.Fatalf("relink commit: %v", err)
+	}
+	var linked uuid.UUID
+	if err := env.pool.QueryRow(env.ctx, `SELECT provider_account_id FROM codex_credential_state WHERE user_secret_id = $1`,
+		fx.aliasID).Scan(&linked); err != nil || linked != otherAccount {
+		t.Fatalf("alias links %s (%v), want the relinked account %s", linked, err, otherAccount)
+	}
+}
+
+// TestCodexAccountPromoteSurvivorRecoveryLiveDB is the PRD's survivor leg: a held run whose account
+// was quarantined with verified recovery material at its current generation (the protect-before-
+// park path of a failed refresh). One Sweep tick runs the survivor pass (PromoteCodexRecovery
+// installs the material, generation+1, quarantine cleared, credential_revision unchanged) and
+// then, in the same tick, the account promotion pass, so the run is queued after that one tick.
+// The next claim delivers the recovered login's access token at the new generation, and none of
+// the refresh material or the pre-quarantine token.
+func TestCodexAccountPromoteSurvivorRecoveryLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	fx := newCodexClaimFix(t, env, false)
+	gen := accountGeneration(t, env, fx.accountID)
+	acct := env.mustAccount(t, fx.userID, fx.accountID)
+
+	// Protect recovery material under a live lease; SetCodexRecoverySlot quarantines the account.
+	recAccess, recRefresh := codexToken("recovery-access"), codexToken("recovery-refresh")
+	op := uuid.New()
+	if n, err := env.q.AcquireCodexRefreshLease(env.ctx, store.AcquireCodexRefreshLeaseParams{
+		Op: op, Deadline: pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true},
+		ID: fx.accountID, UserID: fx.userID, FromGeneration: gen,
+	}); err != nil || n != 1 {
+		t.Fatalf("AcquireCodexRefreshLease = (%d, %v), want (1, nil)", n, err)
+	}
+	raw, err := json.Marshal(codexLoginBlob{AccessToken: recAccess, RefreshToken: recRefresh}) //nolint:gosec // G117: synthetic recovery fixture
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealed, err := env.box.Seal(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := env.q.SetCodexRecoverySlot(env.ctx, store.SetCodexRecoverySlotParams{
+		Sealed: sealed, Gen: gen, ID: fx.accountID, UserID: fx.userID,
+		Op: op, RecoverySealedWith: pgtype.Text{String: store.SealedWithMaster, Valid: true},
+	}); err != nil || n != 1 {
+		t.Fatalf("SetCodexRecoverySlot = (%d, %v), want (1, nil)", n, err)
+	}
+	svc := parkHeldCodexFix(t, env, fx)
+	held := mustRun(t, env, fx.runID)
+
+	// The recovery blob verifies as this account; every other account's leftover recovery
+	// material in the shared database defers, so this tick changes no foreign account.
+	svc.SetCodexRefresh(&fakeRefreshClient{
+		identityByToken: map[string]codexauth.Identity{
+			recAccess: {ProviderUserID: acct.ProviderUserID, WorkspaceAccountID: acct.WorkspaceAccountID},
+		},
+		discoverDefaultErr: codexauth.ErrIdentityIncomplete,
+	})
+	res, err := svc.Sweep(env.ctx)
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	after := env.mustAccount(t, fx.userID, fx.accountID)
+	if after.CoordState != "idle" || after.Generation != gen+1 || len(after.RecoverySealed) != 0 ||
+		after.CredentialRevision != acct.CredentialRevision {
+		t.Fatalf("account coord=%s gen=%d recovery=%d rev=%d, want the recovery promoted (idle, gen %d, slot empty, rev %d)",
+			after.CoordState, after.Generation, len(after.RecoverySealed), after.CredentialRevision, gen+1, acct.CredentialRevision)
+	}
+	if res.CodexRefreshRecovered < 1 || res.CodexAccountPromoted < 1 {
+		t.Fatalf("recovered=%d promoted=%d, want both >= 1 in the one tick", res.CodexRefreshRecovered, res.CodexAccountPromoted)
+	}
+	assertPromoted(t, env, fx.runID, held)
+
+	payload, err := fx.svc.Claim(env.ctx, fx.claimant(t, true), nil)
+	if err != nil || payload == nil || payload.Secrets.Codex == nil {
+		t.Fatalf("Claim = (%v, %v), want a Codex payload", payload != nil, err)
+	}
+	c := payload.Secrets.Codex
+	if c.AccessToken != recAccess || c.Generation == nil || *c.Generation != gen+1 {
+		t.Fatalf("claim token match=%v generation=%v, want the recovered token at generation %d",
+			c.AccessToken == recAccess, c.Generation, gen+1)
+	}
+	wire, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, secret := range map[string]string{"recovery refresh token": recRefresh, "pre-quarantine access token": fx.access} {
+		if strings.Contains(string(wire), secret) {
+			t.Fatalf("the claim payload carries the %s", name)
+		}
+	}
 }

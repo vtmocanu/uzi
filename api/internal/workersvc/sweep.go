@@ -359,12 +359,34 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 		}
 	}
 
+	// Codex subscription-refresh survivor (issue #1532): reap any account left wedged by an
+	// interrupted refresh (in_progress + expired lease, or an orphaned rotating intent) →
+	// quarantine + resolve its intents, so a re-link can recover it via reconcileTuple's
+	// quarantined arm, and promote verified recovery material at the current generation.
+	// Folded into Sweep — the always-on seam the sweeper Engine calls every tick and on Boot —
+	// rather than an optional sweeper.Pass, so it cannot be silently unregistered from
+	// main.go. Best-effort and non-terminal: a failure is logged and never aborts run
+	// recovery.
+	//
+	// PRD #1590 M3: it runs BEFORE the Codex account park and promotion passes below, which
+	// read the account state it writes. A recovery promotion therefore resumes a
+	// codex_account_unavailable run in the same tick (absent lock contention), and a reaped
+	// lease's queued runs are parked in the same tick. The pass writes only
+	// codex_provider_account and its refresh intents, never runs, and it was already after
+	// every early return above, so moving it here changes which rows it sees in a tick, not
+	// whether it runs.
+	if n, cerr := s.SweepUnresolvedCodexRefresh(ctx); cerr != nil {
+		slog.Error("sweeper: codex refresh survivor failed", "error", cerr)
+	} else {
+		res.CodexRefreshRecovered = n
+	}
+
 	// Codex account park (PRD #1590 M2, D2): move queued Codex subscription runs that
 	// ClaimRun's account gate excludes (quarantined account, or a re-login on the run's alias
 	// in flight) to recovery_wait with cause codex_account_unavailable, so the hold is visible
 	// rather than an unexplained queued wait. A transition, so it runs before the detector and
 	// a parked run is health-consistent in THIS tick. One bounded page per tick (see
-	// parkCodexAccountUnavailable). Best-effort like the survivor pass below: an error is
+	// parkCodexAccountUnavailable). Best-effort like the survivor pass above: an error is
 	// logged and the sweep continues.
 	if n, perr := s.parkCodexAccountUnavailable(ctx); perr != nil {
 		slog.Error("sweeper: park codex account unavailable failed", "error", perr)
@@ -375,12 +397,14 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 	// Codex account promotion (PRD #1590 M3, D3): the only way back to queued for a run held on
 	// cause codex_account_unavailable (both timer promoters skip it). Each held run in one
 	// bounded page is decided in its own transaction (run -> alias -> account, NOWAIT on the
-	// latter two) by the unchanged release predicate. Placed AFTER the park pass so a run moves
-	// at most once per tick: the park only takes runs the gate excludes, and the promote only
-	// releases runs the predicate passes, so the two never undo each other within one tick on
-	// the same state. Placed BEFORE the detector, like the park, so a promoted run is
-	// health-consistent (queued, health reset) in this tick. Best-effort like the park: an
-	// error is logged and the sweep continues; the count survives a partial page.
+	// latter two) by the unchanged release predicate. The park and this pass cannot undo each
+	// other on one account state: every run the gate excludes fails the predicate
+	// (ErrCodexAccountQuarantined or ErrCodexMaterialRevisionStale), and a run that passes the
+	// predicate matches no gate case. That disjointness, not the order, is what keeps a run
+	// from moving twice in a tick; a concurrent re-login landing between the two passes can
+	// still park and then promote the same run. Placed BEFORE the detector, like the park, so
+	// a promoted run is health-consistent (queued, health reset) in this tick. Best-effort like
+	// the park: an error is logged and the sweep continues; the count survives a partial page.
 	n, perr := s.promoteCodexAccountAvailable(ctx)
 	res.CodexAccountPromoted = n
 	if perr != nil {
@@ -413,18 +437,6 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 	// belt-and-braces rather than the mechanism.
 	res.AutoStopped = s.autoStopWedgedRuns(ctx, now)
 
-	// Codex subscription-refresh survivor (issue #1532): reap any account left wedged by an
-	// interrupted refresh (in_progress + expired lease, or an orphaned rotating intent) →
-	// quarantine + resolve its intents, so a re-link can recover it via reconcileTuple's
-	// quarantined arm. Folded into Sweep — the always-on seam the sweeper Engine calls every
-	// tick and on Boot — rather than an optional sweeper.Pass, so it cannot be silently
-	// unregistered from main.go. Best-effort and non-terminal: a failure is logged and never
-	// aborts run recovery, matching detectRunHealth/autoStopWedgedRuns above.
-	if n, cerr := s.SweepUnresolvedCodexRefresh(ctx); cerr != nil {
-		slog.Error("sweeper: codex refresh survivor failed", "error", cerr)
-	} else {
-		res.CodexRefreshRecovered = n
-	}
 	return res, nil
 }
 

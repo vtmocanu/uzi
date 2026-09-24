@@ -18,9 +18,11 @@ type codexHoldCase struct {
 	name string
 	// harness/mode/kind of the run; empty means codex / subscription / issue.
 	harness, mode, kind string
-	// firstLink: the run has not reached first link (codex_account_key and
-	// codex_account_revision NULL).
-	firstLink bool
+	// unfrozen: the run has no frozen identity (codex_account_key and
+	// codex_account_revision NULL). Only FreezeCodexBinding, at create, freezes one, and only
+	// when the alias is already linked, so such a run fails every release predicate with
+	// ErrCodexAccountKeyUnfrozen: it is never held (D1 holds only what can resume).
+	unfrozen bool
 	// alias is the codex_credential_state status: linked, staging, failed or static.
 	alias string
 	// materialAhead: the alias material_revision is past the run's frozen one.
@@ -59,11 +61,11 @@ var codexHoldTable = []codexHoldCase{
 	{name: "A1 same identity relink quarantined", alias: "linked", materialAhead: true, account: "same", coord: "quarantined", hold: true},
 	{name: "relink to other identity is terminal", alias: "linked", materialAhead: true, account: "other", coord: "idle"},
 	{name: "relink with bumped revision is terminal", alias: "linked", materialAhead: true, account: "same", revBumped: true, coord: "idle"},
-	// First link: assembly freezes the identity from the linked account before the final
-	// classification, so the Go side sees the key frozen at the current account.
-	{name: "first link staging", firstLink: true, alias: "staging", materialAhead: true},
-	{name: "first link idle", firstLink: true, alias: "linked", account: "same", coord: "idle"},
-	{name: "first link quarantined", firstLink: true, alias: "linked", account: "same", coord: "quarantined", hold: true},
+	// No frozen identity: nothing freezes it after create, so these runs can never pass the
+	// predicate and none is held; the claim fails them credential_unavailable as before M2.
+	{name: "unfrozen staging", unfrozen: true, alias: "staging", materialAhead: true},
+	{name: "unfrozen idle", unfrozen: true, alias: "linked", account: "same", coord: "idle"},
+	{name: "unfrozen quarantined is terminal", unfrozen: true, alias: "linked", account: "same", coord: "quarantined"},
 	{name: "api_key static alias", mode: codexAuthModeAPIKey, alias: "static"},
 	{name: "api_key mode on a quarantined login", mode: codexAuthModeAPIKey, alias: "linked", account: "same", coord: "quarantined"},
 	// A Claude run cannot carry a Codex binding (runs_codex_harness_coherence_check): this is a
@@ -113,21 +115,13 @@ func (c codexHoldCase) goInputs(t *testing.T) (store.Run, store.GetRunCodexAuthC
 		CodexAuthMode:         pgtype.Text{String: c.authMode(), Valid: true},
 		CodexMaterialRevision: pgtype.Int8{Int64: frozenMaterial, Valid: true},
 	}
-	switch {
-	case !c.firstLink:
+	if !c.unfrozen {
 		key, err := codexAccountKey(identity("same"))
 		if err != nil {
 			t.Fatal(err)
 		}
 		run.CodexAccountKey = pgtype.Text{String: key, Valid: true}
 		run.CodexAccountRevision = pgtype.Int8{Int64: frozenRev, Valid: true}
-	case c.account != "":
-		key, err := codexAccountKey(identity(c.account))
-		if err != nil {
-			t.Fatal(err)
-		}
-		run.CodexAccountKey = pgtype.Text{String: key, Valid: true}
-		run.CodexAccountRevision = pgtype.Int8{Int64: credRev, Valid: true}
 	}
 	boundKind := store.KindCodexAuth
 	if c.alias == "static" {

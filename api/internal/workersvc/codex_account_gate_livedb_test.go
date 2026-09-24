@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -44,8 +45,8 @@ type holdCaseFixture struct {
 	userID, workerID, runID uuid.UUID
 }
 
-// seedHoldCase seeds the baseline (a queued run bound to a linked, idle subscription login, past
-// first link) and applies the row's relative changes with plain UPDATEs.
+// seedHoldCase seeds the baseline (a queued run bound to a linked, idle subscription login, with its
+// identity frozen) and applies the row's relative changes with plain UPDATEs.
 func seedHoldCase(t *testing.T, env codexTestEnv, tc codexHoldCase) holdCaseFixture {
 	t.Helper()
 	userID, workerID, repoID := env.seedCodexInfra(t)
@@ -70,7 +71,7 @@ func seedHoldCase(t *testing.T, env codexTestEnv, tc codexHoldCase) holdCaseFixt
 		WHERE user_secret_id = $1`, aliasID).Scan(&accountID); err != nil {
 		t.Fatalf("read linked account: %v", err)
 	}
-	if tc.firstLink {
+	if tc.unfrozen {
 		env.exec(`UPDATE runs SET codex_account_key = NULL, codex_account_revision = NULL WHERE id = $1`, fx.runID)
 	}
 	switch tc.account {
@@ -378,6 +379,41 @@ func TestClaimRelinkToDifferentIdentityIsClaimableLiveDB(t *testing.T) {
 	if r.ClaimGeneration != 2 || r.Status != "failed" || r.FailOrigin.String != "credential_unavailable" {
 		t.Fatalf("gen=%d status=%s origin=%v, want claimed at 2 then failed credential_unavailable",
 			r.ClaimGeneration, r.Status, r.FailOrigin)
+	}
+}
+
+// TestUnfrozenQuarantinedRunFailsNotHeldLiveDB: a subscription run with no frozen identity
+// (codex_account_key NULL: nothing freezes it after create) on a quarantined account can never
+// pass evalCodexReleasePredicate (ErrCodexAccountKeyUnfrozen), so D1 does not hold it. It is not
+// gated, the park page examines it and leaves it queued, and the claim fails it
+// credential_unavailable with the unfrozen error, as before M2, instead of parking it in a hold
+// the promoter could never release.
+func TestUnfrozenQuarantinedRunFailsNotHeldLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	fx := newCodexClaimFix(t, env, true)
+	env.exec(`UPDATE runs SET codex_account_key = NULL, codex_account_revision = NULL WHERE id = $1`, fx.runID)
+	fx.setAccount(t, "coord_state = 'quarantined'")
+	if healthRowForRun(t, env, fx.runID).CodexAccountGated {
+		t.Fatal("an unfrozen run must not be gated")
+	}
+	svc := gateSweepService(env, fx.svc)
+	svc.codexPark.after, svc.codexPark.capOverride = uuidPredecessor(fx.runID), 1
+	if n, err := svc.parkCodexAccountUnavailable(env.ctx); err != nil || n != 0 {
+		t.Fatalf("park = (%d, %v), want (0, nil)", n, err)
+	}
+	if r := mustRun(t, env, fx.runID); r.Status != "queued" || r.RecoveryWaitCause.Valid {
+		t.Fatalf("after the park page: status=%s cause=%v, want still queued", r.Status, r.RecoveryWaitCause)
+	}
+	payload, err := fx.svc.Claim(env.ctx, fx.claimant(t, true), nil)
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	fx.assertNoClaudeFallback(t, payload)
+	r := mustRun(t, env, fx.runID)
+	if r.Status != "failed" || r.FailOrigin.String != "credential_unavailable" || r.RecoveryWaitCause.Valid ||
+		!strings.Contains(r.FailureReason.String, ErrCodexAccountKeyUnfrozen.Error()) {
+		t.Fatalf("status=%s origin=%v cause=%v reason=%q, want failed/credential_unavailable on the unfrozen key",
+			r.Status, r.FailOrigin, r.RecoveryWaitCause, r.FailureReason.String)
 	}
 }
 
