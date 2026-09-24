@@ -516,8 +516,14 @@ func (f *forgejo) ListWorkflowRuns(ctx context.Context, projectID int64, opts Li
 
 // GetWorkflowRun returns one Actions run's header (the neutral WorkflowRun) by its
 // Forgejo run id, for the `ci` drill-in. Mirrors ListWorkflowRuns' client/slug
-// prelude and its 404→ErrForgeVersionUnsupported degrade, and reuses
-// toForgejoWorkflowRun so the mapping stays identical to the list rows.
+// prelude and reuses toForgejoWorkflowRun so the mapping stays identical to the list
+// rows.
+//
+// A 404 on this single GET is ambiguous: the Actions API may be absent (old server),
+// or the run id may simply not exist (deleted, stale). It is resolved by probing the
+// runs list, whose 404 does mean "no Actions API" (issue #1343): a 404 there degrades
+// to ErrForgeVersionUnsupported; otherwise the run is missing and the original error
+// surfaces as a plain redacted forge error, as the GitHub and GitLab drivers do.
 func (f *forgejo) GetWorkflowRun(ctx context.Context, projectID, runID int64) (WorkflowRun, error) {
 	c, err := f.newClient(ctx)
 	if err != nil {
@@ -529,7 +535,7 @@ func (f *forgejo) GetWorkflowRun(ctx context.Context, projectID, runID int64) (W
 	}
 	run, resp, err := c.GetRepoActionRun(slug.owner, slug.repo, runID)
 	if err != nil {
-		if resp != nil && resp.StatusCode == http.StatusNotFound {
+		if resp != nil && resp.StatusCode == http.StatusNotFound && forgejoActionsAPIAbsent(c, slug) {
 			return WorkflowRun{}, fmt.Errorf("forgejo: get workflow run: actions API not available on this server version: %w", ErrForgeVersionUnsupported)
 		}
 		return WorkflowRun{}, f.wrapErr("get workflow run", err)
@@ -538,6 +544,17 @@ func (f *forgejo) GetWorkflowRun(ctx context.Context, projectID, runID int64) (W
 		return WorkflowRun{}, nil
 	}
 	return toForgejoWorkflowRun(run), nil
+}
+
+// forgejoActionsAPIAbsent reports whether the repo's Actions runs list 404s, the
+// signal ListWorkflowRuns already treats as "no Actions API on this server version".
+// Any other outcome (success, or a different error) means the API exists as far as
+// can be told, so the caller does not claim the version degrade.
+func forgejoActionsAPIAbsent(c *gitea.Client, slug repoSlug) bool {
+	_, resp, err := c.ListRepoActionRuns(slug.owner, slug.repo, gitea.ListRepoActionRunsOptions{
+		ListOptions: gitea.ListOptions{Page: 1, PageSize: 1},
+	})
+	return err != nil && resp != nil && resp.StatusCode == http.StatusNotFound
 }
 
 // toForgejoWorkflowRun maps a gitea Actions run to the neutral WorkflowRun. Forgejo
