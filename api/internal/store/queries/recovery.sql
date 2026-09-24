@@ -347,7 +347,7 @@ WHERE id = @hold_id AND run_id = @run_id;
 --   * the run: still 'completed', still at the successor claim generation, still held by the
 --     caller worker, on the SAME branch and the SAME completion instant (status_since) the
 --     service captured before it asked the forge.
--- Stamps release_evidence='ancestry' with all six audit columns (migration 00247's CHECK
+-- Stamps release_evidence='ancestry' with all six audit columns (migration 00251's CHECK
 -- refuses an 'ancestry' row missing any of them). Nulls both live FKs like every release.
 -- Never touches a sibling hold: the WHERE names exactly one id.
 WITH cutoff AS (

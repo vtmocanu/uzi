@@ -23,7 +23,7 @@ import (
 var ErrInvalidSettleRequest = errors.New("invalid recovery settle request")
 
 // isSettleSHA reports whether s is a full 40-char LOWERCASE hex commit id — the only shape
-// the settle surface (and migration 00247's audit CHECKs) accept.
+// the settle surface (and migration 00251's audit CHECKs) accept.
 func isSettleSHA(s string) bool {
 	if len(s) != 40 {
 		return false
@@ -38,7 +38,7 @@ func isSettleSHA(s string) bool {
 }
 
 // maxSettleBranchLen bounds the run branch the settle surface will send to a forge; it is
-// also migration 00247's release_branch CHECK ceiling.
+// also migration 00251's release_branch CHECK ceiling.
 const maxSettleBranchLen = 255
 
 // isSettleBranchName reports whether b is a well-formed git branch name, checked BEFORE the

@@ -150,7 +150,7 @@ func TestCustodyReleaseEvidenceLiveDB(t *testing.T) {
 	}
 
 	// ── Issue #1582 M1: ReleasePredecessorCustodyHoldByAncestry stamps 'ancestry' with all six
-	// audit columns, and migration 00247's CHECKs refuse an 'ancestry' row missing any of them
+	// audit columns, and migration 00251's CHECKs refuse an 'ancestry' row missing any of them
 	// (and a malformed SHA or over-long branch in an audit column). ──
 	const (
 		shaP = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
