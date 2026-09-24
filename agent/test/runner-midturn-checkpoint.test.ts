@@ -2239,6 +2239,39 @@ describe("mid-turn checkpoint round 4 (issue #1597 M2)", () => {
     }
   });
 
+  it("(r4 6) a merge-added file whose PATH is secret-shaped is trusted: only hunk '+' lines are fed, never the `+++ b/` header", async (t) => {
+    await eachScanner(t, async (bin, label) => {
+      const w = workRepo(`hdr-${label.replace(/\W/g, "")}`);
+      const main = w.git(["rev-parse", "--abbrev-ref", "HEAD"]);
+      w.git(["checkout", "-q", "-b", "side"]);
+      fs.writeFileSync(path.join(w.dir, "side.txt"), "side\n");
+      w.git(["add", "-A"]);
+      w.git(["commit", "-q", "-m", "side"]);
+      w.git(["checkout", "-q", main]);
+      fs.writeFileSync(path.join(w.dir, "line.txt"), "line\n");
+      w.git(["add", "-A"]);
+      w.git(["commit", "-q", "-m", "line"]);
+      w.git(["merge", "-q", "--no-ff", "--no-commit", "side"]);
+      // The MERGE itself adds a file with clean content under a secret-shaped name (so no ordinary
+      // commit carries it): its only appearance in the merge's own diff is the file header.
+      const name = `${runtimeSecret()}.txt`;
+      fs.writeFileSync(path.join(w.dir, name), "clean content\n");
+      w.git(["add", "-A"]);
+      w.git(["commit", "-q", "-m", "merge adding a secret-named file"]);
+      const tip = w.git(["rev-parse", "HEAD"]);
+      assert.ok(
+        w.git(["diff", "--no-color", `${tip}^1`, tip]).includes(`+++ b/${name}`),
+        "the merge diff carries the secret-shaped `+++ b/` header",
+      );
+      const g = new GitCache(fx.dataDir, nullLogger(), undefined, { gitleaksBin: bin });
+      assert.deepEqual(
+        await g.secretScanCheckpointRange(w.dir, { tipSha: tip, excludeSha: w.base }),
+        { trusted: true, findings: [] },
+        label,
+      );
+    });
+  });
+
   it("(r4 4) CHECKPOINT_TICK_INTERVAL=0: a Codex milestone publishes right after its permit, before the checkpoint returns", async () => {
     const tmp = scratchDir("notick");
     const shim = writeShim(tmp, "detect");
@@ -2284,6 +2317,60 @@ describe("mid-turn checkpoint round 4 (issue #1597 M2)", () => {
   });
 });
 
+describe("mid-turn checkpoint round 4: deferred publish vs shutdown (issue #1597 M2)", () => {
+  it("(r4 7) CHECKPOINT_TICK_INTERVAL=0: a shutdown during the Codex permit skips the post-permit scan+publish", async () => {
+    const tmp = scratchDir("notickshut");
+    const shim = writeShim(tmp, "detect");
+    const codex = fakeCodex();
+    let runner: RunRunner | undefined;
+    const safety: CodexExecutionSafety = {
+      ...codex.safety,
+      withBoundary: (req, action) =>
+        codex.safety.withBoundary(req, async (permit) => {
+          const v = await action(permit);
+          runner!.shutdown(); // the worker is told to stop while the permit is still held
+          return v;
+        }),
+    };
+    const pub = stubPublish(async (_n, _tip, pack) => {
+      await drain(pack);
+      return LANDED;
+    });
+    const claim = gitlabClaim(1597_275);
+    let publishesWhenCheckpointReturned = -1;
+    let scansWhenCheckpointReturned = -1;
+    try {
+      runner = mkRunner(
+        mkGit(fx.dataDir, shim),
+        () => ({
+          executor: {
+            run: async (ctx: RunContext) => {
+              await recordingTurnErrors(async () => {
+                commitIn(ctx.worktreePath, "S.txt", "s\n");
+                await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] } });
+                publishesWhenCheckpointReturned = pub.count();
+                scansWhenCheckpointReturned = shimCalls(shim).length;
+              });
+              await waitAbort(ctx.signal!);
+              throw new Error("aborted mid-turn");
+            },
+            safety,
+          },
+        }),
+        undefined,
+        { checkpointTickIntervalMs: 0 },
+      );
+      await runner.execute(claim).catch(() => undefined);
+      assert.deepEqual(codex.boundaryErrors, []);
+      assert.equal(scansWhenCheckpointReturned, 0, "no post-permit scan once the flight is cancelled");
+      assert.equal(publishesWhenCheckpointReturned, 0, "no post-permit publish once the flight is cancelled");
+    } finally {
+      pub.restore();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("mid-turn checkpoint round 4: gate_busy quick retry (issue #1597 M2)", () => {
   it("(r4 5) an owed publish whose tick finds the sink gate busy arms ONE quick retry; a second miss waits for the normal cadence", async () => {
     const tmp = scratchDir("gateretry");
@@ -2319,6 +2406,10 @@ describe("mid-turn checkpoint round 4: gate_busy quick retry (issue #1597 M2)", 
                 await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] } }); // deferred
                 assert.equal(await ctx.parkForPause!({ completedCount: 1 }), false);
                 seen.push(await ctl.fire()); // gate free again: the owed publish goes out
+                // The published attempt SETTLED the owed publish: new work on a frozen clock now
+                // waits for the time gate instead of bypassing it on every tick.
+                commitIn(ctx.worktreePath, "R2.txt", "r2\n");
+                seen.push(await ctl.fire());
               });
               return { branch: ctx.branch };
             },
@@ -2328,7 +2419,7 @@ describe("mid-turn checkpoint round 4: gate_busy quick retry (issue #1597 M2)", 
         ctl,
       ).execute(claim);
       assert.equal(finalStatus(claim.run_id), "completed");
-      assert.deepEqual(seen, ["gate_busy", "gate_busy", "published"]);
+      assert.deepEqual(seen, ["gate_busy", "gate_busy", "published", "time_gate_closed"]);
       assert.deepEqual(delays, [1_000, 1_000, TICK_MS], "one quick retry, then the normal cadence");
       assert.equal(pub.tips.at(-1), sha);
     } finally {

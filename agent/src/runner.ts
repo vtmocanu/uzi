@@ -927,7 +927,8 @@ interface RunFlight {
   retainedBareLocks: string[];
   /** issue #1597 M2 (round 3): a milestone publish was DEFERRED out of a Codex permit
    *  (`scan_deferred`) and is owed — the next overlay-less checkpoint outside a permit publishes
-   *  regardless of the time gate; cleared by a confirmed pinned publish. */
+   *  regardless of the time gate; cleared by any non-aborted scan+publish attempt outside a permit
+   *  (published, blocked, or failed). */
   pendingPublish: boolean;
   /** issue #1597 M2 (round 3): set by the running mid-turn ticker — schedule a tick soon. */
   kickMidTurnTick?: () => void;
@@ -5903,7 +5904,10 @@ export class RunRunner {
         // and before the checkpoint returns — the same scanned path, never inside the permit — so a
         // Codex milestone still publishes like it did before #1597 instead of waiting for the next
         // iteration boundary. (With a ticker running, the kicked tick publishes it.)
-        if (flight.pendingPublish && !flight.kickMidTurnTick) {
+        // Skipped once the flight is cancelled (shutdown or a steering cancel aborted flight.cancel
+        // while the permit was held): the shutdown sink owns durability from here, and a scan +
+        // publish started now would only delay it.
+        if (flight.pendingPublish && !flight.kickMidTurnTick && !flight.cancel.signal.aborted) {
           await doCheckpointPublish(undefined, false, true);
         }
       } else {

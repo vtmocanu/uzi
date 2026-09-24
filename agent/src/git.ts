@@ -192,9 +192,9 @@ export const CHECKPOINT_SCAN_TIMEOUT_MS = 60_000;
 //    generated/binary artefact.
 //  - 128 MiB of blob bytes in total: a multi-hour turn's honest delta is orders of magnitude smaller.
 //  - 100k blob oids: bounds the listing we buffer (~41 bytes per oid).
-/** Largest single new blob a checkpoint scan accepts (bytes). */
+/** Largest single blob, old or new side, a checkpoint scan accepts (bytes). */
 const CHECKPOINT_SCAN_MAX_BLOB_BYTES = 8 * 1024 * 1024;
-/** Largest total of new blob bytes a checkpoint scan accepts. */
+/** Largest total of blob bytes, old and new side, a checkpoint scan accepts. */
 const CHECKPOINT_SCAN_MAX_TOTAL_BYTES = 128 * 1024 * 1024;
 /** Most distinct blob oids (old + new side) the scanned commits may touch. */
 const CHECKPOINT_SCAN_MAX_OBJECTS = 100_000;
@@ -2056,6 +2056,9 @@ export class GitCache {
    *     expected count is the non-merge commits with a numeric, non-zero `--numstat` line under
    *     `--diff-filter=d` (same default rename detection as gitleaks' log). Known instrument limit:
    *     gitleaks skips NUL-containing (binary) files in git mode; binary assets are not blocked.
+   *     Known limit: only ADDED lines are scanned, so a multi-line secret (e.g. a PEM body swapped
+   *     in between existing BEGIN/END lines) is not detected when only its middle lines are added,
+   *     the same as gitleaks git mode on an ordinary commit.
    *  3. MERGES. git mode neither diffs nor counts merge commits. Each merge's OWN contribution is
    *     scanned separately through `gitleaks stdin`: `git show --remerge-diff --text` for a
    *     two-parent merge (the diff from git's own re-merge of the parents to the recorded result —
@@ -3196,11 +3199,11 @@ export class GitCache {
   }
 
   /**
-   * The credential-free core shared by {@link secretScanRange} (finalize) and
-   * {@link secretScanCheckpointRange} (issue #1597 M2): count `logRange`, run gitleaks over it in the
-   * bare with the silencers disabled, read the size-capped report and apply the liveness gate.
-   * `label` prefixes every log line and `onUntrusted` ends the untrusted ones (the finalize wording
-   * is byte-identical to before the split).
+   * The credential-free finalize core of {@link secretScanRange}, its only caller (the checkpoint
+   * scan, {@link secretScanCheckpointRange}, runs gitleaks through runCheckpointGitleaks instead):
+   * count `logRange`, run gitleaks over it in the bare with the silencers disabled, read the
+   * size-capped report and apply the liveness gate. `label` prefixes every log line and
+   * `onUntrusted` ends the untrusted ones (the finalize wording is byte-identical to before the split).
    */
   private async scanLogRange(
     barePath: string,
