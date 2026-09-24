@@ -4,6 +4,9 @@ set -eu
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT="$HERE/backup-loop.sh"
+# macOS /bin/bash is 3.2, which rejects empty-array expansions under set -u.
+# Exercise the shell used by the launchd job, not a newer bash earlier on PATH.
+BASH_BIN="${BASH_BIN:-/bin/bash}"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 fail(){ echo "FAIL: $*" >&2; exit 1; }
@@ -36,10 +39,12 @@ chmod +x "$WORK/uzi"
 export CALLS="$WORK/calls"
 export COUNT="$WORK/count"
 export BACKUP_COUNT="$WORK/backup-count"
-UZI_BIN="$WORK/uzi" UZI_BACKUP_RUNS_SCRIPT="$WORK/backup-runs" \
+if ! UZI_BIN="$WORK/uzi" UZI_BACKUP_RUNS_SCRIPT="$WORK/backup-runs" \
   UZI_BACKUP_DIR="$WORK/out" UZI_BACKUP_INTERVAL=1 UZI_BACKUP_MAX_HOURS=1 \
   UZI_BACKUP_RETENTION_DAYS=14 UZI_CTX=test-ctx UZI_WORKER_NS='ns-a ns-b' \
-  bash "$SCRIPT" run-a run-b > "$WORK/loop.log" 2>&1
+  "$BASH_BIN" "$SCRIPT" run-a run-b > "$WORK/loop.log" 2>&1; then
+  fail "backup loop exited nonzero under $BASH_BIN: $(cat "$WORK/loop.log")"
+fi
 
 [ "$(awk 'NR==1{print; exit}' "$CALLS")" = "run-a run-b" ] \
   || fail "first cycle did not include both runs: $(cat "$CALLS")"

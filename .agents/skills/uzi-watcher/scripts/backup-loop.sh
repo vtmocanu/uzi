@@ -3,10 +3,11 @@
 # run ids, independent of any Claude/terminal session. Self-terminates when every
 # target run is terminal, when MAX_HOURS elapses, or when a STOP file appears.
 #
-# Launch it DETACHED so it outlives the launching shell:
+# Launch it outside the agent session so it outlives the launching shell:
 #   Linux:  setsid bash backup-loop.sh <RUN_ID>... </dev/null >>/tmp/uzi-backups/loop.log 2>&1 &
-#   macOS:  ( nohup bash backup-loop.sh <RUN_ID>... </dev/null >>/tmp/uzi-backups/loop.log 2>&1 & )
-#           (no setsid on macOS; the subshell double-fork orphans it to init)
+#   macOS:  use a launchd LaunchAgent. This agent harness reaps nohup children.
+#           Keep launchd stdout/stderr under /tmp even when UZI_BACKUP_DIR is
+#           Downloads; a Downloads log path failed before the job could start.
 #
 # Stop it:  touch "$UZI_BACKUP_DIR/STOP"   (default /tmp/uzi-backups/STOP)
 #     or:   kill "$(cat "$UZI_BACKUP_DIR/backup-loop.pid")"
@@ -66,7 +67,8 @@ write_state(){
     echo "started_at=$STARTED_AT"
     echo "ends_at=$ENDS_AT"
     echo "retention_days=${UZI_BACKUP_RETENTION_DAYS:-14}"
-    echo "runs=${RUNS[*]}"
+    # Bash 3.2 treats an empty array expansion as unbound under set -u.
+    if [ "${#RUNS[@]}" -eq 0 ]; then echo "runs="; else echo "runs=${RUNS[*]}"; fi
     [ -n "$ended_at" ] && echo "ended_at=$ended_at"
   } > "$tmp"
   mv -f "$tmp" "$STATE"
@@ -96,7 +98,8 @@ while :; do
       *) next_runs+=("$RID") ;;
     esac
   done
-  RUNS=("${next_runs[@]}")
+  RUNS=()
+  if [ "${#next_runs[@]}" -gt 0 ]; then RUNS=("${next_runs[@]}"); fi
   write_state running
   [ "${#RUNS[@]}" -eq 0 ] && { llog "all runs terminal; exiting"; break; }
   [ "$(date +%s)" -ge "$END" ] && { llog "max runtime reached; exiting"; break; }

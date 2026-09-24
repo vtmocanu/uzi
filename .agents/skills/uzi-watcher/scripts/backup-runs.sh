@@ -398,10 +398,12 @@ for RID in "${RUNS[@]}"; do
       log "SNAP $RID ($LBL) status=$st mr=${mr:-none} (status saved; no worker capture)"
       continue ;;
     queued)
-      # A queued run has no worker clone yet. Keep its status in the snapshot and
-      # try for work on the next cycle after a worker claims it.
-      log "SNAP $RID ($LBL) status=queued (status saved; awaiting worker capture)"
-      continue ;;
+      # A never-claimed run has no clone. A requeued run keeps worker_id for
+      # affinity, so its clone may still hold uncommitted work on that worker.
+      if [ -z "$wid" ]; then
+        log "SNAP $RID ($LBL) status=queued (status saved; awaiting worker capture)"
+        continue
+      fi ;;
   esac
   if [ -z "$wid" ]; then
     # A branch name is not a run identity: a fresh queued run on an issue can reuse
@@ -493,7 +495,7 @@ for RID in "${RUNS[@]}"; do
       # A typed missing-source/no-new-commits result is deterministic; retrying the same
       # pod three times cannot create a clone or tracking ref. Other failures may be a
       # transient kubectl stream break, so retry those.
-      case "$kc_rc" in 3|4|5) break ;; esac
+      case "$kc_rc" in 3|4|5|7) break ;; esac
       [ "$kc_rc" -ne 0 ] && continue
       break
     fi
