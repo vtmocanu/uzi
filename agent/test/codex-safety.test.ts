@@ -718,8 +718,11 @@ describe("CodexExecutionSafety.withBoundary: boundary deadline trigger (issue #1
     const reg = new ExecutionRegistry(newLocalExecutionEpoch(40));
     const safety = createCodexExecutionSafety(reg, spawnCounter().seam);
     let signal: AbortSignal | undefined;
+    // Real default timer, but a budget wide enough that quiesce/reap/permit acquisition
+    // cannot plausibly outrun it under a loaded event loop: the action is always reached
+    // and then waits only on the deadline's abort, so the rejection stage is "action".
     await assert.rejects(
-      safety.withBoundary({ boundary: "shutdown", deadlineMs: 30 }, async (permit) => {
+      safety.withBoundary({ boundary: "shutdown", deadlineMs: 250 }, async (permit) => {
         signal = permit.signal;
         await awaitAbort(permit.signal);
       }),
@@ -750,9 +753,12 @@ describe("CodexExecutionSafety.withBoundary: boundary deadline trigger (issue #1
       globalThis.setTimeout = realSetTimeout;
       globalThis.clearTimeout = realClearTimeout;
     }
-    assert.equal(armed.length, 1, "exactly one deadline timer armed");
-    const [deadline] = armed;
-    assert.ok(deadline && (deadline.ms ?? 0) > 59_000 && (deadline.ms ?? 0) <= 60_000, `armed for the remaining budget: ${deadline?.ms}`);
+    // The spy is process-global, so under node's shared-process test mode it can also see
+    // timers scheduled by concurrent work during the await window. Only the boundary's own
+    // deadline is armed for the remaining ~60s budget, so filter on that window.
+    const deadlines = armed.filter(({ ms }) => ms !== undefined && ms > 59_000 && ms <= 60_000);
+    assert.equal(deadlines.length, 1, `exactly one deadline timer armed for the remaining budget: ${armed.map((a) => a.ms).join(",")}`);
+    const [deadline] = deadlines;
     assert.equal(deadline?.handle.hasRef(), false, "the deadline timer never holds the process open");
     assert.ok(cleared.includes(deadline?.handle), "teardown cleared the deadline timer");
   });

@@ -318,7 +318,12 @@ function statuses(runId: string): string[] {
 // Issue #1513: per-spawn delays that make the permit-held Git before the upload / forge call
 // outlast the OLD wall-clock budgets (500ms shutdown, 2000ms finalize), reproducing the
 // suite-load flake deterministically. The event-gated deadline must make that irrelevant.
-const SHUTDOWN_LOAD_SPAWN_DELAY_MS = 75;
+// The loaded tests' lower bounds (>= 500 / >= 2000) depend on how many permit-held git
+// spawns precede the upload / forge call: about 8 on the shutdown path and about 11 on the
+// finalize path today. The delays keep headroom against that count shrinking: 5 shutdown
+// spawns alone (550ms) and 8 finalize spawns alone (2000ms) already reach the bound. If a
+// boundary refactor drops spawns below that, raise the delay rather than the bound.
+const SHUTDOWN_LOAD_SPAWN_DELAY_MS = 110;
 const FINALIZE_LOAD_SPAWN_DELAY_MS = 250;
 
 /** The finalize deadline contract: a stuck forge request is aborted by the (event-gated)
@@ -421,6 +426,8 @@ async function shutdownDeadlineScenario(
     uploadSignal = signal;
     await drain(pack);
     if (!signal) throw new Error("the shutdown upload must carry the boundary signal");
+    // Prove the deadline (not an already-aborted signal) is what aborts the upload.
+    assert.equal(signal.aborted, false, "the upload signal is live until the deadline fires");
     deadline.fire();
     await new Promise<void>((resolve) => {
       if (signal.aborted) resolve();
