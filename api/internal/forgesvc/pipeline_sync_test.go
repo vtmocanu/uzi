@@ -422,7 +422,7 @@ func TestSyncPipelinesRefCapLogsTransitionsOnly(t *testing.T) {
 	slog.SetDefault(slog.New(capLogHandler{mu: &mu, msgs: &msgs}))
 
 	const (
-		warn = "WARN forgesvc: pipeline watch hit the ref cap; older run branches are not watched until it clears (see admin Health: forge.ciwatch)"
+		warn = "WARN forgesvc: pipeline watch hit the ref cap; at least one older run branch is not watched until it clears (admin Health forge.ciwatch has the count)"
 		info = "INFO forgesvc: pipeline watch back under the ref cap; every eligible run branch is watched"
 	)
 	st := &fakeStore{}

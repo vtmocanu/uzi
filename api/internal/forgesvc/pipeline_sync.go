@@ -150,7 +150,7 @@ func (s *Service) logRefCapTransition(repoID uuid.UUID, maxRefs int, capped bool
 
 	switch {
 	case capped && !was:
-		slog.Warn("forgesvc: pipeline watch hit the ref cap; older run branches are not watched until it clears (see admin Health: forge.ciwatch)",
+		slog.Warn("forgesvc: pipeline watch hit the ref cap; at least one older run branch is not watched until it clears (admin Health forge.ciwatch has the count)",
 			"repo", repoID, "cap", maxRefs)
 	case !capped && was:
 		slog.Info("forgesvc: pipeline watch back under the ref cap; every eligible run branch is watched",
