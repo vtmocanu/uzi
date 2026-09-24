@@ -195,7 +195,10 @@ func TestProveNoUserNeverHeldWhileAHopperLives(t *testing.T) {
 	// At least minDecided DECIDED proofs ("held" or "user_alive": an
 	// "unknown" one cannot show "held", so it proves nothing), then more until
 	// one sees the hopper, all within budget. Every proof must not be "held".
-	const minDecided, budget = 50, 20 * time.Second
+	// The budget is generous because the decided-proof rate is load-dependent:
+	// on a busy CI runner most proofs race a vanished pid and come back
+	// "unknown" (observed ~70:1), and the loop exits as soon as the minimum is met.
+	const minDecided, budget = 50, 60 * time.Second
 	deadline := time.Now().Add(budget)
 	decided := func() int { return counts[proofHeld] + counts[proofUserAlive] }
 	for i := 0; (decided() < minDecided || counts[proofUserAlive] == 0) && time.Now().Before(deadline); i++ {
