@@ -111,6 +111,7 @@ if [ "\${1:-}" = run ] && [ "\${2:-}" = get ]; then
   case "\${3:-}" in
     *mrr*) printf '%s' '{"status":"running","issue_iid":null,"kind":"mr_rework","branch":null,"pipeline_ref":"agent/issue-9999","worker_id":"${WID:-w0rker}","mr_iid":7777,"mr_web_url":null,"health_reason":"ok","anthropic_secret_label":"tok","anthropic_bind_mode":"default","milestones":[],"milestones_completed":[]}' ;;
     *noworker*) printf '%s' '{"status":"running","issue_iid":4242,"kind":"issue","branch":null,"pipeline_ref":null,"worker_id":null,"mr_web_url":null,"health_reason":"ok","anthropic_secret_label":"tok","anthropic_bind_mode":"default","milestones":[],"milestones_completed":[]}' ;;
+    *queuedbound*) printf '%s' '{"status":"queued","issue_iid":4242,"kind":"issue","branch":null,"pipeline_ref":null,"worker_id":"${WID:-w0rker}","mr_web_url":null,"health_reason":"ok","anthropic_secret_label":"tok","anthropic_bind_mode":"default","milestones":[],"milestones_completed":[]}' ;;
     *queued*) printf '%s' '{"status":"queued","issue_iid":4242,"kind":"issue","branch":null,"pipeline_ref":null,"worker_id":null,"mr_web_url":null,"health_reason":"ok","anthropic_secret_label":"tok","anthropic_bind_mode":"default","milestones":[],"milestones_completed":[]}' ;;
     *)     printf '%s' '{"status":"running","issue_iid":4242,"kind":"issue","branch":null,"pipeline_ref":null,"worker_id":"${WID:-w0rker}","mr_web_url":null,"health_reason":"ok","anthropic_secret_label":"tok","anthropic_bind_mode":"default","milestones":[],"milestones_completed":[]}' ;;
   esac
@@ -168,6 +169,18 @@ tar -xOzf "$L1_DUBIOUS/issue-4242.tgz" issue-4242.uncommitted.patch | grep -qF '
 tar -xOzf "$L1_DUBIOUS/issue-4242.tgz" issue-4242.meta.txt | grep -qF "head=$MAIN" \
   || fail "dubious owner: Git HEAD was not captured"
 echo "PASS dubious owner: exact clone trusted; patch and HEAD kept"
+
+# A requeued run keeps its worker binding and may still have uncommitted work
+# in the old clone. It must get an archive, not the never-claimed status-only path.
+git --git-dir="$BARE" config 'uzi-recovery.agent/issue-4242.clone' \
+  "{\"runId\":\"queuedbound-1\",\"clonePath\":\"$RUNNER\"}"
+L1_QUEUED_BOUND="$(run_backup 1.queuedbound queuedbound-1)"
+[ -f "$L1_QUEUED_BOUND/issue-4242.tgz" ] || fail "bound queued: no archive"
+tar -xOzf "$L1_QUEUED_BOUND/issue-4242.tgz" issue-4242.uncommitted.patch | grep -qF '+dirty' \
+  || fail "bound queued: uncommitted work was not captured"
+git --git-dir="$BARE" config 'uzi-recovery.agent/issue-4242.clone' \
+  "{\"runId\":\"run-4242\",\"clonePath\":\"$RUNNER\"}"
+echo "PASS bound queued: live clone work captured after requeue"
 
 # --- case 2: one committed commit -> a (small) bundle, OK -----------------------
 git_q "$RUNNER" checkout f.txt   # drop the uncommitted change
