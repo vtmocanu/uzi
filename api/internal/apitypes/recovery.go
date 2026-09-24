@@ -158,6 +158,69 @@ type RecoveryReleaseRequest struct {
 	ReleaseEvidence *string `json:"release_evidence,omitempty"`
 }
 
+// RecoverySettleRequest is the worker's request that the api settle ONE older-generation
+// custody hold on a completed run by ANCESTRY (issue #1582 M1): the predecessor generation's
+// work was adopted by a same-worker successor that then completed. The worker supplies
+// CANDIDATE SHAs only: PushedSha is the SUCCESSOR generation's acknowledged pushed head (the
+// head the completing generation pushed and landed, persisted by the worker before its terminal
+// report); SourceSha is the PREDECESSOR generation's journaled source; AdoptedSha is the tip the
+// successor adopted. The api proves, through the forge compare API alone, that each is an
+// ancestor of (or equal to) the completed branch head. There is deliberately NO field for the
+// worker's own ancestry verdict: the handler decodes strictly, so an extra field (for example
+// "ancestry":"ancestor") is a 400. Every SHA must be a 40-char lowercase hex commit id.
+type RecoverySettleRequest struct {
+	PredecessorGeneration int64  `json:"predecessor_generation"`
+	SuccessorGeneration   int64  `json:"successor_generation"`
+	PushedSha             string `json:"pushed_sha"`
+	SourceSha             string `json:"source_sha"`
+	AdoptedSha            string `json:"adopted_sha"`
+}
+
+// Settle outcomes and retained reasons (issue #1582 M1). Outcome is released only when the
+// named hold is (now, or already by an identical earlier settle) released with 'ancestry'
+// evidence; every other answer is retained with one bounded reason.
+const (
+	RecoverySettleReleased = "released"
+	RecoverySettleRetained = "retained"
+
+	// RecoverySettleAncestryUnknown: the forge could not prove ancestry (branch head
+	// unreadable, a rate limit, a redirect, an error, or an inconclusive answer). Transient:
+	// the worker may retry later.
+	RecoverySettleAncestryUnknown = "ancestry_unknown"
+	// RecoverySettleNotAncestor: the forge explicitly reported a candidate NOT contained in
+	// the completed branch head.
+	RecoverySettleNotAncestor = "not_ancestor"
+	// RecoverySettleStateChanged: the run or hold changed between the proof and the guarded
+	// release, so nothing was released.
+	RecoverySettleStateChanged = "state_changed"
+	// RecoverySettleNotEligible: the run/hold is not an older-generation hold of this worker
+	// on a run this worker completed at the named successor generation, the run's branch is
+	// not a valid git branch name, an interlocked run has no consumed completion permit to
+	// bind to (or that permit's head is not a 40-char lowercase hex commit id), or the hold
+	// was already settled with a different identity.
+	RecoverySettleNotEligible = "not_eligible"
+	// RecoverySettleCandidateMismatch: a candidate SHA contradicts a fact the server already
+	// holds for this hold or run (issue #1582 M1 rework): source_sha is not the source_sha of
+	// any recovery capture registered under the hold before the successor generation claimed
+	// (a later capture is ignored), or pushed_sha is not the head of the
+	// completion permit the run's (interlocked) completion consumed. Terminal: retrying the
+	// same candidates can never succeed.
+	RecoverySettleCandidateMismatch = "candidate_mismatch"
+	// RecoverySettleBranchMissing: the forge reports the completed branch does not exist (a
+	// 404 on the branch read), so there is no head to prove against. Terminal for the worker.
+	RecoverySettleBranchMissing = "branch_missing"
+)
+
+// RecoverySettleResponse is the api's answer to a RecoverySettleRequest (issue #1582 M1).
+// FinalHeadSha is the branch head the api proved against, set only on a release.
+type RecoverySettleResponse struct {
+	RunID        string `json:"run_id"`
+	HoldID       string `json:"hold_id"`
+	Outcome      string `json:"outcome"`
+	Reason       string `json:"reason,omitempty"`
+	FinalHeadSha string `json:"final_head_sha,omitempty"`
+}
+
 // RecoveryHoldDTO is one open custody hold this worker holds on a run, in the worker-facing
 // post-clone inventory (PRD #1349 M1, D3). HoldID + Generation are the exact hold identity;
 // HasAvailableCapture is true when a ready archive already covers this hold's source, and

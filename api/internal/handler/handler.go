@@ -1223,6 +1223,16 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		r.Get("/runs/{id}/archives/{captureID}", h.WorkerRecoveryStatus)
 		// PRD #1349 M1: the post-clone generation-exact hold inventory for this worker's run.
 		r.Get("/runs/{id}/recovery-holds", h.WorkerListRecoveryHolds)
+		// Issue #1582 M1: settle ONE older-generation hold on a completed run by the api's own
+		// forge ancestry proof. The worker supplies candidate SHAs only (strict decode). Each
+		// call that reaches the proof spends the OWNER's forge quota (one branch-head read plus
+		// up to three compares, six on Forgejo, which asks both directions), so it rides the
+		// per-worker proposal limiter instance. That limiter keys its buckets by (route
+		// pattern, worker id), so this route has its OWN bucket, separate from the proposal
+		// and finding routes', but every bucket is sized by the same PROPOSAL_RATE_LIMIT_MAX /
+		// PROPOSAL_RATE_LIMIT_WINDOW settings: a looping worker cannot burn the owner's forge
+		// budget.
+		r.With(proposalLimiter.PerWorkerMiddleware).Post("/runs/{id}/recovery-holds/{holdID}/settle", h.WorkerSettleRecoveryHold)
 	})
 }
 

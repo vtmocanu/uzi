@@ -2448,3 +2448,29 @@ export interface RecoveryHoldsResponse {
   run_id: string;
   holds: RecoveryHold[];
 }
+
+/** RecoverySettleRequest is the worker's request that the api settle ONE older-generation
+ *  custody hold on a completed run by ANCESTRY (issue #1582, mirrors
+ *  api/internal/apitypes/recovery.go). Candidate SHAs only (40-char lowercase hex): pushed_sha
+ *  is the SUCCESSOR generation's pushed head, source_sha the PREDECESSOR generation's journaled
+ *  source, adopted_sha the tip the successor adopted. There is deliberately no field for a
+ *  worker ancestry verdict: the api decodes strictly and proves ancestry via the forge itself. */
+export interface RecoverySettleRequest {
+  predecessor_generation: number;
+  successor_generation: number;
+  pushed_sha: string;
+  source_sha: string;
+  adopted_sha: string;
+}
+
+/** RecoverySettleResponse is the api's answer to a {@link RecoverySettleRequest} (issue #1582).
+ *  outcome is "released" or "retained"; reason is the bounded retained reason
+ *  (ancestry_unknown | state_changed | not_ancestor | not_eligible | candidate_mismatch |
+ *  branch_missing); final_head_sha is the branch head proved against, set only on a release. */
+export interface RecoverySettleResponse {
+  run_id: string;
+  hold_id: string;
+  outcome: string;
+  reason?: string;
+  final_head_sha?: string;
+}

@@ -326,3 +326,69 @@ describe("Worker boot claim gate (PRD #1391 Run B M4)", () => {
     assert.equal(registeredSnapshot, undefined, "no pending terminal ⇒ no register snapshot (byte-identical register wire)");
   });
 });
+
+describe("Worker boot: the ancestry-settlement sweep starts only after the boot terminal gate (issue #1582 M2)", () => {
+  it("no settlement sweep until resolveBootTerminals resolves; then an immediate sweep and timed re-sweeps", async () => {
+    const outbox = await mkOutbox();
+    await outbox.journalTerminal(RUN, 4, "running", 0, { status: "completed" });
+
+    const events: string[] = [];
+    let releaseReport!: () => void;
+    const reportGate = new Promise<void>((r) => (releaseReport = r));
+    const client = fakeClient({
+      reportState: async () => {
+        events.push("boot-resolve:start");
+        await reportGate;
+        events.push("boot-resolve:done");
+        return { applied: true, status: "completed" } as StateAck;
+      },
+    });
+    let sweeps = 0;
+    const runner = {
+      resumePendingRecoveries: async () => {},
+      execute: async () => {},
+      settlePendingPredecessors: async () => {
+        sweeps += 1;
+        events.push("settle-sweep");
+      },
+    } as unknown as RunRunner;
+
+    const controller = new AbortController();
+    const worker = new Worker(
+      fakeConfig(),
+      client,
+      runner,
+      idleChat,
+      noJudge,
+      noReview,
+      nullLogger(),
+      okPreflight,
+      outbox,
+      new Map(),
+      undefined,
+      20, // settlement re-sweep interval (ms)
+    );
+    const done = worker.run(controller.signal);
+    try {
+      await pollUntil(() => events.includes("boot-resolve:start"), 2000, "the boot terminal resolve started");
+      await sleep(60); // every chance for the sweep to (wrongly) start early
+      assert.equal(sweeps, 0, "the settlement sweep must not run before the pending terminal is resolved");
+
+      releaseReport();
+      await pollUntil(() => sweeps >= 3, 2000, "an immediate sweep, then timed re-sweeps");
+      assert.ok(
+        events.indexOf("boot-resolve:done") < events.indexOf("settle-sweep"),
+        "the first sweep follows the boot terminal resolve",
+      );
+    } finally {
+      // Stop the worker even when an assertion above failed, so a regression reads as a failure
+      // rather than a hung test file.
+      releaseReport();
+      controller.abort();
+      await done;
+    }
+    const after = sweeps;
+    await sleep(60);
+    assert.equal(sweeps, after, "the sweep loop stops on abort");
+  });
+});

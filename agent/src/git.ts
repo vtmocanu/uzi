@@ -232,6 +232,20 @@ function runnerTrackingRef(branch: string): string {
 // is the leaf, so the namespace is D/F-safe and dodges the branch-slash D/F hazard that affected
 // `refs/uzi-runner` (issue #887) — it never carries the branch.
 const RECOVERY_PIN_PREFIX = "refs/uzi-recovery-pin/";
+// issue #1582 M2 — the settlement pins for an older-generation custody hold a same-worker successor
+// adopted: `refs/uzi-settle/<runId>/<holdId>/{source,adopted,pushed}`. They keep the three candidate
+// commits the settle request names reachable (a `--all` gc root, like refs/uzi-recovery-pin) until the
+// api releases the hold. Both ids are sanitized into SINGLE safe path components; an id that
+// sanitizes to empty yields no ref at all.
+const SETTLE_PIN_PREFIX = "refs/uzi-settle/";
+type SettlementPinKind = "source" | "adopted" | "pushed";
+const SETTLEMENT_PIN_KINDS: readonly SettlementPinKind[] = ["source", "adopted", "pushed"];
+function settlementPinBase(runId: string, holdId: string): string | null {
+  const rid = runId.replace(/[^A-Za-z0-9_-]/g, "-");
+  const hid = holdId.replace(/[^A-Za-z0-9_-]/g, "-");
+  if (rid === "" || hid === "") return null;
+  return `${SETTLE_PIN_PREFIX}${rid}/${hid}/`;
+}
 function recoveryPinRef(runId: string, generation: number): string {
   const rid = runId.replace(/[^A-Za-z0-9_-]/g, "-");
   return `${RECOVERY_PIN_PREFIX}${rid}/${generation}`;
@@ -502,6 +516,10 @@ export class GitCache {
    *  It survives runner-clone removal and worker restart, so a terminal/restart retry can
    *  re-upload the exact journaled bytes with no forge PAT (D5). Worker-owned. */
   readonly recoveryRoot: string;
+  /** issue #1582 M2 — the authenticated ancestry-settlement journal (one record per adopted
+   *  predecessor hold). A SIBLING of `recoveryRoot`, never inside it: the recovery restart sweep
+   *  treats every entry under `recovery/` as a runId. Worker-owned. */
+  readonly recoverySettlementRoot: string;
   /** Per-bare-path serialization: git's lockfiles can't take parallel mutations. */
   private readonly locks = new Map<string, Promise<unknown>>();
   private readonly boundaryProcesses = new AsyncLocalStorage<BoundaryProcessScope>();
@@ -517,6 +535,7 @@ export class GitCache {
     this.runnerRoot = path.join(dataDir, "runner");
     this.runnerHoldingRoot = path.join(dataDir, "runner-quarantine");
     this.recoveryRoot = path.join(dataDir, "recovery");
+    this.recoverySettlementRoot = path.join(dataDir, "recovery-settlement");
   }
 
   /** Scope every subprocess and bare-lock acquisition created by `action` to the
@@ -1613,6 +1632,55 @@ export class GitCache {
    */
   async deleteRecoveryPin(barePath: string, runId: string, generation: number): Promise<void> {
     await this.tryGit(barePath, ["update-ref", "-d", recoveryPinRef(runId, generation)]);
+  }
+
+  /**
+   * issue #1582 M2 — pin the settlement candidates for ONE adopted predecessor hold at
+   * `refs/uzi-settle/<runId>/<holdId>/<kind>`. UNDER THE BARE LOCK, every named SHA is first
+   * re-confirmed as a real commit present in the bare; if ANY is absent (or not 40-hex) nothing is
+   * written and false is returned, so the caller records no evidence. Worker-uid, local,
+   * credential-free. Never throws.
+   */
+  async pinSettlementRefs(
+    barePath: string,
+    runId: string,
+    holdId: string,
+    shas: Partial<Record<SettlementPinKind, string>>,
+  ): Promise<boolean> {
+    const base = settlementPinBase(runId, holdId);
+    const entries = SETTLEMENT_PIN_KINDS.flatMap((k) => (shas[k] !== undefined ? [[k, shas[k]!] as const] : []));
+    if (base === null || entries.length === 0) return false;
+    if (!entries.every(([, sha]) => /^[0-9a-f]{40}$/.test(sha))) return false;
+    try {
+      return await this.withLock(barePath, async () => {
+        for (const [, sha] of entries) {
+          const present = (
+            await this.runGit(barePath, ["rev-parse", "--verify", `${sha}^{commit}`]).catch(() => "")
+          ).trim();
+          if (present !== sha) return false;
+        }
+        for (const [kind, sha] of entries) {
+          await this.runGit(barePath, ["update-ref", `${base}${kind}`, sha]);
+        }
+        return true;
+      });
+    } catch (err) {
+      this.log.warn("recovery settlement: could not pin the settlement candidates in the trusted bare", {
+        bare: barePath,
+        error: gitErrorMessage(err),
+      });
+      return false;
+    }
+  }
+
+  /** issue #1582 M2 — best-effort remove every settlement pin for ONE hold (after the api
+   *  released it). Never throws. */
+  async deleteSettlementRefs(barePath: string, runId: string, holdId: string): Promise<void> {
+    const base = settlementPinBase(runId, holdId);
+    if (base === null) return;
+    for (const kind of SETTLEMENT_PIN_KINDS) {
+      await this.tryGit(barePath, ["update-ref", "-d", `${base}${kind}`]);
+    }
   }
 
   /** Record clone ownership BEFORE running the model, so disk pressure during a

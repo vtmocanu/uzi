@@ -2,11 +2,16 @@ package store_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -142,6 +147,79 @@ func TestCustodyReleaseEvidenceLiveDB(t *testing.T) {
 	}
 	if state, ev := holdEvidence(hDisc); state != "discarded" || ev == nil || *ev != "owner_discard" {
 		t.Fatalf("owner-discard hold state=%q evidence=%v, want discarded/owner_discard", state, ev)
+	}
+
+	// ── Issue #1582 M1: ReleasePredecessorCustodyHoldByAncestry stamps 'ancestry' with all six
+	// audit columns, and migration 00251's CHECKs refuse an 'ancestry' row missing any of them
+	// (and a malformed SHA or over-long branch in an audit column). ──
+	const (
+		shaP = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		shaS = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+		shaA = "cccccccccccccccccccccccccccccccccccccccc"
+		shaH = "dddddddddddddddddddddddddddddddddddddddd"
+	)
+	rAnc := newRun("completed", 2)
+	exec(`UPDATE runs SET worker_id = $2, branch = 'agent/issue-anc', status_since = now() WHERE id = $1`, rAnc, workerID)
+	hAnc := openHold(rAnc, 1)
+	hAncSibling := openHold(rAnc, 2)
+	var since pgtype.Timestamptz
+	if err := pool.QueryRow(ctx, `SELECT status_since FROM runs WHERE id = $1`, rAnc).Scan(&since); err != nil {
+		t.Fatalf("read status_since: %v", err)
+	}
+	ancParams := store.ReleasePredecessorCustodyHoldByAncestryParams{
+		PushedSha: shaP, SourceSha: shaS, AdoptedSha: shaA, FinalHeadSha: shaH,
+		SuccessorGeneration: 2, Branch: "agent/issue-anc", HoldID: hAnc, RunID: rAnc,
+		PredecessorGeneration: 1, WorkerID: workerID, CompletedSince: since,
+	}
+	// A changed completion instant moves zero rows (the guard the service relies on).
+	stale := ancParams
+	stale.CompletedSince = pgtype.Timestamptz{Time: since.Time.Add(-time.Second), Valid: true}
+	if n, err := q.ReleasePredecessorCustodyHoldByAncestry(ctx, stale); err != nil || n != 0 {
+		t.Fatalf("ancestry release with a stale status_since = (%d, %v), want 0 rows", n, err)
+	}
+	if n, err := q.ReleasePredecessorCustodyHoldByAncestry(ctx, ancParams); err != nil || n != 1 {
+		t.Fatalf("ReleasePredecessorCustodyHoldByAncestry = (%d, %v), want 1 row", n, err)
+	}
+	got, err := q.GetCustodyHoldForSettle(ctx, store.GetCustodyHoldForSettleParams{HoldID: hAnc, RunID: rAnc})
+	if err != nil {
+		t.Fatalf("GetCustodyHoldForSettle: %v", err)
+	}
+	if got.State != "released" || got.ReleaseEvidence.String != "ancestry" || got.ReleasePushedSha.String != shaP ||
+		got.ReleaseSourceSha.String != shaS || got.ReleaseAdoptedSha.String != shaA || got.ReleaseFinalHeadSha.String != shaH ||
+		got.ReleaseSuccessorGeneration.Int64 != 2 || got.ReleaseBranch.String != "agent/issue-anc" ||
+		got.LiveWorkerID.Valid || got.LiveRunID.Valid || !got.ReleasedAt.Valid {
+		t.Fatalf("ancestry-released hold = %+v, want released/ancestry with all six audit columns and null live FKs", got)
+	}
+	if state, _ := holdEvidence(hAncSibling); state != "open" {
+		t.Fatalf("sibling generation hold state = %q, want open (never touched)", state)
+	}
+	// Idempotent: a second identical call moves zero rows.
+	if n, err := q.ReleasePredecessorCustodyHoldByAncestry(ctx, ancParams); err != nil || n != 0 {
+		t.Fatalf("repeat ancestry release = (%d, %v), want 0 rows", n, err)
+	}
+	// The all-or-nothing CHECK: an 'ancestry' row missing any audit column is refused.
+	hPartial := openHold(newRun("running", 0), 1)
+	for _, bad := range []string{
+		`UPDATE recovery_custody_holds SET state = 'released', release_evidence = 'ancestry' WHERE id = $1`,
+		`UPDATE recovery_custody_holds SET state = 'released', release_evidence = 'ancestry',
+		   release_pushed_sha = '` + shaP + `', release_source_sha = '` + shaS + `', release_adopted_sha = '` + shaA + `',
+		   release_final_head_sha = '` + shaH + `', release_successor_generation = 2 WHERE id = $1`,
+		`UPDATE recovery_custody_holds SET release_pushed_sha = 'ABC' WHERE id = $1`,
+		`UPDATE recovery_custody_holds SET release_final_head_sha = '` + strings.ToUpper("abcdef"+shaH[6:]) + `' WHERE id = $1`,
+		`UPDATE recovery_custody_holds SET release_branch = '` + strings.Repeat("b", 256) + `' WHERE id = $1`,
+		`UPDATE recovery_custody_holds SET release_evidence = 'worker_says_ancestor' WHERE id = $1`,
+		// Issue #1582 M1 rework: a successor generation is always positive.
+		`UPDATE recovery_custody_holds SET release_successor_generation = 0 WHERE id = $1`,
+		`UPDATE recovery_custody_holds SET release_successor_generation = -3 WHERE id = $1`,
+	} {
+		_, err := pool.Exec(ctx, bad, hPartial)
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "23514" {
+			t.Fatalf("exec %q = %v, want a CHECK violation (23514)", bad, err)
+		}
+	}
+	if state, ev := holdEvidence(hPartial); state != "open" || ev != nil {
+		t.Fatalf("partial-ancestry hold state=%q evidence=%v, want untouched open", state, ev)
 	}
 
 	// ── ListReleasableCustodyHolds returns the correct per-hold reason. The list is

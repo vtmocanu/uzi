@@ -158,6 +158,38 @@ Each retained claim keeps its own hold, keyed to the exact claim that
 produced the work, so a later run on the same worker never drops an older
 claim's only copy.
 
+## Automatic settlement of an older held generation
+
+When a run is resumed on the same worker (after a rate-limit park, a
+recovery restart, or a similar restart), the new generation may adopt an
+older generation's committed work as its starting point. If that older
+generation still has an open custody hold and the resumed run goes on to
+publish, uzi can release the older hold automatically once it can *prove*
+the older work is actually contained in what got published — you don't have
+to notice and discard it by hand.
+
+The worker never decides this itself. It reports the candidate commits — the
+older generation's recorded source, the commit it adopted, and the head it
+pushed — and the server checks them against what it has on record (an earlier
+recovery capture of that hold, or the completed run's permitted head, when
+either exists). The server then asks your forge whether each candidate is an
+ancestor of the branch's current published head, using the forge's own
+comparison API. Only a positive, unambiguous answer releases the hold. A
+rate-limited, erroring, or inconclusive answer, or a run whose state changed
+underneath the check, keeps the hold open and the worker retries later with
+backoff (up to a bounded number of attempts); a definite "not contained", a
+candidate that contradicts the server's record, or a branch that no longer
+exists stops automatic settlement for that hold. Before reporting anything,
+the worker also checks locally that the older generation's recorded source is
+contained in the commit the resume adopted. When it isn't (for example, a
+resume that restored uncommitted parked work from a `wip(park)` checkpoint),
+that hold gets no settlement attempt from this resume, and a later resume
+settles it only if the commit it adopts contains that source; otherwise it
+stays open for `uzi run export` or `uzi run discard`. A hold that settlement can't clear behaves
+exactly like any other open hold: it still shows up under **Recovery
+archives**, and you can still resolve it yourself with `uzi run export` or
+`uzi run discard`.
+
 ## Reviewing and resolving held work
 
 At most **8 unresolved holds per owner** (the *Unresolved recovery holds*

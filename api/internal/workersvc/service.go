@@ -539,6 +539,17 @@ type Store interface {
 	// so completing a newer generation never releases an older same-worker orphan (PRD #1349 M4).
 	ReleaseCustodyHold(ctx context.Context, arg store.ReleaseCustodyHoldParams) (int64, error)
 	ReleaseCustodyHoldExact(ctx context.Context, arg store.ReleaseCustodyHoldExactParams) (int64, error)
+	// Issue #1582 M1: the predecessor-settle pair. GetCustodyHoldForSettle reads the exact hold
+	// (scoped to its run); ReleasePredecessorCustodyHoldByAncestry is the single guarded
+	// statement that releases that one older-generation hold with 'ancestry' evidence after the
+	// api's own forge proof, re-asserting every run/hold guard so a change mid-proof moves 0 rows.
+	GetCustodyHoldForSettle(ctx context.Context, arg store.GetCustodyHoldForSettleParams) (store.RecoveryCustodyHold, error)
+	ReleasePredecessorCustodyHoldByAncestry(ctx context.Context, arg store.ReleasePredecessorCustodyHoldByAncestryParams) (int64, error)
+	// Issue #1582 M1 rework: the server-held facts the settle candidates must match — the
+	// source_sha of every capture under the hold created before the successor generation
+	// claimed, and the head of the completion permit an interlocked run's completion consumed.
+	ListCaptureSourceShasForHold(ctx context.Context, arg store.ListCaptureSourceShasForHoldParams) ([]string, error)
+	GetSettleCompletionPermitHead(ctx context.Context, arg store.GetSettleCompletionPermitHeadParams) (string, error)
 	DiscardCaptureForOwner(ctx context.Context, arg store.DiscardCaptureForOwnerParams) (int64, error)
 	// ExpireReadyCaptures is the periodic ready-artifact retention sweep (PRD #1296 D4): it
 	// flips every 'available' capture past its expires_at to 'expired' AND deletes that

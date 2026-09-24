@@ -67,7 +67,13 @@ var limiterNames = [...]string{
 // error rather than a failing row. Spelled `lim*` rather than matching the parameter
 // names exactly, so nothing here shadows a parameter inside Routes.
 //
-// 204 as of this commit (PRD #1484 M2-B added POST /api/admin/health/snooze — the per-admin,
+// 205 as of this commit (issue #1582 M1 added POST
+// /api/worker/runs/{id}/recovery-holds/{holdID}/settle — the worker-authenticated
+// predecessor-hold settle by the api's own forge ancestry proof. Each call can spend the owner's
+// forge quota, so it rides proposalLimiter.PerWorkerMiddleware, which this per-USER probe reads
+// as noLimiter, like /proposals and /findings; TestRecoverySettleIsRateLimitedLiveDB drives
+// that mount through the real WorkerRoutes).
+// It was 204 until then (PRD #1484 M2-B added POST /api/admin/health/snooze — the per-admin,
 // per-episode Danger-banner snooze in the admin WRITE group, cookie+CSRF, a single local
 // per-(episode, caller) upsert → noLimiter, like the release-check snooze it sits beside).
 // It was 203 until then (PRD #1484 M1 added GET /api/admin/health — the admin-health document
@@ -692,6 +698,13 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/worker/runs/{id}/archives/release", noLimiter},
 	{"POST", "/api/worker/runs/{id}/archives/reserve", noLimiter},
 	{"POST", "/api/worker/runs/{id}/archives/{captureID}/upload", noLimiter},
+	// Issue #1582 M1: the worker predecessor-hold settle. Worker-authenticated; a call that
+	// reaches the proof spends the OWNER's forge quota (one branch-head read plus up to three
+	// compares, up to six on Forgejo, which compares both directions per candidate), so it
+	// rides proposalLimiter.PerWorkerMiddleware (a per-WORKER, IP-fallback mount), which this
+	// per-USER probe reads as noLimiter, like /findings and /proposals.
+	// TestRecoverySettleIsRateLimitedLiveDB proves the mount through the real WorkerRoutes.
+	{"POST", "/api/worker/runs/{id}/recovery-holds/{holdID}/settle", noLimiter},
 	{"POST", "/api/worker/runs/{id}/memory", noLimiter},
 	{"POST", "/api/worker/runs/{id}/messages", noLimiter},
 	{"POST", "/api/worker/runs/{id}/proposals", noLimiter},
