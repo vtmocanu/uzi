@@ -307,9 +307,11 @@ if [ "$GATE" != "none" ]; then
   for g in "${GATES[@]}"; do
     case "$g" in gate:web) pkg=web;; gate:agent) pkg=agent;; *) continue;; esac
     if [ -f "$pkg/package-lock.json" ] && [ ! -d "$pkg/node_modules" ]; then
-      log "installing $pkg/ dependencies (npm ci --ignore-scripts)"
-      if ! (cd "$pkg" && npm ci --ignore-scripts --no-audit --no-fund >/dev/null 2>&1); then
-        echo "RESULT=gate_failed GATE=$g LOG=npm-ci WORKTREE=$WT"; exit 7
+      npmlog=$(mktemp "${TMPDIR:-/tmp}/land-prep-${PR}-npm-ci-${pkg}.XXXXXX")
+      log "installing $pkg/ dependencies (npm ci --ignore-scripts) -> $npmlog"
+      if ! (cd "$pkg" && npm ci --ignore-scripts --no-audit --no-fund) > "$npmlog" 2>&1; then
+        tail -n 40 "$npmlog"
+        echo "RESULT=gate_failed GATE=$g LOG=$npmlog WORKTREE=$WT"; exit 7
       fi
     fi
   done

@@ -85,6 +85,7 @@ cat > "$WORK/bin/npm" <<'STUB'
 #!/usr/bin/env bash
 set -eu
 printf '%s\n' "$*" >> "$NPM_LOG"
+[ -z "${NPM_FAIL:-}" ] || { echo "npm ERR! simulated install failure"; exit 1; }
 [ "${1:-}" = ci ] || { echo "unexpected npm: $*" >&2; exit 1; }
 case " $* " in *" --ignore-scripts "*) ;; *) echo "npm ci without --ignore-scripts" >&2; exit 1;; esac
 mkdir -p node_modules
@@ -121,6 +122,17 @@ grep -q 'base entry two' "$WORK/out.102" || fail "the removed line was not print
 # ...and the explicit override lets it through to preparation.
 run clrm 102 --skip-rebase --allow-changelog-removals --no-push --gate none
 [ "$rc" -eq 0 ] || fail "--allow-changelog-removals did not pass, rc=$rc: $(cat "$WORK/out.102")"
+
+# 3a. A failing install stops as a gate failure whose LOG is a real file carrying npm's output.
+: > "$TASK_LOG"
+NPM_FAIL=1 run deps 104 --no-push
+[ "$rc" -eq 7 ] || fail "npm ci failure not exit 7, rc=$rc: $(cat "$WORK/out.104")"
+npmlog=$(sed -n 's/^RESULT=gate_failed GATE=gate:agent LOG=\([^ ]*\) .*/\1/p' "$WORK/out.104")
+[ -n "$npmlog" ] && [ -f "$npmlog" ] || fail "LOG is not a file: $(cat "$WORK/out.104")"
+grep -q 'simulated install failure' "$npmlog" || fail "the npm log lacks npm's output"
+grep -q 'simulated install failure' "$WORK/out.104" || fail "no failure tail was printed"
+grep -q '^gate:agent$' "$TASK_LOG" && fail "gate:agent ran after a failed install"
+rm -f "$npmlog"
 
 # 3. gate:agent on a worktree with no node_modules installs them first, with --ignore-scripts.
 : > "$TASK_LOG"
