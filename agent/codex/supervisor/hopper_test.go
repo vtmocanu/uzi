@@ -13,17 +13,20 @@ import (
 	"time"
 )
 
-// hopScript is one generation of a shell pid hopper: unless $D/stop exists or
-// the generation budget $N is spent, it pauses $P seconds when $P is set (the
-// generation stays alive, so a whole scan can observe its pid), then starts
-// the next generation in the background (a NEW process: dash forks and execs
-// sh), appends that child's pid to $D/pids, and exits, so the live hopper's
-// pid changes every generation. The pause's sleep child is not a generation:
-// its comm is "sleep", so hopperRows never counts it.
-const hopScript = `[ -e "$D/stop" ] && exit 0
+// hopScript is one generation of a shell pid hopper: unless $D/stop exists,
+// $D is gone or the generation budget $N is spent, it pauses $P seconds when
+// $P is set (the generation stays alive, so a whole scan can observe its
+// pid), checks $D/stop and $D again, then starts the next generation in the
+// background (a NEW process: dash forks and execs sh), appends that child's
+// pid to $D/pids, and exits, so the live hopper's pid changes every
+// generation. A missing $D stops the hopper too, so no generation outlives
+// the test's temp dir. The pause's sleep child is not counted as a generation
+// once it has exec'd sleep: its comm is then "sleep".
+const hopScript = `[ -e "$D/stop" ] || [ ! -d "$D" ] && exit 0
 N=$((N - 1)); export N
 [ "$N" -le 0 ] && exit 0
 [ -n "$P" ] && sleep "$P"
+[ -e "$D/stop" ] || [ ! -d "$D" ] && exit 0
 sh -c "$S" </dev/null >/dev/null 2>&1 &
 echo $! >> "$D/pids"
 exit 0`
@@ -163,18 +166,23 @@ func startHopper(t *testing.T, pause string) (hopperTable, func() int) {
 		if err := os.WriteFile(filepath.Join(dir, "stop"), nil, 0o600); err != nil {
 			t.Error(err)
 		}
-		// Every generation now exits without a successor; wait for the pids
-		// file to stop growing.
-		last := -1
-		for range 200 {
-			fi, err := os.Stat(filepath.Join(dir, "pids"))
-			if err == nil && fi.Size() == int64(last) {
+		// Every generation now exits without a successor: one mid-pause
+		// rechecks stop when it wakes, and one past that check starts a
+		// successor that exits at once. Wait until the pids file has not grown
+		// for quiet, far longer than a generation's pause and fork, so the
+		// temp dir is not removed under a generation still writing to it.
+		const quiet, limit = time.Second, 30 * time.Second
+		last, since := int64(-1), time.Now()
+		for start := time.Now(); time.Since(start) < limit; time.Sleep(50 * time.Millisecond) {
+			size := int64(0)
+			if fi, err := os.Stat(filepath.Join(dir, "pids")); err == nil {
+				size = fi.Size()
+			}
+			if size != last {
+				last, since = size, time.Now()
+			} else if time.Since(since) >= quiet {
 				return
 			}
-			if err == nil {
-				last = int(fi.Size())
-			}
-			time.Sleep(50 * time.Millisecond)
 		}
 		t.Error("the hopper did not stop")
 	}
@@ -200,8 +208,8 @@ func startHopper(t *testing.T, pause string) (hopperTable, func() int) {
 // rule), because the hopper's next generation, created after the listing, is
 // absent from it. Each generation here lives hopperPause before it hops, so a
 // live hopper pid spans whole scans and most proofs are DECIDED ("held" or
-// "user_alive"; an "unknown" one cannot show "held", so it proves nothing)
-// whatever the host's load; the fork rate no longer decides the count.
+// "user_alive"; an "unknown" one cannot show "held", so it proves nothing):
+// the hopper's own fork rate no longer decides the count.
 func TestProveNoUserNeverHeldWhileAHopperLives(t *testing.T) {
 	const hopperPause = "0.1"
 	table, generations := startHopper(t, hopperPause)
