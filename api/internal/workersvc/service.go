@@ -1659,7 +1659,12 @@ type Service struct {
 	// codexPark is the park_codex_account_unavailable pass's in-memory keyset cursor (PRD
 	// #1590 M2, D2): the last queued Codex subscription run id the pass examined. Zero value is
 	// the start of the id space. Restart-losing by design: losing it only restarts the scan.
-	codexPark codexAccountParkCursor
+	codexPark codexAccountPageCursor
+	// codexPromote is the promote_codex_account_available pass's keyset cursor (PRD #1590 M3,
+	// D3) over the held codex_account_unavailable set, with the same restart-losing semantics.
+	codexPromote codexAccountPageCursor
+	// codexPromoteHooks are the promotion pass's LiveDB race seams (nil in production).
+	codexPromoteHooks *codexPromoteTestHooks
 	// readyAt is the moment the worker-facing listener(s) became ready (PRD #1390 M1, D1),
 	// stored as Unix nanoseconds (0 = not yet ready). main.go writes it via SetReadyAt after
 	// binding every enabled listener; the sweeper goroutine reads it each tick to anchor the
@@ -5965,6 +5970,11 @@ type SweepResult struct {
 	// is in flight. Normally 0. Each tick examines at most one bounded page of queued Codex
 	// subscription runs, so a gated run deep in a large queue is parked within a few ticks.
 	CodexAccountParked int64
+	// CodexAccountPromoted is the number of codex_account_unavailable runs this pass returned
+	// from recovery_wait to queued (PRD #1590 M3, D3) because the unchanged release predicate
+	// passed on their alias and account, read under lock. Normally 0. Bounded by one page of
+	// held runs per tick.
+	CodexAccountPromoted int64
 	// LimitPromoted is the number of runs this pass brought back from limit_wait to
 	// queued because their retry_not_before elapsed (PRD #35). Normally 0: the
 	// partial index this reads covers only parked runs, a set that is empty on a

@@ -124,7 +124,7 @@ func (e *Engine) runOnce(ctx context.Context) {
 	}
 	// Only log when the pass actually did something, to keep the log quiet on an
 	// idle system.
-	if res.WorkersOffline+res.ClaimedReset+res.WallParkRequested+res.WallParked+res.StaleFailed+res.StaleRequeued+res.ChatIdleCompleted+res.ProposalsRecovered+res.HealthChanged+res.AutoStopped+res.LimitPromoted+res.PoolResumed+res.LimitReevaluated+res.RecoveryPromoted+res.CompletionBudgetExhausted+res.CustodyReleased+res.RecoveryStalled+res.RecoveryExpired+res.TaskUndispatchedFailed+res.CodexRefreshRecovered+res.CodexAccountParked > 0 {
+	if res.WorkersOffline+res.ClaimedReset+res.WallParkRequested+res.WallParked+res.StaleFailed+res.StaleRequeued+res.ChatIdleCompleted+res.ProposalsRecovered+res.HealthChanged+res.AutoStopped+res.LimitPromoted+res.PoolResumed+res.LimitReevaluated+res.RecoveryPromoted+res.CompletionBudgetExhausted+res.CustodyReleased+res.RecoveryStalled+res.RecoveryExpired+res.TaskUndispatchedFailed+res.CodexRefreshRecovered+res.CodexAccountParked+res.CodexAccountPromoted > 0 {
 		slog.Info("sweeper pass",
 			"workers_offline", res.WorkersOffline,
 			"claimed_reset", res.ClaimedReset,
@@ -192,6 +192,8 @@ func (e *Engine) runOnce(ctx context.Context) {
 			// PRD #1590 M2: same reasoning, so a tick that only parks queued Codex runs on an
 			// unavailable account still raises this line.
 			"codex_account_parked", res.CodexAccountParked,
+			// PRD #1590 M3: likewise, so a tick that only resumes held Codex runs is visible.
+			"codex_account_promoted", res.CodexAccountPromoted,
 		)
 	}
 }

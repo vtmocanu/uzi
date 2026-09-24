@@ -2369,8 +2369,11 @@ FOR UPDATE;
 -- started_at = NULL so the resumed run gets a FRESH RUN_TIMEOUT wall, and
 -- budget_paused_seconds = 0 so the pause banked against the OLD baseline is not
 -- over-credited — both exactly as PromoteLimitWaitRuns does. NULL <= @now is UNKNOWN, so a
--- run whose recovery_retry_not_before is NULL is never promoted (harmless: a park always
--- writes a finite stamp).
+-- run whose recovery_retry_not_before is NULL is never promoted. Every timer-driven park
+-- writes a finite stamp; both writers of cause codex_account_unavailable
+-- (ParkRunCodexAccountUnavailable and ParkQueuedCodexAccountUnavailablePage) write NULL. The
+-- cause fence below is what keeps this timer promoter off that cause, whatever its stamp: that
+-- hold is resumed only by the account (PromoteCodexAccountWaitRun, PRD #1590 D3).
 --
 -- session_id, worker_id and recovery_retry_not_before are left in place as affinity/history
 -- exactly as PromoteLimitWaitRuns leaves limit_wait's. A stale recovery_retry_not_before
@@ -3547,8 +3550,10 @@ WHERE id = @id AND status = 'claimed';
 -- name: ParkRunCodexAccountUnavailable :one
 -- Called under the exact-claim row lock, after settling this generation's hold.
 -- recovery_retry_not_before is cleared: this cause is resumed by the account, never by the
--- timer (PromoteRecoveryWaitRuns skips it), and the row shape matches
--- ParkQueuedCodexAccountUnavailablePage, the other writer of this cause.
+-- timer (PromoteRecoveryWaitRuns skips it). The SET list is
+-- ParkQueuedCodexAccountUnavailablePage's (the other writer of this cause) plus one extra
+-- column: this exact-claim park also rewrites worker_id to the newest open custody holder (D4),
+-- while the queued park leaves worker_id alone.
 UPDATE runs SET
     status = 'recovery_wait', recovery_wait_cause = 'codex_account_unavailable',
     status_since = now(), recovery_retry_not_before = NULL,
@@ -3646,6 +3651,46 @@ SELECT (SELECT count(*) FROM page)::bigint AS page_size,
        COALESCE((SELECT page.id FROM page ORDER BY page.id DESC LIMIT 1),
                 '00000000-0000-0000-0000-000000000000'::uuid)::uuid AS last_scanned_id,
        COALESCE((SELECT array_agg(parked.id ORDER BY parked.id) FROM parked), '{}')::uuid[] AS parked_ids;
+
+-- name: ListCodexAccountWaitRunsPage :many
+-- PRD #1590 M3 (D3): one keyset page of the promote_codex_account_available pass. The ids of at
+-- most @page_cap runs held in recovery_wait with cause codex_account_unavailable, with id past
+-- the service's in-memory cursor, in id order, over the partial index
+-- idx_runs_codex_account_wait (00252). A pure read: every decision is re-made per run under
+-- lock (LockCodexAccountWaitRunForUpdate and the alias/account FOR SHARE NOWAIT pair), so a run
+-- that moved after this list is simply skipped.
+SELECT id FROM runs
+WHERE status = 'recovery_wait' AND recovery_wait_cause = 'codex_account_unavailable'
+  AND id > @after_id::uuid
+ORDER BY id
+LIMIT @page_cap::int;
+
+-- name: LockCodexAccountWaitRunForUpdate :one
+-- PRD #1590 M3 (D3): the first lock of the per-run promotion transaction, taken BEFORE the
+-- alias and then the account (run -> alias -> account). Status and cause are re-checked here,
+-- so a run cancelled or promoted since the page was listed is pgx.ErrNoRows. SKIP LOCKED: the
+-- sweeper never waits on a run row another transaction holds (a cancel, say); that run is
+-- retried on a later tick. No writer in the re-login path touches the run row.
+SELECT * FROM runs
+WHERE id = @id AND status = 'recovery_wait' AND recovery_wait_cause = 'codex_account_unavailable'
+FOR UPDATE SKIP LOCKED;
+
+-- name: PromoteCodexAccountWaitRun :execrows
+-- PRD #1590 M3 (D3): the account-driven promotion recovery_wait -> queued, run inside the
+-- per-run transaction after evalCodexReleasePredicate passed on a GetRunCodexAuthContext read
+-- taken under the run, alias and account locks. The SET list is PromoteRecoveryWaitRuns' field
+-- for field (fresh RUN_TIMEOUT wall, banked pause cleared, capability revoked and epoch bumped,
+-- health reset); worker_id, session_id and recovery_wait_count stay as affinity and history,
+-- as there. Fenced on status and the cause, so it can promote only this hold.
+UPDATE runs SET
+    status     = 'queued',
+    status_since = now(),
+    started_at = NULL,
+    budget_paused_seconds = 0,
+    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE id = @id AND status = 'recovery_wait' AND recovery_wait_cause = 'codex_account_unavailable';
 
 -- name: FailClaimAssemblyExact :execrows
 -- Terminal claim assembly failure, fenced to the same locked claim (PRD #1590 D2). The

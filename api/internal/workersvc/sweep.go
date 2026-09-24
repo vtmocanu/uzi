@@ -372,6 +372,21 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 		res.CodexAccountParked = n
 	}
 
+	// Codex account promotion (PRD #1590 M3, D3): the only way back to queued for a run held on
+	// cause codex_account_unavailable (both timer promoters skip it). Each held run in one
+	// bounded page is decided in its own transaction (run -> alias -> account, NOWAIT on the
+	// latter two) by the unchanged release predicate. Placed AFTER the park pass so a run moves
+	// at most once per tick: the park only takes runs the gate excludes, and the promote only
+	// releases runs the predicate passes, so the two never undo each other within one tick on
+	// the same state. Placed BEFORE the detector, like the park, so a promoted run is
+	// health-consistent (queued, health reset) in this tick. Best-effort like the park: an
+	// error is logged and the sweep continues; the count survives a partial page.
+	n, perr := s.promoteCodexAccountAvailable(ctx)
+	res.CodexAccountPromoted = n
+	if perr != nil {
+		slog.Error("sweeper: promote codex account available failed", "error", perr)
+	}
+
 	// Bound the in-process persistence-failure tracker (PRD #108 M4). This is the
 	// memory bound for the one case no other eviction path reaches: a run whose
 	// worker vanished without the run ever reaching terminal. Pruned BEFORE the
