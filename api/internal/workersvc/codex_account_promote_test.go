@@ -56,9 +56,9 @@ func TestClassifyCodexAccountHold(t *testing.T) {
 		{"no account columns read", func(in *codexReleaseInputs) {
 			in.currentProviderUserIDValid, in.currentWorkspaceAccountIDValid, in.currentCredentialRevValid = false, false, false
 			in.coordStateValid = false
-		}, codexHoldStay, ErrCodexAccountTupleMismatch},
+		}, codexHoldStay, ErrCodexAliasAccountMissing},
 		{"no current credential revision", func(in *codexReleaseInputs) { in.currentCredentialRevValid = false },
-			codexHoldStay, ErrCodexAccountTupleMismatch},
+			codexHoldStay, ErrCodexAliasAccountMissing},
 		{"not an actively-claimed status", func(in *codexReleaseInputs) { in.status = "queued" },
 			codexHoldStay, ErrCodexRunNotActivelyClaimed},
 
@@ -72,6 +72,10 @@ func TestClassifyCodexAccountHold(t *testing.T) {
 			in.currentProviderUserID, in.coordState = "user-2", "in_progress"
 		}, codexHoldFail, ErrCodexAccountTupleMismatch},
 		{"undecodable frozen key", func(in *codexReleaseInputs) { in.frozenAccountKey = "not-json" },
+			codexHoldFail, ErrCodexAccountTupleMismatch},
+		// jsonb-equal to the canonical key but not byte-equal: the Go check is a string
+		// comparison, so it is a mismatch here (ReadmitRunCodexBinding refuses it to agree).
+		{"non-canonical frozen key", func(in *codexReleaseInputs) { in.frozenAccountKey = `["user-1", "ws-1"]` },
 			codexHoldFail, ErrCodexAccountTupleMismatch},
 		{"unfrozen identity", func(in *codexReleaseInputs) { in.frozenAccountKeyValid = false },
 			codexHoldFail, ErrCodexAccountKeyUnfrozen},

@@ -29,15 +29,20 @@ import (
 // Per run, in order (D3 steps plus D5):
 //  1. a held run whose alias was deleted (codex_secret_id NULL, frozen material revision set)
 //     is failed credential_unavailable, before any alias or account lock;
-//  2. alias lock; an alias that is not linked to an account (staging or failed re-login,
-//     unlinked) leaves the run held with nothing written;
+//  2. alias lock; an alias that is not linked (a staging or failed re-login) leaves the run held
+//     with nothing written, and a linked alias with no account is failed as incoherent;
 //  3. account lock;
 //  4. D5 re-admission (ReadmitRunCodexBinding) when the alias material is ahead of the run's,
-//     plus the feed line; every D5 fence is in that statement's WHERE;
+//     plus the feed line; every D5 fence is in that statement's WHERE, and the frozen key must
+//     equal the Go encoding of the locked account's tuple, so the SQL identity check agrees
+//     with classifyCodexAccountHold's;
 //  5. the GetRunCodexAuthContext re-read, classified by classifyCodexAccountHold into promote
 //     (the unchanged evalCodexReleasePredicate passes), stay held, or terminal.
-// A re-admission commits only together with its promotion: a re-admitted run that does not
-// promote in the same transaction is rolled back, so the relaxation never lands on its own.
+// A re-admission commits only together with its promotion. If a re-admitted run classifies as
+// anything else, promoteCodexAccountRun rolls the whole transaction back (no re-admission, no
+// feed line, nothing counted or published) and decides the run again in a fresh transaction
+// with re-admission disabled; that second decision is the one committed (see
+// promoteCodexAccountRun).
 
 // codexAccountPromoteStore is the pass's page read. *store.Queries satisfies it; a fake Store
 // that does not is reported as errCodexStoreUnavailable, like the park pass.
@@ -65,12 +70,14 @@ type codexPromoteTestHooks struct {
 	afterAliasLock func(ctx context.Context, runID uuid.UUID)
 	// afterAccountLock runs once the account FOR SHARE lock is held, before re-admission.
 	afterAccountLock func(ctx context.Context, runID uuid.UUID)
+	// wrapQueries wraps each per-run transaction's statement surface.
+	wrapQueries func(q codexPromoteQueries) codexPromoteQueries
 }
 
 // codexAccountPromoteResult is one page's tally.
 type codexAccountPromoteResult struct {
 	Promoted   int64 // held runs returned to queued
-	Readmitted int64 // of those, runs re-admitted (D5) in the same transaction
+	Readmitted int64 // of those, runs re-admitted (D5) in the same, committed transaction
 	Failed     int64 // held runs failed credential_unavailable (deleted alias, binding change)
 }
 
@@ -85,6 +92,8 @@ const (
 
 // codexHoldDecision is promoteCodexAccountRunTx's result. reason is the terminal cause for
 // codexHoldFail; readmit is the feed line to broadcast after commit, when the run was re-admitted.
+// promoteCodexAccountRun only returns a decision with readmit set when its outcome is
+// codexHoldPromote.
 type codexHoldDecision struct {
 	outcome codexHoldOutcome
 	reason  string
@@ -144,14 +153,18 @@ func codexReadmitPayload(run store.Run, from, to int64) ([]byte, error) {
 //   - the run has no frozen identity (nothing freezes it after create, so it can never pass);
 //   - the linked account's identity tuple differs from the frozen one (an account's tuple is
 //     immutable, so the alias now names a different account);
-//   - the account's credential_revision differs from the frozen one (a revoke; D5 never
-//     advances it).
+//   - the account's credential_revision differs from the frozen one. Nothing bumps
+//     credential_revision today (it stays at its DEFAULT 0), so this is defence in depth: a
+//     future revocation that bumps it ends the hold, and D5 never advances it.
 //
 // Everything else stays held (codexHoldStay), because it can still resolve on its own:
 //   - coord_state quarantined with the same identity and revision (awaiting recovery or re-login);
 //   - coord_state in_progress, or a material revision still ahead of the run's (re-admission did
 //     not apply: a lease is live, or a concurrent material change made its CAS match 0 rows);
-//   - no account columns in the read (not a definite mismatch; the next tick re-reads);
+//   - no account columns in the read (ErrCodexAliasAccountMissing). Unreachable from the
+//     promoter, which reads under the account FOR SHARE lock of the alias's linked account;
+//     kept fail-closed (held, no token) rather than terminal because it is not a definite
+//     mismatch;
 //   - any other predicate refusal.
 //
 // codexHoldPromote requires the unchanged evalCodexReleasePredicate to pass.
@@ -166,7 +179,7 @@ func classifyCodexAccountHold(in codexReleaseInputs) (codexHoldOutcome, error) {
 		return codexHoldFail, ErrCodexAccountKeyUnfrozen
 	}
 	if !in.currentProviderUserIDValid || !in.currentWorkspaceAccountIDValid || !in.currentCredentialRevValid {
-		return codexHoldStay, ErrCodexAccountTupleMismatch
+		return codexHoldStay, ErrCodexAliasAccountMissing
 	}
 	if err := codexCheckAccountTuple(in); err != nil {
 		if errors.Is(err, ErrCodexAccountTupleMismatch) {
@@ -223,6 +236,7 @@ func (s *Service) promoteCodexAccountAvailable(ctx context.Context) (codexAccoun
 			errs = append(errs, fmt.Errorf("run %s: %w", id, err))
 			continue
 		}
+		// promoteCodexAccountRun returns readmit only on a committed promotion.
 		if d.readmit != nil {
 			res.Readmitted++
 			if s.bcast != nil {
@@ -242,10 +256,34 @@ func (s *Service) promoteCodexAccountAvailable(ctx context.Context) (codexAccoun
 	return res, errors.Join(errs...)
 }
 
-// promoteCodexAccountRun decides one held run in one transaction (promoteCodexAccountRunTx) and
-// commits only a promotion or a terminal failure; every other outcome rolls back, so a run left
-// held is untouched.
+// errCodexReadmitWithoutPromote reports a transaction that re-admitted a run which then did not
+// promote. promoteCodexAccountRunOnce rolls it back; it never leaves promoteCodexAccountRun.
+var errCodexReadmitWithoutPromote = errors.New("codex re-admission did not promote")
+
+// promoteCodexAccountRun decides one held run and commits only a promotion or a terminal
+// failure; a run left held is untouched.
+//
+// A re-admission commits only with its promotion. When a transaction re-admits the run and then
+// classifies it as anything else (terminal or stay), the whole transaction is rolled back: the
+// re-admission and its feed line never land, and nothing is counted or published for them. The
+// run is then decided again in a fresh transaction with re-admission disabled, from its
+// unrelaxed binding. Re-admission only moves the material revision, and classifyCodexAccountHold
+// checks kind, mode, identity and credential revision before it, so the second decision is the
+// same terminal failure (committed without the re-admission) or a stay (the run remains held,
+// nothing written).
 func (s *Service) promoteCodexAccountRun(ctx context.Context, runID uuid.UUID) (codexHoldDecision, error) {
+	d, err := s.promoteCodexAccountRunOnce(ctx, runID, true)
+	if !errors.Is(err, errCodexReadmitWithoutPromote) {
+		return d, err
+	}
+	slog.Warn("sweeper: codex re-admission did not promote; rolled back and deciding without it", "run", runID)
+	return s.promoteCodexAccountRunOnce(ctx, runID, false)
+}
+
+// promoteCodexAccountRunOnce is one transaction of promoteCodexAccountRun: it commits a
+// promotion or a terminal failure, and rolls back a stay or a re-admission that did not promote
+// (errCodexReadmitWithoutPromote).
+func (s *Service) promoteCodexAccountRunOnce(ctx context.Context, runID uuid.UUID, allowReadmit bool) (codexHoldDecision, error) {
 	if s.txBeginner == nil {
 		return codexHoldDecision{}, errClaimRecoveryNoTx
 	}
@@ -254,9 +292,19 @@ func (s *Service) promoteCodexAccountRun(ctx context.Context, runID uuid.UUID) (
 		return codexHoldDecision{}, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	d, err := s.promoteCodexAccountRunTx(ctx, store.New(tx), runID)
-	if err != nil || d.outcome == codexHoldStay {
+	var q codexPromoteQueries = store.New(tx)
+	if h := s.codexPromoteHooks; h != nil && h.wrapQueries != nil {
+		q = h.wrapQueries(q)
+	}
+	d, err := s.promoteCodexAccountRunTx(ctx, q, runID, allowReadmit)
+	if err != nil {
 		return codexHoldDecision{}, err
+	}
+	if d.readmit != nil && d.outcome != codexHoldPromote {
+		return codexHoldDecision{}, errCodexReadmitWithoutPromote
+	}
+	if d.outcome == codexHoldStay {
+		return codexHoldDecision{}, nil
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return codexHoldDecision{}, err
@@ -264,10 +312,11 @@ func (s *Service) promoteCodexAccountRun(ctx context.Context, runID uuid.UUID) (
 	return d, nil
 }
 
-// promoteCodexAccountRunTx is promoteCodexAccountRun's body over the open transaction (see the
-// file comment for the steps). A codexHoldStay result may carry writes (a re-admission that did
-// not promote); the caller rolls those back.
-func (s *Service) promoteCodexAccountRunTx(ctx context.Context, q codexPromoteQueries, runID uuid.UUID) (codexHoldDecision, error) {
+// promoteCodexAccountRunTx is promoteCodexAccountRunOnce's body over the open transaction (see
+// the file comment for the steps). allowReadmit=false skips D5 re-admission. A result may carry
+// writes the caller must roll back: a stay after a re-admission, or a re-admission that did not
+// promote.
+func (s *Service) promoteCodexAccountRunTx(ctx context.Context, q codexPromoteQueries, runID uuid.UUID, allowReadmit bool) (codexHoldDecision, error) {
 	stay := codexHoldDecision{}
 	run, err := q.LockCodexAccountWaitRunForUpdate(ctx, runID)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -278,7 +327,11 @@ func (s *Service) promoteCodexAccountRunTx(ctx context.Context, q codexPromoteQu
 	}
 	if !run.CodexSecretID.Valid {
 		if !run.CodexMaterialRevision.Valid {
-			return stay, nil // never bound: nothing this pass can decide
+			// Never bound. Unreachable: a run enters this cause only through a park whose gate
+			// joins its alias (the sweeper park, or the claim-time park of a bound run), and the
+			// freeze writes codex_secret_id and codex_material_revision together. Fail-closed:
+			// the run stays held, and with no binding no token can be released for it.
+			return stay, nil
 		}
 		// D5: the alias was deleted after the park (the FK nulled codex_secret_id). Decided
 		// on the locked run row alone, before any alias or account lock.
@@ -289,18 +342,34 @@ func (s *Service) promoteCodexAccountRunTx(ctx context.Context, q codexPromoteQu
 	alias, err := q.LockCodexAliasForShareNowait(ctx, store.LockCodexAliasForShareNowaitParams{
 		UserSecretID: uuid.UUID(run.CodexSecretID.Bytes), UserID: run.UserID,
 	})
+	// A missing state row (pgx.ErrNoRows) stays held. Unreachable: no statement deletes a
+	// codex_credential_state row except the cascade from its alias, and deleting the alias also
+	// nulls the run's codex_secret_id (handled above). Fail-closed: held, no token.
 	if held, err := codexPromoteLockOutcome(err); held || err != nil {
 		return stay, err
 	}
 	if h := s.codexPromoteHooks; h != nil && h.afterAliasLock != nil {
 		h.afterAliasLock(ctx, runID)
 	}
-	if alias.Status != "linked" || !alias.ProviderAccountID.Valid {
-		return stay, nil // re-login staging or failed, or unlinked: identity unknown, stays held
+	if alias.Status != "linked" {
+		return stay, nil // re-login staging or failed: identity unknown, stays held
+	}
+	if !alias.ProviderAccountID.Valid {
+		// Incoherent alias (PRD #1590 D1, terminal): linked, but to no account. No writer
+		// produces it (a link sets the status and the account together, a re-login PATCH
+		// clears both, and deleting the account demotes the alias to failed through the
+		// orphan trigger), so it can only come from a direct write, and no later transition
+		// repairs it.
+		return s.failCodexAccountHold(ctx, q, run, fmt.Sprintf(
+			"%v: the Codex login %s bound to this run changed while the run waited for its account: %v",
+			errCredentialUnavailable, codexAliasLabel(run), ErrCodexAliasAccountMissing))
 	}
 	_, err = q.LockCodexAccountForShareNowait(ctx, store.LockCodexAccountForShareNowaitParams{
 		ID: uuid.UUID(alias.ProviderAccountID.Bytes), UserID: run.UserID,
 	})
+	// A missing account row stays held. Unreachable: the owner-scoped foreign key keeps
+	// provider_account_id pointing at an existing account (a deletion nulls it and the orphan
+	// trigger demotes the alias to failed). Fail-closed: held, no token.
 	if held, err := codexPromoteLockOutcome(err); held || err != nil {
 		return stay, err
 	}
@@ -309,14 +378,24 @@ func (s *Service) promoteCodexAccountRunTx(ctx context.Context, q codexPromoteQu
 	}
 
 	var readmit *codexReadmitLine
-	if run.CodexMaterialRevision.Valid && alias.MaterialRevision > run.CodexMaterialRevision.Int64 {
+	if allowReadmit && run.CodexMaterialRevision.Valid && alias.MaterialRevision > run.CodexMaterialRevision.Int64 {
 		readmit, err = s.readmitCodexAccountHold(ctx, q, run, alias.MaterialRevision)
 		if err != nil {
 			return stay, err
 		}
 	}
+	// Every outcome carries the re-admission, so promoteCodexAccountRunOnce can see one that
+	// did not promote and roll it back.
+	d, err := s.decideCodexAccountHold(ctx, q, run)
+	d.readmit = readmit
+	return d, err
+}
 
-	row, err := q.GetRunCodexAuthContext(ctx, runID)
+// decideCodexAccountHold is step 5: the GetRunCodexAuthContext re-read under the locks,
+// classified and applied (promote, terminal failure, or stay with nothing written).
+func (s *Service) decideCodexAccountHold(ctx context.Context, q codexPromoteQueries, run store.Run) (codexHoldDecision, error) {
+	stay := codexHoldDecision{}
+	row, err := q.GetRunCodexAuthContext(ctx, run.ID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return stay, nil
 	}
@@ -326,11 +405,11 @@ func (s *Service) promoteCodexAccountRunTx(ctx context.Context, q codexPromoteQu
 	outcome, cause := classifyCodexAccountHold(codexReleaseInputsFromAuthRow(row))
 	switch outcome {
 	case codexHoldPromote:
-		n, err := q.PromoteCodexAccountWaitRun(ctx, runID)
+		n, err := q.PromoteCodexAccountWaitRun(ctx, run.ID)
 		if err != nil || n != 1 {
 			return stay, err
 		}
-		return codexHoldDecision{outcome: codexHoldPromote, readmit: readmit}, nil
+		return codexHoldDecision{outcome: codexHoldPromote}, nil
 	case codexHoldFail:
 		return s.failCodexAccountHold(ctx, q, run, fmt.Sprintf(
 			"%v: the Codex login %s bound to this run changed while the run waited for its account: %v",
@@ -342,12 +421,29 @@ func (s *Service) promoteCodexAccountRunTx(ctx context.Context, q codexPromoteQu
 
 // readmitCodexAccountHold runs D5's ReadmitRunCodexBinding from the run's frozen material
 // revision to the alias's locked one, and on success writes the feed line in the same
-// transaction. It returns nil (no error) when the CAS matched 0 rows: a fence failed or the
-// material moved concurrently, and the caller's re-read decides.
+// transaction. The statement's account_key is codexAccountKey over the locked account's tuple
+// (read here, under the caller's locks), the exact text codexCheckAccountTuple compares, so a
+// frozen key the Go check would reject is never re-admitted. It returns nil (no error) when the
+// read finds no account tuple or the CAS matched 0 rows: a fence failed or the material moved,
+// and the caller's re-read decides.
 func (s *Service) readmitCodexAccountHold(ctx context.Context, q codexPromoteQueries, run store.Run, aliasMaterial int64) (*codexReadmitLine, error) {
+	cur, err := q.GetRunCodexAuthContext(ctx, run.ID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !cur.ProviderUserID.Valid || !cur.WorkspaceAccountID.Valid {
+		return nil, nil
+	}
+	key, err := codexAccountKey(cur.ProviderUserID.String, cur.WorkspaceAccountID.String)
+	if err != nil {
+		return nil, fmt.Errorf("encode readmit account key: %w", err)
+	}
 	from := run.CodexMaterialRevision.Int64
 	n, err := q.ReadmitRunCodexBinding(ctx, store.ReadmitRunCodexBindingParams{
-		ID: run.ID, SecretID: uuid.UUID(run.CodexSecretID.Bytes),
+		ID: run.ID, SecretID: uuid.UUID(run.CodexSecretID.Bytes), AccountKey: key,
 		OldMaterialRevision: from, NewMaterialRevision: aliasMaterial,
 	})
 	if err != nil || n != 1 {

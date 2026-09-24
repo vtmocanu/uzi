@@ -168,6 +168,11 @@ var (
 	// ErrCodexAccountRevisionStale: the account's credential_revision has advanced since
 	// the run froze it — a genuine account-level revoke.
 	ErrCodexAccountRevisionStale = errors.New("codex account credential revision is stale")
+	// ErrCodexAliasAccountMissing: a linked alias has no provider account behind it (a NULL
+	// provider_account_id, or no account columns in the authority read). The PRD #1590
+	// promoter fails a held run on a linked alias with no account as an incoherent alias;
+	// classifyCodexAccountHold keeps a read with no account columns held.
+	ErrCodexAliasAccountMissing = errors.New("codex alias is linked to no provider account")
 	// ErrCodexAccountQuarantined: the run's subscription account is parked in the
 	// 'quarantined' coord_state (a refresh commit failed into the recovery slot). No
 	// access token may be released or refresh started until it is reconciled or

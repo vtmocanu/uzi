@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -109,6 +111,40 @@ func readmitLines(t *testing.T, env codexTestEnv, runID uuid.UUID) []struct {
 		t.Fatal(err)
 	}
 	return out
+}
+
+// readmitRecorder is a Broadcaster that records what the promotion pass published: the feed
+// lines (PublishMessage) and the swept states (PublishState), per run.
+type readmitRecorder struct {
+	mu       sync.Mutex
+	messages map[uuid.UUID][]int32
+	states   map[uuid.UUID][]string
+}
+
+func newReadmitRecorder() *readmitRecorder {
+	return &readmitRecorder{messages: map[uuid.UUID][]int32{}, states: map[uuid.UUID][]string{}}
+}
+
+func (r *readmitRecorder) PublishMessage(runID uuid.UUID, seq int32, _, _, _, _ string, _ []byte, _ time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.messages[runID] = append(r.messages[runID], seq)
+}
+
+func (r *readmitRecorder) PublishState(runID uuid.UUID, status string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.states[runID] = append(r.states[runID], status)
+}
+
+func (*readmitRecorder) PublishHealth(uuid.UUID, string, string, bool) {}
+func (*readmitRecorder) PublishInput(uuid.UUID)                        {}
+
+// published returns the feed-line seqs and states published for runID.
+func (r *readmitRecorder) published(runID uuid.UUID) ([]int32, []string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]int32(nil), r.messages[runID]...), append([]string(nil), r.states[runID]...)
 }
 
 // assertHoldFailed checks the terminal exit from a hold: failed credential_unavailable with a
@@ -275,6 +311,12 @@ func TestCodexReadmitTerminalBindingChangesLiveDB(t *testing.T) {
 			sameIdentityRelogin(t, env, fx, codexToken("access-relogin"))
 			env.exec(`UPDATE runs SET codex_account_key = 'not-json' WHERE id = $1`, fx.runID)
 		}, ErrCodexAccountTupleMismatch},
+		// D1's incoherent alias: linked to no account. Only a direct write makes it (from a
+		// staging row, whose link is already NULL, so the orphan trigger does not fire).
+		{"linked alias with no account", func(t *testing.T, env codexTestEnv, fx *codexClaimFix) {
+			startRelogin(t, env, fx, "staging")
+			env.exec(`UPDATE codex_credential_state SET status = 'linked' WHERE user_secret_id = $1`, fx.aliasID)
+		}, ErrCodexAliasAccountMissing},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			env := setupCodexLiveDB(t)
@@ -371,11 +413,18 @@ func TestCodexReadmitStagingOrFailedStaysHeldNoTokenLiveDB(t *testing.T) {
 	}
 }
 
-// TestCodexReadmitConcurrentMaterialChangeLiveDB: the alias's material revision moves between the
-// promoter's observation and its ReadmitRunCodexBinding. The CAS matches 0 rows, nothing is
+// TestCodexReadmitMaterialCASFenceLiveDB pins ReadmitRunCodexBinding's material-revision CAS
+// fences as the promoter drives them: the alias's material revision is moved between the
+// promoter's observation and its ReadmitRunCodexBinding call. The CAS matches 0 rows, nothing is
 // re-admitted, and the run is left held (not failed, not promoted): the re-read still sees a
 // newer alias material than the run's, which is transient. The transaction then rolls back.
-func TestCodexReadmitConcurrentMaterialChangeLiveDB(t *testing.T) {
+//
+// The change is injected inside the promoter's OWN transaction, so this is not a concurrency
+// test: a real concurrent writer (BumpCodexMaterialRevision, LinkCodexCredentialState) cannot
+// move the alias row at this point, because the promoter holds it FOR SHARE and the writer
+// blocks until the promoter's transaction ends. The CAS is the statement's own fence against a
+// caller whose observed values are stale.
+func TestCodexReadmitMaterialCASFenceLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	fx, svc := heldCodexFix(t, env)
 	sameIdentityRelogin(t, env, fx, codexToken("access-relogin"))
@@ -392,7 +441,7 @@ func TestCodexReadmitConcurrentMaterialChangeLiveDB(t *testing.T) {
 			t.Fatalf("inject material change: %v", err)
 		}
 	}}
-	d, err := svc.promoteCodexAccountRunTx(env.ctx, q, fx.runID)
+	d, err := svc.promoteCodexAccountRunTx(env.ctx, q, fx.runID, true)
 	if err != nil {
 		t.Fatalf("promoteCodexAccountRunTx: %v", err)
 	}
@@ -438,6 +487,7 @@ func TestReadmitRunCodexBindingFencesLiveDB(t *testing.T) {
 		setup  func(t *testing.T, env codexTestEnv, fx *codexClaimFix, sibling uuid.UUID) // mutates rows; may be nil
 		call   func(old, new int64, sibling int64) call                                   // observed values; nil = the true ones
 		secret func(fx *codexClaimFix, sibling uuid.UUID) uuid.UUID                       // nil = the run's alias
+		key    func(canonical string) string                                              // nil = the account's Go encoding
 		want   int64
 	}{
 		{name: "control", want: 1},
@@ -474,6 +524,14 @@ func TestReadmitRunCodexBindingFencesLiveDB(t *testing.T) {
 		}},
 		{name: "frozen key NULL", setup: func(t *testing.T, env codexTestEnv, fx *codexClaimFix, _ uuid.UUID) {
 			env.exec(`UPDATE runs SET codex_account_key = NULL WHERE id = $1`, fx.runID)
+		}},
+		// jsonb-equal to the account's tuple, but not the Go encoding codexCheckAccountTuple
+		// compares (jsonb's text form puts a space after the comma).
+		{name: "frozen key non-canonical", setup: func(t *testing.T, env codexTestEnv, fx *codexClaimFix, _ uuid.UUID) {
+			env.exec(`UPDATE runs SET codex_account_key = (codex_account_key::jsonb)::text WHERE id = $1`, fx.runID)
+		}},
+		{name: "observed account key differs", key: func(canonical string) string {
+			return strings.Replace(canonical, `","`, `", "`, 1)
 		}},
 		{name: "credential_revision bumped", setup: func(t *testing.T, env codexTestEnv, fx *codexClaimFix, _ uuid.UUID) {
 			fx.setAccount(t, "credential_revision = credential_revision + 1")
@@ -513,13 +571,21 @@ func TestReadmitRunCodexBindingFencesLiveDB(t *testing.T) {
 			if tc.secret != nil {
 				secret = tc.secret(fx, sibling)
 			}
+			acct := env.mustAccount(t, fx.userID, fx.accountID)
+			key, err := codexAccountKey(acct.ProviderUserID, acct.WorkspaceAccountID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.key != nil {
+				key = tc.key(key)
+			}
 			tx, err := env.pool.Begin(env.ctx)
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer func() { _ = tx.Rollback(env.ctx) }()
 			n, err := store.New(tx).ReadmitRunCodexBinding(env.ctx, store.ReadmitRunCodexBindingParams{
-				ID: fx.runID, SecretID: secret, OldMaterialRevision: c.old, NewMaterialRevision: c.new,
+				ID: fx.runID, SecretID: secret, AccountKey: key, OldMaterialRevision: c.old, NewMaterialRevision: c.new,
 			})
 			if err != nil {
 				t.Fatalf("ReadmitRunCodexBinding: %v", err)
@@ -534,5 +600,163 @@ func TestReadmitRunCodexBindingFencesLiveDB(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestCodexReadmitNonCanonicalFrozenKeyLiveDB is the regression for a re-admission committed
+// together with a terminal failure. The run's frozen codex_account_key is rewritten by direct SQL
+// to a form that is jsonb-equal to the account's tuple but is not the Go encoding
+// (codexAccountKey), with an otherwise qualifying same-identity re-login. The Go authority check
+// compares the key text, so the run can never be released and the tick fails it
+// credential_unavailable (tuple mismatch). ReadmitRunCodexBinding's key fence must agree with that
+// check: nothing is re-admitted (the frozen material revision stays), no feed line is written or
+// published, and Readmitted is not counted.
+func TestCodexReadmitNonCanonicalFrozenKeyLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	fx, svc := heldCodexFix(t, env)
+	sameIdentityRelogin(t, env, fx, codexToken("access-relogin"))
+	canonical := mustRun(t, env, fx.runID).CodexAccountKey.String
+	env.exec(`UPDATE runs SET codex_account_key = (codex_account_key::jsonb)::text WHERE id = $1`, fx.runID)
+	held := mustRun(t, env, fx.runID)
+	var jsonbEqual bool
+	if err := env.pool.QueryRow(env.ctx, `SELECT $1::jsonb = $2::jsonb`, held.CodexAccountKey.String, canonical).
+		Scan(&jsonbEqual); err != nil {
+		t.Fatal(err)
+	}
+	if held.CodexAccountKey.String == canonical || !jsonbEqual {
+		t.Fatalf("seeded key %q vs canonical %q (jsonb-equal %v), want a different text with equal jsonb",
+			held.CodexAccountKey.String, canonical, jsonbEqual)
+	}
+	rec := newReadmitRecorder()
+	svc.SetBroadcaster(rec)
+
+	res := promoteOnlyResult(t, svc, fx.runID)
+	if res.Readmitted != 0 || res.Promoted != 0 || res.Failed != 1 {
+		t.Fatalf("tick: %+v, want one terminal failure and nothing re-admitted", res)
+	}
+	assertHoldFailed(t, env, fx.runID, held, ErrCodexAccountTupleMismatch)
+	msgs, states := rec.published(fx.runID)
+	if len(msgs) != 0 || len(states) != 1 || states[0] != "failed" {
+		t.Fatalf("published messages=%v states=%v, want no feed line and one failed state", msgs, states)
+	}
+}
+
+// readmitThenDivergeWrapper makes a re-admitted transaction classify as a terminal failure: once
+// its ReadmitRunCodexBinding has matched a row, the following GetRunCodexAuthContext re-read
+// returns the frozen key in a non-canonical form, the divergence the SQL key fence now prevents.
+type readmitThenDivergeWrapper struct {
+	codexPromoteQueries
+	readmitted bool
+	rows       *[]int64
+}
+
+func (w *readmitThenDivergeWrapper) ReadmitRunCodexBinding(ctx context.Context, arg store.ReadmitRunCodexBindingParams) (int64, error) {
+	n, err := w.codexPromoteQueries.ReadmitRunCodexBinding(ctx, arg)
+	*w.rows = append(*w.rows, n)
+	w.readmitted = w.readmitted || n == 1
+	return n, err
+}
+
+func (w *readmitThenDivergeWrapper) GetRunCodexAuthContext(ctx context.Context, id uuid.UUID) (store.GetRunCodexAuthContextRow, error) {
+	row, err := w.codexPromoteQueries.GetRunCodexAuthContext(ctx, id)
+	if err == nil && w.readmitted {
+		row.CodexAccountKey.String = strings.Replace(row.CodexAccountKey.String, `","`, `", "`, 1)
+	}
+	return row, err
+}
+
+// TestCodexReadmitWithoutPromoteRollsBackLiveDB pins the promoter's guarantee that a re-admission
+// commits only together with its promotion, independently of the SQL fences: a transaction that
+// re-admits the run and then classifies it as terminal is rolled back whole, and the run is
+// decided again with re-admission disabled. Here the second decision sees the unrelaxed binding
+// (material still behind the alias), so the run stays held: nothing is re-admitted, failed,
+// promoted, counted, written to the feed or published.
+func TestCodexReadmitWithoutPromoteRollsBackLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	fx, svc := heldCodexFix(t, env)
+	sameIdentityRelogin(t, env, fx, codexToken("access-relogin"))
+	held := mustRun(t, env, fx.runID)
+	var rows []int64
+	txs := 0
+	svc.codexPromoteHooks = &codexPromoteTestHooks{wrapQueries: func(q codexPromoteQueries) codexPromoteQueries {
+		txs++
+		return &readmitThenDivergeWrapper{codexPromoteQueries: q, rows: &rows}
+	}}
+	rec := newReadmitRecorder()
+	svc.SetBroadcaster(rec)
+
+	res := promoteOnlyResult(t, svc, fx.runID)
+	if res.Readmitted != 0 || res.Promoted != 0 || res.Failed != 0 {
+		t.Fatalf("tick: %+v, want nothing decided", res)
+	}
+	if txs != 2 || len(rows) != 1 || rows[0] != 1 {
+		t.Fatalf("transactions=%d readmit rows=%v, want a re-admitting transaction then one without re-admission", txs, rows)
+	}
+	assertStillHeld(t, env, fx.runID, held)
+	if l := readmitLines(t, env, fx.runID); len(l) != 0 {
+		t.Fatalf("feed lines = %d, want 0", len(l))
+	}
+	if msgs, states := rec.published(fx.runID); len(msgs) != 0 || len(states) != 0 {
+		t.Fatalf("published messages=%v states=%v, want nothing", msgs, states)
+	}
+}
+
+// TestCodexA1RelinkOneSweepResumesLiveDB is amendment A1 end to end through the production path:
+// a queued run whose alias completed a verified same-identity relink (a re-login PATCH, then the
+// relink to the SAME account at the new material revision) is held by ClaimRun's gate, and ONE
+// full Sweep parks it (park_codex_account_unavailable), re-admits it and promotes it
+// (promote_codex_account_available, last in Sweep). It ends queued with the alias's material
+// revision, exactly one committed and published feed line, no failure, and CodexAccountReadmitted
+// counted; the next claim delivers it. Both page cursors start at the fixture run with a one-row
+// page, so no other run in the shared database is examined by either pass.
+func TestCodexA1RelinkOneSweepResumesLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	fx := newCodexClaimFix(t, env, false)
+	material := startRelogin(t, env, fx, "staging")
+	linkAlias(t, env, fx, fx.accountID, material)
+	if payload, err := fx.svc.Claim(env.ctx, fx.claimant(t, true), nil); err != nil || payload != nil {
+		t.Fatalf("Claim before the sweep = (%v, %v), want idle (held by the gate)", payload != nil, err)
+	}
+	before := mustRun(t, env, fx.runID)
+	if before.Status != "queued" || before.CodexMaterialRevision.Int64 >= material {
+		t.Fatalf("status=%s material=%v, want queued behind the alias's %d", before.Status, before.CodexMaterialRevision, material)
+	}
+
+	svc := gateSweepService(env, fx.svc)
+	rec := newReadmitRecorder()
+	svc.SetBroadcaster(rec)
+	svc.codexPark.after, svc.codexPark.capOverride = uuidPredecessor(fx.runID), 1
+	svc.codexPromote.after, svc.codexPromote.capOverride = uuidPredecessor(fx.runID), 1
+	res, err := svc.Sweep(env.ctx)
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if res.CodexAccountParked != 1 || res.CodexAccountPromoted != 1 || res.CodexAccountReadmitted != 1 || res.CodexAccountFailed != 0 {
+		t.Fatalf("Sweep: parked=%d promoted=%d readmitted=%d failed=%d, want 1/1/1/0",
+			res.CodexAccountParked, res.CodexAccountPromoted, res.CodexAccountReadmitted, res.CodexAccountFailed)
+	}
+	r := mustRun(t, env, fx.runID)
+	if r.Status != "queued" || r.FailOrigin.Valid || r.FailureReason.Valid || r.CodexMaterialRevision.Int64 != material ||
+		r.CodexAccountKey != before.CodexAccountKey || r.CodexAccountRevision != before.CodexAccountRevision {
+		t.Fatalf("status=%s origin=%v material=%v (want %d) key/rev changed=%v, want queued, re-admitted, not failed",
+			r.Status, r.FailOrigin, r.CodexMaterialRevision, material,
+			r.CodexAccountKey != before.CodexAccountKey || r.CodexAccountRevision != before.CodexAccountRevision)
+	}
+	lines := readmitLines(t, env, fx.runID)
+	if len(lines) != 1 {
+		t.Fatalf("re-admission lines = %d, want 1", len(lines))
+	}
+	msgs, states := rec.published(fx.runID)
+	if len(msgs) != 1 || msgs[0] != lines[0].seq {
+		t.Fatalf("published feed seqs %v, want exactly the committed line's %d", msgs, lines[0].seq)
+	}
+	for _, st := range states {
+		if st == "failed" {
+			t.Fatalf("published states %v include failed", states)
+		}
+	}
+	payload, err := fx.svc.Claim(env.ctx, fx.claimant(t, true), nil)
+	if err != nil || payload == nil || payload.Secrets.Codex == nil {
+		t.Fatalf("Claim after the sweep = (%v, %v), want a Codex payload", payload != nil, err)
 	}
 }

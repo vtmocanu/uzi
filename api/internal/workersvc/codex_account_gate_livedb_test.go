@@ -336,8 +336,9 @@ func TestCodexAccountHoldNotClaimedThenParkedLiveDB(t *testing.T) {
 			}
 			svc := gateSweepService(env, fx.svc)
 			// This test pins the park. The same Sweep's promotion pass (at its tail) would
-			// re-admit and resume the A1 leg (PRD #1590 M4, D5; pinned in
-			// codex_account_readmit_livedb_test.go), so its page is started past every id here.
+			// re-admit and resume the A1 leg (PRD #1590 M4, D5), so its page is started past
+			// every id here. That one-Sweep park, re-admission and promotion is pinned by
+			// TestCodexA1RelinkOneSweepResumesLiveDB (codex_account_readmit_livedb_test.go).
 			svc.codexPromote.after = uuid.Max
 			res, err := svc.Sweep(env.ctx)
 			if err != nil {

@@ -546,8 +546,12 @@ type InsertCodexReadmitRunMessageParams struct {
 // ReadmitRunCodexBinding (the caller holds the run row lock). A server-authored message on a
 // held run has no live claim, so it cannot use InsertRunMessage's worker fence: it appends at
 // the next free seq (past both runs.last_seq and the stored maximum) and advances
-// runs.last_seq in the same statement, so a resuming worker starts past it and never collides
-// with it. Fenced on the hold. No row back (a seq collision, or the run left the hold) is
+// runs.last_seq in the same statement, so the worker that resumes the run at its next claim
+// starts past it and never collides with it. That does not cover a zombie: a worker of the
+// displaced flight that still holds an unreleased claim at the run's generation keeps its own
+// seq counter. If it appends at the seq this line took, its InsertRunMessage hits
+// ON CONFLICT (run_id, seq) DO NOTHING, reads as a benign duplicate, and that frame is lost; if
+// its frame lands first, this insert returns no row (below). Fenced on the hold. No row back (a seq collision, or the run left the hold) is
 // pgx.ErrNoRows; the caller rolls back and the run stays held for the next tick. The payload is
 // built by the caller and carries no token material.
 func (q *Queries) InsertCodexReadmitRunMessage(ctx context.Context, arg InsertCodexReadmitRunMessageParams) (int32, error) {
@@ -1053,17 +1057,19 @@ WHERE r.id = $2
            THEN r.codex_account_key::jsonb
                 = jsonb_build_array(cpa.provider_user_id, cpa.workspace_account_id)
            ELSE false END
+  AND r.codex_account_key = $4::text
   AND cpa.credential_revision = r.codex_account_revision
   AND cpa.coord_state IN ('idle', 'committed')
-  AND r.codex_material_revision = $4::bigint
+  AND r.codex_material_revision = $5::bigint
   AND ccs.material_revision = $1::bigint
-  AND $1::bigint > $4::bigint
+  AND $1::bigint > $5::bigint
 `
 
 type ReadmitRunCodexBindingParams struct {
 	NewMaterialRevision int64     `json:"new_material_revision"`
 	ID                  uuid.UUID `json:"id"`
 	SecretID            uuid.UUID `json:"secret_id"`
+	AccountKey          string    `json:"account_key"`
 	OldMaterialRevision int64     `json:"old_material_revision"`
 }
 
@@ -1084,8 +1090,19 @@ type ReadmitRunCodexBindingParams struct {
 //   - the alias is linked, with provider_account_id set (the INNER account join also needs it);
 //   - the linked account's identity tuple encodes to the run's frozen codex_account_key, with
 //     the same guarded jsonb comparison as ClaimRun's gate (an undecodable key never matches);
-//   - the account's credential_revision EQUALS the frozen codex_account_revision (a revoke is
-//     terminal, never advanced here);
+//   - the frozen codex_account_key is byte-for-byte @account_key, the caller's Go encoding
+//     (codexAccountKey) of the locked account's tuple. The jsonb comparison alone accepts a
+//     non-canonical key (e.g. `["u", "w"]`, only writable by direct SQL) that the Go
+//     authority check (codexCheckAccountTuple, a string comparison) rejects, so it would
+//     re-admit a run that then fails classification. With both, the statement matches only a
+//     key that is structurally the account's AND the canonical text the Go side compares, so
+//     the SQL and Go identity checks agree. The jsonb comparison keeps the statement safe on
+//     its own: whatever @account_key a caller passes, a run whose frozen key does not name the
+//     linked account is never re-admitted;
+//   - the account's credential_revision EQUALS the frozen codex_account_revision (never
+//     advanced here). Nothing bumps credential_revision today (it stays at its DEFAULT 0), so
+//     this is defence in depth: once a future revocation bumps it, such a run is never
+//     re-admitted;
 //   - the account is settled: coord_state idle or committed (never quarantined or mid-lease);
 //   - CAS on both material revisions: the run is still at @old_material_revision and the alias
 //     at @new_material_revision, and the move is strictly forward, so a concurrent material
@@ -1098,6 +1115,7 @@ func (q *Queries) ReadmitRunCodexBinding(ctx context.Context, arg ReadmitRunCode
 		arg.NewMaterialRevision,
 		arg.ID,
 		arg.SecretID,
+		arg.AccountKey,
 		arg.OldMaterialRevision,
 	)
 	if err != nil {
