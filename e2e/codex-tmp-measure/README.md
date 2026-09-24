@@ -1,10 +1,15 @@
-# codex-tmp-measure — PRD #1598 M5 boundary measurement
+# codex-tmp-measure — PRD #1598 boundary measurement
 
-Measures the real `/tmp` residue, per-run Codex command cache behavior, and
-Go module download traffic on either side of PRD #1598 M5 (the per-run Codex
-command cache holder), by driving the **real** `uzi-codex-supervisor` and
-`uzi-codex-command-sandbox` binaries, as uid 10003, over a scripted Go-heavy
-command sequence against a given git ref.
+**Boundary-level proxy, not the hosted Codex-run measurement.** Measures the
+real `/tmp` residue, per-run Codex command cache behavior, and Go module
+download traffic comparing pre-#1598 (`f77d3103`) against the #1598 branch
+(`e648d16c`, milestones M1-M5: `internal/safetree` and supervisor-owned
+command tmp from M1/M2, the per-run cache holder from M5), by driving the
+**real** `uzi-codex-supervisor` and `uzi-codex-command-sandbox` binaries, as
+uid 10003, over a scripted Go-heavy command sequence against a given git ref.
+The hosted measurement (the real k8s worker fleet, the real
+`agent/templates/*` image, a real Anthropic/Codex-mediated run) remains a
+**post-deploy maintainer check**, out of scope for this script.
 
 ## What this measures
 
@@ -13,8 +18,9 @@ For a given ref, `run.sh`:
 1. builds an image containing that ref's supervisor + sandbox binaries and a
    writable copy of this repo's `api/` module;
 2. feature-detects whether that ref's supervisor supports the `--hold-cache`
-   standalone mode (PRD #1598 M5); if it does, starts one cache holder for
-   the whole run and points `GOMODCACHE`/`GOCACHE`/`npm_config_cache` at it;
+   standalone mode (added at PRD #1598 M5); if it does, starts one cache
+   holder for the whole run and points
+   `GOMODCACHE`/`GOCACHE`/`npm_config_cache` at it;
 3. runs N (default 5) commands through the real supervisor + sandbox, each:
    `--expect-uid 10003 --cleanup-token <uuid> -- uzi-codex-command-sandbox
    --root <workdir> --tmp /tmp/uzi-codex-command-<uuid> --cwd <workdir>
@@ -59,14 +65,16 @@ build needs no network) on a plain `golang:1.26-alpine` base, with the same
 three runtime uids the real image creates (`worker` 10001, `runner` 10002,
 `runner-cmd` 10003, PRD #51 A1 / PRD #1171 M1). What is proxied, concretely:
 
-- **No read-only root, no seccomp profile, no worker-level capability drop.**
-  The real worker image runs its entrypoint under `--read-only` plus a
-  seccomp profile (see `e2e/codex-m3a/run-lifecycle.sh` for the production
+- **No read-only root, no seccomp profile, and a capability set that is
+  hand-picked for this harness rather than the worker's own.** The real
+  worker image runs its entrypoint under `--read-only` plus a seccomp
+  profile (see `e2e/codex-m3a/run-lifecycle.sh` for the production
   confinement posture); this fallback runs a plain root-started container
-  with a hand-picked, narrower-than-default `--cap-drop ALL` set (see below).
-  The supervisor's OWN pre-fork profile verification (subreaper,
-  nondumpable, capability/no-new-privs checks) is real and unrelaxed either
-  way — that part is not proxied.
+  that DOES apply `--cap-drop ALL` plus a small, hand-picked `--cap-add`
+  set (see below) — a real drop, just not the one the k8s pod spec applies
+  in production. The supervisor's OWN pre-fork profile verification
+  (subreaper, nondumpable, capability/no-new-privs checks) is real and
+  unrelaxed either way — that part is not proxied.
 - **No nix-provisioned Go toolchain version pin.** The real worker's Go
   toolchain (used for a Go-heavy Codex run) comes from a pinned nix closure;
   this fallback uses whatever `go` `golang:1.26-alpine` ships. `GOTOOLCHAIN`
@@ -91,29 +99,74 @@ depends on the two binaries and a writable API checkout being present.
 
 ### Other bypasses, named explicitly
 
-- **`GOTOOLCHAIN=local`.** `api/go.mod` pins `toolchain go1.27.1`; without
-  this override, the FIRST `go build` of every command (even on the cached
-  branch path) would additionally try to download that toolchain (tens of
-  MB), which is a fixed one-time cost unrelated to the M5 boundary this
-  script measures (the module/build cache, not the toolchain itself). Left
-  unset, this would make cross-run timing noisy without changing the
-  qualitative base-vs-branch comparison this script exists to make.
-- **The capability set is hand-picked, not the real worker's.** `run.sh`
-  passes `--cap-drop ALL --cap-add SETUID --cap-add SETGID --cap-add SETPCAP
-  --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER`. SETUID/SETGID
-  are what `setpriv --reuid/--regid` need to drop from root to uid 10003;
-  **SETPCAP is required for `setpriv --bounding-set -all` to actually clear
-  the bounding set** (without it, `setpriv` silently leaves the bounding set
-  unchanged — confirmed by inspecting `/proc/self/status` inside the
-  container during development — which the supervisor's own pre-fork
-  profile check then correctly refuses with `profile:capBnd`, since neither
-  a fully-empty nor an exact SETUID|SETGID-residue bounding set was
-  achieved). CHOWN/DAC_OVERRIDE/FOWNER are only for root's own setup step
-  (copying `api/` to a uid-10003-owned tree, creating the 0700 cache root);
-  they are dropped again for every actual supervisor invocation via that
-  same `--bounding-set -all` (confirmed empty, `CapBnd: 0000000000000000`).
-  None of this maps onto the real worker's actual container capability
-  set, which is provisioned by the k8s pod spec, not by this script.
+- **The environment is inherited, not replaced.** The real launcher
+  (`agent/src/codex/launcher.ts`) spawns the supervisor with a fully
+  **REPLACED** environment: a fixed `PATH`, `LANG=C`, and a private
+  `HOME`/`TMPDIR`/XDG tree per command, plus the cache variables — never a
+  merge of the worker process's own environment. This harness's
+  `measure-inner.sh` instead runs the supervisor as a normal child of the
+  golang-image shell, so it **inherits** that image's whole environment
+  (`PATH`, locale, etc.) and only explicitly overrides the handful of
+  variables it cares about (`HOME`, `TMPDIR`, `GOPATH`, `GOTOOLCHAIN`, and,
+  on the branch, `GOMODCACHE`/`GOCACHE`/`npm_config_cache`). This does not
+  affect the tmp/cache boundary being measured (the supervisor and sandbox
+  binaries only look at the variables they define), but it means the
+  harness's env is not a faithful proxy of production's locked-down env.
+- **The cache root path differs from production.** This harness uses
+  `/cache` as the cache root (`CACHE_ROOT=/cache` in `measure-inner.sh`);
+  production uses `/var/cache/uzi-codex-cmd` (see
+  `agent/codex/supervisor/cmdsandbox/cache_test.go`). Only the path differs;
+  the cache-holder/`--cache` mechanics exercised are the same regardless of
+  root.
+- **The `GOPATH` pin matches production's default, it does not bypass it.**
+  `measure-inner.sh` pins `GOPATH=$HOME/go` under the ephemeral per-command
+  `HOME` on every command. Production never sets `GOPATH` at all, so Go
+  falls back to its own default of `$HOME/go` under production's private,
+  per-command `HOME` tree — the same effective path. The pin here exists
+  only to defeat the alpine base image's own baked-in `GOPATH=/go`, which
+  would otherwise leak a free, shared, unmeasured module cache across every
+  command regardless of ref; it is not a deviation from what production
+  does.
+- **`GOTOOLCHAIN=local`, and its rationale understates the branch's real
+  benefit.** `api/go.mod` pins `toolchain go1.27.1`; without this override,
+  the FIRST `go build` of every command (even on the cached branch path)
+  would additionally try to download that toolchain (tens of MB). That
+  download is NOT purely a one-time cost orthogonal to what M5 measures:
+  Go stores a downloaded toolchain under `GOMODCACHE` (a `golang.org/toolchain@...`
+  module), so on the branch ref, once the per-run cache holder is warm, a
+  downloaded toolchain would persist in the SAME per-run cache directory
+  the branch already keeps warm across commands — meaning leaving
+  `GOTOOLCHAIN` unset would make the branch's warm-cache advantage look
+  *bigger* on a cold run and identical thereafter, not merely "noisier."
+  Forcing `GOTOOLCHAIN=local` removes that source entirely so the numbers
+  in `RESULTS.md` isolate the module/build cache boundary alone; the real
+  boundary this script measures is therefore understated relative to a
+  production run that would also benefit from a persisted toolchain
+  download, not overstated.
+- **The capability set differs from production's residue, not just from a
+  hand-picked default.** `run.sh` passes `--cap-drop ALL --cap-add SETUID
+  --cap-add SETGID --cap-add SETPCAP --cap-add CHOWN --cap-add DAC_OVERRIDE
+  --cap-add FOWNER`. SETUID/SETGID are what `setpriv --reuid/--regid` need
+  to drop from root to uid 10003; **SETPCAP is required for `setpriv
+  --bounding-set -all` to actually clear the bounding set** (without it,
+  `setpriv` silently leaves the bounding set unchanged — confirmed by
+  inspecting `/proc/self/status` inside the container during development —
+  which the supervisor's own pre-fork profile check then correctly refuses
+  with `profile:capBnd`, since neither a fully-empty nor an exact
+  SETUID|SETGID-residue bounding set was achieved). CHOWN/DAC_OVERRIDE/FOWNER
+  are only for root's own setup step (copying `api/` to a uid-10003-owned
+  tree, creating the 0700 cache root); they are dropped again for every
+  actual supervisor invocation via that same `--bounding-set -all`
+  (confirmed empty in this harness, `CapBnd: 0000000000000000`).
+  **Production's own pre-fork profile check instead expects, and accepts, a
+  residual SETUID|SETGID bounding set (`0xc0`)** left by its
+  controller-only setuid/setgid entrypoint (see
+  `agent/codex/supervisor/profile.go`'s `capBndSetuidSetgidResidue`
+  constant and `doc.go`'s note on the entrypoint's controller-only
+  SETUID/SETGID). This harness's fully-empty bounding set is therefore
+  STRICTER than production's actual bounding set, not merely "not the real
+  worker's" — the supervisor's profile check treats both as passing, but
+  they are not the same posture.
 - **Landlock is whatever this kernel/sandbox actually offers**, not forced
   either way. `--mode best-effort` is passed (never `required`), and the
   actual probe result is recorded in `RESULTS.md` rather than assumed.
@@ -171,8 +224,16 @@ redirect stdout to a file to keep the machine-readable record, e.g.:
 
 Each invocation creates its own detached worktree and image (named after the
 resolved commit sha, e.g. `m1598-img-e648d16c-e648d16cd48f`) and removes both
-on exit unless `UZI_M1598_KEEP=1`. Nothing outside a throwaway worktree and a
-uniquely-named `m1598-*` image/container is touched.
+on exit unless `UZI_M1598_KEEP=1`. **This does not mean nothing else is
+touched.** Two things persist outside the throwaway worktree and the
+uniquely-named `m1598-*` image/container, and neither is cleaned up by
+`run.sh`: the `golang:1.26-alpine` base image, pulled (and cached) by the
+docker daemon the first time any ref is measured, and BuildKit's own build
+cache/layer cache for the intermediate build stages, both of which persist
+in the docker daemon's local storage across invocations and across repo
+checkouts. Reclaim them with the ordinary docker commands
+(`docker image rm golang:1.26-alpine`, `docker builder prune`) if disk needs
+to be recovered.
 
 ### Requirements
 
@@ -204,4 +265,24 @@ uniquely-named `m1598-*` image/container is touched.
   flushed/grepped, sending `dispose` while the real `go build`/`go test`
   was still running (visible as a force-killed dispose and a falsely tiny
   duration). Only a `child_exit` line in the evidence log means the command
-  actually finished.
+  actually finished — but `child_exit` alone only proves the command
+  finished, not that it succeeded: `measure-inner.sh` also pulls the
+  `code` field off that same evidence line (before the log is deleted) into
+  each result row's `child_exit_code`, so a fast *failure* can never be
+  misread as a fast, warm-cache success from duration alone.
+- **This harness's own scratch files (FIFOs, evidence/output/holder logs)
+  live under `/work/m1598-logs`, never `/tmp`.** `/tmp` is the exact
+  directory this script measures residue in; a harness bookkeeping file
+  placed there would count as if the supervised commands themselves left
+  it behind. Only the sandboxed command's own `--tmp` directory
+  (`/tmp/uzi-codex-command-<token>`) is deliberately under `/tmp` — that
+  one IS what is being measured.
+- **The cache holder's stderr is captured to its own file, never merged
+  into the log this script parses.** Production's own launcher only ever
+  reads the holder's stdout NDJSON; merging stderr in as this harness
+  originally did risked a stray diagnostic line being read back as a real
+  evidence line. `measure-inner.sh` also runs every log line spliced into
+  its own NDJSON output through a `safe_embed_json` check (must look like a
+  single-line `{...}` JSON object, else emitted as the literal `null`), so
+  a malformed or partial line from either log can never corrupt the
+  NDJSON row this script itself emits.

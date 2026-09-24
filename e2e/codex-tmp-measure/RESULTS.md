@@ -1,4 +1,11 @@
-# PRD #1598 M5 boundary measurement — results
+# PRD #1598 boundary measurement — results
+
+**This is a BOUNDARY-LEVEL PROXY, not the hosted Codex-run measurement.** It
+drives the real supervisor/sandbox binaries against a scripted Go build/test
+sequence on a minimal fallback image; the hosted measurement (real k8s worker
+fleet, real `agent/templates/*` image, a real Anthropic/Codex-mediated run)
+remains a **post-deploy maintainer check**, out of scope here. See the "proxy
+caveat" in README.md before reading any number below as production truth.
 
 **Date:** 2026-09-24
 **Host kernel:** `Linux 6.1.83-4.ph5 #1-photon SMP PREEMPT_DYNAMIC` (x86_64)
@@ -52,8 +59,8 @@ Exact commands run to produce this file:
 | 2 | 80.83 s | 350,012,023 (333.8 MiB) | 2 | 0 | 78 |
 | 3 | 81.17 s | 525,013,149 (500.7 MiB) | 3 | 0 | 78 |
 | 4 | 82.87 s | 700,014,275 (667.6 MiB) | 4 | 0 | 78 |
-| 5 | 76.85 s | 875,015,401 (834.6 MiB) | 5 | 0 | 78 |
-| **final** (after all 5) | — | **875,005,630 (834.5 MiB)** | **5** | 0 | **390 total** |
+| 5 | 76.85 s | 875,015,401 (834.48 MiB) | 5 | 0 | 78 |
+| **final** (after all 5) | — | **875,005,630 (834.48 MiB)** | **5** | 0 | **390 total** |
 
 Every single command re-downloaded all 78 modules (no cache exists at this
 commit), and — the more striking result — **every command's ephemeral tmp
@@ -70,47 +77,74 @@ directory permissions (a deliberate Go behavior, the same reason
 commit's `HOME`/`GOPATH` point INSIDE that same ephemeral `--tmp`, so
 `os.RemoveAll` silently fails on the read-only module-cache subtree it just
 populated, leaving the directory (and everything under it) behind. This is
-specific to this exact base commit's era (a supervisor with
-`commandtmp.go`+`internal/safetree` — confirmed present starting one of the
-intermediate M4 commits, well before M5 — uses a permission-restoring
-removal and would very likely not exhibit this particular residue, even
-without M5's cache relocation); it is reported here as measured, at the
-exact base commit given, not as a general claim about every pre-M5 state.
+specific to this exact base commit's era (a pre-#1598 commit with no
+supervisor-owned tmp at all): `internal/safetree` (M1, `7f1ba455`) and the
+supervisor taking ownership of the command tmp with a permission-restoring
+removal (M2, `9e5ef5fe`) both land after this base commit, so the residue
+reported here is exactly what M1/M2 fix, not something introduced or
+removed later in the #1598 branch; it is reported here as measured, at the
+exact base commit given, not as a general claim about every pre-#1598 state.
 
-### branch (`e648d16c`, #1598 M5) — `--hold-cache` supported (feature-detected: `cache_support.supported=1`)
+### branch (`e648d16c`, #1598 branch, M1–M5) — `--hold-cache` supported (feature-detected: `cache_support.supported=1`)
 
 Cache holder ready at `/cache/<run-uuid>` before the first command; released
 (`{"op":"release","drained":true}`) after the last.
 
 | cmd | duration | /tmp bytes after | `uzi-codex-command-*` dirs left in /tmp | cache dir bytes | `go: downloading` lines |
 |---|---|---|---|---|---|
-| 1 | 80.40 s | 9,887 | 0 | 1,004,013,728 (957.7 MiB) | 78 |
+| 1 | 80.40 s | 9,887 | 0 | 1,004,013,728 (957.50 MiB) | 78 |
 | 2 | 9.68 s | 5,683 | 0 | 1,004,013,728 | 0 |
 | 3 | 10.09 s | 5,683 | 0 | 1,004,013,728 | 0 |
 | 4 | 8.78 s | 5,683 | 0 | 1,004,013,728 | 0 |
 | 5 | 8.83 s | 5,683 | 0 | 1,004,013,728 | 0 |
-| **final** (after release) | — | **0** | **0** | **peak 1,004,013,728 (957.7 MiB); retained: NO — holder reported `cache_cleanup state=removed`** | **78 total** |
+| **final** (after release) | — | **0** | **0** | **peak 1,004,013,728 (957.50 MiB); retained: NO — holder reported `cache_cleanup state=removed`** | **78 total** |
+
+The small non-zero `/tmp` byte counts on this ref (9,887 bytes after command
+1, 5,683 bytes after commands 2-5) are **not** residue left by the supervised
+commands — every `uzi-codex-command-*` dir count is 0, meaning the
+supervisor's own tmp cleanup left nothing behind. They are **the harness's
+own files**: the release FIFO/log and, per command, the control/evidence
+FIFOs and their log/output files that `measure-inner.sh` places directly
+under `/tmp` (`m1598-hold-*`, `m1598-ctl-*`, `m1598-ev-*`, `m1598-evlog-*`,
+`m1598-cmdout-*`), measured before that command's own cleanup at the end of
+each loop iteration removes them. See "Harness files under /tmp" below;
+`measure-inner.sh` has since been changed to place these under `/work`
+instead, so a re-run would not show even this residue.
 
 Every command's ephemeral `/tmp` residue is fully removed by the supervisor's
 own `tmpCleanup` (`{"state":"removed","reason":""}` on every dispose) — it
 never contains module-cache files at all, since `GOMODCACHE`/`GOCACHE` are
 pointed at the separate `--cache` directory instead. Only the FIRST command
 pays the module-download cost (78 `go: downloading` lines, ~958 MiB of
-module cache built up); commands 2-5 hit the warm cache and each finish in
-under 11 seconds, a ~8-9x speedup over base's ~75-83 s per command. At the
-end of the run the cache holder is released with `drained:true` and the
-supervisor's own attestation removes the whole per-run cache directory —
-nothing is left behind.
+module cache built up); commands 2-5 show no `go: downloading` lines and
+finish in under 11 seconds, consistent with a warm cache (this is an
+inference from duration and the absence of download lines, not a direct
+"cache hit" signal — see the exit-code caveat below for why child_exit alone
+cannot rule out a fast failure), a ~7.4–9.4x speedup over base's ~75-83 s per
+command. At the end of the run the cache holder is released with
+`drained:true` and the supervisor's own attestation removes the whole
+per-run cache directory — nothing is left behind.
 
-## Summary: what M5 changes, as measured here
+**Exit code was not recorded for these runs.** `measure-inner.sh` did not
+emit the command's exit code (`child_exit`'s code, present in the evidence
+log) into the NDJSON result row at the time these numbers were captured; the
+evidence log is deleted before this field could be back-filled, so it cannot
+be re-derived from these recorded runs. `measure-inner.sh` now emits it
+(`child_exit_code` in the `command` event) for future runs, but every row in
+this results file predates that field. Practically: a fast command 2-5 could
+in principle be a fast *failure* rather than a warm-cache hit; the "warm
+cache" reading above rests on duration plus the absence of `go: downloading`
+lines, not on a confirmed zero exit code.
 
-| Metric (N=5 commands) | base (no cache) | branch (M5 cache holder) |
+## Summary: pre-#1598 (`f77d3103`) vs the #1598 branch (`e648d16c`, M1–M5), as measured here
+
+| Metric (N=5 commands) | base (pre-#1598, no cache, no supervisor-owned tmp) | branch (#1598 branch, M1–M5: safetree + supervisor-owned tmp + cache holder) |
 |---|---|---|
 | Total wall time for 5 commands | ~396 s (74-83 s each) | ~118 s (80 s cold + 4× ~9 s) |
 | Total `go: downloading` lines | 390 (78 × 5, every command) | 78 (only command 1) |
-| `/tmp` residue after 5 commands | **875 MB, growing without bound** | **0 bytes** |
+| `/tmp` residue after 5 commands | **834.48 MiB, growing without bound** | **0 bytes** |
 | `uzi-codex-command-*` dirs left in /tmp | 5 (never cleaned) | 0 (cleaned after every command) |
-| Per-run cache dir | none | peak 958 MiB, **not retained** after release |
+| Per-run cache dir | none | peak 957.50 MiB, **not retained** after release |
 
 ## What this run could NOT measure (and where that IS covered)
 
@@ -128,6 +162,18 @@ nothing is left behind.
   measured here (persistent per-run `GOMODCACHE`/`GOCACHE`, cleaned
   ephemeral tmp) is expected to scale the same way; only the exact byte/time
   numbers would differ.
+
+## Harness files under /tmp
+
+The tiny branch-ref residues noted above (9,887 and 5,683 bytes) were the
+harness's own release FIFO/log and per-command control/evidence
+FIFOs/logs/output files, which `measure-inner.sh` placed directly under
+`/tmp` at measurement time. They have since been moved to `/work/m1598-logs`
+so the `/tmp` measurement reflects only what the supervised commands
+themselves leave behind, with no harness-file noise; the underlying finding
+(0 bytes retained on the branch ref, once supervisor-owned tmp cleanup ran)
+is unchanged, and a re-run would show exactly 0 rather than these small
+values.
 
 ## Bugs/observations noticed while building this harness (not part of the measurement)
 

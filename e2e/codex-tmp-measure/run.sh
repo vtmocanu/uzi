@@ -32,7 +32,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
 
-REF="${1:?usage: run.sh <git-ref> [N]}"
+REF="${1:?usage: run.sh <git-ref> (UZI_M1598_N=<count> to set N, default 5)}"
 N="${UZI_M1598_N:-5}"
 KEEP="${UZI_M1598_KEEP:-0}"
 
@@ -44,12 +44,30 @@ SHORT=${SHA:0:12}
 WORKDIR=$(mktemp -d "${TMPDIR:-/tmp}/uzi-m1598-$SLUG-XXXXXX")
 CTX="$WORKDIR/ctx"
 IMAGE="m1598-img-$SLUG-$SHORT"
+# Deterministic, unique-per-invocation container name (also passed to `docker
+# run --name` below) so the cleanup trap can target exactly the container this
+# invocation started, never a foreign one, even if it is still running (e.g.
+# this script was killed mid-run).
+CONTAINER="m1598-measure-$SLUG-$$"
+# Only set true once THIS invocation's `docker build` has actually succeeded.
+# Gating the image removal on it means a failed build (or a build that never
+# ran) never issues `docker image rm` against an image this invocation did
+# not create -- e.g. a same-named image left over from a prior, still-wanted
+# `UZI_M1598_KEEP=1` run at the same ref/sha.
+BUILT=0
 
 cleanup() {
+  # Always stop/remove OUR OWN container by its exact deterministic name,
+  # regardless of KEEP: a kept image/worktree is for inspecting the build
+  # artifacts, not for leaving a (possibly still-running) container behind.
+  docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
   if [ "$KEEP" != "1" ]; then
     git -C "$REPO" worktree remove --force "$WORKDIR/wt" >/dev/null 2>&1 || true
     rm -rf "$WORKDIR"
-    docker image rm -f "$IMAGE" >/dev/null 2>&1 || true
+    git -C "$REPO" worktree prune >/dev/null 2>&1 || true
+    if [ "$BUILT" = "1" ]; then
+      docker image rm -f "$IMAGE" >/dev/null 2>&1 || true
+    fi
   else
     log "UZI_M1598_KEEP=1: leaving worktree at $WORKDIR/wt and image $IMAGE"
   fi
@@ -71,6 +89,7 @@ cp "$HERE/measure-inner.sh" "$CTX/e2e/codex-tmp-measure/measure-inner.sh"
 
 log "=== building $IMAGE (fallback minimal image; see README.md deviation) ==="
 docker build -f "$HERE/Dockerfile.fallback" -t "$IMAGE" "$CTX" >&2
+BUILT=1
 
 # The docker CLI here may talk to a remote/sibling daemon (DOCKER_HOST): no
 # bind mount is used anywhere (a host path is not guaranteed to be the
@@ -88,7 +107,7 @@ CAPS=(--cap-drop ALL --cap-add SETUID --cap-add SETGID --cap-add SETPCAP
   --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER)
 
 log "=== running $N supervised commands in $IMAGE (uid 10003) ==="
-docker run --rm "${CAPS[@]}" -e "UZI_M1598_N=$N" --name "m1598-measure-$SLUG-$$" \
+docker run --rm "${CAPS[@]}" -e "UZI_M1598_N=$N" --name "$CONTAINER" \
   "$IMAGE" bash /measure-inner.sh
 
 log "=== done: $REF ($SHORT) ==="

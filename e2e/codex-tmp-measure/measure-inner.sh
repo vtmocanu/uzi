@@ -1,11 +1,16 @@
 #!/bin/bash
-# Runs INSIDE the m1598-img-<ref> container, as root, via `docker run --entrypoint
-# /bin/bash`. It prepares the writable trees, detects whether this ref's
-# supervisor supports the --hold-cache standalone mode, drives N supervised
-# Go-heavy commands through the REAL uzi-codex-supervisor + uzi-codex-command-sandbox
+# Runs INSIDE the m1598-img-<ref> container, as root, via `docker run ... bash
+# /measure-inner.sh` (run.sh does not pass `--entrypoint`; the image's default
+# entrypoint is unset, so `docker run` executes this command+args directly).
+# It prepares the writable trees, detects whether this ref's supervisor
+# supports the --hold-cache standalone mode, drives N supervised Go-heavy
+# commands through the REAL uzi-codex-supervisor + uzi-codex-command-sandbox
 # as uid 10003, and prints one NDJSON line of measurements per command plus a
 # final summary line to STDOUT, one JSON object per line (NDJSON), with all
-# human-readable progress on STDERR. run.sh captures the two separately.
+# human-readable progress on STDERR. run.sh passes both streams straight
+# through to its own stdout/stderr (no redirection or capture inside run.sh
+# itself); it is the CALLER of run.sh that redirects each to a separate file,
+# as shown in README.md and RESULTS.md's "exact commands run" sections.
 #
 # See e2e/codex-tmp-measure/README.md for what this measures and what it does
 # NOT prove.
@@ -23,8 +28,31 @@ log() { printf '%s\n' "$*" >&2; }
 # reach the invoking shell).
 emit() { printf '%s\n' "$1"; }
 
+# safe_embed_json prints its argument unchanged if it looks like a single-line
+# JSON object the real supervisor/holder emitted (starts with `{`, ends with
+# `}`, no embedded raw newline -- callers already `tr -d '\n'` first), or the
+# bare literal `null` otherwise. Used wherever a line read back from a
+# supervisor/holder log is spliced into the NDJSON row THIS script emits, so
+# a malformed, partial, or (if a caller ever forgot to separate streams)
+# non-JSON diagnostic line can never corrupt this script's own machine-
+# readable output.
+safe_embed_json() {
+  case "$1" in
+    '{'*'}') printf '%s' "$1" ;;
+    *) printf 'null' ;;
+  esac
+}
+
 SETPRIV_BASE=(setpriv --reuid 10003 --regid 10003 --init-groups --no-new-privs
   --bounding-set -all --inh-caps -all --ambient-caps -all --)
+
+# All of this harness's own scratch files (FIFOs, evidence/output logs) live
+# under /work, NOT /tmp: /tmp is the exact directory this script measures
+# residue in (`tmp_bytes`/`tmp_cmd_dirs` below), so a harness file placed
+# there would count as if it were something the supervised commands left
+# behind, when it is actually just this driver's own bookkeeping.
+LOGDIR=/work/m1598-logs
+mkdir -p "$LOGDIR"
 
 # ---- 1. writable API checkout, owned by the command uid ------------------
 mkdir -p /work
@@ -84,13 +112,23 @@ if [ "$HAS_CACHE" = "1" ]; then
   # channels below use, where EOF is never needed) measurably does NOT
   # deliver EOF to the holder's read loop even after `exec {FD}>&-` -- this
   # hung for real during development; do not "simplify" it back to `<>`.
-  HOLD_RELFIFO=/tmp/m1598-hold-release-$RUN_TOKEN
+  HOLD_RELFIFO="$LOGDIR/m1598-hold-release-$RUN_TOKEN"
   mkfifo "$HOLD_RELFIFO"
-  HOLDLOG=/tmp/m1598-hold-log-$RUN_TOKEN
+  HOLDLOG="$LOGDIR/m1598-hold-log-$RUN_TOKEN"
   : > "$HOLDLOG"
+  # The holder's stderr is kept OUT of $HOLDLOG (production's own launcher
+  # ignores the holder's stderr entirely -- it only ever reads its NDJSON
+  # stdout). Merging stderr into the same file this script greps for
+  # `cache_ready`/`path`/the last-line release confirmation would risk a
+  # stray diagnostic line being read back as if it were a real evidence
+  # line (see safe_embed_json above for the belt-and-suspenders check on
+  # top of this). Captured to a separate file purely for a human to inspect
+  # on failure; never parsed.
+  HOLDERR="$LOGDIR/m1598-hold-err-$RUN_TOKEN"
+  : > "$HOLDERR"
   "${SETPRIV_BASE[@]}" /usr/local/bin/uzi-codex-supervisor --hold-cache \
     --expect-uid 10003 --cache-root "$CACHE_ROOT" --cache-token "$RUN_TOKEN" \
-    <"$HOLD_RELFIFO" >"$HOLDLOG" 2>&1 &
+    <"$HOLD_RELFIFO" >"$HOLDLOG" 2>"$HOLDERR" &
   HOLD_PID=$!
   exec {HOLDRELW}>"$HOLD_RELFIFO"
   for _ in $(seq 1 100); do
@@ -122,16 +160,16 @@ PEAK_CACHE=0
 # ---- 5. run N supervised Go-heavy commands ---------------------------------
 for i in $(seq 1 "$N"); do
   TOKEN=$(cat /proc/sys/kernel/random/uuid)
-  CTL=/tmp/m1598-ctl-$TOKEN
-  EVF=/tmp/m1598-ev-$TOKEN
+  CTL="$LOGDIR/m1598-ctl-$TOKEN"
+  EVF="$LOGDIR/m1598-ev-$TOKEN"
   mkfifo "$CTL" "$EVF"
   exec {CTLRW}<>"$CTL"
   exec {EVRW}<>"$EVF"
-  EVLOG=/tmp/m1598-evlog-$TOKEN
+  EVLOG="$LOGDIR/m1598-evlog-$TOKEN"
   : > "$EVLOG"
   cat <&"$EVRW" >> "$EVLOG" &
   CATPID=$!
-  CMDOUT=/tmp/m1598-cmdout-$TOKEN
+  CMDOUT="$LOGDIR/m1598-cmdout-$TOKEN"
   : > "$CMDOUT"
 
   # The child argv element right after cmdsandbox's own `--` must itself begin
@@ -191,13 +229,23 @@ for i in $(seq 1 "$N"); do
   DOWNLOAD_LINES=$(grep -c '^go: downloading' "$CMDOUT" 2>/dev/null || true)
   DOWNLOAD_LINES=${DOWNLOAD_LINES:-0}
   DISPOSE_LINE=$(grep '"event":"dispose"' "$EVLOG" 2>/dev/null | tail -1 | tr -d '\n')
+  # The command's own exit code (doc.go: {"event":"child_exit","code":<int>}),
+  # pulled out of the evidence log BEFORE it is deleted below. Recorded per
+  # command so a fast run can never silently pass for a warm cache hit when
+  # it was in fact a fast failure -- duration and download-line-count alone
+  # cannot distinguish the two. `null` when no child_exit line was ever
+  # observed (CHILD_SEEN=0).
+  CHILD_EXIT_CODE=$(grep -o '"event":"child_exit","code":-\{0,1\}[0-9]\{1,\}' "$EVLOG" 2>/dev/null \
+    | tail -1 | grep -o -- '-\{0,1\}[0-9]\{1,\}$')
   TMPB=$(tmp_bytes)
   CMDDIRS=$(tmp_cmd_dirs)
   CACHEB=$(cache_dir_bytes)
   if [ "$CACHEB" -gt "$PEAK_CACHE" ]; then PEAK_CACHE=$CACHEB; fi
 
-  log "cmd $i/$N: child_seen=$CHILD_SEEN sup_rc=$SUP_RC dur_ms=$DUR_MS tmp_bytes=$TMPB cmd_dirs=$CMDDIRS cache_bytes=$CACHEB downloads=$DOWNLOAD_LINES"
-  emit "{\"event\":\"command\",\"i\":$i,\"child_seen\":$CHILD_SEEN,\"sup_rc\":$SUP_RC,\"dur_ms\":$DUR_MS,\"tmp_bytes\":$TMPB,\"tmp_cmd_dirs\":$CMDDIRS,\"cache_bytes\":$CACHEB,\"downloading_lines\":$DOWNLOAD_LINES,\"dispose\":${DISPOSE_LINE:-null}}"
+  DISPOSE_JSON=$(safe_embed_json "${DISPOSE_LINE:-}")
+
+  log "cmd $i/$N: child_seen=$CHILD_SEEN sup_rc=$SUP_RC child_exit_code=${CHILD_EXIT_CODE:-null} dur_ms=$DUR_MS tmp_bytes=$TMPB cmd_dirs=$CMDDIRS cache_bytes=$CACHEB downloads=$DOWNLOAD_LINES"
+  emit "{\"event\":\"command\",\"i\":$i,\"child_seen\":$CHILD_SEEN,\"sup_rc\":$SUP_RC,\"child_exit_code\":${CHILD_EXIT_CODE:-null},\"dur_ms\":$DUR_MS,\"tmp_bytes\":$TMPB,\"tmp_cmd_dirs\":$CMDDIRS,\"cache_bytes\":$CACHEB,\"downloading_lines\":$DOWNLOAD_LINES,\"dispose\":$DISPOSE_JSON}"
 
   rm -f "$CTL" "$EVF" "$EVLOG" "$CMDOUT"
 done
@@ -212,11 +260,16 @@ if [ "$HAS_CACHE" = "1" ]; then
   set -e
   sleep 0.2
   HOLD_LAST=$(tail -1 "$HOLDLOG" | tr -d '\n')
+  HOLD_LAST_JSON=$(safe_embed_json "$HOLD_LAST")
   CACHE_REMAINS=0
   [ -d "$RUN_CACHE_DIR" ] && CACHE_REMAINS=1
   log "cache holder released: rc=$HOLD_RC remains=$CACHE_REMAINS last_line=$HOLD_LAST"
-  emit "{\"event\":\"cache_release\",\"rc\":$HOLD_RC,\"remains\":$CACHE_REMAINS,\"holder_line\":${HOLD_LAST:-null}}"
-  rm -f "$HOLD_RELFIFO" "$HOLDLOG"
+  if [ -s "$HOLDERR" ]; then
+    log "cache holder stderr (not parsed, for diagnosis only):"
+    cat "$HOLDERR" >&2
+  fi
+  emit "{\"event\":\"cache_release\",\"rc\":$HOLD_RC,\"remains\":$CACHE_REMAINS,\"holder_line\":$HOLD_LAST_JSON}"
+  rm -f "$HOLD_RELFIFO" "$HOLDLOG" "$HOLDERR"
 fi
 
 FINAL_TMPB=$(tmp_bytes)

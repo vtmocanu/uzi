@@ -4,22 +4,30 @@
 # that image bakes a full nix + devbox toolchain that does not fit this box's
 # disk budget (see run.sh / README.md "deviation"). This fallback builds the
 # REAL uzi-codex-supervisor and uzi-codex-command-sandbox from the exact
-# sources at the ref under measurement (build context is that ref's
-# agent/codex/supervisor directory, vendored, so no network is needed for the
-# supervisor's own build), on a plain golang:1.26-alpine base, with the same
-# three runtime uids the real worker image creates (PRD #51 A1 / PRD #1171 M1).
+# sources at the ref under measurement, vendored, so no network is needed for
+# the supervisor's own build, on a plain golang:1.26-alpine base, with the
+# same three runtime uids the real worker image creates (PRD #51 A1 / PRD
+# #1171 M1).
 #
 # The numbers this produces are a PROXY: real /tmp, cache and network behavior
 # under the real supervisor + sandbox binaries, but without the real worker's
 # read-only root, capability drop, seccomp profile, or nix-provisioned Go
 # toolchain version pinning.
 #
-# Build context is the WHOLE ref checkout (run.sh's detached worktree), because
-# the docker CLI here talks to a possibly-remote/sibling daemon over
-# DOCKER_HOST (no shared host filesystem to bind-mount from at run time — see
-# README.md "Why everything is baked into the image"): the API module under
-# test and the driver script are baked in at BUILD time instead, and the
-# per-run writable copy is made from the baked-in reference at container start.
+# Build context is a SYNTHETIC directory `run.sh` assembles per invocation
+# (NOT the ref's checkout root, and not just `agent/codex/supervisor/`
+# either): it copies in `agent/codex/supervisor/` (this Dockerfile's first
+# COPY, below), `api/` (this repo's API module under test, this Dockerfile's
+# second COPY), and this directory's own `measure-inner.sh`. run.sh builds a
+# fresh context directory rather than pointing docker at the worktree root
+# because the repo-root `.dockerignore` (which excludes `agent/`, `api/` and
+# `e2e/` for the WEB image) applies to ANY build whose context is the repo
+# root, and the synthetic context has no `.dockerignore` of its own to fight
+# (see README.md "The repo's .dockerignore and the synthetic build context").
+# Separately, everything is baked in at BUILD time (not bind-mounted) because
+# the docker CLI here may talk to a possibly-remote/sibling daemon over
+# DOCKER_HOST with no shared host filesystem at run time — see README.md
+# "Why everything is baked into the image".
 FROM golang:1.26-alpine
 
 # util-linux setpriv (the busybox applet cannot --reuid, same guard the real
