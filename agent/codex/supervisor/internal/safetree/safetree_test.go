@@ -1255,8 +1255,8 @@ func TestRemoveDescendantVanishedBeforeOpenIsNotAbsent(t *testing.T) {
 	})
 
 	err := Remove(f.parentFd, treeName, pin)
-	if err == nil || errors.Is(err, ErrNotExist) || Reason(err) == "absent" {
-		t.Fatalf("Remove = %v (reason %q), want a non-absent failure", err, Reason(err))
+	if !errors.Is(err, ErrIO) || errors.Is(err, ErrNotExist) || Reason(err) == "absent" {
+		t.Fatalf("Remove = %v (reason %q), want ErrIO, not absent", err, Reason(err))
 	}
 	assertExists(t, f.root())
 }
@@ -1278,4 +1278,31 @@ func TestCreateFailsUnderOwnerStrippingUmask(t *testing.T) {
 	if !errors.Is(err, ErrMismatch) {
 		t.Fatalf("Create = %v, want ErrMismatch", err)
 	}
+}
+
+// The root vanishing after a successful recheck and before its rmdir is
+// ErrMismatch, never "absent".
+func TestRemoveRootVanishedBeforeRmdirIsMismatch(t *testing.T) {
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	f := newFixture(t)
+	pin := f.createTree(t)
+	rechecking := false
+	setRootRecheckHook(t, func(int, string) { rechecking = true })
+	setFstatat(t, func(real func(int, string, *unix.Stat_t, int) error, dirfd int, path string, st *unix.Stat_t, flags int) error {
+		err := real(dirfd, path, st, flags)
+		if rechecking && dirfd == f.parentFd && path == treeName {
+			if rerr := os.Rename(f.root(), f.root()+".orig"); rerr != nil {
+				t.Errorf("rename: %v", rerr)
+			}
+		}
+		return err
+	})
+
+	err := Remove(f.parentFd, treeName, pin)
+	if !errors.Is(err, ErrMismatch) || errors.Is(err, ErrNotExist) {
+		t.Fatalf("Remove = %v, want ErrMismatch", err)
+	}
+	assertExists(t, f.root()+".orig")
 }

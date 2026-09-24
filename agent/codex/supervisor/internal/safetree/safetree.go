@@ -35,8 +35,10 @@
 // /proc that is not procfs. If the magic link cannot be resolved (no /proc)
 // the chmod fails and the walk stops with ErrIO. Remove reports ErrNotExist
 // only when the root's first O_PATH open finds no entry; the root vanishing
-// after that (between the two opens, at the recheck, or before its rmdir) is
-// ErrMismatch, because a verified root that disappeared was moved, not removed.
+// after that (between the two opens, at the recheck, or before its rmdir), like
+// a verified descendant directory vanishing before its rmdir, is ErrMismatch:
+// a peer moved it (so it may still exist elsewhere) or removed it, and Remove
+// cannot tell which, so it never claims the tree is absent.
 //
 // Every entry is lstat'ed (fstatat AT_SYMLINK_NOFOLLOW), must sit on the pinned
 // root's filesystem (st_dev == Pin.Dev), and must be owned by the pinned uid; a
@@ -390,8 +392,9 @@ func Remove(parentFd int, name string, pin Pin) error {
 	var re unix.Stat_t
 	if err := fstatat(parentFd, name, &re, unix.AT_SYMLINK_NOFOLLOW); err != nil {
 		if errors.Is(err, unix.ENOENT) {
-			// The verified root was renamed away mid-walk: it still exists
-			// elsewhere, so this is a mismatch, never "absent".
+			// The verified root was moved (and may still exist elsewhere) or
+			// removed by a peer; Remove cannot tell which, so this is a
+			// mismatch, never "absent".
 			return fmt.Errorf("%w: root recheck: %w", ErrMismatch, err)
 		}
 		return ioErr("recheck root", err)
@@ -508,6 +511,11 @@ func (w *walker) removeEntry(dirfd int, name string, depth int) error {
 		return err
 	}
 	if err := unix.Unlinkat(dirfd, name, unix.AT_REMOVEDIR); err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			// Same rule as the root: a verified, emptied directory that vanished
+			// was moved or removed by a peer; Remove cannot tell which.
+			return fmt.Errorf("%w: rmdir: %w", ErrMismatch, err)
+		}
 		return ioErr("rmdir", err)
 	}
 	return nil
