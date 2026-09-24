@@ -97,7 +97,12 @@ python3 -c 'import socket,time
 s=socket.socket(); s.bind(("127.0.0.1",0)); s.listen(1)
 print(s.getsockname()[1], flush=True); time.sleep(120)' > "$tmp/port" &
 listener=$!
-trap 'kill "$listener" 2>/dev/null || true; rm -rf "$tmp"' EXIT
+# Stop and reap the listener on every exit path, including a cancelled build: INT/TERM
+# exit through the EXIT trap rather than leaving the listener behind.
+cleanup() { kill "$listener" 2>/dev/null || true; wait "$listener" 2>/dev/null || true; rm -rf "$tmp"; }
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 for _ in $(seq 100); do [ -s "$tmp/port" ] && break; sleep 0.1; done
 port="$(cat "$tmp/port")"
 [ -n "$port" ] || { echo "FAIL: lsof probe listener never reported its port." >&2; exit 1; }
