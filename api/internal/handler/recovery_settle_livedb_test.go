@@ -171,6 +171,10 @@ func newSettleEnv(t *testing.T) *settleEnv {
 	e.tokenB = e.insertWorker(e.user, e.workerB)
 	e.run, e.branch = e.insertCompletedRun(e.workerA, 2)
 	e.pred = e.insertHold(e.run, 1, e.workerA)
+	// The predecessor claimed well before the successor: its hold predates the default
+	// capture age (insertCapture, an hour ago), which predates the successor hold (now), so a
+	// capture cutoff read off the WRONG generation's hold is visible.
+	e.exec(`UPDATE recovery_custody_holds SET created_at = now() - interval '2 hours' WHERE id = $1`, e.pred)
 	e.sibGen = e.insertHold(e.run, 2, e.workerA)
 	e.sibWork = e.insertHold(e.run, 1, e.workerB)
 	return e
@@ -587,13 +591,21 @@ func TestRecoverySettleEligibilityLiveDB(t *testing.T) {
 	})
 }
 
-// insertCapture registers a recovery capture under hold with the given source_sha.
+// insertCapture registers a recovery capture under hold with the given source_sha, reserved
+// an hour ago: BEFORE the successor generation's hold (created at env setup), so it binds.
 func (e *settleEnv) insertCapture(hold uuid.UUID, source string) {
 	e.t.Helper()
+	e.insertCaptureAt(hold, source, -time.Hour)
+}
+
+// insertCaptureAt registers a recovery capture under hold with the given source_sha and
+// created_at = now() + offset (a positive offset is a reservation after the successor claimed).
+func (e *settleEnv) insertCaptureAt(hold uuid.UUID, source string, offset time.Duration) {
+	e.t.Helper()
 	e.exec(`INSERT INTO recovery_captures
-	      (id, hold_id, run_id, user_id, original_worker_id, original_worker_identity, source_sha, idempotency_key, state)
-	      VALUES ($1, $2, $3, $4, $5, 'settle-cap', $6, $7, 'preparing')`,
-		uuid.New(), hold, e.run, e.user, e.workerA, source, "settle-"+uuid.NewString())
+	      (id, hold_id, run_id, user_id, original_worker_id, original_worker_identity, source_sha, idempotency_key, state, created_at)
+	      VALUES ($1, $2, $3, $4, $5, 'settle-cap', $6, $7, 'preparing', now() + make_interval(secs => $8))`,
+		uuid.New(), hold, e.run, e.user, e.workerA, source, "settle-"+uuid.NewString(), offset.Seconds())
 }
 
 // makeInterlocked marks the run interlocked at contract revision rev.
@@ -648,10 +660,12 @@ func TestRecoverySettleCandidateBindingLiveDB(t *testing.T) {
 	})
 	t.Run("capture registered mid-proof refuses the release", func(t *testing.T) {
 		e := newSettleEnv(t)
+		// The capture is backdated to before the successor hold, so it is a BINDING capture
+		// the service never saw: only the guarded UPDATE's re-asserted binding can refuse it.
 		e.fake.beforeCompare = func() {
 			if _, err := e.pool.Exec(e.ctx, `INSERT INTO recovery_captures
-			      (id, hold_id, run_id, user_id, original_worker_id, original_worker_identity, source_sha, idempotency_key, state)
-			      VALUES ($1, $2, $3, $4, $5, 'settle-cap', $6, 'mid-proof', 'preparing')`,
+			      (id, hold_id, run_id, user_id, original_worker_id, original_worker_identity, source_sha, idempotency_key, state, created_at)
+			      VALUES ($1, $2, $3, $4, $5, 'settle-cap', $6, 'mid-proof', 'preparing', now() - interval '1 hour')`,
 				uuid.New(), e.pred, e.run, e.user, e.workerA, settleOther); err != nil {
 				t.Errorf("insert capture: %v", err)
 			}
@@ -701,6 +715,84 @@ func TestRecoverySettleCandidateBindingLiveDB(t *testing.T) {
 			t.Fatalf("hold = %+v, want released by ancestry with the permit's head", h)
 		}
 		e.assertOpen(e.sibGen, e.sibWork)
+	})
+}
+
+// TestRecoverySettleCaptureCutoffLiveDB (issue #1582 M1 follow-up, L-1): only captures created
+// BEFORE the successor generation claimed bind source_sha: that generation's hold's created_at
+// on the same run, else runs.claimed_at, else every capture binds. A capture reserved later
+// (for example after completion, with a planted source) is ignored entirely, in BOTH the
+// service read and the guarded UPDATE: it can neither satisfy a pre-existing binding nor, on
+// its own, create one.
+func TestRecoverySettleCaptureCutoffLiveDB(t *testing.T) {
+	released := func(e *settleEnv, code int, res apitypes.RecoverySettleResponse, raw string) {
+		e.t.Helper()
+		if code != http.StatusOK || res.Outcome != apitypes.RecoverySettleReleased || res.FinalHeadSha != settleHead {
+			e.t.Fatalf("settle = %d %+v (%s), want released", code, res, raw)
+		}
+		if h := e.hold(e.pred); h.state != "released" || h.evidence != "ancestry" || h.source != settleSource {
+			e.t.Fatalf("hold = %+v, want released by ancestry with the request's source", h)
+		}
+	}
+	t.Run("a planted post-successor capture does not satisfy a pre-existing binding", func(t *testing.T) {
+		e := newSettleEnv(t)
+		e.insertCapture(e.pred, settleOther)                 // the predecessor's real capture
+		e.insertCaptureAt(e.pred, settleSource, time.Minute) // reserved after the successor claimed
+		code, res, raw := e.settle(e.tokenA, e.run, e.pred, goodBody())
+		e.assertRetained(code, res, raw, apitypes.RecoverySettleCandidateMismatch)
+		e.assertNoForgeCalls()
+		e.assertOpen(e.pred, e.sibGen, e.sibWork)
+	})
+	t.Run("a post-successor capture alone is no binding capture", func(t *testing.T) {
+		e := newSettleEnv(t)
+		e.insertCaptureAt(e.pred, settleOther, time.Minute)
+		code, res, raw := e.settle(e.tokenA, e.run, e.pred, goodBody())
+		released(e, code, res, raw)
+		e.assertOpen(e.sibGen, e.sibWork)
+	})
+	t.Run("a post-successor capture registered mid-proof is ignored by the guarded update", func(t *testing.T) {
+		e := newSettleEnv(t)
+		e.fake.beforeCompare = func() {
+			if _, err := e.pool.Exec(e.ctx, `INSERT INTO recovery_captures
+			      (id, hold_id, run_id, user_id, original_worker_id, original_worker_identity, source_sha, idempotency_key, state)
+			      VALUES ($1, $2, $3, $4, $5, 'settle-cap', $6, 'mid-proof-late', 'preparing')`,
+				uuid.New(), e.pred, e.run, e.user, e.workerA, settleOther); err != nil {
+				t.Errorf("insert capture: %v", err)
+			}
+		}
+		code, res, raw := e.settle(e.tokenA, e.run, e.pred, goodBody())
+		released(e, code, res, raw)
+		e.assertOpen(e.sibGen, e.sibWork)
+	})
+	t.Run("without a successor hold the cutoff is runs.claimed_at", func(t *testing.T) {
+		e := newSettleEnv(t)
+		e.exec(`DELETE FROM recovery_custody_holds WHERE id = $1`, e.sibGen)
+		e.exec(`UPDATE runs SET claimed_at = now() - interval '30 minutes' WHERE id = $1`, e.run)
+		e.insertCapture(e.pred, settleOther)                     // an hour ago: before the claim, binds
+		e.insertCaptureAt(e.pred, settleSource, -10*time.Minute) // after the claim: ignored
+		code, res, raw := e.settle(e.tokenA, e.run, e.pred, goodBody())
+		e.assertRetained(code, res, raw, apitypes.RecoverySettleCandidateMismatch)
+		e.assertNoForgeCalls()
+		e.assertOpen(e.pred, e.sibWork)
+	})
+	t.Run("without a successor hold a post-claim capture alone does not bind", func(t *testing.T) {
+		e := newSettleEnv(t)
+		e.exec(`DELETE FROM recovery_custody_holds WHERE id = $1`, e.sibGen)
+		e.exec(`UPDATE runs SET claimed_at = now() - interval '30 minutes' WHERE id = $1`, e.run)
+		e.insertCaptureAt(e.pred, settleOther, -10*time.Minute)
+		code, res, raw := e.settle(e.tokenA, e.run, e.pred, goodBody())
+		released(e, code, res, raw)
+		e.assertOpen(e.sibWork)
+	})
+	t.Run("with neither a successor hold nor claimed_at every capture binds", func(t *testing.T) {
+		e := newSettleEnv(t)
+		e.exec(`DELETE FROM recovery_custody_holds WHERE id = $1`, e.sibGen)
+		e.exec(`UPDATE runs SET claimed_at = NULL WHERE id = $1`, e.run)
+		e.insertCaptureAt(e.pred, settleOther, time.Minute)
+		code, res, raw := e.settle(e.tokenA, e.run, e.pred, goodBody())
+		e.assertRetained(code, res, raw, apitypes.RecoverySettleCandidateMismatch)
+		e.assertNoForgeCalls()
+		e.assertOpen(e.pred, e.sibWork)
 	})
 }
 

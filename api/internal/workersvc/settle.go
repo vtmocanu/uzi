@@ -86,7 +86,10 @@ func validateSettleRequest(req apitypes.RecoverySettleRequest) error {
 // COMPLETED, on the api's OWN ancestry proof (issue #1582 M1). A same-worker resume adopts the
 // predecessor generation's work and completes; the completed-generation backstop deliberately
 // never releases the older hold, so it would stay open forever. The worker names the hold and
-// candidate SHAs only; the api:
+// three candidate SHAs only: pushed_sha, the SUCCESSOR generation's acknowledged pushed head
+// (the head the completing generation pushed and landed, persisted by the worker before its
+// terminal report); source_sha, the PREDECESSOR generation's journaled source; and
+// adopted_sha, the tip the successor adopted. The api:
 //
 //  1. reads the run from its own row: it must be 'completed', at claim_generation ==
 //     successor_generation, held by the caller (runs.worker_id), on a branch that is a valid
@@ -98,12 +101,15 @@ func validateSettleRequest(req apitypes.RecoverySettleRequest) error {
 //     'ancestry' evidence and the SAME stored identity is an idempotent released; any other
 //     settled hold is retained/not_eligible. Otherwise it must be open.
 //  3. binds the candidates to the facts the server already holds, where they exist: when any
-//     recovery capture is registered under the hold, source_sha must equal one of those
-//     captures' source_sha; when the run is interlocked, pushed_sha must equal the head of the
-//     completion permit its completion consumed. A mismatch is retained/candidate_mismatch
-//     (an interlocked run with no consumed permit is retained/not_eligible). The worker process
-//     holds the custody, but these candidates must not be free choices where the server knows
-//     the answer.
+//     recovery capture registered under the hold was created BEFORE the successor generation
+//     claimed (its hold's created_at, else runs.claimed_at; a later capture is ignored
+//     entirely, so one reserved after completion cannot plant a source), source_sha must equal
+//     one of those captures' source_sha; when the run is interlocked, pushed_sha must equal
+//     the head of the completion permit its completion consumed. A mismatch is
+//     retained/candidate_mismatch (an interlocked run with no consumed permit, or one whose
+//     consumed permit head is not a 40-char lowercase hex commit id, is retained/not_eligible).
+//     The worker process holds the custody, but these candidates must not be free choices
+//     where the server knows the answer.
 //  4. proves: reads the branch head H ONCE from the forge (a 404 is retained/branch_missing),
 //     then asks the forge whether each distinct candidate is an ancestor of H. Any
 //     not_ancestor is retained/not_ancestor; otherwise any unknown or error is
@@ -171,7 +177,9 @@ func (s *Service) SettlePredecessorHold(ctx context.Context, wkr store.Worker, r
 	}
 
 	// 3. The server-held candidate binding.
-	sources, err := s.q.ListCaptureSourceShasForHold(ctx, holdID)
+	sources, err := s.q.ListCaptureSourceShasForHold(ctx, store.ListCaptureSourceShasForHoldParams{
+		HoldID: holdID, RunID: runID, SuccessorGeneration: req.SuccessorGeneration,
+	})
 	if err != nil {
 		return apitypes.RecoverySettleResponse{}, err
 	}
@@ -190,6 +198,11 @@ func (s *Service) SettlePredecessorHold(ctx context.Context, wkr store.Worker, r
 				return retained(apitypes.RecoverySettleNotEligible), nil
 			}
 			return apitypes.RecoverySettleResponse{}, err
+		}
+		if !isSettleSHA(permitHead) {
+			// Not a commit id this surface could ever match or stamp: there is no usable
+			// server fact to bind to, which is ineligibility, not a worker mismatch.
+			return retained(apitypes.RecoverySettleNotEligible), nil
 		}
 		if permitHead != req.PushedSha {
 			return retained(apitypes.RecoverySettleCandidateMismatch), nil

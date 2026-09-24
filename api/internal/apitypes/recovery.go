@@ -161,8 +161,10 @@ type RecoveryReleaseRequest struct {
 // RecoverySettleRequest is the worker's request that the api settle ONE older-generation
 // custody hold on a completed run by ANCESTRY (issue #1582 M1): the predecessor generation's
 // work was adopted by a same-worker successor that then completed. The worker supplies
-// CANDIDATE SHAs only — what the predecessor pushed, its source, and what the successor
-// adopted — and the api proves, through the forge compare API alone, that each is an
+// CANDIDATE SHAs only: PushedSha is the SUCCESSOR generation's acknowledged pushed head (the
+// head the completing generation pushed and landed, persisted by the worker before its terminal
+// report); SourceSha is the PREDECESSOR generation's journaled source; AdoptedSha is the tip the
+// successor adopted. The api proves, through the forge compare API alone, that each is an
 // ancestor of (or equal to) the completed branch head. There is deliberately NO field for the
 // worker's own ancestry verdict: the handler decodes strictly, so an extra field (for example
 // "ancestry":"ancestor") is a 400. Every SHA must be a 40-char lowercase hex commit id.
@@ -194,11 +196,13 @@ const (
 	// RecoverySettleNotEligible: the run/hold is not an older-generation hold of this worker
 	// on a run this worker completed at the named successor generation, the run's branch is
 	// not a valid git branch name, an interlocked run has no consumed completion permit to
-	// bind to, or the hold was already settled with a different identity.
+	// bind to (or that permit's head is not a 40-char lowercase hex commit id), or the hold
+	// was already settled with a different identity.
 	RecoverySettleNotEligible = "not_eligible"
 	// RecoverySettleCandidateMismatch: a candidate SHA contradicts a fact the server already
 	// holds for this hold or run (issue #1582 M1 rework): source_sha is not the source_sha of
-	// any recovery capture registered under the hold, or pushed_sha is not the head of the
+	// any recovery capture registered under the hold before the successor generation claimed
+	// (a later capture is ignored), or pushed_sha is not the head of the
 	// completion permit the run's (interlocked) completion consumed. Terminal: retrying the
 	// same candidates can never succeed.
 	RecoverySettleCandidateMismatch = "candidate_mismatch"

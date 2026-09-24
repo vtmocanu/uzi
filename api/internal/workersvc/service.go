@@ -546,9 +546,9 @@ type Store interface {
 	GetCustodyHoldForSettle(ctx context.Context, arg store.GetCustodyHoldForSettleParams) (store.RecoveryCustodyHold, error)
 	ReleasePredecessorCustodyHoldByAncestry(ctx context.Context, arg store.ReleasePredecessorCustodyHoldByAncestryParams) (int64, error)
 	// Issue #1582 M1 rework: the server-held facts the settle candidates must match — the
-	// source_sha of every capture under the hold, and the head of the completion permit an
-	// interlocked run's completion consumed.
-	ListCaptureSourceShasForHold(ctx context.Context, holdID uuid.UUID) ([]string, error)
+	// source_sha of every capture under the hold created before the successor generation
+	// claimed, and the head of the completion permit an interlocked run's completion consumed.
+	ListCaptureSourceShasForHold(ctx context.Context, arg store.ListCaptureSourceShasForHoldParams) ([]string, error)
 	GetSettleCompletionPermitHead(ctx context.Context, arg store.GetSettleCompletionPermitHeadParams) (string, error)
 	DiscardCaptureForOwner(ctx context.Context, arg store.DiscardCaptureForOwnerParams) (int64, error)
 	// ExpireReadyCaptures is the periodic ready-artifact retention sweep (PRD #1296 D4): it

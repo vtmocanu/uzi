@@ -520,12 +520,13 @@ type GetSettleCompletionPermitHeadParams struct {
 }
 
 // Issue #1582 M1 rework: the head of the completion permit an INTERLOCKED run's completion
-// consumed — the server-held fact the predecessor-settle request's pushed_sha must match.
-// completeRunWithPermit consumes exactly one permit for (run, the LOCKED row's
-// contract_revision, head) in the same transaction that writes 'completed', fenced to the
-// completing worker. InvalidatePriorCompletionPermits also stamps consumed_at, but only on
-// revisions BELOW the one a decision bumped to, so at the run's current revision every
-// consumed permit was consumed by a completion; the newest is the final completion's.
+// consumed — the server-held fact the predecessor-settle request's pushed_sha (the SUCCESSOR
+// generation's acknowledged pushed head) must match. completeRunWithPermit consumes one permit
+// for (run, the LOCKED row's contract_revision, head) in the same transaction that writes
+// 'completed', fenced to the completing worker. InvalidatePriorCompletionPermits also stamps
+// consumed_at, but only on revisions BELOW the one a decision bumped to, so a consumed permit
+// at the run's current revision was consumed by a completion. The ORDER BY/LIMIT only makes
+// the read deterministic; it does not assert that several such permits exist.
 // pgx.ErrNoRows when none exists (a non-interlocked run never has one).
 func (q *Queries) GetSettleCompletionPermitHead(ctx context.Context, arg GetSettleCompletionPermitHeadParams) (string, error) {
 	row := q.db.QueryRow(ctx, getSettleCompletionPermitHead, arg.RunID, arg.ContractRevision, arg.WorkerID)
@@ -596,17 +597,36 @@ func (q *Queries) ListCaptureChunks(ctx context.Context, captureID uuid.UUID) ([
 }
 
 const listCaptureSourceShasForHold = `-- name: ListCaptureSourceShasForHold :many
-SELECT DISTINCT source_sha FROM recovery_captures
-WHERE hold_id = $1
-ORDER BY source_sha
+SELECT DISTINCT c.source_sha FROM recovery_captures c
+WHERE c.hold_id = $1
+  AND c.created_at < COALESCE(
+      (SELECT min(s.created_at) FROM recovery_custody_holds s
+       WHERE s.run_id = $2 AND s.generation = $3::bigint),
+      (SELECT r.claimed_at FROM runs r WHERE r.id = $2),
+      'infinity'::timestamptz
+  )
+ORDER BY c.source_sha
 `
 
-// Issue #1582 M1 rework: the source_sha values of every recovery capture registered under ONE
+type ListCaptureSourceShasForHoldParams struct {
+	HoldID              uuid.UUID `json:"hold_id"`
+	RunID               uuid.UUID `json:"run_id"`
+	SuccessorGeneration int64     `json:"successor_generation"`
+}
+
+// Issue #1582 M1 rework: the source_sha values of the BINDING recovery captures under ONE
 // hold — the server-held facts the predecessor-settle request's source_sha must match (a
-// capture's source_sha is the predecessor's committed head H, recorded when the capture was
-// reserved). Empty when the hold never captured; the service then has nothing to bind to.
-func (q *Queries) ListCaptureSourceShasForHold(ctx context.Context, holdID uuid.UUID) ([]string, error) {
-	rows, err := q.db.Query(ctx, listCaptureSourceShasForHold, holdID)
+// capture's source_sha is the predecessor generation's committed head H, recorded when the
+// capture was reserved). A binding capture is one created strictly BEFORE the successor
+// generation's claim: that generation's hold's created_at on the same run (the earliest, should
+// there be several), else runs.claimed_at, else no cutoff (every capture binds). A capture
+// reserved after the successor claimed, for example after its completion, is ignored entirely,
+// so the worker cannot plant a source to bind to. Every capture state counts (a discarded or
+// expired capture still records the H the predecessor reserved it for). Empty when no binding
+// capture exists; the service then has nothing to bind to. The guarded
+// ReleasePredecessorCustodyHoldByAncestry re-asserts this exact set.
+func (q *Queries) ListCaptureSourceShasForHold(ctx context.Context, arg ListCaptureSourceShasForHoldParams) ([]string, error) {
+	rows, err := q.db.Query(ctx, listCaptureSourceShasForHold, arg.HoldID, arg.RunID, arg.SuccessorGeneration)
 	if err != nil {
 		return nil, err
 	}
@@ -1219,6 +1239,19 @@ func (q *Queries) ReleaseCustodyHoldExact(ctx context.Context, arg ReleaseCustod
 }
 
 const releasePredecessorCustodyHoldByAncestry = `-- name: ReleasePredecessorCustodyHoldByAncestry :execrows
+WITH cutoff AS (
+    -- The successor generation's claim instant: its hold's created_at (ClaimRun inserts the
+    -- hold in the same statement that bumps claim_generation), else, for a run whose successor
+    -- took no hold, runs.claimed_at (ClaimRun stamps it with that same bump; the run guard
+    -- below pins claim_generation to the successor, so it is that claim's instant). With
+    -- neither, 'infinity' binds every capture.
+    SELECT COALESCE(
+        (SELECT min(s.created_at) FROM recovery_custody_holds s
+         WHERE s.run_id = $8 AND s.generation = $5::bigint),
+        (SELECT r.claimed_at FROM runs r WHERE r.id = $8),
+        'infinity'::timestamptz
+    ) AS at
+)
 UPDATE recovery_custody_holds h
 SET state = 'released',
     live_worker_id = NULL,
@@ -1247,12 +1280,17 @@ WHERE h.id = $7
         AND r.branch = $6::text
         AND r.status_since = $11::timestamptz
   )
-  -- The server-held candidate binding (issue #1582 M1 rework), re-asserted here so a
-  -- capture registered under the hold DURING the proof is honoured too: when any capture
-  -- exists under this hold, one of them must carry the source_sha being stamped.
+  -- The server-held candidate binding (issue #1582 M1 rework), re-asserted here with the SAME
+  -- binding set as ListCaptureSourceShasForHold: when any BINDING capture exists under this
+  -- hold, one of them must carry the source_sha being stamped. A binding capture is one
+  -- created strictly before the successor generation's claim (the cutoff CTE); a capture
+  -- reserved after it, a completion included, is ignored entirely, so a late reservation with
+  -- a planted source can neither satisfy nor block the binding.
   AND (
-      NOT EXISTS (SELECT 1 FROM recovery_captures c WHERE c.hold_id = h.id)
-      OR EXISTS (SELECT 1 FROM recovery_captures c WHERE c.hold_id = h.id AND c.source_sha = $2::text)
+      NOT EXISTS (SELECT 1 FROM recovery_captures c, cutoff
+                  WHERE c.hold_id = h.id AND c.created_at < cutoff.at)
+      OR EXISTS (SELECT 1 FROM recovery_captures c, cutoff
+                 WHERE c.hold_id = h.id AND c.created_at < cutoff.at AND c.source_sha = $2::text)
   )
 `
 
@@ -1272,8 +1310,11 @@ type ReleasePredecessorCustodyHoldByAncestryParams struct {
 
 // Issue #1582 M1: release ONE older-generation hold on a COMPLETED run whose work the api has
 // PROVEN (via the forge compare API, never the worker's opinion) is contained in the completed
-// branch head. Every guard is re-asserted in this one statement so a change between the proof
-// and the write moves ZERO rows (the caller then re-reads and answers state_changed):
+// branch head. The audit columns record the candidates the proof covered: pushed_sha is the
+// SUCCESSOR generation's acknowledged pushed head (what the completing generation pushed and
+// landed), source_sha the PREDECESSOR generation's journaled source, adopted_sha the tip the
+// successor adopted. Every guard is re-asserted in this one statement so a change between the
+// proof and the write moves ZERO rows (the caller then re-reads and answers state_changed):
 //   - the hold: exact id + run + predecessor generation, taken by the caller worker, still open,
 //     and strictly older than the successor generation;
 //   - the run: still 'completed', still at the successor claim generation, still held by the

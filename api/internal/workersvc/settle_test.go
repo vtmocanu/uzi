@@ -2,6 +2,7 @@ package workersvc
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -48,7 +49,7 @@ func (s *settleUnitStore) GetCustodyHoldForSettle(context.Context, store.GetCust
 	return s.hold, nil
 }
 
-func (s *settleUnitStore) ListCaptureSourceShasForHold(context.Context, uuid.UUID) ([]string, error) {
+func (s *settleUnitStore) ListCaptureSourceShasForHold(context.Context, store.ListCaptureSourceShasForHoldParams) ([]string, error) {
 	return s.sources, nil
 }
 
@@ -277,6 +278,20 @@ func TestSettleBindsPushedToCompletionPermit(t *testing.T) {
 			t.Fatalf("%d forge calls, want 0", n)
 		}
 	})
+	// Issue #1582 M1 follow-up (N3): a consumed permit head that is not a 40-char lowercase hex
+	// commit id is no usable server fact, so the answer is not_eligible, never candidate_mismatch,
+	// even when the worker's pushed_sha would be compared against it verbatim.
+	for _, bad := range []string{"", "main", strings.ToUpper(uA), uA[:39], uA + "0", "gggggggggggggggggggggggggggggggggggggggg"} {
+		t.Run("malformed permit head "+strconv.Quote(bad), func(t *testing.T) {
+			u := newSettleUnit()
+			interlocked(u)
+			u.st.permitHead = bad
+			assertSettleRetained(t, u.settle(t, uA, uB, uC), apitypes.RecoverySettleNotEligible)
+			if n := u.fk.calls(); n != 0 || u.st.released != nil {
+				t.Fatalf("%d forge calls / release %v on a malformed permit head", n, u.st.released)
+			}
+		})
+	}
 	t.Run("non-interlocked ignores the permit table", func(t *testing.T) {
 		u := newSettleUnit()
 		u.st.permitHead = uHead // would mismatch if it were consulted

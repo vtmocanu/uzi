@@ -4,16 +4,20 @@
 -- same-worker resume adopted its work (the completed-generation backstop in
 -- ListReleasableCustodyHolds deliberately never qualifies an older generation). The api now
 -- releases that exact older hold ONLY on its OWN proof, taken through the forge compare API:
--- every candidate SHA the worker names (what the predecessor pushed, its source, what the
--- successor adopted) must be an ancestor of, or equal to, the completed branch's head. The
--- worker's ancestry opinion is never accepted. This migration is the schema half:
+-- every candidate SHA the worker names must be an ancestor of, or equal to, the completed
+-- branch's head: the SUCCESSOR generation's acknowledged pushed head (pushed_sha: the head the
+-- completing generation pushed and landed), the PREDECESSOR generation's journaled source
+-- (source_sha), and the tip the successor adopted (adopted_sha). The worker's ancestry opinion
+-- is never accepted. This migration is the schema half:
 --
 --   1. recovery_custody_holds_release_evidence_check widened with a SIXTH class, 'ancestry'
 --      (server-stamped only; the worker Release endpoint's allowlist stays
 --      publication/forge_no_output). Drop + re-add, the 00232 template: the CHECK validates
 --      against the existing rows on ADD, cheap for this small domain column.
 --   2. Six nullable AUDIT columns recording the exact evidence an 'ancestry' release rested on:
---      the three candidate SHAs, the branch head the api read (release_final_head_sha), the
+--      the three candidate SHAs (release_pushed_sha = the successor's pushed head,
+--      release_source_sha = the predecessor's journaled source, release_adopted_sha = the tip
+--      the successor adopted), the branch head the api read (release_final_head_sha), the
 --      successor generation that completed, and the completed branch. Each SHA is CHECKed to a
 --      40-char lowercase hex object id, the successor generation to be positive, and the branch
 --      is length-bounded.
