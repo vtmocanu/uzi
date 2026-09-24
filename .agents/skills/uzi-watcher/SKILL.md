@@ -385,7 +385,9 @@ and falling back to the durable bare tracking ref when no clone survives:
   `UZI_BACKUP_INTERVAL` (default 900s), **detached** so it outlives the session (`setsid`
   on Linux, a launchd LaunchAgent on macOS; this harness reaps `nohup` children).
   For a Downloads backup root, keep the launchd stdout/stderr log under `/tmp`;
-  launchd refused a log path in Downloads before starting the job. The loop
+  launchd refused a log path in Downloads before starting the job. Set the plist's
+  `WorkingDirectory` to the checkout (or `UZI_REPO_SLUG` in `EnvironmentVariables`);
+  otherwise the slug derivation fails and every cycle exits rc=2, capturing nothing. The loop
   self-terminates when every run is terminal, after `UZI_BACKUP_MAX_HOURS`
   (default 12), or on `touch $UZI_BACKUP_DIR/STOP`.
   It rides through `limit_wait` (keeps snapshotting while a run is parked), retires each

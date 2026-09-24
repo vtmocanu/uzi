@@ -8,6 +8,9 @@
 #   macOS:  use a launchd LaunchAgent. This agent harness reaps nohup children.
 #           Keep launchd stdout/stderr under /tmp even when UZI_BACKUP_DIR is
 #           Downloads; a Downloads log path failed before the job could start.
+#           Set WorkingDirectory to the repo checkout (or UZI_REPO_SLUG in
+#           EnvironmentVariables): outside a checkout the slug derivation from
+#           `origin` fails, so every cycle exits rc=2 and captures nothing.
 #
 # Stop it:  touch "$UZI_BACKUP_DIR/STOP"   (default /tmp/uzi-backups/STOP)
 #     or:   kill "$(cat "$UZI_BACKUP_DIR/backup-loop.pid")"
