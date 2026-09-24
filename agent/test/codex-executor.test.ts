@@ -49,7 +49,7 @@ import { PauseNowSignal } from "../src/steering.js";
 import type { Logger } from "../src/log.js";
 import type { AgentTemplate } from "../src/protocol.js";
 import type { BoundaryRequest } from "../src/harness.js";
-import type { CodexEffectLaunchSpec, CodexRootHandle, DisposeEvidence } from "../src/codex/launcher.js";
+import type { CodexEffectLaunchSpec, CodexRootHandle, DisposeEvidence, DisposeOutcome } from "../src/codex/launcher.js";
 import { CODEX_M3B_LOOPBACK_PROVIDER_NAME } from "../src/codex/config.js";
 import { MAX_LEAD_FINAL_MESSAGE_LEN, PLAN_MISSING_NUDGE, REASON_PLAN_MISSING } from "../src/plan-missing.js";
 
@@ -3017,6 +3017,50 @@ describe("CodexExecutor: retained command tmp is logged, never an unclean reap",
       const { handle } = tmpHandle(tmpCleanup);
       const spawnCommand = makeDefaultSpawnCommand(registry, async () => handle, 1000, "/data/runner/repo/run-4", {}, "required", rlog.log);
       await withTimeout(spawnCommand(["/bin/true"], { cwd: "/data/runner/repo/run-4" }), 5000, "removed command");
+      assert.deepEqual(warnings(rlog.lines), []);
+    }
+  });
+
+  function abnormalHandle(outcome: DisposeOutcome): CodexRootHandle {
+    const { handle } = tmpHandle(undefined);
+    return { ...handle, dispose: async () => outcome };
+  }
+
+  it("an unclean dispose carrying a drained abnormal's retained tmpCleanup logs one warn and stays unclean", async () => {
+    const rlog = recordingLog();
+    const root = registeredRoot(
+      abnormalHandle({ clean: false, reason: "supervisor abnormal: control EOF", tmpCleanup: { state: "retained", reason: "mismatch" } }),
+      "command",
+      rlog.log,
+    );
+    const reaped = await root.reap(100);
+    assert.equal(reaped.ok, false, "the abnormal still makes the reap unclean");
+    await assert.rejects(root.dispose(100), /disposal not clean/);
+    const warns = warnings(rlog.lines);
+    assert.equal(warns.length, 1, "logged once across reap and dispose");
+    assert.equal(warns[0]?.msg, "codex command tmp retained");
+    assert.equal(warns[0]?.reason, "mismatch");
+    assert.equal(warns[0]?.clean, false);
+  });
+
+  it("an unclean dispose whose drained dispose event retained the tmp logs it", async () => {
+    const rlog = recordingLog();
+    const event: DisposeEvidence = { event: "dispose", id: 1, state: "drained", authority: "ECHILD+__WALL", tmpCleanup: { state: "retained", reason: "io" } };
+    const root = registeredRoot(abnormalHandle({ clean: false, reason: "supervisor exited non-zero", event }), "command", rlog.log);
+    assert.equal((await root.reap(100)).ok, false);
+    const warns = warnings(rlog.lines);
+    assert.equal(warns.length, 1);
+    assert.equal(warns[0]?.reason, "io");
+  });
+
+  it("an unclean dispose with a removed or no tmpCleanup logs nothing", async () => {
+    for (const outcome of [
+      { clean: false, reason: "supervisor abnormal: control EOF", tmpCleanup: { state: "removed", reason: "" } },
+      { clean: false, reason: "supervisor abnormal: control EOF" },
+    ] as const) {
+      const rlog = recordingLog();
+      const root = registeredRoot(abnormalHandle(outcome), "command", rlog.log);
+      assert.equal((await root.reap(100)).ok, false);
       assert.deepEqual(warnings(rlog.lines), []);
     }
   });

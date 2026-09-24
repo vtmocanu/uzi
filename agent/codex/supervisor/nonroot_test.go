@@ -20,8 +20,11 @@ const commandUID = 10003
 
 // requireNonRootCommandUID guarantees the calling test body runs with a non-root
 // euid, because root bypasses the permission and ownership checks a command tmp
-// test exists to exercise, and would let it pass for the wrong reason. Copied
-// from internal/safetree/export_test.go.
+// test exists to exercise, and would let it pass for the wrong reason.
+//
+// This is a deliberate copy of the same helper in
+// internal/safetree/export_test.go: a _test.go helper cannot be imported from
+// another package, so each package that needs it keeps its own copy.
 //
 // It returns true when the caller should run its body in this process. As root it
 // instead re-execs this exact test as uid/gid 10003 (a copy of the test binary in

@@ -16,14 +16,22 @@ func main() {
 	os.Exit(realMain(os.Args[1:]))
 }
 
-// realMain is the whole flow: parse the trusted argv, establish + verify the
+// realMain is the whole flow: mark every inherited fd above 4 close-on-exec,
+// parse the trusted argv, establish + verify the
 // subreaper/nondumpable posture, verify the container profile BEFORE fork, create
 // and lock the command tmp when a cleanup token was given, launch the child with
 // fd3/fd4 closed at its execve, then run the control loop. Every
 // pre-fork failure emits a sanitized abnormal event on fd 4 and exits non-zero
 // WITHOUT forking.
 func realMain(args []string) int {
+	// Before anything is opened: no fd above the trusted 3/4 inherited from our
+	// own parent may reach the child through ForkExec.
+	strayErr := markStrayFdsCloexec(closeRangeCloexec, setCloexec)
 	ev := &evidence{w: os.NewFile(4, "evidence")}
+	if strayErr != nil {
+		_ = ev.writeJSON(abnormalEvidence("fd hygiene failed", nil))
+		return 2
+	}
 
 	expectUID, cleanupToken, dropControllerCaps, childArgv, err := parseArgs(args)
 	if err != nil {
@@ -71,27 +79,6 @@ func realMain(args []string) int {
 	if !ok {
 		return 2
 	}
-	tmpCleanup := tmpCleanupFor(tmp)
-	// The supervised child inherited stdio 0/1/2. Drop the supervisor's copies so
-	// EOF/backpressure describe the child tree rather than this long-lived control
-	// process; control/evidence remain isolated on fd3/fd4.
-	_ = unix.Close(0)
-	_ = unix.Close(1)
-	_ = unix.Close(2)
-	childReady, readyErr := watchChild(childPid)
-	if readyErr != nil {
-		deadline := time.Now().Add(time.Duration(defaultDisposeTimeoutMs) * time.Millisecond)
-		cleanup := drain(deadline, time.Now, func() { time.Sleep(2 * time.Millisecond) }, selfDirectChildren, realKill, realReap)
-		m := abnormalEvidence("child watch failed", &cleanup)
-		// The tmp is touched only after a confirmed drain: an unconfirmed one may
-		// leave a live descendant using it, so it stays for the startup reaper.
-		if cleanup.State == stateDrained && tmpCleanup != nil {
-			withTmpCleanup(m, tmpCleanup())
-		}
-		_ = ev.writeJSON(m)
-		return 2
-	}
-
 	sup := &supervisor{
 		ev:      ev,
 		control: &controlReader{r: os.NewFile(3, "control")},
@@ -100,16 +87,23 @@ func realMain(args []string) int {
 			directChildren: selfDirectChildren,
 			kill:           realKill,
 			reap:           realReap,
-			childReady:     childReady,
 			reapChild:      realReapChild,
 			snapshot:       func() ([]procRow, error) { return walkDescendants(os.Getpid()) },
 			now:            time.Now,
 			sleep:          func() { time.Sleep(2 * time.Millisecond) },
-			tmpCleanup:     tmpCleanup,
+			tmpCleanup:     tmpCleanupFor(tmp),
 		},
 	}
-	// The lock fd held in tmp stays open until process exit, after any cleanup.
-	return sup.run(childPid, st)
+	// The supervised child inherited stdio 0/1/2. Drop the supervisor's copies so
+	// EOF/backpressure describe the child tree rather than this long-lived control
+	// process; control/evidence remain isolated on fd3/fd4.
+	_ = unix.Close(0)
+	_ = unix.Close(1)
+	_ = unix.Close(2)
+	// A child-watch failure goes through sup.abnormal, which touches the tmp only
+	// after a confirmed drain. The lock fd held in tmp stays open until process
+	// exit, after any cleanup.
+	return sup.runWatched(childPid, st, watchChild)
 }
 
 // watchChild returns a one-shot readiness channel backed by a pidfd. Readiness
@@ -228,6 +222,44 @@ func validCleanupToken(token string) bool {
 		}
 	}
 	return true
+}
+
+// firstStrayFd is the lowest fd markStrayFdsCloexec touches: 0/1/2 are the
+// child's stdio and 3/4 the trusted control/evidence pair.
+const firstStrayFd = 5
+
+// fallbackFdLimit bounds the per-fd fallback loop when close_range is missing.
+const fallbackFdLimit = 1024
+
+// closeRangeCloexec sets close-on-exec on every fd from first upward in one
+// close_range(CLOSE_RANGE_CLOEXEC) call, without closing any.
+func closeRangeCloexec(first uint) error {
+	return unix.CloseRange(first, ^uint(0), unix.CLOSE_RANGE_CLOEXEC)
+}
+
+// setCloexec sets FD_CLOEXEC on one fd (the only fd flag).
+func setCloexec(fd int) error {
+	_, err := unix.FcntlInt(uintptr(fd), unix.F_SETFD, unix.FD_CLOEXEC)
+	return err
+}
+
+// markStrayFdsCloexec makes every fd from firstStrayFd upward close-on-exec,
+// so an fd the supervisor itself inherited without close-on-exec can never
+// reach the child. When close_range fails for any reason (ENOSYS or EINVAL on
+// a kernel without it or without CLOSE_RANGE_CLOEXEC, and EPERM where a
+// seccomp profile denies it, as measured in this repo's dev sandbox) it falls
+// back to set on each fd below fallbackFdLimit, skipping the unopened ones
+// (EBADF). Any other fallback error is returned.
+func markStrayFdsCloexec(closeRange func(first uint) error, set func(fd int) error) error {
+	if closeRange(firstStrayFd) == nil {
+		return nil
+	}
+	for fd := firstStrayFd; fd < fallbackFdLimit; fd++ {
+		if err := set(fd); err != nil && !errors.Is(err, unix.EBADF) {
+			return err
+		}
+	}
+	return nil
 }
 
 // establishSubreaper sets PR_SET_CHILD_SUBREAPER then CONFIRMS it via

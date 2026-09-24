@@ -223,3 +223,79 @@ func TestCleanupTmpRunsAtMostOnce(t *testing.T) {
 		t.Fatalf("cleanup calls = %d, want 1", rec.calls)
 	}
 }
+
+func failingWatch(int) (<-chan error, error) { return nil, syscall.EMFILE }
+
+// TestRunWatchedWatchFailureNotDrainedLeavesTmp: the child-watch failure path
+// goes through abnormal, so an unconfirmed drain never touches the tmp.
+func TestRunWatchedWatchFailureNotDrainedLeavesTmp(t *testing.T) {
+	sup, buf := newTestSupervisor("", scriptedReaper(reapPending))
+	rec := &cleanupRecorder{buf: buf, result: &tmpCleanupResult{State: tmpCleanupRemoved}}
+	sup.seams.tmpCleanup = rec.seam()
+
+	if code := sup.runWatched(9, procStatus{}, failingWatch); code != 2 {
+		t.Fatalf("code = %d, want 2", code)
+	}
+	if rec.calls != 0 {
+		t.Fatalf("cleanup ran %d times after an unconfirmed drain", rec.calls)
+	}
+	lines := decodeLines(t, buf)
+	if len(lines) != 1 || lines[0]["event"] != "abnormal" || lines[0]["reason"] != "child watch failed" {
+		t.Fatalf("evidence = %v", lines)
+	}
+	if c, _ := lines[0]["cleanup"].(map[string]any); c["state"] != stateUnconfirmed {
+		t.Fatalf("cleanup = %v, want unconfirmed", lines[0]["cleanup"])
+	}
+	if _, ok := tmpCleanupField(t, lines[0]); ok {
+		t.Fatal("watch-failure abnormal after an unconfirmed drain carries tmpCleanup")
+	}
+}
+
+// TestRunWatchedWatchFailureDrainedCleansTmpOnce: a drained watch-failure
+// abnormal removes the tmp and reports it; the at-most-once guard then keeps a
+// later abnormal from running it again.
+func TestRunWatchedWatchFailureDrainedCleansTmpOnce(t *testing.T) {
+	sup, buf := newTestSupervisor("", scriptedReaper(reapEmpty))
+	rec := &cleanupRecorder{buf: buf, result: &tmpCleanupResult{State: tmpCleanupRetained, Reason: "owner"}}
+	sup.seams.tmpCleanup = rec.seam()
+
+	if code := sup.runWatched(9, procStatus{}, failingWatch); code != 2 {
+		t.Fatalf("code = %d, want 2", code)
+	}
+	if rec.calls != 1 {
+		t.Fatalf("cleanup calls = %d, want 1", rec.calls)
+	}
+	lines := decodeLines(t, buf)
+	if len(lines) != 1 || lines[0]["event"] != "abnormal" || lines[0]["reason"] != "child watch failed" {
+		t.Fatalf("evidence = %v", lines)
+	}
+	tc, ok := tmpCleanupField(t, lines[0])
+	if !ok || tc["state"] != "retained" || tc["reason"] != "owner" {
+		t.Fatalf("tmpCleanup = %v, want retained/owner", tc)
+	}
+
+	sup.abnormal("control EOF")
+	if rec.calls != 1 {
+		t.Fatalf("cleanup calls = %d after a second abnormal, want 1", rec.calls)
+	}
+	if _, ok := tmpCleanupField(t, decodeLines(t, buf)[1]); ok {
+		t.Fatal("a second abnormal carries tmpCleanup")
+	}
+}
+
+// TestRunWatchedRunsTheLoopAfterAWatch: a successful watch of the child's pid
+// hands over to the control loop.
+func TestRunWatchedRunsTheLoopAfterAWatch(t *testing.T) {
+	sup, _ := newTestSupervisor(`{"op":"dispose","id":1}`+"\n", scriptedReaper(reapEmpty))
+	watched := 0
+	watch := func(pid int) (<-chan error, error) {
+		watched = pid
+		return make(chan error), nil
+	}
+	if code := sup.runWatched(9, procStatus{}, watch); code != 0 {
+		t.Fatalf("code = %d, want 0", code)
+	}
+	if watched != 9 {
+		t.Fatalf("watched pid %d, want 9", watched)
+	}
+}

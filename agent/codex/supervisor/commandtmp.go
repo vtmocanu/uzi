@@ -23,6 +23,13 @@ const (
 // directory Create pinned.
 var errTmpRecheck = errors.New("command tmp recheck mismatch")
 
+// Test seams for createCommandTmp. flock takes the liveness lock;
+// hookAfterLock runs after the lock is taken and before the name is rechecked.
+var (
+	flock         = unix.Flock
+	hookAfterLock func(parentFd int, name string)
+)
+
 // tmpCleanupResult is the tmpCleanup evidence field. Reason is safetree.Reason
 // of the removal error: "" when removed, a fixed short word otherwise.
 type tmpCleanupResult struct {
@@ -32,9 +39,10 @@ type tmpCleanupResult struct {
 
 // commandTmp is the supervisor-owned per-command scratch directory. The
 // supervisor creates it before fork, holds an exclusive flock on dirFd for its
-// whole lifetime (the liveness signal a startup reaper tests), and removes it
-// only after a confirmed drain. parentFd and dirFd are close-on-exec, so the
-// child never inherits either; neither is closed before process exit.
+// whole lifetime (the liveness signal the startup orphan reaper, --reap-orphans,
+// tests), and removes it only after a confirmed drain. parentFd and dirFd are
+// close-on-exec, so the child never inherits either; neither is closed before
+// process exit.
 type commandTmp struct {
 	parentFd int
 	name     string
@@ -61,7 +69,13 @@ func commandTmpName(token string) string {
 // openCommandTmp opens /tmp without following a symlink and creates, locks and
 // rechecks the token's directory under it. It is the production tmpSetup.
 func openCommandTmp(token string, uid int) (*commandTmp, error) {
-	parentFd, err := unix.Open(path.Dir(commandTmpPrefix), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	return openCommandTmpIn(path.Dir(commandTmpPrefix), token, uid)
+}
+
+// openCommandTmpIn is openCommandTmp under parentDir. The parent fd is
+// close-on-exec, so the child never inherits it.
+func openCommandTmpIn(parentDir, token string, uid int) (*commandTmp, error) {
+	parentFd, err := unix.Open(parentDir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -74,18 +88,22 @@ func openCommandTmp(token string, uid int) (*commandTmp, error) {
 }
 
 // createCommandTmp makes name under parentFd as a fresh 0700 directory owned by
-// uid, takes LOCK_EX|LOCK_NB on its fd, then re-verifies with an lstat that the
-// name still names the pinned dev/ino, which closes the window between the
-// mkdir and the lock. On failure it closes the directory fd (dropping the lock)
-// and leaves the directory for the startup reaper: nothing is removed here.
+// uid, takes LOCK_EX|LOCK_NB on its fd, then re-verifies with fstatat
+// (AT_SYMLINK_NOFOLLOW) that the name still names the pinned dev/ino, which
+// closes the window between the mkdir and the lock. On failure it closes the
+// directory fd (dropping the lock) and leaves the directory for the startup
+// orphan reaper (--reap-orphans): nothing is removed here.
 func createCommandTmp(parentFd int, name string, uid int) (*commandTmp, error) {
 	dirFd, pin, err := safetree.Create(parentFd, name, uid)
 	if err != nil {
 		return nil, err
 	}
-	if err := unix.Flock(dirFd, unix.LOCK_EX|unix.LOCK_NB); err != nil {
+	if err := flock(dirFd, unix.LOCK_EX|unix.LOCK_NB); err != nil {
 		_ = unix.Close(dirFd)
 		return nil, err
+	}
+	if hookAfterLock != nil {
+		hookAfterLock(parentFd, name)
 	}
 	var st unix.Stat_t
 	if err := unix.Fstatat(parentFd, name, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
@@ -106,7 +124,8 @@ type tmpSetup func(token string, uid int) (*commandTmp, error)
 // given) and then launches the child. Any setup failure emits the pre-fork
 // abnormal "command tmp setup failed" and returns ok == false WITHOUT calling
 // launch. A launch failure emits "child launch failed"; the tmp is then left
-// for the startup reaper, because cleanup runs only after a confirmed drain.
+// for the startup orphan reaper (--reap-orphans), because cleanup runs only
+// after a confirmed drain.
 func setupAndLaunch(ev *evidence, token string, uid int, setup tmpSetup, launch func([]string) (int, error), argv []string) (*commandTmp, int, bool) {
 	var ct *commandTmp
 	if token != "" {

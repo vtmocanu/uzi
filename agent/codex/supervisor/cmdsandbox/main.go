@@ -17,7 +17,8 @@
 // above this process: it holds the creation pin and outlives any backgrounded
 // descendant, so it alone can tell when removal is safe. This command has no
 // cleanup role. It only ADOPTS --tmp, refusing it unless it is a real directory
-// (not a symlink) owned by the calling uid with mode exactly 0700.
+// (not a symlink) owned by the calling uid with mode exactly 0700 and EMPTY, and
+// grants the Landlock tmp rule through the adopted fd, never by path again.
 //
 // "Unavailable" is defined by errno (D8): a version probe returning ENOSYS or
 // EOPNOTSUPP is unavailable; any other errno, an ABI below 1, and every later
@@ -140,10 +141,13 @@ func realMain(args []string) int {
 	if err != nil {
 		return setupFailure("invalid arguments", err)
 	}
-	if err := adoptPrivateTmp(tmp, os.Getuid(), unix.Open, unix.Fstat); err != nil {
+	tmpFd, err := adoptPrivateTmp(tmp, os.Getuid(), unix.Open, unix.Fstat)
+	if err != nil {
 		return setupFailure("adopt private tmp", err)
 	}
-	if err := applyPolicy(root, tmp, mode, realVersionProbe, confine, applyNoNewPrivs); err != nil {
+	// The adopted fd is close-on-exec, so the child never inherits it.
+	defer unix.Close(tmpFd)
+	if err := applyPolicy(root, tmpFd, mode, realVersionProbe, confine, applyNoNewPrivs); err != nil {
 		return setupFailure("apply Landlock policy", err)
 	}
 	if err := os.Chdir(cwd); err != nil {
@@ -170,16 +174,27 @@ func realMain(args []string) int {
 }
 
 // adoptPrivateTmp verifies the supervisor-created private tmp before any policy
-// is applied: an O_NOFOLLOW|O_DIRECTORY open (a symlink or a non-directory
-// fails there), then an fstat of that fd that must show a directory owned by uid
-// with permission bits exactly 0700. It never creates, chmods or removes. open
-// and fstat are seams so tests can inject a foreign owner.
-func adoptPrivateTmp(tmp string, uid int, open func(string, int, uint32) (int, error), fstat func(int, *unix.Stat_t) error) error {
+// is applied: an O_NOFOLLOW|O_DIRECTORY|O_CLOEXEC open (a symlink or a
+// non-directory fails there), then an fstat of that fd that must show a
+// directory owned by uid with permission bits exactly 0700, then a getdents of
+// that fd that must show nothing but "." and "..", so a tmp planted with, say, a
+// .gitconfig is refused (the freshness the old in-sandbox mkdir gave). It never
+// creates, chmods or removes. On success it returns the verified fd, still
+// open and close-on-exec, for the Landlock tmp rule; on failure it closes it.
+// open and fstat are seams so tests can inject a foreign owner.
+func adoptPrivateTmp(tmp string, uid int, open func(string, int, uint32) (int, error), fstat func(int, *unix.Stat_t) error) (int, error) {
 	fd, err := open(tmp, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return fmt.Errorf("open: %w", err)
+		return -1, fmt.Errorf("open: %w", err)
 	}
-	defer unix.Close(fd)
+	if err := verifyAdoptedTmp(fd, uid, fstat); err != nil {
+		_ = unix.Close(fd)
+		return -1, err
+	}
+	return fd, nil
+}
+
+func verifyAdoptedTmp(fd int, uid int, fstat func(int, *unix.Stat_t) error) error {
 	var st unix.Stat_t
 	if err := fstat(fd, &st); err != nil {
 		return fmt.Errorf("fstat: %w", err)
@@ -193,7 +208,26 @@ func adoptPrivateTmp(tmp string, uid int, open func(string, int, uint32) (int, e
 	if mode := st.Mode & 0o7777; mode != 0o700 {
 		return fmt.Errorf("mode %04o, want 0700", mode)
 	}
-	return nil
+	return requireEmptyDir(fd)
+}
+
+// requireEmptyDir reads fd's entries with getdents and fails on the first one
+// other than "." and ".." (ParseDirent skips those two). It stops at the first
+// non-empty batch, so a huge planted directory costs one read.
+func requireEmptyDir(fd int) error {
+	buf := make([]byte, 4096)
+	for {
+		n, err := unix.ReadDirent(fd, buf)
+		if err != nil {
+			return fmt.Errorf("getdents: %w", err)
+		}
+		if n <= 0 {
+			return nil
+		}
+		if _, count, _ := unix.ParseDirent(buf[:n], 1, nil); count > 0 {
+			return errors.New("not empty")
+		}
+	}
 }
 
 // parseArgs reads the trusted worker-built argv. Grammar:
@@ -310,7 +344,7 @@ func decidePolicy(probe versionProbe, mode sandboxMode) (action policyAction, ab
 // kernel. Production always passes the real confine/applyNoNewPrivs, so shipped
 // behaviour is byte-identical; confine() still calls the real applyNoNewPrivs
 // internally regardless of these seams.
-type confineFunc func(root, tmp string, abi int) error
+type confineFunc func(root string, tmpFd int, abi int) error
 
 type noNewPrivsFunc func() error
 
@@ -321,11 +355,11 @@ type noNewPrivsFunc func() error
 // error so realMain fails closed. The two enforcement primitives are injected
 // (confineFn/noNewPrivsFn) so the dispatch itself is unit-testable; realMain
 // passes the real confine/applyNoNewPrivs.
-func applyPolicy(root, tmp string, mode sandboxMode, probe versionProbe, confineFn confineFunc, noNewPrivsFn noNewPrivsFunc) error {
+func applyPolicy(root string, tmpFd int, mode sandboxMode, probe versionProbe, confineFn confineFunc, noNewPrivsFn noNewPrivsFunc) error {
 	action, abi, err := decidePolicy(probe, mode)
 	switch action {
 	case actionApply:
-		return confineFn(root, tmp, abi)
+		return confineFn(root, tmpFd, abi)
 	case actionUnconfined:
 		// Degraded best-effort: no worktree confinement, but the uid split and
 		// no_new_privs still hold (the private 0700 tmp and cwd-inside-root check
@@ -347,8 +381,10 @@ func applyNoNewPrivs() error {
 // the access rights this kernel understands (from the version probe). EVERY
 // failure here (real create, add-rule, restrict_self, deny-probe) is an ERROR
 // that fails closed in BOTH modes; the caller only reaches confine when the probe
-// classified the kernel as available.
-func confine(root, tmp string, abi int) error {
+// classified the kernel as available. The tmp rule is granted through tmpFd,
+// the fd adoptPrivateTmp verified, so a rename or symlink swap of the --tmp
+// path after adoption cannot redirect it.
+func confine(root string, tmpFd int, abi int) error {
 	handled := baseRights
 	if abi >= 2 {
 		handled |= unix.LANDLOCK_ACCESS_FS_REFER
@@ -380,7 +416,7 @@ func confine(root, tmp string, abi int) error {
 	if err := addPathRule(int(fd), root, handled); err != nil {
 		return err
 	}
-	if err := addPathRule(int(fd), tmp, handled); err != nil {
+	if err := addFdRule(int(fd), tmpFd, handled); err != nil {
 		return err
 	}
 	if err := requireProbeReadable(landlockDenyProbe, os.Open); err != nil {
@@ -430,12 +466,19 @@ func requireProbeDenied(path string, open probeOpen) error {
 	return nil
 }
 
+// addPathRule opens path (O_PATH) and grants access beneath it.
 func addPathRule(ruleset int, path string, access uint64) error {
 	fd, err := unix.Open(path, unix.O_PATH|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return &os.PathError{Op: "open", Path: path, Err: err}
 	}
 	defer unix.Close(fd)
+	return addFdRule(ruleset, fd, access)
+}
+
+// addFdRule grants access beneath the file fd already refers to. It never
+// resolves a path, so the rule lands on exactly the inode the caller verified.
+func addFdRule(ruleset int, fd int, access uint64) error {
 	attr := unix.LandlockPathBeneathAttr{Allowed_access: access, Parent_fd: int32(fd)}
 	_, _, errno := syscall.Syscall6(
 		unix.SYS_LANDLOCK_ADD_RULE,

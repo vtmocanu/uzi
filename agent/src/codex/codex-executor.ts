@@ -2629,17 +2629,20 @@ interface RegisteredEffectRoot {
   readonly root: RegisteredRoot;
 }
 
-/** Warn once when a clean disposal reports that the supervisor RETAINED the command's
- *  private tmp. Diagnostic only: a retained tmp is disk left behind for the startup
- *  reaper, never an unclean reap, so the reap/dispose result is unchanged. */
+/** Warn once when a disposal reports that the supervisor RETAINED the command's
+ *  private tmp: on a clean disposal (the drained dispose's tmpCleanup) and on an
+ *  unclean one (the tmpCleanup of an abnormal event whose cleanup drained, or of a
+ *  drained dispose the exit then contradicted). Diagnostic only: a retained tmp is
+ *  disk left behind for the startup orphan reaper (--reap-orphans), so the
+ *  reap/dispose result is unchanged. */
 function makeTmpRetainedReporter(log: Pick<Logger, "warn"> | undefined): (outcome: DisposeOutcome) => void {
   let reported = false;
   return (outcome) => {
-    if (!log || reported || !outcome.clean) return;
-    const tmp = outcome.event.tmpCleanup;
+    if (!log || reported) return;
+    const tmp = outcome.clean ? outcome.event.tmpCleanup : (outcome.tmpCleanup ?? outcome.event?.tmpCleanup);
     if (tmp?.state !== "retained") return;
     reported = true;
-    log.warn("codex command tmp retained", { reason: tmp.reason });
+    log.warn("codex command tmp retained", { reason: tmp.reason, clean: outcome.clean });
   };
 }
 

@@ -59,6 +59,12 @@
 // The cap-drop flag is used only for worker-uid durability roots: it clears the
 // entrypoint's controller-only SETUID/SETGID before the unchanged zero-cap check.
 //
+// DESCRIPTORS: before opening anything, the supervisor marks every fd from 5
+// upward close-on-exec (close_range, or a per-fd fallback below 1024 when
+// close_range fails), so the child inherits only stdio 0/1/2 even when the
+// supervisor itself inherited a stray fd; a failure is the pre-fork abnormal
+// "fd hygiene failed".
+//
 // EXIT CODE: 0 iff a dispose reached state "drained"; non-zero on abnormal,
 // unconfirmed or profile-fail.
 //

@@ -16,7 +16,8 @@
 // launcher side to match; we invent no fields):
 //   control  → fd3 (we WRITE): {"op":"snapshot","id"} / {"op":"dispose","id","timeoutMs"}
 //   evidence ← fd4 (we READ):  started / snapshot / dispose(drained|unconfirmed) / abnormal
-//            (dispose/abnormal may carry an optional, strictly validated tmpCleanup)
+//            (a drained dispose, or an abnormal whose cleanup drained, may carry an
+//             optional, strictly validated tmpCleanup; on any other event it is a breach)
 //   argv: <supervisor> --expect-uid <N> [--cleanup-token <uuid>] -- <child> <argv...>
 //   stdio: [pipe0, pipe1, pipe2, pipe3=control, pipe4=evidence]; 0/1/2 are the
 //          app-server TRANSPORT the child inherits — exposed on the handle so a
@@ -233,8 +234,8 @@ export interface DisposeEvidence {
   readonly children?: readonly number[];
   /** Present only for a root launched with a cleanup token: the outcome of the
    *  supervisor removing `/tmp/uzi-codex-command-<token>` after a confirmed drain.
-   *  `reason` is "" when removed, otherwise a short fixed word (e.g. "absent",
-   *  "mismatch"). A retained tmp does not make the disposal unclean. */
+   *  `reason` is "" when removed, otherwise one of the fixed words mismatch, owner,
+   *  bound, io, absent or name. A retained tmp does not make the disposal unclean. */
   readonly tmpCleanup?: TmpCleanupEvidence;
 }
 
@@ -243,25 +244,50 @@ export interface TmpCleanupEvidence {
   readonly reason: string;
 }
 
-/** Strict shape check for the optional `tmpCleanup` evidence field: an object
- *  with exactly a `state` of "removed"/"retained" and a `reason` of at most 32
- *  lowercase ASCII letters. Anything else is a protocol breach. */
+/** The fixed reasons the supervisor reports for a RETAINED tmp (Go
+ *  `safetree.Reason`). A removed tmp always reports "". */
+const TMP_RETAINED_REASONS: ReadonlySet<string> = new Set(["mismatch", "owner", "bound", "io", "absent", "name"]);
+
+/** Strict meaning check for the optional `tmpCleanup` evidence field: an object
+ *  with exactly `state` and `reason`, where `removed` pairs only with reason ""
+ *  and `retained` only with one of the fixed retained reasons. Anything else is a
+ *  protocol breach. */
 function isValidTmpCleanup(value: unknown): value is TmpCleanupEvidence {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const record = value as Record<string, unknown>;
   const keys = Object.keys(record);
   if (keys.length !== 2 || !keys.includes("state") || !keys.includes("reason")) return false;
-  return (record.state === "removed" || record.state === "retained")
-    && typeof record.reason === "string"
-    && record.reason.length <= 32
-    && /^[a-z]*$/.test(record.reason);
+  if (record.state === "removed") return record.reason === "";
+  if (record.state === "retained") return typeof record.reason === "string" && TMP_RETAINED_REASONS.has(record.reason);
+  return false;
+}
+
+/** Whether `tmpCleanup` may appear on this evidence record at all. The
+ *  supervisor removes the tmp only after a confirmed drain, so the field is
+ *  legal ONLY on a dispose whose `state` is "drained" and on an abnormal event
+ *  whose `cleanup.state` is "drained"; on any other event it is a breach. */
+function tmpCleanupAllowed(record: Record<string, unknown>): boolean {
+  if (record.event === "dispose") return record.state === "drained";
+  if (record.event === "abnormal") {
+    const cleanup = record.cleanup;
+    return typeof cleanup === "object" && cleanup !== null && !Array.isArray(cleanup)
+      && (cleanup as Record<string, unknown>).state === "drained";
+  }
+  return false;
 }
 
 /** The result of a disposal attempt for exactly THIS owned root. `clean` is true ONLY
  *  when the supervisor reported `state:"drained"` AND exited 0. Never a run-level fact. */
 export type DisposeOutcome =
   | { readonly clean: true; readonly event: DisposeEvidence }
-  | { readonly clean: false; readonly reason: string; readonly event?: DisposeEvidence };
+  | {
+    readonly clean: false;
+    readonly reason: string;
+    readonly event?: DisposeEvidence;
+    /** The validated `tmpCleanup` an `abnormal` event carried (its best-effort
+     *  drain was confirmed), surfaced so a retained tmp is still reported. */
+    readonly tmpCleanup?: TmpCleanupEvidence;
+  };
 
 export interface CodexRootHandle {
   /** The `started` evidence (present once `launchCodexRoot` resolves). */
@@ -721,6 +747,7 @@ async function createHandle(
   let disposeInFlight = false;
   let cleanDisposed = false;
   let lastDrained: DisposeEvidence | undefined;
+  let abnormalTmpCleanup: TmpCleanupEvidence | undefined;
   let lineCount = 0;
 
   let resolveStarted!: (e: StartedEvidence) => void;
@@ -772,6 +799,10 @@ async function createHandle(
   function dispatch(value: unknown): void {
     if (typeof value !== "object" || value === null) { fail(new Error("evidence line is not a JSON object")); return; }
     const record = value as Record<string, unknown>;
+    if ("tmpCleanup" in record && (!tmpCleanupAllowed(record) || !isValidTmpCleanup(record.tmpCleanup))) {
+      fail(new Error("malformed tmpCleanup evidence"));
+      return;
+    }
     switch (record.event) {
       case "started": {
         const ev = record as unknown as StartedEvidence;
@@ -797,10 +828,6 @@ async function createHandle(
       }
       case "snapshot":
       case "dispose": {
-        if (record.event === "dispose" && "tmpCleanup" in record && !isValidTmpCleanup(record.tmpCleanup)) {
-          fail(new Error("malformed tmpCleanup evidence"));
-          return;
-        }
         const id = record.id;
         const waiter = typeof id === "number" ? pending.get(id) : undefined;
         if (waiter && typeof id === "number") { pending.delete(id); waiter.resolve(record as unknown as SnapshotEvidence | DisposeEvidence); }
@@ -821,10 +848,8 @@ async function createHandle(
         return;
       }
       case "abnormal": {
-        if ("tmpCleanup" in record && !isValidTmpCleanup(record.tmpCleanup)) {
-          fail(new Error("malformed tmpCleanup evidence"));
-          return;
-        }
+        // Validated above: record it so the unclean dispose outcome still reports it.
+        if ("tmpCleanup" in record) abnormalTmpCleanup = record.tmpCleanup as TmpCleanupEvidence;
         fail(new Error(`supervisor abnormal: ${String(record.reason ?? "unknown")}`));
         return;
       }
@@ -880,7 +905,15 @@ async function createHandle(
     return withDeadline(childExitPromise, timeoutMs, "supervised child exit");
   }
 
-  async function dispose(timeoutMs = 2000): Promise<DisposeOutcome> {
+  /** Every unclean outcome carries the tmpCleanup an abnormal event reported, however
+   *  the disposal came to be unclean (the abnormal may land before or during it). */
+  async function dispose(timeoutMs?: number): Promise<DisposeOutcome> {
+    const outcome = await disposeOnce(timeoutMs);
+    if (outcome.clean || !abnormalTmpCleanup) return outcome;
+    return { ...outcome, tmpCleanup: abnormalTmpCleanup };
+  }
+
+  async function disposeOnce(timeoutMs = 2000): Promise<DisposeOutcome> {
     if (cleanDisposed && lastDrained) return { clean: true, event: lastDrained };
     if (failure) return { clean: false, reason: failure.message };
     if (exited) return { clean: false, reason: `supervisor already exited (code=${String(exitInfo?.code)})` };

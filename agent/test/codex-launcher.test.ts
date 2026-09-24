@@ -632,6 +632,93 @@ describe("createHandle: strict tmpCleanup evidence", () => {
   });
 });
 
+describe("createHandle: tmpCleanup must carry meaning, not just shape", () => {
+  /** whenFailed, bounded: an accepted record never fails the root, and must redden the test rather than hang it. */
+  const failedWithin = (handle: { whenFailed: Promise<Error> }, ms = 1000): Promise<Error> =>
+    Promise.race([handle.whenFailed, new Promise<Error>((resolve) => setTimeout(() => resolve(new Error("root did not fail")), ms).unref())]);
+
+  for (const reason of ["mismatch", "owner", "bound", "io", "absent", "name"]) {
+    it(`accepts a retained tmpCleanup with the fixed reason "${reason}"`, async () => {
+      const fake = newFake({ disposeTmpCleanup: { state: "retained", reason } });
+      const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+      const outcome = await handle.dispose(500);
+      assert.equal(outcome.clean, true);
+      assert.deepEqual(outcome.clean ? outcome.event.tmpCleanup : undefined, { state: "retained", reason });
+    });
+  }
+
+  const meaningless: ReadonlyArray<[string, unknown]> = [
+    ["a removed state with a non-empty reason", { state: "removed", reason: "absent" }],
+    ["a retained state with an empty reason", { state: "retained", reason: "" }],
+    ["a retained state with an unknown lowercase word", { state: "retained", reason: "gone" }],
+    ["a retained state with a reason that only prefixes a fixed word", { state: "retained", reason: "iox" }],
+  ];
+  for (const [label, value] of meaningless) {
+    it(`fails closed on a drained dispose tmpCleanup with ${label}`, async () => {
+      const fake = newFake({ disposeTmpCleanup: value });
+      const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+      const outcome = await handle.dispose(500);
+      assert.equal(outcome.clean, false);
+      assert.match(String(handle.failed?.message), /malformed tmpCleanup evidence/);
+    });
+  }
+
+  const valid = { state: "removed", reason: "" };
+  const misplaced: ReadonlyArray<[string, Record<string, unknown>]> = [
+    ["an unconfirmed dispose", { event: "dispose", id: 99, state: "unconfirmed", reason: "deadline", killed: [], reaped: [], children: [], tmpCleanup: valid }],
+    ["a dispose with no state", { event: "dispose", id: 99, tmpCleanup: valid }],
+    ["a snapshot", { event: "snapshot", id: 99, processes: [], tmpCleanup: valid }],
+    ["a child_exit", { event: "child_exit", code: 0, tmpCleanup: valid }],
+    ["an abnormal whose cleanup is unconfirmed", { event: "abnormal", reason: "control EOF", cleanup: { state: "unconfirmed" }, tmpCleanup: valid }],
+    ["a pre-fork abnormal with no cleanup", { event: "abnormal", reason: "command tmp setup failed", tmpCleanup: valid }],
+    ["an abnormal whose cleanup is not an object", { event: "abnormal", reason: "control EOF", cleanup: "drained", tmpCleanup: valid }],
+    ["an unknown event", { event: "later", tmpCleanup: valid }],
+  ];
+  for (const [label, record] of misplaced) {
+    it(`fails closed on a valid tmpCleanup on ${label}`, async () => {
+      const fake = newFake();
+      const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+      fake.writeEvidence(record);
+      const failure = await failedWithin(handle);
+      assert.match(failure.message, /malformed tmpCleanup evidence/);
+      const outcome = await handle.dispose(500);
+      assert.equal(outcome.clean, false);
+      assert.equal(outcome.clean ? undefined : outcome.tmpCleanup, undefined, "a rejected tmpCleanup is never surfaced");
+    });
+  }
+
+  it("a started event carrying tmpCleanup rejects the launch", async () => {
+    const fake = newFake({ autoStarted: false });
+    const launched = launchCodexRoot(baseSpec(), baseDeps(fake));
+    fake.writeEvidence({
+      event: "started", supervisorPid: fake.pid, childPid: fake.pid + 1, subreaper: true, nondumpable: true, uid: RUNNER_UID,
+      liveCapsZero: true, capBoundingSet: "0xc0", noNewPrivs: true, tmpCleanup: valid,
+    });
+    await assert.rejects(launched, /malformed tmpCleanup evidence/);
+  });
+
+  it("surfaces a drained abnormal's retained tmpCleanup on the unclean dispose outcome", async () => {
+    const fake = newFake();
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    fake.writeEvidence({ event: "abnormal", reason: "control EOF", cleanup: { state: "drained", authority: "ECHILD+__WALL", killed: [], reaped: [] }, tmpCleanup: { state: "retained", reason: "owner" } });
+    const failure = await failedWithin(handle);
+    assert.match(failure.message, /supervisor abnormal: control EOF/);
+    const outcome = await handle.dispose(500);
+    assert.equal(outcome.clean, false);
+    assert.deepEqual(outcome.clean ? undefined : outcome.tmpCleanup, { state: "retained", reason: "owner" });
+  });
+
+  it("an abnormal without tmpCleanup leaves the unclean outcome without one", async () => {
+    const fake = newFake();
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    fake.emitAbnormal("control EOF");
+    await failedWithin(handle);
+    const outcome = await handle.dispose(500);
+    assert.equal(outcome.clean, false);
+    assert.equal(outcome.clean ? undefined : outcome.tmpCleanup, undefined);
+  });
+});
+
 describe("launchCodexRoot: abnormal paths never claim clean disposal", () => {
   it("treats a provider primary-child exit as a root failure", async () => {
     const fake = newFake();

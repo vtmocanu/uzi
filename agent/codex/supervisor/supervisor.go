@@ -39,6 +39,18 @@ func (s *supervisor) drainWith(timeoutMs int) drainResult {
 	return drain(deadline, s.seams.now, s.seams.sleep, s.seams.directChildren, s.seams.kill, s.seams.reap)
 }
 
+// runWatched watches the primary child through watch and then runs the control
+// loop. A watch failure ends the run through abnormal, the one path that
+// gates the command tmp cleanup on a drained drain and runs it at most once.
+func (s *supervisor) runWatched(childPid int, st procStatus, watch func(pid int) (<-chan error, error)) int {
+	ready, err := watch(childPid)
+	if err != nil {
+		return s.abnormal("child watch failed")
+	}
+	s.seams.childReady = ready
+	return s.run(childPid, st)
+}
+
 // run emits the started evidence, then services control frames until a dispose
 // reaches drained (exit 0) or an abnormal condition ends the run (non-zero).
 // There is NO fixed lifetime: the loop lives on the control channel, bounded
@@ -133,7 +145,7 @@ func (s *supervisor) run(childPid int, st procStatus) int {
 //
 // The command tmp is removed only when that drain reached drained. An
 // unconfirmed drain may leave a live descendant still using the tmp, so it is
-// left untouched for the startup reaper.
+// left untouched for the startup orphan reaper (--reap-orphans).
 func (s *supervisor) abnormal(reason string) int {
 	cleanup := s.drainWith(defaultDisposeTimeoutMs)
 	m := abnormalEvidence(reason, &cleanup)

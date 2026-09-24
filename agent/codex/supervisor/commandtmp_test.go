@@ -265,3 +265,175 @@ func TestSetupAndLaunchLaunchFailureLeavesTmp(t *testing.T) {
 		t.Fatalf("evidence = %v", lines)
 	}
 }
+
+// setAfterLockHook installs hookAfterLock for one test.
+func setAfterLockHook(t *testing.T, h func(parentFd int, name string)) {
+	t.Helper()
+	hookAfterLock = h
+	t.Cleanup(func() { hookAfterLock = nil })
+}
+
+// setFlock replaces the flock seam for one test.
+func setFlock(t *testing.T, f func(fd int, how int) error) {
+	t.Helper()
+	flock = f
+	t.Cleanup(func() { flock = unix.Flock })
+}
+
+// setupVia is a tmpSetup that creates the token's tmp under parentFd instead of /tmp.
+func setupVia(parentFd int) tmpSetup {
+	return func(token string, uid int) (*commandTmp, error) {
+		return createCommandTmp(parentFd, commandTmpName(token), uid)
+	}
+}
+
+// requireSetupRefused runs setupAndLaunch with setup and asserts the pre-fork
+// "command tmp setup failed" abnormal and no launch.
+func requireSetupRefused(t *testing.T, setup tmpSetup) {
+	t.Helper()
+	var buf bytes.Buffer
+	launched := false
+	launch := func([]string) (int, error) { launched = true; return 42, nil }
+	ct, _, ok := setupAndLaunch(&evidence{w: &buf}, testToken, os.Geteuid(), setup, launch, []string{"/bin/true"})
+	if ok || ct != nil {
+		t.Fatalf("setupAndLaunch = %v/%v, want a setup failure", ct, ok)
+	}
+	if launched {
+		t.Fatal("launched a child after a command tmp setup failure")
+	}
+	lines := decodeLines(t, &buf)
+	if len(lines) != 1 || lines[0]["reason"] != "command tmp setup failed" {
+		t.Fatalf("evidence = %v", lines)
+	}
+}
+
+// TestCreateCommandTmpRecheckRefusesNameSwappedAfterLock swaps the name to
+// another directory between the lock and the recheck: the recheck must refuse
+// it with errTmpRecheck, drop the lock, and the launch must never happen.
+func TestCreateCommandTmpRecheckRefusesNameSwappedAfterLock(t *testing.T) {
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	parent := t.TempDir()
+	parentFd := openParent(t, parent)
+	name := commandTmpName(testToken)
+	full := filepath.Join(parent, name)
+	swaps := 0
+	movedTo := func(n int) string { return fmt.Sprintf("%s.pinned%d", full, n) }
+	setAfterLockHook(t, func(pfd int, n string) {
+		swaps++
+		if pfd != parentFd || n != name {
+			t.Errorf("hook got %d/%q", pfd, n)
+		}
+		if err := os.Rename(full, movedTo(swaps)); err != nil {
+			t.Fatalf("rename: %v", err)
+		}
+		if err := os.Mkdir(full, 0o700); err != nil {
+			t.Fatalf("mkdir substitute: %v", err)
+		}
+	})
+
+	if ct, err := createCommandTmp(parentFd, name, os.Geteuid()); !errors.Is(err, errTmpRecheck) {
+		t.Fatalf("createCommandTmp = %+v/%v, want errTmpRecheck", ct, err)
+	}
+	moved := movedTo(1)
+	// The pinned dir's lock was dropped: a fresh fd can take it.
+	fd, err := unix.Open(moved, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = unix.Close(fd) }()
+	if err := unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		t.Fatalf("lock still held after a recheck failure: %v", err)
+	}
+	// Nothing was removed: both dirs stay for the orphan reaper.
+	for _, p := range []string{full, moved} {
+		if _, err := os.Lstat(p); err != nil {
+			t.Fatalf("%s: %v", p, err)
+		}
+	}
+
+	// Through setupAndLaunch: the same swap fails setup and never launches.
+	if err := os.Remove(full); err != nil {
+		t.Fatal(err)
+	}
+	requireSetupRefused(t, setupVia(parentFd))
+	if swaps != 2 {
+		t.Fatalf("hook ran %d times, want 2", swaps)
+	}
+}
+
+// TestCreateCommandTmpLockHeldElsewhereFailsSetup: another holder already has
+// the lock, so LOCK_NB gets EWOULDBLOCK; setup fails, the directory fd is
+// closed, and nothing is launched.
+func TestCreateCommandTmpLockHeldElsewhereFailsSetup(t *testing.T) {
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	parent := t.TempDir()
+	parentFd := openParent(t, parent)
+	name := commandTmpName(testToken)
+	var lockedFd int
+	var holders []int
+	t.Cleanup(func() {
+		for _, h := range holders {
+			_ = unix.Close(h)
+		}
+	})
+	setFlock(t, func(fd int, how int) error {
+		// Another holder takes the lock on the same directory first.
+		h, err := unix.Open(filepath.Join(parent, name), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+		if err != nil {
+			t.Fatalf("open holder: %v", err)
+		}
+		holders = append(holders, h)
+		if err := unix.Flock(h, unix.LOCK_EX|unix.LOCK_NB); err != nil {
+			t.Fatalf("holder lock: %v", err)
+		}
+		lockedFd = fd
+		return unix.Flock(fd, how)
+	})
+
+	ct, err := createCommandTmp(parentFd, name, os.Geteuid())
+	if !errors.Is(err, unix.EWOULDBLOCK) {
+		t.Fatalf("createCommandTmp = %+v/%v, want EWOULDBLOCK", ct, err)
+	}
+	if _, err := unix.FcntlInt(uintptr(lockedFd), unix.F_GETFD, 0); !errors.Is(err, unix.EBADF) {
+		t.Fatalf("directory fd still open after a lock failure: %v", err)
+	}
+
+	for _, h := range holders {
+		_ = unix.Close(h)
+	}
+	holders = nil
+	if err := os.Remove(filepath.Join(parent, name)); err != nil {
+		t.Fatal(err)
+	}
+	requireSetupRefused(t, setupVia(parentFd))
+}
+
+// TestOpenCommandTmpFdsAreCloseOnExec pins O_CLOEXEC on the /tmp parent fd
+// (and the lock fd), so the child never inherits either.
+func TestOpenCommandTmpFdsAreCloseOnExec(t *testing.T) {
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	parent := t.TempDir()
+	ct, err := openCommandTmpIn(parent, testToken, os.Geteuid())
+	if err != nil {
+		t.Fatalf("openCommandTmpIn: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = unix.Close(ct.dirFd)
+		_ = unix.Close(ct.parentFd)
+	})
+	for label, fd := range map[string]int{"parent": ct.parentFd, "lock": ct.dirFd} {
+		flags, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0)
+		if err != nil || flags&unix.FD_CLOEXEC == 0 {
+			t.Fatalf("%s fd is not close-on-exec (flags=%d err=%v)", label, flags, err)
+		}
+	}
+	if got := ct.cleanup(); got.State != tmpCleanupRemoved {
+		t.Fatalf("cleanup = %+v", got)
+	}
+}
