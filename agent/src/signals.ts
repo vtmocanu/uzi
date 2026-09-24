@@ -495,10 +495,10 @@ function clamp(s: string, n: number): string {
  * questions and must never throw. A call whose questions all fail to parse yields an
  * empty array, which the executor treats as "no park" rather than as an empty park.
  */
-function parseQuestions(raw: unknown): AskUserQuestion[] {
+function parseQuestions(raw: unknown, limit = MAX_QUESTIONS): AskUserQuestion[] {
   if (!Array.isArray(raw)) return [];
   const out: AskUserQuestion[] = [];
-  for (const item of raw.slice(0, MAX_QUESTIONS)) {
+  for (const item of raw.slice(0, limit)) {
     const q = asRecord(item);
     if (!q) continue;
     const question =
@@ -768,9 +768,11 @@ export function scanSignals(message: unknown): ScannedSignals {
       // and a prompt-injected subagent reaching ask_user would post
       // attacker-chosen text into the owner's Slack DM under uzi's bot identity. That
       // is a phishing primitive, not merely a spurious park.
-      const parsed = parseQuestions(asRecord(block["input"])?.["questions"]);
-      if (parsed.length > 0)
-        out.questions = [...(out.questions ?? []), ...parsed];
+      const remaining = MAX_QUESTIONS - (out.questions?.length ?? 0);
+      if (remaining > 0) {
+        const parsed = parseQuestions(asRecord(block["input"])?.["questions"], remaining);
+        if (parsed.length > 0) out.questions = [...(out.questions ?? []), ...parsed];
+      }
     } else if (name === REPORT_PROGRESS_QUALIFIED) {
       // PRD #122 M2. Extracted HERE, inside the content loop that isSubagentFrame already
       // guards, for the SAME reason milestones is nested inside submit_plan's branch: a

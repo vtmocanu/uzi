@@ -42,6 +42,34 @@ describe("scanSignals", () => {
     assert.deepStrictEqual(scanSignals(toolUse("mcp__uzi__signal_done", {})), { done: true });
   });
 
+  it("keeps the first ten questions across ask_user blocks in one message", () => {
+    const content: unknown[] = Array.from({ length: 25 }, (_, i) => ({
+      type: "tool_use", name: "mcp__uzi__ask_user",
+      input: { questions: [{ question: `Question ${i + 1}?` }] },
+    }));
+    content.push({ type: "tool_use", name: "mcp__uzi__signal_done", input: {} });
+    assert.deepStrictEqual(scanSignals({ type: "assistant", message: { content } }), {
+      questions: Array.from({ length: 10 }, (_, i) => ({ question: `Question ${i + 1}?`, header: "" })),
+      done: true,
+    });
+  });
+
+  it("skips full-frame question inputs while still scanning later signals", () => {
+    const content: unknown[] = Array.from({ length: 10 }, (_, i) => ({
+      type: "tool_use", name: "mcp__uzi__ask_user",
+      input: { questions: [{ question: `Question ${i + 1}?` }] },
+    }));
+    content.push({
+      type: "tool_use", name: "mcp__uzi__ask_user",
+      get input(): never { throw new Error("full-frame ask_user input was read"); },
+    });
+    content.push({ type: "tool_use", name: "mcp__uzi__signal_done", input: {} });
+    const result = scanSignals({ type: "assistant", message: { content } });
+    assert.deepStrictEqual(result.questions?.map((q) => q.question),
+      Array.from({ length: 10 }, (_, i) => `Question ${i + 1}?`));
+    assert.strictEqual(result.done, true);
+  });
+
   it("returns nothing for plain text, user frames, and unrelated tools", () => {
     assert.deepStrictEqual(scanSignals({ type: "assistant", message: { content: [{ type: "text", text: "hi" }] } }), {});
     assert.deepStrictEqual(scanSignals(toolUse("Bash", { command: "ls" })), {});
