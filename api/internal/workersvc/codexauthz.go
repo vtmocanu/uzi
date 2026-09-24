@@ -50,7 +50,8 @@ const codexCoordQuarantined = "quarantined"
 // the awaiting_* parks are a worker still holding the run, and D4 requires
 // persist-before-park, so a park must be able to persist recovery material. recovery_wait
 // is a MID-EXECUTION park like limit_wait (a running worker parked the run on a transient
-// recovery), so it belongs here — unlike the pre-execution 'pool_wait' below. The following
+// recovery). A pre-execution codex_account_unavailable recovery_wait also belongs here:
+// its park revokes the capability, so no credential operation can use it. The following
 // are deliberately EXCLUDED, all on the
 // same principle (no worker is actively executing the run, so no live capability should
 // be honored): 'queued' — the requeue gap where the run was handed back and no worker
@@ -825,7 +826,7 @@ func (s *Service) codexFreezeZeroRows(ctx context.Context, q codexFreezeStore, r
 // run whose codex_secret_id was nulled by alias deletion still routes here and fails closed rather
 // than assembling a Claude claim); an ordinary Claude run skips this entirely and its claim JSON
 // stays byte-identical.
-func (s *Service) codexClaimSecrets(ctx context.Context, wkr store.Worker, run store.Run) (*ClaimCodexSecrets, error) {
+func (s *Service) codexClaimSecrets(ctx context.Context, wkr store.Worker, run store.Run) (secrets *ClaimCodexSecrets, claimErr error) {
 	q, ok := s.codexStore()
 	if !ok {
 		return nil, errCodexStoreUnavailable
@@ -872,8 +873,14 @@ func (s *Service) codexClaimSecrets(ctx context.Context, wkr store.Worker, run s
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, errRunVanished
 		}
-		return nil, fmt.Errorf("codex claim: mint capability: %w", err)
+		return nil, fmt.Errorf("%w: %v", errCodexMintAmbiguous, err)
 	}
+	// Carry the persisted mint identity privately through any later assembly error.
+	defer func() {
+		if claimErr != nil {
+			claimErr = &codexMintedClaimError{cause: claimErr, epoch: epoch, hash: hash}
+		}
+	}()
 	// Wire the capability off the PERSISTED post-bump epoch the mint returned, not a
 	// re-derived value: the stored epoch is authoritative.
 	wireCap := formatCodexCapability(epoch, plaintext)
