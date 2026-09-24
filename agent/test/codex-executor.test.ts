@@ -4348,7 +4348,8 @@ describe("CodexExecutor clarification turns (#1584)", () => {
     await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "plan clarification");
     assert.deepEqual(asked, ["Which target?"]);
     assert.deepEqual(gated, ["approved plan"]);
-    assert.match(promptTexts(rig.epochs[0]!.transport)[1]!, /server/);
+    assert.equal(promptTexts(rig.epochs[0]!.transport)[1],
+      "The human answered your questions:\n\nQ: Which target?\nA: server\n\nContinue the work with these answers.\n\nNow produce the implementation plan and submit it with submit_plan. Do not begin implementing.");
     assert.equal(rig.epochs[0]!.transport.threadStartCount, 1);
     assert.equal(emitted.filter((m) => m.kind === "answer").length, 1);
   });
@@ -4378,13 +4379,49 @@ describe("CodexExecutor clarification turns (#1584)", () => {
       } else {
         await run;
         assert.equal(gates, 1);
-        assert.match(promptTexts(rig.epochs[0]!.transport)[1]!, /could not be put to a human/);
+        assert.equal(promptTexts(rig.epochs[0]!.transport)[1],
+          "Your questions could not be put to a human on this run:\n\n- Which target?\n\nProceed on your best judgment. State the assumption you are making, and do not ask again.\n\nNow produce the implementation plan and submit it with submit_plan. Do not begin implementing.");
         if (mode === "auto") assert.doesNotMatch(promptTexts(rig.epochs[0]!.transport)[1]!, /AUTOPILOT_SENTINEL/);
       }
       assert.equal(asks, mode === "unwired" ? 0 : 1);
       assert.equal(emitted.filter((m) => m.kind === "answer").length, 0);
     });
   }
+
+  it("forwards only the first ten questions across repeated callbacks in one turn", async () => {
+    const responder: Responder = (c) => {
+      if (c.method === "thread/start") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") {
+        const tn = `tn-${c.turnStartCount}`;
+        if (c.turnStartCount === 1) {
+          c.transport.push(threadStarted());
+          for (let i = 1; i <= 25; i++) {
+            c.transport.push(toolCall(i, "ask_user", { questions: [{ question: `Question ${i}?` }] }, "th-1", tn, `c-ask-${i}`));
+          }
+        } else {
+          c.transport.push(toolCall(30, "signal_done", {}, "th-1", tn, "c-done"));
+        }
+        c.transport.push(turnCompleted("completed", "th-1", tn));
+        return { turn: { id: tn } };
+      }
+      return {};
+    };
+    const rig = makeRig({ responder });
+    const asked: string[][] = [];
+    const { ctx } = makeCtx({
+      config: { max_iterations: 1 },
+      askUser: async (qs) => {
+        asked.push(qs.map((q) => q.question));
+        return { kind: "answer", answers: qs.map(() => "yes") };
+      },
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "question cap");
+    assert.deepEqual(asked, [Array.from({ length: 10 }, (_, i) => `Question ${i + 1}?`)]);
+    const followUp = promptTexts(rig.transport)[1]!;
+    const entries = Array.from({ length: 10 }, (_, i) => `Q: Question ${i + 1}?\nA: yes`);
+    assert.equal(followUp,
+      `The human answered your questions:\n\n${entries.join("\n\n")}\n\nContinue the work with these answers.\n\nContinue the implementation.`);
+  });
 
   it("shares the human cap across planning, revision, and implementation", async () => {
     const rig = makeMultiEpochRig([
@@ -4457,7 +4494,9 @@ describe("CodexExecutor clarification turns (#1584)", () => {
         assert.deepEqual(iterations, [1]);
         assert.deepEqual(checkpoints, []);
         const prompt = promptTexts(rig.transport)[1]!;
-        assert.match(prompt, mode === "answer" ? /use server/ : /could not be put to a human/);
+        assert.equal(prompt, mode === "answer"
+          ? "The human answered your questions:\n\nQ: Which target?\nA: use server\n\nContinue the work with these answers.\n\nContinue the implementation."
+          : "Your questions could not be put to a human on this run:\n\n- Which target?\n\nProceed on your best judgment. State the assumption you are making, and do not ask again.\n\nContinue the implementation.");
         if (mode === "auto") assert.doesNotMatch(prompt, /AUTOPILOT_SENTINEL/);
       }
       assert.equal(calls, mode === "answer" || mode === "cancel" || mode === "auto" ? 1 : 0);

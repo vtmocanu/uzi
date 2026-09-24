@@ -31,6 +31,7 @@ import type {
 import { projectInit, projectItem, projectResult } from "./harness-messages.js";
 
 const LEAD = "lead";
+const MAX_TURN_QUESTIONS = 10;
 
 export class RunTurnReducerImpl implements RunTurnReducer {
   /** First-truthy-once-per-run latch (run-level; persists across turns). */
@@ -161,7 +162,7 @@ export class RunTurnReducerImpl implements RunTurnReducer {
 
   /** Preserve the exact signal folds (driveTurn L2684-2719): plan/milestones and
    *  the declaration fields are last-wins; done/checkpoint/reportOnly latch;
-   *  questions concatenate; progress is last-wins AND delivered immediately via the
+   *  questions keep the first 10 per turn; progress is last-wins AND delivered immediately via the
    *  reduction so the owner reports it off the hot stream without awaiting. */
   private foldSignals(s: Readonly<Partial<TurnSignals>>, reduction: TurnReduction): void {
     if (s.plan !== undefined) this.result.plan = s.plan;
@@ -180,7 +181,11 @@ export class RunTurnReducerImpl implements RunTurnReducer {
     if (s.reportOnly) this.result.reportOnly = true;
     if (s.proposal !== undefined) this.result.proposal = s.proposal;
     if (s.questions?.length) {
-      this.result.questions = [...(this.result.questions ?? []), ...s.questions];
+      const accepted = this.result.questions?.length ?? 0;
+      const remaining = MAX_TURN_QUESTIONS - accepted;
+      if (remaining > 0) {
+        this.result.questions = [...(this.result.questions ?? []), ...s.questions.slice(0, remaining)];
+      }
     }
   }
 
