@@ -99,14 +99,14 @@ A few things worth knowing:
 ### When planning ends without a plan
 
 Sometimes a plan (or plan-revision) turn ends with the lead just writing
-prose — no plan submitted, no question asked. uzi resumes the same session
+prose: no plan submitted, no question asked. uzi resumes the same session
 once with a fixed corrective nudge, so most of the time you never see this.
 If the nudged turn is *still* prose only, a status card appears in the feed
 showing the lead's last message (bounded, secret-scrubbed, and rendered as
-plain text, never markdown) — and, on an attended (non-autopilot) run, the run parks at
+plain text, never markdown), and, on an attended (non-autopilot) run, the run parks at
 `awaiting_input` on a uzi-authored question headed **Plan missing**. Answering
 with guidance resumes planning in the same session, but that answer is never
-plan approval — a plan still has to be submitted and go through the approval
+plan approval: a plan still has to be submitted and go through the approval
 gate. You can also cancel the run instead. The usual answer deadline applies.
 There's no "revise the PRD and retry" option here: to change the PRD or issue,
 cancel and re-dispatch. If planning is still prose-only after your guidance,
