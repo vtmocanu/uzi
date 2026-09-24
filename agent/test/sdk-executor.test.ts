@@ -333,7 +333,8 @@ describe("SdkExecutor plan gate", () => {
   });
 
   it("fails when the planning turn ends without a submitted plan", async () => {
-    const { queryFn } = fakeTurns([[assistantText("I did nothing"), resultSuccess()]]);
+    // Text-free: a turn ending in lead PROSE is nudged and parked instead (issue #1593).
+    const { queryFn } = fakeTurns([[resultSuccess()]]);
     const probe = makeCtx();
     await assert.rejects(
       new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx),
@@ -454,7 +455,7 @@ describe("SdkExecutor plan revision loop (PRD #41)", () => {
   it("a revision turn that submits no plan fails with REASON_NO_PLAN", async () => {
     const { queryFn } = fakeTurns([
       [submitPlan("# Plan v1"), resultSuccess()],
-      [assistantText("I forgot to submit"), resultSuccess()], // revision turn, no plan
+      [resultSuccess()], // revision turn, no plan and no text (prose is nudged, issue #1593)
     ]);
     const probe = makeCtx({}, [revise("redo it"), approve]);
     await assert.rejects(
@@ -1762,7 +1763,7 @@ describe("SdkExecutor agent-tree reap (B1)", () => {
   it("reaps the agent subprocess even on a failure path (no plan submitted)", async () => {
     const killed: (number | undefined)[] = [];
     const exec = new SdkExecutor(nullLogger(), homeDir, {
-      queryFn: spawningQuery([[assistantText("nothing"), resultSuccess()]]),
+      queryFn: spawningQuery([[resultSuccess()]]), // text-free: prose is nudged (issue #1593)
       spawn: () => ({ pid: 6001 }),
       kill: (p) => (killed.push(p), true),
     });
@@ -4659,8 +4660,14 @@ describe("SdkExecutor empty-turn recovery (issue #1197 D-RC2b)", () => {
 
   it("control: a NON-empty planning turn that neither plans nor asks still fails REASON_NO_PLAN (not retried)", async () => {
     // num_turns:1 + an assistant frame ⇒ activity ⇒ NOT positively empty ⇒ no retry;
-    // drivePlanningTurn's existing REASON_NO_PLAN control fires.
-    const { queryFn, turns } = fakeTurns([[assistantText("I did nothing"), resultSuccess()]]);
+    // drivePlanningTurn's existing REASON_NO_PLAN control fires. The frame is a non-signal
+    // tool call rather than text: a turn ending in lead prose is nudged instead (issue #1593).
+    const toolOnly = {
+      type: "assistant",
+      session_id: "sess-1",
+      message: { content: [{ type: "tool_use", id: "t-read", name: "Read", input: { file_path: "README.md" } }] },
+    } as unknown as SDKMessage;
+    const { queryFn, turns } = fakeTurns([[toolOnly, resultSuccess()]]);
     const probe = makeCtx();
     await assert.rejects(
       new SdkExecutor(nullLogger(), homeDir, fastRecovery(queryFn)).run(probe.ctx),

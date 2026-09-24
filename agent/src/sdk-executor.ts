@@ -102,6 +102,7 @@ import type {
   TurnStreamEnd,
 } from "./harness.js";
 import { PlanRejectedError } from "./executor.js";
+import { emitPlanMissingNotice, isProseOnlyPlanTurn, PLAN_MISSING_NUDGE, REASON_PLAN_MISSING, resolvePlanMissing } from "./plan-missing.js";
 import { clampToDirCharset, errMessage } from "./util.js";
 import { SummaryRunner } from "./summary-runner.js";
 import { resolvePrdInput, type PrdInput } from "./prd-link.js";
@@ -3129,7 +3130,12 @@ export class SdkExecutor implements Executor {
     // told to proceed. Without it a lead that answers every answer with another
     // question would loop here forever, never planning and never failing.
     const maxRounds = questionMax(ctx.config ?? null) + 1;
-    for (let round = 0; ; round++) {
+    // Issue #1593: the prose-only recovery budget, LOCAL to this invocation so the first plan
+    // turn and every revision turn each get one nudge and one owner park. Kept apart from
+    // `round`, which counts clarification rounds only.
+    let nudged = false;
+    let fallbackUsed = false;
+    for (let round = 0; ; ) {
       // issue #1197 (D-RC2b): a POSITIVELY-empty planning turn is retried in-process,
       // then escalated to TransientRecoveryError (the recovery_wait park) by the
       // wrapper — which throws BEFORE the REASON_NO_PLAN control below is reached. A
@@ -3148,12 +3154,34 @@ export class SdkExecutor implements Executor {
       if (turn.plan !== undefined)
         return { ...turn, sessionId: resumeId, plan: turn.plan };
 
+      // Issue #1593: prose only (no plan, no question, some lead text). Nudge once with fixed
+      // text, then park on the owner, then fail. Nothing is derived from the prose: it never
+      // becomes a plan, a question or part of a prompt, and any plan still goes to the gate.
+      if (isProseOnlyPlanTurn(turn)) {
+        if (!nudged) {
+          nudged = true;
+          turnPrompt = PLAN_MISSING_NUDGE;
+          continue;
+        }
+        if (fallbackUsed) {
+          emitPlanMissingNotice(ctx, turn.finalText!);
+          throw new Error(REASON_PLAN_MISSING);
+        }
+        const r = await resolvePlanMissing(ctx, turn.finalText!);
+        if (r.kind === "cancel") throw new Error(REASON_CANCELLED);
+        fallbackUsed = true;
+        turnPrompt = r.prompt;
+        continue;
+      }
+
       const asked = turn.questions;
-      // The unchanged contract: a planning turn that neither planned nor asked is the
-      // original error. Never push un-gated work, even if the lead signalled done.
+      // The unchanged contract: a planning turn that neither planned nor asked (and left no
+      // text to recover from) is the original error. Never push un-gated work, even if the
+      // lead signalled done.
       if (!asked?.length) throw new Error(REASON_NO_PLAN);
       if (round >= maxRounds)
         throw new Error(REASON_NO_PLAN_AFTER_CLARIFICATION);
+      round++;
 
       const verdict = await this.askUserOrContinue(ctx, asked, budget.asked);
       if (verdict.cancelled) throw new Error(REASON_CANCELLED);

@@ -67,6 +67,7 @@ import { RunTurnReducerImpl } from "../harness-reducer.js";
 import { buildLeadSystemPrompt, buildRevisePlanPrompt, publishedTipNote } from "../prompt.js";
 import { RUNNER_UID, WORKER_UID, uidSplitActive } from "../runner-uid.js";
 import { errMessage } from "../util.js";
+import { emitPlanMissingNotice, isProseOnlyPlanTurn, PLAN_MISSING_NUDGE, REASON_PLAN_MISSING, resolvePlanMissing } from "../plan-missing.js";
 import { makeTextRedactor } from "../redact.js";
 import type { AgentTemplate, AskUserQuestion, ClaimSkill } from "../protocol.js";
 import type { CommandSandboxMode } from "../config.js";
@@ -1595,7 +1596,12 @@ export class CodexExecutor implements Executor {
       };
       const drivePlan = async (initialPrompt: string) => {
         let prompt = initialPrompt;
-        for (let round = 0; ; round++) {
+        // #1593: the prose-only recovery budget, LOCAL to this invocation so the initial plan
+        // turn and every revision turn each get one nudge and one owner park.
+        let nudged = false;
+        let fallbackUsed = false;
+        // `round` counts clarification rounds only; the prose-only recovery below has its own budget.
+        for (let round = 0; ; ) {
           const turn = await this.driveTurnWithWallPark(ctx, epoch!.harness, reducer, "plan", prompt, epoch!.resumeSessionId, idleMs, wallMs, epoch!.buildPhaseBroker, { completedCount: 0 });
           if (turn.kind === "walled") return turn;
           const result = turn.result;
@@ -1603,8 +1609,29 @@ export class CodexExecutor implements Executor {
             emitIgnoredQuestions(result);
             return turn;
           }
+          // #1593: prose only (no plan, no question, some lead text). Nudge once, then park on
+          // the owner, then fail. Nothing is derived from the prose, and these rounds do not
+          // count against the clarification budget. A turn with no text at all is returned
+          // unchanged, so the caller keeps its existing "produced no plan" throw.
+          if (isProseOnlyPlanTurn(result)) {
+            if (!nudged) {
+              nudged = true;
+              prompt = PLAN_MISSING_NUDGE;
+              continue;
+            }
+            if (fallbackUsed) {
+              emitPlanMissingNotice(ctx, result.finalText!);
+              throw new Error(REASON_PLAN_MISSING);
+            }
+            const r = await resolvePlanMissing(ctx, result.finalText!);
+            if (r.kind === "cancel") throw new Error(REASON_CANCEL);
+            fallbackUsed = true;
+            prompt = r.prompt;
+            continue;
+          }
           if (!result.questions?.length) return turn;
           if (round >= maxClarificationRounds) throw new Error("codex clarification rounds exhausted during planning");
+          round++;
           const followUp = await clarify(result.questions);
           prompt = `${followUp}\n\nNow produce the implementation plan and submit it with submit_plan. Do not begin implementing.`;
         }
@@ -2113,6 +2140,11 @@ export class CodexExecutor implements Executor {
     reducer.beginTurn();
     let sawTerminal = false;
     let terminal: import("../harness.js").HarnessTerminal | undefined;
+    // #1593: the root thread's own text this turn. The harness projects root agent messages
+    // with NO agent attribution (children carry their role), so the shared reducer, which keys
+    // lead text on agent "lead", never sets finalText for a Codex turn. Collected here so the
+    // planning loop can tell a prose-only turn from a genuinely empty one.
+    const rootText: string[] = [];
 
     const request = this.buildRunRequest(ctx, phase, prompt, resumeId, turnAbort.signal);
     try {
@@ -2130,7 +2162,13 @@ export class CodexExecutor implements Executor {
             this.log.warn("codex onSessionId handler threw", { run_id: ctx.runId, error: errMessage(err) });
           }
         }
-        for (const em of reduction.messages) ctx.emit(em);
+        for (const em of reduction.messages) {
+          if (em.kind === "text" && (em.agent === undefined || em.agent === "lead")) {
+            const t = em.payload["text"];
+            if (typeof t === "string" && t) rootText.push(t);
+          }
+          ctx.emit(em);
+        }
         if (reduction.progress) void Promise.resolve(ctx.reportProgress?.(reduction.progress)).catch(() => undefined);
         if (event.kind === "turn_finished") {
           sawTerminal = true;
@@ -2150,7 +2188,9 @@ export class CodexExecutor implements Executor {
       }
       // (d) clean terminal / exhausted.
       const end: TurnStreamEnd = sawTerminal && terminal ? { kind: "terminal", terminal } : { kind: "exhausted" };
-      return reducer.finish(end).result;
+      const result = reducer.finish(end).result;
+      if (result.finalText === undefined && rootText.length > 0) result.finalText = rootText.join("\n");
+      return result;
     } catch (err) {
       // (a) again: a trip beats the raw aborted/protocol error the iterator threw.
       if (tripReason) throw this.tripError(tripReason);

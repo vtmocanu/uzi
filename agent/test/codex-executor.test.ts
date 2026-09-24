@@ -51,6 +51,7 @@ import type { AgentTemplate } from "../src/protocol.js";
 import type { BoundaryRequest } from "../src/harness.js";
 import type { CodexEffectLaunchSpec, CodexRootHandle } from "../src/codex/launcher.js";
 import { CODEX_M3B_LOOPBACK_PROVIDER_NAME } from "../src/codex/config.js";
+import { MAX_LEAD_FINAL_MESSAGE_LEN, PLAN_MISSING_NUDGE, REASON_PLAN_MISSING } from "../src/plan-missing.js";
 
 // PRD #1171 (M3, milestone 3, Phase 2A) — the production CodexExecutor + the claim-aware
 // DARK selection seam, driven with an in-memory transport and scripted app-server frames
@@ -4585,5 +4586,171 @@ describe("CodexExecutor clarification turns (#1584)", () => {
     assert.equal(asks, 0);
     assert.equal(gates, 1);
     assert.equal(notices(emitted).filter((s) => s.includes("question was ignored")).length, 1);
+  });
+});
+
+// #1593: a gated planning turn that ends in prose only (no submit_plan, no ask_user) is nudged
+// once, then falls back to a worker-authored owner park, instead of failing the run outright.
+describe("CodexExecutor prose-only planning turns (#1593)", () => {
+  const PROSE = "I think we should refactor the widget; let me know what you think.";
+  type Step = "ask" | "plan" | "done" | "prose";
+  const scripted = (steps: Step[][], th = "th-plan", prose = PROSE): Responder => (c) => {
+    if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: th } };
+    if (c.method === "turn/start") {
+      const tn = `tn-${c.turnStartCount}`;
+      if (c.turnStartCount === 1) c.transport.push(threadStarted(th));
+      (steps[c.turnStartCount - 1] ?? []).forEach((step, i) => {
+        const id = c.turnStartCount * 10 + i;
+        if (step === "prose") c.transport.push(agentMessage(prose, th));
+        else if (step === "ask") c.transport.push(toolCall(id, "ask_user", { questions: [{ question: "Which target?", header: "Target" }] }, th, tn, `c-ask-${id}`));
+        else c.transport.push(toolCall(id, step === "plan" ? "submit_plan" : "signal_done", step === "plan" ? { plan_md: "approved plan" } : {}, th, tn, `c-${step}-${id}`));
+      });
+      c.transport.push(turnCompleted("completed", th, tn));
+      return { turn: { id: tn } };
+    }
+    return {};
+  };
+  const promptTexts = (t: FakeTransport): string[] => t.requests.filter((r) => r.method === "turn/start")
+    .map((r) => (r.params as { input?: { text?: string }[] }).input?.[0]?.text ?? "");
+  const cards = (emitted: EmittedMessage[]) => emitted.filter((m) => m.kind === "status" && m.payload.event === "plan_missing");
+  const approve = { kind: "approve", selection: { source: "own", agents: [] } } as never;
+
+  it("nudges once with the fixed prompt, then gates the plan the nudged turn submits", async () => {
+    const rig = makeMultiEpochRig([scripted([["prose"], ["plan"]]), scripted([["done"]])]);
+    const gated: string[] = [];
+    let parks = 0;
+    const { ctx, emitted } = makeCtx({
+      planApproved: false, approvedPlan: undefined,
+      askPlanMissing: async () => { parks++; return { kind: "cancel" }; },
+      gatePlan: async (plan) => { gated.push(plan); return approve; },
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "nudge then plan");
+    assert.equal(promptTexts(rig.epochs[0]!.transport)[1], PLAN_MISSING_NUDGE);
+    assert.deepEqual(gated, ["approved plan"]);
+    assert.equal(parks, 0);
+    assert.equal(cards(emitted).length, 0);
+  });
+
+  it("routes a question on the nudged turn through the existing clarification path", async () => {
+    const rig = makeMultiEpochRig([scripted([["prose"], ["ask"], ["plan"]]), scripted([["done"]])]);
+    const asked: string[] = [];
+    let gates = 0;
+    const { ctx } = makeCtx({
+      planApproved: false, approvedPlan: undefined,
+      askUser: async (qs) => { asked.push(qs[0]!.question); return { kind: "answer", answers: ["server"] }; },
+      askPlanMissing: async () => { throw new Error("must not park"); },
+      gatePlan: async () => { gates++; return approve; },
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "nudge then question");
+    assert.deepEqual(asked, ["Which target?"]);
+    assert.equal(gates, 1);
+    assert.equal(promptTexts(rig.epochs[0]!.transport).filter((p) => p === PLAN_MISSING_NUDGE).length, 1);
+  });
+
+  it("gives the initial plan turn and a revision turn one nudge each", async () => {
+    const rig = makeMultiEpochRig([scripted([["prose"], ["plan"], ["prose"], ["plan"]]), scripted([["done"]])]);
+    let gates = 0;
+    const { ctx } = makeCtx({
+      planApproved: false, approvedPlan: undefined,
+      askPlanMissing: async () => { throw new Error("must not park"); },
+      gatePlan: async () => (++gates === 1 ? { kind: "revise", feedback: "tighten it" } : approve),
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "revision nudge");
+    const prompts = promptTexts(rig.epochs[0]!.transport);
+    assert.equal(gates, 2);
+    assert.equal(prompts[1], PLAN_MISSING_NUDGE);
+    assert.equal(prompts[3], PLAN_MISSING_NUDGE);
+    assert.equal(prompts.filter((p) => p === PLAN_MISSING_NUDGE).length, 2);
+  });
+
+  it("parks on the owner after a nudged prose turn and resumes on guidance only", async () => {
+    const rig = makeMultiEpochRig([scripted([["prose"], ["prose"], ["plan"]]), scripted([["done"]])]);
+    const parkArgs: unknown[][] = [];
+    const gated: string[] = [];
+    const { ctx, emitted } = makeCtx({
+      planApproved: false, approvedPlan: undefined,
+      askPlanMissing: async (...args: unknown[]) => { parkArgs.push(args); return { kind: "answer", answers: ["use the server path"] }; },
+      gatePlan: async (plan) => { gated.push(plan); return approve; },
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "guidance");
+    const prompts = promptTexts(rig.epochs[0]!.transport);
+    assert.deepEqual(parkArgs, [[]], "the park takes no model text");
+    assert.match(prompts[2]!, /use the server path/);
+    assert.ok(!prompts[2]!.includes(PROSE), "the lead's prose never re-enters a prompt");
+    assert.equal(prompts.filter((p) => p === PLAN_MISSING_NUDGE).length, 1);
+    assert.deepEqual(gated, ["approved plan"], "the plan after guidance still goes to the gate");
+    assert.equal(cards(emitted).length, 1);
+    assert.equal(cards(emitted)[0]!.payload.lead_final_message, PROSE);
+    const answers = emitted.filter((m) => m.kind === "answer");
+    assert.equal(answers.length, 1);
+    assert.equal(answers[0]!.agent, "worker");
+  });
+
+  it("fails REASON_PLAN_MISSING when the turn after guidance is prose again, without a second nudge or park", async () => {
+    const rig = makeRig({ responder: scripted([["prose"], ["prose"], ["prose"], ["plan"]]) });
+    let parks = 0;
+    let gates = 0;
+    const { ctx, emitted } = makeCtx({
+      planApproved: false, approvedPlan: undefined,
+      askPlanMissing: async () => { parks++; return { kind: "answer", answers: ["try again"] }; },
+      gatePlan: async () => { gates++; return approve; },
+    });
+    await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "second prose"),
+      (e: Error) => e.message === REASON_PLAN_MISSING);
+    assert.equal(parks, 1);
+    assert.equal(gates, 0);
+    assert.equal(rig.transport.turnStartCount, 3);
+    assert.equal(promptTexts(rig.transport).filter((p) => p === PLAN_MISSING_NUDGE).length, 1);
+    assert.equal(cards(emitted).length, 2);
+  });
+
+  it("maps a cancelled owner park to the cancel reason", async () => {
+    const rig = makeRig({ responder: scripted([["prose"], ["prose"]]) });
+    const { ctx } = makeCtx({
+      planApproved: false, approvedPlan: undefined,
+      askPlanMissing: async () => ({ kind: "cancel" }),
+      gatePlan: async () => approve,
+    });
+    await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "cancel"), /run cancelled/);
+    assert.equal(rig.transport.turnStartCount, 2);
+  });
+
+  for (const mode of ["unwired", "unattended"] as const) {
+    it(`fails REASON_PLAN_MISSING with a bounded status card when no human can answer: ${mode}`, async () => {
+      const secret = "sekret-" + "value-1593";
+      const long = "x".repeat(MAX_LEAD_FINAL_MESSAGE_LEN) + " tail";
+      const rig = makeRig({ responder: scripted([["prose"], ["prose"]], "th-plan", `${secret} ${long}`) });
+      const { ctx, emitted } = makeCtx({
+        planApproved: false, approvedPlan: undefined,
+        redactText: (s) => s.split(secret).join("[REDACTED]"),
+        askPlanMissing: mode === "unwired" ? undefined : async () => ({ kind: "unattended" }),
+        gatePlan: async () => approve,
+      });
+      await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, mode),
+        (e: Error) => e.message === REASON_PLAN_MISSING);
+      const c = cards(emitted);
+      assert.equal(c.length, 1);
+      assert.equal(c[0]!.agent, "worker");
+      const msg = String(c[0]!.payload.lead_final_message);
+      assert.ok(msg.length <= MAX_LEAD_FINAL_MESSAGE_LEN);
+      assert.ok(msg.startsWith("[REDACTED] "));
+      assert.ok(msg.endsWith("…[truncated]"));
+      assert.ok(!msg.includes(secret));
+    });
+  }
+
+  it("keeps today's throw for a no-plan turn with no text, initial and on revision", async () => {
+    const rig = makeRig({ responder: scripted([[]]) });
+    const { ctx, emitted } = makeCtx({ planApproved: false, approvedPlan: undefined, gatePlan: async () => approve });
+    await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "empty"),
+      (e: Error) => e.message === "codex plan turn produced no plan");
+    assert.equal(rig.transport.turnStartCount, 1);
+    assert.equal(cards(emitted).length, 0);
+
+    const rev = makeRig({ responder: scripted([["plan"], []]) });
+    const r = makeCtx({ planApproved: false, approvedPlan: undefined, gatePlan: async () => ({ kind: "revise", feedback: "again" }) });
+    await assert.rejects(withTimeout(makeExecutor(rev, bindingOf(SUBSCRIPTION)).run(r.ctx), 5000, "empty revision"),
+      (e: Error) => e.message === "codex plan turn produced no plan on revision");
+    assert.equal(rev.transport.turnStartCount, 2);
   });
 });

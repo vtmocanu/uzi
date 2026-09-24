@@ -332,6 +332,16 @@ export interface RunContext {
    * clarify. Failing closed here would kill runs on any executor that did not wire it.
    */
   askUser?(questions: AskUserQuestion[]): Promise<AnswerVerdict>;
+  /**
+   * Issue #1593: the worker-authored fallback park for a planning turn that ended in prose
+   * only, even after a corrective nudge. Takes NO model text: the runner parks on a fixed
+   * question (plan-missing.ts), and the lead's prose is never passed in — it reaches the
+   * owner only as bounded, untrusted data on the status card.
+   *
+   * `unattended` is an autopilot run, which never parks; the executor then fails with
+   * REASON_PLAN_MISSING, as it does when this is absent. Does not count against question_max.
+   */
+  askPlanMissing?: () => Promise<{ kind: "answer"; answers: string[] } | { kind: "cancel" } | { kind: "unattended" }>;
   /** M4: dequeue the next queued follow-up to inject into the next loop turn. */
   pullFollowUp?(): string | undefined;
   /** PRD #1416 M2: drain the WORKER-AUTHORITATIVE safety steer armed in-process by the runner's
