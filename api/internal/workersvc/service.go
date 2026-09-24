@@ -5975,6 +5975,14 @@ type SweepResult struct {
 	// passed on their alias and account, read under lock. Normally 0. Bounded by one page of
 	// held runs per tick.
 	CodexAccountPromoted int64
+	// CodexAccountReadmitted is how many of CodexAccountPromoted were first re-admitted after a
+	// verified same-identity re-login on their alias (PRD #1590 M4, D5: runs.codex_material_revision
+	// advanced to the alias's, with a feed status line). Normally 0.
+	CodexAccountReadmitted int64
+	// CodexAccountFailed is the number of codex_account_unavailable runs this pass failed
+	// credential_unavailable (PRD #1590 M4, D5): the alias was deleted while held, or a linked
+	// alias now names a different identity, credential revision, auth mode or kind. Normally 0.
+	CodexAccountFailed int64
 	// LimitPromoted is the number of runs this pass brought back from limit_wait to
 	// queued because their retry_not_before elapsed (PRD #35). Normally 0: the
 	// partial index this reads covers only parked runs, a set that is empty on a

@@ -157,8 +157,9 @@ var (
 	// the run froze it (the alias was manually replaced), invalidating the run.
 	ErrCodexMaterialRevisionStale = errors.New("codex alias material revision is stale")
 	// ErrCodexAccountKeyUnfrozen: a subscription run has no frozen account identity
-	// tuple yet (NULL codex_account_key) — not-yet-runnable. Rejected so a later
-	// replacement that resolves to a different account cannot retarget the run.
+	// tuple (NULL codex_account_key). Nothing freezes it after create (PRD #1590 D2
+	// as-built), so such a run is never runnable. Rejected so a later replacement that
+	// resolves to a different account cannot retarget the run.
 	ErrCodexAccountKeyUnfrozen = errors.New("codex run account identity is not frozen")
 	// ErrCodexAccountTupleMismatch: the run's frozen account identity tuple no longer
 	// equals the account's current (provider_user_id, workspace_account_id) — a
@@ -410,7 +411,7 @@ func codexCheckMaterialRev(in codexReleaseInputs) error {
 
 // codexCheckAccountTuple enforces that a subscription run's frozen identity tuple is
 // present and still equals the account's current (provider_user_id, workspace_account_id).
-// A NULL frozen tuple is ErrCodexAccountKeyUnfrozen (not-yet-runnable); a NULL current
+// A NULL frozen tuple is ErrCodexAccountKeyUnfrozen (never runnable); a NULL current
 // tuple or a differing tuple is ErrCodexAccountTupleMismatch (a replacement resolved
 // elsewhere). Both sides encode through the single codexAccountKey encoder so the two can
 // never serialize the same tuple differently.
@@ -739,9 +740,10 @@ func (s *Service) freezeCodexBinding(ctx context.Context, q codexFreezeStore, us
 		AuthMode:         authMode,
 		SecretLabel:      meta.Label,
 		MaterialRevision: st.MaterialRevision,
-		// The identity tuple/revision are frozen by SetRunCodexFrozenIdentity below when
-		// known; a run whose subscription account is not yet linked stays unfrozen (and
-		// so not-yet-runnable) until then.
+		// The identity tuple/revision are frozen by SetRunCodexFrozenIdentity below, and
+		// only when the alias is already linked. Nothing freezes them after create, so a
+		// run whose subscription account is not linked here stays unfrozen for good and
+		// fails ErrCodexAccountKeyUnfrozen (PRD #1590 D2 as-built).
 		AccountKey:      pgtype.Text{},
 		AccountRevision: pgtype.Int8{},
 		ID:              runID,
@@ -761,8 +763,9 @@ func (s *Service) freezeCodexBinding(ctx context.Context, q codexFreezeStore, us
 
 	// For a linked subscription alias, freeze the identity tuple + account revision now
 	// so the authority check has a frozen baseline. A staging alias (no account yet) and
-	// every api_key alias leave the tuple NULL — which the authority check treats as
-	// not-yet-runnable for subscription, and simply skips for api_key.
+	// every api_key alias leave the tuple NULL — which the authority check refuses for
+	// subscription (ErrCodexAccountKeyUnfrozen; nothing freezes it later), and simply
+	// skips for api_key.
 	if authMode == codexAuthModeSubscription && st.ProviderAccountID.Valid {
 		acct, aerr := q.GetCodexProviderAccountByID(ctx, store.GetCodexProviderAccountByIDParams{
 			UserID: userID,

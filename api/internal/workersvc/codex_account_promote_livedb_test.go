@@ -60,7 +60,8 @@ func promoteOnly(t *testing.T, svc *Service, runID uuid.UUID) (int64, error) {
 	// Bounded, so a promoter that waited on a lock (the deadlock regression) fails promptly.
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	return svc.promoteCodexAccountAvailable(ctx)
+	res, err := svc.promoteCodexAccountAvailable(ctx)
+	return res.Promoted, err
 }
 
 // sealedLogin seals a fresh login blob the way the reconciler's master path does.
@@ -128,7 +129,8 @@ func assertStillHeld(t *testing.T, env codexTestEnv, runID uuid.UUID, held store
 	t.Helper()
 	r := mustRun(t, env, runID)
 	if r.Status != "recovery_wait" || r.RecoveryWaitCause.String != recoveryCauseCodexAccountUnavailable ||
-		r.CodexClaimEpoch != held.CodexClaimEpoch || !r.UpdatedAt.Time.Equal(held.UpdatedAt.Time) {
+		r.CodexClaimEpoch != held.CodexClaimEpoch || !r.UpdatedAt.Time.Equal(held.UpdatedAt.Time) ||
+		r.CodexMaterialRevision != held.CodexMaterialRevision || r.FailOrigin.Valid {
 		t.Fatalf("status=%s cause=%v epoch=%d (held %d) updated %v (held %v), want the hold untouched",
 			r.Status, r.RecoveryWaitCause, r.CodexClaimEpoch, held.CodexClaimEpoch, r.UpdatedAt.Time, held.UpdatedAt.Time)
 	}
@@ -172,8 +174,10 @@ func TestCodexAccountPromoteHealthyAccountLiveDB(t *testing.T) {
 }
 
 // TestCodexAccountPromoteStaysHeldLiveDB: a still-quarantined account, a re-login in flight
-// (alias PATCHed to staging, link cleared), and a same-identity relink (material ahead; D5
-// re-admission is M4) all fail the predicate, so the run stays held, untouched, across ticks.
+// (alias PATCHed to staging, link cleared), a failed re-login, a same-identity relink while a
+// refresh lease is live (in_progress), and a same-identity relink on a still-quarantined account
+// are all transient under D5: nothing is re-admitted, promoted or failed, so the run stays held,
+// untouched (material revision, epoch and updated_at unchanged), across ticks.
 // Each tick runs a one-row promotion page and then a full Sweep whose promotion page starts at
 // the fixture run; an afterList hook counts the fixture's examinations, so both legs are proven
 // to have decided this run rather than passed it by.
@@ -192,10 +196,25 @@ func TestCodexAccountPromoteStaysHeldLiveDB(t *testing.T) {
 			}
 			fx.setAccount(t, "coord_state = 'idle'")
 		}},
-		{"same-identity relink awaiting re-admission", func(t *testing.T, fx *codexClaimFix) {
+		{"re-login failed", func(t *testing.T, fx *codexClaimFix) {
+			n, err := fx.env.q.BumpCodexMaterialRevision(fx.env.ctx, store.BumpCodexMaterialRevisionParams{
+				UserSecretID: fx.aliasID, UserID: fx.userID, Status: "failed",
+			})
+			if err != nil || n != 1 {
+				t.Fatalf("BumpCodexMaterialRevision = (%d, %v)", n, err)
+			}
+			fx.setAccount(t, "coord_state = 'idle'")
+		}},
+		{"same-identity relink during a live refresh lease", func(t *testing.T, fx *codexClaimFix) {
+			// D5 re-admits only a settled account (idle or committed); in_progress is transient.
 			fx.env.exec(`UPDATE codex_credential_state SET material_revision = material_revision + 1
 				WHERE user_secret_id = $1`, fx.aliasID)
-			fx.setAccount(t, "coord_state = 'idle'")
+			fx.setAccount(t, "coord_state = 'in_progress', coord_operation_id = gen_random_uuid(), lease_deadline = now() + interval '1 hour'")
+		}},
+		{"same identity, quarantined, material ahead", func(t *testing.T, fx *codexClaimFix) {
+			// Quarantine is transient even with a newer login linked: not re-admitted, not failed.
+			fx.env.exec(`UPDATE codex_credential_state SET material_revision = material_revision + 1
+				WHERE user_secret_id = $1`, fx.aliasID)
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -236,20 +255,23 @@ func TestCodexAccountPromoteStaysHeldLiveDB(t *testing.T) {
 // The race is injected in afterList, which runs BEFORE the run's transaction opens, so the write
 // has committed by the time the promoter locks anything: this pins only that the in-transaction
 // re-read (under the run, alias and account locks) sees a change made after the page was listed,
-// and the run is not promoted. It does not exercise a writer racing the open transaction; that
-// is TestCodexAccountPromoteRelinkWaitsOnAliasLockLiveDB. A control run without the race is
-// promoted, so the refusal is the race's.
+// and the run is not promoted. The different-identity relink is a definite binding change on a
+// linked alias, so since M4 (D5) the pass fails the run credential_unavailable instead of leaving
+// it held; the staging bump stays held. It does not exercise a writer racing the open
+// transaction; that is TestCodexAccountPromoteRelinkWaitsOnAliasLockLiveDB. A control run without
+// the race is promoted, so the refusal is the race's.
 func TestCodexAccountPromoteRelinkRaceLiveDB(t *testing.T) {
 	for _, tc := range []struct {
-		name string
-		race func(t *testing.T, fx *codexClaimFix)
+		name       string
+		race       func(t *testing.T, fx *codexClaimFix)
+		wantFailed bool
 	}{
-		{"none (control)", nil},
+		{"none (control)", nil, false},
 		{"relink to a different identity", func(t *testing.T, fx *codexClaimFix) {
 			other := fx.env.seedLinkedSubscription(t, fx.userID, "codex-other-"+uuid.NewString(), codexToken("access"), codexToken("refresh"))
 			fx.env.exec(`UPDATE codex_credential_state s SET provider_account_id = o.provider_account_id
 				FROM codex_credential_state o WHERE s.user_secret_id = $1 AND o.user_secret_id = $2`, fx.aliasID, other)
-		}},
+		}, true},
 		{"material bump", func(t *testing.T, fx *codexClaimFix) {
 			n, err := fx.env.q.BumpCodexMaterialRevision(fx.env.ctx, store.BumpCodexMaterialRevisionParams{
 				UserSecretID: fx.aliasID, UserID: fx.userID, Status: "staging",
@@ -257,7 +279,7 @@ func TestCodexAccountPromoteRelinkRaceLiveDB(t *testing.T) {
 			if err != nil || n != 1 {
 				t.Fatalf("BumpCodexMaterialRevision = (%d, %v)", n, err)
 			}
-		}},
+		}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			env := setupCodexLiveDB(t)
@@ -284,6 +306,10 @@ func TestCodexAccountPromoteRelinkRaceLiveDB(t *testing.T) {
 			}
 			if raced != 1 || n != 0 {
 				t.Fatalf("raced=%d promoted=%d, want the race injected once and nothing promoted", raced, n)
+			}
+			if tc.wantFailed {
+				assertHoldFailed(t, env, fx.runID, held, ErrCodexAccountTupleMismatch)
+				return
 			}
 			assertStillHeld(t, env, fx.runID, held)
 		})
@@ -503,7 +529,8 @@ func TestCodexAccountPromoteAccountLockNowaitLiveDB(t *testing.T) {
 // (here, relinking the alias to a DIFFERENT identity) blocks on that row until the promoter's
 // transaction ends. The promoter decides on the state it locked (the frozen identity, healthy),
 // promotes and commits; only then does the relink land. The next claim re-runs the full
-// predicate against the relinked alias, so the promotion never releases a credential by itself.
+// predicate against the relinked alias and fails the run credential_unavailable on the identity
+// mismatch, delivering nothing, so the promotion never releases a credential by itself.
 func TestCodexAccountPromoteRelinkWaitsOnAliasLockLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	fx, svc := heldCodexFix(t, env)
@@ -577,13 +604,24 @@ func TestCodexAccountPromoteRelinkWaitsOnAliasLockLiveDB(t *testing.T) {
 		fx.aliasID).Scan(&linked); err != nil || linked != otherAccount {
 		t.Fatalf("alias links %s (%v), want the relinked account %s", linked, err, otherAccount)
 	}
+	payload, err := fx.svc.Claim(env.ctx, fx.claimant(t, true), nil)
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	fx.assertNoClaudeFallback(t, payload)
+	if r := mustRun(t, env, fx.runID); r.Status != "failed" || r.FailOrigin.String != "credential_unavailable" ||
+		!strings.Contains(r.FailureReason.String, ErrCodexAccountTupleMismatch.Error()) {
+		t.Fatalf("after claim: status=%s origin=%v reason=%q, want failed credential_unavailable on the identity mismatch",
+			r.Status, r.FailOrigin, r.FailureReason.String)
+	}
 }
 
 // TestCodexAccountPromoteSurvivorRecoveryLiveDB is the PRD's survivor leg: a held run whose account
 // was quarantined with verified recovery material at its current generation (the protect-before-
 // park path of a failed refresh). One Sweep tick runs the survivor pass (PromoteCodexRecovery
 // installs the material, generation+1, quarantine cleared, credential_revision unchanged) and
-// then, in the same tick, the account promotion pass, so the run is queued after that one tick.
+// then, in the same tick, the account promotion pass (which runs after it, at the tail of Sweep),
+// so the run is queued after that one tick.
 // The next claim delivers the recovered login's access token at the new generation, and none of
 // the refresh material or the pre-quarantine token.
 func TestCodexAccountPromoteSurvivorRecoveryLiveDB(t *testing.T) {
@@ -618,8 +656,10 @@ func TestCodexAccountPromoteSurvivorRecoveryLiveDB(t *testing.T) {
 	svc := parkHeldCodexFix(t, env, fx)
 	held := mustRun(t, env, fx.runID)
 
-	// The recovery blob verifies as this account; every other account's leftover recovery
-	// material in the shared database defers, so this tick changes no foreign account.
+	// The recovery blob verifies as this account. Every other account's leftover recovery
+	// material in the shared database fails identity discovery, so this fake promotes none of
+	// it; the tick can still reap or quarantine other leftover accounts, which this test does not
+	// assert on.
 	svc.SetCodexRefresh(&fakeRefreshClient{
 		identityByToken: map[string]codexauth.Identity{
 			recAccess: {ProviderUserID: acct.ProviderUserID, WorkspaceAccountID: acct.WorkspaceAccountID},
@@ -636,8 +676,11 @@ func TestCodexAccountPromoteSurvivorRecoveryLiveDB(t *testing.T) {
 		t.Fatalf("account coord=%s gen=%d recovery=%d rev=%d, want the recovery promoted (idle, gen %d, slot empty, rev %d)",
 			after.CoordState, after.Generation, len(after.RecoverySealed), after.CredentialRevision, gen+1, acct.CredentialRevision)
 	}
-	if res.CodexRefreshRecovered < 1 || res.CodexAccountPromoted < 1 {
-		t.Fatalf("recovered=%d promoted=%d, want both >= 1 in the one tick", res.CodexRefreshRecovered, res.CodexAccountPromoted)
+	// The account state above proves the survivor promoted this account's recovery; the
+	// promotion count is asserted rather than the survivor's, whose tally mixes in other
+	// tests' leftover accounts.
+	if res.CodexAccountPromoted < 1 {
+		t.Fatalf("promoted=%d, want >= 1 in the one tick", res.CodexAccountPromoted)
 	}
 	assertPromoted(t, env, fx.runID, held)
 

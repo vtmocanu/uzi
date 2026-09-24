@@ -335,6 +335,10 @@ func TestCodexAccountHoldNotClaimedThenParkedLiveDB(t *testing.T) {
 				t.Fatalf("status=%s gen=%d, want queued at 1", before.Status, before.ClaimGeneration)
 			}
 			svc := gateSweepService(env, fx.svc)
+			// This test pins the park. The same Sweep's promotion pass (at its tail) would
+			// re-admit and resume the A1 leg (PRD #1590 M4, D5; pinned in
+			// codex_account_readmit_livedb_test.go), so its page is started past every id here.
+			svc.codexPromote.after = uuid.Max
 			res, err := svc.Sweep(env.ctx)
 			if err != nil {
 				t.Fatalf("Sweep: %v", err)
