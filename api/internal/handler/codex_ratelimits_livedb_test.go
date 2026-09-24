@@ -27,6 +27,7 @@ type codexAccountJSON struct {
 	Aliases       []string `json:"aliases"`
 	IsDefault     bool     `json:"is_default"`
 	Status        string   `json:"status"`
+	Reason        string   `json:"reason"`
 	LastSuccessAt string   `json:"last_success_at"`
 	Stale         *bool    `json:"stale"`
 	Buckets       []struct {
@@ -165,7 +166,8 @@ func TestCodexRateLimitsReadSurfaceLiveDB(t *testing.T) {
 	// reauth_required=true requires the observed (generation, credential_revision) set too
 	// (codex_provider_account_reauth_coherence, 00239).
 	mustExecT(ctx, t, pool, `UPDATE codex_provider_account
-		SET reauth_required = true, reauth_generation = 0, reauth_credential_revision = 0 WHERE id = $1`, acctReauth)
+		SET reauth_required = true, reauth_generation = 0, reauth_credential_revision = 0,
+		    reauth_reason = 'provider_rejected' WHERE id = $1`, acctReauth)
 
 	acctDup := seedAccount(t, userA, []string{"dup-a", "dup-b"}, false) // two aliases ⇒ one account
 	seedRL(t, userA, acctDup, buckets(33), now, now)
@@ -262,6 +264,16 @@ func TestCodexRateLimitsReadSurfaceLiveDB(t *testing.T) {
 		if reauth.Status != codexRateLimitStatusCredentialActionRequired {
 			t.Errorf("reauth-sub status = %q, want credential_action_required (reauth overrides a fresh reading)", reauth.Status)
 		}
+		// issue #1594: the stored provider_rejected reason reaches the owner DTO, and no
+		// other account carries a reason.
+		if reauth.Reason != "provider_rejected" {
+			t.Errorf("reauth-sub reason = %q, want provider_rejected", reauth.Reason)
+		}
+		for alias, a := range byAlias {
+			if alias != "reauth-sub" && a.Reason != "" {
+				t.Errorf("%s reason = %q, want absent", alias, a.Reason)
+			}
+		}
 
 		dup := byAlias["dup-a"]
 		if len(dup.Aliases) != 2 || dup.Aliases[0] != "dup-a" || dup.Aliases[1] != "dup-b" {
@@ -307,9 +319,20 @@ func TestCodexRateLimitsReadSurfaceLiveDB(t *testing.T) {
 		// Other live-DB tests may seed their own users; assert only on ours.
 		byEmail := map[string]int{}
 		locked := map[string]bool{}
+		adminReason := ""
 		for _, u := range body.Users {
 			byEmail[u.Email] = len(u.Accounts)
 			locked[u.Email] = u.VaultLocked
+			for _, a := range u.Accounts {
+				if u.Email == emailA && len(a.Aliases) > 0 && a.Aliases[0] == "reauth-sub" {
+					adminReason = a.Reason
+				}
+			}
+		}
+		// issue #1594: the admin read carries the same reason (unless userA's vault is
+		// locked, which takes precedence and suppresses it).
+		if want := map[bool]string{false: "provider_rejected", true: ""}[locked[emailA]]; adminReason != want {
+			t.Errorf("admin: reauth-sub reason = %q, want %q", adminReason, want)
 		}
 		if byEmail[emailA] != 6 {
 			t.Fatalf("admin: %s has %d accounts, want 6 (dup collapsed)", emailA, byEmail[emailA])

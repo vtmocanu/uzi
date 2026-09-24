@@ -34,6 +34,11 @@ const (
 	codexRateLimitStatusPollingDisabled          = "polling_disabled"
 )
 
+// codexRateLimitReasonProviderRejected is the only CodexAccountRateLimitDTO.Reason value
+// (issue #1594): the account's reauth_reason as stored by the provider-rejection refresh
+// transaction. Any other stored reason maps to "" (no reason shown).
+const codexRateLimitReasonProviderRejected = "provider_rejected"
+
 // SelfCodexRateLimits returns the caller's Codex account rate-limit meters, ONE PER
 // LINKED SUBSCRIPTION ACCOUNT (PRD #1209 M3) — the Codex sibling of SelfRateLimits.
 // RequireUser (session OR a user-scoped CLI token), scoped to the caller by the query's
@@ -64,7 +69,7 @@ func (h *Handler) SelfCodexRateLimits(w http.ResponseWriter, r *http.Request) {
 	accounts := make([]apitypes.CodexAccountRateLimitDTO, 0, len(rows))
 	for _, row := range rows {
 		accounts = append(accounts, h.codexAccountDTO(
-			row.ProviderAccountID, row.Aliases, row.IsDefault, row.ReauthRequired,
+			row.ProviderAccountID, row.Aliases, row.IsDefault, row.ReauthRequired, row.ReauthReason,
 			row.Buckets, row.LastSuccessAt, row.LastAttemptAt, vaultLocked,
 		))
 	}
@@ -107,7 +112,7 @@ func (h *Handler) AdminCodexRateLimits(w http.ResponseWriter, r *http.Request) {
 		}
 		grp := &users[len(users)-1]
 		grp.Accounts = append(grp.Accounts, h.codexAccountDTO(
-			row.ProviderAccountID, row.Aliases, row.IsDefault, row.ReauthRequired,
+			row.ProviderAccountID, row.Aliases, row.IsDefault, row.ReauthRequired, row.ReauthReason,
 			row.Buckets, row.LastSuccessAt, row.LastAttemptAt, grp.VaultLocked,
 		))
 	}
@@ -118,8 +123,9 @@ func (h *Handler) AdminCodexRateLimits(w http.ResponseWriter, r *http.Request) {
 // codexAccountDTO maps one store row's shared fields onto a CodexAccountRateLimitDTO,
 // deriving the status and normalizing the two collection fields to non-nil slices (the
 // contract keeps aliases and buckets PRESENT, never null). Both store reads carry these
-// same fields, so the two handlers share this one builder.
-func (h *Handler) codexAccountDTO(accountID uuid.UUID, aliases []string, isDefault, reauthRequired bool, buckets []byte, lastSuccessAt, lastAttemptAt pgtype.Timestamptz, vaultLocked bool) apitypes.CodexAccountRateLimitDTO {
+// same fields, so the two handlers share this one builder. reauthReason becomes the DTO's
+// reason only under credential_action_required and only for the closed-set value.
+func (h *Handler) codexAccountDTO(accountID uuid.UUID, aliases []string, isDefault, reauthRequired bool, reauthReason pgtype.Text, buckets []byte, lastSuccessAt, lastAttemptAt pgtype.Timestamptz, vaultLocked bool) apitypes.CodexAccountRateLimitDTO {
 	status := codexRateLimitStatus(h.cfg.CodexUsagePollInterval, vaultLocked, reauthRequired, lastSuccessAt, lastAttemptAt, time.Now())
 
 	// Aliases and buckets are contract fields with no omitempty, so a nil slice would
@@ -148,6 +154,9 @@ func (h *Handler) codexAccountDTO(accountID uuid.UUID, aliases []string, isDefau
 		IsDefault: isDefault,
 		Status:    status,
 		Buckets:   bucketsDTO,
+	}
+	if status == codexRateLimitStatusCredentialActionRequired && reauthReason.Valid && reauthReason.String == codexRateLimitReasonProviderRejected {
+		dto.Reason = codexRateLimitReasonProviderRejected
 	}
 	if lastSuccessAt.Valid {
 		dto.LastSuccessAt = lastSuccessAt.Time.UTC().Format(time.RFC3339)

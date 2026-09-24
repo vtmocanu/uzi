@@ -152,6 +152,16 @@ var (
 	// ErrCodexRefreshNoToken: the account's sealed login carries no refresh token, so
 	// there is nothing to exchange. Terminal for this attempt; never spends a call.
 	ErrCodexRefreshNoToken = errors.New("codex account login has no refresh token to exchange")
+	// ErrCodexRefreshRejected: the provider explicitly rejected this operation's refresh
+	// material (a 400/401 carrying refresh_token_expired, refresh_token_reused,
+	// refresh_token_invalidated or invalid_grant; see codexauth.AuthError.
+	// RefreshMaterialRejected), AND the rejection was recorded durably in one transaction:
+	// the account is quarantined with reauth_required and reauth_reason='provider_rejected',
+	// and the intent is 'unrecoverable' (issue #1594). It is only ever returned wrapped
+	// together with ErrCodexRefreshUnrecoverable (errors.Is holds for both), so every
+	// caller that already maps the unrecoverable outcome keeps doing so. Never returns a
+	// token. Rides CodexRefreshQuarantined.
+	ErrCodexRefreshRejected = errors.New("codex refresh rejected by the provider; re-login required")
 	// errCodexObservedAhead: the caller's observed generation is HIGHER than the
 	// account's current generation, which cannot happen for an honest caller (the account
 	// is authoritative). Defensive; refuses to rotate on an impossible observation.
@@ -381,13 +391,22 @@ func CodexTimingMS(d time.Duration) int64 {
 // logCodexRefreshPhase emits one secret-free per-phase timing record, correlated by the
 // non-secret operation_id. Called unconditionally after each phase so a cancellation/
 // deadline is captured even when no later phase runs.
+//
+// When err is a *codexauth.AuthError carrying an OAuth error code, the record also carries
+// "oauth_error": that field is always "" or a member of codexauth's closed code set (the
+// parser normalises anything else to "unknown"), so it is secret-free by construction.
 func logCodexRefreshPhase(operationID uuid.UUID, phase string, start time.Time, err error) {
-	slog.Info(codexTimingMsgPhase,
+	attrs := []any{
 		"operation_id", operationID.String(),
 		"phase", phase,
 		"elapsed_ms", CodexTimingMS(time.Since(start)),
 		"result", CodexTimingResult(err),
-	)
+	}
+	var authErr *codexauth.AuthError
+	if errors.As(err, &authErr) && authErr.OAuthCode != "" {
+		attrs = append(attrs, "oauth_error", authErr.OAuthCode)
+	}
+	slog.Info(codexTimingMsgPhase, attrs...)
 }
 
 // logCodexRefreshService emits the service-total timing record for one coordinated refresh.
@@ -587,16 +606,34 @@ func (s *Service) advanceCodexRefresh(ctx context.Context, q codexRefreshStore, 
 		return CodexRefreshResult{Outcome: CodexRefreshContended}, ErrCodexRefreshContended
 	}
 
-	// (5) Exactly one provider exchange. On error the outcome is AMBIGUOUS (the provider
-	// may have rotated server-side before the transport failed), so the intent is LEFT
-	// 'rotating' for a survivor to reconcile — never a blind retry of the old refresh
-	// token. The lease expires and routes to quarantine.
+	// (5) Exactly one provider exchange. On error the outcome is AMBIGUOUS by default (the
+	// provider may have rotated server-side before the transport failed, and a bare 400/401
+	// does not prove the presented token was unspent), so the intent is LEFT 'rotating' for a
+	// survivor to reconcile — never a blind retry of the old refresh token. The lease expires
+	// and routes to quarantine.
+	//
+	// The one narrow exception (issue #1594) is an explicit rejection of the refresh
+	// material itself: a 400/401 whose OAuth error code is refresh_token_expired,
+	// refresh_token_reused, refresh_token_invalidated or invalid_grant
+	// (codexauth.AuthError.RefreshMaterialRejected). The provider has then said this login
+	// can never refresh again, so waiting for a survivor only delays the re-login the user
+	// must do anyway. The rejection is recorded in ONE fenced transaction
+	// (store.QuarantineRejectedCodexRefresh: account quarantined + reauth_required with
+	// reason 'provider_rejected', intent 'unrecoverable'). It still never re-spends the token
+	// and never releases one. If that transaction does not apply (a fence moved, a recovery
+	// slot exists, a DB error), the outcome falls back to exactly the ambiguous result below.
 	providerCtx, cancelProvider := context.WithDeadline(ctx, providerDeadline)
 	defer cancelProvider()
 	oauthStart := time.Now()
 	result, rerr := s.codexRefresh.Refresh(providerCtx, prev.RefreshToken)
 	logCodexRefreshPhase(operationID, codexRefreshPhaseOAuthPost, oauthStart, rerr)
 	if rerr != nil {
+		var authErr *codexauth.AuthError
+		if errors.As(rerr, &authErr) && authErr.RefreshMaterialRejected() {
+			if s.recordCodexRefreshRejection(ctx, userID, accountID, operationID, acct.Generation) {
+				return CodexRefreshResult{Outcome: CodexRefreshQuarantined}, fmt.Errorf("%w: %w", ErrCodexRefreshRejected, ErrCodexRefreshUnrecoverable)
+			}
+		}
 		return CodexRefreshResult{Outcome: CodexRefreshContended}, fmt.Errorf("codex refresh: provider exchange: %w", rerr)
 	}
 
@@ -760,6 +797,58 @@ func (s *Service) codexRetainUnverifiedMaterial(ctx context.Context, q codexRefr
 		return CodexRefreshResult{Outcome: CodexRefreshQuarantined}, fmt.Errorf("%w: %v", ErrCodexRefreshUnrecoverable, perr)
 	}
 	return CodexRefreshResult{Outcome: CodexRefreshQuarantined}, fmt.Errorf("%w: fresh access-token identity claims are unverified", ErrCodexRefreshQuarantined)
+}
+
+// codexRefreshRejector records a provider rejection of an operation's refresh material
+// (issue #1594). store.QuarantineRejectedCodexRefresh is the production implementation
+// (reached through Service.txBeginner); tests inject a recording fake via
+// Service.codexRejector.
+type codexRefreshRejector interface {
+	QuarantineRejectedCodexRefresh(ctx context.Context, arg store.QuarantineRejectedCodexRefreshParams) (store.CodexRejectionOutcome, error)
+}
+
+// codexRejectionWriteTimeout bounds the rejection transaction on its detached context.
+const codexRejectionWriteTimeout = 5 * time.Second
+
+// codexRejectionTransition runs the rejection transaction: the injected codexRejector when
+// set, else store.QuarantineRejectedCodexRefresh over s.txBeginner. With neither wired it
+// applies nothing (NotApplied, nil), which the caller treats as the ambiguous outcome.
+func (s *Service) codexRejectionTransition(ctx context.Context, arg store.QuarantineRejectedCodexRefreshParams) (store.CodexRejectionOutcome, error) {
+	if s.codexRejector != nil {
+		return s.codexRejector.QuarantineRejectedCodexRefresh(ctx, arg)
+	}
+	if s.txBeginner != nil {
+		return store.QuarantineRejectedCodexRefresh(ctx, s.txBeginner, arg)
+	}
+	return store.CodexRejectionNotApplied, nil
+}
+
+// recordCodexRefreshRejection runs the rejection transition on a DETACHED, bounded context
+// (the same idiom as writeCodexRecoverySlotOnce): the provider already answered, so a
+// request ctx cancelled after the reply must not stop the rejection from being recorded.
+// It reports whether the transition applied. A not-applied or failed transition is logged
+// (ids and a fixed reason only, never token material) and reported false, so the caller
+// returns the ambiguous outcome.
+func (s *Service) recordCodexRefreshRejection(ctx context.Context, userID, accountID, operationID uuid.UUID, fromGeneration int64) bool {
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), codexRejectionWriteTimeout)
+	defer cancel()
+	outcome, err := s.codexRejectionTransition(rctx, store.QuarantineRejectedCodexRefreshParams{
+		UserID:         userID,
+		AccountID:      accountID,
+		OperationID:    operationID,
+		FromGeneration: fromGeneration,
+	})
+	if err != nil {
+		slog.Warn("codex refresh: provider rejection could not be recorded; leaving the outcome ambiguous",
+			"account", accountID, "operation", operationID, "result", CodexTimingResult(err))
+		return false
+	}
+	if outcome != store.CodexRejectionApplied {
+		slog.Warn("codex refresh: provider rejection not applied (fence moved or recovery material exists); leaving the outcome ambiguous",
+			"account", accountID, "operation", operationID)
+		return false
+	}
+	return true
 }
 
 // persistCodexRecoverySlot writes freshly-rotated (single-use) codex material into the

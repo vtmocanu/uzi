@@ -1543,6 +1543,10 @@ type Service struct {
 	// provider, so a deployment (or test) without it never rotates. Production wires it
 	// through SetCodexRefresh for the public Codex path activated by PRD #1429.
 	codexRefresh CodexRefreshClient
+	// codexRejector records a provider rejection of refresh material (issue #1594). Nil in
+	// production: codexRejectionTransition then runs store.QuarantineRejectedCodexRefresh
+	// over txBeginner. Tests set it to a recording fake.
+	codexRejector codexRefreshRejector
 	// Two narrow settings views over the same *settings.Cache: `settings` =
 	// judge/self-improve reads, `healthSettings` = run-health reads (interface
 	// segregation — each feature's tests fake only what they use).

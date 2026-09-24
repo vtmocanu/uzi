@@ -45,11 +45,20 @@ type CodexRateLimitBucketDTO struct {
 //
 //	no_subscription | pending | no_reading | fresh | stale | vault_locked |
 //	credential_action_required | polling_disabled
+//
+// reason (omitempty) says WHY a credential_action_required account needs action. It is a
+// CLOSED set, set only when status is credential_action_required (issue #1594):
+//
+//	provider_rejected — the saved Codex login was rejected by the provider; add a login
+//	                    used only by uzi.
+//
+// It is absent for every other status and for a re-login flagged for any other reason.
 type CodexAccountRateLimitDTO struct {
 	AccountID     string                    `json:"account_id"`
 	Aliases       []string                  `json:"aliases"`
 	IsDefault     bool                      `json:"is_default"`
 	Status        string                    `json:"status"`
+	Reason        string                    `json:"reason,omitempty"`
 	LastSuccessAt string                    `json:"last_success_at,omitempty"`
 	Stale         *bool                     `json:"stale,omitempty"`
 	Buckets       []CodexRateLimitBucketDTO `json:"buckets"`

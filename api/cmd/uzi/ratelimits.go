@@ -115,14 +115,15 @@ func codexRateLimitRows(accts []apitypes.CodexAccountRateLimitDTO) [][]string {
 	rows := make([][]string, 0, len(accts))
 	for _, a := range accts {
 		acct := codexAccountCell(a)
+		status := codexRateLimitStatusCell(a)
 		if len(a.Buckets) == 0 {
-			rows = append(rows, []string{acct, a.Status, "-", "—", "—", "—"})
+			rows = append(rows, []string{acct, status, "-", "—", "—", "—"})
 			continue
 		}
 		for _, b := range a.Buckets {
 			rows = append(rows, []string{
 				acct,
-				a.Status,
+				status,
 				codexBucketCell(b),
 				codexPctCell(b.Primary),
 				codexPctCell(b.Secondary),
@@ -131,6 +132,15 @@ func codexRateLimitRows(accts []apitypes.CodexAccountRateLimitDTO) [][]string {
 		}
 	}
 	return rows
+}
+
+// codexRateLimitStatusCell renders an account's STATUS cell: the closed-set status, plus a short
+// explanation when the server named why the account needs action (issue #1594).
+func codexRateLimitStatusCell(a apitypes.CodexAccountRateLimitDTO) string {
+	if a.Reason == "provider_rejected" {
+		return a.Status + " (login rejected by provider)"
+	}
+	return a.Status
 }
 
 // runAdminCodexRateLimits renders the factory-wide per-user Codex meters (PRD #1209 M3),
