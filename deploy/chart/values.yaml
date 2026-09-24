@@ -1035,6 +1035,28 @@ workers:
       - name: allow-anthropic
         fqdn: "*.anthropic.com"
         ports: [443]
+      # The Codex (OpenAI) endpoints, PRD #1106 D12. FLEET-WIDE for the restricted
+      # tier: this is a namespace-level policy, so every worker in it can reach these
+      # three, including workers that only ever run Claude. Accepted as symmetric with
+      # *.anthropic.com above (an unauthenticated POST to either vendor is the same
+      # exfiltration class); a per-harness worker pool was rejected.
+      #   api.openai.com   -> the API-key endpoint
+      #   chatgpt.com      -> the ChatGPT Codex backend (subscription auth)
+      #   auth.openai.com  -> the OpenAI auth host
+      # EXACT names on purpose: the chatgpt.com rule does NOT cover its subdomains, and
+      # no wildcard or further OpenAI host is added until a real M6 provisioning failure
+      # names one (the "expand from a REAL failure" rule above). Per the REPLACED-not-
+      # merged note above, any deployment values that override this list must add the
+      # same three before live Codex verification.
+      - name: allow-openai-api
+        fqdn: "api.openai.com"
+        ports: [443]
+      - name: allow-chatgpt
+        fqdn: "chatgpt.com"
+        ports: [443]
+      - name: allow-openai-auth
+        fqdn: "auth.openai.com"
+        ports: [443]
       - name: allow-nix-substituters
         fqdn: "cache.nixos.org"
         ports: [443]

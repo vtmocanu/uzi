@@ -1,0 +1,70 @@
+# CANARY: liveness fixture for the Codex egress SHAPE check (check_codex_egress) in
+# scripts/assert-chart-render.sh (PRD #1106 D12, issue #1623). This is a
+# DELIBERATELY-WRONG slice of a worker egress render, carrying one error per finding
+# class the check must name:
+#   - `chatgpt.com` is allowed on port 80, not TCP 443 only (wrong ports);
+#   - an extra `*.openai.com` Allow, a wildcard widening D12 forbids (unexpected host);
+#   - `auth.openai.com` has NO Allow entry at all (missing host).
+# `api.openai.com` on TCP 443 is CORRECT on purpose, so the check must NOT name it.
+# assert-chart-render.sh runs the check against this file before checking the real
+# render and requires rc=1 with all three exact FAIL lines; any other outcome means
+# the instrument is broken (exit 2).
+#
+# Do NOT "fix" this file: correcting any of the three errors silences the canary and
+# the gate would stop proving the shape check works. This file holds no secrets.
+apiVersion: crd.antrea.io/v1beta1
+kind: NetworkPolicy
+metadata:
+  name: uzi-worker-egress
+  namespace: uzi-workers
+spec:
+  priority: 5
+  tier: application
+  appliedTo:
+    - podSelector:
+        matchLabels:
+          app.kubernetes.io/name: uzi-hosted-worker
+  egress:
+    - name: drop-cloud-metadata
+      action: Drop
+      to:
+        - ipBlock:
+            cidr: 169.254.169.254/32
+    - name: allow-anthropic
+      action: Allow
+      to:
+        - fqdn: "*.anthropic.com"
+      ports:
+        - protocol: TCP
+          port: 443
+    - name: allow-openai-api
+      action: Allow
+      to:
+        - fqdn: "api.openai.com"
+      ports:
+        - protocol: TCP
+          port: 443
+    # WRONG ON PURPOSE: port 80, not 443 -- see the CANARY header above.
+    - name: allow-chatgpt
+      action: Allow
+      to:
+        - fqdn: "chatgpt.com"
+      ports:
+        - protocol: TCP
+          port: 80
+    # WRONG ON PURPOSE: a wildcard OpenAI widening -- see the CANARY header above.
+    - name: allow-openai-wildcard
+      action: Allow
+      to:
+        - fqdn: "*.openai.com"
+      ports:
+        - protocol: TCP
+          port: 443
+    # allow-openai-auth (auth.openai.com) is OMITTED ON PURPOSE -- see the CANARY header.
+    - name: allow-forge-gitlab-example-com
+      action: Allow
+      to:
+        - fqdn: "gitlab.example.com"
+      ports:
+        - protocol: TCP
+          port: 443
