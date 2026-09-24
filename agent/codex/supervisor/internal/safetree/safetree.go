@@ -36,9 +36,12 @@
 // the chmod fails and the walk stops with ErrIO. Remove reports ErrNotExist
 // only when the root's first O_PATH open finds no entry; the root vanishing
 // after that (between the two opens, at the recheck, or before its rmdir), like
-// a verified descendant directory vanishing before its rmdir, is ErrMismatch:
+// a descendant directory vanishing after its O_PATH open (between its two opens
+// or after it was emptied), is ErrMismatch:
 // a peer moved it (so it may still exist elsewhere) or removed it, and Remove
-// cannot tell which, so it never claims the tree is absent.
+// cannot tell which, so it never claims the tree is absent. A descendant that
+// vanishes between its fstatat and its first open is ErrIO; that is also never
+// "absent".
 //
 // Every entry is lstat'ed (fstatat AT_SYMLINK_NOFOLLOW), must sit on the pinned
 // root's filesystem (st_dev == Pin.Dev), and must be owned by the pinned uid; a

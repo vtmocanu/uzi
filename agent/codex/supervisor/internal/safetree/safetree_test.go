@@ -1216,7 +1216,7 @@ func TestOpenDirNoFollow(t *testing.T) {
 }
 
 // A verified root that disappears at the recheck (renamed away, nothing put
-// back) was moved, not removed: ErrMismatch, never "absent".
+// back) was moved or removed by a peer: ErrMismatch, never "absent".
 func TestRemoveRootVanishedAtRecheckIsMismatch(t *testing.T) {
 	if !requireNonRootCommandUID(t) {
 		return
@@ -1305,4 +1305,33 @@ func TestRemoveRootVanishedBeforeRmdirIsMismatch(t *testing.T) {
 		t.Fatalf("Remove = %v, want ErrMismatch", err)
 	}
 	assertExists(t, f.root()+".orig")
+}
+
+// A descendant directory that vanishes after it was opened and emptied, before
+// its rmdir, is ErrMismatch like the root.
+func TestRemoveDescendantVanishedBeforeRmdirIsMismatch(t *testing.T) {
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	f := newFixture(t)
+	pin := f.createTree(t)
+	sub := filepath.Join(f.root(), "sub")
+	mustMkdir(t, sub)
+	mustWrite(t, filepath.Join(sub, "leaf"), "x")
+	moved := filepath.Join(f.base, "moved")
+	setFstatat(t, func(real func(int, string, *unix.Stat_t, int) error, dirfd int, path string, st *unix.Stat_t, flags int) error {
+		err := real(dirfd, path, st, flags)
+		if path == "leaf" {
+			if rerr := os.Rename(sub, moved); rerr != nil {
+				t.Errorf("rename: %v", rerr)
+			}
+		}
+		return err
+	})
+
+	err := Remove(f.parentFd, treeName, pin)
+	if !errors.Is(err, ErrMismatch) {
+		t.Fatalf("Remove = %v, want ErrMismatch", err)
+	}
+	assertExists(t, moved)
 }
