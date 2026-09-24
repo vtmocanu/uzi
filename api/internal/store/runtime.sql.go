@@ -474,7 +474,7 @@ UPDATE runs SET
     status             = 'cancelled',
     status_since       = now(),
     fail_origin        = NULL,
-    move_pending_since = now(),
+    move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END,
     finished_at        = now(),
     -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
     milestones_in_progress = NULL,
@@ -513,7 +513,7 @@ func (q *Queries) CancelRunByWorker(ctx context.Context, arg CancelRunByWorkerPa
 }
 
 const cancelRunServerSide = `-- name: CancelRunServerSide :execrows
-UPDATE runs SET status = 'cancelled', status_since = now(), stop_kind = 'cancelled', move_pending_since = now(), finished_at = now(),
+UPDATE runs SET status = 'cancelled', status_since = now(), stop_kind = 'cancelled', move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END, finished_at = now(),
     -- PRD #503 M3: persist the operator's OPTIONAL cancel reason. @stop_reason binds a
     -- nullable pgtype.Text: an invalid/zero value stores NULL (no reason supplied).
     stop_reason = $1,
@@ -550,7 +550,7 @@ func (q *Queries) CancelRunServerSide(ctx context.Context, arg CancelRunServerSi
 }
 
 const cancelRunServerSideWithPendingOutcome = `-- name: CancelRunServerSideWithPendingOutcome :execrows
-UPDATE runs SET status = 'cancelled', status_since = now(), stop_kind = 'cancelled', move_pending_since = now(), finished_at = now(),
+UPDATE runs SET status = 'cancelled', status_since = now(), stop_kind = 'cancelled', move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END, finished_at = now(),
     stop_reason = $1,
     milestones_in_progress = NULL,
     milestones_agents = NULL,
@@ -3114,7 +3114,7 @@ UPDATE runs SET status = 'failed', status_since = now(),
     -- deliberately (see 00126) so this failed writer, like every other, sets a
     -- non-NULL origin without a consumer joining two columns.
     fail_origin        = 'auto_stopped',
-    move_pending_since = now(),
+    move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END,
     finished_at        = now(),
     -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
     milestones_in_progress = NULL,
@@ -3234,7 +3234,7 @@ func (q *Queries) FailRunAutoStop(ctx context.Context, arg FailRunAutoStopParams
 const failRunsMissingFromSnapshot = `-- name: FailRunsMissingFromSnapshot :many
 UPDATE runs SET status = 'failed', status_since = now(), failure_reason = $1,
     fail_origin = 'worker_lost',
-    move_pending_since = now(), finished_at = now(),
+    move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END, finished_at = now(),
     milestones_in_progress = NULL,
     milestones_agents = NULL,
     pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
@@ -3314,7 +3314,7 @@ WITH locked AS (
 UPDATE runs SET status = 'failed', status_since = now(), failure_reason = $1,
     -- PRD #69 M7a: the trusted failure class for an orphaned run whose worker is gone.
     fail_origin = 'worker_lost',
-    move_pending_since = now(), finished_at = now(),
+    move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END, finished_at = now(),
     -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
     milestones_in_progress = NULL,
     milestones_agents = NULL,
@@ -3395,7 +3395,7 @@ const failWorkerRunsOverCap = `-- name: FailWorkerRunsOverCap :many
 UPDATE runs SET status = 'failed', status_since = now(), failure_reason = $1,
     -- PRD #69 M7a: the trusted failure class for an orphaned run whose worker is gone.
     fail_origin = 'worker_lost',
-    move_pending_since = now(), finished_at = now(),
+    move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END, finished_at = now(),
     -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
     milestones_in_progress = NULL,
     milestones_agents = NULL,
@@ -6377,6 +6377,10 @@ type ListPendingColumnMovesParams struct {
 	MaxBatch     int32              `json:"max_batch"`
 }
 
+// Only a run with a board card (issue_iid set) is ever stamped: every terminal writer
+// sets move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END (issue
+// #1482), so a judge/chat/ci_fix/prompt/task run never enters this loop or the
+// give-up warning below, whose "manual heal" cannot exist for a card-less run.
 // Reconcile-loop candidates: runs with a pending column move that is older than a
 // short grace (so the inline move is not raced) and still inside the 30-minute
 // retry window (older markers have been given up on and are deliberately left
@@ -8005,7 +8009,7 @@ UPDATE runs SET
     -- 'guardrail_blocked') and passes it here, so the class survives the assembly that
     -- would otherwise collapse into one indistinguishable failure_reason.
     fail_origin        = $2,
-    move_pending_since = now(),
+    move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END,
     finished_at        = now(),
     -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
     milestones_in_progress = NULL,
@@ -9502,7 +9506,7 @@ const rejectRunServerSide = `-- name: RejectRunServerSide :execrows
 UPDATE runs SET status = 'failed', status_since = now(), stop_kind = 'plan_rejected',
     -- PRD #69 M7a: trusted failure class, overlapping stop_kind deliberately (see 00126).
     fail_origin = 'plan_rejected',
-    failure_reason = $1, move_pending_since = now(), finished_at = now(),
+    failure_reason = $1, move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END, finished_at = now(),
     -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
     milestones_in_progress = NULL,
     milestones_agents = NULL,
@@ -11165,7 +11169,7 @@ UPDATE runs SET
     -- stale timeout classification. No-op on a normal completion (both already NULL).
     failure_reason     = NULL,
     fail_origin        = NULL,
-    move_pending_since = now(),
+    move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END,
     finished_at        = now(),
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
@@ -11549,7 +11553,7 @@ UPDATE runs SET
     -- push. NULL on every other failed path (only that arm sends a non-nil value).
     preserved_patch    = $3,
     session_id         = COALESCE($4, session_id),
-    move_pending_since = now(),
+    move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END,
     finished_at        = now(),
     -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
     milestones_in_progress = NULL,
@@ -13206,7 +13210,7 @@ UPDATE runs SET
     stop_reason        = 'The MR branch was advanced by a concurrent writer, so this rework was superseded and not applied. The branch and the concurrent commits are intact.',
     status_since       = now(),
     fail_origin        = NULL,
-    move_pending_since = now(),
+    move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END,
     finished_at        = now(),
     milestones_in_progress = NULL,
     milestones_agents = NULL,

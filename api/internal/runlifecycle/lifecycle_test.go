@@ -520,6 +520,31 @@ func TestTerminalCommentSweeperFailurePostsViaReconcile(t *testing.T) {
 	}
 }
 
+// A card-less autopilot run with a repo (a scheduled prompt/task, or ci_fix) carries a
+// NULL issue_iid. If a stale marker brings it to the reconcile loop, reconcileOne must
+// clear the marker and neither move a card nor post a terminal comment to issue 0, the
+// way notifyOnce already skips it (issue #1482).
+func TestReconcileCardlessRunClearsMarkerWithoutComment(t *testing.T) {
+	runID, repoID := uuid.New(), uuid.New()
+	mc := autopilotMoveCtx(repoID, 0, "failed", 0, "")
+	mc.IssueIid = pgtype.Int8{}
+	fs := &fakeStore{moveCtx: mc, columns: defaultCols()}
+	fm := &fakeMover{}
+	l := newTestLifecycle(fs, fm)
+
+	l.reconcileOne(context.Background(), runID)
+
+	if fs.claimCalls != 0 || (fm.forge != nil && len(fm.forge.notes) != 0) {
+		t.Fatalf("card-less run must not claim or post a terminal comment, claims=%d forge=%v", fs.claimCalls, fm.forge)
+	}
+	if len(fm.moves) != 0 || len(fs.recorded) != 0 {
+		t.Fatalf("card-less run must not move a card: moves=%v recorded=%v", fm.moves, fs.recorded)
+	}
+	if len(fs.cleared) != 1 || fs.cleared[0] != runID {
+		t.Fatalf("card-less run's stale marker must be cleared once, got %v", fs.cleared)
+	}
+}
+
 func TestTerminalCommentSuccessPostsMRLink(t *testing.T) {
 	runID, repoID := uuid.New(), uuid.New()
 	fs := &fakeStore{

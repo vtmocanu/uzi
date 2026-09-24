@@ -308,7 +308,7 @@ func contextFromRow(mc store.GetRunMoveContextRow) moveContext {
 		// GetRunMoveContext INNER-JOINs repos, so a row is returned only for a run
 		// with a non-NULL repo_id (a chat run yields ErrNoRows and never reaches here).
 		repoID:          uuid.UUID(mc.RepoID.Bytes),
-		issueIID:        mc.IssueIid.Int64, // valid: notifyOnce skips ci_fix runs (NULL issue_iid)
+		issueIID:        mc.IssueIid.Int64, // valid: notifyOnce and reconcileOne skip card-less runs (NULL issue_iid)
 		forgeProjectID:  mc.ForgeProjectID,
 		forgeType:       mc.ForgeType,
 		baseURL:         mc.BaseUrl,
@@ -581,6 +581,13 @@ func (l *Lifecycle) reconcileOne(ctx context.Context, runID uuid.UUID) {
 	}
 	if !mc.MovePendingSince.Valid {
 		return // healed by an inline move or manual drag since the candidate scan
+	}
+	// A card-less run (repo but no issue: ci_fix, prompt, task) has nothing to move and
+	// no issue to comment on; mirror notifyOnce's skip and clear a stale marker instead
+	// of posting an autopilot comment to issue 0 (issue #1482).
+	if !mc.IssueIid.Valid {
+		l.clearPending(ctx, runID)
+		return
 	}
 	l.apply(ctx, runID, contextFromRow(mc), reconcilerDecision(mc.Status, mc.OriginColumn))
 	// The sweeper's bulk terminal writes never call the inline notify — they only
