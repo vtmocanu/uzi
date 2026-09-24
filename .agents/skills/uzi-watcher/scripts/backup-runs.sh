@@ -162,9 +162,14 @@ RUNNER_BASE="${3:-/data/runner/'"$REPO_SLUG"'}"
 CLONE="$RUNNER_BASE/$STEM"
 [ -d "$CLONE/.git" ] || { echo "NO_CLONE $CLONE" >&2; exit 3; }
 cd "$CLONE" || exit 3
+# kubectl exec enters as the worker container user, while the runner clone can
+# belong to another UID. Trust only the verified clone for this capture;
+# never change persistent Git configuration or trust every directory.
+git(){ command git -c safe.directory="$CLONE" "$@"; }
 OUT="$(mktemp -d)"
 BR="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
 HEAD="$(git rev-parse HEAD 2>/dev/null)"
+[ -n "$BR" ] && [ -n "$HEAD" ] || { echo "invalid clone Git metadata: $CLONE" >&2; exit 7; }
 # Exclude the TRUE public remote main (REALMAIN, read from the shared BARE repo by
 # the host) so the bundle prerequisite is a commit that exists on the forge and is
 # recoverable off-PVC. The working clone advances its OWN origin/main to a private
@@ -391,6 +396,11 @@ for RID in "${RUNS[@]}"; do
   case "$st" in
     completed|failed|cancelled)
       log "SNAP $RID ($LBL) status=$st mr=${mr:-none} (status saved; no worker capture)"
+      continue ;;
+    queued)
+      # A queued run has no worker clone yet. Keep its status in the snapshot and
+      # try for work on the next cycle after a worker claims it.
+      log "SNAP $RID ($LBL) status=queued (status saved; awaiting worker capture)"
       continue ;;
   esac
   if [ -z "$wid" ]; then

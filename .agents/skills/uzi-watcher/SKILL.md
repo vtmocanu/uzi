@@ -366,6 +366,8 @@ and falling back to the durable bare tracking ref when no clone survives:
   runner tracking ref. The result vocabulary is `OK` (live clone + bundle), `PART` (live
   clone, uncommitted/status only), `BARE` (committed history only; no live WIP), and `FAIL`.
   An active-run `FAIL` exits 1, so callers cannot misread a status-only attempt as a backup.
+  A `queued` run has no worker clone yet: it gets a status-only `SNAP` and stays in
+  the loop so a later cycle captures its work after claim.
   Deployment coordinates come from env
   (`UZI_CTX`, `UZI_WORKER_NS`, `UZI_REPO_SLUG` — the last derived from `origin` if unset),
   never hard-coded. **Always pass `UZI_CTX` explicitly**: unset, it falls back to the

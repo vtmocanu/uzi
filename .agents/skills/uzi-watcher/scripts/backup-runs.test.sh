@@ -75,6 +75,7 @@ fi
 if [ "\${cmd[0]:-}" = sh ]; then
   # cmd = (sh -c <CAPTURE> _ <STEM> <REALMAIN> <RUNNER_BASE>); the host already
   # forwarded RUNNER_BASE as the last arg, so run it verbatim.
+  if [ "\${UZI_TEST_DUBIOUS:-}" = 1 ]; then export GIT_TEST_ASSUME_DIFFERENT_OWNER=1; fi
   exec "\${cmd[@]}"
 fi
 exit 0
@@ -109,7 +110,8 @@ set -u
 if [ "\${1:-}" = run ] && [ "\${2:-}" = get ]; then
   case "\${3:-}" in
     *mrr*) printf '%s' '{"status":"running","issue_iid":null,"kind":"mr_rework","branch":null,"pipeline_ref":"agent/issue-9999","worker_id":"${WID:-w0rker}","mr_iid":7777,"mr_web_url":null,"health_reason":"ok","anthropic_secret_label":"tok","anthropic_bind_mode":"default","milestones":[],"milestones_completed":[]}' ;;
-    *noworker*) printf '%s' '{"status":"queued","issue_iid":4242,"kind":"issue","branch":null,"pipeline_ref":null,"worker_id":null,"mr_web_url":null,"health_reason":"ok","anthropic_secret_label":"tok","anthropic_bind_mode":"default","milestones":[],"milestones_completed":[]}' ;;
+    *noworker*) printf '%s' '{"status":"running","issue_iid":4242,"kind":"issue","branch":null,"pipeline_ref":null,"worker_id":null,"mr_web_url":null,"health_reason":"ok","anthropic_secret_label":"tok","anthropic_bind_mode":"default","milestones":[],"milestones_completed":[]}' ;;
+    *queued*) printf '%s' '{"status":"queued","issue_iid":4242,"kind":"issue","branch":null,"pipeline_ref":null,"worker_id":null,"mr_web_url":null,"health_reason":"ok","anthropic_secret_label":"tok","anthropic_bind_mode":"default","milestones":[],"milestones_completed":[]}' ;;
     *)     printf '%s' '{"status":"running","issue_iid":4242,"kind":"issue","branch":null,"pipeline_ref":null,"worker_id":"${WID:-w0rker}","mr_web_url":null,"health_reason":"ok","anthropic_secret_label":"tok","anthropic_bind_mode":"default","milestones":[],"milestones_completed":[]}' ;;
   esac
   exit 0
@@ -156,6 +158,16 @@ grep -q "^.*PART .*run-4242" "$L1/backup.log" || fail "case1: expected PART in l
 tar tzf "$L1/issue-4242.tgz" 2>/dev/null | grep -q 'issue-4242[.]uncommitted[.]patch' \
   || fail "case1: uncommitted.patch missing (the work was not captured)"
 echo "PASS case1: uncommitted-only -> no bundle, PART, patch kept"
+
+# The worker container can exec as a different UID than the runner clone owner.
+# Git then refuses every clone operation unless this exact clone is trusted.
+L1_DUBIOUS="$(UZI_TEST_DUBIOUS=1 run_backup dubious)"
+[ -f "$L1_DUBIOUS/issue-4242.tgz" ] || fail "dubious owner: no archive"
+tar -xOzf "$L1_DUBIOUS/issue-4242.tgz" issue-4242.uncommitted.patch | grep -qF '+dirty' \
+  || fail "dubious owner: live uncommitted work was not captured"
+tar -xOzf "$L1_DUBIOUS/issue-4242.tgz" issue-4242.meta.txt | grep -qF "head=$MAIN" \
+  || fail "dubious owner: Git HEAD was not captured"
+echo "PASS dubious owner: exact clone trusted; patch and HEAD kept"
 
 # --- case 2: one committed commit -> a (small) bundle, OK -----------------------
 git_q "$RUNNER" checkout f.txt   # drop the uncommitted change
@@ -253,6 +265,18 @@ if rg --files "$ROOT6" | grep -q '[.]tgz$'; then
   fail "case6: no-worker run adopted a stale same-issue ref"
 fi
 echo "PASS case6: no worker binding refuses stale all-pod branch adoption"
+
+# A queued run has no clone to capture yet. Its status belongs in this cycle,
+# and the next cycle must still be free to capture work once it is claimed.
+L6_QUEUED="$(run_backup 6.queued queued-1)"
+L6_QUEUED_ATTEMPT="$WORK/out.6.queued/latest-attempt"
+[ -f "$L6_QUEUED_ATTEMPT/issue-4242.run.json" ] || fail "queued: status missing"
+if rg --files "$L6_QUEUED_ATTEMPT" | grep -q '[.]tgz$'; then
+  fail "queued: adopted stale work before a worker claimed the run"
+fi
+grep -q 'SNAP .*status=queued' "$L6_QUEUED_ATTEMPT/backup.log" \
+  || fail "queued: expected status-only snapshot"
+echo "PASS queued: status saved without adopting stale work"
 
 # --- case 7: relative latest target remains protected under a symlinked root ---
 git --git-dir="$BARE" update-ref -d refs/uzi-runner/agent/issue-4242
