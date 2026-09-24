@@ -253,8 +253,10 @@ and namespace from your own kubeconfig; they are deployment-specific, do not har
 2. **Bundle the branch out**, base excluded so it stays small. The bare tracking ref
    advances at checkpoint boundaries (milestone/iteration checkpoints, park, shutdown via
    `fetchBackBestEffort`; finalize via `fetchAgentBranch`) and, mid-turn, on the
-   `CHECKPOINT_TICK_INTERVAL` tick (default 5m; issue #1597) whenever the tip has moved and
-   the clone is not busy — but still not on every commit, so
+   `CHECKPOINT_TICK_INTERVAL` tick (default 5m; issue #1597) whenever the tip has moved, the
+   clone is not git-busy, the tick can acquire the per-flight sink gate, and no retained
+   bare lock blocks the sink (adr/1597-midturn-checkpoint-durability.md, "Per-flight sink
+   gate and preemption" and "Lock ownership proof") — but still not on every commit, so
    after a hard mid-milestone/mid-tick kill the **working-clone branch HEAD** is the fresher
    committed tip, when its pod still lives. For
    a run still claimed on the worker holding the clone, `scripts/backup-runs.sh RUN` is easiest
