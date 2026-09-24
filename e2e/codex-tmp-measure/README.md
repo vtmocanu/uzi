@@ -32,7 +32,13 @@ For a given ref, `run.sh`:
 4. after each command, and once at the end, records `du -sb /tmp`, the count
    of `uzi-codex-command-*` directories left in `/tmp`, the cache directory's
    size, and the count of `go: downloading` lines (a direct measure of
-   modules actually fetched over the network for that command);
+   modules actually fetched over the network for that command); per command
+   it also records the child's own exit code (`child_exit_code`, from the
+   evidence log's `child_exit` event, `null` if that event was never
+   observed), the supervisor process's own exit status (`sup_rc`), and the
+   command's wall-clock duration (`dur_ms`) — so a fast command can never be
+   silently misread as a fast, warm-cache success when it was in fact a fast
+   failure or a timed-out dispose;
 5. releases the cache holder (`{"op":"release","drained":true}`) and records
    whether the cache directory is removed or retained.
 
@@ -80,7 +86,10 @@ three runtime uids the real image creates (`worker` 10001, `runner` 10002,
   this fallback uses whatever `go` `golang:1.26-alpine` ships. `GOTOOLCHAIN`
   is forced to `local` for every measured command (see below) specifically
   so this version difference cannot inject an extra, unrelated download into
-  the "module bytes downloaded" numbers.
+  the numbers this script actually records: `du -sb` of the per-run cache
+  directory (peak and after release) and the count of `go: downloading`
+  lines in each command's output (see "What this measures" above — there is
+  no separate byte-accounted module-download total).
 - **The docker daemon here may not share a filesystem with the invoking
   shell.** `DOCKER_HOST` pointed at a TCP endpoint during development, and a
   bind-mounted host path silently resolved to an empty directory on the
@@ -135,14 +144,23 @@ depends on the two binaries and a writable API checkout being present.
   Go stores a downloaded toolchain under `GOMODCACHE` (a `golang.org/toolchain@...`
   module), so on the branch ref, once the per-run cache holder is warm, a
   downloaded toolchain would persist in the SAME per-run cache directory
-  the branch already keeps warm across commands — meaning leaving
-  `GOTOOLCHAIN` unset would make the branch's warm-cache advantage look
-  *bigger* on a cold run and identical thereafter, not merely "noisier."
-  Forcing `GOTOOLCHAIN=local` removes that source entirely so the numbers
-  in `RESULTS.md` isolate the module/build cache boundary alone; the real
-  boundary this script measures is therefore understated relative to a
-  production run that would also benefit from a persisted toolchain
-  download, not overstated.
+  the branch already keeps warm across commands, but base has no persistent
+  cache at all, so it would re-download the toolchain on EVERY command. That
+  means command 1 (cold, on both refs) would be unchanged either way — the
+  toolchain download is a one-time cold cost paid on the first command
+  regardless of `GOTOOLCHAIN` — while the gap between refs would instead
+  GROW across commands 2-5 (branch: paid once, then cached; base: paid
+  again every command), not stay "bigger on a cold run and identical
+  thereafter" as an earlier draft of this note claimed. Forcing
+  `GOTOOLCHAIN=local` removes that source entirely so the numbers in
+  `RESULTS.md` isolate the module/build cache boundary alone. Whether the
+  real boundary this script measures is therefore understated relative to
+  production is conditional, not automatic: only if a production run's
+  nix-pinned toolchain does NOT already satisfy `api/go.mod`'s `toolchain
+  go1.27.1` pin would production also pay (and, on the branch, cache) a
+  toolchain download this fallback's override suppresses; if production's
+  pinned toolchain already matches, no such download happens there either,
+  and this override changes nothing relative to production.
 - **The capability set differs from production's residue, not just from a
   hand-picked default.** `run.sh` passes `--cap-drop ALL --cap-add SETUID
   --cap-add SETGID --cap-add SETPCAP --cap-add CHOWN --cap-add DAC_OVERRIDE
@@ -223,10 +241,14 @@ redirect stdout to a file to keep the machine-readable record, e.g.:
 ```
 
 Each invocation creates its own detached worktree and image (named after the
-resolved commit sha, e.g. `m1598-img-e648d16c-e648d16cd48f`) and removes both
-on exit unless `UZI_M1598_KEEP=1`. **This does not mean nothing else is
-touched.** Two things persist outside the throwaway worktree and the
-uniquely-named `m1598-*` image/container, and neither is cleaned up by
+resolved commit sha AND a per-invocation id from its throwaway worktree's own
+`mktemp` suffix, e.g. `m1598-img-e648d16c-e648d16cd48f-a1b2c3`, never just the
+sha, so two invocations at the same ref never share an image/container name
+and one's `UZI_M1598_KEEP=1` image can never be retagged/removed by the
+other) and removes both on exit unless `UZI_M1598_KEEP=1`. **This does not
+mean nothing else is touched.** Two things persist outside the throwaway
+worktree and the uniquely-named `m1598-*` image/container, and neither is
+cleaned up by
 `run.sh`: the `golang:1.26-alpine` base image, pulled (and cached) by the
 docker daemon the first time any ref is measured, and BuildKit's own build
 cache/layer cache for the intermediate build stages, both of which persist

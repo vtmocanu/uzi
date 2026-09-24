@@ -26,7 +26,7 @@ full). Identical on both refs (same host, same fallback base image).
 | Label | Ref | Resolved sha |
 |---|---|---|
 | base | `f77d31036236289a45abe9aef6858a8c3aaa68e6` | `f77d3103` |
-| branch | `agent/issue-1598` @ HEAD | `e648d16c` |
+| branch | `agent/issue-1598`, HEAD at measurement time | `e648d16c` |
 
 **Command sequence (N=5 per ref):** for each command, the real supervisor +
 sandbox ran, as uid 10003: `--expect-uid 10003 --cleanup-token <uuid> --
@@ -102,14 +102,17 @@ Cache holder ready at `/cache/<run-uuid>` before the first command; released
 The small non-zero `/tmp` byte counts on this ref (9,887 bytes after command
 1, 5,683 bytes after commands 2-5) are **not** residue left by the supervised
 commands — every `uzi-codex-command-*` dir count is 0, meaning the
-supervisor's own tmp cleanup left nothing behind. They are **the harness's
-own files**: the release FIFO/log and, per command, the control/evidence
-FIFOs and their log/output files that `measure-inner.sh` places directly
-under `/tmp` (`m1598-hold-*`, `m1598-ctl-*`, `m1598-ev-*`, `m1598-evlog-*`,
-`m1598-cmdout-*`), measured before that command's own cleanup at the end of
-each loop iteration removes them. See "Harness files under /tmp" below;
-`measure-inner.sh` has since been changed to place these under `/work`
-instead, so a re-run would not show even this residue.
+supervisor's own tmp cleanup left nothing behind. Their attribution to **the
+harness's own files** (the release FIFO/log and, per command, the
+control/evidence FIFOs and their log/output files that `measure-inner.sh`
+placed directly under `/tmp`: `m1598-hold-*`, `m1598-ctl-*`, `m1598-ev-*`,
+`m1598-evlog-*`, `m1598-cmdout-*`) is **inferred** from reading the version of
+`measure-inner.sh` that produced this run, not observed directly (no
+per-file `du` breakdown of `/tmp` was captured at measurement time — only the
+aggregate `du -sb /tmp` byte counts in the table above). See "Harness files
+under /tmp" below; `measure-inner.sh` has since been changed to place these
+files under `/work` instead, so a re-run is **expected** to show 0 bytes
+here rather than this residue — this has not itself been re-measured.
 
 Every command's ephemeral `/tmp` residue is fully removed by the supervisor's
 own `tmpCleanup` (`{"state":"removed","reason":""}` on every dispose) — it
@@ -165,15 +168,17 @@ lines, not on a confirmed zero exit code.
 
 ## Harness files under /tmp
 
-The tiny branch-ref residues noted above (9,887 and 5,683 bytes) were the
-harness's own release FIFO/log and per-command control/evidence
-FIFOs/logs/output files, which `measure-inner.sh` placed directly under
-`/tmp` at measurement time. They have since been moved to `/work/m1598-logs`
-so the `/tmp` measurement reflects only what the supervised commands
-themselves leave behind, with no harness-file noise; the underlying finding
-(0 bytes retained on the branch ref, once supervisor-owned tmp cleanup ran)
-is unchanged, and a re-run would show exactly 0 rather than these small
-values.
+The tiny branch-ref residues noted above (9,887 and 5,683 bytes) are
+**inferred** to be the harness's own release FIFO/log and per-command
+control/evidence FIFOs/logs/output files, which `measure-inner.sh` placed
+directly under `/tmp` at measurement time — inferred from the script version
+that produced this run, not confirmed by a per-file breakdown captured
+during that run. They have since been moved to `/work/m1598-logs` so the
+`/tmp` measurement reflects only what the supervised commands themselves
+leave behind, with no harness-file noise; the underlying finding (0 bytes
+retained on the branch ref, once supervisor-owned tmp cleanup ran) is
+unchanged, and a re-run is **expected** to show exactly 0 rather than these
+small values — this expectation has not itself been re-measured.
 
 ## Bugs/observations noticed while building this harness (not part of the measurement)
 

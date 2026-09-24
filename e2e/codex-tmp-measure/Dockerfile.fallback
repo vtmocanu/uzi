@@ -11,8 +11,15 @@
 #
 # The numbers this produces are a PROXY: real /tmp, cache and network behavior
 # under the real supervisor + sandbox binaries, but without the real worker's
-# read-only root, capability drop, seccomp profile, or nix-provisioned Go
-# toolchain version pinning.
+# read-only root, seccomp profile, or nix-provisioned Go toolchain version
+# pinning. A capability drop IS applied here (run.sh passes `--cap-drop ALL`
+# plus a small hand-picked `--cap-add` set, and every supervisor invocation
+# additionally clears the bounding set to fully empty via `setpriv
+# --bounding-set -all`) -- just not the k8s pod's own posture, which retains a
+# residual SETUID|SETGID bounding set (0xc0) from its controller-only
+# entrypoint. This harness's fully-empty bounding set is therefore STRICTER
+# than production's residue, not a missing drop. See README.md's "capability
+# set differs from production's residue" note for the full detail.
 #
 # Build context is a SYNTHETIC directory `run.sh` assembles per invocation
 # (NOT the ref's checkout root, and not just `agent/codex/supervisor/`

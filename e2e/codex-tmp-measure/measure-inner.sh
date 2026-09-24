@@ -20,22 +20,28 @@ N="${UZI_M1598_N:-5}"
 log() { printf '%s\n' "$*" >&2; }
 
 # emit writes one NDJSON result line to STDOUT (fd 1), kept strictly separate
-# from the human-readable progress log() writes to STDERR. The two are always
-# redirected to separate files by the caller (run.sh), never mixed on a
-# terminal, because there is no shared host filesystem to bind-mount a result
-# file out of (the docker CLI here talks to a remote/sibling daemon over
-# DOCKER_HOST; only the CLI's own stdout/stderr streams are guaranteed to
-# reach the invoking shell).
+# from the human-readable progress log() writes to STDERR. run.sh passes both
+# streams straight through to its own stdout/stderr unmodified (no redirection
+# or capture inside run.sh itself); it is the CALLER of run.sh that redirects
+# each to a separate file, as shown in README.md and RESULTS.md's "exact
+# commands run" sections. This is because there is no shared host filesystem
+# to bind-mount a result file out of (the docker CLI here talks to a
+# remote/sibling daemon over DOCKER_HOST; only the CLI's own stdout/stderr
+# streams are guaranteed to reach the invoking shell).
 emit() { printf '%s\n' "$1"; }
 
-# safe_embed_json prints its argument unchanged if it looks like a single-line
-# JSON object the real supervisor/holder emitted (starts with `{`, ends with
-# `}`, no embedded raw newline -- callers already `tr -d '\n'` first), or the
-# bare literal `null` otherwise. Used wherever a line read back from a
-# supervisor/holder log is spliced into the NDJSON row THIS script emits, so
-# a malformed, partial, or (if a caller ever forgot to separate streams)
-# non-JSON diagnostic line can never corrupt this script's own machine-
-# readable output.
+# safe_embed_json rejects any non-object line: it prints its argument
+# unchanged only when it starts with `{` and ends with `}` (callers already
+# `tr -d '\n'` first, so no embedded raw newline reaches here), and prints
+# the bare literal `null` for anything else -- including a line that merely
+# LOOKS like an object at its two ends but is not valid JSON in between (this
+# is a cheap shape check, not a parse/validate: jq is not installed in
+# Dockerfile.fallback's image, and adding it purely for this check was out of
+# scope). Used wherever a line read back from a supervisor/holder log is
+# spliced into the NDJSON row THIS script emits, so a malformed, partial, or
+# (if a caller ever forgot to separate streams) non-JSON diagnostic line can
+# never corrupt this script's own machine-readable output with something
+# that isn't at least object-shaped.
 safe_embed_json() {
   case "$1" in
     '{'*'}') printf '%s' "$1" ;;
@@ -228,15 +234,25 @@ for i in $(seq 1 "$N"); do
 
   DOWNLOAD_LINES=$(grep -c '^go: downloading' "$CMDOUT" 2>/dev/null || true)
   DOWNLOAD_LINES=${DOWNLOAD_LINES:-0}
-  DISPOSE_LINE=$(grep '"event":"dispose"' "$EVLOG" 2>/dev/null | tail -1 | tr -d '\n')
+  # `|| true` on both pipelines below: under `set -euo pipefail`, an empty
+  # grep match (exit 1) propagates as the pipeline's own exit status even
+  # though the downstream `tail`/`tr`/second `grep` succeed (pipefail reports
+  # the last NON-ZERO stage, not simply the rightmost stage), which would
+  # otherwise abort this whole script. An empty match here is not an error --
+  # it happens on every command whose wait loop above timed out and drove
+  # dispose after the supervisor was already killed (dispose's cleanup exits
+  # without ever appending a "dispose"/"child_exit" evidence line) -- so both
+  # fields must still resolve to JSON `null` rather than kill the run.
+  DISPOSE_LINE=$(grep '"event":"dispose"' "$EVLOG" 2>/dev/null | tail -1 | tr -d '\n' || true)
   # The command's own exit code (doc.go: {"event":"child_exit","code":<int>}),
   # pulled out of the evidence log BEFORE it is deleted below. Recorded per
   # command so a fast run can never silently pass for a warm cache hit when
   # it was in fact a fast failure -- duration and download-line-count alone
   # cannot distinguish the two. `null` when no child_exit line was ever
-  # observed (CHILD_SEEN=0).
+  # observed (CHILD_SEEN=0, or the wait loop timed out and dispose killed the
+  # child before it produced one).
   CHILD_EXIT_CODE=$(grep -o '"event":"child_exit","code":-\{0,1\}[0-9]\{1,\}' "$EVLOG" 2>/dev/null \
-    | tail -1 | grep -o -- '-\{0,1\}[0-9]\{1,\}$')
+    | tail -1 | grep -o -- '-\{0,1\}[0-9]\{1,\}$' || true)
   TMPB=$(tmp_bytes)
   CMDDIRS=$(tmp_cmd_dirs)
   CACHEB=$(cache_dir_bytes)

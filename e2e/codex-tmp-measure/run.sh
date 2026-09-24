@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PRD #1598 M5 boundary measurement.
+# PRD #1598 boundary measurement (pre-#1598 vs the M1-M5 branch).
 #
 # Drives the REAL uzi-codex-supervisor + uzi-codex-command-sandbox, as uid
 # 10003, over a scripted Go-heavy command sequence (`go build ./...` then
@@ -8,11 +8,10 @@
 #
 #   - the /tmp residue (writable-layer bytes under /tmp) after each command
 #     and at the end,
-#   - the per-run Codex command cache's peak size and whether it is retained
-#     after release,
-#   - the module bytes downloaded (via GOMODCACHE `cache/download` growth AND
-#     a count of `go: downloading` lines), comparing command #1 (cold) against
-#     the rest.
+#   - the per-run Codex command cache's size (via `du -sb` of the per-run
+#     cache directory), its peak, and whether it is retained after release,
+#   - the count of `go: downloading` lines per command, comparing command #1
+#     (cold) against the rest.
 #
 # This is a BOUNDARY-LEVEL PROXY, not the hosted Codex-run measurement (a
 # post-deploy maintainer check against the real k8s worker fleet). See
@@ -43,12 +42,25 @@ SHA=$(git -C "$REPO" rev-parse "$REF")
 SHORT=${SHA:0:12}
 WORKDIR=$(mktemp -d "${TMPDIR:-/tmp}/uzi-m1598-$SLUG-XXXXXX")
 CTX="$WORKDIR/ctx"
-IMAGE="m1598-img-$SLUG-$SHORT"
+# INVOCATION_ID is `mktemp -d`'s own random suffix off $WORKDIR's basename --
+# unique per invocation by construction (mktemp guarantees it, unlike a PID,
+# which the OS can and does reuse across invocations that do not overlap in
+# time) -- reused in both IMAGE and CONTAINER below so two invocations at the
+# SAME ref (e.g. one plain, one UZI_M1598_KEEP=1, run back-to-back or
+# concurrently) never share an image/container name. Without this, IMAGE was
+# only `$SLUG-$SHORT` (ref+sha, identical across invocations of the same
+# ref), so a second invocation's cleanup could `docker image rm` the FIRST
+# invocation's still-wanted KEEP=1 image out from under it, even though the
+# `BUILT` gate correctly stops an invocation from removing an image it never
+# itself built -- the gate does not help when the second invocation legally
+# rebuilds and owns that same shared tag.
+INVOCATION_ID=${WORKDIR##*-}
+IMAGE="m1598-img-$SLUG-$SHORT-$INVOCATION_ID"
 # Deterministic, unique-per-invocation container name (also passed to `docker
 # run --name` below) so the cleanup trap can target exactly the container this
 # invocation started, never a foreign one, even if it is still running (e.g.
 # this script was killed mid-run).
-CONTAINER="m1598-measure-$SLUG-$$"
+CONTAINER="m1598-measure-$SLUG-$INVOCATION_ID"
 # Only set true once THIS invocation's `docker build` has actually succeeded.
 # Gating the image removal on it means a failed build (or a build that never
 # ran) never issues `docker image rm` against an image this invocation did
