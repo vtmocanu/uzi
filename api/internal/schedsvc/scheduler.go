@@ -49,13 +49,13 @@ const promptTitleCap = 60
 const sweepPacing = 50 * time.Millisecond
 
 // backfillHeadroom is how many EXTRA candidates past max_issues one sweep fire may
-// examine to backfill slots lost to skipped (ineligible/already-running/transient)
-// candidates (issue #416). The cap counts runs STARTED, not candidates matched, so the
+// examine to backfill slots lost to skipped (already-running/transient, or ineligible by
+// a race after selection) candidates (issue #416). The cap counts runs STARTED, not candidates matched, so the
 // fan-out walks oldest-first past a skip and starts the next eligible candidate until
 // max_issues runs fire. This constant bounds that walk: a fire fetches at most
 // max_issues + backfillHeadroom candidates and so spends at most that many forge
 // GetIssue / DB HasActiveRunForIssue calls, even when the head of the backlog is a wall
-// of ineligible issues. 10 is a round, generous headroom for realistic backlogs; it is
+// of skipped issues (ineligible issues are filtered out in SQL before the window, #1543). 10 is a round, generous headroom for realistic backlogs; it is
 // additive (not a multiplier) so per-fire cost stays predictable for small caps. Runs
 // STARTED are still capped at max_issues, so backfill adds no load on the run limiter.
 const backfillHeadroom = 10
@@ -453,6 +453,13 @@ func (e *Scheduler) fireIssue(ctx context.Context, sched store.RunSchedule) (Fir
 // runs have started — so a slot lost to a skip is refilled from the next eligible
 // candidate rather than wasted. A NULL/invalid cap renders an unlimited LIMIT (today's
 // unbounded behaviour) and has no started ceiling, draining the candidate set as before.
+//
+// Eligibility (issue #1543): the candidate query filters by the run-eligibility gate (the
+// configured uzi label OR assignment to the connection's bot) BEFORE the LIMIT, so the scan
+// window holds only eligible issues. A label sweep additionally counts the whole selector
+// backlog (whatever the cap) so the outcome can report how many open issues match the
+// selector but are not eligible (FireOutcome.IneligibleMatched); an assigned sweep counts
+// only when a cap is set, since only a cap can truncate.
 func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) (FireOutcome, error) {
 	// Catalog overlay (PRD #589 M2, Decision 2): a default-origin sweep row stores NULL
 	// labels/guidance and carries them in the builtin catalog, resolved HERE by catalog_slug
@@ -535,8 +542,8 @@ func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) (Fir
 	}
 	// Backfill scan window (issue #416): fetch max_issues + backfillHeadroom candidates so
 	// the loop below can walk past skipped slots and still start up to max_issues runs. The
-	// widened limit is computed here in Go and threaded into the SAME MaxIssues query param
-	// (no SQL change). A NULL/invalid cap stays unlimited exactly as before.
+	// widened limit is computed here in Go and threaded into the query's MaxIssues LIMIT
+	// param. A NULL/invalid cap stays unlimited exactly as before.
 	scanLimit := sched.MaxIssues
 	if sched.MaxIssues.Valid {
 		scanLimit = pgtype.Int4{Int32: sched.MaxIssues.Int32 + backfillHeadroom, Valid: true}
@@ -550,21 +557,29 @@ func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) (Fir
 	e.logger.Info("scheduler: sweep fan-out (not behind the per-user run limiter, review N1)",
 		"schedule", sched.ID.String(), "candidates", len(candidates))
 
-	// Capped probe: only a set max_issues can truncate, so count the full matching set
-	// only when the cap is present (a NULL cap can never truncate → Capped=false, no count).
-	// Since the fetch widened to the scan window (issue #416), Capped now means "more
-	// matching open issues than the scan window (max_issues + backfillHeadroom) reached",
-	// i.e. eligible issues may exist beyond backfill's reach — it still drives the
-	// started-nothing hint.
+	// Count probe. Capped: only a set max_issues can truncate, so it is true only when the
+	// cap is present AND more ELIGIBLE open issues exist than the scan window (max_issues +
+	// backfillHeadroom) reached — eligible issues beyond backfill's reach; it drives the
+	// started-nothing hint. IneligibleMatched (label sweeps only, issue #1543): open issues
+	// matching the selector but neither uzi-labelled nor bot-assigned, over the whole
+	// selector backlog. So the count runs when the cap is set OR the sweep is label-selected
+	// (a NULL-cap label sweep still counts for IneligibleMatched), and never for a NULL-cap
+	// assigned sweep, which has nothing to report. A count error is transient.
+	isLabelSweep := querySelector == schedtmpl.SelectorLabel
 	capped := false
-	if sched.MaxIssues.Valid {
+	var ineligibleMatched *int64
+	if sched.MaxIssues.Valid || isLabelSweep {
 		counts, err := e.store.CountSweepCandidateIssues(ctx, store.CountSweepCandidateIssuesParams{
 			RepoID: repo.ID, Selector: querySelector, Labels: labelsJSON, UziLabel: uziLabel, BotID: botID,
 		})
 		if err != nil {
 			return FireOutcome{}, err // transient DB error
 		}
-		capped = counts.Eligible > int64(len(candidates))
+		capped = sched.MaxIssues.Valid && counts.Eligible > int64(len(candidates))
+		if isLabelSweep {
+			n := counts.Matched - counts.Eligible
+			ineligibleMatched = &n
+		}
 	}
 
 	// Matched is set at the END to len(Started)+len(Skips) — the candidates actually
@@ -572,7 +587,7 @@ func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) (Fir
 	// invariant (PRD #308 Decision 4) by construction. Every candidate the loop reaches
 	// lands in exactly one of Started/Skips; the loop stops early once max_issues have
 	// started, so Matched counts attempts (may exceed max_issues), not the whole window.
-	out := FireOutcome{Capped: capped}
+	out := FireOutcome{Capped: capped, IneligibleMatched: ineligibleMatched}
 	for _, c := range candidates {
 		iid := c.ForgeIssueIid
 		iidCopy := iid
@@ -957,8 +972,10 @@ func (e *Scheduler) resolveSweepLabels(ctx context.Context, stored []byte) ([]by
 }
 
 // resolveUziLabel returns the configured run-eligibility (uzi) label, falling back to
-// settings.DefaultUziLabel when it is unset or blank — the same fallback the run-create
-// gate applies, so the sweep's SQL eligibility filter and createRun agree (issue #1543).
+// settings.DefaultUziLabel when it is unset or whitespace-only. The run-create gate
+// (workersvc's uziLabel) falls back only for an exactly-empty value; the two agree for any
+// setting that passes settings.ValidateLabel (which rejects whitespace-only), so the
+// sweep's SQL eligibility filter and createRun see the same label (issue #1543).
 func (e *Scheduler) resolveUziLabel(ctx context.Context) string {
 	if e.settings == nil {
 		return settings.DefaultUziLabel

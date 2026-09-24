@@ -44,11 +44,18 @@ type FireOutcome struct {
 	// whenever a fire is attempted).
 	Matched int
 	// Capped is set only by a sweep whose max_issues cap is present and the repo has more
-	// matching open issues than the SCAN WINDOW (max_issues + backfillHeadroom) reached
-	// (issue #416 widened the fetch, so "truncated" now means "beyond backfill's reach"),
-	// so the "newer issues not reached" hint can be factual. Always false for issue/prompt
-	// and for a sweep with a NULL cap (a NULL cap fetches everything and can never truncate).
-	Capped  bool
-	Started []Started
-	Skips   []Skip
+	// ELIGIBLE open issues than the SCAN WINDOW (max_issues + backfillHeadroom) reached
+	// (issue #416 widened the fetch, so "truncated" now means "beyond backfill's reach";
+	// issue #1543 filters eligibility before the window), so the "newer issues not
+	// reached" hint can be factual. Always false for issue/prompt and for a sweep with a
+	// NULL cap (a NULL cap fetches everything and can never truncate).
+	Capped bool
+	// IneligibleMatched is set by label sweeps only (issue #1543): the number of open
+	// issues matching the selector but not eligible (neither carrying the configured uzi
+	// label nor assigned to the bot), counted over the whole selector backlog, not the
+	// scan window. nil means not applicable/unknown (assigned sweeps, issue/prompt,
+	// self-improve). These issues are never candidates, so they are outside Matched.
+	IneligibleMatched *int64
+	Started           []Started
+	Skips             []Skip
 }

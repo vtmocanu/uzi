@@ -713,8 +713,11 @@ nothing a manual start cannot.
   summary line (`fired <time> · examined N · started M · skipped K`), one line per started
   run (`#<iid> → run <run-id>  <title>`, or a `prompt` marker for a prompt schedule), one
   line per skipped candidate with a human reason label (`not eligible`, `already running`,
-  `description too large`, `fetch failed`), and — when a capped fire
-  reached nobody — a hint to raise `--max-issues` or add the `uzi` label. A
+  `description too large`, `fetch failed`), and — when a capped fire started nothing
+  with more eligible issues left unreached — a hint that the candidates ahead of them
+  were skipped. For a label sweep it also prints `N open issue(s) match the selector but
+  are not eligible` when some selector matches carry neither the `uzi` label nor a bot
+  assignment (`--json`: `.last_fire.ineligible_matched`; absent on older fires). A
   never-fired schedule reads `Last fire: never fired`. `--json` carries the same detail
   under `.last_fire`. A `TOKEN` row shows the schedule's credential override (the pinned
   label, `auto`, `default`, or `inherit` when none is set); `--json` carries it as
@@ -778,10 +781,13 @@ nothing a manual start cannot.
   Prints a per-candidate breakdown: a `Started N run(s)` header with the created run
   id(s), one line per started run, then — when candidates were skipped — a
   `Examined N candidate(s), skipped K:` tally with a human reason label per skip and, for a
-  `not eligible` skip, a `# add the uzi label, or raise --max-issues` hint. A fire
-  that started nothing AND skipped nothing (a benign dedup, a prior run still live) reports
-  `no run started`. `--json` dumps the raw response (`created`, `run_ids`, `matched`,
-  `capped`, `started`, `skips`).
+  `not eligible` skip (eligibility changed between selection and run creation), a
+  `# add the configured uzi label or assign the issue to uzi` hint. A label sweep that
+  found no eligible candidate but has ineligible selector matches reports
+  `no run started from <id>: no eligible candidates` plus the ineligible count; a fire
+  that started nothing AND skipped nothing otherwise (a benign dedup, a prior run still
+  live) reports `no run started`. `--json` dumps the raw response (`created`, `run_ids`,
+  `matched`, `capped`, `ineligible_matched`, `started`, `skips`).
 - `uzi schedule delete <schedule-id>` — delete a schedule. Run history is preserved.
 - `uzi schedule catalog list` — the builtin **default scheduled jobs** (docs hygiene, bug
   triage, a planned-work sweep, and so on) as a table (`SLUG`, `TARGET`, `CRON`, `ENABLED`,

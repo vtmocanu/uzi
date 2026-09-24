@@ -36,11 +36,14 @@ type lastFireSkip struct {
 // is the advance instant (the scheduler's now at persist time), so the UI can show WHEN
 // the last fire happened alongside WHAT it did.
 type lastFireRecord struct {
-	FiredAt time.Time         `json:"fired_at"`
-	Matched int               `json:"matched"`
-	Capped  bool              `json:"capped"`
-	Started []lastFireStarted `json:"started"`
-	Skips   []lastFireSkip    `json:"skips"`
+	FiredAt time.Time `json:"fired_at"`
+	Matched int       `json:"matched"`
+	Capped  bool      `json:"capped"`
+	// IneligibleMatched is FireOutcome.IneligibleMatched (issue #1543): omitted when nil
+	// (non-label sweeps, issue/prompt), emitted when set — including 0.
+	IneligibleMatched *int64            `json:"ineligible_matched,omitempty"`
+	Started           []lastFireStarted `json:"started"`
+	Skips             []lastFireSkip    `json:"skips"`
 }
 
 // marshalLastFire builds a lastFireRecord from a fire outcome and serializes it to the
@@ -50,11 +53,12 @@ type lastFireRecord struct {
 // marshal error is the caller's cue to persist SQL NULL rather than wedge the cadence.
 func marshalLastFire(out FireOutcome, firedAt time.Time) ([]byte, error) {
 	rec := lastFireRecord{
-		FiredAt: firedAt,
-		Matched: out.Matched,
-		Capped:  out.Capped,
-		Started: make([]lastFireStarted, 0, len(out.Started)),
-		Skips:   make([]lastFireSkip, 0, len(out.Skips)),
+		FiredAt:           firedAt,
+		Matched:           out.Matched,
+		Capped:            out.Capped,
+		IneligibleMatched: out.IneligibleMatched,
+		Started:           make([]lastFireStarted, 0, len(out.Started)),
+		Skips:             make([]lastFireSkip, 0, len(out.Skips)),
 	}
 	for _, s := range out.Started {
 		rec.Started = append(rec.Started, lastFireStarted{

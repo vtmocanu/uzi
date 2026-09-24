@@ -1507,6 +1507,10 @@ export interface LastFire {
   fired_at: string;
   matched: number;
   capped: boolean;
+  // Label sweeps only (issue #1543): open issues matching the selector but not eligible
+  // (no configured uzi label, not assigned to the bot), counted over the whole backlog.
+  // Absent on older fires and non-label sweeps — that means UNKNOWN, not zero.
+  ineligible_matched?: number | null;
   started: LastFireStarted[];
   skips: LastFireSkip[];
 }
@@ -1519,6 +1523,8 @@ export type RunNowResponse = {
   run_ids: string[];
   matched: number;
   capped: boolean;
+  // Same meaning as LastFire.ineligible_matched; absent = unknown / not a label sweep.
+  ineligible_matched?: number | null;
   started: LastFireStarted[];
   skips: LastFireSkip[];
 };

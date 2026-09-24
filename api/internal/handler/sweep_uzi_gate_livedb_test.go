@@ -190,8 +190,9 @@ func TestSweepFiresOnlyUziLabelledCandidateLiveDB(t *testing.T) {
 		t.Fatalf("read last_fire: %v", err)
 	}
 	var lf struct {
-		Matched int `json:"matched"`
-		Started []struct {
+		Matched           int    `json:"matched"`
+		IneligibleMatched *int64 `json:"ineligible_matched"`
+		Started           []struct {
 			IssueIID *int64 `json:"issue_iid"`
 		} `json:"started"`
 		Skips []struct {
@@ -207,5 +208,10 @@ func TestSweepFiresOnlyUziLabelledCandidateLiveDB(t *testing.T) {
 	}
 	if lf.Started[0].IssueIID == nil || *lf.Started[0].IssueIID != uziIID {
 		t.Fatalf("last_fire start iid = %v, want %d", lf.Started[0].IssueIID, uziIID)
+	}
+	// The filtered-out bare ["bug"] issue is still reported: it matches the selector but is
+	// not eligible, counted over the whole selector backlog (#1543).
+	if lf.IneligibleMatched == nil || *lf.IneligibleMatched != 1 {
+		t.Fatalf("last_fire ineligible_matched = %v, want 1 (the bare ['bug'] issue) (raw %s)", lf.IneligibleMatched, lastFireRaw)
 	}
 }

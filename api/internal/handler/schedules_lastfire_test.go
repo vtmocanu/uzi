@@ -160,3 +160,16 @@ func TestRunNowResponseEmptyOutcomeNonNilSlices(t *testing.T) {
 		t.Errorf("created = %d, want 0", resp.Created)
 	}
 }
+
+// TestRunNowResponseIneligibleMatched (issue #1543): the label sweep's ineligible count is
+// carried through to the run-now wire, and a nil (non-label sweep) stays nil (unknown).
+func TestRunNowResponseIneligibleMatched(t *testing.T) {
+	n := int64(16)
+	resp := runNowResponse(schedsvc.FireOutcome{IneligibleMatched: &n})
+	if resp.IneligibleMatched == nil || *resp.IneligibleMatched != 16 {
+		t.Errorf("ineligible_matched = %v, want 16", resp.IneligibleMatched)
+	}
+	if resp := runNowResponse(schedsvc.FireOutcome{}); resp.IneligibleMatched != nil {
+		t.Errorf("nil IneligibleMatched must stay nil, got %d", *resp.IneligibleMatched)
+	}
+}
