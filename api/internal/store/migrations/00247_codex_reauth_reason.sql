@@ -30,5 +30,5 @@ ALTER TABLE codex_provider_account ADD CONSTRAINT codex_provider_account_reauth_
 
 -- True inverse of the additive Up (goose downs are not run in this deployment;
 -- store.Migrate only ever goes up). Drop the constraint before the column it references.
-ALTER TABLE codex_provider_account DROP CONSTRAINT codex_provider_account_reauth_reason_check;
+ALTER TABLE codex_provider_account DROP CONSTRAINT IF EXISTS codex_provider_account_reauth_reason_check;
 ALTER TABLE codex_provider_account DROP COLUMN IF EXISTS reauth_reason;

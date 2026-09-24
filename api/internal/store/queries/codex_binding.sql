@@ -467,10 +467,10 @@ WHERE id = @id AND user_id = @user_id
 -- name: LockCodexAccountForRejection :one
 -- Step 1 of the provider-rejection primitive (issue #1594, store.QuarantineRejectedCodexRefresh):
 -- row-lock the account the rejected refresh was running against, ONLY IF it is still held by
--- the rejecting operation (@op) at the generation the refresh started from. Lock order is
--- ACCOUNT then INTENT (LockRotatingCodexRefreshIntent), the same account-then-intent order
--- ClearMismatchedCodexRecoveryAndMarkIntents writes in. pgx.ErrNoRows means the fence did not
--- hold and the caller applies nothing.
+-- the rejecting operation (@op) at the generation the refresh started from. The account row is
+-- locked first, then the intent (LockRotatingCodexRefreshIntent); see
+-- store.QuarantineRejectedCodexRefresh for why no lock cycle forms with the other writers of
+-- these two tables. pgx.ErrNoRows means the fence did not hold and the caller applies nothing.
 --
 -- coord_state IN ('in_progress','quarantined'): the quarantined arm exists because a survivor
 -- reap (QuarantineExpiredCodexLease, which keeps coord_operation_id) may land between the
@@ -489,7 +489,7 @@ FOR UPDATE;
 -- name: LockRotatingCodexRefreshIntent :one
 -- Step 2 of the provider-rejection primitive (issue #1594): row-lock the rejecting operation's
 -- intent, ONLY IF it is still 'rotating' from the same generation on the same account. Taken
--- AFTER LockCodexAccountForRejection (account-then-intent lock order). pgx.ErrNoRows means the
+-- AFTER LockCodexAccountForRejection (account row first, then the intent). pgx.ErrNoRows means the
 -- intent already moved (committed/reconciled/unrecoverable) and the caller applies nothing.
 -- Owner-scoped.
 SELECT operation_id FROM codex_refresh_intent

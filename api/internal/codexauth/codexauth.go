@@ -81,7 +81,7 @@ var ErrNoAccessToken = errors.New("codexauth: refresh response carried no access
 // only after checking StatusCode == 429.
 //
 // OAuthCode is set by Refresh only (discover_identity and read_usage leave it ""). It is
-// a member of a CLOSED set (the OAuthCode* constants), never provider text: Refresh reads
+// a member of a CLOSED set (the OAuthCode* constants), never provider text: Refresh parses
 // at most maxOAuthErrorBodyBytes of the error body, extracts the OAuth error code, and
 // keeps it only when it normalises to an allowlisted value. Any other code, a malformed
 // or oversized body, is OAuthCodeUnknown; a body carrying no code is "". The raw
@@ -289,9 +289,7 @@ type usageResponse struct {
 //     an account_id from either source → Identity{user_id, account_id}.
 //   - 2xx with user_id absent, or with no account_id from either source →
 //     ErrIdentityIncomplete (the login authenticated but its account is not yet fully named).
-//   - non-2xx (including 401) → *AuthError carrying the status and OAuthCode: at most
-//     maxOAuthErrorBodyBytes of the error body is read (the rest is drained, bounded by
-//     maxBodyBytes) and only an allowlisted, normalised OAuth error code is kept.
+//   - non-2xx (including 401) → *AuthError carrying the status (OAuthCode stays "").
 func (c *Client) DiscoverIdentity(ctx context.Context, accessToken string) (Identity, error) {
 	ctx, cancel := c.requestContext(ctx)
 	defer cancel()
@@ -415,8 +413,10 @@ type refreshResponse struct {
 //     identity claims; RefreshToken is nil when the provider omitted a rotated token.
 //   - 2xx without an access_token → ErrNoAccessToken.
 //   - non-2xx (including 401) → *AuthError carrying the status and OAuthCode: at most
-//     maxOAuthErrorBodyBytes of the error body is read (the rest is drained, bounded by
-//     maxBodyBytes) and only an allowlisted, normalised OAuth error code is kept.
+//     maxOAuthErrorBodyBytes of the error body is parsed (up to one byte more is read
+//     to detect an oversized body, which is not parsed, and the rest is drained,
+//     bounded by maxBodyBytes in total) and only an allowlisted, normalised OAuth
+//     error code is kept.
 func (c *Client) Refresh(ctx context.Context, refreshToken string) (RefreshResult, error) {
 	payload, err := json.Marshal(refreshRequest{ //nolint:gosec // G117: the refresh request must carry the refresh token to the provider token endpoint
 		ClientID:     c.clientID,

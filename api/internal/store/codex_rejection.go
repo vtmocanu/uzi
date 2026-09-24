@@ -46,12 +46,16 @@ var codexRejectionAfterAccountLock func(ctx context.Context)
 // re-login-required with reason 'provider_rejected', and the operation's rotating intent
 // is marked 'unrecoverable'. Either both writes commit or neither does.
 //
-// Locks are taken in the declared order ACCOUNT then INTENT, the same account-then-intent
-// order ClearMismatchedCodexRecoveryAndMarkIntents writes in. Each lock re-checks its fence
-// (see the query comments); a fence that does not hold, or an update that does not touch
-// exactly one row, rolls back and returns CodexRejectionNotApplied with a nil error. Any
-// database error rolls back and returns CodexRejectionNotApplied with that error. No
-// recovery column is written.
+// The account row is locked first, then the intent. No lock cycle forms with the other
+// statements that touch both tables: ClearMismatchedCodexRecoveryAndMarkIntents (one
+// statement) updates only intents already 'reconciled', never a 'rotating' intent this
+// primitive locks, and SetCodexRefreshIntentStateFenced only reads the account in an EXISTS
+// subquery (no row lock on it) while it updates the intent. (InsertCodexRefreshIntent's
+// foreign-key check takes a KEY SHARE lock on the account, but its only intent row is the
+// one it is inserting, which no other transaction can hold.) Each lock re-checks its fence
+// (see the query comments); a fence that does not hold rolls back and returns
+// CodexRejectionNotApplied with a nil error. Any database error rolls back and returns
+// CodexRejectionNotApplied with that error. No recovery column is written.
 func QuarantineRejectedCodexRefresh(ctx context.Context, b CodexRejectionTxBeginner, arg QuarantineRejectedCodexRefreshParams) (CodexRejectionOutcome, error) {
 	tx, err := b.Begin(ctx)
 	if err != nil {
@@ -88,6 +92,9 @@ func QuarantineRejectedCodexRefresh(ctx context.Context, b CodexRejectionTxBegin
 	if err != nil {
 		return CodexRejectionNotApplied, err
 	}
+	// Defensive invariant, not a live path: both rows are locked under fences each UPDATE's
+	// WHERE repeats verbatim, so each touches exactly one row. Should a future edit let the
+	// two diverge, roll back rather than commit a half-applied rejection.
 	if accountRows != 1 || intentRows != 1 {
 		return CodexRejectionNotApplied, nil
 	}

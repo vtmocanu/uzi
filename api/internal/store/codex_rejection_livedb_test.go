@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -239,6 +240,16 @@ func TestQuarantineRejectedCodexRefreshFencesLiveDB(t *testing.T) {
 				t.Fatalf("SetCodexRecoverySlot = (%d,%v), want (1,nil)", n, err)
 			}
 			return f.params()
+		}},
+		// Another user presenting the victim's account/operation/generation: every fence is
+		// owner-scoped, so a foreign owner matches no row and writes nothing.
+		{"foreign_owner", func(ctx context.Context, t *testing.T, pool *pgxpool.Pool, _ *store.Queries, f rejectionFixture) store.QuarantineRejectedCodexRefreshParams {
+			other := uuid.New()
+			mustExec(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
+				other, fmt.Sprintf("codex-foreign-%s@e2e", other))
+			p := f.params()
+			p.UserID = other
+			return p
 		}},
 	}
 	for _, tc := range cases {
