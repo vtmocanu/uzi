@@ -54,6 +54,25 @@ describe("scanSignals", () => {
     });
   });
 
+  it("does not let a malformed question displace the tenth valid one", () => {
+    const content: unknown[] = Array.from({ length: 9 }, (_, i) => ({
+      type: "tool_use", name: "mcp__uzi__ask_user",
+      input: { questions: [{ question: `Question ${i + 1}?` }] },
+    }));
+    content.push({
+      type: "tool_use", name: "mcp__uzi__ask_user",
+      input: { questions: [{}, { question: "Question 10?" }] },
+    });
+    content.push({
+      type: "tool_use", name: "mcp__uzi__ask_user",
+      input: { questions: [{ question: "Question 11?" }] },
+    });
+    assert.deepStrictEqual(
+      scanSignals({ type: "assistant", message: { content } }).questions?.map((q) => q.question),
+      Array.from({ length: 10 }, (_, i) => `Question ${i + 1}?`),
+    );
+  });
+
   it("skips full-frame question inputs while still scanning later signals", () => {
     const content: unknown[] = Array.from({ length: 10 }, (_, i) => ({
       type: "tool_use", name: "mcp__uzi__ask_user",

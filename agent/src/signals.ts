@@ -498,7 +498,10 @@ function clamp(s: string, n: number): string {
 function parseQuestions(raw: unknown, limit = MAX_QUESTIONS): AskUserQuestion[] {
   if (!Array.isArray(raw)) return [];
   const out: AskUserQuestion[] = [];
-  for (const item of raw.slice(0, limit)) {
+  // Bound raw parsing per tool call while counting only valid questions toward
+  // the remaining frame capacity.
+  for (const item of raw.slice(0, MAX_QUESTIONS)) {
+    if (out.length >= limit) break;
     const q = asRecord(item);
     if (!q) continue;
     const question =
