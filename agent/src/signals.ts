@@ -708,7 +708,7 @@ export function scanSignals(message: unknown): ScannedSignals {
       const input = asRecord(block["input"]);
       const plan = input?.["plan_md"];
       if (typeof plan === "string") out.plan = plan;
-      else out.plan = out.plan ?? ""; // a submit_plan with no/blank body still counts as "a plan was submitted"
+      else out.plan = out.plan ?? ""; // a no-body submit_plan still yields a plan field here; the planning loops treat a blank plan as no plan (#1593)
       // PRD #122 M1. Extracted HERE, inside the submit_plan branch and therefore
       // behind the isSubagentFrame guard at the top of scanSignals — that guard is
       // what gives milestones the main-thread-only guarantee, exactly as it does for

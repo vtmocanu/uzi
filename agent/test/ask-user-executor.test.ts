@@ -389,6 +389,19 @@ describe("issue #1593 — a prose-only planning turn is nudged, then parked on t
     assert.deepEqual(gated, ["# real"]);
   });
 
+  it("fails REASON_NO_PLAN for a blank submit_plan with no text, never gating it", async () => {
+    const { queryFn, turns } = fakeTurns([[submitPlan("  \n "), resultSuccess()], plan("# real")]);
+    const gated: string[] = [];
+    const probe = makeCtx({
+      gatePlan: async (md) => { gated.push(md); return { kind: "approve", selection: { status: "absent" } }; },
+      askPlanMissing: async () => { throw new Error("must not park"); },
+    });
+    await assert.rejects(new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx), /without submitting a plan/);
+    assert.deepEqual(gated, []);
+    assert.equal(turns.length, 1);
+    assert.equal(nudges(turns), 0);
+  });
+
   it("fails REASON_PLAN_MISSING when the turn after guidance is prose again, without a second nudge or park", async () => {
     const { queryFn, turns } = fakeTurns([prose(), prose(), prose(), plan()]);
     let parks = 0;

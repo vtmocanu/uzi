@@ -52,11 +52,12 @@ export const REASON_PLAN_MISSING =
 export const MAX_LEAD_FINAL_MESSAGE_LEN = 4000;
 
 /** How many characters beyond the cap {@link boundLeadFinalMessage} reads, and how many it
- *  then discards from the left edge of that window. 1024 exceeds any plausible secret (API
- *  keys and tokens run to a few hundred characters at most), so a secret split by the window
- *  edge, whose surviving suffix the redactor cannot recognise, is always inside the discarded
- *  strip. */
-export const LEAD_MESSAGE_SECRET_MARGIN = 1024;
+ *  then discards from the left edge of that window, so a secret split by the window edge,
+ *  whose surviving suffix the redactor cannot recognise, falls inside the discarded strip.
+ *  Sized for the longest secret the redactor holds, not a typical API key: Codex OAuth
+ *  access tokens (claim.secrets.codex and runtime-released tokens) are JWTs that can run
+ *  past 1024 characters. A secret longer than this margin could leave its tail. */
+export const LEAD_MESSAGE_SECRET_MARGIN = 4096;
 
 /** How much of a turn's lead text an executor holds while collecting it (the most recent
  *  characters). Far above the bounder's window, so holding only this tail changes nothing
