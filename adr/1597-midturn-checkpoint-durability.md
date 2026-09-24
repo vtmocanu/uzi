@@ -1,8 +1,7 @@
 # ADR-1597: A mid-turn tick publishes a scanned, pinned checkpoint without waiting for a milestone
 
 **Status**: Accepted (M1/M2 implemented; M3a is a measurement-only investigation with no
-code change; a final hardening round on the secret-scan path is in progress and is
-described below as the design a fact-check pass will reconcile against the shipped code)
+code change)
 **Date**: 2026-09-24
 **Deciders**: architect (design), team lead, Vlad (maintainer).
 **Issue**: GitHub issue [vtmocanu/uzi#1597](https://github.com/vtmocanu/uzi/issues/1597) —
@@ -25,9 +24,10 @@ during a single very long turn lost everything committed since the last boundary
 whole turn, in the worst case. This closes that gap **inside** the turn:
 
 1. **A repeating mid-turn tick**, `CHECKPOINT_TICK_INTERVAL` (default `5m`; `0` disables),
-   fetches the runner clone's committed work back into the worker's bare repository, and,
-   once `CHECKPOINT_INTERVAL` (default `20m`, unchanged from PRD #267) has elapsed since
-   the last origin publish and the branch tip has moved, publishes it to origin through the
+   fetches the runner clone's committed work back into the worker's bare repository at
+   most once per tick, when the branch tip has moved and the clone is not busy, and, once
+   `CHECKPOINT_INTERVAL` (default `20m`, unchanged from PRD #267) has elapsed since the last
+   publish *attempt* and the branch tip has moved, publishes it to origin through the
    existing ADR-122 broker — credential-free, worker-side, unchanged wire contract.
 2. **A per-flight sink gate** serializes the tick against every other path that moves the
    run's durable state — the checkpoint closure, the pause/wall/completion-hold parks, and
@@ -35,9 +35,13 @@ whole turn, in the worst case. This closes that gap **inside** the turn:
    publish a marker a park path is about to undo, or race the checkpoint floor.
 3. **A stat-only git-busy probe** skips the tick, rather than racing git, whenever any lock
    or merge/rebase marker is present in the runner clone, regardless of its age.
-4. **Every overlay-less publish is secret-scanned** over exactly the pinned commit range
-   being packed, before the pack is built; a finding or an untrusted scan skips the remote
-   publish and falls back to the local fetch-back only.
+4. **Every checkpoint publish that goes through the checkpoint body without an overlay
+   context is secret-scanned** — the mid-turn tick, the time-gated iteration-boundary tier,
+   and milestone publishes on non-GitHub forges — over the pinned commit range being
+   packed, minus content already public, before the pack is built; a finding or an
+   untrusted scan skips the remote publish and falls back to the local fetch-back only. On
+   a Codex run a milestone publish is instead deferred (`scan_deferred`) rather than
+   scanned inside the boundary permit.
 5. **The tick runs in a cancellable process scope**: a quiescing run, shutdown, or a
    preempting sink waits for every tick child to exit, every lock wait to resolve, and any
    in-flight publish to settle before the clone or bare is touched again.
@@ -45,10 +49,13 @@ whole turn, in the worst case. This closes that gap **inside** the turn:
    classes** when the checkpoint is not published, instead of ever putting a raw error
    message or remote text on the feed.
 
-Entry points: the tick's own module, `agent/src/tick-spawner.ts` (`GitCache.withBoundaryProcessSpawner`,
-lock custody) and `agent/src/sink-gate.ts` (the per-flight mutex); the tick body and the
-shutdown reason-class union live in `agent/src/runner.ts`; the pinned scan-then-pack range
-and the size caps live in `agent/src/git.ts`; `CHECKPOINT_TICK_INTERVAL` parsing is in
+Entry points: `GitCache.withBoundaryProcessSpawner` is in `agent/src/git.ts`;
+`agent/src/tick-spawner.ts` provides the `TickSpawner` handed to it (own process group per
+child, lock custody on cancellation); `agent/src/sink-gate.ts` is the per-flight mutex; the
+tick body and the shutdown reason-class union live in `agent/src/runner.ts`; the pinned
+scan-then-pack range and the size caps live in `agent/src/git.ts`; the pre-push (finalize)
+secret scan runs via `agent/src/git.ts`'s `secretScanRange`, with `agent/src/secret-scan-guard.ts`
+holding its pure, I/O-free helpers; `CHECKPOINT_TICK_INTERVAL` parsing is in
 `agent/src/config.ts`.
 
 ## Context
@@ -69,9 +76,13 @@ assumed.
 ### The tick: interval, worst-case loss, and its claim boundary
 
 `CHECKPOINT_TICK_INTERVAL` defaults to `5m` (`0` disables it entirely, same convention as
-`CHECKPOINT_INTERVAL`). The tick fetches back every interval regardless of the origin
-publish cadence, and only *publishes* to origin once `CHECKPOINT_INTERVAL` (still `20m`)
-has elapsed since the last successful publish. Worst-case data loss from a worker-disk
+`CHECKPOINT_INTERVAL`). Each tick fetches back at most once, and only when the branch tip
+has moved and the clone is not busy; it publishes to origin once `CHECKPOINT_INTERVAL`
+(still `20m`) has elapsed since the last publish **attempt** — not the last success, so a
+persistent broker failure is retried at most once per interval rather than hammered. A
+milestone publish deferred out of a Codex permit (`pendingPublish`) is owed and bypasses
+this gate once; after that attempt (published, blocked, or failed) the normal
+`CHECKPOINT_INTERVAL` gate governs retries again. Worst-case data loss from a worker-disk
 loss, while at least one publish sink (origin, through the broker) is reachable, is
 therefore bounded at roughly `CHECKPOINT_INTERVAL` plus one tick interval — the tick that
 was about to publish, plus the interval it waited to notice work had moved.
@@ -83,26 +94,36 @@ alone — with the remote publish skipped or failing — is never reported as du
 shutdown feed (see the reason classes below): it is exactly the pre-existing PRD #267
 local-only fallback, unchanged.
 
-### The claim boundary that does not move: overlay and park/shutdown/pause/capture stay unscanned
+### The claim boundary that does not move: park/shutdown/pause/capture and every GitHub milestone stay unscanned
 
-**This is unchanged by design, not an oversight.** The api's overlay publish path (the
-ADR-1036 workflow-overlay checkpoint), and the park/shutdown/pause/capture checkpoint
-publishes, are still pushed to `refs/uzi-checkpoints/<branch>` **without** a secret scan,
-exactly as before this issue. Scanning is new **only** on the mid-turn tick's overlay-less
-publish path (item 4 above). The rationale: those other paths are narrow, already-audited
-windows (a park/shutdown/capture publish happens once, at a boundary the agent does not
-control mid-flight; the overlay is a synthetic transport wrapper, not agent-authored
-content), while the mid-turn tick fires repeatedly, unattended, deep inside a live agent
-turn — the highest-frequency, highest-exposure publish path uzi has. Concretely: **a
-secret committed and then removed within the same single turn is caught** by the mid-turn
-tick's scan of exactly that turn's pinned range, something none of the boundary-only
-publishers could ever see (their range never isolates a single turn). **GitHub push
-protection is not relied on** as a backstop for this path — it runs only at the final
-branch push (`agent/src/secret-scan-guard.ts`'s pre-push scan plus the `GH013` remote
-parse), long after a checkpoint publish would already have shipped the range to the
-`refs/uzi-checkpoints/<branch>` mirror.
+**This is unchanged by design, not an oversight.** Scanning covers every checkpoint publish
+that goes through the checkpoint body **without** an overlay context: the mid-turn tick, the
+time-gated iteration-boundary tier, and milestone publishes on non-GitHub forges. On a Codex
+run such a milestone publish is deferred (`scan_deferred`) instead of being scanned inside
+the boundary permit — see the scan hardening section below. On GitHub, every milestone
+(`reap:true`) publish carries an overlay context and is therefore unscanned, whether or not
+an overlay commit is actually built (the overlay context is built for every GitHub milestone;
+the pack carries the agent's own commits either way). Explicitly, the unscanned set is: park,
+shutdown, pause, capture, and GitHub milestone publishes — all pushed unscanned to
+`refs/uzi-checkpoints/<branch>` by the api (`Service.Publish` in
+`api/internal/workersvc/service.go`). The rationale: those paths are narrow, already-audited
+windows (a park/shutdown/pause/capture publish happens once, at a boundary the agent does not
+control mid-flight; the overlay is a synthetic transport wrapper, not agent-authored content),
+while the mid-turn tick fires repeatedly, unattended, deep inside a live agent turn — the
+highest-frequency, highest-exposure publish path uzi has. Concretely: **a secret committed
+and then removed within the same single turn is caught by any scanned publish whose range
+contains the adding commit**, because gitleaks git mode scans each commit's patch. The
+unscanned publishers (park/shutdown/pause/capture, and GitHub milestone publishes) would ship
+it. **uzi's push-protection handling runs only at finalize** — it is not relied on as a
+backstop for this path (`agent/src/secret-scan-guard.ts`'s pre-push scan plus the `GH013`
+remote parse), long after a checkpoint publish would already have shipped the range to the
+`refs/uzi-checkpoints/<branch>` mirror. Once a finding is in the unpublished range, it blocks
+every *scanned* publish until it leaves that range (fail closed); the unscanned
+park/shutdown/pause/capture and GitHub-milestone publishers would still ship it, unaffected by
+the block. gitleaks git mode also skips files with a NUL byte (binary content) — a known
+instrument limit this scan shares with the finalize pre-push scan, not a regression.
 
-### The scan hardening (round 3 — described here as the design a fact-check pass will reconcile against the shipped code)
+### The scan hardening
 
 - **gitleaks v8.30.1 in `git` mode does not honour `--timeout`** — it exits `0` with a
   partial, silently-clean-looking report instead of erroring or timing out. The worker
@@ -110,33 +131,41 @@ parse), long after a checkpoint publish would already have shipped the range to 
   an overrun as **untrusted** (`deadline`); it never passes `--timeout` to a `git`-mode
   invocation, because that flag cannot be trusted to do anything there.
 - **gitleaks never runs inside a Codex boundary permit.** An overlay-less milestone on a
-  Codex run instead fetches back and **defers** the remote publish (`scan_deferred`) to the
-  next tick, which is not permit-bound and runs promptly, publishing regardless of the time
-  gate once it does. This avoids either starving the permit's own deadline for scan time or
-  running the scan un-timed inside a window the permit's supervisor cannot individually
-  kill a child in.
+  Codex run instead fetches back and **defers** the remote publish (`scan_deferred`): a tick
+  is kicked to run about 1s later; if the sink gate is still held it retries shortly,
+  otherwise the publish waits for the next tick. With `CHECKPOINT_TICK_INTERVAL=0` the
+  deferred scan+publish runs right after the permit ends, before the milestone checkpoint
+  returns. This avoids either starving the permit's own deadline for scan time or running
+  the scan un-timed inside a window the permit's supervisor cannot individually kill a
+  child in.
 - **The scan range is floored at content already public.** Three floors, the maximum of
   which excludes nothing already known to be visible: `excludeSha` (`origin/<branch>` when
   it exists, else the default branch), the last **confirmed** published checkpoint tip
   (only when it is an ancestor of the pinned tip), and the origin default-branch tip. The
   pack range stays exactly `tipSha ^excludeSha` — unchanged from the pre-tick pinned-range
-  contract. Invariant: every packed commit is either scanned right now, already reachable
-  from a confirmed checkpoint publish, or already on the default branch — no packed commit
-  is both unscanned and not already public.
+  contract, but the SCANNED range is over the pinned range being packed, minus commits
+  already reachable from the default branch or the last confirmed checkpoint (content
+  already public). Invariant: every packed commit is either scanned right now, already
+  reachable from a confirmed checkpoint publish (which may itself have been an unscanned
+  park/pause/shutdown publish — already public), or already on the default branch — no
+  packed commit is both unscanned and not already public.
 - **Size caps charge what gitleaks actually reads**, including the OLD-side blobs of
-  modified or deleted paths (a diff touches both sides): 8 MiB per blob, 128 MiB total new
-  blob bytes, 100k objects. Exceeding any cap is treated as **untrusted**, same as a scan
+  modified or deleted paths (a diff touches both sides): 8 MiB per blob; 128 MiB total
+  across distinct old- and new-side blob bytes; 100k distinct blob oids (both sides); at
+  most 32 merges (`too_many_merges`) and a 32 MiB cap per merge diff
+  (`merge_diff_too_large`). Exceeding any cap is treated as **untrusted**, same as a scan
   failure — the publish is skipped, not force-published unscanned.
-- **Merge commits.** The expected-commit count used to validate the scan's completeness
-  excludes merges (a merge contributes no textual hunk of its own in the ordinary sense);
-  each merge's own contribution is scanned separately via `git diff --text M^1 M` (or a
-  remerge-diff where available) piped through gitleaks on stdin. Binary (NUL-containing)
-  files in an ordinary, non-merge commit are skipped by gitleaks' `git` mode — a known
-  instrument limitation this scan shares with the pre-existing finalize-time scan; it is
-  not a regression introduced here.
-- **Commits with no textual hunk at all** (a pure rename, an empty commit, a mode-only
-  change, a binary-only commit) are excluded from the expected-commit count so they do not
-  wedge the scan waiting for a hunk that will never appear.
+- **Merge commits.** gitleaks git mode neither diffs nor counts merge commits; each merge's
+  own contribution is scanned via `git show --remerge-diff --text` for a two-parent merge on
+  git ≥2.36, or `git diff --text M^1 M` (a superset) for an octopus merge or older git,
+  feeding gitleaks stdin only the ADDED lines (what git mode itself scans), with a
+  byte-count liveness check. gitleaks git mode also skips files with a NUL byte (a known
+  instrument limit shared with finalize) in an ordinary, non-merge commit; it is not a
+  regression introduced here.
+- **Commits with no textual hunk in a non-deleted file** (pure rename, empty, mode-only,
+  binary-only, empty new file, delete-only) are excluded from the expected count so the
+  liveness check (expected == gitleaks' "N commits scanned") does not class a complete scan
+  untrusted.
 
 ### Per-flight sink gate and preemption
 
@@ -155,15 +184,18 @@ Before touching the runner clone, the tick opens `.git` exactly **once**, with
 `O_RDONLY | O_NOFOLLOW | O_NONBLOCK` (so a FIFO left in place opens immediately instead of
 blocking on a writer, and a symlink is refused with `ELOOP`), then classifies it by
 `fstat` on that same file handle — never a separate stat-then-open, which would leave a
-TOCTOU window. Any lock or merge/rebase marker present makes the tick skip, **whatever its
+TOCTOU window. "Busy" is one of a fixed set of lock and in-progress markers (`index.lock`,
+`HEAD.lock`, `packed-refs.lock`, `refs/heads/<branch>.lock`, `MERGE_HEAD`,
+`CHERRY_PICK_HEAD`, `REVERT_HEAD`, `rebase-merge/`, `rebase-apply/`), or an
+unreadable/non-regular `.git`. Any marker present makes the tick skip, **whatever its
 age**: an old, abandoned lock is treated exactly like a fresh one, because the probe cannot
 distinguish "still being written" from "leaked" without racing the writer. Two residuals
 follow directly from this design, not from a bug: (1) the TOCTOU window between the probe's
 open and the tick's actual git invocation is real but narrow, and errors the tick's own
 attempt rather than corrupting state; and (2) a **planted** lock file (or marker) left by
 some other process can make the tick defer indefinitely — this is surfaced to an operator
-once it becomes visible on the run: after 3 consecutive deferrals for the same cause, the
-tick's outcome is distinguishable from an ordinary transient busy state.
+once it becomes visible on the run: after 3 consecutive git-busy ticks (any marker), one
+deduped feed line, distinguishing the tick's outcome from an ordinary transient busy state.
 
 ### Pinned-SHA scan-then-pack
 
@@ -208,11 +240,13 @@ fetch-back or publish). **A publish that landed wins over a late Codex boundary 
 the checkpoint body's publish was ACKed before the boundary itself later throws (e.g. a
 deadline or cleanup failure after the ACK), the feed reports `published`, not the boundary
 error — a checkpoint that is real on origin must never be reported as failed because of an
-unrelated failure downstream of it. An **aborted** publish is silent (no reason class,
-because it never attempted to publish in the first place — e.g. the sink was never
-reached). No raw error message, remote text, or credential is ever placed on the feed; only
-the class. A checkpoint later confirmed to have landed, after an earlier report of failure,
-emits one recovery line.
+unrelated failure downstream of it. On the **generic publish-failure feed** an aborted
+publish is silent (run log only, because it never attempted to publish in the first place —
+e.g. the sink was never reached). On the **shutdown line specifically**, an aborted publish
+is instead named: `timeout` when the permit/deadline signal is what aborted it, else
+`publish_error` for any other abort. No raw error message, remote text, or credential is
+ever placed on the feed; only the class. A checkpoint later confirmed to have landed, after
+an earlier report of failure, emits one recovery line.
 
 ### The #1416 steer's feed timing
 
@@ -242,7 +276,7 @@ the cluster's actual kubelet version was not checked against that source read, s
 upstream contract, not a confirmed match to the exact deployed kubelet). The `run-workdir`
 `emptyDir` mount is counted **separately** from that figure by kubelet, not folded into it.
 
-Measured table, from `scripts/measure-worker-ephemeral.sh` on the real worker image:
+Table, condensed from `scripts/measure-worker-ephemeral.sh` output (real worker image):
 
 ```
 writable layer (SizeRw)                      55  55.0B     COUNTED (Rootfs.UsedBytes)
@@ -305,9 +339,12 @@ substitute for.
   (ADR-122) and the workflow overlay (ADR-1036) are both reused byte-unchanged.
 - **No durability claim is made while every publish sink is unreachable**; a fetch-back
   with no successful remote publish is reported exactly as before (never `published`).
-- **The claim boundary intentionally does not widen**: park/shutdown/pause/capture and the
-  overlay path remain unscanned, by design, not oversight — see the dedicated section
-  above. A future decision to scan them is a separate, larger piece of work.
+- **The claim boundary intentionally does not widen**: park/shutdown/pause/capture and every
+  GitHub milestone publish remain unscanned, by design, not oversight — see the dedicated
+  section above. A future decision to scan them is a separate, larger piece of work.
+- **Neither `CHECKPOINT_TICK_INTERVAL` nor `CHECKPOINT_INTERVAL` is exposed via the chart or
+  the controller**, so hosted workers run the defaults (`5m`/`20m`); overriding either needs
+  a worker-env change outside the chart's current surface.
 - **A planted lock or marker can defer the tick indefinitely**; visible to an operator after
   3 consecutive deferrals for the same cause, but not auto-resolved — the busy probe
   deliberately never races a writer to decide otherwise.

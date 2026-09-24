@@ -252,8 +252,9 @@ and namespace from your own kubeconfig; they are deployment-specific, do not har
    worker.) Its pod is `uzi-hw-WORKER_ID-*` in the worker namespace.
 2. **Bundle the branch out**, base excluded so it stays small. The bare tracking ref
    advances at checkpoint boundaries (milestone/iteration checkpoints, park, shutdown via
-   `fetchBackBestEffort`; finalize via `fetchAgentBranch`) and, mid-turn, every
-   `CHECKPOINT_TICK_INTERVAL` (default 5m; issue #1597) — but still not on every commit, so
+   `fetchBackBestEffort`; finalize via `fetchAgentBranch`) and, mid-turn, on the
+   `CHECKPOINT_TICK_INTERVAL` tick (default 5m; issue #1597) whenever the tip has moved and
+   the clone is not busy — but still not on every commit, so
    after a hard mid-milestone/mid-tick kill the **working-clone branch HEAD** is the fresher
    committed tip, when its pod still lives. For
    a run still claimed on the worker holding the clone, `scripts/backup-runs.sh RUN` is easiest

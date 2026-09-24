@@ -25,7 +25,7 @@ through `[0.52.0]`.)
 ### Added
 
 - **A long implementation turn now reaches a checkpoint without waiting for a milestone ([#1597](https://github.com/vtmocanu/uzi/issues/1597)).**
-  A repeating mid-turn tick (`CHECKPOINT_TICK_INTERVAL`, default 5m, 0 disables) fetches committed work into the worker's bare repository and publishes it to origin through the existing credential-free broker once `CHECKPOINT_INTERVAL` has elapsed, bounding worst-case data loss to roughly one interval even mid-turn. Every such publish is secret-scanned over the exact pinned range being packed before it ships; a finding or an untrusted scan keeps the fetch-back local instead of publishing.
+  A repeating mid-turn tick (`CHECKPOINT_TICK_INTERVAL`, default 5m, 0 disables) fetches committed work into the worker's bare repository and publishes it to origin through the existing credential-free broker once `CHECKPOINT_INTERVAL` has elapsed, bounding worst-case data loss to roughly `CHECKPOINT_INTERVAL` plus one tick interval (~25m at defaults) even mid-turn. Every such publish (the tick, the iteration-boundary tier, and a non-GitHub-forge milestone) is secret-scanned over the pinned range being packed, minus content already public, before it ships; a finding or an untrusted scan keeps the fetch-back local instead of publishing. Park/shutdown/pause/capture and every GitHub milestone publish stay unscanned, unchanged from before.
 
 ### Changed
 
