@@ -121,7 +121,8 @@ const (
 	// eviction ranking against the worker's REQUEST (see ephemeralRequest); it carries NO
 	// sizeLimit on purpose, because a sizeLimit is an eviction path of its own (the same
 	// argument as the no-`limits.ephemeral-storage` rule). What bounds it is per-run
-	// cleanup: the supervisor's reaper deletes each run's dir.
+	// cleanup: the uid-10003 cache holder removes its run's dir at run end, and the
+	// supervisor's startup orphan reaper removes any dir a crashed run left behind.
 	codexCmdCacheVolume = "codex-cmd-cache"
 	codexCmdCacheDir    = "/var/cache/uzi-codex-cmd"
 
@@ -238,9 +239,21 @@ const (
 const (
 	// Plain worker: the working tree is NOT on ephemeral storage. render.go mounts
 	// run-workdir only when w.Docker, so /data/runner falls through to the `data`
-	// PVC and what is left on ephemeral is container logs plus the writable layer.
-	// Measured 45 KiB; kubelet's default log rotation ceiling is 10Mi x 5 per
+	// PVC. What is left on ephemeral is container logs, the writable layer, and the
+	// worker-only codex-cmd-cache emptyDir (codexCmdCacheDir). Logs plus the layer
+	// measured 45 KiB; kubelet's default log rotation ceiling is 10Mi x 5 per
 	// container. 512Mi is ~10x that ceiling.
+	//
+	// codex-cmd-cache is NOT in that measurement. With the uid split on, it holds a
+	// Codex run's per-run GOMODCACHE, GOCACHE and npm cache, removed per run (by the
+	// uid-10003 cache holder at run end, and by the startup orphan reaper for
+	// leftovers), and its bytes count toward pod ephemeral usage and so toward
+	// eviction ranking. This number is deliberately NOT raised for it: issue #1598
+	// requires measuring a Go-heavy Codex run's peak and retention on hosted workers
+	// first, and that post-deploy verification is pending. A Go-heavy Codex run may
+	// therefore exceed 512Mi. That only lowers the pod's eviction rank under node
+	// pressure: a request ranks and never limits, and codex-cmd-cache carries no
+	// sizeLimit and no container an ephemeral limit (the 🔴 rule above).
 	workerDefaultEphemeralRequest = "512Mi"
 	// Docker worker: run-workdir IS an emptyDir, and it holds the run's entire
 	// working tree — one clone per run, multiplied by WORKER_MAX_CONCURRENT_RUNS,
@@ -250,6 +263,12 @@ const (
 	// It is 4Gi and not the 6Gi an earlier draft carried BECAUSE of M-a: the daemon's
 	// image cache used to be an emptyDir on this same budget and is now a PVC. Do not
 	// raise this without re-deriving what is actually left on ephemeral storage.
+	//
+	// The docker tier carries the same codex-cmd-cache emptyDir on top of run-workdir,
+	// with the same per-run contents, cleanup and ranking effect as the plain tier.
+	// 4Gi was sized before it existed and is deliberately NOT raised in this change,
+	// pending the same #1598 measurement; concurrent Go-heavy Codex runs may push
+	// usage past it, which again only ranks and never limits.
 	workerDefaultDockerEphemeralRequest = "4Gi"
 )
 
