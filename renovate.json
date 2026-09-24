@@ -11,6 +11,8 @@
   "constraints": {
     "npm": ">=11.3.0"
   },
+  "timezone": "Europe/Bucharest",
+  "schedule": ["* 0-6 * * *"],
   "prHourlyLimit": 5,
   "minimumReleaseAge": "7 days",
   "internalChecksFilter": "strict",
