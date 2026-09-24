@@ -383,8 +383,11 @@ and falling back to the durable bare tracking ref when no clone survives:
   Pruning is path/name constrained, never follows symlinks, and preserves both latest targets.
 - **`scripts/backup-loop.sh <RUN_ID>...`** — runs `backup-runs.sh` every
   `UZI_BACKUP_INTERVAL` (default 900s), **detached** so it outlives the session (`setsid`
-  on Linux, a `( nohup … & )` subshell on macOS). It self-terminates when every run is
-  terminal, after `UZI_BACKUP_MAX_HOURS` (default 12), or on `touch $UZI_BACKUP_DIR/STOP`.
+  on Linux, a launchd LaunchAgent on macOS; this harness reaps `nohup` children).
+  For a Downloads backup root, keep the launchd stdout/stderr log under `/tmp`;
+  launchd refused a log path in Downloads before starting the job. The loop
+  self-terminates when every run is terminal, after `UZI_BACKUP_MAX_HOURS`
+  (default 12), or on `touch $UZI_BACKUP_DIR/STOP`.
   It rides through `limit_wait` (keeps snapshotting while a run is parked), retires each
   terminal run after its first terminal snapshot, and retries active runs after a failed
   capture. `backup-loop.state` records its PID, context, namespaces, interval, exact end
