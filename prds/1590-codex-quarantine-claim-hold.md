@@ -2,7 +2,7 @@
 
 **Issue:** [#1590](https://github.com/vtmocanu/uzi/issues/1590)
 
-**Status:** Ready for implementation (peer-reviewed over four rounds, 2026-09-24). No milestone started.
+**Status:** M1 in progress (2026-09-24); M2–M7 pending.
 
 **Priority:** High
 
@@ -90,6 +90,8 @@ Verified against `main` at `45c1acec` on 2026-09-24. Recheck anchors before impl
 
 ### D1: the hold class is quarantine and its re-login, nothing else
 
+M1 implementation note: the final run claim classifier re-reads alias and account authority under the exact claim lock. It checks successful payloads as well as assembly errors. A mint write with an ambiguous outcome makes no state mutation; a known mint is fenced by its epoch and hash. The judge remains terminal and never enters the hold class.
+
 Split the Codex claim sentinels into two classes, and pin the split in a table test:
 
 | class | condition | outcome |
@@ -99,14 +101,18 @@ Split the Codex claim sentinels into two classes, and pin the split in a table t
 | **terminal** | kind↔mode mismatch; login blob; deleted or incoherent alias (PRD #1332 D3) | `credential_unavailable`, unchanged |
 | **terminal** | identity tuple mismatch; `ErrCodexAccountKeyUnfrozen` on a run past first link | `credential_unavailable`, unchanged |
 | **terminal** | `ErrCodexAccountRevisionStale` (revocation fence) | `credential_unavailable`, unchanged |
-| **terminal** | a material-revision change that is not a same-alias re-login in flight (the alias is linked to a different identity or credential revision, or its auth mode changed); a relink that fails D5 | `credential_unavailable`, unchanged |
-| **terminal** | any bare store error | `credential_unavailable`, unchanged |
+| **hold** | a completed, verified same-alias re-login linked to the same frozen identity with unchanged credential revision, but newer material | park; D5 re-admits before promotion, and the old assembled token is discarded |
+| **terminal** | a material-revision change linked to a different identity or credential revision, or with changed auth mode; a relink that fails D5 | `credential_unavailable`, unchanged |
+| **terminal** | a known non-transient store defect | `credential_unavailable`, unchanged |
+| **no mutation** | an ambiguous capability mint or transient database/lock failure during final classification | return no payload and report the error; the exact claim and hold stay untouched |
 
 `coord_state='in_progress'` is **not** a hold condition. During a live refresh lease the committed login stays releasable, which is the existing contract of `evalCodexReleasePredicate`, and this PRD does not change it. A lease that expires is reaped into `quarantined` within one survivor tick, and the D2 gate catches it there. Keeping ClaimRun's gate, the sweeper park, and the authority predicate on the identical condition (`coord_state='quarantined'`) removes the SQL-vs-predicate drift.
 
 A `failed` staging alias (the new login proved unusable) keeps the run held with the re-login reason, since the owner can retry. Only a successful link to a non-matching account or revision is terminal.
 
 ### D2: gate in ClaimRun; park from the sweeper; assembly is only the race fallback
+
+M1 final-check note: both Claim return paths classify successful assembly and assembly errors in one locked transaction. They check status, worker and generation first, then the attempt's minted epoch/hash before account authority. A stale or superseded attempt returns idle without mutation. A current quarantine, in-flight or verified same-identity re-login parks the exact claim; terminal credential, provisioning and guardrail failures fail it. Each outcome settles only its expected current-generation hold, preserving older holds. If a hold-class assembly error sees a recovered account at this check, the discarded attempt still parks and the account-driven promoter can resume it. An ambiguous mint or transient classification error makes no mutation. The check narrows the handoff race and does not make HTTP delivery atomic with the database. M2's pre-claim gate and sweeper are still pending.
 
 - **ClaimRun predicate.** A standalone predicate, shaped like the custom-model clause, excludes a Codex subscription run (`harness='codex'`, `codex_auth_mode='subscription'`) in either of two cases:
   - **quarantine:** the linked account exists and `cpa.coord_state='quarantined'`;
@@ -116,7 +122,7 @@ A `failed` staging alias (the new login proved unusable) keeps the run held with
 - **Sweeper park.** A new pass, `park_codex_account_unavailable`, moves `queued` runs matching either case of the same predicate to `recovery_wait` with cause `codex_account_unavailable`. It moves no generation, opens no hold, leaves `worker_id` alone, and fences on `status='queued'` and the observed row.
 - **Assembly fallback.** When assembly sees a hold-class sentinel, it runs a new transaction, `ParkRunCodexAccountUnavailable`, that composes the two precedents:
   - It locks the run `FOR UPDATE`, and refuses (with nothing mutated) unless `status='claimed'`, `worker_id` is the claimant and `claim_generation` is the claim's generation. A cancel or a competing reclaim wins.
-  - It computes the **expected** number of holds this claim opened from the **same claim-time recovery-capable boolean ClaimRun passed to its `hold` CTE** (`runtime.sql` ~1044-1063; carried from the claim into assembly, never re-derived from a later mutable worker row or from the observed count): one when the CTE applied (a claimant advertising `recovery_archive_v1`, on a hold-opening kind), otherwise zero (see `api/internal/workersvc/claim_custody_livedb_test.go` ~98 for the zero-hold claim). It locks the open holds for (run, claimant, this generation) and requires exactly that count. With one, it releases the hold with `release_evidence='no_adopted_source'`. With zero, it releases nothing and parks. Any other count (an unexpected hold, or two) refuses and fails closed to today's behaviour, logged.
+  - It computes the **expected** number of holds this claim opened from the **same claim-time recovery-capable boolean ClaimRun passed to its `hold` CTE** (`runtime.sql` ~1044-1063; carried from the claim into assembly, never re-derived from a later mutable worker row or from the observed count): one when the CTE applied (a claimant advertising `recovery_archive_v1`, on a hold-opening kind), otherwise zero (see `api/internal/workersvc/claim_custody_livedb_test.go` ~98 for the zero-hold claim). It locks the open holds for (run, claimant, this generation) and requires exactly that count. With one, it releases the hold with `release_evidence='no_adopted_source'`. With zero, it releases nothing and parks. Any other count (an unexpected hold, or two) rolls back and reports a fail-closed error without delivering a payload or falling through to the unfenced `MarkRunFailedByID`, logged.
   - It sets `status='recovery_wait'`, the cause, `status_since`, `started_at=NULL`, `budget_paused_seconds=0`, `codex_cap_hash=NULL`, `codex_claim_epoch+1`, and clears health (the `SetRunPoolWait` field set).
   - It applies the D4 affinity preference.
   - Older-generation holds stay open, so custody is retained.
@@ -206,7 +212,7 @@ Chat is interactive, with the owner present at the moment of failure, and judge 
 
 Each milestone ends green on `task gate:api`, plus `task gate:web` for M5 and `task gate:repo` for the migration milestone. Each carries a regression test that fails on the unfixed code, observed in both directions.
 
-- [ ] **M1: Sentinel split and assembly park.**
+- [ ] **M1: Sentinel split, exact-claim assembly outcomes and park.** LiveDB execution remains required before this checkbox is ticked. Implementation in progress; final live-DB regression and judge error-path coverage remain to be verified.
   - The D1 classification table test.
   - The comment update at `codexauthz.go:49-53` (D3), and a test that a capability-scoped release or start-refresh against a `codex_account_unavailable` run is refused (its cap is revoked).
   - The migration widening `runs_recovery_wait_cause_check` with `codex_account_unavailable`, plus a new Go test pinning the cause vocabulary to the CHECK (the `TestFailOriginVocabularyMatchesCheck` pattern).

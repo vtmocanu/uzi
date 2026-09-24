@@ -3455,6 +3455,37 @@ UPDATE runs SET status = 'queued', status_since = now(),
     updated_at = now()
 WHERE id = @id AND status = 'claimed';
 
+-- name: ParkRunCodexAccountUnavailable :one
+-- Called under the exact-claim row lock, after settling this generation's hold.
+UPDATE runs SET
+    status = 'recovery_wait', recovery_wait_cause = 'codex_account_unavailable',
+    status_since = now(), started_at = NULL, budget_paused_seconds = 0,
+    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    worker_id = COALESCE((
+        SELECT h.live_worker_id FROM recovery_custody_holds h
+        WHERE h.run_id = runs.id AND h.state = 'open'
+        ORDER BY h.generation DESC, h.created_at DESC LIMIT 1
+    ), runs.worker_id),
+    updated_at = now()
+WHERE runs.id = @id AND runs.worker_id = @worker_id AND runs.claim_generation = @claim_generation
+  AND runs.status = 'claimed' AND runs.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework')
+RETURNING *;
+
+-- name: FailClaimAssemblyExact :execrows
+-- Terminal claim assembly failure, fenced to the same locked claim.
+UPDATE runs SET
+    status = 'failed', status_since = now(), failure_reason = @failure_reason,
+    fail_origin = @fail_origin, move_pending_since = now(), finished_at = now(),
+    milestones_in_progress = NULL, milestones_agents = NULL,
+    pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
+    credential_switch_requested_at = NULL, credential_switch_generation = NULL,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
+    updated_at = now()
+WHERE id = @id AND worker_id = @worker_id AND claim_generation = @claim_generation
+  AND status = 'claimed';
+
 -- name: SetRunPoolWait :execrows
 -- Hold an `auto` run whose token pool is genuinely empty (PRD #754 M4). claimed →
 -- pool_wait, NON-TERMINAL and NON-LOCKING: the run keeps its worker_id affinity, and

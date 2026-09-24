@@ -2390,10 +2390,7 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker, snapshot *ActiveS
 			return nil, err
 		}
 		payload, err := s.assembleClaim(ctx, wkr, run)
-		if err != nil {
-			return nil, s.recoverClaimAssembly(ctx, run, err)
-		}
-		return payload, nil
+		return s.finishRunClaim(ctx, run, payload, err, claimRecoveryIdentity{workerID: wkr.ID, recoveryCapable: params.RecoveryCapable})
 	}
 
 	// Snapshot carried + tx beginner: ONE transaction in the canonical lock order (D8), so a
@@ -2469,10 +2466,7 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker, snapshot *ActiveS
 	}
 	committed = true
 	payload, err := s.assembleClaim(ctx, wkr, run)
-	if err != nil {
-		return nil, s.recoverClaimAssembly(ctx, run, err)
-	}
-	return payload, nil
+	return s.finishRunClaim(ctx, run, payload, err, claimRecoveryIdentity{workerID: wkr.ID, recoveryCapable: params.RecoveryCapable})
 }
 
 // requestActivePairs extracts the index-aligned (run_id, claim_generation) pairs a claim's request

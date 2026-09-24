@@ -656,15 +656,13 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		if err != nil {
 			// recoverClaimAssembly handles errVaultLocked (transient requeue) and
 			// errRunVanished (drop) by IDENTITY — pass those through untouched. Every other
-			// codex sentinel (ErrCodexMaterialRevisionStale, ErrCodexAccountRevisionStale,
-			// ErrCodexAccountQuarantined, ErrCodexKindModeMismatch, ErrCodexLoginBlob, and any
-			// bare store error) means the bound credential cannot be delivered right now, so
-			// wrap it as errCredentialUnavailable to fail the run cleanly (terminal), rather
-			// than propagating an unclassified error the recover switch would not handle.
-			if errors.Is(err, errVaultLocked) || errors.Is(err, errRunVanished) {
+			// Preserve the Codex sentinel for the final exact-claim classifier. Quarantine
+			// and a same-alias re-login in flight can hold a run-lane claim; other
+			// credential failures remain terminal.
+			if errors.Is(err, errVaultLocked) || errors.Is(err, errRunVanished) || errors.Is(err, errCodexMintAmbiguous) {
 				return nil, err
 			}
-			return nil, fmt.Errorf("%w: %v", errCredentialUnavailable, err)
+			return nil, fmt.Errorf("%w: %w", errCredentialUnavailable, err)
 		}
 		payload.Secrets.Codex = codex
 	}
