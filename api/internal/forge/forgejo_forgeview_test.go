@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 )
@@ -338,11 +339,14 @@ func TestForgejoGetWorkflowRun(t *testing.T) {
 }
 
 // TestForgejoGetWorkflowRunUnsupported pins the honest degrade path for the single
-// GET: a 404 (Actions API absent on this server version) surfaces as
-// ErrForgeVersionUnsupported, exactly as the list does.
+// GET: a 404 whose runs-list probe also 404s (Actions API absent on this server
+// version) surfaces as ErrForgeVersionUnsupported, exactly as the list does.
 func TestForgejoGetWorkflowRunUnsupported(t *testing.T) {
 	m := newMockForgejo(t, map[string]http.HandlerFunc{
 		"/repos/acme/widgets/actions/runs/88": func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, `{"message":"Not Found"}`, http.StatusNotFound)
+		},
+		"/repos/acme/widgets/actions/runs": func(w http.ResponseWriter, _ *http.Request) {
 			http.Error(w, `{"message":"Not Found"}`, http.StatusNotFound)
 		},
 	})
@@ -354,5 +358,47 @@ func TestForgejoGetWorkflowRunUnsupported(t *testing.T) {
 	}
 	if !errors.Is(err, ErrForgeVersionUnsupported) {
 		t.Fatalf("a 404 on the Actions run endpoint must wrap ErrForgeVersionUnsupported, got %v", err)
+	}
+}
+
+// TestForgejoGetWorkflowRunMissingRun pins issue #1343: on an Actions-capable server
+// (the runs list answers), a 404 for one run id means the run is gone, not that the
+// API is absent. It must NOT wrap ErrForgeVersionUnsupported (which the handler turns
+// into the "not available on this forge version" notice) and must stay redacted.
+func TestForgejoGetWorkflowRunMissingRun(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		probe http.HandlerFunc
+	}{
+		{"runs list answers", func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{"total_count": 0, "workflow_runs": []any{}})
+		}},
+		{"runs list fails otherwise", func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, `{"message":"boom"}`, http.StatusInternalServerError)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newMockForgejo(t, map[string]http.HandlerFunc{
+				"/repos/acme/widgets/actions/runs/88": func(w http.ResponseWriter, _ *http.Request) {
+					http.Error(w, `{"message":"Not Found"}`, http.StatusNotFound)
+				},
+				"/repos/acme/widgets/actions/runs": tc.probe,
+			})
+			d := newForgejoDriver(t, m, "forgejo-token-value-123456")
+
+			_, err := d.GetWorkflowRun(context.Background(), 7, 88)
+			if err == nil {
+				t.Fatal("expected an error for a missing run id")
+			}
+			if errors.Is(err, ErrForgeVersionUnsupported) {
+				t.Fatalf("a missing run on an Actions-capable server must not claim the version degrade, got %v", err)
+			}
+			if !strings.Contains(err.Error(), "forgejo: get workflow run:") {
+				t.Fatalf("want the plain wrapped get error, got %v", err)
+			}
+			if strings.Contains(err.Error(), "forgejo-token-value-123456") {
+				t.Fatalf("error leaked the PAT: %v", err)
+			}
+		})
 	}
 }
