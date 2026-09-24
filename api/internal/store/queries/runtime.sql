@@ -3546,9 +3546,13 @@ WHERE id = @id AND status = 'claimed';
 
 -- name: ParkRunCodexAccountUnavailable :one
 -- Called under the exact-claim row lock, after settling this generation's hold.
+-- recovery_retry_not_before is cleared: this cause is resumed by the account, never by the
+-- timer (PromoteRecoveryWaitRuns skips it), and the row shape matches
+-- ParkQueuedCodexAccountUnavailablePage, the other writer of this cause.
 UPDATE runs SET
     status = 'recovery_wait', recovery_wait_cause = 'codex_account_unavailable',
-    status_since = now(), started_at = NULL, budget_paused_seconds = 0,
+    status_since = now(), recovery_retry_not_before = NULL,
+    started_at = NULL, budget_paused_seconds = 0,
     codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
     health = 'ok', health_reason = NULL, health_since = NULL,
     worker_id = COALESCE((
@@ -3580,8 +3584,8 @@ RETURNING *;
 --
 -- The SET list is the M1 exact-claim park's, minus the worker_id affinity rewrite: a queued run
 -- has no claim of this pass's making, so claim_generation and worker_id are left alone and no
--- custody hold is opened or released. recovery_retry_not_before is cleared because this cause
--- is resumed by the account, never by the timer (PromoteRecoveryWaitRuns skips it).
+-- custody hold is opened or released. Both writers clear recovery_retry_not_before because this
+-- cause is resumed by the account, never by the timer (PromoteRecoveryWaitRuns skips it).
 --
 -- Returns one row even when nothing parks: page_size (rows examined), last_scanned_id (the nil
 -- uuid on an empty page) and the parked ids.

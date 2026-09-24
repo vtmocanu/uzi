@@ -486,6 +486,14 @@ func TestParkCodexAccountSparseQueueBoundedLiveDB(t *testing.T) {
 	svc.codexPark.capOverride = pageCap
 	svc.codexPark.after = cursorStart
 	n := countQueuedCodexSubscription(t, env) // includes other tests' leftovers
+	var ahead int
+	if err := env.pool.QueryRow(env.ctx, `SELECT count(*) FROM runs WHERE status = 'queued'
+		AND harness = 'codex' AND codex_auth_mode = 'subscription' AND id > $1`, cursorStart).Scan(&ahead); err != nil {
+		t.Fatal(err)
+	}
+	if ahead < pageCap {
+		t.Fatalf("only %d queued Codex subscription runs ahead of the cursor, want >= %d", ahead, pageCap)
+	}
 	bound := (n+pageCap-1)/pageCap + 1
 	wrapped := false
 	for tick := 1; tick <= bound; tick++ {
@@ -495,6 +503,13 @@ func TestParkCodexAccountSparseQueueBoundedLiveDB(t *testing.T) {
 		page := rec.pages[len(rec.pages)-1]
 		if page.PageSize > pageCap {
 			t.Fatalf("tick %d examined %d rows, want <= %d", tick, page.PageSize, pageCap)
+		}
+		// Tick 1 starts at the cursor with >= pageCap rows ahead, almost all healthy: the LIMIT
+		// applies before the account predicate, so the page is exactly full. With the predicate
+		// inside the page it would hold only the gated rows ahead (2 of ours plus any leftovers).
+		if tick == 1 && page.PageSize != pageCap {
+			t.Fatalf("tick 1 examined %d rows from the cursor with %d ahead, want exactly %d (LIMIT before the account predicate)",
+				page.PageSize, ahead, pageCap)
 		}
 		if mustRun(t, env, ids[10]).Status == "recovery_wait" && !wrapped {
 			t.Fatalf("tick %d parked the run behind the cursor before the cursor wrapped", tick)
@@ -517,6 +532,34 @@ func TestParkCodexAccountSparseQueueBoundedLiveDB(t *testing.T) {
 		}
 	}
 	t.Fatalf("gated runs not all parked within %d ticks (N=%d, cap=%d)", bound, n, pageCap)
+}
+
+// TestParkCodexAccountRevokesCapabilityLiveDB: the sweeper park revokes a capability the queued
+// row still carries. The run is seeded with a non-empty codex_cap_hash and a known
+// codex_claim_epoch by direct SQL (the shared fixture's rows have no hash, so a park that left it
+// in place would pass assertCodexAccountParked); Sweep must NULL the hash and bump the epoch by
+// exactly one.
+func TestParkCodexAccountRevokesCapabilityLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	fx := newCodexClaimFix(t, env, false)
+	const epoch = 7
+	env.exec(`UPDATE runs SET codex_cap_hash = $2, codex_claim_epoch = $3 WHERE id = $1`,
+		fx.runID, bytes.Repeat([]byte{0xab}, 32), epoch)
+	fx.setAccount(t, "coord_state = 'quarantined'")
+	before := mustRun(t, env, fx.runID)
+	if before.Status != "queued" || len(before.CodexCapHash) == 0 || before.CodexClaimEpoch != epoch {
+		t.Fatalf("seed: status=%s hash=%x epoch=%d, want queued with a hash at epoch %d",
+			before.Status, before.CodexCapHash, before.CodexClaimEpoch, epoch)
+	}
+	svc := gateSweepService(env, fx.svc)
+	if _, err := svc.Sweep(env.ctx); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	r := mustRun(t, env, fx.runID)
+	if r.CodexCapHash != nil || r.CodexClaimEpoch != epoch+1 {
+		t.Fatalf("hash=%x epoch=%d, want NULL hash and epoch %d", r.CodexCapHash, r.CodexClaimEpoch, epoch+1)
+	}
+	assertCodexAccountParked(t, env, fx.runID, before)
 }
 
 // TestParkCodexAccountSkipsLockedCandidateLiveDB: a gated run another connection holds FOR UPDATE

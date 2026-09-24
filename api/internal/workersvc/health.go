@@ -188,7 +188,7 @@ const (
 	// on its alias is in flight or has just linked the same identity with newer material. No
 	// worker can clear it, so it is resolved with the other fleet-independent owner-state blocks,
 	// ahead of every worker reason. Read from ListActiveRunsForHealth's codex_account_gated, the
-	// byte-identical copy of the claim gate, so the pill and the claim can never disagree. The
+	// byte-identical copy of the claim gate, so the pill and the claim use the same predicate. The
 	// park_codex_account_unavailable pass normally moves such a run to recovery_wait within a
 	// tick or a few; this reason covers the window before it does. Maps to the SAME
 	// healthWaitingWorker enum (runs.health_reason is free text).

@@ -53,8 +53,11 @@ func newCodexClaimFix(t *testing.T, env codexTestEnv, olderHold bool) *codexClai
 	if olderHold {
 		fx.holdA = claimRecoveryHold(t, env, f.runID, fx.workerA, 1)
 	}
-	// The sweeper's requeue: worker_id kept for affinity, capability revoked.
+	// The sweeper's requeue: worker_id kept for affinity, capability revoked. A stale
+	// recovery_retry_not_before is left in place as history (as PromoteRecoveryWaitRuns leaves
+	// it), so a codex_account_unavailable park must clear it.
 	env.exec(`UPDATE runs SET status = 'queued', status_since = now(), worker_id = $2,
+		recovery_retry_not_before = now() - interval '1 hour',
 		started_at = now() - interval '3 hours', budget_paused_seconds = 120,
 		updated_at = now() - interval '3 hours' WHERE id = $1`, f.runID, fx.workerA)
 	fx.workerB = uuid.New()
@@ -134,6 +137,9 @@ func (fx *codexClaimFix) assertParked(t *testing.T, before store.Run, wantWorker
 	}
 	if r.StartedAt.Valid || r.BudgetPausedSeconds != 0 || r.Health != "ok" {
 		t.Fatalf("wall not reset: started_at=%v paused=%d health=%s", r.StartedAt, r.BudgetPausedSeconds, r.Health)
+	}
+	if r.RecoveryRetryNotBefore.Valid {
+		t.Fatalf("recovery_retry_not_before = %v, want NULL (the account, not the timer, resumes this cause)", r.RecoveryRetryNotBefore)
 	}
 	if r.WorkerID != pgconv.UUID(wantWorker) {
 		t.Fatalf("worker_id = %v, want %s", r.WorkerID, wantWorker)
