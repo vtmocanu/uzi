@@ -47,12 +47,13 @@ func TestDeriveCodexAccountAction(t *testing.T) {
 			in.leaseLive = true
 		}, CodexAccountActionReconciling},
 		{"quarantined, no material and no lease", quarantine, CodexAccountActionReloginRequired},
-		// Recovery material outranks the reauth flag: the survivor pass promotes it and
-		// PromoteCodexRecovery clears reauth_required, so no owner action is needed.
+		// The reauth flag outranks recovery material: survivor promotion can defer
+		// indefinitely (nil codexRefresh, locked vault, ErrIdentityIncomplete, a non-2xx
+		// DiscoverIdentity), while a same-alias re-login is always a valid way out.
 		{"quarantined, recovery material but reauth flag set", func(in *codexAccountActionInputs) {
 			quarantine(in)
 			in.recoveryAtGeneration, in.reauthRequired = true, true
-		}, CodexAccountActionReconciling},
+		}, CodexAccountActionReloginRequired},
 		{"quarantined, reauth flag set, no material", func(in *codexAccountActionInputs) {
 			quarantine(in)
 			in.reauthRequired = true

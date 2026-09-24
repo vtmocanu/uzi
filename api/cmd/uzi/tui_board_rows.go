@@ -220,9 +220,9 @@ func (m tuiModel) boardEmptyState() string {
 // selected row rides the full-width warm selection bar with a ▸ cursor; a DONE-band row is
 // faint end to end.
 func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool, mc boardMarkerCols) string {
-	band := runBand(r.Status, r.IsRevising)
+	band := runBandOf(r)
 	terminal := band == bandDone
-	tok := m.pal.stateToken(r.Status, r.Health, r.IsPlanning, r.IsRevising, r.LandingState, strOr(r.RecoveryWaitCause, ""))
+	tok := m.pal.runStateToken(r.RunDTO, r.IsRevising)
 	showCred := m.boardShowCred()
 
 	var bg color.Color

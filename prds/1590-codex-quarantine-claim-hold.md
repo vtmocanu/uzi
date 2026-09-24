@@ -214,9 +214,10 @@ The run DTO gains a derived `codex_account_action` for a run held on `codex_acco
 
 | condition | action |
 |---|---|
-| alias linked, account quarantined, recovery material at the current generation (even with the reauth flag set: the survivor pass promotes the material and `PromoteCodexRecovery` clears the flag) or a live lease | `reconciling` |
+| alias linked, account quarantined, reauth flag set (even with recovery material: survivor promotion can defer indefinitely, while a same-alias re-login always works) | `relogin_required` |
+| alias linked, account quarantined, no reauth flag, recovery material at the current generation or a live lease | `reconciling` |
 | alias linked, account `in_progress` with a live lease, or with an expired lease the survivor pass reaps on its next tick, while a same-identity re-admission waits on it | `reconciling` |
-| alias linked, account quarantined, no material and no live lease, or reauth flag set without material | `relogin_required` |
+| alias linked, account quarantined, no material and no live lease | `relogin_required` |
 | alias `staging` (new login being verified) | `verifying_login` |
 | alias `failed` (new login unusable) | `relogin_required` |
 | alias deleted (`codex_secret_id` NULL) | transient: the next promoter tick fails the run per D5; until then, `relogin_required` |

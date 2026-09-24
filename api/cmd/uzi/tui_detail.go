@@ -667,7 +667,7 @@ func (m tuiModel) detailHeaderLines() []string {
 	if d.run.ID != "" {
 		// RunDTO carries no is_revising (issue #750): the detail header keeps its own
 		// derivePlanRevision panel, so revising is not surfaced through this token here.
-		tok := m.pal.stateToken(d.run.Status, d.run.Health, d.run.IsPlanning, false, d.run.LandingState, strOr(d.run.RecoveryWaitCause, ""))
+		tok := m.pal.runStateToken(d.run, false)
 		statusTag = lipgloss.NewStyle().Foreground(tok.color).Render(tok.glyph + " " + tok.word)
 		if dur := runDuration(d.run, time.Now()); dur != "" {
 			statusTag += m.pal.faint.Render(" · " + dur)
@@ -768,8 +768,10 @@ func (m tuiModel) renderDetail() string {
 	// above (a recovery_wait run is never limit_wait, so the two never both draw). It carries
 	// the owner's alias label, USER-AUTHORED text: codexAccountActionLine already folds it
 	// through cellText, and renderer.Plain here is the D7 backstop. No retry countdown.
+	// clampVisual fits it to m.width: a long label must not wrap, because transcriptViewport
+	// charges this line exactly one row (the #379 invariant).
 	if line := codexAccountActionLine(d.run); line != "" {
-		sb.WriteString(m.pal.state(crewWaiting).Render(m.renderer.Plain(line, 120)) + "\n")
+		sb.WriteString(clampVisual(m.pal.state(crewWaiting).Render(m.renderer.Plain(line, 120)), m.width) + "\n")
 	}
 
 	// The near-timeout countdown (PRD #1170), the run detail's OTHER conditional second

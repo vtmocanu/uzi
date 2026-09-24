@@ -1415,7 +1415,7 @@ func TestCodexAccountActionLine(t *testing.T) {
 	}{
 		{"reconciling", strp("reconciling"), strp("work"), "Codex account is reconciling"},
 		{"relogin_required", strp("relogin_required"), strp("work laptop"), "re-log in Codex credential work laptop to continue"},
-		{"relogin_required, no label", strp("relogin_required"), nil, "re-log in your Codex credential to continue"},
+		{"relogin_required, no label", strp("relogin_required"), nil, "re-log in the run's Codex credential to continue"},
 		{"verifying_login", strp("verifying_login"), strp("work"), "verifying the new Codex login"},
 		{"resuming", strp("resuming"), strp("work"), "Codex account available again"},
 		{"unknown action", strp("some_future_action"), strp("work"), "Codex account unavailable"},
@@ -1481,10 +1481,10 @@ func TestRenderRunDetailCodexAccountRow(t *testing.T) {
 }
 
 // TestRunStatusCellCodexHold: the `uzi run list` / `uzi admin runs` STATUS cell appends the
-// action for a held run and is unchanged for every other run.
+// short, label-free action for a held run and is unchanged for every other run.
 func TestRunStatusCellCodexHold(t *testing.T) {
 	held := apitypes.RunListItemDTO{RunDTO: codexHoldRun(strp("reconciling"), nil)}
-	if got, want := runStatusCell(held), "recovery_wait (Codex account is reconciling)"; got != want {
+	if got, want := runStatusCell(held), "recovery_wait (Codex reconciling)"; got != want {
 		t.Errorf("runStatusCell(held) = %q, want %q", got, want)
 	}
 	other := apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{Status: "running"}}

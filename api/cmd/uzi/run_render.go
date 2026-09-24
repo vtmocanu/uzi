@@ -1589,7 +1589,8 @@ func isCodexAccountHold(r apitypes.RunDTO) bool {
 // CodexSecretLabel is USER-AUTHORED text (the owner's alias label), so it goes through
 // cellText, which strips control and format runes, folds newlines and bounds its length; a
 // hostile label cannot reach the terminal as an escape sequence. A relogin_required hold with
-// no label still tells the owner what to do, just without naming the credential.
+// no label still says what to do, just without naming the credential; it says "the run's",
+// not "your", because an admin reading another owner's run sees the same copy (and the web's).
 func codexAccountActionLine(r apitypes.RunDTO) string {
 	if !isCodexAccountHold(r) {
 		return ""
@@ -1601,7 +1602,7 @@ func codexAccountActionLine(r apitypes.RunDTO) string {
 		if label := cellText(strOr(r.CodexSecretLabel, "")); label != "" {
 			return "re-log in Codex credential " + label + " to continue"
 		}
-		return "re-log in your Codex credential to continue"
+		return "re-log in the run's Codex credential to continue"
 	case codexActionVerifyingLogin:
 		return "verifying the new Codex login"
 	case codexActionResuming:
@@ -1611,13 +1612,37 @@ func codexAccountActionLine(r apitypes.RunDTO) string {
 	}
 }
 
+// codexAccountActionShort is the bounded, label-free form of codexAccountActionLine for the
+// run tables' STATUS cell. The table sizes each column to its widest cell, so one held run's
+// full sentence (which carries the user-authored alias label, up to cellText's bound) would
+// widen that column on EVERY row; this form never names the label and stays under 27 runes.
+// The full sentence, label included, stays on `run get`'s CODEX_ACCOUNT row. "" for any run
+// that is not a Codex account hold.
+func codexAccountActionShort(r apitypes.RunDTO) string {
+	if !isCodexAccountHold(r) {
+		return ""
+	}
+	switch strOr(r.CodexAccountAction, "") {
+	case codexActionReconciling:
+		return "Codex reconciling"
+	case codexActionReloginRequired:
+		return "re-log in Codex credential"
+	case codexActionVerifyingLogin:
+		return "verifying Codex login"
+	case codexActionResuming:
+		return "Codex available again"
+	default:
+		return "Codex unavailable"
+	}
+}
+
 // runStatusCell is the STATUS cell of the run tables (`uzi run list`, `uzi admin runs`):
-// displayRunStatus, plus the Codex account action in parentheses for a run held on its
+// displayRunStatus, plus the short Codex account action in parentheses for a run held on its
 // Codex account (PRD #1590), so the list says what the held run needs without a `run get`.
 func runStatusCell(r apitypes.RunListItemDTO) string {
 	s := displayRunStatus(r.Status, r.IsPlanning, r.IsRevising, r.LandingState)
-	if line := codexAccountActionLine(r.RunDTO); line != "" {
-		s += " (" + line + ")"
+	if short := codexAccountActionShort(r.RunDTO); short != "" {
+		s += " (" + short + ")"
 	}
 	return s
 }

@@ -41,13 +41,14 @@ func TestCodexAccountActionsForRunsLiveDB(t *testing.T) {
 		{"quarantined, recovery material at the current generation", func(t *testing.T, fx *codexClaimFix) {
 			seedActionRecovery(t, fx)
 		}, CodexAccountActionReconciling},
-		// Recovery material outranks the reauth flag: the survivor pass promotes it and
-		// PromoteCodexRecovery clears reauth_required, so no owner action is needed.
+		// The reauth flag outranks recovery material: survivor promotion can defer
+		// indefinitely (nil codexRefresh, locked vault, ErrIdentityIncomplete, a non-2xx
+		// DiscoverIdentity), while a same-alias re-login is always a valid way out.
 		{"quarantined, recovery material but reauth required", func(t *testing.T, fx *codexClaimFix) {
 			seedActionRecovery(t, fx)
 			fx.setAccount(t, `reauth_required = true, reauth_generation = generation,
 				reauth_credential_revision = credential_revision`)
-		}, CodexAccountActionReconciling},
+		}, CodexAccountActionReloginRequired},
 		{"quarantined, reauth required, no recovery material", func(t *testing.T, fx *codexClaimFix) {
 			fx.setAccount(t, `reauth_required = true, reauth_generation = generation,
 				reauth_credential_revision = credential_revision`)

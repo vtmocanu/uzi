@@ -147,13 +147,16 @@ func codexAccountActionInputsFromRow(row store.ListCodexAccountActionInputsRow, 
 //     is ahead of the run's and the account is idle or committed (ReadmitRunCodexBinding's
 //     coord_state fence; its identity and credential-revision fences are classify's own
 //     terminal checks). Promote is resuming (transient until the next tick);
-//   - stay on a quarantined account with recovery material at its current generation:
-//     reconciling, EVEN WHEN the reauth flag is set. The survivor pass
-//     (reconcileUnresolvedCodexRefresh) promotes exactly that material, and PromoteCodexRecovery
-//     clears reauth_required in the same statement, so the account recovers with no owner
-//     action; telling the owner to re-log in would ask for work the next tick makes moot;
-//   - stay on a quarantined account otherwise: relogin_required when the reauth flag is set,
-//     reconciling when a lease is live, otherwise relogin_required;
+//   - stay on a quarantined account: relogin_required when the reauth flag is set, EVEN WHEN
+//     recovery material sits at the current generation. The survivor pass
+//     (reconcileUnresolvedCodexRefresh) would promote that material and clear the flag, but
+//     only if promotion goes through, and it can defer indefinitely: a nil codexRefresh, a
+//     locked vault, ErrIdentityIncomplete, or any non-2xx from DiscoverIdentity (a 401
+//     included) leaves the account quarantined with the flag still set. "reconciling" would
+//     then mislead the owner for as long as that lasts, whereas a same-alias re-login is
+//     always a valid way out (D5 re-admits the run on the fresh material). Without the flag:
+//     reconciling when recovery material sits at the current generation or a lease is live,
+//     otherwise relogin_required;
 //   - stay on an in_progress account with a live lease (a refresh in flight, the promoter waits
 //     for it to finish before re-admitting): reconciling. D6's table names the live lease only
 //     under quarantine; an owner re-login would not help a run whose account is mid-refresh,
@@ -190,11 +193,10 @@ func deriveCodexAccountAction(in codexAccountActionInputs) string {
 		return CodexAccountActionReloginRequired
 	}
 	switch {
-	case rel.coordState == codexCoordQuarantined && in.recoveryAtGeneration:
-		return CodexAccountActionReconciling // before the reauth flag: the promotion clears it
 	case rel.coordState == codexCoordQuarantined && in.reauthRequired:
+		// Before the recovery material: its promotion can defer indefinitely, a re-login cannot.
 		return CodexAccountActionReloginRequired
-	case rel.coordState == codexCoordQuarantined && in.leaseLive:
+	case rel.coordState == codexCoordQuarantined && (in.recoveryAtGeneration || in.leaseLive):
 		return CodexAccountActionReconciling
 	case rel.coordState == codexCoordInProgress && (in.leaseLive || in.leaseExpired):
 		return CodexAccountActionReconciling

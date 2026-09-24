@@ -196,8 +196,10 @@ func TestCodexHoldTUIDetailAndBoard(t *testing.T) {
 	if !strings.Contains(out, "re-log in Codex credential [2Jwork]8;;http://evil to continue") {
 		t.Errorf("detail lacks the Codex account action line:\n%s", out)
 	}
-	if !strings.Contains(out, "codex wait") {
-		t.Errorf("detail header lacks the codex wait token:\n%s", out)
+	// relogin_required is the owner's turn (PRD #1590): the header reads the amber attention
+	// token "codex login", not the self-resolving "codex wait".
+	if !strings.Contains(out, "codex login") {
+		t.Errorf("detail header lacks the codex login token:\n%s", out)
 	}
 	if strings.Contains(out, "retry at") || strings.Contains(out, "resumes in") {
 		t.Errorf("a Codex account hold must show no retry countdown:\n%s", out)
@@ -208,7 +210,7 @@ func TestCodexHoldTUIDetailAndBoard(t *testing.T) {
 	raw = board.View().Content
 	assertNoRawControls(t, "codex hold board", raw)
 	out = stripANSI(raw)
-	if !strings.Contains(out, "codex wait") || !strings.Contains(out, "▸ re-log in Codex credential [2Jwork]8;;http://evil to continue") {
-		t.Errorf("board lacks the codex wait token or the selected row's action line:\n%s", out)
+	if !strings.Contains(out, "codex login") || !strings.Contains(out, "▸ re-log in Codex credential [2Jwork]8;;http://evil to continue") {
+		t.Errorf("board lacks the codex login token or the selected row's action line:\n%s", out)
 	}
 }
