@@ -84,7 +84,7 @@ Verified against `main` at `45c1acec` on 2026-09-24. Recheck anchors before impl
 - **Budget display.** `budget_used_seconds` is computed per request (`api/internal/handler/runs_dto.go` ~462-475) as `now − started_at − budget_paused_seconds` for every non-paused started row, terminal rows included. That is why the failed run reported 30226 s. It is a separate display defect (see Out of scope).
 - **Surfaces.** `recovery_wait_cause` is an untyped string in `api/internal/apitypes/run.go:678` and `web/src/lib/apiTypes.ts:2525`. It is rendered in `web/src/pages/RunView.tsx` ~1515-1575 (`RecoveryWaitPanel`, a binary `forgePark` check) and in the CLI/TUI at `api/cmd/uzi/run_render.go:1459,1542-1550`, `run_steer.go:471`, `tui_render.go:230`, `tui_detail.go:670`, `tui_board.go:149`, `tui_board_rows.go:225` and `tui_steer.go:157`.
 - **Docs.** `docs/run-recovery-wait.md` (embedded copy under `api/internal/uzidocs/embed/`) documents recovery_wait, pool_wait, limit_wait and paused, and has a "Forge unreachable at clone" section to follow. No doc mentions Codex quarantine.
-- **Migration head** is `00246_user_per_harness_models.sql`. This PRD drafts one migration (00247). It is renumbered at landing (`task migration:renumber`).
+- **Migration head** was `00246_user_per_harness_models.sql` at PRD verification; at implementation base `df8e1df3` it is `00249_validate_codex_reauth_reason.sql`, and `00250` is claimed by open PR #1602. This PRD drafts `00251` (the cause CHECK) and `00252` (the bounded-sweep partial indexes). Both are renumbered at landing (`task migration:renumber`).
 
 ## Decisions
 
