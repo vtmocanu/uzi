@@ -26,8 +26,11 @@
 // tmp (a real directory, not a symlink, owned by the calling uid, mode exactly
 // 0700) EXCEPT that it need not be empty, because it persists across a run's
 // commands, and it is granted the same full rights through its adopted fd: a
-// rule on that run's directory only, never on the cache root above it. The
-// adoption checks run in every mode, including the best-effort degrade.
+// rule on that run's directory only, never on the cache root above it. Its
+// path must be absolute and already clean, and its last element a lowercase
+// uuid (the run's cache token), so the cache root itself is refused in argv
+// parsing. The adoption checks run in every mode, including the best-effort
+// degrade.
 //
 // "Unavailable" is defined by errno (D8): a version probe returning ENOSYS or
 // EOPNOTSUPP is unavailable; any other errno, an ABI below 1, and every later
@@ -298,8 +301,8 @@ func parseArgs(args []string) (root, tmp, cwd, cache string, mode sandboxMode, c
 	// spelled `--cache` or `--mode` can never reach them.
 	if len(rest) >= 2 && rest[0] == "--cache" {
 		cache = rest[1]
-		if !filepath.IsAbs(cache) || filepath.Clean(cache) == string(filepath.Separator) {
-			return fail(errors.New("cache must be an absolute directory other than /"))
+		if !validCachePath(cache) {
+			return fail(errors.New("cache must be an absolute, clean path to a run directory named by a lowercase uuid"))
 		}
 		rest = rest[2:]
 	}
@@ -326,6 +329,39 @@ func parseArgs(args []string) (root, tmp, cwd, cache string, mode sandboxMode, c
 		return fail(errors.New("cwd escapes root"))
 	}
 	return root, tmp, cwd, cache, mode, child, nil
+}
+
+// validCachePath accepts only a per-run cache directory: an absolute path that
+// is already clean (filepath.Clean leaves it unchanged, so no "..", no "."
+// and no trailing or doubled separator) whose last element is a lowercase
+// uuid, the same name the orphan reaper takes as a cache candidate. The cache
+// root itself, "/" and any other directory are refused, so the rule the
+// sandbox grants can only ever cover one run's directory.
+func validCachePath(cache string) bool {
+	if !filepath.IsAbs(cache) || filepath.Clean(cache) != cache {
+		return false
+	}
+	return isLowercaseUUID(filepath.Base(cache))
+}
+
+// isLowercaseUUID matches exactly 8-4-4-4-12 lowercase hex digits (the
+// supervisor's validCleanupToken).
+func isLowercaseUUID(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i, c := range s {
+		if i == 8 || i == 13 || i == 18 || i == 23 {
+			if c != '-' {
+				return false
+			}
+			continue
+		}
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // parseMode strictly maps a mode token to a sandboxMode; an unknown value is

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
@@ -27,7 +28,8 @@ const (
 
 // cacheCleanup reasons besides safetree.Reason's words.
 const (
-	// cacheReasonUnattested: no release with drained:true arrived before EOF.
+	// cacheReasonUnattested: no drained:true arrived before EOF, a
+	// drained:false did, or stdin failed.
 	cacheReasonUnattested = "unattested"
 	// cacheReasonLive: --remove-cache found the lock held.
 	cacheReasonLive = "live"
@@ -102,9 +104,12 @@ func openCacheRoot(root string, uid int) (int, error) {
 //	{"event":"cache_cleanup","state":"removed"|"retained","reason":"..."}
 //	{"event":"cache_error","reason":"create"|"subdir"|"lock"|"recheck"}
 //
-// It removes the tree only when the last valid release line before EOF said
-// drained:true (the worker's attestation that every command root using the
-// cache drained); a bare EOF or drained:false retains it as "unattested".
+// (runMode made the process nondumpable before this; see modeEnv.)
+//
+// It removes the tree only when, by EOF, a valid release line said
+// drained:true and none said drained:false (the worker's attestation that
+// every command root using the cache drained; see readRelease); a bare EOF,
+// any drained:false or a stdin read error retains it as "unattested".
 // The lock fd stays open, so the lock is held, until holdCache returns, which
 // the process's exit follows. A setup failure after the create leaves the
 // directory for the orphan reaper.
@@ -141,12 +146,15 @@ func holdCache(rootFd int, rootPath, token string, uid int, in io.Reader, out io
 	return cacheCleanup(out, tmpCleanupRemoved, "")
 }
 
-// readRelease reads lines from in until EOF (or a read error) and reports
-// whether the last valid release line said drained:true. A line longer than
+// readRelease reads lines from in until EOF and reports whether the worker
+// attested the drain: at least one valid release line said drained:true and
+// none said drained:false. drained:false is STICKY: once a valid
+// drained:false is seen, no later drained:true can flip it back. A read error
+// other than EOF retains (false) whatever came before it. A line longer than
 // maxReleaseLine, or anything but a release line, is ignored.
 func readRelease(in io.Reader) bool {
 	br := bufio.NewReaderSize(in, maxReleaseLine+1)
-	drained := false
+	drained, refused := false, false
 	oversize := false
 	for {
 		line, err := br.ReadSlice('\n')
@@ -155,20 +163,28 @@ func readRelease(in io.Reader) bool {
 			oversize = true
 			continue
 		}
+		if err != nil && !errors.Is(err, io.EOF) {
+			return false
+		}
 		if !oversize && len(line) > 0 {
 			if v, ok := parseRelease(line); ok {
-				drained = v
+				if v {
+					drained = true
+				} else {
+					refused = true
+				}
 			}
 		}
 		oversize = false
 		if err != nil {
-			return drained
+			return drained && !refused
 		}
 	}
 }
 
-// parseRelease accepts exactly {"op":"release","drained":<bool>} (keys
-// compared exactly, no other key, nothing after the object).
+// parseRelease accepts exactly {"op":"release","drained":<bool>}: the two keys
+// compared exactly, each exactly once (a repeated key is rejected, not
+// resolved last-wins), no other key, nothing after the object.
 func parseRelease(line []byte) (drained bool, ok bool) {
 	if n := len(line); n > 0 && line[n-1] == '\n' {
 		line = line[:n-1]
@@ -176,21 +192,57 @@ func parseRelease(line []byte) (drained bool, ok bool) {
 	if len(line) > maxReleaseLine {
 		return false, false
 	}
-	var m map[string]json.RawMessage
-	if err := json.Unmarshal(line, &m); err != nil || len(m) != 2 {
+	dec := json.NewDecoder(bytes.NewReader(line))
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
 		return false, false
 	}
 	var op string
-	if err := json.Unmarshal(m["op"], &op); err != nil || op != "release" {
+	var sawOp, sawDrained bool
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			return false, false
+		}
+		key, isKey := tok.(string)
+		if !isKey {
+			return false, false
+		}
+		switch {
+		case key == "op" && !sawOp:
+			if err := dec.Decode(&op); err != nil {
+				return false, false
+			}
+			sawOp = true
+		case key == "drained" && !sawDrained:
+			// A JSON bool literal only (not a string, a number or null).
+			var raw json.RawMessage
+			if err := dec.Decode(&raw); err != nil {
+				return false, false
+			}
+			switch string(raw) {
+			case "true":
+				drained = true
+			case "false":
+				drained = false
+			default:
+				return false, false
+			}
+			sawDrained = true
+		default:
+			return false, false
+		}
+	}
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('}') {
 		return false, false
 	}
-	switch string(m["drained"]) {
-	case "true":
-		return true, true
-	case "false":
-		return false, true
+	// Nothing but whitespace after the object.
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return false, false
 	}
-	return false, false
+	if !sawOp || !sawDrained || op != "release" {
+		return false, false
+	}
+	return drained, true
 }
 
 // removeCache removes the per-run cache token under rootFd for a worker that

@@ -26,6 +26,8 @@ const (
 	testHelperArgEnv  = "SUPERVISOR_TEST_HELPER_ARG"
 	testHelperLock    = "lock" // flock the dir in ARG, print "locked", sleep
 	testHelperRunMode = "mode" // runMode(JSON argv in ARG) with the real env
+	// testHelperRealMain runs realMain(JSON argv in ARG): the whole dispatch.
+	testHelperRealMain = "realmain"
 )
 
 func TestMain(m *testing.M) {
@@ -44,6 +46,12 @@ func TestMain(m *testing.M) {
 			os.Exit(90)
 		}
 		os.Exit(runMode(args, realModeEnv()))
+	case testHelperRealMain:
+		var args []string
+		if err := json.Unmarshal([]byte(os.Getenv(testHelperArgEnv)), &args); err != nil {
+			os.Exit(90)
+		}
+		os.Exit(realMain(args))
 	}
 	os.Exit(m.Run())
 }
@@ -113,33 +121,32 @@ func killWait(cmd *exec.Cmd) {
 }
 
 // filteredTable is the REAL proc scan restricted to the pids a test spawned
-// plus this process and its ancestor chain, so that unrelated same-uid
-// processes on the host do not decide the proof.
+// plus this process (the only exempt pid), so that unrelated same-uid
+// processes on the host, this test binary's own ancestors included (go test
+// and the shell above it run as the test's uid), do not decide the proof. An
+// invalid scan (a listed pid vanished anywhere on the host) is retaken here up
+// to 100 times before it reaches proveNoUser's own rescan rule, so a busy
+// host does not turn an expected "held" into "unknown"; a vanished scan is
+// still never accepted.
 type filteredTable struct {
 	keep map[int]bool
 }
 
 func (f filteredTable) rows() ([]procUserRow, error) {
-	all, err := procFS{root: procRootPath, self: os.Getpid()}.rows()
+	var all []procUserRow
+	var err error
+	for range 100 {
+		all, err = procFS{root: procRootPath, self: os.Getpid()}.rows()
+		if !errors.Is(err, errProcVanished) {
+			break
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
-	parent := map[int]int{}
-	for _, r := range all {
-		parent[r.pid] = r.ppid
-	}
-	chain := map[int]bool{}
-	for pid := os.Getpid(); pid > 0 && !chain[pid]; {
-		chain[pid] = true
-		pp, ok := parent[pid]
-		if !ok {
-			break
-		}
-		pid = pp
-	}
 	var out []procUserRow
 	for _, r := range all {
-		if f.keep[r.pid] || chain[r.pid] {
+		if f.keep[r.pid] || r.pid == os.Getpid() {
 			out = append(out, r)
 		}
 	}
@@ -150,7 +157,7 @@ func (f filteredTable) rows() ([]procUserRow, error) {
 // cannot run (a hiding proc mount).
 func realTable(t *testing.T, pids ...int) procTable {
 	t.Helper()
-	if _, err := (procFS{root: procRootPath, self: os.Getpid()}).rows(); err != nil {
+	if _, err := (filteredTable{}).rows(); err != nil {
 		if errors.Is(err, errProcHidden) {
 			t.Skip("the proc mount here hides processes")
 		}
@@ -317,10 +324,11 @@ func TestReapSupervisorKilledWhileChildLives(t *testing.T) {
 	child := spawnUser(t, dir)
 	table := realTable(t, holder.cmd.Process.Pid, child.Process.Pid)
 
-	// Held: live, whatever the proof.
+	// The holder itself runs as the uid: the first proof is not held, so the
+	// candidate is retained without even being locked.
 	res := mustReap(t, r, tableConfig(table))
-	if res.Live != 1 || res.Proof != proofUserAlive {
-		t.Fatalf("with the holder alive: %s", counts(res))
+	if got := counts(res); got != "scanned=1 live=0 removed=0 retained=1 foreign=0 proof=user_alive" || res.outcomes[0].reason != "proof" {
+		t.Fatalf("with the holder alive: %s %+v", got, res.outcomes)
 	}
 
 	holder.kill()
@@ -362,9 +370,18 @@ func TestReapCacheHolderKilledWhileCommandLives(t *testing.T) {
 	table := realTable(t, holder.cmd.Process.Pid, command.Process.Pid)
 
 	res := mustReap(t, r, tableConfig(table))
-	if res.Live != 1 || res.Removed != 0 {
+	if res.Retained != 1 || res.Removed != 0 || res.Proof != proofUserAlive {
 		t.Fatalf("holder alive: %s", counts(res))
 	}
+	// Only the holder's own lock protects it once the proof is held: with the
+	// command gone and the holder alive, it is live.
+	killWait(command)
+	res = mustReap(t, r, tableConfig(realTable(t)))
+	if got := counts(res); got != "scanned=1 live=1 removed=0 retained=0 foreign=0 proof=held" {
+		t.Fatalf("holder alive, filtered out of the proof: %s", got)
+	}
+	command = spawnUser(t, filepath.Join(path, "gomod"))
+	table = realTable(t, holder.cmd.Process.Pid, command.Process.Pid)
 	holder.kill()
 	res = mustReap(t, r, tableConfig(table))
 	if res.Retained != 1 || res.Removed != 0 || res.Proof != proofUserAlive {
@@ -571,31 +588,98 @@ func TestReapSkipsNonCandidatesAndForeign(t *testing.T) {
 	requireExists(t, owned)
 }
 
-// (h) One pass acts on at most maxReapCandidates; the next pass continues.
-func TestReapBoundsCandidatesPerPass(t *testing.T) {
+// (h) One pass acts on at most maxReapCandidates in EACH root; the next pass
+// continues.
+func TestReapBoundsCandidatesPerRoot(t *testing.T) {
 	if !requireNonRootCommandUID(t) {
 		return
 	}
 	r := newRoots(t)
 	const n = maxReapCandidates + 6
 	for i := range n {
-		parent := r.tmp
-		name := tmpNameN(100 + i)
-		if i%2 == 1 {
-			parent, name = r.cache, tokenN(100+i)
+		if err := os.Mkdir(filepath.Join(r.tmp, tmpNameN(100+i)), 0o700); err != nil {
+			t.Fatal(err)
 		}
-		if err := os.Mkdir(filepath.Join(parent, name), 0o700); err != nil {
+		if err := os.Mkdir(filepath.Join(r.cache, tokenN(300+i)), 0o700); err != nil {
 			t.Fatal(err)
 		}
 	}
 	var calls int
 	res := mustReap(t, r, proofConfig(&calls, proofHeld))
-	if res.Scanned != maxReapCandidates || res.Removed != maxReapCandidates {
+	if res.Scanned != 2*maxReapCandidates || res.Removed != 2*maxReapCandidates {
 		t.Fatalf("first pass: %s", counts(res))
 	}
 	res = mustReap(t, r, proofConfig(&calls, proofHeld))
-	if res.Scanned != 6 || res.Removed != 6 {
+	if res.Scanned != 12 || res.Removed != 12 {
 		t.Fatalf("second pass: %s", counts(res))
+	}
+}
+
+// A candidate that pins as foreign is counted but does not consume its root's
+// cap: many foreign names cannot starve the real candidates.
+func TestReapForeignDoesNotConsumeTheCap(t *testing.T) {
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	r := newRoots(t)
+	target := filepath.Join(t.TempDir(), "target")
+	mkTree(t, target)
+	const foreign = 3 * maxReapCandidates
+	for i := range foreign {
+		if err := os.Symlink(target, filepath.Join(r.tmp, tmpNameN(500+i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := range 5 {
+		if err := os.Mkdir(filepath.Join(r.tmp, tmpNameN(900+i)), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var calls int
+	res := mustReap(t, r, proofConfig(&calls, proofHeld))
+	if got := counts(res); got != fmt.Sprintf("scanned=%d live=0 removed=5 retained=0 foreign=%d proof=held", foreign+5, foreign) {
+		t.Fatalf("reap = %s", got)
+	}
+	requireExists(t, target)
+}
+
+// When the first proof is not held nothing is locked at all: every candidate
+// that pins as ours is retained ("proof") without a flock, so a concurrent
+// setup's LOCK_NB is never refused because of the reaper.
+func TestReapWithoutAHeldProofNeverLocks(t *testing.T) {
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	for _, first := range []string{proofUserAlive, proofUnknown} {
+		r := newRoots(t)
+		tmpDir := filepath.Join(r.tmp, tmpNameN(40))
+		cacheDir := filepath.Join(r.cache, tokenN(41))
+		mkTree(t, tmpDir)
+		mkTree(t, cacheDir)
+		// A held lock: still not "live", because it is never tried.
+		fd, err := unix.Open(cacheDir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB); err != nil {
+			t.Fatal(err)
+		}
+		var flocks int
+		setFlock(t, func(fd int, how int) error { flocks++; return unix.Flock(fd, how) })
+		var calls int
+		res := mustReap(t, r, proofConfig(&calls, first))
+		_ = unix.Close(fd)
+		want := "scanned=2 live=0 removed=0 retained=2 foreign=0 proof=" + first
+		if got := counts(res); got != want || flocks != 0 || calls != 1 {
+			t.Fatalf("first proof %s: %s (flocks %d, proofs %d), want %s with no flock", first, got, flocks, calls, want)
+		}
+		for _, o := range res.outcomes {
+			if o.reason != "proof" {
+				t.Fatalf("outcome %+v, want reason proof", o)
+			}
+		}
+		requireExists(t, tmpDir)
+		requireExists(t, cacheDir)
 	}
 }
 
@@ -646,14 +730,15 @@ func TestReapPassBudget(t *testing.T) {
 func testModeEnv(stdout io.Writer, tmpDir string, table procTable) modeEnv {
 	uid := os.Geteuid()
 	return modeEnv{
-		stdin:   strings.NewReader(""),
-		stdout:  stdout,
-		hygiene: func() error { return nil },
-		uids:    func() (int, int) { return uid, uid },
-		tmpDir:  tmpDir,
-		procs:   table,
-		selfPid: os.Getpid(),
-		now:     time.Now,
+		stdin:       strings.NewReader(""),
+		stdout:      stdout,
+		hygiene:     func() error { return nil },
+		nondumpable: func() bool { return true },
+		uids:        func() (int, int) { return uid, uid },
+		tmpDir:      tmpDir,
+		procs:       table,
+		selfPid:     os.Getpid(),
+		now:         time.Now,
 	}
 }
 
@@ -712,11 +797,34 @@ func TestRunModeReapOrphans(t *testing.T) {
 	}
 }
 
-// Through realMain: a mode flag first runs the mode, with no fd 3/4.
+// Through realMain: a mode flag first runs the mode (its own stdout line), not
+// the supervisor, which would write nothing to stdout. Each case fails in the
+// strict argv parser, before any fd, root or uid is touched.
 func TestRealMainDispatchesModes(t *testing.T) {
-	// No "--expect-uid" value: the strict parser refuses before anything opens.
-	if code := realMain([]string{modeRemoveCache, "--expect-uid"}); code != 2 {
-		t.Fatalf("realMain(--remove-cache …) = %d, want 2", code)
+	for _, tc := range []struct {
+		args []string
+		line string
+	}{
+		{[]string{modeRemoveCache, "--expect-uid"}, `{"event":"cache_error","reason":"args"}`},
+		{[]string{modeHoldCache, "--expect-uid", "x"}, `{"event":"cache_error","reason":"args"}`},
+		{[]string{modeReapOrphans, "--expect-uid"}, `{"event":"reap_error","reason":"args"}`},
+	} {
+		argv, err := json.Marshal(tc.args)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.Command(os.Args[0], "-test.run=^$")
+		cmd.Env = append(os.Environ(), testHelperEnv+"="+testHelperRealMain, testHelperArgEnv+"="+string(argv))
+		var stdout bytes.Buffer
+		cmd.Stdout = &stdout
+		err = cmd.Run()
+		var exit *exec.ExitError
+		if !errors.As(err, &exit) || exit.ExitCode() != 2 {
+			t.Errorf("realMain(%v): %v, want exit 2", tc.args, err)
+		}
+		if got := stdout.String(); got != tc.line+"\n" {
+			t.Errorf("realMain(%v) stdout = %q, want %q", tc.args, got, tc.line+"\n")
+		}
 	}
 }
 

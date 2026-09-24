@@ -14,13 +14,20 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// Run cache tokens (lowercase uuids).
+const (
+	runTokenA = "0a1b2c3d-0000-4000-8000-00000000000a"
+	runTokenB = "0a1b2c3d-0000-4000-8000-00000000000b"
+)
+
 func TestParseArgsCache(t *testing.T) {
+	cacheA := "/var/cache/uzi-codex-cmd/" + runTokenA
 	base := []string{"--root", "/data/run", "--tmp", "/tmp/run", "--cwd", "/data/run"}
 	with := func(extra ...string) []string { return append(append([]string{}, base...), extra...) }
 
 	// (present) --cache before -- is parsed.
-	_, _, _, cache, mode, child, err := parseArgs(with("--cache", "/var/cache/uzi-codex-cmd/run", "--", "/bin/true"))
-	if err != nil || cache != "/var/cache/uzi-codex-cmd/run" || mode != modeRequired || !reflect.DeepEqual(child, []string{"/bin/true"}) {
+	_, _, _, cache, mode, child, err := parseArgs(with("--cache", cacheA, "--", "/bin/true"))
+	if err != nil || cache != cacheA || mode != modeRequired || !reflect.DeepEqual(child, []string{"/bin/true"}) {
 		t.Fatalf("--cache: cache=%q mode=%q child=%v err=%v", cache, mode, child, err)
 	}
 
@@ -30,8 +37,8 @@ func TestParseArgsCache(t *testing.T) {
 	}
 
 	// (combined) --cache then --mode, both honoured.
-	_, _, _, cache, mode, child, err = parseArgs(with("--cache", "/c/run", "--mode", "best-effort", "--", "/bin/true", "x"))
-	if err != nil || cache != "/c/run" || mode != modeBestEffort || !reflect.DeepEqual(child, []string{"/bin/true", "x"}) {
+	_, _, _, cache, mode, child, err = parseArgs(with("--cache", "/c/"+runTokenB, "--mode", "best-effort", "--", "/bin/true", "x"))
+	if err != nil || cache != "/c/"+runTokenB || mode != modeBestEffort || !reflect.DeepEqual(child, []string{"/bin/true", "x"}) {
 		t.Fatalf("--cache --mode: cache=%q mode=%q child=%v err=%v", cache, mode, child, err)
 	}
 
@@ -46,11 +53,23 @@ func TestParseArgsCache(t *testing.T) {
 	}
 
 	for name, args := range map[string][]string{
-		"mode before cache": with("--mode", "required", "--cache", "/c/run", "--", "/bin/true"),
-		"relative cache":    with("--cache", "c/run", "--", "/bin/true"),
+		"mode before cache": with("--mode", "required", "--cache", cacheA, "--", "/bin/true"),
+		"relative cache":    with("--cache", "c/"+runTokenA, "--", "/bin/true"),
 		"root cache":        with("--cache", "/", "--", "/bin/true"),
 		"missing value":     with("--cache", "--", "/bin/true"),
-		"repeated cache":    with("--cache", "/c/a", "--cache", "/c/b", "--", "/bin/true"),
+		"repeated cache":    with("--cache", cacheA, "--cache", "/c/"+runTokenB, "--", "/bin/true"),
+		// Must be clean and must be a run directory, never the cache root.
+		"the cache root":      with("--cache", "/var/cache/uzi-codex-cmd", "--", "/bin/true"),
+		"not a uuid":          with("--cache", "/c/run", "--", "/bin/true"),
+		"upper-case uuid":     with("--cache", "/c/"+strings.ToUpper(runTokenA), "--", "/bin/true"),
+		"uuid without dashes": with("--cache", "/c/"+strings.ReplaceAll(runTokenA, "-", "")+"xxxx", "--", "/bin/true"),
+		"uuid plus suffix":    with("--cache", cacheA+"x", "--", "/bin/true"),
+		"trailing slash":      with("--cache", cacheA+"/", "--", "/bin/true"),
+		"dot-dot":             with("--cache", cacheA+"/..", "--", "/bin/true"),
+		"dot-dot then uuid":   with("--cache", "/var/cache/../etc/"+runTokenA, "--", "/bin/true"),
+		"dot element":         with("--cache", "/var/cache/./"+runTokenA, "--", "/bin/true"),
+		"double slash":        with("--cache", "/var/cache//"+runTokenA, "--", "/bin/true"),
+		"bare uuid":           with("--cache", runTokenA, "--", "/bin/true"),
 	} {
 		if _, _, _, _, _, _, err := parseArgs(args); err == nil {
 			t.Errorf("%s: %v accepted", name, args)
@@ -253,7 +272,7 @@ func TestLandlockCacheIsolation(t *testing.T) {
 	}
 
 	parent := t.TempDir()
-	a, b := filepath.Join(parent, "a"), filepath.Join(parent, "b")
+	a, b := filepath.Join(parent, runTokenA), filepath.Join(parent, runTokenB)
 	for _, d := range []string{a, b} {
 		if err := os.Mkdir(d, 0o700); err != nil {
 			t.Fatal(err)

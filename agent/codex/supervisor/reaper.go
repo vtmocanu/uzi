@@ -14,8 +14,9 @@ import (
 const (
 	// maxReapDirents is the most directory entries read from each root.
 	maxReapDirents = 4096
-	// maxReapCandidates is the most candidates one pass acts on, both roots
-	// together.
+	// maxReapCandidates is the most candidates one pass acts on in EACH root
+	// (/tmp and the cache root have one cap each). A candidate that pins as
+	// foreign, or is gone before its open, does not consume it.
 	maxReapCandidates = 64
 	// reapCandidateBudget bounds one candidate's removal.
 	reapCandidateBudget = 60 * time.Second
@@ -105,19 +106,30 @@ type reapCandidate struct {
 
 // reap runs one orphan-reaping pass over tmpFd (command tmps) and cacheFd
 // (per-run caches; -1 when the cache root is absent). It returns an error only
-// when a root cannot be listed, before any candidate is touched.
+// when a root cannot be listed, before any candidate of that root is touched.
 //
 // A held lock always protects. A released lock only makes a directory a
 // candidate, because the lock follows the supervisor or holder process, not
 // the command descendants that can outlive it: deletion additionally needs a
 // fresh no-user proof taken with the candidate's lock held. Without it the
 // candidate is retained.
+//
+// When the pass's first proof is not "held", no candidate is locked at all:
+// each one that pins as ours is retained (reason "proof") without a flock, so
+// a pass that cannot remove anything never contends with a concurrent setup's
+// LOCK_NB (a supervisor or holder creating its directory would otherwise see
+// EWOULDBLOCK). Such a pass therefore never reports "live". The worker must
+// invoke the reaper only before launching runs (the no-user proof depends on
+// it); this keeps even a misplaced pass from breaking a setup.
+//
+// Each root has its own cap of maxReapCandidates acted-on candidates; a name
+// that pins as foreign (a symlink, a non-directory, a foreign owner) is
+// counted as foreign without consuming it, and neither does a name gone
+// before its open.
 func reap(tmpFd, cacheFd int, cfg reapConfig) (reapResult, error) {
 	res := reapResult{Event: "reap"}
 	start := cfg.now()
 	passDeadline := start.Add(reapPassBudget)
-	// The initial proof: when it is not held nothing is removed this pass, but
-	// the candidates are still classified (live/foreign/retained).
 	res.Proof = cfg.prove()
 	canRemove := res.Proof == proofHeld
 
@@ -125,38 +137,43 @@ func reap(tmpFd, cacheFd int, cfg reapConfig) (reapResult, error) {
 	if cacheFd >= 0 {
 		roots = append(roots, reapRoot{fd: cacheFd, match: validCleanupToken})
 	}
-	var cands []reapCandidate
 	for _, root := range roots {
 		names, err := listCandidates(root.fd, root.match, maxReapDirents)
 		if err != nil {
 			return res, err
 		}
+		acted := 0
 		for _, n := range names {
-			if len(cands) < maxReapCandidates {
-				cands = append(cands, reapCandidate{parentFd: root.fd, name: n})
+			if acted >= maxReapCandidates {
+				break
+			}
+			state := reapOne(&res, reapCandidate{parentFd: root.fd, name: n}, cfg, canRemove, passDeadline)
+			if state != "" && state != reapForeign {
+				acted++
 			}
 		}
-	}
-
-	for _, c := range cands {
-		reapOne(&res, c, cfg, canRemove, passDeadline)
 	}
 	return res, nil
 }
 
-// reapOne classifies and, when proven safe, removes one candidate.
-func reapOne(res *reapResult, c reapCandidate, cfg reapConfig, canRemove bool, passDeadline time.Time) {
+// reapOne classifies and, when proven safe, removes one candidate. It returns
+// the recorded state, or "" when the name was gone before its open (nothing
+// recorded).
+func reapOne(res *reapResult, c reapCandidate, cfg reapConfig, canRemove bool, passDeadline time.Time) string {
+	record := func(state, reason string) string {
+		res.record(c.name, state, reason)
+		return state
+	}
 	fd, err := safetree.OpenDirNoFollow(c.parentFd, c.name)
 	if err != nil {
 		switch {
 		case errors.Is(err, unix.ENOENT):
-			return // gone since the listing: nothing to count
+			return "" // gone since the listing: nothing to count
 		case errors.Is(err, unix.ELOOP), errors.Is(err, unix.ENOTDIR):
-			res.record(c.name, reapForeign, "")
+			return record(reapForeign, "")
 		default:
-			res.record(c.name, reapRetained, "io")
+			return record(reapRetained, "io")
 		}
-		return
 	}
 	// Closing the fd releases the lock taken below.
 	defer func() { _ = unix.Close(fd) }()
@@ -164,38 +181,34 @@ func reapOne(res *reapResult, c reapCandidate, cfg reapConfig, canRemove bool, p
 	pin, err := pinFromFd(fd, cfg.uid)
 	if err != nil {
 		if errors.Is(err, safetree.ErrOwner) || errors.Is(err, safetree.ErrMismatch) {
-			res.record(c.name, reapForeign, "")
-		} else {
-			res.record(c.name, reapRetained, safetree.Reason(err))
+			return record(reapForeign, "")
 		}
-		return
+		return record(reapRetained, safetree.Reason(err))
+	}
+
+	// Without a held first proof nothing can be removed: retain without
+	// taking the lock, so a concurrent setup's LOCK_NB never fails on it.
+	if !canRemove {
+		return record(reapRetained, "proof")
 	}
 
 	if err := flock(fd, unix.LOCK_EX|unix.LOCK_NB); err != nil {
 		if errors.Is(err, unix.EWOULDBLOCK) {
-			res.record(c.name, reapLive, "")
-		} else {
-			res.record(c.name, reapRetained, "lock")
+			return record(reapLive, "")
 		}
-		return
+		return record(reapRetained, "lock")
 	}
 
-	if !canRemove {
-		res.record(c.name, reapRetained, "proof")
-		return
-	}
 	// With the lock held, a fresh proof: a command descendant of the process
 	// that held the lock may still be alive.
 	res.Proof = cfg.prove()
 	if res.Proof != proofHeld {
-		res.record(c.name, reapRetained, "proof")
-		return
+		return record(reapRetained, "proof")
 	}
 
 	now := cfg.now()
 	if !now.Before(passDeadline) {
-		res.record(c.name, reapRetained, "deadline")
-		return
+		return record(reapRetained, "deadline")
 	}
 	deadline := now.Add(reapCandidateBudget)
 	if passDeadline.Before(deadline) {
@@ -205,10 +218,9 @@ func reapOne(res *reapResult, c reapCandidate, cfg reapConfig, canRemove bool, p
 		hookBeforeReapRemove(c.parentFd, c.name)
 	}
 	if err := safetree.RemoveBy(c.parentFd, c.name, pin, deadline); err != nil {
-		res.record(c.name, reapRetained, safetree.Reason(err))
-		return
+		return record(reapRetained, safetree.Reason(err))
 	}
-	res.record(c.name, reapRemoved, "")
+	return record(reapRemoved, "")
 }
 
 // listCandidates reads at most maxDirents entries of the directory fd and

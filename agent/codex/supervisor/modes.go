@@ -85,6 +85,10 @@ type modeEnv struct {
 	stdout io.Writer
 	// hygiene marks every inherited fd from firstStrayFd upward close-on-exec.
 	hygiene func() error
+	// nondumpable makes the process nondumpable (PR_SET_DUMPABLE 0, confirmed),
+	// so a same-uid peer cannot reopen its fds (its stdin, the release
+	// channel) through the proc fd directory; --hold-cache runs it first.
+	nondumpable func() bool
 	// uids returns the real and effective uid.
 	uids func() (int, int)
 	// tmpDir is the directory holding the command tmps.
@@ -99,14 +103,15 @@ type modeEnv struct {
 func realModeEnv() modeEnv {
 	pid := os.Getpid()
 	return modeEnv{
-		stdin:   os.Stdin,
-		stdout:  os.Stdout,
-		hygiene: func() error { return markStrayFdsCloexec(realFdHygiene) },
-		uids:    func() (int, int) { return os.Getuid(), os.Geteuid() },
-		tmpDir:  "/tmp",
-		procs:   procFS{root: procRootPath, self: pid},
-		selfPid: pid,
-		now:     time.Now,
+		stdin:       os.Stdin,
+		stdout:      os.Stdout,
+		hygiene:     func() error { return markStrayFdsCloexec(realFdHygiene) },
+		nondumpable: establishNondumpable,
+		uids:        func() (int, int) { return os.Getuid(), os.Geteuid() },
+		tmpDir:      "/tmp",
+		procs:       procFS{root: procRootPath, self: pid},
+		selfPid:     pid,
+		now:         time.Now,
 	}
 }
 
@@ -116,9 +121,10 @@ type reapErrorLine struct {
 	Reason string `json:"reason"`
 }
 
-// runMode runs the standalone mode args[0] names: fd hygiene first, then the
-// strict argv, then the uid check (real and effective uid must both be
-// --expect-uid), then the mode. It returns the exit code.
+// runMode runs the standalone mode args[0] names: for --hold-cache the
+// nondumpable step first, then fd hygiene, then the strict argv, then the uid
+// check (real and effective uid must both be --expect-uid), then the mode. It
+// returns the exit code.
 func runMode(args []string, env modeEnv) int {
 	fail := func(reason string) int {
 		if len(args) > 0 && args[0] == modeReapOrphans {
@@ -126,6 +132,9 @@ func runMode(args []string, env modeEnv) int {
 			return reapExitSetup
 		}
 		return cacheError(env.stdout, reason)
+	}
+	if len(args) > 0 && args[0] == modeHoldCache && !env.nondumpable() {
+		return fail("dumpable")
 	}
 	if err := env.hygiene(); err != nil {
 		return fail("fd_hygiene")

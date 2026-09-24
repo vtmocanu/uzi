@@ -10,11 +10,37 @@ import (
 )
 
 // The no-user proof: the orphan reaper deletes a released directory only when
-// the kernel process table shows that no process in this PID namespace, other
-// than the reaper and its ancestor chain, has the command uid in any of its
-// real/effective/saved/filesystem uids. Every command user runs as that uid
-// with zero capabilities and no_new_privs, so it cannot leave it; a process
-// that could still use a released directory therefore shows up here.
+// a VALID scan of the kernel process table shows that no process in this PID
+// namespace, other than the reaper itself, has the command uid in any of its
+// real/effective/saved/filesystem uids. Only the reaper's own pid is exempt:
+// its ancestors in production (setpriv, which execs into it, the worker and
+// init) do not run as the command uid, so any other process with that uid,
+// ancestor or not, means "user_alive". Every command user runs as that uid
+// with zero capabilities and no_new_privs, so it cannot leave it.
+//
+// The rescan rule: a scan lists the pids first and then reads each listed
+// pid's status. It is valid only if NO listed pid vanished (ENOENT/ESRCH)
+// between the listing and its status read. A scan in which one did is
+// discarded and taken again, up to maxProofScans attempts; when none is valid
+// the proof is "unknown". Skipping a vanished pid instead is unsound: a
+// process that forks a child and exits (a pid hopper) can be listed under its
+// old pid, vanish before its status is read, and have its child, created after
+// the listing, absent from the list.
+//
+// Why a valid scan sees every command user: a command-uid process alive after
+// the listing either was alive at the listing time or was created later, and
+// one created later has an ancestor that was alive at the listing time and
+// already ran as the command uid (it inherited the uid from command-uid
+// ancestors, which cannot change it; the one exception is a new command the
+// worker launches, which is why the worker must invoke the reaper only before
+// launching runs). That ancestor, or a descendant of it created during the
+// listing, was listed (the listing assumption below), and its status read
+// then either succeeded (its uid is seen, so the proof is "user_alive") or
+// failed because it vanished (the scan is invalid). This rests on the listing returning every process alive
+// throughout it; the proc directory lists tgids in increasing order and new
+// pids are allocated upward, so a hopper stays ahead of the listing cursor
+// unless the pid counter wraps during that one listing, which this rule does
+// not detect.
 const (
 	proofHeld      = "held"
 	proofUnknown   = "unknown"
@@ -57,7 +83,14 @@ var (
 	errProcSelf     = errors.New("proc self is not this process")
 	errProcTooLarge = errors.New("proc file too large")
 	errStatusParse  = errors.New("malformed status")
+	// errProcVanished: a listed pid's status was gone (ENOENT/ESRCH) when
+	// read, so the scan is invalid (the rescan rule).
+	errProcVanished = errors.New("a listed pid vanished before its status was read")
 )
+
+// maxProofScans is how many scans one proof takes at most before it is
+// "unknown" because every one of them saw a listed pid vanish.
+const maxProofScans = 5
 
 // procFS is the production procTable: it reads the proc filesystem mounted at
 // root through fd-relative opens. self is this process's pid, which root's
@@ -71,8 +104,9 @@ type procFS struct {
 // rows opens the proc root without following a symlink, refuses a mount that
 // can hide processes (checkProcMount), checks "self", then lists the numeric
 // entries (at most maxPids) and parses each one's status. A pid whose status
-// is gone (ENOENT/ESRCH: it exited mid-scan) is skipped; any other read or
-// parse failure is an error.
+// is gone (ENOENT/ESRCH: it exited after the listing) makes the whole scan
+// invalid, errProcVanished, never a skipped row; any other read or parse
+// failure is an error too.
 func (p procFS) rows() ([]procUserRow, error) {
 	fd, err := unix.Open(p.root, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
@@ -111,7 +145,7 @@ func (p procFS) rows() ([]procUserRow, error) {
 	for _, pid := range pids {
 		data, truncated, err := readFileAt(fd, strconv.Itoa(pid)+"/status", maxStatusBytes)
 		if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ESRCH) {
-			continue
+			return nil, fmt.Errorf("status of %d: %w", pid, errProcVanished)
 		}
 		if err != nil {
 			return nil, fmt.Errorf("status of %d: %w", pid, err)
@@ -314,33 +348,32 @@ func unescapeMountField(s string) string {
 	return b.String()
 }
 
-// proveNoUser takes one proof from table: "held" when no process other than
-// selfPid and its ancestor chain (followed through the rows' PPid) has uid in
-// any uid field, "user_alive" when one does, and "unknown" when the table
-// errs or does not list selfPid itself.
+// proveNoUser takes one proof from table: "held" when a valid scan shows no
+// process other than selfPid with uid in any uid field, "user_alive" when one
+// does, and "unknown" when the table errs, when maxProofScans scans in a row
+// were invalid (errProcVanished: the rescan rule), or when the scan does not
+// list selfPid itself.
 func proveNoUser(table procTable, uid, selfPid int) string {
-	rows, err := table.rows()
+	var rows []procUserRow
+	err := errProcVanished
+	for attempt := 0; attempt < maxProofScans && errors.Is(err, errProcVanished); attempt++ {
+		rows, err = table.rows()
+	}
 	if err != nil {
 		return proofUnknown
 	}
-	parent := make(map[int]int, len(rows))
+	sawSelf := false
 	for _, r := range rows {
-		parent[r.pid] = r.ppid
-	}
-	if _, ok := parent[selfPid]; !ok {
-		return proofUnknown
-	}
-	exempt := map[int]bool{}
-	for pid := selfPid; pid > 0 && !exempt[pid]; {
-		exempt[pid] = true
-		pp, ok := parent[pid]
-		if !ok {
+		if r.pid == selfPid {
+			sawSelf = true
 			break
 		}
-		pid = pp
+	}
+	if !sawSelf {
+		return proofUnknown
 	}
 	for _, r := range rows {
-		if exempt[r.pid] {
+		if r.pid == selfPid {
 			continue
 		}
 		for _, u := range r.uids {

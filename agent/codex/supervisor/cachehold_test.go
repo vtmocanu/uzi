@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -122,6 +123,11 @@ func TestHoldCacheWithoutAttestationRetains(t *testing.T) {
 		"bare EOF":               "",
 		"drained false":          `{"op":"release","drained":false}` + "\n",
 		"true then false (last)": `{"op":"release","drained":true}` + "\n" + `{"op":"release","drained":false}` + "\n",
+		"false then true":        `{"op":"release","drained":false}` + "\n" + `{"op":"release","drained":true}` + "\n",
+		"false, junk, true":      `{"op":"release","drained":false}` + "\nnot json\n" + `{"op":"release","drained":true}`,
+		"duplicate drained":      `{"op":"release","drained":false,"drained":true}` + "\n",
+		"duplicate op":           `{"op":"release","op":"release","drained":true}` + "\n",
+		"drained null":           `{"op":"release","drained":null}` + "\n",
 		"garbage only":           "release\n" + `{"op":"release","drained":"true"}` + "\n" + `{"op":"release","drained":1}` + "\n",
 		"extra key":              `{"op":"release","drained":true,"force":true}` + "\n",
 		"wrong op":               `{"op":"Release","drained":true}` + "\n",
@@ -148,7 +154,7 @@ func TestHoldCacheWithoutAttestationRetains(t *testing.T) {
 	}
 }
 
-// Ignored lines (oversize, garbage) do not reset the last valid release, and a
+// Ignored lines (oversize, garbage) do not undo a valid drained:true, and a
 // final unterminated valid line counts.
 func TestHoldCacheIgnoresBadLines(t *testing.T) {
 	if !requireNonRootCommandUID(t) {
@@ -222,6 +228,18 @@ func TestHoldCacheSetupErrors(t *testing.T) {
 
 	got, code = run(newCacheRoot(t), func(e modeEnv) modeEnv { e.hygiene = func() error { return errors.New("x") }; return e })
 	wantErr("fd hygiene", "fd_hygiene", got, code)
+
+	// The nondumpable step runs first: its failure creates nothing.
+	dumpable := newCacheRoot(t)
+	got, code = run(dumpable, func(e modeEnv) modeEnv {
+		e.nondumpable = func() bool { return false }
+		e.hygiene = func() error { t.Error("hygiene ran after a nondumpable failure"); return nil }
+		return e
+	})
+	wantErr("dumpable", "dumpable", got, code)
+	if _, err := os.Lstat(filepath.Join(dumpable, testToken)); !os.IsNotExist(err) {
+		t.Errorf("nondumpable failure created the cache: %v", err)
+	}
 
 	existing := newCacheRoot(t)
 	if err := os.Mkdir(filepath.Join(existing, testToken), 0o700); err != nil {
@@ -325,6 +343,21 @@ func TestHoldCacheProcess(t *testing.T) {
 	if line != readyLine(root, testToken) {
 		t.Fatalf("ready = %q", line)
 	}
+	// The holder is nondumpable: this same-uid process cannot reopen its
+	// stdin through the proc fd directory, while it can reopen a dumpable
+	// same-uid process's (the control).
+	control := spawnUser(t, t.TempDir())
+	if f, err := os.Open(procFdPath(control.Process.Pid)); err != nil {
+		t.Fatalf("control: a dumpable same-uid stdin: %v", err)
+	} else {
+		_ = f.Close()
+	}
+	if f, err := os.Open(procFdPath(h.cmd.Process.Pid)); err == nil {
+		_ = f.Close()
+		t.Fatal("the holder's stdin was reopened through the proc fd directory")
+	} else if !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("reopen the holder's stdin: %v, want EACCES", err)
+	}
 	if _, err := io.WriteString(h.in, `{"op":"release","drained":true}`+"\n"); err != nil {
 		t.Fatal(err)
 	}
@@ -337,4 +370,91 @@ func TestHoldCacheProcess(t *testing.T) {
 		t.Fatalf("holder exit: %v", err)
 	}
 	requireGone(t, filepath.Join(root, testToken))
+}
+
+// errReader returns its data, then err.
+type errReader struct {
+	data []byte
+	err  error
+}
+
+func (e *errReader) Read(p []byte) (int, error) {
+	if len(e.data) == 0 {
+		return 0, e.err
+	}
+	n := copy(p, e.data)
+	e.data = e.data[n:]
+	return n, nil
+}
+
+// A stdin read error other than EOF retains, even after a drained:true; a
+// clean EOF after the same line removes.
+func TestReadReleaseRetainsOnReadError(t *testing.T) {
+	line := `{"op":"release","drained":true}` + "\n"
+	if !readRelease(&errReader{data: []byte(line), err: io.EOF}) {
+		t.Fatal("drained:true then EOF was not attested")
+	}
+	if readRelease(&errReader{data: []byte(line), err: unix.EIO}) {
+		t.Fatal("drained:true then a read error was attested")
+	}
+	if readRelease(&errReader{data: []byte(line + "junk"), err: unix.EIO}) {
+		t.Fatal("a read error mid-line was attested")
+	}
+
+	// Through the holder: the stdin pipe fails.
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	root := newCacheRoot(t)
+	h := startHolder(t, root, testToken)
+	h.line(t)
+	h.send(t, line)
+	_ = h.in.CloseWithError(unix.EIO)
+	last := h.line(t)
+	if code := <-h.done; last != `{"event":"cache_cleanup","state":"retained","reason":"unattested"}` || code != 3 {
+		t.Fatalf("cleanup = %q exit %d", last, code)
+	}
+	if _, err := os.Lstat(filepath.Join(root, testToken, "gomod")); err != nil {
+		t.Fatalf("retained cache is gone: %v", err)
+	}
+}
+
+func TestParseRelease(t *testing.T) {
+	for line, want := range map[string]bool{
+		`{"op":"release","drained":true}`:            true,
+		`{"drained":true,"op":"release"}`:            true,
+		` { "op" : "release" , "drained" : false } `: false,
+		`{"op":"release","drained":false}` + "\n":    false,
+	} {
+		if got, ok := parseRelease([]byte(line)); !ok || got != want {
+			t.Errorf("%q: %v %v, want %v true", line, got, ok, want)
+		}
+	}
+	for _, line := range []string{
+		`{"op":"release","drained":true,"drained":true}`,
+		`{"op":"release","drained":false,"drained":true}`,
+		`{"op":"release","op":"release","drained":true}`,
+		`{"op":"release","drained":true,"op":"release"}`,
+		`{"op":"release","drained":null}`,
+		`{"op":null,"drained":true}`,
+		`{"op":"release","drained":"true"}`,
+		`{"op":"release","drained":1}`,
+		`{"op":"release"}`,
+		`{"drained":true}`,
+		`{"op":"release","drained":true,"x":1}`,
+		`{"op":"release","drained":true}{}`,
+		`{"op":"release","drained":true} x`,
+		`["op","release"]`,
+		`{"op":"release","drained":true`,
+		``,
+	} {
+		if _, ok := parseRelease([]byte(line)); ok {
+			t.Errorf("%q accepted", line)
+		}
+	}
+}
+
+// procFdPath is pid's fd 0 in the proc fd directory.
+func procFdPath(pid int) string {
+	return filepath.Join(procRootPath, strconv.Itoa(pid), "fd", "0")
 }

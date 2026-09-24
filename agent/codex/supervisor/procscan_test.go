@@ -121,7 +121,6 @@ func TestProcFSRowsOnAFakeRoot(t *testing.T) {
 		self: statusText(1, [4]int{10003, 10003, 10003, 10003}),
 		1:    statusText(0, [4]int{0, 0, 0, 0}),
 		77:   statusText(1, [4]int{10002, 10002, 10003, 10002}),
-		88:   "", // exited mid-scan: skipped
 	})
 	rows, err := procFS{root: root, self: self}.rows()
 	if err != nil {
@@ -134,8 +133,20 @@ func TestProcFSRowsOnAFakeRoot(t *testing.T) {
 	if len(got) != 3 || got[77].uids[2] != 10003 || got[77].ppid != 1 || got[self].ppid != 1 {
 		t.Fatalf("rows = %+v", rows)
 	}
-	if _, ok := got[88]; ok {
-		t.Fatal("a pid without a status must be skipped")
+}
+
+// A listed pid whose status is gone (it exited after the listing) makes the
+// scan invalid: an error, never a row skipped.
+func TestProcFSRowsVanishedPidInvalidatesTheScan(t *testing.T) {
+	const self = 4242
+	root := fakeProcRoot(t, self, "rw", map[int]string{
+		self: statusText(1, uids4(10003)),
+		77:   statusText(1, uids4(10002)),
+		88:   "", // listed, but no status: vanished
+	})
+	rows, err := procFS{root: root, self: self}.rows()
+	if !errors.Is(err, errProcVanished) || rows != nil {
+		t.Fatalf("rows = %+v, err = %v; want errProcVanished", rows, err)
 	}
 }
 
@@ -221,7 +232,7 @@ func TestProveNoUser(t *testing.T) {
 	const uid, self = 10003, 500
 	base := []procUserRow{
 		{pid: 1, ppid: 0, uids: uids4(0)},
-		{pid: 400, ppid: 1, uids: uids4(uid)}, // an ancestor with the uid: exempt
+		{pid: 400, ppid: 1, uids: uids4(0)}, // an ancestor without the uid
 		{pid: self, ppid: 400, uids: uids4(uid)},
 		{pid: 600, ppid: 1, uids: uids4(10002)},
 	}
@@ -232,6 +243,16 @@ func TestProveNoUser(t *testing.T) {
 		want  string
 	}{
 		{"only self and ancestors", staticTable{list: base}, proofHeld},
+		// Only self is exempt: an ancestor with the uid is a user.
+		{"ancestor with the uid", staticTable{list: []procUserRow{
+			{pid: 1, ppid: 0, uids: uids4(0)},
+			{pid: 400, ppid: 1, uids: uids4(uid)},
+			{pid: self, ppid: 400, uids: uids4(uid)},
+		}}, proofUserAlive},
+		{"parent with the fs uid", staticTable{list: []procUserRow{
+			{pid: 400, ppid: 1, uids: [4]int{0, 0, 0, uid}},
+			{pid: self, ppid: 400, uids: uids4(uid)},
+		}}, proofUserAlive},
 		{"real uid", staticTable{list: with(procUserRow{pid: 700, ppid: 1, uids: [4]int{uid, 1, 1, 1}})}, proofUserAlive},
 		{"effective uid", staticTable{list: with(procUserRow{pid: 700, ppid: 1, uids: [4]int{1, uid, 1, 1}})}, proofUserAlive},
 		{"saved uid", staticTable{list: with(procUserRow{pid: 700, ppid: 1, uids: [4]int{1, 1, uid, 1}})}, proofUserAlive},
@@ -245,4 +266,115 @@ func TestProveNoUser(t *testing.T) {
 			t.Errorf("%s: proof = %q, want %q", tc.name, got, tc.want)
 		}
 	}
+}
+
+// scriptedTable returns its results in order (the last one repeats) and
+// counts the scans.
+type scriptedTable struct {
+	results []staticTable
+	calls   int
+}
+
+func (s *scriptedTable) rows() ([]procUserRow, error) {
+	r := s.results[min(s.calls, len(s.results)-1)]
+	s.calls++
+	return r.list, r.err
+}
+
+// The rescan rule: an invalid scan (a listed pid vanished) is taken again, up
+// to maxProofScans times; then the proof is unknown. Any other error is
+// unknown at once.
+func TestProveNoUserRescansAVanishedPid(t *testing.T) {
+	const uid, self = 10003, 500
+	selfRow := procUserRow{pid: self, ppid: 1, uids: uids4(uid)}
+	vanished := staticTable{err: fmt.Errorf("status of 7: %w", errProcVanished)}
+	clean := staticTable{list: []procUserRow{selfRow}}
+	user := staticTable{list: []procUserRow{selfRow, {pid: 8, ppid: 1, uids: uids4(uid)}}}
+	tests := []struct {
+		name      string
+		results   []staticTable
+		want      string
+		wantCalls int
+	}{
+		{"valid at once", []staticTable{clean}, proofHeld, 1},
+		{"vanished, then valid", []staticTable{vanished, clean}, proofHeld, 2},
+		{"vanished, then a user", []staticTable{vanished, vanished, user}, proofUserAlive, 3},
+		{"valid on the last attempt", []staticTable{vanished, vanished, vanished, vanished, clean}, proofHeld, maxProofScans},
+		{"vanished every time", []staticTable{vanished}, proofUnknown, maxProofScans},
+		{"another error", []staticTable{{err: errProcHidden}, clean}, proofUnknown, 1},
+	}
+	for _, tc := range tests {
+		table := &scriptedTable{results: tc.results}
+		if got := proveNoUser(table, uid, self); got != tc.want || table.calls != tc.wantCalls {
+			t.Errorf("%s: proof = %q after %d scans, want %q after %d", tc.name, got, table.calls, tc.want, tc.wantCalls)
+		}
+	}
+}
+
+// hookedTable runs after(n) once its n-th real scan returns.
+type hookedTable struct {
+	inner procTable
+	after func(n int)
+	calls int
+}
+
+func (h *hookedTable) rows() ([]procUserRow, error) {
+	rows, err := h.inner.rows()
+	h.calls++
+	h.after(h.calls)
+	return rows, err
+}
+
+// The rescan rule on the real procFS over a fake root: the listing returns
+// pids [A, B] (and self); A's status read is ENOENT. The first scan is
+// invalid and a rescan happens; if A stays vanished for maxProofScans scans,
+// the proof is unknown.
+func TestProveNoUserRescanOnAFakeRoot(t *testing.T) {
+	const uid, self, pidA, pidB = 10003, 4242, 71, 72
+	statuses := func() map[int]string {
+		return map[int]string{
+			self: statusText(1, uids4(uid)),
+			pidA: "", // listed, status ENOENT
+			pidB: statusText(1, uids4(10002)),
+		}
+	}
+
+	t.Run("recovers", func(t *testing.T) {
+		root := fakeProcRoot(t, self, "rw", statuses())
+		// After the first (invalid) scan, A is fully gone from the listing.
+		table := &hookedTable{inner: procFS{root: root, self: self}, after: func(n int) {
+			if n == 1 {
+				if err := os.Remove(filepath.Join(root, strconv.Itoa(pidA))); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}}
+		if got := proveNoUser(table, uid, self); got != proofHeld || table.calls != 2 {
+			t.Fatalf("proof = %q after %d scans, want held after 2", got, table.calls)
+		}
+	})
+
+	t.Run("recovers to a user", func(t *testing.T) {
+		root := fakeProcRoot(t, self, "rw", statuses())
+		// A's status appears (a new process reused the pid): it is read.
+		table := &hookedTable{inner: procFS{root: root, self: self}, after: func(n int) {
+			if n == 1 {
+				p := filepath.Join(root, strconv.Itoa(pidA), "status")
+				if err := os.WriteFile(p, []byte(statusText(1, uids4(uid))), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}}
+		if got := proveNoUser(table, uid, self); got != proofUserAlive || table.calls != 2 {
+			t.Fatalf("proof = %q after %d scans, want user_alive after 2", got, table.calls)
+		}
+	})
+
+	t.Run("persists", func(t *testing.T) {
+		root := fakeProcRoot(t, self, "rw", statuses())
+		table := &hookedTable{inner: procFS{root: root, self: self}, after: func(int) {}}
+		if got := proveNoUser(table, uid, self); got != proofUnknown || table.calls != maxProofScans {
+			t.Fatalf("proof = %q after %d scans, want unknown after %d", got, table.calls, maxProofScans)
+		}
+	})
 }
