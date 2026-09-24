@@ -946,6 +946,7 @@ tasks:
       - ./.agents/skills/uzi-lander/scripts/lib/greptile-verdict.test.sh
       - ./.agents/skills/uzi-lander/scripts/cr-rate-limit.test.sh
       - ./.agents/skills/uzi-lander/scripts/land-prep.test.sh
+      - ./.agents/skills/uzi-lander/scripts/land-prep-guards.test.sh
       - ./.agents/skills/uzi-lander/scripts/watch-pr.test.sh
       - ./.agents/skills/uzi-lander/scripts/pr-findings.test.sh
       - ./.agents/skills/uzi-lander/scripts/merge.test.sh

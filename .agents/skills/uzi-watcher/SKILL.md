@@ -178,8 +178,9 @@ worker that could rewrite CI is a supply-chain risk, so this is by design, not a
 the final push, **atomically**, with a `remote rejected … refusing to allow a Personal
 Access Token to create or update workflow … without workflow scope`. The whole branch push
 is rejected, so **nothing lands on the remote** (a `git ls-remote origin` for the run's
-`agent/issue-*` branch comes back empty). But on hosted (k8s) workers **the work is NOT
-lost** — it survives in the worker's PVC; see *Recovering a failed run's work from the
+`agent/issue-*` branch comes back empty). The committed work is usually recoverable from
+the durable sources or the worker's bare tracking ref, not guaranteed: a Docker worker's
+clone is an `emptyDir` lost with its pod. See *Recovering a failed run's work from the
 worker PVC* below (recovered #422's full 12 commits that way, 2026-08-20).
 
 **A workflow-scope rejection does NOT always mean the branch touched a workflow file.**
@@ -252,7 +253,8 @@ and namespace from your own kubeconfig; they are deployment-specific, do not har
 2. **Bundle the branch out**, base excluded so it stays small. The bare tracking ref
    advances only at checkpoint boundaries (milestone/iteration checkpoints, park, shutdown via
    `fetchBackBestEffort`; finalize via `fetchAgentBranch`), not on every commit, so after a
-   hard mid-milestone kill the **working-clone branch HEAD** is the fresher committed tip. For
+   hard mid-milestone kill the **working-clone branch HEAD**, when its pod still lives, is
+   the fresher committed tip. For
    a run still claimed on the worker holding the clone, `scripts/backup-runs.sh RUN` is easiest
    and also saves the uncommitted patch + untracked files separately. By hand (committed
    history only; add `git -C CLONE diff HEAD` and an untracked tar for WIP):

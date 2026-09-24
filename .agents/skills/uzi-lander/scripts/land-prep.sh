@@ -7,7 +7,7 @@
 # directory, a red gate.
 #
 # Usage: land-prep.sh OWNER/REPO PR [--worktree DIR] [--skip-rebase] [--gate auto|none|api,web,agent,controller]
-#                     [--no-push] [--no-rework-check] [--repo-root DIR]
+#                     [--no-push] [--no-rework-check] [--allow-changelog-removals] [--repo-root DIR]
 #   --worktree DIR   where the PR branch is checked out (default: <repo-root>-land-<PR>,
 #                    a sibling of the repo root). Reused if it already exists on the branch.
 #   --skip-rebase    re-entry after you resolved a conflict by hand (`git rebase --continue`
@@ -22,6 +22,8 @@
 #                    `none` skips gates (only when CI is the arbiter, e.g. a docs-only PR).
 #   --no-push        stop before the push (inspect the worktree first).
 #   --no-rework-check  skip the mr_rework guard (ONLY for a repo that is not on uzi).
+#   --allow-changelog-removals  push even though the branch deletes CHANGELOG.md lines the
+#                    base carries (a deliberate reword); without it that stops with exit 9.
 #   --repo-root DIR  the checkout whose .git the worktree is added to (default: cwd's root).
 #
 # Guards, in order: no active mr_rework on the MR (a rework push would collide; the check
@@ -43,9 +45,12 @@
 #   7  a gate failed — log path printed; fix in the worktree, commit, re-run --skip-rebase
 #   8  the remote head or base moved since this landing started, or the worktree and the
 #      remote diverged with no landing on record — start over with --fresh
+#   9  the branch deletes CHANGELOG.md lines the base carries (usually a conflict resolved
+#      from a stale copy, e.g. a --fresh backup); restore them, or pass
+#      --allow-changelog-removals for a deliberate reword
 set -uo pipefail
 
-REPO=""; PR=""; WT=""; SKIP_REBASE=0; GATE="auto"; PUSH=1; ROOT=""; REWORK_CHECK=1; FRESH=0
+REPO=""; PR=""; WT=""; SKIP_REBASE=0; GATE="auto"; PUSH=1; ROOT=""; REWORK_CHECK=1; FRESH=0; ALLOW_CL_RM=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --worktree) WT="${2:?}"; shift 2;;
@@ -54,8 +59,9 @@ while [ $# -gt 0 ]; do
     --gate) GATE="${2:?}"; shift 2;;
     --no-push) PUSH=0; shift;;
     --no-rework-check) REWORK_CHECK=0; shift;;
+    --allow-changelog-removals) ALLOW_CL_RM=1; shift;;
     --repo-root) ROOT="${2:?}"; shift 2;;
-    -h|--help) sed -n '2,38p' "$0"; exit 2;;
+    -h|--help) sed -n '2,50p' "$0"; exit 2;;
     -*) echo "unknown flag: $1" >&2; exit 2;;
     *) if [ -z "$REPO" ]; then REPO="$1"; elif [ -z "$PR" ]; then PR="$1"; else echo "unexpected arg: $1" >&2; exit 2; fi; shift;;
   esac
@@ -225,14 +231,24 @@ else
 fi
 
 # ---- migrations -----------------------------------------------------------------------------
-added=$(git diff --name-only --diff-filter=A "origin/$BASE...HEAD" -- api/internal/store/migrations/ | xargs -n1 basename 2>/dev/null || true)
-if [ -n "$added" ]; then
+# Read each listing into a variable first and fail CLOSED on a git error. Piping
+# `git ls-tree | xargs basename | grep -q` under pipefail made an early grep match SIGPIPE
+# xargs, so the pipeline reported failure on a real collision and the renumber was skipped.
+if ! added_paths=$(git diff --name-only --diff-filter=A "origin/$BASE...HEAD" -- api/internal/store/migrations/); then
+  echo "cannot list the branch's added migrations" >&2; exit 3
+fi
+if [ -n "$added_paths" ]; then
+  if ! base_paths=$(git ls-tree --name-only "origin/$BASE" -- api/internal/store/migrations/); then
+    echo "cannot list origin/$BASE migrations" >&2; exit 3
+  fi
+  base_names=$(printf '%s\n' "$base_paths" | sed 's|.*/||')
   collide=0
   while IFS= read -r m; do
     [ -z "$m" ] && continue
-    pfx=$(printf '%s' "$m" | grep -oE '^[0-9]+')
-    if git ls-tree --name-only "origin/$BASE" -- api/internal/store/migrations/ | xargs -n1 basename | grep -qE "^${pfx}_"; then collide=1; fi
-  done <<< "$added"
+    pfx=$(printf '%s' "${m##*/}" | grep -oE '^[0-9]+' || true)
+    [ -n "$pfx" ] || continue
+    if printf '%s\n' "$base_names" | grep -E "^${pfx}_" >/dev/null; then collide=1; fi
+  done <<< "$added_paths"
   if [ "$collide" -eq 1 ]; then
     log "migration number collision with origin/$BASE — running task migration:renumber"
     if ! out=$(task migration:renumber 2>&1); then
@@ -253,6 +269,23 @@ if [ -n "$added" ]; then
   fi
 fi
 
+# ---- CHANGELOG guard ------------------------------------------------------------------------
+# A rebase conflict resolved from a stale copy (a --fresh backup, an older branch state)
+# silently deletes entries that landed on the base meanwhile. The branch adds its own entry;
+# it has no business removing the base's.
+if [ "$ALLOW_CL_RM" -eq 0 ]; then
+  if ! cl_diff=$(git diff --unified=0 "origin/$BASE..HEAD" -- CHANGELOG.md); then
+    echo "cannot diff CHANGELOG.md against origin/$BASE" >&2; exit 3
+  fi
+  removed=$(printf '%s\n' "$cl_diff" | grep -E '^-' | grep -vE '^--- (a/|/dev/null)' || true)
+  if [ -n "$removed" ]; then
+    log "branch deletes CHANGELOG.md line(s) that origin/$BASE carries:"
+    printf '%s\n' "$removed" | cut -c1-160
+    echo "RESULT=changelog_removal WORKTREE=$WT"
+    exit 9
+  fi
+fi
+
 # ---- gates --------------------------------------------------------------------------------
 if [ "$GATE" != "none" ]; then
   if [ "$GATE" = "auto" ]; then
@@ -268,6 +301,18 @@ if [ "$GATE" != "none" ]; then
     GATES=()
     for p in "${parts[@]}"; do GATES+=("gate:$p"); done
   fi
+  # A fresh sibling worktree has no node_modules, and deps-check then fails the gate as an
+  # instrument failure. Install from the lockfile, always with --ignore-scripts (agent/'s
+  # agent-browser postinstall rewrites a host-wide binary; deps-check-gate.sh).
+  for g in "${GATES[@]}"; do
+    case "$g" in gate:web) pkg=web;; gate:agent) pkg=agent;; *) continue;; esac
+    if [ -f "$pkg/package-lock.json" ] && [ ! -d "$pkg/node_modules" ]; then
+      log "installing $pkg/ dependencies (npm ci --ignore-scripts)"
+      if ! (cd "$pkg" && npm ci --ignore-scripts --no-audit --no-fund >/dev/null 2>&1); then
+        echo "RESULT=gate_failed GATE=$g LOG=npm-ci WORKTREE=$WT"; exit 7
+      fi
+    fi
+  done
   for g in "${GATES[@]}"; do
     logf=$(mktemp "${TMPDIR:-/tmp}/land-prep-${PR}-${g//:/-}.XXXXXX")
     log "running task $g -> $logf"
