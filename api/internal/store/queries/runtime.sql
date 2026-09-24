@@ -880,6 +880,30 @@ WITH target AS (
           )
           OR 'codex_custom_model_v1' = ANY(@worker_protocol_caps::text[])
       )
+      -- PRD #1590 M2a (D2): keep a Codex subscription run queued while its
+      -- linked account is quarantined, or while a newer login on its SAME alias
+      -- is staging/failed after the run's first link. This gate is independent
+      -- of worker capabilities and precedes the custody-opening hold CTE.
+      -- The LEFT JOIN preserves an unlinked alias (including a first login);
+      -- every lookup stays scoped to this run's owner.
+      AND NOT (
+          r.harness = 'codex'
+          AND r.codex_auth_mode = 'subscription'
+          AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework')
+          AND EXISTS (
+              SELECT 1 FROM codex_credential_state ccs
+              LEFT JOIN codex_provider_account cpa
+                  ON cpa.id = ccs.provider_account_id AND cpa.user_id = r.user_id
+              WHERE ccs.user_secret_id = r.codex_secret_id
+                AND ccs.user_id = r.user_id
+                AND (
+                    cpa.coord_state = 'quarantined'
+                    OR (r.codex_account_key IS NOT NULL
+                        AND ccs.status IN ('staging', 'failed')
+                        AND ccs.material_revision > r.codex_material_revision)
+                )
+          )
+      )
       -- PRD #529 Decision 4: an ephemeral worker exists to serve exactly one run and
       -- must never take foreign work — otherwise it could hold a non-owning run when
       -- its bound run terminates, blocking the busy-guarded teardown (M4). So an
@@ -964,6 +988,26 @@ WITH target AS (
                             false)
                     )
                     OR 'codex_custom_model_v1' = ANY(p.protocol_capabilities)
+                )
+                -- PRD #1590 M2a (D2): mirror the claimant's account gate so a
+                -- busy worker never defers this run to a peer that cannot claim it.
+                AND NOT (
+                    r.harness = 'codex'
+                    AND r.codex_auth_mode = 'subscription'
+                    AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework')
+                    AND EXISTS (
+                        SELECT 1 FROM codex_credential_state ccs
+                        LEFT JOIN codex_provider_account cpa
+                            ON cpa.id = ccs.provider_account_id AND cpa.user_id = r.user_id
+                        WHERE ccs.user_secret_id = r.codex_secret_id
+                          AND ccs.user_id = r.user_id
+                          AND (
+                              cpa.coord_state = 'quarantined'
+                              OR (r.codex_account_key IS NOT NULL
+                                  AND ccs.status IN ('staging', 'failed')
+                                  AND ccs.material_revision > r.codex_material_revision)
+                          )
+                    )
                 )
                 AND pa.active < p.max_concurrent_runs
                 AND pa.active * (SELECT w.max_concurrent_runs FROM workers w WHERE w.id = @worker_id)
