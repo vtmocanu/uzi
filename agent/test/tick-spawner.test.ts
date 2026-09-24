@@ -207,7 +207,7 @@ ${exitAfterMs === undefined ? "setInterval(() => {}, 1000);" : `setTimeout(() =>
     const h = await sp.spawn(req([NODE, "-e", "process.exit(0)"]));
     await h.completed;
     await sp.settled();
-    assert.deepEqual(sp.survivors(), [{ pgid: sp.pids()[0], identity: "worker_pat" }]);
+    assert.deepEqual(sp.survivors(), [{ pgid: sp.pids()[0], identity: "worker_pat", killConfirmed: true }]);
     forceAlive = false;
   });
 

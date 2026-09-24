@@ -1293,8 +1293,8 @@ describe("mid-turn checkpoint lock custody (issue #1597 M2)", () => {
           assert.equal(ctl.outcomes[0], "tick_process_survived", "a survivor names its own tick's class");
           assert.ok(Date.now() - t0 >= 1_500, "the gated sink waited for the survivor");
           assert.ok(
-            lines.some((l) => l.msg === "durable sink proceeding while a surviving tick process group is still alive"),
-            "the gated sink logged the residual",
+            lines.some((l) => l.msg === "durable sink proceeding while a SIGKILLed tick process group is stuck in the kernel"),
+            "the gated sink logged the residual (SIGKILL confirmed: stuck, so it proceeds)",
           );
           // Still alive: a later tick skips on the survivor.
           ctl.advance(INTERVAL_MS + 1);
@@ -1327,6 +1327,75 @@ describe("mid-turn checkpoint lock custody (issue #1597 M2)", () => {
         feed.filter((t) => t === "mid-turn checkpoint sink blocked: a checkpoint process survived being stopped").length,
         1,
         JSON.stringify(feed),
+      );
+    } finally {
+      forceAlive = false;
+      await settleAndClean({ ctl, runners: runner ? [runner] : [], running: [p], restore: pub.restore, paths: [tmp] });
+    }
+  });
+
+  it("(i) survivor, SIGKILL unconfirmed: the best-effort milestone sink is SKIPPED (no git work, no publish)", async () => {
+    const tmp = scratchDir("survivor-unconfirmed");
+    const shim = writeShim(tmp, "detect");
+    const iid = 1597_236;
+    const g = mkGit(fx.dataDir, shim);
+    const stubborn = stubbornScript(tmp);
+    let forceAlive = true;
+    const ctl = control({
+      tickSpawn: {
+        rewrite: fetchBecomes(stubborn),
+        groupAlive: () => (forceAlive ? true : undefined),
+        // Delivery can never be confirmed (models EPERM / a failed runner-uid kill wrapper).
+        signalGroup: (pgid, sig) => {
+          try {
+            process.kill(-pgid, sig);
+          } catch {
+            /* gone */
+          }
+          return forceAlive ? false : undefined;
+        },
+      },
+      tickKillGraceMs: 300,
+    });
+    const pub = stubPublish(async (_n, _tip, pack) => {
+      await drain(pack);
+      return { ok: true };
+    });
+    const { logger, lines: rawLines } = recordingLogger();
+    const lines = rawLines as Array<Record<string, unknown>>;
+    const claim = gitlabClaim(iid);
+    let milestoneDone = false;
+    let runner: RunRunner | undefined;
+    let p: Promise<unknown> | undefined;
+    try {
+      runner = mkRunner(
+        g,
+        blockingTurn(async (ctx) => {
+          commitIn(ctx.worktreePath, "U.txt", "u\n");
+          ctl.advance(INTERVAL_MS + 1);
+          ctl.fireNoWait();
+          await waitFor(() => isReady(stubborn));
+          await ctx.checkpoint!({ reap: false }); // time gate open: it WOULD publish if it ran
+          assert.equal(ctl.outcomes[0], "tick_process_survived");
+          assert.equal(pub.count(), 0, "the skipped milestone sink published nothing");
+          forceAlive = false;
+          milestoneDone = true;
+        }),
+        ctl,
+        {},
+        logger,
+      );
+      p = runner.execute(claim);
+      await waitFor(() => milestoneDone, 30_000);
+      runner.shutdown();
+      await p;
+      assert.ok(
+        lines.some((l) => l.msg === "a surviving tick process group's SIGKILL could not be confirmed"),
+        "the unconfirmed kill was logged at error level",
+      );
+      assert.ok(
+        lines.some((l) => l.msg === "checkpoint skipped: a surviving tick process group may still be running"),
+        "the milestone sink was skipped",
       );
     } finally {
       forceAlive = false;

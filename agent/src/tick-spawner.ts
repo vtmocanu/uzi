@@ -39,6 +39,9 @@ import { runnerCommand, uidSplitActive } from "./runner-uid.js";
 export interface SurvivingGroup {
   pgid: number;
   identity: BoundaryProcessRequest["identity"];
+  /** True when the last SIGKILL to the group was CONFIRMED delivered (so a live member is stuck in
+   *  the kernel and cannot start new work); false when delivery could not be confirmed. */
+  killConfirmed: boolean;
 }
 
 /**
@@ -58,6 +61,36 @@ export function processGroupAlive(pgid: number, identity: BoundaryProcessRequest
     return true;
   } catch (e) {
     return (e as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
+
+/**
+ * Send `sig` to process group `pgid` and report whether delivery is CONFIRMED: true when the kernel
+ * accepted it, or the group is already gone (nothing left to signal). A permission failure, a
+ * failed runner-uid wrapper or any other error is NOT a confirmed delivery (kill(2) sends nothing
+ * on EPERM). Under the uid split an identity-`command` group is signalled as the runner uid.
+ */
+export function signalProcessGroup(
+  pgid: number,
+  identity: BoundaryProcessRequest["identity"],
+  sig: "SIGTERM" | "SIGKILL",
+): boolean {
+  if (identity === "command" && uidSplitActive()) {
+    const w = runnerCommand("kill", [sig === "SIGTERM" ? "-TERM" : "-KILL", `-${pgid}`]);
+    const r = spawnSync(w.command, w.args, { stdio: ["ignore", "ignore", "pipe"], encoding: "utf8" });
+    return r.status === 0 || killProbeSaysGone(r.status, String(r.stderr ?? ""));
+  }
+  try {
+    process.kill(-pgid, sig);
+    return true;
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ESRCH") return true;
+    try {
+      process.kill(pgid, sig); // best effort on the leader; the group itself was not signalled
+    } catch {
+      /* already gone */
+    }
+    return false;
   }
 }
 
@@ -124,6 +157,8 @@ export interface TickSpawnerTestHooks {
   /** Override the process-group liveness probe (return undefined to use the real one). Lets a test
    *  model a group that survives SIGKILL, which no real test process can do. */
   groupAlive?: (pgid: number) => boolean | undefined;
+  /** Override the group signal's delivery result (return undefined to signal for real). */
+  signalGroup?: (pgid: number, sig: "SIGTERM" | "SIGKILL") => boolean | undefined;
 }
 
 export interface TickSpawnerOptions {
@@ -149,6 +184,8 @@ interface Tracked {
   groupGone: Promise<void>;
   /** Set when members of the group were still alive when the bounded wait gave up. */
   survived: boolean;
+  /** Whether the last SIGKILL to the group was confirmed delivered. */
+  killConfirmed: boolean;
   snapshot: Map<string, LockStat> | undefined;
   /** Set once the child was signalled because of a cancellation. */
   signalled: boolean;
@@ -268,7 +305,9 @@ export class TickSpawner {
   /** Process groups that still had live members when the bounded wait gave up. Settlement does not
    *  wait for them forever, so the caller must treat them as blocking the sink. */
   survivors(): SurvivingGroup[] {
-    return this.all.filter((t) => t.survived).map((t) => ({ pgid: t.pid, identity: t.identity }));
+    return this.all
+      .filter((t) => t.survived)
+      .map((t) => ({ pgid: t.pid, identity: t.identity, killConfirmed: t.killConfirmed }));
   }
 
   /** True when any child had to be signalled by a cancellation (so lock reconcile is due). */
@@ -312,6 +351,7 @@ export class TickSpawner {
       isExited: () => exitedFlag,
       groupGone,
       survived: false,
+      killConfirmed: false,
       snapshot,
       signalled: false,
       killed: false,
@@ -377,7 +417,7 @@ export class TickSpawner {
     const graceEnd = Date.now() + this.killGraceMs;
     while (this.groupAlive(t) && Date.now() < graceEnd) await sleep(GROUP_POLL_MS);
     if (!this.groupAlive(t)) return;
-    this.signalGroup(t, "SIGKILL");
+    t.killConfirmed = this.signalGroup(t, "SIGKILL");
     const killEnd = Date.now() + GROUP_KILL_WAIT_MS;
     while (this.groupAlive(t) && Date.now() < killEnd) await sleep(GROUP_POLL_MS);
     if (!this.groupAlive(t)) return;
@@ -388,23 +428,11 @@ export class TickSpawner {
     });
   }
 
-  private signalGroup(t: Tracked, sig: "SIGTERM" | "SIGKILL"): void {
-    if (t.identity === "command" && uidSplitActive()) {
-      // The worker cannot signal a runner-uid process directly (EPERM): signal the group as the
-      // runner uid, the same way killRunnerGroup reaps the agent tree.
-      const w = runnerCommand("kill", [sig === "SIGTERM" ? "-TERM" : "-KILL", `-${t.pid}`]);
-      spawnSync(w.command, w.args, { stdio: "ignore" });
-      return;
-    }
-    try {
-      process.kill(-t.pid, sig);
-    } catch {
-      try {
-        process.kill(t.pid, sig);
-      } catch {
-        /* already gone */
-      }
-    }
+  /** Signal the child's group; true when delivery is confirmed (see {@link signalProcessGroup}). The
+   *  worker cannot signal a runner-uid process directly (EPERM), so under the uid split the group is
+   *  signalled as the runner uid, the same way killRunnerGroup reaps the agent tree. */
+  private signalGroup(t: Tracked, sig: "SIGTERM" | "SIGKILL"): boolean {
+    return this.opts.hooks?.signalGroup?.(t.pid, sig) ?? signalProcessGroup(t.pid, t.identity, sig);
   }
 
   private async terminate(t: Tracked): Promise<void> {

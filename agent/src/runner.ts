@@ -19,6 +19,7 @@ import { SinkGate } from "./sink-gate.js";
 import {
   TickSpawner,
   processGroupAlive,
+  signalProcessGroup,
   type RetainedLock,
   type SurvivingGroup,
   type TickSpawnerTestHooks,
@@ -6409,9 +6410,13 @@ export class RunRunner {
       // Best-effort throughout: a checkpoint must NEVER fail the run.
       checkpoint: (opts) =>
         // issue #1597 M2: gated — waits for (and preempts) an in-flight mid-turn tick.
-        this.runGatedSink(flight, async () => {
-          await checkpointBody({ reap: opts.reap, progress: opts.progress });
-        }),
+        this.runGatedSink(
+          flight,
+          async () => {
+            await checkpointBody({ reap: opts.reap, progress: opts.progress });
+          },
+          () => undefined, // best-effort: the next boundary retries
+        ),
       // Issue #281: a cheap fingerprint of the runner clone's committed + working-tree
       // state for the executor's no-progress detector — the runner-owned clone's branch
       // tip (committed work) plus `git status --porcelain` (uncommitted changes). Both are
@@ -6985,28 +6990,60 @@ export class RunRunner {
     return alive.length > 0;
   }
 
-  /** issue #1597 M2: before a durable sink touches the clone or the bare, wait (bounded) for any
-   *  surviving tick process group to go. A durable sink is NOT skipped for it: a group that survived
-   *  SIGKILL is a process stuck in the kernel, and starving every milestone/park/shutdown checkpoint
-   *  for it would lose the very durability this work adds; the residual is logged instead. */
-  private async awaitTickSurvivorsGone(flight: RunFlight): Promise<void> {
-    if (!this.tickSurvivorsRemain(flight)) return;
-    const deadline = Date.now() + SURVIVOR_SINK_WAIT_MS;
-    while (Date.now() < deadline) {
-      await new Promise((r) => setTimeout(r, 25));
-      if (!this.tickSurvivorsRemain(flight)) return;
+  /**
+   * issue #1597 M2: before a durable sink touches the clone or the bare, wait (bounded) for any
+   * surviving tick process group to go, re-sending a CHECKED SIGKILL once. Verdicts:
+   *  - `gone`: nothing survives.
+   *  - `stuck`: members live on but every group's SIGKILL was confirmed delivered, so they are stuck
+   *    in the kernel and can start no new work (at most one in-flight syscall completes).
+   *  - `unconfirmed`: a group lives on and its SIGKILL could not be confirmed (EPERM, a failed
+   *    runner-uid wrapper): it may still be running.
+   */
+  private async awaitTickSurvivorsGone(flight: RunFlight): Promise<"gone" | "stuck" | "unconfirmed"> {
+    const waitGone = async (ms: number): Promise<boolean> => {
+      const deadline = Date.now() + ms;
+      while (this.tickSurvivorsRemain(flight)) {
+        if (Date.now() >= deadline) return false;
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      return true;
+    };
+    if (!this.tickSurvivorsRemain(flight)) return "gone";
+    if (await waitGone(SURVIVOR_SINK_WAIT_MS)) return "gone";
+    const hook = this.checkpointTestHooks?.tickSpawn?.signalGroup;
+    for (const g of flight.survivingTickGroups) {
+      g.killConfirmed = hook?.(g.pgid, "SIGKILL") ?? signalProcessGroup(g.pgid, g.identity, "SIGKILL");
     }
-    flight.runLog.warn("durable sink proceeding while a surviving tick process group is still alive", {
-      run_id: flight.runId,
-      pgids: flight.survivingTickGroups.map((g) => g.pgid),
-    });
+    if (await waitGone(SURVIVOR_SINK_WAIT_MS)) return "gone";
+    const pgids = flight.survivingTickGroups.map((g) => g.pgid);
+    if (flight.survivingTickGroups.every((g) => g.killConfirmed)) {
+      flight.runLog.warn("durable sink proceeding while a SIGKILLed tick process group is stuck in the kernel", {
+        run_id: flight.runId,
+        pgids,
+      });
+      return "stuck";
+    }
+    flight.runLog.error("a surviving tick process group's SIGKILL could not be confirmed", { run_id: flight.runId, pgids });
+    return "unconfirmed";
   }
 
-  /** issue #1597 M2: run a durable sink under the per-flight sink gate, after surviving tick
-   *  process groups had their bounded chance to go. */
-  private runGatedSink<T>(flight: RunFlight, fn: () => Promise<T>): Promise<T> {
+  /**
+   * issue #1597 M2: run a durable sink under the per-flight sink gate, after surviving tick process
+   * groups had their bounded chance to go. A `stuck` survivor (SIGKILL confirmed) never blocks a
+   * sink. An `unconfirmed` one may still run git: a sink passed `onUnconfirmed` (the best-effort
+   * milestone checkpoint, which the next boundary retries) is SKIPPED; the last-chance sinks (park,
+   * wall, completion hold, credential switch) proceed, because skipping them loses the only
+   * durable copy, and the error line above records the residual.
+   */
+  private runGatedSink<T>(flight: RunFlight, fn: () => Promise<T>, onUnconfirmed?: () => T): Promise<T> {
     return flight.sinkGate.run(async () => {
-      await this.awaitTickSurvivorsGone(flight);
+      const verdict = await this.awaitTickSurvivorsGone(flight);
+      if (verdict === "unconfirmed" && onUnconfirmed) {
+        flight.runLog.warn("checkpoint skipped: a surviving tick process group may still be running", {
+          run_id: flight.runId,
+        });
+        return onUnconfirmed();
+      }
       return fn();
     });
   }
