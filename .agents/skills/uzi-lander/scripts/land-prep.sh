@@ -65,7 +65,8 @@
 #   9  the branch deletes CHANGELOG.md lines the base carries (usually a conflict resolved
 #      from a stale copy, e.g. a --fresh backup); restore them, or pass
 #      --allow-changelog-removals for a deliberate reword. A pure heading collapse (a
-#      duplicate `### ` heading plus adjacent blank lines) is not a removal
+#      `### ` heading repeated in the base's [Unreleased], left once, plus adjacent blank
+#      lines) is not a removal
 set -uo pipefail
 
 REPO=""; PR=""; WT=""; SKIP_REBASE=0; GATE="auto"; PUSH=1; ROOT=""; REWORK_CHECK=1; FRESH=0; ALLOW_CL_RM=0
@@ -367,34 +368,41 @@ fi
 # A rebase conflict resolved from a stale copy (a --fresh backup, an older branch state)
 # silently deletes entries that landed on the base meanwhile. The branch adds its own entry;
 # it has no business removing the base's. One removal is accepted: a pure heading collapse,
-# a hunk whose removed lines are only blank lines plus a `### ` heading that HEAD's
-# CHANGELOG.md still carries (collapse_changelog's output). Runs again after a pre-push
-# base-move rebase, which can union-resolve CHANGELOG.md.
+# a hunk whose removed lines are only blank lines plus `### X` headings where the base's
+# [Unreleased] carries `### X` at least twice and HEAD's exactly once (collapse_changelog's
+# output). Both counts are scoped to [Unreleased]: a released section's `### X` must not
+# vouch for deleting the only [Unreleased] one. Runs again after a pre-push base-move
+# rebase, which can union-resolve CHANGELOG.md.
+unreleased_headings() { # FILE-or-empty on stdin -> the `### ` lines inside [Unreleased]
+  awk '/^## \[Unreleased\]/{u=1; next} /^## /{u=0} u && /^### /{sub(/[ \t]+$/, ""); print}'
+}
 changelog_guard() {
-  local cl_diff removed have=/dev/null
+  local cl_diff removed
   [ "$ALLOW_CL_RM" -eq 0 ] || return 0
   if ! cl_diff=$(git diff --unified=0 "origin/$BASE..HEAD" -- CHANGELOG.md); then
     echo "cannot diff CHANGELOG.md against origin/$BASE" >&2; exit 3
   fi
-  [ -f CHANGELOG.md ] && have=CHANGELOG.md
   removed=$(printf '%s\n' "$cl_diff" | awk '
-    function flush(   i, ok, head) {
+    function flush(   i, ok, head, h) {
       if (nr == 0) return
       ok = 1; head = 0
       for (i = 1; i <= nr; i++) {
         if (R[i] ~ /^[ \t]*$/) continue
-        if (R[i] ~ /^### / && (R[i] in have)) { head = 1; continue }
+        h = R[i]; sub(/[ \t]+$/, "", h)
+        if (h ~ /^### / && basen[h] >= 2 && headn[h] == 1) { head = 1; continue }
         ok = 0
       }
       if (!ok || !head) for (i = 1; i <= nr; i++) print "-" R[i]
       nr = 0
     }
-    FILENAME == ARGV[1] { have[$0] = 1; next }
+    FILENAME == ARGV[1] { basen[$0]++; next }
+    FILENAME == ARGV[2] { headn[$0]++; next }
     /^@@/ { flush(); inh = 1; next }
     !inh { next }
     /^-/ { R[++nr] = substr($0, 2) }
     END { flush() }
-  ' "$have" -) || { echo "cannot read the CHANGELOG.md diff" >&2; exit 3; }
+  ' <(git show "origin/$BASE:CHANGELOG.md" 2>/dev/null | unreleased_headings) \
+    <({ unreleased_headings < CHANGELOG.md; } 2>/dev/null) -) || { echo "cannot read the CHANGELOG.md diff" >&2; exit 3; }
   if [ -n "$removed" ]; then
     log "branch deletes CHANGELOG.md line(s) that origin/$BASE carries:"
     printf '%s\n' "$removed" | cut -c1-160

@@ -15,7 +15,12 @@
 #      collapse commit;
 #   J. the guard accepts a pure heading collapse of the base's own duplicate heading
 #      without --allow-changelog-removals;
-#   K. ...and still refuses a real removal alongside one.
+#   K. ...and still refuses a real removal alongside one;
+#   L. deleting the ONLY [Unreleased] `### Security` heading is refused even though a
+#      released section also carries `### Security` (the collapse exception is scoped to
+#      [Unreleased] duplicates), and still refused when the branch adds a new `### Security`
+#      elsewhere in [Unreleased] (the base never repeated it);
+#   M. deleting EVERY copy of a heading the base repeats is refused (HEAD must keep one).
 set -eu
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -248,5 +253,43 @@ run bk2 212 --no-push --gate none
 [ "$rc" -eq 9 ] || fail "K2: a removal beside a collapse returned rc=$rc, want 9: $(cat "$WORK/out.212")"
 grep -qF -- '-- **two**' "$WORK/out.212" || fail "K2: the removed bullet was not printed"
 grep -qx -- '-### Fixed' "$WORK/out.212" && fail "K2: the accepted heading collapse was reported as a removal"
+
+# L. main's [Unreleased] ends with a single `### Security` section; [0.1.0] has one too. The
+#    branch deletes the [Unreleased] heading (and its blank line), so the bullet silently
+#    moves under the preceding section: a recategorisation, exit 9.
+git -C "$SEED" switch -q main
+awk '$0=="## [0.1.0] - 2026-01-01"{print "### Security"; print ""; print "- **sec bullet**"; print ""} {print}' "$SEED/CHANGELOG.md" > "$SEED/CHANGELOG.md.tmp"
+printf '\n### Security\n\n- **old sec**\n' >> "$SEED/CHANGELOG.md.tmp"
+mv "$SEED/CHANGELOG.md.tmp" "$SEED/CHANGELOG.md"; git -C "$SEED" commit -qam 'security sections'; git -C "$SEED" push -q origin main
+mk_branch bl
+awk 'skip && /^$/ {skip=0; next} /^## \[Unreleased\]/{u=1} /^## \[0/{u=0} u && $0=="### Security"{skip=1; next} {skip=0; print}' "$SEED/CHANGELOG.md" > "$SEED/CHANGELOG.md.tmp"
+mv "$SEED/CHANGELOG.md.tmp" "$SEED/CHANGELOG.md"
+[ "$(grep -c '^### Security$' "$SEED/CHANGELOG.md")" -eq 1 ] || fail "L: fixture did not delete exactly the [Unreleased] heading"
+commit_push bl 'branch l'
+run bl 213 --no-push --gate none
+[ "$rc" -eq 9 ] || fail "L: deleting the only [Unreleased] ### Security returned rc=$rc, want 9: $(cat "$WORK/out.213")"
+grep -qx -- '-### Security' "$WORK/out.213" || fail "L: the removed heading was not printed: $(cat "$WORK/out.213")"
+# L2. the same deletion plus a NEW `### Security` section at the top of [Unreleased]: HEAD
+#     carries the heading once, but the base never repeated it, so it is no collapse.
+mk_branch bl2
+awk 'skip && /^$/ {skip=0; next} /^## \[Unreleased\]/{u=1; print; print ""; print "### Security"; print ""; print "- **new sec**"; next} /^## \[0/{u=0} u && $0=="### Security"{skip=1; next} {skip=0; print}' "$SEED/CHANGELOG.md" > "$SEED/CHANGELOG.md.tmp"
+mv "$SEED/CHANGELOG.md.tmp" "$SEED/CHANGELOG.md"
+[ "$(awk '/^## \[Unreleased\]/{u=1; next} /^## /{u=0} u && $0=="### Security"' "$SEED/CHANGELOG.md" | wc -l | tr -d ' ')" -eq 1 ] || fail "L2: fixture does not leave one [Unreleased] ### Security"
+commit_push bl2 'branch l2'
+run bl2 215 --no-push --gate none
+[ "$rc" -eq 9 ] || fail "L2: recategorising under a re-added heading returned rc=$rc, want 9: $(cat "$WORK/out.215")"
+grep -qx -- '-### Security' "$WORK/out.215" || fail "L2: the removed heading was not printed: $(cat "$WORK/out.215")"
+
+# M. main's [Unreleased] repeats `### Fixed` (J's bad resolution); the branch deletes both
+#    copies (and their blank lines): nothing is left to collapse into, exit 9.
+mk_branch bm
+awk 'skip && /^$/ {skip=0; next} /^## \[Unreleased\]/{u=1} /^## \[0/{u=0} u && $0=="### Fixed"{skip=1; next} {skip=0; print}' "$SEED/CHANGELOG.md" > "$SEED/CHANGELOG.md.tmp"
+mv "$SEED/CHANGELOG.md.tmp" "$SEED/CHANGELOG.md"
+[ "$(awk '/^## \[Unreleased\]/{u=1; next} /^## /{u=0} u && $0=="### Fixed"' "$SEED/CHANGELOG.md" | wc -l | tr -d ' ')" -eq 0 ] || fail "M: fixture left a ### Fixed"
+git -C "$SEED" show main:CHANGELOG.md | awk '/^## \[Unreleased\]/{u=1; next} /^## /{u=0} u && $0=="### Fixed"{n++} END{exit !(n>=2)}' || fail "M: main does not repeat ### Fixed"
+commit_push bm 'branch m'
+run bm 214 --no-push --gate none
+[ "$rc" -eq 9 ] || fail "M: deleting every copy of a repeated heading returned rc=$rc, want 9: $(cat "$WORK/out.214")"
+grep -qx -- '-### Fixed' "$WORK/out.214" || fail "M: the removed heading was not printed"
 
 echo "PASS land-prep base move: disjoint tolerated without re-gate, overlap/conflict refused, CHANGELOG union auto-resolve, heading collapse and guard"
