@@ -477,8 +477,8 @@ func (h errorCounter) WithAttrs([]slog.Attr) slog.Handler { return h }
 func (h errorCounter) WithGroup(string) slog.Handler      { return h }
 
 // TestAutopilotBranchInUseDefersQuietly pins issue #1626: an active ci_fix / mr_rework on
-// agent/issue-<iid> refuses the create with ErrBranchInUse. That is a transient busy state,
-// so the event is left UNRECORDED (the next tick retries once the branch frees), no comment
+// agent/issue-<iid> refuses the create with ErrBranchInUse. That busy state lasts as long
+// as the holding run, so the event is left UNRECORDED (the next tick retries once the branch frees), no comment
 // is posted, and nothing is logged at ERROR (the default arm's slog.Error every tick was the
 // log storm). Swaps slog.SetDefault (process-global): must not run in parallel.
 func TestAutopilotBranchInUseDefersQuietly(t *testing.T) {

@@ -235,9 +235,8 @@ func (a *Autopilot) handle(ctx context.Context, r store.ListEnabledReposWithConn
 		// MR from a prior run caught it first, or this would be ErrOpenMRExists above). That
 		// is a busy state, NOT an outcome for this label application: it lasts as long as the
 		// holding run (which may be parked awaiting a human) and the label is still asking for an
-		// issue run. So,
-		// unlike the active-run swallow, the event is left UNRECORDED and the next tick
-		// retries (the create then succeeds once the branch frees). Logged at Debug, not
+		// issue run. So, unlike the active-run swallow, the event is left UNRECORDED and the
+		// next tick retries (the create then succeeds once the branch frees). Logged at Debug, not
 		// through the Error default, so the retry is not an error-log storm. Each deferred tick
 		// repeats this issue's forge reads, as an active ci_fix already did before #1626.
 		slog.Debug("poller: autopilot deferred, branch busy", "repo", r.PathWithNamespace, "issue", iid)

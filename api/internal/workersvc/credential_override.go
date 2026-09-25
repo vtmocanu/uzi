@@ -84,15 +84,17 @@ var (
 // no work of its own beyond delegating — the validation, the D9/D10 refusals and the
 // column resolution all live in the one validator — and returns the same resolved
 // *CredentialOverride (nil = inherit) or one of the exported typed refusals the handler
-// maps to HTTP statuses (404/409/422/400). Wired by run set-token / schedule create-edit in
-// M4/M6; createRun calls validateCredentialOverrideOn with its transaction's queries instead.
+// maps to HTTP statuses (404/409/422/400). Wired by schedule create/edit (M6); run set-token
+// calls validateCredentialOverride in-package, and createRun calls validateCredentialOverrideOn
+// with its transaction's queries.
 func (s *Service) ResolveCredentialOverride(ctx context.Context, userID uuid.UUID, kind, harness, mode string, secretID *uuid.UUID) (*CredentialOverride, error) {
 	return s.validateCredentialOverride(ctx, userID, kind, harness, mode, secretID)
 }
 
-// validateCredentialOverride is the ONE validator every override write runs through
-// (PRD #1247 M1) — at run create, run approve --token, run set-token, and schedule
-// create/edit (the handlers wire it in M2/M4/M6; M1 provides the function and its
+// validateCredentialOverride is the pool-bound entry to the ONE validator every override
+// write runs through, validateCredentialOverrideOn (PRD #1247 M1) — at run create (which
+// calls validateCredentialOverrideOn directly on its transaction, issue #1626), run approve
+// --token, run set-token, and schedule create/edit (the handlers wire it in M2/M4/M6; M1 provides the function and its
 // tests). It answers "may this run/schedule carry this override, and what columns does
 // it write?" and returns the resolved *CredentialOverride (nil = inherit ⇒ clear both
 // columns) or one of the typed refusals above.

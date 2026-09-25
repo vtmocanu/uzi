@@ -299,7 +299,7 @@ func testCreateWaitsOnRunBranchLock(t *testing.T, n int64,
 		select {
 		case err := <-done:
 			// The create finished while the lock was held: it never took the run-branch lock,
-			// so it could not have seen the issue run. This is the product defect, a real red.
+			// so it could not have seen the held run. This is the product defect, a real red.
 			t.Fatalf("create returned (err = %v) while the test held the run-branch lock on %s: it did not wait on the lock", err, branch)
 		default:
 		}
