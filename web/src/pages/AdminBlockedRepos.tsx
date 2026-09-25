@@ -199,8 +199,8 @@ export function AdminBlockedRepos() {
           guardrail refused. Rendered above the blocked/overridden table, and outside its
           repos-empty guard so a request shows even when nothing else is blocked. */}
       {!loading && requests.length > 0 && (
-        <Card className="p-0">
-          <div className="border-b border-edge px-4 py-3">
+        <Card flush>
+          <div className="border-b border-edge px-5 py-3">
             <h2 className="text-sm font-semibold text-fg">Pending override requests</h2>
             <p className="mt-0.5 text-xs text-muted">
               Members asking to enable a repo the guardrail refused. Approving records the override so the
@@ -274,7 +274,7 @@ export function AdminBlockedRepos() {
           }
         />
       ) : (
-        <Card className="p-0">
+        <Card flush>
           <div className="overflow-x-auto">
             <table className="w-full text-left text-sm">
               <thead className="border-b border-edge text-muted">

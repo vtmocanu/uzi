@@ -202,7 +202,7 @@ function GroupCard({
 }) {
   const attention = checks.filter(isAttention).length;
   return (
-    <Card className="overflow-hidden p-0">
+    <Card flush className="overflow-hidden">
       <header className="flex items-baseline justify-between gap-3 border-b border-edge px-5 py-3">
         <h2 className="text-xs font-semibold uppercase tracking-wider text-faint">{group.title}</h2>
         <span className="text-xs tabular-nums text-faint">

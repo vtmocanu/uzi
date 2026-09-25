@@ -20,21 +20,38 @@ export function cx(...parts: (string | false | null | undefined)[]): string {
 
 // ── Surfaces ─────────────────────────────────────────────────────────────────
 
+// A flush Card drops its padding so a table's dividers run edge to edge, then
+// pads the outermost cells to 20px (pl-5 / pr-5) so table text shares the 20px
+// left edge of ordinary card content. It is a prop rather than a className
+// because cx has no tailwind-merge: Tailwind emits `.p-0` before `.p-5`, so a
+// caller's `className="p-0"` never beat the base padding. `data-flush-inner`
+// marks a cell that is first in the DOM but not leftmost on screen (a rowspan
+// continuation row), which must keep its ordinary inner padding.
+const CARD_FLUSH_CLASSES =
+  "[&_th:first-child]:pl-5 [&_th:last-child]:pr-5 [&_td:last-child]:pr-5 [&_td:first-child:not([data-flush-inner])]:pl-5";
+
 export function Card({
   children,
   className = "",
   id,
+  flush = false,
 }: {
   children: ReactNode;
   className?: string;
   // Anchor target for in-page section indexes (Admin → Instance); pair it with a
   // scroll-mt-* class so a jump does not clip the card's title.
   id?: string;
+  // Edge-to-edge table card: no p-5, outer th/td cells padded to 20px instead.
+  flush?: boolean;
 }) {
   return (
     <div
       id={id}
-      className={cx("rounded-xl border border-edge bg-surface p-5", className)}
+      className={cx(
+        "rounded-xl border border-edge bg-surface",
+        flush ? CARD_FLUSH_CLASSES : "p-5",
+        className,
+      )}
     >
       {children}
     </div>

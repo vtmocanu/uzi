@@ -298,7 +298,7 @@ function CodexAdminSection() {
           <Alert message={error} />
         </div>
       )}
-      <Card className="p-0">
+      <Card flush>
         <div className="overflow-x-auto">
           <table className="w-full text-left text-sm">
             <thead className="border-b border-edge text-muted">
@@ -316,7 +316,10 @@ function CodexAdminSection() {
                   return (
                     <tr key={`${u.id}:${a.account_id}`} className="transition-colors hover:bg-raised/30">
                       {i === 0 ? <CodexUserCell user={u} rowSpan={u.accounts.length} /> : null}
-                      <td className="px-4 py-3 align-top">
+                      {/* On continuation rows this cell is first in the DOM but sits
+                          right of the rowspan user cell, so it opts out of the flush
+                          Card's outer-edge padding. */}
+                      <td className="px-4 py-3 align-top" data-flush-inner={i > 0 ? "" : undefined}>
                         <div className="flex flex-wrap items-center gap-2">
                           <span className="text-xs font-medium text-fg">{codexAccountLabel(a)}</span>
                           {a.is_default && <Badge tone="neutral">default</Badge>}
@@ -384,7 +387,7 @@ export function AdminRateLimits() {
           description="Rate-limit readings appear here once users save an Anthropic token."
         />
       ) : (
-        <Card className="p-0">
+        <Card flush>
           <div className="overflow-x-auto">
             <table className="w-full text-left text-sm">
               <thead className="border-b border-edge text-muted">
@@ -434,7 +437,9 @@ export function AdminRateLimits() {
                             {i === 0 ? (
                               <UserCell user={u} rowSpan={u.tokens.length} showIdentity />
                             ) : null}
-                            <td className="px-4 py-3 align-top">
+                            {/* Continuation rows: first in the DOM, not leftmost on
+                                screen, so no flush Card outer-edge padding. */}
+                            <td className="px-4 py-3 align-top" data-flush-inner={i > 0 ? "" : undefined}>
                               <div className="flex items-center gap-2">
                                 <span className="text-xs font-medium text-fg">{t.label}</span>
                                 {t.is_default && <Badge tone="neutral">default</Badge>}

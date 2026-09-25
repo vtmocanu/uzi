@@ -364,7 +364,7 @@ export function ForgeSettings() {
           description="Connect a bot PAT above — repos the bot can see become boards."
         />
       ) : (
-        <Card className="p-0">
+        <Card flush>
           <div className="overflow-x-auto">
             <table className="w-full text-left text-sm">
               <thead className="border-b border-edge text-muted">
