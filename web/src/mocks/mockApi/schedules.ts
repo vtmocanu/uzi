@@ -422,11 +422,11 @@ function materializeDefault(
 const catalogBySlug = (slug: string): CatalogEntry | undefined =>
   scheduleCatalog.find((e) => e.slug === slug);
 
-// Seed a few materialized defaults so the Default-jobs UX is visible under
-// VITE_UZI_MOCK=1: bug-triage enabled on TWO repos (Layout A — one summary row
-// expanding to two per-repo sub-rows, one active + one paused so the resume
-// affordance shows), and docs-hygiene enabled + customized on one repo (the
-// "customized" indicator + a prominent Reset).
+// Seed a few materialized defaults so the default-row UX is visible under
+// VITE_UZI_MOCK=1: bug-triage enabled on TWO repos (two rows in the flat Schedules
+// list, one active + one paused so the resume affordance shows, and a Job catalog
+// card reading "Enabled on 2 repos, 1 paused"), and docs-hygiene enabled + customized
+// on one repo (the "customized" indicator + a prominent Reset).
 const seededDefaults: Schedule[] = [
   materializeDefault(catalogBySlug("bug-triage")!, "repo-uzi", "sch-def-bt-uzi", {
     last_fired_at: daysFromNow(-1, 2),

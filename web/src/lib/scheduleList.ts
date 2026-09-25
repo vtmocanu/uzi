@@ -184,3 +184,40 @@ export function foldRefs(folded: readonly Schedule[]): string[] {
   }
   return refs;
 }
+
+// pruneFilter drops a Repo or Job dimension that no longer names anything on the page, so
+// a filter can never stay active invisibly (the Repo select offers only repos that have a
+// row; the Job chip names a catalog entry or a row). `repoId` is pruned once no schedule
+// is on that repo; `jobSlug` once no schedule carries it AND the catalog has no such entry.
+// Returns `f` itself when nothing was pruned, so a caller can compare by identity.
+export function pruneFilter(
+  f: ScheduleFilter,
+  all: readonly Schedule[],
+  catalogSlugs: ReadonlySet<string>,
+): ScheduleFilter {
+  const repoGone = f.repoId !== null && !all.some((s) => s.repo_id === f.repoId);
+  const jobGone =
+    f.jobSlug !== null && !catalogSlugs.has(f.jobSlug) && !all.some((s) => s.catalog_slug === f.jobSlug);
+  if (!repoGone && !jobGone) return f;
+  return { ...f, repoId: repoGone ? null : f.repoId, jobSlug: jobGone ? null : f.jobSlug };
+}
+
+// ── The Job catalog (D7) ─────────────────────────────────────────────────────
+
+// jobEnablement summarizes where a catalog entry runs: the distinct repos carrying an
+// origin-default row for `slug`, and how many of those repos have it paused. A repo is
+// "enabled" for the entry whether its row is on or off: re-enabling a paused default is a
+// server no-op, so the enable dialog locks it and the card counts it.
+export function jobEnablement(
+  all: readonly Schedule[],
+  slug: string,
+): { repoIds: Set<string>; pausedRepos: number } {
+  const repoIds = new Set<string>();
+  const paused = new Set<string>();
+  for (const s of all) {
+    if (s.origin !== "default" || s.catalog_slug !== slug) continue;
+    repoIds.add(s.repo_id);
+    if (!s.enabled) paused.add(s.repo_id);
+  }
+  return { repoIds, pausedRepos: paused.size };
+}

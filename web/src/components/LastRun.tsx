@@ -1,7 +1,7 @@
 // LastRun — the shared "Last run" UI for a schedule row (PRD #308 M4, mock §1/§2).
 //
 // Extracted verbatim from Schedules.tsx so it can be reused without a circular import
-// (Schedules.tsx imports DefaultJobs and ScheduleGroupRow, so re-exporting the "last run"
+// (Schedules.tsx imports ScheduleListRow, which renders these, so re-exporting the "last run"
 // pieces from Schedules.tsx would cycle). The public surface is LastRunOutcome (the list
 // cell), LastFireDetail (the expandable panel), and formatStamp (the single source of
 // truth for the schedules' timestamp formatting).

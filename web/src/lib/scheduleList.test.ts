@@ -6,8 +6,10 @@ import {
   clearHidingFilters,
   foldRefs,
   isFoldedOnce,
+  jobEnablement,
   matchesFilter,
   nextFireOf,
+  pruneFilter,
   repoOptions,
   scheduleDisplayName,
   sortSchedules,
@@ -191,5 +193,49 @@ describe("the fired one-shot fold (D6)", () => {
     expect(
       foldRefs([fired({ issue_iid: 158 }), fired({ issue_iid: 158 }), fired({ target: "prompt" }), fired({ issue_iid: 7 })]),
     ).toEqual(["#158", "#7"]);
+  });
+});
+
+describe("pruneFilter (M2 review note 1)", () => {
+  const rows = [
+    sched({ id: "a", repo_id: "r1", origin: "default", catalog_slug: "bug-triage" }),
+    sched({ id: "b", repo_id: "r2" }),
+  ];
+  const slugs = new Set(["bug-triage", "docs-hygiene"]);
+
+  it("returns the same filter when every dimension still names something", () => {
+    const f = { source: "all" as const, repoId: "r2", jobSlug: "docs-hygiene" };
+    expect(pruneFilter(f, rows, slugs)).toBe(f);
+  });
+
+  it("drops a repo no schedule is on any more, keeping the rest", () => {
+    const f = { source: "paused" as const, repoId: "r9", jobSlug: "bug-triage" };
+    expect(pruneFilter(f, rows, slugs)).toEqual({ source: "paused", repoId: null, jobSlug: "bug-triage" });
+  });
+
+  it("keeps a job with no row while the catalog carries it; drops one known to neither", () => {
+    const keep = { ...NO_FILTER, jobSlug: "docs-hygiene" };
+    expect(pruneFilter(keep, rows, slugs)).toBe(keep);
+    // A retired slug a row still carries is kept too (the rows are what it filters).
+    const retired = [...rows, sched({ id: "c", origin: "default", catalog_slug: "retired" })];
+    const onRow = { ...NO_FILTER, jobSlug: "retired" };
+    expect(pruneFilter(onRow, retired, slugs)).toBe(onRow);
+    expect(pruneFilter({ ...NO_FILTER, jobSlug: "gone" }, rows, slugs)).toEqual(NO_FILTER);
+  });
+});
+
+describe("jobEnablement (D7)", () => {
+  it("counts distinct repos with a default row for the slug, and the paused ones", () => {
+    const rows = [
+      sched({ id: "a", repo_id: "r1", origin: "default", catalog_slug: "bug-triage" }),
+      sched({ id: "b", repo_id: "r2", origin: "default", catalog_slug: "bug-triage", enabled: false }),
+      // A user row or another slug on a third repo never counts.
+      sched({ id: "c", repo_id: "r3", origin: "user", catalog_slug: null }),
+      sched({ id: "d", repo_id: "r3", origin: "default", catalog_slug: "docs-hygiene" }),
+    ];
+    const got = jobEnablement(rows, "bug-triage");
+    expect([...got.repoIds].sort()).toEqual(["r1", "r2"]);
+    expect(got.pausedRepos).toBe(1);
+    expect(jobEnablement(rows, "nope")).toEqual({ repoIds: new Set(), pausedRepos: 0 });
   });
 });

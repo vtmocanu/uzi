@@ -23,7 +23,8 @@ import { errorMessage } from "../lib/apiError";
 import { useAsyncData } from "../lib/useAsyncData";
 import { ScheduleModal } from "../components/ScheduleModal";
 import { browserTimezone } from "../lib/timezone";
-import { DefaultJobs, catalogEntryId } from "../components/DefaultJobs";
+import { JobCatalog, catalogEntryId } from "../components/JobCatalog";
+import type { EnableResult } from "../components/EnableJobDialog";
 import { ScheduleListRow, scheduleNameId } from "../components/ScheduleListRow";
 import { formatStamp } from "../components/LastRun";
 import { FILTER_ALL_ID, ScheduleFilters } from "../components/ScheduleFilters";
@@ -32,6 +33,7 @@ import {
   clearHidingFilters,
   foldRefs,
   isFoldedOnce,
+  pruneFilter,
   repoOptions,
   scheduleDisplayName,
   sourceCounts,
@@ -89,7 +91,14 @@ export function Schedules() {
   const [catalog, setCatalog] = useState<ScheduleCatalog | null>(null);
   const [repos, setRepos] = useState<Repo[]>([]);
   const [error, setError] = useState("");
-  const [notice, setNotice] = useState("");
+  // The page notice (role=status). `jobSlug` is set only by a fully successful catalog
+  // enable, whose notice then offers the Schedules tab filtered to that job (D7).
+  const [noticeState, setNoticeState] = useState<{ text: string; jobSlug: string | null }>({ text: "", jobSlug: null });
+  const notice = noticeState.text;
+  const setNotice = (text: string, jobSlug: string | null = null) => setNoticeState({ text, jobSlug });
+  // The Job catalog card whose enable dialog is open (D7), at most one; page-owned so a
+  // default row's "Enable on another repo" can open it from the Schedules tab (D4).
+  const [enableDialogSlug, setEnableDialogSlug] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [editing, setEditing] = useState<Schedule | null>(null);
   const [busyId, setBusyId] = useState<string>("");
@@ -129,7 +138,8 @@ export function Schedules() {
     setFoldOpen(null);
   };
   // Load sequence: `loadSeq` is bumped as each list load starts; `loadedSeq` is the
-  // sequence of the load whose list is in `schedules` (see pendingReveal).
+  // sequence of the latest current load to SETTLE: its list is in `schedules` when it
+  // succeeded, and when it failed the list on screen is older (see pendingReveal).
   const loadSeq = useRef(0);
   const [loadedSeq, setLoadedSeq] = useState(0);
   // A catalog entry to focus once the Job catalog tab has rendered ("from catalog").
@@ -168,12 +178,21 @@ export function Schedules() {
     async ({ isCurrent }) => {
       const seq = ++loadSeq.current;
       const rev = pauseRev.current;
-      const [rows, cat, repoList, pauseState] = await Promise.all([
-        api.listSchedules(),
-        api.listScheduleCatalog(),
-        api.listRepos().then((r) => r.repos),
-        api.getSchedulePause(),
-      ]);
+      let loadedAll: [Schedule[], ScheduleCatalog, Repo[], SchedulePauseDTO];
+      try {
+        loadedAll = await Promise.all([
+          api.listSchedules(),
+          api.listScheduleCatalog(),
+          api.listRepos().then((r) => r.repos),
+          api.getSchedulePause(),
+        ]);
+      } catch (err) {
+        // A failed load still settles its sequence, so a reveal awaiting it is dropped
+        // rather than left armed to steal focus on some later render (pendingReveal).
+        if (isCurrent()) setLoadedSeq(seq);
+        throw err;
+      }
+      const [rows, cat, repoList, pauseState] = loadedAll;
       if (!isCurrent()) return;
       setSchedules(rows);
       setLoadedSeq(seq);
@@ -240,13 +259,16 @@ export function Schedules() {
   };
 
   // Enable a catalog default on a set of repos — one call per repo (client fan-out,
-  // matching the CLI), reporting a partial failure rather than swallowing it.
-  const enableDefault = async (entry: CatalogEntry, repoIds: string[]) => {
-    if (repoIds.length === 0) return;
+  // matching the CLI), reporting a partial failure rather than swallowing it. Resolves to
+  // the per-repo outcome so the enable dialog can lock the repos that succeeded and keep
+  // the failed ones for a retry (D7); null when it did not start (nothing to enable, or
+  // another mutation in flight). It never switches tabs (D12).
+  const enableDefault = async (entry: CatalogEntry, repoIds: string[]): Promise<EnableResult | null> => {
+    if (repoIds.length === 0) return null;
     // In-flight guard (matches every other mutating action here): a double-click would
     // otherwise fan out duplicate enableCatalogSchedule calls. busyId keys off the entry
-    // slug (distinct from any schedule id), which disables this entry's Enable buttons.
-    if (busyId) return;
+    // slug (distinct from any schedule id), which disables every card's Enable.
+    if (busyId) return null;
     setBusyId(entry.slug);
     setError("");
     setNotice("");
@@ -260,16 +282,26 @@ export function Schedules() {
       const results = await Promise.allSettled(
         repoIds.map((rid) => api.enableCatalogSchedule(rid, entry.slug, tz)),
       );
-      const ok = results.filter((r) => r.status === "fulfilled").length;
-      const failed = results.length - ok;
+      const out: EnableResult = { enabled: [], failed: [] };
+      results.forEach((r, i) => {
+        if (r.status === "fulfilled") out.enabled.push(repoIds[i]);
+        else out.failed.push({ repoId: repoIds[i], message: errorMessage(r.reason, "Could not enable on this repo") });
+      });
+      // The refreshed list is what flips the succeeded repos to "enabled" in the dialog.
+      // Reload FIRST: every load clears the page error as it starts (onFetchStart), so an
+      // error set before it would be wiped before it was ever seen.
+      await reload();
+      const ok = out.enabled.length;
+      const failed = out.failed.length;
       if (failed > 0) {
         setError(`Enabled “${entry.name}” on ${ok} of ${repoIds.length} repos; ${failed} failed.`);
       } else {
         setNotice(
           `Enabled “${entry.name}” on ${ok} repo${ok === 1 ? "" : "s"} → ${ok} schedule${ok === 1 ? "" : "s"}.`,
+          entry.slug,
         );
       }
-      await reload();
+      return out;
     } finally {
       setBusyId("");
     }
@@ -344,11 +376,25 @@ export function Schedules() {
     setPendingReveal({ id, focus, afterSeq });
   };
 
-  // "from catalog" (and, until M3 wires its picker, "Enable on another repo"): switch to
-  // the Job catalog tab and move focus to that entry.
+  // "from catalog": switch to the Job catalog tab and move focus to that entry's card.
   const showInCatalog = (slug: string) => {
     setTab("catalog");
     setPendingCatalogFocus(slug);
+  };
+
+  // "Enable on another repo" (D4): switch to the Job catalog tab and open that entry's
+  // enable dialog, which moves focus into itself.
+  const enableElsewhere = (slug: string) => {
+    setTab("catalog");
+    setEnableDialogSlug(slug);
+  };
+
+  // A card's "Enabled on N repos" link, and the enable notice's link (D7): the Schedules
+  // tab filtered to that job, every other dimension cleared.
+  const showJobInSchedules = (slug: string) => {
+    setEnableDialogSlug(null);
+    setTab("schedules");
+    applyFilter({ ...NO_FILTER, jobSlug: slug });
   };
 
   // Closing the edit modal: a clone's modal hands focus to the cloned row (D12).
@@ -467,9 +513,17 @@ export function Schedules() {
   const nameOf = (s: Schedule) => scheduleDisplayName(s, entriesBySlug);
   // Only a default whose slug the loaded catalog still carries has an entry to show; any
   // other row gets no "from catalog" link and no "Enable on another repo" item.
-  const catalogLinkFor = (s: Schedule) => {
+  const catalogSlugOf = (s: Schedule) => {
     const slug = s.origin === "default" ? s.catalog_slug : null;
-    return slug && entriesBySlug.has(slug) ? () => showInCatalog(slug) : undefined;
+    return slug && entriesBySlug.has(slug) ? slug : null;
+  };
+  const catalogLinkFor = (s: Schedule) => {
+    const slug = catalogSlugOf(s);
+    return slug ? () => showInCatalog(slug) : undefined;
+  };
+  const enableElsewhereFor = (s: Schedule) => {
+    const slug = catalogSlugOf(s);
+    return slug ? () => enableElsewhere(slug) : undefined;
   };
   const all = schedules ?? [];
   // D5 → D6 → D3: filter, fold the fired one-shots that survived, sort each part.
@@ -490,6 +544,14 @@ export function Schedules() {
   const notEnabled = (catalog?.entries ?? []).filter((e) => !enabledSlugs.has(e.slug)).length;
   const loaded = schedules !== null && catalog !== null;
 
+  // A Repo or Job filter whose target left the page (its last row removed, the entry gone
+  // from the catalog) is pruned, so no filter stays active while nothing shows it.
+  useEffect(() => {
+    if (!schedules || !catalog) return;
+    const pruned = pruneFilter(filter, schedules, new Set(catalog.entries.map((e) => e.slug)));
+    if (pruned !== filter) applyFilter(pruned);
+  }, [schedules, catalog, filter]);
+
   const renderRow = (s: Schedule) => (
     <ScheduleListRow
       key={s.id}
@@ -508,6 +570,7 @@ export function Schedules() {
       onRemove={() => removeSchedule(s)}
       onAddRepo={(repoId) => addRepo(s, repoId)}
       onShowInCatalog={catalogLinkFor(s)}
+      onEnableElsewhere={enableElsewhereFor(s)}
     />
   );
 
@@ -534,6 +597,8 @@ export function Schedules() {
       // The row is gone from a list loaded after the mutation (removed meanwhile): drop
       // the request so it cannot fire on some later render, and keep focus off <body>.
       // A list that predates the mutation proves nothing, so keep waiting on it.
+      // A FAILED load at or after it settles `loadedSeq` too: the row cannot be shown, so
+      // the request is dropped instead of lingering to steal focus later.
       if (!row && schedules && loadedSeq >= pendingReveal.afterSeq) {
         setPendingReveal(null);
         if (pendingReveal.focus) tabRefs.current.schedules?.focus();
@@ -668,22 +733,18 @@ export function Schedules() {
           <ListSkeleton rows={4} />
         </>
       ) : tab === "catalog" ? (
-        <div role="tabpanel" id={panelId("catalog")} aria-labelledby={tabId("catalog")}>
-          <DefaultJobs
+        <div className="space-y-4" role="tabpanel" id={panelId("catalog")} aria-labelledby={tabId("catalog")}>
+          {(error || loadError) && <Alert message={error || loadError} />}
+          {notice && <PageNotice text={notice} jobSlug={noticeState.jobSlug} onShowJob={showJobInSchedules} />}
+          <JobCatalog
             catalog={catalog}
             schedules={schedules}
             repos={repos}
-            busyId={busyId}
+            busy={busyId !== ""}
+            openSlug={enableDialogSlug}
+            onOpenSlug={setEnableDialogSlug}
             onEnable={enableDefault}
-            onTogglePause={toggleEnabled}
-            onRunNow={runNow}
-            onReset={resetDefault}
-            onClone={cloneSchedule}
-            onRemove={removeSchedule}
-            onEdit={setEditing}
-            pauseNote={pauseNote}
-            notice={notice}
-            error={error || loadError}
+            onShowJob={showJobInSchedules}
           />
         </div>
       ) : (
@@ -694,7 +755,7 @@ export function Schedules() {
           aria-labelledby={tabId("schedules")}
         >
           {(error || loadError) && <Alert message={error || loadError} />}
-          {notice && <Alert message={notice} tone="info" />}
+          {notice && <PageNotice text={notice} jobSlug={noticeState.jobSlug} onShowJob={showJobInSchedules} />}
 
           {all.length === 0 ? (
             <div className="rounded-xl border border-dashed border-edge p-10 text-center">
@@ -851,6 +912,34 @@ function FoldRow({
         </button>
       </td>
     </tr>
+  );
+}
+
+// PageNotice is the page's info notice (role=status, like Alert's info tone). A catalog
+// enable's notice also offers the Schedules tab filtered to that job (D7); on the
+// Schedules tab the link would only re-apply the filter it just set, so it is harmless.
+function PageNotice({
+  text,
+  jobSlug,
+  onShowJob,
+}: {
+  text: string;
+  jobSlug: string | null;
+  onShowJob: (slug: string) => void;
+}) {
+  return (
+    <div role="status" className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border border-info/40 bg-info/10 px-3 py-2 text-sm text-info">
+      <span>{text}</span>
+      {jobSlug && (
+        <button
+          type="button"
+          onClick={() => onShowJob(jobSlug)}
+          className="rounded font-medium underline underline-offset-2 hover:text-fg"
+        >
+          Show it on the Schedules tab
+        </button>
+      )}
+    </div>
   );
 }
 

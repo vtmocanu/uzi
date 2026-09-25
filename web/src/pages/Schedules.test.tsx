@@ -278,11 +278,12 @@ describe("Schedules — enable-default sends the browser timezone (issue #660)",
       );
       await waitFor(() => expect(screen.getByText("Bug triage sweep")).toBeTruthy());
 
-      // Pick the repo in the shared RepoMultiSelect (its checkbox lives inside a collapsed
-      // <details>, so query it including hidden elements). Selecting it reveals the Enable
-      // button on the catalog row.
-      fireEvent.click(screen.getByRole("checkbox", { name: "vtmocanu/uzi", hidden: true }));
-      fireEvent.click(screen.getByRole("button", { name: /Enable/ }));
+      // Pick the repo in the card's enable dialog; Enable is offered once its label check settles.
+      fireEvent.click(screen.getByRole("button", { name: "Enable Bug triage sweep on…" }));
+      fireEvent.click(screen.getByRole("checkbox", { name: /vtmocanu\/uzi/ }));
+      const enable = await screen.findByRole("button", { name: "Enable 1" });
+      await waitFor(() => expect((enable as HTMLButtonElement).disabled).toBe(false));
+      fireEvent.click(enable);
 
       // The single real call site fans out one call per repo, now carrying the detected zone.
       await waitFor(() =>
@@ -922,18 +923,31 @@ describe("Schedules — default rows on the unified list (PRD #1645 D4)", () => 
     const card = document.getElementById("catalog-entry-bug-triage");
     expect(card).not.toBeNull();
     await waitFor(() => expect(document.activeElement).toBe(card));
+    // It only focuses the card: no enable dialog opens.
+    expect(screen.queryByRole("dialog")).toBeNull();
   });
 
-  it("the menu's 'Enable on another repo' also leads to that catalog entry (M3 wires the picker)", async () => {
+  it("the menu's 'Enable on another repo' opens that entry's enable dialog on the Job catalog (D4)", async () => {
     mockApi.listScheduleCatalog.mockResolvedValue(CATALOG);
     mockApi.listSchedules.mockResolvedValue([customizedDefault()]);
+    mockApi.listRepos.mockResolvedValue(REPOS3);
     renderPage();
 
     fireEvent.click(await screen.findByRole("button", { name: "More actions for Bug triage sweep on vtmocanu/uzi" }));
     // Default rows offer Enable-on-another-repo, never Add-to-another-repo.
     expect(screen.queryByRole("menuitem", { name: "Add to another repo" })).toBeNull();
     fireEvent.click(screen.getByRole("menuitem", { name: "Enable on another repo" }));
-    await waitFor(() => expect(document.activeElement).toBe(document.getElementById("catalog-entry-bug-triage")));
+
+    expect(tabNamed(/^Job catalog/).getAttribute("aria-selected")).toBe("true");
+    const dialog = await screen.findByRole("dialog", { name: "Enable Bug triage sweep on" });
+    expect(document.getElementById("catalog-entry-bug-triage")!.contains(dialog)).toBe(true);
+    await waitFor(() => expect(document.activeElement).toBe(dialog));
+    // The row's own repo is the one already enabled.
+    const uzi = within(dialog).getByRole("checkbox", { name: /vtmocanu\/uzi/ }) as HTMLInputElement;
+    expect(uzi.checked && uzi.disabled).toBe(true);
+    // Escape returns focus to the card's Enable on… button, not <body>.
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Enable Bug triage sweep on…" }));
   });
 });
 
@@ -959,23 +973,23 @@ describe("Schedules — D3 sort on the page", () => {
 });
 
 describe("Schedules — clone reveals the copy (PRD #1645 D12)", () => {
-  it("cloning from the catalog tab switches to Schedules, keeps the edit modal, and focuses the clone when it closes", async () => {
+  it("cloning keeps the edit modal over the Schedules tab and focuses the clone when it closes", async () => {
     const clone = sched({ id: "c1", target: "sweep", labels: ["bug"], origin: "user" });
     mockApi.listScheduleCatalog.mockResolvedValue(CATALOG);
     mockApi.listSchedules
       .mockResolvedValueOnce([customizedDefault()])
       .mockResolvedValue([customizedDefault(), clone]);
     mockApi.cloneSchedule.mockResolvedValue(clone);
-    renderAt("/schedules?tab=catalog");
+    renderAt("/schedules");
 
-    // The old catalog tab's per-repo Clone (behind its expander until M3).
-    fireEvent.click(await screen.findByRole("button", { name: "Show repos for Bug triage sweep" }));
-    fireEvent.click(screen.getByRole("button", { name: "Clone Bug triage sweep on vtmocanu/uzi" }));
+    // The catalog tab carries no per-repo controls (D7): clone lives in the row's menu.
+    fireEvent.click(await screen.findByRole("button", { name: "More actions for Bug triage sweep on vtmocanu/uzi" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Clone to an editable copy" }));
     await waitFor(() => expect(mockApi.cloneSchedule).toHaveBeenCalledWith("d1"));
 
     // Switched to Schedules with the clone rendered behind the open edit modal.
-    await waitFor(() => expect(tabNamed(/^Schedules/).getAttribute("aria-selected")).toBe("true"));
-    expect(screen.getByTestId("loc").textContent).toBe("?tab=schedules");
+    await waitFor(() => expect(screen.getByTestId("loc").textContent).toBe("?tab=schedules"));
+    expect(tabNamed(/^Schedules/).getAttribute("aria-selected")).toBe("true");
     expect(await screen.findByRole("dialog")).toBeTruthy();
     const nameCell = await waitFor(() => {
       const el = document.getElementById("schedule-name-c1");
@@ -1795,5 +1809,188 @@ describe("Schedules — the mock rejects a self_improve target conversion (PRD #
       status: 400,
       message: "target must be one of: issue, sweep, prompt",
     });
+  });
+});
+
+// ── PRD #1645 M3: the Job catalog tab (D7) wired into the page ────────────────
+describe("Schedules — Job catalog (PRD #1645 D7)", () => {
+  // A prompt entry: no label check, so Enable is offered as soon as a repo is checked.
+  const DOCS = {
+    ...CATALOG.entries[0],
+    slug: "docs-hygiene",
+    name: "Docs hygiene",
+    target: "prompt" as const,
+    labels: [],
+    max_issues: 0,
+  };
+  const docsRow = (over: Partial<Schedule> = {}) =>
+    sched({ id: "dh1", origin: "default", catalog_slug: "docs-hygiene", target: "prompt", ...over });
+
+  beforeEach(() => {
+    mockApi.listScheduleCatalog.mockResolvedValue({ entries: [CATALOG.entries[0], DOCS], enablements: [] });
+    mockApi.listRepos.mockResolvedValue(REPOS3);
+  });
+
+  const catalogCard = (slug: string) => document.getElementById(`catalog-entry-${slug}`)!;
+
+  it("the status link switches to Schedules with the Job filter applied and its chip shown", async () => {
+    mockApi.listSchedules.mockResolvedValue([
+      customizedDefault({ id: "d1" }),
+      customizedDefault({ id: "d2", repo_id: "repo-atlas", repo_path: "vtmocanu/atlas", enabled: false }),
+      docsRow(),
+      sched({ id: "u1", target: "prompt", prompt: "mine" }),
+    ]);
+    renderAt("/schedules");
+    await waitFor(() => expect(nameIds()).toHaveLength(4));
+    fireEvent.click(chip(/^Mine/)); // a filter the link replaces
+    fireEvent.click(tabNamed(/^Job catalog/));
+
+    const link = within(catalogCard("bug-triage")).getByRole("button", { name: "Enabled on 2 repos, 1 paused" });
+    fireEvent.click(link);
+    expect(tabNamed(/^Schedules/).getAttribute("aria-selected")).toBe("true");
+    expect(screen.getByTestId("loc").textContent).toBe("?tab=schedules");
+    expect(screen.getByText("Job: Bug triage sweep")).toBeTruthy();
+    expect(chip(/^All/).getAttribute("aria-pressed")).toBe("true");
+    expect(nameIds().sort()).toEqual(["d1", "d2"]);
+  });
+
+  it("a full success stays on the catalog, closes the dialog, and its notice links to the filtered list", async () => {
+    mockApi.listSchedules.mockResolvedValueOnce([]).mockResolvedValue([docsRow({ repo_id: "repo-atlas", repo_path: "vtmocanu/atlas" })]);
+    mockApi.enableCatalogSchedule.mockResolvedValue(docsRow());
+    renderAt("/schedules");
+    await waitFor(() => expect(tabNamed(/^Job catalog/).getAttribute("aria-selected")).toBe("true"));
+
+    fireEvent.click(screen.getByRole("button", { name: "Enable Docs hygiene on…" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: /vtmocanu\/atlas/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Enable 1" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(mockApi.enableCatalogSchedule).toHaveBeenCalledWith("repo-atlas", "docs-hygiene", expect.any(String));
+    // No tab jump (D12); the refreshed card now links to where it runs.
+    expect(tabNamed(/^Job catalog/).getAttribute("aria-selected")).toBe("true");
+    expect(within(catalogCard("docs-hygiene")).getByRole("button", { name: "Enabled on 1 repo" })).toBeTruthy();
+    expect(screen.getByText(/Enabled “Docs hygiene” on 1 repo/)).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Show it on the Schedules tab" }));
+    expect(tabNamed(/^Schedules/).getAttribute("aria-selected")).toBe("true");
+    expect(screen.getByText("Job: Docs hygiene")).toBeTruthy();
+    expect(nameIds()).toEqual(["dh1"]);
+  });
+
+  it("a partial failure keeps the dialog open, locks the succeeded repo from the refreshed list, shows the error inline and retries only the failed repo", async () => {
+    const { ApiError } = await vi.importActual<typeof import("../lib/api")>("../lib/api");
+    const atlasRow = docsRow({ id: "dh-a", repo_id: "repo-atlas", repo_path: "vtmocanu/atlas" });
+    const newRow = docsRow({ id: "dh-n", repo_id: "repo-new", repo_path: "vtmocanu/newrepo" });
+    let retrying = false;
+    mockApi.listSchedules
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([atlasRow])
+      .mockResolvedValue([atlasRow, newRow]);
+    mockApi.enableCatalogSchedule.mockImplementation(async (repoId: string) => {
+      if (repoId === "repo-new" && !retrying) {
+        throw new ApiError(502, "the forge timed out");
+      }
+      return docsRow({ repo_id: repoId });
+    });
+    renderAt("/schedules");
+    await waitFor(() => expect(tabNamed(/^Job catalog/).getAttribute("aria-selected")).toBe("true"));
+
+    fireEvent.click(screen.getByRole("button", { name: "Enable Docs hygiene on…" }));
+    const dialog = screen.getByRole("dialog", { name: "Enable Docs hygiene on" });
+    fireEvent.click(within(dialog).getByRole("checkbox", { name: /vtmocanu\/atlas/ }));
+    fireEvent.click(within(dialog).getByRole("checkbox", { name: /vtmocanu\/newrepo/ }));
+    fireEvent.click(within(dialog).getByRole("button", { name: "Enable 2" }));
+
+    // The page keeps its error text; the dialog stays, with the failure inline.
+    await waitFor(() => expect(screen.getByText("Enabled “Docs hygiene” on 1 of 2 repos; 1 failed.")).toBeTruthy());
+    expect(screen.getByRole("dialog")).toBe(dialog);
+    expect(within(dialog).getByText("the forge timed out")).toBeTruthy();
+    const atlas = within(dialog).getByRole("checkbox", { name: /vtmocanu\/atlas/ }) as HTMLInputElement;
+    expect(atlas.checked && atlas.disabled).toBe(true);
+    expect(atlas.closest("label")!.textContent).toContain("enabled");
+    const fresh = within(dialog).getByRole("checkbox", { name: /vtmocanu\/newrepo/ }) as HTMLInputElement;
+    expect(fresh.checked).toBe(true);
+    expect(fresh.disabled).toBe(false);
+
+    mockApi.enableCatalogSchedule.mockClear();
+    retrying = true;
+    fireEvent.click(within(dialog).getByRole("button", { name: "Enable 1" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(mockApi.enableCatalogSchedule.mock.calls.map((c) => c[0])).toEqual(["repo-new"]);
+  });
+
+  it("the not-enabled pill counts entries enabled on no repo (D1) and tracks an enable", async () => {
+    mockApi.listSchedules.mockResolvedValueOnce([customizedDefault()]).mockResolvedValue([customizedDefault(), docsRow()]);
+    mockApi.enableCatalogSchedule.mockResolvedValue(docsRow());
+    renderAt("/schedules?tab=catalog");
+    await waitFor(() => expect(tabNamed(/^Job catalog · 2/).textContent).toContain("1 not enabled"));
+    fireEvent.click(screen.getByRole("button", { name: "Enable Docs hygiene on…" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: /vtmocanu\/atlas/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Enable 1" }));
+    await waitFor(() => expect(tabNamed(/^Job catalog · 2$/)).toBeTruthy());
+  });
+});
+
+// ── PRD #1645 M2 review notes, fixed in M3 ────────────────────────────────────
+describe("Schedules — M2 review notes", () => {
+  it("a Repo filter is pruned when its repo's last row is removed, instead of staying active invisibly", async () => {
+    const atlas = sched({ id: "a1", target: "prompt", prompt: "atlas job", repo_id: "repo-atlas", repo_path: "vtmocanu/atlas" });
+    const rest = [sched({ id: "s1" }), sched({ id: "s2", target: "prompt", prompt: "x" })];
+    mockApi.listSchedules.mockResolvedValueOnce([...rest, atlas]).mockResolvedValue(rest);
+    mockApi.deleteSchedule.mockResolvedValue(null);
+    renderPage();
+    fireEvent.change(await screen.findByRole("combobox", { name: "Repo" }), { target: { value: "repo-atlas" } });
+    expect(nameIds()).toEqual(["a1"]);
+
+    fireEvent.click(screen.getByRole("button", { name: "More actions for Prompt: atlas job on vtmocanu/atlas" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Remove" }));
+    // The filter is gone with its repo: every remaining row shows (not "No schedules match").
+    await waitFor(() => expect(nameIds().sort()).toEqual(["s1", "s2"]));
+    expect(screen.queryByText("No schedules match")).toBeNull();
+    expect(screen.queryByRole("combobox", { name: "Repo" })).toBeNull();
+  });
+
+  it("a Job filter whose rows are gone keeps its visible chip while the catalog still carries the entry", async () => {
+    mockApi.listScheduleCatalog.mockResolvedValue(CATALOG);
+    mockApi.listSchedules.mockResolvedValueOnce([customizedDefault(), sched({ id: "u1" })]).mockResolvedValue([sched({ id: "u1" })]);
+    mockApi.deleteSchedule.mockResolvedValue(null);
+    renderAt("/schedules?tab=catalog");
+    fireEvent.click(await screen.findByRole("button", { name: "Enabled on 1 repo" }));
+    expect(nameIds()).toEqual(["d1"]);
+
+    fireEvent.click(screen.getByRole("button", { name: "More actions for Bug triage sweep on vtmocanu/uzi" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Remove" }));
+    await waitFor(() => expect(screen.getByText("No schedules match")).toBeTruthy());
+    // Not invisible: the chip that explains the empty list stays, removable.
+    expect(screen.getByText("Job: Bug triage sweep")).toBeTruthy();
+  });
+
+  it("a reveal whose awaited reload FAILED is dropped, so a later successful load does not steal focus", async () => {
+    mockApi.listRepos.mockResolvedValue(REPOS3);
+    const g1 = sched({ id: "g1", target: "prompt", prompt: "grouped job", repo_id: "repo-uzi", repo_path: "vtmocanu/uzi", sibling_group_id: "grp-1" });
+    const g2 = sched({ id: "g2", target: "prompt", prompt: "other job", repo_id: "repo-atlas", repo_path: "vtmocanu/atlas" });
+    const added = sched({ id: "g3", target: "prompt", prompt: "grouped job", repo_id: "repo-new", repo_path: "vtmocanu/newrepo", sibling_group_id: "grp-1" });
+    mockApi.listSchedules
+      .mockResolvedValueOnce([g1, g2])
+      .mockRejectedValueOnce(new Error("network down")) // the reload the reveal awaits
+      .mockResolvedValue([g1, g2, added]);
+    mockApi.addScheduleRepo.mockResolvedValue(added);
+    mockApi.updateSchedule.mockImplementation(async (id: string, input) => ({ ...g2, id, enabled: input.enabled ?? true }));
+    renderPage();
+
+    fireEvent.click(await screen.findByRole("button", { name: "More actions for Prompt: grouped job on vtmocanu/uzi" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Add to another repo" }));
+    fireEvent.change(await screen.findByRole("combobox", { name: /Add Prompt: grouped job on another repo/ }), {
+      target: { value: "repo-new" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Add" }));
+    await waitFor(() => expect(screen.getByText("Could not load schedules")).toBeTruthy());
+
+    // Some later action reloads successfully and brings the new row: it must not be focused.
+    const sw = screen.getByRole("switch", { name: "Pause Prompt: other job on vtmocanu/atlas" });
+    sw.focus();
+    fireEvent.click(sw);
+    await waitFor(() => expect(document.getElementById("schedule-name-g3")).not.toBeNull());
+    await act(async () => {});
+    expect(document.activeElement).not.toBe(document.getElementById("schedule-name-g3"));
   });
 });

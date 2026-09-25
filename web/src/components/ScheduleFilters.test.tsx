@@ -66,4 +66,20 @@ describe("ScheduleFilters", () => {
     expect(screen.getByRole("button", { name: /^All/ })).toBeTruthy(); // positive control
     expect(screen.queryByText(/^Job:/)).toBeNull();
   });
+
+  // M2 review notes 1 and 3.
+  it("keeps the Repo select while a repo is selected, even with fewer than two repos", () => {
+    const p = renderBar({ repos: [TWO_REPOS[0]], repoId: "r1" });
+    const select = screen.getByRole("combobox", { name: "Repo" }) as HTMLSelectElement;
+    expect(select.value).toBe("r1");
+    fireEvent.change(select, { target: { value: "" } });
+    expect(p.onRepo).toHaveBeenCalledWith(null);
+  });
+
+  it("labels a repo with no path 'Unknown repo' rather than a blank option", () => {
+    renderBar({ repos: [{ id: "r0", path: "" }, ...TWO_REPOS] });
+    const opt = screen.getByRole("option", { name: "Unknown repo" }) as HTMLOptionElement;
+    expect(opt.value).toBe("r0");
+    expect(screen.getAllByRole("option").map((o) => o.textContent)).not.toContain("");
+  });
 });

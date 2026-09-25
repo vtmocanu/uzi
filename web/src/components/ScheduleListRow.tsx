@@ -21,7 +21,7 @@ import { humanizeCron } from "../lib/schedulePresets";
 import { nextFireOf } from "../lib/scheduleList";
 import { relativeFromNow } from "./ScheduleModal";
 import { LastRunOutcome, LastFireDetail, formatStamp } from "./LastRun";
-import { AddAnotherRepo } from "./ScheduleGroupRow";
+import { AddAnotherRepo } from "./AddAnotherRepo";
 import { MoreActionsMenu, type MoreActionsItem } from "./MoreActionsMenu";
 import { Badge, Button, Toggle, cx } from "./ui";
 import { LockIcon, PencilIcon, PlayIcon, RotateCcwIcon } from "./icons";
@@ -73,6 +73,7 @@ export function ScheduleListRow({
   onRemove,
   onAddRepo,
   onShowInCatalog,
+  onEnableElsewhere,
 }: {
   s: Schedule;
   // The display name (catalog entry name for a default row, target title for a user row).
@@ -98,6 +99,9 @@ export function ScheduleListRow({
   // Switch to the Job catalog tab and focus this default's entry. Absent when the row is
   // not a default or its slug has no catalog entry (nothing to show or enable from).
   onShowInCatalog?: () => void;
+  // Switch to the Job catalog tab and open this default's enable dialog (D4 "Enable on
+  // another repo"). Absent under the same conditions as onShowInCatalog.
+  onEnableElsewhere?: () => void;
 }) {
   const demo = useDemoMode();
   const isDefault = s.origin === "default";
@@ -154,7 +158,7 @@ export function ScheduleListRow({
     { key: "clone", label: "Clone to an editable copy", disabled: busy, onSelect: onClone },
   ];
   if (isDefault) {
-    if (onShowInCatalog) menuItems.push({ key: "enable", label: "Enable on another repo", onSelect: onShowInCatalog });
+    if (onEnableElsewhere) menuItems.push({ key: "enable", label: "Enable on another repo", onSelect: onEnableElsewhere });
   } else {
     menuItems.push(
       s.target === "issue"

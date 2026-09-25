@@ -1,8 +1,9 @@
 // ScheduleFilters — the filter bar above the Schedules tab's list (PRD #1645 D5, D11).
 //
 // A single-select chip group (All · From catalog · Mine · Paused) whose counts describe
-// what each chip would show over ALL schedules, a Repo select offered only when the
-// schedules span two or more repos, and a removable "Job: <name>" chip while a job filter
+// what each chip would show over ALL schedules, a Repo select offered when the schedules
+// span two or more repos (and kept while a repo is selected, so an applied repo filter is
+// never invisible), and a removable "Job: <name>" chip while a job filter
 // is applied. Stateless: the page owns the filter state so it survives a tab switch.
 
 import type { SourceFilter } from "../lib/scheduleList";
@@ -33,7 +34,8 @@ export function ScheduleFilters({
   source: SourceFilter;
   counts: Record<SourceFilter, number>;
   onSource: (s: SourceFilter) => void;
-  // The distinct repos the schedules span; the select renders only for two or more.
+  // The distinct repos the schedules span; the select renders for two or more, or while
+  // one is selected. A row with no repo path is offered as "Unknown repo".
   repos: { id: string; path: string }[];
   repoId: string | null;
   onRepo: (id: string | null) => void;
@@ -80,7 +82,7 @@ export function ScheduleFilters({
           </button>
         </span>
       )}
-      {repos.length >= 2 && (
+      {(repos.length >= 2 || repoId !== null) && (
         <Select
           aria-label="Repo"
           value={repoId ?? ""}
@@ -90,7 +92,7 @@ export function ScheduleFilters({
           <option value="">All repos</option>
           {repos.map((r) => (
             <option key={r.id} value={r.id}>
-              {maskRepoPath(r.path, demo)}
+              {r.path ? maskRepoPath(r.path, demo) : "Unknown repo"}
             </option>
           ))}
         </Select>
