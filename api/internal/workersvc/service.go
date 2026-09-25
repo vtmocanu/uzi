@@ -941,6 +941,9 @@ type Store interface {
 	// above, and off the hot path for the same reason — it runs only for a Codex-indicating queued
 	// run already past its health threshold.
 	CountOnlineWorkersSatisfyingCodexHarness(ctx context.Context, userID uuid.UUID) (int64, error)
+	// CountOnlineWorkersSatisfyingCodexCompletion checks the protocol intersection
+	// required by an interlocked Codex run, including a custom root when requested.
+	CountOnlineWorkersSatisfyingCodexCompletion(ctx context.Context, arg store.CountOnlineWorkersSatisfyingCodexCompletionParams) (int64, error)
 	// CountOnlineWorkersSatisfyingCustomCodex backs PRD #1551 M4's (D6) queued-reason rung: a
 	// CUSTOM-Codex-root queued run whose owner has NO online worker advertising BOTH
 	// 'codex_harness_v1' AND 'codex_custom_model_v1' gets reasonNoCustomCodexCapableWorker — the

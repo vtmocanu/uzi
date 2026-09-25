@@ -164,7 +164,8 @@ const (
 	// online (rather than silently running Astra). Placed one rung below the plain Codex-harness rung
 	// so the more general "no Codex-capable worker" reason keeps precedence when the fleet has no
 	// Codex worker at all. Maps to the SAME healthWaitingWorker enum (runs.health_reason is free text).
-	reasonNoCustomCodexCapableWorker = "no worker supporting custom Codex models is online"
+	reasonNoCustomCodexCapableWorker     = "no worker supporting custom Codex models is online"
+	reasonNoCodexCompletionCapableWorker = "no online worker implements the Codex completion interlock (codex_completion_interlock_v1); provision a capable worker"
 	// reasonRepoNotDockerAllowed (PRD #361) is the queued reason for a repo-bearing run
 	// that no online worker is eligible to claim because every online worker is a Docker
 	// worker and the repo is not on the Docker-worker allowlist (fn_worker_can_claim,
@@ -757,6 +758,18 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 			slog.Error("health: count online workers satisfying custom codex", "run_id", r.ID, "error", cerr)
 		} else if c == 0 {
 			return reasonNoCustomCodexCapableWorker
+		}
+	}
+	// All protocol requirements must be present on one worker. A separate count for each
+	// capability can falsely report a split fleet as capable.
+	if r.CompletionContractVersion.Valid && (r.Harness == harnessCodex || r.CodexMaterialRevision.Valid || r.CodexSecretID.Valid) {
+		c, cerr := s.q.CountOnlineWorkersSatisfyingCodexCompletion(ctx, store.CountOnlineWorkersSatisfyingCodexCompletionParams{
+			UserID: r.UserID, CustomRoot: r.CodexCustomRoot,
+		})
+		if cerr != nil {
+			slog.Error("health: count workers satisfying Codex completion protocol", "run_id", r.ID, "error", cerr)
+		} else if c == 0 {
+			return reasonNoCodexCompletionCapableWorker
 		}
 	}
 	// A queued run the kind-derived priority DEMOTED (PRD #320 D9) is not stuck — it is

@@ -90,6 +90,9 @@ const CodexHarnessV1 = "codex_harness_v1"
 // capable-worker custom-model claim test then fails.
 const CodexCustomModelV1 = "codex_custom_model_v1"
 
+// CodexCompletionInterlockV1 identifies workers implementing Codex completion attempts.
+const CodexCompletionInterlockV1 = "codex_completion_interlock_v1"
+
 // CredentialSwitchV1 is the PROTOCOL capability a worker self-reports (PRD #1247 M5, D3/D4)
 // to declare it implements the HELD-STATE credential-switch protocol — the two-phase local
 // release (quiesce -> verified capture -> teardown -> {status:"credential_switch"} report) and
@@ -118,18 +121,19 @@ const WallParkV1 = "wall_park_v1"
 // entirely separate from `vocabulary` so a protocol string is never offered to users
 // through Vocabulary()/the web mirror. FilterProtocol drops anything not in here.
 var protocolVocabulary = map[string]struct{}{
-	CompletionInterlockV1: {},
-	RecoveryArchiveV1:     {},
-	RecoveryArchiveV2:     {},
-	CodexHarnessV1:        {},
-	CodexCustomModelV1:    {},
-	CredentialSwitchV1:    {},
-	WallParkV1:            {},
+	CompletionInterlockV1:      {},
+	RecoveryArchiveV1:          {},
+	RecoveryArchiveV2:          {},
+	CodexHarnessV1:             {},
+	CodexCustomModelV1:         {},
+	CodexCompletionInterlockV1: {},
+	CredentialSwitchV1:         {},
+	WallParkV1:                 {},
 }
 
 // protocolOrder fixes FilterProtocol's stable output order (protocolVocabulary is a map,
 // so its own iteration order is not stable). Keep in lockstep with protocolVocabulary.
-var protocolOrder = []string{CompletionInterlockV1, RecoveryArchiveV1, RecoveryArchiveV2, CodexHarnessV1, CodexCustomModelV1, CredentialSwitchV1, WallParkV1}
+var protocolOrder = []string{CompletionInterlockV1, RecoveryArchiveV1, RecoveryArchiveV2, CodexHarnessV1, CodexCustomModelV1, CodexCompletionInterlockV1, CredentialSwitchV1, WallParkV1}
 
 // FilterProtocol returns the members of in that are in the PROTOCOL vocabulary, DROPPING
 // unknowns silently (never an error), deduped, in stable order. It mirrors Filter but

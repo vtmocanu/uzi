@@ -47,6 +47,9 @@ export const CODEX_HARNESS_CAPABILITY = "codex_harness_v1";
  *  renderer always has the passthrough behavior, so the two are advertised together). */
 export const CODEX_CUSTOM_MODEL_CAPABILITY = "codex_custom_model_v1";
 
+/** This build implements completion attempts for Codex turns. Advertise only with the Codex harness. */
+export const CODEX_COMPLETION_INTERLOCK_CAPABILITY = "codex_completion_interlock_v1";
+
 /** Default install prefix, matching agent/codex/install-codex.sh's UZI_CODEX_PREFIX
  *  default. The receipt is written at `${prefix}/${version}.receipt.json`. */
 const DEFAULT_CODEX_PREFIX = "/opt/uzi-codex";
