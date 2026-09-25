@@ -1,6 +1,6 @@
 ---
 name: tester
-version: 13
+version: 14
 description: "Runs the repo's quality gate (format, lint, typecheck, dead code, coverage, tests) scoped to what the change touched, and validates behavior against representative real-world inputs. Adapts to whatever testing surface the repo actually has: unit-test framework (jest, pytest, go test, cargo test), scenario simulation for repos without one (CI workflows, infra, KCL/IaC libs), live-API dry-runs, or end-to-end runs with a consumer."
 tools: Bash, Read, Grep, Glob, WebFetch, Edit, Write, SendMessage, TaskUpdate, TaskList, TaskGet
 model: sonnet
@@ -142,6 +142,12 @@ the three testing flavors below fit the repo and the change.
   `kill "$pid"`. Never find it by pattern or port (`pkill -f`, `killall`,
   `fuser -k`, `kill $(lsof -ti :<port>)`): busybox `lsof` ignores its
   filters and lists every process, so a port lookup can kill your own agent.
+- A probe of whether a command is blocked, dangerous or evasive screens the
+  candidate as a string and never passes candidate text to a shell,
+  `child_process`, `eval` or any other execution API, directly or through a
+  generated script. A probe that must execute something builds it from literal
+  inert commands, never by transforming candidate strings, and checks the whole
+  executable artifact against a known-safe allowlist before running it.
 - Treat a uniform result across every cell as an instrument failure until
   proven otherwise; re-running the same command cannot tell you which.
 - A timeout that recurs at a raised limit is a hang, not slowness. Raise
@@ -215,6 +221,8 @@ conversation), with sections:
     the residual gap, never let scope be inferred from silence.
 
 ## For this repo (uzi)
+
+**Guardrail probes: screen, never run.** To test what `agent/src/guardrails.ts` allows or denies, call `screenBashCommand` on the candidate string from a `node --import tsx` probe and read `denied` / `reason`. Never execute a candidate, including through a generated script meant to swap in a marker.
 
 **Every gate recipe lives in root `Taskfile.yml`; `task --list` enumerates the targets** (descriptions carry the flags). `task gate` runs everything (`gate:repo` first, then the four components, serially); `task gate:api` / `gate:controller` / `gate:web` / `gate:agent` run one component; `task --dry gate:repo` lists the repo-wide checks. **`task` reports its own exit code, not the underlying command's: `201` = a target ran and failed, `109` = a malformed `Taskfile.yml` (nothing ran). Test for non-zero, never a specific number.** Task echoes each command, so flags are visible in your output.
 

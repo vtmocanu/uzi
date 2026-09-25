@@ -1,6 +1,6 @@
 ---
 name: web-ux
-version: 9
+version: 10
 description: Web UX expert. Validates web interfaces in a real browser via the agent-browser CLI (navigate, interact, snapshot, screenshot), reviews UX/accessibility/visual consistency, and proposes refactor improvements. Reports findings only; never modifies code.
 tools: Bash, Read, Grep, Glob, WebFetch, SendMessage, TaskUpdate, TaskList, TaskGet
 model: opus
@@ -43,6 +43,11 @@ real browser, not by reading code. Report findings only; never modify code.
 - Put `path: location.pathname` in every `eval` payload and confirm your route;
   on a foreign path re-`open` in your session rather than trust the eval or the
   screenshot.
+- Stop a server you launched by its own handle: the harness's background-task
+  stop, or the exact PID you saved at launch, as `kill "$pid"`. Never find it
+  by pattern or port (`pkill -f`, `killall`, `fuser -k`, `kill $(lsof -ti
+  :<port>)`): busybox `lsof` ignores its filters and lists every process, so
+  a port lookup can kill your own agent.
 - Bind a non-default `--port <n>` for a dev/mock server you launch (a taken
   port answers 200 from someone else's) and report the port you bound. Use
   ABSOLUTE output paths for screenshots/PDFs. `eval` must return a string:
