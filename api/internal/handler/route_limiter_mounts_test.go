@@ -67,7 +67,11 @@ var limiterNames = [...]string{
 // error rather than a failing row. Spelled `lim*` rather than matching the parameter
 // names exactly, so nothing here shadows a parameter inside Routes.
 //
-// 205 as of this commit (issue #1582 M1 added POST
+// 202 as of this commit (PRD #1650 M2 retired the notifications inbox read path: GET
+// /api/notifications/, GET /api/notifications/unread_count and POST
+// /api/notifications/{id}/read were removed, all three noLimiter; the removal is pinned by
+// TestNotificationsInboxRoutesAreGone).
+// It was 205 until then (issue #1582 M1 added POST
 // /api/worker/runs/{id}/recovery-holds/{holdID}/settle — the worker-authenticated
 // predecessor-hold settle by the api's own forge ancestry proof. Each call can spend the owner's
 // forge quota, so it rides proposalLimiter.PerWorkerMiddleware, which this per-USER probe reads
@@ -383,8 +387,6 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/me/secrets/", noLimiter},
 	{"GET", "/api/me/settings/", noLimiter},
 	{"GET", "/api/me/slack/", noLimiter},
-	{"GET", "/api/notifications/", noLimiter},
-	{"GET", "/api/notifications/unread_count", noLimiter},
 	// PRD #1349 M5: the owner-wide custody hold list + aggregate. Owner-scoped RequireUser read,
 	// no forge call, no token spend → noLimiter, like the owner recovery-archive reads.
 	{"GET", "/api/recovery/holds", noLimiter},
@@ -574,7 +576,6 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/me/secrets/codex_auth", noLimiter},
 	{"POST", "/api/me/secrets/openai_api_key", noLimiter},
 	{"POST", "/api/me/slack/test-dm", limSlackDM},
-	{"POST", "/api/notifications/{id}/read", noLimiter},
 	{"POST", "/api/repos/{id}/ci-fix-runs", limForge},
 	// GitHub Projects v2 sync adopt + autonomous provision (issue #534, PRD #364
 	// follow-up): relocated from /admin to owner-or-admin /repos (D4). Adopt/provision

@@ -226,9 +226,9 @@ func (h *Handler) RequestGuardrailOverride(w http.ResponseWriter, r *http.Reques
 	httpx.JSON(w, http.StatusOK, map[string]any{"override_request": overrideRequestStateDTO(reqRow)})
 }
 
-// guardrailOverrideDecidedKind is the notifications.kind for the inbox row a member
-// gets when an admin approves or rejects their guardrail-override request (PRD #1432
-// M3). The notifications table's kind + payload jsonb is generic (PRD #60), so a new
+// guardrailOverrideDecidedKind is the notifications.kind for the row recorded (and the
+// Slack DM sent to the requesting member, PRD #1650 D3) when an admin approves or
+// rejects their guardrail-override request (PRD #1432 M3). The notifications table's kind + payload jsonb is generic (PRD #60), so a new
 // kind is free text needing no migration; the payload carries the rendered title/body,
 // the repo, and the decision. (issue #1432.)
 const guardrailOverrideDecidedKind = "guardrail_override_decided"
@@ -560,7 +560,7 @@ func buildGuardrailOverrideDecidedNotification(baseURL string, req store.Guardra
 	case "approved":
 		emoji = "✅"
 		title = "Guardrail override approved"
-		bodyText = "An instance admin approved your request to allow " + repoLabel + " through the guardrail. Retry Enable on your Repos page — the live guard runs again."
+		bodyText = "An instance admin approved your request to allow " + repoLabel + " through the guardrail. Retry Enable on your Repos page. The live guard runs again."
 	default: // "rejected"
 		emoji = "⛔"
 		title = "Guardrail override rejected"

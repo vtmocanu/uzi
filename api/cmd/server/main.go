@@ -597,12 +597,13 @@ func run() error {
 		slacksvc.WithRunTimeout(cfg.RunTimeout),
 		slacksvc.WithExtensionCap(settingsCache.RunExtensionCapSeconds),
 	)
-	// Notifications write seam (PRD #46 M2): the one place that creates inbox rows.
-	// It persists the row first, then delivers best-effort through slackNotifier
-	// (reusing its per-user opt-in gating + drain goroutine via a separate queue).
-	// M3+ tenants (the judge) call notifier.Notify; the M2 REST read endpoints go
-	// straight to the store, so the handler only needs the seam wired for future
-	// producers.
+	// Notifications write seam (PRD #46 M2): the one place that creates notification
+	// rows. It persists the row first, then delivers best-effort through slackNotifier
+	// (reusing its per-user opt-in gating + drain goroutine via a separate queue). The
+	// in-app inbox read path is retired (PRD #1650 D1), so the table is a pruned,
+	// write-only event log plus the incidental-finding DM latch; the Slack DM is what
+	// the user sees. Every producer below (handler, poller detectors, scheduler,
+	// reconcilers, usage engine) calls notifier.Notify or one of its helpers.
 	notifier := notifysvc.New(q, slackNotifier, notifysvc.DefaultUserCap, slog.Default())
 
 	// Wire the mid-flight mr_rework abort (#853): when the MR-close watcher observes a
@@ -661,7 +662,7 @@ func run() error {
 	// and the M4 loop-guard ledger. Activation is gated by an admin global kill-switch
 	// (settings ci_autofix_enabled, default ON), read fail-closed inside the detector
 	// (PRD #914), plus the per-user opt-in (users.ci_autofix_enabled) and the
-	// pipelineMaxRefs>0 gate. notifier lands the inbox rows.
+	// pipelineMaxRefs>0 gate. notifier sends the halt DM (and records its row).
 	engine.SetCIAutoFix(poller.NewCIAutoFix(q, wsvc, notifier, settingsCache, cfg.CIFixMaxJobs, cfg.CIFixLogTailBytes, cfg.CIAutofixMaxAttempts, cfg.CIAutofixConfigPaths))
 	// MR review watcher (PRD #700 M3): the poller's post-SyncMRStates detector turns an
 	// opted-in completed run's MR that gained new review comments on a green head

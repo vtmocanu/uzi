@@ -59,3 +59,24 @@ func TestGuardrailOverrideDecidedSlackNoBaseNoLink(t *testing.T) {
 		t.Fatalf("a missing repo path must degrade to %q: %q", "your repository", n.Slack.Body)
 	}
 }
+
+// The approved body tells the member what to do next, in user-facing copy that carries
+// no em dash (house style for user-facing text); the same string is the DM body and the
+// recorded payload body.
+func TestGuardrailOverrideApprovedBodyCopy(t *testing.T) {
+	n := buildGuardrailOverrideDecidedNotification("https://uzi.example.com", store.GuardrailOverrideRequest{}, "grp/proj", "approved")
+	const want = "An instance admin approved your request to allow grp/proj through the guardrail. " +
+		"Retry Enable on your Repos page. The live guard runs again."
+	if n.Slack == nil || n.Slack.Body != want {
+		t.Fatalf("approved DM body = %q, want %q", n.Slack.Body, want)
+	}
+	if p, ok := n.Payload.(map[string]any); !ok || p["body"] != want {
+		t.Fatalf("approved payload body = %v, want %q", n.Payload, want)
+	}
+	for _, status := range []string{"approved", "rejected"} {
+		b := buildGuardrailOverrideDecidedNotification("", store.GuardrailOverrideRequest{}, "grp/proj", status).Slack.Body
+		if strings.ContainsRune(b, '—') {
+			t.Fatalf("%s body carries an em dash: %q", status, b)
+		}
+	}
+}

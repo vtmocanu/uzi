@@ -1,15 +1,17 @@
-// Package notifysvc is the single write seam for the notifications inbox
-// (PRD #46 Decision 6, M2). Every feature that wants to notify a user — the
-// judge (M4), the self-improvement engine (M5), anything later — calls Notify
-// rather than touching the table or Slack directly, so one place owns the
-// load-bearing ordering: the row is PERSISTED FIRST, then Slack is attempted
-// best-effort. That mirrors the run_messages discipline (persist, then
-// broadcast): a Slack outage, an unlinked user, or a full notifier queue can
-// never lose the inbox row, and the inbox is the source of truth the SPA reads.
+// Package notifysvc is the single write seam for user notifications (PRD #46
+// Decision 6). Every feature that wants to notify a user calls Notify rather than
+// touching the notifications table or Slack directly, so one place owns the
+// ordering: the row is PERSISTED FIRST, then Slack is attempted best-effort, so a
+// Slack outage, an unlinked user, or a full notifier queue never loses the row.
+//
+// Since PRD #1650 retired the in-app inbox, nothing reads the table back to a user:
+// it is a pruned, write-only event log (capped per user by DefaultUserCap, so not a
+// durable audit log) plus the per-run incidental-finding Slack DM latch
+// (NotifyIncidentalFinding). The user-facing delivery is the Slack DM.
 //
 // The service is generic: it knows nothing about judges. The caller supplies the
-// kind, a jsonb payload (the inbox render data), optional run/review deep-link
-// anchors, and an optional Slack rendering. The judge is simply tenant #1.
+// kind, a jsonb payload (the event data), optional run/review anchors, and an
+// optional Slack rendering.
 package notifysvc
 
 import (
@@ -29,8 +31,7 @@ import (
 
 // DefaultUserCap is the per-user retention cap: the newest this-many notifications
 // are kept, older ones pruned on write (Decision 6 — pruning ships with the table,
-// not later). Sized so a busy opted-in user's judge history stays browsable while
-// the table can't grow without bound. Overridable via New for tests.
+// not later), so the table can't grow without bound. Overridable via New for tests.
 const DefaultUserCap = 200
 
 // Store is the slice of generated queries the service needs. *store.Queries
@@ -39,11 +40,11 @@ const DefaultUserCap = 200
 type Store interface {
 	InsertNotification(ctx context.Context, arg store.InsertNotificationParams) (store.Notification, error)
 	PruneNotificationsForUser(ctx context.Context, arg store.PruneNotificationsForUserParams) (int64, error)
-	// FindUnreadNotificationForRunKind / UpdateNotificationPayload are the PRD #333 D6
-	// per-run coalescing pair: find the run's still-unread finding notification (a miss
-	// ⇒ this is the run's first finding, insert + one Slack DM), else bump its payload
-	// count WITHOUT re-firing Slack. See NotifyIncidentalFinding.
-	FindUnreadNotificationForRunKind(ctx context.Context, arg store.FindUnreadNotificationForRunKindParams) (store.Notification, error)
+	// FindNotificationForRunKind / UpdateNotificationPayload are the PRD #333 D6
+	// per-run coalescing pair: find the run's finding notification, whatever its read
+	// state (a miss ⇒ this is the run's first finding, insert + one Slack DM), else
+	// bump its payload count WITHOUT re-firing Slack. See NotifyIncidentalFinding.
+	FindNotificationForRunKind(ctx context.Context, arg store.FindNotificationForRunKindParams) (store.Notification, error)
 	UpdateNotificationPayload(ctx context.Context, arg store.UpdateNotificationPayloadParams) (store.Notification, error)
 }
 
@@ -70,7 +71,7 @@ type Service struct {
 	logger *slog.Logger
 }
 
-// New builds a Service. slack may be nil (delivery is then inbox-only). A
+// New builds a Service. slack may be nil (the row is then recorded, no DM). A
 // non-positive cap falls back to DefaultUserCap.
 func New(q Store, slack Slacker, cap int, logger *slog.Logger) *Service {
 	if logger == nil {
@@ -91,7 +92,7 @@ func New(q Store, slack Slacker, cap int, logger *slog.Logger) *Service {
 // intentional mrkdwn markup (`*bold*`, “ `code` “ chips, verdict emoji) built from
 // CLOSED enums/ints — the notifier scrubs them but does NOT mrkdwn-escape them (that
 // would break the intended markup). The notifier escapes + scrubs the untrusted
-// fields before they leave the box; the inbox row is the durable copy regardless.
+// fields before they leave the box; the row is recorded regardless.
 //
 // LinkLabel is an optional caller-set FIXED label for the deep link (e.g. "Open the
 // pipeline"); empty renders the default "Open in uzi", so a render that leaves it unset
@@ -118,7 +119,7 @@ type CIAutofixPayload struct {
 }
 
 // Notification is the input to Notify: a user to notify, a kind + jsonb payload
-// for the inbox render, optional run/review anchors (both ON DELETE CASCADE at the
+// for the event log, optional run/review anchors (both ON DELETE CASCADE at the
 // table), and an optional Slack rendering. Payload is marshaled to jsonb; a nil
 // Payload persists as '{}'.
 type Notification struct {
@@ -130,10 +131,10 @@ type Notification struct {
 	Slack    *SlackRender
 }
 
-// Notify persists the notification row, then prunes the user's inbox to the cap
+// Notify persists the notification row, then prunes the user's rows to the cap
 // (best-effort), then enqueues the Slack DM (best-effort). The persisted row is
-// returned. Only a failure to persist is fatal to the call — the inbox is the
-// source of truth, so prune/Slack failures are logged and swallowed. The prune and
+// returned. Only a failure to persist is fatal to the call; prune/Slack failures
+// are logged and swallowed. The prune and
 // Slack steps run after the durable write so neither can cost the caller the row.
 func (s *Service) Notify(ctx context.Context, n Notification) (store.Notification, error) {
 	payload := []byte("{}")
@@ -182,18 +183,17 @@ const KindIncidentalFinding = "incidental_finding"
 
 // KindEarlyLimitReset is the notifications.kind for a LOUD alert that the Anthropic
 // 7-day rate limit reset EARLIER than its expected window (PRD #1020 M3). kind is a
-// generic text column with no CHECK, so this needs no migration. The web renderer
-// (M5) keys off this kind and reads the payload's title.
+// generic text column with no CHECK, so this needs no migration.
 const KindEarlyLimitReset = "early_limit_reset"
 
 // maxCoalescedFindingIDs caps the finding_ids the coalesced payload accumulates so a
-// noisy run cannot grow one inbox row's jsonb without bound. The count keeps climbing past
-// the cap (it is the badge/headline number); only the id list stops appending. The per-run
+// noisy run cannot grow one row's jsonb without bound. The count keeps climbing past
+// the cap; only the id list stops appending. The per-run
 // capture cap (workersvc.MaxFindingsPerRun) is far below this, so in practice the cap is
 // defense-in-depth, not a limit users meet.
 const maxCoalescedFindingIDs = 50
 
-// IncidentalFindingPayload is the jsonb the inbox renders for an incidental_finding
+// IncidentalFindingPayload is the jsonb recorded for an incidental_finding
 // notification (PRD #333 D6). run_id/repo_id anchor it; repo_path is the human label;
 // count is the coalesced headline ("Run flagged M findings") and finding_ids the deep-link
 // set. All fields are server-built from the run/repo, never untrusted agent text (the
@@ -218,24 +218,29 @@ type IncidentalFindingNotifyInput struct {
 	Link      string
 }
 
-// NotifyIncidentalFinding is the PRD #333 D6 coalescing entry point: the run's FIRST
-// finding inserts one inbox row and fires exactly one Slack DM (via the existing Notify
-// persist-first + prune + Slack path); every SUBSEQUENT finding for the SAME run bumps
-// that unread row's payload count and appends the finding id WITHOUT re-firing Slack, so
-// the bell badge and inbox read "Run flagged M findings" while the user is DM'd once. The
+// NotifyIncidentalFinding is the PRD #333 D6 coalescing entry point: a finding with no
+// latch row for its (user, run) inserts one row and fires one Slack DM (via the existing
+// Notify persist-first + prune + Slack path); a later finding for the SAME run finds that
+// row, bumps its payload count and appends the finding id WITHOUT re-firing Slack. The
+// lookup ignores read state (PRD #1650 D4), so a row read before the inbox was retired
+// still latches.
+//
+// Coalescing is BEST-EFFORT, not exactly-once: the per-user prune (DefaultUserCap) can
+// evict a long run's latch row, and two concurrent first findings on one run can both
+// miss the lookup before either inserts. Either case sends the user a second DM. The
 // caller resolves whether to notify at all (a suppressed matching-hash re-report never
 // calls this, R2) and logs-and-swallows any error — the finding is already durably stored,
 // so a notification failure must never fail the capture.
 func (s *Service) NotifyIncidentalFinding(ctx context.Context, in IncidentalFindingNotifyInput) error {
-	existing, err := s.q.FindUnreadNotificationForRunKind(ctx, store.FindUnreadNotificationForRunKindParams{
+	existing, err := s.q.FindNotificationForRunKind(ctx, store.FindNotificationForRunKindParams{
 		UserID: in.UserID,
 		RunID:  in.RunID,
 		Kind:   KindIncidentalFinding,
 	})
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
-		// No coalescible unread row ⇒ the run's FIRST finding: persist the inbox row and
-		// fire one Slack DM. Notify owns persist-first + prune + best-effort Slack.
+		// No latch row ⇒ treated as the run's FIRST finding: persist the row and fire one
+		// Slack DM. Notify owns persist-first + prune + best-effort Slack.
 		runID := in.RunID
 		_, nerr := s.Notify(ctx, Notification{
 			UserID: in.UserID,
@@ -259,9 +264,9 @@ func (s *Service) NotifyIncidentalFinding(ctx context.Context, in IncidentalFind
 	case err != nil:
 		return err
 	default:
-		// A coalescible unread row exists ⇒ a SUBSEQUENT finding on the same run: bump the
-		// count and append the id, then rewrite the payload. NO Slack (D6: the DM fired on
-		// the first finding). The row stays unread so it keeps counting toward the bell.
+		// A latch row exists ⇒ a SUBSEQUENT finding on the same run: bump the count and
+		// append the id, then rewrite the payload. NO Slack (D6: the DM fired on the first
+		// finding).
 		var payload IncidentalFindingPayload
 		if derr := json.Unmarshal(existing.Payload, &payload); derr != nil {
 			return derr
@@ -283,8 +288,8 @@ func (s *Service) NotifyIncidentalFinding(ctx context.Context, in IncidentalFind
 	}
 }
 
-// EarlyResetPayload is the jsonb the inbox renders for an early_limit_reset notification
-// (PRD #1020 M3). title is the fixed headline the web renderer (M5) shows; expected/observed
+// EarlyResetPayload is the jsonb recorded for an early_limit_reset notification
+// (PRD #1020 M3). title is the fixed headline; expected/observed
 // are RFC3339 timestamps for the reset window we projected vs. the one we saw; hours_early is
 // the whole-hour display figure. Every field is server-derived from trusted time.Time values —
 // no untrusted text rides in here.
@@ -295,7 +300,7 @@ type EarlyResetPayload struct {
 	HoursEarly int    `json:"hours_early"`
 }
 
-// NotifyEarlyReset fires a LOUD Slack DM (and the durable inbox row) when the Anthropic
+// NotifyEarlyReset fires a LOUD Slack DM (and records the row) when the Anthropic
 // 7-day rate limit reset EARLIER than expected (PRD #1020 M3). It builds a distinctive
 // SlackRender — the "loud" alert is produced entirely here, since slacksvc flattens every
 // notification through one generic render with no per-kind dispatch — and delivers it via

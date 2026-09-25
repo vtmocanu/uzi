@@ -20,6 +20,15 @@ func TestSafeLinkURL(t *testing.T) {
 		"https:///grp/proj":                                 "",
 		"forge.example/p":                                   "",
 		"https://forge.example/%zz-invalid":                 "",
+		// userinfo: a credential or a spoofed "trusted-host@" prefix never rides a DM link.
+		"https://user:pass@forge.example/p":      "",
+		"https://trusted.example@evil.example/p": "",
+		"https://token@forge.example/p":          "",
+		// Unicode format characters (category Cf) are invisible in Slack and can reorder or
+		// hide what the reader sees: right-to-left override, zero-width space, BOM.
+		"https://forge.example/p\u202Eq": "",
+		"https://forge.example/p\u200Bq": "",
+		"https://forge.example/p\uFEFFq": "",
 	} {
 		if got := SafeLinkURL(in); got != want {
 			t.Errorf("SafeLinkURL(%q) = %q, want %q", in, got, want)

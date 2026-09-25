@@ -1,6 +1,6 @@
 # shellcheck shell=bash
 # phase:    judge-funnel
-# title:    PRD #46: run judge (stub) — funnel enqueue -> claim -> review -> persist-first notification
+# title:    PRD #46: run judge (stub) — funnel enqueue -> claim -> review -> durable review via the judge API
 # critical: no
 # lane:     gitlab
 # executor: any
@@ -10,7 +10,7 @@
 # mutates:  settings:judge_enabled=true,judge_model=haiku; per-user judge opt-in PUT /api/me/judge enabled=true (both restored in-phase at the end)
 # restores: settings:judge_enabled=false + per-user opt-in OFF, in-phase at the end (explicit restores + EXIT-trap fail-safe so a mid-phase fail can't leave judge globally enabled; 39-review-row-cap re-disables idempotently as belt-and-braces)
 # =============================================================================
-# PRD #46 — run judge + notifications inbox, end to end. UZI_E2E_EXECUTOR=stub
+# PRD #46 — run judge, end to end. UZI_E2E_EXECUTOR=stub
 # selects the STUB judge queryFn (judge-runner-stub.ts): the judge model call makes
 # NO network request and returns an error result, so JudgeRunner deterministically
 # posts its command-not-found FALLBACK — a real review with a dummy token and ZERO
@@ -18,8 +18,12 @@
 # genuinely full-wire: enable the judge (global kill-switch + admin opt-in), finish an
 # issue run → the committed-terminal funnel enqueues a `judge` run → the worker claims
 # it (repo-less, Anthropic-only claim: no forge PAT) → fetches the trace via the
-# judge-scoped endpoint → posts a review → a PERSIST-FIRST inbox notification lands
-# for the reviewed run.
+# judge-scoped endpoint → posts a review → the review is durably persisted, anchored to
+# the reviewed run and linked to the judge run that posted it, as read back through the
+# owner-scoped judge review API (GET /api/runs/{id}/review).
+# The judge_review notification row is no longer asserted here: the notifications inbox
+# read API was retired (PRD #1650 D1), and Notify's persist-then-Slack ordering is
+# covered by the focused notifysvc service tests (api/internal/notifysvc/service_test.go).
 # Phase B (plant `jq: command not found` → re-judge → the replacement review UPSERTs
 # the same single row naming install_worker_tool 'jq') was DROPPED by PRD #97 M4. Every
 # link of that chain is proven at a cheaper layer that runs in CI on every MR:
@@ -48,7 +52,7 @@
 # 39 direct-INSERTs `completed` rows (no terminal transition, so maybeEnqueueJudge never
 # fires). 39-review-row-cap re-disables idempotently as belt-and-braces.
 # =============================================================================
-say "PRD #46: run judge (stub) — funnel enqueue -> claim -> review -> persist-first notification"
+say "PRD #46: run judge (stub) — funnel enqueue -> claim -> review -> durable review via the judge API"
 
 login   # fresh admin session; login also unlocks the admin's vault (the dummy token is DEK-sealed)
 [ "$(apiget /api/auth/me | jq -r '.vault.unlocked')" = true ] \
@@ -64,7 +68,7 @@ pass "judge enabled (global kill-switch + admin opt-in); dummy token present; va
 # with `trap - EXIT` after the explicit restore runs.
 trap 'apiput /api/admin/settings '\''{"settings":{"judge_enabled":"false"}}'\'' >/dev/null 2>&1 || true; apiput /api/me/judge '\''{"enabled":false}'\'' >/dev/null 2>&1 || true' EXIT
 
-# --- the funnel: a finished run is auto-judged; a review + notification land ---
+# --- the funnel: a finished run is auto-judged; a durable review lands ---
 J_IID="$(apipost "/api/repos/$REPO_ID/issues" \
   '{"title":"E2E judge target","description":"judge e2e — implements prds/46-run-judge-self-improvement.md"}' \
   | jq -r '.card.iid')"
@@ -87,7 +91,9 @@ wait_review() {
   fail "PRD #46: no judge review ever landed for run $run"
 }
 wait_review "$J_RUN" 120
-[ "$(apiget "/api/runs/$J_RUN/review" | jq -r '.review.status')" = failed ] \
+J_REVIEW="$(apiget "/api/runs/$J_RUN/review")"
+J_REVIEW_ID="$(printf '%s' "$J_REVIEW" | jq -r '.review.id')"
+[ "$(printf '%s' "$J_REVIEW" | jq -r '.review.status')" = failed ] \
   || fail "PRD #46: the stub judge must post a fallback review (status=failed)"
 pass "funnel: the finished run was auto-judged; a review landed on the run-page endpoint (stub fallback, status=failed)"
 
@@ -99,10 +105,17 @@ J_JUDGE="$(db_psql "SELECT id FROM runs WHERE kind='judge' AND target_run_id='$J
   || fail "PRD #46: the judge run must be repo-less (no repo join, no forge PAT in its claim)"
 pass "judge run $J_JUDGE is repo-less (Anthropic-only claim; no forge PAT)"
 
-# Persist-first: the review POST created an inbox notification anchored to the reviewed run.
-[ "$(apiget /api/notifications | jq --arg r "$J_RUN" '[.notifications[] | select(.run_id==$r and .kind=="judge_review")] | length')" -ge 1 ] \
-  || fail "PRD #46: no judge_review inbox notification for the reviewed run (persist-first delivery)"
-pass "persist-first: a judge_review inbox notification landed for the reviewed run"
+# Durable persistence, read back through the judge review API after the judge run is
+# known: the SAME review row (same id as when it landed) is anchored to the reviewed run
+# and linked to the judge run that posted it.
+J_REREAD="$(apiget "/api/runs/$J_RUN/review")"
+[ "$(printf '%s' "$J_REREAD" | jq -r '.review.id')" = "$J_REVIEW_ID" ] \
+  || fail "PRD #46: re-reading the review returned a different row than the one that landed ($J_REVIEW_ID)"
+[ "$(printf '%s' "$J_REREAD" | jq -r '.review.target_run_id')" = "$J_RUN" ] \
+  || fail "PRD #46: the persisted review is not anchored to the reviewed run $J_RUN"
+[ "$(printf '%s' "$J_REREAD" | jq -r '.review.judge_run.judge_run_id // empty')" = "$J_JUDGE" ] \
+  || fail "PRD #46: the persisted review is not linked to the judge run $J_JUDGE that posted it"
+pass "durable: review $J_REVIEW_ID re-reads through the judge API, anchored to $J_RUN and linked to judge run $J_JUDGE"
 
 # Restore judge OFF here, in-phase, so no later phase is left relying on 39 to do it.
 # The judged run + its review are already persisted above, and nothing downstream needs

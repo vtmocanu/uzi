@@ -39,19 +39,21 @@ type MRReworkRunStarter interface {
 	CreateAutoMRReworkRun(ctx context.Context, userID, repoID uuid.UUID, ref string, mrIID int64, sourceRunID uuid.UUID, title, description string, snapshot *workersvc.ReviewCommentsSnapshot) (store.Run, error)
 }
 
-// MRReviewNotifier lands an inbox notification for the MR owner (PRD #700 M3).
-// *notifysvc.Service satisfies it. Optional (nil-safe): a detector built without a
-// notifier still starts/halts runs and posts issue comments, it just skips the inbox
-// row — same contract as CIAutofixNotifier.
+// MRReviewNotifier records the halt notification and sends its Slack DM to the MR
+// owner (PRD #700 M3, PRD #1650 D3). *notifysvc.Service satisfies it. Optional
+// (nil-safe): a detector built without a notifier still starts/halts runs and posts
+// issue comments, it just sends no DM and records no row — same contract as
+// CIAutofixNotifier.
 type MRReviewNotifier interface {
 	Notify(ctx context.Context, n notifysvc.Notification) (store.Notification, error)
 }
 
 // MRReworkSettings resolves the two admin gates the watcher needs (PRD #700 M5
 // Decision 5): the global kill-switch and the per-MR capLimit, plus the public base URL
-// the halt DM links from (PRD #1650 D3). *settings.Cache satisfies it. MrReworkEnabled is DELIBERATELY three-state and error-propagating (see its
-// doc): the detector maps a non-nil error to OFF (fail closed), so a settings-read
-// blip never fails OPEN into auto-reworking every MR.
+// the halt DM links from (PRD #1650 D3). *settings.Cache satisfies it. MrReworkEnabled
+// is DELIBERATELY three-state and error-propagating (see its doc): the detector maps a
+// non-nil error to OFF (fail closed), so a settings-read blip never fails OPEN into
+// auto-reworking every MR.
 type MRReworkSettings interface {
 	MrReworkEnabled(ctx context.Context) (bool, error)
 	MrReworkCap(ctx context.Context) (int, error)
@@ -78,7 +80,7 @@ type MRReviewWatch struct {
 }
 
 // NewMRReviewWatch builds a detector. q is the store, runs creates the automatic
-// mr_rework runs (workersvc), notifier lands the inbox rows (notifysvc, nil-safe),
+// mr_rework runs (workersvc), notifier sends the halt DM (notifysvc, nil-safe),
 // set resolves the admin gate + capLimit (settings). maxAttemptsDefault is the fallback
 // per-MR capLimit used when the admin capLimit read errors; quietPeriod is the review-landed
 // debounce (fire only once the newest review comment has settled for this long).
@@ -164,7 +166,7 @@ func (d *MRReviewWatch) detectOne(ctx context.Context, r store.ListEnabledReposW
 	// Scheduled-run branches (`uzi/prompt-…`, `uzi/self-improve/…`) do not parse to an
 	// issue iid, and that is now EXPECTED (PRD #908): the rework still fires for them —
 	// only the halt ISSUE COMMENT is suppressed, since there is no issue to comment on
-	// and the Forge interface has no MR-note write. The inbox notification carries the
+	// and the Forge interface has no MR-note write. The halt Slack DM carries the
 	// halt instead (notifyHalt fires for both branch shapes). When !ok, issueIID is 0,
 	// which is fine for the notification payload. For an `agent/issue-N` branch the parse
 	// still succeeds and the halt comment still posts (issue-run behavior unchanged).

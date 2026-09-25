@@ -42,10 +42,10 @@ type CIAutoFixRunStarter interface {
 	CreateAutoCIFixRun(ctx context.Context, userID, repoID uuid.UUID, ref, title, description string, snapshot workersvc.FailureSnapshot, ciConfigPaths []string) (store.Run, error)
 }
 
-// CIAutofixNotifier lands an inbox notification for the ref's owner (PRD #71 M6).
-// *notifysvc.Service satisfies it. Optional (nil-safe): a detector built without a
-// notifier still starts/halts runs and posts issue comments, it just skips the
-// inbox row.
+// CIAutofixNotifier records the halt notification and sends its Slack DM to the ref's
+// owner (PRD #71 M6, PRD #1650 D3). *notifysvc.Service satisfies it. Optional
+// (nil-safe): a detector built without a notifier still starts/halts runs and posts
+// issue comments, it just sends no DM and records no row.
 type CIAutofixNotifier interface {
 	Notify(ctx context.Context, n notifysvc.Notification) (store.Notification, error)
 }
@@ -76,7 +76,7 @@ type CIAutoFix struct {
 }
 
 // NewCIAutoFix builds a detector. q is the store, runs creates the automatic ci_fix
-// runs (workersvc), notifier lands the inbox rows (notifysvc, nil-safe), set resolves
+// runs (workersvc), notifier sends the halt DM (notifysvc, nil-safe), set resolves
 // the admin kill-switch (settings). maxJobs / logTailBytes bound the failure snapshot;
 // maxAttempts is the auto-fix cap; configPaths is the guard's default CI-config watch set.
 func NewCIAutoFix(q ciAutofixStore, runs CIAutoFixRunStarter, notifier CIAutofixNotifier, set CIAutofixSettings, maxJobs, logTailBytes, maxAttempts int, configPaths []string) *CIAutoFix {
@@ -379,7 +379,7 @@ func startCommentBody(ref, pipelineWebURL string) string {
 }
 
 // haltReason distinguishes the two halt episodes so the outward comment and the
-// inbox reason can each be truthful. They are NOT interchangeable: a cap halt is
+// halt DM's reason can each be truthful. They are NOT interchangeable: a cap halt is
 // final for this branch, a no-progress halt below the cap is not — a different
 // failure on the same branch can still be auto-fixed.
 type haltReason int
@@ -412,9 +412,9 @@ func haltCommentBody(reason haltReason, maxAttempts int, mrIid pgtype.Int8) stri
 		mrRef, maxAttempts)
 }
 
-// haltReasonPayload is the inbox notification's `reason` field: a short, DISTINCT
-// phrase per halt kind (the SPA renders it verbatim). Kept separate from the fuller
-// forge comment body so the two can evolve independently.
+// haltReasonPayload is the halt notification's `reason`: a short, DISTINCT phrase per
+// halt kind, recorded in the payload and quoted in the Slack DM body. Kept separate
+// from the fuller forge comment body so the two can evolve independently.
 func haltReasonPayload(reason haltReason, maxAttempts int) string {
 	if reason == haltCap {
 		return fmt.Sprintf("reached the %d-attempt limit", maxAttempts)

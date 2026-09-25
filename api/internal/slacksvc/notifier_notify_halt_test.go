@@ -13,8 +13,10 @@ import (
 // PRD #1650 D3: the three actionable kinds (ci_autofix_halted, mr_rework_halted,
 // guardrail_override_decided) hand the notifier RAW untrusted values — a forge branch
 // ref, a repo path — in Title-adjacent Body text, plus a deep link that for
-// ci_autofix_halted is forge-supplied. These tests drive the REAL notificationBlocks so
-// the escaping contract is proven where it is enforced.
+// ci_autofix_halted is forge-supplied. These tests drive the REAL notificationBlocks, so
+// they guard the renderer's escaping contract where it is enforced. They build the
+// notifyEvent by hand, so they do not prove what any producer sends; the producers'
+// own tests pin that.
 
 // hasLinkBlock reports whether the render carries the deep-link context block.
 func hasLinkBlock(blocks []slack.Block) bool {
@@ -26,10 +28,12 @@ func hasLinkBlock(blocks []slack.Block) bool {
 	return false
 }
 
-// Hostile ref / repo path values are escaped EXACTLY ONCE: the broadcast mention is
-// inert, the ampersand becomes a single &amp;, and nothing is double-escaped
-// (&amp;lt; / &amp;amp; would mean a producer pre-escaped before the notifier did).
-func TestNotificationBlocksHaltKindsEscapeUntrustedOnce(t *testing.T) {
+// A regression guard over notificationBlocks' escaping, fed body shapes like the halt
+// and override-decision kinds': hostile ref / repo path values are escaped EXACTLY ONCE
+// by the renderer (the broadcast mention is inert, the ampersand becomes a single &amp;,
+// nothing is double-escaped). It renders a hand-built body, so it is not proof that a
+// producer passes raw (unescaped) text; that is pinned in the producers' tests.
+func TestNotificationBlocksEscapesUntrustedBodyOnce(t *testing.T) {
 	for _, body := range []string{
 		// ci_autofix_halted / mr_rework_halted shape: a hostile branch ref.
 		"Automatic CI fix stopped on feat/<!channel>&*x*: reached the 2-attempt limit.",
@@ -95,5 +99,33 @@ func TestNotificationLinkLabelPlumbedWithDefault(t *testing.T) {
 	blocks, _ = notificationBlocks(plain)
 	if got := contextText(blocks); got != "🔗 <"+url+"|Open in uzi>" {
 		t.Fatalf("default label changed: %q", got)
+	}
+}
+
+// A custom LinkLabel that could break out of the <url|label> markup (a `|`, `<`, `>`,
+// a newline or other control character, or an invisible Unicode format character) falls
+// back to the default label, so a future dynamic label cannot inject markup or a second
+// link. Today every LinkLabel is a fixed caller constant; this guards the day one is not.
+func TestNotificationBlocksUnsafeLinkLabelFallsBackToDefault(t *testing.T) {
+	const url = "https://forge.example/grp/proj/-/pipelines/9"
+	for _, bad := range []string{
+		"Open|<https://evil.example|click>",
+		"Open the pipeline|x",
+		"Open <!channel>",
+		"Open > here",
+		"Open\nthe pipeline",
+		"Open\x07the pipeline",
+		"Open\u202Ethe pipeline",
+		"Open\u200Bthe pipeline",
+	} {
+		blocks, _ := notificationBlocks(notifyEvent{title: "CI auto-fix stopped", link: url, linkLabel: bad})
+		if got, want := contextText(blocks), "🔗 <"+url+"|"+defaultNotifyLinkLabel+">"; got != want {
+			t.Errorf("label %q rendered %q, want the default %q", bad, got, want)
+		}
+	}
+	// A plain label (with an ampersand, which is escaped, not rejected) still renders.
+	blocks, _ := notificationBlocks(notifyEvent{title: "t", link: url, linkLabel: "Pipeline & logs"})
+	if got, want := contextText(blocks), "🔗 <"+url+"|Pipeline &amp; logs>"; got != want {
+		t.Errorf("safe label rendered %q, want %q", got, want)
 	}
 }

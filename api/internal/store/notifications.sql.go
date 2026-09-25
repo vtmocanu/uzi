@@ -12,72 +12,35 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const countAllNotifications = `-- name: CountAllNotifications :one
-SELECT count(*) FROM notifications
-`
-
-// Total across all users, for the admin all-view page count.
-func (q *Queries) CountAllNotifications(ctx context.Context) (int64, error) {
-	row := q.db.QueryRow(ctx, countAllNotifications)
-	var count int64
-	err := row.Scan(&count)
-	return count, err
-}
-
-const countNotificationsForUser = `-- name: CountNotificationsForUser :one
-SELECT count(*) FROM notifications WHERE user_id = $1
-`
-
-// Total in the caller's inbox, for the page count.
-func (q *Queries) CountNotificationsForUser(ctx context.Context, userID uuid.UUID) (int64, error) {
-	row := q.db.QueryRow(ctx, countNotificationsForUser, userID)
-	var count int64
-	err := row.Scan(&count)
-	return count, err
-}
-
-const countUnreadNotificationsForUser = `-- name: CountUnreadNotificationsForUser :one
-SELECT count(*) FROM notifications WHERE user_id = $1 AND read_at IS NULL
-`
-
-// The unread-badge number. Served by the partial idx_notifications_unread.
-func (q *Queries) CountUnreadNotificationsForUser(ctx context.Context, userID uuid.UUID) (int64, error) {
-	row := q.db.QueryRow(ctx, countUnreadNotificationsForUser, userID)
-	var count int64
-	err := row.Scan(&count)
-	return count, err
-}
-
-const findUnreadNotificationForRunKind = `-- name: FindUnreadNotificationForRunKind :one
+const findNotificationForRunKind = `-- name: FindNotificationForRunKind :one
 
 SELECT id, user_id, kind, payload, run_id, review_id, read_at, created_at FROM notifications
 WHERE user_id = $1
   AND run_id = $2::uuid
   AND kind = $3
-  AND read_at IS NULL
-ORDER BY created_at DESC
+ORDER BY created_at DESC, id DESC
 LIMIT 1
 `
 
-type FindUnreadNotificationForRunKindParams struct {
+type FindNotificationForRunKindParams struct {
 	UserID uuid.UUID `json:"user_id"`
 	RunID  uuid.UUID `json:"run_id"`
 	Kind   string    `json:"kind"`
 }
 
-// ── PRD #333 Incidental Findings: the per-run notification coalescing plumbing (D6) ──
-// notifysvc.Notify is INSERT-only, so "N findings on one run → one updated inbox row" is
-// NEW plumbing, not an existing pattern. These two queries are the whole of it that M1
-// owns; M3 adds the notifysvc entry point that uses them. The existing 8 queries above are
-// untouched.
-// Find the coalescible unread row for a (user, run, kind): the newest still-unread
-// notification of this kind anchored to this run. M3's coalescing path calls this for a
-// run's SUBSEQUENT finding — a hit means bump the existing row's payload count (below)
-// with NO new Slack DM; a miss (pgx.ErrNoRows) means this is the first finding, so insert
-// and fire one Slack DM. Scoped to the caller and their run; read_at IS NULL is what makes
-// a row the user has already seen fall out and a fresh notification fire instead.
-func (q *Queries) FindUnreadNotificationForRunKind(ctx context.Context, arg FindUnreadNotificationForRunKindParams) (Notification, error) {
-	row := q.db.QueryRow(ctx, findUnreadNotificationForRunKind, arg.UserID, arg.RunID, arg.Kind)
+// ── PRD #333 Incidental Findings: the per-run finding coalescing plumbing (D6) ──
+// notifysvc.Notify is INSERT-only, so "N findings on one run → one Slack DM" needs the
+// lookup + payload bump below.
+// Find the coalescing latch row for a (user, run, kind): the newest notification of this
+// kind anchored to this run. notifysvc.NotifyIncidentalFinding calls this for each
+// finding: a hit means bump the existing row's payload count (below) with NO new Slack
+// DM; a miss (pgx.ErrNoRows) means this is the run's first finding, so insert and fire
+// one Slack DM. Scoped to the caller and their run. Read state is deliberately ignored
+// (PRD #1650 D4): nothing marks a row read any more, and a row read before the inbox was
+// retired must still latch. Best-effort, not exactly-once: the per-user prune can evict
+// the latch row during a long run, and two concurrent first findings can both miss.
+func (q *Queries) FindNotificationForRunKind(ctx context.Context, arg FindNotificationForRunKindParams) (Notification, error) {
+	row := q.db.QueryRow(ctx, findNotificationForRunKind, arg.UserID, arg.RunID, arg.Kind)
 	var i Notification
 	err := row.Scan(
 		&i.ID,
@@ -107,12 +70,12 @@ type InsertNotificationParams struct {
 	ReviewID pgtype.UUID `json:"review_id"`
 }
 
-// Notifications inbox (PRD #46 Decision 6, M2). The table is generic (kind +
-// payload jsonb) so any feature can enqueue without a schema change; the judge is
-// tenant #1. Scoping mirrors the owner-or-admin GetRunForViewer rule: the list and
-// unread count are session-user-scoped, the admin all-view is a separate query
-// that carries the owner, and mark-read matches on (id, user_id) so a non-owner's
-// id resolves to zero rows (audit M2).
+// Notifications event log (PRD #46 Decision 6; read path retired by PRD #1650 D1/D4).
+// The table is generic (kind + payload jsonb) so any producer can record an event
+// without a schema change. Nothing reads it back to a user any more: it is a pruned,
+// write-only event log (not a durable audit log; PruneNotificationsForUser caps it per
+// user) plus the per-run incidental-finding Slack DM latch (FindNotificationForRunKind).
+// The read_at column stays in the schema but nothing sets or reads it.
 // The write seam (notifysvc.Notify): persist the row FIRST, then best-effort Slack.
 // payload defaults to '{}' at the column, but the caller always marshals a value.
 func (q *Queries) InsertNotification(ctx context.Context, arg InsertNotificationParams) (Notification, error) {
@@ -123,144 +86,6 @@ func (q *Queries) InsertNotification(ctx context.Context, arg InsertNotification
 		arg.RunID,
 		arg.ReviewID,
 	)
-	var i Notification
-	err := row.Scan(
-		&i.ID,
-		&i.UserID,
-		&i.Kind,
-		&i.Payload,
-		&i.RunID,
-		&i.ReviewID,
-		&i.ReadAt,
-		&i.CreatedAt,
-	)
-	return i, err
-}
-
-const listAllNotifications = `-- name: ListAllNotifications :many
-SELECT n.id, n.user_id, n.kind, n.payload, n.run_id, n.review_id, n.read_at, n.created_at, u.email AS owner_email, u.display_name AS owner_display_name
-FROM notifications n
-JOIN users u ON u.id = n.user_id
-ORDER BY n.created_at DESC, n.id DESC
-LIMIT $2 OFFSET $1
-`
-
-type ListAllNotificationsParams struct {
-	Off int32 `json:"off"`
-	Lim int32 `json:"lim"`
-}
-
-type ListAllNotificationsRow struct {
-	ID               uuid.UUID          `json:"id"`
-	UserID           uuid.UUID          `json:"user_id"`
-	Kind             string             `json:"kind"`
-	Payload          []byte             `json:"payload"`
-	RunID            pgtype.UUID        `json:"run_id"`
-	ReviewID         pgtype.UUID        `json:"review_id"`
-	ReadAt           pgtype.Timestamptz `json:"read_at"`
-	CreatedAt        pgtype.Timestamptz `json:"created_at"`
-	OwnerEmail       string             `json:"owner_email"`
-	OwnerDisplayName pgtype.Text        `json:"owner_display_name"`
-}
-
-// Admin all-view (?all=1, RequireAdmin): every user's notifications newest-first,
-// carrying the owner (email + display name) so the admin sees whose inbox each row
-// is. Own-user listing uses ListNotificationsForUser instead — this join is only
-// paid on the admin path.
-func (q *Queries) ListAllNotifications(ctx context.Context, arg ListAllNotificationsParams) ([]ListAllNotificationsRow, error) {
-	rows, err := q.db.Query(ctx, listAllNotifications, arg.Off, arg.Lim)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []ListAllNotificationsRow{}
-	for rows.Next() {
-		var i ListAllNotificationsRow
-		if err := rows.Scan(
-			&i.ID,
-			&i.UserID,
-			&i.Kind,
-			&i.Payload,
-			&i.RunID,
-			&i.ReviewID,
-			&i.ReadAt,
-			&i.CreatedAt,
-			&i.OwnerEmail,
-			&i.OwnerDisplayName,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
-const listNotificationsForUser = `-- name: ListNotificationsForUser :many
-SELECT id, user_id, kind, payload, run_id, review_id, read_at, created_at FROM notifications
-WHERE user_id = $1
-ORDER BY created_at DESC, id DESC
-LIMIT $3 OFFSET $2
-`
-
-type ListNotificationsForUserParams struct {
-	UserID uuid.UUID `json:"user_id"`
-	Off    int32     `json:"off"`
-	Lim    int32     `json:"lim"`
-}
-
-// One page of the caller's own inbox, newest first. Served by
-// idx_notifications_user_created (user_id, created_at DESC). id is the tiebreaker
-// so the order is total and stable under equal created_at (seeded/bulk rows).
-func (q *Queries) ListNotificationsForUser(ctx context.Context, arg ListNotificationsForUserParams) ([]Notification, error) {
-	rows, err := q.db.Query(ctx, listNotificationsForUser, arg.UserID, arg.Off, arg.Lim)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []Notification{}
-	for rows.Next() {
-		var i Notification
-		if err := rows.Scan(
-			&i.ID,
-			&i.UserID,
-			&i.Kind,
-			&i.Payload,
-			&i.RunID,
-			&i.ReviewID,
-			&i.ReadAt,
-			&i.CreatedAt,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
-const markNotificationRead = `-- name: MarkNotificationRead :one
-UPDATE notifications
-SET read_at = COALESCE(read_at, now())
-WHERE id = $1 AND user_id = $2
-RETURNING id, user_id, kind, payload, run_id, review_id, read_at, created_at
-`
-
-type MarkNotificationReadParams struct {
-	ID     uuid.UUID `json:"id"`
-	UserID uuid.UUID `json:"user_id"`
-}
-
-// Mark one notification read. The (id, user_id) match IS the ownership check
-// (audit M2): a row belonging to another user matches zero rows, which the handler
-// surfaces as 404 exactly like an unknown id. COALESCE keeps the first read_at so
-// re-marking an already-read row is idempotent (returns the row, unchanged time).
-func (q *Queries) MarkNotificationRead(ctx context.Context, arg MarkNotificationReadParams) (Notification, error) {
-	row := q.db.QueryRow(ctx, markNotificationRead, arg.ID, arg.UserID)
 	var i Notification
 	err := row.Scan(
 		&i.ID,
@@ -295,7 +120,7 @@ type PruneNotificationsForUserParams struct {
 
 // Per-user retention cap (PRD #46 Decision 6: pruning ships with the table). Keeps
 // the newest @keep rows for a user and deletes the rest. The inner subquery takes
-// the newest @keep rows in the list query's total order (created_at DESC, id DESC)
+// the newest @keep rows in a total order (created_at DESC, id DESC)
 // via idx_notifications_user_created — a bounded index read of @keep rows, not a
 // scan — and `min(created_at)` over them is the boundary: the created_at of the
 // @keep-th newest (the oldest row still kept). The DELETE removes everything
@@ -304,7 +129,7 @@ type PruneNotificationsForUserParams struct {
 // exactly @keep ⇒ no deletion). The comparison is created_at-only, so rows tied at
 // the boundary's created_at are all kept — a small keep-slightly-more residual
 // accepted for v1 (M6 pins exact semantics). Called best-effort by notifysvc after
-// each insert, so an active writer's inbox can never grow without bound while an
+// each insert, so an active user's event log can never grow without bound while an
 // idle one is never touched.
 func (q *Queries) PruneNotificationsForUser(ctx context.Context, arg PruneNotificationsForUserParams) (int64, error) {
 	result, err := q.db.Exec(ctx, pruneNotificationsForUser, arg.UserID, arg.Keep)
@@ -327,13 +152,13 @@ type UpdateNotificationPayloadParams struct {
 	UserID  uuid.UUID `json:"user_id"`
 }
 
-// Bump a coalesced notification's payload without re-firing Slack (D6). M3 rewrites
-// payload.count (and finding_ids) on the row FindUnreadNotificationForRunKind returned, so
-// the bell badge and inbox reflect "Run #N flagged M findings" while the Slack DM fired
-// exactly once, on the first finding. RETURNING * so the caller can echo the updated row.
-// The (id, user_id) match is defense-in-depth (matching MarkNotificationRead): the caller
-// always passes the row FindUnreadNotificationForRunKind returned for this same user, so a
-// foreign id can never be updated even if a caller is ever wired to pass an untrusted id.
+// Bump a coalesced notification's payload without re-firing Slack (D6). The caller
+// rewrites payload.count (and finding_ids) on the row FindNotificationForRunKind returned,
+// so the event log records "Run #N flagged M findings" while the Slack DM fired once, on
+// the first finding. RETURNING * so the caller can echo the updated row. The
+// (id, user_id) match is defense-in-depth: the caller always passes the row
+// FindNotificationForRunKind returned for this same user, so a foreign id can never be
+// updated even if a caller is ever wired to pass an untrusted id.
 func (q *Queries) UpdateNotificationPayload(ctx context.Context, arg UpdateNotificationPayloadParams) (Notification, error) {
 	row := q.db.QueryRow(ctx, updateNotificationPayload, arg.Payload, arg.ID, arg.UserID)
 	var i Notification

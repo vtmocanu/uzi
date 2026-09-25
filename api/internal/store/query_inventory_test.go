@@ -199,15 +199,16 @@ import (
 //
 //	0  CreateSelfImproveRun, MarkImproveUziRecommendationsAddressed  (selfimprove.sql)
 //	0  ListCLITokens                                                 (cli_tokens.sql)
-//	0  ListNotificationsForUser, CountUnreadNotificationsForUser,
-//	   MarkNotificationRead, ListAllNotifications, CountAllNotifications (notifications.sql)
 //	0  GetUserVault, CreateUserVaultIfAbsent, DeleteUserVault      (user_vaults.sql — ALL of it)
 //	0  ListAppSettingsForUpdate                                    (settings.sql)
 //	1  CountActiveSelfImproveRuns  — the row that was wrong
 //	35 TouchCLIToken               — runs constantly, asserted nowhere
 //	1..39 everything else
 //
-// Those twelve zeroes are exactly the twelve UNPINNED rows below, and the two non-zero sentinels
+// Those zeroes were exactly that sweep's twelve UNPINNED rows (seven remain listed: PRD #1650 M2
+// deleted the five notifications.sql read-path queries, ListNotificationsForUser,
+// CountUnreadNotificationsForUser, MarkNotificationRead, ListAllNotifications and
+// CountAllNotifications, and their rows with them), and the two non-zero sentinels
 // are exactly the two EXERCISED-UNASSERTED rows. That correspondence is the check: if a row's
 // state and its execution count ever disagree, the ROW is wrong.
 //
@@ -235,9 +236,10 @@ import (
 //     revoke that returns 200. The seventh, ListAllCLITokensForAdmin, is the deliberate
 //     exception that proves the rule: it is factory-wide BY DESIGN, so its pin asserts the
 //     absence of the predicate every other row here asserts the presence of.
-//   notifications.sql (8)  — every row a user's inbox renders, all owner-scoped. Drift here is
+//   notifications.sql (8)  — every row a user's inbox rendered, all owner-scoped. Drift here was
 //     silent and permanently visible: a wrong unread badge is the bug a user reports and nobody
-//     can reproduce.
+//     can reproduce. (PRD #1650 M2 retired the inbox read path and deleted six of those queries;
+//     the file now holds the write seam, the prune and the finding-coalescing pair.)
 //   agent_memory.sql (6)   — user+repo scoped reads plus an eviction that DELETES, so a lost
 //     predicate either leaks another tenant's notes into a prompt or destroys the wrong rows.
 //
@@ -253,8 +255,8 @@ import (
 // table a distribution rather than a list of complaints, and it is the control on the process —
 // a widening exercise that only ever finds holes is one nobody should trust. notifications.sql
 // came out the other way, and the split inside it is the finding: the WRITE path (insert,
-// count, prune) is live-pinned and the entire READ path is not, which no per-file summary would
-// have surfaced.
+// count, prune) was live-pinned and the entire READ path was not, which no per-file summary would
+// have surfaced. (PRD #1650 M2 then deleted that unpinned read path outright.)
 //
 // WHY DECLARED AND NOT INFERRED. A prototype that infers pinning by scanning Test*LiveDB
 // function bodies for the query name was measured against this same tree, and it is wrong in
@@ -712,42 +714,18 @@ var queryInventory = []queryPin{
 			"redden. The MECHANISM is the durable half. Also: " +
 			"revoked-sorts-last is asserted PAIRWISE WITHIN THE FIXTURE rather than table-wide, so the " +
 			"shared live database's other rows may interleave without touching it"},
-	// ── notifications.sql — the inbox. THE WRITE PATH IS PINNED; THE READ PATH IS NOT ───
-	// The shape is worth seeing before the rows: one live test covers insert/count/prune, and
-	// the entire LIST + MARK-READ half — every query the user's inbox actually renders from —
-	// has never touched a database. handler/notifications_test.go looks like coverage and is
-	// fake-store throughout, so the owner predicates below are pinned only by a fake that takes
-	// the scoping as a parameter.
+	// ── notifications.sql — the pruned, write-only event log (PRD #1650 D4) ───
+	// The inbox read path (list, counts, admin all-view, mark-read) was deleted by PRD #1650
+	// M2 along with its six queries. What remains is the write seam and the per-user prune,
+	// pinned here, and the incidental-finding coalescing pair further down.
 	{"PruneNotificationsForUser", "notifications.sql", "TestNotificationsPruneLiveDB",
-		"direct call through the prune helper, notifications_integration_test.go:64, driven by " +
+		"direct call through the prune helper in notifications_integration_test.go, driven by " +
 			"several subtests. Discriminating: under-cap keeps everything, over-cap deletes exactly " +
 			"the excess, and one user's prune leaves another user's rows untouched"},
 	{"InsertNotification", "notifications.sql", "TestNotificationsPruneLiveDB",
-		"direct call, :157 — the 'write-seam round-trip' subtest, NOT mere fixture setup: it " +
-			"inserts four, asserts the count reads four, prunes to two, and asserts the rows were " +
-			"genuinely removed"},
-	{"CountNotificationsForUser", "notifications.sql", "TestNotificationsPruneLiveDB",
-		"direct call, :164 and :170, asserted on both sides of a prune in the same subtest"},
-	{"ListNotificationsForUser", "notifications.sql", unpinnedPin,
-		"No live test executes it. The only caller is handler/notifications.go:162, and " +
-			"handler/notifications_test.go is fake-store — TestListNotificationsOwnScope asserts the " +
-			"owner scoping against a fake that receives user_id as a parameter and therefore cannot " +
-			"be wrong about where it came from. This is the query the inbox page renders from"},
-	{"CountUnreadNotificationsForUser", "notifications.sql", unpinnedPin,
-		"No live test executes it. Callers are handler/notifications.go:134 and :192 only. It " +
-			"drives the unread BADGE, so drift is silent and permanently visible — a stuck count is " +
-			"the kind of bug a user reports and nobody can reproduce"},
-	{"MarkNotificationRead", "notifications.sql", unpinnedPin,
-		"No live test executes it. handler/notifications_test.go:332-363 drives the handler " +
-			"against a fake, including TestMarkNotificationReadCrossUserDenied — so the cross-user " +
-			"denial that matters is asserted where the SQL is not. Its `user_id = @user_id` is what " +
-			"stops one user marking another's notification read"},
-	{"ListAllNotifications", "notifications.sql", unpinnedPin,
-		"No live test executes it. Caller is handler/notifications.go:142, the ADMIN all-users " +
-			"view — the one read deliberately NOT owner-scoped, which is exactly why its pagination " +
-			"and ordering going wrong would be invisible rather than caught by a scoping assertion"},
-	{"CountAllNotifications", "notifications.sql", unpinnedPin,
-		"No live test executes it. Caller is handler/notifications.go:148, the admin view's total"},
+		"direct call in the 'write-seam round-trip' subtest, NOT mere fixture setup: it " +
+			"inserts four, asserts a raw count(*) reads four, prunes to two, and asserts the rows " +
+			"were genuinely removed"},
 
 	// ── agent_memory.sql — pinned end to end, recorded because a table of gaps is not the ──
 	// point. One live test covers all six with discriminating assertions in both directions;
@@ -978,13 +956,13 @@ var queryInventory = []queryPin{
 			"slow-but-alive CreateIssue mid-flight (M5 review reaper)"},
 
 	// ── notifications.sql — the PRD #333 D6 coalescing plumbing (M1 lands the queries; M3 uses them) ──
-	{"FindUnreadNotificationForRunKind", "notifications.sql", unpinnedPin,
-		"PRD #333 M3 drives this query, but only from notifysvc.NotifyIncidentalFinding — exercised " +
-			"by TestNotifyIncidentalFindingCoalescesPerRun in internal/notifysvc, which is NOT one of " +
-			"inventoryPackages (a non-live fake Store, not a store-package live-DB test). That test " +
-			"asserts the coalesce-vs-fire-fresh decision this query's read_at IS NULL + (user_id, " +
-			"run_id, kind) predicate makes: a miss inserts + DMs once, a hit bumps the payload. UNPINNED " +
-			"because no store/handler test executes it against a live DB; the honest pin lives in notifysvc."},
+	{"FindNotificationForRunKind", "notifications.sql", "TestFindNotificationForRunKindIgnoresReadStateLiveDB",
+		"direct call, both directions (PRD #1650 D4, renamed from FindUnreadNotificationForRunKind " +
+			"and widened to ignore read_at): a (user, run, kind) row whose read_at was set by a raw " +
+			"UPDATE is still returned (the regression that would re-fire the incidental-finding DM), " +
+			"the newest of two matching rows wins, and another run, another kind or another user " +
+			"each get pgx.ErrNoRows. The coalesce-vs-fire decision on top of it is asserted in " +
+			"internal/notifysvc (TestNotifyIncidentalFindingCoalescesPerRun, a fake Store)"},
 	{"UpdateNotificationPayload", "notifications.sql", unpinnedPin,
 		"PRD #333 M3 drives this query from the same notifysvc.NotifyIncidentalFinding coalescing path, " +
 			"exercised by TestNotifyIncidentalFindingCoalescesPerRun in internal/notifysvc (outside " +

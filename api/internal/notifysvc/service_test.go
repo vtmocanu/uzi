@@ -47,9 +47,9 @@ func (f *fakeStore) PruneNotificationsForUser(_ context.Context, arg store.Prune
 }
 
 // The two PRD #333 coalescing queries. The base fakeStore is used by the Notify tests
-// that never coalesce, so find reports "no coalescible row" (pgx.ErrNoRows) and update is
+// that never coalesce, so find reports "no latch row" (pgx.ErrNoRows) and update is
 // an unused stub; the stateful coalescingStore below exercises the real coalescing path.
-func (f *fakeStore) FindUnreadNotificationForRunKind(context.Context, store.FindUnreadNotificationForRunKindParams) (store.Notification, error) {
+func (f *fakeStore) FindNotificationForRunKind(context.Context, store.FindNotificationForRunKindParams) (store.Notification, error) {
 	return store.Notification{}, pgx.ErrNoRows
 }
 func (f *fakeStore) UpdateNotificationPayload(_ context.Context, arg store.UpdateNotificationPayloadParams) (store.Notification, error) {
@@ -136,7 +136,7 @@ func TestNotifyWithoutSlackRenderSkipsDelivery(t *testing.T) {
 	fs := &fakeStore{}
 	slk := &fakeSlacker{}
 	svc := New(fs, slk, 0, nil)
-	// Slacker is wired, but no SlackRender ⇒ inbox-only, no DM.
+	// Slacker is wired, but no SlackRender ⇒ row only, no DM.
 	if _, err := svc.Notify(context.Background(), Notification{UserID: uuid.New(), Kind: "x"}); err != nil {
 		t.Fatalf("Notify: %v", err)
 	}
@@ -148,7 +148,7 @@ func TestNotifyWithoutSlackRenderSkipsDelivery(t *testing.T) {
 	}
 }
 
-func TestNotifyNilSlackerIsInboxOnly(t *testing.T) {
+func TestNotifyNilSlackerIsRowOnly(t *testing.T) {
 	fs := &fakeStore{}
 	svc := New(fs, nil, 0, nil)
 	if _, err := svc.Notify(context.Background(), Notification{
@@ -232,9 +232,9 @@ func TestNotifyEarlyResetBuildsLoudSlackDM(t *testing.T) {
 		t.Fatalf("NotifyEarlyReset: %v", err)
 	}
 
-	// The durable inbox row is written (persist-first) with the new kind.
+	// The row is written (persist-first) with the new kind.
 	if !fs.insertCalled {
-		t.Fatalf("early-reset notification must persist a durable inbox row")
+		t.Fatalf("early-reset notification must persist its row")
 	}
 	if fs.inserted.UserID != user || fs.inserted.Kind != KindEarlyLimitReset {
 		t.Fatalf("inserted = user=%s kind=%q, want user=%s kind=%s", fs.inserted.UserID, fs.inserted.Kind, user, KindEarlyLimitReset)

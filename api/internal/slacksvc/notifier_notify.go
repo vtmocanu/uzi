@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"unicode"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/slack-go/slack"
@@ -12,15 +13,15 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/notifysvc"
 )
 
-// The generic inbox-notification DM seam (PRD #46): handleNotify delivers a
+// The generic notification DM seam (PRD #46): handleNotify delivers a
 // notifysvc-published notification to a user's DM and its Block Kit render.
 
-// handleNotify delivers one generic inbox notification to the user's DM (PRD #46
+// handleNotify delivers one generic notification to the user's DM (PRD #46
 // M2). It reuses the run-state path's delivery resolution + per-user opt-in gating
 // (GetSlackDeliveryForUser) but NOT its rendering: there is no run/repo context, so
 // it never calls GetSlackRunContext. Unlinked / opted-out / unconfirmed users drop
 // silently; every failure logs redacted and returns (a Slack problem never affects
-// the caller — the inbox row is already persisted).
+// the caller — the notification row is already persisted).
 func (n *Notifier) handleNotify(ctx context.Context, ev notifyEvent) {
 	target, err := n.store.GetSlackDeliveryForUser(ctx, ev.userID)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -53,8 +54,29 @@ func (n *Notifier) handleNotify(ctx context.Context, ev notifyEvent) {
 // must go so the fallback reads cleanly and can never leave a dangling mrkdwn token.
 var notifyFactMarkupStripper = strings.NewReplacer("*", "", "`", "", "_", "")
 
-// defaultNotifyLinkLabel is the deep link's label when the render sets no LinkLabel.
+// defaultNotifyLinkLabel is the deep link's label when the render sets no LinkLabel,
+// or one notifyLinkLabel rejects.
 const defaultNotifyLinkLabel = "Open in uzi"
+
+// notifyLinkLabel returns the label to render inside the deep link's <url|label>
+// markup: the caller's LinkLabel, trimmed and EscapeMrkdwn'd, or defaultNotifyLinkLabel
+// when it is empty or carries a character that could end or split the markup (`|`, `<`,
+// `>`), a control character (a newline included), or an invisible Unicode format
+// character (category Cf, e.g. U+202E, U+200B). Rejecting rather than stripping keeps a
+// hostile label from rendering as a plausible-looking fragment. Today every LinkLabel is
+// a fixed caller constant; this keeps a future dynamic label from breaking the link.
+func notifyLinkLabel(raw string) string {
+	l := strings.TrimSpace(raw)
+	if l == "" {
+		return defaultNotifyLinkLabel
+	}
+	for _, r := range l {
+		if r == '|' || r == '<' || r == '>' || unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+			return defaultNotifyLinkLabel
+		}
+	}
+	return EscapeMrkdwn(l)
+}
 
 // notificationBlocks builds the content-minimized DM for a generic notification as
 // Block Kit (message family D, PRD #268 M3). Shape, in order and only for the parts
@@ -78,10 +100,12 @@ const defaultNotifyLinkLabel = "Open in uzi"
 //     #292 Decision 6), because a `> ` prefix injected into a fence's interior lines corrupts
 //     Slack's code rendering.
 //   - the deep link keeps its raw <url|label> markup, but only when notifysvc.SafeLinkURL
-//     accepts it (absolute http(s), a host, no `<`, `>`, `|`, whitespace or control
-//     character); anything else drops the link block, since a forge-supplied URL (the
-//     ci_autofix_halted pipeline link, PRD #1650 D3) is not operator-controlled. The label
-//     is a caller-set fixed string (default "Open in uzi"), EscapeMrkdwn'd anyway. The
+//     accepts it (absolute http(s), a host, no userinfo, no `<`, `>`, `|`, whitespace,
+//     control or Unicode format character); anything else drops the link block, since a
+//     forge-supplied URL (the ci_autofix_halted pipeline link, PRD #1650 D3) is not
+//     operator-controlled. The label is a caller-set fixed string (default "Open in uzi"),
+//     EscapeMrkdwn'd anyway, and falls back to the default when notifyLinkLabel rejects
+//     it (a `|`, `<`, `>`, control or format character). The
 //     whole line is ScrubSecrets'd as a no-op-on-clean last line of defense.
 //
 // The fallback is built from FIXED/escaped fields only — never a raw model summary alone:
@@ -120,10 +144,7 @@ func notificationBlocks(ev notifyEvent) (blocks []slack.Block, fallback string) 
 	}
 
 	if url := notifysvc.SafeLinkURL(ev.link); url != "" {
-		label := defaultNotifyLinkLabel
-		if l := strings.TrimSpace(ev.linkLabel); l != "" {
-			label = EscapeMrkdwn(l)
-		}
+		label := notifyLinkLabel(ev.linkLabel)
 		blocks = append(blocks, slack.NewContextBlock("slack_notify_link",
 			slack.NewTextBlockObject(slack.MarkdownType, ScrubSecrets(fmt.Sprintf("🔗 <%s|%s>", url, label)), false, false)))
 	}

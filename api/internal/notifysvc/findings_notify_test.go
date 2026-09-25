@@ -4,16 +4,19 @@ import (
 	"context"
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // coalescingStore models the notifications table just enough to exercise the PRD #333 D6
-// per-run coalescing path: it holds the rows Insert writes, resolves the coalescible
-// unread row by (user, run, kind), and rewrites a row's payload on update. That lets a
+// per-run coalescing path: it holds the rows Insert writes, resolves the latch row by
+// (user, run, kind) whatever its read_at (mirroring FindNotificationForRunKind, PRD #1650
+// D4), and rewrites a row's payload on update. That lets a
 // table test assert the row COUNT stays 1 across a run's findings while the payload count
 // climbs — the coalescing invariant — without a database.
 type coalescingStore struct {
@@ -28,7 +31,6 @@ func (s *coalescingStore) InsertNotification(_ context.Context, arg store.Insert
 		Kind:    arg.Kind,
 		Payload: arg.Payload,
 		RunID:   arg.RunID,
-		// read_at is left NULL (pgtype zero) so the row counts as unread and is coalescible.
 	}
 	s.rows = append(s.rows, row)
 	return row, nil
@@ -38,11 +40,12 @@ func (s *coalescingStore) PruneNotificationsForUser(context.Context, store.Prune
 	return 0, nil
 }
 
-func (s *coalescingStore) FindUnreadNotificationForRunKind(_ context.Context, arg store.FindUnreadNotificationForRunKindParams) (store.Notification, error) {
-	// Newest-first, like the query's ORDER BY created_at DESC.
+func (s *coalescingStore) FindNotificationForRunKind(_ context.Context, arg store.FindNotificationForRunKindParams) (store.Notification, error) {
+	// Newest-first, like the query's ORDER BY created_at DESC. No read_at filter: the
+	// query ignores read state (PRD #1650 D4).
 	for i := len(s.rows) - 1; i >= 0; i-- {
 		r := s.rows[i]
-		if r.UserID == arg.UserID && r.Kind == arg.Kind && r.ReadAt.Valid == false &&
+		if r.UserID == arg.UserID && r.Kind == arg.Kind &&
 			r.RunID.Valid && uuid.UUID(r.RunID.Bytes) == arg.RunID {
 			return r, nil
 		}
@@ -78,8 +81,8 @@ func TestNotifyIncidentalFindingCoalescesPerRun(t *testing.T) {
 	user, run, repo := uuid.New(), uuid.New(), uuid.New()
 	f1, f2 := uuid.New(), uuid.New()
 
-	// (1) The run's FIRST finding: one inbox row inserted (unread → counts toward the
-	//     bell) and exactly one Slack DM with a populated SlackRender.
+	// (1) The run's FIRST finding: one row inserted and one Slack DM with a populated
+	//     SlackRender.
 	if err := svc.NotifyIncidentalFinding(context.Background(), IncidentalFindingNotifyInput{
 		UserID: user, RunID: run, RepoID: repo, RepoPath: "acme/widgets", FindingID: f1,
 		Link: "https://uzi.example/runs/" + run.String(),
@@ -91,9 +94,6 @@ func TestNotifyIncidentalFindingCoalescesPerRun(t *testing.T) {
 	}
 	if cs.rows[0].Kind != KindIncidentalFinding {
 		t.Errorf("row kind = %q, want %q", cs.rows[0].Kind, KindIncidentalFinding)
-	}
-	if cs.rows[0].ReadAt.Valid {
-		t.Error("the coalesced row must be unread so it counts toward the bell badge")
 	}
 	if slk.calls != 1 {
 		t.Fatalf("Slack fired %d times on the first finding, want exactly 1", slk.calls)
@@ -110,7 +110,7 @@ func TestNotifyIncidentalFindingCoalescesPerRun(t *testing.T) {
 		t.Errorf("first payload = %+v, want count=1 + the first finding id and run/repo anchors", p)
 	}
 
-	// (2) A SECOND finding on the SAME run: the existing unread row's payload bumps to
+	// (2) A SECOND finding on the SAME run: the existing latch row's payload bumps to
 	//     count=2 (the row COUNT stays 1) and NO new Slack DM fires.
 	if err := svc.NotifyIncidentalFinding(context.Background(), IncidentalFindingNotifyInput{
 		UserID: user, RunID: run, RepoID: repo, RepoPath: "acme/widgets", FindingID: f2,
@@ -133,9 +133,9 @@ func TestNotifyIncidentalFindingCoalescesPerRun(t *testing.T) {
 	}
 }
 
-func TestNotifyIncidentalFindingNilSlackerIsInboxOnly(t *testing.T) {
-	// With no Slacker wired the Slack seam is a no-op — never an error — and the inbox row
-	// still persists (the durable half). Mirrors TestNotifyNilSlackerIsInboxOnly.
+func TestNotifyIncidentalFindingNilSlackerIsRowOnly(t *testing.T) {
+	// With no Slacker wired the Slack seam is a no-op — never an error — and the row still
+	// persists. Mirrors TestNotifyNilSlackerIsRowOnly.
 	cs := &coalescingStore{}
 	svc := New(cs, nil, 0, nil)
 	if err := svc.NotifyIncidentalFinding(context.Background(), IncidentalFindingNotifyInput{
@@ -144,13 +144,13 @@ func TestNotifyIncidentalFindingNilSlackerIsInboxOnly(t *testing.T) {
 		t.Fatalf("NotifyIncidentalFinding with a nil slacker must not error: %v", err)
 	}
 	if len(cs.rows) != 1 {
-		t.Fatalf("the inbox row must still persist with no Slacker wired, rows=%d", len(cs.rows))
+		t.Fatalf("the row must still persist with no Slacker wired, rows=%d", len(cs.rows))
 	}
 }
 
 func TestNotifyIncidentalFindingCapsFindingIDs(t *testing.T) {
 	// The finding_ids slice is capped so a run cannot grow one row's jsonb without bound,
-	// while count keeps climbing (it is the badge number). The per-run capture cap is far
+	// while count keeps climbing. The per-run capture cap is far
 	// below maxCoalescedFindingIDs, so this only guards the pathological path.
 	cs := &coalescingStore{}
 	svc := New(cs, nil, 0, nil)
@@ -172,5 +172,53 @@ func TestNotifyIncidentalFindingCapsFindingIDs(t *testing.T) {
 	}
 	if len(p.FindingIDs) != maxCoalescedFindingIDs {
 		t.Errorf("finding_ids len = %d, want capped at %d", len(p.FindingIDs), maxCoalescedFindingIDs)
+	}
+}
+
+// TestNotifyIncidentalFindingLatchIgnoresReadState pins PRD #1650 D4 at the service: a
+// second finding on a run whose latch row carries a non-null read_at (a row read before the
+// inbox was retired) still coalesces with NO second DM, while a finding on a DIFFERENT run
+// misses the latch and inserts + DMs.
+func TestNotifyIncidentalFindingLatchIgnoresReadState(t *testing.T) {
+	cs := &coalescingStore{}
+	slk := &fakeSlacker{}
+	svc := New(cs, slk, 0, nil)
+	user, run, repo := uuid.New(), uuid.New(), uuid.New()
+	notify := func(runID uuid.UUID) {
+		t.Helper()
+		if err := svc.NotifyIncidentalFinding(context.Background(), IncidentalFindingNotifyInput{
+			UserID: user, RunID: runID, RepoID: repo, RepoPath: "acme/widgets", FindingID: uuid.New(),
+		}); err != nil {
+			t.Fatalf("NotifyIncidentalFinding: %v", err)
+		}
+	}
+
+	notify(run)
+	if len(cs.rows) != 1 || slk.calls != 1 {
+		t.Fatalf("first finding: rows=%d dms=%d, want 1 and 1", len(cs.rows), slk.calls)
+	}
+	cs.rows[0].ReadAt = pgtype.Timestamptz{Time: time.Now(), Valid: true}
+
+	notify(run)
+	if len(cs.rows) != 1 {
+		t.Fatalf("second finding on the same run after the latch row was read: rows=%d, want 1 (coalesced)", len(cs.rows))
+	}
+	if slk.calls != 1 {
+		t.Fatalf("second finding on the same run after the latch row was read sent %d DMs total, want 1", slk.calls)
+	}
+	if p := decodeFindingPayload(t, cs.rows[0].Payload); p.Count != 2 {
+		t.Errorf("coalesced count = %d, want 2", p.Count)
+	}
+
+	otherRun := uuid.New()
+	notify(otherRun)
+	if len(cs.rows) != 2 {
+		t.Fatalf("finding on a different run: rows=%d, want 2 (a fresh latch row)", len(cs.rows))
+	}
+	if slk.calls != 2 {
+		t.Fatalf("finding on a different run: %d DMs total, want 2", slk.calls)
+	}
+	if got := uuid.UUID(cs.rows[1].RunID.Bytes); got != otherRun {
+		t.Errorf("new row anchored to run %s, want %s", got, otherRun)
 	}
 }
