@@ -5656,3 +5656,97 @@ describe("CodexExecutor: per-run command cache (issue #1598)", () => {
     assert.throws(() => commandSandboxArgv(WORKSPACE, WORKSPACE, "/bin/true", [], "/tmp/uzi-codex-command-x", "required", `${CACHE_DIR}/../x`), /cache/);
   });
 });
+
+describe("Codex completion interlock", () => {
+  const doneEpoch = (n: number): Responder => resumedEpochResponder("th-1", `tn-${n}`, (t, th, tn) => {
+    t.push(toolCall(n, "signal_done", { milestones_completed: ["m1"] }, th, tn, `done-${n}`))
+      .push(turnCompleted("completed", th, tn));
+  });
+  const firstEpoch = (n: number): Responder => epochResponder("th-1", `tn-${n}`, (t, th, tn) => {
+    t.push(toolCall(n, "signal_done", { milestones_completed: ["m1"] }, th, tn, `done-${n}`))
+      .push(turnCompleted("completed", th, tn));
+  });
+
+  it("checkpoints before the server attempt and reworks on the same thread", async () => {
+    const rig = makeMultiEpochRig([firstEpoch(1), doneEpoch(2)]);
+    const order: string[] = [];
+    let count = 0;
+    const { ctx } = makeCtx({
+      kind: "issue", completionInterlock: true,
+      frozenMilestones: [{ id: "m2", title: "Remaining" }],
+      checkpoint: async (opts) => { assert.equal(opts.reap, true); order.push("checkpoint"); },
+      worktreeFingerprint: async () => { order.push("fingerprint"); return "head-1\n M x"; },
+      recordCompletionAttempt: async (args) => {
+        order.push("attempt");
+        assert.deepEqual(args, { declared: ["m1"], head: "head-1", worktreeFingerprint: "head-1\n M x" });
+        return { unmet: count++ === 0 ? ["m2"] : [], attemptCount: count };
+      },
+    });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "completion rework");
+    assert.equal(result.completionHeld, undefined);
+    assert.deepEqual(order, ["checkpoint", "fingerprint", "attempt", "checkpoint", "fingerprint", "attempt"]);
+    assert.equal(rig.providerLaunches(), 2);
+    assert.equal(rig.epochs[0]!.disposed(), 1);
+    assert.ok(rig.sessionOps.persist >= 2);
+    assert.ok(rig.epochs[1]!.transport.requests.some((r) => r.method === "thread/resume"));
+    assert.match(JSON.stringify(rig.epochs[1]!.transport.requests.find((r) => r.method === "turn/start")?.params), /m2: Remaining/);
+  });
+
+  it("asks at three identical attempts, continues with guidance, then holds on expiry", async () => {
+    const rig = makeMultiEpochRig([firstEpoch(1), doneEpoch(2), doneEpoch(3), doneEpoch(4), doneEpoch(5), doneEpoch(6)]);
+    let attempts = 0;
+    let questions = 0;
+    const holds: string[] = [];
+    const { ctx } = makeCtx({
+      kind: "issue", completionInterlock: true, config: { max_iterations: 8 },
+      checkpoint: async () => {},
+      worktreeFingerprint: async () => "same-head\n",
+      recordCompletionAttempt: async () => ({ unmet: ["m2"], attemptCount: ++attempts }),
+      askCompletionQuestion: async (unmet) => {
+        assert.deepEqual(unmet, ["m2"]);
+        return ++questions === 1 ? { outcome: "continue", guidance: "Check docs" } : { outcome: "expired" };
+      },
+      enterCompletionHold: async (reason) => { holds.push(reason); return true; },
+    });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "completion hold");
+    assert.equal(attempts, 6);
+    assert.equal(questions, 2);
+    assert.equal(holds.length, 1);
+    assert.deepEqual(result.completionHeld, { reason: holds[0] });
+    assert.match(JSON.stringify(rig.epochs[3]!.transport.requests.find((r) => r.method === "turn/start")?.params), /Check docs/);
+  });
+
+  it("holds on post-attempt iteration and server budget exhaustion", async () => {
+    for (const budget of ["iteration", "server"] as const) {
+      const rig = makeMultiEpochRig([firstEpoch(1), doneEpoch(2)]);
+      let attempts = 0;
+      const holds: string[] = [];
+      const { ctx } = makeCtx({
+        kind: "issue", completionInterlock: true, config: { max_iterations: budget === "iteration" ? 1 : 5 },
+        checkpoint: async () => {},
+        recordCompletionAttempt: async () => ({ unmet: ["m2"], attemptCount: ++attempts }),
+        reportIteration: async (iteration) => budget === "server" && iteration === 2
+          ? { budgetExhausted: true } : undefined,
+        enterCompletionHold: async (reason) => { holds.push(reason); return true; },
+      });
+      const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, `${budget} hold`);
+      assert.equal(attempts, 1);
+      assert.deepEqual(result.completionHeld, { reason: holds[0] });
+      assert.equal(holds.length, 1);
+    }
+  });
+
+  it("leaves legacy and interactive done outside the interlock", async () => {
+    for (const flag of [{ completionInterlock: false }, { completionInterlock: true, interactive: true }]) {
+      const rig = makeMultiEpochRig([firstEpoch(1)]);
+      let attempts = 0;
+      const { ctx } = makeCtx({
+        kind: "issue", ...flag,
+        recordCompletionAttempt: async () => { attempts++; return { unmet: ["m2"], attemptCount: 1 }; },
+      });
+      const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "legacy completion");
+      assert.equal(attempts, 0);
+      assert.equal(result.completionHeld, undefined);
+    }
+  });
+});

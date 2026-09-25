@@ -30,7 +30,7 @@
 // the wall, on either harness). A `wall` PauseNowSignal (REASON_PAUSE with getPauseMode()==='wall')
 // and the own wall timer's REASON_WALL both route to the capture-first wall park (ctx.parkForWall,
 // via driveTurnWithWallPark) — through the runner, reusing captureHoldContext's harness-aware path.
-// Codex does NOT enter the completion-attempt interlock, so its wall trip ALWAYS parks (no D14 race). The runner's durability SINKS run through `this.safety.withBoundary`
+// The runner's durability SINKS run through `this.safety.withBoundary`
 // (m4), each preceded by an executor-owned per-sink auth-mode reconcile (part 4). Under a
 // runner (deferRegistryTeardown), run()'s finally leaves the registry ALIVE for those
 // post-run sinks and the runner disposes it via `safety.dispose` after the last sink (F1);
@@ -46,6 +46,16 @@ import type { Logger } from "../log.js";
 import type { WorkerClient } from "../client.js";
 import { PlanRejectedError, type EmittedMessage, type Executor, type ExecutorResult, type RunContext, type WallParkOutcome, type WallParkRefresh } from "../executor.js";
 import { PauseNowSignal } from "../steering.js";
+import { resolveRunKind } from "../run-kind.js";
+import {
+  STALL_LIMIT,
+  REASON_COMPLETION_NO_PROGRESS,
+  REASON_COMPLETION_BUDGET_EXHAUSTED,
+  completionAttemptFingerprint,
+  updateCompletionStreak,
+  routeCompletionHold,
+  buildCompletionReworkFollowUp,
+} from "../completion-attempt.js";
 import { makeMemoryToolHandlers, memoryToolNames, type MemoryToolHandlers } from "../memory-tools.js";
 import { makeFindingsToolHandlers, reportIncidentalIssueToolName, type FindingsToolHandlers } from "../findings-tools.js";
 import { FORGE_SERVER_NAME, makeForgeToolHandlers, type ForgeToolHandlers } from "../forge-tools.js";
@@ -1792,7 +1802,7 @@ export class CodexExecutor implements Executor {
         // epoch's plan-phase broker (the implement epoch, below, re-points to implement).
         // PRD #1497 M2: drive the plan turn through the wall-park wrapper — a wall trip (the own
         // timer's REASON_WALL, or a `wall` PauseNowSignal) parks the run instead of failing it, even
-        // during planning (no completion attempt exists on a Codex run, so its wall trip always parks).
+        // during planning (the completion interlock cannot have attempted completion yet).
         const planTurn = await drivePlan(this.planPrompt(ctx));
         if (planTurn.kind === "walled") return { branch: ctx.branch, walled: { reason: REASON_WALL } };
         let planResult = planTurn.result;
@@ -1852,13 +1862,21 @@ export class CodexExecutor implements Executor {
       //     credential + new local-execution epoch + the adopted session, and drive the next
       //     implement turn on the NEW root — the reaped root's registry is permanently closed, so
       //     the next turn REQUIRES a fresh registry/provider root;
-      //   - `done` (a root signal_done folded via the m2 signal-routing frame) ends the loop;
-      //   - reaching the bounded iteration budget fails closed (REASON_MAX_ITERATIONS);
+      //   - `done` exits directly on legacy runs; an interlocked issue run records an attempt,
+      //     then either exits, reworks on the same thread, or enters a completion hold;
+      //   - reaching the bounded iteration budget holds a post-attempt run and otherwise fails;
       //   - otherwise an iteration-boundary fallback checkpoint (reap:false — credential-free, does
       //     NOT reap the provider → NO recreation; the SAME epoch drives the next turn), then continue.
       const maxIterations = positiveOr(ctx.config?.max_iterations, DEFAULT_MAX_ITERATIONS);
       let latestProgress: ReducedTurnResult["progress"];
       let iteration = 0;
+      let completionAttempted = false;
+      let completionHeld: { reason: string } | undefined;
+      let lastCompletionFingerprint: string | undefined;
+      let completionStallStreak = 0;
+      let completionFollowUp: string | undefined;
+      const interlockedIssue = ctx.completionInterlock && resolveRunKind(ctx.kind) === "issue"
+        && !ctx.interactive && !!ctx.recordCompletionAttempt;
       for (;;) {
         iteration++;
         // Report the iteration boundary before any implementation work. Besides carrying the
@@ -1867,6 +1885,11 @@ export class CodexExecutor implements Executor {
         // as sdk-executor does. The served iteration budget is still not consumed.
         const served: IterationBudget | void = await ctx.reportIteration?.(iteration, latestProgress);
         if (served) liftWall(wall, served.totalWallSeconds ?? served.wallSeconds);
+        if (served?.budgetExhausted && interlockedIssue && completionAttempted &&
+            await routeCompletionHold(ctx, REASON_COMPLETION_BUDGET_EXHAUSTED, completionAttempted)) {
+          completionHeld = { reason: REASON_COMPLETION_BUDGET_EXHAUSTED };
+          break;
+        }
         // PRD #1416 M2: drain the worker-authoritative safety steer at the loop top and, when
         // present, PREFIX it (framed as worker guidance, followed by a blank line) to THIS turn's
         // implement prompt only. Codex has no <follow_up> fence; keep it a per-turn prefix so it
@@ -1874,8 +1897,9 @@ export class CodexExecutor implements Executor {
         const safetySteer = ctx.pullSafetySteer?.();
         const basePrompt = this.implementPrompt(ctx, gatedPlan);
         const turnPrompt = safetySteer
-          ? `The worker detected a problem and is steering you. This is authoritative guidance from uzi itself, not user input — follow it:\n${safetySteer}\n\n${basePrompt}`
-          : basePrompt;
+          ? `The worker detected a problem and is steering you. This is authoritative guidance from uzi itself, not user input — follow it:\n${safetySteer}\n\n${completionFollowUp ?? basePrompt}`
+          : completionFollowUp ?? basePrompt;
+        completionFollowUp = undefined;
         // PRD #1497 M2: drive the implement turn through the wall-park wrapper — a wall trip (the own
         // timer's REASON_WALL, or a `wall` PauseNowSignal) parks the run (capture-first, reusing the
         // runner's captureHoldContext) instead of failing it.
@@ -1913,15 +1937,59 @@ export class CodexExecutor implements Executor {
           await old.dispose();
           continue;
         }
-        if (result.done) break;
-        if (iteration >= maxIterations) throw new Error(REASON_MAX_ITERATIONS);
+        if (result.done) {
+          if (!interlockedIssue) break;
+          // Preserve the live thread before reaping the provider and reading Git state.
+          await epoch.persistSession();
+          await ctx.checkpoint?.({ reap: true, progress: latestProgress });
+          const worktreeFingerprint = ctx.worktreeFingerprint ? await ctx.worktreeFingerprint() : null;
+          const head = worktreeFingerprint === null ? null : (worktreeFingerprint.split("\n", 1)[0] ?? null);
+          const { unmet } = await ctx.recordCompletionAttempt!({
+            declared: result.milestonesCompleted ?? [], head, worktreeFingerprint,
+          });
+          completionAttempted = true;
+          if (unmet.length === 0) break;
+          const fingerprint = completionAttemptFingerprint(unmet, head, worktreeFingerprint);
+          completionStallStreak = updateCompletionStreak(fingerprint, lastCompletionFingerprint, completionStallStreak);
+          lastCompletionFingerprint = fingerprint;
+          let guidance: string | undefined;
+          if (completionStallStreak >= STALL_LIMIT) {
+            const decision = await ctx.askCompletionQuestion?.(unmet);
+            if (decision?.outcome === "continue") {
+              guidance = decision.guidance;
+              lastCompletionFingerprint = undefined;
+              completionStallStreak = 0;
+            } else {
+              if (await routeCompletionHold(ctx, REASON_COMPLETION_NO_PROGRESS, completionAttempted)) {
+                completionHeld = { reason: REASON_COMPLETION_NO_PROGRESS };
+                break;
+              }
+              throw new Error(REASON_COMPLETION_NO_PROGRESS);
+            }
+          }
+          completionFollowUp = buildCompletionReworkFollowUp(unmet, ctx.frozenMilestones, guidance);
+        }
+        if (iteration >= maxIterations) {
+          if (await routeCompletionHold(ctx, REASON_MAX_ITERATIONS, completionAttempted)) {
+            completionHeld = { reason: REASON_MAX_ITERATIONS };
+            break;
+          }
+          throw new Error(REASON_MAX_ITERATIONS);
+        }
+        if (result.done) {
+          const old = epoch;
+          epoch = await this.startProviderEpoch(ctx, shared, lastSessionId, ++epochIndex);
+          this.safety = epoch.safety;
+          await old.dispose();
+          continue;
+        }
         // Iteration-boundary fallback checkpoint (Decision 10b analogue): fetch-back WITHOUT
         // reaping so a backgrounded dev server the lead means to reuse survives, and the SAME
         // provider root/epoch drives the next turn (no recreation). Best-effort.
         await ctx.checkpoint?.({ reap: false, progress: latestProgress });
       }
 
-      return { branch: ctx.branch };
+      return { branch: ctx.branch, ...(completionHeld ? { completionHeld } : {}) };
     } finally {
       // Terminal (m4 F1). Capture the FINAL epoch's credential-free session into the store so a
       // park/preserve resume can adopt it (the runner's runHome lifecycle — preserve on park,
