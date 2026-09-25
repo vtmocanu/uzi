@@ -703,8 +703,7 @@ nothing a manual start cannot.
   `WHEN`, `NEXT`, `ON`, `HARNESS`); `SOURCE` is the catalog slug for a **default**
   schedule (the `catalog_slug` of an `origin: "default"` row) and `custom` for one you
   authored. `--json` dumps the raw array (no `SOURCE` field; read `origin` and
-  `catalog_slug`). Each element's `target` is the
-  string enum `issue` | `sweep` | `prompt` (a plain string, NOT a nested object),
+  `catalog_slug`). Each element's `target` is the string enum `issue` | `sweep` | `prompt` (a plain string, NOT a nested object),
   and a sweep's label selector is the top-level `labels` array. So the correct way
   to answer "is there a sweep schedule, and on which label(s)?" is
   `uzi schedule list --json | jq '[.[] | select(.target=="sweep") | {id, labels, enabled}]'`.
@@ -810,10 +809,11 @@ nothing a manual start cannot.
   failed label check or create prints a `WARNING` and proceeds (the enable otherwise reads
   nothing from the forge).
 - `uzi schedule reset <schedule-id>` — restore a **default** schedule's edited fields to the
-  builtin catalog values: cron, timezone, model, auto-approve, wait-on-limit, MR rework,
-  max issues and output mode return to the catalog values, `apply-model-to-agents` resets
-  to `false`, and the guidance, the harness pin and the credential override are cleared.
-  It also clears the customized flag. The catalog-owned prompt and labels are not touched.
+  builtin catalog values: cron, timezone, model, auto-approve, wait-on-limit, max issues
+  and output mode return to the catalog values, `apply-model-to-agents` resets to `false`,
+  and MR rework, the guidance, the harness pin and the credential override are cleared to
+  inherit. It also clears the customized flag and re-activates the schedule on its catalog
+  cadence (a parked schedule fires again). The catalog-owned prompt and labels are not touched.
   Only a default-origin schedule can be reset; a user-origin one is a `409`.
 - `uzi schedule clone <schedule-id> [--repo <repo-id>]` — copy a schedule into a new, fully
   editable schedule you own. Cloning a **default** schedule lifts its catalog prompt lock (the

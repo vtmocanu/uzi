@@ -64,10 +64,11 @@ func newScheduleResetCmd(env Env, gf *globalFlags) *cobra.Command {
 		Use:   "reset <schedule-id>",
 		Short: "Reset a default schedule's edited fields back to the catalog defaults",
 		Long: "Restore a default-origin schedule's editable fields to the builtin catalog values:\n" +
-			"cron, timezone, model, auto-approve, wait-on-limit, MR rework, max issues and output\n" +
-			"mode return to the catalog values, apply-model-to-agents is set to false, and the\n" +
-			"guidance, the harness pin and the credential override are cleared. The customized\n" +
-			"flag is cleared too. The catalog-owned prompt and labels are not touched. Only a\n" +
+			"cron, timezone, model, auto-approve, wait-on-limit, max issues and output mode return\n" +
+			"to the catalog values, apply-model-to-agents is set to false, and MR rework, the\n" +
+			"guidance, the harness pin and the credential override are cleared to inherit. The\n" +
+			"customized flag is cleared and the schedule is re-activated on its catalog cadence\n" +
+			"(a parked schedule fires again). The catalog-owned prompt and labels are not touched. Only a\n" +
 			"default-origin schedule can be reset; a user-origin one is a conflict (there is\n" +
 			"nothing to reset to).",
 		Args: cobra.ExactArgs(1),
