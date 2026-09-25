@@ -24,7 +24,9 @@
 #      elsewhere in [Unreleased] (the base never repeated it);
 #   M. deleting EVERY copy of a heading the base repeats is refused (HEAD must keep one);
 #   N. deleting the FIRST copy of a repeated heading (its bullet stranded under the section
-#      above) is refused: only exactly what --collapse makes is accepted.
+#      above) is refused: only exactly what --collapse makes is accepted;
+#   O. a branch whose later commit rewords its own earlier CHANGELOG bullet stops with exit 5
+#      instead of a union keeping both wordings (#1644).
 set -eu
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -327,5 +329,22 @@ commit_push bn 'branch n'
 run bn 217 --no-push --gate none
 [ "$rc" -eq 9 ] || fail "N: deleting the first copy of a repeated heading returned rc=$rc, want 9: $(cat "$WORK/out.217")"
 grep -qx -- '-### Fixed' "$WORK/out.217" || fail "N: the removed heading was not printed: $(cat "$WORK/out.217")"
+
+# O. commit 1 adds a bullet, commit 2 rewords it; main adds its own bullet at the same spot.
+#    Stop 1 (distinct bullets) is unioned; stop 2 (the reword) is refused: exit 5.
+git -C "$SEED" switch -q main
+printf '## [Unreleased]\n\n### Fixed\n\n- **one**\n\n## [0.1.0] - 2026-01-01\n\n- **old**\n' > "$SEED/CHANGELOG.md"
+git -C "$SEED" commit -qam 'reset changelog'; git -C "$SEED" push -q origin main
+mk_branch bo
+cl_one() { awk -v add="$2" '{print} $0=="- **one**"{print add}' "$1" > "$1.tmp" && mv "$1.tmp" "$1"; }
+cl_one "$SEED/CHANGELOG.md" '- **note, first wording**'; git -C "$SEED" commit -qam 'bo 1'
+gsed -i 's/- \*\*note, first wording\*\*/- **note, second wording**/' "$SEED/CHANGELOG.md"; commit_push bo 'bo 2'
+git -C "$SEED" switch -q main; cl_one "$SEED/CHANGELOG.md" '- **main o**'; git -C "$SEED" commit -qam 'main o'; git -C "$SEED" push -q origin main
+run bo 219 --no-push --gate none
+[ "$rc" -eq 5 ] || fail "O: a reworded bullet returned rc=$rc, want 5: $(cat "$WORK/out.219")"
+grep -q 'auto-resolved the CHANGELOG.md conflict' "$WORK/out.219" || fail "O: the first (distinct) stop was not unioned: $(cat "$WORK/out.219")"
+grep -qF 'a side deletes or rewords a line' "$WORK/out.219" || fail "O: the reword refusal was not printed: $(cat "$WORK/out.219")"
+[ -d "$(git -C "$WORK/wt-219" rev-parse --git-path rebase-merge)" ] || fail "O: worktree not left mid-rebase"
+git -C "$WORK/wt-219" rebase --abort
 
 echo "PASS land-prep base move: disjoint tolerated without re-gate, overlap/conflict refused, CHANGELOG union auto-resolve, heading collapse and guard"

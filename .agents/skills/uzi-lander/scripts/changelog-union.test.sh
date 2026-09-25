@@ -83,6 +83,7 @@ cat > "$WORK/dup.md" <<'EOF'
 
 - **main fix**
   main desc
+||||||| parent
 =======
 - **branch fix**
   branch desc
@@ -138,6 +139,7 @@ cat > "$WORK/lossy.md" <<'EOF'
 
 <<<<<<< HEAD
 - **keep me**
+||||||| parent
 =======
 - **branch fix**
 >>>>>>> abc1234 (branch)
@@ -161,7 +163,7 @@ set -e
 cmp -s "$WORK/lossy.orig" "$WORK/lossy.md" || fail "a lossy resolution modified the file"
 grep -qF 'keep me' "$WORK/lossy.out" || fail "the lost line was not named: $(cat "$WORK/lossy.out")"
 # ...and an unterminated conflict block is refused the same way.
-printf '## [Unreleased]\n\n<<<<<<< HEAD\n- a\n=======\n- b\n' > "$WORK/open.md"
+printf '## [Unreleased]\n\n<<<<<<< HEAD\n- a\n||||||| parent\n=======\n- b\n' > "$WORK/open.md"
 cp "$WORK/open.md" "$WORK/open.orig"
 set +e
 bash "$SCRIPT" "$WORK/open.md" > "$WORK/open.out" 2>&1
@@ -180,6 +182,7 @@ cat > "$WORK/shared.md" <<'EOF'
 <<<<<<< HEAD
 - **shared fix**
 - **main only**
+||||||| parent
 =======
 - **shared fix**
 - **branch only**
@@ -192,7 +195,7 @@ rc=$?
 set -e
 [ "$rc" -eq 1 ] || fail "a line on both sides returned rc=$rc, want 1: $(cat "$WORK/shared.out")"
 cmp -s "$WORK/shared.orig" "$WORK/shared.md" || fail "a line on both sides modified the file"
-grep -qF 'line on both sides of the conflict ending at line 11: - **shared fix**' "$WORK/shared.out" || fail "the shared line was not named: $(cat "$WORK/shared.out")"
+grep -qF 'line on both sides of the conflict ending at line 12: - **shared fix**' "$WORK/shared.out" || fail "the shared line was not named: $(cat "$WORK/shared.out")"
 # 3c. ...the same for HEADINGS: each side carries `## [Unreleased]` / `### Fixed` / its own
 #     bullet, which a union would turn into two [Unreleased] sections.
 cat > "$WORK/twosec.md" <<'EOF'
@@ -204,6 +207,7 @@ cat > "$WORK/twosec.md" <<'EOF'
 ### Fixed
 
 - **main only**
+||||||| parent
 =======
 ## [Unreleased]
 
@@ -232,6 +236,7 @@ cat > "$WORK/twover.md" <<'EOF'
 ## [0.2.0] - 2026-02-01
 
 - **main only**
+||||||| parent
 =======
 ## [0.2.0] - 2026-02-02
 
@@ -247,7 +252,7 @@ set -e
 cmp -s "$WORK/twover.orig" "$WORK/twover.md" || fail "a repeated version heading modified the file"
 grep -qF 'repeats version heading(s) ## [0.2.0]' "$WORK/twover.out" || fail "the repeated version was not named: $(cat "$WORK/twover.out")"
 # 3e. Positive: distinct bullets on the two sides still union.
-printf '## [Unreleased]\n\n### Fixed\n\n<<<<<<< HEAD\n- **main only**\n=======\n- **branch only**\n>>>>>>> abc (b)\n' > "$WORK/distinct.md"
+printf '## [Unreleased]\n\n### Fixed\n\n<<<<<<< HEAD\n- **main only**\n||||||| parent\n=======\n- **branch only**\n>>>>>>> abc (b)\n' > "$WORK/distinct.md"
 bash "$SCRIPT" "$WORK/distinct.md" > "$WORK/distinct.out" 2>&1 || fail "distinct bullets did not union: $(cat "$WORK/distinct.out")"
 [ "$(printf '## [Unreleased]\n\n### Fixed\n\n- **main only**\n- **branch only**\n\n')" = "$(cat "$WORK/distinct.md"; echo)" ] || fail "distinct union wrong: $(cat "$WORK/distinct.md")"
 
@@ -265,6 +270,7 @@ cat > "$WORK/sub.md" <<'EOF'
 ### Fixed
 
 - **main fix**
+||||||| parent
 =======
 ### Changed
 
@@ -335,6 +341,7 @@ cat > "$WORK/relsub.md" <<'EOF'
 ### Fixed
 
 - **main old**
+||||||| parent
 =======
 ### Fixed
 
@@ -348,6 +355,41 @@ rc=$?
 set -e
 [ "$rc" -eq 1 ] || fail "a shared ### heading in a released section returned rc=$rc, want 1: $(cat "$WORK/relsub.out")"
 cmp -s "$WORK/relsub.orig" "$WORK/relsub.md" || fail "a shared released-section heading modified the file"
+
+# 3i. A later commit REWORDS its own earlier bullet (#1644): the diff3 base holds the old
+#     wording, the commit's side the new. A union would keep both: refused, file untouched.
+cat > "$WORK/reword.md" <<'EOF'
+## [Unreleased]
+
+### Fixed
+
+<<<<<<< HEAD
+- **main fix**
+- **note, first wording**
+||||||| parent of abc1234 (branch)
+- **note, first wording**
+=======
+- **note, second wording**
+>>>>>>> abc1234 (branch)
+EOF
+cp "$WORK/reword.md" "$WORK/reword.orig"
+set +e
+bash "$SCRIPT" "$WORK/reword.md" > "$WORK/reword.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 1 ] || fail "a reworded bullet returned rc=$rc, want 1: $(cat "$WORK/reword.out")"
+cmp -s "$WORK/reword.orig" "$WORK/reword.md" || fail "a reworded bullet modified the file"
+grep -qF 'a side deletes or rewords a line of the conflict ending at line 12: - **note, first wording**' "$WORK/reword.out" || fail "the reworded line was not named: $(cat "$WORK/reword.out")"
+# 3j. A block with no diff3 base section cannot be checked for that: refused, file untouched.
+printf '## [Unreleased]\n\n<<<<<<< HEAD\n- **a**\n=======\n- **b**\n>>>>>>> x (y)\n' > "$WORK/nobase.md"
+cp "$WORK/nobase.md" "$WORK/nobase.orig"
+set +e
+bash "$SCRIPT" "$WORK/nobase.md" > "$WORK/nobase.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 1 ] || fail "a block without a base section returned rc=$rc, want 1"
+cmp -s "$WORK/nobase.orig" "$WORK/nobase.md" || fail "a block without a base section modified the file"
+grep -qF 'no diff3 base section' "$WORK/nobase.out" || fail "missing base not named: $(cat "$WORK/nobase.out")"
 
 # 4. No markers: success, file untouched (even with a duplicate heading).
 printf '## [Unreleased]\n\n### Fixed\n\n- a\n\n### Fixed\n\n- b\n' > "$WORK/clean.md"
@@ -431,4 +473,4 @@ set -e
 [ "$rc" -eq 1 ] || fail "--collapse on a conflicted file returned rc=$rc, want 1"
 cmp -s "$WORK/lossy.orig" "$WORK/mk.md" || fail "--collapse modified a conflicted file"
 
-echo "PASS changelog-union: union, duplicate-heading collapse, lossy refusal, both-sides and repeated-version refusals, shared ### subsections, no-op, --collapse"
+echo "PASS changelog-union: union, duplicate-heading collapse, lossy refusal, both-sides and repeated-version refusals, shared ### subsections, reword and no-base refusals, no-op, --collapse"

@@ -44,8 +44,9 @@
 #      rebase continued, commit by commit; the CHANGELOG guard (exit 9) still runs after.
 #      The helper refuses (so this stays exit 5) when a bullet, continuation line or `## `
 #      heading appears on both sides of one conflict block (a shared `### ` subsection
-#      heading under [Unreleased] is allowed and folded), or the union would repeat a
-#      `## [<version>]` heading.
+#      heading under [Unreleased] is allowed and folded), when a side deletes or rewords a
+#      line of the diff3 base section (rebases run with merge.conflictStyle=diff3), or when
+#      the union would repeat a `## [<version>]` heading.
 #      After every completed rebase that leaves CHANGELOG.md in the branch diff, repeated
 #      `### <Section>` headings under [Unreleased] are collapsed in a separate
 #      "chore: collapse duplicate CHANGELOG section headings" commit (only if it changes
@@ -87,7 +88,7 @@ while [ $# -gt 0 ]; do
     --no-rework-check) REWORK_CHECK=0; shift;;
     --allow-changelog-removals) ALLOW_CL_RM=1; shift;;
     --repo-root) ROOT="${2:?}"; shift 2;;
-    -h|--help) sed -n '2,76p' "$0"; exit 2;;
+    -h|--help) sed -n '2,77p' "$0"; exit 2;;
     -*) echo "unknown flag: $1" >&2; exit 2;;
     *) if [ -z "$REPO" ]; then REPO="$1"; elif [ -z "$PR" ]; then PR="$1"; else echo "unexpected arg: $1" >&2; exit 2; fi; shift;;
   esac
@@ -225,7 +226,7 @@ union_continue() {
     fi
     git add CHANGELOG.md || return 1
     log "auto-resolved the CHANGELOG.md conflict at $(git rev-parse --short REBASE_HEAD 2>/dev/null || echo '?') (union of both sides)"
-    if GIT_EDITOR=true git rebase --continue >/dev/null 2>&1; then return 0; fi
+    if GIT_EDITOR=true git -c merge.conflictStyle=diff3 rebase --continue >/dev/null 2>&1; then return 0; fi
   done
   return 1
 }
@@ -263,7 +264,7 @@ try_base_move() {
     return 1
   fi
   pre=$(git rev-parse HEAD)
-  if ! git rebase "$new" --quiet >/dev/null 2>&1 && ! union_continue; then
+  if ! git -c merge.conflictStyle=diff3 rebase "$new" --quiet >/dev/null 2>&1 && ! union_continue; then
     # Restoring is load-bearing: exit 8 promises the worktree as it was. Any step that fails
     # to get back to $pre is an instrument failure, never a quiet "back at".
     if rebase_in_progress && ! git rebase --abort >/dev/null 2>&1; then
@@ -322,7 +323,7 @@ fi
 # ---- rebase -----------------------------------------------------------------------------
 if [ "$SKIP_REBASE" -eq 0 ]; then
   # A CHANGELOG.md-only stop is resolved by union_continue; anything else stops as exit 5.
-  if git rebase "origin/$BASE" --quiet || union_continue; then
+  if git -c merge.conflictStyle=diff3 rebase "origin/$BASE" --quiet || union_continue; then
     log "rebased onto origin/$BASE ($(git rev-list --count "origin/$BASE..HEAD") commits)"
     collapse_changelog "origin/$BASE" || exit 3
   else

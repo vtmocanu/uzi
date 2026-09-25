@@ -8,7 +8,10 @@
 # (`|||||||` .. `=======`) is dropped. FAIL-CLOSED: when a bullet, a continuation line or a
 # `## [...]` heading appears on BOTH sides of one conflict block, the union would duplicate
 # it, so the helper refuses and leaves the file for a human (land-prep then stops with exit
-# 5). A shared `### <Section>` subsection heading is allowed (each side bringing its own
+# 5). Each block must carry a diff3 base section (land-prep rebases with
+# merge.conflictStyle=diff3): a non-blank base line missing from either side means that side
+# deleted or REWORDED it (a later commit editing its own earlier bullet), and a union would
+# keep both wordings, so that refuses too, as does a block with no base section. A shared `### <Section>` subsection heading is allowed (each side bringing its own
 # `### Fixed` is the common case) only when the block sits inside `## [Unreleased]`: there
 # a repeated `### <Section>` is collapsed into its first occurrence (its bullets move under
 # it). Blank lines left between bullet items are dropped. A file with no conflict markers is left untouched.
@@ -103,23 +106,28 @@ if ! awk -v before="$tmpd/before" '
   BEGIN { st = 0 }  # 0 outside, 1 first side, 2 diff3 base, 3 second side
   st == 0 && /^## / { unrel = ($0 ~ /^## \[Unreleased\]/) }
   /^<<<<<<<( |$)/ { if (st != 0) { bad = "nested <<<<<<< at line " NR; exit 1 } st = 1; next }
-  /^[|]{7}( |$)/  { if (st != 1) { bad = "stray ||||||| at line " NR; exit 1 } st = 2; next }
+  /^[|]{7}( |$)/  { if (st != 1) { bad = "stray ||||||| at line " NR; exit 1 } st = 2; hasbase = 1; next }
   /^=======$/     { if (st != 1 && st != 2) { bad = "stray ======= at line " NR; exit 1 } st = 3; next }
   /^>>>>>>>( |$)/ {
     if (st != 3) { bad = "stray >>>>>>> at line " NR; exit 1 }
     # A line on both sides would be written twice: refuse rather than guess a dedupe. Only
     # a `### ` subsection heading may be shared, inside [Unreleased] with no `## ` heading in
     # either side, where pass 2 folds the repeat into its first occurrence.
-    split("", seen); h2 = 0
+    if (!hasbase) { bad = "conflict ending at line " NR " has no diff3 base section (rebase with -c merge.conflictStyle=diff3)"; exit 1 }
+    split("", seen); split("", seenb); h2 = 0
+    for (i = 1; i <= nb; i++) if (B[i] !~ /^[ \t]*$/) seenb[B[i]] = 1
     for (i = 1; i <= na; i++) { if (A[i] !~ /^[ \t]*$/) seen[A[i]] = 1; if (A[i] ~ /^## /) h2 = 1 }
+    for (i = 1; i <= nc; i++) if (C[i] !~ /^[ \t]*$/ && !((C[i] in seen) && (C[i] in seenb))) {
+      bad = "a side deletes or rewords a line of the conflict ending at line " NR ": " C[i]; exit 1
+    }
     for (i = 1; i <= nb; i++) if (B[i] ~ /^## /) h2 = 1
     for (i = 1; i <= nb; i++) if (B[i] !~ /^[ \t]*$/ && (B[i] in seen)) {
       if (B[i] ~ /^### / && unrel && !h2) continue
       bad = "line on both sides of the conflict ending at line " NR ": " B[i]; exit 1
     }
-    st = 0; na = 0; nb = 0; next
+    st = 0; na = 0; nb = 0; nc = 0; hasbase = 0; next
   }
-  st == 2 { next }
+  st == 2 { C[++nc] = $0; next }
   st == 1 { A[++na] = $0 }
   st == 3 { B[++nb] = $0 }
   { print; print > before }
