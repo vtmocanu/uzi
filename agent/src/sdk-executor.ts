@@ -246,6 +246,58 @@ export class ProviderTransientError extends Error {
   }
 }
 
+// issue #1656: in-process resumes of a turn whose SDK CLI died from a FOREIGN SIGTERM/SIGKILL,
+// counted per turn on their own counter (provider and empty-turn retries never extend it). Small
+// on purpose: a self-inflicted kill can recur on resume, so this never joins the uncapped
+// recovery_wait park; exhaustion fails the run exactly as before.
+const CLI_SIGNAL_DEATH_MAX_RETRIES = 2;
+
+/**
+ * issue #1656: the SDK CLI child died from a foreign SIGTERM/SIGKILL (or exited 143/137) with
+ * no uzi trip pending. Thrown from driveTurn's catch and resumed in-process on the same session
+ * by {@link SdkExecutor.driveTurnWithEmptyRecovery}. `sessionId` is the session observed THIS
+ * turn, if any; `death` names the signal or exit code (never the SDK's stderr tail) for the
+ * feed notice; `original` is the SDK's own error, rethrown unchanged when the resume is not
+ * possible or its bound is spent, so the run fails exactly as it did before.
+ */
+class CliSignalDeathError extends Error {
+  public readonly original: Error;
+  public readonly death: string;
+  public readonly sessionId?: string;
+  constructor(original: Error, death: string, sessionId?: string) {
+    super(original.message);
+    this.name = "CliSignalDeathError";
+    this.original = original;
+    this.death = death;
+    this.sessionId = sessionId;
+  }
+}
+
+/**
+ * issue #1656: if `err` is the SDK's error for a CLI child ended by SIGTERM/SIGKILL, a short
+ * description of the death (`signal SIGTERM`, `exit code 143`); otherwise undefined.
+ *
+ * READS UNDOCUMENTED SDK INTERNALS: `getProcessExitError` (sdk.mjs) tags its Error with OWN
+ * properties `errorClass: "process_killed_by_signal"` + `signal`, or
+ * `errorClass: "process_exited_nonzero"` + `exitCode`; none is in the public `.d.ts`. The exit
+ * codes 143/137 are the signal-shaped codes for SIGTERM/SIGKILL (the SDK reports a code, not
+ * proof of the signal). Crash signals and every other code return false and fail fast.
+ * test/sdk-signal-death.test.ts pins the shape against the installed SDK.
+ */
+function foreignCliTermination(err: Error): string | undefined {
+  const own = (key: string): unknown => (Object.hasOwn(err, key) ? Reflect.get(err, key) : undefined);
+  const errorClass = own("errorClass");
+  if (errorClass === "process_killed_by_signal") {
+    const signal = own("signal");
+    return signal === "SIGTERM" || signal === "SIGKILL" ? `signal ${signal}` : undefined;
+  }
+  if (errorClass === "process_exited_nonzero") {
+    const exitCode = own("exitCode");
+    return exitCode === 143 || exitCode === 137 ? `exit code ${exitCode}` : undefined;
+  }
+  return undefined;
+}
+
 /**
  * issue #1088: whether a FAILED terminal is a TRANSIENT provider error that should be
  * retried and, on a sustained outage, PARKED (recovery_wait) rather than terminal-failed.
@@ -3495,6 +3547,12 @@ export class SdkExecutor implements Executor {
       // A watchdog/cancel trip surfaces as its static reason, not the raw
       // AbortError the aborted iterator throws.
       if (state.tripReason) throw this.tripError(state);
+      // issue #1656: only with no trip pending — every uzi kill sets tripReason first — is a
+      // SIGTERM/SIGKILL death of the CLI foreign, and resumable by the recovery wrapper.
+      const death = err instanceof Error ? foreignCliTermination(err) : undefined;
+      if (err instanceof Error && death !== undefined) {
+        throw new CliSignalDeathError(err, death, observedSessionId);
+      }
       throw err instanceof Error ? err : new Error(errMessage(err));
     } finally {
       if (idleTimer) clearTimeout(idleTimer);
@@ -3527,6 +3585,10 @@ export class SdkExecutor implements Executor {
    *    wall is spent, and the next driveTurn's `armWall` trips REASON_WALL naturally —
    *    the genuine wall outcome, not a park. The between-turns wait is debited from the
    *    wall (disarmed between turns) so the next turn sees the true remaining budget.
+   *  - A {@link CliSignalDeathError} (issue #1656: a foreign SIGTERM/SIGKILL of the CLI) is
+   *    re-driven at once on the same session, at most CLI_SIGNAL_DEATH_MAX_RETRIES times per
+   *    turn on a counter no other retry touches; with no known session, or once spent, the
+   *    SDK's own error re-throws and the run fails as before (never the recovery_wait park).
    *  - The re-drive resumes the last session observed — a fresh empty planning turn's
    *    `turn.sessionId`, or a transient throw's `err.sessionId`. The persisted
    *    first-session ID stays authoritative.
@@ -3547,35 +3609,69 @@ export class SdkExecutor implements Executor {
   ): Promise<TurnResult> {
     // issue #1088: a driveTurn either RETURNS a result (possibly positively-empty) or
     // THROWS. A ProviderTransientError throw is captured (retry it, like an empty turn);
+    // a CliSignalDeathError is re-driven inside runOnce on its own bound (issue #1656);
     // a trip / LimitReachedError / any other throw re-throws unchanged. `turn` is left
     // undefined on a captured transient throw, `lastProviderErr` records the latest one.
     let turn: TurnResult | undefined;
     let lastProviderErr: ProviderTransientError | undefined;
+    // issue #1656: resumes spent on foreign CLI signal deaths in THIS turn. Declared outside
+    // runOnce so the provider/empty-turn retries below can neither reset nor extend it.
+    let signalDeathRetries = 0;
     const runOnce = async (): Promise<void> => {
-      try {
-        turn = await this.driveTurn(
-          ctx,
-          turnConfig,
-          phase,
-          resumeId,
-          prompt,
-          state,
-          idleMs,
-          onProgress,
-        );
-        lastProviderErr = undefined;
-      } catch (err) {
-        // A real cancel/idle/wall trip WINS and keeps its existing outcome.
-        if (state.tripReason) throw this.tripError(state);
-        // A usage-limit death routes to the usage-limit wait path, unchanged.
-        if (err instanceof LimitReachedError) throw err;
-        // Any genuine (non-transient) failure fails the run, exactly as before.
-        if (!(err instanceof ProviderTransientError)) throw err;
-        // A transient provider error: retry it like an empty turn, and preserve the
-        // session lineage on this throw path (the clean path uses turn.sessionId).
-        lastProviderErr = err;
-        turn = undefined;
-        resumeId = err.sessionId ?? resumeId;
+      for (;;) {
+        try {
+          turn = await this.driveTurn(
+            ctx,
+            turnConfig,
+            phase,
+            resumeId,
+            prompt,
+            state,
+            idleMs,
+            onProgress,
+          );
+          lastProviderErr = undefined;
+          return;
+        } catch (err) {
+          // A real cancel/idle/wall trip WINS and keeps its existing outcome.
+          if (state.tripReason) throw this.tripError(state);
+          // A usage-limit death routes to the usage-limit wait path, unchanged.
+          if (err instanceof LimitReachedError) throw err;
+          if (err instanceof CliSignalDeathError) {
+            // issue #1656: resume the same session: this turn's observed one, else the
+            // caller's. With neither, or once the bound is spent, fail exactly as before with
+            // the SDK's own error: never a fresh session labelled a resume, never recovery_wait.
+            const sessionId = err.sessionId ?? resumeId;
+            if (sessionId === undefined || signalDeathRetries >= CLI_SIGNAL_DEATH_MAX_RETRIES) {
+              throw err.original;
+            }
+            signalDeathRetries++;
+            resumeId = sessionId;
+            this.log.warn("agent CLI died from a foreign signal; resuming the session", {
+              run_id: ctx.runId,
+              death: err.death,
+              attempt: signalDeathRetries,
+            });
+            ctx.emit({
+              kind: "status",
+              agent: "worker",
+              payload: {
+                text: `the agent CLI was terminated (${err.death}); resuming the session (${signalDeathRetries}/${CLI_SIGNAL_DEATH_MAX_RETRIES})…`,
+              },
+            });
+            // Re-drive at once. The wall is not reset: driveTurn re-arms it with the remaining
+            // budget and trips an already-spent one before any SDK call.
+            continue;
+          }
+          // Any genuine (non-transient) failure fails the run, exactly as before.
+          if (!(err instanceof ProviderTransientError)) throw err;
+          // A transient provider error: retry it like an empty turn, and preserve the
+          // session lineage on this throw path (the clean path uses turn.sessionId).
+          lastProviderErr = err;
+          turn = undefined;
+          resumeId = err.sessionId ?? resumeId;
+          return;
+        }
       }
     };
 
