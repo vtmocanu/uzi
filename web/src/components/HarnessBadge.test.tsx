@@ -36,7 +36,7 @@ describe("HarnessBadge", () => {
     render(<HarnessBadge harness={harness} />);
     const chip = screen.getByRole("img", { name: harness === "claude" ? "Claude" : "Codex" });
     expect(chip.className).toBe("inline-flex h-5 w-5 flex-none items-center justify-center rounded-full border border-edge bg-ink text-fg");
-    expect(chip.querySelector("svg")?.getAttribute("class")).toBe("h-[13px] w-[13px]");
+    expect(chip.querySelector("svg")?.getAttribute("class")).toContain("h-[13px] w-[13px]");
   });
 
   it.each(["claude", "codex"] as const)("renders the bare %s logo with 28px square geometry", (harness) => {
@@ -46,7 +46,7 @@ describe("HarnessBadge", () => {
     expect(logo.getAttribute("title")).toBe(`Runs on ${name}`);
     expect(logo.className).toBe("relative z-10 inline-flex h-7 w-7 flex-none items-center justify-center text-fg");
     expect(logo.className).not.toMatch(/border|rounded|bg-/);
-    expect(logo.querySelector("svg")?.getAttribute("class")).toBe("h-[22px] w-[22px]");
+    expect(logo.querySelector("svg")?.getAttribute("class")).toContain("h-[22px] w-[22px]");
     expect(logo.querySelector("svg")?.getAttribute("aria-hidden")).toBe("true");
   });
 

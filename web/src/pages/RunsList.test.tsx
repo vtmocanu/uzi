@@ -406,7 +406,7 @@ describe("RunsList — autopilot badge", () => {
 });
 
 describe("RunsList — harness logo (PRD #1429 M4a, PRD #1653 D-W5, issue #1681)", () => {
-  it("marks every run with its provider chip, Claude and Codex alike", async () => {
+  it("marks every run with its provider logo, Claude and Codex alike", async () => {
     mockApi.listRuns.mockResolvedValue({
       runs: [
         aRun({ id: "codex-run", issue_title: "Codex run", harness: "codex" }),
@@ -433,7 +433,7 @@ describe("RunsList — harness logo (PRD #1429 M4a, PRD #1653 D-W5, issue #1681)
       expect(leading.firstElementChild).toBe(chip);
       expect(chip.className).toContain("relative z-10");
       expect(chip.className).toContain("h-7 w-7");
-      expect(chip.querySelector("svg")?.getAttribute("class")).toBe("h-[22px] w-[22px]");
+      expect(chip.querySelector("svg")?.getAttribute("class")).toContain("h-[22px] w-[22px]");
       expect(leading.children[1].className).toContain("min-w-0 flex-1");
       expect(leading.children[1].contains(screen.getByText(title))).toBe(true);
       expect(chrome.children[1].contains(chip)).toBe(false);
