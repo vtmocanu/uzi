@@ -1789,8 +1789,9 @@ describe("CodexExecutor: child-thread delegation demux (part C)", () => {
     // Both drives must use this same registry; the first reservation stays unsettled.
     const subscribe = ExecutionRegistry.prototype.subscribeCallbacks;
     let registry: ExecutionRegistry | undefined;
+    const captureRegistry = (value: ExecutionRegistry): void => { registry = value; };
     ExecutionRegistry.prototype.subscribeCallbacks = function (listener) {
-      registry = this;
+      captureRegistry(this);
       return subscribe.call(this, listener);
     };
     let parks = 0;
