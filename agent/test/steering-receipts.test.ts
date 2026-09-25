@@ -101,7 +101,9 @@ describe("recoverable /inputs drain (issue #1673)", () => {
       const ch = channel(clientLosingGets(1), 3, cancel);
       await c.delivered(ch, cancel);
       await until(() => api.inputReceiptCalls.some((call) => call.kind === "applied"));
-      await ch.awaitReceiptSettlement();
+      // Not awaitReceiptSettlement: after a routed cancel the aborted controller makes a waiting
+      // report reject (it must not go out uncertain). Wait for the server to record the apply.
+      for (let i = 0; i < 200 && (await unapplied()).length > 0; i++) await new Promise((r) => setTimeout(r, 5));
       assert.deepStrictEqual(
         api.inputReceiptCalls.map((call) => [call.kind, call.ids, call.generation]),
         [["ack", [11], 3], ["ack", [11], 3], ["applied", [11], 3]],
