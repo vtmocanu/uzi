@@ -873,8 +873,9 @@ never forces past a bad plan, a blocked merge, or an unfixable pipeline.
    add the label with the repository's native forge CLI and verify the forge reports
    it. The direct label write reaches uzi's cached issue on the next poller sync. Let
    step 3 attempt creation once; only if it returns that specific eligibility
-   rejection while the forge still shows the label, retry the same create after short
-   waits for up to 90 seconds (one full default poll interval plus sync margin). Stop on
+   rejection while the forge still shows the label, or (for an issue filed moments ago)
+   "issue not found on this repo's board", retry the same create after short waits for
+   up to 90 seconds (one full default poll interval plus sync margin). Stop on
    any other error, and never blindly repeat a create whose result is uncertain.
 2. **Pre-flight: is anything already in flight that this run depends on or
    collides with?** Ask the user **only on a confident blocker**, never on the

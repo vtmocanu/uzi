@@ -272,6 +272,17 @@ for n in "$@"; do
     elif [ -n "$GRL_NOTE" ]; then
       echo "  Greptile: last verdict on ${GRV_SHA:0:8} — ${GRV_ADDED} comments added; comments from older passes are superseded (this head is still unreviewed)"
       if [ "$GRV_ADDED" = "0" ]; then gr_clean=1; else gr_review_id="$GRV_REVIEW_ID"; fi
+    elif [ "$gr_status" = "absent" ] && [ -z "$gr_review_id" ]; then
+      # No anchored comments, so greptile_scope_live had nothing to scope and skipped the
+      # history. A clean earlier pass (it posts no comments) would otherwise go unmentioned,
+      # and "not triggered on this head" reads as "never reviewed". Name the earlier verdict
+      # and the files changed since, so the lander can judge the delta (e.g. docs-only).
+      # Informational only: the gate above already recorded this head as unreviewed.
+      if greptile_prior_verdict "$repo" "$n" "$head" && [ -n "$GRV_SHA" ]; then
+        delta=$(gh api "repos/${repo}/compare/${GRV_SHA}...${head}" --jq '[.files[].filename]|join(", ")' 2>/dev/null) \
+          || delta="(unreadable)"
+        echo "  Greptile: no verdict on this head; last verdict on ${GRV_SHA:0:8} — ${GRV_ADDED} comments added. Changed since: ${delta:-(none)}"
+      fi
     fi
   fi
   # shellcheck disable=SC2016
