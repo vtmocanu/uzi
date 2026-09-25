@@ -15,11 +15,12 @@
 // inventory's open groups live in AllChecks state, which a new document does not remount.
 //
 // Severity is encoded in FORM as well as colour (PRD #1648 D6): the shared SeverityBadge
-// (shape + word) and, where a shape stands alone on an inventory chip or line, a SeverityShape
-// carrying the severity word as its accessible name — never colour alone. Check titles,
-// summaries, evidence and commands are server-composed and render as React text only.
-// Untrusted strings (worker names, blocking reasons) are server-sanitized, but any that reach
-// a `title=` attribute are re-stripped with stripUnsafeChars first (FleetRow, BlockingCell).
+// (shape + word) and, on an inventory chip or line, InventoryMark: an aria-hidden
+// SeverityShape followed by a visually hidden (sr-only) span carrying the severity word, so the
+// word is in the accessible text — never colour alone. Check titles, summaries, evidence and
+// commands are server-composed and render as React text only. Untrusted strings (worker
+// names, upgrade details, blocking reasons) are server-sanitized, but any that reach a
+// `title=` attribute are re-stripped with stripUnsafeChars first (FleetRow, BlockingCell).
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 
@@ -27,8 +28,8 @@ import { AdminShell } from "../components/AdminShell";
 import { DocLink } from "../components/DocLink";
 import { SEV, SeverityBadge, SeverityShape, sevOf, type Sev } from "../components/healthSeverity";
 import { ChevronRightIcon } from "../components/icons";
-import { WorkerUpgradeBadge, likelyCause } from "../components/WorkerUpgradeBadge";
-import { Badge, Button, Card, SectionTitle, cx } from "../components/ui";
+import { likelyCause, upgradePresentation } from "../components/WorkerUpgradeBadge";
+import { Badge, Button, Card, SectionTitle, Skeleton, cx } from "../components/ui";
 import { api, type AdminWorker, type HealthCheck, type HealthDoc } from "../lib/api";
 import { useDemoMode } from "../lib/demoMode";
 import { maskEmail } from "../lib/demoMask";
@@ -153,11 +154,7 @@ function HealthContent({ doc, nowMs }: { doc: HealthDoc; nowMs: number }) {
     <div className="space-y-5">
       {attention.length > 0 ? <AttentionCard doc={doc} attention={attention} nowMs={nowMs} /> : <AllClearLine />}
       <AllChecks doc={doc} />
-      {/* FleetTable still draws its own header with a top rule (PRD #1648 M5 restyles it);
-          inside its own card that rule would double the card's top border, so drop it. */}
-      <Card flush id="fleet" className="scroll-mt-6 overflow-hidden [&>div:first-child]:border-t-0">
-        <FleetTable />
-      </Card>
+      <FleetCard />
     </div>
   );
 }
@@ -167,8 +164,10 @@ function HealthContent({ doc, nowMs }: { doc: HealthDoc; nowMs: number }) {
 function AttentionCard({ doc, attention, nowMs }: { doc: HealthDoc; attention: HealthCheck[]; nowMs: number }) {
   const danger = doc.status === "danger";
   const { title } = healthVerdict(doc.status, doc.counts);
-  // Counts come from the list itself, so the band, its sub line and the items below can never
-  // disagree. The sub line is page-local on purpose: healthVerdict.sub is the Overview card's.
+  // The title and the band's tone come from doc.status / doc.counts (healthVerdict); the
+  // severity badges and the sub line are counted from the attention list itself, so those two
+  // always match the items below. The sub line is page-local on purpose: healthVerdict.sub is
+  // the Overview card's.
   const count = (s: Sev) => attention.filter((c) => sevOf(c.severity) === s).length;
   const more = attention.length - count("danger");
   const sub = danger
@@ -482,11 +481,15 @@ function CheckLine({ check }: { check: HealthCheck }) {
   );
 }
 
-// FleetTable is the cross-user fleet, rendered in its own Fleet card (PRD #1484, #1648 D1). It reads
-// GET /api/admin/workers, which now carries roll health, and reuses the Workers page's
-// upgrade rendering (WorkerUpgradeBadge / likelyCause) so the Upgrade and Blocking cells
-// match. Its own best-effort poll keeps the last-good rows on a failed fetch.
-function FleetTable() {
+// FleetCard is the cross-user fleet in its own card (PRD #1484, #1648 D1/D7), the target of
+// the fleet.* items' "See the affected workers" link (id="fleet"). It reads
+// GET /api/admin/workers, which carries roll health, and shares the Workers page's upgrade
+// words (upgradePresentation) and blocking cause (likelyCause), so the two pages cannot drift.
+// Its own best-effort poll keeps the last-good rows on a failed fetch.
+const FLEET_COLUMNS = ["Owner", "Worker", "Status", "Version", "Upgrade", "Blocking", "Last seen"];
+const SKELETON_ROWS = 3;
+
+function FleetCard() {
   const [workers, setWorkers] = useState<AdminWorker[] | null>(null);
   const demo = useDemoMode();
 
@@ -502,36 +505,38 @@ function FleetTable() {
   }, [load]);
   usePollWhileVisible(load, 10000);
 
+  const loading = workers === null;
   return (
-    <div className="border-t border-edge">
-      <header className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1 px-5 pb-1 pt-3">
-        <h2 className="text-xs font-semibold uppercase tracking-wider text-faint">Fleet, all users</h2>
-        <span className="text-xs text-faint">Upgrade and Blocking read the roll health the admin list now carries</span>
+    <Card flush id="fleet" className="scroll-mt-6 overflow-hidden">
+      <header className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1 border-b border-edge px-5 py-3">
+        <SectionTitle>Fleet, all users</SectionTitle>
+        <span className="text-xs text-faint">Worker status and upgrade blockers across every user</span>
       </header>
       <div className="overflow-x-auto">
-        <table className="w-full text-left text-sm">
-          <thead>
-            <tr className="border-b border-edge text-xs uppercase tracking-wide text-faint">
-              <th scope="col" className="px-3 py-2 pl-5 font-semibold">Owner</th>
-              <th scope="col" className="px-3 py-2 font-semibold">Worker</th>
-              <th scope="col" className="px-3 py-2 font-semibold">Kind</th>
-              <th scope="col" className="px-3 py-2 font-semibold">Status</th>
-              <th scope="col" className="px-3 py-2 font-semibold">Version</th>
-              <th scope="col" className="px-3 py-2 font-semibold">Upgrade</th>
-              <th scope="col" className="px-3 py-2 font-semibold">Blocking</th>
-              <th scope="col" className="px-3 py-2 pr-5 font-semibold">Since</th>
+        <table className="w-full text-left text-sm" aria-busy={loading}>
+          <thead className="border-b border-edge text-muted">
+            <tr>
+              {FLEET_COLUMNS.map((c) => (
+                <th key={c} scope="col" className="px-4 py-3 font-medium">
+                  {c}
+                </th>
+              ))}
             </tr>
           </thead>
           <tbody className="divide-y divide-edge">
-            {workers === null ? (
-              <tr>
-                <td colSpan={8} className="px-5 py-4 text-xs text-faint">
-                  Loading fleet…
-                </td>
-              </tr>
+            {loading ? (
+              Array.from({ length: SKELETON_ROWS }, (_, i) => (
+                <tr key={i}>
+                  {FLEET_COLUMNS.map((c) => (
+                    <td key={c} className="px-4 py-3">
+                      <Skeleton className="h-4 w-16" />
+                    </td>
+                  ))}
+                </tr>
+              ))
             ) : workers.length === 0 ? (
               <tr>
-                <td colSpan={8} className="px-5 py-4 text-xs text-faint">
+                <td colSpan={FLEET_COLUMNS.length} className="px-4 py-3 text-muted">
                   No workers across any user.
                 </td>
               </tr>
@@ -541,45 +546,49 @@ function FleetTable() {
           </tbody>
         </table>
       </div>
-    </div>
+    </Card>
   );
 }
 
 function FleetRow({ worker: w, demo }: { worker: AdminWorker; demo: boolean }) {
-  // The worker name is owner-supplied (server-sanitized at write time). Strip it again on the
-  // way to the `title=` attribute — an attribute is a sink a rendered-text sweep misses, so a
-  // bidi override there could reorder how the tooltip reads (issue #124).
+  // The worker name and the upgrade detail are server-sanitized at write time. Strip them
+  // again on the way to a `title=` attribute: an attribute is a sink a rendered-text sweep
+  // misses, so a bidi override there could reorder how the tooltip reads (issue #124).
   const name = stripUnsafeChars(w.name);
-  const statusTone =
-    w.upgrade_status === "upgrade_failed"
-      ? "text-danger"
-      : w.status === "offline"
-        ? "text-faint"
-        : "text-ok";
+  const upgrade = upgradePresentation(w.upgrade_status);
 
   return (
     <tr>
-      <td className="px-3 py-2 pl-5">{maskEmail(w.owner_email, demo)}</td>
-      <td className="px-3 py-2">
-        <span className="font-mono" title={name}>
+      <td className="px-4 py-3 text-fg">{maskEmail(w.owner_email, demo)}</td>
+      <td className="px-4 py-3">
+        <span className="font-mono text-fg" title={name}>
           {name}
-        </span>
+        </span>{" "}
+        <span className="text-xs text-faint">{w.kind}</span>
       </td>
-      <td className="px-3 py-2">{w.kind}</td>
-      <td className="px-3 py-2">
-        <span className={cx("inline-flex items-center gap-1.5", statusTone)}>
-          <span aria-hidden="true" className="h-1.5 w-1.5 rounded-full bg-current" />
+      <td className="px-4 py-3">
+        {/* Online reads ok, anything else neutral: an upgrade failure is the Upgrade column's
+            danger badge, not a second danger signal here. */}
+        <Badge tone={w.status === "online" ? "ok" : "neutral"} dot>
           {w.status}
-        </span>
+        </Badge>
       </td>
-      <td className="px-3 py-2 font-mono">{w.version ?? "—"}</td>
-      <td className="px-3 py-2">
-        <WorkerUpgradeBadge worker={w} />
+      <td className="px-4 py-3 font-mono">{w.version ?? "—"}</td>
+      <td className="px-4 py-3">
+        {/* `unknown` has no presentation and renders a faint dash (the Workers page badge
+            renders nothing for it: an unstamped image is not a finding). */}
+        {upgrade ? (
+          <Badge tone={upgrade.tone} title={w.upgrade_detail ? stripUnsafeChars(w.upgrade_detail) : undefined}>
+            {upgrade.label}
+          </Badge>
+        ) : (
+          <span className="text-faint">—</span>
+        )}
       </td>
-      <td className="px-3 py-2">
+      <td className="px-4 py-3">
         <BlockingCell worker={w} />
       </td>
-      <td className="px-3 py-2 pr-5 text-xs tabular-nums text-faint">
+      <td className="px-4 py-3 tabular-nums text-muted">
         {w.last_heartbeat_at ? formatAgo(w.last_heartbeat_at) : "—"}
       </td>
     </tr>

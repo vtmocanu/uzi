@@ -5,7 +5,8 @@
 // the mocked api client — the same pattern CustodyBoardAlert.test.tsx uses. Covered: the
 // header line (Copy diagnostics), the attention card in its danger / warn / unknown forms or
 // the all-clear line, the All checks inventory (disclosure, chips, counts, poll survival,
-// in-page jumps with reduced motion), na on a no-hosted-workers fixture, and the fleet table.
+// in-page jumps with reduced motion), na on a no-hosted-workers fixture, and the Fleet card
+// (M5: headers, status/upgrade badge words, skeleton loading, last-good rows on a failed poll).
 // Severity is asserted by ACCESSIBLE NAME / TEXT (the badge word, the shape's label), never a
 // colour class; the tab pip's worded aria-label is asserted; and a hostile worker name /
 // blocking reason rendered into a `title=` attribute is asserted on the attribute.
@@ -14,6 +15,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import { MemoryRouter } from "react-router-dom";
 
 import { AdminHealth } from "./AdminHealth";
+import { likelyCause } from "../components/WorkerUpgradeBadge";
 import { api, type AdminWorker, type HealthDoc } from "../lib/api";
 import {
   degradedDoc,
@@ -310,6 +312,14 @@ describe("AdminHealth — All checks inventory (M4)", () => {
     expect(screen.queryByLabelText(/health checks? needs? attention/)).toBeNull();
   });
 
+  it("a group with both attention and N/A checks counts N/A out of the denominator", async () => {
+    // Workers group on the no-hosted fixture: fleet.roll N/A, fleet.capacity (now danger),
+    // fleet.disk OK. Applicable = 2, so "1 of 2", never "1 of 3".
+    await renderHealth(withSeverity(noHostedWorkersDoc(), { "fleet.capacity": "danger" }));
+    expect(screen.getByText("1 of 2 need attention, 1 not applicable")).toBeTruthy();
+    expect(screen.queryByText(/^1 of 3 need attention/)).toBeNull();
+  });
+
   it("a group whose checks are all N/A reads 'not applicable'", async () => {
     await renderHealth(withSeverity(noHostedWorkersDoc(), { "forge.ciwatch": "na" }));
     expect(screen.getByText("not applicable")).toBeTruthy();
@@ -359,5 +369,145 @@ describe("AdminHealth — untrusted strings in attributes", () => {
     // likelyCause yields null and the title falls back to the stripped container:reason).
     const blockingCell = screen.getByTitle("worker: PullBackOff");
     expect(blockingCell.getAttribute("title")).toBe("worker: PullBackOff");
+  });
+});
+
+// ── Fleet card (M5) ──────────────────────────────────────────────────────────────────
+
+// One worker per upgrade status, varied status/version, built from the incident fixture.
+function fleetWorker(over: Partial<AdminWorker>): AdminWorker {
+  return {
+    ...incidentFleetWorkers()[0],
+    upgrade_status: "up_to_date",
+    upgrade_detail: null,
+    upgrade_blocking_container: null,
+    upgrade_blocking_reason: null,
+    ...over,
+  };
+}
+
+function fleetCard(): HTMLElement {
+  const el = document.getElementById("fleet");
+  if (!el) throw new Error("no Fleet card");
+  return el;
+}
+
+// The row of the worker whose (stripped) name title is `name`.
+async function fleetRow(name: string): Promise<HTMLElement> {
+  const cell = await within(fleetCard()).findByTitle(name);
+  const tr = cell.closest("tr");
+  if (!tr) throw new Error(`no row for ${name}`);
+  return tr;
+}
+
+describe("AdminHealth — Fleet card (M5)", () => {
+  it("own card with a sentence-case header and the seven columns, no Kind or Since", async () => {
+    await renderHealth(healthySilentDoc(), [fleetWorker({ id: "w-1", name: "base.l-aaaa" })]);
+    const card = fleetCard();
+    expect(within(card).getByRole("heading", { name: "Fleet, all users" })).toBeTruthy();
+    expect(within(card).getByText("Worker status and upgrade blockers across every user")).toBeTruthy();
+    expect(screen.queryByText(/Upgrade and Blocking read/)).toBeNull();
+    const headers = within(card)
+      .getAllByRole("columnheader")
+      .map((th) => th.textContent);
+    expect(headers).toEqual(["Owner", "Worker", "Status", "Version", "Upgrade", "Blocking", "Last seen"]);
+    expect(within(card).queryByRole("columnheader", { name: "Kind" })).toBeNull();
+    expect(within(card).queryByRole("columnheader", { name: "Since" })).toBeNull();
+  });
+
+  it("status and upgrade badge words, kind on the worker cell, version dash, blocking cause", async () => {
+    const RLO = String.fromCharCode(0x202e);
+    const BEL = String.fromCharCode(7);
+    await renderHealth(healthySilentDoc(), [
+      fleetWorker({ id: "w-1", name: "w-ok", status: "online", version: "0.84.0", upgrade_status: "up_to_date" }),
+      fleetWorker({
+        id: "w-2",
+        name: "w-old",
+        status: "offline",
+        version: null,
+        upgrade_status: "outdated",
+        upgrade_detail: `running 0.83.1,${RLO} target 0.84.0${BEL}`,
+      }),
+      fleetWorker({ id: "w-3", name: "w-rolling", status: "online", upgrade_status: "upgrading" }),
+      fleetWorker({
+        id: "w-4",
+        name: "w-stuck",
+        status: "offline",
+        upgrade_status: "upgrade_failed",
+        upgrade_detail: "worker: ImagePullBackOff",
+        upgrade_blocking_container: "worker",
+        upgrade_blocking_reason: "ImagePullBackOff",
+      }),
+      fleetWorker({ id: "w-5", name: "w-unstamped", status: "online", upgrade_status: "unknown" }),
+    ]);
+
+    const ok = await fleetRow("w-ok");
+    expect(within(ok).getByText("online")).toBeTruthy();
+    expect(within(ok).getByText("up to date")).toBeTruthy();
+    expect(within(ok).getByText("0.84.0")).toBeTruthy();
+    expect(within(ok).getByText("hosted")).toBeTruthy(); // kind, on the worker cell
+    expect(within(ok).getByText("none")).toBeTruthy(); // nothing blocking
+
+    const old = await fleetRow("w-old");
+    expect(within(old).getByText("offline")).toBeTruthy();
+    // The upgrade badge's title is the STRIPPED detail (no RLO, no BEL).
+    expect(within(old).getByText("outdated").getAttribute("title")).toBe("running 0.83.1, target 0.84.0");
+    expect(within(old).getAllByText("—").length).toBe(1); // version null
+
+    const rolling = await fleetRow("w-rolling");
+    expect(within(rolling).getByText("upgrading").hasAttribute("title")).toBe(false);
+
+    const stuck = await fleetRow("w-stuck");
+    expect(within(stuck).getByText("upgrade failed").getAttribute("title")).toBe("worker: ImagePullBackOff");
+    // Exactly one blocking text, titled with the human cause.
+    const blocking = within(stuck).getByText("worker: ImagePullBackOff");
+    expect(blocking.getAttribute("title")).toBe(likelyCause("worker", "ImagePullBackOff", null)!);
+
+    // unknown renders no badge word at all, only a dash.
+    const unstamped = await fleetRow("w-unstamped");
+    expect(within(unstamped).queryByText(/up to date|outdated|upgrading|upgrade failed|unknown/)).toBeNull();
+    expect(within(unstamped).getByText("—")).toBeTruthy();
+  });
+
+  it("skeleton rows and aria-busy while the first fetch is pending, then the rows", async () => {
+    let resolve!: (v: { workers: AdminWorker[] }) => void;
+    mockApi.getAdminHealth.mockResolvedValue(healthySilentDoc());
+    mockApi.adminListWorkers.mockReturnValue(new Promise((r) => (resolve = r)));
+    render(
+      <MemoryRouter initialEntries={["/admin/health"]}>
+        <AdminHealth />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(screen.getByText("Copy diagnostics")).toBeTruthy());
+    const table = within(fleetCard()).getByRole("table");
+    expect(table.getAttribute("aria-busy")).toBe("true");
+    const body = table.querySelector("tbody")!;
+    expect(body.querySelectorAll("tr").length).toBe(3);
+    expect(body.textContent).toBe("");
+    expect(screen.queryByText(/Loading fleet/)).toBeNull();
+
+    await act(async () => resolve({ workers: [fleetWorker({ id: "w-1", name: "w-loaded" })] }));
+    expect(await within(fleetCard()).findByTitle("w-loaded")).toBeTruthy();
+    expect(table.getAttribute("aria-busy")).toBe("false");
+    expect(body.querySelectorAll("tr").length).toBe(1);
+  });
+
+  it("empty fleet keeps its text", async () => {
+    await renderHealth(healthySilentDoc(), []);
+    expect(await within(fleetCard()).findByText("No workers across any user.")).toBeTruthy();
+    expect(within(fleetCard()).getByRole("table").getAttribute("aria-busy")).toBe("false");
+  });
+
+  it("keeps the last-good rows when a poll fails", async () => {
+    await renderHealth(healthySilentDoc(), [fleetWorker({ id: "w-1", name: "w-kept" })]);
+    await fleetRow("w-kept");
+    const calls = mockApi.adminListWorkers.mock.calls.length;
+    mockApi.adminListWorkers.mockRejectedValue(new Error("blip"));
+    await act(async () => {
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    await waitFor(() => expect(mockApi.adminListWorkers.mock.calls.length).toBeGreaterThan(calls));
+    expect(within(fleetCard()).getByTitle("w-kept")).toBeTruthy();
+    expect(within(fleetCard()).queryByText("No workers across any user.")).toBeNull();
   });
 });

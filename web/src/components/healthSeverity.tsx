@@ -19,8 +19,9 @@ import { Badge, cx, type BadgeTone } from "./ui";
 
 export type Sev = "ok" | "warn" | "danger" | "unknown" | "na";
 
-// Per-severity presentation. `label` is the visible word tests assert on (and the accessible
-// name of a bare SeverityShape on the Health inventory); `tone` is the shared Badge tone.
+// Per-severity presentation. `label` is the visible word tests assert on (on the Health
+// inventory it is the visually hidden word in a sibling sr-only span beside an aria-hidden
+// SeverityShape, not the shape's own accessible name); `tone` is the shared Badge tone.
 export const SEV: Record<Sev, { label: string; tone: BadgeTone }> = {
   ok: { label: "OK", tone: "ok" },
   warn: { label: "Warn", tone: "warning" },
