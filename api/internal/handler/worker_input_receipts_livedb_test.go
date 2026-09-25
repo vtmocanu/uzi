@@ -64,7 +64,7 @@ func TestWorkerInputReceiptsLiveDB(t *testing.T) {
 	exec(`INSERT INTO users (id,email,password_hash) VALUES ($1,$2,'x')`, user, fmt.Sprintf("receipt-%s@e2e", user))
 	newWorker(worker, "receipt", true)
 	newWorker(nextWorker, "receipt2", true)
-	exec(`INSERT INTO runs (id,user_id,issue_iid,issue_title,issue_description,status,worker_id,claim_generation) VALUES ($1,$2,1,'t','d','running',$3,1)`, run, user, worker)
+	exec(`INSERT INTO runs (id,user_id,kind,issue_title,issue_description,status,worker_id,claim_generation) VALUES ($1,$2,'chat','t','d','running',$3,1)`, run, user, worker)
 	ids := make(map[string]int64)
 	for _, kind := range []string{"cancel", "approve_plan", "follow_up"} {
 		var id int64
@@ -236,6 +236,18 @@ func TestWorkerInputReceiptsLiveDB(t *testing.T) {
 	call("POST", "/inputs/applied", freshBody, newer, 200)
 	call("POST", "/inputs/applied", freshBody, newer, 200)
 	get(newer, 0) // all replayed rows and the fresh follow-up are applied
+	// The first APPLIED committed but its reply was lost, then the claim was
+	// released: the retry of rows this claim already applied still succeeds.
+	for _, fence := range []string{
+		`UPDATE runs SET claim_released_at=now() WHERE id=$1`,
+		`UPDATE runs SET credential_switch_requested_at=now(),credential_switch_generation=2 WHERE id=$1`,
+	} {
+		exec(fence, run)
+		if out := call("POST", "/inputs/applied", freshBody, newer, 200); out["active"] != false || len(out["inputs"].([]any)) != 1 {
+			t.Fatalf("applied retry after fence %q: %v", fence, out)
+		}
+		exec(`UPDATE runs SET claim_released_at=NULL,credential_switch_requested_at=NULL,credential_switch_generation=NULL WHERE id=$1`, run)
+	}
 
 	// A legacy consume-on-read row was backfilled as applied and cannot be taken over.
 	var legacy int64
@@ -246,7 +258,7 @@ func TestWorkerInputReceiptsLiveDB(t *testing.T) {
 	get(newer, 0)
 
 	otherRun := uuid.New()
-	exec(`INSERT INTO runs (id,user_id,issue_iid,issue_title,issue_description,status,worker_id,claim_generation) VALUES ($1,$2,2,'t','d','running',$3,2)`, otherRun, user, nextWorker)
+	exec(`INSERT INTO runs (id,user_id,kind,issue_title,issue_description,status,worker_id,claim_generation) VALUES ($1,$2,'chat','t','d','running',$3,2)`, otherRun, user, nextWorker)
 	var foreign int64
 	if err := pool.QueryRow(ctx, `INSERT INTO run_user_inputs (run_id,kind,body) VALUES ($1,'cancel','foreign') RETURNING id`, otherRun).Scan(&foreign); err != nil {
 		t.Fatal(err)

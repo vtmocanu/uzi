@@ -75,21 +75,26 @@ func (s *Service) inputReceipt(ctx context.Context, wkr store.Worker, runID uuid
 	out := make([]InputDTO, 0, len(ids))
 	followUp := false
 	for _, row := range rows {
-		if !row.ConsumedAt.Valid {
-			if applied || !active {
+		ownReceipt := row.ConsumedAt.Valid && row.ConsumedClaimGeneration.Valid && row.ConsumedClaimGeneration.Int64 == generation &&
+			row.ConsumedWorkerID.Valid && uuid.UUID(row.ConsumedWorkerID.Bytes) == wkr.ID
+		switch {
+		case applied:
+			// A retried APPLIED for rows this claim already applied succeeds even after the
+			// claim released: the first reply was lost, and the worker already routed them.
+			if !ownReceipt || (!active && !row.AppliedAt.Valid) {
+				return InputReceiptResult{}, ErrInputReceiptConflict
+			}
+		case !row.ConsumedAt.Valid:
+			if !active {
 				return InputReceiptResult{}, ErrInputReceiptConflict
 			}
 			toAck = append(toAck, row.ID)
-		} else if !row.ConsumedClaimGeneration.Valid || row.ConsumedClaimGeneration.Int64 != generation ||
-			!row.ConsumedWorkerID.Valid || uuid.UUID(row.ConsumedWorkerID.Bytes) != wkr.ID {
-			if applied || !active || row.AppliedAt.Valid {
+		case !ownReceipt:
+			if !active || row.AppliedAt.Valid {
 				return InputReceiptResult{}, ErrInputReceiptConflict
 			}
 			// Transfer an unapplied receipt to the current active claim.
 			toAck = append(toAck, row.ID)
-		}
-		if applied && !active {
-			return InputReceiptResult{}, ErrInputReceiptConflict
 		}
 		if row.Kind == "follow_up" && !row.ConsumedAt.Valid {
 			followUp = true
