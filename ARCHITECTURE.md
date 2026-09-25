@@ -986,7 +986,7 @@ chain in the diagram above, with no intervening `running`.
   the separate, duplicate `run_failed` notification): a run whose failure
   reason is a deliberate cancel renders as "Cancelled" and stays quiet on the
   ❌ glyph, but every other failed run — including a plan-rejection — still
-  posts "❌ *Failed*" with its reason, so only a genuine cancel is silent.
+  posts "❌ *Failed*" with its reason, so only a genuine cancel avoids the ❌ Failed alarm.
   The `notifications` table itself is not gone (PRD #1650): it stays as a
   pruned (200 rows/user), write-only event log and the incidental-finding
   Slack de-dup latch (`notifysvc.Notify`) — nothing in the product reads it

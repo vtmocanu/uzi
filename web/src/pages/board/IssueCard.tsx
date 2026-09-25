@@ -62,7 +62,7 @@ function Highlighted({ text, query }: { text: string; query: string }) {
 // next step, like the run parks. role="img" gives the short visible label a full
 // accessible name that starts with the same words (WCAG 2.5.3) and adds the count.
 function AutofixHaltedMarker({ attempts }: { attempts: number }) {
-  const label = `Autofix stopped after ${attempts} ${attempts === 1 ? "attempt" : "attempts"}: automatic CI fixing will not retry on this branch. Fixing CI is up to you.`;
+  const label = `Autofix stopped after ${attempts} ${attempts === 1 ? "attempt" : "attempts"}: fixing this failure is up to you.`;
   return (
     <span role="img" aria-label={label} title={label} className="inline-flex">
       <Badge tone="warning">Autofix stopped</Badge>

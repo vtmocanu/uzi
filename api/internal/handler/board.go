@@ -94,8 +94,8 @@ type cardDTO struct {
 	Pipeline *apitypes.PipelineDTO `json:"pipeline"`
 	// CIAutofixHalted reports that automatic CI fixing has stopped on the card's MOST
 	// RECENT run's branch (PRD #1650 D3a): its ci_autofix_attempts row latched
-	// halt_notified (the attempt cap or a no-progress halt), so "Fix CI" is now the
-	// user's to press. Read from the ledger, never through Pipeline: a halt shows even
+	// halt_notified (the attempt cap or a no-progress halt), so fixing that failure is
+	// up to the user. Read from the ledger, never through Pipeline: a halt shows even
 	// when no pipeline is cached. Set on every card-returning response (assembleCards,
 	// MoveIssue, PromoteIssue); a freshly created issue has no run, so false.
 	CIAutofixHalted bool `json:"ci_autofix_halted"`

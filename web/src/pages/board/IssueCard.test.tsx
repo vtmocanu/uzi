@@ -71,14 +71,14 @@ function renderCard(over: Partial<Card> = {}) {
 // starts with the visible text (WCAG 2.5.3), and the copy never promises a Fix CI button:
 // that button renders only for a failed cached pipeline, the marker in every halt state.
 const haltLabel = (n: number) =>
-  `Autofix stopped after ${n} ${n === 1 ? "attempt" : "attempts"}: automatic CI fixing will not retry on this branch. Fixing CI is up to you.`;
+  `Autofix stopped after ${n} ${n === 1 ? "attempt" : "attempts"}: fixing this failure is up to you.`;
 
 describe("IssueCard — CI auto-fix halted marker (#1650 D3a)", () => {
   it("shows the marker beside the pipeline badge, with the attempt count in its name and title", () => {
     renderCard({ pipeline: FAILED_PIPELINE, ci_autofix_halted: true, ci_autofix_attempts: 3 });
     const expected = haltLabel(3);
     expect(expected).toBe(
-      "Autofix stopped after 3 attempts: automatic CI fixing will not retry on this branch. Fixing CI is up to you.",
+      "Autofix stopped after 3 attempts: fixing this failure is up to you.",
     );
     const marker = screen.getByRole("img", { name: expected });
     expect(marker.textContent).toBe("Autofix stopped");
@@ -92,7 +92,7 @@ describe("IssueCard — CI auto-fix halted marker (#1650 D3a)", () => {
     renderCard({ pipeline: FAILED_PIPELINE, ci_autofix_halted: true, ci_autofix_attempts: 1 });
     expect(
       screen.getByRole("img", {
-        name: "Autofix stopped after 1 attempt: automatic CI fixing will not retry on this branch. Fixing CI is up to you.",
+        name: "Autofix stopped after 1 attempt: fixing this failure is up to you.",
       }),
     ).toBeTruthy();
   });

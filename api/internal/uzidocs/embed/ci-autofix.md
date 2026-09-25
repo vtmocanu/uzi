@@ -85,11 +85,12 @@ Either way, uzi sends you a Slack DM (if you've linked your account, see
 [Slack](./slack.md)) and, on an issue-run branch, also posts one comment on
 the backing issue (worded differently for "hit the attempt limit" than for
 "no progress") and shows an **"Autofix stopped"** marker on that issue's board
-card (with the attempt count in its title), so you know **Fix CI** is now
-yours to press. A scheduled prompt MR has no backing issue card, so it gets
-the Slack DM only. uzi then stops trying automatically — **it does not retry
-on its own**. The manual **Fix CI** button is still there as your escape
-hatch any time. The attempt counter only resets once the branch's pipeline
+card (with the attempt count in its title), so you know fixing this failure
+is up to you. A scheduled prompt MR has no backing issue card, so it gets
+the Slack DM only. After hitting the attempt limit uzi stops trying on that
+branch; after a "no progress" halt it will not retry the same failure, but a
+different failure on the same branch can still be auto-fixed. The manual
+**Fix CI** button is still there as your escape hatch any time. The attempt counter only resets once the branch's pipeline
 actually goes green, which also clears the board marker; pressing **Fix CI**
 and letting automatic fixing proceed again clears it too.
 

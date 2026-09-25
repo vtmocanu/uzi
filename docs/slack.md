@@ -234,8 +234,8 @@ with the bot, so the sender is already `uzi`. Glyph legend:
   `code` chip per category), and the summary as a blockquoted excerpt with an
   Open-in-uzi link. If you've enabled the `self-improve` default job (see
   [Scheduling](./scheduling.md#default-jobs)) on a repo, you get a DM when a
-  cycle is skipped (vault locked, repo disconnected, a cycle already
-  running). A started cycle is status-only — no DM, since the run itself and
+  cycle is skipped because your vault is locked or the repo already has
+  its maximum of open self-improvement merge requests. A started cycle is status-only — no DM, since the run itself and
   the merge request it opens already carry it. A judge or self-improvement
   run's *own* state changes (queued, running, completed) are never DM'd on
   their own — only the review-ready / cycle-skipped messages above, so you
