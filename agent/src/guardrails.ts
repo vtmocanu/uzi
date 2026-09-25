@@ -79,6 +79,8 @@
 //    `<<\EOF`) is literal, so the scanner skips it and backticked prose there passes.
 //    Substitutions nested past MAX_DEPTH, or more than MAX_SUBST_BODIES bodies
 //    in one string, fail closed with REASON_DEPTH.
+//    Within a scanned `$(…)` body, quotes and backslash escapes inside `${…}`
+//    also fail closed: a quoted `}` can otherwise end the parameter frame early.
 //    Known evasions: a PID read back from a file an earlier command wrote, the variable
 //    PID forms above, and the substitution scanner's desyncs, where its raw quote/paren
 //    count ends or skips a body in the wrong place so a later substitution is not
@@ -760,7 +762,8 @@ function advanceShellExpression(command: string, pos: number, stack: ShellExpres
 
 /**
  * The index of the `)` that closes the `$(` whose body starts at `start`, or the end of
- * the string when it is unbalanced. Returns undefined past MAX_DEPTH so callers deny.
+ * the string when it is unbalanced. Returns undefined past MAX_DEPTH or on quoted
+ * parameter-expansion text so callers deny.
  * A quote-aware paren-depth count; a heredoc opened
  * inside the body (`$(cat <<'EOF'` …) has its body jumped over, quoted or not, because
  * bash's own parse does not read parens in a heredoc body: prose like `a)` or `:)` in a
@@ -780,6 +783,9 @@ function substitutionEnd(command: string, start: number, substDepth: number): nu
   let escapedDouble = false;
   while (j < n) {
     const c = command[j]!;
+    if (expressions[expressions.length - 1]?.kind === "parameter" && (c === "'" || c === '"' || c === "\\")) {
+      return undefined; // quote-aware `${…}` parsing is intentionally fail-closed
+    }
     // Treat paired escaped quotes conservatively as a quoted span too. Bash may
     // read them literally, but counting a `)` inside would hide later commands.
     if (c === "\\" && command[j + 1] === '"' && (!inDouble || escapedDouble)) {
@@ -835,7 +841,7 @@ function substitutionEnd(command: string, start: number, substDepth: number): nu
  * run, so that body is skipped (consumeHeredocBodies); an unquoted-delimiter body still
  * expands and is scanned. A `<<` after an unquoted `#` comment opener, or inside double
  * quotes, arithmetic or parameter expansion opens no heredoc. Returns undefined
- * past MAX_SUBST_BODIES or MAX_DEPTH.
+ * past MAX_SUBST_BODIES, MAX_DEPTH, or ambiguous quoted parameter text.
  */
 function extractSubstitutionBodies(command: string, heredocs = true, depth = 0): string[] | undefined {
   const bodies: string[] = [];
@@ -849,6 +855,9 @@ function extractSubstitutionBodies(command: string, heredocs = true, depth = 0):
   let i = 0;
   while (i < n) {
     const ch = command[i]!;
+    if (depth > 0 && expressions[expressions.length - 1]?.kind === "parameter" && (ch === "'" || ch === '"' || ch === "\\")) {
+      return undefined;
+    }
     if (ch === "\\") { i += 2; continue; }
     if (ch === "\n" && !inDouble) {
       inComment = false;

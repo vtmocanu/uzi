@@ -665,6 +665,18 @@ describe("mass-signal guardrail (#1576)", () => {
     assert.strictEqual(screenBashCommand('echo "$(echo ${x:-(a)})"').denied, false);
   });
 
+  for (const cmd of [
+    'echo "$(echo ${x:-"}"foo)}; pkill node)"',
+    "echo \"$(echo ${x:-'}'foo)}; pkill node)\"",
+    'echo "$(echo ${x:-\\}foo)}; pkill node)"',
+  ]) it(`denies ambiguous quoting inside a parameter expansion: ${cmd}`, () => {
+    assert.strictEqual(screenBashCommand(cmd).denied, true, cmd);
+  });
+  it("keeps unquoted parameter expansions and simple quoted substitutions allowed", () => {
+    assert.strictEqual(screenBashCommand("echo ${HOME}").denied, false);
+    assert.strictEqual(screenBashCommand('echo "$(echo ${x:-ok})"').denied, false);
+  });
+
   for (const [name, cmd] of [
     ['quoted long backtick body', 'echo "`' + "((1<<E))\n".repeat(1100) + 'pkill node`"'],
     ['unquoted long backtick body', 'echo `' + "((1<<E))\n".repeat(1100) + 'pkill node`'],
