@@ -22,13 +22,24 @@ daemon.
 The sidecar is its own container (compose) or its own sidecar container in
 the worker's pod (hosted/k8s) — never the host's Docker. It:
 
-- runs **rootless** (a breakout lands as an unprivileged, userns-remapped
-  uid, never host root);
-- shares **only its daemon socket** with the worker, over its own mount
-  namespace — it mounts none of the worker's join token, `/data`, or `/nix`,
-  so a container the agent launches (`docker run -v ...`) can bind-mount
-  none of the worker's own files;
+- runs **rootless** by default (a breakout lands as an unprivileged,
+  userns-remapped uid, never host root). A hosted cluster whose nodes cannot
+  run rootless DinD may opt into a privileged, non-rootless sidecar instead;
+  its residual is node root, and the chart requires an explicit
+  acknowledgement (`acknowledgeNonRootlessNodeRoot`) to enable it;
+- runs in its own mount namespace and mounts none of the worker's join
+  token, `/data` cache, or `/nix`, so a container the agent launches
+  (`docker run -v ...`) cannot bind-mount your credentials or those volumes;
 - there is no host `docker.sock` anywhere in the picture, on either track.
+
+**One shared directory on hosted workers.** On a hosted (k8s) worker the
+sidecar also mounts the shared run working directory (`/data/runner`), so
+builds can see the checkout. That directory holds the clone of *every* run
+the worker is executing at the time, so a container launched from one run
+can read or write another concurrent run's clone. Hosted workers only
+ever run their owner's runs, so the exposure stays within your own runs;
+it is an accepted part of the docker tier. Under docker compose the sidecar
+shares only its daemon socket and its own data, not the run directory.
 
 This mount-namespace separation, not the guardrail, is what actually stops a
 hijacked agent from reading your credentials through a container mount — see
