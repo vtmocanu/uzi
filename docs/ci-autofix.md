@@ -112,8 +112,9 @@ hand — the manual button, or an approved CI-config plan — pushes normally.
 
 An automatic fix starting or landing (its pipeline goes green and the run is
 verified) no longer notifies you — you can already see the `ci_fix` run in
-Runs and its verdict chip on the run page, and, on an issue-run branch, the
-forge comment those events already post stays unchanged.
+Runs and its verdict chip on the run page. On an issue-run branch, the forge
+comment posted when the fix starts is unchanged; landing itself never posted
+a forge comment.
 
 A halt is the one event that reaches you: a Slack DM (if you've linked your
 account, see [Slack](./slack.md)) plus, on an issue-run branch, the board's

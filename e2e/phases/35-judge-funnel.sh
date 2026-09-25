@@ -112,7 +112,7 @@ pass "judge run $J_JUDGE is repo-less (Anthropic-only claim; no forge PAT)"
 
 # Durable persistence, read back through the judge review API after the judge run is
 # known: the SAME review row (same id as when it landed) is anchored to the reviewed run
-# and linked to the judge run that posted it.
+# and records the judge run from run_reviews.judge_run_id.
 J_REREAD="$(apiget "/api/runs/$J_RUN/review")"
 [ "$(printf '%s' "$J_REREAD" | jq -r '.review.id')" = "$J_REVIEW_ID" ] \
   || fail "PRD #46: re-reading the review returned a different row than the one that landed ($J_REVIEW_ID)"

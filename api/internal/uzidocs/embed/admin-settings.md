@@ -292,7 +292,9 @@ attempt. An admin **Approve**s or **Reject**s it, either way with an optional no
 back to the requester. Approve sets the same per-repo override described above — the
 member's own reason, the admin's identity, and a timestamp — it does **not** enable
 the repo; the owner still has to retry Enable so the live guard runs again against
-the current forge state. The requester is notified of the decision either way.
+the current forge state. The requester gets a one-time Slack DM with the
+decision when their Slack account is linked (see [Slack](./slack.md)); either
+way, the Repos page row for that repo also shows the decision.
 
 **The override can never waive the case where uzi couldn't read the repo's
 protection at all.** A forge read error, timeout, or an unverifiable answer (see

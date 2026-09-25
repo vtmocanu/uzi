@@ -982,10 +982,11 @@ chain in the diagram above, with no intervening `running`.
   is not discarded, while a permanent rejection (auth, protected-branch guardrail,
   non-fast-forward) fails fast, per
   [ADR-284](adr/0284-forge-push-retry-classifier.md). A `failed` transition is
-  covered by `slacksvc`'s own Slack ❌ DM for opted-in users (PRD #1650 removed
-  the separate, duplicate `run_failed` notification), gated on `stop_kind` so
-  a deliberate cancel or plan-rejection stays silent and only genuine
-  breakage notifies.
+  covered by `slacksvc`'s own Slack DM for opted-in users (PRD #1650 removed
+  the separate, duplicate `run_failed` notification): a run whose failure
+  reason is a deliberate cancel renders as "Cancelled" and stays quiet on the
+  ❌ glyph, but every other failed run — including a plan-rejection — still
+  posts "❌ *Failed*" with its reason, so only a genuine cancel is silent.
   The `notifications` table itself is not gone (PRD #1650): it stays as a
   pruned (200 rows/user), write-only event log and the incidental-finding
   Slack de-dup latch (`notifysvc.Notify`) — nothing in the product reads it

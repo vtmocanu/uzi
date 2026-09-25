@@ -44,6 +44,11 @@ Register a worker and start a run from a board card: see
 
 ## Along the way
 
+- **The browser tab icon** carries a small status dot for the most urgent
+  thing across your runs, so a backgrounded tab still tells you: rose once
+  one of your runs has freshly failed, amber once one is awaiting your
+  approval or an answer, ember while any run is queued, claimed, or
+  running, and no dot once nothing needs you and nothing is in flight.
 - [Agent templates](./agent-templates.md): the roles (`coder`, `reviewer`,
   ...) your agents play, and how an admin edits them.
 - [Admin settings](./admin-settings.md): the two forge labels an admin can
