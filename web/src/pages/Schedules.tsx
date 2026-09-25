@@ -80,12 +80,16 @@ export function Schedules() {
   const tab: Tab = isTab(tabParam) ? tabParam : (landing ?? "schedules");
   // The Job catalog card whose enable dialog is open (D7), at most one; page-owned so a
   // default row's "Enable on another repo" can open it from the Schedules tab (D4).
-  // Leaving the catalog tab by any path (a click, the tablist's arrow keys, a link)
-  // closes it, so coming back never re-opens a dialog whose open effect would take focus
-  // from the tab the user just moved to.
+  // It is cleared whenever the displayed tab is not the catalog (the effect below keys on
+  // `tab`, which derives from the URL), so a tab click, the tablist's arrow keys and a URL
+  // change that bypasses setTab (e.g. the app nav's Schedules link) all close it, and
+  // coming back never re-opens a dialog whose open effect would take focus from the tab
+  // the user just moved to.
   const [enableDialogSlug, setEnableDialogSlug] = useState<string | null>(null);
+  useEffect(() => {
+    if (tab !== "catalog") setEnableDialogSlug(null);
+  }, [tab]);
   const setTab = (t: Tab) => {
-    if (t !== "catalog") setEnableDialogSlug(null);
     setSearchParams(
       (prev) => {
         const next = new URLSearchParams(prev);

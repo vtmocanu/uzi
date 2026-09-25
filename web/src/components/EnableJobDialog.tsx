@@ -209,12 +209,12 @@ function EnablePanel({
     [],
   );
 
-  // A selected repo that dropped out of `repos` (a reload after it was disconnected) leaves
-  // the selection: it can neither count in "Enable N" nor hold Enable on a check whose
-  // warn no longer renders. Derived here for the render that first sees the new list, and
-  // pruned from state below so the repo does not come back selected if it reappears.
-  const present = new Set(repos.map((r) => r.id));
+  // A selected repo that dropped out of `repos` (a reload after it was disconnected) is
+  // pruned from the selection (and its error) whenever the list changes, so it neither
+  // counts in "Enable N", nor holds Enable on a check whose warn no longer renders, nor
+  // comes back selected if it reappears.
   useEffect(() => {
+    const present = new Set(repos.map((r) => r.id));
     setPick((p) =>
       p.selected.every((id) => present.has(id))
         ? p
@@ -228,13 +228,12 @@ function EnablePanel({
         ? e
         : Object.fromEntries(Object.entries(e).filter(([id]) => present.has(id))),
     );
-    // `present` is derived from `repos`; re-running on the list is the intent.
-  }, [repos]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [repos]);
 
   const labels = entry.target === "sweep" ? (entry.labels ?? []) : [];
   const needsCheck = labels.length > 0;
   const locked = (id: string) => enabledRepoIds.has(id) || justEnabled.includes(id);
-  const newly = pick.selected.filter((id) => present.has(id) && !locked(id));
+  const newly = pick.selected.filter((id) => !locked(id));
   const checking = needsCheck && newly.some((id) => pick.checks[id] !== "done");
   const canEnable = newly.length > 0 && !checking && !busy && !submitting;
 
@@ -286,22 +285,23 @@ function EnablePanel({
     setFocusFailed(res.failed.map((f) => f.repoId));
   };
 
+  const pathOf = (r: Repo) => maskRepoPath(r.path_with_namespace, demo);
+  const q = query.trim().toLowerCase();
+  const listed = q === "" ? repos : repos.filter((r) => pathOf(r).toLowerCase().includes(q));
+  const warnRepos = needsCheck ? repos.filter((r) => newly.includes(r.id)) : [];
+
   useEffect(() => {
     if (!focusFailed) return;
     setFocusFailed(null);
-    const first = repos.find((r) => focusFailed.includes(r.id));
-    // Matched on the dataset rather than a selector, so no repo id needs CSS escaping. A
-    // failed repo hidden by the filter leaves focus on the panel itself.
+    // The first failed repo the filter still shows; with every failed repo filtered out,
+    // focus stays on the panel itself. Matched on the dataset rather than a selector, so no
+    // repo id needs CSS escaping.
+    const first = listed.find((r) => focusFailed.includes(r.id));
     const box = [...(panelRef.current?.querySelectorAll<HTMLInputElement>("input[data-repo-id]") ?? [])].find(
       (el) => el.dataset.repoId === first?.id,
     );
     (box ?? panelRef.current)?.focus();
   }, [focusFailed]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  const pathOf = (r: Repo) => maskRepoPath(r.path_with_namespace, demo);
-  const q = query.trim().toLowerCase();
-  const listed = q === "" ? repos : repos.filter((r) => pathOf(r).toLowerCase().includes(q));
-  const warnRepos = needsCheck ? repos.filter((r) => newly.includes(r.id)) : [];
 
   const primaryLabel = submitting
     ? "Enabling…"

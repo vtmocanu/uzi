@@ -145,6 +145,35 @@ describe("EnableJobDialog — submit and list changes", () => {
     expect(primary().textContent).toBe("Enable 2");
   });
 
+  it("a partial failure focuses the first failed repo the filter still shows, not one it hides", async () => {
+    // Enough repos to show the filter, with atlas listed before www.
+    const repos = [
+      ...REPOS,
+      { id: "repo-www", path_with_namespace: "vtmocanu/www" } as Repo,
+      ...Array.from({ length: 6 }, (_, i) => ({ id: `repo-x${i}`, path_with_namespace: `vtmocanu/x${i}` }) as Repo),
+    ];
+    const { dialog, box, primary, setRepos } = renderDialog({
+      entry: PROMPT,
+      onEnable: async () => ({
+        enabled: [],
+        failed: [
+          { repoId: "repo-atlas", message: "forge unreachable" },
+          { repoId: "repo-www", message: "forge unreachable" },
+        ],
+      }),
+    });
+    setRepos(repos);
+    fireEvent.click(box(/vtmocanu\/atlas/));
+    fireEvent.click(box(/vtmocanu\/www/));
+    // Filter atlas out of view; it stays selected.
+    fireEvent.change(within(dialog).getByRole("textbox", { name: "Filter repos" }), { target: { value: "www" } });
+    expect(within(dialog).queryByRole("checkbox", { name: /vtmocanu\/atlas/ })).toBeNull();
+    primary().focus();
+    await act(async () => fireEvent.click(primary()));
+
+    expect(document.activeElement).toBe(box(/vtmocanu\/www/));
+  });
+
   it("a selected repo that drops out of the list leaves the selection", () => {
     const { box, primary, setRepos } = renderDialog();
     fireEvent.click(box(/vtmocanu\/uzi/));

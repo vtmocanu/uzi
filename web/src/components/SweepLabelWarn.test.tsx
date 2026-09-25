@@ -103,7 +103,7 @@ describe("SweepLabelWarn — onCheckStateChange", () => {
     vi.useRealTimers();
   });
 
-  it("reports checking synchronously on mount, before any forge call, then done when the check settles", async () => {
+  it("reports checking on mount, before the debounce elapses or any forge call, then done when the check settles", async () => {
     vi.useFakeTimers();
     let settle: (v: { missing: string[] }) => void = () => {};
     mockApi.checkRepoLabels.mockReturnValue(new Promise((r) => (settle = r)));

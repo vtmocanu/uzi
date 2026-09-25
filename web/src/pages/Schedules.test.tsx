@@ -4,7 +4,7 @@
 // per-row enable toggle PATCHes { enabled } and adopts the server's returned row.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { MemoryRouter, useLocation, useNavigate } from "react-router-dom";
+import { Link, MemoryRouter, useLocation, useNavigate } from "react-router-dom";
 import { Schedules } from "./Schedules";
 import { api, type LastFire, type Schedule } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
@@ -834,6 +834,34 @@ describe("Schedules — tabs, landing and ?tab deep link (PRD #1645 D1)", () => 
     // Let any pending open effect run before judging focus.
     await act(async () => {});
     expect(document.activeElement).toBe(tabNamed(/^Job catalog/));
+  });
+
+  it("leaving the catalog by a link that bypasses the tab strip closes an open enable dialog too", async () => {
+    mockApi.listScheduleCatalog.mockResolvedValue(CATALOG);
+    mockApi.listRepos.mockResolvedValue(REPOS3);
+    // Stands in for the app nav's Schedules link: a plain URL change, no tab click, no
+    // outside mousedown (keyboard activation).
+    render(
+      <MemoryRouter initialEntries={["/schedules?tab=catalog"]}>
+        <Link to="/schedules">Nav schedules</Link>
+        <Schedules />
+        <LocationProbe />
+      </MemoryRouter>,
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "Enable Bug triage sweep on…" }));
+    const dialog = await screen.findByRole("dialog", { name: "Enable Bug triage sweep on" });
+    await waitFor(() => expect(document.activeElement).toBe(dialog));
+
+    fireEvent.click(screen.getByRole("link", { name: "Nav schedules" }));
+    await waitFor(() => expect(tabNamed(/^Schedules/).getAttribute("aria-selected")).toBe("true"));
+    expect(screen.getByTestId("loc").textContent).toBe("");
+
+    fireEvent.click(tabNamed(/^Job catalog/));
+    expect(tabNamed(/^Job catalog/).getAttribute("aria-selected")).toBe("true");
+    // Positive control: the catalog rendered again, with the card's Enable button.
+    expect(await screen.findByRole("button", { name: "Enable Bug triage sweep on…" })).toBeTruthy();
+    await act(async () => {});
+    expect(screen.queryByRole("dialog")).toBeNull();
   });
 
   it("counts every schedule of both origins, and pills catalog entries enabled nowhere", async () => {
