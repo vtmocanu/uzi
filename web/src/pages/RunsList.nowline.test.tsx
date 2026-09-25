@@ -4,6 +4,7 @@ import { cleanup, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { RunRow } from "./RunsList";
 import type { RunActivity, RunListItem } from "../lib/api";
+import { setDemoMode } from "../lib/demoMode";
 
 // PRD #1064 M3: the runs-list row's "now" line (read from the current_activity DTO), its
 // terminal-hiding, the ◐ badge suffix, and the D5 byte-compat guard. RunRow is rendered
@@ -105,7 +106,10 @@ function renderRow(run: RunListItem) {
   );
 }
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  setDemoMode(false);
+});
 
 describe("RunsList row now line (PRD #1064 M3)", () => {
   it("renders the now line for a non-terminal run carrying current_activity", () => {
@@ -121,7 +125,50 @@ describe("RunsList row now line (PRD #1064 M3)", () => {
     // The first in-progress milestone id (D4) is shown on the compact line.
     expect(screen.getByText("m2")).toBeTruthy();
     expect(screen.getByText("Expose heartbeat freshness gauge")).toBeTruthy();
-    expect(screen.getByText("40s")).toBeTruthy();
+    const age = screen.getByText("· 40s ago");
+    expect(age.previousElementSibling?.textContent).toBe("Expose heartbeat freshness gauge");
+    expect(age.className).not.toContain("ml-auto");
+  });
+
+  it("omits the age and its separator for an invalid activity timestamp", () => {
+    const { container } = renderRow(aRun({ current_activity: anActivity({ at: "invalid" }) }));
+    expect(screen.getByText("Expose heartbeat freshness gauge")).toBeTruthy();
+    expect(container.textContent).not.toContain("ago");
+    expect(container.querySelectorAll(".italic + span")).toHaveLength(0);
+  });
+
+  it("centres the logo group and keeps meta separators attached to their items", () => {
+    const { container } = renderRow(aRun({
+      worker_name: "worker A",
+      usage: { input_tokens: 1000, cache_read_tokens: 0, cache_creation_tokens: 0, output_tokens: 200, cost_usd: 0, cost_status: "subscription" },
+    }));
+    const title = screen.getByText("A run");
+    expect(title.parentElement?.parentElement?.className).toContain("items-center");
+    const meta = container.querySelector("p.flex.flex-wrap")!;
+    expect(meta.className).toContain("gap-x-2");
+    for (const item of Array.from(meta.children).slice(1)) {
+      expect(item.className).not.toContain("font-mono");
+      expect(item.className).toContain("inline-flex");
+      expect(item.firstElementChild?.textContent).toBe("·");
+    }
+    expect(meta.textContent).toContain("subscription");
+  });
+
+  it("keeps the MR separator outside its chip and masks repo and owner in demo mode", () => {
+    setDemoMode(true);
+    const { container } = render(
+      <MemoryRouter>
+        <RunRow run={aRun({ mr_iid: 12, repo_path: "private/project", owner_email: "alice.smith@example.test" })} now={NOW} showOwner />
+      </MemoryRouter>,
+    );
+    const meta = container.querySelector("p.flex.flex-wrap")!;
+    expect(meta.textContent).toContain("demo/project");
+    expect(meta.textContent).toContain("Alice");
+    expect(meta.textContent).not.toContain("private/");
+    expect(meta.textContent).not.toContain("alice.smith@");
+    const mrItem = Array.from(meta.children).find((item) => item.textContent?.includes("MR !12"))!;
+    expect(mrItem.firstElementChild?.textContent).toBe("·");
+    expect(mrItem.lastElementChild?.textContent).toBe("MR !12");
   });
 
   it("HIDES the now line for a terminal run even when current_activity is populated", () => {

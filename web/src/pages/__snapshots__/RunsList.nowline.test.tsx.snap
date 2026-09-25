@@ -16,7 +16,7 @@ exports[`RunsList row now line (PRD #1064 M3) > D5: a null-milestone null-activi
       data-live=""
     >
       <div
-        class="flex w-full min-w-0 items-start gap-2 sm:w-auto sm:flex-1"
+        class="flex w-full min-w-0 items-center gap-2 sm:w-auto sm:flex-1"
       >
         <span
           aria-label="Claude"
@@ -58,18 +58,34 @@ exports[`RunsList row now line (PRD #1064 M3) > D5: a null-milestone null-activi
                 7
               </span>
             </span>
-            <span>
-              · 
+            <span
+              class="inline-flex items-center gap-2"
+            >
+              <span
+                aria-hidden="true"
+              >
+                ·
+              </span>
               w1
             </span>
-            <span>
-              · 
+            <span
+              class="inline-flex items-center gap-2"
+            >
+              <span
+                aria-hidden="true"
+              >
+                ·
+              </span>
               7/5/2026, 12:00:00 PM
             </span>
             <span
-              class="font-mono tabular-nums"
+              class="inline-flex items-center gap-2 tabular-nums"
             >
-              · 
+              <span
+                aria-hidden="true"
+              >
+                ·
+              </span>
               running 40s
             </span>
           </p>

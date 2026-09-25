@@ -292,6 +292,7 @@ export function RunRow({
   // finished run read exactly as before (D5). Untrusted fields render escaped.
   const activity = run.current_activity;
   const showNow = activity != null && !isTerminalRun(run.status);
+  const age = showNow && activity ? activityAge(activity.at, now) : "";
   const nowMilestone = firstInProgressMilestoneId(run);
   // Issue #256 M3: a live, per-state duration token ("running 1h 30m", "ran 42m", …);
   // "" for a pre-feature/no-anchor run, which then adds nothing to the meta line.
@@ -350,7 +351,7 @@ export function RunRow({
         {/* The full-width leading group keeps the logo beside the title below sm while
             the badge cluster stacks underneath. Its min-w-0 title column still
             truncates long titles; above sm the groups share one row. */}
-        <div className="flex w-full min-w-0 items-start gap-2 sm:w-auto sm:flex-1">
+        <div className="flex w-full min-w-0 items-center gap-2 sm:w-auto sm:flex-1">
           <HarnessBadge harness={run.harness} variant="bare" />
           <div className="min-w-0 flex-1">
             {/* Issue #124: the run title is the forge ISSUE title — writable by anyone who
@@ -373,9 +374,7 @@ export function RunRow({
                 <span className="min-w-0 truncate italic text-muted">
                   {stripUnsafeChars(activity.agent_label || activity.detail || activity.tool)}
                 </span>
-                <span className="ml-auto shrink-0 whitespace-nowrap font-mono tabular-nums text-faint">
-                  {activityAge(activity.at, now)}
-                </span>
+                {age && <span className="shrink-0 whitespace-nowrap tabular-nums text-faint">· {age} ago</span>}
               </p>
             )}
             <p className="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-faint">
@@ -389,17 +388,17 @@ export function RunRow({
                   raised
                 />
               </span>
-              {run.worker_name && <span>· {run.worker_name}</span>}
-              {showOwner && run.owner_email && <span>· {maskEmail(run.owner_email, demo)}</span>}
-              <span>· {new Date(run.updated_at).toLocaleString()}</span>
-              {duration && <span className="font-mono tabular-nums">· {duration}</span>}
+              {run.worker_name && <span className="inline-flex items-center gap-2"><span aria-hidden>·</span>{run.worker_name}</span>}
+              {showOwner && run.owner_email && <span className="inline-flex items-center gap-2"><span aria-hidden>·</span>{maskEmail(run.owner_email, demo)}</span>}
+              <span className="inline-flex items-center gap-2"><span aria-hidden>·</span>{new Date(run.updated_at).toLocaleString()}</span>
+              {duration && <span className="inline-flex items-center gap-2 tabular-nums"><span aria-hidden>·</span>{duration}</span>}
               {run.mr_iid != null && (
                 // The "· " separator lives OUTSIDE MrChip (issue #1253): the inline merged
                 // chip is now a bordered box, so a dot passed through `label` would render
                 // inside the border. Mirror IssueView — keep only the "MR "/"PR " abbrev in
                 // `label`, and emit the separator as a sibling text node.
-                <span>
-                  ·{" "}
+                <span className="inline-flex items-center gap-2">
+                  <span aria-hidden>·</span>
                   <MrChip
                     variant="inline"
                     label={`${mrAbbrev(run.forge_type)} `}
@@ -421,18 +420,18 @@ export function RunRow({
                   shows its "so far" figure, which grows as phases fold. */}
               {run.usage && cost && (
                 <>
-                  <span className="font-mono tabular-nums">
-                    · {formatTokens(runUsageTotalTokens(run.usage))} tok
+                  <span className="inline-flex items-center gap-2 tabular-nums">
+                    <span aria-hidden>·</span>{formatTokens(runUsageTotalTokens(run.usage))} tok
                     {run.status === "running" ? " so far" : ""}
                   </span>
                   {/* PRD #1429 M4b (D7): metered shows the real $ figure; subscription/
                       unreported get an honest marker — never a silent omission that
                       reads as free, and never a bare "$0.00" for a non-metered run. */}
                   {cost.kind === "metered" ? (
-                    <span className="font-mono text-brand/90">· {cost.dollars}</span>
+                    <span className="inline-flex items-center gap-2 text-brand/90"><span aria-hidden>·</span>{cost.dollars}</span>
                   ) : (
-                    <span className="font-mono text-faint">
-                      · {cost.kind === "subscription" ? "subscription" : "cost n/a"}
+                    <span className="inline-flex items-center gap-2 text-faint">
+                      <span aria-hidden>·</span>{cost.kind === "subscription" ? "subscription" : "cost n/a"}
                     </span>
                   )}
                 </>
