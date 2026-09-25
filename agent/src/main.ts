@@ -197,6 +197,7 @@ export function buildRunExecutor(runId: string, codex: ClaimCodexSecrets | undef
         // materializes the per-run HOME with the wrong gid. provisionRoot takes its
         // computed default (path.dirname(provisionHomeDir)/provision).
         provisionHomeDir: sdkHomeRoot,
+        dockerWiring,
         // PRD #1493 M3: the worker-configured command-sandbox mode (never run/repo/model
         // input). Threaded into commandSandboxArgv's `--mode` token; degraded drives the
         // per-run feed line.

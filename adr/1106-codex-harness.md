@@ -352,6 +352,30 @@ handlers. M3 implements them; M4 exercises the full adversarial clause map.
 | Skills and instructions | Worker delivers only approved, sanitized skill content and instructions with the allocated per-agent grants; cloned-repo discovery supplies no authority. |
 | Native extensions | Native web, MCP, plugins, apps and hooks are off; no hook-bypass dependency. Needed run capabilities use worker callbacks. |
 
+### Docker-wired command confinement limit
+
+Docker-wired Codex commands can access DinD. On hosted Kubernetes workers, DinD
+shares all of `/data/runner` (`controller/internal/kube/render_dind.go:61`,
+`dindWorkdirDir`), so a Docker bind mount can read or write a sibling run's clone
+even when Landlock confines the command to its own run. The shared workdir may
+contain sensitive repository files. This shared-clone, same-owner cross-run
+disclosure and integrity residual is accepted for the opt-in Docker tier: hosted
+workers claim only their owner's runs (`api/internal/workersvc/service.go:2362`,
+`UserID: wkr.UserID`; `api/internal/store/queries/runtime.sql:768`,
+`WHERE r.user_id = @user_id`). Compose DinD does not share the run workdir.
+
+The DinD mount boundary prevents a direct Docker bind mount of the worker's
+token, data, nix or Codex cache volumes (`controller/internal/kube/render_test.go:1120`,
+`TestDindContainersMountNoneOfTheWorkersVolumes`). It does not guarantee
+credential isolation after Docker API access: in the supported non-rootless
+posture DinD runs privileged as real root, and a breakout can read node and
+co-scheduled pod secrets, including other users' credentials. That separate,
+owner-accepted node-root residual is documented in
+[PRD #89](../prds/done/89-optional-nonrootless-dind.md#security-framing); the
+Docker tier's broad-egress residual is recorded in
+[ADR-0285](0285-worker-egress-tier-trust-model.md). Host and context screener
+denials are regression checks, not containment after Docker API access.
+
 Every run/advice thread start or resume builder must explicitly provision the
 canonical project as `untrusted`, set `project_doc_max_bytes = 0`, and disable
 native extensions and hooks. This cannot rely on an unset trust value: pinned
