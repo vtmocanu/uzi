@@ -71,6 +71,23 @@ describe("filterShellenv (output allowlist)", () => {
     const filtered = filterShellenv('export PATH="/nix/bin:$PATH"\n', "/weird/$&/$1/bin");
     assert.strictEqual(filtered.PATH, "/nix/bin:/weird/$&/$1/bin");
   });
+
+  it("strips the `;` terminator real devbox shellenv puts on each export", () => {
+    // devbox 0.17.x emits `export KEY="value";` — the quote must not survive into the value.
+    const out = [
+      'export PATH="/data/provision/r/.devbox/nix/profile/default/bin:/usr/bin:/bin";',
+      'export NIX_SSL_CERT_FILE="/etc/ssl/certs/ca-certificates.crt";',
+    ].join("\n");
+    const filtered = filterShellenv(out, "/ignored");
+    assert.strictEqual(filtered.PATH, "/data/provision/r/.devbox/nix/profile/default/bin:/usr/bin:/bin");
+    assert.strictEqual(filtered.NIX_SSL_CERT_FILE, "/etc/ssl/certs/ca-certificates.crt");
+    for (const v of Object.values(filtered)) assert.ok(!/["';]/.test(v), `stray quote/terminator in ${v}`);
+  });
+
+  it("resolves $PATH and strips the terminator together, quoted or not", () => {
+    assert.strictEqual(filterShellenv('export PATH="/nix/bin:$PATH";\n', "/usr/bin:/bin").PATH, "/nix/bin:/usr/bin:/bin");
+    assert.strictEqual(filterShellenv("export LOCALE_ARCHIVE=/nix/loc ;\n", "/b").LOCALE_ARCHIVE, "/nix/loc");
+  });
 });
 
 describe("provisionTools", () => {
