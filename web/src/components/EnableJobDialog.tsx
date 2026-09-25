@@ -106,7 +106,10 @@ export function EnableJobDialog({
     [],
   );
 
-  // Keep the panel on-screen at phone width (ExtendTimePopover's clamp; a no-op in jsdom).
+  // Keep the panel inside the visible content area. The bounds are the enclosing <main>,
+  // not the viewport: on desktop the fixed sidebar covers the viewport's left edge, so a
+  // viewport clamp let a first-column card's panel slide under it. Without a <main> (or
+  // at phone width, where <main> spans the viewport) this reduces to the viewport clamp.
   useEffect(() => {
     if (!open) {
       setShiftPx(0);
@@ -119,11 +122,14 @@ export function EnableJobDialog({
       const vw = document.documentElement.clientWidth;
       if (!vw) return;
       const margin = 8;
+      const area = host.closest("main")?.getBoundingClientRect();
+      const minLeft = Math.max(0, area?.left ?? 0) + margin;
+      const maxRight = Math.min(vw, area && area.right > 0 ? area.right : vw) - margin;
       const hostRight = host.getBoundingClientRect().right;
       const naturalLeft = hostRight - panel.offsetWidth;
       let shift = 0;
-      if (naturalLeft < margin) shift = margin - naturalLeft;
-      else if (hostRight > vw - margin) shift = vw - margin - hostRight;
+      if (naturalLeft < minLeft) shift = minLeft - naturalLeft;
+      else if (hostRight > maxRight) shift = maxRight - hostRight;
       setShiftPx(shift);
     };
     clamp();

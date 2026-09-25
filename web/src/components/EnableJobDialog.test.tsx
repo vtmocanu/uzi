@@ -192,3 +192,51 @@ describe("EnableJobDialog — submit and list changes", () => {
     expect(primary().textContent).toBe("Enable 1");
   });
 });
+
+// Regression (PR #1662 review): the panel is right-aligned to its button, so a
+// first-column card's panel overflows left. The clamp used the viewport's left edge,
+// but on desktop the fixed sidebar covers it, so the panel slid under the sidebar
+// (measured in a browser: panel 222..542 px, <main> starting at 240). The clamp must
+// keep the panel inside the enclosing <main>.
+describe("EnableJobDialog — keeps the panel inside the content area", () => {
+  const rect = (left: number, right: number) =>
+    ({ left, right, top: 0, bottom: 0, width: right - left, height: 0, x: left, y: 0, toJSON: () => ({}) }) as DOMRect;
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    delete (HTMLElement.prototype as { offsetWidth?: number }).offsetWidth;
+    delete (document.documentElement as { clientWidth?: number }).clientWidth;
+  });
+
+  it("shifts a first-column panel right so it clears the sidebar", () => {
+    Object.defineProperty(document.documentElement, "clientWidth", { configurable: true, value: 1440 });
+    Object.defineProperty(HTMLElement.prototype, "offsetWidth", {
+      configurable: true,
+      get(this: HTMLElement) {
+        return this.getAttribute("role") === "dialog" ? 320 : 0;
+      },
+    });
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+      if (this.tagName === "MAIN") return rect(240, 1440);
+      // The dialog's host: the positioned wrapper around the "Enable on…" button.
+      if (this.querySelector(":scope > button") && this.classList.contains("inline-block")) return rect(460, 541);
+      return rect(0, 0);
+    });
+    render(
+      <main>
+        <EnableJobDialog
+          entry={PROMPT}
+          repos={REPOS}
+          enabledRepoIds={new Set()}
+          busy={false}
+          open
+          onOpenChange={() => {}}
+          onEnable={async (ids) => ({ enabled: ids, failed: [] })}
+        />
+      </main>,
+    );
+    const dialog = screen.getByRole("dialog", { name: `Enable ${PROMPT.name} on` });
+    // Natural left = 541 - 320 = 221; the content area starts at 240 + 8 px margin = 248.
+    expect(dialog.style.transform).toBe("translateX(27px)");
+  });
+});
