@@ -24,7 +24,7 @@ export function HarnessBadge({ harness, variant = "chip" }: { harness: Harness |
       aria-label={name}
       title={`Runs on ${name}`}
       className={variant === "bare"
-        ? "relative z-10 inline-flex h-7 w-7 flex-none items-center justify-center text-fg"
+        ? "inline-flex h-7 w-7 flex-none items-center justify-center text-fg"
         : "inline-flex h-5 w-5 flex-none items-center justify-center rounded-full border border-edge bg-ink text-fg"}
     >
       {name === "Claude" ? (

@@ -44,7 +44,7 @@ describe("HarnessBadge", () => {
     const name = harness === "claude" ? "Claude" : "Codex";
     const logo = screen.getByRole("img", { name });
     expect(logo.getAttribute("title")).toBe(`Runs on ${name}`);
-    expect(logo.className).toBe("relative z-10 inline-flex h-7 w-7 flex-none items-center justify-center text-fg");
+    expect(logo.className).toBe("inline-flex h-7 w-7 flex-none items-center justify-center text-fg");
     expect(logo.className).not.toMatch(/border|rounded|bg-/);
     expect(logo.querySelector("svg")?.getAttribute("class")).toContain("h-[22px] w-[22px]");
     expect(logo.querySelector("svg")?.getAttribute("aria-hidden")).toBe("true");
