@@ -394,15 +394,18 @@ export function buildSignalMcpServer(
                 "`in_progress` is the ids you are actively working on right now. This does NOT end your turn — keep working after calling it. " +
                 "It is purely informational: it does not commit, checkpoint, or gate anything.",
               {
+                // No `.default([])` on these (issue #1555): a Zod v4 defaulted field is
+                // treated as nonoptional by output-mode validation (and listed as
+                // `required` in output-mode JSON Schema), so MCP tool-call validation
+                // rejected a call omitting it (-32602, seen via the deferred ToolSearch
+                // path). The handler ignores args; scanSignals treats a missing array as [].
                 completed: z
                   .array(z.string())
                   .optional()
-                  .default([])
                   .describe("Milestone ids reported complete (cumulative; repeats are fine)."),
                 in_progress: z
                   .array(z.string())
                   .optional()
-                  .default([])
                   .describe("Milestone ids currently being worked on (a snapshot, replaced each call)."),
                 milestones_agents: z
                   .array(z.object({ id: z.string(), agent: z.string(), agent_label: z.string().optional() }))

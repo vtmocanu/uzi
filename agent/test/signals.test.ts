@@ -861,6 +861,72 @@ describe("buildSignalMcpServer report_progress schema gate (PRD #122 M2)", () =>
   });
 });
 
+/** Drive a built MCP server through the REAL JSON-RPC path (initialize, initialized,
+ *  tools/call) over a tiny in-test transport, so the SDK's own argument validation
+ *  runs. Deliberately does not import @modelcontextprotocol/sdk (a transitive dep). */
+async function callToolOverJsonRpc(
+  server: unknown,
+  name: string,
+  args: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  type Msg = Record<string, unknown>;
+  const sent: Msg[] = [];
+  const transport: {
+    start(): Promise<void>;
+    send(m: Msg): Promise<void>;
+    close(): Promise<void>;
+    onmessage?: (m: Msg) => void;
+    onclose?: () => void;
+    onerror?: (e: Error) => void;
+  } = {
+    async start() {},
+    async send(m) {
+      sent.push(m);
+    },
+    async close() {
+      transport.onclose?.();
+    },
+  };
+  const instance = (server as { instance: { connect(t: unknown): Promise<void>; close(): Promise<void> } }).instance;
+  await instance.connect(transport);
+  const waitFor = async (id: number): Promise<Msg> => {
+    for (let i = 0; i < 2000; i++) {
+      const hit = sent.find((m) => m["id"] === id);
+      if (hit) return hit;
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    throw new Error(`no JSON-RPC response for id ${id}; got ${JSON.stringify(sent)}`);
+  };
+  try {
+    transport.onmessage!({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "test", version: "0" } },
+    });
+    const init = await waitFor(1);
+    assert.ok(!("error" in init), `initialize failed: ${JSON.stringify(init)}`);
+    transport.onmessage!({ jsonrpc: "2.0", method: "notifications/initialized" });
+    transport.onmessage!({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name, arguments: args } });
+    return await waitFor(2);
+  } finally {
+    await instance.close();
+  }
+}
+
+describe("report_progress tools/call with an omitted field (issue #1555)", () => {
+  it("accepts { in_progress } with completed omitted: no JSON-RPC error, no isError", async () => {
+    const res = await callToolOverJsonRpc(buildSignalMcpServer({ progress: true }), "report_progress", {
+      in_progress: ["m1"],
+    });
+    assert.ok(!("error" in res), `unexpected JSON-RPC error: ${JSON.stringify(res)}`);
+    const result = res["result"] as { isError?: boolean; content?: unknown[] } | undefined;
+    assert.ok(result, `expected a result; got ${JSON.stringify(res)}`);
+    assert.notStrictEqual(result!.isError, true, `tool returned isError: ${JSON.stringify(result)}`);
+    assert.ok((result!.content ?? []).length > 0, "expected the progress ack text");
+  });
+});
+
 describe("scanSignals checkpoint (PRD #122 M6)", () => {
   const CHECKPOINT = "mcp__uzi__checkpoint";
 

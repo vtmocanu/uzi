@@ -328,7 +328,9 @@ export function buildMemoryServer(deps: MemoryToolsDeps): {
             .describe(`The durable fact to remember, not a volatile snapshot like a test-pass count or version tally (≤${MEMORY_BODY_MAX_BYTES} bytes).`),
           basis: z
             .enum(["observed", "inferred"])
-            .default("inferred")
+            // Optional, not `.default()` (issue #1555): a defaulted field is `required`
+            // in output-mode JSON Schema. saveMemory applies the "inferred" default.
+            .optional()
             .describe(
               'Provenance of the claim: "observed" only when backed by a tool result, command output, or file:line you can name (put the pointer in evidence); otherwise "inferred". Defaults to "inferred".',
             ),

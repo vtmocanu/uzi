@@ -51,6 +51,11 @@ through `[0.52.0]`.)
 - **A label sweep no longer starves eligible issues behind a long run of ineligible ones ([#1543](https://github.com/vtmocanu/uzi/issues/1543)).**
   Sweep candidates are now filtered to eligible issues (carrying the configured `uzi` label, or assigned to the uzi-bot) before the scan window is cut, so a `bug`-labeled backlog with no `uzi` label at its head no longer permanently starves the eligible issues behind it; a capped fire's hint no longer suggests raising `--max-issues`, and a label sweep now reports `ineligible_matched`, the count of selector matches that aren't eligible, over its whole backlog rather than just the scan window.
 
+### Fixed
+
+- **`report_progress` and `save_memory` no longer reject a call that omits an optional field ([#1555](https://github.com/vtmocanu/uzi/issues/1555)).**
+  Omitting `completed`/`in_progress` on `report_progress`, or `basis` on `save_memory`, returned MCP `-32602` ("expected nonoptional") through the deferred ToolSearch path, because a Zod `.default()` makes the field required in output-mode validation. The fields are now plain optional (the worker already defaults them), and a test pins every uzi MCP tool so its output-mode JSON Schema requires nothing its input schema leaves optional.
+
 ## [0.84.0] - 2026-09-20
 
 ### Added
