@@ -1012,6 +1012,23 @@ describe("the shared root-entry drop wrapper", () => {
     assert.match(repair, /"\$CHOWN"\s+runner:runner\s+"\$dot"/, "each top-level dot entry is re-owned to runner");
     assert.doesNotMatch(repair, /"\$CHOWN"\s+-R/, "the repair must be NON-recursive (only top-level inodes are damaged)");
     assert.doesNotMatch(repair, /"\$CHMOD"/, "the repair must never chmod (no CAP_FOWNER)");
+    assert.match(repair, /"\$BUSYBOX"\s+stat\s+-c\s+%h\s+"\$dot"/, "the repair checks each dot entry's link count");
+  });
+
+  it("issue #1696: BOTH agent-home dot loops re-own only a real dir or a single-link regular file", () => {
+    // A runner-writable agent-home lets a hardlink to a worker-owned repos/ file be planted as a
+    // top-level dot entry; it passes [ -L ] / [ -e ], so each loop must filter on the link count
+    // BEFORE its chown, and treat a failed stat as "skip".
+    const loops = [...entrypoint.matchAll(/for dot in "\$DATA_DIR"\/agent-home\/[^\n]*; do\n([\s\S]*?)\n\s*done/g)].map((m) => m[1]);
+    assert.equal(loops.length, 2, "expected exactly two agent-home dot loops (legacy walk + (a2c) repair)");
+    for (const body of loops) {
+      const chownAt = body.search(/"\$CHOWN"/);
+      const guard = body.search(
+        /\[ -L "\$dot" \] && continue[^\n]*\n\s*if \[ ! -d "\$dot" \]; then[^\n]*\n\s*\[ -f "\$dot" \] \|\| continue[^\n]*\n\s*nlink=\$\("\$BUSYBOX" stat -c %h "\$dot" 2>\/dev\/null\) \|\| continue[^\n]*\n\s*\[ "\$nlink" = 1 \] \|\| continue[^\n]*\n\s*fi/,
+      );
+      assert.ok(guard >= 0, `dot loop must skip symlinks, non-regular non-dirs and hardlinked files:\n${body}`);
+      assert.ok(chownAt > guard, "the link-count filter must precede the chown");
+    }
   });
 
   it("PRD #1493 M2 change 5: PVC-root fsGroup alignment, gated on the setgid fingerprint (compose no-op)", () => {

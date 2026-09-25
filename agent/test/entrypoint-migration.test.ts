@@ -119,12 +119,23 @@ function makeHarness(opts: { mutate?: (patched: string) => string } = {}): Harne
   // posture (STUB_TOKEN_TARGET_POSTURE, default a valid kube posture) but fails (exit 1) on a
   // dangling chain ([ -e ] false) or when STUB_TOKEN_STAT_FAIL is set; without -L (lstat) it
   // returns the symlink's own 0777 (STUB_TOKEN_LINK_POSTURE). `cat` honors STUB_TOKEN_UNREADABLE
-  // (exit 1) as the dropped-worker read-denial seam, else reads for real.
+  // (exit 1) as the dropped-worker read-denial seam, else reads for real. Issue #1696: a
+  // `stat -c %h <path>` (the dot loops' link-count probe) is answered with the REAL link count
+  // from the host's stat (GNU or BusyBox, both support it); every other stat call keeps the
+  // token-posture behaviour above unchanged.
   writeStub(
     stubDir,
     "busybox",
     '#!/bin/sh\nsub=$1; shift\ncase "$sub" in\n' +
       "  stat)\n" +
+      '    if [ "$#" -eq 3 ] && [ "$1" = "-c" ] && [ "$2" = "%h" ]; then\n' +
+      "      for s in /usr/bin/stat /bin/stat /bin/busybox; do\n" +
+      '        [ -x "$s" ] || continue\n' +
+      '        if [ "$s" = /bin/busybox ]; then exec "$s" stat -c %h "$3"; fi\n' +
+      '        exec "$s" -c %h "$3"\n' +
+      "      done\n" +
+      "      exit 1\n" +
+      "    fi\n" +
       "    follow=\n" +
       '    for a in "$@"; do [ "$a" = "-L" ] && follow=1; done\n' +
       '    for p in "$@"; do target=$p; done\n' +
@@ -590,8 +601,11 @@ describe("PRD #1493 M2: root-branch migration ownership map (portable, record-on
   // devbox/nix, the chat SDK CLI). Its own top-level dot entries are that shared state, never a
   // per-run HOME, so they must end up runner-owned: wholesale (chown -R) inside the legacy walk,
   // and top-level-inode-only (non-recursive) in the separate one-time repair for volumes the old
-  // walk already damaged. Planted symlinks at the dot level (and one nested in .cache) prove
-  // neither path re-owns through a link into the worker-only repos/ cache.
+  // walk already damaged. Planted symlinks at the dot level (and one nested in .cache) and a
+  // top-level HARDLINK to a repos/ file are planted too. The harness only RECORDS ops and never
+  // walks the tree, so these tests prove only that no op NAMES a planted link; that the recursive
+  // chown does not traverse the NESTED .cache/devbox link rests on the measured BusyBox behaviour
+  // noted in entrypoint.sh, not on this test.
   const LEGACY_SENTINEL_NAME = ".uzi-legacy-split-migrated";
   const PROVISION_SENTINEL_NAME = ".uzi-provision-home-repaired";
   const LEGACY_BANNER = /one-time ownership-aware migration/;
@@ -617,6 +631,11 @@ describe("PRD #1493 M2: root-branch migration ownership map (portable, record-on
     fs.symlinkSync("../repos", path.join(ah, ".config"));
     fs.symlinkSync("../repos/x", path.join(ah, ".claude.json.bak"));
     fs.symlinkSync("../../repos", path.join(ah, ".cache", "devbox"));
+    // A HARDLINK to the worker's bare-repo config: it passes [ -L ] / [ -e ] / [ -f ], so only the
+    // link-count filter keeps root from handing that shared inode to runner.
+    fs.mkdirSync(path.join(h.data, "repos", "r.git"), { recursive: true });
+    fs.writeFileSync(path.join(h.data, "repos", "r.git", "config"), "[core]\n");
+    fs.linkSync(path.join(h.data, "repos", "r.git", "config"), path.join(ah, ".gitconfig-planted"));
     fs.writeFileSync(h.token, "t");
     return { ah, runX, reposReal };
   }
@@ -636,15 +655,19 @@ describe("PRD #1493 M2: root-branch migration ownership map (portable, record-on
       const r = run(h, { STUB_NOOP: "1" });
       assert.equal(r.status, 0, `repair run must succeed (stderr: ${r.stderr})`);
 
-      // Exactly the four real top-level dot entries, re-owned non-recursively (dirs AND the file).
-      for (const name of [".cache", ".local", ".claude", ".claude.json"]) {
-        assert.ok(r.ops.includes(`chown runner:runner ${ah}/${name}`), `${name} must be re-owned to runner (top-level inode)`);
-      }
+      // Exactly the four real top-level dot entries, re-owned non-recursively (dirs AND the
+      // single-link file); no other agent-home dot entry is chowned.
+      const dotChowns = r.ops.filter((o) => o.startsWith("chown ") && o.includes(`${ah}/.`)).sort();
+      assert.deepEqual(
+        dotChowns,
+        [".cache", ".claude", ".claude.json", ".local"].map((n) => `chown runner:runner ${ah}/${n}`),
+        "exactly the real dirs and the single-link dot file are re-owned (top-level inode only)",
+      );
       assert.ok(
         !r.ops.some((o) => o.startsWith("chown -R") && o.includes(`${ah}/`)),
         `the repair must never recurse under agent-home (ops: ${r.ops.join(" | ")})`,
       );
-      for (const frag of ["run-x", "codex-session-store", ".nix-profile", `${ah}/.config`, ".claude.json.bak", ".cache/devbox"]) {
+      for (const frag of ["run-x", "codex-session-store", ".nix-profile", `${ah}/.config`, ".claude.json.bak", ".cache/devbox", ".gitconfig-planted"]) {
         assert.ok(!r.ops.some((o) => o.includes(frag)), `no op may touch ${frag}`);
       }
       assert.deepEqual(opsReachingRepos(r.ops, reposReal, "chown"), [], "no chown may reach repos/");
@@ -683,8 +706,8 @@ describe("PRD #1493 M2: root-branch migration ownership map (portable, record-on
       for (const name of [".cache", ".local", ".claude", ".claude.json"]) {
         assert.ok(r.ops.includes(`chown -R runner:runner ${ah}/${name}`), `${name} must be re-owned to runner recursively`);
       }
-      for (const frag of [".nix-profile", `${ah}/.config`, ".claude.json.bak", ".cache/devbox"]) {
-        assert.ok(!r.ops.some((o) => o.includes(frag)), `planted symlink ${frag} must never be an op target`);
+      for (const frag of [".nix-profile", `${ah}/.config`, ".claude.json.bak", ".cache/devbox", ".gitconfig-planted"]) {
+        assert.ok(!r.ops.some((o) => o.includes(frag)), `planted link ${frag} must never be an op target`);
       }
       assert.deepEqual(opsReachingRepos(r.ops, reposReal, "chown"), [], "no chown may reach repos/");
       assert.deepEqual(opsReachingRepos(r.ops, reposReal, "chmod"), [], "no chmod may reach repos/");

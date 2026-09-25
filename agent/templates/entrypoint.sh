@@ -355,12 +355,15 @@ if [ ! -f "$LEGACY_SENTINEL" ]; then
   #       ever descends REAL directories. A legitimate carve-out child / per-run HOME / epoch is
   #       always a real path; a symlink there is never something the migration needs to re-own.
   #
-  # KNOWN, ACCEPTED, NARROW RESIDUAL (deliberately NOT "fixed" with an nlink filter): `[ -L ]` cannot
+  # KNOWN, ACCEPTED, NARROW RESIDUAL (no nlink filter INSIDE the recursive walks): `[ -L ]` cannot
   # catch a HARDLINK. A legacy-planted hardlink from inside a migrated tree to an existing
   # repos/<repo> FILE would transfer that single inode's ownership to `runner` via `chown -R` (files
   # only, same-fs, the target must pre-exist). This is far narrower than the symlink class (no
   # directory trees, no new inodes), and a general defense is impractical: git LEGITIMATELY hardlinks
   # pack/object files, so an `nlink > 1` skip would break real clones. Documented and accepted.
+  # The shared HOME's dot loops (below, and the (a2c) repair) DO filter their own TOP-LEVEL entry:
+  # only a real directory or a regular file with a link count of exactly 1 is re-owned, so for the
+  # shared HOME this residual stays scoped to hardlinks NESTED inside its recursively re-owned trees.
   #
   # "$DATA_DIR"/runner + /provision: re-own retained content to `runner`, preserving it. Only the
   # PARENT's CHILDREN are re-owned (the parents stay worker:runner, set just above).
@@ -409,9 +412,17 @@ if [ ! -f "$LEGACY_SENTINEL" ]; then
     # on the digest-pinned node:24-alpine base (no coreutils), and a BusyBox v1.37.0 `chown -R`
     # measured 2026-09-25 re-owned a nested dir- or file-symlink itself and left its target
     # untouched. That is a measurement of this binary, not a claim about chown in general.
+    # A top-level HARDLINK (a regular file with nlink > 1, e.g. one planted to a repos/<r>.git
+    # file) is skipped too, as is anything that is neither a directory nor a regular file (fifo,
+    # socket, device): only a real dir or a single-link regular file is re-owned. A failed stat
+    # counts as "skip".
     for dot in "$DATA_DIR"/agent-home/.[!.]* "$DATA_DIR"/agent-home/..?*; do
       [ -L "$dot" ] && continue                         # never hand a planted symlink to a chown -R
-      [ -e "$dot" ] || continue
+      if [ ! -d "$dot" ]; then
+        [ -f "$dot" ] || continue                       # not a dir or regular file (or absent): skip
+        nlink=$("$BUSYBOX" stat -c %h "$dot" 2>/dev/null) || continue
+        [ "$nlink" = 1 ] || continue                    # a hardlinked file: never re-own the shared inode
+      fi
       "$CHOWN" -R runner:runner "$dot"
     done
   fi
@@ -426,10 +437,14 @@ fi
 # legacy mode (no CAP_FOWNER to chmod it) and a top-level dot FILE such as .claude.json was skipped
 # and left worker:worker, so the runner could not use them. Affected volumes already carry
 # LEGACY_SENTINEL, so a fix inside that block never runs for them; this separate sentinel does.
-# The old walk already chown -R'd every CHILD of each dot dir to runner, so only the top-level
-# inodes are damaged: the repair is NON-recursive, which also keeps the documented hardlink residual
-# (see the legacy block) from being widened to a post-split runner, and a per-entry loop (not a
-# fixed dir list) also covers .claude.json. It runs once on a fresh volume too (idempotent there).
+# The old walk already chown -R'd every non-symlink CHILD of each dot dir to runner, so only the
+# top-level inodes are damaged. A post-split runner can write agent-home (worker:runner, group
+# writable) and so could plant a hardlink there to a worker-owned file (e.g. a repos/<r>.git
+# config) before this repair runs. The repair is NON-recursive, which keeps any NESTED hardlink out
+# of reach, and a TOP-LEVEL hardlink is excluded by the filter: only a real directory or a regular
+# file with a link count of exactly 1 is re-owned (symlinks, hardlinked files, fifos, sockets and
+# devices are skipped; a failed stat counts as "skip"). A per-entry loop (not a fixed dir list)
+# also covers .claude.json. It runs once on a fresh volume too (idempotent there).
 # Chown only, never chmod (no CAP_FOWNER). A runner-owned 0700 .claude is unreadable to the worker's
 # resume probe, which fails open (sdk-session.ts: "leaving the resume as-is"), as on a fresh volume.
 PROVISION_HOME_SENTINEL="$DATA_DIR/.uzi-provision-home-repaired"
@@ -439,7 +454,11 @@ if [ ! -f "$PROVISION_HOME_SENTINEL" ]; then
   if [ -d "$DATA_DIR/agent-home" ]; then
     for dot in "$DATA_DIR"/agent-home/.[!.]* "$DATA_DIR"/agent-home/..?*; do
       [ -L "$dot" ] && continue                         # never re-own through a planted symlink
-      [ -e "$dot" ] || continue
+      if [ ! -d "$dot" ]; then
+        [ -f "$dot" ] || continue                       # not a dir or regular file (or absent): skip
+        nlink=$("$BUSYBOX" stat -c %h "$dot" 2>/dev/null) || continue
+        [ "$nlink" = 1 ] || continue                    # a hardlinked file: never re-own the shared inode
+      fi
       "$CHOWN" runner:runner "$dot"                     # top-level inode only, NON-recursive
     done
   fi
