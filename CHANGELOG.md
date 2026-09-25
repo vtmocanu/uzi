@@ -22,11 +22,6 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
-### Fixed
-
-- **Run-list rows align the harness logo with the badges and keep the activity age beside its step ([#1708](https://github.com/vtmocanu/uzi/pull/1708)).**
-  The row's meta items now use consistent separators and typography, while long live-activity text still truncates cleanly and invalid activity timestamps show no age.
-
 ## [0.84.0] - 2026-09-20
 
 ### Added
@@ -183,6 +178,9 @@ through `[0.52.0]`.)
   Before, orphaned grandchildren stayed zombies until the command ended, so liveness probes and process-group checks saw dead processes as alive.
 - **A missing command in a provisioned devbox environment fails with "not found" again instead of a permission error ([#1685](https://github.com/vtmocanu/uzi/issues/1685), PR [#1694](https://github.com/vtmocanu/uzi/pull/1694)).**
   The provisioned `PATH` no longer includes a HOME nix-profile directory the runner cannot search, which turned ENOENT into EACCES.
+
+- **Run-list rows align the harness logo with the badges and keep the activity age beside its step ([#1708](https://github.com/vtmocanu/uzi/pull/1708)).**
+  The row's meta items now use consistent separators and typography, while long live-activity text still truncates cleanly and invalid activity timestamps show no age.
 
 ### Changed
 
