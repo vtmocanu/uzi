@@ -57,11 +57,11 @@ through `[0.52.0]`.)
 - **A long implementation turn now reaches a checkpoint without waiting for a milestone ([#1597](https://github.com/vtmocanu/uzi/issues/1597)).**
   A repeating mid-turn tick (`CHECKPOINT_TICK_INTERVAL`, default 5m, 0 disables) fetches committed work into the worker's bare repository and publishes it to origin through the existing credential-free broker once `CHECKPOINT_INTERVAL` has elapsed, giving a best-effort bound of roughly `CHECKPOINT_INTERVAL` plus one tick interval (~25m at defaults) on worst-case data loss even mid-turn. The bound holds only while the tick runs (the clone is not git-busy), the scan is trusted and finding-free, and the broker accepts the publish; origin reachability alone does not provide it. Every such publish (the tick, the iteration-boundary tier, and a non-GitHub-forge milestone) is secret-scanned over the pinned range being packed, minus content already public, before it ships; a finding or an untrusted scan keeps the fetch-back local instead of publishing. Park/shutdown/pause/capture and every GitHub milestone publish stay unscanned, unchanged from before.
 
-- **The Schedules page is one operational list, with a Job catalog tab (#1645).**
+- **The Schedules page is one operational list, with a Job catalog tab ([#1645](https://github.com/vtmocanu/uzi/pull/1645)).**
   Every schedule, default and custom, now appears in one flat list with filters (source, paused, repo, job), sorting and a fold for fired one-shots. A separate Job catalog tab shows the default jobs as cards, each with an enable dialog that checks sweep labels before enabling and keeps failed repos for retry. `uzi schedule list` gains a SOURCE column, and the `schedule reset` help names everything a reset clears.
-- **Usage meters and run badges show the provider logo and account name (#1653).**
+- **Usage meters and run badges show the provider logo and account name ([#1653](https://github.com/vtmocanu/uzi/pull/1653)).**
   The sidebar lists Claude tokens and Codex accounts together, each with its provider icon, account name and usage meter, plus a link to Settings for the rest. Run lists and run details carry a provider chip for Claude and Codex runs alike, and the terminal dashboard labels Codex accounts and window lengths (`?` when a window length is unknown).
-- **Admin → Health puts what needs attention first (#1648).**
+- **Admin → Health puts what needs attention first ([#1648](https://github.com/vtmocanu/uzi/pull/1648)).**
   The tab now opens with the checks that need action, fully explained, followed by a compact, expandable inventory of every check and the fleet table in its own card. Health surfaces use the shared badge style with stable severity shapes, the Health count on the sidebar matches the other nav counts, and a card padding bug that affected pages across the app is fixed.
 
 ### Fixed
@@ -152,7 +152,7 @@ through `[0.52.0]`.)
 - **An interlocked run could hold at finalize with "completion identity unresolvable," or never freeze a milestone-less contract at all ([#1626](https://github.com/vtmocanu/uzi/issues/1626)).**
   The worker now also learns the frozen `contract_revision` from the ordinary `/state` acknowledgement, not only from the claim response, so a run claimed once before its plan was approved still resolves its identity once the contract later freezes. And a plan with no milestones now freezes an empty (`criteria: []`) contract instead of never freezing one, at the same point it always froze at (plan approval for a gated run, or the first plan-bearing `running` report for an autopilot run), so the run passes the completion check vacuously rather than being unable to ever complete. A run started from a seeded plan (`--plan-file`) is unaffected either way: it never sends a plan-bearing report, so it is never stamped interlocked to begin with.
 
-- **Codex execution deadlines cancel reliably under load (#1513).**
+- **Codex execution deadlines cancel reliably under load ([#1513](https://github.com/vtmocanu/uzi/pull/1513)).**
   A deadline now cancels its request even when background work is slow, and the deadline timer is cleaned up when the execution boundary settles.
 
 ### Changed
@@ -180,8 +180,8 @@ through `[0.52.0]`.)
 - **The agent's Bash guardrail now denies mass-signal kill commands ([#1576](https://github.com/vtmocanu/uzi/issues/1576)).**
   On both the Claude and Codex lanes, `pkill`, `killall`, `skill`, `fuser -k`, a `kill` of `0`, a negative (broadcast or process-group) target or a statically evaluated one (`$((-1))`, `$'-1'`, `$[-1]`, `{-1,}`), and a `kill` of PIDs enumerated by `lsof`/`pgrep`/`ps`/`fuser`/`pidof` in the same command (`kill $(lsof -ti :3000)`, `lsof -ti :3000 | xargs kill`) are denied, because they can kill the agent's own process tree. Stop a background task through the harness, or run `kill "$pid"` with the exact PID saved at launch as its own command: an enumerator anywhere in the same command is denied too. The body of a double-quoted `$(…)` or a backtick substitution is now screened for this rule only (`echo "$(pkill node)"` is denied, `echo "$(git push)"` is still allowed); a quoted-delimiter heredoc (`<<'EOF'`) is literal and skipped, so backticked prose in commit and PR bodies passes, but a heredoc line that starts with `pkill` is still denied. Defense in depth, not containment: a PID read from a file, a variable PID (`${x:--1}` included) and some quoting tricks are not caught, and `kill $((pid))` and `kill {1234,5678}` are over-denied. The screener also peels wrapper option values (`sudo -u root`, `sudo --us root`, `timeout -s 9 5`, `timeout --si 9 5`, `xargs -n 1`, `exec -a x`) and a leading `if`/`then`/`while`/`do`/`!`/`{`, so for the listed wrappers' documented options every rule, `git push` included, screens the command that runs after them.
 
-- **Chat describes run eligibility as the run label or bot assignment (#1629).**
-  When proposing an issue, chat no longer asks for a `prds/*.md` file or the `PRD` label. It says an issue can run when it carries the instance's run label or is assigned to the bot account, asks for the exact label name, and adds a label only with your agreement. Chat and tool text also say "forge issue" instead of "GitLab issue" (#1628).
+- **Chat describes run eligibility as the run label or bot assignment ([#1629](https://github.com/vtmocanu/uzi/pull/1629)).**
+  When proposing an issue, chat no longer asks for a `prds/*.md` file or the `PRD` label. It says an issue can run when it carries the instance's run label or is assigned to the bot account, asks for the exact label name, and adds a label only with your agreement. Chat and tool text also say "forge issue" instead of "GitLab issue" ([#1628](https://github.com/vtmocanu/uzi/pull/1628)).
 
 ## [0.83.1] - 2026-09-19
 
