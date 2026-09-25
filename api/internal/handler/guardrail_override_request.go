@@ -228,9 +228,10 @@ func (h *Handler) RequestGuardrailOverride(w http.ResponseWriter, r *http.Reques
 
 // guardrailOverrideDecidedKind is the notifications.kind for the row recorded (and the
 // Slack DM sent to the requesting member, PRD #1650 D3) when an admin approves or
-// rejects their guardrail-override request (PRD #1432 M3). The notifications table's kind + payload jsonb is generic (PRD #60), so a new
-// kind is free text needing no migration; the payload carries the rendered title/body,
-// the repo, and the decision. (issue #1432.)
+// rejects their guardrail-override request (PRD #1432 M3). The notifications table's
+// kind + payload jsonb is generic (PRD #60), so a new kind is free text needing no
+// migration; the payload carries the rendered title/body, the repo, and the decision.
+// (issue #1432.)
 const guardrailOverrideDecidedKind = "guardrail_override_decided"
 
 // guardrailOverrideRequestDTO maps a ListPendingGuardrailOverrideRequestsRow to the

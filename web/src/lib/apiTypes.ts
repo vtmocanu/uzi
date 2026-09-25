@@ -735,6 +735,13 @@ export interface Card {
   // has no branch, no CI, or the card has never run. Drives the per-card badge and
   // the Fix CI affordance.
   pipeline: PipelineStatus | null;
+  // Automatic CI fixing has stopped on the latest run's branch (PRD #1650 D3a): the
+  // attempt cap or a no-progress halt, so Fix CI is the user's to press. Read from the
+  // autofix ledger, not from `pipeline`, so it shows even with no cached pipeline.
+  // A current server always sends both (false / 0 when not halted); optional so the
+  // many typed Card literals in mocks and tests need not spell them out.
+  ci_autofix_halted?: boolean;
+  ci_autofix_attempts?: number;
 }
 
 export interface Board {

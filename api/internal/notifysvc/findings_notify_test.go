@@ -4,19 +4,18 @@ import (
 	"context"
 	"encoding/json"
 	"testing"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // coalescingStore models the notifications table just enough to exercise the PRD #333 D6
 // per-run coalescing path: it holds the rows Insert writes, resolves the latch row by
-// (user, run, kind) whatever its read_at (mirroring FindNotificationForRunKind, PRD #1650
-// D4), and rewrites a row's payload on update. That lets a
+// (user, run, kind) alone (it does not model read_at, so PRD #1650 D4's read-state
+// predicate is pinned only by the live-DB FindNotificationForRunKind test), and rewrites
+// a row's payload on update. That lets a
 // table test assert the row COUNT stays 1 across a run's findings while the payload count
 // climbs — the coalescing invariant — without a database.
 type coalescingStore struct {
@@ -175,11 +174,14 @@ func TestNotifyIncidentalFindingCapsFindingIDs(t *testing.T) {
 	}
 }
 
-// TestNotifyIncidentalFindingLatchIgnoresReadState pins PRD #1650 D4 at the service: a
-// second finding on a run whose latch row carries a non-null read_at (a row read before the
-// inbox was retired) still coalesces with NO second DM, while a finding on a DIFFERENT run
-// misses the latch and inserts + DMs.
-func TestNotifyIncidentalFindingLatchIgnoresReadState(t *testing.T) {
+// TestNotifyIncidentalFindingCoalescesSameRunInsertsNewRun pins the per-run DM latch at the
+// service: a second finding on the same run coalesces into the existing row with NO second
+// DM, while a finding on a DIFFERENT run misses the latch and inserts + DMs.
+//
+// It does NOT guard PRD #1650 D4 (the latch ignoring read_at): coalescingStore does not
+// model read_at, so it cannot see the SQL predicate. The real guard is the live-DB
+// TestFindNotificationForRunKindIgnoresReadStateLiveDB in internal/store.
+func TestNotifyIncidentalFindingCoalescesSameRunInsertsNewRun(t *testing.T) {
 	cs := &coalescingStore{}
 	slk := &fakeSlacker{}
 	svc := New(cs, slk, 0, nil)
@@ -197,14 +199,13 @@ func TestNotifyIncidentalFindingLatchIgnoresReadState(t *testing.T) {
 	if len(cs.rows) != 1 || slk.calls != 1 {
 		t.Fatalf("first finding: rows=%d dms=%d, want 1 and 1", len(cs.rows), slk.calls)
 	}
-	cs.rows[0].ReadAt = pgtype.Timestamptz{Time: time.Now(), Valid: true}
 
 	notify(run)
 	if len(cs.rows) != 1 {
-		t.Fatalf("second finding on the same run after the latch row was read: rows=%d, want 1 (coalesced)", len(cs.rows))
+		t.Fatalf("second finding on the same run: rows=%d, want 1 (coalesced)", len(cs.rows))
 	}
 	if slk.calls != 1 {
-		t.Fatalf("second finding on the same run after the latch row was read sent %d DMs total, want 1", slk.calls)
+		t.Fatalf("second finding on the same run sent %d DMs total, want 1", slk.calls)
 	}
 	if p := decodeFindingPayload(t, cs.rows[0].Payload); p.Count != 2 {
 		t.Errorf("coalesced count = %d, want 2", p.Count)

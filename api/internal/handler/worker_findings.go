@@ -110,10 +110,11 @@ func (h *Handler) WorkerCreateFinding(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// The capture is the durable write; the notification is a best-effort side effect that
-	// must never fail the 200 (the finding is already stored). Fire the coalesced inbox +
-	// Slack notification (D6) only when the coordinate ended up open/re-opened — a
-	// suppressed matching-hash re-report (notify==false) never notifies (the anti-nag
-	// guarantee, R2). Any error is logged and swallowed.
+	// must never fail the 200 (the finding is already stored). Fire the coalesced
+	// notification (D6: an event-log row that doubles as the per-run DM latch, plus the
+	// Slack DM) only when the coordinate ended up open/re-opened — a suppressed
+	// matching-hash re-report (notify==false) never notifies (the anti-nag guarantee,
+	// R2). Any error is logged and swallowed.
 	if notify {
 		h.notifyIncidentalFinding(r.Context(), finding)
 	}

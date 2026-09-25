@@ -1245,8 +1245,9 @@ func run() error {
 	// their Slack DMs (PRD #25 M3). Best-effort: a nil linker (never in production)
 	// would make those endpoints report Slack as unavailable.
 	h.SetSlackLinker(slackLinker)
-	// Wire the notifications write seam (PRD #46 M2) for future producers (the judge,
-	// M4). The M2 read endpoints don't need it; this makes the seam available.
+	// Wire the notifications write seam (PRD #46 M2) for the handler's producers (the
+	// judge review, guardrail override decisions, incidental findings). Nothing reads
+	// the rows back as an inbox (PRD #1650 D1): the Slack DM is the delivery.
 	h.SetNotifier(notifier)
 	// Hosted k8s workers (PRD #58 Decision 12). Only when the feature is on: off (the
 	// compose default) Routes mounts no controller endpoint, so the service would have

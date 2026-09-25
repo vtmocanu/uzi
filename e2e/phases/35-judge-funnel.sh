@@ -99,8 +99,13 @@ pass "funnel: the finished run was auto-judged; a review landed on the run-page 
 
 # The judge run is repo-less — the observable proxy for its Anthropic-only/no-PAT claim
 # (the wire-level no-PAT assertion is TestClaimJudgeWireCarriesNoPATValue).
-J_JUDGE="$(db_psql "SELECT id FROM runs WHERE kind='judge' AND target_run_id='$J_RUN' ORDER BY created_at DESC LIMIT 1")"
-[ -n "$J_JUDGE" ] || fail "PRD #46: no judge run row for target $J_RUN"
+# J_JUDGE is the judge run the review row records (run_reviews.judge_run_id, one review
+# per target), not the newest kind='judge' run for the target: a retried judge can add a
+# newer run row that never posted this review, which would flake the linkage check below.
+J_JUDGE="$(db_psql "SELECT judge_run_id FROM run_reviews WHERE target_run_id='$J_RUN'")"
+[ -n "$J_JUDGE" ] || fail "PRD #46: the review for target $J_RUN records no judge run"
+[ "$(db_psql "SELECT kind = 'judge' AND target_run_id = '$J_RUN' FROM runs WHERE id='$J_JUDGE'")" = t ] \
+  || fail "PRD #46: the review's judge run $J_JUDGE is not a judge run targeting $J_RUN"
 [ "$(db_psql "SELECT repo_id IS NULL FROM runs WHERE id='$J_JUDGE'")" = t ] \
   || fail "PRD #46: the judge run must be repo-less (no repo join, no forge PAT in its claim)"
 pass "judge run $J_JUDGE is repo-less (Anthropic-only claim; no forge PAT)"

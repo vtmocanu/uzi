@@ -861,6 +861,12 @@ var queryInventory = []queryPin{
 		"direct call: reset-on-green returns 1 for a present row and 0 for an absent one (the no-op case)"},
 	{"DeleteCIAutofixAttemptsNotIn", "ci_autofix.sql", "TestCIAutofixLiveDB",
 		"direct call: seeds three refs, keeps one, asserts exactly 2 evicted and the kept ref survives"},
+	{"ListCIAutofixHaltsForRepo", "ci_autofix.sql", "TestListCIAutofixHaltsForRepoLiveDB",
+		"direct call (PRD #1650 D3a board marker), asserted as an exact issue->attempts map: a " +
+			"halted newest-run branch with NO pipeline row is present, a halt_notified=false row is " +
+			"absent, an older run's halted branch (newest run elsewhere, or branch NULL) is absent, and " +
+			"a second repo's halt on the same ref does not leak (the ledger join's repo_id scope). " +
+			"Also driven end to end by the handler's TestBoardCardAutofixHaltLiveDB"},
 	{"GetActiveCIFixTargetForRef", "ci_autofix.sql", unpinnedPin,
 		"Arrived in PRD #71 M6 for the detector's active-run swallow cap. No live-DB test in " +
 			"internal/store executes it yet: its only production caller is the M6 poller detector " +

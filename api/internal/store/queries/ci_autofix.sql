@@ -161,3 +161,24 @@ WHERE repo_id = @repo_id::uuid AND ref = @ref;
 -- An empty keep-set clears the repo's ledger entirely.
 DELETE FROM ci_autofix_attempts
 WHERE repo_id = @repo_id::uuid AND ref <> ALL(@keep_refs::text[]);
+
+-- name: ListCIAutofixHaltsForRepo :many
+-- Board card "Autofix stopped" marker (PRD #1650 D3a): for each issue, whether the
+-- ledger row of its MOST RECENT run's branch has latched a halt (halt_notified), and
+-- the auto attempts spent. The latest_run CTE is ListRunPipelineStatusesForRepo's
+-- (newest run per issue, regardless of branch), so an older run's halted branch
+-- never marks a card whose newest run is on another branch. It deliberately does
+-- NOT join pipeline_statuses: that cache row exists only while a pipeline is
+-- cached, and a halt must stay visible without one. A ref with no issue card (a
+-- prompt-schedule MR) has no row here; the Slack halt DM is its only surface.
+WITH latest_run AS (
+    SELECT DISTINCT ON (r.issue_iid) r.issue_iid, r.branch
+    FROM runs r
+    WHERE r.repo_id = @repo_id::uuid AND r.issue_iid IS NOT NULL
+    ORDER BY r.issue_iid, r.created_at DESC
+)
+SELECT lr.issue_iid, a.attempt_count
+FROM latest_run lr
+JOIN ci_autofix_attempts a ON a.repo_id = @repo_id::uuid AND a.ref = lr.branch
+WHERE lr.branch IS NOT NULL AND lr.branch <> ''
+  AND a.halt_notified;
