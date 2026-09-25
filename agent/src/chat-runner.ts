@@ -305,6 +305,9 @@ export class ChatRunner {
         await batcher.close().catch(() => undefined);
         return;
       }
+      // Issue #1673: a message whose applied receipt was given up must not be completed over.
+      const unconfirmed = source.unconfirmedInput?.();
+      if (unconfirmed) throw new Error(unconfirmed);
       batcher.emit({ kind: "status", agent: "worker", payload: { text: chatEndText(result) } });
       await batcher.close();
       await reportState({ status: "completed" });
@@ -315,7 +318,7 @@ export class ChatRunner {
         await batcher.close().catch(() => undefined);
         return;
       }
-      const reason = redactText(errMessage(err));
+      const reason = redactText(source.unconfirmedInput?.() ?? errMessage(err));
       runLog.error("chat failed", { error: reason });
       batcher.emit({ kind: "error", agent: "worker", payload: { text: reason } });
       await batcher.close().catch(() => undefined);

@@ -973,7 +973,7 @@ describe("ChatSteering", () => {
     }
   });
 
-  it("marks the claim lost when stop gives up a routed follow-up's APPLIED, so the chat does not complete", async () => {
+  it("fails the chat visibly when stop gives up a routed follow-up's APPLIED, so it does not complete", async () => {
     const row = inp("follow_up", "unapplied");
     let applies = 0;
     const client = {
@@ -987,13 +987,14 @@ describe("ChatSteering", () => {
       assert.deepStrictEqual(await ch.awaitFollowUp(100_000), { kind: "message", text: "unapplied" });
       await ch.stop();
       assert.ok(applies >= 1);
-      assert.strictEqual(ch.claimLost(), true, "a routed, unapplied follow-up must be replayed by the next claim");
+      assert.strictEqual(ch.unconfirmedInput(), "could not confirm your message was applied; please resend it");
+      assert.strictEqual(ch.claimLost(), false, "nothing requeues a chat, so the loss must be visible, not silent");
     } finally {
       await ch.stop();
     }
   });
 
-  it("marks the claim lost when a routed follow-up's APPLIED fails 30 times on the active claim", async () => {
+  it("fails the chat visibly when a routed follow-up's APPLIED fails 30 times on the active claim", async () => {
     const row = inp("follow_up", "never confirmed");
     let applies = 0;
     const client = {
@@ -1005,8 +1006,9 @@ describe("ChatSteering", () => {
     ch.start();
     try {
       assert.deepStrictEqual(await ch.awaitFollowUp(100_000), { kind: "message", text: "never confirmed" });
-      for (let i = 0; i < 500 && !ch.claimLost(); i++) await tick(2);
-      assert.strictEqual(ch.claimLost(), true, "the chat must not complete over an unapplied follow-up");
+      for (let i = 0; i < 500 && !ch.unconfirmedInput(); i++) await tick(2);
+      assert.strictEqual(ch.unconfirmedInput(), "could not confirm your message was applied; please resend it");
+      assert.strictEqual(ch.claimLost(), false);
       assert.strictEqual(applies, 30);
     } finally {
       await ch.stop();

@@ -160,6 +160,24 @@ describe("ChatRunner — claim → session loop → complete (no clone, no MR)",
     assert.strictEqual(states.at(-1)?.status, "completed");
   });
 
+  it("reports failed with a clear reason, not completed, when a message's applied receipt was given up", async () => {
+    // Issue #1673: nothing requeues a chat, so a silent stop would leave the run running until the
+    // idle sweep completes it with the message lost. The chat ends failed, visibly.
+    const { states, client } = fakeClient();
+    const { queryFn } = fakeQuery();
+    const reason = "could not confirm your message was applied; please resend it";
+    const source: ChatInputSource = {
+      start() {},
+      async stop() {},
+      claimLost: () => false,
+      unconfirmedInput: () => reason,
+      async awaitFollowUp() { return { kind: "ended" }; },
+    };
+    await runner(client, new ChatExecutor(nullLogger(), homeDir, { queryFn }), source).execute(baseClaim());
+    assert.deepStrictEqual(states.map((state) => state.status), ["running", "failed"]);
+    assert.strictEqual(states.at(-1)?.failure_reason, reason);
+  });
+
   it("does not report a terminal state when the source loses its claim during the drain", async () => {
     const { states, client } = fakeClient();
     const { queryFn } = fakeQuery();

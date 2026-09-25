@@ -1362,6 +1362,9 @@ export interface ChatInputSource {
   awaitFollowUp(idleMs: number): Promise<ChatInput>;
   /** True when a receipt definitively fences this claim's old worker. */
   claimLost?(): boolean;
+  /** Issue #1673: set when a routed message's applied receipt was given up; the chat must end
+   *  failed with this reason, since nothing requeues a chat and completing would drop it. */
+  unconfirmedInput?(): string | undefined;
 }
 
 export interface ChatSteeringOptions {
@@ -1388,6 +1391,9 @@ export interface ChatSteeringOptions {
  * End chat also aborts a turn in flight, not just a parked wait.
  */
 /** The server has fenced this chat claim; its old worker must not report a terminal state. */
+/** Issue #1673: why a chat ends failed when its message's applied receipt cannot be confirmed. */
+const UNCONFIRMED_CHAT_REASON = "could not confirm your message was applied; please resend it";
+
 class ChatClaimLostError extends Error {
   constructor() {
     super("chat claim is no longer active");
@@ -1407,6 +1413,7 @@ export class ChatSteering implements ChatInputSource {
   private readonly routedIds = new Set<number>();
   private stopApplyAttempts = 0;
   private applyFailures = 0;
+  private unconfirmed: string | undefined;
   private waiter:
     | { resolve: (i: ChatInput) => void; idleMs: number; parkedAt: number }
     | undefined;
@@ -1500,6 +1507,23 @@ export class ChatSteering implements ChatInputSource {
 
   /** The server fenced this chat claim (inactive receipt, or a 404/409): route nothing more,
    *  end the chat, and let ChatRunner skip its terminal report. */
+  /** A routed message's applied receipt was given up. No worker path requeues a chat (the chat
+   *  claim takes only queued runs, and the missing-snapshot requeue skips chat), so a silent stop
+   *  would leave the run `running` until the idle sweep completes it with the message lost. End the
+   *  chat VISIBLY instead: ChatRunner reports it failed with this reason. */
+  private giveUpUnconfirmed(): void {
+    this.log.error("chat steering: giving up a routed message's applied receipt; failing the chat", { run_id: this.runId });
+    this.unconfirmed = UNCONFIRMED_CHAT_REASON;
+    this.held = undefined;
+    this.applyFailures = 0;
+    this.stopped = true;
+    if (!this.cancel.signal.aborted) this.cancel.abort(new Error(UNCONFIRMED_CHAT_REASON));
+  }
+
+  unconfirmedInput(): string | undefined {
+    return this.unconfirmed;
+  }
+
   private loseClaim(): void {
     this.held = undefined;
     this.lost = true;
@@ -1516,9 +1540,7 @@ export class ChatSteering implements ChatInputSource {
           break;
         }
         if (this.stopApplyAttempts >= STOP_APPLY_ATTEMPTS) {
-          // A routed follow-up is still unapplied: completing the chat would block its replay, so
-          // treat the claim as lost (no terminal report) and let the next claim replay it.
-          this.loseClaim();
+          this.giveUpUnconfirmed();
           break;
         }
         this.stopApplyAttempts++;
@@ -1571,9 +1593,7 @@ export class ChatSteering implements ChatInputSource {
           this.held = undefined;
           this.applyFailures = 0;
         } else if (this.held?.phase === "applied" && ++this.applyFailures >= ACTIVE_APPLY_ATTEMPTS) {
-          // A routed follow-up is still unapplied: completing the chat would block its replay, so
-          // treat the claim as lost (no terminal report), as the stop path does.
-          this.loseClaim();
+          this.giveUpUnconfirmed();
         }
         this.log.warn("chat steering: input poll failed", {
           run_id: this.runId,
