@@ -1159,7 +1159,9 @@ func (h *Handler) workerInputReceipt(w http.ResponseWriter, r *http.Request, app
 	if err != nil {
 		switch {
 		case errors.Is(err, workersvc.ErrRunNotOwned):
-			httpx.Error(w, http.StatusNotFound, "run not found")
+			// Typed, like the 409: the worker ends its flight only on reason "stale", and keeps
+			// retrying an untyped 404 (an older api pod without this route, mid-roll).
+			httpx.ErrorReason(w, http.StatusNotFound, "run not found", workersvc.ReceiptStale)
 		case errors.Is(err, workersvc.ErrInputReceiptInvalid):
 			httpx.Error(w, http.StatusBadRequest, "invalid input ids or capability")
 		case errors.Is(err, workersvc.ErrInputReceiptConflict):

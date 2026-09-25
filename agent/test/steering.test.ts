@@ -1500,7 +1500,7 @@ describe("input receipts", () => {
     }
   });
 
-  it("ends a settlement wait on a cancel or the report's own abort, leaving the outcome to the report", async () => {
+  it("rejects a settlement wait on a cancel or the report's own abort, so the report is not sent", async () => {
     for (const via of ["cancel", "report"] as const) {
       const row: UserInput = { id: 7, kind: "approve_plan", body: null };
       const cancel = new AbortController();
@@ -1519,8 +1519,66 @@ describe("input receipts", () => {
         const waiting = ch.awaitReceiptSettlement(report.signal);
         const started = Date.now();
         (via === "cancel" ? cancel : report).abort();
-        await waiting;
+        await assert.rejects(waiting, (err: Error) => err.name === "ReceiptWaitInterrupted", via);
         assert.ok(Date.now() - started < 200, `${via}: the abort ended the wait before the applied reply`);
+        // Already aborted: a later report is refused at once while the receipt is uncertain.
+        await assert.rejects(ch.awaitReceiptSettlement(report.signal.aborted ? report.signal : undefined),
+          (err: Error) => err.name === "ReceiptWaitInterrupted");
+      } finally {
+        await ch.stop();
+      }
+    }
+  });
+
+  it("ends the flight on a typed 404 (reason stale) from ACK or APPLIED", async () => {
+    for (const at of ["ack", "applied"] as const) {
+      const row: UserInput = { id: 7, kind: at === "ack" ? "approve_plan" : "follow_up", body: at === "ack" ? null : "seven" };
+      const typed = (path: string): RequestError =>
+        new RequestError("POST", path, 404, JSON.stringify({ error: "run not found", reason: "stale" }));
+      const cancel = new AbortController();
+      const client = {
+        getInputs: async () => ({ inputs: [row] }),
+        ackInputs: async () => {
+          if (at === "ack") throw typed("/inputs/ack");
+          return { inputs: [row], active: true };
+        },
+        applyInputs: async () => { throw typed("/inputs/applied"); },
+      } as unknown as WorkerClient;
+      const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), cancel);
+      ch.start();
+      try {
+        await until(() => ch.claimFence() !== undefined);
+        assert.strictEqual(ch.claimFence(), "stale", at);
+        assert.strictEqual((cancel.signal.reason as Error).name, "ClaimFencedSignal");
+      } finally {
+        await ch.stop();
+      }
+    }
+  });
+
+  it("gives up an ACK-phase batch at its attempt or time bound, so newer GETs flow", async () => {
+    for (const bound of ["attempts", "deadline"] as const) {
+      const row: UserInput = { id: 7, kind: "approve_plan", body: null };
+      let gets = 0;
+      let acks = 0;
+      const client = {
+        getInputs: async () => { gets++; return { inputs: [row] }; },
+        ackInputs: async () => {
+          acks++;
+          // Attempts: fail fast. Deadline: each attempt takes 20 ms, past a 50 ms deadline.
+          if (bound === "deadline") await tick(20);
+          throw new RequestError("POST", "/inputs/ack", 503, "unavailable");
+        },
+        applyInputs: async () => { throw Error("an unACKed batch must not apply"); },
+      } as unknown as WorkerClient;
+      const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController(), {
+        receiptDeadlineMs: bound === "deadline" ? 50 : 600_000,
+      });
+      ch.start();
+      try {
+        await until(() => gets >= 2);
+        assert.ok(bound === "attempts" ? acks >= 30 : acks < 30, `${bound}: ${acks} ACK attempts before the next GET`);
+        assert.strictEqual(ch.claimFence(), undefined, "an ACK bound drops the batch, it does not fence");
       } finally {
         await ch.stop();
       }

@@ -46,6 +46,7 @@ export class FakeApi {
   private readonly seenInputIds = new Map<string, Set<number>>();
   private readonly receiptFenceReason = new Map<string, string>();
   private readonly failingReceipts = new Map<"ack" | "applied", number>();
+  private readonly delayedReceipts = new Map<"ack" | "applied", number>();
   /** Issue #1673: receipt tests set this so a receipt for a run with no explicit claim
    *  generation fails loudly instead of being accepted as the only claim. */
   strictReceiptGenerations = false;
@@ -397,6 +398,11 @@ export class FakeApi {
     else this.failingReceipts.set(kind, status);
   }
 
+  /** Hold every `kind` receipt reply for `ms` before answering (0 restores immediate replies). */
+  delayInputReceipts(kind: "ack" | "applied", ms: number): void {
+    this.delayedReceipts.set(kind, ms);
+  }
+
   loseNextInputReceiptReply(kind: "ack" | "applied"): void {
     this.lostReceiptReplies.set(kind, (this.lostReceiptReplies.get(kind) ?? 0) + 1);
   }
@@ -666,6 +672,8 @@ export class FakeApi {
       const active = current === undefined || generation === current;
       // The claim's inactive reason, as the server names it (switch_pending | released | stale).
       const reason = active ? undefined : (this.receiptFenceReason.get(runId) ?? "stale");
+      const delay = this.delayedReceipts.get(kind) ?? 0;
+      if (delay > 0) await new Promise((r) => setTimeout(r, delay));
       const failing = this.failingReceipts.get(kind);
       if (failing !== undefined) return send(res, failing, { error: "fake: receipt failure" });
       const rows = this.inputsByRun.get(runId) ?? [];

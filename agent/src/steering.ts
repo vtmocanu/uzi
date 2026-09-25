@@ -191,15 +191,28 @@ class ClaimFencedSignal extends Error {
 }
 
 /** Issue #1673: the claim fence a failed receipt names: a 409's `reason` ("" for a row-state
- *  conflict), undefined for anything else. Only the new route's typed body fences a claim: an
- *  untyped 404 (an api pod that predates the route, mid-roll) is an availability error. */
+ *  conflict), a typed 404's `reason` ("stale": the run is not this worker's), undefined for
+ *  anything else. Only the new route's typed body fences a claim: an untyped 404 (an api pod that
+ *  predates the route, mid-roll) is an availability error and is retried. */
 function receiptFenceReason(err: unknown): string | undefined {
-  if (!(err instanceof RequestError) || err.status !== 409) return undefined;
+  if (!(err instanceof RequestError) || (err.status !== 409 && err.status !== 404)) return undefined;
+  let reason: unknown;
   try {
-    const reason = (JSON.parse(err.body) as { reason?: unknown }).reason;
-    return typeof reason === "string" ? reason : "";
+    reason = (JSON.parse(err.body) as { reason?: unknown }).reason;
   } catch {
-    return "";
+    reason = undefined;
+  }
+  if (err.status === 404) return reason === "stale" ? "stale" : undefined;
+  return typeof reason === "string" ? reason : "";
+}
+
+/** Issue #1673: a state report was interrupted (cancel, pause, switch or its own abort) while a
+ *  routed input's applied receipt was still uncertain. Thrown instead of letting the report go
+ *  out, since the server's guard would not yet see the input as applied. */
+class ReceiptWaitInterrupted extends Error {
+  constructor(readonly interruption: unknown) {
+    super(`state report interrupted while an operator input's applied receipt was uncertain: ${errMessage(interruption)}`);
+    this.name = "ReceiptWaitInterrupted";
   }
 }
 
@@ -263,7 +276,9 @@ export class SteeringChannel {
   /** Issue #1673: the one input batch in flight. No newer GET replaces it until its ACK and
    *  applied receipts settle: "ack" retries the same ids, "routed" is serviced by the waiters
    *  on the tick that routed it, "applied" retries the applied receipt without rerouting. */
-  private held: { ids: number[]; phase: "ack" | "routed" | "applied"; hasFollowUp: boolean; routedAt?: number } | undefined;
+  private held: { ids: number[]; phase: "ack" | "routed" | "applied"; hasFollowUp: boolean; heldAt: number; routedAt?: number } | undefined;
+  /** Consecutive failed ACK attempts for the held batch; bounded like the applied receipt. */
+  private ackFailures = 0;
   /** Applied attempts made since stop(); bounded by STOP_APPLY_ATTEMPTS. */
   private stopApplyAttempts = 0;
   /** Consecutive failed applied attempts on the active claim; bounded by ACTIVE_APPLY_ATTEMPTS. */
@@ -287,9 +302,11 @@ export class SteeringChannel {
     if (this.receiptFailure) throw this.receiptFailure;
     if (!this.receiptPending()) return;
     // Abort-aware: a cancel, pause or switch trip (the shared controller) or the report's own
-    // signal ends the wait, and the report then takes its own outcome.
+    // signal ends the wait by REJECTING, so the report does not go out without the applied receipt
+    // its server guard needs. Only the explicit `failed` path skips this wait (the runner).
     const signals = [this.cancel.signal, signal].filter((s): s is AbortSignal => s !== undefined);
-    if (signals.some((s) => s.aborted)) return;
+    const aborted = signals.find((s) => s.aborted);
+    if (aborted) throw new ReceiptWaitInterrupted(aborted.reason);
     await new Promise<void>((resolve, reject) => {
       const done = (): void => {
         clearTimeout(timer);
@@ -302,7 +319,7 @@ export class SteeringChannel {
       const onAbort = (): void => {
         const i = this.receiptWaiters.indexOf(waiter);
         if (i >= 0) this.receiptWaiters.splice(i, 1);
-        waiter.resolve();
+        waiter.reject(new ReceiptWaitInterrupted(signals.find((s) => s.aborted)?.reason));
       };
       // Deadline-bound even while an applied request is still in flight (a slow or hung reply).
       const timer = setTimeout(() => {
@@ -338,6 +355,7 @@ export class SteeringChannel {
   private releaseHeld(): void {
     this.held = undefined;
     this.applyFailures = 0;
+    this.ackFailures = 0;
     for (const w of this.receiptWaiters.splice(0)) w.resolve();
   }
 
@@ -374,6 +392,20 @@ export class SteeringChannel {
     const reason = receiptFenceReason(err);
     if (endsFlight(reason)) return this.endFencedFlight(reason!);
     if (reason !== undefined || definitiveReceiptError(err)) return this.releaseHeld();
+    if (this.held.phase === "ack") {
+      // Nothing is routed yet, so giving up only drops the batch: it blocks no report, but it
+      // would block every newer GET. The next GET reads the rows again.
+      const acks = ++this.ackFailures;
+      if (acks >= ACTIVE_APPLY_ATTEMPTS || this.now() - this.held.heldAt >= this.receiptDeadlineMs) {
+        this.log.warn("steering: giving up the ACK of a held batch; the next GET reads it again", {
+          run_id: this.runId,
+          attempts: acks,
+          error: errMessage(err),
+        });
+        this.releaseHeld();
+      }
+      return;
+    }
     if (this.held.phase !== "applied" || this.stopped) return;
     const attempts = ++this.applyFailures;
     if (attempts >= ACTIVE_APPLY_ATTEMPTS || this.receiptOverdue())
@@ -1219,6 +1251,7 @@ export class SteeringChannel {
               ids: batch.map((input) => input.id),
               phase: "ack",
               hasFollowUp: batch.some((input) => input.kind === "follow_up" && !!input.body?.trim()),
+              heldAt: this.now(),
             };
           }
           // PRD #1247 M5b: the credential-switch signal rides EVERY inputs response (incl. an
@@ -1468,6 +1501,7 @@ export class ChatSteering implements ChatInputSource {
             }
             // The waiter is serviced below; the applied receipt goes out on the next tick.
             this.held.phase = "applied";
+            this.applyFailures = 0;
           }
         } else if (this.held?.phase === "applied") {
           const receipt = await this.client.applyInputs(this.runId, this.held.ids, this.claimGeneration);
@@ -1481,7 +1515,11 @@ export class ChatSteering implements ChatInputSource {
         if (this.held && (endsFlight(reason) || reason === "switch_pending")) this.loseClaim();
         else if (this.held && (reason !== undefined || definitiveReceiptError(err)))
           this.held = undefined;
-        else if (this.held?.phase === "applied" && ++this.applyFailures >= ACTIVE_APPLY_ATTEMPTS) {
+        else if (this.held?.phase === "ack" && ++this.applyFailures >= ACTIVE_APPLY_ATTEMPTS) {
+          // Nothing routed yet: drop the batch so newer GETs flow; the next GET reads it again.
+          this.held = undefined;
+          this.applyFailures = 0;
+        } else if (this.held?.phase === "applied" && ++this.applyFailures >= ACTIVE_APPLY_ATTEMPTS) {
           // Nothing waits on a chat's applied receipt, so giving it up only drops the batch: the
           // next GET replays the rows, which are ACKed and applied again but not re-routed.
           this.held = undefined;

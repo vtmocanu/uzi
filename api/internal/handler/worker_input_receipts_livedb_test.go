@@ -370,4 +370,16 @@ func TestWorkerInputReceiptsLiveDB(t *testing.T) {
 	if out := call("POST", "/inputs/applied", lateBody, newer, 200); out["active"] != false || out["reason"] != "stale" {
 		t.Fatalf("applied retry after completion: %v", out)
 	}
+
+	// A run this worker cannot see answers a TYPED 404 (reason stale), so the worker can tell it
+	// from an untyped 404 of an older api pod that lacks the route and only retries that one.
+	for _, path := range []string{"/inputs/ack", "/inputs/applied"} {
+		saved := run
+		run = uuid.New()
+		out := call("POST", path, lateBody, newer, 404)
+		run = saved
+		if out["reason"] != "stale" {
+			t.Fatalf("%s on an unknown run: %v", path, out)
+		}
+	}
 }

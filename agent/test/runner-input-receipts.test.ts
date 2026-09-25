@@ -101,4 +101,32 @@ describe("RunRunner — input receipts (issue #1673)", () => {
       "no failure surfaced on the run feed",
     );
   });
+
+  it("sends no non-failed report when an abort lands while the approval's APPLIED is still uncertain", async () => {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(1676, { claim_generation: 5 });
+    api.setInputClaimGeneration(claim.run_id, 5);
+    api.onState(claim.run_id, (body) => {
+      if (body.status === "awaiting_approval") api.setInputs(claim.run_id, [input("approve_plan")]);
+    });
+    // The applied reply is slow; the worker shuts down (aborting the run's controller) while it is
+    // still in flight, so the resume report that waits on it must not go out.
+    api.delayInputReceipts("applied", 1_500);
+    const r = runner(new StubExecutor(nullLogger(), { planGate: true }), gitlab);
+    const running = r.execute(claim);
+    for (let i = 0; i < 500 && !api.inputReceiptCalls.some((c) => c.runId === claim.run_id && c.kind === "applied"); i++)
+      await new Promise((res) => setTimeout(res, 5));
+    assert.ok(api.inputReceiptCalls.some((c) => c.kind === "applied"), "the approval's APPLIED is in flight");
+    r.shutdown();
+    await running;
+
+    const statuses = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body.status);
+    const gate = statuses.indexOf("awaiting_approval");
+    assert.ok(gate >= 0, statuses.join(","));
+    assert.deepStrictEqual(
+      statuses.slice(gate + 1).filter((s) => s !== "failed"),
+      [],
+      `no non-failed report after the gate: ${statuses.join(",")}`,
+    );
+  });
 });
