@@ -149,11 +149,18 @@ describe("RunsList row now line (PRD #1064 M3)", () => {
     expect(meta.className).toContain("overflow-x-clip");
     for (const item of Array.from(meta.children).slice(1)) {
       expect(item.className).not.toContain("font-mono");
-      expect(item.className).toContain("relative inline-flex");
+      // No positioned item: a relative/absolute item would paint above the stretched run
+      // link and make the meta text a dead click zone (review of #1708).
+      expect(item.className).toContain("inline-flex");
+      expect(item.className).not.toMatch(/\b(relative|absolute)\b/);
       expect(item.className).not.toContain("gap-2");
       expect(item.firstElementChild?.textContent).toBe("·");
-      expect(item.firstElementChild?.className).toContain("absolute -left-4 w-4 text-center");
+      expect(item.firstElementChild?.className).toContain("-ml-4 w-4 shrink-0 text-center");
+      expect(item.firstElementChild?.getAttribute("aria-hidden")).toBe("true");
     }
+    expect(meta.children[0].className).not.toMatch(/\b(relative|absolute)\b/);
+    // A space precedes every hidden dot, so textContent and screen readers keep items apart.
+    expect(meta.textContent).toContain(" ·worker A");
     expect(meta.textContent).toContain("subscription");
   });
 

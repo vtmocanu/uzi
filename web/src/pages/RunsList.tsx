@@ -90,6 +90,23 @@ export function sortPast(a: RunListItem, b: RunListItem): number {
   return (PAST_STATUS_RANK[a.status] ?? 3) - (PAST_STATUS_RANK[b.status] ?? 3);
 }
 
+// MetaSep is the meta line's separator: an in-flow dot pulled into the preceding gap-x-4
+// by -ml-4, so it stays attached to the item after it and a wrapped line's leading dot
+// falls left of the line box, where the <p>'s overflow-x-clip hides it. It is in flow on
+// purpose: a positioned (relative/absolute) item would paint above the card's stretched
+// run link and turn the meta text into a dead click zone. The leading space keeps the
+// items apart in textContent and for screen readers; flex drops it visually.
+function MetaSep() {
+  return (
+    <>
+      {" "}
+      <span aria-hidden className="-ml-4 w-4 shrink-0 text-center">
+        ·
+      </span>
+    </>
+  );
+}
+
 // The meta line's "tok" figure is the run's ALL-token total (fresh + cached + cache
 // creation + output), matching the mock's single "1.33M tok".
 function runUsageTotalTokens(u: RunUsage): number {
@@ -378,7 +395,7 @@ export function RunRow({
               </p>
             )}
             <p className="mt-0.5 flex flex-wrap items-center gap-x-4 overflow-x-clip text-xs text-faint">
-              <span className="relative inline-flex min-w-0 max-w-full items-center gap-1">
+              <span className="inline-flex min-w-0 max-w-full items-center gap-1">
                 <span className="min-w-0 truncate">{maskRepoPath(run.repo_path, demo)}</span>
                 <span className="shrink-0">
                   <RunIssueRef
@@ -391,17 +408,17 @@ export function RunRow({
                   />
                 </span>
               </span>
-              {run.worker_name && <span className="relative inline-flex items-center"><span aria-hidden className="absolute -left-4 w-4 text-center">·</span>{run.worker_name}</span>}
-              {showOwner && run.owner_email && <span className="relative inline-flex items-center"><span aria-hidden className="absolute -left-4 w-4 text-center">·</span>{maskEmail(run.owner_email, demo)}</span>}
-              <span className="relative inline-flex items-center"><span aria-hidden className="absolute -left-4 w-4 text-center">·</span>{new Date(run.updated_at).toLocaleString()}</span>
-              {duration && <span className="relative inline-flex items-center tabular-nums"><span aria-hidden className="absolute -left-4 w-4 text-center">·</span>{duration}</span>}
+              {run.worker_name && <span className="inline-flex items-center"><MetaSep />{run.worker_name}</span>}
+              {showOwner && run.owner_email && <span className="inline-flex items-center"><MetaSep />{maskEmail(run.owner_email, demo)}</span>}
+              <span className="inline-flex items-center"><MetaSep />{new Date(run.updated_at).toLocaleString()}</span>
+              {duration && <span className="inline-flex items-center tabular-nums"><MetaSep />{duration}</span>}
               {run.mr_iid != null && (
                 // The "· " separator lives OUTSIDE MrChip (issue #1253): the inline merged
                 // chip is now a bordered box, so a dot passed through `label` would render
                 // inside the border. Mirror IssueView — keep only the "MR "/"PR " abbrev in
                 // `label`, and emit the separator as a sibling element.
-                <span className="relative inline-flex items-center">
-                  <span aria-hidden className="absolute -left-4 w-4 text-center">·</span>
+                <span className="inline-flex items-center">
+                  <MetaSep />
                   <MrChip
                     variant="inline"
                     label={`${mrAbbrev(run.forge_type)} `}
@@ -423,18 +440,18 @@ export function RunRow({
                   shows its "so far" figure, which grows as phases fold. */}
               {run.usage && cost && (
                 <>
-                  <span className="relative inline-flex items-center tabular-nums">
-                    <span aria-hidden className="absolute -left-4 w-4 text-center">·</span>{formatTokens(runUsageTotalTokens(run.usage))} tok
+                  <span className="inline-flex items-center tabular-nums">
+                    <MetaSep />{formatTokens(runUsageTotalTokens(run.usage))} tok
                     {run.status === "running" ? " so far" : ""}
                   </span>
                   {/* PRD #1429 M4b (D7): metered shows the real $ figure; subscription/
                       unreported get an honest marker — never a silent omission that
                       reads as free, and never a bare "$0.00" for a non-metered run. */}
                   {cost.kind === "metered" ? (
-                    <span className="relative inline-flex items-center text-brand/90"><span aria-hidden className="absolute -left-4 w-4 text-center">·</span>{cost.dollars}</span>
+                    <span className="inline-flex items-center text-brand/90"><MetaSep />{cost.dollars}</span>
                   ) : (
-                    <span className="relative inline-flex items-center text-faint">
-                      <span aria-hidden className="absolute -left-4 w-4 text-center">·</span>{cost.kind === "subscription" ? "subscription" : "cost n/a"}
+                    <span className="inline-flex items-center text-faint">
+                      <MetaSep />{cost.kind === "subscription" ? "subscription" : "cost n/a"}
                     </span>
                   )}
                 </>
