@@ -242,6 +242,13 @@ never sends the plan-bearing report the check hooks into. Turning it off is an
 explicit, instance-wide kill-switch — an issue run created while it's off
 behaves as it did before this feature existed, and a run created before the
 switch was ever flipped keeps whatever the switch said at its own creation.
+
+A worker must also advertise the `completion_interlock_v1` protocol
+capability (shipped in v0.83.0) to claim a stamped run in the first place. If
+no online worker implements it, the run stays queued and its health reason
+says so directly: "no online worker implements the completion interlock
+(completion_interlock_v1); provision a capable worker." Upgrade your workers
+to clear that, or turn Completion check off above.
 See [Completion holds and the structural interlock](./run-completion-hold.md)
 for what the check does and what an owner sees when it catches something.
 

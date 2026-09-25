@@ -24,6 +24,14 @@ is never interlocked in the first place. And a run created before this
 default changed is unaffected either way: the switch is read once, when the
 run is created, never retroactively against a run already in flight.
 
+This default also gates who can pick up the run: a worker must advertise the
+`completion_interlock_v1` protocol capability (shipped in v0.83.0) to claim a
+stamped run at all. If no online worker advertises it, the run stays queued,
+and its health reason names it directly: "no online worker implements the
+completion interlock (completion_interlock_v1); provision a capable worker."
+Upgrade your workers to clear it, or turn Completion check off if you'd
+rather run without the interlock for now.
+
 ## Why a run holds
 
 An interlocked run signals done only after every milestone in its frozen plan
