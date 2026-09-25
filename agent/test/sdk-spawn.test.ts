@@ -95,66 +95,41 @@ describe("killProcessGroupOnly (issue #1656)", () => {
 });
 
 describe("processGroupPresent (issue #1656)", () => {
-  // A fake procfs: `<root>/self/mountinfo` plus one `<root>/<pid>/stat` per entry.
-  function fakeProc(opts: { superOpts?: string; mountinfo?: boolean; stats?: Record<string, string> }): string {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-fakeproc-"));
-    if (opts.mountinfo !== false) {
-      fs.mkdirSync(path.join(root, "self"));
-      fs.writeFileSync(
-        path.join(root, "self", "mountinfo"),
-        `22 1 0:5 / / rw,relatime - overlay overlay rw\n` +
-          `23 22 0:21 / ${root} rw,nosuid,nodev,noexec,relatime - proc proc ${opts.superOpts ?? "rw"}\n`,
-      );
-    }
-    for (const [pid, stat] of Object.entries(opts.stats ?? {})) {
-      fs.mkdirSync(path.join(root, pid));
-      fs.writeFileSync(path.join(root, pid, "stat"), stat);
-    }
-    return root;
-  }
-  const stat = (pid: number, comm: string, pgrp: number, state = "S"): string =>
-    `${pid} (${comm}) ${state} 1 ${pgrp} ${pgrp} 0 -1 4194560 0 0 0 0\n`;
-
-  const cases: Array<[string, Parameters<typeof fakeProc>[0], boolean | undefined]> = [
-    ["a member (comm with spaces and parens) is present", { stats: { "7": stat(7, "a) (b", 4242) } }, true],
-    ["a zombie member still counts as present", { stats: { "7": stat(7, "sh", 4242, "Z") } }, true],
-    ["no member is absent", { stats: { "7": stat(7, "sh", 7), "8": stat(8, "node", 8) } }, false],
-    ["hidepid=2 is unknowable", { superOpts: "rw,hidepid=2", stats: { "7": stat(7, "sh", 7) } }, undefined],
-    ["hidepid=invisible is unknowable", { superOpts: "rw,hidepid=invisible", stats: { "7": stat(7, "sh", 7) } }, undefined],
-    ["hidepid=ptraceable is unknowable", { superOpts: "rw,hidepid=ptraceable", stats: { "7": stat(7, "sh", 7) } }, undefined],
-    ["numeric hidepid=4 is unknowable", { superOpts: "rw,hidepid=4", stats: { "7": stat(7, "sh", 7) } }, undefined],
-    ["an unrecognised future hidepid value is unknowable", { superOpts: "rw,hidepid=someday", stats: { "7": stat(7, "sh", 7) } }, undefined],
-    ["any subset= value is unknowable", { superOpts: "rw,subset=sysfs", stats: { "7": stat(7, "sh", 7) } }, undefined],
-    ["hidepid=0 counts as complete", { superOpts: "rw,hidepid=0", stats: { "7": stat(7, "sh", 4242) } }, true],
-    ["hidepid=off counts as complete", { superOpts: "rw,hidepid=off", stats: { "7": stat(7, "sh", 7) } }, false],
-    ["subset=pid is unknowable", { superOpts: "rw,subset=pid", stats: { "7": stat(7, "sh", 7) } }, undefined],
-    ["no mountinfo is unknowable", { mountinfo: false, stats: { "7": stat(7, "sh", 7) } }, undefined],
-    ["a scan that sees no process is unknowable", { stats: {} }, undefined],
-    ["a malformed stat is unknowable", { stats: { "7": "garbage" } }, undefined],
+  // The kernel is the authority: `kill(-pgid, 0)` is an atomic existence check on the group,
+  // unlike any listing of processes. ESRCH ⇒ absent; success or EPERM (a live runner group seen
+  // from the worker uid under the split) ⇒ present; anything else ⇒ unknowable.
+  const errno = (code: string): Error => Object.assign(new Error(code), { code });
+  const cases: Array<[string, () => true, boolean | undefined]> = [
+    ["a delivered probe signal means present", () => true, true],
+    ["EPERM means present (a live group of another uid)", () => { throw errno("EPERM"); }, true],
+    ["ESRCH means absent", () => { throw errno("ESRCH"); }, false],
+    ["any other error is unknowable", () => { throw errno("EINVAL"); }, undefined],
+    ["an error with no code is unknowable", () => { throw new Error("boom"); }, undefined],
   ];
-  for (const [label, spec, want] of cases) {
+  for (const [label, kill, want] of cases) {
     it(label, () => {
-      const root = fakeProc(spec);
-      try {
-        assert.strictEqual(processGroupPresent(4242, root), want);
-      } finally {
-        fs.rmSync(root, { recursive: true, force: true });
-      }
+      const calls: Array<[number, string | number | undefined]> = [];
+      const got = processGroupPresent(4242, (pid, signal) => {
+        calls.push([pid, signal]);
+        return kill();
+      });
+      assert.strictEqual(got, want);
+      assert.deepStrictEqual(calls, [[-4242, 0]], "probes the GROUP with signal 0, nothing else");
     });
   }
 
-  it("a procfs root that does not exist is unknowable", () => {
-    assert.strictEqual(processGroupPresent(4242, path.join(os.tmpdir(), `uzi-no-proc-${process.pid}`)), undefined);
+  it("a non-positive pgid is unknowable and probes nothing", () => {
+    let called = false;
+    const probe = (): true => { called = true; return true; };
+    assert.strictEqual(processGroupPresent(0, probe), undefined);
+    assert.strictEqual(processGroupPresent(-5, probe), undefined);
+    assert.strictEqual(called, false);
   });
 
-  it("on the real procfs, tracks a detached group through its group kill (Linux) or is unknowable", async () => {
+  it("tracks a real detached group through its group kill", async () => {
     const child = spawnDetached(spawnOpts("sleep", ["30"]));
     try {
       assert.ok(typeof child.pid === "number" && child.pid > 0);
-      if (!fs.existsSync("/proc/self/stat")) {
-        assert.strictEqual(processGroupPresent(child.pid), undefined, "no procfs: never reported absent");
-        return;
-      }
       assert.strictEqual(processGroupPresent(child.pid), true);
       assert.strictEqual(killProcessGroupOnly(child.pid), true);
       assert.strictEqual(await waitUntil(() => processGroupPresent(child.pid!) === false), true);

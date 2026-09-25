@@ -317,6 +317,78 @@ describe("SdkExecutor foreign CLI signal death (issue #1656)", () => {
     assert.deepEqual(turns.map((t) => t.options.resume), [undefined, "sess-A", "sess-B"]);
   });
 
+  it("a subagent frame's session id never replaces the turn's init session as the resume target", async () => {
+    const initB = { type: "system", subtype: "init", session_id: "sess-B" } as unknown as SDKMessage;
+    const subFrame = {
+      type: "assistant",
+      session_id: "sess-SUB",
+      subagent_type: "coder",
+      parent_tool_use_id: "p1",
+      message: { content: [{ type: "text", text: "sub work" }] },
+    } as unknown as SDKMessage;
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("# Plan", "sess-A"), resultSuccess("sess-A")],
+      dies(sdkSignal("SIGTERM"), [initB, assistantText("working", "sess-B"), subFrame]),
+      [signalDone("sess-B"), resultSuccess("sess-B")],
+    ]);
+    const result = await new SdkExecutor(nullLogger(), homeDir, opts(queryFn)).run(makeCtx().ctx);
+    assert.equal(result.branch, "agent/issue-5");
+    assert.deepEqual(turns.map((t) => t.options.resume), [undefined, "sess-A", "sess-B"]);
+  });
+
+  it("the synchronous group kill's own time is charged to the wall budget", async () => {
+    // Wall 1.5s. The first drive spends ~1s then dies; the group kill blocks ~700ms (the
+    // setpriv spawnSync path can), which alone spends the rest of the wall.
+    const { queryFn, turns } = fakeTurns([
+      dies(sdkSignal("SIGTERM"), [assistantText("working")], 1_000),
+      [submitPlan("# Plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const err = await rejection(
+      new SdkExecutor(nullLogger(), homeDir, opts(queryFn, {
+        killCliGroup: () => {
+          const until = Date.now() + 700;
+          while (Date.now() < until) { /* a blocking spawnSync */ }
+          return true;
+        },
+      })).run(makeCtx({ config: { run_timeout_seconds: 1.5 } }).ctx),
+    );
+    assert.match(err.message, /wall-clock timeout/);
+    assert.equal(turns.length, 1);
+  });
+
+  it("a cancel during the confirmation poll never aims the fallback-capable kill at the dead pid", async () => {
+    // trip() kills state.currentChild.pid through killProcessGroup, which falls back to the bare
+    // pid; the dead CLI's pid must not be its target. The one allowed kill of it is the
+    // run-end reap (the group was never confirmed gone, so the pid stays in the set).
+    const ac = new AbortController();
+    const spawned: number[] = [];
+    const killed: Array<number | undefined> = [];
+    const { queryFn } = fakeTurns([
+      dies(sdkSignal("SIGTERM"), [assistantText("working")]),
+      [submitPlan("# Plan"), resultSuccess()],
+    ]);
+    const executor = new SdkExecutor(nullLogger(), homeDir, opts(queryFn, {
+      spawn: () => {
+        const pid = fakePid++;
+        spawned.push(pid);
+        return { pid };
+      },
+      kill: (pid) => {
+        killed.push(pid);
+        return true;
+      },
+      cliGroupPresent: () => {
+        if (!ac.signal.aborted) setTimeout(() => ac.abort(), 0);
+        return true;
+      },
+    }));
+    const err = await rejection(executor.run(makeCtx({ signal: ac.signal }).ctx));
+    assert.match(err.message, /run cancelled/);
+    const dead = spawned[0]!;
+    assert.equal(killed.filter((p) => p === dead).length, 1, `only the run-end reap kills it: ${JSON.stringify(killed)}`);
+  });
+
   it("a wall budget that expires during the reap confirmation ends with the wall outcome", async () => {
     // Wall 2s. The first drive spends ~1.5s then dies; the group never empties, so the
     // (up to 1s) confirmation poll outlives the remaining ~0.5s of wall.
@@ -439,17 +511,18 @@ describe("SdkExecutor foreign CLI signal death (issue #1656)", () => {
 
   it("control: a cancel whose CLI death surfaces as exit 143 stays cancelled", async () => {
     const ac = new AbortController();
-    const { queryFn, turns } = fakeTurns([hangThenDie(sdkExit(143)), [submitPlan("# Plan"), resultSuccess()]]);
-    const t = setTimeout(() => ac.abort(), 50);
-    try {
-      const got = await rejection(
-        new SdkExecutor(nullLogger(), homeDir, opts(queryFn)).run(makeCtx({ sessionId: "prev", signal: ac.signal }).ctx),
-      );
-      assert.match(got.message, /run cancelled/);
-      assert.equal(turns.length, 1);
-    } finally {
-      clearTimeout(t);
-    }
+    // Cancel once the turn is in flight (a fixed delay can land before the turn starts).
+    const hang = hangThenDie(sdkExit(143)) as (signal: AbortSignal) => AsyncIterable<unknown>;
+    const inFlightCancel: Script = (signal) => {
+      setTimeout(() => ac.abort(), 0);
+      return hang(signal);
+    };
+    const { queryFn, turns } = fakeTurns([inFlightCancel, [submitPlan("# Plan"), resultSuccess()]]);
+    const got = await rejection(
+      new SdkExecutor(nullLogger(), homeDir, opts(queryFn)).run(makeCtx({ sessionId: "prev", signal: ac.signal }).ctx),
+    );
+    assert.match(got.message, /run cancelled/);
+    assert.equal(turns.length, 1);
   });
 });
 

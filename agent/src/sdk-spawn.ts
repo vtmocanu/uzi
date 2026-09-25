@@ -25,8 +25,6 @@
 // grandchildren; if even the single pid fails (already gone) it is a no-op.
 
 import type { ChildProcess } from "node:child_process";
-import fs from "node:fs";
-import path from "node:path";
 import type { SpawnOptions } from "@anthropic-ai/claude-agent-sdk";
 import { killRunnerGroup, killRunnerGroupOnly, runnerSpawn } from "./runner-uid.js";
 
@@ -60,61 +58,25 @@ export function killProcessGroupOnly(pgid: number): boolean {
 }
 
 /**
- * issue #1656: whether any process is still in process group `pgid`, by scanning
- * `<procRoot>/<pid>/stat` (field 5, pgrp; zombies count as present). Independent of any kill's
- * exit status. @returns undefined when absence cannot be established: no readable procfs, a
- * procfs mounted with any `hidepid` but 0/off, or any `subset=` (other uids' processes, e.g. the runner's, would be
- * invisible and read as absent), a stat unreadable for any reason but the process exiting
- * mid-scan, or a scan that saw no process at all. `procRoot` is injectable for tests.
+ * issue #1656: whether any process is still in process group `pgid`, asked of the kernel with
+ * `kill(-pgid, 0)`: an atomic existence check on the group, unlike a snapshot listing of
+ * processes that a member forking around the list/read steps can slip past. ESRCH means absent;
+ * success or EPERM means present (EPERM is what the worker uid gets for a live runner group
+ * under the uid split); zombies count as present. @returns undefined, fail closed, for any other
+ * error or a non-positive pgid. `kill` is injectable for tests.
  */
-export function processGroupPresent(pgid: number, procRoot = "/proc"): boolean | undefined {
-  if (!procfsShowsAllProcesses(procRoot)) return undefined;
-  let entries: string[];
+export function processGroupPresent(
+  pgid: number,
+  kill: (pid: number, signal?: string | number) => true = process.kill,
+): boolean | undefined {
+  if (pgid <= 0) return undefined;
   try {
-    entries = fs.readdirSync(procRoot);
-  } catch {
+    kill(-pgid, 0);
+    return true;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ESRCH") return false;
+    if (code === "EPERM") return true;
     return undefined;
   }
-  let scanned = 0;
-  for (const name of entries) {
-    if (!/^\d+$/.test(name)) continue;
-    let stat: string;
-    try {
-      stat = fs.readFileSync(path.join(procRoot, name, "stat"), "utf8");
-    } catch (err) {
-      // Exited between the listing and the read: not a member. Anything else is unknowable.
-      if ((err as NodeJS.ErrnoException).code === "ENOENT" || (err as NodeJS.ErrnoException).code === "ESRCH") continue;
-      return undefined;
-    }
-    // `pid (comm) state ppid pgrp ...`; comm may hold spaces and parens, so split after the LAST ')'.
-    const close = stat.lastIndexOf(")");
-    if (close < 0) return undefined;
-    const pgrp = Number(stat.slice(close + 2).split(" ")[2]);
-    if (!Number.isInteger(pgrp)) return undefined;
-    scanned++;
-    if (pgrp === pgid) return true;
-  }
-  return scanned > 0 ? false : undefined;
-}
-
-/** Whether the procfs at `procRoot` provably lists every uid's processes. Fail closed: only a
- *  proc mount with no `hidepid` option (or `hidepid=0`/`hidepid=off`) and no `subset=` option
- *  counts; any other value, including one a future kernel adds, is not complete. */
-function procfsShowsAllProcesses(procRoot: string): boolean {
-  let mountinfo: string;
-  try {
-    mountinfo = fs.readFileSync(path.join(procRoot, "self", "mountinfo"), "utf8");
-  } catch {
-    return false;
-  }
-  for (const line of mountinfo.split("\n")) {
-    const fields = line.split(" ");
-    const sep = fields.indexOf("-");
-    if (sep < 0 || fields[4] !== procRoot || fields[sep + 1] !== "proc") continue;
-    const superOpts = (fields[sep + 3] ?? "").split(",");
-    return superOpts.every((o) =>
-      o.startsWith("hidepid=") ? o === "hidepid=0" || o === "hidepid=off" : !o.startsWith("subset="),
-    );
-  }
-  return false;
 }

@@ -3456,10 +3456,12 @@ export class SdkExecutor implements Executor {
     // this is the throw-path analog, passed to a ProviderTransientError so the recovery
     // park resumes the same session lineage.
     let observedSessionId: string | undefined;
-    // issue #1656: the session THIS turn actually runs, read off the turn's own events (last
-    // truthy, as the reducer's per-turn id), and whether an init reported a session other than
-    // the requested resume. Unlike the once-per-run latch above, these see a later turn whose
-    // requested resume came back as a fresh session.
+    // issue #1656: the session THIS turn actually runs, read off the turn's own events, and
+    // whether an init reported a session other than the requested resume. Unlike the once-per-run
+    // latch above, these see a later turn whose requested resume came back as a fresh session.
+    // The init's id is authoritative; failing that, the last id on a main-thread event. A
+    // subagent frame's id never counts, so it cannot replace the root session.
+    let initSessionId: string | undefined;
     let turnSessionId: string | undefined;
     let freshInit = false;
 
@@ -3490,8 +3492,12 @@ export class SdkExecutor implements Executor {
       const turn = this.harness.startTurn(request);
       for await (const event of turn.events) {
         armIdle(); // any event is liveness
-        if (event.sessionId) turnSessionId = event.sessionId;
-        if (event.kind === "initialized" && event.freshSession === true) freshInit = true;
+        if (event.kind === "initialized") {
+          if (event.sessionId) initSessionId = event.sessionId;
+          if (event.freshSession === true) freshInit = true;
+        } else if (event.sessionId && !(event.kind === "frame" && event.origin.kind === "subagent")) {
+          turnSessionId = event.sessionId;
+        }
         const reduction = await reducer.accept(event);
         // First-truthy session id once per run: the run callback, catch-and-warn
         // exactly as before (a handler throw must not fail the turn).
@@ -3581,7 +3587,7 @@ export class SdkExecutor implements Executor {
       if (err instanceof Error && death !== undefined) {
         // Resume the session this turn ran; with none seen, the requested one, but only when no
         // init reported a different (fresh) session. Otherwise no session: fail as before.
-        const resumable = turnSessionId ?? (freshInit ? undefined : resumeId);
+        const resumable = initSessionId ?? turnSessionId ?? (freshInit ? undefined : resumeId);
         throw new CliSignalDeathError(err, death, resumable, state.currentChild.pid);
       }
       throw err instanceof Error ? err : new Error(errMessage(err));
@@ -3802,9 +3808,11 @@ export class SdkExecutor implements Executor {
    * checks tripReason). @returns true only when confirmed gone.
    */
   private async reapDeadCliGroup(state: RunDrive, pgid: number): Promise<boolean> {
-    this.killCliGroup(pgid);
+    // Started before the kill: the group kill is synchronous and, under the split, a spawnSync
+    // of setpriv, so its own time is charged to the wall too.
     const started = Date.now();
     try {
+      this.killCliGroup(pgid);
       for (;;) {
         // A trip (cancel, pause) landing mid-poll, or the wall budget running out during it,
         // ends it; the caller throws the trip / wall outcome.
