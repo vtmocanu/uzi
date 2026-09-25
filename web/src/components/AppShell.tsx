@@ -19,8 +19,8 @@ import { UpdateEscalationBanner } from "./UpdateEscalationBanner";
 import { HealthDangerBanner } from "./HealthDangerBanner";
 import { HealthPip } from "./healthSeverity";
 import { HealthStatusProvider, useHealthStatus } from "../lib/useAdminHealth";
-import { RateLimitAnnouncer, SidebarRateLimits } from "./RateLimitMeters";
-import { SidebarCodexRateLimits } from "./CodexRateLimitMeters";
+import { RateLimitAnnouncer } from "./RateLimitMeters";
+import { SidebarUsageLimits } from "./SidebarUsageLimits";
 import { onNotificationsChanged } from "../lib/notifications";
 import { useFavicon } from "../lib/useFavicon";
 import { brandTabTitle } from "../lib/brandTitle";
@@ -982,12 +982,10 @@ function SidebarContent({
                   </>
                 )}
               </div>
-              {/* Claude rate-limit micro-meters (PRD #53): two 5px bars under the
-                  user block. Self-gates — renders nothing without a live reading. */}
-              <SidebarRateLimits />
-              {/* Codex per-account micro-meters (PRD #1209 M3): a provider-labeled
-                  sibling beside the Claude bars. Self-gates the same way. */}
-              <SidebarCodexRateLimits />
+              {/* Usage micro-meters under the user block (PRD #1653 D-W2): one list
+                  of accounts, Claude tokens then Codex accounts, each named under its
+                  provider logo. Self-gates — renders nothing without a live reading. */}
+              <SidebarUsageLimits />
             </div>
           ))}
 

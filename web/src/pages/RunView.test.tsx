@@ -1169,16 +1169,22 @@ describe("RunView header — the frozen per-schedule model badge (PRD #300)", ()
     expect(screen.queryByTitle(OVERRIDE_BADGE_TITLE)).toBeNull();
   });
 
-  // PRD #1429 M4a: the run's actual harness, in the same header cluster.
-  it("shows the Codex badge for a codex-harness run", async () => {
+  // PRD #1429 M4a / PRD #1653 D-W5: the run's actual harness, in the same header
+  // cluster, as the round provider chip on every run.
+  it("shows the Codex chip for a codex-harness run", async () => {
     renderPage({ status: "completed", harness: "codex" });
-    expect(await screen.findByText("Codex")).toBeTruthy();
+    const chip = await screen.findByRole("img", { name: "Codex" });
+    expect(chip.getAttribute("title")).toBe("Runs on Codex");
+    expect(screen.queryByRole("img", { name: "Claude" })).toBeNull();
+    // The retired "Codex" text badge is gone.
+    expect(screen.queryByText("Codex")).toBeNull();
   });
 
-  it("shows no harness badge for a claude-harness run (unmarked)", async () => {
+  it("shows the Claude chip for a claude-harness run (no longer unmarked)", async () => {
     renderPage({ status: "completed", harness: "claude" });
-    await screen.findByText("Add rate limiting");
-    expect(screen.queryByText("Codex")).toBeNull();
+    const chip = await screen.findByRole("img", { name: "Claude" });
+    expect(chip.getAttribute("title")).toBe("Runs on Claude");
+    expect(screen.queryByRole("img", { name: "Codex" })).toBeNull();
   });
 });
 

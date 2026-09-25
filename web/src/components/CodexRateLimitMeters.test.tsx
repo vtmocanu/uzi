@@ -1,11 +1,8 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
-import { CodexRateLimitCard, SidebarCodexRateLimits } from "./CodexRateLimitMeters";
-import { emitSidebarTokensChanged } from "../lib/sidebarTokens";
+import { CodexRateLimitCard } from "./CodexRateLimitMeters";
 import { api, type CodexAccountRateLimit, type CodexRateLimitBucket, type CodexRateLimitWindow, type CodexRateLimitStatus, type UserSettings } from "../lib/api";
-import { MICRO_METER_GRID_COLS } from "../lib/rateLimitLayout";
 
 vi.mock("../lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/api")>();
@@ -254,6 +251,59 @@ describe("CodexRateLimitCard (Settings)", () => {
     expect(screen.getAllByRole("checkbox")).toHaveLength(1);
   });
 
+  // PRD #1653 D-W4: the OpenAI logo leads the card title (aria-hidden, so the heading's
+  // accessible name stays "Codex limits"), and it draws in the text colour.
+  it("carries the OpenAI logo in the card title", async () => {
+    mockApi.getMyCodexRateLimits.mockResolvedValue({ accounts: [freshDefault] });
+    render(<CodexRateLimitCard sidebarAccountIds={[]} onToggleSidebarAccount={noop} />);
+    const heading = await screen.findByRole("heading", { name: "Codex limits" });
+    const logo = heading.querySelector("svg");
+    expect(logo).not.toBeNull();
+    expect(logo?.getAttribute("viewBox")).toBe("0 0 16 16");
+    expect(logo?.getAttribute("aria-hidden")).toBe("true");
+    // No per-account logo inside the card: the title's OpenAI mark is the only one.
+    const marks = [...document.querySelectorAll("svg")].filter((svg) => svg.getAttribute("viewBox") === "0 0 16 16");
+    expect(marks).toHaveLength(1);
+  });
+
+  // PRD #1653 D-W3: the main bucket (id "codex", empty display name, as the api builds the
+  // top-level rate_limit) draws no caption; every other bucket keeps its name. Both keep
+  // the bucket name in their meters' accessible names.
+  it("hides the main 'codex' bucket's caption and keeps an additional bucket's", async () => {
+    mockApi.getMyCodexRateLimits.mockResolvedValue({
+      accounts: [
+        acct("cdx-main", ["personal-codex"], true, "fresh", [
+          bucket("codex", "", win(28, 18000, 5000), win(46, 604800, 200_000)),
+          bucket("code", "Code (3-hour)", win(63, 10800, 2400)),
+        ]),
+      ],
+    });
+    render(<CodexRateLimitCard sidebarAccountIds={[]} onToggleSidebarAccount={noop} />);
+    await screen.findByText("Codex limits");
+    expect(screen.queryByText("codex")).toBeNull();
+    expect(screen.getByText("Code (3-hour)")).toBeTruthy();
+    expect(screen.getByRole("progressbar", { name: "codex 5h window" })).toBeTruthy();
+    expect(screen.getByRole("progressbar", { name: "codex 7d window" })).toBeTruthy();
+    expect(screen.getByRole("progressbar", { name: "Code (3-hour) 3h window" })).toBeTruthy();
+    // The account is still named and the default badge stays.
+    expect(screen.getByText("personal-codex")).toBeTruthy();
+    expect(screen.getByText("default")).toBeTruthy();
+  });
+
+  it("keeps the limit-reached flag on a main bucket that has no caption", async () => {
+    mockApi.getMyCodexRateLimits.mockResolvedValue({
+      accounts: [
+        acct("cdx-main", ["personal-codex"], true, "fresh", [
+          bucket("codex", "", win(100, 604800, 200_000), null, { limit_reached: true, allowed: false }),
+        ]),
+      ],
+    });
+    render(<CodexRateLimitCard sidebarAccountIds={[]} onToggleSidebarAccount={noop} />);
+    await screen.findByText("Codex limits");
+    expect(screen.getByText("limit reached")).toBeTruthy();
+    expect(screen.queryByText("codex")).toBeNull();
+  });
+
   it("renders nothing when the user has no linked subscription account (API-key-only default)", async () => {
     mockApi.getMyCodexRateLimits.mockResolvedValue({ accounts: [] });
     render(<CodexRateLimitCard sidebarAccountIds={[]} onToggleSidebarAccount={noop} />);
@@ -298,108 +348,5 @@ describe("CodexRateLimitCard (Settings)", () => {
   });
 });
 
-describe("SidebarCodexRateLimits", () => {
-  const extra = acct("cdx-extra", ["extra-codex"], false, "fresh", [
-    bucket("requests", "Requests", win(77, 18000, 5000)),
-  ]);
-
-  it("carries a 'Codex' provider label and shows only the default account plus a '+N more' link", async () => {
-    mockApi.getMyCodexRateLimits.mockResolvedValue({ accounts: [freshDefault, extra] });
-    mockApi.getMySettings.mockResolvedValue(settings([]));
-    render(
-      <MemoryRouter>
-        <SidebarCodexRateLimits />
-      </MemoryRouter>,
-    );
-    await screen.findByLabelText("Codex rate limits");
-    expect(screen.getByText("Codex")).toBeTruthy();
-    // The default account's numbers render; the unchecked extra's do not.
-    expect(screen.getByText("28%")).toBeTruthy();
-    expect(screen.queryByText("77%")).toBeNull();
-    const more = await screen.findByRole("link", { name: "+1 more Codex account in Settings" });
-    expect(more.getAttribute("href")).toBe("/settings");
-  });
-
-  it("also shows a checked extra account, and drops the link when nothing is hidden", async () => {
-    mockApi.getMyCodexRateLimits.mockResolvedValue({ accounts: [freshDefault, extra] });
-    mockApi.getMySettings.mockResolvedValue(settings(["cdx-extra"]));
-    render(
-      <MemoryRouter>
-        <SidebarCodexRateLimits />
-      </MemoryRouter>,
-    );
-    await screen.findByLabelText("Codex rate limits");
-    await waitFor(() => expect(screen.getByText("77%")).toBeTruthy());
-    expect(screen.getByText("28%")).toBeTruthy();
-    expect(screen.queryByRole("link")).toBeNull();
-  });
-
-  // PRD #1519 M2: CodexMicroRow must use the SAME shared grid-template constant as the
-  // Anthropic MicroRow (RateLimitMeters.test.tsx asserts the same constant on that side),
-  // so the label column is 1.4rem on both and the 1fr meter tracks align. jsdom does no
-  // layout, so this asserts the shared class, not pixel geometry.
-  it("lays each Codex micro-row out on the shared grid-template constant", async () => {
-    mockApi.getMyCodexRateLimits.mockResolvedValue({ accounts: [freshDefault] });
-    mockApi.getMySettings.mockResolvedValue(settings([]));
-    render(
-      <MemoryRouter>
-        <SidebarCodexRateLimits />
-      </MemoryRouter>,
-    );
-    await screen.findByLabelText("Codex rate limits");
-    const row = screen.getByText("5h").parentElement as HTMLElement;
-    expect(row.className).toContain(MICRO_METER_GRID_COLS);
-    // The constant must be the complete arbitrary-value literal (Tailwind content-scan).
-    expect(MICRO_METER_GRID_COLS).toBe("grid-cols-[1.4rem_1fr_2.6rem]");
-  });
-
-  it("renders nothing when no surfaced account has a reading (pending default)", async () => {
-    mockApi.getMyCodexRateLimits.mockResolvedValue({
-      accounts: [acct("cdx-default", ["personal-codex"], true, "pending", [])],
-    });
-    render(
-      <MemoryRouter>
-        <SidebarCodexRateLimits />
-      </MemoryRouter>,
-    );
-    await waitFor(() => expect(mockApi.getMyCodexRateLimits).toHaveBeenCalled());
-    await Promise.resolve();
-    expect(screen.queryByLabelText("Codex rate limits")).toBeNull();
-  });
-
-  it("dims a stale account's bars", async () => {
-    mockApi.getMyCodexRateLimits.mockResolvedValue({
-      accounts: [
-        acct("cdx-default", ["personal-codex"], true, "stale", [
-          bucket("requests", "Requests", win(41, 18000, 5000), win(33, 604800, 200_000)),
-        ], { stale: true }),
-      ],
-    });
-    render(
-      <MemoryRouter>
-        <SidebarCodexRateLimits />
-      </MemoryRouter>,
-    );
-    await screen.findByLabelText("Codex rate limits");
-    const fills = screen.getAllByRole("progressbar").map((b) => b.lastChild as HTMLElement);
-    expect(fills.length).toBeGreaterThan(0);
-    for (const fill of fills) expect(fill.className).toMatch(/opacity-40/);
-  });
-
-  it("refetches its selection on the shared sidebar-changed event", async () => {
-    mockApi.getMyCodexRateLimits.mockResolvedValue({ accounts: [freshDefault, extra] });
-    mockApi.getMySettings.mockResolvedValue(settings([]));
-    render(
-      <MemoryRouter>
-        <SidebarCodexRateLimits />
-      </MemoryRouter>,
-    );
-    await screen.findByLabelText("Codex rate limits");
-    // Default only until the selection changes.
-    expect(screen.queryByText("77%")).toBeNull();
-    // A Settings save now includes the extra account and fires the shared event.
-    mockApi.getMySettings.mockResolvedValue(settings(["cdx-extra"]));
-    emitSidebarTokensChanged();
-    await waitFor(() => expect(screen.getByText("77%")).toBeTruthy());
-  });
-});
+// The sidebar micro-meters moved into the combined account list (PRD #1653 D-W2);
+// their tests live in SidebarUsageLimits.test.tsx.

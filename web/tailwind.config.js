@@ -50,6 +50,9 @@ export default {
         "syn-arg": token("syn-arg"),
         "tool-rail": token("tool-rail"),
         ring: token("ring"), // keyboard focus ring (see :focus-visible in index.css)
+        // A fixed provider brand hue, the same on every theme (PRD #1653 D-W1):
+        // the Claude mark's orange, drawn by ClaudeIcon as text-brand-claude.
+        "brand-claude": token("brand-claude"),
       },
       // Radii derive from the single --radius token via a calc scheme, so a
       // theme can densify or soften the whole UI at once.

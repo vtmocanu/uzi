@@ -398,8 +398,8 @@ describe("RunsList — autopilot badge", () => {
   });
 });
 
-describe("RunsList — harness badge (PRD #1429 M4a)", () => {
-  it("shows a Codex badge only for a codex-harness run, Claude stays unmarked", async () => {
+describe("RunsList — harness chip (PRD #1429 M4a, PRD #1653 D-W5)", () => {
+  it("marks every run with its provider chip, Claude and Codex alike", async () => {
     mockApi.listRuns.mockResolvedValue({
       runs: [
         aRun({ id: "codex-run", issue_title: "Codex run", harness: "codex" }),
@@ -411,8 +411,15 @@ describe("RunsList — harness badge (PRD #1429 M4a)", () => {
 
     await waitFor(() => expect(screen.getByText("Codex run")).toBeTruthy());
     expect(screen.getByText("Claude run")).toBeTruthy();
-    // Exactly one badge — the Claude run must not carry it.
-    expect(screen.getAllByText("Codex")).toHaveLength(1);
+    // One chip per run, each named for its provider, with a "Runs on …" title.
+    const codexChip = screen.getByRole("img", { name: "Codex" });
+    const claudeChip = screen.getByRole("img", { name: "Claude" });
+    expect(codexChip.getAttribute("title")).toBe("Runs on Codex");
+    expect(claudeChip.getAttribute("title")).toBe("Runs on Claude");
+    expect(screen.getAllByRole("img", { name: "Codex" })).toHaveLength(1);
+    expect(screen.getAllByRole("img", { name: "Claude" })).toHaveLength(1);
+    // The retired "Codex" text badge is gone.
+    expect(screen.queryByText("Codex")).toBeNull();
   });
 });
 

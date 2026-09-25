@@ -2202,8 +2202,8 @@ export interface Run {
   issue_description: string;
   /** The run's ACTUAL execution harness (PRD #1429 M1 / D2), the stored runs.harness.
    *  Always present (NOT NULL DEFAULT 'claude' server-side, so every current run reads
-   *  "claude"). The web renders Claude visually unmarked and Codex explicit, and keys the
-   *  model/effort vocabulary on it (M4). */
+   *  "claude"). The web marks every run with its provider chip (HarnessBadge, PRD #1653
+   *  D-W5), and keys the model/effort vocabulary on it (M4). */
   harness: Harness;
   /** Chat conversation title (PRD #39), first-message derived; null for other kinds
    *  and until derived. resume_of_run_id points a continued chat at the ended one. */

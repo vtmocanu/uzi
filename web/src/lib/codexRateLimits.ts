@@ -14,6 +14,7 @@ import type {
 import type {
   CodexAccountRateLimit,
   CodexAdminRateLimitRow,
+  CodexRateLimitBucket,
   CodexRateLimitStatus,
   CodexRateLimitWindow,
 } from "./api";
@@ -71,6 +72,36 @@ export function codexWindowForecast(
 export function codexAccountLabel(account: Pick<CodexAccountRateLimit, "aliases">): string {
   const named = [...new Set(account.aliases.filter((a) => a.trim() !== ""))];
   return named.length > 0 ? named.join(", ") : "Codex account";
+}
+
+// CODEX_MAIN_BUCKET_ID is the id of an account's MAIN limit. Mirrors
+// api/internal/codexauth/usage.go `const codexMainBucketID = "codex"`: the top-level
+// rate_limit of the usage response becomes the bucket with this id and an EMPTY display
+// name, while each additional_rate_limits entry becomes a bucket named by its limit id.
+export const CODEX_MAIN_BUCKET_ID = "codex";
+
+// codexBucketDisplayName is a bucket's name for ACCESSIBLE labels and anywhere a name is
+// required: the trimmed display name, else the id. The main bucket therefore reads "codex"
+// here, so a window row's accessible name stays "codex 7d window".
+export function codexBucketDisplayName(bucket: Pick<CodexRateLimitBucket, "id" | "display_name">): string {
+  return bucket.display_name?.trim() || bucket.id;
+}
+
+// codexBucketCaption is the VISIBLE caption drawn above a bucket's windows (the sidebar and
+// the Settings card, PRD #1653 D-W3): null for the main bucket, whose caption would only
+// repeat the provider ("codex"), else the same name as codexBucketDisplayName.
+export function codexBucketCaption(bucket: Pick<CodexRateLimitBucket, "id" | "display_name">): string | null {
+  if (bucket.id === CODEX_MAIN_BUCKET_ID) return null;
+  return codexBucketDisplayName(bucket);
+}
+
+// hasCodexMicroReading is true when the account has at least one window with a reported
+// percentage, i.e. the sidebar would draw at least one micro-meter row for it. The sidebar
+// uses it to skip an account whose header would otherwise sit above no rows.
+export function hasCodexMicroReading(account: Pick<CodexAccountRateLimit, "buckets">): boolean {
+  return account.buckets.some(
+    (b) => b.primary?.used_percent != null || b.secondary?.used_percent != null,
+  );
 }
 
 // isCodexAccountShownInSidebar is the ONE place the "default always, extras by choice" rule

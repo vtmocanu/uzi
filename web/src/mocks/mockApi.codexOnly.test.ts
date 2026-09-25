@@ -47,10 +47,18 @@ describe("the default scenario is unaffected by the codex-only overlay (negative
     expect(secrets.some((s) => s.kind === "anthropic_token" && s.is_default)).toBe(true);
   });
 
-  it("every listed run reads harness claude", async () => {
+  // PRD #1653 M4: the default scenario seeds exactly ONE Codex run among Claude runs, so
+  // the harness chip shows both providers offline; the overlay leaves it as seeded.
+  it("every listed run reads harness claude except the one seeded Codex run", async () => {
     const { runs } = await mockApi.listRuns();
-    expect(runs.length).toBeGreaterThan(0);
-    expect(runs.every((r) => r.harness === "claude")).toBe(true);
+    expect(runs.length).toBeGreaterThan(1);
+    expect(runs.filter((r) => r.harness === "codex").map((r) => r.id)).toEqual(["run-rework-capped"]);
+    expect(runs.filter((r) => r.id !== "run-rework-capped").every((r) => r.harness === "claude")).toBe(true);
+  });
+
+  it("getRun on the seeded Codex run reads harness codex (list and detail agree)", async () => {
+    const { run } = await mockApi.getRun("run-rework-capped");
+    expect(run.harness).toBe("codex");
   });
 });
 
