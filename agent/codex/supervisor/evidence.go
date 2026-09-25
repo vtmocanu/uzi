@@ -29,8 +29,9 @@ type drainResult struct {
 }
 
 // fields renders the drain result to the exact wire shape. killed/reaped are
-// always present (as [] when empty, never null); authority appears only for a
-// drained result; reason and children appear only for an unconfirmed one.
+// always present (as [] when empty, never null); reaped lists only waits done
+// during this drain, excluding earlier periodic waits. Authority appears only
+// for a drained result; reason and children appear only for an unconfirmed one.
 func (d drainResult) fields() map[string]any {
 	m := map[string]any{
 		"state":  d.State,
