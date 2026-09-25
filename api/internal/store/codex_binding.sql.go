@@ -424,6 +424,9 @@ SELECT
     r.codex_cap_hash,
     r.worker_id,
     r.status,
+    -- PRD #1590: the run's current claim generation, so the claim's release barriers can
+    -- refuse a stale attempt from an earlier generation of the same worker's claim.
+    r.claim_generation,
     -- CURRENT alias material revision (the run-frozen one is r.codex_material_revision).
     ccs.material_revision AS current_material_revision,
     -- CURRENT account counters + immutable identity tuple (NULL for an api_key alias).
@@ -456,6 +459,7 @@ type GetRunCodexAuthContextRow struct {
 	CodexCapHash              []byte      `json:"codex_cap_hash"`
 	WorkerID                  pgtype.UUID `json:"worker_id"`
 	Status                    string      `json:"status"`
+	ClaimGeneration           int64       `json:"claim_generation"`
 	CurrentMaterialRevision   int64       `json:"current_material_revision"`
 	CurrentGeneration         pgtype.Int8 `json:"current_generation"`
 	CurrentCredentialRevision pgtype.Int8 `json:"current_credential_revision"`
@@ -502,6 +506,7 @@ func (q *Queries) GetRunCodexAuthContext(ctx context.Context, id uuid.UUID) (Get
 		&i.CodexCapHash,
 		&i.WorkerID,
 		&i.Status,
+		&i.ClaimGeneration,
 		&i.CurrentMaterialRevision,
 		&i.CurrentGeneration,
 		&i.CurrentCredentialRevision,
@@ -1484,6 +1489,7 @@ SET codex_cap_hash    = $1,
     codex_claim_epoch = codex_claim_epoch + 1,
     updated_at        = now()
 WHERE id = $2 AND worker_id = $3
+  AND claim_generation = $4
   AND status IN (
       'claimed', 'running', 'awaiting_approval',
       'awaiting_input', 'awaiting_followup', 'limit_wait'
@@ -1492,9 +1498,10 @@ RETURNING codex_claim_epoch
 `
 
 type SetRunCodexClaimCapabilityParams struct {
-	Hash     []byte      `json:"hash"`
-	ID       uuid.UUID   `json:"id"`
-	WorkerID pgtype.UUID `json:"worker_id"`
+	Hash            []byte      `json:"hash"`
+	ID              uuid.UUID   `json:"id"`
+	WorkerID        pgtype.UUID `json:"worker_id"`
+	ClaimGeneration int64       `json:"claim_generation"`
 }
 
 // Mint (or rotate) the per-claim Codex capability (PRD #1147 M2): store the new hash and
@@ -1521,8 +1528,21 @@ type SetRunCodexClaimCapabilityParams struct {
 // match on worker_id and let the departed worker re-mint a fresh capability. Closing this
 // requeue TOCTOU: a 0-row match now surfaces as pgx.ErrNoRows → errRunVanished in the caller,
 // which is the desired outcome.
+//
+// GENERATION GUARD (PRD #1590): the mint is also fenced on @claim_generation, the claim
+// generation the caller's ClaimRun returned. worker_id + status alone cannot tell a stale
+// attempt from a live one when the SAME worker reclaims the run: an attempt at generation G
+// that paused before its mint, while the run was requeued and reclaimed by that worker as
+// G+1, would otherwise match, overwrite G+1's capability and bump the epoch, so G+1's
+// release barrier would see a superseded mint and drop its payload. The stale attempt now
+// matches 0 rows → pgx.ErrNoRows → errRunVanished, and G+1's capability stays live.
 func (q *Queries) SetRunCodexClaimCapability(ctx context.Context, arg SetRunCodexClaimCapabilityParams) (int64, error) {
-	row := q.db.QueryRow(ctx, setRunCodexClaimCapability, arg.Hash, arg.ID, arg.WorkerID)
+	row := q.db.QueryRow(ctx, setRunCodexClaimCapability,
+		arg.Hash,
+		arg.ID,
+		arg.WorkerID,
+		arg.ClaimGeneration,
+	)
 	var codex_claim_epoch int64
 	err := row.Scan(&codex_claim_epoch)
 	return codex_claim_epoch, err

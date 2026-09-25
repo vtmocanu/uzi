@@ -352,6 +352,108 @@ func TestClaimSameWorkerRemintIsIdleLiveDB(t *testing.T) {
 	}
 }
 
+// TestClaimStaleGenerationMintIsFencedLiveDB (PRD #1590 review): the capability mint is fenced on
+// claim_generation. Worker B claims the run at generation G, the claim is requeued (the real
+// RequeueClaimedRunToQueued, which keeps worker_id = B), and B reclaims it through Service.Claim
+// as G+1. Right after G+1 minted, the stale generation-G attempt resumes through the REAL
+// codexClaimSecrets: it must refuse with errRunVanished and leave G+1's capability (hash and
+// epoch) untouched, so G+1's release barrier still sees its own mint and delivers the payload.
+// Without the fence the G attempt matches on worker_id + status, overwrites G+1's capability and
+// bumps the epoch, and G+1 drops its payload as superseded.
+func TestClaimStaleGenerationMintIsFencedLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	fx := newCodexClaimFix(t, env, false)
+	wkr := fx.claimant(t, false)
+
+	// Generation G: B's first claim, paused before its mint (nothing assembled yet).
+	runAtG, err := env.q.ClaimRun(env.ctx, claimRunParamsFor(wkr))
+	if err != nil {
+		t.Fatalf("ClaimRun (generation G): %v", err)
+	}
+	if runAtG.ID != fx.runID || uuid.UUID(runAtG.WorkerID.Bytes) != fx.workerB {
+		t.Fatalf("ClaimRun claimed run %s for worker %v, want %s for B", runAtG.ID, runAtG.WorkerID, fx.runID)
+	}
+	// The claim is requeued the way the sweeper does it: status back to queued, worker_id kept.
+	if n, err := env.q.RequeueClaimedRunToQueued(env.ctx, fx.runID); err != nil || n != 1 {
+		t.Fatalf("RequeueClaimedRunToQueued = (%d, %v), want (1, nil)", n, err)
+	}
+
+	var (
+		staleErr             error
+		staleSecrets         *ClaimCodexSecrets
+		liveHash             []byte
+		liveEpoch            int64
+		liveGen              int64
+		afterReplay          store.Run
+		hookRan, replayFired bool
+	)
+	hooks := &claimTestHooks{}
+	hooks.afterMint = func(ctx context.Context, live store.Run) {
+		hookRan = true
+		liveGen = live.ClaimGeneration
+		mintedLive := mustRun(t, env, fx.runID)
+		liveHash = append([]byte(nil), mintedLive.CodexCapHash...)
+		liveEpoch = mintedLive.CodexClaimEpoch
+		// Replay the stale generation-G attempt through the real claim-secrets path, with the
+		// race hooks cleared so the nested call does not re-enter this hook.
+		fx.svc.claimHooks = nil
+		staleSecrets, staleErr = fx.svc.codexClaimSecrets(ctx, wkr, runAtG)
+		fx.svc.claimHooks = hooks
+		replayFired = true
+		afterReplay = mustRun(t, env, fx.runID)
+	}
+	fx.svc.claimHooks = hooks
+
+	// Generation G+1: B reclaims the requeued run through the real claim path.
+	payload, err := fx.svc.Claim(env.ctx, wkr, nil)
+	fx.svc.claimHooks = nil
+	if !hookRan || !replayFired {
+		t.Fatalf("afterMint hook ran=%v replay=%v, want both (the reclaim never minted)", hookRan, replayFired)
+	}
+	if liveGen != runAtG.ClaimGeneration+1 {
+		t.Fatalf("reclaim generation = %d, want G+1 = %d", liveGen, runAtG.ClaimGeneration+1)
+	}
+	if !errors.Is(staleErr, errRunVanished) || staleSecrets != nil {
+		t.Fatalf("stale generation-G codexClaimSecrets = (secrets=%v, %v), want (nil, errRunVanished)", staleSecrets != nil, staleErr)
+	}
+	if len(liveHash) == 0 || string(afterReplay.CodexCapHash) != string(liveHash) || afterReplay.CodexClaimEpoch != liveEpoch {
+		t.Fatalf("stale replay overwrote the live capability: epoch=%d (want %d) hash_matches=%v",
+			afterReplay.CodexClaimEpoch, liveEpoch, string(afterReplay.CodexCapHash) == string(liveHash))
+	}
+	if err != nil || payload == nil || payload.Secrets.Codex == nil || payload.Secrets.Codex.AccessToken == "" {
+		t.Fatalf("G+1 Claim = (payload=%v, codex=%v, %v), want a payload carrying Codex secrets",
+			payload != nil, payload != nil && payload.Secrets.Codex != nil, err)
+	}
+	epoch, secret, ok := parseCodexCapability(payload.Secrets.Codex.Capability)
+	if !ok || epoch != liveEpoch || string(hashCodexCapability(secret)) != string(liveHash) {
+		t.Fatalf("G+1 payload capability is not G+1's mint: epoch=%d (want %d) parsed=%v", epoch, liveEpoch, ok)
+	}
+	final := mustRun(t, env, fx.runID)
+	if final.Status != "claimed" || final.ClaimGeneration != liveGen ||
+		final.CodexClaimEpoch != liveEpoch || string(final.CodexCapHash) != string(liveHash) {
+		t.Fatalf("final run: status=%s gen=%d epoch=%d (want claimed, %d, %d) hash_matches=%v",
+			final.Status, final.ClaimGeneration, final.CodexClaimEpoch, liveGen, liveEpoch,
+			string(final.CodexCapHash) == string(liveHash))
+	}
+
+	// The release barriers carry their own generation check (defence in depth behind the SQL
+	// fence, which stops the stale mint before a barrier runs, so the scenario above cannot
+	// reach it). Pin it directly against the live row: with G+1's own mint identity, the
+	// barriers accept generation G+1 and refuse generation G, in both barrier modes.
+	q, ok := fx.svc.codexStore()
+	if !ok {
+		t.Fatal("codex store unavailable")
+	}
+	for _, checkCap := range []bool{false, true} {
+		if err := fx.svc.reauthorizeCodexRelease(env.ctx, q, fx.runID, wkr, liveGen, liveEpoch, liveHash, checkCap); err != nil {
+			t.Fatalf("reauthorize at live generation (checkCapability=%v) = %v, want nil", checkCap, err)
+		}
+		if err := fx.svc.reauthorizeCodexRelease(env.ctx, q, fx.runID, wkr, runAtG.ClaimGeneration, liveEpoch, liveHash, checkCap); !errors.Is(err, errRunVanished) {
+			t.Fatalf("reauthorize at stale generation G (checkCapability=%v) = %v, want errRunVanished", checkCap, err)
+		}
+	}
+}
+
 // TestClaimAmbiguousMintNoMutationLiveDB (f): an ambiguous capability mint (the write may have
 // landed) returns the error with no payload and changes nothing, on the real ClaimRun row.
 func TestClaimAmbiguousMintNoMutationLiveDB(t *testing.T) {

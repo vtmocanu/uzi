@@ -232,6 +232,10 @@ The DTO exposes only the run's own snapshotted alias label (`codex_secret_label`
 
 Chat is interactive, with the owner present at the moment of failure, and judge runs are advisory. Both keep the terminal classification. The D2 gate and park apply to the kinds that open custody holds (issue, ci_fix, self_improve, prompt, task, mr_rework), matching the custom-model clause's scoping.
 
+### D8: the Codex capability mint is fenced on claim generation
+
+An MR review found that `SetRunCodexClaimCapability` matched only on the run id, `worker_id` and an actively-claimed status. That let a stale same-worker assembly at generation G mint over a G+1 reclaim's capability before `finishRunClaim` rejected G, and G+1 then dropped its payload. The mint now also matches `claim_generation = @claim_generation`, so a 0-row match becomes `errRunVanished`. `reauthorizeCodexRelease` (barriers A and B) refuses any row whose `claim_generation` differs from the claim's. `TestClaimStaleGenerationMintIsFencedLiveDB` pins this. It failed with the SQL fence reverted (the stale replay overwrote the epoch) and with the reauthorize check reverted, and it passes with both in place. (AI-synced 2026-09-25)
+
 ## Out of scope (separate issues)
 
 - Every durability boundary does a full provider refresh-token rotation, with no "access token still fresh" skip (`buildRunLaneReconcile` → `coordinatedRefresh`). This multiplies ambiguous-exchange exposure.

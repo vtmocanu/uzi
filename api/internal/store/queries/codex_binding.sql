@@ -132,6 +132,9 @@ SELECT
     r.codex_cap_hash,
     r.worker_id,
     r.status,
+    -- PRD #1590: the run's current claim generation, so the claim's release barriers can
+    -- refuse a stale attempt from an earlier generation of the same worker's claim.
+    r.claim_generation,
     -- CURRENT alias material revision (the run-frozen one is r.codex_material_revision).
     ccs.material_revision AS current_material_revision,
     -- CURRENT account counters + immutable identity tuple (NULL for an api_key alias).
@@ -324,11 +327,20 @@ WHERE id = @id AND status = 'recovery_wait' AND recovery_wait_cause = 'codex_acc
 -- match on worker_id and let the departed worker re-mint a fresh capability. Closing this
 -- requeue TOCTOU: a 0-row match now surfaces as pgx.ErrNoRows → errRunVanished in the caller,
 -- which is the desired outcome.
+--
+-- GENERATION GUARD (PRD #1590): the mint is also fenced on @claim_generation, the claim
+-- generation the caller's ClaimRun returned. worker_id + status alone cannot tell a stale
+-- attempt from a live one when the SAME worker reclaims the run: an attempt at generation G
+-- that paused before its mint, while the run was requeued and reclaimed by that worker as
+-- G+1, would otherwise match, overwrite G+1's capability and bump the epoch, so G+1's
+-- release barrier would see a superseded mint and drop its payload. The stale attempt now
+-- matches 0 rows → pgx.ErrNoRows → errRunVanished, and G+1's capability stays live.
 UPDATE runs
 SET codex_cap_hash    = @hash,
     codex_claim_epoch = codex_claim_epoch + 1,
     updated_at        = now()
 WHERE id = @id AND worker_id = @worker_id
+  AND claim_generation = @claim_generation
   AND status IN (
       'claimed', 'running', 'awaiting_approval',
       'awaiting_input', 'awaiting_followup', 'limit_wait'

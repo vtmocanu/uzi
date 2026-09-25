@@ -128,16 +128,23 @@ func newSubscriptionFixture(t *testing.T, env codexTestEnv) codexRunFixture {
 
 // mintCap mints and installs a fresh capability worker-scoped, returning the wire form
 // the worker would present. Used by reject tests that do not run the full claim path.
+// The mint is fenced on the run's claim generation, so it mints at the run's CURRENT one
+// (a same-generation re-mint, exactly what the live claim of that generation would do).
 func (e codexTestEnv) mintCap(t *testing.T, runID, workerID uuid.UUID) string {
 	t.Helper()
+	cur, err := e.q.GetRunByID(e.ctx, runID)
+	if err != nil {
+		t.Fatalf("mintCap: read run: %v", err)
+	}
 	plaintext, hash := mintCodexCapability()
 	// The mint is now :one RETURNING codex_claim_epoch: it returns the PERSISTED post-bump
 	// epoch (pgx.ErrNoRows when no row matched), so wire the capability off that rather than
 	// a separately-read epochBefore+1.
 	epoch, err := e.q.SetRunCodexClaimCapability(e.ctx, store.SetRunCodexClaimCapabilityParams{
-		Hash:     hash,
-		ID:       runID,
-		WorkerID: pgconv.UUID(workerID),
+		Hash:            hash,
+		ID:              runID,
+		WorkerID:        pgconv.UUID(workerID),
+		ClaimGeneration: cur.ClaimGeneration,
 	})
 	if err != nil {
 		t.Fatalf("SetRunCodexClaimCapability: %v", err)
