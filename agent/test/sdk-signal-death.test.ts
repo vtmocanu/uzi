@@ -162,9 +162,11 @@ const opts = (queryFn: SdkQueryFn, extra: Partial<SdkExecutorOptions> = {}): Sdk
   queryFn,
   emptyTurnBackoffBaseMs: 0,
   emptyTurnMaxRetries: 2,
-  // No test here may group-kill anything: the fakes spawn nothing, and the real-SDK pin's
-  // children end themselves.
+  // No test here may signal anything: the fakes spawn nothing, and the real-SDK pin's
+  // children end themselves. The dead-CLI reap is recorded-only and reports the group gone.
   kill: () => true,
+  killCliGroup: () => true,
+  cliGroupPresent: () => false,
   ...extra,
 });
 
@@ -415,11 +417,15 @@ async function realSdkError(body: string): Promise<Error & Record<string, unknow
   throw new Error("the SDK did not throw on the child's exit");
 }
 
-describe("dead CLI reap before a resume (issue #1656)", () => {
-  it("group-kills the dead CLI's pid once at resume time and drops it from the final reap", async () => {
-    // A resumed run can live for hours; a dead pid left in spawnedPids until the run-end
-    // killAgentTree could by then name a RECYCLED process group. The dead child is reaped
-    // (its orphans with it) before the re-drive, and never killed again.
+describe("dead CLI group confirmed gone before a resume (issue #1656)", () => {
+  // A resumed run can live for hours; a dead pid left in spawnedPids until the run-end
+  // killAgentTree could by then name a RECYCLED process group. The resume waits until the
+  // dead CLI's group is CONFIRMED absent, then drops the pid; anything else fails closed.
+  // These prove call order and set membership with recording fakes; nothing is signalled.
+  async function driveRealDeath(
+    killCliGroup: (pgid: number) => boolean,
+    cliGroupPresent: (pgid: number) => boolean | undefined,
+  ): Promise<{ run: Promise<unknown>; events: string[]; deadPid: () => number | undefined; children: ChildProcess[] }> {
     const children: ChildProcess[] = [];
     const events: string[] = [];
     const fake = fakeTurns([
@@ -437,27 +443,65 @@ describe("dead CLI reap before a resume (issue #1656)", () => {
       homeDir,
       opts(queryFn, {
         spawn: (o) => spawnSelfEnding(o),
-        // Record only: nothing here signals a real process.
         kill: (pid) => {
-          events.push(`kill:${pid}`);
+          events.push(`reap:${pid}`);
           return true;
+        },
+        killCliGroup: (pgid) => {
+          events.push(`killGroup:${pgid}`);
+          return killCliGroup(pgid);
+        },
+        cliGroupPresent: (pgid) => {
+          events.push(`probe:${pgid}`);
+          return cliGroupPresent(pgid);
         },
       }),
     );
+    const run = executor.run(makeCtx({ sessionId: "prev" }).ctx);
+    return { run, events, deadPid: () => children[0]?.pid, children };
+  }
+
+  const onDead = (events: string[], pid: number): string[] =>
+    events.filter((e) => e.startsWith("query") || e.endsWith(`:${pid}`));
+
+  it("signals the group, confirms it absent, removes the pid from the run-end reap set, then resumes", async () => {
+    const d = await driveRealDeath(() => true, () => false);
     try {
-      const result = await executor.run(makeCtx({ sessionId: "prev" }).ctx);
+      const result = (await d.run) as { branch: string };
       assert.equal(result.branch, "agent/issue-5");
-      const dead = children[0]?.pid;
-      assert.ok(dead !== undefined, "the real SDK spawned the self-ending CLI");
+      const pid = d.deadPid();
+      assert.ok(pid !== undefined, "the real SDK spawned the self-ending CLI");
       assert.deepEqual(
-        events.filter((e) => e.startsWith("query") || e === `kill:${dead}`),
-        ["query0", `kill:${dead}`, "query1", "query2"],
-        "killed exactly once, between the death and the resume, and not by the final reap",
+        onDead(d.events, pid),
+        ["query0", `killGroup:${pid}`, `probe:${pid}`, "query1", "query2"],
+        "group signalled and probed before the resume; the run-end reap never sees the pid",
       );
     } finally {
-      await reaped(children);
+      await reaped(d.children);
     }
   });
+
+  for (const [label, killResult, present] of [
+    ["the signal fails and the group is still present", false, true],
+    ["the signal is delivered but the group never disappears", true, true],
+    ["absence is unknowable (no /proc)", true, undefined],
+  ] as const) {
+    it(`fails closed when ${label}: no resume, pid kept for the run-end reap`, async () => {
+      const d = await driveRealDeath(() => killResult, () => present);
+      try {
+        const err = await rejection(d.run);
+        assert.equal(err.message, "Claude Code process exited with code 143");
+        const pid = d.deadPid();
+        assert.ok(pid !== undefined);
+        const seen = onDead(d.events, pid);
+        assert.deepEqual(seen.filter((e) => e.startsWith("query")), ["query0"], "no resume");
+        assert.equal(seen.filter((e) => e === `killGroup:${pid}`).length, 1);
+        assert.equal(seen.at(-1), `reap:${pid}`, "the pid stayed in spawnedPids for the run-end reap");
+      } finally {
+        await reaped(d.children);
+      }
+    });
+  }
 });
 
 describe("SDK process-exit error shape (issue #1656 pin)", () => {

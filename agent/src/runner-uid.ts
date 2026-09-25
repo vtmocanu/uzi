@@ -221,24 +221,39 @@ export function runnerSpawn(
  */
 export function killRunnerGroup(pid: number | undefined): boolean {
   if (pid === undefined || pid <= 0) return false;
+  if (killRunnerGroupOnly(pid)) return true;
   if (!uidSplitActive()) {
-    // Single-uid: signal the group directly (same uid, permitted).
     try {
-      process.kill(-pid, "SIGKILL");
+      process.kill(pid, "SIGKILL");
       return true;
     } catch {
-      try {
-        process.kill(pid, "SIGKILL");
-        return true;
-      } catch {
-        return false;
-      }
+      return false;
     }
   }
-  // Split: reap as `runner` via setpriv. `kill -KILL -<pid>` targets the process group.
-  const r = spawnSync(SETPRIV, [...setprivRunnerArgs(), "kill", "-KILL", `-${pid}`], { stdio: "ignore" });
-  if (r.status === 0) return true;
   // Fall back to the single pid (a non-group-leader child) as `runner`.
   const r2 = spawnSync(SETPRIV, [...setprivRunnerArgs(), "kill", "-KILL", `${pid}`], { stdio: "ignore" });
   return r2.status === 0;
+}
+
+/**
+ * SIGKILL the process GROUP `pgid` and nothing else: unlike {@link killRunnerGroup} there is
+ * no fallback to the bare numeric pid, which for a leader that already exited may name an
+ * unrelated, recycled process (issue #1656). @returns true if the signal was delivered; false
+ * both when the group is already gone (ESRCH) and when the signal failed, so a caller that
+ * needs the group gone must confirm absence independently.
+ */
+export function killRunnerGroupOnly(pgid: number): boolean {
+  if (pgid <= 0) return false;
+  if (!uidSplitActive()) {
+    // Single-uid: signal the group directly (same uid, permitted).
+    try {
+      process.kill(-pgid, "SIGKILL");
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  // Split: reap as `runner` via setpriv. `kill -KILL -<pgid>` targets the process group.
+  const r = spawnSync(SETPRIV, [...setprivRunnerArgs(), "kill", "-KILL", `-${pgid}`], { stdio: "ignore" });
+  return r.status === 0;
 }

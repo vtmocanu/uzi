@@ -90,7 +90,7 @@ import type { WorkerClient } from "./client.js";
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import { qualifiedSkillName, type SkillDrop } from "./skills-plugin.js";
 import { prepareSkillPlugin, resolveSkillCaps } from "./skills-run.js";
-import { killProcessGroup, spawnDetached } from "./sdk-spawn.js";
+import { killProcessGroup, killProcessGroupOnly, processGroupPresent, spawnDetached } from "./sdk-spawn.js";
 import { defaultQueryFn, providerErrorMessage } from "./sdk-messages.js";
 import { ClaudeHarness, type ClaudeTurnConfig } from "./claude-harness.js";
 import { RunTurnReducerImpl } from "./harness-reducer.js";
@@ -251,12 +251,17 @@ export class ProviderTransientError extends Error {
 // on purpose: a self-inflicted kill can recur on resume, so this never joins the uncapped
 // recovery_wait park; exhaustion fails the run exactly as before.
 const CLI_SIGNAL_DEATH_MAX_RETRIES = 2;
+// issue #1656: how long, and how often, to poll for a dead CLI's process group to be gone
+// after the group SIGKILL, before a resume. Past the deadline the run fails closed.
+const CLI_GROUP_REAP_CONFIRM_MS = 1_000;
+const CLI_GROUP_REAP_POLL_MS = 25;
 
 /**
  * issue #1656: the SDK CLI child died from a foreign SIGTERM/SIGKILL (or exited 143/137) with
  * no uzi trip pending. Thrown from driveTurn's catch and resumed in-process on the same session
  * by {@link SdkExecutor.driveTurnWithEmptyRecovery}. `sessionId` is the session observed THIS
- * turn, if any; `pid` is the dead CLI's pid, reaped before any resume; `death` names the signal
+ * turn, if any; `pid` is the dead CLI's pid (its process-group id), whose group must be
+ * confirmed gone before any resume; `death` names the signal
  * or exit code (never the SDK's stderr tail) for the feed notice; `original` is the SDK's own
  * error, rethrown unchanged when the resume is not possible or its bound is spent, so the run
  * fails exactly as it did before.
@@ -381,6 +386,12 @@ export interface SdkExecutorOptions {
   spawn?: (opts: SpawnOptions) => { pid?: number };
   /** Group-kill a pid (default = killProcessGroup). Injected in tests. */
   kill?: (pid: number | undefined) => boolean;
+  /** issue #1656: SIGKILL a dead CLI's process group only, no bare-pid fallback (default =
+   *  killProcessGroupOnly). Injected in tests. */
+  killCliGroup?: (pgid: number) => boolean;
+  /** issue #1656: whether a process group still has members; undefined = unknowable (default
+   *  = processGroupPresent). Injected in tests. */
+  cliGroupPresent?: (pgid: number) => boolean | undefined;
   /** Worker-credential file paths (UZI_WORKER_TOKEN_FILE) the Bash guard denies. */
   secretPaths?: readonly string[];
   /** Root for per-run tool-provisioning dirs (PRD #18 M3), OUTSIDE any clone.
@@ -623,6 +634,8 @@ export class SdkExecutor implements Executor {
   private readonly queryFn: SdkQueryFn;
   private readonly spawn: (opts: SpawnOptions) => { pid?: number };
   private readonly kill: (pid: number | undefined) => boolean;
+  private readonly killCliGroup: (pgid: number) => boolean;
+  private readonly cliGroupPresent: (pgid: number) => boolean | undefined;
   private readonly secretPaths: readonly string[];
   private readonly provisionRoot: string;
   private readonly provisionHomeDir: string;
@@ -648,8 +661,8 @@ export class SdkExecutor implements Executor {
    *  turn before escalating to {@link TransientRecoveryError}. Injectable for tests. */
   private readonly emptyTurnMaxRetries: number;
   /** Every pid spawned across the current run's turns, for the done-path reap
-   *  (a CLI that died from a foreign signal is reaped and removed at resume time,
-   *  issue #1656).
+   *  (a CLI that died from a foreign signal is removed at resume time, once its group
+   *  is confirmed gone, issue #1656).
    *  Private to THIS instance — one SdkExecutor is built per run (PRD #42 Decision
    *  4), so two concurrent runs can never wipe/kill each other's set. Shared with
    *  the Claude adapter, which records pids into it; killAgentTree (below, the
@@ -680,6 +693,8 @@ export class SdkExecutor implements Executor {
     this.queryFn = opts.queryFn ?? defaultQueryFn;
     this.spawn = opts.spawn ?? spawnDetached;
     this.kill = opts.kill ?? killProcessGroup;
+    this.killCliGroup = opts.killCliGroup ?? killProcessGroupOnly;
+    this.cliGroupPresent = opts.cliGroupPresent ?? processGroupPresent;
     this.secretPaths = opts.secretPaths ?? [];
     // Provisioning HOME + root are SHARED worker-lifetime paths (Decision 5): they
     // must NOT be derived from the per-run SDK homeDir, or the nix profile/devbox
@@ -3643,19 +3658,27 @@ export class SdkExecutor implements Executor {
           // A usage-limit death routes to the usage-limit wait path, unchanged.
           if (err instanceof LimitReachedError) throw err;
           if (err instanceof CliSignalDeathError) {
-            // Reap the dead CLI's process group NOW (its orphans, e.g. a nohup'd child that
-            // could read the PAT, go with it) and forget its pid: a resumed run can last hours,
-            // and a pid left for the run-end killAgentTree could by then name a recycled group.
-            if (err.pid !== undefined) {
-              this.kill(err.pid);
-              this.spawnedPids.delete(err.pid);
-            }
             // issue #1656: resume the same session: this turn's observed one, else the
             // caller's. With neither, or once the bound is spent, fail exactly as before with
             // the SDK's own error: never a fresh session labelled a resume, never recovery_wait.
             const sessionId = err.sessionId ?? resumeId;
             if (sessionId === undefined || signalDeathRetries >= CLI_SIGNAL_DEATH_MAX_RETRIES) {
               throw err.original;
+            }
+            // Reap the dead CLI's process group before resuming (its orphans, e.g. a nohup'd
+            // child that could read the PAT, go with it), and resume only once the group is
+            // CONFIRMED gone: a resumed run can last hours, and a pid left for the run-end
+            // killAgentTree could by then name a recycled group. Unconfirmed (still present or
+            // unknowable) fails the run as before and keeps the pid for the run-end reap.
+            if (err.pid !== undefined) {
+              if (!(await this.reapDeadCliGroup(state, err.pid))) {
+                this.log.warn("agent CLI died from a foreign signal; its process group is not confirmed gone, not resuming", {
+                  run_id: ctx.runId,
+                  death: err.death,
+                });
+                throw err.original;
+              }
+              this.spawnedPids.delete(err.pid);
             }
             signalDeathRetries++;
             resumeId = sessionId;
@@ -3748,6 +3771,28 @@ export class SdkExecutor implements Executor {
         ? `provider transient error persisted after bounded in-process retries: ${lastProviderErr.message}`
         : undefined,
     );
+  }
+
+  /**
+   * issue #1656: SIGKILL a dead CLI's process group (group only; the signal's result is not
+   * trusted, since "already gone" and "failed" look alike) and poll, briefly and bounded, until
+   * the group is confirmed empty. SIGKILL delivery is asynchronous, hence the poll. The wait is
+   * debited from the wall like the empty-turn backoff. @returns true only when confirmed gone.
+   */
+  private async reapDeadCliGroup(state: RunDrive, pgid: number): Promise<boolean> {
+    this.killCliGroup(pgid);
+    const started = Date.now();
+    try {
+      for (;;) {
+        const present = this.cliGroupPresent(pgid);
+        if (present === false) return true;
+        if (present === undefined) return false;
+        if (Date.now() - started >= CLI_GROUP_REAP_CONFIRM_MS) return false;
+        await sleep(CLI_GROUP_REAP_POLL_MS);
+      }
+    } finally {
+      state.wallRemainingMs -= Date.now() - started;
+    }
   }
 
   /**
