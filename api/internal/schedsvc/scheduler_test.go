@@ -1462,6 +1462,34 @@ func TestRunNowDoesNotPersistLastFire(t *testing.T) {
 	}
 }
 
+// TestRunNowOnceIssueBranchInUseSkips (issue #1626): a once issue schedule refused with
+// ErrBranchInUse is a transient hold on the tick path, but a manual RunNow still answers
+// with a benign already_running skip (202), not an error the handler maps to 502.
+func TestRunNowOnceIssueBranchInUseSkips(t *testing.T) {
+	h := newHarness()
+	s := h.issueSchedule()
+	s.Timing = "once"
+	s.CronExpr = pgtype.Text{}
+	h.runs.err = workersvc.ErrBranchInUse
+	out, err := h.sched.RunNow(context.Background(), s)
+	if err != nil {
+		t.Fatalf("RunNow on a held once issue must not surface an error, got %v", err)
+	}
+	if out.Matched != 1 || len(out.Started) != 0 || len(out.Skips) != 1 {
+		t.Fatalf("outcome = %+v, want Matched:1 Started:0 Skips:1", out)
+	}
+	if out.Skips[0].Reason != SkipAlreadyRunning {
+		t.Fatalf("reason = %q, want already_running", out.Skips[0].Reason)
+	}
+	if out.Skips[0].IssueIID == nil || *out.Skips[0].IssueIID != 7 {
+		t.Fatalf("skip IssueIID = %v, want 7", out.Skips[0].IssueIID)
+	}
+	if len(h.st.advanceCalls) != 0 {
+		t.Fatalf("RunNow must NOT advance: advance calls = %d, want 0", len(h.st.advanceCalls))
+	}
+	assertBalances(t, out)
+}
+
 // TestFireIssueSuccessStarted: a successful issue fire yields one Started pairing the issue
 // (iid + fetched title) with the run it produced.
 func TestFireIssueSuccessStarted(t *testing.T) {

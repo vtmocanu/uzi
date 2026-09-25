@@ -11517,11 +11517,14 @@ UPDATE runs SET
     -- a report with no milestones passes NULL and clears the candidate (the candidate
     -- reflects only the latest proposal). On an INTERLOCKED run the FIRST plan-bearing
     -- report (stored plan_md still NULL) with no milestones passes the explicit '[]' (so
-    -- approval freezes an empty contract). A later milestone-less report (a re-presented
-    -- gate or a revise round) passes a stored candidate back unchanged, and over a NULL
-    -- candidate (an earlier list was rejected) stays NULL: the rejection is sticky and
-    -- fail-closed. A rejected (invalid) list passes NULL on either kind. The immutable
-    -- frozen list is untouched here (it is written at approve / by autopilot).
+    -- approval freezes an empty contract). A later milestone-less report re-presenting
+    -- the SAME plan (its NUL-stripped plan_md equals the stored one) passes a stored
+    -- candidate back unchanged; a revise round with a DIFFERENT plan and no milestones
+    -- resets a non-empty candidate to '[]', so the superseded plan's list never freezes.
+    -- Over a NULL candidate (an earlier list was rejected) the result stays NULL: the
+    -- rejection is sticky and fail-closed. A rejected (invalid) list passes NULL on
+    -- either kind. The immutable frozen list is untouched here (it is written at
+    -- approve / by autopilot).
     milestones_candidate = $2::jsonb,
     -- PRD #84 M4 (unit 4b): persist the plan-time INFERRED requirement set the worker
     -- emits on this report. ALL THREE assignments are ABSENT-SAFE (a nil param must not

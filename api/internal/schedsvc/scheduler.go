@@ -367,9 +367,18 @@ func (e *Scheduler) process(ctx context.Context, sched store.RunSchedule, pc *pa
 // must not disturb the recurring cadence (next_fire_at stays where the tick left it) nor
 // terminate a once schedule. Errors ride up UNCHANGED — workersvc.ErrRepoNotFound (repo
 // gone / not owned), ErrBadConfig (malformed stored config), or a transient forge/DB
-// error — so the handler can map each to the right HTTP code.
+// error — so the handler can map each to the right HTTP code. The one exception is
+// ErrBranchInUse on an issue target, which becomes an already_running skip (see below).
 func (e *Scheduler) RunNow(ctx context.Context, sched store.RunSchedule) (FireOutcome, error) {
-	return e.fireOne(ctx, sched)
+	out, err := e.fireOne(ctx, sched)
+	// Issue #1626: createIssueRun returns ErrBranchInUse as an error for a once issue
+	// schedule so the tick path holds the row. RunNow never advances, so there is nothing
+	// to hold: answer with the benign already_running skip, as before, instead of a 502.
+	if errors.Is(err, workersvc.ErrBranchInUse) && sched.Target == "issue" {
+		iid := sched.IssueIid.Int64
+		return FireOutcome{Matched: 1, Skips: []Skip{{IssueIID: &iid, Reason: SkipAlreadyRunning}}}, nil
+	}
+	return out, err
 }
 
 // fireOne dispatches on the schedule target and returns the FireOutcome for this fire,
