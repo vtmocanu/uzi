@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   CodexExecutor,
@@ -6011,5 +6012,395 @@ describe("Codex completion interlock", () => {
       assert.equal(attempts, 0);
       assert.equal(result.completionHeld, undefined);
     }
+  });
+});
+
+// ================================================================================
+// Issue #1674: Codex runs report milestone progress. The implement prompts carry the shared
+// milestone tracker guidance (the FINAL approved list on a fresh gated run, the claim's frozen
+// list on a pre-approved resume), each report_progress observation pushes at once and emits its
+// transition frames, a checkpoint keeps a concurrent sibling, and signal_done's
+// milestones_completed reaches the terminal result.
+describe("CodexExecutor milestone progress (issue #1674)", () => {
+  type TurnScript = (th: string, tn: string, n: number) => CodexNotification[];
+  const script = (th: string, turns: TurnScript[]): Responder => (c) => {
+    if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: th } };
+    if (c.method === "turn/start") {
+      const tn = `tn-${th}-${c.turnStartCount}`;
+      if (c.turnStartCount === 1) c.transport.push(threadStarted(th));
+      for (const note of turns[c.turnStartCount - 1]?.(th, tn, c.turnStartCount) ?? []) c.transport.push(note);
+      c.transport.push(turnCompleted("completed", th, tn));
+      return { turn: { id: tn } };
+    }
+    return {};
+  };
+  const progress = (id: number, args: Record<string, unknown>, th: string, tn: string): CodexNotification =>
+    toolCall(id, "report_progress", args, th, tn, `c-prog-${id}`);
+  const done = (id: number, th: string, tn: string, args: Record<string, unknown> = {}): CodexNotification =>
+    toolCall(id, "signal_done", args, th, tn, `c-done-${id}`);
+  const quiet: TurnScript = () => [];
+  const turnTexts = (t: FakeTransport): string[] =>
+    t.requests
+      .filter((r) => r.method === "turn/start")
+      .map((r) => (r.params as { input?: { text?: string }[] }).input?.[0]?.text ?? "");
+  const statusTexts = (emitted: EmittedMessage[]): string[] => emitted
+    .filter((m) => m.kind === "status" && m.agent === "worker")
+    .map((m) => String((m.payload as { text?: string }).text ?? ""));
+  const transitions = (emitted: EmittedMessage[]): string[] =>
+    statusTexts(emitted).filter((t) => /^milestone \S+ (started|reported complete)/.test(t));
+  const approve = { kind: "approve", selection: { source: "own", agents: [] } } as never;
+  const planWith = (milestones: unknown[][]): Responder => script("th-plan", milestones.map((ms, i) => (th, tn) => [
+    toolCall(i + 1, "submit_plan", { plan_md: `PLAN-${i + 1}`, milestones: ms }, th, tn, `c-plan-${i + 1}`),
+  ]));
+  const TRACKER = "Keep this tracker honest as you go.";
+  const REASK = "Your last turn marked no milestone in progress.";
+
+  it("a fresh gated approval appends the tracker guidance with the approved list after the approved plan", async () => {
+    const approved = [{ id: "m1", title: "Wire the schema" }, { id: "m2", title: "Render the badge" }];
+    const rig = makeMultiEpochRig([
+      script("th-plan", [(th, tn) => [
+        // A plan-phase progress report is forwarded, but emits no transition frame.
+        progress(3, { in_progress: ["m1"] }, th, tn),
+        toolCall(1, "submit_plan", { plan_md: "PLAN-1", milestones: approved }, th, tn, "c-plan-1"),
+      ]]),
+      script("th-impl", [(th, tn) => [done(9, th, tn)]]),
+    ]);
+    const { ctx, emitted } = makeCtx({
+      planApproved: false,
+      approvedPlan: undefined,
+      // A stale claim list must not win over the list this run's gate approved.
+      frozenMilestones: [{ id: "stale", title: "Stale claim milestone" }],
+      reportProgress: async () => {},
+      gatePlan: async () => approve,
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#1674 fresh gated run");
+
+    const [text] = turnTexts(rig.epochs[1]!.transport);
+    assert.ok(text!.includes("<approved_plan>\nPLAN-1\n</approved_plan>"), "the Codex approved-plan framing is kept");
+    assert.ok(text!.includes("- [m1] Wire the schema — not started"));
+    assert.ok(text!.includes("- [m2] Render the badge — not started"));
+    assert.ok(text!.includes(TRACKER) && text!.includes("`report_progress`") && text!.includes("`[<id>]"));
+    assert.ok(text!.indexOf(TRACKER) > text!.indexOf("</approved_plan>"), "the guidance is APPENDED after the framing");
+    // The Codex lead has no Agent/Task tool: the addendum names spawn_agent, its subagent_type and the
+    // [<id>] description prefix, after the shared note (which stays byte-identical to the SDK's).
+    assert.ok(text!.includes("`spawn_agent`") && text!.includes("`subagent_type`") && text!.includes("[<id>] Wire the limiter"));
+    assert.ok(text!.indexOf("`spawn_agent`") > text!.indexOf(TRACKER), "the Codex addendum follows the shared note");
+    assert.ok(!text!.includes("Stale claim milestone"), "the approved list wins over the claim list");
+    assert.ok(!text!.includes(REASK), "no re-ask on the first implement turn");
+    assert.deepEqual(transitions(emitted), [], "the planning phase emits no transition frames");
+  });
+
+  it("a revise that replaced the candidate list renders the revised list, never the superseded one", async () => {
+    const rig = makeMultiEpochRig([
+      planWith([[{ id: "a1", title: "Superseded breakdown" }], [{ id: "b1", title: "Revised one" }, { id: "b2", title: "Revised two" }]]),
+      script("th-impl", [(th, tn) => [done(9, th, tn)]]),
+    ]);
+    let gates = 0;
+    const { ctx } = makeCtx({
+      planApproved: false,
+      approvedPlan: undefined,
+      config: { plan_max_revisions: 1 },
+      gatePlan: async () => (++gates === 1 ? { kind: "revise", feedback: "split it" } : approve),
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#1674 revise run");
+
+    const [text] = turnTexts(rig.epochs[1]!.transport);
+    assert.ok(text!.includes("- [b1] Revised one — not started"));
+    assert.ok(text!.includes("- [b2] Revised two — not started"));
+    assert.ok(!text!.includes("Superseded breakdown") && !text!.includes("[a1]"));
+  });
+
+  it("a pre-approved resume falls back to ctx.frozenMilestones", async () => {
+    const rig = makeMultiEpochRig([script("th-1", [(th, tn) => [done(9, th, tn)]])]);
+    const { ctx } = makeCtx({ frozenMilestones: [{ id: "m1", title: "Resume title" }] });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#1674 resume run");
+
+    const [text] = turnTexts(rig.epochs[0]!.transport);
+    assert.ok(text!.startsWith("the approved plan\n\n"), "the raw persisted plan still leads");
+    assert.ok(text!.includes("- [m1] Resume title — not started"));
+  });
+
+  it("re-asks after a work turn with nothing in progress, resets once one is, and emits one bounded status", async () => {
+    const rig = makeMultiEpochRig([script("th-1", [
+      quiet,
+      quiet,
+      (th, tn) => [progress(31, { in_progress: ["m1"] }, th, tn)],
+      (th, tn) => [done(41, th, tn)],
+    ])]);
+    const { ctx, emitted } = makeCtx({
+      config: { max_iterations: 4 },
+      frozenMilestones: [{ id: "m1", title: "Alpha" }],
+      reportProgress: async () => {},
+    });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#1674 missed-turn run");
+
+    assert.equal(result.branch, "agent/issue-42", "a missed report is never fatal");
+    const texts = turnTexts(rig.epochs[0]!.transport);
+    assert.equal(texts.length, 4);
+    assert.deepEqual(texts.map((t) => t.includes(REASK)), [false, true, true, false]);
+    assert.ok(texts[3]!.includes("- [m1] Alpha — in progress"), "the note renders the live status");
+    const misses = statusTexts(emitted).filter((t) => t.startsWith("milestone tracker:"));
+    assert.equal(misses.length, 1, "exactly one enforcement status at the miss limit");
+  });
+
+  it("the completion-rework prompt carries the tracker guidance, the re-ask, and the retained list", async () => {
+    const approvedLike = [{ id: "m1", title: "Alpha" }, { id: "m2", title: "Beta" }];
+    const rig = makeMultiEpochRig([
+      script("th-1", [quiet, (th, tn) => [done(21, th, tn, { milestones_completed: ["m1"] })]]),
+      script("th-1", [(th, tn) => [done(31, th, tn, { milestones_completed: ["m1", "m2"] })]]),
+    ]);
+    let attempts = 0;
+    const { ctx } = makeCtx({
+      kind: "issue",
+      completionInterlock: true,
+      config: { max_iterations: 5 },
+      frozenMilestones: approvedLike,
+      checkpoint: async () => {},
+      recordCompletionAttempt: async () => ({ unmet: attempts++ === 0 ? ["m2"] : [], attemptCount: attempts }),
+    });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#1674 rework run");
+
+    const [text] = turnTexts(rig.epochs[1]!.transport);
+    assert.ok(text!.startsWith("Completion check (structural interlock)"), "the rework follow-up leads");
+    assert.ok(text!.includes("- m2: Beta"), "the rework names the unmet milestone's title from the retained list");
+    assert.ok(text!.includes(TRACKER) && text!.includes("- [m2] Beta — not started"));
+    assert.ok(text!.includes(REASK), "the earlier missed turn escalates the rework prompt too");
+    assert.deepEqual(result.milestonesCompleted, ["m1", "m2"], "the interlocked terminal result carries the declaration");
+  });
+
+  it("a fresh gated rework names the unmet milestone from the approved list, not the absent claim list", async () => {
+    const rig = makeMultiEpochRig([
+      planWith([[{ id: "m1", title: "Alpha" }, { id: "m2", title: "Gated Beta" }]]),
+      script("th-impl", [(th, tn) => [done(21, th, tn, { milestones_completed: ["m1"] })]]),
+      script("th-impl", [(th, tn) => [done(31, th, tn, { milestones_completed: ["m1", "m2"] })]]),
+    ]);
+    let attempts = 0;
+    const { ctx } = makeCtx({
+      kind: "issue",
+      completionInterlock: true,
+      planApproved: false,
+      approvedPlan: undefined,
+      config: { max_iterations: 5 },
+      gatePlan: async () => approve,
+      checkpoint: async () => {},
+      recordCompletionAttempt: async () => ({ unmet: attempts++ === 0 ? ["m2"] : [], attemptCount: attempts }),
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#1674 gated rework run");
+
+    const [text] = turnTexts(rig.epochs[2]!.transport);
+    assert.ok(text!.includes("- m2: Gated Beta"), "the rework list is the retained approved list");
+  });
+
+  it("the clarification continuation prompt carries the tracker guidance and the re-ask", async () => {
+    const rig = makeMultiEpochRig([script("th-1", [
+      quiet,
+      (th, tn) => [toolCall(21, "ask_user", { questions: [{ question: "Which target?", header: "Target" }] }, th, tn, "c-ask-21")],
+      (th, tn) => [done(31, th, tn)],
+    ])]);
+    const { ctx } = makeCtx({
+      config: { max_iterations: 3 },
+      frozenMilestones: [{ id: "m1", title: "Alpha" }],
+      askUser: async () => ({ kind: "answer", answers: ["server"] }),
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#1674 clarification run");
+
+    const texts = turnTexts(rig.epochs[0]!.transport);
+    assert.equal(texts.length, 3);
+    assert.ok(texts[2]!.startsWith("The human answered your questions:"));
+    const cont = texts[2]!.indexOf("Continue the implementation.");
+    assert.ok(cont >= 0 && texts[2]!.indexOf(TRACKER) > cont, "the guidance follows the continuation");
+    assert.ok(texts[2]!.includes(REASK));
+  });
+
+  it("a checkpoint drops only the checkpointed milestone and keeps a concurrent sibling", async () => {
+    const agents = [{ id: "m1", agent: "coder" }, { id: "m2", agent: "tester", agent_label: "Tests" }];
+    for (const [label, reported, expected] of [
+      [
+        "with a completed id",
+        { completed: ["m1"], in_progress: ["m1", "m2"], milestones_agents: agents },
+        { completed: ["m1"], in_progress: ["m2"], milestones_agents: [agents[1]] },
+      ],
+      [
+        "with no completed ids",
+        { in_progress: ["m1", "m2"], milestones_agents: agents },
+        { completed: [], in_progress: ["m1", "m2"], milestones_agents: agents },
+      ],
+    ] as const) {
+      const rig = makeMultiEpochRig([
+        script("th-1", [(th, tn) => [progress(11, reported, th, tn), toolCall(12, "checkpoint", {}, th, tn, "c-ckpt")]]),
+        script("th-1", [(th, tn) => [done(21, th, tn)]]),
+      ]);
+      const iterations: { n: number; progress: unknown }[] = [];
+      const checkpointed: unknown[] = [];
+      const { ctx } = makeCtx({
+        frozenMilestones: [{ id: "m1", title: "Alpha" }, { id: "m2", title: "Beta" }],
+        reportProgress: async () => {},
+        checkpoint: async (opts) => { checkpointed.push(opts.progress); },
+        reportIteration: async (n, p) => { iterations.push({ n, progress: p }); return undefined; },
+      });
+      await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, `#1674 checkpoint ${label}`);
+
+      assert.deepEqual(checkpointed.length, 1, `${label}: one cooperative checkpoint`);
+      assert.deepEqual(iterations.map((i) => i.n), [1, 2]);
+      assert.deepEqual(iterations[1]!.progress, expected, `${label}: the next running report keeps the sibling`);
+      const [next] = turnTexts(rig.epochs[1]!.transport);
+      assert.ok(next!.includes("- [m2] Beta — in progress"), `${label}: the sibling stays in progress in the prompt`);
+      assert.ok(!next!.includes(REASK), `${label}: a checkpoint re-arms enforcement`);
+    }
+  });
+
+  it("pushes each report at once, emits each transition frame exactly once, completions before starts", async () => {
+    const log: string[] = [];
+    const rig = makeMultiEpochRig([script("th-1", [
+      (th, tn) => [
+        progress(11, { in_progress: ["m1"], milestones_agents: [{ id: "m1", agent: "coder" }] }, th, tn),
+        progress(12, { completed: ["m1"], in_progress: ["m2"] }, th, tn),
+        progress(13, { completed: ["m1"], in_progress: ["m2"] }, th, tn),
+      ],
+      (th, tn) => [progress(21, { completed: ["m1"], in_progress: ["m2"] }, th, tn), done(22, th, tn)],
+    ])]);
+    const pushes: unknown[] = [];
+    const { ctx, emitted } = makeCtx({
+      config: { max_iterations: 3 },
+      frozenMilestones: [{ id: "m1", title: "Alpha" }, { id: "m2", title: "Beta" }],
+      emit: (m) => {
+        emitted.push(m);
+        const t = m.kind === "status" ? String((m.payload as { text?: string }).text ?? "") : "";
+        if (t.startsWith("milestone ")) log.push(`frame:${t}`);
+      },
+      reportProgress: async (p) => { pushes.push(p); log.push(`push:${p.in_progress.join(",")}`); },
+      reportIteration: async (n) => { log.push(`iteration:${n}`); return undefined; },
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#1674 transition run");
+
+    assert.deepEqual(transitions(emitted), [
+      "milestone m1 started — Alpha",
+      "milestone m1 reported complete — Alpha",
+      "milestone m2 started — Beta",
+    ]);
+    assert.equal(pushes.length, 4, "every observation is pushed, repeats included");
+    assert.deepEqual(pushes[0], { completed: [], in_progress: ["m1"], milestones_agents: [{ id: "m1", agent: "coder" }] },
+      "milestones_agents reaches the progress push");
+    assert.deepEqual(log.slice(0, 7), [
+      "iteration:1",
+      "frame:milestone m1 started — Alpha",
+      "push:m1",
+      "frame:milestone m1 reported complete — Alpha",
+      "frame:milestone m2 started — Beta",
+      "push:m2",
+      "push:m2",
+    ], "frames and pushes land during the turn, before the next iteration boundary");
+    assert.equal(log[7], "iteration:2");
+  });
+
+  it("swallows a synchronous reportProgress throw", async () => {
+    const rig = makeMultiEpochRig([script("th-1", [(th, tn) => [progress(11, { in_progress: ["m1"] }, th, tn), done(12, th, tn)]])]);
+    const { ctx, emitted } = makeCtx({
+      frozenMilestones: [{ id: "m1", title: "Alpha" }],
+      reportProgress: () => { throw new Error("sync progress boom"); },
+    });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#1674 sync throw run");
+    assert.equal(result.branch, "agent/issue-42");
+    assert.deepEqual(transitions(emitted), ["milestone m1 started — Alpha"]);
+  });
+
+  it("carries signal_done milestones_completed into the terminal result on issue runs only", async () => {
+    for (const [kind, args, expected] of [
+      ["issue", { milestones_completed: ["m1"] }, ["m1"]],
+      ["issue", {}, undefined],
+      ["task", { milestones_completed: ["m1"] }, undefined],
+    ] as const) {
+      const rig = makeMultiEpochRig([script("th-1", [(th, tn) => [done(11, th, tn, args)]])]);
+      const { ctx } = makeCtx({ kind });
+      const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, `#1674 ${kind} done`);
+      if (expected === undefined) assert.ok(!("milestonesCompleted" in result), `${kind} ${JSON.stringify(args)}: omitted`);
+      else assert.deepEqual(result.milestonesCompleted, expected);
+    }
+  });
+});
+
+// ================================================================================
+// Issue #1674 M3: the Codex delegation projection, as the worker POSTS it, is the frame shape
+// the server's lane derivation (api/internal/milestonelanes.Derive) binds. This drives a real
+// `[<id>]`-tagged spawn_agent through the executor and a real MessageBatcher, keeps the dispatch,
+// the child's frames and the lead completion, normalizes the volatile dispatch nonce, the seq and
+// the (server-assigned) created_at, and asserts the result equals the checked-in fixture. The Go
+// half (milestonelanes/derive_codex_fixture_test.go) feeds the SAME frames to Derive.
+describe("CodexExecutor projection-to-server lane fixture (issue #1674 M3)", () => {
+  const FIXTURE = fileURLToPath(new URL("../../fixtures/codex-milestone-lanes/projection.json", import.meta.url));
+  const BASE_AT = Date.parse("2026-09-25T11:59:00Z");
+  interface FixtureFrame {
+    kind: string;
+    agent: string;
+    agent_instance: string;
+    agent_label: string;
+    payload: Record<string, unknown>;
+    created_at: string;
+    seq: number;
+  }
+
+  it("the posted spawn_agent dispatch, child frame and lead completion match the shared fixture", async () => {
+    const agents: AgentTemplate[] = [
+      { name: "lead", description: "the lead", prompt_body: "lead body", tools: null, skills: [] },
+      { name: "coder", description: "a coder", prompt_body: "coder body", tools: null, skills: [] },
+    ];
+    const rig = makeRig({
+      responder: (c) => {
+        if (c.method === "thread/start") return { thread: { id: c.threadStartCount === 1 ? "th-1" : "th-child-1" } };
+        if (c.method === "turn/start") {
+          if (c.turnStartCount === 1) return { turn: { id: "tn-1" } };
+          c.transport
+            .push(toolCall(11, "uzi_bash", { command: "go test ./..." }, "th-child-1", "tn-child", "cc-bash"))
+            .push(agentMessage("tests pass", "th-child-1"))
+            .push(turnCompleted("completed", "th-child-1", "tn-child"));
+          return { turn: { id: "tn-child" } };
+        }
+        return {};
+      },
+    });
+    rig.deps = { ...rig.deps, spawnCommand: async () => ({ code: 0, stdout: "ok", stderr: "" }) };
+    rig.transport
+      .push(threadStarted())
+      .push(toolCall(1, "spawn_agent", { subagent_type: "coder", description: "[m1] Wire the limiter", prompt: "wire it" }, "th-1", "tn-1", "c-spawn"));
+
+    const posted: OutgoingMessage[] = [];
+    const client = {
+      async postMessages(_runId: string, msgs: OutgoingMessage[]): Promise<void> {
+        posted.push(...msgs);
+      },
+    } as unknown as WorkerClient;
+    const batcher = new MessageBatcher(client, "run-1", 0, 5, noopLog, makeRedactor([]), makeTextRedactor([]));
+    const { ctx } = makeCtx({ agents, emit: (m) => batcher.emit(m) });
+    const runP = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    await waitFor(() => rig.transport.responses.some((r) => r.requestId === 1), "parent spawn_agent reply", 5000);
+    rig.transport.push(signalDone("th-1", "tn-1")).push(turnCompleted("completed", "th-1", "tn-1")).end();
+    await withTimeout(runP, 5000, "projection fixture run");
+    await batcher.close();
+
+    const dispatch = posted.find((m) => m.kind === "tool_use" && m.payload.name === "Agent");
+    assert.ok(dispatch, "the spawn_agent dispatch was posted as an Agent tool_use");
+    const rawId = String(dispatch.payload.id);
+    assert.match(rawId, /^cx-[0-9a-f]{12}-t\d+-c-spawn$/);
+    const normId = rawId.replace(/^cx-[0-9a-f]{12}-/, "cx-000000000000-");
+    const norm = (v: unknown): unknown => JSON.parse(JSON.stringify(v).split(rawId).join(normId));
+    const delegation = posted.filter((m) =>
+      m === dispatch || m.agent_instance === rawId || (m.kind === "tool_result" && m.payload.tool_use_id === rawId));
+    const frames: FixtureFrame[] = delegation.map((m, i) => ({
+      kind: m.kind,
+      agent: m.agent ?? "",
+      agent_instance: String(norm(m.agent_instance ?? "")),
+      agent_label: m.agent_label ?? "",
+      payload: norm(m.payload) as Record<string, unknown>,
+      created_at: new Date(BASE_AT + i * 1000).toISOString().replace(".000Z", "Z"),
+      seq: i + 1,
+    }));
+    const kinds = frames.map((f) => `${f.agent}:${f.kind}`);
+    assert.deepEqual(kinds.slice(0, 1), ["lead:tool_use"], "the dispatch leads");
+    assert.ok(kinds.includes("coder:tool_use"), "an active child tool_use frame is captured");
+    assert.equal(kinds.at(-1), "lead:tool_result", "the projected lead completion closes the delegation");
+
+    const fixture = JSON.parse(await fs.readFile(FIXTURE, "utf8")) as { frames: FixtureFrame[] };
+    assert.deepEqual(frames, fixture.frames,
+      `the real projection drifted from the fixture; re-record frames from:\n${JSON.stringify(frames, null, 2)}`);
   });
 });

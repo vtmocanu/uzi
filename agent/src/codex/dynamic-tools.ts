@@ -123,6 +123,11 @@ function definition(name: string): Omit<CodexDynamicToolSpec, "type" | "name"> {
         inputSchema: objectSchema({
           completed: { type: "array", items: STRING },
           in_progress: { type: "array", items: STRING },
+          // Issue #1674 (PRD #1224 M1): per-milestone agent attribution; signals.ts parses it.
+          milestones_agents: {
+            type: "array",
+            items: objectSchema({ id: STRING, agent: STRING, agent_label: STRING }, ["id", "agent"], false),
+          },
         }, [], false),
       };
     case "checkpoint":

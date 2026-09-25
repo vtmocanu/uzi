@@ -20,6 +20,7 @@ import {
   isCIConfigPlan,
   isNotCodePlan,
   LEAD_GUARDRAIL_APPEND,
+  milestoneStatusNote,
   MR_REWORK_LIFECYCLE_APPEND,
   PRD_LIFECYCLE_APPEND,
   NOT_CODE_MARKER,
@@ -947,6 +948,14 @@ describe("buildImplementPrompt — milestone note (PRD #122 M6)", () => {
     // PRD #390 M2: the mid-run report is now a REQUIRED per-turn declaration, not "MAY".
     assert.match(p, /At the start of each implement turn, call/, "the note requires a per-turn report_progress declaration");
     assert.doesNotMatch(p, /you MAY call `report_progress`/, "the old permissive MAY phrasing is gone");
+  });
+
+  it("exports the milestone note for harness-specific implement prompts", () => {
+    const note = milestoneStatusNote(milestones, { completed: ["m1"], in_progress: ["m2"] }, true);
+    assert.match(note, /\[m1\] wire the schema — done/);
+    assert.match(note, /\[m2\] render the badge — in progress/);
+    assert.match(note, /Your last turn marked no milestone in progress/);
+    assert.equal(milestoneStatusNote(undefined, undefined, true), "");
   });
 
   it("PRD #390 M2: escalates with progressMissedLastTurn, and only then", () => {

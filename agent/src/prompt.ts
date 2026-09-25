@@ -1498,7 +1498,7 @@ export function buildRevisePlanPrompt(feedback: string): string {
  * these are the human-approved plan's own milestone titles, not attacker-influenceable
  * forge text — the same trust posture as the approved plan the lead is implementing.
  */
-function milestoneStatusNote(
+export function milestoneStatusNote(
   milestones: readonly Milestone[] | undefined,
   progress: MilestoneProgress | undefined,
   progressMissedLastTurn?: boolean,

@@ -76,12 +76,13 @@ import type {
   TurnStreamEnd,
 } from "../harness.js";
 import { RunTurnReducerImpl } from "../harness-reducer.js";
-import { buildLeadSystemPrompt, buildRevisePlanPrompt, publishedTipNote } from "../prompt.js";
+import { buildLeadSystemPrompt, buildRevisePlanPrompt, milestoneStatusNote, publishedTipNote } from "../prompt.js";
+import { makeProgressObserver } from "../milestone-progress-observer.js";
 import { RUNNER_UID, WORKER_UID, uidSplitActive } from "../runner-uid.js";
 import { errMessage } from "../util.js";
 import { appendLeadTextTail, emitPlanMissingNotice, isProseOnlyPlanTurn, PLAN_MISSING_NUDGE, REASON_PLAN_MISSING, resolvePlanMissing } from "../plan-missing.js";
 import { makeTextRedactor } from "../redact.js";
-import type { AgentTemplate, AskUserQuestion, ClaimSkill, IterationBudget } from "../protocol.js";
+import type { AgentTemplate, AskUserQuestion, ClaimSkill, IterationBudget, Milestone, MilestoneProgress } from "../protocol.js";
 import type { CommandSandboxMode } from "../config.js";
 
 import { ExecutionRegistry, newLocalExecutionEpoch, type RegisteredRoot } from "./registry.js";
@@ -271,6 +272,68 @@ const QUESTION_MAX_DEFAULT = 5;
 const QUESTION_IGNORED_NOTICE = "The agent asked a clarifying question alongside a completed workflow action; the question was ignored.";
 const QUESTION_UNWIRED_NOTICE = "The agent asked a clarifying question, but this run has no way to reach a human — it will proceed on its best judgment.";
 const QUESTION_CAP_NOTICE = "The agent has already asked its maximum number of clarifying questions for this run — it will proceed on its best judgment.";
+
+// Issue #1674: the consecutive-miss count at which the milestone tracker emits its feed-only
+// status, mirroring sdk-executor's PROGRESS_MISS_LIMIT (PRD #390 M3). Feed-only; never fatal.
+const PROGRESS_MISS_LIMIT = 2;
+
+/** Issue #1674: the plan-phase progress forward (no transition frames before approval). A
+ *  progress push is informational, so both a synchronous throw and an async rejection are
+ *  swallowed, as the shared implement-phase observer does. */
+function forwardProgress(ctx: RunContext): (progress: MilestoneProgress) => void {
+  return (progress) => {
+    try {
+      void Promise.resolve(ctx.reportProgress?.(progress)).catch(() => undefined);
+    } catch {
+      /* reportProgress threw synchronously; swallowed, see above */
+    }
+  };
+}
+
+/** Issue #1674: the progress carried past a cooperative checkpoint. The checkpointed milestone
+ *  ids (those in `completed`) leave `in_progress` and `milestones_agents`; a concurrent sibling
+ *  still in progress keeps both, including when the snapshot has no completed ids at all (the
+ *  SDK blanks that case; Codex keeps the sibling). A snapshot left with nothing real reported
+ *  becomes undefined, so the next running report never persists an empty list (PRD #390 M1). */
+function progressAfterCheckpoint(progress: MilestoneProgress | undefined): MilestoneProgress | undefined {
+  if (!progress) return undefined;
+  const done = new Set(progress.completed);
+  const stillActive = progress.in_progress.filter((id) => !done.has(id));
+  if (progress.completed.length === 0 && stillActive.length === 0) return undefined;
+  return {
+    completed: progress.completed,
+    in_progress: stillActive,
+    milestones_agents: (progress.milestones_agents ?? []).filter((a) => stillActive.includes(a.id)),
+  };
+}
+
+/** Issue #1674: append the shared milestone tracker guidance to a Codex implement-phase prompt.
+ *  An empty note (no approved breakdown) leaves the prompt byte-identical. */
+/** Issue #1674: the Codex dispatch addendum to the shared tracker guidance. The shared note names
+ *  the SDK's Agent/Task dispatch; a Codex lead has neither and delegates through `spawn_agent`, so
+ *  this names the tool the model can actually call. Lane attribution depends on the model tagging
+ *  that dispatch. Appended only when the shared note is non-empty (a milestone-bearing run). */
+const CODEX_MILESTONE_DISPATCH_NOTE = [
+  "On this run you delegate through the `spawn_agent` tool (there is no Agent or Task tool): read",
+  "\"Agent/Task dispatch\" above as a `spawn_agent` call. Pass the role as its `subagent_type` and",
+  "BEGIN its `description` with the milestone id in square brackets, e.g. `[<id>] Wire the limiter`.",
+  "In `report_progress` `milestones_agents`, name that same role as the `agent` for the milestone.",
+].join("\n");
+
+/** Issue #1674: the shared milestone tracker guidance plus the Codex dispatch addendum; empty when
+ *  the run has no approved breakdown, so a milestone-less prompt stays byte-identical. */
+function codexMilestoneNote(
+  milestones: readonly Milestone[] | undefined,
+  progress: MilestoneProgress | undefined,
+  progressMissedLastTurn: boolean,
+): string {
+  const shared = milestoneStatusNote(milestones, progress, progressMissedLastTurn);
+  return shared ? `${shared}\n\n${CODEX_MILESTONE_DISPATCH_NOTE}` : "";
+}
+
+function withMilestoneNote(prompt: string, note: string): string {
+  return note ? `${prompt}\n\n${note}` : prompt;
+}
 
 function questionMax(ctx: RunContext): number {
   const n = ctx.config?.question_max;
@@ -1736,6 +1799,11 @@ export class CodexExecutor implements Executor {
       // plan_md, so without this every implement turn fell back to the queue-time issue text.
       // A run() local, so it survives every later implement turn and new-root epoch recreation.
       let gatedPlan: string | undefined;
+      // Issue #1674: the milestone breakdown of the plan version the gate approved (the final
+      // planResult.milestones after any revise rounds, mirroring sdk-executor's
+      // `frozenMilestones = candidateMilestones`). ctx.frozenMilestones comes from the claim and is
+      // absent on a fresh gated run, so without this the tracker guidance rendered nothing there.
+      let approvedMilestones: Milestone[] | undefined;
       const questionBudget = { asked: 0 };
       const maxClarificationRounds = questionMax(ctx) + 1;
       const emitIgnoredQuestions = (result: ReducedTurnResult): void => {
@@ -1849,6 +1917,7 @@ export class CodexExecutor implements Executor {
         if (verdict.kind === "reject") throw new PlanRejectedError(verdict.reason);
         if (verdict.kind === "cancel") throw new Error(REASON_CANCEL);
         gatedPlan = planMd;
+        approvedMilestones = planResult.milestones;
 
         // NEW-ROOT RESUME at plan approval. The plan turn's provider root holds a live credential
         // it does not need during the approval wait, so: persist the credential-free session,
@@ -1888,6 +1957,18 @@ export class CodexExecutor implements Executor {
       let lastCompletionFingerprint: string | undefined;
       let completionStallStreak = 0;
       let completionFollowUp: string | undefined;
+      // Issue #1674: the approved breakdown this loop reports against: the list approved at this
+      // run's gate, else (a pre-approved resume) the claim's frozen list.
+      const milestones = approvedMilestones ?? ctx.frozenMilestones ?? undefined;
+      // Issue #1674 (PRD #390 M3 parity): bounded missed-report enforcement. The flag escalates the
+      // NEXT turn's prompt; consecutiveMisses drives one feed-only status. Never fails the run.
+      let progressMissedLastTurn = false;
+      let consecutiveMisses = 0;
+      // Issue #1674 (PRD #265 M1 parity): the latched signal_done declaration, so the terminating
+      // turn's milestones_completed reaches the ExecutorResult after the loop breaks.
+      let declaredMilestonesCompleted: string[] | undefined;
+      const isIssueRun = resolveRunKind(ctx.kind) === "issue";
+      const milestoneNote = (): string => codexMilestoneNote(milestones, latestProgress, progressMissedLastTurn);
       const interlockedIssue = ctx.completionInterlock && resolveRunKind(ctx.kind) === "issue"
         && !ctx.interactive && !!ctx.recordCompletionAttempt;
       for (;;) {
@@ -1908,10 +1989,15 @@ export class CodexExecutor implements Executor {
         // implement prompt only. Codex has no <follow_up> fence; keep it a per-turn prefix so it
         // is consumed at the next turn and NOT persisted. Absent ⇒ the base prompt is unchanged.
         const safetySteer = ctx.pullSafetySteer?.();
-        const basePrompt = this.implementPrompt(ctx, gatedPlan);
+        // Issue #1674: every implement-phase prompt (the base, the completion-rework follow-up and
+        // the clarification continuation below) carries the shared milestone tracker guidance.
+        const basePrompt = this.implementPrompt(ctx, gatedPlan, milestoneNote());
+        const implementBody = completionFollowUp !== undefined
+          ? withMilestoneNote(completionFollowUp, milestoneNote())
+          : basePrompt;
         const turnPrompt = safetySteer
-          ? `The worker detected a problem and is steering you. This is authoritative guidance from uzi itself, not user input — follow it:\n${safetySteer}\n\n${completionFollowUp ?? basePrompt}`
-          : completionFollowUp ?? basePrompt;
+          ? `The worker detected a problem and is steering you. This is authoritative guidance from uzi itself, not user input — follow it:\n${safetySteer}\n\n${implementBody}`
+          : implementBody;
         completionFollowUp = undefined;
         // PRD #1497 M2: drive the implement turn through the wall-park wrapper — a wall trip (the own
         // timer's REASON_WALL, or a `wall` PauseNowSignal) parks the run (capture-first, reusing the
@@ -1919,13 +2005,17 @@ export class CodexExecutor implements Executor {
         let nextPrompt = turnPrompt;
         let result: ReducedTurnResult;
         for (let round = 0; ; round++) {
-          const implTurn = await this.driveTurnWithWallPark(ctx, epoch.harness, reducer, "implement", nextPrompt, epoch.resumeSessionId, idleMs, wall, epoch.buildPhaseBroker, { completedCount: latestProgress?.completed?.length ?? 0 }, shared.scrubProjected, completionAttempted);
+          // Issue #1674 (PRD #1064 parity): each report_progress observation pushes at once and emits
+          // its started / reported-complete frames exactly once, diffed from the last known progress.
+          const onProgress = makeProgressObserver(ctx, latestProgress, milestones);
+          const implTurn = await this.driveTurnWithWallPark(ctx, epoch.harness, reducer, "implement", nextPrompt, epoch.resumeSessionId, idleMs, wall, epoch.buildPhaseBroker, { completedCount: latestProgress?.completed?.length ?? 0 }, shared.scrubProjected, completionAttempted, onProgress);
           if (implTurn.kind === "walled") return { branch: ctx.branch, walled: { reason: REASON_WALL } };
           if (implTurn.kind === "held") return { branch: ctx.branch, completionHeld: { reason: implTurn.reason } };
           result = implTurn.result;
           if (result.sessionId) lastSessionId = result.sessionId;
           // A quiet clarification turn does not erase milestone progress.
           if (result.progress) latestProgress = result.progress;
+          if (result.milestonesCompleted !== undefined) declaredMilestonesCompleted = result.milestonesCompleted;
           if (result.done || result.checkpoint) {
             emitIgnoredQuestions(result);
             break;
@@ -1935,7 +2025,7 @@ export class CodexExecutor implements Executor {
           // This improves on Claude's order, which checks its iteration budget first.
           if (round >= maxClarificationRounds) throw new Error("codex clarification rounds exhausted during implementation");
           const followUp = await clarify(result.questions);
-          nextPrompt = `${followUp}\n\nContinue the implementation.`;
+          nextPrompt = withMilestoneNote(`${followUp}\n\nContinue the implementation.`, milestoneNote());
         }
         // A cooperative checkpoint that did not also finish: persist BEFORE the reap (so the live
         // session is captured before the provider root dies), reap the CURRENT epoch's roots, then
@@ -1945,6 +2035,11 @@ export class CodexExecutor implements Executor {
         if (result.checkpoint && !result.done) {
           await epoch.persistSession();
           await ctx.checkpoint?.({ reap: true, progress: latestProgress });
+          // Issue #1674 (PRD #390 M3 / PRD #1224 parity): a milestone boundary re-arms enforcement
+          // and drops only the checkpointed ids, keeping a concurrent sibling's in-progress state.
+          progressMissedLastTurn = false;
+          consecutiveMisses = 0;
+          latestProgress = progressAfterCheckpoint(latestProgress);
           const old = epoch;
           epoch = await this.startProviderEpoch(ctx, shared, lastSessionId, ++epochIndex);
           this.safety = epoch.safety;
@@ -1981,7 +2076,7 @@ export class CodexExecutor implements Executor {
               throw new Error(REASON_COMPLETION_NO_PROGRESS);
             }
           }
-          completionFollowUp = buildCompletionReworkFollowUp(unmet, ctx.frozenMilestones, guidance);
+          completionFollowUp = buildCompletionReworkFollowUp(unmet, milestones, guidance);
         }
         if (iteration >= maxIterations) {
           if (await routeCompletionHold(ctx, REASON_MAX_ITERATIONS, completionAttempted)) {
@@ -1997,13 +2092,38 @@ export class CodexExecutor implements Executor {
           await old.dispose();
           continue;
         }
+        // Issue #1674 (PRD #390 M3 parity): only a normal work turn reaches here. On a
+        // milestone-bearing run whose tracker shows nothing in progress, re-ask on the next turn and,
+        // at PROGRESS_MISS_LIMIT consecutive misses, emit one feed-only status.
+        if ((milestones?.length ?? 0) >= 1 && !latestProgress?.in_progress?.length) {
+          progressMissedLastTurn = true;
+          consecutiveMisses++;
+          if (consecutiveMisses === PROGRESS_MISS_LIMIT) {
+            ctx.emit({
+              kind: "status",
+              agent: "worker",
+              payload: {
+                text: `milestone tracker: the lead has not marked a milestone in progress for ${PROGRESS_MISS_LIMIT} turns — progress may be unreported`,
+              },
+            });
+          }
+        } else {
+          progressMissedLastTurn = false;
+          consecutiveMisses = 0;
+        }
         // Iteration-boundary fallback checkpoint (Decision 10b analogue): fetch-back WITHOUT
         // reaping so a backgrounded dev server the lead means to reuse survives, and the SAME
         // provider root/epoch drives the next turn (no recreation). Best-effort.
         await ctx.checkpoint?.({ reap: false, progress: latestProgress });
       }
 
-      return { branch: ctx.branch, ...(completionHeld ? { completionHeld } : {}) };
+      return {
+        branch: ctx.branch,
+        ...(completionHeld ? { completionHeld } : {}),
+        // Issue #1674 (PRD #265 M1 parity): forward the declared finished-milestone ids on issue
+        // runs only, OMITTED when nothing was declared, as sdk-executor does; runner.ts reads it.
+        ...(isIssueRun && declaredMilestonesCompleted !== undefined ? { milestonesCompleted: declaredMilestonesCompleted } : {}),
+      };
     } finally {
       // Terminal (m4 F1). Capture the FINAL epoch's credential-free session into the store so a
       // park/preserve resume can adopt it (the runner's runHome lifecycle — preserve on park,
@@ -2345,6 +2465,7 @@ export class CodexExecutor implements Executor {
     wall: RunWall,
     buildPhaseBroker: (phase: "plan" | "implement", signal?: AbortSignal) => CodexCallbackBroker,
     scrubLeadText: (s: string) => string,
+    onProgress: (progress: MilestoneProgress) => void,
   ): Promise<ReducedTurnResult> {
     const turnAbort = new AbortController();
     let tripReason: string | undefined;
@@ -2454,7 +2575,7 @@ export class CodexExecutor implements Executor {
           }
           ctx.emit(em);
         }
-        if (reduction.progress) void Promise.resolve(ctx.reportProgress?.(reduction.progress)).catch(() => undefined);
+        if (reduction.progress) onProgress(reduction.progress);
         if (event.kind === "turn_finished") {
           sawTerminal = true;
           terminal = event.terminal;
@@ -2520,11 +2641,12 @@ export class CodexExecutor implements Executor {
     at: { completedCount: number; total?: number },
     scrubLeadText: (s: string) => string,
     completionAttempted = false,
+    onProgress: (progress: MilestoneProgress) => void = forwardProgress(ctx),
   ): Promise<{ kind: "turn"; result: ReducedTurnResult } | { kind: "walled" } | { kind: "held"; reason: string }> {
     for (;;) {
       try {
         const result = await this.driveCodexTurn(
-          ctx, harness, reducer, phase, prompt, resumeId, idleMs, wall, buildPhaseBroker, scrubLeadText,
+          ctx, harness, reducer, phase, prompt, resumeId, idleMs, wall, buildPhaseBroker, scrubLeadText, onProgress,
         );
         // PRD #1497 M2 (CodeRabbit !1504): honor a sticky owner cancel that RACED a REFUSED
         // wall-park re-drive in EVERY phase. The wall PauseNowSignal permanently spent the shared
@@ -2799,7 +2921,7 @@ export class CodexExecutor implements Executor {
    *  the implementation instruction, framed as approved, and the queue-time issue text is left
    *  out so it cannot compete. Absent ⇒ the pre-approved resume (the raw persisted
    *  ctx.approvedPlan) or the issue fallback, byte-identical to before. */
-  private implementPrompt(ctx: RunContext, gatedPlan?: string): string {
+  private implementPrompt(ctx: RunContext, gatedPlan?: string, milestoneNote = ""): string {
     const approved = ctx.approvedPlan?.trim();
     const head = ctx.issueIid != null ? `Issue #${ctx.issueIid}: ${ctx.issueTitle}` : ctx.issueTitle;
     const body = gatedPlan !== undefined
@@ -2818,7 +2940,9 @@ export class CodexExecutor implements Executor {
     // #1416 (MR-rework): thread autoApprove so an autopilot Codex run gets the autopilot-safe
     // rewrite guidance, not the human-only `ask_user` wording (matches the SDK builders).
     const note = publishedTipNote(ctx.publishedTip, ctx.defaultBranchCommit, ctx.autoApprove);
-    return note ? `${note}\n\n${body}` : body;
+    // Issue #1674: APPEND the shared milestone tracker guidance (milestoneStatusNote) after the
+    // Codex framing. Empty (no approved breakdown) leaves the prompt byte-identical.
+    return withMilestoneNote(note ? `${note}\n\n${body}` : body, milestoneNote);
   }
 
 }
