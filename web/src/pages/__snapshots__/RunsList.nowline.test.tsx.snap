@@ -16,7 +16,7 @@ exports[`RunsList row now line (PRD #1064 M3) > D5: a null-milestone null-activi
       data-live=""
     >
       <div
-        class="flex w-full min-w-0 items-start gap-2 sm:w-auto sm:flex-1"
+        class="flex w-full min-w-0 items-center gap-2 sm:w-auto sm:flex-1"
       >
         <span
           aria-label="Claude"
@@ -46,30 +46,61 @@ exports[`RunsList row now line (PRD #1064 M3) > D5: a null-milestone null-activi
             A run
           </p>
           <p
-            class="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-faint"
+            class="mt-0.5 flex flex-wrap items-center gap-x-4 overflow-x-clip text-xs text-faint"
           >
             <span
-              class="inline-flex items-center gap-1"
+              class="inline-flex min-w-0 max-w-full items-center gap-1"
             >
-              grp/proj
-               
-              <span>
-                #
-                7
+              <span
+                class="min-w-0 truncate"
+              >
+                grp/proj
+              </span>
+              <span
+                class="shrink-0"
+              >
+                <span
+                  class="focus-visible:ring-inset focus-visible:ring-offset-0"
+                >
+                  #
+                  7
+                </span>
               </span>
             </span>
-            <span>
-              · 
+            <span
+              class="inline-flex items-center"
+            >
+               
+              <span
+                aria-hidden="true"
+                class="-ml-4 w-4 shrink-0 text-center"
+              >
+                ·
+              </span>
               w1
             </span>
-            <span>
-              · 
+            <span
+              class="inline-flex items-center"
+            >
+               
+              <span
+                aria-hidden="true"
+                class="-ml-4 w-4 shrink-0 text-center"
+              >
+                ·
+              </span>
               7/5/2026, 12:00:00 PM
             </span>
             <span
-              class="font-mono tabular-nums"
+              class="inline-flex items-center tabular-nums"
             >
-              · 
+               
+              <span
+                aria-hidden="true"
+                class="-ml-4 w-4 shrink-0 text-center"
+              >
+                ·
+              </span>
               running 40s
             </span>
           </p>
