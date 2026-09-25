@@ -3,7 +3,7 @@
 // delete rule must be visible (not just enforced by a server 409), and the
 // affected-workers warning must be stated BEFORE a destructive click (D5).
 
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi, beforeEach } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { AnthropicTokens } from "./AnthropicTokens";
@@ -233,6 +233,54 @@ describe("AnthropicTokens", () => {
     expect(vi.mocked(window.confirm).mock.calls[0][0]).toMatch(/alpha/);
     expect(vi.mocked(window.confirm).mock.calls[0][0]).not.toMatch(/nothing is bound/i);
     await waitFor(() => expect(mockApi.deleteAnthropicTokenById).toHaveBeenCalledWith("sec-2"));
+  });
+
+  // A row that unmounts while the worker read is in flight (the user left the page)
+  // must not confirm, delete or report once the read settles, either way.
+  it("does nothing after the read settles if the row unmounted meanwhile", async () => {
+    const onError = vi.fn();
+    let settle: { resolve: (v: { workers: Worker[] }) => void; reject: (e: unknown) => void } = {
+      resolve: () => {},
+      reject: () => {},
+    };
+    for (const outcome of ["resolve", "reject"] as const) {
+      mockApi.listWorkers.mockReturnValue(
+        new Promise((resolve, reject) => {
+          settle = { resolve, reject };
+        }),
+      );
+      const { unmount } = render(
+        <MemoryRouter>
+          <AnthropicTokens
+            secrets={[secret(), secret({ id: "sec-2", label: "console-key", is_default: false })]}
+            loading={false}
+            busy={false}
+            reload={noop}
+            onError={onError}
+            onNotice={() => {}}
+            judgeSecretId={null}
+            sidebarTokenIds={[]}
+            onToggleSidebarToken={async () => {}}
+          />
+        </MemoryRouter>,
+      );
+      fireEvent.click(within(screen.getByTestId("token-sec-2")).getByRole("button", { name: "Delete" }));
+      await waitFor(() => expect(mockApi.listWorkers).toHaveBeenCalled());
+      onError.mockClear();
+      unmount();
+      if (outcome === "resolve") {
+        settle.resolve({ workers: [worker({ id: "w1", name: "alpha", anthropic_secret_id: "sec-2" })] });
+      } else {
+        settle.reject(new Error("boom"));
+      }
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(window.confirm).not.toHaveBeenCalled();
+      expect(mockApi.deleteAnthropicTokenById).not.toHaveBeenCalled();
+      expect(onError).not.toHaveBeenCalled();
+      mockApi.listWorkers.mockClear();
+    }
   });
 
   // Without the names the D5 warning cannot be honest, so a failed read refuses the

@@ -6,7 +6,7 @@
 // after saving — rotation is a re-paste, which is why "Replace value" is a form
 // and not an edit-in-place field.
 
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import { api, type AutoStatus, type SecretMeta } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
 import { isVaultLocked } from "../lib/api";
@@ -130,6 +130,15 @@ function TokenRow({
   const [renaming, setRenaming] = useState(false);
   const [label, setLabel] = useState(secret.label);
   const [rowBusy, setRowBusy] = useState(false);
+  // The Delete click awaits a worker read before confirming; a row that unmounted
+  // meanwhile (the user left the page) must not confirm, delete or report.
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
   const disabled = busy || rowBusy;
   const blockedByD6 = secret.is_default && !soleToken;
   const d6HintId = `d6-${secret.id}`;
@@ -259,6 +268,7 @@ function TokenRow({
                       .filter((w) => w.anthropic_secret_id === secret.id)
                       .map((w) => w.name);
                   } catch (err) {
+                    if (!mounted.current) return;
                     // Without the names the D5 warning cannot be honest, so refuse
                     // rather than delete on a guess.
                     onError(
@@ -266,8 +276,9 @@ function TokenRow({
                     );
                     return;
                   } finally {
-                    setRowBusy(false);
+                    if (mounted.current) setRowBusy(false);
                   }
+                  if (!mounted.current) return;
                 }
                 if (
                   !window.confirm(
