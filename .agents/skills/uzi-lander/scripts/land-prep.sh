@@ -61,9 +61,9 @@
 #      but CHANGELOG.md (the migrations directory counts as one path) and `git rebase <new>`
 #      applies, a CHANGELOG.md-only stop union-resolved as for exit 5: the branch is
 #      rebased, the recorded base updated, and the push proceeds WITHOUT re-running the
-#      local gate. The local gate is a pre-push courtesy: merge.sh refuses unless the PR's
-#      required checks are reported (an empty list refuses) with none failing, pending or
-#      cancelled, and merges with --match-head-commit, so CI stays the authoritative gate.
+#      local gate. The local gate is a pre-push courtesy: merge.sh refuses unless gh reads
+#      the PR's required checks cleanly, at least one passed, and none is failing, pending
+#      or cancelled, and merges with --match-head-commit, so CI stays the authoritative gate.
 #      The CHANGELOG guard (exit 9) re-runs. Any other shared path or conflict (the rebase
 #      aborted, worktree restored; a failed restore is exit 3) is still exit 8. The
 #      branch-head check has no such tolerance.

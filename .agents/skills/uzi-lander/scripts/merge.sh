@@ -28,7 +28,8 @@
 # Exit codes:
 #   0  merged — prints MERGE_SHA=<sha>; next: watch-run-ci.sh --sha <sha>
 #   1  a required check is failing on the head — not merged
-#   2  usage, or required checks still pending, unreadable, or none reported — not merged
+#   2  usage, or required checks still pending, unreadable, none reported, none passed,
+#      or gh failed without a failing/pending check explaining it — not merged
 #   3  gh error, or the merge command was refused (classifier block, ruleset, conflict):
 #      the exact command is printed for the user to run via a `!` line
 #   4  an mr_rework run is active on this MR — defer
@@ -144,6 +145,13 @@ c=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="cancel")]|length')
 [ "$f" -gt 0 ] && { echo "required check failing on ${head:0:8}; not merging"; exit 1; }
 [ "$p" -gt 0 ] && { echo "required checks still pending on ${head:0:8}; not merging"; exit 2; }
 [ "$c" -gt 0 ] && { echo "a required check on ${head:0:8} was cancelled (superseded?); not merging"; exit 2; }
+# A non-zero gh exit that no failing or pending check explains is a partial read (an API
+# failure mid-listing), not a verdict. And at least one required check must have PASSED:
+# `skipping` alone means no required gate ran; path-filtered checks that skip next to a
+# passing one are fine.
+[ "$cj_rc" -ne 0 ] && { echo "gh pr checks exited $cj_rc with no failing or pending check on ${head:0:8} (partial read?); not merging"; exit 2; }
+ok=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="pass")]|length')
+[ "$ok" -gt 0 ] || { echo "no required check passed on ${head:0:8} (only: $(printf '%s' "$cj" | jq -r '[.[].bucket]|unique|join(",")')); not merging"; exit 2; }
 [ "$mg" = "CONFLICTING" ] && { echo "PR has merge conflicts (--admin does not bypass a git conflict); resolve with land-prep.sh"; exit 3; }
 
 # ---- merge lock (repo-wide, 10-min TTL) ----------------------------------------------------

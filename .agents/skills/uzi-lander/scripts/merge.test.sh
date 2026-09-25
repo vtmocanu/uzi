@@ -174,7 +174,8 @@ grep -q 'not MERGED' "$WORK/open.out" || fail "--confirm-only OPEN did not repor
 # 5. The guarded merge's required-checks gate is fail-closed. An EMPTY list (a head with no
 #    check runs: CI skipped, a missed dispatch) and an unreadable reply both refuse with
 #    exit 2 and no merge call; a failing check is read from the array gh prints alongside
-#    its non-zero exit; a passing list reaches the merge (the positive control).
+#    its non-zero exit; a pass with an unexplained non-zero exit (partial read) and a
+#    skipping-only list refuse; pass+skipping and pass reach the merge.
 MERGE_STATE=OPEN; export MERGE_STATE
 merge_run() { # label -> rc, output in $WORK/m.<label>
   rm -f "$WORK/merge.log"
@@ -197,9 +198,25 @@ CHECKS_JSON='[{"bucket":"pass"},{"bucket":"fail"}]' CHECKS_RC=1
 merge_run failing
 [ "$rc" -eq 1 ] || fail "a failing required check returned rc=$rc, want 1: $(cat "$WORK/m.failing")"
 [ ! -e "$WORK/merge.log" ] || fail "merged with a failing required check"
+# A pass with a NON-zero gh exit is a partial read (API failure), not a verdict.
+CHECKS_JSON='[{"bucket":"pass"}]' CHECKS_RC=1
+merge_run partial
+[ "$rc" -eq 2 ] || fail "a pass list with gh exit 1 returned rc=$rc, want 2: $(cat "$WORK/m.partial")"
+grep -q 'gh pr checks exited 1 with no failing or pending check' "$WORK/m.partial" || fail "partial read not named: $(cat "$WORK/m.partial")"
+[ ! -e "$WORK/merge.log" ] || fail "merged on a partial required-checks read"
+# Only skipping checks: no required gate ran.
+CHECKS_JSON='[{"bucket":"skipping"},{"bucket":"skipping"}]' CHECKS_RC=0
+merge_run skipping
+[ "$rc" -eq 2 ] || fail "skipping-only returned rc=$rc, want 2: $(cat "$WORK/m.skipping")"
+grep -q 'no required check passed' "$WORK/m.skipping" || fail "skipping-only not named: $(cat "$WORK/m.skipping")"
+[ ! -e "$WORK/merge.log" ] || fail "merged with only skipping required checks"
+# Path-filtered checks skip next to a passing one: that still merges.
+CHECKS_JSON='[{"bucket":"pass"},{"bucket":"skipping"}]' CHECKS_RC=0
+merge_run passskip
+grep -q -- '--match-head-commit' "$WORK/merge.log" 2>/dev/null || fail "pass+skipping did not reach the merge: $(cat "$WORK/m.passskip")"
 CHECKS_JSON='[{"bucket":"pass"}]' CHECKS_RC=0
 merge_run green
 grep -q -- '--match-head-commit' "$WORK/merge.log" 2>/dev/null || fail "a green required-checks list did not reach the merge: $(cat "$WORK/m.green")"
 unset CHECKS_JSON CHECKS_RC
 
-echo "PASS merge: --confirm-only reconciles an out-of-band merge; empty/unreadable required checks refuse"
+echo "PASS merge: --confirm-only reconciles an out-of-band merge; empty/unreadable/partial/skipping-only required checks refuse"

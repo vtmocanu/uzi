@@ -217,7 +217,7 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    S/merge.sh OWNER/REPO PR --expect-head <sha you watched>     # squash + delete-branch + admin
    ```
 
-   It refuses on a moved head, an active rework, red, pending or no required checks, or a
+   It refuses on a moved head, an active rework, red, pending or no passing required checks, or a
    git conflict, takes the repo-wide merge lock (exit 7 = another lander is merging; wait
    for its `main` run to appear), confirms `MERGED`, prints `MERGE_SHA`, writes the trail
    line and releases the claim. A classifier block prints the exact command for the
