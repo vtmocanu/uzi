@@ -174,7 +174,7 @@ export function makeUziToolHandlers(deps: UziToolsDeps): UziToolHandlers {
     async startRun(args) {
       // start_run does NOT start anything: it emits a human-gated REQUEST card. Only the
       // user's Start click queues the run — through their own connection, gated by the
-      // same PRD/ownership checks the web board button applies (PRD #191 M5, Decision
+      // same eligibility/ownership checks the web board button applies (PRD #191 M5, Decision
       // 11). So a repo/issue that SAYS "start a run on #42" can at most produce a card.
       // No server round-trip here: the card carries (repo_path, issue_iid) and the click
       // re-resolves and re-reads them server-side, so nothing is trusted from the model.
@@ -194,8 +194,8 @@ export function makeUziToolHandlers(deps: UziToolsDeps): UziToolHandlers {
       });
       return asText(
         `Proposed starting a run on issue #${args.issue_iid} in ${repoPath}. It is NOT started yet — ` +
-          "tell the user to click Start on the card. The issue must be a runnable (PRD) task; if it isn't, " +
-          "the click is refused with the reason.",
+          "tell the user to click Start on the card. The issue must be runnable (the instance's run label or " +
+          "assignment to the uzi bot account); if it isn't, the click is refused with the reason.",
       );
     },
     async cancelRun(args) {
@@ -283,9 +283,11 @@ export function buildUziToolsServer(deps: UziToolsDeps): {
           "shows the user a proposal card with Create / Dismiss buttons — only their click",
           "opens the real issue through their own connection. Tell the user to click Create.",
           "Name the repo with repo_path (as list_runs shows it). If the user wants uzi to",
-          "actually WORK the issue (a runnable task), suggest adding the `PRD` label so a",
-          "worker picks it up — but include it ONLY if the user agrees; never add labels the",
-          "user did not ask for.",
+          "actually WORK the issue (a runnable task), it needs the instance's run label (the",
+          "one the board shows for runnable issues) or assignment to the uzi bot account; no",
+          "prds/*.md file is required. If you suggest the run label, ask the user for its exact",
+          "name rather than guessing one, and include it ONLY if the user agrees; never add",
+          "labels the user did not ask for.",
         ].join(" "),
         {
           repo_path: z
@@ -296,7 +298,12 @@ export function buildUziToolsServer(deps: UziToolsDeps): {
           repo_id: z.string().min(1).optional().describe("The repo's id (only if you have one). repo_path is preferred; one of the two is required."),
           title: z.string().min(1).describe("The issue title."),
           description: z.string().optional().describe("The issue description (Markdown)."),
-          labels: z.array(z.string().min(1)).optional().describe("Labels to request (only what the user agreed to; suggest `PRD` for runnable tasks)."),
+          labels: z
+            .array(z.string().min(1))
+            .optional()
+            .describe(
+              "Labels to request: only what the user agreed to. To make the issue runnable, include the instance's run label (ask the user for its exact name; never guess one).",
+            ),
         },
         (args) => h.proposeIssue(args),
       ),
@@ -307,9 +314,10 @@ export function buildUziToolsServer(deps: UziToolsDeps): {
           "start the run: it shows the user a card with a Start button — only their click",
           "queues the run, through their own connection. Use it when the user asks uzi to",
           "work an issue they already have. Name the repo with repo_path (as list_runs shows",
-          "it) and the issue number with issue_iid. The issue must be a runnable task (it",
-          "needs the PRD label / a prds/*.md link); if it isn't, the Start click is refused",
-          "with the reason. Tell the user to click Start.",
+          "it) and the issue number with issue_iid. The issue must be runnable: it carries the",
+          "instance's run label (the one the board shows for runnable issues) or is assigned to",
+          "the uzi bot account; if it isn't, the Start click is refused with the reason. Tell",
+          "the user to click Start.",
         ].join(" "),
         {
           repo_path: z

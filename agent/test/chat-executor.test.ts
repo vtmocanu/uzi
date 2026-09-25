@@ -291,6 +291,19 @@ describe("buildChatSystemPrompt", () => {
     assert.match(sp.append, /UNTRUSTED/);
     assert.match(sp.append, /never invent/i);
   });
+
+  // Issue #1629: runnability is the instance's configured run label (admin-renamable)
+  // OR assignment to the uzi bot account, not a hardcoded `PRD` label / prds/*.md link.
+  it("describes runnability as the instance's run label or bot assignment, never a hardcoded PRD label", () => {
+    const { append } = buildChatSystemPrompt();
+    assert.doesNotMatch(append, /labelled\s+PRD/);
+    assert.doesNotMatch(append, /`PRD`\s+label/);
+    assert.doesNotMatch(append, /prds\/\*\.md link/);
+    assert.match(append, /run\s+label/);
+    assert.match(append, /bot\s+account/);
+    assert.match(append, /ask the user\s+for its exact name/i, "the agent asks for the label name instead of guessing one");
+    assert.match(append, /never add\s+labels the user did not ask for/);
+  });
 });
 
 describe("ChatExecutor session env + assembly", () => {
