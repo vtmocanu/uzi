@@ -68,6 +68,14 @@ func (c *HTTPClient) SetTokenAutoEligible(ctx context.Context, id string, eligib
 	return env.Secret, nil
 }
 
+func (c *HTTPClient) SelfUsage(ctx context.Context) (apitypes.SelfUsageDTO, error) {
+	var out apitypes.SelfUsageDTO
+	if err := c.get(ctx, "/api/usage", &out); err != nil {
+		return apitypes.SelfUsageDTO{}, err
+	}
+	return out, nil
+}
+
 func (c *HTTPClient) SelfRateLimits(ctx context.Context) ([]apitypes.TokenRateLimitDTO, error) {
 	var env struct {
 		Tokens []apitypes.TokenRateLimitDTO `json:"tokens"`

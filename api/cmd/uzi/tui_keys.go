@@ -133,6 +133,7 @@ func helpLines(v tuiView) []string {
 		return append([]string{
 			"a          toggle the factory-wide admin board (needs a uza_ token)",
 			"h          hide finished runs (completed/failed/cancelled); keeps active + needs-you",
+			"+ after 7d cost means subscription/unreported costs excluded",
 			"tab        switch screen (floor · pulls · ci)",
 		}, common...)
 	}

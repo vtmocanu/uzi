@@ -1487,47 +1487,6 @@ func TestTUIBoardCostCell(t *testing.T) {
 	}
 }
 
-// The own-board summary carries a floor total (PRD #650): the rounded RAW CostUSD sum over
-// usage-bearing runs, dropped when 0 or when no run carries Usage.
-func TestTUIBoardCostSummaryTotal(t *testing.T) {
-	runs := []apitypes.RunListItemDTO{
-		{RunDTO: apitypes.RunDTO{ID: "aaaaaaaa-1", Kind: "issue", Status: "running", IssueTitle: "one",
-			Usage: &apitypes.UsageDTO{CostUSD: 1.6, InputTokens: 100}}},
-		{RunDTO: apitypes.RunDTO{ID: "bbbbbbbb-2", Kind: "issue", Status: "running", IssueTitle: "two",
-			Usage: &apitypes.UsageDTO{CostUSD: 1.6, InputTokens: 100}}},
-	}
-	m := tuiTestModel(t, &uzicli.FakeClient{Runs: runs}, "")
-	m.width = 120
-	next, _ := m.Update(boardRunsMsg{reqID: m.board.waitID, runs: runs})
-	m = next.(tuiModel)
-	// round(1.6 + 1.6) = round(3.2) = 3 → "$3"; summing the rounded per-row cells would give
-	// 2 + 2 = 4. The presence of "$3" proves the total is computed from the raw sum.
-	content := m.View().Content
-	if out := stripANSI(content); !strings.Contains(out, "$3") {
-		t.Errorf("summary floor total should show the rounded raw sum $3\n%s", out)
-	}
-	// The floor total wears the tungsten accent (tui-ux P1), not the faint chrome around it, so
-	// the money figure is findable in the cluster and matches the detail SPEND total's weight. A
-	// colour a screenshot cannot gate, so pin the SGR here.
-	if wantTung := lipgloss.NewStyle().Foreground(m.pal.tungsten).Render("$3"); !strings.Contains(content, wantTung) {
-		t.Errorf("floor total should carry the tungsten accent SGR, got:\n%q", content)
-	}
-	if faint := m.pal.faint.Render("$3"); strings.Contains(content, faint) {
-		t.Errorf("floor total must not use the faint chrome tone (it should be tungsten)")
-	}
-
-	// A board whose runs all carry nil Usage shows no "$" total segment at all.
-	nilRuns := []apitypes.RunListItemDTO{
-		{RunDTO: apitypes.RunDTO{ID: "cccccccc-3", Kind: "issue", Status: "running", IssueTitle: "no usage"}},
-	}
-	m2 := tuiTestModel(t, &uzicli.FakeClient{Runs: nilRuns}, "")
-	next, _ = m2.Update(boardRunsMsg{reqID: m2.board.waitID, runs: nilRuns})
-	m2 = next.(tuiModel)
-	if out := stripANSI(m2.View().Content); strings.Contains(out, "$") {
-		t.Errorf("a board with no usage-bearing runs must show no cost total\n%s", out)
-	}
-}
-
 // The COST column obeys the #379 drop order (PRD #650 M2) as a PROPERTY, not a pixel pin: the
 // milestone micro-bar drops FIRST on a narrowing terminal, then COST, and the title is never
 // squeezed past the edge. Asserted over a width sweep plus a fit check in the cost-only band and

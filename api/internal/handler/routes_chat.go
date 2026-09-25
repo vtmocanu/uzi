@@ -1,9 +1,8 @@
 package handler
 
-// routes_chat.go carries the cookie-only tail of Routes() — /api/usage and the
-// /api/chats/* group — split out as a same-package mount method (PRD #1008, epic
-// #915 Batch 3). Pure motion. The /runs/* and /ws blocks that precede it in
-// Routes() deliberately stay inline in handler.go this round (PRD #1008 D5).
+// routes_chat.go mounts the CLI-reachable /api/usage read and the cookie-only
+// /api/chats/* group in the same-package route method (PRD #1008, epic #915
+// Batch 3). The /runs/* and /ws blocks remain in handler.go.
 
 import (
 	"github.com/go-chi/chi/v5"
@@ -11,18 +10,23 @@ import (
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 )
 
-// mountChatRoutes registers the cookie-only tail: the caller's own usage (/usage)
-// and the in-app chat agent lifecycle verbs (/chats/*).
+// mountChatRoutes registers the caller's own usage (/usage) and the cookie-only
+// in-app chat agent lifecycle verbs (/chats/*).
 func (h *Handler) mountChatRoutes(r chi.Router, chatLimiter, forgeLimiter *mw.Limiter) {
-	// Cookie-only tail: self usage and chat (mints runs). The WS follow channel
-	// used to sit here and no longer does (PRD #112 M1, the /ws group).
+	// Incremental disclosure: a CLI Bearer now gains the caller's uncapped lifetime
+	// and last-7-days token/cost totals (including judge usage), own failed-run
+	// outcome aggregate, and subscription/unreported counts. RequireUser supplies
+	// the owner-scoped context ID; SelfUsage has no admin branch, outbound/forge
+	// call, or secret material.
+	r.Group(func(r chi.Router) {
+		r.Use(mw.RequireUser(h.q, h.cfg))
+		r.Get("/usage", h.SelfUsage)
+	})
+
+	// Chat mints runs and stays cookie-only. The WS follow channel moved to its
+	// own /ws group (PRD #112 M1).
 	r.Group(func(r chi.Router) {
 		r.Use(mw.RequireAuth(h.q, h.cfg))
-
-		// The caller's own token/cost usage (PRD #40): lifetime + last-7-days
-		// totals + run count. Self-scoped; admins use /api/admin/usage for the
-		// factory view.
-		r.Get("/usage", h.SelfUsage)
 
 		// In-app chat agent (PRD #39): conversations ride runs.kind='chat'. The
 		// live view reuses /api/ws + the /api/runs/{id}/messages replay (a chat run

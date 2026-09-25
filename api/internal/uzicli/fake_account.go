@@ -39,6 +39,13 @@ func (f *FakeClient) SetTokenAutoEligible(_ context.Context, id string, eligible
 	return f.PoolSecret, nil
 }
 
+func (f *FakeClient) SelfUsage(context.Context) (apitypes.SelfUsageDTO, error) {
+	if f.Err != nil {
+		return apitypes.SelfUsageDTO{}, f.Err
+	}
+	return f.SelfUsageV, nil
+}
+
 func (f *FakeClient) SelfRateLimits(context.Context) ([]apitypes.TokenRateLimitDTO, error) {
 	if f.Err != nil {
 		return nil, f.Err

@@ -283,7 +283,7 @@ func (m tuiModel) boardKey(k string) (tea.Model, tea.Cmd) {
 		// becomes the new waitID, so the next periodic tick does not stack a second poll on top
 		// of this one and any periodic reply still in flight is superseded (its stale reqID is
 		// dropped); this reply's own reqID clears the guard.
-		return m, tea.Batch((&m).startBoardReq(), m.fetchRateLimitsCmd(), m.fetchCodexRateLimitsCmd(), m.fetchSettingsCmd(), m.fetchVaultCmd())
+		return m, tea.Batch((&m).startBoardReq(), m.fetchRateLimitsCmd(), m.fetchCodexRateLimitsCmd(), (&m).startSelfUsageReq(), m.fetchSettingsCmd(), m.fetchVaultCmd())
 	case keyAdmin:
 		m.board.admin = !m.board.admin
 		m.board.adminDenied = false
@@ -292,7 +292,7 @@ func (m tuiModel) boardKey(k string) (tea.Model, tea.Cmd) {
 		// Same as keyRefresh (D1): always fetch, minting a fresh id via startBoardReq so the next
 		// tick does not stack and any pre-toggle periodic reply is superseded. The subsequent
 		// boardRunsMsg for the new admin value carries the matching reqID and clears the guard.
-		return m, (&m).startBoardReq()
+		return m, tea.Batch((&m).startBoardReq(), (&m).startSelfUsageReq())
 	case keyHideDone:
 		// No-op on the admin board: AdminListRuns already returns non-terminal runs only, so
 		// hiding "finished" runs would change no rows — flipping the label there reads as a
@@ -661,6 +661,11 @@ func (m tuiModel) boardEyebrow(it boardItem) string {
 // boardFooter is the one-line key legend; key letters are tungsten (keyHint), labels faint.
 func (m tuiModel) boardFooter() string {
 	parts := []string{m.keyHint("enter/→", "open"), m.keyHint("/", "filter")}
+	markedCost := !m.board.admin && m.selfUsageReady && (m.selfUsage.Last7SubscriptionRunCount > 0 || m.selfUsage.Last7UnreportedRunCount > 0)
+	if markedCost {
+		// Keep the cost cue and quit key ahead of hints that may be clipped at narrow widths.
+		parts = append(parts, m.keyHint("q", "quit"), m.pal.faint.Render("+ partial"))
+	}
 	if m.board.admin {
 		parts = append(parts, m.keyHint("a", "my runs"))
 	} else {
@@ -673,7 +678,10 @@ func (m tuiModel) boardFooter() string {
 			parts = append(parts, m.keyHint("h", "fold done"))
 		}
 	}
-	parts = append(parts, m.keyHint("r", "refresh"), m.keyHint("?", "keys"), m.keyHint("q", "quit"))
+	parts = append(parts, m.keyHint("r", "refresh"), m.keyHint("?", "keys"))
+	if !markedCost {
+		parts = append(parts, m.keyHint("q", "quit"))
+	}
 	return " " + strings.Join(parts, m.pal.faint.Render(" · "))
 }
 
@@ -1000,14 +1008,10 @@ func (m tuiModel) boardSummary() string {
 	if warn > 0 {
 		segs = append(segs, paintSeg(m.pal.stall, nil, false, "▲ "+itoa(warn)))
 	}
-	// Floor total (PRD #650): the rounded raw-CostUSD sum over usage-bearing runs, own board only
-	// (the admin board attaches no Usage, so its total would always be 0 — the guard makes the
-	// "admin shows no total" invariant explicit). boardCostTotal drops the segment when 0. It wears
-	// the tungsten accent (not the faint chrome of the ` · ` dividers and `N runs`) so the floor's
-	// headline spend figure is findable in the cluster and matches the detail SPEND total's weight.
-	if !m.board.admin {
-		if total, ok := boardCostTotal(m.board.runs); ok {
-			segs = append(segs, lipgloss.NewStyle().Foreground(m.pal.tungsten).Render(total))
+	// The server's seven-day aggregate includes runs beyond the board's row limit.
+	if !m.board.admin && m.selfUsageReady {
+		if total, ok := boardUsageCost(m.selfUsage); ok {
+			segs = append(segs, lipgloss.NewStyle().Foreground(m.pal.tungsten).Render(m.renderer.Plain(total, 40)))
 		}
 	}
 	segs = append(segs, m.pal.faint.Render(itoa(len(m.board.runs))+" runs"))

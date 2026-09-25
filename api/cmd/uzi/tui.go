@@ -101,6 +101,13 @@ type boardTickMsg struct{ gen uint64 }
 // meters + settings, independently of the 2s boardTickMsg runs cadence.
 type stripTickMsg struct{}
 
+// selfUsageMsg belongs to the most recently issued usage request.
+type selfUsageMsg struct {
+	usage apitypes.SelfUsageDTO
+	err   error
+	reqID uint64
+}
+
 // themeTickMsg fires on the slow themePollInterval to re-query the terminal background so a live
 // theme change reaches the model (issue #1348), independently of the board/strip/skew ticks.
 type themeTickMsg struct{}
@@ -359,6 +366,10 @@ type tuiModel struct {
 	rateLimits      []apitypes.TokenRateLimitDTO
 	sidebarTokenIds []string
 
+	selfUsage      apitypes.SelfUsageDTO
+	selfUsageReady bool
+	selfUsageReqID uint64
+
 	// codexRateLimits and sidebarCodexAccountIds drive the Codex meters shown beside the
 	// Claude ones on the board strip and the detail rail (PRD #1209 M3). Same selection
 	// shape as the Claude side — the default account plus sidebar_codex_account_ids — but
@@ -477,6 +488,7 @@ func newTUIModel(ctx context.Context, c uzicli.Client, startRun string) tuiModel
 	// The repos scope fetch IS in flight at Init (initCmds issues fetchReposCmd), so seed the
 	// guard true — the reply clears it. Without this a pulls tick that fires before the Init
 	// reposMsg lands could stack a second repos fetch on top of the Init one.
+	m.selfUsageReqID = 1 // initial fetch in initCmds
 	m.reposInFlight = true
 	if startRun != "" {
 		m.view = viewDetail
@@ -493,7 +505,7 @@ func newTUIModel(ctx context.Context, c uzicli.Client, startRun string) tuiModel
 // so a light terminal actually gets the light theme instead of the dark default.
 func (m tuiModel) initCmds() []tea.Cmd {
 	cmds := []tea.Cmd{m.fetchRunsCmd(m.board.admin, m.board.waitID), m.fetchSecretsCmd(),
-		m.fetchRateLimitsCmd(), m.fetchCodexRateLimitsCmd(), m.fetchSettingsCmd(), m.fetchVaultCmd(), tickAfter(boardPollInterval, m.board.tickGen), stripTickCmd(),
+		m.fetchRateLimitsCmd(), m.fetchCodexRateLimitsCmd(), m.fetchSelfUsageCmd(m.selfUsageReqID), m.fetchSettingsCmd(), m.fetchVaultCmd(), tickAfter(boardPollInterval, m.board.tickGen), stripTickCmd(),
 		themeTickCmd(),
 		// The forge views' repo scope (PRD #1255 D2) and the `pulls` list's own 10s tick chain.
 		// The tick is armed now but polls the forge only while the pulls screen is in focus
@@ -677,6 +689,21 @@ func (m tuiModel) fetchCodexRateLimitsCmd() tea.Cmd {
 	return func() tea.Msg {
 		accounts, err := c.SelfCodexRateLimits(ctx)
 		return codexRateLimitsMsg{accounts: accounts, err: err}
+	}
+}
+
+// startSelfUsageReq gives each refresh a newer identity, including when a previous
+// request is still in flight. Only the newest reply may change the summary.
+func (m *tuiModel) startSelfUsageReq() tea.Cmd {
+	m.selfUsageReqID++
+	return m.fetchSelfUsageCmd(m.selfUsageReqID)
+}
+
+func (m tuiModel) fetchSelfUsageCmd(reqID uint64) tea.Cmd {
+	c, ctx := m.client, m.ctx
+	return func() tea.Msg {
+		usage, err := c.SelfUsage(ctx)
+		return selfUsageMsg{usage: usage, err: err, reqID: reqID}
 	}
 }
 
@@ -897,7 +924,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.quitting || m.updatePrompt.showing {
 			return m, stripTickCmd()
 		}
-		return m, tea.Batch(m.fetchRateLimitsCmd(), m.fetchCodexRateLimitsCmd(), m.fetchSettingsCmd(), m.fetchVaultCmd(), stripTickCmd())
+		return m, tea.Batch(m.fetchRateLimitsCmd(), m.fetchCodexRateLimitsCmd(), (&m).startSelfUsageReq(), m.fetchSettingsCmd(), m.fetchVaultCmd(), stripTickCmd())
 
 	case themeTickMsg:
 		// Re-query the terminal background so a LIVE theme switch reaches the model (issue #1348).
@@ -1142,6 +1169,15 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case secretsMsg:
 		if msg.err == nil {
 			m.tokenCount = msg.count
+		}
+		return m, nil
+
+	case selfUsageMsg:
+		if msg.reqID == m.selfUsageReqID {
+			m.selfUsageReady = msg.err == nil
+			if msg.err == nil {
+				m.selfUsage = msg.usage
+			}
 		}
 		return m, nil
 

@@ -167,6 +167,8 @@ type Client interface {
 	// half. The status string is computed server-side by autoselect.Classify and is
 	// RENDERED here, never re-derived (D21).
 	SelfRateLimits(ctx context.Context) ([]apitypes.TokenRateLimitDTO, error)
+	// SelfUsage reads the caller's own usage summary from GET /api/usage.
+	SelfUsage(ctx context.Context) (apitypes.SelfUsageDTO, error)
 	// SelfCodexRateLimits returns the caller's OWN per-account Codex rate-limit
 	// meters (PRD #1209 M3): GET /api/me/codex-rate-limits. RequireUser, so a uzc_
 	// CLI token reaches it. Each account carries a NESTED bucket shape (labels,
