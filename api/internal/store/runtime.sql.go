@@ -8649,13 +8649,14 @@ func (q *Queries) LockOwnedRunsByIDs(ctx context.Context, arg LockOwnedRunsByIDs
 }
 
 const lockRunForInputReceipt = `-- name: LockRunForInputReceipt :one
-SELECT id, worker_id, claim_generation, claim_released_at, credential_switch_requested_at,
+SELECT id, status, worker_id, claim_generation, claim_released_at, credential_switch_requested_at,
        credential_switch_generation
 FROM runs WHERE id = $1 FOR UPDATE
 `
 
 type LockRunForInputReceiptRow struct {
 	ID                          uuid.UUID          `json:"id"`
+	Status                      string             `json:"status"`
 	WorkerID                    pgtype.UUID        `json:"worker_id"`
 	ClaimGeneration             int64              `json:"claim_generation"`
 	ClaimReleasedAt             pgtype.Timestamptz `json:"claim_released_at"`
@@ -8668,6 +8669,7 @@ func (q *Queries) LockRunForInputReceipt(ctx context.Context, runID uuid.UUID) (
 	var i LockRunForInputReceiptRow
 	err := row.Scan(
 		&i.ID,
+		&i.Status,
 		&i.WorkerID,
 		&i.ClaimGeneration,
 		&i.ClaimReleasedAt,

@@ -1163,7 +1163,14 @@ func (h *Handler) workerInputReceipt(w http.ResponseWriter, r *http.Request, app
 		case errors.Is(err, workersvc.ErrInputReceiptInvalid):
 			httpx.Error(w, http.StatusBadRequest, "invalid input ids or capability")
 		case errors.Is(err, workersvc.ErrInputReceiptConflict):
-			httpx.Error(w, http.StatusConflict, "input receipt conflicts with claim")
+			// The inactive reason tells the worker whether to keep polling (switch_pending)
+			// or end its old flight (released, stale); empty for a row-state conflict.
+			var conflict *workersvc.InputReceiptConflictError
+			reason := ""
+			if errors.As(err, &conflict) {
+				reason = conflict.Reason
+			}
+			httpx.ErrorReason(w, http.StatusConflict, "input receipt conflicts with claim", reason)
 		default:
 			slog.Error("worker input receipt", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")

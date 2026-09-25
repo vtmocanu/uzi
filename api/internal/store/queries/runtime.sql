@@ -5773,7 +5773,7 @@ ORDER BY id ASC
 LIMIT 1000;
 
 -- name: LockRunForInputReceipt :one
-SELECT id, worker_id, claim_generation, claim_released_at, credential_switch_requested_at,
+SELECT id, status, worker_id, claim_generation, claim_released_at, credential_switch_requested_at,
        credential_switch_generation
 FROM runs WHERE id = @run_id FOR UPDATE;
 

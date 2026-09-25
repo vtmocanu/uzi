@@ -318,4 +318,56 @@ func TestWorkerInputReceiptsLiveDB(t *testing.T) {
 	if got := call("GET", "/inputs", "", legacyWkr, 200)["inputs"].([]any); len(got) != 0 {
 		t.Fatalf("legacy replayed applied inputs: %v", got)
 	}
+
+	// A NEW ACK is fenced on run status: a terminal run keeps worker_id and generation, and a
+	// requeued run keeps worker_id, so an ACK in flight across either must not deliver a late
+	// cancel. The 409 names why the claim is inactive, so the worker knows whether to keep polling.
+	exec(`UPDATE runs SET worker_id=$2,claim_generation=4,status='running',claim_released_at=NULL WHERE id=$1`, run, nextWorker)
+	var late int64
+	if err := pool.QueryRow(ctx, `INSERT INTO run_user_inputs (run_id,kind,body) VALUES ($1,'cancel','late') RETURNING id`, run).Scan(&late); err != nil {
+		t.Fatal(err)
+	}
+	lateBody := fmt.Sprintf(`{"ids":[%d],"claim_generation":4}`, late)
+	pending := func() bool {
+		t.Helper()
+		var consumed bool
+		if err := pool.QueryRow(ctx, `SELECT consumed_at IS NOT NULL FROM run_user_inputs WHERE id=$1`, late).Scan(&consumed); err != nil {
+			t.Fatal(err)
+		}
+		return !consumed
+	}
+	for _, fence := range []struct{ sql, reason string }{
+		{`UPDATE runs SET status='completed' WHERE id=$1`, "stale"},
+		{`UPDATE runs SET status='cancelled' WHERE id=$1`, "stale"},
+		{`UPDATE runs SET status='failed' WHERE id=$1`, "stale"},
+		{`UPDATE runs SET status='queued' WHERE id=$1`, "stale"},
+		{`UPDATE runs SET claim_released_at=now() WHERE id=$1`, "released"},
+		{`UPDATE runs SET credential_switch_requested_at=now(),credential_switch_generation=4 WHERE id=$1`, "switch_pending"},
+	} {
+		exec(fence.sql, run)
+		if out := call("POST", "/inputs/ack", lateBody, newer, 409); out["reason"] != fence.reason {
+			t.Fatalf("ACK after %q: reason %v, want %s", fence.sql, out["reason"], fence.reason)
+		}
+		if !pending() {
+			t.Fatalf("ACK after %q consumed the late input", fence.sql)
+		}
+		exec(`UPDATE runs SET status='running',claim_released_at=NULL,credential_switch_requested_at=NULL,credential_switch_generation=NULL WHERE id=$1`, run)
+	}
+	if out := call("POST", "/inputs/ack", fmt.Sprintf(`{"ids":[%d],"claim_generation":3}`, late), newer, 409); out["reason"] != "stale" {
+		t.Fatalf("superseded generation ACK: %v", out)
+	}
+	// An already-received row answers read-only with the reason; applied rows stay idempotent.
+	if out := call("POST", "/inputs/ack", lateBody, newer, 200); out["active"] != true || out["reason"] != nil {
+		t.Fatalf("active ACK: %v", out)
+	}
+	exec(`UPDATE runs SET claim_released_at=now() WHERE id=$1`, run)
+	if out := call("POST", "/inputs/ack", lateBody, newer, 200); out["active"] != false || out["reason"] != "released" {
+		t.Fatalf("released ACK retry: %v", out)
+	}
+	exec(`UPDATE runs SET claim_released_at=NULL WHERE id=$1`, run)
+	call("POST", "/inputs/applied", lateBody, newer, 200)
+	exec(`UPDATE runs SET status='completed' WHERE id=$1`, run)
+	if out := call("POST", "/inputs/applied", lateBody, newer, 200); out["active"] != false || out["reason"] != "stale" {
+		t.Fatalf("applied retry after completion: %v", out)
+	}
 }
