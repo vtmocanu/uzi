@@ -361,48 +361,40 @@ describe("RunRunner — checkpoint on graceful shutdown (PRD #1030 M4)", () => {
     }
   });
 
-  it("does not hang past the client-side budget when the publish is slow, and states NOT-published", async () => {
+  // issue #1081: event-gated, no wall clock. The shutdown budget timer (the only `setTimer` arm
+  // of BUDGET) fires the moment the hung publish is ENTERED, so the pre-publish git steps can
+  // never eat the budget under load and no elapsed-time sum is asserted. The per-test timeout
+  // is only a hang guard: a shutdown that waits out the hanging publish never returns.
+  it("does not hang past the client-side budget when the publish is slow, and states NOT-published", { timeout: 60_000 }, async () => {
     const { gitlab } = fakeGitlab();
     const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-1030-shut-hang-"));
     const { entered, restore } = spyPublishHang();
+    // Above the 60s hang guard, so a budget armed on a real clock (bypassing `setTimer`) fails.
+    const BUDGET = 10 * 60_000 + 1;
+    const setTimer = (cb: () => void, ms: number): (() => void) => {
+      if (ms === BUDGET) {
+        void entered.then(cb);
+        return () => {};
+      }
+      const t = setTimeout(cb, ms);
+      t.unref?.();
+      return () => clearTimeout(t);
+    };
     try {
       const iid = 1033;
       const { factory, started } = shutdownFactory(homeRoot, iid, "WORK.txt");
-      // A short budget: the hanging publish must be cut off, the run must complete
-      // promptly. Kept comfortably above local git-subprocess latency (the pre-publish
-      // commitWipMarker/fetch-back/overlay steps race the same budget in runner.ts) yet
-      // far below the 5s wall assertion below, so on a healthy host the publish IS
-      // reached and the budget caps the *hanging publish* — not an earlier git step.
       // Test-only override; the production default (15s) is untouched.
       const runner = runnerWith(factory, gitlab, undefined, nullLogger(), {
-        shutdownPublishTimeoutMs: 500,
+        shutdownPublishTimeoutMs: BUDGET,
+        setTimer,
       });
       const claim = gitlabClaim(iid);
-      const started_at = Date.now();
       const p = runner.execute(claim);
       await started;
       runner.shutdown();
-      await p; // must resolve despite the never-settling publish
-      // Best-effort non-vacuity signal: on a healthy host the budget lets the pre-publish
-      // git steps finish so publish IS reached and `entered` resolves. Under CPU contention
-      // those real git subprocesses can eat the whole budget before publish is reached, so
-      // `entered` may never resolve — that is a legitimately skipped step, NOT a hang. Bound
-      // the wait so the test can never deadlock either way; the load-invariant lives in the
-      // observable assertions below (prompt return, requeue, NOT-published line). The timer
-      // is cleared after the race so it holds no handle open (see spyPublishHang's note).
-      let publishReachTimer: ReturnType<typeof setTimeout> | undefined;
-      await Promise.race([
-        entered,
-        new Promise<void>((resolve) => {
-          publishReachTimer = setTimeout(resolve, 1_000);
-        }),
-      ]);
-      clearTimeout(publishReachTimer);
+      await p; // must resolve despite the never-settling publish (the budget capped it)
+      await entered; // deterministic: the budget only elapses once the publish is entered
 
-      assert.ok(
-        Date.now() - started_at < 5_000,
-        "the shutdown must not wait out a hanging publish (budget capped it)",
-      );
       assert.strictEqual(
         terminal(claim.run_id),
         false,
