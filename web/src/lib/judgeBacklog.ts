@@ -49,7 +49,7 @@ export function bucketTabLabel(bucket: JudgeBacklogBucket): string {
 
 // bucketTabCount reads a tab's number STRAIGHT from the canonical triage aggregate —
 // never from the groups on screen (PRD #98: the To-triage tab must agree with the nav
-// badge and the notification to the digit, which only holds if it reads triage.todo
+// badge to the digit, which only holds if it reads triage.todo
 // rather than re-tallying a possibly-truncated, possibly-filtered group list). "all" is
 // the recommendation-row denominator (triage.total), matching #94's strip.
 export function bucketTabCount(triage: TriageCounts, bucket: JudgeBacklogBucket): number {

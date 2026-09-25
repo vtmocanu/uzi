@@ -211,7 +211,7 @@ func (s *Service) CreateFinding(ctx context.Context, wkr store.Worker, runID uui
 	}
 
 	// (8) The caller (the handler) fires the M3 coalesced notification when notify is
-	// true — inbox + one Slack DM per run (D6), coalesced on subsequent findings and
+	// true — the latch row + one Slack DM per run (D6), coalesced on subsequent findings and
 	// suppressed here on a resolved matching coordinate. The notification is best-effort
 	// and lives in the handler so workersvc stays free of a notifysvc import (the cycle
 	// warning in judge_enqueue.go: notifysvc imports workersvc).

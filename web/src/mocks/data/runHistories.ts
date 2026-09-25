@@ -52,11 +52,15 @@ const HIST_WORKERS = ["w-laptop", "w-ci", "w-nas", "w-hosted-eu", "w-mira"] as c
 function histRun(i: number, minsBack: number): Run {
   // Mostly completed, a steady trickle of failed and (deliberately) cancelled rows so
   // the calm "stopped" pill and the danger "failed" pill both appear down the history.
-  const status = i % 9 === 4 ? "failed" : i % 13 === 7 ? "cancelled" : "completed";
+  // A rarer plan-rejected row (status failed, stop_kind plan_rejected: a human stop) is
+  // what the Past runs "Failed" filter (PRD #1650 D7) must exclude, so the demo shows the
+  // filter's count leaving it out.
+  const planRejected = i % 9 !== 4 && i % 13 !== 7 && i % 17 === 11;
+  const status = i % 9 === 4 || planRejected ? "failed" : i % 13 === 7 ? "cancelled" : "completed";
   const cancelled = status === "cancelled";
-  const ranMins = 23 + (i % 6) * 17; // 23–108 minutes of work
+  const ranMins = planRejected ? 6 : 23 + (i % 6) * 17; // 23–108 minutes of work
   const merged = status === "completed" && i % 4 !== 3;
-  const hasMr = status === "completed" || i % 3 === 0;
+  const hasMr = status === "completed" || (!planRejected && i % 3 === 0);
   return {
     id: `run-hist-${i}`,
     repo_id: HIST_REPOS[i % HIST_REPOS.length],
@@ -83,8 +87,13 @@ function histRun(i: number, minsBack: number): Run {
     issue_web_url: null,
     mr_iid: hasMr ? 900 + i : null,
     mr_state: hasMr ? (merged ? "merged" : status === "completed" ? "opened" : "closed") : null,
-    failure_reason: status === "failed" ? "gate red: vitest — 2 failed" : null,
-    stop_kind: cancelled ? "cancelled" : null,
+    // A reject's reason lands in failure_reason, not stop_reason (PRD #503 M2).
+    failure_reason: planRejected
+      ? "Split the migration into its own PR first."
+      : status === "failed"
+        ? "gate red: vitest — 2 failed"
+        : null,
+    stop_kind: cancelled ? "cancelled" : planRejected ? "plan_rejected" : null,
     stop_reason: cancelled ? "wrong branch, restarting" : null,
     health: "ok",
     health_reason: null,

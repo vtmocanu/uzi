@@ -21,17 +21,15 @@ import { healthPipLabel } from "../lib/healthView";
 import { HealthStatusProvider, useHealthStatus } from "../lib/useAdminHealth";
 import { RateLimitAnnouncer } from "./RateLimitMeters";
 import { SidebarUsageLimits } from "./SidebarUsageLimits";
-import { onNotificationsChanged } from "../lib/notifications";
 import { useFavicon } from "../lib/useFavicon";
 import { brandTabTitle } from "../lib/brandTitle";
 import { licenseCreditEnabled } from "../lib/flags";
-import { JudgeTodoContext, JudgeTodoValueContext } from "./JudgeTodoContext";
+import { JudgeTodoContext } from "./JudgeTodoContext";
 import { FindingsOpenContext, FindingsOpenValueContext } from "./FindingsOpenContext";
 import { BuildInfoPopover } from "./BuildInfoPopover";
 import { ChangelogDrawer } from "./ChangelogDrawer";
 import {
   ActivityIcon,
-  BellIcon,
   BoardIcon,
   BookIcon,
   BotIcon,
@@ -418,6 +416,22 @@ export function forgeIcon(forgeType: string | undefined): ReactNode {
   return forgeType === "gitlab" ? <GitLabIcon /> : <GitIcon />;
 }
 
+// A count badge and its accessible noun travel together: `badgeLabel` is required
+// whenever `badge` is passed, so no caller can announce a bare number.
+type NavItemBadge =
+  | {
+      // badge is a count: expanded, a count pill trails the label; collapsed, a dot
+      // overlaps the icon since a rail has no room for a number. 0 renders nothing.
+      badge: number;
+      // badgeLabel is the NOUN the accessible count announces ("in progress" for the
+      // Runs badge, so a screen reader says "Runs, 5 in progress"). Only the item knows
+      // what its number MEANS, so there is no per-tone fallback noun: the former
+      // "unread" fallback belonged to the retired Notifications inbox (PRD #1650) and
+      // was wrong for every other count that inherited it.
+      badgeLabel: string;
+    }
+  | { badge?: undefined; badgeLabel?: undefined };
+
 function NavItem({
   to,
   icon,
@@ -428,9 +442,9 @@ function NavItem({
   collapsed = false,
   badge = 0,
   badgeTone = "count",
-  badgeLabel,
+  badgeLabel = "",
   healthPip,
-}: {
+}: NavItemBadge & {
   to: string;
   icon?: ReactNode;
   label: string;
@@ -440,14 +454,10 @@ function NavItem({
   // When collapsed the item is an icon-only rail button; the label moves to a
   // native title tooltip so the destination is still identifiable on hover.
   collapsed?: boolean;
-  // badge is an unread count (PRD #46 M2): expanded, a count pill trails the label;
-  // collapsed, a dot overlaps the icon since a rail has no room for a number. 0
-  // renders nothing.
-  badge?: number;
   // badgeTone distinguishes "go look" from "there is a queue" (PRD #113 Decision 2).
-  // The default `count` tone is the brand pill every existing badge uses — an unread
-  // count, a Judge backlog: things to get to. `alert` is red, and it means a worker
-  // needs attention now.
+  // The default `count` tone is the brand pill most badges use — runs in progress, a
+  // Judge backlog: things to get to. `alert` is red, and it means something
+  // needs attention now: a worker, or a parked schedule (PRD #1650 D6).
   //
   // A new TONE rather than a new mechanism, deliberately: two badge implementations
   // would drift in position, size and collapsed-rail behaviour, and the rail's dot has
@@ -456,12 +466,12 @@ function NavItem({
   // with the pill in CountPill (ui.tsx).
   badgeTone?: CountPillTone;
   // badgeLabel is the NOUN the accessible count announces — "in progress" for the Runs
-  // badge, so a screen reader says "Runs, 5 in progress" rather than the meaningless
-  // "5 unread" (a run is never unread). Defaults per tone when unset: the `count` tone
-  // falls back to "unread" (correct for Notifications) and `alert` to "needing attention"
-  // (Workers), so every existing badge is byte-for-byte unchanged. The NavItem comment
-  // above already states the label must say what the number MEANS; this makes that
-  // reachable per-item instead of one hardcoded string for the whole tone.
+  // badge, so a screen reader says "Runs, 5 in progress". Every count badge passes its
+  // own noun, because only the item knows what its number MEANS. The fallback exists for
+  // the tones, not for any caller: `alert` falls back to "needing attention" (Workers)
+  // and `count` to a neutral "pending". It no longer falls back to "unread": that noun
+  // belonged to the retired Notifications inbox (PRD #1650) and was wrong for every
+  // other count that inherited it.
   badgeLabel?: string;
   // The Admin entry's health severity pip (PRD #1484 M5, reshaped by PRD #1648 D9): the
   // doc's per-severity tally. No attention (danger + unknown + warn = 0) or null renders
@@ -482,7 +492,7 @@ function NavItem({
       ? { count: pipCount, danger: healthPip.danger > 0, label: healthPipLabel(healthPip) }
       : null;
   // The accessible noun: explicit override, else the per-tone default.
-  const badgeNoun = badgeLabel ?? (alert || badgeTone === "warn" ? "needing attention" : "unread");
+  const badgeNoun = badgeLabel ?? (alert || badgeTone === "warn" ? "needing attention" : "pending");
   return (
     <Link
       to={to}
@@ -551,10 +561,10 @@ function NavItem({
           sr-only rather than an aria-label on the Link, so the destination name and the
           count stay separate strings rather than one run-on label. */}
       {collapsed && hasBadge && (
-        <span className="sr-only">{`${badge} ${badgeNoun}`}</span>
+        <span className="sr-only">{`${badge} ${badgeLabel}`}</span>
       )}
       {!collapsed && hasBadge && (
-        // The label says what the number MEANS. "3 unread" for a worker count would be
+        // The label says what the number MEANS. "3 pending" for a worker count would be
         // wrong in a way a screen-reader user could not recover from — nothing else on
         // the page would explain it. Contrast notes for every tone live in CountPill.
         <CountPill className="ml-auto" count={badge} tone={badgeTone} label={`${badge} ${badgeNoun}`} />
@@ -596,10 +606,10 @@ function SidebarContent({
   onNavigate,
   collapsed = false,
   onToggleCollapse,
-  unread = 0,
   judgeTodo = 0,
   runsInProgress = 0,
   schedulesEnabled = 0,
+  schedulesParked = 0,
   workersAttention = 0,
   findingsOpen = 0,
   onOpenChangelog,
@@ -610,8 +620,8 @@ function SidebarContent({
   collapsed?: boolean;
   onToggleCollapse?: () => void;
   // Judge to-triage count for the Judge nav badge (PRD #98). Owned by AppShell alongside
-  // `unread`, sourced from /me/judge/stats.todo — the ONE canonical number, so the badge
-  // agrees with the Judge page's To-triage tab and the judge notification to the digit.
+  // the other nav counts, sourced from /me/judge/stats.todo — the ONE canonical number, so
+  // the badge agrees with the Judge page's To-triage tab to the digit.
   judgeTodo?: number;
   // In-progress run count for the Runs nav badge (PRD #239). Owned by AppShell alongside
   // `judgeTodo`, sourced from /me/runs/in-progress-count — the caller's non-terminal runs
@@ -622,17 +632,16 @@ function SidebarContent({
   // enabled schedules (paused ones don't nag), brand "count" tone like Runs. 0 renders
   // nothing.
   schedulesEnabled?: number;
+  // Parked-schedule count (PRD #1650 D6): the caller's schedules with status "error".
+  // Non-zero replaces the enabled count on the Schedules badge, in the alert tone.
+  schedulesParked?: number;
   // Count for the Workers nav badge (PRD #113 M6). 0 renders nothing at all — not a
   // badge showing zero, which would be a permanent ornament that means nothing.
   workersAttention?: number;
   // Open-findings count for the Findings nav badge (PRD #333 M7, D8). The caller's open
   // finding coordinates, sourced from the GET /api/findings response `open_count` meta — a
-  // new count source, separate from the shared bell unread. Brand "count" tone, 0 hides it.
+  // count source of its own. Brand "count" tone, 0 hides it.
   findingsOpen?: number;
-  // Notifications unread count for the bell badge (PRD #46 M2). Owned by the
-  // parent AppShell so the single poll feeds both this badge and the status
-  // favicon (PRD #70), and both sidebar instances (desktop + mobile) share it.
-  unread?: number;
   // Opens the app-level changelog drawer (PRD #415 M2). AppShell passes the SAME
   // callback to both SidebarContent mounts so the two footer triggers open one
   // drawer instance mounted at AppShell scope — the drawer must NOT live here.
@@ -768,14 +777,6 @@ function SidebarContent({
       <nav className="flex-1 space-y-1 overflow-y-auto px-2 pb-4 lg:space-y-0.5 lg:pb-2">
         <div className="space-y-0.5 pt-3 lg:pt-2">
           <NavItem to="/dashboard" icon={<HomeIcon />} label="Overview" onNavigate={onNavigate} collapsed={collapsed} />
-          <NavItem
-            to="/notifications"
-            icon={<BellIcon />}
-            label="Notifications"
-            badge={unread}
-            onNavigate={onNavigate}
-            collapsed={collapsed}
-          />
         </div>
 
         <NavGroup label="Work" collapsed={collapsed}>
@@ -801,8 +802,8 @@ function SidebarContent({
             icon={<ActivityIcon />}
             label="Runs"
             badge={runsInProgress}
-            // "in progress", not the count tone's default "unread": a run is never unread,
-            // and the mock spec'd this noun. Brand tone (Decision 2), not the Workers alert red.
+            // "in progress": the noun the mock spec'd for this count. Brand tone
+            // (Decision 2), not the Workers alert red.
             badgeLabel="in progress"
             onNavigate={onNavigate}
             collapsed={collapsed}
@@ -822,13 +823,20 @@ function SidebarContent({
             collapsed={collapsed}
           />
           {/* Schedules (PRD #241): the time-driven run origin. Badge is the caller's
-              enabled-schedule count — brand "count" tone, paused ones excluded. */}
+              enabled-schedule count — brand "count" tone, paused ones excluded — unless
+              any schedule is parked (PRD #1650 D6): then it is the parked count in the
+              alert tone, since a parked schedule has stopped firing until it is fixed. */}
           <NavItem
             to="/schedules"
             icon={<ClockIcon />}
             label="Schedules"
-            badge={schedulesEnabled}
-            badgeLabel="enabled"
+            {...(schedulesParked > 0
+              ? {
+                  badge: schedulesParked,
+                  badgeTone: "alert" as const,
+                  badgeLabel: schedulesParked === 1 ? "parked schedule" : "parked schedules",
+                }
+              : { badge: schedulesEnabled, badgeLabel: "enabled" })}
             onNavigate={onNavigate}
             collapsed={collapsed}
           />
@@ -849,12 +857,23 @@ function SidebarContent({
             // alert, not the default count tone: red reads "go look", while the grey
             // Judge pill beside it reads "there is a queue" (Decision 2).
             badgeTone="alert"
+            badgeLabel="needing attention"
             onNavigate={onNavigate}
             collapsed={collapsed}
           />
           {/* Judge (PRD #98): the cross-run recommendation workbench. Badge is the
               to-triage backlog count — the same number the page's To-triage tab shows. */}
-          <NavItem to="/judge" icon={<ScaleIcon />} label="Judge" badge={judgeTodo} onNavigate={onNavigate} collapsed={collapsed} />
+          <NavItem
+            to="/judge"
+            icon={<ScaleIcon />}
+            label="Judge"
+            badge={judgeTodo}
+            // The Judge page's own tab name for this number, so the badge and the tab
+            // announce the same thing.
+            badgeLabel="to triage"
+            onNavigate={onNavigate}
+            collapsed={collapsed}
+          />
         </NavGroup>
 
         {/* The bottom cluster: system destinations, grouped by a rule rather than a
@@ -1078,11 +1097,8 @@ export function AppShell({ children }: { children: ReactNode }) {
   const { user } = useAuth();
   const location = useLocation();
   const [mobileOpen, setMobileOpen] = useState(false);
-  // Notifications unread badge (PRD #46 M2). Owned here — above the guest early
-  // return — so a single poll feeds both the bell badge (passed to each
-  // SidebarContent) and the status favicon, and it survives across routes.
-  const [unread, setUnread] = useState(0);
-  // Judge to-triage badge (PRD #98). Owned here alongside `unread`, from
+  // Judge to-triage badge (PRD #98). Owned here — above the guest early return, so it
+  // survives across routes and feeds both SidebarContent mounts — from
   // /me/judge/stats.todo — the ONE canonical to-triage number.
   //
   // Reading the same number is necessary but NOT sufficient for the badge to agree with the
@@ -1099,6 +1115,10 @@ export function AppShell({ children }: { children: ReactNode }) {
   // Enabled-schedule badge (PRD #241 M5). Owned here alongside runsInProgress; the
   // caller's enabled schedules, from the owner-scoped listSchedules.
   const [schedulesEnabled, setSchedulesEnabled] = useState(0);
+  // Parked-schedule badge (PRD #1650 D6), derived from the SAME listSchedules response
+  // as schedulesEnabled: no extra request, and it clears on the next nav poll once the
+  // schedule is fixed.
+  const [schedulesParked, setSchedulesParked] = useState(0);
   // Workers needing attention (PRD #113 M6): upgrade_failed + outdated, minus muted,
   // counted server-side so this badge and the Workers page's badges cannot disagree.
   const [workersAttention, setWorkersAttention] = useState(0);
@@ -1124,33 +1144,9 @@ export function AppShell({ children }: { children: ReactNode }) {
   // one module-memoised GET with the two SidebarContent mounts.
   const branding = useBranding();
 
-  // Unread badge: poll on navigation (no WS — PRD #46 M2) and refresh on the
-  // in-app change event (e.g. after marking one read on the inbox page). A failed
-  // fetch is non-fatal: keep the last known count rather than blanking the badge.
-  useEffect(() => {
-    if (!user) {
-      setUnread(0);
-      return;
-    }
-    let alive = true;
-    const load = () =>
-      api
-        .unreadNotificationCount()
-        .then(({ unread }) => {
-          if (alive) setUnread(unread);
-        })
-        .catch(() => {});
-    load();
-    const off = onNotificationsChanged(load);
-    return () => {
-      alive = false;
-      off();
-    };
-  }, [user, location.pathname]);
-
-  // Judge to-triage poll (PRD #98): the same on-navigation cadence as the unread poll
-  // above, reading the canonical /me/judge/stats.todo. A failed fetch keeps the last
-  // known count rather than blanking the badge.
+  // Judge to-triage poll (PRD #98): polled on navigation (no WS), reading the canonical
+  // /me/judge/stats.todo. A failed fetch keeps the last known count rather than
+  // blanking the badge.
   useEffect(() => {
     if (!user) {
       setJudgeTodo(0);
@@ -1189,18 +1185,22 @@ export function AppShell({ children }: { children: ReactNode }) {
   }, [user, location.pathname]);
 
   // Enabled-schedule poll (PRD #241 M5): the same on-navigation cadence as the Runs
-  // poll above, reading the owner-scoped listSchedules and counting enabled rows. A
-  // failed fetch keeps the last known count rather than blanking the badge.
+  // poll above, reading the owner-scoped listSchedules and counting enabled rows, and
+  // (PRD #1650 D6) parked rows, status "error", from the same response. A failed fetch
+  // keeps the last known counts rather than blanking the badge.
   useEffect(() => {
     if (!user) {
       setSchedulesEnabled(0);
+      setSchedulesParked(0);
       return;
     }
     let alive = true;
     api
       .listSchedules()
       .then((rows) => {
-        if (alive) setSchedulesEnabled(rows.filter((s) => s.enabled).length);
+        if (!alive) return;
+        setSchedulesEnabled(rows.filter((s) => s.enabled).length);
+        setSchedulesParked(rows.filter((s) => s.status === "error").length);
       })
       .catch(() => {});
     return () => {
@@ -1268,13 +1268,13 @@ export function AppShell({ children }: { children: ReactNode }) {
 
   // Status favicon (PRD #70 M4): mounted here so it lives on every route incl.
   // guest and survives logout (enabled flips false → reset to the static mark).
-  // Reuses the unread count above — no second unread poll — and owns its own
-  // runs poll (which fires while the tab is hidden). Called before the guest
-  // early return so the hook order stays stable. The base icon white-labels to the
+  // It derives every state from its own runs poll (which fires while the tab is
+  // hidden); no inbox count feeds it any more (PRD #1650 D5). Called before the
+  // guest early return so the hook order stays stable. The base icon white-labels to the
   // branded app logo (issue #688) — appMarkImgSrc reuses the module-memoised
   // branding fetch, and applies signed-out too so a guest on a branded instance
   // still gets the branded base (no status dot).
-  useFavicon({ unread, enabled: !!user, appLogoSrc: appMarkImgSrc(branding) });
+  useFavicon({ enabled: !!user, appLogoSrc: appMarkImgSrc(branding) });
 
   // White-label the browser-tab title (issue #688): index.html carries the static
   // default for pre-hydration/unbranded; this effect swaps it to brand_company for a
@@ -1319,10 +1319,10 @@ export function AppShell({ children }: { children: ReactNode }) {
         <SidebarContent
           collapsed={collapsed}
           onToggleCollapse={() => setCollapsed((c) => !c)}
-          unread={unread}
           judgeTodo={judgeTodo}
           runsInProgress={runsInProgress}
           schedulesEnabled={schedulesEnabled}
+          schedulesParked={schedulesParked}
           workersAttention={workersAttention}
           findingsOpen={findingsOpen}
           onOpenChangelog={() => setChangelogOpen(true)}
@@ -1370,7 +1370,7 @@ export function AppShell({ children }: { children: ReactNode }) {
             >
               <XIcon />
             </button>
-            <SidebarContent onNavigate={() => setMobileOpen(false)} unread={unread} judgeTodo={judgeTodo} runsInProgress={runsInProgress} schedulesEnabled={schedulesEnabled} workersAttention={workersAttention} findingsOpen={findingsOpen} onOpenChangelog={() => setChangelogOpen(true)} />
+            <SidebarContent onNavigate={() => setMobileOpen(false)} judgeTodo={judgeTodo} runsInProgress={runsInProgress} schedulesEnabled={schedulesEnabled} schedulesParked={schedulesParked} workersAttention={workersAttention} findingsOpen={findingsOpen} onOpenChangelog={() => setChangelogOpen(true)} />
           </div>
         </div>
       )}
@@ -1388,20 +1388,16 @@ export function AppShell({ children }: { children: ReactNode }) {
               self-gating, with a 1 h per-episode snooze. Reads the shared HealthStatusProvider,
               so a non-admin never fetches the admin endpoint. */}
           <HealthDangerBanner />
-          {/* Both halves of the one canonical to-triage number (PRD #98). The setter is
-              how the Judge page keeps it fresh after a dispose; the value is how the judge
-              notification in the inbox reads the SAME number the nav badge above is
-              rendering, rather than polling for its own copy. */}
+          {/* The publisher for the one canonical to-triage number (PRD #98): how the Judge
+              page keeps the nav badge fresh after a dispose. */}
           {/* Findings' twin of the judge channel (PRD #1183 M4): the setter lets the Findings
               page keep the nav badge fresh after a dismiss without a navigation; the value lets a
               consumer read the SAME number the badge above renders. Nested inside the judge
-              providers so both channels wrap `children`. */}
+              provider so both channels wrap `children`. */}
           <JudgeTodoContext.Provider value={setJudgeTodo}>
-            <JudgeTodoValueContext.Provider value={judgeTodo}>
-              <FindingsOpenContext.Provider value={setFindingsOpen}>
-                <FindingsOpenValueContext.Provider value={findingsOpen}>{children}</FindingsOpenValueContext.Provider>
-              </FindingsOpenContext.Provider>
-            </JudgeTodoValueContext.Provider>
+            <FindingsOpenContext.Provider value={setFindingsOpen}>
+              <FindingsOpenValueContext.Provider value={findingsOpen}>{children}</FindingsOpenValueContext.Provider>
+            </FindingsOpenContext.Provider>
           </JudgeTodoContext.Provider>
         </div>
       </main>

@@ -928,8 +928,8 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// PRD #319 M3: when the just-approved selection EXPLICITLY excluded a guard role
-	// (spec-keeper today), emit exactly one best-effort owner heads-up — an inbox row plus
-	// an optional Slack DM. A non-guard exclusion (or any non-approve path) leaves the
+	// (spec-keeper today), emit exactly one best-effort owner heads-up — a notifications
+	// event-log row plus an optional Slack DM. A non-guard exclusion (or any non-approve path) leaves the
 	// slice empty and emits nothing. Best-effort: it never fails the approve, which is
 	// already durably recorded by SubmitInput.
 	if len(res.ExcludedGuardRoles) > 0 {
@@ -957,12 +957,12 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusAccepted, resp)
 }
 
-// guardRoleExcludedNotificationKind is the inbox kind emitted when a run owner approves a
-// plan whose agent selection EXPLICITLY excludes a guard role (PRD #319 M3). Like every
-// other kind it is a plain literal — notifications.kind is a generic text column with no
-// CHECK, so a new kind needs no migration. The inbox + Slack renderers key on the
-// { title, body } payload convention; the web renders it generically and routes the
-// run-anchored row to the run page.
+// guardRoleExcludedNotificationKind is the notification kind emitted when a run owner
+// approves a plan whose agent selection EXPLICITLY excludes a guard role (PRD #319 M3).
+// Like every other kind it is a plain literal — notifications.kind is a generic text
+// column with no CHECK, so a new kind needs no migration. The row follows the { title,
+// body } payload convention of the pruned, write-only event log (nothing renders it as
+// an inbox, PRD #1650 D1); the Slack DM is what the owner sees.
 const guardRoleExcludedNotificationKind = "guard_role_excluded"
 
 // notifyGuardRoleExcluded fires the "guard role excluded" heads-up for a just-approved

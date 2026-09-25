@@ -24,6 +24,38 @@ describe("mock default-jobs catalog (PRD #589)", () => {
     expect(enablements.some((e) => e.slug === "docs-hygiene" && e.repo_id === "repo-uzi")).toBe(true);
   });
 
+  // PRD #1645 M4: the seed carries every state the unified Schedules list and the Job
+  // catalog tab render, so VITE_UZI_MOCK=1 shows each without setup. Runs before any test
+  // here mutates the seed (the reset test below clears docs-hygiene's customized flag).
+  it("seeds every Schedules / Job catalog state the unified list renders (PRD #1645)", async () => {
+    const all = await mockApi.listSchedules();
+    const { entries, enablements } = await mockApi.listScheduleCatalog();
+    const defaults = all.filter((s) => s.origin === "default");
+
+    // A default enabled on two repos.
+    const reposBySlug = new Map<string, Set<string>>();
+    for (const s of defaults) {
+      const set = reposBySlug.get(s.catalog_slug!) ?? new Set<string>();
+      set.add(s.repo_id);
+      reposBySlug.set(s.catalog_slug!, set);
+    }
+    expect([...reposBySlug.values()].some((r) => r.size >= 2)).toBe(true);
+    // A customized default and a paused default.
+    expect(defaults.some((s) => s.customized)).toBe(true);
+    expect(defaults.some((s) => !s.enabled)).toBe(true);
+    // A paused user sweep.
+    expect(all.some((s) => s.origin === "user" && s.target === "sweep" && !s.enabled)).toBe(true);
+    // At least two fired one-shots with an issue target, so the fold lists issue refs.
+    const fired = all.filter((s) => s.timing === "once" && s.status === "fired");
+    expect(fired.length).toBeGreaterThanOrEqual(2);
+    expect(fired.every((s) => s.target === "issue" && s.issue_iid != null)).toBe(true);
+    // One parked row.
+    expect(all.some((s) => s.status === "error")).toBe(true);
+    // A catalog entry enabled on no repo.
+    const enabledSlugs = new Set(enablements.map((e) => e.slug));
+    expect(entries.some((e) => !enabledSlugs.has(e.slug))).toBe(true);
+  });
+
   it("enableCatalogSchedule materializes a default row and is idempotent (incl. an already-paused repo)", async () => {
     // A fresh repo materializes a new origin='default' row with the resolved catalog values.
     const created = await mockApi.enableCatalogSchedule("repo-payments", "bug-triage");

@@ -226,11 +226,12 @@ func (h *Handler) RequestGuardrailOverride(w http.ResponseWriter, r *http.Reques
 	httpx.JSON(w, http.StatusOK, map[string]any{"override_request": overrideRequestStateDTO(reqRow)})
 }
 
-// guardrailOverrideDecidedKind is the notifications.kind for the inbox row a member
-// gets when an admin approves or rejects their guardrail-override request (PRD #1432
-// M3). The notifications table's kind + payload jsonb is generic (PRD #60), so a new
-// kind is free text needing no migration; the payload carries the rendered title/body,
-// the repo, and the decision. (issue #1432.)
+// guardrailOverrideDecidedKind is the notifications.kind for the row recorded (and the
+// Slack DM sent to the requesting member, PRD #1650 D3) when an admin approves or
+// rejects their guardrail-override request (PRD #1432 M3). The notifications table's
+// kind + payload jsonb is generic (PRD #60), so a new kind is free text needing no
+// migration; the payload carries the rendered title/body, the repo, and the decision.
+// (issue #1432.)
 const guardrailOverrideDecidedKind = "guardrail_override_decided"
 
 // guardrailOverrideRequestDTO maps a ListPendingGuardrailOverrideRequestsRow to the
@@ -520,13 +521,13 @@ func (h *Handler) dismissStaleOverrideRequest(ctx context.Context, w http.Respon
 	httpx.Error(w, http.StatusConflict, note)
 }
 
-// notifyGuardrailOverrideDecision fires the best-effort inbox notification a member
-// gets when an admin settles their override request (PRD #1432 M3). Nil-safe: no
-// notifier wired ⇒ no-op (precedent notifyReviewReady). The repo path is a best-effort
-// lookup — a lookup miss degrades the body to "your repository" rather than dropping
-// the notification. A delivery error is logged, never returned: the decision is already
-// committed and must not fail on a notify error. Slack:nil ⇒ inbox-only (precedent the
-// run-failure notifier).
+// notifyGuardrailOverrideDecision fires the best-effort notification a member gets when
+// an admin settles their override request (PRD #1432 M3). Nil-safe: no notifier wired ⇒
+// no-op (precedent notifyReviewReady). The repo path is a best-effort lookup — a lookup
+// miss degrades the body to "your repository" rather than dropping the notification. A
+// delivery error is logged, never returned: the decision is already committed and must
+// not fail on a notify error. The Slack DM's deep link base is the operator-set public
+// base URL; a lookup failure simply drops the link (precedent notifyGuardRoleExcluded).
 func (h *Handler) notifyGuardrailOverrideDecision(ctx context.Context, req store.GuardrailOverrideRequest, status string) {
 	if h.notifier == nil {
 		return
@@ -535,20 +536,38 @@ func (h *Handler) notifyGuardrailOverrideDecision(ctx context.Context, req store
 	if rp, err := h.q.GetRepoByID(ctx, req.RepoID); err == nil {
 		repoPath = rp.PathWithNamespace
 	}
+	base := ""
+	if h.settings != nil {
+		if b, err := h.settings.PublicBaseURL(ctx); err == nil {
+			base = b
+		}
+	}
+	if _, err := h.notifier.Notify(ctx, buildGuardrailOverrideDecidedNotification(base, req, repoPath, status)); err != nil {
+		slog.Error("notify guardrail override decision", "error", err)
+	}
+}
+
+// buildGuardrailOverrideDecidedNotification assembles the guardrail_override_decided
+// notification (PRD #1432 M3; Slack DM PRD #1650 D3). It is PURE (no I/O) so its shape
+// is unit-testable. status is the closed decision enum ("approved" / anything else reads
+// as rejected), so it alone picks the emoji.
+func buildGuardrailOverrideDecidedNotification(baseURL string, req store.GuardrailOverrideRequest, repoPath, status string) notifysvc.Notification {
 	repoLabel := repoPath
 	if repoLabel == "" {
 		repoLabel = "your repository"
 	}
-	var title, bodyText string
+	var title, bodyText, emoji string
 	switch status {
 	case "approved":
+		emoji = "✅"
 		title = "Guardrail override approved"
-		bodyText = "An instance admin approved your request to allow " + repoLabel + " through the guardrail. Retry Enable on your Repos page — the live guard runs again."
+		bodyText = "An instance admin approved your request to allow " + repoLabel + " through the guardrail. Retry Enable on your Repos page. The live guard runs again."
 	default: // "rejected"
+		emoji = "⛔"
 		title = "Guardrail override rejected"
 		bodyText = "An instance admin rejected your request to allow " + repoLabel + " through the guardrail."
 	}
-	if _, err := h.notifier.Notify(ctx, notifysvc.Notification{
+	return notifysvc.Notification{
 		UserID: req.RequestedBy,
 		Kind:   guardrailOverrideDecidedKind,
 		Payload: map[string]any{
@@ -558,8 +577,23 @@ func (h *Handler) notifyGuardrailOverrideDecision(ctx context.Context, req store
 			"repo_id":   req.RepoID.String(),
 			"decision":  status,
 		},
-		Slack: nil,
-	}); err != nil {
-		slog.Error("notify guardrail override decision", "error", err)
+		// The DM links to the Repos page, where the member acts on the decision. The
+		// repo path in bodyText goes RAW: the notifier's SlackMrkdwn owns its escaping.
+		Slack: &notifysvc.SlackRender{
+			Emoji: emoji,
+			Title: title,
+			Body:  bodyText,
+			Link:  reposDeepLink(baseURL),
+		},
 	}
+}
+
+// reposDeepLink builds the Repos page deep link from the operator-set public base URL;
+// an empty base yields "" so the notification simply carries no link (as runDeepLink).
+func reposDeepLink(baseURL string) string {
+	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if baseURL == "" {
+		return ""
+	}
+	return baseURL + "/repos"
 }

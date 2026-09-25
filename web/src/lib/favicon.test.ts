@@ -19,20 +19,20 @@ function run(
 const NONE = new Set<string>(); // empty baseline
 
 describe("deriveFaviconState — the four states in isolation", () => {
-  it("idle for no runs and no unread", () => {
-    expect(deriveFaviconState([], 0, NONE)).toBe("idle");
+  it("idle for no runs", () => {
+    expect(deriveFaviconState([], NONE)).toBe("idle");
   });
   it("failed for a fresh genuine failure", () => {
-    expect(deriveFaviconState([run("failed")], 0, NONE)).toBe("failed");
+    expect(deriveFaviconState([run("failed")], NONE)).toBe("failed");
   });
   it("attention for a run awaiting approval", () => {
-    expect(deriveFaviconState([run("awaiting_approval")], 0, NONE)).toBe("attention");
+    expect(deriveFaviconState([run("awaiting_approval")], NONE)).toBe("attention");
   });
   // PRD #88. The tab dot cannot say WHICH action is owed and does not need to — it says
   // "you are the blocker", and a run parked on a question is exactly that. Leaving it
   // out would make the one status designed to be noticed the only one the tab ignores.
   it("attention for a run awaiting the user's ANSWER too", () => {
-    expect(deriveFaviconState([run("awaiting_input")], 0, NONE)).toBe("attention");
+    expect(deriveFaviconState([run("awaiting_input")], NONE)).toBe("attention");
   });
   // issue #750. A run re-planning after a revise keeps status === "awaiting_approval"
   // server-side, but its is_revising flag flips the EFFECTIVE status to "revising", so it
@@ -40,42 +40,33 @@ describe("deriveFaviconState — the four states in isolation", () => {
   // of the derived flag is to keep it out of the human-attention grouping while the
   // planner reworks. With nothing else live it falls through to idle.
   it("NOT attention for a run re-planning after a revise (idle instead)", () => {
-    expect(deriveFaviconState([run("awaiting_approval", { is_revising: true })], 0, NONE)).toBe("idle");
+    expect(deriveFaviconState([run("awaiting_approval", { is_revising: true })], NONE)).toBe("idle");
   });
   it("attention returns once the next plan lands (is_revising false)", () => {
-    expect(deriveFaviconState([run("awaiting_approval", { is_revising: false })], 0, NONE)).toBe("attention");
+    expect(deriveFaviconState([run("awaiting_approval", { is_revising: false })], NONE)).toBe("attention");
     // Absent (rollout skew) reads as not-revising, so an ordinary awaiting_approval still lights.
-    expect(deriveFaviconState([run("awaiting_approval")], 0, NONE)).toBe("attention");
+    expect(deriveFaviconState([run("awaiting_approval")], NONE)).toBe("attention");
   });
   it("running for a run in flight", () => {
-    expect(deriveFaviconState([run("running")], 0, NONE)).toBe("running");
+    expect(deriveFaviconState([run("running")], NONE)).toBe("running");
   });
 });
 
 describe("deriveFaviconState — priority ladder (first match wins)", () => {
   it("a fresh failure beats a concurrent awaiting_approval → failed", () => {
-    expect(deriveFaviconState([run("awaiting_approval"), run("failed")], 0, NONE)).toBe("failed");
+    expect(deriveFaviconState([run("awaiting_approval"), run("failed")], NONE)).toBe("failed");
   });
   it("attention beats a concurrent running → attention", () => {
-    expect(deriveFaviconState([run("running"), run("awaiting_approval")], 0, NONE)).toBe("attention");
-  });
-  it("unread > 0 alone → attention", () => {
-    expect(deriveFaviconState([], 3, NONE)).toBe("attention");
-  });
-  it("unread > 0 outranks a concurrent running → attention", () => {
-    expect(deriveFaviconState([run("running")], 1, NONE)).toBe("attention");
-  });
-  it("a fresh failure outranks unread > 0 → failed", () => {
-    expect(deriveFaviconState([run("failed")], 5, NONE)).toBe("failed");
+    expect(deriveFaviconState([run("running"), run("awaiting_approval")], NONE)).toBe("attention");
   });
 });
 
 describe("deriveFaviconState — a deliberate stop is not a failure", () => {
   it("a failed run carrying a stop_kind does not redden", () => {
-    expect(deriveFaviconState([run("failed", { stop_kind: "plan_rejected" })], 0, NONE)).toBe("idle");
+    expect(deriveFaviconState([run("failed", { stop_kind: "plan_rejected" })], NONE)).toBe("idle");
   });
   it("a cancelled run does not redden", () => {
-    expect(deriveFaviconState([run("cancelled")], 0, NONE)).toBe("idle");
+    expect(deriveFaviconState([run("cancelled")], NONE)).toBe("idle");
   });
   // ...but an AUTO-stop is not a deliberate stop (PRD #108 M5). It is uzi killing a
   // broken run, so it must redden the tab exactly like any other fresh failure. The
@@ -83,40 +74,40 @@ describe("deriveFaviconState — a deliberate stop is not a failure", () => {
   // narrowing needed a test on THIS side too: nothing in favicon.ts mentions
   // stop_kind's members, so a change there silently retunes the attention set.
   it("an auto-stopped run DOES redden — the tab must show breakage", () => {
-    expect(deriveFaviconState([run("failed", { stop_kind: "auto_stopped" })], 0, NONE)).toBe("failed");
+    expect(deriveFaviconState([run("failed", { stop_kind: "auto_stopped" })], NONE)).toBe("failed");
   });
 });
 
 describe("deriveFaviconState — fresh vs. baseline", () => {
   it("a failed run whose id is in the baseline does not redden", () => {
     const baseline = new Set(["run-failed"]);
-    expect(deriveFaviconState([run("failed")], 0, baseline)).toBe("idle");
+    expect(deriveFaviconState([run("failed")], baseline)).toBe("idle");
   });
   it("the same run id NOT in the baseline reddens", () => {
-    expect(deriveFaviconState([run("failed")], 0, NONE)).toBe("failed");
+    expect(deriveFaviconState([run("failed")], NONE)).toBe("failed");
   });
   it("a baselined failure still yields attention if another run awaits approval", () => {
     const baseline = new Set(["run-failed"]);
-    expect(deriveFaviconState([run("failed"), run("awaiting_approval")], 0, baseline)).toBe("attention");
+    expect(deriveFaviconState([run("failed"), run("awaiting_approval")], baseline)).toBe("attention");
   });
   it("a baselined failure alongside a running run falls through to running", () => {
     const baseline = new Set(["run-failed"]);
-    expect(deriveFaviconState([run("failed"), run("running")], 0, baseline)).toBe("running");
+    expect(deriveFaviconState([run("failed"), run("running")], baseline)).toBe("running");
   });
 });
 
 describe("deriveFaviconState — every running status", () => {
   it("queued alone → running", () => {
-    expect(deriveFaviconState([run("queued")], 0, NONE)).toBe("running");
+    expect(deriveFaviconState([run("queued")], NONE)).toBe("running");
   });
   it("claimed alone → running", () => {
-    expect(deriveFaviconState([run("claimed")], 0, NONE)).toBe("running");
+    expect(deriveFaviconState([run("claimed")], NONE)).toBe("running");
   });
   it("running alone → running", () => {
-    expect(deriveFaviconState([run("running")], 0, NONE)).toBe("running");
+    expect(deriveFaviconState([run("running")], NONE)).toBe("running");
   });
   it("a completed run alone → idle", () => {
-    expect(deriveFaviconState([run("completed")], 0, NONE)).toBe("idle");
+    expect(deriveFaviconState([run("completed")], NONE)).toBe("idle");
   });
 });
 

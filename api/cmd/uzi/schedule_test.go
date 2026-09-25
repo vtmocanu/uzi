@@ -576,6 +576,57 @@ func TestScheduleListTable(t *testing.T) {
 	}
 }
 
+// TestScheduleListSourceColumn (PRD #1645 D10): SOURCE sits right after TARGET and
+// reads the catalog slug for a default-origin row, "custom" for a user-origin row, and
+// "-" for a default that carries no slug.
+func TestScheduleListSourceColumn(t *testing.T) {
+	fc := &uzicli.FakeClient{Schedules: []apitypes.ScheduleDTO{
+		{ID: "sch_def", Origin: "default", CatalogSlug: ptr("nightly-bug-sweep"), Target: "sweep", Labels: []string{"bug"}, RepoPath: "vtmocanu/uzi", Timing: "recurring", CronExpr: "0 2 * * *", Enabled: true},
+		{ID: "sch_usr", Origin: "user", Target: "prompt", RepoPath: "vtmocanu/uzi", Timing: "recurring", CronExpr: "0 9 * * 1", Enabled: true},
+		{ID: "sch_noslug", Origin: "default", Target: "prompt", RepoPath: "vtmocanu/uzi", Timing: "recurring", CronExpr: "0 9 * * 1", Enabled: true},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "schedule", "list")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
+	if len(lines) != 4 {
+		t.Fatalf("want header + 3 rows, got %d lines\n%s", len(lines), out)
+	}
+	header := strings.Fields(lines[0])
+	wantHeader := []string{"ID", "TARGET", "SOURCE", "REPO", "WHEN", "NEXT", "ON", "HARNESS"}
+	if strings.Join(header, " ") != strings.Join(wantHeader, " ") {
+		t.Fatalf("header = %v, want %v", header, wantHeader)
+	}
+	// Each row's cells start ID, TARGET, SOURCE; none of those cells contains a space.
+	want := map[string][2]string{
+		"sch_def":    {"sweep:bug", "nightly-bug-sweep"},
+		"sch_usr":    {"prompt", "custom"},
+		"sch_noslug": {"prompt", "-"},
+	}
+	for _, line := range lines[1:] {
+		f := strings.Fields(line)
+		if len(f) < 3 {
+			t.Fatalf("short row %q", line)
+		}
+		w, ok := want[f[0]]
+		if !ok {
+			t.Fatalf("unexpected row %q", line)
+		}
+		if f[1] != w[0] || f[2] != w[1] {
+			t.Errorf("row %s: TARGET/SOURCE = %q/%q, want %q/%q", f[0], f[1], f[2], w[0], w[1])
+		}
+		// SOURCE's value is left-aligned under the SOURCE header.
+		if got, hdr := strings.Index(line, f[2]), strings.Index(lines[0], "SOURCE"); got != hdr {
+			t.Errorf("row %s: SOURCE cell at column %d, header at %d", f[0], got, hdr)
+		}
+		delete(want, f[0])
+	}
+	if len(want) != 0 {
+		t.Errorf("rows missing from the table: %v", want)
+	}
+}
+
 // TestScheduleGetNotFound: an unknown id is exit 4.
 func TestScheduleGetNotFound(t *testing.T) {
 	fc := &uzicli.FakeClient{ScheduleByID: map[string]apitypes.ScheduleDTO{}}

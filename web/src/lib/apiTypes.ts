@@ -735,6 +735,13 @@ export interface Card {
   // has no branch, no CI, or the card has never run. Drives the per-card badge and
   // the Fix CI affordance.
   pipeline: PipelineStatus | null;
+  // Automatic CI fixing has stopped on the latest run's branch (PRD #1650 D3a): the
+  // attempt cap or a no-progress halt, so fixing that failure is up to the user. Read from the
+  // autofix ledger, not from `pipeline`, so it shows even with no cached pipeline.
+  // A current server always sends both (false / 0 when not halted); optional so the
+  // many typed Card literals in mocks and tests need not spell them out.
+  ci_autofix_halted?: boolean;
+  ci_autofix_attempts?: number;
 }
 
 export interface Board {
@@ -1615,8 +1622,9 @@ export interface Schedule {
   // Display-only sibling grouping key (PRD #636). Purely a view-grouping tag for custom
   // (origin='user') rows — the analog of catalog_slug for defaults — carrying no
   // behavior: editing one sibling never touches another. null = standalone row (the
-  // common single-repo case); a non-null id shared by ≥2 live rows renders them as one
-  // expandable group. Owner-scoped, so it can only ever group the caller's own rows.
+  // common single-repo case); a non-null id is shared by ≥2 live rows. The Schedules page
+  // lists each sibling as its own row (PRD #1645 D2). Owner-scoped, so it can only ever
+  // group the caller's own rows.
   sibling_group_id: string | null;
   created_at: string;
   updated_at: string;
@@ -3129,37 +3137,6 @@ export interface AdminCodexRateLimits {
   users: CodexAdminRateLimitRow[];
 }
 
-// ── Notifications inbox (PRD #46 M2) ─────────────────────────────────────────
-// A generic in-app notification. kind + payload let any feature enqueue one; the
-// judge is tenant #1. payload is the render blob — by convention a `title` and
-// optional `body` the inbox shows, but readers must tolerate any shape. run_id /
-// review_id are optional deep-link anchors. owner is present ONLY on the admin
-// all-view so the admin sees whose inbox a row belongs to.
-export interface NotificationOwner {
-  id: string;
-  email: string;
-  display_name: string | null;
-}
-
-export interface Notification {
-  id: string;
-  kind: string;
-  payload: Record<string, unknown>;
-  run_id: string | null;
-  review_id: string | null;
-  read_at: string | null;
-  created_at: string;
-  owner?: NotificationOwner;
-}
-
-// NotificationList is the inbox envelope: one page of rows, the caller's own
-// unread count (the bell badge), and the scope total for paging.
-export interface NotificationList {
-  notifications: Notification[];
-  unread: number;
-  total: number;
-}
-
 // ── Run judge review (PRD #46 M4) ────────────────────────────────────────────
 // The judge's retrospective of a finished run: a verdict + structured
 // recommendations. Every free-text field (summary_md, each rationale_md, target)
@@ -3404,7 +3381,7 @@ export interface JudgeRecommendationGroup {
 // JudgeBacklog is GET /api/me/judge/recommendations (PRD #98 M1). `bucket` echoes the
 // applied filter and `run` the ?run= anchor (""" when absent). `triage` is the
 // canonical GET /me/judge/stats aggregate — NEVER tallied from `groups` — so the page
-// tabs, the nav badge and the notification cannot drift; it survives both filters and
+// tabs and the nav badge cannot drift; it survives both filters and
 // truncation. `truncated` says the hard row cap bit: when true a SURVIVING group's
 // counts/rollup may be understated, so a truncated page is never authoritative.
 export interface JudgeBacklog {

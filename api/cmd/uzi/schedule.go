@@ -63,10 +63,14 @@ func newScheduleResetCmd(env Env, gf *globalFlags) *cobra.Command {
 	return &cobra.Command{
 		Use:   "reset <schedule-id>",
 		Short: "Reset a default schedule's edited fields back to the catalog defaults",
-		Long: "Restore a default-origin schedule's editable fields (cron, timezone, model,\n" +
-			"auto-approve, wait-on-limit, mr-rework, max-issues) to the builtin catalog values and clear its\n" +
-			"customized flag. Only a default-origin schedule can be reset; a user-origin one is a\n" +
-			"conflict (there is nothing to reset to).",
+		Long: "Restore a default-origin schedule's editable fields to the builtin catalog values:\n" +
+			"cron, timezone, model, auto-approve, wait-on-limit, max issues and output mode return\n" +
+			"to the catalog values, apply-model-to-agents is set to false, and MR rework, the\n" +
+			"guidance, the harness pin and the credential override are cleared to inherit. The\n" +
+			"customized flag is cleared and the schedule is re-activated on its catalog cadence\n" +
+			"(a parked schedule fires again unless it is paused). The catalog-owned prompt and\n" +
+			"labels are not touched. Only a default-origin schedule can be reset; a user-origin\n" +
+			"one is a conflict (there is nothing to reset to).",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, err := env.client(gf)
@@ -126,8 +130,8 @@ func newScheduleCloneCmd(env Env, gf *globalFlags) *cobra.Command {
 // newScheduleAddRepoCmd — `uzi schedule add-repo <id> --repo <repoID>` (PRD #636 M4,
 // Decision 5): replicate an existing user schedule's current config onto ANOTHER repo you
 // own as a new grouped sibling. It stamps both the source and the new row with one shared
-// display-only sibling_group_id (allocated server-side, race-safely), so they render as one
-// expandable group — the CLI twin of the web "Add another repo" action. Only a user-origin
+// display-only sibling_group_id (allocated server-side, race-safely); the web lists each as its
+// own row — the CLI twin of the web "Add to another repo" action. Only a user-origin
 // schedule can be added onto; a foreign source or target repo is a 404.
 //
 // A 409 means the schedule already has a sibling on that repo (the (sibling_group_id,
@@ -138,7 +142,7 @@ func newScheduleAddRepoCmd(env Env, gf *globalFlags) *cobra.Command {
 		Use:   "add-repo <schedule-id>",
 		Short: "Replicate a schedule onto another repo as a grouped sibling",
 		Long: "Replicate an existing schedule you own onto ANOTHER repo you own as a new sibling,\n" +
-			"grouped with the source so they render as one expandable group. The new row is an\n" +
+			"grouped with the source (the web lists each as its own row). The new row is an\n" +
 			"independent, fully-editable copy of the source's current config (edit/pause/remove it\n" +
 			"on its own). Pass --repo <repoID> for the target repo (from `uzi repo list`). If the\n" +
 			"schedule already has a sibling on that repo this is a clean no-op.",
@@ -237,8 +241,8 @@ func newScheduleCreateCmd(env Env, gf *globalFlags) *cobra.Command {
 			}
 			// Multi-repo client-side fan-out: one independent create per --repo. Generate ONE
 			// display-only sibling_group_id (uuid v4) here and stamp it on every create body so
-			// the N rows share a group and the web renders them as one expandable summary (PRD
-			// #636 Decision 4). The single-repo fast path above leaves it nil (a standalone row).
+			// the N rows share a group (PRD #636 Decision 4; since PRD #1645 the web lists each
+			// sibling as its own row). The single-repo fast path above leaves it nil (a standalone row).
 			// The group id is cosmetic — the rows stay fully independent; owner-scoping bounds
 			// its blast radius to the caller's own rows.
 			groupID := uuid.NewString()
@@ -323,6 +327,7 @@ func newScheduleListCmd(env Env, gf *globalFlags) *cobra.Command {
 				rows = append(rows, []string{
 					s.ID,
 					scheduleTarget(s),
+					scheduleSource(s),
 					strOr(&s.RepoPath, "-"),
 					scheduleWhen(s),
 					scheduleNextCell(s, now, pause),
@@ -333,7 +338,7 @@ func newScheduleListCmd(env Env, gf *globalFlags) *cobra.Command {
 					strOr(s.Harness, "-"),
 				})
 			}
-			return p.Table([]string{"ID", "TARGET", "REPO", "WHEN", "NEXT", "ON", "HARNESS"}, rows)
+			return p.Table([]string{"ID", "TARGET", "SOURCE", "REPO", "WHEN", "NEXT", "ON", "HARNESS"}, rows)
 		},
 	}
 }
@@ -710,6 +715,16 @@ func scheduleTarget(s apitypes.ScheduleDTO) string {
 	default:
 		return s.Target
 	}
+}
+
+// scheduleSource renders the list table's SOURCE column (PRD #1645 D10): the catalog
+// slug for a default-origin schedule ("-" when a default carries no slug), else "custom"
+// for an owner-authored one.
+func scheduleSource(s apitypes.ScheduleDTO) string {
+	if s.Origin == schedOriginDefault {
+		return strOr(s.CatalogSlug, "-")
+	}
+	return "custom"
 }
 
 // maxIssuesStr renders the sweep cap for the detail block: the number when set, or

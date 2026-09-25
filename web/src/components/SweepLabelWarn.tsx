@@ -6,10 +6,15 @@
 // label is missing, warns with a one-click "Create label" that creates it on the forge.
 //
 // It is deliberately self-contained (its own check/ensure calls) so both the modal (a
-// custom sweep's form labels) and the Default-jobs enable flow (a default's catalog
-// labels) can drop it in with just { repoId, repoPath, labels }.
+// custom sweep's form labels) and the Job catalog's enable dialog (a default's catalog
+// labels, checked BEFORE the enable) can drop it in with just { repoId, repoPath, labels }.
+//
+// A parent that must know when the check has finished (the enable dialog holds its Enable
+// button while a check is in flight, PRD #1645 D7) passes onCheckStateChange: "checking" is
+// reported synchronously on mount and whenever the repo or labels change, before the
+// debounce, and "done" only when the CURRENT check settles, success or error.
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { api } from "../lib/api";
 import { Alert, Button, cx } from "./ui";
 import { AlertIcon } from "./icons";
@@ -21,12 +26,17 @@ export function SweepLabelWarn({
   className,
   // Called after a successful ensure, so a parent can refresh any dependent view.
   onEnsured,
+  onCheckStateChange,
 }: {
   repoId: string;
   repoPath?: string;
   labels: string[];
   className?: string;
   onEnsured?: (ensured: string[]) => void;
+  // "checking" while this repo's label check is pending (including the debounce window),
+  // "done" once the current check settled, whatever its result. A check superseded by a
+  // new repo/labels never reports "done". Nothing to check reports "done" at once.
+  onCheckStateChange?: (state: "checking" | "done") => void;
 }) {
   const [missing, setMissing] = useState<string[]>([]);
   // The labels a "Create label(s)" click just created — on success the warn resolves, and
@@ -41,6 +51,19 @@ export function SweepLabelWarn({
   // label at fire time) has nothing to check, so the warn stays silent.
   const selector = [...new Set(labels.map((l) => l.trim()).filter(Boolean))];
   const selectorKey = selector.join(",");
+  // The latest callback, so a parent passing a fresh closure each render neither re-runs
+  // the check nor reports into a stale closure.
+  const reportRef = useRef(onCheckStateChange);
+  reportRef.current = onCheckStateChange;
+  const hasCheck = !!repoId && selector.length > 0;
+
+  // Report "checking" from a layout effect, which React runs before the browser paints
+  // and before the debounced check below is scheduled. No test pins that timing; the
+  // enable dialog does not rely on it, since it marks a newly checked repo "checking"
+  // itself.
+  useLayoutEffect(() => {
+    reportRef.current?.(hasCheck ? "checking" : "done");
+  }, [repoId, selectorKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     window.clearTimeout(debounceRef.current);
@@ -56,11 +79,15 @@ export function SweepLabelWarn({
       api
         .checkRepoLabels(repoId, selector)
         .then(({ missing }) => {
-          if (alive) setMissing(missing);
+          if (!alive) return; // superseded: its settlement is not this check's
+          setMissing(missing);
+          reportRef.current?.("done");
         })
         .catch(() => {
           // A check failure is advisory too — never block the user on it.
-          if (alive) setMissing([]);
+          if (!alive) return;
+          setMissing([]);
+          reportRef.current?.("done");
         });
     }, 300);
     return () => {

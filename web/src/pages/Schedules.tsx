@@ -1,11 +1,14 @@
-// Schedules — the /schedules list page (PRD #241 M5, mock §1).
+// Schedules — the /schedules page (PRD #241 M5; restructured by PRD #1645).
 //
-// An owner-scoped table of what each schedule targets, when it next/last fires, its
-// options, and a per-row enable toggle (PATCH { enabled }). Recurring rows persist;
-// a fired `once` row shows as terminal; a status='error' (parked) row is called out
-// distinctly. The "New schedule" button and the per-row ✎ open the shared modal.
+// Two tabs (D1). **Schedules** is the one operational list: every schedule the owner has,
+// catalog-derived and user-authored, one flat row per schedule (ScheduleListRow) with its
+// own cadence, next/last fire, options, inline actions and toggle (D2-D4), sorted per D3.
+// **Job catalog** is where shipped jobs are discovered and enabled. `?tab=` deep-links a
+// tab; without it the page lands on Schedules when the owner has any, else the catalog.
+// The "New schedule" button and each row's Edit open the shared modal.
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import {
   api,
   ApiError,
@@ -18,49 +21,45 @@ import {
 import { PauseAllButton, PausePanel, PausedBanner } from "../components/SchedulePauseControl";
 import { errorMessage } from "../lib/apiError";
 import { useAsyncData } from "../lib/useAsyncData";
-import { relativeFromNow, ScheduleModal } from "../components/ScheduleModal";
+import { ScheduleModal } from "../components/ScheduleModal";
 import { browserTimezone } from "../lib/timezone";
-import { useDemoMode } from "../lib/demoMode";
-import { maskRepoPath } from "../lib/demoMask";
-import { DefaultJobs } from "../components/DefaultJobs";
-import { AddAnotherRepo, ScheduleGroupRow, ScheduleSubRow } from "../components/ScheduleGroupRow";
-import { LastRunOutcome, LastFireDetail, formatStamp } from "../components/LastRun";
-import { humanizeCron } from "../lib/schedulePresets";
+import { JobCatalog, catalogEntryId } from "../components/JobCatalog";
+import type { EnableResult } from "../components/EnableJobDialog";
+import { ScheduleListRow, scheduleNameId } from "../components/ScheduleListRow";
+import { formatStamp } from "../components/LastRun";
+import { FILTER_ALL_ID, ScheduleFilters } from "../components/ScheduleFilters";
+import {
+  NO_FILTER,
+  clearHidingFilters,
+  foldRefs,
+  isFoldedOnce,
+  pruneFilter,
+  repoOptions,
+  scheduleDisplayName,
+  sourceCounts,
+  splitFold,
+  type ScheduleFilter,
+} from "../lib/scheduleList";
 import {
   Alert,
   Badge,
   Button,
   ListSkeleton,
   PageHeader,
-  Toggle,
   cx,
 } from "../components/ui";
-import {
-  ClockIcon,
-  CopyIcon,
-  PencilIcon,
-  PlayIcon,
-  PlusIcon,
-  TrashIcon,
-} from "../components/icons";
+import { ChevronRightIcon, ClockIcon, PlusIcon } from "../components/icons";
 
-type Tab = "defaults" | "mine";
+type Tab = "schedules" | "catalog";
+
+// A pending D12 reveal (see `pendingReveal` in the page).
+type Reveal = { id: string; focus: boolean; afterSeq: number };
 
 // The tab order, for the APG roving-tabindex arrow-key handler.
-const TAB_ORDER: Tab[] = ["defaults", "mine"];
+const TAB_ORDER: Tab[] = ["schedules", "catalog"];
 const tabId = (t: Tab) => `sched-tab-${t}`;
 const panelId = (t: Tab) => `sched-panel-${t}`;
-
-// The COLSPAN of the schedules table, so the expandable "Last fire" detail row
-// stretches the full width (Target · When · Next run · Last run · Options · On).
-const COLS = 6;
-
-// Why an issue-target schedule cannot be replicated onto another repo: the issue
-// number is repo-relative, so the same iid points at a different (or missing) issue
-// elsewhere. The API now rejects add-repo for issue targets with a 422, so the
-// "Add another repo" affordance is disabled with this tooltip rather than left to
-// no-op (PRD #636 follow-up, issue #638 P1c).
-const ISSUE_NO_MULTI_REPO = "Issue schedules can't span repos - issue numbers are repo-relative";
+const isTab = (v: string | null): v is Tab => v === "schedules" || v === "catalog";
 
 // TAB_CLASS mirrors AdminShell's tab strip (issue #204 overflow contract) so the two
 // in-page tabs read identically to the app's other tabbed surfaces.
@@ -70,12 +69,45 @@ const TAB_ACTIVE = "border-brand text-fg";
 const TAB_INACTIVE = "border-transparent text-muted hover:border-edge-strong hover:text-fg";
 
 export function Schedules() {
-  const [tab, setTab] = useState<Tab>("defaults");
+  // The active tab lives in the URL (?tab=schedules|catalog, D1), so a tab is shareable
+  // and back-navigable; a change replaces the entry rather than pushing one. Without a
+  // valid ?tab the page lands on Schedules when the owner has ≥1 schedule, else the Job
+  // catalog, decided ONCE on the first successful load (`landing`) so removing the last
+  // schedule later does not yank the page to the other tab.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const tabParam = searchParams.get("tab");
+  const [landing, setLanding] = useState<Tab | null>(null);
+  const tab: Tab = isTab(tabParam) ? tabParam : (landing ?? "schedules");
+  // The Job catalog card whose enable dialog is open (D7), at most one; page-owned so a
+  // default row's "Enable on another repo" can open it from the Schedules tab (D4).
+  // It is cleared whenever the displayed tab is not the catalog (the effect below keys on
+  // `tab`, which derives from the URL), so a tab click, the tablist's arrow keys and a URL
+  // change that bypasses setTab (e.g. the app nav's Schedules link) all close it, and
+  // coming back never re-opens a dialog whose open effect would take focus from the tab
+  // the user just moved to.
+  const [enableDialogSlug, setEnableDialogSlug] = useState<string | null>(null);
+  useEffect(() => {
+    if (tab !== "catalog") setEnableDialogSlug(null);
+  }, [tab]);
+  const setTab = (t: Tab) => {
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        next.set("tab", t);
+        return next;
+      },
+      { replace: true },
+    );
+  };
   const [schedules, setSchedules] = useState<Schedule[] | null>(null);
   const [catalog, setCatalog] = useState<ScheduleCatalog | null>(null);
   const [repos, setRepos] = useState<Repo[]>([]);
   const [error, setError] = useState("");
-  const [notice, setNotice] = useState("");
+  // The page notice (role=status). `jobSlug` is set only by a fully successful catalog
+  // enable, whose notice then offers the Schedules tab filtered to that job (D7).
+  const [noticeState, setNoticeState] = useState<{ text: string; jobSlug: string | null }>({ text: "", jobSlug: null });
+  const notice = noticeState.text;
+  const setNotice = (text: string, jobSlug: string | null = null) => setNoticeState({ text, jobSlug });
   const [creating, setCreating] = useState(false);
   const [editing, setEditing] = useState<Schedule | null>(null);
   const [busyId, setBusyId] = useState<string>("");
@@ -95,10 +127,32 @@ export function Schedules() {
   // cancellation flag alone is not enough: it flips at commit, so a stale read and a
   // mutation resolving in ONE React batch would still let the read land last.
   const pauseRev = useRef(0);
-  // Which sibling groups are expanded in My schedules (keyed by sibling_group_id), the
-  // same Set<string> disclosure pattern DefaultJobs uses for its catalog slugs. Lives in
-  // the parent so "add another repo" can auto-expand the group its new sibling landed in.
-  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
+  // D12: a row to bring into view once it is rendered on the Schedules tab (after a clone
+  // or add-repo), and whether to move focus to its name cell. `afterSeq` is the load
+  // sequence of the reload that followed the mutation: the request is dropped as "the row
+  // is gone" only by a list loaded at or after it, never by an older one still on screen
+  // (an overlapping reload can supersede the awaited one, so `await reload()` returning
+  // does not mean its list was applied). Consumed by the effect below.
+  const [pendingReveal, setPendingReveal] = useState<Reveal | null>(null);
+  // The cloned row whose name cell takes focus when the edit modal it opened closes (D12).
+  const [focusAfterEdit, setFocusAfterEdit] = useState<{ id: string; afterSeq: number } | null>(null);
+  // D5 filters: page-level state, so they survive switching tabs and back; not persisted
+  // and not in the URL. `foldOpen` is the D6 fold's disclosure: null follows the derived
+  // default (open only when the fold holds every match), a boolean is the user's own
+  // choice, honoured until the filters change.
+  const [filter, setFilter] = useState<ScheduleFilter>(NO_FILTER);
+  const [foldOpen, setFoldOpen] = useState<boolean | null>(null);
+  const applyFilter = (next: ScheduleFilter) => {
+    setFilter(next);
+    setFoldOpen(null);
+  };
+  // Load sequence: `loadSeq` is bumped as each list load starts; `loadedSeq` is the
+  // sequence of the latest current load to SETTLE: its list is in `schedules` when it
+  // succeeded, and when it failed the list on screen is older (see pendingReveal).
+  const loadSeq = useRef(0);
+  const [loadedSeq, setLoadedSeq] = useState(0);
+  // A catalog entry to focus once the Job catalog tab has rendered ("from catalog").
+  const [pendingCatalogFocus, setPendingCatalogFocus] = useState<string | null>(null);
   // Session-scoped clone provenance: the DTO carries no "cloned from" field (a clone
   // bakes its source in with catalog_slug=null), so this shows the source name for a
   // clone made THIS session. Persistent provenance would need a backend field (seam).
@@ -131,15 +185,27 @@ export function Schedules() {
   // renders the skeleton the same as the old code did with catalog still null.
   const { error: loadError, reload } = useAsyncData(
     async ({ isCurrent }) => {
+      const seq = ++loadSeq.current;
       const rev = pauseRev.current;
-      const [rows, cat, repoList, pauseState] = await Promise.all([
-        api.listSchedules(),
-        api.listScheduleCatalog(),
-        api.listRepos().then((r) => r.repos),
-        api.getSchedulePause(),
-      ]);
+      let loadedAll: [Schedule[], ScheduleCatalog, Repo[], SchedulePauseDTO];
+      try {
+        loadedAll = await Promise.all([
+          api.listSchedules(),
+          api.listScheduleCatalog(),
+          api.listRepos().then((r) => r.repos),
+          api.getSchedulePause(),
+        ]);
+      } catch (err) {
+        // A failed load still settles its sequence, so a reveal awaiting it is dropped
+        // rather than left armed to steal focus on some later render (pendingReveal).
+        if (isCurrent()) setLoadedSeq(seq);
+        throw err;
+      }
+      const [rows, cat, repoList, pauseState] = loadedAll;
       if (!isCurrent()) return;
       setSchedules(rows);
+      setLoadedSeq(seq);
+      setLanding((cur) => cur ?? (rows.length > 0 ? "schedules" : "catalog"));
       setCatalog(cat);
       setRepos(repoList);
       // A pause mutation that started after this read began owns the newer state.
@@ -148,6 +214,16 @@ export function Schedules() {
     [],
     { fallback: "Could not load schedules", onFetchStart: () => setError("") },
   );
+
+  // reloadMarked reloads and returns that load's sequence. The fetcher bumps loadSeq
+  // synchronously when reload() starts it, so reading it right after the call names
+  // exactly this load.
+  const reloadMarked = async () => {
+    const done = reload();
+    const seq = loadSeq.current;
+    await done;
+    return seq;
+  };
 
   const toggleEnabled = async (s: Schedule) => {
     setBusyId(s.id);
@@ -192,13 +268,16 @@ export function Schedules() {
   };
 
   // Enable a catalog default on a set of repos — one call per repo (client fan-out,
-  // matching the CLI), reporting a partial failure rather than swallowing it.
-  const enableDefault = async (entry: CatalogEntry, repoIds: string[]) => {
-    if (repoIds.length === 0) return;
+  // matching the CLI), reporting a partial failure rather than swallowing it. Resolves to
+  // the per-repo outcome so the enable dialog can lock the repos that succeeded and keep
+  // the failed ones for a retry (D7); null when it did not start (nothing to enable, or
+  // another mutation in flight). It never switches tabs (D12).
+  const enableDefault = async (entry: CatalogEntry, repoIds: string[]): Promise<EnableResult | null> => {
+    if (repoIds.length === 0) return null;
     // In-flight guard (matches every other mutating action here): a double-click would
     // otherwise fan out duplicate enableCatalogSchedule calls. busyId keys off the entry
-    // slug (distinct from any schedule id), which disables this entry's Enable buttons.
-    if (busyId) return;
+    // slug (distinct from any schedule id), which disables every card's Enable.
+    if (busyId) return null;
     setBusyId(entry.slug);
     setError("");
     setNotice("");
@@ -212,16 +291,26 @@ export function Schedules() {
       const results = await Promise.allSettled(
         repoIds.map((rid) => api.enableCatalogSchedule(rid, entry.slug, tz)),
       );
-      const ok = results.filter((r) => r.status === "fulfilled").length;
-      const failed = results.length - ok;
+      const out: EnableResult = { enabled: [], failed: [] };
+      results.forEach((r, i) => {
+        if (r.status === "fulfilled") out.enabled.push(repoIds[i]);
+        else out.failed.push({ repoId: repoIds[i], message: errorMessage(r.reason, "Could not enable on this repo") });
+      });
+      // The refreshed list is what flips the succeeded repos to "enabled" in the dialog.
+      // Reload FIRST: every load clears the page error as it starts (onFetchStart), so an
+      // error set before it would be wiped before it was ever seen.
+      await reload();
+      const ok = out.enabled.length;
+      const failed = out.failed.length;
       if (failed > 0) {
         setError(`Enabled “${entry.name}” on ${ok} of ${repoIds.length} repos; ${failed} failed.`);
       } else {
         setNotice(
           `Enabled “${entry.name}” on ${ok} repo${ok === 1 ? "" : "s"} → ${ok} schedule${ok === 1 ? "" : "s"}.`,
+          entry.slug,
         );
       }
-      await reload();
+      return out;
     } finally {
       setBusyId("");
     }
@@ -252,9 +341,12 @@ export function Schedules() {
       const clone = await api.cloneSchedule(s.id);
       const label = s.origin === "default" && s.catalog_slug ? catalogName(catalog, s.catalog_slug) : "a schedule";
       setClonedFrom((m) => ({ ...m, [clone.id]: label }));
-      await reload();
+      const afterSeq = await reloadMarked();
       setEditing(clone);
-      setTab("mine");
+      // D12: show the clone on the Schedules tab behind the modal; its name cell takes
+      // focus when the modal closes (the modal holds focus while open).
+      revealSchedule(clone.id, false, afterSeq);
+      setFocusAfterEdit({ id: clone.id, afterSeq });
     } catch (err) {
       setError(errorMessage(err, "Could not clone the schedule"));
     } finally {
@@ -262,12 +354,21 @@ export function Schedules() {
     }
   };
 
+  // Remove, then hand focus to where the row was instead of letting it fall to <body>
+  // with the row's menu button: the next row's name cell, else the previous row's, else
+  // (the list is now empty) the Schedules tab. A remove started from the Job catalog tab
+  // keeps its own focus handling.
   const removeSchedule = async (s: Schedule) => {
+    const fromList = tab === "schedules";
+    const at = displayed.findIndex((r) => r.id === s.id);
+    const neighbour = at < 0 ? undefined : (displayed[at + 1] ?? displayed[at - 1]);
     setBusyId(s.id);
     setError("");
     try {
       await api.deleteSchedule(s.id);
       await reload();
+      if (fromList && neighbour) setPendingReveal({ id: neighbour.id, focus: true, afterSeq: 0 });
+      else if (fromList) tabRefs.current.schedules?.focus();
     } catch (err) {
       setError(errorMessage(err, "Could not remove the schedule"));
     } finally {
@@ -275,18 +376,50 @@ export function Schedules() {
     }
   };
 
-  const toggleGroupExpand = (groupId: string) =>
-    setExpandedGroups((s) => {
-      const next = new Set(s);
-      if (next.has(groupId)) next.delete(groupId);
-      else next.add(groupId);
-      return next;
-    });
+  // revealSchedule brings a just-created row into view (D12): switch to the Schedules tab,
+  // then, once the row is in the loaded list, clear any filter that would hide it, expand
+  // the fired-one-shot fold if it lands there, scroll it into view and optionally focus
+  // its name cell (the effect below). `afterSeq` is the mutation's reload (reloadMarked).
+  const revealSchedule = (id: string, focus: boolean, afterSeq: number) => {
+    setTab("schedules");
+    setPendingReveal({ id, focus, afterSeq });
+  };
 
-  // Add another repo to a custom schedule (PRD #636 M3): replicate the source sibling's
-  // config onto a new repo via the M1 add-repo endpoint. On success, refresh and
-  // auto-expand the (now ≥2-member) group so the new sibling is visible. A 409 (the repo
-  // already carries a sibling in this group) is friendly and non-fatal, not an error.
+  // "from catalog": switch to the Job catalog tab and move focus to that entry's card.
+  const showInCatalog = (slug: string) => {
+    setTab("catalog");
+    setPendingCatalogFocus(slug);
+  };
+
+  // "Enable on another repo" (D4): switch to the Job catalog tab and open that entry's
+  // enable dialog, which moves focus into itself.
+  const enableElsewhere = (slug: string) => {
+    setTab("catalog");
+    setEnableDialogSlug(slug);
+  };
+
+  // A card's "Enabled on N repos" link, and the enable notice's link (D7): the Schedules
+  // tab filtered to that job, every other dimension cleared. From the Job catalog tab either
+  // trigger unmounts with its panel, so focus moves to the Schedules tab, not <body>.
+  const showJobInSchedules = (slug: string) => {
+    setTab("schedules");
+    applyFilter({ ...NO_FILTER, jobSlug: slug });
+    tabRefs.current.schedules?.focus();
+  };
+
+  // Closing the edit modal: a clone's modal hands focus to the cloned row (D12).
+  const closeEditing = () => {
+    setEditing(null);
+    if (focusAfterEdit) {
+      setPendingReveal({ ...focusAfterEdit, focus: true });
+      setFocusAfterEdit(null);
+    }
+  };
+
+  // Add another repo to a custom schedule (PRD #636 M3): replicate the source's config
+  // onto a new repo via the add-repo endpoint. On success, refresh and reveal the new
+  // row, focusing its name cell (D12). A 409 (the repo already carries a sibling of this
+  // schedule) is friendly and non-fatal, not an error.
   const addRepo = async (source: Schedule, repoId: string) => {
     if (busyId) return;
     setBusyId(source.id);
@@ -295,10 +428,7 @@ export function Schedules() {
     try {
       const sibling = await api.addScheduleRepo(source.id, repoId);
       setNotice("Added on another repo.");
-      await reload();
-      if (sibling.sibling_group_id) {
-        setExpandedGroups((s) => new Set(s).add(sibling.sibling_group_id as string));
-      }
+      revealSchedule(sibling.id, true, await reloadMarked());
     } catch (err) {
       if (err instanceof ApiError && err.status === 409) {
         setNotice("That schedule is already on that repo.");
@@ -368,17 +498,127 @@ export function Schedules() {
 
   const onSaved = () => {
     setCreating(false);
-    setEditing(null);
+    closeEditing();
     reload();
   };
 
-  // My schedules holds the owner-authored (and cloned) rows; catalog defaults live in
-  // the Default jobs tab, so they are filtered out here to avoid showing twice.
-  const mine = (schedules ?? []).filter((s) => s.origin === "user");
-  const enabledCount = mine.filter((s) => s.enabled).length;
-  const activeCount = mine.filter((s) => s.enabled && s.status === "active").length;
-  const total = mine.length;
-  const enabledDefaults = (schedules ?? []).filter((s) => s.origin === "default" && s.enabled).length;
+  useEffect(() => {
+    if (!pendingCatalogFocus || tab !== "catalog") return;
+    const el = document.getElementById(catalogEntryId(pendingCatalogFocus));
+    if (!el) {
+      // A slug the loaded catalog does not carry will never render: drop the request.
+      if (catalog && !catalog.entries.some((e) => e.slug === pendingCatalogFocus)) setPendingCatalogFocus(null);
+      return;
+    }
+    el.scrollIntoView?.({ block: "nearest" });
+    el.focus();
+    setPendingCatalogFocus(null);
+  }, [pendingCatalogFocus, tab, catalog]);
+
+  // Every schedule, both origins (D2), named (D4) and ordered (D3).
+  const entriesBySlug = useMemo(
+    () => new Map((catalog?.entries ?? []).map((e) => [e.slug, e])),
+    [catalog],
+  );
+  const nameOf = (s: Schedule) => scheduleDisplayName(s, entriesBySlug);
+  // Only a default whose slug the loaded catalog still carries has an entry to show; any
+  // other row gets no "from catalog" link and no "Enable on another repo" item.
+  const catalogSlugOf = (s: Schedule) => {
+    const slug = s.origin === "default" ? s.catalog_slug : null;
+    return slug && entriesBySlug.has(slug) ? slug : null;
+  };
+  const catalogLinkFor = (s: Schedule) => {
+    const slug = catalogSlugOf(s);
+    return slug ? () => showInCatalog(slug) : undefined;
+  };
+  const enableElsewhereFor = (s: Schedule) => {
+    const slug = catalogSlugOf(s);
+    return slug ? () => enableElsewhere(slug) : undefined;
+  };
+  const all = schedules ?? [];
+  // D5 → D6 → D3: filter, fold the fired one-shots that survived, sort each part.
+  const { shown, folded } = splitFold(all, filter, nameOf);
+  // The fold opens by itself when it holds every match, so a filter never looks empty
+  // while hiding its matches; a user's own open/close stands until the filters change.
+  const foldExpanded = foldOpen ?? (shown.length === 0 && folded.length > 0);
+  // The rows on screen, in order (Remove hands focus to a displayed neighbour).
+  const displayed = foldExpanded ? [...shown, ...folded] : shown;
+  const counts = sourceCounts(all);
+  const repoChoices = repoOptions(all);
+  const jobName = filter.jobSlug === null ? null : (entriesBySlug.get(filter.jobSlug)?.name ?? filter.jobSlug);
+  const total = all.length;
+  const enabledCount = all.filter((s) => s.enabled).length;
+  const activeCount = all.filter((s) => s.enabled && s.status === "active").length;
+  // Catalog entries enabled on none of the owner's repos (the "K not enabled" pill, D1).
+  const enabledSlugs = new Set(all.filter((s) => s.origin === "default" && s.catalog_slug).map((s) => s.catalog_slug));
+  const notEnabled = (catalog?.entries ?? []).filter((e) => !enabledSlugs.has(e.slug)).length;
+  const loaded = schedules !== null && catalog !== null;
+
+  // A Repo or Job filter whose target left the page (its last row removed, the entry gone
+  // from the catalog) is pruned, so no filter stays active while nothing shows it.
+  useEffect(() => {
+    if (!schedules || !catalog) return;
+    const pruned = pruneFilter(filter, schedules, new Set(catalog.entries.map((e) => e.slug)));
+    if (pruned !== filter) applyFilter(pruned);
+  }, [schedules, catalog, filter]);
+
+  const renderRow = (s: Schedule) => (
+    <ScheduleListRow
+      key={s.id}
+      s={s}
+      name={nameOf(s)}
+      busy={busyId === s.id}
+      addBusy={busyId !== ""}
+      clonedFrom={clonedFrom[s.id]}
+      pauseNote={pauseNote}
+      repos={repos}
+      onToggle={() => toggleEnabled(s)}
+      onRunNow={() => runNow(s)}
+      onEdit={() => setEditing(s)}
+      onReset={() => resetDefault(s)}
+      onClone={() => cloneSchedule(s)}
+      onRemove={() => removeSchedule(s)}
+      onAddRepo={(repoId) => addRepo(s, repoId)}
+      onShowInCatalog={catalogLinkFor(s)}
+      onEnableElsewhere={enableElsewhereFor(s)}
+    />
+  );
+
+  // D12 reveal: runs once the target row is in the loaded list (the list may still be
+  // reloading, and the tab switch lands a render later). First it clears the filters in
+  // the row's way and opens the fold it lands in, one render each; then it scrolls to and
+  // optionally focuses the row, and clears itself.
+  useEffect(() => {
+    if (!pendingReveal || tab !== "schedules") return;
+    const row = schedules?.find((r) => r.id === pendingReveal.id);
+    if (row) {
+      const cleared = clearHidingFilters(filter, row);
+      if (cleared !== filter) {
+        applyFilter(cleared);
+        return;
+      }
+      if (isFoldedOnce(row) && !foldExpanded) {
+        setFoldOpen(true);
+        return;
+      }
+    }
+    const el = document.getElementById(scheduleNameId(pendingReveal.id));
+    if (!el) {
+      // The row is gone from a list loaded after the mutation (removed meanwhile): drop
+      // the request so it cannot fire on some later render, and keep focus off <body>.
+      // A list that predates the mutation proves nothing, so keep waiting on it.
+      // A FAILED load at or after it settles `loadedSeq` too: the row cannot be shown, so
+      // the request is dropped instead of lingering to steal focus later.
+      if (!row && schedules && loadedSeq >= pendingReveal.afterSeq) {
+        setPendingReveal(null);
+        if (pendingReveal.focus) tabRefs.current.schedules?.focus();
+      }
+      return;
+    }
+    el.scrollIntoView?.({ block: "nearest" });
+    if (pendingReveal.focus) el.focus();
+    setPendingReveal(null);
+  }, [pendingReveal, tab, schedules, loadedSeq, filter, foldExpanded]);
 
   // The pre-formatted "paused until <stamp>" line every Next-run cell shows while the
   // switch is on (warn-coloured at the render site); null when not paused. Computed once
@@ -427,7 +667,7 @@ export function Schedules() {
     <div className="space-y-6">
       <PageHeader
         title="Schedules"
-        description="Time-driven runs: enable a shipped default job, or author your own against a pinned issue, a label sweep, or an ad-hoc prompt."
+        description="Everything that runs on a clock, in one place. Enable a shipped job from the Job catalog, or author your own against a pinned issue, a label sweep, or an ad-hoc prompt."
         actions={
           <Button onClick={() => setCreating(true)}>
             <PlusIcon /> New schedule
@@ -437,8 +677,7 @@ export function Schedules() {
 
       {/* Pause-all slot (PRD #1093 D9): the inline preset picker or the paused banner
           lives here, between the header and the tab row, so it covers nothing on the
-          page (a dropdown would have hidden the "Enable a default" card). One control
-          per state: while paused the tab-row button yields to the banner. */}
+          page. One control per state: while paused the tab-row button yields to the banner. */}
       {pickerOpen ? (
         <PausePanel onSubmit={submitPause} onCancel={() => setPickerOpen(false)} busy={pauseBusy} />
       ) : pauseActive && pause ? (
@@ -450,39 +689,48 @@ export function Schedules() {
         />
       ) : null}
 
-      {/* Two tabs, same table shape (PRD #589 M6): shipped defaults vs the owner's own. */}
+      {/* Two tabs (D1): the operational list, then the catalog of shipped jobs. */}
       <div className="flex items-center gap-1 overflow-x-auto border-b border-edge" role="tablist" aria-label="Schedules">
         <button
           type="button"
           role="tab"
-          id={tabId("defaults")}
-          aria-selected={tab === "defaults"}
-          aria-controls={panelId("defaults")}
-          tabIndex={tab === "defaults" ? 0 : -1}
+          id={tabId("schedules")}
+          aria-selected={tab === "schedules"}
+          aria-controls={panelId("schedules")}
+          tabIndex={tab === "schedules" ? 0 : -1}
           ref={(el) => {
-            tabRefs.current.defaults = el;
+            tabRefs.current.schedules = el;
           }}
           onKeyDown={onTabKeyDown}
-          onClick={() => setTab("defaults")}
-          className={cx(TAB_BASE, tab === "defaults" ? TAB_ACTIVE : TAB_INACTIVE)}
+          onClick={() => setTab("schedules")}
+          className={cx(TAB_BASE, tab === "schedules" ? TAB_ACTIVE : TAB_INACTIVE)}
         >
-          Default jobs{enabledDefaults > 0 ? ` · ${enabledDefaults}` : ""}
+          Schedules{loaded ? ` · ${total}` : ""}
         </button>
         <button
           type="button"
           role="tab"
-          id={tabId("mine")}
-          aria-selected={tab === "mine"}
-          aria-controls={panelId("mine")}
-          tabIndex={tab === "mine" ? 0 : -1}
+          id={tabId("catalog")}
+          aria-selected={tab === "catalog"}
+          aria-controls={panelId("catalog")}
+          tabIndex={tab === "catalog" ? 0 : -1}
           ref={(el) => {
-            tabRefs.current.mine = el;
+            tabRefs.current.catalog = el;
           }}
           onKeyDown={onTabKeyDown}
-          onClick={() => setTab("mine")}
-          className={cx(TAB_BASE, tab === "mine" ? TAB_ACTIVE : TAB_INACTIVE)}
+          onClick={() => setTab("catalog")}
+          // With the badge shown, name the tab explicitly so the count and the badge read
+          // as "Job catalog · 9, 6 not enabled" rather than "· 9 6 not enabled". A hidden
+          // separator node would need a whitespace flex item, doubling the visible gap.
+          aria-label={
+            loaded && notEnabled > 0
+              ? `Job catalog · ${catalog.entries.length}, ${notEnabled} not enabled`
+              : undefined
+          }
+          className={cx(TAB_BASE, "inline-flex items-center gap-2", tab === "catalog" ? TAB_ACTIVE : TAB_INACTIVE)}
         >
-          My schedules{total > 0 ? ` · ${total}` : ""}
+          Job catalog{loaded ? ` · ${catalog.entries.length}` : ""}
+          {loaded && notEnabled > 0 && <Badge tone="neutral">{notEnabled} not enabled</Badge>}
         </button>
         {/* Running state only: the button sits at the right end of the tab row (ml-auto),
             directly under "New schedule", so no header height is added. It disappears
@@ -497,112 +745,124 @@ export function Schedules() {
 
       {/* One tabpanel per tab, each labelled by its tab; the inactive one is unmounted,
           so its id/aria-controls link is live only for the shown panel (APG tabs). */}
-      {schedules === null || catalog === null ? (
+      {!loaded ? (
         <>
           {(error || loadError) && <Alert message={error || loadError} />}
           <ListSkeleton rows={4} />
         </>
-      ) : tab === "defaults" ? (
-        <div role="tabpanel" id={panelId("defaults")} aria-labelledby={tabId("defaults")}>
-          <DefaultJobs
+      ) : tab === "catalog" ? (
+        <div className="space-y-4" role="tabpanel" id={panelId("catalog")} aria-labelledby={tabId("catalog")}>
+          {(error || loadError) && <Alert message={error || loadError} />}
+          {notice && <PageNotice text={notice} jobSlug={noticeState.jobSlug} onShowJob={showJobInSchedules} />}
+          <JobCatalog
             catalog={catalog}
             schedules={schedules}
             repos={repos}
-            busyId={busyId}
+            busy={busyId !== ""}
+            openSlug={enableDialogSlug}
+            onOpenSlug={setEnableDialogSlug}
             onEnable={enableDefault}
-            onTogglePause={toggleEnabled}
-            onRunNow={runNow}
-            onReset={resetDefault}
-            onClone={cloneSchedule}
-            onRemove={removeSchedule}
-            onEdit={setEditing}
-            pauseNote={pauseNote}
-            notice={notice}
-            error={error || loadError}
+            onShowJob={showJobInSchedules}
           />
         </div>
       ) : (
         <div
           className="space-y-6"
           role="tabpanel"
-          id={panelId("mine")}
-          aria-labelledby={tabId("mine")}
+          id={panelId("schedules")}
+          aria-labelledby={tabId("schedules")}
         >
           {(error || loadError) && <Alert message={error || loadError} />}
-          {notice && <Alert message={notice} tone="info" />}
-          <p className="text-sm text-muted">
-            {total === 0
-              ? "Your own schedules — none yet."
-              : `${total} schedule${total === 1 ? "" : "s"} · ${activeCount} active · ${enabledCount} enabled`}
-          </p>
+          {notice && <PageNotice text={notice} jobSlug={noticeState.jobSlug} onShowJob={showJobInSchedules} />}
 
-          {mine.length === 0 ? (
+          {all.length === 0 ? (
             <div className="rounded-xl border border-dashed border-edge p-10 text-center">
               <div className="mx-auto mb-3 flex h-10 w-10 items-center justify-center rounded-lg bg-raised text-lg text-muted">
                 <ClockIcon />
               </div>
-              <h3 className="text-sm font-medium text-fg">No schedules of your own</h3>
-              <p className="mx-auto mt-1 max-w-sm text-sm text-faint">
-                Author a run to fire once at a future moment or on a recurring cadence, or enable a
-                shipped default from the Default jobs tab. The dark factory can work off-hours.
+              {/* D8, verbatim. */}
+              <p className="mx-auto max-w-sm text-sm text-muted">
+                Nothing runs on a clock yet. Enable a shipped job from the Job catalog, or create your own.
               </p>
-              <div className="mt-4">
+              <div className="mt-4 flex flex-wrap justify-center gap-2">
+                <Button variant="secondary" onClick={() => setTab("catalog")}>
+                  Open the Job catalog
+                </Button>
                 <Button onClick={() => setCreating(true)}>
                   <PlusIcon /> New schedule
                 </Button>
               </div>
             </div>
           ) : (
-            <div className="overflow-x-auto rounded-xl border border-edge bg-surface">
-              <table className="w-full text-left text-sm">
-                <thead>
-                  <tr className="border-b border-edge text-[12.5px] text-muted">
-                    <th className="px-4 py-3 font-medium">Target</th>
-                    <th className="px-4 py-3 font-medium">When</th>
-                    <th className="px-4 py-3 font-medium">Next run</th>
-                    <th className="px-4 py-3 font-medium">Last run</th>
-                    <th className="px-4 py-3 font-medium">Options</th>
-                    <th className="px-4 py-3 text-right font-medium">On</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {groupMine(mine).map((row) =>
-                    row.kind === "single" ? (
-                      <ScheduleRow
-                        key={row.schedule.id}
-                        s={row.schedule}
-                        busy={busyId === row.schedule.id}
-                        addBusy={busyId !== ""}
-                        clonedFrom={clonedFrom[row.schedule.id]}
-                        pauseNote={pauseNote}
-                        repos={repos}
-                        onToggle={() => toggleEnabled(row.schedule)}
-                        onRunNow={() => runNow(row.schedule)}
-                        onEdit={() => setEditing(row.schedule)}
-                        onClone={() => cloneSchedule(row.schedule)}
-                        onAddRepo={(repoId) => addRepo(row.schedule, repoId)}
-                      />
-                    ) : (
-                      <MyScheduleGroup
-                        key={row.groupId}
-                        groupId={row.groupId}
-                        members={row.members}
-                        repos={repos}
-                        pauseNote={pauseNote}
-                        busyId={busyId}
-                        expanded={expandedGroups.has(row.groupId)}
-                        onToggleExpand={() => toggleGroupExpand(row.groupId)}
-                        onToggle={toggleEnabled}
-                        onRunNow={runNow}
-                        onEdit={setEditing}
-                        onRemove={removeSchedule}
-                        onAddRepo={addRepo}
-                      />
-                    ),
-                  )}
-                </tbody>
-              </table>
-            </div>
+            <>
+              <p className="text-sm text-muted">
+                {`${total} schedule${total === 1 ? "" : "s"} · ${activeCount} active · ${enabledCount} enabled`}
+              </p>
+              <ScheduleFilters
+                source={filter.source}
+                counts={counts}
+                onSource={(source) => applyFilter({ ...filter, source })}
+                repos={repoChoices}
+                repoId={filter.repoId}
+                onRepo={(repoId) => applyFilter({ ...filter, repoId })}
+                jobName={jobName}
+                onClearJob={() => applyFilter({ ...filter, jobSlug: null })}
+              />
+              {shown.length === 0 && folded.length === 0 ? (
+                <div className="rounded-xl border border-dashed border-edge p-8 text-center">
+                  <p className="text-sm text-muted">No schedules match</p>
+                  <div className="mt-3">
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      onClick={() => {
+                        applyFilter(NO_FILTER);
+                        // The button unmounts with the empty state: hand focus to the
+                        // now-pressed "All" chip rather than letting it fall to <body>.
+                        document.getElementById(FILTER_ALL_ID)?.focus();
+                      }}
+                    >
+                      Clear filters
+                    </Button>
+                  </div>
+                </div>
+              ) : (
+                /* Below md the table restyles into stacked cards (D11): no horizontal scroll. */
+                <div className="rounded-xl border border-edge bg-surface md:overflow-x-auto">
+                  <table className="block w-full text-left text-sm md:table">
+                    <thead className="hidden md:table-header-group">
+                      <tr className="border-b border-edge text-[12.5px] text-muted">
+                        <th className="px-4 py-3 font-medium">Target · repo</th>
+                        <th className="px-4 py-3 font-medium">When</th>
+                        <th className="px-4 py-3 font-medium">Next run</th>
+                        <th className="px-4 py-3 font-medium">Last run</th>
+                        <th className="px-4 py-3 font-medium">Options</th>
+                        <th className="px-4 py-3 text-right font-medium">Actions · On</th>
+                      </tr>
+                    </thead>
+                    <tbody className="block md:table-row-group">
+                      {shown.map(renderRow)}
+                    </tbody>
+                    {folded.length > 0 && (
+                      <>
+                        <tbody className="block md:table-row-group">
+                          <FoldRow
+                            count={folded.length}
+                            refs={foldRefs(folded)}
+                            expanded={foldExpanded}
+                            onToggle={() => setFoldOpen(!foldExpanded)}
+                          />
+                        </tbody>
+                        {/* The disclosure's aria-controls target; rows render only while open. */}
+                        <tbody id={FOLD_ID} className="block md:table-row-group">
+                          {foldExpanded && folded.map(renderRow)}
+                        </tbody>
+                      </>
+                    )}
+                  </table>
+                </div>
+              )}
+            </>
           )}
 
           <Legend />
@@ -613,10 +873,11 @@ export function Schedules() {
       {editing && (
         <ScheduleModal
           editing={editing}
-          onClose={() => setEditing(null)}
+          onClose={closeEditing}
           onSaved={onSaved}
           onCloneToEdit={(s) => {
             setEditing(null);
+            setFocusAfterEdit(null);
             cloneSchedule(s);
           }}
         />
@@ -625,485 +886,84 @@ export function Schedules() {
   );
 }
 
+// The D6 fold's rows (the disclosure's aria-controls target).
+const FOLD_ID = "schedules-fired-fold";
+
+// FoldRow is the D6 disclosure: one row at the bottom of the table standing for the
+// fired one-time schedules that match the filters, with their issue refs. A real button
+// carries the expanded state; it works on the narrow-card layout (D11) as a full-width row.
+function FoldRow({
+  count,
+  refs,
+  expanded,
+  onToggle,
+}: {
+  count: number;
+  refs: string[];
+  expanded: boolean;
+  onToggle: () => void;
+}) {
+  const shownRefs = refs.slice(0, 8);
+  return (
+    <tr className="block border-t border-edge md:table-row">
+      <td colSpan={6} className="block px-4 py-2.5 md:table-cell">
+        <button
+          type="button"
+          aria-expanded={expanded}
+          aria-controls={FOLD_ID}
+          onClick={onToggle}
+          className="flex w-full flex-wrap items-center gap-x-2 gap-y-1 rounded text-left text-[12.5px] text-muted hover:text-fg"
+        >
+          <ChevronRightIcon
+            aria-hidden="true"
+            className={cx("shrink-0 transition-transform motion-reduce:transition-none", expanded && "rotate-90")}
+          />
+          <span className="font-medium">
+            {count} one-time schedule{count === 1 ? "" : "s"} already fired
+          </span>
+          {shownRefs.length > 0 && (
+            <span className="font-mono text-faint">
+              {shownRefs.join(" ")}
+              {refs.length > shownRefs.length && ` +${refs.length - shownRefs.length} more`}
+            </span>
+          )}
+        </button>
+      </td>
+    </tr>
+  );
+}
+
+// PageNotice is the page's info notice (role=status, like Alert's info tone). A catalog
+// enable's notice also offers the Schedules tab filtered to that job (D7); on the
+// Schedules tab the link would only re-apply the filter it just set, so it is harmless.
+function PageNotice({
+  text,
+  jobSlug,
+  onShowJob,
+}: {
+  text: string;
+  jobSlug: string | null;
+  onShowJob: (slug: string) => void;
+}) {
+  return (
+    <div role="status" className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border border-info/40 bg-info/10 px-3 py-2 text-sm text-info">
+      <span>{text}</span>
+      {jobSlug && (
+        <button
+          type="button"
+          onClick={() => onShowJob(jobSlug)}
+          className="rounded font-medium underline underline-offset-2 hover:text-fg"
+        >
+          Show it on the Schedules tab
+        </button>
+      )}
+    </div>
+  );
+}
+
 // catalogName resolves a slug to its display name for the "cloned from" label.
 function catalogName(catalog: ScheduleCatalog | null, slug: string): string {
   return catalog?.entries.find((e) => e.slug === slug)?.name ?? "a default";
-}
-
-function ScheduleRow({
-  s,
-  busy,
-  addBusy,
-  clonedFrom,
-  pauseNote,
-  repos,
-  onToggle,
-  onRunNow,
-  onEdit,
-  onClone,
-  onAddRepo,
-}: {
-  s: Schedule;
-  busy: boolean;
-  // A GLOBAL busy signal (any row's op in flight), used only for the add-repo
-  // affordance so it matches the group's global gating: addRepo() no-ops while
-  // busyId is set, so the picker must be disabled the whole time, not just for
-  // this row's own op (issue #638 P2a). Run-now/clone/edit/toggle stay per-row `busy`.
-  addBusy: boolean;
-  // The source name when this row was cloned this session (session-scoped label).
-  clonedFrom?: string;
-  // While pause-all is active, the pre-formatted "paused until <stamp>" line (warn) shown
-  // under the Next-run pill; null when not paused. Per-row `enabled` is unchanged.
-  pauseNote: string | null;
-  // The owner's repos, for the "add another repo" picker (excludes this row's own repo).
-  repos: Repo[];
-  onToggle: () => void;
-  onRunNow: () => void;
-  onEdit: () => void;
-  onClone: () => void;
-  // Adds a sibling on repoId, promoting this standalone row into a group (PRD #636 M3).
-  onAddRepo: (repoId: string) => void;
-}) {
-  const demo = useDemoMode();
-  const off = !s.enabled;
-  const fired = s.timing === "once" && s.status === "fired";
-  const parked = s.status === "error";
-  // A self_improve schedule is always auto-approved (server-forced), so it is not a
-  // user option — suppress the chip and let the "defaults" fallback show instead.
-  const showApprove = s.auto_approve && s.target !== "self_improve";
-  const [expanded, setExpanded] = useState(false);
-  const [addingRepo, setAddingRepo] = useState(false);
-  return (
-    <>
-    <tr className={cx("border-t border-edge align-middle", off && "opacity-60")}>
-      {/* Target */}
-      <td className="px-4 py-3">
-        <div className="flex items-center gap-2 font-medium text-fg">
-          <span>{targetTitle(s)}</span>
-          {s.target === "sweep" && (
-            <Badge tone="info" dot>
-              sweep
-            </Badge>
-          )}
-          {s.target === "prompt" && (
-            <Badge tone="ok" dot>
-              prompt
-            </Badge>
-          )}
-          {/* PRD #929 M1: resolved output mode for a prompt schedule (null = job default). */}
-          {s.target === "prompt" && s.output_mode && (
-            <Badge tone="neutral">{s.output_mode}</Badge>
-          )}
-          {s.timing === "once" && (
-            <Badge tone="brand" dot>
-              once
-            </Badge>
-          )}
-          {parked && (
-            <Badge tone="danger" dot>
-              parked
-            </Badge>
-          )}
-          {clonedFrom && (
-            <Badge tone="neutral" title={`Cloned from ${clonedFrom}`}>
-              cloned from {clonedFrom}
-            </Badge>
-          )}
-        </div>
-        <div className="mt-0.5 font-mono text-[12px] text-faint">
-          {s.repo_path ? maskRepoPath(s.repo_path, demo) : "repo unavailable"}
-          {s.target === "prompt" && " · no issue"}
-        </div>
-      </td>
-
-      {/* When */}
-      <td className="px-4 py-3">
-        {s.timing === "recurring" ? (
-          <>
-            <div className="font-mono text-[12.5px] text-fg">{s.cron_expr}</div>
-            <div className="mt-0.5 text-[12px] text-muted">
-              {humanizeCron(s.cron_expr)} · {s.timezone}
-            </div>
-          </>
-        ) : (
-          <>
-            <div className="font-mono text-[12.5px] text-fg">{s.run_at ? formatStamp(s.run_at) : "—"}</div>
-            <div className="mt-0.5 text-[12px] text-muted">One time · {s.timezone}</div>
-          </>
-        )}
-      </td>
-
-      {/* Next run */}
-      <td className="px-4 py-3">
-        {parked ? (
-          <Badge tone="danger">error</Badge>
-        ) : off ? (
-          <Badge tone="neutral">paused</Badge>
-        ) : fired ? (
-          <Badge tone="neutral">fired</Badge>
-        ) : s.next_fire_at ? (
-          <div className="text-[12.5px] text-muted">
-            {formatStamp(s.next_fire_at)}
-            <div className="text-[11px] text-faint">{relativeFromNow(s.next_fire_at)}</div>
-          </div>
-        ) : (
-          <span className="text-faint">—</span>
-        )}
-        {pauseNote && <div className="mt-0.5 text-[11px] text-warn">{pauseNote}</div>}
-      </td>
-
-      {/* Last run */}
-      <td className="px-4 py-3">
-        {s.last_fire ? (
-          <LastRunOutcome
-            fire={s.last_fire}
-            expanded={expanded}
-            onToggle={() => setExpanded((v) => !v)}
-            panelId={`last-fire-${s.id}`}
-          />
-        ) : s.last_fired_at ? (
-          <div className="text-[12.5px] text-muted">{formatStamp(s.last_fired_at)}</div>
-        ) : (
-          <span className="text-faint">— never fired</span>
-        )}
-      </td>
-
-      {/* Options */}
-      <td className="px-4 py-3">
-        <div className="flex flex-wrap gap-1">
-          {s.wait_on_limit && <OptionChip>wait-on-limit</OptionChip>}
-          {showApprove && <OptionChip>auto-approve</OptionChip>}
-          {/* PRD #841: only an EXPLICIT per-schedule override earns a chip; null/inherit
-              is the default and shows nothing (or "defaults" below). */}
-          {s.mr_rework_enabled != null && (
-            <OptionChip>mr-rework: {s.mr_rework_enabled ? "on" : "off"}</OptionChip>
-          )}
-          {!s.wait_on_limit && !showApprove && s.mr_rework_enabled == null && (
-            <span className="text-[12px] text-faint">defaults</span>
-          )}
-        </div>
-      </td>
-
-      {/* On + actions */}
-      <td className="px-4 py-3">
-        <div className="flex items-center justify-end gap-1.5">
-          <Button
-            variant="ghost"
-            size="sm"
-            title="Run now"
-            aria-label="Run now"
-            disabled={busy}
-            onClick={onRunNow}
-          >
-            <PlayIcon />
-          </Button>
-          <Button variant="ghost" size="sm" title="Edit" aria-label="Edit" onClick={onEdit}>
-            <PencilIcon />
-          </Button>
-          <Button
-            variant="ghost"
-            size="sm"
-            title="Clone"
-            aria-label="Clone schedule"
-            disabled={busy}
-            onClick={onClone}
-          >
-            <CopyIcon />
-          </Button>
-          {/* Add another repo — replicates this config onto a new repo as a sibling,
-              promoting this standalone row into an expandable group (PRD #636 M3).
-              Disabled for issue targets (repo-relative iid, issue #638 P1c) and while
-              ANY row's op is in flight (global gate matching the group, #638 P2a).
-              aria-label stays stable so it's findable by role/name; the title carries
-              the issue-target reason when that's why it's disabled. */}
-          <Button
-            variant="ghost"
-            size="sm"
-            title={s.target === "issue" ? ISSUE_NO_MULTI_REPO : "Add another repo"}
-            // When blocked for an issue target the button is disabled, so its title
-            // tooltip is unreachable by keyboard/SR/touch — carry the reason in the
-            // accessible name instead so assistive tech announces why (issue #638 P1c).
-            aria-label={s.target === "issue" ? "Add another repo (unavailable for issue schedules)" : "Add another repo"}
-            aria-expanded={addingRepo}
-            aria-controls={`add-repo-${s.id}`}
-            disabled={addBusy || s.target === "issue"}
-            onClick={() => setAddingRepo((v) => !v)}
-          >
-            <PlusIcon />
-          </Button>
-          <Toggle
-            checked={s.enabled}
-            onChange={onToggle}
-            disabled={busy}
-            label={s.enabled ? "Disable schedule" : "Enable schedule"}
-          />
-        </div>
-      </td>
-    </tr>
-    {addingRepo && (
-      <tr className="border-t border-edge">
-        {/* id pairs with the toggle's aria-controls (a11y review fix); conditionally
-            rendered, so the reference exists only while the picker is open. */}
-        <td id={`add-repo-${s.id}`} colSpan={COLS} className="bg-raised/30 px-4 pb-4 pt-2">
-          <AddAnotherRepo
-            name={targetTitle(s)}
-            repos={repos}
-            taken={new Set([s.repo_id])}
-            busy={addBusy}
-            disabledReason={s.target === "issue" ? ISSUE_NO_MULTI_REPO : undefined}
-            onAddRepo={(repoId) => {
-              onAddRepo(repoId);
-              setAddingRepo(false);
-            }}
-          />
-        </td>
-      </tr>
-    )}
-    {s.last_fire && expanded && (
-      <tr className="border-t border-edge">
-        {/* The id pairs with the disclosure's aria-controls (review-wave fix 4).
-            Conditionally rendered, so the reference only exists while expanded —
-            which is when aria-controls has anything to say. */}
-        <td id={`last-fire-${s.id}`} colSpan={COLS} className="bg-raised/30 px-4 pb-4 pt-0">
-          <LastFireDetail s={s} fire={s.last_fire} />
-        </td>
-      </tr>
-    )}
-    </>
-  );
-}
-
-// A My-schedules render unit: a standalone row, or an expandable sibling group.
-type MineRow =
-  | { kind: "single"; schedule: Schedule }
-  | { kind: "group"; groupId: string; members: Schedule[] };
-
-// groupMine groups the owner's rows by sibling_group_id per PRD #636 Decision 3, WITHOUT
-// ever collapsing the null-group rows together (the naive groupBy(sibling_group_id) bug
-// that would render every standalone schedule as one bogus group):
-//   - sibling_group_id === null           → always a standalone row;
-//   - a non-null id with exactly ONE live → also standalone (never a one-child group);
-//     the load-bearing view collapse for delete / partial-failure / repo-disconnect;
-//   - a non-null id with ≥2 live members   → one expandable group, emitted at the
-//     position of its first member so input order is preserved.
-function groupMine(mine: Schedule[]): MineRow[] {
-  const buckets = new Map<string, Schedule[]>();
-  for (const s of mine) {
-    if (!s.sibling_group_id) continue;
-    const b = buckets.get(s.sibling_group_id);
-    if (b) b.push(s);
-    else buckets.set(s.sibling_group_id, [s]);
-  }
-  const emitted = new Set<string>();
-  const rows: MineRow[] = [];
-  for (const s of mine) {
-    const gid = s.sibling_group_id;
-    if (!gid) {
-      rows.push({ kind: "single", schedule: s });
-      continue;
-    }
-    const members = buckets.get(gid);
-    if (!members || members.length < 2) {
-      // A non-null id with a single live member is a standalone row, never a group.
-      rows.push({ kind: "single", schedule: s });
-      continue;
-    }
-    if (emitted.has(gid)) continue;
-    emitted.add(gid);
-    rows.push({ kind: "group", groupId: gid, members });
-  }
-  return rows;
-}
-
-// MyScheduleGroup renders ≥2 sibling rows sharing a sibling_group_id as one expandable
-// summary (name + repo-count + toggle, via the neutral ScheduleGroupRow) over per-repo
-// sub-rows. Siblings are independent (Decision 1): every sub-row control targets only
-// its own row.
-function MyScheduleGroup({
-  groupId,
-  members,
-  repos,
-  pauseNote,
-  busyId,
-  expanded,
-  onToggleExpand,
-  onToggle,
-  onRunNow,
-  onEdit,
-  onRemove,
-  onAddRepo,
-}: {
-  groupId: string;
-  members: Schedule[];
-  repos: Repo[];
-  // The "paused until <stamp>" sub-row line while pause-all is active; null when not paused.
-  pauseNote: string | null;
-  busyId: string;
-  expanded: boolean;
-  onToggleExpand: () => void;
-  onToggle: (s: Schedule) => void;
-  onRunNow: (s: Schedule) => void;
-  onEdit: (s: Schedule) => void;
-  onRemove: (s: Schedule) => void;
-  onAddRepo: (source: Schedule, repoId: string) => void;
-}) {
-  // The siblings share a job config (copied at add-repo time), so the summary name is the
-  // head member's target title; per-repo cadence/state lives in the sub-rows.
-  const head = members[0];
-  const name = targetTitle(head);
-  const taken = new Set(members.map((m) => m.repo_id));
-  return (
-    <ScheduleGroupRow
-      name={name}
-      cols={COLS}
-      expanded={expanded}
-      onToggleExpand={onToggleExpand}
-      disclosureId={`sibling-repos-${groupId}`}
-      expandLabelName={name}
-      repoCount={members.length}
-    >
-      {/* PRD #636 M3 (line ~106): the custom group summary carries name + repo-count +
-          expand toggle ONLY — no type pill. The type is already spelled out in the name
-          (targetTitle prefixes "Prompt:" / "Sweep ·"), and siblings may have diverged, so
-          per-repo target/cadence/state live in the sub-rows below, not the summary. */}
-      {members.map((s) => (
-        <MyScheduleSubRow
-          key={s.id}
-          s={s}
-          busy={busyId === s.id}
-          pauseNote={pauseNote}
-          onToggle={() => onToggle(s)}
-          onRunNow={() => onRunNow(s)}
-          onEdit={() => onEdit(s)}
-          onRemove={() => onRemove(s)}
-        />
-      ))}
-      {/* Disabled for an issue-target group (repo-relative iid, issue #638 P1c). In
-          practice such a group can only exist from before this fix, but the control
-          must still be gated. */}
-      <AddAnotherRepo
-        name={name}
-        repos={repos}
-        taken={taken}
-        busy={busyId !== ""}
-        disabledReason={head.target === "issue" ? ISSUE_NO_MULTI_REPO : undefined}
-        onAddRepo={(repoId) => onAddRepo(head, repoId)}
-      />
-    </ScheduleGroupRow>
-  );
-}
-
-// MyScheduleSubRow is one per-repo sibling line under a group summary: the neutral
-// ScheduleSubRow shell plus this tab's editable per-row controls (run-now, edit,
-// remove, pause/resume). No lock, no reset — this is a user-owned row.
-function MyScheduleSubRow({
-  s,
-  busy,
-  pauseNote,
-  onToggle,
-  onRunNow,
-  onEdit,
-  onRemove,
-}: {
-  s: Schedule;
-  busy: boolean;
-  pauseNote: string | null;
-  onToggle: () => void;
-  onRunNow: () => void;
-  onEdit: () => void;
-  onRemove: () => void;
-}) {
-  const demo = useDemoMode();
-  const repoLabel = s.repo_path ? maskRepoPath(s.repo_path, demo) : "repo unavailable";
-  const nextFire = s.next_fires?.[0] ?? s.next_fire_at;
-  const [expanded, setExpanded] = useState(false);
-  const panelId = `last-fire-${s.id}`;
-  return (
-    <ScheduleSubRow
-      repoLabel={repoLabel}
-      enabled={s.enabled}
-      cronExpr={s.cron_expr}
-      nextFire={nextFire}
-      pausedNote={pauseNote}
-      panelId={panelId}
-      // Per-repo last-run parity with the standalone ScheduleRow (issue #690): the same
-      // three-way fallback (outcome badge / bare stamp / never-fired), and the expandable
-      // detail rendered below the flex row only while expanded.
-      lastRun={
-        s.last_fire ? (
-          <LastRunOutcome
-            fire={s.last_fire}
-            expanded={expanded}
-            onToggle={() => setExpanded((v) => !v)}
-            panelId={panelId}
-          />
-        ) : s.last_fired_at ? (
-          <div className="text-[12.5px] text-muted">{formatStamp(s.last_fired_at)}</div>
-        ) : (
-          <span className="text-faint">— never fired</span>
-        )
-      }
-      lastRunDetail={s.last_fire && expanded ? <LastFireDetail s={s} fire={s.last_fire} /> : null}
-      // Per-repo target pill: the group summary no longer carries the type (PRD #636 M3),
-      // and a sibling can diverge (it is an independently editable row), so surface each
-      // row's own target here rather than dropping it silently.
-      badges={
-        <>
-          {s.target === "sweep" && (
-            <Badge tone="info" dot>
-              sweep
-            </Badge>
-          )}
-          {s.target === "prompt" && (
-            <Badge tone="ok" dot>
-              prompt
-            </Badge>
-          )}
-          {/* PRD #929 M1: resolved output mode for a prompt schedule (null = job default). */}
-          {s.target === "prompt" && s.output_mode && (
-            <Badge tone="neutral">{s.output_mode}</Badge>
-          )}
-          {s.target === "self_improve" && (
-            <Badge tone="ok" dot>
-              self-improve
-            </Badge>
-          )}
-          {s.target === "issue" && (
-            <Badge tone="brand" dot>
-              issue
-            </Badge>
-          )}
-        </>
-      }
-      actions={
-        <>
-          <Button variant="ghost" size="sm" title="Run now" aria-label={`Run now on ${repoLabel}`} disabled={busy} onClick={onRunNow}>
-            <PlayIcon />
-          </Button>
-          <Button variant="ghost" size="sm" title="Edit" aria-label={`Edit on ${repoLabel}`} onClick={onEdit}>
-            <PencilIcon />
-          </Button>
-          <Button variant="ghost" size="sm" title="Remove" aria-label={`Remove on ${repoLabel}`} disabled={busy} onClick={onRemove}>
-            <TrashIcon />
-          </Button>
-          <Toggle
-            checked={s.enabled}
-            onChange={onToggle}
-            disabled={busy}
-            label={s.enabled ? `Pause on ${repoLabel}` : `Resume on ${repoLabel}`}
-          />
-        </>
-      }
-    />
-  );
-}
-
-function OptionChip({ children }: { children: React.ReactNode }) {
-  return (
-    <span className="inline-flex items-center rounded-md border border-edge bg-raised px-1.5 py-0.5 text-[11px] text-muted">
-      {children}
-    </span>
-  );
 }
 
 function Legend() {
@@ -1127,26 +987,10 @@ function Legend() {
         </Badge>
         issue-less run, opens an MR
       </span>
+      <span className="flex items-center gap-1.5">
+        <span className="text-brand">from catalog</span>
+        a shipped job; its prompt and labels are sealed
+      </span>
     </div>
   );
-}
-
-// targetTitle renders a schedule's human target line for the first column.
-function targetTitle(s: Schedule): string {
-  switch (s.target) {
-    case "issue":
-      return s.issue_iid != null ? `#${s.issue_iid}` : "Pinned issue";
-    case "sweep":
-      return s.labels && s.labels.length > 0
-        ? `Sweep · label ${s.labels.join(", ")}`
-        : "Sweep eligible issues";
-    case "prompt":
-      return s.prompt ? `Prompt: ${truncate(s.prompt, 42)}` : "Prompt";
-    case "self_improve":
-      return "Self-improvement";
-  }
-}
-
-function truncate(s: string, n: number): string {
-  return s.length > n ? `${s.slice(0, n - 1)}…` : s;
 }

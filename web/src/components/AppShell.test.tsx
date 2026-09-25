@@ -17,7 +17,6 @@ vi.mock("../lib/api", () => ({
   api: {
     listRepos: vi.fn(),
     listConnections: vi.fn(),
-    unreadNotificationCount: vi.fn(),
     // The Judge nav badge (PRD #98) polls /me/judge/stats on mount; default to an empty
     // backlog so the badge is absent unless a test overrides it.
     // PRD #113 M6: AppShell now owns a workers-attention poll too. Zero by default so
@@ -194,7 +193,6 @@ beforeEach(() => {
   });
   mockApi.listRepos.mockResolvedValue({ repos });
   mockApi.listConnections.mockResolvedValue({ connections: [gitlabConnection] });
-  mockApi.unreadNotificationCount.mockResolvedValue({ unread: 0 });
 });
 
 const emptyTriage = { total: 0, todo: 0, filed: 0, done: 0, dismissed: 0, false_positives: 0 };
@@ -394,11 +392,11 @@ describe("Workers nav alert badge (PRD #113 M6)", () => {
   it("badges the Workers nav item with the attention count, alert-toned", async () => {
     mockApi.workerUpgradeSummary.mockResolvedValue({ attention: 2, target_release: "0.6.0" });
     renderShell("/dashboard");
-    // The aria-label says what the number MEANS. "2 unread" for a worker count would be
+    // The aria-label says what the number MEANS. "2 pending" for a worker count would be
     // wrong in a way a screen-reader user could not recover from.
     const badge = await screen.findByLabelText("2 needing attention");
     expect(badge.textContent).toBe("2");
-    // Alert tone, not the brand pill the Judge/unread badges use (Decision 2): red reads
+    // Alert tone, not the brand pill the Judge/Runs badges use (Decision 2): red reads
     // "go look", grey reads "there is a queue".
     expect(badge.className).toContain("bg-danger");
   });
@@ -429,7 +427,10 @@ describe("Workers nav alert badge (PRD #113 M6)", () => {
     mockApi.getJudgeStats.mockResolvedValue({ ...emptyTriage, total: 4, todo: 4 });
     renderShell("/dashboard");
     const workers = await screen.findByLabelText("1 needing attention");
-    const judge = await screen.findByLabelText("4 unread");
+    // The Judge badge names its own noun (the page's To-triage tab), never the retired
+    // inbox's "unread" (PRD #1650).
+    const judge = await screen.findByLabelText("4 to triage");
+    expect(screen.queryByLabelText("4 unread")).toBeNull();
     expect(workers.className).toContain("bg-danger");
     expect(judge.className).not.toContain("bg-danger");
   });
@@ -438,9 +439,9 @@ describe("Workers nav alert badge (PRD #113 M6)", () => {
 // PRD #239: the Runs nav count badge. Brand "count" tone (Decision 2), not the Workers
 // alert red — in-progress runs are healthy activity, a queue to get to.
 describe("Runs nav count badge (PRD #239)", () => {
-  // The accessible noun is "in progress" (badgeLabel), NOT the count tone's default
-  // "unread" — a run is never unread. That also makes "N in progress" a label unique to
-  // this badge; assertions are still scoped to the Runs link with within() for robustness
+  // The accessible noun is "in progress" (badgeLabel, which every badge names
+  // explicitly). That also makes "N in progress" a label unique to this badge;
+  // assertions are still scoped to the Runs link with within() for robustness
   // (belt-and-braces against a future badge reusing the noun, and against a prior test's
   // leaked count since clearAllMocks keeps mock implementations).
   it("badges the Runs nav item with the in-progress count, brand-toned", async () => {
@@ -494,6 +495,83 @@ describe("Runs nav count badge (PRD #239)", () => {
     // aria-hidden, so the sr-only count is the only carrier left. Brand tone → "N in progress".
     fireEvent.click(screen.getByRole("button", { name: /collapse sidebar/i }));
     expect(await within(runs).findByText("3 in progress")).toBeTruthy();
+  });
+});
+
+// PRD #1650 D6: a parked schedule (status "error") has a home on the Schedules nav item.
+// When any of the caller's schedules is parked the badge shows the PARKED count in the
+// alert tone; otherwise it keeps the enabled count in the brand tone. Both come from the
+// one listSchedules response the shell already polls.
+describe("Schedules nav parked count (PRD #1650 D6)", () => {
+  // Only the fields the badge derives from; the rest of Schedule is irrelevant here.
+  const sched = (enabled: boolean, status: "active" | "fired" | "error") =>
+    ({ enabled, status }) as unknown as Awaited<ReturnType<typeof api.listSchedules>>[number];
+
+  // clearAllMocks keeps implementations, so restore the empty default after each case
+  // rather than leaking a parked list into the suites below.
+  afterEach(() => {
+    mockApi.listSchedules.mockResolvedValue([]);
+  });
+
+  it("shows the parked count in the alert tone, not the enabled count", async () => {
+    mockApi.listSchedules.mockResolvedValue([
+      sched(true, "error"),
+      sched(true, "error"),
+      sched(true, "active"),
+    ]);
+    renderShell("/dashboard");
+    const link = await screen.findByRole("link", { name: /Schedules/ });
+    const badge = await within(link).findByLabelText("2 parked schedules");
+    expect(badge.textContent).toBe("2");
+    expect(badge.className).toContain("bg-danger");
+    // Positive above, so this negative is not vacuous: the enabled count gave way.
+    expect(within(link).queryByLabelText(/enabled/)).toBeNull();
+  });
+
+  it("names a single parked schedule in the singular", async () => {
+    mockApi.listSchedules.mockResolvedValue([sched(false, "error"), sched(true, "active")]);
+    renderShell("/dashboard");
+    const link = await screen.findByRole("link", { name: /Schedules/ });
+    const badge = await within(link).findByLabelText("1 parked schedule");
+    expect(badge.className).toContain("bg-danger");
+  });
+
+  it("falls back to the enabled count in the brand tone when none is parked", async () => {
+    mockApi.listSchedules.mockResolvedValue([
+      sched(true, "active"),
+      sched(true, "fired"),
+      sched(false, "active"),
+    ]);
+    renderShell("/dashboard");
+    const link = await screen.findByRole("link", { name: /Schedules/ });
+    const badge = await within(link).findByLabelText("2 enabled");
+    expect(badge.className).toContain("bg-brand");
+    expect(badge.className).not.toContain("bg-danger");
+    expect(within(link).queryByLabelText(/parked/)).toBeNull();
+  });
+
+  it("keeps the parked count and its alert dot in the collapsed rail", async () => {
+    mockApi.listSchedules.mockResolvedValue([sched(true, "error"), sched(true, "error")]);
+    renderShell("/dashboard");
+    // Hold the node: collapsed, its accessible name is the sr-only count, not "Schedules".
+    const link = await screen.findByRole("link", { name: /Schedules/ });
+    await within(link).findByLabelText("2 parked schedules");
+    fireEvent.click(screen.getByRole("button", { name: /collapse sidebar/i }));
+    expect(await within(link).findByText("2 parked schedules")).toBeTruthy();
+    // The rail dot carries the tone: red, not the brand dot an enabled count gets.
+    const dot = link.querySelector('[aria-hidden="true"].rounded-full');
+    expect(dot?.className).toContain("bg-danger");
+  });
+
+  it("shows the parked count on the mobile drawer's Schedules item as well", async () => {
+    mockApi.listSchedules.mockResolvedValue([sched(true, "error")]);
+    renderShell("/dashboard");
+    await screen.findByLabelText("1 parked schedule");
+    fireEvent.click(screen.getByLabelText("Open navigation"));
+    const drawer = screen.getByLabelText("Close navigation").parentElement!;
+    const mobileLink = within(drawer).getByRole("link", { name: /Schedules/ });
+    const badge = await within(mobileLink).findByLabelText("1 parked schedule");
+    expect(badge.className).toContain("bg-danger");
   });
 });
 

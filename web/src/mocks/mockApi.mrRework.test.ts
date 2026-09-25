@@ -1,20 +1,14 @@
 // @vitest-environment jsdom
 import { afterEach, describe, it, expect, vi } from "vitest";
-import {
-  mockMrReworkFixture,
-  mockNotifications,
-  mockRuns,
-  type MrReworkBranch,
-} from "./data";
+import { mockMrReworkFixture, mockRuns, type MrReworkBranch } from "./data";
 
 // PRD #700 M6: completeness + parity guard for the MR-review-watcher fixture.
 //
 // The fixture (mockMrReworkFixture) enumerates every branch the PRD names. This
 // test asserts the fixture CONTAINS ALL of them and that each is backed by real
-// mock data, so dropping a branch — or letting its backing run/notification/setting
-// rot — fails here rather than silently thinning the differential the web + mock
-// parity work depends on. Derived (not snapshotted) so the fixture can still gain
-// rows, mirroring mockApi.notifications.test.ts's rationale.
+// mock data, so dropping a branch — or letting its backing run/setting rot — fails
+// here rather than silently thinning the differential the web + mock parity work
+// depends on. Derived (not snapshotted) so the fixture can still gain rows.
 
 function installStorage(initial: Record<string, string> = {}): void {
   const m = new Map<string, string>(Object.entries(initial));
@@ -72,12 +66,17 @@ describe("MR-review-watcher differential fixture (PRD #700 M6)", () => {
     expect(run?.mr_state).toBe("opened");
   });
 
-  it("the capped branch is backed by a halt inbox notification (not a new endpoint)", () => {
+  it("the capped branch is backed by a run the run view shows as stopped (PRD #1202, not a new endpoint)", () => {
     const id = mockMrReworkFixture.find((b) => b.branch === "capped")?.fixtureId;
-    const ntf = mockNotifications.find((n) => n.id === id);
-    expect(ntf, `mockNotifications is missing the capped halt row "${id}"`).toBeTruthy();
-    // Deep-links to the reworking run so the flagged card is reachable.
-    expect(ntf?.run_id).toBe("run-mr-rework");
+    const run = mockRuns.find((r) => r.id === id);
+    expect(run, `mockRuns is missing the capped run "${id}"`).toBeTruthy();
+    // RunView renders "Automatic rework: N of M cycles used · stopped" exactly when the
+    // owner-only guard readings are populated and cycles >= cap.
+    expect(run?.mr_rework_auto_cycles).not.toBeNull();
+    expect(run?.mr_rework_auto_cap).not.toBeNull();
+    expect(run!.mr_rework_auto_cycles!).toBeGreaterThanOrEqual(run!.mr_rework_auto_cap!);
+    // The MR is still open, so the past-cap "Rework now" affordance is the way forward.
+    expect(run?.mr_state).toBe("opened");
   });
 });
 

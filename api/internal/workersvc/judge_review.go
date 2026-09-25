@@ -64,7 +64,7 @@ type ReviewRecommendation struct {
 // ReviewResult identifies the persisted review after a PostReview — the reviewed
 // run's owner and the review row id. The handler uses it to fire the "review ready"
 // notification AFTER the review is durably persisted (M4, persist-first): the deep
-// link is built from the target run id, the inbox row is anchored to both ids, and
+// link is built from the target run id, the event-log row is anchored to both ids, and
 // the notification is delivered only to the run's own owner (never cross-user).
 type ReviewResult struct {
 	OwnerID  uuid.UUID

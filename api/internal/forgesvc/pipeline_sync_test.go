@@ -14,20 +14,8 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
-	"github.com/vtmocanu/uzi/api/internal/notifysvc"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
-
-// fakeLandedNotifier captures the ci_autofix_landed inbox rows the reset-on-green
-// path emits (PRD #71 M6).
-type fakeLandedNotifier struct {
-	calls []notifysvc.Notification
-}
-
-func (n *fakeLandedNotifier) Notify(_ context.Context, note notifysvc.Notification) (store.Notification, error) {
-	n.calls = append(n.calls, note)
-	return store.Notification{ID: uuid.New()}, nil
-}
 
 // runRef builds a watched-run-ref row: a branch, optionally with an MR iid.
 func runRef(branch string, mrIID int64) store.ListWatchedRunRefsForRepoRow {
@@ -228,80 +216,29 @@ func TestSyncPipelinesVerifiesFixBranch(t *testing.T) {
 	}
 }
 
-// TestSyncPipelinesNotifiesAutofixLanded: a green post-fix pipeline on a ref whose
+// TestSyncPipelinesAutofixLandedNoNotification: a green post-fix pipeline on a ref whose
 // ci-autofix ledger existed (DeleteCIAutofixAttempt returns n>0) AND that verified a
-// ci_fix run lands one inbox-only ci_autofix_landed row for the run's owner.
-func TestSyncPipelinesNotifiesAutofixLanded(t *testing.T) {
-	owner := uuid.New()
-	fixRun := store.Run{ID: uuid.New(), UserID: owner}
+// ci_fix run resets the ledger and stamps the run verified. It lands NO notification:
+// ci_autofix_landed is a status-only kind the sync no longer produces (PRD #1650 D2),
+// and the Service has no notifier seam at all; the verified run is the signal.
+func TestSyncPipelinesAutofixLandedNoNotification(t *testing.T) {
+	fixRun := store.Run{ID: uuid.New(), UserID: uuid.New()}
 	st := &fakeStore{
 		watchedRefs:       []store.ListWatchedRunRefsForRepoRow{runRef("agent/issue-7", 77)},
 		stampTarget:       fixRun,
 		autofixDeleteRows: 1, // the ref HAD an auto-fix ledger
 	}
 	svc := newTestService(st)
-	note := &fakeLandedNotifier{}
-	svc.SetNotifier(note)
 	f := &fakeForge{pipelineByMR: map[int64]forge.Pipeline{77: pipelineAt(4300, "success")}}
 
 	if err := svc.SyncPipelines(context.Background(), uuid.New(), 7, f, syncOpts(false)); err != nil {
 		t.Fatalf("SyncPipelines: %v", err)
 	}
-	if len(note.calls) != 1 {
-		t.Fatalf("expected exactly one landed notification, got %d", len(note.calls))
+	if len(st.stamps) != 1 || st.stamps[0].ID != fixRun.ID || st.stamps[0].FixVerdict.String != "verified" {
+		t.Fatalf("expected the fix run stamped verified, got %+v", st.stamps)
 	}
-	c := note.calls[0]
-	if c.Kind != "ci_autofix_landed" || c.UserID != owner {
-		t.Fatalf("landed notification kind/owner wrong: %+v", c)
-	}
-	if c.RunID == nil || *c.RunID != fixRun.ID {
-		t.Fatalf("landed notification must anchor to the fix run, got %+v", c.RunID)
-	}
-	if c.Slack != nil {
-		t.Fatalf("landed notification must be inbox-only (Slack nil)")
-	}
-}
-
-// A green verified fix on a ref with NO ledger (n==0) is NOT a landed auto-fix — a
-// human's manual Fix CI does not notify through this path.
-func TestSyncPipelinesNoLandedNotifyWithoutLedger(t *testing.T) {
-	st := &fakeStore{
-		watchedRefs:       []store.ListWatchedRunRefsForRepoRow{runRef("agent/issue-7", 77)},
-		stampTarget:       store.Run{ID: uuid.New(), UserID: uuid.New()},
-		autofixDeleteRows: 0, // no auto-fix ledger for this ref
-	}
-	svc := newTestService(st)
-	note := &fakeLandedNotifier{}
-	svc.SetNotifier(note)
-	f := &fakeForge{pipelineByMR: map[int64]forge.Pipeline{77: pipelineAt(4300, "success")}}
-
-	if err := svc.SyncPipelines(context.Background(), uuid.New(), 7, f, syncOpts(false)); err != nil {
-		t.Fatalf("SyncPipelines: %v", err)
-	}
-	if len(note.calls) != 0 {
-		t.Fatalf("no ledger row → no landed notification, got %+v", note.calls)
-	}
-}
-
-// A RED post-fix pipeline stamps fix_failed and never notifies "landed", even if a
-// ledger row happened to be cleared by an unrelated green earlier — here the pipeline
-// itself is red so reset-on-green does not even run.
-func TestSyncPipelinesNoLandedNotifyOnRed(t *testing.T) {
-	st := &fakeStore{
-		watchedRefs:       []store.ListWatchedRunRefsForRepoRow{runRef("agent/issue-7", 77)},
-		stampTarget:       store.Run{ID: uuid.New(), UserID: uuid.New()},
-		autofixDeleteRows: 1,
-	}
-	svc := newTestService(st)
-	note := &fakeLandedNotifier{}
-	svc.SetNotifier(note)
-	f := &fakeForge{pipelineByMR: map[int64]forge.Pipeline{77: pipelineAt(4300, "failed")}}
-
-	if err := svc.SyncPipelines(context.Background(), uuid.New(), 7, f, syncOpts(false)); err != nil {
-		t.Fatalf("SyncPipelines: %v", err)
-	}
-	if len(note.calls) != 0 {
-		t.Fatalf("a red fix pipeline must not notify landed, got %+v", note.calls)
+	if len(st.autofixDeletes) != 1 || st.autofixDeletes[0].Ref != "agent/issue-7" {
+		t.Fatalf("expected the ledger reset on green, got %+v", st.autofixDeletes)
 	}
 }
 

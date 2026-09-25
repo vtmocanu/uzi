@@ -70,8 +70,6 @@ import type {
   Memory,
   MyCodexRateLimits,
   MyRateLimitsResponse,
-  Notification,
-  NotificationList,
   OverrideRequestState,
   PendingJudge,
   PrivilegeReport,
@@ -1689,37 +1687,11 @@ const realApi = {
   adminListBlockedRepos: () =>
     request<AdminBlockedRepos>("GET", "/admin/blocked-repos"),
 
-  // Notifications inbox (PRD #46 M2). listNotifications is the caller's own inbox;
-  // { all: true } asks for every user's (admin only — a non-admin gets 403). The
-  // envelope's `unread` is always the caller's own count (the bell badge).
-  // unreadNotificationCount is the bell's lightweight poll (no rows).
-  listNotifications: (params?: {
-    all?: boolean;
-    limit?: number;
-    offset?: number;
-  }) => {
-    const q = new URLSearchParams();
-    if (params?.all) q.set("all", "1");
-    if (params?.limit != null) q.set("limit", String(params.limit));
-    if (params?.offset != null) q.set("offset", String(params.offset));
-    const qs = q.toString();
-    return request<NotificationList>(
-      "GET",
-      qs ? `/notifications?${qs}` : "/notifications",
-    );
-  },
-  unreadNotificationCount: () =>
-    request<{ unread: number }>("GET", "/notifications/unread_count"),
   // Runs-in-progress count for the Runs nav badge (PRD #239). Owner-scoped, one
   // indexed count(*): the caller's non-terminal runs, kind NOT IN ('chat','judge')
   // — the same scope predicate the /runs page's ListRunsForUser uses (Decision 4).
   runsInProgressCount: () =>
     request<{ count: number }>("GET", "/me/runs/in-progress-count"),
-  markNotificationRead: (id: string) =>
-    request<{ notification: Notification }>(
-      "POST",
-      `/notifications/${id}/read`,
-    ),
 
   // ── CLI tokens (PRD #64) — cookie-only CRUD ────────────────────────────────
   // A CLI token can never reach these endpoints (deliberate: a stolen token would

@@ -4,7 +4,7 @@
 // the target repo is warned about (advisory, never blocking), with a one-click "Create
 // label" that creates it on the forge and clears the warning.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { SweepLabelWarn } from "./SweepLabelWarn";
 import { api } from "../lib/api";
 
@@ -91,6 +91,72 @@ describe("SweepLabelWarn", () => {
     render(<SweepLabelWarn repoId="repo-uzi" labels={[]} />);
     // Nothing to check: the endpoint is never called and nothing renders.
     await new Promise((r) => setTimeout(r, 350));
+    expect(mockApi.checkRepoLabels).not.toHaveBeenCalled();
+  });
+});
+
+// PRD #1645 D7: the enable dialog holds its Enable button on this report, so "checking"
+// must arrive before the debounce (no clickable window) and "done" only for the CURRENT
+// check. Fake timers make the debounce window observable.
+describe("SweepLabelWarn — onCheckStateChange", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("reports checking on mount, before the debounce elapses or any forge call, then done when the check settles", async () => {
+    vi.useFakeTimers();
+    let settle: (v: { missing: string[] }) => void = () => {};
+    mockApi.checkRepoLabels.mockReturnValue(new Promise((r) => (settle = r)));
+    const onState = vi.fn();
+    render(<SweepLabelWarn repoId="repo-a" labels={["bug"]} onCheckStateChange={onState} />);
+
+    // Mounted: "checking" already reported, still inside the 300 ms debounce.
+    expect(onState.mock.calls).toEqual([["checking"]]);
+    expect(mockApi.checkRepoLabels).not.toHaveBeenCalled();
+
+    await act(async () => vi.advanceTimersByTime(300));
+    expect(mockApi.checkRepoLabels).toHaveBeenCalledTimes(1);
+    expect(onState.mock.calls).toEqual([["checking"]]); // in flight: not done yet
+
+    await act(async () => settle({ missing: ["bug"] }));
+    expect(onState.mock.calls).toEqual([["checking"], ["done"]]);
+  });
+
+  it("a failed check still reports done (advisory)", async () => {
+    vi.useFakeTimers();
+    mockApi.checkRepoLabels.mockRejectedValue(new Error("forge down"));
+    const onState = vi.fn();
+    render(<SweepLabelWarn repoId="repo-a" labels={["bug"]} onCheckStateChange={onState} />);
+    await act(async () => vi.advanceTimersByTime(300));
+    expect(onState.mock.calls).toEqual([["checking"], ["done"]]);
+  });
+
+  it("a superseded check's settlement is ignored: done follows only the current check", async () => {
+    vi.useFakeTimers();
+    const settles: ((v: { missing: string[] }) => void)[] = [];
+    mockApi.checkRepoLabels.mockImplementation(() => new Promise((r) => settles.push(r)));
+    const onState = vi.fn();
+    const { rerender } = render(<SweepLabelWarn repoId="repo-a" labels={["bug"]} onCheckStateChange={onState} />);
+    await act(async () => vi.advanceTimersByTime(300)); // check A in flight
+
+    // The repo changes: "checking" is reported again at once, before check B is scheduled.
+    rerender(<SweepLabelWarn repoId="repo-b" labels={["bug"]} onCheckStateChange={onState} />);
+    expect(onState.mock.calls).toEqual([["checking"], ["checking"]]);
+
+    // A settles late: superseded, so no "done".
+    await act(async () => settles[0]({ missing: [] }));
+    expect(onState.mock.calls).toEqual([["checking"], ["checking"]]);
+
+    await act(async () => vi.advanceTimersByTime(300)); // check B starts
+    expect(mockApi.checkRepoLabels).toHaveBeenLastCalledWith("repo-b", ["bug"]);
+    await act(async () => settles[1]({ missing: [] }));
+    expect(onState.mock.calls).toEqual([["checking"], ["checking"], ["done"]]);
+  });
+
+  it("nothing to check reports done at once", () => {
+    const onState = vi.fn();
+    render(<SweepLabelWarn repoId="repo-a" labels={[" "]} onCheckStateChange={onState} />);
+    expect(onState.mock.calls).toEqual([["done"]]);
     expect(mockApi.checkRepoLabels).not.toHaveBeenCalled();
   });
 });
