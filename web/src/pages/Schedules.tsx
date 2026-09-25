@@ -78,7 +78,14 @@ export function Schedules() {
   const tabParam = searchParams.get("tab");
   const [landing, setLanding] = useState<Tab | null>(null);
   const tab: Tab = isTab(tabParam) ? tabParam : (landing ?? "schedules");
-  const setTab = (t: Tab) =>
+  // The Job catalog card whose enable dialog is open (D7), at most one; page-owned so a
+  // default row's "Enable on another repo" can open it from the Schedules tab (D4).
+  // Leaving the catalog tab by any path (a click, the tablist's arrow keys, a link)
+  // closes it, so coming back never re-opens a dialog whose open effect would take focus
+  // from the tab the user just moved to.
+  const [enableDialogSlug, setEnableDialogSlug] = useState<string | null>(null);
+  const setTab = (t: Tab) => {
+    if (t !== "catalog") setEnableDialogSlug(null);
     setSearchParams(
       (prev) => {
         const next = new URLSearchParams(prev);
@@ -87,6 +94,7 @@ export function Schedules() {
       },
       { replace: true },
     );
+  };
   const [schedules, setSchedules] = useState<Schedule[] | null>(null);
   const [catalog, setCatalog] = useState<ScheduleCatalog | null>(null);
   const [repos, setRepos] = useState<Repo[]>([]);
@@ -96,9 +104,6 @@ export function Schedules() {
   const [noticeState, setNoticeState] = useState<{ text: string; jobSlug: string | null }>({ text: "", jobSlug: null });
   const notice = noticeState.text;
   const setNotice = (text: string, jobSlug: string | null = null) => setNoticeState({ text, jobSlug });
-  // The Job catalog card whose enable dialog is open (D7), at most one; page-owned so a
-  // default row's "Enable on another repo" can open it from the Schedules tab (D4).
-  const [enableDialogSlug, setEnableDialogSlug] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [editing, setEditing] = useState<Schedule | null>(null);
   const [busyId, setBusyId] = useState<string>("");
@@ -392,7 +397,6 @@ export function Schedules() {
   // A card's "Enabled on N repos" link, and the enable notice's link (D7): the Schedules
   // tab filtered to that job, every other dimension cleared.
   const showJobInSchedules = (slug: string) => {
-    setEnableDialogSlug(null);
     setTab("schedules");
     applyFilter({ ...NO_FILTER, jobSlug: slug });
   };

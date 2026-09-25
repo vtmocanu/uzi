@@ -8,13 +8,14 @@
 // button enables exactly the newly checked repos.
 //
 // The pre-enable label check (D7, binding): for a sweep entry with selector labels, a
-// SweepLabelWarn renders for every newly checked repo and reports its check state. Checking
-// a repo marks it "checking" in the SAME state update that selects it, so the very first
-// render after the click already holds Enable ("Checking labels…"); the warn's own report
-// then keeps it held until the check settles. The hold also reads any state other than
-// "done" as checking, so a selected repo with no recorded state is held too: either half
-// alone keeps Enable disabled (EnableJobDialog.test.tsx stubs the warn to pin this). Once every selected repo is "done" Enable is
-// offered whatever the result: the guardrail is advisory, never blocking.
+// SweepLabelWarn renders for every newly checked repo and reports its check state. Enable
+// is held ("Checking labels…") until every newly selected repo reports "done", by two
+// redundant layers: the checkbox handler records the repo as "checking" in the SAME state
+// update that selects it, and the hold reads any state other than "done", none recorded
+// included, as checking. EnableJobDialog.test.tsx stubs the warn silent and pins that the
+// dialog holds Enable without the warn's help; it does not tell the two layers apart.
+// Once every selected repo is "done" Enable is offered whatever the result: the guardrail
+// is advisory, never blocking.
 //
 // Partial failure: the dialog stays open, repos that succeeded lock as "enabled", failed
 // ones stay checked with their error inline, and Enable retries only those.
@@ -194,6 +195,12 @@ function EnablePanel({
   const [justEnabled, setJustEnabled] = useState<string[]>([]);
   const [query, setQuery] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  // Set synchronously on submit: a second click delivered before the re-render that
+  // disables Enable would still see the old `canEnable` and fan out twice.
+  const inFlight = useRef(false);
+  // After a partial failure: the failed repos, whose first listed checkbox takes focus once
+  // the re-render has enabled it again (Enable, which held focus, stays disabled).
+  const [focusFailed, setFocusFailed] = useState<string[] | null>(null);
   const alive = useRef(true);
   useEffect(
     () => () => {
@@ -202,10 +209,32 @@ function EnablePanel({
     [],
   );
 
+  // A selected repo that dropped out of `repos` (a reload after it was disconnected) leaves
+  // the selection: it can neither count in "Enable N" nor hold Enable on a check whose
+  // warn no longer renders. Derived here for the render that first sees the new list, and
+  // pruned from state below so the repo does not come back selected if it reappears.
+  const present = new Set(repos.map((r) => r.id));
+  useEffect(() => {
+    setPick((p) =>
+      p.selected.every((id) => present.has(id))
+        ? p
+        : {
+            selected: p.selected.filter((id) => present.has(id)),
+            checks: Object.fromEntries(Object.entries(p.checks).filter(([id]) => present.has(id))),
+          },
+    );
+    setErrors((e) =>
+      Object.keys(e).every((id) => present.has(id))
+        ? e
+        : Object.fromEntries(Object.entries(e).filter(([id]) => present.has(id))),
+    );
+    // `present` is derived from `repos`; re-running on the list is the intent.
+  }, [repos]); // eslint-disable-line react-hooks/exhaustive-deps
+
   const labels = entry.target === "sweep" ? (entry.labels ?? []) : [];
   const needsCheck = labels.length > 0;
   const locked = (id: string) => enabledRepoIds.has(id) || justEnabled.includes(id);
-  const newly = pick.selected.filter((id) => !locked(id));
+  const newly = pick.selected.filter((id) => present.has(id) && !locked(id));
   const checking = needsCheck && newly.some((id) => pick.checks[id] !== "done");
   const canEnable = newly.length > 0 && !checking && !busy && !submitting;
 
@@ -233,10 +262,16 @@ function EnablePanel({
     );
 
   const submit = async () => {
-    if (!canEnable) return;
+    if (!canEnable || inFlight.current) return;
+    inFlight.current = true;
     const ids = newly;
     setSubmitting(true);
-    const res = await onEnable(ids);
+    let res: EnableResult | null;
+    try {
+      res = await onEnable(ids);
+    } finally {
+      inFlight.current = false;
+    }
     if (!alive.current) return;
     setSubmitting(false);
     if (!res) return;
@@ -248,7 +283,20 @@ function EnablePanel({
     setJustEnabled((cur) => [...cur, ...res.enabled]);
     setPick((p) => ({ ...p, selected: p.selected.filter((id) => !ok.has(id)) }));
     setErrors(Object.fromEntries(res.failed.map((f) => [f.repoId, f.message])));
+    setFocusFailed(res.failed.map((f) => f.repoId));
   };
+
+  useEffect(() => {
+    if (!focusFailed) return;
+    setFocusFailed(null);
+    const first = repos.find((r) => focusFailed.includes(r.id));
+    // Matched on the dataset rather than a selector, so no repo id needs CSS escaping. A
+    // failed repo hidden by the filter leaves focus on the panel itself.
+    const box = [...(panelRef.current?.querySelectorAll<HTMLInputElement>("input[data-repo-id]") ?? [])].find(
+      (el) => el.dataset.repoId === first?.id,
+    );
+    (box ?? panelRef.current)?.focus();
+  }, [focusFailed]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const pathOf = (r: Repo) => maskRepoPath(r.path_with_namespace, demo);
   const q = query.trim().toLowerCase();
@@ -310,6 +358,7 @@ function EnablePanel({
                       checked={isLocked || pick.selected.includes(r.id)}
                       disabled={isLocked || submitting}
                       onChange={(e) => toggle(r.id, e.target.checked)}
+                      data-repo-id={r.id}
                       aria-describedby={err ? `${headingId}-err-${r.id}` : undefined}
                       className="accent-brand"
                     />

@@ -57,8 +57,10 @@ export function SweepLabelWarn({
   reportRef.current = onCheckStateChange;
   const hasCheck = !!repoId && selector.length > 0;
 
-  // Report before paint and before the debounced check is even scheduled, so there is no
-  // window in which a parent could read a stale "done" for the new repo/labels.
+  // Report "checking" from a layout effect, which React runs before the browser paints
+  // and before the debounced check below is scheduled. No test pins that timing; the
+  // enable dialog does not rely on it, since it marks a newly checked repo "checking"
+  // itself.
   useLayoutEffect(() => {
     reportRef.current?.(hasCheck ? "checking" : "done");
   }, [repoId, selectorKey]); // eslint-disable-line react-hooks/exhaustive-deps

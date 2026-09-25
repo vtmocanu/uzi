@@ -37,22 +37,31 @@ const SWEEP = {
   labels: ["bug"],
 } as CatalogEntry;
 
-function renderDialog() {
-  const onEnable = vi.fn<(repoIds: string[]) => Promise<EnableResult | null>>(async (ids) => ({ enabled: ids, failed: [] }));
-  render(
+// A prompt entry: no label check, so Enable is offered as soon as a repo is checked.
+const PROMPT = { slug: "docs-hygiene", name: "Docs hygiene", target: "prompt", labels: [] } as unknown as CatalogEntry;
+
+type OnEnable = (repoIds: string[]) => Promise<EnableResult | null>;
+
+function renderDialog(
+  { entry = SWEEP, onEnable: impl }: { entry?: CatalogEntry; onEnable?: OnEnable } = {},
+) {
+  const onEnable = vi.fn<OnEnable>(impl ?? (async (ids) => ({ enabled: ids, failed: [] })));
+  const ui = (repos: Repo[]) => (
     <EnableJobDialog
-      entry={SWEEP}
-      repos={REPOS}
+      entry={entry}
+      repos={repos}
       enabledRepoIds={new Set()}
       busy={false}
       open
       onOpenChange={() => {}}
       onEnable={onEnable}
-    />,
+    />
   );
-  const dialog = screen.getByRole("dialog", { name: "Enable Bug triage sweep on" });
+  const { rerender } = render(ui(REPOS));
+  const dialog = screen.getByRole("dialog", { name: `Enable ${entry.name} on` });
   const primary = () => within(dialog).getByRole("button", { name: /^(Enable \d|Checking labels|Enabling)/ }) as HTMLButtonElement;
-  return { dialog, primary, onEnable };
+  const box = (name: RegExp) => within(dialog).getByRole("checkbox", { name }) as HTMLInputElement;
+  return { dialog, primary, box, onEnable, setRepos: (repos: Repo[]) => rerender(ui(repos)) };
 }
 
 describe("EnableJobDialog — its own label-check guard, with the warn silent", () => {
@@ -86,5 +95,71 @@ describe("EnableJobDialog — its own label-check guard, with the warn silent", 
     fireEvent.click(atlas); // on again: the earlier "done" must not carry over
     expect(primary().disabled).toBe(true);
     expect(primary().textContent).toBe("Checking labels…");
+  });
+});
+
+describe("EnableJobDialog — submit and list changes", () => {
+  it("two clicks delivered before the re-render fan out once", async () => {
+    let resolve!: (r: EnableResult) => void;
+    const { box, primary, onEnable } = renderDialog({
+      entry: PROMPT,
+      onEnable: () => new Promise<EnableResult>((r) => (resolve = r)),
+    });
+    fireEvent.click(box(/vtmocanu\/atlas/));
+    const btn = primary();
+    expect(btn.disabled).toBe(false);
+    // Both clicks land in one act, so no re-render disables Enable between them.
+    act(() => {
+      btn.click();
+      btn.click();
+    });
+    expect(onEnable).toHaveBeenCalledTimes(1);
+    expect(onEnable).toHaveBeenCalledWith(["repo-atlas"]);
+    await act(async () => resolve({ enabled: ["repo-atlas"], failed: [] }));
+  });
+
+  it("a partial failure moves focus from the disabled Enable to the first failed repo's checkbox", async () => {
+    const repos = [...REPOS, { id: "repo-www", path_with_namespace: "vtmocanu/www" } as Repo];
+    const { box, primary, setRepos } = renderDialog({
+      entry: PROMPT,
+      onEnable: async () => ({
+        enabled: ["repo-uzi"],
+        // Reported out of list order: focus follows the list, not the response.
+        failed: [
+          { repoId: "repo-www", message: "forge unreachable" },
+          { repoId: "repo-atlas", message: "forge unreachable" },
+        ],
+      }),
+    });
+    setRepos(repos);
+    fireEvent.click(box(/vtmocanu\/uzi/));
+    fireEvent.click(box(/vtmocanu\/atlas/));
+    fireEvent.click(box(/vtmocanu\/www/));
+    primary().focus();
+    await act(async () => fireEvent.click(primary()));
+
+    const atlas = box(/vtmocanu\/atlas/);
+    expect(atlas.disabled).toBe(false);
+    expect(document.activeElement).toBe(atlas);
+    // Enable still offers the retry of the two failed repos.
+    expect(primary().textContent).toBe("Enable 2");
+  });
+
+  it("a selected repo that drops out of the list leaves the selection", () => {
+    const { box, primary, setRepos } = renderDialog();
+    fireEvent.click(box(/vtmocanu\/uzi/));
+    act(() => reporters.get("repo-uzi")!("done"));
+    fireEvent.click(box(/vtmocanu\/atlas/)); // its check never reports
+    expect(primary().textContent).toBe("Checking labels…");
+
+    // A reload no longer lists atlas: it neither counts nor holds Enable.
+    setRepos([REPOS[0]]);
+    expect(primary().disabled).toBe(false);
+    expect(primary().textContent).toBe("Enable 1");
+
+    // Nor does it come back selected when the repo reappears.
+    setRepos(REPOS);
+    expect(box(/vtmocanu\/atlas/).checked).toBe(false);
+    expect(primary().textContent).toBe("Enable 1");
   });
 });

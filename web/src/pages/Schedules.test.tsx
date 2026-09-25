@@ -129,6 +129,16 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
+// expectNoRowDisclosure pins D2's "nothing to expand before acting": the table holds no
+// disclosure button (aria-expanded, not a menu trigger), the shape the retired group
+// "Show repos for …" expander had. Its control half proves the selector can see buttons
+// in these rows at all: every row's More actions trigger carries aria-expanded too, so
+// `rows` of them must be found, or the negative is looking in the wrong place.
+function expectNoRowDisclosure(table: HTMLElement, rows: number) {
+  expect(table.querySelectorAll("button[aria-expanded][aria-haspopup='menu']")).toHaveLength(rows);
+  expect(table.querySelectorAll("button[aria-expanded]:not([aria-haspopup])")).toHaveLength(0);
+}
+
 // With no ?tab the page lands on the Schedules tab whenever the owner has a schedule
 // (PRD #1645 D1), which is where every row under test lives.
 function renderPage() {
@@ -212,7 +222,7 @@ describe("Schedules — one list for both origins (PRD #1645 D2)", () => {
     expect(user.closest("table")).toBe(def.closest("table"));
     expect(user.closest("table")).not.toBeNull();
     // Flat rows: nothing to expand before acting.
-    expect(screen.queryByRole("button", { name: /Show repos for/ })).toBeNull();
+    expectNoRowDisclosure(user.closest("table")!, 2);
   });
 
   it("a user row's More actions menu offers Clone, which calls cloneSchedule", async () => {
@@ -559,7 +569,9 @@ describe("Schedules — siblings render as independent rows (PRD #1645 D2)", () 
 
     await waitFor(() => expect(screen.getByRole("switch", { name: "Pause Prompt: grouped job on vtmocanu/uzi" })).toBeTruthy());
     expect(screen.getByRole("switch", { name: "Pause Prompt: grouped job on vtmocanu/atlas" })).toBeTruthy();
-    expect(screen.queryByRole("button", { name: /Show repos for/ })).toBeNull();
+    // No group summary row to expand: exactly the two sibling rows, no disclosure.
+    const table = screen.getByRole("switch", { name: /on vtmocanu\/uzi$/ }).closest("table")!;
+    expectNoRowDisclosure(table, 2);
     // Each row carries its own target pill.
     const uziRow = screen.getByRole("switch", { name: /on vtmocanu\/uzi$/ }).closest("tr")!;
     expect(within(uziRow).getByText("prompt")).toBeTruthy();
@@ -801,6 +813,29 @@ describe("Schedules — tabs, landing and ?tab deep link (PRD #1645 D1)", () => 
     expect(document.activeElement).toBe(tabNamed(/^Schedules/));
   });
 
+  it("leaving the catalog by the arrow-key tablist closes an open enable dialog, so returning keeps focus on the tab", async () => {
+    mockApi.listScheduleCatalog.mockResolvedValue(CATALOG);
+    mockApi.listRepos.mockResolvedValue(REPOS3);
+    renderAt("/schedules?tab=catalog");
+    fireEvent.click(await screen.findByRole("button", { name: "Enable Bug triage sweep on…" }));
+    const dialog = await screen.findByRole("dialog", { name: "Enable Bug triage sweep on" });
+    await waitFor(() => expect(document.activeElement).toBe(dialog));
+
+    // The user moves back to the tablist and arrows away, then back.
+    tabNamed(/^Job catalog/).focus();
+    fireEvent.keyDown(tabNamed(/^Job catalog/), { key: "ArrowLeft" });
+    expect(tabNamed(/^Schedules/).getAttribute("aria-selected")).toBe("true");
+    fireEvent.keyDown(tabNamed(/^Schedules/), { key: "ArrowRight" });
+    expect(tabNamed(/^Job catalog/).getAttribute("aria-selected")).toBe("true");
+
+    // Positive control: the catalog rendered again, with the card's Enable button.
+    expect(await screen.findByRole("button", { name: "Enable Bug triage sweep on…" })).toBeTruthy();
+    expect(screen.queryByRole("dialog")).toBeNull();
+    // Let any pending open effect run before judging focus.
+    await act(async () => {});
+    expect(document.activeElement).toBe(tabNamed(/^Job catalog/));
+  });
+
   it("counts every schedule of both origins, and pills catalog entries enabled nowhere", async () => {
     mockApi.listScheduleCatalog.mockResolvedValue({
       entries: [CATALOG.entries[0], { ...CATALOG.entries[0], slug: "refactor-scout", name: "Refactor scout" }],
@@ -903,7 +938,7 @@ describe("Schedules — default rows on the unified list (PRD #1645 D4)", () => 
     await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenCalledWith("d1", { enabled: false }));
     fireEvent.click(screen.getByRole("button", { name: "Edit Bug triage sweep on vtmocanu/uzi" }));
     expect(await screen.findByRole("dialog")).toBeTruthy();
-    expect(screen.queryByRole("button", { name: /Show repos for/ })).toBeNull();
+    expectNoRowDisclosure(screen.getByRole("switch", { name: /Bug triage sweep on vtmocanu\/uzi/ }).closest("table")!, 1);
   });
 
   it("a paused default reads 'Resume …' on its toggle", async () => {
@@ -1469,11 +1504,20 @@ describe("Schedules — the toggle keeps focus across a layout flip (PRD #1645 D
       matches = to;
       listeners.forEach((l) => l());
     });
+  // The row subscribes to the media query in a passive effect (useSyncExternalStore), which
+  // React may not have flushed when findByRole resolves on the commit's DOM mutation. A
+  // flip before that reaches no listener, so wait for the subscription itself; without
+  // this wait the first test failed about 1 run in 20, always with no listener registered.
+  const renderedAndSubscribed = async () => {
+    const sw = await screen.findByRole("switch");
+    await waitFor(() => expect(listeners.size).toBeGreaterThan(0));
+    return sw;
+  };
 
   it("a focused toggle is refocused after it moves between cells", async () => {
     mockApi.listSchedules.mockResolvedValue([sched({ id: "s1" })]);
     renderPage();
-    const before = await screen.findByRole("switch");
+    const before = await renderedAndSubscribed();
     before.focus();
     flip(false);
     const after = screen.getByRole("switch");
@@ -1486,10 +1530,12 @@ describe("Schedules — the toggle keeps focus across a layout flip (PRD #1645 D
   it("an unfocused toggle does not take focus on a flip (control)", async () => {
     mockApi.listSchedules.mockResolvedValue([sched({ id: "s1" })]);
     renderPage();
-    await screen.findByRole("switch");
+    const before = await renderedAndSubscribed();
     const runNow = screen.getByRole("button", { name: /^Run now: / });
     runNow.focus();
     flip(false);
+    // The flip did move the toggle, so staying on Run now is not a missed flip.
+    expect(screen.getByRole("switch")).not.toBe(before);
     expect(document.activeElement).toBe(runNow);
   });
 });
