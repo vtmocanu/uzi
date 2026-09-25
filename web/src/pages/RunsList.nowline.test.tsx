@@ -145,11 +145,14 @@ describe("RunsList row now line (PRD #1064 M3)", () => {
     const title = screen.getByText("A run");
     expect(title.parentElement?.parentElement?.className).toContain("items-center");
     const meta = container.querySelector("p.flex.flex-wrap")!;
-    expect(meta.className).toContain("gap-x-2");
+    expect(meta.className).toContain("gap-x-4");
+    expect(meta.className).toContain("overflow-x-clip");
     for (const item of Array.from(meta.children).slice(1)) {
       expect(item.className).not.toContain("font-mono");
-      expect(item.className).toContain("inline-flex");
+      expect(item.className).toContain("relative inline-flex");
+      expect(item.className).not.toContain("gap-2");
       expect(item.firstElementChild?.textContent).toBe("·");
+      expect(item.firstElementChild?.className).toContain("absolute -left-4 w-4 text-center");
     }
     expect(meta.textContent).toContain("subscription");
   });

@@ -46,10 +46,10 @@ exports[`RunsList row now line (PRD #1064 M3) > D5: a null-milestone null-activi
             A run
           </p>
           <p
-            class="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-faint"
+            class="mt-0.5 flex flex-wrap items-center gap-x-4 overflow-x-clip text-xs text-faint"
           >
             <span
-              class="inline-flex items-center gap-1"
+              class="relative inline-flex items-center gap-1"
             >
               grp/proj
                
@@ -59,30 +59,33 @@ exports[`RunsList row now line (PRD #1064 M3) > D5: a null-milestone null-activi
               </span>
             </span>
             <span
-              class="inline-flex items-center gap-2"
+              class="relative inline-flex items-center"
             >
               <span
                 aria-hidden="true"
+                class="absolute -left-4 w-4 text-center"
               >
                 ·
               </span>
               w1
             </span>
             <span
-              class="inline-flex items-center gap-2"
+              class="relative inline-flex items-center"
             >
               <span
                 aria-hidden="true"
+                class="absolute -left-4 w-4 text-center"
               >
                 ·
               </span>
               7/5/2026, 12:00:00 PM
             </span>
             <span
-              class="inline-flex items-center gap-2 tabular-nums"
+              class="relative inline-flex items-center tabular-nums"
             >
               <span
                 aria-hidden="true"
+                class="absolute -left-4 w-4 text-center"
               >
                 ·
               </span>

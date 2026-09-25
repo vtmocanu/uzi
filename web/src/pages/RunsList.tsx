@@ -377,8 +377,8 @@ export function RunRow({
                 {age && <span className="shrink-0 whitespace-nowrap tabular-nums text-faint">· {age} ago</span>}
               </p>
             )}
-            <p className="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-faint">
-              <span className="inline-flex items-center gap-1">
+            <p className="mt-0.5 flex flex-wrap items-center gap-x-4 overflow-x-clip text-xs text-faint">
+              <span className="relative inline-flex items-center gap-1">
                 {maskRepoPath(run.repo_path, demo)}{" "}
                 <RunIssueRef
                   issueIid={run.issue_iid}
@@ -388,17 +388,17 @@ export function RunRow({
                   raised
                 />
               </span>
-              {run.worker_name && <span className="inline-flex items-center gap-2"><span aria-hidden>·</span>{run.worker_name}</span>}
-              {showOwner && run.owner_email && <span className="inline-flex items-center gap-2"><span aria-hidden>·</span>{maskEmail(run.owner_email, demo)}</span>}
-              <span className="inline-flex items-center gap-2"><span aria-hidden>·</span>{new Date(run.updated_at).toLocaleString()}</span>
-              {duration && <span className="inline-flex items-center gap-2 tabular-nums"><span aria-hidden>·</span>{duration}</span>}
+              {run.worker_name && <span className="relative inline-flex items-center"><span aria-hidden className="absolute -left-4 w-4 text-center">·</span>{run.worker_name}</span>}
+              {showOwner && run.owner_email && <span className="relative inline-flex items-center"><span aria-hidden className="absolute -left-4 w-4 text-center">·</span>{maskEmail(run.owner_email, demo)}</span>}
+              <span className="relative inline-flex items-center"><span aria-hidden className="absolute -left-4 w-4 text-center">·</span>{new Date(run.updated_at).toLocaleString()}</span>
+              {duration && <span className="relative inline-flex items-center tabular-nums"><span aria-hidden className="absolute -left-4 w-4 text-center">·</span>{duration}</span>}
               {run.mr_iid != null && (
                 // The "· " separator lives OUTSIDE MrChip (issue #1253): the inline merged
                 // chip is now a bordered box, so a dot passed through `label` would render
                 // inside the border. Mirror IssueView — keep only the "MR "/"PR " abbrev in
                 // `label`, and emit the separator as a sibling text node.
-                <span className="inline-flex items-center gap-2">
-                  <span aria-hidden>·</span>
+                <span className="relative inline-flex items-center">
+                  <span aria-hidden className="absolute -left-4 w-4 text-center">·</span>
                   <MrChip
                     variant="inline"
                     label={`${mrAbbrev(run.forge_type)} `}
@@ -420,18 +420,18 @@ export function RunRow({
                   shows its "so far" figure, which grows as phases fold. */}
               {run.usage && cost && (
                 <>
-                  <span className="inline-flex items-center gap-2 tabular-nums">
-                    <span aria-hidden>·</span>{formatTokens(runUsageTotalTokens(run.usage))} tok
+                  <span className="relative inline-flex items-center tabular-nums">
+                    <span aria-hidden className="absolute -left-4 w-4 text-center">·</span>{formatTokens(runUsageTotalTokens(run.usage))} tok
                     {run.status === "running" ? " so far" : ""}
                   </span>
                   {/* PRD #1429 M4b (D7): metered shows the real $ figure; subscription/
                       unreported get an honest marker — never a silent omission that
                       reads as free, and never a bare "$0.00" for a non-metered run. */}
                   {cost.kind === "metered" ? (
-                    <span className="inline-flex items-center gap-2 text-brand/90"><span aria-hidden>·</span>{cost.dollars}</span>
+                    <span className="relative inline-flex items-center text-brand/90"><span aria-hidden className="absolute -left-4 w-4 text-center">·</span>{cost.dollars}</span>
                   ) : (
-                    <span className="inline-flex items-center gap-2 text-faint">
-                      <span aria-hidden>·</span>{cost.kind === "subscription" ? "subscription" : "cost n/a"}
+                    <span className="relative inline-flex items-center text-faint">
+                      <span aria-hidden className="absolute -left-4 w-4 text-center">·</span>{cost.kind === "subscription" ? "subscription" : "cost n/a"}
                     </span>
                   )}
                 </>
