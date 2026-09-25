@@ -416,6 +416,22 @@ export function forgeIcon(forgeType: string | undefined): ReactNode {
   return forgeType === "gitlab" ? <GitLabIcon /> : <GitIcon />;
 }
 
+// A count badge and its accessible noun travel together: `badgeLabel` is required
+// whenever `badge` is passed, so no caller can announce a bare number.
+type NavItemBadge =
+  | {
+      // badge is a count: expanded, a count pill trails the label; collapsed, a dot
+      // overlaps the icon since a rail has no room for a number. 0 renders nothing.
+      badge: number;
+      // badgeLabel is the NOUN the accessible count announces ("in progress" for the
+      // Runs badge, so a screen reader says "Runs, 5 in progress"). Only the item knows
+      // what its number MEANS, so there is no per-tone fallback noun: the former
+      // "unread" fallback belonged to the retired Notifications inbox (PRD #1650) and
+      // was wrong for every other count that inherited it.
+      badgeLabel: string;
+    }
+  | { badge?: undefined; badgeLabel?: undefined };
+
 function NavItem({
   to,
   icon,
@@ -426,9 +442,9 @@ function NavItem({
   collapsed = false,
   badge = 0,
   badgeTone = "count",
-  badgeLabel,
+  badgeLabel = "",
   healthPip,
-}: {
+}: NavItemBadge & {
   to: string;
   icon?: ReactNode;
   label: string;
@@ -438,13 +454,10 @@ function NavItem({
   // When collapsed the item is an icon-only rail button; the label moves to a
   // native title tooltip so the destination is still identifiable on hover.
   collapsed?: boolean;
-  // badge is a count: expanded, a count pill trails the label; collapsed, a dot
-  // overlaps the icon since a rail has no room for a number. 0 renders nothing.
-  badge?: number;
   // badgeTone distinguishes "go look" from "there is a queue" (PRD #113 Decision 2).
   // The default `count` tone is the brand pill most badges use — runs in progress, a
-  // Judge backlog: things to get to. `alert` is red, and it means a worker
-  // needs attention now.
+  // Judge backlog: things to get to. `alert` is red, and it means something
+  // needs attention now: a worker, or a parked schedule (PRD #1650 D6).
   //
   // A new TONE rather than a new mechanism, deliberately: two badge implementations
   // would drift in position, size and collapsed-rail behaviour, and the rail's dot has
@@ -548,7 +561,7 @@ function NavItem({
           sr-only rather than an aria-label on the Link, so the destination name and the
           count stay separate strings rather than one run-on label. */}
       {collapsed && hasBadge && (
-        <span className="sr-only">{`${badge} ${badgeNoun}`}</span>
+        <span className="sr-only">{`${badge} ${badgeLabel}`}</span>
       )}
       {!collapsed && hasBadge && (
         // The label says what the number MEANS. "3 pending" for a worker count would be
@@ -596,6 +609,7 @@ function SidebarContent({
   judgeTodo = 0,
   runsInProgress = 0,
   schedulesEnabled = 0,
+  schedulesParked = 0,
   workersAttention = 0,
   findingsOpen = 0,
   onOpenChangelog,
@@ -618,6 +632,9 @@ function SidebarContent({
   // enabled schedules (paused ones don't nag), brand "count" tone like Runs. 0 renders
   // nothing.
   schedulesEnabled?: number;
+  // Parked-schedule count (PRD #1650 D6): the caller's schedules with status "error".
+  // Non-zero replaces the enabled count on the Schedules badge, in the alert tone.
+  schedulesParked?: number;
   // Count for the Workers nav badge (PRD #113 M6). 0 renders nothing at all — not a
   // badge showing zero, which would be a permanent ornament that means nothing.
   workersAttention?: number;
@@ -785,7 +802,8 @@ function SidebarContent({
             icon={<ActivityIcon />}
             label="Runs"
             badge={runsInProgress}
-            // "in progress": the noun the mock spec'd for this count. Brand tone (Decision 2), not the Workers alert red.
+            // "in progress": the noun the mock spec'd for this count. Brand tone
+            // (Decision 2), not the Workers alert red.
             badgeLabel="in progress"
             onNavigate={onNavigate}
             collapsed={collapsed}
@@ -805,13 +823,20 @@ function SidebarContent({
             collapsed={collapsed}
           />
           {/* Schedules (PRD #241): the time-driven run origin. Badge is the caller's
-              enabled-schedule count — brand "count" tone, paused ones excluded. */}
+              enabled-schedule count — brand "count" tone, paused ones excluded — unless
+              any schedule is parked (PRD #1650 D6): then it is the parked count in the
+              alert tone, since a parked schedule has stopped firing until it is fixed. */}
           <NavItem
             to="/schedules"
             icon={<ClockIcon />}
             label="Schedules"
-            badge={schedulesEnabled}
-            badgeLabel="enabled"
+            {...(schedulesParked > 0
+              ? {
+                  badge: schedulesParked,
+                  badgeTone: "alert" as const,
+                  badgeLabel: schedulesParked === 1 ? "parked schedule" : "parked schedules",
+                }
+              : { badge: schedulesEnabled, badgeLabel: "enabled" })}
             onNavigate={onNavigate}
             collapsed={collapsed}
           />
@@ -1090,6 +1115,10 @@ export function AppShell({ children }: { children: ReactNode }) {
   // Enabled-schedule badge (PRD #241 M5). Owned here alongside runsInProgress; the
   // caller's enabled schedules, from the owner-scoped listSchedules.
   const [schedulesEnabled, setSchedulesEnabled] = useState(0);
+  // Parked-schedule badge (PRD #1650 D6), derived from the SAME listSchedules response
+  // as schedulesEnabled: no extra request, and it clears on the next nav poll once the
+  // schedule is fixed.
+  const [schedulesParked, setSchedulesParked] = useState(0);
   // Workers needing attention (PRD #113 M6): upgrade_failed + outdated, minus muted,
   // counted server-side so this badge and the Workers page's badges cannot disagree.
   const [workersAttention, setWorkersAttention] = useState(0);
@@ -1115,8 +1144,9 @@ export function AppShell({ children }: { children: ReactNode }) {
   // one module-memoised GET with the two SidebarContent mounts.
   const branding = useBranding();
 
-  // Judge to-triage poll (PRD #98): polled on navigation (no WS), reading the canonical /me/judge/stats.todo. A failed fetch keeps the last
-  // known count rather than blanking the badge.
+  // Judge to-triage poll (PRD #98): polled on navigation (no WS), reading the canonical
+  // /me/judge/stats.todo. A failed fetch keeps the last known count rather than
+  // blanking the badge.
   useEffect(() => {
     if (!user) {
       setJudgeTodo(0);
@@ -1155,18 +1185,22 @@ export function AppShell({ children }: { children: ReactNode }) {
   }, [user, location.pathname]);
 
   // Enabled-schedule poll (PRD #241 M5): the same on-navigation cadence as the Runs
-  // poll above, reading the owner-scoped listSchedules and counting enabled rows. A
-  // failed fetch keeps the last known count rather than blanking the badge.
+  // poll above, reading the owner-scoped listSchedules and counting enabled rows, and
+  // (PRD #1650 D6) parked rows, status "error", from the same response. A failed fetch
+  // keeps the last known counts rather than blanking the badge.
   useEffect(() => {
     if (!user) {
       setSchedulesEnabled(0);
+      setSchedulesParked(0);
       return;
     }
     let alive = true;
     api
       .listSchedules()
       .then((rows) => {
-        if (alive) setSchedulesEnabled(rows.filter((s) => s.enabled).length);
+        if (!alive) return;
+        setSchedulesEnabled(rows.filter((s) => s.enabled).length);
+        setSchedulesParked(rows.filter((s) => s.status === "error").length);
       })
       .catch(() => {});
     return () => {
@@ -1288,6 +1322,7 @@ export function AppShell({ children }: { children: ReactNode }) {
           judgeTodo={judgeTodo}
           runsInProgress={runsInProgress}
           schedulesEnabled={schedulesEnabled}
+          schedulesParked={schedulesParked}
           workersAttention={workersAttention}
           findingsOpen={findingsOpen}
           onOpenChangelog={() => setChangelogOpen(true)}
@@ -1335,7 +1370,7 @@ export function AppShell({ children }: { children: ReactNode }) {
             >
               <XIcon />
             </button>
-            <SidebarContent onNavigate={() => setMobileOpen(false)} judgeTodo={judgeTodo} runsInProgress={runsInProgress} schedulesEnabled={schedulesEnabled} workersAttention={workersAttention} findingsOpen={findingsOpen} onOpenChangelog={() => setChangelogOpen(true)} />
+            <SidebarContent onNavigate={() => setMobileOpen(false)} judgeTodo={judgeTodo} runsInProgress={runsInProgress} schedulesEnabled={schedulesEnabled} schedulesParked={schedulesParked} workersAttention={workersAttention} findingsOpen={findingsOpen} onOpenChangelog={() => setChangelogOpen(true)} />
           </div>
         </div>
       )}

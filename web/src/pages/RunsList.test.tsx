@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { RunRow, RunsHistory, RunsLayout, RunsList, sortPast } from "./RunsList";
 import { api, type RunListItem, type SecretMeta, type CostStatus } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
@@ -946,6 +946,173 @@ describe("RunsHistory — archive search, grouping and reveal (ux-tweaks)", () =
     await waitFor(() => expect(screen.getByText("In flight")).toBeTruthy());
     expect(screen.getByRole("link", { name: "Past runs · 1" })).toBeTruthy();
     expect(mockApi.listRuns).toHaveBeenCalledTimes(1);
+  });
+});
+
+// PRD #1650 D7: the Past runs "Failed" filter. A failed run has no resolved state, so it
+// gets a filter rather than a nav badge: genuine failures only (status failed and not a
+// human stop), counted in the chip label, applied before paging and grouping, and kept in
+// the URL alongside the search query (?q=) without either clobbering the other.
+describe("RunsHistory — the Failed filter (PRD #1650 D7)", () => {
+  beforeEach(() => {
+    vi.mocked(useAuth).mockReturnValue({
+      user: { is_admin: false },
+      vaultUnlocked: true,
+    } as unknown as ReturnType<typeof useAuth>);
+  });
+
+  const past = (id: string, title: string, over: Partial<RunListItem>, minute = 0) =>
+    aRun({
+      id,
+      issue_title: title,
+      started_at: atLocal(2026, 6, 5, 12, minute),
+      finished_at: atLocal(2026, 6, 5, 12, minute),
+      ...over,
+    });
+
+  // Two genuine failures (one auto-stopped: uzi killed it, which is breakage, not a human
+  // stop), plus every shape that must NOT count: success, cancel, and a plan rejection
+  // (status failed, but a deliberate human stop).
+  const mixed = [
+    past("f1", "Parser gate went red", { status: "failed" }, 50),
+    past("f2", "Exporter auto-stopped", { status: "failed", stop_kind: "auto_stopped" }, 40),
+    past("ok", "Parser shipped fine", { status: "completed" }, 30),
+    past("cx", "Cancelled by owner", { status: "cancelled", stop_kind: "cancelled" }, 20),
+    past("pr", "Plan was rejected", { status: "failed", stop_kind: "plan_rejected" }, 10),
+  ];
+
+  // The page's location, so URL assertions read the real search params, not a guess.
+  function LocationProbe() {
+    const loc = useLocation();
+    return <output data-testid="loc">{loc.search}</output>;
+  }
+  function renderHistory(path: string) {
+    return render(
+      <MemoryRouter initialEntries={[path]}>
+        <Routes>
+          <Route element={<RunsLayout />}>
+            <Route path="/runs/history" element={<RunsHistory />} />
+          </Route>
+        </Routes>
+        <LocationProbe />
+      </MemoryRouter>,
+    );
+  }
+  const params = () => new URLSearchParams(screen.getByTestId("loc").textContent ?? "");
+
+  it("labels the chip with the genuine-failure count and shows only those runs when on", async () => {
+    mockApi.listRuns.mockResolvedValue({ runs: mixed });
+    renderHistory("/runs/history");
+
+    await waitFor(() => expect(screen.getByText("Plan was rejected")).toBeTruthy());
+    const chip = screen.getByRole("button", { name: "Failed · 2" });
+    expect(chip.getAttribute("aria-pressed")).toBe("false");
+
+    fireEvent.click(chip);
+    expect(chip.getAttribute("aria-pressed")).toBe("true");
+    expect(params().get("status")).toBe("failed");
+    // The two genuine failures remain...
+    expect(screen.getByText("Parser gate went red")).toBeTruthy();
+    expect(screen.getByText("Exporter auto-stopped")).toBeTruthy();
+    // ...and success, cancel and plan rejection are gone.
+    expect(screen.queryByText("Parser shipped fine")).toBeNull();
+    expect(screen.queryByText("Cancelled by owner")).toBeNull();
+    expect(screen.queryByText("Plan was rejected")).toBeNull();
+
+    // Off again: the whole archive returns and the param is dropped.
+    fireEvent.click(chip);
+    expect(chip.getAttribute("aria-pressed")).toBe("false");
+    expect(params().has("status")).toBe(false);
+    expect(screen.getByText("Plan was rejected")).toBeTruthy();
+  });
+
+  it("arrives filtered from a ?status=failed deep link", async () => {
+    mockApi.listRuns.mockResolvedValue({ runs: mixed });
+    renderHistory("/runs/history?status=failed");
+
+    await waitFor(() => expect(screen.getByText("Parser gate went red")).toBeTruthy());
+    expect(screen.getByRole("button", { name: "Failed · 2" }).getAttribute("aria-pressed")).toBe("true");
+    expect(screen.queryByText("Parser shipped fine")).toBeNull();
+  });
+
+  it("pages over the failures only, so the count and reveal reflect the filtered set", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        ...Array.from({ length: 12 }, (_, i) => past(`f${i}`, `Failed run ${i}`, { status: "failed" }, 59 - i)),
+        ...Array.from({ length: 5 }, (_, i) => past(`c${i}`, `Done run ${i}`, { status: "completed" }, 30 - i)),
+      ],
+    });
+    renderHistory("/runs/history");
+
+    await waitFor(() => expect(screen.getByText("Failed run 0")).toBeTruthy());
+    // Unfiltered control: 10 of all 17.
+    expect(screen.getByText("10/17")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Failed · 12" }));
+    expect(screen.getByText("10/12")).toBeTruthy();
+    expect(screen.queryByText("10/17")).toBeNull();
+    expect(screen.getByText("Failed run 9")).toBeTruthy();
+    expect(screen.queryByText("Failed run 10")).toBeNull();
+    // The reveal offers exactly the two hidden failures, not the completed runs.
+    fireEvent.click(screen.getByText(/Show 2 more/));
+    expect(screen.getByText("Failed run 11")).toBeTruthy();
+    expect(screen.queryByText("Done run 0")).toBeNull();
+  });
+
+  it("keeps the search query when the filter is toggled on and off", async () => {
+    mockApi.listRuns.mockResolvedValue({ runs: mixed });
+    renderHistory("/runs/history?q=parser");
+
+    await waitFor(() => expect(screen.getByText("Parser shipped fine")).toBeTruthy());
+    const chip = screen.getByRole("button", { name: "Failed · 2" });
+
+    fireEvent.click(chip);
+    expect(params().get("q")).toBe("parser");
+    expect(params().get("status")).toBe("failed");
+    expect((screen.getByLabelText("Search past runs") as HTMLInputElement).value).toBe("parser");
+    // Both narrowings apply: the failed parser run stays, the completed one goes.
+    expect(screen.getByText("Parser gate went red")).toBeTruthy();
+    expect(screen.queryByText("Parser shipped fine")).toBeNull();
+
+    fireEvent.click(chip);
+    expect(params().get("q")).toBe("parser");
+    expect(params().has("status")).toBe(false);
+    expect(screen.getByText("Parser shipped fine")).toBeTruthy();
+  });
+
+  it("keeps the filter when the search is typed and cleared", async () => {
+    mockApi.listRuns.mockResolvedValue({ runs: mixed });
+    renderHistory("/runs/history?status=failed");
+
+    await waitFor(() => expect(screen.getByText("Parser gate went red")).toBeTruthy());
+    const search = screen.getByLabelText("Search past runs");
+
+    fireEvent.change(search, { target: { value: "exporter" } });
+    expect(params().get("q")).toBe("exporter");
+    expect(params().get("status")).toBe("failed");
+    expect(screen.getByText("Exporter auto-stopped")).toBeTruthy();
+    expect(screen.queryByText("Parser gate went red")).toBeNull();
+
+    // Escape clears the search; the filter stays on.
+    fireEvent.keyDown(search, { key: "Escape" });
+    expect(params().has("q")).toBe(false);
+    expect(params().get("status")).toBe("failed");
+    expect(screen.getByText("Parser gate went red")).toBeTruthy();
+    expect(screen.queryByText("Parser shipped fine")).toBeNull();
+  });
+
+  it("explains an empty filtered archive and offers the way back", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [past("ok", "Parser shipped fine", { status: "completed" })],
+    });
+    renderHistory("/runs/history?status=failed");
+
+    expect(await screen.findByText(/No failed runs/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Failed · 0" })).toBeTruthy();
+    expect(screen.queryByText("Parser shipped fine")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Show all past runs" }));
+    expect(screen.getByText("Parser shipped fine")).toBeTruthy();
+    expect(params().has("status")).toBe(false);
   });
 });
 

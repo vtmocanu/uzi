@@ -132,6 +132,9 @@ beforeEach(() => {
   });
   // A server that still reported unread inbox rows must not reach the UI at all.
   unreadSpy.mockResolvedValue({ unread: 3 });
+  // Idle runs by default, reset per test: clearAllMocks keeps implementations, so the
+  // awaiting-approval override below would otherwise leak into any later test.
+  mockApi.listRuns.mockResolvedValue({ runs: [] });
 });
 
 afterEach(() => {
