@@ -874,6 +874,14 @@ interface RunFlight {
     signal?: AbortSignal,
   ) => ReturnType<WorkerClient["reportState"]>;
   observedSessionId: string | undefined;
+  /** Issue #1626: the latest frozen completion-contract revision any /state ACK of THIS flight
+   *  carried (StateAck.contractRevision, off RunDTO.completion_revision). A fresh interlocked run's
+   *  claim is assembled BEFORE the contract freezes (at plan approval, or on the autopilot plan
+   *  report) and the worker stays in-process across the plan gate with no re-claim, so the claim's
+   *  `config.contract_revision` is absent; the ack is the only channel that brings the revision
+   *  in. Updated at the flight.reportState choke point from every non-stale ACK that carries one;
+   *  the finalize permit request uses it ahead of the claim's value. undefined until then. */
+  latestContractRevision: number | undefined;
   barePath: string | undefined;
   worktreePath: string | undefined;
   branch: string | undefined;
@@ -4566,9 +4574,11 @@ export class RunRunner {
       //    trackingTip reads the landed tip after either path. The frozen contract revision is echoed
       //    verbatim so the server can reject a revision drift. If either is unresolvable a permit
       //    cannot be bound to (run, revision, branch, head), so route to the hold rather than report
-      //    completed.
+      //    completed. Issue #1626: the revision is the LATEST one a /state ACK carried
+      //    (flight.latestContractRevision) — a fresh run's contract freezes after its claim, so the
+      //    claim's value is absent there — falling back to the claim's (a resume re-delivers it).
       const head = await this.git.trackingTip(barePath, result.branch);
-      const contractRevision = claim.config?.contract_revision;
+      const contractRevision = flight.latestContractRevision ?? claim.config?.contract_revision;
       if (head === null || contractRevision === undefined) {
         runLog.warn(
           "completion interlock: the landed head or contract revision is unresolvable; holding rather than completing",
@@ -4954,6 +4964,7 @@ export class RunRunner {
       steering,
       claimGeneration,
       observedSessionId: undefined,
+      latestContractRevision: undefined,
       reportState: async (body, signal) => {
         // PRD #1390 M2a: this same choke point is where the run announces every phase
         // transition, so reflect the four snapshot phases (running / awaiting_approval /
@@ -5001,6 +5012,10 @@ export class RunRunner {
         // report (another claim owns the run now). A stale ack on the TERMINAL `failed` report is
         // a no-op: that reportState is already `.catch(...)`-guarded, so the throw is swallowed.
         if (ack.staleClaim) throw new StaleClaimError();
+        // Issue #1626: remember the frozen completion-contract revision this (non-stale) ACK
+        // carries, so the interlocked finalize can bind its permit to a contract that froze after
+        // the claim was issued. Every report goes through here, so the latest ACK wins.
+        if (ack.contractRevision !== undefined) flight.latestContractRevision = ack.contractRevision;
         // issue #1582 M2: a TERMINAL report's ACK drives the settlement lifecycle (promote the
         // write-ahead `pushed` head on a completed outcome, else stop the records). Here, inside the
         // send, so it lands BEFORE the terminal resolve retires the outbox journal.

@@ -2200,6 +2200,15 @@ export interface StateAck {
    *  worker's current budget unchanged. */
   budgetMaxIterations?: number;
   budgetWallSeconds?: number;
+  /** Issue #1626: the run's FROZEN completion-contract revision, read off the SAME
+   *  `{run: RunDTO}` body as `status` (the DTO's `completion_revision` field). It is the
+   *  mechanism by which a FRESH interlocked run — whose contract froze mid-run at plan approval
+   *  or on the autopilot plan report, AFTER its claim was issued without one — learns the
+   *  revision its completion permit must echo (a resume gets it on the claim config's
+   *  `contract_revision` instead). An integer >= 1 only; null/absent (older server, a
+   *  legacy/never-frozen run, an unparseable body, a non-integer value) ⇒ undefined = "no
+   *  revision update". */
+  contractRevision?: number;
   /** PRD #1189 M1 (D6): the run's TOTAL wall-clock budget the server serves — the DTO's
    *  `budget_total_seconds` field, COALESCE(budget_wall_seconds, RUN_TIMEOUT) +
    *  budget_extension_seconds. When present it is the authoritative served wall and the

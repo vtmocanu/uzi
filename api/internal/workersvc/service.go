@@ -3457,7 +3457,9 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		inferredCaps, inferredTools, sizeClass := inferredRequirementParams(req)
 		rows, err = q.SetRunAwaitingApproval(ctx, store.SetRunAwaitingApprovalParams{
 			PlanMd: stripNULParam(req.PlanMd), SessionID: sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
-			MilestonesCandidate:  milestonesParam(owned.Kind, req.Milestones),
+			// Issue #1626: an interlocked run's milestone-less plan is the explicit `[]`
+			// (planMilestonesParam), so the approve freeze builds a criteria:[] contract.
+			MilestonesCandidate:  planMilestonesParam(owned, req.PlanMd, req.Milestones),
 			InferredCapabilities: inferredCaps,
 			InferredTools:        inferredTools,
 			SizeClass:            sizeClass,
@@ -4019,7 +4021,12 @@ func (s *Service) runningStateParams(ctx context.Context, run store.Run, req Sta
 	// never overwrites a frozen list and never disturbs the heartbeat. Unlike the
 	// RepoAgents/AgentSelection paths below, a bad milestone list is DROPPED rather
 	// than failing the report — additive-optional.
-	p.MilestonesFrozen = milestonesParam(run.Kind, req.Milestones)
+	//
+	// Issue #1626: for an INTERLOCKED run, the plan-bearing report (plan_md present) with no
+	// milestones freezes the explicit `[]` (planMilestonesParam), so the contract freeze below
+	// and in SetRunRunning lands criteria:[]. The claim-time report carries no plan_md and
+	// stays NULL, keeping the milestone-source guard intact.
+	p.MilestonesFrozen = planMilestonesParam(run, req.PlanMd, req.Milestones)
 
 	// PRD #122 M2 (Decision 3/12): the live progress sets. Validated + membership-checked
 	// against the run's FROZEN list and kind-gated (progressParams); a bad or non-issue

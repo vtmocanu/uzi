@@ -9,6 +9,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // Milestone is one entry of a run's milestone list (PRD #122): a small {id, title}
@@ -112,6 +113,34 @@ func milestonesParam(kind string, ms *[]Milestone) []byte {
 		return nil
 	}
 	return encoded
+}
+
+// planMilestonesParam is milestonesParam for a PLAN-BEARING report — the awaiting_approval
+// report (the candidate list) and the autopilot `running` report that carries the approved
+// plan_md (the frozen list). Issue #1626: the worker sends `milestones` only when the plan
+// has any, so a milestone-less plan used to persist NULL, and the completion-contract freeze
+// (CreateApprovePlanInput / SetRunRunning), which requires a non-NULL milestone source,
+// never froze a contract — an INTERLOCKED run then held at finalize with "completion
+// identity unresolvable". For an interlocked issue run only
+// (completion_contract_version stamped), a plan-bearing report whose milestones are ABSENT
+// is read as the explicit empty list `[]`, so the freeze lands criteria:[] at revision 1 and
+// the permit grants vacuously (computeUnmetCriteria). Server-side so it holds for any
+// worker. Everything else is milestonesParam unchanged:
+//   - a legacy (unstamped) run, or a non-issue kind, keeps NULL — byte-identical to before;
+//   - a report WITHOUT a non-blank plan_md keeps NULL. This is load-bearing on the
+//     `running` path: an autopilot run reports `running` at claim time BEFORE it has
+//     planned (no plan_md), and freezing `[]` there would spend the contract-IS-NULL
+//     freeze before the plan's real milestones arrive (TestCompletionContractNotFrozenBeforeMilestonesLiveDB);
+//   - a PRESENT list that fails validation still drops to NULL (a malformed plan must not
+//     silently freeze an empty, vacuously-met contract).
+func planMilestonesParam(run store.Run, planMd *string, ms *[]Milestone) []byte {
+	if ms != nil || run.Kind != runkind.Issue || !run.CompletionContractVersion.Valid || planMd == nil {
+		return milestonesParam(run.Kind, ms)
+	}
+	if clean, _ := stripNUL(*planMd); strings.TrimSpace(clean) == "" {
+		return nil
+	}
+	return []byte("[]")
 }
 
 // progressParams validates a worker-reported progress update (Decision 3/12): every
