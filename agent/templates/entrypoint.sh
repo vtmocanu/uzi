@@ -250,7 +250,7 @@ for d in runner agent-home provision; do
   # 🔴 SC3067 IS A TRUE PORTABILITY STATEMENT AND A FALSE BUG REPORT AGAINST THIS
   # IMAGE, AND IT STOPS BEING FALSE THE MOMENT THE SHEBANG OR THE BASE IMAGE MOVES.
   # This file is `#!/bin/sh` and both worker Dockerfiles ship it on the same
-  # digest-pinned node:22-alpine with an exec-form ENTRYPOINT
+  # digest-pinned node:24-alpine with an exec-form ENTRYPOINT
   # (controller/internal/kube/render.go sets no `Command:` ON THE WORKER CONTAINER,
   # so k8s uses the image's own ENTRYPOINT. That file has five `Command:` fields on
   # OTHER containers, so the unqualified version of this sentence invited a reader
@@ -319,6 +319,12 @@ done
 #         / shell snapshots AND the provider-owned codex-data/epoch-N trees — is re-owned to
 #         the `runner` identity, which runs the SDK/provider under the split and must read AND
 #         update this state or every resumed run on a migrated volume fails on its own HOME.
+#   * "$DATA_DIR"/agent-home's OWN top-level dot entries (.cache, .local, .claude, .claude.json,
+#     ...) are NOT per-run HOMEs: agent-home is also the shared HOME of runner-uid processes
+#     (provisioning's devbox/nix, the chat SDK CLI), so each is re-owned wholesale to runner
+#     (issue #1696). Every worker-created agent-home entry (run ids, codex-advice-*, uzi-judge-/
+#     uzi-review-/uzi-summary- mkdtemps, tombstones) is non-dot, so the run-HOME map above only
+#     ever needs the non-dot glob.
 #   * "$DATA_DIR"/provision (shared provisioning state, written by the runner): re-owned to runner.
 LEGACY_SENTINEL="$DATA_DIR/.uzi-legacy-split-migrated"
 if [ ! -f "$LEGACY_SENTINEL" ]; then
@@ -349,12 +355,15 @@ if [ ! -f "$LEGACY_SENTINEL" ]; then
   #       ever descends REAL directories. A legitimate carve-out child / per-run HOME / epoch is
   #       always a real path; a symlink there is never something the migration needs to re-own.
   #
-  # KNOWN, ACCEPTED, NARROW RESIDUAL (deliberately NOT "fixed" with an nlink filter): `[ -L ]` cannot
+  # KNOWN, ACCEPTED, NARROW RESIDUAL (no nlink filter INSIDE the recursive walks): `[ -L ]` cannot
   # catch a HARDLINK. A legacy-planted hardlink from inside a migrated tree to an existing
   # repos/<repo> FILE would transfer that single inode's ownership to `runner` via `chown -R` (files
   # only, same-fs, the target must pre-exist). This is far narrower than the symlink class (no
   # directory trees, no new inodes), and a general defense is impractical: git LEGITIMATELY hardlinks
   # pack/object files, so an `nlink > 1` skip would break real clones. Documented and accepted.
+  # The shared HOME's dot loops (below, and the (a2c) repair) DO filter their own TOP-LEVEL entry:
+  # only a real directory or a regular file with a link count of exactly 1 is re-owned, so for the
+  # shared HOME this residual stays scoped to hardlinks NESTED inside its recursively re-owned trees.
   #
   # "$DATA_DIR"/runner + /provision: re-own retained content to `runner`, preserving it. Only the
   # PARENT's CHILDREN are re-owned (the parents stay worker:runner, set just above).
@@ -371,7 +380,9 @@ if [ ! -f "$LEGACY_SENTINEL" ]; then
   # "$DATA_DIR"/agent-home: the mixed per-subtree map above.
   require_real_carveout_root "$DATA_DIR/agent-home"
   if [ -d "$DATA_DIR/agent-home" ]; then
-    for home in "$DATA_DIR"/agent-home/* "$DATA_DIR"/agent-home/.[!.]* "$DATA_DIR"/agent-home/..?*; do
+    # Per-run HOMEs are NON-DOT only: a dot entry here is the shared runner HOME's own state
+    # (handled by the loop below), never a run HOME (issue #1696).
+    for home in "$DATA_DIR"/agent-home/*; do
       [ -d "$home" ] || continue
       [ -L "$home" ] && continue                        # a legit per-run HOME is always a REAL dir; skip a planted symlink so it can never become a mid-path prefix
       "$CHOWN" worker:runner "$home"                    # run HOME / advice-parent root STAYS worker-owned, gid runner
@@ -392,9 +403,67 @@ if [ ! -f "$LEGACY_SENTINEL" ]; then
         "$CHOWN" -R runner:runner "$entry"              # Claude SDK state + advice provider roots -> runner
       done
     done
+    # The shared HOME's own dot entries (issue #1696): the legacy single-uid volume was written
+    # entirely by the agent uid, and post-split only runner-uid children (provisioning's
+    # devbox/nix, the chat SDK CLI) use this HOME's dot state, so each dot entry (dir OR file,
+    # e.g. .claude.json) is re-owned wholesale to runner. A symlink entry is skipped (`[ -L ]`
+    # first; a dangling one also fails `[ -e ]`). A symlink NESTED inside a dot dir is not
+    # followed by the recursive chown on the current image: its /bin/chown is BusyBox v1.37.0
+    # on the digest-pinned node:24-alpine base (no coreutils), and a BusyBox v1.37.0 `chown -R`
+    # measured 2026-09-25 re-owned a nested dir- or file-symlink itself and left its target
+    # untouched. That is a measurement of this binary, not a claim about chown in general.
+    # A top-level HARDLINK (a regular file with nlink > 1, e.g. one planted to a repos/<r>.git
+    # file) is skipped too, as is anything that is neither a directory nor a regular file (fifo,
+    # socket, device): only a real dir or a single-link regular file is re-owned. A failed stat
+    # counts as "skip".
+    for dot in "$DATA_DIR"/agent-home/.[!.]* "$DATA_DIR"/agent-home/..?*; do
+      [ -L "$dot" ] && continue                         # never hand a planted symlink to a chown -R
+      if [ ! -d "$dot" ]; then
+        [ -f "$dot" ] || continue                       # not a dir or regular file (or absent): skip
+        nlink=$("$BUSYBOX" stat -c %h "$dot" 2>/dev/null) || continue
+        [ "$nlink" = 1 ] || continue                    # a hardlinked file: never re-own the shared inode
+      fi
+      "$CHOWN" -R runner:runner "$dot"
+    done
   fi
   : > "$LEGACY_SENTINEL" 2>/dev/null && "$CHOWN" "$WORKER_OWNER" "$LEGACY_SENTINEL" 2>/dev/null \
     || echo "uzi-entrypoint: warning: could not persist $LEGACY_SENTINEL (re-runs next boot)" >&2
+fi
+
+# --- (a2c) issue #1696: one-time repair of the shared provisioning HOME's dot-entry ownership ----
+# /data/agent-home is also the HOME of runner-uid processes (provisioning's devbox/nix via
+# runnerCommand, the chat SDK CLI), but the legacy walk above used to treat its dot entries
+# (.cache, .local, .claude) as per-run HOMEs: their ROOT inode was left worker:runner in a private
+# legacy mode (no CAP_FOWNER to chmod it) and a top-level dot FILE such as .claude.json was skipped
+# and left worker:worker, so the runner could not use them. Affected volumes already carry
+# LEGACY_SENTINEL, so a fix inside that block never runs for them; this separate sentinel does.
+# The old walk already chown -R'd every non-symlink CHILD of each dot dir to runner, so only the
+# top-level inodes are damaged. A post-split runner can write agent-home (worker:runner, group
+# writable) and so could plant a hardlink there to a worker-owned file (e.g. a repos/<r>.git
+# config) before this repair runs. The repair is NON-recursive, which keeps any NESTED hardlink out
+# of reach, and a TOP-LEVEL hardlink is excluded by the filter: only a real directory or a regular
+# file with a link count of exactly 1 is re-owned (symlinks, hardlinked files, fifos, sockets and
+# devices are skipped; a failed stat counts as "skip"). A per-entry loop (not a fixed dir list)
+# also covers .claude.json. It runs once on a fresh volume too (idempotent there).
+# Chown only, never chmod (no CAP_FOWNER). A runner-owned 0700 .claude is unreadable to the worker's
+# resume probe, which fails open (sdk-session.ts: "leaving the resume as-is"), as on a fresh volume.
+PROVISION_HOME_SENTINEL="$DATA_DIR/.uzi-provision-home-repaired"
+if [ ! -f "$PROVISION_HOME_SENTINEL" ]; then
+  echo "uzi-entrypoint: one-time repair of shared provisioning HOME dot-entry ownership [issue #1696]" >&2
+  require_real_carveout_root "$DATA_DIR/agent-home"
+  if [ -d "$DATA_DIR/agent-home" ]; then
+    for dot in "$DATA_DIR"/agent-home/.[!.]* "$DATA_DIR"/agent-home/..?*; do
+      [ -L "$dot" ] && continue                         # never re-own through a planted symlink
+      if [ ! -d "$dot" ]; then
+        [ -f "$dot" ] || continue                       # not a dir or regular file (or absent): skip
+        nlink=$("$BUSYBOX" stat -c %h "$dot" 2>/dev/null) || continue
+        [ "$nlink" = 1 ] || continue                    # a hardlinked file: never re-own the shared inode
+      fi
+      "$CHOWN" runner:runner "$dot"                     # top-level inode only, NON-recursive
+    done
+  fi
+  : > "$PROVISION_HOME_SENTINEL" 2>/dev/null && "$CHOWN" "$WORKER_OWNER" "$PROVISION_HOME_SENTINEL" 2>/dev/null \
+    || echo "uzi-entrypoint: warning: could not persist $PROVISION_HOME_SENTINEL (re-runs next boot)" >&2
 fi
 
 # --- (a3) PRD #51 M3 / 5-bis: distinct per-uid TMPDIR on 0700 trees -------------
