@@ -17,7 +17,8 @@
 #   VERB (at most one; only meaningful with an RC in flight):
 #     (none)          no RC in flight -> cut vX.Y.Z-rc.1. An RC in flight for THIS base
 #                     (release-cut B while vB-rc.N exists) -> cut the next candidate
-#                     vB-rc.(N+1) (requires [Unreleased] empty, D3). An RC in flight for
+#                     vB-rc.(N+1), folding [Unreleased] into the open [B] section per
+#                     subsection (guarded, D3). An RC in flight for
 #                     a LOWER base -> REFUSE (exit 3) and print the facts, so the lead
 #                     picks a verb.
 #     --promote       promote the in-flight RC to stable from its own commit (D5), then
@@ -339,6 +340,83 @@ rename_and_fold() { # skiprc: rename `## [IB]`->`## [NEW]` (date today), move [U
   mv "$tmp" CHANGELOG.md; rm -f "$bodyf"
 }
 
+# fold_into_open <base>: nextrc: move the [Unreleased] body into the open `## [base]`
+# section, subsection by subsection (D3, amended): each `### X` bucket is appended to the
+# end of the section's own `### X`, or opens that subsection at the section's end. PRs
+# land their entries in [Unreleased], so a re-spin nearly always has some. Guarded, because
+# a malformed merge is invisible to the oracle and changelog-links --check: refuses (exit 3,
+# CHANGELOG untouched) on text before the first `###`, a subsection name outside Keep a
+# Changelog's six, a duplicate `###` in the result, or any line lost or invented.
+fold_into_open() {
+  local base="$1" tmp; tmp="$(mktemp)"
+  awk -v base="$base" '
+    function flush(   n, i, lines) {   # append the bucket for the current subsection
+      if (sub_ != "" && (sub_ in bucket)) {
+        n = split(bucket[sub_], lines, "\n")
+        print ""; for (i = 1; i < n; i++) print lines[i]
+        used[sub_] = 1
+      }
+    }
+    function trim(s) { sub(/^\n+/, "", s); sub(/\n+$/, "\n", s); return s }
+    FNR == NR {
+      if ($0 ~ /^## \[Unreleased\]/) { inU = 1; next }
+      if (inU && /^## \[/) inU = 0
+      if (!inU) next
+      if ($0 ~ /^### /) {
+        cur = substr($0, 5); sub(/[[:space:]]+$/, "", cur)
+        if (cur !~ /^(Added|Changed|Deprecated|Removed|Fixed|Security)$/) { print "release-cut: [Unreleased] has an unknown subsection: ### " cur > "/dev/stderr"; bad = 1 }
+        if (!(cur in bucket)) { order[++no] = cur; bucket[cur] = "" }
+        next
+      }
+      if (cur == "") { if ($0 ~ /[^[:space:]]/) { print "release-cut: [Unreleased] has text before its first ### subsection: " $0 > "/dev/stderr"; bad = 1 }; next }
+      bucket[cur] = bucket[cur] $0 "\n"
+      next
+    }
+    FNR == 1 {
+      if (bad) exit 3
+      for (k in bucket) { bucket[k] = trim(bucket[k]); if (bucket[k] !~ /[^[:space:]]/) delete bucket[k] }
+    }
+    /^## \[Unreleased\]/ && !u { print; print ""; u = 1; skipU = 1; next }
+    skipU && /^## \[/ { skipU = 0 }
+    skipU { next }
+    index($0, "## [" base "]") == 1 && !inB { inB = 1; found = 1; sub_ = ""; print; next }
+    inB && /^[[:space:]]*$/ { blanks = blanks $0 "\n"; next }
+    inB && (/^### / || /^## \[/) {
+      flush()
+      if (/^## \[/) {
+        for (i = 1; i <= no; i++) if ((order[i] in bucket) && !(order[i] in used)) { print ""; print "### " order[i]; n = split(bucket[order[i]], L, "\n"); print ""; for (j = 1; j < n; j++) print L[j]; used[order[i]] = 1 }
+        print ""; blanks = ""; inB = 0; print; next
+      }
+      printf "%s", blanks; blanks = ""
+      sub_ = substr($0, 5); sub(/[[:space:]]+$/, "", sub_); print; next
+    }
+    inB { printf "%s", blanks; blanks = ""; print; next }
+    { print }
+    END {
+      if (bad) exit 3
+      if (!found) { print "release-cut: no open ## [" base "] section" > "/dev/stderr"; exit 3 }
+      if (inB) {   # the open section was the last one in the file
+        flush()
+        for (i = 1; i <= no; i++) if ((order[i] in bucket) && !(order[i] in used)) { print ""; print "### " order[i]; n = split(bucket[order[i]], L, "\n"); print ""; for (j = 1; j < n; j++) print L[j] }
+      }
+    }
+  ' CHANGELOG.md CHANGELOG.md > "$tmp" || { rm -f "$tmp"; echo "release-cut: [Unreleased] fold into [$base] refused; CHANGELOG untouched" >&2; exit 3; }
+
+  # Guard 1: no subsection appears twice in the open section.
+  local dups
+  dups="$(awk -v base="$base" 'index($0, "## [" base "]") == 1 { s = 1; next } s && /^## \[/ { exit } s && /^### / { print }' "$tmp" | sort | uniq -d)"
+  # Guard 2: every non-blank line survives exactly once, nothing invented. `###` lines are
+  # excluded: folding a bucket into an existing subsection drops its heading by design.
+  local before after
+  before="$(grep -v -e '^[[:space:]]*$' -e '^### ' CHANGELOG.md | sort)"
+  after="$(grep -v -e '^[[:space:]]*$' -e '^### ' "$tmp" | sort)"
+  if [ -n "$dups" ] || [ "$before" != "$after" ] || [ -n "$(awk '/^## \[Unreleased\]/{f=1;next} f&&/^## \[/{exit} f' "$tmp" | tr -d '[:space:]')" ]; then
+    echo "release-cut: [Unreleased] fold into [$base] failed its guard (duplicate subsection: ${dups:-none}; line set changed: $([ "$before" = "$after" ] && echo no || echo yes)); CHANGELOG untouched" >&2
+    rm -f "$tmp"; exit 3
+  fi
+  mv "$tmp" CHANGELOG.md
+}
+
 # sync_stable_heading <stable-tag>: make main's `## [S] - <date>` heading match the copy in
 # the stable tag. Promotion dates the section on the release branch (D3/D5); a promote that
 # never touches main (--promote-only, or the implicit promote-only branch) leaves main at the
@@ -532,14 +610,12 @@ case "$OP" in
   rc1|stable)
     fold_or_insert "$BASE" ;;
   nextrc)
-    body="$(changelog_unreleased_body | tr -d '[:space:]')"
-    if [ -n "$body" ]; then
-      echo "release-cut: [Unreleased] must be EMPTY to cut $TAG (write re-spin entries into the open ## [$BASE] section). Was:" >&2
-      changelog_unreleased_body | sed 's/^/    | /' >&2
-      exit 3
-    fi
     if ! grep -qE "^## \[$BASE\]" CHANGELOG.md; then
       echo "release-cut: no open '## [$BASE]' section for the next candidate; expected it from the first RC." >&2; exit 3
+    fi
+    if [ -n "$(changelog_unreleased_body | tr -d '[:space:]')" ]; then
+      fold_into_open "$BASE"
+      echo "  CHANGELOG: [Unreleased] folded into the open [$BASE] section"
     fi ;;
   skiprc)
     rename_and_fold "$IB" "$BASE" ;;

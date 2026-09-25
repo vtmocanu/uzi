@@ -463,25 +463,26 @@ run_rc "$S1" 0.2.0
 assert_eq "next RC exits 0"                  "0"          "$RC_RC"
 assert_eq "next RC chart is 0.2.0-rc.2"      "0.2.0-rc.2" "$(chart_ver "$S1")"
 
-echo "=== M2: next RC refused on non-empty [Unreleased] ==="
-S3="$(mktemp -d)"; seed_repo "$S3"; add_feature "$S3" 201
-put_changelog "$S3" <<'MD'
+echo "=== M2: next RC folds a non-empty [Unreleased] into the open section ==="
+# next_rc_fixture <dir> : first RC of 0.2.0 tagged, then CHANGELOG from stdin committed.
+next_rc_fixture() {
+  local cl; cl="$(cat)"   # read stdin first: the first-RC cut below must not consume it
+  seed_repo "$1"; add_feature "$1" 201
+  printf '# Changelog\n\n## [Unreleased]\n### Added\n- **Feature 201** (#201)\n\n## [0.1.0] - 2026-09-01\n### Added\n- **Initial** (#100)\n' | put_changelog "$1"
+  run_rc "$1" 0.2.0
+  git -C "$1" tag v0.2.0-rc.1
+  add_feature "$1" 250
+  printf '%s\n' "$cl" | put_changelog "$1"
+}
+open_section() { awk '/^## \[0\.2\.0\]/{s=1;next} s&&/^## \[/{exit} s' "$1/CHANGELOG.md"; }
+S3="$(mktemp -d)"
+next_rc_fixture "$S3" <<'MD'
 # Changelog
 
 ## [Unreleased]
-### Added
-- **Feature 201** (#201)
+### Fixed
+- **Late fix** (#250)
 
-## [0.1.0] - 2026-09-01
-### Added
-- **Initial** (#100)
-MD
-run_rc "$S3" 0.2.0                # first RC
-git -C "$S3" tag v0.2.0-rc.1
-put_changelog "$S3" <<'MD'
-# Changelog
-
-## [Unreleased]
 ### Added
 - **Late thing** (#250)
 
@@ -494,8 +495,56 @@ put_changelog "$S3" <<'MD'
 - **Initial** (#100)
 MD
 run_rc "$S3" 0.2.0
-assert_eq "next RC refused (non-empty [Unreleased]) exits 3" "3" "$RC_RC"
-assert_contains "next RC refusal explains EMPTY rule" "must be EMPTY" "$RC_OUT"
+assert_eq "next RC with non-empty [Unreleased] exits 0" "0" "$RC_RC"
+assert_eq "next RC chart is 0.2.0-rc.2 after a fold" "0.2.0-rc.2" "$(chart_ver "$S3")"
+assert_eq "[Unreleased] is empty after the fold" "" \
+  "$(awk '/^## \[Unreleased\]/{f=1;next} f&&/^## \[/{exit} f' "$S3/CHANGELOG.md" | tr -d '[:space:]')"
+sec="$(open_section "$S3")"
+assert_eq "open section keeps ONE ### Added" "1" "$(printf '%s\n' "$sec" | grep -c '^### Added')"
+assert_eq "open section gains ### Fixed" "1" "$(printf '%s\n' "$sec" | grep -c '^### Fixed')"
+assert_eq "Late thing lands under the existing ### Added, after Feature 201" "### Added|- **Feature 201**|- **Late thing**|### Fixed|- **Late fix**" \
+  "$(printf '%s\n' "$sec" | grep -v '^[[:space:]]*$' | sed 's/^\(- \*\*[^*]*\*\*\).*/\1/' | paste -sd'|' -)"
+
+echo "=== M2: next RC fold refuses what it cannot place ==="
+S3U="$(mktemp -d)"
+next_rc_fixture "$S3U" <<'MD'
+# Changelog
+
+## [Unreleased]
+### Improvements
+- **Late thing** (#250)
+
+## [0.2.0] - 2026-10-01
+### Added
+- **Feature 201** (#201)
+
+## [0.1.0] - 2026-09-01
+### Added
+- **Initial** (#100)
+MD
+cl_before="$(cat "$S3U/CHANGELOG.md")"
+run_rc "$S3U" 0.2.0
+assert_eq "fold refuses an unknown subsection (exit 3)" "3" "$RC_RC"
+assert_contains "refusal names the unknown subsection" "unknown subsection: ### Improvements" "$RC_OUT"
+assert_eq "refused fold leaves CHANGELOG untouched" "$cl_before" "$(cat "$S3U/CHANGELOG.md")"
+S3T="$(mktemp -d)"
+next_rc_fixture "$S3T" <<'MD'
+# Changelog
+
+## [Unreleased]
+- **Stray bullet** (#250)
+
+## [0.2.0] - 2026-10-01
+### Added
+- **Feature 201** (#201)
+
+## [0.1.0] - 2026-09-01
+### Added
+- **Initial** (#100)
+MD
+run_rc "$S3T" 0.2.0
+assert_eq "fold refuses text before the first ### (exit 3)" "3" "$RC_RC"
+assert_contains "refusal quotes the stray line" "text before its first ### subsection" "$RC_OUT"
 
 echo "=== M2: refuse a new version with no verb + --stable refused in flight ==="
 S4="$(mktemp -d)"; seed_repo "$S4"; add_feature "$S4" 201
