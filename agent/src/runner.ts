@@ -6503,8 +6503,8 @@ export class RunRunner {
       // and HOME); false means it did NOT park (it cleared its preserve flags), so the executor falls
       // back to the legacy throw and the run's normal terminal cleanup runs. Live for every
       // interlocked run: completion_interlock_rollout defaults ON (#1626), so an unseeded
-      // Claude-harness issue run carries completion_contract_version and completionInterlock
-      // above is true; a legacy, seeded or Codex run leaves it false and never reaches this seam.
+      // Claude or Codex issue run carries completion_contract_version and completionInterlock
+      // above is true; a legacy or seeded run leaves it false and never reaches this seam.
       // issue #1597 M2: gated against the mid-turn tick (it reaps and captures a restore point).
       enterCompletionHold: (reason) =>
         this.runGatedSink(flight, () => this.enterCompletionHold(flight, claim, reason, runLog)),

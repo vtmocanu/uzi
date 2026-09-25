@@ -797,6 +797,7 @@ Mock at `prds/mockups/1167-lights-on-themes-mock.html`.
 Tracked as GitHub issue vtmocanu/uzi#1226 (parent epic #1225); PRD at `prds/done/1226-structural-completion-interlock.md`.
 
 - An issue run may open a closing PR only after every in-scope approved milestone is declared complete against a frozen contract for the exact final head, or the owner records an explicit later decision. An incomplete attempt returns to the same lead and otherwise holds without discarding its work. [user, #1226]
+- (AI-synced 2026-09-25) The structural completion interlock applies by default to new, unseeded issue runs on both Claude and Codex. A Codex interlocked run needs a worker advertising `codex_completion_interlock_v1` in addition to the shared completion protocol; unmet milestones return to the same Codex thread before a recoverable hold. [AI-synced, #1226]
 - (AI-synced 2026-09-13) That explicit later decision is delivered by #1227 as three bounded, revisioned, owner-only decisions — continue, partial (reduce scope by exact milestone ids → a `scope_reduced` delivery that never closes the issue) and accept (waive exact named criteria with a required reason, named in the closing PR); each creates a new contract revision and invalidates every prior permit, and the lead has no route to the decision authority. PRD at `prds/done/1227-completion-owner-decisions.md`. [AI-synced, #1227]
 
 ## Feature #1265 — RC-first release train

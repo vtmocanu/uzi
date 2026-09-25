@@ -140,8 +140,8 @@ const (
 	// healthWaitingWorker enum (no migration — runs.health_reason is free text). NOT gated by the
 	// interlock switch: a run that IS interlocked stays subject to the claim clause regardless of
 	// the flag, so the reason reflects the run's actual state. With the switch ON by default
-	// (#1626) every new unseeded Claude-harness issue run is interlocked, so this fires whenever
-	// such a run's owner has no protocol-capable worker online.
+	// (#1626) every new unseeded Claude or Codex issue run is interlocked, so this fires
+	// whenever such a run's owner has no protocol-capable worker online.
 	reasonNoCompletionCapableWorker = "no online worker implements the completion interlock (completion_interlock_v1); provision a capable worker"
 	// reasonNoCodexCapableWorker (PRD #1332 M5A, D3) is emitted for a CODEX-INDICATING queued run
 	// (harness='codex', or a surviving M1 binding sentinel) whose owner has NO online worker
@@ -887,7 +887,7 @@ func (s *Service) capabilityAwareOn(ctx context.Context) bool {
 // error only on a cold read with no valid cached snapshot (a failed refresh over a valid
 // cache serves the cached value error-free), and on that error the value is discarded, so a
 // momentarily-unreadable setting creates a legacy (unstamped) run. createRun additionally
-// stamps only unseeded Claude-harness runs.
+// stamps only unseeded issue runs; both Claude and Codex can be interlocked.
 func (s *Service) completionInterlockOn(ctx context.Context) bool {
 	if s.completionInterlock == nil {
 		return false

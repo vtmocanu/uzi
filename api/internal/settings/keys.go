@@ -98,9 +98,9 @@ const (
 	// a docker-needing run may be claimed by a non-docker worker and fail mid-run).
 	KeyCapabilityAwareScheduling = "capability_aware_scheduling"
 	// Completion-interlock switch (PRD #1226 M1, D1/D8; #1626). A bool ("true"/"false"),
-	// default ON for Claude-harness issue runs. When on, CreateRun stamps
-	// completion_contract_version=1 on a new, unseeded issue run whose resolved harness is
-	// Claude, before its first claim, so the run is interlocked and the non-bypassable
+	// default ON for unseeded Claude and Codex issue runs. When on, CreateRun stamps
+	// completion_contract_version=1 on a new, unseeded issue run, before its first
+	// claim, so the run is interlocked and the non-bypassable
 	// ClaimRun protocol clause (D2) applies. It is an admin kill-switch (Admin -> Instance settings ->
 	// Completion check): an explicit "false" row keeps it off. A junk value
 	// falls to the default (now on), the same as the sibling bools. Read errors: a cold read
@@ -323,8 +323,8 @@ const (
 	// hatch if inference false-positives start blocking runs.
 	DefaultCapabilityAwareScheduling = "true"
 	// PRD #1226 M1 (D1/D8), #1626: the completion-interlock switch defaults ON, so a new
-	// unseeded Claude-harness issue run is interlocked out of the box (Codex runs are never
-	// stamped; see workersvc createRun). It stays an admin kill-switch (Admin -> Instance settings ->
+	// unseeded Claude or Codex issue run is interlocked out of the box.
+	// It stays an admin kill-switch (Admin -> Instance settings ->
 	// Completion check): an explicit "false" row keeps it off, junk falls to
 	// this default (on) like the sibling bools, and a cold read error means no stamp because
 	// completionInterlockOn discards any errored value, while a failed refresh with a valid

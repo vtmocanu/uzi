@@ -6,7 +6,7 @@ import { Alert, Button, Card, SectionTitle } from "../../components/ui";
 // CompletionInterlockCard is the admin kill-switch for the completion interlock
 // (issue #1626, PRD #1226). Default ON. Before an issue run opens a PR that closes its
 // issue, the interlock checks every milestone of the approved plan is marked done.
-// It applies to Claude runs only; Codex runs are not checked yet. Sends only
+// It applies to new, unseeded issue runs on both Claude and Codex. Sends only
 // completion_interlock_rollout on change, following the CapabilitySchedulingCard
 // bool-default-true precedent.
 export function CompletionInterlockCard({
@@ -57,7 +57,7 @@ export function CompletionInterlockCard({
           told which ones and keeps working. If it still does not finish them, the run pauses for
           its owner to continue it, ship only some milestones without closing the issue, or accept
           specific criteria as met. The check itself uses no model, though the extra work it
-          triggers does. Applies to Claude runs; Codex runs are not checked yet. Turn off only if
+          triggers does. Applies to new, unseeded Claude and Codex issue runs. Turn off only if
           it blocks runs you trust.
         </p>
       </div>

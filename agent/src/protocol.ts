@@ -781,9 +781,9 @@ export interface ClaimConfig {
    *  ⇒ this run is INTERLOCKED and the worker must run the structural completion protocol
    *  (checkpoint-first same-lead attempt loop, permit before PR). Read straight off
    *  runs.completion_contract_version, stamped at CreateRun (M1) when the completion-interlock
-   *  switch is on (default on since #1626) for an unseeded Claude-harness run. This is
-   *  WORKER-ONLY claim config — deliberately NOT on the web RunDTO. Absent (a legacy, seeded or
-   *  Codex run, or the switch off) ⇒ the worker runs the legacy path, byte-identical to today. */
+   *  switch is on (default on since #1626) for an unseeded Claude or Codex issue run. This is
+   *  WORKER-ONLY claim config — deliberately NOT on the web RunDTO. Absent (a legacy,
+   *  seeded or switch-off run) ⇒ the worker runs the legacy path, byte-identical to today. */
   completion_contract_version?: number;
   /** PRD #1226 M4 (D5): the FROZEN structural completion-contract revision, read straight off
    *  runs.contract_revision. The worker echoes it VERBATIM in its completion permit request so

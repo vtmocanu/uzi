@@ -235,22 +235,22 @@ actually blocked this way.
 Whether uzi checks, before an interlocked issue run opens a pull/merge
 request that closes its issue, that every milestone of the approved plan was
 actually declared done: **Completion check** (`completion_interlock_rollout`),
-**on by default** for a new, unseeded issue run using the Claude harness. A
-Codex issue run is not checked yet, regardless of this setting, and neither
-is a run started from a seeded plan (`uzi run create --plan-file`) — it
-never sends the plan-bearing report the check hooks into. Turning it off is an
+**on by default** for a new, unseeded issue run using either the Claude or
+Codex harness. A run started from a seeded plan (`uzi run create --plan-file`)
+is exempt because it never sends the plan-bearing report the check hooks into. Turning it off is an
 explicit, instance-wide kill-switch — an issue run created while it's off
 behaves as it did before this feature existed, and a run created before the
 switch was ever flipped keeps whatever the switch said at its own creation.
 
 A worker must also advertise the `completion_interlock_v1` protocol
-capability to claim a stamped run in the first place. If none of the run
-owner's online workers does, the run stays queued and its health reason says
-so directly: "no online worker implements the completion interlock
-(completion_interlock_v1); provision a capable worker". Upgrade the owner's
-workers to this release to clear it (a worker from v0.83.0 onward can claim
-the run, but an older one than this release may still pause it at finalize;
-see the CHANGELOG). Turning Completion check off does **not** release a run
+capability to claim a stamped run in the first place. For an interlocked Codex
+run, the worker must also advertise `codex_completion_interlock_v1`. If none of the run
+owner's online workers has the required protocol capabilities, the run stays
+queued. The health reason names the missing completion capability, including
+`codex_completion_interlock_v1` for an interlocked Codex run. Upgrade the
+owner's workers to this release to clear it (a worker from v0.83.0 onward can
+claim an interlocked Claude run, but an older one than this release may still
+pause it at finalize; see the CHANGELOG). Turning Completion check off does **not** release a run
 already queued this way: it only stops stamping runs created afterwards, so
 the stuck run needs a capable worker, or cancel it and create it again.
 See [Completion holds and the structural interlock](./run-completion-hold.md)
