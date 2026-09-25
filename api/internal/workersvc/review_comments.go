@@ -78,9 +78,10 @@ func isBotControlComment(body string) bool {
 // walkthrough/status/tips note: authored by a GitHub App bot (login ends in "[bot]"),
 // carrying one of CodeRabbit's summary/walkthrough markers, or consisting solely of a
 // recognized review-bot control command (botControlCommands: CodeRabbit, Greptile). A
-// human top-level note ("please also rename X") stays actionable, including one that adds prose after a bot command. Anything whose
-// review state is not the summary sentinel defaults to actionable, so the trigger set can
-// only ever shrink relative to the pre-#1142 behavior, never grow.
+// human top-level note ("please also rename X") stays actionable, including one that
+// adds prose after a bot command. Anything whose review state is not the summary
+// sentinel defaults to actionable, so the trigger set can only ever shrink relative to
+// the pre-#1142 behavior, never grow.
 //
 // It reads only the fields BuildReviewCommentsSnapshot already carries; the poller
 // detector (poller/mr_review_watch.go) calls it to compute the trigger high-water,

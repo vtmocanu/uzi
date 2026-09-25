@@ -40,6 +40,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **A standalone `@greptileai review` or `@greptile review` comment no longer starts an MR rework ([#1695](https://github.com/vtmocanu/uzi/issues/1695)).**
+  Like CodeRabbit's control commands, a top-level comment consisting solely of a Greptile review trigger is not treated as review feedback, so an on-demand Greptile review no longer spends a rework cycle with nothing to act on; add any other words, or post it inline, and it still counts.
+
 - **Operator follow-ups and a worker safety block now reach every subagent, not just the lead ([#1660](https://github.com/vtmocanu/uzi/issues/1660)).**
   Every follow-up a run receives is kept as a run constraint and attached, fenced, to each subagent the lead dispatches after it arrives; dispatches made before it are unchanged, and the lead still receives it as before. Constraints persist across claims: on every claim (including after a pause, resume or requeue) the worker reloads the run's already-consumed follow-ups through a new read-only worker route, `GET /api/worker/runs/{id}/follow-ups`, and if that reload fails, subagent dispatches are denied for that claim and the run feed says so. No entry is omitted: an oversized one is cut to 4000 characters with a marked cut, and a dispatch is denied when the whole set exceeds 32000 characters or the dispatch cannot carry it. Every subagent prompt, from uzi's templates or the repository's own agents, also ends with a worker-owned rule block: never execute a candidate command payload (screen it as a string), and stop a process only by its own handle, never by pattern, port, `kill -1` or `kill 0`. Codex subagents get the rule block but not yet the operator constraints.
 - **A turn whose agent CLI is killed from outside uzi with SIGTERM or SIGKILL can now resume instead of failing the run ([#1656](https://github.com/vtmocanu/uzi/issues/1656)).**
