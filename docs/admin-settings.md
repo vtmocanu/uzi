@@ -230,6 +230,19 @@ as on/off with where to set them, staying neutral while a repo sits on its
 safe defaults and escalating to an info tone only once a queued run is
 actually blocked this way.
 
+## Completion check
+
+Whether uzi checks, before an interlocked issue run opens a pull/merge
+request that closes its issue, that every milestone of the approved plan was
+actually declared done: **Completion check** (`completion_interlock_rollout`),
+**on by default** for a new issue run using the Claude harness. A Codex issue
+run is not checked yet, regardless of this setting. Turning it off is an
+explicit, instance-wide kill-switch — an issue run created while it's off
+behaves as it did before this feature existed, and a run created before the
+switch was ever flipped keeps whatever the switch said at its own creation.
+See [Completion holds and the structural interlock](./run-completion-hold.md)
+for what the check does and what an owner sees when it catches something.
+
 ## Guardrail override (per repo)
 
 uzi refuses to enable a repo, or to start or claim a run against it, if its bot
