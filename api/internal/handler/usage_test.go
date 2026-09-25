@@ -2,6 +2,7 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -335,15 +336,20 @@ func TestAdminUsageRequiresAdmin(t *testing.T) {
 
 func TestListRunsAttachesUsageOnlyWhenPresent(t *testing.T) {
 	user := store.User{ID: uuid.New()}
-	st := &runsStore{userRuns: []store.ListRunsForUserRow{
-		{
-			Run: store.Run{ID: uuid.New(), Status: "completed"}, RepoPath: "g/r",
-			UsageInputTokens:  pgtype.Int8{Int64: 1200, Valid: true},
-			UsageOutputTokens: pgtype.Int8{Int64: 800, Valid: true},
-			UsageCostUsd:      numericFor(0.05),
+	withUsageID, noUsageID := uuid.New(), uuid.New()
+	// Issue #1620: usage no longer rides the ListRunsForUser row; it comes from ONE
+	// ListRunUsageTotalsForRuns call over the page's ids, and a run absent from that
+	// result renders no usage (never a fake 0).
+	st := &runsStore{
+		userRuns: []store.ListRunsForUserRow{
+			{Run: store.Run{ID: withUsageID, Status: "completed"}, RepoPath: "g/r"},
+			{Run: store.Run{ID: noUsageID, Status: "queued"}, RepoPath: "g/r"}, // no usage rows → absent
 		},
-		{Run: store.Run{ID: uuid.New(), Status: "queued"}, RepoPath: "g/r"}, // no usage rows → NULL columns
-	}}
+		runUsageTotals: []store.RunUsageTotal{{
+			RunID: withUsageID, InputTokens: 1200, OutputTokens: 800,
+			CostUsd: numericFor(0.05), CostStatus: "metered",
+		}},
+	}
 	h := newRunsHandler(t, st)
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/api/runs", nil)
@@ -362,11 +368,34 @@ func TestListRunsAttachesUsageOnlyWhenPresent(t *testing.T) {
 	if len(body.Runs) != 2 {
 		t.Fatalf("want 2 runs, got %d", len(body.Runs))
 	}
-	if body.Runs[0].Usage == nil || body.Runs[0].Usage.InputTokens != 1200 || body.Runs[0].Usage.CostUSD != 0.05 {
+	if body.Runs[0].Usage == nil || body.Runs[0].Usage.InputTokens != 1200 || body.Runs[0].Usage.OutputTokens != 800 || body.Runs[0].Usage.CostUSD != 0.05 {
 		t.Fatalf("run with usage should carry it: %+v", body.Runs[0].Usage)
 	}
 	if body.Runs[1].Usage != nil {
 		t.Fatalf("run without usage rows must omit usage (never a fake 0), got %+v", body.Runs[1].Usage)
+	}
+	if len(st.runUsageTotalsArg) != 2 || st.runUsageTotalsArg[0] != withUsageID || st.runUsageTotalsArg[1] != noUsageID {
+		t.Fatalf("usage totals must be read for exactly the page's run ids, got %v", st.runUsageTotalsArg)
+	}
+}
+
+// Issue #1620: the usage read is NOT best-effort decoration. Dropping it on error would
+// render every run on the page as "no usage", a fabricated answer, so the list fails 500.
+func TestListRunsUsageTotalsErrorIs500(t *testing.T) {
+	user := store.User{ID: uuid.New()}
+	st := &runsStore{
+		userRuns:          []store.ListRunsForUserRow{{Run: store.Run{ID: uuid.New(), Status: "completed"}, RepoPath: "g/r"}},
+		runUsageTotalsErr: errors.New("boom"),
+	}
+	h := newRunsHandler(t, st)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/runs", nil)
+	h.ListRuns(rec, req.WithContext(mw.ContextWithUser(req.Context(), user)))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("ListRuns with a failing usage read = %d, want 500", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), "boom") {
+		t.Fatalf("500 body must not leak the store error: %s", rec.Body.String())
 	}
 }
 

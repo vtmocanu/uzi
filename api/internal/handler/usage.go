@@ -273,24 +273,22 @@ func (h *Handler) AdminUsage(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// usageFromListRow builds the run-level usage bundle for a run list row, or nil
-// when the run has no usage (the LEFT JOIN yields NULLs — a pre-feature run shows
-// nothing, never a fake 0). All usage_* columns are NULL together, so the input
-// token column's validity gates the whole bundle.
-func usageFromListRow(row store.ListRunsForUserRow) *apitypes.UsageDTO {
-	if !row.UsageInputTokens.Valid {
+// usageFromTotals builds the run-level usage bundle for a run list row from its
+// ListRunUsageTotalsForRuns row (issue #1620), or nil when the run has no usage (ok is
+// false: the run is absent from the page's totals map — a pre-feature run shows nothing,
+// never a fake 0).
+func usageFromTotals(row store.RunUsageTotal, ok bool) *apitypes.UsageDTO {
+	if !ok {
 		return nil
 	}
 	return &apitypes.UsageDTO{
-		InputTokens:         row.UsageInputTokens.Int64,
-		CacheReadTokens:     row.UsageCacheReadTokens.Int64,
-		CacheCreationTokens: row.UsageCacheCreationTokens.Int64,
-		OutputTokens:        row.UsageOutputTokens.Int64,
-		CostUSD:             numericToFloat(row.UsageCostUsd),
-		// PRD #1429 M1 (D7): the run's folded cost_status from run_usage_totals. Nullable in
-		// the LEFT join, but a usage-bearing row (guarded above by UsageInputTokens.Valid)
-		// always carries it; a NULL reads as "" (harmless — the row has usage, so the token
-		// columns gate the bundle, and cost_status is the display marker).
-		CostStatus: row.UsageCostStatus.String,
+		InputTokens:         row.InputTokens,
+		CacheReadTokens:     row.CacheReadTokens,
+		CacheCreationTokens: row.CacheCreationTokens,
+		OutputTokens:        row.OutputTokens,
+		CostUSD:             numericToFloat(row.CostUsd),
+		// PRD #1429 M1 (D7): the run's folded cost_status from run_usage_totals, so a
+		// subscription/unreported placeholder 0 never reads as a real dollar total.
+		CostStatus: row.CostStatus,
 	}
 }

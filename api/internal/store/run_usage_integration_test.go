@@ -611,20 +611,56 @@ func TestUsageRollupsLiveDB(t *testing.T) {
 		t.Fatalf("user B per-user input = %d, want 300", got)
 	}
 
-	// --- run list: usage columns populated for a run with usage, NULL for one without.
-	rows, err := q.ListRunsForUser(ctx, store.ListRunsForUserParams{UserID: userA})
+	// --- run list usage (issue #1620): the Runs list no longer LEFT-joins the view; it
+	// reads the page's totals with ONE ListRunUsageTotalsForRuns call. A run with usage is
+	// present with its rollup; a run without usage is ABSENT (never a fake 0 row).
+	listed, err := q.ListRunUsageTotalsForRuns(ctx, []uuid.UUID{a1, a2, a3, b1, bl})
 	if err != nil {
-		t.Fatalf("ListRunsForUser(A): %v", err)
+		t.Fatalf("ListRunUsageTotalsForRuns: %v", err)
 	}
-	byID := map[uuid.UUID]store.ListRunsForUserRow{}
-	for _, row := range rows {
-		byID[row.Run.ID] = row
+	byID := map[uuid.UUID]store.RunUsageTotal{}
+	for _, row := range listed {
+		if _, dup := byID[row.RunID]; dup {
+			t.Fatalf("ListRunUsageTotalsForRuns returned run %s twice; the view must yield one row per run", row.RunID)
+		}
+		byID[row.RunID] = row
 	}
-	if r := byID[a1]; !r.UsageInputTokens.Valid || r.UsageInputTokens.Int64 != 1700 {
-		t.Fatalf("A1 list usage = %+v, want valid 1700", r.UsageInputTokens)
+	if r, ok := byID[a1]; !ok || r.InputTokens != 1700 || r.OutputTokens != 750 {
+		t.Fatalf("A1 list usage = %+v (present=%t), want 1700/750", r, ok)
 	}
-	if r := byID[a3]; r.UsageInputTokens.Valid {
-		t.Fatalf("A3 (no usage) must have NULL usage columns, got %+v", r.UsageInputTokens)
+	if r, ok := byID[a3]; ok {
+		t.Fatalf("A3 (no usage) must be absent from ListRunUsageTotalsForRuns, got %+v", r)
+	}
+	if len(byID) != 4 { // a1, a2, b1, bl carry usage; a3 does not
+		t.Fatalf("ListRunUsageTotalsForRuns returned %d runs, want 4 (every requested run with usage, a3 absent)", len(byID))
+	}
+	// The ANY(@run_ids) filter scopes to exactly the requested ids: asking for one run
+	// returns only that run, even though other runs in the DB carry usage.
+	only, err := q.ListRunUsageTotalsForRuns(ctx, []uuid.UUID{b1})
+	if err != nil {
+		t.Fatalf("ListRunUsageTotalsForRuns(b1): %v", err)
+	}
+	if len(only) != 1 || only[0].RunID != b1 || only[0].InputTokens != 300 {
+		t.Fatalf("ListRunUsageTotalsForRuns(b1) = %+v, want exactly b1 with 300 input", only)
+	}
+
+	// --- equality with the per-run read: for every seeded run with usage, the page
+	// read's row is field-for-field the GetRunUsageTotal row (the same view, only the
+	// qual differs), so the list and the run-detail strip can never disagree.
+	for _, id := range []uuid.UUID{a1, a2, b1, bl} {
+		one, err := q.GetRunUsageTotal(ctx, id)
+		if err != nil {
+			t.Fatalf("GetRunUsageTotal(%s): %v", id, err)
+		}
+		page := byID[id]
+		got := store.GetRunUsageTotalRow{
+			InputTokens: page.InputTokens, CacheReadTokens: page.CacheReadTokens,
+			CacheCreationTokens: page.CacheCreationTokens, OutputTokens: page.OutputTokens,
+			CostUsd: page.CostUsd, CostStatus: page.CostStatus,
+		}
+		if fmt.Sprintf("%+v", got) != fmt.Sprintf("%+v", one) {
+			t.Fatalf("run %s: ListRunUsageTotalsForRuns row %+v != GetRunUsageTotal row %+v", id, got, one)
+		}
 	}
 }
 

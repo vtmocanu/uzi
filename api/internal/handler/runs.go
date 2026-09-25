@@ -49,14 +49,24 @@ func (h *Handler) ListRuns(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	// Judge to-triage counts for the runs ON THIS PAGE (PRD #98 M4). Deliberately a
-	// second query bucketed in Go rather than a join: see queries/runtime.sql. Best
-	// effort — the judge badge is decoration, so a failure here logs and leaves every
-	// count at 0 rather than failing the whole run list.
 	runIDs := make([]uuid.UUID, 0, len(rows))
 	for _, row := range rows {
 		runIDs = append(runIDs, row.Run.ID)
 	}
+	// Usage totals for the runs ON THIS PAGE (issue #1620): a second query rather than a
+	// join, because a LEFT JOIN of run_usage_totals inside ListRunsForUser nested-looped the
+	// whole view per run row under pgx's generic plan. NOT best-effort like the decoration
+	// below: dropping the map would render every run as "no usage", a fake answer.
+	usage, err := h.wsvc.RunUsageTotalsForRuns(r.Context(), runIDs)
+	if err != nil {
+		slog.Error("run usage totals", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	// Judge to-triage counts for the runs ON THIS PAGE (PRD #98 M4). Deliberately a
+	// second query bucketed in Go rather than a join: see queries/runtime.sql. Best
+	// effort — the judge badge is decoration, so a failure here logs and leaves every
+	// count at 0 rather than failing the whole run list.
 	todo, err := h.wsvc.JudgeTodoCountsForRuns(r.Context(), user.ID, runIDs)
 	if err != nil {
 		slog.Error("judge todo counts", "error", err)
@@ -100,7 +110,8 @@ func (h *Handler) ListRuns(w http.ResponseWriter, r *http.Request) {
 		item.ForgeType = row.ForgeType // per-run MR/PR noun (PRD #65 D2)
 		// PRD #411: the joined forge issue web URL, nil for issue-less/uncached runs.
 		item.IssueWebURL = textPtrValue(row.IssueWebUrl.Valid, row.IssueWebUrl.String)
-		item.Usage = usageFromListRow(row) // nil when the run has no usage rows (PRD #40)
+		usageRow, hasUsage := usage[row.Run.ID]
+		item.Usage = usageFromTotals(usageRow, hasUsage) // nil when the run has no usage rows (PRD #40)
 		// nil stays nil for an unjudged run — absent, not a neutral verdict.
 		item.JudgeVerdict = textPtrValue(row.JudgeVerdict.Valid, row.JudgeVerdict.String)
 		item.JudgeTodoCount = todo[row.Run.ID]

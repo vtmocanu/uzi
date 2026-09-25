@@ -499,6 +499,10 @@ type Store interface {
 	// instant so submitApproval can log what CreateApprovePlanInput saw (issue #260).
 	GetRunMilestoneFreezeSnapshot(ctx context.Context, id uuid.UUID) (store.GetRunMilestoneFreezeSnapshotRow, error)
 	ListRunsForUser(ctx context.Context, arg store.ListRunsForUserParams) ([]store.ListRunsForUserRow, error)
+	// ListRunUsageTotalsForRuns reads the rollup totals for a page of runs (issue #1620):
+	// the Runs list no longer LEFT-joins run_usage_totals, whose generic plan re-folded the
+	// view once per run row.
+	ListRunUsageTotalsForRuns(ctx context.Context, runIds []uuid.UUID) ([]store.RunUsageTotal, error)
 	ListActiveRunsAll(ctx context.Context, backgroundGraceCutoff pgtype.Timestamptz) ([]store.ListActiveRunsAllRow, error)
 	ListAllWorkers(ctx context.Context) ([]store.ListAllWorkersRow, error)
 	GetRunOwnedByWorker(ctx context.Context, arg store.GetRunOwnedByWorkerParams) (store.Run, error)
@@ -5749,6 +5753,25 @@ func (s *Service) ListRunsForUser(ctx context.Context, userID uuid.UUID, repoID 
 		arg.IssueIid = pgtype.Int8{Int64: *issueIID, Valid: true}
 	}
 	return s.q.ListRunsForUser(ctx, arg)
+}
+
+// RunUsageTotalsForRuns returns the rollup usage totals for the given runs, keyed by run id
+// (issue #1620). It backs the Runs list's usage column, which used to ride a LEFT JOIN of
+// run_usage_totals inside ListRunsForUser. A run with no usage is ABSENT from the map (the
+// caller renders absent, never a fake 0). An empty input issues no query.
+func (s *Service) RunUsageTotalsForRuns(ctx context.Context, runIDs []uuid.UUID) (map[uuid.UUID]store.RunUsageTotal, error) {
+	if len(runIDs) == 0 {
+		return map[uuid.UUID]store.RunUsageTotal{}, nil
+	}
+	rows, err := s.q.ListRunUsageTotalsForRuns(ctx, runIDs)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[uuid.UUID]store.RunUsageTotal, len(rows))
+	for _, row := range rows {
+		out[row.RunID] = row
+	}
+	return out, nil
 }
 
 // ListAllWorkers returns every worker with owner email and busy status (admin).

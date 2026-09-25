@@ -53,9 +53,11 @@ func (c *HTTPClient) DownloadRecoveryArchive(ctx context.Context, runID, capture
 	req.Header.Set("Accept", "application/octet-stream")
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		// Dial refused, DNS, TLS, timeout, context deadline, or a refused redirect: the
-		// server is effectively unreachable, as with doJSONRead.
-		return 0, Exitf(ExitUnreachable, "cannot reach uzi at %s: %v", c.BaseURL, transportMsg(err))
+		// Dial refused, DNS, TLS, timeout, context deadline, or a refused redirect:
+		// ExitUnreachable, worded by transportExit as with doJSONRead (any timeout,
+		// connect/TLS/DNS timeouts included, reads "did not respond in time",
+		// anything else "cannot reach").
+		return 0, transportExit(c.BaseURL, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode/100 != 2 {

@@ -38,6 +38,10 @@ through `[0.52.0]`.)
 
 - **Runs that provision tools get a usable PATH and CA-bundle path again.**
   The worker now strips the `;` terminator that `devbox shellenv` puts on each `export` line. Previously the provisioned `PATH` kept a stray leading quote and a trailing `";`, so its first tool directory and `/bin` never resolved, and `NIX_SSL_CERT_FILE` pointed at a file that does not exist.
+- **The run list no longer times out under load with "could not refresh: cannot reach uzi … context deadline exceeded" ([#1620](https://github.com/vtmocanu/uzi/issues/1620)).**
+  `/api/runs` no longer `LEFT JOIN`s the `run_usage_totals` view; the page's usage is now fetched separately, keyed by the page's run ids, a query shape PostgreSQL pushes to an index scan regardless of which plan it picks for the statement. `/api/usage` folds its own usage the same per-run way. See [ADR-1620](adr/1620-custom-plan-cache-mode.md) for the query-plan measurement behind the fix and the durable rule new consumers of the view must follow.
+- **A CLI request that times out now says so, instead of "cannot reach uzi" ([#1620](https://github.com/vtmocanu/uzi/issues/1620)).**
+  Hitting a request deadline now reports "uzi at <url> did not respond in time (the server may be slow or unreachable): …", distinguishing a slow/overloaded server from one that's actually unreachable; the exit code is unchanged.
 
 ## [0.84.0] - 2026-09-20
 
