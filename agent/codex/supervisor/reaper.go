@@ -10,9 +10,12 @@ import (
 	"uzi.local/codex-supervisor/internal/safetree"
 )
 
-// Bounds of one reap pass. The two counts bound the memory one page and one
-// batch hold, never how much of a root a pass reaches: a pass reads each root
-// to its end unless the pass budget runs out first.
+// Bounds of one reap pass. maxReapDirents bounds the entries examined between
+// two batches, and maxReapCandidates the names one batch holds; the memory a
+// pass holds is the names parsed from its one 8 KiB getdents buffer plus one
+// batch. Neither count limits how much of a root a pass reaches: a pass reads
+// each root to its end unless the pass budget runs out first or a read error
+// ends it (reap_error "list").
 const (
 	// maxReapDirents is the most directory entries one page examines.
 	maxReapDirents = 4096
@@ -28,12 +31,15 @@ const (
 
 // Reap test seams: pinFromFd pins a candidate (a foreign owner can be
 // injected); hookBeforeReapRemove runs with the lock held and the proof
-// taken, right before RemoveBy; reapSeek and reapGetdents read a root.
+// taken, right before RemoveBy; reapSeek and reapGetdents read a root;
+// reapRemoveBy removes a candidate (its deadline argument can be observed and
+// its error injected).
 var (
 	pinFromFd            = safetree.PinFromFd
 	hookBeforeReapRemove func(parentFd int, name string)
 	reapSeek             = unix.Seek
 	reapGetdents         = unix.Getdents
+	reapRemoveBy         = safetree.RemoveBy
 )
 
 // Per-candidate outcomes.
@@ -45,11 +51,14 @@ const (
 )
 
 // reapResult is the reaper's one stdout line. Scanned is the number of
-// candidates acted on, and always Live+Removed+Retained+Foreign. Truncated
-// reports that the pass budget ran out before every entry of both roots was
-// handled (or a removal was cut short by its deadline). DirentsExamined is the
-// number of directory entries read from the roots, "." and ".." excluded, so
-// Scanned never exceeds it.
+// candidates acted on, and always Live+Removed+Retained+Foreign. Truncated is
+// true when the pass stopped before both present roots were read to their end
+// (the pass budget ran out), or a candidate was retained with reason
+// "deadline" (its own 60 s removal limit or the pass budget). A page boundary
+// alone never sets it. It can be true even when every entry left unread would
+// have been nothing to act on, because the budget ran out before the end of
+// the root was seen. DirentsExamined is the number of directory entries read
+// from the roots, "." and ".." excluded, so Scanned never exceeds it.
 type reapResult struct {
 	Event           string `json:"event"`
 	Scanned         int    `json:"scanned"`
@@ -141,11 +150,15 @@ type reapBounds struct {
 //
 // Each root is read once, from its start, in pages of at most maxReapDirents
 // entries, a page ending early once it holds maxReapCandidates matching names;
-// that batch is acted on before the next page is read, and a name read but
-// not yet acted on is kept for the next page, never dropped. There is no
-// ceiling on the candidates a pass acts on: only the pass budget stops it,
-// checked before each page and before each candidate, and then the result is
-// truncated and the rest of the pass (later roots included) is left untouched.
+// that batch is acted on before the next page is read, and on the normal path
+// a name read but not yet acted on is kept for the next page, never dropped.
+// On a read error the current partial batch is left untouched (not acted on)
+// and the pass ends with the error. There is no ceiling on the candidates a
+// pass acts on: only the pass budget or a read error stops it. The budget is
+// checked before each page and before each candidate; when it has run out the
+// result is truncated and the rest of the pass (later roots included) is left
+// untouched. A candidate retained with reason "deadline" (its removal hit its
+// own 60 s limit or the pass budget) also makes the result truncated.
 func reap(tmpFd, cacheFd int, cfg reapConfig) (reapResult, error) {
 	return reapWith(tmpFd, cacheFd, cfg, reapBounds{pageDirents: maxReapDirents, batchCandidates: maxReapCandidates})
 }
@@ -320,7 +333,7 @@ func reapOne(res *reapResult, c reapCandidate, cfg reapConfig, canRemove bool, p
 	if hookBeforeReapRemove != nil {
 		hookBeforeReapRemove(c.parentFd, c.name)
 	}
-	if err := safetree.RemoveBy(c.parentFd, c.name, pin, deadline); err != nil {
+	if err := reapRemoveBy(c.parentFd, c.name, pin, deadline); err != nil {
 		return record(reapRetained, safetree.Reason(err))
 	}
 	return record(reapRemoved, "")

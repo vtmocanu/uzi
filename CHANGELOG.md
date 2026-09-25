@@ -46,7 +46,7 @@ through `[0.52.0]`.)
 ### Fixed
 
 - **The Codex startup orphan reaper no longer strands orphans past its first 4,096 entries or 64 candidates ([#1621](https://github.com/vtmocanu/uzi/issues/1621)).**
-  Each cache root is now read to its end in bounded pages within the existing five-minute pass budget, instead of stopping after the first page. The reap line gains `truncated` and `dirents_examined`, and a pass the budget cut short is logged as a startup warning (orphans may remain until a later startup) without blocking the worker. Deletion stays fail-closed, unchanged.
+  Both roots (command tmps in /tmp and the per-run cache root) are now read to their end in bounded pages within the existing five-minute pass budget, instead of stopping after the first page. The reap line gains `truncated` and `dirents_examined`, and a pass cut short by the budget or a removal deadline is logged as a startup warning (orphans may remain until a later startup) without blocking the worker. Deletion stays fail-closed, unchanged.
 
 ## [0.84.0] - 2026-09-20
 

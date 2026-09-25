@@ -142,12 +142,16 @@
 // acts on the names that match exactly (uzi-codex-command-<lowercase uuid> in
 // /tmp, a bare lowercase uuid in the cache root). It reads in pages of at most
 // 4096 entries, a page ending early once it holds 64 matching names; that
-// batch is acted on before the next page is read, and a name already read is
-// never dropped. These two numbers bound memory only: no count of entries or
-// candidates ends a pass. Only the 5-minute pass budget does, checked before
-// each page and before each candidate; the pass then stops, later roots
-// included, leaves every name it had not yet acted on untouched, and reports
-// truncated. For each candidate, in order: a no-follow open and a pin that
+// batch is acted on before the next page is read, and on the normal path a
+// name already read is never dropped (on a read error the current partial
+// batch is left untouched, not acted on). The 4096 bounds the entries examined
+// between two batches and the 64 the names one batch holds; the memory a pass
+// holds is the names parsed from its one 8 KiB getdents buffer plus one batch.
+// No count of entries or candidates ends a pass. Only the 5-minute pass budget
+// or a read error (reap_error "list") does. The budget is checked before each
+// page and before each candidate; when it has run out the pass stops, later
+// roots included, leaves every name it had not yet acted on untouched, and
+// reports truncated. For each candidate, in order: a no-follow open and a pin that
 // must be a directory owned by --expect-uid (else "foreign", untouched). When
 // the pass's first proof was not "held", the candidate is then retained
 // (reason "proof") WITHOUT being locked, so such a pass never reports "live"
@@ -161,13 +165,16 @@
 //	{"event":"reap_error","reason":"fd_hygiene"|"args"|"uid"|"tmp_root"|"cache_root"|"list"}                                                                      // exit 2
 //
 // scanned is always live+removed+retained+foreign; a name gone before its
-// open is not counted. truncated is true when the pass budget ran out before
-// every entry of both roots was handled, or when a candidate was retained with
-// reason "deadline" (the pass budget, or its own 60 s removal deadline); a
-// pass that read both roots to their end with no such candidate reports
-// false (an entry created during the pass may or may not be read, as getdents
-// promises nothing for it; the next startup's pass sees it). dirents_examined is the number of directory entries read from the
-// roots ("." and ".." excluded), so scanned never exceeds it. A root that
+// open is not counted. truncated is true when the pass stopped before both
+// present roots were read to their end (the pass budget ran out), or when a
+// candidate was retained with reason "deadline" (its own 60 s removal limit or
+// the pass budget). A page boundary alone never sets it. It can be true even
+// when every entry left unread would have been nothing to act on, because the
+// budget ran out before the end of the root was seen. A pass that read both
+// roots to their end with no such candidate reports false (an entry created
+// during the pass may or may not be read, as getdents promises nothing for it;
+// the next startup's pass sees it). dirents_examined is the number of
+// directory entries read from the roots ("." and ".." excluded), so scanned never exceeds it. A root that
 // cannot be read, at its start or midway, is reap_error "list"; a name not yet
 // read from it is untouched.
 //

@@ -1265,7 +1265,7 @@ async function stopReaper(
  *  "protocol" (garbage, a missing line or an exit code inconsistent with the line), or
  *  "timeout_unkilled" (a timed-out or aborted reaper did not close after the kill, so it
  *  may still be running: no run may start). On `ok:true`, `truncated` means the pass
- *  budget stopped scanning or deletion early, so orphans may remain for a later startup,
+ *  budget ran out or a removal hit its deadline, so orphans may remain for a later startup,
  *  and `direntsExamined` (never below `scanned`) counts the entries the pass read. */
 export type ReapOrphansResult =
   | {

@@ -1168,6 +1168,92 @@ func TestReapPassBudget(t *testing.T) {
 	requireExists(t, dir)
 }
 
+// A removal that RemoveBy itself cuts short with ErrDeadline retains the
+// candidate (reason "deadline") and truncates the pass, with the pass budget
+// never spent, so no pre-removal budget check can set truncated instead.
+func TestReapRemovalDeadlineTruncates(t *testing.T) {
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	r := newRoots(t)
+	dir := filepath.Join(r.tmp, tmpNameN(30))
+	mkTree(t, dir)
+	calls := 0
+	reapRemoveBy = func(int, string, safetree.Pin, time.Time) error {
+		calls++
+		return fmt.Errorf("walk: %w", safetree.ErrDeadline)
+	}
+	t.Cleanup(func() { reapRemoveBy = safetree.RemoveBy })
+	start := time.Now()
+	cfg := reapConfig{uid: os.Geteuid(), prove: func() string { return proofHeld }, now: func() time.Time { return start }}
+	// No cache root, and the tmp root reaches its end within the one page, so
+	// only the "deadline" retention can set truncated.
+	res, err := reap(r.tmpFd, -1, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkSums(t, res)
+	if calls != 1 || res.Retained != 1 || len(res.outcomes) != 1 || res.outcomes[0].reason != "deadline" || !res.Truncated {
+		t.Fatalf("calls=%d reap = %s truncated=%v %+v", calls, counts(res), res.Truncated, res.outcomes)
+	}
+	requireExists(t, dir)
+}
+
+// The deadline handed to RemoveBy is the candidate's 60 s limit, capped by the
+// pass deadline once fewer than 60 s of the pass budget remain.
+func TestReapRemovalDeadlineIsCapped(t *testing.T) {
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	cases := []struct {
+		name string
+		// inReapOne is the clock at reapOne's own now(), relative to start.
+		inReapOne time.Duration
+		// want is the deadline RemoveBy must get, relative to start.
+		want time.Duration
+	}{
+		{"plenty of budget left", 0, reapCandidateBudget},
+		{"under 60 s of budget left", reapPassBudget - 10*time.Second, reapPassBudget},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRoots(t)
+			dir := filepath.Join(r.tmp, tmpNameN(31))
+			mkTree(t, dir)
+			var got []time.Time
+			reapRemoveBy = func(parentFd int, name string, pin safetree.Pin, deadline time.Time) error {
+				got = append(got, deadline)
+				return safetree.RemoveBy(parentFd, name, pin, deadline)
+			}
+			t.Cleanup(func() { reapRemoveBy = safetree.RemoveBy })
+			start := time.Now()
+			// The pass start, the page check and the pre-candidate check are
+			// at start; the check inside reapOne, after the fresh proof, is at
+			// start+inReapOne.
+			clock := []time.Time{start, start, start, start.Add(tc.inReapOne)}
+			cfg := reapConfig{uid: os.Geteuid(), prove: func() string { return proofHeld }, now: func() time.Time {
+				now := clock[0]
+				if len(clock) > 1 {
+					clock = clock[1:]
+				}
+				return now
+			}}
+			res, err := reap(r.tmpFd, -1, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			checkSums(t, res)
+			if len(got) != 1 || !got[0].Equal(start.Add(tc.want)) {
+				t.Fatalf("RemoveBy deadlines = %v, want [start+%v] (start %v)", got, tc.want, start)
+			}
+			if res.Removed != 1 || res.Truncated {
+				t.Fatalf("reap = %s truncated=%v %+v", counts(res), res.Truncated, res.outcomes)
+			}
+			requireGone(t, dir)
+		})
+	}
+}
+
 // A getdents failure mid-traversal is an error; a name it had not yet
 // returned is untouched, and what was done before stays recorded.
 func TestReapListErrorMidTraversal(t *testing.T) {
