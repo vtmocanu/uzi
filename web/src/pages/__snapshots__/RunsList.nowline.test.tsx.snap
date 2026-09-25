@@ -20,7 +20,7 @@ exports[`RunsList row now line (PRD #1064 M3) > D5: a null-milestone null-activi
       >
         <span
           aria-label="Claude"
-          class="relative z-10 inline-flex h-7 w-7 flex-none items-center justify-center text-fg"
+          class="inline-flex h-7 w-7 flex-none items-center justify-center text-fg"
           role="img"
           title="Runs on Claude"
         >
