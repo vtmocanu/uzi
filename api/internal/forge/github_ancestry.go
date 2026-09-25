@@ -9,7 +9,7 @@ import (
 	"net/http"
 	"net/url"
 
-	gh "github.com/google/go-github/v91/github"
+	gh "github.com/google/go-github/v92/github"
 )
 
 // githubBranchHeadBody is the ONLY part of GET /repos/{o}/{r}/branches/{branch} that
