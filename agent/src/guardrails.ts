@@ -64,13 +64,18 @@
 //    in depth, NOT containment. A shell parser cannot prove that a variable-expanded PID
 //    lies outside the agent's own process tree, so `kill "$pid"` stays allowed; the
 //    enumerator co-occurrence test for a dynamic `kill` target is a whole-command
-//    heuristic. Commands inside a double-quoted `$(…)` or inside a backtick substitution
-//    are NOT screened as commands: the tokenizer keeps them inside one word, so only the
-//    raw-string checks (SUBST_MASS_SIGNAL_RE, SUBST_ENUMERATOR_RE, KILL_STATIC_EVAL_RE)
-//    look inside, and every other rule (git push included) does not. Known evasions: a
-//    PID read back from a file an earlier command wrote, and escaping inside such a
-//    substitution (`kill "$(\lsof -t)"`, `` echo "`\pkill x`" ``), which the raw checks
-//    do not unescape.
+//    heuristic. The tokenizer keeps a double-quoted `$(…)` and any backtick substitution
+//    inside one word, so each such body (extractSubstitutionBodies) is screened
+//    as a command FOR THE MASS-SIGNAL RULE ONLY: its `kill`/enumerator feed the pairing,
+//    and a mass-signal denial from it counts, while a body denial for any other rule is
+//    ignored (`echo "$(git push)"` stays allowed, as at base). Because a heredoc body is
+//    tokenized like commands (see above), a heredoc inside a substitution
+//    (`git commit -m "$(cat <<'EOF' … EOF)"`) is over-denied when one of its LINES
+//    STARTS with pkill, killall, skill, `fuser -k` or a `kill` of 0 or a negative target;
+//    the same word mid-line is not a command word and passes. Substitutions nested past
+//    MAX_DEPTH are not screened, and more than MAX_SUBST_BODIES bodies in one string
+//    fails closed with REASON_DEPTH. Known evasion: a PID read back from a file an
+//    earlier command wrote.
 //    Accepted false positive: an enumerator anywhere in the same command as a
 //    `kill "$pid"` (`lsof -i :3000; kill "$SERVER_PID"`) is denied; the reason tells the
 //    agent to run the kill as its own command. The primary fixes are the worker image
@@ -212,13 +217,27 @@ const WRAPPER_VALUE_OPTS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
   // xargs `-e`/`--eof`/`--max-lines` take only an ATTACHED optional value (`-eEOF`,
   // `--eof=EOF`); a separate next word is the command (`xargs -e echo HIT` prints HIT).
   ["xargs", new Set(["-n", "-P", "-I", "-L", "-s", "-d", "-E", "-a", "--max-args", "--max-procs", "--max-chars", "--delimiter", "--arg-file", "--process-slot-var"])],
-  // sudo `-h`/`--host` are absent: a bare `-h` is `--help` on Linux sudo.
-  ["sudo", new Set(["-u", "-g", "-p", "-C", "-D", "-r", "-t", "-U", "-T", "-R", "--user", "--group", "--prompt", "--close-from", "--chdir", "--role", "--type", "--other-user", "--command-timeout", "--chroot"])],
+  // sudo `-h` is absent: it takes only an optional ATTACHED value (`-hhost`), and a bare
+  // `-h` is `--help`. `--host` always takes a value, so it is listed.
+  ["sudo", new Set(["-u", "-g", "-p", "-C", "-D", "-r", "-t", "-U", "-T", "-R", "--user", "--group", "--prompt", "--close-from", "--chdir", "--role", "--type", "--other-user", "--command-timeout", "--chroot", "--host"])],
   ["doas", new Set(["-u", "-C"])],
   ["timeout", new Set(["-s", "-k", "--signal", "--kill-after"])],
   ["nice", new Set(["-n", "--adjustment"])],
   ["ionice", new Set(["-c", "-n", "-p", "-P", "-u", "--class", "--classdata", "--pid", "--pgid", "--uid"])],
   ["stdbuf", new Set(["-i", "-o", "-e", "--input", "--output", "--error"])],
+]);
+// Generic-wrapper short options known to take NO argument, as letters. A short-option
+// cluster skips the next word only when every letter before its last is listed here
+// and the last is a WRAPPER_VALUE_OPTS letter (`sudo -Eu root`, `xargs -rn 1`). getopt
+// lets an optional-argument or value letter take the rest of the word (`xargs -en`
+// sets the eof string to `n`, `sudo -hu` the host to `u`), so a letter missing here,
+// known or not, keeps the cluster to one word: the base 613f1434 peel (#1576).
+const WRAPPER_NOARG_LETTERS: ReadonlyMap<string, string> = new Map([
+  ["xargs", "0rtpxo"],
+  ["sudo", "AbEHikKlnPSsVvBN"],
+  ["timeout", "v"],
+  ["ionice", "t"],
+  ["doas", "nsL"],
 ]);
 // Shell reserved words that can precede a real command in the same segment (`if git
 // push; then …`, `while read p; do kill $p; done`, `! git push`). The peel skips them
@@ -520,7 +539,8 @@ function analyzeDocker(cmd: string[], assignments: readonly string[], dockerWire
 }
 
 /** Whole-command state collected while screening, read once by screenBashCommand after
- *  every segment (including `sh -c`/`eval` inner screens) has been analyzed. */
+ *  every segment (including `sh -c`/`eval` inner screens and substitution bodies) has
+ *  been analyzed. */
 interface ScreenCtx {
   /** A `kill` with a target that is not a literal positive PID or a `%job` spec
    *  (`$pid`, an xargs placeholder like `{}`, a padded number), or with no target at
@@ -539,32 +559,73 @@ const ENUMERATORS = new Set(["lsof", "pgrep", "ps", "fuser", "pidof"]);
 /** `kill` options that only list signal names; they send nothing. */
 const KILL_LIST_FLAGS = new Set(["-l", "-L", "--list", "--table"]);
 
-/** Fallback for a PID enumerator inside a command substitution the tokenizer keeps in
- *  one word (a double-quoted `"$(lsof -t)"`, or any backtick substitution): the
- *  enumerator as a whole word ANYWHERE inside `$(…)`/backticks, directly after the opener
- *  or after whitespace, `;`, `&`, `|`, `(`, `{` or `/` (a path prefix). So
- *  `"$(command lsof -t)"`, `"$(sudo lsof -t)"` and `"$(true; lsof -t)"` count, and so
- *  does an enumerator NAME used as an argument (`"$(grep ps f)"`): a raw-string
- *  heuristic that over-denies safe. `[^`)]` stops the scan at the first `)` or backtick,
- *  so an enumerator after a nested `$(…)` closes is missed. Only consulted when the
- *  command also has a dynamic `kill`; every other enumerator is found from tokens
- *  (ScreenCtx.enumerator) (#1576). */
-const SUBST_ENUMERATOR_RE = /(?:\$\(|`)(?:[^`)]*?[\s;&|({/])?(?:lsof|pgrep|ps|fuser|pidof)(?=$|[\s;&|)`"'])/;
-
-/** The same raw-string check for a mass-signal command (MASS_SIGNAL_BASES) inside a
- *  `$(…)`/backtick substitution the tokenizer keeps in one word (`` echo `pkill node` ``,
- *  `echo "$(pkill node)"`). Same shape, and the same limits, as SUBST_ENUMERATOR_RE;
- *  denied on its own, no `kill` needed (#1576). */
-const SUBST_MASS_SIGNAL_RE = /(?:\$\(|`)(?:[^`)]*?[\s;&|({/])?(?:pkill|killall5?|skill)(?=$|[\s;&|)`"'])/;
-
 /** A `kill` whose argument bash evaluates statically (#1576): ANSI-C or locale quoting
  *  (`kill -9 $'-1'`, `$"-1"`, which the tokenizer turns into the word `$-1`) or
  *  arithmetic expansion (`kill -9 $((-1))`, `$((0-1))`, which the tokenizer splits at
  *  `(`, leaving the target `$`). A raw-string HEURISTIC: `kill` as a word (after start,
- *  whitespace, `;&|(`, a backtick or a path `/`), then up to the next `;`, `&`, `|` or
- *  newline. It denies every arithmetic `kill` target, the harmless `kill $((pid))`
- *  included; that degrades safe, and `kill "$pid"` is the supported form. */
-const KILL_STATIC_EVAL_RE = /(?:^|[\s;&|(`/])kill\b[^;&|\n]*\$(?:\(\(|['"])/;
+ *  whitespace, `;&|(`, a backtick or a path `/`), then ANY `$((`, `$'` or `$"` within
+ *  the next 256 characters before a `;`, `&`, `|` or newline. So it also over-denies a
+ *  `$((` that is not the target (`kill "$pid" > out.$((n))`) and the harmless
+ *  `kill $((pid))`; that degrades safe, and `kill "$pid"` is the supported form. The
+ *  256-character bound keeps the scan linear on long inputs; a `kill` separated from
+ *  such a target by more than that is missed. */
+const KILL_STATIC_EVAL_RE = /(?:^|[\s;&|(`/])kill\b[^;&|\n]{0,256}?\$(?:\(\(|['"])/;
+
+/** Upper bound on the substitution bodies extractSubstitutionBodies returns for one
+ *  string. Past it the screen fails closed with REASON_DEPTH (#1576). */
+const MAX_SUBST_BODIES = 1024;
+
+/**
+ * The bodies of the command substitutions the tokenizer keeps inside one word (#1576),
+ * in one linear pass: single-quoted regions are literal and skipped; each `$(` inside
+ * double quotes yields the text up to its matching `)` by paren-depth count (a raw
+ * count, so a quoted paren inside the body shifts it; unbalanced means up to the end of
+ * the string); each unquoted or double-quoted backtick yields the text up to the next
+ * unescaped backtick. An UNQUOTED `$(` is not a body: the tokenizer already splits it
+ * into segments that the caller screens under every rule, so the scan walks into it and
+ * still finds a quoted substitution or backtick nested there. The scan resumes after
+ * each body, so bodies are disjoint and a substitution nested in a body is found when
+ * that body is itself screened. Returns undefined past MAX_SUBST_BODIES.
+ */
+function extractSubstitutionBodies(command: string): string[] | undefined {
+  const bodies: string[] = [];
+  const n = command.length;
+  let inDouble = false;
+  let i = 0;
+  while (i < n) {
+    const ch = command[i]!;
+    if (ch === "\\") { i += 2; continue; }
+    if (ch === "'" && !inDouble) {
+      const close = command.indexOf("'", i + 1);
+      i = close < 0 ? n : close + 1;
+      continue;
+    }
+    if (ch === '"') { inDouble = !inDouble; i++; continue; }
+    let body: string | undefined;
+    if (ch === "$" && command[i + 1] === "(" && inDouble) {
+      let depth = 1;
+      let j = i + 2;
+      for (; j < n; j++) {
+        const c = command[j];
+        if (c === "(") depth++;
+        else if (c === ")" && --depth === 0) break;
+      }
+      body = command.slice(i + 2, j);
+      i = j + 1;
+    } else if (ch === "`") {
+      let j = i + 1;
+      while (j < n && command[j] !== "`") j += command[j] === "\\" ? 2 : 1;
+      body = command.slice(i + 1, Math.min(j, n));
+      i = j + 1;
+    } else {
+      i++;
+      continue;
+    }
+    if (bodies.length >= MAX_SUBST_BODIES) return undefined;
+    bodies.push(body);
+  }
+  return bodies;
+}
 
 /**
  * Screen a `kill` simple command (#1576). Positional parse: `-s`/`-n` consume the next
@@ -657,6 +718,24 @@ function analyzeSimple(cmd: string[], secretPaths: readonly string[], dockerWire
   return ALLOW;
 }
 
+/** Whether option `opt` of generic wrapper `base` consumes the NEXT word as its value
+ *  (#1576): an exact WRAPPER_VALUE_OPTS entry (`-u`, `--user`), or a single-dash cluster
+ *  whose LAST letter takes a value and whose every earlier letter is in
+ *  WRAPPER_NOARG_LETTERS (`sudo -Eu root`, `xargs -rn 1`, `timeout -vs 9`). Any other
+ *  cluster (`-uroot`, `-n1`, `xargs -en`, `sudo -hu`) carries its value attached and
+ *  takes nothing. */
+function wrapperOptTakesNext(base: string, opt: string): boolean {
+  const valueOpts = WRAPPER_VALUE_OPTS.get(base);
+  if (!valueOpts) return false;
+  if (valueOpts.has(opt)) return true;
+  if (opt.startsWith("--") || opt.length < 3 || !valueOpts.has(`-${opt[opt.length - 1]}`)) return false;
+  const noArg = WRAPPER_NOARG_LETTERS.get(base) ?? "";
+  for (let k = 1; k < opt.length - 1; k++) {
+    if (!noArg.includes(opt[k]!)) return false;
+  }
+  return true;
+}
+
 /**
  * Peel leading `VAR=value` env-assignments + `env`/shell/`eval`/generic wrappers, then
  * screen the real command. Assignments are peeled at EACH leading position (before AND
@@ -668,21 +747,6 @@ function analyzeSimple(cmd: string[], secretPaths: readonly string[], dockerWire
  * docker analyzer for the B5 DOCKER_HOST= redirect check, INCLUDING across an `sh -c`/
  * `eval` wrapper (a prefix assignment is exported to that subshell).
  */
-/** Whether wrapper option `opt` consumes the NEXT word as its value (#1576): an exact
- *  WRAPPER_VALUE_OPTS entry (`-u`, `--user`), or a single-dash cluster whose value-taking
- *  letter is its LAST letter (`sudo -Eu root`, `xargs -rn 1`, `timeout -vs 9`). getopt
- *  reads a cluster left to right and the first value-taking letter takes the rest of the
- *  word as its value, so `-uroot` / `-n1` carry their value attached and take nothing. */
-function wrapperOptTakesNext(opt: string, valueOpts: ReadonlySet<string> | undefined): boolean {
-  if (!valueOpts) return false;
-  if (valueOpts.has(opt)) return true;
-  if (opt.startsWith("--") || opt.length < 3) return false;
-  for (let k = 1; k < opt.length; k++) {
-    if (valueOpts.has(`-${opt[k]}`)) return k === opt.length - 1;
-  }
-  return false;
-}
-
 function analyzeSegment(words: string[], depth: number, secretPaths: readonly string[], dockerWired: boolean, inherited: readonly string[], ctx: ScreenCtx): BashScreenResult {
   const assignments: string[] = [...inherited];
   let i = 0;
@@ -725,8 +789,7 @@ function analyzeSegment(words: string[], depth: number, secretPaths: readonly st
 
     if (GENERIC_WRAPPERS.has(base)) {
       i++;
-      const valueOpts = WRAPPER_VALUE_OPTS.get(base);
-      while (i < words.length && words[i]!.startsWith("-")) i += wrapperOptTakesNext(words[i]!, valueOpts) ? 2 : 1;
+      while (i < words.length && words[i]!.startsWith("-")) i += wrapperOptTakesNext(base, words[i]!) ? 2 : 1;
       if ((base === "timeout" || base === "nice" || base === "ionice" || base === "chrt") && i < words.length && /^\d/.test(words[i]!)) i++;
       continue;
     }
@@ -754,6 +817,20 @@ function screenWithDepth(
   for (const seg of splitSegments(tokenize(command))) {
     const r = analyzeSegment(seg, depth, secretPaths, dockerWired, assignments, ctx);
     if (r.denied && !first) first = r;
+  }
+  // #1576: the tokenizer keeps a double-quoted `$(…)` and any backtick substitution
+  // inside one word, so screen each substitution body as a command, sharing `ctx` so its
+  // `kill`/enumerator feed the whole-command pairing in screenBashCommand. Only a
+  // mass-signal denial from a body counts, and it replaces only an allow or REASON_PS.
+  // A body denial for any other reason is IGNORED on purpose: base 613f1434 never
+  // screened quoted substitution bodies for the other rules (`echo "$(git push)"` is
+  // allowed there and here), and screening them would over-deny prose in commit
+  // messages. A body screened past MAX_DEPTH returns REASON_DEPTH and is ignored too.
+  const bodies = extractSubstitutionBodies(command);
+  if (bodies === undefined) return deny(REASON_DEPTH);
+  for (const body of bodies) {
+    const r = screenWithDepth(body, depth + 1, secretPaths, dockerWired, ctx, assignments);
+    if (r.reason === REASON_MASS_SIGNAL && (!first || first.reason === REASON_PS)) first = r;
   }
   return first ?? ALLOW;
 }
@@ -783,12 +860,10 @@ export function screenBashCommand(
   // Replaces only REASON_PS (`kill $(pgrep x)`) or an allow, because it names the
   // supported alternative; any other denial (`git push …; kill $(pgrep x)`) keeps its
   // own reason. A heuristic, not containment (file header).
-  const massSignal = ctx.dynamicKill && (ctx.enumerator || SUBST_ENUMERATOR_RE.test(command));
-  // The raw-string checks: a mass-signal command inside a substitution the tokenizer
-  // keeps in one word, and a statically evaluated `kill` target (`$'-1'`, `$((-1))`).
-  // Same precedence as the enumerator pairing above.
-  const rawMassSignal = SUBST_MASS_SIGNAL_RE.test(command) || KILL_STATIC_EVAL_RE.test(command);
-  if ((massSignal || rawMassSignal) && (!result.denied || result.reason === REASON_PS)) return deny(REASON_MASS_SIGNAL);
+  // A statically evaluated `kill` target (`$'-1'`, `$((-1))`) is a raw-string check with
+  // the same precedence.
+  const massSignal = (ctx.dynamicKill && ctx.enumerator) || KILL_STATIC_EVAL_RE.test(command);
+  if (massSignal && (!result.denied || result.reason === REASON_PS)) return deny(REASON_MASS_SIGNAL);
   return result;
 }
 

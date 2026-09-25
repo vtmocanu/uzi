@@ -373,11 +373,21 @@ describe("mass-signal guardrail (#1576)", () => {
     "kill $(pidof node)",
     "pidof node | xargs kill",
     // A mass-signal command inside a backtick or double-quoted substitution, which the
-    // tokenizer keeps in one word: SUBST_MASS_SIGNAL_RE reads the raw string.
+    // tokenizer keeps in one word: each substitution body is screened as a command.
     "echo `pkill node`",
     "x=`killall node`",
     'echo "$(pkill node)"',
     'echo "`pkill node`"',
+    'echo "$(kill -- -1)"',
+    'echo "$(kill 0)"',
+    "echo `kill -9 -1`",
+    "x=`kill 0`",
+    'echo "$(sudo kill -9 -1)"',
+    'echo "$(fuser -k 3000/tcp)"',
+    "echo `fuser -k 3000/tcp`",
+    // The body is tokenized, so an escape inside it does not hide the command word.
+    'kill "$(\\lsof -t)"',
+    'echo "`\\pkill x`"',
     "skill -KILL -u runner",
     // Pins the keep-scanning loop in screenWithDepth: the pgrep segment denies first.
     "pid=$(pgrep node); kill $pid",
@@ -391,6 +401,10 @@ describe("mass-signal guardrail (#1576)", () => {
     "lsof -ti :3000 | xargs -rI {} kill {}",
     // xargs -e takes only an attached value, so `kill` is the command word.
     "lsof -ti :3000 | xargs -e kill",
+    // A cluster led by an optional-value letter takes the rest of the word (`-en` sets
+    // the eof string to `n`), so the next word is the command.
+    "true | xargs -en pkill node",
+    "lsof -t -i:3000 | xargs -en kill -9",
     // Targets bash evaluates statically to -1 (KILL_STATIC_EVAL_RE).
     "kill -9 $'-1'",
     "kill -9 $((-1))",
@@ -458,6 +472,15 @@ describe("mass-signal guardrail (#1576)", () => {
     "true | xargs --eof git push",
     "true | xargs --max-lines git push origin HEAD:main",
     "sudo -h git push --force",
+    // A cluster skips the next word only when every letter before the last is a known
+    // no-argument letter; `-e`/`-i`/`-l` take the rest of the word as their value.
+    "xargs -en git push origin main",
+    "xargs -in git push",
+    "xargs -ln git push",
+    "xargs -eP git push",
+    "sudo -uroot git push",
+    // `--host` always takes a separate value.
+    "sudo --host h git push",
     // A backtick is a plain word character to the tokenizer, so push stays the
     // subcommand after a backtick-substituted global option value.
     "git -C `pwd` push",
@@ -477,6 +500,48 @@ describe("mass-signal guardrail (#1576)", () => {
       assert.strictEqual(screenBashCommand(cmd).denied, false, `expected allowed for: ${cmd}`);
     });
   }
+
+  // A value letter before the last letter of a cluster takes the rest of the word
+  // (`sudo -hu` sets the host to `u`, `-au` the auth type), so the NEXT word, not git, is
+  // the command that runs. The peel keeps the cluster to one word, as base 613f1434 did.
+  for (const cmd of ["sudo -hu root git push", "sudo -au x git push", "sudo -cu x git push", "doas -aC x git push"]) {
+    it(`does not skip past an attached-value cluster: ${cmd}`, () => {
+      assert.strictEqual(screenBashCommand(cmd).denied, false, `expected allowed for: ${cmd}`);
+    });
+  }
+
+  // Substitution bodies are screened, but a word that is not the command word of a body
+  // line passes: commit and PR bodies that mention these tools stay allowed.
+  const heredoc = (body: string): string => `"$(cat <<'EOF'\n${body}\nEOF\n)"`;
+  for (const cmd of [
+    `git commit -m ${heredoc("docs: refresh\n\n...update the uzi-lander skill...")}`,
+    'git commit -m "docs: `uzi-cli` skill update"',
+    `gh pr create --title t --body ${heredoc("This PR teaches the watcher skill to poll")}`,
+    `git commit -m ${heredoc("guardrail: deny pkill and killall")}`,
+    'echo "$(date)"',
+    "echo `git rev-parse HEAD`",
+  ]) {
+    it(`allows a benign substitution body: ${JSON.stringify(cmd)}`, () => {
+      assert.strictEqual(screenBashCommand(cmd).denied, false, `expected allowed for: ${cmd}`);
+    });
+  }
+
+  // Scope pin: a quoted substitution body is screened for the mass-signal rule ONLY. A
+  // body denial for any other rule is ignored, which keeps base 613f1434 behavior (it
+  // never screened quoted substitution bodies), so `echo "$(git push)"` stays allowed.
+  it("ignores a non-mass-signal denial from a quoted substitution body", () => {
+    assert.strictEqual(screenBashCommand('echo "$(git push)"').denied, false);
+    assert.strictEqual(screenBashCommand("echo `git push --force`").denied, false);
+  });
+
+  // An unbounded number of substitutions fails closed rather than screening each one;
+  // the cap (1024 per string) is far above any normal command.
+  it("denies a command with more substitution bodies than the screen extracts", () => {
+    assert.strictEqual(screenBashCommand("echo " + '"$(a)" '.repeat(1000)).denied, false);
+    const r = screenBashCommand("echo " + '"$(a)" '.repeat(1100));
+    assert.strictEqual(r.denied, true);
+    assert.ok(r.reason?.includes("nested too deeply"), `unexpected reason: ${r.reason}`);
+  });
 });
 
 function baseInput(): Omit<HookInput, "hook_event_name" | "tool_name" | "tool_input" | "tool_use_id"> {
