@@ -578,7 +578,7 @@ It claims as soon as you start, or already have, a capable worker online.
 With this on, uzi instead spins up a throwaway worker just for that one run.
 
 **Turning it on** takes two switches, both off by default: an admin enables
-the feature instance-wide from **Admin → Settings**, then you opt in from
+the feature instance-wide from **Admin → Instance settings**, then you opt in from
 your own **Workers page** (Settings → Workers), in the hosted-worker
 section — that per-user toggle only appears there once the admin switch is
 on. A per-user cap also bounds how many throwaway workers you can have

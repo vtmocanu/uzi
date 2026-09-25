@@ -13,8 +13,8 @@ request. This page explains what a hold looks like when the interlock catches
 something, and what you can do about it.
 
 This is **on by default for a new, unseeded issue run using the Claude
-harness**. An admin can turn it off from **Admin → Settings → Completion
-check** (`completion_interlock_rollout`); an explicit off is the only way to
+harness**. An admin can turn it off from **Admin → Instance settings →
+Completion check** (`completion_interlock_rollout`); an explicit off is the only way to
 disable it. A **Codex** issue run is not checked yet — the Codex executor
 doesn't run the completion-attempt loop this page describes, so the switch
 has no effect on one, regardless of its setting. A run started from a
