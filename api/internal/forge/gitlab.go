@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	gitlab "gitlab.com/gitlab-org/api/client-go/v2"
+	gitlab "gitlab.com/gitlab-org/api/client-go/v3"
 )
 
 // developerAccessLevel is GitLab's Developer role access level. The privilege
@@ -223,11 +223,11 @@ func (g *gitLab) DefaultBranchProtection(ctx context.Context, projectID int64, b
 func (g *gitLab) ListProjects(ctx context.Context) ([]Project, error) {
 	opt := &gitlab.ListProjectsOptions{
 		ListOptions:    gitlab.ListOptions{Page: 1, PerPage: perPage},
-		Membership:     gitlab.Ptr(true),
-		MinAccessLevel: gitlab.Ptr(gitlab.DeveloperPermissions),
+		Membership:     new(true),
+		MinAccessLevel: new(gitlab.DeveloperPermissions),
 		// Simple trims the payload to the fields we map; we don't need the
 		// heavy statistics/permissions blocks.
-		Simple: gitlab.Ptr(true),
+		Simple: new(true),
 	}
 	wrap := func(e error) error { return g.wrapErr("list projects", e) }
 	return paginate(wrap, func(page int) ([]Project, int, error) {
@@ -285,12 +285,12 @@ func (g *gitLab) EnsureLabels(ctx context.Context, projectID int64, labels []Lab
 		if _, ok := have[l.Name]; ok {
 			continue
 		}
-		opt := &gitlab.CreateLabelOptions{Name: gitlab.Ptr(l.Name)}
+		opt := &gitlab.CreateLabelOptions{Name: new(l.Name)}
 		color := l.Color
 		if color == "" {
 			color = gitlabDefaultLabelColor
 		}
-		opt.Color = gitlab.Ptr(color)
+		opt.Color = new(color)
 		if _, _, err := g.client.Labels.CreateLabel(projectID, opt, gitlab.WithContext(ctx)); err != nil {
 			return g.wrapErr(fmt.Sprintf("create label %q", l.Name), err)
 		}
@@ -310,7 +310,7 @@ func (g *gitLab) ListIssues(ctx context.Context, projectID int64, opts ListIssue
 		// and the mapping below is a pass-through. That coincidence is exactly why a
 		// GitLab-shaped fake cannot catch a driver that fails to translate; see the
 		// Forgejo driver, where the vocabularies differ.
-		State: gitlab.Ptr(gitlabIssueStateParam(opts.State)),
+		State: new(gitlabIssueStateParam(opts.State)),
 	}
 	if len(opts.Labels) > 0 {
 		labels := gitlab.LabelOptions(opts.Labels)
@@ -362,8 +362,8 @@ func (g *gitLab) GetIssue(ctx context.Context, projectID, issueIID int64) (Issue
 
 func (g *gitLab) CreateIssue(ctx context.Context, projectID int64, title, description string, labels []string) (Issue, error) {
 	opt := &gitlab.CreateIssueOptions{
-		Title:       gitlab.Ptr(title),
-		Description: gitlab.Ptr(description),
+		Title:       new(title),
+		Description: new(description),
 	}
 	if len(labels) > 0 {
 		l := gitlab.LabelOptions(labels)
@@ -427,7 +427,7 @@ func (g *gitLab) UserExists(ctx context.Context, username string) (bool, error) 
 	// GitLab's username filter is an exact match, so a non-empty result means the
 	// account exists. We only need to know if any row came back.
 	users, _, err := g.client.Users.ListUsers(&gitlab.ListUsersOptions{
-		Username: gitlab.Ptr(username),
+		Username: new(username),
 	}, gitlab.WithContext(ctx))
 	if err != nil {
 		return false, g.wrapErr("lookup user", err)
@@ -463,8 +463,8 @@ func (g *gitLab) ListIssueLabelEvents(ctx context.Context, projectID, issueIID i
 func (g *gitLab) ListIssueComments(ctx context.Context, projectID, issueIID int64) ([]IssueComment, error) {
 	opt := &gitlab.ListIssueNotesOptions{
 		ListOptions: gitlab.ListOptions{Page: 1, PerPage: perPage},
-		OrderBy:     gitlab.Ptr("created_at"),
-		Sort:        gitlab.Ptr("asc"),
+		OrderBy:     new("created_at"),
+		Sort:        new("asc"),
 	}
 	wrap := func(e error) error { return g.wrapErr("list issue comments", e) }
 	return paginate(wrap, func(page int) ([]IssueComment, int, error) {
@@ -495,7 +495,7 @@ func (g *gitLab) ListIssueComments(ctx context.Context, projectID, issueIID int6
 
 func (g *gitLab) CreateIssueNote(ctx context.Context, projectID, issueIID int64, body string) (IssueNote, error) {
 	note, _, err := g.client.Notes.CreateIssueNote(projectID, issueIID, &gitlab.CreateIssueNoteOptions{
-		Body: gitlab.Ptr(body),
+		Body: new(body),
 	}, gitlab.WithContext(ctx))
 	if err != nil {
 		return IssueNote{}, g.wrapErr("create issue note", err)
@@ -581,7 +581,7 @@ func (g *gitLab) ListMergeRequestComments(ctx context.Context, projectID, mrIID 
 // replyID (a discussion id from ListMergeRequestComments).
 func (g *gitLab) ReplyMergeRequestComment(ctx context.Context, projectID, mrIID int64, replyID, body string) error {
 	_, _, err := g.client.Discussions.AddMergeRequestDiscussionNote(projectID, mrIID, replyID,
-		&gitlab.AddMergeRequestDiscussionNoteOptions{Body: gitlab.Ptr(body)}, gitlab.WithContext(ctx))
+		&gitlab.AddMergeRequestDiscussionNoteOptions{Body: new(body)}, gitlab.WithContext(ctx))
 	if err != nil {
 		return g.wrapErr("reply merge request comment", err)
 	}
@@ -592,7 +592,7 @@ func (g *gitLab) ReplyMergeRequestComment(ctx context.Context, projectID, mrIID 
 // resolved. On GitLab the resolve anchor equals the reply anchor (the discussion id).
 func (g *gitLab) ResolveMergeRequestThread(ctx context.Context, projectID, mrIID int64, resolveID string) error {
 	_, _, err := g.client.Discussions.ResolveMergeRequestDiscussion(projectID, mrIID, resolveID,
-		&gitlab.ResolveMergeRequestDiscussionOptions{Resolved: gitlab.Ptr(true)}, gitlab.WithContext(ctx))
+		&gitlab.ResolveMergeRequestDiscussionOptions{Resolved: new(true)}, gitlab.WithContext(ctx))
 	if err != nil {
 		return g.wrapErr("resolve merge request thread", err)
 	}
