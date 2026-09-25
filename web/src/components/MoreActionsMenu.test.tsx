@@ -190,4 +190,27 @@ describe("MoreActionsMenu", () => {
       else delete (html as unknown as { clientWidth?: number }).clientWidth;
     }
   });
+
+  it("keeps its left edge on screen when the button sits near the left of a narrow viewport", () => {
+    const html = document.documentElement;
+    const had = Object.getOwnPropertyDescriptor(html, "clientWidth");
+    Object.defineProperty(html, "clientWidth", { configurable: true, value: 390 });
+    const width = vi.spyOn(HTMLElement.prototype, "offsetWidth", "get").mockReturnValue(256);
+    try {
+      const { button } = setup();
+      vi.spyOn(button, "getBoundingClientRect").mockReturnValue({
+        top: 100, bottom: 128, left: 180, right: 215, width: 35, height: 28, x: 180, y: 100, toJSON: () => ({}),
+      });
+      fireEvent.click(button);
+      const right = parseFloat(screen.getByRole("menu").style.right);
+      // Unclamped, right = 390 - 215 = 175 and the left edge would sit at 390 - 175 - 256 = -41.
+      const left = 390 - right - 256;
+      expect(left).toBeGreaterThanOrEqual(4);
+      expect(right).toBeGreaterThanOrEqual(4);
+    } finally {
+      width.mockRestore();
+      if (had) Object.defineProperty(html, "clientWidth", had);
+      else delete (html as unknown as { clientWidth?: number }).clientWidth;
+    }
+  });
 });

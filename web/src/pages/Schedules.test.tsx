@@ -876,6 +876,8 @@ describe("Schedules — tabs, landing and ?tab deep link (PRD #1645 D1)", () => 
     renderAt("/schedules");
     await waitFor(() => expect(tabNamed(/^Schedules · 2$/)).toBeTruthy());
     expect(tabNamed(/^Job catalog · 2/).textContent).toContain("1 not enabled");
+    // The count and the pill read as two phrases, not "· 2 1 not enabled".
+    expect(tabNamed(/^Job catalog · 2, 1 not enabled$/)).toBeTruthy();
   });
 
   it("hides the not-enabled pill when every entry runs somewhere", async () => {
@@ -1568,6 +1570,46 @@ describe("Schedules — the toggle keeps focus across a layout flip (PRD #1645 D
   });
 });
 
+// Browser acceptance N1: a button that turns natively disabled is blurred by the browser,
+// dropping a keyboard user's focus to <body>. While the row is busy, Run now and the toggle
+// are aria-disabled instead: they keep focus and ignore a second activation.
+describe("Schedules — Run now and the toggle keep focus while busy (PRD #1645 acceptance)", () => {
+  it("Run now stays focused and inert while its request is in flight", async () => {
+    let finish!: (v: Awaited<ReturnType<typeof api.runScheduleNow>>) => void;
+    mockApi.listSchedules.mockResolvedValue([sched({ id: "s1" })]);
+    mockApi.runScheduleNow.mockImplementation(() => new Promise((res) => (finish = res)));
+    renderPage();
+    const runNow = await screen.findByRole("button", { name: /^Run now: / });
+    runNow.focus();
+    fireEvent.click(runNow);
+    await waitFor(() => expect(runNow.getAttribute("aria-disabled")).toBe("true"));
+    expect(runNow.hasAttribute("disabled")).toBe(false);
+    expect(document.activeElement).toBe(runNow);
+    fireEvent.click(runNow);
+    expect(mockApi.runScheduleNow).toHaveBeenCalledTimes(1);
+    await act(async () => finish({ created: 1, run_ids: ["r"], matched: 1, capped: false, started: [], skips: [] }));
+    await waitFor(() => expect(runNow.getAttribute("aria-disabled")).toBeNull());
+    expect(document.activeElement).toBe(runNow);
+  });
+
+  it("the toggle stays focused and inert while its update is in flight", async () => {
+    let finish!: (v: Schedule) => void;
+    mockApi.listSchedules.mockResolvedValue([sched({ id: "s1", enabled: true })]);
+    mockApi.updateSchedule.mockImplementation(() => new Promise((res) => (finish = res)));
+    renderPage();
+    const sw = await screen.findByRole("switch");
+    sw.focus();
+    fireEvent.click(sw);
+    await waitFor(() => expect(sw.getAttribute("aria-disabled")).toBe("true"));
+    expect(sw.hasAttribute("disabled")).toBe(false);
+    expect(document.activeElement).toBe(sw);
+    fireEvent.click(sw);
+    expect(mockApi.updateSchedule).toHaveBeenCalledTimes(1);
+    await act(async () => finish(sched({ id: "s1", enabled: false })));
+    await waitFor(() => expect(screen.getByRole("switch").getAttribute("aria-disabled")).toBeNull());
+  });
+});
+
 // ── PRD #1093 M4: the "Pause all schedules" switch (button / picker / banner) ───
 describe("Schedules — pause all (PRD #1093)", () => {
   function renderRoot() {
@@ -1920,8 +1962,11 @@ describe("Schedules — Job catalog (PRD #1645 D7)", () => {
     fireEvent.click(tabNamed(/^Job catalog/));
 
     const link = within(catalogCard("bug-triage")).getByRole("button", { name: "Enabled on 2 repos, 1 paused" });
+    link.focus();
     fireEvent.click(link);
     expect(tabNamed(/^Schedules/).getAttribute("aria-selected")).toBe("true");
+    // The link unmounts with the catalog panel; focus lands on the Schedules tab, not <body>.
+    expect(document.activeElement).toBe(tabNamed(/^Schedules/));
     expect(screen.getByTestId("loc").textContent).toBe("?tab=schedules");
     expect(screen.getByText("Job: Bug triage sweep")).toBeTruthy();
     expect(chip(/^All/).getAttribute("aria-pressed")).toBe("true");
@@ -1944,8 +1989,11 @@ describe("Schedules — Job catalog (PRD #1645 D7)", () => {
     expect(within(catalogCard("docs-hygiene")).getByRole("button", { name: "Enabled on 1 repo" })).toBeTruthy();
     expect(screen.getByText(/Enabled “Docs hygiene” on 1 repo/)).toBeTruthy();
 
-    fireEvent.click(screen.getByRole("button", { name: "Show it on the Schedules tab" }));
+    const show = screen.getByRole("button", { name: "Show it on the Schedules tab" });
+    show.focus();
+    fireEvent.click(show);
     expect(tabNamed(/^Schedules/).getAttribute("aria-selected")).toBe("true");
+    expect(document.activeElement).toBe(tabNamed(/^Schedules/));
     expect(screen.getByText("Job: Docs hygiene")).toBeTruthy();
     expect(nameIds()).toEqual(["dh1"]);
   });

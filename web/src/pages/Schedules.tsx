@@ -399,10 +399,12 @@ export function Schedules() {
   };
 
   // A card's "Enabled on N repos" link, and the enable notice's link (D7): the Schedules
-  // tab filtered to that job, every other dimension cleared.
+  // tab filtered to that job, every other dimension cleared. From the Job catalog tab either
+  // trigger unmounts with its panel, so focus moves to the Schedules tab, not <body>.
   const showJobInSchedules = (slug: string) => {
     setTab("schedules");
     applyFilter({ ...NO_FILTER, jobSlug: slug });
+    tabRefs.current.schedules?.focus();
   };
 
   // Closing the edit modal: a clone's modal hands focus to the cloned row (D12).
@@ -720,7 +722,15 @@ export function Schedules() {
           className={cx(TAB_BASE, "inline-flex items-center gap-2", tab === "catalog" ? TAB_ACTIVE : TAB_INACTIVE)}
         >
           Job catalog{loaded ? ` · ${catalog.entries.length}` : ""}
-          {loaded && notEnabled > 0 && <Badge tone="neutral">{notEnabled} not enabled</Badge>}
+          {/* The hidden comma and space separate the count from the badge in the tab's
+              accessible name ("Job catalog · 9, 6 not enabled", not "· 9 6 not enabled");
+              CSS flex layout does not render a whitespace-only text run between items. */}
+          {loaded && notEnabled > 0 && (
+            <>
+              <span className="sr-only">,</span>{" "}
+              <Badge tone="neutral">{notEnabled} not enabled</Badge>
+            </>
+          )}
         </button>
         {/* Running state only: the button sits at the right end of the tab row (ml-auto),
             directly under "New schedule", so no header height is added. It disappears

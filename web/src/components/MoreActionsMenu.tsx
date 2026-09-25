@@ -13,9 +13,10 @@
 // The menu is portalled into document.body and position:fixed, anchored to the button: a
 // table wrapper's overflow cannot clip it, and an ancestor's stacking context (a paused
 // row's opacity) cannot paint later rows over it. It is re-anchored on scroll and resize,
-// and flips above the button when it would run off the bottom of the viewport. It renders
-// hidden until its first placement, and focus moves into it only once it is placed:
-// a browser refuses focus on a visibility:hidden element.
+// and flips above the button when it would run off the bottom of the viewport; its right
+// offset is clamped so its left edge stays on screen as well. It renders hidden until its
+// first placement, and focus moves into it only once it is placed: a browser refuses focus
+// on a visibility:hidden element.
 
 import { useEffect, useId, useLayoutEffect, useRef, useState, type RefObject } from "react";
 import { createPortal } from "react-dom";
@@ -75,7 +76,12 @@ export function MoreActionsMenu({
       const below = r.bottom + 4;
       const top = below + h > window.innerHeight && r.top - h - 4 > 0 ? r.top - h - 4 : below;
       // clientWidth excludes a vertical scrollbar, matching what `right` is measured from.
-      setPos({ top, right: Math.max(4, document.documentElement.clientWidth - r.right) });
+      // Right-align to the button, but keep the whole menu within [4, cw - 4]: a button near
+      // the left edge of a narrow viewport would otherwise push the menu's left edge off screen.
+      const cw = document.documentElement.clientWidth;
+      const w = menuRef.current?.offsetWidth || 256;
+      const right = Math.min(Math.max(4, cw - r.right), Math.max(4, cw - w - 4));
+      setPos({ top, right });
     };
     place();
     window.addEventListener("scroll", place, true);

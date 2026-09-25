@@ -170,7 +170,13 @@ export function ScheduleListRow({
 
   // The row's one toggle, placed by layout (see the header comment and D11).
   const toggle = (
-    <Toggle checked={s.enabled} onChange={onToggle} disabled={busy} label={s.enabled ? `Pause ${on}` : `Resume ${on}`} />
+    <Toggle
+      checked={s.enabled}
+      onChange={onToggle}
+      disabled={busy}
+      focusableWhenDisabled
+      label={s.enabled ? `Pause ${on}` : `Resume ${on}`}
+    />
   );
 
   return (
@@ -312,7 +318,19 @@ export function ScheduleListRow({
         {/* Actions · On */}
         <td className={cx(TD, FULL)}>
           <div className="flex flex-wrap items-center gap-1.5 md:flex-nowrap md:justify-end">
-            <Button variant="ghost" size="sm" title="Run now" aria-label={`Run now: ${on}`} disabled={busy} onClick={onRunNow}>
+            {/* aria-disabled rather than disabled while busy: a browser blurs a button that
+                becomes disabled, which would drop a keyboard user's focus to <body>. */}
+            <Button
+              variant="ghost"
+              size="sm"
+              title="Run now"
+              aria-label={`Run now: ${on}`}
+              aria-disabled={busy || undefined}
+              onClick={() => {
+                if (!busy) onRunNow();
+              }}
+              className="aria-disabled:cursor-not-allowed aria-disabled:opacity-50"
+            >
               <PlayIcon />
             </Button>
             <Button variant="ghost" size="sm" title="Edit" aria-label={`Edit ${on}`} onClick={onEdit}>
