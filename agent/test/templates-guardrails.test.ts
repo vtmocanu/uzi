@@ -994,6 +994,26 @@ describe("the shared root-entry drop wrapper", () => {
     assert.doesNotMatch(entrypoint, /"\$CHMOD"[^\n]*"\$entry"/, "descendants must not be chmod'd (no CAP_FOWNER on worker-owned files)");
   });
 
+  it("issue #1696: a separate one-time, chown-only, NON-recursive repair of agent-home's dot entries", () => {
+    assert.match(
+      entrypoint,
+      /PROVISION_HOME_SENTINEL="\$DATA_DIR\/\.uzi-provision-home-repaired"/,
+      "must gate the repair on its own sentinel (volumes already carry LEGACY_SENTINEL)",
+    );
+    // The legacy block ends where it persists its sentinel; the repair must come AFTER it, so it
+    // runs on volumes whose legacy walk already happened.
+    const legacyEnd = entrypoint.search(/echo "uzi-entrypoint: warning: could not persist \$LEGACY_SENTINEL/);
+    const repairStart = entrypoint.search(/^PROVISION_HOME_SENTINEL=/m);
+    const repairEnd = entrypoint.search(/echo "uzi-entrypoint: warning: could not persist \$PROVISION_HOME_SENTINEL/);
+    assert.ok(legacyEnd >= 0 && repairStart > legacyEnd && repairEnd > repairStart, "the repair block must follow the legacy block");
+    const repair = entrypoint.slice(repairStart, repairEnd);
+    assert.match(repair, /if\s+\[\s+!\s+-f\s+"\$PROVISION_HOME_SENTINEL"\s+\]/, "the repair is skipped once its sentinel exists");
+    assert.match(repair, /require_real_carveout_root\s+"\$DATA_DIR\/agent-home"/, "the repair refuses a symlinked agent-home root");
+    assert.match(repair, /"\$CHOWN"\s+runner:runner\s+"\$dot"/, "each top-level dot entry is re-owned to runner");
+    assert.doesNotMatch(repair, /"\$CHOWN"\s+-R/, "the repair must be NON-recursive (only top-level inodes are damaged)");
+    assert.doesNotMatch(repair, /"\$CHMOD"/, "the repair must never chmod (no CAP_FOWNER)");
+  });
+
   it("PRD #1493 M2 change 5: PVC-root fsGroup alignment, gated on the setgid fingerprint (compose no-op)", () => {
     // The k8s-only signal is captured BEFORE migrate_tree flips /nix's group.
     assert.match(entrypoint, /NIX_HAD_FSGROUP=\s*\n\s*\[\s+-g\s+"\$NIX_DIR"\s+\]\s+&&\s+NIX_HAD_FSGROUP=1/, "must capture the setgid fingerprint before migrate_tree");
@@ -1022,7 +1042,7 @@ describe("the shared root-entry drop wrapper", () => {
     assert.ok(branchStart >= 0 && branchEnd > branchStart, "must locate the non-root branch");
     const branch = entrypoint.slice(branchStart, branchEnd);
     assert.match(branch, /unset UZI_UID_SPLIT UZI_RUNNER_PATH UZI_RUNNER_TMPDIR/, "the non-root branch still unsets the split env");
-    for (const token of ["DATA_DIR", "NIX_DIR", "BUSYBOX", "FSGROUP", "NIX_HAD_FSGROUP", "LEGACY_SENTINEL", "align_pvc_root"]) {
+    for (const token of ["DATA_DIR", "NIX_DIR", "BUSYBOX", "FSGROUP", "NIX_HAD_FSGROUP", "LEGACY_SENTINEL", "PROVISION_HOME_SENTINEL", "align_pvc_root"]) {
       assert.doesNotMatch(branch, new RegExp(token), `the non-root branch must NOT reference the root-only ${token}`);
     }
   });
