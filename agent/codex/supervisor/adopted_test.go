@@ -213,17 +213,12 @@ func TestLiveAdoptedChildReapedBeforePrimaryExit(t *testing.T) {
 	primary, adopted := 0, 0
 	t.Cleanup(func() {
 		if cmd.ProcessState == nil {
-			if primary > 0 {
-				_ = unix.Kill(primary, unix.SIGKILL)
-			}
-			if adopted > 0 {
-				_ = unix.Kill(adopted, unix.SIGKILL)
-			} else if data, err := os.ReadFile(pidFile); err == nil {
-				var pid int
-				if _, err := fmt.Sscanf(string(data), "%d", &pid); err == nil && pid > 0 {
-					_ = unix.Kill(pid, unix.SIGKILL)
-				}
-			}
+			// Never signal the saved primary/grandchild PIDs: once the helper reaps
+			// either, the number can be reused by an unrelated process. The release
+			// file makes the primary exit on its own, the grandchild exits after its
+			// short sleep, and the helper is our own unreaped child, so its PID is
+			// still ours to kill.
+			_ = os.WriteFile(releaseFile, nil, 0o600)
 			_ = cmd.Process.Kill()
 			_ = cmd.Wait()
 		}
