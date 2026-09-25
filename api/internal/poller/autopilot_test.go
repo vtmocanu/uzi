@@ -3,7 +3,9 @@ package poller
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/google/uuid"
@@ -453,6 +455,63 @@ func TestAutopilotRaceActiveAtCreateSwallow(t *testing.T) {
 	}
 	if got := lastUpsert(t, st); got.LastEventID != 100 {
 		t.Fatalf("recorded event id = %d, want 100", got.LastEventID)
+	}
+}
+
+// errorCounter counts ERROR-level records (TestAutopilotBranchInUseDefersQuietly).
+type errorCounter struct {
+	mu     *sync.Mutex
+	errors *int
+}
+
+func (h errorCounter) Enabled(context.Context, slog.Level) bool { return true }
+func (h errorCounter) Handle(_ context.Context, r slog.Record) error {
+	if r.Level >= slog.LevelError {
+		h.mu.Lock()
+		*h.errors++
+		h.mu.Unlock()
+	}
+	return nil
+}
+func (h errorCounter) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h errorCounter) WithGroup(string) slog.Handler      { return h }
+
+// TestAutopilotBranchInUseDefersQuietly pins issue #1626: an active ci_fix / mr_rework on
+// agent/issue-<iid> refuses the create with ErrBranchInUse. That is a transient busy state,
+// so the event is left UNRECORDED (the next tick retries once the branch frees), no comment
+// is posted, and nothing is logged at ERROR (the default arm's slog.Error every tick was the
+// log storm). Swaps slog.SetDefault (process-global): must not run in parallel.
+func TestAutopilotBranchInUseDefersQuietly(t *testing.T) {
+	prev := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	var (
+		mu   sync.Mutex
+		errs int
+	)
+	slog.SetDefault(slog.New(errorCounter{mu: &mu, errors: &errs}))
+
+	st := &apStore{
+		candidates: []store.ListAutopilotCandidateIssuesRow{candIssue(7, "alice")},
+		cc:         ccOwner("alice", true, true),
+	}
+	runs := &apRuns{err: workersvc.ErrBranchInUse}
+	f := &apForge{events: map[int64][]forge.LabelEvent{7: {addEvt(100, "alice")}}}
+
+	detectWith(st, runs, f)
+
+	if len(runs.calls) != 1 {
+		t.Fatalf("CreateAutopilotRun calls = %d, want 1", len(runs.calls))
+	}
+	if len(f.notes) != 0 {
+		t.Fatalf("expected no comment on a busy branch, got %+v", f.notes)
+	}
+	if len(st.upserts) != 0 {
+		t.Fatalf("a busy branch must leave the event unrecorded for retry, upserts = %+v", st.upserts)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if errs != 0 {
+		t.Fatalf("a busy branch logged %d ERROR record(s), want 0 (quiet retry, no error-log storm)", errs)
 	}
 }
 

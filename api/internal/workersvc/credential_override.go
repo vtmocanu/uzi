@@ -107,6 +107,20 @@ func (s *Service) ResolveCredentialOverride(ctx context.Context, userID uuid.UUI
 // is refused rather than silently clearing (D10/D9). The 404 secret check runs only for
 // a pinned request, the only mode that names a credential.
 func (s *Service) validateCredentialOverride(ctx context.Context, userID uuid.UUID, kind, harness, mode string, secretID *uuid.UUID) (*CredentialOverride, error) {
+	return validateCredentialOverrideOn(ctx, s.q, userID, kind, harness, mode, secretID)
+}
+
+// credentialSecretMetaReader is the one read the validator makes (the pinned-mode secret
+// lookup), so a caller already inside a transaction can pass its tx-bound Store.
+type credentialSecretMetaReader interface {
+	GetUserSecretMetaByIDOfKind(ctx context.Context, arg store.GetUserSecretMetaByIDOfKindParams) (store.GetUserSecretMetaByIDOfKindRow, error)
+}
+
+// validateCredentialOverrideOn is validateCredentialOverride with the secret lookup read
+// through q rather than the pool. createRun's insert closure (issue #1626) passes its
+// tx-bound Store so the pinned lookup does not take a second pool connection while the
+// closure holds the run-branch advisory lock.
+func validateCredentialOverrideOn(ctx context.Context, q credentialSecretMetaReader, userID uuid.UUID, kind, harness, mode string, secretID *uuid.UUID) (*CredentialOverride, error) {
 	// D10: chat, judge and self_improve follow their own ladders and are not switchable.
 	switch kind {
 	case runkind.Chat, runkind.Judge, runkind.SelfImprove:
@@ -132,7 +146,7 @@ func (s *Service) validateCredentialOverride(ctx context.Context, userID uuid.UU
 		// 404: the secret must be the caller's OWN anthropic_token. The kind-scoped
 		// owner-scoped lookup returns pgx.ErrNoRows for a foreign id, a deleted id, or a
 		// wrong-kind id alike — the same "unavailable" fact a foreign id produces at open.
-		if _, err := s.q.GetUserSecretMetaByIDOfKind(ctx, store.GetUserSecretMetaByIDOfKindParams{
+		if _, err := q.GetUserSecretMetaByIDOfKind(ctx, store.GetUserSecretMetaByIDOfKindParams{
 			ID:     *secretID,
 			UserID: userID,
 			Kind:   store.KindAnthropicToken,

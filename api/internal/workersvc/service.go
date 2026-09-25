@@ -5384,23 +5384,6 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		!isAssignedToBot(issue.AssigneeIds, row.BotForgeUserID) {
 		return store.Run{}, ErrNotPRDIssue
 	}
-	// Cross-kind same-branch exclusion (PRD #6, widened by issue #1626): this issue run will
-	// use the worktree agent/issue-<iid>; refuse if an active ci_fix OR mr_rework run is
-	// already working that ref. This pre-transaction read is only a cheap fast-fail, so a
-	// doomed create neither pays the forge comment fetch below nor reports OpenMRExistsError
-	// first; the authoritative re-check runs inside the create transaction, after
-	// LockRunBranch (see the insert closure). The reverse checks live in createCIFixRun and
-	// createMRReworkRun.
-	fixing, err := s.q.CountActiveBranchRunsForRef(ctx, store.CountActiveBranchRunsForRefParams{
-		RepoID:      repoID,
-		PipelineRef: pgtype.Text{String: agentIssueBranch(issueIID), Valid: true},
-	})
-	if err != nil {
-		return store.Run{}, err
-	}
-	if fixing > 0 {
-		return store.Run{}, ErrBranchInUse
-	}
 	// Manual-path dedup pre-check (PRD #754 M4 Decision 8). The uq_runs_one_active_per_issue
 	// index — the ONLY dedup the manual/board/Slack path had (it relies solely on the index
 	// catching 23505 → ErrActiveRunExists below) — now EXCLUDES pool_wait so a held run is
@@ -5443,6 +5426,28 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 			return store.Run{}, &OpenMRExistsError{IssueIID: issueIID, MRIID: mrIID.Int64}
 		}
 	}
+	// Cross-kind same-branch exclusion (PRD #6, widened by issue #1626): this issue run will
+	// use the worktree agent/issue-<iid>; refuse if an active ci_fix OR mr_rework run is
+	// already working that ref. This pre-transaction read is only a cheap fast-fail, so a
+	// doomed create does not pay the forge comment fetch below; the authoritative re-check
+	// runs inside the create transaction, after LockRunBranch (see the insert closure). The
+	// reverse checks live in createCIFixRun and createMRReworkRun.
+	//
+	// ORDER MATTERS: it runs AFTER the active-run gate and the open-MR guard above. An
+	// active mr_rework on agent/issue-<iid> always implies a completed issue run with an OPEN
+	// MR, so an UNFORCED create must keep getting OpenMRExistsError (which every caller
+	// already maps to a skip / "use --force"); only a FORCED create reaches this check and
+	// gets ErrBranchInUse. An active ci_fix without an open MR likewise reaches it unforced.
+	fixing, err := s.q.CountActiveBranchRunsForRef(ctx, store.CountActiveBranchRunsForRefParams{
+		RepoID:      repoID,
+		PipelineRef: pgtype.Text{String: agentIssueBranch(issueIID), Valid: true},
+	})
+	if err != nil {
+		return store.Run{}, err
+	}
+	if fixing > 0 {
+		return store.Run{}, ErrBranchInUse
+	}
 	// PRD #381: snapshot the issue's human comments alongside the description. One
 	// extra forge round-trip, centralized here so every issue-backed origin (manual,
 	// autopilot, scheduled) captures it (D6) without rippling the Create*Run seam.
@@ -5476,7 +5481,8 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 	// Read on the pool BEFORE the create transaction (issue #1626): the closure below holds the
 	// run-branch lock while a same-branch waiter holds a pool connection of its own, so these
 	// two plain reads are kept out of the lock-holding window rather than acquiring a second
-	// connection inside it. (An explicit credential override is still validated in-closure.)
+	// connection inside it. (An explicit credential override is still validated in-closure, on the
+	// tx-bound q, so it takes no second connection either.)
 	originColumn := s.originColumn(ctx, repoID, issue)
 	resolvedWaitOnLimit := s.resolveWaitOnLimit(ctx, userID, waitOnLimit)
 	run, err := s.createRunResolved(ctx, userID, explicit, func(q Store, resolved resolvedHarness) (store.Run, error) {
@@ -5505,9 +5511,11 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		// ErrCredentialOverrideHarnessUnsupported and rolls the whole create back (no run row, no
 		// forge write after the invalid fact is known); a pre-resolved credOverride (a schedule's
 		// stored choice) is written as-is. nil override ⇒ inherit, byte-identical to a pre-#1247 run.
+		// The pinned-secret lookup reads through the tx-bound q (issue #1626), not the pool, so
+		// no second connection is taken while this closure holds the run-branch lock.
 		effOverride := credOverride
 		if rawOverride != nil {
-			ov, verr := s.ResolveCredentialOverride(ctx, userID, runkind.Issue, string(resolved.Harness), rawOverride.Mode, rawOverride.SecretID)
+			ov, verr := validateCredentialOverrideOn(ctx, q, userID, runkind.Issue, string(resolved.Harness), rawOverride.Mode, rawOverride.SecretID)
 			if verr != nil {
 				return store.Run{}, verr
 			}

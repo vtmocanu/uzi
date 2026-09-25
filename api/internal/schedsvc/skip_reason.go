@@ -20,7 +20,9 @@ const (
 
 	// SkipAlreadyRunning ← the active-run pre-check bool (HasActiveRunForIssue /
 	// HasActiveRunForSchedule true) AND the seam's ErrActiveRunExists / ErrActivePromptExists
-	// race. A prior run for the same issue/schedule is still live.
+	// race. A prior run for the same issue/schedule is still live. Also ←
+	// workersvc.ErrBranchInUse (issue #1626): an active ci_fix / mr_rework run holds the
+	// issue's agent/issue-<iid> branch.
 	SkipAlreadyRunning SkipReason = "already_running"
 
 	// SkipDescriptionTooLarge ← workersvc.ErrDescriptionTooLarge: the composed run
@@ -107,6 +109,13 @@ func skipReasonForErr(err error) (SkipReason, bool) {
 	case errors.Is(err, workersvc.ErrNotPRDIssue):
 		return SkipNotEligible, true
 	case errors.Is(err, workersvc.ErrActiveRunExists):
+		return SkipAlreadyRunning, true
+	case errors.Is(err, workersvc.ErrBranchInUse):
+		// Issue #1626: an active ci_fix / mr_rework run is already working this issue's
+		// agent/issue-<iid> branch, so a fresh issue run for it is refused. That is an active
+		// run working the issue, so it records the existing already_running reason (the closed
+		// set is mirrored by the web union; no new wire value). Benign, advancing: without this
+		// arm it fell to the transient default and the schedule re-fired every tick.
 		return SkipAlreadyRunning, true
 	case errors.Is(err, workersvc.ErrDescriptionTooLarge):
 		return SkipDescriptionTooLarge, true

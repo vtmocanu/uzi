@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -97,8 +98,11 @@ func TestActiveIssueRunBlocksMRReworkAndCIFixLiveDB(t *testing.T) {
 
 // (b) An active mr_rework on agent/issue-N blocks a FORCED issue run for N. force bypasses only
 // the open-MR guard; before issue #1626 the branch check saw only ci_fix, so a forced create
-// put an issue run beside the rework. A non-forced create is refused on the branch too, and
-// before the open-MR guard (the fast-fail runs first).
+// put an issue run beside the rework. An UNFORCED create keeps its pre-#1626 answer, the
+// open-MR refusal, NOT ErrBranchInUse: an active mr_rework always implies the completed source
+// run's open MR, and every issue-create caller (autopilot, scheduler, handlers) already maps
+// OpenMRExistsError to a skip / "use --force". The branch fast-fail therefore runs AFTER the
+// active-run gate and the open-MR guard.
 func TestActiveMRReworkBlocksForcedIssueRunLiveDB(t *testing.T) {
 	env, svc, userID, repoID := branchSerializeEnv(t)
 	const n int64 = 16262
@@ -112,11 +116,36 @@ func TestActiveMRReworkBlocksForcedIssueRunLiveDB(t *testing.T) {
 	if _, err := svc.CreateRun(env.ctx, userID, repoID, n, "desc", nil, nil, true /*force*/, nil, nil, nil); !errors.Is(err, ErrBranchInUse) {
 		t.Fatalf("CreateRun(%d, force) with active mr_rework = %v, want ErrBranchInUse", n, err)
 	}
-	if _, err := svc.CreateRun(env.ctx, userID, repoID, n, "desc", nil, nil, false /*force*/, nil, nil, nil); !errors.Is(err, ErrBranchInUse) {
-		t.Fatalf("CreateRun(%d) with active mr_rework = %v, want ErrBranchInUse", n, err)
+	_, err := svc.CreateRun(env.ctx, userID, repoID, n, "desc", nil, nil, false /*force*/, nil, nil, nil)
+	if errors.Is(err, ErrBranchInUse) {
+		t.Fatalf("CreateRun(%d) unforced with active mr_rework = ErrBranchInUse, want the open-MR refusal first (the pollers and scheduler skip that one)", n)
+	}
+	var om *OpenMRExistsError
+	if !errors.Is(err, ErrOpenMRExists) || !errors.As(err, &om) || om.MRIID != 162620 {
+		t.Fatalf("CreateRun(%d) unforced with active mr_rework = %v, want OpenMRExistsError for MR 162620", n, err)
 	}
 	if got := countActiveOnAgentBranch(t, env, repoID, n); got != 1 {
 		t.Fatalf("active runs on %s = %d, want exactly 1 (the mr_rework)", branch, got)
+	}
+}
+
+// (b2) An active ci_fix on agent/issue-N with NO open MR for N (nothing for the open-MR guard to
+// catch) still refuses an UNFORCED issue create with ErrBranchInUse: moving the fast-fail after
+// the open-MR guard did not open a gap for the ci_fix side.
+func TestActiveCIFixBlocksUnforcedIssueRunLiveDB(t *testing.T) {
+	env, svc, userID, repoID := branchSerializeEnv(t)
+	const n int64 = 16265
+	branch := agentIssueBranch(n)
+	seedEligibleIssue(t, env, repoID, n)
+
+	if _, err := svc.CreateCIFixRun(env.ctx, userID, repoID, branch, "Fix CI", "d", ciFixSnapshot(branch, 162650), nil); err != nil {
+		t.Fatalf("CreateCIFixRun(%s) = %v, want success", branch, err)
+	}
+	if _, err := svc.CreateRun(env.ctx, userID, repoID, n, "desc", nil, nil, false /*force*/, nil, nil, nil); !errors.Is(err, ErrBranchInUse) {
+		t.Fatalf("CreateRun(%d) unforced with active ci_fix and no open MR = %v, want ErrBranchInUse", n, err)
+	}
+	if got := countActiveOnAgentBranch(t, env, repoID, n); got != 1 {
+		t.Fatalf("active runs on %s = %d, want exactly 1 (the ci_fix)", branch, got)
 	}
 }
 
@@ -188,7 +217,7 @@ func TestConcurrentBranchCreatesSerializeLiveDB(t *testing.T) {
 // waiting on that exact advisory lock, and after the commit it must see the issue run and
 // return ErrBranchInUse.
 func TestMRReworkWaitsOnRunBranchLockLiveDB(t *testing.T) {
-	testCreateWaitsOnRunBranchLock(t, 16263, func(svc *Service, env codexTestEnv, userID, repoID, source uuid.UUID, n int64) error {
+	testCreateWaitsOnRunBranchLock(t, 16263, holdIssueRow, func(svc *Service, env codexTestEnv, userID, repoID, source uuid.UUID, n int64) error {
 		_, err := svc.CreateAutoMRReworkRun(env.ctx, userID, repoID, agentIssueBranch(n), n*10, source, "Rework MR review", "desc", nil)
 		return err
 	})
@@ -196,17 +225,56 @@ func TestMRReworkWaitsOnRunBranchLockLiveDB(t *testing.T) {
 
 // (c2) Forced interleave, ci_fix side: as above, for CreateCIFixRun.
 func TestCIFixWaitsOnRunBranchLockLiveDB(t *testing.T) {
-	testCreateWaitsOnRunBranchLock(t, 16264, func(svc *Service, env codexTestEnv, userID, repoID, _ uuid.UUID, n int64) error {
+	testCreateWaitsOnRunBranchLock(t, 16264, holdIssueRow, func(svc *Service, env codexTestEnv, userID, repoID, _ uuid.UUID, n int64) error {
 		ref := agentIssueBranch(n)
 		_, err := svc.CreateCIFixRun(env.ctx, userID, repoID, ref, "Fix CI", "d", ciFixSnapshot(ref, n*10), nil)
 		return err
 	})
 }
 
-func testCreateWaitsOnRunBranchLock(t *testing.T, n int64, create func(svc *Service, env codexTestEnv, userID, repoID, source uuid.UUID, n int64) error) {
+// (c2) Forced interleave, ISSUE side: the test's transaction holds the run-branch lock and an
+// UNCOMMITTED mr_rework on pipeline_ref agent/issue-N. A FORCED CreateRun for N (force skips the
+// open-MR guard; the uncommitted row is invisible to the pre-transaction fast-fail) must be
+// observed waiting on that advisory lock inside its create transaction, and after the commit
+// its in-closure recount must see the rework and return ErrBranchInUse. Without createRun's
+// in-closure LockRunBranch the create inserts and returns while the lock is still held.
+func TestIssueRunWaitsOnRunBranchLockLiveDB(t *testing.T) {
+	testCreateWaitsOnRunBranchLock(t, 16266, holdMRReworkRow, func(svc *Service, env codexTestEnv, userID, repoID, _ uuid.UUID, n int64) error {
+		_, err := svc.CreateRun(env.ctx, userID, repoID, n, "desc", nil, nil, true /*force*/, nil, nil, nil)
+		return err
+	})
+}
+
+// holdIssueRow inserts, on the lock-holding tx, an uncommitted queued issue run for n.
+func holdIssueRow(t *testing.T, env codexTestEnv, tx pgx.Tx, userID, repoID, _ uuid.UUID, n int64) {
+	t.Helper()
+	if _, err := tx.Exec(env.ctx,
+		`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, status, harness)
+		 VALUES ($1, $2, $3, 'issue', $4, 't', 'd', 'queued', 'claude')`,
+		uuid.New(), userID, repoID, n); err != nil {
+		t.Fatalf("insert uncommitted issue run: %v", err)
+	}
+}
+
+// holdMRReworkRow inserts, on the lock-holding tx, an uncommitted queued mr_rework on
+// pipeline_ref agent/issue-n targeting the completed source run.
+func holdMRReworkRow(t *testing.T, env codexTestEnv, tx pgx.Tx, userID, repoID, source uuid.UUID, n int64) {
+	t.Helper()
+	if _, err := tx.Exec(env.ctx,
+		`INSERT INTO runs (id, user_id, repo_id, kind, issue_title, issue_description, pipeline_ref, mr_iid, target_run_id, status, harness)
+		 VALUES ($1, $2, $3, 'mr_rework', 't', 'd', $4, $5, $6, 'queued', 'claude')`,
+		uuid.New(), userID, repoID, agentIssueBranch(n), n*10, source); err != nil {
+		t.Fatalf("insert uncommitted mr_rework run: %v", err)
+	}
+}
+
+func testCreateWaitsOnRunBranchLock(t *testing.T, n int64,
+	hold func(t *testing.T, env codexTestEnv, tx pgx.Tx, userID, repoID, source uuid.UUID, n int64),
+	create func(svc *Service, env codexTestEnv, userID, repoID, source uuid.UUID, n int64) error) {
 	t.Helper()
 	env, svc, userID, repoID := branchSerializeEnv(t)
 	branch := agentIssueBranch(n)
+	seedEligibleIssue(t, env, repoID, n)
 	source := seedCompletedSourceRun(t, env, userID, repoID, n, n*10)
 
 	tx, err := env.pool.Begin(env.ctx)
@@ -217,13 +285,7 @@ func testCreateWaitsOnRunBranchLock(t *testing.T, n int64, create func(svc *Serv
 	if err := store.New(tx).LockRunBranch(env.ctx, repoID, branch); err != nil {
 		t.Fatalf("LockRunBranch: %v", err)
 	}
-	if _, err := tx.Exec(env.ctx,
-		`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, status, harness)
-		 VALUES ($1, $2, $3, 'issue', $4, 't', 'd', 'queued', 'claude')`,
-		uuid.New(), userID, repoID, n); err != nil {
-		t.Fatalf("insert uncommitted issue run: %v", err)
-	}
-
+	hold(t, env, tx, userID, repoID, source, n)
 	done := make(chan error, 1)
 	go func() { done <- create(svc, env, userID, repoID, source, n) }()
 
@@ -273,7 +335,7 @@ func testCreateWaitsOnRunBranchLock(t *testing.T, n int64, create func(svc *Serv
 		t.Fatalf("create did not return within 15s of the commit")
 	}
 	if got := countActiveOnAgentBranch(t, env, repoID, n); got != 1 {
-		t.Fatalf("active runs on %s = %d, want exactly 1 (the committed issue run)", branch, got)
+		t.Fatalf("active runs on %s = %d, want exactly 1 (the committed held run)", branch, got)
 	}
 }
 

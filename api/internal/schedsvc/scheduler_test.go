@@ -1290,6 +1290,9 @@ func TestSkipReasonForErr(t *testing.T) {
 		{workersvc.ErrDescriptionTooLarge, SkipDescriptionTooLarge, true},
 		{workersvc.ErrOpenMRExists, SkipOpenMRExists, true},
 		{workersvc.ErrNoUsableCredential, SkipNoUsableCredential, true},
+		// Issue #1626: an active ci_fix / mr_rework holding agent/issue-<iid> is an active run
+		// working the issue → already_running (benign, advancing), not the transient default.
+		{workersvc.ErrBranchInUse, SkipAlreadyRunning, true},
 		{workersvc.ErrActivePromptExists, "", false},
 		{workersvc.ErrRepoNotFound, "", false},
 		{context.DeadlineExceeded, "", false},
@@ -1321,6 +1324,9 @@ func TestFireIssueSentinelSkips(t *testing.T) {
 		{"active_run", workersvc.ErrActiveRunExists, SkipAlreadyRunning},
 		{"not_eligible", workersvc.ErrNotPRDIssue, SkipNotEligible},
 		{"too_large", workersvc.ErrDescriptionTooLarge, SkipDescriptionTooLarge},
+		// Issue #1626: before the mapping this fell to the transient default, so the schedule
+		// never advanced and re-fired (and re-hit the forge) every tick.
+		{"branch_in_use", workersvc.ErrBranchInUse, SkipAlreadyRunning},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -1547,6 +1553,22 @@ func TestFireSweepPerCandidateBuckets(t *testing.T) {
 		}
 		if out.Skips[0].Title != "Broken login" {
 			t.Fatalf("sweep skip Title = %q, want the fetched issue title", out.Skips[0].Title)
+		}
+		assertBalances(t, out)
+	})
+
+	t.Run("branch_in_use_is_already_running_not_fetch_failed", func(t *testing.T) {
+		// Issue #1626: an active ci_fix / mr_rework on agent/issue-<iid> refuses the create with
+		// ErrBranchInUse. Before the mapping the sweep recorded it as fetch_failed.
+		h := newHarness()
+		h.st.sweepRows = oneRow
+		h.runs.err = workersvc.ErrBranchInUse
+		out, err := h.sched.RunNow(context.Background(), h.sweepSchedule(pgtype.Int4{}))
+		if err != nil {
+			t.Fatalf("sweep must not abort, got %v", err)
+		}
+		if out.Matched != 1 || len(out.Skips) != 1 || out.Skips[0].Reason != SkipAlreadyRunning {
+			t.Fatalf("outcome = %+v, want one already_running skip", out)
 		}
 		assertBalances(t, out)
 	})
