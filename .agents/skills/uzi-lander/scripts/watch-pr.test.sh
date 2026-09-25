@@ -36,11 +36,9 @@ if [ "${1:-}" = pr ] && [ "${2:-}" = checks ]; then
   echo '[{"bucket":"pass"}]'
   exit 0
 fi
-# Greptile's PR-body block naming commit $1, and a page holding one completed Greptile run
-# (id $1, completed_at $2, M = $3). Head deadbeef was committed 2026-09-25T16:14:20Z.
-body_json() { jq -n --arg s "$1" '{body:("Intro\n\n<!-- greptile_comment -->\n\n<!-- greptile_confidence_score:5 -->\n\n<sub>Reviews (1) · Last reviewed commit: [\"fix: x\"](https://github.com/test/repo/commit/" + $s + ")</sub>\n\n<!-- /greptile_comment -->")}'; }
-grun() { printf '{"check_runs":[{"id":%s,"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","completed_at":"%s","output":{"summary":"Greptile has reviewed the Pull Request.\\n\\n10 files reviewed, %s comments added."}}]}\n' "$1" "$2" "$3"; }
 if [ "${1:-}" = api ]; then
+# pushrace* modes: the PR #1698 race, shared with the other entrypoints' tests.
+case "$MODE" in pushrace*) . "$RACE_FIXTURE"; shift; race_api "$@"; exit $? ;; esac
   case "$*" in
     *'graphql'*)
       if [ "$MODE" = pending_findings ]; then
@@ -56,7 +54,7 @@ if [ "${1:-}" = api ]; then
       case "$MODE" in
         pending_findings|revovr_cr_pending) echo '{"statuses":[{"context":"CodeRabbit","description":"Review in progress"}]}' ;;
         cr_limited) echo '{"statuses":[{"context":"CodeRabbit","description":"Review rate limited","updated_at":"2026-09-23T10:00:00Z"}]}' ;;
-        greptile_*|prior_*|head_*|body_*) echo '{"statuses":[]}' ;;
+        greptile_*|prior_*|head_*) echo '{"statuses":[]}' ;;
         *) echo '{"statuses":[{"context":"CodeRabbit","description":"Review completed"}]}' ;;
       esac ;;
     *'/pulls/42/reviews'*)
@@ -66,7 +64,6 @@ if [ "${1:-}" = api ]; then
         prior_headreview|head_two_runs) echo '[{"id":77,"user":{"login":"greptile-apps[bot]"},"commit_id":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","state":"COMMENTED","body":""}]' ;;
         prior_findings) echo '[{"id":44,"user":{"login":"greptile-apps[bot]"},"commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","state":"COMMENTED","body":""},{"id":55,"user":{"login":"greptile-apps[bot]"},"commit_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","state":"COMMENTED","body":""}]' ;;
         cr_resolved) echo '[{"id":9,"user":{"login":"coderabbitai[bot]"},"commit_id":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","state":"APPROVED","body":""}]' ;;
-        body_review_findings) echo '[{"id":7,"user":{"login":"greptile-apps[bot]"},"commit_id":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","state":"COMMENTED","body":""}]' ;;
         *) echo '[]' ;;
       esac ;;
     *'/issues/42/comments'*) cat "$COMMENTS" ;;
@@ -77,35 +74,18 @@ if [ "${1:-}" = api ]; then
         prior_clean|prior_none|prior_unreadable|prior_pending|prior_unparseable|head_unreadable) echo '[{"user":{"login":"greptile-apps[bot]"},"line":8,"body":"<img alt=\"P1\"> old addressed finding","pull_request_review_id":99}]' ;;
         prior_findings) echo '[{"user":{"login":"greptile-apps[bot]"},"line":8,"body":"<img alt=\"P1\"> superseded finding","pull_request_review_id":44},{"user":{"login":"greptile-apps[bot]"},"line":9,"body":"<img alt=\"P1\"> still open finding","pull_request_review_id":55}]' ;;
         greptile_clean) echo '[{"user":{"login":"greptile-apps[bot]"},"line":8,"body":"<img alt=\"P1\"> old addressed finding","pull_request_review_id":99}]' ;;
-        greptile_mixed|body_review_findings) echo '[{"user":{"login":"greptile-apps[bot]"},"line":3,"body":"<img alt=\"P2\"> inline finding","pull_request_review_id":7}]' ;;
+        greptile_mixed) echo '[{"user":{"login":"greptile-apps[bot]"},"line":3,"body":"<img alt=\"P2\"> inline finding","pull_request_review_id":7}]' ;;
         cr_resolved) echo '[{"user":{"login":"coderabbitai[bot]"},"line":8,"body":"🟡 **resolved finding**","pull_request_review_id":9}]' ;;
         *) echo '[]' ;;
       esac ;;
-    *'/pulls/42')
-      case "$MODE" in
-        body_othersha) body_json bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb ;;
-        body_short) body_json deadbeef ;;
-        body_noblock|body_pending_first) echo '{"body":"Last reviewed commit: [x](https://github.com/test/repo/commit/deadbeefdeadbeefdeadbeefdeadbeefdeadbeef)"}' ;;
-        body_malformed) echo '{"body":"<!-- /greptile_comment -->\nLast reviewed commit: [x](https://github.com/test/repo/commit/deadbeefdeadbeefdeadbeefdeadbeefdeadbeef)\n<!-- greptile_comment -->"}' ;;
-        body_*) body_json deadbeefdeadbeefdeadbeefdeadbeefdeadbeef ;;
-        *) echo '{"body":"plain description"}' ;;
-      esac ;;
     *'/pulls/42/commits'*)
       [ "$MODE" = prior_unreadable ] && exit 1
-      case "$MODE" in body_*)
-        echo '[{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","commit":{"committer":{"date":"2026-09-25T16:11:38Z"}}},{"sha":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","commit":{"committer":{"date":"2026-09-25T16:14:20Z"}}}]'
-        exit 0 ;;
-      esac
       echo '[{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},{"sha":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"}]' ;;
     *'/commits/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/check-runs'*)
       case "$MODE" in
         prior_clean|prior_headreview|prior_unparseable|head_unreadable) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"90 files reviewed, 0 comments added"}}]}' ;;
         prior_pending) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"in_progress","conclusion":null,"output":{"summary":""}}]}' ;;
         prior_findings) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"90 files reviewed, 1 comments added"}}]}' ;;
-        body_early) grun 3 2026-09-25T16:10:00Z 0 ;;
-        body_review_findings|body_findings_noreview) grun 3 2026-09-25T16:18:40Z 1 ;;
-        body_norun) echo '{"check_runs":[{"app":{"slug":"github-actions"},"name":"CI","status":"completed","conclusion":"success","completed_at":"2026-09-25T16:20:00Z","output":{"summary":""}}]}' ;;
-        body_*) grun 3 2026-09-25T16:18:40Z 0 ;;
         *) echo '{"check_runs":[{"app":{"slug":"github-actions"},"name":"CI","status":"completed","conclusion":"success","output":{"summary":""}}]}' ;;
       esac ;;
     *'/commits/deadbeefdeadbeefdeadbeefdeadbeefdeadbeef/check-runs'*)
@@ -116,7 +96,6 @@ if [ "${1:-}" = api ]; then
         greptile_outside_clean) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"Greptile has reviewed the Pull Request.\n\n90 files reviewed, 0 comments added"}}]}' ;;
         prior_unparseable) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"Reviewed 90 files and raised 3 issues"}}]}' ;;
         head_unreadable) exit 1 ;;
-        body_stale_dup|body_pending_first) echo '{"check_runs":[{"id":4,"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"in_progress","conclusion":null,"started_at":"2026-09-25T16:24:51Z","output":{"summary":""}}]}' ;;
         # Newest first, as the API lists them: the re-trigger (id 2) found something the first run did not.
         head_two_runs) echo '{"check_runs":[{"id":2,"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"90 files reviewed, 1 comments added"}},{"id":1,"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"90 files reviewed, 0 comments added"}}]}' ;;
         *) echo '{"check_runs":[]}' ;;
@@ -131,6 +110,7 @@ STUB
 chmod +x "$WORK/bin/gh" "$WORK/bin/uzi" "$WORK/bin/sleep"
 export PATH="$WORK/bin:$PATH"
 export COMMENTS="$WORK/comments.json"
+export RACE_FIXTURE="$HERE/lib/greptile-race.fixture.sh"
 MODE="full"; export MODE
 
 jq -n '[
@@ -411,39 +391,53 @@ rc=$?
 set -e
 [ "$rc" -eq 2 ] || fail "--reviewer any stopped waiting for a CodeRabbit review in progress, rc=$rc: $(cat "$WORK/revovr-any.out")"
 
-# ---- Greptile's verdict on a head whose run landed on an OLDER commit (PR #1698) -------
-# A push raced `@greptileai review`: the run sits on bbbbbbbb, the PR-body block names the
-# head, and the run completed after the head's committer date. That is a clean review of the
-# head, and the log names the evidence.
+# ---- Greptile's run landed on an OLDER commit than the head it reviewed (PR #1698) ------
+# lib/greptile-race.fixture.sh holds the data; pr-findings and takeover judge the same modes.
 wp() { MODE="$1"; export MODE; set +e; bash "$SCRIPT" test/repo 42 0 1 --reviewer greptile --reviewer-grace 0 > "$WORK/$1.out" 2>&1; rc=$?; set -e; }
-wp body_race
-[ "$rc" -eq 0 ] || fail "body-paired clean Greptile review of the head did not reach ready, rc=$rc: $(cat "$WORK/body_race.out")"
-grep -qF 'greptile=completed(body→deadbeef via run on bbbbbbbb) (10 files reviewed, 0 comments added)' "$WORK/body_race.out" \
-  || fail "the body-paired evidence was not named: $(cat "$WORK/body_race.out")"
-# Not reviewed, each on its own missing leg: no qualifying run anywhere, the body naming
-# another commit, no block (a lookalike line outside it), markers out of order, a short SHA,
-# and a run that completed before the head existed.
-for m in body_norun body_othersha body_noblock body_malformed body_short body_early; do
+# The race: Greptile's own edit names the head, one run completed 6 s later, started after
+# the newest trigger. Reviewed clean, and the log names the evidence.
+wp pushrace
+[ "$rc" -eq 0 ] || fail "pushrace: a clean review of the head did not reach ready, rc=$rc: $(cat "$WORK/pushrace.out")"
+grep -qF 'greptile=completed(edit→deadbeef via run on bbbbbbbb) (10 files reviewed, 0 comments added)' "$WORK/pushrace.out" \
+  || fail "pushrace: the evidence was not named: $(cat "$WORK/pushrace.out")"
+# A stale in_progress duplicate on the head that no newer trigger started does not block.
+wp pushrace_stale_dup
+[ "$rc" -eq 0 ] || fail "pushrace_stale_dup: a stale duplicate blocked a proven review, rc=$rc: $(cat "$WORK/pushrace_stale_dup.out")"
+# A NEWER trigger than the bound run's start is a review still due: pending, not reviewed,
+# whether its run is already on the head or not visible yet.
+for m in pushrace_new_trigger pushrace_new_trigger_absent; do
   wp "$m"
-  [ "$rc" -eq 6 ] || fail "$m: a head without paired Greptile evidence read as reviewed, rc=$rc: $(cat "$WORK/$m.out")"
-  grep -q 'greptile=absent' "$WORK/$m.out" || fail "$m: head was not reported absent: $(cat "$WORK/$m.out")"
+  [ "$rc" -eq 2 ] || fail "$m: a newer trigger did not keep the watcher waiting, rc=$rc: $(cat "$WORK/$m.out")"
+  grep -q 'pending: trigger 2026-09-25T16:24:25Z' "$WORK/$m.out" || fail "$m: pending not named: $(cat "$WORK/$m.out")"
+  if grep -q 'unknown=1' "$WORK/$m.out"; then fail "$m: pending read as unknown: $(cat "$WORK/$m.out")"; fi
 done
-# Comments added on the paired run: reviewed, not clean. With the head review object as the
-# marker the finding is counted live; with only the body there is no review id to scope by,
-# which is unknown (never ready).
-wp body_review_findings
-[ "$rc" -eq 3 ] || fail "paired review with comments did not surface findings, rc=$rc: $(cat "$WORK/body_review_findings.out")"
-grep -qF 'greptile=completed(review→deadbeef via run on bbbbbbbb)' "$WORK/body_review_findings.out" || fail "review-marker evidence not named: $(cat "$WORK/body_review_findings.out")"
-grep -q '^RESULT=findings live=1 cr=0 gr=1 ' "$WORK/body_review_findings.out" || fail "paired finding not counted: $(cat "$WORK/body_review_findings.out")"
-wp body_findings_noreview
-[ "$rc" -eq 2 ] || fail "body-paired review with unscopable comments was not unknown, rc=$rc: $(cat "$WORK/body_findings_noreview.out")"
-grep -q 'unknown=1' "$WORK/body_findings_noreview.out" || fail "unscopable body-paired comments not unknown: $(cat "$WORK/body_findings_noreview.out")"
-# A stale in_progress duplicate on the head does not block a proven completed review...
-wp body_stale_dup
-[ "$rc" -eq 0 ] || fail "a stale in_progress duplicate blocked a body-paired review, rc=$rc: $(cat "$WORK/body_stale_dup.out")"
-# ...but a genuinely first review in progress, with no completed evidence, stays pending.
-wp body_pending_first
-[ "$rc" -eq 2 ] || fail "an in-progress first Greptile review was not waited on, rc=$rc: $(cat "$WORK/body_pending_first.out")"
-grep -q 'greptile=in_progress' "$WORK/body_pending_first.out" || fail "in-progress head not reported: $(cat "$WORK/body_pending_first.out")"
+# No evidence: no trigger; only a user edit names the head; Greptile's edit names another
+# commit, is malformed, short, missing or truncated; no run in the window; no run at all;
+# the bound run finished before the head's committer date.
+for m in pushrace_notrigger pushrace_forged pushrace_othersha pushrace_malformed pushrace_short pushrace_nodiff pushrace_truncated pushrace_nowindow pushrace_norun pushrace_early; do
+  wp "$m"
+  [ "$rc" -eq 6 ] || fail "$m: a head without bound Greptile evidence read as reviewed, rc=$rc: $(cat "$WORK/$m.out")"
+  grep -q 'greptile=absent live=' "$WORK/$m.out" || fail "$m: head not reported absent: $(cat "$WORK/$m.out")"
+done
+# Unknown, never clean: two runs could bind the edit; the edit history has a further page.
+for m in pushrace_two_runs pushrace_more_pages; do
+  wp "$m"
+  [ "$rc" -eq 2 ] || fail "$m: ambiguous or truncated evidence did not defer, rc=$rc: $(cat "$WORK/$m.out")"
+  grep -q 'unknown=1' "$WORK/$m.out" || fail "$m: not unknown: $(cat "$WORK/$m.out")"
+  grep -q 'greptile=absent live=' "$WORK/$m.out" || fail "$m: head read as reviewed: $(cat "$WORK/$m.out")"
+done
+# Comments added on the bound run: findings (head review object as marker), or unknown when
+# only the edit marks the head and no review id can scope them.
+wp pushrace_review_findings
+[ "$rc" -eq 3 ] || fail "pushrace_review_findings: findings not surfaced, rc=$rc: $(cat "$WORK/pushrace_review_findings.out")"
+grep -qF 'greptile=completed(review→deadbeef via run on bbbbbbbb)' "$WORK/pushrace_review_findings.out" || fail "review marker not named: $(cat "$WORK/pushrace_review_findings.out")"
+grep -q '^RESULT=findings live=1 cr=0 gr=1 ' "$WORK/pushrace_review_findings.out" || fail "bound finding not counted: $(cat "$WORK/pushrace_review_findings.out")"
+wp pushrace_findings_noreview
+[ "$rc" -eq 2 ] || fail "pushrace_findings_noreview: unscopable comments not unknown, rc=$rc: $(cat "$WORK/pushrace_findings_noreview.out")"
+grep -q 'unknown=1' "$WORK/pushrace_findings_noreview.out" || fail "pushrace_findings_noreview: not unknown: $(cat "$WORK/pushrace_findings_noreview.out")"
+# A first review in progress with no completed evidence stays pending, as before.
+wp pushrace_pending_first
+[ "$rc" -eq 2 ] || fail "pushrace_pending_first: an in-progress first review was not waited on, rc=$rc: $(cat "$WORK/pushrace_pending_first.out")"
+grep -q 'greptile=in_progress live=' "$WORK/pushrace_pending_first.out" || fail "pushrace_pending_first: $(cat "$WORK/pushrace_pending_first.out")"
 
-echo "PASS watch-pr: settled reviews, resolved-thread scope, earlier-verdict Greptile scope, change_assessment head marker, reviewer override, body-paired Greptile verdict"
+echo "PASS watch-pr: settled reviews, resolved-thread scope, earlier-verdict Greptile scope, change_assessment head marker, reviewer override, Greptile run on an older commit"

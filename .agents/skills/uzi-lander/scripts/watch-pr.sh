@@ -58,9 +58,9 @@
 # "Greptile reviewed this head" is its `Greptile Review` check-run on the head SHA at
 # status completed (its summary carries "N files reviewed, M comments added"); with 0
 # findings Greptile posts NO review object. When a push races the trigger the run lands on
-# an older commit instead, and the head's only marker is the PR-body "Last reviewed commit"
-# (or a head review object when comments were added), paired with that run
-# (lib/greptile-verdict.sh, greptile_paired_verdict).
+# an older commit instead, and the head's only marker is Greptile's own PR-body edit naming it
+# (read from the authenticated edit history, never the live body) or a head review object
+# when comments were added, bound to that run (lib/greptile-verdict.sh, greptile_paired_verdict).
 # The script errs toward timeout (exit 2) rather than a false "ready".
 set -euo pipefail
 
@@ -195,7 +195,7 @@ while [ "$i" -lt "$MAX" ]; do
   # does NOT accept jq's --arg (so the head SHA is passed to standalone jq), and `gh api
   # --paginate` emits one array PER PAGE (so pages are slurped with `-s`/`.[][]`).
   cr_reviewed=0; cr_unconfirmed=0
-  cr_a=""; gr_review_id=""
+  cr_a=""; gr_review_id=""; gr_review_at=""
   if rev_raw=$(gh api --paginate "repos/$REPO/pulls/$PR/reviews" 2>/dev/null) && pages_are_arrays "$rev_raw"; then
     # shellcheck disable=SC2016  # $h is a jq var (--arg), must stay single-quoted
     rev_on_head=$(printf '%s' "$rev_raw" | jq -rs --arg h "$head" \
@@ -215,6 +215,8 @@ while [ "$i" -lt "$MAX" ]; do
     # id so old still-anchored comments from prior reviews cannot contaminate this pass.
     gr_review_id=$(printf '%s' "$rev_raw" | jq -rs --arg h "$head" \
       '[.[][]|select(.user.login=="greptile-apps[bot]" and .commit_id==$h)]|last|.id // empty' 2>/dev/null) || unknown=1
+    gr_review_at=$(printf '%s' "$rev_raw" | jq -rs --arg h "$head" \
+      '[.[][]|select(.user.login=="greptile-apps[bot]" and .commit_id==$h)]|last|.submitted_at // empty' 2>/dev/null) || unknown=1
   else
     unknown=1
   fi
@@ -355,21 +357,26 @@ while [ "$i" -lt "$MAX" ]; do
     unknown=1
   fi
   # No completed review run on the head: a push that raced `@greptileai review` leaves the run
-  # on an older commit while Greptile reviewed this head (PR #1698). A head review object or
-  # the PR-body "Last reviewed commit" naming this head, paired with a completed run that
-  # finished after the head's committer date, is a review of this head (lib/greptile-verdict.sh,
-  # greptile_paired_verdict). It also outranks a stale queued/in_progress duplicate on the head.
+  # on an older commit while Greptile reviewed this head (PR #1698). A head review object, or
+  # Greptile's own PR-body edit (authenticated edit history) naming this head, bound to the
+  # one run that completed right after it and started after the newest trigger, is a review
+  # of this head (lib/greptile-verdict.sh, greptile_paired_verdict). It outranks a stale
+  # queued/in_progress duplicate the newest trigger did not start; a newer trigger is pending.
   # A completed non-review run on the head (failure, no summary) keeps today's reading.
-  gr_via=""
+  gr_via=""; gr_pending=0
   case "$gr_state" in
     absent|queued|in_progress)
       gp_rc=0
-      greptile_paired_verdict "$REPO" "$PR" "$head" "$gr_review_id" || gp_rc=$?
-      if [ "$gp_rc" -ne 0 ]; then
-        unknown=1
-      elif [ -n "$GRP_SHA" ]; then
-        gr_state="completed"; gr_concl="success"; gr_summary="$GRP_SUMMARY"; gr_via="($GRP_NOTE)"
-      fi ;;
+      if gp_issue=$(printf '%s' "${issue_c:-}" | jq -se 'if length>0 and all(.[]; type=="array") then add else error("x") end' 2>/dev/null); then
+        greptile_paired_verdict "$REPO" "$PR" "$head" "$gr_review_at" "$gp_issue" || gp_rc=$?
+      else gp_rc=1; fi
+      case "$gp_rc" in
+        0) if [ -n "$GRP_SHA" ]; then
+             gr_state="completed"; gr_concl="success"; gr_summary="$GRP_SUMMARY"; gr_via="($GRP_NOTE)"
+           fi ;;
+        2) gr_pending=1; gr_via="(pending: trigger $GRP_TRIGGER is newer than the run that reviewed ${head:0:8})" ;;
+        *) unknown=1 ;;
+      esac ;;
   esac
   # Greptile's outside-diff findings live in one ISSUE comment, not in a review object
   # (lib/greptile-verdict.sh, greptile_outside_diff). They count toward its tally and stay
@@ -522,7 +529,7 @@ while [ "$i" -lt "$MAX" ]; do
     # not waited on: --reviewer greptile does not block on a CodeRabbit review in progress,
     # and --reviewer coderabbit does not block on a Greptile one.
     if { [ "$cr_counts" -eq 1 ] && [ "$cr_pending" -eq 1 ]; } \
-       || { [ "$gr_counts" -eq 1 ] && { [ "$gr_state" = "in_progress" ] || [ "$gr_state" = "queued" ]; }; }; then
+       || { [ "$gr_counts" -eq 1 ] && { [ "$gr_state" = "in_progress" ] || [ "$gr_state" = "queued" ] || [ "$gr_pending" -eq 1 ]; }; }; then
       : # a counted review is in flight; keep polling
     elif [ "$reviewed_head" -eq 1 ]; then
       # Revalidate the head right before deciding (TOCTOU): a push during this iteration would

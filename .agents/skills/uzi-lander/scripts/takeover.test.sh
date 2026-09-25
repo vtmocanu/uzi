@@ -30,6 +30,8 @@ if [ "${1:-}" = pr ] && [ "${2:-}" = view ]; then
 fi
 if [ "${1:-}" = pr ] && [ "${2:-}" = checks ]; then echo '[{"bucket":"pass"}]'; exit 0; fi
 [ "${1:-}" = api ] || { echo "unexpected gh call: $*" >&2; exit 1; }
+# pushrace* modes: the PR #1698 race, shared with the other entrypoints' tests.
+case "$MODE" in pushrace*) . "$RACE_FIXTURE"; shift; race_api "$@"; exit $? ;; esac
 case "$*" in
   *"/commits/$HEAD/status"*) echo '{"statuses":[]}' ;;
   *'/pulls/42/reviews'*)
@@ -72,6 +74,7 @@ esac
 STUB
 chmod +x "$WORK/bin/gh" "$WORK/bin/uzi"
 export PATH="$WORK/bin:$PATH"
+export RACE_FIXTURE="$HERE/lib/greptile-race.fixture.sh"
 
 # snap MODE — one snapshot; never claims (that writes shared state). A snapshot always exits 0.
 snap() {
@@ -149,4 +152,38 @@ snap head_two_runs
 has head_two_runs "GREPTILE_SUMMARY='90 files reviewed, 1 comments added'"
 has head_two_runs 'LIVE_FINDINGS=1 (cr=0 gr=1 '
 
-echo "PASS takeover: Greptile liveness agrees with watch-pr and pr-findings"
+# ---- Greptile's run landed on an OLDER commit than the head it reviewed (PR #1698) ------
+# The same modes watch-pr.test.sh and pr-findings.test.sh judge; the three must agree.
+for m in pushrace pushrace_stale_dup; do
+  snap "$m"
+  has "$m" 'GREPTILE_REVIEWED_HEAD=1'
+  has "$m" "GREPTILE_EVIDENCE='edit→deadbeef via run on bbbbbbbb'"
+  has "$m" 'NEXT=ready'
+done
+for m in pushrace_new_trigger pushrace_new_trigger_absent; do
+  snap "$m"
+  has "$m" 'GREPTILE_REVIEWED_HEAD=0'
+  has "$m" "GREPTILE_EVIDENCE='pending: trigger 2026-09-25T16:24:25Z"
+  has "$m" 'NEXT=review_pending'
+done
+for m in pushrace_notrigger pushrace_forged pushrace_othersha pushrace_malformed pushrace_short pushrace_nodiff pushrace_truncated pushrace_nowindow pushrace_norun pushrace_early; do
+  snap "$m"
+  has "$m" 'GREPTILE_REVIEWED_HEAD=0'
+  has "$m" 'NEXT=no_review'
+done
+for m in pushrace_two_runs pushrace_more_pages; do
+  snap "$m"
+  has "$m" 'GREPTILE_REVIEWED_HEAD=0'
+  has "$m" 'NEXT=unknown'
+done
+snap pushrace_review_findings
+has pushrace_review_findings 'GREPTILE_REVIEWED_HEAD=1'
+has pushrace_review_findings 'LIVE_FINDINGS=1 (cr=0 gr=1 '
+has pushrace_review_findings 'NEXT=findings'
+# Comments added with no head review id to show them: never ready.
+snap pushrace_findings_noreview
+has pushrace_findings_noreview 'NEXT=unknown'
+snap pushrace_pending_first
+has pushrace_pending_first 'NEXT=review_pending'
+
+echo "PASS takeover: Greptile liveness agrees with watch-pr and pr-findings, including a run on an older commit"

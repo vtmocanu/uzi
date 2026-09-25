@@ -173,7 +173,33 @@ if [ -n "$gr_json" ]; then
   # completed check is not a review.
   if [ "$gr_state" = "completed" ] && [ "$gr_concl" = "success" ] && [ -n "$gr_sum" ]; then gr_reviewed=1; fi
 fi
-echo "GREPTILE=$gr_state${gr_concl:+/$gr_concl}"; [ -n "$gr_sum" ] && echo "GREPTILE_SUMMARY='$gr_sum'"; echo "GREPTILE_REVIEWED_HEAD=$gr_reviewed"
+# No completed review run on the head: a push that raced `@greptileai review` leaves the run
+# on an older commit while Greptile reviewed this head (PR #1698). The same evidence
+# watch-pr.sh and pr-findings.sh use (lib/greptile-verdict.sh, greptile_paired_verdict): a
+# head review object or Greptile's own edit-history PR-body edit naming the head, bound to one
+# run started after the newest trigger. A newer trigger is pending (NEXT=review_pending).
+gr_via=""; gr_pending=0
+case "$gr_state" in
+  absent|queued|in_progress)
+    gr_review_at=$(printf '%s' "$rev_raw" | jq -r --arg h "$head" '[.[]|select(.user.login=="greptile-apps[bot]" and .commit_id==$h)]|last|.submitted_at // empty' 2>/dev/null || true)
+    gp_rc=0
+    greptile_paired_verdict "$REPO" "$PR" "$head" "$gr_review_at" "$issue_c" || gp_rc=$?
+    case "$gp_rc" in
+      0) if [ -n "$GRP_SHA" ]; then
+           gr_state="completed"; gr_concl="success"; gr_sum="$GRP_SUMMARY"; gr_reviewed=1; gr_via="$GRP_NOTE"
+           # Comments added with no head review object to hold them (and not all outside the
+           # diff) cannot be shown: never ready on a count that may be missing them.
+           if [ "$GRP_ADDED" != "0" ] && [ -z "$gr_review_at" ]; then
+             gp_od=0
+             if greptile_outside_diff "$head" <<<"$issue_c"; then gp_od="$GOD_HEAD"; fi
+             [ $(( GRP_ADDED - gp_od )) -gt 0 ] && UNKNOWN=1
+           fi
+         fi ;;
+      2) gr_pending=1; gr_via="pending: trigger $GRP_TRIGGER is newer than the run that reviewed ${head:0:8}" ;;
+      *) UNKNOWN=1; gr_via="edit-history or paired-run evidence unreadable or ambiguous" ;;
+    esac ;;
+esac
+echo "GREPTILE=$gr_state${gr_concl:+/$gr_concl}"; [ -n "$gr_via" ] && echo "GREPTILE_EVIDENCE='$gr_via'"; [ -n "$gr_sum" ] && echo "GREPTILE_SUMMARY='$gr_sum'"; echo "GREPTILE_REVIEWED_HEAD=$gr_reviewed"
 
 # Live inline findings from either bot (+ the unconfirmed CodeRabbit review body).
 pull_c=$(gh api --paginate "repos/$REPO/pulls/$PR/comments" 2>/dev/null | jq -s 'add // []' 2>/dev/null || echo 'x')
@@ -281,7 +307,7 @@ elif [ "$reviewed" -eq 0 ]; then
   case "$cr_desc" in
     *"in progress"*) echo "NEXT=review_pending";;
     *"rate limited"*) echo "NEXT=cr_rate_limited";;
-    *) if [ "$gr_state" = "in_progress" ] || [ "$gr_state" = "queued" ]; then echo "NEXT=review_pending"; else echo "NEXT=no_review"; fi;;
+    *) if [ "$gr_state" = "in_progress" ] || [ "$gr_state" = "queued" ] || [ "$gr_pending" -eq 1 ]; then echo "NEXT=review_pending"; else echo "NEXT=no_review"; fi;;
   esac
 elif [ "$live" -gt 0 ]; then echo "NEXT=findings"
 else echo "NEXT=ready${merge_state:+ (merge_state=$merge_state)}"
