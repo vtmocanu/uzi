@@ -9,7 +9,7 @@ import type { ChatRunner } from "../src/chat-runner.js";
 import type { JudgeRunner } from "../src/judge-runner.js";
 import type { ReviewRunner } from "../src/review-runner.js";
 import type { ClaimResponse, ChatClaimResponse, WorkerStats } from "../src/protocol.js";
-import { CODEX_CUSTOM_MODEL_CAPABILITY, CODEX_HARNESS_CAPABILITY } from "../src/codex/codex-runtime-probe.js";
+import { CODEX_COMPLETION_INTERLOCK_CAPABILITY, CODEX_CUSTOM_MODEL_CAPABILITY, CODEX_HARNESS_CAPABILITY } from "../src/codex/codex-runtime-probe.js";
 import { ActiveRunRegistry } from "../src/active-run-registry.js";
 import { recordingLogger } from "./helpers.js";
 
@@ -842,7 +842,7 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     );
     assert.deepStrictEqual(
       caps,
-      ["completion_interlock_v1", "recovery_archive_v1", "recovery_archive_v2", "credential_switch_v1", "wall_park_v1", CODEX_HARNESS_CAPABILITY, CODEX_CUSTOM_MODEL_CAPABILITY],
+      ["completion_interlock_v1", "recovery_archive_v1", "recovery_archive_v2", "credential_switch_v1", "wall_park_v1", CODEX_HARNESS_CAPABILITY, CODEX_COMPLETION_INTERLOCK_CAPABILITY, CODEX_CUSTOM_MODEL_CAPABILITY],
       "an advertising result appends codex_harness_v1 then codex_custom_model_v1 (PRD #1551 D6) after the always-present protocol caps (v2 by PRD #1349 M1, credential_switch_v1 by PRD #1247 M5b, wall_park_v1 by PRD #1497 M2)",
     );
   });
@@ -867,6 +867,7 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
       "a non-advertising result leaves the always-present protocol caps unchanged (Claude service intact)",
     );
     assert.ok(!caps?.includes(CODEX_HARNESS_CAPABILITY), "codex_harness_v1 is absent when not advertising");
+    assert.ok(!caps?.includes(CODEX_COMPLETION_INTERLOCK_CAPABILITY));
   });
 
   it("omits codex_harness_v1 when the result is absent (defensive optional chaining)", async () => {
@@ -902,6 +903,7 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
       fakeConfig({ codexHarness: { advertise: true, degraded: false, landlock: "available" } }),
     );
     assert.ok(advertising?.includes(CODEX_HARNESS_CAPABILITY), "harness cap present when advertising");
+    assert.ok(advertising?.includes(CODEX_COMPLETION_INTERLOCK_CAPABILITY));
     assert.ok(
       advertising?.includes(CODEX_CUSTOM_MODEL_CAPABILITY),
       "codex_custom_model_v1 present exactly when codex_harness_v1 is",
@@ -911,6 +913,7 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
       fakeConfig({ codexHarness: { advertise: false, degraded: false, landlock: "unavailable" } }),
     );
     assert.ok(!notAdvertising?.includes(CODEX_HARNESS_CAPABILITY), "harness cap absent when not advertising");
+    assert.ok(!notAdvertising?.includes(CODEX_COMPLETION_INTERLOCK_CAPABILITY));
     assert.ok(
       !notAdvertising?.includes(CODEX_CUSTOM_MODEL_CAPABILITY),
       "codex_custom_model_v1 absent when codex_harness_v1 is",

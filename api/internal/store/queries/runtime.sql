@@ -439,9 +439,9 @@ WHERE status = 'online'
 -- the fields above: it is a silently-omittable nullable param (sqlc.narg). createRun reads
 -- the completion_interlock_rollout switch (default ON; an explicit "false" is the admin
 -- kill-switch; a cold read error counts as off) and passes 1 ONLY when it is on AND the run
--- is not seeded AND its resolved harness is Claude (#1626: Codex does not run the
--- completion-attempt loop), stamping the run as INTERLOCKED before its first claim; every
--- other run (switch off, seeded, Codex) passes NULL and stays the explicit legacy state. An omitted Go struct field would compile green
+-- is not seeded, whether its resolved harness is Claude or Codex, stamping the run as
+-- INTERLOCKED before its first claim; a switch-off or seeded run passes NULL and stays
+-- the explicit legacy state. An omitted Go struct field would compile green
 -- and silently ship NULL for every run (the feature inert), so a per-path test guards it,
 -- not the compiler. Stamped BEFORE the first claim on purpose: approval does not re-claim,
 -- so stamping only at approval would make the D2 hard claim clause vacuous for the
@@ -851,6 +851,10 @@ WITH target AS (
       -- workers.protocol_capabilities, passed by the Go caller).
       AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
            OR 'codex_harness_v1' = ANY(@worker_protocol_caps::text[]))
+      -- Interlocked Codex turns require the newer completion loop, independently of overrides.
+      AND (r.completion_contract_version IS NULL
+           OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
+           OR 'codex_completion_interlock_v1' = ANY(@worker_protocol_caps::text[]))
       -- PRD #1551 M4 (D6): the NON-BYPASSABLE custom-Codex-model claim clause, a SIBLING of the
       -- codex-harness clause directly above. A Codex run whose EFFECTIVE worker-root model is a
       -- CUSTOM (non-curated) id may be claimed ONLY by a worker whose protocol_capabilities contain
@@ -999,6 +1003,9 @@ WITH target AS (
                 -- claimant's @worker_protocol_caps).
                 AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                      OR 'codex_harness_v1' = ANY(p.protocol_capabilities))
+                AND (r.completion_contract_version IS NULL
+                     OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
+                     OR 'codex_completion_interlock_v1' = ANY(p.protocol_capabilities))
                 -- PRD #1551 M4 (D6): MIRROR the non-bypassable custom-Codex-model clause for the peer, or
                 -- fleet-spread could DEFER a CUSTOM-root Codex run to an INCAPABLE peer that could never
                 -- claim it (its OWN custom-model clause above blocks it) — making the run permanently
@@ -6136,6 +6143,9 @@ WHERE run.id = @run_id
        OR 'completion_interlock_v1' = ANY(w.protocol_capabilities))
   AND (NOT (run.harness = 'codex' OR run.codex_material_revision IS NOT NULL OR run.codex_secret_id IS NOT NULL)
        OR 'codex_harness_v1' = ANY(w.protocol_capabilities))
+  AND (run.completion_contract_version IS NULL
+       OR NOT (run.harness = 'codex' OR run.codex_material_revision IS NOT NULL OR run.codex_secret_id IS NOT NULL)
+       OR 'codex_completion_interlock_v1' = ANY(w.protocol_capabilities))
   -- PRD #1551 M4 (D6): MIRROR ClaimRun's non-bypassable custom-Codex-model clause, so this
   -- claimable count and the claim gate never disagree. The effective-root expression is written
   -- IDENTICALLY to ClaimRun (run.model/curated-else-lane, NULL-safe via COALESCE), reading the
@@ -6299,6 +6309,19 @@ WHERE w.user_id = @user_id
   AND w.draining_since IS NULL
   AND NOT w.ephemeral
   AND 'codex_harness_v1' = ANY(w.protocol_capabilities);
+
+-- name: CountOnlineWorkersSatisfyingCodexCompletion :one
+-- Static protocol intersection for an interlocked Codex run. Ignore free slots and the
+-- released incarnation: those are transient availability constraints handled later.
+SELECT count(*) FROM workers w
+WHERE w.user_id = @user_id
+  AND w.status = 'online'
+  AND w.draining_since IS NULL
+  AND NOT w.ephemeral
+  AND 'completion_interlock_v1' = ANY(w.protocol_capabilities)
+  AND 'codex_harness_v1' = ANY(w.protocol_capabilities)
+  AND 'codex_completion_interlock_v1' = ANY(w.protocol_capabilities)
+  AND (NOT @custom_root::boolean OR 'codex_custom_model_v1' = ANY(w.protocol_capabilities));
 
 -- name: CountOnlineWorkersSatisfyingCustomCodex :one
 -- PRD #1551 M4 (D6): how many of a user's ONLINE, non-draining, non-ephemeral workers self-report

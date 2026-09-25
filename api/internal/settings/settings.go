@@ -260,7 +260,7 @@ func (c *Cache) CapabilityAwareScheduling(ctx context.Context) (bool, error) {
 // default-on posture as CapabilityAwareScheduling. It is an admin kill-switch (Admin ->
 // Instance settings -> Completion check): an explicit "false" row keeps it off. The
 // createRun path threads the result in as the completion_contract_version stamp gate
-// (Claude-harness, unseeded runs only). A boolSetting read error propagates alongside the
+// (new, unseeded Claude and Codex issue runs). A boolSetting read error propagates alongside the
 // value: on a cold read error (no valid cache snapshot) the value is the default (true)
 // with a non-nil error, and the service's completionInterlockOn discards any errored
 // value, so no run is stamped; a failed refresh with a valid cache returns the cached

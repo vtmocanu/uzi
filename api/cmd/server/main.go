@@ -535,7 +535,7 @@ func run() error {
 	// Completion-interlock rollout switch (PRD #1226 M1, D1): createRun reads it from the
 	// same settings cache to decide whether to stamp completion_contract_version=1 on a new
 	// issue run, so an admin flip takes effect within the cache TTL. Default ON for
-	// Claude-harness issue runs (issue #1626; Codex and seeded runs stay legacy); an explicit
+	// unseeded Claude and Codex issue runs (issue #1626); an explicit
 	// "false" is the admin kill-switch, and a cold read error still creates a legacy run.
 	wsvc.SetCompletionInterlockSettings(settingsCache)
 

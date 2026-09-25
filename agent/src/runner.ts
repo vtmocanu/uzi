@@ -2,6 +2,7 @@ import { AsyncResource } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
+import { join } from "node:path";
 import type { WorkerClient } from "./client.js";
 import { RequestError } from "./client.js";
 import type { GitCache, RunnerClone, CheckpointOverlayContext, CheckpointRange } from "./git.js";
@@ -81,6 +82,7 @@ import { GitLabClient, ForgejoClient, GitHubClient, type ForgeClient } from "./f
 import { classifyForgeError, withForgeRetry } from "./forge-retry.js";
 import { makeRedactor, makeTextRedactor } from "./redact.js";
 import { sessionTranscriptResolvable } from "./sdk-session.js";
+import { CodexSessionStore } from "./codex/session-state.js";
 import { errMessage, RUN_ID_RE, sleep } from "./util.js";
 import {
   CHECKPOINT_SCAN_TIMEOUT_MS,
@@ -5484,11 +5486,13 @@ export class RunRunner {
     if (
       sessionId &&
       runHome &&
-      !(await sessionTranscriptResolvable(runHome, sessionId, runLog))
+      (claim.secrets.codex
+        ? (await CodexSessionStore.inspectSession(join(runHome, "codex-session-store"), sessionId)) !== "present"
+        : !(await sessionTranscriptResolvable(runHome, sessionId, runLog)))
     ) {
       sessionId = undefined;
       runLog.warn(
-        "resume session transcript is not resolvable here; starting a fresh SDK session",
+        "resume session transcript is not resolvable here; starting a fresh session",
         {
           run_home: runHome,
           event: RESUME_LINEAGE_BREAK_EVENT,
@@ -5520,7 +5524,7 @@ export class RunRunner {
       // silent there, matching the lineage-break guard's intent.
       if (runHome) {
         runLog.info(
-          "resume session transcript resolved here; continuing the prior SDK session",
+          "resume session transcript resolved here; continuing the prior session",
           {
             run_home: runHome,
             event: RESUME_CONTINUED_EVENT,
@@ -6543,8 +6547,8 @@ export class RunRunner {
       // and HOME); false means it did NOT park (it cleared its preserve flags), so the executor falls
       // back to the legacy throw and the run's normal terminal cleanup runs. Live for every
       // interlocked run: completion_interlock_rollout defaults ON (#1626), so an unseeded
-      // Claude-harness issue run carries completion_contract_version and completionInterlock
-      // above is true; a legacy, seeded or Codex run leaves it false and never reaches this seam.
+      // Claude or Codex issue run carries completion_contract_version and completionInterlock
+      // above is true; a legacy or seeded run leaves it false and never reaches this seam.
       // issue #1597 M2: gated against the mid-turn tick (it reaps and captures a restore point).
       enterCompletionHold: (reason) =>
         this.runGatedSink(flight, () => this.enterCompletionHold(flight, claim, reason, runLog)),

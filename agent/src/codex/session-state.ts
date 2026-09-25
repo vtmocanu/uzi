@@ -828,6 +828,7 @@ export interface CodexSessionStoreApi {
   persist(codexHome: string, storeDir: string, opts?: { bounds?: SessionStoreBounds }): Promise<PersistResult>;
   adopt(storeDir: string, codexHome: string, opts?: { destination?: SessionAdoptDestination }): Promise<AdoptResult>;
   inspect(storeDir: string, opts?: { scanCap?: number }): Promise<SessionPresence>;
+  inspectSession(storeDir: string, sessionId: string, opts?: { scanCap?: number }): Promise<SessionPresence>;
   remove(storeDir: string): Promise<void>;
 }
 
@@ -1069,6 +1070,73 @@ export function createCodexSessionStore(hooks: CodexSessionStoreHooks = {}): Cod
             return "unknown"; // bound breach or unexpected I/O → uncertainty
           }
         } finally {
+          await closeQuietly(genFd);
+          await closeQuietly(gensFd);
+          await closeQuietly(storeFd);
+        }
+      });
+    },
+
+    /** Look up one claimed thread in the current generation, without following symlinks. */
+    async inspectSession(storeDir, sessionId, opts = {}) {
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(sessionId)) return "absent";
+      return withStoreLock(storeDir, async () => {
+        let storeFd: FileHandle | undefined;
+        let gensFd: FileHandle | undefined;
+        let genFd: FileHandle | undefined;
+        let sessionsFd: FileHandle | undefined;
+        try {
+          try {
+            storeFd = await resolveDir(storeDir);
+            const pointer = await readCurrentPointer(storeFd, hooks.faultPointerRead);
+            if (pointer.kind !== "present") return "absent";
+            gensFd = await openAt(storeFd, GENERATIONS_SUBDIR, FS.O_RDONLY | FS.O_DIRECTORY | FS.O_NOFOLLOW);
+            genFd = await openAt(gensFd, pointer.genId, FS.O_RDONLY | FS.O_DIRECTORY | FS.O_NOFOLLOW);
+            sessionsFd = await openAt(genFd, SESSION_ALLOWED_SUBDIR, FS.O_RDONLY | FS.O_DIRECTORY | FS.O_NOFOLLOW);
+          } catch (error) {
+            const code = (error as NodeJS.ErrnoException).code;
+            return code === "ENOENT" || code === "ENOTDIR" || code === "ELOOP" ? "absent" : "unknown";
+          }
+          let visited = 0;
+          const scanCap = opts.scanCap ?? DEFAULT_SESSION_STORE_BOUNDS.maxScanEntries;
+          const walk = async (dir: FileHandle, depth: number): Promise<boolean> => {
+            if (depth > DEFAULT_SESSION_STORE_MAX_DEPTH) throw new CodexSessionStoreBoundError("maxDepth", DEFAULT_SESSION_STORE_MAX_DEPTH);
+            const entries = await fsp.readdir(`/proc/self/fd/${dir.fd}`, { withFileTypes: true });
+            for (const entry of entries) {
+              if (++visited > scanCap) throw new CodexSessionStoreBoundError("maxScanEntries", scanCap);
+              if (entry.isDirectory() && !nameHasDenySubstring(entry.name)) {
+                let child: FileHandle | undefined;
+                try {
+                  child = await openAt(dir, entry.name, FS.O_RDONLY | FS.O_DIRECTORY | FS.O_NOFOLLOW);
+                  if (await walk(child, depth + 1)) return true;
+                } catch (error) {
+                  const code = (error as NodeJS.ErrnoException).code;
+                  if (code !== "ENOENT" && code !== "ELOOP" && code !== "ENOTDIR") throw error;
+                } finally {
+                  await closeQuietly(child);
+                }
+              } else if (entry.isFile() && entry.name.endsWith(`-${sessionId}.jsonl`) && isAllowedSessionArtifact(entry.name)) {
+                let file: FileHandle | undefined;
+                try {
+                  file = await openAt(dir, entry.name, FS.O_RDONLY | FS.O_NOFOLLOW);
+                  if ((await file.stat()).isFile()) return true;
+                } catch (error) {
+                  const code = (error as NodeJS.ErrnoException).code;
+                  if (code !== "ENOENT" && code !== "ELOOP") throw error;
+                } finally {
+                  await closeQuietly(file);
+                }
+              }
+            }
+            return false;
+          };
+          try {
+            return await walk(sessionsFd, 0) ? "present" : "absent";
+          } catch {
+            return "unknown";
+          }
+        } finally {
+          await closeQuietly(sessionsFd);
           await closeQuietly(genFd);
           await closeQuietly(gensFd);
           await closeQuietly(storeFd);

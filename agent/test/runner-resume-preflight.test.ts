@@ -4,7 +4,13 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { PassThrough } from "node:stream";
+import { CodexExecutor } from "../src/codex/codex-executor.js";
+import { selectCodexBinding } from "../src/codex/select.js";
+import type { CodexNotification, CodexTransport } from "../src/codex/transport.js";
+import type { CodexRootHandle } from "../src/codex/launcher.js";
 import { type RunContext, type ExecutorResult } from "../src/executor.js";
+import { CodexSessionStore } from "../src/codex/session-state.js";
 import {
   type ExecutorFactory,
   RESUME_CONTINUED_EVENT,
@@ -12,11 +18,14 @@ import {
 } from "../src/runner.js";
 import {
   api,
+  client,
   fakeGitlab,
   fx,
+  git,
   gitlabClaim,
   installHarness,
   runnerWith,
+  worktreeDirFor,
 } from "./runner-harness.js";
 
 installHarness();
@@ -62,6 +71,41 @@ describe("RunRunner — resume preflight (issue #105)", () => {
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, `${sessionId}.jsonl`), "{}\n");
   }
+
+  it("Codex resumes only when the claimed thread is persisted on this worker", async () => {
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-codex-resume-"));
+    const codexHome = path.join(homeRoot, "source");
+    const codex = {
+      auth_mode: "subscription" as const, access_token: "fixture-access", capability: "fixture-capability",
+      generation: 3, chatgpt_account_id: "fixture-account", chatgpt_plan_type: null,
+    };
+    try {
+      for (const [index, expected] of [[1, undefined], [2, SID], [3, undefined]] as const) {
+        const { gitlab } = fakeGitlab();
+        const seen: RunContext[] = [];
+        const claim = gitlabClaim(700 + index, { session_id: SID, secrets: {
+          forge_pat: "fixture-forge", forge_username: "bot", anthropic_oauth_token: "fixture-oauth", codex,
+        } });
+        const store = path.join(homeRoot, claim.run_id, "codex-session-store");
+        fs.mkdirSync(path.dirname(store), { recursive: true });
+        if (index === 2) {
+          fs.mkdirSync(path.join(codexHome, "sessions"), { recursive: true });
+          fs.writeFileSync(path.join(codexHome, "sessions", `rollout-2026-09-25-${SID}.jsonl`), "{}\n");
+          await CodexSessionStore.persist(codexHome, store);
+        } else if (index === 3) {
+          fs.rmSync(path.join(codexHome, "sessions", `rollout-2026-09-25-${SID}.jsonl`));
+          fs.writeFileSync(path.join(codexHome, "sessions", "rollout-2026-09-25-ffffffff-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl"), "{}\n");
+          await CodexSessionStore.persist(codexHome, store);
+        }
+        await runnerWith(capturingFactory(homeRoot, seen), gitlab).execute(claim);
+        assert.equal(seen[0]?.sessionId, expected);
+        const events = api.messages(claim.run_id).filter((m) => m.kind === "status").map((m) => m.payload.event);
+        assert.ok(events.includes(expected ? RESUME_CONTINUED_EVENT : RESUME_LINEAGE_BREAK_EVENT));
+      }
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
 
   it("drops the resume and says so when the transcript is not on this worker", async () => {
     const { gitlab } = fakeGitlab();
@@ -306,4 +350,182 @@ describe("RunRunner — resume preflight (issue #105)", () => {
     // 'resume_continued'`) by the server/web; a silent rename would break it (PRD #556 M2).
     assert.strictEqual(RESUME_CONTINUED_EVENT, "resume_continued");
   });
+});
+
+it("a resumed Codex runner turn adopts the claimed persisted thread", async () => {
+  const sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+  const turnId = "resumed-turn";
+  const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-codex-runner-resume-"));
+  const source = path.join(homeRoot, "source");
+  const { gitlab } = fakeGitlab();
+  const capturedHead = execFileSync("git", ["-C", fx.originPath, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+  const codex = {
+    auth_mode: "subscription" as const, access_token: "fixture-access", capability: "fixture-capability",
+    generation: 3, chatgpt_account_id: "verified-account", chatgpt_plan_type: null,
+  };
+  const firstClaim = gitlabClaim(1627, {
+    plan_approved: true,
+    plan_md: "Approved plan",
+    secrets: {
+      forge_pat: "fixture-forge", forge_username: "bot", anthropic_oauth_token: "fixture-oauth", codex,
+    },
+  });
+  const claim = { ...firstClaim, session_id: sid };
+  const requests: Array<{ method: string; params: unknown }> = [];
+  const runHome = path.join(homeRoot, claim.run_id);
+  const sessionFile = `rollout-2026-09-25-${sid}.jsonl`;
+  const sessionBytes = '{"thread":"held-run-session"}\n';
+  const artifact = path.join(runHome, "codex-data", "epoch-0", "codex", "sessions", sessionFile);
+  let artifactAtLaunch = false;
+  let completedTurn = false;
+  let enteredHold: boolean | undefined;
+  let waiter: ((value: IteratorResult<CodexNotification>) => void) | undefined;
+  let ended = false;
+  const queue: CodexNotification[] = [];
+  const push = (note: CodexNotification): void => {
+    if (waiter) { const resolve = waiter; waiter = undefined; resolve({ value: note, done: false }); }
+    else queue.push(note);
+  };
+  const originalStatus = git.worktreeStatus;
+  const originalVerify = git.verifyRunnerTrackingCovers;
+  const originalPack = git.checkpointPack;
+  const transport: CodexTransport = {
+    async request<T>(method: string, params?: unknown): Promise<T> {
+      requests.push({ method, params });
+      if (method === "initialize") return { userAgent: "codex/0.153.2", codexHome: source, platformFamily: "unix", platformOs: "linux" } as T;
+      if (method === "account/login/start") return { type: (params as { type: string }).type } as T;
+      if (method === "thread/resume") {
+        if (!artifactAtLaunch || !fs.existsSync(artifact) || fs.readFileSync(artifact, "utf8") !== sessionBytes) {
+          throw new Error("claimed thread artifact was not adopted before resume");
+        }
+        return { thread: { id: sid } } as T;
+      }
+      if (method === "thread/start") throw new Error("resumed claim started a new thread");
+      if (method === "turn/start") {
+        push({ kind: "activity", method: "item/tool/call", requestId: 1,
+          params: { threadId: sid, turnId, callId: "done-1", tool: "signal_done", arguments: { report_only: true, summary: "Resumed turn completed" } } });
+        push({ kind: "turn_completed", method: "turn/completed", threadId: sid, turnId,
+          status: "completed", params: { threadId: sid, turn: { id: turnId, status: "completed" } } });
+        completedTurn = true;
+        ended = true;
+        return { turn: { id: turnId } } as T;
+      }
+      return {} as T;
+    },
+    notify() {},
+    respond() {},
+    installServerRequestInterceptor: () => () => {},
+    notifications() {
+      return {
+        next: () => queue.length ? Promise.resolve({ value: queue.shift()!, done: false as const })
+          : ended ? Promise.resolve({ value: undefined, done: true as const })
+          : new Promise<IteratorResult<CodexNotification>>((resolve) => { waiter = resolve; }),
+        return: async () => ({ value: undefined, done: true as const }),
+        [Symbol.asyncIterator]() { return this; },
+      };
+    },
+    async close() { if (waiter) { waiter({ value: undefined, done: true }); waiter = undefined; } },
+  };
+  try {
+    fs.mkdirSync(path.join(source, "sessions"), { recursive: true });
+    fs.writeFileSync(path.join(source, "sessions", sessionFile), sessionBytes);
+    const store = path.join(runHome, "codex-session-store");
+    // The injected launcher owns the synthetic provider HOME's parent.
+    fs.mkdirSync(path.join(runHome, "codex-data", "epoch-0"), { recursive: true });
+    await CodexSessionStore.persist(source, store);
+
+    // Seed the real clone, then park this run with its per-run HOME and session intact.
+    api.setCompletionHoldResponse("paused", 200);
+    await runnerWith(() => ({
+      homeDir: runHome,
+      executor: {
+        run: async (ctx: RunContext): Promise<ExecutorResult> => {
+          git.worktreeStatus = (async () => []) as typeof git.worktreeStatus;
+          git.verifyRunnerTrackingCovers = (async () => true) as typeof git.verifyRunnerTrackingCovers;
+          git.checkpointPack = (async () => null) as typeof git.checkpointPack;
+          enteredHold = await ctx.enterCompletionHold!("test completion hold reason");
+          if (!enteredHold) throw new Error("completion hold was refused");
+          return { branch: ctx.branch, completionHeld: { reason: "test completion hold reason" } };
+        },
+      },
+    }), gitlab, undefined, undefined, { recoveryRetryMs: 1 }).execute(firstClaim);
+    git.worktreeStatus = originalStatus;
+    git.verifyRunnerTrackingCovers = originalVerify;
+    git.checkpointPack = originalPack;
+    assert.equal(enteredHold, true, "the server acknowledged a real completion hold");
+    assert.equal(api.completionHoldRequests.length, 1);
+    assert.equal(api.completionHoldRequests[0]?.runId, claim.run_id);
+    assert.equal(api.completionHoldRequests[0]?.body.head, capturedHead);
+    assert.ok(!api.states.some((s) => s.runId === claim.run_id && s.body.status === "failed"));
+    assert.ok(!api.states.some((s) => s.runId === claim.run_id && s.body.status === "completed"));
+    assert.equal(fs.existsSync(worktreeDirFor(1627)), true, "held clone survives");
+    assert.equal(fs.existsSync(store), true, "held per-run HOME keeps the persisted session");
+    assert.equal(await CodexSessionStore.inspectSession(store, sid), "present");
+
+    // The retained clone journal makes the first reclaim capture and park at recovery_wait.
+    // That park retires the captured clone while preserving the same run HOME for requeue.
+    await runnerWith(() => ({
+      homeDir: runHome,
+      executor: { run: async () => { throw new Error("recovery reclaim reached the executor"); } },
+    }), gitlab, undefined, undefined, { recoveryRetryMs: 1 }).execute(claim);
+    assert.ok(api.states.some((s) => s.runId === claim.run_id && s.body.status === "recovery_wait"));
+    assert.ok(!api.states.some((s) => s.runId === claim.run_id && s.body.status === "failed"));
+    assert.equal(fs.existsSync(store), true, "recovery park preserves the held session");
+    claim.last_seq = api.messages(claim.run_id).at(-1)?.seq ?? 0;
+
+    const selected = selectCodexBinding({ codex });
+    assert.equal(selected.kind, "codex");
+    if (selected.kind !== "codex") throw new Error("invalid Codex fixture");
+    const provider = { name: "openai", baseUrl: "http://127.0.0.1:9/v1", envKey: "OPENAI_API_KEY", model: "gpt-6-astra" };
+    await runnerWith((runId) => ({
+      homeDir: path.join(homeRoot, runId),
+      executor: (() => {
+        const codexExecutor = new CodexExecutor({ debug() {}, info() {}, warn() {}, error() {}, addSecret() {}, removeSecret() {}, child() { return this; } },
+        path.join(homeRoot, runId), { binding: selected.binding, client, provider }, {
+          launchProviderRoot: async () => {
+            artifactAtLaunch = fs.existsSync(artifact) && fs.readFileSync(artifact, "utf8") === sessionBytes;
+            return { root: { kind: "provider", reap: async () => ({ ok: true }), dispose: async () => {} }, transport, supervisorPid: 1234 };
+          },
+          launchEffectRoot: async (): Promise<CodexRootHandle> => ({
+            started: { event: "started", supervisorPid: 200, childPid: 201, subreaper: true,
+              nondumpable: true, uid: 10003, liveCapsZero: true, capBoundingSet: "0xc0", noNewPrivs: true },
+            supervisorPid: 200,
+            transport: { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough() },
+            snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
+            waitChild: async () => ({ event: "child_exit", code: 0 }),
+            dispose: async () => ({ clean: true, event: { event: "dispose", id: 1, state: "drained", authority: "ECHILD+__WALL" } }),
+            failed: undefined, whenFailed: new Promise<Error>(() => undefined),
+          }),
+          wireFileop: () => ({ client: { op: async () => ({ ok: true }) }, dispose: async () => {} }),
+          spawnCommand: async () => ({ code: 0, stdout: "", stderr: "" }),
+          provisionRunTools: async () => ({ toolEnv: {} }),
+          idleMs: 5000, wallMs: 5000, childTurnDeadlineMs: 5000,
+        });
+        return { run: async (ctx: RunContext): Promise<ExecutorResult> => {
+          const result = await codexExecutor.run(ctx);
+          git.worktreeStatus = (async () => []) as typeof git.worktreeStatus;
+          git.verifyRunnerTrackingCovers = (async () => true) as typeof git.verifyRunnerTrackingCovers;
+          git.checkpointPack = (async () => null) as typeof git.checkpointPack;
+          const held = await ctx.enterCompletionHold!("resumed turn verified");
+          assert.equal(held, true, "the resumed turn entered a second completion hold");
+          return { ...result, completionHeld: { reason: "resumed turn verified" } };
+        } };
+      })(),
+    }), gitlab).execute(claim);
+    const events = api.messages(claim.run_id).filter((m) => m.kind === "status").map((m) => m.payload.event);
+    assert.ok(events.includes(RESUME_CONTINUED_EVENT), "runner accepted the persisted claimed thread");
+    assert.equal(artifactAtLaunch, true, `session artifact missing at launch; requests=${JSON.stringify(requests.map((r) => r.method))} messages=${JSON.stringify(api.messages(claim.run_id).map((m) => [m.kind, m.payload.event, m.payload.text]))}`);
+    const resume = requests.find((r) => r.method === "thread/resume");
+    const turn = requests.find((r) => r.method === "turn/start");
+    assert.equal((resume?.params as { threadId?: string })?.threadId, sid);
+    assert.equal((turn?.params as { threadId?: string })?.threadId, sid);
+    assert.equal(completedTurn, true, "the resumed turn emitted completion");
+    assert.ok(!api.states.some((s) => s.runId === claim.run_id && s.body.status === "failed"), "resumed hold did not fail");
+    assert.equal(api.completionHoldRequests.length, 2, "both completion holds were acknowledged");
+  } finally {
+    git.worktreeStatus = originalStatus;
+    git.verifyRunnerTrackingCovers = originalVerify;
+    git.checkpointPack = originalPack;
+    fs.rmSync(homeRoot, { recursive: true, force: true });
+  }
 });

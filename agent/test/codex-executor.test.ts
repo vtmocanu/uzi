@@ -45,7 +45,7 @@ import { MessageBatcher } from "../src/batcher.js";
 import { MAX_PROJECTED_BYTES } from "../src/codex/projection.js";
 import type { WorkerClient } from "../src/client.js";
 import type { OutgoingMessage } from "../src/protocol.js";
-import type { CodexNotification, CodexTransport } from "../src/codex/transport.js";
+import { CodexTransportError, type CodexNotification, type CodexTransport } from "../src/codex/transport.js";
 import type { RunContext, EmittedMessage, Executor, WallParkOutcome } from "../src/executor.js";
 import { PauseNowSignal } from "../src/steering.js";
 import type { Logger } from "../src/log.js";
@@ -891,9 +891,9 @@ describe("CodexExecutor: run() control flow (run-lane precedence)", () => {
 // PauseNowSignal trips REASON_PAUSE (not REASON_CANCEL). A `wall` PauseNowSignal (getPauseMode()
 // === 'wall') and the own wall timer's REASON_WALL both route to the capture-first wall park
 // (ctx.parkForWall). An ordinary owner now/milestone pause on a Codex run keeps today's behaviour
-// (the run cancels — Codex owner-pause is out of scope, PRD #1190). Codex does NOT enter the
-// completion-attempt interlock, so its wall trip ALWAYS parks (no D14 race). Tests cover BOTH trips
-// in BOTH the plan turn and the implement turn.
+// (the run cancels — Codex owner-pause is out of scope, PRD #1190). Before a recorded
+// completion attempt wall trips park; afterward they first route to the completion hold.
+// Tests cover both wall trips in the plan and implement turns.
 describe("CodexExecutor: wall park (PRD #1497 M2)", () => {
   // Wire the wall-park seams onto a ctx: a mutable pause mode (read by pauseModeRequested), a
   // parkForWall spy returning a configurable outcome, and a clearWallMode spy.
@@ -1372,13 +1372,66 @@ describe("CodexExecutor: credential bridge + isolation", () => {
 
   it("(12) a resume seeds adopt (credential-free) AND still releases a fresh token", async () => {
     const rig = makeRig();
-    rig.transport.push(threadStarted("resumed-1")).push(signalDone("resumed-1", "tn-1")).push(turnCompleted("completed", "resumed-1")).end();
+    rig.transport.requestOverride = (c) => c.method === "thread/resume"
+      ? Promise.resolve({ thread: { id: "prior-session" } })
+      : undefined;
+    rig.transport.push(threadStarted("prior-session")).push(signalDone("prior-session", "tn-1")).push(turnCompleted("completed", "prior-session")).end();
     const { ctx } = makeCtx({ sessionId: "prior-session" });
     await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "resume run");
     assert.ok(rig.sessionOps.adopt >= 1, "adopt seeded the credential-free session subset");
     assert.equal(rig.client.releaseCalls.length, 1, "a resumed root still releases a fresh token");
     const resume = rig.transport.requests.find((r) => r.method === "thread/resume");
     assert.ok(resume, "the harness resumed the prior session");
+    assert.equal(rec(resume.params).threadId, "prior-session", "the claimed thread is resumed");
+    const turnStart = rig.transport.requests.find((r) => r.method === "turn/start");
+    assert.ok(turnStart);
+    assert.equal(rec(turnStart.params).threadId, "prior-session", "the resumed turn uses the exact claimed thread id");
+  });
+
+  it("falls back to a fresh thread when the provider rejects the claimed resume", async () => {
+    const rig = makeRig();
+    rig.transport.requestOverride = (c) => c.method === "thread/resume"
+      ? Promise.reject(new CodexTransportError({ category: "protocol", message: "codex app-server returned a JSON-RPC error (code -32602)" }))
+      : undefined;
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    const { ctx, emitted } = makeCtx({ sessionId: "claimed-thread" });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "resume rejection fallback");
+    assert.ok(rig.transport.requests.some((r) => r.method === "thread/resume"));
+    assert.ok(rig.transport.requests.some((r) => r.method === "thread/start"));
+    assert.ok(emitted.some((m) => m.payload.event === "resume_lineage_break"));
+  });
+
+  it("does not break lineage when turn/start fails after a successful resume", async () => {
+    const rig = makeRig();
+    const rpcError = new Error("codex app-server returned a JSON-RPC error (code -32602)");
+    rig.transport.requestOverride = (c) => {
+      if (c.method === "thread/resume") return Promise.resolve({ thread: { id: "claimed-thread" } });
+      if (c.method === "turn/start") return Promise.reject(rpcError);
+      return undefined;
+    };
+    const { ctx, emitted } = makeCtx({ sessionId: "claimed-thread" });
+    await assert.rejects(
+      withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "resumed turn/start failure"),
+      (error: unknown) => error === rpcError,
+    );
+    assert.equal(rig.transport.requests.filter((r) => r.method === "thread/resume").length, 1);
+    const turns = rig.transport.requests.filter((r) => r.method === "turn/start");
+    assert.equal(turns.length, 1, "the failed turn is not retried");
+    assert.equal(rec(turns[0]?.params).threadId, "claimed-thread");
+    assert.equal(rig.transport.requests.filter((r) => r.method === "thread/start").length, 0);
+    assert.equal(emitted.filter((m) => m.payload.event === "resume_lineage_break").length, 0);
+  });
+
+  it("falls back when thread/resume returns no thread id", async () => {
+    const rig = makeRig();
+    rig.transport.requestOverride = (c) => c.method === "thread/resume"
+      ? Promise.resolve({ thread: {} })
+      : undefined;
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    const { ctx, emitted } = makeCtx({ sessionId: "claimed-thread" });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "resume without id fallback");
+    assert.equal(rig.transport.requests.filter((r) => r.method === "thread/start").length, 1);
+    assert.ok(emitted.some((m) => m.payload.event === "resume_lineage_break"));
   });
 
   it("(13) the fileop helper is spawned with a SCRUBBED, replaced env (no inherited secrets)", async () => {
@@ -5775,5 +5828,188 @@ describe("CodexExecutor: per-run command cache (issue #1598)", () => {
   it("commandSandboxArgv refuses a cache outside the cache root", () => {
     assert.throws(() => commandSandboxArgv(WORKSPACE, WORKSPACE, "/bin/true", [], "/tmp/uzi-codex-command-x", "required", "/tmp/evil"), /cache/);
     assert.throws(() => commandSandboxArgv(WORKSPACE, WORKSPACE, "/bin/true", [], "/tmp/uzi-codex-command-x", "required", `${CACHE_DIR}/../x`), /cache/);
+  });
+});
+
+describe("Codex completion interlock", () => {
+  const doneEpoch = (n: number): Responder => resumedEpochResponder("th-1", `tn-${n}`, (t, th, tn) => {
+    t.push(toolCall(n, "signal_done", { milestones_completed: ["m1"] }, th, tn, `done-${n}`))
+      .push(turnCompleted("completed", th, tn));
+  });
+  const firstEpoch = (n: number): Responder => epochResponder("th-1", `tn-${n}`, (t, th, tn) => {
+    t.push(toolCall(n, "signal_done", { milestones_completed: ["m1"] }, th, tn, `done-${n}`))
+      .push(turnCompleted("completed", th, tn));
+  });
+
+  const quietEpoch = (n: number): Responder => resumedEpochResponder("th-1", `tn-${n}`, () => {});
+
+  for (const trip of ["wall timer", "wall pause", "idle"] as const) {
+    it(`routes ${trip} after a recorded attempt to a completion hold`, async () => {
+      const rig = makeMultiEpochRig([firstEpoch(1), quietEpoch(2)]);
+      const controller = new AbortController();
+      rig.deps = { ...rig.deps, wallMs: trip === "wall timer" ? 30 : 5000, idleMs: trip === "idle" ? 30 : 5000 };
+      let attempts = 0;
+      let parks = 0;
+      const holds: string[] = [];
+      const { ctx } = makeCtx({
+        kind: "issue", completionInterlock: true, config: { max_iterations: 3 },
+        signal: controller.signal,
+        pauseModeRequested: () => trip === "wall pause" ? "wall" : null,
+        recordCompletionAttempt: async () => ({ unmet: ["m2"], attemptCount: ++attempts }),
+        enterCompletionHold: async (reason) => { holds.push(reason); return true; },
+        parkForWall: async () => { parks++; return "parked"; },
+      });
+      const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+      if (trip === "wall pause") {
+        await waitFor(() => attempts === 1 && rig.epochs[1]!.transport.turnStartCount === 1, "post-attempt turn");
+        controller.abort(new PauseNowSignal());
+      }
+      const result = await withTimeout(running, 3000, `${trip} completion hold`);
+      const reason = trip === "idle" ? "codex run idle timeout" : "codex run wall-clock timeout";
+      assert.deepEqual(result.completionHeld, { reason });
+      assert.deepEqual(holds, [reason]);
+      assert.equal(attempts, 1);
+      assert.equal(parks, 0);
+    });
+  }
+
+  for (const trip of ["wall timer", "idle"] as const) {
+    it(`keeps ${trip} before an attempt on its existing path`, async () => {
+      const rig = makeRig();
+      rig.deps = { ...rig.deps, wallMs: trip === "wall timer" ? 25 : 5000, idleMs: trip === "idle" ? 25 : 5000 };
+      rig.transport.push(threadStarted());
+      let attempts = 0;
+      let parks = 0;
+      let holds = 0;
+      const { ctx } = makeCtx({
+        kind: "issue", completionInterlock: true,
+        recordCompletionAttempt: async () => { attempts++; return { unmet: ["m2"], attemptCount: attempts }; },
+        enterCompletionHold: async () => { holds++; return true; },
+        parkForWall: async () => { parks++; return "parked"; },
+      });
+      const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+      if (trip === "idle") await assert.rejects(withTimeout(running, 3000, "pre-attempt idle"), /codex run idle timeout/);
+      else assert.deepEqual((await withTimeout(running, 3000, "pre-attempt wall")).walled, { reason: "codex run wall-clock timeout" });
+      assert.equal(attempts, 0);
+      assert.equal(holds, 0);
+      assert.equal(parks, trip === "wall timer" ? 1 : 0);
+    });
+  }
+
+  it("parks after an attempt when the wall completion hold is refused", async () => {
+    const rig = makeMultiEpochRig([firstEpoch(1), quietEpoch(2)]);
+    rig.deps = { ...rig.deps, wallMs: 30, idleMs: 5000 };
+    const holds: string[] = [];
+    let parks = 0;
+    const { ctx } = makeCtx({
+      kind: "issue", completionInterlock: true, config: { max_iterations: 3 },
+      recordCompletionAttempt: async () => ({ unmet: ["m2"], attemptCount: 1 }),
+      enterCompletionHold: async (reason) => { holds.push(reason); return false; },
+      parkForWall: async () => { parks++; return "parked"; },
+    });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "refused wall hold");
+    assert.deepEqual(holds, ["codex run wall-clock timeout"]);
+    assert.equal(parks, 1);
+    assert.deepEqual(result.walled, { reason: "codex run wall-clock timeout" });
+    assert.equal(result.completionHeld, undefined);
+  });
+
+  it("rethrows idle after an attempt when the completion hold is refused", async () => {
+    const rig = makeMultiEpochRig([firstEpoch(1), quietEpoch(2)]);
+    rig.deps = { ...rig.deps, wallMs: 5000, idleMs: 30 };
+    const holds: string[] = [];
+    let parks = 0;
+    const { ctx } = makeCtx({
+      kind: "issue", completionInterlock: true, config: { max_iterations: 3 },
+      recordCompletionAttempt: async () => ({ unmet: ["m2"], attemptCount: 1 }),
+      enterCompletionHold: async (reason) => { holds.push(reason); return false; },
+      parkForWall: async () => { parks++; return "parked"; },
+    });
+    await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "refused idle hold"), /codex run idle timeout/);
+    assert.deepEqual(holds, ["codex run idle timeout"]);
+    assert.equal(parks, 0);
+  });
+
+  it("checkpoints before the server attempt and reworks on the same thread", async () => {
+    const rig = makeMultiEpochRig([firstEpoch(1), doneEpoch(2)]);
+    const order: string[] = [];
+    let count = 0;
+    const { ctx } = makeCtx({
+      kind: "issue", completionInterlock: true,
+      frozenMilestones: [{ id: "m2", title: "Remaining" }],
+      checkpoint: async (opts) => { assert.equal(opts.reap, true); order.push("checkpoint"); },
+      worktreeFingerprint: async () => { order.push("fingerprint"); return "head-1\n M x"; },
+      recordCompletionAttempt: async (args) => {
+        order.push("attempt");
+        assert.deepEqual(args, { declared: ["m1"], head: "head-1", worktreeFingerprint: "head-1\n M x" });
+        return { unmet: count++ === 0 ? ["m2"] : [], attemptCount: count };
+      },
+    });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "completion rework");
+    assert.equal(result.completionHeld, undefined);
+    assert.deepEqual(order, ["checkpoint", "fingerprint", "attempt", "checkpoint", "fingerprint", "attempt"]);
+    assert.equal(rig.providerLaunches(), 2);
+    assert.equal(rig.epochs[0]!.disposed(), 1);
+    assert.ok(rig.sessionOps.persist >= 2);
+    assert.ok(rig.epochs[1]!.transport.requests.some((r) => r.method === "thread/resume"));
+    assert.match(JSON.stringify(rig.epochs[1]!.transport.requests.find((r) => r.method === "turn/start")?.params), /m2: Remaining/);
+  });
+
+  it("asks at three identical attempts, continues with guidance, then holds on expiry", async () => {
+    const rig = makeMultiEpochRig([firstEpoch(1), doneEpoch(2), doneEpoch(3), doneEpoch(4), doneEpoch(5), doneEpoch(6)]);
+    let attempts = 0;
+    let questions = 0;
+    const holds: string[] = [];
+    const { ctx } = makeCtx({
+      kind: "issue", completionInterlock: true, config: { max_iterations: 8 },
+      checkpoint: async () => {},
+      worktreeFingerprint: async () => "same-head\n",
+      recordCompletionAttempt: async () => ({ unmet: ["m2"], attemptCount: ++attempts }),
+      askCompletionQuestion: async (unmet) => {
+        assert.deepEqual(unmet, ["m2"]);
+        return ++questions === 1 ? { outcome: "continue", guidance: "Check docs" } : { outcome: "expired" };
+      },
+      enterCompletionHold: async (reason) => { holds.push(reason); return true; },
+    });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "completion hold");
+    assert.equal(attempts, 6);
+    assert.equal(questions, 2);
+    assert.equal(holds.length, 1);
+    assert.deepEqual(result.completionHeld, { reason: holds[0] });
+    assert.match(JSON.stringify(rig.epochs[3]!.transport.requests.find((r) => r.method === "turn/start")?.params), /Check docs/);
+  });
+
+  it("holds on post-attempt iteration and server budget exhaustion", async () => {
+    for (const budget of ["iteration", "server"] as const) {
+      const rig = makeMultiEpochRig([firstEpoch(1), doneEpoch(2)]);
+      let attempts = 0;
+      const holds: string[] = [];
+      const { ctx } = makeCtx({
+        kind: "issue", completionInterlock: true, config: { max_iterations: budget === "iteration" ? 1 : 5 },
+        checkpoint: async () => {},
+        recordCompletionAttempt: async () => ({ unmet: ["m2"], attemptCount: ++attempts }),
+        reportIteration: async (iteration) => budget === "server" && iteration === 2
+          ? { budgetExhausted: true } : undefined,
+        enterCompletionHold: async (reason) => { holds.push(reason); return true; },
+      });
+      const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, `${budget} hold`);
+      assert.equal(attempts, 1);
+      assert.deepEqual(result.completionHeld, { reason: holds[0] });
+      assert.equal(holds.length, 1);
+    }
+  });
+
+  it("leaves legacy and interactive done outside the interlock", async () => {
+    for (const flag of [{ completionInterlock: false }, { completionInterlock: true, interactive: true }]) {
+      const rig = makeMultiEpochRig([firstEpoch(1)]);
+      let attempts = 0;
+      const { ctx } = makeCtx({
+        kind: "issue", ...flag,
+        recordCompletionAttempt: async () => { attempts++; return { unmet: ["m2"], attemptCount: 1 }; },
+      });
+      const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "legacy completion");
+      assert.equal(attempts, 0);
+      assert.equal(result.completionHeld, undefined);
+    }
   });
 });

@@ -173,6 +173,15 @@ func TestFilterProtocol_KeepsCodexHarnessV1(t *testing.T) {
 	}
 }
 
+func TestFilterProtocol_KeepsCodexCompletionInterlockV1(t *testing.T) {
+	if got := FilterProtocol([]string{CodexCompletionInterlockV1, CodexHarnessV1}); !reflect.DeepEqual(got, []string{CodexHarnessV1, CodexCompletionInterlockV1}) {
+		t.Fatalf("FilterProtocol = %v", got)
+	}
+	if got := Filter([]string{CodexCompletionInterlockV1}); len(got) != 0 {
+		t.Fatalf("scheduler vocabulary admitted protocol capability: %v", got)
+	}
+}
+
 // TestFilterProtocol_KeepsCodexCustomModelV1 pins PRD #1551 M4 (D6): the custom-Codex-model
 // protocol capability is a member of the protocol vocabulary (so a worker's self-reported
 // codex_custom_model_v1 survives registration and reaches workers.protocol_capabilities, where the

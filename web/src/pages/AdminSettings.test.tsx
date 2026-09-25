@@ -854,7 +854,7 @@ describe("AdminSettings — completion check kill-switch (issue #1626)", () => {
       "If some are missing, the agent is told which ones and keeps working.",
       "If it still does not finish them, the run pauses for its owner to continue it, ship only some milestones without closing the issue, or accept specific criteria as met.",
       "The check itself uses no model, though the extra work it triggers does.",
-      "Applies to Claude runs; Codex runs are not checked yet. Turn off only if it blocks runs you trust.",
+      "Applies to new, unseeded Claude and Codex issue runs. Turn off only if it blocks runs you trust.",
     ].join(" ");
     expect(screen.getByText(body)).toBeTruthy();
   });

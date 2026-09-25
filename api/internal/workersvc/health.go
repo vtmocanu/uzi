@@ -140,8 +140,8 @@ const (
 	// healthWaitingWorker enum (no migration — runs.health_reason is free text). NOT gated by the
 	// interlock switch: a run that IS interlocked stays subject to the claim clause regardless of
 	// the flag, so the reason reflects the run's actual state. With the switch ON by default
-	// (#1626) every new unseeded Claude-harness issue run is interlocked, so this fires whenever
-	// such a run's owner has no protocol-capable worker online.
+	// (#1626) every new unseeded Claude or Codex issue run is interlocked, so this fires
+	// whenever such a run's owner has no protocol-capable worker online.
 	reasonNoCompletionCapableWorker = "no online worker implements the completion interlock (completion_interlock_v1); provision a capable worker"
 	// reasonNoCodexCapableWorker (PRD #1332 M5A, D3) is emitted for a CODEX-INDICATING queued run
 	// (harness='codex', or a surviving M1 binding sentinel) whose owner has NO online worker
@@ -164,7 +164,8 @@ const (
 	// online (rather than silently running Astra). Placed one rung below the plain Codex-harness rung
 	// so the more general "no Codex-capable worker" reason keeps precedence when the fleet has no
 	// Codex worker at all. Maps to the SAME healthWaitingWorker enum (runs.health_reason is free text).
-	reasonNoCustomCodexCapableWorker = "no worker supporting custom Codex models is online"
+	reasonNoCustomCodexCapableWorker     = "no worker supporting custom Codex models is online"
+	reasonNoCodexCompletionCapableWorker = "no online worker implements the Codex completion interlock (codex_completion_interlock_v1); provision a capable worker"
 	// reasonRepoNotDockerAllowed (PRD #361) is the queued reason for a repo-bearing run
 	// that no online worker is eligible to claim because every online worker is a Docker
 	// worker and the repo is not on the Docker-worker allowlist (fn_worker_can_claim,
@@ -759,6 +760,18 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 			return reasonNoCustomCodexCapableWorker
 		}
 	}
+	// All protocol requirements must be present on one worker. A separate count for each
+	// capability can falsely report a split fleet as capable.
+	if r.CompletionContractVersion.Valid && (r.Harness == harnessCodex || r.CodexMaterialRevision.Valid || r.CodexSecretID.Valid) {
+		c, cerr := s.q.CountOnlineWorkersSatisfyingCodexCompletion(ctx, store.CountOnlineWorkersSatisfyingCodexCompletionParams{
+			UserID: r.UserID, CustomRoot: r.CodexCustomRoot,
+		})
+		if cerr != nil {
+			slog.Error("health: count workers satisfying Codex completion protocol", "run_id", r.ID, "error", cerr)
+		} else if c == 0 {
+			return reasonNoCodexCompletionCapableWorker
+		}
+	}
 	// A queued run the kind-derived priority DEMOTED (PRD #320 D9) is not stuck — it is
 	// yielding to interactive work — so its owner gets a reason that says so rather than the
 	// generic wait. The class comes from the SAME SQL function ClaimRun's ORDER BY ranks by
@@ -874,7 +887,7 @@ func (s *Service) capabilityAwareOn(ctx context.Context) bool {
 // error only on a cold read with no valid cached snapshot (a failed refresh over a valid
 // cache serves the cached value error-free), and on that error the value is discarded, so a
 // momentarily-unreadable setting creates a legacy (unstamped) run. createRun additionally
-// stamps only unseeded Claude-harness runs.
+// stamps only unseeded issue runs; both Claude and Codex can be interlocked.
 func (s *Service) completionInterlockOn(ctx context.Context) bool {
 	if s.completionInterlock == nil {
 		return false

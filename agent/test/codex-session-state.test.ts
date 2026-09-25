@@ -70,6 +70,34 @@ async function waitFor(cond: () => boolean, label: string, ms = 3000): Promise<v
   }
 }
 
+describe("claimed Codex thread lookup", () => {
+  it("finds only the claimed rollout in the current generation", async () => {
+    const root = mkdtempSync(join(tmpdir(), "uzi-codex-lookup-"));
+    const source = join(root, "source");
+    const store = join(root, "store");
+    const claimed = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    const other = "ffffffff-bbbb-cccc-dddd-eeeeeeeeeeee";
+    try {
+      assert.equal(await CodexSessionStore.inspectSession(store, claimed), "absent");
+      await writeFileAt(join(source, "sessions", "2026", `rollout-2026-09-25-${other}.jsonl`), "{}\n");
+      await CodexSessionStore.persist(source, store);
+      assert.equal(await CodexSessionStore.inspect(store), "present");
+      assert.equal(await CodexSessionStore.inspectSession(store, claimed), "absent");
+      const generation = await currentGenDir(store);
+      await fsp.symlink(join(source, "sessions", "2026", `rollout-2026-09-25-${other}.jsonl`),
+        join(generation, "sessions", "2026", `rollout-2026-09-25-${claimed}.jsonl`));
+      assert.equal(await CodexSessionStore.inspectSession(store, claimed), "absent", "a planted symlink is not a rollout");
+      await fsp.unlink(join(generation, "sessions", "2026", `rollout-2026-09-25-${claimed}.jsonl`));
+      await writeFileAt(join(source, "sessions", "2026", `rollout-2026-09-25-${claimed}.jsonl`), "{}\n");
+      await CodexSessionStore.persist(source, store);
+      assert.equal(await CodexSessionStore.inspectSession(store, claimed), "present");
+      assert.equal(await CodexSessionStore.inspectSession(store, claimed, { scanCap: 0 }), "unknown");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
 // ─── store-layout helpers (generations/<genId>/sessions/** + a plain-text `current`) ─────
 
 /** A fresh generation id matching the module's closed grammar `/^g[0-9a-f]{24}$/`. */
