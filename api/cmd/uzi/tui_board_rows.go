@@ -38,10 +38,11 @@ func tokenPeakPct(t apitypes.TokenRateLimitDTO) int {
 
 // selectedRateMeters applies the #519 board/sidebar selection to the model's own
 // per-token meters, shared by the board strip and the detail rail so the two surfaces
-// cannot disagree on which accounts show OR on showLabel. readable = Limits.Status "ok";
+// cannot disagree on which accounts show. readable = Limits.Status "ok"; shown = readable
+// filtered by (IsDefault || SecretID in sidebar_token_ids). Empty selection => (nil, false).
 // showLabel is keyed off the READABLE count (>1), not the shown count, so a readable-but-
-// unlisted token still forces per-token labels; shown = readable filtered by
-// (IsDefault || SecretID in sidebar_token_ids). Empty selection => (nil, false).
+// unlisted token still forces per-token labels; only the detail rail (railRateMeters) still
+// honours it — the board strip labels every token unconditionally (PRD #1653 D-T2).
 func (m tuiModel) selectedRateMeters() (shown []apitypes.TokenRateLimitDTO, showLabel bool) {
 	readable := make([]apitypes.TokenRateLimitDTO, 0, len(m.rateLimits))
 	for _, t := range m.rateLimits {
@@ -66,7 +67,6 @@ func (m tuiModel) selectedRateMeters() (shown []apitypes.TokenRateLimitDTO, show
 // mirroring the web left-bottom sidebar's token SELECTION (SidebarRateLimits +
 // sidebarTokens.ts):
 //   - readable = tokens whose Limits.Status == "ok"; nothing readable → no strip.
-//   - showLabel is keyed off readable (len > 1), NOT off the shown subset.
 //   - shown = readable filtered by isShownInSidebar (IsDefault || SecretID ∈ sidebarTokenIds);
 //     nothing shown → no strip.
 //
@@ -75,7 +75,8 @@ func (m tuiModel) selectedRateMeters() (shown []apitypes.TokenRateLimitDTO, show
 // returns "" — there is no TUI analog for that Settings affordance. That is a render difference,
 // not a selection one.
 //
-// Each shown token renders its 5h and 7d windows as a faint label + tone-coloured mini bar +
+// Each shown token renders its label (always, a lone token included — PRD #1653 D-T2 supersedes
+// PRD 1519's hide-when-one-readable rule) then its 5h and 7d windows as a faint label + tone-coloured mini bar +
 // NN% text. The NN% text is always present so an Ascii/NO_COLOR terminal (which strips the SGR
 // tone) keeps the legible signal — colour is never the only cue. Clamped to one physical line.
 // The Label is USER-AUTHORED and drawn through renderer.Plain (D7).
@@ -105,16 +106,13 @@ func (m tuiModel) boardRateLimitStrip(now time.Time) string {
 // Split out of boardRateLimitStrip so boardMeterLayout can measure and combine them with the
 // Codex accounts section onto one adaptive header line without perturbing the Claude bytes.
 func (m tuiModel) boardClaudeMeterSegs(now time.Time) []string {
-	shown, showLabel := m.selectedRateMeters()
+	shown, _ := m.selectedRateMeters() // the strip always labels (PRD #1653 D-T2)
 	if len(shown) == 0 {
 		return nil
 	}
 	segs := make([]string, 0, len(shown))
 	for _, t := range shown {
-		seg := ""
-		if showLabel {
-			seg = paintSeg(m.pal.faintC, nil, false, m.renderer.Plain(t.Label, 16)+" ")
-		}
+		seg := paintSeg(m.pal.faintC, nil, false, m.renderer.Plain(t.Label, 16)+" ")
 		seg += m.rateWindowCell("5h", t.Limits.FiveHour, rateBarWidth, 0, now) + "   " + m.rateWindowCell("7d", t.Limits.SevenDay, rateBarWidth, 0, now)
 		// Prefix a per-group accent bar TIGHT against the label: it both delimits the group and
 		// doubles as a status light — alarm when the token's peak window pct ≥ rateDangerPct,

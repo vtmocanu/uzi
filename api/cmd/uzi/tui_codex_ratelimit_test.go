@@ -4,10 +4,12 @@ package main
 // meters on the board strip (boardCodexAccountsSeg, placed by boardMeterLayout) and the detail
 // rail (railCodexRateMeters). The
 // selection mirrors the Claude #519 seam via selectedCodexRateMeters: readable = a status
-// carrying a reading (fresh|stale), nothing readable → nothing; showLabel keyed off readable
-// (>1); shown = readable filtered by (IsDefault || AccountID ∈ sidebar_codex_account_ids),
-// deduped to one meter per account. A stale reading is shown DIMMED; a nil/no-reading window
-// renders "—", never 0. Aliases and bucket display names ride renderer.Plain (D7).
+// carrying a reading (fresh|stale), nothing readable → nothing; shown = readable filtered by
+// (IsDefault || AccountID ∈ sidebar_codex_account_ids), deduped to one meter per account. A
+// stale reading is shown DIMMED; a nil/no-reading window renders "—", never 0. Aliases and
+// bucket display names ride renderer.Plain (D7). PRD #1653 (D-T2..D-T5): every drawn account
+// is named, windows are labelled by their reported length ("5h"/"7d"/"3h", "?" unknown), the
+// main "codex" bucket draws no name, and every Codex-bearing board line carries one tag.
 
 import (
 	"strings"
@@ -25,13 +27,33 @@ func cwin(pct int) *apitypes.CodexRateLimitWindowDTO {
 	return &apitypes.CodexRateLimitWindowDTO{UsedPercent: fPtr(float64(pct))}
 }
 
-// codexAcct builds one Codex account with a single "5h" bucket carrying the given primary
-// and secondary windows (either may be nil).
+// Window lengths in seconds, as Codex reports them in limit_window_seconds.
+const (
+	secs5h = int64(5 * 3600)
+	secs3h = int64(3 * 3600)
+	secs7d = int64(7 * 86400)
+)
+
+// withLen returns a copy of w carrying the given limit_window_seconds, unless w is nil or
+// already carries a length.
+func withLen(w *apitypes.CodexRateLimitWindowDTO, secs int64) *apitypes.CodexRateLimitWindowDTO {
+	if w == nil || w.LimitWindowSeconds != nil {
+		return w
+	}
+	c := *w
+	c.LimitWindowSeconds = &secs
+	return &c
+}
+
+// codexAcct builds one Codex account in the shape codexauth produces: a single main bucket
+// (id codexMainBucketID, empty display name) carrying the given primary and secondary windows
+// (either may be nil). A window with no reported length gets the usual 5h primary / 7d
+// secondary, so the labels read like a real reading.
 func codexAcct(accountID, alias string, isDefault bool, status string, primary, secondary *apitypes.CodexRateLimitWindowDTO) apitypes.CodexAccountRateLimitDTO {
 	return apitypes.CodexAccountRateLimitDTO{
 		AccountID: accountID, Aliases: []string{alias}, IsDefault: isDefault, Status: status,
 		Buckets: []apitypes.CodexRateLimitBucketDTO{
-			{ID: "5h", DisplayName: "5h", Primary: primary, Secondary: secondary},
+			{ID: codexMainBucketID, Primary: withLen(primary, secs5h), Secondary: withLen(secondary, secs7d)},
 		},
 	}
 }
@@ -85,10 +107,10 @@ func TestBoardCodexStripDropsUnreadable(t *testing.T) {
 }
 
 // TestBoardCodexStripSelection — default AND a listed non-default show; an unlisted
-// non-default does not. showLabel is true (two readable), so the aliases render. The accounts
-// section carries NO provider tag (that is the layout's job, PRD 1519 M3) — asserted here by the
-// absence of the retired "Codex " group prefix; the single "codex" provider tag is proved by the
-// boardMeterLayout tests below.
+// non-default does not. Every drawn account is named (PRD #1653 D-T2), so the aliases render.
+// The accounts section carries NO provider tag (that is the layout's job, PRD 1519 M3) —
+// asserted here by the absence of the retired "Codex " group prefix; the single "codex"
+// provider tag is proved by the boardMeterLayout tests below.
 func TestBoardCodexStripSelection(t *testing.T) {
 	accts := []apitypes.CodexAccountRateLimitDTO{
 		codexAcct("cx-primary", "primary", true, "fresh", cwin(33), cwin(61)),
@@ -121,7 +143,7 @@ func TestBoardCodexStripDedupOneMeterPerAccount(t *testing.T) {
 		codexAcct("cx-dup", "dupacct", false, "fresh", cwin(77), cwin(88)), // SAME id, sidebar-listed → also clears it
 	}
 	m := codexStripModel(t, accts, []string{"cx-dup"}) // the non-default duplicate is sidebar-listed
-	shown, _ := m.selectedCodexRateMeters()
+	shown := m.selectedCodexRateMeters()
 	if len(shown) != 1 {
 		t.Fatalf("two rows with the same AccountID must dedup to one meter, got %d: %+v", len(shown), shown)
 	}
@@ -186,17 +208,18 @@ func TestBoardCodexStripStaleDimmed(t *testing.T) {
 }
 
 // TestBoardCodexStripNilWindow — a present window with no reading (used_percent null)
-// renders "P —", never "P 0%": partial/unknown is preserved.
+// renders "5h —" (its length label, PRD #1653 D-T3), never "5h 0%": partial/unknown is
+// preserved.
 func TestBoardCodexStripNilWindow(t *testing.T) {
 	m := codexStripModel(t, []apitypes.CodexAccountRateLimitDTO{
 		codexAcct("cx-primary", "primary", true, "fresh",
 			&apitypes.CodexRateLimitWindowDTO{UsedPercent: nil}, nil),
 	}, nil)
 	strip := stripANSI(m.boardCodexAccountsSeg(time.Now()))
-	if !strings.Contains(strip, "P —") {
-		t.Errorf("a no-reading window must render `P —`:\n%s", strip)
+	if !strings.Contains(strip, "5h —") {
+		t.Errorf("a no-reading window must render `5h —`:\n%s", strip)
 	}
-	if strings.Contains(strip, "P 0%") {
+	if strings.Contains(strip, "0%") {
 		t.Errorf("a no-reading window must NOT render 0%%:\n%s", strip)
 	}
 }
@@ -251,8 +274,8 @@ func bothProvidersModel(t *testing.T, width int, claude []apitypes.TokenRateLimi
 
 // TestBoardMeterLayoutCombinedWide (PRD 1519 M5a) — at a WIDE width with one Claude token AND one
 // Codex account, boardMeterLayout returns ONE combined line carrying BOTH providers' meters, with
-// exactly ONE provider-level "codex" tag (the D3 combined-line invariant). A single Codex account
-// shows no per-account label A (showLabel is false), so the only "codex" on the line is P.
+// exactly ONE provider-level "codex" tag (the D3 combined-line invariant). The single account is
+// named "primary" and its main bucket draws no name (PRD #1653), so the only "codex" is the tag.
 func TestBoardMeterLayoutCombinedWide(t *testing.T) {
 	m := bothProvidersModel(t, 200,
 		[]apitypes.TokenRateLimitDTO{okMeter("sec-personal", "personal", true, 35, 62)},
@@ -306,8 +329,9 @@ func TestBoardMeterLayoutCombinedWide(t *testing.T) {
 // has a readable Codex account but no readable/selected Anthropic token, boardMeterLayout renders the
 // Codex meters on ONE line that MUST carry the single provider tag "codex": there is no Claude line
 // above to disambiguate the provider, and under Ascii/NoTTY the accent-bar tint is stripped (the ▎
-// glyph is identical for both providers), so the tag is the only provider signal. This pins the
-// `case !hasClaude:` branch, which the both-providers layout tests never exercise.
+// glyph is identical for both providers), so the tag is the provider signal. This pins the
+// `case !hasClaude:` branch, which the both-providers layout tests never exercise. PRD #1653: the
+// lone account is named, its windows read "5h"/"7d", and its main bucket draws no "codex" name.
 func TestBoardMeterLayoutCodexOnlyIncludesProviderTag(t *testing.T) {
 	m := codexStripModel(t, []apitypes.CodexAccountRateLimitDTO{
 		codexAcct("cx-primary", "primary", true, "fresh", cwin(71), cwin(29)),
@@ -317,9 +341,11 @@ func TestBoardMeterLayoutCodexOnlyIncludesProviderTag(t *testing.T) {
 		t.Fatalf("a Codex-only viewer must render ONE meter line, got %d: %q", len(layout.lines), layout.lines)
 	}
 	plain := stripANSI(layout.lines[0])
-	// A single account never shows a per-account label (showLabel is false for one account), so the
-	// only "codex" token must be the provider tag P — dropping P here would leave the section
-	// unlabelled with no Claude line above to disambiguate it.
+	// The alias is not "codex" and the main bucket draws no name, so the only "codex" token must be
+	// the provider tag — dropping it would leave the section with no provider mark at all.
+	if !strings.HasPrefix(plain, " codex ▎primary 5h ") {
+		t.Errorf("the Codex-only line must read ` codex ▎primary 5h …` (tag, named account, length label):\n%s", plain)
+	}
 	if n := strings.Count(plain, "codex"); n != 1 {
 		t.Errorf("the Codex-only line must carry exactly ONE provider tag \"codex\", got %d:\n%s", n, plain)
 	}
@@ -337,7 +363,9 @@ func TestBoardMeterLayoutCodexOnlyIncludesProviderTag(t *testing.T) {
 // TestBoardMeterLayoutNarrowFallback (PRD 1519 M5b) — at a NARROW width where the combined line
 // does not fit (two Claude tokens + two Codex accounts ≈ 163 cols at width 100), boardMeterLayout
 // falls back to TWO lines: the Claude line, then a separate Codex line. The Codex readings stay
-// reachable on their own line, and P is omitted on the fallback Codex line (matrix default-omit).
+// reachable on their own line, and — PRD #1653 D-T4, superseding PRD 1519's default-omit — the
+// fallback Codex line STARTS with the single "codex" tag, since its "5h"/"7d" window labels no
+// longer say Codex on their own.
 func TestBoardMeterLayoutNarrowFallback(t *testing.T) {
 	m := bothProvidersModel(t, 100,
 		[]apitypes.TokenRateLimitDTO{
@@ -363,10 +391,16 @@ func TestBoardMeterLayoutNarrowFallback(t *testing.T) {
 	if !strings.Contains(codexLine, "71%") {
 		t.Errorf("the fallback Codex line must carry the Codex reading (reachable, not clipped):\n%s", codexLine)
 	}
-	// P omitted on the fallback Codex line (the aliases here are not "codex", so any "codex" would
-	// be a wrongly re-added provider tag).
-	if strings.Contains(codexLine, "codex") {
-		t.Errorf("the fallback Codex line must OMIT the provider tag (matrix default-omit):\n%s", codexLine)
+	// The fallback Codex line leads with the tag, exactly once (the aliases here are not "codex").
+	if !strings.HasPrefix(codexLine, " codex ▎primary ") {
+		t.Errorf("the fallback Codex line must start with the provider tag then the first account:\n%s", codexLine)
+	}
+	if n := strings.Count(codexLine, "codex"); n != 1 {
+		t.Errorf("the fallback Codex line must carry exactly ONE provider tag \"codex\", got %d:\n%s", n, codexLine)
+	}
+	// The Claude line is labelled too (PRD #1653 D-T2) and keeps its Claude-only look.
+	if !strings.HasPrefix(claudeLine, " ▎personal 5h ") {
+		t.Errorf("the fallback Claude line must start with the labelled first token:\n%s", claudeLine)
 	}
 }
 
@@ -398,10 +432,10 @@ func TestBoardCodexReachableAtStandardWidth(t *testing.T) {
 }
 
 // TestBoardMeterLayoutAliasEqualsCodex (PRD 1519 M5c) — with two Codex accounts where ONE account's
-// alias is literally "codex", on a combined line, BOTH the provider tag P AND that account's own
-// label A render: the "codex" provider tag PLUS the aliased account's "codex" label, two distinct
-// tokens, NOT the old redundant single prefix. P is never suppressed to match an alias, so "codex"
-// appears exactly twice (P once + the aliased account's A once).
+// alias is literally "codex", on a combined line, BOTH the provider tag AND that account's own
+// label render: the "codex" provider tag PLUS the aliased account's "codex" label, two distinct
+// tokens, NOT the old redundant single prefix. The tag is never suppressed to match an alias, and
+// the main bucket draws no "codex" name (PRD #1653 D-T3), so "codex" appears exactly twice.
 func TestBoardMeterLayoutAliasEqualsCodex(t *testing.T) {
 	m := bothProvidersModel(t, 200,
 		[]apitypes.TokenRateLimitDTO{okMeter("sec-personal", "personal", true, 35, 62)},
@@ -414,24 +448,27 @@ func TestBoardMeterLayoutAliasEqualsCodex(t *testing.T) {
 		t.Fatalf("this config must combine onto ONE line, got %d: %q", len(layout.lines), layout.lines)
 	}
 	plain := stripANSI(layout.lines[0])
-	// P (the provider tag at the section start) AND A (the aliased account's own "codex" label) both
-	// render → "codex" appears exactly twice. Suppressing P to match the alias would give 1; dropping
-	// A would give 1. So the count discriminates both failure modes.
+	// The tag (at the section start) AND the aliased account's own "codex" label both render →
+	// "codex" appears exactly twice. Suppressing the tag to match the alias would give 1; dropping
+	// the label would give 1; a main-bucket "codex" name would give 3. So the count discriminates.
 	if n := strings.Count(plain, "codex"); n != 2 {
-		t.Errorf("an account aliased \"codex\" must yield the provider tag P plus its own label A (\"codex\" ×2), got %d:\n%s", n, plain)
+		t.Errorf("an account aliased \"codex\" must yield the provider tag plus its own label (\"codex\" ×2), got %d:\n%s", n, plain)
 	}
-	// The aliased account is the default one, so its label carries the "(default)" badge — proving A
-	// (not just P) actually drew.
-	if !strings.Contains(plain, "(default)") {
-		t.Errorf("the aliased account's per-account label A did not render (no \"(default)\" badge):\n%s", plain)
+	// The tag, then the aliased account's label straight after its accent bar — proving the label
+	// (not just the tag) drew. The label carries no "(default)" badge (PRD #1653 amendment).
+	if !strings.Contains(plain, "codex ▎codex 5h ") {
+		t.Errorf("the aliased account's label did not render right after the tag:\n%s", plain)
+	}
+	if strings.Contains(plain, "(default)") {
+		t.Errorf("the Codex account label must not carry a \"(default)\" badge:\n%s", plain)
 	}
 }
 
 // TestBoardMeterLayoutAsciiCombinedMultiAccount (PRD 1519 M5d) — under a colorprofile.Ascii/NoTTY
 // downgrade, with TWO Codex accounts on a combined line, the accent tint is stripped and the ▎ glyph
-// is identical for both providers, so the single "codex" provider tag P is the ONLY provider signal.
-// The Codex section still renders the labels the D3 matrix requires (P once, plus a per-account label
-// A per account) and stays provider-distinguishable with no colour at all.
+// is identical for both providers, so the single "codex" provider tag is the ONLY provider signal.
+// The Codex section still renders the tag once plus a per-account label per account, and stays
+// provider-distinguishable with no colour at all.
 func TestBoardMeterLayoutAsciiCombinedMultiAccount(t *testing.T) {
 	m := bothProvidersModel(t, 200,
 		[]apitypes.TokenRateLimitDTO{okMeter("sec-personal", "personal", true, 35, 62)},
@@ -446,11 +483,11 @@ func TestBoardMeterLayoutAsciiCombinedMultiAccount(t *testing.T) {
 		t.Fatalf("this config must combine onto ONE line, got %d: %q", len(layout.lines), layout.lines)
 	}
 	plain := stripANSI(layout.lines[0])
-	// The provider tag P survives the downgrade as plain text and is the provider distinguisher.
+	// The provider tag survives the downgrade as plain text and is the provider distinguisher.
 	if n := strings.Count(plain, "codex"); n != 1 {
 		t.Errorf("under Ascii the combined line must carry exactly ONE provider tag \"codex\", got %d:\n%s", n, plain)
 	}
-	// Both per-account labels A render (showLabel true), so each account is still identified.
+	// Both per-account labels render, so each account is still identified.
 	for _, want := range []string{"primaryacct", "teamacct"} {
 		if !strings.Contains(plain, want) {
 			t.Errorf("under Ascii the per-account label %q is missing:\n%s", want, plain)
@@ -535,7 +572,7 @@ func TestBoardCodexStripAsciiSignalSurvives(t *testing.T) {
 
 // TestSelectedCodexRateMetersSharedByBoardAndRail — the anti-drift guarantee: the board strip
 // and the detail rail both consume selectedCodexRateMeters, so they cannot disagree on the
-// shown set or showLabel.
+// shown set (and both name every drawn account, PRD #1653 D-T2).
 func TestSelectedCodexRateMetersSharedByBoardAndRail(t *testing.T) {
 	accts := []apitypes.CodexAccountRateLimitDTO{
 		codexAcct("cx-primary", "primary", true, "fresh", cwin(33), cwin(61)),
@@ -546,10 +583,7 @@ func TestSelectedCodexRateMetersSharedByBoardAndRail(t *testing.T) {
 	sidebar := []string{"cx-team"}
 
 	board := codexStripModel(t, accts, sidebar)
-	shown, showLabel := board.selectedCodexRateMeters()
-	if !showLabel {
-		t.Errorf("showLabel must be true (three readable accounts), got false")
-	}
+	shown := board.selectedCodexRateMeters()
 	gotIDs := make([]string, 0, len(shown))
 	for _, a := range shown {
 		gotIDs = append(gotIDs, a.AccountID)
@@ -606,17 +640,17 @@ func TestRailCodexRateMetersRendersReading(t *testing.T) {
 	}
 }
 
-// TestRailCodexRateMetersNilWindow — a present window with no reading renders "P —" in the
-// rail too, mirroring the board strip and the CLI table.
+// TestRailCodexRateMetersNilWindow — a present window with no reading renders "5h —" in the
+// rail too (its length label, PRD #1653 D-T3), mirroring the board strip.
 func TestRailCodexRateMetersNilWindow(t *testing.T) {
 	rail := stripANSI(codexRailModel(t, []apitypes.CodexAccountRateLimitDTO{
 		codexAcct("cx-primary", "primary", true, "fresh",
 			&apitypes.CodexRateLimitWindowDTO{UsedPercent: nil}, nil),
 	}, nil).renderLaneRail())
-	if !strings.Contains(rail, "P —") {
-		t.Errorf("a no-reading window must render `P —` in the rail:\n%s", rail)
+	if !strings.Contains(rail, "5h —") {
+		t.Errorf("a no-reading window must render `5h —` in the rail:\n%s", rail)
 	}
-	if strings.Contains(rail, "P 0%") {
+	if strings.Contains(rail, "0%") {
 		t.Errorf("a no-reading window must NOT render 0%% in the rail:\n%s", rail)
 	}
 }
@@ -694,13 +728,14 @@ func TestRailCodexBlockAutoFoldsIntoView(t *testing.T) {
 
 // TestCodexMetersSanitizeUntrustedText — a hostile alias AND a hostile bucket display name,
 // each carrying control + bidi bytes, are scrubbed by renderer.Plain (D7) before they reach
-// EITHER the board strip or the detail rail. The account is default+sidebar-listed and a
-// second readable account forces showLabel so both the alias eyebrow and the bucket name
-// eyebrow actually render (a non-vacuous test).
+// EITHER the board strip or the detail rail. The alias is always drawn (PRD #1653 D-T2) and the
+// hostile bucket is a NON-main bucket, so its name is drawn too (the main "codex" bucket draws
+// none) — both untrusted fields actually render (a non-vacuous test).
 func TestCodexMetersSanitizeUntrustedText(t *testing.T) {
 	hostileAlias := "acct\u202ehostile\x1b[31m\rmeta"
 	hostileBucket := "5h\u202e\x07evil\x1b[32m"
 	nasty := codexAcct("cx-evil", hostileAlias, true, "fresh", cwin(44), cwin(55))
+	nasty.Buckets[0].ID = "gpt-extra" // a non-main bucket: its (hostile) name is drawn
 	nasty.Buckets[0].DisplayName = hostileBucket
 	accts := []apitypes.CodexAccountRateLimitDTO{
 		nasty,

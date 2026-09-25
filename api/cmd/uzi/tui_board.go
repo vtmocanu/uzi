@@ -815,32 +815,33 @@ func (m tuiModel) boardShowCred() bool {
 // now values and flip the combined-vs-split decision, so deriving the layout twice (two nows) is banned.
 type boardMeterLayout struct{ lines []string }
 
-// boardCodexProviderTag is the single faint LOWERCASE provider tag "codex " — P in the PRD 1519 D3
-// label-precedence matrix. It is a hardcoded literal, so it needs no renderer.Plain; only the
-// user-authored account aliases and bucket names (inside boardCodexAccountsSeg) go through Plain (D7).
-// P and the per-account label A are SEMANTICALLY DISTINCT and BOTH render even when an account alias
-// literally equals "codex": that yields the "codex" provider tag PLUS that account's own "codex"
-// label, which is correct — NOT the old redundant hardcoded prefix. P is never suppressed to match an
-// alias.
+// boardCodexProviderTag is the single faint LOWERCASE provider tag "codex " (the provider tag of the
+// PRD 1519 D3 matrix; PRD #1653 D-T1 keeps it as the TUI's only provider mark — no glyph, Claude
+// untagged). It is a hardcoded literal, so it needs no renderer.Plain; only the user-authored account
+// aliases and bucket names (inside boardCodexAccountsSeg) go through Plain (D7). The tag and the
+// per-account label are SEMANTICALLY DISTINCT and BOTH render even when an account alias literally
+// equals "codex": that yields the "codex" provider tag PLUS that account's own "codex" label, which is
+// correct — NOT the old redundant hardcoded prefix. The tag is never suppressed to match an alias.
 func (m tuiModel) boardCodexProviderTag() string {
 	return paintSeg(m.pal.faintC, nil, false, "codex ")
 }
 
-// boardMeterLayout builds the snapshot (PRD 1519 D3/D4). claudeStr is the Claude section (" " +
-// the 3-space-joined per-token segments); codexAccounts is the Codex ACCOUNTS section with NO
-// provider tag; P is the single faint "codex " tag placed by THIS layout code, not by the sections.
+// boardMeterLayout builds the snapshot (PRD 1519 D3/D4, PRD #1653 D-T4). claudeStr is the Claude
+// section (" " + the 3-space-joined per-token segments); codexAccounts is the Codex ACCOUNTS section
+// with NO provider tag; the tag (boardCodexProviderTag, "codex ") is placed by THIS layout code, not
+// by the sections.
 //
-// P-placement rule (matrix invariant: at most one provider-level token ever renders):
+// Tag-placement rule (invariant: at most one provider-level token ever renders per line):
 //   - neither section present → 0 lines.
-//   - Claude only → the Claude line; no P (there is no Codex section).
-//   - Codex only → one line " " + P + codexAccounts; P IS included — there is no Claude line above
-//     to disambiguate the provider, and under Ascii/NoTTY the accent-bar tint is stripped and the ▎
-//     glyph is identical for both providers, so the tag is the only provider signal.
-//   - both, and the combined line fits m.width → one line claudeStr + gap + P + codexAccounts; exactly
-//     one P (the D3 combined-line invariant), so the provider stays unambiguous under Ascii/NoTTY.
-//   - both, and it does NOT fit → two lines (Claude, then Codex); P is OMITTED on the fallback Codex
-//     line (matrix "default omit"): the line position, the accent bar, and the P/S window labels
-//     disambiguate, and re-adding P here would risk clipping the readings the fallback exists to save.
+//   - Claude only → the Claude line; no tag (there is no Codex section).
+//   - Codex only → one line " " + tag + codexAccounts — under Ascii/NoTTY the accent-bar tint is
+//     stripped and the ▎ glyph is identical for both providers, so the tag is the provider signal.
+//   - both, and the combined line fits m.width → one line claudeStr + gap + tag + codexAccounts;
+//     exactly one tag, so the provider stays unambiguous under Ascii/NoTTY.
+//   - both, and it does NOT fit → two lines (Claude, then " " + tag + codexAccounts). PRD #1653 D-T4
+//     supersedes PRD 1519's omission of the tag here: the Codex windows are now labelled by length
+//     ("5h"/"7d"), the same vocabulary as Claude's, so without the tag nothing on the split line says
+//     Codex. A line wider than m.width is clipped at the right edge (D-T5).
 //
 // The Claude↔Codex section gap on the combined line is the same 3-space token gap the sections use
 // internally; the per-account accent bar ▎ still delimits the account groups.
@@ -855,18 +856,18 @@ func (m tuiModel) boardMeterLayout(now time.Time) boardMeterLayout {
 	case !hasCodex: // Claude only — no Codex section, so no provider tag.
 		claudeStr := " " + strings.Join(claudeSegs, "   ")
 		return boardMeterLayout{[]string{clampVisual(claudeStr, m.width)}}
-	case !hasClaude: // Codex only — include P (no Claude line above to disambiguate).
+	case !hasClaude: // Codex only — one tag.
 		return boardMeterLayout{[]string{clampVisual(" "+m.boardCodexProviderTag()+codexAccounts, m.width)}}
 	default: // both
 		claudeStr := " " + strings.Join(claudeSegs, "   ")
 		combined := claudeStr + "   " + m.boardCodexProviderTag() + codexAccounts
 		if visualWidth(combined) <= m.width {
-			return boardMeterLayout{[]string{clampVisual(combined, m.width)}} // exactly one P
+			return boardMeterLayout{[]string{clampVisual(combined, m.width)}} // exactly one tag
 		}
-		// Fallback: two lines, P omitted on the Codex line (matrix default-omit).
+		// Fallback: two lines; the Codex line keeps the tag (PRD #1653 D-T4).
 		return boardMeterLayout{[]string{
 			clampVisual(claudeStr, m.width),
-			clampVisual(" "+codexAccounts, m.width),
+			clampVisual(" "+m.boardCodexProviderTag()+codexAccounts, m.width),
 		}}
 	}
 }

@@ -233,32 +233,32 @@ func (m tuiModel) railAutoFolded(now time.Time) bool {
 }
 
 // railCodexFloorRows reports the CODEX block's protected floor — the 1-row CODEX header plus the
-// FIRST shown Codex account's entry (its optional label eyebrow and each bucket's name/P/S lines)
-// — and whether any Codex account is shown at all. It is the PRD #1209 M3 analog of the Claude
+// FIRST shown Codex account's entry (its always-drawn label eyebrow, each non-main bucket's name
+// eyebrow, and one line per present window; PRD #1653 D-T2/D-T3) — and whether any Codex account is shown at all. It is the PRD #1209 M3 analog of the Claude
 // own-account floor railAutoFolded protects: railCodexRateMeters appends whole entries in order
 // and drops the rest bottom-up, so the first renderable account is the one guaranteed on screen
 // whenever the block renders. Counting it makes the crew auto-fold to keep at least that account
 // visible instead of letting the whole CODEX block silently overflow. The row math here mirrors
 // railCodexRateMeters' entry-building exactly, so the decision and the render cannot disagree.
 func (m tuiModel) railCodexFloorRows() (rows int, shownAny bool) {
-	shown, showLabel := m.selectedCodexRateMeters()
-	for _, a := range shown {
-		entry := 0
-		if showLabel {
-			entry++ // the account label eyebrow
-		}
-		for _, b := range a.Buckets {
-			entry += 2 // the bucket name eyebrow + the primary (P) window line
-			if b.Secondary != nil {
-				entry++ // the secondary (S) window line
-			}
-		}
-		if entry == 0 {
-			continue // railCodexRateMeters skips a zero-line entry too (no label, no buckets)
-		}
-		return 1 + entry, true // the 1-row CODEX header + the first renderable account's rows
+	shown := m.selectedCodexRateMeters()
+	if len(shown) == 0 {
+		return 0, false
 	}
-	return 0, false
+	// Every entry now has at least its label row, so no account is skipped as empty and the
+	// first shown account is the floor.
+	a := shown[0]
+	entry := 1 // the account label eyebrow, always drawn (D-T2)
+	for _, b := range a.Buckets {
+		if b.ID != codexMainBucketID {
+			entry++ // the bucket name eyebrow; the main bucket draws none (D-T3)
+		}
+		entry++ // the primary window line
+		if b.Secondary != nil {
+			entry++ // the secondary window line
+		}
+	}
+	return 1 + entry, true // the 1-row CODEX header + the first account's rows
 }
 
 // laneIdentities maps each real lane's key to the identity string the crew rail shows for it,
