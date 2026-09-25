@@ -1265,7 +1265,7 @@ SELECT r.checkpoint_tip,
                   AND i.consumed_at IS NOT NULL))::boolean AS human_plan_approved
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
-JOIN forge_connections c ON c.id = rp.connection_id
+JOIN forge_connections c ON c.id = rp.connection_id AND c.user_id = r.user_id -- #1688: owner-scoped token
 WHERE r.id = @run_id;
 
 -- name: SetRunAnthropicSecret :execrows
@@ -5815,7 +5815,7 @@ SELECT r.status, r.issue_iid, r.repo_id, r.origin_column, r.board_column, r.move
        c.forge_type, c.base_url, c.token_ciphertext
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
-JOIN forge_connections c ON c.id = rp.connection_id
+JOIN forge_connections c ON c.id = rp.connection_id AND c.user_id = r.user_id -- #1688: owner-scoped token
 WHERE r.id = @run_id;
 
 -- name: GetRunForgeConnForWorker :one
@@ -5831,7 +5831,7 @@ SELECT rp.forge_project_id,
        c.forge_type, c.base_url, c.token_ciphertext, c.bot_forge_user_id
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
-JOIN forge_connections c ON c.id = rp.connection_id
+JOIN forge_connections c ON c.id = rp.connection_id AND c.user_id = r.user_id -- #1688: owner-scoped token
 WHERE r.id = @run_id AND r.worker_id = @worker_id;
 
 -- name: ClaimAutopilotTerminalComment :execrows
