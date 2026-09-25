@@ -235,8 +235,10 @@ actually blocked this way.
 Whether uzi checks, before an interlocked issue run opens a pull/merge
 request that closes its issue, that every milestone of the approved plan was
 actually declared done: **Completion check** (`completion_interlock_rollout`),
-**on by default** for a new issue run using the Claude harness. A Codex issue
-run is not checked yet, regardless of this setting. Turning it off is an
+**on by default** for a new, unseeded issue run using the Claude harness. A
+Codex issue run is not checked yet, regardless of this setting, and neither
+is a run started from a seeded plan (`uzi run create --plan-file`) — it
+never sends the plan-bearing report the check hooks into. Turning it off is an
 explicit, instance-wide kill-switch — an issue run created while it's off
 behaves as it did before this feature existed, and a run created before the
 switch was ever flipped keeps whatever the switch said at its own creation.

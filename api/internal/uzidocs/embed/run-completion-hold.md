@@ -12,15 +12,17 @@ lead actually declared complete before it can open a closing pull/merge
 request. This page explains what a hold looks like when the interlock catches
 something, and what you can do about it.
 
-This is **on by default for a new issue run using the Claude harness**. An
-admin can turn it off from **Admin → Settings → Completion check**
-(`completion_interlock_rollout`); an explicit off, or an environment
-override, is the only way to disable it. A **Codex** issue run is not
-checked yet — the Codex executor doesn't run the completion-attempt loop
-this page describes, so the switch has no effect on one, regardless of its
-setting. And a run created before this default changed is unaffected either
-way: the switch is read once, when the run is created, never retroactively
-against a run already in flight.
+This is **on by default for a new, unseeded issue run using the Claude
+harness**. An admin can turn it off from **Admin → Settings → Completion
+check** (`completion_interlock_rollout`); an explicit off is the only way to
+disable it. A **Codex** issue run is not checked yet — the Codex executor
+doesn't run the completion-attempt loop this page describes, so the switch
+has no effect on one, regardless of its setting. A run started from a
+**seeded plan** (`uzi run create --plan-file`) is never checked either: it
+never goes through the plan-bearing report this interlock hooks into, so it
+is never interlocked in the first place. And a run created before this
+default changed is unaffected either way: the switch is read once, when the
+run is created, never retroactively against a run already in flight.
 
 ## Why a run holds
 
