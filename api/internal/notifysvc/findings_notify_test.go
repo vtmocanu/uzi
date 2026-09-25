@@ -38,10 +38,6 @@ func (s *coalescingStore) PruneNotificationsForUser(context.Context, store.Prune
 	return 0, nil
 }
 
-func (s *coalescingStore) GetRunByID(context.Context, uuid.UUID) (store.Run, error) {
-	return store.Run{}, nil
-}
-
 func (s *coalescingStore) FindUnreadNotificationForRunKind(_ context.Context, arg store.FindUnreadNotificationForRunKindParams) (store.Notification, error) {
 	// Newest-first, like the query's ORDER BY created_at DESC.
 	for i := len(s.rows) - 1; i >= 0; i-- {

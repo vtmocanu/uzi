@@ -17,7 +17,6 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/board"
 	"github.com/vtmocanu/uzi/api/internal/forge"
-	"github.com/vtmocanu/uzi/api/internal/notifysvc"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -174,11 +173,6 @@ type Service struct {
 	timeout time.Duration
 	labels  LabelConfig
 
-	// notifier lands the "your auto-fix landed" inbox row on the reset-on-green path
-	// (PRD #71 M6). Optional (nil-safe): set via SetNotifier, unset means the landed
-	// notification is skipped — every other pipeline-sync behaviour is unaffected.
-	notifier LandedNotifier
-
 	// reworkCanceller aborts an in-flight mr_rework run when its MR leaves the opened
 	// state (issue #853). Optional (nil-safe): set via SetReworkCanceller, unset means
 	// the mid-flight abort is skipped — every other MR-sync behaviour is unaffected.
@@ -199,25 +193,12 @@ type ReworkCanceller interface {
 	CancelReworkForMR(ctx context.Context, repoID uuid.UUID, mrIID int64, reason string) error
 }
 
-// LandedNotifier lands an inbox notification when a ci_fix run's fix pipeline goes
-// green (PRD #71 M6). *notifysvc.Service satisfies it. Kept as an interface so the
-// sync's core has no hard dependency on notifysvc and the pipeline-sync tests need
-// no notifier.
-type LandedNotifier interface {
-	Notify(ctx context.Context, n notifysvc.Notification) (store.Notification, error)
-}
-
 // New constructs a Service. box encrypts/decrypts stored PATs; timeout bounds
 // every forge HTTP call; labels resolves the configured uzi label the sync
 // filters on (nil is tolerated and falls back to the compiled-in default).
 func New(q IssueStore, box *secretbox.Box, timeout time.Duration, labels LabelConfig) *Service {
 	return &Service{q: q, box: box, timeout: timeout, labels: labels}
 }
-
-// SetNotifier wires the landed-notification collaborator (PRD #71 M6). Call once at
-// startup, before the poller runs. A nil notifier (the default) disables the landed
-// inbox row; the rest of the sync is unchanged.
-func (s *Service) SetNotifier(n LandedNotifier) { s.notifier = n }
 
 // SetReworkCanceller wires the mid-flight mr_rework abort collaborator (issue #853).
 // Call once at startup, before the poller runs. A nil canceller (the default) disables

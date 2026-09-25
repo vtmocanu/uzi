@@ -8,6 +8,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/slack-go/slack"
+
+	"github.com/vtmocanu/uzi/api/internal/notifysvc"
 )
 
 // The generic inbox-notification DM seam (PRD #46): handleNotify delivers a
@@ -51,6 +53,9 @@ func (n *Notifier) handleNotify(ctx context.Context, ev notifyEvent) {
 // must go so the fallback reads cleanly and can never leave a dangling mrkdwn token.
 var notifyFactMarkupStripper = strings.NewReplacer("*", "", "`", "", "_", "")
 
+// defaultNotifyLinkLabel is the deep link's label when the render sets no LinkLabel.
+const defaultNotifyLinkLabel = "Open in uzi"
+
 // notificationBlocks builds the content-minimized DM for a generic notification as
 // Block Kit (message family D, PRD #268 M3). Shape, in order and only for the parts
 // that apply: a section with the caller emoji + bold title; a context block of the
@@ -72,8 +77,12 @@ var notifyFactMarkupStripper = strings.NewReplacer("*", "", "`", "", "_", "")
 //     walk, not a substring scan): a fenced body is emitted as a PLAIN section instead (PRD
 //     #292 Decision 6), because a `> ` prefix injected into a fence's interior lines corrupts
 //     Slack's code rendering.
-//   - the deep link keeps its raw <url|label> markup (operator-set base, http(s)-validated),
-//     ScrubSecrets'd as a no-op-on-clean last line of defense.
+//   - the deep link keeps its raw <url|label> markup, but only when notifysvc.SafeLinkURL
+//     accepts it (absolute http(s), a host, no `<`, `>`, `|`, whitespace or control
+//     character); anything else drops the link block, since a forge-supplied URL (the
+//     ci_autofix_halted pipeline link, PRD #1650 D3) is not operator-controlled. The label
+//     is a caller-set fixed string (default "Open in uzi"), EscapeMrkdwn'd anyway. The
+//     whole line is ScrubSecrets'd as a no-op-on-clean last line of defense.
 //
 // The fallback is built from FIXED/escaped fields only — never a raw model summary alone:
 // the escaped title, then the facts with their markup stripped (so the verdict/count still
@@ -110,9 +119,13 @@ func notificationBlocks(ev notifyEvent) (blocks []slack.Block, fallback string) 
 			slack.NewTextBlockObject(slack.MarkdownType, text, false, false), nil, nil))
 	}
 
-	if url := strings.TrimSpace(ev.link); url != "" {
+	if url := notifysvc.SafeLinkURL(ev.link); url != "" {
+		label := defaultNotifyLinkLabel
+		if l := strings.TrimSpace(ev.linkLabel); l != "" {
+			label = EscapeMrkdwn(l)
+		}
 		blocks = append(blocks, slack.NewContextBlock("slack_notify_link",
-			slack.NewTextBlockObject(slack.MarkdownType, ScrubSecrets(fmt.Sprintf("🔗 <%s|Open in uzi>", url)), false, false)))
+			slack.NewTextBlockObject(slack.MarkdownType, ScrubSecrets(fmt.Sprintf("🔗 <%s|%s>", url, label)), false, false)))
 	}
 
 	return blocks, notificationFallback(ev)

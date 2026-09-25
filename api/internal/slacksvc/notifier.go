@@ -193,8 +193,10 @@ type notifyEvent struct {
 	title  string
 	body   string
 	link   string
-	emoji  string
-	facts  []string
+	// linkLabel is the caller-set fixed label for link; empty ⇒ "Open in uzi".
+	linkLabel string
+	emoji     string
+	facts     []string
 }
 
 // healthEvent is a run-health flag change (PRD #47 M4). nudge is set only when the
@@ -236,7 +238,7 @@ func NewNotifier(s NotifierStore, poster Poster, baseURL func(context.Context) (
 // full (Slack is strictly best-effort — the inbox row is already durable).
 func (n *Notifier) PublishNotification(userID uuid.UUID, r notifysvc.SlackRender) {
 	select {
-	case n.notifyCh <- notifyEvent{userID: userID, title: r.Title, body: r.Body, link: r.Link, emoji: r.Emoji, facts: r.Facts}:
+	case n.notifyCh <- notifyEvent{userID: userID, title: r.Title, body: r.Body, link: r.Link, linkLabel: r.LinkLabel, emoji: r.Emoji, facts: r.Facts}:
 	default:
 		n.logger.Warn("slack: notifier queue full, dropping notification", "user", userID.String())
 	}

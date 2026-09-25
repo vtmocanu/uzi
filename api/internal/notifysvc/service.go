@@ -39,10 +39,6 @@ const DefaultUserCap = 200
 type Store interface {
 	InsertNotification(ctx context.Context, arg store.InsertNotificationParams) (store.Notification, error)
 	PruneNotificationsForUser(ctx context.Context, arg store.PruneNotificationsForUserParams) (int64, error)
-	// GetRunByID loads a run by id (PRD #284 M5). The run-failure notifier reads
-	// through its own narrower runReader, but keeping this on Store lets the same
-	// *store.Queries value back both the notify seam and the adapter.
-	GetRunByID(ctx context.Context, id uuid.UUID) (store.Run, error)
 	// FindUnreadNotificationForRunKind / UpdateNotificationPayload are the PRD #333 D6
 	// per-run coalescing pair: find the run's still-unread finding notification (a miss
 	// ⇒ this is the run's first finding, insert + one Slack DM), else bump its payload
@@ -96,20 +92,24 @@ func New(q Store, slack Slacker, cap int, logger *slog.Logger) *Service {
 // CLOSED enums/ints — the notifier scrubs them but does NOT mrkdwn-escape them (that
 // would break the intended markup). The notifier escapes + scrubs the untrusted
 // fields before they leave the box; the inbox row is the durable copy regardless.
+//
+// LinkLabel is an optional caller-set FIXED label for the deep link (e.g. "Open the
+// pipeline"); empty renders the default "Open in uzi", so a render that leaves it unset
+// is byte-identical to one built before the field existed.
 type SlackRender struct {
-	Title string
-	Body  string
-	Link  string
-	Emoji string
-	Facts []string
+	Title     string
+	Body      string
+	Link      string
+	LinkLabel string
+	Emoji     string
+	Facts     []string
 }
 
-// CIAutofixPayload is the jsonb the inbox renders for every ci_autofix_* notification
-// kind (started / halted from the poller, landed from forgesvc). It lives here — the
-// one package all three producers already import — so all three kinds carry one shape
-// instead of drifting between a typed poller struct and a forgesvc map. Optional
-// fields are omitempty: landed carries no issue iid or reason, started carries no
-// reason, so only halted sets Reason and only the poller kinds set IssueIID.
+// CIAutofixPayload is the jsonb carried by the poller's halt notifications:
+// ci_autofix_halted and mr_rework_halted (the only producers left once the status-only
+// ci_autofix_started / ci_autofix_landed kinds were retired, PRD #1650 D2). Older rows
+// of the retired kinds carry the same shape. IssueIID and Reason are omitempty (an
+// issueless branch has no issue iid); mr_rework_halted leaves PipelineWebURL empty.
 type CIAutofixPayload struct {
 	Ref            string `json:"ref"`
 	PipelineWebURL string `json:"pipeline_web_url"`

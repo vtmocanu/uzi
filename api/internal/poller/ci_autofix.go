@@ -139,8 +139,8 @@ func (d *CIAutoFix) detectOne(ctx context.Context, r store.ListEnabledReposWithC
 	// Scheduled-run branches (`uzi/prompt-…`, `uzi/self-improve/…`) do not parse to an
 	// issue iid, and are now PROCESSED normally (PRD #908): the ci_fix still fires — only
 	// the issue comments (start + halt) are suppressed, since there is no issue to comment
-	// on. The inbox notifications (notifyStarted / notifyHalt) still fire for both branch
-	// shapes. When !ok, iid is 0, which is fine for the notification payload. For an
+	// on. The halt notification (notifyHalt) still fires for both branch shapes. When !ok,
+	// iid is 0, which is fine for the notification payload. For an
 	// `agent/issue-N` branch the parse still succeeds and the comments still post
 	// (issue-run behavior unchanged).
 	iid, ok := issueIIDFromBranch(ref)
@@ -276,7 +276,7 @@ func (d *CIAutoFix) detectOne(ctx context.Context, r store.ListEnabledReposWithC
 	// draws a spurious "started" comment. On success, UPSERT-THEN-COMMENT — the ledger
 	// write (which increments the counter) is what makes the next tick's active-run
 	// swallow prevent a double run if a crash follows; a lost comment is the accepted trade.
-	run, err := d.runs.CreateAutoCIFixRun(ctx, cand.UserID, r.ID, ref, title, description, snap, ciConfigPaths)
+	_, err = d.runs.CreateAutoCIFixRun(ctx, cand.UserID, r.ID, ref, title, description, snap, ciConfigPaths)
 	switch {
 	case err == nil:
 		if err := d.q.UpsertCIAutofixAttempt(ctx, store.UpsertCIAutofixAttemptParams{
@@ -294,7 +294,6 @@ func (d *CIAutoFix) detectOne(ctx context.Context, r store.ListEnabledReposWithC
 				slog.Warn("poller: ci-autofix start comment", "repo", r.PathWithNamespace, "ref", ref, "error", err)
 			}
 		}
-		d.notifyStarted(ctx, cand, iid, run.ID)
 	case errors.Is(err, workersvc.ErrActiveFixExists), errors.Is(err, workersvc.ErrBranchInUse):
 		// A race with the manual Fix-CI button (or an issue run on the branch): swallow,
 		// no comment, do not advance the counter.
@@ -318,39 +317,33 @@ func (d *CIAutoFix) recordPipeline(ctx context.Context, r store.ListEnabledRepos
 	}
 }
 
-// notifyStarted lands the ci_autofix_started inbox row for the ref's owner
-// (best-effort, nil-safe). RunID anchors it to the started run. Slack is nil
-// (INBOX-ONLY): the run-failure notifier already DMs the last attempt's failure on
-// PublishState, so a Slack halt/start DM would double up; the issue comment is the
-// primary outward signal.
-func (d *CIAutoFix) notifyStarted(ctx context.Context, cand store.ListCIAutofixCandidateRefsRow, iid int64, runID uuid.UUID) {
-	if d.notifier == nil {
-		return
-	}
-	if _, err := d.notifier.Notify(ctx, notifysvc.Notification{
-		UserID:  cand.UserID,
-		Kind:    "ci_autofix_started",
-		Payload: notifysvc.CIAutofixPayload{Ref: cand.Ref.String, PipelineWebURL: cand.PipelineWebUrl, IssueIID: iid},
-		RunID:   &runID,
-		Slack:   nil,
-	}); err != nil {
-		slog.Warn("poller: ci-autofix notify started", "user", cand.UserID.String(), "error", err)
-	}
-}
-
-// notifyHalt lands the ci_autofix_halted inbox row for the ref's owner
-// (best-effort, nil-safe). No RunID (no run was started). Slack is nil for the same
-// reason notifyStarted's is — see there.
+// notifyHalt lands the ci_autofix_halted notification for the ref's owner
+// (best-effort, nil-safe). No RunID (no run was started). The halt is actionable (the
+// owner now presses Fix CI themselves), so it also DMs on Slack (PRD #1650 D3), linking
+// to the failing pipeline. The halt_notified latch the caller sets first keeps this to
+// one notification per halt.
+//
+// The ref (a forge branch name) and the reason go into Body RAW: the notifier's
+// SlackMrkdwn owns their escaping, and escaping here too would double-escape them. The
+// pipeline URL is forge-supplied, so it becomes the link only when notifysvc.SafeLinkURL
+// accepts it; otherwise the DM goes out without a link.
 func (d *CIAutoFix) notifyHalt(ctx context.Context, cand store.ListCIAutofixCandidateRefsRow, iid int64, reason string) {
 	if d.notifier == nil {
 		return
 	}
+	ref := cand.Ref.String
 	if _, err := d.notifier.Notify(ctx, notifysvc.Notification{
 		UserID:  cand.UserID,
 		Kind:    "ci_autofix_halted",
-		Payload: notifysvc.CIAutofixPayload{Ref: cand.Ref.String, PipelineWebURL: cand.PipelineWebUrl, IssueIID: iid, Reason: reason},
+		Payload: notifysvc.CIAutofixPayload{Ref: ref, PipelineWebURL: cand.PipelineWebUrl, IssueIID: iid, Reason: reason},
 		RunID:   nil,
-		Slack:   nil,
+		Slack: &notifysvc.SlackRender{
+			Emoji:     "🛑",
+			Title:     "CI auto-fix stopped",
+			Body:      "uzi stopped fixing CI automatically on " + ref + ": " + reason + ". Use Fix CI in uzi to try again yourself.",
+			Link:      notifysvc.SafeLinkURL(cand.PipelineWebUrl),
+			LinkLabel: "Open the pipeline",
+		},
 	}); err != nil {
 		slog.Warn("poller: ci-autofix notify halt", "user", cand.UserID.String(), "error", err)
 	}

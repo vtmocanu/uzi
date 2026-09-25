@@ -602,27 +602,17 @@ func run() error {
 	// (reusing its per-user opt-in gating + drain goroutine via a separate queue).
 	// M3+ tenants (the judge) call notifier.Notify; the M2 REST read endpoints go
 	// straight to the store, so the handler only needs the seam wired for future
-	// producers. Built before SetBroadcaster because failNotifier (below) writes
-	// through it and joins the broadcast fan-out.
+	// producers.
 	notifier := notifysvc.New(q, slackNotifier, notifysvc.DefaultUserCap, slog.Default())
-
-	// Run-failure inbox notifier (PRD #284 M5): a Broadcaster that lands an inbox
-	// notification when a run transitions to "failed", so a user WITHOUT Slack gets
-	// a badge on failure (the slacksvc ❌ DM only reaches opted-in users). It writes
-	// through notifier with Slack == nil (inbox-only — no double-DM), and sits in
-	// the MultiBroadcaster so it covers worker-reported AND sweep-driven failures
-	// uniformly. PublishState never blocks; a drain goroutine (below) does the work.
-	// CI-autofix landed notification (PRD #71 M6): when a ci_fix run's fix pipeline
-	// goes green on a ref that had an auto-fix ledger, forgesvc lands an inbox row for
-	// the owner. Nil-safe; wired here so the sync's reset-on-green path can reach it.
-	svc.SetNotifier(notifier)
 
 	// Wire the mid-flight mr_rework abort (#853): when the MR-close watcher observes a
 	// merge/close, cancel any in-flight rework for that MR through workersvc's cancel path.
 	svc.SetReworkCanceller(wsvc)
 
-	failNotifier := notifysvc.NewRunFailureNotifier(q, notifier, slog.Default())
-	wsvc.SetBroadcaster(workersvc.MultiBroadcaster{liveHub, slackNotifier, failNotifier})
+	// A failed run lands no notification row (PRD #1650 D2): the slacksvc failed-run DM
+	// (notifier_state.go) reaches Slack-linked users, and the run page plus the Runs list
+	// carry the signal for everyone else.
+	wsvc.SetBroadcaster(workersvc.MultiBroadcaster{liveHub, slackNotifier})
 
 	// Admin-health loop-beat registry (PRD #1484 M2, D8): ONE registry, built here before
 	// the four background loops so each can be Registered with its effective interval and
@@ -806,7 +796,7 @@ func run() error {
 	wsvc.SetRepoGuard(pcheck)
 
 	var bgWG sync.WaitGroup
-	bgWG.Add(6)
+	bgWG.Add(5)
 	go func() {
 		defer bgWG.Done()
 		engine.Run(ctx)
@@ -826,10 +816,6 @@ func run() error {
 	go func() {
 		defer bgWG.Done()
 		slackNotifier.Run(ctx)
-	}()
-	go func() {
-		defer bgWG.Done()
-		failNotifier.Run(ctx)
 	}()
 	if cfg.PrivilegeCheckInterval > 0 {
 		privSweep := privcheck.NewEngine(pcheck, cfg.PrivilegeCheckInterval)

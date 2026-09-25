@@ -210,9 +210,6 @@ func (s *notifyingSpyStore) InsertNotification(_ context.Context, arg store.Inse
 func (s *notifyingSpyStore) PruneNotificationsForUser(context.Context, store.PruneNotificationsForUserParams) (int64, error) {
 	return 0, nil
 }
-func (s *notifyingSpyStore) GetRunByID(context.Context, uuid.UUID) (store.Run, error) {
-	return store.Run{}, nil
-}
 func (s *notifyingSpyStore) FindUnreadNotificationForRunKind(context.Context, store.FindUnreadNotificationForRunKindParams) (store.Notification, error) {
 	return store.Notification{}, pgx.ErrNoRows
 }

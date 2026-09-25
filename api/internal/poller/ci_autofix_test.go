@@ -178,6 +178,7 @@ type cfNotifyCall struct {
 	userID  uuid.UUID
 	runID   *uuid.UUID
 	payload notifysvc.CIAutofixPayload
+	slack   *notifysvc.SlackRender
 }
 
 type cfNotifier struct {
@@ -188,7 +189,7 @@ type cfNotifier struct {
 
 func (n *cfNotifier) Notify(_ context.Context, note notifysvc.Notification) (store.Notification, error) {
 	p, _ := note.Payload.(notifysvc.CIAutofixPayload)
-	n.calls = append(n.calls, cfNotifyCall{note.Kind, note.UserID, note.RunID, p})
+	n.calls = append(n.calls, cfNotifyCall{note.Kind, note.UserID, note.RunID, p, note.Slack})
 	if n.ops != nil {
 		*n.ops = append(*n.ops, "notify")
 	}
@@ -352,12 +353,14 @@ func TestCIAutofixProceedStartsRun(t *testing.T) {
 	if len(f.notes) != 1 || !strings.Contains(f.notes[0].body, "Automatic CI fix started") {
 		t.Fatalf("expected one start comment, got %+v", f.notes)
 	}
-	if len(notifier.calls) != 1 || notifier.calls[0].kind != "ci_autofix_started" || notifier.calls[0].runID == nil {
-		t.Fatalf("expected one started notification anchored to the run, got %+v", notifier.calls)
+	// PRD #1650 D2: a started auto-fix is a status-only event, so it lands NO notification
+	// (the forge comment above and the run itself carry it).
+	if len(notifier.calls) != 0 {
+		t.Fatalf("a started auto-fix must not notify, got %+v", notifier.calls)
 	}
-	// create → upsert → comment → notify.
-	if strings.Join(ops, ",") != "create,upsert,comment,notify" {
-		t.Fatalf("op order = %v, want [create upsert comment notify]", ops)
+	// create → upsert → comment, and nothing after.
+	if strings.Join(ops, ",") != "create,upsert,comment" {
+		t.Fatalf("op order = %v, want [create upsert comment]", ops)
 	}
 }
 
@@ -554,7 +557,7 @@ func TestCIAutofixIssuelessBranchFiresNoComment(t *testing.T) {
 	// PRD #908 M2: a scheduled-run branch (`uzi/prompt-…`, `uzi/self-improve/…`) does not
 	// parse to an issue iid, and the detector now PROCESSES it — the ci_fix run still fires;
 	// only the issue comment (CreateIssueNote) is suppressed, since there is no issue to
-	// comment on. The started notification still fires. (The old test asserted the OPPOSITE
+	// comment on. It lands no started notification (PRD #1650 D2). (The old test asserted the OPPOSITE
 	// — that an unparseable ref was skipped entirely — which M2 made semantically wrong.)
 	cand := cfCand(9001)
 	cand.Ref = pgtype.Text{String: "uzi/prompt-" + uuid.NewString(), Valid: true}
@@ -579,12 +582,9 @@ func TestCIAutofixIssuelessBranchFiresNoComment(t *testing.T) {
 	if len(f.notes) != 0 {
 		t.Fatalf("an issueless branch must post NO issue comment, got %+v", f.notes)
 	}
-	// The started notification still fires (issue iid 0 in the payload).
-	if len(notifier.calls) != 1 || notifier.calls[0].kind != "ci_autofix_started" || notifier.calls[0].runID == nil {
-		t.Fatalf("expected one started notification anchored to the run, got %+v", notifier.calls)
-	}
-	if notifier.calls[0].payload.IssueIID != 0 {
-		t.Fatalf("issueless branch notification IssueIID = %d, want 0", notifier.calls[0].payload.IssueIID)
+	// No started notification either (PRD #1650 D2): the run is the signal.
+	if len(notifier.calls) != 0 {
+		t.Fatalf("an issueless started auto-fix must not notify, got %+v", notifier.calls)
 	}
 }
 

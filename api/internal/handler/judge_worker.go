@@ -404,9 +404,7 @@ func recommendationCategories(recs []workersvc.ReviewRecommendation) []string {
 // no Slack digest (Decision 5, user-decided); only the destination moves.
 //
 // This function is judge-only by construction — it is called from exactly one place, the
-// judge review notification — which is why it is a plain URL change here and a
-// kind-conditional guard in the web inbox (see web/src/lib/notifications.ts, where the
-// same link is computed for a surface that renders EVERY kind).
+// judge review notification — which is why it is a plain URL change here.
 func reviewDeepLink(baseURL string, targetID uuid.UUID) string {
 	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
 	if baseURL == "" {

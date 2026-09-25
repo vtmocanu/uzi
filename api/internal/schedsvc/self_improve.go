@@ -107,8 +107,8 @@ func (e *Scheduler) fireSelfImprove(ctx context.Context, sched store.RunSchedule
 	// once the vault is unlocked. A nil vault is treated as always unlocked (a deployment
 	// without the vault), mirroring the bespoke engine.
 	if e.vault != nil && !e.vault.Unlocked(sched.UserID) {
-		e.notifySelfImprove(ctx, sched.UserID, "selfimprove_skipped", "Self-improvement cycle skipped",
-			"Your vault is locked, so this self-improvement cycle was skipped — it can't spend your token while locked. It will try again at the next scheduled time; unlock your vault before then so it isn't skipped again.", nil)
+		e.notifySelfImproveSkipped(ctx, sched.UserID,
+			"Your vault is locked, so this self-improvement cycle was skipped — it can't spend your token while locked. It will try again at the next scheduled time; unlock your vault before then so it isn't skipped again.")
 		return FireOutcome{Matched: 1, Skips: []Skip{{Reason: SkipVaultLocked}}}, nil
 	}
 
@@ -151,8 +151,8 @@ func (e *Scheduler) fireSelfImprove(ctx context.Context, sched store.RunSchedule
 		}
 	}
 	if openMRs >= selfImproveMaxOpenMRs {
-		e.notifySelfImprove(ctx, sched.UserID, "selfimprove_skipped", "Self-improvement cycle skipped",
-			"This self-improvement cycle was skipped: the open-MR cap reached its limit for this repo. Review and merge or close an outstanding self-improvement merge request, and the next scheduled cycle will fire.", nil)
+		e.notifySelfImproveSkipped(ctx, sched.UserID,
+			"This self-improvement cycle was skipped: the open-MR cap reached its limit for this repo. Review and merge or close an outstanding self-improvement merge request, and the next scheduled cycle will fire.")
 		e.logger.Info("scheduler: self_improve open-MR cap reached, skipping fire", "schedule", sched.ID.String(), "open_mrs", openMRs)
 		return FireOutcome{Matched: 1, Skips: []Skip{{Reason: SkipSelfImproveMRCapReached}}}, nil
 	}
@@ -210,26 +210,24 @@ func (e *Scheduler) fireSelfImprove(ctx context.Context, sched store.RunSchedule
 		}
 	}
 
-	// 9. Started notification to the owner.
-	runID := run.ID
-	e.notifySelfImprove(ctx, sched.UserID, "selfimprove_started", "Self-improvement run started",
-		"A self-improvement run has started on "+repo.PathWithNamespace+". It will open a merge request; review its plan in the run view.", &runID)
+	// No started notification (PRD #1650 D2): a started run is status-only, and the run
+	// itself plus the merge request it opens carry it.
 	e.logger.Info("scheduler: self_improve cycle started", "schedule", sched.ID.String(), "run", run.ID.String(), "recommendations", len(recs))
 	return FireOutcome{Matched: 1, Started: []Started{{RunID: run.ID, Title: selfImproveTrackingTitle}}}, nil
 }
 
-// notifySelfImprove emits one self-improvement inbox notification (persist-first,
-// best-effort Slack), nil-safe on the notifier. runID is nil for a skip and the started
-// run for a start. The kind strings are load-bearing wire values ("selfimprove_started" /
-// "selfimprove_skipped"), unchanged from the bespoke engine.
-func (e *Scheduler) notifySelfImprove(ctx context.Context, userID uuid.UUID, kind, title, body string, runID *uuid.UUID) {
+// notifySelfImproveSkipped emits one selfimprove_skipped notification (persist-first,
+// best-effort Slack), nil-safe on the notifier. The kind string is a load-bearing wire
+// value, unchanged from the bespoke engine. It is the only self-improvement notification
+// left: the selfimprove_started one was retired as status-only (PRD #1650 D2).
+func (e *Scheduler) notifySelfImproveSkipped(ctx context.Context, userID uuid.UUID, body string) {
 	if e.notifier == nil {
 		return
 	}
+	const kind, title = "selfimprove_skipped", "Self-improvement cycle skipped"
 	if _, err := e.notifier.Notify(ctx, notifysvc.Notification{
 		UserID:  userID,
 		Kind:    kind,
-		RunID:   runID,
 		Payload: map[string]any{"title": title, "body": body},
 		Slack:   &notifysvc.SlackRender{Emoji: "🔧", Title: title, Body: body},
 	}); err != nil {

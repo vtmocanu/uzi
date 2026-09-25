@@ -106,10 +106,6 @@ func (s *countingNotifStore) PruneNotificationsForUser(context.Context, store.Pr
 	return 0, nil
 }
 
-func (s *countingNotifStore) GetRunByID(context.Context, uuid.UUID) (store.Run, error) {
-	return store.Run{}, nil
-}
-
 // The PRD #333 coalescing pair, unused by the guard-role path but required to satisfy the
 // widened notifysvc.Store interface. Find reports "no coalescible row" so any accidental
 // caller takes the insert branch rather than a phantom hit.

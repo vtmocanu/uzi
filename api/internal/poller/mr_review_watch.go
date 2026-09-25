@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -47,13 +48,17 @@ type MRReviewNotifier interface {
 }
 
 // MRReworkSettings resolves the two admin gates the watcher needs (PRD #700 M5
-// Decision 5): the global kill-switch and the per-MR capLimit. *settings.Cache satisfies
-// it. MrReworkEnabled is DELIBERATELY three-state and error-propagating (see its
+// Decision 5): the global kill-switch and the per-MR capLimit, plus the public base URL
+// the halt DM links from (PRD #1650 D3). *settings.Cache satisfies it. MrReworkEnabled is DELIBERATELY three-state and error-propagating (see its
 // doc): the detector maps a non-nil error to OFF (fail closed), so a settings-read
 // blip never fails OPEN into auto-reworking every MR.
 type MRReworkSettings interface {
 	MrReworkEnabled(ctx context.Context) (bool, error)
 	MrReworkCap(ctx context.Context) (int, error)
+	// PublicBaseURL is the operator-set public base URL the mr_rework_halted Slack DM
+	// builds its run deep link from (PRD #1650 D3). An empty value or an error yields a
+	// DM with no link, never a dropped notification.
+	PublicBaseURL(ctx context.Context) (string, error)
 }
 
 // MRReviewWatch is the poller's post-SyncMRStates MR-review-rework detector (PRD #700
@@ -303,29 +308,56 @@ func (d *MRReviewWatch) detectOne(ctx context.Context, r store.ListEnabledReposW
 	}
 }
 
-// notifyHalt lands the mr_rework_halted inbox row for the MR owner (best-effort,
-// nil-safe). It anchors the row to the SOURCE run (PRD #1202 D10) so the inbox row links
-// to the run page — where the owner can now press "Rework now" past the cap; the web's
-// notificationLink turns any kind carrying a run_id into a /runs/<id> link. Slack is nil
-// (inbox-only), mirroring the ci-autofix halt notification.
+// notifyHalt lands the mr_rework_halted notification for the MR owner (best-effort,
+// nil-safe). It anchors the row to the SOURCE run (PRD #1202 D10), where the owner can
+// now press "Rework now" past the cap. The halt is actionable, so it also DMs on Slack
+// (PRD #1650 D3), linking to that run page; the halt_notified latch the caller sets
+// first keeps this to one DM per halt.
+//
+// The ref (a forge branch name) goes into Body RAW: the notifier's SlackMrkdwn owns its
+// escaping, and escaping here too would double-escape it. The cap is an int, so it may
+// ride in the trusted Facts. The run link is built from the operator-set public base
+// URL; an unset base or a failed read drops the link, never the notification.
 func (d *MRReviewWatch) notifyHalt(ctx context.Context, cand store.ListMRReworkCandidatesRow, issueIID int64, capLimit int) {
 	if d.notifier == nil {
 		return
 	}
 	runID := cand.SourceRunID
+	ref := cand.Ref.String
+	base, err := d.set.PublicBaseURL(ctx)
+	if err != nil {
+		slog.Warn("poller: mr-rework halt DM public base URL read (sending without a link)", "error", err)
+		base = ""
+	}
 	if _, err := d.notifier.Notify(ctx, notifysvc.Notification{
 		UserID: cand.UserID,
 		Kind:   "mr_rework_halted",
 		Payload: notifysvc.CIAutofixPayload{
-			Ref:      cand.Ref.String,
+			Ref:      ref,
 			IssueIID: issueIID,
 			Reason:   fmt.Sprintf("reached the %d-cycle MR rework limit", capLimit),
 		},
 		RunID: &runID,
-		Slack: nil,
+		Slack: &notifysvc.SlackRender{
+			Emoji: "✋",
+			Title: "MR rework stopped",
+			Body:  "uzi stopped reworking review comments automatically on " + ref + ". To run another cycle, press Rework now on the run page.",
+			Link:  runPageLink(base, runID),
+			Facts: []string{fmt.Sprintf("`%d`-cycle limit", capLimit)},
+		},
 	}); err != nil {
 		slog.Warn("poller: mr-rework notify halt", "user", cand.UserID.String(), "error", err)
 	}
+}
+
+// runPageLink builds the run page deep link from the operator-set public base URL,
+// mirroring the handler's runDeepLink: an empty base yields "" (no link).
+func runPageLink(baseURL string, runID uuid.UUID) string {
+	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if baseURL == "" {
+		return ""
+	}
+	return baseURL + "/runs/" + runID.String()
 }
 
 // mrReworkHaltCommentBody is the user-facing forge comment posted on the issue when an

@@ -74,9 +74,10 @@ var neverJudgeFailOrigins = map[string]bool{
 // publish failure — a spend/accuracy footgun, NOT a security boundary (contrast guardrail_blocked,
 // which gates a security classification, and forge_unreachable, which is server-derived). These
 // three are already trusted worker-reported values that set preserved_patch / display today, so no
-// new trust is conferred. The deterministic failure NOTIFICATION is unaffected: each arrives as a
-// worker-reported `failed` SetState transition that fires PublishState(runID,"failed") BEFORE
-// maybeEnqueueJudge, and RunFailureNotifier notifies off that, exactly as for the infra origins.
+// new trust is conferred. The failure SIGNAL is unaffected: each arrives as a worker-reported
+// `failed` SetState transition that fires PublishState(runID,"failed") BEFORE maybeEnqueueJudge;
+// the slacksvc failed-run DM (slacksvc/notifier_state.go) reacts to that for Slack-linked users,
+// and the run page and Runs list show the failure to everyone, exactly as for the infra origins.
 //
 // history_rewritten is DELIBERATELY NOT a member: uzi never force-pushes, so a branch rewritten
 // below the published tip is an AGENT DEFECT (the agent rewrote published history against the
@@ -196,24 +197,23 @@ func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 	// This is the ACCURACY+SPEND fix: such a failure has no agent behavior to review, and
 	// skipping avoids the most expensive per-run call (opus) on a run that did nothing.
 	//
-	// DETERMINISTIC INFRA NOTIFICATION — delivered here by the EXISTING RunFailureNotifier,
-	// NOT injected. The judge is a REPLACEMENT for these runs, not an addition, so they still
-	// owe a failure notification. Every path that reaches this gate — the worker-reported
-	// SetState terminal transition for the three infra origins, AND SetState's own forge-park
-	// transaction for forge_unreachable — fires s.bcast.PublishState(runID,"failed") BEFORE
-	// calling maybeEnqueueJudge; the RunFailureNotifier subscribes to that PublishState and
-	// notifies every non-cancelled/non-plan_rejected failure (infra included), so the
-	// notification has already been delivered on the SAME transition and this gate need only
-	// skip the judge. (The server-side claim-assembly failer that also stamps the three infra
-	// origins via MarkRunFailedByID never calls maybeEnqueueJudge at all, so it is not
-	// gate-reachable; it notifies through its own s.notify.) No notifysvc injection is possible
-	// anyway — notifysvc imports workersvc (RunFailureNotifier is a workersvc.Broadcaster), so
-	// injecting it would create an import cycle.
+	// DETERMINISTIC INFRA FAILURE SIGNAL — carried by the EXISTING broadcast, NOT injected.
+	// The judge is a REPLACEMENT for these runs, not an addition, so the failure must still
+	// surface. Every path that reaches this gate — the worker-reported SetState terminal
+	// transition for the three infra origins, AND SetState's own forge-park transaction for
+	// forge_unreachable — fires s.bcast.PublishState(runID,"failed") BEFORE calling
+	// maybeEnqueueJudge. On that SAME transition the slacksvc failed-run DM
+	// (slacksvc/notifier_state.go) reaches Slack-linked users, and the run page and the Runs
+	// list carry the failure for everyone (no notification row is written for a failed run,
+	// PRD #1650 D2), so this gate need only skip the judge. (The server-side claim-assembly
+	// failer that also stamps the three infra origins via MarkRunFailedByID never calls
+	// maybeEnqueueJudge at all, so it is not gate-reachable; it signals through its own
+	// s.notify.)
 	if run.Status == "failed" && run.FailOrigin.Valid &&
 		(neverJudgeFailOrigins[run.FailOrigin.String] ||
 			envPublishFailOrigins[run.FailOrigin.String] ||
 			(run.IterationCount == 0 && preStartInfraFailOrigins[run.FailOrigin.String])) {
-		slog.Debug("judge enqueue: server-derived / environment-caused publish / pre-start infra failure, skipping judge (deterministic notification delivered by RunFailureNotifier on the same transition)",
+		slog.Debug("judge enqueue: server-derived / environment-caused publish / pre-start infra failure, skipping judge (failure surfaced by the failed-run broadcast on the same transition)",
 			"run", run.ID, "fail_origin", run.FailOrigin.String)
 		return
 	}
