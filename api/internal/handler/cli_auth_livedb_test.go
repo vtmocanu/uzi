@@ -263,6 +263,84 @@ func cliCSRFHeader(t *testing.T, jwt string) string {
 	return enc.EncodeToString(nonce) + "." + enc.EncodeToString(mac.Sum(nil))
 }
 
+// TestCLIUsageBearerSelfScopeLiveDB exercises the real router and SQL owner filter.
+// Distinct outcomes make a cross-user aggregate observable even without metered runs.
+func TestCLIUsageBearerSelfScopeLiveDB(t *testing.T) {
+	_, router, pool := cliLiveDB(t)
+	admin := cliSeedUser(t, pool, true)
+	other := cliSeedUser(t, pool, false)
+	for _, fixture := range []struct {
+		user   uuid.UUID
+		status string
+	}{
+		{admin, "completed"},
+		{other, "failed"},
+	} {
+		repo := cliSeedOwnedRepo(t, pool, fixture.user)
+		cliMustExec(t, pool,
+			`INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, status, kind)
+			 VALUES ($1, $2, $3, 42, 'usage scope', 'fixture', $4, 'issue')`,
+			uuid.New(), fixture.user, repo, fixture.status)
+	}
+	adminUzc := cliMintToken(t, pool, admin, clitoken.ScopeUser)
+	otherUzc := cliMintToken(t, pool, other, clitoken.ScopeUser)
+	adminUza := cliMintToken(t, pool, admin, clitoken.ScopeAdminRO)
+	adminJWT := cliMintJWT(t, pool, admin)
+
+	checkUsage := func(label string, rec *httptest.ResponseRecorder, completed, failed int64) {
+		t.Helper()
+		if rec.Code != http.StatusOK {
+			t.Errorf("%s /api/usage = %d, want 200; body: %s", label, rec.Code, rec.Body.String())
+			return
+		}
+		var body struct {
+			Outcomes struct {
+				Lifetime struct {
+					Finished  int64 `json:"finished"`
+					Completed int64 `json:"completed"`
+					Failed    int64 `json:"failed"`
+				} `json:"lifetime"`
+				Last7Days struct {
+					Finished  int64 `json:"finished"`
+					Completed int64 `json:"completed"`
+					Failed    int64 `json:"failed"`
+				} `json:"last_7_days"`
+			} `json:"outcomes"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Errorf("%s decode /api/usage: %v; body: %s", label, err, rec.Body.String())
+			return
+		}
+		for window, got := range map[string]struct{ finished, completed, failed int64 }{
+			"lifetime": {body.Outcomes.Lifetime.Finished, body.Outcomes.Lifetime.Completed, body.Outcomes.Lifetime.Failed},
+			"last7":    {body.Outcomes.Last7Days.Finished, body.Outcomes.Last7Days.Completed, body.Outcomes.Last7Days.Failed},
+		} {
+			if got.finished != 1 || got.completed != completed || got.failed != failed {
+				t.Errorf("%s %s outcomes = %+v, want finished=1 completed=%d failed=%d", label, window, got, completed, failed)
+			}
+		}
+	}
+	checkUsage("admin uzc_", bearerReq(router, http.MethodGet, "/api/usage", adminUzc), 1, 0)
+	checkUsage("other uzc_", bearerReq(router, http.MethodGet, "/api/usage", otherUzc), 0, 1)
+	checkUsage("admin uza_ self scope", bearerReq(router, http.MethodGet, "/api/usage", adminUza), 1, 0)
+	checkUsage("admin cookie", cookieReq(t, router, http.MethodGet, "/api/usage", adminJWT, ""), 1, 0)
+
+	if rec := bearerReq(router, http.MethodGet, "/api/usage", ""); rec.Code != http.StatusUnauthorized {
+		t.Errorf("no auth /api/usage = %d, want 401; body: %s", rec.Code, rec.Body.String())
+	}
+	if rec := bearerReq(router, http.MethodGet, "/api/chats", adminUzc); rec.Code != http.StatusUnauthorized {
+		t.Errorf("uzc_ /api/chats = %d, want 401; body: %s", rec.Code, rec.Body.String())
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/usage", nil)
+	req.AddCookie(&http.Cookie{Name: auth.AuthCookieName, Value: adminJWT})
+	req.Header.Set("Authorization", "Bearer malformed")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("malformed bearer with valid cookie /api/usage = %d, want 401; body: %s", rec.Code, rec.Body.String())
+	}
+}
+
 // -------------------------------------------------------------------------
 // (a) The load-bearing trio: an admin's uzc_ gets 404 on ANOTHER user's run,
 // messages, AND review — the review fixture JUDGED — while the owner's token and
