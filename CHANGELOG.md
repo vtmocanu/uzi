@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Fixed
+
+- **Run-list rows align the harness logo with the badges and keep the activity age beside its step ([#1708](https://github.com/vtmocanu/uzi/pull/1708)).**
+  The row's meta items now use consistent separators and typography, while long live-activity text still truncates cleanly and invalid activity timestamps show no age.
+
 ## [0.84.0] - 2026-09-20
 
 ### Added
