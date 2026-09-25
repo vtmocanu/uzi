@@ -122,6 +122,16 @@ Remove "Codex runs are not checked" everywhere listed under *Resolved facts*; ru
 
 M1 → M2 → (M3, M4) → M5 → M6 → M7. M5 and M6 ship in one PR (D8).
 
+### Delivery status (2026-09-25)
+
+- [ ] M1: the shared core is implemented and the existing SDK and runner completion tests passed unchanged, but `task gate:agent` remains red in unrelated process-spawn and ENOENT tests.
+- [x] M2: Codex attempt, same-thread nudge, owner question, and budget routing are implemented and covered by focused tests.
+- [x] M3: post-attempt wall and idle hold routing, timer races, and hold refusal are covered by focused tests.
+- [x] M4: completion-held Codex resume adopts the claimed thread; missing and rejected session fallbacks and Claude behavior are covered by focused tests.
+- [ ] M5: capability advertisement, claim and peer predicates, and queued-health intersection are implemented; the named live-DB tests could not run locally and need CI `test-api-store-it` evidence.
+- [ ] M6: create-time Codex stamping, seeded-run behavior, and switch-off behavior are implemented; the named live-DB tests could not run locally and need CI `test-api-store-it` evidence.
+- [x] M7: admin copy, docs, ADR, spec, and comments are updated; `task docs:sync`, `task gate:web`, `task check-docs:web`, and `task gate:api` passed.
+
 ### What runs where
 
 - **On the worker**: `task gate:agent`, `task gate:web`, `task check-docs:web`, `task docs:sync`, `sqlc generate` and `task gate:api`. `go run` fetches the pinned sqlc through the Go module proxy, which is package-cache egress the worker allows; if it cannot, report exit 2 from `check:sqlc-drift` in the PR rather than skipping it.
