@@ -749,9 +749,11 @@ function advanceShellExpression(command: string, pos: number, stack: ShellExpres
       if (--top.parens === 0) stack.pop();
       return pos + 1;
     }
-  } else if (top?.kind === "parameter" && command[pos] === "}") {
-    stack.pop();
-    return pos + 1;
+  } else if (top?.kind === "parameter") {
+    if (command[pos] === "}") { stack.pop(); return pos + 1; }
+    // These belong to `${…}` text, not an enclosing command substitution.
+    // Nested `$(`, `${` and `$((` were handled above or by the caller.
+    if (command[pos] === "(" || command[pos] === ")") return pos + 1;
   }
   return undefined;
 }
