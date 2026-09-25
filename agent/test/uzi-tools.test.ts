@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { makeUziToolHandlers, uziToolNames, wrapEvidence, UZI_TOOLS_SERVER_NAME } from "../src/uzi-tools.js";
+import { buildUziToolsServer, makeUziToolHandlers, uziToolNames, wrapEvidence, UZI_TOOLS_SERVER_NAME } from "../src/uzi-tools.js";
 import { RequestError, type WorkerClient } from "../src/client.js";
 import type { EmittedMessage } from "../src/executor.js";
 import type { WorkerRunDetail, WorkerRunListItem, WorkerRunMessage, WorkerProposal } from "../src/protocol.js";
@@ -380,5 +380,47 @@ describe("uzi tool wiring", () => {
       "mcp__uzi__cancel_run",
       "mcp__uzi__steer_run",
     ]);
+  });
+});
+
+// Issue #1629: an issue is runnable when it carries the instance's configured run label
+// (admin-renamable) OR is assigned to the uzi bot account, so the tool copy must not
+// claim a hardcoded `PRD` label or a prds/*.md link is what makes it runnable.
+describe("uzi tool copy — runnability wording (issue #1629)", () => {
+  type Registered = { description: string; inputSchema?: unknown };
+  const registered = (): Record<string, Registered> => {
+    const { server } = buildUziToolsServer({ client: fakeClient().client, runId: "chat-current", emit: () => {}, log: nullLogger() });
+    return (server as unknown as { instance: { _registeredTools: Record<string, Registered> } }).instance._registeredTools;
+  };
+  const assertRunnableWording = (text: string, what: string) => {
+    assert.doesNotMatch(text, /`PRD` label/, `${what}: no hardcoded PRD label`);
+    assert.doesNotMatch(text, /PRD label/, `${what}: no hardcoded PRD label`);
+    assert.doesNotMatch(text, /prds\/\*\.md link/, `${what}: no prds/*.md link requirement`);
+    assert.doesNotMatch(text, /\(PRD\) task/, `${what}: no "(PRD) task"`);
+    assert.match(text, /run label/, `${what}: names the instance's run label`);
+    assert.match(text, /bot account/, `${what}: names bot-account assignment`);
+  };
+
+  it("propose_issue and start_run descriptions name the run label or bot assignment", () => {
+    const tools = registered();
+    assertRunnableWording(tools.propose_issue!.description, "propose_issue");
+    assertRunnableWording(tools.start_run!.description, "start_run");
+    assert.match(tools.propose_issue!.description, /exact name/, "asks the user for the label's exact name");
+  });
+
+  it("propose_issue's labels field no longer suggests PRD and names the run label", () => {
+    const shape = (registered().propose_issue!.inputSchema as { shape: Record<string, { description?: string }> }).shape;
+    const desc = shape.labels!.description ?? "";
+    assert.doesNotMatch(desc, /suggest `PRD`/);
+    assert.match(desc, /run label/);
+    assert.match(desc, /never guess/);
+  });
+
+  it("the start_run result text names the run label or bot assignment, not a (PRD) task", async () => {
+    const { h } = handlersWith(fakeClient().client);
+    const text = bodyText(await h.startRun({ repo_path: "group/project", issue_iid: 42 }));
+    assert.doesNotMatch(text, /runnable \(PRD\) task/);
+    assert.match(text, /run label/);
+    assert.match(text, /bot account/);
   });
 });

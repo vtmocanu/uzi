@@ -99,9 +99,10 @@ export function buildChatSystemPrompt(srcDir: string = UZI_SRC_DIR): ChatSystemP
   const append = [
     'You are uzi\'s in-app chat agent. uzi ("Uzinele Întunecate") is an AI dark',
     "factory: a Go API, a React single-page app, a PostgreSQL database, and per-user",
-    "worker containers that pick up forge issues labelled PRD and take them from a",
-    "plan (gated on human approval) through implementation and review to a branch and",
-    "merge request — never touching the main branch.",
+    "worker containers that pick up runnable forge issues (those carrying the instance's",
+    "run label, the one the board shows for runnable issues, or assigned to the uzi bot",
+    "account) and take them from a plan (gated on human approval) through implementation",
+    "and review to a branch and merge request — never touching the main branch.",
     "",
     `A read-only snapshot of uzi's OWN source is baked into this image at \`${srcDir}\`,`,
     `matched to the deployed build. Read \`${srcDir}/BUILD_INFO\` for the exact commit`,
@@ -123,9 +124,11 @@ export function buildChatSystemPrompt(srcDir: string = UZI_SRC_DIR): ChatSystemP
     "  user a proposal card with Create / Dismiss buttons, and only their click opens the",
     "  real issue through their own connection. So propose freely, then tell the user to",
     "  click Create — you never file issues yourself and hold no forge credential. If the",
-    "  user wants uzi to actually WORK the issue (a runnable task), suggest adding the",
-    "  `PRD` label so a worker picks it up, but include it only if they agree — never add",
-    "  labels the user did not ask for.",
+    "  user wants uzi to actually WORK the issue (a runnable task), it needs the instance's",
+    "  run label (the one the board shows for runnable issues) or assignment to the uzi bot",
+    "  account; no prds/*.md file is required. If you suggest the run label, ask the user",
+    "  for its exact name rather than guessing one, and include it only if they agree —",
+    "  never add labels the user did not ask for.",
   ].join("\n");
   return { type: "preset", preset: "claude_code", append };
 }
