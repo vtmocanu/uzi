@@ -42,8 +42,10 @@
 #      --continue`, then re-run with --skip-rebase. A stop whose ONLY conflicted path is
 #      CHANGELOG.md is resolved automatically (changelog-union.sh keeps both sides) and the
 #      rebase continued, commit by commit; the CHANGELOG guard (exit 9) still runs after.
-#      The helper refuses (so this stays exit 5) when any line or heading appears on both
-#      sides of one conflict block, or the union would repeat a `## [<version>]` heading.
+#      The helper refuses (so this stays exit 5) when a bullet, continuation line or `## `
+#      heading appears on both sides of one conflict block (a shared `### ` subsection
+#      heading under [Unreleased] is allowed and folded), or the union would repeat a
+#      `## [<version>]` heading.
 #      After every completed rebase that leaves CHANGELOG.md in the branch diff, repeated
 #      `### <Section>` headings under [Unreleased] are collapsed in a separate
 #      "chore: collapse duplicate CHANGELOG section headings" commit (only if it changes
@@ -85,7 +87,7 @@ while [ $# -gt 0 ]; do
     --no-rework-check) REWORK_CHECK=0; shift;;
     --allow-changelog-removals) ALLOW_CL_RM=1; shift;;
     --repo-root) ROOT="${2:?}"; shift 2;;
-    -h|--help) sed -n '2,74p' "$0"; exit 2;;
+    -h|--help) sed -n '2,76p' "$0"; exit 2;;
     -*) echo "unknown flag: $1" >&2; exit 2;;
     *) if [ -z "$REPO" ]; then REPO="$1"; elif [ -z "$PR" ]; then PR="$1"; else echo "unexpected arg: $1" >&2; exit 2; fi; shift;;
   esac

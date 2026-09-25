@@ -5,11 +5,13 @@
 # Usage: changelog-union.sh [--collapse] [FILE]      (default: CHANGELOG.md)
 #
 # Every conflict block keeps its first side, then its second; a diff3 base section
-# (`|||||||` .. `=======`) is dropped. FAIL-CLOSED: when any non-blank line (bullet or
-# heading) appears on BOTH sides of one conflict block, the union would duplicate it, so the
-# helper refuses and leaves the file for a human (land-prep then stops with exit 5). Inside `## [Unreleased]`, a repeated `### <Section>`
-# heading is collapsed into its first occurrence (its bullets move under it) and blank lines
-# left between bullet items are dropped. A file with no conflict markers is left untouched.
+# (`|||||||` .. `=======`) is dropped. FAIL-CLOSED: when a bullet, a continuation line or a
+# `## [...]` heading appears on BOTH sides of one conflict block, the union would duplicate
+# it, so the helper refuses and leaves the file for a human (land-prep then stops with exit
+# 5). A shared `### <Section>` subsection heading is allowed (each side bringing its own
+# `### Fixed` is the common case) only when the block sits inside `## [Unreleased]`: there
+# a repeated `### <Section>` is collapsed into its first occurrence (its bullets move under
+# it). Blank lines left between bullet items are dropped. A file with no conflict markers is left untouched.
 #
 # --collapse: for a marker-free file (a clean rebase can leave two `### Fixed` headings when a
 # commit adds its own next to the base's). Only a repeated `### <Section>` inside
@@ -19,7 +21,8 @@
 #
 # Verification before the file is replaced: no marker survives, the multiset of content
 # lines (non-blank, non-marker, non-heading) from the resolved sides is identical before and
-# after, the set of distinct headings is unchanged, and no `## [<version>]` heading
+# after, each paired with the `## ` section and `### ` subsection heading it sits under (so
+# no line changes section), the set of distinct headings is unchanged, and no `## [<version>]` heading
 # (`## [Unreleased]` included) occurs twice. Any miss leaves FILE untouched.
 #
 # Exit codes: 0 resolved / collapsed (or nothing to do), 1 verification failed or malformed
@@ -98,15 +101,20 @@ else
 # must keep (both sides and the unconflicted text; the diff3 base is dropped on purpose).
 if ! awk -v before="$tmpd/before" '
   BEGIN { st = 0 }  # 0 outside, 1 first side, 2 diff3 base, 3 second side
+  st == 0 && /^## / { unrel = ($0 ~ /^## \[Unreleased\]/) }
   /^<<<<<<<( |$)/ { if (st != 0) { bad = "nested <<<<<<< at line " NR; exit 1 } st = 1; next }
   /^[|]{7}( |$)/  { if (st != 1) { bad = "stray ||||||| at line " NR; exit 1 } st = 2; next }
   /^=======$/     { if (st != 1 && st != 2) { bad = "stray ======= at line " NR; exit 1 } st = 3; next }
   /^>>>>>>>( |$)/ {
     if (st != 3) { bad = "stray >>>>>>> at line " NR; exit 1 }
-    # A line on both sides would be written twice: refuse rather than guess a dedupe.
-    split("", seen)
-    for (i = 1; i <= na; i++) if (A[i] !~ /^[ \t]*$/) seen[A[i]] = 1
+    # A line on both sides would be written twice: refuse rather than guess a dedupe. Only
+    # a `### ` subsection heading may be shared, inside [Unreleased] with no `## ` heading in
+    # either side, where pass 2 folds the repeat into its first occurrence.
+    split("", seen); h2 = 0
+    for (i = 1; i <= na; i++) { if (A[i] !~ /^[ \t]*$/) seen[A[i]] = 1; if (A[i] ~ /^## /) h2 = 1 }
+    for (i = 1; i <= nb; i++) if (B[i] ~ /^## /) h2 = 1
     for (i = 1; i <= nb; i++) if (B[i] !~ /^[ \t]*$/ && (B[i] in seen)) {
+      if (B[i] ~ /^### / && unrel && !h2) continue
       bad = "line on both sides of the conflict ending at line " NR ": " B[i]; exit 1
     }
     st = 0; na = 0; nb = 0; next
@@ -178,10 +186,17 @@ fi
 if grep -Eq "$MARKER_RE" "$tmpd/out"; then
   echo "changelog-union: conflict markers remain; $FILE left untouched" >&2; exit 1
 fi
-content() { grep -Ev '^[[:space:]]*$' "$1" | grep -Ev '^#' | LC_ALL=C sort; }
+# Each content line with the `## ` and `### ` headings it sits under (trailing blanks trimmed).
+content() {
+  awk '{ t = $0; sub(/[ \t]+$/, "", t) }
+    t ~ /^## / { h2 = t; h3 = ""; next }
+    t ~ /^### / { h3 = t; next }
+    t ~ /^#/ || t == "" { next }
+    { print h2 " | " h3 " | " $0 }' "$1" | LC_ALL=C sort
+}
 headings() { grep -E '^#' "$1" | sed -E 's/[[:space:]]+$//' | LC_ALL=C sort -u; }
 if ! diff <(content "$tmpd/before") <(content "$tmpd/out") > "$tmpd/content.diff"; then
-  echo "changelog-union: content lines would change (< lost, > gained); $FILE left untouched:" >&2
+  echo "changelog-union: content lines or their sections would change (< lost, > gained); $FILE left untouched:" >&2
   cat "$tmpd/content.diff" >&2; exit 1
 fi
 if ! diff <(headings "$tmpd/before") <(headings "$tmpd/out") > "$tmpd/headings.diff"; then

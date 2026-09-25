@@ -251,6 +251,104 @@ printf '## [Unreleased]\n\n### Fixed\n\n<<<<<<< HEAD\n- **main only**\n=======\n
 bash "$SCRIPT" "$WORK/distinct.md" > "$WORK/distinct.out" 2>&1 || fail "distinct bullets did not union: $(cat "$WORK/distinct.out")"
 [ "$(printf '## [Unreleased]\n\n### Fixed\n\n- **main only**\n- **branch only**\n\n')" = "$(cat "$WORK/distinct.md"; echo)" ] || fail "distinct union wrong: $(cat "$WORK/distinct.md")"
 
+# 3f. The common real conflict (#1644): each side brings its own `### Fixed` section, one
+#     side also a `### Changed`. A shared `### ` subsection heading inside [Unreleased] is
+#     allowed: one `### Fixed` remains and every bullet stays under its own section.
+cat > "$WORK/sub.md" <<'EOF'
+## [Unreleased]
+
+### Added
+
+- **added**
+
+<<<<<<< HEAD
+### Fixed
+
+- **main fix**
+=======
+### Changed
+
+- **branch changed**
+
+### Fixed
+
+- **branch fix**
+>>>>>>> abc1234 (branch)
+
+## [0.1.0] - 2026-01-01
+
+- **old**
+EOF
+cat > "$WORK/sub.want" <<'EOF'
+## [Unreleased]
+
+### Added
+
+- **added**
+
+### Fixed
+
+- **main fix**
+- **branch fix**
+
+### Changed
+
+- **branch changed**
+
+## [0.1.0] - 2026-01-01
+
+- **old**
+EOF
+cp "$WORK/sub.md" "$WORK/sub.orig"
+bash "$SCRIPT" "$WORK/sub.md" > "$WORK/sub.out" 2>&1 || fail "a shared ### subsection heading was refused: $(cat "$WORK/sub.out")"
+diff -u "$WORK/sub.want" "$WORK/sub.md" || fail "shared-subsection union produced the wrong file"
+# 3h. The verification is section-aware: an awk shim moves `- **branch changed**` under
+#     `### Fixed` in the collapse output (same lines, wrong section). Refused, file untouched.
+cp "$WORK/sub.orig" "$WORK/move.md"
+REAL_AWK2=$(command -v awk)
+mkdir -p "$WORK/bin2"
+cat > "$WORK/bin2/awk" <<STUB
+#!/usr/bin/env bash
+case "\$*" in
+  *emit_body*) "$REAL_AWK2" "\$@" | "$REAL_AWK2" '\$0 == "- **branch changed**" { next } { print } \$0 == "- **main fix**" { print "- **branch changed**" }';;
+  *) exec "$REAL_AWK2" "\$@";;
+esac
+STUB
+chmod +x "$WORK/bin2/awk"
+set +e
+PATH="$WORK/bin2:$PATH" bash "$SCRIPT" "$WORK/move.md" > "$WORK/move.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -ne 0 ] || fail "a line moved to another section was accepted: $(cat "$WORK/move.out")"
+cmp -s "$WORK/sub.orig" "$WORK/move.md" || fail "a section-changing resolution modified the file"
+
+# 3g. ...but a shared `### ` heading OUTSIDE [Unreleased] (a released section, which the
+#     collapse never touches) is still refused, file untouched.
+cat > "$WORK/relsub.md" <<'EOF'
+## [Unreleased]
+
+- **u**
+
+## [0.1.0] - 2026-01-01
+
+<<<<<<< HEAD
+### Fixed
+
+- **main old**
+=======
+### Fixed
+
+- **branch old**
+>>>>>>> abc1234 (branch)
+EOF
+cp "$WORK/relsub.md" "$WORK/relsub.orig"
+set +e
+bash "$SCRIPT" "$WORK/relsub.md" > "$WORK/relsub.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 1 ] || fail "a shared ### heading in a released section returned rc=$rc, want 1: $(cat "$WORK/relsub.out")"
+cmp -s "$WORK/relsub.orig" "$WORK/relsub.md" || fail "a shared released-section heading modified the file"
+
 # 4. No markers: success, file untouched (even with a duplicate heading).
 printf '## [Unreleased]\n\n### Fixed\n\n- a\n\n### Fixed\n\n- b\n' > "$WORK/clean.md"
 cp "$WORK/clean.md" "$WORK/clean.orig"
@@ -333,4 +431,4 @@ set -e
 [ "$rc" -eq 1 ] || fail "--collapse on a conflicted file returned rc=$rc, want 1"
 cmp -s "$WORK/lossy.orig" "$WORK/mk.md" || fail "--collapse modified a conflicted file"
 
-echo "PASS changelog-union: union, duplicate-heading collapse, lossy refusal, both-sides and repeated-version refusals, no-op, --collapse"
+echo "PASS changelog-union: union, duplicate-heading collapse, lossy refusal, both-sides and repeated-version refusals, shared ### subsections, no-op, --collapse"
