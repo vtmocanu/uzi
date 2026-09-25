@@ -14,19 +14,21 @@ But the CLI alone can't run anything: there's no daemon behind it, and the
 every `docker`/`docker compose` command outright until one is wired up.
 
 To actually run containers, use a **docker-capable worker**: an ordinary
-worker plus a rootless Docker-in-Docker (DinD) sidecar that supplies the
-daemon.
+worker plus a Docker-in-Docker (DinD) sidecar that supplies the daemon
+(rootless by default; see below).
 
-## Trust: rootless, isolated, no host access
+## Trust boundaries and Docker tiers
 
 The sidecar is its own container (compose) or its own sidecar container in
 the worker's pod (hosted/k8s) — never the host's Docker. It:
 
 - runs **rootless** by default (a breakout lands as an unprivileged,
   userns-remapped uid, never host root). A hosted cluster whose nodes cannot
-  run rootless DinD may opt into a privileged, non-rootless sidecar instead;
-  its residual is node root, and the chart requires an explicit
-  acknowledgement (`acknowledgeNonRootlessNodeRoot`) to enable it;
+  run rootless DinD may opt into a privileged, non-rootless sidecar instead.
+  There a container breakout lands as root on the node and can read the
+  node's and co-scheduled pods' secrets, including other users'
+  credentials, so the chart requires an explicit acknowledgement
+  (`acknowledgeNonRootlessNodeRoot`) to enable it;
 - runs in its own mount namespace and mounts none of the worker's join
   token, `/data` cache, or `/nix`, so a container the agent launches
   (`docker run -v ...`) cannot bind-mount your credentials or those volumes;
