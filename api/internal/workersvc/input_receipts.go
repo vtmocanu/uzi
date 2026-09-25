@@ -63,7 +63,7 @@ func (s *Service) inputReceipt(ctx context.Context, wkr store.Worker, runID uuid
 	}
 	active := run.WorkerID.Valid && uuid.UUID(run.WorkerID.Bytes) == wkr.ID &&
 		run.ClaimGeneration == generation && !run.ClaimReleasedAt.Valid &&
-		!(run.CredentialSwitchRequestedAt.Valid && run.CredentialSwitchGeneration.Valid && run.CredentialSwitchGeneration.Int64 == generation)
+		(!run.CredentialSwitchRequestedAt.Valid || !run.CredentialSwitchGeneration.Valid || run.CredentialSwitchGeneration.Int64 != generation)
 	rows, err := q.ListInputReceiptRows(ctx, store.ListInputReceiptRowsParams{RunID: runID, Ids: ids})
 	if err != nil {
 		return InputReceiptResult{}, err

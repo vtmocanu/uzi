@@ -1574,7 +1574,7 @@ func (q *Queries) ConsumeCompletionPermit(ctx context.Context, arg ConsumeComple
 
 const consumeRunInputs = `-- name: ConsumeRunInputs :many
 WITH pending AS (
-    SELECT p.id FROM run_user_inputs p
+    SELECT p.id, (p.consumed_at IS NULL)::boolean AS first_consumption FROM run_user_inputs p
     -- PRD #634 M2: the scope audit row (kind='scope') is server-side ONLY — the control it
     -- carries travels as runs.scope_ceiling on the ACK/claim, never through this queue — so
     -- the worker must NEVER drain it. Draining would hit SteeringChannel.route's default arm
@@ -1592,27 +1592,30 @@ WITH pending AS (
     -- worker must never drain or route it either. 'pause' and
     -- 'pause_cancel' are NOT excluded — the worker DOES consume them (the ` + "`" + `now` + "`" + ` abort and the
     -- flag clear). Everything else consumes as before.
-    WHERE p.run_id = $1 AND p.consumed_at IS NULL AND p.kind NOT IN ('scope', 'resume', 'completion_decision', 'extend')
+    WHERE p.run_id = $1 AND p.applied_at IS NULL AND p.kind NOT IN ('scope', 'resume', 'completion_decision', 'extend')
     ORDER BY p.id ASC
     FOR UPDATE SKIP LOCKED
 ),
 consumed AS (
-    UPDATE run_user_inputs u SET consumed_at = now(), applied_at = now()
+    UPDATE run_user_inputs u SET consumed_at = COALESCE(u.consumed_at, now()), applied_at = now()
     FROM pending WHERE u.id = pending.id
     RETURNING u.id, u.kind, u.body, u.created_at
 )
-SELECT id, kind, body, created_at FROM consumed ORDER BY id ASC
+SELECT consumed.id, consumed.kind, consumed.body, consumed.created_at, pending.first_consumption
+FROM consumed JOIN pending USING (id) ORDER BY consumed.id ASC
 `
 
 type ConsumeRunInputsRow struct {
-	ID        int64              `json:"id"`
-	Kind      string             `json:"kind"`
-	Body      pgtype.Text        `json:"body"`
-	CreatedAt pgtype.Timestamptz `json:"created_at"`
+	ID               int64              `json:"id"`
+	Kind             string             `json:"kind"`
+	Body             pgtype.Text        `json:"body"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+	FirstConsumption bool               `json:"first_consumption"`
 }
 
-// FIFO consume: mark and return every pending input for the run, oldest first.
+// FIFO consume: apply and return every unapplied worker input for the run, oldest first.
 // FOR UPDATE SKIP LOCKED keeps two concurrent polls from returning the same row.
+// ACKed but unapplied inputs transfer to a legacy worker after a claim handoff.
 func (q *Queries) ConsumeRunInputs(ctx context.Context, runID uuid.UUID) ([]ConsumeRunInputsRow, error) {
 	rows, err := q.db.Query(ctx, consumeRunInputs, runID)
 	if err != nil {
@@ -1627,6 +1630,7 @@ func (q *Queries) ConsumeRunInputs(ctx context.Context, runID uuid.UUID) ([]Cons
 			&i.Kind,
 			&i.Body,
 			&i.CreatedAt,
+			&i.FirstConsumption,
 		); err != nil {
 			return nil, err
 		}
@@ -4492,7 +4496,7 @@ SELECT r.checkpoint_tip,
        (EXISTS (SELECT 1 FROM run_user_inputs i
                 WHERE i.run_id = r.id
                   AND i.kind = 'approve_plan'
-                  AND i.consumed_at IS NOT NULL))::boolean AS human_plan_approved
+                  AND i.applied_at IS NOT NULL))::boolean AS human_plan_approved
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 JOIN forge_connections c ON c.id = rp.connection_id AND c.user_id = r.user_id -- #1688: owner-scoped token
@@ -4550,7 +4554,7 @@ type GetRunClaimContextRow struct {
 // already names: if that admits a run to 'running' and it then parks, the resume
 // skips the gate on an unreviewed plan_md. Required invariant, stated so a future
 // change can be checked against it: NO awaiting_approval REPORT REWRITES plan_md
-// AFTER THE CONSUMED approve_plan THAT MADE human_plan_approved TRUE. A tighter
+// AFTER THE APPLIED approve_plan THAT MADE human_plan_approved TRUE. A tighter
 // derivation is not cheaply available — runs carries no plan_md_set_at to compare
 // consumed_at against, and inventing one is out of this PRD's scope.
 //
@@ -6956,6 +6960,7 @@ SELECT id, kind, body, created_at FROM run_user_inputs
 WHERE run_id = $1 AND applied_at IS NULL
   AND kind NOT IN ('scope', 'resume', 'completion_decision', 'extend')
 ORDER BY id ASC
+LIMIT 1000
 `
 
 type ListReplayRunInputsRow struct {
@@ -11989,26 +11994,26 @@ UPDATE runs SET
     -- Issue #552 M1 / #559 M1: the park-scoped follow_up watermark. The value is now
     -- WORKER-PROVIDED — the highest follow_up id the worker has ALREADY DELIVERED/applied
     -- to a turn at the moment it parks — and CLAMPED here to the server-derived max
-    -- already-consumed follow_up as a safety ceiling (the LEAST(...) below). When the
+    -- already-applied follow_up as a safety ceiling (the LEAST(...) below). When the
     -- worker OMITS it (an old worker, or the very first park before anything was
-    -- delivered) the COALESCE falls back to that same server-derived max-consumed, so an
-    -- absent param is byte-identical to the pre-#559 pure-server behavior.
+    -- delivered) the COALESCE falls back to that same server-derived max-applied, so an
+    -- absent param uses the same applied-row ceiling as the worker-provided path.
     --
-    -- Why worker-provided: deriving the watermark purely from the server's max-consumed
-    -- races a follow_up consumed DURING this park report's DB round-trip — it would fold a
-    -- not-yet-applied follow_up into the watermark and permanently strand the run (the
+    -- Why worker-provided: deriving the watermark purely from the server's max-applied
+    -- races a follow_up applied DURING this park report's DB round-trip — it would fold a
+    -- follow_up the worker has not yet included in its park watermark and permanently strand the run (the
     -- guard then never sees a follow_up NEWER than the watermark). The worker knows exactly
     -- which follow_ups it has applied, so it reports that; a correct worker's last-delivered
-    -- id is ALWAYS ≤ max-consumed, so the clamp never bites it. The clamp exists only to
+    -- id is ALWAYS ≤ max-applied, so the clamp never bites it. The clamp exists only to
     -- neutralize a buggy huge value that would otherwise strand the run forever.
     --
-    -- A later follow_up with a higher id — the one the resuming worker will consume to wake
+    -- A later follow_up with a higher id — the one the resuming worker will apply to wake
     -- THIS park — is what SetRunRunning's Decision-7 guard requires to admit
     -- awaiting_followup → running, so the watermark discriminates "THIS park's follow_up"
-    -- from "any follow_up ever consumed".
+    -- from "any follow_up ever applied".
     --
-    -- CONSUMED-only (consumed_at IS NOT NULL) remains load-bearing on the server ceiling:
-    -- the follow_up that wakes a park is UNCONSUMED until it wakes, so a consumed-only MAX
+    -- APPLIED-only (applied_at IS NOT NULL) remains load-bearing on the server ceiling:
+    -- the follow_up that wakes a park is UNAPPLIED until it wakes, so an applied-only MAX
     -- never advances past it. Monotonicity across re-parks is now ENFORCED by the
     -- GREATEST(COALESCE(open_followup_id, 0), ...) current-value floor below — no longer
     -- merely asserted from the protocol. Issue #817: the old "(or the worker's
@@ -12020,7 +12025,7 @@ UPDATE runs SET
     -- LEAST only bounds a huge value from above, so a nonsensical NEGATIVE worker value
     -- (e.g. -1) would otherwise pass through and fail-open THIS run's own wake guard
     -- (` + "`" + `id > COALESCE(open_followup_id, 0)` + "`" + ` is ` + "`" + `id > -1` + "`" + `, true for every positive
-    -- bigserial id, so any consumed follow_up wakes it — reopening #558 for that run).
+    -- bigserial id, so any applied follow_up wakes it — reopening #558 for that run).
     -- Flooring to 0 maps it to "nothing applied" (the first-park value), matching the
     -- stated "neutralize a buggy value" intent. GREATEST(0, ...) never affects a correct
     -- worker: its last-delivered id is always ≥ 0.
@@ -12028,19 +12033,19 @@ UPDATE runs SET
     -- can never REGRESS. The RHS ` + "`" + `open_followup_id` + "`" + ` reads the PRE-UPDATE (old) row —
     -- the same self-referential SET-RHS pattern this file already uses for
     -- milestones_completed (see SetRunRunning and SetRunCompleted). Strand-free: every
-    -- GREATEST operand is ≤ the run's MAX(consumed follow_up id), which is monotone
-    -- non-decreasing, and the unconsumed wake follow_up has id > that max, so
+    -- GREATEST operand is ≤ the run's MAX(applied follow_up id), which is monotone
+    -- non-decreasing, and the unapplied wake follow_up has id > that max, so
     -- ` + "`" + `id > open_followup_id` + "`" + ` always still holds. SAFETY DEPENDS on run_user_inputs
-    -- being append-only and consumed_at set-once: a retention/pruning job that
-    -- hard-deletes consumed follow_up rows would let MAX(consumed) drop below a prior
+    -- being append-only and applied_at set-once: a retention/pruning job that
+    -- hard-deletes applied follow_up rows would let MAX(applied) drop below a prior
     -- stamp, and this floor — unlike the pre-fix pure-LEAST clamp — would then hold the
     -- watermark too high; such a change must reckon with the wake guard.
     open_followup_id = GREATEST(0, COALESCE(open_followup_id, 0), LEAST(
         COALESCE($2::bigint,
                  (SELECT COALESCE(MAX(id), 0) FROM run_user_inputs
-                  WHERE run_user_inputs.run_id = $3 AND kind = 'follow_up' AND consumed_at IS NOT NULL)),
+                  WHERE run_user_inputs.run_id = $3 AND kind = 'follow_up' AND applied_at IS NOT NULL)),
         (SELECT COALESCE(MAX(id), 0) FROM run_user_inputs
-         WHERE run_user_inputs.run_id = $3 AND kind = 'follow_up' AND consumed_at IS NOT NULL))),
+         WHERE run_user_inputs.run_id = $3 AND kind = 'follow_up' AND applied_at IS NOT NULL))),
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE id = $3 AND worker_id = $4
@@ -13435,7 +13440,7 @@ WHERE runs.id = $19 AND worker_id = $20
         SELECT 1 FROM run_user_inputs
         WHERE run_user_inputs.run_id = $19
           AND run_user_inputs.kind = 'approve_plan'
-          AND run_user_inputs.consumed_at IS NOT NULL))
+          AND run_user_inputs.applied_at IS NOT NULL))
   -- awaiting_input → running is guarded the same way and for the same reason
   -- (PRD #88 M1), as a SECOND, INDEPENDENT clause. Never merge the two into
   -- ` + "`" + `status NOT IN (...) OR kind IN (...)` + "`" + `: that would let a consumed ` + "`" + `answer` + "`" + `
@@ -13458,28 +13463,28 @@ WHERE runs.id = $19 AND worker_id = $20
         SELECT 1 FROM run_user_inputs
         WHERE run_user_inputs.run_id = $19
           AND run_user_inputs.kind = 'answer'
-          AND run_user_inputs.consumed_at IS NOT NULL
+          AND run_user_inputs.applied_at IS NOT NULL
           AND run_user_inputs.question_id = runs.open_question_id))
   -- awaiting_followup → running is guarded the SAME way and for the same reason as
   -- awaiting_input above (PRD #517 Decision 7), as a THIRD, INDEPENDENT clause. The
   -- interactive-task park (Decision 3) holds the run in-process at ` + "`" + `awaiting_followup` + "`" + `
   -- after signal_done; the worker resumes ONLY when a ` + "`" + `follow_up` + "`" + ` steering input has
-  -- been consumed (` + "`" + `uzi run follow-up` + "`" + `, Decision 4 waiter). Requiring a CONSUMED
+  -- been applied (` + "`" + `uzi run follow-up` + "`" + `, Decision 4 waiter). Requiring an APPLIED
   -- follow_up is what ties the wake to the in-process worker on the current claim:
   -- the outer ` + "`" + `worker_id = @worker_id` + "`" + ` already pins the worker, and this clause pins the
   -- CAUSE — a delayed or duplicate PRE-PARK ` + "`" + `running` + "`" + ` report (the batcher retries, and
   -- the pre-gate fire-and-forget reports already exist, so reordering is not
-  -- hypothetical) carries no consumed follow_up, so it cannot un-park an idle task and
+  -- hypothetical) carries no applied follow_up, so it cannot un-park an idle task and
   -- re-arm the wall clock. Kept SEPARATE from the two clauses above, never merged into
-  -- a single ` + "`" + `status NOT IN (...) OR kind IN (...)` + "`" + `: that would let a consumed ` + "`" + `answer` + "`" + `
+  -- a single ` + "`" + `status NOT IN (...) OR kind IN (...)` + "`" + `: that would let an applied ` + "`" + `answer` + "`" + `
   -- satisfy the FOLLOWUP gate (and vice-versa), re-opening #44 F2 sideways.
   --
   -- Like awaiting_input this clause IS now keyed on a per-park identity (issue #552 M1):
   -- runs.open_followup_id, a WATERMARK of the highest follow_up the run had already
-  -- consumed at the moment it parked. The tie is therefore "a follow_up NEWER than the
-  -- watermark was consumed" — i.e. THIS park's follow_up — not "any follow_up was ever
-  -- consumed". Without it, on a run that has already iterated (cycle ≥2, an earlier
-  -- follow_up consumed) the bare EXISTS always found a consumed follow_up and degraded
+  -- applied at the moment it parked. The tie is therefore "a follow_up NEWER than the
+  -- watermark was applied" — i.e. THIS park's follow_up — not "any follow_up was ever
+  -- applied". Without it, on a run that has already iterated (cycle ≥2, an earlier
+  -- follow_up applied) the bare EXISTS always found an applied follow_up and degraded
   -- to a no-op, so a stale pre-park ` + "`" + `running` + "`" + ` report un-parked an idle run: a real
   -- awaiting_followup→running STATE CHANGE (the health CASE arms fire their ELSE branch),
   -- re-arming the wall clock on a task sitting in the follow-up waiter.
@@ -13489,16 +13494,16 @@ WHERE runs.id = $19 AND worker_id = $20
   -- runs.open_question_id does in the awaiting_input guard above. The setter's
   -- COALESCE(MAX(id),0) floor stamps 0 (never NULL) on every park, so open_followup_id is
   -- genuinely NULL only for a run that has never parked at all; that NULL COALESCEs to 0
-  -- here, so any consumed follow_up clears it: fail-open only in the one case where any
-  -- consumed follow_up genuinely IS new.
+  -- here, so any applied follow_up clears it: fail-open only in the one case where any
+  -- applied follow_up genuinely IS new.
   --
   -- No clear-on-wake is needed, and a future reader must NOT "add the missing sibling
   -- clear" the way open_question_id needs one. As of issue #559 the watermark is
   -- WORKER-PROVIDED at each park (SetRunAwaitingFollowup) — the max follow_up id the
-  -- worker has already DELIVERED — CLAMPED there to the server's max already-consumed
-  -- follow_up, with a server-derived fallback to that same max-consumed when the worker
-  -- omits it (old worker / first park). Either way it keys on CONSUMED-only rows for its
-  -- ceiling: the follow_up that wakes a park is unconsumed until it wakes, so it never
+  -- worker has already DELIVERED — CLAMPED there to the server's max already-applied
+  -- follow_up, with a server-derived fallback to that same max-applied when the worker
+  -- omits it (old worker / first park). Either way it keys on APPLIED-only rows for its
+  -- ceiling: the follow_up that wakes a park is unapplied until it wakes, so it never
   -- counts toward the watermark that guards its own park, and the next park rolls the
   -- watermark forward to include it. There is nothing to reset between parks. The guard
   -- predicate below (` + "`" + `id > COALESCE(open_followup_id, 0)` + "`" + `) is UNCHANGED by #559.
@@ -13506,7 +13511,7 @@ WHERE runs.id = $19 AND worker_id = $20
         SELECT 1 FROM run_user_inputs
         WHERE run_user_inputs.run_id = $19
           AND run_user_inputs.kind = 'follow_up'
-          AND run_user_inputs.consumed_at IS NOT NULL
+          AND run_user_inputs.applied_at IS NOT NULL
           AND run_user_inputs.id > COALESCE(runs.open_followup_id, 0)))
 `
 

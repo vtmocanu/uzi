@@ -180,4 +180,46 @@ func TestWorkerInputReceiptsLiveDB(t *testing.T) {
 	call(h.WorkerRunInputsAck, "POST", "/inputs/ack", switchBody, newer, 200)
 	exec(`UPDATE runs SET claim_released_at=now() WHERE id=$1`, run)
 	call(h.WorkerRunInputsApplied, "POST", "/inputs/applied", switchBody, newer, 409)
+
+	// A legacy worker taking over must receive ACKed rows that were never applied.
+	legacyWorker := uuid.New()
+	exec(`INSERT INTO workers (id,user_id,name,token_hash) VALUES ($1,$2,'legacy',$3)`, legacyWorker, user, legacyWorker[:])
+	exec(`UPDATE runs SET worker_id=$2,claim_generation=3,claim_released_at=NULL WHERE id=$1`, run, legacyWorker)
+	legacyWkr := store.Worker{ID: legacyWorker, UserID: user}
+	var before string
+	if err := pool.QueryRow(ctx, `SELECT consumed_at::text FROM run_user_inputs WHERE id=$1`, switched).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	// The earlier ACKed follow-up is first in ID order, before this fresh row.
+	var freshLegacy int64
+	if err := pool.QueryRow(ctx, `INSERT INTO run_user_inputs (run_id,kind,body) VALUES ($1,'cancel','fresh legacy') RETURNING id`, run).Scan(&freshLegacy); err != nil {
+		t.Fatal(err)
+	}
+	var audit int64
+	if err := pool.QueryRow(ctx, `INSERT INTO run_user_inputs (run_id,kind,body) VALUES ($1,'extend','audit') RETURNING id`, run).Scan(&audit); err != nil {
+		t.Fatal(err)
+	}
+	out := call(h.WorkerRunInputs, "GET", "/inputs", "", legacyWkr, 200)
+	inputs := out["inputs"].([]any)
+	if len(inputs) != 2 || int64(inputs[0].(map[string]any)["id"].(float64)) != switched ||
+		int64(inputs[1].(map[string]any)["id"].(float64)) != freshLegacy {
+		t.Fatalf("legacy handoff inputs = %v, want ACKed follow-up then fresh cancel", inputs)
+	}
+	var after string
+	var applied bool
+	if err := pool.QueryRow(ctx, `SELECT consumed_at::text, applied_at IS NOT NULL FROM run_user_inputs WHERE id=$1`, switched).Scan(&after, &applied); err != nil {
+		t.Fatal(err)
+	}
+	if before != after || !applied {
+		t.Fatalf("legacy handoff consumed_at=%q before=%q applied=%v", after, before, applied)
+	}
+	if err := pool.QueryRow(ctx, `SELECT applied_at IS NOT NULL FROM run_user_inputs WHERE id=$1`, audit).Scan(&applied); err != nil {
+		t.Fatal(err)
+	}
+	if applied {
+		t.Fatal("legacy drain applied a server-only audit row")
+	}
+	if got := call(h.WorkerRunInputs, "GET", "/inputs", "", legacyWkr, 200)["inputs"].([]any); len(got) != 0 {
+		t.Fatalf("legacy replayed applied inputs: %v", got)
+	}
 }

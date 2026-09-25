@@ -28,8 +28,9 @@ func TestListConsumedFollowUpInputsForRunLiveDB(t *testing.T) {
 	run := f.seedInteractiveTaskRun(ctx, t, "running", &wkr)
 	other := f.seedInteractiveTaskRun(ctx, t, "running", &wkr)
 
-	insert := `INSERT INTO run_user_inputs (run_id, kind, body, consumed_at, created_at)
-	           VALUES ($1, $2, $3, CASE WHEN $4::boolean THEN now() END, now() + make_interval(secs => $5))`
+	insert := `INSERT INTO run_user_inputs (run_id, kind, body, consumed_at, applied_at, created_at)
+	           VALUES ($1, $2, $3, CASE WHEN $4::boolean THEN now() END,
+	                   CASE WHEN $4::boolean THEN now() END, now() + make_interval(secs => $5))`
 	seed := []struct {
 		kind     string
 		body     string

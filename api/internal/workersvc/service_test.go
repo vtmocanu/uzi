@@ -5094,7 +5094,7 @@ func TestConsumeInputsBroadcastsOnFollowUp(t *testing.T) {
 	fs := &fakeStore{
 		runOwned: store.Run{ID: runID, WorkerID: pgconv.UUID(w.ID)},
 		consumeRows: []store.ConsumeRunInputsRow{
-			{ID: 1, Kind: "follow_up", Body: pgconv.TextOrNull("do the thing")},
+			{ID: 1, Kind: "follow_up", Body: pgconv.TextOrNull("do the thing"), FirstConsumption: true},
 		},
 	}
 	svc := New(fs, newBox(t), testParams())
@@ -5106,6 +5106,15 @@ func TestConsumeInputsBroadcastsOnFollowUp(t *testing.T) {
 	}
 	if len(b.inputRuns) != 1 || b.inputRuns[0] != runID {
 		t.Fatalf("input broadcast = %v, want [%s] (one frame for the run)", b.inputRuns, runID)
+	}
+	// A legacy handoff may deliver the same follow-up after a capable worker ACKed it.
+	// Its consumed_at did not change, so the browser needs no second delivery frame.
+	fs.consumeRows[0].FirstConsumption = false
+	if _, err := svc.ConsumeInputs(context.Background(), w, runID); err != nil {
+		t.Fatalf("ConsumeInputs handoff: %v", err)
+	}
+	if len(b.inputRuns) != 1 {
+		t.Fatalf("input broadcast after handoff = %v, want one frame", b.inputRuns)
 	}
 }
 
