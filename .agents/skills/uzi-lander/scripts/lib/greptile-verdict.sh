@@ -15,9 +15,10 @@
 # was 170 files. If Greptile ever reviews incrementally this rule is wrong; the current-head
 # zeroing in the callers rests on the same premise.
 #
-# LIVENESS ONLY. A verdict on an earlier commit says nothing about the commits after it, so
-# whether the current head was reviewed stays an exact-head question the callers answer
-# themselves; nothing here may satisfy a review gate.
+# LIVENESS ONLY for greptile_prior_verdict / greptile_scope_live. A verdict on an earlier
+# commit says nothing about the commits after it, so whether the current head was reviewed
+# stays an exact-head question. greptile_paired_verdict is the one exception, and still an
+# exact-head answer: it proves a review OF the head whose check-run landed on an older commit.
 
 # greptile_newest_run — stdin: `gh api --paginate .../check-runs` pages. Prints the NEWEST
 # `Greptile Review` run as JSON, or {} when there is none; fails on an unreadable payload.
@@ -28,6 +29,135 @@ greptile_newest_run() {
            [.[].check_runs[]|select(.app.slug=="greptile-apps" and .name=="Greptile Review")]
            | if length==0 then {} else max_by(.id) end
          else error("check-run pages unreadable") end' 2>/dev/null
+}
+
+# greptile_body_sha — stdin: one JSON object whose `.body` is a PR-body snapshot (the callers
+#   pass Greptile's own edit from the PR's edit history, never the live body). Prints the full
+#   40-hex SHA of the "Last reviewed commit" `/commit/<sha>` link inside Greptile's block, or
+#   nothing. The block is the text between exactly one `<!-- greptile_comment -->` and one
+#   later `<!-- /greptile_comment -->`; the SHA must be the only one named on "Last reviewed
+#   commit" lines there. A missing, truncated or malformed snapshot, or a short or ambiguous
+#   SHA, prints nothing (no evidence, never clean); rc 1 only when stdin is not an object.
+greptile_body_sha() {
+  jq -r 'if type!="object" then error("not an object") else
+    (.body // "") as $b
+    | if ($b|type)!="string" then "" else
+        ($b|gsub("\r";"")) as $s
+        | if ([$s|match("<!-- greptile_comment -->";"g")]|length)!=1
+             or ([$s|match("<!-- /greptile_comment -->";"g")]|length)!=1 then ""
+          else ($s|split("<!-- greptile_comment -->")[1]|split("<!-- /greptile_comment -->")) as $p
+            | if ($p|length)!=2 then ""
+              else [$p[0]|split("\n")[]|select(contains("Last reviewed commit"))
+                     |scan("/commit/([0-9a-f]+)")[0]]|unique
+                | if length==1 and (.[0]|test("^[0-9a-f]{40}$")) then .[0] else "" end
+              end
+          end
+      end
+  end' 2>/dev/null
+}
+
+# greptile_paired_verdict REPO PR HEAD HEAD_REVIEW_AT ISSUE_COMMENTS
+#   Greptile's verdict on HEAD when the head carries no completed `Greptile Review` run of its
+#   own. A push that races `@greptileai review` leaves the run on the OLDER commit while
+#   Greptile reviews the new head (PR #1698, 2026-09-25); a clean pass posts no review object.
+#     HEAD_REVIEW_AT  submitted_at of the newest greptile-apps[bot] review whose commit_id is
+#                     HEAD, or empty (such a review exists only when comments were added)
+#     ISSUE_COMMENTS  `issues/N/comments` as ONE flat JSON array (the trigger comments)
+#   Every leg below is authenticated or server-stamped; the live PR body (user-editable) is
+#   never read. The marker, in order: HEAD_REVIEW_AT, else the newest (by editedAt) PR-body
+#   edit by `greptile-apps` in GraphQL `userContentEdits`, whose block must name HEAD
+#   (greptile_body_sha). `diff` is documented only as a summary of the change; it has been
+#   observed to be the full body snapshot, so anything else reads as no marker.
+#   The marker binds the ONE `Greptile Review` run (app greptile-apps, completed, success,
+#   "N files reviewed, M comments added") among the newest GREPTILE_PRIOR_MAX (default 20)
+#   PR commits whose completed_at lies in [marker, marker + GREPTILE_EDIT_WINDOW] (default
+#   120 s; measured: the run completed +6 s and +3 s after Greptile's edits on #1698 and
+#   +3 s after its review on #1449). Two candidates are ambiguous: unknown. The run must also finish at or after
+#   HEAD's committer date: client-set, so a sanity bound, not a push time.
+#   Freshness: the run's started_at must be at or after the newest `@greptile(ai) review`
+#   comment by a non-Bot user. A newer trigger means a newer review is due: pending. No
+#   trigger at all: no evidence (a review started by the body's Retrigger link posts none).
+#   Sets GRP_SHA (the bound run's commit; empty = no evidence), GRP_SUMMARY, GRP_ADDED (M),
+#   GRP_NOTE (`<review|edit>→<head8> via run on <sha8>`), GRP_TRIGGER (the trigger time).
+#   rc 0 read (GRP_SHA may be empty); rc 1 unknown (a lookup failed or was unreadable, the edit
+#   history has a further page, two runs could bind, or the commit list does not end at
+#   HEAD); rc 2 pending. Never cached: a newer trigger or run can arrive at any poll.
+# shellcheck disable=SC2034  # GRP_* are this function's outputs, read by the sourcing scripts.
+greptile_paired_verdict() {
+  local repo="$1" pr="$2" head="$3" review_at="$4" issue_comments="$5"
+  local max="${GREPTILE_PRIOR_MAX:-20}" win="${GREPTILE_EDIT_WINDOW:-120}"
+  local kind anchor owner name raw edit sha pages commits head_date cands="" run n bound
+  GRP_SHA=""; GRP_SUMMARY=""; GRP_ADDED=""; GRP_NOTE=""; GRP_TRIGGER=""
+  GRP_TRIGGER=$(printf '%s' "$issue_comments" | jq -r 'if type=="array" then
+      [.[]|select((.user.type // "") != "Bot")|select((.body // "")|test("@greptile(ai)?\\s+review"; "i"))
+          |.created_at|select(type=="string")]|max // ""
+    else error("issue comments are not an array") end' 2>/dev/null) || return 1
+  [ -n "$GRP_TRIGGER" ] || return 0
+
+  if [ -n "$review_at" ]; then
+    kind=review; anchor="$review_at"
+  else
+    owner=${repo%%/*}; name=${repo#*/}
+    [ -n "$owner" ] && [ -n "$name" ] && [ "$owner" != "$name" ] || return 1
+    raw=$(gh api graphql -F owner="$owner" -F name="$name" -F number="$pr" -f query='query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){userContentEdits(first:100){pageInfo{hasNextPage} nodes{editedAt editor{login} diff}}}}}' 2>/dev/null) || return 1
+    # The newest edit by editedAt, never by node order. A further page could hold a newer one.
+    edit=$(printf '%s' "$raw" | jq -c '.data.repository.pullRequest.userContentEdits as $e
+      | if ((.errors // [])|length)!=0 or ($e|type)!="object" or ($e.nodes|type)!="array" then error("edits unreadable")
+        elif $e.pageInfo.hasNextPage!=false then error("edit history has a further page")
+        else [$e.nodes[]|select(type=="object" and (.editor.login // "")=="greptile-apps" and (.editedAt|type)=="string")]
+             | max_by(.editedAt) // empty end' 2>/dev/null) || return 1
+    [ -n "$edit" ] || return 0
+    sha=$(printf '%s' "$edit" | jq '{body: .diff}' | greptile_body_sha) || return 1
+    [ "$sha" = "$head" ] || return 0
+    kind=edit; anchor=$(printf '%s' "$edit" | jq -r .editedAt)
+  fi
+
+  pages=$(gh api --paginate "repos/$repo/pulls/$pr/commits" 2>/dev/null) || return 1
+  commits=$(printf '%s' "$pages" | jq -cs --arg h "$head" \
+    'if length>0 and all(.[]; type=="array") then
+       [.[][]] | if (last.sha // "") != $h then error("commit list does not end at the head") else . end
+     else error("commit pages are not arrays") end' 2>/dev/null) || return 1
+  head_date=$(printf '%s' "$commits" | jq -r 'last.commit.committer.date // ""' 2>/dev/null) || return 1
+  [ -n "$head_date" ] || return 0
+
+  while IFS= read -r sha; do
+    [ -n "$sha" ] || continue
+    pages=$(gh api --paginate "repos/$repo/commits/$sha/check-runs" 2>/dev/null) || return 1
+    run=$(printf '%s' "$pages" | jq -cs --arg s "$sha" --arg a "$anchor" --arg d "$head_date" \
+      --argjson win "$win" '
+      def ts: (sub("\\.[0-9]+";"")|fromdateiso8601)? // null;
+      if length>0 and all(.[]; type=="object" and has("check_runs")) then
+        ($a|ts) as $lo | ($d|ts) as $floor
+        | if $lo==null or $floor==null then error("marker or head date unparseable") else
+            .[].check_runs[]
+            | select(.app.slug=="greptile-apps" and .name=="Greptile Review"
+                     and .status=="completed" and .conclusion=="success")
+            | ((.output.summary // "")|[match("[0-9]+ files reviewed, [0-9]+ comments added").string]|first) as $sum
+            | select($sum!=null)
+            | ((.completed_at // "")|ts) as $at
+            | select($at!=null and $at >= $lo and $at <= ($lo + $win) and $at >= $floor)
+            | {sha:$s, summary:$sum, started:(.started_at // "")}
+          end
+      else error("check-run pages unreadable") end' 2>/dev/null) || return 1
+    [ -n "$run" ] && cands="${cands}${run}"$'\n'
+  done < <(printf '%s' "$commits" | jq -r --argjson max "$max" 'reverse|.[0:$max]|.[].sha')
+
+  n=$(printf '%s' "$cands" | grep -c . || true)
+  [ "$n" -eq 0 ] && return 0
+  [ "$n" -eq 1 ] || return 1
+  bound=$(printf '%s' "$cands" | jq -r --arg t "$GRP_TRIGGER" '
+    def ts: (sub("\\.[0-9]+";"")|fromdateiso8601)? // null;
+    (.started|ts) as $st | ($t|ts) as $tr
+    | if $st==null or $tr==null then "none" elif $st >= $tr then "fresh" else "stale" end' 2>/dev/null) || return 1
+  case "$bound" in
+    none) return 0 ;;
+    stale) return 2 ;;
+  esac
+  GRP_SHA=$(printf '%s' "$cands" | jq -r .sha)
+  GRP_SUMMARY=$(printf '%s' "$cands" | jq -r .summary)
+  GRP_ADDED=$(printf '%s' "$GRP_SUMMARY" | grep -oE '[0-9]+ comments added' | grep -oE '^[0-9]+')
+  GRP_NOTE="${kind}→${head:0:8} via run on ${GRP_SHA:0:8}"
+  return 0
 }
 
 # greptile_prior_verdict REPO PR HEAD

@@ -235,6 +235,44 @@ scope 0 0 "bbbbbbbb/0" absent "" 2 "$(trigger "$now_iso" 'greptile already looke
 # Unreadable issue comments fail closed and keep the raw count.
 scope 1 2 "" absent "" 2 'x'
 
+# ---- greptile_paired_verdict ----------------------------------------------------------
+# The PR #1698 race fixture the entrypoint tests share, answered by a `gh` function in a
+# subshell (the PATH stub above serves the other sections). Pins each outcome's rc:
+# 0 = evidence or none, 1 = unknown, 2 = pending.
+# paired MODE RC SHA8 ADDED [HEAD_REVIEW_AT]
+paired() (
+  # shellcheck source=greptile-race.fixture.sh
+  . "$HERE/greptile-race.fixture.sh"
+  gh() { shift; race_api "$@"; }
+  MODE="$1"; export MODE
+  rc=0
+  greptile_paired_verdict test/repo 42 "$RACE_HEAD" "${5:-}" "$(race_api /issues/42/comments)" || rc=$?
+  [ "$rc" -eq "$2" ] || fail "paired $1: rc=$rc, want $2"
+  [ "${GRP_SHA:0:8}" = "$3" ] || fail "paired $1: GRP_SHA='$GRP_SHA', want '$3'"
+  [ "$GRP_ADDED" = "$4" ] || fail "paired $1: GRP_ADDED='$GRP_ADDED', want '$4'"
+)
+paired pushrace 0 bbbbbbbb 0
+paired pushrace_stale_dup 0 bbbbbbbb 0
+paired pushrace_review_findings 0 bbbbbbbb 1 2026-09-25T16:18:37Z
+paired pushrace_new_trigger 2 "" ""
+for m in pushrace_notrigger pushrace_forged pushrace_othersha pushrace_malformed pushrace_short pushrace_nodiff pushrace_truncated pushrace_nowindow pushrace_norun pushrace_early pushrace_pending_first; do
+  paired "$m" 0 "" ""
+done
+paired pushrace_two_runs 1 "" ""
+paired pushrace_more_pages 1 "" ""
+
+# greptile_body_sha parses only inside the block, and only a full, unambiguous SHA.
+bs() { printf '%s' "$1" | greptile_body_sha; }
+blk() { jq -n --arg t "$1" '{body:("desc\n<!-- greptile_comment -->\n" + $t + "\n<!-- /greptile_comment -->")}'; }
+[ "$(bs "$(blk "Last reviewed commit: [x](https://g/o/r/commit/$HEAD_SHA)")")" = "$HEAD_SHA" ] || fail "body SHA not read"
+[ -z "$(bs "$(blk 'Last reviewed commit: [x](https://g/o/r/commit/cccccccc)')")" ] || fail "a short body SHA was accepted"
+[ -z "$(bs "$(blk "Last reviewed commit: [x](https://g/o/r/commit/${HEAD_SHA}ab)")")" ] || fail "an over-long body SHA was accepted"
+[ -z "$(bs "$(blk "Last reviewed commit: [x](https://g/o/r/commit/$HEAD_SHA) [y](https://g/o/r/commit/$PREV_SHA)")")" ] || fail "an ambiguous body SHA was accepted"
+[ -z "$(bs "$(blk "Reviewed [x](https://g/o/r/commit/$HEAD_SHA)")")" ] || fail "a SHA off the Last-reviewed line was accepted"
+[ -z "$(bs "{\"body\":\"Last reviewed commit: [x](https://g/o/r/commit/$HEAD_SHA)\"}")" ] || fail "a SHA outside any block was accepted"
+[ -z "$(bs '{"body":null}')" ] || fail "a null body produced a SHA"
+if bs '[]' >/dev/null; then fail "a non-object pull did not fail"; fi
+
 # ---- greptile_outside_diff -------------------------------------------------------------
 # Here-strings, not a pipe: the function sets GOD_* in the CALLER's shell.
 od() { greptile_outside_diff "$HEAD_SHA" <<<"$1"; }
@@ -247,4 +285,4 @@ od '[{"id":2,"user":{"login":"someone"},"body":"<!-- greptile_outside_diff -->\n
 [ "$GOD_TOTAL" = 0 ] || fail "a non-Greptile comment was counted"
 if od '{"not":"array"}'; then fail "unreadable issue comments did not fail closed"; fi
 
-echo "PASS greptile-verdict: earlier verdict scoped, newer evidence outranks it, unreadable fails closed"
+echo "PASS greptile-verdict: earlier verdict scoped, newer evidence outranks it, run-on-older-commit head verdict, unreadable fails closed"

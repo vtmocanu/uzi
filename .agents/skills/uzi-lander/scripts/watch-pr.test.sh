@@ -37,6 +37,8 @@ if [ "${1:-}" = pr ] && [ "${2:-}" = checks ]; then
   exit 0
 fi
 if [ "${1:-}" = api ]; then
+# pushrace* modes: the PR #1698 race, shared with the other entrypoints' tests.
+case "$MODE" in pushrace*) . "$RACE_FIXTURE"; shift; race_api "$@"; exit $? ;; esac
   case "$*" in
     *'graphql'*)
       if [ "$MODE" = pending_findings ]; then
@@ -108,6 +110,7 @@ STUB
 chmod +x "$WORK/bin/gh" "$WORK/bin/uzi" "$WORK/bin/sleep"
 export PATH="$WORK/bin:$PATH"
 export COMMENTS="$WORK/comments.json"
+export RACE_FIXTURE="$HERE/lib/greptile-race.fixture.sh"
 MODE="full"; export MODE
 
 jq -n '[
@@ -388,4 +391,53 @@ rc=$?
 set -e
 [ "$rc" -eq 2 ] || fail "--reviewer any stopped waiting for a CodeRabbit review in progress, rc=$rc: $(cat "$WORK/revovr-any.out")"
 
-echo "PASS watch-pr: settled reviews, resolved-thread scope, earlier-verdict Greptile scope, change_assessment head marker, reviewer override"
+# ---- Greptile's run landed on an OLDER commit than the head it reviewed (PR #1698) ------
+# lib/greptile-race.fixture.sh holds the data; pr-findings and takeover judge the same modes.
+wp() { MODE="$1"; export MODE; set +e; bash "$SCRIPT" test/repo 42 0 1 --reviewer greptile --reviewer-grace 0 > "$WORK/$1.out" 2>&1; rc=$?; set -e; }
+# The race: Greptile's own edit names the head, one run completed 6 s later, started after
+# the newest trigger. Reviewed clean, and the log names the evidence.
+wp pushrace
+[ "$rc" -eq 0 ] || fail "pushrace: a clean review of the head did not reach ready, rc=$rc: $(cat "$WORK/pushrace.out")"
+grep -qF 'greptile=completed(edit→deadbeef via run on bbbbbbbb) (10 files reviewed, 0 comments added)' "$WORK/pushrace.out" \
+  || fail "pushrace: the evidence was not named: $(cat "$WORK/pushrace.out")"
+# A stale in_progress duplicate on the head that no newer trigger started does not block.
+wp pushrace_stale_dup
+[ "$rc" -eq 0 ] || fail "pushrace_stale_dup: a stale duplicate blocked a proven review, rc=$rc: $(cat "$WORK/pushrace_stale_dup.out")"
+# A NEWER trigger than the bound run's start is a review still due: pending, not reviewed,
+# whether its run is already on the head or not visible yet.
+for m in pushrace_new_trigger pushrace_new_trigger_absent; do
+  wp "$m"
+  [ "$rc" -eq 2 ] || fail "$m: a newer trigger did not keep the watcher waiting, rc=$rc: $(cat "$WORK/$m.out")"
+  grep -q 'pending: trigger 2026-09-25T16:24:25Z' "$WORK/$m.out" || fail "$m: pending not named: $(cat "$WORK/$m.out")"
+  if grep -q 'unknown=1' "$WORK/$m.out"; then fail "$m: pending read as unknown: $(cat "$WORK/$m.out")"; fi
+done
+# No evidence: no trigger; only a user edit names the head; Greptile's edit names another
+# commit, is malformed, short, missing or truncated; no run in the window; no run at all;
+# the bound run finished before the head's committer date.
+for m in pushrace_notrigger pushrace_forged pushrace_othersha pushrace_malformed pushrace_short pushrace_nodiff pushrace_truncated pushrace_nowindow pushrace_norun pushrace_early; do
+  wp "$m"
+  [ "$rc" -eq 6 ] || fail "$m: a head without bound Greptile evidence read as reviewed, rc=$rc: $(cat "$WORK/$m.out")"
+  grep -q 'greptile=absent live=' "$WORK/$m.out" || fail "$m: head not reported absent: $(cat "$WORK/$m.out")"
+done
+# Unknown, never clean: two runs could bind the edit; the edit history has a further page.
+for m in pushrace_two_runs pushrace_more_pages; do
+  wp "$m"
+  [ "$rc" -eq 2 ] || fail "$m: ambiguous or truncated evidence did not defer, rc=$rc: $(cat "$WORK/$m.out")"
+  grep -q 'unknown=1' "$WORK/$m.out" || fail "$m: not unknown: $(cat "$WORK/$m.out")"
+  grep -q 'greptile=absent live=' "$WORK/$m.out" || fail "$m: head read as reviewed: $(cat "$WORK/$m.out")"
+done
+# Comments added on the bound run: findings (head review object as marker), or unknown when
+# only the edit marks the head and no review id can scope them.
+wp pushrace_review_findings
+[ "$rc" -eq 3 ] || fail "pushrace_review_findings: findings not surfaced, rc=$rc: $(cat "$WORK/pushrace_review_findings.out")"
+grep -qF 'greptile=completed(review→deadbeef via run on bbbbbbbb)' "$WORK/pushrace_review_findings.out" || fail "review marker not named: $(cat "$WORK/pushrace_review_findings.out")"
+grep -q '^RESULT=findings live=1 cr=0 gr=1 ' "$WORK/pushrace_review_findings.out" || fail "bound finding not counted: $(cat "$WORK/pushrace_review_findings.out")"
+wp pushrace_findings_noreview
+[ "$rc" -eq 2 ] || fail "pushrace_findings_noreview: unscopable comments not unknown, rc=$rc: $(cat "$WORK/pushrace_findings_noreview.out")"
+grep -q 'unknown=1' "$WORK/pushrace_findings_noreview.out" || fail "pushrace_findings_noreview: not unknown: $(cat "$WORK/pushrace_findings_noreview.out")"
+# A first review in progress with no completed evidence stays pending, as before.
+wp pushrace_pending_first
+[ "$rc" -eq 2 ] || fail "pushrace_pending_first: an in-progress first review was not waited on, rc=$rc: $(cat "$WORK/pushrace_pending_first.out")"
+grep -q 'greptile=in_progress live=' "$WORK/pushrace_pending_first.out" || fail "pushrace_pending_first: $(cat "$WORK/pushrace_pending_first.out")"
+
+echo "PASS watch-pr: settled reviews, resolved-thread scope, earlier-verdict Greptile scope, change_assessment head marker, reviewer override, Greptile run on an older commit"

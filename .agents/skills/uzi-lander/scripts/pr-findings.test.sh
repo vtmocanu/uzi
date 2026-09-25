@@ -14,6 +14,8 @@ cat > "$WORK/bin/gh" <<'STUB'
 set -eu
 if [ "${1:-}" = pr ] && [ "${2:-}" = view ]; then echo deadbeefdeadbeefdeadbeefdeadbeefdeadbeef; exit 0; fi
 if [ "${1:-}" = api ]; then
+# pushrace* modes: the PR #1698 race, shared with the other entrypoints' tests.
+case "$MODE" in pushrace*) . "$RACE_FIXTURE"; shift; race_api "$@"; exit $? ;; esac
   case "$*" in
     *'graphql'*)
       if [ "$MODE" = cr_resolved ]; then
@@ -81,6 +83,7 @@ echo "unexpected gh call: $*" >&2
 exit 1
 STUB
 chmod +x "$WORK/bin/gh"
+export RACE_FIXTURE="$HERE/lib/greptile-race.fixture.sh"
 MODE="clean"; export MODE
 
 PATH="$WORK/bin:$PATH" bash "$SCRIPT" test/repo 42 > "$WORK/out" 2>&1 \
@@ -91,11 +94,11 @@ if grep -q '^  GR  ' "$WORK/out"; then fail "old Greptile comment survived clean
 
 MODE="race"; export MODE
 set +e
-PATH="$WORK/bin:$PATH" bash "$SCRIPT" test/repo 42 > "$WORK/race.out" 2>&1
+PATH="$WORK/bin:$PATH" bash "$SCRIPT" test/repo 42 > "$WORK/pushrace.out" 2>&1
 rc=$?
 set -e
-[ "$rc" -eq 3 ] || fail "incomplete current Greptile findings exited rc=$rc, want 3: $(cat "$WORK/race.out")"
-grep -q 'Greptile finding set incomplete (0/1 current-review comments readable)' "$WORK/race.out" \
+[ "$rc" -eq 3 ] || fail "incomplete current Greptile findings exited rc=$rc, want 3: $(cat "$WORK/pushrace.out")"
+grep -q 'Greptile finding set incomplete (0/1 current-review comments readable)' "$WORK/pushrace.out" \
   || fail "incomplete current Greptile findings were not surfaced"
 
 MODE="in_progress"; export MODE
@@ -289,4 +292,40 @@ grep -q 'incremental pass covered the head' "$WORK/ca-findings.out" || fail "cha
 grep -q '^  CR  ca.go:4' "$WORK/ca-findings.out" || fail "the current-head CR finding was not listed: $(cat "$WORK/ca-findings.out")"
 if grep -q 'carried from an earlier review' "$WORK/ca-findings.out"; then fail "a current-head CR finding was mislabeled as carried/stale: $(cat "$WORK/ca-findings.out")"; fi
 
-echo "PASS pr-findings: settled, resolved current-head scope, earlier-verdict Greptile scope, change_assessment head marker"
+# ---- Greptile's run landed on an OLDER commit than the head it reviewed (PR #1698) ------
+pf() { MODE="$1"; export MODE; set +e; PATH="$WORK/bin:$PATH" bash "$SCRIPT" test/repo 42 > "$WORK/$1.out" 2>&1; rc=$?; set -e; }
+for m in pushrace pushrace_stale_dup; do
+  pf "$m"
+  [ "$rc" -eq 0 ] || fail "$m: a bound clean review did not satisfy the gate, rc=$rc: $(cat "$WORK/$m.out")"
+  grep -qF 'Greptile: completed on head (edit→deadbeef via run on bbbbbbbb) — 10 files reviewed, 0 comments added' "$WORK/$m.out" \
+    || fail "$m: the evidence was not named: $(cat "$WORK/$m.out")"
+done
+for m in pushrace_new_trigger pushrace_new_trigger_absent; do
+  pf "$m"
+  [ "$rc" -eq 3 ] || fail "$m: a newer trigger did not defer, rc=$rc: $(cat "$WORK/$m.out")"
+  grep -q 'Greptile: pending: trigger 2026-09-25T16:24:25Z' "$WORK/$m.out" || fail "$m: pending not named: $(cat "$WORK/$m.out")"
+  grep -q 'review still in progress; findings deferred' "$WORK/$m.out" || fail "$m: not deferred: $(cat "$WORK/$m.out")"
+done
+for m in pushrace_notrigger pushrace_forged pushrace_othersha pushrace_malformed pushrace_short pushrace_nodiff pushrace_truncated pushrace_nowindow pushrace_norun pushrace_early; do
+  pf "$m"
+  [ "$rc" -eq 3 ] || fail "$m: a head without bound Greptile evidence cleared the gate, rc=$rc: $(cat "$WORK/$m.out")"
+  grep -q 'NOT REVIEWED on head by any bot' "$WORK/$m.out" || fail "$m: head not reported unreviewed: $(cat "$WORK/$m.out")"
+done
+for m in pushrace_two_runs pushrace_more_pages; do
+  pf "$m"
+  [ "$rc" -eq 3 ] || fail "$m: ambiguous or truncated evidence exited rc=$rc: $(cat "$WORK/$m.out")"
+  grep -q 'evidence UNREADABLE or ambiguous' "$WORK/$m.out" || fail "$m: not surfaced: $(cat "$WORK/$m.out")"
+  if grep -q 'completed on head' "$WORK/$m.out"; then fail "$m: read as reviewed: $(cat "$WORK/$m.out")"; fi
+done
+pf pushrace_review_findings
+[ "$rc" -eq 0 ] || fail "pushrace_review_findings exited rc=$rc: $(cat "$WORK/pushrace_review_findings.out")"
+grep -qF 'completed on head (review→deadbeef via run on bbbbbbbb) — 10 files reviewed, 1 comments added' "$WORK/pushrace_review_findings.out" || fail "review marker not named: $(cat "$WORK/pushrace_review_findings.out")"
+grep -q '^  GR  in.go:3' "$WORK/pushrace_review_findings.out" || fail "bound finding not listed: $(cat "$WORK/pushrace_review_findings.out")"
+pf pushrace_findings_noreview
+[ "$rc" -eq 3 ] || fail "pushrace_findings_noreview exited rc=$rc: $(cat "$WORK/pushrace_findings_noreview.out")"
+grep -q 'review id is missing' "$WORK/pushrace_findings_noreview.out" || fail "missing review id not surfaced: $(cat "$WORK/pushrace_findings_noreview.out")"
+pf pushrace_pending_first
+[ "$rc" -eq 3 ] || fail "pushrace_pending_first exited rc=$rc: $(cat "$WORK/pushrace_pending_first.out")"
+grep -q 'review still in progress; findings deferred' "$WORK/pushrace_pending_first.out" || fail "pushrace_pending_first not deferred: $(cat "$WORK/pushrace_pending_first.out")"
+
+echo "PASS pr-findings: settled, resolved current-head scope, earlier-verdict Greptile scope, change_assessment head marker, Greptile run on an older commit"
