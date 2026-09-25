@@ -9,10 +9,11 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/vtmocanu/uzi/api/internal/capability"
+	"github.com/vtmocanu/uzi/api/internal/jointoken"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
@@ -36,16 +37,33 @@ func TestWorkerInputReceiptsLiveDB(t *testing.T) {
 	svc := workersvc.New(q, newHandlerTestBox(t), workersvc.Params{})
 	svc.SetTxBeginner(pool)
 	h := &Handler{q: q, wsvc: svc}
+	router := h.WorkerRoutes(mw.NewLimiter(1000, time.Minute, nil))
+	tokens := make(map[uuid.UUID]string)
+	user, worker, nextWorker, run := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	newWorker := func(id uuid.UUID, name string, capable bool) {
+		t.Helper()
+		token, hash, err := jointoken.Generate()
+		if err != nil {
+			t.Fatal(err)
+		}
+		tokens[id] = token
+		caps := []string{}
+		if capable {
+			caps = append(caps, capability.InputReceiptsV1)
+		}
+		if _, err := pool.Exec(ctx, `INSERT INTO workers (id,user_id,name,token_hash,protocol_capabilities) VALUES ($1,$2,$3,$4,$5)`, id, user, name, hash, caps); err != nil {
+			t.Fatal(err)
+		}
+	}
 	exec := func(sql string, args ...any) {
 		t.Helper()
 		if _, err := pool.Exec(ctx, sql, args...); err != nil {
 			t.Fatal(err)
 		}
 	}
-	user, worker, nextWorker, run := uuid.New(), uuid.New(), uuid.New(), uuid.New()
 	exec(`INSERT INTO users (id,email,password_hash) VALUES ($1,$2,'x')`, user, fmt.Sprintf("receipt-%s@e2e", user))
-	exec(`INSERT INTO workers (id,user_id,name,token_hash,protocol_capabilities) VALUES ($1,$2,'receipt',$3,ARRAY[$4]::text[])`, worker, user, worker[:], capability.InputReceiptsV1)
-	exec(`INSERT INTO workers (id,user_id,name,token_hash,protocol_capabilities) VALUES ($1,$2,'receipt2',$3,ARRAY[$4]::text[])`, nextWorker, user, nextWorker[:], capability.InputReceiptsV1)
+	newWorker(worker, "receipt", true)
+	newWorker(nextWorker, "receipt2", true)
 	exec(`INSERT INTO runs (id,user_id,issue_iid,issue_title,issue_description,status,worker_id,claim_generation) VALUES ($1,$2,1,'t','d','running',$3,1)`, run, user, worker)
 	ids := make(map[string]int64)
 	for _, kind := range []string{"cancel", "approve_plan", "follow_up"} {
@@ -56,16 +74,17 @@ func TestWorkerInputReceiptsLiveDB(t *testing.T) {
 		ids[kind] = id
 	}
 	wkr := store.Worker{ID: worker, UserID: user, ProtocolCapabilities: []string{capability.InputReceiptsV1}}
-	request := func(method, path, body string, who store.Worker) *http.Request {
+	request := func(method, path, body, token string) *http.Request {
 		req := httptest.NewRequest(method, "/api/worker/runs/"+run.String()+path, strings.NewReader(body))
-		rc := chi.NewRouteContext()
-		rc.URLParams.Add("id", run.String())
-		return req.WithContext(context.WithValue(mw.ContextWithWorker(req.Context(), who), chi.RouteCtxKey, rc))
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		return req
 	}
-	call := func(fn func(http.ResponseWriter, *http.Request), method, path, body string, who store.Worker, want int) map[string]any {
+	call := func(method, path, body string, who store.Worker, want int) map[string]any {
 		t.Helper()
 		rec := httptest.NewRecorder()
-		fn(rec, request(method, path, body, who))
+		router.ServeHTTP(rec, request(method, path, body, tokens[who.ID]))
 		if rec.Code != want {
 			t.Fatalf("%s %s status %d want %d: %s", method, path, rec.Code, want, rec.Body.String())
 		}
@@ -75,9 +94,20 @@ func TestWorkerInputReceiptsLiveDB(t *testing.T) {
 		}
 		return out
 	}
+	for _, path := range []string{"/inputs", "/inputs/ack", "/inputs/applied"} {
+		method := http.MethodPost
+		if path == "/inputs" {
+			method = http.MethodGet
+		}
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, request(method, path, `{"ids":[1],"claim_generation":1}`, ""))
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("unauthenticated %s %s: status %d", method, path, rec.Code)
+		}
+	}
 	get := func(who store.Worker, want int) {
 		t.Helper()
-		out := call(h.WorkerRunInputs, "GET", "/inputs", "", who, 200)
+		out := call("GET", "/inputs", "", who, 200)
 		if got := len(out["inputs"].([]any)); got != want {
 			t.Fatalf("GET inputs=%d want %d", got, want)
 		}
@@ -93,28 +123,63 @@ func TestWorkerInputReceiptsLiveDB(t *testing.T) {
 	}
 	for _, kind := range []string{"cancel", "approve_plan", "follow_up"} {
 		body := fmt.Sprintf(`{"ids":[%d],"claim_generation":1}`, ids[kind])
-		out := call(h.WorkerRunInputsAck, "POST", "/inputs/ack", body, wkr, 200)
+		out := call("POST", "/inputs/ack", body, wkr, 200)
 		if out["active"] != true || len(out["inputs"].([]any)) != 1 {
 			t.Fatalf("ACK %s: %v", kind, out)
 		}
 		get(wkr, 3) // consumed but unapplied is replayed
+		// Model a lost ACK response: the worker retries the same receipt.
+		repeat := call("POST", "/inputs/ack", body, wkr, 200)
+		if repeat["active"] != true || len(repeat["inputs"].([]any)) != 1 {
+			t.Fatalf("lost ACK retry %s: %v", kind, repeat)
+		}
 		exec(`UPDATE runs SET claim_released_at=now() WHERE id=$1`, run)
-		retry := call(h.WorkerRunInputsAck, "POST", "/inputs/ack", body, wkr, 200)
+		retry := call("POST", "/inputs/ack", body, wkr, 200)
 		if retry["active"] != false || len(retry["inputs"].([]any)) != 1 {
 			t.Fatalf("released retry %s: %v", kind, retry)
 		}
-		call(h.WorkerRunInputsApplied, "POST", "/inputs/applied", body, wkr, 409)
+		call("POST", "/inputs/applied", body, wkr, 409)
 		exec(`UPDATE runs SET claim_released_at=NULL WHERE id=$1`, run)
 	}
-	exec(`UPDATE runs SET worker_id=$2,claim_generation=2 WHERE id=$1`, run, nextWorker)
-	body := fmt.Sprintf(`{"ids":[%d],"claim_generation":1}`, ids["cancel"])
-	retry := call(h.WorkerRunInputsAck, "POST", "/inputs/ack", body, wkr, 200)
-	if retry["active"] != false {
-		t.Fatalf("old claim retry active: %v", retry)
+	// A switch fences the old claim before release. A lost ACK response remains
+	// recoverable for each input kind while the claim changes hands.
+	exec(`UPDATE runs SET credential_switch_requested_at=now(),credential_switch_generation=1 WHERE id=$1`, run)
+	for _, kind := range []string{"cancel", "approve_plan", "follow_up"} {
+		body := fmt.Sprintf(`{"ids":[%d],"claim_generation":1}`, ids[kind])
+		retry := call("POST", "/inputs/ack", body, wkr, 200)
+		if retry["active"] != false || len(retry["inputs"].([]any)) != 1 {
+			t.Fatalf("switched retry %s: %v", kind, retry)
+		}
 	}
+	exec(`UPDATE runs SET claim_released_at=now() WHERE id=$1`, run)
+	for _, kind := range []string{"cancel", "approve_plan", "follow_up"} {
+		body := fmt.Sprintf(`{"ids":[%d],"claim_generation":1}`, ids[kind])
+		retry := call("POST", "/inputs/ack", body, wkr, 200)
+		if retry["active"] != false || len(retry["inputs"].([]any)) != 1 {
+			t.Fatalf("released switch retry %s: %v", kind, retry)
+		}
+	}
+	exec(`UPDATE runs SET worker_id=$2,claim_generation=2,claim_released_at=NULL,credential_switch_requested_at=NULL,credential_switch_generation=NULL WHERE id=$1`, run, nextWorker)
+	for _, kind := range []string{"cancel", "approve_plan", "follow_up"} {
+		body := fmt.Sprintf(`{"ids":[%d],"claim_generation":1}`, ids[kind])
+		retry := call("POST", "/inputs/ack", body, wkr, 200)
+		if retry["active"] != false || len(retry["inputs"].([]any)) != 1 {
+			t.Fatalf("old claim retry %s: %v", kind, retry)
+		}
+	}
+	body := fmt.Sprintf(`{"ids":[%d],"claim_generation":1}`, ids["cancel"])
 	newer := store.Worker{ID: nextWorker, UserID: user, ProtocolCapabilities: []string{capability.InputReceiptsV1}}
-	get(newer, 3)
-	call(h.WorkerRunInputsApplied, "POST", "/inputs/applied", body, wkr, 409)
+	replayed := call("GET", "/inputs", "", newer, 200)["inputs"].([]any)
+	for i, kind := range []string{"cancel", "approve_plan", "follow_up"} {
+		if len(replayed) != 3 {
+			t.Fatalf("new claim replayed %d inputs: %v", len(replayed), replayed)
+		}
+		input := replayed[i].(map[string]any)
+		if input["kind"] != kind || int64(input["id"].(float64)) != ids[kind] {
+			t.Fatalf("new claim replay %d = %v, want %s input %d", i, input, kind, ids[kind])
+		}
+	}
+	call("POST", "/inputs/applied", body, wkr, 409)
 	// Each replayed receipt moves to the active claim, then can be applied.
 	for i, kind := range []string{"cancel", "approve_plan", "follow_up"} {
 		var consumedBefore string
@@ -122,7 +187,7 @@ func TestWorkerInputReceiptsLiveDB(t *testing.T) {
 			t.Fatal(err)
 		}
 		body := fmt.Sprintf(`{"ids":[%d],"claim_generation":2}`, ids[kind])
-		ack := call(h.WorkerRunInputsAck, "POST", "/inputs/ack", body, newer, 200)
+		ack := call("POST", "/inputs/ack", body, newer, 200)
 		if ack["active"] != true || len(ack["inputs"].([]any)) != 1 {
 			t.Fatalf("takeover ACK %s: %v", kind, ack)
 		}
@@ -137,20 +202,20 @@ func TestWorkerInputReceiptsLiveDB(t *testing.T) {
 			t.Fatalf("takeover ownership %s: generation=%d worker=%s applied=%v consumed=%q before=%q", kind, generation, owner, appliedAt, consumedAfter, consumedBefore)
 		}
 		oldBody := fmt.Sprintf(`{"ids":[%d],"claim_generation":1}`, ids[kind])
-		call(h.WorkerRunInputsAck, "POST", "/inputs/ack", oldBody, wkr, 409)
-		call(h.WorkerRunInputsApplied, "POST", "/inputs/applied", body, wkr, 409)
-		call(h.WorkerRunInputsApplied, "POST", "/inputs/applied", body, newer, 200)
+		call("POST", "/inputs/ack", oldBody, wkr, 409)
+		call("POST", "/inputs/applied", body, wkr, 409)
+		call("POST", "/inputs/applied", body, newer, 200)
 		get(newer, 2-i)
 	}
-	call(h.WorkerRunInputsAck, "POST", "/inputs/ack", body, wkr, 409)
+	call("POST", "/inputs/ack", body, wkr, 409)
 	var fresh int64
 	if err := pool.QueryRow(ctx, `INSERT INTO run_user_inputs (run_id,kind,body) VALUES ($1,'follow_up','new') RETURNING id`, run).Scan(&fresh); err != nil {
 		t.Fatal(err)
 	}
 	freshBody := fmt.Sprintf(`{"ids":[%d],"claim_generation":2}`, fresh)
-	call(h.WorkerRunInputsAck, "POST", "/inputs/ack", freshBody, newer, 200)
-	call(h.WorkerRunInputsApplied, "POST", "/inputs/applied", freshBody, newer, 200)
-	call(h.WorkerRunInputsApplied, "POST", "/inputs/applied", freshBody, newer, 200)
+	call("POST", "/inputs/ack", freshBody, newer, 200)
+	call("POST", "/inputs/applied", freshBody, newer, 200)
+	call("POST", "/inputs/applied", freshBody, newer, 200)
 	get(newer, 0) // all replayed rows and the fresh follow-up are applied
 
 	// A legacy consume-on-read row was backfilled as applied and cannot be taken over.
@@ -158,7 +223,7 @@ func TestWorkerInputReceiptsLiveDB(t *testing.T) {
 	if err := pool.QueryRow(ctx, `INSERT INTO run_user_inputs (run_id,kind,body,consumed_at,applied_at) VALUES ($1,'cancel','legacy',now(),now()) RETURNING id`, run).Scan(&legacy); err != nil {
 		t.Fatal(err)
 	}
-	call(h.WorkerRunInputsAck, "POST", "/inputs/ack", fmt.Sprintf(`{"ids":[%d],"claim_generation":2}`, legacy), newer, 409)
+	call("POST", "/inputs/ack", fmt.Sprintf(`{"ids":[%d],"claim_generation":2}`, legacy), newer, 409)
 	get(newer, 0)
 
 	otherRun := uuid.New()
@@ -167,7 +232,7 @@ func TestWorkerInputReceiptsLiveDB(t *testing.T) {
 	if err := pool.QueryRow(ctx, `INSERT INTO run_user_inputs (run_id,kind,body) VALUES ($1,'cancel','foreign') RETURNING id`, otherRun).Scan(&foreign); err != nil {
 		t.Fatal(err)
 	}
-	call(h.WorkerRunInputsAck, "POST", "/inputs/ack", fmt.Sprintf(`{"ids":[%d],"claim_generation":2}`, foreign), newer, 400)
+	call("POST", "/inputs/ack", fmt.Sprintf(`{"ids":[%d],"claim_generation":2}`, foreign), newer, 400)
 
 	var switched int64
 	if err := pool.QueryRow(ctx, `INSERT INTO run_user_inputs (run_id,kind,body) VALUES ($1,'follow_up','switch') RETURNING id`, run).Scan(&switched); err != nil {
@@ -175,15 +240,15 @@ func TestWorkerInputReceiptsLiveDB(t *testing.T) {
 	}
 	switchBody := fmt.Sprintf(`{"ids":[%d],"claim_generation":2}`, switched)
 	exec(`UPDATE runs SET credential_switch_requested_at=now(),credential_switch_generation=2 WHERE id=$1`, run)
-	call(h.WorkerRunInputsAck, "POST", "/inputs/ack", switchBody, newer, 409)
+	call("POST", "/inputs/ack", switchBody, newer, 409)
 	exec(`UPDATE runs SET credential_switch_requested_at=NULL,credential_switch_generation=NULL WHERE id=$1`, run)
-	call(h.WorkerRunInputsAck, "POST", "/inputs/ack", switchBody, newer, 200)
+	call("POST", "/inputs/ack", switchBody, newer, 200)
 	exec(`UPDATE runs SET claim_released_at=now() WHERE id=$1`, run)
-	call(h.WorkerRunInputsApplied, "POST", "/inputs/applied", switchBody, newer, 409)
+	call("POST", "/inputs/applied", switchBody, newer, 409)
 
 	// A legacy worker taking over must receive ACKed rows that were never applied.
 	legacyWorker := uuid.New()
-	exec(`INSERT INTO workers (id,user_id,name,token_hash) VALUES ($1,$2,'legacy',$3)`, legacyWorker, user, legacyWorker[:])
+	newWorker(legacyWorker, "legacy", false)
 	exec(`UPDATE runs SET worker_id=$2,claim_generation=3,claim_released_at=NULL WHERE id=$1`, run, legacyWorker)
 	legacyWkr := store.Worker{ID: legacyWorker, UserID: user}
 	var before string
@@ -199,7 +264,7 @@ func TestWorkerInputReceiptsLiveDB(t *testing.T) {
 	if err := pool.QueryRow(ctx, `INSERT INTO run_user_inputs (run_id,kind,body) VALUES ($1,'extend','audit') RETURNING id`, run).Scan(&audit); err != nil {
 		t.Fatal(err)
 	}
-	out := call(h.WorkerRunInputs, "GET", "/inputs", "", legacyWkr, 200)
+	out := call("GET", "/inputs", "", legacyWkr, 200)
 	inputs := out["inputs"].([]any)
 	if len(inputs) != 2 || int64(inputs[0].(map[string]any)["id"].(float64)) != switched ||
 		int64(inputs[1].(map[string]any)["id"].(float64)) != freshLegacy {
@@ -219,7 +284,7 @@ func TestWorkerInputReceiptsLiveDB(t *testing.T) {
 	if applied {
 		t.Fatal("legacy drain applied a server-only audit row")
 	}
-	if got := call(h.WorkerRunInputs, "GET", "/inputs", "", legacyWkr, 200)["inputs"].([]any); len(got) != 0 {
+	if got := call("GET", "/inputs", "", legacyWkr, 200)["inputs"].([]any); len(got) != 0 {
 		t.Fatalf("legacy replayed applied inputs: %v", got)
 	}
 }
