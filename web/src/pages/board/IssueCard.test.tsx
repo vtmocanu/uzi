@@ -66,12 +66,20 @@ function renderCard(over: Partial<Card> = {}) {
   );
 }
 
-// PRD #1650 D3a: once automatic CI fixing halts on the card's branch, Fix CI is the
-// user's to press, and the card says so with an "Autofix stopped" marker.
+// PRD #1650 D3a: once automatic CI fixing halts on the card's branch, fixing CI is up
+// to the user, and the card says so with an "Autofix stopped" marker. The accessible name
+// starts with the visible text (WCAG 2.5.3), and the copy never promises a Fix CI button:
+// that button renders only for a failed cached pipeline, the marker in every halt state.
+const haltLabel = (n: number) =>
+  `Autofix stopped after ${n} ${n === 1 ? "attempt" : "attempts"}: automatic CI fixing will not retry on this branch. Fixing CI is up to you.`;
+
 describe("IssueCard — CI auto-fix halted marker (#1650 D3a)", () => {
   it("shows the marker beside the pipeline badge, with the attempt count in its name and title", () => {
     renderCard({ pipeline: FAILED_PIPELINE, ci_autofix_halted: true, ci_autofix_attempts: 3 });
-    const expected = "CI auto-fix stopped after 3 attempts. Fix CI is yours to press.";
+    const expected = haltLabel(3);
+    expect(expected).toBe(
+      "Autofix stopped after 3 attempts: automatic CI fixing will not retry on this branch. Fixing CI is up to you.",
+    );
     const marker = screen.getByRole("img", { name: expected });
     expect(marker.textContent).toBe("Autofix stopped");
     expect(marker.getAttribute("title")).toBe(expected);
@@ -83,17 +91,32 @@ describe("IssueCard — CI auto-fix halted marker (#1650 D3a)", () => {
   it("uses the singular for one attempt", () => {
     renderCard({ pipeline: FAILED_PIPELINE, ci_autofix_halted: true, ci_autofix_attempts: 1 });
     expect(
-      screen.getByRole("img", { name: "CI auto-fix stopped after 1 attempt. Fix CI is yours to press." }),
+      screen.getByRole("img", {
+        name: "Autofix stopped after 1 attempt: automatic CI fixing will not retry on this branch. Fixing CI is up to you.",
+      }),
     ).toBeTruthy();
   });
 
   it("shows the marker where the badge would be when the card has no cached pipeline", () => {
     renderCard({ pipeline: null, ci_autofix_halted: true, ci_autofix_attempts: 2 });
-    const marker = screen.getByRole("img", {
-      name: "CI auto-fix stopped after 2 attempts. Fix CI is yours to press.",
-    });
+    const marker = screen.getByRole("img", { name: haltLabel(2) });
     expect(marker.textContent).toBe("Autofix stopped");
+    expect(marker.getAttribute("title")).toBe(haltLabel(2));
     expect(screen.queryByRole("link", { name: /^CI / })).toBeNull();
+    // No Fix CI button renders without a failed pipeline, so the copy must not name one.
+    expect(screen.queryByRole("button", { name: "Fix CI" })).toBeNull();
+    expect(marker.getAttribute("aria-label")).not.toMatch(/Fix CI/);
+  });
+
+  it("does not promise Fix CI while a new pipeline runs", () => {
+    renderCard({
+      pipeline: { ...FAILED_PIPELINE, status: "running" },
+      ci_autofix_halted: true,
+      ci_autofix_attempts: 3,
+    });
+    const marker = screen.getByRole("img", { name: haltLabel(3) });
+    expect(marker.textContent).toBe("Autofix stopped");
+    expect(screen.queryByRole("button", { name: "Fix CI" })).toBeNull();
   });
 
   it("is absent when ci_autofix_halted is false", () => {
@@ -102,7 +125,7 @@ describe("IssueCard — CI auto-fix halted marker (#1650 D3a)", () => {
     expect(screen.getByText("#7")).toBeTruthy();
     expect(screen.getByRole("button", { name: "Fix CI" })).toBeTruthy();
     expect(screen.queryByText("Autofix stopped")).toBeNull();
-    expect(screen.queryByRole("img", { name: /auto-fix stopped/ })).toBeNull();
+    expect(screen.queryByRole("img", { name: /^Autofix stopped/ })).toBeNull();
   });
 
   it("is absent when the halt fields are missing (an older API replica)", () => {
@@ -110,6 +133,6 @@ describe("IssueCard — CI auto-fix halted marker (#1650 D3a)", () => {
     expect(screen.getByText("#7")).toBeTruthy();
     expect(screen.getByRole("button", { name: "Fix CI" })).toBeTruthy();
     expect(screen.queryByText("Autofix stopped")).toBeNull();
-    expect(screen.queryByRole("img", { name: /auto-fix stopped/ })).toBeNull();
+    expect(screen.queryByRole("img", { name: /^Autofix stopped/ })).toBeNull();
   });
 });

@@ -203,6 +203,22 @@ describe("Run defaults — run judge opt-in (PRD #46, Decision 7)", () => {
     expect(text).toMatch(/recommend/i);
   });
 
+  it("says where the judge's results appear, with no inbox (PRD #1650)", () => {
+    const { container } = render(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+    const text = container.textContent ?? "";
+    // Positive half first: the results' real homes. The negative below is the
+    // did-the-retired-copy-come-back guard and stays paired with it.
+    expect(text).toContain(
+      "Results appear on the Judge page and on the run\u2019s page, plus a Slack DM when your Slack account is linked.",
+    );
+    expect(text).toContain("It only recommends and never changes code.");
+    expect(text).not.toMatch(/inbox/i);
+  });
+
   it("reflects the current opt-in state", () => {
     mockAuth({ ...baseUser, judge_enabled: true });
     render(

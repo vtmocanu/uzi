@@ -194,8 +194,19 @@ const boardFixtures: Record<string, Board> = {
         conflict: true,
         assignee_ids: [],
         forge_updated_at: minsAgo(1500),
-        latest_run: null,
-        // A red per-card pipeline: the Fix CI affordance (M6) will hang off this.
+        // run-ci-halted opened MR !47 for this issue. The halt below is read through this
+        // run's branch, so a halted card always has a latest run.
+        latest_run: latestRun({
+          id: "run-ci-halted",
+          status: "completed",
+          mr_iid: 47,
+          mr_web_url: "https://gitlab.example.com/myorg/uzi/-/merge_requests/47",
+          mr_state: "opened",
+          worker_name: "laptop",
+          created_at: minsAgo(1752),
+          updated_at: minsAgo(1682),
+        }),
+        // A red per-card pipeline on the run's branch, so the card shows Fix CI.
         pipeline: {
           status: "failed",
           web_url: "https://gitlab.example.com/myorg/uzi/-/pipelines/4201",
@@ -204,7 +215,7 @@ const boardFixtures: Record<string, Board> = {
           synced_at: minsAgo(3),
         },
         // PRD #1650 D3a: automatic CI fixing gave up on this branch, so the card shows
-        // the "Autofix stopped" marker beside the red badge and Fix CI is the user's.
+        // the "Autofix stopped" marker beside the red badge and the Fix CI button.
         ci_autofix_halted: true,
         ci_autofix_attempts: 3,
       },
@@ -370,7 +381,8 @@ const boardFixtures: Record<string, Board> = {
         }),
         pipeline: null,
         // PRD #1650 D3a: a halt with no cached pipeline. The halt comes from the autofix
-        // ledger, not the badge, so the marker shows where the pipeline badge would be.
+        // ledger, not the badge, so the marker shows where the pipeline badge would be,
+        // and no Fix CI button renders (it needs a failed pipeline).
         ci_autofix_halted: true,
         ci_autofix_attempts: 1,
       },

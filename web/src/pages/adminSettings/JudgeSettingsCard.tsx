@@ -72,8 +72,9 @@ export function JudgeSettingsCard({
         <p className="mt-2 text-sm text-muted">
           When on, every finished run of an opted-in user is reviewed by an LLM on{" "}
           <strong className="text-fg">that user&rsquo;s own Anthropic tokens</strong>, producing a verdict
-          and recommendations in their inbox. This switch arms the feature instance-wide; each user still
-          opts in under their own Settings. Off by default.
+          and recommendations on the Judge page and the run&rsquo;s page, plus a Slack DM when that user has
+          linked Slack. This switch arms the feature instance-wide; each user still opts in under their own
+          Settings. Off by default.
         </p>
       </div>
 

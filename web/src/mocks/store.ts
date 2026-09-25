@@ -84,6 +84,9 @@ function seed(): MockState {
   // run-closed is a completed run (its MR was later closed unmerged); reuse the
   // done stream so it also shows the run-view usage surfaces (PRD #40 web-ux).
   messages.set("run-closed", [...mockDoneMessages]);
+  // run-ci-halted (PRD #1650 D3a) is a completed run too; the CI halt is board-card state,
+  // not a feed row, so the done stream is enough to open its run view.
+  messages.set("run-ci-halted", [...mockDoneMessages]);
   messages.set("run-awaiting", [...mockAwaitingMessages]);
   // PRD #209 M5: the seeded-plan demo run. Its plan rides run.plan_md (SeededPlanPanel),
   // NOT a feed message, so this log carries none — see mockSeededMessages.

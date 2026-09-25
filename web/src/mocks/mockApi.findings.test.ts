@@ -12,7 +12,7 @@ async function freshApi() {
 afterEach(() => vi.resetModules());
 
 // Expectations are DERIVED from the fixture, not snapshotted — the demo fixture must be free
-// to grow (it feeds the page, the card, and the notification) without reddening these.
+// to grow (it feeds the page and the card) without reddening these.
 const mine = mockFindings.filter((f) => f.user_id === mockAdmin.id);
 const openCount = mine.filter((f) => f.status === "open").length;
 

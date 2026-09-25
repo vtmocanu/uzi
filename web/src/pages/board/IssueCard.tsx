@@ -53,20 +53,16 @@ function Highlighted({ text, query }: { text: string; query: string }) {
   );
 }
 
-/**
- * One board card. Exported for the same reason RunView factors out its panels: `Board`
- * itself needs routing, four API mocks and a drag context to mount, and this file had NO
- * test at all — so an assertion about a card could not otherwise be written, and the #124
- * strip on `card.title` would have shipped unverified.
- */
 // AutofixHaltedMarker (PRD #1650 D3a) says automatic CI fixing has stopped on the
-// card's branch (attempt cap or no-progress halt), so Fix CI is now the user's to
-// press. It sits beside the pipeline badge, or in its place when no pipeline is
-// cached (the halt is read from the autofix ledger, not from `pipeline`). Warn tone:
-// a human owes the branch its next step, like the run parks. role="img" gives the
-// short visible label a full accessible name carrying the attempt count.
+// card's branch (attempt cap or no-progress halt), so fixing CI is now up to the user.
+// It sits beside the pipeline badge, or in its place when no pipeline is cached (the
+// halt is read from the autofix ledger, not from `pipeline`). The copy never names the
+// Fix CI button: that renders only for a failed cached pipeline, while the marker also
+// shows with no pipeline or while a new one runs. Warn tone: a human owes the branch its
+// next step, like the run parks. role="img" gives the short visible label a full
+// accessible name that starts with the same words (WCAG 2.5.3) and adds the count.
 function AutofixHaltedMarker({ attempts }: { attempts: number }) {
-  const label = `CI auto-fix stopped after ${attempts} ${attempts === 1 ? "attempt" : "attempts"}. Fix CI is yours to press.`;
+  const label = `Autofix stopped after ${attempts} ${attempts === 1 ? "attempt" : "attempts"}: automatic CI fixing will not retry on this branch. Fixing CI is up to you.`;
   return (
     <span role="img" aria-label={label} title={label} className="inline-flex">
       <Badge tone="warning">Autofix stopped</Badge>
@@ -74,6 +70,12 @@ function AutofixHaltedMarker({ attempts }: { attempts: number }) {
   );
 }
 
+/**
+ * One board card. Exported for the same reason RunView factors out its panels: `Board`
+ * itself needs routing, four API mocks and a drag context to mount, and this file had NO
+ * test at all — so an assertion about a card could not otherwise be written, and the #124
+ * strip on `card.title` would have shipped unverified.
+ */
 export function IssueCard({
   card,
   repoId,
