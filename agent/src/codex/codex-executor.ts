@@ -2348,6 +2348,7 @@ export class CodexExecutor implements Executor {
     buildPhaseBroker: (phase: "plan" | "implement", signal?: AbortSignal) => CodexCallbackBroker,
     scrubLeadText: (s: string) => string,
   ): Promise<ReducedTurnResult> {
+    const callbackCursor = registry.callbackAdmissionCursor();
     const turnAbort = new AbortController();
     let tripReason: string | undefined;
     const trip = (reason: string): void => {
@@ -2389,14 +2390,18 @@ export class CodexExecutor implements Executor {
       } else ctx.signal.addEventListener("abort", onCancel, { once: true });
     }
     let idleTimer: ReturnType<typeof setTimeout> | undefined;
+    let currentTurnCallbacks = registry.inFlightCallbackCountSince(callbackCursor);
     const armIdle = (): void => {
       if (idleTimer) clearTimeout(idleTimer);
       idleTimer = undefined;
-      if (registry.inFlightCallbackCount() > 0) return;
+      currentTurnCallbacks = registry.inFlightCallbackCountSince(callbackCursor);
+      if (currentTurnCallbacks > 0) return;
       idleTimer = setTimeout(() => trip(REASON_IDLE), idleMs);
       idleTimer.unref?.();
     };
-    const unsubscribeCallbacks = registry.subscribeCallbacks(armIdle);
+    const unsubscribeCallbacks = registry.subscribeCallbacks(() => {
+      if (registry.inFlightCallbackCountSince(callbackCursor) !== currentTurnCallbacks) armIdle();
+    });
     // Issue #1600: arm the RUN-WIDE remaining budget, not a fresh per-turn wall; the finally debits
     // this turn's elapsed time. An already-spent budget trips before the turn starts.
     const wallArmedAt = Date.now();

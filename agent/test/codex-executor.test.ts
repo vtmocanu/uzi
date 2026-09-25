@@ -1773,6 +1773,62 @@ describe("CodexExecutor: child-thread delegation demux (part C)", () => {
     assert.equal(replyOf1(rig).success, true, "the parent spawn_agent callback succeeded after the child settled");
   });
 
+  it("(20a) a refused wall-park re-drive ignores an unsettled callback from the interrupted drive for idle", async () => {
+    const IDLE_MS = 90;
+    const rig = makeRig({ responder: (c) => {
+      if (c.method === "thread/start") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") {
+        if (c.turnStartCount === 1) c.transport.push(threadStarted());
+        return { turn: { id: "tn-1" } };
+      }
+      return {};
+    } });
+    rig.deps = { ...rig.deps, idleMs: IDLE_MS, wallMs: 50, boundaryDeadlineMs: 50 };
+
+    // Capture the real epoch registry as the executor subscribes its idle watchdog.
+    // Both drives must use this same registry; the first reservation stays unsettled.
+    const subscribe = ExecutionRegistry.prototype.subscribeCallbacks;
+    let registry: ExecutionRegistry | undefined;
+    ExecutionRegistry.prototype.subscribeCallbacks = function (listener) {
+      registry = this;
+      return subscribe.call(this, listener);
+    };
+    let parks = 0;
+    const { ctx } = makeCtx({
+      parkForWall: async () => ++parks === 1 ? "refused" : "parked",
+      takeWallParkRefresh: () => ({ totalSeconds: 1, usedSeconds: 0 }),
+    });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    try {
+      await waitFor(() => rig.transport.turnStartCount === 1 && registry !== undefined, "first drive and registry");
+      const epoch = registry!;
+      const stale = epoch.reserveCallback({ threadId: "th-1", turnId: "tn-1", callId: "stale", fingerprint: "stale" });
+      assert.equal(stale.kind, "admitted");
+
+      await waitFor(() => rig.transport.turnStartCount === 2, "refused park re-drive");
+      assert.equal(registry, epoch, "the re-drive uses the same epoch registry");
+      assert.equal(epoch.inFlightCallbackCount(), 1, "the interrupted drive left one callback unsettled");
+      const current = epoch.reserveCallback({ threadId: "th-1", turnId: "tn-1", callId: "current", fingerprint: "current" });
+      assert.equal(current.kind, "admitted");
+      if (current.kind !== "admitted") return;
+
+      await new Promise<void>((resolve) => setTimeout(resolve, IDLE_MS + 50));
+      assert.equal(parks, 1, "a callback admitted in the current drive suppresses idle");
+      epoch.settleCallback(current.token, "ok");
+      assert.equal(epoch.inFlightCallbackCount(), 1, "only the stale callback remains");
+      await assert.rejects(
+        withTimeout(running, 2000, "idle after the current callback settles"),
+        /codex run idle timeout/,
+        "the current drive idles even though the interrupted drive's callback never settled",
+      );
+      assert.equal(parks, 1, "idle did not consume the bounded wall budget");
+    } finally {
+      ExecutionRegistry.prototype.subscribeCallbacks = subscribe;
+      rig.transport.end();
+      await running.catch(() => undefined);
+    }
+  });
+
   it("(C4a) a child's token_usage_updated flows through the REAL delegation flow and is charged to the CHILD's configured model, not the root's", async () => {
     // The executor→accountant wiring seam: startChildTurn calls harness.recordChildThreadModel
     // (codex-executor.ts) so a child thread is REGISTERED with the model it was spawned on. If
