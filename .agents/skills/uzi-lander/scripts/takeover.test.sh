@@ -39,18 +39,23 @@ case "$*" in
     esac ;;
   *'/issues/42/comments'*)
     if [ "$MODE" = prior_requested ]; then printf '[{"user":{"login":"lander","type":"User"},"created_at":"%s","body":"@greptileai review"}]\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    elif [ "$MODE" = outside_diff ]; then
+      jq -n --arg h "$HEAD" '[{id:900,user:{login:"greptile-apps[bot]"},body:("<!-- greptile_outside_diff -->\n\n- <img alt=\"P1\">&nbsp;**Halt alert can be lost** `x.go:252` <a href=\"https://x/blob/" + $h + "/x.go#L252\">x</a>")}]'
     else echo '[]'; fi ;;
   *"/commits/$HEAD/check-runs"*)
     case "$MODE" in
       head_clean) greptile completed '"success"' 'Greptile has reviewed the Pull Request.\n\n90 files reviewed, 0 comments added.' ;;
       head_findings) greptile completed '"success"' '90 files reviewed, 10 comments added' ;;
+      outside_diff) greptile completed '"success"' '149 files reviewed, 1 comments added' ;;
       head_failed) greptile completed '"failure"' '' ;;
       head_unreadable) echo '[]' ;;
       # Newest first, as the API lists them: the re-trigger (id 2) found something the first run did not.
       head_two_runs) echo '{"check_runs":[{"id":2,"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"90 files reviewed, 1 comments added"}},{"id":1,"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"90 files reviewed, 0 comments added"}}]}' ;;
       *) none ;;
     esac ;;
-  *'/pulls/42/comments'*) echo '[{"user":{"login":"greptile-apps[bot]"},"line":8,"body":"<img alt=\"P1\"> finding","pull_request_review_id":99}]' ;;
+  *'/pulls/42/comments'*)
+    if [ "$MODE" = outside_diff ]; then echo '[]'
+    else echo '[{"user":{"login":"greptile-apps[bot]"},"line":8,"body":"<img alt=\"P1\"> finding","pull_request_review_id":99}]'; fi ;;
   *'/pulls/42/commits'*)
     [ "$MODE" = prior_unreadable ] && exit 1
     printf '[{"sha":"%s"},{"sha":"%s"}]\n' "$PREV" "$HEAD" ;;
@@ -83,6 +88,12 @@ has head_clean 'LIVE_FINDINGS=0 (cr=0 gr=0 '
 # ...while ", 10 comments added" must not match the ", 0 comments added" clean test.
 snap head_findings
 has head_findings 'LIVE_FINDINGS=1 (cr=0 gr=1 '
+
+# Every finding the head pass added is outside the diff (one Greptile ISSUE comment, no
+# inline comment, no review object): it is live, so the PR is never NEXT=ready (PR #1671).
+snap outside_diff
+has outside_diff 'LIVE_FINDINGS=1 (cr=0 gr=1 '
+hasnt outside_diff 'NEXT=ready'
 
 # No Greptile evidence on the head: the newest earlier verdict scopes the count, and the
 # head still reads unreviewed (an earlier verdict never satisfies the gate).

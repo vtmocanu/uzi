@@ -235,4 +235,16 @@ scope 0 0 "bbbbbbbb/0" absent "" 2 "$(trigger "$now_iso" 'greptile already looke
 # Unreadable issue comments fail closed and keep the raw count.
 scope 1 2 "" absent "" 2 'x'
 
+# ---- greptile_outside_diff -------------------------------------------------------------
+# Here-strings, not a pipe: the function sets GOD_* in the CALLER's shell.
+od() { greptile_outside_diff "$HEAD_SHA" <<<"$1"; }
+OD_JSON=$(jq -n --arg h "$HEAD_SHA" --arg p "$PREV_SHA" '[{id:1,user:{login:"greptile-apps[bot]"},
+  body:("<!-- greptile_outside_diff -->\n\n- <img alt=\"P1\">&nbsp;**Head bug** `a.go:3` <a href=\"https://x/blob/" + $h + "/a.go#L3\">x</a>\n- <img alt=\"P2\">&nbsp;**Old bug** `b.go:9` <a href=\"https://x/blob/" + $p + "/b.go#L9\">x</a>")}]')
+od "$OD_JSON" || fail "outside-diff read failed"
+[ "$GOD_TOTAL" = 2 ] && [ "$GOD_HEAD" = 1 ] || fail "outside-diff counts: total=$GOD_TOTAL head=$GOD_HEAD"
+printf '%s' "$GOD_LINES" | grep -qF '  GR  a.go:3  [P1] Head bug (outside diff)' || fail "outside-diff row: $GOD_LINES"
+od '[{"id":2,"user":{"login":"someone"},"body":"<!-- greptile_outside_diff -->\n- spoof"}]' || fail "non-greptile comment read failed"
+[ "$GOD_TOTAL" = 0 ] || fail "a non-Greptile comment was counted"
+if od '{"not":"array"}'; then fail "unreadable issue comments did not fail closed"; fi
+
 echo "PASS greptile-verdict: earlier verdict scoped, newer evidence outranks it, unreadable fails closed"
