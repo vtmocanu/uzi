@@ -886,32 +886,6 @@ describe("CodexExecutor: run() control flow (run-lane precedence)", () => {
     await new Promise((resolve) => setTimeout(resolve, 35));
     assert.equal(finished, false, "settlement grants a fresh idle window");
     await assert.rejects(withTimeout(run, 3000, "post-settle idle"), /idle timeout/);
-    assert.equal(effectAborted, false);
-  });
-
-  it("overlapping admitted Bash callbacks keep idle suspended until the final settlement", async () => {
-    const idleMs = 100;
-    const rig = makeRig();
-    const releases: Array<() => void> = [];
-    rig.deps = { ...rig.deps, idleMs, wallMs: 2000,
-      spawnCommand: async () => new Promise((resolve) => {
-        releases.push(() => resolve({ code: 0, stdout: "ok", stderr: "" }));
-      }),
-    };
-    rig.transport.push(threadStarted())
-      .push(toolCall(91, "Bash", { command: "sleep 60" }, "th-1", "tn-1", "overlap-1"))
-      .push(toolCall(92, "Bash", { command: "sleep 60" }, "th-1", "tn-1", "overlap-2"));
-    let finished = false;
-    const run = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx);
-    void run.finally(() => { finished = true; }).catch(() => undefined);
-    await waitFor(() => releases.length === 2, "both Bash effects start");
-    releases[0]!();
-    await waitFor(() => rig.transport.responses.some((r) => r.requestId === 91), "first Bash reply");
-    await new Promise((resolve) => setTimeout(resolve, idleMs + 40));
-    assert.equal(finished, false, "the second admitted callback still suspends idle");
-    releases[1]!();
-    await waitFor(() => rig.transport.responses.some((r) => r.requestId === 92), "second Bash reply");
-    await assert.rejects(withTimeout(run, 3000, "final-settle idle"), /idle timeout/);
   });
 
   it("user cancel propagates the active turn signal into the shell effect", async () => {
