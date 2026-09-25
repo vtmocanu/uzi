@@ -469,8 +469,8 @@ func TestSetRunRunningClearsCompletionMarkerLiveDB(t *testing.T) {
 	e.exec(t, `UPDATE runs SET status = 'awaiting_input', completion_attempts = 1,
 	               open_question_id = $2, completion_question_at = now() WHERE id = $1`, runID, qid)
 	// A consumed answer naming the open question — the awaiting_input→running guard requires it.
-	e.exec(t, `INSERT INTO run_user_inputs (run_id, kind, body, question_id, consumed_at)
-	           VALUES ($1, 'answer', '{"question_id":"`+qid+`","answers":["continue"]}', $2, now())`,
+	e.exec(t, `INSERT INTO run_user_inputs (run_id, kind, body, question_id, consumed_at, applied_at)
+	           VALUES ($1, 'answer', '{"question_id":"`+qid+`","answers":["continue"]}', $2, now(), now())`,
 		runID, qid)
 	if !e.completionMarkerSet(t, runID) {
 		t.Fatal("precondition: the marker must be set before the running report")
