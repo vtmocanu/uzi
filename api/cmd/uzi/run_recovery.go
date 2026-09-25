@@ -34,9 +34,9 @@ func newRunRecoveryCmd(env Env, gf *globalFlags) *cobra.Command {
 			"is available, or discard the held source with `run discard <run-id> --hold <hold-id> " +
 			"--yes`. An `archive_ready` hold releases itself once its archive is durable; `active` is " +
 			"healthy protection of a still-running run and needs nothing.\n\n" +
-			"--json emits the run's raw hold DTOs, each with a `captures` array listing that " +
-			"hold's recovery captures (id, state, source_sha, byte_size, created_at); a capture id " +
-			"is what `run export --capture` takes.",
+			"--json emits each of the run's hold DTOs plus a `captures` array listing that hold's " +
+			"recovery captures (id, state, source_sha, byte_size, created_at); a capture id is what " +
+			"`run export --capture` takes. A hold that outlived its deleted run lists `captures: []`.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, err := env.client(gf)
@@ -61,10 +61,17 @@ func newRunRecoveryCmd(env Env, gf *globalFlags) *cobra.Command {
 			var archives []apitypes.RecoveryArchiveDTO
 			if gf.json && len(forRun) > 0 {
 				summary, err := c.RecoveryArchives(cmd.Context(), runID)
-				if err != nil {
+				switch {
+				case uzicli.ExitCodeFor(err) == uzicli.ExitNotFound:
+					// A released/discarded hold outlives its run (runs cascade-delete with
+					// their repo; holds keep a plain run_id), so the holds list still names a
+					// run whose archives read 404s. Degrade to every hold listing no captures
+					// rather than failing the whole listing.
+				case err != nil:
 					return err
+				default:
+					archives = summary.Archives
 				}
-				archives = summary.Archives
 			}
 			return renderRunRecovery(env, gf, runID, forRun, archives)
 		},
@@ -91,14 +98,14 @@ type recoveryHoldJSON struct {
 
 // holdsWithCaptures attaches each archive to the hold whose id it names, in archive order.
 // Every hold gets a non-nil captures slice, so the JSON is [] and never null. An archive
-// whose hold_id is empty (a server predating the field) or names no listed hold is attached
-// nowhere.
+// whose hold_id names no listed hold (including an empty hold_id from a server predating
+// the field) is attached nowhere.
 func holdsWithCaptures(holds []apitypes.RecoveryCustodyHoldDTO, archives []apitypes.RecoveryArchiveDTO) []recoveryHoldJSON {
 	out := make([]recoveryHoldJSON, 0, len(holds))
 	for _, h := range holds {
 		caps := []recoveryHoldCapture{}
 		for _, a := range archives {
-			if a.HoldID == "" || a.HoldID != h.ID {
+			if a.HoldID != h.ID {
 				continue
 			}
 			caps = append(caps, recoveryHoldCapture{
@@ -111,8 +118,9 @@ func holdsWithCaptures(holds []apitypes.RecoveryCustodyHoldDTO, archives []apity
 }
 
 // renderRunRecovery emits a run's custody holds. --json prints the filtered hold DTOs, each
-// with its captures joined from archives; the human form prints one table row per hold with its exact id, generation, disposition and
-// capture state, plus a one-line hint when a hold needs an owner decision.
+// with its captures joined from archives; the human form prints one table row per hold with
+// its exact id, generation, disposition and capture state, plus a one-line hint when a hold
+// needs an owner decision.
 func renderRunRecovery(env Env, gf *globalFlags, runID string, holds []apitypes.RecoveryCustodyHoldDTO,
 	archives []apitypes.RecoveryArchiveDTO) error {
 	p := env.printer(gf)
