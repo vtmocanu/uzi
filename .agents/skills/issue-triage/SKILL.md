@@ -1,32 +1,21 @@
 ---
 name: issue-triage
-description: "Triages one GitHub issue on this repo end to end. Preflight first: lists spent one-time issue schedules to delete and open issues from anyone but the maintainer, which are triaged first. Then prioritizes issues that are silently un-sweepable by uzi — they look queued but never fire because they are missing a sweep selector (bug/Planned) or the `uzi` eligibility label. Hunts those gaps first, then the raw un-triaged backlog, then proposes revisiting parked (brainstorm/Later) issues. Explains what the issue proposes, recommends whether to implement it, verifies the issue is not stale (premise still holds, file anchors current, any referenced PR or PRD actually merged), then on your confirmation applies the missing sweep labels and posts a freshness comment. Use when triaging the issue backlog, finding issues the nightly sweep will never touch, deciding what to send to uzi, or asked to triage the next issue, go through the open issues, or judge whether an issue is worth doing. Triggers include triage issue, triage the backlog, un-sweepable issues, issues not swept by uzi, next issue to implement, should we do this issue, queue an issue for uzi."
+description: "Triages one GitHub issue on this repo from backlog to a queued or parked decision. Preflight lists spent one-time issue schedules to delete and open issues from non-maintainers, which go first. Then hunts silently un-sweepable issues (a bug/Planned selector without uzi eligibility, or eligible without a selector), then the un-triaged backlog, then parked brainstorm/Later issues. Explains the issue, recommends a verdict, checks freshness (premise, anchors, referenced PR/PRD merged), and on confirmation applies labels plus a freshness comment. Use when triaging the backlog, finding issues the sweep never fires, or deciding what to send to uzi. Triggers include triage issue, triage the backlog, un-sweepable issues, next issue to implement, should we do this issue, queue an issue for uzi, clean up fired schedules."
 ---
 
 # Issue triage
 
-Take ONE un-triaged GitHub issue from backlog to a queued (or parked) decision. One
-issue per run. This repo is **GitHub** (`github.com/vtmocanu/uzi`): use `gh` only, never
-`glab`/`tea`.
+One issue per run. GitHub repo `vtmocanu/uzi`: use `gh` only.
 
-This skill owns the **triage workflow**. It does NOT restate mechanics documented
-elsewhere:
+Out of scope, read instead:
+- Sweep gating and this instance's schedules: `CLAUDE.local.md` → "uzi scheduled jobs", `docs/scheduling.md`, `docs/admin-settings.md#run-eligibility`. Live truth: `uzi schedule list`.
+- Dispatching and plan steering: **uzi-watcher**. Landing the PR: **uzi-lander**.
 
-- **Sweep gating + this instance's sweep labels/schedules** live in `CLAUDE.local.md`
-  → "uzi scheduled sweeps on this instance", plus `docs/scheduling.md` and
-  `docs/admin-settings.md#run-eligibility`. **Read those for how a label makes an issue
-  fire**; do not hardcode the mechanics here (they are machine/instance-specific and
-  drift). Live source of truth for the schedules is `uzi schedule list`.
-- **Sending an issue to uzi and steering its plan** is the **uzi-watcher** skill;
-  **landing the resulting PR** is **uzi-lander**. This skill stops at "queued for the
-  sweep" or "hand to uzi-watcher".
+## Step 0: Preflight
 
-## Step 0 — Preflight (every run, before picking)
+Run both checks; report results before Step 1.
 
-Report both checks to the user before Step 1.
-
-**A. Spent one-shot schedules.** A one-time issue schedule stays listed after it fires
-(`status=fired`, `enabled=true`, `next_fire_at=null`). List them with the run each started:
+**A. Spent one-shot schedules** (fired, still listed as enabled):
 
 ```sh
 uzi schedule list --json 2>/dev/null | jq -r '.[]
@@ -35,16 +24,12 @@ uzi schedule list --json 2>/dev/null | jq -r '.[]
   | "\($id)\t#\(.issue_iid)\t\(.run_id)"'
 ```
 
-For each row, check the run (`uzi run get <run_id> --json | jq -r .status`), the issue
-state and its `agent/issue-<n>` PR. Propose deleting a schedule only when its run is
-terminal and the work has landed (PR merged or issue closed); a schedule whose run is still
-live or unlanded stays. Delete on the user's OK with `uzi schedule delete <id>` (run
-history is preserved). Keep stderr out of the `jq` pipe: the CLI's version-skew warning
-breaks it.
+- Per row, check run status (`uzi run get <run_id> --json | jq -r .status`), issue state, and the `agent/issue-<n>` PR.
+- Propose delete only if the run is terminal AND the work landed (PR merged or issue closed). Keep the rest.
+- On OK: `uzi schedule delete <id>` (run history is preserved).
+- Keep stderr out of `jq` pipes (CLI version-skew warning breaks them).
 
-**B. Issues from anyone but the maintainer.** Issues opened by people other than the
-maintainer (`vtmocanu`) are triaged **first**, ahead of Tier 1. Bot authors (`app/…`,
-e.g. the nightly e2e alarms) are listed separately: they are CI signals, not requests.
+**B. Non-maintainer issues** (triaged before Tier 1; `bot` rows are CI signals, not requests):
 
 ```sh
 gh issue list --repo vtmocanu/uzi --state open --limit 400 --json number,title,author,labels \
@@ -54,50 +39,22 @@ gh issue list --repo vtmocanu/uzi --state open --limit 400 --json number,title,a
   | sort
 ```
 
-An empty result means only the maintainer has open issues. Sanity-check the filter
-against the open total when it looks suspicious.
+Empty = maintainer-only backlog. If suspicious, compare against the open-issue total.
 
-## Step 1 — Pick the issue
+## Step 1: Pick
 
-If the user named an issue (number/URL), use it. Otherwise pick the lowest-numbered
-**external** issue from Step 0B if any, else hunt in **priority order**, picking the
-lowest-numbered issue in the highest non-empty tier.
+Order: user-named issue → lowest-numbered `external` from 0B → lowest-numbered issue in the highest non-empty tier.
 
-**Why the tiers.** A sweep fires an issue only when it has BOTH halves: (a) a
-**selector** label (`Planned`, or `bug` for a bug) AND (b) eligibility — the **`uzi`
-label**, or the issue **assigned to the uzi-bot account** (a second, label-less way
-to be eligible, PRD #767); assignment alone makes an issue eligible — no PRD link
-and no admin waiver required.
-(Authoritative mechanics, which drift: `CLAUDE.local.md` → "uzi scheduled sweeps",
-plus `docs/scheduling.md`, `docs/admin-settings.md#run-eligibility`.) An issue missing
-**either** half looks queued but silently never runs, and nobody notices — so those are
-the highest-priority triage targets, ahead of the raw backlog.
+A sweep fires an issue only with BOTH a selector (`Planned`, or `bug`) AND eligibility (`uzi` label OR assigned to the uzi-bot account). Missing either half = looks queued, never runs.
 
-The gap query below reads **assignees too** when `BOT_LOGIN` is set (`gh issue list --json
-...,labels,assignees,...`), so eligibility = `uzi` label OR bot assignment: a Tier-1A hit
-already excludes bot-assigned issues, and a bot-assigned issue with no selector correctly
-surfaces as Tier-1B rather than Tier-2. When `BOT_LOGIN` is left empty the query degrades to
-label-only (today's behavior), and THEN a Tier-1A hit (selector, no `uzi`) can be a false
-positive if the issue is already bot-assigned and genuinely eligible — in that case the manual
-check still applies: `gh issue view NNN --json assignees` for the account name; if it's already
-assigned to the bot, the issue is not actually a gap.
-
-- **Tier 1 — silently un-sweepable gaps** (not parked). Two shapes (eligibility =
-  `uzi` label OR bot assignment):
-  - **1A selector, not eligible** — has `bug`/`Planned` but is neither `uzi`-labelled
-    nor bot-assigned. The `bug` sweep picks it as a candidate, then the gate drops it.
-    (This is #190's shape.)
-  - **1B eligible, no selector** — is eligible (`uzi` label OR bot-assigned) but has no
-    `bug`/`Planned`, so it never even becomes a candidate. Common on a fully-specced
-    issue nobody labelled `Planned`.
-- **Tier 2 — un-triaged backlog**: no sweep and no park label at all.
-- **Tier 3 — parked** (`brainstorm`/`Later`): propose *revisiting* only when tiers 1
-  and 2 are empty — these need a human decision the sweep will never make.
+- **1A selector, not eligible**: `bug`/`Planned`, no `uzi`, not bot-assigned.
+- **1B eligible, no selector**: `uzi` or bot-assigned, no `bug`/`Planned`.
+- **2 untriaged**: no selector, no park label.
+- **3 parked** (`brainstorm`/`Later`): propose revisiting only when 1 and 2 are empty.
 
 ```sh
-# BOT_LOGIN is this instance's uzi-bot account login (source of truth: CLAUDE.local.md →
-# "uzi scheduled sweeps"). Leaving it empty degrades the query to label-only (today's
-# behavior) rather than erroring — a 1A hit may then be a bot-assigned false positive.
+# BOT_LOGIN: uzi-bot login from CLAUDE.local.md. Empty = label-only; then verify a 1A hit
+# with `gh issue view NNN --json assignees` (bot-assigned = not a gap).
 BOT_LOGIN="${BOT_LOGIN:-}"
 gh issue list --repo vtmocanu/uzi --state open --json number,title,labels,assignees,body --limit 400 \
   | jq -r --arg bot "$BOT_LOGIN" '
@@ -120,80 +77,44 @@ gh issue list --repo vtmocanu/uzi --state open --json number,title,labels,assign
     | sort | .[]'
 ```
 
-Confirm the picked number with the user before spending effort on it. A picked gap
-issue still runs the full Step 2–4 flow: the gap tells you which label is *missing*,
-not that adding it is correct — the issue may be Already done, Not worth it, or
-genuinely `Later` (in which case the fix is to make that intent explicit, not to
-complete the sweep config).
+Confirm the pick with the user. Gap issues still run Steps 2 to 4: the gap names the missing label, not whether adding it is right.
 
-## Step 2 — Understand and explain
+## Step 2: Explain
 
-Read the full issue (`gh issue view NNN --repo vtmocanu/uzi --json title,body,labels,comments`).
-**Read the existing comments** — a decision or verdict may already be recorded.
+- Read issue plus comments: `gh issue view NNN --repo vtmocanu/uzi --json title,body,labels,comments`. A verdict may already be recorded.
+- Give a one-paragraph plain summary, plus one line on user-visible change if any.
 
-Give the user a **short plain-English** summary: what the issue proposes and why, in
-one small paragraph, no jargon. Then a one-line "what changes for a user" if it is
-user-visible.
+## Step 3: Recommend
 
-## Step 3 — Recommend
+One verdict, one-line reason. Apply only after Step 5 confirmation.
 
-State a verdict with a one-line reason. Each verdict has a label action, applied only
-after the user confirms (Step 5):
-
-| Verdict | When | Action on confirm |
+| Verdict | When | Action |
 |---|---|---|
-| **Send to sweep** | clear value, self-contained, premise holds, does NOT touch `.github/workflows` | sweep selector (`Planned`, or `bug` for a bug) + `uzi` unless already labelled; post freshness comment |
-| **Do locally** | tiny/mechanical, or it MUST touch `.github/workflows` (a sweep cannot), or the user wants it now | do it in-session or hand to **uzi-watcher**; no sweep labels |
-| **Needs design** | open question or competing approaches | add `brainstorm`; summarize the fork |
-| **Defer** | valid but not now | add `Later` |
-| **Already done** | premise no longer holds (verify in code) | recommend close, cite the code that already implements it |
-| **Not worth it** | duplicate / invalid / out of scope | comment the rationale + `wontfix`/`duplicate`/`invalid` |
+| **Send to sweep** | clear value, self-contained, premise holds, no `.github/workflows` | add the missing selector/`uzi`; freshness comment |
+| **Do locally** | tiny, must touch `.github/workflows`, or wanted now | in-session or **uzi-watcher**; no sweep labels |
+| **Needs design** | open question / competing approaches | `brainstorm`; summarize the fork |
+| **Defer** | valid, not now | `Later` |
+| **Already done** | premise gone (verified in code) | recommend close; cite code |
+| **Not worth it** | duplicate / invalid / out of scope | rationale comment + `wontfix`/`duplicate`/`invalid` |
 
-Prefer the best-practice choice and say why. Do not author a `prds/*.md` when the issue
-body is already a complete spec — a PRD file is optional, never required, so a
-spec-in-body issue runs fine with just the `uzi` label.
+- Recommend the best-practice option and say why.
+- No `prds/*.md` for a spec-in-body issue; `uzi` label suffices.
+- Tier 1: add only the missing half (1A → `uzi` or bot assignee; 1B → selector).
+- Deliberately deferred gap → **Defer** (`Later`), not sweep completion.
 
-**For a Tier-1 gap issue, the "Send to sweep" action is just completing the missing
-half** — add only what the gap lacks, don't blindly re-add both labels:
+## Step 4: Freshness (sweep/local verdicts only)
 
-- **1A** (selector, not eligible): add `uzi` (or assign the issue to the uzi-bot); the `bug`/`Planned` is already there.
-- **1B** (eligible, no selector): add the selector only (`Planned`, or `bug` for a bug) — eligibility (`uzi` label or bot assignment) is already satisfied.
+Do not trust issue line numbers.
 
-If a Tier-1 gap issue is actually deferred on purpose (that is *why* it lacks a
-selector), the fix is **Defer** — add `Later` to make the intent explicit so it stops
-surfacing as a gap — not to complete the sweep config.
+1. **Premise**: grep the target code. Already implemented → **Already done**.
+2. **Referenced PR/PRD**: confirm merged (`gh pr view NNN --json state,mergedAt`).
+3. **Anchors**: re-grep named symbols; record current locations and omitted/extra sites.
+4. **Design forks**: pin a direction with reason; verify any ADR/PRD conflict against code, not the issue's framing.
+5. **Workflow scope**: a fix that must touch `.github/workflows/**` cannot go to a sweep (worker PAT lacks `workflow` scope; the whole push is rejected). → **Do locally**, or split into a local-only issue. See `.claude/rules/prds.md`.
 
-## Step 4 — Freshness check (only if worth implementing)
+## Step 5: Propose, confirm, apply
 
-Before queuing, confirm the issue is not stale. Do NOT trust its line numbers.
-
-1. **Premise still true.** Grep the code the issue targets. If the change is already
-   implemented, switch the verdict to **Already done** and cite the code.
-2. **Referenced PR/PRD merged.** For a follow-up issue (e.g. "PR #508 review
-   follow-up"), confirm the referenced PR/PRD actually merged (`gh pr view NNN --json
-   state,mergedAt`) so the findings are live, not superseded.
-3. **Refresh anchors.** The issue's `file:line` references drift. Re-grep the named
-   symbols, note current locations, and flag any **omitted or extra sites** the issue
-   missed (e.g. a fourth scan site it listed three of).
-4. **Pin design forks.** If a step embeds a decision — especially one that appears to
-   conflict with an existing ADR / PRD Decision — state the direction and why, so the
-   worker does not guess. Verify the apparent conflict against the actual code/comment
-   rather than the issue's framing.
-5. **Workflow-scope guardrail.** If the fix MUST touch `.github/workflows/**`, it
-   **cannot** go to a uzi sweep: the worker PAT lacks `workflow` scope, so the whole
-   branch push is rejected and the work is lost. Recommend **Do locally**, or split the
-   workflow edit into a separate local-only issue. (Cross-ref `.claude/rules/prds.md`
-   and the uzi-watcher skill's guardrail.)
-
-## Step 5 — Propose, confirm, apply
-
-Labels and comments are public writes on the repo. **Always propose first and apply
-only after the user's OK.** Then:
-
-The snippet below demonstrates the **label-based** eligibility path. For a 1A gap
-whose fix is assignment instead, swap the `--add-label "uzi"` for
-`--add-assignee <uzi-bot>` (the concrete login is instance-specific, sourced from
-`CLAUDE.local.md` — don't invent one).
+Labels and comments are public writes: propose first, apply on OK.
 
 ```sh
 gh issue edit NNN --repo vtmocanu/uzi --add-label "SELECTOR" --add-label "uzi"
@@ -204,10 +125,6 @@ EOF
 )"
 ```
 
-The comment captures the Step-4 findings: refreshed anchors, omitted/extra sites, and
-any pinned design direction. Mirror the style of the freshness comments on #525/#509.
-
-After queuing, remind the user: the sweep runs unattended past the plan gate
-(auto-approve is on for these schedules), but a human still merges the MR and `main` is
-never touched. To review the plan before code lands, drive it via **uzi-watcher** (Auto
-mode) instead of waiting for the sweep.
+- Bot-assignment path: replace `--add-label "uzi"` with `--add-assignee BOT_LOGIN` (from `CLAUDE.local.md`; never invent it).
+- Comment carries Step 4 findings; mirror #525/#509.
+- Remind the user: auto-approve runs past the plan gate; a human still merges. For plan review first, use **uzi-watcher** (Auto mode).
