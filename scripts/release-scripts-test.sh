@@ -59,17 +59,20 @@ assert_contains() {
 # --- fixture repo -------------------------------------------------------------
 REPO="$(mktemp -d)"
 # A stub `gh` first on PATH keeps the oracle's closing-issues lookup offline: it fails
-# unless GH_STUB_CLOSING is set, then prints those numbers and logs the PR it was asked.
+# unless GH_STUB_OUT is set, then prints it verbatim (the merge-commit OID line, then
+# one owner/repo#N per closing issue) and logs the arguments it was called with.
 GH_STUB="$(mktemp -d)"
 trap 'rm -rf "$REPO" "$GH_STUB"' EXIT
 cat > "$GH_STUB/gh" <<'STUB'
 #!/usr/bin/env bash
-[ -n "${GH_STUB_CLOSING:-}" ] || exit 1
+[ -n "${GH_STUB_OUT:-}" ] || exit 1
 [ -z "${GH_STUB_LOG:-}" ] || printf '%s\n' "$*" >> "$GH_STUB_LOG"
-printf '%s\n' $GH_STUB_CLOSING
+printf '%s\n' "$GH_STUB_OUT"
 STUB
 chmod +x "$GH_STUB/gh"
 export PATH="$GH_STUB:$PATH"
+unset GH_STUB_OUT GH_STUB_LOG
+export GH_REPO=test/uzi
 
 DATE_N=0
 tick() { DATE_N=$((DATE_N + 1)); printf '2026-09-%02dT00:00:00' "$DATE_N"; }
@@ -336,16 +339,25 @@ printf 'apiVersion: v2\nname: uzi\nversion: 0.9.0\nappVersion: "0.9.0"\n' > "$SQ
 printf '# Changelog\n\n## [0.9.0] - 2026-09-01\n### Added\n- **Initial** (#900)\n' > "$SQ/CHANGELOG.md"
 git -C "$SQ" add -A; git -C "$SQ" commit -q -m "chore(release): v0.9.0"; git -C "$SQ" tag v0.9.0
 printf 'package main // fix\n' > "$SQ/api/fix.go"
-git -C "$SQ" add -A; git -C "$SQ" commit -q -m "Codex idle watchdog fails a run (#902)" -m "* fix(agent): suspend idle while a command runs"
+git -C "$SQ" add -A; git -C "$SQ" commit -q -m "Codex idle watchdog fails a run (#899) (#902)" -m "* fix(agent): suspend idle while a command runs"
+SQ_SHA="$(git -C "$SQ" rev-parse HEAD)"
 printf 'apiVersion: v2\nname: uzi\nversion: 0.10.0\nappVersion: "0.10.0-rc.1"\n' > "$SQ/deploy/chart/Chart.yaml"
 printf '# Changelog\n\n## [0.10.0] - 2026-09-02\n### Fixed\n- **Idle watchdog** ([#901](https://example.com/issues/901))\n\n## [0.9.0] - 2026-09-01\n### Added\n- **Initial** (#900)\n' > "$SQ/CHANGELOG.md"
 git -C "$SQ" add -A; git -C "$SQ" commit -q -m "chore(release): v0.10.0-rc.1"
 sq_run() { ( cd "$SQ" && bash "$ORACLE" HEAD "" 0.10.0-rc.1 >/dev/null 2>&1 ); }
 if sq_run; then fail "oracle FAIL offline (gh unavailable): issue-only citation"; else pass "oracle FAIL offline (gh unavailable): issue-only citation"; fi
 GH_STUB_LOG="$SQ.ghlog"; export GH_STUB_LOG
-if GH_STUB_CLOSING="901" sq_run; then pass "oracle PASS: section cites the issue PR #902 closes"; else fail "oracle PASS: section cites the issue PR #902 closes"; fi
-assert_contains "the lookup asks for the subject's PR" "pr view 902" "$(cat "$GH_STUB_LOG" 2>/dev/null)"
-if GH_STUB_CLOSING="903" sq_run; then fail "oracle FAIL: PR #902 closes an issue the section does not cite"; else pass "oracle FAIL: PR #902 closes an issue the section does not cite"; fi
+if GH_STUB_OUT="$SQ_SHA
+test/uzi#901" sq_run; then pass "oracle PASS: section cites the issue PR #902 closes"; else fail "oracle PASS: section cites the issue PR #902 closes"; fi
+assert_contains "a two-group subject looks up its LAST (#N), the PR" "pr view 902" "$(cat "$GH_STUB_LOG" 2>/dev/null)"
+if GH_STUB_OUT="$SQ_SHA
+test/uzi#903" sq_run; then fail "oracle FAIL: PR #902 closes an issue the section does not cite"; else pass "oracle FAIL: PR #902 closes an issue the section does not cite"; fi
+if GH_STUB_OUT="0000000000000000000000000000000000000000
+test/uzi#901" sq_run; then fail "oracle FAIL: the PR's merge commit is not this commit"; else pass "oracle FAIL: the PR's merge commit is not this commit"; fi
+if GH_STUB_OUT="$SQ_SHA
+other/repo#901" sq_run; then fail "oracle FAIL: the closing issue lives in another repo"; else pass "oracle FAIL: the closing issue lives in another repo"; fi
+if GH_STUB_OUT="$SQ_SHA
+TEST/UZI#901" sq_run; then pass "oracle PASS: repo match ignores case"; else fail "oracle PASS: repo match ignores case"; fi
 unset GH_STUB_LOG
 rm -rf "$SQ" "$SQ.ghlog"
 

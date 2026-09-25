@@ -295,13 +295,26 @@ EOF
   # A squash merge's body is its commits' messages, which need not name the issue the
   # PR closes ("Closes #N" lives in the PR body). So also accept a section citing an
   # issue that the subject's trailing "(#N)" PR closes on GitHub. Additive only:
-  # without `gh`, a token or network the verdict is exactly the offline one.
+  # without `gh`, a token, network or a resolvable repo the verdict is the offline one.
+  # Two identity checks keep the lookup from borrowing another merge's issue: the PR's
+  # merge commit must BE this commit (a subject can name any PR), and a closing issue
+  # counts only when it lives in this repo (`Closes other/repo#N` collides by number).
   if [ "$found" = 0 ] && command -v gh >/dev/null 2>&1; then
     pr="$(sed -nE 's/.*\(#([0-9]+)\)[[:space:]]*$/\1/p' "$SUBJECT_FILE")"
-    if [ -n "$pr" ]; then
-      closing="$( { gh pr view "$pr" --json closingIssuesReferences \
-                      --jq '.closingIssuesReferences[].number' 2>/dev/null || true; } \
-                  | { grep -E '^[0-9]+$' || true; } | sort -un )"
+    if [ -n "$pr" ] && [ -z "${GH_REPO_RESOLVED+x}" ]; then
+      GH_REPO_RESOLVED="${GH_REPO:-$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null || true)}"
+    fi
+    if [ -n "$pr" ] && [ -n "$GH_REPO_RESOLVED" ]; then
+      { gh pr view "$pr" --json mergeCommit,closingIssuesReferences \
+          --jq '(.mergeCommit.oid // ""), (.closingIssuesReferences[] | "\(.repository.owner.login)/\(.repository.name)#\(.number)")' \
+          2>/dev/null || true; } > "$WORK/closing.txt"
+      closing=""
+      if [ "$(head -n 1 "$WORK/closing.txt")" = "$sha" ]; then
+        closing="$(tail -n +2 "$WORK/closing.txt" \
+          | awk -v repo="$GH_REPO_RESOLVED" 'BEGIN { repo = tolower(repo) }
+              { i = index($0, "#"); if (i && tolower(substr($0, 1, i - 1)) == repo && substr($0, i + 1) ~ /^[0-9]+$/) print substr($0, i + 1) }' \
+          | sort -un)"
+      fi
       for n in $closing; do
         if grep -qE -- "#0*$n([^0-9]|$)" "$SECTION_FILE"; then found=1; break; fi
       done
