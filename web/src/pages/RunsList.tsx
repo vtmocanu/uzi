@@ -95,7 +95,7 @@ export function sortPast(a: RunListItem, b: RunListItem): number {
 // falls left of the line box, where the <p>'s overflow-x-clip hides it. It is in flow on
 // purpose: a positioned (relative/absolute) item would paint above the card's stretched
 // run link and turn the meta text into a dead click zone. The leading space keeps the
-// items apart in textContent and for screen readers; flex drops it visually.
+// items apart in textContent (copy, tests); flex does not render it.
 function MetaSep() {
   return (
     <>
