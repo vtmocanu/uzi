@@ -545,12 +545,11 @@ export interface RunContext {
    * the ack (the park must actually take, mirroring askUser's ack check), then (b) blocks on
    * the steering channel's `awaitFollowUp(idleMs)` and returns the outcome.
    *
-   * CONSUME-BEFORE-REPORT ORDERING: the follow-up is delivered ONLY from the poll loop's
-   * post-route service step (serviceFollowUp), which runs after ConsumeRunInputs has stamped
-   * `consumed_at` in the same RETURNING that handed over the follow-up. So by the time this
-   * resolves `{kind:"followup"}`, the input is already consumed — and the loop's next
-   * `reportIteration` (`running`) passes the server's SetRunRunning wake guard by construction.
-   * This is the same discipline askUser uses; see runner.ts.
+   * APPLY-BEFORE-REPORT ORDERING (issue #1673): the follow-up is delivered ONLY from the poll
+   * loop's post-route service step (serviceFollowUp), after an active ACK; its APPLIED receipt
+   * follows on a later tick. The runner holds every non-failed state report behind that receipt
+   * (steering.awaitReceiptSettlement), so the loop's next `reportIteration` (`running`) passes the
+   * server's applied-only SetRunRunning wake guard. The same holds for askUser; see runner.ts.
    *
    * The executor calls it OUTSIDE driveTurn (the idle watchdog lives inside driveTurn, so a
    * parked run cannot trip REASON_IDLE), guarded on `ctx.interactive`. Absent on the

@@ -1761,7 +1761,7 @@ describe("input receipts", () => {
     }
   });
 
-  it("rejects the waiting report on a switch_pending APPLIED, drops the batch, and keeps polling", async () => {
+  it("takes the credential-switch path on a switch_pending APPLIED: the waiting report rejects with the switch signal", async () => {
     const row: UserInput = { id: 7, kind: "follow_up", body: "seven" };
     let gets = 0;
     let release!: () => void;
@@ -1774,14 +1774,18 @@ describe("input receipts", () => {
         throw new RequestError("POST", "/inputs/applied", 409, JSON.stringify({ error: "conflict", reason: "switch_pending" }));
       },
     } as unknown as WorkerClient;
-    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController());
+    const cancel = new AbortController();
+    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), cancel, { claimGeneration: 4 });
     ch.start();
     try {
       assert.deepStrictEqual(await ch.awaitFollowUp(100_000), { kind: "followup", body: "seven" });
       await tick();
       const waiting = ch.awaitReceiptSettlement();
       release();
-      await assert.rejects(waiting, (err: Error) => err.name === "InputReceiptError", "the resume report must not go out unapplied");
+      await assert.rejects(waiting, (err: Error) => err.name === "CredentialSwitchSignal",
+        "the resume report must not go out unapplied, and must enter the switch path, not a failure");
+      assert.strictEqual(ch.pendingCredentialSwitch(), 4, "the switch is tripped for this claim");
+      assert.strictEqual((cancel.signal.reason as Error).name, "CredentialSwitchSignal");
       await ch.awaitReceiptSettlement(); // not sticky: the switch's own release report still goes out
       const seen = gets;
       await until(() => gets > seen);

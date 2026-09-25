@@ -46,6 +46,11 @@ export class FakeApi {
   private readonly seenInputIds = new Map<string, Set<number>>();
   private readonly receiptFenceReason = new Map<string, string>();
   private readonly failingReceipts = new Map<"ack" | "applied", number>();
+  private readonly failingReceiptReasons = new Map<"ack" | "applied", string>();
+  /** Runs whose credential switch becomes pending right after the next successful ACK. */
+  private readonly switchAfterAck = new Set<string>();
+  /** Runs with a pending switch: GET drains nothing (the server fence) and APPLIED is refused. */
+  private readonly switchPendingRuns = new Set<string>();
   private readonly delayedReceipts = new Map<"ack" | "applied", number>();
   /** Issue #1673: receipt tests set this so a receipt for a run with no explicit claim
    *  generation fails loudly instead of being accepted as the only claim. */
@@ -397,14 +402,24 @@ export class FakeApi {
   }
 
   /** Answer every `kind` receipt with `status` (undefined restores normal replies). */
-  failInputReceipts(kind: "ack" | "applied", status: number | undefined): void {
+  failInputReceipts(kind: "ack" | "applied", status: number | undefined, reason?: string): void {
     if (status === undefined) this.failingReceipts.delete(kind);
     else this.failingReceipts.set(kind, status);
+    if (reason === undefined) this.failingReceiptReasons.delete(kind);
+    else this.failingReceiptReasons.set(kind, reason);
   }
 
   /** Hold every `kind` receipt reply for `ms` before answering (0 restores immediate replies). */
   delayInputReceipts(kind: "ack" | "applied", ms: number): void {
     this.delayedReceipts.set(kind, ms);
+  }
+
+  /** Issue #1673: a credential switch becomes pending right after this run's next successful
+   *  ACK, so the routed batch's APPLIED is refused with 409 reason switch_pending, and GET, fenced
+   *  like the server's ConsumeInputs, returns no rows. No switch signal rides the GET, so only the
+   *  APPLIED refusal can reveal the switch. */
+  pendSwitchAfterNextAck(runId: string): void {
+    this.switchAfterAck.add(runId);
   }
 
   loseNextInputReceiptReply(kind: "ack" | "applied"): void {
@@ -676,10 +691,13 @@ export class FakeApi {
       const active = current === undefined || generation === current;
       // The claim's inactive reason, as the server names it (switch_pending | released | stale).
       const reason = active ? undefined : (this.receiptFenceReason.get(runId) ?? "stale");
+      if (kind === "applied" && this.switchPendingRuns.has(runId))
+        return send(res, 409, { error: "input receipt conflicts with claim", reason: "switch_pending" });
       const delay = this.delayedReceipts.get(kind) ?? 0;
       if (delay > 0) await new Promise((r) => setTimeout(r, delay));
       const failing = this.failingReceipts.get(kind);
-      if (failing !== undefined) return send(res, failing, { error: "fake: receipt failure" });
+      if (failing !== undefined)
+        return send(res, failing, { error: "fake: receipt failure", reason: this.failingReceiptReasons.get(kind) });
       const rows = this.inputsByRun.get(runId) ?? [];
       const acked = this.ackedByRun.get(runId) ?? new Set<number>();
       const applied = this.appliedByRun.get(runId) ?? new Set<number>();
@@ -694,6 +712,7 @@ export class FakeApi {
       if (kind === "ack") {
         for (const id of ids) acked.add(id);
         this.ackedByRun.set(runId, acked);
+        if (this.switchAfterAck.delete(runId)) this.switchPendingRuns.add(runId);
         // GET /follow-ups returns RECEIVED follow-ups, applied or not (ListConsumedFollowUpInputsForRun).
         const consumed = this.consumedFollowUpsByRun.get(runId) ?? [];
         for (const row of rows.filter((row) => ids.includes(row.id) && row.kind === "follow_up"))
@@ -726,7 +745,9 @@ export class FakeApi {
       if (req.method === "GET" && kind === "inputs") {
         const rows = this.inputsByRun.get(runId) ?? [];
         const applied = this.appliedByRun.get(runId) ?? new Set<number>();
-        const pending = rows.filter((row) => !applied.has(row.id)).sort((a, b) => a.id - b.id);
+        const pending = this.switchPendingRuns.has(runId)
+          ? []
+          : rows.filter((row) => !applied.has(row.id)).sort((a, b) => a.id - b.id);
         if (this.legacyConsumeOnRead) {
           // An older api pod: consume on read (mark applied now) and send no receipt marker.
           for (const row of pending) applied.add(row.id);

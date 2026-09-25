@@ -365,7 +365,7 @@ export class SteeringChannel {
 
   /** Drop the held batch and reject the reports waiting on it, without making the failure
    *  sticky: later reports, with nothing pending, go out. */
-  private rejectHeld(err: InputReceiptError): void {
+  private rejectHeld(err: Error): void {
     this.held = undefined;
     this.applyFailures = 0;
     this.ackFailures = 0;
@@ -412,10 +412,16 @@ export class SteeringChannel {
         const refused = new InputReceiptError(
           `the applied receipt for ${this.held.ids.length} routed operator input(s) was refused: ${errMessage(err)}`,
         );
-        // A pending switch: reject only the reports waiting now and drop the batch for the next
-        // claim. Polling continues, so the switch signal still trips and its release report,
-        // which finds nothing pending, is not refused.
-        if (reason === "switch_pending") return this.rejectHeld(refused);
+        // A pending switch: take the EXISTING credential-switch path, never a generic failure. The
+        // reports waiting now reject with a CredentialSwitchSignal (so the executor/runner enter the
+        // switch release, which never reports `failed`), the batch is dropped for the next claim to
+        // replay, and the switch is tripped as the GET's signal would. The failure is not sticky, so
+        // the release report, finding nothing pending, goes out.
+        if (reason === "switch_pending") {
+          this.rejectHeld(new CredentialSwitchSignal());
+          this.maybeTripCredentialSwitch(this.claimGeneration);
+          return;
+        }
         return this.failReceipts(refused);
       }
       return this.releaseHeld();

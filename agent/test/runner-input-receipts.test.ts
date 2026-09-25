@@ -9,7 +9,8 @@ import path from "node:path";
 import { nullLogger } from "./helpers.js";
 import { Outbox } from "../src/outbox.js";
 import { StubExecutor } from "../src/executor.js";
-import { api, fakeGitlab, gitlabClaim, input, installHarness, runner } from "./runner-harness.js";
+import { api, fakeGitlab, git, gitlabClaim, input, installHarness, runner, runnerWith } from "./runner-harness.js";
+import type { Executor, RunContext } from "../src/executor.js";
 
 installHarness();
 
@@ -138,6 +139,49 @@ describe("RunRunner — input receipts (issue #1673)", () => {
       afterGate.filter((r) => r.status !== "failed" && !r.applied),
       [],
       "no non-failed report went out while the approval's APPLIED was uncertain",
+    );
+  });
+
+  it("a switch_pending APPLIED after routing enters the credential-switch path, never `failed`, and leaves the input to replay", async () => {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(1677, { claim_generation: 5 });
+    api.setInputClaimGeneration(claim.run_id, 5);
+    api.onState(claim.run_id, (body) => {
+      if (body.status === "awaiting_approval") {
+        api.setInputs(claim.run_id, [input("approve_plan")]);
+        // The switch becomes pending after the approval is ACKed and routed, before its APPLIED.
+        api.pendSwitchAfterNextAck(claim.run_id);
+      }
+    });
+    // An executor that gates, then behaves like the SDK loop on a switch: a CredentialSwitchSignal
+    // abort of the shared controller is re-thrown for the runner's existing switch handling.
+    const executor: Executor = {
+      run: async (ctx: RunContext) => {
+        git.worktreeStatus = (async () => []) as typeof git.worktreeStatus;
+        git.fetchAgentBranch = (async () => `refs/uzi-runner/${ctx.branch}`) as typeof git.fetchAgentBranch;
+        git.verifyRunnerTrackingCovers = (async () => true) as typeof git.verifyRunnerTrackingCovers;
+        git.trackingTip = (async () => "cafef00dcafef00dcafef00dcafef00dcafef00d") as typeof git.trackingTip;
+        git.checkpointPack = (async () => null) as typeof git.checkpointPack;
+        const verdict = await ctx.gatePlan!("## Plan\n- do it", undefined);
+        assert.strictEqual(verdict.kind, "approve");
+        for (let i = 0; i < 500 && !ctx.signal?.aborted; i++) await new Promise((r) => setTimeout(r, 5));
+        const reason = ctx.signal?.reason as Error | undefined;
+        if (reason?.name === "CredentialSwitchSignal") throw reason;
+        return { branch: ctx.branch, reportOnly: true, summary: "no switch surfaced" };
+      },
+    };
+    await runnerWith(() => ({ executor }), gitlab, undefined, undefined, { recoveryRetryMs: 1 }).execute(claim);
+
+    const statuses = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body.status);
+    const gate = statuses.indexOf("awaiting_approval");
+    assert.ok(gate >= 0, statuses.join(","));
+    const after = statuses.slice(gate + 1);
+    assert.ok(!after.includes("failed") && !after.includes("completed"), `never failed or completed: ${statuses.join(",")}`);
+    assert.ok(after.includes("credential_switch") || after.includes("credential_switch_failed"),
+      `the existing switch path handled it: ${statuses.join(",")}`);
+    assert.ok(
+      !api.inputReceiptReplies.some((r) => r.runId === claim.run_id && r.kind === "applied"),
+      "the approval stays unapplied, so the next claim's GET replays it",
     );
   });
 });
