@@ -1071,6 +1071,37 @@ func TestReapTruncatesBetweenBatches(t *testing.T) {
 	}
 }
 
+// The pass budget runs out inside the one batch of the only root: the check
+// before the next candidate alone truncates (no later page or root check runs
+// to set it instead).
+func TestReapTruncatesWithinABatch(t *testing.T) {
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	r := newRoots(t)
+	for i := range 3 {
+		mkTree(t, filepath.Join(r.tmp, tmpNameN(140+i)))
+	}
+	start := time.Now()
+	removals := 0
+	hookBeforeReapRemove = func(int, string) { removals++ }
+	t.Cleanup(func() { hookBeforeReapRemove = nil })
+	cfg := reapConfig{uid: os.Geteuid(), prove: func() string { return proofHeld }, now: func() time.Time {
+		if removals >= 1 {
+			return start.Add(reapPassBudget)
+		}
+		return start
+	}}
+	res, err := reap(r.tmpFd, -1, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkSums(t, res)
+	if got := counts(res); got != "scanned=1 live=0 removed=1 retained=0 foreign=0 proof=held" || !res.Truncated || res.DirentsExamined != 3 {
+		t.Fatalf("reap = %s truncated=%v dirents_examined=%d", got, res.Truncated, res.DirentsExamined)
+	}
+}
+
 // The pass budget runs out once the tmp root is done: the cache root is not
 // examined at all.
 func TestReapTruncatesBeforeTheCacheRoot(t *testing.T) {
@@ -1124,7 +1155,9 @@ func TestReapPassBudget(t *testing.T) {
 		}
 		return now
 	}}
-	res, err := reap(r.tmpFd, r.cacheFd, cfg)
+	// No cache root, and the tmp root reaches its end within the one page, so
+	// only the "deadline" retention can set truncated.
+	res, err := reap(r.tmpFd, -1, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}

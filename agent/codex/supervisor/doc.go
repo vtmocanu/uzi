@@ -165,7 +165,8 @@
 // every entry of both roots was handled, or when a candidate was retained with
 // reason "deadline" (the pass budget, or its own 60 s removal deadline); a
 // pass that read both roots to their end with no such candidate reports
-// false. dirents_examined is the number of directory entries read from the
+// false (an entry created during the pass may or may not be read, as getdents
+// promises nothing for it; the next startup's pass sees it). dirents_examined is the number of directory entries read from the
 // roots ("." and ".." excluded), so scanned never exceeds it. A root that
 // cannot be read, at its start or midway, is reap_error "list"; a name not yet
 // read from it is untouched.
