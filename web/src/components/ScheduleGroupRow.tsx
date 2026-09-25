@@ -42,6 +42,7 @@ export function ScheduleGroupRow({
   disclosureId,
   expandLabelName,
   cols,
+  rowId,
   children,
 }: {
   // The schedule/job name — the only text the neutral summary carries by itself.
@@ -73,12 +74,19 @@ export function ScheduleGroupRow({
   expandLabelName: string;
   // The schedules table's colspan, so the expanded sub-rows row spans full width.
   cols: number;
+  // Optional id on the summary row, which is then programmatically focusable (tabIndex
+  // -1) so another surface can move focus to it (PRD #1645 "from catalog").
+  rowId?: string;
   // The expanded region: per-repo sub-rows + the add/enable-another-repo affordance.
   children?: ReactNode;
 }) {
   return (
     <>
-      <tr className="border-t border-edge align-top">
+      <tr
+        id={rowId}
+        tabIndex={rowId ? -1 : undefined}
+        className="border-t border-edge align-top outline-hidden focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand/60"
+      >
         {/* Target — name + variant badges in one flex-wrap container, description after */}
         <td className="px-4 py-3">
           <div className="flex flex-wrap items-center gap-2 font-medium text-fg">

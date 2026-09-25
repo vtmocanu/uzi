@@ -114,11 +114,10 @@ describe("Schedules — a mutation error clears on onSaved → reload() (item 4c
         <Schedules />
       </MemoryRouter>,
     );
-    fireEvent.click(screen.getByRole("tab", { name: /My schedules/ }));
     await waitFor(() => expect(screen.getByText("Sweep eligible issues")).toBeTruthy());
 
     // Fail the toggle → the mutation error is shown.
-    fireEvent.click(screen.getByRole("switch", { name: "Disable schedule" }));
+    fireEvent.click(screen.getByRole("switch", { name: "Pause Sweep eligible issues on vtmocanu/uzi" }));
     await waitFor(() => expect(screen.getByText("Could not update the schedule")).toBeTruthy());
 
     // Open the (mocked) New-schedule modal and save: onSaved → reload() → onFetchStart clears.

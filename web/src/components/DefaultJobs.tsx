@@ -37,6 +37,10 @@ import {
 
 const COLS = 6;
 
+// The DOM id of a catalog entry's row, so the Schedules tab's "from catalog" link can move
+// focus to it (PRD #1645 D4).
+export const catalogEntryId = (slug: string) => `catalog-entry-${slug}`;
+
 export function DefaultJobs({
   catalog,
   schedules,
@@ -255,6 +259,7 @@ function CatalogRow({
     <ScheduleGroupRow
       name={entry.name}
       cols={COLS}
+      rowId={catalogEntryId(entry.slug)}
       expanded={expanded}
       onToggleExpand={onToggleExpand}
       disclosureId={`catalog-repos-${entry.slug}`}

@@ -4,7 +4,7 @@
 // per-row enable toggle PATCHes { enabled } and adopts the server's returned row.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import { Schedules } from "./Schedules";
 import { api, type LastFire, type Schedule } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
@@ -47,6 +47,31 @@ vi.mock("../auth/AuthContext", () => ({ useAuth: vi.fn() }));
 const mockApi = vi.mocked(api);
 
 const EMPTY_CATALOG = { entries: [], enablements: [] };
+
+// One shipped sweep entry. Its catalog cadence (UTC, 02:00 daily, inherit model) is
+// deliberately DIFFERENT from what the default-row fixtures below carry, so a row that
+// rendered catalog values instead of its own would fail.
+const CATALOG = {
+  entries: [
+    {
+      slug: "bug-triage",
+      name: "Bug triage sweep",
+      description: "Daily bug sweep",
+      target: "sweep" as const,
+      cron: "0 2 * * *",
+      timezone: "UTC",
+      model: "",
+      output_mode: "",
+      prompt: "",
+      labels: ["bug"],
+      guidance: "Triage the bug.",
+      max_issues: 3,
+      auto_approve: true,
+      wait_on_limit: true,
+    },
+  ],
+  enablements: [],
+};
 
 function sched(over: Partial<Schedule>): Schedule {
   return {
@@ -103,17 +128,14 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-// The page opens on the Default jobs tab; the rows under test live in My schedules,
-// so switch there. The tab bar renders synchronously (not gated on load), so a click
-// before the fetch resolves just seeds tab state for when the table paints.
+// With no ?tab the page lands on the Schedules tab whenever the owner has a schedule
+// (PRD #1645 D1), which is where every row under test lives.
 function renderPage() {
-  const utils = render(
+  return render(
     <MemoryRouter>
       <Schedules />
     </MemoryRouter>,
   );
-  fireEvent.click(screen.getByRole("tab", { name: /My schedules/ }));
-  return utils;
 }
 
 describe("Schedules list", () => {
@@ -127,22 +149,18 @@ describe("Schedules list", () => {
     expect(screen.getByText("paused")).toBeTruthy();
   });
 
-  it("renders a sibling sub-row whose next_fires is null without crashing (issue #1003)", async () => {
-    // A once/invalid-cron schedule ships `next_fires: null` on the wire. The per-repo
-    // sibling sub-row (MyScheduleSubRow, Schedules.tsx:1014) reads `s.next_fires?.[0]` and
-    // must tolerate it. Two siblings sharing a group id form the expandable group whose
-    // expansion mounts that sub-row.
+  it("renders sibling rows whose next_fires is null without crashing (issue #1003)", async () => {
+    // A once/invalid-cron schedule ships `next_fires: null` on the wire. The row's next
+    // fire (nextFireOf) reads `s.next_fires?.[0]` and must tolerate it, for siblings too.
     mockApi.listSchedules.mockResolvedValue([
       sched({ id: "g1", sibling_group_id: "grp-1003", repo_id: "repo-uzi", repo_path: "vtmocanu/uzi", target: "prompt", prompt: "grouped null next_fires", next_fires: null }),
       sched({ id: "g2", sibling_group_id: "grp-1003", repo_id: "repo-atlas", repo_path: "vtmocanu/atlas", target: "prompt", prompt: "grouped null next_fires", next_fires: null }),
     ]);
     renderPage();
-    // The group summary paints; expanding it mounts the MyScheduleSubRow per sibling.
-    await waitFor(() => expect(screen.getByText("Prompt: grouped null next_fires")).toBeTruthy());
-    fireEvent.click(screen.getByRole("button", { name: "Show repos for Prompt: grouped null next_fires" }));
-    // The sub-rows rendered (their repo labels appear), so the Schedules.tsx:1014 nextFire
-    // read ran on a null next_fires without throwing.
-    expect(screen.getByText("vtmocanu/uzi")).toBeTruthy();
+    await waitFor(() => expect(screen.getAllByText("Prompt: grouped null next_fires")).toHaveLength(2));
+    // Both rows rendered (their repo labels appear), so the null next_fires read did not throw.
+    expect(screen.getByText(/^vtmocanu\/uzi/)).toBeTruthy();
+    expect(screen.getByText(/^vtmocanu\/atlas/)).toBeTruthy();
   });
 
   it("suppresses the auto-approve chip for a self_improve row (PRD #590 follow-up 2)", async () => {
@@ -169,59 +187,32 @@ describe("Schedules list", () => {
     renderPage();
     await waitFor(() => expect(screen.getByText("Sweep eligible issues")).toBeTruthy());
 
-    // s1 is enabled; disabling it sends { enabled: false }.
-    const toggle = screen.getByRole("switch", { name: "Disable schedule" });
+    // s1 is enabled; pausing it sends { enabled: false }.
+    const toggle = screen.getByRole("switch", { name: "Pause Sweep eligible issues on vtmocanu/uzi" });
     fireEvent.click(toggle);
     await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenCalledWith("s1", { enabled: false }));
   });
 });
 
-// ── PRD #589 M6: the two-tab split (Default jobs vs My schedules) ──────────────
-describe("Schedules — two tabs (PRD #589 M6)", () => {
-  const CATALOG = {
-    entries: [
-      {
-        slug: "bug-triage",
-        name: "Bug triage sweep",
-        description: "Daily bug sweep",
-        target: "sweep" as const,
-        cron: "0 2 * * *",
-        timezone: "UTC",
-        model: "",
-        output_mode: "",
-        prompt: "",
-        labels: ["bug"],
-        guidance: "Triage the bug.",
-        max_issues: 3,
-        auto_approve: true,
-        wait_on_limit: true,
-      },
-    ],
-    enablements: [],
-  };
-
-  it("opens on Default jobs (catalog entry shown, user rows hidden) and switches to My schedules", async () => {
+// ── PRD #1645 D2: one table for both origins (replaces the PRD #589 two-tab split) ──
+describe("Schedules — one list for both origins (PRD #1645 D2)", () => {
+  it("a default row and a user row render in the same table, with no expand control", async () => {
     mockApi.listScheduleCatalog.mockResolvedValue(CATALOG);
     mockApi.listSchedules.mockResolvedValue([
       sched({ id: "u1", target: "prompt", prompt: "my own flaky hunt", origin: "user" }),
+      sched({ id: "d1", origin: "default", catalog_slug: "bug-triage", labels: ["bug"] }),
     ]);
-    render(
-      <MemoryRouter>
-        <Schedules />
-      </MemoryRouter>,
-    );
+    renderPage();
 
-    // Default jobs is the initial tab: the catalog entry renders, the user row does NOT.
-    await waitFor(() => expect(screen.getByText("Bug triage sweep")).toBeTruthy());
-    expect(screen.queryByText("Prompt: my own flaky hunt")).toBeNull();
-
-    // Switch to My schedules: the user row renders, the catalog entry is gone.
-    fireEvent.click(screen.getByRole("tab", { name: /My schedules/ }));
-    await waitFor(() => expect(screen.getByText("Prompt: my own flaky hunt")).toBeTruthy());
-    expect(screen.queryByText("Bug triage sweep")).toBeNull();
+    const user = await screen.findByText("Prompt: my own flaky hunt");
+    const def = screen.getByText("Bug triage sweep");
+    expect(user.closest("table")).toBe(def.closest("table"));
+    expect(user.closest("table")).not.toBeNull();
+    // Flat rows: nothing to expand before acting.
+    expect(screen.queryByRole("button", { name: /Show repos for/ })).toBeNull();
   });
 
-  it("a user row exposes a Clone action that calls cloneSchedule", async () => {
+  it("a user row's More actions menu offers Clone, which calls cloneSchedule", async () => {
     mockApi.listSchedules.mockResolvedValue([sched({ id: "u1", target: "prompt", prompt: "mine", origin: "user" })]);
     mockApi.cloneSchedule.mockResolvedValue(
       sched({ id: "u2", target: "prompt", prompt: "mine", origin: "user" }),
@@ -229,7 +220,8 @@ describe("Schedules — two tabs (PRD #589 M6)", () => {
     renderPage();
     await waitFor(() => expect(screen.getByText("Prompt: mine")).toBeTruthy());
 
-    fireEvent.click(screen.getByRole("button", { name: "Clone schedule" }));
+    fireEvent.click(screen.getByRole("button", { name: "More actions for Prompt: mine on vtmocanu/uzi" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Clone to an editable copy" }));
     await waitFor(() => expect(mockApi.cloneSchedule).toHaveBeenCalledWith("u1"));
   });
 });
@@ -275,7 +267,7 @@ describe("Schedules — enable-default sends the browser timezone (issue #660)",
         sched({ id: "new1", origin: "default", catalog_slug: "bug-triage", timezone: "Europe/Bucharest" }),
       );
 
-      // The page opens on the Default jobs tab, where the enable fan-out lives.
+      // With no schedules the page lands on the Job catalog tab, where the enable fan-out lives.
       render(
         <MemoryRouter>
           <Schedules />
@@ -541,148 +533,80 @@ describe("Schedules — the cap hint (PRD #308 M4, Goal 2)", () => {
   });
 });
 
-// ── PRD #636 M3: grouped/expandable sibling view + "add another repo" ──────────
-describe("Schedules — sibling groups (PRD #636 M3)", () => {
+// ── PRD #636 siblings, now flat rows (PRD #1645 D2) + "add another repo" ──────────
+const REPOS3 = {
+  repos: [
+    { id: "repo-uzi", path_with_namespace: "vtmocanu/uzi" },
+    { id: "repo-atlas", path_with_namespace: "vtmocanu/atlas" },
+    { id: "repo-new", path_with_namespace: "vtmocanu/newrepo" },
+  ],
+} as Awaited<ReturnType<typeof api.listRepos>>;
+
+describe("Schedules — siblings render as independent rows (PRD #1645 D2)", () => {
   // Two siblings sharing a non-null group id on distinct repos.
   const twoSiblings = () => [
     sched({ id: "g1", target: "prompt", prompt: "grouped job", repo_id: "repo-uzi", repo_path: "vtmocanu/uzi", sibling_group_id: "grp-1" }),
     sched({ id: "g2", target: "prompt", prompt: "grouped job", repo_id: "repo-atlas", repo_path: "vtmocanu/atlas", sibling_group_id: "grp-1" }),
   ];
-  // The expand toggle's accessible name is derived from the head member's target title.
-  const groupToggle = /Show repos for Prompt: grouped job/;
 
-  it("two rows sharing a group id render as ONE expandable summary over 2 sub-rows", async () => {
+  it("two rows sharing a group id render as TWO rows, each with its own toggle, and no group summary", async () => {
     mockApi.listSchedules.mockResolvedValue(twoSiblings());
     renderPage();
 
-    // One group summary with an expand toggle — not two standalone rows.
-    await waitFor(() => expect(screen.getByRole("button", { name: groupToggle })).toBeTruthy());
-    // Collapsed: the per-repo sub-row pause toggles are not rendered yet (non-vacuous
-    // against the expanded state asserted below).
-    expect(screen.queryByRole("switch", { name: "Pause on vtmocanu/uzi" })).toBeNull();
-    expect(screen.queryByRole("switch", { name: "Pause on vtmocanu/atlas" })).toBeNull();
-
-    fireEvent.click(screen.getByRole("button", { name: groupToggle }));
-
-    // Expanded: exactly one sub-row per sibling repo.
-    await waitFor(() => expect(screen.getByRole("switch", { name: "Pause on vtmocanu/uzi" })).toBeTruthy());
-    expect(screen.getByRole("switch", { name: "Pause on vtmocanu/atlas" })).toBeTruthy();
-  });
-
-  it("the group summary carries name + repo-count only — no type pill (PRD #636 M3)", async () => {
-    mockApi.listSchedules.mockResolvedValue(twoSiblings());
-    renderPage();
-
-    const toggle = await screen.findByRole("button", { name: groupToggle });
-    const summaryRow = toggle.closest("tr")!;
-    // Positive half: the summary DOES carry the schedule name and the repo-count/expand
-    // toggle (so the negative below is discriminating, not vacuous).
-    expect(within(summaryRow).getByText("Prompt: grouped job")).toBeTruthy();
-    expect(within(summaryRow).getByText(/2 repos/)).toBeTruthy();
-    // Discriminating negative: NO sweep/prompt type pill in the summary. The type is
-    // already in the name ("Prompt:"/"Sweep ·") and siblings may have diverged, so the
-    // per-repo target lives in the sub-rows, not the collapsed summary.
-    expect(within(summaryRow).queryByText("prompt")).toBeNull();
-    expect(within(summaryRow).queryByText("sweep")).toBeNull();
-  });
-
-  it("each expanded sub-row surfaces its own per-repo target badge (PRD #636 M3)", async () => {
-    mockApi.listSchedules.mockResolvedValue(twoSiblings());
-    renderPage();
-
-    fireEvent.click(await screen.findByRole("button", { name: groupToggle }));
-    await waitFor(() => expect(screen.getByRole("switch", { name: "Pause on vtmocanu/uzi" })).toBeTruthy());
-
-    // The summary dropped the type pill, so each sub-row must carry its own target — a
-    // diverged sibling's target is surfaced per-repo, never silently dropped.
-    const uziRow = screen.getByText("vtmocanu/uzi").closest<HTMLElement>("div.rounded-lg")!;
+    await waitFor(() => expect(screen.getByRole("switch", { name: "Pause Prompt: grouped job on vtmocanu/uzi" })).toBeTruthy());
+    expect(screen.getByRole("switch", { name: "Pause Prompt: grouped job on vtmocanu/atlas" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /Show repos for/ })).toBeNull();
+    // Each row carries its own target pill.
+    const uziRow = screen.getByRole("switch", { name: /on vtmocanu\/uzi$/ }).closest("tr")!;
     expect(within(uziRow).getByText("prompt")).toBeTruthy();
-    const atlasRow = screen.getByText("vtmocanu/atlas").closest<HTMLElement>("div.rounded-lg")!;
-    expect(within(atlasRow).getByText("prompt")).toBeTruthy();
   });
 
-  it("two NULL-group rows render as TWO standalone rows with NO summary/expand control", async () => {
-    mockApi.listSchedules.mockResolvedValue([
-      sched({ id: "n1", target: "prompt", prompt: "first solo", sibling_group_id: null }),
-      sched({ id: "n2", target: "prompt", prompt: "second solo", sibling_group_id: null }),
-    ]);
-    renderPage();
+  it("'Add to another repo' calls addScheduleRepo, then reveals and focuses the new row (D12)", async () => {
+    mockApi.listRepos.mockResolvedValue(REPOS3);
+    const added = sched({ id: "g3", target: "prompt", prompt: "grouped job", repo_id: "repo-new", repo_path: "vtmocanu/newrepo", sibling_group_id: "grp-1" });
+    mockApi.listSchedules.mockResolvedValueOnce(twoSiblings()).mockResolvedValueOnce([...twoSiblings(), added]);
+    mockApi.addScheduleRepo.mockResolvedValue(added);
+    const scrolled: Element[] = [];
+    const proto = Element.prototype as unknown as { scrollIntoView?: () => void };
+    const had = proto.scrollIntoView;
+    proto.scrollIntoView = function (this: Element) {
+      scrolled.push(this);
+    };
+    try {
+      renderPage();
+      fireEvent.click(await screen.findByRole("button", { name: "More actions for Prompt: grouped job on vtmocanu/uzi" }));
+      fireEvent.click(screen.getByRole("menuitem", { name: "Add to another repo" }));
 
-    // Both rows render as their own standalone ScheduleRow…
-    await waitFor(() => expect(screen.getByText("Prompt: first solo")).toBeTruthy());
-    expect(screen.getByText("Prompt: second solo")).toBeTruthy();
-    // …and CRUCIALLY there is NO group summary/expand control. The naive
-    // groupBy(sibling_group_id) bug would collapse both nulls into one bogus group with a
-    // "Show repos for" toggle, so this absence is the discriminating assertion (a bare
-    // "2 rows appear" check would pass on that bug).
-    expect(screen.queryByRole("button", { name: /Show repos for/ })).toBeNull();
-    // Positive control: each standalone row exposes its own row-level enable toggle.
-    expect(screen.getAllByRole("switch", { name: /able schedule/ })).toHaveLength(2);
-  });
+      // The picker offers only repos other than this row's own, and takes focus.
+      const picker = await screen.findByRole("combobox", { name: /Add Prompt: grouped job on another repo/ });
+      await waitFor(() => expect(document.activeElement).toBe(picker));
+      expect(within(picker).getByRole("option", { name: "vtmocanu/newrepo" })).toBeTruthy();
+      expect(within(picker).queryByRole("option", { name: "vtmocanu/uzi" })).toBeNull();
 
-  it("a non-null group with exactly ONE live member renders standalone (no summary)", async () => {
-    mockApi.listSchedules.mockResolvedValue([
-      sched({ id: "solo", target: "prompt", prompt: "lonely sibling", sibling_group_id: "grp-lonely" }),
-    ]);
-    renderPage();
+      fireEvent.change(picker, { target: { value: "repo-new" } });
+      fireEvent.click(screen.getByRole("button", { name: "Add" }));
 
-    await waitFor(() => expect(screen.getByText("Prompt: lonely sibling")).toBeTruthy());
-    // A one-member non-null group is a standalone row, never a one-child group.
-    expect(screen.queryByRole("button", { name: /Show repos for/ })).toBeNull();
-    // It IS a standalone ScheduleRow (row-level enable toggle present; the fixture row is
-    // enabled, so the toggle reads "Disable schedule").
-    expect(screen.getByRole("switch", { name: "Disable schedule" })).toBeTruthy();
-  });
-
-  it("'add another repo' calls addScheduleRepo with the source id + repo, and the new sibling appears after refresh", async () => {
-    const repoList = {
-      repos: [
-        { id: "repo-uzi", path_with_namespace: "vtmocanu/uzi" },
-        { id: "repo-atlas", path_with_namespace: "vtmocanu/atlas" },
-        { id: "repo-new", path_with_namespace: "vtmocanu/newrepo" },
-      ],
-    } as Awaited<ReturnType<typeof api.listRepos>>;
-    mockApi.listRepos.mockResolvedValue(repoList);
-    mockApi.listSchedules
-      .mockResolvedValueOnce(twoSiblings())
-      .mockResolvedValueOnce([
-        ...twoSiblings(),
-        sched({ id: "g3", target: "prompt", prompt: "grouped job", repo_id: "repo-new", repo_path: "vtmocanu/newrepo", sibling_group_id: "grp-1" }),
-      ]);
-    mockApi.addScheduleRepo.mockResolvedValue(
-      sched({ id: "g3", target: "prompt", prompt: "grouped job", repo_id: "repo-new", repo_path: "vtmocanu/newrepo", sibling_group_id: "grp-1" }),
-    );
-    renderPage();
-
-    fireEvent.click(await screen.findByRole("button", { name: groupToggle }));
-    // The picker offers only repos not already in the group (repo-new).
-    const picker = await screen.findByRole("combobox", { name: /Add Prompt: grouped job on another repo/ });
-    expect(within(picker).getByRole("option", { name: "vtmocanu/newrepo" })).toBeTruthy();
-    expect(within(picker).queryByRole("option", { name: "vtmocanu/uzi" })).toBeNull();
-
-    fireEvent.change(picker, { target: { value: "repo-new" } });
-    fireEvent.click(screen.getByRole("button", { name: "Add" }));
-
-    // Called with the head sibling's id and the chosen repo (not a fixed uuid).
-    await waitFor(() => expect(mockApi.addScheduleRepo).toHaveBeenCalledWith("g1", "repo-new"));
-    // The refreshed group auto-expands and shows the new sibling's sub-row.
-    await waitFor(() => expect(screen.getByRole("switch", { name: "Pause on vtmocanu/newrepo" })).toBeTruthy());
+      await waitFor(() => expect(mockApi.addScheduleRepo).toHaveBeenCalledWith("g1", "repo-new"));
+      // The new row is rendered, scrolled into view and focused (its name cell).
+      await waitFor(() => expect(screen.getByRole("switch", { name: "Pause Prompt: grouped job on vtmocanu/newrepo" })).toBeTruthy());
+      const nameCell = document.getElementById("schedule-name-g3");
+      expect(nameCell).not.toBeNull();
+      await waitFor(() => expect(document.activeElement).toBe(nameCell));
+      expect(scrolled).toContain(nameCell);
+    } finally {
+      proto.scrollIntoView = had;
+    }
   });
 
   it("a duplicate add (409) is friendly and non-fatal, not an error", async () => {
-    mockApi.listRepos.mockResolvedValue({
-      repos: [
-        { id: "repo-uzi", path_with_namespace: "vtmocanu/uzi" },
-        { id: "repo-atlas", path_with_namespace: "vtmocanu/atlas" },
-        { id: "repo-new", path_with_namespace: "vtmocanu/newrepo" },
-      ],
-    } as Awaited<ReturnType<typeof api.listRepos>>);
+    mockApi.listRepos.mockResolvedValue(REPOS3);
     mockApi.listSchedules.mockResolvedValue(twoSiblings());
     const { ApiError } = await vi.importActual<typeof import("../lib/api")>("../lib/api");
     mockApi.addScheduleRepo.mockRejectedValue(new ApiError(409, "already on that repo"));
     renderPage();
 
-    fireEvent.click(await screen.findByRole("button", { name: groupToggle }));
+    fireEvent.click(await screen.findByRole("button", { name: "More actions for Prompt: grouped job on vtmocanu/uzi" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Add to another repo" }));
     const picker = await screen.findByRole("combobox", { name: /Add Prompt: grouped job on another repo/ });
     fireEvent.change(picker, { target: { value: "repo-new" } });
     fireEvent.click(screen.getByRole("button", { name: "Add" }));
@@ -692,33 +616,28 @@ describe("Schedules — sibling groups (PRD #636 M3)", () => {
     expect(screen.queryByRole("alert")).toBeNull();
   });
 
-  it("per-sub-row pause and remove target ONLY that sibling's id", async () => {
+  it("per-row pause and Remove target ONLY that sibling's id", async () => {
     mockApi.listSchedules.mockResolvedValue(twoSiblings());
     mockApi.updateSchedule.mockImplementation(async (id: string, input) => sched({ id, enabled: input.enabled ?? true }));
     mockApi.deleteSchedule.mockResolvedValue(null);
     renderPage();
 
-    fireEvent.click(await screen.findByRole("button", { name: groupToggle }));
-    await waitFor(() => expect(screen.getByRole("switch", { name: "Pause on vtmocanu/atlas" })).toBeTruthy());
-
     // Pause the atlas sibling — only g2 is PATCHed.
-    fireEvent.click(screen.getByRole("switch", { name: "Pause on vtmocanu/atlas" }));
+    fireEvent.click(await screen.findByRole("switch", { name: "Pause Prompt: grouped job on vtmocanu/atlas" }));
     await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenCalledWith("g2", { enabled: false }));
     expect(mockApi.updateSchedule).not.toHaveBeenCalledWith("g1", { enabled: false });
 
-    // Remove the uzi sibling — only g1 is deleted.
-    fireEvent.click(screen.getByRole("button", { name: "Remove on vtmocanu/uzi" }));
+    // Remove the uzi sibling — only g1 is deleted (no confirmation, D4).
+    fireEvent.click(screen.getByRole("button", { name: "More actions for Prompt: grouped job on vtmocanu/uzi" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Remove" }));
     await waitFor(() => expect(mockApi.deleteSchedule).toHaveBeenCalledWith("g1"));
     expect(mockApi.deleteSchedule).not.toHaveBeenCalledWith("g2");
   });
 });
 
-// ── issue #690: per-repo last-run parity on grouped sub-rows ───────────────────
-describe("Schedules — last-run parity on grouped sub-rows (issue #690)", () => {
-  it("a grouped sub-row with a last_fire shows the outcome badge and expands to the fire detail", async () => {
-    // Only the uzi sibling carries a fire; the atlas sibling never fired. That keeps the
-    // "Last fire" disclosure unambiguous (one sub-row has it) while proving both the
-    // outcome-badge and never-fired branches render per-repo.
+// ── issue #690: per-repo last-run parity, now on each flat row ─────────────────
+describe("Schedules — per-repo last run on sibling rows (issue #690)", () => {
+  it("each sibling row shows its own outcome, and the fired one expands to its detail", async () => {
     mockApi.listSchedules.mockResolvedValue([
       sched({
         id: "g1",
@@ -745,109 +664,326 @@ describe("Schedules — last-run parity on grouped sub-rows (issue #690)", () =>
     ]);
     renderPage();
 
-    fireEvent.click(await screen.findByRole("button", { name: /Show repos for Prompt: grouped job/ }));
-    await waitFor(() => expect(screen.getByRole("switch", { name: "Pause on vtmocanu/uzi" })).toBeTruthy());
-
-    // The uzi sub-row shows the enriched green outcome badge; the atlas sub-row never fired.
-    // Scope each outcome to its own sub-row (anchored on the unique per-repo pause switch)
-    // so a Uzi/Atlas swap fails the test — a document-level getByText would pass either way,
-    // and "— never fired" also appears in the group summary cell (issue #690 CR).
-    const uziRow = screen
-      .getByRole("switch", { name: "Pause on vtmocanu/uzi" })
-      .closest<HTMLElement>("div.rounded-lg")!;
-    const atlasRow = screen
-      .getByRole("switch", { name: "Pause on vtmocanu/atlas" })
-      .closest<HTMLElement>("div.rounded-lg")!;
+    const uziRow = (await screen.findByRole("switch", { name: /on vtmocanu\/uzi$/ })).closest("tr")!;
+    const atlasRow = screen.getByRole("switch", { name: /on vtmocanu\/atlas$/ }).closest("tr")!;
     expect(within(uziRow).getByText("1 started")).toBeTruthy();
     expect(within(uziRow).queryByText("— never fired")).toBeNull();
     expect(within(atlasRow).getByText("— never fired")).toBeTruthy();
     expect(within(atlasRow).queryByText("1 started")).toBeNull();
 
-    // Only one sub-row carries a fire, so the disclosure is unambiguous. Expanding reveals
-    // the started run (LastFireDetail) below that sub-row's flex row.
     expect(screen.queryByText("grouped started")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Last fire" }));
     expect(screen.getByText("grouped started")).toBeTruthy();
   });
 });
 
-// ── issue #638: issue schedules can't span repos + per-repo target badges ───────
-describe("Schedules — issue-target add-repo gating + sub-row badges (issue #638)", () => {
+// ── issue #638: issue schedules can't span repos ───────────────────────────────
+describe("Schedules — issue-target add-repo gating (issue #638)", () => {
   const reason = "Issue schedules can't span repos - issue numbers are repo-relative";
 
-  it("P1c: an issue-target standalone row disables the 'Add another repo' control (with the reason as its tooltip)", async () => {
-    mockApi.listRepos.mockResolvedValue({
-      repos: [
-        { id: "repo-uzi", path_with_namespace: "vtmocanu/uzi" },
-        { id: "repo-atlas", path_with_namespace: "vtmocanu/atlas" },
-      ],
-    } as Awaited<ReturnType<typeof api.listRepos>>);
+  it("P1c: an issue-target row's 'Add to another repo' item is disabled, with the reason as its description", async () => {
+    mockApi.listRepos.mockResolvedValue(REPOS3);
     mockApi.listSchedules.mockResolvedValue([
       sched({ id: "iss1", target: "issue", issue_iid: 42, origin: "user", sibling_group_id: null }),
     ]);
     renderPage();
-    await waitFor(() => expect(screen.getByText("#42")).toBeTruthy());
+    fireEvent.click(await screen.findByRole("button", { name: "More actions for #42 on vtmocanu/uzi" }));
 
-    // The affordance is still present (discoverable), but disabled. Its accessible
-    // name carries the blocked reason (the title tooltip is unreachable on a disabled
-    // button for keyboard/SR/touch), and its title tooltip repeats the fuller reason.
-    const addBtn = screen.getByRole("button", { name: "Add another repo (unavailable for issue schedules)" });
-    expect((addBtn as HTMLButtonElement).disabled).toBe(true);
-    expect(addBtn.getAttribute("title")).toBe(reason);
+    const item = screen.getByRole("menuitem", { name: "Add to another repo" });
+    expect(item.getAttribute("aria-disabled")).toBe("true");
+    expect(document.getElementById(item.getAttribute("aria-describedby")!)?.textContent).toBe(reason);
+    // Activating it does nothing: no picker opens.
+    fireEvent.click(item);
+    expect(screen.queryByRole("combobox", { name: /on another repo/ })).toBeNull();
   });
 
-  it("P1c control-negative: a non-issue (sweep) standalone row keeps 'Add another repo' enabled", async () => {
-    mockApi.listRepos.mockResolvedValue({
-      repos: [
-        { id: "repo-uzi", path_with_namespace: "vtmocanu/uzi" },
-        { id: "repo-atlas", path_with_namespace: "vtmocanu/atlas" },
-      ],
-    } as Awaited<ReturnType<typeof api.listRepos>>);
+  it("P1c control-negative: a sweep row's 'Add to another repo' item is enabled", async () => {
+    mockApi.listRepos.mockResolvedValue(REPOS3);
     mockApi.listSchedules.mockResolvedValue([
       sched({ id: "sw1", target: "sweep", origin: "user", sibling_group_id: null }),
     ]);
     renderPage();
-    await waitFor(() => expect(screen.getByText("Sweep eligible issues")).toBeTruthy());
+    fireEvent.click(await screen.findByRole("button", { name: "More actions for Sweep eligible issues on vtmocanu/uzi" }));
 
-    // Discriminates the P1c gate: a sweep row's add-repo control is NOT disabled, so the
-    // disabled assertion above is driven by target === "issue", not an always-off control.
-    const addBtn = screen.getByRole("button", { name: "Add another repo" });
-    expect((addBtn as HTMLButtonElement).disabled).toBe(false);
-    expect(addBtn.getAttribute("title")).toBe("Add another repo");
+    const item = screen.getByRole("menuitem", { name: "Add to another repo" });
+    expect(item.getAttribute("aria-disabled")).toBeNull();
+    expect(item.getAttribute("aria-describedby")).toBeNull();
   });
 
-  it("P2b: grouped issue siblings surface a per-repo 'issue' target badge", async () => {
-    mockApi.listSchedules.mockResolvedValue([
-      sched({ id: "gi1", target: "issue", issue_iid: 7, repo_id: "repo-uzi", repo_path: "vtmocanu/uzi", origin: "user", sibling_group_id: "grp-iss" }),
-      sched({ id: "gi2", target: "issue", issue_iid: 7, repo_id: "repo-atlas", repo_path: "vtmocanu/atlas", origin: "user", sibling_group_id: "grp-iss" }),
-    ]);
-    renderPage();
-
-    fireEvent.click(await screen.findByRole("button", { name: /Show repos for #7/ }));
-    await waitFor(() => expect(screen.getByRole("switch", { name: "Pause on vtmocanu/uzi" })).toBeTruthy());
-
-    // The group summary drops the type pill, so each sub-row must carry its own target
-    // badge — previously absent for issue targets (only sweep/prompt were rendered).
-    const uziRow = screen.getByText("vtmocanu/uzi").closest<HTMLElement>("div.rounded-lg")!;
-    expect(within(uziRow).getByText("issue")).toBeTruthy();
-    const atlasRow = screen.getByText("vtmocanu/atlas").closest<HTMLElement>("div.rounded-lg")!;
-    expect(within(atlasRow).getByText("issue")).toBeTruthy();
-  });
-
-  it("P2b: grouped self_improve siblings surface a per-repo 'self-improve' target badge", async () => {
+  it("self_improve sibling rows each carry the 'self-improve' target pill", async () => {
     mockApi.listSchedules.mockResolvedValue([
       sched({ id: "si1", target: "self_improve", repo_id: "repo-uzi", repo_path: "vtmocanu/uzi", origin: "user", sibling_group_id: "grp-si" }),
       sched({ id: "si2", target: "self_improve", repo_id: "repo-atlas", repo_path: "vtmocanu/atlas", origin: "user", sibling_group_id: "grp-si" }),
     ]);
     renderPage();
 
-    fireEvent.click(await screen.findByRole("button", { name: /Show repos for Self-improvement/ }));
-    await waitFor(() => expect(screen.getByRole("switch", { name: "Pause on vtmocanu/uzi" })).toBeTruthy());
-
-    const uziRow = screen.getByText("vtmocanu/uzi").closest<HTMLElement>("div.rounded-lg")!;
+    const uziRow = (await screen.findByRole("switch", { name: /on vtmocanu\/uzi$/ })).closest("tr")!;
+    const atlasRow = screen.getByRole("switch", { name: /on vtmocanu\/atlas$/ }).closest("tr")!;
     expect(within(uziRow).getByText("self-improve")).toBeTruthy();
-    const atlasRow = screen.getByText("vtmocanu/atlas").closest<HTMLElement>("div.rounded-lg")!;
     expect(within(atlasRow).getByText("self-improve")).toBeTruthy();
+  });
+});
+
+// ── PRD #1645 M1: the unified list, tabs, row anatomy, reveal ─────────────────
+function LocationProbe() {
+  const loc = useLocation();
+  return <output data-testid="loc">{loc.search}</output>;
+}
+
+function renderAt(url: string) {
+  return render(
+    <MemoryRouter initialEntries={[url]}>
+      <Schedules />
+      <LocationProbe />
+    </MemoryRouter>,
+  );
+}
+
+// A default row whose own cadence, zone and model all differ from CATALOG's entry.
+const customizedDefault = (over: Partial<Schedule> = {}) =>
+  sched({
+    id: "d1",
+    origin: "default",
+    catalog_slug: "bug-triage",
+    target: "sweep",
+    labels: ["bug"],
+    max_issues: 3,
+    cron_expr: "30 7 * * 1-5",
+    timezone: "Europe/Bucharest",
+    model: "claude-sonnet-4-5",
+    customized: true,
+    ...over,
+  });
+
+const tabNamed = (re: RegExp) => screen.getByRole("tab", { name: re });
+
+describe("Schedules — tabs, landing and ?tab deep link (PRD #1645 D1)", () => {
+  it("lands on Schedules when the owner has a schedule", async () => {
+    renderAt("/schedules");
+    await waitFor(() => expect(tabNamed(/^Schedules · 2/).getAttribute("aria-selected")).toBe("true"));
+    expect(tabNamed(/^Job catalog/).getAttribute("aria-selected")).toBe("false");
+  });
+
+  it("lands on the Job catalog when the owner has no schedules", async () => {
+    mockApi.listSchedules.mockResolvedValue([]);
+    mockApi.listScheduleCatalog.mockResolvedValue(CATALOG);
+    renderAt("/schedules");
+    await waitFor(() => expect(tabNamed(/^Job catalog · 1/).getAttribute("aria-selected")).toBe("true"));
+    expect(screen.getByText("Bug triage sweep")).toBeTruthy();
+  });
+
+  it("?tab=catalog selects the catalog even when schedules exist; an invalid ?tab falls back to the landing rule", async () => {
+    mockApi.listScheduleCatalog.mockResolvedValue(CATALOG);
+    renderAt("/schedules?tab=catalog");
+    await waitFor(() => expect(screen.getByText("Bug triage sweep")).toBeTruthy());
+    expect(tabNamed(/^Job catalog/).getAttribute("aria-selected")).toBe("true");
+    cleanup();
+
+    renderAt("/schedules?tab=bogus");
+    await waitFor(() => expect(screen.getByText("Sweep eligible issues")).toBeTruthy());
+    expect(tabNamed(/^Schedules/).getAttribute("aria-selected")).toBe("true");
+  });
+
+  it("the URL follows tab changes, by click and by the arrow-key tablist", async () => {
+    renderAt("/schedules?keep=1");
+    await waitFor(() => expect(screen.getByText("Sweep eligible issues")).toBeTruthy());
+    fireEvent.click(tabNamed(/^Job catalog/));
+    expect(screen.getByTestId("loc").textContent).toBe("?keep=1&tab=catalog");
+    expect(tabNamed(/^Job catalog/).getAttribute("aria-selected")).toBe("true");
+
+    // APG roving tablist: ArrowRight wraps back to Schedules and moves focus with it.
+    fireEvent.keyDown(tabNamed(/^Job catalog/), { key: "ArrowRight" });
+    expect(screen.getByTestId("loc").textContent).toBe("?keep=1&tab=schedules");
+    expect(document.activeElement).toBe(tabNamed(/^Schedules/));
+  });
+
+  it("counts every schedule of both origins, and pills catalog entries enabled nowhere", async () => {
+    mockApi.listScheduleCatalog.mockResolvedValue({
+      entries: [CATALOG.entries[0], { ...CATALOG.entries[0], slug: "refactor-scout", name: "Refactor scout" }],
+      enablements: [],
+    });
+    mockApi.listSchedules.mockResolvedValue([
+      customizedDefault(),
+      sched({ id: "u1", target: "prompt", prompt: "mine" }),
+    ]);
+    renderAt("/schedules");
+    await waitFor(() => expect(tabNamed(/^Schedules · 2$/)).toBeTruthy());
+    expect(tabNamed(/^Job catalog · 2/).textContent).toContain("1 not enabled");
+  });
+
+  it("hides the not-enabled pill when every entry runs somewhere", async () => {
+    mockApi.listScheduleCatalog.mockResolvedValue(CATALOG);
+    mockApi.listSchedules.mockResolvedValue([customizedDefault({ enabled: false })]);
+    renderAt("/schedules");
+    await waitFor(() => expect(tabNamed(/^Schedules · 1$/)).toBeTruthy());
+    // Positive control: the catalog tab rendered its count.
+    expect(tabNamed(/^Job catalog · 1$/)).toBeTruthy();
+    expect(screen.queryByText(/not enabled$/)).toBeNull();
+  });
+
+  it("the empty Schedules tab shows the D8 copy and links to the catalog", async () => {
+    mockApi.listSchedules.mockResolvedValue([]);
+    mockApi.listScheduleCatalog.mockResolvedValue(CATALOG);
+    renderAt("/schedules?tab=schedules");
+    await waitFor(() =>
+      expect(
+        screen.getByText("Nothing runs on a clock yet. Enable a shipped job from the Job catalog, or create your own."),
+      ).toBeTruthy(),
+    );
+    // Both New schedule buttons (header + empty state) are offered.
+    expect(screen.getAllByRole("button", { name: /New schedule/ })).toHaveLength(2);
+    fireEvent.click(screen.getByRole("button", { name: "Open the Job catalog" }));
+    expect(tabNamed(/^Job catalog/).getAttribute("aria-selected")).toBe("true");
+  });
+});
+
+describe("Schedules — default rows on the unified list (PRD #1645 D4)", () => {
+  it("a default row shows its OWN cron, timezone and model, never the catalog's", async () => {
+    mockApi.listScheduleCatalog.mockResolvedValue(CATALOG);
+    mockApi.listSchedules.mockResolvedValue([customizedDefault()]);
+    renderPage();
+
+    const name = await screen.findByText("Bug triage sweep");
+    const row = name.closest("tr")!;
+    expect(within(row).getByText("30 7 * * 1-5")).toBeTruthy();
+    expect(within(row).getByText(/Europe\/Bucharest/)).toBeTruthy();
+    expect(within(row).getByText("model claude-sonnet-4-5")).toBeTruthy();
+    // The catalog's values (0 2 * * *, UTC, inherit model) appear nowhere on the row.
+    expect(within(row).queryByText("0 2 * * *")).toBeNull();
+    expect(within(row).queryByText(/UTC/)).toBeNull();
+    expect(within(row).queryByText("inherit model")).toBeNull();
+    // Sealed labels and the max-issues cap are chips from the row too.
+    expect(within(row).getByText("label bug")).toBeTruthy();
+    expect(within(row).getByText("max 3")).toBeTruthy();
+    // Provenance: lock marker, kind pill, customized badge.
+    expect(within(row).getByLabelText("Baked prompt, read-only")).toBeTruthy();
+    expect(within(row).getByText("sweep")).toBeTruthy();
+    expect(within(row).getByText("customized")).toBeTruthy();
+  });
+
+  it("a customized default shows Reset inline (scope in its tooltip); a non-customized one offers none", async () => {
+    mockApi.listScheduleCatalog.mockResolvedValue(CATALOG);
+    mockApi.listSchedules.mockResolvedValue([
+      customizedDefault(),
+      customizedDefault({ id: "d2", repo_id: "repo-atlas", repo_path: "vtmocanu/atlas", customized: false }),
+    ]);
+    mockApi.resetSchedule.mockResolvedValue(customizedDefault({ customized: false }));
+    renderPage();
+
+    const reset = await screen.findByRole("button", { name: "Reset Bug triage sweep on vtmocanu/uzi to catalog defaults" });
+    expect(reset.getAttribute("title")).toBe(
+      "Restores all editable settings to the catalog defaults and clears your guidance, harness and token overrides. The shipped prompt and labels are unchanged.",
+    );
+    // Exactly one Reset: the non-customized atlas row has none inline...
+    expect(screen.getAllByRole("button", { name: /^Reset / })).toHaveLength(1);
+    expect(screen.queryByRole("button", { name: /Reset Bug triage sweep on vtmocanu\/atlas/ })).toBeNull();
+    // ...nor in its menu.
+    fireEvent.click(screen.getByRole("button", { name: "More actions for Bug triage sweep on vtmocanu/atlas" }));
+    expect(screen.queryByRole("menuitem", { name: /Reset/ })).toBeNull();
+    fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+
+    fireEvent.click(reset);
+    await waitFor(() => expect(mockApi.resetSchedule).toHaveBeenCalledWith("d1"));
+  });
+
+  it("toggle, Run now and Edit are on the row with no expand step", async () => {
+    mockApi.listScheduleCatalog.mockResolvedValue(CATALOG);
+    mockApi.listSchedules.mockResolvedValue([customizedDefault({ customized: false })]);
+    mockApi.runScheduleNow.mockResolvedValue({ created: 1, run_ids: ["r"], matched: 1, capped: false, started: [], skips: [] });
+    mockApi.updateSchedule.mockImplementation(async (id: string, input) => customizedDefault({ id, enabled: input.enabled ?? true }));
+    renderPage();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Run now: Bug triage sweep on vtmocanu/uzi" }));
+    await waitFor(() => expect(mockApi.runScheduleNow).toHaveBeenCalledWith("d1"));
+    fireEvent.click(screen.getByRole("switch", { name: "Pause Bug triage sweep on vtmocanu/uzi" }));
+    await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenCalledWith("d1", { enabled: false }));
+    fireEvent.click(screen.getByRole("button", { name: "Edit Bug triage sweep on vtmocanu/uzi" }));
+    expect(await screen.findByRole("dialog")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /Show repos for/ })).toBeNull();
+  });
+
+  it("a paused default reads 'Resume …' on its toggle", async () => {
+    mockApi.listScheduleCatalog.mockResolvedValue(CATALOG);
+    mockApi.listSchedules.mockResolvedValue([customizedDefault({ enabled: false })]);
+    renderPage();
+    expect(await screen.findByRole("switch", { name: "Resume Bug triage sweep on vtmocanu/uzi" })).toBeTruthy();
+  });
+
+  it("'from catalog' switches to the Job catalog and focuses that entry", async () => {
+    mockApi.listScheduleCatalog.mockResolvedValue(CATALOG);
+    mockApi.listSchedules.mockResolvedValue([customizedDefault()]);
+    renderPage();
+
+    fireEvent.click(await screen.findByRole("button", { name: "from catalog: Bug triage sweep" }));
+    expect(tabNamed(/^Job catalog/).getAttribute("aria-selected")).toBe("true");
+    const card = document.getElementById("catalog-entry-bug-triage");
+    expect(card).not.toBeNull();
+    await waitFor(() => expect(document.activeElement).toBe(card));
+  });
+
+  it("the menu's 'Enable on another repo' also leads to that catalog entry (M3 wires the picker)", async () => {
+    mockApi.listScheduleCatalog.mockResolvedValue(CATALOG);
+    mockApi.listSchedules.mockResolvedValue([customizedDefault()]);
+    renderPage();
+
+    fireEvent.click(await screen.findByRole("button", { name: "More actions for Bug triage sweep on vtmocanu/uzi" }));
+    // Default rows offer Enable-on-another-repo, never Add-to-another-repo.
+    expect(screen.queryByRole("menuitem", { name: "Add to another repo" })).toBeNull();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Enable on another repo" }));
+    await waitFor(() => expect(document.activeElement).toBe(document.getElementById("catalog-entry-bug-triage")));
+  });
+});
+
+describe("Schedules — D3 sort on the page", () => {
+  it("orders parked first, then enabled by next fire, then enabled with none, then paused", async () => {
+    mockApi.listScheduleCatalog.mockResolvedValue(CATALOG);
+    const soon = new Date(Date.now() + 1 * 3_600_000).toISOString();
+    const later = new Date(Date.now() + 5 * 3_600_000).toISOString();
+    mockApi.listSchedules.mockResolvedValue([
+      sched({ id: "paused", target: "prompt", prompt: "a paused one", enabled: false }),
+      sched({ id: "later", target: "prompt", prompt: "b later", next_fire_at: later }),
+      sched({ id: "none", target: "prompt", prompt: "c no next fire", next_fire_at: null }),
+      customizedDefault({ id: "soon", next_fire_at: soon, next_fires: [soon] }),
+      sched({ id: "parked", target: "prompt", prompt: "z parked", status: "error" }),
+    ]);
+    renderPage();
+    await waitFor(() => expect(screen.getByText("Prompt: z parked")).toBeTruthy());
+    const order = [...document.querySelectorAll<HTMLElement>("[id^='schedule-name-']")].map((el) =>
+      el.id.replace("schedule-name-", ""),
+    );
+    expect(order).toEqual(["parked", "soon", "later", "none", "paused"]);
+  });
+});
+
+describe("Schedules — clone reveals the copy (PRD #1645 D12)", () => {
+  it("cloning from the catalog tab switches to Schedules, keeps the edit modal, and focuses the clone when it closes", async () => {
+    const clone = sched({ id: "c1", target: "sweep", labels: ["bug"], origin: "user" });
+    mockApi.listScheduleCatalog.mockResolvedValue(CATALOG);
+    mockApi.listSchedules
+      .mockResolvedValueOnce([customizedDefault()])
+      .mockResolvedValue([customizedDefault(), clone]);
+    mockApi.cloneSchedule.mockResolvedValue(clone);
+    renderAt("/schedules?tab=catalog");
+
+    // The old catalog tab's per-repo Clone (behind its expander until M3).
+    fireEvent.click(await screen.findByRole("button", { name: "Show repos for Bug triage sweep" }));
+    fireEvent.click(screen.getByRole("button", { name: "Clone Bug triage sweep on vtmocanu/uzi" }));
+    await waitFor(() => expect(mockApi.cloneSchedule).toHaveBeenCalledWith("d1"));
+
+    // Switched to Schedules with the clone rendered behind the open edit modal.
+    await waitFor(() => expect(tabNamed(/^Schedules/).getAttribute("aria-selected")).toBe("true"));
+    expect(screen.getByTestId("loc").textContent).toBe("?tab=schedules");
+    expect(await screen.findByRole("dialog")).toBeTruthy();
+    const nameCell = await waitFor(() => {
+      const el = document.getElementById("schedule-name-c1");
+      expect(el).not.toBeNull();
+      return el!;
+    });
+    expect(document.activeElement).not.toBe(nameCell); // the modal holds focus while open
+
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(document.activeElement).toBe(nameCell));
   });
 });
 
@@ -866,7 +1002,7 @@ describe("Schedules — pause all (PRD #1093)", () => {
     renderRoot();
     await waitFor(() => expect(screen.getByRole("button", { name: /Pause all/ })).toBeTruthy());
     // Positive control that the page loaded, so the banner-absent check below is meaningful.
-    expect(screen.getByRole("tab", { name: /Default jobs/ })).toBeTruthy();
+    expect(screen.getByRole("tab", { name: /^Schedules/ })).toBeTruthy();
     expect(screen.queryByText(/All schedules paused/)).toBeNull();
   });
 
@@ -924,7 +1060,7 @@ describe("Schedules — pause all (PRD #1093)", () => {
     // The timer fired and the re-read was attempted (and rejected).
     await waitFor(() => expect(mockApi.getSchedulePause.mock.calls.length).toBeGreaterThanOrEqual(2));
     // Positive control for the negative below: the page is still rendered.
-    expect(screen.getByRole("tab", { name: /Default jobs/ })).toBeTruthy();
+    expect(screen.getByRole("tab", { name: /^Schedules/ })).toBeTruthy();
     // The banner stays and the running control does not appear on an unknown state.
     expect(screen.getByText(/All schedules paused until/)).toBeTruthy();
     expect(screen.queryByRole("button", { name: /^Pause all$/ })).toBeNull();
@@ -1115,7 +1251,6 @@ describe("Schedules — pause all (PRD #1093)", () => {
         <Schedules />
       </MemoryRouter>,
     );
-    fireEvent.click(screen.getByRole("tab", { name: /My schedules/ }));
     await waitFor(() => expect(screen.getByText("Sweep eligible issues")).toBeTruthy());
     // The row's Next-run cell carries the paused note (the banner uses different copy:
     // "All schedules paused until …"), so match the cell's "paused until <stamp>" form.
