@@ -62,8 +62,9 @@ EOF
 bash "$SCRIPT" "$WORK/two.md" > "$WORK/two.out" 2>&1 || fail "two-sided union failed: $(cat "$WORK/two.out")"
 diff -u "$WORK/two.want" "$WORK/two.md" || fail "two-sided union produced the wrong file"
 
-# 2. Both sides add a `### Fixed` section (and an earlier bad resolution left one too): all
-#    collapse into the first `### Fixed` under [Unreleased]; released sections are untouched.
+# 2. One side adds its own `### Fixed` section next to the existing one, the other side a
+#    bare bullet: all collapse into the first `### Fixed` under [Unreleased]; released
+#    sections are untouched.
 cat > "$WORK/dup.md" <<'EOF'
 ## [Unreleased]
 
@@ -83,8 +84,6 @@ cat > "$WORK/dup.md" <<'EOF'
 - **main fix**
   main desc
 =======
-### Fixed
-
 - **branch fix**
   branch desc
 >>>>>>> def5678 (branch)
@@ -171,6 +170,87 @@ set -e
 [ "$rc" -ne 0 ] || fail "an unterminated conflict exited 0"
 cmp -s "$WORK/open.orig" "$WORK/open.md" || fail "an unterminated conflict modified the file"
 
+# 3b. FAIL-CLOSED: a bullet on BOTH sides of one conflict block (each side also has its own)
+#     would be written twice: refuse, file untouched.
+cat > "$WORK/shared.md" <<'EOF'
+## [Unreleased]
+
+### Fixed
+
+<<<<<<< HEAD
+- **shared fix**
+- **main only**
+=======
+- **shared fix**
+- **branch only**
+>>>>>>> abc1234 (branch)
+EOF
+cp "$WORK/shared.md" "$WORK/shared.orig"
+set +e
+bash "$SCRIPT" "$WORK/shared.md" > "$WORK/shared.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 1 ] || fail "a line on both sides returned rc=$rc, want 1: $(cat "$WORK/shared.out")"
+cmp -s "$WORK/shared.orig" "$WORK/shared.md" || fail "a line on both sides modified the file"
+grep -qF 'line on both sides of the conflict ending at line 11: - **shared fix**' "$WORK/shared.out" || fail "the shared line was not named: $(cat "$WORK/shared.out")"
+# 3c. ...the same for HEADINGS: each side carries `## [Unreleased]` / `### Fixed` / its own
+#     bullet, which a union would turn into two [Unreleased] sections.
+cat > "$WORK/twosec.md" <<'EOF'
+# Changelog
+
+<<<<<<< HEAD
+## [Unreleased]
+
+### Fixed
+
+- **main only**
+=======
+## [Unreleased]
+
+### Fixed
+
+- **branch only**
+>>>>>>> abc1234 (branch)
+
+## [0.1.0] - 2026-01-01
+
+- **old**
+EOF
+cp "$WORK/twosec.md" "$WORK/twosec.orig"
+set +e
+bash "$SCRIPT" "$WORK/twosec.md" > "$WORK/twosec.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 1 ] || fail "a two-sided [Unreleased] section returned rc=$rc, want 1: $(cat "$WORK/twosec.out")"
+cmp -s "$WORK/twosec.orig" "$WORK/twosec.md" || fail "a two-sided [Unreleased] section modified the file"
+# 3d. The post-check: sides that share no line but would repeat a version heading (same
+#     version, different dates) are refused too.
+cat > "$WORK/twover.md" <<'EOF'
+## [Unreleased]
+
+<<<<<<< HEAD
+## [0.2.0] - 2026-02-01
+
+- **main only**
+=======
+## [0.2.0] - 2026-02-02
+
+- **branch only**
+>>>>>>> abc1234 (branch)
+EOF
+cp "$WORK/twover.md" "$WORK/twover.orig"
+set +e
+bash "$SCRIPT" "$WORK/twover.md" > "$WORK/twover.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 1 ] || fail "a repeated version heading returned rc=$rc, want 1: $(cat "$WORK/twover.out")"
+cmp -s "$WORK/twover.orig" "$WORK/twover.md" || fail "a repeated version heading modified the file"
+grep -qF 'repeats version heading(s) ## [0.2.0]' "$WORK/twover.out" || fail "the repeated version was not named: $(cat "$WORK/twover.out")"
+# 3e. Positive: distinct bullets on the two sides still union.
+printf '## [Unreleased]\n\n### Fixed\n\n<<<<<<< HEAD\n- **main only**\n=======\n- **branch only**\n>>>>>>> abc (b)\n' > "$WORK/distinct.md"
+bash "$SCRIPT" "$WORK/distinct.md" > "$WORK/distinct.out" 2>&1 || fail "distinct bullets did not union: $(cat "$WORK/distinct.out")"
+[ "$(printf '## [Unreleased]\n\n### Fixed\n\n- **main only**\n- **branch only**\n\n')" = "$(cat "$WORK/distinct.md"; echo)" ] || fail "distinct union wrong: $(cat "$WORK/distinct.md")"
+
 # 4. No markers: success, file untouched (even with a duplicate heading).
 printf '## [Unreleased]\n\n### Fixed\n\n- a\n\n### Fixed\n\n- b\n' > "$WORK/clean.md"
 cp "$WORK/clean.md" "$WORK/clean.orig"
@@ -253,4 +333,4 @@ set -e
 [ "$rc" -eq 1 ] || fail "--collapse on a conflicted file returned rc=$rc, want 1"
 cmp -s "$WORK/lossy.orig" "$WORK/mk.md" || fail "--collapse modified a conflicted file"
 
-echo "PASS changelog-union: union, duplicate-heading collapse, lossy refusal, no-op, --collapse"
+echo "PASS changelog-union: union, duplicate-heading collapse, lossy refusal, both-sides and repeated-version refusals, no-op, --collapse"

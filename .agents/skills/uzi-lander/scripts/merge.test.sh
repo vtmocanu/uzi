@@ -64,6 +64,8 @@ if [ "\${1:-}" = pr ] && [ "\${2:-}" = view ]; then
   esac
   exit 0
 fi
+if [ "\${1:-}" = pr ] && [ "\${2:-}" = checks ]; then printf '%s\n' "\${CHECKS_JSON:-}"; exit "\${CHECKS_RC:-0}"; fi
+if [ "\${1:-}" = pr ] && [ "\${2:-}" = merge ]; then echo "\$*" >> "$WORK/merge.log"; exit 0; fi
 echo "unexpected gh call: \$*" >&2
 exit 1
 STUB
@@ -169,4 +171,35 @@ set -e
 grep -q 'not MERGED' "$WORK/open.out" || fail "--confirm-only OPEN did not report not-merged: $(cat "$WORK/open.out")"
 { [ -e "$CL/#42.json" ] && [ -e "$TR/#42.trail" ]; } || fail "--confirm-only OPEN mutated the claim/trail: $(cat "$WORK/open.out")"
 
-echo "PASS merge: --confirm-only reconciles an out-of-band merge"
+# 5. The guarded merge's required-checks gate is fail-closed. An EMPTY list (a head with no
+#    check runs: CI skipped, a missed dispatch) and an unreadable reply both refuse with
+#    exit 2 and no merge call; a failing check is read from the array gh prints alongside
+#    its non-zero exit; a passing list reaches the merge (the positive control).
+MERGE_STATE=OPEN; export MERGE_STATE
+merge_run() { # label -> rc, output in $WORK/m.<label>
+  rm -f "$WORK/merge.log"
+  set +e
+  bash "$SCRIPT" test/repo 42 --no-rework-check > "$WORK/m.$1" 2>&1
+  rc=$?
+  set -e
+}
+CHECKS_JSON='[]' CHECKS_RC=0; export CHECKS_JSON CHECKS_RC
+merge_run empty
+[ "$rc" -eq 2 ] || fail "an empty required-checks list returned rc=$rc, want 2: $(cat "$WORK/m.empty")"
+grep -q "no required checks reported on ${HEAD:0:8}; not merging" "$WORK/m.empty" || fail "empty list not named: $(cat "$WORK/m.empty")"
+[ ! -e "$WORK/merge.log" ] || fail "merged with no required checks reported"
+CHECKS_JSON='' CHECKS_RC=1
+merge_run unreadable
+[ "$rc" -eq 2 ] || fail "a failed gh pr checks returned rc=$rc, want 2: $(cat "$WORK/m.unreadable")"
+grep -q 'cannot read the required checks for #42 (gh exit 1)' "$WORK/m.unreadable" || fail "gh failure not named: $(cat "$WORK/m.unreadable")"
+[ ! -e "$WORK/merge.log" ] || fail "merged with unreadable required checks"
+CHECKS_JSON='[{"bucket":"pass"},{"bucket":"fail"}]' CHECKS_RC=1
+merge_run failing
+[ "$rc" -eq 1 ] || fail "a failing required check returned rc=$rc, want 1: $(cat "$WORK/m.failing")"
+[ ! -e "$WORK/merge.log" ] || fail "merged with a failing required check"
+CHECKS_JSON='[{"bucket":"pass"}]' CHECKS_RC=0
+merge_run green
+grep -q -- '--match-head-commit' "$WORK/merge.log" 2>/dev/null || fail "a green required-checks list did not reach the merge: $(cat "$WORK/m.green")"
+unset CHECKS_JSON CHECKS_RC
+
+echo "PASS merge: --confirm-only reconciles an out-of-band merge; empty/unreadable required checks refuse"

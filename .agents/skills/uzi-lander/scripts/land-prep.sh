@@ -42,6 +42,8 @@
 #      --continue`, then re-run with --skip-rebase. A stop whose ONLY conflicted path is
 #      CHANGELOG.md is resolved automatically (changelog-union.sh keeps both sides) and the
 #      rebase continued, commit by commit; the CHANGELOG guard (exit 9) still runs after.
+#      The helper refuses (so this stays exit 5) when any line or heading appears on both
+#      sides of one conflict block, or the union would repeat a `## [<version>]` heading.
 #      After every completed rebase that leaves CHANGELOG.md in the branch diff, repeated
 #      `### <Section>` headings under [Unreleased] are collapsed in a separate
 #      "chore: collapse duplicate CHANGELOG section headings" commit (only if it changes
@@ -57,11 +59,14 @@
 #      tolerated (before the push, and at a --skip-rebase re-entry) when the base delta
 #      (`git diff --name-only <recorded> <new>`) and the branch's own files share no path
 #      but CHANGELOG.md (the migrations directory counts as one path) and `git rebase <new>`
-#      applies, a CHANGELOG.md-only stop union-resolved as for exit 5: the branch is rebased, the recorded base updated, and the push proceeds
-#      WITHOUT re-running the local gate. The local gate is a pre-push courtesy; merge.sh
-#      refuses anything without green required CI on the exact head, so CI stays the
-#      authoritative gate; the CHANGELOG guard (exit 9) re-runs. Any other shared path or
-#      conflict (the rebase aborted, worktree restored) is still exit 8. The branch-head check has no such tolerance.
+#      applies, a CHANGELOG.md-only stop union-resolved as for exit 5: the branch is
+#      rebased, the recorded base updated, and the push proceeds WITHOUT re-running the
+#      local gate. The local gate is a pre-push courtesy: merge.sh refuses unless the PR's
+#      required checks are reported (an empty list refuses) with none failing, pending or
+#      cancelled, and merges with --match-head-commit, so CI stays the authoritative gate.
+#      The CHANGELOG guard (exit 9) re-runs. Any other shared path or conflict (the rebase
+#      aborted, worktree restored; a failed restore is exit 3) is still exit 8. The
+#      branch-head check has no such tolerance.
 #   9  the branch deletes CHANGELOG.md lines the base carries (usually a conflict resolved
 #      from a stale copy, e.g. a --fresh backup); restore them, or pass
 #      --allow-changelog-removals for a deliberate reword. A pure heading collapse (a
@@ -80,7 +85,7 @@ while [ $# -gt 0 ]; do
     --no-rework-check) REWORK_CHECK=0; shift;;
     --allow-changelog-removals) ALLOW_CL_RM=1; shift;;
     --repo-root) ROOT="${2:?}"; shift 2;;
-    -h|--help) sed -n '2,68p' "$0"; exit 2;;
+    -h|--help) sed -n '2,74p' "$0"; exit 2;;
     -*) echo "unknown flag: $1" >&2; exit 2;;
     *) if [ -z "$REPO" ]; then REPO="$1"; elif [ -z "$PR" ]; then PR="$1"; else echo "unexpected arg: $1" >&2; exit 2; fi; shift;;
   esac
@@ -257,8 +262,17 @@ try_base_move() {
   fi
   pre=$(git rev-parse HEAD)
   if ! git rebase "$new" --quiet >/dev/null 2>&1 && ! union_continue; then
-    git rebase --abort >/dev/null 2>&1
-    [ "$(git rev-parse HEAD)" = "$pre" ] || git reset -q --hard "$pre"
+    # Restoring is load-bearing: exit 8 promises the worktree as it was. Any step that fails
+    # to get back to $pre is an instrument failure, never a quiet "back at".
+    if rebase_in_progress && ! git rebase --abort >/dev/null 2>&1; then
+      log "ERROR: git rebase --abort failed in $WT; the worktree is mid-rebase, NOT at ${pre:0:8}"; exit 3
+    fi
+    if [ "$(git rev-parse HEAD)" != "$pre" ] && ! git reset -q --hard "$pre"; then
+      log "ERROR: git reset --hard ${pre:0:8} failed in $WT; the worktree is NOT restored"; exit 3
+    fi
+    if rebase_in_progress || [ "$(git rev-parse HEAD)" != "$pre" ]; then
+      log "ERROR: after the aborted rebase $WT is at $(git rev-parse --short HEAD), not ${pre:0:8}; NOT restored"; exit 3
+    fi
     log "rebase onto the moved base ${new:0:8} conflicts; aborted, worktree back at ${pre:0:8}"
     return 1
   fi

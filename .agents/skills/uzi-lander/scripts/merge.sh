@@ -28,7 +28,7 @@
 # Exit codes:
 #   0  merged — prints MERGE_SHA=<sha>; next: watch-run-ci.sh --sha <sha>
 #   1  a required check is failing on the head — not merged
-#   2  usage, or required checks still pending — not merged
+#   2  usage, or required checks still pending, unreadable, or none reported — not merged
 #   3  gh error, or the merge command was refused (classifier block, ruleset, conflict):
 #      the exact command is printed for the user to run via a `!` line
 #   4  an mr_rework run is active on this MR — defer
@@ -125,10 +125,19 @@ if [ "$REWORK_CHECK" -eq 1 ]; then
   fi
 fi
 
-# Required checks on the head — FAIL CLOSED: unreadable JSON is "not merging", a cancelled
-# required check is not green (supersession), pending is not green.
-cj=$(gh pr checks "$PR" --repo "$REPO" --required --json bucket 2>/dev/null || true)
-printf '%s' "$cj" | jq -e 'type=="array"' >/dev/null 2>&1 || { echo "cannot read the required checks for #$PR; not merging"; exit 2; }
+# Required checks on the head — FAIL CLOSED: unreadable JSON is "not merging", an EMPTY list
+# is "not merging" (a head with no check runs — CI skipped, a missed dispatch — would
+# otherwise merge ungated), a cancelled required check is not green (supersession), pending
+# is not green. gh exits non-zero while still printing the array when a check is failing or
+# pending, so its status only matters when no array came back.
+cj_rc=0
+cj=$(gh pr checks "$PR" --repo "$REPO" --required --json bucket 2>/dev/null) || cj_rc=$?
+if ! printf '%s' "$cj" | jq -e 'type=="array"' >/dev/null 2>&1; then
+  echo "cannot read the required checks for #$PR (gh exit $cj_rc); not merging"; exit 2
+fi
+if [ "$(printf '%s' "$cj" | jq 'length')" -eq 0 ]; then
+  echo "no required checks reported on ${head:0:8}; not merging"; exit 2
+fi
 f=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="fail")]|length')
 p=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="pending")]|length')
 c=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="cancel")]|length')

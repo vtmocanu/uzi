@@ -5,7 +5,9 @@
 # Usage: changelog-union.sh [--collapse] [FILE]      (default: CHANGELOG.md)
 #
 # Every conflict block keeps its first side, then its second; a diff3 base section
-# (`|||||||` .. `=======`) is dropped. Inside `## [Unreleased]`, a repeated `### <Section>`
+# (`|||||||` .. `=======`) is dropped. FAIL-CLOSED: when any non-blank line (bullet or
+# heading) appears on BOTH sides of one conflict block, the union would duplicate it, so the
+# helper refuses and leaves the file for a human (land-prep then stops with exit 5). Inside `## [Unreleased]`, a repeated `### <Section>`
 # heading is collapsed into its first occurrence (its bullets move under it) and blank lines
 # left between bullet items are dropped. A file with no conflict markers is left untouched.
 #
@@ -17,7 +19,8 @@
 #
 # Verification before the file is replaced: no marker survives, the multiset of content
 # lines (non-blank, non-marker, non-heading) from the resolved sides is identical before and
-# after, and the set of distinct headings is unchanged. Any miss leaves FILE untouched.
+# after, the set of distinct headings is unchanged, and no `## [<version>]` heading
+# (`## [Unreleased]` included) occurs twice. Any miss leaves FILE untouched.
 #
 # Exit codes: 0 resolved / collapsed (or nothing to do), 1 verification failed or malformed
 #             markers (or markers under --collapse),
@@ -98,11 +101,22 @@ if ! awk -v before="$tmpd/before" '
   /^<<<<<<<( |$)/ { if (st != 0) { bad = "nested <<<<<<< at line " NR; exit 1 } st = 1; next }
   /^[|]{7}( |$)/  { if (st != 1) { bad = "stray ||||||| at line " NR; exit 1 } st = 2; next }
   /^=======$/     { if (st != 1 && st != 2) { bad = "stray ======= at line " NR; exit 1 } st = 3; next }
-  /^>>>>>>>( |$)/ { if (st != 3) { bad = "stray >>>>>>> at line " NR; exit 1 } st = 0; next }
+  /^>>>>>>>( |$)/ {
+    if (st != 3) { bad = "stray >>>>>>> at line " NR; exit 1 }
+    # A line on both sides would be written twice: refuse rather than guess a dedupe.
+    split("", seen)
+    for (i = 1; i <= na; i++) if (A[i] !~ /^[ \t]*$/) seen[A[i]] = 1
+    for (i = 1; i <= nb; i++) if (B[i] !~ /^[ \t]*$/ && (B[i] in seen)) {
+      bad = "line on both sides of the conflict ending at line " NR ": " B[i]; exit 1
+    }
+    st = 0; na = 0; nb = 0; next
+  }
   st == 2 { next }
+  st == 1 { A[++na] = $0 }
+  st == 3 { B[++nb] = $0 }
   { print; print > before }
   END {
-    if (bad != "") { print "changelog-union: malformed markers: " bad > "/dev/stderr"; exit 1 }
+    if (bad != "") { print "changelog-union: refusing: " bad > "/dev/stderr"; exit 1 }
     if (st != 0) { print "changelog-union: unterminated conflict block" > "/dev/stderr"; exit 1 }
   }
 ' "$FILE" > "$tmpd/union"; then
@@ -173,6 +187,11 @@ fi
 if ! diff <(headings "$tmpd/before") <(headings "$tmpd/out") > "$tmpd/headings.diff"; then
   echo "changelog-union: headings would change; $FILE left untouched:" >&2
   cat "$tmpd/headings.diff" >&2; exit 1
+fi
+dup_versions=$(awk 'match($0, /^## \[[^]]*\]/) { k = substr($0, RSTART, RLENGTH); if (seen[k]++ == 1) print k }' "$tmpd/out")
+if [ -n "$dup_versions" ]; then
+  echo "changelog-union: the result repeats version heading(s) $(printf '%s' "$dup_versions" | tr '\n' ' '); $FILE left untouched" >&2
+  exit 1
 fi
 
 cat "$tmpd/out" > "$FILE" || { echo "changelog-union: cannot write $FILE" >&2; exit 2; }

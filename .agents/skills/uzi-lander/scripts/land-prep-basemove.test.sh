@@ -5,6 +5,8 @@
 #   B. the delta touches a branch path (even one that would rebase cleanly): exit 8, no push;
 #   C. the delta is disjoint but the rebase conflicts (file/directory): exit 8, worktree
 #      restored to its pre-rebase head;
+#   C2. ...and when that restore fails (`git rebase --abort` errors), exit 3 naming it, never
+#      a quiet "worktree back at";
 #   D. a --skip-rebase re-entry after a disjoint base move rebases and continues;
 #   E. a rebase stopping on CHANGELOG.md alone is resolved as a union and continued;
 #   F. a stop on CHANGELOG.md plus another path is still exit 5;
@@ -142,6 +144,23 @@ C_WT="$WORK/wt-203"
 [ "$(git --git-dir="$ORIGIN" rev-parse refs/heads/bc)" = "$BC_HEAD" ] || fail "C: the branch was pushed"
 # HEAD is still the prepared head on the recorded base (one commit below the moved main).
 [ "$(git -C "$C_WT" rev-parse HEAD^)" = "$(git -C "$C_WT" rev-parse "$(origin_main)^")" ] || fail "C: worktree HEAD is not the prepared head"
+
+# C2. the same file/directory conflict, but `git rebase --abort` fails: exit 3, loudly.
+mk_branch bc2; printf 'file\n' > "$SEED/web/dfx2"; commit_push bc2 'branch c2'
+hook web/dfx2/y.md 'dir\n' 'main adds another directory'
+REAL_GIT=$(command -v git)
+cat > "$WORK/bin/git" <<STUB
+#!/usr/bin/env bash
+case " \$* " in *" rebase --abort "*) echo "fatal: simulated abort failure" >&2; exit 128;; esac
+exec "$REAL_GIT" "\$@"
+STUB
+chmod +x "$WORK/bin/git"
+run bc2 216
+rm -f "$WORK/bin/git"
+[ "$rc" -eq 3 ] || fail "C2: a failed abort returned rc=$rc, want 3: $(cat "$WORK/out.216")"
+grep -q 'ERROR: git rebase --abort failed' "$WORK/out.216" || fail "C2: the failed abort was not named: $(cat "$WORK/out.216")"
+grep -q 'worktree back at' "$WORK/out.216" && fail "C2: claimed the worktree was restored"
+git -C "$WORK/wt-216" rebase --abort
 
 # D. --skip-rebase re-entry after a disjoint move: rebased, gates run, prepared.
 mk_branch bd; printf 'd\n' > "$SEED/web/d.txt"; commit_push bd 'branch d'
