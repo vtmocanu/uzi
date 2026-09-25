@@ -695,8 +695,8 @@ function priorWorkNote(prior: PriorWork | undefined): string {
 // The runner clone is wiped and re-seeded on EVERY claim (git.ts `runnerCloneForBranch`
 // opens with an unconditional `fs.rm`). On a RESUME that destroys any work an earlier
 // attempt left in the tree but never pushed. A follow-up the user QUEUED against the
-// pre-reseed tree survives the wipe (it is cleared only by the worker's consume-on-read
-// `GET /inputs`) and is delivered on a later implement turn, so the lead can act on a
+// pre-reseed tree survives the wipe (it is cleared only once a worker has applied it,
+// issue #1673) and is delivered on a later implement turn, so the lead can act on a
 // correction whose premise — the files/commits it names — no longer exists, with nothing
 // to tell it the tree changed. `priorWorkNote` does not cover this: it fires only when
 // COMMITTED work was recovered (`priorCommits > 0`), and the default-branch reseed leg

@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import type { Logger } from "../src/log.js";
-import type { ClaimResponse } from "../src/protocol.js";
+import type { WorkerClient } from "../src/client.js";
+import { ChatSteering, SteeringChannel } from "../src/steering.js";
+import type { ClaimResponse, UserInput } from "../src/protocol.js";
 
 /** A no-op logger so tests don't spray JSON lines into the reporter. */
 export function nullLogger(): Logger {
@@ -57,4 +59,42 @@ export function makeClaim(overrides: Partial<ClaimResponse> = {}): ClaimResponse
     agents: [],
     ...overrides,
   };
+}
+
+/** Issue #1673: give a scripted getInputs fake the receipt endpoints. Every ACK and applied
+ *  receipt succeeds on the active claim and echoes the rows of the latest GET. */
+export function withReceipts(client: WorkerClient): WorkerClient {
+  let latest: UserInput[] = [];
+  const getInputs = client.getInputs.bind(client);
+  return {
+    ...client,
+    getInputs: async (runId: string) => {
+      const result = await getInputs(runId);
+      latest = result.inputs;
+      return { ...result, receipts: true };
+    },
+    ackInputs: async (_runId: string, ids: number[]) => ({
+      inputs: latest.filter((row) => ids.includes(row.id)).sort((a, b) => a.id - b.id),
+      active: true,
+    }),
+    applyInputs: async () => ({ inputs: latest, active: true }),
+  } as unknown as WorkerClient;
+}
+
+// Issue #1663: a failed assertion before `await ch.stop()` left a steering poll loop running,
+// and node --test never finished the file. Every started channel is recorded here; a test file
+// passes stopStartedChannels to afterEach. stop() is idempotent, so a test's own stop is unaffected.
+const startedChannels = new Set<{ stop(): Promise<void> }>();
+for (const Channel of [SteeringChannel, ChatSteering]) {
+  const start = Channel.prototype.start;
+  Channel.prototype.start = function (this: SteeringChannel & ChatSteering): void {
+    startedChannels.add(this);
+    start.call(this);
+  };
+}
+
+export async function stopStartedChannels(): Promise<void> {
+  const running = [...startedChannels];
+  startedChannels.clear();
+  await Promise.all(running.map((channel) => channel.stop()));
 }

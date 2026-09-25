@@ -1048,6 +1048,7 @@ type Store interface {
 	// SetRunRunning's resume guard compares it in SQL.
 	CreateRunAnswerInput(ctx context.Context, arg store.CreateRunAnswerInputParams) (store.RunUserInput, error)
 	ConsumeRunInputs(ctx context.Context, runID uuid.UUID) ([]store.ConsumeRunInputsRow, error)
+	ListReplayRunInputs(ctx context.Context, runID uuid.UUID) ([]store.ListReplayRunInputsRow, error)
 	// ListConsumedFollowUpInputsForRun reads the run's already-consumed follow_up inputs,
 	// oldest first (issue #1660): the worker's operator-constraint rehydrate on every claim.
 	ListConsumedFollowUpInputsForRun(ctx context.Context, runID uuid.UUID) ([]store.ListConsumedFollowUpInputsForRunRow, error)
@@ -4209,12 +4210,16 @@ type InputDTO struct {
 type ConsumeInputsResult struct {
 	Inputs           []InputDTO
 	CredentialSwitch *CredentialSwitchSignal
+	// Receipts marks a read-only replay a receipt-capable worker must ACK and apply (issue
+	// #1673). Absent, the reply was consumed on read: an older api pod mid-roll, or a legacy
+	// worker, and the worker routes it with no receipts.
+	Receipts bool
 }
 
-// ConsumeInputs returns and marks-consumed every pending steering input for a
-// run the worker owns, FIFO. Delivery marks the input consumed (there is no
-// separate ack), so a worker crash right after the GET drops that input — an
-// accepted MVP trade-off for the steering channel (the user can re-send).
+// ConsumeInputs returns steering inputs for a run the worker owns, FIFO.
+// Receipt-capable workers replay unapplied rows until they ACK and apply them.
+// Legacy workers mark each delivered row consumed and applied in one transaction;
+// a crash after that GET can lose the input, so the user may need to re-send.
 //
 // CONSUME-NOTHING RULE (PRD #1247 M5, step 2): the buffered inputs of a run whose claim is being
 // switched are earmarked for the RECLAIM, and this drains NOTHING until that reclaim happens. Two
@@ -4246,6 +4251,17 @@ func (s *Service) ConsumeInputs(ctx context.Context, wkr store.Worker, runID uui
 		// for this claim, if any, is already released).
 		return ConsumeInputsResult{}, nil
 	}
+	if slices.Contains(wkr.ProtocolCapabilities, capability.InputReceiptsV1) {
+		rows, err := s.q.ListReplayRunInputs(ctx, runID)
+		if err != nil {
+			return ConsumeInputsResult{}, err
+		}
+		out := make([]InputDTO, 0, len(rows))
+		for _, row := range rows {
+			out = append(out, InputDTO{ID: row.ID, Kind: row.Kind, Body: textPtr(row.Body), CreatedAt: row.CreatedAt.Time})
+		}
+		return ConsumeInputsResult{Inputs: out, Receipts: true}, nil
+	}
 	rows, err := s.q.ConsumeRunInputs(ctx, runID)
 	if err != nil {
 		return ConsumeInputsResult{}, err
@@ -4253,13 +4269,13 @@ func (s *Service) ConsumeInputs(ctx context.Context, wkr store.Worker, runID uui
 	out := make([]InputDTO, 0, len(rows))
 	consumedFollowUp := false
 	for _, row := range rows {
-		if row.Kind == "follow_up" {
+		if row.Kind == "follow_up" && row.FirstConsumption {
 			consumedFollowUp = true
 		}
 		out = append(out, InputDTO{ID: row.ID, Kind: row.Kind, Body: textPtr(row.Body), CreatedAt: row.CreatedAt.Time})
 	}
-	// Delivery ack (PRD #95 Decision 5): a follow-up is now consumed (consumed_at
-	// stamped, committed above), so poke the browser to re-read its steer queue and
+	// Delivery ack (PRD #95 Decision 5): a follow-up first became consumed
+	// (consumed_at stamped, committed above), so poke the browser to re-read its steer queue and
 	// flip Queued → Delivered. Only for follow_up — approve_plan/cancel/reject own
 	// their own UI and never render in the queue. Nil-guarded (mirrors AppendMessages):
 	// ConsumeInputs never broadcast before, so an unset broadcaster (many tests) must

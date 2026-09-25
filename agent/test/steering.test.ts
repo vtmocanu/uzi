@@ -1,4 +1,4 @@
-import { describe, it } from "node:test";
+import { afterEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
   SteeringChannel,
@@ -7,20 +7,24 @@ import {
   CredentialSwitchSignal,
   type PlanVerdict,
 } from "../src/steering.js";
-import type { WorkerClient } from "../src/client.js";
+import { RequestError, type WorkerClient } from "../src/client.js";
 import type { UserInput } from "../src/protocol.js";
 import { buildAgentGuardHook, NESTED_AGENT_TOOL } from "../src/guardrails.js";
 import type { HookInput } from "@anthropic-ai/claude-agent-sdk";
-import { nullLogger } from "./helpers.js";
+import { nullLogger, stopStartedChannels, withReceipts } from "./helpers.js";
 
 // The steering channel is the single /inputs poller; it routes verdicts,
 // follow-ups, and cancel. Driven with a scripted getInputs — no live server.
 
+// Issue #1663: stop every started channel after each test, even one whose assertion threw.
+afterEach(stopStartedChannels);
+
 function fakeClient(batches: UserInput[][]): WorkerClient {
   let i = 0;
   // PRD #1247 M5: getInputs now returns { inputs, credentialSwitch? }; the poller reads `.inputs`.
-  return { getInputs: async () => ({ inputs: batches[i++] ?? [] }) } as unknown as WorkerClient;
+  return withReceipts({ getInputs: async () => ({ inputs: batches[i++] ?? [] }) } as unknown as WorkerClient);
 }
+
 
 // Every input gets a fresh id, as real run_user_inputs rows do (issue #1660: follow-ups are
 // de-duplicated by id, so a shared constant id would read as one repeated row).
@@ -91,7 +95,7 @@ describe("SteeringChannel", () => {
         return { inputs: calls === 2 ? [inp("approve_plan")] : [] };
       },
     } as unknown as WorkerClient;
-    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController());
+    const ch = new SteeringChannel(withReceipts(client), "run-1", 1, nullLogger(), new AbortController());
     ch.start();
     assert.deepStrictEqual(await ch.awaitVerdict(), { kind: "approve", selection: { status: "absent" } });
     await ch.stop();
@@ -537,13 +541,13 @@ describe("SteeringChannel — last-delivered follow-up watermark (issue #559)", 
   it("the watermark is monotone (Math.max) across out-of-order delivered ids", async () => {
     // A lower id delivered after a higher one must NOT regress the watermark. Mutation: replace
     // Math.max(...) with a plain assignment in takeFollowUp → the second pull drops it to 4.
-    const { ch } = makeChannel([
-      [inpId("follow_up", 10, "hi"), inpId("follow_up", 4, "lo")],
-    ]);
+    // Issue #1673 routes one batch in id order, so the lower id arrives in a later batch.
+    const { ch } = makeChannel([[inpId("follow_up", 10, "hi")], [inpId("follow_up", 4, "lo")]]);
     ch.start();
     await tick();
     assert.strictEqual(ch.pullFollowUp(), "hi");
     assert.strictEqual(ch.getLastDeliveredFollowUpId(), 10);
+    await tick(30);
     assert.strictEqual(ch.pullFollowUp(), "lo");
     assert.strictEqual(ch.getLastDeliveredFollowUpId(), 10, "a lower delivered id never regresses it");
     await ch.stop();
@@ -688,7 +692,7 @@ describe("SteeringChannel — plan revision (PRD #41)", () => {
     // approve is left buffered — proven stale at the next epoch — not consumed.
     const notices: string[] = [];
     const { client, push } = pushableClient();
-    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController(), { notify: (t) => notices.push(t) });
+    const ch = new SteeringChannel(withReceipts(client), "run-1", 1, nullLogger(), new AbortController(), { notify: (t) => notices.push(t) });
     const e = ch.bumpEpoch();
     ch.start();
     push([inp("approve_plan"), inp("revise_plan", "tweak it")]); // approve FIRST in the batch
@@ -706,7 +710,7 @@ describe("SteeringChannel — plan revision (PRD #41)", () => {
   it("discards a PRIOR-epoch approve with a feed notice; a current-epoch approve lands", async () => {
     const notices: string[] = [];
     const { client, push, consumed } = pushableClient();
-    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController(), { notify: (t) => notices.push(t) });
+    const ch = new SteeringChannel(withReceipts(client), "run-1", 1, nullLogger(), new AbortController(), { notify: (t) => notices.push(t) });
     ch.bumpEpoch(); // epoch 1
     ch.start();
     push([inp("approve_plan")]); // consumed + buffered at epoch 1
@@ -725,7 +729,7 @@ describe("SteeringChannel — plan revision (PRD #41)", () => {
     // cancel is epoch-exempt), but the feed wording must read correctly for a rejection.
     const notices: string[] = [];
     const { client, push, consumed } = pushableClient();
-    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController(), { notify: (t) => notices.push(t) });
+    const ch = new SteeringChannel(withReceipts(client), "run-1", 1, nullLogger(), new AbortController(), { notify: (t) => notices.push(t) });
     ch.bumpEpoch(); // epoch 1
     ch.start();
     push([inp("reject_plan", "no thanks")]); // consumed + buffered at epoch 1
@@ -742,7 +746,7 @@ describe("SteeringChannel — plan revision (PRD #41)", () => {
   it("discards a stale (prior-epoch) queued revise with a feed notice", async () => {
     const notices: string[] = [];
     const { client, push, consumed } = pushableClient();
-    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController(), { notify: (t) => notices.push(t) });
+    const ch = new SteeringChannel(withReceipts(client), "run-1", 1, nullLogger(), new AbortController(), { notify: (t) => notices.push(t) });
     ch.bumpEpoch(); // epoch 1
     ch.start();
     push([inp("revise_plan", "old feedback")]); // queued at epoch 1
@@ -758,7 +762,7 @@ describe("SteeringChannel — plan revision (PRD #41)", () => {
   it("cancel is epoch-exempt: it applies even when stamped at an older epoch", async () => {
     const cancel = new AbortController();
     const { client, push, consumed } = pushableClient();
-    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), cancel);
+    const ch = new SteeringChannel(withReceipts(client), "run-1", 1, nullLogger(), cancel);
     ch.bumpEpoch(); // epoch 1
     ch.start();
     push([inp("cancel")]); // seen at epoch 1
@@ -817,7 +821,7 @@ describe("ChatSteering", () => {
         return { inputs: [] };
       },
     } as unknown as WorkerClient;
-    const ch = new ChatSteering(client, "chat-1", 1, nullLogger(), new AbortController(), { now: () => clock });
+    const ch = new ChatSteering(withReceipts(client), "chat-1", 1, nullLogger(), new AbortController(), { now: () => clock });
     ch.start();
     assert.deepStrictEqual(await ch.awaitFollowUp(50), { kind: "message", text: "raced-in" });
     await ch.stop();
@@ -839,6 +843,219 @@ describe("ChatSteering", () => {
     await tick();
     await ch.stop();
     assert.deepStrictEqual(await p, { kind: "ended" });
+  });
+
+  it("retries a failed GET before idle and delivers the follow-up", async () => {
+    let gets = 0;
+    const row = inp("follow_up", "after GET retry");
+    const client = withReceipts({ getInputs: async () => {
+      if (++gets === 1) throw Error("lost GET reply");
+      return { inputs: gets === 2 ? [row] : [] };
+    } } as unknown as WorkerClient);
+    const ch = new ChatSteering(client, "chat-1", 1, nullLogger(), new AbortController());
+    ch.start();
+    assert.deepStrictEqual(await ch.awaitFollowUp(100000), { kind: "message", text: "after GET retry" });
+    await ch.stop();
+    assert.ok(gets >= 2);
+  });
+
+  it("still services the idle deadline after a GET failure", async () => {
+    let clock = 0;
+    const client = { getInputs: async () => { clock = 100; throw Error("temporary GET failure"); } } as unknown as WorkerClient;
+    const ch = new ChatSteering(client, "chat-1", 1, nullLogger(), new AbortController(), { now: () => clock });
+    const outcome = ch.awaitFollowUp(50);
+    ch.start();
+    assert.deepStrictEqual(await outcome, { kind: "idle" });
+    await ch.stop();
+  });
+
+  it("holds one ACK batch through reply loss, routes every row in ID order, and drains on stop", async () => {
+    const rows = [{ id: 8, kind: "follow_up", body: "eight" }, { id: 7, kind: "follow_up", body: "seven" }] as UserInput[];
+    let gets = 0;
+    let acks = 0;
+    let applies = 0;
+    const client = {
+      getInputs: async () => { gets++; return { receipts: true, inputs: rows }; },
+      ackInputs: async (_run: string, ids: number[], generation: number) => {
+        assert.deepStrictEqual(ids, [8, 7]);
+        assert.strictEqual(generation, 4);
+        if (++acks === 1) throw Error("lost ACK reply");
+        return { inputs: rows, active: true };
+      },
+      applyInputs: async (_run: string, ids: number[]) => { applies++; assert.deepStrictEqual(ids, [8, 7]); return { inputs: rows, active: true }; },
+    } as unknown as WorkerClient;
+    const ch = new ChatSteering(client, "chat-1", 1, nullLogger(), new AbortController(), {}, 4);
+    ch.start();
+    assert.deepStrictEqual(await ch.awaitFollowUp(100000), { kind: "message", text: "seven" });
+    assert.strictEqual(gets, 1);
+    assert.strictEqual(applies, 0, "waiter was serviced before applied began");
+    assert.deepStrictEqual(await ch.awaitFollowUp(100000), { kind: "message", text: "eight" });
+    await ch.stop();
+    assert.strictEqual(acks, 2);
+    assert.strictEqual(applies, 1);
+    assert.strictEqual(gets, 1);
+  });
+
+  it("delivers the follow-up before an applied reply is lost, then retries its held IDs", async () => {
+    const row = inp("follow_up", "delivered once");
+    let gets = 0;
+    let applies = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const client = {
+      getInputs: async () => { gets++; return { receipts: true, inputs: [row] }; },
+      ackInputs: async () => ({ inputs: [row], active: true }),
+      applyInputs: async () => {
+        if (++applies === 1) { await gate; throw Error("lost applied reply"); }
+        return { inputs: [row], active: true };
+      },
+    } as unknown as WorkerClient;
+    const ch = new ChatSteering(client, "chat-1", 1, nullLogger(), new AbortController());
+    ch.start();
+    try {
+      assert.deepStrictEqual(await ch.awaitFollowUp(100000), { kind: "message", text: "delivered once" });
+      assert.strictEqual(applies, 0);
+      const stopped = ch.stop();
+      release();
+      await stopped;
+      assert.strictEqual(applies, 2);
+      assert.strictEqual(gets, 1);
+    } finally {
+      release();
+      await ch.stop();
+    }
+  });
+
+  it("retries a lost applied reply without GET or rerouting, even after cancel and stop", async () => {
+    const rows = [inp("follow_up", "first"), inp("cancel")];
+    const cancel = new AbortController();
+    let gets = 0;
+    let applies = 0;
+    const client = {
+      getInputs: async () => { gets++; return { receipts: true, inputs: rows }; },
+      ackInputs: async () => ({ inputs: rows, active: true }),
+      applyInputs: async () => { if (++applies === 1) throw Error("lost applied reply"); return { inputs: rows, active: true }; },
+    } as unknown as WorkerClient;
+    const ch = new ChatSteering(client, "chat-1", 1, nullLogger(), cancel);
+    ch.start();
+    assert.deepStrictEqual(await ch.awaitFollowUp(100000), { kind: "ended" });
+    assert.strictEqual(cancel.signal.aborted, true);
+    await ch.stop();
+    assert.strictEqual(applies, 2);
+    assert.strictEqual(gets, 1);
+  });
+
+  it("keeps idle parked while a known follow-up ACK is uncertain", async () => {
+    let clock = 0;
+    const row = inp("follow_up", "raced");
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let ackStarted = false;
+    const client = {
+      getInputs: async () => { clock = 100; return { receipts: true, inputs: [row] }; },
+      ackInputs: async () => { ackStarted = true; await gate; return { inputs: [row], active: true }; },
+      applyInputs: async () => ({ inputs: [row], active: true }),
+    } as unknown as WorkerClient;
+    const ch = new ChatSteering(client, "chat-1", 1, nullLogger(), new AbortController(), { now: () => clock });
+    const outcome = ch.awaitFollowUp(50);
+    ch.start();
+    try {
+      while (!ackStarted) await tick(1);
+      let settled = false;
+      void outcome.then(() => { settled = true; });
+      await tick(2);
+      assert.strictEqual(settled, false);
+      release();
+      assert.deepStrictEqual(await outcome, { kind: "message", text: "raced" });
+    } finally {
+      release();
+      await ch.stop();
+    }
+  });
+
+  it("fails the chat visibly when stop gives up a routed follow-up's APPLIED, so it does not complete", async () => {
+    const row = inp("follow_up", "unapplied");
+    let applies = 0;
+    const client = {
+      getInputs: async () => ({ receipts: true, inputs: [row] }),
+      ackInputs: async () => ({ inputs: [row], active: true }),
+      applyInputs: async () => { applies++; throw new RequestError("POST", "/inputs/applied", 503, "unavailable"); },
+    } as unknown as WorkerClient;
+    const ch = new ChatSteering(client, "chat-1", 1, nullLogger(), new AbortController());
+    ch.start();
+    try {
+      assert.deepStrictEqual(await ch.awaitFollowUp(100_000), { kind: "message", text: "unapplied" });
+      await ch.stop();
+      assert.ok(applies >= 1);
+      assert.strictEqual(ch.unconfirmedInput(), "could not confirm your message was applied; please resend it");
+      assert.strictEqual(ch.claimLost(), false, "nothing requeues a chat, so the loss must be visible, not silent");
+    } finally {
+      await ch.stop();
+    }
+  });
+
+  it("fails the chat visibly when a routed follow-up's APPLIED fails 30 times on the active claim", async () => {
+    const row = inp("follow_up", "never confirmed");
+    let applies = 0;
+    const client = {
+      getInputs: async () => ({ receipts: true, inputs: [row] }),
+      ackInputs: async () => ({ inputs: [row], active: true }),
+      applyInputs: async () => { applies++; throw new RequestError("POST", "/inputs/applied", 503, "unavailable"); },
+    } as unknown as WorkerClient;
+    const ch = new ChatSteering(client, "chat-1", 1, nullLogger(), new AbortController());
+    ch.start();
+    try {
+      assert.deepStrictEqual(await ch.awaitFollowUp(100_000), { kind: "message", text: "never confirmed" });
+      for (let i = 0; i < 500 && !ch.unconfirmedInput(); i++) await tick(2);
+      assert.strictEqual(ch.unconfirmedInput(), "could not confirm your message was applied; please resend it");
+      assert.strictEqual(ch.claimLost(), false);
+      assert.strictEqual(applies, 30);
+    } finally {
+      await ch.stop();
+    }
+  });
+
+  it("marks the claim lost when an APPLIED retry reports the claim inactive", async () => {
+    const row = inp("follow_up", "applied then released");
+    let applies = 0;
+    const client = {
+      getInputs: async () => ({ receipts: true, inputs: [row] }),
+      ackInputs: async () => ({ inputs: [row], active: true }),
+      applyInputs: async () => {
+        // The first reply is lost after the commit; the retry sees the claim already released.
+        if (++applies === 1) throw Error("lost applied reply");
+        return { inputs: [row], active: false, reason: "released" };
+      },
+    } as unknown as WorkerClient;
+    const ch = new ChatSteering(client, "chat-1", 1, nullLogger(), new AbortController());
+    ch.start();
+    try {
+      assert.deepStrictEqual(await ch.awaitFollowUp(100_000), { kind: "message", text: "applied then released" });
+      for (let i = 0; i < 200 && applies < 2; i++) await tick(2);
+      await ch.stop();
+      assert.strictEqual(ch.claimLost(), true);
+    } finally {
+      await ch.stop();
+    }
+  });
+
+  it("ends an inactive ACK and a definitive applied 409 without another GET", async () => {
+    for (const staleAt of ["ack", "applied"]) {
+      const row = inp("follow_up", "stale");
+      let gets = 0;
+      let applies = 0;
+      const client = {
+        getInputs: async () => { gets++; return { receipts: true, inputs: [row] }; },
+        ackInputs: async () => ({ inputs: [row], active: staleAt !== "ack" }),
+        applyInputs: async () => { applies++; throw new RequestError("POST", "/inputs/applied", 409, JSON.stringify({ error: "fenced", reason: "stale" })); },
+      } as unknown as WorkerClient;
+      const ch = new ChatSteering(client, "chat-1", 1, nullLogger(), new AbortController());
+      ch.start();
+      await ch.stop();
+      assert.strictEqual(ch.claimLost(), true);
+      assert.strictEqual(gets, 1);
+      assert.strictEqual(applies, staleAt === "ack" ? 0 : 1);
+    }
   });
 });
 
@@ -877,7 +1094,7 @@ describe("SteeringChannel operator constraints (issue #1660)", () => {
   it("acceptance: a follow-up received after run start reaches a later dispatch and no earlier one", async () => {
     const queue: UserInput[][] = [];
     const client = { getInputs: async () => ({ inputs: queue.shift() ?? [] }) } as unknown as WorkerClient;
-    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController());
+    const ch = new SteeringChannel(withReceipts(client), "run-1", 1, nullLogger(), new AbortController());
     const hook = buildAgentGuardHook(["reviewer", "auditor"], nullLogger(), () => ch.operatorConstraints());
     const dispatch = async (subagent_type: string): Promise<string> => {
       const out = (await hook({
@@ -972,192 +1189,655 @@ describe("SteeringChannel.markOperatorConstraintsUnavailable (issue #1660)", () 
   });
 });
 
-// Issue #1660 (PR #1667 review): /inputs is consume-on-read, so a poll whose reply is lost after
-// the server committed the consume drops that follow-up for the rest of the claim. After ANY poll
-// error the channel reports "reconciling" (the Agent guard denies dispatches), and the next poll
-// first re-reads /follow-ups and merges by id, delivering a recovered follow-up to the lead once.
-describe("SteeringChannel reconciles after a failed poll (issue #1660)", () => {
-  const RULE = "never execute a string containing kill; screen strings only";
-  const dispatchWith = async (ch: SteeringChannel) => {
-    const hook = buildAgentGuardHook(["reviewer"], nullLogger(), () => ch.operatorConstraints());
-    return (await hook({
-      session_id: "s",
-      transcript_path: "/t",
-      cwd: "/w",
-      hook_event_name: "PreToolUse",
-      tool_name: NESTED_AGENT_TOOL,
-      tool_input: { subagent_type: "reviewer", prompt: "review HEAD" },
-      tool_use_id: "tu",
-    } as HookInput)) as {
-      hookSpecificOutput?: { permissionDecision?: string; permissionDecisionReason?: string; updatedInput?: { prompt?: string } };
-    };
+describe("input receipts", () => {
+  const until = async (ready: () => boolean): Promise<void> => {
+    for (let i = 0; i < 100 && !ready(); i++) await tick(2);
+    assert.ok(ready(), "receipt operation reached");
   };
-  const until = async (cond: () => boolean, ms = 2_000): Promise<void> => {
-    const deadline = Date.now() + ms;
-    while (!cond() && Date.now() < deadline) await tick(2);
-    assert.ok(cond(), "condition reached");
-  };
-
-  it("denies while pending, then recovers the lost follow-up for dispatches and the lead, once", async () => {
-    // Poll 1: live follow-up 3 arrives. Poll 2: the server consumes 7 but the reply is lost.
-    // The /follow-ups read is held until the test releases it, to observe the pending window.
-    let polls = 0;
-    let reads = 0;
-    let release!: () => void;
-    const gate = new Promise<void>((r) => (release = r));
+  it("retries one ACK batch before a newer GET and routes IDs in order", async () => {
+    const rows: UserInput[] = [
+      { id: 8, kind: "follow_up", body: "eight" },
+      { id: 7, kind: "follow_up", body: "seven" },
+    ];
+    let gets = 0;
+    let acks = 0;
+    let applied = 0;
     const client = {
-      getInputs: async () => {
-        polls++;
-        if (polls === 1) return { inputs: [{ id: 3, kind: "follow_up", body: "live one" }] };
-        if (polls === 2) throw new Error("socket hang up after commit");
-        return { inputs: [] };
+      getInputs: async () => { gets++; return { receipts: true, inputs: rows }; },
+      ackInputs: async (_run: string, ids: number[]) => {
+        acks++;
+        assert.deepStrictEqual(ids, [8, 7]);
+        if (acks === 1) throw Error("lost ACK reply");
+        return { inputs: rows, active: true };
       },
-      getConsumedFollowUps: async () => {
-        reads++;
-        await gate;
-        return [
-          { id: 3, kind: "follow_up", body: "live one" },
-          { id: 7, kind: "follow_up", body: RULE },
-        ];
-      },
+      applyInputs: async () => { applied++; return { inputs: rows, active: true }; },
     } as unknown as WorkerClient;
     const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController());
     ch.start();
     try {
-      await until(() => reads === 1);
-      const pending = await dispatchWith(ch);
-      assert.strictEqual(pending.hookSpecificOutput?.permissionDecision, "deny", "denied while reconciling");
-      assert.match(pending.hookSpecificOutput?.permissionDecisionReason ?? "", /operator constraints are being reconciled; retry/);
+      await until(() => applied > 0);
+      assert.strictEqual(ch.pullFollowUp(), "seven");
+      assert.strictEqual(ch.pullFollowUp(), "eight");
+      assert.strictEqual(ch.pullFollowUp(), undefined);
+      assert.ok(acks >= 2);
+      assert.ok(applied >= 1);
+      assert.ok(gets >= 1);
+    } finally {
+      await ch.stop();
+    }
+  });
 
-      release();
-      await until(() => Array.isArray(ch.operatorConstraints()));
-      assert.deepStrictEqual(ch.operatorConstraints(), ["live one", RULE], "merged by id, no duplicate");
-      const after = await dispatchWith(ch);
-      assert.ok(after.hookSpecificOutput?.updatedInput?.prompt?.includes(RULE), "a later dispatch carries it");
+  it("retries an uncertain applied receipt through stop", async () => {
+    const row: UserInput = { id: 7, kind: "follow_up", body: "one" };
+    let attempts = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const client = {
+      getInputs: async () => ({ receipts: true, inputs: [row] }),
+      ackInputs: async () => ({ inputs: [row], active: true }),
+      applyInputs: async () => {
+        attempts++;
+        if (attempts === 1) { await gate; throw Error("lost apply reply"); }
+        return { inputs: [row], active: true };
+      },
+    } as unknown as WorkerClient;
+    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController());
+    ch.start();
+    const stopped = ch.stop();
+    release();
+    await stopped;
+    assert.ok(attempts >= 2);
+  });
 
-      // The lead gets the live one and the recovered one, each exactly once.
-      await tick(20);
-      assert.strictEqual(ch.pullFollowUp(), "live one");
-      assert.strictEqual(ch.pullFollowUp(), RULE);
+  it("routes the full ACK in ID order and services a waiter before apply", async () => {
+    const rows: UserInput[] = [
+      { id: 8, kind: "follow_up", body: "eight" },
+      { id: 7, kind: "follow_up", body: "seven" },
+    ];
+    let applyCalls = 0;
+    let releaseApply!: () => void;
+    const applyGate = new Promise<void>((resolve) => { releaseApply = resolve; });
+    const client = {
+      getInputs: async () => ({ receipts: true, inputs: rows }),
+      ackInputs: async () => ({ inputs: rows, active: true }),
+      applyInputs: async () => { applyCalls++; await applyGate; return { inputs: rows, active: true }; },
+    } as unknown as WorkerClient;
+    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController());
+    ch.start();
+    try {
+      assert.deepStrictEqual(await ch.awaitFollowUp(100000), { kind: "followup", body: "seven" });
+      assert.strictEqual(applyCalls, 0, "the waiter is serviced before apply begins");
+      assert.strictEqual(ch.pullFollowUp(), "eight");
       assert.strictEqual(ch.pullFollowUp(), undefined);
     } finally {
-      release();
+      releaseApply();
       await ch.stop();
     }
   });
 
-  it("stays denied while the reconcile read itself fails, and does not re-deliver on a second reconcile", async () => {
-    let polls = 0;
-    let reads = 0;
+  it("retries a lost apply reply with the same IDs and never routes twice", async () => {
+    const rows: UserInput[] = [{ id: 7, kind: "follow_up", body: "seven" }];
+    let gets = 0;
+    let acks = 0;
+    const appliedIds: number[][] = [];
     const client = {
-      getInputs: async () => {
-        polls++;
-        if (polls === 1 || polls === 3) throw new Error("lost reply");
-        return { inputs: [] };
-      },
-      getConsumedFollowUps: async () => {
-        reads++;
-        if (reads === 1) throw new Error("follow-ups read failed");
-        return [{ id: 7, kind: "follow_up", body: RULE }];
+      getInputs: async () => { gets++; return { receipts: true, inputs: gets === 1 ? rows : [] }; },
+      ackInputs: async () => { acks++; return { inputs: rows, active: true }; },
+      applyInputs: async (_run: string, ids: number[]) => {
+        appliedIds.push([...ids]);
+        if (appliedIds.length === 1) throw Error("lost apply reply");
+        return { inputs: rows, active: true };
       },
     } as unknown as WorkerClient;
     const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController());
     ch.start();
     try {
-      await until(() => reads === 1);
-      assert.strictEqual(ch.operatorConstraints(), "reconciling", "a failed reconcile read keeps it pending");
-      await until(() => reads >= 3 && Array.isArray(ch.operatorConstraints()));
-      assert.deepStrictEqual(ch.operatorConstraints(), [RULE]);
-      assert.strictEqual(ch.pullFollowUp(), RULE);
-      assert.strictEqual(ch.pullFollowUp(), undefined, "the second reconcile does not re-deliver");
+      await until(() => appliedIds.length >= 1);
+      await ch.awaitReceiptSettlement();
+      assert.deepStrictEqual(appliedIds, [[7], [7]]);
+      assert.strictEqual(acks, 1);
+      assert.strictEqual(gets, 1, "no GET precedes settlement");
+      assert.strictEqual(ch.pullFollowUp(), "seven");
+      assert.strictEqual(ch.pullFollowUp(), undefined);
     } finally {
       await ch.stop();
     }
   });
-});
 
-// Issue #1660 (PR #1667 review): the reconcile read runs in the background, single-flight. A
-// stalled /follow-ups read must never delay the /inputs poll that carries cancel, stop and the
-// plan verdicts; the dispatch denial simply stays until the read succeeds.
-describe("SteeringChannel reconcile never blocks /inputs (issue #1660)", () => {
-  it("delivers a cancel on the next poll while the reconcile read is stalled, with one read in flight", async () => {
-    let polls = 0;
-    let reads = 0;
+  it("keeps idle parked when GET holds a follow-up and ACK is uncertain", async () => {
+    let clock = 0;
+    const row: UserInput = { id: 7, kind: "follow_up", body: "seven" };
+    let ackCalls = 0;
+    let releaseAck!: () => void;
+    const ackGate = new Promise<void>((resolve) => { releaseAck = resolve; });
     const client = {
-      getInputs: async () => {
-        polls++;
-        if (polls === 1) throw new Error("lost reply");
-        if (polls === 2) return { inputs: [inp("cancel")] };
-        return { inputs: [] };
+      getInputs: async () => { clock = 100; return { receipts: true, inputs: [row] }; },
+      ackInputs: async () => {
+        ackCalls++;
+        if (ackCalls === 1) { await ackGate; throw Error("lost ACK reply"); }
+        return { inputs: [row], active: true };
       },
-      // Stalls forever, like a read hanging until the HTTP timeout.
-      getConsumedFollowUps: () => {
-        reads++;
-        return new Promise<never>(() => {});
-      },
+      applyInputs: async () => ({ inputs: [row], active: true }),
     } as unknown as WorkerClient;
+    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController(), { now: () => clock });
+    const outcome = ch.awaitFollowUp(50);
+    ch.start();
+    try {
+      await tick();
+      let settled = false;
+      void outcome.then(() => { settled = true; });
+      assert.strictEqual(settled, false);
+      releaseAck();
+      assert.deepStrictEqual(await outcome, { kind: "followup", body: "seven" });
+    } finally {
+      releaseAck();
+      await ch.stop();
+    }
+  });
+
+  it("routes nothing from a switch_pending ACK, keeps polling and does not cancel the flight", async () => {
+    // A pending credential switch: the rows belong to the next claim, and the switch signal on a
+    // later GET releases this one. A local cancel would report the run cancelled mid-switch.
+    const row: UserInput = { id: 7, kind: "cancel", body: null };
+    let gets = 0;
+    let applied = 0;
+    let acked = 0;
     const cancel = new AbortController();
+    const client = {
+      getInputs: async () => { gets++; return { receipts: true, inputs: gets === 1 ? [row] : [] }; },
+      ackInputs: async () => { acked++; return { inputs: [row], active: false, reason: "switch_pending" }; },
+      applyInputs: async () => { applied++; return { inputs: [row], active: true }; },
+    } as unknown as WorkerClient;
     const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), cancel);
     ch.start();
     try {
-      const verdict = await Promise.race([
-        ch.awaitVerdict(),
-        new Promise<"blocked">((r) => setTimeout(() => r("blocked"), 1_000)),
-      ]);
-      assert.deepStrictEqual(verdict, { kind: "cancel" }, "the cancel is not held behind the stalled read");
-      assert.strictEqual(cancel.signal.aborted, true);
-      await tick(20);
-      assert.ok(polls > 3, `the /inputs poll keeps running (polls=${polls})`);
-      assert.strictEqual(reads, 1, "single-flight: one read in flight, not one per poll");
-      assert.strictEqual(ch.operatorConstraints(), "reconciling", "dispatches stay denied until the read succeeds");
+      await until(() => gets >= 3);
+      await ch.awaitReceiptSettlement();
+      assert.strictEqual(acked, 1);
+      assert.strictEqual(applied, 0);
+      assert.strictEqual(cancel.signal.aborted, false, "the inactive batch's cancel was not routed");
+      assert.strictEqual(ch.isCancelled(), false);
     } finally {
       await ch.stop();
     }
   });
-});
 
-// Issue #1660 (PR #1667 review): a reconcile read can overlap a successful /inputs poll, and
-// both responses can carry the same newly consumed follow-up. Whichever path lands first, the
-// lead gets it once and the constraints hold it once (one id-keyed record both paths check).
-describe("SteeringChannel dedups a follow-up seen by both reconcile and /inputs (issue #1660)", () => {
-  it("reconcile first, then the same id live: the lead gets it once, the constraints hold it once", async () => {
-    const RULE = "screen strings only";
-    let polls = 0;
-    let releaseRead!: () => void;
-    const readGate = new Promise<void>((r) => (releaseRead = r));
-    let releasePoll!: () => void;
-    const pollGate = new Promise<void>((r) => (releasePoll = r));
+  it("rejects a malformed ACK row and retries the held IDs without routing it", async () => {
+    const row: UserInput = { id: 7, kind: "follow_up", body: "seven" };
+    let acks = 0;
+    let gets = 0;
+    let getsAtRetry = -1;
     const client = {
-      getInputs: async () => {
-        polls++;
-        if (polls === 1) throw new Error("lost reply");
-        // Poll 2 carries id 9, but its reply lands only after the reconcile read has merged it.
-        if (polls === 2) {
-          await pollGate;
-          return { inputs: [{ id: 9, kind: "follow_up", body: RULE }] };
-        }
-        return { inputs: [] };
+      getInputs: async () => { gets++; return { receipts: true, inputs: gets === 1 ? [row] : [] }; },
+      ackInputs: async (_run: string, ids: number[]) => {
+        assert.deepStrictEqual(ids, [7]);
+        acks++;
+        if (acks === 1) return { inputs: [{ id: 7, kind: "follow_up", body: 42 }], active: true };
+        getsAtRetry = gets;
+        return { inputs: [row], active: true };
       },
-      getConsumedFollowUps: async () => {
-        await readGate;
-        return [{ id: 9, kind: "follow_up", body: RULE }];
-      },
+      applyInputs: async () => ({ inputs: [row], active: true }),
     } as unknown as WorkerClient;
     const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController());
     ch.start();
     try {
-      while (polls < 2) await tick(2);
-      releaseRead();
-      await tick(20);
-      assert.deepStrictEqual(ch.operatorConstraints(), [RULE], "reconcile merged it first");
-      releasePoll();
-      await tick(20);
-      assert.deepStrictEqual(ch.operatorConstraints(), [RULE], "the live copy is not added twice");
-      assert.strictEqual(ch.pullFollowUp(), RULE);
-      assert.strictEqual(ch.pullFollowUp(), undefined, "the lead gets it exactly once");
+      await until(() => acks === 2);
+      assert.strictEqual(getsAtRetry, 1, "the retry reused the held ids without a newer GET");
+      await tick();
+      assert.strictEqual(ch.pullFollowUp(), "seven", "routed once, from the well-formed receipt");
+      assert.strictEqual(ch.pullFollowUp(), undefined);
     } finally {
-      releaseRead();
-      releasePoll();
+      await ch.stop();
+    }
+  });
+
+  it("drops the batch on a switch_pending applied 409 and never routes a replay of it again", async () => {
+    // A `now` pause fires the interrupt on every route, so a second route of the replayed row is
+    // observable (follow-ups are also de-duplicated by the lead queue, so they would not show it).
+    const row: UserInput = { id: 7, kind: "pause", body: "now" };
+    let attempts = 0;
+    let gets = 0;
+    let interrupts = 0;
+    const client = {
+      // The claim is fenced and then reinstated (a failed credential switch): the same unapplied
+      // row comes back on a later GET of this claim.
+      getInputs: async () => { gets++; return { receipts: true, inputs: gets === 1 || gets === 3 ? [row] : [] }; },
+      ackInputs: async () => ({ inputs: [row], active: true }),
+      applyInputs: async () => {
+        attempts++;
+        // A switch is pending, then fails: the batch is dropped and later replayed on this claim.
+        if (attempts === 1) throw new RequestError("POST", "/inputs/applied", 409, JSON.stringify({ error: "conflict", reason: "switch_pending" }));
+        return { inputs: [row], active: true };
+      },
+    } as unknown as WorkerClient;
+    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController());
+    ch.onPauseNow(() => { interrupts++; });
+    ch.start();
+    try {
+      await until(() => attempts >= 2);
+      await ch.awaitReceiptSettlement();
+      assert.strictEqual(interrupts, 1, "the replayed row was applied, not rerouted");
+    } finally {
+      await ch.stop();
+    }
+  });
+
+  it("ends the flight on a released or stale claim, from a 200 or a 409 receipt", async () => {
+    for (const reason of ["released", "stale"]) {
+      for (const via of ["200", "409"]) {
+        const row: UserInput = { id: 7, kind: "approve_plan", body: null };
+        let gets = 0;
+        const cancel = new AbortController();
+        const client = {
+          getInputs: async () => { gets++; return { receipts: true, inputs: [row] }; },
+          ackInputs: async () => {
+            if (via === "409") throw new RequestError("POST", "/inputs/ack", 409, JSON.stringify({ error: "fenced", reason }));
+            return { inputs: [row], active: false, reason };
+          },
+          applyInputs: async () => { throw Error("a fenced batch must not apply"); },
+        } as unknown as WorkerClient;
+        const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), cancel);
+        const gate = ch.awaitVerdict();
+        ch.start();
+        try {
+          await assert.rejects(gate, (err: Error) => err.name === "ClaimFencedSignal", `${reason} via ${via}`);
+          assert.strictEqual((cancel.signal.reason as Error).name, "ClaimFencedSignal");
+          assert.strictEqual(ch.isCancelled(), false, "the fenced batch's inputs were not routed");
+          await assert.rejects(ch.awaitFollowUp(100_000), (err: Error) => err.name === "ClaimFencedSignal", "a later park fails at once");
+          const settled = gets;
+          await tick(20);
+          assert.strictEqual(gets, settled, "the old flight stopped polling");
+        } finally {
+          await ch.stop();
+        }
+      }
+    }
+  });
+
+  it("keeps a switch_pending flight parked and delivers the batch once the claim is active again", async () => {
+    const row: UserInput = { id: 7, kind: "approve_plan", body: null };
+    let acks = 0;
+    const cancel = new AbortController();
+    const client = {
+      getInputs: async () => ({ receipts: true, inputs: [row] }),
+      ackInputs: async () => {
+        acks++;
+        // The first two ACKs race a pending credential switch, which then fails: the claim is active again.
+        if (acks <= 2) throw new RequestError("POST", "/inputs/ack", 409, JSON.stringify({ error: "fenced", reason: "switch_pending" }));
+        return { inputs: [row], active: true };
+      },
+      applyInputs: async () => ({ inputs: [row], active: true }),
+    } as unknown as WorkerClient;
+    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), cancel);
+    ch.start();
+    try {
+      assert.deepStrictEqual(await ch.awaitVerdict(), { kind: "approve", selection: { status: "absent" } });
+      assert.ok(acks >= 3);
+      assert.strictEqual(cancel.signal.aborted, false);
+    } finally {
+      await ch.stop();
+    }
+  });
+
+  it("fails a waiting state report and later parks when APPLIED keeps failing on the active claim", async () => {
+    for (const kind of ["approve_plan", "follow_up"] as const) {
+      const row: UserInput = { id: 7, kind, body: kind === "follow_up" ? "seven" : null };
+      let applies = 0;
+      const client = {
+        getInputs: async () => ({ receipts: true, inputs: [row] }),
+        ackInputs: async () => ({ inputs: [row], active: true }),
+        applyInputs: async () => { applies++; throw new RequestError("POST", "/inputs/applied", 503, "unavailable"); },
+      } as unknown as WorkerClient;
+      const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController());
+      ch.start();
+      try {
+        // The routed input reaches the executor, which then reports the resume.
+        if (kind === "approve_plan") assert.strictEqual((await ch.awaitVerdict()).kind, "approve");
+        else assert.deepStrictEqual(await ch.awaitFollowUp(100_000), { kind: "followup", body: "seven" });
+        await assert.rejects(ch.awaitReceiptSettlement(), (err: Error) => err.name === "InputReceiptError",
+          "the guarded report never goes out as if the input were applied");
+        assert.strictEqual(applies, 30, "bounded on the active claim");
+        await assert.rejects(ch.awaitReceiptSettlement(), (err: Error) => err.name === "InputReceiptError");
+        await assert.rejects(ch.awaitAnswer("q1"), (err: Error) => err.name === "InputReceiptError");
+      } finally {
+        await ch.stop();
+      }
+    }
+  });
+
+  it("retries an untyped 404 on ACK or APPLIED (an api pod without the route) instead of ending the flight", async () => {
+    for (const at of ["ack", "applied"] as const) {
+      const row: UserInput = { id: 7, kind: "approve_plan", body: null };
+      let acks = 0;
+      let applies = 0;
+      const notFound = (path: string): RequestError => new RequestError("POST", path, 404, "404 page not found");
+      const cancel = new AbortController();
+      const client = {
+        getInputs: async () => ({ receipts: true, inputs: [row] }),
+        ackInputs: async () => {
+          if (at === "ack" && ++acks <= 2) throw notFound("/inputs/ack");
+          return { inputs: [row], active: true };
+        },
+        applyInputs: async () => {
+          if (at === "applied" && ++applies <= 2) throw notFound("/inputs/applied");
+          return { inputs: [row], active: true };
+        },
+      } as unknown as WorkerClient;
+      const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), cancel);
+      ch.start();
+      try {
+        assert.deepStrictEqual(await ch.awaitVerdict(), { kind: "approve", selection: { status: "absent" } }, at);
+        await until(() => (at === "ack" ? acks : applies) >= 3);
+        await ch.awaitReceiptSettlement();
+        assert.strictEqual(ch.claimFence(), undefined, `${at}: an untyped 404 is not a fence`);
+        assert.strictEqual(cancel.signal.aborted, false);
+      } finally {
+        await ch.stop();
+      }
+    }
+  });
+
+  it("gives up an applied receipt by elapsed time when the request hangs or is slow", async () => {
+    for (const mode of ["hung", "slow"] as const) {
+      const row: UserInput = { id: 7, kind: "follow_up", body: "seven" };
+      let applies = 0;
+      const client = {
+        getInputs: async () => ({ receipts: true, inputs: [row] }),
+        ackInputs: async () => ({ inputs: [row], active: true }),
+        applyInputs: async () => {
+          applies++;
+          // A hung request answers only at the client's HTTP timeout (here 500 ms, past the
+          // 100 ms deadline); a slow one fails after 20 ms each time.
+          await tick(mode === "hung" ? 500 : 20);
+          throw new RequestError("POST", "/inputs/applied", 504, "timeout");
+        },
+      } as unknown as WorkerClient;
+      const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController(), { receiptDeadlineMs: 100 });
+      ch.start();
+      try {
+        assert.deepStrictEqual(await ch.awaitFollowUp(100_000), { kind: "followup", body: "seven" });
+        const started = Date.now();
+        await assert.rejects(ch.awaitReceiptSettlement(), (err: Error) => err.name === "InputReceiptError", mode);
+        assert.ok(Date.now() - started < 2_000, `${mode}: bounded by the deadline, not the attempt count`);
+        assert.ok(applies < 30, `${mode}: gave up after ${applies} attempts`);
+      } finally {
+        await ch.stop();
+      }
+    }
+  });
+
+  it("rejects a settlement wait on a cancel or the report's own abort, so the report is not sent", async () => {
+    for (const via of ["cancel", "report"] as const) {
+      const row: UserInput = { id: 7, kind: "approve_plan", body: null };
+      const cancel = new AbortController();
+      const client = {
+        getInputs: async () => ({ receipts: true, inputs: [row] }),
+        ackInputs: async () => ({ inputs: [row], active: true }),
+        // Slow enough that only the abort can end the wait first.
+        applyInputs: async () => { await tick(300); return { inputs: [row], active: true }; },
+      } as unknown as WorkerClient;
+      const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), cancel);
+      ch.start();
+      try {
+        await ch.awaitVerdict();
+        await tick();
+        const report = new AbortController();
+        const waiting = ch.awaitReceiptSettlement(report.signal);
+        const started = Date.now();
+        (via === "cancel" ? cancel : report).abort();
+        await assert.rejects(waiting, (err: Error) => err.name === "ReceiptWaitInterrupted", via);
+        assert.ok(Date.now() - started < 200, `${via}: the abort ended the wait before the applied reply`);
+        if (via === "report") {
+          // The report's own signal, already aborted: refused at once while the receipt is uncertain.
+          await assert.rejects(ch.awaitReceiptSettlement(report.signal), (err: Error) => err.name === "ReceiptWaitInterrupted");
+        } else {
+          // The shared controller aborts once and stays aborted; that stale abort says nothing
+          // about a later report, which waits for the applied receipt and then goes out.
+          await ch.awaitReceiptSettlement();
+        }
+      } finally {
+        await ch.stop();
+      }
+    }
+  });
+
+  it("ends the flight on a typed 404 (reason stale) from ACK or APPLIED", async () => {
+    for (const at of ["ack", "applied"] as const) {
+      const row: UserInput = { id: 7, kind: at === "ack" ? "approve_plan" : "follow_up", body: at === "ack" ? null : "seven" };
+      const typed = (path: string): RequestError =>
+        new RequestError("POST", path, 404, JSON.stringify({ error: "run not found", reason: "stale" }));
+      const cancel = new AbortController();
+      const client = {
+        getInputs: async () => ({ receipts: true, inputs: [row] }),
+        ackInputs: async () => {
+          if (at === "ack") throw typed("/inputs/ack");
+          return { inputs: [row], active: true };
+        },
+        applyInputs: async () => { throw typed("/inputs/applied"); },
+      } as unknown as WorkerClient;
+      const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), cancel);
+      ch.start();
+      try {
+        await until(() => ch.claimFence() !== undefined);
+        assert.strictEqual(ch.claimFence(), "stale", at);
+        assert.strictEqual((cancel.signal.reason as Error).name, "ClaimFencedSignal");
+      } finally {
+        await ch.stop();
+      }
+    }
+  });
+
+  it("gives up an ACK-phase batch at its attempt or time bound, so newer GETs flow", async () => {
+    for (const bound of ["attempts", "deadline"] as const) {
+      const row: UserInput = { id: 7, kind: "approve_plan", body: null };
+      let gets = 0;
+      let acks = 0;
+      const client = {
+        getInputs: async () => { gets++; return { receipts: true, inputs: [row] }; },
+        ackInputs: async () => {
+          acks++;
+          // Attempts: fail fast. Deadline: each attempt takes 20 ms, past a 50 ms deadline.
+          if (bound === "deadline") await tick(20);
+          throw new RequestError("POST", "/inputs/ack", 503, "unavailable");
+        },
+        applyInputs: async () => { throw Error("an unACKed batch must not apply"); },
+      } as unknown as WorkerClient;
+      const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController(), {
+        receiptDeadlineMs: bound === "deadline" ? 50 : 600_000,
+      });
+      ch.start();
+      try {
+        await until(() => gets >= 2);
+        assert.ok(bound === "attempts" ? acks >= 30 : acks < 30, `${bound}: ${acks} ACK attempts before the next GET`);
+        assert.strictEqual(ch.claimFence(), undefined, "an ACK bound drops the batch, it does not fence");
+      } finally {
+        await ch.stop();
+      }
+    }
+  });
+
+  it("after a declined `now` park, a later follow-up's report still waits for its APPLIED", async () => {
+    // A `now` pause aborts the shared controller once; the park is declined and the turn restarts
+    // with the controller still aborted. A follow-up routed afterwards must still hold its report.
+    const pause: UserInput = { id: 7, kind: "pause", body: "now" };
+    const followUp: UserInput = { id: 8, kind: "follow_up", body: "eight" };
+    let gets = 0;
+    let appliedFollowUp = false;
+    const cancel = new AbortController();
+    const client = {
+      getInputs: async () => { gets++; return { receipts: true, inputs: gets === 1 ? [pause] : gets === 2 ? [followUp] : [] }; },
+      ackInputs: async (_run: string, ids: number[]) => ({ inputs: ids[0] === 7 ? [pause] : [followUp], active: true }),
+      applyInputs: async (_run: string, ids: number[]) => {
+        if (ids[0] === 8) { await tick(150); appliedFollowUp = true; }
+        return { inputs: ids[0] === 7 ? [pause] : [followUp], active: true };
+      },
+    } as unknown as WorkerClient;
+    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), cancel);
+    ch.start();
+    try {
+      await until(() => cancel.signal.aborted);
+      assert.deepStrictEqual(await ch.awaitFollowUp(100_000), { kind: "followup", body: "eight" });
+      await ch.awaitReceiptSettlement();
+      assert.strictEqual(appliedFollowUp, true, "the running report waited for the follow-up's APPLIED");
+    } finally {
+      await ch.stop();
+    }
+  });
+
+  it("after a given-up credential switch, a later follow-up's report still waits for its APPLIED", async () => {
+    // The switch trips the shared controller once; the give-up is confirmed and the flight continues
+    // in place with the controller still aborted. A follow-up routed afterwards must hold its report.
+    const followUp: UserInput = { id: 8, kind: "follow_up", body: "eight" };
+    let gets = 0;
+    let appliedFollowUp = false;
+    const cancel = new AbortController();
+    const client = {
+      getInputs: async () => {
+        gets++;
+        if (gets === 1) return { receipts: true, inputs: [], credentialSwitch: { generation: 3 } };
+        return { receipts: true, inputs: gets === 3 ? [followUp] : [] };
+      },
+      ackInputs: async () => ({ inputs: [followUp], active: true }),
+      applyInputs: async () => { await tick(150); appliedFollowUp = true; return { inputs: [followUp], active: true }; },
+    } as unknown as WorkerClient;
+    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), cancel, { claimGeneration: 3 });
+    ch.start();
+    try {
+      await until(() => cancel.signal.aborted);
+      assert.strictEqual((cancel.signal.reason as Error).name, "CredentialSwitchSignal");
+      ch.rearmCredentialSwitch(); // the give-up's stamp-clear was confirmed; the flight continues
+      assert.deepStrictEqual(await ch.awaitFollowUp(100_000), { kind: "followup", body: "eight" });
+      await ch.awaitReceiptSettlement();
+      assert.strictEqual(appliedFollowUp, true, "the running report waited for the follow-up's APPLIED");
+    } finally {
+      await ch.stop();
+    }
+  });
+
+  it("rejects a waiting report when APPLIED is refused with a definitive 4xx after routing", async () => {
+    for (const refusal of [
+      new RequestError("POST", "/inputs/applied", 409, JSON.stringify({ error: "conflict", reason: "" })),
+      new RequestError("POST", "/inputs/applied", 400, "invalid input ids"),
+    ]) {
+      const row: UserInput = { id: 7, kind: "follow_up", body: "seven" };
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      const client = {
+        getInputs: async () => ({ receipts: true, inputs: [row] }),
+        ackInputs: async () => ({ inputs: [row], active: true }),
+        applyInputs: async () => { await gate; throw refusal; },
+      } as unknown as WorkerClient;
+      const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController());
+      ch.start();
+      try {
+        assert.deepStrictEqual(await ch.awaitFollowUp(100_000), { kind: "followup", body: "seven" });
+        await tick();
+        const waiting = ch.awaitReceiptSettlement();
+        release();
+        await assert.rejects(waiting, (err: Error) => err.name === "InputReceiptError", `status ${refusal.status}`);
+      } finally {
+        release();
+        await ch.stop();
+      }
+    }
+  });
+
+  it("routes a GET reply without the receipts marker at once, with no ACK or APPLIED (an older api pod)", async () => {
+    const rows: UserInput[] = [{ id: 7, kind: "approve_plan", body: null }, { id: 8, kind: "follow_up", body: "eight" }];
+    let gets = 0;
+    const client = {
+      getInputs: async () => { gets++; return { inputs: gets === 1 ? rows : [] }; },
+      ackInputs: async () => { throw Error("a consume-on-read reply must not be ACKed"); },
+      applyInputs: async () => { throw Error("a consume-on-read reply must not be applied"); },
+    } as unknown as WorkerClient;
+    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController());
+    ch.start();
+    try {
+      assert.deepStrictEqual(await ch.awaitVerdict(), { kind: "approve", selection: { status: "absent" } });
+      assert.strictEqual(ch.pullFollowUp(), "eight");
+      await ch.awaitReceiptSettlement();
+    } finally {
+      await ch.stop();
+    }
+  });
+
+  it("takes the credential-switch path on a switch_pending APPLIED: the waiting report rejects with the switch signal", async () => {
+    const row: UserInput = { id: 7, kind: "follow_up", body: "seven" };
+    let gets = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const client = {
+      getInputs: async () => { gets++; return { receipts: true, inputs: gets === 1 ? [row] : [] }; },
+      ackInputs: async () => ({ inputs: [row], active: true }),
+      applyInputs: async () => {
+        await gate;
+        throw new RequestError("POST", "/inputs/applied", 409, JSON.stringify({ error: "conflict", reason: "switch_pending" }));
+      },
+    } as unknown as WorkerClient;
+    const cancel = new AbortController();
+    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), cancel, { claimGeneration: 4 });
+    ch.start();
+    try {
+      assert.deepStrictEqual(await ch.awaitFollowUp(100_000), { kind: "followup", body: "seven" });
+      await tick();
+      const waiting = ch.awaitReceiptSettlement();
+      release();
+      await assert.rejects(waiting, (err: Error) => err.name === "CredentialSwitchSignal",
+        "the resume report must not go out unapplied, and must enter the switch path, not a failure");
+      assert.strictEqual(ch.pendingCredentialSwitch(), 4, "the switch is tripped for this claim");
+      assert.strictEqual((cancel.signal.reason as Error).name, "CredentialSwitchSignal");
+      await ch.awaitReceiptSettlement(); // not sticky: the switch's own release report still goes out
+      const seen = gets;
+      await until(() => gets > seen);
+      assert.strictEqual(ch.claimFence(), undefined);
+    } finally {
+      release();
+      await ch.stop();
+    }
+  });
+
+  it("gives up a routed receipt after a bounded number of applied attempts at stop", async () => {
+    const row: UserInput = { id: 7, kind: "approve_plan", body: null };
+    let attempts = 0;
+    const client = {
+      getInputs: async () => ({ receipts: true, inputs: [row] }),
+      ackInputs: async () => ({ inputs: [row], active: true }),
+      applyInputs: async () => { attempts++; throw Error("api down"); },
+    } as unknown as WorkerClient;
+    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController());
+    ch.start();
+    await until(() => attempts >= 1);
+    await ch.stop();
+    const atStop = attempts;
+    await ch.awaitReceiptSettlement();
+    await tick();
+    assert.ok(atStop <= 1 + 3 + 1, `bounded applied attempts, got ${atStop}`);
+    assert.strictEqual(attempts, atStop, "no attempt after stop returned");
+  });
+
+  it("holds a state report behind a routed batch until its applied receipt lands", async () => {
+    const row: UserInput = { id: 7, kind: "follow_up", body: "seven" };
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let appliedDone = false;
+    const client = {
+      getInputs: async () => ({ receipts: true, inputs: [row] }),
+      ackInputs: async () => ({ inputs: [row], active: true }),
+      applyInputs: async () => { await gate; appliedDone = true; return { inputs: [row], active: true }; },
+    } as unknown as WorkerClient;
+    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController());
+    ch.start();
+    try {
+      assert.deepStrictEqual(await ch.awaitFollowUp(100000), { kind: "followup", body: "seven" });
+      let reported = false;
+      const report = ch.awaitReceiptSettlement().then(() => { reported = true; });
+      await tick();
+      assert.strictEqual(reported, false, "the wake report waits for the applied receipt");
+      release();
+      await report;
+      assert.strictEqual(appliedDone, true);
+    } finally {
+      release();
       await ch.stop();
     }
   });

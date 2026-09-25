@@ -175,8 +175,8 @@ func TestRunMilestonesLifecycleLiveDB(t *testing.T) {
 			 VALUES ($1, $2, $3, 9, 't', 'd', 'awaiting_approval', $4, 'issue', $5)`,
 			gateRun, userID, repoID, wkr.ID, candidateJSON)
 		mustExec(ctx, t, pool,
-			`INSERT INTO run_user_inputs (run_id, kind, body, consumed_at)
-			 VALUES ($1, 'approve_plan', '{}', now())`, gateRun)
+			`INSERT INTO run_user_inputs (run_id, kind, body, consumed_at, applied_at)
+			 VALUES ($1, 'approve_plan', '{}', now(), now())`, gateRun)
 		if got := milestones(gateRun, "milestones_frozen"); got != nil {
 			t.Fatalf("precondition: frozen must be NULL before the running report, got %s", got)
 		}

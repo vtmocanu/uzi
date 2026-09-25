@@ -319,6 +319,7 @@ export class Worker {
           // row can be asked to park itself; an image WITHOUT it has its out-of-time run parked
           // server-side at once (never failed), so advertising it is negotiation, not a toggle.
           "wall_park_v1",
+          "input_receipts_v1",
         ];
         // PRD #1332 D3 (M5A / C2), refined by PRD #1493 M3: advertise the Codex harness
         // PROTOCOL capability ONLY on an HONEST availability result. The old gate was the

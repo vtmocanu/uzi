@@ -704,7 +704,7 @@ func TestRunMilestoneProgressLiveDB(t *testing.T) {
 			     started_at = now() - interval '600 seconds' WHERE id = $1`, run)
 		// Satisfy SetRunRunning's awaiting_approval resume guard with a CONSUMED approve_plan.
 		mustExec(ctx, t, pool,
-			`INSERT INTO run_user_inputs (run_id, kind, body, consumed_at) VALUES ($1, 'approve_plan', '{}', now())`, run)
+			`INSERT INTO run_user_inputs (run_id, kind, body, consumed_at, applied_at) VALUES ($1, 'approve_plan', '{}', now(), now())`, run)
 
 		setRunning := func(what string) {
 			t.Helper()

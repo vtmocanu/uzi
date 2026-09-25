@@ -429,20 +429,26 @@ func TestGetRunClaimContextHumanPlanApprovedLiveDB(t *testing.T) {
 	}
 
 	mustExec(ctx, t, pool,
-		`INSERT INTO run_user_inputs (run_id, kind, consumed_at) VALUES ($1, 'approve_plan', now())`, otherRun)
+		`INSERT INTO run_user_inputs (run_id, kind, consumed_at, applied_at) VALUES ($1, 'approve_plan', now(), now())`, otherRun)
 	if approved(t) {
 		t.Fatal("a DIFFERENT run's consumed approve_plan made human_plan_approved true; the " +
 			"EXISTS is supposed to be correlated by run_id")
 	}
 
 	mustExec(ctx, t, pool,
-		`INSERT INTO run_user_inputs (run_id, kind, consumed_at) VALUES ($1, 'follow_up', now())`, runID)
+		`INSERT INTO run_user_inputs (run_id, kind, consumed_at, applied_at) VALUES ($1, 'follow_up', now(), now())`, runID)
 	if approved(t) {
 		t.Fatal("a consumed input of a DIFFERENT KIND made human_plan_approved true")
 	}
 
 	mustExec(ctx, t, pool,
 		`UPDATE run_user_inputs SET consumed_at = now() WHERE run_id = $1 AND kind = 'approve_plan'`, runID)
+	if approved(t) {
+		t.Fatal("an ACKed but unapplied approve_plan made human_plan_approved true (issue #1673)")
+	}
+
+	mustExec(ctx, t, pool,
+		`UPDATE run_user_inputs SET applied_at = now() WHERE run_id = $1 AND kind = 'approve_plan'`, runID)
 	if !approved(t) {
 		t.Fatal("a consumed approve_plan on this very run did NOT make human_plan_approved " +
 			"true; the resume would re-plan, re-park at the gate in front of a human who " +

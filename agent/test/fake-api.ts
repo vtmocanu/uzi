@@ -39,6 +39,28 @@ export class FakeApi {
   // --- control -------------------------------------------------------------
   private readonly claimQueue: ClaimResponse[] = [];
   private readonly inputsByRun = new Map<string, UserInput[]>();
+  private readonly ackedByRun = new Map<string, Set<number>>();
+  private readonly appliedByRun = new Map<string, Set<number>>();
+  private readonly receiptGeneration = new Map<string, number>();
+  private readonly lostReceiptReplies = new Map<string, number>();
+  private readonly seenInputIds = new Map<string, Set<number>>();
+  private readonly receiptFenceReason = new Map<string, string>();
+  private readonly failingReceipts = new Map<"ack" | "applied", number>();
+  private readonly failingReceiptReasons = new Map<"ack" | "applied", string>();
+  /** Runs whose credential switch becomes pending right after the next successful ACK. */
+  private readonly switchAfterAck = new Set<string>();
+  /** Runs with a pending switch: GET drains nothing (the server fence) and APPLIED is refused. */
+  private readonly switchPendingRuns = new Set<string>();
+  private readonly delayedReceipts = new Map<"ack" | "applied", number>();
+  /** Issue #1673: receipt tests set this so a receipt for a run with no explicit claim
+   *  generation fails loudly instead of being accepted as the only claim. */
+  strictReceiptGenerations = false;
+  /** Issue #1673: answer GET /inputs like an older api pod: consume on read, no receipt marker. */
+  legacyConsumeOnRead = false;
+  private nextSyntheticInputId = 1_000_000;
+  readonly inputReceiptCalls: Array<{ runId: string; kind: "ack" | "applied"; ids: number[]; generation: number }> = [];
+  /** Receipts answered 200, in reply order (a delayed reply lands here only once it is sent). */
+  readonly inputReceiptReplies: Array<{ runId: string; kind: "ack" | "applied" }> = [];
   // Issue #1660: the follow_up inputs /inputs has already drained, per run, oldest first — what
   // the real server's GET /runs/{id}/follow-ups (ListConsumedFollowUpInputsForRun) returns.
   private readonly consumedFollowUpsByRun = new Map<string, UserInput[]>();
@@ -241,6 +263,7 @@ export class FakeApi {
   }
 
   enqueueClaim(claim: ClaimResponse): void {
+    this.receiptGeneration.set(claim.run_id, claim.claim_generation ?? 0);
     this.claimQueue.push(claim);
   }
 
@@ -356,7 +379,51 @@ export class FakeApi {
   }
 
   setInputs(runId: string, inputs: UserInput[]): void {
+    // Issue #1673: a real row id is never reused, and receipts are keyed by id. Many older
+    // fixtures send every input as id 1; a row whose id this run has already seen gets a fresh
+    // one (also within one batch), so a later input is a new row rather than a replay.
+    const seen = this.seenInputIds.get(runId) ?? new Set<number>();
+    inputs = inputs.map((row) => {
+      const fresh = seen.has(row.id) ? { ...row, id: this.nextSyntheticInputId++ } : row;
+      seen.add(fresh.id);
+      return fresh;
+    });
+    this.seenInputIds.set(runId, seen);
     this.inputsByRun.set(runId, inputs);
+  }
+
+  setInputClaimGeneration(runId: string, generation: number): void {
+    this.receiptGeneration.set(runId, generation);
+  }
+
+  /** Why the run's claim is inactive once its generation moves on (default "stale"). */
+  setInputFenceReason(runId: string, reason: "switch_pending" | "released" | "stale"): void {
+    this.receiptFenceReason.set(runId, reason);
+  }
+
+  /** Answer every `kind` receipt with `status` (undefined restores normal replies). */
+  failInputReceipts(kind: "ack" | "applied", status: number | undefined, reason?: string): void {
+    if (status === undefined) this.failingReceipts.delete(kind);
+    else this.failingReceipts.set(kind, status);
+    if (reason === undefined) this.failingReceiptReasons.delete(kind);
+    else this.failingReceiptReasons.set(kind, reason);
+  }
+
+  /** Hold every `kind` receipt reply for `ms` before answering (0 restores immediate replies). */
+  delayInputReceipts(kind: "ack" | "applied", ms: number): void {
+    this.delayedReceipts.set(kind, ms);
+  }
+
+  /** Issue #1673: a credential switch becomes pending right after this run's next successful
+   *  ACK, so the routed batch's APPLIED is refused with 409 reason switch_pending, and GET, fenced
+   *  like the server's ConsumeInputs, returns no rows. No switch signal rides the GET, so only the
+   *  APPLIED refusal can reveal the switch. */
+  pendSwitchAfterNextAck(runId: string): void {
+    this.switchAfterAck.add(runId);
+  }
+
+  loseNextInputReceiptReply(kind: "ack" | "applied"): void {
+    this.lostReceiptReplies.set(kind, (this.lostReceiptReplies.get(kind) ?? 0) + 1);
   }
 
   /** PRD #1247 M5b (MINOR-7): arm a TOP-LEVEL credential_switch signal on every /state ACK for a
@@ -608,6 +675,64 @@ export class FakeApi {
       });
     }
 
+    const receiptMatch = /^\/api\/worker\/runs\/([^/]+)\/inputs\/(ack|applied)$/.exec(p);
+    if (req.method === "POST" && receiptMatch) {
+      const runId = receiptMatch[1]!;
+      const kind = receiptMatch[2] as "ack" | "applied";
+      const ids = json.ids as number[];
+      const generation = json.claim_generation as number;
+      this.inputReceiptCalls.push({ runId, kind, ids: [...ids], generation });
+      // A run whose claim generation the test never set (it ran a claim without enqueueClaim)
+      // accepts any generation, as that claim is the only one, unless the test asked for strict
+      // generations: then an unset one is a fixture error, so a fencing regression cannot hide.
+      const current = this.receiptGeneration.get(runId);
+      if (current === undefined && this.strictReceiptGenerations)
+        return send(res, 500, { error: `fake: no claim generation set for run ${runId}` });
+      const active = current === undefined || generation === current;
+      // The claim's inactive reason, as the server names it (switch_pending | released | stale).
+      const reason = active ? undefined : (this.receiptFenceReason.get(runId) ?? "stale");
+      if (kind === "applied" && this.switchPendingRuns.has(runId))
+        return send(res, 409, { error: "input receipt conflicts with claim", reason: "switch_pending" });
+      const delay = this.delayedReceipts.get(kind) ?? 0;
+      if (delay > 0) await new Promise((r) => setTimeout(r, delay));
+      const failing = this.failingReceipts.get(kind);
+      if (failing !== undefined)
+        return send(res, failing, { error: "fake: receipt failure", reason: this.failingReceiptReasons.get(kind) });
+      const rows = this.inputsByRun.get(runId) ?? [];
+      const acked = this.ackedByRun.get(runId) ?? new Set<number>();
+      const applied = this.appliedByRun.get(runId) ?? new Set<number>();
+      if (!Array.isArray(ids) || ids.length === 0 || ids.some((id) => !rows.some((row) => row.id === id)))
+        return send(res, 400, { error: "invalid input ids" });
+      if (kind === "ack" && !active && ids.some((id) => !acked.has(id)))
+        return send(res, 409, { error: "inactive claim", reason });
+      // Like the server: a retried applied for rows already applied succeeds even after the
+      // claim was fenced; an unapplied row needs the active claim.
+      if (kind === "applied" && ids.some((id) => !acked.has(id) || (!active && !applied.has(id))))
+        return send(res, 409, { error: "inactive or unacked", reason: reason ?? "" });
+      if (kind === "ack") {
+        for (const id of ids) acked.add(id);
+        this.ackedByRun.set(runId, acked);
+        if (this.switchAfterAck.delete(runId)) this.switchPendingRuns.add(runId);
+        // GET /follow-ups returns RECEIVED follow-ups, applied or not (ListConsumedFollowUpInputsForRun).
+        const consumed = this.consumedFollowUpsByRun.get(runId) ?? [];
+        for (const row of rows.filter((row) => ids.includes(row.id) && row.kind === "follow_up"))
+          if (!consumed.some((old) => old.id === row.id)) consumed.push(row);
+        consumed.sort((a, b) => a.id - b.id);
+        this.consumedFollowUpsByRun.set(runId, consumed);
+      } else {
+        for (const id of ids) applied.add(id);
+        this.appliedByRun.set(runId, applied);
+      }
+      const remaining = this.lostReceiptReplies.get(kind) ?? 0;
+      if (remaining > 0) {
+        this.lostReceiptReplies.set(kind, remaining - 1);
+        res.destroy();
+        return;
+      }
+      this.inputReceiptReplies.push({ runId, kind });
+      return send(res, 200, { inputs: rows.filter((row) => ids.includes(row.id)).sort((a, b) => a.id - b.id), active, reason });
+    }
+
     const runMatch =
       /^\/api\/worker\/runs\/([^/]+)\/(messages|state|inputs)$/.exec(p);
     if (runMatch) {
@@ -618,14 +743,18 @@ export class FakeApi {
       if (req.method === "POST" && kind === "state")
         return this.handleState(res, runId, json);
       if (req.method === "GET" && kind === "inputs") {
-        // Consume-on-read, FIFO — matches M1's ConsumeInputs (each GET returns
-        // then clears the pending inputs; there is no separate ack).
-        const pending = this.inputsByRun.get(runId) ?? [];
-        this.inputsByRun.set(runId, []);
-        const consumed = this.consumedFollowUpsByRun.get(runId) ?? [];
-        consumed.push(...pending.filter((i) => i.kind === "follow_up"));
-        this.consumedFollowUpsByRun.set(runId, consumed);
-        return send(res, 200, { inputs: pending });
+        const rows = this.inputsByRun.get(runId) ?? [];
+        const applied = this.appliedByRun.get(runId) ?? new Set<number>();
+        const pending = this.switchPendingRuns.has(runId)
+          ? []
+          : rows.filter((row) => !applied.has(row.id)).sort((a, b) => a.id - b.id);
+        if (this.legacyConsumeOnRead) {
+          // An older api pod: consume on read (mark applied now) and send no receipt marker.
+          for (const row of pending) applied.add(row.id);
+          this.appliedByRun.set(runId, applied);
+          return send(res, 200, { inputs: pending });
+        }
+        return send(res, 200, { inputs: pending, receipts: true });
       }
     }
 

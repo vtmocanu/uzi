@@ -20,6 +20,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/config"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
@@ -46,6 +47,8 @@ type protocolStore struct {
 	// Issue #1660: the consumed follow-ups the rehydrate read returns, and whether it ran.
 	followUpRows   []store.ListConsumedFollowUpInputsForRunRow
 	followUpCalled bool
+	replayRows     []store.ListReplayRunInputsRow
+	replayRunIDs   []uuid.UUID
 }
 
 func (p *protocolStore) ClaimRun(context.Context, store.ClaimRunParams) (store.Run, error) {
@@ -64,6 +67,10 @@ func (p *protocolStore) RunMessageGaps(_ context.Context, arg store.RunMessageGa
 func (p *protocolStore) ListConsumedFollowUpInputsForRun(context.Context, uuid.UUID) ([]store.ListConsumedFollowUpInputsForRunRow, error) {
 	p.followUpCalled = true
 	return p.followUpRows, nil
+}
+func (p *protocolStore) ListReplayRunInputs(_ context.Context, runID uuid.UUID) ([]store.ListReplayRunInputsRow, error) {
+	p.replayRunIDs = append(p.replayRunIDs, runID)
+	return p.replayRows, nil
 }
 func (p *protocolStore) SetRunCompleted(context.Context, store.SetRunCompletedParams) (int64, error) {
 	return p.completedRows, nil
@@ -1163,6 +1170,63 @@ func TestWorkerRegisterCarriesOutboxMaxPending(t *testing.T) {
 	}
 	if *resp.WorkerOutboxMaxPending != 32 {
 		t.Fatalf("worker_outbox_max_pending = %d, want 32 (= cfg.WorkerOutboxMaxPending)", *resp.WorkerOutboxMaxPending)
+	}
+}
+
+// A capable worker reads the same pending inputs on repeated GETs through a real chi route.
+func TestWorkerRunInputsCapableRouteReplaysInIDOrder(t *testing.T) {
+	runID := uuid.New()
+	at := time.Date(2026, 9, 25, 7, 1, 7, 0, time.UTC)
+	st := &protocolStore{
+		ownedRun: store.Run{ID: runID, Status: "running"},
+		replayRows: []store.ListReplayRunInputsRow{
+			{ID: 3, Kind: "cancel", CreatedAt: pgtype.Timestamptz{Time: at, Valid: true}},
+			{ID: 8, Kind: "approve_plan", CreatedAt: pgtype.Timestamptz{Time: at.Add(time.Minute), Valid: true}},
+			{ID: 12, Kind: "follow_up", Body: pgtype.Text{String: "check the retry", Valid: true}, CreatedAt: pgtype.Timestamptz{Time: at.Add(2 * time.Minute), Valid: true}},
+		},
+	}
+	h := newProtocolHandler(t, st)
+	router := chi.NewRouter()
+	router.Get("/api/worker/runs/{id}/inputs", h.WorkerRunInputs)
+	wkr := store.Worker{ID: uuid.New(), UserID: uuid.New(), ProtocolCapabilities: []string{capability.InputReceiptsV1}}
+	var firstBody string
+	for poll := 1; poll <= 2; poll++ {
+		req := httptest.NewRequest(http.MethodGet, "/api/worker/runs/"+runID.String()+"/inputs", nil)
+		req = req.WithContext(mw.ContextWithWorker(req.Context(), wkr))
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("poll %d: status = %d, want 200 (body %q)", poll, rec.Code, rec.Body.String())
+		}
+		var got struct {
+			Inputs []workersvc.InputDTO `json:"inputs"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+			t.Fatalf("poll %d: decode body: %v", poll, err)
+		}
+		if len(got.Inputs) != 3 {
+			t.Fatalf("poll %d: inputs = %+v, want three replay inputs", poll, got.Inputs)
+		}
+		for i, want := range []struct {
+			id   int64
+			kind string
+		}{{3, "cancel"}, {8, "approve_plan"}, {12, "follow_up"}} {
+			in := got.Inputs[i]
+			if in.ID != want.id || in.Kind != want.kind || !in.CreatedAt.Equal(at.Add(time.Duration(i)*time.Minute)) {
+				t.Fatalf("poll %d: inputs[%d] = %+v, want id %d kind %s", poll, i, in, want.id, want.kind)
+			}
+			if i < 2 && in.Body != nil || i == 2 && (in.Body == nil || *in.Body != "check the retry") {
+				t.Fatalf("poll %d: inputs[%d].body = %v, want null for cancel/approve_plan or follow-up text", poll, i, in.Body)
+			}
+		}
+		if poll == 1 {
+			firstBody = rec.Body.String()
+		} else if rec.Body.String() != firstBody {
+			t.Fatalf("second poll changed replay result: first %q, second %q", firstBody, rec.Body.String())
+		}
+	}
+	if len(st.replayRunIDs) != 2 || st.replayRunIDs[0] != runID || st.replayRunIDs[1] != runID {
+		t.Fatalf("replay reads = %v, want two reads for run %s", st.replayRunIDs, runID)
 	}
 }
 

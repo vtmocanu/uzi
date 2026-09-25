@@ -114,7 +114,7 @@ func TestSetRunRunningAwaitingApprovalGuardLiveDB(t *testing.T) {
 	// ── A consumed approve_plan on a DIFFERENT run does not unblock this one: the
 	//    EXISTS clause is correlated by run_id. ──
 	mustExec(ctx, t, pool,
-		`INSERT INTO run_user_inputs (run_id, kind, consumed_at) VALUES ($1, 'approve_plan', now())`, claimedRun)
+		`INSERT INTO run_user_inputs (run_id, kind, consumed_at, applied_at) VALUES ($1, 'approve_plan', now(), now())`, claimedRun)
 	if rows := report(gateRun); rows != 0 {
 		t.Fatalf("stale report with a foreign run's consumed input: rows = %d, want 0", rows)
 	}
@@ -122,7 +122,7 @@ func TestSetRunRunningAwaitingApprovalGuardLiveDB(t *testing.T) {
 		t.Fatalf("foreign consumed input: status = %q, want awaiting_approval", s)
 	}
 
-	// ── An UNconsumed approve_plan on this run still blocks: only consumed_at IS NOT
+	// ── An UNconsumed approve_plan on this run still blocks: only applied_at IS NOT
 	//    NULL counts (a queued verdict the worker has not yet acted on). ──
 	mustExec(ctx, t, pool,
 		`INSERT INTO run_user_inputs (run_id, kind) VALUES ($1, 'approve_plan')`, gateRun)
@@ -133,10 +133,18 @@ func TestSetRunRunningAwaitingApprovalGuardLiveDB(t *testing.T) {
 		t.Fatalf("unconsumed approve_plan: status = %q, want awaiting_approval", s)
 	}
 
-	// ── Once the approve_plan is consumed, the legitimate post-approval resume report
-	//    transitions awaiting_approval → running. ──
+	// ── An ACKed but unapplied approve_plan (issue #1673: consumed_at set, applied_at
+	//    NULL) still blocks: the worker has received the verdict but not acted on it. ──
 	mustExec(ctx, t, pool,
 		`UPDATE run_user_inputs SET consumed_at = now() WHERE run_id = $1 AND kind = 'approve_plan'`, gateRun)
+	if rows := report(gateRun); rows != 0 {
+		t.Fatalf("stale report with an ACKed but unapplied approve_plan: rows = %d, want 0", rows)
+	}
+
+	// ── Once the approve_plan is applied, the legitimate post-approval resume report
+	//    transitions awaiting_approval → running. ──
+	mustExec(ctx, t, pool,
+		`UPDATE run_user_inputs SET applied_at = now() WHERE run_id = $1 AND kind = 'approve_plan'`, gateRun)
 	if rows := report(gateRun); rows != 1 {
 		t.Fatalf("post-approval resume report: rows = %d, want 1", rows)
 	}

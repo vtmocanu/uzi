@@ -107,6 +107,9 @@ type ChatClaimPayload struct {
 	ResumeOfRunID *string `json:"resume_of_run_id"`
 	LastSeq       int32   `json:"last_seq"` // resume: continue message numbering
 	RequeueCount  int32   `json:"requeue_count"`
+	// ClaimGeneration is the run's claim_generation, which the worker sends on its input
+	// receipts (issue #1673). The chat lane does not bump it, so it is usually 0.
+	ClaimGeneration int64 `json:"claim_generation"`
 
 	Secrets ChatClaimSecrets `json:"secrets"`
 	Config  ChatClaimConfig  `json:"config"`
@@ -245,14 +248,15 @@ func (s *Service) assembleChatClaim(ctx context.Context, run store.Run) (*ChatCl
 	}
 
 	return &ChatClaimPayload{
-		RunID:         run.ID.String(),
-		Kind:          run.Kind,
-		Title:         run.Title.String,
-		Status:        run.Status,
-		SessionID:     textPtr(sessionID),
-		ResumeOfRunID: uuidPtr(run.ResumeOfRunID),
-		LastSeq:       run.LastSeq,
-		RequeueCount:  run.RequeueCount,
+		RunID:           run.ID.String(),
+		Kind:            run.Kind,
+		Title:           run.Title.String,
+		Status:          run.Status,
+		SessionID:       textPtr(sessionID),
+		ResumeOfRunID:   uuidPtr(run.ResumeOfRunID),
+		LastSeq:         run.LastSeq,
+		RequeueCount:    run.RequeueCount,
+		ClaimGeneration: run.ClaimGeneration,
 		Secrets: ChatClaimSecrets{
 			AnthropicOAuthToken: string(anthropic),
 		},

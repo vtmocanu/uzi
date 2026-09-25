@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Fixed
+
+- **A cancel, stop, plan verdict or follow-up is no longer lost when the worker's reply from the server is lost, and follow-ups reach the lead in the order you sent them ([#1673](https://github.com/vtmocanu/uzi/issues/1673)).**
+  Before, the worker's input poll marked your inputs delivered as it returned them, so a reply lost to a network error or timeout dropped a cancel or plan verdict for good and could deliver an older follow-up after a newer one. A worker that advertises the new `input_receipts_v1` capability now reads inputs without consuming them, acknowledges them (`POST /api/worker/runs/{id}/inputs/ack`), and confirms them once acted on (`POST /api/worker/runs/{id}/inputs/applied`); it retries a lost reply with the same inputs, acts on each input once, in the order sent, and an input still unconfirmed when a claim ends goes to the run's next claim. A follow-up shows as delivered when the worker acknowledges it. Older worker images keep the previous behaviour until they are upgraded; a migration marks every input delivered before the upgrade as confirmed.
+
 ## [0.84.0] - 2026-09-20
 
 ### Added

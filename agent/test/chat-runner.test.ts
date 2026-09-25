@@ -132,6 +132,66 @@ describe("ChatRunner — claim → session loop → complete (no clone, no MR)",
     assert.ok(answer && userMsg!.seq < answer.seq, "user_message precedes the model reply");
   });
 
+  it("passes claim generation and drains the source before reporting completion", async () => {
+    const { states, client } = fakeClient();
+    const { queryFn } = fakeQuery();
+    let generation = -1;
+    let release!: () => void;
+    const confirmation = new Promise<void>((resolve) => { release = resolve; });
+    let stopping = false;
+    const source: ChatInputSource = {
+      start() {},
+      async stop() { stopping = true; await confirmation; },
+      async awaitFollowUp() { return { kind: "idle" }; },
+    };
+    const chat = new ChatRunner(client, () => new ChatExecutor(nullLogger(), homeDir, { queryFn }), nullLogger(), 5, DEFAULTS, JOIN, {
+      makeSource: (_id, _cancel, _log, claimGeneration) => { generation = claimGeneration; return source; },
+    });
+    const running = chat.execute(baseClaim({ claim_generation: 9 }));
+    try {
+      for (let i = 0; i < 100 && !stopping; i++) await new Promise((resolve) => setTimeout(resolve, 1));
+      assert.strictEqual(stopping, true);
+      assert.strictEqual(generation, 9);
+      assert.deepStrictEqual(states.map((state) => state.status), ["running"]);
+    } finally {
+      release();
+      await running;
+    }
+    assert.strictEqual(states.at(-1)?.status, "completed");
+  });
+
+  it("reports failed with a clear reason, not completed, when a message's applied receipt was given up", async () => {
+    // Issue #1673: nothing requeues a chat, so a silent stop would leave the run running until the
+    // idle sweep completes it with the message lost. The chat ends failed, visibly.
+    const { states, client } = fakeClient();
+    const { queryFn } = fakeQuery();
+    const reason = "could not confirm your message was applied; please resend it";
+    const source: ChatInputSource = {
+      start() {},
+      async stop() {},
+      claimLost: () => false,
+      unconfirmedInput: () => reason,
+      async awaitFollowUp() { return { kind: "ended" }; },
+    };
+    await runner(client, new ChatExecutor(nullLogger(), homeDir, { queryFn }), source).execute(baseClaim());
+    assert.deepStrictEqual(states.map((state) => state.status), ["running", "failed"]);
+    assert.strictEqual(states.at(-1)?.failure_reason, reason);
+  });
+
+  it("does not report a terminal state when the source loses its claim during the drain", async () => {
+    const { states, client } = fakeClient();
+    const { queryFn } = fakeQuery();
+    let lost = false;
+    const source: ChatInputSource = {
+      start() {},
+      async stop() { lost = true; },
+      claimLost: () => lost,
+      async awaitFollowUp() { return { kind: "idle" }; },
+    };
+    await runner(client, new ChatExecutor(nullLogger(), homeDir, { queryFn }), source).execute(baseClaim());
+    assert.deepStrictEqual(states.map((state) => state.status), ["running"]);
+  });
+
   it("carries NO forge PAT on a chat claim (Decision 9) and has no git collaborator", async () => {
     const { client } = fakeClient();
     const { queryFn } = fakeQuery();

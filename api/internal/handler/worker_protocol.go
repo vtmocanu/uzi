@@ -1128,7 +1128,72 @@ func (h *Handler) WorkerRunInputs(w http.ResponseWriter, r *http.Request) {
 	if res.CredentialSwitch != nil {
 		body["credential_switch"] = res.CredentialSwitch
 	}
+	// Issue #1673: declare receipt mode on the reply itself. A worker that advertised
+	// input_receipts_v1 can still reach an older api pod mid-roll, which consumes on read and
+	// sends no marker; the worker then routes that reply at once instead of waiting on an ACK.
+	if res.Receipts {
+		body["receipts"] = true
+	}
 	httpx.JSON(w, http.StatusOK, body)
+}
+
+func (h *Handler) workerInputReceipt(w http.ResponseWriter, r *http.Request, applied bool) {
+	wkr, ok := mw.WorkerFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "worker authentication required")
+		return
+	}
+	runID, ok := httpx.PathUUID(w, r, "id", "run")
+	if !ok {
+		return
+	}
+	var body struct {
+		IDs             []int64 `json:"ids"`
+		ClaimGeneration *int64  `json:"claim_generation"`
+	}
+	if err := httpx.DecodeJSON(r, &body); err != nil || body.ClaimGeneration == nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid input receipt body")
+		return
+	}
+	var res workersvc.InputReceiptResult
+	var err error
+	if applied {
+		res, err = h.wsvc.ApplyInputs(r.Context(), wkr, runID, *body.ClaimGeneration, body.IDs)
+	} else {
+		res, err = h.wsvc.AckInputs(r.Context(), wkr, runID, *body.ClaimGeneration, body.IDs)
+	}
+	if err != nil {
+		switch {
+		case errors.Is(err, workersvc.ErrRunNotOwned):
+			// Typed, like the 409: the worker ends its flight only on reason "stale", and keeps
+			// retrying an untyped 404 (an older api pod without this route, mid-roll).
+			httpx.ErrorReason(w, http.StatusNotFound, "run not found", workersvc.ReceiptStale)
+		case errors.Is(err, workersvc.ErrInputReceiptInvalid):
+			httpx.Error(w, http.StatusBadRequest, "invalid input ids or capability")
+		case errors.Is(err, workersvc.ErrInputReceiptConflict):
+			// The inactive reason tells the worker whether to keep polling (switch_pending)
+			// or end its old flight (released, stale); empty for a row-state conflict.
+			var conflict *workersvc.InputReceiptConflictError
+			reason := ""
+			if errors.As(err, &conflict) {
+				reason = conflict.Reason
+			}
+			httpx.ErrorReason(w, http.StatusConflict, "input receipt conflicts with claim", reason)
+		default:
+			slog.Error("worker input receipt", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+		}
+		return
+	}
+	httpx.JSON(w, http.StatusOK, res)
+}
+
+func (h *Handler) WorkerRunInputsAck(w http.ResponseWriter, r *http.Request) {
+	h.workerInputReceipt(w, r, false)
+}
+
+func (h *Handler) WorkerRunInputsApplied(w http.ResponseWriter, r *http.Request) {
+	h.workerInputReceipt(w, r, true)
 }
 
 // WorkerRunFollowUps returns the already-consumed follow_up inputs of a run this worker owns,
