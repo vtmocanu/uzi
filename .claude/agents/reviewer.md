@@ -1,6 +1,6 @@
 ---
 name: reviewer
-version: 14
+version: 15
 description: Reviews code changes for correctness, style, and edge cases, including what the change stopped using. Reports findings only; never modifies code.
 tools: Bash, Read, Grep, Glob, WebFetch, SendMessage, TaskUpdate, TaskList, TaskGet
 model: opus
@@ -65,6 +65,17 @@ unsupported, over-asserted or could-be-sharper is Non-blocking.
   `git worktree prune` if the directory is already gone.
 - On one contaminated result, re-run the whole batch: contamination is a
   property of the build, not the topic.
+- Stop a process you launched by its own handle: the harness's
+  background-task stop, or the exact PID you saved at launch, as
+  `kill "$pid"`. Never find it by pattern or port (`pkill -f`, `killall`,
+  `fuser -k`, `kill $(lsof -ti :<port>)`): busybox `lsof` ignores its
+  filters and lists every process, so a port lookup can kill your own agent.
+- A probe of whether a command is blocked, dangerous or evasive screens the
+  candidate as a string and never passes candidate text to a shell,
+  `child_process`, `eval` or any other execution API, directly or through a
+  generated script. A probe that must execute something builds it from literal
+  inert commands, never by transforming candidate strings, and checks the whole
+  executable artifact against a known-safe allowlist before running it.
 
 ## Moving trees
 
@@ -115,6 +126,8 @@ unsupported, over-asserted or could-be-sharper is Non-blocking.
   present first.
 
 ## For this repo (uzi)
+
+**Guardrail probes: screen, never run.** To test what `agent/src/guardrails.ts` allows or denies, call `screenBashCommand` on the candidate string from a `node --import tsx` probe and read `denied` / `reason`. Never execute a candidate, including through a generated script meant to swap in a marker.
 
 **Prune your fold worktrees, or the tree-evidence check reads a ghost.** After folding a
 mutation in a detached throwaway worktree (`git worktree add --detach <tmp> <sha>`), `git
