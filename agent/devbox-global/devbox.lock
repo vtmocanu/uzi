@@ -223,6 +223,20 @@
         }
       }
     },
+    "lsof": {
+      "resolved": "github:NixOS/nixpkgs/79b35bf0bda5cd110f856aa5b5b2c5ba4460dbf5#lsof",
+      "source": "nixpkg",
+      "systems": {
+        "x86_64-linux": {
+          "outputs": [
+            {
+              "path": "/nix/store/4r7zkya5jhaydx5wvpr7fxr017zqhg6c-lsof-4.99.7",
+              "default": true
+            }
+          ]
+        }
+      }
+    },
     "openssl.bin": {
       "resolved": "github:NixOS/nixpkgs/79b35bf0bda5cd110f856aa5b5b2c5ba4460dbf5#openssl.bin",
       "source": "nixpkg",
@@ -265,6 +279,20 @@
             {
               "name": "man",
               "path": "/nix/store/gw7zagh9cvx25b601jd1sv021xjp797p-perl-5.42.3-man",
+              "default": true
+            }
+          ]
+        }
+      }
+    },
+    "procps.out": {
+      "resolved": "github:NixOS/nixpkgs/79b35bf0bda5cd110f856aa5b5b2c5ba4460dbf5#procps.out",
+      "source": "nixpkg",
+      "systems": {
+        "x86_64-linux": {
+          "outputs": [
+            {
+              "path": "/nix/store/3zijspba1n5f5dc63kkd6yfs8q5748vj-procps-4.0.7",
               "default": true
             }
           ]

@@ -74,4 +74,53 @@ done < <(grep -v '^[[:space:]]*#' "$GUARD" | grep -v '^[[:space:]]*$')
 
 [ "$failed" -eq 0 ] || exit 1
 
-echo "OK: toolchain guard -- $(wc -l < "$tmp/guarded" | tr -d ' ') packages, all covered, all resolving."
+# --- 3. NO BUSYBOX PROCESS TOOLS (issue #1575) ------------------------------
+# The base image's lsof/pgrep/pkill are busybox applets. Busybox lsof ignores every
+# option, so `lsof -ti tcp:<port>` lists every PID in the container (exit 0) and
+# `kill $(lsof -ti tcp:N)` signals the agent itself. Resolving on PATH is not enough
+# (the applet resolves too): each must be a nix store binary, and lsof's port filter
+# must actually filter.
+for bin in lsof pgrep pkill; do
+  real="$(readlink -f "$(command -v "$bin" 2>/dev/null || echo /nonexistent)" 2>/dev/null || true)"
+  case "$real" in
+    /nix/store/*/bin/"$bin") ;;
+    *) echo "FAIL: \`$bin\` resolves to '${real:-nothing}', not a toolchain (nix store) binary." >&2
+       echo "      A busybox applet here ignores its filters (issue #1575)." >&2
+       failed=1 ;;
+  esac
+done
+[ "$failed" -eq 0 ] || exit 1
+
+# Listener: python3 binds an ephemeral loopback port and prints it. Its PID is $!,
+# the one handle we stop it by.
+python3 -c 'import socket,time
+s=socket.socket(); s.bind(("127.0.0.1",0)); s.listen(1)
+print(s.getsockname()[1], flush=True); time.sleep(120)' > "$tmp/port" &
+listener=$!
+# Stop and reap the listener on every exit path, including a cancelled build: INT/TERM
+# exit through the EXIT trap rather than leaving the listener behind.
+cleanup() { kill "$listener" 2>/dev/null || true; wait "$listener" 2>/dev/null || true; rm -rf "$tmp"; }
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+for _ in $(seq 100); do [ -s "$tmp/port" ] && break; sleep 0.1; done
+port="$(cat "$tmp/port")"
+[ -n "$port" ] || { echo "FAIL: lsof probe listener never reported its port." >&2; exit 1; }
+
+# Positive: the listener's port yields exactly the listener's PID.
+got="$(lsof -ti "tcp:$port" 2>/dev/null || true)"
+if [ "$got" != "$listener" ]; then
+  echo "FAIL: \`lsof -ti tcp:$port\` printed '$(echo "$got" | head -3 | tr '\n' ' ')', want only $listener." >&2
+  exit 1
+fi
+
+# Negative: once the listener is gone that port has no owner: no output, non-zero exit.
+kill "$listener" 2>/dev/null || true
+wait "$listener" 2>/dev/null || true
+rc=0; got="$(lsof -ti "tcp:$port" 2>/dev/null)" || rc=$?
+if [ -n "$got" ] || [ "$rc" -eq 0 ]; then
+  echo "FAIL: \`lsof -ti tcp:$port\` with no listener printed '$(echo "$got" | head -3 | tr '\n' ' ')' (rc=$rc); want nothing, non-zero." >&2
+  exit 1
+fi
+
+echo "OK: toolchain guard -- $(wc -l < "$tmp/guarded" | tr -d ' ') packages, all covered, all resolving; lsof port filter proven."

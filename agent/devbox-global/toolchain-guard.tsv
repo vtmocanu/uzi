@@ -48,3 +48,5 @@ ripgrep	rg	rg --version
 opentofu	tofu	tofu version
 yamllint	yamllint	yamllint --version
 semgrep	semgrep	semgrep --version
+lsof	lsof	lsof -v
+procps.out	pgrep	pgrep -V
