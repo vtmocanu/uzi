@@ -49,6 +49,7 @@ import type { CodexNotification, CodexTransport } from "../src/codex/transport.j
 import type { RunContext, EmittedMessage, Executor, WallParkOutcome } from "../src/executor.js";
 import { PauseNowSignal } from "../src/steering.js";
 import type { Logger } from "../src/log.js";
+import type { DockerWiring } from "../src/docker-wiring.js";
 import type { AgentTemplate } from "../src/protocol.js";
 import type { BoundaryRequest } from "../src/harness.js";
 import type {
@@ -533,11 +534,12 @@ function makeExecutor(
   rig: { client: FakeClient; deps: CodexExecutorDeps },
   binding: CodexBinding,
   log: Logger = noopLog,
+  dockerWiring?: DockerWiring,
 ): CodexExecutor {
   return new CodexExecutor(
     log,
     "/data/agent-home/run-1",
-    { binding, client: rig.client as never, provider },
+    { binding, client: rig.client as never, provider, dockerWiring },
     rig.deps,
   );
 }
@@ -3967,8 +3969,127 @@ describe("CodexExecutor: new-root resume + session lifecycle (m4)", () => {
 // /opt/uzi-toolchain/bin + system dirs come FIRST, the run's allowlisted provisioned
 // toolEnv is folded in (PATH appended, nix vars folded), and nothing breaches the
 // boundary literals or inherits process.env.
+describe("CodexExecutor: Docker wiring", () => {
+  const host = "unix:///run/dind/docker.sock";
+  const toolEnv = {
+    DOCKER_HOST: "tcp://other:2375",
+    DOCKER_CONTEXT: "other",
+    DOCKER_CONFIG: "/tmp/other-config",
+    NIX_SSL_CERT_FILE: "/nix/cert",
+  };
+  const noDaemonReason = "denied by guardrail: docker requires a daemon sidecar, which this worker has none wired";
+  const redirectReason = "denied by guardrail: redirecting the docker client to a different daemon is not permitted";
+  const reply = (rig: Rig, id: number): { success?: boolean; contentItems?: { text?: string }[] } =>
+    rec(rec(rig.transport.responses.find((r) => r.requestId === id)?.response).result) as { success?: boolean; contentItems?: { text?: string }[] };
+  const success = (rig: Rig, id: number): boolean => reply(rig, id).success === true;
+  const deniedFor = (rig: Rig, id: number, reason: string): void => {
+    assert.equal(reply(rig, id).success, false);
+    assert.equal(reply(rig, id).contentItems?.[0]?.text, reason, `callback ${id} denial reason`);
+  };
+
+  async function runRoot(wiring: DockerWiring | undefined, commands: string[]): Promise<Rig> {
+    const rig = makeRig();
+    rig.deps = { ...rig.deps, provisionRunTools: async () => ({ toolEnv }) };
+    rig.transport.push(threadStarted());
+    commands.forEach((command, i) => {
+      rig.transport.push(toolCall(i + 1, "Bash", { command }, "th-1", "tn-1", `docker-${i}`));
+    });
+    rig.transport.push(signalDone()).push(turnCompleted("completed")).end();
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION), noopLog, wiring).run(makeCtx().ctx), 3000, "docker callbacks");
+    return rig;
+  }
+
+  it("denies an unwired docker ps and excludes hostile Docker env keys", async () => {
+    const rig = await runRoot(undefined, ["docker ps"]);
+    deniedFor(rig, 1, noDaemonReason);
+    assert.equal(rig.spawnCommandCalls.length, 0);
+    const env = rig.fileopSpawns[0]!.env;
+    assert.equal(env.DOCKER_HOST, undefined);
+    assert.equal(env.DOCKER_CONTEXT, undefined);
+    assert.equal(env.DOCKER_CONFIG, undefined);
+    assert.equal(env.NIX_SSL_CERT_FILE, "/nix/cert");
+  });
+
+  it("allows wired docker ps with the trusted host and denies daemon redirects", async () => {
+    const rig = await runRoot({ dockerHost: host }, [
+      "docker ps",
+      "docker -H tcp://other:2375 ps",
+      "DOCKER_HOST=tcp://other:2375 docker ps",
+      "DOCKER_CONTEXT=other docker ps",
+      "docker context use other",
+      "export DOCKER_HOST=tcp://other:2375; docker ps",
+    ]);
+    assert.equal(success(rig, 1), true);
+    for (let id = 2; id <= 6; id++) deniedFor(rig, id, redirectReason);
+    assert.equal(rig.spawnCommandCalls.length, 1);
+    for (const env of [rig.fileopSpawns[0]!.env, (rig.spawnCommandCalls[0]!.opts as { env: NodeJS.ProcessEnv }).env]) {
+      assert.equal(env.DOCKER_HOST, host);
+      assert.equal(env.DOCKER_CONTEXT, undefined);
+      assert.equal(env.DOCKER_CONFIG, undefined);
+      assert.equal(env.NIX_SSL_CERT_FILE, "/nix/cert");
+    }
+  });
+
+  for (const wiring of [undefined, { dockerHost: host }]) it(`passes the ${wiring ? "wired" : "unwired"} policy to a delegated child`, async () => {
+    const agents: AgentTemplate[] = [
+      { name: "lead", description: "lead", prompt_body: "lead", tools: null, skills: [] },
+      { name: "coder", description: "coder", prompt_body: "coder", tools: null, skills: [] },
+    ];
+    const responder: Responder = (c) => {
+      if (c.method === "thread/start") return { thread: { id: c.threadStartCount === 1 ? "th-1" : "th-child" } };
+      if (c.method === "turn/start") {
+        if (c.turnStartCount === 1) return { turn: { id: "tn-1" } };
+        c.transport.push(toolCall(11, "uzi_bash", { command: "docker ps" }, "th-child", "tn-child", "child-docker"))
+          .push(toolCall(12, "uzi_bash", { command: "docker --host tcp://other:2375 ps" }, "th-child", "tn-child", "child-redirect"))
+          .push(turnCompleted("completed", "th-child", "tn-child"));
+        return { turn: { id: "tn-child" } };
+      }
+      return {};
+    };
+    const rig = makeRig({ responder });
+    rig.deps = { ...rig.deps, provisionRunTools: async () => ({ toolEnv }) };
+    rig.transport.push(threadStarted())
+      .push(toolCall(1, "spawn_agent", { role: "coder", prompt: "check docker" }, "th-1", "tn-1", "spawn"));
+    const run = makeExecutor(rig, bindingOf(SUBSCRIPTION), noopLog, wiring).run(makeCtx({ agents }).ctx);
+    await waitFor(() => rig.transport.responses.some((r) => r.requestId === 1), "child completion");
+    rig.transport.push(signalDone()).push(turnCompleted("completed")).end();
+    await withTimeout(run, 3000, "child docker run");
+    if (wiring) {
+      assert.equal(success(rig, 11), true);
+      deniedFor(rig, 12, redirectReason);
+      assert.equal(rig.spawnCommandCalls.length, 1);
+      assert.equal((rig.spawnCommandCalls[0]!.opts as { env: NodeJS.ProcessEnv }).env.DOCKER_HOST, host);
+    } else {
+      deniedFor(rig, 11, noDaemonReason);
+      deniedFor(rig, 12, noDaemonReason);
+      assert.equal(rig.spawnCommandCalls.length, 0);
+      assert.equal(rig.fileopSpawns[0]!.env.DOCKER_HOST, undefined);
+    }
+  });
+});
+
 describe("CodexExecutor: credential-free command env (item 6)", () => {
   const FIXED_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/uzi-toolchain/bin";
+
+  it("accepts only a trusted Docker host after folding hostile toolEnv keys", () => {
+    const hostile = {
+      DOCKER_HOST: "tcp://other:2375",
+      DOCKER_CONTEXT: "other",
+      DOCKER_CONFIG: "/tmp/other-config",
+      NIX_SSL_CERT_FILE: "/nix/cert",
+    };
+    const unwired = buildCommandEnv("/private/tmp", hostile);
+    assert.equal(unwired.DOCKER_HOST, undefined);
+    assert.equal(unwired.DOCKER_CONTEXT, undefined);
+    assert.equal(unwired.DOCKER_CONFIG, undefined);
+    assert.equal(unwired.NIX_SSL_CERT_FILE, "/nix/cert");
+
+    const wired = buildCommandEnv("/private/tmp", hostile, "unix:///run/dind/docker.sock");
+    assert.equal(wired.DOCKER_HOST, "unix:///run/dind/docker.sock");
+    assert.equal(wired.DOCKER_CONTEXT, undefined);
+    assert.equal(wired.DOCKER_CONFIG, undefined);
+    assert.equal(wired.NIX_SSL_CERT_FILE, "/nix/cert");
+  });
 
   it("puts the fixed toolchain+system dirs FIRST and APPENDS the provisioned PATH (fail-old/pass-fixed on /opt/uzi-toolchain/bin)", () => {
     const env = buildCommandEnv("/private/tmp", {

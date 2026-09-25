@@ -44,6 +44,7 @@ import type { Readable, Writable } from "node:stream";
 
 import type { Logger } from "../log.js";
 import type { WorkerClient } from "../client.js";
+import type { DockerWiring } from "../docker-wiring.js";
 import { PlanRejectedError, type EmittedMessage, type Executor, type ExecutorResult, type RunContext, type WallParkOutcome, type WallParkRefresh } from "../executor.js";
 import { PauseNowSignal } from "../steering.js";
 import { makeMemoryToolHandlers, memoryToolNames, type MemoryToolHandlers } from "../memory-tools.js";
@@ -183,7 +184,8 @@ const COMMAND_ENV_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbi
  *  identity pins these, and sdk-env.ts's PROTECTED_ENV_KEYS deliberately OMITS
  *  PATH/TMPDIR/LANG, so relying on it alone would leave those open) with a MIRROR of that
  *  module-private PROTECTED_ENV_KEYS set (the OAuth credential + the two ANTHROPIC_* keys +
- *  the browser flag). So a hostile/malformed `toolEnv` can neither breach the command
+ *  the browser flag), plus Docker endpoint/configuration keys owned by trusted startup wiring.
+ *  So a hostile/malformed `toolEnv` can neither breach the command
  *  boundary NOR reintroduce a credential-adjacent key. PATH is additionally handled
  *  specially in {@link buildCommandEnv} (fixed prefix, provisioned value appended). */
 const COMMAND_ENV_PROTECTED_KEYS: ReadonlySet<string> = new Set([
@@ -192,6 +194,10 @@ const COMMAND_ENV_PROTECTED_KEYS: ReadonlySet<string> = new Set([
   "TMPDIR",
   "LANG",
   "HOME",
+  // Only startup-resolved DockerWiring may supply the daemon endpoint.
+  "DOCKER_HOST",
+  "DOCKER_CONTEXT",
+  "DOCKER_CONFIG",
   // Issue #1598: the per-run command cache variables. Only commandEffectSpec sets them,
   // and only to the run's held cache; a provisioned toolEnv can never point a command's
   // module/build/npm cache anywhere else. NPM_CONFIG_CACHE is npm's upper-case spelling
@@ -1267,6 +1273,8 @@ export interface CodexExecutorOptions {
   readonly binding: CodexBinding;
   readonly client: WorkerClient;
   readonly provider: CodexProviderConfig;
+  /** Startup-resolved Docker capability shared with the worker. */
+  readonly dockerWiring?: DockerWiring;
   /** The SHARED worker-lifetime provisioning HOME (PRD #42 Decision 5), deliberately
    *  distinct from the per-run `homeRoot`: the nix/devbox provisioning subprocess sets
    *  HOME to this, so keeping it worker-lifetime (not per-run) stops the nix profile /
@@ -1579,6 +1587,7 @@ export class CodexExecutor implements Executor {
       const commandEnv: NodeJS.ProcessEnv = buildCommandEnv(
         this.deps.commandTmpdir ?? "/tmp",
         provisioned.toolEnv,
+        this.opts.dockerWiring?.dockerHost,
       );
 
       // Issue #1598: hold ONE per-run command cache BEFORE any command root can launch (the
@@ -1673,7 +1682,7 @@ export class CodexExecutor implements Executor {
         // it. The provision root (dirname(homeRoot)/provision) and codex-session-store are
         // deliberately NOT added, and no `$CODEX_HOME` literal is used (D6 forbids paths derived
         // from model arguments).
-        screenPolicy: { dockerWired: false, extraSecretPaths: [path.join(this.homeRoot, "codex-data") + path.sep] },
+        screenPolicy: { dockerWired: this.opts.dockerWiring?.dockerHost !== undefined, extraSecretPaths: [path.join(this.homeRoot, "codex-data") + path.sep] },
         toolHandlers,
         registerToken,
         // Issue #1583: BOTH secret sets are scrubbed before a projection is bounded — the claim
@@ -3020,12 +3029,13 @@ export function commandSandboxArgv(
  *     `toolEnv.PATH` is APPENDED after them, so provisioned tools resolve but can never
  *     displace or drop the boundary dirs (the fixed prefix always wins on a collision).
  *   - the OTHER allowlisted vars (NIX_SSL_CERT_FILE / LOCALE_ARCHIVE) are folded in.
+ *   - an optional startup-resolved Docker host is set after the toolEnv fold.
  *   - a `toolEnv` entry can NEVER overwrite a boundary literal (PATH/TMPDIR/LANG/HOME) or a
  *     PROTECTED_ENV_KEYS member — {@link COMMAND_ENV_PROTECTED_KEYS} unions both, because
  *     PROTECTED_ENV_KEYS alone omits PATH/TMPDIR/LANG. `commandEffectSpec` later overrides
  *     HOME/TMPDIR to the per-command private tmp, so those stay boundary-safe regardless.
  */
-export function buildCommandEnv(tmpdir: string, toolEnv: Record<string, string>): NodeJS.ProcessEnv {
+export function buildCommandEnv(tmpdir: string, toolEnv: Record<string, string>, dockerHost?: string): NodeJS.ProcessEnv {
   const provisionedPath = toolEnv.PATH;
   const env: NodeJS.ProcessEnv = {
     // The fixed boundary dirs come first; a provisioned PATH is appended (never prepended,
@@ -3038,6 +3048,7 @@ export function buildCommandEnv(tmpdir: string, toolEnv: Record<string, string>)
     if (COMMAND_ENV_PROTECTED_KEYS.has(k)) continue; // never breach the boundary / reintroduce a credential key
     env[k] = v;
   }
+  if (dockerHost !== undefined) env.DOCKER_HOST = dockerHost;
   return env;
 }
 
