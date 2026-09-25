@@ -151,8 +151,12 @@ func TestWorkerCodexRoutesReleaseAndRefreshLiveDB(t *testing.T) {
 	}
 	capabilitySecret := "route-capability-" + uuid.NewString()
 	capabilityHash := sha256.Sum256([]byte(capabilitySecret))
+	seeded, err := q.GetRunByID(ctx, runID)
+	if err != nil {
+		t.Fatalf("read seeded run: %v", err)
+	}
 	epoch, err := q.SetRunCodexClaimCapability(ctx, store.SetRunCodexClaimCapabilityParams{
-		Hash: capabilityHash[:], ID: runID, WorkerID: pgconv.UUID(workerID),
+		Hash: capabilityHash[:], ID: runID, WorkerID: pgconv.UUID(workerID), ClaimGeneration: seeded.ClaimGeneration,
 	})
 	if err != nil {
 		t.Fatalf("mint capability: %v", err)

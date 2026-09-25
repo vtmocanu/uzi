@@ -681,12 +681,17 @@ func seedAPIKey(ctx context.Context, pool *pgxpool.Pool, q *store.Queries, box *
 
 // mintCapability mints a run's per-claim Codex capability the same way the live-DB test
 // does: a random secret, its sha256 stored via SetRunCodexClaimCapability, and the wire
-// form "<epoch>.<secret>" the worker presents.
+// form "<epoch>.<secret>" the worker presents. The mint is fenced on the run's claim
+// generation, so it reads the seeded run's CURRENT generation and mints at it.
 func mintCapability(ctx context.Context, q *store.Queries, runID, workerID uuid.UUID, prefix string) (string, error) {
+	run, err := q.GetRunByID(ctx, runID)
+	if err != nil {
+		return "", fmt.Errorf("read run for mint: %w", err)
+	}
 	secret := prefix + uuid.NewString()
 	hash := sha256.Sum256([]byte(secret))
 	epoch, err := q.SetRunCodexClaimCapability(ctx, store.SetRunCodexClaimCapabilityParams{
-		Hash: hash[:], ID: runID, WorkerID: pgconv.UUID(workerID),
+		Hash: hash[:], ID: runID, WorkerID: pgconv.UUID(workerID), ClaimGeneration: run.ClaimGeneration,
 	})
 	if err != nil {
 		return "", fmt.Errorf("mint capability: %w", err)

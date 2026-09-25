@@ -50,7 +50,8 @@ const codexCoordQuarantined = "quarantined"
 // the awaiting_* parks are a worker still holding the run, and D4 requires
 // persist-before-park, so a park must be able to persist recovery material. recovery_wait
 // is a MID-EXECUTION park like limit_wait (a running worker parked the run on a transient
-// recovery), so it belongs here — unlike the pre-execution 'pool_wait' below. The following
+// recovery). A pre-execution codex_account_unavailable recovery_wait also belongs here:
+// its park revokes the capability, so no credential operation can use it. The following
 // are deliberately EXCLUDED, all on the
 // same principle (no worker is actively executing the run, so no live capability should
 // be honored): 'queued' — the requeue gap where the run was handed back and no worker
@@ -156,8 +157,9 @@ var (
 	// the run froze it (the alias was manually replaced), invalidating the run.
 	ErrCodexMaterialRevisionStale = errors.New("codex alias material revision is stale")
 	// ErrCodexAccountKeyUnfrozen: a subscription run has no frozen account identity
-	// tuple yet (NULL codex_account_key) — not-yet-runnable. Rejected so a later
-	// replacement that resolves to a different account cannot retarget the run.
+	// tuple (NULL codex_account_key). Nothing freezes it after create (PRD #1590 D2
+	// as-built), so such a run is never runnable. Rejected so a later replacement that
+	// resolves to a different account cannot retarget the run.
 	ErrCodexAccountKeyUnfrozen = errors.New("codex run account identity is not frozen")
 	// ErrCodexAccountTupleMismatch: the run's frozen account identity tuple no longer
 	// equals the account's current (provider_user_id, workspace_account_id) — a
@@ -166,6 +168,11 @@ var (
 	// ErrCodexAccountRevisionStale: the account's credential_revision has advanced since
 	// the run froze it — a genuine account-level revoke.
 	ErrCodexAccountRevisionStale = errors.New("codex account credential revision is stale")
+	// ErrCodexAliasAccountMissing: a linked alias has no provider account behind it (a NULL
+	// provider_account_id, or no account columns in the authority read). The PRD #1590
+	// promoter fails a held run on a linked alias with no account as an incoherent alias;
+	// classifyCodexAccountHold keeps a read with no account columns held.
+	ErrCodexAliasAccountMissing = errors.New("codex alias is linked to no provider account")
 	// ErrCodexAccountQuarantined: the run's subscription account is parked in the
 	// 'quarantined' coord_state (a refresh commit failed into the recovery slot). No
 	// access token may be released or refresh started until it is reconciled or
@@ -409,7 +416,7 @@ func codexCheckMaterialRev(in codexReleaseInputs) error {
 
 // codexCheckAccountTuple enforces that a subscription run's frozen identity tuple is
 // present and still equals the account's current (provider_user_id, workspace_account_id).
-// A NULL frozen tuple is ErrCodexAccountKeyUnfrozen (not-yet-runnable); a NULL current
+// A NULL frozen tuple is ErrCodexAccountKeyUnfrozen (never runnable); a NULL current
 // tuple or a differing tuple is ErrCodexAccountTupleMismatch (a replacement resolved
 // elsewhere). Both sides encode through the single codexAccountKey encoder so the two can
 // never serialize the same tuple differently.
@@ -738,9 +745,10 @@ func (s *Service) freezeCodexBinding(ctx context.Context, q codexFreezeStore, us
 		AuthMode:         authMode,
 		SecretLabel:      meta.Label,
 		MaterialRevision: st.MaterialRevision,
-		// The identity tuple/revision are frozen by SetRunCodexFrozenIdentity below when
-		// known; a run whose subscription account is not yet linked stays unfrozen (and
-		// so not-yet-runnable) until then.
+		// The identity tuple/revision are frozen by SetRunCodexFrozenIdentity below, and
+		// only when the alias is already linked. Nothing freezes them after create, so a
+		// run whose subscription account is not linked here stays unfrozen for good and
+		// fails ErrCodexAccountKeyUnfrozen (PRD #1590 D2 as-built).
 		AccountKey:      pgtype.Text{},
 		AccountRevision: pgtype.Int8{},
 		ID:              runID,
@@ -760,8 +768,9 @@ func (s *Service) freezeCodexBinding(ctx context.Context, q codexFreezeStore, us
 
 	// For a linked subscription alias, freeze the identity tuple + account revision now
 	// so the authority check has a frozen baseline. A staging alias (no account yet) and
-	// every api_key alias leave the tuple NULL — which the authority check treats as
-	// not-yet-runnable for subscription, and simply skips for api_key.
+	// every api_key alias leave the tuple NULL — which the authority check refuses for
+	// subscription (ErrCodexAccountKeyUnfrozen; nothing freezes it later), and simply
+	// skips for api_key.
 	if authMode == codexAuthModeSubscription && st.ProviderAccountID.Valid {
 		acct, aerr := q.GetCodexProviderAccountByID(ctx, store.GetCodexProviderAccountByIDParams{
 			UserID: userID,
@@ -825,7 +834,7 @@ func (s *Service) codexFreezeZeroRows(ctx context.Context, q codexFreezeStore, r
 // run whose codex_secret_id was nulled by alias deletion still routes here and fails closed rather
 // than assembling a Claude claim); an ordinary Claude run skips this entirely and its claim JSON
 // stays byte-identical.
-func (s *Service) codexClaimSecrets(ctx context.Context, wkr store.Worker, run store.Run) (*ClaimCodexSecrets, error) {
+func (s *Service) codexClaimSecrets(ctx context.Context, wkr store.Worker, run store.Run) (secrets *ClaimCodexSecrets, claimErr error) {
 	q, ok := s.codexStore()
 	if !ok {
 		return nil, errCodexStoreUnavailable
@@ -856,23 +865,35 @@ func (s *Service) codexClaimSecrets(ctx context.Context, wkr store.Worker, run s
 		return nil, perr
 	}
 
-	// Mint the per-claim capability and store its hash worker-scoped, bumping the epoch.
-	// 0 rows means this worker no longer owns the run (a requeue reclaimed it between the
-	// claim read and here) — treat it as the run vanishing under us.
+	// Mint the per-claim capability and store its hash worker-scoped and generation-fenced,
+	// bumping the epoch. 0 rows means this claim attempt no longer owns the run (a requeue
+	// reclaimed it between the claim read and here, possibly by this same worker at a newer
+	// claim generation) — treat it as the run vanishing under us. run is the row ClaimRun
+	// returned, so run.ClaimGeneration is this attempt's own generation.
 	plaintext, hash := mintCodexCapability()
 	epoch, err := q.SetRunCodexClaimCapability(ctx, store.SetRunCodexClaimCapabilityParams{
-		Hash:     hash,
-		ID:       run.ID,
-		WorkerID: pgconv.UUID(wkr.ID),
+		Hash:            hash,
+		ID:              run.ID,
+		WorkerID:        pgconv.UUID(wkr.ID),
+		ClaimGeneration: run.ClaimGeneration,
 	})
 	if err != nil {
-		// The :one mint returns pgx.ErrNoRows when no row matched — this worker no longer
-		// owns the run (a requeue reclaimed it between the claim read and here); treat it
-		// as the run vanishing under us.
+		// The :one mint returns pgx.ErrNoRows when no row matched — this attempt no longer
+		// owns the run (a requeue reclaimed it between the claim read and here, or a newer
+		// claim generation superseded it); treat it as the run vanishing under us.
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, errRunVanished
 		}
-		return nil, fmt.Errorf("codex claim: mint capability: %w", err)
+		return nil, fmt.Errorf("%w: %v", errCodexMintAmbiguous, err)
+	}
+	// Carry the persisted mint identity privately through any later assembly error.
+	defer func() {
+		if claimErr != nil {
+			claimErr = &codexMintedClaimError{cause: claimErr, epoch: epoch, hash: hash}
+		}
+	}()
+	if h := s.claimHooks; h != nil && h.afterMint != nil {
+		h.afterMint(ctx, run)
 	}
 	// Wire the capability off the PERSISTED post-bump epoch the mint returned, not a
 	// re-derived value: the stored epoch is authoritative.
@@ -884,7 +905,7 @@ func (s *Service) codexClaimSecrets(ctx context.Context, wkr store.Worker, run s
 	// read and the mint would otherwise still open and ship a now-wrong credential. This
 	// re-check re-asserts worker-ownership + the full release predicate so a run whose
 	// authority lapsed in that window opens NOTHING.
-	if rerr := s.reauthorizeCodexRelease(ctx, q, run.ID, wkr, epoch, hash, false); rerr != nil {
+	if rerr := s.reauthorizeCodexRelease(ctx, q, run.ID, wkr, run.ClaimGeneration, epoch, hash, false); rerr != nil {
 		return nil, rerr
 	}
 
@@ -973,7 +994,7 @@ func (s *Service) codexClaimSecrets(ctx context.Context, wkr store.Worker, run s
 	// before any plaintext leaves the function. (A true requeue moves status to 'queued' and
 	// is already rejected by the actively-claimed predicate above — Barrier A / this read's
 	// evalCodexReleasePredicate — never reaching the epoch/hash compare.)
-	if rerr := s.reauthorizeCodexRelease(ctx, q, run.ID, wkr, epoch, hash, true); rerr != nil {
+	if rerr := s.reauthorizeCodexRelease(ctx, q, run.ID, wkr, run.ClaimGeneration, epoch, hash, true); rerr != nil {
 		return nil, rerr
 	}
 
@@ -999,13 +1020,18 @@ func (s *Service) codexClaimSecrets(ctx context.Context, wkr store.Worker, run s
 // case; a true requeue (status to 'queued', capability revoked) is caught a step earlier by
 // the actively-claimed predicate, so do NOT weaken that predicate assuming this covers it.
 //
+// Unconditionally (both barriers) the run's live claim_generation must still equal
+// expectedGeneration, the generation of the ClaimRun this attempt holds: a requeue plus a
+// same-worker reclaim leaves worker_id and an actively-claimed status in place, so only the
+// generation tells this attempt apart from the newer claim (PRD #1590).
+//
 // Error mapping mirrors the initial read and stays compatible with claim_assembly.go's
 // routing: pgx.ErrNoRows → ErrCodexRunNotBound; a failed predicate returns its own
 // distinct sentinel; a lost ownership returns ErrCodexWorkerMismatch; a superseded
-// epoch/hash returns errRunVanished (the capability we minted is no longer the live one —
-// a same-worker re-mint superseded it). None of these is errVaultLocked, so a stale-state
+// epoch/hash or a moved claim generation returns errRunVanished (the capability we minted is
+// no longer the live one, or a newer claim of the run superseded this attempt). None of these is errVaultLocked, so a stale-state
 // rejection never masquerades as a transient vault-lock requeue.
-func (s *Service) reauthorizeCodexRelease(ctx context.Context, q codexAuthzStore, runID uuid.UUID, wkr store.Worker, mintedEpoch int64, mintedHash []byte, checkCapability bool) error {
+func (s *Service) reauthorizeCodexRelease(ctx context.Context, q codexAuthzStore, runID uuid.UUID, wkr store.Worker, expectedGeneration, mintedEpoch int64, mintedHash []byte, checkCapability bool) error {
 	row, err := q.GetRunCodexAuthContext(ctx, runID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -1018,6 +1044,11 @@ func (s *Service) reauthorizeCodexRelease(ctx context.Context, q codexAuthzStore
 	}
 	if !row.WorkerID.Valid || uuid.UUID(row.WorkerID.Bytes) != wkr.ID {
 		return ErrCodexWorkerMismatch
+	}
+	if row.ClaimGeneration != expectedGeneration {
+		// A newer claim of the run (requeue + reclaim, possibly by this same worker) owns it
+		// now; this attempt's authority lapsed with its generation.
+		return errRunVanished
 	}
 	if checkCapability {
 		// The capability we minted must still be the live one. A same-worker re-mint (status

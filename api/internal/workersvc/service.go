@@ -862,11 +862,6 @@ type Store interface {
 	// RequeueClaimedRunToQueued resets one just-claimed run to queued when its
 	// owner's vault locked between the claim gate and the token open (PRD #32 M3).
 	RequeueClaimedRunToQueued(ctx context.Context, id uuid.UUID) (int64, error)
-	// SetRunPoolWait holds one just-claimed `auto` run whose token pool is genuinely
-	// empty (PRD #754 M4). claimed → pool_wait, a non-locking hold; positive source
-	// guard (status='claimed'), keeps worker_id for affinity, and does NOT touch the
-	// usage-limit budget (an empty pool is not a usage park). M5 resumes it.
-	SetRunPoolWait(ctx context.Context, arg store.SetRunPoolWaitParams) (int64, error)
 	// HasActiveRunForIssue reports whether the issue already has a non-terminal run.
 	// CreateRun uses it as the manual-path dedup pre-check that replaces the
 	// uq_runs_one_active_per_issue index for pool_wait runs (PRD #754 M4 Decision 8):
@@ -1660,6 +1655,20 @@ type Service struct {
 	// to the real freeze — so the seam is inert unless a test sets it, matching the
 	// publishFn/deleteCheckpointFn/background seam idiom above.
 	codexFreezeFn func(ctx context.Context, q codexFreezeStore, userID, runID, secretID uuid.UUID, authMode string) error
+	// claimHooks are the run-lane claim race seams (PRD #1590 M1): a LiveDB test injects a
+	// concurrent account or claim mutation between ClaimRun and assembly, after the Codex mint,
+	// or between assembly and the final exact-claim transaction. Nil in production, so every
+	// hook is inert unless a test sets it (the codexFreezeFn idiom above).
+	claimHooks *claimTestHooks
+	// codexPark is the park_codex_account_unavailable pass's in-memory keyset cursor (PRD
+	// #1590 M2, D2): the last queued Codex subscription run id the pass examined. Zero value is
+	// the start of the id space. Restart-losing by design: losing it only restarts the scan.
+	codexPark codexAccountPageCursor
+	// codexPromote is the promote_codex_account_available pass's keyset cursor (PRD #1590 M3,
+	// D3) over the held codex_account_unavailable set, with the same restart-losing semantics.
+	codexPromote codexAccountPageCursor
+	// codexPromoteHooks are the promotion pass's LiveDB race seams (nil in production).
+	codexPromoteHooks *codexPromoteTestHooks
 	// readyAt is the moment the worker-facing listener(s) became ready (PRD #1390 M1, D1),
 	// stored as Unix nanoseconds (0 = not yet ready). main.go writes it via SetReadyAt after
 	// binding every enabled listener; the sweeper goroutine reads it each tick to anchor the
@@ -2399,7 +2408,9 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker, snapshot *ActiveS
 	// TODAY'S path — a single auto-commit ClaimRun, then assembleClaim. The predicate params above
 	// still apply, so an old worker gets the persisted-snapshot exclusions and the overflow closure;
 	// only the claimant guard (the flagged-worker-itself refusal) and the request pre-lock are
-	// snapshot-only, and an old worker is never flagged and lists nothing.
+	// snapshot-only, and an old worker is never flagged and lists nothing. Either path ends in
+	// finishRunClaim's exact-claim transaction (PRD #1590 M1), which refuses with no payload
+	// when no tx beginner is wired, so a fake-store claim never delivers or mutates unfenced.
 	if snapshot == nil || s.txBeginner == nil {
 		run, err := s.q.ClaimRun(ctx, params)
 		if err != nil {
@@ -2408,11 +2419,7 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker, snapshot *ActiveS
 			}
 			return nil, err
 		}
-		payload, err := s.assembleClaim(ctx, wkr, run)
-		if err != nil {
-			return nil, s.recoverClaimAssembly(ctx, run, err)
-		}
-		return payload, nil
+		return s.assembleAndFinishRunClaim(ctx, wkr, run, params.RecoveryCapable)
 	}
 
 	// Snapshot carried + tx beginner: ONE transaction in the canonical lock order (D8), so a
@@ -2487,11 +2494,7 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker, snapshot *ActiveS
 		return nil, err
 	}
 	committed = true
-	payload, err := s.assembleClaim(ctx, wkr, run)
-	if err != nil {
-		return nil, s.recoverClaimAssembly(ctx, run, err)
-	}
-	return payload, nil
+	return s.assembleAndFinishRunClaim(ctx, wkr, run, params.RecoveryCapable)
 }
 
 // requestActivePairs extracts the index-aligned (run_id, claim_generation) pairs a claim's request
@@ -2516,9 +2519,11 @@ func requestActivePairs(snap *ActiveSnapshot) ([]uuid.UUID, []int64) {
 	return ids, gens
 }
 
-// recoverClaimAssembly turns a failed claim assembly (run OR chat lane) into the
-// right terminal/transient outcome, always reporting idle (nil payload) to the
-// caller so a broken claim never wedges the worker's poll loop:
+// recoverClaimAssembly turns a failed CHAT-lane claim assembly into the right
+// terminal/transient outcome, always reporting idle (nil payload) to the caller so a
+// broken claim never wedges the worker's poll loop. The run lane no longer comes here:
+// since PRD #1590 M1 every run-lane outcome settles in finishRunClaim's exact-claim
+// transaction (claim_recovery.go), whose fenced writers mirror these arms:
 //   - a locked vault is transient — reset the just-claimed run to queued (never
 //     fail it), keeping worker_id for affinity and NOT bumping requeue_count, so a
 //     persistently locked vault can't trip the requeue cap (mirrors
@@ -2527,6 +2532,10 @@ func requestActivePairs(snap *ActiveSnapshot) ([]uuid.UUID, []int64) {
 //     guardrail block at claim (D1 layer 3), are terminal — fail the run with the
 //     safe (no-secret-bytes) reason and fire the failed notify;
 //   - a vanished run (its forge connection cascade-deleted the repo → run) is dropped.
+//
+// A chat spends the owner's default token and has no custom Codex root, so it produces
+// neither errAutoPoolEmpty nor errCustomModelCapabilityMissing and has no arm for them:
+// either would fall through to the default and propagate.
 //
 // The returned error is nil for every handled case (report idle) and non-nil only
 // for an unexpected error the caller must propagate.
@@ -2537,34 +2546,6 @@ func (s *Service) recoverClaimAssembly(ctx context.Context, run store.Run, err e
 			return rerr
 		}
 		return nil // idle; the run is queued again, awaiting unlock
-	case errors.Is(err, errAutoPoolEmpty):
-		// An auto claim with a genuinely empty pool must not spend the non-pooled default
-		// nor hard-fail (PRD #754). It is HELD in the non-locking pool_wait status (M4,
-		// replacing M2's interim requeue): SetRunPoolWait keeps worker_id for affinity,
-		// does not touch the usage-limit budget, and — unlike the requeue — does not churn
-		// the queue. The run is idle (nil payload) exactly as before; M5 adds the reactive
-		// + manual resume off pool_wait. Still "never spends the default, never hard-fails".
-		// Positive source guard (status='claimed'), so a re-delivered claim is a no-op.
-		if _, rerr := s.q.SetRunPoolWait(ctx, store.SetRunPoolWaitParams{
-			ID:       run.ID,
-			WorkerID: run.WorkerID,
-		}); rerr != nil {
-			return rerr
-		}
-		return nil // idle; the run is held in pool_wait, awaiting a pooled token
-	case errors.Is(err, errCustomModelCapabilityMissing):
-		// PRD #1551 M4 (D6): assembly found this Codex run's effective root is a CUSTOM model but
-		// the claiming worker lacks codex_custom_model_v1 (the owner's lane flipped custom in the
-		// window between the claim's SQL gate and assembly). REQUEUE — never fail, never run Astra:
-		// keep worker_id for resume affinity and do NOT bump requeue_count (mirroring the
-		// vault-locked path). ClaimRun's custom-model clause excludes this incapable worker,
-		// while affinity holds capable peers until the worker row disappears or the configured
-		// ceiling expires. Clearing worker_id here would allow a cold peer to bypass the PVC
-		// holding a resumed run's unpublished work. This bounded wait is the approved M4 tradeoff.
-		if _, rerr := s.q.RequeueClaimedRunToQueued(ctx, run.ID); rerr != nil {
-			return rerr
-		}
-		return nil // idle; the run is queued again, awaiting a custom-Codex-capable worker
 	case errors.Is(err, errCredentialUnavailable) || errors.Is(err, errToolPackagesRejected) || errors.Is(err, errGuardrailBlockedClaim):
 		// A guardrail block at claim (D1 layer 3) is TERMINAL — fail-closed even on a
 		// forge blip (R4; the user restarts after fixing protection), matching
@@ -2610,7 +2591,7 @@ var errRunVanished = errors.New("run vanished before claim assembly")
 
 // errCustomModelCapabilityMissing marks a Codex claim whose effective worker-root model is a
 // CUSTOM (non-curated) id that the claiming worker cannot run — it does not advertise
-// codex_custom_model_v1 (PRD #1551 M4, D6). recoverClaimAssembly treats it as a TRANSIENT
+// codex_custom_model_v1 (PRD #1551 M4, D6). finishRunClaim treats it as a TRANSIENT
 // requeue (like errVaultLocked, NOT the terminal errCredentialUnavailable): the run returns to
 // queued for a capable worker rather than failing or silently running Astra. Its message carries
 // no secret bytes.
@@ -2618,7 +2599,7 @@ var errCustomModelCapabilityMissing = errors.New("worker lacks codex_custom_mode
 
 // errGuardrailBlockedClaim marks a claim the #66 default-branch guardrail refused
 // AT CLAIM (D1 layer 3, the security net): the bot can reach the repo's default
-// branch, or that could not be verified (fail-closed). recoverClaimAssembly treats
+// branch, or that could not be verified (fail-closed). finishRunClaim treats
 // it as TERMINAL (like errCredentialUnavailable, not the transient errVaultLocked
 // requeue), so the run is failed rather than pushing. Its message is safe to store
 // as a run failure reason — it carries only the block finding messages, never any
@@ -2636,9 +2617,10 @@ var errVaultLocked = errors.New("vault locked during claim")
 // an empty pool, or a resuming run whose only pooled token is the excluded dead
 // credential (#754 M2). The auto lane must NEVER spend the non-pooled owner default,
 // and it must NOT hard-fail a run for a transient/holdable condition — so this is
-// HOLDABLE like errVaultLocked, and recoverClaimAssembly HOLDS the run in the
-// non-locking pool_wait status (PRD #754 M4, via SetRunPoolWait) rather than failing
-// it — M5 resumes it reactively or manually. Its message carries no secret bytes.
+// HOLDABLE like errVaultLocked, and finishRunClaim HOLDS the run in the
+// non-locking pool_wait status (PRD #754 M4, via RequeueClaimAssemblyExact's pool_wait
+// arm) rather than failing it — M5 resumes it reactively or manually. Its message
+// carries no secret bytes.
 var errAutoPoolEmpty = errors.New("auto pool is empty")
 
 // Worker Anthropic bind modes (PRD #111 M3, D1), mirroring migration 00088's CHECK.
@@ -3213,6 +3195,9 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	// legacy untyped park). Only forge_unreachable triggers the dedicated park transaction
 	// below; empty_turn/provider_outage are accepted here (reserved, D9) but take the ordinary
 	// untyped park, which writes cause NULL.
+	if req.RecoveryCause != nil && serverRecoveryWaitCauses[*req.RecoveryCause] {
+		return store.Run{}, false, fmt.Errorf("%w: recovery_cause %q is server-only", ErrInvalidState, *req.RecoveryCause)
+	}
 	if req.RecoveryCause != nil && !recoveryWaitCauses[*req.RecoveryCause] {
 		return store.Run{}, false, fmt.Errorf("%w: unknown recovery_cause %q", ErrInvalidState, *req.RecoveryCause)
 	}
@@ -4922,7 +4907,7 @@ func (s *Service) CreateWorker(ctx context.Context, userID uuid.UUID, name, temp
 	// else `default`. So a pooled-up owner's new worker spends the pool by default
 	// instead of the owner's single default token. This choice happens at creation,
 	// not at every claim: removing the pooled tokens later leaves an auto worker in
-	// auto mode, and recoverClaimAssembly holds its run in pool_wait on errAutoPoolEmpty.
+	// auto mode, and finishRunClaim holds its run in pool_wait on errAutoPoolEmpty.
 	// Corrected 2026-09-08 against that claim-time branch; the former "never parks"
 	// comment incorrectly extended the creation-time pool check to later claims.
 	bindMode := BindModeDefault
@@ -6002,6 +5987,25 @@ type SweepResult struct {
 	// account is left in_progress with an already-terminal intent) is still observable — see
 	// SweepUnresolvedCodexRefresh.
 	CodexRefreshRecovered int64
+	// CodexAccountParked is the number of queued Codex subscription runs this pass moved to
+	// recovery_wait with cause codex_account_unavailable (PRD #1590 M2, D2): runs ClaimRun's
+	// account gate excludes because their account is quarantined or a re-login on their alias
+	// is in flight. Normally 0. Each tick examines at most one bounded page of queued Codex
+	// subscription runs, so a gated run deep in a large queue is parked within a few ticks.
+	CodexAccountParked int64
+	// CodexAccountPromoted is the number of codex_account_unavailable runs this pass returned
+	// from recovery_wait to queued (PRD #1590 M3, D3) because the unchanged release predicate
+	// passed on their alias and account, read under lock. Normally 0. Bounded by one page of
+	// held runs per tick.
+	CodexAccountPromoted int64
+	// CodexAccountReadmitted is how many of CodexAccountPromoted were first re-admitted after a
+	// verified same-identity re-login on their alias (PRD #1590 M4, D5: runs.codex_material_revision
+	// advanced to the alias's, with a feed status line). Normally 0.
+	CodexAccountReadmitted int64
+	// CodexAccountFailed is the number of codex_account_unavailable runs this pass failed
+	// credential_unavailable (PRD #1590 M4, D5): the alias was deleted while held, or a linked
+	// alias now names a different identity, credential revision, auth mode or kind. Normally 0.
+	CodexAccountFailed int64
 	// LimitPromoted is the number of runs this pass brought back from limit_wait to
 	// queued because their retry_not_before elapsed (PRD #35). Normally 0: the
 	// partial index this reads covers only parked runs, a set that is empty on a

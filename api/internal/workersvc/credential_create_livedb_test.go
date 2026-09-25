@@ -23,6 +23,8 @@ import (
 func TestCreateRunOverrideFirstClaimSpendsPinnedTokenLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	svc := New(env.q, env.box, testParams())
+	// PRD #1590 M1: the run-lane claim settles in an exact-claim transaction, as main.go wires it.
+	svc.SetTxBeginner(env.pool)
 
 	userID, workerID, repoID := env.seedCodexInfra(t)
 	// Claim opens the forge PAT alongside the Anthropic credential, so the placeholder PAT

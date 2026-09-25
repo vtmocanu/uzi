@@ -217,18 +217,18 @@ func TestClaimGuardrailBlocksAtClaim(t *testing.T) {
 	if guard.called != 1 {
 		t.Fatalf("guard called %d times, want 1", guard.called)
 	}
-	if f.fs.markedFailed == nil {
+	if f.fs.claimFailed == nil {
 		t.Fatal("a guardrail-blocked claim must mark the run failed")
 	}
-	if f.fs.markedFailed.ID != f.runID {
-		t.Fatalf("failed run id = %v, want %v", f.fs.markedFailed.ID, f.runID)
+	if f.fs.claimFailed.ID != f.runID {
+		t.Fatalf("failed run id = %v, want %v", f.fs.claimFailed.ID, f.runID)
 	}
-	if reason := f.fs.markedFailed.FailureReason.String; !strings.Contains(reason, "default-branch guardrail") {
+	if reason := f.fs.claimFailed.FailureReason.String; !strings.Contains(reason, "default-branch guardrail") {
 		t.Fatalf("failure reason = %q, want it to name the guardrail", reason)
 	}
 	// The block finding messages ride the reason (safe to store — no secret bytes),
 	// and never the PAT ciphertext.
-	if reason := f.fs.markedFailed.FailureReason.String; !strings.Contains(reason, "the bot can push to the default branch") {
+	if reason := f.fs.claimFailed.FailureReason.String; !strings.Contains(reason, "the bot can push to the default branch") {
 		t.Fatalf("failure reason = %q, want the block finding message", reason)
 	}
 	// A blocked claim aborts before openAnthropic, so no Anthropic credential is
@@ -257,8 +257,8 @@ func TestClaimGuardrailNotBlockedProceeds(t *testing.T) {
 	if guard.called != 1 {
 		t.Fatalf("guard called %d times, want 1", guard.called)
 	}
-	if f.fs.markedFailed != nil {
-		t.Fatalf("a cleared claim must not fail the run, got %+v", f.fs.markedFailed)
+	if f.fs.claimFailed != nil {
+		t.Fatalf("a cleared claim must not fail the run, got %+v", f.fs.claimFailed)
 	}
 }
 
@@ -298,8 +298,8 @@ func TestClaimNilGuardBackstopSkips(t *testing.T) {
 	if payload == nil {
 		t.Fatal("a nil guard must not block the claim, got idle")
 	}
-	if f.fs.markedFailed != nil {
-		t.Fatalf("a nil guard must not fail the run, got %+v", f.fs.markedFailed)
+	if f.fs.claimFailed != nil {
+		t.Fatalf("a nil guard must not fail the run, got %+v", f.fs.claimFailed)
 	}
 }
 

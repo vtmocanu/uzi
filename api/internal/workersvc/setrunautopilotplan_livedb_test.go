@@ -223,6 +223,8 @@ func TestSetRunAutopilotPlanLiveDB(t *testing.T) {
 		// spread bypass + affinity clauses in ClaimRun make it claimable by this worker).
 		exec(`UPDATE runs SET status = 'queued', started_at = NULL, claimed_at = NULL WHERE id = $1`, id)
 
+		// PRD #1590 M1: the run-lane claim settles in an exact-claim transaction, as main.go wires it.
+		svc.SetTxBeginner(pool)
 		payload, err := svc.Claim(ctx, wkr, nil)
 		if err != nil {
 			t.Fatalf("svc.Claim: %v", err)

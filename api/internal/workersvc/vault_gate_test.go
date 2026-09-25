@@ -166,10 +166,10 @@ func TestClaimLockRaceRequeuesNeverFails(t *testing.T) {
 	if payload != nil {
 		t.Fatal("expected idle after a lock race, got a payload")
 	}
-	if fs.requeuedRun == nil || *fs.requeuedRun != runID {
-		t.Fatalf("run not requeued to queued: %v", fs.requeuedRun)
+	if fs.claimRequeued == nil || fs.claimRequeued.PoolWait || fs.claimRequeued.ID != runID {
+		t.Fatalf("run not requeued to queued: %v", fs.claimRequeued)
 	}
-	if fs.markedFailed != nil {
+	if fs.claimFailed != nil {
 		t.Fatal("a lock race must NEVER fail the run (it is transient)")
 	}
 }

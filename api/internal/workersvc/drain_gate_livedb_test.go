@@ -50,6 +50,8 @@ func TestDrainGateLiveDB(t *testing.T) {
 	box := newBox(t)
 	q := store.New(pool)
 	svc := New(q, box, testParams())
+	// PRD #1590 M1: the run-lane claim settles in an exact-claim transaction, as main.go wires it.
+	svc.SetTxBeginner(pool)
 
 	exec := func(sql string, args ...any) {
 		t.Helper()

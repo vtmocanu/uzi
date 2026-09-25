@@ -68,6 +68,8 @@ func seedRunInStatus(t *testing.T, env codexTestEnv, o reevalOwner, issueIID int
 func TestSetRunCredentialParkedStatesPromoteLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	svc := New(env.q, env.box, testParams())
+	// PRD #1590 M1: the run-lane claim settles in an exact-claim transaction, as main.go wires it.
+	svc.SetTxBeginner(env.pool)
 	now := time.Now().UTC()
 	o := seedReevalOwner(t, env, BindModeAuto, false)
 
@@ -134,6 +136,8 @@ func TestSetRunCredentialParkedStatesPromoteLiveDB(t *testing.T) {
 func TestSetRunCredentialLimitWaitAutoClaimExcludesDeadTokenLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	svc := New(env.q, env.box, autoParams())
+	// PRD #1590 M1: the run-lane claim settles in an exact-claim transaction, as main.go wires it.
+	svc.SetTxBeginner(env.pool)
 	now := time.Now().UTC()
 	svc.now = func() time.Time { return now }
 
@@ -185,6 +189,8 @@ func TestSetRunCredentialLimitWaitAutoClaimExcludesDeadTokenLiveDB(t *testing.T)
 func TestSetRunCredentialRefusedStatesLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	svc := New(env.q, env.box, testParams())
+	// PRD #1590 M1: the run-lane claim settles in an exact-claim transaction, as main.go wires it.
+	svc.SetTxBeginner(env.pool)
 	now := time.Now().UTC()
 	o := seedReevalOwner(t, env, BindModeAuto, false)
 
@@ -255,6 +261,8 @@ func TestSetRunCredentialRefusedStatesLiveDB(t *testing.T) {
 func TestSetRunCredentialLaneAndSecretRefusalsLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	svc := New(env.q, env.box, testParams())
+	// PRD #1590 M1: the run-lane claim settles in an exact-claim transaction, as main.go wires it.
+	svc.SetTxBeginner(env.pool)
 	now := time.Now().UTC()
 	// altEligible so altTok is an unambiguously VALID pin (the caller's own anthropic_token
 	// with a fresh gauge) — the lane cases must still refuse a valid pin.
@@ -432,6 +440,8 @@ func TestSetRunCredentialLaneAndSecretRefusalsLiveDB(t *testing.T) {
 func TestSetRunCredentialWarningsLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	svc := New(env.q, env.box, autoParams())
+	// PRD #1590 M1: the run-lane claim settles in an exact-claim transaction, as main.go wires it.
+	svc.SetTxBeginner(env.pool)
 	now := time.Now().UTC()
 	svc.now = func() time.Time { return now }
 

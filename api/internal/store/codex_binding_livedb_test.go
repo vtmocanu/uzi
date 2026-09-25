@@ -357,18 +357,34 @@ func TestSetRunCodexClaimCapabilityLiveDB(t *testing.T) {
 
 	// A worker-owned, claimed run.
 	runID := insertCodexRun(ctx, t, pool, user, repo, worker, 103, "claimed", "marker")
+	// The mint is fenced on claim_generation (PRD #1590). Only ClaimRun advances it, so every
+	// mint below runs at the seeded run's generation.
+	seeded, err := q.GetRunByID(ctx, runID)
+	if err != nil {
+		t.Fatalf("GetRunByID(seeded): %v", err)
+	}
+	gen := seeded.ClaimGeneration
+
+	// Generation guard: the owning worker minting at a DIFFERENT claim generation (a stale
+	// attempt from an earlier claim, or any generation that is not the run's current one)
+	// matches no row, so a stale same-worker attempt can never overwrite a newer claim's mint.
+	if epoch, err := q.SetRunCodexClaimCapability(ctx, store.SetRunCodexClaimCapabilityParams{
+		Hash: []byte("cap-stale-gen"), ID: runID, WorkerID: pgUUID(worker), ClaimGeneration: gen + 1,
+	}); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("SetRunCodexClaimCapability(wrong generation) = (%d,%v), want (_, pgx.ErrNoRows)", epoch, err)
+	}
 
 	// A non-owning worker cannot mint. The query is now :one RETURNING codex_claim_epoch,
 	// so a non-matching WHERE (foreign worker) returns pgx.ErrNoRows rather than 0 rows.
 	if epoch, err := q.SetRunCodexClaimCapability(ctx, store.SetRunCodexClaimCapabilityParams{
-		Hash: []byte("cap"), ID: runID, WorkerID: pgUUID(uuid.New()),
+		Hash: []byte("cap"), ID: runID, WorkerID: pgUUID(uuid.New()), ClaimGeneration: gen,
 	}); !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("SetRunCodexClaimCapability(non-owner) = (%d,%v), want (_, pgx.ErrNoRows)", epoch, err)
 	}
 	// The owning worker mints: hash set, epoch 0 -> 1. The RETURNING value is the
 	// PERSISTED post-bump epoch, so it must come back as 1.
 	if epoch, err := q.SetRunCodexClaimCapability(ctx, store.SetRunCodexClaimCapabilityParams{
-		Hash: []byte("cap"), ID: runID, WorkerID: pgUUID(worker),
+		Hash: []byte("cap"), ID: runID, WorkerID: pgUUID(worker), ClaimGeneration: gen,
 	}); err != nil || epoch != 1 {
 		t.Fatalf("SetRunCodexClaimCapability(owner) = (%d,%v), want (1,nil)", epoch, err)
 	}
@@ -401,7 +417,7 @@ func TestSetRunCodexClaimCapabilityLiveDB(t *testing.T) {
 	// guard is what now rejects the re-mint, surfacing as pgx.ErrNoRows. This closes the
 	// requeue TOCTOU where a departed worker could re-mint a fresh capability. ---
 	if epoch, err := q.SetRunCodexClaimCapability(ctx, store.SetRunCodexClaimCapabilityParams{
-		Hash: []byte("cap-after-requeue"), ID: runID, WorkerID: pgUUID(worker),
+		Hash: []byte("cap-after-requeue"), ID: runID, WorkerID: pgUUID(worker), ClaimGeneration: gen,
 	}); !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("SetRunCodexClaimCapability(queued run) = (%d,%v), want (_, pgx.ErrNoRows)", epoch, err)
 	}
@@ -410,7 +426,7 @@ func TestSetRunCodexClaimCapabilityLiveDB(t *testing.T) {
 	// Re-mint on a running codex run, and add a non-codex control run with a marker.
 	mustExec(ctx, t, pool, `UPDATE runs SET status='running' WHERE id=$1`, runID)
 	if _, err := q.SetRunCodexClaimCapability(ctx, store.SetRunCodexClaimCapabilityParams{
-		Hash: []byte("cap2"), ID: runID, WorkerID: pgUUID(worker),
+		Hash: []byte("cap2"), ID: runID, WorkerID: pgUUID(worker), ClaimGeneration: gen,
 	}); err != nil {
 		t.Fatalf("re-mint: %v", err)
 	}
@@ -450,7 +466,7 @@ func TestSetRunCodexClaimCapabilityLiveDB(t *testing.T) {
 	// Make the worker stale (old heartbeat) and put the codex run back to running.
 	mustExec(ctx, t, pool, `UPDATE runs SET status='running', requeue_count=0 WHERE id=$1`, runID)
 	if _, err := q.SetRunCodexClaimCapability(ctx, store.SetRunCodexClaimCapabilityParams{
-		Hash: []byte("cap3"), ID: runID, WorkerID: pgUUID(worker),
+		Hash: []byte("cap3"), ID: runID, WorkerID: pgUUID(worker), ClaimGeneration: gen,
 	}); err != nil {
 		t.Fatalf("re-mint before stale requeue: %v", err)
 	}

@@ -183,7 +183,7 @@ func TestClaimRecordsNothingWhenOpenFails(t *testing.T) {
 	if len(f.fs.recordedCreds) != 0 {
 		t.Fatalf("recorded %+v for a credential that never opened", f.fs.recordedCreds)
 	}
-	if f.fs.markedFailed == nil {
+	if f.fs.claimFailed == nil {
 		t.Fatal("the run should have been failed with credential-unavailable")
 	}
 }
@@ -205,11 +205,11 @@ func TestTokenlessUserKeepsItsFailureText(t *testing.T) {
 	if payload != nil {
 		t.Fatal("a token-less user's claim must not produce a payload")
 	}
-	if f.fs.markedFailed == nil {
+	if f.fs.claimFailed == nil {
 		t.Fatal("the run should have been failed")
 	}
 	const want = "credential unavailable: no Anthropic token configured for this user"
-	if got := f.fs.markedFailed.FailureReason.String; got != want {
+	if got := f.fs.claimFailed.FailureReason.String; got != want {
 		t.Fatalf("failure reason = %q, want %q — D8 moved where this error is raised, "+
 			"and it must not move what the user is told", got, want)
 	}
@@ -237,7 +237,7 @@ func TestDefaultDeletedBetweenResolveAndOpen(t *testing.T) {
 	if payload != nil {
 		t.Fatal("expected no payload")
 	}
-	if f.fs.markedFailed == nil {
+	if f.fs.claimFailed == nil {
 		t.Fatal("the run should have been failed with credential-unavailable")
 	}
 	if len(f.fs.recordedCreds) != 0 {
@@ -279,7 +279,7 @@ func TestRecordVanishedRunDropsTheClaim(t *testing.T) {
 	if payload != nil {
 		t.Fatal("expected idle for a vanished run")
 	}
-	if f.fs.markedFailed != nil {
+	if f.fs.claimFailed != nil {
 		t.Fatal("a vanished run must not be marked failed — there is no row to fail")
 	}
 }

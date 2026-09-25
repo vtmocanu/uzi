@@ -32,8 +32,8 @@ import (
 // on the run lane floored onto another pooled token.
 //
 // 🔴 D14, reshaped by #754 M2. Without the retry arm, "auto never fails a run" is
-// simply untrue. recoverClaimAssembly maps errCredentialUnavailable to
-// MarkRunFailedByID — a TERMINAL failure — so a token that passes the gauge gate
+// simply untrue. finishRunClaim maps errCredentialUnavailable to
+// FailClaimAssemblyExact — a TERMINAL failure — so a token that passes the gauge gate
 // and then will not decrypt (a rotated UZI_SECRET_KEY, a corrupt row, a token
 // deleted between the ranking query and the open) kills a run another POOLED
 // token could have completed.
@@ -283,7 +283,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	// assembleClaim runs (service.go), so the owner's Codex lane could have flipped to a CUSTOM
 	// (non-curated) id in the window between the claim's SQL gate and here. For an ordinary
 	// (non-review) Codex run whose effective root is custom, refuse to ship it to a worker that
-	// lacks codex_custom_model_v1 and return an error recoverClaimAssembly REQUEUES — the run
+	// lacks codex_custom_model_v1 and return an error finishRunClaim REQUEUES — the run
 	// goes back to queued for a capable worker rather than silently running Astra or failing. A
 	// review run left defaultModel nil above and is exempt; judge/chat never reach here. A custom
 	// id is exactly one harnessModelCompatible rejects for the Codex harness (non-empty,
@@ -654,17 +654,19 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	if run.Harness == harnessCodex {
 		codex, err := s.codexClaimSecrets(ctx, wkr, run)
 		if err != nil {
-			// recoverClaimAssembly handles errVaultLocked (transient requeue) and
-			// errRunVanished (drop) by IDENTITY — pass those through untouched. Every other
-			// codex sentinel (ErrCodexMaterialRevisionStale, ErrCodexAccountRevisionStale,
-			// ErrCodexAccountQuarantined, ErrCodexKindModeMismatch, ErrCodexLoginBlob, and any
-			// bare store error) means the bound credential cannot be delivered right now, so
-			// wrap it as errCredentialUnavailable to fail the run cleanly (terminal), rather
-			// than propagating an unclassified error the recover switch would not handle.
-			if errors.Is(err, errVaultLocked) || errors.Is(err, errRunVanished) {
+			// finishRunClaim (claim_recovery.go) settles every outcome in one exact-claim
+			// transaction and matches these by IDENTITY, so pass them through untouched:
+			// errVaultLocked (transient requeue), errRunVanished (drop) and
+			// errCodexMintAmbiguous (no payload, no mutation: the mint write may have landed).
+			// Every other Codex error is wrapped as errCredentialUnavailable with %w, so the
+			// sentinel and any minted epoch/hash survive for that classifier: a quarantine or a
+			// same-alias re-login in flight parks the run in recovery_wait, and the other
+			// credential failures (kind/mode mismatch, login blob, revoked revision, identity
+			// change, a store defect) stay terminal.
+			if errors.Is(err, errVaultLocked) || errors.Is(err, errRunVanished) || errors.Is(err, errCodexMintAmbiguous) {
 				return nil, err
 			}
-			return nil, fmt.Errorf("%w: %v", errCredentialUnavailable, err)
+			return nil, fmt.Errorf("%w: %w", errCredentialUnavailable, err)
 		}
 		payload.Secrets.Codex = codex
 	}
@@ -880,7 +882,7 @@ func (s *Service) resolveTooling(ctx context.Context, run store.Run) (toolPackag
 	// PRD #123 M3 (Decision 4c): an allowlisted package that is not in the baked
 	// worker toolchain cannot be provisioned behind the egress block, so fail the
 	// claim here rather than let the run hang at 0 iterations. Wrap
-	// errToolPackagesRejected so recoverClaimAssembly's existing terminal handling
+	// errToolPackagesRejected so finishRunClaim's exact-claim terminal handling
 	// applies (the run is failed with the offending names, never secret bytes).
 	var unbaked []string
 	for _, p := range allowed {

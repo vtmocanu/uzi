@@ -35,8 +35,9 @@ ALTER TABLE runs
     -- The frozen canonical identity tuple (provider_user_id, workspace_account_id),
     -- serialized as a two-element JSON array TEXT: json.Marshal([]string{provider_user_id,
     -- workspace_account_id}), e.g. ["provider-x","workspace-y"]. This is the identity the
-    -- run is authoritative for; NULL until it is frozen at first link
-    -- (SetRunCodexFrozenIdentity). A JSON array is used rather than a NUL-separated
+    -- run is authoritative for. SetRunCodexFrozenIdentity freezes it at run creation when
+    -- the alias is already linked; otherwise it stays NULL, since nothing freezes it after
+    -- create (PRD #1590 D2 as-built). A JSON array is used rather than a NUL-separated
     -- (E'\x00') join because Postgres TEXT cannot store a NUL byte (SQLSTATE 22021), and
     -- JSON escaping keeps the two components unambiguous while staying a plain comparable
     -- TEXT the authority check equality-tests as-is (both sides serialize the same way, so

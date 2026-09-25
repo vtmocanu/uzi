@@ -139,14 +139,14 @@ func TestAutoChoiceHoldsWhenTheOnlyPooledTokenIsTheDeadCredential(t *testing.T) 
 			f.fs.recordedCreds)
 	}
 	// PRD #754 M4: the empty-pool hold now transitions the run to pool_wait, not requeue.
-	if f.fs.poolWaitHeld == nil || f.fs.poolWaitHeld.ID != f.runID {
-		t.Fatalf("run not held in pool_wait: %v — an empty-pool hold holds the run", f.fs.poolWaitHeld)
+	if f.fs.claimRequeued == nil || !f.fs.claimRequeued.PoolWait || f.fs.claimRequeued.ID != f.runID {
+		t.Fatalf("run not held in pool_wait: %v — an empty-pool hold holds the run", f.fs.claimRequeued)
 	}
-	if f.fs.requeuedRun != nil {
-		t.Fatalf("run was requeued (%v); M4 replaced the requeue with the pool_wait hold", f.fs.requeuedRun)
+	if f.fs.claimRequeued != nil && !f.fs.claimRequeued.PoolWait {
+		t.Fatalf("run was requeued (%v); M4 replaced the requeue with the pool_wait hold", f.fs.claimRequeued)
 	}
-	if f.fs.markedFailed != nil {
-		t.Fatalf("the run was failed terminally (%v); the empty-pool hold must not hard-fail", f.fs.markedFailed)
+	if f.fs.claimFailed != nil {
+		t.Fatalf("the run was failed terminally (%v); the empty-pool hold must not hard-fail", f.fs.claimFailed)
 	}
 }
 

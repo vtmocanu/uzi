@@ -454,6 +454,9 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 			dto.CurrentActivity = activity[run.ID]
 		}
 	}
+	// PRD #1590 D6: the derived owner action of a run held on its Codex account (null
+	// otherwise). Best-effort, and queried only for such a held run.
+	h.overlayCodexAccountActions(r.Context(), &dto)
 	// PRD #1353: the server-derived per-in-progress-milestone LIVE LANES, additive to
 	// milestones_agents and populated ONLY on this run-detail read for a non-terminal run
 	// (D9 — the board/list stay a single now-line). Best-effort: a derivation error leaves

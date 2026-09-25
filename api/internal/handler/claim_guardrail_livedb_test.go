@@ -68,6 +68,8 @@ func newClaimGuardFixture(ctx context.Context, t *testing.T) claimGuardFixture {
 	pcheck := privcheck.NewService(q, svc)
 	wsvc := workersvc.New(q, box, workersvc.Params{})
 	wsvc.SetRepoGuard(pcheck)
+	// PRD #1590 M1: the run-lane claim settles in an exact-claim transaction, as main.go wires it.
+	wsvc.SetTxBeginner(pool)
 
 	f := claimGuardFixture{
 		pool:   pool,

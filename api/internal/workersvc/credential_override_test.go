@@ -173,7 +173,7 @@ func TestRunOverrideForeignIDIsUnavailable(t *testing.T) {
 	if payload := f.claim(t); payload != nil {
 		t.Fatal("expected idle: a foreign run-override token must be terminal, not inherited")
 	}
-	if f.fs.markedFailed == nil {
+	if f.fs.claimFailed == nil {
 		t.Fatal("a foreign run-override token did not fail the run")
 	}
 	if len(f.fs.recordedCreds) != 0 {
@@ -197,7 +197,7 @@ func TestRunOverrideWrongKindRefused(t *testing.T) {
 	if payload := f.claim(t); payload != nil {
 		t.Fatal("expected idle: a wrong-kind run-override token must be refused, not spent")
 	}
-	if f.fs.markedFailed == nil {
+	if f.fs.claimFailed == nil {
 		t.Fatal("a wrong-kind run-override token did not fail the run")
 	}
 	if len(f.fs.recordedCreds) != 0 {

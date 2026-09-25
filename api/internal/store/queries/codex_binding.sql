@@ -9,9 +9,11 @@
 -- rather than the public CreateRun — the binding is decided once, atomically, when the
 -- claim is assembled. Records the alias id, auth mode, snapshotted label and the alias
 -- material_revision frozen at creation; the account identity/revision are OPTIONAL here
--- (nullable args) because a subscription run may not have resolved its account yet —
--- SetRunCodexFrozenIdentity freezes those at first link. Owner-scoped; 0 rows for a
--- run this user does not own.
+-- (nullable args) because a subscription run may not have resolved its account yet.
+-- SetRunCodexFrozenIdentity freezes those only at creation, and only when the alias is
+-- already linked (freezeCodexBinding); nothing freezes a run's identity after create, so a
+-- run created on an unlinked alias keeps a NULL identity (PRD #1590 D2 as-built).
+-- Owner-scoped; 0 rows for a run this user does not own.
 --
 -- SECURITY HARDENING (PRD #1147 audit): write-once-OR-exact-unchanged-retry freeze.
 -- Immutability is keyed on `codex_material_revision IS NULL` as the "not yet frozen"
@@ -71,14 +73,17 @@ WHERE id = @id AND user_id = @user_id
     AND (codex_account_key IS NULL OR sqlc.narg('account_key')::text IS NULL OR codex_account_key = sqlc.narg('account_key')::text);
 
 -- name: SetRunCodexFrozenIdentity :execrows
--- Freeze the run's canonical identity + account revision at FIRST link (PRD #1147 M2):
--- once a subscription run resolves its provider account, the account_key (the frozen
--- identity tuple) and account_revision are pinned onto the run so the authority check
--- can later compare run-frozen vs current. Owner-scoped; 0 rows for a foreign run.
+-- Freeze the run's canonical identity + account revision (PRD #1147 M2): the account_key
+-- (the frozen identity tuple) and account_revision are pinned onto the run so the
+-- authority check can later compare run-frozen vs current. Called only from
+-- freezeCodexBinding at run creation, and only when the alias is already linked; nothing
+-- freezes a run's identity after create (PRD #1590 D2 as-built), so a run created on an
+-- unlinked alias keeps a NULL identity and fails ErrCodexAccountKeyUnfrozen. Owner-scoped;
+-- 0 rows for a foreign run.
 --
 -- SECURITY HARDENING (PRD #1147 audit): write-once identity freeze. The guard
 -- `codex_account_key IS NULL OR (codex_account_key = @key AND codex_account_revision =
--- @rev)` pins the frozen identity tuple AND its account_revision immutably at first link
+-- @rev)` pins the frozen identity tuple AND its account_revision immutably once frozen
 -- — the FIRST freeze (NULL) and an identical retry (equal tuple AND equal revision)
 -- succeed, but a conflicting freeze presenting a DIFFERENT identity affects 0 rows, so
 -- the run's canonical identity can never be silently repointed to another account after
@@ -127,6 +132,9 @@ SELECT
     r.codex_cap_hash,
     r.worker_id,
     r.status,
+    -- PRD #1590: the run's current claim generation, so the claim's release barriers can
+    -- refuse a stale attempt from an earlier generation of the same worker's claim.
+    r.claim_generation,
     -- CURRENT alias material revision (the run-frozen one is r.codex_material_revision).
     ccs.material_revision AS current_material_revision,
     -- CURRENT account counters + immutable identity tuple (NULL for an api_key alias).
@@ -148,6 +156,152 @@ LEFT JOIN codex_provider_account cpa
     ON cpa.id = ccs.provider_account_id AND cpa.user_id = r.user_id
 WHERE r.id = @id;
 
+-- name: LockCodexAliasForShareNowait :one
+-- PRD #1590 D2/D3: the final claim classifier's alias lock, taken under the exact-claim run
+-- row lock and BEFORE the account lock. FOR SHARE blocks a concurrent re-login writer
+-- (BumpCodexMaterialRevision, LinkCodexCredentialState) until the decision commits; NOWAIT
+-- means the classifier never waits on that writer, which takes the account before the alias
+-- (see D3 deadlock avoidance): a held row returns 55P03 and the caller retries. Owner-scoped.
+SELECT status, material_revision, provider_account_id
+FROM codex_credential_state
+WHERE user_secret_id = @user_secret_id AND user_id = @user_id
+FOR SHARE NOWAIT;
+
+-- name: LockCodexAccountForShareNowait :one
+-- PRD #1590 D2/D3: the account half of the classifier's lock pair, after the alias. NOWAIT
+-- is required even with the alias held (RefreshCodexAccountLogin holds the account first).
+-- Owner-scoped; a missing row is pgx.ErrNoRows.
+SELECT id FROM codex_provider_account
+WHERE id = @id AND user_id = @user_id
+FOR SHARE NOWAIT;
+
+-- name: ReadmitRunCodexBinding :execrows
+-- PRD #1590 D5: re-admit a run held on codex_account_unavailable after a verified
+-- same-identity re-login on its SAME alias. This is the ONLY relaxation of the write-once
+-- binding freeze: it advances runs.codex_material_revision alone, from the observed old value
+-- to the alias's observed current value, and cannot re-point the run to another alias,
+-- account, auth mode or credential revision (no other binding column is written).
+--
+-- Called by the promote_codex_account_available pass under the run lock (FOR NO KEY UPDATE)
+-- and the alias and account FOR SHARE NOWAIT locks, before its GetRunCodexAuthContext re-read.
+-- Every fence is in this WHERE, so the statement is safe on its own and a caller that skipped
+-- its own checks still cannot re-admit a mismatched run:
+--   * the run is still held: recovery_wait with cause codex_account_unavailable;
+--   * the same alias, not deleted: codex_secret_id equals the caller's observed id (NULL never
+--     equals, so a deleted alias's run is never re-admitted);
+--   * subscription mode, and the alias is still a codex_auth secret;
+--   * the alias is linked, with provider_account_id set (the INNER account join also needs it);
+--   * the linked account's identity tuple encodes to the run's frozen codex_account_key, with
+--     the same guarded jsonb comparison as ClaimRun's gate (an undecodable key never matches);
+--   * the frozen codex_account_key is byte-for-byte @account_key, the caller's Go encoding
+--     (codexAccountKey) of the locked account's tuple. The jsonb comparison alone accepts a
+--     non-canonical key (e.g. `["u", "w"]`, only writable by direct SQL) that the Go
+--     authority check (codexCheckAccountTuple, a string comparison) rejects, so it would
+--     re-admit a run that then fails classification. With both, the statement matches only a
+--     key that is structurally the account's AND the canonical text the Go side compares, so
+--     the SQL and Go identity checks agree. The jsonb comparison keeps the statement safe on
+--     its own: whatever @account_key a caller passes, a run whose frozen key does not name the
+--     linked account is never re-admitted;
+--   * the account's credential_revision EQUALS the frozen codex_account_revision (never
+--     advanced here). Nothing bumps credential_revision today (it stays at its DEFAULT 0), so
+--     this is defence in depth: once a future revocation bumps it, such a run is never
+--     re-admitted;
+--   * the account is settled: coord_state idle or committed (never quarantined or mid-lease);
+--   * CAS on both material revisions: the run is still at @old_material_revision and the alias
+--     at @new_material_revision, and the move is strictly forward, so a concurrent material
+--     change matches 0 rows and nothing is re-admitted.
+-- Owner-consistent: the alias state, secret and account rows must all belong to the run's
+-- user. 0 rows is not an error: the run stays held, and the caller's re-read decides.
+UPDATE runs r
+SET codex_material_revision = @new_material_revision::bigint,
+    updated_at              = now()
+FROM codex_credential_state ccs
+JOIN user_secrets us
+    ON us.id = ccs.user_secret_id AND us.user_id = ccs.user_id
+JOIN codex_provider_account cpa
+    ON cpa.id = ccs.provider_account_id AND cpa.user_id = ccs.user_id
+WHERE r.id = @id
+  AND r.status = 'recovery_wait'
+  AND r.recovery_wait_cause = 'codex_account_unavailable'
+  AND r.codex_secret_id = @secret_id::uuid
+  AND ccs.user_secret_id = r.codex_secret_id
+  AND ccs.user_id = r.user_id
+  AND r.codex_auth_mode = 'subscription'
+  AND us.kind = 'codex_auth'
+  AND ccs.status = 'linked'
+  AND ccs.provider_account_id IS NOT NULL
+  AND CASE WHEN pg_input_is_valid(r.codex_account_key, 'jsonb')
+           THEN r.codex_account_key::jsonb
+                = jsonb_build_array(cpa.provider_user_id, cpa.workspace_account_id)
+           ELSE false END
+  AND r.codex_account_key = @account_key::text
+  AND cpa.credential_revision = r.codex_account_revision
+  AND cpa.coord_state IN ('idle', 'committed')
+  AND r.codex_material_revision = @old_material_revision::bigint
+  AND ccs.material_revision = @new_material_revision::bigint
+  AND @new_material_revision::bigint > @old_material_revision::bigint;
+
+-- name: InsertCodexReadmitRunMessage :one
+-- PRD #1590 D5: the run feed status line for a re-admission, written in the same transaction as
+-- ReadmitRunCodexBinding (the caller holds the run row lock). A server-authored message on a
+-- held run has no live claim, so it cannot use InsertRunMessage's worker fence: it appends at
+-- the next free seq (past both runs.last_seq and the stored maximum) and advances
+-- runs.last_seq in the same statement, so the worker that resumes the run at its next claim
+-- starts past it and never collides with it. That does not cover a zombie: a worker of the
+-- displaced flight that still holds an unreleased claim at the run's generation keeps its own
+-- seq counter. If it appends at the seq this line took, its InsertRunMessage hits
+-- ON CONFLICT (run_id, seq) DO NOTHING, reads as a benign duplicate, and that frame is lost. A
+-- zombie frame committed before this statement's snapshot is part of MAX(seq), so this insert
+-- takes the seq after it. Only a zombie insert at the same seq that this statement's snapshot
+-- does not see (still in flight, or committed after the snapshot) makes this insert return no
+-- row: ON CONFLICT waits for an in-flight one and does nothing once it commits. Fenced on the
+-- hold. No row back (that seq collision, or the run left the hold) is pgx.ErrNoRows; the caller
+-- rolls back and the run stays held for the next tick. The payload is built by the caller and
+-- carries no token material.
+WITH next AS (
+    SELECT r.id,
+           GREATEST(r.last_seq,
+                    COALESCE((SELECT MAX(m.seq) FROM run_messages m WHERE m.run_id = r.id), 0)) + 1 AS seq
+    FROM runs r
+    WHERE r.id = @run_id
+      AND r.status = 'recovery_wait' AND r.recovery_wait_cause = 'codex_account_unavailable'
+),
+ins AS (
+    INSERT INTO run_messages (run_id, seq, kind, payload)
+    SELECT next.id, next.seq, 'status', @payload::jsonb FROM next
+    ON CONFLICT (run_id, seq) DO NOTHING
+    RETURNING seq
+),
+bump AS (
+    UPDATE runs SET last_seq = GREATEST(runs.last_seq, ins.seq)
+    FROM ins
+    WHERE runs.id = @run_id
+    RETURNING runs.id
+)
+SELECT ins.seq FROM ins;
+
+-- name: FailCodexAccountWaitRun :execrows
+-- PRD #1590 D5: the terminal exit from a codex_account_unavailable hold, when the run's binding
+-- can never be released again (its alias was deleted, or a linked alias now names a different
+-- identity, credential revision, auth mode or kind). Fenced on status = 'recovery_wait' AND the
+-- cause, so it can end only this hold (a cancel or a promotion wins). The SET list is
+-- MarkRunFailedByID's field for field (including #1482's card-only move_pending_since) plus
+-- the claim-capability revoke (already NULL on a hold; kept so every Codex exit revokes). It
+-- touches no custody hold: like every failed run, the run retains custody for capture or
+-- discard (ListReleasableCustodyHolds never qualifies a failed run without a ready capture).
+UPDATE runs SET
+    status = 'failed', status_since = now(), failure_reason = @failure_reason,
+    fail_origin = @fail_origin,
+    move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END,
+    finished_at = now(),
+    milestones_in_progress = NULL, milestones_agents = NULL,
+    pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
+    credential_switch_requested_at = NULL, credential_switch_generation = NULL,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
+    updated_at = now()
+WHERE id = @id AND status = 'recovery_wait' AND recovery_wait_cause = 'codex_account_unavailable';
+
 -- name: SetRunCodexClaimCapability :one
 -- Mint (or rotate) the per-claim Codex capability (PRD #1147 M2): store the new hash and
 -- bump the epoch so a prior capability is superseded. Guarded on worker_id — only the
@@ -158,7 +312,7 @@ WHERE r.id = @id;
 -- lives in every claimed→queued path in runtime.sql (the three Requeue* queries plus
 -- SweepClaimedNeverStarted), which clear the hash + bump the epoch on ownership loss.
 -- PRD #1147 F7 (defense-in-depth) extends the same revoke to the park/promote paths that
--- likewise leave a run without a live owner: SetRunPoolWait (claimed→pool_wait hold),
+-- likewise leave a run without a live owner: RequeueClaimAssemblyExact (claimed→pool_wait hold),
 -- PromotePoolWaitRun (pool_wait→queued), and PromoteLimitWaitRuns (limit_wait→queued).
 -- SetRunLimitWait is INTENTIONALLY EXCLUDED: limit_wait is an actively-claimed status that
 -- keeps its live capability by design (persist-before-park), so revoking there would strip
@@ -173,11 +327,20 @@ WHERE r.id = @id;
 -- match on worker_id and let the departed worker re-mint a fresh capability. Closing this
 -- requeue TOCTOU: a 0-row match now surfaces as pgx.ErrNoRows → errRunVanished in the caller,
 -- which is the desired outcome.
+--
+-- GENERATION GUARD (PRD #1590): the mint is also fenced on @claim_generation, the claim
+-- generation the caller's ClaimRun returned. worker_id + status alone cannot tell a stale
+-- attempt from a live one when the SAME worker reclaims the run: an attempt at generation G
+-- that paused before its mint, while the run was requeued and reclaimed by that worker as
+-- G+1, would otherwise match, overwrite G+1's capability and bump the epoch, so G+1's
+-- release barrier would see a superseded mint and drop its payload. The stale attempt now
+-- matches 0 rows → pgx.ErrNoRows → errRunVanished, and G+1's capability stays live.
 UPDATE runs
 SET codex_cap_hash    = @hash,
     codex_claim_epoch = codex_claim_epoch + 1,
     updated_at        = now()
 WHERE id = @id AND worker_id = @worker_id
+  AND claim_generation = @claim_generation
   AND status IN (
       'claimed', 'running', 'awaiting_approval',
       'awaiting_input', 'awaiting_followup', 'limit_wait'
@@ -668,3 +831,49 @@ marked AS (
 )
 SELECT (SELECT count(*) FROM cleared)::bigint AS cleared,
        (SELECT count(*) FROM marked)::bigint  AS marked;
+
+-- name: ListCodexAccountActionInputs :many
+-- PRD #1590 D6: the read-time inputs of the derived codex_account_action, batched over one
+-- page of run ids. A plain read with no locks: the action is display-only, never persisted,
+-- and the promoter re-decides every run under its own locks. Only runs still held on
+-- codex_account_unavailable come back, so a run that left the hold since the page read gets
+-- no row (and no action). Every join is LEFT and owner-scoped (the joined alias, state and
+-- account rows must belong to the run's own user): a deleted alias (codex_secret_id NULL),
+-- a missing state row, and an alias linked to no account each come back with NULL columns
+-- instead of dropping the run. The account is the alias's CURRENTLY linked one, the same join
+-- as GetRunCodexAuthContext. The recovery slot is reduced to one boolean (material present at
+-- the account's current generation, the survivor pass's promotion test), so no sealed
+-- material leaves the database on this path. The label is the run's OWN snapshot
+-- (runs.codex_secret_label), never the alias row's current label.
+SELECT
+    r.id,
+    r.codex_secret_id,
+    r.codex_auth_mode,
+    r.codex_account_key,
+    r.codex_material_revision,
+    r.codex_account_revision,
+    r.codex_secret_label,
+    r.status,
+    us.kind                 AS bound_kind,
+    ccs.status              AS alias_status,
+    ccs.material_revision   AS current_material_revision,
+    ccs.provider_account_id AS alias_provider_account_id,
+    cpa.id                  AS account_id,
+    cpa.credential_revision AS current_credential_revision,
+    cpa.provider_user_id,
+    cpa.workspace_account_id,
+    cpa.coord_state         AS current_coord_state,
+    COALESCE(length(cpa.recovery_sealed) > 0
+             AND cpa.recovery_generation = cpa.generation, false)::boolean AS recovery_at_generation,
+    cpa.lease_deadline,
+    cpa.reauth_required
+FROM runs r
+LEFT JOIN user_secrets us
+    ON us.id = r.codex_secret_id AND us.user_id = r.user_id
+LEFT JOIN codex_credential_state ccs
+    ON ccs.user_secret_id = r.codex_secret_id AND ccs.user_id = r.user_id
+LEFT JOIN codex_provider_account cpa
+    ON cpa.id = ccs.provider_account_id AND cpa.user_id = r.user_id
+WHERE r.id = ANY(@run_ids::uuid[])
+  AND r.status = 'recovery_wait'
+  AND r.recovery_wait_cause = 'codex_account_unavailable';

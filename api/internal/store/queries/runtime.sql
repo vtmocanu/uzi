@@ -875,6 +875,61 @@ WITH target AS (
           )
           OR 'codex_custom_model_v1' = ANY(@worker_protocol_caps::text[])
       )
+      -- PRD #1590 M2 (D2, amendment A1): keep a Codex subscription run queued while
+      -- its SAME alias's account authority is on hold (D1's hold class):
+      --   (1) quarantine: the linked account is quarantined and is still the run's
+      --       frozen identity at its frozen credential_revision. A run with no frozen
+      --       identity (codex_account_key NULL: its alias was unlinked at create, and
+      --       nothing freezes it later) fails evalCodexReleasePredicate with
+      --       ErrCodexAccountKeyUnfrozen whatever the account does, so it is not held
+      --       (D1 holds only what can resume); like a different identity or a bumped
+      --       revision, the claim proceeds and fails in assembly as before;
+      --   (2) re-login in flight: past first link, a newer login on the alias is
+      --       staging/failed (the PATCH cleared the link, so (1) cannot see it);
+      --   (3) A1: past first link, that newer login already linked back to the
+      --       frozen identity at the frozen credential_revision (D5 re-admits it;
+      --       until then the run's material_revision is stale).
+      -- This is the SQL twin of classifyCodexClaimAuthority; a shared fixture table
+      -- pins the two against each other. The frozen identity is stored only as the
+      -- Go-encoded JSON array codex_account_key (00202, codexAccountKey), and no SQL
+      -- encoder exists, so it is DECODED with a guarded ::jsonb cast and compared
+      -- structurally to the account's tuple; an undecodable key never matches. The
+      -- gate is run-level, independent of worker capabilities, and precedes the
+      -- custody-opening hold CTE. The LEFT JOIN preserves an unlinked alias
+      -- (including a first login); every lookup stays scoped to this run's owner.
+      -- The SAME predicate text appears in the peer mirror below, in
+      -- ParkQueuedCodexAccountUnavailablePage and in ListActiveRunsForHealth's
+      -- codex_account_gated; a store test pins the copies byte-identical after
+      -- whitespace normalisation.
+      AND NOT (
+          r.harness = 'codex'
+          AND r.codex_auth_mode = 'subscription'
+          AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework')
+          AND EXISTS (
+              SELECT 1 FROM codex_credential_state ccs
+              LEFT JOIN codex_provider_account cpa
+                  ON cpa.id = ccs.provider_account_id AND cpa.user_id = r.user_id
+              WHERE ccs.user_secret_id = r.codex_secret_id
+                AND ccs.user_id = r.user_id
+                AND (
+                    (cpa.coord_state = 'quarantined'
+                     AND cpa.credential_revision = r.codex_account_revision
+                     AND CASE WHEN pg_input_is_valid(r.codex_account_key, 'jsonb')
+                              THEN r.codex_account_key::jsonb
+                                   = jsonb_build_array(cpa.provider_user_id, cpa.workspace_account_id)
+                              ELSE false END)
+                    OR (r.codex_account_key IS NOT NULL
+                        AND ccs.material_revision > r.codex_material_revision
+                        AND (ccs.status IN ('staging', 'failed')
+                             OR (ccs.status = 'linked'
+                                 AND cpa.credential_revision = r.codex_account_revision
+                                 AND CASE WHEN pg_input_is_valid(r.codex_account_key, 'jsonb')
+                                          THEN r.codex_account_key::jsonb
+                                               = jsonb_build_array(cpa.provider_user_id, cpa.workspace_account_id)
+                                          ELSE false END)))
+                )
+          )
+      )
       -- PRD #529 Decision 4: an ephemeral worker exists to serve exactly one run and
       -- must never take foreign work — otherwise it could hold a non-owning run when
       -- its bound run terminates, blocking the busy-guarded teardown (M4). So an
@@ -959,6 +1014,37 @@ WITH target AS (
                             false)
                     )
                     OR 'codex_custom_model_v1' = ANY(p.protocol_capabilities)
+                )
+                -- PRD #1590 M2 (D2, A1): mirror the claimant's account gate so a
+                -- busy worker never defers this run to a peer that cannot claim it.
+                AND NOT (
+                    r.harness = 'codex'
+                    AND r.codex_auth_mode = 'subscription'
+                    AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework')
+                    AND EXISTS (
+                        SELECT 1 FROM codex_credential_state ccs
+                        LEFT JOIN codex_provider_account cpa
+                            ON cpa.id = ccs.provider_account_id AND cpa.user_id = r.user_id
+                        WHERE ccs.user_secret_id = r.codex_secret_id
+                          AND ccs.user_id = r.user_id
+                          AND (
+                              (cpa.coord_state = 'quarantined'
+                               AND cpa.credential_revision = r.codex_account_revision
+                               AND CASE WHEN pg_input_is_valid(r.codex_account_key, 'jsonb')
+                                        THEN r.codex_account_key::jsonb
+                                             = jsonb_build_array(cpa.provider_user_id, cpa.workspace_account_id)
+                                        ELSE false END)
+                              OR (r.codex_account_key IS NOT NULL
+                                  AND ccs.material_revision > r.codex_material_revision
+                                  AND (ccs.status IN ('staging', 'failed')
+                                       OR (ccs.status = 'linked'
+                                           AND cpa.credential_revision = r.codex_account_revision
+                                           AND CASE WHEN pg_input_is_valid(r.codex_account_key, 'jsonb')
+                                                    THEN r.codex_account_key::jsonb
+                                                         = jsonb_build_array(cpa.provider_user_id, cpa.workspace_account_id)
+                                                    ELSE false END)))
+                          )
+                    )
                 )
                 AND pa.active < p.max_concurrent_runs
                 AND pa.active * (SELECT w.max_concurrent_runs FROM workers w WHERE w.id = @worker_id)
@@ -2277,8 +2363,11 @@ FOR UPDATE;
 -- started_at = NULL so the resumed run gets a FRESH RUN_TIMEOUT wall, and
 -- budget_paused_seconds = 0 so the pause banked against the OLD baseline is not
 -- over-credited — both exactly as PromoteLimitWaitRuns does. NULL <= @now is UNKNOWN, so a
--- run whose recovery_retry_not_before is NULL is never promoted (harmless: a park always
--- writes a finite stamp).
+-- run whose recovery_retry_not_before is NULL is never promoted. Every timer-driven park
+-- writes a finite stamp; both writers of cause codex_account_unavailable
+-- (ParkRunCodexAccountUnavailable and ParkQueuedCodexAccountUnavailablePage) write NULL. The
+-- cause fence below is what keeps this timer promoter off that cause, whatever its stamp: that
+-- hold is resumed only by the account (PromoteCodexAccountWaitRun, PRD #1590 D3).
 --
 -- session_id, worker_id and recovery_retry_not_before are left in place as affinity/history
 -- exactly as PromoteLimitWaitRuns leaves limit_wait's. A stale recovery_retry_not_before
@@ -2294,7 +2383,8 @@ UPDATE runs SET
     codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
-WHERE status = 'recovery_wait' AND recovery_retry_not_before <= @now
+WHERE status = 'recovery_wait' AND recovery_wait_cause IS DISTINCT FROM 'codex_account_unavailable'
+  AND recovery_retry_not_before <= @now
 RETURNING id, user_id, status;
 
 -- name: PromoteRecoveryWaitRunNow :execrows
@@ -2322,7 +2412,8 @@ UPDATE runs SET
     codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
-WHERE id = @id AND user_id = @user_id AND status = 'recovery_wait';
+WHERE id = @id AND user_id = @user_id AND status = 'recovery_wait'
+  AND recovery_wait_cause IS DISTINCT FROM 'codex_account_unavailable';
 
 -- name: SetRunPaused :execrows
 -- Park a run on the owner's explicit request (PRD #1190 M1). running -> paused,
@@ -3450,60 +3541,197 @@ UPDATE runs SET status = 'queued', status_since = now(),
     updated_at = now()
 WHERE id = @id AND status = 'claimed';
 
--- name: SetRunPoolWait :execrows
--- Hold an `auto` run whose token pool is genuinely empty (PRD #754 M4). claimed →
--- pool_wait, NON-TERMINAL and NON-LOCKING: the run keeps its worker_id affinity, and
--- M5 resumes it (reactively when a token is pooled, or manually). This REPLACES M2's
--- interim requeue (RequeueClaimedRunToQueued on errAutoPoolEmpty): the auto lane must
--- never spend the non-pooled owner default and must not hard-fail a holdable run, so
--- a distinct status is the hold rather than churning the queue.
---
--- 🔴 THE SOURCE GUARD IS POSITIVE (status = 'claimed'), like SetRunLimitWait's
--- status='running' and unlike the negative sibling guards above. A held run only ever
--- comes from a JUST-CLAIMED run in assembleClaim (recoverClaimAssembly runs on the
--- claim path, before the worker starts), so 'claimed' is the only legitimate source.
--- Every other transition is a 0-row no-op, so a re-delivered or out-of-order report
--- cannot re-hold a run that a concurrent path already advanced. kind <> 'judge'
--- mirrors SetRunLimitWait: a judge never holds (Decision 14).
---
--- 🔴 THIS IS NOT A USAGE PARK (PRD Decision 9). An empty pool is not a usage-limit
--- event, so the limit-wait budget must be untouched: limit_wait_count is NOT bumped,
--- and limit_resets_at / retry_not_before / rate_limit_type are NOT set. Folding an
--- empty-pool hold into the usage-limit machinery would let a pooling gap consume the
--- RUN_LIMIT_MAX_WAITS budget a genuine limit event needs.
---
--- limit_dead_secret_id is LEFT AS-IS (deliberately not cleared): M3's exclude-relax
--- reads it on resume to know which just-parked credential's window is still closed, so
--- clearing it here would lose the exclusion across the hold.
---
--- started_at = NULL so a later resume gets a FRESH RUN_TIMEOUT wall (Decision 6d, same
--- as PromoteLimitWaitRuns): without it SweepRunningTimeout would measure the resumed
--- run against a started_at from before a hold that may have lasted a long time.
---
--- Health reset (health='ok', health_reason=NULL, health_since=NULL) exactly as
--- SetRunLimitWait does: ListActiveRunsForHealth is a POSITIVE allowlist that never
--- revisits a held run, so whatever flag was live at hold time would freeze for the
--- whole hold with nothing to clear it. The DISTINCT STATUS is the signal — do NOT
--- write a human sentence into health_reason (that would break the detector's
--- single-writer invariant; the UI/CLI render the "add a token to the pool" copy as
--- fixed text keyed on the status). worker_id is kept for resume affinity.
+-- name: ParkRunCodexAccountUnavailable :one
+-- Called under the exact-claim row lock, after settling this generation's hold.
+-- recovery_retry_not_before is cleared: this cause is resumed by the account, never by the
+-- timer (PromoteRecoveryWaitRuns skips it). The SET list is
+-- ParkQueuedCodexAccountUnavailablePage's (the other writer of this cause) plus one extra
+-- column: this exact-claim park also rewrites worker_id to the newest open custody holder (D4),
+-- while the queued park leaves worker_id alone.
 UPDATE runs SET
-    status       = 'pool_wait',
-    status_since = now(),
-    started_at   = NULL,
-    -- Issue #783: the fresh wall discards started_at, so the pause banked against the
-    -- OLD baseline must be cleared too — otherwise it over-credits the new deadline.
-    budget_paused_seconds = 0,
-    -- PRD #1147 F7 (defense-in-depth): revoke the per-claim Codex capability on the
-    -- claimed→pool_wait hold. A held run no longer has a live owner executing it, so any
-    -- capability minted for the claim must not survive the park; clearing the hash and
-    -- bumping the epoch supersedes it, mirroring the claimed→queued revocation sites.
+    status = 'recovery_wait', recovery_wait_cause = 'codex_account_unavailable',
+    status_since = now(), recovery_retry_not_before = NULL,
+    started_at = NULL, budget_paused_seconds = 0,
     codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
     health = 'ok', health_reason = NULL, health_since = NULL,
-    updated_at   = now()
-WHERE id = @id AND worker_id = @worker_id
+    worker_id = COALESCE((
+        SELECT h.live_worker_id FROM recovery_custody_holds h
+        WHERE h.run_id = runs.id AND h.state = 'open'
+        ORDER BY h.generation DESC, h.created_at DESC LIMIT 1
+    ), runs.worker_id),
+    updated_at = now()
+WHERE runs.id = @id AND runs.worker_id = @worker_id AND runs.claim_generation = @claim_generation
+  AND runs.status = 'claimed' AND runs.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework')
+RETURNING *;
+
+-- name: ParkQueuedCodexAccountUnavailablePage :one
+-- PRD #1590 M2 (D2, A1): the park_codex_account_unavailable sweeper pass. Moves QUEUED Codex
+-- subscription runs that ClaimRun's account gate excludes to recovery_wait with cause
+-- codex_account_unavailable, so the hold is visible instead of an invisible queued wait.
+--
+-- BOUNDED BY ROWS EXAMINED, not rows updated. `page` is a MATERIALIZED keyset page over the
+-- partial index idx_runs_codex_sub_queued (00253): at most @page_cap queued Codex subscription
+-- runs with id > @after_id, in id order. The LIMIT applies BEFORE the alias/account predicate
+-- is evaluated, so a large queue in which few runs are gated still costs one page per tick; the
+-- service advances its in-memory cursor to last_scanned_id and wraps to the start (uuid.Nil)
+-- once a page comes back shorter than the cap.
+--
+-- `locked` takes the page's still-queued rows FOR UPDATE SKIP LOCKED: a row a concurrent
+-- claim or writer holds is skipped this tick and retried after the cursor wraps. The UPDATE
+-- then rechecks status='queued', the hold-opening kinds and the shared account predicate (the
+-- byte-identical copy of ClaimRun's gate, pinned by a store test) on the locked row.
+--
+-- The SET list is the M1 exact-claim park's, minus the worker_id affinity rewrite: a queued run
+-- has no claim of this pass's making, so claim_generation and worker_id are left alone and no
+-- custody hold is opened or released. Both writers clear recovery_retry_not_before because this
+-- cause is resumed by the account, never by the timer (PromoteRecoveryWaitRuns skips it).
+--
+-- Returns one row even when nothing parks: page_size (rows examined), last_scanned_id (the nil
+-- uuid on an empty page) and the parked ids.
+WITH page AS MATERIALIZED (
+    SELECT runs.id FROM runs
+    WHERE runs.status = 'queued' AND runs.harness = 'codex' AND runs.codex_auth_mode = 'subscription'
+      AND runs.id > @after_id::uuid
+    ORDER BY runs.id
+    LIMIT @page_cap::int
+),
+locked AS (
+    SELECT runs.id FROM runs
+    WHERE runs.id IN (SELECT page.id FROM page) AND runs.status = 'queued'
+    ORDER BY runs.id
+    FOR UPDATE SKIP LOCKED
+),
+parked AS (
+    UPDATE runs r SET
+        status = 'recovery_wait', recovery_wait_cause = 'codex_account_unavailable',
+        status_since = now(), recovery_retry_not_before = NULL,
+        started_at = NULL, budget_paused_seconds = 0,
+        codex_cap_hash = NULL, codex_claim_epoch = r.codex_claim_epoch + 1,
+        health = 'ok', health_reason = NULL, health_since = NULL,
+        updated_at = now()
+    WHERE r.id IN (SELECT locked.id FROM locked)
+      AND r.status = 'queued'
+      AND r.harness = 'codex'
+      AND r.codex_auth_mode = 'subscription'
+      AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework')
+      AND EXISTS (
+          SELECT 1 FROM codex_credential_state ccs
+          LEFT JOIN codex_provider_account cpa
+              ON cpa.id = ccs.provider_account_id AND cpa.user_id = r.user_id
+          WHERE ccs.user_secret_id = r.codex_secret_id
+            AND ccs.user_id = r.user_id
+            AND (
+                (cpa.coord_state = 'quarantined'
+                 AND cpa.credential_revision = r.codex_account_revision
+                 AND CASE WHEN pg_input_is_valid(r.codex_account_key, 'jsonb')
+                          THEN r.codex_account_key::jsonb
+                               = jsonb_build_array(cpa.provider_user_id, cpa.workspace_account_id)
+                          ELSE false END)
+                OR (r.codex_account_key IS NOT NULL
+                    AND ccs.material_revision > r.codex_material_revision
+                    AND (ccs.status IN ('staging', 'failed')
+                         OR (ccs.status = 'linked'
+                             AND cpa.credential_revision = r.codex_account_revision
+                             AND CASE WHEN pg_input_is_valid(r.codex_account_key, 'jsonb')
+                                      THEN r.codex_account_key::jsonb
+                                           = jsonb_build_array(cpa.provider_user_id, cpa.workspace_account_id)
+                                      ELSE false END)))
+            )
+      )
+    RETURNING r.id
+)
+SELECT (SELECT count(*) FROM page)::bigint AS page_size,
+       COALESCE((SELECT page.id FROM page ORDER BY page.id DESC LIMIT 1),
+                '00000000-0000-0000-0000-000000000000'::uuid)::uuid AS last_scanned_id,
+       COALESCE((SELECT array_agg(parked.id ORDER BY parked.id) FROM parked), '{}')::uuid[] AS parked_ids;
+
+-- name: ListCodexAccountWaitRunsPage :many
+-- PRD #1590 M3 (D3): one keyset page of the promote_codex_account_available pass. The ids of at
+-- most @page_cap runs held in recovery_wait with cause codex_account_unavailable, with id past
+-- the service's in-memory cursor, in id order, over the partial index
+-- idx_runs_codex_account_wait (00253). A pure read: every decision is re-made per run under
+-- lock (LockCodexAccountWaitRunForUpdate and the alias/account FOR SHARE NOWAIT pair), so a run
+-- that moved after this list is simply skipped.
+SELECT id FROM runs
+WHERE status = 'recovery_wait' AND recovery_wait_cause = 'codex_account_unavailable'
+  AND id > @after_id::uuid
+ORDER BY id
+LIMIT @page_cap::int;
+
+-- name: LockCodexAccountWaitRunForUpdate :one
+-- PRD #1590 M3 (D3): the first lock of the per-run promotion transaction, taken BEFORE the
+-- alias and then the account (run -> alias -> account). Status and cause are re-checked here,
+-- so a run cancelled or promoted since the page was listed is pgx.ErrNoRows. SKIP LOCKED: the
+-- sweeper never waits on a run row another transaction holds (a cancel, say); that run is
+-- retried on a later tick. No writer in the re-login path touches the run row. NO KEY UPDATE,
+-- the level PromoteCodexAccountWaitRun's own UPDATE takes: it changes no column a foreign key
+-- can reference, so the lock need not block FOR KEY SHARE (a child row's FK check).
+SELECT * FROM runs
+WHERE id = @id AND status = 'recovery_wait' AND recovery_wait_cause = 'codex_account_unavailable'
+FOR NO KEY UPDATE SKIP LOCKED;
+
+-- name: PromoteCodexAccountWaitRun :execrows
+-- PRD #1590 M3 (D3): the account-driven promotion recovery_wait -> queued, run inside the
+-- per-run transaction after evalCodexReleasePredicate passed on a GetRunCodexAuthContext read
+-- taken under the run, alias and account locks. The SET list is PromoteRecoveryWaitRuns' field
+-- for field (fresh RUN_TIMEOUT wall, banked pause cleared, capability revoked and epoch bumped,
+-- health reset); worker_id, session_id and recovery_wait_count stay as affinity and history,
+-- as there. Fenced on status and the cause, so it can promote only this hold.
+UPDATE runs SET
+    status     = 'queued',
+    status_since = now(),
+    started_at = NULL,
+    budget_paused_seconds = 0,
+    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE id = @id AND status = 'recovery_wait' AND recovery_wait_cause = 'codex_account_unavailable';
+
+-- name: FailClaimAssemblyExact :execrows
+-- Terminal claim assembly failure, fenced to the same locked claim (PRD #1590 D2). The
+-- SET list mirrors MarkRunFailedByID field for field, including #1482's card-only
+-- move_pending_since stamp (a card-less judge or prompt run keeps it NULL). It adds only
+-- the claim-capability revoke and the exact-claim WHERE.
+UPDATE runs SET
+    status = 'failed', status_since = now(), failure_reason = @failure_reason,
+    fail_origin = @fail_origin,
+    move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END,
+    finished_at = now(),
+    milestones_in_progress = NULL, milestones_agents = NULL,
+    pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
+    credential_switch_requested_at = NULL, credential_switch_generation = NULL,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
+    updated_at = now()
+WHERE id = @id AND worker_id = @worker_id AND claim_generation = @claim_generation
+  AND status = 'claimed';
+
+-- name: RequeueClaimAssemblyExact :execrows
+-- PRD #1590 D2: the transient claim-assembly outcomes (vault locked, custom-model capability
+-- missing, empty auto pool), fenced to the exact locked claim. @pool_wait=false is the
+-- RequeueClaimedRunToQueued field set (claimed -> queued, started_at kept). @pool_wait=true
+-- is the only writer of the empty-pool hold (PRD #754 M4): claimed -> pool_wait, a
+-- non-terminal, non-locking hold that M5 resumes. The pool_wait arm:
+--   - gives a later resume a FRESH RUN_TIMEOUT wall (started_at NULL, Decision 6d) and clears
+--     the pause banked against the old baseline (budget_paused_seconds 0, issue #783);
+--   - is NOT a usage park (Decision 9): limit_wait_count, limit_resets_at, retry_not_before
+--     and rate_limit_type are untouched, and limit_dead_secret_id is kept because M3's
+--     exclude-relax reads it on resume;
+--   - never holds a judge (`kind <> 'judge'`, Decision 14).
+-- Both arms keep the POSITIVE source guard (status = 'claimed'), revoke the claim's Codex
+-- capability (PRD #1147 F7), reset health (the status itself is the signal; never write a
+-- sentence into health_reason) and keep worker_id for resume affinity.
+UPDATE runs SET
+    status = CASE WHEN @pool_wait::boolean THEN 'pool_wait' ELSE 'queued' END,
+    status_since = now(),
+    started_at = CASE WHEN @pool_wait::boolean THEN NULL ELSE started_at END,
+    budget_paused_seconds = CASE WHEN @pool_wait::boolean THEN 0 ELSE budget_paused_seconds END,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
+    updated_at = now()
+WHERE id = @id AND worker_id = @worker_id AND claim_generation = @claim_generation
   AND status = 'claimed'
-  AND kind <> 'judge';
+  AND (NOT @pool_wait::boolean OR kind <> 'judge');
 
 -- name: ListPoolWaitRuns :many
 -- The reactive-resume worklist (PRD #754 M5): every run currently held in pool_wait,
@@ -5712,6 +5940,11 @@ UPDATE runs SET checkpoint_tip = @checkpoint_tip, checkpoint_tip_at = now() WHER
 -- lane; NULL-safe via COALESCE), and the exemption is keyed on review_target_run_id/kind (task-review,
 -- judge and chat are exempt), NEVER on all of kind='task'. Cast ::boolean so sqlc types it as a usable
 -- bool (an expression is interface{} without the cast, per .claude/rules/go.md).
+-- PRD #1590 M2 (D2, A1): codex_account_gated projects ClaimRun's Codex account gate onto each
+-- row (the SAME predicate text, evaluated over a self-join aliased r so the copies stay
+-- byte-identical), so the queued arm names the account hold instead of a worker reason for a
+-- queued run the gate excludes in the window before the park_codex_account_unavailable pass
+-- moves it to recovery_wait.
 SELECT id, user_id, status, auto_approve,
        started_at, last_activity_at, updated_at, status_since,
        health, health_reason, health_since, health_notified_at,
@@ -5725,7 +5958,38 @@ SELECT id, user_id, status, auto_approve,
             NOT ((CASE WHEN runs.model = ANY(@codex_curated_models::text[]) THEN runs.model
                        ELSE (SELECT u.default_codex_model FROM users u WHERE u.id = runs.user_id) END)
                  = ANY(@codex_curated_models::text[])),
-            false))::boolean AS codex_custom_root
+            false))::boolean AS codex_custom_root,
+       (EXISTS (
+           SELECT 1 FROM runs r
+           WHERE r.id = runs.id
+             AND r.harness = 'codex'
+             AND r.codex_auth_mode = 'subscription'
+             AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework')
+             AND EXISTS (
+                 SELECT 1 FROM codex_credential_state ccs
+                 LEFT JOIN codex_provider_account cpa
+                     ON cpa.id = ccs.provider_account_id AND cpa.user_id = r.user_id
+                 WHERE ccs.user_secret_id = r.codex_secret_id
+                   AND ccs.user_id = r.user_id
+                   AND (
+                       (cpa.coord_state = 'quarantined'
+                        AND cpa.credential_revision = r.codex_account_revision
+                        AND CASE WHEN pg_input_is_valid(r.codex_account_key, 'jsonb')
+                                 THEN r.codex_account_key::jsonb
+                                      = jsonb_build_array(cpa.provider_user_id, cpa.workspace_account_id)
+                                 ELSE false END)
+                       OR (r.codex_account_key IS NOT NULL
+                           AND ccs.material_revision > r.codex_material_revision
+                           AND (ccs.status IN ('staging', 'failed')
+                                OR (ccs.status = 'linked'
+                                    AND cpa.credential_revision = r.codex_account_revision
+                                    AND CASE WHEN pg_input_is_valid(r.codex_account_key, 'jsonb')
+                                             THEN r.codex_account_key::jsonb
+                                                  = jsonb_build_array(cpa.provider_user_id, cpa.workspace_account_id)
+                                             ELSE false END)))
+                   )
+             )
+       ))::boolean AS codex_account_gated
 FROM runs
 WHERE status IN ('queued', 'running', 'awaiting_approval')
   AND kind <> 'chat';

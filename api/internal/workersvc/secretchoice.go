@@ -403,7 +403,7 @@ func (s *Service) recordRunCredentialTx(ctx context.Context, run store.Run, cred
 	// Step 2: fence re-validate UNDER THE LOCK. A raced release/reclaim — the claim was released
 	// (claim_released_at set) or a reclaim bumped the generation past this claim's — makes this
 	// assembly stale. Abort WITHOUT writing and treat it like the vanished-run path
-	// (recoverClaimAssembly drops errRunVanished to an idle no-op; the run is requeued and
+	// (finishRunClaim drops errRunVanished to an idle no-op; the run is requeued and
 	// re-claimed fresh). Defense in depth: assembleClaim runs synchronously right after ClaimRun,
 	// so the fence normally holds.
 	if locked.ClaimGeneration != gen || locked.ClaimReleasedAt.Valid {
@@ -810,7 +810,7 @@ func (s *Service) claimExclude(run store.Run) uuid.UUID {
 //   - Empty-pool hold (Floor.ok == false): there is genuinely nothing pooled to spend
 //     — an empty pool, or the only pooled token is the excluded dead credential. Do NOT
 //     spend the non-pooled default and do NOT hard-fail; signal errAutoPoolEmpty, which
-//     recoverClaimAssembly holds in the non-locking pool_wait status (PRD #754 M4) so
+//     finishRunClaim holds in the non-locking pool_wait status (PRD #754 M4) so
 //     the run waits rather than billing an account the user did not pool.
 //
 // Floor.ok, not Select's PoolNonEmpty, decides floor-vs-hold: they diverge in the
@@ -849,7 +849,7 @@ func (s *Service) autoChoice(ctx context.Context, run store.Run) (secretChoice, 
 	}
 	// Genuinely nothing pooled to spend (empty pool, or the only pooled token is the
 	// excluded dead credential). Do NOT spend the default and do NOT hard-fail — signal
-	// an empty-pool hold that recoverClaimAssembly holds in pool_wait (PRD #754 M4).
+	// an empty-pool hold that finishRunClaim holds in pool_wait (PRD #754 M4).
 	return secretChoice{}, errAutoPoolEmpty
 }
 
@@ -884,7 +884,7 @@ func (s *Service) autoFloorRetry(ctx context.Context, run store.Run, failedID uu
 	floorID, ok := autoselect.Floor(cands, exclude, s.now())
 	if !ok {
 		// No OTHER pooled token to spend — terminal. Never fall to the non-pooled
-		// default (#754); recoverClaimAssembly fails the run on errCredentialUnavailable.
+		// default (#754); finishRunClaim fails the run on errCredentialUnavailable.
 		return secretChoice{}, fmt.Errorf("%w: no other pooled Anthropic token after open failure", errCredentialUnavailable)
 	}
 	id := floorID

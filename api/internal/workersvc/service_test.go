@@ -166,10 +166,24 @@ type fakeStore struct {
 	// requeuedRun records the run id reset to queued by the vault lock-race path
 	// (PRD #32 M3); nil unless RequeueClaimedRunToQueued was called.
 	requeuedRun *uuid.UUID
-	// poolWaitHeld records the args of the pool_wait hold (PRD #754 M4); nil unless
-	// SetRunPoolWait was called. A held run records NO credential and is NOT failed —
-	// tests assert on this to distinguish the hold from the old requeue and from a fail.
-	poolWaitHeld *store.SetRunPoolWaitParams
+	// The run lane's exact-claim finish transaction (PRD #1590 M1, claim_finish_fake_test.go).
+	// claimFailed / claimRequeued / claimParked record the COMMITTED fenced write, nil unless
+	// the transaction committed it. claimFinishLocked overrides the locked row (default: the
+	// ClaimRun row as claimed by the locking worker); claimFinishHolds stages the open holds
+	// for (run, worker, generation); claimReleased counts committed exact releases.
+	claimFailed       *store.FailClaimAssemblyExactParams
+	claimRequeued     *store.RequeueClaimAssemblyExactParams
+	claimParked       *store.ParkRunCodexAccountUnavailableParams
+	claimFinishLocked *store.Run
+	claimFinishHolds  []uuid.UUID
+	claimReleased     int
+	// claimReleaseRows overrides ReleaseCustodyHoldExact's affected-row count (default 1, the
+	// single exact hold) so a test can stage a release that matched no row.
+	claimReleaseRows *int64
+	// claimFinishLockErrs is consumed one per exact-claim row lock (then nil): a test stages
+	// SQLSTATE errors to drive finishRunClaim's bounded 55P03 retry.
+	claimFinishLockErrs []error
+	claimFinishBegins   int
 	// hasActiveRunForIssue is what the CreateRun dedup pre-check returns (PRD #754 M4);
 	// hasActiveRunForIssueErr forces its error path.
 	hasActiveRunForIssue    bool
@@ -1253,10 +1267,6 @@ func (f *fakeStore) SweepTaskNeverDispatched(_ context.Context, arg store.SweepT
 }
 func (f *fakeStore) RequeueClaimedRunToQueued(_ context.Context, id uuid.UUID) (int64, error) {
 	f.requeuedRun = &id
-	return 1, nil
-}
-func (f *fakeStore) SetRunPoolWait(_ context.Context, arg store.SetRunPoolWaitParams) (int64, error) {
-	f.poolWaitHeld = &arg
 	return 1, nil
 }
 func (f *fakeStore) HasActiveRunForIssue(_ context.Context, _ store.HasActiveRunForIssueParams) (bool, error) {
@@ -2505,11 +2515,11 @@ func TestClaimFailsRunWhenAnthropicTokenMissing(t *testing.T) {
 	if payload != nil {
 		t.Fatal("a run with no Anthropic token must not hand out a payload")
 	}
-	if fs.markedFailed == nil {
+	if fs.claimFailed == nil {
 		t.Fatal("the run should have been marked failed")
 	}
-	if !fs.markedFailed.FailureReason.Valid || !strings.Contains(fs.markedFailed.FailureReason.String, "Anthropic token") {
-		t.Fatalf("failure reason unclear: %+v", fs.markedFailed.FailureReason)
+	if !fs.claimFailed.FailureReason.Valid || !strings.Contains(fs.claimFailed.FailureReason.String, "Anthropic token") {
+		t.Fatalf("failure reason unclear: %+v", fs.claimFailed.FailureReason)
 	}
 }
 
@@ -2604,11 +2614,11 @@ func TestClaimFailsRunWhenToolPackagesRejected(t *testing.T) {
 	if payload != nil {
 		t.Fatal("a rejected tool package must not hand out a payload")
 	}
-	if fs.markedFailed == nil {
+	if fs.claimFailed == nil {
 		t.Fatal("the run should have been marked failed")
 	}
-	if !strings.Contains(fs.markedFailed.FailureReason.String, "opentofu") {
-		t.Fatalf("failure reason should name the rejected package: %+v", fs.markedFailed.FailureReason)
+	if !strings.Contains(fs.claimFailed.FailureReason.String, "opentofu") {
+		t.Fatalf("failure reason should name the rejected package: %+v", fs.claimFailed.FailureReason)
 	}
 }
 
@@ -2626,7 +2636,7 @@ func TestClaimFailsRunWhenPATUndecryptable(t *testing.T) {
 	if payload != nil {
 		t.Fatal("an undecryptable PAT must not hand out a payload")
 	}
-	if fs.markedFailed == nil {
+	if fs.claimFailed == nil {
 		t.Fatal("the run should have been marked failed")
 	}
 }
@@ -5450,7 +5460,7 @@ func TestClaimBoundToVanishedSecretFailsClosed(t *testing.T) {
 		t.Fatal("a claim whose bound credential does not resolve must not produce a payload — " +
 			"silently falling back to the default would spend the wrong account with no error")
 	}
-	if fs.markedFailed == nil {
+	if fs.claimFailed == nil {
 		t.Fatal("the run should have been failed with credential-unavailable")
 	}
 }
@@ -5680,7 +5690,7 @@ func TestJudgeBoundToVanishedSecretFailsClosed(t *testing.T) {
 	if payload != nil {
 		t.Fatal("a judge claim whose bound credential does not resolve must not produce a payload")
 	}
-	if fs.markedFailed == nil {
+	if fs.claimFailed == nil {
 		t.Fatal("the judge run should have been failed with credential-unavailable")
 	}
 }

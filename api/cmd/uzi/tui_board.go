@@ -146,7 +146,7 @@ func (b *boardState) visible() []apitypes.RunListItemDTO {
 			// #321 hides) plus the human word, so a user can filter by either "awaiting_approval"
 			// or "plan gate". The truly-raw r.Status is deliberately NOT included: it would let
 			// "running" match a planning run again, the exact thing #321 fixed.
-			_, word := stateGlyphWord(r.Status, r.Health, r.IsPlanning, r.IsRevising, r.LandingState, strOr(r.RecoveryWaitCause, ""))
+			word := runStateWord(r)
 			hay := strings.ToLower(strings.Join([]string{
 				r.ID, r.Kind, effectiveRunStatus(r.Status, r.IsPlanning, r.IsRevising),
 				word, r.Health, cellText(runTitle(r.RunDTO)),
@@ -162,7 +162,7 @@ func (b *boardState) visible() []apitypes.RunListItemDTO {
 
 // The three triage bands, in fixed top-to-bottom order.
 const (
-	bandNeedsYou = iota // awaiting_approval + awaiting_input + awaiting_followup — the only rows a human must act on
+	bandNeedsYou = iota // awaiting_approval + awaiting_input + awaiting_followup + a Codex relogin_required hold — the only rows a human must act on
 	bandFloor           // everything non-terminal not in NEEDS YOU (running/claimed/queued/planning/limit_wait/pool_wait/recovery_wait, stalled)
 	bandDone            // terminal: completed/failed/cancelled
 	numBands
@@ -192,12 +192,34 @@ func runBand(status string, isRevising bool) int {
 	return bandFloor
 }
 
+// runBandOf is runBand over a list row, plus the one band decision the status cannot make
+// alone: a run held on its Codex account that needs the owner to re-log in (PRD #1590
+// relogin_required) is the owner's turn, so it bands into NEEDS YOU. Every other Codex hold
+// action resolves without the owner and stays ON THE FLOOR. Every band decision on the board
+// (the ordering, the eyebrow counts, the row's title ink) goes through here so they agree.
+func runBandOf(r apitypes.RunListItemDTO) int {
+	if codexReloginHold(r.RunDTO) {
+		return bandNeedsYou
+	}
+	return runBand(r.Status, r.IsRevising)
+}
+
+// runStateWord is the human status word the board row draws for r (runStateToken's word),
+// which the `/` filter matches alongside the effective status.
+func runStateWord(r apitypes.RunListItemDTO) string {
+	if codexReloginHold(r.RunDTO) {
+		return codexReloginWord
+	}
+	_, word := stateGlyphWord(r.Status, r.Health, r.IsPlanning, r.IsRevising, r.LandingState, strOr(r.RecoveryWaitCause, ""))
+	return word
+}
+
 // bandOrder partitions runs into the three bands, preserving each band's internal order
 // (the server's), and concatenates them NEEDS YOU → ON THE FLOOR → DONE.
 func bandOrder(runs []apitypes.RunListItemDTO) []apitypes.RunListItemDTO {
 	var buckets [numBands][]apitypes.RunListItemDTO
 	for _, r := range runs {
-		b := runBand(r.Status, r.IsRevising)
+		b := runBandOf(r)
 		buckets[b] = append(buckets[b], r)
 	}
 	out := make([]apitypes.RunListItemDTO, 0, len(runs))
@@ -579,12 +601,12 @@ const (
 func (m tuiModel) buildBoardItems(rows []apitypes.RunListItemDTO) []boardItem {
 	var counts [numBands]int
 	for _, r := range rows {
-		counts[runBand(r.Status, r.IsRevising)]++
+		counts[runBandOf(r)]++
 	}
 	items := make([]boardItem, 0, len(rows)+numBands*2)
 	prevBand := -1
 	for i, r := range rows {
-		if b := runBand(r.Status, r.IsRevising); b != prevBand {
+		if b := runBandOf(r); b != prevBand {
 			if prevBand != -1 {
 				items = append(items, boardItem{kind: biSpacer})
 			}
@@ -930,14 +952,18 @@ func (m tuiModel) syncedScroll() int {
 	return start
 }
 
-// boardSummary is the top-right glyph cluster: ⚑ N · ✎ N · ➤ N · ▲ N · <total> runs.
+// boardSummary is the top-right glyph cluster: ⚑ N · ✎ N · ➤ N · ⚿ N · ▲ N · <total> runs.
 // Zero-count segments are dropped, so a healthy factory reads simply "N runs". Computed
-// over m.board.runs so it does not shrink under a filter. All three parks in the NEEDS YOU
-// band get a segment — awaiting_followup (PRD #517) alongside awaiting_approval and
-// awaiting_input — so a follow-up park is never invisible in the summary line.
+// over m.board.runs so it does not shrink under a filter. Every park in the NEEDS YOU
+// band gets a segment — awaiting_followup (PRD #517) alongside awaiting_approval and
+// awaiting_input, and the Codex relogin_required hold (PRD #1590, ⚿) — so no run that is
+// the owner's turn is invisible in the summary line.
 func (m tuiModel) boardSummary() string {
-	approvals, inputs, followups, warn := 0, 0, 0, 0
+	approvals, inputs, followups, relogins, warn := 0, 0, 0, 0, 0
 	for _, r := range m.board.runs {
+		if codexReloginHold(r.RunDTO) {
+			relogins++
+		}
 		switch r.Status {
 		case "awaiting_approval":
 			// issue #750: a run mid-"revise" replan keeps status == awaiting_approval but is
@@ -966,6 +992,9 @@ func (m tuiModel) boardSummary() string {
 	}
 	if followups > 0 {
 		segs = append(segs, paintSeg(m.pal.amber, nil, false, "➤ "+itoa(followups)))
+	}
+	if relogins > 0 {
+		segs = append(segs, paintSeg(m.pal.amber, nil, false, codexReloginGlyph+" "+itoa(relogins)))
 	}
 	if warn > 0 {
 		segs = append(segs, paintSeg(m.pal.stall, nil, false, "▲ "+itoa(warn)))

@@ -1386,3 +1386,112 @@ func TestSteerStateOnAParkedRun(t *testing.T) {
 		t.Errorf("steerState(unconsumed, completed) = %q — the terminal label regressed", got)
 	}
 }
+
+// codexHoldRun is a recovery_wait run held on its Codex account (PRD #1590) carrying action and
+// label; a nil action is the best-effort derivation that failed.
+func codexHoldRun(action, label *string) apitypes.RunDTO {
+	cause := codexAccountUnavailableCause
+	retry := time.Now().Add(30 * time.Minute)
+	return apitypes.RunDTO{
+		ID: "run-codex", Kind: "issue", Status: statusRecoveryWait, IssueTitle: "held", Health: "ok",
+		RecoveryWaitCause: &cause, CodexAccountAction: action, CodexSecretLabel: label,
+		// A retry stamp is set on purpose: this cause must never render a countdown off it.
+		RecoveryRetryNotBefore: &retry,
+	}
+}
+
+func strp(s string) *string { return &s }
+
+// TestCodexAccountActionLine pins the PRD #1590 D6 copy per action (the web shares it). Each
+// case reddens alone when its switch arm is dropped: the run then falls to the "Codex account
+// unavailable" default. Mutation-checked: deleting the relogin_required arm reddened the
+// relogin_required and label cases.
+func TestCodexAccountActionLine(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		action *string
+		label  *string
+		want   string
+	}{
+		{"reconciling", strp("reconciling"), strp("work"), "Codex account is reconciling"},
+		{"relogin_required", strp("relogin_required"), strp("work laptop"), "re-log in Codex credential work laptop to continue"},
+		{"relogin_required, no label", strp("relogin_required"), nil, "re-log in the run's Codex credential to continue"},
+		{"verifying_login", strp("verifying_login"), strp("work"), "verifying the new Codex login"},
+		{"resuming", strp("resuming"), strp("work"), "Codex account available again"},
+		{"unknown action", strp("some_future_action"), strp("work"), "Codex account unavailable"},
+		{"null action", nil, nil, "Codex account unavailable"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := codexAccountActionLine(codexHoldRun(tc.action, tc.label)); got != tc.want {
+				t.Errorf("codexAccountActionLine = %q, want %q", got, tc.want)
+			}
+		})
+	}
+	// Only a recovery_wait run on this cause is a Codex hold: a forge park, a legacy null
+	// cause and a running run with a stale action all render nothing.
+	forge := codexHoldRun(strp("reconciling"), nil)
+	forge.RecoveryWaitCause = strp(forgeUnreachableCause)
+	legacy := codexHoldRun(strp("reconciling"), nil)
+	legacy.RecoveryWaitCause = nil
+	running := codexHoldRun(strp("reconciling"), nil)
+	running.Status = "running"
+	for name, r := range map[string]apitypes.RunDTO{"forge": forge, "legacy": legacy, "running": running} {
+		if got := codexAccountActionLine(r); got != "" {
+			t.Errorf("%s: codexAccountActionLine = %q, want \"\" (not a Codex account hold)", name, got)
+		}
+	}
+}
+
+// TestCodexAccountActionLineHostileLabel: the alias label is user-authored, so control bytes,
+// an ANSI escape, a bidi override and a newline must reach the line inert. Mutation-checked:
+// drawing the raw label instead of cellText(label) reddened this test.
+func TestCodexAccountActionLineHostileLabel(t *testing.T) {
+	got := codexAccountActionLine(codexHoldRun(strp("relogin_required"), strp("\x1b[2J\u202E\x07wo\nrk\x1b]8;;http://x\x07")))
+	if strings.ContainsAny(got, "\x1b\x07\n\u202E") {
+		t.Fatalf("hostile label reached the line raw: %q", got)
+	}
+	if !strings.HasPrefix(got, "re-log in Codex credential ") || !strings.HasSuffix(got, " to continue") || !strings.Contains(got, "wo rk") {
+		t.Errorf("hostile label line = %q, want the relogin copy around the inert label", got)
+	}
+}
+
+// TestRenderRunDetailCodexAccountRow: `uzi run get` prints the CODEX_ACCOUNT row for a held
+// run, never a retry countdown for this cause, and no row for any other run.
+func TestRenderRunDetailCodexAccountRow(t *testing.T) {
+	render := func(r apitypes.RunDTO) string {
+		var buf bytes.Buffer
+		p := uzicli.NewPrinter(&buf, false, false, true, false)
+		if err := renderRunDetail(p, r); err != nil {
+			t.Fatalf("renderRunDetail: %v", err)
+		}
+		return buf.String()
+	}
+	out := render(codexHoldRun(strp("relogin_required"), strp("work")))
+	if !strings.Contains(out, "CODEX_ACCOUNT") || !strings.Contains(out, "re-log in Codex credential work to continue") {
+		t.Errorf("held run detail lacks the CODEX_ACCOUNT row:\n%s", out)
+	}
+	if strings.Contains(out, "retry at") || strings.Contains(out, "resumes in") {
+		t.Errorf("a Codex account hold must show no retry countdown:\n%s", out)
+	}
+	plain := codexHoldRun(strp("relogin_required"), strp("work"))
+	plain.RecoveryWaitCause = nil
+	if out := render(plain); strings.Contains(out, "CODEX_ACCOUNT") {
+		t.Errorf("a non-Codex recovery park gained a CODEX_ACCOUNT row:\n%s", out)
+	}
+}
+
+// TestRunStatusCellCodexHold: the `uzi run list` / `uzi admin runs` STATUS cell appends the
+// short, label-free action for a held run and is unchanged for every other run.
+func TestRunStatusCellCodexHold(t *testing.T) {
+	held := apitypes.RunListItemDTO{RunDTO: codexHoldRun(strp("reconciling"), nil)}
+	if got, want := runStatusCell(held), "recovery_wait (Codex reconciling)"; got != want {
+		t.Errorf("runStatusCell(held) = %q, want %q", got, want)
+	}
+	other := apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{Status: "running"}}
+	if got := runStatusCell(other); got != "running" {
+		t.Errorf("runStatusCell(running) = %q, want \"running\"", got)
+	}
+	if got := steerState("follow_up", nil, nil, statusRecoveryWait, codexAccountUnavailableCause); got != "queued (run held on its Codex account)" {
+		t.Errorf("steerState(codex hold) = %q", got)
+	}
+}

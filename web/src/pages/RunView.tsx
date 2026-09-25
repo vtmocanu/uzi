@@ -6,7 +6,7 @@
 // states get a hero banner: the MR link is the run's entire output and must
 // not hide in chrome. The breadcrumb keeps PRD #12's in-app board / issue links.
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Link, useParams } from "react-router-dom";
 import {
   api,
@@ -33,6 +33,7 @@ import {
 import { ExtendTimePopover } from "../components/ExtendTimePopover";
 import { canReworkNow, canToggleMrRework, effectiveMrRework } from "../lib/mrRework";
 import { stripUnsafeChars } from "../lib/safeText";
+import { sanitizeLabel } from "../lib/sanitizeLabel";
 import { useNow } from "../lib/useNow";
 import {
   effectiveMilestoneAgents,
@@ -1491,6 +1492,76 @@ function PoolWaitPanel({
 }
 
 /**
+ * PRD #1590 D6: the copy for a run held because its Codex subscription account cannot be
+ * used (`recovery_wait_cause === "codex_account_unavailable"`), keyed on the server-derived
+ * `codex_account_action`. The hold has NO timer — it lasts until the account recovers, the
+ * owner logs in again, or the owner cancels — so none of these carries a retry time.
+ * `label` is the run's own snapshotted alias label, already passed through sanitizeLabel;
+ * it is rendered as a text child (React-escaped), never as markup. An unknown or null
+ * action gets an honest generic line rather than a guess at a known one.
+ *
+ * `announce` is the sentence RunView's always-mounted sr-only region speaks. Every action
+ * has its OWN sentence (label-free, so it never depends on the alias): the region only
+ * narrates a content change, so two actions sharing one sentence would make a transition
+ * such as verifying_login → resuming silent. `holding` is false only for resuming: the
+ * account is usable again, so the "this hold does not expire" line no longer applies.
+ */
+function codexHoldCopy(
+  action: string | null,
+  label: string,
+): { heading: ReactNode; body: string; announce: string; relogin: boolean; holding: boolean } {
+  switch (action) {
+    case "reconciling":
+      return {
+        heading: "Waiting: Codex account is reconciling",
+        body: "The Codex account this run uses is repairing its login on its own. The run resumes automatically once it does, so no action is needed.",
+        announce: "This run is waiting while its Codex account repairs its login. No action is needed.",
+        relogin: false,
+        holding: true,
+      };
+    case "relogin_required":
+      return {
+        heading: label ? (
+          <>
+            Waiting: re-log in Codex credential{" "}
+            <span className="[overflow-wrap:anywhere]">“{label}”</span> to continue
+          </>
+        ) : (
+          "Waiting: re-log in the run's Codex credential to continue"
+        ),
+        body: "The Codex login this run uses can no longer be refreshed. Log in again on the same credential with the same ChatGPT account and the run resumes on its own. Logging in with a different account fails the run instead.",
+        announce: "This run is waiting for you to log in to its Codex credential again.",
+        relogin: true,
+        holding: true,
+      };
+    case "verifying_login":
+      return {
+        heading: "Waiting: verifying the new Codex login",
+        body: "uzi is checking that the new login belongs to the same ChatGPT account. The run resumes as soon as it is verified.",
+        announce: "This run is waiting while uzi verifies the new Codex login.",
+        relogin: false,
+        holding: true,
+      };
+    case "resuming":
+      return {
+        heading: "Resuming: Codex account available again",
+        body: "The Codex account is usable again. The run goes back in the queue on the next sweep and picks up where it left off.",
+        announce: "The Codex account is usable again. This run is resuming.",
+        relogin: false,
+        holding: false,
+      };
+    default:
+      return {
+        heading: "Waiting: Codex account unavailable",
+        body: "The Codex account this run uses cannot be used right now. The run holds here until the account is usable again.",
+        announce: "This run is waiting on its Codex account and will resume once the account is usable.",
+        relogin: false,
+        holding: true,
+      };
+  }
+}
+
+/**
  * Issue #1197: the transient-recovery park panel — the analogue of PoolWaitPanel for
  * `recovery_wait`, and deliberately COPY ONLY.
  *
@@ -1506,9 +1577,13 @@ function PoolWaitPanel({
  * PRD #1392 M5: when the typed cause is `forge_unreachable` (the forge stayed unreachable
  * at clone) the panel swaps in forge-specific copy — "Waiting for the forge", the retry
  * time from `recovery_retry_not_before`, and the park count against its cap ("N of MAX",
- * or "N of unlimited" when `forge_park_max` is 0). A null/other cause keeps the generic
- * transient-interruption copy (issue #1197, widened by issue #1088). The wording is kept
- * consistent with the TUI and `uzi run get`.
+ * or "N of unlimited" when `forge_park_max` is 0).
+ *
+ * PRD #1590 D6: when the cause is `codex_account_unavailable` the panel swaps in the
+ * per-action Codex copy from codexHoldCopy instead, with no retry time or park count.
+ *
+ * A null/other cause keeps the generic transient-interruption copy (issue #1197, widened
+ * by issue #1088). The wording is kept consistent with the TUI and `uzi run get`.
  *
  * Exported like the sibling panels so its copy is reachable without mounting the page.
  */
@@ -1518,9 +1593,16 @@ export function RecoveryWaitPanel({ run }: { run: Run }) {
   // limit_wait, and this self-hides on both so mounting all three side by side is safe.
   if (run.status !== "recovery_wait") return null;
 
-  // PRD #1392 M5: a forge-unreachable park gets forge-specific copy. Every other cause
-  // (including the null/untyped transient-interruption park, issue #1197/#1088) keeps the copy below.
+  // PRD #1392 M5: a forge-unreachable park gets forge-specific copy, and (PRD #1590 D6) a
+  // codex_account_unavailable hold gets the Codex copy below. Every other cause (including
+  // the null/untyped transient-interruption park, issue #1197/#1088) keeps the generic copy.
   const forgePark = run.recovery_wait_cause === "forge_unreachable";
+  // PRD #1590 D6: a Codex account hold has its own copy and, unlike the forge park, NO
+  // retry time or park count — the hold has no timer, so nothing may count down.
+  const codexHold =
+    run.recovery_wait_cause === "codex_account_unavailable"
+      ? codexHoldCopy(run.codex_account_action, sanitizeLabel(run.codex_secret_label ?? "").trim())
+      : null;
   const retryMs = run.recovery_retry_not_before ? Date.parse(run.recovery_retry_not_before) : NaN;
   // Same wall-clock HH:MM idiom as the paused/limit surfaces on this page.
   const retryAt = Number.isFinite(retryMs)
@@ -1541,9 +1623,29 @@ export function RecoveryWaitPanel({ run }: { run: Run }) {
             what reliably announces the hold. */}
         <p role="status" className="text-sm font-semibold text-warn">
           <span aria-hidden="true">⏸ </span>
-          {forgePark ? "Waiting for the forge" : "Recovering and resuming automatically"}
+          {codexHold
+            ? codexHold.heading
+            : forgePark
+              ? "Waiting for the forge"
+              : "Recovering and resuming automatically"}
         </p>
-        {forgePark ? (
+        {codexHold ? (
+          <>
+            <p className="mt-0.5 text-xs text-muted">{codexHold.body}</p>
+            {codexHold.relogin && (
+              <p className="mt-1.5 text-xs">
+                <Link to="/settings" className="font-medium text-fg underline hover:text-brand">
+                  Log in again in Settings
+                </Link>
+              </p>
+            )}
+            {codexHold.holding && (
+              <p className="mt-1.5 text-xs text-muted">
+                This hold does not expire. Cancel the run if you would rather not wait.
+              </p>
+            )}
+          </>
+        ) : forgePark ? (
           <>
             <p className="mt-0.5 text-xs text-muted">
               This run paused because the forge was unreachable when it went to clone. It
@@ -1800,7 +1902,12 @@ export function RunView() {
         : run?.status === "pool_wait"
           ? "pool_wait"
           : run?.status === "recovery_wait"
-            ? "recovery_wait"
+            ? // PRD #1590: a Codex account hold is not a self-resuming transient park, so
+              // it keys on its action, and every action has its own sentence
+              // (codexHoldCopy's `announce`), so each action change is re-announced.
+              run.recovery_wait_cause === "codex_account_unavailable"
+              ? `codex:${run.codex_account_action ?? ""}`
+              : "recovery_wait"
             : run?.status === "paused"
               ? "paused"
             : "";
@@ -1816,6 +1923,8 @@ export function RunView() {
           ? "The run is waiting for a pooled Anthropic token. Add a token to the pool and it resumes automatically."
           : parkKey === "recovery_wait"
             ? "This run paused to recover from a transient interruption and will resume automatically."
+            : parkKey.startsWith("codex:")
+              ? codexHoldCopy(parkKey.slice("codex:".length) || null, "").announce
             : parkKey === "paused"
               ? "The run is paused. Resume it from this page or with the uzi run resume command."
             : "The agent is asking you a question. The run is parked until you answer.",

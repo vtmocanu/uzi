@@ -357,8 +357,8 @@ func judgeRunToDTO(jr *store.GetJudgeRunUsageForTargetRow) *apitypes.JudgeRunDTO
 //     judge run (its writer guards `kind = 'task' AND interactive`), but the schema
 //     permits the status on any row, so the query can still return it.
 //   - pool_wait (00170): PRD #754's empty-token-pool hold; out of reach for a judge run
-//     (SetRunPoolWait carries `AND kind <> 'judge'`, Decision 14, and only an auto run is
-//     ever held), but the schema permits the status on any row.
+//     (RequeueClaimAssemblyExact's pool_wait arm carries `AND kind <> 'judge'`, Decision 14,
+//     and only an auto run is ever held), but the schema permits the status on any row.
 //   - recovery_wait (00203): issue #1197's transient-recovery park; out of reach for a
 //     judge run (SetRunRecoveryWait carries `AND kind <> 'judge'`, mirroring Decision 14),
 //     but the schema permits the status on any row.

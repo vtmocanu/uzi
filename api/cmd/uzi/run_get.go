@@ -34,7 +34,7 @@ func newRunListCmd(env Env, gf *globalFlags) *cobra.Command {
 			rows := make([][]string, 0, len(runs))
 			now := time.Now()
 			for _, r := range runs {
-				rows = append(rows, []string{r.ID, r.Kind, displayRunStatus(r.Status, r.IsPlanning, r.IsRevising, r.LandingState), runAgeCell(r.RunDTO, now), harnessListCell(r.Harness), runTitle(r.RunDTO)})
+				rows = append(rows, []string{r.ID, r.Kind, runStatusCell(r), runAgeCell(r.RunDTO, now), harnessListCell(r.Harness), runTitle(r.RunDTO)})
 			}
 			return p.Table([]string{"ID", "KIND", "STATUS", "AGE", "HARNESS", "TITLE"}, rows)
 		},
@@ -208,7 +208,13 @@ func newRunLogsCmd(env Env, gf *globalFlags) *cobra.Command {
 							// prints the retry time + park count against its cap; every other
 							// cause keeps the transient-interruption wording (issue #1197,
 							// widened to a transient provider outage by issue #1088).
-							if isForgePark(run) {
+							if line := codexAccountActionLine(run); line != "" {
+								// PRD #1590: a Codex account hold has no retry clock; it
+								// says what the account needs and does not promise a resume.
+								_, _ = fmt.Fprintf(env.Stderr,
+									"run %s held — %s; still following\n",
+									args[0], line)
+							} else if isForgePark(run) {
 								_, _ = fmt.Fprintf(env.Stderr,
 									"run %s %s — still following; it resumes on its own\n",
 									args[0], forgeParkLine(run))

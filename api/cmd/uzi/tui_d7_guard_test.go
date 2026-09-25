@@ -134,6 +134,11 @@ var d7UntrustedFields = []string{
 	// header credential tag was removed), both via renderer.Plain. Same defence: this guard +
 	// the hostile-label case in the render test.
 	"AnthropicSecretLabel",
+	// CodexSecretLabel is the run's USER-AUTHORED Codex alias label (PRD #1590 D6), drawn on the
+	// board's selected-row second line and the detail park line only inside
+	// codexAccountActionLine (cellText) and renderer.Plain. The hostile-label case in
+	// TestCodexHoldTUIDetailAndBoard is the render-level proof.
+	"CodexSecretLabel",
 	// Codex meter labels (PRD #1209 M3). Aliases (a Codex account's linked-alias labels) and
 	// DisplayName (a Codex bucket's human name) are user-/provider-authored free text drawn on
 	// the board strip (boardCodexAccountsSeg) and the detail rail (railCodexRateMeters) via

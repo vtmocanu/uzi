@@ -8,6 +8,8 @@ import (
 	"charm.land/glamour/v2/ansi"
 	"charm.land/glamour/v2/styles"
 	lipgloss "charm.land/lipgloss/v2"
+
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 )
 
 // D7's render layer: every untrusted string the TUI draws passes through sanitizeTTY
@@ -231,7 +233,9 @@ func displayHealth(health string) string {
 // tail so the many existing call sites without it stay valid. When it is "forge_unreachable"
 // the wait word reads "forge wait" instead of "recovery wait" (glyph and colour unchanged —
 // it is still a wait-family hold). The retry/cap detail does not fit this fixed-width token;
-// it lives on the run-get notice and the web panel.
+// it lives on the run-get notice and the web panel. PRD #1590: "codex_account_unavailable"
+// reads "codex wait" here, its action living on the board second line and the detail park line;
+// a relogin_required hold is re-tokened "⚿ codex login" by palette.runStateToken.
 //
 // LANDING (issue #1418): landingState is the run's server-derived LandingState. A `failed` run
 // whose value is "needs_landing" reads the word "needs landing" instead of "failed" — its
@@ -280,6 +284,14 @@ func stateGlyphWord(status, health string, isPlanning, isRevising bool, landingS
 		// park reads "forge wait" so it is distinguishable from the empty-turn recovery.
 		if len(cause) > 0 && cause[0] == forgeUnreachableCause {
 			return "~", "forge wait"
+		}
+		// PRD #1590: a run held on its Codex account. The action ("reconciling",
+		// "re-log in …") does not fit this fixed-width token; the board's selected-row
+		// second line and the detail's park line carry it (codexAccountActionLine). A
+		// relogin_required hold never reaches here on the board or detail header:
+		// runStateToken draws it as the amber "codex login" attention token instead.
+		if len(cause) > 0 && cause[0] == codexAccountUnavailableCause {
+			return "~", "codex wait"
 		}
 		return "~", "recovery wait"
 	case statusPaused:
@@ -348,6 +360,34 @@ type runToken struct {
 func (p palette) stateToken(status, health string, isPlanning, isRevising bool, landingState string, cause ...string) runToken {
 	g, w := stateGlyphWord(status, health, isPlanning, isRevising, landingState, cause...)
 	return runToken{glyph: g, word: w, color: p.stateColor(status, health, isPlanning, isRevising)}
+}
+
+// codexReloginHold reports whether a run is held on its Codex account AND the account needs
+// the owner to re-log in (PRD #1590 D6 relogin_required). It is the one Codex hold action a
+// human must act on, so the board bands it into NEEDS YOU and counts it in the header
+// cluster; every other action (reconciling, verifying_login, resuming, unknown) resolves on
+// its own and stays an ON THE FLOOR "codex wait".
+func codexReloginHold(r apitypes.RunDTO) bool {
+	return isCodexAccountHold(r) && strOr(r.CodexAccountAction, "") == codexActionReloginRequired
+}
+
+// Glyph and word of a relogin_required Codex hold (PRD #1590): an attention token like the
+// other NEEDS YOU parks (⚑ plan gate, ✎ needs input, ➤ follow-up), drawn in their amber. The
+// key glyph ⚿ is its NO_COLOR twin, distinct from the ~ every self-resolving wait draws.
+const (
+	codexReloginGlyph = "⚿"
+	codexReloginWord  = "codex login"
+)
+
+// runStateToken is stateToken over a whole run: the Codex relogin_required hold (which the
+// status/cause pair cannot express, it hangs on CodexAccountAction) reads as an amber
+// attention token, and every other run takes stateToken unchanged. isRevising is passed
+// separately because only the list DTO carries it (the detail header passes false).
+func (p palette) runStateToken(r apitypes.RunDTO, isRevising bool) runToken {
+	if codexReloginHold(r) {
+		return runToken{glyph: codexReloginGlyph, word: codexReloginWord, color: p.amber}
+	}
+	return p.stateToken(r.Status, r.Health, r.IsPlanning, isRevising, r.LandingState, strOr(r.RecoveryWaitCause, ""))
 }
 
 // verdictColor maps a judge verdict to a severity colour: issues → alarm red, everything

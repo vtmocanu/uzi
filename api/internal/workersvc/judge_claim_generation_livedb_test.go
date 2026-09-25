@@ -45,6 +45,8 @@ func TestJudgeClaimCarriesClaimGenerationLiveDB(t *testing.T) {
 	          VALUES ($1, $2, 'judge', 't', 'd', 'queued', $3)`, judgeID, userID, targetID)
 
 	svc := New(env.q, env.box, testParams())
+	// PRD #1590 M1: the run-lane claim settles in an exact-claim transaction, as main.go wires it.
+	svc.SetTxBeginner(env.pool)
 	svc.SetSettings(fakeSettings{enabled: true, model: "haiku"})
 	wkr := store.Worker{ID: workerID, UserID: userID, Name: "worker-judge", Status: "online"}
 

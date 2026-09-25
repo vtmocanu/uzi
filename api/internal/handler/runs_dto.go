@@ -630,3 +630,48 @@ func steerInputToDTO(i store.RunUserInput) apitypes.SteerInputDTO {
 		Disposition: textPtrValue(i.Disposition.Valid, i.Disposition.String),
 	}
 }
+
+// overlayCodexAccountActions sets codex_account_action and the run's own codex_secret_label
+// (PRD #1590 D6) on the DTOs of runs held on codex_account_unavailable. runToDTO stays pure, so the read handlers overlay it here. Only
+// held runs are looked up, in ONE batched read per call, so a response with no held run costs no
+// query. Best-effort: a read error logs and leaves every action and label null, never failing the
+// read.
+func (h *Handler) overlayCodexAccountActions(ctx context.Context, dtos ...*apitypes.RunDTO) {
+	var ids []uuid.UUID
+	byID := make(map[uuid.UUID][]*apitypes.RunDTO)
+	for _, d := range dtos {
+		if d == nil || !workersvc.IsCodexAccountHold(d.Status, d.RecoveryWaitCause) {
+			continue
+		}
+		id, err := uuid.Parse(d.ID)
+		if err != nil {
+			continue
+		}
+		if _, seen := byID[id]; !seen {
+			ids = append(ids, id)
+		}
+		byID[id] = append(byID[id], d)
+	}
+	if len(ids) == 0 || h.wsvc == nil {
+		return
+	}
+	actions, err := h.wsvc.CodexAccountActionsForRuns(ctx, ids)
+	if err != nil {
+		slog.Error("codex account actions", "runs", len(ids), "error", err)
+		return
+	}
+	for id, ds := range byID {
+		hold, ok := actions[id]
+		if !ok {
+			continue
+		}
+		for _, d := range ds {
+			a := hold.Action
+			d.CodexAccountAction = &a
+			if hold.Label != nil {
+				l := *hold.Label
+				d.CodexSecretLabel = &l
+			}
+		}
+	}
+}

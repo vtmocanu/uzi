@@ -103,12 +103,74 @@ forge error (401/403/404 — bad credentials or a deleted repo) fails the run
 immediately instead of parking, since retrying would not help. Cancelling
 the run at any point during these retries ends it `cancelled`, as usual.
 
+## Codex account unavailable
+
+A `recovery_wait` park can also come from the Codex subscription account
+itself: it is quarantined (a safety state, not a defect) or it needs a fresh
+login, so uzi holds a Codex subscription run here instead of failing it.
+Only the run kinds that hold custody of your source — issue, ci_fix,
+self_improve, prompt, task and mr_rework — are held this way; a Codex chat
+run still fails immediately (you're present to react to it), and so does a
+judge run (it's advisory).
+
+The run card, `uzi run get`, `uzi run list`/`uzi admin runs`, and the TUI
+board each name one of four states (a state this client does not recognise
+reads **Codex account unavailable**):
+
+- **Codex account is reconciling** — the account is repairing its login on
+  its own. No action is needed; the run resumes automatically once it
+  clears.
+- **Re-log in Codex credential \<label\> to continue** — the account has no way back on
+  its own. Log in again in Settings, on the **same** credential — the same
+  alias, the same ChatGPT account. Logging in with a different account does
+  not resume the run (see below).
+- **Verifying the new Codex login** — you already logged in again; uzi is
+  confirming the new login belongs to the same account before releasing
+  anything.
+- **Codex account available again** — the account cleared; the run is going
+  back into the queue and will pick up where it left off. When the hold
+  began at claim time, it prefers the worker that held its source.
+
+A successful same-credential re-login re-admits the run: the activity feed
+records the re-admission, naming the credential and what changed.
+
+### No expiry, no timer
+
+Unlike the forge-unreachable park above, this hold has no lifetime cap and
+no countdown. It lasts until the account recovers, you log in again, or you
+cancel. Cancel works exactly as it does for any `recovery_wait` run.
+
+### When it fails instead
+
+Logging in with a different ChatGPT account does not resume the run: it
+fails with `credential_unavailable` and a reason naming the change. The
+same happens if the credential is deleted while the run waits, or if the
+account's credential revision no longer matches the one the run started
+with. `uzi run set-token` does not accept Codex credentials; a Codex subscription run whose
+credential is gone cannot be re-pointed at a different one, only
+cancelled and re-created.
+
+### Where you'll see it
+
+- The run page's recovery panel, with the per-state copy above and, for a
+  re-login hold, a link to Settings.
+- `uzi run get <id>` — a `CODEX_ACCOUNT` row with the full sentence.
+- `uzi run list` / `uzi admin runs` — the STATUS cell appends a short form
+  in parentheses, e.g. `recovery_wait (re-log in Codex credential)`.
+- `uzi tui` — a re-login hold is banded into NEEDS YOU as `⚿ codex login`
+  and counted in the top summary's `⚿ N` segment. The other three states
+  stay in ON THE FLOOR and read `~ codex wait`, like any other
+  self-resolving recovery park.
+
 ## Other waiting states
 
 - `recovery_wait`: a positively-empty SDK turn or a transient provider error
-  persisted through bounded retries, or the forge was unreachable at clone/fetch
-  (see [Forge unreachable at clone](#forge-unreachable-at-clone) above). The
-  server retries automatically after a backoff.
+  persisted through bounded retries, the forge was unreachable at clone/fetch
+  (see [Forge unreachable at clone](#forge-unreachable-at-clone) above), or
+  the Codex subscription account is unavailable (see
+  [Codex account unavailable](#codex-account-unavailable) above). The server
+  retries automatically after a backoff, except the Codex account hold,
+  which has no timer and instead resumes when the account does.
 - `limit_wait`: a usage-limit window must reset. See
   [Paused on a usage limit](run-limit-wait.md).
 - `pool_wait`: no token is available in the selected pool. It needs an

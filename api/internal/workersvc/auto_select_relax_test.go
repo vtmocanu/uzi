@@ -132,14 +132,14 @@ func TestAutoChoiceStillExcludesDeadTokenWhileWindowClosed(t *testing.T) {
 		t.Fatalf("recorded a credential while the sole pooled token's window was still closed: %+v", f.fs.recordedCreds)
 	}
 	// PRD #754 M4: a window-closed hold now transitions the run to pool_wait, not requeue.
-	if f.fs.poolWaitHeld == nil || f.fs.poolWaitHeld.ID != f.runID {
-		t.Fatalf("run not held in pool_wait: %v — a window-closed hold holds the run", f.fs.poolWaitHeld)
+	if f.fs.claimRequeued == nil || !f.fs.claimRequeued.PoolWait || f.fs.claimRequeued.ID != f.runID {
+		t.Fatalf("run not held in pool_wait: %v — a window-closed hold holds the run", f.fs.claimRequeued)
 	}
-	if f.fs.requeuedRun != nil {
-		t.Fatalf("run was requeued (%v); M4 replaced the requeue with the pool_wait hold", f.fs.requeuedRun)
+	if f.fs.claimRequeued != nil && !f.fs.claimRequeued.PoolWait {
+		t.Fatalf("run was requeued (%v); M4 replaced the requeue with the pool_wait hold", f.fs.claimRequeued)
 	}
-	if f.fs.markedFailed != nil {
-		t.Fatalf("the run was failed terminally (%v); a window-closed hold must not hard-fail", f.fs.markedFailed)
+	if f.fs.claimFailed != nil {
+		t.Fatalf("the run was failed terminally (%v); a window-closed hold must not hard-fail", f.fs.claimFailed)
 	}
 	// M3's exclude-relax must still be able to read the dead credential on resume, so the
 	// hold must NOT clear limit_dead_secret_id — the query leaves it in place (asserted at

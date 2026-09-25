@@ -152,7 +152,7 @@ func TestSweepPoolResumeSkipsCandidateReadFailure(t *testing.T) {
 // #1247 M3, Part 3). Early promotion (the set-token verb and D8) can leave a pool_wait
 // run carrying a FUTURE retry_not_before whose only AutoEligible token is its own dead
 // credential — a state the pre-M3 exclude-blind PoolNonEmpty loop would "resume" every
-// tick, only for the run to re-hold, churning forever while SetRunPoolWait never counts
+// tick, only for the run to re-hold, churning forever while the pool_wait hold never counts
 // against RUN_LIMIT_MAX_WAITS. The fix asks autoselect.Floor(cands, claimExclude(run)):
 // with the sole token excluded (its window still closed), Floor.ok is false, so the run
 // stays held and is NOT churned across ticks.

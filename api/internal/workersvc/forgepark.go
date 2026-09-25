@@ -26,6 +26,19 @@ var recoveryWaitCauses = map[string]bool{
 	"provider_outage":   true,
 }
 
+// recoveryCauseCodexAccountUnavailable is the PRD #1590 cause for a Codex run held on its
+// quarantined subscription account or a same-alias re-login (D1/D2).
+const recoveryCauseCodexAccountUnavailable = "codex_account_unavailable"
+
+// serverRecoveryWaitCauses are the recovery_wait causes only the SERVER writes, kept apart
+// from the worker-reportable recoveryWaitCauses above. codex_account_unavailable is written
+// by finishRunClaim's exact-claim park (ParkRunCodexAccountUnavailable), never by a worker:
+// SetState refuses it as a reported cause. Together the two sets are exactly
+// runs_recovery_wait_cause_check (pinned by TestRecoveryWaitCauseVocabularyMatchesCheck).
+var serverRecoveryWaitCauses = map[string]bool{
+	recoveryCauseCodexAccountUnavailable: true,
+}
+
 // parkForgeUnreachable is SetState's forge pre-clone park transaction (PRD #1392 M1, D2/D3/D4).
 // A transient forge failure at clone parks the run on 'recovery_wait' with a typed cause,
 // settling its exact-generation custody hold in the SAME locked transaction, or fails it past

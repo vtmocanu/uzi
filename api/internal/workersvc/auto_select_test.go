@@ -294,7 +294,7 @@ func TestSelfImproveIgnoresTheWorkerBindMode(t *testing.T) {
 //     recorded as pool_stale with no headroom — the SPENT id is the pooled token, not
 //     f.fs.defaultCredID();
 //   - a GENUINELY empty pool holds: the claim transitions the run to pool_wait
-//     (errAutoPoolEmpty ⇒ SetRunPoolWait, PRD #754 M4), records no credential at all,
+//     (errAutoPoolEmpty ⇒ RequeueClaimAssemblyExact pool_wait, PRD #754 M4), records no credential at all,
 //     and above all never records the default.
 //
 // MUTATION THIS CATCHES: reinstating the owner-default fallback on either rung — the
@@ -374,15 +374,15 @@ func TestAutoFloorsOntoAPooledTokenNeverTheDefault(t *testing.T) {
 						f.fs.recordedCreds)
 				}
 				// PRD #754 M4: the empty-pool claim now HOLDS the run in pool_wait
-				// (SetRunPoolWait) instead of the M2 interim requeue-to-queued.
-				if f.fs.poolWaitHeld == nil || f.fs.poolWaitHeld.ID != f.runID {
-					t.Fatalf("run not held in pool_wait: %v — an empty pool holds the run, not requeues it", f.fs.poolWaitHeld)
+				// (RequeueClaimAssemblyExact's pool_wait arm) instead of the M2 interim requeue.
+				if f.fs.claimRequeued == nil || !f.fs.claimRequeued.PoolWait || f.fs.claimRequeued.ID != f.runID {
+					t.Fatalf("run not held in pool_wait: %v — an empty pool holds the run, not requeues it", f.fs.claimRequeued)
 				}
-				if f.fs.requeuedRun != nil {
-					t.Fatalf("run was requeued (%v); M4 replaced the requeue with the pool_wait hold", f.fs.requeuedRun)
+				if f.fs.claimRequeued != nil && !f.fs.claimRequeued.PoolWait {
+					t.Fatalf("run was requeued (%v); M4 replaced the requeue with the pool_wait hold", f.fs.claimRequeued)
 				}
-				if f.fs.markedFailed != nil {
-					t.Fatalf("the run was failed terminally (%v); an empty pool must not hard-fail — it holds in pool_wait", f.fs.markedFailed)
+				if f.fs.claimFailed != nil {
+					t.Fatalf("the run was failed terminally (%v); an empty pool must not hard-fail — it holds in pool_wait", f.fs.claimFailed)
 				}
 			})
 		}
@@ -438,13 +438,13 @@ func TestAutoFloorIsIndependentOfWaitOnLimit(t *testing.T) {
 			}
 			// The floor must SPEND, never hold or hard-fail — the two non-floor outcomes a
 			// wait_on_limit coupling would most plausibly divert to.
-			if f.fs.poolWaitHeld != nil {
+			if f.fs.claimRequeued != nil && f.fs.claimRequeued.PoolWait {
 				t.Fatalf("wait_on_limit=%v: a stale (floorable) pool was held in pool_wait (%v); it must floor, not hold",
-					waitOnLimit, f.fs.poolWaitHeld)
+					waitOnLimit, f.fs.claimRequeued)
 			}
-			if f.fs.markedFailed != nil {
+			if f.fs.claimFailed != nil {
 				t.Fatalf("wait_on_limit=%v: the run was failed terminally (%v); a floorable pool never hard-fails",
-					waitOnLimit, f.fs.markedFailed)
+					waitOnLimit, f.fs.claimFailed)
 			}
 		})
 	}
@@ -495,7 +495,7 @@ func TestAutoCandidateQueryErrorFailsTheClaim(t *testing.T) {
 	if len(f.fs.recordedCreds) != 0 {
 		t.Fatalf("recorded a credential after a failed selection: %+v", f.fs.recordedCreds)
 	}
-	if f.fs.markedFailed != nil {
+	if f.fs.claimFailed != nil {
 		t.Fatal("a transport error must not fail the run terminally; the claim is retried")
 	}
 }
@@ -532,8 +532,8 @@ func TestAutoRetriesOnceOntoAnotherPooledTokenWhenThePickWillNotOpen(t *testing.
 	if payload == nil {
 		t.Fatal("an undecryptable auto pick went idle; the second pooled token was openable")
 	}
-	if f.fs.markedFailed != nil {
-		t.Fatalf("the run was failed terminally (%v); D14 exists so auto never does that", f.fs.markedFailed)
+	if f.fs.claimFailed != nil {
+		t.Fatalf("the run was failed terminally (%v); D14 exists so auto never does that", f.fs.claimFailed)
 	}
 	// Two opens, in order: the pick that failed, then the SECOND POOLED token. The
 	// second must be fullID, NOT the owner default — that is the whole #754 fix.
@@ -600,7 +600,7 @@ func TestAutoRetryIsOnceOnly(t *testing.T) {
 			t.Fatalf("open #%d spent the owner default; the auto lane must NEVER open the non-pooled default (#754)", i)
 		}
 	}
-	if f.fs.markedFailed == nil {
+	if f.fs.claimFailed == nil {
 		t.Fatal("neither pooled token opened and the run was not failed; it would sit claimed forever")
 	}
 	if len(f.fs.recordedCreds) != 0 {
@@ -658,10 +658,10 @@ func TestAutoDoesNotRetryOnALockedVault(t *testing.T) {
 	if payload != nil {
 		t.Fatal("expected idle after a lock race, got a payload")
 	}
-	if fs.requeuedRun == nil || *fs.requeuedRun != runID {
-		t.Fatalf("run not requeued: %v — a locked vault is transient, not a reason to spend elsewhere", fs.requeuedRun)
+	if fs.claimRequeued == nil || fs.claimRequeued.PoolWait || fs.claimRequeued.ID != runID {
+		t.Fatalf("run not requeued: %v — a locked vault is transient, not a reason to spend elsewhere", fs.claimRequeued)
 	}
-	if fs.markedFailed != nil {
+	if fs.claimFailed != nil {
 		t.Fatal("a lock race must never fail the run")
 	}
 	if len(fs.byIDLookups) != 1 {
@@ -698,7 +698,7 @@ func TestPinnedOpenFailureStaysTerminal(t *testing.T) {
 		t.Fatalf("by-id opens = %+v, want exactly 1 — a pinned failure must NOT retry on the default",
 			f.fs.byIDLookups)
 	}
-	if f.fs.markedFailed == nil {
+	if f.fs.claimFailed == nil {
 		t.Fatal("a pinned worker's undecryptable credential did not fail the run")
 	}
 	if len(f.fs.recordedCreds) != 0 {

@@ -220,9 +220,9 @@ func (m tuiModel) boardEmptyState() string {
 // selected row rides the full-width warm selection bar with a ▸ cursor; a DONE-band row is
 // faint end to end.
 func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool, mc boardMarkerCols) string {
-	band := runBand(r.Status, r.IsRevising)
+	band := runBandOf(r)
 	terminal := band == bandDone
-	tok := m.pal.stateToken(r.Status, r.Health, r.IsPlanning, r.IsRevising, r.LandingState, strOr(r.RecoveryWaitCause, ""))
+	tok := m.pal.runStateToken(r.RunDTO, r.IsRevising)
 	showCred := m.boardShowCred()
 
 	var bg color.Color
@@ -496,11 +496,12 @@ func (m tuiModel) milestoneMarker(r apitypes.RunListItemDTO, dim bool, bg color.
 }
 
 // boardShowSecondLine reports whether the SELECTED row gets its second "now" line (PRD #1064
-// D4): a non-terminal run with a server-derived current_activity. It has no milestone
+// D4): a non-terminal run with a server-derived current_activity, or a run held on its Codex
+// account (PRD #1590), whose second line is the account action. It has no milestone
 // precondition (D5) — the board reads current_activity directly. Used both by the row window
 // math (which must reserve a physical line for it) and by renderBoard.
 func (m tuiModel) boardShowSecondLine(r apitypes.RunListItemDTO) bool {
-	return r.CurrentActivity != nil && !terminalRunStatuses[r.Status]
+	return (r.CurrentActivity != nil && !terminalRunStatuses[r.Status]) || codexAccountActionLine(r.RunDTO) != ""
 }
 
 // boardSecondLine is the selected row's second line (PRD #1064 D4): `▸ <id> <title> · <role>
@@ -510,11 +511,20 @@ func (m tuiModel) boardShowSecondLine(r apitypes.RunListItemDTO) bool {
 // and label are UNTRUSTED, model-authored text and go through renderer.Plain (D7). Clamped and
 // padded to the full width so the selection bar spans the row.
 func (m tuiModel) boardSecondLine(r apitypes.RunListItemDTO) string {
+	bg := m.pal.selBg
+	// PRD #1590 D6: a run held on its Codex account has no live activity; its second line is
+	// what the account needs next, in the wait ink (a relogin_required hold reads "codex login" and
+	// bands into NEEDS YOU via runBandOf; its line keeps the wait ink). The line carries
+	// the owner's alias label (user-authored), folded through cellText by
+	// codexAccountActionLine and through renderer.Plain here (D7).
+	if line := codexAccountActionLine(r.RunDTO); line != "" {
+		out := paintSeg(m.pal.tungsten, bg, false, "  ▸ ") + paintSeg(m.pal.wait, bg, false, m.renderer.Plain(line, 120))
+		return padSeg(clampVisual(out, m.width), m.width, bg)
+	}
 	act := r.CurrentActivity
 	if act == nil || terminalRunStatuses[r.Status] {
 		return ""
 	}
-	bg := m.pal.selBg
 	var b strings.Builder
 	b.WriteString(paintSeg(m.pal.tungsten, bg, false, "  ▸ "))
 	if id, title := milestoneInProgress(r.RunDTO); id != "" {
