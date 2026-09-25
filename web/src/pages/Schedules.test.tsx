@@ -74,6 +74,10 @@ const CATALOG = {
   enablements: [],
 };
 
+// One next fire for every default fixture row, read once: a per-call Date.now() gives two
+// rows built a millisecond apart different fire times, so the sort's name tie-break flakes.
+const DEFAULT_NEXT_FIRE = new Date(Date.now() + 3_600_000).toISOString();
+
 function sched(over: Partial<Schedule>): Schedule {
   return {
     id: "s1",
@@ -87,7 +91,7 @@ function sched(over: Partial<Schedule>): Schedule {
     cron_expr: "0 2 * * 1-5",
     run_at: null,
     timezone: "Europe/Bucharest",
-    next_fire_at: new Date(Date.now() + 3_600_000).toISOString(),
+    next_fire_at: DEFAULT_NEXT_FIRE,
     last_fired_at: null,
     last_fire: null,
     auto_approve: true,
@@ -1342,13 +1346,19 @@ describe("Schedules — fired one-shots fold away (PRD #1645 D6)", () => {
   const disclosure = () => screen.getByRole("button", { name: /one-time schedules? already fired/ });
 
   it("folds fired one-shots into one disclosure, counted within the filtered set, with their issue refs", async () => {
-    mockApi.listSchedules.mockResolvedValue([
+    // The clock advances between fixture calls, as it can on a loaded runner: the two live
+    // rows must still tie on next fire so the name tie-break orders them (the CI flake).
+    let t = Date.now();
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => (t += 1));
+    const rows = [
       sched({ id: "live-uzi", target: "prompt", prompt: "live on uzi" }),
       sched({ id: "live-atlas", target: "prompt", prompt: "live on atlas", repo_id: "repo-atlas", repo_path: "vtmocanu/atlas" }),
       firedOnce({ id: "f1", issue_iid: 158 }),
       firedOnce({ id: "f2", issue_iid: 159 }),
       firedOnce({ id: "f3", issue_iid: 160, repo_id: "repo-atlas", repo_path: "vtmocanu/atlas" }),
-    ]);
+    ];
+    clock.mockRestore();
+    mockApi.listSchedules.mockResolvedValue(rows);
     renderPage();
     await waitFor(() => expect(nameIds()).toEqual(["live-atlas", "live-uzi"].sort()));
     expect(disclosure().textContent).toContain("3 one-time schedules already fired");
