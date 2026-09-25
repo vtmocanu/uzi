@@ -52,13 +52,13 @@ if [ "${1:-}" = api ]; then
       case "$MODE" in
         pending_findings|revovr_cr_pending) echo '{"statuses":[{"context":"CodeRabbit","description":"Review in progress"}]}' ;;
         cr_limited) echo '{"statuses":[{"context":"CodeRabbit","description":"Review rate limited","updated_at":"2026-09-23T10:00:00Z"}]}' ;;
-        greptile_clean|greptile_race|prior_*|head_*) echo '{"statuses":[]}' ;;
+        greptile_*|prior_*|head_*) echo '{"statuses":[]}' ;;
         *) echo '{"statuses":[{"context":"CodeRabbit","description":"Review completed"}]}' ;;
       esac ;;
     *'/pulls/42/reviews'*)
       case "$MODE" in
         pending_findings) echo '[{"id":1,"user":{"login":"coderabbitai[bot]"},"commit_id":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","state":"APPROVED","body":""}]' ;;
-        greptile_race) echo '[{"id":7,"user":{"login":"greptile-apps[bot]"},"commit_id":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","state":"COMMENTED","body":""}]' ;;
+        greptile_race|greptile_mixed) echo '[{"id":7,"user":{"login":"greptile-apps[bot]"},"commit_id":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","state":"COMMENTED","body":""}]' ;;
         prior_headreview|head_two_runs) echo '[{"id":77,"user":{"login":"greptile-apps[bot]"},"commit_id":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","state":"COMMENTED","body":""}]' ;;
         prior_findings) echo '[{"id":44,"user":{"login":"greptile-apps[bot]"},"commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","state":"COMMENTED","body":""},{"id":55,"user":{"login":"greptile-apps[bot]"},"commit_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","state":"COMMENTED","body":""}]' ;;
         cr_resolved) echo '[{"id":9,"user":{"login":"coderabbitai[bot]"},"commit_id":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","state":"APPROVED","body":""}]' ;;
@@ -72,6 +72,7 @@ if [ "${1:-}" = api ]; then
         prior_clean|prior_none|prior_unreadable|prior_pending|prior_unparseable|head_unreadable) echo '[{"user":{"login":"greptile-apps[bot]"},"line":8,"body":"<img alt=\"P1\"> old addressed finding","pull_request_review_id":99}]' ;;
         prior_findings) echo '[{"user":{"login":"greptile-apps[bot]"},"line":8,"body":"<img alt=\"P1\"> superseded finding","pull_request_review_id":44},{"user":{"login":"greptile-apps[bot]"},"line":9,"body":"<img alt=\"P1\"> still open finding","pull_request_review_id":55}]' ;;
         greptile_clean) echo '[{"user":{"login":"greptile-apps[bot]"},"line":8,"body":"<img alt=\"P1\"> old addressed finding","pull_request_review_id":99}]' ;;
+        greptile_mixed) echo '[{"user":{"login":"greptile-apps[bot]"},"line":3,"body":"<img alt=\"P2\"> inline finding","pull_request_review_id":7}]' ;;
         cr_resolved) echo '[{"user":{"login":"coderabbitai[bot]"},"line":8,"body":"🟡 **resolved finding**","pull_request_review_id":9}]' ;;
         *) echo '[]' ;;
       esac ;;
@@ -88,7 +89,9 @@ if [ "${1:-}" = api ]; then
     *'/commits/deadbeefdeadbeefdeadbeefdeadbeefdeadbeef/check-runs'*)
       case "$MODE" in
         greptile_clean|revovr_cr_pending) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"Greptile has reviewed the Pull Request.\n\n90 files reviewed, 0 comments added"}}]}' ;;
-        greptile_race) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"Greptile has reviewed the Pull Request.\n\n90 files reviewed, 1 comments added"}}]}' ;;
+        greptile_race|greptile_outside|greptile_od_unreadable) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"Greptile has reviewed the Pull Request.\n\n90 files reviewed, 1 comments added"}}]}' ;;
+        greptile_mixed) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"90 files reviewed, 2 comments added"}}]}' ;;
+        greptile_outside_clean) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"Greptile has reviewed the Pull Request.\n\n90 files reviewed, 0 comments added"}}]}' ;;
         prior_unparseable) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"Reviewed 90 files and raised 3 issues"}}]}' ;;
         head_unreadable) exit 1 ;;
         # Newest first, as the API lists them: the re-trigger (id 2) found something the first run did not.
@@ -184,7 +187,50 @@ bash "$SCRIPT" test/repo 42 0 1 --reviewer greptile --reviewer-grace 0 > "$WORK/
 rc=$?
 set -e
 [ "$rc" -eq 2 ] || fail "incomplete Greptile findings read ready, rc=$rc: $(cat "$WORK/greptile-race.out")"
-grep -q 'gr_scope=0/1.*unknown=1' "$WORK/greptile-race.out" || fail "incomplete Greptile scope was not visible"
+grep -q 'gr_scope=0+0od/1.*unknown=1' "$WORK/greptile-race.out" || fail "incomplete Greptile scope was not visible"
+
+# Greptile posts findings on lines outside the diff as ONE issue comment, with no review
+# object; its tally counts them. They are live findings, not an unscopable (unknown) set.
+cp "$COMMENTS" "$WORK/comments.saved"
+jq -n '[{id:900,user:{login:"greptile-apps[bot]"},created_at:"2026-09-25T10:51:43Z",
+  body:"<!-- greptile_outside_diff -->\n\n<h3>Comments Outside Diff</h3>\n\n- <img alt=\"P1\" src=\"x\">&nbsp;**Halt alert can be lost** `api/x.go:252` <a href=\"https://github.com/test/repo/blob/deadbeefdeadbeefdeadbeefdeadbeefdeadbeef/api/x.go#L252\">▶</a>\n\n  detail"}]' > "$COMMENTS"
+MODE="greptile_outside"; export MODE
+set +e
+bash "$SCRIPT" test/repo 42 0 1 --reviewer greptile --reviewer-grace 0 > "$WORK/greptile-outside.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 3 ] || fail "outside-diff Greptile finding was not live, rc=$rc: $(cat "$WORK/greptile-outside.out")"
+grep -q 'gr_scope=0+1od/1' "$WORK/greptile-outside.out" || fail "outside-diff tally not reconciled: $(cat "$WORK/greptile-outside.out")"
+grep -q 'unknown=1' "$WORK/greptile-outside.out" && fail "outside-diff finding read as unknown: $(cat "$WORK/greptile-outside.out")"
+
+# A clean current-head pass (0 comments added) speaks for the whole diff: a stale
+# outside-diff bullet left in the comment does not block.
+MODE="greptile_outside_clean"; export MODE
+set +e
+bash "$SCRIPT" test/repo 42 0 1 --reviewer greptile --reviewer-grace 0 > "$WORK/greptile-outside-clean.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 0 ] || fail "clean Greptile pass blocked on a stale outside-diff bullet, rc=$rc: $(cat "$WORK/greptile-outside-clean.out")"
+# Mixed: one inline comment (scoped to the head review) + one outside-diff bullet = tally 2.
+MODE="greptile_mixed"; export MODE
+set +e
+bash "$SCRIPT" test/repo 42 0 1 --reviewer greptile --reviewer-grace 0 > "$WORK/greptile-mixed.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 3 ] || fail "mixed inline/outside findings not live, rc=$rc: $(cat "$WORK/greptile-mixed.out")"
+grep -q 'gr_scope=1+1od/2.*gr=2' "$WORK/greptile-mixed.out" || fail "mixed tally not reconciled: $(cat "$WORK/greptile-mixed.out")"
+
+# Issue comments unreadable on a reviewed head: never ready (unknown until timeout).
+COMMENTS_SAVED_PATH="$COMMENTS"; COMMENTS="$WORK/missing.json"; export COMMENTS
+MODE="greptile_od_unreadable"; export MODE
+set +e
+bash "$SCRIPT" test/repo 42 0 1 --reviewer greptile --reviewer-grace 0 > "$WORK/greptile-od-unread.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 2 ] || fail "unreadable issue comments did not fail closed, rc=$rc: $(cat "$WORK/greptile-od-unread.out")"
+grep -q 'unknown=1' "$WORK/greptile-od-unread.out" || fail "unreadable issue comments not unknown: $(cat "$WORK/greptile-od-unread.out")"
+COMMENTS="$COMMENTS_SAVED_PATH"; export COMMENTS
+cp "$WORK/comments.saved" "$COMMENTS"
 
 # A GraphQL-resolved CodeRabbit thread is not live even if its REST comment stays anchored.
 MODE="cr_resolved"; export MODE
@@ -300,7 +346,7 @@ bash "$SCRIPT" test/repo 42 0 1 --reviewer greptile --reviewer-grace 0 > "$WORK/
 rc=$?
 set -e
 [ "$rc" -eq 3 ] || fail "the older clean head run hid the re-trigger's finding, rc=$rc: $(cat "$WORK/head-two-runs.out")"
-grep -q 'gr_scope=1/1' "$WORK/head-two-runs.out" || fail "the newest head Greptile run was not the one read: $(cat "$WORK/head-two-runs.out")"
+grep -q 'gr_scope=1+0od/1' "$WORK/head-two-runs.out" || fail "the newest head Greptile run was not the one read: $(cat "$WORK/head-two-runs.out")"
 
 # Signal (e): CodeRabbit dropped the final_review_risk block and marks the reviewed head with
 # change_assessment_commit:"<full-sha>" beside a clean recent_review block (#1502). The exact

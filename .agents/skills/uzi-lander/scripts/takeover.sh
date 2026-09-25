@@ -200,6 +200,12 @@ else
     if [ "$gr_rc" -eq 2 ]; then echo "GREPTILE_PRIOR_VERDICT=pending"; else echo "GREPTILE_PRIOR_VERDICT=unreadable"; fi
   fi
 fi
+# Greptile's outside-diff findings live in one issue comment, not in pulls/N/comments
+# (lib/greptile-verdict.sh, greptile_outside_diff). Live unless THIS head's pass added 0.
+case "$gr_reviewed:$gr_sum" in
+  1:*', 0 comments added') ;;
+  *) if greptile_outside_diff "$head" <<<"$issue_c"; then gr_live=$(( gr_live + GOD_TOTAL )); else UNKNOWN=1; fi ;;
+esac
 live=$((cr_live + gr_live + cr_unconfirmed))
 echo "LIVE_FINDINGS=$live (cr=$cr_live gr=$gr_live cr_unconfirmed=$cr_unconfirmed)"
 

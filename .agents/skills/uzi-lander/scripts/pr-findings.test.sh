@@ -25,7 +25,7 @@ if [ "${1:-}" = api ]; then
       fi ;;
     *'/pulls/42/reviews'*)
       case "$MODE" in
-        race) echo '[{"id":7,"user":{"login":"greptile-apps[bot]"},"commit_id":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","state":"COMMENTED","body":""}]' ;;
+        race|od_mixed) echo '[{"id":7,"user":{"login":"greptile-apps[bot]"},"commit_id":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","state":"COMMENTED","body":""}]' ;;
         in_progress) echo '[{"id":8,"user":{"login":"coderabbitai[bot]"},"commit_id":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","state":"APPROVED","body":""}]' ;;
         cr_resolved|head_unreadable) echo '[{"id":9,"user":{"login":"coderabbitai[bot]"},"commit_id":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","state":"APPROVED","body":""}]' ;;
         head_two_runs) echo '[{"id":77,"user":{"login":"greptile-apps[bot]"},"commit_id":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","state":"COMMENTED","body":""}]' ;;
@@ -34,7 +34,8 @@ if [ "${1:-}" = api ]; then
     *'/issues/42/comments'*)
       case "$MODE" in
         prior_requested) printf '[{"user":{"login":"lander","type":"User"},"created_at":"%s","body":"@greptileai review"}]\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" ;;
-        issue_unreadable) exit 1 ;;
+        issue_unreadable|od_issue_unreadable) exit 1 ;;
+        od_only|od_mixed) jq -n --arg h deadbeefdeadbeefdeadbeefdeadbeefdeadbeef '[{id:900,user:{login:"greptile-apps[bot]"},body:("<!-- greptile_outside_diff -->\n\n- <img alt=\"P1\">&nbsp;**Outside bug** `out.go:5` <a href=\"https://x/blob/" + $h + "/out.go#L5\">x</a>")}]' ;;
         cr_ca_clean|cr_ca_findings) echo '[{"user":{"login":"coderabbitai[bot]"},"body":"<!-- walkthrough_start -->\n<!-- recent_review_start -->\nNo actionable comments were generated in the recent review. 🎉\n<!-- recent_review_end -->\n<!-- change_assessment_commit:\"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\" -->"}]' ;;
         *) echo '[]' ;;
       esac ;;
@@ -55,13 +56,15 @@ if [ "${1:-}" = api ]; then
         head_failed) echo '{"check_runs":[{"id":10,"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"failure","output":{"summary":""}}]}' ;;
         # Newest first, as the API lists them: the re-trigger (id 2) found something the first run did not.
         head_two_runs) echo '{"check_runs":[{"id":2,"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"90 files reviewed, 1 comments added"}},{"id":1,"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"90 files reviewed, 0 comments added"}}]}' ;;
-        race) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"Greptile has reviewed the Pull Request.\n\n90 files reviewed, 1 comments added"}}]}' ;;
+        race|od_only|od_issue_unreadable) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"Greptile has reviewed the Pull Request.\n\n90 files reviewed, 1 comments added"}}]}' ;;
+        od_mixed) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"90 files reviewed, 2 comments added"}}]}' ;;
         in_progress) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"in_progress","conclusion":null,"output":{"summary":""}}]}' ;;
         *) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"Greptile has reviewed the Pull Request.\n\n90 files reviewed, 0 comments added"}}]}' ;;
       esac ;;
     *'/pulls/42/comments'*)
       case "$MODE" in
         race|cr_ca_clean|cr_ca_findings) echo '[]' ;;
+        od_mixed) echo '[{"user":{"login":"greptile-apps[bot]"},"path":"in.go","line":3,"body":"<img alt=\"P2\"> inline finding","pull_request_review_id":7},{"user":{"login":"greptile-apps[bot]"},"path":"old.go","line":8,"body":"<img alt=\"P1\"> old addressed finding","pull_request_review_id":99}]' ;;
         in_progress) echo '[{"user":{"login":"greptile-apps[bot]"},"path":"partial.go","line":9,"body":"<img alt=\"P1\"> partial finding","pull_request_review_id":101}]' ;;
         head_two_runs) echo '[{"user":{"login":"greptile-apps[bot]"},"path":"retrigger.go","line":8,"body":"<img alt=\"P1\"> found by the re-trigger","pull_request_review_id":77}]' ;;
         cr_resolved) echo '[{"user":{"login":"coderabbitai[bot]"},"path":"resolved.go","line":8,"body":"🟡 **resolved finding**","pull_request_review_id":9}]' ;;
@@ -100,6 +103,29 @@ set -e
 [ "$rc" -eq 3 ] || fail "in-progress review exited rc=$rc, want 3: $(cat "$WORK/progress.out")"
 grep -q 'review still in progress; findings deferred' "$WORK/progress.out" || fail "in-progress review was not deferred"
 if grep -q '^  GR  ' "$WORK/progress.out"; then fail "partial in-progress finding was printed"; fi
+
+# Greptile's head pass added ONE comment, outside the diff: an issue comment, no review
+# object. The tally reconciles, the finding is listed, the older inline comment is superseded.
+MODE="od_only"; export MODE
+set +e; PATH="$WORK/bin:$PATH" bash "$SCRIPT" test/repo 42 > "$WORK/od-only.out" 2>&1; rc=$?; set -e
+[ "$rc" -eq 0 ] || fail "outside-diff-only pass was not confirmed, rc=$rc: $(cat "$WORK/od-only.out")"
+grep -qF '  GR  out.go:5  [P1] Outside bug (outside diff)' "$WORK/od-only.out" || fail "outside-diff finding not listed: $(cat "$WORK/od-only.out")"
+if grep -q 'review id is missing' "$WORK/od-only.out"; then fail "outside-diff tally still read as unscopable"; fi
+if grep -q '^  GR  old.go:8' "$WORK/od-only.out"; then fail "superseded inline comment listed: $(cat "$WORK/od-only.out")"; fi
+
+# Mixed: one inline (scoped to the head review) plus one outside the diff = the tally of 2.
+MODE="od_mixed"; export MODE
+set +e; PATH="$WORK/bin:$PATH" bash "$SCRIPT" test/repo 42 > "$WORK/od-mixed.out" 2>&1; rc=$?; set -e
+[ "$rc" -eq 0 ] || fail "mixed inline/outside pass was not confirmed, rc=$rc: $(cat "$WORK/od-mixed.out")"
+grep -qF '  GR  in.go:3' "$WORK/od-mixed.out" || fail "inline finding missing: $(cat "$WORK/od-mixed.out")"
+grep -qF '  GR  out.go:5  [P1] Outside bug (outside diff)' "$WORK/od-mixed.out" || fail "outside finding missing: $(cat "$WORK/od-mixed.out")"
+if grep -q '^  GR  old.go:8' "$WORK/od-mixed.out"; then fail "older-review comment listed: $(cat "$WORK/od-mixed.out")"; fi
+
+# Unreadable issue comments on a reviewed head: outside-diff findings unknown, never clean.
+MODE="od_issue_unreadable"; export MODE
+set +e; PATH="$WORK/bin:$PATH" bash "$SCRIPT" test/repo 42 > "$WORK/od-unread.out" 2>&1; rc=$?; set -e
+[ "$rc" -eq 3 ] || fail "unreadable issue comments read clean, rc=$rc: $(cat "$WORK/od-unread.out")"
+grep -q 'outside-diff findings unknown' "$WORK/od-unread.out" || fail "unreadable outside-diff not surfaced: $(cat "$WORK/od-unread.out")"
 
 MODE="cr_resolved"; export MODE
 PATH="$WORK/bin:$PATH" bash "$SCRIPT" test/repo 42 > "$WORK/cr-resolved.out" 2>&1 \

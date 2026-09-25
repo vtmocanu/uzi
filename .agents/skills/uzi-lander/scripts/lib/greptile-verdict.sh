@@ -149,3 +149,36 @@ greptile_scope_live() {
   fi
   return 0
 }
+
+# greptile_outside_diff HEAD — stdin: `issues/N/comments` as ONE flat JSON array.
+#   Greptile posts findings on lines the diff does not cover as a single ISSUE comment
+#   marked `<!-- greptile_outside_diff -->` (one `- ` bullet per finding, each linking
+#   `/blob/<sha>/path#L<n>`), not as review comments, and edits it in place: a bullet leaves
+#   once its file changes. Its check-run tally ("M comments added") counts these bullets, so
+#   a pass whose findings are all outside the diff posts no review object at all.
+#   Reads the NEWEST such comment. Sets:
+#     GOD_TOTAL  bullets still listed (all live)
+#     GOD_HEAD   bullets linking HEAD, i.e. added by the pass on HEAD
+#     GOD_LINES  one rendered `  GR  path:line  [Pn] title (outside diff)` row per bullet
+#   rc 0 read (zero when there is no such comment); rc 1 unreadable input.
+# shellcheck disable=SC2034  # GOD_* are this function's outputs, read by the sourcing scripts.
+greptile_outside_diff() {
+  local head="$1" json
+  json=$(jq --arg h "$head" '
+    if type!="array" then error("issue comments are not an array") else
+      ([.[]|select(.user.login=="greptile-apps[bot]"
+              and ((.body // "")|contains("<!-- greptile_outside_diff -->")))]
+       | if length==0 then [] else (max_by(.id).body|split("\n")|map(select(startswith("- ")))) end) as $b
+      | {total: ($b|length),
+         head: ([$b[]|select(contains("/blob/" + $h + "/"))]|length),
+         lines: [$b[]
+           | ((match("alt=\"(P[0-9])\"").captures[0].string)? // "?") as $p
+           | ((match("\\*\\*([^*]+)\\*\\*").captures[0].string)? // "-") as $t
+           | ((match("`([^`]+)`").captures[0].string)? // "-") as $loc
+           | "  GR  \($loc)  [\($p)] \($t) (outside diff)"]}
+    end' 2>/dev/null) || return 1
+  GOD_TOTAL=$(printf '%s' "$json" | jq -r '.total')
+  GOD_HEAD=$(printf '%s' "$json" | jq -r '.head')
+  GOD_LINES=$(printf '%s' "$json" | jq -r '.lines[]')
+  return 0
+}

@@ -1,0 +1,741 @@
+import { afterEach, beforeEach, describe, it } from "node:test";
+import assert from "node:assert/strict";
+import { spawn, type ChildProcess } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { query, type Options as SdkOptions, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+import { SdkExecutor, TransientRecoveryError, type SdkQueryFn, type SdkExecutorOptions } from "../src/sdk-executor.js";
+import type { EmittedMessage, RunContext } from "../src/executor.js";
+import type { PlanVerdict } from "../src/steering.js";
+import { defaultQueryFn } from "../src/sdk-messages.js";
+import { nullLogger } from "./helpers.js";
+
+// issue #1656: a FOREIGN SIGTERM/SIGKILL of the SDK CLI child (no result frame, no uzi trip)
+// resumes the same session in-process, at most twice per turn, instead of failing the run.
+// A uzi-initiated kill always sets state.tripReason first and keeps its trip outcome; crash
+// signals and other exit codes still fail fast; with no known session id nothing resumes.
+//
+// Same harness shape as sdk-executor.test.ts: `queryFn` is faked per turn, so every path runs
+// with dummy credentials. The SDK-shape pin at the bottom drives the INSTALLED SDK's real
+// process-exit path with a child this test spawns and that ends ITSELF (exit 143 or a signal
+// to its own pid); nothing here signals a process it did not spawn.
+
+const OAUTH = "dummy-oauth-token-do-not-scan-0000";
+const FAKE_PAT = "dummy-forge-pat-do-not-scan-1111";
+const FAKE_JOIN_TOKEN = "dummy-join-token-do-not-scan-2222";
+
+// Unique per process and per call, never created (see sdk-executor.test.ts: the executor
+// materializes a sibling skills-plugin dir, and node --test runs files concurrently).
+let nonexistentWorktreeSeq = 0;
+function nonexistentWorktree(): string {
+  return path.join(os.tmpdir(), `uzi-signal-death-wt-${process.pid}-${nonexistentWorktreeSeq++}`);
+}
+
+function assistantText(text: string, sessionId = "sess-1"): SDKMessage {
+  return { type: "assistant", session_id: sessionId, message: { content: [{ type: "text", text }] } } as unknown as SDKMessage;
+}
+function submitPlan(plan: string, sessionId = "sess-1"): SDKMessage {
+  return {
+    type: "assistant",
+    session_id: sessionId,
+    message: { content: [{ type: "tool_use", id: "t1", name: "mcp__uzi__submit_plan", input: { plan_md: plan } }] },
+  } as unknown as SDKMessage;
+}
+function signalDone(sessionId = "sess-1"): SDKMessage {
+  return {
+    type: "assistant",
+    session_id: sessionId,
+    message: { content: [{ type: "tool_use", id: "t2", name: "mcp__uzi__signal_done", input: {} }] },
+  } as unknown as SDKMessage;
+}
+function resultSuccess(sessionId = "sess-1"): SDKMessage {
+  return { type: "result", subtype: "success", is_error: false, num_turns: 1, session_id: sessionId } as unknown as SDKMessage;
+}
+function resultApiError(status: number, sessionId = "sess-1"): SDKMessage {
+  return {
+    type: "result",
+    subtype: "success",
+    is_error: true,
+    api_error_status: status,
+    result: `API Error: ${status}`,
+    terminal_reason: "api_error",
+    session_id: sessionId,
+  } as unknown as SDKMessage;
+}
+
+// The SDK's tagged exit errors, as getProcessExitError builds them (own properties on a
+// plain Error). The real shape is pinned against the installed SDK at the bottom.
+function sdkExit(code: number): Error {
+  return Object.assign(new Error(`Claude Code process exited with code ${code}`), {
+    errorClass: "process_exited_nonzero",
+    exitCode: code,
+  });
+}
+function sdkSignal(signal: string): Error {
+  return Object.assign(new Error(`Claude Code process terminated by signal ${signal}`), {
+    errorClass: "process_killed_by_signal",
+    signal,
+  });
+}
+
+type Script = SDKMessage[] | ((signal: AbortSignal) => AsyncIterable<unknown>);
+
+interface Turn {
+  options: SdkOptions;
+  startedAt: number;
+}
+
+/** Replays one scripted stream per turn. With `withPid` (the default) each turn "spawns" its
+ *  CLI through the executor's spawn hook, as the real SDK does, so the executor records a
+ *  (fake, never-signalled) pid for the turn; `withPid: false` models a turn with no pid. */
+function fakeTurns(scripts: Script[], withPid = true): { queryFn: SdkQueryFn; turns: Turn[] } {
+  const turns: Turn[] = [];
+  let i = 0;
+  const queryFn: SdkQueryFn = (params) => {
+    const script = scripts[Math.min(i, scripts.length - 1)]!;
+    i++;
+    turns.push({ options: params.options, startedAt: Date.now() });
+    if (withPid) {
+      params.options.spawnClaudeCodeProcess?.({
+        command: "claude",
+        args: [],
+        env: {},
+        signal: params.options.abortController!.signal,
+      });
+    }
+    return (async function* () {
+      for await (const _p of params.prompt) { /* drain the SDK prompt */ }
+      const s = typeof script === "function" ? script(params.options.abortController!.signal) : script;
+      if (Array.isArray(s)) for (const m of s) yield m;
+      else yield* s as AsyncIterable<SDKMessage>;
+    })();
+  };
+  return { queryFn, turns };
+}
+
+/** A turn that yields `frames` (optionally after `delayMs`), then its CLI dies with `err`. */
+function dies(err: Error, frames: SDKMessage[] = [], delayMs = 0): Script {
+  return () =>
+    (async function* () {
+      for (const f of frames) yield f;
+      if (delayMs > 0) await new Promise((r) => setTimeout(r, delayMs));
+      throw err;
+    })();
+}
+
+/** Waits until the turn is aborted (a trip), then surfaces `err` as the CLI's death, the way
+ *  a group-killed CLI's exit can reach the iterator before the abort is observed. */
+function hangThenDie(err: Error): Script {
+  return (signal) =>
+    (async function* () {
+      await new Promise<void>((resolve) => {
+        if (signal.aborted) return resolve();
+        const keepAlive = setInterval(() => {}, 1_000);
+        signal.addEventListener("abort", () => { clearInterval(keepAlive); resolve(); }, { once: true });
+      });
+      yield* [];
+      throw err;
+    })();
+}
+
+let homeDir: string;
+let saved: Record<string, string | undefined>;
+
+function makeCtx(overrides: Partial<RunContext> = {}): { ctx: RunContext; emits: EmittedMessage[]; gated: string[] } {
+  const emits: EmittedMessage[] = [];
+  const gated: string[] = [];
+  const verdict: PlanVerdict = { kind: "approve", selection: { status: "absent" } };
+  const ctx: RunContext = {
+    runId: "r1",
+    issueIid: 5,
+    issueTitle: "Fix login",
+    issueDescription: "please implement",
+    worktreePath: nonexistentWorktree(),
+    branch: "agent/issue-5",
+    emit: (m) => emits.push(m),
+    oauthToken: OAUTH,
+    agents: [],
+    config: null,
+    sessionId: null,
+    gatePlan: async (planMd) => {
+      gated.push(planMd);
+      return verdict;
+    },
+    pullFollowUp: () => undefined,
+    reportIteration: () => {},
+    ...overrides,
+  };
+  return { ctx, emits, gated };
+}
+
+// Fake CLI pids handed out by the default spawn hook: nothing runs under them, and every kill
+// below is a recorder, so none is ever signalled.
+let fakePid = 900_000;
+const opts = (queryFn: SdkQueryFn, extra: Partial<SdkExecutorOptions> = {}): SdkExecutorOptions => ({
+  queryFn,
+  emptyTurnBackoffBaseMs: 0,
+  emptyTurnMaxRetries: 2,
+  spawn: () => ({ pid: fakePid++ }),
+  // No test here may signal anything: the fakes spawn nothing, and the real-SDK pin's
+  // children end themselves. The dead-CLI reap is recorded-only and reports the group gone.
+  kill: () => true,
+  killCliGroup: () => true,
+  cliGroupPresent: () => false,
+  ...extra,
+});
+
+async function rejection(p: Promise<unknown>): Promise<Error> {
+  return p.then(
+    () => { throw new Error("expected the run to reject"); },
+    (e: unknown) => {
+      assert.ok(e instanceof Error, "the run rejects with an Error");
+      return e;
+    },
+  );
+}
+
+beforeEach(() => {
+  homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-sighome-"));
+  saved = { UZI_WORKER_TOKEN: process.env.UZI_WORKER_TOKEN, UZI_FORGE_PAT: process.env.UZI_FORGE_PAT };
+  process.env.UZI_WORKER_TOKEN = FAKE_JOIN_TOKEN;
+  process.env.UZI_FORGE_PAT = FAKE_PAT;
+});
+
+afterEach(() => {
+  fs.rmSync(homeDir, { recursive: true, force: true });
+  for (const [k, v] of Object.entries(saved)) {
+    if (v === undefined) delete process.env[k];
+    else process.env[k] = v;
+  }
+});
+
+describe("SdkExecutor foreign CLI signal death (issue #1656)", () => {
+  for (const [label, err] of [
+    ["process_killed_by_signal SIGTERM", () => sdkSignal("SIGTERM")],
+    ["process_killed_by_signal SIGKILL", () => sdkSignal("SIGKILL")],
+    ["process_exited_nonzero 143", () => sdkExit(143)],
+    ["process_exited_nonzero 137", () => sdkExit(137)],
+  ] as const) {
+    it(`first turn: a ${label} death after the session frame resumes the SAME session`, async () => {
+      const { queryFn, turns } = fakeTurns([
+        dies(err(), [assistantText("working", "sess-1")]),
+        [submitPlan("# Plan", "sess-1"), resultSuccess("sess-1")],
+        [signalDone("sess-1"), resultSuccess("sess-1")],
+      ]);
+      const probe = makeCtx();
+      const result = await new SdkExecutor(nullLogger(), homeDir, opts(queryFn)).run(probe.ctx);
+      assert.equal(result.branch, "agent/issue-5");
+      assert.deepEqual(probe.gated, ["# Plan"]);
+      assert.deepEqual(
+        turns.map((t) => t.options.resume),
+        [undefined, "sess-1", "sess-1"],
+        "the retry resumes the observed session; no fresh session is started",
+      );
+    });
+  }
+
+  for (const [label, err] of [
+    ["SIGTERM", () => sdkSignal("SIGTERM")],
+    ["exit 143", () => sdkExit(143)],
+  ] as const) {
+    it(`later turn: a ${label} death with NO frames resumes the caller's resumeId`, async () => {
+      const { queryFn, turns } = fakeTurns([
+        [submitPlan("# Plan", "sess-A"), resultSuccess("sess-A")],
+        dies(err()), // implement turn: dies before any frame (the run's session latch already fired)
+        [signalDone("sess-A"), resultSuccess("sess-A")],
+      ]);
+      const result = await new SdkExecutor(nullLogger(), homeDir, opts(queryFn)).run(makeCtx().ctx);
+      assert.equal(result.branch, "agent/issue-5");
+      assert.deepEqual(turns.map((t) => t.options.resume), [undefined, "sess-A", "sess-A"]);
+    });
+  }
+
+  it("emits a truthful status notice for each resume", async () => {
+    const { queryFn } = fakeTurns([
+      dies(sdkSignal("SIGTERM"), [assistantText("working")]),
+      [submitPlan("# Plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx();
+    await new SdkExecutor(nullLogger(), homeDir, opts(queryFn)).run(probe.ctx);
+    const notices = probe.emits
+      .filter((m) => m.kind === "status")
+      .map((m) => String(m.payload["text"]))
+      .filter((t) => /SIGTERM/.test(t) && /resum/i.test(t));
+    assert.equal(notices.length, 1, `one resume notice, got ${JSON.stringify(notices)}`);
+  });
+
+  it("after 2 retries the run fails with the SDK's own error, never a recovery park", async () => {
+    const { queryFn, turns } = fakeTurns([dies(sdkSignal("SIGTERM"), [assistantText("working")])]);
+    const err = await rejection(new SdkExecutor(nullLogger(), homeDir, opts(queryFn)).run(makeCtx().ctx));
+    assert.equal(err.message, "Claude Code process terminated by signal SIGTERM");
+    assert.ok(!(err instanceof TransientRecoveryError), "exhaustion is not routed to recovery_wait");
+    assert.equal(turns.length, 3, "the first death plus at most two resumes");
+    assert.deepEqual(turns.map((t) => t.options.resume), [undefined, "sess-1", "sess-1"]);
+  });
+
+  it("the bound is per turn: a later turn gets its own two retries", async () => {
+    const { queryFn, turns } = fakeTurns([
+      dies(sdkExit(143), [assistantText("working", "sess-A")]),
+      dies(sdkExit(143)),
+      [submitPlan("# Plan", "sess-A"), resultSuccess("sess-A")],
+      dies(sdkExit(143)),
+      dies(sdkExit(143)),
+      [signalDone("sess-A"), resultSuccess("sess-A")],
+    ]);
+    const result = await new SdkExecutor(nullLogger(), homeDir, opts(queryFn)).run(makeCtx().ctx);
+    assert.equal(result.branch, "agent/issue-5");
+    assert.equal(turns.length, 6);
+  });
+
+  it("provider-transient retries in the same turn do not extend the signal-death bound", async () => {
+    // death → resume 1 → transient 529 (provider retry) → death → resume 2 → death → exhausted.
+    // A counter reset or shared by the provider retry would allow a fifth drive.
+    const { queryFn, turns } = fakeTurns([
+      dies(sdkSignal("SIGTERM"), [assistantText("working")]),
+      [resultApiError(529)],
+      dies(sdkSignal("SIGTERM")),
+    ]);
+    const err = await rejection(new SdkExecutor(nullLogger(), homeDir, opts(queryFn)).run(makeCtx().ctx));
+    assert.equal(err.message, "Claude Code process terminated by signal SIGTERM");
+    assert.equal(turns.length, 4, "two signal-death resumes in total, however the provider retries fall");
+  });
+
+  it("a later turn whose requested resume came back as a FRESH session resumes that session, not the stale one", async () => {
+    // The run-level first-session latch fired on the plan turn (sess-A). The implement turn
+    // asks to resume sess-A but the CLI starts sess-B, then dies: the retry must continue
+    // sess-B, the session this turn actually ran, never fall back to the stale sess-A.
+    const initB = { type: "system", subtype: "init", session_id: "sess-B" } as unknown as SDKMessage;
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("# Plan", "sess-A"), resultSuccess("sess-A")],
+      dies(sdkSignal("SIGTERM"), [initB, assistantText("working", "sess-B")]),
+      [signalDone("sess-B"), resultSuccess("sess-B")],
+    ]);
+    const result = await new SdkExecutor(nullLogger(), homeDir, opts(queryFn)).run(makeCtx().ctx);
+    assert.equal(result.branch, "agent/issue-5");
+    assert.deepEqual(turns.map((t) => t.options.resume), [undefined, "sess-A", "sess-B"]);
+  });
+
+  it("a subagent frame's session id never replaces the turn's init session as the resume target", async () => {
+    const initB = { type: "system", subtype: "init", session_id: "sess-B" } as unknown as SDKMessage;
+    const subFrame = {
+      type: "assistant",
+      session_id: "sess-SUB",
+      subagent_type: "coder",
+      parent_tool_use_id: "p1",
+      message: { content: [{ type: "text", text: "sub work" }] },
+    } as unknown as SDKMessage;
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("# Plan", "sess-A"), resultSuccess("sess-A")],
+      dies(sdkSignal("SIGTERM"), [initB, assistantText("working", "sess-B"), subFrame]),
+      [signalDone("sess-B"), resultSuccess("sess-B")],
+    ]);
+    const result = await new SdkExecutor(nullLogger(), homeDir, opts(queryFn)).run(makeCtx().ctx);
+    assert.equal(result.branch, "agent/issue-5");
+    assert.deepEqual(turns.map((t) => t.options.resume), [undefined, "sess-A", "sess-B"]);
+  });
+
+  it("the synchronous group kill's own time is charged to the wall budget", async () => {
+    // Wall 1.5s. The first drive spends ~1s then dies; the group kill blocks ~700ms (the
+    // setpriv spawnSync path can), which alone spends the rest of the wall.
+    const { queryFn, turns } = fakeTurns([
+      dies(sdkSignal("SIGTERM"), [assistantText("working")], 1_000),
+      [submitPlan("# Plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const err = await rejection(
+      new SdkExecutor(nullLogger(), homeDir, opts(queryFn, {
+        killCliGroup: () => {
+          const until = Date.now() + 700;
+          while (Date.now() < until) { /* a blocking spawnSync */ }
+          return true;
+        },
+      })).run(makeCtx({ config: { run_timeout_seconds: 1.5 } }).ctx),
+    );
+    assert.match(err.message, /wall-clock timeout/);
+    assert.equal(turns.length, 1);
+  });
+
+  it("a cancel during the confirmation poll never aims the fallback-capable kill at the dead pid", async () => {
+    // trip() kills state.currentChild.pid through killProcessGroup, which falls back to the bare
+    // pid; the dead CLI's pid must not be its target. The one allowed kill of it is the
+    // run-end reap (the group was never confirmed gone, so the pid stays in the set).
+    const ac = new AbortController();
+    const spawned: number[] = [];
+    const killed: Array<number | undefined> = [];
+    const { queryFn } = fakeTurns([
+      dies(sdkSignal("SIGTERM"), [assistantText("working")]),
+      [submitPlan("# Plan"), resultSuccess()],
+    ]);
+    const executor = new SdkExecutor(nullLogger(), homeDir, opts(queryFn, {
+      spawn: () => {
+        const pid = fakePid++;
+        spawned.push(pid);
+        return { pid };
+      },
+      kill: (pid) => {
+        killed.push(pid);
+        return true;
+      },
+      cliGroupPresent: () => {
+        if (!ac.signal.aborted) setTimeout(() => ac.abort(), 0);
+        return true;
+      },
+    }));
+    const err = await rejection(executor.run(makeCtx({ signal: ac.signal }).ctx));
+    assert.match(err.message, /run cancelled/);
+    const dead = spawned[0]!;
+    assert.equal(killed.filter((p) => p === dead).length, 0, `the fallback-capable kill never targets it: ${JSON.stringify(killed)}`);
+  });
+
+  it("a wall budget that expires during the reap confirmation ends with the wall outcome", async () => {
+    // Wall 2s. The first drive spends ~1.5s then dies; the group never empties, so the
+    // (up to 1s) confirmation poll outlives the remaining ~0.5s of wall.
+    const { queryFn, turns } = fakeTurns([
+      dies(sdkSignal("SIGTERM"), [assistantText("working")], 1_500),
+      [submitPlan("# Plan"), resultSuccess()],
+    ]);
+    const err = await rejection(
+      new SdkExecutor(nullLogger(), homeDir, opts(queryFn, { cliGroupPresent: () => true })).run(
+        makeCtx({ config: { run_timeout_seconds: 2 } }).ctx,
+      ),
+    );
+    assert.match(err.message, /wall-clock timeout/);
+    assert.equal(turns.length, 1);
+  });
+
+  it("a resume does not reset the wall budget", async () => {
+    // Wall 1.2s. The first drive spends ~0.8s then dies; the resume hangs until the wall
+    // trips. With the remaining budget carried over the resume lasts ~0.4s; a reset would
+    // give it the full 1.2s.
+    const { queryFn, turns } = fakeTurns([
+      dies(sdkSignal("SIGTERM"), [assistantText("working")], 800),
+      hangThenDie(sdkExit(143)),
+    ]);
+    const err = await rejection(
+      new SdkExecutor(nullLogger(), homeDir, opts(queryFn)).run(makeCtx({ config: { run_timeout_seconds: 1.2 } }).ctx),
+    );
+    const resumedFor = Date.now() - turns[1]!.startedAt;
+    assert.match(err.message, /wall-clock timeout/);
+    assert.equal(turns.length, 2);
+    assert.ok(resumedFor < 900, `the resume ran on the remaining budget, lasted ${resumedFor}ms`);
+  });
+
+  it("a trip during a resume wins (idle), and nothing further is driven", async () => {
+    const { queryFn, turns } = fakeTurns([
+      dies(sdkSignal("SIGTERM"), [assistantText("working")]),
+      hangThenDie(sdkExit(143)),
+    ]);
+    const err = await rejection(
+      new SdkExecutor(nullLogger(), homeDir, opts(queryFn)).run(makeCtx({ config: { idle_timeout_seconds: 0.1 } }).ctx),
+    );
+    assert.match(err.message, /idle timeout/);
+    assert.equal(turns.length, 2);
+  });
+
+  it("a signal death with no known session id fails as today and starts no fresh session", async () => {
+    const { queryFn, turns } = fakeTurns([dies(sdkSignal("SIGTERM")), [submitPlan("# Plan"), resultSuccess()]]);
+    const err = await rejection(new SdkExecutor(nullLogger(), homeDir, opts(queryFn)).run(makeCtx().ctx));
+    assert.equal(err.message, "Claude Code process terminated by signal SIGTERM");
+    assert.equal(turns.length, 1, "no second query: a fresh session is never labelled a resume");
+  });
+
+  it("a death with no recorded CLI pid does not resume: its group cannot be confirmed gone", async () => {
+    const { queryFn, turns } = fakeTurns([
+      dies(sdkSignal("SIGTERM"), [assistantText("working")]),
+      [submitPlan("# Plan"), resultSuccess()],
+    ], false);
+    const err = await rejection(new SdkExecutor(nullLogger(), homeDir, opts(queryFn)).run(makeCtx().ctx));
+    assert.equal(err.message, "Claude Code process terminated by signal SIGTERM");
+    assert.equal(turns.length, 1, "no resume without a pid to confirm");
+  });
+
+  // Each entry builds a fresh probe: present on every poll, or present for four polls then gone.
+  const probes: Array<[string, () => () => boolean]> = [
+    ["the group stays present", () => () => true],
+    ["the group is then confirmed gone", () => { let n = 0; return () => n++ < 4; }],
+  ];
+  for (const [label, present] of probes) {
+    it(`a cancel that lands mid-confirmation wins over the death (${label})`, async () => {
+      const ac = new AbortController();
+      const probe = present();
+      const { queryFn, turns } = fakeTurns([
+        dies(sdkSignal("SIGTERM"), [assistantText("working")]),
+        [submitPlan("# Plan"), resultSuccess()],
+      ]);
+      const executor = new SdkExecutor(nullLogger(), homeDir, opts(queryFn, {
+        cliGroupPresent: () => {
+          // The first probe of the poll fires the cancel; the poll is then in flight.
+          if (!ac.signal.aborted) setTimeout(() => ac.abort(), 0);
+          return probe();
+        },
+      }));
+      const err = await rejection(executor.run(makeCtx({ signal: ac.signal }).ctx));
+      assert.match(err.message, /run cancelled/);
+      assert.equal(turns.length, 1, "nothing is driven after the trip");
+    });
+  }
+
+  it("a death that cannot resume (no session) leaves its pid to a group-only run-end reap", async () => {
+    const spawned: number[] = [];
+    const killed: string[] = [];
+    const { queryFn, turns } = fakeTurns([dies(sdkSignal("SIGTERM")), [submitPlan("# Plan"), resultSuccess()]]);
+    const executor = new SdkExecutor(nullLogger(), homeDir, opts(queryFn, {
+      spawn: () => {
+        const pid = fakePid++;
+        spawned.push(pid);
+        return { pid };
+      },
+      kill: (pid) => { killed.push(`fallback:${pid}`); return true; },
+      killCliGroup: (pgid) => { killed.push(`groupOnly:${pgid}`); return true; },
+    }));
+    const err = await rejection(executor.run(makeCtx().ctx));
+    assert.equal(err.message, "Claude Code process terminated by signal SIGTERM");
+    assert.equal(turns.length, 1);
+    const dead = spawned[0]!;
+    assert.deepEqual(killed.filter((k) => k.endsWith(`:${dead}`)), [`groupOnly:${dead}`]);
+  });
+
+  // ---- negative controls: unchanged behaviour ------------------------------------------
+
+  for (const [label, err] of [
+    ["process_killed_by_signal SIGSEGV", () => sdkSignal("SIGSEGV")],
+    ["process_killed_by_signal SIGABRT", () => sdkSignal("SIGABRT")],
+    ["process_exited_nonzero 1", () => sdkExit(1)],
+    ["process_exited_nonzero 139", () => sdkExit(139)],
+    ["an untagged Error", () => new Error("Claude Code process exited with code 143")],
+  ] as const) {
+    it(`control: ${label} still fails the run with no resume`, async () => {
+      const thrown = err();
+      const { queryFn, turns } = fakeTurns([dies(thrown, [assistantText("working")]), [submitPlan("# Plan"), resultSuccess()]]);
+      const got = await rejection(new SdkExecutor(nullLogger(), homeDir, opts(queryFn)).run(makeCtx().ctx));
+      assert.equal(got.message, thrown.message);
+      assert.equal(turns.length, 1);
+    });
+  }
+
+  for (const [label, ctxOverrides, reason] of [
+    ["idle", { config: { idle_timeout_seconds: 0.1 } }, /idle timeout/],
+    ["wall", { config: { run_timeout_seconds: 0.1 } }, /wall-clock timeout/],
+  ] as const) {
+    it(`control: a ${label} trip whose CLI death surfaces as exit 143 keeps its trip outcome`, async () => {
+      const { queryFn, turns } = fakeTurns([hangThenDie(sdkExit(143)), [submitPlan("# Plan"), resultSuccess()]]);
+      const got = await rejection(
+        new SdkExecutor(nullLogger(), homeDir, opts(queryFn)).run(makeCtx({ sessionId: "prev", ...ctxOverrides }).ctx),
+      );
+      assert.match(got.message, reason);
+      assert.equal(turns.length, 1, "a uzi trip is never reclassified as a foreign death");
+    });
+  }
+
+  it("control: a cancel whose CLI death surfaces as exit 143 stays cancelled", async () => {
+    const ac = new AbortController();
+    // Cancel once the turn is in flight (a fixed delay can land before the turn starts).
+    const hang = hangThenDie(sdkExit(143)) as (signal: AbortSignal) => AsyncIterable<unknown>;
+    const inFlightCancel: Script = (signal) => {
+      setTimeout(() => ac.abort(), 0);
+      return hang(signal);
+    };
+    const { queryFn, turns } = fakeTurns([inFlightCancel, [submitPlan("# Plan"), resultSuccess()]]);
+    const got = await rejection(
+      new SdkExecutor(nullLogger(), homeDir, opts(queryFn)).run(makeCtx({ sessionId: "prev", signal: ac.signal }).ctx),
+    );
+    assert.match(got.message, /run cancelled/);
+    assert.equal(turns.length, 1);
+  });
+});
+
+// ---- SDK-shape pin: the INSTALLED SDK's real process-exit error ----------------------------
+//
+// The classifier reads getProcessExitError's own-property tags, which are not in the SDK's
+// public types. These tests run the real `query()` with a CLI child that ends ITSELF once the
+// SDK has written its first stdin line, so an SDK bump that renames or drops the tags turns
+// them red instead of silently degrading the classifier to "fail the run".
+
+/** A child that ends itself after its first stdin line, recorded so the test can await it. */
+function selfEndingSpawn(body: string, children: ChildProcess[]): NonNullable<SdkExecutorOptions["spawn"]> {
+  return () => {
+    const child = spawn(process.execPath, ["-e", `process.stdin.once("data", () => { ${body} });`], {
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    children.push(child);
+    return child;
+  };
+}
+
+async function reaped(children: ChildProcess[]): Promise<void> {
+  await Promise.all(
+    children.map((c) =>
+      c.exitCode !== null || c.signalCode !== null ? undefined : new Promise((r) => c.once("exit", r)),
+    ),
+  );
+}
+
+async function realSdkError(body: string): Promise<Error & Record<string, unknown>> {
+  const children: ChildProcess[] = [];
+  const spawnFn = selfEndingSpawn(body, children);
+  try {
+    const q = query({
+      prompt: "hi",
+      options: {
+        env: { PATH: process.env.PATH ?? "" },
+        spawnClaudeCodeProcess: (o) => spawnFn(o) as unknown as ReturnType<NonNullable<SdkOptions["spawnClaudeCodeProcess"]>>,
+      },
+    });
+    for await (const _m of q) { /* the child emits nothing */ }
+  } catch (err) {
+    return err as Error & Record<string, unknown>;
+  } finally {
+    await reaped(children);
+  }
+  throw new Error("the SDK did not throw on the child's exit");
+}
+
+describe("dead CLI group confirmed gone before a resume (issue #1656)", () => {
+  // A resumed run can live for hours; a dead pid left in spawnedPids until the run-end
+  // killAgentTree could by then name a RECYCLED process group. The resume waits until the
+  // dead CLI's group is CONFIRMED absent, then drops the pid; anything else fails closed.
+  // These prove call order and set membership with recording fakes; nothing is signalled.
+  async function driveRealDeath(
+    killCliGroup: (pgid: number) => boolean,
+    cliGroupPresent: (pgid: number) => boolean | undefined,
+  ): Promise<{ run: Promise<unknown>; events: string[]; deadPid: () => number | undefined; children: ChildProcess[] }> {
+    const children: ChildProcess[] = [];
+    const events: string[] = [];
+    const fake = fakeTurns([
+      [submitPlan("# Plan", "prev"), resultSuccess("prev")],
+      [signalDone("prev"), resultSuccess("prev")],
+    ], false);
+    let call = 0;
+    const queryFn: SdkQueryFn = (params) => {
+      events.push(`query${call}`);
+      return call++ === 0 ? defaultQueryFn(params) : fake.queryFn(params);
+    };
+    const spawnSelfEnding = selfEndingSpawn("process.exit(143);", children);
+    const executor = new SdkExecutor(
+      nullLogger(),
+      homeDir,
+      opts(queryFn, {
+        spawn: (o) => spawnSelfEnding(o),
+        kill: (pid) => {
+          events.push(`reap:${pid}`);
+          return true;
+        },
+        killCliGroup: (pgid) => {
+          events.push(`killGroup:${pgid}`);
+          return killCliGroup(pgid);
+        },
+        cliGroupPresent: (pgid) => {
+          events.push(`probe:${pgid}`);
+          return cliGroupPresent(pgid);
+        },
+      }),
+    );
+    const run = executor.run(makeCtx({ sessionId: "prev" }).ctx);
+    return { run, events, deadPid: () => children[0]?.pid, children };
+  }
+
+  const onDead = (events: string[], pid: number): string[] =>
+    events.filter((e) => e.startsWith("query") || e.endsWith(`:${pid}`));
+
+  it("signals the group, confirms it absent, removes the pid from the run-end reap set, then resumes", async () => {
+    const d = await driveRealDeath(() => true, () => false);
+    try {
+      const result = (await d.run) as { branch: string };
+      assert.equal(result.branch, "agent/issue-5");
+      const pid = d.deadPid();
+      assert.ok(pid !== undefined, "the real SDK spawned the self-ending CLI");
+      assert.deepEqual(
+        onDead(d.events, pid),
+        ["query0", `killGroup:${pid}`, `probe:${pid}`, "query1", "query2"],
+        "group signalled and probed before the resume; the run-end reap never sees the pid",
+      );
+    } finally {
+      await reaped(d.children);
+    }
+  });
+
+  for (const [label, killResult, present] of [
+    ["the signal fails and the group is still present", false, true],
+    ["the signal is delivered but the group never disappears", true, true],
+    ["absence is unknowable (an inconclusive probe)", true, undefined],
+  ] as const) {
+    it(`fails closed when ${label}: no resume, and the run-end reap of the dead pid is group-only`, async () => {
+      const d = await driveRealDeath(() => killResult, () => present);
+      try {
+        const err = await rejection(d.run);
+        assert.equal(err.message, "Claude Code process exited with code 143");
+        const pid = d.deadPid();
+        assert.ok(pid !== undefined);
+        const seen = onDead(d.events, pid);
+        assert.deepEqual(seen.filter((e) => e.startsWith("query")), ["query0"], "no resume");
+        // Once in the confirmation attempt, once more by the run-end reap: both group-only. The
+        // fallback-capable kill (bare pid on a failed group signal) never sees the dead pid.
+        assert.deepEqual(
+          seen.filter((e) => !e.startsWith("query") && !e.startsWith("probe:")),
+          [`killGroup:${pid}`, `killGroup:${pid}`],
+        );
+        assert.ok(!seen.includes(`reap:${pid}`), "never the fallback-capable kill");
+      } finally {
+        await reaped(d.children);
+      }
+    });
+  }
+});
+
+describe("SDK process-exit error shape (issue #1656 pin)", () => {
+  it("exit 143 carries own errorClass=process_exited_nonzero and exitCode=143", async () => {
+    const err = await realSdkError("process.exit(143);");
+    assert.ok(Object.hasOwn(err, "errorClass") && Object.hasOwn(err, "exitCode"), "own-property tags");
+    assert.equal(err["errorClass"], "process_exited_nonzero");
+    assert.equal(err["exitCode"], 143);
+  });
+
+  it("a self-SIGTERM carries own errorClass=process_killed_by_signal and signal=SIGTERM", async () => {
+    const err = await realSdkError('process.kill(process.pid, "SIGTERM");');
+    assert.ok(Object.hasOwn(err, "errorClass") && Object.hasOwn(err, "signal"), "own-property tags");
+    assert.equal(err["errorClass"], "process_killed_by_signal");
+    assert.equal(err["signal"], "SIGTERM");
+  });
+
+  for (const [label, body, expectResume] of [
+    ["exit 143", "process.exit(143);", true],
+    ["self-SIGTERM", 'process.kill(process.pid, "SIGTERM");', true],
+    ["self-SIGSEGV", 'process.kill(process.pid, "SIGSEGV");', false],
+  ] as const) {
+    it(`through the executor, the real SDK's ${label} ${expectResume ? "resumes" : "fails the run"}`, async () => {
+      const children: ChildProcess[] = [];
+      const fake = fakeTurns([
+        [submitPlan("# Plan", "prev"), resultSuccess("prev")],
+        [signalDone("prev"), resultSuccess("prev")],
+      ], false);
+      const resumes: Array<string | undefined> = [];
+      let call = 0;
+      // Turn 0 runs the REAL SDK through the production query seam (its CLI is the
+      // self-ending child); later turns are faked.
+      const queryFn: SdkQueryFn = (params) => {
+        resumes.push(params.options.resume);
+        return call++ === 0 ? defaultQueryFn(params) : fake.queryFn(params);
+      };
+      const run = new SdkExecutor(
+        nullLogger(),
+        homeDir,
+        opts(queryFn, { spawn: selfEndingSpawn(body, children) }),
+      ).run(makeCtx({ sessionId: "prev" }).ctx);
+      try {
+        if (expectResume) {
+          const result = await run;
+          assert.equal(result.branch, "agent/issue-5");
+          assert.deepEqual(resumes, ["prev", "prev", "prev"]);
+        } else {
+          const err = await rejection(run);
+          assert.match(err.message, /terminated by signal SIGSEGV/);
+          assert.deepEqual(resumes, ["prev"]);
+        }
+      } finally {
+        await reaped(children);
+      }
+    });
+  }
+});

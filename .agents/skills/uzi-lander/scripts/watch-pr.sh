@@ -351,19 +351,34 @@ while [ "$i" -lt "$MAX" ]; do
     gr_state="unreadable"
     unknown=1
   fi
+  # Greptile's outside-diff findings live in one ISSUE comment, not in a review object
+  # (lib/greptile-verdict.sh, greptile_outside_diff). They count toward its tally and stay
+  # live until Greptile drops them from that comment.
+  god_total=0; god_head=0
+  if [ -n "${issue_c:-}" ] && greptile_outside_diff "$head" < <(printf '%s' "$issue_c" | jq -s 'add // []'); then
+    god_total="$GOD_TOTAL"; god_head="$GOD_HEAD"
+  else
+    unknown=1
+  fi
   gr_reviewed=0; gr_added=""
   if [ "$gr_state" = "completed" ] && [ "$gr_concl" = "success" ] && [ -n "$gr_summary" ]; then
     gr_reviewed=1
     gr_added=$(printf '%s' "$gr_summary" | grep -oE '[0-9]+ comments added' | grep -oE '^[0-9]+' || true)
+    # The inline share of the tally: the head pass's outside-diff bullets are not review comments.
+    gr_inline_added=$(( ${gr_added:-0} - god_head ))
     if [ "$gr_added" = "0" ]; then
       # Greptile posts no review object for a clean pass; the explicit current-head zero is
       # authoritative and every still-anchored Greptile comment belongs to an older pass.
-      gr_live=0
+      gr_live=0; god_total=0
+    elif [ "$gr_inline_added" -le 0 ]; then
+      # Every comment this pass added is outside the diff, so no review object exists and
+      # none is needed; older inline comments were superseded by this full-diff pass.
+      gr_live=0; gr_scoped_total=0
     elif [ -z "$gr_review_id" ]; then
-      # A summary says comments were added but no current-head review id can scope them.
-      # Fail closed rather than mixing old and new comments into a false finding set.
+      # A summary says inline comments were added but no current-head review id can scope
+      # them. Fail closed rather than mixing old and new comments into a false finding set.
       unknown=1
-    elif [ "$gr_scoped_total" -ne "$gr_added" ]; then
+    elif [ "$gr_scoped_total" -ne "$gr_inline_added" ]; then
       # GitHub can expose the completed check/review before all inline comments. Until the
       # review-scoped count matches Greptile's own tally, the finding set is incomplete.
       unknown=1
@@ -388,6 +403,7 @@ while [ "$i" -lt "$MAX" ]; do
       [ "$gr_rc" -eq 2 ] && gr_prior="pending"
     fi
   fi
+  gr_live=$(( gr_live + god_total ))
   [ "$gr_state" = "completed" ] && [ "$gr_reviewed" -eq 0 ] && gr_state="completed(${gr_concl:-no-conclusion}, no summary)"
   # An unconfirmed CodeRabbit review counts as live; Greptile is scoped to its current-head
   # review, cleared by an explicit clean zero-comment summary, or, with no review on this
@@ -470,7 +486,7 @@ while [ "$i" -lt "$MAX" ]; do
 
   eqnote=""; grnote=""
   [ "$equiv" -eq 1 ] && eqnote=" equiv=1"
-  [ "$gr_reviewed" -eq 1 ] && grnote=" gr_scope=$gr_scoped_total/${gr_added:-?}"
+  [ "$gr_reviewed" -eq 1 ] && grnote=" gr_scope=$gr_scoped_total+${god_head}od/${gr_added:-?}"
   [ -n "$gr_prior" ] && grnote=" gr_prior=$gr_prior"
   echo "try $i: head=${head:0:8} req_fail=$fail req_pend=$pend req_cancel=$cancel mrw_active=$mrw_active cr_reviewed=$cr_reviewed${eqnote} cr_status='${cr_desc:-absent}' cr_full_required=$cr_full_required greptile=$gr_state${gr_summary:+ ($gr_summary)}${grnote} live=$live (cr=$cr_live gr=$gr_live cr_unconfirmed=$cr_unconfirmed)${unknown:+ unknown=$unknown}"
 

@@ -26,7 +26,7 @@
 
 import type { ChildProcess } from "node:child_process";
 import type { SpawnOptions } from "@anthropic-ai/claude-agent-sdk";
-import { killRunnerGroup, runnerSpawn } from "./runner-uid.js";
+import { killRunnerGroup, killRunnerGroupOnly, runnerSpawn } from "./runner-uid.js";
 
 /** Spawn the SDK subprocess in its own process group, under the `runner` uid. */
 export function spawnDetached(opts: SpawnOptions): ChildProcess {
@@ -46,4 +46,37 @@ export function spawnDetached(opts: SpawnOptions): ChildProcess {
  */
 export function killProcessGroup(pid: number | undefined): boolean {
   return killRunnerGroup(pid);
+}
+
+/**
+ * issue #1656: SIGKILL the process GROUP `pgid` only, never the bare pid (see
+ * killRunnerGroupOnly). The return value cannot tell "already gone" from "failed"; confirm
+ * absence with {@link processGroupPresent}.
+ */
+export function killProcessGroupOnly(pgid: number): boolean {
+  return killRunnerGroupOnly(pgid);
+}
+
+/**
+ * issue #1656: whether any process is still in process group `pgid`, asked of the kernel with
+ * `kill(-pgid, 0)`: an atomic existence check on the group, unlike a snapshot listing of
+ * processes that a member forking around the list/read steps can slip past. ESRCH means absent;
+ * success or EPERM means present (EPERM is what the worker uid gets for a live runner group
+ * under the uid split); zombies count as present. @returns undefined, fail closed, for any other
+ * error or a non-positive pgid. `kill` is injectable for tests.
+ */
+export function processGroupPresent(
+  pgid: number,
+  kill: (pid: number, signal?: string | number) => true = process.kill,
+): boolean | undefined {
+  if (pgid <= 0) return undefined;
+  try {
+    kill(-pgid, 0);
+    return true;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ESRCH") return false;
+    if (code === "EPERM") return true;
+    return undefined;
+  }
 }
