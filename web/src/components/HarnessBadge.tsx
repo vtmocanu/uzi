@@ -1,7 +1,8 @@
 // HarnessBadge — the run harness chip (PRD #1429 M4a, reworked by PRD #1653 D-W5).
 //
-// EVERY run shows which agent it runs on, Claude included: a small round chip holding
-// the provider logo (the Claude mark for "claude", the OpenAI mark for "codex"). PRD
+// Claude runs are marked too, not just Codex: a small round chip holding the provider
+// logo (the Claude mark for "claude", the OpenAI mark for "codex"). Callers decide where
+// it shows: the run list omits it on a row showing the vault-waiting badge instead. PRD
 // #1429 M4a left Claude runs unmarked and gave Codex a text badge; PRD #1653 reversed
 // that, so a mixed run list says at a glance which agent ran what, and the run header
 // matches the list.

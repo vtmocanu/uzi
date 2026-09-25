@@ -87,7 +87,10 @@ function AccountGroup({
             <OpenAIIcon className="h-4 w-4 text-fg" />
           )}
         </span>
-        <span className="min-w-0 truncate text-[10px] font-medium uppercase tracking-wide text-faint">
+        <span
+          title={name}
+          className="min-w-0 truncate text-[10px] font-medium uppercase tracking-wide text-faint"
+        >
           {name}
         </span>
       </div>

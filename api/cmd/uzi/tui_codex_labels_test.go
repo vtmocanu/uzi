@@ -92,7 +92,8 @@ func TestBoardSingleCodexAccountNamedWithLengthLabels(t *testing.T) {
 }
 
 // TestBoardCodexExtraBucketKeepsName — a non-main bucket keeps its (Plain-routed) name before
-// its windows while the main bucket stays unnamed, and a 3-hour window reads "3h".
+// its windows while the main bucket stays unnamed, a 3-hour window reads "3h", and the bucket
+// joins its account's main bucket with a two-space (not the three-space account) gap.
 func TestBoardCodexExtraBucketKeepsName(t *testing.T) {
 	m := codexStripModel(t, []apitypes.CodexAccountRateLimitDTO{{
 		AccountID: "cx-a", Aliases: []string{"alpha"}, IsDefault: true, Status: "fresh",
@@ -105,8 +106,13 @@ func TestBoardCodexExtraBucketKeepsName(t *testing.T) {
 	if !strings.Contains(line, "▎alpha 5h ") {
 		t.Errorf("the main bucket must draw no name — its windows follow the account label:\n%q", line)
 	}
-	if !strings.Contains(line, "   mini 3h ") {
+	if !strings.Contains(line, "  mini 3h ") {
 		t.Errorf("an extra bucket must keep its name before its windows, and a 3-hour window reads 3h:\n%q", line)
+	}
+	// Buckets of one account join with two spaces; three is the gap between accounts, which
+	// would make the extra bucket read like a sibling account.
+	if strings.Contains(line, "   mini 3h ") {
+		t.Errorf("buckets of one account must join with two spaces, not the three-space account gap:\n%q", line)
 	}
 	if n := strings.Count(line, "codex"); n != 1 {
 		t.Errorf("only the provider tag may say \"codex\", got %d:\n%q", n, line)

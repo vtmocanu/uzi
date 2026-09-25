@@ -234,11 +234,12 @@ func (m tuiModel) railAutoFolded(now time.Time) bool {
 
 // railCodexFloorRows reports the CODEX block's protected floor — the 1-row CODEX header plus the
 // FIRST shown Codex account's entry (its always-drawn label eyebrow, each non-main bucket's name
-// eyebrow, and one line per present window; PRD #1653 D-T2/D-T3) — and whether any Codex account is shown at all. It is the PRD #1209 M3 analog of the Claude
-// own-account floor railAutoFolded protects: railCodexRateMeters appends whole entries in order
-// and drops the rest bottom-up, so the first renderable account is the one guaranteed on screen
-// whenever the block renders. Counting it makes the crew auto-fold to keep at least that account
-// visible instead of letting the whole CODEX block silently overflow. The row math here mirrors
+// eyebrow, and one line per present window; PRD #1653 D-T2/D-T3) — and whether any Codex
+// account is shown at all. It is the PRD #1209 M3 analog of the Claude own-account floor
+// railAutoFolded protects: railCodexRateMeters appends whole entries in order and drops the rest
+// bottom-up, so the first renderable account is the one guaranteed on screen whenever the block
+// renders. Counting it makes the crew auto-fold to keep at least that account visible instead of
+// letting the whole CODEX block silently overflow. The row math here mirrors
 // railCodexRateMeters' entry-building exactly, so the decision and the render cannot disagree.
 func (m tuiModel) railCodexFloorRows() (rows int, shownAny bool) {
 	shown := m.selectedCodexRateMeters()

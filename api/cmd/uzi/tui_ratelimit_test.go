@@ -87,11 +87,11 @@ func TestBoardRateLimitStripSelection(t *testing.T) {
 	}
 }
 
-// TestBoardRateLimitStripLabelKeyedOffReadable — PRD #1653 D-T2 supersedes the PRD 1519
+// TestBoardRateLimitStripAlwaysLabels — PRD #1653 D-T2 supersedes the PRD 1519
 // hide-when-one-readable rule on the board strip: the label shows for EVERY shown token, a lone
 // readable one included, and whether or not other readable tokens exist. (The detail rail keeps
 // its readable-keyed showLabel; TestRailRateMetersLabelKeyedOffReadable pins that.)
-func TestBoardRateLimitStripLabelKeyedOffReadable(t *testing.T) {
+func TestBoardRateLimitStripAlwaysLabels(t *testing.T) {
 	// Single readable token → still labelled, right after its accent bar, before its windows.
 	single := stripModel(t, []apitypes.TokenRateLimitDTO{
 		okMeter("sec-personal", "solotoken", true, 33, 61),

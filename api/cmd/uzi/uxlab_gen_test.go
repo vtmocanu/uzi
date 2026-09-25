@@ -262,28 +262,29 @@ func boardMeters() []apitypes.TokenRateLimitDTO {
 }
 
 // codexMeters is a representative set of the viewer's own per-account Codex rate-limit meters,
-// mirroring demo.go's SelfCodexMeters: the default "primary" account and the listed "team"
-// account both show (ok/warn/danger bands across their 5h bucket's primary+secondary windows),
-// "unlisted" is readable but hidden, "archive" is stale (shown DIMMED) and listed, a no_reading
-// account never appears. Shared by the ux-lab Codex frames so the Codex meters (PRD #1209 M3) are
-// exercised offline on both the board strip and the detail rail.
+// mirroring demo.go's SelfCodexMeters: every account carries the main "codex" bucket (ID
+// codexMainBucketID, so no bucket name is drawn) with a 5h primary (limit_window_seconds 18000)
+// and, where present, a 7d secondary (604800), PRD #1653. The default "primary" account and the
+// listed "team" account both show (ok/warn/danger bands across their windows), "unlisted" is
+// readable but hidden, "archive" is stale (shown DIMMED) and listed, a no_reading account never
+// appears. No extra named bucket: at the lab's 100 cols it would push the stale "archive" account
+// off the board line (TestBoardCodexExtraBucketKeepsName covers that case instead). Shared by the
+// ux-lab Codex frames so the Codex meters (PRD #1209 M3) are exercised offline on both the board
+// strip and the detail rail.
 func codexMeters() []apitypes.CodexAccountRateLimitDTO {
-	fp := func(f float64) *float64 { return &f }
-	bucket := func(primary, secondary *float64) []apitypes.CodexRateLimitBucketDTO {
-		b := apitypes.CodexRateLimitBucketDTO{ID: "5h", DisplayName: "5h"}
-		if primary != nil {
-			b.Primary = &apitypes.CodexRateLimitWindowDTO{UsedPercent: primary}
-		}
-		if secondary != nil {
-			b.Secondary = &apitypes.CodexRateLimitWindowDTO{UsedPercent: secondary}
-		}
-		return []apitypes.CodexRateLimitBucketDTO{b}
+	win := func(pct float64, secs int64) *apitypes.CodexRateLimitWindowDTO {
+		return &apitypes.CodexRateLimitWindowDTO{UsedPercent: fPtr(pct), LimitWindowSeconds: i64Ptr(secs)}
 	}
+	const fiveHour, sevenDay = 18000, 604800
 	return []apitypes.CodexAccountRateLimitDTO{
-		{AccountID: "cx-primary", Aliases: []string{"primary"}, IsDefault: true, Status: "fresh", Buckets: bucket(fp(41), fp(63))},
-		{AccountID: "cx-team", Aliases: []string{"team"}, Status: "fresh", Buckets: bucket(fp(88), fp(52))},
-		{AccountID: "cx-unlisted", Aliases: []string{"unlisted"}, Status: "fresh", Buckets: bucket(fp(12), nil)},
-		{AccountID: "cx-old", Aliases: []string{"archive"}, Status: "stale", Buckets: bucket(fp(70), nil)},
+		{AccountID: "cx-primary", Aliases: []string{"primary"}, IsDefault: true, Status: "fresh",
+			Buckets: []apitypes.CodexRateLimitBucketDTO{{ID: "codex", Primary: win(41, fiveHour), Secondary: win(63, sevenDay)}}},
+		{AccountID: "cx-team", Aliases: []string{"team"}, Status: "fresh",
+			Buckets: []apitypes.CodexRateLimitBucketDTO{{ID: "codex", Primary: win(88, fiveHour), Secondary: win(52, sevenDay)}}},
+		{AccountID: "cx-unlisted", Aliases: []string{"unlisted"}, Status: "fresh",
+			Buckets: []apitypes.CodexRateLimitBucketDTO{{ID: "codex", Primary: win(12, fiveHour)}}},
+		{AccountID: "cx-old", Aliases: []string{"archive"}, Status: "stale", Stale: boolPtr(true),
+			Buckets: []apitypes.CodexRateLimitBucketDTO{{ID: "codex", Primary: win(70, fiveHour)}}},
 		{AccountID: "cx-pending", Aliases: []string{"pending"}, Status: "no_reading"},
 	}
 }

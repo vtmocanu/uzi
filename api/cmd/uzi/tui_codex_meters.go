@@ -32,7 +32,9 @@ const codexMainBucketID = "codex"
 // limit_window_seconds, mirroring the web formatCodexWindowLabel
 // (web/src/lib/codexRateLimits.ts): whole days → "Nd", whole hours → "Nh", whole minutes →
 // "Nm", else "Ns". A missing or non-positive length reads "?" (PRD #1653 amendment: the web
-// says "window", which the 26-col rail cannot fit). Derived from a number, so no Plain needed.
+// says "window", but on the 26-col detail rail codexRailWindowLine would shrink the 10-cell bar
+// by the label's excess over codexRailLabelCols, so a 6-char label costs 3 of the 10 bar cells;
+// "?" keeps the bar full). Derived from a number, so no Plain needed.
 func codexWindowLabel(secs *int64) string {
 	if secs == nil || *secs <= 0 {
 		return "?"
@@ -202,7 +204,7 @@ func (m tuiModel) boardCodexAccountsSeg(now time.Time) string {
 }
 
 // boardCodexAccountSeg renders one Codex account's board-strip segment:
-// `▎<label> [<bucket name> ]<len> <bar> NN%  <len> <bar> NN%`. The label is always drawn; the
+// `▎<label> [<bucket name> ]<len> <bar> NN%  <len> <bar> NN%`, buckets joined by two spaces. The label is always drawn; the
 // main bucket (codexMainBucketID) draws no bucket name, any other bucket keeps its name before
 // its windows (PRD #1653 D-T2/D-T3). An absent secondary window is not drawn.
 func (m tuiModel) boardCodexAccountSeg(a apitypes.CodexAccountRateLimitDTO, now time.Time) string {
@@ -220,7 +222,10 @@ func (m tuiModel) boardCodexAccountSeg(a apitypes.CodexAccountRateLimitDTO, now 
 		}
 		bucketSegs = append(bucketSegs, bs)
 	}
-	seg += strings.Join(bucketSegs, "   ")
+	// Buckets of one account join with two spaces, one narrower than the three-space gap between
+	// accounts (boardCodexAccountsSeg), so an extra bucket reads as part of its account rather
+	// than as a sibling account (prds/mockups/1653-usage-provider-icons-tui-mock.sh, case 2).
+	seg += strings.Join(bucketSegs, "  ")
 	accent := m.pal.faintC
 	if codexAccountPeakPct(a) >= rateDangerPct {
 		accent = m.pal.alarm

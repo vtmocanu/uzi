@@ -172,6 +172,15 @@ describe("SidebarUsageLimits: one account list (PRD #1653 D-W2)", () => {
     expect(within(group).getByText("team")).toBeTruthy();
   });
 
+  it("titles each account name with the full name, so a truncated name reads on hover", async () => {
+    mockData([team], [codexDefault]);
+    renderList();
+    const claude = await screen.findByRole("group", { name: "Claude account team" });
+    const codex = await screen.findByRole("group", { name: "Codex account personal-codex" });
+    expect(within(claude).getByText("team").getAttribute("title")).toBe("team");
+    expect(within(codex).getByText("personal-codex").getAttribute("title")).toBe("personal-codex");
+  });
+
   it("names a lone Codex account in a visible header", async () => {
     mockData([], [codexDefault]);
     renderList();
