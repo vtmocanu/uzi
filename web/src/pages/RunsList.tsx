@@ -740,10 +740,19 @@ export function RunsList() {
   );
 }
 
-// The archive: every finished run, searchable, date-grouped, progressively
-// revealed. Search state lives in ?q= so a filtered view is shareable — the whole
-// point of the route split (replace:true keeps typing out of the history stack, so
-// Back leaves the page rather than un-typing).
+// isGenuineFailure (PRD #1650 D7): the Failed filter's membership. A failed run that a
+// human deliberately stopped (plan rejected) is not a failure, and a cancelled run never
+// is; isStoppedRun owns that line, so the filter and the row's pill agree.
+function isGenuineFailure(r: RunListItem): boolean {
+  return r.status === "failed" && !isStoppedRun(r.status, r.stop_kind);
+}
+
+// The archive: every finished run, searchable, filterable to failures, date-grouped,
+// progressively revealed. Search lives in ?q= and the Failed filter in ?status=failed,
+// so a filtered view is shareable — the whole point of the route split. Each control
+// rewrites only its own param, so typing keeps the filter and toggling keeps the query
+// (replace:true keeps both out of the history stack, so Back leaves the page rather than
+// un-typing).
 export function RunsHistory() {
   // Every row here is terminal, so the duration token is static ("ran 42m") — a
   // minute-cadence clock keeps the "N minutes ago"-class derivations honest without
@@ -755,10 +764,23 @@ export function RunsHistory() {
   const { runs, loading, error, tokenCount } = useRunsData();
   const [searchParams, setSearchParams] = useSearchParams();
   const query = searchParams.get("q") ?? "";
-  const setQuery = useCallback(
-    (v: string) => setSearchParams(v ? { q: v } : {}, { replace: true }),
+  const failedOnly = searchParams.get("status") === "failed";
+  // Merge, never replace: set or drop ONE param and carry every other one over.
+  const setParam = useCallback(
+    (key: string, v: string) =>
+      setSearchParams(
+        (prev) => {
+          const next = new URLSearchParams(prev);
+          if (v) next.set(key, v);
+          else next.delete(key);
+          return next;
+        },
+        { replace: true },
+      ),
     [setSearchParams],
   );
+  const setQuery = useCallback((v: string) => setParam("q", v), [setParam]);
+  const setFailedOnly = useCallback((on: boolean) => setParam("status", on ? "failed" : ""), [setParam]);
   // The render slice the reveal button grows; lanePaging clamps it up to the
   // baseline (PAST_CAP, or PAGE while a search is active), so 0 means "at baseline".
   const [shownCount, setShownCount] = useState(0);
@@ -783,15 +805,20 @@ export function RunsHistory() {
   // Starting or clearing a search re-baselines the reveal (the board does the same
   // on its searchActive toggle): a slice grown while browsing must not leak into
   // search results, nor the reverse.
+  // Toggling the Failed filter re-baselines it for the same reason.
   useEffect(() => {
     setShownCount(0);
-  }, [searchActive]);
+  }, [searchActive, failedOnly]);
 
   const past = runs.filter((r) => isTerminalRun(r.status)).sort(sortPast);
-  // Membership → search → slice → group (the board's Decision 6 order, transposed):
-  // grouping runs over the SLICED list so a group never renders half its rows with a
-  // header count claiming more, while the reveal button carries the honest remainder.
-  const pastFiltered = searchActive ? past.filter((r) => runMatchesQuery(r, q)) : past;
+  const failures = past.filter(isGenuineFailure);
+  // Membership → Failed filter → search → slice → group (the board's Decision 6 order,
+  // transposed): the filter narrows before paging so the count and the pages reflect
+  // failures only, and grouping runs over the SLICED list so a group never renders half
+  // its rows with a header count claiming more, while the reveal button carries the
+  // honest remainder.
+  const pastMembers = failedOnly ? failures : past;
+  const pastFiltered = searchActive ? pastMembers.filter((r) => runMatchesQuery(r, q)) : pastMembers;
   const paging = lanePaging({
     total: pastFiltered.length,
     shownCount,
@@ -842,6 +869,22 @@ export function RunsHistory() {
               placeholder="Search past runs…"
               className="w-72 py-1 text-xs"
             />
+            {/* The Failed filter (PRD #1650 D7): a toggle, not a nav badge, because a
+                failed run has no resolved state and a count that never clears is noise.
+                Its count is the archive's genuine failures, independent of the search. */}
+            <button
+              type="button"
+              onClick={() => setFailedOnly(!failedOnly)}
+              aria-pressed={failedOnly}
+              className={cx(
+                "rounded-md border px-2 py-1 text-xs tabular-nums transition-colors",
+                failedOnly
+                  ? "border-edge-strong bg-raised font-medium text-fg"
+                  : "border-edge text-muted hover:bg-raised/60 hover:text-fg",
+              )}
+            >
+              Failed · {failures.length}
+            </button>
             <span className="ml-auto text-xs tabular-nums text-faint">
               {paging.countLabel || String(pastFiltered.length)}
             </span>
@@ -872,9 +915,22 @@ export function RunsHistory() {
             </div>
           ))}
 
+          {failedOnly && !searchActive && pastFiltered.length === 0 && (
+            <p className="text-sm text-faint">
+              No failed runs in the archive.{" "}
+              <button
+                type="button"
+                onClick={() => setFailedOnly(false)}
+                className="font-medium text-brand hover:text-brand-hover"
+              >
+                Show all past runs
+              </button>
+            </p>
+          )}
+
           {searchActive && pastFiltered.length === 0 && (
             <p className="text-sm text-faint">
-              No past runs match “{q}”.{" "}
+              No {failedOnly ? "failed" : "past"} runs match “{q}”.{" "}
               <button
                 type="button"
                 onClick={() => setQuery("")}

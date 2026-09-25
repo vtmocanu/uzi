@@ -231,6 +231,61 @@ func (q *Queries) ListCIAutofixCandidateRefs(ctx context.Context, repoID uuid.UU
 	return items, nil
 }
 
+const listCIAutofixHaltsForRepo = `-- name: ListCIAutofixHaltsForRepo :many
+WITH latest_run AS (
+    SELECT DISTINCT ON (r.issue_iid) r.issue_iid, r.branch, r.mr_state
+    FROM runs r
+    WHERE r.repo_id = $1::uuid AND r.issue_iid IS NOT NULL
+    ORDER BY r.issue_iid, r.created_at DESC
+)
+SELECT lr.issue_iid, a.attempt_count
+FROM latest_run lr
+JOIN ci_autofix_attempts a ON a.repo_id = $1::uuid AND a.ref = lr.branch
+WHERE lr.branch IS NOT NULL AND lr.branch <> ''
+  AND (lr.mr_state IS NULL OR lr.mr_state NOT IN ('closed', 'merged'))
+  AND a.halt_notified
+`
+
+type ListCIAutofixHaltsForRepoRow struct {
+	IssueIid     pgtype.Int8 `json:"issue_iid"`
+	AttemptCount int32       `json:"attempt_count"`
+}
+
+// Board card "Autofix stopped" marker (PRD #1650 D3a): for each issue, whether the
+// ledger row of its MOST RECENT run's branch has latched a halt (halt_notified), and
+// the auto attempts spent. The latest_run CTE is ListRunPipelineStatusesForRepo's
+// (newest run per issue, regardless of branch), so an older run's halted branch
+// never marks a card whose newest run is on another branch. It deliberately does
+// NOT join pipeline_statuses: that cache row exists only while a pipeline is
+// cached, and a halt must stay visible without one. A ref with no issue card (a
+// prompt-schedule MR) has no row here; the Slack halt DM is its only surface.
+// The marker also drops once the newest run's MR is recorded closed or merged: a
+// terminal mr_state takes the branch out of the watch set, but the ledger row is
+// only evicted on the next reconcile (DeleteCIAutofixAttemptsNotIn), so the
+// query hides the marker in the gap before eviction. runs.mr_state
+// holds only forge.MRState* values (opened|closed|merged|locked, gated by
+// IsKnownMRState in the watchers); NULL (no MR observed yet), 'opened' and
+// 'locked' keep the marker.
+func (q *Queries) ListCIAutofixHaltsForRepo(ctx context.Context, repoID uuid.UUID) ([]ListCIAutofixHaltsForRepoRow, error) {
+	rows, err := q.db.Query(ctx, listCIAutofixHaltsForRepo, repoID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListCIAutofixHaltsForRepoRow{}
+	for rows.Next() {
+		var i ListCIAutofixHaltsForRepoRow
+		if err := rows.Scan(&i.IssueIid, &i.AttemptCount); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const recordCIAutofixPipeline = `-- name: RecordCIAutofixPipeline :exec
 INSERT INTO ci_autofix_attempts (repo_id, ref, last_pipeline_id)
 VALUES ($1::uuid, $2, $3)

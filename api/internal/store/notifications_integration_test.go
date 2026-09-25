@@ -2,12 +2,14 @@ package store_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -19,7 +21,7 @@ import (
 // the newest cap, the created_at-tie boundary residual (the prune subquery has no id
 // tiebreaker and deletes with a strict `<`, so rows tied at the boundary's created_at
 // are ALL kept — a small keep-slightly-more, documented in queries/notifications.sql),
-// per-user isolation, and an InsertNotification→Prune→Count round-trip proving rows
+// per-user isolation, and an InsertNotification→Prune→count round-trip proving rows
 // are genuinely removed through the generated write seam.
 //
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres (run via
@@ -161,14 +163,101 @@ func TestNotificationsPruneLiveDB(t *testing.T) {
 			}
 			time.Sleep(2 * time.Millisecond) // distinct created_at so the cap is unambiguous
 		}
-		if got, err := q.CountNotificationsForUser(ctx, u); err != nil || got != 4 {
-			t.Fatalf("CountNotificationsForUser = %d, %v; want 4 inserted", got, err)
+		if got := countFor(u); got != 4 {
+			t.Fatalf("count = %d; want 4 inserted", got)
 		}
 		if got := prune(u, 2); got != 2 {
 			t.Errorf("deleted %d, want 2", got)
 		}
-		if got, err := q.CountNotificationsForUser(ctx, u); err != nil || got != 2 {
-			t.Fatalf("CountNotificationsForUser = %d, %v; want 2 after prune (rows genuinely removed)", got, err)
+		if got := countFor(u); got != 2 {
+			t.Fatalf("count = %d; want 2 after prune (rows genuinely removed)", got)
 		}
 	})
+}
+
+// TestFindNotificationForRunKindIgnoresReadStateLiveDB pins PRD #1650 D4 against a REAL
+// Postgres: the incidental-finding coalescing latch keys on the (user, run, kind) row alone,
+// never on its historical read state. Nothing marks a row read any more, but rows read
+// before the inbox was retired carry a non-null read_at; a lookup that still filtered on
+// read_at IS NULL would miss them and fire a second Slack DM for the same run. It also pins
+// the scoping: another run, another kind or another user misses, and with several matching
+// rows the newest is returned.
+//
+// Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres (run via
+// e2e/run-store-it.sh).
+func TestFindNotificationForRunKindIgnoresReadStateLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
+	}
+	ctx := context.Background()
+	if err := store.Migrate(ctx, dsn); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	pool, err := store.OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	defer pool.Close()
+	q := store.New(pool)
+
+	newUser := func() uuid.UUID {
+		id := uuid.New()
+		mustExec(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
+			id, fmt.Sprintf("latch-%s@e2e", id))
+		return id
+	}
+	newRun := func(u uuid.UUID) uuid.UUID {
+		id := uuid.New()
+		mustExec(ctx, t, pool,
+			`INSERT INTO runs (id, user_id, kind, issue_title, issue_description) VALUES ($1, $2, 'chat', 't', 'd')`, id, u)
+		return id
+	}
+	insert := func(u, run uuid.UUID, kind string, at time.Time) uuid.UUID {
+		var id uuid.UUID
+		if err := pool.QueryRow(ctx,
+			`INSERT INTO notifications (user_id, kind, payload, run_id, created_at)
+			 VALUES ($1, $2, '{}', $3, $4) RETURNING id`, u, kind, run, at).Scan(&id); err != nil {
+			t.Fatalf("insert notification: %v", err)
+		}
+		return id
+	}
+	const kind = "incidental_finding"
+	find := func(u, run uuid.UUID, k string) (store.Notification, error) {
+		return q.FindNotificationForRunKind(ctx, store.FindNotificationForRunKindParams{
+			UserID: u, RunID: run, Kind: k,
+		})
+	}
+
+	u := newUser()
+	run := newRun(u)
+	t0 := time.Now().UTC()
+	latch := insert(u, run, kind, t0.Add(-time.Minute))
+	mustExec(ctx, t, pool, `UPDATE notifications SET read_at = now() WHERE id = $1`, latch)
+
+	got, err := find(u, run, kind)
+	if err != nil {
+		t.Fatalf("lookup after the latch row was marked read: %v; want the row (a miss re-fires the Slack DM)", err)
+	}
+	if got.ID != latch {
+		t.Errorf("lookup returned %v, want the read latch row %v", got.ID, latch)
+	}
+
+	// Several matching rows: the newest wins.
+	newer := insert(u, run, kind, t0)
+	if got, err := find(u, run, kind); err != nil || got.ID != newer {
+		t.Errorf("lookup with two matching rows = %v, %v; want the newest %v", got.ID, err, newer)
+	}
+
+	// Scoping: a different run, a different kind, or a different user all miss.
+	otherRun := newRun(u)
+	if _, err := find(u, otherRun, kind); !errors.Is(err, pgx.ErrNoRows) {
+		t.Errorf("lookup on another run = %v; want pgx.ErrNoRows", err)
+	}
+	if _, err := find(u, run, "judge_review"); !errors.Is(err, pgx.ErrNoRows) {
+		t.Errorf("lookup with another kind = %v; want pgx.ErrNoRows", err)
+	}
+	if _, err := find(newUser(), run, kind); !errors.Is(err, pgx.ErrNoRows) {
+		t.Errorf("lookup as another user = %v; want pgx.ErrNoRows", err)
+	}
 }

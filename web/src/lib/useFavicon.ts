@@ -7,11 +7,10 @@ import {
   type FaviconRun,
   type FaviconState,
 } from "./favicon";
-import { onNotificationsChanged } from "./notifications";
 
 // useFavicon (PRD #70 M4) owns the status-favicon poll: it keeps the browser-tab
 // icon in sync with the most urgent live state across the signed-in user's runs
-// (deriveFaviconState) plus their unread-notification count, so a BACKGROUNDED tab
+// (deriveFaviconState), so a BACKGROUNDED tab
 // still telegraphs "something failed / needs you / is working".
 //
 // The tab icon is a PURE SIDE EFFECT: nothing renders from the run list, so the
@@ -34,11 +33,9 @@ import { onNotificationsChanged } from "./notifications";
 const POLL_MS = 20_000;
 
 export function useFavicon({
-  unread,
   enabled,
   appLogoSrc,
 }: {
-  unread: number;
   enabled: boolean;
   appLogoSrc: string | null;
 }): void {
@@ -51,10 +48,6 @@ export function useFavicon({
   // the factory mark (and idle restores the static /favicon.svg). Independent of
   // auth, so it survives the disabled branch's reset.
   const baseImgRef = useRef<HTMLImageElement | null>(null);
-  // Latest unread, mirrored into a ref every render so the stable deriveAndApply
-  // callback always reads the current count.
-  const unreadRef = useRef(unread);
-  unreadRef.current = unread;
   // The "failed baseline": the ids of runs already failed at the hook's FIRST poll.
   // Seeded once so a page that opens with old failures in history never reads them as
   // fresh (deriveFaviconState only reddens a failure NOT in this set). null means "no
@@ -69,26 +62,20 @@ export function useFavicon({
   // deriveAndApply reads the latest values from the refs, derives the tab signal, and
   // applies it if it changed. Stable (no deps) so the poll effect never re-subscribes.
   const deriveAndApply = useCallback(() => {
-    let next: FaviconState;
-    if (baselineRef.current === null) {
-      // No successful runs poll yet: we cannot tell a fresh failure from a
-      // pre-existing one without the seeded baseline, so we do NOT redden. But a
-      // pure-unread `attention` needs no baseline (Fix 3), so surface it here; with
-      // nothing to say, leave the icon as-is rather than forcing idle and fighting a
-      // real state the first poll is about to derive.
-      if (unreadRef.current > 0) next = "attention";
-      else return;
-    } else {
-      next = deriveFaviconState(runsRef.current, unreadRef.current, baselineRef.current);
-    }
+    // No successful runs poll yet: we cannot tell a fresh failure from a pre-existing
+    // one without the seeded baseline, so we do NOT redden, and every other state is
+    // derived from runs too. Leave the icon as-is rather than forcing idle and
+    // fighting a real state the first poll is about to derive.
+    if (baselineRef.current === null) return;
+    const next = deriveFaviconState(runsRef.current, baselineRef.current);
     if (next === lastStateRef.current) return;
     lastStateRef.current = next;
     applyFavicon(next, baseImgRef.current);
   }, []);
 
-  // The poll lifecycle is keyed ONLY on `enabled` (deriveAndApply is stable) — never
-  // on `unread`. A changing unread prop never tears down and recreates the interval
-  // (which would reset the clock). Mirrors the ref-for-latest-callback rationale in
+  // The poll lifecycle is keyed ONLY on `enabled` (deriveAndApply is stable), so a
+  // re-render never tears down and recreates the interval (which would reset the
+  // clock). Mirrors the ref-for-latest-callback rationale in
   // usePollWhileVisible.
   useEffect(() => {
     if (!enabled) {
@@ -115,7 +102,7 @@ export function useFavicon({
           deriveAndApply();
         })
         // A failed poll is non-fatal: keep the last state rather than blanking the
-        // icon (mirrors AppShell's unread-count poll tolerance).
+        // icon (mirrors AppShell's nav-badge poll tolerance).
         .catch(() => {});
     };
 
@@ -127,15 +114,11 @@ export function useFavicon({
       if (!document.hidden) poll();
     };
     document.addEventListener("visibilitychange", onVisible);
-    // AppShell already refreshes `unread` on this event; we re-poll runs so an
-    // approval/failure that lands alongside a notification shows without a full tick.
-    const offNotif = onNotificationsChanged(poll);
 
     return () => {
       alive = false;
       clearInterval(interval);
       document.removeEventListener("visibilitychange", onVisible);
-      offNotif();
     };
   }, [enabled, deriveAndApply]);
 
@@ -153,7 +136,7 @@ export function useFavicon({
     if (!appLogoSrc) {
       // Unbranded: clear the ref so the base reverts to the factory mark and idle
       // restores the static /favicon.svg. Force a re-apply ONLY when we are actually
-      // CLEARING a previously-set branded base (had === true): the poll/unread guard
+      // CLEARING a previously-set branded base (had === true): the poll's state guard
       // (next === lastStateRef.current) would otherwise suppress a same-state redraw
       // and leave a stale branded PNG on the tab. Skip it on the initial null pass so
       // we don't flash idle over the enabled effect's own first apply.
@@ -183,11 +166,4 @@ export function useFavicon({
       alive = false;
     };
   }, [appLogoSrc]);
-
-  // Re-derive from the ref'd latest runs whenever `unread` changes, so a pure-unread
-  // `attention` shows both before and after the baseline is seeded (Fix 3).
-  useEffect(() => {
-    if (!enabled) return;
-    deriveAndApply();
-  }, [unread, enabled, deriveAndApply]);
 }

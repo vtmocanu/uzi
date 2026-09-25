@@ -171,8 +171,8 @@ export const mockRuns: Run[] = [
     // takes its issue-less branch and renders the "MR rework" kind chip (not a
     // forge #anchor). It folds the fixes onto the EXISTING branch and MR rather than
     // opening a new one, hence branch/mr_iid/mr_state are populated and status is
-    // running. The per-MR cap is NOT a run status; a capped MR surfaces via the halt
-    // inbox notification (ntf-mr-rework-capped), mirroring M3's ci-autofix halt path.
+    // running. The per-MR cap is NOT a run status; a capped MR surfaces on the run view's
+    // "cycles used · stopped" line (run-rework-capped, PRD #1202).
     id: "run-mr-rework",
     repo_id: "repo-uzi",
     issue_iid: null,
@@ -942,6 +942,75 @@ export const mockRuns: Run[] = [
     finished_at: minsAgo(184),
     created_at: minsAgo(225),
     updated_at: minsAgo(184),
+  },
+  {
+    // run-ci-halted (PRD #1650 D3a): a COMPLETED issue run whose MR is still open and whose
+    // branch pipeline is red after automatic CI fixing gave up. It is issue 22's latest run
+    // on the board, because the server reads the halt through the latest run's branch
+    // (ci_autofix_attempts joined on repo + latest_run.branch); a halted card with no
+    // latest run is a state the real board cannot produce.
+    id: "run-ci-halted",
+    repo_id: "repo-uzi",
+    issue_iid: 22,
+    issue_title: "Per-run cost budget with hard stop",
+    issue_description: "See prds/22-run-cost-budget.md.",
+    harness: "claude",
+    kind: "issue",
+    title: null,
+    resume_of_run_id: null,
+    pipeline_ref: null,
+    pipeline_web_url: null,
+    fix_verdict: null,
+    status: "completed",
+    requeue_count: 0,
+    iteration_count: 3,
+    auto_approve: true,
+    worker_id: "w-laptop",
+    branch: "agent/issue-22",
+    model: null,
+    override_subagent_model: false,
+    forge_type: "gitlab",
+    mr_web_url: "https://gitlab.example.com/myorg/uzi/-/merge_requests/47",
+    issue_web_url: null,
+    mr_iid: 47,
+    mr_state: "opened",
+    failure_reason: null,
+    stop_kind: null,
+    stop_reason: null,
+    health: "ok",
+    health_reason: null,
+    health_since: null,
+    plan_md: SAMPLE_PLAN(),
+    repo_agents: null,
+    agent_source: null,
+    agent_exclusions: null,
+    own_agents: null,
+    budget_max_iterations: 10,
+    budget_wall_seconds: 7200,
+    budget_extension_seconds: 0,
+    budget_extension_cap_seconds: 57600,
+    budget_total_seconds: null,
+    budget_used_seconds: 4020,
+    anthropic_secret_id: "sec-console",
+    anthropic_secret_label: "console-key",
+    anthropic_select_reason: "default",
+    anthropic_headroom_pct: null,
+    wait_on_limit: false,
+    limit_resets_at: null,
+    retry_not_before: null,
+    limit_wait_count: 0,
+    rate_limit_type: null,
+    recovery_wait_cause: null,
+    codex_account_action: null,
+    codex_secret_label: null,
+    recovery_retry_not_before: null,
+    forge_park_count: 0,
+    forge_park_max: 0,
+    claimed_at: minsAgo(1750),
+    started_at: minsAgo(1749),
+    finished_at: minsAgo(1682),
+    created_at: minsAgo(1752),
+    updated_at: minsAgo(1682),
   },
   {
     // run-rework-capped (PRD #1202): a COMPLETED issue run whose MR is still OPEN and whose

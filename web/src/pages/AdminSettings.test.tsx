@@ -564,6 +564,19 @@ describe("AdminSettings", () => {
 });
 
 describe("AdminSettings — run judge (PRD #46)", () => {
+  it("says where the judge's results appear, with no inbox (PRD #1650)", async () => {
+    mockApi.getSettings.mockResolvedValue(response({}));
+    const { container } = renderPage();
+    await screen.findByLabelText(/Enable the run judge for this instance/i);
+    const text = container.textContent ?? "";
+    // Positive half first: the results' real homes. The negative below is the
+    // did-the-retired-copy-come-back guard and stays paired with it.
+    expect(text).toContain(
+      "producing a verdict and recommendations on the Judge page and the run\u2019s page, plus a Slack DM when that user has linked Slack.",
+    );
+    expect(text).not.toMatch(/inbox/i);
+  });
+
   it("loads the current global toggle and judge model", async () => {
     mockApi.getSettings.mockResolvedValue(response({ judge_enabled: "true", judge_model: "sonnet" }));
     renderPage();

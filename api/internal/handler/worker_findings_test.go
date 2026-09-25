@@ -192,7 +192,7 @@ func manyLabels(n int) string {
 // notifyingSpyStore is a notifysvc.Store that records the InsertNotification calls the M3
 // coalescing path makes, so the handler test can assert WorkerCreateFinding fires the
 // notification when the finding opened/re-opened a coordinate and stays silent when it was
-// suppressed. FindUnreadNotificationForRunKind always reports "no coalescible row" so the
+// suppressed. FindNotificationForRunKind always reports "no coalescible row" so the
 // first (and only) finding takes the insert-and-DM branch. insertErr lets a test prove the
 // notification failing does not fail the 200.
 type notifyingSpyStore struct {
@@ -210,10 +210,7 @@ func (s *notifyingSpyStore) InsertNotification(_ context.Context, arg store.Inse
 func (s *notifyingSpyStore) PruneNotificationsForUser(context.Context, store.PruneNotificationsForUserParams) (int64, error) {
 	return 0, nil
 }
-func (s *notifyingSpyStore) GetRunByID(context.Context, uuid.UUID) (store.Run, error) {
-	return store.Run{}, nil
-}
-func (s *notifyingSpyStore) FindUnreadNotificationForRunKind(context.Context, store.FindUnreadNotificationForRunKindParams) (store.Notification, error) {
+func (s *notifyingSpyStore) FindNotificationForRunKind(context.Context, store.FindNotificationForRunKindParams) (store.Notification, error) {
 	return store.Notification{}, pgx.ErrNoRows
 }
 func (s *notifyingSpyStore) UpdateNotificationPayload(_ context.Context, arg store.UpdateNotificationPayloadParams) (store.Notification, error) {
@@ -270,7 +267,7 @@ func TestWorkerCreateFindingNotificationFailureDoesNotFail200(t *testing.T) {
 	uid, repoID := uuid.New(), uuid.New()
 	run := findingRun(uid, repoID)
 	st := &workerFindingsStore{userID: uid, run: run}
-	ns := &notifyingSpyStore{insertErr: errors.New("inbox down")}
+	ns := &notifyingSpyStore{insertErr: errors.New("notifications store down")}
 	h := newNotifyingWorkerHandler(st, ns)
 	wkr := store.Worker{ID: uuid.New(), UserID: uid}
 

@@ -15,7 +15,7 @@ const triage: TriageCounts = { total: 11, todo: 5, filed: 2, done: 2, dismissed:
 describe("judgeBacklog — bucket tabs", () => {
   it("reads each tab count STRAIGHT from the canonical triage aggregate (never re-tallied)", () => {
     // This is the load-bearing property (PRD #98 auditor #3): the To-triage tab must
-    // equal triage.todo — the same number the nav badge and the notification read — not a
+    // equal triage.todo — the same number the nav badge reads — not a
     // count of the group rows on screen. `all` is the recommendation-row total.
     expect(bucketTabCount(triage, "todo")).toBe(5);
     expect(bucketTabCount(triage, "filed")).toBe(2);

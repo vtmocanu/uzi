@@ -10,7 +10,6 @@ import { cliTokensApi } from "./cliTokens";
 import { forgeApi } from "./forge";
 import { judgeApi } from "./judge";
 import { memoryApi } from "./memory";
-import { notificationsApi } from "./notifications";
 import { findingsApi } from "./findings";
 import { runsApi } from "./runs";
 import { chatApi } from "./chat";
@@ -39,8 +38,6 @@ export const mockApi = {
 
   // ── Agent source (PRD #602 M5) ───────────────────────────────────────────────
   ...agentSourceApi,
-
-  ...notificationsApi,
 
   // ── Secrets ─────────────────────────────────────────────────────────────────
   ...secretsApi,

@@ -461,7 +461,7 @@ function computeBacklog(
   const capped = capBacklogRows(selected, backlogMaxRows());
   let groups = groupJudgeRecommendations(capped.rows);
   // ?run= anchor: a coordinate-level semi-join — keep a group iff it recurs in the anchor
-  // run, but keep ALL its occurrences (so a notification still shows the other runs it
+  // run, but keep ALL its occurrences (so the deep-linked view still shows the other runs it
   // recurs in). A foreign/unknown run matches nothing → empty, no existence oracle.
   //
   // This filters GROUPS after grouping; the server filters ROWS before it, inside the

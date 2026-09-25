@@ -194,8 +194,19 @@ const boardFixtures: Record<string, Board> = {
         conflict: true,
         assignee_ids: [],
         forge_updated_at: minsAgo(1500),
-        latest_run: null,
-        // A red per-card pipeline: the Fix CI affordance (M6) will hang off this.
+        // run-ci-halted opened MR !47 for this issue. The halt below is read through this
+        // run's branch, so a halted card always has a latest run.
+        latest_run: latestRun({
+          id: "run-ci-halted",
+          status: "completed",
+          mr_iid: 47,
+          mr_web_url: "https://gitlab.example.com/myorg/uzi/-/merge_requests/47",
+          mr_state: "opened",
+          worker_name: "laptop",
+          created_at: minsAgo(1752),
+          updated_at: minsAgo(1682),
+        }),
+        // A red per-card pipeline on the run's branch, so the card shows Fix CI.
         pipeline: {
           status: "failed",
           web_url: "https://gitlab.example.com/myorg/uzi/-/pipelines/4201",
@@ -203,6 +214,10 @@ const boardFixtures: Record<string, Board> = {
           pipeline_id: 4201,
           synced_at: minsAgo(3),
         },
+        // PRD #1650 D3a: automatic CI fixing gave up on this branch, so the card shows
+        // the "Autofix stopped" marker beside the red badge and the Fix CI button.
+        ci_autofix_halted: true,
+        ci_autofix_attempts: 3,
       },
       {
         // PRD #35: the board's only parked card. It is what makes runBadge's
@@ -365,6 +380,39 @@ const boardFixtures: Record<string, Board> = {
           updated_at: minsAgo(120),
         }),
         pipeline: null,
+      },
+      {
+        // run-rework-capped's issue: a completed run whose MR !61 is still open.
+        // PRD #1650 D3a: a halt with no cached pipeline. The halt comes from the autofix
+        // ledger, not the badge, so the marker shows where the pipeline badge would be,
+        // and no Fix CI button renders (it needs a failed pipeline). The MR must be open:
+        // the server drops the marker once the latest run's MR is closed or merged.
+        iid: 61,
+        title: "Board: virtualize the card list for very large boards",
+        state: "opened",
+        labels: ["uzi", "Review"],
+        web_url: uziUrl(61),
+        author: "mira",
+        forge_type: "gitlab",
+        has_prd_link: true,
+        column: "Review",
+        closed: false,
+        conflict: false,
+        assignee_ids: [],
+        forge_updated_at: minsAgo(96),
+        latest_run: latestRun({
+          id: "run-rework-capped",
+          status: "completed",
+          mr_iid: 61,
+          mr_web_url: "https://gitlab.example.com/myorg/uzi/-/merge_requests/61",
+          mr_state: "opened",
+          worker_name: "laptop",
+          created_at: minsAgo(145),
+          updated_at: minsAgo(96),
+        }),
+        pipeline: null,
+        ci_autofix_halted: true,
+        ci_autofix_attempts: 1,
       },
       {
         iid: 15,

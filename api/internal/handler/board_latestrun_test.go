@@ -217,7 +217,7 @@ func TestAssembleCards(t *testing.T) {
 	}
 	position := map[string]int{"In Progress": 0}
 
-	cards := assembleCards(issues, runRows, nil, position, viewer, "forgejo", nil, 2*time.Hour)
+	cards := assembleCards(issues, runRows, nil, nil, position, viewer, "forgejo", nil, 2*time.Hour)
 	byIID := make(map[int64]cardDTO, len(cards))
 	for _, c := range cards {
 		byIID[c.IID] = c
@@ -304,5 +304,31 @@ func TestAssembleCards(t *testing.T) {
 	// A completed run has no wall deadline → deadline_at null (non-vacuous negative).
 	if dl := byIID[20].LatestRun.DeadlineAt; dl != nil {
 		t.Fatalf("issue 20: a completed run must have deadline_at null, got %v", *dl)
+	}
+}
+
+// TestAssembleCardsCarriesAutofixHalt (PRD #1650 D3a): the iid -> attempts halt map
+// lands on the RIGHT card, a card absent from it is un-halted with 0 attempts, and a
+// nil map leaves every card un-halted.
+func TestAssembleCardsCarriesAutofixHalt(t *testing.T) {
+	issues := []store.Issue{
+		{ForgeIssueIid: 10, Title: "ten", State: "opened", Labels: []byte(`[]`)},
+		{ForgeIssueIid: 20, Title: "twenty", State: "opened", Labels: []byte(`[]`)},
+	}
+	cards := assembleCards(issues, nil, nil, map[int64]int32{20: 2}, nil, uuid.Nil, "gitlab", nil, 0)
+	byIID := map[int64]cardDTO{}
+	for _, c := range cards {
+		byIID[c.IID] = c
+	}
+	if c := byIID[20]; !c.CIAutofixHalted || c.CIAutofixAttempts != 2 {
+		t.Fatalf("card 20 = (halted %v, attempts %d), want (true, 2)", c.CIAutofixHalted, c.CIAutofixAttempts)
+	}
+	if c := byIID[10]; c.CIAutofixHalted || c.CIAutofixAttempts != 0 {
+		t.Fatalf("card 10 = (halted %v, attempts %d), want (false, 0)", c.CIAutofixHalted, c.CIAutofixAttempts)
+	}
+	for _, c := range assembleCards(issues, nil, nil, nil, nil, uuid.Nil, "gitlab", nil, 0) {
+		if c.CIAutofixHalted || c.CIAutofixAttempts != 0 {
+			t.Fatalf("nil halt map: card %d = (halted %v, attempts %d), want (false, 0)", c.IID, c.CIAutofixHalted, c.CIAutofixAttempts)
+		}
 	}
 }

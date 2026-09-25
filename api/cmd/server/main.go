@@ -597,32 +597,23 @@ func run() error {
 		slacksvc.WithRunTimeout(cfg.RunTimeout),
 		slacksvc.WithExtensionCap(settingsCache.RunExtensionCapSeconds),
 	)
-	// Notifications write seam (PRD #46 M2): the one place that creates inbox rows.
-	// It persists the row first, then delivers best-effort through slackNotifier
-	// (reusing its per-user opt-in gating + drain goroutine via a separate queue).
-	// M3+ tenants (the judge) call notifier.Notify; the M2 REST read endpoints go
-	// straight to the store, so the handler only needs the seam wired for future
-	// producers. Built before SetBroadcaster because failNotifier (below) writes
-	// through it and joins the broadcast fan-out.
+	// Notifications write seam (PRD #46 M2): the one place that creates notification
+	// rows. It persists the row first, then delivers best-effort through slackNotifier
+	// (reusing its per-user opt-in gating + drain goroutine via a separate queue). The
+	// in-app inbox read path is retired (PRD #1650 D1), so the table is a pruned,
+	// write-only event log plus the incidental-finding DM latch; the Slack DM is what
+	// the user sees. Every producer below (handler, poller detectors, scheduler,
+	// reconcilers, usage engine) calls notifier.Notify or one of its helpers.
 	notifier := notifysvc.New(q, slackNotifier, notifysvc.DefaultUserCap, slog.Default())
-
-	// Run-failure inbox notifier (PRD #284 M5): a Broadcaster that lands an inbox
-	// notification when a run transitions to "failed", so a user WITHOUT Slack gets
-	// a badge on failure (the slacksvc ❌ DM only reaches opted-in users). It writes
-	// through notifier with Slack == nil (inbox-only — no double-DM), and sits in
-	// the MultiBroadcaster so it covers worker-reported AND sweep-driven failures
-	// uniformly. PublishState never blocks; a drain goroutine (below) does the work.
-	// CI-autofix landed notification (PRD #71 M6): when a ci_fix run's fix pipeline
-	// goes green on a ref that had an auto-fix ledger, forgesvc lands an inbox row for
-	// the owner. Nil-safe; wired here so the sync's reset-on-green path can reach it.
-	svc.SetNotifier(notifier)
 
 	// Wire the mid-flight mr_rework abort (#853): when the MR-close watcher observes a
 	// merge/close, cancel any in-flight rework for that MR through workersvc's cancel path.
 	svc.SetReworkCanceller(wsvc)
 
-	failNotifier := notifysvc.NewRunFailureNotifier(q, notifier, slog.Default())
-	wsvc.SetBroadcaster(workersvc.MultiBroadcaster{liveHub, slackNotifier, failNotifier})
+	// A failed run lands no notification row (PRD #1650 D2): the slacksvc failed-run DM
+	// (notifier_state.go) reaches Slack-linked users, and the run page plus the Runs list
+	// carry the signal for everyone else.
+	wsvc.SetBroadcaster(workersvc.MultiBroadcaster{liveHub, slackNotifier})
 
 	// Admin-health loop-beat registry (PRD #1484 M2, D8): ONE registry, built here before
 	// the four background loops so each can be Registered with its effective interval and
@@ -671,7 +662,7 @@ func run() error {
 	// and the M4 loop-guard ledger. Activation is gated by an admin global kill-switch
 	// (settings ci_autofix_enabled, default ON), read fail-closed inside the detector
 	// (PRD #914), plus the per-user opt-in (users.ci_autofix_enabled) and the
-	// pipelineMaxRefs>0 gate. notifier lands the inbox rows.
+	// pipelineMaxRefs>0 gate. notifier sends the halt DM (and records its row).
 	engine.SetCIAutoFix(poller.NewCIAutoFix(q, wsvc, notifier, settingsCache, cfg.CIFixMaxJobs, cfg.CIFixLogTailBytes, cfg.CIAutofixMaxAttempts, cfg.CIAutofixConfigPaths))
 	// MR review watcher (PRD #700 M3): the poller's post-SyncMRStates detector turns an
 	// opted-in completed run's MR that gained new review comments on a green head
@@ -806,7 +797,7 @@ func run() error {
 	wsvc.SetRepoGuard(pcheck)
 
 	var bgWG sync.WaitGroup
-	bgWG.Add(6)
+	bgWG.Add(5)
 	go func() {
 		defer bgWG.Done()
 		engine.Run(ctx)
@@ -826,10 +817,6 @@ func run() error {
 	go func() {
 		defer bgWG.Done()
 		slackNotifier.Run(ctx)
-	}()
-	go func() {
-		defer bgWG.Done()
-		failNotifier.Run(ctx)
 	}()
 	if cfg.PrivilegeCheckInterval > 0 {
 		privSweep := privcheck.NewEngine(pcheck, cfg.PrivilegeCheckInterval)
@@ -1258,8 +1245,9 @@ func run() error {
 	// their Slack DMs (PRD #25 M3). Best-effort: a nil linker (never in production)
 	// would make those endpoints report Slack as unavailable.
 	h.SetSlackLinker(slackLinker)
-	// Wire the notifications write seam (PRD #46 M2) for future producers (the judge,
-	// M4). The M2 read endpoints don't need it; this makes the seam available.
+	// Wire the notifications write seam (PRD #46 M2) for the handler's producers (the
+	// judge review, guardrail override decisions, incidental findings). Nothing reads
+	// the rows back as an inbox (PRD #1650 D1): the Slack DM is the delivery.
 	h.SetNotifier(notifier)
 	// Hosted k8s workers (PRD #58 Decision 12). Only when the feature is on: off (the
 	// compose default) Routes mounts no controller endpoint, so the service would have

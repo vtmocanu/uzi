@@ -3735,14 +3735,10 @@ func TestTickSelfImproveFiresFoldsAndAdvances(t *testing.T) {
 	if call.model == nil || *call.model != model || !call.overrideSubagentModel {
 		t.Fatalf("model threading = (%v, %v), want (%q, true)", call.model, call.overrideSubagentModel, model)
 	}
-	// Started notification, carrying the run id.
-	if got := h.countKind("selfimprove_started"); got != 1 {
-		t.Fatalf("selfimprove_started notifications = %d, want 1", got)
-	}
-	for _, n := range h.notif.notifications {
-		if n.Kind == "selfimprove_started" && (n.RunID == nil || *n.RunID != h.runs.selfImproveRun.ID) {
-			t.Fatalf("started notification RunID = %v, want %v", n.RunID, h.runs.selfImproveRun.ID)
-		}
+	// No started notification (PRD #1650 D2): a started run is status-only; the run
+	// itself and its merge request carry it.
+	if got := h.countKind("selfimprove_started"); got != 0 {
+		t.Fatalf("selfimprove_started notifications = %d, want 0", got)
 	}
 	// Recurring advance, stays active; no park.
 	if len(h.st.advanceCalls) != 1 || h.st.advanceCalls[0].Status != "active" {
@@ -3938,23 +3934,6 @@ func TestTickSelfImproveRaceSkips(t *testing.T) {
 	}
 }
 
-// selfImproveStartedBody returns the body of the single selfimprove_started notification,
-// failing the test if there is not exactly one. It reads the Slack render body, mirroring
-// selfImproveSkippedBody so the "started" and "skipped" body assertions share a shape.
-func selfImproveStartedBody(t *testing.T, h *harness) string {
-	t.Helper()
-	var bodies []string
-	for _, notif := range h.notif.notifications {
-		if notif.Kind == "selfimprove_started" && notif.Slack != nil {
-			bodies = append(bodies, notif.Slack.Body)
-		}
-	}
-	if len(bodies) != 1 {
-		t.Fatalf("selfimprove_started notifications = %d, want exactly 1", len(bodies))
-	}
-	return bodies[0]
-}
-
 // lastFireSkips unmarshals the single advance call's last_fire and returns its recorded
 // skips, failing the test if there is not exactly one advance.
 func lastFireSkips(t *testing.T, h *harness) []lastFireSkip {
@@ -4051,23 +4030,6 @@ func TestTickSelfImproveGenericSkipsBacklog(t *testing.T) {
 	}
 }
 
-// TestTickSelfImproveStartedNotificationNamesRepo pins PRD #686 M5 case (c) / M2: the
-// started notification's BODY names the target repo (PathWithNamespace), in both modes.
-// Asserted on the body, not just the kind, because the repo-named notification is the
-// observable behavior the notifier-renderer test cannot reach (Risks §"Notification test
-// is NOT gate-forcing").
-func TestTickSelfImproveStartedNotificationNamesRepo(t *testing.T) {
-	h := newHarness() // default repo path_with_namespace = "vtmocanu/uzi"
-	h.st.due = []store.RunSchedule{h.selfImproveSchedule()}
-
-	h.sched.Boot(context.Background())
-
-	body := selfImproveStartedBody(t, h)
-	if !strings.Contains(body, "vtmocanu/uzi") {
-		t.Fatalf("started notification body = %q, want it to name the repo %q", body, "vtmocanu/uzi")
-	}
-}
-
 // siMRRow builds a candidate row for the open-MR cap with a valid mr_iid.
 func siMRRow(mrIID int64) store.RecentSelfImproveMRRunsForRepoRow {
 	return store.RecentSelfImproveMRRunsForRepoRow{
@@ -4137,8 +4099,8 @@ func TestTickSelfImproveBelowCapFires(t *testing.T) {
 	if got := h.countKind("selfimprove_skipped"); got != 0 {
 		t.Fatalf("below cap must not skip: selfimprove_skipped notifications = %d, want 0", got)
 	}
-	if got := h.countKind("selfimprove_started"); got != 1 {
-		t.Fatalf("below cap: selfimprove_started notifications = %d, want 1", got)
+	if got := h.countKind("selfimprove_started"); got != 0 {
+		t.Fatalf("below cap: selfimprove_started notifications = %d, want 0 (PRD #1650 D2)", got)
 	}
 }
 

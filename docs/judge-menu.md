@@ -64,10 +64,9 @@ item, and it is not built.
 **To triage / Filed / Done / Dismissed / All.** A recommendation is in exactly
 one, ranked highest-wins: Dismissed > Done > Filed > To triage.
 
-The **To triage** tab, the **Judge** nav badge and the judge notification in
-your inbox are the same number, from the same server-side count — not three
-tallies of what happens to be on screen. **seen in N runs** is a row's
-recurrence, never a competing total.
+The **To triage** tab count and the **Judge** nav badge are the same number,
+from the same server-side count — not two tallies of what happens to be on
+screen. **seen in N runs** is a row's recurrence, never a competing total.
 
 **If you see a "backlog was truncated" banner, read it as *unknown*, not
 *empty*.** The cap applies before rows are grouped, so a group can be missing
@@ -81,18 +80,14 @@ bucket tabs filter what survived it.
   first, and the still-to-triage count only when there is one. A run **nobody
   has judged** carries no badge at all: "never judged" and "judged and fine"
   are different claims, and a neutral pill would assert the second.
-- **In your inbox**, "Run review ready" now opens **Judge**, anchored to that
-  run (`/judge?run=…`), instead of the run page. Notifications of every other
-  kind still open their run. The Slack DM's link moved the same way; its
-  cadence did not — still one DM per review, no digest.
-- **A run of consecutive judge pings collapses** into one "N reviews ready"
-  header you can expand. The rows underneath are unchanged — same ids, same
-  read state, same **Mark read**.
+- **The Slack DM**, "Run review ready", opens **Judge**, anchored to that run
+  (`/judge?run=…`), instead of the run page. Its cadence is unchanged — still
+  one DM per review, no digest.
 
 An anchored link (`/judge?run=…`) opens on the **All** tab, not To triage. That
-is on purpose: the recommendation the notification is about may already have
-been settled through another run, and landing on an empty To-triage tab would
-read as "nothing here". An unanchored **Judge** still opens on To triage.
+is on purpose: the recommendation the DM is about may already have been
+settled through another run, and landing on an empty To-triage tab would read
+as "nothing here". An unanchored **Judge** still opens on To triage.
 
 ## 5. Closing a filed issue marks it done
 

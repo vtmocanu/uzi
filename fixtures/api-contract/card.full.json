@@ -45,5 +45,7 @@
     "web_url": "x",
     "pipeline_id": 1,
     "synced_at": "2020-01-02T03:04:05Z"
-  }
+  },
+  "ci_autofix_halted": true,
+  "ci_autofix_attempts": 1
 }

@@ -130,11 +130,11 @@ out in Settings.
 
 A merge request can't be reworked forever. uzi tracks, per MR, how many
 automatic rework cycles it has spent and stops after a cap — **5 by
-default**, admin-configurable (`mr_rework_cap`). Past the cap, uzi lands an
-in-app notification and, on an issue-run MR, also posts one comment on the
-issue naming the limit and pointing at the manual escape hatch below; a
-scheduled prompt MR has no backing issue, so it gets the in-app notification
-only. uzi then stops trying automatically. From there you can address the
+default**, admin-configurable (`mr_rework_cap`). Past the cap, uzi sends a
+Slack DM ("MR rework stopped") linking the run page and, on an issue-run
+MR, also posts one comment on the issue naming the limit and pointing at
+the manual escape hatch below; a scheduled prompt MR has no backing issue,
+so it gets the Slack DM only. uzi then stops trying automatically. From there you can address the
 remaining comments yourself, push more changes to the branch, or — if you
 want uzi to take one more pass — trigger a [rework on demand](#rework-on-demand);
 on-demand cycles don't count against this cap.

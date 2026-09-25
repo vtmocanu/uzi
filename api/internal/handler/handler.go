@@ -851,7 +851,6 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 		h.mountMeRoutes(r)
 		h.mountSchedulesRoutes(r, forgeLimiter)
 		h.mountVaultRoutes(r, authLimiter)
-		h.mountNotificationRoutes(r)
 		h.mountSlackRoutes(r, slackDMLimiter)
 		h.mountAgentRoutes(r)
 		h.mountAdminRoutes(r, forgeLimiter, authLimiter)

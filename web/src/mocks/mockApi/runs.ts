@@ -215,6 +215,23 @@ function overrideToRead(body: { mode: string; secret_id?: string }): CredentialO
 
 export const runsApi = {
   // ── Runs ────────────────────────────────────────────────────────────────────
+  // Runs-in-progress count for the Runs nav badge (PRD #239). Counted LIVE from the
+  // fixtures the same way the real endpoint counts rows: non-terminal runs, excluding
+  // chat/judge kinds (Decision 1 + Decision 4), so the demo build shows a real number
+  // that moves as runs start and finish rather than a hardcoded constant. (It lived in
+  // the retired notifications mock module beside the bell's poll until PRD #1650.)
+  runsInProgressCount: async () => {
+    // Other users' runs are excluded exactly as the real /me/runs/in-progress-count
+    // is caller-scoped — the badge counts YOUR queue, not the factory's.
+    const count = [...state.runs.values()].filter(
+      (r) =>
+        !isTerminalRun(r.status) &&
+        r.kind !== "chat" &&
+        r.kind !== "judge" &&
+        !(r.id in mockOtherRunOwners),
+    ).length;
+    return delay({ count }, 40);
+  },
   createRun: async (
     repoId: string,
     issueIid: number,

@@ -13,5 +13,7 @@
   "conflict": false,
   "forge_updated_at": "0001-01-01T00:00:00Z",
   "latest_run": null,
-  "pipeline": null
+  "pipeline": null,
+  "ci_autofix_halted": false,
+  "ci_autofix_attempts": 0
 }
