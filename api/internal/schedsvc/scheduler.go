@@ -812,6 +812,17 @@ func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule,
 	// no_usable_credential — review fix, PRD #1429: neither harness usable for the owner is
 	// benign, not transient). The old link-less skip reason was retired with the PRD-link
 	// gate (PRD #764).
+	//
+	// Issue #1626 exception: a ONE-TIME issue schedule refused with ErrBranchInUse (a
+	// ci_fix / mr_rework run holds agent/issue-<iid>) is transient, not a benign skip —
+	// advancing would mark the row fired and the issue run would never start. Returned as
+	// an error it takes fireOne's transient arm (not advanced, retried next tick), like the
+	// paused-once hold in process(). Scoped to Target=="issue": fireSweep also calls
+	// createIssueRun and turns any error into fetch_failed, so a once sweep keeps the
+	// benign already_running skip.
+	if errors.Is(err, workersvc.ErrBranchInUse) && sched.Target == "issue" && sched.Timing == "once" {
+		return FireOutcome{}, err
+	}
 	if reason, ok := skipReasonForErr(err); ok {
 		e.logger.Info("scheduler: issue fire skipped", "schedule", sched.ID.String(), "issue", iid, "reason", err)
 		return FireOutcome{Matched: 1, Skips: []Skip{{IssueIID: &iidCopy, Title: title, Reason: reason, WebURL: webURL}}}, nil

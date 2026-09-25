@@ -1112,6 +1112,67 @@ func TestTickOnceScheduleFiresToStatus(t *testing.T) {
 	}
 }
 
+// TestTickOnceIssueBranchInUseHoldsThenFires (issue #1626): a one-time issue schedule that
+// fires while a ci_fix / mr_rework run holds agent/issue-<iid> must NOT advance (that would
+// mark it fired with no next fire, so the issue run never starts). It is held un-advanced
+// and fires on a later tick once the branch frees up. Recurring issue rows and once sweeps
+// keep the benign, advancing already_running skip.
+func TestTickOnceIssueBranchInUseHoldsThenFires(t *testing.T) {
+	t.Run("once_issue_holds_then_fires", func(t *testing.T) {
+		h := newHarness()
+		s := h.issueSchedule()
+		s.Timing = "once"
+		s.CronExpr = pgtype.Text{} // once carries run_at, not cron
+		h.st.due = []store.RunSchedule{s}
+		h.runs.err = workersvc.ErrBranchInUse
+
+		h.sched.Boot(context.Background())
+
+		if len(h.st.advanceCalls) != 0 {
+			t.Fatalf("branch in use on a once issue row must NOT advance: advance calls = %d, want 0", len(h.st.advanceCalls))
+		}
+		if len(h.st.statusCalls) != 0 {
+			t.Fatalf("branch in use on a once issue row must NOT park: status calls = %d, want 0", len(h.st.statusCalls))
+		}
+		if len(h.runs.autopilot) != 0 {
+			t.Fatalf("no run may be created while the branch is held: autopilot calls = %d, want 0", len(h.runs.autopilot))
+		}
+
+		// The branch frees up; the row is still due (never advanced) and fires next tick.
+		h.runs.err = nil
+		h.sched.Boot(context.Background())
+
+		if len(h.runs.autopilot) != 1 {
+			t.Fatalf("once issue retry: CreateScheduledAutopilotRun calls = %d, want 1", len(h.runs.autopilot))
+		}
+		if len(h.st.advanceCalls) != 1 {
+			t.Fatalf("advance calls = %d, want 1", len(h.st.advanceCalls))
+		}
+		adv := h.st.advanceCalls[0]
+		if adv.Status != "fired" {
+			t.Fatalf("once advance status = %q, want fired", adv.Status)
+		}
+		if adv.NextFireAt.Valid {
+			t.Fatalf("once next_fire_at = %+v, want NULL", adv.NextFireAt)
+		}
+	})
+
+	t.Run("recurring_issue_still_advances", func(t *testing.T) {
+		h := newHarness()
+		h.st.due = []store.RunSchedule{h.issueSchedule()}
+		h.runs.err = workersvc.ErrBranchInUse
+
+		h.sched.Boot(context.Background())
+
+		if len(h.st.advanceCalls) != 1 {
+			t.Fatalf("recurring branch-in-use skip must advance: advance calls = %d, want 1", len(h.st.advanceCalls))
+		}
+		if h.st.advanceCalls[0].Status != "active" {
+			t.Fatalf("recurring advance status = %q, want active", h.st.advanceCalls[0].Status)
+		}
+	})
+}
+
 func TestTickDedupSkipStillAdvances(t *testing.T) {
 	h := newHarness()
 	h.st.activeIssue = true // a prior run for the issue is still live
