@@ -1,6 +1,6 @@
 ---
 name: issue-triage
-description: "Triages one GitHub issue on this repo end to end, prioritizing issues that are silently un-sweepable by uzi — they look queued but never fire because they are missing a sweep selector (bug/Planned) or the `uzi` eligibility label. Hunts those gaps first, then the raw un-triaged backlog, then proposes revisiting parked (brainstorm/Later) issues. Explains what the issue proposes, recommends whether to implement it, verifies the issue is not stale (premise still holds, file anchors current, any referenced PR or PRD actually merged), then on your confirmation applies the missing sweep labels and posts a freshness comment. Use when triaging the issue backlog, finding issues the nightly sweep will never touch, deciding what to send to uzi, or asked to triage the next issue, go through the open issues, or judge whether an issue is worth doing. Triggers include triage issue, triage the backlog, un-sweepable issues, issues not swept by uzi, next issue to implement, should we do this issue, queue an issue for uzi."
+description: "Triages one GitHub issue on this repo end to end. Preflight first: lists spent one-time issue schedules to delete and open issues from anyone but the maintainer, which are triaged first. Then prioritizes issues that are silently un-sweepable by uzi — they look queued but never fire because they are missing a sweep selector (bug/Planned) or the `uzi` eligibility label. Hunts those gaps first, then the raw un-triaged backlog, then proposes revisiting parked (brainstorm/Later) issues. Explains what the issue proposes, recommends whether to implement it, verifies the issue is not stale (premise still holds, file anchors current, any referenced PR or PRD actually merged), then on your confirmation applies the missing sweep labels and posts a freshness comment. Use when triaging the issue backlog, finding issues the nightly sweep will never touch, deciding what to send to uzi, or asked to triage the next issue, go through the open issues, or judge whether an issue is worth doing. Triggers include triage issue, triage the backlog, un-sweepable issues, issues not swept by uzi, next issue to implement, should we do this issue, queue an issue for uzi."
 ---
 
 # Issue triage
@@ -21,10 +21,47 @@ elsewhere:
   **landing the resulting PR** is **uzi-lander**. This skill stops at "queued for the
   sweep" or "hand to uzi-watcher".
 
+## Step 0 — Preflight (every run, before picking)
+
+Report both checks to the user before Step 1.
+
+**A. Spent one-shot schedules.** A one-time issue schedule stays listed after it fires
+(`status=fired`, `enabled=true`, `next_fire_at=null`). List them with the run each started:
+
+```sh
+uzi schedule list --json 2>/dev/null | jq -r '.[]
+  | select(.timing=="once" and .status=="fired")
+  | .id as $id | (.last_fire.started // [])[]
+  | "\($id)\t#\(.issue_iid)\t\(.run_id)"'
+```
+
+For each row, check the run (`uzi run get <run_id> --json | jq -r .status`), the issue
+state and its `agent/issue-<n>` PR. Propose deleting a schedule only when its run is
+terminal and the work has landed (PR merged or issue closed); a schedule whose run is still
+live or unlanded stays. Delete on the user's OK with `uzi schedule delete <id>` (run
+history is preserved). Keep stderr out of the `jq` pipe: the CLI's version-skew warning
+breaks it.
+
+**B. Issues from anyone but the maintainer.** Issues opened by people other than the
+maintainer (`vtmocanu`) are triaged **first**, ahead of Tier 1. Bot authors (`app/…`,
+e.g. the nightly e2e alarms) are listed separately: they are CI signals, not requests.
+
+```sh
+gh issue list --repo vtmocanu/uzi --state open --limit 400 --json number,title,author,labels \
+  | jq -r '.[] | select(.author.login != "vtmocanu")
+      | (if (.author.login | startswith("app/")) then "bot" else "external" end) as $k
+      | "\($k)\t#\(.number)\t\(.author.login)\t[\([.labels[].name]|join(","))]\t\(.title[0:64])"' \
+  | sort
+```
+
+An empty result means only the maintainer has open issues. Sanity-check the filter
+against the open total when it looks suspicious.
+
 ## Step 1 — Pick the issue
 
-If the user named an issue (number/URL), use it. Otherwise hunt in **priority order**,
-picking the lowest-numbered issue in the highest non-empty tier.
+If the user named an issue (number/URL), use it. Otherwise pick the lowest-numbered
+**external** issue from Step 0B if any, else hunt in **priority order**, picking the
+lowest-numbered issue in the highest non-empty tier.
 
 **Why the tiers.** A sweep fires an issue only when it has BOTH halves: (a) a
 **selector** label (`Planned`, or `bug` for a bug) AND (b) eligibility — the **`uzi`
