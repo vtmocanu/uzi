@@ -2494,9 +2494,9 @@ type CreateRunParams struct {
 // the fields above: it is a silently-omittable nullable param (sqlc.narg). createRun reads
 // the completion_interlock_rollout switch (default ON; an explicit "false" is the admin
 // kill-switch; a cold read error counts as off) and passes 1 ONLY when it is on AND the run
-// is not seeded AND its resolved harness is Claude (#1626: Codex does not run the
-// completion-attempt loop), stamping the run as INTERLOCKED before its first claim; every
-// other run (switch off, seeded, Codex) passes NULL and stays the explicit legacy state. An omitted Go struct field would compile green
+// is not seeded, whether its resolved harness is Claude or Codex, stamping the run as
+// INTERLOCKED before its first claim; a switch-off or seeded run passes NULL and stays
+// the explicit legacy state. An omitted Go struct field would compile green
 // and silently ship NULL for every run (the feature inert), so a per-path test guards it,
 // not the compiler. Stamped BEFORE the first claim on purpose: approval does not re-claim,
 // so stamping only at approval would make the D2 hard claim clause vacuous for the

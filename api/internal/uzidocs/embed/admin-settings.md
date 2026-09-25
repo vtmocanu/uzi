@@ -239,18 +239,23 @@ actually declared done: **Completion check** (`completion_interlock_rollout`),
 Codex harness. A run started from a seeded plan (`uzi run create --plan-file`)
 is exempt because it never sends the plan-bearing report the check hooks into. Turning it off is an
 explicit, instance-wide kill-switch — an issue run created while it's off
-behaves as it did before this feature existed, and a run created before the
-switch was ever flipped keeps whatever the switch said at its own creation.
+behaves as it did before this feature existed. A cold settings read without a
+valid cache snapshot also leaves that new run unstamped; later runs can be
+stamped once the setting is readable. A run created before the switch was
+flipped keeps the stamp set at its own creation.
 
 A worker must also advertise the `completion_interlock_v1` protocol
 capability to claim a stamped run in the first place. For an interlocked Codex
 run, the worker must also advertise `codex_completion_interlock_v1`. If none of the run
 owner's online workers has the required protocol capabilities, the run stays
-queued. The health reason names the missing completion capability, including
-`codex_completion_interlock_v1` for an interlocked Codex run. Upgrade the
-owner's workers to this release to clear it (a worker from v0.83.0 onward can
-claim an interlocked Claude run, but an older one than this release may still
-pause it at finalize; see the CHANGELOG). Turning Completion check off does **not** release a run
+queued. When the shared `completion_interlock_v1` capability is absent, its
+health reason names that shared capability first. When the shared capability
+and Codex harness capability are present but no worker advertises
+`codex_completion_interlock_v1` together with them, the reason names
+`codex_completion_interlock_v1`. Upgrade the owner's workers to this release
+to clear it (a worker from v0.83.0 onward can claim an interlocked Claude run,
+but an older one than this release may still pause it at finalize; see the
+CHANGELOG). Turning Completion check off does **not** release a run
 already queued this way: it only stops stamping runs created afterwards, so
 the stuck run needs a capable worker, or cancel it and create it again.
 See [Completion holds and the structural interlock](./run-completion-hold.md)
