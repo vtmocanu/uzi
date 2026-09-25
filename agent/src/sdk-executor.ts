@@ -395,7 +395,7 @@ interface TurnResult {
   /** PRD #122 M1: the candidate milestone list the lead passed to submit_plan this
    *  turn, if any. Rides the gate call so the human approves the breakdown. */
   milestones?: Milestone[];
-  /** Issue #1626: the lead's entirely-malformed submit_plan milestone list (see
+  /** Issue #1626: the lead's malformed submit_plan milestone list (see
    *  ScannedSignals.rejectedMilestones). Sent on the gate report in place of `milestones` so the
    *  server rejects it; never used as the worker's own breakdown. */
   rejectedMilestones?: Milestone[];
@@ -1583,9 +1583,10 @@ export class SdkExecutor implements Executor {
         // gate, so `planPrompt` built above is consumed only on the planning path.
         let candidateMilestones: Milestone[] | undefined;
         // Issue #1626: what the gate REPORTS as the candidate. Equal to candidateMilestones except
-        // when the lead's list was entirely malformed: then the worker keeps no breakdown
-        // (candidateMilestones undefined) but the report carries the rejected entries, so the
-        // server drops the candidate to NULL rather than reading "no milestones" as an empty contract.
+        // when the lead's list was malformed (ScannedSignals.rejectedMilestones): then the worker
+        // keeps no breakdown (candidateMilestones undefined) but the report carries the rejected
+        // entries, so the server drops the candidate to NULL rather than reading "no milestones"
+        // (or a narrowed list) as the completion contract.
         let gateMilestones: Milestone[] | undefined;
         if (resumeAtGate) {
           ctx.emit({

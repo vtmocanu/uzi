@@ -524,9 +524,12 @@ describe("scanSignals milestones (PRD #122 M1)", () => {
   });
 
   it("drops malformed milestones without throwing", () => {
-    // Non-array ⇒ no milestones key (plan still captured).
+    // Non-array ⇒ no milestones key (plan still captured). Issue #1626 (N-c): a PRESENT
+    // non-array value is not "no milestones" — it rides as a rejected list the server refuses.
     const nonArray = scanSignals(toolUse(PLAN, { plan_md: "p", milestones: "nope" })) as Record<string, unknown>;
     assert.ok(!("milestones" in nonArray), "non-array milestones must not be captured");
+    assert.strictEqual(nonArray["plan"], "p");
+    assert.deepStrictEqual(nonArray["rejectedMilestones"], [{ id: "", title: "" }]);
 
     // Array of junk / entries missing id or title ⇒ all dropped, no key set.
     const junk = scanSignals(
@@ -561,22 +564,49 @@ describe("scanSignals milestones (PRD #122 M1)", () => {
     for (const m of junk["rejectedMilestones"] as { id: string; title: string }[]) {
       assert.ok(m.id === "" || m.title === "", `every rejected entry is server-invalid: ${JSON.stringify(m)}`);
     }
-    // No list, an empty list, or a non-array stays additive-absent (a genuinely milestone-less plan).
-    for (const ms of [undefined, [], "nope"]) {
+    // Issue #1626 (N-c): every present non-array value (a JSON-stringified array included) is a
+    // rejected list, never "no milestones".
+    for (const ms of ["nope", JSON.stringify([{ id: "m1", title: "First" }]), 7, { id: "m1", title: "First" }, true]) {
+      const r = scanSignals(toolUse(PLAN, { plan_md: "p", milestones: ms })) as Record<string, unknown>;
+      assert.ok(!("milestones" in r), `no milestones for ${JSON.stringify(ms)}`);
+      assert.deepStrictEqual(r["rejectedMilestones"], [{ id: "", title: "" }], `rejected list for ${JSON.stringify(ms)}`);
+    }
+    // No list, null, or an empty list stays additive-absent (a genuinely milestone-less plan).
+    for (const ms of [undefined, null, []]) {
       const r = scanSignals(toolUse(PLAN, { plan_md: "p", ...(ms === undefined ? {} : { milestones: ms }) })) as Record<string, unknown>;
       assert.ok(!("rejectedMilestones" in r), `no rejectedMilestones for ${JSON.stringify(ms)}`);
       assert.ok(!("milestones" in r), `no milestones for ${JSON.stringify(ms)}`);
     }
 
-    // A mixed list keeps only the well-formed entries.
+    // Issue #1626 (N-b): a partly-valid list is NOT narrowed to its valid entries (that would
+    // silently drop milestones from the completion contract). The WHOLE list rides as rejected —
+    // valid entries included, as trimmed strings — so the server rejects it as a unit.
     const mixed = scanSignals(
       toolUse(PLAN, {
         plan_md: "p",
-        milestones: [{ id: "m1", title: "good" }, { id: "m2" }, 7],
+        milestones: [{ id: " m1 ", title: " good " }, { id: "m2" }, 7],
       }),
-    );
-    assert.deepStrictEqual(mixed.milestones, [{ id: "m1", title: "good" }]);
-    assert.ok(!("rejectedMilestones" in mixed), "a partly-valid list keeps its valid entries, no rejected list");
+    ) as Record<string, unknown>;
+    assert.ok(!("milestones" in mixed), "a partly-valid list must not be narrowed to its valid entries");
+    assert.deepStrictEqual(mixed["rejectedMilestones"], [
+      { id: "m1", title: "good" },
+      { id: "m2", title: "" },
+      { id: "", title: "" },
+    ]);
+
+    // Within one message the LAST submit_plan wins, and the two shapes stay exclusive.
+    const lastValid = scanSignals({
+      type: "assistant",
+      session_id: "s",
+      message: {
+        content: [
+          { type: "tool_use", id: "a", name: PLAN, input: { plan_md: "p1", milestones: [{ id: "m1" }] } },
+          { type: "tool_use", id: "b", name: PLAN, input: { plan_md: "p2", milestones: [{ id: "m1", title: "ok" }] } },
+        ],
+      },
+    }) as Record<string, unknown>;
+    assert.deepStrictEqual(lastValid["milestones"], [{ id: "m1", title: "ok" }]);
+    assert.ok(!("rejectedMilestones" in lastValid), "a later valid submit_plan clears an earlier rejected list");
   });
 
   it("clamps over-long id and title (worker-side hygiene, not the real cap)", () => {

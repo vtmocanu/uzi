@@ -229,8 +229,8 @@ func TestRepresentedGateKeepsCandidateLiveDB(t *testing.T) {
 		t.Fatalf("SetState awaiting_approval (with milestones): applied=%v err=%v", applied, err)
 	}
 	// The re-presented gate: same plan_md, milestones absent.
-	if _, _, err := svc.SetState(e.ctx, wkr, runID, StateRequest{State: "awaiting_approval", PlanMd: strPtr(plan)}); err != nil {
-		t.Fatalf("SetState awaiting_approval (re-presented): %v", err)
+	if _, applied, err := svc.SetState(e.ctx, wkr, runID, StateRequest{State: "awaiting_approval", PlanMd: strPtr(plan)}); err != nil || !applied {
+		t.Fatalf("SetState awaiting_approval (re-presented): applied=%v err=%v", applied, err)
 	}
 	cand, _ := e.milestoneColumns(t, runID)
 	if got, err := DecodeMilestones(cand); err != nil || len(got) != 2 || got[0].ID != "m1" || got[1].ID != "m2" {
@@ -267,5 +267,103 @@ func TestRepresentedGateKeepsCandidateLiveDB(t *testing.T) {
 	}
 	if permit.Granted {
 		t.Fatalf("permit granted with m1/m2 undone (vacuous grant against a two-milestone plan): %+v", permit)
+	}
+}
+
+// TestRejectedListThenMilestonelessReviseHoldsLiveDB (issue #1626 B-a): an interlocked run's first
+// plan-bearing report carries a milestone list the server REJECTS (a duplicate id, which the
+// worker's blank-field check does not catch), so the candidate is NULL beside a stored plan_md.
+// A revise then reports a DIFFERENT plan with no milestones. That NULL must stay sticky: the
+// revised report must not infer the vacuous `[]`, the approve must freeze NO contract, and the
+// permit must not be granted — the run holds at finalize, where the owner's completion decision
+// is the escape. Before the fix the same-plan-text guard missed the different plan, the candidate
+// became `[]`, approve froze criteria:[], and the permit was granted.
+func TestRejectedListThenMilestonelessReviseHoldsLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	svc := e.permitService(t)
+	wid := e.seedWorker(t, []string{"completion_interlock_v1"})
+	wkr := store.Worker{ID: wid}
+	runID := e.seedOwnedRun(t, wid, "running", true, false)
+
+	dup := []Milestone{{ID: "m1", Title: "First"}, {ID: "m1", Title: "Second"}}
+	if _, applied, err := svc.SetState(e.ctx, wkr, runID, StateRequest{State: "awaiting_approval", PlanMd: strPtr("# Plan A"), Milestones: &dup}); err != nil || !applied {
+		t.Fatalf("SetState awaiting_approval (rejected list): applied=%v err=%v", applied, err)
+	}
+	if cand, _ := e.milestoneColumns(t, runID); cand != nil {
+		t.Fatalf("milestones_candidate = %q, want NULL (a duplicate-id list is rejected)", cand)
+	}
+
+	if _, err := svc.SubmitInput(e.ctx, e.userID, runID, "revise_plan", "split it differently", nil); err != nil {
+		t.Fatalf("SubmitInput revise_plan: %v", err)
+	}
+	if _, err := svc.ConsumeInputs(e.ctx, wkr, runID); err != nil {
+		t.Fatalf("ConsumeInputs (revise): %v", err)
+	}
+	if _, applied, err := svc.SetState(e.ctx, wkr, runID, StateRequest{State: "awaiting_approval", PlanMd: strPtr("# Plan B (revised)")}); err != nil || !applied {
+		t.Fatalf("SetState awaiting_approval (revised, no milestones): applied=%v err=%v", applied, err)
+	}
+	if cand, _ := e.milestoneColumns(t, runID); cand != nil {
+		t.Fatalf("milestones_candidate = %q after a milestone-less revise over a rejected list, want NULL (sticky rejection)", cand)
+	}
+
+	if _, err := svc.SubmitInput(e.ctx, e.userID, runID, "approve_plan", "", &AgentSelection{Source: AgentSourceOwn}); err != nil {
+		t.Fatalf("SubmitInput approve_plan: %v", err)
+	}
+	if c, r := e.readContract(t, runID); c != nil || r != nil {
+		t.Fatalf("approve froze a contract (%s, rev %v) over a rejected milestone list, want none", c, r)
+	}
+	if _, err := svc.ConsumeInputs(e.ctx, wkr, runID); err != nil {
+		t.Fatalf("ConsumeInputs (approve): %v", err)
+	}
+	if _, applied, err := svc.SetState(e.ctx, wkr, runID, StateRequest{State: "running"}); err != nil || !applied {
+		t.Fatalf("SetState running after approve: applied=%v err=%v", applied, err)
+	}
+	if c, r := e.readContract(t, runID); c != nil || r != nil {
+		t.Fatalf("the post-approval running report froze a contract (%s, rev %v), want none", c, r)
+	}
+	permit, err := svc.RequestCompletionPermit(e.ctx, wkr, runID,
+		CompletionPermitRequest{ContractRevision: 1, Branch: "agent/issue-1626", Head: "0123abcd"})
+	if err != nil {
+		t.Fatalf("RequestCompletionPermit: %v", err)
+	}
+	if permit.Granted {
+		t.Fatalf("permit granted after a rejected milestone list and a milestone-less revise (vacuous grant): %+v", permit)
+	}
+}
+
+// TestAutopilotRejectedListThenMilestonelessReportHoldsLiveDB is B-a's autopilot twin: the first
+// plan-bearing `running` report carries a rejected list (frozen stays NULL, SetRunAutopilotPlan
+// stores plan_md), and a later plan-bearing report of the same plan with no milestones must not
+// freeze `[]` — no contract, no grant.
+func TestAutopilotRejectedListThenMilestonelessReportHoldsLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	svc := e.permitService(t)
+	wid := e.seedWorker(t, []string{"completion_interlock_v1"})
+	wkr := store.Worker{ID: wid}
+	runID := e.seedOwnedRun(t, wid, "claimed", true, true)
+
+	dup := []Milestone{{ID: "m1", Title: "First"}, {ID: "m1", Title: "Second"}}
+	if _, applied, err := svc.SetState(e.ctx, wkr, runID, StateRequest{State: "running", PlanMd: strPtr(milestonelessPlan), Milestones: &dup}); err != nil || !applied {
+		t.Fatalf("SetState running (plan report, rejected list): applied=%v err=%v", applied, err)
+	}
+	if c, r := e.readContract(t, runID); c != nil || r != nil {
+		t.Fatalf("a rejected list froze a contract (%s, rev %v)", c, r)
+	}
+	if _, applied, err := svc.SetState(e.ctx, wkr, runID, StateRequest{State: "running", PlanMd: strPtr(milestonelessPlan)}); err != nil || !applied {
+		t.Fatalf("SetState running (plan re-report, no milestones): applied=%v err=%v", applied, err)
+	}
+	if _, frozen := e.milestoneColumns(t, runID); frozen != nil {
+		t.Fatalf("milestones_frozen = %q after a rejected list, want NULL (sticky rejection)", frozen)
+	}
+	if c, r := e.readContract(t, runID); c != nil || r != nil {
+		t.Fatalf("a milestone-less re-report after a rejected list froze a contract (%s, rev %v)", c, r)
+	}
+	permit, err := svc.RequestCompletionPermit(e.ctx, wkr, runID,
+		CompletionPermitRequest{ContractRevision: 1, Branch: "agent/issue-1626", Head: "0123abcd"})
+	if err != nil {
+		t.Fatalf("RequestCompletionPermit: %v", err)
+	}
+	if permit.Granted {
+		t.Fatalf("autopilot permit granted after a rejected milestone list (vacuous grant): %+v", permit)
 	}
 }

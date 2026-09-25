@@ -441,8 +441,10 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		// candidate so the worker re-sends the same breakdown with the re-presented plan instead
 		// of a milestone-less report. Never overrides a frozen list; a malformed candidate
 		// degrades to none, like the frozen decode above (the server's planMilestonesParam
-		// guard keeps the stored candidate either way).
-		if len(milestones) == 0 {
+		// guard keeps the stored candidate either way). Gated on an INTERLOCKED run
+		// (completion_contract_version stamped): a legacy run's claim stays byte-identical to
+		// before the interlock existed.
+		if len(milestones) == 0 && run.CompletionContractVersion.Valid {
 			if cand, cerr := DecodeMilestones(run.MilestonesCandidate); cerr != nil {
 				slog.Error("workersvc: decode run milestone candidate", "run_id", run.ID, "error", cerr)
 			} else {

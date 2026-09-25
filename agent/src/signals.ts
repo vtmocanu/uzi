@@ -88,14 +88,18 @@ export interface ScannedSignals {
    *  isSubagentFrame guard as the plan) and defensive — a malformed list yields
    *  nothing rather than throwing, and is only set when at least one entry parsed. */
   milestones?: Milestone[];
-  /** Issue #1626: the lead passed a NON-EMPTY `milestones` list to submit_plan and EVERY entry
-   *  failed normalisation, so `milestones` is absent. Omitting the list would read on the wire as
-   *  "the plan has no milestones", which the server turns into an empty (vacuously met)
-   *  completion contract on an interlocked run. These are the lead's entries coerced to trimmed
-   *  strings (each has a blank id or title, so the server's validation rejects the list and the
-   *  candidate stays NULL: the run holds rather than completing unchecked). Wire-only: the gate
-   *  sends it in place of `milestones`; the worker itself treats the plan as milestone-less.
-   *  Mutually exclusive with `milestones`. */
+  /** Issue #1626: the lead passed a submit_plan `milestones` value the worker could not take
+   *  whole, so `milestones` is absent. Two shapes: a NON-EMPTY list in which ANY entry failed
+   *  normalisation (a dropped entry would silently narrow the completion contract), or a value
+   *  that is present but not an array (e.g. a JSON-stringified array). Omitting it would read on
+   *  the wire as "the plan has no milestones", which the server turns into an empty (vacuously
+   *  met) completion contract on an interlocked run. For a list these are ALL the lead's
+   *  entries coerced to trimmed strings (at least one has a blank id or title); for a non-array
+   *  it is a single blank entry. Either way the server's validation rejects the list as a unit
+   *  and the candidate stays NULL: the run holds rather than completing unchecked. Wire-only: the
+   *  gate sends it in place of `milestones`; the worker itself treats the plan as
+   *  milestone-less. Mutually exclusive with `milestones`. A `null` (or absent) value is "no
+   *  milestones", not a rejection. */
   rejectedMilestones?: Milestone[];
   /** PRD #122 M2: the milestone progress a report_progress call carried, if the message
    *  made one. MAIN-THREAD-ONLY (extracted behind the same isSubagentFrame guard as the
@@ -549,13 +553,20 @@ function parseQuestions(raw: unknown, limit = MAX_QUESTIONS): AskUserQuestion[] 
 }
 
 /**
- * Issue #1626: coerce a submit_plan `milestones` list that parseMilestones emptied into
- * {id, title} string pairs for the wire (see ScannedSignals.rejectedMilestones). Every entry
- * parseMilestones dropped has a blank trimmed id or title, so each coerced entry does too, and
+ * Issue #1626: decide whether a submit_plan `milestones` value must ride the wire as a REJECTED
+ * list (see ScannedSignals.rejectedMilestones), returning the entries to send, or undefined when
+ * parseMilestones takes it whole (absent, null, an empty list, or a list whose every entry
+ * parses). A present non-array value yields a single blank entry; a list in which parseMilestones
+ * would drop ANY entry yields every entry coerced to trimmed {id, title} strings. An entry
+ * parseMilestones drops has a blank trimmed id or title, so at least one sent entry does too and
  * the server rejects the whole list. Clamped and capped like parseMilestones (hygiene only).
  */
-function rejectedMilestoneEntries(raw: unknown[]): Milestone[] {
-  return raw.slice(0, MAX_MILESTONES).map((item) => {
+function rejectedMilestonesOf(raw: unknown): Milestone[] | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (!Array.isArray(raw)) return [{ id: "", title: "" }];
+  const capped = raw.slice(0, MAX_MILESTONES);
+  if (parseMilestones(capped).length === capped.length) return undefined;
+  return capped.map((item) => {
     const m = asRecord(item);
     const id = typeof m?.["id"] === "string" ? m["id"].trim() : "";
     const title = typeof m?.["title"] === "string" ? m["title"].trim() : "";
@@ -741,15 +752,23 @@ export function scanSignals(message: unknown): ScannedSignals {
       // what gives milestones the main-thread-only guarantee, exactly as it does for
       // the plan itself. A subagent frame never reaches this loop, so no rejection or
       // latch handling is needed here. Only set out.milestones when at least one entry
-      // parsed, so a submit_plan with no milestones stays additive-absent. Issue #1626: a
-      // NON-EMPTY list that normalises to nothing is NOT "no milestones" — it rides as
-      // rejectedMilestones so the server drops the candidate to NULL (fail-closed) instead of
-      // inferring an empty, vacuously met completion contract.
+      // parsed, so a submit_plan with no milestones stays additive-absent. Issue #1626: a list
+      // with ANY entry dropped by normalisation, or a present non-array value, is NOT "no
+      // milestones" (nor a narrower list) — it rides as rejectedMilestones so the server rejects
+      // the whole list and the candidate stays NULL (fail-closed) instead of an empty or
+      // silently narrowed completion contract. The last submit_plan in a message wins, and the
+      // two shapes stay mutually exclusive.
       const rawMilestones = input?.["milestones"];
-      const milestones = parseMilestones(rawMilestones);
-      if (milestones.length > 0) out.milestones = milestones;
-      else if (Array.isArray(rawMilestones) && rawMilestones.length > 0)
-        out.rejectedMilestones = rejectedMilestoneEntries(rawMilestones);
+      const rejected = rejectedMilestonesOf(rawMilestones);
+      if (rejected) {
+        out.rejectedMilestones = rejected;
+        delete out.milestones;
+      } else {
+        const milestones = parseMilestones(rawMilestones);
+        if (milestones.length > 0) out.milestones = milestones;
+        else delete out.milestones;
+        delete out.rejectedMilestones;
+      }
     } else if (name === SIGNAL_DONE_QUALIFIED) {
       out.done = true;
       // PRD #72 M4. THE ONLY extraction point for prd_done_path, deliberately.

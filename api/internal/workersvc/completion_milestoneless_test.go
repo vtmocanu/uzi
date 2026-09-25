@@ -10,8 +10,10 @@ import (
 )
 
 // TestPlanMilestonesParam pins issue #1626's server-side reading of a milestone-less plan: only
-// an INTERLOCKED issue run's PLAN-BEARING report (non-blank plan_md) with ABSENT milestones
-// becomes the explicit `[]`; every other shape is milestonesParam unchanged.
+// an INTERLOCKED issue run's FIRST PLAN-BEARING report (non-blank plan_md, no stored plan_md)
+// with ABSENT milestones becomes the explicit `[]`; a stored candidate is kept on a later
+// milestone-less report, a rejected list stays sticky (NULL), and every other shape is
+// milestonesParam unchanged.
 func TestPlanMilestonesParam(t *testing.T) {
 	interlocked := store.Run{Kind: runkind.Issue, CompletionContractVersion: pgtype.Int4{Int32: 1, Valid: true}}
 	legacy := store.Run{Kind: runkind.Issue}
@@ -26,6 +28,16 @@ func TestPlanMilestonesParam(t *testing.T) {
 	withEmptyCandidate.MilestonesCandidate = []byte("[]")
 	samePlanNullCandidate := interlocked
 	samePlanNullCandidate.PlanMd = pgtype.Text{String: *plan, Valid: true}
+	// B-a: an earlier plan-bearing report stored "# Plan A" and its milestone list was REJECTED
+	// (candidate NULL). A DIFFERENT plan with no milestones must not infer `[]`.
+	rejectedEarlierPlan := interlocked
+	rejectedEarlierPlan.PlanMd = pgtype.Text{String: "# Plan A", Valid: true}
+	planB := strPtr("# Plan B (revised)")
+	emptyCandidateStoredPlan := withEmptyCandidate
+	emptyCandidateStoredPlan.PlanMd = pgtype.Text{String: "# Plan A", Valid: true}
+	corruptCandidateStoredPlan := interlocked
+	corruptCandidateStoredPlan.MilestonesCandidate = []byte("{not json")
+	corruptCandidateStoredPlan.PlanMd = pgtype.Text{String: "# Plan A", Valid: true}
 	legacyWithCandidate := legacy
 	legacyWithCandidate.MilestonesCandidate = []byte(twoJSON)
 
@@ -54,6 +66,20 @@ func TestPlanMilestonesParam(t *testing.T) {
 		// list) stays NULL rather than inferring the vacuous `[]`.
 		{"interlocked, same plan re-reported after a NULL candidate", samePlanNullCandidate, plan, nil, ""},
 		{"legacy, absent milestones, candidate not carried", legacyWithCandidate, plan, nil, ""},
+		// B-a (sticky rejection): a NULL stored candidate beside a non-NULL stored plan_md means an
+		// earlier list was rejected; only the FIRST plan-bearing report (stored plan_md NULL) infers.
+		{"interlocked, different plan after a rejected list stays NULL", rejectedEarlierPlan, planB, nil, ""},
+		{"interlocked, different plan after a rejected list, explicit [] wins", rejectedEarlierPlan, planB, empty, "[]"},
+		{"interlocked, different plan after a rejected list, valid list wins", rejectedEarlierPlan, planB, one, `[{"id":"m1","title":"First"}]`},
+		{"interlocked, different plan after a rejected list, rejected again", rejectedEarlierPlan, planB, bad, ""},
+		{"interlocked, revise without milestones keeps a stored []", emptyCandidateStoredPlan, planB, nil, "[]"},
+		{"interlocked, revise without milestones keeps a stored non-empty candidate", func() store.Run {
+			r := withCandidate
+			r.PlanMd = pgtype.Text{String: "# Plan A", Valid: true}
+			return r
+		}(), planB, nil, twoJSON},
+		{"interlocked, corrupt stored candidate beside a stored plan stays NULL", corruptCandidateStoredPlan, planB, nil, ""},
+		{"interlocked, rejected list replaces a stored candidate with NULL", withCandidate, plan, bad, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

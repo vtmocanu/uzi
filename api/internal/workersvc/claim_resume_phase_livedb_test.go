@@ -111,10 +111,27 @@ func TestAssembleClaimResumePhaseAwaitingApprovalLiveDB(t *testing.T) {
 	if payload.PlanApproved {
 		t.Fatalf("assembled claim PlanApproved = true, want false for an awaiting_approval resume")
 	}
-	// Issue #1626 (B1): the gate resume carries the unapproved CANDIDATE (nothing is frozen yet),
-	// so the worker re-presents the plan WITH its milestones rather than without them.
+	// Issue #1626 (N-a): this fixture is a LEGACY run (no completion_contract_version), so its
+	// claim stays byte-identical to before the interlock: nothing is frozen, and the candidate is
+	// NOT replayed.
+	if len(payload.Milestones) != 0 {
+		t.Fatalf("legacy assembled claim Milestones = %+v, want none (the candidate replay is interlock-only)", payload.Milestones)
+	}
+
+	// Issue #1626 (B1): an INTERLOCKED run's gate resume carries the unapproved CANDIDATE
+	// (nothing is frozen yet), so the worker re-presents the plan WITH its milestones rather than
+	// without them.
+	env.exec(`UPDATE runs SET completion_contract_version = 1 WHERE id = $1`, runID)
+	interlocked := mustRun(t, env, runID)
+	payload, err = svc.assembleClaim(env.ctx, wkr, interlocked)
+	if err != nil {
+		t.Fatalf("assembleClaim (interlocked): %v", err)
+	}
+	if payload.ResumePhase != "awaiting_approval" {
+		t.Fatalf("interlocked assembled claim ResumePhase = %q, want awaiting_approval", payload.ResumePhase)
+	}
 	if len(payload.Milestones) != 2 || payload.Milestones[0].ID != "m1" || payload.Milestones[1].ID != "m2" {
-		t.Fatalf("assembled claim Milestones = %+v, want the m1,m2 candidate on an awaiting_approval resume", payload.Milestones)
+		t.Fatalf("interlocked assembled claim Milestones = %+v, want the m1,m2 candidate on an awaiting_approval resume", payload.Milestones)
 	}
 }
 

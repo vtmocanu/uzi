@@ -3469,6 +3469,53 @@ describe("CodexExecutor: plan folding + implement/review loop (m2)", () => {
     assert.equal(capped.transport.turnStartCount, 1, "zero revision budget cannot start another plan turn");
   });
 
+  it("issue #1626: both plan-gate call sites send rejectedMilestones in place of milestones", async () => {
+    // A partly-malformed submit_plan list must ride the gate report as the WHOLE rejected list (so
+    // the server rejects it as a unit), on the first gate call AND on the revise round's call. A
+    // regression of either call site to `planResult.milestones` would send undefined here.
+    const firstRound = [{ id: "m1", title: "ok" }, { id: "m2" }];
+    const reviseRound = [{ id: "r1", title: "fine" }, { title: "no id" }];
+    const planResponder: Responder = (c) => {
+      if (c.method === "thread/start") return { thread: { id: "th-plan" } };
+      if (c.method === "turn/start") {
+        const turnId = `tn-plan-${c.turnStartCount}`;
+        if (c.turnStartCount === 1) c.transport.push(threadStarted("th-plan"));
+        const milestones = c.turnStartCount === 1 ? firstRound : reviseRound;
+        c.transport
+          .push(toolCall(c.turnStartCount, "submit_plan", { plan_md: `plan-${c.turnStartCount}`, milestones }, "th-plan", turnId, `c-plan-${c.turnStartCount}`))
+          .push(turnCompleted("completed", "th-plan", turnId));
+        return { turn: { id: turnId } };
+      }
+      return {};
+    };
+    const rig = makeMultiEpochRig([
+      planResponder,
+      epochResponder("resumed-plan", "tn-implement", (t, th, tn) => {
+        t.push(toolCall(99, "signal_done", {}, th, tn, "c-done")).push(turnCompleted("completed", th, tn));
+      }),
+    ]);
+    const gated: unknown[] = [];
+    const gatePlan: NonNullable<RunContext["gatePlan"]> = async (_planMd, milestones) => {
+      gated.push(milestones);
+      return gated.length === 1
+        ? { kind: "revise", feedback: "again" }
+        : { kind: "approve", selection: { source: "own", agents: [] } } as never;
+    };
+    const { ctx } = makeCtx({ planApproved: false, approvedPlan: undefined, gatePlan, config: { plan_max_revisions: 1 } });
+
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "rejected-milestones plan run");
+    assert.deepEqual(gated, [
+      [
+        { id: "m1", title: "ok" },
+        { id: "m2", title: "" },
+      ],
+      [
+        { id: "r1", title: "fine" },
+        { id: "", title: "no id" },
+      ],
+    ]);
+  });
+
   it("(m2-2) a cooperative checkpoint (not done) drives ctx.checkpoint({reap:true}), recreates the epoch, and the next implement turn on the NEW root reaches done", async () => {
     // m4 change: a cooperative checkpoint reap recreates the provider epoch, so the second implement
     // turn runs on a DISTINCT root/transport (the reaped root's registry is permanently closed).

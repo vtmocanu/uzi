@@ -1777,13 +1777,13 @@ UPDATE runs SET
     -- (Decision 2), so a fresh awaiting_approval report overwrites the prior proposal.
     -- The VALUE is decided in Go (planMilestonesParam, issue #1626). On a LEGACY run
     -- a report with no milestones passes NULL and clears the candidate (the candidate
-    -- reflects only the latest proposal). On an INTERLOCKED run a milestone-less plan
-    -- passes the explicit '[]' (so approval freezes an empty contract) — EXCEPT that it
-    -- never downgrades a stored non-empty candidate: a re-presented gate or a revise
-    -- round with no milestones passes the stored candidate back unchanged (fail-closed),
-    -- and a re-report of the same plan_md over a NULL candidate stays NULL. A rejected
-    -- (invalid) list passes NULL on either kind. The immutable frozen list is untouched
-    -- here (it is written at approve / by autopilot).
+    -- reflects only the latest proposal). On an INTERLOCKED run the FIRST plan-bearing
+    -- report (stored plan_md still NULL) with no milestones passes the explicit '[]' (so
+    -- approval freezes an empty contract). A later milestone-less report (a re-presented
+    -- gate or a revise round) passes a stored candidate back unchanged, and over a NULL
+    -- candidate (an earlier list was rejected) stays NULL: the rejection is sticky and
+    -- fail-closed. A rejected (invalid) list passes NULL on either kind. The immutable
+    -- frozen list is untouched here (it is written at approve / by autopilot).
     milestones_candidate = sqlc.narg('milestones_candidate')::jsonb,
     -- PRD #84 M4 (unit 4b): persist the plan-time INFERRED requirement set the worker
     -- emits on this report. ALL THREE assignments are ABSENT-SAFE (a nil param must not

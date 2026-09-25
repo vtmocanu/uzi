@@ -3458,10 +3458,13 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		inferredCaps, inferredTools, sizeClass := inferredRequirementParams(req)
 		rows, err = q.SetRunAwaitingApproval(ctx, store.SetRunAwaitingApprovalParams{
 			PlanMd: stripNULParam(req.PlanMd), SessionID: sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
-			// Issue #1626: an interlocked run's milestone-less plan is the explicit `[]`
-			// (planMilestonesParam), so the approve freeze builds a criteria:[] contract — but a
-			// milestone-less re-presentation (a gate reclaim) or revise round never downgrades a
-			// stored non-empty candidate: planMilestonesParam passes it back unchanged.
+			// Issue #1626: an interlocked run's FIRST plan-bearing report with no milestones is the
+			// explicit `[]` (planMilestonesParam), so the approve freeze builds a criteria:[]
+			// contract. `owned` predates this report's plan_md write, which is what lets
+			// planMilestonesParam tell a first report (stored plan_md NULL) from a later one. A
+			// milestone-less re-presentation (a gate reclaim) or revise round keeps a stored
+			// candidate unchanged, and after a REJECTED list (stored candidate NULL beside a
+			// stored plan_md) it stays NULL: nothing freezes and the run holds at finalize.
 			MilestonesCandidate:  planMilestonesParam(owned, req.PlanMd, req.Milestones),
 			InferredCapabilities: inferredCaps,
 			InferredTools:        inferredTools,
@@ -4025,10 +4028,14 @@ func (s *Service) runningStateParams(ctx context.Context, run store.Run, req Sta
 	// RepoAgents/AgentSelection paths below, a bad milestone list is DROPPED rather
 	// than failing the report — additive-optional.
 	//
-	// Issue #1626: for an INTERLOCKED run, the plan-bearing report (plan_md present) with no
-	// milestones freezes the explicit `[]` (planMilestonesParam), so the contract freeze below
+	// Issue #1626: for an INTERLOCKED run, the FIRST plan-bearing report (plan_md present) with
+	// no milestones freezes the explicit `[]` (planMilestonesParam), so the contract freeze below
 	// and in SetRunRunning lands criteria:[]. The claim-time report carries no plan_md and
-	// stays NULL, keeping the milestone-source guard intact.
+	// stays NULL, keeping the milestone-source guard intact. `run` is the SetState snapshot taken
+	// BEFORE SetRunAutopilotPlan stored this report's plan_md, so the first plan report sees a
+	// NULL stored plan_md and infers `[]`; a later plan report after a REJECTED list (frozen still
+	// NULL, plan_md already stored) stays NULL, so a rejection is never turned into a vacuous
+	// empty contract.
 	p.MilestonesFrozen = planMilestonesParam(run, req.PlanMd, req.Milestones)
 
 	// PRD #122 M2 (Decision 3/12): the live progress sets. Validated + membership-checked

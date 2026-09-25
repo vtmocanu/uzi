@@ -1800,8 +1800,9 @@ export class CodexExecutor implements Executor {
         if (planMd === undefined || planMd.trim().length === 0) {
           throw new Error("codex plan turn produced no plan");
         }
-        // Issue #1626: an entirely-malformed milestone list rides the report as rejectedMilestones,
-        // so the server drops the candidate instead of reading "no milestones" as an empty contract.
+        // Issue #1626: a malformed milestone list (any entry dropped, or a non-array) rides the
+        // report as rejectedMilestones, so the server rejects the candidate as a unit instead of
+        // reading "no milestones" (or a narrowed list) as the completion contract.
         let verdict = await ctx.gatePlan(planMd, planResult.rejectedMilestones ?? planResult.milestones);
         const maxRevisions = planMaxRevisionsOf(ctx.config);
         let revisions = 0;

@@ -167,7 +167,8 @@ export class RunTurnReducerImpl implements RunTurnReducer {
   private foldSignals(s: Readonly<Partial<TurnSignals>>, reduction: TurnReduction): void {
     if (s.plan !== undefined) this.result.plan = s.plan;
     // Last-wins across the two exclusive shapes of a submit_plan milestone list (issue #1626):
-    // the latest submit_plan's valid list, or its entirely-malformed one, replaces the other.
+    // the latest submit_plan's valid list, or its rejected (malformed or partly-malformed) one,
+    // replaces the other.
     if (s.milestones) {
       this.result.milestones = s.milestones;
       delete this.result.rejectedMilestones;
