@@ -1618,6 +1618,36 @@ describe("input receipts", () => {
     }
   });
 
+  it("after a given-up credential switch, a later follow-up's report still waits for its APPLIED", async () => {
+    // The switch trips the shared controller once; the give-up is confirmed and the flight continues
+    // in place with the controller still aborted. A follow-up routed afterwards must hold its report.
+    const followUp: UserInput = { id: 8, kind: "follow_up", body: "eight" };
+    let gets = 0;
+    let appliedFollowUp = false;
+    const cancel = new AbortController();
+    const client = {
+      getInputs: async () => {
+        gets++;
+        if (gets === 1) return { inputs: [], credentialSwitch: { generation: 3 } };
+        return { inputs: gets === 3 ? [followUp] : [] };
+      },
+      ackInputs: async () => ({ inputs: [followUp], active: true }),
+      applyInputs: async () => { await tick(150); appliedFollowUp = true; return { inputs: [followUp], active: true }; },
+    } as unknown as WorkerClient;
+    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), cancel, { claimGeneration: 3 });
+    ch.start();
+    try {
+      await until(() => cancel.signal.aborted);
+      assert.strictEqual((cancel.signal.reason as Error).name, "CredentialSwitchSignal");
+      ch.rearmCredentialSwitch(); // the give-up's stamp-clear was confirmed; the flight continues
+      assert.deepStrictEqual(await ch.awaitFollowUp(100_000), { kind: "followup", body: "eight" });
+      await ch.awaitReceiptSettlement();
+      assert.strictEqual(appliedFollowUp, true, "the running report waited for the follow-up's APPLIED");
+    } finally {
+      await ch.stop();
+    }
+  });
+
   it("gives up a routed receipt after a bounded number of applied attempts at stop", async () => {
     const row: UserInput = { id: 7, kind: "approve_plan", body: null };
     let attempts = 0;
