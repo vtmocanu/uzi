@@ -36,6 +36,11 @@ through `[0.52.0]`.)
 - **The early-limit-reset alert is now Slack-only ([#1650](https://github.com/vtmocanu/uzi/issues/1650)).**
   Without a linked Slack account you no longer get this alert at all; the early reset still shows up on the rate-limit meters either way.
 
+### Fixed
+
+- **A turn whose agent CLI is killed from outside uzi with SIGTERM or SIGKILL can now resume instead of failing the run ([#1656](https://github.com/vtmocanu/uzi/issues/1656)).**
+  When the CLI dies from SIGTERM/SIGKILL (or exits 143/137) with no uzi watchdog, cancel or pause behind it, the worker resumes the session that turn was running, at most twice per turn, on the run's remaining wall budget, and only when that session is known and the dead CLI's process group is confirmed gone after being killed. Otherwise the run fails as before: crash signals and other exit codes, a death whose session is unknown, a process group that cannot be confirmed gone, and a third death in the same turn.
+
 ## [0.84.0] - 2026-09-20
 
 ### Added

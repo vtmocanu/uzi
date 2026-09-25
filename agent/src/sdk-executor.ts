@@ -90,7 +90,7 @@ import type { WorkerClient } from "./client.js";
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import { qualifiedSkillName, type SkillDrop } from "./skills-plugin.js";
 import { prepareSkillPlugin, resolveSkillCaps } from "./skills-run.js";
-import { killProcessGroup, spawnDetached } from "./sdk-spawn.js";
+import { killProcessGroup, killProcessGroupOnly, processGroupPresent, spawnDetached } from "./sdk-spawn.js";
 import { defaultQueryFn, providerErrorMessage } from "./sdk-messages.js";
 import { ClaudeHarness, type ClaudeTurnConfig } from "./claude-harness.js";
 import { RunTurnReducerImpl } from "./harness-reducer.js";
@@ -246,6 +246,66 @@ export class ProviderTransientError extends Error {
   }
 }
 
+// issue #1656: in-process resumes of a turn whose SDK CLI died from a FOREIGN SIGTERM/SIGKILL,
+// counted per turn on their own counter (provider and empty-turn retries never extend it). Small
+// on purpose: a self-inflicted kill can recur on resume, so this never joins the uncapped
+// recovery_wait park; exhaustion fails the run exactly as before.
+const CLI_SIGNAL_DEATH_MAX_RETRIES = 2;
+// issue #1656: how long, and how often, to poll for a dead CLI's process group to be gone
+// after the group SIGKILL, before a resume. Past the deadline the run fails closed.
+const CLI_GROUP_REAP_CONFIRM_MS = 1_000;
+const CLI_GROUP_REAP_POLL_MS = 25;
+
+/**
+ * issue #1656: the SDK CLI child died from a foreign SIGTERM/SIGKILL (or exited 143/137) with
+ * no uzi trip pending. Thrown from driveTurn's catch and resumed in-process on the same session
+ * by {@link SdkExecutor.driveTurnWithEmptyRecovery}. `sessionId` is the session to resume: the
+ * one THIS turn ran, else the requested one when no init reported a fresh session, else none; `pid` is the dead CLI's pid (its process-group id), whose group must be
+ * confirmed gone before any resume; `death` names the signal
+ * or exit code (never the SDK's stderr tail) for the feed notice; `original` is the SDK's own
+ * error, rethrown unchanged when the resume is not possible or its bound is spent, so the run
+ * fails exactly as it did before.
+ */
+class CliSignalDeathError extends Error {
+  public readonly original: Error;
+  public readonly death: string;
+  public readonly sessionId?: string;
+  public readonly pid?: number;
+  constructor(original: Error, death: string, sessionId?: string, pid?: number) {
+    super(original.message);
+    this.name = "CliSignalDeathError";
+    this.original = original;
+    this.death = death;
+    this.sessionId = sessionId;
+    this.pid = pid;
+  }
+}
+
+/**
+ * issue #1656: if `err` is the SDK's error for a CLI child ended by SIGTERM/SIGKILL, a short
+ * description of the death (`signal SIGTERM`, `exit code 143`); otherwise undefined.
+ *
+ * READS UNDOCUMENTED SDK INTERNALS: `getProcessExitError` (sdk.mjs) tags its Error with OWN
+ * properties `errorClass: "process_killed_by_signal"` + `signal`, or
+ * `errorClass: "process_exited_nonzero"` + `exitCode`; none is in the public `.d.ts`. The exit
+ * codes 143/137 are the signal-shaped codes for SIGTERM/SIGKILL (the SDK reports a code, not
+ * proof of the signal). Crash signals and every other code return false and fail fast.
+ * test/sdk-signal-death.test.ts pins the shape against the installed SDK.
+ */
+function foreignCliTermination(err: Error): string | undefined {
+  const own = (key: string): unknown => (Object.hasOwn(err, key) ? Reflect.get(err, key) : undefined);
+  const errorClass = own("errorClass");
+  if (errorClass === "process_killed_by_signal") {
+    const signal = own("signal");
+    return signal === "SIGTERM" || signal === "SIGKILL" ? `signal ${signal}` : undefined;
+  }
+  if (errorClass === "process_exited_nonzero") {
+    const exitCode = own("exitCode");
+    return exitCode === 143 || exitCode === 137 ? `exit code ${exitCode}` : undefined;
+  }
+  return undefined;
+}
+
 /**
  * issue #1088: whether a FAILED terminal is a TRANSIENT provider error that should be
  * retried and, on a sustained outage, PARKED (recovery_wait) rather than terminal-failed.
@@ -326,6 +386,12 @@ export interface SdkExecutorOptions {
   spawn?: (opts: SpawnOptions) => { pid?: number };
   /** Group-kill a pid (default = killProcessGroup). Injected in tests. */
   kill?: (pid: number | undefined) => boolean;
+  /** issue #1656: SIGKILL a dead CLI's process group only, no bare-pid fallback (default =
+   *  killProcessGroupOnly). Injected in tests. */
+  killCliGroup?: (pgid: number) => boolean;
+  /** issue #1656: whether a process group still has members; undefined = unknowable (default
+   *  = processGroupPresent). Injected in tests. */
+  cliGroupPresent?: (pgid: number) => boolean | undefined;
   /** Worker-credential file paths (UZI_WORKER_TOKEN_FILE) the Bash guard denies. */
   secretPaths?: readonly string[];
   /** Root for per-run tool-provisioning dirs (PRD #18 M3), OUTSIDE any clone.
@@ -568,6 +634,8 @@ export class SdkExecutor implements Executor {
   private readonly queryFn: SdkQueryFn;
   private readonly spawn: (opts: SpawnOptions) => { pid?: number };
   private readonly kill: (pid: number | undefined) => boolean;
+  private readonly killCliGroup: (pgid: number) => boolean;
+  private readonly cliGroupPresent: (pgid: number) => boolean | undefined;
   private readonly secretPaths: readonly string[];
   private readonly provisionRoot: string;
   private readonly provisionHomeDir: string;
@@ -592,12 +660,18 @@ export class SdkExecutor implements Executor {
   /** issue #1197 (D-RC2b): bounded in-process re-drive count for a positively-empty
    *  turn before escalating to {@link TransientRecoveryError}. Injectable for tests. */
   private readonly emptyTurnMaxRetries: number;
-  /** Every pid spawned across the current run's turns, for the done-path reap.
+  /** Every pid spawned across the current run's turns, for the done-path reap
+   *  (a CLI that died from a foreign signal is removed at resume time, once its group
+   *  is confirmed gone, issue #1656).
    *  Private to THIS instance — one SdkExecutor is built per run (PRD #42 Decision
    *  4), so two concurrent runs can never wipe/kill each other's set. Shared with
    *  the Claude adapter, which records pids into it; killAgentTree (below, the
    *  legacy path) reaps it. */
   private readonly spawnedPids = new Set<number>();
+  /** issue #1656: the subset of spawnedPids whose CLI is known to have died from a foreign
+   *  signal (its group not confirmed gone). The run-end reap signals these group-only: after
+   *  the leader exited, killProcessGroup's bare-pid fallback could hit a recycled process. */
+  private readonly deadCliPids = new Set<number>();
   /** The Claude run-lane adapter (PRD #1146 M2). Owns query options finalization,
    *  frame decode, the lead context read, process ownership and terminal building;
    *  driveTurn drives it and the per-run reducer. */
@@ -623,6 +697,8 @@ export class SdkExecutor implements Executor {
     this.queryFn = opts.queryFn ?? defaultQueryFn;
     this.spawn = opts.spawn ?? spawnDetached;
     this.kill = opts.kill ?? killProcessGroup;
+    this.killCliGroup = opts.killCliGroup ?? killProcessGroupOnly;
+    this.cliGroupPresent = opts.cliGroupPresent ?? processGroupPresent;
     this.secretPaths = opts.secretPaths ?? [];
     // Provisioning HOME + root are SHARED worker-lifetime paths (Decision 5): they
     // must NOT be derived from the per-run SDK homeDir, or the nix profile/devbox
@@ -684,11 +760,16 @@ export class SdkExecutor implements Executor {
    * and could read the PAT out of the git child's /proc/environ during the
    * worker's push. The runner calls this before pushBranch; run()'s finally also
    * calls it so no path leaks an orphan. Idempotent: the set is cleared so a
-   * recycled pid is never re-signalled.
+   * recycled pid is never re-signalled. A CLI known to have died from a foreign
+   * signal is signalled group-only, with no bare-pid fallback (issue #1656).
    */
   killAgentTree(): void {
-    for (const pid of this.spawnedPids) this.kill(pid);
+    for (const pid of this.spawnedPids) {
+      if (this.deadCliPids.has(pid)) this.killCliGroup(pid);
+      else this.kill(pid);
+    }
     this.spawnedPids.clear();
+    this.deadCliPids.clear();
   }
 
   /**
@@ -771,6 +852,7 @@ export class SdkExecutor implements Executor {
 
   async run(ctx: RunContext): Promise<ExecutorResult> {
     this.spawnedPids.clear();
+    this.deadCliPids.clear();
     // Fresh per-run reducer: the first-truthy-session latch must not survive a
     // second run() on this instance (one executor per run is the norm, but keep
     // the latch honest regardless).
@@ -3384,6 +3466,14 @@ export class SdkExecutor implements Executor {
     // this is the throw-path analog, passed to a ProviderTransientError so the recovery
     // park resumes the same session lineage.
     let observedSessionId: string | undefined;
+    // issue #1656: the session THIS turn actually runs, read off the turn's own events, and
+    // whether an init reported a session other than the requested resume. Unlike the once-per-run
+    // latch above, these see a later turn whose requested resume came back as a fresh session.
+    // The init's id is authoritative; failing that, the last id on a main-thread event. A
+    // subagent frame's id never counts, so it cannot replace the root session.
+    let initSessionId: string | undefined;
+    let turnSessionId: string | undefined;
+    let freshInit = false;
 
     this.armWall(state);
     // Budget already spent by earlier turns → fail now rather than run unbounded.
@@ -3412,6 +3502,12 @@ export class SdkExecutor implements Executor {
       const turn = this.harness.startTurn(request);
       for await (const event of turn.events) {
         armIdle(); // any event is liveness
+        if (event.kind === "initialized") {
+          if (event.sessionId) initSessionId = event.sessionId;
+          if (event.freshSession === true) freshInit = true;
+        } else if (event.sessionId && !(event.kind === "frame" && event.origin.kind === "subagent")) {
+          turnSessionId = event.sessionId;
+        }
         const reduction = await reducer.accept(event);
         // First-truthy session id once per run: the run callback, catch-and-warn
         // exactly as before (a handler throw must not fail the turn).
@@ -3495,6 +3591,15 @@ export class SdkExecutor implements Executor {
       // A watchdog/cancel trip surfaces as its static reason, not the raw
       // AbortError the aborted iterator throws.
       if (state.tripReason) throw this.tripError(state);
+      // issue #1656: only with no trip pending — every uzi kill sets tripReason first — is a
+      // SIGTERM/SIGKILL death of the CLI foreign, and resumable by the recovery wrapper.
+      const death = err instanceof Error ? foreignCliTermination(err) : undefined;
+      if (err instanceof Error && death !== undefined) {
+        // Resume the session this turn ran; with none seen, the requested one, but only when no
+        // init reported a different (fresh) session. Otherwise no session: fail as before.
+        const resumable = initSessionId ?? turnSessionId ?? (freshInit ? undefined : resumeId);
+        throw new CliSignalDeathError(err, death, resumable, state.currentChild.pid);
+      }
       throw err instanceof Error ? err : new Error(errMessage(err));
     } finally {
       if (idleTimer) clearTimeout(idleTimer);
@@ -3527,6 +3632,10 @@ export class SdkExecutor implements Executor {
    *    wall is spent, and the next driveTurn's `armWall` trips REASON_WALL naturally —
    *    the genuine wall outcome, not a park. The between-turns wait is debited from the
    *    wall (disarmed between turns) so the next turn sees the true remaining budget.
+   *  - A {@link CliSignalDeathError} (issue #1656: a foreign SIGTERM/SIGKILL of the CLI) is
+   *    re-driven at once on the same session, at most CLI_SIGNAL_DEATH_MAX_RETRIES times per
+   *    turn on a counter no other retry touches; with no known session, or once spent, the
+   *    SDK's own error re-throws and the run fails as before (never the recovery_wait park).
    *  - The re-drive resumes the last session observed — a fresh empty planning turn's
    *    `turn.sessionId`, or a transient throw's `err.sessionId`. The persisted
    *    first-session ID stays authoritative.
@@ -3547,35 +3656,97 @@ export class SdkExecutor implements Executor {
   ): Promise<TurnResult> {
     // issue #1088: a driveTurn either RETURNS a result (possibly positively-empty) or
     // THROWS. A ProviderTransientError throw is captured (retry it, like an empty turn);
+    // a CliSignalDeathError is re-driven inside runOnce on its own bound (issue #1656);
     // a trip / LimitReachedError / any other throw re-throws unchanged. `turn` is left
     // undefined on a captured transient throw, `lastProviderErr` records the latest one.
     let turn: TurnResult | undefined;
     let lastProviderErr: ProviderTransientError | undefined;
+    // issue #1656: resumes spent on foreign CLI signal deaths in THIS turn. Declared outside
+    // runOnce so the provider/empty-turn retries below can neither reset nor extend it.
+    let signalDeathRetries = 0;
     const runOnce = async (): Promise<void> => {
-      try {
-        turn = await this.driveTurn(
-          ctx,
-          turnConfig,
-          phase,
-          resumeId,
-          prompt,
-          state,
-          idleMs,
-          onProgress,
-        );
-        lastProviderErr = undefined;
-      } catch (err) {
-        // A real cancel/idle/wall trip WINS and keeps its existing outcome.
-        if (state.tripReason) throw this.tripError(state);
-        // A usage-limit death routes to the usage-limit wait path, unchanged.
-        if (err instanceof LimitReachedError) throw err;
-        // Any genuine (non-transient) failure fails the run, exactly as before.
-        if (!(err instanceof ProviderTransientError)) throw err;
-        // A transient provider error: retry it like an empty turn, and preserve the
-        // session lineage on this throw path (the clean path uses turn.sessionId).
-        lastProviderErr = err;
-        turn = undefined;
-        resumeId = err.sessionId ?? resumeId;
+      for (;;) {
+        try {
+          turn = await this.driveTurn(
+            ctx,
+            turnConfig,
+            phase,
+            resumeId,
+            prompt,
+            state,
+            idleMs,
+            onProgress,
+          );
+          lastProviderErr = undefined;
+          return;
+        } catch (err) {
+          // A real cancel/idle/wall trip WINS and keeps its existing outcome.
+          if (state.tripReason) throw this.tripError(state);
+          // A usage-limit death routes to the usage-limit wait path, unchanged.
+          if (err instanceof LimitReachedError) throw err;
+          if (err instanceof CliSignalDeathError) {
+            // The CLI is dead: from here on its pid is reaped group-only, whatever happens next.
+            if (err.pid !== undefined) this.deadCliPids.add(err.pid);
+            // issue #1656: resume the session the dead turn ran (driveTurn resolved it against
+            // the id the turn started with). With none, or once the bound is spent, fail exactly
+            // as before with the SDK's own error: never a fresh session labelled a resume, never
+            // recovery_wait.
+            const sessionId = err.sessionId;
+            if (sessionId === undefined || signalDeathRetries >= CLI_SIGNAL_DEATH_MAX_RETRIES) {
+              throw err.original;
+            }
+            // Reap the dead CLI's process group before resuming (its orphans, e.g. a nohup'd
+            // child that could read the PAT, go with it), and resume only once the group is
+            // CONFIRMED gone: a resumed run can last hours, and a pid left for the run-end
+            // killAgentTree could by then name a recycled group. Unconfirmed (still present or
+            // unknowable, or no recorded pid to check) fails the run as before and keeps any
+            // pid for the run-end reap. A trip landing during the confirmation poll wins with
+            // its existing outcome, on both branches.
+            const pid = err.pid;
+            // The dead child's pid must not stay the trip target: a cancel landing during the
+            // poll would otherwise group-kill it with killProcessGroup's bare-pid fallback.
+            state.currentChild = {};
+            const confirmed = pid !== undefined && (await this.reapDeadCliGroup(state, pid));
+            // The wall is disarmed between turns, so a budget spent during the poll is noticed
+            // here; it and any cancel/pause trip win over both branches.
+            if (!state.tripReason && state.wallRemainingMs <= 0) state.tripReason = REASON_WALL;
+            if (state.tripReason) throw this.tripError(state);
+            if (pid === undefined || !confirmed) {
+              this.log.warn("agent CLI died from a foreign signal; its process group is not confirmed gone, not resuming", {
+                run_id: ctx.runId,
+                death: err.death,
+              });
+              throw err.original;
+            }
+            this.spawnedPids.delete(pid);
+            this.deadCliPids.delete(pid);
+            signalDeathRetries++;
+            resumeId = sessionId;
+            this.log.warn("agent CLI died from a foreign signal; resuming the session", {
+              run_id: ctx.runId,
+              death: err.death,
+              attempt: signalDeathRetries,
+            });
+            ctx.emit({
+              kind: "status",
+              agent: "worker",
+              payload: {
+                text: `the agent CLI was terminated (${err.death}); resuming the session (${signalDeathRetries}/${CLI_SIGNAL_DEATH_MAX_RETRIES})…`,
+              },
+            });
+            // Re-drive at once. The wall is not reset: driveTurn re-arms it with the remaining
+            // budget and trips an already-spent one before any SDK call.
+            continue;
+          }
+          // Any genuine (non-transient) failure fails the run, exactly as before.
+          if (!(err instanceof ProviderTransientError)) throw err;
+          // A transient provider error: retry it like an empty turn, and preserve the
+          // session lineage on this throw path (the clean path uses turn.sessionId).
+          lastProviderErr = err;
+          turn = undefined;
+          resumeId = err.sessionId ?? resumeId;
+          return;
+        }
       }
     };
 
@@ -3640,6 +3811,34 @@ export class SdkExecutor implements Executor {
         ? `provider transient error persisted after bounded in-process retries: ${lastProviderErr.message}`
         : undefined,
     );
+  }
+
+  /**
+   * issue #1656: SIGKILL a dead CLI's process group (group only; the signal's result is not
+   * trusted, since "already gone" and "failed" look alike) and poll, briefly and bounded, until
+   * the group is confirmed empty. SIGKILL delivery is asynchronous, hence the poll. The wait is
+   * debited from the wall like the empty-turn backoff, and stops early on a trip (the caller
+   * checks tripReason). @returns true only when confirmed gone.
+   */
+  private async reapDeadCliGroup(state: RunDrive, pgid: number): Promise<boolean> {
+    // Started before the kill: the group kill is synchronous and, under the split, a spawnSync
+    // of setpriv, so its own time is charged to the wall too.
+    const started = Date.now();
+    try {
+      this.killCliGroup(pgid);
+      for (;;) {
+        // A trip (cancel, pause) landing mid-poll, or the wall budget running out during it,
+        // ends it; the caller throws the trip / wall outcome.
+        if (state.tripReason || state.wallRemainingMs - (Date.now() - started) <= 0) return false;
+        const present = this.cliGroupPresent(pgid);
+        if (present === false) return true;
+        if (present === undefined) return false;
+        if (Date.now() - started >= CLI_GROUP_REAP_CONFIRM_MS) return false;
+        await sleep(CLI_GROUP_REAP_POLL_MS);
+      }
+    } finally {
+      state.wallRemainingMs -= Date.now() - started;
+    }
   }
 
   /**
